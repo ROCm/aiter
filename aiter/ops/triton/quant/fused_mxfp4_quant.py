@@ -17,6 +17,7 @@ from aiter.ops.triton._triton_kernels.quant.fused_mxfp4_quant import (
     _fused_flatten_mxfp4_quant,
     _fused_reduce_act_mul_and_dynamic_mxfp4_quant_kernel,
     _fused_reduce_rms_mxfp4_quant_kernel,
+    _fused_rms_gated_mxfp4_quant_kernel,
     _fused_rms_mxfp4_quant_kernel,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
@@ -187,6 +188,82 @@ def fused_rms_mxfp4_quant(
         )
 
     return (out1_fp4, out1_bs), out1, out2, out_res1
+
+
+def fused_rms_gated_mxfp4_quant(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    z: torch.Tensor,
+    eps: float,
+    *,
+    norm_before_gate: bool = True,
+    activation: str = "silu",
+    group_size: int | None = None,
+):
+    """
+    Gated RMSNorm followed by MXFP4 quantization, the RMSNormGated + per-1x32
+    activation quant sequence in front of an MXFP4 linear:
+        norm_before_gate=True:  y = rms_norm(x) * weight * act(z)
+        norm_before_gate=False: y = rms_norm(x * act(z)) * weight
+    with the RMS taken over each group_size slice of the last dimension
+    (the whole row if None). y is rounded to x.dtype, then quantized.
+
+    Key parameters:
+    - x, z: Matrices with shape (M, N), contiguous.
+    - weight: Vector with shape (group_size,) or (N,) if group_size is None.
+    - activation: "silu" (or "swish") or "sigmoid".
+
+    Returns:
+    - out_fp4: The output matrix with shape (M, N // 2).
+    - out_bs: The e8m0 block scales with shape (M, N // 32), unshuffled.
+    """
+    _LOGGER.info("FUSED_RMS_GATED_MXFP4_QUANT: inp=%s", tuple(x.shape))
+
+    MXFP4_QUANT_BLOCK_SIZE = 32
+    assert x.is_contiguous() and z.is_contiguous()
+    assert x.shape == z.shape, "x and z must have the same shape"
+    assert activation in ("silu", "swish", "sigmoid"), f"unsupported {activation=}"
+    M, N = x.shape
+    G = N if group_size is None else int(group_size)
+    if G <= 0 or N % G != 0 or G % MXFP4_QUANT_BLOCK_SIZE != 0:
+        raise ValueError(
+            f"group_size ({G}) must divide N ({N}) and be a multiple of "
+            f"{MXFP4_QUANT_BLOCK_SIZE}"
+        )
+    assert weight.numel() == G, "weight must have group_size elements"
+
+    x = x.view(-1, G)
+    z = z.view(-1, G)
+    rows = x.shape[0]
+    out_fp4 = torch.empty((rows, G // 2), dtype=torch.uint8, device=x.device)
+    out_bs = torch.empty(
+        (rows, G // MXFP4_QUANT_BLOCK_SIZE), dtype=torch.uint8, device=x.device
+    )
+
+    BLOCK_SIZE_N = triton.next_power_of_2(G)
+    BLOCK_SIZE_M = min(8, triton.next_power_of_2(triton.cdiv(rows, 1024)))
+    grid = (triton.cdiv(rows, BLOCK_SIZE_M),)
+    _fused_rms_gated_mxfp4_quant_kernel[grid](
+        x,
+        z,
+        weight.contiguous(),
+        out_fp4,
+        out_bs,
+        eps,
+        rows,
+        G,
+        x.stride(0),
+        z.stride(0),
+        out_fp4.stride(0),
+        out_bs.stride(0),
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
+        NORM_BEFORE_GATE=norm_before_gate,
+        ACTIVATION="sigmoid" if activation == "sigmoid" else "silu",
+    )
+
+    return out_fp4.view(M, N // 2), out_bs.view(M, N // MXFP4_QUANT_BLOCK_SIZE)
 
 
 def fused_flatten_mxfp4_quant(
