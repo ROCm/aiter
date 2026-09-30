@@ -1018,6 +1018,115 @@ def test_k2_page_past_4gib():
         )
 
 
+def _interleave_kv(k_cache, v_cache):
+    """vLLM's paged layout: one ``[pages, page_size, H, 2 * D]`` buffer, K|V."""
+    d = k_cache.shape[-1]
+    kv = torch.cat((k_cache, v_cache), dim=-1)
+    return kv[..., :d], kv[..., d:]
+
+
+def test_k2_interleaved_kv_view_matches_contiguous():
+    """K2 reads K|V-interleaved cache views in place, bit-equal to copies.
+
+    Covers family A and its TP2 shard (12 query heads over 1 KV head), at
+    decode and prefill M.
+    """
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    gqa = FAMILY_A_GQA
+    device = torch.device("cuda")
+    seq_len, page_size, width = 256, 16, 64
+    for n_heads, kv_heads in (
+        (gqa.n_heads, gqa.kv_heads),
+        (gqa.n_heads // 2, gqa.kv_heads // 2),
+    ):
+        for m in (2, 512):
+            torch.manual_seed(m)
+            q = torch.randn(m, n_heads, gqa.head_dim, dtype=dtypes.bf16, device=device)
+            k = torch.randn(
+                seq_len, kv_heads, gqa.head_dim, dtype=dtypes.bf16, device=device
+            )
+            v = torch.randn_like(k)
+            indices = torch.randint(
+                0, seq_len, (m, width), dtype=dtypes.i32, device=device
+            )
+            indices[:, -3:] = -1
+            token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+            gen = torch.Generator(device=device)
+            gen.manual_seed(2)
+            k_cache, kv_table = pack_paged_cache(k, page_size, generator=gen)
+            v_cache, _ = pack_paged_cache(v, page_size, physical=kv_table[0])
+            k_view, v_view = _interleave_kv(k_cache, v_cache)
+            if k_view.is_contiguous():
+                raise AssertionError("interleaved K view should be strided")
+            ref = qsa_k2(q, k_cache, v_cache, indices, kv_table, token_to_req)
+            got = qsa_k2(q, k_view, v_view, indices, kv_table, token_to_req)
+            if not torch.equal(ref, got):
+                diff = (ref.float() - got.float()).abs().max().item()
+                raise AssertionError(
+                    f"K2 on interleaved K|V diverged at Hq={n_heads} "
+                    f"Hk={kv_heads} M={m}: max |diff| {diff}"
+                )
+
+
+def test_k2_interleaved_kv_page_past_4gib():
+    """The wide path honours the view's page stride, not a dense one.
+
+    An interleaved K view of 2 KV heads at D=256 has a 32768-byte page
+    stride, so page 131072 starts at 4 GiB. The view's numel alone would
+    stay under 4 GiB and pick the narrow descriptor.
+    """
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    gqa = FAMILY_A_GQA
+    device = torch.device("cuda")
+    page_size = 16
+    page_bytes = 2 * page_size * gqa.kv_heads * gqa.head_dim * dtypes.bf16.itemsize
+    alias = (1 << 32) // page_bytes
+    if alias * page_bytes != 1 << 32:
+        raise AssertionError(f"page of {page_bytes} bytes does not divide 4 GiB")
+    n_pages = alias + 1
+    need = n_pages * page_bytes
+    free, _total = torch.cuda.mem_get_info(device)
+    if free < need + (1 << 30):
+        aiter.logger.warning(
+            "skip K2 interleaved 4GiB page test: need %s bytes, %s free", need, free
+        )
+        return
+    kv = torch.empty(
+        n_pages,
+        page_size,
+        gqa.kv_heads,
+        2 * gqa.head_dim,
+        dtype=dtypes.bf16,
+        device=device,
+    )
+    k_view, v_view = kv[..., : gqa.head_dim], kv[..., gqa.head_dim :]
+    k_view[0].zero_()
+    k_view[alias].zero_()
+    v_view[0].fill_(1)
+    v_view[alias].fill_(2)
+    q = torch.zeros(3, gqa.n_heads, gqa.head_dim, dtype=dtypes.bf16, device=device)
+    page_table = torch.zeros(1, n_pages, dtype=dtypes.i32, device=device)
+    page_table[0, alias] = alias
+    far_tok = alias * page_size
+    indices = torch.tensor(
+        [[far_tok, 0], [far_tok, -1], [0, -1]], dtype=dtypes.i32, device=device
+    )
+    token_to_req = torch.zeros(3, dtype=dtypes.i32, device=device)
+    got = qsa_k2(q, k_view, v_view, indices, page_table, token_to_req).float()
+    expect = (
+        torch.tensor([1.5, 2.0, 1.0], dtype=torch.float32, device=device)
+        .view(3, 1, 1)
+        .expand_as(got)
+    )
+    if not torch.equal(got, expect):
+        raise AssertionError(
+            "K2 interleaved page past 4 GiB aliased or collapsed: "
+            f"row means {got.mean(dim=(1, 2)).tolist()}"
+        )
+
+
 def _k2_one_live_token(m, width, live_col):
     """Q/K zero, V one, every index -1 except ``live_col``."""
     gqa = FAMILY_A_GQA
@@ -2511,6 +2620,8 @@ def _run_unit_cases():
     test_k2_family_a_decode_matches_oracle()
     test_k2_family_a_prefill_matches_oracle()
     test_k2_page_past_4gib()
+    test_k2_interleaved_kv_view_matches_contiguous()
+    test_k2_interleaved_kv_page_past_4gib()
     test_k2_empty_first_tile_keeps_later_token()
     test_k2_default_out_ignores_query_strides()
     test_k2_empty_cache_or_table_returns_zeros()
