@@ -43,6 +43,7 @@ def assert_exact(actual, expected):
 @pytest.fixture(autouse=True)
 def isolated_context(monkeypatch):
     monkeypatch.delenv("AITER_G2L_TORCH", raising=False)
+    monkeypatch.delenv("AITER_G2L_TRITON", raising=False)
     monkeypatch.setenv("AITER_TDM_DIRECT_EP_MASK", "1")
     monkeypatch.setattr(grouped, "_flydsl_dispatch_context", lambda: None)
     monkeypatch.setattr(grouped, "_G2L_COUNTER_CACHE", {})
@@ -190,7 +191,12 @@ def test_dynamic_graph(n, no_fallback):
 
 @pytest.mark.parametrize(
     "reason,n,E",
-    [("size", 1025, 256), ("size", 1, 1025), ("env", 513, 128), ("compile", 513, 128)],
+    [
+        ("size", 16385, 256),
+        ("size", 1, 16385),
+        ("env", 513, 128),
+        ("compile", 513, 128),
+    ],
 )
 def test_torch_fallback(reason, n, E, monkeypatch):
     calls = []
