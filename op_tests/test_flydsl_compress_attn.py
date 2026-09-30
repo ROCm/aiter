@@ -4,8 +4,8 @@
 """Tests for flydsl ``fused_compress_attn`` kernels (V4-Pro / V4-Flash).
 
 Single test for every arch: the ``flydsl_fused_compress_attn`` /
-``flydsl_hca_compress_attn`` wrappers dispatch internally by ``get_gfx()`` —
-wave64 on the gfx9 family (gfx942/gfx950) and wave32 on gfx1250 — so we drive
+``flydsl_hca_compress_attn`` wrappers dispatch internally by ``get_gfx()`` --
+wave64 on the gfx9 family (gfx942/gfx950) and wave32 on gfx1250 -- so we drive
 the public wrapper and never import an arch-specific kernel directly. gfx1250
 uses the linear FP8 layout, so ``preshuffle`` is forced off there.
 
@@ -48,10 +48,10 @@ torch.set_default_device("cuda")
 SUPPORTED_GFX = ["gfx942", "gfx950", "gfx1250"]
 
 # (label, head_dim, rope_head_dim, ratio, overlap, quant_mode, use_ue8m0, preshuffle)
-# quant_mode ∈ {"none","fp8","group_fp8","fp4"}.
+# quant_mode ? {"none","fp8_per_row","fp8_group","fp4"}.
 SHAPES = [
     ("csa_main", 512, 64, 4, True, "none", False, False),
-    ("csa_indexer", 128, 64, 4, True, "fp8", True, True),
+    ("csa_indexer", 128, 64, 4, True, "fp8_per_row", True, True),
     ("csa_indexer_fp4", 128, 64, 4, True, "fp4", True, True),
     ("hca_main", 512, 64, 128, False, "none", False, False),
 ]
@@ -103,7 +103,7 @@ def _build_inputs(shape, bs, mtp, mode):
     kernel's plan-capacity > num_compress padding-bail path is exercised.
     """
     _label, D, RD, ratio, overlap, quant_mode, ue8m0, preshuffle = shape
-    quant = quant_mode in ("fp8", "group_fp8", "fp4")
+    quant = quant_mode in ("fp8_per_row", "fp8_group", "fp4")
     if get_gfx() == "gfx1250":
         preshuffle = False  # gfx1250 (wave32) uses the linear FP8 layout
     dim_full = (2 if overlap else 1) * D
@@ -185,7 +185,7 @@ def _build_inputs(shape, bs, mtp, mode):
     # paged cache: one block per seq is enough (num_per_seq <= K_PER_BLOCK).
     blocks_per_seq = (num_per_seq + K_PER_BLOCK - 1) // K_PER_BLOCK
     total_blocks = bs * blocks_per_seq + 4
-    if quant_mode == "fp8":
+    if quant_mode == "fp8_per_row":
         kv_cache = torch.zeros(total_blocks, K_PER_BLOCK, D, dtype=dtypes.fp8)
         cache_scale = torch.zeros(total_blocks, K_PER_BLOCK, dtype=torch.float32)
     elif quant_mode == "fp4":
@@ -242,7 +242,11 @@ def _build_inputs(shape, bs, mtp, mode):
         "ratio": ratio,
         "overlap": overlap,
         "quant": quant,
-        "quant_mode": quant_mode,
+        "quant_mode": (
+            "fp4_gfx950_flydsl"
+            if quant_mode == "fp4" and get_gfx() == "gfx950"
+            else quant_mode
+        ),
         "use_ue8m0": ue8m0,
         "preshuffle": preshuffle,
         "rms_eps": RMS_EPS,
@@ -319,8 +323,8 @@ def _check_fp4_cache(out_cache, out_scale, ref_cache, ref_scale, msg):
 def _check_fp8_cache(out_cache, out_scale, ref_cache, ref_scale, msg):
     """Compare an FP8 (e4m3 + fp32 per-row scale) paged cache against the
     reference: kv_cache allclose within tol; cache_scale bit-exact (the reference
-    mirrors the kernel's exact fp32 ops — am_safe * inv_fp8_max + ue8m0 ceil-pow2
-    — so the scale per row must match to the bit). Returns the kv_cache err %.
+    mirrors the kernel's exact fp32 ops -- am_safe * inv_fp8_max + ue8m0 ceil-pow2
+    -- so the scale per row must match to the bit). Returns the kv_cache err %.
     Shared by the shape sweep and the dedicated K-split coverage test."""
     err = checkAllclose(
         out_cache.to(dtypes.fp32),
@@ -346,7 +350,7 @@ def test_flydsl_compress_attn(shape_label, bs, mtp, mode, path):
     """One case. ``mode`` ? {'decode','prefill'}, ``path`` ? {'single','2kernel'}."""
     shape = _shape_by_label(shape_label)
     _, D, RD, ratio, overlap, quant_mode, ue8m0, _preshuffle = shape
-    quant = quant_mode in ("fp8", "fp4")
+    quant = quant_mode in ("fp8_per_row", "fp4")
     use_2kernel = path == "2kernel"
     inp = _build_inputs(shape, bs, mtp, mode)
 
@@ -379,7 +383,7 @@ def test_flydsl_compress_attn(shape_label, bs, mtp, mode, path):
         head_dim=D,
         rope_head_dim=RD,
         quant=quant,
-        quant_mode=quant_mode,
+        quant_mode=inp["quant_mode"],
         cache_scale=ref_inp["cache_scale"],
         use_ue8m0=ue8m0,
         preshuffle=inp["preshuffle"],  # arch-adjusted (False on gfx1250)
@@ -600,7 +604,7 @@ def test_flydsl_hca_fp8(bs, ratio=128, D=512, RD=64, G=64):
 @benchmark()
 def test_flydsl_csa_nm_asm_fp8(bs, mtp=0):
     """CSA Main FP8 nm-asm group-quant: single-kernel ``flydsl_fused_compress_attn``
-    (overlap=True, ratio=4, quant_mode='group_fp8') writes the V4 nm layout (nope fp8 +
+    (overlap=True, ratio=4, quant_mode='fp8_group') writes the V4 nm layout (nope fp8 +
     inline dup e8m0 + separate bf16 rope) -- byte-compatible with HCA Main. Validated
     against the shared pure-torch ``fused_compress_attn_reference(group_quant=True)``.
     """
@@ -640,7 +644,7 @@ def test_flydsl_csa_nm_asm_fp8(bs, mtp=0):
         **common,
         kv_cache=fly_entry,
         quant=True,
-        quant_mode="group_fp8",
+        quant_mode="fp8_group",
         preshuffle=False,
         cache_scale=None,
         k_rope_cache=fly_rope,
@@ -717,7 +721,7 @@ def test_flydsl_csa_indexer_ksplit(shape_label, bs=2, mtp=0):
     WITHOUT an explicit ``k_split_num_waves`` and:
 
       1. asserts the auto-pick actually engages the multi-wave kernel (NW>1) for
-         this plan_capacity — i.e. the auto path is the K-split path, not legacy;
+         this plan_capacity -- i.e. the auto path is the K-split path, not legacy;
       2. validates that the auto (K-split) cache matches the pure-torch reference;
       3. validates the forced-legacy (NW=1) cache matches the reference too when
          that path is supported, so the two wave layouts are cross-checked
@@ -730,7 +734,7 @@ def test_flydsl_csa_indexer_ksplit(shape_label, bs=2, mtp=0):
     shape = _shape_by_label(shape_label)
     _, D, RD, ratio, overlap, quant_mode, ue8m0, _ = shape
     assert quant_mode in (
-        "fp8",
+        "fp8_per_row",
         "fp4",
     ), f"{shape_label} quant_mode={quant_mode!r} is not a quantized indexer shape"
 
@@ -802,7 +806,7 @@ def test_flydsl_csa_indexer_ksplit(shape_label, bs=2, mtp=0):
         head_dim=D,
         rope_head_dim=RD,
         quant=True,
-        quant_mode=quant_mode,
+        quant_mode=inp["quant_mode"],
         cache_scale=ref_inp["cache_scale"],
         use_ue8m0=ue8m0,
         preshuffle=inp["preshuffle"],
@@ -918,7 +922,7 @@ def main():
         nargs="*",
         default=[1, 16, 64, 256],
         help="""Batch sizes for the CSA Main nm-asm fp8 group-quant check (flydsl
-        single-kernel quant_mode='group_fp8' vs torch group_quant ref). Empty to skip.""",
+        single-kernel quant_mode='fp8_group' vs torch group_quant ref). Empty to skip.""",
     )
     parser.add_argument(
         "--ksplit-bs",
