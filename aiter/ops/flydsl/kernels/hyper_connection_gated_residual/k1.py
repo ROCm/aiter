@@ -980,6 +980,8 @@ def _decode_reduce_params(total: int):
 # wins at very small M (M<=4: ~17-26us, ~1.4-1.8x vs Triton); above that the padded
 # split-K/pipe path is far better, so gate the skinny decode at 4.
 DECODE_MAX_M = 4
+# Two launches (skinny.py) instead of the four below.
+_SKINNY_TWO_KERNEL = os.environ.get("AITER_GR_SKINNY_TWO_KERNEL", "1") == "1"
 
 
 def flydsl_k1k2_skinny_decode(
@@ -1034,6 +1036,26 @@ def flydsl_k1k2_skinny_decode(
     w = norm_weight_f32(norm_weight)
     if stream is None:
         stream = torch.cuda.current_stream()
+    if _SKINNY_TWO_KERNEL:
+        from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.skinny import (
+            skinny_two_kernel,
+        )
+
+        r2, x, packed = skinny_two_kernel(
+            residual,
+            block_output,
+            injection,
+            inj_stride,
+            w,
+            w_up,
+            w_down_merged,
+            lowrank,
+            hc_count,
+            eps,
+            stream,
+        )
+        inj_next = packed[:, lowrank : lowrank + hc_count] if need_inj else None
+        return r2, x, inj_next
     dev = residual.device
     r2 = torch.empty(tokens, hidden, dtype=torch.bfloat16, device=dev)
     rrms = torch.empty(tokens, hc_count, dtype=torch.float32, device=dev)
