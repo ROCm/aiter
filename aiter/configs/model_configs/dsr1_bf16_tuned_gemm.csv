@@ -1,7 +1,6 @@
 gfx,cu_num,M,N,K,bias,dtype,outdtype,scaleAB,bpreshuffle,libtype,solidx,splitK,us,kernelName,err_ratio,tflops,bw
 gfx1250,256,768,2112,7168,False,torch.bfloat16,torch.bfloat16,False,False,opus,21270,0,26.1096,opus_gemm_gfx1250_4wave_wl_co_128x64x128x128_4x1_16x16x32_0x0x0_w2x2_c4x4_p3_v1024w1,0.0,890.6,1705.57
 gfx1250,256,1280,2112,7168,False,torch.bfloat16,torch.bfloat16,False,False,opus,21148,0,29.1484,opus_gemm_gfx1250_4wave_wl_co_128x96x128x128_4x1_16x16x32_0x0x0_w2x2_c2x2_p3_v1024w1,0.0,1329.59,1853.77
-gfx1250,256,1536,2112,7168,False,torch.bfloat16,torch.bfloat16,False,False,opus,21153,0,31.3278,opus_gemm_gfx1250_4wave_wl_co_128x96x192x128_4x1_16x16x32_0x0x0_w2x2_c2x2_p3_v1024w1,0.0,1484.51,1876.47
 gfx1250,256,1792,2112,7168,False,torch.bfloat16,torch.bfloat16,False,False,opus,21108,0,33.0084,opus_gemm_gfx1250_4wave_wl_co_128x128x128x128_4x1_16x16x32_0x0x0_w4x1_c2x2_p3_v1024w1,0.0,1643.75,1924.88
 gfx1250,256,2560,2112,7168,False,torch.bfloat16,torch.bfloat16,False,False,opus,21174,0,40.0694,opus_gemm_gfx1250_4wave_wl_co_128x128x192x128_4x1_16x16x32_0x0x0_w2x2_c4x4_p3_v1024w1,0.0,1934.41,1941.41
 gfx1250,256,3072,2112,7168,False,torch.bfloat16,torch.bfloat16,False,False,opus,21177,0,47.6917,opus_gemm_gfx1250_4wave_wl_co_128x128x256x128_4x1_16x16x32_0x0x0_w2x2_c4x1_p3_v1024w1,0.0,1950.3,1830.38
