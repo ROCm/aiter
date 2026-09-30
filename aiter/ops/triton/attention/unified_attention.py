@@ -121,11 +121,11 @@ def use_2d_kernel(params: _UAParams):
         return True
 
     gate = params.target_num_prgms
-    if get_arch().is_rdna:
-        # on RDNA the 3D split-KV kernel only pays off while the 2D launch is too
-        # small to fill the machine; past that the extra segment traffic and the
-        # reduce pass cost more than the added parallelism. On gfx1100 the
-        # crossover sits at cu_count/4, i.e. target_num_prgms (cu_count*4) // 16.
+    if DEVICE_ARCH == "gfx1100":
+        # on gfx1100 the 3D split-KV kernel only pays off while the 2D launch is
+        # too small to fill the machine; past that the extra segment traffic and
+        # the reduce pass cost more than the added parallelism. The crossover
+        # sits at cu_count/4, i.e. target_num_prgms (cu_count*4) // 16.
         gate = params.target_num_prgms // 16
 
     return (
