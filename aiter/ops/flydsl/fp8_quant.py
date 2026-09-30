@@ -40,7 +40,7 @@ def flydsl_fp8_quant(
     multiple of 32. Rotation uses an in-register FWHT and is available only for
     power-of-two head dimensions; set ``rotation=False`` otherwise.
 
-    The returned tensors and descales are enqueued on the current stream of
+    The returned tensors and scales are enqueued on the current stream of
     ``q.device``. Consumers on another stream must establish the usual PyTorch
     event dependency themselves.
     """
@@ -72,10 +72,9 @@ def flydsl_fp8_quant(
             "pass rotation=False to quantize without rotation"
         )
 
-    # D64's common BSHD producer shape can share one 96-thread workgroup per
-    # row: wave 0 quantizes Q, wave 1 K, and wave 2 V. Keep all other cases on
-    # the established per-tensor implementation, including cross-attention
-    # Q/K/V tensors with different sequence lengths.
+    # Same-shape D64 BSHD inputs share one 96-thread workgroup per row: wave 0
+    # quantizes Q, wave 1 K, and wave 2 V. Cross-attention and all other shapes
+    # use the per-tensor implementation.
     if head_dim == 64 and q.shape == k.shape == v.shape:
         return flydsl_fp8_qkv_d64_quant(q, k, v, rotate=rotation)
 
@@ -83,6 +82,7 @@ def flydsl_fp8_quant(
         if head_dim in (64, 128, 256, 512, 1024):
             return flydsl_fp8_pertensor_quant(x, rotate=do_rotate)
 
+        # Non-power-of-two dimensions use the unrotated packed specializations.
         padded_dim = 1 << (head_dim - 1).bit_length()
         if padded_dim > 1024:
             raise ValueError(

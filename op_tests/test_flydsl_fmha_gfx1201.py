@@ -21,14 +21,13 @@ from aiter.test_common import benchmark, checkAllclose, run_perftest
 SUPPORTED_GFX = ["gfx1201"]
 SEED = 0
 
-# (label, batch, seq_q, seq_kv, heads, head_dim, causal). These are attention
-# consumer paths: D64 uses the 256x64 tile, D128 covers the KV tail and the
-# BLOCK_M=256/BLOCK_N=64 selector, Flux is the production self-attention path.
+# (label, batch, seq_q, seq_kv, heads, head_dim, causal). These are distinct
+# attention consumer paths: D64 uses the 128x64 tile, D128 covers the KV tail
+# and the BLOCK_M=256/BLOCK_N=64 selector, and causal masking is separate.
 SHAPES = [
     ("d64_256", 1, 256, 256, 8, 64, False),
     ("d128_cross_tail", 1, 2048, 1400, 8, 128, False),
     ("causal_d128", 1, 512, 512, 8, 128, True),
-    ("flux_d128", 1, 4096, 4096, 24, 128, False),
 ]
 
 

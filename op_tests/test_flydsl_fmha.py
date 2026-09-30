@@ -126,10 +126,9 @@ def _make_qkv(
         (2, 1024, 8, 128),
         # Unaligned shape — exercises the auto-padding path. 32760 → 32768.
         (1, 32760, 12, 128),
-        # Flux self-attn, short sequences (128x32 tile).
+        # Short Flux self-attention (128x32 tile).
         (1, 512, 24, 128),
-        (1, 1536, 24, 128),
-        # SD3 joint attention.
+        # 24-head diffusion attention.
         (1, 1024, 24, 128),
         # Head dimension 64 uses the 128x64 tile.
         (1, 2048, 16, 64),

@@ -1,21 +1,21 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Fully-FlyDSL per-tensor fp8 (e4m3) quant + optional Hadamard rotation.
+"""Fully FlyDSL per-tensor FP8 (e4m3) quantization with optional Hadamard rotation.
 
 gfx1201 / RDNA4, wave32. One wave (32 lanes) owns one row (= one token-head,
 ``head_dim`` elements); each lane holds ``VEC = head_dim // 32`` contiguous
-elements. Feeds the per-tensor fp8 flash-attention kernel (``real = fp8 * scale``
-with a single global descale per tensor).
+elements. Feeds the per-tensor FP8 flash-attention kernel (``real = fp8 * scale``
+with one global scale per tensor).
 
-Per-tensor scaling needs the global amax of the (rotated) tensor before any value
-can be scaled, so the quant is a **2-pass** kernel:
+Per-tensor scaling needs the global amax of the (rotated) tensor before values can
+be scaled, so quantization uses two passes:
 
 * pass 1 (``amax``): load + optional FWHT + per-row amax; lane 0 writes one partial
   per row. A tiny ``partials.amax()`` in torch then gives the global amax without
   atomics or cross-workgroup reduction.
-* pass 2 (``scale``): load + optional FWHT (recomputed) + scale by the single
-  global descale + clamp + cast to fp8.
+* pass 2 (``scale``): load + optional FWHT (recomputed) + divide by the global
+  scale, clamp, and cast to FP8.
 
 Recomputing the rotation in pass 2 keeps the rotated tensor off HBM. The
 in-register Fast Walsh-Hadamard Transform uses butterfly shuffles rather than a
@@ -74,9 +74,11 @@ def _storage_overlaps(lhs, rhs):
 
 
 def _build_kernel(*, head_dim: int, rotate: bool, mode: str):
-    """Build one pass (``mode`` in {"amax", "scale"}) of the 2-pass per-tensor
-    fp8 quant (+ optional FWHT) for a given (head_dim, rotate). Shape constants
-    are captured by closure so distinct configs coexist safely."""
+    """Build one per-tensor FP8 quantization pass for ``head_dim`` and ``rotate``.
+
+    ``mode`` is ``"amax"`` or ``"scale"``. Shape constants are captured by
+    closure so independently compiled configurations coexist safely.
+    """
     assert mode in ("amax", "scale")
     D = head_dim
     VEC = D // BLOCK_THREADS
@@ -155,7 +157,7 @@ def _build_kernel(*, head_dim: int, rotate: bool, mode: str):
         scale = fx.recast_iter(fx.Float32, scale_io).load()
         inv_scale = fx.Float32(1.0) / scale
 
-        # ---- scale + clamp + pack to fp8 ----
+        # Scale, clamp, then pack to FP8.
         c_max = fx.Float32(_FP8_MAX)
         c_min = fx.Float32(-_FP8_MAX)
         q = []
@@ -164,7 +166,7 @@ def _build_kernel(*, head_dim: int, rotate: bool, mode: str):
             v = v.maximumf(c_min).minimumf(c_max)
             q.append(v)
         c0 = fx.Int32(0)
-        # FlyDSL 0.3.4.1 has no typed wrapper for this packed FP8 conversion.
+        # Keep this raw intrinsic: FlyDSL 0.3.4.1 has no typed packed-FP8 conversion.
         if const_expr(VEC == 2):
             pk = rocdl.cvt_pk_fp8_f32(
                 fx.Int32.ir_type, q[0].ir_value(), q[1].ir_value(), c0.ir_value(), 0
@@ -303,7 +305,7 @@ def _build_qkv_d64_kernel(*, rotate: bool, mode: str):
                 c_min = fx.Float32(-_FP8_MAX)
                 q0 = (x0 * inv_scale).maximumf(c_min).minimumf(c_max)
                 q1 = (x1 * inv_scale).maximumf(c_min).minimumf(c_max)
-                # FlyDSL 0.3.4.1 has no typed wrapper for this packed FP8 conversion.
+                # Keep this raw intrinsic: FlyDSL 0.3.4.1 has no typed packed-FP8 conversion.
                 pk = rocdl.cvt_pk_fp8_f32(
                     fx.Int32.ir_type,
                     q0.ir_value(),
