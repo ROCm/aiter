@@ -514,9 +514,22 @@ class TestFailedGroupResults(unittest.TestCase):
         self.assertEqual(results[0], measured["cand-a"])
         self.assertEqual([info for info, *_ in results], ["cand-a", "cand-b", "cand-c"])
         self.assertEqual([us for _, us, *_ in results[1:]], [float("inf")] * 2)
-        self.assertEqual([status for *_, status, _ in results[1:]], ["crash"] * 2)
+        self.assertEqual(
+            [status for *_, status, _ in results[1:]], ["crash", "not_run"]
+        )
         # cand-c is behind the fault and never ran, so a resume may retry it.
         self.assertEqual(to_publish, [results[1]])
+
+    def test_candidates_behind_the_fault_name_the_one_that_stopped_it(self):
+        typed, _ = self._results(
+            return_status=True, status="timeout", detail="exceeded 60s"
+        )
+        self.assertEqual(typed[0][3:], ("timeout", "exceeded 60s"))
+        for _, us, err, status, detail in typed[1:]:
+            self.assertEqual((us, err, status), (float("inf"), 1.0, "not_run"))
+            self.assertEqual(
+                detail, "not reached: the group stopped at cand-a (timeout)"
+            )
 
     def test_untyped_callers_never_see_a_partial_group(self):
         # A caller without statuses picks the fastest finite result, so a
