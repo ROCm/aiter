@@ -348,7 +348,7 @@ def fused_clamp_act_mul(
         # only for triton
         config = _get_config(M, n_half, BLOCK_SIZE_N, "triton")
         num_warps = config["num_warps"]
-        waves_per_eu = config.get("waves_per_eu", 0)
+        waves_per_eu = config["waves_per_eu"]
 
         _fused_clamp_silu_mul_kernel[(M,)](
             inp,
