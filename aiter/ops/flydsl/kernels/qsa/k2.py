@@ -637,6 +637,43 @@ def build_qsa_k2_module(
         init_acc = [fx.Vector.filled(4, 0.0, Float32) for _ in range(out_chunks)]
         init_acc.append(Float32(float("-inf")))
         init_acc.append(Float32(0.0))
+        # One fragment per gather round. gfx942 BN16 has a single chunk, so
+        # this is the whole K tile and it can ride in registers across PV.
+        n_k_pref = n_gather_chunks * gather_chunk
+
+        def k_row_of(phys, page_off):
+            if const_expr(wide_cache):
+                return kv_row(k_base, phys, page_off)
+            return fx.logical_divide(
+                fx.slice(k_buf, (phys, page_off, kv_h, None)),
+                vec_layout,
+            )
+
+        def load_k_frags(k_row):
+            frags = []
+            for gr in range_constexpr(n_k_pref):
+                d_chunk = chunk_owner + Int32(gr * col_owners)
+                k_src = fx.slice(k_row, (None, d_chunk))
+                k_frag = fx.make_fragment_like(k_src)
+                fx.copy(g_copy, k_src, k_frag)
+                frags.append(k_frag)
+            return frags
+
+        def store_k_pref(vecs, live_k):
+            for gr in range_constexpr(n_k_pref):
+                k_vec = live_k.select(
+                    vecs[gr],
+                    fx.Vector.filled(vec, 0.0, BFloat16),
+                )
+                k_tile = make_k_lds_view(
+                    k_arr,
+                    Int32(gr * gather_span),
+                    (block_n, gather_span),
+                )
+                k_dst = kv_store.partition_D(k_tile)
+                k_store_frag = fx.make_fragment_like(k_dst)
+                fx.memref_store_vec(k_vec, k_store_frag)
+                fx.copy(lds_copy, k_store_frag, k_dst)
 
         def tile_body(safe_phys, page_off_i, live, state):
             gpu.barrier()
@@ -660,49 +697,57 @@ def build_qsa_k2_module(
                     fx.copy(g_copy, v_src, v_frag)
                     v_frags.append(v_frag)
 
-            if const_expr(wide_cache):
-                k_row = kv_row(k_base, safe_phys, page_off_i)
+            if const_expr(gfx942_v_pf):
+                # Issued during the previous tile's softmax and PV, so the
+                # gather has a whole tile of math to come back. This tile
+                # only parks it in LDS.
+                k_pref = [state[out_chunks + 5 + i] for i in range(n_k_pref)]
+                store_k_pref(k_pref, live)
             else:
-                k_row = fx.logical_divide(
-                    fx.slice(k_buf, (safe_phys, page_off_i, kv_h, None)),
-                    vec_layout,
-                )
-            for gc in range_constexpr(n_gather_chunks):
-                k_frags = []
-                for j in range_constexpr(gather_chunk):
-                    gr = gc * gather_chunk + j
-                    d_chunk = chunk_owner + Int32(gr * col_owners)
-                    k_src = fx.slice(k_row, (None, d_chunk))
-                    k_frag = fx.make_fragment_like(k_src)
-                    fx.copy(g_copy, k_src, k_frag)
-                    k_frags.append(k_frag)
-                for j in range_constexpr(gather_chunk):
-                    gr = gc * gather_chunk + j
-                    k_vec = live.select(
-                        fx.Vector(fx.memref_load_vec(k_frags[j])),
-                        fx.Vector.filled(vec, 0.0, BFloat16),
+                if const_expr(wide_cache):
+                    k_row = kv_row(k_base, safe_phys, page_off_i)
+                else:
+                    k_row = fx.logical_divide(
+                        fx.slice(k_buf, (safe_phys, page_off_i, kv_h, None)),
+                        vec_layout,
                     )
-                    if const_expr(use_k32):
+            if const_expr(not gfx942_v_pf):
+                for gc in range_constexpr(n_gather_chunks):
+                    k_frags = []
+                    for j in range_constexpr(gather_chunk):
+                        gr = gc * gather_chunk + j
                         d_chunk = chunk_owner + Int32(gr * col_owners)
-                        k_dst = fx.make_view(
-                            k_arr.ptr + amd_k_off(col, d_chunk * Int32(8)),
-                            fx.make_layout(8, 1),
+                        k_src = fx.slice(k_row, (None, d_chunk))
+                        k_frag = fx.make_fragment_like(k_src)
+                        fx.copy(g_copy, k_src, k_frag)
+                        k_frags.append(k_frag)
+                    for j in range_constexpr(gather_chunk):
+                        gr = gc * gather_chunk + j
+                        k_vec = live.select(
+                            fx.Vector(fx.memref_load_vec(k_frags[j])),
+                            fx.Vector.filled(vec, 0.0, BFloat16),
                         )
-                        k_store_frag = fx.make_rmem_tensor(
-                            fx.make_layout(8, 1), BFloat16
-                        )
-                        fx.memref_store_vec(k_vec, k_store_frag)
-                        fx.copy_atom_call(lds_copy, k_store_frag, k_dst)
-                    else:
-                        k_tile = make_k_lds_view(
-                            k_arr,
-                            Int32(gr * gather_span),
-                            (block_n, gather_span),
-                        )
-                        k_dst = kv_store.partition_D(k_tile)
-                        k_store_frag = fx.make_fragment_like(k_dst)
-                        fx.memref_store_vec(k_vec, k_store_frag)
-                        fx.copy(lds_copy, k_store_frag, k_dst)
+                        if const_expr(use_k32):
+                            d_chunk = chunk_owner + Int32(gr * col_owners)
+                            k_dst = fx.make_view(
+                                k_arr.ptr + amd_k_off(col, d_chunk * Int32(8)),
+                                fx.make_layout(8, 1),
+                            )
+                            k_store_frag = fx.make_rmem_tensor(
+                                fx.make_layout(8, 1), BFloat16
+                            )
+                            fx.memref_store_vec(k_vec, k_store_frag)
+                            fx.copy_atom_call(lds_copy, k_store_frag, k_dst)
+                        else:
+                            k_tile = make_k_lds_view(
+                                k_arr,
+                                Int32(gr * gather_span),
+                                (block_n, gather_span),
+                            )
+                            k_dst = kv_store.partition_D(k_tile)
+                            k_store_frag = fx.make_fragment_like(k_dst)
+                            fx.memref_store_vec(k_vec, k_store_frag)
+                            fx.copy(lds_copy, k_store_frag, k_dst)
             if const_expr(token_major_v):
                 fx.rocdl.s_waitcnt(lgkmcnt=0)
                 fx.rocdl.s_barrier()
@@ -933,6 +978,28 @@ def build_qsa_k2_module(
             else:
                 qk_accs = qk_local
 
+            # Next tile's K, issued before softmax and PV. The page load
+            # has had all of QK to land. Nothing may cross the fence, so
+            # these loads cannot sink onto the next tile's vmcnt the way
+            # an unpinned gather does.
+            if const_expr(gfx942_v_pf):
+                tok_next = state[out_chunks + 3]
+                phys_next = state[out_chunks + 5 + n_k_pref]
+                tile_i = state[out_chunks + 6 + n_k_pref]
+                # One tile past the split clamps to its first column, so
+                # the last iteration's extra gather stays in bounds.
+                safe_n, off_n, _live_n = resolve(
+                    tok_next, tile_i + Int32(1), phys_next
+                )
+                next_frags = load_k_frags(k_row_of(safe_n, off_n))
+                # Nothing crosses, so the new loads stay above softmax and
+                # PV instead of sinking to the next tile's drain. The
+                # values are read into vectors after PV, which is what the
+                # loop can carry.
+                fx.rocdl.sched_barrier("none")
+            else:
+                next_frags = []
+
             m_prev = Float32(state[out_chunks])
             l_prev = Float32(state[out_chunks + 1])
             tile_max = _neg_inf()
@@ -1089,7 +1156,14 @@ def build_qsa_k2_module(
                     else:
                         acc4 = pv_mfma(p_vecs[ng], v_vec, acc4)
                 next_acc.append(acc4)
-            return next_acc + [m_new, l_new]
+            if const_expr(gfx942_v_pf):
+                more = [
+                    fx.Vector(fx.memref_load_vec(next_frags[i]))
+                    for i in range(n_k_pref)
+                ]
+            else:
+                more = []
+            return next_acc + [m_new, l_new] + more
 
         # Software-pipelined address resolution. Each iteration issues the
         # index two tiles ahead and the page one tile ahead; neither is read
@@ -1098,11 +1172,20 @@ def build_qsa_k2_module(
         # The three carried registers ride behind the accumulator so the
         # epilogue's ``results`` indices are unchanged.
         n_tiles = tile_end - tile_start
+        if const_expr(gfx942_v_pf):
+            # Tile 0's K starts once its page load has had the Q block to
+            # land. Later tiles are issued at the end of the previous one.
+            safe0, off0, _live0 = resolve(tok0, Int32(0), phys0)
+            k0_frags = load_k_frags(k_row_of(safe0, off0))
+            k0 = [fx.Vector(fx.memref_load_vec(k0_frags[i])) for i in range(n_k_pref)]
+            init_state = init_acc + [tok0, tok1, phys0] + k0
+        else:
+            init_state = init_acc + [tok0, tok1, phys0]
         for tile64, state in range(
             fx.Int64(0),
             fx.Int64(n_tiles),
             fx.Int64(1),
-            init=init_acc + [tok0, tok1, phys0],
+            init=init_state,
         ):
             t = Int32(tile64)
             tok_cur = Int32(state[out_chunks + 2])
@@ -1111,8 +1194,16 @@ def build_qsa_k2_module(
             tok_n2 = load_index(t + Int32(2))
             phys_n1 = load_page(tok_n1)
             safe_phys, page_off_i, live = resolve(tok_cur, t, phys_cur)
-            acc = tile_body(safe_phys, page_off_i, live, state)
-            results = yield acc + [tok_n1, tok_n2, phys_n1]
+            if const_expr(gfx942_v_pf):
+                acc = tile_body(
+                    safe_phys, page_off_i, live, state + [phys_n1, t]
+                )
+                head_n = out_chunks + 2
+                carried = acc[:head_n] + [tok_n1, tok_n2, phys_n1] + acc[head_n:]
+            else:
+                acc = tile_body(safe_phys, page_off_i, live, state)
+                carried = acc + [tok_n1, tok_n2, phys_n1]
+            results = yield carried
 
         m_final = Float32(results[out_chunks])
         l_final = Float32(results[out_chunks + 1])
