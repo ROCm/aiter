@@ -749,3 +749,168 @@ t256 相邻三轮 const0:
 最终同步文件后的 const0:
 /tmp/t192_final_exact_const0.log
 ```
+
+## GEMM1 B payload TDM cache hint 优化
+
+### 优化内容
+
+该优化只修改 GEMM1 读取权重 B payload 时使用的 TDM descriptor：
+
+```text
+tdm_b_th = 6
+TH=6 = NT_HT
+near cache: non-temporal
+far cache: high-priority temporal
+```
+
+实现中将 `tdm_b_th` 从目标规模的 CSV row 传到 optimized GEMM launcher，并且只用于 B payload 的 `cache_modifier`。A payload、ScaleA、ScaleB、output store、tile、wave、cluster、MMA schedule 和计算逻辑均不变。kernel symbol 增加 `_bth6`，用于确认 profiler 实际运行了该版本。
+
+目标 CSV key 和最终配置：
+
+```text
+token=2048
+model_dim=7168
+inter_dim=2048
+expert=64
+topk=8
+tile_m=192
+tile_m2=192
+cluster_m=1
+tdm_b_th=6
+```
+
+实际 GEMM1 symbol：
+
+```text
+a8w4_tdm_fp4_t192x256x256_w2x2_b4_K7168_e64_act1_cn4_cm1_prefetch_eb8_apre_sh_bth6_rcw_mg4_fc20_xdl0_reuse_ostore2p_s3
+```
+
+GEMM2 的两个调用点固定传入 `tdm_b_th=0`，因此正式代码只对 GEMM1 启用该优化。
+
+### 复现命令
+
+在 a07-3 主机上，每次性能运行前执行：
+
+```bash
+/data/yanguahe/code/gpu_users.sh
+```
+
+只有输出“当前没有进程在使用 GPU”时，才将后续结果计入性能对比。
+
+进入容器并切换到仓库：
+
+```bash
+docker exec -it hyg_fyd_e2e bash
+cd /app/aiter
+```
+
+运行正式的 GEMM1 `B_TH=6` 版本：
+
+```bash
+unset AITER_TDM_B_TH
+
+ENABLE_CK=0 \
+AITER_MOE_EXPERT_BALANCE=true \
+AITER_LOG_MORE=1 \
+AITER_USE_GROUPED_GEMM=1 \
+AITER_GROUPED_DEBUG=0 \
+AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE=1 \
+FLYDSL_DUMP_IR=0 \
+python3 -u my_code/test_flydsl_grouped_gemm_gfx1250.py \
+  --scenario bench \
+  --data-format a4w4 \
+  --act silu \
+  --no-bias \
+  --no-check-aot-cache \
+  --experts 64 \
+  --tokens 1536 \
+  --topk 8 \
+  --model-dim 7168 \
+  --inter-dim 2048 \
+  --iters 20 \
+  --const-init 0
+```
+
+运行相同代码路径的 `B_TH=0` 对照，只需在同一命令前设置：
+
+```bash
+export AITER_TDM_B_TH=0
+```
+
+random 正确性验证使用同一命令，但删除 `--const-init 0`。
+
+### 三轮相邻复测
+
+测试顺序为：
+
+```text
+round 1: B_TH=0 -> B_TH=6
+round 2: B_TH=6 -> B_TH=0
+round 3: B_TH=0 -> B_TH=6
+```
+
+每个 case 运行前均确认整机 GPU/KFD 空闲。
+
+| round | GEMM1 B_TH=0 | GEMM1 B_TH=6 | GEMM1 提升 | B_TH=0 MoE e2e | B_TH=6 MoE e2e |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 85.801 us | 79.200 us | 7.69% | 216.180 us | 208.807 us |
+| 2 | 95.563 us | 81.894 us | 14.30% | 224.937 us | 221.306 us |
+| 3 | 95.462 us | 78.759 us | 17.50% | 225.010 us | 204.659 us |
+| median | 95.462 us | 79.200 us | 17.03% | 224.937 us | 208.807 us |
+
+由于 MI450 当前频率和性能状态会动态变化，三组绝对时间存在波动；三组相邻对比都显示 GEMM1 `B_TH=6` 更快，中位数降低 `16.262 us`。MoE e2e 中位数降低 `16.130 us`，对应提升 `7.17%`。
+
+原始日志位于 a07-3 主机：
+
+```text
+/tmp/dsr1_bth6_final/r1_baseline.log
+/tmp/dsr1_bth6_final/r1_optimized.log
+/tmp/dsr1_bth6_final/r2_optimized.log
+/tmp/dsr1_bth6_final/r2_baseline.log
+/tmp/dsr1_bth6_final/r3_baseline.log
+/tmp/dsr1_bth6_final/r3_optimized.log
+```
+
+### random 正确性
+
+正式 GEMM1 `B_TH=6` 版本的 random MoE e2e 结果：
+
+```text
+logits_diff = 3.3849e-06
+rel_l2      = 2.6019e-03
+pass        = True
+```
+
+GEMM2 output hash 与 reference 完全一致；GEMM1 和最终 MoE output 因正常的 MXFP4 数值误差与 reference hash 不同，但误差与此前正确版本一致，并通过 `logits_diff < 0.01` 门限。
+
+random 日志：
+
+```text
+/tmp/dsr1_bth6_final/random_optimized.log
+```
+
+### GEMM2 B payload `B_TH=6` 实验
+
+为了隔离 GEMM2 的影响，实验期间 GEMM1 始终保持正式的 `B_TH=6`，只在两个 GEMM2 launch 点临时将 `tdm_b_th` 从 `0` 改为 `6`。测试结束后已恢复为 `0`，该实验代码未保留。
+
+三轮相邻结果：
+
+| round | GEMM2 B_TH=0 | GEMM2 B_TH=6 | B_TH=6 相对变化 |
+|---:|---:|---:|---:|
+| 1 | 60.378 us | 60.930 us | -0.92% |
+| 2 | 59.908 us | 61.630 us | -2.88% |
+| 3 | 61.822 us | 61.816 us | +0.01% |
+| median | 60.378 us | 61.630 us | -2.07% |
+
+GEMM2 `B_TH=6` 没有稳定收益，中位数反而回退 `1.253 us`。因此最终代码继续保持 GEMM2 `tdm_b_th=0`。
+
+实验日志位于 a07-3 主机：
+
+```text
+/tmp/dsr1_bth6_final/g2_r1_b0.log
+/tmp/dsr1_bth6_final/g2_r1_b6.log
+/tmp/dsr1_bth6_final/g2_r2_b6.log
+/tmp/dsr1_bth6_final/g2_r2_b0.log
+/tmp/dsr1_bth6_final/g2_r3_b0.log
+/tmp/dsr1_bth6_final/g2_r3_b6.log
+```

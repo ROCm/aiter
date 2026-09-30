@@ -930,7 +930,6 @@ def _grouped_a8w4_tdm_moe(
         (
             enable_ep_scatter,
             bool(tdm_as_in_prologue),
-            bool(tdm_b_th),
             bool(_row_major_ascale),
             _prequantized,
         )
@@ -1235,7 +1234,7 @@ def _grouped_a8w4_tdm_moe(
         waves_per_tensor_tdm=waves_per_tensor_tdm,
         next_stage_prefetch=next_stage_prefetch,
         tdm_as_in_prologue=tdm_as_in_prologue,
-        tdm_b_th=tdm_b_th,
+        tdm_b_th=0,
         a_preshuffle=_gemm2_a_preshuffle,
         **_ep_gemm2_kwargs,
     )
@@ -1397,7 +1396,7 @@ def _grouped_a8w4_tdm_moe(
                     waves_per_tensor_tdm=waves_per_tensor_tdm,
                     next_stage_prefetch=next_stage_prefetch,
                     tdm_as_in_prologue=tdm_as_in_prologue,
-                    tdm_b_th=tdm_b_th,
+                    tdm_b_th=0,
                     a_preshuffle=_gemm2_a_preshuffle,
                 ),
             )

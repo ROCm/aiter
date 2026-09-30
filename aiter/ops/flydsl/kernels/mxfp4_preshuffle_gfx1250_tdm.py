@@ -1934,6 +1934,7 @@ def launch_gemm_a8w4_tdm_optimized(
     cluster_m: Constexpr[int] = -1,
     next_stage_prefetch: Constexpr[int] = 0,
     num_waves_per_tensor_tdm: Constexpr[int] = 2,
+    tdm_b_th: Constexpr[int] = 0,
 ):
     """Launch the grouped contiguous-M a8w4 MoE GEMM for gfx1250.
 
@@ -2044,6 +2045,7 @@ def launch_gemm_a8w4_tdm_optimized(
         cluster_m,
         next_stage_on,
         num_waves_per_tensor_tdm,
+        tdm_b_th,
         epilogue_batch_wn,
         relax_cluster_wrap_dscnt,
         disable_xdl_arb_stall,
@@ -2110,11 +2112,12 @@ def launch_gemm_a8w4_tdm_optimized(
     _overlap_store = f"_ostore2p_s{output_store_split_wm}"
     _output_wave_split = "_ow2" if output_store_wave_split else ""
     _cluster_m = f"_cm{cluster_m}" if fp4_prefill_schedule and cluster_m != 4 else ""
+    _b_tdm_th = f"_bth{tdm_b_th}" if tdm_b_th else ""
     _kname = (
         "a8w4_tdm_fp4"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
         f"_b{num_buffers}_K{K}"
-        f"{_grouped}{_act}_cn4{_cluster_m}_prefetch{_epilogue_batch}_apre_sh"
+        f"{_grouped}{_act}_cn4{_cluster_m}_prefetch{_epilogue_batch}_apre_sh{_b_tdm_th}"
         f"{_relax_cluster_wrap}_mg4_fc{fence_cover_mma}{_xdl_arb}"
         f"{_wmma_reuse}{_overlap_store}{_output_wave_split}"
     )
@@ -2358,7 +2361,7 @@ def launch_gemm_a8w4_tdm_optimized(
             "Job",
             (
                 "g_base g_off g_stride oob inner outer on_i32 lds_off lds_row "
-                "k_adv waves pad wg_mask split_inner"
+                "k_adv waves pad wg_mask split_inner cache_modifier"
             ),
         )
         jobs = []
@@ -2379,6 +2382,7 @@ def launch_gemm_a8w4_tdm_optimized(
             pad=None,
             wg_mask=None,
             split_inner=False,
+            cache_modifier=0,
         ):
             jobs.append(
                 Job(
@@ -2396,6 +2400,7 @@ def launch_gemm_a8w4_tdm_optimized(
                     pad,
                     wg_mask,
                     split_inner,
+                    cache_modifier,
                 )
             )
 
@@ -2426,6 +2431,7 @@ def launch_gemm_a8w4_tdm_optimized(
             k_adv=PACK_TK * 16,
             wv=data_waves[1],
             wg_mask=b_mcast_mask,
+            cache_modifier=tdm_b_th,
         )
         add_tdm_loads(
             gSA_base,
@@ -2509,6 +2515,7 @@ def launch_gemm_a8w4_tdm_optimized(
                     # Descriptor bit 21: release to the peers already present and
                     # re-broadcast later, so early arrivals are not held for a merge.
                     early_timeout=j.wg_mask is not None,
+                    cache_modifier=j.cache_modifier,
                     **pad_kw,
                 )
                 if const_expr(j.wg_mask is not None):

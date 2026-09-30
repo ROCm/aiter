@@ -227,7 +227,6 @@ def flydsl_grouped_gemm_a8w4_masked(
         (
             enable_ep_scatter,
             bool(tdm_as_in_prologue),
-            bool(tdm_b_th),
             bool(row_major_ascale),
             bool(a_row_stride_bytes),
             bool(a_scale_row_stride_bytes),
@@ -270,6 +269,7 @@ def flydsl_grouped_gemm_a8w4_masked(
             cluster_m,
             next_stage_prefetch,
             waves_per_tensor_tdm,
+            _select_tdm_b_th(tdm_b_th),
         )
         return out
     ep_row_map_tensor = ep_row_map if ep_row_map is not None else out
