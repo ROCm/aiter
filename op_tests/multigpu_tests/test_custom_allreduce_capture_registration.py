@@ -27,6 +27,7 @@ from multiprocessing import Pool, freeze_support, set_start_method
 
 import torch
 
+from aiter.dist.utils import get_open_port
 from aiter.test_common import checkAllclose
 
 logger = logging.getLogger("aiter")
@@ -144,9 +145,11 @@ def _worker(tp_size, rankID, scenario, shape):
     }
 
 
-def test_capture_registration(tp_size, shape, scenario, port):
+def test_capture_registration(tp_size, shape, scenario):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
+    # Ask the OS for a free port: a fixed one can collide with another
+    # connection's ephemeral port on a busy runner (EADDRINUSE).
+    os.environ["MASTER_PORT"] = str(get_open_port())
     pool = Pool(processes=tp_size)
     rets = [
         pool.apply_async(_worker, args=(tp_size, i, scenario, shape))
@@ -231,10 +234,7 @@ if __name__ == "__main__":
 
     n_gpu = torch.cuda.device_count()
     tp_sizes = args.tp_size or [tp for tp in (2, 3, 4, 8) if tp <= n_gpu]
-    port = 49375
     for tp_size in tp_sizes:
         for scenario in args.scenario:
-            # A fresh port per run: the previous store may still hold its own.
-            ret = test_capture_registration(tp_size, (128, 8192), scenario, port)
-            port += 1
+            ret = test_capture_registration(tp_size, (128, 8192), scenario)
             print(f"tp_size={tp_size} scenario={scenario}: {ret}")
