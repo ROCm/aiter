@@ -3276,9 +3276,11 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
     // A placed launch (one TopkRowPlacement argument) takes the first half of
     // each group of `period` workgroups for consecutive rows; the rest exit
     // before touching LDS or memory.  Every row still maps to exactly one
-    // workgroup, whatever the hardware placement.  The division runs on VALU;
-    // readfirstlane keeps the row and the exit test scalar, so the row
-    // pointers stay in SGPRs.
+    // workgroup, whatever the hardware placement.  Which physical XCCs that
+    // first half lands on depends on the queue's round-robin start, and only
+    // the speed depends on it (see topk_oneblock_reg_placement).  The division
+    // runs on VALU; readfirstlane keeps the row and the exit test scalar, so
+    // the row pointers stay in SGPRs.
     int64_t batch_id = blockIdx.x;
     if constexpr(sizeof...(Placement) != 0)
     {
@@ -6932,15 +6934,23 @@ inline int topk_oneblock_num_xcd()
     return v;
 }
 
-// Workgroups are dealt to the XCDs round-robin in launch order, so a grid of at
-// least one row per XCD spreads over every XCD, and on MI355X such a launch
-// takes up to about 1 us longer than one that stays on half of them.  From one
-// row per XCD up to one row per CU of half the XCDs, place the rows on the
-// first half of every group of XCD-count workgroups; the other half exit at
-// once.  Correctness never depends on the placement; the speed-up does: it
-// relies on that round-robin dispatch and was validated only in SPX / NPS1
-// mode on MI355X.  With one XCD (CPX) or an unknown count, or outside that row
-// range, `rows` is 0 and the launch is unplaced.
+// XCD-subset placement.  On a cold dispatch (the launch reaches an idle GPU)
+// the XCDs do not start together: on MI355X, XCCs 0-3 start first and XCCs
+// 4-7 about 0.4-0.8 us later (1.0-1.4 us on a low-priority queue), and a
+// kernel ends with its latest-starting working XCD.  From one row per XCD up to
+// one row per CU of half the XCDs, place the rows on the first half of every
+// group of XCD-count workgroups; the other half exit at once.  Limits:
+//  - Workgroups go to the XCCs round-robin from a starting XCC that depends on
+//    the hardware queue, so "first half of each group" means XCCs 0-3 only on
+//    a queue that starts at XCC 0.  PyTorch's default stream does; other queues
+//    were seen starting at XCC 3, 5, 6 or 7, where most of the gain is lost.
+//  - Queued launches and HIP graphs start all XCDs together; there it is
+//    neutral.
+//  - Validated only in SPX / NPS1 mode on MI355X.
+// Correctness never depends on placement: each row maps to exactly one
+// workgroup.  Diagnosis: XCD start-skew report REPORT_XCD.md (2026-09-30).
+// With one XCD (CPX) or an unknown count, or outside that row range, `rows` is
+// 0 and the launch is unplaced.
 inline TopkRowPlacement topk_oneblock_reg_placement(int batch_size)
 {
     int const xcds = topk_oneblock_num_xcd();
