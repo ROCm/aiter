@@ -13,7 +13,7 @@ Minimal test suite for validating the aiter tuning infrastructure.
 | `test_mha_tuner_logic.py` | 1 | No | MHA forward tuner: problem keys, candidate enumeration, gating, runtime CSV, selection proof |
 | `test_mha_search_and_promotion.py` | 1 | No | MHA forward candidate sample, `--backends` restriction, skipping already-tuned shapes unless `--all`, and the gate against the incumbent |
 | `test_mha_store_agreement.py` | 1 | No | `aiter.ops.mha` and the Triton entry point resolve the same tile from one runtime CSV |
-| `test_mp_tuner_fault.py` | 2 | Yes | `mp_tuner` with one faulting candidate in a shape group: untyped callers get the whole group failed, `return_status` callers keep what was measured |
+| `test_mp_tuner_fault.py` | 2 | Yes | `mp_tuner` with a candidate that faults in-process or kills its worker: untyped callers get the whole group failed, `return_status` callers keep what was measured and see `not_run` behind the fault, and a shape queued behind a dead worker still finishes |
 | `test_tuning_policy.py` | 1 | No | `aiter/utility/tuning_policy.py`: measurement, run and promotion defaults reach `ARG_DEFAULTS`, policy validation, `gate_against_incumbent` boundaries |
 | `test_online_tune.py` | 1 | No | `AITER_ONLINE_TUNE` decision logic, `mp_lock` synchronization, MainFunc CSV write, cfg_2stages reload |
 | `test_tune_pipeline.py` | 2 | Yes | End-to-end: run each tuner on small shapes (mp=1 + mp=default), verify output CSV; `--compare --update_improved`; `AITER_ONLINE_TUNE` e2e |
@@ -24,7 +24,8 @@ Minimal test suite for validating the aiter tuning infrastructure.
 
 Fast deterministic tuning validation is part of the normal pull-request test
 sharding through `.github/scripts/split_tests.sh`. That gate includes CSV
-validation, shape-collision checks, and the mixed-MXFP tuner unit tests.
+validation, shape-collision checks, the mixed-MXFP tuner unit tests, the
+tuning policy, and the one-GPU `mp_tuner` fault and worker-death tests.
 
 The full Level 0+1 workflow repeats the broader CPU suite on its daily/manual
 schedule. GPU tuner-pipeline and all-shape `--run_config` validation remain
