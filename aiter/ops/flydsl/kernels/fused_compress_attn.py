@@ -16,8 +16,8 @@ Two kernel families share this file:
     online-softmax reduce, single dispatch. Parallelizes the serial softmax
     chain that bottlenecks the latency-bound small-N decode regime. On the
     CSA Main (D=512, BF16) and CSA Indexer (D=128, FP8/FP4) shapes it
-    auto-engages via ``csa_ksplit_num_waves(plan_capacity)`` and wins ~1.3-1.4×
-    (BF16) / ~1.15-1.24× (FP8) at decode bs=1-32; it falls back to legacy at
+    auto-engages via ``csa_ksplit_num_waves(plan_capacity)`` and wins ~1.3-1.4x
+    (BF16) / ~1.15-1.24x (FP8) at decode bs=1-32; it falls back to legacy at
     high N where CU occupancy already saturates. The K-split win comes from
     parallelizing the dtype-agnostic online-softmax pool, so FP4 reuses the
     FP8 wave-count heuristic. See ``flydsl_fused_compress_attn``'s
@@ -86,7 +86,7 @@ from aiter.utility.mx_types import (
     MxScaleRoundModeInt as _MxRoundInt,
 )
 
-# Shared FP8 group_fp8 (V4 nm-asm) scatter emitter (single source of truth across
+# Shared FP8 fp8_group (V4 nm-asm) scatter emitter (single source of truth across
 # the CSA single-kernel + HCA 2-kernel paths). See fused_compress_attn_common.
 from .fused_compress_attn_common import (
     _NEG_INF,
@@ -185,8 +185,8 @@ def _build_kernel(
     rms_weight_is_bf16: bool,
     rms_eps: float,
     enable_prefetch_input: bool = True,
-    # Single quant source of truth: "none" | "per_row_fp8" (indexer) |
-    # "group_fp8" (CSA/HCA Main nm-asm) | "fp4". `quant`/`quant_fp4`/`nm_asm`
+    # Single quant source of truth: "none" | "fp8_per_row" (indexer) |
+    # "fp8_group" (CSA/HCA Main nm-asm) | "fp4" | "fp4_gfx950_flydsl" | "fp4_gfx950_opus". `quant`/`quant_fp4`/`nm_asm`
     # are derived from it below.
     quant_mode: str = "none",
     quant_group_size: int = 64,
@@ -202,16 +202,16 @@ def _build_kernel(
       - overlap: True -> K = 2*RATIO (CSA), False -> K = RATIO (HCA, no overlap)
       - state_size: ring-buffer modulo of kv_state.shape[1] (>= K)
       - k_per_block: paged cache tokens per block (= block_size // ratio)
-      - has_block_table: False → skip cache scatter (warmup path)
+      - has_block_table: False -> skip cache scatter (warmup path)
       - quant_mode: single quant selector (the booleans below are derived):
-          "none"        → bf16 paged write (Main)            → quant=False
-          "per_row_fp8" → FP8 e4m3 per-row scale (Indexer)   → quant=True
-          "group_fp8"   → FP8 1xG group scale (Main nm-asm)  → quant=True, nm_asm
-          "fp4"         → FP4 (E2M1) per-group(32) e8m0 scale → quant=True, quant_fp4
+          "none"        -> bf16 paged write (Main)            -> quant=False
+          "fp8_per_row" -> FP8 e4m3 per-row scale (Indexer)   -> quant=True
+          "fp8_group"   -> FP8 1xG group scale (Main nm-asm)  -> quant=True, nm_asm
+          "fp4"         -> FP4 (E2M1) per-group(32) e8m0 scale -> quant=True, quant_fp4
       - use_ue8m0: only for fp8 (round scale to power-of-2); the FP4 path
         always uses the MX RoundUp e8m0 scale regardless.
       - preshuffle: only when quant (MFMA 16x16 tile / FP4 KV tile layout)
-      - enable_prefetch_input: True → Phase 2 carries k+1 loads through
+      - enable_prefetch_input: True -> Phase 2 carries k+1 loads through
         scf.for iter-args so the buffer_load issue overlaps current iter's
         softmax compute. Helps long K (HCA K=128). Larger VEC pays a register
         cost (loop-carry grows by 3*VEC fp32) -- gate off if it regresses.
@@ -232,11 +232,11 @@ def _build_kernel(
 
     # Derive the quant booleans from the single `quant_mode` source of truth.
     quant = quant_mode != "none"
-    quant_fp4 = quant_mode == "fp4"
-    # FP8 1xG e8m0 group-quant geometry (quant_mode=="group_fp8" only): nope region split
+    quant_fp4 = quant_mode in ("fp4", "fp4_gfx950_flydsl", "fp4_gfx950_opus")
+    # FP8 1xG e8m0 group-quant geometry (quant_mode=="fp8_group" only): nope region split
     # into N_GROUPS groups of quant_group_size; RTS lanes per group cooperate on amax via
     # shuffle_xor. Byte-identical to HCA Kernel B / C++ k_wave fp8.
-    nm_asm = quant_mode == "group_fp8"
+    nm_asm = quant_mode == "fp8_group"
     GROUP_SIZE_Q = quant_group_size
     RTS = (GROUP_SIZE_Q // VEC) if nm_asm else 1  # threads/group (=8 for G=64,VEC=8)
     log2_rts = int(math.log2(RTS)) if nm_asm else 0
@@ -259,7 +259,7 @@ def _build_kernel(
         # the FP8 cache reader consumes). Reject early.
         raise ValueError("quant=True requires has_block_table=True")
     if quant_fp4:
-        # FP4 KV preshuffle: k_tile = 128 elems → 4 groups of 32; data tile is
+        # FP4 KV preshuffle: k_tile = 128 elems -> 4 groups of 32; data tile is
         # [..., kv_block_size, 16] bytes (16 bytes = 32 fp4). Require D a
         # multiple of 128 and k_per_block a multiple of the 16-token tile.
         assert not (quant and not quant_fp4), "internal: fp4/fp8 are exclusive"
@@ -280,6 +280,8 @@ def _build_kernel(
         ("OVL" if overlap else "NOOVL"),
         f"SS{state_size}",
     ]
+    if quant_mode == "fp4_gfx950_opus":
+        _name_parts.append("opus_scale")
     if has_block_table:
         _name_parts.append(f"KB{k_per_block}")
         if quant:
@@ -454,7 +456,7 @@ def _build_kernel(
             # 4 GiB from its base; a state tensor whose slot stride is a
             # per-request arena entry (rather than the field's own size) spans
             # far more than that across all slots. Folding the slot term into
-            # the base — 64-bit pointer arithmetic, done once per program —
+            # the base -- 64-bit pointer arithmetic, done once per program --
             # leaves the offset covering a single entry.
             kv_state_buf = ptr_buf_tensor(
                 _ptr_at_byte_off(
@@ -828,7 +830,7 @@ def _build_kernel(
                             bf16_as_i32
                         )
                 elif const_expr(nm_asm):
-                    # -- group_fp8 (V4 nm-asm): nope fp8 + inline dup e8m0; rope bf16
+                    # -- fp8_group (V4 nm-asm): nope fp8 + inline dup e8m0; rope bf16
                     # -> separate k_rope_buff. Shared emitter (byte-identical to HCA). --
                     # The block term rides on each descriptor's base, not on
                     # the 32-bit offset -- see `block_base_bytes_i64`.
@@ -859,7 +861,7 @@ def _build_kernel(
                         wave_width=BLOCK_THREADS,
                     )
                 elif const_expr(not quant_fp4):
-                    # ── QUANT=1: FP8 per-row scaled write + fp32 scale ──
+                    # -- QUANT=1: FP8 per-row scaled write + fp32 scale --
                     # Steps:
                     #   (a) per-lane amax over VEC values, wave-reduce-max
                     #   (b) scale = amax / FP8_MAX (with safety floor); for
@@ -1040,12 +1042,12 @@ def _build_kernel(
                         )
                         fx.add_offset(fx.get_iter(cs_buf), slot_in_block).store(scale_v)
                 else:
-                    # ── QUANT=1, FP4: per-group(32) e8m0 scale + E2M1 write ──
+                    # -- QUANT=1, FP4: per-group(32) e8m0 scale + E2M1 write --
                     # Mirrors dsv4_rotate_quant.cu's FP4 KV writer + the shared
                     # FlyDSL IR builders (emit_mx_e8m0_scale / emit_f32_to_e2m1,
                     # used by silu_and_mul_fq). Each group of 32 elements shares
                     # one e8m0 byte; NTG = 32//VEC lanes cooperate per group.
-                    #   (a) per-lane amax over VEC → group-reduce-max over NTG
+                    #   (a) per-lane amax over VEC -> group-reduce-max over NTG
                     #   (b) e8m0 = ceil_pow2(amax/6) (MX RoundUp); quant_scale =
                     #       (254 - e8m0) << 23
                     #   (c) per-element E2M1 nibble, pack VEC/2 bytes
@@ -1056,7 +1058,7 @@ def _build_kernel(
                     PACKED_BYTES = VEC // 2
                     K_TILES = D // _FP4_K_TILE
                     KVBS = k_per_block
-                    # smallest-normal * fp4_max floor — guards all-zero groups,
+                    # smallest-normal * fp4_max floor -- guards all-zero groups,
                     # matches dsv4_rotate_quant.cu eps_amax (bit-exact w/ ref).
                     c_eps_amax = fx.Float32(6.0 * float.fromhex("0x1p-126"))
 
@@ -1172,10 +1174,20 @@ def _build_kernel(
                             cs_off = slot_in_block * (D // _FP4_GROUP_SIZE) + fx.Int32(
                                 scale_group_idx
                             )
+                        if const_expr(quant_mode == "fp4_gfx950_opus"):
+                            # [group%2, slot%32, group/2, slot/32] -> [2,32,4].
+                            sg = fx.Uint32(scale_group_idx)
+                            opus_slot = fx.Uint32(slot_in_block)
+                            cs_off = fx.Int32(
+                                (sg % 2) * 128
+                                + (opus_slot % 32) * 4
+                                + (sg // 2) * 2
+                                + opus_slot // 32
+                            )
                         fx.add_offset(fx.get_iter(cs_buf), cs_off).store(
                             fx.Int32(e8m0).to(fx.Int8)
                         )  # e8m0 uint8
-            # else: warmup — no scatter, just consume compute.
+            # else: warmup -- no scatter, just consume compute.
 
         if fx.Int32(position) >= 0:
             _body()
@@ -1285,8 +1297,8 @@ def _build_kernel_ksplit(
     preshuffle: bool,
     rms_weight_is_bf16: bool,
     rms_eps: float,
-    # Single quant source of truth: "none" | "per_row_fp8" | "group_fp8" | "fp4".
-    # `quant`/`quant_fp4`/`nm_asm` are derived below. group_fp8 (nm-asm) and fp4
+    # Single quant source of truth: "none" | "fp8_per_row" | "fp8_group" | "fp4" | "fp4_gfx950_flydsl" | "fp4_gfx950_opus".
+    # `quant`/`quant_fp4`/`nm_asm` are derived below. fp8_group (nm-asm) and fp4
     # are both K-split-capable (nm-asm on the CSA Main shape; fp4 on the indexer).
     quant_mode: str = "none",
     quant_group_size: int = 64,
@@ -1295,7 +1307,7 @@ def _build_kernel_ksplit(
     scatter (BF16, FP8, or FP4). Constexpr knobs mirror :func:`_build_kernel`
     minus ``enable_prefetch_input`` (each wave runs so few iters that prefetch
     is moot). The FP8 / FP4 / ue8m0 / preshuffle scatter is emitted in wave 0,
-    where ``lid`` (0..63) plays the single-wave ``tid`` role — pair-coop
+    where ``lid`` (0..63) plays the single-wave ``tid`` role -- pair-coop
     shuffle_xor and _wave_reduce_max stay within wave 0's 64 lanes, identical
     to the legacy kernel's semantics.
 
@@ -1321,15 +1333,15 @@ def _build_kernel_ksplit(
 
     # Derive the quant booleans from the single `quant_mode` source of truth.
     quant = quant_mode != "none"
-    quant_fp4 = quant_mode == "fp4"
+    quant_fp4 = quant_mode in ("fp4", "fp4_gfx950_flydsl", "fp4_gfx950_opus")
 
     ROPE_THREAD_LO = NOPE // VEC
     PAIRS_PER_THREAD = VEC // 2
 
-    # FP8 group_fp8 (V4 nm-asm) geometry: nope split into groups of
+    # FP8 fp8_group (V4 nm-asm) geometry: nope split into groups of
     # GROUP_SIZE_Q; RTS lanes/group cooperate on amax. Scatter reuses the
     # shared emitter (byte-identical to legacy / HCA). See _build_kernel.
-    nm_asm = quant_mode == "group_fp8"
+    nm_asm = quant_mode == "fp8_group"
     GROUP_SIZE_Q = quant_group_size
     RTS = (GROUP_SIZE_Q // VEC) if nm_asm else 1
     log2_rts = int(math.log2(RTS)) if nm_asm else 0
@@ -1377,6 +1389,8 @@ def _build_kernel_ksplit(
         f"KB{k_per_block}",
         f"KS{NW}",
     ]
+    if quant_mode == "fp4_gfx950_opus":
+        _name_parts.append("opus_scale")
     if quant:
         _name_parts.append("Q")
         if nm_asm:
@@ -1462,7 +1476,7 @@ def _build_kernel_ksplit(
 
             kv_in_buf = ptr_buf_tensor(fx.get_iter(kv_in), fx.Int32)
             score_in_buf = ptr_buf_tensor(fx.get_iter(score_in), fx.Int32)
-            # Rebased onto this program's slot — see `state_slot_byte_offset`.
+            # Rebased onto this program's slot -- see `state_slot_byte_offset`.
             kv_state_buf = ptr_buf_tensor(
                 _ptr_at_byte_off(
                     kv_state, state_slot_byte_offset(slot, kv_state_slot_stride)
@@ -1748,7 +1762,7 @@ def _build_kernel_ksplit(
                             bf16_as_i32
                         )
                 elif const_expr(nm_asm):
-                    # -- group_fp8 (V4 nm-asm): nope fp8 + inline dup e8m0; rope
+                    # -- fp8_group (V4 nm-asm): nope fp8 + inline dup e8m0; rope
                     # bf16 -> separate k_rope_buff. Shared emitter, byte-identical
                     # to the legacy single-wave / HCA paths (lane == wave-0 lid). --
                     # The block term rides on each descriptor's base, not on
@@ -1780,7 +1794,7 @@ def _build_kernel_ksplit(
                         wave_width=BLOCK_THREADS,
                     )
                 elif const_expr(not quant_fp4):
-                    # ── FP8 per-row scaled write + fp32 scale (mirror legacy) ──
+                    # -- FP8 per-row scaled write + fp32 scale (mirror legacy) --
                     # Wave-reduce-max over wave 0's 64 lanes; pair-coop dword
                     # store via shuffle_xor(1) within the wave.
                     _, fp8_max = _fp8_const()
@@ -1912,12 +1926,12 @@ def _build_kernel_ksplit(
                         )
                         fx.add_offset(fx.get_iter(cs_buf), slot_in_block).store(scale_v)
                 else:
-                    # ── FP4: per-group(32) e8m0 scale + E2M1 write (mirror
+                    # -- FP4: per-group(32) e8m0 scale + E2M1 write (mirror
                     # legacy _build_kernel). Emitted in wave 0 where ``lid``
                     # (0..63) is the single-wave ``tid`` equivalent; the
                     # butterfly group-reduce over NTG lanes stays within wave
                     # 0's 64 physical lanes. ``lid_x_vec`` replaces the legacy
-                    # ``tid_x_vec``. See _build_kernel for the full rationale. ──
+                    # ``tid_x_vec``. See _build_kernel for the full rationale. --
                     lid_x_vec_i = lid_x_vec
                     NTG = _FP4_GROUP_SIZE // VEC
                     LOG2_NTG = int(math.log2(NTG))
@@ -2032,6 +2046,16 @@ def _build_kernel_ksplit(
                         else:
                             cs_off = slot_in_block * (D // _FP4_GROUP_SIZE) + fx.Int32(
                                 scale_group_idx
+                            )
+                        if const_expr(quant_mode == "fp4_gfx950_opus"):
+                            # [group%2, slot%32, group/2, slot/32] -> [2,32,4].
+                            sg = fx.Uint32(scale_group_idx)
+                            opus_slot = fx.Uint32(slot_in_block)
+                            cs_off = fx.Int32(
+                                (sg % 2) * 128
+                                + (opus_slot % 32) * 4
+                                + (sg // 2) * 2
+                                + opus_slot // 32
                             )
                         fx.add_offset(fx.get_iter(cs_buf), cs_off).store(
                             fx.Int32(e8m0).to(fx.Int8)
@@ -2168,7 +2192,7 @@ def compile_flydsl_fused_compress_attn(
     rms_weight_is_bf16: bool,
     rms_eps: float,
     enable_prefetch_input: bool = True,
-    # "none" | "per_row_fp8" | "group_fp8" | "fp4" (single quant selector).
+    # "none" | "fp8_per_row" | "fp8_group" | "fp4" | "fp4_gfx950_flydsl" | "fp4_gfx950_opus" (single quant selector).
     quant_mode: str = "none",
     quant_group_size: int = 64,
 ):
@@ -2232,7 +2256,7 @@ def compile_flydsl_fused_compress_attn_ksplit(
     preshuffle: bool,
     rms_weight_is_bf16: bool,
     rms_eps: float,
-    # "none" | "per_row_fp8" | "group_fp8" | "fp4" (single quant selector).
+    # "none" | "fp8_per_row" | "fp8_group" | "fp4" | "fp4_gfx950_flydsl" | "fp4_gfx950_opus" (single quant selector).
     quant_mode: str = "none",
     quant_group_size: int = 64,
 ):
@@ -2280,13 +2304,13 @@ def flydsl_fused_compress_attn(
     use_ue8m0: bool = True,
     preshuffle: bool = True,
     # Master quant selector; overrides the legacy `quant` bool. Accepts:
-    #   "none" | "fp8"/"per_row_fp8" (indexer) | "group_fp8" (CSA/HCA Main
-    #   nm-asm) | "fp4". None -> derive from `quant` ("per_row_fp8" if quant).
+    #   "none" | "fp8"/"fp8_per_row" (indexer) | "fp8_group" (CSA/HCA Main
+    #   nm-asm) | "fp4" | "fp4_gfx950_flydsl" | "fp4_gfx950_opus". None -> derive from `quant` ("fp8_per_row" if quant).
     quant_mode: str | None = None,
     k_split_num_waves: int | None = None,
     k_rope_cache: (
         torch.Tensor | None
-    ) = None,  # group_fp8 only: paged [NB, k_per_block, RD] bf16 rope
+    ) = None,  # fp8_group only: paged [NB, k_per_block, RD] bf16 rope
     stream: torch.cuda.Stream | None = None,
 ) -> None:
     """FlyDSL drop-in replacement for ``fused_compress_attn`` (Triton).
@@ -2297,11 +2321,20 @@ def flydsl_fused_compress_attn(
 
     ``quant_mode`` selects the scatter quantization (default derived from the
     legacy ``quant`` bool: ``"fp8" if quant else "none"``):
-      - ``"none"`` → BF16 paged write (CSA / HCA Main).
-      - ``"fp8"``  → FP8 e4m3 per-row e8m0 scale + MFMA 16x16 preshuffle.
-      - ``"fp4"``  → FP4 (E2M1) per-group(32) e8m0 scale + FP4 KV preshuffle
-        (``kv_cache`` uint8 [NB, k_tiles, 4, k_per_block, 16];
-        ``cache_scale`` uint8 [NB, k_tiles, 4, k_per_block]).
+      - ``"none"`` -> BF16 paged write (CSA / HCA Main).
+      - ``"fp8_per_row"`` (alias ``"fp8"``) -> per-row FP8 with E8M0-rounded scale.
+      - ``"fp8_group"`` -> group FP8 main-cache data with inline E8M0 scales
+        and a separate BF16 RoPE cache.
+      - ``"fp4"`` -> natural FP4 E2M1 rows [NB, page, D/2] and
+        per-group(32) E8M0 scales [NB, page, D/32], without shuffle.
+      - ``"fp4_gfx950_flydsl"`` -> packed KV [NB, D/128, 4, page, 16]
+        and FlyDSL scales [NB, D/128, 4, page].
+      - ``"fp4_gfx950_opus"`` -> packed KV [NB,4,64,16] and OPUS MFMA
+        scales [NB,2,32,4], requiring D=128 and page=64 on gfx950.
+
+    FP4 modes determine both layouts independently of ``preshuffle``;
+    that legacy argument controls FP8 only. Single-wave and K-split writers
+    emit the selected layout directly. gfx1250 supports natural ``"fp4"``.
 
     ``k_split_num_waves`` (BF16, FP8, or FP4 scatter): when set to NW > 1, routes
     to the multi-wave LDS K-split kernel (block = 64*NW, K split across NW waves,
@@ -2316,27 +2349,43 @@ def flydsl_fused_compress_attn(
     """
     # ---- resolve quant mode (quant_mode overrides the legacy `quant` bool) ----
     #   "none"        -> bf16 paged write
-    #   "per_row_fp8" -> FP8 e4m3 per-row scale (indexer)        [alias "fp8"]
-    #   "group_fp8"   -> FP8 1xG group scale (CSA/HCA Main nm-asm)
+    #   "fp8_per_row" -> FP8 e4m3 per-row scale (indexer)        [alias "fp8"]
+    #   "fp8_group"   -> FP8 1xG group scale (CSA/HCA Main nm-asm)
     #   "fp4"         -> FP4 (E2M1) per-group(32) e8m0 scale
+    #   "fp4_gfx950_opus"    -> FP4 with gfx950 OPUS scale permutation
     _mode = (
-        quant_mode if quant_mode is not None else ("per_row_fp8" if quant else "none")
+        quant_mode if quant_mode is not None else ("fp8_per_row" if quant else "none")
     )
     if _mode == "fp8":
-        _mode = "per_row_fp8"  # back-compat alias
-    if _mode not in ("none", "per_row_fp8", "group_fp8", "fp4"):
+        _mode = "fp8_per_row"  # back-compat alias
+    if _mode not in (
+        "none",
+        "fp8_per_row",
+        "fp8_group",
+        "fp4",
+        "fp4_gfx950_flydsl",
+        "fp4_gfx950_opus",
+    ):
         raise ValueError(
-            f"quant_mode must be none|fp8|per_row_fp8|group_fp8|fp4, got {_mode!r}"
+            f"quant_mode must be none|fp8|fp8_per_row|fp8_group|fp4|fp4_gfx950_flydsl|fp4_gfx950_opus, got {_mode!r}"
         )
     _quant = _mode != "none"
-    _fp4 = _mode == "fp4"
-    # `_mode` (none|per_row_fp8|group_fp8|fp4) is the single selector passed
+    _fp4 = _mode in ("fp4", "fp4_gfx950_flydsl", "fp4_gfx950_opus")
+    if _fp4:
+        # The mode owns both data and scale layout; legacy preshuffle is FP8-only.
+        preshuffle = _mode != "fp4"
+    if _mode == "fp4_gfx950_opus" and (head_dim != 128 or k_per_block != 64):
+        raise ValueError("quant_mode=fp4_gfx950_opus requires D=128, page=64")
+    # `_mode` (none|fp8_per_row|fp8_group|fp4|fp4_gfx950_flydsl|fp4_gfx950_opus) is the single selector passed
     # straight to the builders, which derive quant/quant_fp4/nm_asm from it.
 
     # ---- gfx1250 dispatch (wave32) ----
     from aiter.jit.utils.chip_info import get_gfx as _get_gfx
 
-    if _get_gfx() == "gfx1250":
+    arch = _get_gfx()
+    if _mode in ("fp4_gfx950_flydsl", "fp4_gfx950_opus") and arch != "gfx950":
+        raise ValueError(f"quant_mode={_mode!r} requires gfx950, got {arch}")
+    if arch == "gfx1250":
         from .fused_compress_attn_gfx1250 import flydsl_fused_compress_attn_gfx1250
 
         return flydsl_fused_compress_attn_gfx1250(
@@ -2373,8 +2422,8 @@ def flydsl_fused_compress_attn(
     if plan_capacity == 0:
         return
 
-    # group_fp8 (V4 nm-asm group-quant): non-preshuffle, separate bf16 rope buffer.
-    nm_asm = _mode == "group_fp8"
+    # fp8_group (V4 nm-asm group-quant): non-preshuffle, separate bf16 rope buffer.
+    nm_asm = _mode == "fp8_group"
     if nm_asm:
         preshuffle = False
 
@@ -2405,7 +2454,7 @@ def flydsl_fused_compress_attn(
     if kv_state.dtype != torch.float32 or score_state.dtype != torch.float32:
         raise TypeError("kv_state/score_state must be fp32")
     # Slot and ring strides are passed to the kernel and the descriptor is
-    # rebased per slot, so the states may be strided views — a per-request
+    # rebased per slot, so the states may be strided views -- a per-request
     # arena hands out a view whose slot stride is a whole entry. Only the
     # innermost dim must be unit stride: the kernel addresses it as
     # `col_off + lane`.
@@ -2450,7 +2499,7 @@ def flydsl_fused_compress_attn(
         if not has_bt:
             raise ValueError("quant requires block_tables")
         if not _fp4:
-            # FP8 path (per_row_fp8, or group_fp8/nm_asm which carries its own
+            # FP8 path (fp8_per_row, or fp8_group/nm_asm which carries its own
             # inline e8m0 scale layout -> no separate 2D cache_scale).
             if kv_cache.dtype == torch.bfloat16:
                 raise TypeError("fp8 quant needs fp8 kv_cache")
@@ -2482,6 +2531,15 @@ def flydsl_fused_compress_attn(
                 raise ValueError("fp4 quant requires uint8 e8m0 cache_scale")
             if cache_scale.shape[0] != kv_cache.shape[0]:
                 raise ValueError("fp4 cache_scale NB must match kv_cache NB")
+            if _mode == "fp4_gfx950_opus" and (
+                tuple(kv_cache.shape[1:]) != (4, 64, 16)
+                or tuple(cache_scale.shape[1:]) != (2, 32, 4)
+                or not kv_cache.is_contiguous()
+                or not cache_scale.is_contiguous()
+            ):
+                raise ValueError(
+                    "OPUS requires packed KV [NB,4,64,16], scale [NB,2,32,4]"
+                )
             if head_dim % _FP4_K_TILE != 0:
                 raise ValueError(f"fp4 requires head_dim%128==0, got {head_dim}")
             if head_dim % _FP4_GROUP_SIZE != 0:
@@ -2529,7 +2587,7 @@ def flydsl_fused_compress_attn(
         bt_seq_stride = block_tables.stride(0)
         kv_cache_arg = kv_cache
         # FP4 store derives byte offsets from constants (k_tiles/group/tile),
-        # not these strides — bind the outer block stride for completeness.
+        # not these strides -- bind the outer block stride for completeness.
         kv_cache_block_stride = kv_cache.stride(0)
         kv_cache_token_stride = kv_cache.stride(1) if not _fp4 else 0
     else:
@@ -2554,7 +2612,7 @@ def flydsl_fused_compress_attn(
     if nm_asm:
         if not _quant:
             raise ValueError(
-                "quant_mode='group_fp8' requires quant=True (fp8 kv_cache)"
+                "quant_mode='fp8_group' requires quant=True (fp8 kv_cache)"
             )
         if (
             k_rope_cache is None
@@ -2562,7 +2620,7 @@ def flydsl_fused_compress_attn(
             or k_rope_cache.dim() != 3
         ):
             raise ValueError(
-                "quant_mode='group_fp8' requires bf16 [NB, k_per_block, RD] k_rope_cache"
+                "quant_mode='fp8_group' requires bf16 [NB, k_per_block, RD] k_rope_cache"
             )
         krope_arg = k_rope_cache
         krope_block_stride = k_rope_cache.stride(0)
@@ -2573,8 +2631,8 @@ def flydsl_fused_compress_attn(
         krope_token_stride = 0
 
     # ---- K-split fast path (BF16 + FP8 + FP4 scatter) ----
-    # k_split_num_waves: None ⟹ auto-pick (tuned geometries only); int>1 ⟹
-    # forced NW; 1 ⟹ forced legacy. Auto triggers for the CSA Main (BF16),
+    # k_split_num_waves: None ? auto-pick (tuned geometries only); int>1 ?
+    # forced NW; 1 ? forced legacy. Auto triggers for the CSA Main (BF16),
     # CSA Indexer (FP8), and CSA Indexer (FP4) shapes the K-split kernel
     # supports; other shapes fall through to the legacy single-wave kernel.
     _is_csa_main = (
@@ -2589,20 +2647,16 @@ def flydsl_fused_compress_attn(
         and rope_head_dim == 64
         and ratio == 4
         and overlap
-        and _mode == "per_row_fp8"
+        and _mode == "fp8_per_row"
     )
     # FP4 indexer: same compress geometry as the FP8 indexer (D=128, RD=64,
     # ratio=4, overlap), only the scatter dtype differs. The K-split win comes
     # from parallelizing the dtype-agnostic online-softmax pool, so the FP8
     # wave-count heuristic carries over.
     _is_csa_indexer_fp4 = (
-        head_dim == 128
-        and rope_head_dim == 64
-        and ratio == 4
-        and overlap
-        and _mode == "fp4"
+        head_dim == 128 and rope_head_dim == 64 and ratio == 4 and overlap and _fp4
     )
-    # group_fp8 (nm-asm) CSA Main shares the CSA Main geometry (D=512, K=8); it is
+    # fp8_group (nm-asm) CSA Main shares the CSA Main geometry (D=512, K=8); it is
     # ported to the K-split kernel via the shared nm-asm scatter emitter.
     _is_csa_main_nm = (
         head_dim == 512
@@ -2641,7 +2695,7 @@ def flydsl_fused_compress_attn(
             preshuffle=preshuffle,
             rms_weight_is_bf16=_rms_weight_is_bf16,
             rms_eps=float(rms_eps),
-            quant_mode=_mode,  # resolved: none|per_row_fp8|group_fp8|fp4
+            quant_mode=_mode,
             quant_group_size=64,
         )
         if stream is None:
@@ -2692,7 +2746,7 @@ def flydsl_fused_compress_attn(
         preshuffle=preshuffle,
         rms_weight_is_bf16=_rms_weight_is_bf16,
         rms_eps=float(rms_eps),
-        quant_mode=_mode,  # single selector: none|per_row_fp8|group_fp8|fp4
+        quant_mode=_mode,
         quant_group_size=64,
     )
 
