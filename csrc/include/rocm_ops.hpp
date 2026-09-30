@@ -1379,6 +1379,21 @@ namespace py = pybind11;
           py::arg("num_shared_experts")         = 0,                           \
           py::arg("shared_expert_scoring_func") = "",                          \
           "Apply topk softmax to the gating outputs.");                        \
+    m.def("topk_softmax_fused_shared_gate",                                     \
+          &aiter::topk_softmax_fused_shared_gate,                               \
+          py::arg("topk_weights"),                                             \
+          py::arg("topk_indices"),                                             \
+          py::arg("token_expert_indices"),                                     \
+          py::arg("gating_output"),                                            \
+          py::arg("need_renorm"),                                              \
+          py::arg("num_shared_experts"),                                       \
+          py::arg("shared_expert_scoring_func"),                               \
+          py::arg("hidden_states"),                                            \
+          py::arg("gate_weight"),                                              \
+          py::arg("shared_expert_scale")        = 1.0f,                        \
+          py::arg("shared_expert_base")         = -1,                          \
+          "Apply topk softmax with in-kernel shared-expert gate GEMV "         \
+          "(Option A fuse-gate).");                                            \
     m.def("grouped_topk",                                                      \
           &grouped_topk,                                                       \
           py::arg("gating_output"),                                            \
