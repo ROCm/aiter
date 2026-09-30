@@ -8,6 +8,16 @@ from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a8w8_a_per_token
     _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_kernel,
     _get_config,
 )
+from aiter.ops.triton.utils._triton.arch_info import get_arch
+
+_GLUON_SUPPORTED_ARCHS = ("gfx1250",)
+
+
+def _is_gluon_available():
+    try:
+        return any(supported in get_arch() for supported in _GLUON_SUPPORTED_ARCHS)
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
@@ -22,6 +32,7 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
     transpose_bm: bool | None = False,
     transpose_bm_in: bool | None = False,
     config: dict | None = None,
+    backend: str | None = None,
 ):
     """
     Computes batched 8 bit matrix multiplication Y[i] = X[i] @ W[i]^T with active activation quantization.
@@ -41,6 +52,10 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
         transpose_bm (Optional[bool]): Transpose batch and M dimensions in output.
         transpose_bm_in (Optional[bool]): Transpose batch and M dimensions in input.
         config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M).
+        backend (Optional[str]): "triton", "gluon", or None (auto: gluon on gfx1250
+            when supported). The gluon path (gfx1250) keeps X in bf16 and upcasts WQ
+            to bf16 in registers instead of quantizing X per token-group, so it is
+            at least as accurate; it does not support bias.
 
     Returns:
         torch.Tensor: Output batch with shape (B, M, N) or (M, B, N) if transpose_bm=True.
@@ -66,6 +81,28 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
         torch.float16,
     ], f"Output {dtype=} is currently not supported in batched_gemm_a8w8"
     assert splitK is None, "Currently, there isn't any support for splitK on Triton"
+
+    if backend is None:
+        backend = (
+            "gluon"
+            if _is_gluon_available()
+            and bias is None
+            and X.stride(2) == 1
+            and WQ.stride(2) == 1
+            and X.dtype in (torch.bfloat16, torch.float16)
+            else "triton"
+        )
+    if backend == "gluon":
+        from aiter.ops.triton.gemm.batched.batched_gemm_a16w8 import (
+            batched_gemm_a16w8,
+        )
+
+        assert bias is None, "gluon backend does not support bias"
+        X_bmk = X.transpose(0, 1) if transpose_bm_in else X
+        return batched_gemm_a16w8(
+            X_bmk, WQ, w_scale, dtype=dtype, YQ=YQ, transpose_bm=transpose_bm
+        )
+    assert backend == "triton", f"Unknown backend '{backend}'"
 
     WQ = WQ.transpose(1, 2)
 

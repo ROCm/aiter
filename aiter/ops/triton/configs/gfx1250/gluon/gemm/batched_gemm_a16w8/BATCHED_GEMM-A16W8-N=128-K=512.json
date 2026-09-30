@@ -1,0 +1,62 @@
+{
+    "M_LEQ_64": {
+        "BLOCK_SIZE_M": 64,
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 256,
+        "num_warps": 4,
+        "NUM_BUFFERS": 2,
+        "WG_PER_CU": 2,
+        "STORE_MODE": 1,
+        "C_PAD": 16
+    },
+    "M_LEQ_256": {
+        "BLOCK_SIZE_M": 128,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 128,
+        "num_warps": 4,
+        "NUM_BUFFERS": 2,
+        "WG_PER_CU": 1,
+        "STORE_MODE": 2,
+        "C_PAD": 16
+    },
+    "M_LEQ_512": {
+        "BLOCK_SIZE_M": 256,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 128,
+        "num_warps": 4,
+        "NUM_BUFFERS": 2,
+        "WG_PER_CU": 1,
+        "STORE_MODE": 2,
+        "C_PAD": 16
+    },
+    "M_LEQ_1024": {
+        "BLOCK_SIZE_M": 256,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 128,
+        "num_warps": 4,
+        "NUM_BUFFERS": 2,
+        "WG_PER_CU": 1,
+        "STORE_MODE": 2,
+        "C_PAD": 16
+    },
+    "M_LEQ_2048": {
+        "BLOCK_SIZE_M": 256,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 128,
+        "num_warps": 4,
+        "NUM_BUFFERS": 2,
+        "WG_PER_CU": 1,
+        "STORE_MODE": 2,
+        "C_PAD": 16
+    },
+    "any": {
+        "BLOCK_SIZE_M": 256,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 128,
+        "num_warps": 4,
+        "NUM_BUFFERS": 3,
+        "WG_PER_CU": 1,
+        "STORE_MODE": 1,
+        "C_PAD": 16
+    }
+}
