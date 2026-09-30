@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Runtime correctness and timing for FlyDSL quick all-reduce (``QuickAllReduceInt4``).
+"""Runtime correctness and timing for FlyDSL quick all-reduce (``FlyQuickAllReduce``).
 
 A default run covers what production dispatch can run on this host, and each
 sweep ends in a markdown table:
@@ -48,7 +48,7 @@ floor.
 
 The kernels see a flat payload, so the derived shapes use one width, 4096,
 whose rows land exactly on every policy and ladder boundary.
-QuickAllReduceInt4 runs on gfx942/gfx950 at TP in {2, 4, 8}; other archs skip,
+FlyQuickAllReduce runs on gfx942/gfx950 at TP in {2, 4, 8}; other archs skip,
 and ``main()`` skips a world size when fewer GPUs are visible than TP.
 """
 
@@ -79,17 +79,17 @@ set_start_method("spawn", force=True)
 
 from aiter.ops.flydsl import allreduce_policy as fly_policy
 from aiter.ops.flydsl.kernels.quick_allreduce_codec import SUPPORTED_BLOCKS
-from aiter.ops.flydsl.kernels.quick_allreduce_int4 import (
+from aiter.ops.flydsl.kernels.quick_allreduce_mesh import (
     clamp_grid_cap,
     mesh_st_ladder,
 )
-from aiter.ops.flydsl.kernels.quick_allreduce_int4_ring import ring_st_ladder
+from aiter.ops.flydsl.kernels.quick_allreduce_ring import ring_st_ladder
 from aiter.ops.flydsl.kernels.quick_allreduce_shared import (
     ATOMS,
     DEFAULT_GRID_CAP,
     SUPPORTED_WORLDS,
 )
-from aiter.ops.flydsl.quick_allreduce_int4 import (
+from aiter.ops.flydsl.quick_allreduce import (
     _resolve_inbox_flags,
     batches_publishes,
 )
@@ -318,7 +318,7 @@ def _expected_cfg(
     block: int | None = None,
     skip_self: bool | None = None,
 ) -> tuple[int, int, bool]:
-    """Mirror of ``QuickAllReduceInt4._pick_cfg``: the ``(super_tile, block,
+    """Mirror of ``FlyQuickAllReduce._pick_cfg``: the ``(super_tile, block,
     skip_self)`` kernel an engine with no super-tile pinned runs *nbytes* on.
     *block* and *skip_self* are the overrides the engine was built with,
     ``None`` for the rung's own.
@@ -583,7 +583,7 @@ def _run_rank(
     """
     import torch.distributed as dist
 
-    from aiter.ops.flydsl import QuickAllReduceInt4
+    from aiter.ops.flydsl import FlyQuickAllReduce
 
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
@@ -594,12 +594,12 @@ def _run_rank(
         rank=rank,
         device_id=device,
     )
-    # QuickAllReduceInt4 exchanges IPC metadata over a non-NCCL group; NCCL
+    # FlyQuickAllReduce exchanges IPC metadata over a non-NCCL group; NCCL
     # stays for the fp32 reference all-reduce.
     gloo = dist.new_group(backend="gloo")
     group = dist.group.WORLD
 
-    fly = QuickAllReduceInt4(
+    fly = FlyQuickAllReduce(
         group=gloo,
         device=device,
         rank=rank,
@@ -1055,7 +1055,7 @@ def _summarize(name: str, rows: list[dict]) -> None:
 
 def main():
     if ARCH not in SUPPORTED_ARCHS:
-        aiter.logger.warning("QuickAllReduceInt4 unsupported on %s; skipping", ARCH)
+        aiter.logger.warning("FlyQuickAllReduce unsupported on %s; skipping", ARCH)
         return
     n_gpu = torch.cuda.device_count()
 
@@ -1153,7 +1153,7 @@ def main():
     algos = args.algorithm
     dts = [d for d in args.dtype if d == dtypes.bf16]
     if len(dts) != len(args.dtype):
-        aiter.logger.warning("QuickAllReduceInt4 payload is bf16; skipping others")
+        aiter.logger.warning("FlyQuickAllReduce payload is bf16; skipping others")
 
     if args.mnk is not None:
         for mnk in args.mnk:
@@ -1317,7 +1317,7 @@ def main():
 
     if _FAILURES:
         raise SystemExit(
-            f"{len(_FAILURES)} QuickAllReduceInt4 check(s) failed:\n  "
+            f"{len(_FAILURES)} FlyQuickAllReduce check(s) failed:\n  "
             + "\n  ".join(_FAILURES)
         )
 

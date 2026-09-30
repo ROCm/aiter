@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""gfx942/gfx950 TP∈{2,4,8} INT4 **mesh** all-reduce.
+"""gfx942/gfx950 TP∈{2,4,8} INT4/INT5/INT6 **mesh** all-reduce.
 
 Topology of each lap: every rank pushes directly to all ``N-1`` peers, twice.
 
-INT4 nibble: [-8,+7], −1/8, 4 B/thread, 1152 B rank-tile. Scale is
+INT4 nibble: [-8,+7], −1/8, 4 B/thread, 1152 B rank-tile. INT5 adds a 1-bit
+plane (1408 B) and INT6 a 2-bit plane (1664 B) at block=256. Scale is
 group-16 signed E4M3 in the 128 B region. Super-tile ST∈{1,8}; host
 uses ST=1 when ``num_tiles ≤`` the occupancy-clamped persistent grid.
 Payload HBM is bf16; in-kernel math is packed fp16. Each rank owns
@@ -85,7 +86,7 @@ __all__ = [
     "TILE_BYTES",
     "WORLD",
     "clamp_grid_cap",
-    "make_quick_allreduce_int4_kernel",
+    "make_quick_allreduce_mesh_kernel",
     "mesh_st_ladder",
 ]
 
@@ -179,10 +180,10 @@ def mesh_st_ladder(world_size: int, link: str = "pcie"):
 
 
 # Wire formats the mesh can build.
-MESH_CODECS = ("int4", "fp16")
+MESH_CODECS = ("int4", "int5", "int6", "fp16")
 
 
-def make_quick_allreduce_int4_kernel(
+def make_quick_allreduce_mesh_kernel(
     *,
     world_size: int = WORLD,
     super_tile: int = 1,
@@ -272,7 +273,7 @@ def make_quick_allreduce_int4_kernel(
     flags_i32 = PHASES * grid * world_size
 
     @flyc.kernel(known_block_size=[block, 1, 1])
-    def quick_allreduce_int4(
+    def quick_allreduce_mesh(
         rank: Int32,
         nbytes: Int64,
         num_tiles: Int32,
@@ -693,7 +694,7 @@ def make_quick_allreduce_int4_kernel(
     flat_wg = f"{block},{block}"
 
     @flyc.jit
-    def launch_quick_allreduce_int4(
+    def launch_quick_allreduce_mesh(
         rank: Int32,
         nbytes: Int64,
         num_tiles: Int32,
@@ -704,7 +705,7 @@ def make_quick_allreduce_int4_kernel(
         grid_x: Int32,
         stream: Stream = Stream(None),  # noqa: B008
     ):
-        quick_allreduce_int4(
+        quick_allreduce_mesh(
             rank,
             nbytes,
             num_tiles,
@@ -726,13 +727,13 @@ def make_quick_allreduce_int4_kernel(
         # ``_r<n>_`` is the rank field the bench's variant comparison already
         # collapses before checking that the ranks agree.
         tag += f"_r{self_rank}_ss"
-    launch_quick_allreduce_int4.func.__name__ = f"launch_quick_allreduce_int4_{tag}"
+    launch_quick_allreduce_mesh.func.__name__ = f"launch_quick_allreduce_mesh_{tag}"
     try:
-        quick_allreduce_int4.func.__name__ = f"quick_allreduce_int4_{tag}"
+        quick_allreduce_mesh.func.__name__ = f"quick_allreduce_mesh_{tag}"
     except AttributeError:
         pass
     return {
-        "launch": launch_quick_allreduce_int4,
+        "launch": launch_quick_allreduce_mesh,
         "flags_bytes": flags_i32 * 4,
         "data_bytes": PHASES * grid * world_size * wire_tile_bytes,
         "lds_bytes": lds_bytes,

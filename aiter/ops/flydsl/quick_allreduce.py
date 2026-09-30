@@ -3,15 +3,16 @@
 
 """Host launch for gfx942/gfx950 TP∈{2,4,8} INT4/INT6 all-reduce.
 
-Public type ``QuickAllReduceInt4``, with two interchangeable schedules selected
+Public type ``FlyQuickAllReduce``, with two interchangeable schedules selected
 by ``algorithm``. Both are two-shot -- reduce-scatter then all-gather -- so
 they are named for the topology of each lap instead:
 
 * ``"mesh"`` the default: fanout to all N-1 peers, twice.
 * ``"ring"`` 2(N-1) single-destination hops.
 
-Super-tile ST∈{1,8} on the mesh, ST∈{1,8,16,32} on the ring. INT4 nibble or
-INT6 bit-plane pair, both with group-16 E4M3 scales. Payload HBM is bf16.
+Super-tile ST∈{1,8} on the mesh, ST∈{1,8,16,32} on the ring. INT4 nibble,
+INT5 nibble+1-bit plane, or INT6 bit-plane pair, all with group-16 E4M3
+scales. INT5 is mesh-only. Payload HBM is bf16.
 
 Two more tuning knobs ride every ladder rung: ``block`` (threads per workgroup,
 which sets the tile) and, on the mesh only, ``skip_self`` (no round trip through
@@ -41,18 +42,18 @@ from .allreduce_shared import (
     payload_probes,
 )
 from .kernels.quick_allreduce_codec import SUPPORTED_BLOCKS
-from .kernels.quick_allreduce_int4 import (
+from .kernels.quick_allreduce_mesh import (
     MESH_CODECS,
     SUPER_TILES,
     clamp_grid_cap,
-    make_quick_allreduce_int4_kernel,
+    make_quick_allreduce_mesh_kernel,
     mesh_st_ladder,
 )
-from .kernels.quick_allreduce_int4_ring import (
+from .kernels.quick_allreduce_ring import (
     AG_CODECS,
     RING_SUPER_TILES,
     RS_CODECS,
-    make_quick_allreduce_int4_ring_kernel,
+    make_quick_allreduce_ring_kernel,
     ring_st_ladder,
 )
 from .kernels.quick_allreduce_shared import (
@@ -71,7 +72,7 @@ logger = logging.getLogger("aiter")
 MIN_PAYLOAD_BYTES = 128 << 10
 
 # Floor on the block count when batching publishes into super-tiles; see
-# ``QuickAllReduceInt4._grid_x``. Shrinking the grid trades parallelism for
+# ``FlyQuickAllReduce._grid_x``. Shrinking the grid trades parallelism for
 # fewer release fences, which is only a good trade once there are enough fences
 # to matter.
 _MIN_BATCH_BLOCKS = 32
@@ -83,7 +84,7 @@ _MIN_BATCH_BLOCKS = 32
 # ``allreduce_policy.FAMILY_POLICY``, whose ``mesh_max`` these mirror; the
 # numbers come from the same fit.
 #
-# This is only the *standalone* guard rail -- what ``QuickAllReduceInt4``
+# This is only the *standalone* guard rail -- what ``FlyQuickAllReduce``
 # refuses below when someone constructs one directly with ``algorithm="ring"``.
 # Production dispatch does not consult it; the FlyDSL backend inside
 # ``QuickAllReduce`` owns the real boundary via ``allreduce_policy.resolve_quant``,
@@ -100,7 +101,7 @@ _RING_DEFAULT_MIN_PAYLOAD_BYTES = 12 << 20
 class _Algorithm:
     """One all-reduce schedule, plus the host-side policy that tunes it.
 
-    Everything ``QuickAllReduceInt4`` does *around* the kernel -- IPC setup,
+    Everything ``FlyQuickAllReduce`` does *around* the kernel -- IPC setup,
     payload validation, one engine per super-tile, launch -- is identical
     across schedules and stays on the class. What differs is which kernel
     factory to call, which super-tile values and wire formats that factory
@@ -134,7 +135,7 @@ class _Algorithm:
 
     # ``(world_size, link) -> ((min_payload_bytes, super_tile, grid_cap,
     # block, skip_self), ...)``, ascending. When the caller did not pin
-    # ``super_tile``, ``QuickAllReduceInt4`` builds an engine per rung and
+    # ``super_tile``, ``FlyQuickAllReduce`` builds an engine per rung and
     # selects by payload size at launch.
     #
     # Keyed on world size because the rungs genuinely move with it: publishes
@@ -146,6 +147,8 @@ class _Algorithm:
     st_ladder: Callable[[int, str], tuple] | None = None
     # Whether the schedule has a round trip through its own inbox to skip.
     supports_skip_self: bool = False
+    # Mesh carries one format on both laps. The ring may differ.
+    single_codec: bool = False
 
     def ladder_for(self, world_size: int, link: str = "pcie") -> tuple:
         """Rungs for *(link, world_size)*; ``()`` when there is no ladder."""
@@ -171,7 +174,7 @@ def _build_mesh(
             f"mesh algorithm has one wire format for both laps, got "
             f"rs_codec={rs_codec!r} != ag_codec={ag_codec!r}"
         )
-    return make_quick_allreduce_int4_kernel(
+    return make_quick_allreduce_mesh_kernel(
         world_size=world_size,
         super_tile=super_tile,
         grid=grid,
@@ -189,7 +192,7 @@ def _build_ring(*, skip_self, **kw):
             "skip_self does not apply to the ring: it never writes its own "
             "inbox, so there is no round trip to skip"
         )
-    return make_quick_allreduce_int4_ring_kernel(**kw)
+    return make_quick_allreduce_ring_kernel(**kw)
 
 
 ALGORITHMS = {
@@ -204,6 +207,7 @@ ALGORITHMS = {
         default_super_tile=8,
         st_ladder=mesh_st_ladder,
         supports_skip_self=True,
+        single_codec=True,
     ),
     "ring": _Algorithm(
         name="ring",
@@ -239,9 +243,25 @@ def _resolve_codecs(algo, world_size, rs_codec, ag_codec):
     downgrade, not a restatement of the default.
 
     A codec the selected schedule cannot build raises. The per-N *default*
-    silently narrows to what the schedule supports -- the mesh has no INT6
-    path, so TP8's INT6 reduce-scatter default does not leak into it.
+    silently narrows to what the schedule supports. The mesh is single-codec
+    and stays on INT4 unless a caller names another format.
     """
+    if algo.single_codec:
+        if rs_codec is not None and ag_codec is not None and rs_codec != ag_codec:
+            raise ValueError(
+                f"{algo.name} algorithm carries one wire format, got "
+                f"rs_codec={rs_codec!r} != ag_codec={ag_codec!r}"
+            )
+        chosen = rs_codec if rs_codec is not None else ag_codec
+        if chosen is None:
+            chosen = "int4"
+        if chosen not in algo.rs_codecs:
+            raise ValueError(
+                f"rs_codec must be one of {algo.rs_codecs} for "
+                f"algorithm={algo.name!r}, got {chosen!r}"
+            )
+        return chosen, chosen
+
     rs_default = "int6" if world_size >= _RS_INT6_MIN_WORLD else "int4"
 
     # The all-gather lap forwards bytes verbatim and so contributes exactly one
@@ -267,7 +287,7 @@ def _resolve_codecs(algo, world_size, rs_codec, ag_codec):
 
 
 def batches_publishes(inbox_memory: str, algorithm: str, link: str) -> bool:
-    """Whether ``QuickAllReduceInt4`` batches publishes by default.
+    """Whether ``FlyQuickAllReduce`` batches publishes by default.
 
     Always with a release fence, where every publish is an L2 writeback. The
     PCIe ring batches without one too: each of its ``2(N-1)`` hops ends in a
@@ -276,8 +296,8 @@ def batches_publishes(inbox_memory: str, algorithm: str, link: str) -> bool:
     return has_release_fence(inbox_memory) or (algorithm == "ring" and link == "pcie")
 
 
-class QuickAllReduceInt4:
-    """IPC inbox + flag buffer and launch wrapper for ``quick_allreduce_int4``.
+class FlyQuickAllReduce:
+    """IPC inbox + flag buffer and launch wrapper for ``quick_allreduce_mesh``.
 
     Requires a non-NCCL, single-node process group for IPC metadata exchange.
 
@@ -385,7 +405,7 @@ class QuickAllReduceInt4:
         arch = get_gfx_runtime()
         if arch not in _SUPPORTED_ARCHS:
             raise RuntimeError(
-                f"QuickAllReduceInt4 supports {', '.join(_SUPPORTED_ARCHS)}, got {arch}"
+                f"FlyQuickAllReduce supports {', '.join(_SUPPORTED_ARCHS)}, got {arch}"
             )
         cap = DEFAULT_GRID_CAP if grid_cap is None else int(grid_cap)
         if cap < 1:
@@ -613,11 +633,11 @@ class QuickAllReduceInt4:
 
     def _check_payload(self, inp, out) -> int:
         if not isinstance(inp, torch.Tensor) or not isinstance(out, torch.Tensor):
-            raise TypeError("QuickAllReduceInt4 requires torch.Tensor input/output")
+            raise TypeError("FlyQuickAllReduce requires torch.Tensor input/output")
         if inp.dtype != torch.bfloat16 or out.dtype != torch.bfloat16:
-            raise ValueError("QuickAllReduceInt4 supports bf16 input/output")
+            raise ValueError("FlyQuickAllReduce supports bf16 input/output")
         if not inp.is_cuda or not out.is_cuda:
-            raise ValueError("QuickAllReduceInt4 requires CUDA tensors")
+            raise ValueError("FlyQuickAllReduce requires CUDA tensors")
         if (
             inp.device.index != self._device_index
             or out.device.index != self._device_index
@@ -627,22 +647,22 @@ class QuickAllReduceInt4:
                 f"got {inp.device} / {out.device}"
             )
         if not inp.is_contiguous() or not out.is_contiguous():
-            raise ValueError("QuickAllReduceInt4 requires contiguous input/output")
+            raise ValueError("FlyQuickAllReduce requires contiguous input/output")
         inp_ptr = int(inp.data_ptr())
         out_ptr = int(out.data_ptr())
         if inp_ptr % 16 != 0 or out_ptr % 16 != 0:
-            raise ValueError("QuickAllReduceInt4 requires 16-byte-aligned input/output")
+            raise ValueError("FlyQuickAllReduce requires 16-byte-aligned input/output")
         live_bytes = int(inp.numel()) * int(inp.element_size())
         if live_bytes > 0xFFFFFFFF:
             raise ValueError(
-                "QuickAllReduceInt4 payload must not exceed the 4 GiB buffer window"
+                "FlyQuickAllReduce payload must not exceed the 4 GiB buffer window"
             )
         if live_bytes % 16 != 0:
             raise ValueError("byte size must be a multiple of 16 (8 bf16)")
         if int(out.numel()) * int(out.element_size()) != live_bytes:
             raise ValueError("inp/out byte size mismatch")
         if max(inp_ptr, out_ptr) < min(inp_ptr + live_bytes, out_ptr + live_bytes):
-            raise ValueError("QuickAllReduceInt4 requires non-overlapping input/output")
+            raise ValueError("FlyQuickAllReduce requires non-overlapping input/output")
         return live_bytes
 
     def _launch_args(
@@ -750,7 +770,7 @@ class QuickAllReduceInt4:
         live_bytes = self._check_payload(inp, out)
         if not self.is_beneficial(live_bytes):
             raise ValueError(
-                f"QuickAllReduceInt4.allreduce got a {live_bytes} B payload, "
+                f"FlyQuickAllReduce.allreduce got a {live_bytes} B payload, "
                 f"below the {self.min_bytes} B floor: at decode sizes this "
                 "kernel saves a few microseconds on a collective that is not "
                 "the bottleneck, and charges ~36 dB of SQNR for them. Route "
