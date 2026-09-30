@@ -108,7 +108,11 @@ def _ds_write2st64_b64(addr, data0, data1, offset0=0, offset1=16):
 
 
 def _launch_config(
-    rows: int, n_sel: int, n_kv_heads: int, head_dim: int
+    rows: int,
+    n_sel: int,
+    n_kv_heads: int,
+    head_dim: int,
+    tiny_splits: int = _TINY_SPLITS,
 ) -> tuple[int, int, int]:
     """Return ``(BLOCK_N, threads, splits)`` using the tuned policy."""
     base_programs = rows * n_kv_heads
@@ -119,7 +123,7 @@ def _launch_config(
         _DECODE_BANDS_NARROW if head_dim <= _NARROW_HEAD_DIM else _DECODE_BANDS_WIDE
     )
     if base_programs <= tiny_max:
-        block_n, target_splits, threads = 16, _TINY_SPLITS, _DECODE_THREADS
+        block_n, target_splits, threads = 16, tiny_splits, _DECODE_THREADS
     elif base_programs <= mid_max:
         block_n, target_splits, threads = 16, 64, _DECODE_THREADS
     elif base_programs < 32:
