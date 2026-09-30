@@ -252,6 +252,23 @@ def wave_size_of(device_index: int | None = None) -> int:
     return get_warp_size(torch.cuda.get_device_properties(device_index).gcnArchName)
 
 
+def check_e8m0(
+    scale: torch.Tensor, name: str, owner: str, shape: tuple[int, ...] | None = None
+) -> None:
+    """Validate an e8m0 scale operand: e8m0/uint8 storage, contiguous, and
+    ``shape`` when given. ``owner`` prefixes the error, e.g. "FlyDSL gfx950 bmm"."""
+    from aiter.utility import dtypes
+
+    if shape is not None and tuple(scale.shape) != shape:
+        raise RuntimeError(
+            f"[{owner}] {name} must have shape {shape}, got {tuple(scale.shape)}"
+        )
+    if scale.dtype not in (dtypes.fp8_e8m0, torch.uint8):
+        raise RuntimeError(f"[{owner}] {name} must be e8m0/uint8, got {scale.dtype}")
+    if not scale.is_contiguous():
+        raise RuntimeError(f"[{owner}] {name} must be contiguous")
+
+
 def ptr_arg(t: torch.Tensor, dtype=None):
     """Wrap a torch.Tensor as an fx.Pointer (PointerJitArg) for kernel launch."""
     if dtype is None:
@@ -263,17 +280,11 @@ def ptr_arg(t: torch.Tensor, dtype=None):
     return flyc.from_c_void_p(dtype, t.data_ptr())
 
 
-def _run_compiled(exe, *args):
-    """First call: ``flyc.compile(exe, *args)`` compiles **and** executes the kernel.
-    Subsequent calls: fast dispatch via the cached ``CompiledFunction``.
-    """
-    cf = getattr(exe, "_cf", None)
-    if cf is not None:
-        cf(*args)
-        return
+def _compile_and_run(exe, *args):
+    """``flyc.compile(exe, *args)``: compiles **and** executes the kernel, and
+    returns its ``CompiledFunction`` (None under compile-only)."""
     try:
-        cf = flyc.compile(exe, *args)
-        exe._cf = cf
+        return flyc.compile(exe, *args)
     except Exception:
         # flyc.compile leaks ir.Context on failure; pop it so a retry takes the right path.
         try:
@@ -282,6 +293,17 @@ def _run_compiled(exe, *args):
         except Exception:  # noqa: BLE001, S110
             pass
         raise
+
+
+def _run_compiled(exe, *args):
+    """First call: ``flyc.compile(exe, *args)`` compiles **and** executes the kernel.
+    Subsequent calls: fast dispatch via the cached ``CompiledFunction``.
+    """
+    cf = getattr(exe, "_cf", None)
+    if cf is not None:
+        cf(*args)
+        return
+    exe._cf = _compile_and_run(exe, *args)
 
 
 def _preload_compiled(exe, *args):

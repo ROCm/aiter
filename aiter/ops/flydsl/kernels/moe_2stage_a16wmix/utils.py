@@ -94,12 +94,12 @@ def _cvt_pk_bf16_f32_se(src_a_f32, src_b_f32):
     )
 
 
-def _int4_nibble_to_bf16x8(raw_i32, scale_f32, *, use_k16=False, old_pack=False):
+def _int4_nibble_to_bf16x8(raw_i32, scale_f32, *, is_gfx942=False, old_pack=False):
     """int4 (signed) -> bf16 upconvert for one MFMA K32 step (8 nibbles -> v8bf16).
 
     ``raw_i32`` holds 8 signed-int4 nibbles. ``v_cvt_off_f32_i4`` reads the nibble
     unsigned, subtracts 8, and scales the mantissa by 16, so the x16 is folded into
-    ``eff = scale*16``. ``use_k16`` (gfx942): pack two f32 high-16s into a bf16
+    ``eff = scale*16``. ``is_gfx942``: pack two f32 high-16s into a bf16
     pair with lshr-16 (no ``v_cvt_pk_bf16_f32`` on this arch).
 
     ``old_pack`` (a16wi4 consuming the OLD FlyDSL kernel's weight preshuffle,
@@ -113,7 +113,7 @@ def _int4_nibble_to_bf16x8(raw_i32, scale_f32, *, use_k16=False, old_pack=False)
     eff = scale_f32 * fx.Float32(16.0)
     raw_even = fx.Int32(raw_i32)
     raw_odd = raw_even.shrui(fx.Int32(4))
-    if use_k16:
+    if is_gfx942:
         # gfx942: pack two f32 high-16s into a bf16 pair. Exact for scaled int4.
         los = []
         his = []
@@ -189,9 +189,9 @@ def _bf16_frag4(v8, half):
     return t
 
 
-def _mma_bf16(mma_atom, use_k16, acc, a8, b8):
-    """One K32 MFMA from v8bf16 A/B fragments; gfx942 (use_k16) splits it into 2x K16."""
-    if const_expr(use_k16):
+def _mma_bf16(mma_atom, is_gfx942, acc, a8, b8):
+    """One K32 MFMA from v8bf16 A/B fragments; gfx942 splits it into 2x K16."""
+    if const_expr(is_gfx942):
         for h in range_constexpr(2):
             fx.gemm(mma_atom, acc, _bf16_frag4(a8, h), _bf16_frag4(b8, h), acc)
     else:
@@ -258,7 +258,7 @@ def make_a_loader(
                              entirely -- stage2 has a single, unslotted A region.
       * ``a_load_threads``   threads cooperating on one tile (< 256 when k_wave > 1
                              splits the block into per-k-group loader sets).
-      * ``dma_via_vgpr``     gfx942 (use_k16) staging fallback, see below.
+      * ``dma_via_vgpr``     gfx942 staging fallback, see below.
     """
     elem_bytes = 2  # bf16
     # Per-thread A gather: each thread moves 16 B (v8bf16) per pass.
@@ -392,6 +392,87 @@ class _BLoader(NamedTuple):
     upconvert: Callable  # upconvert(raw, ku, scale) -> v8bf16 MMA operand
 
 
+# FP4 (E2M1) -> bf16 byte-lookup decode, for architectures without
+# v_cvt_scalef32_pk_bf16_fp4 (i.e. everything before gfx950).
+#
+# Every E2M1 magnitude is exactly representable in bf16, so the 16-entry table is a byte
+# permute over two constant pools selected by ``nibble & 7``; the sign is the nibble's
+# bit 3 shifted into bf16 bit 15. That avoids reconstructing each value through an f32 --
+# two compares and two selects for the subnormal cases, then a full cvt including a NaN
+# check E2M1 can never trigger.
+_FP4_MAG_HI_LO = 0x3F3F3F00  # bf16 high bytes for nibble&7 = 0,1,2,3
+_FP4_MAG_HI_HI = 0x40404040  # bf16 high bytes for nibble&7 = 4,5,6,7
+_FP4_MAG_LO_LO = 0xC0800000  # bf16 low bytes  for nibble&7 = 0,1,2,3
+_FP4_MAG_LO_HI = 0xC0804000  # bf16 low bytes  for nibble&7 = 4,5,6,7
+
+
+def _fp4_perm(src_hi, src_lo, sel):
+    """v_perm_b32: result byte i = pool[sel.byte(i)], pool = {src_hi:src_lo}.
+
+    Selector bytes 0..3 index src_lo bytes 0..3, selector bytes 4..7 index src_hi.
+    """
+    return fx.Int32(
+        rocdl.perm_b32(_raw(fx.Int32(src_hi)), _raw(fx.Int32(src_lo)), _raw(sel))
+    )
+
+
+def _fp4_mag_dwords(raw_i32):
+    """Decode 8 FP4 nibbles to 4 dwords, each holding 2 bf16, scale not applied.
+
+    ``raw_i32`` holds 8 nibbles in bits[4n+3:4n], the same K order as the gfx950
+    ``sel 0..3`` path, so element j lands in dword j//2 half j%2 and the MMA operand
+    layout is unchanged.
+    """
+    raw = fx.Int32(raw_i32)
+    # Magnitude selectors, one per byte. v_perm only honours selector values 0..7, so
+    # the sign bit is masked off here and folded back into the high byte below.
+    sel_even = raw & fx.Int32(0x07070707)  # low nibble of each byte -> elements 0,2,4,6
+    sel_odd = raw.shrui(fx.Int32(4)) & fx.Int32(0x07070707)  # -> elements 1,3,5,7
+
+    hb_even = _fp4_perm(_FP4_MAG_HI_HI, _FP4_MAG_HI_LO, sel_even)
+    lb_even = _fp4_perm(_FP4_MAG_LO_HI, _FP4_MAG_LO_LO, sel_even)
+    hb_odd = _fp4_perm(_FP4_MAG_HI_HI, _FP4_MAG_HI_LO, sel_odd)
+    lb_odd = _fp4_perm(_FP4_MAG_LO_HI, _FP4_MAG_LO_LO, sel_odd)
+
+    # Sign: nibble bit 3 -> bf16 bit 15, i.e. bit 7 of the high byte.
+    hb_even = hb_even | ((raw & fx.Int32(0x08080808)) << fx.Int32(4))
+    hb_odd = hb_odd | (raw & fx.Int32(0x80808080))
+
+    # dword d = [lb_even[d], hb_even[d], lb_odd[d], hb_odd[d]].
+    ev01 = _fp4_perm(hb_even, lb_even, fx.Int32(0x05010400))  # bf16 of elements 0 and 2
+    od01 = _fp4_perm(hb_odd, lb_odd, fx.Int32(0x05010400))  # elements 1 and 3
+    ev23 = _fp4_perm(hb_even, lb_even, fx.Int32(0x07030602))  # elements 4 and 6
+    od23 = _fp4_perm(hb_odd, lb_odd, fx.Int32(0x07030602))  # elements 5 and 7
+    return [
+        _fp4_perm(od01, ev01, fx.Int32(0x05040100)),
+        _fp4_perm(od01, ev01, fx.Int32(0x07060302)),
+        _fp4_perm(od23, ev23, fx.Int32(0x05040100)),
+        _fp4_perm(od23, ev23, fx.Int32(0x07060302)),
+    ]
+
+
+def _fp4_nibble_to_bf16x8(raw_i32, scale_f32):
+    """FP4 (E2M1) -> v8bf16 for one MFMA K32 step, with the groupwise scale applied.
+
+    Same result as the gfx950 ``cvt_scalef32_pk_bf16_fp4`` path in
+    :func:`make_b_loader`. The magnitudes come from the byte lookup; the E8M0 scale is a
+    power of two, so the product stays exactly representable in bf16 and the f32 -> bf16
+    step is a truncation, not a round-to-nearest. bf16 <-> f32 is just a 16-bit shift, so
+    each half is scaled in place without unpacking to a vector.
+    """
+    scale = fx.Float32(scale_f32)
+    out = []
+    for d in _fp4_mag_dwords(raw_i32):
+        lo_f = fx.Float32(_raw(d << fx.Int32(16)).bitcast(T.f32))
+        hi_f = fx.Float32(_raw(d & fx.Int32(0xFFFF0000)).bitcast(T.f32))
+        lo_b = fx.Int32(_raw(lo_f * scale).bitcast(T.i32)).shrui(fx.Int32(16))
+        hi_b = fx.Int32(_raw(hi_f * scale).bitcast(T.i32)) & fx.Int32(0xFFFF0000)
+        out.append(lo_b | hi_b)
+    return fx.Vector.from_elements([_raw(x) for x in out], fx.Int32).bitcast(
+        fx.BFloat16
+    )
+
+
 def make_b_loader(
     arg_bq,
     arg_bscale,
@@ -405,7 +486,7 @@ def make_b_loader(
     TILE_K,
     w_dtype,
     b_cache_mod,
-    use_k16,
+    rocm_arch,
 ):
     """Build the shared B (weight) operand path for gemm1 and gemm2.
 
@@ -428,10 +509,13 @@ def make_b_loader(
     here rather than inline in the kernel body does not perturb instruction order.
 
     Cache-key note: FlyDSL hashes this factory's source (not nested helpers).
-    gfx942 a16wi4 W upconvert is lshr-16 bf16 pack in ``_int4_nibble_to_bf16x8``.
+    On gfx942 the a16wi4 W upconvert is the lshr-16 bf16 pack in
+    ``_int4_nibble_to_bf16x8``; a16wfp4 uses ``_fp4_nibble_to_bf16x8`` instead of
+    ``v_cvt_scalef32_pk_bf16_fp4``.
     """
     _is_int4 = w_dtype == "int4"
     _is_bf16 = w_dtype == "bf16"
+    _is_gfx942 = str(rocm_arch).startswith("gfx942")
     # Emitted before the layouts/resources below: this is where the stages used to
     # compute it, and the ISA is sensitive to the order operands are materialized in.
     expert_off = e * fx.Int32(N_OUT)
@@ -723,8 +807,11 @@ def make_b_loader(
         i32_val = _raw(raw[ku // 4][ku % 4])
         if const_expr(_is_int4):
             return _int4_nibble_to_bf16x8(
-                fx.Int32(i32_val), scale_f32, use_k16=use_k16, old_pack=True
+                fx.Int32(i32_val), scale_f32, is_gfx942=_is_gfx942, old_pack=True
             )
+        if const_expr(_is_gfx942):
+            # gfx942: no v_cvt_scalef32_pk_bf16_fp4; decode E2M1 via v_perm_b32.
+            return _fp4_nibble_to_bf16x8(fx.Int32(i32_val), scale_f32)
         # raw[ku//4][ku%4] i32 holds 8 fp4 -> 4x cvt (v2bf16, sel 0..3) -> v8bf16.
         s_raw = _raw(scale_f32)
         i32s = []
