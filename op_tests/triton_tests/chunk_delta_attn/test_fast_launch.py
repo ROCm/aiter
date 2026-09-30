@@ -20,8 +20,8 @@ that produces. So the tests here are about the key, not about speed:
 import pytest
 import torch
 
-from aiter.ops.triton._triton_kernels.chunk_delta_attn import fast_launch
-from aiter.ops.triton._triton_kernels.chunk_delta_attn.flash_kda import flash_kda_fwd
+from aiter.ops.triton._triton_kernels.kimi_delta_attn import fast_launch
+from aiter.ops.triton._triton_kernels.kimi_delta_attn.flash_kda import flash_kda_fwd
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="flash_kda needs a GPU"
@@ -122,11 +122,11 @@ def test_a_second_shape_does_not_reuse_the_first_entry():
 
 def _wrapped():
     """Every fast_launch-wrapped kernel the pipeline can reach."""
-    from aiter.ops.triton._gluon_kernels.gfx950.chunk_delta_attn import (
+    from aiter.ops.triton._gluon_kernels.gfx950.kimi_delta_attn import (
         flash_kda_k1,
         flash_kda_k2,
     )
-    from aiter.ops.triton._triton_kernels.chunk_delta_attn import flash_kda as fk
+    from aiter.ops.triton._triton_kernels.kimi_delta_attn import flash_kda as fk
 
     candidates = (
         fk._prepare_fast,
