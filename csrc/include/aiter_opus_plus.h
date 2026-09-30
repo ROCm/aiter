@@ -74,15 +74,19 @@ OPUS_D decltype(auto) fp32_to_fp8_scaled_x4(const S& s, float inverted_scale)
     return fp8x4_t{lo[0], lo[1], hi[0], hi[1]};
 }
 
-// bf16x8 -> fp8x8 with scalef32 (gfx1250: v_cvt_scalef32_pk8_fp8_bf16, 1 instr)
-// Scale semantics: result[i] = bf16[i] / scale (hardware divides, with saturation to ±448).
+// bf16x8 / fp16x8 -> fp8x8 with scalef32 (gfx1250: v_cvt_scalef32_pk8_fp8_{bf16,f16}, 1 instr)
+// Scale semantics: result[i] = s[i] / scale. Finite overflow is not saturated.
 // The caller's inverted_scale = 1/row_scale, so we pass 1/inverted_scale = row_scale.
 #if defined(__gfx1250__)
-template <typename S, std::enable_if_t<std::is_same_v<S, bf16x8_t>, bool> = true>
-OPUS_D decltype(auto) bf16_to_fp8_scalef32_x8(const S& s, float scale)
+template <typename S, std::enable_if_t<is_any_of_v<S, bf16x8_t, fp16x8_t>, bool> = true>
+OPUS_D decltype(auto) to_fp8_scalef32_x8(const S& s, float scale)
 {
     typedef int __attribute__((ext_vector_type(2))) i2;
-    i2 r = __builtin_amdgcn_cvt_scalef32_pk8_fp8_bf16(s, scale);
+    i2 r;
+    if constexpr(std::is_same_v<S, bf16x8_t>)
+        r = __builtin_amdgcn_cvt_scalef32_pk8_fp8_bf16(s, scale);
+    else
+        r = __builtin_amdgcn_cvt_scalef32_pk8_fp8_f16(s, scale);
     return __builtin_bit_cast(vector_t<fp8_t, 8>, r);
 }
 #endif
@@ -605,7 +609,7 @@ OPUS_D decltype(auto) scaled_cast(const S& s, float inverted_scale)
 #if defined(__gfx1250__)
 template <typename D,
           typename S,
-          std::enable_if_t<is_vector_v<S> && std::is_same_v<get_value_t<S>, bf16_t> &&
+          std::enable_if_t<is_vector_v<S> && is_any_of_v<get_value_t<S>, bf16_t, fp16_t> &&
                                std::is_same_v<D, fp8_t> && (size<S>() % 8 == 0),
                            bool> = true>
 OPUS_D decltype(auto) scaled_cast_div(const S& s, float scale)
@@ -613,9 +617,9 @@ OPUS_D decltype(auto) scaled_cast_div(const S& s, float scale)
     constexpr index_t N = size<S>();
     vector_t<fp8_t, N> out;
     static_for<N / 8>([&](auto i) {
-        bf16x8_t chunk;
+        vector_t<get_value_t<S>, 8> chunk;
         static_for<8>([&](auto j) { chunk[j.value] = s[i.value * 8 + j.value]; });
-        auto pk = bf16_to_fp8_scalef32_x8(chunk, scale);
+        auto pk = to_fp8_scalef32_x8(chunk, scale);
         static_for<8>([&](auto j) { out[i.value * 8 + j.value] = pk[j.value]; });
     });
     return out;
@@ -626,7 +630,7 @@ OPUS_D decltype(auto) scaled_cast_div(const S& s, float scale)
 template <typename D,
           typename S,
 #if defined(__gfx1250__)
-          std::enable_if_t<!(is_vector_v<S> && std::is_same_v<get_value_t<S>, bf16_t> &&
+          std::enable_if_t<!(is_vector_v<S> && is_any_of_v<get_value_t<S>, bf16_t, fp16_t> &&
                              std::is_same_v<D, fp8_t> && (size<S>() % 8 == 0)),
                            bool> = true>
 #else
