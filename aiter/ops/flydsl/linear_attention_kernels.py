@@ -8,12 +8,14 @@ from __future__ import annotations
 import collections
 import functools
 
+import flydsl.expr as fx
 import torch
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.runtime.device import get_rocm_arch
 
 from aiter.ops.triton.utils.device_info import get_num_sms
 
+from .kernels.gdn_decode_verify import create_gdn_decode_verify_kernel
 from .kernels.gdr_decode import (
     MTP_MODE_CHAIN,
     MTP_MODE_SNAPSHOT,
@@ -23,6 +25,7 @@ from .kernels.gdr_decode import (
 from .kernels.tensor_shim import _run_compiled, get_dtype_str
 
 __all__ = [
+    "flydsl_gdn_decode_varlen",
     "flydsl_gdr_decode",
     "flydsl_gdr_mtp",
     "flydsl_gdr_mtp_sglang",
@@ -1067,3 +1070,168 @@ def flydsl_gdr_mtp_sglang(
         disable_state_update=disable_state_update,
         stream=stream,
     )
+
+
+_GDN_VARLEN_VITER4_MIN_DRAFT = 4
+_GDN_VARLEN_VITER4_BLOCKS_PER_CU = 1.5
+_GDN_VARLEN_VITER2_BLOCKS_PER_CU = 12.0
+
+
+def _gdn_varlen_viter(n, tokens_per_seq, num_v_heads, head_v_dim, ksplit, block):
+    """Widest v-iteration this launch's grid can pay for.
+
+    A VITER that does not divide the head width is skipped rather than rounded,
+    since the kernel would refuse it.
+    """
+    vlanes = block // ksplit
+    num_sms = get_num_sms()
+    draft = max(1, tokens_per_seq)
+
+    def blocks(viter):
+        vtile = vlanes * viter
+        if head_v_dim % vtile:
+            return None
+        return n * num_v_heads * (head_v_dim // vtile)
+
+    wide = blocks(4)
+    if (
+        draft >= _GDN_VARLEN_VITER4_MIN_DRAFT
+        and wide is not None
+        and wide >= _GDN_VARLEN_VITER4_BLOCKS_PER_CU * num_sms
+    ):
+        return 4
+    mid = blocks(2)
+    if mid is not None and mid >= (_GDN_VARLEN_VITER2_BLOCKS_PER_CU / draft) * num_sms:
+        return 2
+    return 1
+
+
+def flydsl_gdn_decode_varlen(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    state: torch.Tensor,
+    state_indices: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    scale: float | None = None,
+    softplus_beta: float = 1.0,
+    softplus_threshold: float = 20.0,
+    disable_state_update: bool = False,
+    intermediate_states: torch.Tensor | None = None,
+    intermediate_state_indices: torch.Tensor | None = None,
+    ksplit: int = 8,
+    block: int = 256,
+    viter: int | None = None,
+) -> torch.Tensor:
+    """Gated Delta Net decode recurrence over a packed (varlen) batch.
+
+    Unlike :func:`flydsl_gdr_decode` this takes the layout a serving stack hands
+    over during speculative decoding: ``q``/``k``/``v`` packed as ``[1, T, H, D]``
+    with ``cu_seqlens``, optional per-draft-step state snapshots, and an optional
+    suppressed final write-back (EAGLE target-verify commits the accepted prefix
+    itself).
+
+    Returns ``out`` shaped ``[1, T, num_v_heads, head_v_dim]``.
+    """
+    B, T, Hg, K = k.shape
+    HV, V = v.shape[-2:]
+    if B != 1:
+        raise ValueError(f"packed decode expects B=1, got {B}")
+    if K != 128:
+        raise ValueError(f"head_k_dim must be 128, got {K}")
+    if HV % Hg:
+        raise ValueError(f"num_v_heads {HV} must be a multiple of num_k_heads {Hg}")
+
+    for name, t_, dim in (("q", q, K), ("k", k, K), ("v", v, V)):
+        if t_.dtype != torch.bfloat16:
+            raise ValueError(f"{name} must be bf16, got {t_.dtype}")
+        if t_.stride()[-1] != 1 or t_.stride()[-2] != dim:
+            raise ValueError(
+                f"{name} must be head-major contiguous within a token "
+                f"(stride[-2:] == ({dim}, 1)), got {t_.stride()[-2:]}"
+            )
+    for name, t_ in (("a", a), ("b", b), ("A_log", A_log), ("dt_bias", dt_bias)):
+        if t_.dtype not in (torch.float32, torch.bfloat16):
+            raise ValueError(f"{name} must be fp32 or bf16, got {t_.dtype}")
+        if not t_.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+    if state.dtype != torch.bfloat16:
+        raise ValueError("state pool must be bf16")
+    if state.stride()[1:] != (V * K, K, 1):
+        raise ValueError("state pool inner dims must be contiguous [HV, V, K]")
+
+    n = cu_seqlens.numel() - 1
+    if n <= 0 or T % n:
+        raise ValueError(f"ragged batch: T={T} is not divisible by n={n}")
+    tokens_per_seq = T // n
+
+    cache_states = intermediate_states is not None
+    if cache_states:
+        if intermediate_state_indices is None:
+            raise ValueError("intermediate_states needs intermediate_state_indices")
+        if intermediate_states.dtype != state.dtype:
+            raise ValueError("intermediate_states dtype must match the state pool")
+        if not intermediate_states.is_contiguous():
+            raise ValueError("intermediate_states must be contiguous")
+        if tuple(intermediate_states.shape[2:]) != (HV, V, K):
+            raise ValueError(
+                f"intermediate_states must be [slots, steps, {HV}, {V}, {K}], "
+                f"got {tuple(intermediate_states.shape)}"
+            )
+        cache_steps = intermediate_states.shape[1]
+    else:
+        cache_steps = 0
+
+    out = q.new_empty(1, T, HV, V)
+
+    with CompilationContext.compile_hints({"fastmath": "fast"}):
+        launch = create_gdn_decode_verify_kernel(
+            HV,
+            Hg,
+            V,
+            tokens_per_seq,
+            out.numel() * out.element_size(),
+            state.stride(0),
+            q.stride()[1],
+            k.stride()[1],
+            v.stride()[1],
+            a.stride()[1] if a.ndim == 3 else a.stride()[-2],
+            b.stride()[1] if b.ndim == 3 else b.stride()[-2],
+            float(K**-0.5) if scale is None else float(scale),
+            float(softplus_beta),
+            float(softplus_threshold),
+            not disable_state_update,
+            cache_states,
+            int(cache_steps),
+            str(a.dtype),
+            str(b.dtype),
+            ksplit,
+            block,
+            (
+                _gdn_varlen_viter(n, tokens_per_seq, HV, V, ksplit, block)
+                if viter is None
+                else int(viter)
+            ),
+        )
+        launch(
+            q,
+            k,
+            v,
+            a,
+            b,
+            A_log,
+            dt_bias,
+            state,
+            state_indices,
+            out,
+            cu_seqlens,
+            intermediate_states if cache_states else state,
+            intermediate_state_indices if cache_states else state_indices,
+            fx.Int32(n),
+        )
+    return out
