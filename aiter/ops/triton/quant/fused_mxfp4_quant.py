@@ -39,6 +39,7 @@ def fused_rms_mxfp4_quant(
     scale_shuffle_padding: bool | None = False,
     output_unquantized_inp1=False,
     inargs: str = "auto",
+    transpose_scale: bool = False,
 ):
     """
     This op contains several steps:
@@ -49,6 +50,9 @@ def fused_rms_mxfp4_quant(
 
     Key parameters:
     - x: Matrix X with shape (M, N1, N2).
+    - transpose_scale: If True, out1_bs is returned column-major (strides (1, M)),
+      the same layout dynamic_mxfp4_quant returns. Values are unchanged. Not
+      supported together with shuffle / scale_shuffle_padding.
 
     Returns:
     - out1_fp4: The output matrix with shape (M, N1 // 2).
@@ -85,11 +89,23 @@ def fused_rms_mxfp4_quant(
     else:
         SCALE_M = M
         SCALE_N = SCALE_N_valid
-    out1_bs = torch.empty(
-        (SCALE_M, SCALE_N),
-        dtype=torch.uint8,
-        device=x1.device,
-    )
+    if transpose_scale:
+        assert (
+            not use_scale_shuffle_padding
+        ), "transpose_scale is not supported with shuffle / scale_shuffle_padding"
+        # the kernel stores through the strides it is given, so a transposed
+        # view is enough to get the column-major layout
+        out1_bs = torch.empty(
+            (SCALE_N, SCALE_M),
+            dtype=torch.uint8,
+            device=x1.device,
+        ).T
+    else:
+        out1_bs = torch.empty(
+            (SCALE_M, SCALE_N),
+            dtype=torch.uint8,
+            device=x1.device,
+        )
 
     out1 = None
     out1_stride_m = 0
@@ -242,6 +258,8 @@ def fused_reduce_act_mul_and_mxfp4_quant(
     shuffle: bool = False,
     scale_shuffle_padding: bool = False,
     dtype: float | None = torch.bfloat16,
+    round_to_input_dtype: bool = False,
+    transpose_scale: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Apply reduction along the first dimension and apply the activation function + per-token group quantization to MX FP4 format.
@@ -270,6 +288,12 @@ def fused_reduce_act_mul_and_mxfp4_quant(
             - etc.
         shuffle: Indicates whether to enable preshuffling of scales.
             - When enabled, scale dimensions (X, Y) are adjusted to be multiples of 8 and 256, respectively.
+        round_to_input_dtype: Round act(x) * x_mul to the dtype of x before quantizing.
+            - This makes the output bit-identical to running the act_mul in x's dtype
+              and then dynamic_mxfp4_quant on its result. Default keeps fp32.
+        transpose_scale: Return y_scale column-major (strides (1, M)), the layout
+            dynamic_mxfp4_quant returns. Values are unchanged. Not supported
+            together with shuffle / scale_shuffle_padding.
     Returns:
         tuple: (y, y_scale), y2
             if shuffle or scale_shuffle_padding:
@@ -330,11 +354,21 @@ def fused_reduce_act_mul_and_mxfp4_quant(
     else:
         scaleM = M
         scaleN = scaleN_valid
-    y_scale = torch.empty(
-        (scaleM, scaleN),
-        dtype=torch.uint8,
-        device=x.device,
-    )
+    if transpose_scale:
+        assert (
+            not use_scale_shuffle_padding
+        ), "transpose_scale is not supported with shuffle / scale_shuffle_padding"
+        y_scale = torch.empty(
+            (scaleN, scaleM),
+            dtype=torch.uint8,
+            device=x.device,
+        ).T
+    else:
+        y_scale = torch.empty(
+            (scaleM, scaleN),
+            dtype=torch.uint8,
+            device=x.device,
+        )
 
     NUM_ITER = 1
     NUM_WARPS = 4
@@ -360,6 +394,14 @@ def fused_reduce_act_mul_and_mxfp4_quant(
     if shuffle:
         BLOCK_SIZE_M1 = triton.cdiv(BLOCK_SIZE_M1, 32) * 32
         BLOCK_SIZE_N1 = triton.cdiv(BLOCK_SIZE_N1, 32) * 32
+
+    # a 1x128 tile on 4 warps leaves most lanes idle and launches M * N_half / 128
+    # programs. One warp over a wider row measured 1.02-3.8x faster on gfx950 for
+    # N_half 2048..28672 and M 1..8192, the tile doesnt change the output bytes.
+    if not use_scale_shuffle_padding and not X_HAS_SPLITK and N_half > 1024:
+        BLOCK_SIZE_M1 = 1
+        BLOCK_SIZE_N1 = 256 if M <= 64 else 512
+        NUM_WARPS = 1
 
     num_pid = triton.cdiv(M, BLOCK_SIZE_M1) * triton.cdiv(
         N_half, BLOCK_SIZE_N1 * NUM_ITER
@@ -405,6 +447,7 @@ def fused_reduce_act_mul_and_mxfp4_quant(
         X_HAS_SPLITK=X_HAS_SPLITK,
         X_NUM_KSPLIT=x_num_splitk,
         X_NUM_KSPLIT_POW2=triton.next_power_of_2(x_num_splitk),
+        ROUND_ACT=round_to_input_dtype,
         num_warps=NUM_WARPS,
         waves_per_eu=0,
         num_stages=1,

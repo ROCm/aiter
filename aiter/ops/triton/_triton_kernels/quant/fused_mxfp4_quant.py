@@ -323,6 +323,7 @@ _fused_reduce_act_mul_and_dynamic_mxfp4_quant_repr = make_kernel_repr(
         "X_HAS_SPLITK",
         "X_NUM_KSPLIT",
         "X_NUM_KSPLIT_POW2",
+        "ROUND_ACT",
         "num_warps",
         "num_stages",
     ],
@@ -379,6 +380,7 @@ def _fused_reduce_act_mul_and_dynamic_mxfp4_quant_kernel(
     X_HAS_SPLITK: tl.constexpr,
     X_NUM_KSPLIT: tl.constexpr,
     X_NUM_KSPLIT_POW2: tl.constexpr,
+    ROUND_ACT: tl.constexpr,
 ):
 
     tl.assume(stride_x_spk > 0)
@@ -491,6 +493,9 @@ def _fused_reduce_act_mul_and_dynamic_mxfp4_quant_kernel(
 
         # x = _apply_activation_from_str(a, ACTIVATION) * b
         x = ACTIVATION(x) * x_mul
+        if ROUND_ACT:
+            # same values a separate act_mul kernel would write out
+            x = x.to(x_ptr.dtype.element_ty).to(tl.float32)
 
         y, y_scale = _mxfp4_quant_op(
             x, BLOCK_SIZE_N1, BLOCK_SIZE_M1, MXFP4_QUANT_BLOCK_SIZE
