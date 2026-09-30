@@ -214,3 +214,25 @@ def _reduce_grouped(
     else:
         out_n_mask = pid_n * BLOCK_N_OUT + tl.arange(0, BLOCK_N_OUT) < Nrem
         tl.store(out_ptr, acc, mask=out_n_mask)
+
+
+# Q256 producer partials are already weighted. Gather by the inverse route map
+# emitted by sorting, accumulate in FP32, and store the final BF16 output.
+@triton.jit
+def _reduce_q256_routes(
+    partials, inverse, output, MODEL: tl.constexpr, TOPK: tl.constexpr
+):
+    row = tl.program_id(0)
+    cols = tl.program_id(1) * 8192 + tl.arange(0, 8192)
+    slots = tl.arange(0, triton.next_power_of_2(TOPK))
+    source = tl.load(inverse + row * TOPK + slots, slots < TOPK, 0).to(tl.int64)
+    values = tl.load(
+        partials + source[:, None] * MODEL + cols[None, :],
+        (slots[:, None] < TOPK) & (cols[None, :] < MODEL),
+        0,
+        # Each contribution is consumed once. On gfx950, .cg emits streaming
+        # loads and improves the measured D8192/top-k11 reduction path.
+        cache_modifier=".cg" if MODEL == 8192 and TOPK == 11 else "",
+    ).to(tl.float32)
+    total = tl.sum(values, axis=0)
+    tl.store(output + row.to(tl.int64) * MODEL + cols, total, cols < MODEL)

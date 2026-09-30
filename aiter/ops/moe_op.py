@@ -666,3 +666,68 @@ def ck_moe_stage2_fwd(
         is_shuffled=getattr(w2, "is_shuffled", False),
     )
     return out
+
+
+@compile_ops("module_moe_q256_asm", ffi_type="ctypes")
+def fmoe_q256_producer(
+    out: Tensor,
+    partials: Tensor,
+    input: Tensor,
+    gate: Tensor,
+    down: Tensor,
+    sorted_ids: Tensor,
+    sorted_weights: Tensor,
+    sorted_experts: Tensor,
+    counts: Tensor,
+    reverse_sorted: Tensor,
+    input_scale: Tensor,
+    gate_scale: Tensor,
+    down_scale: Tensor,
+    topk: int,
+) -> None: ...
+
+
+def fmoe_q256(
+    out: Tensor,
+    partials: Tensor,
+    input: Tensor,
+    gate: Tensor,
+    down: Tensor,
+    sorted_ids: Tensor,
+    sorted_weights: Tensor,
+    sorted_experts: Tensor,
+    counts: Tensor,
+    reverse_sorted: Tensor,
+    input_scale: Tensor,
+    gate_scale: Tensor,
+    down_scale: Tensor,
+    topk: int,
+) -> None:
+    """Run the universal assembly producer and its supplied FP32 reducer."""
+    from aiter.ops.triton._triton_kernels.moe.reduce import _reduce_q256_routes
+
+    fmoe_q256_producer(
+        out,
+        partials,
+        input,
+        gate,
+        down,
+        sorted_ids,
+        sorted_weights,
+        sorted_experts,
+        counts,
+        reverse_sorted,
+        input_scale,
+        gate_scale,
+        down_scale,
+        topk,
+    )
+    tokens, model = out.shape
+    _reduce_q256_routes[(tokens, (model + 8191) // 8192)](
+        partials,
+        reverse_sorted,
+        out,
+        model,
+        topk,
+        num_warps=4,
+    )

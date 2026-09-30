@@ -544,6 +544,17 @@
             "f'{AITER_META_DIR}/hsa/codegen.py -m topksoftmax --output_dir {{}}'"
         ]
     },
+    "module_moe_q256_asm": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_fmoe_q256.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True"
+    },
     "module_moe_fmoe_asm": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_fmoe.cu'",
