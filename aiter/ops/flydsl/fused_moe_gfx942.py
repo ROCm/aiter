@@ -84,14 +84,14 @@ class Config:
                 if not 1 <= problem.batch <= 256:
                     return "decoding requires 1 to 256 tokens"
                 if self.BLOCK_M != 16 or self.BLOCK_N not in (16, 64, 128):
-                    return "decoding requires BM16 and BN64 or BN128"
+                    return "decoding requires BM16 and BN16, BN64 or BN128"
                 if self.BLOCK_K not in (16, 64):
-                    return "decoding requires BK64"
+                    return "decoding requires BK16 or BK64"
                 if problem.batch == 1 and (self.BLOCK_N, self.BLOCK_K) != (16, 16):
                     return "batch1 uses the fixed 16_16_16 config"
             if problem.quant_type == "mxfp4":
                 if not self.use_batch1_algorithm and self.BLOCK_N not in (16, 64):
-                    return "MXFP4 sorted decoding requires BLOCK_N=64"
+                    return "MXFP4 sorted decoding requires BLOCK_N=16 or 64"
                 if problem.hidden_dim % 512 or problem.inter_dim % 128:
                     return "MXFP4 requires hidden_dim divisible by 512 and inter_dim by 128"
             elif problem.hidden_dim % 256 or problem.inter_dim % 64:
