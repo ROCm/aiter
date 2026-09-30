@@ -2,13 +2,13 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import json
+import os
 import sys
 
 import pytest
 import torch
 import torch.nn.functional as F
 
-from aiter.ops.triton.attention import kda as kda_module
 from aiter.ops.triton.attention.kda import (
     fused_recurrent_kda,
     fused_recurrent_kda_packed_decode,
@@ -167,15 +167,20 @@ _TUNED: dict = {}
 
 @pytest.fixture
 def get_config(monkeypatch, tmp_path):
-    name = f"{arch}-KDA_DECODE-DEFAULT.json"
-    with open(f"{triton_core.AITER_TRITON_CONFIGS_PATH}/{name}") as f:
+    # The shipped family lives at <configs>/<arch>/gluon/attention/kda_decode/;
+    # a variant is written to the same relative path under tmp_path and the
+    # config root is pointed there, so the wrapper resolves the variant.
+    cfg_dir = triton_core.resolve_config_dir("attention", "KDA_DECODE", backend="gluon")
+    with open(f"{cfg_dir}/DEFAULT.json") as f:
         shipped = json.load(f)
+    relative = os.path.relpath(cfg_dir, triton_core.AITER_TRITON_CONFIGS_PATH)
 
     def _get(**variant):
         merged = {b: {**values, **variant} for b, values in shipped.items()}
-        (tmp_path / name).write_text(json.dumps(merged))
+        variant_dir = tmp_path / relative
+        variant_dir.mkdir(parents=True, exist_ok=True)
+        (variant_dir / "DEFAULT.json").write_text(json.dumps(merged))
         monkeypatch.setattr(triton_core, "AITER_TRITON_CONFIGS_PATH", str(tmp_path))
-        monkeypatch.setattr(kda_module, "AITER_TRITON_CONFIGS_PATH", str(tmp_path))
         monkeypatch.setattr(sys.modules[__name__], "_TUNED", dict(variant))
 
     return _get
