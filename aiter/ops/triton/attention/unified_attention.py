@@ -542,6 +542,11 @@ def _check_shuffled_tile_lds(params: _UAParams, config: dict):
     lds_cap = arch_info._LDS_CAP_BYTES.get(DEVICE_ARCH)
     if lds_cap is None:
         return
+    # RDNA4 has far more LDS per CU than a Triton kernel can address with
+    # 16-bit offset immediates; keep the Triton check within the 64 KiB
+    # directly-addressable window there (the gluon path is not checked here).
+    if DEVICE_ARCH == "gfx1250":
+        lds_cap = min(lds_cap, 65536)
     assert staged <= lds_cap, (
         f"Unified Attention Triton path with pre-shuffled KV cache: page "
         f"{tile} x head {params.head_size} with num_stages "
