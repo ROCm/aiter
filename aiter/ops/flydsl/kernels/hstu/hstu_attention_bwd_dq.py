@@ -26,10 +26,11 @@ arch contracts of the forward).
 """
 
 import functools
+import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, gpu, range_constexpr, rocdl
+from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels.hstu.hstu_attention_bwd import (
@@ -58,6 +59,38 @@ from aiter.ops.flydsl.kernels.hstu.hstu_attention_common import (
 
 # Reuse the exact same validation contract as the dV/dK kernel.
 validate_hstu_attention_bwd_dq = validate_hstu_attention_bwd
+
+
+# Where silu'(alpha*S) is evaluated.
+#
+# Evaluating it in compute_gate_tile puts it in the serial stretch between the K barrier
+# and the V barrier (GEMM1 sits there to hide V's global-load latency), so its
+# transcendentals have no MFMA to overlap with. Evaluating it in compute_ds_packs
+# instead lets each fragment's exp2/rcp overlap the next fragment's dA MFMAs. Identical
+# math and identical live-state size (4 f32 per fragment either way).
+#
+# The win therefore scales with how much gate work is stranded in that serial stretch,
+# which is KV_SUBTILES * Q_SUBTILES * MFMA_ELEMS_PER_LANE values per lane -- a function
+# of the tuned tile, not of head_dim directly. head_dim is only a build-time proxy for
+# it: with the tiles currently in configs/model_configs/hstu_attention_bwd_tuned.csv,
+# the head_dim<=64 rows strand enough gate work to pay for the move, while the
+# head_dim=128 rows already use a small BLOCK_M and BLOCK_N and strand too little to
+# matter. So this rule is only as good as those tiles -- re-measure it (A/B via the env
+# var below) whenever they are re-tuned. No absolute timings are quoted here for the
+# same reason: they are tile-dependent and would go stale silently.
+#
+# HSTU_DQ_GATE_LATE=1/0 forces it on/off for A/B work; unset = the head_dim rule. Both
+# settings are numerically equivalent, so this is safe to leave set. It is NOT part of
+# the flydsl kernel cache key, though, so an A/B that does not clear the cached binaries
+# (~/.flydsl/cache/*hstu_attention_bwd_dq*, or $FLYDSL_RUNTIME_CACHE_DIR) between runs
+# will silently replay the first variant twice and report "no change". head_dim *is* in
+# the key, so the shipped head_dim-keyed default is unaffected.
+#
+# The two sites that branch on GATE_LATE must keep using `if const_expr(...)`. A plain
+# `if` on the same compile-time constant is not equivalent: FlyDSL's AST rewriter turns
+# every `if` into an scf.if region, so the untaken side would still emit code.
+_GATE_LATE_ENV = os.environ.get("HSTU_DQ_GATE_LATE")
+_GATE_LATE_MAX_HEAD_DIM = 64
 
 
 @functools.lru_cache(maxsize=16384)
@@ -120,6 +153,14 @@ def build_hstu_attention_bwd_dq(
     K_STEPS_K = HEAD_DIM_K // MFMA_QK_K  # padded steps (K side)
     DK_STEPS = hidden_dim // MFMA_DA_K  # dA contraction steps (over hidden d)
     HC_CHUNKS = head_dim // MFMA_M  # dQ accumulator chunks (over head_dim)
+
+    # Where silu' is evaluated; see _GATE_LATE_ENV. Decided per build, so it is baked
+    # into the binary and costs nothing at runtime.
+    GATE_LATE = (
+        head_dim <= _GATE_LATE_MAX_HEAD_DIM
+        if _GATE_LATE_ENV is None
+        else _GATE_LATE_ENV == "1"
+    )
 
     num_q_tiles = (max_seq_len + BLOCK_M - 1) // BLOCK_M
     # HZ_TOTAL = batch * num_heads and its group ceil are batch-dependent, so they
@@ -533,8 +574,20 @@ def build_hstu_attention_bwd_dq(
                         keep = keep & kv_in_seq[i] & q_in_bounds[qg]
                         return keep
 
+                    # The mask stays a lane predicate all the way to the dS epilogue and
+                    # is applied there. Folding it into the gated value here looks free
+                    # -- it would stop carrying MFMA_ELEMS_PER_LANE predicates per
+                    # fragment -- but it trades cheap state for scarce state: a
+                    # predicate is a rematerialisable comparison over q/kv indices held
+                    # in SGPRs, whereas a masked gate is an opaque f32 that must live in
+                    # a VGPR until it is consumed. Measured slower; do not "simplify".
                     keep = [keep_col(i) for i in range_constexpr(MFMA_ELEMS_PER_LANE)]
-                    grad_vals = silu_grad_batch(s_vals)
+
+                    # GATE_LATE (see _GATE_LATE_ENV) defers silu' to compute_ds_packs so
+                    # it overlaps the dA MFMAs; carry the raw S when it is on.
+                    grad_vals = s_vals
+                    if const_expr(not GATE_LATE):
+                        grad_vals = silu_grad_batch(s_vals)
                     g_meta[ng][qg] = (grad_vals, keep)
             return g_meta
 
@@ -564,10 +617,15 @@ def build_hstu_attention_bwd_dq(
                     cur = Vec.filled(MFMA_ELEMS_PER_LANE, 0.0, fx.Float32).ir_value()
                     for ks in range_constexpr(DK_STEPS):
                         cur = da_mfma_acc(v_a[ks].ir_value(), do_packs[ks][qg], cur)
+                    grad_vals, keep = g_meta[ng][qg]
+                    # Under GATE_LATE, g_meta holds the raw S and silu' is applied here
+                    # so each fragment's transcendentals overlap the next fragment's
+                    # MFMAs above. Must stay inside this loop to get that overlap.
+                    if const_expr(GATE_LATE):
+                        grad_vals = silu_grad_batch(grad_vals)
                     da_vals = [
                         Vec(cur)[i] for i in range_constexpr(MFMA_ELEMS_PER_LANE)
                     ]
-                    grad_vals, keep = g_meta[ng][qg]
                     ds_vals = []
                     with arith.fastmath(arith.FastMathFlags.fast):
                         for i in range_constexpr(MFMA_ELEMS_PER_LANE):
