@@ -127,15 +127,15 @@ escaped or wrong directory. `backend` is declared by the caller (gluon kernels
 and gluon dispatch paths pass `"gluon"`; everything else takes the `"triton"`
 default), because the two backends take disjoint config params and borrowing
 across them would be a bug. `arch=` overrides the running architecture only
-where a loader deliberately retries elsewhere — today just MHC's documented
-gfx942 fallback.
+for documented compatibility fallbacks: MHC retries gfx942, and the Triton
+`fused_clamp_act_mul` path retries its legacy gfx950 table.
 
 `config_utils.py` is the shared core; each family keeps its own small loader
 module on top of it, and every function has exactly one home:
 
 | Module | Entry points |
 | ------ | ------------ |
-| `utils/config_utils.py` | `resolve_config_dir`, `load_config_json`, path constants |
+| `utils/config_utils.py` | `resolve_config_dir`, `load_config_json`, `select_leq_config`, path constants |
 | `utils/gemm_config_utils.py` | `get_gemm_config`, `compute_splitk_params`, `add_default_gemm_config_params`, `pick_gemm_num_stages` |
 | `utils/conv_config_utils.py` | `get_conv_config` + the shape-key formatters and table probes |
 | `utils/mhc_config_utils.py` | `get_mhc_config`, `get_mhc_post_config` |
@@ -232,6 +232,11 @@ Do not hand-roll `json.load(open(...))` or function-attribute caches, and
 prefer the family loaders over hand-built
 `f"{AITER_TRITON_CONFIGS_PATH}/..."` paths — a hand-built path is a second
 place the layout is encoded, and it goes stale silently.
+
+Flat dispatch tables whose keys mean “value less than or equal to this upper
+bound” use `select_leq_config(configs, value, prefix="N_LEQ_")`. It selects
+the smallest matching numeric bound and falls back to `any`, returning a copy
+that the caller may consume. Do not duplicate this selection loop in wrappers.
 
 Kernels that carry a Python autotune search space (opt-in tuning) pin their
 single default tile per arch via
