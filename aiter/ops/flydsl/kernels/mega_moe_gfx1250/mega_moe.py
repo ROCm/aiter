@@ -1568,6 +1568,9 @@ class MegaMoEGfx1250:
                 # mori's dispatch only accumulates into total_recv (this package's
                 # zeroes it in Phase 2), so without this it grows every forward.
                 self._total_recv.zero_()
+                launch_args = {}
+                if self._tokoff_ext is not None:
+                    launch_args["tok_off_peers"] = self._tokoff_ext.peers
                 plan.launch(
                     stream=torch.cuda.current_stream().cuda_stream,
                     token_indices=addr_inp_idx,
@@ -1577,15 +1580,13 @@ class MegaMoEGfx1250:
                     dest_pe_token_counter=addr_dest_ctr,
                     total_recv_token_num=addr_total_recv,
                     grid_barrier=addr_disp_bar,
-                    tok_off_peers=(
-                        None if self._tokoff_ext is None else self._tokoff_ext.peers
-                    ),
                     num_tokens=inp_cur_tok,
                     # Read off self rather than through the variant's argument
                     # list: the list is shared with the FlyDSL dispatch, whose
                     # launcher is a traced @flyc.jit signature, and widening it
                     # would put a dead kernarg on the bf16-only launcher path.
                     scales_buf=self._dispatch_sent_scales_ptr,
+                    **launch_args,
                 )
 
             return launch
