@@ -430,11 +430,13 @@ def _moe_sorting_impl(
 
     if (
         output_aux
+        and expert_mask is None
         and not _aux_uses_opus(output_aux, block_size, M * topk, num_experts)
         and _MOE_SORT_BACKEND not in ("opus", "ck")
     ):
         # adaptive (fused) sort emits the a4w4 extras (m_indices + reverse_sorted)
         # plus the atomic zero-init; opus single-pass aux is the env-gated fallback.
+        # It has no expert_mask support, so EP always takes the Opus aux sort.
         # `output` not threaded here: this buffer also feeds stage1 as moe_buf.
         return _adaptive_moe_sort(
             topk_ids,
@@ -459,10 +461,11 @@ def _moe_sorting_impl(
     num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
     # moe_buf shape depends on the downstream stage2 path:
     #  - accumulate (or EP w/ expert_mask): stage2 atomically accumulates into [M, model_dim].
-    #  - else (FlyDSL stage2 reduce mode without mask): caller owns the
-    #    [M, topk, model_dim] intermediate; allocate a placeholder here.
+    #  - else (FlyDSL stage2 reduce mode without mask, or the non-atomic
+    #    output_aux scatter, which writes every output row itself): caller owns
+    #    the intermediate; allocate a placeholder here.
     # A caller buffer can stand in: the sort kernel zeroes what it is handed.
-    if (expert_mask is not None) or accumulate:
+    if accumulate or (expert_mask is not None and not output_aux):
         moe_buf = (
             output
             if output is not None
@@ -486,7 +489,14 @@ def _moe_sorting_impl(
         aux_m_indices = torch.empty(
             max_num_tokens_padded, dtype=dtypes.i32, device=device
         )
-        aux_reverse_sorted = torch.empty(M * topk, dtype=dtypes.i32, device=device)
+        # The sort writes local routes only; EP leaves remote routes at -1,
+        # which the scatter reduce skips.
+        if expert_mask is not None:
+            aux_reverse_sorted = torch.full(
+                (M * topk,), -1, dtype=dtypes.i32, device=device
+            )
+        else:
+            aux_reverse_sorted = torch.empty(M * topk, dtype=dtypes.i32, device=device)
 
     if use_opus:
         ws_size = aiter.moe_sorting_opus_get_workspace_size(
@@ -532,7 +542,7 @@ def _moe_sorting_impl(
         )
     ret = (sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf)
     if output_aux:
-        return (*ret, aux_m_indices, aux_reverse_sorted)
+        ret = (*ret, aux_m_indices, aux_reverse_sorted)
     if return_local_topk_ids:
         return (*ret, local_topk_ids)
     return ret
@@ -1430,14 +1440,16 @@ def _fused_moe_impl(
     sort_m_indices = None
     sort_reverse_sorted = None
     if metadata.output_aux:
-        # The a4w4 FlyDSL port routes through the adaptive/aux sort, which does
-        # not thread expert_mask into moe_sorting below -- EP masking would be
-        # silently ignored and tokens routed to the wrong experts. Fail loudly
-        # until EP support is added to the port.
-        if expert_mask is not None:
+        # Only the layout-v2 scatter GEMM2 consumes the masked aux sort (remote
+        # routes get reverse_sorted = -1). The MXMOE a4w4 port would silently
+        # route tokens to the wrong experts, so fail loudly there.
+        if expert_mask is not None and (
+            getattr(metadata.stage2, "func", metadata.stage2)
+            is not _flydsl_v2_stage2_wrapper
+        ):
             raise NotImplementedError(
                 "MXFP4 a4w4 FlyDSL port does not support expert-parallel yet "
-                "(expert_mask is dropped by the output_aux sort path)."
+                "(only the layout-v2 scatter GEMM2 handles the masked aux sort)."
             )
         _stage2_kwargs = metadata.stage2.keywords
         _kn2 = _stage2_kwargs.get("kernelName2") or _stage2_kwargs.get("kernelName", "")
@@ -1451,6 +1463,9 @@ def _fused_moe_impl(
             model_dim,
             dtype,
             block_size_M,
+            expert_mask,
+            num_local_tokens,
+            return_local_topk_ids=need_local_topk_ids,
             accumulate=_atomic,
             output_aux=metadata.output_aux,
             output=output,
@@ -1463,8 +1478,8 @@ def _fused_moe_impl(
             moe_buf,
             sort_m_indices,
             sort_reverse_sorted,
-        ) = sorting_ret
-        local_topk_ids = None
+        ) = sorting_ret[:7]
+        local_topk_ids = sorting_ret[7] if need_local_topk_ids else None
     else:
         sorting_ret = moe_sorting(
             topk_ids,
@@ -2704,10 +2719,6 @@ def _flydsl_v2_stage2_wrapper(
         if reverse_sorted is None or sorted_weights is None:
             raise ValueError(
                 "epilog='scatter' FlyDSL GEMM2 requires reverse_sorted and sorted_weights"
-            )
-        if expert_mask is not None:
-            raise NotImplementedError(
-                "epilog='scatter' FlyDSL GEMM2 does not support expert-parallel"
             )
         if _s2_fp4_scatter:
             target = torch.empty(
