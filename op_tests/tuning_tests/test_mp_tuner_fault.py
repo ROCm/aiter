@@ -13,9 +13,6 @@ Run: HIP_VISIBLE_DEVICES=0 python3 -m unittest op_tests.tuning_tests.test_mp_tun
 import math
 import unittest
 
-import triton  # noqa: F401  # ROCm environments may require Triton before torch.
-
-# isort: split
 import torch
 
 
