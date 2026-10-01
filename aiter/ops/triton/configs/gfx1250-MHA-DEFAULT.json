@@ -10,13 +10,22 @@
       "num_stages": 1
     },
     "default": {
+      "BLOCK_M": 256,
+      "BLOCK_N": 64,
+      "PRELOAD_V": true,
+      "waves_per_eu": 2,
+      "num_warps": 8,
+      "num_ctas": 1,
+      "num_stages": 3
+    },
+    "small_head": {
       "BLOCK_M": 128,
       "BLOCK_N": 64,
       "PRELOAD_V": true,
       "waves_per_eu": 2,
       "num_warps": 4,
       "num_ctas": 1,
-      "num_stages": 1
+      "num_stages": 3
     },
     "pe": {
       "BLOCK_M": 128,
@@ -35,6 +44,26 @@
       "num_warps": 8,
       "num_ctas": 1,
       "num_stages": 1
+    }
+  },
+  "fwd_gluon": {
+    "default": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 64,
+      "PRELOAD_V": true,
+      "waves_per_eu": 2,
+      "num_warps": 4,
+      "num_ctas": 1,
+      "num_stages": 3
+    },
+    "small_head": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 128,
+      "PRELOAD_V": true,
+      "waves_per_eu": 2,
+      "num_warps": 4,
+      "num_ctas": 1,
+      "num_stages": 3
     }
   },
   "bkwd_fused" : {
