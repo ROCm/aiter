@@ -434,6 +434,39 @@ def test_f_b_non_positive_slots_do_not_modify_caches() -> None:
     assert torch.equal(inputs.state, state_before)
 
 
+@pytest.mark.parametrize("fused_f_b", [False, True])
+def test_out_of_range_slots_do_not_modify_caches(fused_f_b: bool) -> None:
+    batch = 4
+    if fused_f_b:
+        f_a, f_b_weight, inputs = _make_fb_inputs(batch)
+    else:
+        inputs = _make_inputs(batch)
+    # Give the recurrent pool fewer slots than the convolution pool so the
+    # bound must come from the smaller of the two caches.
+    state_slots = inputs.state.shape[0] - 2
+    assert state_slots < inputs.conv_state.shape[0]
+    inputs.state = inputs.state[:state_slots]
+    inputs.state_indices.copy_(
+        torch.tensor(
+            [state_slots, state_slots + 1, 2**31 - 1, 0],
+            dtype=torch.int32,
+            device=_DEVICE,
+        )
+    )
+    conv_before = inputs.conv_state.clone()
+    state_before = inputs.state.clone()
+
+    if fused_f_b:
+        actual = _run_with_f_b(f_a, f_b_weight, inputs)
+    else:
+        actual = _run(inputs)
+    torch.cuda.synchronize()
+
+    assert torch.count_nonzero(actual) == 0
+    assert torch.equal(inputs.conv_state, conv_before)
+    assert torch.equal(inputs.state, state_before)
+
+
 def _move_to_large_caches(
     inputs: Inputs,
     slot_indices: tuple[int, ...],

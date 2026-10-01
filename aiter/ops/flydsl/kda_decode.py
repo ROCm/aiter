@@ -22,6 +22,7 @@ _HEADS = 12
 _DIM = 128
 _CONV_CHANNELS = 3 * _HEADS * _DIM
 _CONV_WIDTH = 4
+_INT32_MAX = 2**31 - 1
 
 
 @functools.cache
@@ -92,6 +93,11 @@ def _check_same_device(
             raise ValueError(f"`{name}` must be a CUDA tensor.")
         if tensor.device != device:
             raise ValueError(f"`{name}` must be on {device}, got {tensor.device}.")
+
+
+def _num_cache_slots(state: torch.Tensor, conv_state: torch.Tensor) -> int:
+    """Return the slot count shared by both caches, clamped to the int32 index range."""
+    return min(state.shape[0], conv_state.shape[0], _INT32_MAX)
 
 
 def _validate_kda_inputs(
@@ -266,6 +272,13 @@ def flydsl_kda_decode(
     :func:`is_flydsl_kda_decode_supported` before dispatch.
     Uses RMSNorm/sigmoid gating. Cache slot zero is reserved: non-positive
     ``state_indices`` produce zero output and leave both caches unchanged.
+    Indices at or above ``min(state.shape[0], conv_state.shape[0])`` are
+    treated the same way, so out-of-range slots are never accessed.
+
+    Every positive in-range entry in ``state_indices`` must be unique within
+    the batch. Duplicate live slots cause unsynchronized concurrent updates of
+    the same recurrent and convolution cache rows and have undefined behavior.
+    Padding entries may repeat.
     """
     if x.ndim != 2:
         raise ValueError(f"`x` must have rank 2, got rank {x.ndim}.")
@@ -323,6 +336,7 @@ def flydsl_kda_decode(
             norm_weight,
             out,
             batch,
+            _num_cache_slots(state, conv_state),
             x.stride(0),
             conv_weight.stride(0),
             conv_weight.stride(1),
@@ -363,6 +377,8 @@ def flydsl_kda_decode_with_f_b(
 
     Projects ``f_a`` with ``f_b_weight`` in FP32, then rounds once to BF16
     before the lower-bound decay gate, without storing raw-g in global memory.
+    ``state_indices`` follows the same bounded, unique-live-slot contract as
+    :func:`flydsl_kda_decode`.
     """
     if f_a.ndim != 2:
         raise ValueError(f"`f_a` must have rank 2, got rank {f_a.ndim}.")
@@ -429,6 +445,7 @@ def flydsl_kda_decode_with_f_b(
             norm_weight,
             out,
             batch,
+            _num_cache_slots(state, conv_state),
             f_a.stride(0),
             f_b_weight.stride(0),
             f_b_weight.stride(1),

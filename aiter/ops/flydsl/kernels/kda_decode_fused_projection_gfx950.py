@@ -34,9 +34,12 @@ _V_ITERS = _DIM // _V_GROUP_TILE
 _PROJECTION_VECTOR = 4
 _PROJECTION_ITERS = _DIM // _PROJECTION_VECTOR
 _WAVES_PER_EU = 2
+_SPECIALIZATION_CACHE_SIZE = 8
 
 
-@functools.cache
+# Each entry holds a JIT launcher and compiled module; keep only a few
+# (norm_eps, lower_bound) specializations alive.
+@functools.lru_cache(maxsize=_SPECIALIZATION_CACHE_SIZE)
 def create_kda_decode_fused_projection_kernel(norm_eps: float, lower_bound: float):
     """Build the fixed gfx950 BF16 f_b plus KDA decode specialization."""
 
@@ -68,6 +71,7 @@ def create_kda_decode_fused_projection_kernel(norm_eps: float, lower_bound: floa
         norm_weight_mem: fx.Tensor,
         out_mem: fx.Tensor,
         batch_size: fx.Int32,
+        num_cache_slots: fx.Int32,
         stride_f_a_token: fx.Int32,
         stride_f_b_head: fx.Int32,
         stride_f_b_output: fx.Int32,
@@ -115,7 +119,10 @@ def create_kda_decode_fused_projection_kernel(norm_eps: float, lower_bound: floa
         lane_k = lane % fx.Int32(_WARP_THREADS_K)
 
         state_idx = fx.Int32(state_indices[batch])
-        valid = state_idx > fx.Int32(0)
+        # Slot zero and negative entries are padding. Slots past the shared
+        # capacity of both caches are treated as padding instead of being
+        # dereferenced out of bounds.
+        valid = (state_idx > fx.Int32(0)) & (state_idx < num_cache_slots)
         # Rebase both caches on the selected slot in 64-bit. Buffer accesses
         # take a 32-bit byte offset, so slot * stride must not reach them.
         state_slot = state_idx.to(fx.Int64)
@@ -567,6 +574,7 @@ def create_kda_decode_fused_projection_kernel(norm_eps: float, lower_bound: floa
         norm_weight_mem: fx.Tensor,
         out_mem: fx.Tensor,
         batch_size: fx.Int32,
+        num_cache_slots: fx.Int32,
         stride_f_a_token: fx.Int32,
         stride_f_b_head: fx.Int32,
         stride_f_b_output: fx.Int32,
@@ -599,6 +607,7 @@ def create_kda_decode_fused_projection_kernel(norm_eps: float, lower_bound: floa
             norm_weight_mem,
             out_mem,
             batch_size,
+            num_cache_slots,
             stride_f_a_token,
             stride_f_b_head,
             stride_f_b_output,
