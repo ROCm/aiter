@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc.
 
-"""Native gfx1201 Q/K/V FP8 quantization for FlyDSL flash attention."""
+"""Native gfx1201 Q/K/V FP8 quantization for FlyDSL flash attention.
+
+This producer's supported head dimensions are independent of the attention
+consumer's per-shape LDS limit, which the consumer validates separately.
+"""
 
 import warnings
 from functools import lru_cache
@@ -13,6 +17,8 @@ from .kernels.fp8_quant_gfx1201 import (
     flydsl_fp8_pertensor_quant,
     flydsl_fp8_qkv_d64_quant,
 )
+
+_INT32_MAX = (1 << 31) - 1
 
 
 @lru_cache(maxsize=16)
@@ -27,6 +33,25 @@ def _gpu_arch(device: torch.device) -> str:
     return _gpu_arch_cached(device.index)
 
 
+def _validate_quant_dword_offsets(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    head_dim: int,
+    native_head_dim: int,
+) -> None:
+    """Reject native quantizer inputs whose BF16 dword offsets overflow Int32."""
+    for name, tensor in (("q", q), ("k", k), ("v", v)):
+        rows = tensor.numel() // head_dim
+        dwords = rows * native_head_dim // 2
+        if dwords - 1 > _INT32_MAX:
+            raise ValueError(
+                f"flydsl_fp8_quant {name} requires dword offset {dwords - 1}, "
+                f"exceeding the native quantizer Int32 limit ({_INT32_MAX})"
+            )
+
+
 def flydsl_fp8_quant(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -37,9 +62,10 @@ def flydsl_fp8_quant(
     """Quantize BF16 BSHD Q/K/V for native gfx1201 FP8 flash attention.
 
     This is a native FlyDSL-only path. Inputs must be non-empty BF16 tensors on
-    one gfx1201 device with a common head dimension that is at least 64 and a
-    multiple of 32. Rotation uses an in-register FWHT and is available only for
-    power-of-two head dimensions; set ``rotation=False`` otherwise.
+    one gfx1201 device with a common head dimension from 64 through 1024,
+    divisible by 32. Rotation uses an in-register FWHT and is available only for
+    power-of-two head dimensions; non-power-of-two dimensions are padded to the
+    next supported power of two and require ``rotation=False``.
 
     The returned tensors and scales are enqueued on the current stream of
     ``q.device``. Consumers on another stream must establish the usual PyTorch
@@ -72,6 +98,14 @@ def flydsl_fp8_quant(
             f"FWHT rotation requires a power-of-two head_dim, got {head_dim}; "
             "pass rotation=False to quantize without rotation"
         )
+    padded_dim = 1 << (head_dim - 1).bit_length()
+    if head_dim not in (64, 128, 256, 512, 1024) and padded_dim > 1024:
+        raise ValueError(
+            f"native FP8 quant has no packed specialization for head_dim={head_dim}"
+        )
+    _validate_quant_dword_offsets(
+        q, k, v, head_dim=head_dim, native_head_dim=padded_dim
+    )
     if not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous()):
         warnings.warn(
             "flydsl_fp8_quant materializes non-contiguous Q/K/V inputs; "
@@ -85,12 +119,7 @@ def flydsl_fp8_quant(
     # use the per-tensor implementation.
     if head_dim == 64 and q.shape == k.shape == v.shape:
         return flydsl_fp8_qkv_d64_quant(q, k, v, rotate=rotation)
-    padded_dim = 1 << (head_dim - 1).bit_length()
     if head_dim not in (64, 128, 256, 512, 1024):
-        if padded_dim > 1024:
-            raise ValueError(
-                f"native FP8 quant has no packed specialization for head_dim={head_dim}"
-            )
         warnings.warn(
             f"flydsl_fp8_quant pads head_dim={head_dim} to {padded_dim} for "
             "the native packed quantizer; use a supported power-of-two head "

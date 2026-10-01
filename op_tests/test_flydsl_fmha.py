@@ -1975,6 +1975,19 @@ def _optest_gfx1201_contracts():
         mean=0.999,
     )
 
+    stream = torch.cuda.Stream(device=q.device)
+    stream_out = torch.full_like(q, float("nan"))
+    streamed = flydsl_flash_attn_func(q, k, v, stream=stream, out=stream_out)
+    stream.synchronize()
+    assert streamed.data_ptr() == stream_out.data_ptr()
+    _optest_assert_gfx1201_quality(
+        stream_out,
+        _optest_gfx1201_reference(q, k, v, causal=False),
+        head_dim=128,
+        minimum=0.99,
+        mean=0.999,
+    )
+
     q_storage = torch.randn((1, 97, 2, 256), dtype=torch.bfloat16, device="cuda")
     q_noncontig = q_storage[..., ::2]
     with warnings.catch_warnings(record=True) as caught:
