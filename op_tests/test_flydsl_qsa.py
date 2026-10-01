@@ -886,6 +886,14 @@ def test_k1_gfx942_h8_skips_prefill_tile():
         raise AssertionError("multi-request prefill entered the 16-row tile")
     if k1_kernel._k1_uses_prefill_scorer(1, 8, 8, "gfx950"):
         raise AssertionError("short M entered the 16-row tile")
+    if not k1_kernel._k1_uses_prefill_scorer(1, 8, 4, "gfx942"):
+        raise AssertionError("gfx942 H=4 left the 16-row tile at 8 rows")
+    if k1_kernel._k1_uses_prefill_scorer(1, 7, 4, "gfx942"):
+        raise AssertionError("gfx942 H=4 entered the 16-row tile below 8 rows")
+    if k1_kernel._k1_uses_prefill_scorer(1, 8, 8, "gfx942"):
+        raise AssertionError("gfx942 H=8 entered the 16-row tile at 8 rows")
+    if k1_kernel._k1_uses_prefill_scorer(1, 8, 4, "gfx950"):
+        raise AssertionError("gfx950 H=4 entered the 16-row tile at 8 rows")
 
 
 def test_qsa_arch_allowlist():
