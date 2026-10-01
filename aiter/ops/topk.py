@@ -813,12 +813,12 @@ def decode_adaptive_width(width: int, max_row_len: int) -> int:
     take the same value: gating on one length and configuring for another is
     how a band admits a shape that then runs the wrong kernel for it.
 
-    `max_row_len` must be at least every `seq_lens` entry, or the kernel stops
-    short of the longest rows and returns wrong indices; `top_k_per_row_decode`
-    holds the full contract. It is required here: the gate declines the adaptive path when the caller
-    states no bound (see `decode_backend_for_call`), so `None` reaching this
-    function is a bug. The physical width is not a fallback, because the bands
-    were admitted assuming a configuration sized to the bound.
+    `max_row_len` must be at least every `seq_lens` entry; if not, the result is
+    wrong. `top_k_per_row_decode` holds the full contract. It is required here:
+    the gate declines the adaptive path when the caller states no bound (see
+    `decode_backend_for_call`), so `None` reaching this function is a bug. The
+    physical width is not a fallback, because the bands were admitted assuming
+    a configuration sized to the bound.
     """
     if max_row_len is None:
         raise ValueError(
@@ -1171,9 +1171,8 @@ def flydsl_top_k_per_row_decode(
     This path is optimized for long-context decode, where its multi-CTA radix
     selection typically outperforms the HIP one-block implementation.
 
-    `max_row_len` must be at least every `seqLens` entry, or the kernel stops
-    short of the longest rows and returns wrong indices; `top_k_per_row_decode`
-    holds the full contract.
+    `max_row_len` must be at least every `seqLens` entry; if not, the result is
+    wrong. Pass `None` when unsure. `top_k_per_row_decode` holds the full contract.
     """
     from .flydsl.topk.topk_per_row import (
         flydsl_top_k_per_row_decode as _flydsl_top_k_per_row_decode,

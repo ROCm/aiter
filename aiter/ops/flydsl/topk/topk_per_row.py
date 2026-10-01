@@ -471,9 +471,9 @@ def flydsl_top_k_per_row_decode(
 ) -> None:
     """Write per-row TopK indices using each request's effective context length.
 
-    `max_row_len` must be at least every `seq_lens` entry, or the kernel stops
-    short of the longest rows and returns wrong indices;
-    `aiter.ops.topk.top_k_per_row_decode` holds the full contract.
+    `max_row_len` must be at least every `seq_lens` entry; if not, the result is
+    wrong. Pass `None` when unsure. `aiter.ops.topk.top_k_per_row_decode` holds
+    the full contract.
     """
     _decode_with_backend(
         logits,
