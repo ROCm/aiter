@@ -602,6 +602,7 @@ class FmoeTuner(TunerCommon):
         q_type,
         act_type,
         splitk=0,
+        use_nt=False,
     ):
         inter_dim = w1_qt_shffle_ck.shape[1] // 2
         token_num = a1_qt.shape[0]
@@ -637,6 +638,7 @@ class FmoeTuner(TunerCommon):
             q_type,
             act_type,
             splitk if is_splitk else 0,
+            use_non_temporal_load=use_nt,
             dst_type=dtype if is_splitk else None,
         )
         if is_splitk:
@@ -678,6 +680,7 @@ class FmoeTuner(TunerCommon):
         blockM,
         q_type,
         act_type,
+        use_nt=False,
     ):
         model_dim = w2_qt_shffle_ck.shape[1]
         token_num = a2_qt.shape[0]
@@ -703,6 +706,7 @@ class FmoeTuner(TunerCommon):
             sorted_weights,
             q_type,
             act_type,
+            use_non_temporal_load=use_nt,
         )
 
     @staticmethod
@@ -2186,6 +2190,7 @@ class FmoeTuner(TunerCommon):
         fuse_fp8=False,
         situ_beta=DEFAULT_SITUV2_BETA,
         situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
+        swiglu_limit=None,
         output_sorted=False,
     ):
         # a16wi4: convert int8 weights to i4x2 so reference function detects the right path
@@ -2212,6 +2217,7 @@ class FmoeTuner(TunerCommon):
             doweight=doweight_stage1,
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
+            swiglu_limit=swiglu_limit,
         )
         token_num = a1_qt.shape[0]
         if fuse_fp4:
@@ -2480,6 +2486,7 @@ class FmoeTuner(TunerCommon):
         activation=ActivationType.Silu,
         quant_type=QuantType.No,
         doweight_stage1=False,
+        swiglu_limit=None,
     ):
         ref1 = torch_moe_stage1(
             hidden_states,
@@ -2495,6 +2502,7 @@ class FmoeTuner(TunerCommon):
             doweight=doweight_stage1,
             situ_beta=DEFAULT_SITUV2_BETA,
             situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
+            swiglu_limit=swiglu_limit,
         )
         AQDType = hidden_states.dtype
 
@@ -3166,14 +3174,19 @@ class FmoeTuner(TunerCommon):
             not doweight_stage1,
             True,  # bpreshuffle
         )
+        # only the blockscale kernels read the hint
+        nt_values = (False, True) if q_type == QuantType.per_1x128 else (False,)
         for blockM in blockMs:
             if blockM in [16, 32, 64, 128] and use_g1u1:
-                for kernel in ck_stage1_kernels.values():
-                    if kernel.MPerBlock != blockM:
-                        continue
+                for kernel, nt in [
+                    (k, n)
+                    for k in ck_stage1_kernels.values()
+                    if k.MPerBlock == blockM
+                    for n in nt_values
+                ]:
                     tasks_ck.append(
                         (
-                            (info, "stage1", kernel.name, blockM),  # tag
+                            (info, "stage1", kernel.name, blockM, 0, 0, nt),  # tag
                             FmoeTuner.generate_data_2stages,
                             (
                                 token,
@@ -3211,7 +3224,7 @@ class FmoeTuner(TunerCommon):
                                 q_type,
                                 act_type,
                             ),
-                            {},
+                            {"use_nt": nt},
                             FmoeTuner.run_torch_moe_stage1,
                             (
                                 [
@@ -3241,11 +3254,12 @@ class FmoeTuner(TunerCommon):
                         )
                     )
 
-                for kernel in ck_stage2_kernels.values():
-                    if kernel.MPerBlock != blockM:
-                        continue
-                    if _is_tune_excluded_kernel(kernel.name):
-                        continue
+                for kernel, nt in [
+                    (k, n)
+                    for k in ck_stage2_kernels.values()
+                    if k.MPerBlock == blockM and not _is_tune_excluded_kernel(k.name)
+                    for n in nt_values
+                ]:
                     s2_ref_args = (
                         [
                             "a2_qt",
@@ -3263,7 +3277,7 @@ class FmoeTuner(TunerCommon):
                     )
                     tasks_ck.append(
                         (
-                            (info, "stage2", kernel.name, blockM),  # tag
+                            (info, "stage2", kernel.name, blockM, 0, 0, nt),  # tag
                             FmoeTuner.generate_data_2stages,
                             (
                                 token,
@@ -3301,7 +3315,7 @@ class FmoeTuner(TunerCommon):
                                 q_type,
                                 act_type,
                             ),
-                            {},
+                            {"use_nt": nt},
                             FmoeTuner.run_torch_moe_stage2,
                             s2_ref_args,
                             {},
@@ -4576,6 +4590,8 @@ class FmoeTuner(TunerCommon):
             q_type = QuantType.per_1x128 if q_type == QuantType.per_128x128 else q_type
             use_g1u1 = bool(row["use_g1u1"])
             doweight_stage1 = bool(row["doweight_stage1"])
+            limit_env = os.environ.get("AITER_MXFP4_TUNE_SWIGLU_LIMIT")
+            swiglu_limit = None if limit_env in (None, "") else float(limit_env)
             # fused_moe overrides the activation quant dtype at runtime for
             # per_1x32 fp4-weight MoE (gate_mode defaults to SEPARATED, which
             # run_config does not override): Silu -> fp4, Swiglu -> bf16/fp4 by M.
@@ -4812,6 +4828,7 @@ class FmoeTuner(TunerCommon):
                         if act_type == ActivationType.Situv2
                         else None
                     ),
+                    swiglu_limit=swiglu_limit,
                     w1_scale=w1_scale_fmoe,
                     w2_scale=w2_scale_fmoe,
                     dtype=dtype,
@@ -4839,6 +4856,7 @@ class FmoeTuner(TunerCommon):
                     activation=act_type,
                     quant_type=q_type,
                     doweight_stage1=doweight_stage1,
+                    swiglu_limit=swiglu_limit,
                 )
                 if not _all_finite(out) or not _all_finite(ref):
                     diag = tensor_compare_diagnostics(ref, out)
@@ -5127,6 +5145,9 @@ class FmoeTuner(TunerCommon):
         if "flat" not in resultdf.columns:
             resultdf["flat"] = 0
         resultdf["flat"] = resultdf["flat"].fillna(0).astype(int)
+        if "nt" not in resultdf.columns:
+            resultdf["nt"] = 0
+        resultdf["nt"] = resultdf["nt"].fillna(0).astype(int)
         if results is not None:
             resultdf = resultdf.astype(str).drop_duplicates(
                 subset=self.keys,
@@ -5139,6 +5160,20 @@ class FmoeTuner(TunerCommon):
         ordered_cols += [c for c in resultdf.columns if c not in ordered_cols]
         resultdf = resultdf[ordered_cols]
         resultdf.to_csv(file, index=False)
+
+    @staticmethod
+    def _pair_nt_agnostic(profileDF, kernel_col):
+        # Only the CK 2-stage instances read the hint; the rest are measured
+        # once, so give them a copy on the nt=1 side of the merge. With the
+        # sweep off there is no such side and the copy would survive as a tie.
+        if not (profileDF["nt"] == 1).any():
+            return profileDF
+        agnostic = profileDF[
+            ~profileDF[kernel_col].astype(str).str.startswith("moe_ck2stages")
+        ]
+        if agnostic.empty:
+            return profileDF
+        return pd.concat([profileDF, agnostic.assign(nt=1)], ignore_index=True)
 
     def post_process(self, results, args, topk=-1, fast_mode=False):
         profileDF = []
@@ -5179,6 +5214,7 @@ class FmoeTuner(TunerCommon):
                 block_m = tail[2]
                 flat_flag = int(tail[3]) if len(tail) > 3 else 0
                 v2_flag = int(tail[4]) if len(tail) > 4 else 0
+                nt_flag = int(tail[5]) if len(tail) > 5 else 0
                 tflops, bw = self.calculate((key, stage, kernelName, block_m, us, err))
                 row_ksplit = 0
                 sk_match = re.search(r"_sk(\d+)$", str(kernelName))
@@ -5211,6 +5247,7 @@ class FmoeTuner(TunerCommon):
                         bw,
                         flat_flag,
                         v2_flag,
+                        nt_flag,
                     ]
                 )
 
@@ -5229,6 +5266,7 @@ class FmoeTuner(TunerCommon):
                     "bw",
                     "flat",
                     "v2",
+                    "nt",
                 ],
             )
             prorfiles.append(profileDF)
@@ -5278,7 +5316,7 @@ class FmoeTuner(TunerCommon):
             profileDF = (
                 profileDF.sort_values("us")
                 .drop_duplicates(
-                    ["stage", "block_m", "flat", "v2", "_is_fused"], keep="first"
+                    ["stage", "block_m", "flat", "nt", "v2", "_is_fused"], keep="first"
                 )
                 .drop(columns=["_is_fused"])
             )
@@ -5295,6 +5333,7 @@ class FmoeTuner(TunerCommon):
                     "bw": "bw1",
                 }
             )
+            stage1_profileDF = self._pair_nt_agnostic(stage1_profileDF, "kernelName1")
             stage2_profileDF = profileDF[profileDF["stage"] == "stage2"].drop(
                 columns=["stage", "ksplit", "flat"]
             )
@@ -5307,6 +5346,7 @@ class FmoeTuner(TunerCommon):
                     "bw": "bw2",
                 }
             )
+            stage2_profileDF = self._pair_nt_agnostic(stage2_profileDF, "kernelName2")
             if (stage1_profileDF.shape[0] == 0 and stage2_profileDF.shape[0] != 0) or (
                 stage1_profileDF.shape[0] != 0 and stage2_profileDF.shape[0] == 0
             ):
@@ -5364,6 +5404,7 @@ class FmoeTuner(TunerCommon):
                     "use_g1u1",
                     "doweight_stage1",
                     "block_m",
+                    "nt",
                     "v2",
                 ],
                 how="inner",
@@ -5404,6 +5445,7 @@ class FmoeTuner(TunerCommon):
                         self.INVALID_TIME,
                         0,
                         0,
+                        -1,
                         -1,
                         -1,
                         -1,
@@ -6042,6 +6084,7 @@ class FmoeTuner(TunerCommon):
                         0,  # flat
                         tflops,
                         bw,
+                        0,  # nt: flydsl rows do not read the hint
                     )
 
         tune_results = []
@@ -6638,7 +6681,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         return data
 
     @staticmethod
-    def _port_e2e(data, kn1, kn2, topk, ne, h, dtype):
+    def _port_e2e(data, kn1, kn2, topk, ne, h, dtype, swiglu_limit=None):
         # kn2 may name either gemm2 family (path B or native mxmoe).
         _g2 = parse_g2_kname_any(kn2)
         atomic = _g2["atomic"]
@@ -6703,6 +6746,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
             situ_linear_beta=(
                 DEFAULT_SITUV2_LINEAR_BETA if p1["act"] == "situv2" else 1.0
             ),
+            swiglu_limit=swiglu_limit,
         )
         return _mxfp4_a4w4_stage2_fw(
             inter_q,
@@ -6722,7 +6766,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         )
 
     @staticmethod
-    def _torch_ref(data, topk, dtype, activation):
+    def _torch_ref(data, topk, dtype, activation, swiglu_limit=None):
         ref1 = FmoeTuner.run_torch_moe_stage1(
             data["a1_qt"],
             data["w1_qt"],
@@ -6736,6 +6780,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
             quant_type=QuantType.per_1x32,
             doweight_stage1=False,
             topk=topk,
+            swiglu_limit=swiglu_limit,
         )
         return FmoeTuner.run_torch_moe_stage2(
             ref1,
@@ -6762,16 +6807,22 @@ class Mxfp4FlydslTuner(FmoeTuner):
             "swiglu": ActivationType.Swiglu,
             "silu": ActivationType.Silu,
         }[self._row_act(row)]
+        limit_env = os.environ.get("AITER_MXFP4_TUNE_SWIGLU_LIMIT")
+        swiglu_limit = None if limit_env in (None, "") else float(limit_env)
         data = self._prepare_case(token, h, e, ne, topk, dtype)
-        out = self._port_e2e(data, kn1, kn2, topk, ne, h, dtype)
-        ref = self._torch_ref(data, topk, dtype, activation)
+        out = self._port_e2e(
+            data, kn1, kn2, topk, ne, h, dtype, swiglu_limit=swiglu_limit
+        )
+        ref = self._torch_ref(data, topk, dtype, activation, swiglu_limit=swiglu_limit)
         err = cosine_diff_compare(ref, out, msg=f"port[{kn1}+{kn2}]")
         # NaN must reject explicitly: `nan > errRatio` is False, so a candidate
         # producing garbage would otherwise pass the gate and, being fast, win.
         if err is None or not math.isfinite(float(err)) or float(err) > args.errRatio:
             raise RuntimeError(f"cosine err_ratio {err} > {args.errRatio}")
         _, us = run_perftest(
-            lambda: self._port_e2e(data, kn1, kn2, topk, ne, h, dtype),
+            lambda: self._port_e2e(
+                data, kn1, kn2, topk, ne, h, dtype, swiglu_limit=swiglu_limit
+            ),
             num_warmup=int(args.warmup),
             num_iters=int(args.iters),
         )
@@ -7031,7 +7082,10 @@ if __name__ == "__main__":
         "use_g1u1",
         "doweight_stage1",
     ]
-    grouped_key = key + ["gate_mode"]
+    # ep_fused is part of the shape identity (gemm2 doing the EP scatter shifts
+    # the stage2 tile optimum), so it must be in the dedup key or the write-back
+    # collapses an ep_fused row into the generic one for the same shape.
+    grouped_key = key + ["gate_mode", "ep_fused"]
     resultList = [
         "block_m",
         "ksplit",
@@ -7081,7 +7135,7 @@ if __name__ == "__main__":
             "mxfp4FlydslTuner", key, resultList, "mxfp4 a4w4 flydsl port fmoe tuner"
         )
     else:
-        tuner = FmoeTuner("fmoeTuner", key, resultList, "fmoe tuner")
+        tuner = FmoeTuner("fmoeTuner", key, resultList + ["nt"], "fmoe tuner")
     args = tuner.parse_args()
 
     if args.e2e_tune:
