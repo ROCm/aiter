@@ -1,4 +1,20 @@
 {
+    "M_BOUNDS": [
+        1,
+        4,
+        8,
+        16,
+        32,
+        64,
+        128,
+        256,
+        512,
+        1024,
+        1536,
+        2048,
+        4096,
+        8192
+    ],
     "M_LEQ_128": {
         "BLOCK_M": 128,
         "BLOCK_N": 128,
@@ -11,6 +27,51 @@
     "M_LEQ_256": {
         "BLOCK_M": 256,
         "BLOCK_N": 128,
+        "BLOCK_K": 64,
+        "NUM_BUFFERS": 3,
+        "num_warps": 4,
+        "kernel_type": "compute_bound",
+        "persistent": false
+    },
+    "M_LEQ_512": {
+        "BLOCK_M": 256,
+        "BLOCK_N": 256,
+        "BLOCK_K": 64,
+        "NUM_BUFFERS": 3,
+        "num_warps": 4,
+        "kernel_type": "compute_bound",
+        "persistent": false
+    },
+    "M_LEQ_1024": {
+        "BLOCK_M": 256,
+        "BLOCK_N": 128,
+        "BLOCK_K": 128,
+        "NUM_BUFFERS": 3,
+        "num_warps": 4,
+        "kernel_type": "compute_bound",
+        "persistent": false
+    },
+    "M_LEQ_1536": {
+        "BLOCK_M": 256,
+        "BLOCK_N": 128,
+        "BLOCK_K": 128,
+        "NUM_BUFFERS": 3,
+        "num_warps": 4,
+        "kernel_type": "compute_bound",
+        "persistent": false
+    },
+    "M_LEQ_2048": {
+        "BLOCK_M": 256,
+        "BLOCK_N": 256,
+        "BLOCK_K": 64,
+        "NUM_BUFFERS": 3,
+        "num_warps": 4,
+        "kernel_type": "compute_bound",
+        "persistent": false
+    },
+    "M_LEQ_4096": {
+        "BLOCK_M": 256,
+        "BLOCK_N": 256,
         "BLOCK_K": 64,
         "NUM_BUFFERS": 3,
         "num_warps": 4,
