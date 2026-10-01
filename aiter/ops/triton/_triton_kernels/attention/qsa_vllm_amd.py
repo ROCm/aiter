@@ -270,6 +270,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     num_rows,
     num_cache_blocks,
     num_requests,
+    softmax_scale_log2,
     TOPK: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     PAGE_TABLE_WIDTH: tl.constexpr,
@@ -303,7 +304,6 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     max_value = tl.full((BLOCK_M,), -1.0e20, dtype=tl.float32)
     normalizer = tl.zeros((BLOCK_M,), dtype=tl.float32)
     accumulator = tl.zeros((BLOCK_M, HEAD_DIM), dtype=tl.float32)
-    softmax_scale_log2: tl.constexpr = (HEAD_DIM**-0.5) * 1.4426950408889634
 
     # Dynamic bounds avoid padded main-loop iterations for uneven splits.
     split_tile_start = split_id * NUM_TILES // NUM_SPLITS
@@ -476,6 +476,7 @@ def qsa_mqa_paged(
     """Compute QSA scores from a paged compressed-key cache.
 
     ``score_scale`` is a *divisor* (vLLM default ``sqrt(head_dim)``).
+    Zero is rejected. A negative divisor flips the score sign.
     """
     _validate_mqa(q)
     if not q.is_cuda:
@@ -495,8 +496,10 @@ def qsa_mqa_paged(
     if compress_ratio <= 0:
         raise ValueError("QSA compression ratio must be positive")
     score_divisor = math.sqrt(q.shape[2]) if score_scale is None else score_scale
-    if score_divisor <= 0:
-        raise ValueError("QSA score scale must be positive")
+    # A divisor of zero is undefined. Negative is a signed scale: the layer
+    # multiplies by the reciprocal, so this has to accept that sign.
+    if score_divisor == 0:
+        raise ValueError("QSA score scale must be non-zero")
 
     capacity = page_table.shape[1] * k_cache.shape[1]
     columns = capacity if num_columns is None else num_columns
@@ -610,8 +613,13 @@ def qsa_select_paged_tokens(
     token_topk: int,
     compress_ratio: int,
     out: torch.Tensor | None = None,
+    score_scale: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Score + HIP top-k + expand. Returns ``(token_indices, block_ids)``."""
+    """Score + HIP top-k + expand. Returns ``(token_indices, block_ids)``.
+
+    ``score_scale`` is the MQA divisor (default ``sqrt(head_dim)``), not the
+    multiplier ``qsa_layer`` applies.
+    """
     rows = q.shape[0]
     output_width = token_topk + compress_ratio - 1
     if out is None:
@@ -641,6 +649,7 @@ def qsa_select_paged_tokens(
             query_positions[row_slice],
             sequence_lengths,
             compress_ratio,
+            score_scale=score_scale,
         )
         blocks = blocks_buffer[: row_end - row_start]
         _topk_per_row_amd(logits, visible_blocks, blocks, block_topk)
@@ -665,8 +674,13 @@ def qsa_sparse_paged_attention(
     block_table: torch.Tensor,
     token_to_req: torch.Tensor,
     out: torch.Tensor | None = None,
+    softmax_scale: float | None = None,
 ) -> torch.Tensor:
-    """Sparse GQA over paged BF16 K/V (live AMD: ``num_stages=1``)."""
+    """Sparse GQA over paged BF16 K/V (live AMD: ``num_stages=1``).
+
+    ``softmax_scale`` multiplies QK before the softmax. ``None`` is
+    ``head_dim**-0.5``. Zero is that multiplier, not the default.
+    """
     if not q.is_cuda:
         raise RuntimeError("paged QSA sparse attention requires a GPU")
     if q.ndim != 3 or k_cache.ndim != 4 or v_cache.shape != k_cache.shape:
@@ -695,6 +709,9 @@ def qsa_sparse_paged_attention(
         raise ValueError(
             f"QSA sparse attention out must be on {q.device}, got {out.device}"
         )
+    if softmax_scale is None:
+        softmax_scale = head_dim**-0.5
+    softmax_scale_log2 = float(softmax_scale) * 1.4426950408889634
     if not q.shape[0]:
         return out
 
@@ -757,6 +774,7 @@ def qsa_sparse_paged_attention(
         q.shape[0],
         k_cache.shape[0],
         block_table.shape[0],
+        softmax_scale_log2,
         TOPK=logical_indices.shape[1],
         PAGE_SIZE=k_cache.shape[1],
         PAGE_TABLE_WIDTH=block_table.shape[1],
