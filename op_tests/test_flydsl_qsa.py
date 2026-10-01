@@ -2521,6 +2521,104 @@ def test_qsa_auto_rejects_a_selection_k1_cannot_build():
             )
 
 
+def test_qsa_layer_triton_threads_scales():
+    """Triton must apply the same multipliers FlyDSL does.
+
+    MQA divides, so a layer ``score_scale`` of 0.5 arrives as the divisor 2.
+    ``softmax_scale=0`` stays zero instead of falling back to ``D**-0.5``.
+    """
+    import aiter.ops.triton.attention.qsa_vllm_amd as amd
+
+    seen = {}
+
+    def select(
+        q,
+        k_cache,
+        page_table,
+        token_to_req,
+        query_positions,
+        sequence_lengths,
+        token_topk,
+        compress_ratio,
+        out=None,
+        score_scale=None,
+    ):
+        seen["divisor"] = score_scale
+        rows = q.shape[0]
+        width = token_topk + compress_ratio - 1
+        blocks = token_topk // compress_ratio
+        return (
+            torch.zeros(rows, width, dtype=torch.int32),
+            torch.zeros(rows, blocks, dtype=torch.int32),
+        )
+
+    def attend(
+        q,
+        k_cache,
+        v_cache,
+        logical_indices,
+        block_table,
+        token_to_req,
+        out=None,
+        softmax_scale=None,
+    ):
+        seen["softmax"] = softmax_scale
+        return q
+
+    measured = _policy_args(1, 24, 256, 128, 16, 4, 128)
+    rows = torch.zeros(1, dtype=torch.int32)
+    old_select = amd.qsa_select_paged_tokens
+    old_attend = amd.qsa_sparse_paged_attention
+    amd.qsa_select_paged_tokens = select
+    amd.qsa_sparse_paged_attention = attend
+    try:
+        (
+            q_indexer,
+            index_cache,
+            index_table,
+            q_gqa,
+            k_cache,
+            v_cache,
+            kv_table,
+            indices,
+        ) = measured
+
+        def run(score_scale, softmax_scale):
+            seen.clear()
+            qsa_layer(
+                q_indexer,
+                index_cache,
+                index_table,
+                q_gqa,
+                k_cache,
+                v_cache,
+                kv_table,
+                rows,
+                rows,
+                torch.ones(1, dtype=torch.int32),
+                indices=indices,
+                score_scale=score_scale,
+                softmax_scale=softmax_scale,
+                backend="triton",
+            )
+
+        run(0.5, 0.0)
+        if seen["divisor"] != 2.0 or seen["softmax"] != 0.0:
+            raise AssertionError(f"scales arrived as {seen}")
+        run(None, None)
+        if seen["divisor"] is not None or seen["softmax"] is not None:
+            raise AssertionError(f"defaults arrived as {seen}")
+        run(0.0, None)
+        if seen["divisor"] != float("inf"):
+            raise AssertionError(f"zero indexer scale arrived as {seen['divisor']}")
+        run(-0.25, None)
+        if seen["divisor"] != -4.0:
+            raise AssertionError(f"negative indexer scale arrived as {seen['divisor']}")
+    finally:
+        amd.qsa_select_paged_tokens = old_select
+        amd.qsa_sparse_paged_attention = old_attend
+
+
 def test_k2_serves_rejects_shapes_the_builder_rejects():
     """A geometry ``build_qsa_k2_module`` raises on is a reason here.
 
@@ -3128,6 +3226,7 @@ def _run_unit_cases():
     test_qsa_backend_default_is_auto()
     test_qsa_auto_admits_only_measured_pairs()
     test_qsa_auto_rejects_a_selection_k1_cannot_build()
+    test_qsa_layer_triton_threads_scales()
     test_k2_serves_rejects_shapes_the_builder_rejects()
     test_qsa_auto_logs_unmeasured_query_once()
     test_qsa_aot_collector_lists_family_a_launches()
