@@ -202,9 +202,10 @@ def launch_gemm_a8w4_tdm(
         if LDS_SOA_LOAD_INTERLEAVE is None
         else LDS_SOA_LOAD_INTERLEAVE
     )
-    assert lds_soa_load_interleave_on in (0, 1), (
-        "lds_soa_load_interleave must be 0 or 1"
-    )
+    assert lds_soa_load_interleave_on in (
+        0,
+        1,
+    ), "lds_soa_load_interleave must be 0 or 1"
     planar_lds_on = int(bool(PLANAR_LDS or lds_soa_load_interleave_on))
     interleaved_lds_load_on = int(
         bool(INTERLEAVED_LDS_LOAD or lds_soa_load_interleave_on)
