@@ -33,9 +33,18 @@ on:
         description: Test the compiler-only logging patch (no prebuild or global verbosity)
         type: boolean
         default: false
+      triage_remaining:
+        description: Replay the two remaining PR 5989 failures with pinned inputs
+        type: boolean
+        default: false
+      triage_mode:
+        description: Isolated PR 5989 experiment (does not modify the production PR)
+        type: choice
+        options: [audit, baseline, affinity, prebuild, ipc-copy]
+        default: baseline
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}${{ inputs.triage && format('-{0}', inputs.triage_model) || '' }}
+  group: ${{ github.workflow }}-${{ github.ref }}${{ (inputs.triage || inputs.triage_remaining) && format('-{0}-{1}', inputs.triage_model, inputs.triage_mode) || '' }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
@@ -59,11 +68,11 @@ jobs:
 
   check-signal:
     if: >-
-      github.event_name != 'pull_request' ||
+      !inputs.triage_remaining && (github.event_name != 'pull_request' ||
       (github.event.pull_request.draft == false &&
       (contains(github.event.pull_request.labels.*.name, 'ci:atom') ||
       contains(github.event.pull_request.labels.*.name, 'ci:atom_full') ||
-      contains(github.event.pull_request.labels.*.name, 'ci:all')))
+      contains(github.event.pull_request.labels.*.name, 'ci:all'))))
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -78,11 +87,11 @@ jobs:
 
   load-atom-models:
     if: >-
-      github.event_name != 'pull_request' ||
+      !inputs.triage_remaining && (github.event_name != 'pull_request' ||
       (github.event.pull_request.draft == false &&
       (contains(github.event.pull_request.labels.*.name, 'ci:atom') ||
       contains(github.event.pull_request.labels.*.name, 'ci:atom_full') ||
-      contains(github.event.pull_request.labels.*.name, 'ci:all')))
+      contains(github.event.pull_request.labels.*.name, 'ci:all'))))
     runs-on: ubuntu-latest
     outputs:
       models_json: ${{ steps.models.outputs.models_json }}
@@ -234,11 +243,11 @@ jobs:
 
   atom_benchmark:
     if: >-
-      github.event_name != 'pull_request' ||
+      !inputs.triage_remaining && (github.event_name != 'pull_request' ||
       (github.event.pull_request.draft == false &&
       (contains(github.event.pull_request.labels.*.name, 'ci:atom') ||
       contains(github.event.pull_request.labels.*.name, 'ci:atom_full') ||
-      contains(github.event.pull_request.labels.*.name, 'ci:all')))
+      contains(github.event.pull_request.labels.*.name, 'ci:all'))))
     needs: [check-signal, load-atom-models, ci_config]
     name: Accuracy (${{ matrix.display_name }}, ${{ matrix.runner }})
     strategy:
@@ -602,3 +611,60 @@ jobs:
         run: |
           docker stop atom_aiter_test || true
           docker rm atom_aiter_test || true
+
+  remaining-failures:
+    if: inputs.triage_remaining && github.ref == 'refs/heads/leo/atom-ci-triage'
+    needs: [ci_config]
+    name: PR5989 (${{ inputs.triage_model }}, ${{ inputs.triage_mode }})
+    runs-on: ${{ inputs.triage_model == 'Kimi-K3' && 'linux-aiter-do-mi350x-8' || 'linux-aiter-do-mi350x-4' }}
+    timeout-minutes: 170
+    steps:
+      - name: Checkout the failed ATOM revision
+        uses: actions/checkout@v4
+        with:
+          repository: ROCm/ATOM
+          ref: 922b3519628a002ae9dbdd4d30683e17d372ff00
+          persist-credentials: false
+
+      - name: Checkout the experiment driver
+        uses: actions/checkout@v4
+        with:
+          repository: ROCm/aiter
+          ref: ${{ github.sha }}
+          path: .aiter-ci-tools
+          sparse-checkout: .github/scripts/atom-ci
+          persist-credentials: false
+
+      - name: Docker login
+        env:
+          DOCKER_USERNAME: ${{ secrets[needs.ci_config.outputs.docker_username_secret] }}
+          DOCKER_PASSWORD: ${{ secrets[needs.ci_config.outputs.docker_password_secret] }}
+        run: echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin
+
+      - name: Replay with isolated diagnostics
+        timeout-minutes: 155
+        env:
+          MODEL: ${{ inputs.triage_model }}
+          MODE: ${{ inputs.triage_mode }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
+        run: |
+          python3 -u .aiter-ci-tools/.github/scripts/atom-ci/remaining/run.py \
+            --model "$MODEL" --mode "$MODE"
+
+      - name: Clean up only this experiment's container
+        if: always()
+        run: |
+          if [ -f atom_diagnostics/container-name.txt ]; then
+            name=$(cat atom_diagnostics/container-name.txt)
+            if [[ "$name" =~ ^atom-pr5989-[a-f0-9]{12}$ ]]; then
+              docker rm -f "$name" || true
+            fi
+          fi
+
+      - name: Upload experiment evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr5989-${{ inputs.triage_model }}-${{ inputs.triage_mode }}-${{ github.run_id }}
+          path: atom_diagnostics/
+          retention-days: 7

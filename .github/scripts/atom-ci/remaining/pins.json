@@ -1,0 +1,23 @@
+{
+  "run": "https://github.com/ROCm/aiter/actions/runs/36712689029",
+  "aiter": "9a0aed1ae5ed9527b81a9fc40ebef9007a8e51fe",
+  "atom": "922b3519628a002ae9dbdd4d30683e17d372ff00",
+  "image": "rocm/atom-dev@sha256:b0f81ddb9095b0e016d8589f8aa6ba969d19151bcb349d14a02d32f27480be76",
+  "packages": {
+    "torch": "2.10.0+rocm7.2.4.lw.git3d3aa833",
+    "triton": "3.8.0+amd.rocm7.2.0.git7cb7b059",
+    "pybind11": "3.1.0"
+  },
+  "models": {
+    "Kimi-K3": {
+      "gpus": 8,
+      "revision": "f831ab66814297da540d832a5235f8e904f29d06",
+      "job": "109878138767"
+    },
+    "Kimi-K2.7-Code-MXFP4": {
+      "gpus": 4,
+      "revision": "dd515255b28d3607bff56b4869a36e7db02a0ffc",
+      "job": "109878138790"
+    }
+  }
+}

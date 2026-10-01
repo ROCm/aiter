@@ -1,0 +1,12 @@
+diff --git a/aiter/dist/device_communicators/custom_all_reduce.py b/aiter/dist/device_communicators/custom_all_reduce.py
+--- a/aiter/dist/device_communicators/custom_all_reduce.py
++++ b/aiter/dist/device_communicators/custom_all_reduce.py
+@@ -779,7 +779,7 @@
+         group: ProcessGroup,
+         device: int | str | torch.device,
+         max_size=1024 * 1024 * 1024,  # 2GB bf16/half
+-        enable_register_for_capturing: bool = True,
++        enable_register_for_capturing: bool = False,
+     ) -> None:
+         """
+         Args:
