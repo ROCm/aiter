@@ -50,7 +50,8 @@ from .ops.iq2r import (
 HIDDEN = 6144
 EXPERTS = 257
 TOPK = 9
-MAX_DECODE_TOKENS = 256
+MAX_DECODE_TOKENS = 1024  # decode kernels cover M2..1024 (tuned rows may pick them)
+DEFAULT_DECODE_TOKENS = 256  # untuned shapes switch to the prefill kernels above this
 MAX_CHUNK_TOKENS = 4096
 INTERMEDIATE_SIZES = (256, 512)  # TP8, TP4
 
@@ -240,7 +241,7 @@ class IQ2RGlm53Config:
 
 
 def _default_config(tokens: int, intermediate_size: int) -> IQ2RGlm53Config:
-    if tokens > MAX_DECODE_TOKENS:
+    if tokens > DEFAULT_DECODE_TOKENS:
         return IQ2RGlm53Config("prefill", 2, "prefill", 0, 1 if tokens <= 2560 else 2)
     down = "route9" if tokens in (1, 2, 4) else "packed"
     return IQ2RGlm53Config("decode", 2, down, 4, 1)
@@ -419,7 +420,7 @@ def iq2r_glm53_moe_out(
             quant, quant_scales, gate_up_data, gate_up_auxiliary, tasks, count,
             intermediate, intermediate_scales,
         )  # fmt: skip
-    elif tokens <= MAX_DECODE_TOKENS:
+    elif config.gate_kernel != "prefill" and tokens <= MAX_DECODE_TOKENS:
         # One launch sorts routes into M32 down / M16 gate tasks and quantizes
         # each token row once; the gate gathers rows through ``gather``.
         tasks = tasks[: _task_capacity(routes, 32)]

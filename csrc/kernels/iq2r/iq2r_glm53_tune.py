@@ -66,7 +66,8 @@ def candidates(tokens: int, intermediate_size: int):
     tp8 = intermediate_size == 256
     if tokens == 1:
         yield IQ2RGlm53Config("decode", 2, "route9", 4, 1)
-    elif tokens <= MAX_DECODE_TOKENS:
+        return
+    if tokens <= MAX_DECODE_TOKENS:
         gates = ("decode", "nobarrier") if tp8 else ("decode",)
         downs = [("route9", 4)] if tokens in (2, 4) else []
         down_kernels = ("packed", "ordered") if tp8 else ("packed",)
@@ -74,22 +75,34 @@ def candidates(tokens: int, intermediate_size: int):
         for gate, grid in itertools.product(gates, (1, 2, 4)):
             for down, down_grid in downs:
                 yield IQ2RGlm53Config(gate, grid, down, down_grid, 1)
-    else:
+    if tokens > 16:
         for grid, chunks in itertools.product((1, 2, 4), (1, 2)):
             yield IQ2RGlm53Config("prefill", grid, "prefill", 0, chunks)
 
 
 def time_us(fn, warmup: int, iters: int) -> float:
-    for _ in range(warmup):
-        fn()
+    """Replay time of a CUDA graph of ``fn``: serving captures decode batches,
+    so host launch overhead (several launches on the prefill path) is excluded."""
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            fn()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for _ in range(10):
+            fn()
+    for _ in range(max(warmup // 10, 1)):
+        graph.replay()
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
     for _ in range(iters):
-        fn()
+        graph.replay()
     end.record()
     torch.cuda.synchronize()
-    return start.elapsed_time(end) * 1000.0 / iters
+    return start.elapsed_time(end) * 100.0 / iters
 
 
 def tune_shape(tokens: int, intermediate_size: int, weights, args) -> dict:

@@ -5415,8 +5415,8 @@ void iq2r_glm53_gate_out(const aiter_tensor_t& activations,
     const bool prefill = kernel == kGlm53GatePrefill;
     AITER_CHECK(kernel == kGlm53GateDecode || prefill || (kernel == kGlm53GateDecodeNoBarrier && !tp4),
                 "GLM-5.3 IQ2R gate kernel id");
-    AITER_CHECK(prefill ? (tokens >= 257 && tokens <= 4096) : (tokens >= 2 && tokens <= 256),
-                "GLM-5.3 IQ2R gate token range: decode 2..256, prefill 257..4096");
+    AITER_CHECK(tokens >= 2 && tokens <= (prefill ? 4096 : 1024),
+                "GLM-5.3 IQ2R gate token range: decode 2..1024, prefill 2..4096");
     const int rows = prefill ? 64 : 16;
     glm53_check_tasks(tasks, task_count, (routes + rows - 1) / rows + std::min(routes, 258));
     HipDeviceGuard device_guard(data.device_id);
@@ -5469,7 +5469,7 @@ void iq2r_glm53_down_out(const aiter_tensor_t& activations,
     const bool tp4 = K == 512;
     glm53_check_device({&activations, &scales, &auxiliary, &tasks, &task_count, &output}, data);
     const int routes = static_cast<int>(activations.size(0));
-    AITER_CHECK(routes >= 2 * kGlm53TopK && routes <= 256 * kGlm53TopK, "GLM-5.3 IQ2R decode down covers M2..256");
+    AITER_CHECK(routes >= 2 * kGlm53TopK && routes <= 1024 * kGlm53TopK, "GLM-5.3 IQ2R decode down covers M2..1024");
     glm53_check_tasks(tasks, task_count, (routes + 31) / 32 + std::min(routes, 258));
     AITER_CHECK(output.dtype() == AITER_DTYPE_bf16 && output.dim() == 2 && output.size(0) == routes &&
                     output.size(1) == kGlm53Hidden,
@@ -5559,7 +5559,7 @@ void iq2r_glm53_down_reduce_out(const aiter_tensor_t& activations,
         data);
     const int routes = static_cast<int>(activations.size(0));
     const int tokens = routes / kGlm53TopK;
-    AITER_CHECK(tokens >= 257 && tokens <= 4096, "GLM-5.3 IQ2R prefill down covers M257..4096");
+    AITER_CHECK(tokens >= 2 && tokens <= 4096, "GLM-5.3 IQ2R prefill down covers M2..4096");
     glm53_check_tasks(tasks, task_count, (routes + 63) / 64 + std::min(routes, 258));
     AITER_CHECK(route_output.dtype() == AITER_DTYPE_bf16 && route_output.dim() == 2 &&
                     route_output.size(0) == routes && route_output.size(1) == kGlm53Hidden,

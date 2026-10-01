@@ -1386,7 +1386,7 @@ __device__ __forceinline__ void glm53_sort_routes(
     __syncthreads();
 
     const int local_tasks = (counts[expert] + task_rows - 1) / task_rows;
-    // Each prefix fits in 16 bits: routes <= 2304. Summing the packed pair
+    // Each task prefix fits in 16 bits: routes <= 9216 give at most 834 tasks. Summing the packed pair
     // cannot carry from the low field to the high.
     const int local_gate_tasks=(counts[expert]+15)/16;
     const int packed_prefix=iq2r_block_inclusive_scan_256(local_tasks+(local_gate_tasks<<16),wave_totals);
@@ -2427,7 +2427,7 @@ void glm53_check_task_table(const aiter_tensor_t& tasks,
 
 } // namespace
 
-// Decode front end for 2..256 tokens: block 0 sorts the 9 routes per token
+// Decode front end for 2..1024 tokens: block 0 sorts the 9 routes per token
 // into M32 down tasks and M16 gate tasks, the remaining blocks quantize each
 // token row once to MXFP8 in token order.
 void iq2r_glm53_sort_quant_out(const aiter_tensor_t& input,
@@ -2445,8 +2445,8 @@ void iq2r_glm53_sort_quant_out(const aiter_tensor_t& input,
     const int device = input.device_id;
     AITER_CHECK(input.is_gpu() && input.dtype() == AITER_DTYPE_bf16 && input.dim() == 2 &&
                     input.size(1) == kGlm53Hidden && input.stride(1) == 1 &&
-                    input.size(0) >= 2 && input.size(0) <= 256,
-                "GLM-5.3 IQ2R sort-quant expects BF16 [2..256, 6144]");
+                    input.size(0) >= 2 && input.size(0) <= 1024,
+                "GLM-5.3 IQ2R sort-quant expects BF16 [2..1024, 6144]");
     const int tokens     = static_cast<int>(input.size(0));
     const int64_t routes = static_cast<int64_t>(tokens) * kGlm53TopK;
     glm53_check_routes(
