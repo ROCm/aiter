@@ -3,6 +3,8 @@
 
 import argparse
 import copy
+import subprocess
+import sys
 
 import pandas as pd
 import torch
@@ -3121,6 +3123,170 @@ def test_fused_qk_norm_rope_cache_pts_q_fp8(head_size, q_scale_val, eps=1e-6):
     }
 
 
+def test_fused_qk_norm_rope_cache_pts_q_fp8_validation(case=None):
+    """Reject invalid optional FP8 Q output contracts before kernel launch."""
+    dev = "cuda"
+    dtype = torch.bfloat16
+    fp8 = get_dtype_fp8()
+    nt, hq, hk, hv, head_size = 1, 4, 1, 1, 128
+
+    qkv = torch.randn(nt, (hq + hk + hv) * head_size, dtype=dtype, device=dev)
+    qw = torch.randn(head_size, dtype=dtype, device=dev)
+    kw = torch.randn(head_size, dtype=dtype, device=dev)
+    cos_sin = torch.randn(8, head_size, dtype=dtype, device=dev)
+    positions = torch.zeros(nt, dtype=torch.int64, device=dev)
+    q_out = torch.empty(nt, hq * head_size, dtype=dtype, device=dev)
+    slot_mapping = torch.zeros(nt, dtype=torch.int64, device=dev)
+    k_scale = torch.ones(1, dtype=torch.float32, device=dev)
+    v_scale = torch.ones(1, dtype=torch.float32, device=dev)
+
+    def run(q_out_fp8, q_scale, cache_dtype=fp8):
+        k_cache = torch.zeros(1, 1, hk, head_size, dtype=cache_dtype, device=dev)
+        v_cache = torch.zeros(1, 1, hv, head_size, dtype=cache_dtype, device=dev)
+        aiter.fused_qk_norm_rope_cache_pts_quant_shuffle(
+            qkv.clone(),
+            qw,
+            kw,
+            cos_sin,
+            positions,
+            nt,
+            hq,
+            hk,
+            hv,
+            head_size,
+            True,
+            1e-6,
+            q_out,
+            k_cache,
+            v_cache,
+            slot_mapping,
+            k_scale,
+            v_scale,
+            None,
+            None,
+            False,
+            False,
+            1,
+            16 // k_cache.element_size(),
+            0,
+            False,
+            q_out_fp8,
+            q_scale,
+        )
+
+    valid_out = torch.empty(nt, hq * head_size, dtype=fp8, device=dev)
+    valid_scale = torch.ones(1, dtype=torch.float32, device=dev)
+    cases = [
+        (
+            "output_without_scale",
+            "must be provided together",
+            lambda: run(valid_out, None),
+        ),
+        (
+            "scale_without_output",
+            "must be provided together",
+            lambda: run(None, valid_scale),
+        ),
+        (
+            "wrong_output_dtype",
+            "q_fp8 dtype",
+            lambda: run(torch.empty_like(q_out), valid_scale),
+        ),
+        (
+            "noncontiguous_output",
+            "q_fp8 must be contiguous",
+            lambda: run(
+                torch.empty(nt, hq * head_size * 2, dtype=fp8, device=dev)[..., ::2],
+                valid_scale,
+            ),
+        ),
+        (
+            "undersized_output",
+            "q_out_fp8 must contain at least",
+            lambda: run(
+                torch.empty(nt * hq * head_size - 1, dtype=fp8, device=dev), valid_scale
+            ),
+        ),
+        (
+            "cpu_output",
+            "q_fp8 must be a GPU tensor",
+            lambda: run(torch.empty(nt * hq * head_size, dtype=fp8), valid_scale),
+        ),
+        (
+            "wrong_scale_dtype",
+            "q_scale dtype",
+            lambda: run(valid_out, torch.ones(1, dtype=dtype, device=dev)),
+        ),
+        (
+            "empty_scale",
+            "must contain exactly one element",
+            lambda: run(valid_out, torch.empty(0, dtype=torch.float32, device=dev)),
+        ),
+        (
+            "multi_element_scale",
+            "must contain exactly one element",
+            lambda: run(valid_out, torch.ones(2, dtype=torch.float32, device=dev)),
+        ),
+        (
+            "cpu_scale",
+            "q_scale must be a GPU tensor",
+            lambda: run(valid_out, torch.ones(1, dtype=torch.float32)),
+        ),
+        (
+            "non_fp8_cache",
+            "supported only with an fp8 KV cache",
+            lambda: run(valid_out, valid_scale, dtype),
+        ),
+    ]
+
+    if torch.cuda.device_count() > 1:
+        other_dev = "cuda:1" if torch.cuda.current_device() == 0 else "cuda:0"
+        cases.extend(
+            [
+                (
+                    "different_device_output",
+                    "must be on the same GPU as qkv",
+                    lambda: run(
+                        torch.empty(nt * hq * head_size, dtype=fp8, device=other_dev),
+                        valid_scale,
+                    ),
+                ),
+                (
+                    "different_device_scale",
+                    "must be on the same GPU as qkv",
+                    lambda: run(
+                        valid_out, torch.ones(1, dtype=torch.float32, device=other_dev)
+                    ),
+                ),
+            ]
+        )
+
+    if case is not None:
+        matching = [item for item in cases if item[0] == case]
+        assert matching, f"unknown q_fp8 validation case: {case}"
+        matching[0][2]()
+        raise AssertionError(f"{case}: invalid arguments were accepted")
+
+    for name, expected, _ in cases:
+        code = (
+            "from op_tests.test_fused_qk_norm_rope_cache_quant import "
+            "test_fused_qk_norm_rope_cache_pts_q_fp8_validation as test; "
+            f"test(case={name!r})"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True, check=False
+        )
+        output = completed.stdout + completed.stderr
+        assert completed.returncode != 0, f"{name}: invalid arguments were accepted"
+        assert expected in output, (
+            f"{name}: expected failure containing {expected!r}; "
+            f"rc={completed.returncode} output={output!r}"
+        )
+    print(
+        f"[PASS] q_fp8 validation rejected {len(cases)} invalid contracts", flush=True
+    )
+
+
 @benchmark()
 def test_fused_qk_norm_rope_cache_pts_v_norm(
     dtype,
@@ -3647,6 +3813,7 @@ if __name__ == "__main__":
         "fused_qk_norm_rope_cache_pts_q_fp8 summary (markdown):\n%s",
         df.to_markdown(index=False),
     )
+    test_fused_qk_norm_rope_cache_pts_q_fp8_validation()
     # Weightless V-norm (Gemma4): head_dim 256 (sliding) + 512 (full attention),
     # v_norm on/off. (cache_dtype, v_scale) pairs: a same-dtype cache (scale is a
     # no-op) plus fp8 at unit and non-trivial scale to check norm-then-quantize.

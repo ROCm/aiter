@@ -21,6 +21,7 @@
 #define AITER_NO_TORCH_TYPES
 #include <cmath>
 #include <cstdlib>
+#include <limits>
 #include <type_traits>
 
 #include "aiter_dispatch.h"
@@ -3293,6 +3294,47 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
     AITER_CHECK(k_cache.stride(k_cache.dim() - 1) == 1 &&
                     v_cache.stride(v_cache.dim() - 1) == 1,
                 "k_cache/v_cache innermost (head_size) dim must be contiguous");
+    // --- Validate optional fp8 Q output ---
+    const bool has_q_out_fp8 = q_out_fp8.has_value();
+    const bool has_q_scale   = per_tensor_q_scale.has_value();
+    AITER_CHECK(has_q_out_fp8 == has_q_scale,
+                "q_out_fp8 and per_tensor_q_scale must be provided together");
+
+    if(has_q_out_fp8)
+    {
+        const auto& q_fp8   = *q_out_fp8;
+        const auto& q_scale = *per_tensor_q_scale;
+
+        CHECK_INPUT(q_fp8);
+        CHECK_INPUT(q_scale);
+        CHECK_TYPE(q_fp8, AITER_DTYPE_fp8);
+        CHECK_TYPE(q_scale, AITER_DTYPE_fp32);
+        AITER_CHECK(q_fp8.device_id == qkv.device_id && q_scale.device_id == qkv.device_id,
+                    "q_out_fp8 and per_tensor_q_scale must be on the same GPU as qkv");
+        AITER_CHECK(num_tokens >= 0 && num_heads_q > 0 && head_size > 0,
+                    "num_tokens must be non-negative and num_heads_q/head_size must be positive");
+
+        const size_t tokens = static_cast<size_t>(num_tokens);
+        const size_t heads  = static_cast<size_t>(num_heads_q);
+        const size_t dim    = static_cast<size_t>(head_size);
+        AITER_CHECK(tokens == 0 || heads <= std::numeric_limits<size_t>::max() / tokens,
+                    "num_tokens * num_heads_q overflows size_t");
+        const size_t token_heads = tokens * heads;
+        AITER_CHECK(token_heads == 0 || dim <= std::numeric_limits<size_t>::max() / token_heads,
+                    "num_tokens * num_heads_q * head_size overflows size_t");
+        const size_t required_q_elements = token_heads * dim;
+        AITER_CHECK(q_fp8.numel() >= required_q_elements,
+                    "q_out_fp8 must contain at least ",
+                    required_q_elements,
+                    " elements, got ",
+                    q_fp8.numel());
+        AITER_CHECK(q_scale.numel() == 1,
+                    "per_tensor_q_scale must contain exactly one element, got ",
+                    q_scale.numel());
+        AITER_CHECK(k_cache.dtype() == AITER_DTYPE_fp8,
+                    "q_out_fp8 is supported only with an fp8 KV cache");
+    }
+
     HipDeviceGuard device_guard(qkv.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
     auto kv_cache_dtype      = k_cache.dtype();
@@ -3302,11 +3344,10 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
     float per_tensor_v_scale_ = *reinterpret_cast<float*>(per_tensor_v_scale.data_ptr());
     // Optional fp8 Q output (static per-tensor scale). When q_out_fp8 is absent the
     // kernel writes only bf16 q_out; the scale is unused in that case.
-    const bool quant_q = q_out_fp8.has_value();
-    float per_tensor_q_scale_ =
-        (quant_q && per_tensor_q_scale.has_value())
-            ? *reinterpret_cast<float*>(per_tensor_q_scale.value().data_ptr())
-            : 1.0f;
+    const bool quant_q = has_q_out_fp8;
+    float per_tensor_q_scale_ = quant_q
+                                    ? *reinterpret_cast<float*>(per_tensor_q_scale->data_ptr())
+                                    : 1.0f;
     // K/V cache indexing is stride-aware in block/token/head (innermost head_size
     // assumed contiguous), so most future KV layout changes need no change here.
     int64_t k_cache_block_stride = k_cache.stride(0);
