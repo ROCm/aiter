@@ -36,6 +36,7 @@ import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.qsa import k1 as k1_kernel
+from aiter.ops.flydsl.kernels.qsa.k2 import qsa_k2_serves
 from aiter.ops.flydsl.qsa import (
     gather_paged_cache,
     gather_qsa_caches,
@@ -2401,14 +2402,14 @@ def _family_b_indexer(index_heads):
     raise ValueError(f"family B indexer heads must be 4 or 8, got {index_heads}")
 
 
-def _policy_args(m, hq, d_gqa, n_columns, page_size, n_heads, d_idx):
+def _policy_args(m, hq, d_gqa, n_columns, page_size, n_heads, d_idx, kv_heads=2):
     """Host-only tensors for the auto-backend predicate. Nothing is launched."""
     n_pages = n_columns // page_size
     q_indexer = torch.zeros(m, n_heads, d_idx, dtype=torch.bfloat16)
     q_gqa = torch.zeros(m, hq, d_gqa, dtype=torch.bfloat16)
     index_cache = torch.zeros(n_pages, page_size, 1, d_idx, dtype=torch.bfloat16)
     index_table = torch.zeros(1, n_pages, dtype=torch.int32)
-    k_cache = torch.zeros(n_pages, page_size, 2, d_gqa, dtype=torch.bfloat16)
+    k_cache = torch.zeros(n_pages, page_size, kv_heads, d_gqa, dtype=torch.bfloat16)
     v_cache = torch.zeros_like(k_cache)
     kv_table = torch.zeros(1, n_pages, dtype=torch.int32)
     indices = torch.zeros(m, 2051, dtype=torch.int32)
@@ -2447,23 +2448,72 @@ def test_qsa_auto_admits_only_measured_pairs():
     """
     page = 16
     n_columns = 128
-    for hq, d_gqa, heads in (
-        (24, 256, 4),
-        (24, 256, 8),
-        (12, 256, 4),
-        (12, 256, 8),
-        (6, 256, 4),
-        (6, 256, 8),
-        (3, 256, 4),
-        (3, 256, 8),
-        (10, 128, 4),
-        (10, 128, 8),
+    for hq, d_gqa, kv_heads, heads in (
+        (24, 256, 2, 4),
+        (24, 256, 2, 8),
+        (12, 256, 1, 4),
+        (12, 256, 1, 8),
+        (6, 256, 1, 4),
+        (6, 256, 1, 8),
+        (3, 256, 1, 4),
+        (3, 256, 1, 8),
+        (10, 128, 2, 4),
+        (10, 128, 2, 8),
     ):
-        swept = _policy_args(1, hq, d_gqa, n_columns, page, heads, 128)
+        swept = _policy_args(1, hq, d_gqa, n_columns, page, heads, 128, kv_heads)
         assert qsa_auto_uses_flydsl(*swept) is True
     # An untuned GQA query stays on Triton however it is indexed.
     untuned = _policy_args(1, 16, 128, n_columns, page, 4, 128)
     assert qsa_auto_uses_flydsl(*untuned) is False
+
+
+def test_k2_serves_rejects_shapes_the_builder_rejects():
+    """A geometry ``build_qsa_k2_module`` raises on is a reason here.
+
+    ``auto`` selects FlyDSL only when this predicate accepts the tensors.
+    An indivisible group, a group past the MFMA M=16 tile, a head_dim that
+    is not a multiple of 32, or a zero page size must stay on Triton.
+    """
+
+    def tensors(hq, hkv, d, page):
+        q = torch.zeros(1, hq, d, dtype=torch.bfloat16)
+        k = torch.zeros(1, page, hkv, d, dtype=torch.bfloat16)
+        indices = torch.zeros(1, 8, dtype=torch.int32)
+        table = torch.zeros(1, 1, dtype=torch.int32)
+        return q, k, torch.zeros_like(k), indices, table
+
+    if qsa_k2_serves(*tensors(24, 2, 256, 16)) is not None:
+        raise AssertionError("family A GQA was rejected")
+    if qsa_k2_serves(*tensors(16, 1, 32, 16)) is not None:
+        raise AssertionError("a group of 16 at head_dim 32 was rejected")
+    rejected = (
+        (24, 5, 256, 16, "do not group"),
+        (24, 0, 256, 16, "do not group"),
+        (24, 1, 256, 16, "MFMA"),
+        (17, 1, 128, 16, "MFMA"),
+        (24, 2, 80, 16, "multiple of 32"),
+        (24, 2, 256, 0, "page_size"),
+    )
+    for hq, hkv, d, page, needle in rejected:
+        reason = qsa_k2_serves(*tensors(hq, hkv, d, page))
+        if reason is None or needle not in reason:
+            raise AssertionError(f"Hq={hq} Hkv={hkv} D={d} page={page} -> {reason!r}")
+    measured = _policy_args(1, 24, 256, 128, 16, 4, 128)
+    q_indexer, index_cache, index_table, q_gqa, _, _, kv_table, indices = measured
+    indivisible = torch.zeros(8, 16, 5, 256, dtype=torch.bfloat16)
+    if qsa_auto_uses_flydsl(
+        q_indexer,
+        index_cache,
+        index_table,
+        q_gqa,
+        indivisible,
+        indivisible.clone(),
+        kv_table,
+        indices,
+    ):
+        raise AssertionError(
+            "auto selected FlyDSL for a GQA group the kernel cannot build"
+        )
 
 
 def test_qsa_auto_logs_unmeasured_query_once():
@@ -3023,6 +3073,7 @@ def _run_unit_cases():
     test_k2_caller_workspace_is_the_only_partial_buffer()
     test_qsa_backend_default_is_auto()
     test_qsa_auto_admits_only_measured_pairs()
+    test_k2_serves_rejects_shapes_the_builder_rejects()
     test_qsa_auto_logs_unmeasured_query_once()
     test_qsa_aot_collector_lists_family_a_launches()
     test_qsa_aot_empty_launch_list_has_no_jobs()
