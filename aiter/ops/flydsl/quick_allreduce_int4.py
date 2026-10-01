@@ -27,20 +27,24 @@ from .kernels.tensor_shim import _run_compiled
 from .quick_allreduce_int4_ipc import UncachedIpcHeap
 
 _SUPPORTED_ARCHS = ("gfx942", "gfx950")
+# The kernel holds both the divisor and its reciprocal in fp16; this range
+# keeps both normal (fp16 normals start at 2**-14).
+DIVISOR_MIN = 2.0**-14
+DIVISOR_MAX = 2.0**14
 
 
 def _check_divisor(divisor: float) -> float:
     """One shared positive divisor. ``1`` leaves the INT4 result unchanged."""
+    msg = (
+        f"QuickAllReduceInt4 divisor must be a finite float in "
+        f"[{DIVISOR_MIN:g}, {DIVISOR_MAX:g}], got {divisor!r}"
+    )
     try:
         value = float(divisor)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(
-            f"QuickAllReduceInt4 divisor must be a positive finite float, got {divisor!r}"
-        ) from exc
-    if not math.isfinite(value) or value <= 0.0:
-        raise ValueError(
-            f"QuickAllReduceInt4 divisor must be a positive finite float, got {divisor!r}"
-        )
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(msg) from exc
+    if not math.isfinite(value) or not DIVISOR_MIN <= value <= DIVISOR_MAX:
+        raise ValueError(msg)
     return value
 
 
