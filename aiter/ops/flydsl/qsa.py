@@ -296,12 +296,21 @@ def _qsa_layer_triton(
     out: torch.Tensor | None,
     token_topk: int,
     compress_ratio: int,
+    score_scale: float | None,
+    softmax_scale: float | None,
 ) -> torch.Tensor:
     from aiter.ops.triton.attention.qsa_vllm_amd import (
         qsa_select_paged_tokens,
         qsa_sparse_paged_attention,
     )
 
+    # K1 multiplies by score_scale. The MQA scorer divides by its scale.
+    if score_scale is None:
+        score_divisor = None
+    elif score_scale == 0:
+        score_divisor = float("inf")
+    else:
+        score_divisor = 1.0 / float(score_scale)
     indices, _block_ids = qsa_select_paged_tokens(
         q_indexer,
         index_k_cache,
@@ -312,6 +321,7 @@ def _qsa_layer_triton(
         token_topk,
         compress_ratio,
         out=indices,
+        score_scale=score_divisor,
     )
     return qsa_sparse_paged_attention(
         q_gqa,
@@ -321,6 +331,7 @@ def _qsa_layer_triton(
         kv_page_table,
         token_to_req,
         out=out,
+        softmax_scale=softmax_scale,
     )
 
 
@@ -353,7 +364,10 @@ def qsa_layer(
     other than 512 blocks at compress ratio 4. ``backend="flydsl"`` is
     K1 + vendored expand + K2. That override still raises on an
     unsupported arch, and on any other selection budget.
-    ``backend="triton"`` is the live AMD path.
+    ``backend="triton"`` is the live AMD path. Both backends multiply
+    indexer scores by ``score_scale`` and QK by ``softmax_scale``
+    (``None`` is ``head_dim**-0.5``). The MQA scorer takes the reciprocal
+    of ``score_scale`` because that API divides.
     """
     selected = normalize_qsa_backend(backend)
     if selected == "flydsl":
@@ -421,4 +435,6 @@ def qsa_layer(
         out,
         token_topk,
         compress_ratio,
+        score_scale,
+        softmax_scale,
     )
