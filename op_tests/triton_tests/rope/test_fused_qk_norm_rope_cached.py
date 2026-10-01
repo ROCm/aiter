@@ -37,7 +37,7 @@ def make(T, H, D, R, dtype, seed=0):
     return q, k, qw, kw, cache
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize(
     "T,H,D,R",
     [

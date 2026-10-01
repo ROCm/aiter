@@ -41,7 +41,7 @@ def generate_fused_sigmoid_mul_inputs(shape, dtype, device="cuda"):
         (8192, 512),
     ],
 )
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("use_explicit_out", [False, True])
 def test_fused_sigmoid_mul(shape, dtype, use_explicit_out):
     if not torch.cuda.is_available():

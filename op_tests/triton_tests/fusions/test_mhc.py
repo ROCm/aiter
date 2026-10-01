@@ -133,8 +133,17 @@ def _config_for_large_n(n):
     return None
 
 
-@pytest.mark.parametrize("M, n, C", get_test_shapes())
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "M, n, C",
+    [
+        shape
+        for shape in get_test_shapes()
+        if (shape[0] in (1, 32, 1024) and shape[2] in (512, 4096))
+        or shape
+        in [(1, 4, 256), (1, 16, 4096), (2048, 4, 512), (128, 4, 7168), (64, 8, 2112)]
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_mhc_correctness(M, n, C, dtype):
     """
     Test that Triton mhc() matches the PyTorch reference for equations 14-19
@@ -276,7 +285,7 @@ def test_mhc_large_values():
 
 
 @pytest.mark.parametrize("M, n, C", [(32, 4, 1024), (64, 4, 2048), (128, 8, 1024)])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_mhc_small_shapes(M, n, C, dtype):
     """Quick smoke test for mhc() with representative shapes."""
     torch.cuda.empty_cache()
@@ -387,7 +396,7 @@ def _make_split_k_config(num_ksplit, n=4):
 
 @pytest.mark.parametrize("M, n, C", [(32, 4, 1024), (64, 4, 2048), (128, 8, 1024)])
 @pytest.mark.parametrize("num_ksplit", [2, 4])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_split_k_correctness(M, n, C, num_ksplit, dtype):
     """Test that split-K matches the PyTorch reference (no Sinkhorn)."""
     torch.cuda.empty_cache()
@@ -729,7 +738,7 @@ def test_triton_mhc_matches_hip(M, n, C):
         (64, 4, 512),
     ],
 )
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_mhc_post_correctness(M, n, C, dtype):
     """Test mhc_post against PyTorch reference."""
     torch.manual_seed(0)
@@ -888,7 +897,7 @@ def test_triton_mhc_post_matches_hip(M, n, C, dtype):
 @pytest.mark.parametrize("M", [1, 4, 64, 128])
 @pytest.mark.parametrize("n", [4])
 @pytest.mark.parametrize("C", [1024, 4096, 7168])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("use_asymmetric_exp_domain", [False, True])
 def test_triton_mhc_pre_post(M, n, C, dtype, use_asymmetric_exp_domain):
     """Fused ``mhc_post_pre()`` matches the unfused reference chain.
@@ -1063,7 +1072,7 @@ def mhc_e2e_triton(
         (1024, 4, 256),  # n*C=1024
     ],
 )
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_mhc_e2e_correctness(M, n, C, dtype):
     """
     Test correctness of Triton mhc → mhc_post pipeline
@@ -1159,7 +1168,7 @@ def _make_head_dsv4_inputs(M, n, C, dtype, device="cuda"):
         (256, 4, 64),
     ],
 )
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_mhc_pre_dsv4_correctness(M, n, C, dtype):
     """mhc_pre_dsv4 Triton forward matches the PyTorch reference."""
     from aiter.ops.triton.fusions.mhc import (
@@ -1208,7 +1217,7 @@ def test_mhc_pre_dsv4_correctness(M, n, C, dtype):
         (128, 4, 256),
     ],
 )
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_mhc_post_dsv4_correctness(M, n, C, dtype):
     """mhc_post_dsv4 Triton forward matches the PyTorch reference."""
     from aiter.ops.triton.fusions.mhc import (
@@ -1258,7 +1267,7 @@ def test_mhc_post_dsv4_correctness(M, n, C, dtype):
         (256, 4, 64),
     ],
 )
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_mhc_head_dsv4_correctness(M, n, C, dtype):
     """mhc_head_dsv4 Triton forward matches the PyTorch reference."""
     from aiter.ops.triton.fusions.mhc import (

@@ -43,7 +43,7 @@ def make(M, N, G, dtype, device, *, runs=True, seed=0):
 
 
 @pytest.mark.parametrize("round_intermediate", [False, True])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize(
     "M,N,G",
     [

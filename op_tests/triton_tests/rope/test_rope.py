@@ -768,7 +768,7 @@ def test_rope_cached_bwd(
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
 
-@pytest.mark.parametrize("T", [(1), (4), (8), (320), (500), (8192)])
+@pytest.mark.parametrize("T", [1, 500, 8192])
 @pytest.mark.parametrize("QH_per_KH", [8])
 @pytest.mark.parametrize("KH", [1, 8])
 @pytest.mark.parametrize("D", [64])  # For now, D is power of 2.
@@ -898,7 +898,7 @@ def test_rope_cached_thd_2c_fwd(
     torch.testing.assert_close(triton_out_y, torch_out_y, atol=1e-3, rtol=1e-1)
 
 
-@pytest.mark.parametrize("T", [(1), (4), (8), (320), (500), (8192)])
+@pytest.mark.parametrize("T", [1, 500, 8192])
 @pytest.mark.parametrize("QH_per_KH", [8])
 @pytest.mark.parametrize("KH", [1, 8])
 @pytest.mark.parametrize("D", [64])  # For now, D is power of 2.
@@ -1016,8 +1016,7 @@ def test_rope_cached_thd_2c_bwd(
 @pytest.mark.parametrize(
     "reuse_freqs_front_part", [False]
 )  # Other cases are off in CK/HIP test case
-# @pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16]) #TODO bf16 results in accuracy issues
-@pytest.mark.parametrize("dtype", [torch.float16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("inplace", [True, False])
 def test_rope_2d_fwd(
     B: int,

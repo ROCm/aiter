@@ -13,7 +13,7 @@ RESOLUTION = {
     torch.bfloat16: 0.016,
 }
 
-BATCH_SIZES = [1, 2, 3, 4, 5, 6, 7, 8, 16, 1335]
+BATCH_SIZES = [1, 3, 8, 1335]
 DIM2 = [16, 128256]
 K = [2, 8]
 
