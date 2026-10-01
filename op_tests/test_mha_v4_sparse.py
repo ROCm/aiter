@@ -402,8 +402,12 @@ def test_mha_v4_sparse_lse_matches_logsumexp_over_selected_blocks(
     kv = mha_v4_kv_tile()
     batch, heads, dim, tiles = 1, 5, 128, 8
     sequence_q, sequence_k = 256, tiles * kv
-    q = torch.randn((batch, sequence_q, heads, dim), device="cuda", dtype=torch.bfloat16)
-    k = torch.randn((batch, sequence_k, heads, dim), device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(
+        (batch, sequence_q, heads, dim), device="cuda", dtype=torch.bfloat16
+    )
+    k = torch.randn(
+        (batch, sequence_k, heads, dim), device="cuda", dtype=torch.bfloat16
+    )
     v = torch.randn_like(k)
     scale = dim**-0.5
 
@@ -427,10 +431,13 @@ def test_mha_v4_sparse_lse_matches_logsumexp_over_selected_blocks(
     index = torch.cat(
         [torch.arange(t * kv, (t + 1) * kv, device=k.device) for t in sorted(kept)]
     )
-    scores = torch.matmul(
-        q.float().permute(0, 2, 1, 3),
-        k.float()[:, index].permute(0, 2, 1, 3).transpose(-1, -2),
-    ) * scale
+    scores = (
+        torch.matmul(
+            q.float().permute(0, 2, 1, 3),
+            k.float()[:, index].permute(0, 2, 1, 3).transpose(-1, -2),
+        )
+        * scale
+    )
     reference = torch.logsumexp(scores, dim=-1)
 
     assert torch.isfinite(lse).all()
@@ -452,9 +459,7 @@ def test_mha_v4_sparse_lse_matches_logsumexp_over_selected_blocks(
         (AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP6),
     ],
 )
-def test_mha_v4_sparse_lse_is_neg_inf_where_the_row_selects_nothing(
-    q_format, v_format
-):
+def test_mha_v4_sparse_lse_is_neg_inf_where_the_row_selects_nothing(q_format, v_format):
     """A LUT row that names no KV tile has an empty softmax, so its LSE is -inf.
 
     The head-0-empty case is the one that matters: a finite LSE there is not obviously wrong, and
@@ -464,23 +469,34 @@ def test_mha_v4_sparse_lse_is_neg_inf_where_the_row_selects_nothing(
     kv = mha_v4_kv_tile()
     batch, heads, dim, tiles = 1, 5, 128, 8
     sequence_q, sequence_k = 256, tiles * kv
-    q = torch.randn((batch, sequence_q, heads, dim), device="cuda", dtype=torch.bfloat16)
-    k = torch.randn((batch, sequence_k, heads, dim), device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(
+        (batch, sequence_q, heads, dim), device="cuda", dtype=torch.bfloat16
+    )
+    k = torch.randn(
+        (batch, sequence_k, heads, dim), device="cuda", dtype=torch.bfloat16
+    )
     v = torch.randn_like(k)
 
     mask = torch.zeros((batch, heads, 1, tiles), device="cuda", dtype=torch.bool)
     mask[:, 1:, :, :] = True  # every head but 0 attends; head 0 selects nothing
 
     _, lse = mha_v4(
-        q, k, v, q_format, q_format, v_format,
-        softmax_scale=dim**-0.5, block_mask=mask, return_lse=True,
+        q,
+        k,
+        v,
+        q_format,
+        q_format,
+        v_format,
+        softmax_scale=dim**-0.5,
+        block_mask=mask,
+        return_lse=True,
     )
     torch.cuda.synchronize()
 
     empty = lse[:, 0].float()
-    assert torch.isinf(empty).all() and (empty < 0).all(), (
-        f"empty LUT row exported a finite LSE (sample {empty.flatten()[0].item()})"
-    )
+    assert (
+        torch.isinf(empty).all() and (empty < 0).all()
+    ), f"empty LUT row exported a finite LSE (sample {empty.flatten()[0].item()})"
     assert torch.isfinite(lse[:, 1:].float()).all()
 
 
@@ -1192,9 +1208,7 @@ def test_mha_v4_packed_sparse_rejects_per_batch_key_lengths():
     """
     heads = 2
     kv_tiles = 4
-    q, k, v = _sparse_fp8_operands(
-        sequence_k=kv_tiles * mha_v4_kv_tile(), heads=heads
-    )
+    q, k, v = _sparse_fp8_operands(sequence_k=kv_tiles * mha_v4_kv_tile(), heads=heads)
     device = q.quantized.device
     fp8_format = native_fp8_format()
     rows = heads

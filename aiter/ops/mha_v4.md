@@ -13,7 +13,10 @@ dispatch metadata. Unsupported recipes fail instead of falling back to another a
 - Per-batch key lengths via `seqlens_k`, on the dense GFX950 `BF16 Q/K` rows only. Every other
   recipe, architecture, and the sorted-sparse path reject it.
 - Log-sum-exp via `return_lse`, on the dense GFX950 rows. Sorted sparse rejects it, and so does
-  GFX942 until its exported value is measured.
+  GFX942 until its exported value is measured. The value is the log-sum-exp of the *quantized*
+  scores, so its error tracks the row max at each format's score precision (~0.001 nats for
+  BF16 Q/K, 36 for MXFP6, 153 for MXFP4, against 1418 nats of range): safe for merging
+  same-recipe ring chunks, wrong as an absolute quantity or across mixed recipes.
 - No backward, dropout, RNG state, causal, or Q-side varlen support yet.
 
 Supported recipes. Every recipe is available in both dense and sorted-sparse mode with the same
