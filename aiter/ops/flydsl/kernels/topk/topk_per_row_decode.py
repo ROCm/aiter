@@ -166,16 +166,6 @@ def _row_length(row, row_ends, width, next_n):
     return (row_len > width).select(width, row_len)
 
 
-def _active_chunks(row_len, chunks_per_row, block_threads, stable):
-    """Chunks with work at the live row length, not the captured row width."""
-    if const_expr(stable):
-        return fx.Int32(chunks_per_row)
-    row_vectors = (row_len + fx.Int32(_VEC - 1)) // fx.Int32(_VEC)
-    active = (row_vectors + fx.Int32(block_threads - 1)) // fx.Int32(block_threads)
-    active = (active < fx.Int32(1)).select(fx.Int32(1), active)
-    return (active > fx.Int32(chunks_per_row)).select(fx.Int32(chunks_per_row), active)
-
-
 def _load_f32x4(tensor, vec_idx):
     src = fx.slice(tensor, (None, vec_idx))
     fragment = fx.make_fragment_like(src)
@@ -652,8 +642,7 @@ def build_topk_per_row_decode_module(
                 if pos < fx.Int32(k):
                     equal_idxs[pos] = idx
 
-        gather_active = _active_chunks(row_len, chunks_per_row, block_threads, stable)
-        if (row_state[_STATE_DIRECT] == 0) & (chunk < gather_active):
+        if row_state[_STATE_DIRECT] == 0:
             row_vectors = (row_len + fx.Int32(_VEC - 1)) // fx.Int32(_VEC)
             for vec_idx in range(
                 chunk * fx.Int32(block_threads) + tid,
