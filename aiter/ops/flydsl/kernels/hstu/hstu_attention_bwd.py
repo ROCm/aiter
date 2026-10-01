@@ -256,13 +256,72 @@ def build_hstu_attention_bwd_dvdk(
     N_ACC_DK = HC_CHUNKS * KV_OWNED_SUBTILES
     N_ACC = N_ACC_DV + N_ACC_DK
 
-    # LDS map: [Q row-major tile][dO row-major tile]. Q is XOR-swizzled by column
-    # (mirrors the forward's K tile); dO stays natural [q, d]. Each field is a
-    # 16B-aligned fx.Array; SharedAllocator sizes the LDS global.
+    # ---- Transposed streamed tiles: dO^T[d, q] and Q^T[hc, q] ----
+    #
+    # The dV/dK accumulation B-operands are 4 adjacent q at a fixed d (resp. hc).
+    # In the row-major [q, d] tiles that is column-strided, so each pack costs
+    # 4x ds_read_u16; out of a [d, q] tile it is one ds_read_b64. The row-major
+    # tiles have to stay: GEMM1's and dA's A-operands are 4 adjacent d at a fixed
+    # q, and no single layout (or swizzle -- a swizzle only permutes banks) can
+    # make both axes contiguous.
+    #
+    # Why this is not the 2026-07-09 Phase C experiment, which cost +59% and was
+    # reverted: that one built the transposed tile *through registers* on the way
+    # in from global, which both destroyed the async global->LDS DMA and put the
+    # residual scatter on the write side as per-element ds_write_b16. Here the DMA
+    # is untouched and the scatter is on the *read* side -- 4 strided reads feeding
+    # one contiguous b64 write. Phase C's own C1b row (padding the gather stride
+    # moved dV ~1.5%, i.e. noise) is the evidence that the strided reads are
+    # already conflict-free, so this direction pays read *count* and nothing else.
+    #
+    # And that count is divided by NUM_WAVES: every wave streams the same Q/dO
+    # tile, so the gathers being replaced ran once per wave, while the transpose
+    # is built once per workgroup.
+    #
+    # The +MFMA_LANE_K pad keeps the 16 rows of one gather in distinct LDS banks
+    # (an unpadded BLOCK_N stride maps them onto a few banks); it stays
+    # MFMA_LANE_K-aligned so the grouped view divides cleanly.
+    T_PAD = MFMA_LANE_K
+    DO_T_STRIDE = BLOCK_N + T_PAD
+    Q_T_STRIDE = BLOCK_N + T_PAD
+
+    # The transposed tiles roughly double LDS, which is free at the deployment
+    # tiles (BLOCK_N=16: 4 KB -> 9 KB at d=64, 8 KB -> 18 KB at d=128) but not at
+    # large BLOCK_N (BLOCK_N=64/d=128 overflows the 64 KB budget outright). Cap at
+    # 32 KB so LDS still admits two workgroups per CU and can never become the
+    # occupancy limiter ahead of the register file; above the cap, fall back to the
+    # scalar gather. head_dim/hidden_dim/BLOCK_N are all in the build cache key, so
+    # this switch is keyed implicitly.
+    T_LDS_BUDGET = 32768
+    _lds_row_major = (BLOCK_N * Q_STRIDE + BLOCK_N * DO_STRIDE) * 2
+    _lds_transposed = (head_dim * Q_T_STRIDE + hidden_dim * DO_T_STRIDE) * 2
+    USE_T_TILES = (_lds_row_major + _lds_transposed) <= T_LDS_BUDGET
+    # Collapsed to a single row when disabled, so the views stay well-formed
+    # (and the allocation is 40 bytes) without a conditional struct.
+    T_Q_ROWS = head_dim if USE_T_TILES else 1
+    T_DO_ROWS = hidden_dim if USE_T_TILES else 1
+
+    # Build work is one unit per (row, 4-wide q group), spread over the workgroup.
+    assert BLOCK_N % MFMA_LANE_K == 0
+    T_QGROUPS = BLOCK_N // MFMA_LANE_K
+    DO_T_UNITS = hidden_dim * T_QGROUPS
+    Q_T_UNITS = head_dim * T_QGROUPS
+    NUM_DO_T_PASSES = (DO_T_UNITS + BLOCK_THREADS - 1) // BLOCK_THREADS
+    NUM_Q_T_PASSES = (Q_T_UNITS + BLOCK_THREADS - 1) // BLOCK_THREADS
+    DO_T_EXACT = DO_T_UNITS % BLOCK_THREADS == 0
+    Q_T_EXACT = Q_T_UNITS % BLOCK_THREADS == 0
+
+    # LDS map: [Q row-major tile][dO row-major tile][Q^T tile][dO^T tile]. Q is
+    # XOR-swizzled by column (mirrors the forward's K tile); dO stays natural
+    # [q, d]; the transposed tiles are natural [row, q] and unswizzled (built
+    # in-kernel, so the gather reads them directly and drops q_swz_col). Each
+    # field is a 16B-aligned fx.Array; SharedAllocator sizes the LDS global.
     @fx.struct
     class SharedStorage:
         q: fx.Array[elem_dtype, BLOCK_N * Q_STRIDE, 16]
         do: fx.Array[elem_dtype, BLOCK_N * DO_STRIDE, 16]
+        q_t: fx.Array[elem_dtype, T_Q_ROWS * Q_T_STRIDE, 16]
+        do_t: fx.Array[elem_dtype, T_DO_ROWS * DO_T_STRIDE, 16]
 
     @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
     def hstu_attention_bwd_dvdk(
@@ -364,6 +423,20 @@ def build_hstu_attention_bwd_dvdk(
             fx.make_layout(
                 (BLOCK_N, DO_STRIDE // MFMA_DA_LANE_K, MFMA_DA_LANE_K),
                 (DO_STRIDE, MFMA_DA_LANE_K, 1),
+            )
+        )
+        # Transposed tiles, grouped along q by the accum-GEMM pack width so a
+        # B-operand pack is view[row, q_grp, None].load() -- a single ds_read_b64.
+        q_t_view = lds.q_t.view(
+            fx.make_layout(
+                (T_Q_ROWS, Q_T_STRIDE // MFMA_LANE_K, MFMA_LANE_K),
+                (Q_T_STRIDE, MFMA_LANE_K, 1),
+            )
+        )
+        do_t_view = lds.do_t.view(
+            fx.make_layout(
+                (T_DO_ROWS, DO_T_STRIDE // MFMA_LANE_K, MFMA_LANE_K),
+                (DO_T_STRIDE, MFMA_LANE_K, 1),
             )
         )
         q_lds_byte_base = fx.ptrtoint(fx.get_iter(q_view))
@@ -568,6 +641,66 @@ def build_hstu_attention_bwd_dvdk(
                 src = fx.slice(do_div, (None, fx.Int32(src_elem)))
                 fx.copy(_dma_atom, src, dst)
 
+        # ---- Cooperative transpose build (see the LDS map note above) ----
+        # One unit = (row, MFMA_LANE_K adjacent q). The decode is tid-only, so it
+        # is hoisted out of the query sweep.
+        def _t_unit_decode(num_passes, units, exact):
+            rows, qgs = [], []
+            for p in range_constexpr(num_passes):
+                unit = tid + fx.Int32(p * BLOCK_THREADS)
+                if const_expr(not exact):
+                    # Surplus lanes redo the last unit rather than branch: the
+                    # write is idempotent (same address, same value).
+                    unit = (unit >= fx.Int32(units)).select(fx.Int32(units - 1), unit)
+                rows.append(unit // fx.Int32(T_QGROUPS))
+                qgs.append(unit % fx.Int32(T_QGROUPS))
+            return rows, qgs
+
+        do_t_rows, do_t_qgs = (
+            _t_unit_decode(NUM_DO_T_PASSES, DO_T_UNITS, DO_T_EXACT)
+            if USE_T_TILES
+            else ([], [])
+        )
+        q_t_rows, q_t_qgs = (
+            _t_unit_decode(NUM_Q_T_PASSES, Q_T_UNITS, Q_T_EXACT)
+            if USE_T_TILES
+            else ([], [])
+        )
+
+        def build_transposed_tiles():
+            """dO[q,d] -> dO^T[d,q] and Q[q,hc] -> Q^T[hc,q], workgroup-cooperative.
+
+            Each unit strided-reads MFMA_LANE_K q at one row and writes them as a
+            single contiguous pack, keeping the scatter on the read side.
+            """
+            for p in range_constexpr(NUM_DO_T_PASSES):
+                d_row = do_t_rows[p]
+                qg = do_t_qgs[p]
+                q_base = qg * fx.Int32(MFMA_LANE_K)
+                d_grp = d_row // fx.Int32(MFMA_DA_LANE_K)
+                d_lane = d_row % fx.Int32(MFMA_DA_LANE_K)
+                elems = [
+                    do_view[q_base + fx.Int32(i), d_grp, d_lane]
+                    for i in range_constexpr(MFMA_LANE_K)
+                ]
+                do_t_view[d_row, qg, None].store(Vec.from_elements(elems, elem_dtype))
+            for p in range_constexpr(NUM_Q_T_PASSES):
+                hc_row = q_t_rows[p]
+                qg = q_t_qgs[p]
+                q_base = qg * fx.Int32(MFMA_LANE_K)
+                elems = []
+                for i in range_constexpr(MFMA_LANE_K):
+                    q_row = q_base + fx.Int32(i)
+                    col = q_swz_col(q_row, hc_row)
+                    elems.append(
+                        q_view[
+                            q_row,
+                            col // fx.Int32(MFMA_QK_LANE_K),
+                            col % fx.Int32(MFMA_QK_LANE_K),
+                        ]
+                    )
+                q_t_view[hc_row, qg, None].store(Vec.from_elements(elems, elem_dtype))
+
         def read_q_packs(ng):
             q_row = fx.Int32(ng * MFMA_M) + lane_mod_16
             packs = []
@@ -641,8 +774,18 @@ def build_hstu_attention_bwd_dvdk(
                     s_meta[ng][og] = (grad_vals, keep)
             return p_packs, s_meta
 
-        def _dv_gather(c):
-            # dO B-operand packs (4 adjacent q at a fixed d) for output chunk c.
+        def _dv_gather_t(c):
+            # dO B-operand packs (4 adjacent q at a fixed d) for output chunk c,
+            # one ds_read_b64 each out of dO^T.
+            do_packs = []
+            for ng in range_constexpr(Q_STREAM_SUBTILES):
+                d_row = fx.Int32(c * MFMA_M) + lane_mod_16
+                q_grp = fx.Int32(ng * (MFMA_M // MFMA_LANE_K)) + lane_div_16
+                do_packs.append(do_t_view[d_row, q_grp, None].load().ir_value())
+            return do_packs
+
+        def _dv_gather_scalar(c):
+            # Fallback when dO^T does not fit: 4x ds_read_u16 per pack.
             do_packs = []
             for ng in range_constexpr(Q_STREAM_SUBTILES):
                 d_col = fx.Int32(c * MFMA_M) + lane_mod_16
@@ -655,6 +798,8 @@ def build_hstu_attention_bwd_dvdk(
                 ]
                 do_packs.append(Vec.from_elements(elems, elem_dtype).ir_value())
             return do_packs
+
+        _dv_gather = _dv_gather_t if USE_T_TILES else _dv_gather_scalar
 
         def accum_dv_tile(dv_acc, p_packs):
             # Prefetch next chunk's B-operand gather before consuming the current
@@ -708,11 +853,21 @@ def build_hstu_attention_bwd_dvdk(
                     ds_packs[ng][og] = pack_mfma_frag(ds_vals, is_bf16, elem_dtype)
             return ds_packs
 
-        def _dk_gather(c):
+        def _dk_gather_t(c):
             # Q B-operand packs (4 adjacent q at a fixed hc) for output chunk c,
-            # scalar-gathered from the *streamed* swizzled Q LDS view (col ->
-            # group col//MFMA_LANE_K, lane col%MFMA_LANE_K), reusing GEMM1's Q — no
-            # separate preshuffled q_t load.
+            # one ds_read_b64 each out of Q^T. The swizzle is absorbed into the
+            # transpose build, so no q_swz_col here.
+            qb_packs = []
+            for ng in range_constexpr(Q_STREAM_SUBTILES):
+                hc_row = fx.Int32(c * MFMA_M) + lane_mod_16
+                q_grp = fx.Int32(ng * (MFMA_M // MFMA_LANE_K)) + lane_div_16
+                qb_packs.append(q_t_view[hc_row, q_grp, None].load().ir_value())
+            return qb_packs
+
+        def _dk_gather_scalar(c):
+            # Fallback when Q^T does not fit: scalar-gather from the *streamed*
+            # swizzled Q LDS view (col -> group col//MFMA_LANE_K, lane
+            # col%MFMA_LANE_K), reusing GEMM1's Q.
             qb_packs = []
             for ng in range_constexpr(Q_STREAM_SUBTILES):
                 hc_col = fx.Int32(c * MFMA_M) + lane_mod_16
@@ -730,6 +885,8 @@ def build_hstu_attention_bwd_dvdk(
                     )
                 qb_packs.append(Vec.from_elements(elems, elem_dtype).ir_value())
             return qb_packs
+
+        _dk_gather = _dk_gather_t if USE_T_TILES else _dk_gather_scalar
 
         def accum_dk_tile(dk_acc, ds_packs):
             qb_cur = _dk_gather(0)
@@ -752,16 +909,24 @@ def build_hstu_attention_bwd_dvdk(
             async_load_do_lds(q_start)
             rocdl.s_waitcnt(vmcnt=0)
             gpu.barrier()
+            # Issue the transpose writes here and run GEMM1 off the row-major tiles
+            # underneath them; the publish barrier is deferred to just before the
+            # first transposed read so the ds_writes retire under the MFMA chain.
+            if const_expr(USE_T_TILES):
+                build_transposed_tiles()
             q_packs = [read_q_packs(ng) for ng in range_constexpr(Q_STREAM_SUBTILES)]
             p_packs, s_meta = compute_s_tile(q_start, q_packs)
             dv_acc = [acc[i] for i in range(N_ACC_DV)]
             dk_acc = [acc[N_ACC_DV + i] for i in range(N_ACC_DK)]
+            if const_expr(USE_T_TILES):
+                gpu.barrier()  # dO^T / Q^T published
             dv_acc = accum_dv_tile(dv_acc, p_packs)
             dk_acc = accum_dk_tile(dk_acc, compute_ds_packs(s_meta))
-            # _dk_gather reads the Q LDS tile at the very end of the body, so without a
-            # closing barrier a wave that finishes early wraps around and DMAs the next
-            # tile over LDS another wave is still reading (WAR). Left open, dK is not
-            # bitwise reproducible run to run.
+            # accum_dk_tile reads a Q LDS tile (Q^T, or Q itself on the scalar
+            # fallback) at the very end of the body, so without a closing barrier a
+            # wave that finishes early wraps around and overwrites (DMA, then
+            # transpose) LDS another wave is still reading (WAR). Left open, dK is
+            # not bitwise reproducible run to run.
             gpu.barrier()
             return dv_acc + dk_acc
 
