@@ -12,7 +12,6 @@ import itertools
 import triton
 
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 logger = AiterTritonLogger()
@@ -36,6 +35,7 @@ def _get_gemm_config_cached(
     specialized_filename: str | None = None,
     backend: str = "triton",
     B: int | None = None,
+    cu: int | None = None,
 ) -> tuple[dict, bool]:
     """
     Internal cached implementation. Do NOT use this directly — use
@@ -76,11 +76,12 @@ def _get_gemm_config_cached(
     elif N is not None and K is not None:
         # Parts of one arch can differ in CU count; a "-CU=<n>" file tuned for
         # this CU count wins over the arch-wide one.
-        cu = get_num_sms()
         if B is not None:
-            specialized_suffixes.append(f"B={B}-N={N}-K={K}-CU={cu}")
+            if cu is not None:
+                specialized_suffixes.append(f"B={B}-N={N}-K={K}-CU={cu}")
             specialized_suffixes.append(f"B={B}-N={N}-K={K}")
-        specialized_suffixes.append(f"N={N}-K={K}-CU={cu}")
+        if cu is not None:
+            specialized_suffixes.append(f"N={N}-K={K}-CU={cu}")
         specialized_suffixes.append(f"N={N}-K={K}")
 
     is_tuned = False
@@ -156,8 +157,9 @@ def get_gemm_config(
         Dictionary with the config params (a fresh deep-copy safe to mutate),
         bool indicating if the config is tuned.(True if tuned, False otherwise)
     """
+    cu = arch_info.get_cu_count() if specialized_filename is None else None
     config, is_tuned = _get_gemm_config_cached(
-        config_name, M, N, K, bounds, specialized_filename, backend, B
+        config_name, M, N, K, bounds, specialized_filename, backend, B, cu
     )
     return copy.deepcopy(config), is_tuned
 

@@ -128,7 +128,7 @@ def gemm_a16w16_(
         # Auto-detect hard-wires gluon on gfx1250, but triton is up to 4.7x
         # faster on the narrow-N decode shapes, so let a tuned config opt in
         # with "backend": "triton"; entries without the key keep gluon.
-        if backend == "gluon" and config is None:
+        if backend == "gluon" and config is None and not persistent:
             tuned, _ = get_gemm_config(
                 "GEMM-A16W16", x.shape[0], w.shape[0], x.shape[1]
             )

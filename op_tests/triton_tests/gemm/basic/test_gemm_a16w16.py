@@ -1,12 +1,18 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import importlib
+import json
+
 import pytest
 import torch
 import torch.nn.functional as F
+import triton
 
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import _is_gluon_available, gemm_a16w16
 from aiter.ops.triton.gemm.basic.gemm_a16w16_atomic import gemm_a16w16_atomic
+from aiter.ops.triton.utils import gemm_config_utils
+from aiter.ops.triton.utils._triton import arch_info
 from op_tests.triton_tests.utils.types import str_to_torch_dtype
 
 
@@ -243,3 +249,107 @@ def test_gemm_a16w16_persistent_output(M: int, N: int, K: int, layout, output, b
         )
 
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
+
+
+def _write_config(path, marker):
+    path.write_text(json.dumps({"any": {"marker": marker}}))
+
+
+@pytest.mark.parametrize(
+    "cu, B, expected",
+    [
+        (192, None, "cu192"),
+        (256, None, "arch"),
+        (None, None, "arch"),
+        (192, 4, "b_cu192"),
+        (256, 4, "b_arch"),
+    ],
+)
+def test_gemm_config_cu_precedence(tmp_path, monkeypatch, cu, B, expected):
+    name = "GEMM-A16W16"
+    _write_config(tmp_path / "DEFAULT.json", "default")
+    _write_config(tmp_path / f"{name}-N=64-K=128.json", "arch")
+    _write_config(tmp_path / f"{name}-N=64-K=128-CU=192.json", "cu192")
+    _write_config(tmp_path / f"{name}-B=4-N=64-K=128.json", "b_arch")
+    _write_config(tmp_path / f"{name}-B=4-N=64-K=128-CU=192.json", "b_cu192")
+    monkeypatch.setattr(
+        gemm_config_utils, "resolve_config_dir", lambda *a, **k: str(tmp_path)
+    )
+    monkeypatch.setattr(gemm_config_utils.arch_info, "get_cu_count", lambda: cu)
+    gemm_config_utils._get_gemm_config_cached.cache_clear()
+    try:
+        config, is_tuned = gemm_config_utils.get_gemm_config(name, 1, 64, 128, B=B)
+    finally:
+        gemm_config_utils._get_gemm_config_cached.cache_clear()
+
+    assert config["marker"] == expected
+    assert not is_tuned
+
+
+def test_get_cu_count_honors_cu_num(monkeypatch):
+    monkeypatch.setenv("CU_NUM", "192")
+    assert arch_info.get_cu_count() == 192
+
+
+_gemm_a16w16_module = importlib.import_module("aiter.ops.triton.gemm.basic.gemm_a16w16")
+
+
+class _TritonLaunchSpy:
+    def __init__(self, kernel):
+        self.kernel = kernel
+        self.async_copy = []
+
+    def __getitem__(self, grid):
+        self.async_copy.append(triton.knobs.amd.use_async_copy)
+        return self.kernel[grid]
+
+
+def _skip_unless_gfx1250():
+    if "gfx1250" not in (arch_info.get_arch() or ""):
+        pytest.skip("gfx1250 only")
+
+
+@pytest.mark.parametrize(
+    "M, N, K, expect_triton",
+    [
+        (1, 4096, 1024, True),
+        (4, 4096, 1024, True),
+        (8, 17408, 4096, True),
+        (16, 4096, 1024, False),
+    ],
+)
+def test_gemm_a16w16_auto_backend_opt_in(monkeypatch, M, N, K, expect_triton):
+    _skip_unless_gfx1250()
+    monkeypatch.setenv("CU_NUM", "256")
+    spy = _TritonLaunchSpy(_gemm_a16w16_module._gemm_a16_w16_kernel)
+    monkeypatch.setattr(_gemm_a16w16_module, "_gemm_a16_w16_kernel", spy)
+    x, w, _, _, _ = generate_gemm_a16w16_inputs(M, N, K, torch.bfloat16, output=False)
+
+    out = gemm_a16w16(x, w)
+
+    torch.testing.assert_close(out, F.linear(x, w), atol=1e-1, rtol=1e-2)
+    assert len(spy.async_copy) == (1 if expect_triton else 0)
+    assert not any(spy.async_copy)
+
+
+def test_gemm_a16w16_persistent_ignores_opt_in(monkeypatch):
+    _skip_unless_gfx1250()
+    monkeypatch.setenv("CU_NUM", "256")
+    requested = []
+    real_get_gemm_config = _gemm_a16w16_module.get_gemm_config
+
+    def recording_get_gemm_config(config_name, *args, **kwargs):
+        requested.append(config_name)
+        return real_get_gemm_config(config_name, *args, **kwargs)
+
+    monkeypatch.setattr(
+        _gemm_a16w16_module, "get_gemm_config", recording_get_gemm_config
+    )
+    x, w, _, _, _ = generate_gemm_a16w16_inputs(
+        1, 4096, 1024, torch.bfloat16, output=False
+    )
+
+    out = gemm_a16w16(x, w, dtype=torch.bfloat16, persistent=True)
+
+    torch.testing.assert_close(out, F.linear(x, w), atol=1e-1, rtol=1e-1)
+    assert requested == ["GEMM-A16W16-PERSISTENT"]
