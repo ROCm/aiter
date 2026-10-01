@@ -23,7 +23,7 @@ Candidates per shape:
                             the pure attention-kernel ceiling; shows fp8's headroom
 
 Functional coverage lives in the executable op test
-``op_tests/test_flydsl_fmha_gfx1201.py``; this file is the comparative perf sweep.
+``op_tests/test_flydsl_fmha.py``; this file is the comparative perf sweep.
 """
 
 import argparse

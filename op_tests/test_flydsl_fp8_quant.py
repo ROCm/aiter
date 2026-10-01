@@ -1,13 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Native gfx1201 FlyDSL Q/K/V FP8 quantizer op test."""
-
-from __future__ import annotations
+"""Public FlyDSL Q/K/V FP8 quantizer op test."""
 
 import argparse
 import itertools
 import math
+import warnings
 
 import pandas as pd
 import torch
@@ -22,9 +21,8 @@ SUPPORTED_GFX = ["gfx1201"]
 FP8_MAX = 448.0
 SEED = 0
 
-# (label, batch, seq_q, seq_kv, heads, head_dim, rotation). D64 same-shape
-# selects the fused producer; D64 cross-attention selects three VEC2 producers;
-# D96 exercises the padded, unrotated generic fallback.
+# D64 same-shape selects the fused producer; D64 cross-attention selects three
+# VEC2 producers; D96 exercises the padded, unrotated generic fallback.
 SHAPES = [
     ("d64_fused", 1, 128, 128, 4, 64, True),
     ("d64_cross", 1, 192, 128, 4, 64, False),
@@ -56,7 +54,7 @@ def _make_qkv(batch, seq_q, seq_kv, heads, head_dim, *, device="cuda"):
     )
 
 
-def _fwht(x: torch.Tensor) -> torch.Tensor:
+def _fwht(x):
     """Orthonormal FWHT over the last dimension, matching Q/K rotation."""
     head_dim = x.shape[-1]
     result = x.float().reshape(-1, head_dim)
@@ -69,21 +67,13 @@ def _fwht(x: torch.Tensor) -> torch.Tensor:
     return result.reshape_as(x) / math.sqrt(head_dim)
 
 
-def _quant_reference(x: torch.Tensor, *, rotation: bool):
+def _quant_reference(x, *, rotation):
     transformed = _fwht(x) if rotation else x.float()
     scale = (transformed.abs().amax() / FP8_MAX).clamp(min=1e-12).reshape(1)
     return transformed, scale
 
 
-def _check_quantized(
-    actual: torch.Tensor,
-    scale: torch.Tensor,
-    reference: torch.Tensor,
-    reference_scale: torch.Tensor,
-    *,
-    exact_scale: bool,
-    name: str,
-) -> float:
+def _check_quantized(actual, scale, reference, reference_scale, *, exact_scale, name):
     if exact_scale:
         assert torch.equal(scale, reference_scale), f"{name}: scale is not exact"
     else:
@@ -99,17 +89,30 @@ def _check_quantized(
     return err
 
 
-def _exercise_public_contracts() -> None:
-    """Validate zero, stream, and input-device ownership contracts."""
-    zero = torch.zeros((1, 32, 2, 64), dtype=torch.bfloat16, device="cuda")
-    q8, k8, v8, sq, sk, sv = flydsl_fp8_quant(zero, zero, zero)
+def _exercise_public_contracts():
+    """Validate materialization, padding, stream, and device ownership."""
+    storage = torch.zeros((1, 32, 2, 128), dtype=torch.bfloat16, device="cuda")
+    noncontiguous = storage[..., ::2]
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        q8, k8, v8, sq, sk, sv = flydsl_fp8_quant(
+            noncontiguous, noncontiguous, noncontiguous
+        )
+    assert any(
+        "materializes non-contiguous Q/K/V" in str(warning.message)
+        for warning in caught
+    )
     for quantized, scale in ((q8, sq), (k8, sk), (v8, sv)):
         assert torch.isfinite(quantized.float()).all()
         assert torch.all(quantized == 0)
         assert torch.equal(scale, torch.tensor([1e-12], device=scale.device))
 
-    # An event after the call on this stream is sufficient to read all outputs
-    # only when the public wrapper enqueues its work on q.device's current stream.
+    padded = torch.zeros((1, 32, 2, 96), dtype=torch.bfloat16, device="cuda")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        flydsl_fp8_quant(padded, padded, padded, rotation=False)
+    assert any("pads head_dim=96 to 128" in str(warning.message) for warning in caught)
+
     stream = torch.cuda.Stream(device="cuda")
     with torch.cuda.stream(stream):
         q, k, v = _make_qkv(1, 64, 64, 2, 64)
@@ -117,20 +120,17 @@ def _exercise_public_contracts() -> None:
         done = torch.cuda.Event()
         done.record(stream)
     done.synchronize()
-    refs = [_quant_reference(x, rotation=False) for x in (q, k, v)]
+    references = [_quant_reference(x, rotation=False) for x in (q, k, v)]
     for actual, scale, (reference, reference_scale), name in zip(
-        (q8, k8, v8), (sq, sk, sv), refs, ("q", "k", "v"), strict=True
+        (q8, k8, v8), (sq, sk, sv), references, ("q", "k", "v"), strict=True
     ):
         _check_quantized(
             actual, scale, reference, reference_scale, exact_scale=True, name=name
         )
 
     if torch.cuda.device_count() < 2:
-        aiter.logger.warning(
-            "two-GPU FlyDSL FP8 quant check skipped: fewer than two GPUs"
-        )
+        aiter.logger.warning("two-GPU FP8 quant check skipped: fewer than two GPUs")
         return
-
     previous_device = torch.cuda.current_device()
     try:
         device1 = torch.device("cuda", 1)
@@ -146,9 +146,8 @@ def _exercise_public_contracts() -> None:
 
 @benchmark()
 def run_flydsl_fp8_quant(shape, batch, seq_q, seq_kv, heads, head_dim, rotation):
-    """Time the public Q/K/V producer and compare to a torch/FWHT reference."""
+    """Time the public producer and compare it to a torch/FWHT reference."""
     q, k, v = _make_qkv(batch, seq_q, seq_kv, heads, head_dim)
-    # The public producer rotates Q/K only; V remains in its original basis.
     references = [
         _quant_reference(q, rotation=rotation),
         _quant_reference(k, rotation=rotation),
@@ -156,9 +155,6 @@ def run_flydsl_fp8_quant(shape, batch, seq_q, seq_kv, heads, head_dim, rotation)
     ]
     outputs, us = run_perftest(flydsl_fp8_quant, q, k, v, rotation=rotation)
     q8, k8, v8, sq, sk, sv = outputs
-
-    # A raw amax has identical FP32 semantics for the unrotated producer paths.
-    # The rotated path is checked against the mathematically equivalent FWHT.
     errors = [
         _check_quantized(
             actual,
@@ -172,10 +168,9 @@ def run_flydsl_fp8_quant(shape, batch, seq_q, seq_kv, heads, head_dim, rotation)
             (q8, k8, v8), (sq, sk, sv), references, ("q", "k", "v"), strict=True
         )
     ]
-
     elements = q.numel() + k.numel() + v.numel()
     flops = elements * (math.log2(head_dim) if rotation else 1)
-    nbytes = elements * (2 * q.element_size() + 1)  # two BF16 passes + FP8 write
+    nbytes = elements * (2 * q.element_size() + 1)
     return {
         "gfx": get_gfx(),
         "flydsl us": us,
@@ -185,14 +180,13 @@ def run_flydsl_fp8_quant(shape, batch, seq_q, seq_kv, heads, head_dim, rotation)
     }
 
 
-def main() -> None:
+def main():
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning(
             "native FlyDSL FP8 quant unsupported on %s; skipping", get_gfx()
         )
         return
-
-    parser = argparse.ArgumentParser(description="Native gfx1201 FlyDSL FP8 quant")
+    parser = argparse.ArgumentParser(description="Native FlyDSL FP8 quant config")
     parser.add_argument(
         "-s",
         "--shape",
@@ -202,7 +196,6 @@ def main() -> None:
         help="Quantizer shape groups to sweep.",
     )
     args = parser.parse_args()
-
     _exercise_public_contracts()
     rows = [
         run_flydsl_fp8_quant(*config)
@@ -210,7 +203,7 @@ def main() -> None:
         if config[0] in args.shape
     ]
     aiter.logger.info(
-        "flydsl_fp8_quant_gfx1201 summary (markdown):\n%s",
+        "flydsl_fp8_quant summary (markdown):\n%s",
         pd.DataFrame(rows).to_markdown(index=False),
     )
 
