@@ -816,41 +816,37 @@ def build_qsa_k2_module(
                             k_store_frag = fx.make_fragment_like(k_dst)
                             fx.memref_store_vec(k_vec, k_store_frag)
                             fx.copy(lds_copy, k_store_frag, k_dst)
-            if const_expr(token_major_v):
-                fx.rocdl.s_waitcnt(lgkmcnt=0)
-                fx.rocdl.s_barrier()
-            else:
-                gpu.barrier()
-
-            # V rounds issued ahead of QK, so their latency lands under the
-            # MFMA block. Every round in flight costs 4 VGPRs, so when V
-            # overlays K the prefetch is one chunk deep; with a separate V
-            # region there is no aliasing barrier to sit behind and the whole
-            # gather can ride across QK, which is where the memory-level
-            # parallelism comes from. gfx942 overlays too, but a partial
-            # chunk held across QK slowed BN32 prefill, so gfx942_v_pf is
-            # set only when that one chunk is the whole gather.
+            # gfx942 V goes out before the K-publish barrier. QK alone is
+            # shorter than this gather, so the loads also cover the LDS
+            # wait and the barrier. Nothing may cross, which keeps the
+            # loads from sinking to the consume.
             v_frags_pf = []
-            if (
-                const_expr(use_k32)
-                and const_expr(not decode_tr_pv)
-                or const_expr(gfx942_v_pf)
-            ):
+            if const_expr(gfx942_v_pf):
                 for gr in range_constexpr(v_pf_rounds):
                     d_chunk = chunk_owner + Int32(gr * col_owners)
                     v_src = fx.slice(v_row, (None, d_chunk))
                     v_frag = fx.make_fragment_like(v_src)
                     fx.copy(kv_copy, v_src, v_frag)
                     v_frags_pf.append(v_frag)
-            if const_expr(gfx942_v_pf):
-                # Nothing may cross, so these loads stay issued here and
-                # remain in flight across the whole QK block. A barrier
-                # that lets VMEM reads through sinks them to the consume,
-                # and the trace drained three of the four after the alias
-                # barrier. The post-QK barrier below keeps the VALU mask
-                # that consumes them from rising into the MFMA. gfx950's
-                # prefetch shares the copy loop and is not pinned.
                 fx.rocdl.sched_barrier("none")
+            if const_expr(token_major_v):
+                fx.rocdl.s_waitcnt(lgkmcnt=0)
+                fx.rocdl.s_barrier()
+            else:
+                gpu.barrier()
+
+            # gfx950 prefill issues V ahead of QK into its own LDS region.
+            # A partial gfx942 chunk held across QK slowed BN32, so that
+            # path only prefetches when one chunk is the whole gather,
+            # and it does so above the barrier.
+            v_ahead = use_k32 and not decode_tr_pv
+            if const_expr(v_ahead):
+                for gr in range_constexpr(v_pf_rounds):
+                    d_chunk = chunk_owner + Int32(gr * col_owners)
+                    v_src = fx.slice(v_row, (None, d_chunk))
+                    v_frag = fx.make_fragment_like(v_src)
+                    fx.copy(g_copy, v_src, v_frag)
+                    v_frags_pf.append(v_frag)
 
             # Compute K @ Q^T. The transposed QK C map is token-major in each
             # lane and can feed PV A without a P-LDS or bpermute transpose.
