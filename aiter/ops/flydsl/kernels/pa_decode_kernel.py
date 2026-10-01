@@ -15,10 +15,12 @@ Logical layouts (not preshuffled):
 
 * ``query``        [num_seqs, num_q_heads, head_dim]  f16/bf16 (head_dim contiguous)
 * ``key_cache``    [num_blocks, num_kv_heads, head_dim//16, block_size, 16]  fp8
-                   or NHD [num_blocks, 64, num_kv_heads, head_dim] (strided, head contiguous)
+                   or NHD [num_blocks, 64, num_kv_heads, 256] (strided, head contiguous;
+                   gfx950, head 256, page 64, one query M-tile only)
 * ``value_cache``  [num_blocks, num_kv_heads, block_size//16, head_dim, 16] (trans_v)
                    or [num_blocks, num_kv_heads, head_dim, block_size] (plain), by rank
-                   or the same NHD view as K, V starting one head later in the token
+                   or, with NHD K, an NHD view of the same shape: head_dim contiguous
+                   bytes per token, often the head_dim bytes after K in one token row
 * ``block_tables`` [num_seqs, max_blocks_per_seq]  int32
 * ``context_lengths`` [num_seqs]  int32
 * ``output``       [num_seqs, num_q_heads, head_dim]  same dtype as query
@@ -58,7 +60,7 @@ NT_LOAD = 2
 _PA_DECODE_TILE_CACHE = {}
 
 
-def longctx_m1_shape(
+def d256_m1_shape(
     head_dim: int,
     block_size: int,
     trans_v: bool,
@@ -66,7 +68,7 @@ def longctx_m1_shape(
     query_length: int,
     query_group_size: int,
 ) -> bool:
-    """Head 256, page 64/128, plain V, per-tensor scales, one query M-tile."""
+    """Head 256, page 64/128, plain V, per-tensor scales, query_length 1, one M-tile."""
     rows = query_length * query_group_size
     return (
         head_dim == 256
@@ -125,7 +127,8 @@ def compile_pa_decode_tile(
     Masked V bytes must remain finite because ``0 * NaN == NaN`` in PV MFMA.
     Pages past the sequence are pinned to block 0; callers must leave the
     unwritten tail of the last owned page finite. ``wide_kv_addressing`` uses
-    i64 offsets when a cache reaches 2 GiB and the i32 page product would wrap.
+    i64 offsets when a cache reaches 2 GiB and the i32 page product would wrap;
+    for NHD it also widens the head term, and the in-page term stays i32.
     """
     if sliding_window > 0 and not use_work_plan:
         raise ValueError("positive sliding_window requires work_plan")
@@ -197,10 +200,10 @@ def compile_pa_decode_tile(
     # evicting V, which is still being merged in L2. V prefetch only stays
     # live if the page-id load is not on the same in-order vmcnt chain, so
     # the host-sized page list is staged in LDS before the tile loop.
-    LONGCTX_PIPE = (
+    D256_M1_PIPE = (
         is_gfx950
         and not use_work_plan
-        and longctx_m1_shape(
+        and d256_m1_shape(
             head_dim,
             block_size,
             trans_v,
@@ -209,18 +212,18 @@ def compile_pa_decode_tile(
             query_group_size,
         )
     )
-    if nhd_layout and not (LONGCTX_PIPE and block_size == 64 and is_gfx950):
+    if nhd_layout and not (D256_M1_PIPE and block_size == 64 and is_gfx950):
         raise NotImplementedError(
             "NHD pa_decode is the gfx950 head-256 page-64 per-tensor decode path"
         )
-    if not LONGCTX_PIPE:
+    if not D256_M1_PIPE:
         stage_page_capacity = 0
     # A second NHD V buffer lets the next tile's DMA overlap PV, but its LDS
     # leaves room for only one CTA per CU; larger grids run faster with two
     # single-buffered CTAs sharing each CU.
     NHD_V_BUFS = 2 if nhd_layout and dense_workgroups <= num_compute_units else 1
     prefetch_v = (
-        LONGCTX_PIPE
+        D256_M1_PIPE
         or PER_TOKEN_M1
         or (
             TUNED_SCALAR
@@ -441,8 +444,8 @@ def compile_pa_decode_tile(
     sPages_off = total_bytes
     if stage_page_capacity:
         total_bytes += stage_page_capacity * 4
-    # One 8x16-byte atom per 8 tokens and 16 head elements. A 16-lane group
-    # transpose-reads that atom into the PV i64 packs.
+    # NHD V: per warp one page of row-major token rows (head_dim bytes each)
+    # with XOR-swizzled 16-byte bands; see _nhd_v_dma.
     sVnhd_off = (total_bytes + 15) & ~15
     nhd_buf_bytes = NWARP * block_size * head_dim
     sVnhd_bytes = NHD_V_BUFS * nhd_buf_bytes if nhd_layout else 0
@@ -576,7 +579,7 @@ def compile_pa_decode_tile(
 
             return _load
 
-        if const_expr(LONGCTX_PIPE):
+        if const_expr(D256_M1_PIPE):
             _k_load_fp8x16 = _make_nt_k_loader(key_cache_ptr)
         else:
             _k_load_fp8x16 = _make_raw_flat_loader(key_cache_ptr, FP8, 16, KV_EXTENT)
@@ -918,6 +921,14 @@ def compile_pa_decode_tile(
         # K token = warp*TOK_PER_WARP + a*MFMA_MNK + lane16;
         # softmax masks and P-pack writes must use the same mapping.
         def _nhd_byte(page, tok, head_byte, block_stride, tok_stride, head_stride):
+            # The host bounds the in-page term to i32; a multi-head pool's head
+            # stride can scale with num_blocks, so wide mode widens it too.
+            if const_expr(wide_kv_addressing):
+                return (
+                    fx.Int64(page) * fx.Int64(block_stride)
+                    + fx.Int64(kv_h) * fx.Int64(head_stride)
+                    + fx.Int64(tok * tok_stride + head_byte)
+                )
             return _kv_addr(
                 page,
                 block_stride,
@@ -1205,9 +1216,13 @@ def compile_pa_decode_tile(
         NHD_DMAS = block_size // NHD_TOKS_PER_DMA
         NHD_K_LOADS = NCHUNK * QKHE_LOOP
         if nhd_layout:
+            # Lane L loads band L&15 of token L>>4: one 16-lane group covers
+            # one 256-byte row, so head_dim must be 256. Warp w stages one page
+            # of the tile, so the page must be TOK_PER_WARP tokens.
             assert (
-                head_dim == WAVE * 16 // NHD_TOKS_PER_DMA
-            ), "NHD staging needs a whole number of token rows per LDS-DMA"
+                NHD_TOKS_PER_DMA == WAVE // 16 and head_dim == 256
+            ), "NHD V DMA maps one 16-lane group to one 256-byte token row"
+            assert block_size == TOK_PER_WARP, "NHD V DMA stages one page per warp"
             assert NHD_DMAS * WAVE * 16 == nhd_page_bytes
 
         def _nhd_band_slot(region, tok, band):
@@ -1236,10 +1251,15 @@ def compile_pa_decode_tile(
             n_records = fx.Int32(
                 rocdl.readfirstlane(T.i32, as_mlir_value(live * stride_v_token))
             )
+            v_head_off = (
+                fx.Int64(kv_h) * fx.Int64(stride_v_head)
+                if const_expr(wide_kv_addressing)
+                else fx.Int64(kv_h * stride_v_head)
+            )
             v_page = buffer_ops.create_buffer_resource_from_addr(
                 buf_base_i64(value_cache_ptr)
                 + fx.Int64(page) * fx.Int64(stride_v_block)
-                + fx.Int64(kv_h * stride_v_head),
+                + v_head_off,
                 num_records_bytes=n_records,
             )
             region = sVnhd_off + buf * nhd_buf_bytes + warp_u * nhd_page_bytes

@@ -31,14 +31,14 @@ from aiter.test_common import benchmark, run_perftest
 try:
     from aiter.ops.flydsl.pa_decode import (
         MAX_CONTEXT_PARTITIONS,
+        d256_m1_shape,
         get_recommended_splits,
-        longctx_m1_shape,
         pa_decode,
         plan_pa_decode,
     )
 except (ImportError, AttributeError, RuntimeError, OSError):
     MAX_CONTEXT_PARTITIONS = 256
-    get_recommended_splits = longctx_m1_shape = pa_decode = plan_pa_decode = None
+    get_recommended_splits = d256_m1_shape = pa_decode = plan_pa_decode = None
 
 SUPPORTED_GFX = ("gfx942", "gfx950")
 KV_COMPUTE_BLOCK = 256
@@ -97,6 +97,12 @@ class DecodeCase:
     query_splits: int | None = None
     wide_kv_addressing: bool | None = None
     nhd: bool = False
+    # NHD storage with KV heads outermost: the head stride spans the pool.
+    nhd_head_major: bool = False
+    # Zero K and V one-hot in head channel tile % head_dim: each partition
+    # owns distinct output channels, so dropping or misweighting any one
+    # partial exceeds the tolerance.
+    one_hot_v: bool = False
 
 
 def _require_gpu():
@@ -231,7 +237,16 @@ def _make_inputs(case, planned=False):
             )
             values = torch.where(visible, (tokens % 4 + 1).float() * 0.25, 0)
             value_quant[start:end] = values.reshape(count, 1, page, 1).to(quant_dtype)
+        if case.one_hot_v and length > 0:
+            tokens = torch.arange(count * page)
+            values = torch.zeros(count * page, dim)
+            values[tokens, (tokens // KV_COMPUTE_BLOCK) % dim] = 224
+            key_quant[start:end].zero_()
+            value_quant[start:end] = values.reshape(count, 1, page, dim).to(quant_dtype)
         start = end
+    if case.one_hot_v:
+        # A long row's channel mean is ~256 / length of the one-hot value.
+        value_scale.fill_(0.25)
 
     selected = (
         2 * torch.randperm(num_pages) + 1 if case.sparse else torch.arange(num_pages)
@@ -249,20 +264,26 @@ def _make_inputs(case, planned=False):
     if case.per_token:
         key_scale, value_scale = scatter(key_scale), scatter(value_scale)
     if case.nhd:
-        storage = torch.empty(
-            physical_pages, kv_heads, page, 2 * dim, dtype=quant_dtype
-        )
-        storage[..., :dim] = key_quant
-        storage[..., dim:] = value_quant
+        # Token rows hold K then V; rows is [pages, kv_heads, page, 2 * dim].
+        if case.nhd_head_major:
+            rows = torch.empty(
+                kv_heads, physical_pages, page, 2 * dim, dtype=quant_dtype
+            ).transpose(0, 1)
+        else:
+            rows = torch.empty(
+                physical_pages, kv_heads, page, 2 * dim, dtype=quant_dtype
+            )
+        rows[..., :dim] = key_quant
+        rows[..., dim:] = value_quant
         # fp8 NaN in the unwritten tail must not poison PV.
         nan = torch.zeros((), dtype=torch.uint8).fill_(0x7F).view(quant_dtype)
         page_base = 0
         for length, count in zip(case.lengths, counts):
             used = length % page
             if length > 0 and used:
-                storage[selected[page_base + count - 1], :, used:, dim:] = nan
+                rows[selected[page_base + count - 1], :, used:, dim:] = nan
             page_base += count
-        key_cache, value_cache = storage.transpose(1, 2).split(dim, dim=-1)
+        key_cache, value_cache = rows.transpose(1, 2).split(dim, dim=-1)
     else:
         key_cache = (
             key_quant.reshape(physical_pages, kv_heads, page, dim // 16, 16)
@@ -300,7 +321,7 @@ def _make_inputs(case, planned=False):
         ctas_per_cu = (
             1
             if get_gfx_runtime() == "gfx950"
-            and longctx_m1_shape(
+            and d256_m1_shape(
                 case.head_dim,
                 page,
                 case.trans_v,
@@ -515,6 +536,28 @@ def _assert_contracts(args, options):
             )
             with pytest.raises(ValueError, match="query_length"):
                 pa_decode(*args, **{**options, "work_plan": wrong_plan})
+
+
+def _assert_nhd_contracts(args, options, reference):
+    """Reject NHD views that break the 16-byte loads or the V tail bound."""
+    key, value = args[2:4]
+    block, token, head, _ = key.stride()
+
+    def view(tensor, stride, offset=0):
+        return tensor.as_strided(tensor.shape, stride, tensor.storage_offset() + offset)
+
+    for invalid, message in [
+        (view(key, key.stride(), offset=1), "16-byte"),
+        (view(key, (block, token - 8, head, 1)), "16-byte"),
+        (view(key, (block, 128, head, 1)), "overlap"),
+    ]:
+        with pytest.raises(ValueError, match=message):
+            pa_decode(*args[:2], invalid, *args[3:], **options)
+    if key.shape[2] == 1:
+        # A single KV head is never stepped, so its stride may be anything.
+        odd = (block, token, 2**40 + 8, 1)
+        args = (*args[:2], view(key, odd), view(value, odd), *args[4:])
+        _assert_close(_run_flydsl(*args, **options), reference())
 
 
 def _case(
@@ -839,11 +882,52 @@ CASES = [
     ),
     # 8192 tokens and 8 splits is four tiles per CTA, so page-id staging runs.
     _case(
-        "longctx-d256-page64",
+        "d256-m1-page64",
         (1, 1, 8, 256),
         (64, 0, 0),
         parts=8,
         lengths=(0, 1, 255, 256, 257, 8192),
+    ),
+    # Above 64 splits the static D256 reducer splits partitions over four
+    # groups; 130 leaves the last group short. 260 tiles fill every split,
+    # so the last group's partials are live.
+    _case(
+        "d256-m1-page64-np130",
+        (1, 1, 8, 256),
+        (64, 0, 0),
+        parts=130,
+        lengths=(0, 1, 257, 66532),
+        one_hot_v=True,
+    ),
+    # 256 splits on 256 tiles: one tile per CTA, every split live, and a
+    # partial last page.
+    _case(
+        "nhd-d256-page64-np256",
+        (1, 1, 8, 256),
+        (64, 0, 0),
+        parts=256,
+        lengths=(65500,),
+        nhd=True,
+        one_hot_v=True,
+    ),
+    _case(
+        "nhd-d256-page64-hkv2",
+        (1, 2, 8, 256),
+        (64, 0, 0),
+        parts=8,
+        lengths=(1, 65, 8192),
+        nhd=True,
+    ),
+    # Wide mode must widen the head term once the head stride spans the pool.
+    _case(
+        "nhd-d256-page64-hkv2-head-major-wide",
+        (1, 2, 8, 256),
+        (64, 0, 0),
+        parts=8,
+        lengths=(1, 65, 8192),
+        nhd=True,
+        nhd_head_major=True,
+        wide_kv_addressing=True,
     ),
     _case(
         "nhd-d256-page64",
@@ -927,7 +1011,7 @@ CASES = [
 ]
 
 
-def test_longctx_split_target():
+def test_recommended_splits_ctas_per_cu():
     """Length-aware splits follow ctas_per_cu; the default stays at two."""
     _require_gpu()
     assert get_recommended_splits(
@@ -963,9 +1047,9 @@ def test_pa_decode(case, planned, monkeypatch):
                     context, case.num_kv_heads, max_partitions=case.num_partitions
                 )
             return
-    if case.nhd and planned:
-        args, options, _reference = _make_inputs(case, planned=True)
-        with pytest.raises(NotImplementedError):
+    if case.nhd and (planned or get_gfx_runtime() != "gfx950"):
+        args, options, _reference = _make_inputs(case, planned)
+        with pytest.raises(NotImplementedError, match="NHD"):
             pa_decode(*args, **options)
         return
     args, options, reference = _make_inputs(case, planned)
@@ -1058,6 +1142,8 @@ def test_pa_decode(case, planned, monkeypatch):
         check(disabled_sink=step == 2)
 
     _assert_contracts(args, options)
+    if case.nhd:
+        _assert_nhd_contracts(args, options, reference)
     if plan is not None:
         # Check int32 limits without allocating a matching KV cache.
         lengths = (-1, 0, 1, 257, 2**31 - 1)

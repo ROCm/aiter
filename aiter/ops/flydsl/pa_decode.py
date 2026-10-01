@@ -17,7 +17,7 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 from .kernels.pa_decode_kernel import (
     KV_COMPUTE_BLOCK,
     compile_pa_decode_tile,
-    longctx_m1_shape,
+    d256_m1_shape,
 )
 from .kernels.pa_decode_plan import PADecodePlan
 from .kernels.pa_decode_plan import plan_pa_decode as plan_pa_decode  # noqa: PLC0414
@@ -26,6 +26,18 @@ from .kernels.pa_decode_reduce import (
     compile_pa_decode_ps_reduce,
 )
 from .kernels.tensor_shim import _run_compiled, get_dtype_str, ptr_arg
+
+
+def _nhd_strides(view: torch.Tensor) -> tuple[int, int, int]:
+    """Block, token and head strides; size-1 axes are never stepped, so 0."""
+    return tuple(0 if view.shape[d] == 1 else int(view.stride(d)) for d in range(3))
+
+
+def _view_span(view: torch.Tensor) -> int:
+    """Elements from the view's first element through its last, inclusive."""
+    return 1 + sum(
+        (size - 1) * stride for size, stride in zip(view.shape, view.stride())
+    )
 
 
 def get_recommended_splits(
@@ -41,11 +53,12 @@ def get_recommended_splits(
 
     Without ``max_context_length``, the default cap is eight. A host length
     hint targets ``ctas_per_cu`` CTAs per CU, bounded by 256-token tiles and
-    the reducer limit. The default is two. Pass one for the gfx950 head-256
-    streamed-K schedule (``longctx_m1_shape``). Short contexts and large
-    grids retain the legacy recommendation. ``max_partitions`` caps either
-    mode. Allocate scratch and call ``pa_decode`` with the returned count
-    for every sequence; no GPU lengths are read back.
+    the reducer limit. The default is two. Pass one for gfx950 shapes that
+    satisfy ``d256_m1_shape`` (nontemporal K, staged page ids, prefetched V).
+    Short contexts and large grids retain the legacy recommendation.
+    ``max_partitions`` caps either mode. Allocate scratch and call
+    ``pa_decode`` with the returned count for every sequence; no GPU lengths
+    are read back.
     """
     if max_context_length is not None and max_context_length < 0:
         raise ValueError("max_context_length must be non-negative")
@@ -196,8 +209,8 @@ def launch_pa_decode_ps_reduce(
 def pa_decode(
     output: torch.Tensor,  # [num_seqs * query_length, num_query_heads, head_size]
     query: torch.Tensor,  # [num_seqs * query_length, num_query_heads, head_size]
-    key_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size // x, kv_block_size, x]
-    value_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size, kv_block_size] or [num_blocks, num_kv_heads, kv_block_size // x, head_size, x]
+    key_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size // x, kv_block_size, x] or NHD [num_blocks, kv_block_size, num_kv_heads, head_size]
+    value_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size, kv_block_size] or [num_blocks, num_kv_heads, kv_block_size // x, head_size, x] or NHD like key_cache
     context_lengths: torch.Tensor,  # [num_seqs]
     block_tables: torch.Tensor,  # [num_seqs, max_num_blocks_per_seq]
     softmax_scale: float,
@@ -221,6 +234,15 @@ def pa_decode(
     Supports page sizes 16/64/128 and head_dim 64 or multiples of 128 up to 1024.
     K/V scales are [1] or [num_blocks, num_kv_heads, block_size, 1].
     ALiBi and externally quantized queries are unsupported.
+
+    A 4D ``key_cache`` selects the NHD layout: K and V are equally shaped
+    [num_blocks, 64, num_kv_heads, 256] views with a contiguous head axis and
+    arbitrary other strides, e.g. both halves of one 512-byte token row. NHD
+    requires gfx950, head 256, page 64, query_length 1, one query M-tile,
+    per-tensor scales, and no work plan. Each view must be 16-byte aligned
+    with 16-byte multiple strides, its token rows must not overlap, and its
+    strides and in-page span must fit int32; heads-outermost storage with
+    several KV heads is thus limited to 2 GiB per head.
 
     MTP lengths include the query tokens and use dense causal masking.
     Independently selected sparse queries need separate table rows and
@@ -375,6 +397,21 @@ def pa_decode(
             )
         if key_cache.stride(-1) != 1 or value_cache.stride(-1) != 1:
             raise ValueError("NHD key and value head axes must be contiguous")
+        for name, view in (("key_cache", key_cache), ("value_cache", value_cache)):
+            # K loads and V LDS-DMAs move 16-byte chunks.
+            strides = _nhd_strides(view)
+            if view.data_ptr() % 16 or any(stride % 16 for stride in strides):
+                raise ValueError(
+                    f"NHD {name} needs a 16-byte aligned base and block, token "
+                    f"and head strides that are multiples of 16, got data_ptr "
+                    f"{view.data_ptr():#x} and strides {view.stride()}"
+                )
+            # The V tail bound is live_tokens * token_stride bytes.
+            if strides[1] < head_dim:
+                raise ValueError(
+                    f"NHD {name} token rows must not overlap, got token stride "
+                    f"{view.stride(1)} for head_dim={head_dim}"
+                )
         v_num_blocks, v_num_kv_heads = num_blocks, num_kv_heads
     elif trans_v:
         v_num_blocks, v_num_kv_heads = value_cache.shape[:2]
@@ -596,7 +633,7 @@ def pa_decode(
                 "NHD pa_decode requires gfx950, per-tensor scales, and no work plan"
             )
         if (
-            not longctx_m1_shape(
+            not d256_m1_shape(
                 head_dim,
                 block_size,
                 trans_v,
@@ -609,21 +646,25 @@ def pa_decode(
             raise NotImplementedError(
                 "NHD pa_decode requires head 256, page 64, and one query M-tile"
             )
-        stride_k_block = int(key_cache.stride(0))
-        stride_k_token = int(key_cache.stride(1))
-        stride_k_head = int(key_cache.stride(2))
-        stride_v_block = int(value_cache.stride(0))
-        stride_v_token = int(value_cache.stride(1))
-        stride_v_head = int(value_cache.stride(2))
+        stride_k_block, stride_k_token, stride_k_head = _nhd_strides(key_cache)
+        stride_v_block, stride_v_token, stride_v_head = _nhd_strides(value_cache)
+        # Strides are i32 kernel arguments, and the in-page offset and V tail
+        # bound stay i32 even in wide mode.
+        strides = (stride_k_block, stride_k_head, stride_v_block, stride_v_head)
+        page_span = block_size * max(stride_k_token, stride_v_token)
+        if max(*strides, page_span) >= 2**31:
+            raise NotImplementedError(
+                "NHD pa_decode requires int32 block and head strides and "
+                "block_size * token_stride < 2**31, got strides "
+                f"{key_cache.stride()} and {value_cache.stride()}"
+            )
 
-    # Widen before either cache's i32 element offsets can wrap.
+    # Widen before either cache's i32 element offsets can wrap. A strided NHD
+    # view can span more bytes than numel(), and its head stride may scale
+    # with num_blocks, so measure the highest byte offset.
     if nhd_layout:
         wide_kv_addressing = (
-            max(
-                key_cache.shape[0] * key_cache.stride(0),
-                value_cache.shape[0] * value_cache.stride(0),
-            )
-            >= 2**31
+            max(_view_span(key_cache), _view_span(value_cache)) >= 2**31
         )
     else:
         wide_kv_addressing = max(key_cache.numel(), value_cache.numel()) >= 2**31
@@ -635,7 +676,7 @@ def pa_decode(
     if (
         work_plan is None
         and arch == "gfx950"
-        and longctx_m1_shape(
+        and d256_m1_shape(
             head_dim,
             block_size,
             trans_v,
