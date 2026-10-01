@@ -75,6 +75,39 @@ class PromotionPolicy:
 
 DEFAULT_PROMOTION = PromotionPolicy()
 
+
+@dataclass(frozen=True)
+class RacePolicy:
+    """How an interleaved elimination race spends its measurements.
+
+    The race's indifference zone is ``PromotionPolicy.min_improvement_pct``
+    unless a caller narrows or widens it, so by default the race and the gate
+    after it agree on what a tie is.
+    """
+
+    # Error budget for eliminating a candidate as slower than the leader.
+    alpha: float = 0.05
+    # Timed calls per candidate per block.
+    block_calls: int = 10
+    # Blocks before elimination may start, and at which the race stops
+    # without certifying a winner.
+    min_blocks: int = 3
+    max_blocks: int = 30
+
+    def __post_init__(self):
+        if not 0.0 < self.alpha < 1.0:
+            raise ValueError(f"alpha must be in (0, 1), got {self.alpha}")
+        if self.block_calls < 1:
+            raise ValueError("block_calls must be at least 1")
+        if not 1 <= self.min_blocks <= self.max_blocks:
+            raise ValueError("need 1 <= min_blocks <= max_blocks")
+
+
+DEFAULT_RACE = RacePolicy()
+
+# Seeds candidate sampling and the race's block order, so a run is repeatable.
+SAMPLE_SEED = 20240917
+
 PROMOTE = "promote"
 RETAIN = "retain"
 

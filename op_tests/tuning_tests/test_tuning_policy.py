@@ -77,6 +77,19 @@ class TestPromotionPolicy(unittest.TestCase):
             policy.PromotionPolicy(min_improvement_pct=-1.0)
 
 
+class TestRacePolicy(unittest.TestCase):
+    def test_rejects_an_unusable_error_budget(self):
+        for alpha in (0.0, 1.0):
+            with self.subTest(alpha=alpha), self.assertRaises(ValueError):
+                policy.RacePolicy(alpha=alpha)
+
+    def test_rejects_a_race_that_stops_before_it_may_eliminate(self):
+        with self.assertRaises(ValueError):
+            policy.RacePolicy(min_blocks=5, max_blocks=4)
+        with self.assertRaises(ValueError):
+            policy.RacePolicy(block_calls=0)
+
+
 class TestGateAgainstIncumbent(unittest.TestCase):
     BAR = policy.PromotionPolicy(min_improvement_pct=3.0)
 
