@@ -243,6 +243,14 @@ MoeKernel moe_dispatch(int M, int N, int K, int block_m, int activation, bool ha
             }
         }
     }
+    TORCH_CHECK(false,
+                "Unsupported CK-Tile MoE activation: activation=",
+                activation,
+                ", has_bias=",
+                has_bias,
+                ", split_k=",
+                split_k);
+    return {};
 }
 
 torch::Tensor cktile_moe_gemm1(torch::Tensor& XQ,

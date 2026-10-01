@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Dispatch-only coverage for non-256-aligned MXFP4 MoE shapes."""
+"""Dispatch and correctness coverage for MXFP4 MoE shapes."""
 
 import functools
 from types import SimpleNamespace
@@ -11,14 +11,18 @@ import torch
 import aiter
 import aiter.fused_moe as fused_moe_module
 from aiter import ActivationType, QuantType, dtypes
-from aiter.fused_moe import cktile_moe_stage2, get_2stage_cfgs
+from aiter.fused_moe import cktile_moe_stage2, fused_moe, get_2stage_cfgs
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.moe_common import GateMode
-from aiter.ops.shuffle import shuffle_scale
+from aiter.ops.shuffle import shuffle_scale, shuffle_weight
+from aiter.ops.triton.quant import dynamic_mxfp4_quant
 
 _SKIP = pytest.mark.skipif(
     get_gfx() not in ("gfx942", "gfx950"),
     reason="CDNA (gfx942/gfx950) required for MXFP4 MoE dispatch",
+)
+_GFX950_ONLY = pytest.mark.skipif(
+    get_gfx() != "gfx950", reason="gfx950 CK-Tile MXFP4 MoE required"
 )
 
 MODEL_DIM = 6144
@@ -247,6 +251,113 @@ def test_cktile_stage2_allows_aligned_mxfp4_shape(monkeypatch):
         32,
     )
     assert called == [True]
+
+
+@_GFX950_ONLY
+def test_cktile_moe_missing_silu_bias_specialization_raises():
+    x = torch.zeros((1, 256), dtype=torch.bfloat16, device="cuda")
+    w1 = torch.zeros((1, 256, 128), dtype=torch.uint8, device="cuda").view(
+        torch.float4_e2m1fn_x2
+    )
+    out = torch.empty((1, 1, 128), dtype=torch.bfloat16, device="cuda")
+    sorted_ids = torch.zeros(16, dtype=torch.int32, device="cuda")
+    expert_ids = torch.zeros(1, dtype=torch.int32, device="cuda")
+    num_valid_ids = torch.ones(1, dtype=torch.int32, device="cuda")
+    bias = torch.zeros((1, 256), dtype=torch.float32, device="cuda")
+
+    with pytest.raises(RuntimeError) as error:
+        aiter.moe_cktile2stages_gemm1(
+            x,
+            w1,
+            out,
+            sorted_ids,
+            expert_ids,
+            num_valid_ids,
+            topk=1,
+            exp_bias=bias,
+            activation=ActivationType.Silu,
+            block_m=16,
+            split_k=1,
+        )
+    assert "activation=0, has_bias=1, split_k_gt_1=0" in str(error.value)
+    assert (
+        "Consider adding the specialization in "
+        "csrc/ck_tile_gemm_moe_2stages/gen_instances.py"
+    ) in str(error.value)
+
+
+@_GFX950_ONLY
+def test_mxfp4_bf16_swiglu_interleaved_matches_separated(monkeypatch):
+    monkeypatch.setenv("AITER_BF16_FP8_MOE_BOUND", "2147483647")
+    monkeypatch.setenv("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "2147483647")
+    get_2stage_cfgs.cache_clear()
+    model_dim, inter_dim = 1024, 256
+    assert (
+        _stage_backend(
+            _dispatch(
+                model_dim=model_dim,
+                inter_dim=inter_dim,
+                gate_mode=GateMode.INTERLEAVE,
+            ).stage1
+        )
+        == "cktile"
+    )
+
+    torch.manual_seed(0)
+    x = torch.randn((TOKEN, model_dim), dtype=torch.bfloat16, device="cuda")
+    w13 = torch.randn(
+        (E, inter_dim * 2, model_dim), dtype=torch.bfloat16, device="cuda"
+    ).mul_(0.1)
+    w2 = torch.randn(
+        (E, model_dim, inter_dim), dtype=torch.bfloat16, device="cuda"
+    ).mul_(0.05)
+    topk_ids = (
+        torch.arange(TOKEN * TOPK, dtype=torch.int32, device="cuda")
+        .reshape(TOKEN, TOPK)
+        .remainder_(E)
+    )
+    topk_weights = torch.full(
+        (TOKEN, TOPK), 1 / TOPK, dtype=torch.float32, device="cuda"
+    )
+
+    def quantize(weight):
+        cols = weight.shape[-1]
+        packed, scales = dynamic_mxfp4_quant(weight.reshape(-1, cols))
+        packed = packed.view(torch.uint8).reshape(
+            weight.shape[0], weight.shape[1], cols // 2
+        )
+        scales = scales.view(torch.uint8).reshape(-1, cols // 32)
+        return packed.view(torch.float4_e2m1fn_x2), scales
+
+    w13_q, w13_scale = quantize(w13)
+    w2_q, w2_scale = quantize(w2)
+
+    def run(gate_mode):
+        interleave = gate_mode == GateMode.INTERLEAVE
+        return fused_moe(
+            x,
+            shuffle_weight(w13_q, is_guinterleave=interleave, gate_up=True),
+            shuffle_weight(w2_q, is_guinterleave=interleave, gate_up=False),
+            topk_weights,
+            topk_ids,
+            activation=ActivationType.Swiglu,
+            quant_type=QuantType.per_1x32,
+            w1_scale=shuffle_scale(w13_scale, E, interleave, True),
+            w2_scale=shuffle_scale(w2_scale, E, interleave, False),
+            swiglu_limit=7.0,
+            gate_mode=gate_mode.value,
+        )
+
+    try:
+        with torch.inference_mode():
+            separated = run(GateMode.SEPARATED)
+            interleaved = run(GateMode.INTERLEAVE)
+        assert torch.count_nonzero(separated) > 0
+        torch.testing.assert_close(
+            interleaved.float(), separated.float(), rtol=0, atol=0.1
+        )
+    finally:
+        get_2stage_cfgs.cache_clear()
 
 
 def _undo_shuffle_scale(scale):
