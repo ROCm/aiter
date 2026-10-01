@@ -18,26 +18,26 @@ chunk_delta_attn_gate_fwd     Per-token gate without cumsum (forward only).
 flash_kda_fwd                 Two-kernel fused forward (opt-in, narrower shapes).
 """
 
-from aiter.ops.triton._triton_kernels.chunk_delta_attn.chunk_fwd import (
+from aiter.ops.triton._triton_kernels.kimi_delta_attn.chunk_fwd import (
     chunk_delta_attn_fwd,
 )
-from aiter.ops.triton._triton_kernels.chunk_delta_attn.flash_kda import (
+from aiter.ops.triton._triton_kernels.kimi_delta_attn.flash_kda import (
     flash_kda_fwd,
 )
-from aiter.ops.triton._triton_kernels.chunk_delta_attn.gate import (
+from aiter.ops.triton._triton_kernels.kimi_delta_attn.gate import (
     beta_sigmoid_fwd,
     chunk_delta_attn_gate_fwd,
 )
-from aiter.ops.triton._triton_kernels.chunk_delta_attn.gla_output import (
+from aiter.ops.triton._triton_kernels.kimi_delta_attn.gla_output import (
     chunk_gla_fwd_o,
 )
-from aiter.ops.triton._triton_kernels.chunk_delta_attn.intra_attn import (
+from aiter.ops.triton._triton_kernels.kimi_delta_attn.intra_attn import (
     chunk_delta_attn_fwd_intra,
 )
-from aiter.ops.triton._triton_kernels.chunk_delta_attn.utils.cumsum import (
+from aiter.ops.triton._triton_kernels.kimi_delta_attn.utils.cumsum import (
     chunk_gate_cumsum,
 )
-from aiter.ops.triton._triton_kernels.chunk_delta_attn.wy_fast import (
+from aiter.ops.triton._triton_kernels.kimi_delta_attn.wy_fast import (
     recompute_w_u_fwd,
 )
 
