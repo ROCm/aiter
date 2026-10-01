@@ -45,9 +45,10 @@ that duplicates functionality already in the tree, even partially — the fix is
 to extend or import the existing implementation, not to add a parallel copy.
 
 `utils/` is layered on purpose: `config_utils.py` holds the shared core
-(`resolve_config_dir`, `load_config_json`, the path constants) and each family
-keeps its own loader module (`gemm_config_utils`, `conv_config_utils`,
-`mhc_config_utils`, `moe_config_utils`, `tuned_config_utils`) on top of it.
+(`resolve_config_dir`, `load_config_json`, `select_leq_config`, the path
+constants) and each family keeps its own loader module (`gemm_config_utils`,
+`conv_config_utils`, `mhc_config_utils`, `moe_config_utils`,
+`tuned_config_utils`) on top of it.
 Flag a function given a second home — a re-export, a wrapper that only
 forwards to another module, or a copy of a core helper inside a family module.
 
@@ -215,14 +216,18 @@ values for either backend live in JSON, never in Python. Flag:
   family loader or `resolve_config_dir()` would work — a hand-built path is a
   second place the layout is encoded, and it skips the argument validation
   that makes a wrong value fail closed.
+- A hand-written loop selecting the smallest matching `N_LEQ_*` (or another
+  upper-bound prefix) entry — use `select_leq_config()` so threshold ordering,
+  fallback, and copying semantics have one implementation.
 - A second MOE config reader. `utils/moe_config_utils.py::get_moe_dispatch` is
   the only MOE fetcher; flag any new MOE path built by hand, any direct
   `load_config_json` on a `moe/` file, and any reintroduced per-wrapper MOE
   loader.
 - A new arch- or backend-fallback chain inside a loader (try this arch, then
-  that one; try triton, then gluon). Resolution is deterministic. MHC's gfx942
-  fallback is the one documented exception and it goes through the `arch=`
-  override, not through a probe.
+  that one; try triton, then gluon). Resolution is deterministic. The
+  documented compatibility exceptions are MHC's gfx942 fallback and Triton
+  `fused_clamp_act_mul`'s legacy gfx950 fallback; both use the `arch=` override
+  instead of a probe.
 - A raw config list handed to `@triton.autotune`. Route it through
   `autotune_configs` from `aiter.ops.triton.utils.tuned_config_utils`:
 

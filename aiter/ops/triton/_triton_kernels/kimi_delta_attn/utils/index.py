@@ -7,7 +7,7 @@
 import torch
 import triton
 
-from aiter.ops.triton._triton_kernels.chunk_delta_attn.chunk_delta_attn_utils import (
+from aiter.ops.triton._triton_kernels.kimi_delta_attn.chunk_delta_attn_utils import (
     tensor_cache,
 )
 
