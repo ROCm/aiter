@@ -491,6 +491,134 @@ def test_fused_qk_norm_rope_gate_fp8_quant_mixed_decode_extend_suffix():
         assert relative_error < 0.04
 
 
+@pytest.mark.parametrize(
+    "lengths, num_decode",
+    [
+        ([1, 1, 1, 16, 37, 5], 3),
+        ([1, 1, 1, 1, 7, 64, 3, 129], 4),
+        ([1, 1, 1, 1, 1, 2, 9, 33, 1, 70, 4, 17, 256], 5),
+    ],
+)
+@pytest.mark.parametrize("num_kv_heads", [1, 4])
+@requires_gfx950
+def test_fused_qk_norm_rope_gate_fp8_quant_decode_prefix_multiple_suffix_sequences(
+    lengths, num_decode, num_kv_heads
+):
+    """Decode prefix followed by several quantized sequences.
+
+    With more than one quantized sequence and ``quant_sequence_start != 0`` the
+    offset kernels search ``cu_seqlens`` for each token's sequence. V is scaled
+    by a different power of two per sequence, so a token attributed to the
+    wrong sequence is quantized against a descale 2x or more off. Comparing
+    the FP8 codes, not only the dequantized values, catches both directions.
+    """
+    num_query_heads = NUM_QUERY_HEADS
+    inputs = _make_inputs(
+        lengths,
+        num_query_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+    )
+    q_gate, key, value, q_weight, k_weight, cache, positions, cu_seqlens = inputs
+    sequence_scales = torch.tensor(
+        [2.0 ** (sequence % 5 - 2) for sequence in range(len(lengths))],
+        dtype=torch.float32,
+        device=value.device,
+    )
+    token_scales = torch.repeat_interleave(
+        sequence_scales,
+        torch.tensor(lengths, device=value.device),
+    )
+    value = (value.float() * token_scales[:, None]).to(value.dtype)
+    inputs = (q_gate, key, value, q_weight, k_weight, cache, positions, cu_seqlens)
+    quant_token_start = sum(lengths[:num_decode])
+    output = fused_qk_norm_rope_gate_fp8_quant(
+        *inputs,
+        num_actual_tokens=sum(lengths),
+        quant_token_start=quant_token_start,
+        quant_sequence_start=num_decode,
+        num_query_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=HEAD_DIM,
+        rotary_dim=ROTARY_DIM,
+        eps=EPS,
+    )
+    torch.cuda.synchronize()
+
+    ref_query, ref_key, ref_gate = _reference_qk_gate(
+        q_gate,
+        key,
+        q_weight,
+        k_weight,
+        cache,
+        positions,
+        num_query_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+    )
+    torch.testing.assert_close(output.query, ref_query, rtol=1.0e-2, atol=1.0e-2)
+    torch.testing.assert_close(output.key, ref_key, rtol=1.0e-2, atol=1.0e-2)
+    torch.testing.assert_close(output.gate, ref_gate, rtol=0, atol=0)
+
+    expected_descales = _expected_descales(
+        output.query,
+        output.key,
+        value,
+        cu_seqlens,
+        quant_sequence_start=num_decode,
+        num_query_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+    )
+    actual_descales = (
+        output.query_descale,
+        output.key_descale,
+        output.value_descale,
+    )
+    for actual, expected in zip(actual_descales, expected_descales):
+        torch.testing.assert_close(
+            actual[num_decode : len(lengths)],
+            expected[num_decode:],
+            rtol=2.0e-6,
+            atol=1.0e-8,
+        )
+
+    query = output.query.view(-1, num_query_heads, HEAD_DIM).float()
+    output_key = output.key.view(-1, num_kv_heads, HEAD_DIM).float()
+    output_value = value.view(-1, num_kv_heads, HEAD_DIM).float()
+    gqa_ratio = num_query_heads // num_kv_heads
+    for sequence in range(num_decode, len(lengths)):
+        start = int(cu_seqlens[sequence].item())
+        end = int(cu_seqlens[sequence + 1].item())
+        for kv_head in range(num_kv_heads):
+            q_head_start = kv_head * gqa_ratio
+            q_head_end = q_head_start + gqa_ratio
+            codes = (
+                output.query_fp8[start:end, q_head_start:q_head_end].float(),
+                output.key_fp8[start:end, kv_head].float(),
+                output.value_fp8[start:end, kv_head].float(),
+            )
+            references = (
+                query[start:end, q_head_start:q_head_end],
+                output_key[start:end, kv_head],
+                output_value[start:end, kv_head],
+            )
+            for code, reference, descale, expected_descale in zip(
+                codes, references, actual_descales, expected_descales
+            ):
+                expected_code = (
+                    (reference / expected_descale[sequence, kv_head])
+                    .to(FP8_DTYPE)
+                    .float()
+                )
+                torch.testing.assert_close(
+                    code, expected_code, rtol=0.125, atol=2.0**-6
+                )
+                actual = code * descale[sequence, kv_head]
+                relative_error = (
+                    actual - reference
+                ).abs().amax() / reference.abs().amax()
+                assert relative_error < 0.04
+                assert torch.isfinite(actual).all()
+
+
 def test_fused_qk_norm_rope_gate_fp8_quant_rejects_cpu_inputs():
     q_gate = torch.empty(1, NUM_QUERY_HEADS * 2 * HEAD_DIM)
     key = torch.empty(1, NUM_KV_HEADS * HEAD_DIM)
