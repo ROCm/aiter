@@ -10,7 +10,7 @@ Minimal test suite for validating the aiter tuning infrastructure.
 | `test_tuner_infra.py` | 1 | No | `base_tuner` utilities: CSV I/O, merge, dedup, calculate, post_process topk, update_config_files |
 | `test_compare_logic.py` | 1 | No | Compare/update_improved: `_build_compare_update_plan`, `_merge_compare_filtered_results` |
 | `test_mp_tuner_logic.py` | 1 | No | `mp_tuner` polling: timeout, AcceleratorError, KeyError, pool restart |
-| `test_mp_tuner_fault.py` | 2 | Yes | `mp_tuner` with a candidate that faults in-process or kills its worker: untyped callers get the whole group failed, `return_status` callers keep what was measured and see `not_run` behind the fault, and a shape queued behind a dead worker still finishes |
+| `test_mp_tuner_fault.py` | 2 | Yes | `mp_tuner` with a candidate that faults in-process, kills its worker, or fails while its inputs are prepared: untyped callers get the whole group failed, `return_status` callers keep what was measured and see `not_run` behind the fault, and a shape queued behind a dead worker still finishes |
 | `test_tuning_policy.py` | 1 | No | `aiter/utility/tuning_policy.py`: measurement, run and promotion defaults reach `ARG_DEFAULTS`, policy validation, `gate_against_incumbent` boundaries |
 | `test_online_tune.py` | 1 | No | `AITER_ONLINE_TUNE` decision logic, `mp_lock` synchronization, MainFunc CSV write, cfg_2stages reload |
 | `test_tune_pipeline.py` | 2 | Yes | End-to-end: run each tuner on small shapes (mp=1 + mp=default), verify output CSV; `--compare --update_improved`; `AITER_ONLINE_TUNE` e2e |
