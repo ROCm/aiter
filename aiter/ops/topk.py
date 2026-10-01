@@ -784,24 +784,19 @@ def _decode_backend(
 
 @functools.lru_cache(maxsize=8)
 def _decode_cu_count(device_index: int) -> int:
-    """CU count the gate keys on and the adaptive launcher sizes its grid for.
-
-    `CU_NUM` may lower it but never raise it past the device, because a row's
-    parts must be co-resident on the card that actually runs them.
-    """
+    """`get_cu_num()`, capped to this device: a row's parts must be co-resident."""
     # Callers pass a CUDA tensor's `device.index`, which torch always sets. Do not
     # map `None` to the current device here: the cache would pin that device's
     # count under the `None` key for every later device.
     physical = torch.cuda.get_device_properties(device_index).multi_processor_count
-    override = int(os.getenv("CU_NUM", "0"))
-    return min(override, physical) if override > 0 else physical
+    return min(get_cu_num(), physical)
 
 
 @functools.lru_cache(maxsize=8)
 def _decode_arch(device_index: int) -> str:
     """Arch of the device the logits live on, read like `_decode_cu_count`.
 
-    Not `get_gfx()`, which honours the build-time `GPU_ARCHS` and ignores the device.
+    Not `get_gfx()` or `get_gfx_runtime()`, which read `GPU_ARCHS` or the first GPU.
     """
     return torch.cuda.get_device_properties(device_index).gcnArchName.split(":")[0]
 
