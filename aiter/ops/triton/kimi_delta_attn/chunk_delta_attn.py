@@ -35,7 +35,7 @@ Notes on the fla-compatible surface:
 
 import torch
 
-from aiter.ops.triton._triton_kernels.chunk_delta_attn import chunk_delta_attn_fwd
+from aiter.ops.triton._triton_kernels.kimi_delta_attn import chunk_delta_attn_fwd
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
