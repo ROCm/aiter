@@ -76,11 +76,11 @@ def create_kda_decode_fused_projection_kernel(norm_eps: float, lower_bound: floa
         stride_x_token: fx.Int32,
         stride_weight_channel: fx.Int32,
         stride_weight_width: fx.Int32,
-        stride_conv_slot: fx.Int32,
+        stride_conv_slot: fx.Int64,
         stride_conv_channel: fx.Int32,
         stride_conv_width: fx.Int32,
         stride_beta_token: fx.Int32,
-        stride_state_slot: fx.Int32,
+        stride_state_slot: fx.Int64,
         stride_gate_token: fx.Int32,
         stride_gate_head: fx.Int32,
         stride_out_token: fx.Int32,
@@ -92,11 +92,9 @@ def create_kda_decode_fused_projection_kernel(norm_eps: float, lower_bound: floa
         f_b_weight = GTensor(f_b_weight_mem, dtype=T.bf16, shape=(-1,))
         x = GTensor(x_mem, dtype=T.bf16, shape=(-1,))
         weight = GTensor(weight_mem, dtype=T.f32, shape=(-1,))
-        conv_state = GTensor(conv_state_mem, dtype=T.bf16, shape=(-1,))
         raw_beta = GTensor(raw_beta_mem, dtype=T.bf16, shape=(-1,))
         A_log = GTensor(A_log_mem, dtype=T.f32, shape=(-1,))
         dt_bias = GTensor(dt_bias_mem, dtype=T.f32, shape=(-1,))
-        state = GTensor(state_mem, dtype=T.f32, shape=(-1,))
         state_indices = GTensor(state_indices_mem, dtype=T.i32, shape=(-1,))
         output_gate = GTensor(output_gate_mem, dtype=T.bf16, shape=(-1,))
         norm_weight = GTensor(norm_weight_mem, dtype=T.bf16, shape=(-1,))
@@ -120,6 +118,21 @@ def create_kda_decode_fused_projection_kernel(norm_eps: float, lower_bound: floa
 
         state_idx = fx.Int32(state_indices[batch])
         valid = state_idx > fx.Int32(0)
+        # Rebase both caches on the selected slot in 64-bit. Buffer accesses
+        # take a 32-bit byte offset, so slot * stride must not reach them.
+        state_slot = state_idx.to(fx.Int64)
+        conv_state = GTensor(
+            conv_state_mem,
+            dtype=T.bf16,
+            shape=(-1,),
+            static_bytes_offset_i64=state_slot * stride_conv_slot * fx.Int64(2),
+        )
+        state = GTensor(
+            state_mem,
+            dtype=T.f32,
+            shape=(-1,),
+            static_bytes_offset_i64=state_slot * stride_state_slot * fx.Int64(4),
+        )
 
         valid_if = scf.IfOp(_to_raw(valid), results_=[], has_else=True)
         with ir.InsertionPoint(valid_if.then_block):
@@ -183,9 +196,7 @@ def create_kda_decode_fused_projection_kernel(norm_eps: float, lower_bound: floa
                 )
 
                 def convolve_channel(channel):
-                    cs_base = (
-                        state_idx * stride_conv_slot + channel * stride_conv_channel
-                    )
+                    cs_base = channel * stride_conv_channel
                     c0 = fx.Float32(conv_state[cs_base])
                     c1 = fx.Float32(conv_state[cs_base + stride_conv_width])
                     c2 = fx.Float32(
@@ -371,9 +382,7 @@ def create_kda_decode_fused_projection_kernel(norm_eps: float, lower_bound: floa
             beta = fx.Float32(1.0) / (
                 fx.Float32(1.0) + fx.math.exp2(-beta_value * fx.Float32(_LOG2E))
             )
-            state_head_base = state_idx * stride_state_slot + head * fx.Int32(
-                _DIM * _DIM
-            )
+            state_head_base = head * fx.Int32(_DIM * _DIM)
 
             state_vecs = []
             for vi in range_constexpr(_V_ITERS):
@@ -566,11 +575,11 @@ def create_kda_decode_fused_projection_kernel(norm_eps: float, lower_bound: floa
         stride_x_token: fx.Int32,
         stride_weight_channel: fx.Int32,
         stride_weight_width: fx.Int32,
-        stride_conv_slot: fx.Int32,
+        stride_conv_slot: fx.Int64,
         stride_conv_channel: fx.Int32,
         stride_conv_width: fx.Int32,
         stride_beta_token: fx.Int32,
-        stride_state_slot: fx.Int32,
+        stride_state_slot: fx.Int64,
         stride_gate_token: fx.Int32,
         stride_gate_head: fx.Int32,
         stride_out_token: fx.Int32,

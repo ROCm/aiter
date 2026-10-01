@@ -434,6 +434,89 @@ def test_f_b_non_positive_slots_do_not_modify_caches() -> None:
     assert torch.equal(inputs.state, state_before)
 
 
+def _move_to_large_caches(
+    inputs: Inputs,
+    slot_indices: tuple[int, ...],
+    slots: int,
+    conv_slot_stride: int,
+) -> Inputs:
+    """Copy each batch slot into zeroed caches large enough to overflow 32-bit
+    byte offsets, at the high ``slot_indices``."""
+    conv_storage = torch.zeros(
+        (slots, conv_slot_stride),
+        dtype=torch.bfloat16,
+        device=_DEVICE,
+    )
+    conv_state = conv_storage[:, : _CHANNELS * (_CONV_WIDTH - 1)].view(
+        slots, _CHANNELS, _CONV_WIDTH - 1
+    )
+    state = torch.zeros(
+        (slots, _HEADS, _DIM, _DIM),
+        dtype=torch.float32,
+        device=_DEVICE,
+    )
+    for batch_idx, slot in enumerate(slot_indices):
+        small_slot = int(inputs.state_indices[batch_idx])
+        conv_state[slot].copy_(inputs.conv_state[small_slot])
+        state[slot].copy_(inputs.state[small_slot])
+    large = _copy_inputs(inputs)
+    large.conv_state = conv_state
+    large.state = state
+    large.state_indices = torch.tensor(
+        slot_indices,
+        dtype=torch.int32,
+        device=_DEVICE,
+    )
+    return large
+
+
+@pytest.mark.parametrize("fused_f_b", [False, True])
+def test_large_cache_slot_offsets(fused_f_b: bool) -> None:
+    # 11,000 [12, 128, 128] FP32 slots cross 2**31 elements of state, and a
+    # 2**18-element BF16 conv slot stride crosses 2**32 bytes past slot 8,192.
+    slots = 11_000
+    slot_indices = (5_500, 10_999)
+    batch = len(slot_indices)
+    if fused_f_b:
+        f_a, f_b_weight, seed = _make_fb_inputs(batch)
+    else:
+        seed = _make_inputs(batch)
+    reference_inputs = _copy_inputs(seed)
+    actual_inputs = _move_to_large_caches(
+        seed,
+        slot_indices,
+        slots,
+        conv_slot_stride=1 << 18,
+    )
+
+    reference = _reference(reference_inputs)
+    if fused_f_b:
+        actual = _run_with_f_b(f_a, f_b_weight, actual_inputs)
+    else:
+        actual = _run(actual_inputs)
+    torch.cuda.synchronize()
+
+    assert _relative_rmse(reference, actual) < 1e-3
+    for batch_idx, slot in enumerate(slot_indices):
+        small_slot = int(reference_inputs.state_indices[batch_idx])
+        assert (
+            _relative_rmse(
+                reference_inputs.state[small_slot],
+                actual_inputs.state[slot],
+            )
+            < 1e-3
+        )
+        assert torch.equal(
+            reference_inputs.conv_state[small_slot],
+            actual_inputs.conv_state[slot],
+        )
+        actual_inputs.state[slot].zero_()
+        actual_inputs.conv_state[slot].zero_()
+    # Nothing outside the addressed slots may be touched by wrapped offsets.
+    assert torch.count_nonzero(actual_inputs.state) == 0
+    assert torch.count_nonzero(actual_inputs.conv_state) == 0
+
+
 def test_f_b_api_rejects_invalid_projection_inputs() -> None:
     f_a, f_b_weight, inputs = _make_fb_inputs(batch=1)
 
