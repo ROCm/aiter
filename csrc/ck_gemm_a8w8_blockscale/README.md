@@ -26,6 +26,93 @@ If you have built gemm_a8w8 kernels before tuning new GEMM shapes, please add `A
 
 ## More Options
 
+### FlyDSL FP8 blockscale (gfx950)
+
+The existing tuner also accepts `--libtype flydsl`. Use `--libtype all` to race
+FlyDSL against the existing supported CK, CKTile, ASM and Opus candidates;
+`--libtype both` retains its original CK/CKTile-only meaning. Add `--preshuffle`
+for the B-preshuffled operator and select its output CSV with `-o`.
+
+- The public `gemm_a8w8_blockscale` and `gemm_a8w8_blockscale_bpreshuffle` APIs
+  keep their signatures and default backends. A winning row with
+  `libtype=flydsl` and a `flydsl_blockscale_8w_...` name selects the new backend.
+  No FlyDSL default or tuned rows are installed by this integration.
+- The candidate table fixes the 256x256x128 tile, half-M pipeline and raw DMA,
+  with one candidate per B layout. Kernel names stay unchanged; candidate IDs
+  are consecutive: ID 0 ends in `ps0_sm1_tdma0`; ID 1 ends in `ps1_sm1_tdma0`.
+  For ID-based tooling, update older records from IDs 2/6 to 0/1 or retune them.
+  Runtime FlyDSL dispatch continues to select the kernel by `kernelName`.
+  `splitK` remains zero. Full-M and tiled-DMA names are no longer accepted;
+  retune external CSVs selecting those removed modes rather than aliasing them
+  to a different implementation.
+- Supported calls use gfx950, FP8 E4M3FN operands, FP32 block scales and BF16
+  output, with positive M/N, K >= 256, K divisible by 256, and N divisible by
+  8 (plain B) or 16 (preshuffled B). LDS, workgroup-local signed-i32 spans and
+  unrebased scale/grid limits are checked before launch. A/B/C descriptor bases
+  are rebased per workgroup with i64 arithmetic, so whole matrices may exceed
+  4 GiB; matrix arguments keep their two-dimensional launch ABI. M/N tile tails
+  are supported. When a tuned row selects FlyDSL,
+  unsupported output types/shapes/devices or non-FP32 scales raise an assertion.
+  Import failures also raise `AssertionError`, preserving the original exception
+  as the cause. No CK fallback is taken for a selected FlyDSL row; the original
+  no-config default path is unchanged. Other compile/runtime errors propagate.
+- Plain B uses row-major `x_scale[M,K/128]`; its transpose cost is included in
+  tuning. For FlyDSL, a prepared scale tensor with the same shape may set
+  `is_transposed=True` to skip that transpose; the flag is trusted without
+  layout inference. Set it on the final tensor (views/clones do not inherit
+  Python attributes). Other backends' scale contracts are unchanged.
+  Preshuffled B consumes the existing `(16,16)` weight shuffle and
+  column-major scale storage, either packed back into shape `[M,K/128]` or a
+  strided column-major view. Both use `w_scale[ceil(N/128),K/128]`. The
+  preshuffle API continues to honor a caller-supplied `out`.
+- The kernel is ported from pyhip commit
+  `a3a94c5a34fc525c118649418b76221cd6d91579`, preserving its half-M blockscale
+  compute and raw-DMA scheduling. The compiler accepts only `TILE_M`, `TILE_N`,
+  `TILE_K`, `N`, `K`, `pid_swizzle`, `permlane_epilogue`, and `preshuffle_b`.
+  `with_scale`, `split_m`, and `useTileDMA` parameters and alternative branches
+  are removed; scales/half-M are mandatory and tiled DMA is unsupported.
+  Aiter does not acquire a pyhip runtime dependency. The tensor adapter and tune
+  table remain separate. The existing gfx1250 MXFP8_128 path is unaffected.
+
+Use `-o2` to retain every candidate result, and `--run_config` with the resulting
+CSV (plus `--preshuffle` for that layout) to validate the production dispatch.
+Prefer scratch output CSVs for experiments rather than overwriting existing
+model configurations. Before promoting winners, check for duplicate shape keys
+across the canonical and model-specific config files.
+
+The dedicated correctness/performance sweep is
+[op_tests/test_gemm_a8w8_blockscale_flydsl.py](../../op_tests/test_gemm_a8w8_blockscale_flydsl.py);
+it covers both public APIs, signed/random data, M/N tails, and packed/strided
+scales. CPU routing/tuner regressions are in
+[op_tests/tuning_tests/test_flydsl_blockscale.py](../../op_tests/tuning_tests/test_flydsl_blockscale.py).
+
+#### Pipeline and synchronization
+
+The current source-level DOT / LR / AC schedule is available as a
+[PNG diagram](figures/pipeline_8wave_current.png) and a
+[scalable SVG](figures/pipeline_8wave_current.svg), with two K tiles, both
+M-slices, FIFO retirement, waits and staggered wave groups.
+The [8-wave pipeline comparison](pipeline_8wave.md) includes the diagram and
+the source-bound 2026-09-29 FlyDSL comparison against pyhip
+`moe_gemm_8wave_g1u1`: DMA counts,
+rolling `vmcnt`, LDS/register lifetimes, FIFO retirement, staggered barrier
+epochs, and source-bound ISA observations. It separates verified instruction
+accounting from cross-wave synchronization proof gaps; it is not a new GPU
+validation or a dense-GEMM-versus-MoE performance claim.
+
+#### Recorded performance
+
+See [MI355X backend comparison and FlyDSL regression calibration (2026-09-28)](perf_gfx950_20260928.md)
+for same-GPU CK/CKTile/ASM/Triton/FlyDSL results, graph and event timing scopes,
+historical screenshot calibration, source fingerprints, and validation limits.
+These measurements do not install or change tuned dispatch configurations.
+
+The [model Q/KV projection comparison (2026-09-28)](perf_model_qkv_gfx950_20260928.md)
+covers Qwen3.8, Qwen3.5, Kimi-K3 and DeepSeek V4 at 8192–65536 local tokens and
+TP 1/2/4/8: 80 unique shapes, both B layouts, 688 validated backend results,
+per-model summaries and large-output availability limits. Model quantization
+caveats and the correct gate/KV-replication/low-rank TP rules are included.
+
 ### Output Configuration
 
 #### `-o2, --profile_file`
