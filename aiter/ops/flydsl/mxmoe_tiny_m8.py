@@ -102,6 +102,8 @@ class PreparedRouteMerge8:
         import aiter
         import torch
 
+        from .moe_kernels import _run_compiled
+
         if not (
             self.enabled
             and tuple(x.shape) == (8, 6144)
@@ -131,36 +133,42 @@ class PreparedRouteMerge8:
         w = self.weights
         dummy = self.out.data_ptr()
         self.out.zero_()
-        self.g1(
-            dummy,
-            dummy,
-            w["w1"].data_ptr(),
-            w["w1_scale"].data_ptr(),
-            ids.data_ptr(),
-            dummy,
-            ids.data_ptr(),
-            8,
-            65 * 2,
-            self.middle.data_ptr(),
-            self.scales.data_ptr(),
-            x.data_ptr(),
-            dummy,
-            stream,
+        _run_compiled(
+            self.g1,
+            (
+                dummy,
+                dummy,
+                w["w1"].data_ptr(),
+                w["w1_scale"].data_ptr(),
+                ids.data_ptr(),
+                dummy,
+                ids.data_ptr(),
+                8,
+                65 * 2,
+                self.middle.data_ptr(),
+                self.scales.data_ptr(),
+                x.data_ptr(),
+                dummy,
+                stream,
+            ),
         )
-        self.g2(
-            self.middle.data_ptr(),
-            self.scales.data_ptr(),
-            w["w2"].data_ptr(),
-            w["w2_scale"].data_ptr(),
-            ids.data_ptr(),
-            dummy,
-            ids.data_ptr(),
-            route_weights.data_ptr(),
-            8,
-            65,
-            dummy,
-            dummy,
-            stream,
+        _run_compiled(
+            self.g2,
+            (
+                self.middle.data_ptr(),
+                self.scales.data_ptr(),
+                w["w2"].data_ptr(),
+                w["w2_scale"].data_ptr(),
+                ids.data_ptr(),
+                dummy,
+                ids.data_ptr(),
+                route_weights.data_ptr(),
+                8,
+                65,
+                dummy,
+                dummy,
+                stream,
+            ),
         )
         return self.out
 
