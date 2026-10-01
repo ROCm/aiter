@@ -231,6 +231,56 @@ class RouteMergeTests(unittest.TestCase):
             variants["fp4"],
         )
 
+    def test_integrated_reset_covers_all_output_exactly_once(self):
+        helper = emitters()
+        written = []
+        for block in range(65 * 2):
+            for thread in range(256):
+                index, valid = helper["reset_index"](Scalar(block), Scalar(thread))
+                if bool(valid):
+                    written.append(int(index))
+        self.assertEqual(written, list(range(8 * 6144 // 2)))
+        self.assertEqual(len(written), len(set(written)))
+        factory = ast.parse((ROOT / "aiter/ops/flydsl/mxmoe_tiny_m8.py").read_text())
+        self.assertFalse(
+            any(
+                isinstance(node, ast.Attribute) and node.attr == "zero_"
+                for node in ast.walk(factory)
+            )
+        )
+        compiler = ast.parse(
+            (ROOT / "aiter/ops/flydsl/kernels/mxfp4_gemm1.py").read_text()
+        )
+        kernel = next(
+            node
+            for node in ast.walk(compiler)
+            if isinstance(node, ast.FunctionDef) and node.name == "gemm1_kernel"
+        )
+        reset = next(
+            node
+            for node in kernel.body
+            if any(
+                isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Name)
+                and n.func.id == "reset_index"
+                for n in ast.walk(node)
+            )
+        )
+        # Reset is a direct kernel-body statement before expert leader gating.
+        leaders = [
+            node
+            for node in kernel.body
+            if isinstance(node, ast.If)
+            and any(
+                isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Name)
+                and n.func.id == "expert_group"
+                for n in ast.walk(node)
+            )
+        ]
+        self.assertEqual(len(leaders), 1)
+        self.assertLess(kernel.body.index(reset), kernel.body.index(leaders[0]))
+
     def test_factory_preserves_native_unclamped_silu(self):
         factory = ast.parse((ROOT / "aiter/ops/flydsl/mxmoe_tiny_m8.py").read_text())
         call = next(
@@ -274,7 +324,7 @@ class RouteMergeTests(unittest.TestCase):
                 )
             )
             self.assertIs(defaults["merge_routes8"].value, False)
-            self.assertIn('"_merge8"', source)
+            self.assertIn('"_merge8', source)
         body = (ROOT / "aiter/ops/flydsl/kernels/mxfp4_gemm2.py").read_text()
         self.assertIn("[v2[0] * weight[mr], v2[1] * weight[mr]], fx.Float32", body)
         self.assertIn("llvm.AtomicBinOp.fadd", body)

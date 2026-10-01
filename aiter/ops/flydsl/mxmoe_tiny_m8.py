@@ -56,6 +56,7 @@ class PreparedRouteMerge8:
             "enabled": self.enabled,
             "rows": rows,
             "middle": "65 stable slot tiles x 16 rows, native packed MXFP4/scales",
+            "output_reset": "integrated across all G1 CTAs before separate G2",
             "routes": "supplied native8 distinct/token plus shared256 in column8 once",
             "reference_contract": self.reference_contract,
             "static_kwargs": {
@@ -135,7 +136,6 @@ class PreparedRouteMerge8:
         stream = torch.cuda.current_stream(self.device)
         w = self.weights
         dummy = self.out.data_ptr()
-        self.out.zero_()
         _run_compiled(
             self.g1,
             (
@@ -181,7 +181,7 @@ class PreparedRouteMerge8:
         )
         return {
             "passed": not self.enabled or current == self.scratch_identity,
-            "scratch_contract": "private per-handle scratch; output zero each call; no counters",
+            "scratch_contract": "private scratch; all G1 CTAs reset output before G2; no counters",
             "accuracy_state_checks": "performed separately by alternating/zero graph qualification",
         }
 

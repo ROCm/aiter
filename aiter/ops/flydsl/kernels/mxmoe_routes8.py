@@ -46,3 +46,9 @@ def route_row(matches, slot, row):
     packed = valid.select(token | (choice << fx.Int32(24)), fx.Int32((9 << 24) | 8))
     index = valid.select(token * fx.Int32(9) + choice, fx.Int32(0))
     return packed, index, valid
+
+
+def reset_index(block, thread):
+    """One I32 per thread: all65x2 G1 CTAs jointly clear the complete M8 output."""
+    index = block * fx.Int32(256) + thread
+    return index, index < fx.Int32(8 * 6144 // 2)

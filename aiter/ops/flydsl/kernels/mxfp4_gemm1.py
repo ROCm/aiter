@@ -9,7 +9,7 @@ from flydsl.expr.typing import T, as_ir_value
 
 from ..mxfp4_kname import MXFP4_G1_VARIANTS
 from . import dpp_utils
-from .mxmoe_routes8 import expert_group, route_row
+from .mxmoe_routes8 import expert_group, reset_index, route_row
 from .mxfp4_gemm_common import (
     _activation_mul_batch,
     _e8m0_from_amax,
@@ -32,6 +32,7 @@ from .mxfp4_gemm_common import (
     _umod,
     bq_bytes_for,
     bscale_bytes_for,
+    global_typed_ptr,
     k_half_for,
     kas_per_chunk_dw_for,
     kbs_per_expert_dw_for,
@@ -1642,7 +1643,7 @@ def compile_gemm1_a4w4_port(
     if native_scale_layout:
         name_suffix += "_native_scale"
     if merge_routes8:
-        name_suffix += "_merge8"
+        name_suffix += "_merge8_reset"
     if out_dtype != "fp4":
         name_suffix += f"_o{out_dtype}"
     if act != "silu":
@@ -1715,6 +1716,14 @@ def compile_gemm1_a4w4_port(
             m_block = first_pid_m + (wig % group_size_m)
             n_block = wig // group_size_m
             return m_block * fx.Int32(NUM_N_BLOCKS) + n_block
+
+        if const_expr(merge_routes8):
+            # Every launched CTA participates, including nonleaders: reset is
+            # complete before the following G2 kernel issues its BF16 atomics.
+            # Inline G1 does not read arg_aq, so its pointer carries the output.
+            reset_word, reset_valid = reset_index(bx_i32, tx_i32)
+            if reset_valid:
+                global_typed_ptr(arg_aq, T.i32)[reset_word] = fx.Int32(0)
 
         if bx_i32 < bound:
             if const_expr(xcd_swizzle > 0):
