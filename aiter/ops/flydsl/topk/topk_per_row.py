@@ -41,6 +41,10 @@ from .row_lens import row_len_slot
 
 # Widths up to this value use the persistent one-workgroup kernel.
 _ONE_WORKGROUP_MAX_ROW_WIDTH = 20_000
+# gfx942, k=512, width >= 8192: one scatter scan of two contiguous float4s.
+# Narrower rows and every other arch keep one float4 per scan step.
+_PAIR_SCATTER_MIN_WIDTH = 8192
+_PAIR_SCATTER_K = 512
 _SHORT_ROWS_1024_THREAD_MAX_ROWS = 256
 # Long rows past this many take 512-thread blocks, two resident per CU.
 _LONG_ROWS_512_THREAD_ARCHES = ("gfx1250",)
@@ -738,6 +742,11 @@ def _decode_with_backend(
     starts = row_starts if packed else len_slot
 
     if width <= _ONE_WORKGROUP_MAX_ROW_WIDTH:
+        pair_scatter = (
+            arch.startswith("gfx942")
+            and k == _PAIR_SCATTER_K
+            and width >= _PAIR_SCATTER_MIN_WIDTH
+        )
         launcher = build_topk_per_row_decode_one_workgroup_module(
             k,
             wave_size=wave_size,
@@ -746,6 +755,7 @@ def _decode_with_backend(
             full_rows=full_rows,
             exact_rows=full_rows and one_workgroup_rows_are_exact(width),
             finite_only=finite_only,
+            pair_scatter=pair_scatter,
         )
         run_topk_launcher(
             launcher,
