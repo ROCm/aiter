@@ -27,6 +27,10 @@ from ..kernels.topk.topk_per_row_decode_persistent import (
 
 # Measured crossover between the one-workgroup and multi-kernel paths.
 _ONE_WORKGROUP_MAX_ROW_WIDTH = 20_000
+# gfx942, k=512, width >= 8192: one scatter scan of two contiguous float4s.
+# Narrower rows and every other arch keep one float4 per scan step.
+_PAIR_SCATTER_MIN_WIDTH = 8192
+_PAIR_SCATTER_K = 512
 _SHORT_ROWS_1024_THREAD_MAX_ROWS = 256
 
 
@@ -399,8 +403,17 @@ def flydsl_top_k_per_row_decode(
     # and seq_lens is one
     starts = row_starts if packed else seq_lens
     if width <= _ONE_WORKGROUP_MAX_ROW_WIDTH:
+        pair_scatter = (
+            arch.startswith("gfx942")
+            and k == _PAIR_SCATTER_K
+            and width >= _PAIR_SCATTER_MIN_WIDTH
+        )
         launcher = build_topk_per_row_decode_one_workgroup_module(
-            k, wave_size=wave_size, write_values=values is not None, packed_rows=packed
+            k,
+            wave_size=wave_size,
+            write_values=values is not None,
+            packed_rows=packed,
+            pair_scatter=pair_scatter,
         )
         _run_compiled(
             launcher,
