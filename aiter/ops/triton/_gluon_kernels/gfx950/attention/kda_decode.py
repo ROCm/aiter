@@ -310,12 +310,11 @@ def fused_recurrent_kda_packed_decode_kernel(
     else:
         seed = 0
         slot = i_n
-    if PAD_SLOT_GUARD:
-        if slot <= 0:
-            zero = gl.full([V], 0.0, o_ptr.dtype.element_ty, OUT)
-            for t in range(n_tok):
-                gl.store(o_p + t * stride_o_token + off_o, zero)
-            return
+    if PAD_SLOT_GUARD and slot <= 0:
+        zero = gl.full([V], 0.0, o_ptr.dtype.element_ty, OUT)
+        for t in range(n_tok):
+            gl.store(o_p + t * stride_o_token + off_o, zero)
+        return
 
     if USE_INITIAL_STATE:
         s_src = state_ptr + (slot * stride_state_slot_rows + i_hv * V).to(gl.int64) * K
