@@ -885,6 +885,176 @@ def test_k1_page_past_4gib():
         )
 
 
+def test_k1_serves_padded_page_and_rejects_misaligned():
+    """A padded page stride is in contract; a 16-byte gather that cannot align is not.
+
+    vLLM keeps D contiguous and the token stride at D, and pads the page
+    stride. ``numel()`` undercounts that view. A D stride other than 1, or a
+    page/token/head stride that is not a multiple of 8 elements, is rejected
+    so ``auto`` stays on Triton.
+    """
+    page_size, d = 16, 128
+    n_pages = 3
+    page_elems = page_size * d
+    q = torch.zeros(1, 4, d, dtype=torch.bfloat16)
+    table = torch.zeros(1, 1, dtype=torch.int32)
+    dense = torch.zeros(n_pages, page_size, 1, d, dtype=torch.bfloat16)
+    if k1_kernel.qsa_k1_serves(q, dense, table, (4,)) is not None:
+        raise AssertionError("a packed indexer cache was rejected")
+    page_stride = page_elems + 256
+    parent = torch.empty(n_pages, page_stride, dtype=torch.bfloat16)
+    view = parent.as_strided((n_pages, page_size, 1, d), (page_stride, d, d, 1))
+    if view.is_contiguous():
+        raise AssertionError("padded page stride should not be contiguous")
+    if k1_kernel.qsa_k1_serves(q, view, table, (4,)) is not None:
+        raise AssertionError(f"padded page stride was rejected: {view.stride()}")
+    span = k1_kernel._span_bytes(view)
+    packed = view.numel() * view.element_size()
+    if span <= packed:
+        raise AssertionError(f"span {span} did not exceed packed bytes {packed}")
+    bad = parent.as_strided((n_pages, page_size, 1, d), (page_elems + 4, d, d, 1))
+    reason = k1_kernel.qsa_k1_serves(q, bad, table, (4,))
+    if reason is None or "multiples of 8" not in reason:
+        raise AssertionError(f"misaligned page stride served: {reason}")
+    wide = torch.empty(n_pages, page_size, 1, d * 2, dtype=torch.bfloat16)
+    strided_d = wide.as_strided(
+        dense.shape, (wide.stride(0), wide.stride(1), wide.stride(2), 2)
+    )
+    reason = k1_kernel.qsa_k1_serves(q, strided_d, table, (4,))
+    if reason is None or "unit D" not in reason:
+        raise AssertionError(f"strided D was served: {reason}")
+
+
+def _indexer_cache_with_page_gap(cache, gap_elems: int) -> torch.Tensor:
+    """Same pages, with ``gap_elems`` unused elements between them."""
+    n_pages, page_size, n_heads, head_dim = cache.shape
+    page_elems = page_size * n_heads * head_dim
+    page_stride = page_elems + gap_elems
+    parent = cache.new_empty(n_pages, page_stride)
+    parent.zero_()
+    parent[:, :page_elems] = cache.reshape(n_pages, page_elems)
+    return parent.as_strided(
+        cache.shape, (page_stride, n_heads * head_dim, head_dim, 1)
+    )
+
+
+def test_k1_padded_page_stride_matches_packed():
+    """K1 reads a padded page stride in place, on both scorers.
+
+    The one-row scorer (M=4) and the 16-row scorer (M=16) must match the
+    packed cache. ``n_columns`` is past 512 so this is the gather, not emit.
+    """
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    idx = FAMILY_A_INDEXER
+    device = torch.device("cuda")
+    page_size = 16
+    n_blocks = 528
+    seq_len = n_blocks * idx.compress_ratio
+    torch.manual_seed(0)
+    k_bar = torch.randn(n_blocks, idx.head_dim, dtype=dtypes.bf16, device=device)
+    index_k = k_bar.unsqueeze(1)
+    gen = torch.Generator(device=device)
+    gen.manual_seed(1)
+    index_cache, index_table = pack_paged_cache(index_k, page_size, generator=gen)
+    gapped = _indexer_cache_with_page_gap(index_cache, 256)
+    if gapped.is_contiguous():
+        raise AssertionError("gapped indexer cache is contiguous")
+    if (
+        k1_kernel.qsa_k1_serves(
+            torch.empty(1, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device),
+            gapped,
+            index_table,
+            (4,),
+        )
+        is not None
+    ):
+        raise AssertionError("gapped indexer cache was rejected")
+    for m in (4, 16):
+        q = torch.randn(m, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device)
+        qpos = _query_positions(m, seq_len, device)
+        slen = torch.full((1,), seq_len, dtype=dtypes.i32, device=device)
+        token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+        packed = qsa_k1_block_ids(
+            q, index_cache, index_table, token_to_req, qpos, slen, heads=(4,)
+        )
+        got = qsa_k1_block_ids(
+            q, gapped, index_table, token_to_req, qpos, slen, heads=(4,)
+        )
+        if not torch.equal(packed, got):
+            raise AssertionError(f"padded page stride diverged at M={m}")
+
+
+def test_k1_wide_padded_page_does_not_alias():
+    """A page past 4 GiB is addressed by its real stride, not by numel.
+
+    Doubling the page stride puts view page ``alias / 2`` on the byte at
+    2^32. The view's packed byte count stays under 4 GiB, which is the
+    decision ``numel()`` would have made.
+    """
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    idx = FAMILY_A_INDEXER
+    device = torch.device("cuda")
+    page_size = 16
+    page_elems = page_size * idx.head_dim
+    page_bytes = page_elems * dtypes.bf16.itemsize
+    alias = (1 << 32) // page_bytes
+    if alias * page_bytes != 1 << 32 or alias % 2:
+        raise AssertionError(f"page of {page_bytes} bytes does not split 4 GiB")
+    n_storage = alias + 1
+    view_pages = alias // 2 + 1
+    if (view_pages - 1) * 2 != alias:
+        raise AssertionError("doubled stride does not land on the 4 GiB page")
+    need = n_storage * page_bytes
+    free, _total = torch.cuda.mem_get_info(device)
+    if free < need + (1 << 30):
+        aiter.logger.warning(
+            "skip K1 wide padded page test: need %s bytes, %s free", need, free
+        )
+        return
+    parent = torch.empty(
+        n_storage, page_size, 1, idx.head_dim, dtype=dtypes.bf16, device=device
+    )
+    parent[0].zero_()
+    parent[alias].fill_(1)
+    view = parent.as_strided(
+        (view_pages, page_size, 1, idx.head_dim),
+        (2 * page_elems, idx.head_dim, idx.head_dim, 1),
+    )
+    span = k1_kernel._span_bytes(view)
+    packed = view.numel() * view.element_size()
+    if span <= (1 << 32) or packed > (1 << 32):
+        raise AssertionError(f"span {span} packed {packed} is not the wide-view case")
+    n_logical = 33
+    far_logical = n_logical - 1
+    n_columns = n_logical * page_size
+    table = torch.zeros(1, n_logical, dtype=dtypes.i32, device=device)
+    table[0, far_logical] = view_pages - 1
+    context = n_columns * idx.compress_ratio
+    k_bar = torch.zeros(n_columns, idx.head_dim, dtype=dtypes.bf16, device=device)
+    k_bar[far_logical * page_size : n_columns] = 1
+    for m in (4, 16):
+        q = torch.ones(m, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device)
+        qpos = torch.full((m,), context - 1, dtype=dtypes.i32, device=device)
+        slen = torch.full((1,), context, dtype=dtypes.i32, device=device)
+        token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+        ref_scores = qsa_indexer_scores(
+            q,
+            k_bar,
+            qpos,
+            slen,
+            token_to_req,
+            idx.compress_ratio,
+            score_scale=FAMILY_A_SCORE_SCALE,
+        )
+        ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
+        got = qsa_k1_block_ids(q, view, table, token_to_req, qpos, slen, heads=(4,))
+        _assert_k1_block_ids(
+            ref_ids, got, f"K1 wide padded page aliased page 0 at M={m}"
+        )
+
+
 def test_k2_family_a_decode_matches_oracle():
     """Family A FlyDSL K2 decode matches qsa_sparse_gqa on paged K/V."""
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
@@ -2724,6 +2894,9 @@ def _run_unit_cases():
     test_k1_k2_sweep_keeps_requested_m_and_fails_on_mismatch()
     test_qsa_arch_allowlist()
     test_k1_page_past_4gib()
+    test_k1_serves_padded_page_and_rejects_misaligned()
+    test_k1_padded_page_stride_matches_packed()
+    test_k1_wide_padded_page_does_not_alias()
     test_k1_family_b_set_equality_short_decode()
     test_k1_family_b_set_equality_short_decode_h8()
     test_k1_family_b_set_equality_two_tiles()
