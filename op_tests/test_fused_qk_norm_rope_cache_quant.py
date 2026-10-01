@@ -3035,6 +3035,92 @@ def test_pts_quant_shuffle_block_layout_parity(
     }
 
 
+def test_fused_qk_norm_rope_cache_pts_q_fp8(head_size, q_scale_val, eps=1e-6):
+    """Validate optional FP8 Q output without changing the BF16 Q output."""
+    dev = "cuda"
+    dtype = torch.bfloat16
+    cache_dtype = get_dtype_fp8()
+    nt, hq, hk, hv = 1, 4, 1, 1
+    block_size = 1
+
+    torch.manual_seed(0)
+    qkv = torch.randn(nt, (hq + hk + hv) * head_size, dtype=dtype, device=dev)
+    qw = torch.randn(head_size, dtype=dtype, device=dev)
+    kw = torch.randn(head_size, dtype=dtype, device=dev)
+    cos_sin = torch.randn(8, head_size, dtype=dtype, device=dev)
+    positions = torch.zeros(nt, dtype=torch.int64, device=dev)
+    slot_mapping = torch.zeros(nt, dtype=torch.int64, device=dev)
+    k_scale = torch.ones(1, dtype=torch.float32, device=dev)
+    v_scale = torch.ones(1, dtype=torch.float32, device=dev)
+    q_scale = torch.full((1,), q_scale_val, dtype=torch.float32, device=dev)
+    x = 16 // torch.empty(0, dtype=cache_dtype).element_size()
+
+    def run(q_out_fp8=None, per_tensor_q_scale=None):
+        q_out = torch.empty(nt, hq * head_size, dtype=dtype, device=dev)
+        k_cache = torch.zeros(
+            1, block_size, hk, head_size, dtype=cache_dtype, device=dev
+        )
+        v_cache = torch.zeros(
+            1, block_size, hv, head_size, dtype=cache_dtype, device=dev
+        )
+        aiter.fused_qk_norm_rope_cache_pts_quant_shuffle(
+            qkv.clone(),
+            qw,
+            kw,
+            cos_sin,
+            positions,
+            nt,
+            hq,
+            hk,
+            hv,
+            head_size,
+            True,
+            eps,
+            q_out,
+            k_cache,
+            v_cache,
+            slot_mapping,
+            k_scale,
+            v_scale,
+            None,
+            None,
+            False,
+            False,
+            block_size,
+            x,
+            0,
+            False,
+            q_out_fp8,
+            per_tensor_q_scale,
+        )
+        return q_out
+
+    q_ref = run()
+    q_fp8 = torch.empty(nt, hq * head_size, dtype=cache_dtype, device=dev)
+    q_out = run(q_fp8, q_scale)
+    expected = (q_out.float() / q_scale_val).to(cache_dtype)
+
+    assert torch.equal(q_ref, q_out), (
+        f"BF16 Q changed when FP8 Q was requested: D={head_size}, "
+        f"q_scale={q_scale_val}"
+    )
+    assert torch.equal(
+        q_fp8.view(torch.uint8), expected.view(torch.uint8)
+    ), f"FP8 Q bytes mismatch: D={head_size}, q_scale={q_scale_val}"
+    print(
+        f"[PASS] q_fp8 D={head_size}, q_scale={q_scale_val}, "
+        "bf16_unchanged=True, fp8_byte_exact=True",
+        flush=True,
+    )
+    return {
+        "head_size": head_size,
+        "q_scale": q_scale_val,
+        "bf16_unchanged": True,
+        "fp8_byte_exact": True,
+        "status": "PASS",
+    }
+
+
 @benchmark()
 def test_fused_qk_norm_rope_cache_pts_v_norm(
     dtype,
@@ -3550,6 +3636,17 @@ if __name__ == "__main__":
         df.to_markdown(index=False),
     )
 
+    # Optional fused FP8 Q output: preserve BF16 Q and match the reference FP8
+    # encoding byte-for-byte for both supported Gemma4 head dimensions.
+    df = []
+    for head_size in (128, 256):
+        for q_scale in (1.0, 0.5):
+            df.append(test_fused_qk_norm_rope_cache_pts_q_fp8(head_size, q_scale))
+    df = pd.DataFrame(df)
+    aiter.logger.info(
+        "fused_qk_norm_rope_cache_pts_q_fp8 summary (markdown):\n%s",
+        df.to_markdown(index=False),
+    )
     # Weightless V-norm (Gemma4): head_dim 256 (sliding) + 512 (full attention),
     # v_norm on/off. (cache_dtype, v_scale) pairs: a same-dtype cache (scale is a
     # no-op) plus fp8 at unit and non-trivial scale to check norm-then-quantize.

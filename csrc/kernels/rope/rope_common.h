@@ -7825,7 +7825,8 @@ template <typename T,
           bool IS_MROPE,
           bool IS_INTERLEAVED,
           int M,
-          typename KVT>
+          typename KVT,
+          bool HAS_Q_FP8 = false>
 __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
                                           const T* q_w,
                                           const T* k_w,
@@ -8062,7 +8063,7 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
             T* q_ = &q_out[(static_cast<int64_t>(token_id) * num_heads_q + head_id_in_token) *
                            HEAD_SIZE];
             out_vec.store(q_ + access_id_in_head);
-            if(q_out_fp8 != nullptr)
+            if constexpr(HAS_Q_FP8)
             {
                 // Fold the Q -> fp8 quantization (static per-tensor scale) into the
                 // kernel epilogue, mirroring the K/V path, so the caller can skip a
@@ -8411,10 +8412,11 @@ void fused_rope_rms_set_kv(const T* qkv,
     dim3 numBlocks((total_warps + num_warps_per_block - 1) / num_warps_per_block);
     std::array<int64_t, 1> mrope_section = {0};
 
-#define DISPATCH_NEOX(HEAD_SIZE)                                             \
+#define DISPATCH_NEOX(HEAD_SIZE, HAS_Q_FP8)                                  \
     if(is_neox_style)                                                        \
     {                                                                        \
-        fused_mrope_rms_kv_kernel<T, HEAD_SIZE, true, false, false, 1, KVT>  \
+        fused_mrope_rms_kv_kernel<T, HEAD_SIZE, true, false, false, 1, KVT,  \
+                                  HAS_Q_FP8>                                 \
             <<<numBlocks, threadsPerBlock, 0, stream>>>(qkv,                 \
                                                         q_w,                 \
                                                         k_w,                 \
@@ -8454,7 +8456,8 @@ void fused_rope_rms_set_kv(const T* qkv,
     }                                                                        \
     else                                                                     \
     {                                                                        \
-        fused_mrope_rms_kv_kernel<T, HEAD_SIZE, false, false, false, 1, KVT> \
+        fused_mrope_rms_kv_kernel<T, HEAD_SIZE, false, false, false, 1, KVT, \
+                                  HAS_Q_FP8>                                 \
             <<<numBlocks, threadsPerBlock, 0, stream>>>(qkv,                 \
                                                         q_w,                 \
                                                         k_w,                 \
@@ -8493,12 +8496,25 @@ void fused_rope_rms_set_kv(const T* qkv,
                                                         per_tensor_q_scale); \
     }
 
-    switch(head_size)
+    if(q_out_fp8 != nullptr)
     {
-    case 64: DISPATCH_NEOX(64) break;
-    case 128: DISPATCH_NEOX(128) break;
-    case 256: DISPATCH_NEOX(256) break;
-    case 512: DISPATCH_NEOX(512) break;
+        switch(head_size)
+        {
+        case 64: DISPATCH_NEOX(64, true) break;
+        case 128: DISPATCH_NEOX(128, true) break;
+        case 256: DISPATCH_NEOX(256, true) break;
+        case 512: DISPATCH_NEOX(512, true) break;
+        }
+    }
+    else
+    {
+        switch(head_size)
+        {
+        case 64: DISPATCH_NEOX(64, false) break;
+        case 128: DISPATCH_NEOX(128, false) break;
+        case 256: DISPATCH_NEOX(256, false) break;
+        case 512: DISPATCH_NEOX(512, false) break;
+        }
     }
 
 #undef DISPATCH_NEOX
