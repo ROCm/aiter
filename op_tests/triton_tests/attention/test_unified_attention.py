@@ -849,17 +849,16 @@ def test_triton_unified_attn_gfx942_large_prefill(
         # decode: d256 shuffled routes to the SHUF stage-1 entry (the
         # stage-2 D_GEQ_256.Q_LEQ_1 exceeds LDS at TILE 128); d512 decode
         # is already stage-1 and needs no SHUF variant
-        if head_size == 256:
+        if shuffled_kv_cache:
+            # d256 gets the SHUF stage-1 entry; d512 decode is already stage-1
             expected_key = (
-                "D_GEQ_256.Q_LEQ_1.SHUF" if shuffled_kv_cache else "D_GEQ_256.Q_LEQ_1"
+                "D_GEQ_256.Q_LEQ_1.SHUF"
+                if head_size == 256
+                else f"D_GEQ_512.Q_LEQ_1{'.DT_fp8_fp8' if dt_tag == 'fp8_fp8' else ''}"
             )
-        elif dt_tag == "fp8_fp8":
-            expected_key = "D_GEQ_512.Q_LEQ_1.DT_fp8_fp8"
         else:
-            expected_key = "D_GEQ_512.Q_LEQ_1"
-        # fp8 decode resolves to the dtype-specific Q_LEQ_1 entries
-        if not shuffled_kv_cache and dt_tag == "fp8_fp8":
-            expected_key = f"D_GEQ_{head_size}.Q_LEQ_1.DT_fp8_fp8"
+            # fp8 decode resolves to the dtype-specific Q_LEQ_1 entries
+            expected_key = f"D_GEQ_{head_size}.Q_LEQ_1{'.DT_fp8_fp8' if dt_tag == 'fp8_fp8' else ''}"
         expected_block_m = 16
     elif max_query_len < 1024 and shuffled_kv_cache:
         # sub-threshold shuffled prefill: the Q-agnostic SHUF entry (M16/s1,
