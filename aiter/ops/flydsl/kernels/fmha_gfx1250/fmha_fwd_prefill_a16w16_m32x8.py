@@ -80,6 +80,8 @@ from .fmha_b16_buffer_managers import (
 WAVE_SIZE = 32  # gfx1250 kernels run wave32
 NUM_WAVES = 8  # "m32x8" — 8 waves per threadgroup
 BLOCK_SIZE = WAVE_SIZE * NUM_WAVES  # 256 threads
+# XCCs of gfx1250 in SPX mode; workgroup dispatch alternates over them.
+NUM_XCC = 8
 
 # "m32x8": each wave owns WMMA_ROW_PER_WAVE adjacent 16-row (WMMA M) Q sub-tiles →
 # BLOCK_M = 16 * 2 * 8 = 256 Q rows per threadgroup. Each wave's 2 tiles are
@@ -213,32 +215,45 @@ def _load_sink_logit(ptr_sink, q_head_idx, num_heads_q):
     return fx.Float32(llvm_dialect.load(T.f32, gptr))
 
 
-def _packed_tile_indices(gqa_ratio, warp_idx, lane_idx):
-    """Map this lane's rows in the packed ``(seq, q_head_in_group)`` tile to global
-    indices; returns ``(kv_head, q_head_idx, seq_idx)`` where ``kv_head`` is a
-    scalar ``fx.Int32`` (shared) and ``q_head_idx`` / ``seq_idx`` are length-R
-    lists (one per q-WMMA-tile owned by this wave; R = WMMA_ROW_PER_WAVE).
+def _workgroup_coords():
+    """Decode the ``(NUM_XCC * nheads_kv, batch, ceil(n_q_tiles / NUM_XCC))`` grid
+    into ``(block_x, kv_head, batch)``.
 
-    GQA head x seq packing:
-      block_id x -> tile over one kv-head's ``(seq, q_head_in_group)`` plane
-      block_id y -> kv_head
-    ``q_head_in_group`` is the fast axis, so the ``% / //`` use the small (often
-    power-of-two) ``gqa_ratio``. Each of the ``BLOCK_M`` rows is an independent
-    query sharing this kv-head's K/V. The R tiles a wave owns are contiguous:
+    Consecutive workgroups are dispatched round-robin over the XCCs, so grid-x
+    phase ``k`` always lands on XCC ``k``: it owns the q tiles ``= k mod NUM_XCC``
+    of every sequence, which balances ragged batches across XCCs. Grid z runs the
+    tile groups in descending order; causal work grows with the q tile, so every
+    XCC dispatches its longest workgroups first and the short ones fill the tail.
+    """
+    gx = fx.Int32(gpu.block_id("x"))
+    tile_group = fx.Int32(gpu.grid_dim.z) - fx.Int32(1) - fx.Int32(gpu.block_id("z"))
+    block_x = tile_group * fx.Int32(NUM_XCC) + gx % fx.Int32(NUM_XCC)
+    kv_head = gx // fx.Int32(NUM_XCC)
+    batch = fx.Int32(gpu.block_id("y"))
+    return block_x, kv_head, batch
+
+
+def _packed_tile_indices(gqa_ratio, block_x, kv_head, warp_idx, lane_idx):
+    """Map this lane's rows in the packed ``(seq, q_head_in_group)`` tile to global
+    indices; returns ``(q_head_idx, seq_idx)``, length-R lists (one per
+    q-WMMA-tile owned by this wave; R = WMMA_ROW_PER_WAVE).
+
+    GQA head x seq packing: ``block_x`` tiles one kv-head's
+    ``(seq, q_head_in_group)`` plane. ``q_head_in_group`` is the fast axis, so the
+    ``% / //`` use the small (often power-of-two) ``gqa_ratio``. Each of the
+    ``BLOCK_M`` rows is an independent query sharing this kv-head's K/V. The R
+    tiles a wave owns are contiguous:
     ``warp_row0 = block_x*BLOCK_M + warp_idx*(R*WMMA_M)`` and tile ``qt`` starts
     at ``warp_row0 + qt*WMMA_M``.
     """
-    kv_head = fx.Int32(gpu.block_id("y"))
-    warp_row0 = fx.Int32(gpu.block_id("x")) * BLOCK_M + warp_idx * (
-        WMMA_ROW_PER_WAVE * WMMA_M
-    )
+    warp_row0 = block_x * BLOCK_M + warp_idx * (WMMA_ROW_PER_WAVE * WMMA_M)
     q_head_idx = []
     seq_idx = []
     for qt in range(WMMA_ROW_PER_WAVE):
         row_idx = warp_row0 + qt * WMMA_M + lane_idx % WMMA_M
         q_head_idx.append(kv_head * gqa_ratio + row_idx % gqa_ratio)
         seq_idx.append(row_idx // gqa_ratio)
-    return kv_head, q_head_idx, seq_idx
+    return q_head_idx, seq_idx
 
 
 # ============================================================================
@@ -655,6 +670,9 @@ def _core_attention(
     # mask_left, window_right only when mask_right. Causal == mask_right, window_right=0.
     window_left,
     window_right,
+    block_x,  # runtime fx.Int32 packed q tile of this workgroup (_workgroup_coords)
+    kv_head,  # runtime fx.Int32 kv head of this workgroup
+    num_heads_kv,  # runtime fx.Int32
     warp_idx,  # runtime fx.Int32 wave index
     warp_type,  # compile-time WarpType (LO_WARP / HI_WARP)
     lds_base,  # LDS base (fx.Int32), allocated once by the caller (_alloc_lds)
@@ -672,7 +690,9 @@ def _core_attention(
     on a 2-wave named barrier (``_named_barrier_pair``, currently a no-op stub).
     """
     lane_idx = _lane_id()
-    kv_head, q_head_idx, seq_idx = _packed_tile_indices(gqa_ratio, warp_idx, lane_idx)
+    q_head_idx, seq_idx = _packed_tile_indices(
+        gqa_ratio, block_x, kv_head, warp_idx, lane_idx
+    )
 
     # K/V staging: N_KV_PP ping-pong slots ([K.pp0|V.pp0][K.pp1|V.pp1]), blocks floored
     # at 64KB. O reuses a non-current slot; Q time-shares slot 1, so the slot must also
@@ -744,7 +764,7 @@ def _core_attention(
         q_start=q_start,
         q_len=q_len,
         kv_head=kv_head,
-        block_x=fx.Int32(gpu.block_id("x")),
+        block_x=block_x,
         warp_idx=warp_idx,
         lane_idx=lane_idx,
         ptr_lds=q_lds_base,
@@ -758,7 +778,6 @@ def _core_attention(
     # we don't run tiles fully past the band. Non-mask_right: all kv (kv_len).
     # Left edge (mask_left): start_tile skips whole tiles before the WG's min query's
     # band start. Non-mask_left: start at tile 0.
-    block_x = fx.Int32(gpu.block_id("x"))
     causal_off = kv_len - q_len
     if mask_right:
         wg_max_seq = (block_x * fx.Int32(BLOCK_M) + fx.Int32(BLOCK_M - 1)) // fx.Int32(
@@ -890,7 +909,7 @@ def _core_attention(
     R = WMMA_ROW_PER_WAVE
     _QS = 2 + d_tiles  # per-q-tile carried state: [m, d, O_0 .. O_{d_tiles-1}]
     if has_sink:
-        num_heads_q = gpu.grid_dim.y * fx.Int32(gqa_ratio)
+        num_heads_q = num_heads_kv * fx.Int32(gqa_ratio)
         m_init = [
             _load_sink_logit(ptr_sink, q_head_idx[qt], num_heads_q) for qt in range(R)
         ]
@@ -1355,6 +1374,9 @@ def _zero_fill_attention(
     lse_num_records_bytes,
     q_start,
     q_len,
+    block_x,
+    kv_head,
+    num_heads_kv,
     elem_dtype,
 ):
     """q_len>0 with kv_len==0 (cross-attention): softmax over an empty KV set, so O=0 for
@@ -1362,8 +1384,7 @@ def _zero_fill_attention(
     surviving softmax term is exp(sink) (sink value is 0, O stays 0). Flat coalesced b128
     write — consecutive lanes write consecutive 16-byte O chunks (no WMMA layout)."""
     tid = _warp_id() * fx.Int32(WAVE_SIZE) + _lane_id()
-    kv_head = fx.Int32(gpu.block_id("y"))
-    row0 = fx.Int32(gpu.block_id("x")) * fx.Int32(BLOCK_M)
+    row0 = block_x * fx.Int32(BLOCK_M)
     g = fx.Int32(gqa_ratio)
     _CH = 8  # bf16 per b128 store
     cpr = v_hdim // _CH  # b128 chunks per O row
@@ -1397,7 +1418,7 @@ def _zero_fill_attention(
         seq = prow // g
         head = kv_head * g + prow % g
         if has_sink:
-            num_heads_q = gpu.grid_dim.y * g
+            num_heads_q = num_heads_kv * g
             lse_val = _load_sink_logit(ptr_sink, head, num_heads_q)
         else:
             lse_val = fx.Float32(float("-inf"))
@@ -1484,12 +1505,13 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
             window_right: fx.Int32,
             max_seqlen_q: fx.Int32,
             max_seqlen_k: fx.Int32,
+            num_heads_kv: fx.Int32,
         ):
             """Varlen THD entry — empty scaffold.
 
-            THD: this batch's token ranges come from cu_seqlens (batch = grid.z).
+            THD: this batch's token ranges come from cu_seqlens.
             """
-            batch = fx.Int32(gpu.block_id("z"))
+            block_x, kv_head, batch = _workgroup_coords()
             q_start, q_end = _load_seqlen_pair(ptr_cu_seqlens_q, batch)
             kv_start, kv_end = _load_seqlen_pair(ptr_cu_seqlens_k, batch)
             q_len = q_end - q_start
@@ -1507,7 +1529,10 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
             # write O/0 = NaN to that batch's query rows; q_len==0 has no rows to
             # write. Self-attn's kv_len==0 implies q_len==0, so this only skips
             # genuinely empty work. (varlen may carry a per-batch kv_len==0 tail.)
-            if (q_len > fx.Int32(0)) & (kv_len > fx.Int32(0)):
+            # The grid covers max_seqlen_q, so tiles past this batch's packed rows
+            # exit here instead of streaming the whole KV for fully masked rows.
+            tile_live = block_x * fx.Int32(BLOCK_M) < q_len * fx.Int32(GQA_RATIO)
+            if tile_live & (kv_len > fx.Int32(0)):
                 _ca_kw = {
                     "qk_hdim": QK_HDIM,
                     "v_hdim": V_HDIM,
@@ -1542,6 +1567,9 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
                     "kv_len": kv_len,
                     "window_left": window_left,
                     "window_right": window_right,
+                    "block_x": block_x,
+                    "kv_head": kv_head,
+                    "num_heads_kv": num_heads_kv,
                     "elem_dtype": ELEM_DTYPE,
                 }
                 # Warp specialization: LO warp (waves 0..N/2-1) vs HI warp (N/2..N-1).
@@ -1561,7 +1589,7 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
                         lds_base=lds_base,
                         **_ca_kw,
                     )
-            elif q_len > fx.Int32(0):
+            elif tile_live:
                 # Cross-attention tail: q_len>0 but kv_len==0 -> O=0, LSE=-inf (or sink).
                 _zero_fill_attention(
                     v_hdim=V_HDIM,
@@ -1578,6 +1606,9 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
                     lse_num_records_bytes=lse_num_records_bytes,
                     q_start=q_start,
                     q_len=q_len,
+                    block_x=block_x,
+                    kv_head=kv_head,
+                    num_heads_kv=num_heads_kv,
                     elem_dtype=ELEM_DTYPE,
                 )
 
@@ -1607,14 +1638,15 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
         window_right: fx.Int32,
         seq_len_q: fx.Int32,
         seq_len_k: fx.Int32,
+        num_heads_kv: fx.Int32,
     ):
         """Batched BSHD entry — empty scaffold.
 
         Uniform sequence lengths (``seq_len_q`` / ``seq_len_k``) replace
         cu_seqlens — nothing transient, so this path is CUDA-graph safe.
-        Token base is batch_idx * seq_len (batch = grid.z).
+        Token base is batch_idx * seq_len.
         """
-        batch = fx.Int32(gpu.block_id("z"))
+        block_x, kv_head, batch = _workgroup_coords()
 
         # LSE is [B, nheads_q, seq_q]: base = batch*stride_lse_batch; every valid
         # element offset is < base + stride_lse_batch (< the 0x7FFFFFFF drop).
@@ -1657,25 +1689,30 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
             "kv_len": seq_len_k,
             "window_left": window_left,
             "window_right": window_right,
+            "block_x": block_x,
+            "kv_head": kv_head,
+            "num_heads_kv": num_heads_kv,
             "elem_dtype": ELEM_DTYPE,
         }
-        # Warp specialization: LO warp (waves 0..N/2-1) vs HI warp (N/2..N-1).
-        lds_base = _alloc_lds()
-        warp_idx = _warp_id()
-        if warp_idx // fx.Int32(NUM_WAVES // 2) == fx.Int32(0):
-            _core_attention(
-                warp_idx=warp_idx,
-                warp_type=WarpType.LO_WARP,
-                lds_base=lds_base,
-                **_ca_kw,
-            )
-        else:
-            _core_attention(
-                warp_idx=warp_idx,
-                warp_type=WarpType.HI_WARP,
-                lds_base=lds_base,
-                **_ca_kw,
-            )
+        # The grid rounds q tiles up to a multiple of NUM_XCC.
+        if block_x * fx.Int32(BLOCK_M) < seq_len_q * fx.Int32(GQA_RATIO):
+            # Warp specialization: LO warp (waves 0..N/2-1) vs HI warp (N/2..N-1).
+            lds_base = _alloc_lds()
+            warp_idx = _warp_id()
+            if warp_idx // fx.Int32(NUM_WAVES // 2) == fx.Int32(0):
+                _core_attention(
+                    warp_idx=warp_idx,
+                    warp_type=WarpType.LO_WARP,
+                    lds_base=lds_base,
+                    **_ca_kw,
+                )
+            else:
+                _core_attention(
+                    warp_idx=warp_idx,
+                    warp_type=WarpType.HI_WARP,
+                    lds_base=lds_base,
+                    **_ca_kw,
+                )
 
     return kn_fmha_fwd_prefill_a16w16_m32x8_bshd
 
@@ -1750,13 +1787,12 @@ def _ensure_thd_kernel(
         batch_size: fx.Int32,
         stream: fx.Stream,
     ):
-        # 3D grid: x = tiles over (seq, q_head_in_group) per kv-head,
-        #          y = kv_head, z = batch. block = 256 (8 waves x wave32).
-        grid_x = fx.Index(
-            fx.ceildiv(fx.Uint32(max_seqlen_q * gqa_ratio), fx.Uint32(BLOCK_M))
-        )
-        grid_y = fx.Index(num_heads_kv)
-        grid_z = fx.Index(batch_size)
+        # Grid (XCC phase x kv_head, batch, tile group), decoded by
+        # _workgroup_coords. block = 256 (8 waves x wave32).
+        n_q_tiles = fx.ceildiv(fx.Uint32(max_seqlen_q * gqa_ratio), fx.Uint32(BLOCK_M))
+        grid_x = fx.Index(fx.Uint32(NUM_XCC) * fx.Uint32(num_heads_kv))
+        grid_y = fx.Index(batch_size)
+        grid_z = fx.Index(fx.ceildiv(n_q_tiles, fx.Uint32(NUM_XCC)))
 
         launcher = kernel(
             ptr_O,
@@ -1782,6 +1818,7 @@ def _ensure_thd_kernel(
             window_right,
             max_seqlen_q,
             max_seqlen_k,
+            num_heads_kv,
         )
         launcher.launch(
             grid=(grid_x, grid_y, grid_z),
@@ -1857,13 +1894,12 @@ def _ensure_bshd_kernel(
         batch_size: fx.Int32,
         stream: fx.Stream,
     ):
-        # 3D grid: x = tiles over (seq, q_head_in_group) per kv-head,
-        #          y = kv_head, z = batch. block = 256 (8 waves x wave32).
-        grid_x = fx.Index(
-            fx.ceildiv(fx.Uint32(seq_len_q * gqa_ratio), fx.Uint32(BLOCK_M))
-        )
-        grid_y = fx.Index(num_heads_kv)
-        grid_z = fx.Index(batch_size)
+        # Grid (XCC phase x kv_head, batch, tile group), decoded by
+        # _workgroup_coords. block = 256 (8 waves x wave32).
+        n_q_tiles = fx.ceildiv(fx.Uint32(seq_len_q * gqa_ratio), fx.Uint32(BLOCK_M))
+        grid_x = fx.Index(fx.Uint32(NUM_XCC) * fx.Uint32(num_heads_kv))
+        grid_y = fx.Index(batch_size)
+        grid_z = fx.Index(fx.ceildiv(n_q_tiles, fx.Uint32(NUM_XCC)))
 
         launcher = kernel(
             ptr_O,
@@ -1888,6 +1924,7 @@ def _ensure_bshd_kernel(
             window_right,
             seq_len_q,
             seq_len_k,
+            num_heads_kv,
         )
         launcher.launch(
             grid=(grid_x, grid_y, grid_z),
