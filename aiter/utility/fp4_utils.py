@@ -158,6 +158,19 @@ def f32_to_mx_e8m0_scale(
     )
 
 
+def f32_to_fused_moe_mxfp8_scale(amax: Tensor) -> Tensor:
+    """Match the FlyDSL fused-MoE FP8 epilogue's E8M0 scale rounding.
+
+    The epilogue rounds ``amax`` to the nearest power of two with ties upward,
+    then reserves eight exponent steps (a factor of 2^8) of FP8 headroom. This
+    differs from the project-wide MXFP8 ``RoundUp`` default.
+    """
+    bits = amax.float().contiguous().view(torch.int32)
+    rounded = (bits + 0x400000) & -0x800000
+    exponent = ((rounded >> 23) - 8).clamp_(0, 255).to(torch.uint8)
+    return exponent.view(dtypes.fp8_e8m0)
+
+
 def fp4_f32_to_e8m0_scale(amax: Tensor) -> Tensor:
     """Default MXFP4 E8M0 block scale: NV ROUND_UP / RCEIL with FP4 E2M1.
 

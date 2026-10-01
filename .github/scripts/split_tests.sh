@@ -59,6 +59,7 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
             printf '%s\n' \
                 "$TEST_DIR/tuning_tests/test_csv_validation.py" \
                 "$TEST_DIR/tuning_tests/test_config_shape_collision.py" \
+                "$TEST_DIR/tuning_tests/test_fhmoe_tuner.py" \
                 "$TEST_DIR/tuning_tests/test_mixed_mxfp_tuning.py"
         } | LC_ALL=C sort -u
     )

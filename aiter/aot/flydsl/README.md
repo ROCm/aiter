@@ -1,9 +1,9 @@
 # FlyDSL AOT Pre-compilation & Tests
 
 This directory holds the **AOT (Ahead-Of-Time) pre-compilation entry points** for
-FlyDSL kernels. Each module extracts every unique FlyDSL kernel name from aiter's
-tuned CSV configs and compiles them into the cache up front, so that at runtime
-the JIT path hits the cache instead of compiling again.
+FlyDSL kernels. Each module derives the runtime-reachable jobs from aiter's
+tuned CSV configs—including ABI/cache variants that share a kernel name—and
+compiles them up front so the runtime JIT path hits the cache.
 
 | Module | OpKind | Description |
 | --- | --- | --- |
@@ -42,6 +42,11 @@ into CI.
 # MoE / Mixed-MoE (default CSVs)
 python -m aiter.aot.flydsl.moe
 
+# Add runtime-debug stage-2 variants for ordinary and shared-expert MoE.
+python -m aiter.aot.flydsl.moe \
+  --include-forced-reduce \
+  --include-stage2-fp8
+
 # GEMM
 python -m aiter.aot.flydsl.gemm
 
@@ -60,6 +65,11 @@ python -m aiter.aot.flydsl.mega_moe
 # Restrict the deployment profiles when building a smaller custom image.
 python -m aiter.aot.flydsl.mega_moe --experts-per-rank 48
 ```
+
+FHMoE stage-1 kernels use distinct cache identities for clamped and unclamped
+shared SiLU. HY4-compatible CSV rows automatically emit both
+`clamp_shared=True` and `False` jobs. Stage-2 forced-reduce and FP8
+intermediate variants remain opt-in through the flags above.
 
 The FP8 flash-attention kernel picks its tile, rescale threshold and split-K
 factor per call, so a serving process JIT-compiles each new combination on the
@@ -99,6 +109,8 @@ python -m aiter.aot.flydsl.chunk_gdn_h --csv /path/to/tuned.csv
 | `AITER_FLYDSL_AOT_MAX_RETRIES` | Retries for a worker that **died abnormally** (OOM-kill / segfault / timeout-kill). A clean compile error is never retried. `0` disables. | `2` |
 | `AITER_CONFIGS` | Resolves the default CSV lookup path (same as the runtime JIT) | repo built-in |
 | `ARCH` / `GPU_ARCHS` | Selects which jobs to build, not what arch a job compiles *for* (that comes from the CSV's `cu_num`). `conv.py` applies it inside `parse_csv`, so both `python -m` and the `setup.py` path (`run_aot`) honour it. `gemm.py` still filters in `main()` only, so `run_aot` builds all of its archs. | auto-detect |
+| `AITER_FLYDSL_FORCE_REDUCE` | Build and use FHMoE/MoE forced stage-2 reduce variants. Equivalent AOT CLI: `--include-forced-reduce`. | `0` |
+| `AITER_FLYDSL_STAGE2_FP8` | Build and use stage-2 FP8-intermediate reduce variants. Equivalent AOT CLI: `--include-stage2-fp8`. | `0` |
 
 > **About the compile target arch.** The arch each kernel is actually compiled
 > for is derived per-job from the CSV's `cu_num` column (`cu_num_to_arch(...)`)
@@ -140,6 +152,11 @@ python op_tests/test_moe_2stage.py
 > Note: both steps must use the **same** `FLYDSL_RUNTIME_CACHE_DIR` and run on
 > (or target) the **same GPU arch**, otherwise step 2 will be treated as a miss
 > because the cache dir / arch don't line up.
+>
+> If runtime sets `AITER_FLYDSL_FORCE_REDUCE=1` or
+> `AITER_FLYDSL_STAGE2_FP8=1`, set the same variable during AOT compilation or
+> pass `--include-forced-reduce` / `--include-stage2-fp8`. Default AOT builds
+> intentionally omit these debug-only variants.
 
 ---
 
