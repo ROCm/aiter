@@ -1,0 +1,15 @@
+gfx,M,N,K,b_intype,a_preshuffle,outdtype,splitK,kernelName,us
+gfx1250,1,2112,7168,mxfp8,0,torch.bfloat16,8,_ZN5aiter47f8gemm_bf16_mxfp8fp8_BpreShuffle_256x256_4x2_psE,7.4958
+gfx1250,2,2112,7168,mxfp8,0,torch.bfloat16,8,_ZN5aiter47f8gemm_bf16_mxfp8fp8_BpreShuffle_256x256_4x2_psE,7.5901
+gfx1250,4,2112,7168,mxfp8,0,torch.bfloat16,8,_ZN5aiter47f8gemm_bf16_mxfp8fp8_BpreShuffle_256x256_4x2_psE,8.1222
+gfx1250,8,2112,7168,mxfp8,0,torch.bfloat16,8,_ZN5aiter47f8gemm_bf16_mxfp8fp8_BpreShuffle_256x256_4x2_psE,8.1538
+gfx1250,16,2112,7168,mxfp8,0,torch.bfloat16,8,_ZN5aiter47f8gemm_bf16_mxfp8fp8_BpreShuffle_256x256_4x2_psE,7.9343
+gfx1250,32,2112,7168,mxfp8,0,torch.bfloat16,8,_ZN5aiter47f8gemm_bf16_mxfp8fp8_BpreShuffle_256x256_4x2_psE,8.0225
+gfx1250,48,2112,7168,mxfp8,0,torch.bfloat16,8,_ZN5aiter47f8gemm_bf16_mxfp8fp8_BpreShuffle_256x256_4x2_psE,8.0867
+gfx1250,64,2112,7168,mxfp8,0,torch.bfloat16,8,_ZN5aiter47f8gemm_bf16_mxfp8fp8_BpreShuffle_256x256_4x2_psE,8.4008
+gfx1250,128,2112,7168,mxfp8,0,torch.bfloat16,8,_ZN5aiter47f8gemm_bf16_mxfp8fp8_BpreShuffle_256x256_4x2_psE,8.9638
+gfx1250,256,2112,7168,mxfp8,0,torch.bfloat16,8,_ZN5aiter47f8gemm_bf16_mxfp8fp8_BpreShuffle_256x256_4x2_psE,10.3864
+gfx1250,512,2112,7168,mxfp8,0,torch.bfloat16,8,_ZN5aiter47f8gemm_bf16_mxfp8fp8_BpreShuffle_256x256_4x2_psE,12.3209
+gfx1250,1024,2112,7168,mxfp8,0,torch.bfloat16,4,_ZN5aiter47f8gemm_bf16_mxfp8fp8_BpreShuffle_256x256_4x4_psE,16.0131
+gfx1250,1536,2112,7168,mxfp8,0,torch.bfloat16,2,_ZN5aiter47f8gemm_bf16_mxfp8fp8_BpreShuffle_256x256_4x2_psE,22.8801
+gfx1250,2048,2112,7168,mxfp8,0,torch.bfloat16,2,_ZN5aiter47f8gemm_bf16_mxfp8fp8_BpreShuffle_256x256_4x4_psE,24.6322
