@@ -130,7 +130,7 @@ def fused_recurrent_kda(
         assert conv_weight.shape == (3, W, H * K) and conv_weight.is_contiguous()
         assert conv_state.shape[1] == 3 * H * K and HV * V == H * K
         if num_accepted_tokens is None:
-            assert conv_state.shape[2] == W - 1
+            assert conv_state.shape[2] >= W - 1
     if use_rms_gate:
         assert out_gate.shape == v.shape and out_gate.stride()[2:] == (V, 1)
         assert B == 1 or out_gate.stride(0) == T * out_gate.stride(1)
