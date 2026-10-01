@@ -8,7 +8,6 @@ from collections import namedtuple
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl.expr import arith, const_expr, range_constexpr, rocdl, tdm_ops
 from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.typing import Constexpr, T
@@ -28,7 +27,6 @@ from .gemm_common_gfx1250 import (
     workgroup_barrier,
 )
 from .kernels_common import ceildiv
-from .mega_moe_gfx1250 import vector
 from .mega_moe_gfx1250.tdm_gather_shim import (
     make_tensor_gather_descriptor,
     tensor_store_gather,
@@ -2079,7 +2077,7 @@ def launch_gemm_a8w4_tdm_optimized(
     STAGE_B = (((tile_n // 16) * B_LDS_ROW + 15) // 16) * 16
 
     SC_INNER = tile_k // 4
-    _SA_SUPERS, SB_SUPERS = tile_m // 32, tile_n // 32
+    SB_SUPERS = tile_n // 32
     AS_INNER = SC_INNER
     AS_SUPERS = tile_m // 32
     # One outer row is one wave's M tile. Its inner (k128, wm, lane16)
@@ -2142,6 +2140,8 @@ def launch_gemm_a8w4_tdm_optimized(
             else int(tile_m == 256 and tile_n == 256 and num_waves == 4)
         )
         if const_expr(fp4_prefill_schedule and xdl_arb_off):
+            from flydsl._mlir.dialects import llvm as llvm_dialect
+
             # gfx1250 SCHED_MODE bit 2; the installed convenience helper
             # writes bit 4 instead. See CDNA5 ISA section 5.7.2.1. Keep this
             # single-wave/SIMD-only: the hardware guide warns that disabling
@@ -2270,6 +2270,8 @@ def launch_gemm_a8w4_tdm_optimized(
                         rocdl.s_barrier_signal(-3)
                     rocdl.s_barrier_wait(-3)
 
+        # Keep the allocator's raw byte pointer. ``peek().ptr`` retypes this
+        # arena and changes address lowering for the t192 specialization.
         base_ptr = fx.SharedAllocator().allocate(ARENA_B)._ptr
 
         def ptr_to_idx(p):
@@ -3154,8 +3156,6 @@ def launch_gemm_a8w4_tdm_optimized(
                 v2i32_ty = T.vec(2, T.i32)
                 QRPT_LOG2 = int(math.log2(QUANT_ROWS_PER_TILE))
                 N_MX_BLKS = wmma_n_rep // WN_PER_MX_BLOCK
-                # Total activated elements per wm row = N_MX_BLKS * WN_PER_MX_BLOCK * 4
-                _N_ELEM = N_MX_BLKS * WN_PER_MX_BLOCK * 4
                 for wm in range_constexpr(wmma_m_rep):
                     # A 16-row block entirely past this expert's valid rows has its
                     # output OOB-clamped away, so skip its work. Wave-uniform, so
@@ -3206,11 +3206,7 @@ def launch_gemm_a8w4_tdm_optimized(
                                 for sub in range_constexpr(2):
                                     sub_wn = half * 2 + sub
                                     wn = mx_blk * WN_PER_MX_BLOCK + sub_wn
-                                    packed_i32 = vector.extract(
-                                        packed_v2i32,
-                                        static_position=[sub],
-                                        dynamic_position=[],
-                                    )
+                                    packed_i32 = Vec(packed_v2i32)[sub]
                                     col_fp8 = (wnb + wn * 16 + kgrp * 8) // 2
                                     lds_store_b32(
                                         stC_idx,

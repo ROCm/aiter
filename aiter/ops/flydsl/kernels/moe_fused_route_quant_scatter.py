@@ -64,10 +64,10 @@ from types import SimpleNamespace
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm, scf
+from flydsl._mlir.dialects import llvm
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, const_expr, gpu, ptrtoint, range_constexpr, rocdl
-from flydsl.expr.arith import ArithValue, CmpIPredicate
+from flydsl.expr.arith import ArithValue
 from flydsl.expr.typing import Int32, T
 from flydsl.runtime.device import get_rocm_arch
 
@@ -79,14 +79,7 @@ from aiter.ops.flydsl.kernels.kernels_common import (
     format_kernel_name,
     get_warp_size,
 )
-from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import vector
 from aiter.ops.flydsl.kernels.moe_route_maps import DROPPED_ROUTE_ROW
-from aiter.ops.flydsl.kernels.quant_utils import (
-    _DTYPE_CFG as _APRE_DTYPE_CFG,
-)
-from aiter.ops.flydsl.kernels.quant_utils import (
-    _M as _APRE_M,
-)
 from aiter.ops.flydsl.kernels.quant_utils import (
     emit_f32_to_e2m1,
     emit_mx_e8m0_scale,
@@ -3245,133 +3238,6 @@ def build_moe_fused_route_psum_quant_scatter_module(
 # A/ScaleA preshuffle producers ported from hyg_gfx1250_gemm_a4w4@98391a4a.
 
 
-def _emit_mx_e8m0_scale_apre(
-    local_max,
-    *,
-    mode: int = _ROUND_MODE,
-    dtype: int = _MxDtype.FP4_E2M1,
-):
-    """Emit IR computing the E8M0 block scale for an MX format.
-
-    FlyDSL IR-builder analogue of PyTorch torchao ``to_mx(scaling_mode,
-    elem_dtype)`` and the CPU torch ref
-    :func:`aiter.utility.fp4_utils.f32_to_mx_e8m0_scale`. The four
-    rounding formulas (FLOOR / RCEIL / CEIL / EVEN) are dtype-agnostic;
-    ``dtype`` only selects ``target_max_pow2`` / ``max_pos`` / ``mbits``
-    constants from :data:`_APRE_DTYPE_CFG`.
-
-    See ``csrc/include/mx_quant_utils.h`` (``MxScaleRoundMode`` /
-    ``MxDtype``) and :mod:`aiter.utility.mx_types` for the four formulas
-    and cross-stack mapping (PyTorch torchao / NV / DSv4 / FlashInfer /
-    AMD Quark naming).
-
-    Args:
-        local_max: f32 IR value, the (warp-reduced) ``max(|x|)`` of one
-            block. Caller is responsible for the per-block reduction.
-        mode: ``MxScaleRoundMode`` value -- accepts either the bare-int
-            mirror :class:`aiter.utility.mx_types.MxScaleRoundModeInt`
-            (recommended for FlyDSL kernel definitions) or the pybind11
-            enum :class:`aiter.utility.mx_types.MxScaleRoundMode` (from
-            user-facing code paths). Default ``RoundUp`` (industry
-            consensus for MXFP4 and MXFP8).
-        dtype: ``MxDtype`` value -- bare-int mirror or pybind11 enum.
-            Default ``FP4_E2M1``.
-
-    Returns:
-        e8m0_biased: i32 IR value in the range ``[0, 0xFF]``. The caller
-        derives ``quant_scale = (254 - e8m0_biased) << 23`` (bitcast to
-        f32) for the multiplicative quant scale, and stores
-        ``e8m0_biased`` as a ``uint8`` in the per-block scale tensor.
-    """
-    local_max = _raw(local_max)
-    # Normalise int / pybind enum into a plain int -- pybind11 enum classes
-    # don't auto-compare equal to ``int`` (unlike ``IntEnum``).
-    mode_int = int(mode)
-    dtype_int = int(dtype)
-    if dtype_int not in _APRE_DTYPE_CFG:
-        raise ValueError(
-            f"emit_mx_e8m0_scale: unsupported dtype {dtype!r}; "
-            f"supported: {list(_APRE_DTYPE_CFG)}"
-        )
-    target_max_pow2, max_pos_inv_bits, mbits = _APRE_DTYPE_CFG[dtype_int]
-
-    c0_i32 = arith.constant(0, type=T.i32)
-    c1_i32 = arith.constant(1, type=T.i32)
-    c23_i32 = arith.constant(23, type=T.i32)
-    c0xFF_i32 = arith.constant(0xFF, type=T.i32)  # E8M0 exponent mask
-    c0x7FFFFF_i32 = arith.constant(0x7FFFFF, type=T.i32)  # f32 mantissa mask
-    target_max_pow2_i32 = arith.constant(target_max_pow2, type=T.i32)
-
-    def _clamp_u8(x):
-        # Defensive clamp into the E8M0 storage range [0, 0xFF]. Pathological
-        # inputs (denormals, fp32 inf, mantissa bump from 0xFF -> 0x100) can
-        # otherwise corrupt the stored uint8.
-        return arith.minsi(arith.maxsi(x, c0_i32), c0xFF_i32)
-
-    if mode_int == _APRE_M.RoundUp:
-        # ceil_pow2(amax / max_pos): multiply by reciprocal of max_pos to get
-        # the working value, then bump the exponent if any mantissa bit is
-        # set. Bit-equivalent to HIP ``aiter::fp_f32_to_e8m0_scale<RoundUp,
-        # FP4_E2M1>`` and to PyTorch torchao ``_to_mx_rceil`` (modulo
-        # the GPU-vs-CPU fp32 ULP boundary effects documented in the PR).
-        c_inv_max_pos = arith.constant(max_pos_inv_bits, type=T.i32)
-        inv_max_pos_f32 = c_inv_max_pos.bitcast(T.f32)
-        working = local_max * inv_max_pos_f32
-        working_i32 = working.bitcast(T.i32)
-        mantissa = working_i32 & c0x7FFFFF_i32
-        biased_exp = (working_i32 >> c23_i32) & c0xFF_i32
-        mant_nonzero = mantissa != c0_i32
-        exp_field = arith.select(
-            mant_nonzero,
-            biased_exp + c1_i32,
-            biased_exp,
-        )
-        return _clamp_u8(exp_field)
-
-    if mode_int == _APRE_M.RoundDown:
-        # floor_pow2(amax) / 2^target_max_pow2: drop the f32 mantissa, then
-        # subtract target_max_pow2 from the biased exponent.
-        amax_i32 = local_max.bitcast(T.i32)
-        biased_exp = (amax_i32 >> c23_i32) & c0xFF_i32
-        return _clamp_u8(biased_exp - target_max_pow2_i32)
-
-    if mode_int == _APRE_M.Ceil:
-        # ceil_pow2(amax) / 2^target_max_pow2: same as RoundDown but bump
-        # the exponent if any mantissa bit is set.
-        amax_i32 = local_max.bitcast(T.i32)
-        mantissa = amax_i32 & c0x7FFFFF_i32
-        biased_exp = (amax_i32 >> c23_i32) & c0xFF_i32
-        mant_nonzero = mantissa != c0_i32
-        biased_exp_bumped = arith.select(
-            mant_nonzero,
-            biased_exp + c1_i32,
-            biased_exp,
-        )
-        return _clamp_u8(biased_exp_bumped - target_max_pow2_i32)
-
-    if mode_int == _APRE_M.Even:
-        # round_pow2_special(amax) / 2^target_max_pow2: add a half-step at
-        # the "(mbits+1)-th-from-top" mantissa bit, then drop all mantissa
-        # bits. ``val_to_add = 1 << (23 - mbits - 1)`` so that the carry
-        # propagates exactly when amax >= 1.5 * 2^k (mbits=1, FP4) or
-        # 1.0625 * 2^k (mbits=3, FP8 e4m3) etc. -- mantissa-precision-
-        # aware ties-to-even on the power-of-2 lattice.
-        val_to_add = 1 << (23 - mbits - 1)
-        c_val_add = arith.constant(val_to_add, type=T.i32)
-        c_sign_exp_mask = arith.constant(0xFF800000, type=T.i32)
-        amax_i32 = local_max.bitcast(T.i32)
-        amax_rounded = (amax_i32 + c_val_add) & c_sign_exp_mask
-        biased_exp = (amax_rounded >> c23_i32) & c0xFF_i32
-        return _clamp_u8(biased_exp - target_max_pow2_i32)
-
-    raise ValueError(
-        f"emit_mx_e8m0_scale: unknown mode int {mode_int} for {mode!r} "
-        f"(expected one of MxScaleRoundModeInt: "
-        f"RoundDown={_APRE_M.RoundDown}, RoundUp={_APRE_M.RoundUp}, "
-        f"Even={_APRE_M.Even}, Ceil={_APRE_M.Ceil})"
-    )
-
-
 def _emit_quant_block_loop_apre(c: SimpleNamespace) -> None:
     """Emit one warp's per-MX-block quant + e8m0 scale-preshuffle loop.
 
@@ -3386,6 +3252,11 @@ def _emit_quant_block_loop_apre(c: SimpleNamespace) -> None:
     Shared verbatim by both stage1 and stage2; only the preamble that computes
     ``c.dests`` differs.
     """
+    # This module-level emitter is called while a kernel is being traced, but is
+    # not itself AST-rewritten. Keep the raw scf boundary local to the two
+    # runtime predicates below; ordinary Python ``if`` would test host truthiness.
+    from flydsl._mlir.dialects import scf
+
     i32 = c.i32
     f32 = c.f32
     mx_group_base = getattr(c, "mx_group_base", None)
@@ -3464,11 +3335,9 @@ def _emit_quant_block_loop_apre(c: SimpleNamespace) -> None:
             chunk_prefetch(it // iters_per_chunk)
         # MX block (along K) this lane works on this iteration.
         mx_block = _mx_block_of(it)
-        block_in_range = arith.cmpi(
-            CmpIPredicate.ult,
-            mx_block,
-            arith.constant(c.mx_blocks_per_row, type=i32),
-        )
+        block_in_range = (
+            fx.Uint32(mx_block) < fx.Uint32(c.mx_blocks_per_row)
+        ).ir_value()
         # Raw scf.if, not a Python `if`: the AST rewriter only transforms
         # @flyc.kernel / @flyc.jit bodies, and this is a plain module-level
         # emitter called from them, so `if block_in_range:` here would be a
@@ -3484,17 +3353,15 @@ def _emit_quant_block_loop_apre(c: SimpleNamespace) -> None:
                 )
                 # 2 bf16/dword -> 4 dwords; one aligned dwordx4 = 8 bf16.
                 dwords4 = _emit_hidden_load(it)
-                vec8_bf16_ty = T.vec(8, T.bf16)
-                vec8_f32_ty = T.vec(8, f32)
-                bf16x8 = vector.bitcast(vec8_bf16_ty, dwords4)
-                f32x8 = bf16x8.extf(vec8_f32_ty)
+                bf16x8 = fx.Vector(dwords4).bitcast(fx.BFloat16)
+                f32x8 = bf16x8.to(fx.Float32)
 
                 # per-block amax over this lane's 8 elems, then a butterfly
                 # shuffle_xor across the block's 4 lanes.
                 block_amax = c.c0_f32
                 for j in range_constexpr(8):
-                    xj = vector.extract(f32x8, static_position=[j], dynamic_position=[])
-                    absj = llvm.call_intrinsic(f32, "llvm.fabs.f32", [xj], [], [])
+                    xj = f32x8[j]
+                    absj = abs(xj)
                     block_amax = arith.maximumf(block_amax, absj)
                 for dist in c.amax_shuffle_dists:
                     peer_amax = block_amax.shuffle_xor(
@@ -3502,12 +3369,14 @@ def _emit_quant_block_loop_apre(c: SimpleNamespace) -> None:
                     )
                     block_amax = arith.maximumf(block_amax, peer_amax)
 
-                e8m0_scale = _emit_mx_e8m0_scale_apre(
+                e8m0_scale = emit_mx_e8m0_scale(
                     block_amax, mode=_ROUND_MODE, dtype=c.mx_dtype
                 )
                 # scale 2^(e8m0-127); the HW divides each input by its exponent
                 # and RNE-packs the 8 outputs (fp4: i32 / fp8: v2i32).
-                block_scale_f32 = (ArithValue(e8m0_scale) << c.c23_i32).bitcast(f32)
+                block_scale_f32 = (fx.Int32(e8m0_scale) << c.c23_i32).bitcast(
+                    fx.Float32
+                )
                 if const_expr(c.is_fp8):
                     payload_val = _cvt_scalef32_pk8_fp8_bf16(
                         bf16x8, block_scale_f32, v2i32_ty=T.vec(2, i32)
@@ -3527,20 +3396,17 @@ def _emit_quant_block_loop_apre(c: SimpleNamespace) -> None:
                 dword_raw = buffer_ops.buffer_load(
                     hidden_rsrc, hidden_dword, vec_width=1, dtype=i32
                 )
-                vec1_i32_ty = T.vec(1, i32)
-                vec2_bf16_ty = T.vec(ELEMS_PER_LANE, T.bf16)
-                vec2_f32_ty = T.vec(ELEMS_PER_LANE, f32)
-                bf16_pair = vector.bitcast(
-                    vec2_bf16_ty, vector.from_elements(vec1_i32_ty, [dword_raw])
+                bf16_pair = fx.Vector.from_elements([dword_raw], fx.Int32).bitcast(
+                    fx.BFloat16
                 )
-                f32_pair = bf16_pair.extf(vec2_f32_ty)
-                x0 = vector.extract(f32_pair, static_position=[0], dynamic_position=[])
-                x1 = vector.extract(f32_pair, static_position=[1], dynamic_position=[])
+                f32_pair = bf16_pair.to(fx.Float32)
+                x0 = f32_pair[0]
+                x1 = f32_pair[1]
 
                 # per-block amax: max over this lane's 2 elems, then a butterfly
                 # shuffle_xor across the block's 16 lanes.
-                abs0 = llvm.call_intrinsic(f32, "llvm.fabs.f32", [x0], [], [])
-                abs1 = llvm.call_intrinsic(f32, "llvm.fabs.f32", [x1], [], [])
+                abs0 = abs(x0)
+                abs1 = abs(x1)
                 block_amax = arith.maximumf(c.c0_f32, arith.maximumf(abs0, abs1))
                 for dist in c.amax_shuffle_dists:
                     peer_amax = block_amax.shuffle_xor(
@@ -3548,7 +3414,7 @@ def _emit_quant_block_loop_apre(c: SimpleNamespace) -> None:
                     )
                     block_amax = arith.maximumf(block_amax, peer_amax)
 
-                e8m0_scale = _emit_mx_e8m0_scale_apre(
+                e8m0_scale = emit_mx_e8m0_scale(
                     block_amax, mode=_ROUND_MODE, dtype=c.mx_dtype
                 )
 
@@ -3557,8 +3423,10 @@ def _emit_quant_block_loop_apre(c: SimpleNamespace) -> None:
                 # multiplies by the reciprocal 2^(127-e8m0) then converts.
                 if const_expr(c.is_fp8):
                     if const_expr(c.use_native):
-                        block_scale_f32 = (ArithValue(e8m0_scale) << c.c23_i32).bitcast(
-                            f32
+                        block_scale_f32 = (
+                            fx.Int32(e8m0_scale) << c.c23_i32
+                        ).bitcast(
+                            fx.Float32
                         )
                         packed = rocdl.cvt_scalef32_pk_fp8_f32(
                             i32,
@@ -3572,17 +3440,19 @@ def _emit_quant_block_loop_apre(c: SimpleNamespace) -> None:
                         recip_scale = ((c.c254_i32 - e8m0_scale) << c.c23_i32).bitcast(
                             f32
                         )
-                        scaled0 = ArithValue(x0) * recip_scale
-                        scaled1 = ArithValue(x1) * recip_scale
+                        scaled0 = x0 * recip_scale
+                        scaled1 = x1 * recip_scale
                         # v_cvt_pk_fp8_f32: 2 f32 -> 2 fp8 bytes in word 0.
                         packed = rocdl.cvt_pk_fp8_f32(
                             i32, scaled0, scaled1, c.c0_i32, 0
                         )
-                    payload_val = arith.trunci(T.i16, ArithValue(packed))  # 2 fp8 B
+                    payload_val = arith.trunci(T.i16, fx.Int32(packed))  # 2 fp8 B
                 else:
                     if const_expr(c.use_native):
-                        block_scale_f32 = (ArithValue(e8m0_scale) << c.c23_i32).bitcast(
-                            f32
+                        block_scale_f32 = (
+                            fx.Int32(e8m0_scale) << c.c23_i32
+                        ).bitcast(
+                            fx.Float32
                         )
                         packed = rocdl.cvt_scalef32_pk_fp4_f32(
                             i32,
@@ -3592,14 +3462,16 @@ def _emit_quant_block_loop_apre(c: SimpleNamespace) -> None:
                             _raw(block_scale_f32),
                             0,
                         )
-                        payload_val = arith.trunci(T.i8, ArithValue(packed))
+                        payload_val = arith.trunci(T.i8, fx.Int32(packed))
                     else:
                         recip_scale = ((c.c254_i32 - e8m0_scale) << c.c23_i32).bitcast(
                             f32
                         )
-                        nib0 = emit_f32_to_e2m1(ArithValue(x0) * recip_scale)
-                        nib1 = emit_f32_to_e2m1(ArithValue(x1) * recip_scale)
-                        packed_byte = ArithValue(nib0) | (ArithValue(nib1) << c.c4_i32)
+                        nib0 = emit_f32_to_e2m1(x0 * recip_scale)
+                        nib1 = emit_f32_to_e2m1(x1 * recip_scale)
+                        packed_byte = fx.Int32(nib0) | (
+                            fx.Int32(nib1) << c.c4_i32
+                        )
                         payload_val = arith.trunci(T.i8, packed_byte)  # 1 fp4x2 B
 
             # One quant result (payload_val + e8m0_scale) is written to every
@@ -4337,7 +4209,7 @@ def build_moe_quant_token_fp4_module(feat_dim: int, tdm_hidden_chunks: int = 0):
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         quant_kernel(grouped_in, token_payload, token_scale, num_tokens).launch(
-            grid=(arith.index_cast(T.index, grid_blocks), 1, 1),
+            grid=(fx.Index(grid_blocks), 1, 1),
             block=(BLOCK_THREADS, 1, 1),
             stream=stream,
         )
@@ -4499,8 +4371,8 @@ def build_moe_scatter_preshuffled_a_lds_module(
         dst_payload_rsrc = ptr_rsrc(grouped_payload)
         dst_scale_rsrc = ptr_rsrc(grouped_scale)
 
-        lds_ptr = fx.SharedAllocator().allocate(lds_bytes)._ptr
-        lds_idx = fx.index_cast(T.index, fx.ptrtoint(lds_ptr))
+        lds_ptr = fx.SharedAllocator().allocate(lds_bytes).peek().ptr
+        lds_idx = fx.Index(fx.ptrtoint(lds_ptr))
         lds_load_b32, lds_store_b32 = make_lds_copy_ops(32)
 
         def write_payload_epoch(epoch):
@@ -4520,7 +4392,7 @@ def build_moe_scatter_preshuffled_a_lds_module(
                         lds_idx,
                         fx.Int32((wave * rows_per_wave + r) * lds_row_bytes)
                         + fx.Int32((sub * 32 + lane) * 4),
-                        vector.from_elements(T.vec(1, i32), [value]),
+                        fx.Vector.from_elements([value], fx.Int32),
                     )
 
         def read_payload_epoch(epoch):
@@ -4537,7 +4409,7 @@ def build_moe_scatter_preshuffled_a_lds_module(
                     )[0]
                     for j in range_constexpr(4)
                 ]
-                payload_value = vector.from_elements(T.vec(4, i32), values)
+                payload_value = fx.Vector.from_elements(values, fx.Int32)
                 row_tile16 = row // fx.Uint32(16)
                 row_in_tile16 = row - row_tile16 * fx.Uint32(16)
                 k_block = k_block_base + wave
@@ -4581,7 +4453,7 @@ def build_moe_scatter_preshuffled_a_lds_module(
                                 lds_idx,
                                 fx.Int32((wave * rows_per_wave + r) * lds_row_bytes)
                                 + fx.Int32(scale_dword * fx.Uint32(4)),
-                                vector.from_elements(T.vec(1, i32), [value]),
+                                fx.Vector.from_elements([value], fx.Int32),
                             )
 
                 gpu.barrier()
@@ -4641,7 +4513,7 @@ def build_moe_scatter_preshuffled_a_lds_module(
             grouped_scale,
             rows_to_tokens,
         ).launch(
-            grid=(arith.index_cast(T.index, grid_blocks), 1, 1),
+            grid=(fx.Index(grid_blocks), 1, 1),
             block=(BLOCK_THREADS, 1, 1),
             stream=stream,
         )
@@ -4787,8 +4659,6 @@ def build_moe_quant_preshuffled_a_rowgroup_module(
         hidden_rsrc = ptr_rsrc(grouped_in)
         payload_rsrc = ptr_rsrc(grouped_payload)
         scale_rsrc = ptr_rsrc(grouped_scale)
-        vec8_bf16_ty = T.vec(8, T.bf16)
-        vec8_f32_ty = T.vec(8, f32)
         shared_allocator = fx.SharedAllocator()
 
         payload_lds = None
@@ -4799,10 +4669,12 @@ def build_moe_quant_preshuffled_a_rowgroup_module(
         payload_shared_tile = None
         payload_lds_pitch = 16 * 16 + 32
         if const_expr(tdm_payload_store):
-            payload_lds = shared_allocator.allocate(
-                L.mx_blocks_per_row * payload_lds_pitch
-            )._ptr
-            payload_lds_idx = fx.index_cast(T.index, fx.ptrtoint(payload_lds))
+            payload_lds = (
+                shared_allocator.allocate(L.mx_blocks_per_row * payload_lds_pitch)
+                .peek()
+                .ptr
+            )
+            payload_lds_idx = fx.Index(fx.ptrtoint(payload_lds))
             _, payload_lds_store = make_lds_copy_ops(32)
             payload_global_base = fx.recast_iter(fx.Int8, grouped_payload) + fx.Int64(
                 row_base // fx.Uint32(16)
@@ -4842,10 +4714,12 @@ def build_moe_quant_preshuffled_a_rowgroup_module(
         hidden_buffer_count = 1 if tdm_hidden_chunks == 1 else 2
         is_tdm_loader = wave == fx.Uint32(0)
         if const_expr(tdm_hidden_chunks):
-            hidden_lds = shared_allocator.allocate(
-                hidden_buffer_count * hidden_slot_bytes
-            )._ptr
-            hidden_lds_idx = fx.index_cast(T.index, fx.ptrtoint(hidden_lds))
+            hidden_lds = (
+                shared_allocator.allocate(hidden_buffer_count * hidden_slot_bytes)
+                .peek()
+                .ptr
+            )
+            hidden_lds_idx = fx.Index(fx.ptrtoint(hidden_lds))
             hidden_lds_load, _ = make_lds_copy_ops(128)
 
             hidden_global_base = fx.recast_iter(fx.Int8, grouped_in) + fx.Int64(
@@ -4950,15 +4824,13 @@ def build_moe_quant_preshuffled_a_rowgroup_module(
                 for pi in range_constexpr(prefetch_depth):
                     it = batch * prefetch_depth + pi
                     mx_block = mx_blocks[pi]
-                    bf16x8 = vector.bitcast(vec8_bf16_ty, prefetched[pi])
-                    f32x8 = bf16x8.extf(vec8_f32_ty)
+                    bf16x8 = fx.Vector(prefetched[pi]).bitcast(fx.BFloat16)
+                    f32x8 = bf16x8.to(fx.Float32)
 
                     block_amax = c0_f32
                     for j in range_constexpr(8):
-                        xj = vector.extract(
-                            f32x8, static_position=[j], dynamic_position=[]
-                        )
-                        absj = llvm.call_intrinsic(f32, "llvm.fabs.f32", [xj], [], [])
+                        xj = f32x8[j]
+                        absj = abs(xj)
                         block_amax = arith.maximumf(block_amax, absj)
                     for dist in (1, 2):
                         peer_amax = block_amax.shuffle_xor(
@@ -4966,10 +4838,12 @@ def build_moe_quant_preshuffled_a_rowgroup_module(
                         )
                         block_amax = arith.maximumf(block_amax, peer_amax)
 
-                    e8m0_scale = _emit_mx_e8m0_scale_apre(
+                    e8m0_scale = emit_mx_e8m0_scale(
                         block_amax, mode=_ROUND_MODE, dtype=_MxDtype.FP4_E2M1
                     )
-                    block_scale_f32 = (ArithValue(e8m0_scale) << c23_i32).bitcast(f32)
+                    block_scale_f32 = (fx.Int32(e8m0_scale) << c23_i32).bitcast(
+                        fx.Float32
+                    )
                     payload_val = _cvt_scalef32_pk8_fp4_bf16(
                         bf16x8, block_scale_f32, i32_ty=i32
                     )
@@ -4981,7 +4855,7 @@ def build_moe_quant_preshuffled_a_rowgroup_module(
                             fx.Int32(mx_block * fx.Uint32(payload_lds_pitch))
                             + fx.Int32(row_in_block * fx.Uint32(16))
                             + fx.Int32(lane_in_block * c4_i32),
-                            vector.from_elements(T.vec(1, i32), [payload_val]),
+                            fx.Vector.from_elements([payload_val], fx.Int32),
                         )
                     else:
                         payload_byte = payload_row_byte + mx_block * fx.Uint32(16 * 16)
@@ -4996,8 +4870,8 @@ def build_moe_quant_preshuffled_a_rowgroup_module(
                     if const_expr(rows_per_wave == 8):
                         # With one K block per subgroup, the same lead lane owns
                         # four consecutive scale bytes across four iterations.
-                        scale_pack = ArithValue(scale_pack) | (
-                            ArithValue(e8m0_scale)
+                        scale_pack = fx.Int32(scale_pack) | (
+                            fx.Int32(e8m0_scale)
                             << arith.constant((it & 3) * 8, type=i32)
                         )
                         if const_expr((it & 3) == 3):
@@ -5062,7 +4936,7 @@ def build_moe_quant_preshuffled_a_rowgroup_module(
             m_tile_map,
             n_rows,
         ).launch(
-            grid=(arith.index_cast(T.index, grid_blocks), 1, 1),
+            grid=(fx.Index(grid_blocks), 1, 1),
             block=(BLOCK_THREADS, 1, 1),
             stream=stream,
         )

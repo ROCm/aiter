@@ -71,6 +71,46 @@ def _select_num_waves_per_tensor_tdm(csv_num_waves: int) -> int:
     return num_waves
 
 
+def _supports_gfx1250_a_preshuffle_resolved(
+    *,
+    N: int,
+    K: int,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    m_warp: int,
+    n_warp: int,
+    num_buffers: int,
+    out_is_f16: int,
+    a_is_fp4: int,
+    stage1_act: int,
+    stage1_quant_out: int,
+    has_bias: int,
+    cluster_n: int,
+    next_stage_prefetch: int,
+    n_experts: int,
+) -> bool:
+    """Check an A-preshuffle schedule after launch options are resolved."""
+    common = all(
+        (
+            a_is_fp4,
+            stage1_quant_out == 0,
+            out_is_f16 == 0,
+            has_bias == 0,
+            n_experts > 0,
+            tile_m in (192, 256),
+            (tile_n, tile_k, m_warp, n_warp, num_buffers) == (256, 256, 2, 2, 4),
+            cluster_n == 4,
+            next_stage_prefetch == 1,
+        )
+    )
+    if not common:
+        return False
+    if stage1_act == 1:
+        return K == 7168 and N in (4096, 6144)
+    return stage1_act == 0 and N == 7168 and K in (2048, 3072)
+
+
 def supports_gfx1250_a_preshuffle(
     *,
     N: int,
@@ -90,31 +130,29 @@ def supports_gfx1250_a_preshuffle(
     next_stage_prefetch: int,
     n_experts: int,
 ) -> bool:
-    """Return whether this stage exactly matches an A-preshuffle tuned tile."""
+    """Return whether this stage resolves to an A-preshuffle tuned tile."""
     num_buffers = min(num_buffers, max(1, K // tile_k))
     n_tiles = (N + tile_n - 1) // tile_n
-    cluster_n = _select_cluster_n(n_tiles, cluster_n)
-    next_stage_prefetch = _select_bool_env(
-        "AITER_TDM_NEXT_STAGE_PREFETCH", next_stage_prefetch
+    return _supports_gfx1250_a_preshuffle_resolved(
+        N=N,
+        K=K,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        m_warp=m_warp,
+        n_warp=n_warp,
+        num_buffers=num_buffers,
+        out_is_f16=out_is_f16,
+        a_is_fp4=a_is_fp4,
+        stage1_act=stage1_act,
+        stage1_quant_out=stage1_quant_out,
+        has_bias=has_bias,
+        cluster_n=_select_cluster_n(n_tiles, cluster_n),
+        next_stage_prefetch=_select_bool_env(
+            "AITER_TDM_NEXT_STAGE_PREFETCH", next_stage_prefetch
+        ),
+        n_experts=n_experts,
     )
-    common = all(
-        (
-            a_is_fp4,
-            stage1_quant_out == 0,
-            out_is_f16 == 0,
-            has_bias == 0,
-            n_experts > 0,
-            tile_m in (192, 256),
-            (tile_n, tile_k, m_warp, n_warp, num_buffers) == (256, 256, 2, 2, 4),
-            cluster_n == 4,
-            next_stage_prefetch == 1,
-        )
-    )
-    if not common:
-        return False
-    if stage1_act == 1:
-        return K == 7168 and N in (4096, 6144)
-    return stage1_act == 0 and N == 7168 and K in (2048, 3072)
 
 
 def flydsl_grouped_gemm_a8w4_masked(
@@ -188,7 +226,7 @@ def flydsl_grouped_gemm_a8w4_masked(
             f"[grouped-moe tdm] cluster_n={cluster_n} needs n_tiles={n_tiles} "
             f"(N={N}, tile_n={tile_n}) to be an exact multiple"
         )
-    target_optimized = bool(a_preshuffle) and supports_gfx1250_a_preshuffle(
+    target_optimized = bool(a_preshuffle) and _supports_gfx1250_a_preshuffle_resolved(
         N=N,
         K=K,
         tile_m=tile_m,
