@@ -2,13 +2,15 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Multi-layer EP MoE end-to-end perf + accuracy on the mori v2 cco/FlyDSL op-layer.
 
-N (default 61, DeepSeek-V4-Pro) MoE layers are chained. The ``base`` mode uses
-Mori v2 dispatch -> AITER fused_moe -> Mori v2 combine. ``fused`` calls only
-``MegaMoEGfx1250``, which owns AITER's dispatch -> fused_moe -> fused-combine
-pipeline. The combined output plus residual feeds the next layer. ``both`` (the
-default) walks base then fused in ONE process, so the two share the weights, the
-tokens, the routings and the single fp32 reference, and land as two rows of the
-same summary table -- perf and accuracy compared column by column.
+N (default 61, DeepSeek-V4-Pro) MoE layers are chained, each one a
+``MegaMoEGfx1250`` forward plus residual. Two switches pick its path:
+``--stage1_fused`` the dispatch (true: FlyDSL compact plan, false: mori) and
+``--stage2_fused`` the combine (true: gemm2-fused P2P scatter + FlyDSL reduce,
+false: plain fused_moe + mori combine). Either may be ``both``: every resulting
+configuration then runs in ONE process, sharing the weights, the tokens, the
+routings and the single fp32 reference, and lands as its own row of the summary
+table -- perf and accuracy compared column by column. (true, false) does not
+exist: the compact plan's rows only find their tokens through the gemm2 scatter.
 
 Two isolated paths (never touch each other's intermediates; they only share the
 config, the bf16 weights and the per-layer routings):
@@ -16,21 +18,24 @@ config, the bf16 weights and the per-layer routings):
   * ``RefModel``  -- pure-torch fp32 reference (mxfp4-dequant weights, per-token
     routed FFN + residual, chained over N layers). Uses NO mori/cco/fused_moe
     kernel. This is the ground truth (mirrors test_moe_ep.py's torch_moe idea).
-  * ``DeviceMoEPipeline`` -- the device path: cco Communicator + EpDispatchCombineOp
-    + a8w4 fused_moe. The whole N-layer dispatch->gemm->combine chain is captured
-    into a SINGLE CUDA graph; perf is measured with torch.profiler over graph
-    replays (not cuda.Event). Contains no fp32-reference logic.
+  * ``DeviceMoEPipeline`` -- the device path: cco Communicator + MegaMoEGfx1250.
+    The whole N-layer dispatch->gemm->combine chain is captured into a SINGLE
+    CUDA graph; perf is measured with torch.profiler over graph replays (not
+    cuda.Event). Contains no fp32-reference logic.
 
 Launcher: torchrun (one process per rank / GPU), mirroring test_moe_layer_ep.py.
 
 Launch (4x gfx1250; every env knob below is already the script's default):
     cd <dir not under /app>   # avoid the /app/triton namespace shadow
     torchrun --standalone --nproc_per_node=4 bench_mega_moe.py \
-      -q a4w4_mxfp4 -e 384 -k 6 -hd 7168 -id 3072 --layers 61 --combine both
+      -q a4w4_mxfp4 -e 384 -k 6 -hd 7168 -id 3072 --layers 61 \
+      --stage1_fused false --stage2_fused true
+    # --stage2_fused both adds the mori-combine baseline row that
+    # speedup_vs_base and stage2_overlap_rate are measured against.
     # Set MORI_CCO_BC to a prebuilt libmori_cco_device.bc to skip CCO JIT.
 
-Env / CLI: --layers --logits_tol --acc_verify --dispatch_backend
-           --stage1_fused --dispatch_wire --combine --combine_quant
+Env / CLI: --layers --logits_tol --acc_verify --stage1_fused --stage2_fused
+           --dispatch_wire --combine_quant
            -tpr -hd -id -e -k --shared_E -q
            --data-init --seed --warmup --iters --prof_replays
 
@@ -62,9 +67,7 @@ from aiter import (
 )
 from aiter.benchmark_data_init import add_data_init_args, fill, make_generator
 from aiter.benchmark_reporting import print_json_table
-from aiter.fused_moe import fused_moe
 from aiter.ops.flydsl.moe_common import GateMode
-from aiter.ops.quant import per_1x32_mx_quant_hip
 from aiter.ops.shuffle import moe_shuffle_scale, shuffle_weight
 from aiter.utility import fp4_utils
 
@@ -81,9 +84,6 @@ os.environ.setdefault("ENABLE_CK", "0")
 os.environ.setdefault("AITER_FORCE_A8W4", "0")
 os.environ.setdefault("AITER_USE_GROUPED_GEMM", "1")
 os.environ.setdefault("AITER_BF16_FP8_MOE_BOUND", "0")
-# The base path uses mori's EpDispatchCombineOp. MegaMoE's dispatch backend is
-# selected independently by --dispatch_backend.
-os.environ.setdefault("MORI_V2_KERNEL_BACKEND", "hip")
 
 os.environ.setdefault("FLYDSL_GPU_ARCH", get_gfx())
 
@@ -98,25 +98,10 @@ _DEFAULT_SCALE_INIT = "constant"
 
 
 def _import_mori_comm():
-    """Import Mori's communicator (needed by every combine mode)."""
+    """Import Mori's communicator (needed by every configuration)."""
     from mori.cco import Communicator
 
     return Communicator
-
-
-def _import_mori_v2():
-    """Import Mori's non-fused dispatch/combine v2 path.
-
-    Deferred: the fused mode runs entirely on aiter's own mega_moe kernels and
-    only needs the communicator, so importing this eagerly would make the fused
-    path fail whenever Mori's copy lags the installed flydsl API.
-    """
-    from mori.ops.dispatch_combine_v2 import (
-        EpDispatchCombineConfig,
-        EpDispatchCombineOp,
-    )
-
-    return EpDispatchCombineConfig, EpDispatchCombineOp
 
 
 # Config / quant-path spec
@@ -137,20 +122,8 @@ def resolve_spec(quant_key):
     }
 
 
-# The dispatch wire, honoured by BOTH combine modes.
+# The dispatch wire, honoured by every configuration.
 _DISPATCH_WIRE_FOR_QUANT = {"a8w4_mxfp4": "fp8", "a4w4_mxfp4": "fp4"}
-# What each wire means to the `base` path's mori op: the dtype mori sizes a
-# transported token with, and the dtype the SENDER quantizes to. mori does no
-# quantizing of its own -- a quantized payload arrives already packed, and the
-# e8m0 rows beside it are forwarded verbatim -- so the second entry is what
-# _layer_step runs before handing the tokens over. None leaves them bf16.
-_MORI_DISPATCH_WIRE = {
-    "bf16": (torch.bfloat16, None),
-    "fp8": (dtypes.fp8, dtypes.fp8),
-    "fp4": (dtypes.fp4x2, dtypes.fp4x2),
-}
-# One e8m0 scale per 32 features, on both the MegaMoE wire and the mori one.
-_MX_SCALE_BLOCK = 32
 
 
 def resolve_dispatch_wire(wire, quant_key):
@@ -162,9 +135,9 @@ def resolve_dispatch_wire(wire, quant_key):
     pairing is a width error, not a slow path, so it is rejected here rather
     than deep inside the gather.
 
-    One wire for both combine modes: base and fused differ in how the expert
-    output comes BACK, and leaving them on different dispatch wires would put
-    that difference on the send leg too.
+    One wire for every configuration: they differ in which kernels move the
+    tokens, and leaving them on different dispatch wires would put a payload
+    width difference on top of that.
     """
     if wire == "auto":
         return _DISPATCH_WIRE_FOR_QUANT[quant_key]
@@ -193,15 +166,35 @@ def resolve_data_init(data_init):
     return dists[0]
 
 
-def resolve_combine_modes(combine):
-    """The combine modes one invocation benchmarks, in the order they run.
+_FUSED_CHOICES = ("true", "false", "both")
+# The --combine_quant wires mori's combine (stage2_fused=false) offers.
+_MORI_COMBINE_QUANTS = ("none", "mxfp4")
 
-    ``both`` is the default so a plain run always produces the base-vs-fused
-    comparison. The fused combine is mxfp4-only and every key in ``QUANT_KEYS``
-    is mxfp4-weight, so ``both`` never has to degrade to base alone here."""
-    if combine != "both":
-        return [combine]
-    return ["base", "fused"]
+
+def resolve_modes(stage1_fused, stage2_fused):
+    """The (stage1_fused, stage2_fused) pairs one invocation benchmarks, in the
+    order they run, and whether ``both`` produced a pair that had to be skipped.
+
+    ``both`` expands to false then true. (true, false) is skipped when ``both``
+    produced it and rejected when asked for outright: the compact plan groups
+    the recv rows per expert, and only the gemm2 scatter maps them back."""
+
+    def values(choice):
+        return (False, True) if choice == "both" else (choice == "true",)
+
+    modes = [(s1, s2) for s1 in values(stage1_fused) for s2 in values(stage2_fused)]
+    valid = [mode for mode in modes if mode != (True, False)]
+    if not valid:
+        raise ValueError(
+            "--stage1_fused true requires --stage2_fused true: the compact plan "
+            "groups recv rows per expert, and only the gemm2 scatter maps them "
+            "back to their tokens"
+        )
+    return valid, len(valid) < len(modes)
+
+
+def mode_label(stage1_fused, stage2_fused):
+    return f"s1_{str(stage1_fused).lower()}_s2_{str(stage2_fused).lower()}"
 
 
 # Weight quantization + shuffle (device path) / dequant (reference)
@@ -260,50 +253,6 @@ def shuffle_group(w1_qt, w1_s, w2_qt, w2_s, spec, n_experts):
         w1_a = w1_a.view(dtypes.fp4x2)
         w2_a = w2_a.view(dtypes.fp4x2)
     return w1_a, w2_a, w1_ss, w2_ss
-
-
-def moe_forward(
-    hidden,
-    w1_a,
-    w2_a,
-    w1_s,
-    w2_s,
-    topk_weights,
-    topk_ids,
-    expert_mask,
-    spec,
-    num_local_tokens=None,
-    a1_scale=None,
-):
-    """Single fused_moe call (device path). ``num_local_tokens`` (device int32
-    scalar == total_recv) lets the caller feed the FULL, un-truncated dispatch
-    buffer: routes past total_recv*topk are dropped in the grouped route kernel,
-    so no host .item()/slice/clone is needed and the call stays graph-capturable.
-
-    ``a1_scale`` is the e8m0 row a quantizing dispatch wire delivered next to
-    the payload; passing it (with ``hidden`` in packed MX bytes) is what tells
-    fused_moe the activations are already quantized. None on a bf16 wire, where
-    fused_moe quantizes each received copy itself."""
-    if num_local_tokens is None:
-        num_local_tokens = torch.tensor(
-            [hidden.shape[0]], dtype=dtypes.i32, device=hidden.device
-        )
-    return fused_moe(
-        hidden,
-        w1_a,
-        w2_a,
-        topk_weights,
-        topk_ids,
-        expert_mask=expert_mask,
-        activation=spec["activation"],
-        gate_mode=spec["gate_mode"].value,
-        quant_type=spec["aiter_qtype"],
-        w1_scale=w1_s,
-        w2_scale=w2_s,
-        a1_scale=a1_scale,
-        dtype=dtypes.bf16,
-        num_local_tokens=num_local_tokens,
-    )
 
 
 # Shared setup (fed to BOTH reference and device path)
@@ -418,9 +367,9 @@ _ACC_TOL_SAFETY = 1.5
 
 def default_logits_tol(quant_key, combine_quant, n_layers):
     # Per-quant tol for an n_layers chain; see _ACC_TOL for the calibration.
-    # Keyed on the COMBINE wire only: --combine base leaves it bf16 (its dispatch
-    # wire tracks --dispatch_wire, same as fused's), and --combine_quant none
-    # does too; both stay under the mxfp8 curve.
+    # Keyed on the COMBINE wire only: --stage2_fused false leaves it bf16 (its
+    # dispatch wire tracks --dispatch_wire, same as the fused combine's), and
+    # --combine_quant none does too; both stay under the mxfp8 curve.
     slope, sat = _ACC_TOL[quant_key, "mxfp4" if combine_quant == "mxfp4" else "mxfp8"]
     return _ACC_TOL_SAFETY * slope * n_layers / (1.0 + sat * n_layers)
 
@@ -526,7 +475,7 @@ class RefModel:
 
 # Device pipeline: N-layer dispatch->gemm->combine, one CUDA graph (ISOLATED)
 class DeviceMoEPipeline:
-    """Owns the cco Communicator + EpDispatchCombineOp + a8w4 shuffled weights.
+    """Owns the cco Communicator + MegaMoEGfx1250 + a8w4 shuffled weights.
     Each layer recomputes its own routing inside dispatch (e2e-faithful), and the
     whole N-layer chain is captured into ONE CUDA graph and timed with
     torch.profiler. No fp32-reference logic here."""
@@ -546,7 +495,8 @@ class DeviceMoEPipeline:
         sw2,
         routings,
         ct,
-        combine_mode="base",
+        stage1_fused=False,
+        stage2_fused=True,
         combine_quant="none",
     ):
         self.dist_ctx = dist_ctx
@@ -557,17 +507,13 @@ class DeviceMoEPipeline:
         self.sw1, self.sw2 = sw1, sw2
         self.routings = routings
         self.ct = ct
-        self.combine_mode = combine_mode
+        self.stage1_fused = stage1_fused
+        self.stage2_fused = stage2_fused
         self.combine_quant = combine_quant
         self.EPR = E // dist_ctx.world
         self.dev = torch.device("cuda", dist_ctx.local_rank)
         self.comm = None
-        self.op = None
         self.mega = None
-        # base path only: what the sender quantizes to (None on a bf16 wire),
-        # and the arrived e8m0 rows the grouped GEMM reads as its a1_scale.
-        self.dispatch_quant_dtype = None
-        self.recv_scale_rows = None
         self.graph = None
         self.x0_static = None
         self.out_static = None
@@ -578,7 +524,7 @@ class DeviceMoEPipeline:
         # torch.cuda.set_device sets the process HIP current device (== driver
         # hipSetDevice) that cco keys off; Dist already set it, repeat for safety.
         torch.cuda.set_device(self.dist_ctx.local_rank)
-        dev, r = self.dev, self.dist_ctx.rank
+        r = self.dist_ctx.rank
 
         # this rank's LOCAL expert weights (quant + layout shuffle), a8w4.
         w1_g = self.w1_bf[r * self.EPR : (r + 1) * self.EPR].contiguous()
@@ -587,168 +533,68 @@ class DeviceMoEPipeline:
         self.w1_a, self.w2_a, self.w1_s, self.w2_s = shuffle_group(
             q1, gs1, q2, gs2, self.spec, self.EPR
         )
-        self.expert_mask = torch.zeros((self.E,), dtype=dtypes.i32, device=dev)
-        self.expert_mask[self.EPR * r : self.EPR * (r + 1)] = 1
-
-        self.transport_dtype = torch.bfloat16  # bf16 transport (mxfp4 path)
 
         # cco rendezvous + op (ONE op, reused by every layer; config is per-layer
-        # identical). max_num_inp_token_per_rank = ct.
+        # identical). max_tokens_per_rank = ct.
         uid = Communicator.get_unique_id() if r == 0 else None
         uid = self.dist_ctx.bcast_uid(uid)
         self.comm = Communicator.init(
             self.dist_ctx.world, r, uid, per_rank_vmm=16 * 1024**3
         )
-        if self.combine_mode == "fused":
-            from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import MegaMoEGfx1250
+        from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import MegaMoEGfx1250
 
-            # Geometry + the expert-GEMM recipe are per-model, so they are fixed
-            # here; the weights are per-layer and go to each forward() call.
-            self.mega = MegaMoEGfx1250(
-                communicator=self.comm,
-                rank=r,
-                world_size=self.dist_ctx.world,
-                model_dim=self.hdim,
-                inter_dim=self.idim,
-                experts=self.E,
-                topk=self.topk,
-                max_tokens_per_rank=self.ct,
-                activation=self.spec["activation"],
-                gate_mode=self.spec["gate_mode"].value,
-                quant_type=self.spec["aiter_qtype"],
-                # Explicit so a stale $MEGA_DISPATCH_WIRE cannot change what is measured.
-                dispatch_wire=self.spec["dispatch_wire"],
-                dispatch_backend=self.spec["dispatch_backend"],
-                stage1_fused=self.spec["stage1_fused"],
-                combine_quant=self.combine_quant,
-            )
-        else:
-            EpDispatchCombineConfig, EpDispatchCombineOp = _import_mori_v2()
-            wire_dtype, self.dispatch_quant_dtype = _MORI_DISPATCH_WIRE[
-                self.spec["dispatch_wire"]
-            ]
-            # A quantizing wire makes this an asymmetric op: an MX payload goes
-            # out on dispatch, the post-expert tokens come back bf16. The two
-            # dtypes are all-or-none, and the scale row is the same hidden/32
-            # e8m0 bytes the fused wire sends -- mori forwards it to the
-            # receiver's out_scales without repacking it.
-            wire_kw = {}
-            if self.dispatch_quant_dtype is not None:
-                if self.hdim % _MX_SCALE_BLOCK:
-                    raise ValueError(
-                        f"one e8m0 scale covers {_MX_SCALE_BLOCK} features, so "
-                        f"--dispatch_wire={self.spec['dispatch_wire']} needs a "
-                        f"hidden dim that is a multiple of it, got {self.hdim}"
-                    )
-                wire_kw = {
-                    "dispatch_data_type": wire_dtype,
-                    "combine_data_type": self.transport_dtype,
-                    "scale_dim": self.hdim // _MX_SCALE_BLOCK,
-                    "scale_type_size": 1,
-                }
-            cfg = EpDispatchCombineConfig(
-                rank=r,
-                world_size=self.dist_ctx.world,
-                hidden_dim=self.hdim,
-                max_num_inp_token_per_rank=self.ct,
-                num_experts_per_rank=self.EPR,
-                num_experts_per_token=self.topk,
-                data_type=self.transport_dtype,
-                combine_mode="gather",  # mori's name for the `base` combine
-                **wire_kw,
-            )
-            self.op = EpDispatchCombineOp(cfg, self.comm)
-            self.recv_scale_rows = self._recv_scale_rows()
+        # Geometry + the expert-GEMM recipe are per-model, so they are fixed
+        # here; the weights are per-layer and go to each forward() call.
+        self.mega = MegaMoEGfx1250(
+            communicator=self.comm,
+            rank=r,
+            world_size=self.dist_ctx.world,
+            model_dim=self.hdim,
+            inter_dim=self.idim,
+            experts=self.E,
+            topk=self.topk,
+            max_tokens_per_rank=self.ct,
+            activation=self.spec["activation"],
+            gate_mode=self.spec["gate_mode"].value,
+            quant_type=self.spec["aiter_qtype"],
+            # Explicit so a stale $MEGA_DISPATCH_WIRE cannot change what is measured.
+            dispatch_wire=self.spec["dispatch_wire"],
+            stage1_fused=self.stage1_fused,
+            stage2_fused=self.stage2_fused,
+            combine_quant=self.combine_quant,
+        )
         self.comm.barrier()
-
-    def _recv_scale_rows(self):
-        """The arrived e8m0 rows as fused_moe's a1_scale, None on a bf16 wire.
-
-        FULL padded rows, which is also what MegaMoE hands the grouped GEMM: the
-        kernel takes a base pointer and strides by the row width it is given,
-        while mori lays the rows down at its own 128 B-aligned pitch. recv_scales()
-        returns that region already trimmed to the meaningful dwords, so the
-        pitch has to come from the op rather than from that view's shape.
-        """
-        if self.dispatch_quant_dtype is None:
-            return None
-        trimmed = self.op.recv_scales()
-        cap = trimmed.shape[0]
-        stride_i32 = self.op.scale_stride_bytes() // 4
-        rows = torch.as_strided(trimmed, (cap, stride_i32), (stride_i32, 1))
-        return rows.view(torch.uint8)
 
     # ---- one graph-capturable layer + full chain (calls grouped together) ---- #
     def _layer_step(self, x, layer_idx):
         ids, wts = self.routings[layer_idx]
         xn = _rmsnorm(x)  # keep the quantized activations in range across 61 layers
-        if self.mega is not None:
-            next_ids = (
-                self.routings[layer_idx + 1][0]
-                if _PLAN_PREFETCH and layer_idx + 1 < self.n_layers
-                else None
-            )
-            y = self.mega(
-                xn,
-                wts,
-                ids,
-                w1=self.w1_a,
-                w2=self.w2_a,
-                w1_scale=self.w1_s,
-                w2_scale=self.w2_s,
-                next_topk_ids=next_ids,
-                # Named per step, not inherited from construction: building the
-                # reduce and running it are separate decisions now.
-                combine_quant=self.combine_quant,
-            )
-            if self.sw1 is not None:
-                y = y + _device_shared_ffn(xn, self.sw1, self.sw2)
-            return x + y
-
-        payload, scales = xn, None
-        if self.dispatch_quant_dtype is not None:
-            # Quantize ONCE PER LOCAL TOKEN on the sender, as the fused wire
-            # does, rather than once per received copy on the far side. mori
-            # only transports: it forwards these bytes and the e8m0 row beside
-            # them, so the payload has to arrive already packed.
-            payload, scales = per_1x32_mx_quant_hip(
-                xn,
-                quant_dtype=self.dispatch_quant_dtype,
-                scale_type=dtypes.fp8_e8m0,
-                shuffle=False,
-            )
-            scales = scales.view(torch.uint8)
-        # Recompute routing every layer (mode A: atomic routing inside dispatch)
-        # instead of replaying a precomputed handle. return_routing=True hands
-        # back this layer's forward dest-slot map, which combine then consumes.
-        recv_x, recv_w, _rs, recv_idx, total_recv_t, handle = self.op.dispatch(
-            payload, wts, scales, ids, return_routing=True
+        next_ids = (
+            self.routings[layer_idx + 1][0]
+            if _PLAN_PREFETCH and layer_idx + 1 < self.n_layers
+            else None
         )
-        out = moe_forward(
-            recv_x,
-            self.w1_a,
-            self.w2_a,
-            self.w1_s,
-            self.w2_s,
-            recv_w,
-            recv_idx.to(dtypes.i32),
-            self.expert_mask,
-            self.spec,
-            num_local_tokens=total_recv_t,
-            a1_scale=self.recv_scale_rows,
+        y = self.mega(
+            xn,
+            wts,
+            ids,
+            w1=self.w1_a,
+            w2=self.w2_a,
+            w1_scale=self.w1_s,
+            w2_scale=self.w2_s,
+            next_topk_ids=next_ids,
+            # Named per step, not inherited from construction: building the
+            # reduce and running it are separate decisions now.
+            combine_quant=self.combine_quant,
         )
-        combine_out, _ = self.op.combine(out.to(self.transport_dtype), routing=handle)
-        y = combine_out[: self.ct].to(dtypes.bf16)
         if self.sw1 is not None:
             y = y + _device_shared_ffn(xn, self.sw1, self.sw2)
         return x + y  # residual
 
     def _pipeline(self, x0):
         x = x0
-        if self.mega is not None:
-            prefetch = getattr(self.mega, "prefetch_compact_plan", None)
-            if prefetch is not None and _PLAN_PREFETCH:
-                prefetch(self.routings[0][0])
+        if _PLAN_PREFETCH:
+            self.mega.prefetch_compact_plan(self.routings[0][0])
         for layer_idx in range(self.n_layers):
             x = self._layer_step(x, layer_idx)
         return x
@@ -844,8 +690,9 @@ class DeviceMoEPipeline:
 
     def teardown(self):
         # Drop the graph and its static tensors too, not just the mori handles:
-        # under --combine both the next mode captures its own N-layer graph right
-        # after this, and the first graph's pool would otherwise stay reserved.
+        # with a `both` switch the next configuration captures its own N-layer
+        # graph right after this, and this graph's pool would otherwise stay
+        # reserved.
         self.graph = None
         self.x0_static = None
         self.out_static = None
@@ -853,7 +700,6 @@ class DeviceMoEPipeline:
         if self.mega is not None:
             self.mega.close()
             self.mega = None
-        self.op = None
         if self.comm is not None:
             self.comm.destroy()
             self.comm = None
@@ -869,11 +715,11 @@ def _event_device_us(e):
     return 0.0
 
 
-def _run_distributed_smi_replay(pipe, dist_ctx, median_us, n_layers, combine_mode):
+def _run_distributed_smi_replay(pipe, dist_ctx, median_us, n_layers, label):
     """Replay the Mega graph while every rank monitors its local GPU.
 
-    `combine_mode` goes into the label so a --combine both run does not file two
-    different pipelines under the same name."""
+    The configuration's `label` goes into the SMI label so a run with a `both`
+    switch does not file two different pipelines under the same name."""
     if os.environ.get("AITER_SMI_MONITOR", "0") != "1":
         return
 
@@ -924,7 +770,7 @@ def _run_distributed_smi_replay(pipe, dist_ctx, median_us, n_layers, combine_mod
     expected_samples = max(1, int(duration_s / interval_s))
     base_label = os.environ.get("AITER_SMI_LABEL", "mega_moe")
     local_result = {
-        "label": f"{base_label}/{combine_mode}/mega_graph_{n_layers}_layers",
+        "label": f"{base_label}/{label}/mega_graph_{n_layers}_layers",
         "device": dist_ctx.local_rank,
         "rank": dist_ctx.rank,
         "interval_s": interval_s,
@@ -1001,18 +847,20 @@ def _aggregate_prof_table(prof, dist_ctx, per_layer_denom=1.0, row_limit=200):
     }
 
 
-def _stage2_overlap_rate(kernel_rows, idim):
+def _stage2_overlap_rate(base, fused, idim):
     """How much of stage 2's communication the fused combine hides behind gemm2.
 
-    Stage 2 is the second expert GEMM and everything that moves its output home.
-    base splits that into compute -- the K{idim} GEMM plus the gather-reduce that
-    lands the result -- and communication, the mori combine; the two are separate
-    kernels, so base pays for them back to back. fused folds the scatter into the
-    GEMM itself, so its stage 2 is that one (heavier) GEMM plus the small fused
-    combine. Whatever the sum of base's two halves loses by becoming the fused
-    total is time fused managed to overlap, and the most it could ever hide is
-    the smaller of the two halves -- hence the min() denominator, which puts a
-    perfect overlap at 1.0 and no overlap at 0.0.
+    ``base`` and ``fused`` are the kernel rows of a stage2_fused=false and a
+    stage2_fused=true run. Stage 2 is the second expert GEMM and everything
+    that moves its output home. base splits that into compute -- the K{idim}
+    GEMM plus the gather-reduce that lands the result -- and communication, the
+    mori combine; the two are separate kernels, so base pays for them back to
+    back. fused folds the scatter into the GEMM itself, so its stage 2 is that
+    one (heavier) GEMM plus the small fused combine. Whatever the sum of base's
+    two halves loses by becoming the fused total is time fused managed to
+    overlap, and the most it could ever hide is the smaller of the two halves --
+    hence the min() denominator, which puts a perfect overlap at 1.0 and no
+    overlap at 0.0.
 
     Both fused combine kernels count, the sync one included: it is the wait the
     fused path did not manage to hide, and dropping it would book that wait as
@@ -1026,7 +874,6 @@ def _stage2_overlap_rate(kernel_rows, idim):
         hits = [r["avg_us"] for r in rows if match(r["kernel"])]
         return sum(hits) if hits else None
 
-    base, fused = kernel_rows.get("base"), kernel_rows.get("fused")
     if not base or not fused:
         return None
 
@@ -1119,10 +966,7 @@ def main():
     os.environ["AITER_FORCE_A8W4"] = "0" if args.quant_type == "a4w4_mxfp4" else "1"
     spec = resolve_spec(args.quant_type)
     spec["dispatch_wire"] = resolve_dispatch_wire(args.dispatch_wire, args.quant_type)
-    spec["dispatch_backend"] = args.dispatch_backend
-    spec["stage1_fused"] = bool(args.stage1_fused)
-    if spec["stage1_fused"] and spec["dispatch_backend"] != "flydsl":
-        raise ValueError("--stage1_fused=1 requires --dispatch_backend=flydsl")
+    modes, skipped_unfused_compact = resolve_modes(args.stage1_fused, args.stage2_fused)
 
     if get_gfx() not in ("gfx950", "gfx1250"):
         if dist_ctx.rank == 0:
@@ -1147,8 +991,7 @@ def main():
         print(
             f"[cfg] world={dist_ctx.world} layers={n_layers} tokens/rank={ct} hidden={hdim} "
             f"inter={idim} E={E} topk={topk} EPR={E // dist_ctx.world} quant={args.quant_type} "
-            f"combine={args.combine} dispatch={spec['dispatch_backend']} "
-            f"stage1_fused={spec['stage1_fused']} "
+            f"stage1_fused={args.stage1_fused} stage2_fused={args.stage2_fused} "
             f"dispatch_wire={spec['dispatch_wire']} "
             f"combine_quant={args.combine_quant} "
             f"force_a8w4={os.environ['AITER_FORCE_A8W4']} "
@@ -1161,6 +1004,12 @@ def main():
             print(
                 f"# note: --scale-init {' '.join(args.scale_init)} is ignored -- "
                 "every scale here comes from quantizing the generated weights",
+                flush=True,
+            )
+        if skipped_unfused_compact:
+            print(
+                "# note: skipping stage1_fused=true stage2_fused=false -- the "
+                "compact plan needs the gemm2 scatter",
                 flush=True,
             )
 
@@ -1198,15 +1047,24 @@ def main():
     )
 
     # ---- device path (isolated): setup -> capture 61 layers in one graph -> bench,
-    # once per combine mode. Every rank walks `modes` in the same order, so the
-    # collectives inside the loop stay in step.
-    modes = resolve_combine_modes(args.combine)
+    # once per (stage1_fused, stage2_fused) configuration. Every rank walks
+    # `modes` in the same order, so the collectives inside the loop stay in step.
     summary_rows = []
     outputs = {}
-    kernel_rows = {}  # per mode, kept for the stage-2 overlap rate below
-    for combine_mode in modes:
+    kernel_rows = {}  # per configuration, kept for the stage-2 overlap rate below
+    for stage1_fused, stage2_fused in modes:
+        label = mode_label(stage1_fused, stage2_fused)
+        combine_quant = args.combine_quant
+        if not stage2_fused and combine_quant not in _MORI_COMBINE_QUANTS:
+            combine_quant = "none"
         if dist_ctx.rank == 0 and len(modes) > 1:
-            print(f"# ---- combine={combine_mode} ----", flush=True)
+            print(f"# ---- {label} ----", flush=True)
+        if dist_ctx.rank == 0 and combine_quant != args.combine_quant:
+            print(
+                f"# note: {label} combines through mori, which has no "
+                f"{args.combine_quant} wire -- running it on bf16",
+                flush=True,
+            )
         pipe = DeviceMoEPipeline(
             dist_ctx,
             E,
@@ -1221,8 +1079,9 @@ def main():
             sw2,
             routings,
             ct,
-            combine_mode=combine_mode,
-            combine_quant=args.combine_quant,
+            stage1_fused=stage1_fused,
+            stage2_fused=stage2_fused,
+            combine_quant=combine_quant,
         )
         pipe.setup(x0)
         pipe.capture(x0)
@@ -1235,9 +1094,7 @@ def main():
         stats = {k: dist_ctx.allreduce_avg_float(v) for k, v in stats.items()}
         per_layer_us = stats["median"] / n_layers
         prof_us = dist_ctx.allreduce_avg_float(prof_us)
-        _run_distributed_smi_replay(
-            pipe, dist_ctx, stats["median"], n_layers, combine_mode
-        )
+        _run_distributed_smi_replay(pipe, dist_ctx, stats["median"], n_layers, label)
         # Aggregate unconditionally, print only on request: bench() profiles the
         # replays either way and this is one gather of a ~20-entry dict, while
         # stage2_overlap_rate is a result the summary should carry whether or not
@@ -1250,43 +1107,43 @@ def main():
             per_layer_denom=args.prof_replays * n_layers,
         )
         if dist_ctx.rank == 0 and tbl is not None:
-            kernel_rows[combine_mode] = tbl["rows"]
+            kernel_rows[stage1_fused, stage2_fused] = tbl["rows"]
         if args.profile_table:
             # Save a chrome/perfetto timeline per rank so the actual kernel
             # timeline (and any gaps) can be inspected directly. Opt-in
             # (--save_trace): the export can stall multi-rank graph-profile runs,
             # so it is off by default.
             if args.save_trace:
-                _trace_path = f"/tmp/mega_trace_{combine_mode}_rank{dist_ctx.rank}.json"
+                _trace_path = f"/tmp/mega_trace_{label}_rank{dist_ctx.rank}.json"
                 try:
                     pipe._prof.export_chrome_trace(_trace_path)
                     if dist_ctx.rank == 0:
                         print(
-                            f"# trace saved: /tmp/mega_trace_{combine_mode}_rank*.json",
+                            f"# trace saved: /tmp/mega_trace_{label}_rank*.json",
                             flush=True,
                         )
                 except Exception as _e:  # noqa: BLE001
                     if dist_ctx.rank == 0:
                         print(f"# trace export failed: {_e}", flush=True)
-            # One table per mode, tagged with it: base and fused run a different
+            # One table per configuration, tagged with it: each runs a different
             # kernel mix, so merging them into a single table would compare rows
             # that never ran in the same pipeline.
             if dist_ctx.rank == 0 and tbl is not None:
-                _emit_table(f"mega_moe kernel profile [{combine_mode}]", tbl["rows"])
+                _emit_table(f"mega_moe kernel profile [{label}]", tbl["rows"])
                 _emit_table(
-                    f"mega_moe kernel profile summary [{combine_mode}]", tbl["summary"]
+                    f"mega_moe kernel profile summary [{label}]", tbl["summary"]
                 )
 
         # Replay once more for the accuracy snapshot while the graph is still
         # alive; teardown below frees it.
         if args.acc_verify:
-            outputs[combine_mode] = pipe.final_output().float()
+            outputs[label] = pipe.final_output().float()
         summary_rows.append(
             {
                 "quant_type": args.quant_type,
-                "combine": combine_mode,
-                "dispatch": spec["dispatch_backend"],
-                "stage1_fused": spec["stage1_fused"],
+                "stage1_fused": stage1_fused,
+                "stage2_fused": stage2_fused,
+                "combine_quant": combine_quant,
                 "data_init": data_dist,
                 "seed": args.seed,
                 "world_size": dist_ctx.world,
@@ -1311,23 +1168,23 @@ def main():
         torch.cuda.empty_cache()
 
     # ---- accuracy (isolated CPU/fp32 reference): end-to-end accumulated compare.
-    # ONE reference for every mode: the modes differ only in how combine moves the
-    # expert output, so they answer to the same ground truth -- and this reference
-    # is by far the most expensive part of the run.
+    # ONE reference for every configuration: they differ only in how dispatch and
+    # combine move the tokens, so they answer to the same ground truth -- and
+    # this reference is by far the most expensive part of the run.
     failures = []
     if args.acc_verify:
         auto_tol = args.logits_tol is None
-        tol = (
-            default_logits_tol(args.quant_type, args.combine_quant, n_layers)
-            if auto_tol
-            else args.logits_tol
-        )
-        tol_desc = f"{tol:.6f}{' auto' if auto_tol else ''}"
         ref = RefModel(w1_bf, w2_bf, sw1, sw2, spec, dev)
         ref_out = ref.run(x0, routings).float()
         for row in summary_rows:
-            combine_mode = row["combine"]
-            logits_diff = _calc_diff(ref_out, outputs[combine_mode])
+            label = mode_label(row["stage1_fused"], row["stage2_fused"])
+            tol = (
+                default_logits_tol(args.quant_type, row["combine_quant"], n_layers)
+                if auto_tol
+                else args.logits_tol
+            )
+            tol_desc = f"{tol:.6f}{' auto' if auto_tol else ''}"
+            logits_diff = _calc_diff(ref_out, outputs[label])
             errs = dist_ctx.allreduce_sum(0 if logits_diff < tol else 1)
             avg_diff = dist_ctx.allreduce_avg_float(logits_diff)
             row["logits_diff"] = avg_diff
@@ -1335,7 +1192,7 @@ def main():
             row["accuracy"] = "PASS" if errs == 0 else "FAIL"
             if dist_ctx.rank == 0:
                 print(
-                    f"# MEGA-CHECK combine={combine_mode} layers={n_layers}: "
+                    f"# MEGA-CHECK {label} layers={n_layers}: "
                     f"{'PASS' if errs == 0 else 'FAIL'} "
                     f"(avg logits_diff={avg_diff:.6f} over {dist_ctx.world} ranks, "
                     f"tol={tol_desc})",
@@ -1343,30 +1200,35 @@ def main():
                 )
             if errs != 0:
                 failures.append(
-                    f"combine={combine_mode} failed on {errs}/{dist_ctx.world} "
+                    f"{label} failed on {errs}/{dist_ctx.world} "
                     f"ranks: average logits_diff={avg_diff:.6f}, "
                     f"tolerance={tol_desc}"
                 )
 
     # The summary goes last so every row carries BOTH its perf and its accuracy.
-    # With more than one mode the rows line up column by column, and speedup_vs_base
-    # spells out the one comparison the table exists for.
+    # With more than one configuration the rows line up column by column, and
+    # speedup_vs_base measures each against the unfused (false, false) one.
     if len(summary_rows) > 1:
-        base_median = next(
-            (r["median_us"] for r in summary_rows if r["combine"] == "base"), None
-        )
+
+        def is_base(row):
+            return not row["stage1_fused"] and not row["stage2_fused"]
+
+        base_median = next((r["median_us"] for r in summary_rows if is_base(r)), None)
         if base_median:
             for row in summary_rows:
                 row["speedup_vs_base"] = base_median / row["median_us"]
-        # Needs both modes' kernel tables, so it only exists under --profile_table.
-        # It describes what fused did with base's stage 2, so it belongs on the
-        # fused row; base is the 0.0 baseline it is measured against.
-        overlap = _stage2_overlap_rate(kernel_rows, idim)
+        # Needs both kernel tables, so it only exists under --profile_table. It
+        # describes what the fused combine did with base's stage 2, so it belongs
+        # on the (false, true) row; base is the 0.0 baseline. Not on a compact
+        # stage 1: its gemm2 runs a different grid, and the formula would book
+        # that difference as overlap.
+        overlap = _stage2_overlap_rate(
+            kernel_rows.get((False, False)), kernel_rows.get((False, True)), idim
+        )
         if overlap is not None:
             for row in summary_rows:
-                row["stage2_overlap_rate"] = (
-                    0.0 if row["combine"] == "base" else overlap
-                )
+                if not row["stage1_fused"]:
+                    row["stage2_overlap_rate"] = overlap if row["stage2_fused"] else 0.0
     if dist_ctx.rank == 0:
         _emit_table("mega_moe summary", summary_rows)
 
@@ -1444,18 +1306,21 @@ def _parse_args():
         "can stall multi-rank graph-profile runs)",
     )
     p.add_argument(
-        "--dispatch_backend",
-        type=str,
-        choices=["flydsl", "mori"],
-        default=os.environ.get("MEGA_DISPATCH", "flydsl"),
-        help="MegaMoE dispatch implementation: flydsl (TDM) or mori",
+        "--stage1_fused",
+        type=str.lower,
+        choices=_FUSED_CHOICES,
+        default="false",
+        help="dispatch: true = FlyDSL compact plan fused with dispatch (needs an "
+        "fp8/fp4 --dispatch_wire), false = mori dispatch, both = run each",
     )
     p.add_argument(
-        "--stage1_fused",
-        type=int,
-        choices=[0, 1],
-        default=0,
-        help="use the compact-plan fused stage-1 path (flydsl dispatch only)",
+        "--stage2_fused",
+        type=str.lower,
+        choices=_FUSED_CHOICES,
+        default="true",
+        help="combine: true = gemm2-fused P2P scatter + FlyDSL reduce, false = "
+        "plain fused_moe + mori combine, both = run each. stage1_fused=true "
+        "needs stage2_fused=true",
     )
     p.add_argument(
         "--dispatch_wire",
@@ -1466,29 +1331,20 @@ def _parse_args():
             if "MEGA_DISPATCH_WIRE" in os.environ or "MEGA_WIRE" in os.environ
             else "auto"
         ),
-        help="what dispatch puts on the wire, on BOTH combine modes: bf16 sends "
+        help="what dispatch puts on the wire, in every configuration: bf16 sends "
         "activations and the receiver quantizes each copy; fp8/fp4 quantize once "
         "on the sender and forward the e8m0 row. 'auto' picks what the quant "
         "key's GEMM wants.",
-    )
-    p.add_argument(
-        "--combine",
-        type=str,
-        choices=["base", "fused", "both"],
-        default=os.environ.get("COMBINE", "both"),
-        help="EP combine mode: base (mori v2 dispatch/combine around fused_moe) "
-        "| fused (gemm2-fused P2P scatter; mxfp4 only) | both (run base then "
-        "fused in one process and compare them row by row in the summary). "
-        "Falls back to $COMBINE.",
     )
     p.add_argument(
         "--combine_quant",
         type=str,
         choices=["none", "mxfp8", "mxfp4"],
         default=os.environ.get("COMBINE_QUANT", "none"),
-        help="combine wire dtype for the fused combine: none (bf16) | mxfp8 "
-        "(fp8 e4m3 payload) | mxfp4 (fp4 e2m1 payload), both with a per-1x32 "
-        "e8m0 scale plane. Falls back to $COMBINE_QUANT.",
+        help="combine wire dtype: none (bf16) | mxfp8 (fp8 e4m3 payload) | mxfp4 "
+        "(fp4 e2m1 payload), both with a per-1x32 e8m0 scale plane. The mori "
+        "combine (stage2_fused=false) has no mxfp8 and runs those rows on bf16. "
+        "Falls back to $COMBINE_QUANT.",
     )
     return p.parse_args()
 
