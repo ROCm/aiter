@@ -64,6 +64,10 @@ _DECODE_THREADS = 128
 # kernel. Past the band ceiling below, doubling splits only buys a bigger
 # merge.
 _TINY_SPLITS = 128
+# gfx942 M=1 is 129 BN16 tiles. 64 splits leave one workgroup with 3 tiles,
+# and that group sets the latency. 65 caps every group at 2. 128 splits
+# widened the merge and lost.
+_GFX942_TINY_SPLITS = 65
 # Decode band ceilings on ``base_programs``, as (128-split, 64-split), for a
 # narrow (D <= 128) and a wide (D > 128) KV head. A narrower head is less work
 # per program, so the grid needs more programs before it covers the machine
