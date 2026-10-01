@@ -28,8 +28,10 @@ constexpr int kLargeKThreshold     = 8192;
 constexpr int kSmallKStepsPerBlock = 2;
 constexpr int kLargeKStepsPerBlock = 3;
 constexpr uintptr_t kOutputAlignment = 16;
-// _hadamard32_np().astype(bfloat16), represented exactly as fp32.
-constexpr float kHadamard32Norm = 0.1767578125f;
+// 1/sqrt(32) at fp32 precision, so the rotation is orthonormal to fp32 rounding and the GEMM
+// product of two rotated operands is scaled by 32 c^2 = 1 - O(1e-8). (Previously bf16-rounded,
+// 0.1767578125, which scaled every product by 0.99979.)
+constexpr float kHadamard32Norm = 0.17677669529663687f;
 // Shift groups above 2^123 before the unnormalized butterfly, whose worst-case
 // growth is 32x. The output scale exponent is biased back before storage.
 constexpr int kHadamardSafetyShift = 3;

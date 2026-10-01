@@ -214,6 +214,15 @@ def _hadamard32_np() -> np.ndarray:
 
 
 _HAD32_NP = _hadamard32_np()
+# The device-side rotation runs the unnormalised +-1 Hadamard (exact in bf16, summed in fp32)
+# and then one fp32 multiply by 1/sqrt(32), exactly as the HIP packers do. Rounding the
+# normalised matrix to bf16 instead would scale every rotated value by bf16(1/sqrt 32)*sqrt 32
+# and every GEMM product of two rotated operands by 0.99979.
+_HAD32_NORM = float(np.float32(1.0 / np.sqrt(float(_SCALE_GROUP_SIZE))))
+# The +-1 matrix is applied as +-1/32 (a power of two, exact in bf16) so the intermediate stays
+# within |x| like the old normalised matrix did, and the remaining factor 32 * c is applied after.
+# Both scalings are exact, so the result equals (sum of +-x) * c bit for bit.
+_HAD32_POST = 32.0 * _HAD32_NORM
 _HAD32_T: dict[torch.device, Tensor] = {}
 _HADAMARD_SAFETY_THRESHOLD = float.fromhex("0x1p123")
 _HADAMARD_SAFETY_SHIFT = 3.0
@@ -222,18 +231,19 @@ _HADAMARD_SAFETY_SHIFT = 3.0
 def _had32_t(device: torch.device) -> Tensor:
     t = _HAD32_T.get(device)
     if t is None:
-        t = torch.from_numpy(_HAD32_NP).to(device)
+        t = torch.from_numpy(np.sign(_HAD32_NP).astype(np.float32) / 32.0).to(device)  # +-1/32
         _HAD32_T[device] = t
     return t
 
 
 def _rotate_k32_torch(x: Tensor) -> Tensor:
-    """Block-diagonal 32x32 Hadamard along the (contiguous) K axis. Rounds H to bf16
-    to mirror the fused kernel's bf16 dot (both: bf16 operands, fp32 accumulate)."""
+    """Block-diagonal 32x32 Hadamard along the (contiguous) K axis: the +-1 butterfly
+    summed in fp32 (applied as +-1/32), then one fp32 multiply, equal to the HIP packers'
+    (sum of +-x) * fp32(1/sqrt 32)."""
     R, K = x.shape
-    h = _had32_t(x.device).to(torch.bfloat16).float()
+    h = _had32_t(x.device)
     return (
-        x.float().reshape(R, K // _SCALE_GROUP_SIZE, _SCALE_GROUP_SIZE) @ h
+        (x.float().reshape(R, K // _SCALE_GROUP_SIZE, _SCALE_GROUP_SIZE) @ h) * _HAD32_POST
     ).reshape(R, K)
 
 
@@ -248,8 +258,8 @@ def _rotate_k32_quant_work(x: Tensor) -> tuple[Tensor, Tensor]:
         0.0,
     )
     work = blocks * torch.exp2(-safety_shift).unsqueeze(-1)
-    h = _had32_t(x.device).to(torch.bfloat16).float()
-    return (work @ h).reshape(R, K), safety_shift
+    h = _had32_t(x.device)
+    return ((work @ h) * _HAD32_POST).reshape(R, K), safety_shift
 
 
 def _rotate_k32_np(x: np.ndarray) -> np.ndarray:
@@ -319,7 +329,8 @@ if _HAS_TRITON:
         h = tl.load(
             h_ptr + tl.arange(0, 32)[:, None] * 32 + tl.arange(0, 32)[None, :]
         ).to(tl.bfloat16)
-        xall = tl.dot(xall.to(tl.bfloat16), h)
+        # h is +-1/32 (exact in bf16); fp32 accumulate; then 32 * fp32(1/sqrt 32).
+        xall = tl.dot(xall.to(tl.bfloat16), h) * 5.656854152679443
         amax = tl.max(tl.abs(xall), 1)
         safe = tl.maximum(amax, 1e-30)
         se = tl.minimum(tl.maximum(tl.floor(tl.log2(safe)) - 2.0, -127.0), 127.0)
@@ -404,7 +415,8 @@ if _HAS_TRITON:
         h = tl.load(
             h_ptr + tl.arange(0, 32)[:, None] * 32 + tl.arange(0, 32)[None, :]
         ).to(tl.bfloat16)
-        xall = tl.dot(xall.to(tl.bfloat16), h)
+        # h is +-1/32 (exact in bf16); fp32 accumulate; then 32 * fp32(1/sqrt 32).
+        xall = tl.dot(xall.to(tl.bfloat16), h) * 5.656854152679443
         amax = tl.max(tl.abs(xall), 1)
         safe = tl.maximum(amax, 1e-30)
         se = tl.minimum(tl.maximum(tl.floor(tl.log2(safe)) - 2.0, -127.0), 127.0)
