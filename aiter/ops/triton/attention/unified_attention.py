@@ -198,8 +198,6 @@ def unified_attention(
     # backend
     backend: str | None = None,  # "triton" | "gluon"
 ):
-    assert causal, "Only causal attention is supported"
-
     if backend is None:
         backend = "gluon" if _is_gluon_available() else "triton"
     backend = backend.lower()
@@ -588,6 +586,7 @@ def _unified_attention_2d_triton(params: _UAParams):
         ALL_DECODE=params.all_decode,
         SHUFFLED_KV_CACHE=params.shuffled_kv_cache,
         K_WIDTH=params.k_width,
+        CAUSAL=params.causal,
         **config,
     )
 
@@ -667,6 +666,7 @@ def _unified_attention_3d_triton(
         IS_KV_FP8=(params.kv_cache_dtype == e4m3_dtype),
         NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
         TILE_SIZE=TILE_SIZE,
+        CAUSAL=params.causal,
         **config,
     )
 
