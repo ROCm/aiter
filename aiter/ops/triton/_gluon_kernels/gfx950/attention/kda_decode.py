@@ -310,13 +310,11 @@ def fused_recurrent_kda_packed_decode_kernel(
     else:
         seed = 0
         slot = i_n
-    if PAD_SLOT_GUARD:  # noqa: SIM102 (constexpr guard, runtime test)
+    if PAD_SLOT_GUARD:
         if slot <= 0:
-            gl.store(
-                o_p + off_o,
-                gl.full([V], 0.0, o_ptr.dtype.element_ty, OUT),
-                mask=off_o < n_tok * V,
-            )
+            zero = gl.full([V], 0.0, o_ptr.dtype.element_ty, OUT)
+            for t in range(n_tok):
+                gl.store(o_p + t * stride_o_token + off_o, zero)
             return
 
     if USE_INITIAL_STATE:
@@ -576,7 +574,7 @@ def get_kda_config(
     num_seq_heads = num_seqs * HV
     aligned = K % 32 == 0 and V % 32 == 0
     if fused:
-        multi = avg_T > 1 and num_seq_heads < 3072 and "fused_t_gt1" in tuned
+        multi = avg_T > 1 and num_seq_heads < 3072
         bucket = "fused_t_gt1" if multi else "fused"
     elif avg_T > 1:
         if aligned and num_seq_heads >= 3072 and V % 128 == 0:

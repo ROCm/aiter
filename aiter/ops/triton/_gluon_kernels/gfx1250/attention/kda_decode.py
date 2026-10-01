@@ -222,6 +222,7 @@ def _conv_qkv_load(
 
 @gluon.jit
 def _conv_qkv_roll(q_ptr, k_ptr, v_ptr, loads):
+    """Advance each q/k/v conv window one token in registers; load the next input."""
     rolled = ()
     for qkv in gl.static_range(3):
         x, _h0, h1, h2, w0, w1, w2, w3, hist_off, mask, x_off = loads[qkv]
@@ -258,6 +259,7 @@ def _conv_qkv_finish(
     K_LAYOUT: gl.constexpr,
     V_LAYOUT: gl.constexpr,
 ):
+    """Causal conv + SiLU of q/k/v; the input goes to tap pos, ROLL shifts the taps."""
     conv_out = ()
     for qkv in gl.static_range(3):
         x, h0, h1, h2, w0, w1, w2, w3, hist_off, mask, _x_off = loads[qkv]
@@ -1000,8 +1002,7 @@ def get_kda_config(
     num_seq_heads = num_seqs * HV
     aligned = K % 32 == 0 and V % 32 == 0
     if fused:
-        multi = avg_T > 1 and num_seq_heads < 3072 and "fused_t_gt1" in tuned
-        bucket = "fused_t_gt1" if multi else "fused"
+        bucket = "fused"
     elif avg_T > 1:
         if aligned and num_seq_heads >= 3072 and V % 128 == 0:
             bucket = "t_gt1_seq_heads_geq_3072"

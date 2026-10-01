@@ -26,7 +26,7 @@ pytestmark = pytest.mark.skipif(
 gfx1250_only = pytest.mark.skipif(arch != "gfx1250", reason="gfx1250-only feature")
 
 
-def skip_on_gfx950(D=128, spec=False):
+def skip_on_gfx950(D=128):
     if arch == "gfx950" and D != 128:
         pytest.skip("gfx950 KDA decode needs head_dim 128")
 
@@ -443,7 +443,6 @@ def test_fused_recurrent_varlen(lens):
 @pytest.mark.parametrize("spec", [False, True])
 def test_fused_recurrent_vllm_decode(B, T, spec):
     """Continuous batching with paged state, poisoning untouched slots."""
-    skip_on_gfx950(spec=spec)
     H, D = 8, 128
     pool_kv, indices, untouched = make_pool(B, T, H, D)
 
@@ -1324,8 +1323,7 @@ def test_pad_slot_guard():
         assert_close(f"o[{n}]", ref, o[:, b:e])
         assert_close(f"ht[{n}]", ref_ht[0], pool_out[int(indices[n, T - 1])])
 
-    assert torch.all(o[:, T] == 0), "pad seq token 0 must be zeroed"
-    assert torch.all(o[:, T + 1 : 2 * T] == 123.0), "pad seq must not be computed"
+    assert torch.all(o[:, T : 2 * T] == 0), "every pad seq token must be zeroed"
     assert torch.all(pool_out[0] == POISON), "the pad slot was written"
 
 
@@ -1501,14 +1499,11 @@ def test_fused_conv_rms_gate(N, T, H):
 
 
 @pytest.mark.parametrize("N, k", [(3, 3), (2, 7), (5, 1)])
-@pytest.mark.parametrize(
-    "config", [None, {"use_tdm_load": False, "use_tdm_store": False}]
-)
-def test_fused_conv_rms_gate_spec(N, k, config):
+@pytest.mark.parametrize("padded", [False, True])
+def test_fused_conv_rms_gate_spec(N, k, padded):
     """vLLM's spec conv window: W-1+k taps in slot column 0, read from
-    num_accepted-1; the step leaves taps 1..W-2 followed by its inputs."""
-    if config is not None and arch != "gfx1250":
-        pytest.skip("TDM load/store is gfx1250-only")
+    num_accepted-1; the step leaves taps 1..W-2 followed by its inputs. A padded
+    sequence (slot 0) zeroes all of its tokens and writes no state."""
     D, W, eps, lb, H = 128, 4, 1e-6, -5.0, 8
     T = k + 1
     lp, TT, NS = H * D, N * T, N * T + 4
@@ -1525,6 +1520,8 @@ def test_fused_conv_rms_gate_spec(N, k, config):
     S = torch.randn(NS, H, D, D, dtype=torch.float32, device=DEVICE) * 0.01
     nw = torch.rand(D, dtype=torch.float32, device=DEVICE) + 0.5
     idx = (torch.randperm(NS - 1, device=DEVICE)[:TT] + 1).int().view(N, T)
+    if padded:
+        idx[0] = 0
     acc = torch.randint(1, T + 1, (N,), dtype=torch.int32, device=DEVICE)
     kw = {
         "g": g,
@@ -1552,14 +1549,16 @@ def test_fused_conv_rms_gate_spec(N, k, config):
         out_gate=og,
         norm_weight=nw,
         norm_eps=eps,
-        config=config,
+        out=torch.full_like(og, float("nan")),
         **kw,
     )
     # reference: torch conv under vLLM's window rules, then the recurrence alone
     x, w, S2, cs2 = mixed.float(), cw.float(), S.clone(), cs.clone()
-    y = torch.empty(TT, 3 * lp, device=DEVICE)
+    y = torch.zeros(TT, 3 * lp, device=DEVICE)
     for n in range(N):
         c, off, rows = int(idx[n, 0]), int(acc[n]) - 1, slice(n * T, (n + 1) * T)
+        if c == 0:
+            continue
         h = cs2[c].float()
         taps = h[:, off : off + W - 1]
         for t in range(T):
@@ -1576,6 +1575,7 @@ def test_fused_conv_rms_gate_spec(N, k, config):
     ref = ob * torch.rsqrt(ob.square().mean(-1, keepdim=True) + eps) * nw
     ref = ref * torch.sigmoid(og.float())
     assert torch.equal(cs1, cs2), "conv window"
+    assert not padded or o1[0, :T].eq(0).all(), "padded sequence output"
     assert_close("o", ref, o1)
     assert_close("ht", S2, S1)
 

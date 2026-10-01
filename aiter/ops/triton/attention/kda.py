@@ -131,9 +131,6 @@ def fused_recurrent_kda(
         assert conv_state.shape[1] == 3 * H * K and HV * V == H * K
         if num_accepted_tokens is None:
             assert conv_state.shape[2] == W - 1
-        else:
-            # vLLM's spec window: W-1+k inputs, taps start at num_accepted-1
-            assert conv_state.shape[2] >= W - 1
     if use_rms_gate:
         assert out_gate.shape == v.shape and out_gate.stride()[2:] == (V, 1)
         assert B == 1 or out_gate.stride(0) == T * out_gate.stride(1)
@@ -234,6 +231,13 @@ def fused_recurrent_kda(
     else:
         stride_indices_seq = 1
         assert num_accepted_tokens is None, "spec decoding requires ssm_state_indices"
+
+    if use_conv and num_accepted_tokens is not None:
+        # spec window: taps read from num_accepted-1 (< T); token t lands at W-2+t
+        max_tok = ssm_state_indices.shape[1] if ssm_state_indices.ndim > 1 else 1
+        assert (
+            conv_state.shape[2] >= W - 2 + max_tok
+        ), f"spec conv_state needs {W - 2 + max_tok} taps, got {conv_state.shape[2]}"
 
     if initial_state is not None:
         assert initial_state.dtype == torch.float32
