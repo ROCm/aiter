@@ -42,13 +42,16 @@ def compile_flydsl_fhmoe_stage1(
     k_wave: int = 1,
     v2_output_layout: bool = False,
     shared_expert_id: int = -1,
+    clamp_shared: bool = True,
 ):
     """Compile the heterogeneous stage1 kernel."""
     from .kernels.fhmoe import compile_mixed_fhmoe_gemm1
     from .moe_common import GateMode
 
-    if b_dtype != "fp4":
-        raise ValueError(f"FHMoE stage1 requires routed MXFP4 weights, got {b_dtype}")
+    if b_dtype not in ("fp4", "fp8"):
+        raise ValueError(
+            f"FHMoE stage1 requires routed MXFP4 or MXFP8 weights, got {b_dtype}"
+        )
     return compile_mixed_fhmoe_gemm1(
         model_dim=model_dim,
         inter_dim=inter_dim,
@@ -76,6 +79,7 @@ def compile_flydsl_fhmoe_stage1(
         k_wave=k_wave,
         v2_output_layout=v2_output_layout,
         shared_expert_id=shared_expert_id,
+        clamp_shared=clamp_shared,
     )
 
 
@@ -108,8 +112,10 @@ def compile_flydsl_fhmoe_stage2(
     """Compile the heterogeneous stage2 kernel."""
     from .kernels.fhmoe import compile_mixed_fhmoe_gemm2
 
-    if b_dtype != "fp4":
-        raise ValueError(f"FHMoE stage2 requires routed MXFP4 weights, got {b_dtype}")
+    if b_dtype not in ("fp4", "fp8"):
+        raise ValueError(
+            f"FHMoE stage2 requires routed MXFP4 or MXFP8 weights, got {b_dtype}"
+        )
     return compile_mixed_fhmoe_gemm2(
         model_dim=model_dim,
         inter_dim=inter_dim,
@@ -291,11 +297,13 @@ def flydsl_fhmoe_stage1(
     shared_w1: torch.Tensor,
     shared_w1_scale: torch.Tensor,
     shared_expert_id: int,
+    clamp_shared: bool = True,
 ):
-    """Run stage1 with MXFP4 routed experts and one FP8 shared expert."""
+    """Run stage1 with MXFP4/MXFP8 routed and separately stored FP8 shared weights."""
     compile_kernel = functools.partial(
         compile_flydsl_fhmoe_stage1,
         shared_expert_id=shared_expert_id,
+        clamp_shared=clamp_shared,
     )
     build_mx_args = functools.partial(
         _s1_args_fhmoe,
@@ -376,7 +384,7 @@ def flydsl_fhmoe_stage2(
     shared_w2_scale: torch.Tensor,
     shared_expert_id: int,
 ) -> torch.Tensor:
-    """Run stage2 with MXFP4 routed experts and one FP8 shared expert."""
+    """Run stage2 with MXFP4/MXFP8 routed and separately stored FP8 shared weights."""
     compile_kernel = functools.partial(
         compile_flydsl_fhmoe_stage2,
         shared_expert_id=shared_expert_id,

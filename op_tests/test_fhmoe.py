@@ -3,8 +3,11 @@
 
 """Correctness oracle for fused heterogeneous MoE (FHMoE).
 
-The default case is deliberately small. Set AITER_HETERO_MOE_DSV4=1 to use
-the exact DeepSeek-V4-Pro TP8 dimensions; that profile allocates several GiB.
+The generic MXFP4 case is deliberately small. Dedicated MXFP8 tests use the
+production HY4 TP8 dimensions (6144x256, E=257) and allocate several GiB.
+Set AITER_HETERO_MOE_DSV4=1 to run the generic path with exact
+DeepSeek-V4-Pro TP8 dimensions, or AITER_HETERO_MOE_HY4=1 to use HY4
+dimensions there as well.
 Set AITER_HETERO_MOE_FULL_SWEEP=1 to cover M=1,4,8,16,24,32,40,64 and
 AITER_HETERO_MOE_STRESS_REPEATS=500 to stress both stage-2 epilogues and
 bound the default atomic path's run-to-run variation.
@@ -33,6 +36,7 @@ from aiter.ops.shuffle import (
     shuffle_weight,
     shuffle_weight_a16w4,
 )
+from aiter.ops.triton.quant import dynamic_mxfp8_quant
 from aiter.utility import fp4_utils
 from aiter.utility.mx_types import MxDtypeInt
 
@@ -64,6 +68,7 @@ class _Weights:
     raw_routed_w2: torch.Tensor
     raw_routed_s1: torch.Tensor
     raw_routed_s2: torch.Tensor
+    routed_expert_ids: tuple[int, ...]
     shared_w1: torch.Tensor
     shared_w2: torch.Tensor
     shared_s1: torch.Tensor
@@ -79,9 +84,16 @@ class _Weights:
 
 
 def _profile() -> _Profile:
+    if os.environ.get("AITER_HETERO_MOE_HY4", "0") == "1":
+        return _Profile(6144, 256, 256, 257, 8)
     if os.environ.get("AITER_HETERO_MOE_DSV4", "0") == "1":
         return _Profile(7168, 384, 384, 385, 6)
     return _Profile(256, 128, 128, 9, 2)
+
+
+def _mxfp8_profile() -> _Profile:
+    """The production contract for MXFP8 routed and FP8 shared experts."""
+    return _Profile(6144, 256, 256, 257, 8)
 
 
 def _m_values() -> list[int]:
@@ -92,6 +104,10 @@ def _m_values() -> list[int]:
 
 def _swiglu_limit(profile: _Profile) -> float:
     return 10.0
+
+
+def _shared_swiglu_limit(swiglu_limit: float, *, clamp_shared: bool) -> float:
+    return swiglu_limit if clamp_shared else float("inf")
 
 
 def _rel_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
@@ -275,11 +291,11 @@ def _make_routed_weights(
     w2 = w2_u8.view(dtypes.fp4x2)
     s1 = s1_u8.view(dtypes.fp8_e8m0)
     s2 = s2_u8.view(dtypes.fp8_e8m0)
-    active = slice(0, profile.routed_topk)
-    raw_w1 = w1[active].clone()
-    raw_w2 = w2[active].clone()
-    raw_s1 = s1[active].clone()
-    raw_s2 = s2[active].clone()
+    routed_expert_ids = tuple(range(profile.routed_topk))
+    raw_w1 = w1[: profile.routed_topk].clone()
+    raw_w2 = w2[: profile.routed_topk].clone()
+    raw_s1 = s1[: profile.routed_topk].clone()
+    raw_s2 = s2[: profile.routed_topk].clone()
     return (
         *_shuffle_w1(w1, s1, interleave),
         *_shuffle_w2(w2, s2, interleave),
@@ -287,12 +303,72 @@ def _make_routed_weights(
         raw_w2,
         raw_s1,
         raw_s2,
+        routed_expert_ids,
     )
 
 
-def _build_weights(profile: _Profile, interleave: bool) -> _Weights:
+def _make_mxfp8_routed_weights(
+    profile: _Profile,
+    device: torch.device,
+    interleave: bool = True,
+) -> tuple:
+    h = profile.hidden
+    i = profile.inter
+    e = profile.experts
+    generator = torch.Generator(device=device).manual_seed(29)
+
+    w1 = torch.zeros((e, 2 * i, h), dtype=dtypes.fp8, device=device)
+    w2 = torch.zeros((e, h, i), dtype=dtypes.fp8, device=device)
+    s1_u8 = torch.full((e, 2 * i, h // 32), 0x7F, dtype=torch.uint8, device=device)
+    s2_u8 = torch.full((e, h, i // 32), 0x7F, dtype=torch.uint8, device=device)
+
+    routed_expert_ids = (
+        (0, 1, 7, 8, 127, 128, 254, 255)
+        if (profile.experts, profile.routed_topk) == (257, 8)
+        else tuple(range(profile.routed_topk))
+    )
+    for slot, expert_id in enumerate(routed_expert_ids):
+        scale = 0.02 + 0.005 * slot
+        dense_w1 = (
+            torch.randn((1, 2 * i, h), generator=generator, device=device) * scale
+        ).to(dtypes.bf16)
+        dense_w2 = (
+            torch.randn((1, h, i), generator=generator, device=device) * scale
+        ).to(dtypes.bf16)
+        if profile.intermediate_pad:
+            dense_w1[:, profile.logical_inter : i] = 0
+            dense_w1[:, i + profile.logical_inter :] = 0
+            dense_w2[:, :, profile.logical_inter :] = 0
+        quant_w1, quant_s1 = dynamic_mxfp8_quant(dense_w1, quant_dtype=dtypes.fp8)
+        quant_w2, quant_s2 = dynamic_mxfp8_quant(dense_w2, quant_dtype=dtypes.fp8)
+        w1[expert_id].copy_(quant_w1[0])
+        w2[expert_id].copy_(quant_w2[0])
+        s1_u8[expert_id].copy_(quant_s1[0])
+        s2_u8[expert_id].copy_(quant_s2[0])
+
+    s1 = s1_u8.view(dtypes.fp8_e8m0)
+    s2 = s2_u8.view(dtypes.fp8_e8m0)
+    active = torch.tensor(routed_expert_ids, dtype=torch.long, device=device)
+    raw_w1 = w1.index_select(0, active).clone()
+    raw_w2 = w2.index_select(0, active).clone()
+    raw_s1 = s1.index_select(0, active).clone()
+    raw_s2 = s2.index_select(0, active).clone()
+    return (
+        *_shuffle_w1(w1, s1, interleave),
+        *_shuffle_w2(w2, s2, interleave),
+        raw_w1,
+        raw_w2,
+        raw_s1,
+        raw_s2,
+        routed_expert_ids,
+    )
+
+
+def _build_weights(
+    profile: _Profile, interleave: bool, *, routed_mxfp8: bool = False
+) -> _Weights:
     if get_gfx() != "gfx950":
-        pytest.skip("heterogeneous MXFP4/FP8 MoE requires gfx950")
+        pytest.skip("heterogeneous MXFP4/FP8 or MXFP8/FP8 MoE requires gfx950")
     if "shared_w1" not in inspect.signature(fused_moe).parameters:
         pytest.fail("AITER fused_moe is missing the heterogeneous shared arguments")
 
@@ -306,7 +382,12 @@ def _build_weights(profile: _Profile, interleave: bool) -> _Weights:
         raw_routed_w2,
         raw_routed_s1,
         raw_routed_s2,
-    ) = _make_routed_weights(profile, device, interleave)
+        routed_expert_ids,
+    ) = (
+        _make_mxfp8_routed_weights(profile, device, interleave)
+        if routed_mxfp8
+        else _make_routed_weights(profile, device, interleave)
+    )
     (
         shared_w1,
         shared_w2,
@@ -330,6 +411,7 @@ def _build_weights(profile: _Profile, interleave: bool) -> _Weights:
         raw_routed_w2,
         raw_routed_s1,
         raw_routed_s2,
+        routed_expert_ids,
         shared_w1,
         shared_w2,
         shared_s1,
@@ -356,7 +438,17 @@ def a4_weights() -> _Weights:
     return _build_weights(profile, interleave=False)
 
 
-def _route_inputs(profile: _Profile, m: int, device: torch.device) -> tuple:
+@pytest.fixture(scope="module")
+def mxfp8_weights() -> _Weights:
+    return _build_weights(_mxfp8_profile(), interleave=True, routed_mxfp8=True)
+
+
+def _route_inputs(
+    profile: _Profile,
+    m: int,
+    device: torch.device,
+    routed_expert_ids: tuple[int, ...] | None = None,
+) -> tuple:
     hidden_generator = torch.Generator(device=device).manual_seed(41 + m)
     hidden = torch.randn(
         (m, profile.hidden),
@@ -368,7 +460,13 @@ def _route_inputs(profile: _Profile, m: int, device: torch.device) -> tuple:
     slot = torch.arange(profile.routed_topk, device=device, dtype=dtypes.i32).unsqueeze(
         0
     )
-    routed_ids = (row + slot) % profile.routed_topk
+    active_ids = torch.tensor(
+        routed_expert_ids or tuple(range(profile.routed_topk)),
+        device=device,
+        dtype=dtypes.i32,
+    )
+    assert active_ids.numel() == profile.routed_topk
+    routed_ids = active_ids[(row + slot) % profile.routed_topk]
     raw_weights = torch.arange(
         1,
         profile.routed_topk + 1,
@@ -413,11 +511,18 @@ def _run_composed_oracle(
     profile: _Profile,
     weights: _Weights,
     m: int,
+    *,
+    clamp_shared: bool,
+    swiglu_limit: float = 10.0,
 ) -> tuple[torch.Tensor, torch.Tensor, dict]:
     hidden, routed_weight, routed_ids, all_weight, all_ids = _route_inputs(
-        profile, m, weights.routed_w1.device
+        profile,
+        m,
+        weights.routed_w1.device,
+        weights.routed_expert_ids,
     )
     hetero_kwargs = _common_kwargs(profile, weights.routed_s1, weights.routed_s2)
+    hetero_kwargs["swiglu_limit"] = swiglu_limit
     hetero_kwargs.update(
         shared_w1=weights.shared_w1,
         shared_w2=weights.shared_w2,
@@ -439,13 +544,15 @@ def _run_composed_oracle(
     routed_w2 = _mark_shuffled(weights.routed_w2[:routed_e])
     routed_s1 = weights.routed_s1[: routed_e * 2 * profile.inter]
     routed_s2 = weights.routed_s2[: routed_e * profile.hidden]
+    routed_kwargs = _common_kwargs(profile, routed_s1, routed_s2)
+    routed_kwargs["swiglu_limit"] = swiglu_limit
     routed_out = fused_moe(
         hidden,
         routed_w1,
         routed_w2,
         routed_weight,
         routed_ids,
-        **_common_kwargs(profile, routed_s1, routed_s2),
+        **routed_kwargs,
     )
 
     shared_ids = torch.zeros((m, 1), dtype=dtypes.i32, device=hidden.device)
@@ -457,13 +564,17 @@ def _run_composed_oracle(
         1,
         1,
     )
+    shared_kwargs = _common_kwargs(native_profile, weights.native_s1, weights.native_s2)
+    shared_kwargs["swiglu_limit"] = _shared_swiglu_limit(
+        swiglu_limit, clamp_shared=clamp_shared
+    )
     shared_out = fused_moe(
         hidden,
         weights.native_w1,
         weights.native_w2,
         shared_weight,
         shared_ids,
-        **_common_kwargs(native_profile, weights.native_s1, weights.native_s2),
+        **shared_kwargs,
     )
     return (
         actual,
@@ -477,6 +588,8 @@ def _run_composed_oracle(
             "hetero_kwargs": hetero_kwargs,
             "routed_out": routed_out,
             "shared_out": shared_out,
+            "clamp_shared": clamp_shared,
+            "swiglu_limit": swiglu_limit,
         },
     )
 
@@ -526,9 +639,14 @@ def _torch_routed_reference(
     profile: _Profile,
     activation_quantization: str = "fp8",
 ) -> torch.Tensor:
-    """Dequantized FP32 reference for the routed A8W4 experts."""
-    w1 = _dequant_fp4_weight(weights.raw_routed_w1, weights.raw_routed_s1)
-    w2 = _dequant_fp4_weight(weights.raw_routed_w2, weights.raw_routed_s2)
+    """Dequantized FP32 reference for routed MXFP4 or MXFP8 experts."""
+    dequant_weight = (
+        _dequant_fp8_weight
+        if weights.raw_routed_w1.dtype == dtypes.fp8
+        else _dequant_fp4_weight
+    )
+    w1 = dequant_weight(weights.raw_routed_w1, weights.raw_routed_s1)
+    w2 = dequant_weight(weights.raw_routed_w2, weights.raw_routed_s2)
     x = _activation_quant_dequant(hidden.float(), activation_quantization)
     expanded_x = x[:, None, :].expand(-1, profile.routed_topk, -1)
     slot_out = torch.zeros(
@@ -537,11 +655,11 @@ def _torch_routed_reference(
         device=hidden.device,
     )
 
-    for expert_id in range(profile.routed_topk):
+    for weight_index, expert_id in enumerate(weights.routed_expert_ids):
         mask = routed_ids == expert_id
         if not mask.any():
             continue
-        gate_up = F.linear(expanded_x[mask], w1[expert_id])
+        gate_up = F.linear(expanded_x[mask], w1[weight_index])
         gate, up = gate_up.chunk(2, dim=-1)
         limit = _swiglu_limit(profile)
         gate = gate.clamp(max=limit)
@@ -550,7 +668,7 @@ def _torch_routed_reference(
         if activation_quantization == "fp8":
             inter = inter.to(dtypes.bf16).float()
         inter = _activation_quant_dequant(inter, activation_quantization)
-        slot_out[mask] = F.linear(inter, w2[expert_id])
+        slot_out[mask] = F.linear(inter, w2[weight_index])
 
     return (slot_out * routed_weight[..., None]).sum(dim=1)
 
@@ -596,7 +714,12 @@ def _torch_heterogeneous_reference(
         profile,
     )
     shared = _torch_shared_reference(
-        context["hidden"], weights, 32, _swiglu_limit(profile)
+        context["hidden"],
+        weights,
+        32,
+        _shared_swiglu_limit(
+            context["swiglu_limit"], clamp_shared=context["clamp_shared"]
+        ),
     )
     return routed + shared, routed, shared
 
@@ -610,7 +733,9 @@ def test_heterogeneous_moe_matches_precision_oracles(
     profile = _profile()
     monkeypatch.setenv("AITER_BF16_FP8_MOE_BOUND", "0")
     monkeypatch.setenv("AITER_FLYDSL_FORCE_REDUCE", "1")
-    forced, unfused, context = _run_composed_oracle(profile, weights, m)
+    forced, unfused, context = _run_composed_oracle(
+        profile, weights, m, clamp_shared=True
+    )
     stress_repeats = int(os.environ.get("AITER_HETERO_MOE_STRESS_REPEATS", "1"))
     assert stress_repeats > 0
     for repeat in range(stress_repeats):
@@ -727,16 +852,260 @@ def test_heterogeneous_moe_matches_precision_oracles(
         atomic_cosine <= 1e-3
     ), f"default atomic FP32 cosine distance: {atomic_cosine:.3e}"
 
-    limit = _swiglu_limit(profile)
-    golden = _torch_shared_reference(context["hidden"], weights, None, limit)
-    per_32 = _torch_shared_reference(context["hidden"], weights, 32, limit)
-    per_128 = _torch_shared_reference(context["hidden"], weights, 128, limit)
+    shared_limit = _shared_swiglu_limit(
+        context["swiglu_limit"], clamp_shared=context["clamp_shared"]
+    )
+    golden = _torch_shared_reference(context["hidden"], weights, None, shared_limit)
+    per_32 = _torch_shared_reference(context["hidden"], weights, 32, shared_limit)
+    per_128 = _torch_shared_reference(context["hidden"], weights, 128, shared_limit)
     error_32 = _rel_l2(per_32, golden)
     error_128 = _rel_l2(per_128, golden)
     assert error_32 <= error_128 + 5e-4, (
         "per-32 heterogeneous activation quantization regressed against native "
         f"per-128 FP8: {error_32=:.3e}, {error_128=:.3e}"
     )
+
+
+def test_mxfp8_routed_fp8_shared_heterogeneous_path(
+    monkeypatch: pytest.MonkeyPatch,
+    mxfp8_weights: _Weights,
+):
+    """Exercise HY4 MXFP8 routed and FP8 shared experts across the ID range."""
+    profile = _mxfp8_profile()
+    assert mxfp8_weights.routed_expert_ids == (0, 1, 7, 8, 127, 128, 254, 255)
+    monkeypatch.setenv("AITER_BF16_FP8_MOE_BOUND", "0")
+    monkeypatch.setenv("AITER_FLYDSL_FORCE_REDUCE", "1")
+
+    fused, composed, context = _run_composed_oracle(
+        profile, mxfp8_weights, 4, clamp_shared=False
+    )
+    high_precision, _, _ = _torch_heterogeneous_reference(
+        profile, mxfp8_weights, context
+    )
+
+    assert torch.isfinite(fused).all()
+    fused_error = _rel_l2(fused, high_precision)
+    composed_error = _rel_l2(composed, high_precision)
+    cosine = _cosine_distance(fused, high_precision)
+    assert fused_error <= 4e-2, f"MXFP8 FHMoE FP32 error: {fused_error:.3e}"
+    # The fused and composed paths can select different tiles and reduction
+    # orders. Keep a comparative guard, but allow normal MXFP8 accumulation
+    # variance while the independent FP32 and cosine limits enforce accuracy.
+    assert fused_error <= composed_error + 2e-2, (
+        "MXFP8 FHMoE error regressed against separately scheduled routed and "
+        f"shared kernels: {fused_error=:.3e}, {composed_error=:.3e}"
+    )
+    assert cosine <= 1e-3, f"MXFP8 FHMoE cosine distance: {cosine:.3e}"
+
+    # The final routed row is a dummy placeholder for the separately supplied
+    # shared expert. Corrupt it to prove shared tiles never read routed storage.
+    dummy_w1 = mxfp8_weights.routed_w1[-1].clone()
+    dummy_w2 = mxfp8_weights.routed_w2[-1].clone()
+    try:
+        mxfp8_weights.routed_w1[-1].fill_(1)
+        mxfp8_weights.routed_w2[-1].fill_(-1)
+        corrupted_dummy_output = fused_moe(
+            context["hidden"],
+            mxfp8_weights.routed_w1,
+            mxfp8_weights.routed_w2,
+            context["all_weight"],
+            context["all_ids"],
+            **context["hetero_kwargs"],
+        )
+    finally:
+        mxfp8_weights.routed_w1[-1].copy_(dummy_w1)
+        mxfp8_weights.routed_w2[-1].copy_(dummy_w2)
+    assert torch.equal(fused, corrupted_dummy_output)
+
+
+def test_mxfp8_hy4_shared_silu_is_unclamped(
+    monkeypatch: pytest.MonkeyPatch,
+    mxfp8_weights: _Weights,
+):
+    profile = _mxfp8_profile()
+    monkeypatch.setenv("AITER_BF16_FP8_MOE_BOUND", "0")
+    monkeypatch.setenv("AITER_FLYDSL_FORCE_REDUCE", "1")
+    fused, composed, context = _run_composed_oracle(
+        profile,
+        mxfp8_weights,
+        4,
+        clamp_shared=False,
+        swiglu_limit=0.25,
+    )
+
+    half_shared_weight = context["all_weight"].clone()
+    half_shared_weight[:, profile.routed_topk] = 0.5
+    half_shared = fused_moe(
+        context["hidden"],
+        mxfp8_weights.routed_w1,
+        mxfp8_weights.routed_w2,
+        half_shared_weight,
+        context["all_ids"],
+        **context["hetero_kwargs"],
+    )
+    observed_shared = 2 * (fused.float() - half_shared.float())
+    unclamped = _torch_shared_reference(
+        context["hidden"], mxfp8_weights, 32, float("inf")
+    )
+    clamped = _torch_shared_reference(context["hidden"], mxfp8_weights, 32, 0.25)
+
+    assert _rel_l2(fused, composed) <= 4e-2
+    assert _rel_l2(unclamped, clamped) >= 1e-2
+    assert _rel_l2(observed_shared, unclamped) < _rel_l2(observed_shared, clamped)
+
+
+@pytest.mark.parametrize(
+    ("m", "stage1_fragment", "stage2_fragment"),
+    (
+        (4, "_t32", "_atomic"),
+        (4096, "_t64", "_reduce"),
+    ),
+)
+def test_mxfp8_production_decode_and_prefill_match_sampled_fp32(
+    monkeypatch: pytest.MonkeyPatch,
+    mxfp8_weights: _Weights,
+    m: int,
+    stage1_fragment: str,
+    stage2_fragment: str,
+):
+    """Numerically exercise the production atomic-decode and reduce-prefill rows."""
+    import importlib
+
+    fused_moe_module = importlib.import_module("aiter.fused_moe")
+    from aiter.jit.core import AITER_CONFIGS
+
+    profile = _mxfp8_profile()
+    config_path = Path(AITER_CONFIGS.AITER_CONFIG_FHMOE_FILE)
+    metadata = fused_moe_module.get_2stage_cfgs(
+        fused_moe_module.get_padded_M(m),
+        profile.hidden,
+        profile.inter,
+        profile.experts,
+        profile.routed_topk + 1,
+        torch.bfloat16,
+        dtypes.fp8,
+        dtypes.fp8,
+        aiter.QuantType.per_1x32,
+        True,
+        aiter.ActivationType.Silu,
+        False,
+        0,
+        0,
+        True,
+        GateMode.INTERLEAVE,
+        config_file=str(config_path),
+    )
+    assert stage1_fragment in metadata.stage1.keywords["kernelName"]
+    assert stage2_fragment in metadata.stage2.keywords["kernelName"]
+
+    monkeypatch.setenv("AITER_BF16_FP8_MOE_BOUND", "0")
+    monkeypatch.setenv("AITER_FLYDSL_FORCE_REDUCE", "0")
+    hidden, routed_weight, routed_ids, all_weight, all_ids = _route_inputs(
+        profile,
+        m,
+        mxfp8_weights.routed_w1.device,
+        mxfp8_weights.routed_expert_ids,
+    )
+    kwargs = _common_kwargs(profile, mxfp8_weights.routed_s1, mxfp8_weights.routed_s2)
+    kwargs.update(
+        shared_w1=mxfp8_weights.shared_w1,
+        shared_w2=mxfp8_weights.shared_w2,
+        shared_w1_scale=mxfp8_weights.shared_s1,
+        shared_w2_scale=mxfp8_weights.shared_s2,
+        shared_expert_id=profile.shared_id,
+    )
+    actual = fused_moe(
+        hidden,
+        mxfp8_weights.routed_w1,
+        mxfp8_weights.routed_w2,
+        all_weight,
+        all_ids,
+        **kwargs,
+    )
+
+    sample_rows = torch.tensor(
+        sorted({0, m // 2, m - 1}), dtype=torch.long, device=hidden.device
+    )
+    sample_context = {
+        "hidden": hidden.index_select(0, sample_rows),
+        "routed_weight": routed_weight.index_select(0, sample_rows),
+        "routed_ids": routed_ids.index_select(0, sample_rows),
+        "clamp_shared": False,
+        "swiglu_limit": _swiglu_limit(profile),
+    }
+    expected, _, _ = _torch_heterogeneous_reference(
+        profile, mxfp8_weights, sample_context
+    )
+    actual_sample = actual.index_select(0, sample_rows)
+
+    assert torch.isfinite(actual_sample).all()
+    assert _rel_l2(actual_sample, expected) <= 4e-2
+    assert _cosine_distance(actual_sample, expected) <= 1e-3
+
+
+def test_mxfp8_shared_k_offsets_cover_multiple_tiles(
+    monkeypatch: pytest.MonkeyPatch,
+    mxfp8_weights: _Weights,
+):
+    """Exercise multiple K tiles in both stages with the production HY4 shape.
+
+    M remains small intentionally: stage-1 H=6144 and stage-2 I=256, rather
+    than token count, are what force shared-weight loads beyond the first tile.
+    """
+    profile = _mxfp8_profile()
+    monkeypatch.setenv("AITER_BF16_FP8_MOE_BOUND", "0")
+    monkeypatch.setenv("AITER_FLYDSL_FORCE_REDUCE", "1")
+
+    fused, composed, _ = _run_composed_oracle(
+        profile, mxfp8_weights, 4, clamp_shared=False
+    )
+
+    assert torch.isfinite(fused).all()
+    assert _rel_l2(fused, composed) <= 4e-2
+
+
+def test_mxfp8_heterogeneous_path_requires_interleaved_gate(
+    mxfp8_weights: _Weights,
+):
+    profile = _mxfp8_profile()
+    hidden, _, _, all_weight, all_ids = _route_inputs(
+        profile,
+        4,
+        mxfp8_weights.routed_w1.device,
+        mxfp8_weights.routed_expert_ids,
+    )
+    kwargs = _common_kwargs(
+        profile,
+        mxfp8_weights.routed_s1,
+        mxfp8_weights.routed_s2,
+        gate_mode=GateMode.SEPARATED,
+    )
+    kwargs.update(
+        shared_w1=mxfp8_weights.shared_w1,
+        shared_w2=mxfp8_weights.shared_w2,
+        shared_w1_scale=mxfp8_weights.shared_s1,
+        shared_w2_scale=mxfp8_weights.shared_s2,
+        shared_expert_id=profile.shared_id,
+    )
+
+    with pytest.raises(ValueError, match="require interleaved gate/up layout"):
+        fused_moe(
+            hidden,
+            mxfp8_weights.routed_w1,
+            mxfp8_weights.routed_w2,
+            all_weight,
+            all_ids,
+            **kwargs,
+        )
+
+
+def test_mxfp8_heterogeneous_path_supports_non_hy4_contract():
+    profile = _Profile(256, 128, 128, 9, 2)
+    weights = _build_weights(profile, interleave=True, routed_mxfp8=True)
+    fused, composed, _ = _run_composed_oracle(profile, weights, 4, clamp_shared=True)
+
+    assert torch.isfinite(fused).all()
+    assert _rel_l2(fused, composed) <= 4e-2
 
 
 def test_no_shared_explicit_defaults_preserve_old_api_output(
@@ -839,6 +1208,10 @@ def test_heterogeneous_moe_uses_a_separate_custom_op_schema():
         "v2_output_layout" in inspect.signature(api).parameters
         for api in (flydsl_fhmoe_stage1, compile_mixed_fhmoe_gemm1)
     )
+    assert all(
+        "clamp_shared" in inspect.signature(api).parameters
+        for api in (flydsl_fhmoe_stage1, compile_mixed_fhmoe_gemm1)
+    )
     fhmoe_apis = (
         flydsl_fhmoe_stage1,
         flydsl_fhmoe_stage2,
@@ -883,6 +1256,7 @@ def test_fhmoe_runtime_compile_bridge_forwards_xcd(monkeypatch: pytest.MonkeyPat
             shared_w1=tensor,
             shared_w1_scale=tensor,
             shared_expert_id=8,
+            clamp_shared=False,
             xcd_swizzle=4,
             v2_output_layout=True,
         )
@@ -907,6 +1281,7 @@ def test_fhmoe_runtime_compile_bridge_forwards_xcd(monkeypatch: pytest.MonkeyPat
             1,
             {
                 "shared_expert_id": 8,
+                "clamp_shared": False,
                 "xcd_swizzle": 4,
                 "v2_output_layout": True,
             },
@@ -1001,7 +1376,8 @@ def test_dsv4_i384_fhmoe_capability_follows_csv(
         assert reader.fieldnames is not None
         fieldnames = reader.fieldnames
 
-    row_4096 = dict(rows[-1])
+    dsv4_rows = [row for row in rows if row["inter_dim"] == "384"]
+    row_4096 = dict(dsv4_rows[-1])
     row_4096["token"] = "4096"
     complete_path = tmp_path / "complete.csv"
     with complete_path.open("w", newline="") as config:
@@ -1028,7 +1404,7 @@ def test_dsv4_i384_fhmoe_capability_follows_csv(
     with duplicate_path.open("w", newline="") as config:
         writer = csv.DictWriter(config, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows([*rows, rows[-1]])
+        writer.writerows([*rows, dsv4_rows[-1]])
     monkeypatch.setattr(
         fhmoe, "_dsv4_i384_fhmoe_config_file", lambda: str(duplicate_path)
     )
@@ -1140,6 +1516,144 @@ def test_dsv4_i384_fhmoe_uses_dedicated_config(
     assert metadata.stage2.keywords["kernelName"] == expected_stage2
 
 
+@pytest.mark.parametrize("num_tokens", (1, 512, 4096, 16384, 32768, 131072))
+def test_hy4_mxfp8_fhmoe_uses_dedicated_config(
+    monkeypatch: pytest.MonkeyPatch,
+    num_tokens: int,
+):
+    import importlib
+
+    fused_moe_module = importlib.import_module("aiter.fused_moe")
+    config_path = Path(__file__).resolve().parents[1] / "aiter/configs/tuned_fhmoe.csv"
+    monkeypatch.setattr(fused_moe_module, "get_cu_num", lambda: 256)
+    monkeypatch.setattr(fused_moe_module, "get_gfx_runtime", lambda: "gfx950")
+    fused_moe_module.get_2stage_cfgs.cache_clear()
+    fused_moe_module.cfg_2stages_by_file.clear()
+
+    metadata = fused_moe_module.get_2stage_cfgs(
+        fused_moe_module.get_padded_M(num_tokens),
+        6144,
+        256,
+        257,
+        9,
+        torch.bfloat16,
+        dtypes.fp8,
+        dtypes.fp8,
+        aiter.QuantType.per_1x32,
+        True,
+        aiter.ActivationType.Silu,
+        False,
+        0,
+        0,
+        True,
+        GateMode.INTERLEAVE,
+        config_file=str(config_path),
+    )
+
+    assert metadata.stage1.keywords["kernelName"].startswith("flydsl_moe1_afp8_wfp8_")
+    assert metadata.stage2.keywords["kernelName"].startswith("flydsl_moe2_afp8_wfp8_")
+    assert "_layout_" not in metadata.stage2.keywords["kernelName"]
+    assert metadata.fuse_quant == "fp8"
+
+
+def test_hy4_mxfp8_fhmoe_capability(monkeypatch: pytest.MonkeyPatch):
+    import importlib
+
+    fhmoe = importlib.import_module("aiter.fhmoe")
+    fused_moe_module = importlib.import_module("aiter.fused_moe")
+    config_path = Path(__file__).resolve().parents[1] / "aiter/configs/tuned_fhmoe.csv"
+    monkeypatch.setattr(fused_moe_module, "get_cu_num", lambda: 256)
+    monkeypatch.setattr(fused_moe_module, "get_gfx_runtime", lambda: "gfx950")
+    monkeypatch.setattr(fhmoe, "_fhmoe_config_file", lambda: str(config_path))
+    fused_moe_module.get_2stage_cfgs.cache_clear()
+    fused_moe_module.cfg_2stages_by_file.clear()
+    fhmoe._supports_hy4_mxfp8_fhmoe_config.cache_clear()
+
+    assert fhmoe.supports_hy4_mxfp8_fhmoe(131072)
+    assert not fhmoe.supports_hy4_mxfp8_fhmoe(0)
+
+
+def test_hy4_mxfp8_fhmoe_capability_fails_on_missing_bucket(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    import csv
+    import importlib
+
+    fhmoe = importlib.import_module("aiter.fhmoe")
+    fused_moe_module = importlib.import_module("aiter.fused_moe")
+    source = Path(__file__).resolve().parents[1] / "aiter/configs/tuned_fhmoe.csv"
+    with source.open(newline="") as stream:
+        reader = csv.DictReader(stream)
+        assert reader.fieldnames is not None
+        rows = list(reader)
+        fields = reader.fieldnames
+    missing = tmp_path / "missing_hy4_m4096.csv"
+    with missing.open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(
+            row
+            for row in rows
+            if not (row["model_dim"] == "6144" and row["token"] == "4096")
+        )
+    monkeypatch.setattr(fused_moe_module, "get_cu_num", lambda: 256)
+    monkeypatch.setattr(fused_moe_module, "get_gfx_runtime", lambda: "gfx950")
+    monkeypatch.setattr(fhmoe, "_fhmoe_config_file", lambda: str(missing))
+    fused_moe_module.get_2stage_cfgs.cache_clear()
+    fused_moe_module.cfg_2stages_by_file.clear()
+    fhmoe._supports_hy4_mxfp8_fhmoe_config.cache_clear()
+
+    assert not fhmoe.supports_hy4_mxfp8_fhmoe(4096)
+
+
+def test_hy4_mxfp8_fhmoe_capability_rejects_wfp4_kernels(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    import csv
+    import importlib
+
+    fhmoe = importlib.import_module("aiter.fhmoe")
+    fused_moe_module = importlib.import_module("aiter.fused_moe")
+    source = Path(__file__).resolve().parents[1] / "aiter/configs/tuned_fhmoe.csv"
+    with source.open(newline="") as stream:
+        reader = csv.DictReader(stream)
+        assert reader.fieldnames is not None
+        rows = list(reader)
+        fields = reader.fieldnames
+    dsv4 = next(
+        row for row in rows if row["model_dim"] == "7168" and row["token"] == "1"
+    )
+    incompatible = tmp_path / "hy4_wfp4_kernels.csv"
+    with incompatible.open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        for row in rows:
+            updated = dict(row)
+            if row["model_dim"] == "6144" and row["token"] == "1":
+                updated["kernelName1"] = dsv4["kernelName1"]
+                updated["kernelName2"] = dsv4["kernelName2"]
+            writer.writerow(updated)
+
+    monkeypatch.setattr(fused_moe_module, "get_cu_num", lambda: 256)
+    monkeypatch.setattr(fused_moe_module, "get_gfx_runtime", lambda: "gfx950")
+    monkeypatch.setattr(fhmoe, "_fhmoe_config_file", lambda: str(incompatible))
+    fused_moe_module.get_2stage_cfgs.cache_clear()
+    fused_moe_module.cfg_2stages_by_file.clear()
+    fhmoe._supports_hy4_mxfp8_fhmoe_config.cache_clear()
+
+    assert not fhmoe.supports_hy4_mxfp8_fhmoe(1)
+
+
+def test_hy4_mxfp8_fhmoe_capability_rejects_config_bypass(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import importlib
+
+    fhmoe = importlib.import_module("aiter.fhmoe")
+    monkeypatch.setenv("AITER_BYPASS_TUNE_CONFIG", "1")
+    assert not fhmoe.supports_hy4_mxfp8_fhmoe(1)
+
+
 @pytest.mark.parametrize("num_tokens", (768, 2049))
 def test_dsv4_i384_fhmoe_config_requires_exact_bucket(
     tmp_path: Path,
@@ -1205,7 +1719,8 @@ def test_dsv4_i384_fhmoe_config_has_true_shapes():
     with ordinary_path.open(newline="") as f:
         ordinary_rows = list(csv.DictReader(f))
 
-    assert {int(row["token"]) for row in rows} == {
+    dsv4_rows = [row for row in rows if int(row["inter_dim"]) == 384]
+    assert {int(row["token"]) for row in dsv4_rows} == {
         1,
         2,
         4,
@@ -1219,13 +1734,12 @@ def test_dsv4_i384_fhmoe_config_has_true_shapes():
         1024,
         2048,
     }
-    assert all(int(row["inter_dim"]) == 384 for row in rows)
-    assert all(int(row["shared_expert_id"]) == 384 for row in rows)
-    assert all(int(row["hidden_pad"]) == 0 for row in rows)
-    assert all(int(row["intermediate_pad"]) == 0 for row in rows)
-    assert all(row["gate_mode"] == "GateMode.INTERLEAVE" for row in rows)
-    assert all(row["kernelName1"].startswith("flydsl_") for row in rows)
-    assert all(row["kernelName2"].startswith("flydsl_") for row in rows)
+    assert all(int(row["shared_expert_id"]) == 384 for row in dsv4_rows)
+    assert all(int(row["hidden_pad"]) == 0 for row in dsv4_rows)
+    assert all(int(row["intermediate_pad"]) == 0 for row in dsv4_rows)
+    assert all(row["gate_mode"] == "GateMode.INTERLEAVE" for row in dsv4_rows)
+    assert all(row["kernelName1"].startswith("flydsl_") for row in dsv4_rows)
+    assert all(row["kernelName2"].startswith("flydsl_") for row in dsv4_rows)
 
     ordinary_m16 = next(
         row
@@ -1248,7 +1762,9 @@ def test_fhmoe_aot_manifest_covers_native_i384():
     )
     config_path = Path(__file__).resolve().parents[1] / "aiter/configs/tuned_fhmoe.csv"
     ordinary_jobs = parse_csv(str(ordinary_path))
-    dedicated_jobs = parse_csv(str(config_path))
+    all_dedicated_jobs = parse_csv(str(config_path))
+    dedicated_jobs = [job for job in all_dedicated_jobs if job["inter_dim"] == 384]
+    hy4_jobs = [job for job in all_dedicated_jobs if job["inter_dim"] == 256]
     ordinary_fhmoe_jobs = [
         job for job in ordinary_jobs if job.get("shared_expert_id", -1) >= 0
     ]
@@ -1272,14 +1788,35 @@ def test_fhmoe_aot_manifest_covers_native_i384():
         1024,
         2048,
     }
-    for job in dedicated_jobs:
+    assert len(hy4_jobs) == 34
+    assert all(job["shared_expert_id"] == 256 for job in hy4_jobs)
+    assert {job["token_num"] for job in hy4_jobs} == {
+        1,
+        2,
+        4,
+        8,
+        16,
+        32,
+        64,
+        128,
+        256,
+        512,
+        1024,
+        2048,
+        4096,
+        8192,
+        16384,
+        32768,
+        131072,
+    }
+    for job in all_dedicated_jobs:
         params = get_flydsl_kernel_params(job["kernel_name"])
         assert params is not None
         assert job.get("xcd_swizzle", 0) == params.get("xcd_swizzle", 0)
         if job["stage"] == 1:
-            assert 384 % job["tile_n"] == 0
+            assert job["inter_dim"] % job["tile_n"] == 0
         else:
-            assert 384 % job["tile_k"] == 0
+            assert job["inter_dim"] % job["tile_k"] == 0
 
     m2048_names = {
         job["kernel_name"] for job in dedicated_jobs if job["token_num"] == 2048
@@ -1288,6 +1825,83 @@ def test_fhmoe_aot_manifest_covers_native_i384():
         "flydsl_moe1_afp8_wfp4_bf16_t64x128x256_w3_bnt0_gui",
         "flydsl_moe2_afp8_wfp4_bf16_t64x128x128_atomic",
     }
+
+
+def test_fhmoe_aot_csv_preserves_padding(tmp_path: Path):
+    import csv
+
+    from aiter.aot.flydsl.moe import parse_csv
+
+    source = Path(__file__).resolve().parents[1] / "aiter/configs/tuned_fhmoe.csv"
+    with source.open(newline="") as stream:
+        reader = csv.DictReader(stream)
+        assert reader.fieldnames is not None
+        row = next(
+            row for row in reader if row["model_dim"] == "6144" and row["token"] == "1"
+        )
+        fields = reader.fieldnames
+    row["hidden_pad"] = "64"
+    row["intermediate_pad"] = "128"
+    padded = tmp_path / "padded_fhmoe.csv"
+    with padded.open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        writer.writerow(row)
+
+    jobs = parse_csv(str(padded))
+    assert jobs
+    assert all(job["model_dim_pad"] == 64 for job in jobs)
+    assert all(job["inter_dim_pad"] == 128 for job in jobs)
+
+
+@pytest.mark.parametrize("stage", (1, 2))
+def test_fhmoe_aot_forwards_padding_to_compiler(
+    monkeypatch: pytest.MonkeyPatch, stage: int
+):
+    from aiter.aot.flydsl import moe as aot_moe
+
+    forwarded = {}
+
+    class Backend:
+        def build_stage1_args(self, *_args, **_kwargs):
+            return ()
+
+        def build_stage2_args(self, *_args, **_kwargs):
+            return ()
+
+        def compile_stage1(self, **kwargs):
+            forwarded.update(kwargs)
+            return object()
+
+        def compile_stage2(self, **kwargs):
+            forwarded.update(kwargs)
+            return object()
+
+    monkeypatch.setattr(aot_moe, "_run_compiled", lambda *_args: None)
+    aot_moe._precompile_to_cache(
+        stage=stage,
+        model_dim=256,
+        inter_dim=128,
+        experts=9,
+        topk=3,
+        tile_m=32,
+        tile_n=128,
+        tile_k=128,
+        a_dtype="fp8",
+        b_dtype="fp8",
+        out_dtype="bf16",
+        gate_mode="interleave",
+        mode="atomic",
+        cu_num=256,
+        token_num=1,
+        block_m=32,
+        model_dim_pad=64,
+        inter_dim_pad=128,
+        _aot_backend=Backend(),
+    )
+
+    assert forwarded["model_dim_pad"] == 64
+    assert forwarded["inter_dim_pad"] == 128
 
 
 def test_fhmoe_aot_precompile_keeps_native_i384(monkeypatch: pytest.MonkeyPatch):
@@ -1312,6 +1926,180 @@ def test_fhmoe_aot_precompile_keeps_native_i384(monkeypatch: pytest.MonkeyPatch)
 
     assert forwarded["inter_dim"] == 384
     assert forwarded["_aot_backend"].shared_expert_id == 384
+
+
+def test_fhmoe_aot_stage2_scale_size_uses_padded_inter_dim():
+    from aiter.aot.flydsl.moe import _mx_w2_scale_numel
+
+    assert _mx_w2_scale_numel(385, 7168, 384) == 385 * 7168 * (512 // 32)
+    assert _mx_w2_scale_numel(257, 6144, 256) == 257 * 6144 * (256 // 32)
+
+
+def test_fhmoe_aot_precompile_accepts_hy4_mxfp8(monkeypatch: pytest.MonkeyPatch):
+    from aiter.aot.flydsl import fhmoe as aot_fhmoe
+    from aiter.aot.flydsl import moe as aot_moe
+
+    forwarded = {}
+
+    def precompile(**kwargs):
+        forwarded.update(kwargs)
+
+    monkeypatch.setattr(aot_moe, "_precompile_to_cache", precompile)
+    aot_fhmoe.precompile_fhmoe_to_cache(
+        experts=257,
+        shared_expert_id=256,
+        a_dtype="fp8",
+        b_dtype="fp8",
+        cu_num=256,
+        stage=1,
+        model_dim=6144,
+        inter_dim=256,
+        topk=9,
+        gate_mode="interleave",
+    )
+
+    assert forwarded["b_dtype"] == "fp8"
+    assert forwarded["inter_dim"] == 256
+    assert forwarded["_aot_backend"].shared_expert_id == 256
+
+
+def test_fhmoe_aot_precompile_accepts_hy4_mxfp8_stage2(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from aiter.aot.flydsl import fhmoe as aot_fhmoe
+    from aiter.aot.flydsl import moe as aot_moe
+
+    forwarded = {}
+
+    def precompile(**kwargs):
+        forwarded.update(kwargs)
+
+    monkeypatch.setattr(aot_moe, "_precompile_to_cache", precompile)
+    aot_fhmoe.precompile_fhmoe_to_cache(
+        experts=257,
+        shared_expert_id=256,
+        a_dtype="fp8",
+        b_dtype="fp8",
+        cu_num=256,
+        stage=2,
+        model_dim=6144,
+        inter_dim=256,
+        topk=9,
+    )
+
+    assert forwarded["stage"] == 2
+    assert forwarded["b_dtype"] == "fp8"
+
+
+def test_fhmoe_aot_precompile_rejects_separated_mxfp8():
+    from aiter.aot.flydsl import fhmoe as aot_fhmoe
+
+    with pytest.raises(ValueError, match="interleaved gate/up layout"):
+        aot_fhmoe.precompile_fhmoe_to_cache(
+            experts=257,
+            shared_expert_id=256,
+            a_dtype="fp8",
+            b_dtype="fp8",
+            cu_num=256,
+            stage=1,
+            model_dim=6144,
+            inter_dim=256,
+            topk=9,
+        )
+
+
+def test_fhmoe_aot_precompile_rejects_unknown_cu_count():
+    from aiter.aot.flydsl import fhmoe as aot_fhmoe
+
+    with pytest.raises(ValueError, match="supports only gfx950"):
+        aot_fhmoe.precompile_fhmoe_to_cache(
+            experts=257,
+            shared_expert_id=256,
+            a_dtype="fp8",
+            b_dtype="fp8",
+            cu_num=999,
+            stage=2,
+            model_dim=6144,
+            inter_dim=256,
+            topk=9,
+        )
+
+
+def test_fhmoe_aot_hy4_unclamped_specialization_requires_exact_contract(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from aiter.aot.flydsl import fhmoe as aot_fhmoe
+    from aiter.ops.flydsl import fhmoe as ops_fhmoe
+
+    monkeypatch.setattr(
+        ops_fhmoe,
+        "compile_flydsl_fhmoe_stage1",
+        lambda **kwargs: kwargs,
+    )
+    backend = aot_fhmoe._FHMoEAOTBackend(shared_expert_id=256)
+    kwargs = {
+        "model_dim": 6144,
+        "inter_dim": 256,
+        "experts": 257,
+        "topk": 9,
+        "b_dtype": "fp8",
+        "model_dim_pad": 0,
+        "inter_dim_pad": 0,
+        "gate_mode": "interleave",
+        "doweight_stage1": False,
+    }
+
+    assert backend.compile_stage1(**kwargs)["clamp_shared"] is False
+    mismatches = {
+        "model_dim": 4096,
+        "inter_dim": 128,
+        "experts": 256,
+        "topk": 8,
+        "b_dtype": "fp4",
+        "model_dim_pad": 1,
+        "inter_dim_pad": 1,
+        "gate_mode": "separated",
+        "doweight_stage1": True,
+    }
+    for field, value in mismatches.items():
+        assert (
+            backend.compile_stage1(**(kwargs | {field: value}))["clamp_shared"] is True
+        )
+    assert (
+        aot_fhmoe._FHMoEAOTBackend(shared_expert_id=255).compile_stage1(**kwargs)[
+            "clamp_shared"
+        ]
+        is True
+    )
+
+
+def test_fhmoe_aot_precompile_accepts_non_hy4_mxfp8(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from aiter.aot.flydsl import fhmoe as aot_fhmoe
+    from aiter.aot.flydsl import moe as aot_moe
+
+    forwarded = {}
+
+    def precompile(**kwargs):
+        forwarded.update(kwargs)
+
+    monkeypatch.setattr(aot_moe, "_precompile_to_cache", precompile)
+    aot_fhmoe.precompile_fhmoe_to_cache(
+        experts=9,
+        shared_expert_id=8,
+        a_dtype="fp8",
+        b_dtype="fp8",
+        cu_num=256,
+        stage=1,
+        model_dim=256,
+        inter_dim=128,
+        topk=3,
+        gate_mode="interleave",
+    )
+
+    assert forwarded["b_dtype"] == "fp8"
+    assert forwarded["_aot_backend"].shared_expert_id == 8
 
 
 def test_fhmoe_aot_stage1_forwards_optional_swiglu_abi(
@@ -1432,7 +2220,10 @@ def test_a4w4_routed_fp8_shared_heterogeneous_path(
         activation_quantization="fp4",
     )
     shared_high = _torch_shared_reference(
-        hidden, a4_weights, "fp4", _swiglu_limit(profile)
+        hidden,
+        a4_weights,
+        "fp4",
+        _shared_swiglu_limit(_swiglu_limit(profile), clamp_shared=True),
     )
     assert torch.isfinite(actual).all()
     error = _rel_l2(actual, routed_high + shared_high)

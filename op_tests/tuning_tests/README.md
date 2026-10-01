@@ -38,6 +38,7 @@ runtime budgets.
 | `batched_a8w8` | `csrc/ck_batched_gemm_a8w8/batched_gemm_a8w8_tune.py` | `a8w8_tuned_batched_gemm.csv` | ✓ | ✓ |
 | `batched_bf16` | `csrc/ck_batched_gemm_bf16/batched_gemm_bf16_tune.py` | `bf16_tuned_batched_gemm.csv` | ✓ | ✓ + shape_grouped |
 | `fmoe` | `csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py` | `tuned_fmoe.csv` + model_configs | ✓ | ✓ (bf16/fp8/int8/gelu) |
+| `fhmoe` | `op_tests/tuners/tune_fhmoe.py` | `tuned_fhmoe.csv` | — | ✓ (HY4 MXFP8/FP8) |
 | `gradlib_bf16` | `gradlib/gradlib/gemm_tuner.py` | `bf16_tuned_gemm.csv` | ✓ | ✓ (hipBLASLt/ASM/FlyDSL) |
 | `gdn_k5_opt` | `csrc/gdn_k5/chunk_gdn_h_opt_tune.py` | `model_configs/*_chunk_gdn_h_opt_tuned.csv` | ✓ | ✓ (shape-only varlen smoke) |
 
@@ -65,6 +66,7 @@ python3 -m unittest op_tests.tuning_tests.test_csv_validation \
   op_tests.tuning_tests.test_mp_tuner_logic \
   op_tests.tuning_tests.test_mixed_mxfp_tuning \
   op_tests.tuning_tests.test_online_tune -v
+python3 -m pytest op_tests/tuning_tests/test_fhmoe_tuner.py -v
 
 # Level 2: pipeline smoke (~10min)
 python3 -m unittest op_tests.tuning_tests.test_tune_pipeline -v
@@ -73,12 +75,35 @@ python3 -m unittest op_tests.tuning_tests.test_tune_pipeline -v
 python3 -m unittest op_tests.tuning_tests.test_run_config -v
 
 # Everything
-python3 -m unittest discover -s op_tests/tuning_tests -v
+python3 -m pytest op_tests/tuning_tests -v
 ```
+
+### Tuning HY4 heterogeneous MoE
+
+```bash
+python op_tests/tuners/tune_fhmoe.py \
+  -i aiter/configs/tuned_fhmoe.csv \
+  -o aiter/configs/tuned_fhmoe.csv \
+  --tokens 1,2,4,8,16,32,64,128,256,512,1024,2048,4096,8192,16384,32768,131072 \
+  --profile /tmp/hy4_fhmoe_profile.csv
+```
+
+Add `--quick` for the reduced stage-1/stage-2 search used by tuning pipeline
+smoke tests. The tuner optimizes the isolated FHMoE call; only commit changed
+rows after a matched serving-level A/B test because full-model scheduling can
+favor a different kernel.
+
+Candidate error checks are baseline-relative regression guards, not independent
+oracles. Before updating each CSV row, the final selected full-M output is also
+checked against an independent FP32 reference for representative token rows
+covering boundary routed experts and the shared expert. Use
+`--sampled-reference-tolerance` to adjust that final acceptance threshold.
 
 ### Running individual tuner tests
 
-Each tuner in `test_tune_pipeline.py` has two variants: `_mp1` (single GPU) and `_mp_default` (all GPUs).
+Most tuners in `test_tune_pipeline.py` have `_mp1` (single GPU) and
+`_mp_default` (all GPUs) variants. FHMoE is gfx950-only and defines `_mp1`
+because its tuner intentionally runs on one GPU.
 
 ```bash
 # Run a specific tuner (both mp1 and mp_default)

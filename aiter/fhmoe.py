@@ -1,7 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Fused heterogeneous MoE (FHMoE) MXFP4/FP8 dispatch."""
+"""Fused heterogeneous MoE (FHMoE) MXFP4/FP8 and MXFP8/FP8 dispatch.
+
+The notation names routed/shared storage respectively. Shared ``FP8`` means
+E4M3 payloads with per-32 E8M0 block scales, stored separately from routed
+weights.
+"""
 
 import functools
 import os
@@ -50,26 +55,31 @@ def _validate_fhmoe_contract(
     inter_dim = w2.shape[2] * (model_dim // w1.shape[-1])
     if get_gfx() != "gfx950":
         raise NotImplementedError(
-            "Heterogeneous MXFP4/FP8 experts currently require gfx950"
+            "Heterogeneous MXFP4/FP8 and MXFP8/FP8 experts currently require gfx950"
         )
     if quant_type != QuantType.per_1x32:
         raise ValueError(
-            "Heterogeneous MXFP4/FP8 experts require per_1x32 quantization"
+            "Heterogeneous MXFP4/FP8 and MXFP8/FP8 experts require "
+            "per_1x32 quantization"
         )
     if activation != ActivationType.Silu:
-        raise ValueError("Heterogeneous MXFP4/FP8 experts currently require SiLU")
+        raise ValueError(
+            "Heterogeneous MXFP4/FP8 and MXFP8/FP8 experts currently require SiLU"
+        )
     if gate_mode not in (GateMode.INTERLEAVE, GateMode.SEPARATED):
         raise ValueError(
-            "Heterogeneous MXFP4/FP8 experts require interleaved or "
-            "separated gate/up weights"
+            "Heterogeneous MXFP4/FP8 and MXFP8/FP8 experts require "
+            "interleaved or separated gate/up weights"
         )
     if expert_mask is not None:
         raise NotImplementedError(
-            "Heterogeneous MXFP4/FP8 experts do not yet support expert masks"
+            "Heterogeneous MXFP4/FP8 and MXFP8/FP8 experts do not yet "
+            "support expert masks"
         )
     if bias1 is not None or bias2 is not None:
         raise NotImplementedError(
-            "Heterogeneous MXFP4/FP8 experts do not support expert biases"
+            "Heterogeneous MXFP4/FP8 and MXFP8/FP8 experts do not support "
+            "expert biases"
         )
     if shared_expert_id != E - 1:
         raise ValueError(
@@ -77,11 +87,21 @@ def _validate_fhmoe_contract(
             f"weight row and shared_expert_id == E - 1; got {shared_expert_id=} "
             f"and E={E}"
         )
-    if w1.dtype != dtypes.fp4x2 or w2.dtype != dtypes.fp4x2:
-        raise ValueError("Heterogeneous routed weights must use MXFP4")
+    if w1.dtype != w2.dtype:
+        raise ValueError(
+            "Heterogeneous routed W1/W2 must use the same dtype, got "
+            f"{w1.dtype} and {w2.dtype}"
+        )
+    if w1.dtype not in (dtypes.fp4x2, dtypes.fp8):
+        raise ValueError("Heterogeneous routed weights must use MXFP4 or MXFP8")
+    if w1.dtype == dtypes.fp8 and gate_mode != GateMode.INTERLEAVE:
+        raise ValueError(
+            "Heterogeneous MXFP8 routed weights require interleaved gate/up layout"
+        )
     if w1.shape[1] != 2 * inter_dim:
         raise ValueError(
-            "Heterogeneous MXFP4/FP8 experts require gate and up projections"
+            "Heterogeneous MXFP4/FP8 and MXFP8/FP8 experts require "
+            "gate and up projections"
         )
     assert shared_w1 is not None and shared_w2 is not None
     assert shared_w1_scale is not None and shared_w2_scale is not None
@@ -185,6 +205,7 @@ def _flydsl_fhmoe_stage1_wrapper(
     shared_w1=None,
     shared_w1_scale=None,
     shared_expert_id: int = -1,
+    clamp_shared: bool = True,
     v2_output_layout: bool = False,
     **_kwargs,
 ):
@@ -230,6 +251,7 @@ def _flydsl_fhmoe_stage1_wrapper(
         k_wave=parsed.get("k_wave", 1),
         v2_output_layout=v2_output_layout,
         shared_expert_id=shared_expert_id,
+        clamp_shared=clamp_shared,
     )
 
 
@@ -313,7 +335,8 @@ def _use_fhmoe_wrappers(metadata):
         or stage2_func is not _flydsl_stage2_wrapper
     ):
         raise NotImplementedError(
-            "Heterogeneous MXFP4/FP8 experts require the two-stage FlyDSL path"
+            "Heterogeneous MXFP4/FP8 and MXFP8/FP8 experts require the "
+            "two-stage FlyDSL path"
         )
     kernel_names = (
         metadata.stage1.keywords.get("kernelName", ""),
@@ -321,7 +344,8 @@ def _use_fhmoe_wrappers(metadata):
     )
     if any(get_flydsl_kernel_params(name) is None for name in kernel_names):
         raise NotImplementedError(
-            "Heterogeneous MXFP4/FP8 experts require valid FlyDSL kernels"
+            "Heterogeneous MXFP4/FP8 and MXFP8/FP8 experts require valid "
+            "FlyDSL kernels"
         )
     stage1 = functools.partial(
         _flydsl_fhmoe_stage1_wrapper,
@@ -336,10 +360,36 @@ def _use_fhmoe_wrappers(metadata):
     return replace(metadata, stage1=stage1, stage2=stage2)
 
 
-def _dsv4_i384_fhmoe_config_file() -> str:
+def _is_hy4_mxfp8_metadata(metadata) -> bool:
+    """Validate that a dedicated HY4 row names compatible FlyDSL kernels."""
+    from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
+
+    stage1 = get_flydsl_kernel_params(metadata.stage1.keywords["kernelName"])
+    stage2 = get_flydsl_kernel_params(metadata.stage2.keywords["kernelName"])
+    if stage1 is None or stage2 is None:
+        return False
+    stage2_sort_block = int(stage2.get("sort_block_m", 0) or stage2["tile_m"])
+    return (
+        metadata.fuse_quant == "fp8"
+        and stage1["stage"] == 1
+        and stage2["stage"] == 2
+        and stage1["a_dtype"] == stage1["b_dtype"] == "fp8"
+        and stage2["a_dtype"] == stage2["b_dtype"] == "fp8"
+        and stage1.get("gate_mode") == "interleave"
+        and int(stage1["tile_m"]) == metadata.block_m
+        and stage2_sort_block == metadata.block_m
+    )
+
+
+def _fhmoe_config_file() -> str:
     from aiter.jit.core import AITER_CONFIGS
 
     return AITER_CONFIGS.AITER_CONFIG_FHMOE_FILE
+
+
+def _dsv4_i384_fhmoe_config_file() -> str:
+    """Compatibility wrapper for existing DSV4 capability tests."""
+    return _fhmoe_config_file()
 
 
 @functools.cache
@@ -399,6 +449,63 @@ def supports_dsv4_i384_fhmoe(max_tokens: int) -> bool:
     return _supports_dsv4_i384_fhmoe_config(max_tokens, config_file)
 
 
+@functools.cache
+def _supports_hy4_mxfp8_fhmoe_config(max_tokens: int, config_file: str) -> bool:
+    try:
+        from aiter.fused_moe import get_2stage_cfgs, get_padded_M
+
+        required_tokens = {
+            get_padded_M(1 << exponent) for exponent in range(max_tokens.bit_length())
+        }
+        required_tokens.add(get_padded_M(max_tokens))
+        for token in required_tokens:
+            metadata = get_2stage_cfgs(
+                token,
+                6144,
+                256,
+                257,
+                9,
+                torch.bfloat16,
+                dtypes.fp8,
+                dtypes.fp8,
+                QuantType.per_1x32,
+                True,
+                ActivationType.Silu,
+                False,
+                0,
+                0,
+                True,
+                GateMode.INTERLEAVE,
+                config_file=config_file,
+            )
+            metadata = _use_fhmoe_wrappers(metadata)
+            if not _is_hy4_mxfp8_metadata(metadata):
+                return False
+    except (
+        ImportError,
+        KeyError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ):
+        return False
+    return True
+
+
+def supports_hy4_mxfp8_fhmoe(max_tokens: int) -> bool:
+    """Return whether CSV-backed HY4 FHMoE configs cover M through the limit."""
+    if type(max_tokens) is not int or max_tokens <= 0:
+        return False
+    try:
+        if int(os.environ.get("AITER_BYPASS_TUNE_CONFIG", "0")) != 0:
+            return False
+        config_file = _fhmoe_config_file()
+    except (ImportError, KeyError, OSError, RuntimeError, TypeError, ValueError):
+        return False
+    return _supports_hy4_mxfp8_fhmoe_config(max_tokens, config_file)
+
+
 def _is_dsv4_i384_fhmoe_contract(
     model_dim: int,
     inter_dim: int,
@@ -415,6 +522,31 @@ def _is_dsv4_i384_fhmoe_contract(
         and intermediate_pad == 0
         and gate_mode == GateMode.INTERLEAVE
         and not doweight_stage1
+    )
+
+
+def _is_hy4_mxfp8_fhmoe_contract(
+    *,
+    model_dim: int,
+    inter_dim: int,
+    experts: int,
+    topk: int,
+    routed_mxfp8: bool,
+    hidden_pad: int,
+    intermediate_pad: int,
+    gate_interleaved: bool,
+    doweight_stage1: bool,
+    shared_expert_id: int,
+) -> bool:
+    """Return whether the stage-1 contract uses HY4's unclamped shared SiLU."""
+    return (
+        (model_dim, inter_dim, experts, topk) == (6144, 256, 257, 9)
+        and routed_mxfp8
+        and hidden_pad == 0
+        and intermediate_pad == 0
+        and gate_interleaved
+        and not doweight_stage1
+        and shared_expert_id == 256
     )
 
 
@@ -570,6 +702,18 @@ def fhmoe_(
     inter_dim = w2.shape[2] * (model_dim // w1.shape[-1])
     topk = topk_ids.shape[1]
     metadata_config_file = None
+    is_hy4_contract = _is_hy4_mxfp8_fhmoe_contract(
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        experts=experts,
+        topk=topk,
+        routed_mxfp8=w1.dtype == dtypes.fp8,
+        hidden_pad=hidden_pad,
+        intermediate_pad=intermediate_pad,
+        gate_interleaved=gate_mode_enum == GateMode.INTERLEAVE,
+        doweight_stage1=doweight_stage1,
+        shared_expert_id=shared_expert_id,
+    )
     if _is_dsv4_i384_fhmoe_contract(
         model_dim,
         inter_dim,
@@ -583,6 +727,15 @@ def fhmoe_(
         if not supports_dsv4_i384_fhmoe(hidden_states.shape[0]):
             raise NotImplementedError(
                 "The active FHMoE config does not cover this DSV4 I384 "
+                f"token shape: M={hidden_states.shape[0]}"
+            )
+        from aiter.jit.core import AITER_CONFIGS
+
+        metadata_config_file = AITER_CONFIGS.AITER_CONFIG_FHMOE_FILE
+    elif is_hy4_contract:
+        if not supports_hy4_mxfp8_fhmoe(hidden_states.shape[0]):
+            raise NotImplementedError(
+                "The active FHMoE config does not cover this HY4 MXFP8 "
                 f"token shape: M={hidden_states.shape[0]}"
             )
         from aiter.jit.core import AITER_CONFIGS
@@ -621,6 +774,9 @@ def fhmoe_(
             "shared_w1_scale": shared_w1_scale,
             "shared_expert_id": shared_expert_id,
             "swiglu_limit": swiglu_limit,
+            # HY4 leaves its dense shared expert unclamped. DSV4 retains the
+            # configured clamp for both routed and shared experts.
+            "clamp_shared": not is_hy4_contract,
         },
         _stage2_extra_args={
             "shared_w2": shared_w2,
