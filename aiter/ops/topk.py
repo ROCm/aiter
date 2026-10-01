@@ -522,19 +522,32 @@ BACKEND_DEFAULT = "default"
 BACKEND_CHUNKED = "chunked"
 BACKEND_ADAPTIVE = "adaptive"
 
-# Which shapes the adaptive kernel is fastest for, as (minimum width, maximum
-# width, minimum rows, maximum rows) per k and per emit, bounds inclusive and a
-# maximum width of None meaning no upper bound. The row minimum is not
-# decoration: one row of a narrow buffer goes to a one-block kernel, which has
-# no grid to fill while the adaptive kernel pays for having one.
+# Which shapes the adaptive kernel is fastest for. One entry, with names in
+# place of the numbers:
+#
+#   (arch, cu_count): {
+#       stable: {
+#           (k, ...): (
+#               (min_width, max_width, min_rows, max_rows),
+#               ...
+#           ),
+#       },
+#   },
+#
+# Every k in a group shares its bands. Bounds are inclusive, and a max_width of
+# None means no upper bound: (4_096, 4_096, 128, 512) admits width 4096 at 128
+# to 512 rows. The row minimum is not decoration: one row of a narrow buffer
+# goes to a one-block kernel, which has no grid to fill while the adaptive
+# kernel pays for having one.
 #
 # Keyed by CU count as well as arch: one arch name spans several, and the grid
 # these were measured against is built from that count. A pair the table does
 # not name is routed by the chunked gate below alone.
 #
-# A cell is admitted only when this kernel is the fastest of the four and at
-# least 1.05x faster than the kernel the gate would pick without it, on a full
-# buffer and on a padded one alike, which the gate cannot tell apart. Every entry
+# A cell is admitted only when this kernel is the fastest of the four decode
+# kernels (adaptive, chunked, FlyDSL one-block, C++ one-block) and at least
+# 1.05x faster than the kernel the gate would pick without it, on a full buffer
+# and on a padded one alike, which the gate cannot tell apart. Every entry
 # assumes the caller declares `max_row_len`.
 _ADAPTIVE_BANDS_BY_K_GROUP = {
     ("gfx942", 80): {
