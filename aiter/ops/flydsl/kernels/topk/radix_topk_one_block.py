@@ -76,6 +76,44 @@ def _build_bitonic_schedule(capacity: int) -> tuple[tuple[int, ...], ...]:
     return tuple(sizes), tuple(strides)
 
 
+# Blocks per row by live length, keyed on the captured row count. Levels are
+# ordered by ascending bound and the first whose bound covers the live length
+# wins; the final level is unbounded. Splitting a row costs a second launch and
+# a merge over blocks * k candidates, so short rows stay on one block.
+_DECODE_SPLIT_LADDERS = (
+    (32, ((16 * 1024, 1), (128 * 1024, 8), (256 * 1024, 10), (None, 16))),
+    (128, ((64 * 1024, 1), (512 * 1024, 4), (None, 10))),
+    (160, ((256 * 1024, 1), (None, 3))),
+    (256, ((256 * 1024, 1), (None, 2))),
+)
+
+SplitLadder = tuple[tuple[int | None, int], ...]
+
+
+def decode_split_ladder(num_rows: int, width: int) -> SplitLadder:
+    """Pick the split ladder for a decode capture of this shape.
+
+    Levels the physical width can never reach are dropped, so a capture that
+    cannot grow past the first bound keeps a grid height of one.
+    """
+    ladder = ((None, 1),)
+    for max_rows, candidate in _DECODE_SPLIT_LADDERS:
+        if num_rows <= max_rows:
+            ladder = candidate
+            break
+    reachable = []
+    for bound, blocks in ladder:
+        reachable.append((bound, blocks))
+        if bound is not None and width <= bound:
+            break
+    reachable[-1] = (None, reachable[-1][1])
+    return tuple(reachable)
+
+
+def decode_split_blocks(ladder: SplitLadder) -> int:
+    return max(blocks for _, blocks in ladder)
+
+
 @cache
 def build_radix_topk_one_block_module(
     k: int,
@@ -87,6 +125,8 @@ def build_radix_topk_one_block_module(
     *,
     wave_size: int,
     arch: str = "",
+    split_mode: str = "none",
+    split_ladder: SplitLadder = (),
 ):
     """Build a prefill/decode kernel specialized for the row-length bounds.
 
@@ -95,6 +135,12 @@ def build_radix_topk_one_block_module(
     arch selects the first radix level from _LONG_RADIX_BY_ARCH; the arches
     listed in _ONE_BLOCK_LDS_BUDGET_BYTES also grow the candidate buffer into
     whatever that budget leaves over. The rest keep the original layout.
+
+    split_mode "split" cuts each decode row into `blockIdx.y` slices and writes
+    every slice's top-k into the auxiliary index/value pair; "merge" reranks a
+    row's slice winners and maps them back through the auxiliary indices. How
+    many slices a row actually uses comes from split_ladder and the live length
+    the kernel reads per launch, so a captured graph picks it per replay.
     """
     if k <= 0:
         raise ValueError("k must be positive")
@@ -104,6 +150,16 @@ def build_radix_topk_one_block_module(
         raise ValueError("wave_size must be 32 or 64")
     if block_threads * _VEC > _PACKED_COUNT_MASK:
         raise ValueError("one scan tile exceeds the packed count range")
+    if split_mode not in ("none", "split", "merge"):
+        raise ValueError("split_mode must be none, split or merge")
+    if split_mode != "none":
+        if not is_decode or stable or short_rows:
+            raise ValueError("split decode needs a non-stable mixed-row decode build")
+        if k > block_threads:
+            raise ValueError("split decode needs k <= block_threads")
+        if not split_ladder or split_ladder[-1][0] is not None:
+            raise ValueError("split_ladder must end with an unbounded level")
+    split_blocks = decode_split_blocks(split_ladder) if split_ladder else 1
 
     num_waves = block_threads // wave_size
     long_radix_bits, pass1_replicas = _LONG_RADIX_BY_ARCH.get(arch, _LONG_RADIX_DEFAULT)
@@ -203,11 +259,13 @@ def build_radix_topk_one_block_module(
         scan: block_scan.SharedStorage
         metadata: fx.Array[fx.Int32, _METADATA_SIZE, 16]
 
+    split_suffix = "" if split_mode == "none" else f"_{split_mode}{split_blocks}"
+
     @flyc.kernel(
         name=(
             f"radix_topk_one_block_{'decode' if is_decode else 'prefill'}"
             f"_{row_variant}_k{k}_b{block_threads}_w{wave_size}"
-            f"_v{int(write_values)}_s{int(stable)}"
+            f"_v{int(write_values)}_s{int(stable)}{split_suffix}"
         ),
         known_block_size=[block_threads, 1, 1],
     )
@@ -217,6 +275,7 @@ def build_radix_topk_one_block_module(
         row_ends: fx.Tensor,
         indices: fx.Tensor,
         value_output: fx.Tensor,
+        aux_indices: fx.Tensor,
         width: fx.Int32,
         next_n: fx.Int32,
     ):
@@ -232,12 +291,40 @@ def build_radix_topk_one_block_module(
         sign_bit = fx.Int32(-2147483648)
 
         # Row bounds
-        if const_expr(is_decode):
+        if const_expr(split_mode != "none"):
+            live_len = _row_length(row, row_ends, width, next_n)
+            wanted = fx.Int32(split_ladder[-1][1])
+            for bound, blocks in reversed(split_ladder[:-1]):
+                wanted = (live_len <= fx.Int32(bound)).select(fx.Int32(blocks), wanted)
+            # Every slice a merge consumes has to hold k real candidates.
+            affordable = live_len // top_k
+            wanted = (wanted < affordable).select(wanted, affordable)
+            wanted = (wanted < one).select(one, wanted)
+            slice_len = (live_len + wanted - one) // wanted
+            slice_len = ((slice_len + vec_width - one) // vec_width) * vec_width
+            slice_len = (slice_len < vec_width).select(vec_width, slice_len)
+            active_splits = (live_len + slice_len - one) // slice_len
+            active_splits = (active_splits < one).select(one, active_splits)
+
+        if const_expr(split_mode == "split"):
+            split_idx = fx.Int32(fx.block_idx.y)
+            row_start = split_idx * slice_len
+            slice_end = row_start + slice_len
+            row_end = (live_len < slice_end).select(live_len, slice_end)
+            row_end = (row_end < row_start).select(row_start, row_end)
+            out_row = row * fx.Int32(split_blocks) + split_idx
+        elif const_expr(split_mode == "merge"):
+            row_start = zero
+            row_end = active_splits * top_k
+            out_row = row
+        elif const_expr(is_decode):
             row_start = zero
             row_end = _row_length(row, row_ends, width, next_n)
+            out_row = row
         else:
             row_start = row_starts[row]
             row_end = row_ends[row]
+            out_row = row
         row_len = row_end - row_start
         full_vector_count = row_len // vec_width
 
@@ -250,8 +337,8 @@ def build_radix_topk_one_block_module(
         )
         input_vector_tiles = fx.logical_divide(input_row, fx.make_layout(_VEC, 1))
 
-        row_indices = fx.slice(indices, (row, None))
-        row_values = fx.slice(value_output, (row, None))
+        row_indices = fx.slice(indices, (out_row, None))
+        row_values = fx.slice(value_output, (out_row, None))
         row_index_tiles = fx.logical_divide(
             fx.make_view(
                 fx.get_iter(row_indices), fx.make_layout(output_vector_elems, 1)
@@ -330,6 +417,19 @@ def build_radix_topk_one_block_module(
         scan = storage.scan.peek()
         metadata = storage.metadata.peek().view(fx.make_layout(_METADATA_SIZE, 1))
 
+        # A merge scans slice winners, so its column is a slot in the auxiliary
+        # buffer rather than a column of the logits row it has to report.
+        if const_expr(split_mode == "merge"):
+            aux_index_row = fx.slice(aux_indices, (row, None))
+
+            def emit_index(col):
+                return aux_index_row[col]
+
+        else:
+
+            def emit_index(col):
+                return row_start + col
+
         # Key encoding and classification
         def ordered_key(value):
             bits = value.bitcast(fx.Int32)
@@ -369,14 +469,14 @@ def build_radix_topk_one_block_module(
             if above:
                 out_pos = atomic_add_i32(metadata, one, _RUNNING_ABOVE, "workgroup")
                 if out_pos < top_k:
-                    row_indices[out_pos] = row_start + col
+                    row_indices[out_pos] = emit_index(col)
                     if const_expr(write_values):
                         row_values[out_pos] = ordered_value(key)
             elif equal:
                 back_pos = atomic_add_i32(metadata, one, _RUNNING_EQUAL, "workgroup")
                 if back_pos < num_needed:
                     out_pos = top_k - one - back_pos
-                    row_indices[out_pos] = row_start + col
+                    row_indices[out_pos] = emit_index(col)
                     if const_expr(write_values):
                         row_values[out_pos] = ordered_value(key)
 
@@ -619,7 +719,7 @@ def build_radix_topk_one_block_module(
             for item in range_constexpr(stable_sort_items_per_thread):
                 pos = tid + item * block_threads
                 if pos < top_k:
-                    row_indices[pos] = row_start + local_indices[item]
+                    row_indices[pos] = emit_index(local_indices[item])
                     if const_expr(write_values):
                         row_values[pos] = input_row[local_indices[item]]
 
@@ -656,7 +756,7 @@ def build_radix_topk_one_block_module(
                     while word != zero:
                         bit_idx = fx.math.cttz(word)
                         col = word_idx * fx.Int32(32) + bit_idx
-                        row_indices[out_pos] = row_start + col
+                        row_indices[out_pos] = emit_index(col)
                         if const_expr(write_values):
                             row_values[out_pos] = input_row[col]
                         out_pos = out_pos + one
@@ -769,13 +869,13 @@ def build_radix_topk_one_block_module(
                         accepted_equal = (my_eq < num_needed).select(my_eq, num_needed)
                         out_pos = my_above + accepted_equal
                         if cls == 2:
-                            row_indices[out_pos] = row_start + col
+                            row_indices[out_pos] = emit_index(col)
                             if const_expr(write_values):
                                 row_values[out_pos] = ordered_value(key)
                             my_above = my_above + 1
                         elif cls == 1:
                             if my_eq < num_needed:
-                                row_indices[out_pos] = row_start + col
+                                row_indices[out_pos] = emit_index(col)
                                 if const_expr(write_values):
                                     row_values[out_pos] = ordered_value(key)
                             my_eq = my_eq + 1
@@ -1078,7 +1178,7 @@ def build_radix_topk_one_block_module(
                             if const_expr(stable_sort_enabled):
                                 staged_local_indices[out_pos] = col
                         else:
-                            row_indices[out_pos] = row_start + col
+                            row_indices[out_pos] = emit_index(col)
                             if const_expr(write_values):
                                 row_values[out_pos] = ordered_value(key)
                 active = active & (prefix == prefix_threshold)
@@ -1278,7 +1378,7 @@ def build_radix_topk_one_block_module(
             # One column per thread: only reached when k <= block_threads.
             col = tid
             if col < k:
-                row_indices[col] = (col < row_len).select(row_start + col, fx.Int32(-1))
+                row_indices[col] = (col < row_len).select(emit_index(col), fx.Int32(-1))
                 if const_expr(write_values):
                     value = fx.Float32(float("-inf"))
                     if col < row_len:
@@ -1367,27 +1467,37 @@ def build_radix_topk_one_block_module(
                 write_direct_vector(row_indices, row_values)
 
         # Kernel control flow
-        if row_len <= top_k:
-            write_direct_output(row_indices, row_values)
+        def run_row():
+            if row_len <= top_k:
+                write_direct_output(row_indices, row_values)
 
-        if row_len > top_k:
-            if tid < _METADATA_SIZE:
-                metadata[tid] = zero
-            gpu.barrier()
+            if row_len > top_k:
+                if tid < _METADATA_SIZE:
+                    metadata[tid] = zero
+                gpu.barrier()
 
-            if const_expr(short_rows):
-                run_cached_path(short_histograms)
-            else:
-                if row_len <= fx.Int32(_COMPACT_CAPACITY):
+                if const_expr(short_rows):
                     run_cached_path(short_histograms)
                 else:
-                    run_streaming_path(
-                        long_histograms,
-                        histogram,
-                        candidate_ordered_keys,
-                        candidate_local_indices,
-                        staged_local_indices,
-                    )
+                    if row_len <= fx.Int32(_COMPACT_CAPACITY):
+                        run_cached_path(short_histograms)
+                    else:
+                        run_streaming_path(
+                            long_histograms,
+                            histogram,
+                            candidate_ordered_keys,
+                            candidate_local_indices,
+                            staged_local_indices,
+                        )
+
+        if const_expr(split_mode == "split"):
+            # Block-uniform, so the barriers inside stay legal.
+            if split_idx < active_splits:
+                run_row()
+        else:
+            run_row()
+
+    grid_y = split_blocks if split_mode == "split" else 1
 
     @flyc.jit
     def launch_radix_topk_one_block(
@@ -1396,13 +1506,14 @@ def build_radix_topk_one_block_module(
         row_ends: fx.Tensor,
         indices: fx.Tensor,
         values: fx.Tensor,
+        aux_indices: fx.Tensor,
         width: fx.Int32,
         next_n: fx.Int32,
         rows_m: fx.Int32,
         stream: fx.Stream,
     ):
         radix_topk_one_block_kernel(
-            input, row_starts, row_ends, indices, values, width, next_n
-        ).launch(grid=(rows_m, 1, 1), block=(block_threads, 1, 1), stream=stream)
+            input, row_starts, row_ends, indices, values, aux_indices, width, next_n
+        ).launch(grid=(rows_m, grid_y, 1), block=(block_threads, 1, 1), stream=stream)
 
     return launch_radix_topk_one_block
