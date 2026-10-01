@@ -149,6 +149,19 @@
         "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
+    "module_sp_head_exchange": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/kernels/sp_head_exchange.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/sp_head_exchange_pybind.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
+    },
     "module_custom_all_reduce_gfx1250": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/custom_all_reduce_gfx1250_pybind.cu'",
@@ -166,6 +179,19 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/quick_all_reduce_pybind.cu'",
             "f'{AITER_CSRC_DIR}/kernels/quick_all_reduce.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
+    },
+    "module_quick_reduce_scatter": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/quick_reduce_scatter_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/quick_reduce_scatter.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],
