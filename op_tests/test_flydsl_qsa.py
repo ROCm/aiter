@@ -2162,10 +2162,9 @@ def test_qsa_backend_default_is_auto():
 def test_qsa_auto_admits_only_measured_pairs():
     """auto admits the swept (GQA query, indexer heads) pairs and no others.
 
-    Both ways this can break are silent. Loosened, auto serves an untuned
-    shape at whatever speed the K2 band table happens to give; narrowed, it
-    drops a measured shape back to Triton. Neither is a wrong result, so no
-    other test in this file would notice. K2 serves any structurally valid
+    Loosened, auto serves an untuned shape at whatever speed the K2 band
+    table happens to give; narrowed, it drops a measured shape back to
+    Triton. Neither is a wrong result. K2 serves any structurally valid
     shape, so the table in ``qsa.py`` is the only thing doing the rejecting.
     """
     page = 16
@@ -2187,6 +2186,108 @@ def test_qsa_auto_admits_only_measured_pairs():
     # An untuned GQA query stays on Triton however it is indexed.
     untuned = _policy_args(1, 16, 128, n_columns, page, 4, 128)
     assert qsa_auto_uses_flydsl(*untuned) is False
+
+
+def test_qsa_auto_logs_unmeasured_query_once():
+    """auto logs a table miss once per GQA query, then stays on Triton.
+
+    The predicate itself stays quiet: only ``qsa_layer`` falls back.
+    A measured query, an M mismatch on a measured query, and an explicit
+    backend do not log. The Triton and FlyDSL launches are replaced so
+    this stays on the host.
+    """
+    import logging
+
+    from aiter.ops.flydsl import qsa as qsa_mod
+
+    messages = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            messages.append(record.getMessage())
+
+    def _call(args, backend="auto", indexer_rows=None):
+        (
+            q_indexer,
+            index_cache,
+            index_table,
+            q_gqa,
+            k_cache,
+            v_cache,
+            kv_table,
+            indices,
+        ) = args
+        if indexer_rows is not None:
+            q_indexer = torch.zeros(
+                indexer_rows,
+                *q_indexer.shape[1:],
+                dtype=q_indexer.dtype,
+            )
+        rows = q_gqa.shape[0]
+        return qsa_layer(
+            q_indexer,
+            index_cache,
+            index_table,
+            q_gqa,
+            k_cache,
+            v_cache,
+            kv_table,
+            torch.zeros(rows, dtype=torch.int32),
+            torch.zeros(rows, dtype=torch.int32),
+            torch.ones(1, dtype=torch.int32),
+            indices=indices,
+            backend=backend,
+        )
+
+    paths = []
+
+    def _triton(*args, **kwargs):
+        paths.append("triton")
+        return args[3]
+
+    def _flydsl(*args, **kwargs):
+        paths.append("flydsl")
+        return args[3]
+
+    page = 16
+    n_columns = 128
+    handler = _Capture()
+    old_triton = qsa_mod._qsa_layer_triton
+    old_flydsl = qsa_mod._qsa_layer_flydsl
+    qsa_mod._log_unmeasured_gqa_query.cache_clear()
+    qsa_mod._qsa_layer_triton = _triton
+    qsa_mod._qsa_layer_flydsl = _flydsl
+    aiter.logger.addHandler(handler)
+    try:
+        untuned = _policy_args(1, 16, 128, n_columns, page, 4, 128)
+        _call(untuned)
+        _call(untuned)
+        other = _policy_args(1, 32, 64, n_columns, page, 4, 128)
+        _call(other)
+        if messages != [
+            "QSA auto: GQA query shape (16, 128) is not in the measured table; using Triton",
+            "QSA auto: GQA query shape (32, 64) is not in the measured table; using Triton",
+        ]:
+            raise AssertionError(f"table-miss log was {messages}")
+        if paths != ["triton", "triton", "triton"]:
+            raise AssertionError(f"unmeasured auto took {paths}")
+
+        messages.clear()
+        paths.clear()
+        swept = _policy_args(1, 24, 256, n_columns, page, 4, 128)
+        _call(swept)
+        _call(untuned, backend="triton")
+        _call(untuned, backend="flydsl")
+        _call(swept, indexer_rows=2)
+        if messages:
+            raise AssertionError(f"measured or explicit backend logged {messages}")
+        if paths != ["flydsl", "triton", "flydsl", "triton"]:
+            raise AssertionError(f"backend choice was {paths}")
+    finally:
+        aiter.logger.removeHandler(handler)
+        qsa_mod._qsa_layer_triton = old_triton
+        qsa_mod._qsa_layer_flydsl = old_flydsl
+        qsa_mod._log_unmeasured_gqa_query.cache_clear()
 
 
 def test_qsa_aot_collector_lists_family_a_launches():
@@ -2639,6 +2740,7 @@ def _run_unit_cases():
     test_k2_caller_workspace_is_the_only_partial_buffer()
     test_qsa_backend_default_is_auto()
     test_qsa_auto_admits_only_measured_pairs()
+    test_qsa_auto_logs_unmeasured_query_once()
     test_qsa_aot_collector_lists_family_a_launches()
     test_qsa_aot_empty_launch_list_has_no_jobs()
     test_qsa_symbols_export_lazily()
