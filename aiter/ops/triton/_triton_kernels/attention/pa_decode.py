@@ -129,7 +129,7 @@ def _paged_attn_decode_v1_wo_dot_kernel(
         # p: [KV_BLK_SZ_POW2]
         p = tl.math.exp2((qk - max_logit_new) * log2e)
         alpha = tl.math.exp2((max_logit - max_logit_new) * log2e)
-        acc *= alpha[:, None]
+        acc *= alpha
 
         # load v [KV_BLK_SZ_POW2, HEAD_SZ_POW2]
         v_0 = tl.load(v_cache_ptr + kv_blk_offs, mask=kv_mask)
@@ -429,7 +429,7 @@ def _paged_attn_decode_v2_wo_dot_kernel(
         # p: [KV_BLK_SZ_POW2]
         p = tl.math.exp2((qk - max_logit_new) * log2e)
         alpha = tl.math.exp2((max_logit - max_logit_new) * log2e)
-        acc *= alpha[:, None]
+        acc *= alpha
 
         # v: [KV_BLK_SZ_POW2, HEAD_SZ_POW2]
         v_0 = tl.load(v_cache_ptr + kv_blk_offs, mask=kv_mask, other=0.0)
@@ -969,7 +969,7 @@ def _paged_attn_decode_v1_wo_dot_kernel_per_token_quant(
         # p: [KV_BLK_SZ_POW2]
         p = tl.math.exp2((qk - max_logit_new) * log2e)
         alpha = tl.math.exp2((max_logit - max_logit_new) * log2e)
-        acc *= alpha[:, None]
+        acc *= alpha
 
         # load v [KV_BLK_SZ_POW2, HEAD_SZ_POW2]
         v_scale = tl.load(v_scale_ptr + kv_scale_offs, mask=kv_scale_mask, other=0.0)
@@ -1291,7 +1291,7 @@ def _paged_attn_decode_v2_wo_dot_kernel_per_token_quant(
         # p: [KV_BLK_SZ_POW2]
         p = tl.math.exp2((qk - max_logit_new) * log2e)
         alpha = tl.math.exp2((max_logit - max_logit_new) * log2e)
-        acc *= alpha[:, None]
+        acc *= alpha
 
         # v: [KV_BLK_SZ_POW2, HEAD_SZ_POW2]
         v_scale = tl.load(v_scale_ptr + kv_scale_offs, mask=kv_scale_mask, other=0.0)
