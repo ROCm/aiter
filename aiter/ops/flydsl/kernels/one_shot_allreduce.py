@@ -193,9 +193,9 @@ def oneshot_ladder(world_size: int, link: str = "pcie"):
 # row at M=1, not at M=4" is two rungs.
 FUSED_ONESHOT_LADDER = {
     # PCIe: from measurements on MI350P
-    ("pcie", 2): ((0, 2, 128, "peer", True, 1),),
-    ("pcie", 4): ((0, 2, 64, "peer", False, 1),),
-    ("pcie", 8): ((0, 4, 64, "peer", False, 1), (8 << 10, 2, 64, "peer", True, 1)),
+    ("pcie", 2): ((0, 1, 128, "peer", True, 1),),
+    ("pcie", 4): ((0, 2, 64, "peer", False, 1), (168 << 10, 4, 32, "peer", True, 1)),
+    ("pcie", 8): ((0, 2, 128, "peer", False, 1), (144 << 10, 2, 8, "peer", True, 1)),
     # xGMI: from measurements on MI325X.
     # Split (k > 1) wins at TP4/TP8 for small M, TP2 never benefits from spliting hidden dim.
     ("xgmi", 2): ((0, 1, 128, "peer", True, 1),),
