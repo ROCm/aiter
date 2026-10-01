@@ -1470,6 +1470,57 @@ namespace py = pybind11;
           py::arg("num_local_tokens")  = std::nullopt, \
           py::arg("dispatch_policy")   = 0);
 
+#define FUSED_MOE_SORTING_PYBIND                       \
+    m.def("fused_moe_sorting_get_workspace_size",      \
+          &fused_moe_sorting_get_workspace_size,       \
+          py::arg("tokens"),                           \
+          py::arg("num_experts"),                      \
+          py::arg("topk"),                             \
+          py::arg("unit_size"));                       \
+    m.def("fused_moe_sorting_is_supported",            \
+          &fused_moe_sorting_is_supported,             \
+          py::arg("tokens"),                           \
+          py::arg("num_experts"),                      \
+          py::arg("topk"),                             \
+          py::arg("unit_size"));                       \
+    m.def("fused_moe_sorting_fwd",                     \
+          &fused_moe_sorting_fwd,                      \
+          py::arg("topk_ids"),                         \
+          py::arg("topk_weights"),                     \
+          py::arg("sorted_token_ids"),                 \
+          py::arg("sorted_weights"),                   \
+          py::arg("sorted_expert_ids"),                \
+          py::arg("num_valid_ids"),                    \
+          py::arg("moe_buf"),                          \
+          py::arg("num_experts"),                      \
+          py::arg("unit_size"),                        \
+          py::arg("local_expert_mask") = std::nullopt, \
+          py::arg("num_local_tokens")  = std::nullopt);      \
+    m.def("fused_moe_sorting_topk_is_supported",       \
+          &fused_moe_sorting_topk_is_supported,        \
+          py::arg("tokens"),                           \
+          py::arg("num_experts"),                      \
+          py::arg("topk"),                             \
+          py::arg("unit_size"),                        \
+          py::arg("router_experts"));                  \
+    m.def("fused_moe_sorting_topk_fwd",                \
+          &fused_moe_sorting_topk_fwd,                 \
+          py::arg("gating_output"),                    \
+          py::arg("sorted_token_ids"),                 \
+          py::arg("sorted_weights"),                   \
+          py::arg("sorted_expert_ids"),                \
+          py::arg("num_valid_ids"),                    \
+          py::arg("moe_buf"),                          \
+          py::arg("num_experts"),                      \
+          py::arg("topk"),                             \
+          py::arg("unit_size"),                        \
+          py::arg("need_renorm"),                      \
+          py::arg("is_softmax"),                       \
+          py::arg("routed_scaling_factor"),            \
+          py::arg("local_expert_mask") = std::nullopt, \
+          py::arg("num_local_tokens")  = std::nullopt, \
+          py::arg("sync")              = std::nullopt);
+
 #define MOE_SORTING_OPUS_PYBIND                        \
     m.def("moe_sorting_opus_get_workspace_size",       \
           &moe_sorting_opus_get_workspace_size,        \
