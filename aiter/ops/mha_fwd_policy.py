@@ -19,6 +19,7 @@ from itertools import product
 from typing import Any, Literal
 
 from ..jit.utils.chip_info import TUNING_HARDWARE_FIELDS
+from ..utility.tuning_policy import DEFAULT_FINALISTS, DEFAULT_PROMOTION, DEFAULT_RACE
 
 # ---------------------------------------------------------------------------
 # Family identity, stated once for the tuner and the tuning-test tables.
@@ -519,20 +520,13 @@ MHA_FWD_ERROR_ATOL = 2e-2
 MHA_FWD_MAX_ERROR_RATIO = 0.0
 MHA_FWD_TASK_TIMEOUT_S = 7200
 
-# Nothing in the justification of the values below is about attention. They
-# are measurement and promotion policy that other families need unchanged,
-# and they are candidates for a central tuning-policy module.
-
-# How much faster a winner must be than the configuration already in use, as
-# a fraction of the incumbent's latency. It is the same bar as
-# --min_improvement_pct, which --all --compare --update_improved applies to
-# the public operator, so the search and the protected re-tune agree on what
-# is worth a row. It also stays above the ~2% an unchanged configuration moves
-# between sessions on this hardware.
-MHA_FWD_MIN_IMPROVEMENT = 0.03
-
-# Seeds --candidate-sample, so a run is repeatable.
-MHA_FWD_SAMPLE_SEED = 20240917
+# What a challenger must beat, and how finalists and a race spend their
+# measurements, say nothing about attention, so they come from the shared
+# tuning policy. Override a value here with dataclasses.replace if this family
+# ever needs its own.
+MHA_FWD_PROMOTION = DEFAULT_PROMOTION
+MHA_FWD_FINALISTS = DEFAULT_FINALISTS
+MHA_FWD_RACE = DEFAULT_RACE
 
 
 def as_bool(value: Any) -> bool:
