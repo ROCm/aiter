@@ -13,6 +13,7 @@ from aiter.ops.attention import (
     _MLA_ASM_STATUSES,
     MlaAsmStatus,
     MlaBackend,
+    decode_update_mla_metadata_v1,
     get_mla_decode_shape_support,
     mla_decode_asm_query,
 )
@@ -206,6 +207,26 @@ def test_decode_agreement():
         if ok != s.supported:
             bad.append((n, msq, d, lse, s.backend.value, s.supported))
     assert not bad, bad
+
+
+@requires_gpu
+def test_decode_update_keeps_planner_work_info():
+    bs, n, qd = len(KV_LENS), 64, dtypes.fp8
+    for msq in (1, 2, 4):
+        _, n_work, meta = _run_planner(bs, msq, n, qd, qd)
+        winfo = meta[1]
+        planned = winfo[:n_work].clone()
+        qo, kv_indptr, last = _indptrs(bs, msq)
+        decode_update_mla_metadata_v1(
+            *(qo, kv_indptr, last, n, 1, True, *meta),
+            max_seqlen_qo=msq,
+            dtype_q=qd,
+            dtype_kv=qd,
+            num_reject_tokens=torch.ones(bs, dtype=torch.int32, device="cuda"),
+        )
+        torch.cuda.synchronize()
+        cols = [0, 4, 5, 6]
+        assert torch.equal(winfo[:n_work, cols], planned[:, cols]), msq
 
 
 if __name__ == "__main__":

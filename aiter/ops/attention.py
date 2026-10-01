@@ -2464,57 +2464,22 @@ def decode_update_mla_metadata_v1(
     assert num_heads_k == 1
     assert kv_granularity >= 16
     assert page_size == 1
-    # assert not (dtype_q == dtypes.bf16 and dtype_kv == dtypes.bf16 and num_heads_per_head_k == 128), "In this case, use get_mla_metadata_v1 instead"
-    q_is_fp8 = dtype_q == dtypes.fp8
-    kv_is_fp8 = dtype_kv == dtypes.fp8
-    arch_id = get_gfx()
-    natively_supported = (
-        (num_heads_per_head_k == 16)
-        or (
-            arch_id == "gfx950"
-            and num_heads_per_head_k == 32
-            and q_is_fp8
-            and kv_is_fp8
-            and max_seqlen_qo == 4
-        )
-        or (
-            arch_id in ("gfx942", "gfx950")
-            and num_heads_per_head_k == 128
-            and q_is_fp8
-            and kv_is_fp8
-        )
-        or (
-            arch_id == "gfx950"
-            and num_heads_per_head_k == 96
-            and q_is_fp8
-            and kv_is_fp8
-            and max_seqlen_qo <= 6
-        )
-        or (
-            arch_id == "gfx1250"
-            and env_flag_atoi("AITER_MLA_DECODE_PS1_FLYDSL")
-            and q_is_fp8
-            and kv_is_fp8
-            and num_heads_per_head_k in (32, 64, 128)
-            and max_seqlen_qo == 1
-        )
-        or (
-            arch_id == "gfx950"
-            and q_is_fp8
-            and kv_is_fp8
-            and num_heads_per_head_k == 12
-            and num_heads_per_head_k * max_seqlen_qo <= 128
-        )
+    assert (
+        max_seqlen_qo >= 1
+    ), "pass the max_seqlen_qo get_mla_metadata_v1 was planned with (>= 1)"
+    head_plan = _mla_metadata_head_plan(
+        num_heads_per_head_k,
+        max_seqlen_qo,
+        dtype_q,
+        dtype_kv,
+        fast_mode=True,
+        intra_batch_mode=False,
     )
+    qk_batch_ratio = head_plan.qk_batch_ratio
+    num_heads_per_head_k = head_plan.kernel_num_heads
     cu_num = work_indptr.shape[0] - 1
     tile_reduce_cnt = reduce_indptr.shape[0] - 1
     max_work = work_info_set.shape[0]
-    batch_size = seqlens_qo_indptr.shape[0] - 1
-    qk_batch_ratio = 1
-    if not natively_supported and num_heads_per_head_k % 16 == 0:
-        qk_batch_ratio = num_heads_per_head_k // 16
-        num_heads_per_head_k = 16
-        batch_size *= qk_batch_ratio
     grid = (max_work,)
     decode_update_mla_metadata_v1_kernel[grid](
         seqlens_qo_indptr,
