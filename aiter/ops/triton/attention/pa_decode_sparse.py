@@ -48,7 +48,7 @@ except ImportError:
     _HAS_SCALED_UPCAST = False
 
 # Below Triton 3.8 the peeled 64-bit split-K kernel spills ~110 VGPRs to scratch.
-_TRITON_GE_38 = Version(Version(triton.__version__).base_version) >= Version("3.8.0")
+_TRITON_GE_38 = Version(triton.__version__) >= Version("3.8.0")
 
 _LOGGER = AiterTritonLogger()
 
