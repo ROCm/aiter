@@ -649,6 +649,69 @@ class TestTunePipeline(unittest.TestCase):
     def test_gdn_k5_opt_mp1(self):
         self._run_one("gdn_k5_opt", mp=1)
 
+    def test_mha_fwd_mp1(self):
+        """Measure, gate, publish and prove one shape in a fresh process.
+
+        Not _run_one: a shape where nothing beats auto-select correctly writes
+        no row, so the check is that every shape reached an answer and every
+        row written was proven, not that there is a row per shape. The tuner
+        exits non-zero when a shape is left without an answer or a written row
+        fails its fresh-process proof. The field is one sampled Triton tile
+        plus the defaults and incumbent the tuner always adds, to keep it
+        within a few minutes.
+        """
+        from aiter.ops.mha_fwd_policy import (
+            MHA_FWD_PROBLEM_KEY_FIELDS,
+            MHA_FWD_TUNER_SCRIPT,
+        )
+
+        shape = {
+            **dict.fromkeys(MHA_FWD_PROBLEM_KEY_FIELDS, 0),
+            "mode": "varlen",
+            "batch": 2,
+            "total_q": 512,
+            "total_k": 512,
+            "max_seqlen_q": 256,
+            "max_seqlen_k": 256,
+            "nhead_q": 8,
+            "nhead_k": 8,
+            "hdim_q": 128,
+            "hdim_v": 128,
+            "dtype": "bfloat16",
+            "window_left": -1,
+            "window_right": -1,
+            "dropout_p": 0.0,
+            "logits_soft_cap": 0.0,
+            "how_v3_bf16_cvt": 1,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            untuned = os.path.join(tmp, "untuned.csv")
+            tuned = os.path.join(tmp, "tuned.csv")
+            _write_csv(
+                untuned,
+                MHA_FWD_PROBLEM_KEY_FIELDS,
+                [[shape[field] for field in MHA_FWD_PROBLEM_KEY_FIELDS]],
+            )
+            result = _run_tuner(
+                MHA_FWD_TUNER_SCRIPT,
+                untuned,
+                tuned,
+                extra_args=[
+                    "--backends",
+                    "triton",
+                    "--candidate-sample",
+                    "1",
+                ],
+                timeout=900,
+                mp=1,
+            )
+            if result.returncode != 0:
+                print(f"\n=== mha_fwd STDOUT ===\n{result.stdout[-2000:]}")
+                print(f"\n=== mha_fwd STDERR ===\n{result.stderr[-2000:]}")
+            self.assertEqual(result.returncode, 0, "mha_fwd tuner failed")
+            written = pd.read_csv(tuned) if os.path.exists(tuned) else pd.DataFrame()
+        self.assertLessEqual(len(written), 1, written)
+
 
 @unittest.skipUnless(_gpu_available(), "No GPU available")
 class TestShapeGrouped(unittest.TestCase):

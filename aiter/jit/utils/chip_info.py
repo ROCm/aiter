@@ -17,6 +17,68 @@ from torch_guard import torch_compile_guard
 
 logger = logging.getLogger("aiter")
 
+_GPU_MODEL_PATTERN = re.compile(r"\bMI[0-9]{3,4}[A-Z0-9]*\b", re.IGNORECASE)
+
+
+def normalize_gpu_model(device_name: str) -> str:
+    """Return a stable lowercase GPU model token for tuned-artifact keys.
+
+    Architecture and CU count are insufficient to distinguish products such
+    as MI300X and MI325X. Prefer the product token exposed by HIP/PyTorch while
+    discarding vendor text that is not part of the model identity.
+    """
+
+    text = str(device_name).strip()
+    match = _GPU_MODEL_PATTERN.search(text)
+    if match is not None:
+        return match.group(0).lower()
+    normalized = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return normalized or "unknown"
+
+
+@functools.lru_cache(maxsize=8)
+def get_gpu_model(device_id: int = 0) -> str:
+    """Return the live GPU model used to isolate per-SKU tuning rows.
+
+    ``AITER_GPU_MODEL`` is an explicit override for controlled build/replay
+    environments. Runtime tuning normally resolves the model from PyTorch's
+    HIP device properties.
+    """
+
+    override = os.getenv("AITER_GPU_MODEL", "").strip()
+    if override:
+        return normalize_gpu_model(override)
+    try:
+        import torch
+
+        return normalize_gpu_model(torch.cuda.get_device_name(int(device_id)))
+    except Exception as error:  # noqa: BLE001 - callers fail closed to "unknown"
+        logger.debug("GPU model detection failed, keying as unknown: %s", error)
+        return "unknown"
+
+
+# Hardware column names of a tuned CSV, in key order. Mirrors the keys of
+# get_tuning_hardware() below.
+TUNING_HARDWARE_FIELDS = ("gfx", "gpu_model", "cu_num")
+
+
+@functools.lru_cache(maxsize=8)
+def get_tuning_hardware(device_id: int = 0) -> dict[str, str | int]:
+    """Return the hardware identity a tuned row is only valid for.
+
+    A measurement is specific to the arch, the SKU and the CU count it ran on,
+    so tuning families scope their rows by this triple. The result is cached
+    and shared, so callers must not mutate it.
+    """
+
+    import torch
+
+    return {
+        "gfx": get_gfx_runtime(),
+        "gpu_model": get_gpu_model(device_id),
+        "cu_num": torch.cuda.get_device_properties(device_id).multi_processor_count,
+    }
+
 
 @functools.lru_cache(maxsize=1)
 def _rocminfo_output() -> str:
