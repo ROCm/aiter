@@ -7,10 +7,11 @@ Several conv kernels don't consume the raw OIHW weight (or NCHW input) layout
 directly — they need it reshaped into a kernel-local format for coalesced loads:
 K-major padded tiles for the 1x1/general GEMM, [K_out, 9, C_pad] for the 3x3
 kernels, channel-blocked NCHWc for the cblocked path, and the G·g·Gᵀ filter
-transform for Winograd F(4x4,3x3). These packs are pure functions of the weight
-tensor, so the results are LRU-cached keyed on (storage ptr, shape, dtype,
-block, version): a weight repacks once and every later call with the same
-weight is a cache hit, making the steady-state repack cost negligible.
+transform for Winograd F(4x4,3x3). For ordinary tensors, these pure transforms
+are LRU-cached by (storage ptr, shape, dtype, block, version). PyTorch inference
+tensors have no version counter, so they are not cached by default. Deployments
+that set AITER_TRITON_CONV_TORCH_INFERENCE_TENSOR_WEIGHTS_IMMUTABLE=1 opt
+into caching them by identity and layout without mutation tracking.
 """
 
 import os
@@ -28,6 +29,9 @@ from aiter.ops.triton.conv._utils import (
 )
 
 _DEFAULT_PACK_CACHE_MAXSIZE = 256
+_TORCH_INFERENCE_TENSOR_WEIGHTS_IMMUTABLE_ENV = (
+    "AITER_TRITON_CONV_TORCH_INFERENCE_TENSOR_WEIGHTS_IMMUTABLE"
+)
 
 
 def _read_pack_cache_maxsize(default: int = _DEFAULT_PACK_CACHE_MAXSIZE) -> int:
@@ -43,7 +47,16 @@ def _read_pack_cache_maxsize(default: int = _DEFAULT_PACK_CACHE_MAXSIZE) -> int:
     return value if value > 0 else default
 
 
+def _read_torch_inference_tensor_weights_immutable() -> bool:
+    """Read the opt-in immutable-inference-weight cache policy."""
+    raw = os.environ.get(_TORCH_INFERENCE_TENSOR_WEIGHTS_IMMUTABLE_ENV, "0")
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 _PACK_CACHE_MAXSIZE = _read_pack_cache_maxsize()
+_TORCH_INFERENCE_TENSOR_WEIGHTS_IMMUTABLE = (
+    _read_torch_inference_tensor_weights_immutable()
+)
 
 
 class _LRUPackCache:
@@ -117,8 +130,8 @@ def clear_conv3d_weight_pack_caches() -> None:
     _PACK_CACHE_3D_WINOGRAD_HW.clear()
 
 
-def _pack_cache_key(w: torch.Tensor, block: int) -> tuple:
-    """Identity for a packed weight, including aliases and in-place updates."""
+def _pack_cache_key(w: torch.Tensor, block: int, version: int | None) -> tuple:
+    """Identity for a packed weight, including its mutation policy."""
     return (
         w.data_ptr(),
         w.device.type,
@@ -126,7 +139,7 @@ def _pack_cache_key(w: torch.Tensor, block: int) -> tuple:
         tuple(w.shape),
         tuple(w.stride()),
         w.dtype,
-        w._version,
+        version,
         block,
     )
 
@@ -159,7 +172,17 @@ def _prepack_fixed_kernel(weight: torch.Tensor, taps: int, block: int):
 
 
 def _get_or_make_pack(cache, weight: torch.Tensor, block: int, packer):
-    key = _pack_cache_key(weight, block)
+    if weight.is_inference():
+        # Inference tensors deliberately have no version counter. The safe
+        # default repacks current values on every call. Fixed-weight inference
+        # deployments may explicitly opt into a versionless cache.
+        if not _TORCH_INFERENCE_TENSOR_WEIGHTS_IMMUTABLE:
+            return packer(weight, block)
+        version = None
+    else:
+        version = weight._version
+
+    key = _pack_cache_key(weight, block, version)
     cached = cache.get(key)
     if cached is not None:
         return cached[1]
