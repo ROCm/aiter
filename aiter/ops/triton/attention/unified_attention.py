@@ -511,6 +511,28 @@ def is_reduce_gluon_available(params: _UAParams, NUM_SEGMENTS, backend: str):
     return use_gluon and use_gluon_arch
 
 
+def _split_loop_modes(params: _UAParams, config: dict) -> tuple[bool, bool]:
+    """``(SPLIT_UNMASKED_LOOP, FUSE_QK_SCALE)`` for this call.
+
+    The tuned table decides where the split loop is worth it; this only strips
+    what would be unsound for the call at hand, whatever the table says. The
+    unmasked bulk pass drops the sliding-window bound along with the causal
+    one, so it is refused for windowed layers (an entry that forgot its SW
+    sibling would otherwise compute wrong results), and decode has one query
+    row and no bulk to speak of.
+
+    The fold takes the maximum of the *unscaled* logits and scales that, which
+    is the true maximum only because scaling by a positive constant is
+    monotone, so it is refused for a non-positive softmax_scale. The descales
+    are quantization scales and positive by construction.
+    """
+    split = bool(config.get("SPLIT_UNMASKED_LOOP", False))
+    if params.sliding_window > 0 or params.all_decode:
+        split = False
+    fuse = split and bool(config.get("FUSE_QK_SCALE", False))
+    return split, fuse and params.softmax_scale > 0
+
+
 def _unified_attention_2d_triton(params: _UAParams):
     if params.shuffled_kv_cache and (
         params.q_dtype == e4m3_dtype and params.kv_cache_dtype == e4m3_dtype
@@ -527,6 +549,9 @@ def _unified_attention_2d_triton(params: _UAParams):
     assert config["BLOCK_Q"] >= 1
     if params.shuffled_kv_cache:
         config["TILE_SIZE"] = params.block_size
+    config["SPLIT_UNMASKED_LOOP"], config["FUSE_QK_SCALE"] = _split_loop_modes(
+        params, config
+    )
     if params.all_decode:
         total_num_q_blocks = params.num_seqs
     else:
