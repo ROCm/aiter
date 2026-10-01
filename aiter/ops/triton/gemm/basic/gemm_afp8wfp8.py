@@ -237,6 +237,7 @@ def gemm_afp8wfp8(
         "B_SCALE_N_GROUP": group_n,
         "B_SCALE_K_GROUP": group_k,
     }
+    const_scales = packed is not None and launch.get("CONSTEXPR_SCALE_STRIDES", False)
     if packed is not None:
         # Native E4M3 pointers avoid the extra LDS conversion generated for
         # byte operands in packed dot_scaled, while accepting public byte views.
@@ -269,6 +270,10 @@ def gemm_afp8wfp8(
             stride_bsn=w_scales.stride(0),
             stride_bsk=w_scales.stride(1),
             stride_cm=stride_cm,
+            # Config opt-in: compile-time scale row strides let the compiler
+            # copy scales straight into LDS instead of staging them in VGPRs.
+            STRIDE_ASM_C=stride_asm if const_scales else 0,
+            STRIDE_BSN_C=w_scales.stride(0) if const_scales else 0,
             stride_cn=stride_cn,
             stride_ck=stride_ck,
             **scales,

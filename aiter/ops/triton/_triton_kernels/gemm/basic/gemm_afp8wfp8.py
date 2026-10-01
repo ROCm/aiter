@@ -381,6 +381,10 @@ def _gemm_afp8wfp8_packed_kernel(
     B_SCALE_N_GROUP: tl.constexpr = 32,
     B_SCALE_K_GROUP: tl.constexpr = 32,
     NUM_KSPLIT: tl.constexpr = 1,
+    # Nonzero: compile-time scale row strides. Small-M launches pass them so the
+    # compiler can prove scale-row alignment and copy scales straight into LDS.
+    STRIDE_ASM_C: tl.constexpr = 0,
+    STRIDE_BSN_C: tl.constexpr = 0,
 ):
     """Small-M E4M3 GEMM with K panels packed into MFMA rows/columns.
 
@@ -394,6 +398,8 @@ def _gemm_afp8wfp8_packed_kernel(
     tl.static_assert(K_PACK == 1 or K_PACK == 2 or K_PACK == 4)
     tl.static_assert(BLOCK_SIZE_M * K_PACK >= 16)
     tl.static_assert(BLOCK_SIZE_K >= 128 and BLOCK_SIZE_K % 32 == 0)
+    stride_asm = STRIDE_ASM_C if STRIDE_ASM_C != 0 else stride_asm
+    stride_bsn = STRIDE_BSN_C if STRIDE_BSN_C != 0 else stride_bsn
     STEP: tl.constexpr = BLOCK_SIZE_K * K_PACK
     tl.static_assert(SPLITK_BLOCK_SIZE % STEP == 0)
     if FUSED_SPLITS > 1:

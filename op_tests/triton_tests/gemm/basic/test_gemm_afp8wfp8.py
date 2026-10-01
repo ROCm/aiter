@@ -504,6 +504,37 @@ def test_compact_scale_execution_variants(a_group, b_group, packed, fused, trans
     assert config == original
 
 
+@pytest.mark.parametrize("a_group", [32, 128])
+@pytest.mark.parametrize("b_group", [(1, 32), (32, 32)])
+@pytest.mark.parametrize("transposed", [False, True])
+@pytest.mark.usefixtures("_require_gfx950")
+def test_packed_constexpr_scale_strides(a_group, b_group, transposed):
+    # K=1152 gives 36-byte group32 scale rows, which Triton cannot prove aligned
+    # from a runtime stride. The constexpr opt-in must not change the result.
+    x, w, xs, ws, expected = _compact_scale_inputs(24, 131, 1152, a_group, b_group)
+    if transposed:
+        xs = xs.T.contiguous().reshape(xs.shape)
+    runtime = _execution_config(packed=True)
+    constexpr = copy.deepcopy(runtime)
+    constexpr["packed"]["CONSTEXPR_SCALE_STRIDES"] = True
+    outputs = [
+        gemm_afp8wfp8(
+            x,
+            w,
+            xs,
+            ws,
+            dtype=torch.bfloat16,
+            config=config,
+            x_scale_group_size=a_group,
+            w_scale_group_size=b_group,
+            is_x_scale_transposed=transposed,
+        )
+        for config in (runtime, constexpr)
+    ]
+    _assert_compact_scale_close(outputs[1], expected)
+    torch.testing.assert_close(outputs[1], outputs[0], atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("b_group", [(32, 32), (128, 128)])
 @pytest.mark.parametrize("splits", [3, 64])
