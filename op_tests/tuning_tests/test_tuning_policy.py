@@ -77,6 +77,18 @@ class TestPromotionPolicy(unittest.TestCase):
             policy.PromotionPolicy(min_improvement_pct=-1.0)
 
 
+class TestFinalistPolicy(unittest.TestCase):
+    def test_rejects_an_empty_finalist_round(self):
+        with self.assertRaises(ValueError):
+            policy.FinalistPolicy(finalists=0)
+        with self.assertRaises(ValueError):
+            policy.FinalistPolicy(rounds=0)
+
+    def test_rejects_a_significance_bar_of_zero(self):
+        with self.assertRaises(ValueError):
+            policy.FinalistPolicy(significance_sigma=0.0)
+
+
 class TestRacePolicy(unittest.TestCase):
     def test_rejects_an_unusable_error_budget(self):
         for alpha in (0.0, 1.0):
@@ -121,6 +133,24 @@ class TestGateAgainstIncumbent(unittest.TestCase):
                 decision = self.gate(incumbent, 50.0)
                 self.assertEqual(decision.outcome, policy.PROMOTE)
                 self.assertIsNone(decision.margin_pct)
+
+    def test_the_standard_error_bar_is_in_percent(self):
+        # 2 sigma x 2.5 us combined standard error on 100 us.
+        self.assertAlmostEqual(policy.standard_error_bar(100.0, 2.5), 5.0)
+        self.assertEqual(policy.standard_error_bar(None, 2.5), 0.0)
+
+    def test_noise_above_the_minimum_raises_the_bar(self):
+        # A 4% win clears the 3% minimum, but not a 5% noise floor.
+        decision = policy.gate_against_incumbent(100.0, 96.0, self.BAR, noise_pct=5.0)
+        self.assertEqual(decision.outcome, policy.RETAIN)
+        self.assertAlmostEqual(decision.bar_pct, 5.0)
+        self.assertEqual(self.gate(100.0, 96.0).outcome, policy.PROMOTE)
+
+    def test_noise_below_the_minimum_does_not_lower_the_bar(self):
+        # Well resolved but too small to be worth a row.
+        decision = policy.gate_against_incumbent(100.0, 99.0, self.BAR, noise_pct=0.1)
+        self.assertEqual(decision.outcome, policy.RETAIN)
+        self.assertAlmostEqual(decision.bar_pct, 3.0)
 
     def test_an_unmeasured_challenger_is_a_caller_error(self):
         for challenger in (None, 0.0, -1.0, float("inf")):
