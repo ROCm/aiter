@@ -89,9 +89,9 @@ def run_benchmark(args):
         raise ValueError("Use either --shape or --model, not both")
 
     x_vals = parse_shape_args(args)
-    providers = args.provider.split(",")
-    if args.use_sr and providers != ["triton"]:
-        raise ValueError("--use-sr currently requires --provider triton")
+    line_vals = get_line_vals(args)
+    if args.use_sr and line_vals != ["mxfp4-triton"]:
+        raise ValueError("--use-sr currently requires --format mxfp4 --provider triton")
     if args.use_sr and args.dtype not in ("bf16", "fp32"):
         raise ValueError("--use-sr requires --dtype bf16 or fp32")
     if args.use_sr and any(M <= 0 or N <= 0 or N % 32 != 0 for _, M, N in x_vals):
@@ -129,14 +129,12 @@ def run_benchmark(args):
         x = torch.randn((M, N), dtype=dtype, device="cuda")
         quant_fn = get_provider(fmt, provider)
 
-        def fn():
-            if use_sr:
-                return quant_fn(x, use_sr=True, philox_seed=1234)
-            return quant_fn(x)
-
-        # Rotates inputs past L2 size.
-        _, us = run_perftest(fn)
-        ms = us / 1000
+        # Rotates input copies past L2 so timings are not cache-hot.
+        if use_sr:
+            _, us = run_perftest(quant_fn, x, use_sr=True, philox_seed=1234)
+        else:
+            _, us = run_perftest(quant_fn, x)
+        ms = us * 1e-3
 
         # Read x and write quantized output + block scales.
         x_bytes = x.numel() * x.element_size()
