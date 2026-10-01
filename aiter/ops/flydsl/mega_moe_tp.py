@@ -6,16 +6,27 @@ Experts are replicated over the TP group and ``inter_dim`` is sharded. One
 launch runs the collectives around GEMM1 + activation + GEMM2 of this rank's
 inter slice (the intermediate stays in LDS), dispatched on ``comm_mode``:
 
-* ``"ag_rs"`` (default): tokens enter sequence-parallel; the layer quantizes
-  and all-gathers them, sums each token's top-k routes and reduce-scatters::
+* ``"ag_rs"`` (default): tokens enter sequence-parallel (each rank its own
+  ``m`` tokens and their routing); the layer all-gathers them, sums each
+  token's top-k routes and reduce-scatters back to the owner::
 
     y_local = moe(x_local, topk_weights, topk_ids)   # [m, H] -> [m, H]
 
-* ``"ar_ar"``: every rank holds a bf16 partial of all ``M = tp * m`` tokens
-  (e.g. a row-parallel projection's output) and the routing of all of them;
-  the layer all-reduces the input, and all-reduces the output::
+* ``"rs"``: every rank holds the same ``M = tp * m`` tokens and routing (all
+  gathered outside); the output is reduce-scattered (rank r gets rows
+  ``r*m : (r+1)*m``)::
 
-    y = moe(x_partial, topk_weights, topk_ids)       # [M, H] -> [M, H]
+    y_local = moe(x, topk_weights, topk_ids)[r*m:(r+1)*m]   # [M, H] -> [m, H]
+
+* ``"ar"``: the standard TP MoE layer: every rank holds the same full hidden
+  state ``x`` and routing of all ``M`` tokens; only the output is
+  all-reduced (identical on every rank)::
+
+    y = moe(x, topk_weights, topk_ids)               # [M, H] -> [M, H]
+
+* ``"ar_ar"``: as ``"ar"``, but each rank holds a bf16 *partial* of ``x``
+  (e.g. the output of a row-parallel projection before its all-reduce); the
+  layer all-reduces the input too. Routing must be the same on every rank.
 
 Weights are MXFP4 (``shuffle_weight(16, 16)`` + ``e8m0_shuffle`` scales), the
 layout the flydsl MoE kernels take. See ``kernels/mega_moe_tp/mega_moe_tp_kernel.py``.
@@ -24,15 +35,17 @@ Contract (the kernel synchronizes the ranks through flags in each other's memory
 
 * ``forward`` is a collective: every rank of the group calls it the same number
   of times, in the same order, with the same number of local tokens ``m``
-  (ag_rs: pad to a common ``m``). ``m == 0`` returns an empty tensor. A rank
+  (ag_rs: pad to a common ``m``); in ``rs`` / ``ar`` / ``ar_ar`` every rank
+  passes the same routing (and, ``rs`` / ``ar``, the same ``x``).
+  ``AITER_MEGAMOE_TP_CHECK=1`` verifies both per call (one collective). ``m == 0`` returns an empty tensor. A rank
   that falls out of step makes the waits time out (2 s each); ``poll_errors`` /
   ``check_errors`` (or ``AITER_MEGAMOE_TP_CHECK=1``: check after every eager
   forward) report it, and ``reset()`` (collective) restarts the layer.
 * ``topk_ids`` outside ``[0, experts)`` are masked (the route adds nothing);
   a token must not repeat an expert.
 * The result is a view of an internal buffer, valid until the next forward of
-  this layer (ar_ar: peers write into it during that forward); pass ``out=`` to
-  get it in a buffer of your own.
+  this layer (ar / ar_ar: peers write into it during that forward); pass
+  ``out=`` to get it in a buffer of your own (ag_rs / rs: written in place).
 * The kernel keeps every CU busy and spins on peers: do not overlap it with
   another persistent / communication kernel (e.g. another layer's, a custom
   all-reduce on a side stream).
@@ -53,11 +66,10 @@ import torch
 
 from aiter import ActivationType
 
-from .kernels.mega_moe_tp.mega_moe_tp import MegaMoeTPEngine
+from .kernels.mega_moe_tp.mega_moe_tp import COMM_MODES, MegaMoeTPEngine
 
 __all__ = ["COMM_MODES", "MegaMoeTP", "MegaMoeTPConfig", "mega_moe_tp_supported"]
 
-COMM_MODES = ("ag_rs", "ar_ar")
 _ACTS = (ActivationType.Silu, ActivationType.Swiglu, ActivationType.Situv2)
 
 
@@ -143,6 +155,7 @@ class MegaMoeTP:
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """ag_rs: x_local [m, H] bf16 (this rank's tokens), topk_* [m, topk].
+        rs / ar: x [M, H] bf16 (all tokens, same on every rank), topk_* [M, topk].
         ar_ar: x [M, H] bf16 (this rank's partial of every token), topk_* [M, topk]
         (the same routing on every rank). topk_ids int32, topk_weights float32
         (others are converted per call)."""

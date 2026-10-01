@@ -55,7 +55,8 @@ __all__ = [
 ]
 
 LDS_LIMIT = 160 * 1024
-_CHECK = os.environ.get("AITER_MEGAMOE_TP_CHECK", "0") == "1"
+COMM_MODES = ("ag_rs", "rs", "ar", "ar_ar")
+_TUNED_LIKE = {"ar": "ar_ar", "rs": "ag_rs"}
 _ERR_NAMES = (
     (ERR_FLAG, "flag"),
     (ERR_META, "routing"),
@@ -190,7 +191,7 @@ class MegaMoeTPEngine:
             raise ValueError(
                 f"fused TP MegaMoE does not tile h{model_dim} i{inter_dim} tp{world_size}"
             )
-        if comm_mode not in ("ag_rs", "ar_ar"):
+        if comm_mode not in COMM_MODES:
             raise ValueError(f"unknown comm_mode {comm_mode!r}")
         if comm_dtype not in ("fp8", "bf16"):
             raise ValueError(f"unknown comm_dtype {comm_dtype!r}")
@@ -199,7 +200,12 @@ class MegaMoeTPEngine:
             raise ValueError(
                 f"need 1 <= topk ({topk}) <= experts ({experts}), max_local_tokens >= 1"
             )
-        self.ar = comm_mode == "ar_ar"
+        self.mode = comm_mode
+        self.check = os.environ.get("AITER_MEGAMOE_TP_CHECK", "0") == "1"
+        self.ar = comm_mode in ("ar", "ar_ar")
+        self.xrep = comm_mode in ("ar", "rs")
+        # inputs and routing of every token on every rank
+        self.rrep = self.ar or self.xrep
         self.rank, self.tp = int(rank), int(world_size)
         self.H, self.I, self.E, self.K = model_dim, inter_dim, experts, topk
         self.mmax = int(max_local_tokens)
@@ -256,7 +262,9 @@ class MegaMoeTPEngine:
         )
         self._flag = arena.reserve("flag", (FLAG_INTS,), torch.int32)
         self._pre = arena.reserve(
-            "pre", (self.tp, self.mmax, H) if self.ar else (1,), torch.bfloat16
+            "pre",
+            (self.tp, self.mmax, H) if self.ar and not self.xrep else (1,),
+            torch.bfloat16,
         )
         self._yall = arena.reserve(
             "yall", (tot, H) if self.ar else (1,), torch.bfloat16
@@ -267,7 +275,9 @@ class MegaMoeTPEngine:
         self.routes = torch.zeros(
             (tot * topk + 1, H), dtype=torch.bfloat16, device=self.device
         )
-        self.y = torch.empty((self.mmax, H), dtype=torch.bfloat16, device=self.device)
+        self.y = torch.empty(
+            (tot if self.ar else self.mmax, H), dtype=torch.bfloat16, device=self.device
+        )
 
         self._scheds: dict = {}
         self.sched = self._sched(0)
@@ -304,9 +314,12 @@ class MegaMoeTPEngine:
             topk,
             activation,
         )
-        self._tuned = _tuned_rows(os.path.abspath(tuned_config_path())).get(
-            tuple(str(k) for k in key), []
-        )
+        rows = _tuned_rows(os.path.abspath(tuned_config_path()))
+        self._tuned = rows.get(tuple(str(k) for k in key), [])
+        if not self._tuned and comm_mode in _TUNED_LIKE:
+            # same output collective and schedule: the closest tuned mode
+            key = key[:3] + (_TUNED_LIKE[comm_mode],) + key[4:]
+            self._tuned = rows.get(tuple(str(k) for k in key), [])
         self._cfgs: dict = {}
         self._launchers: dict = {}
         self._armed: set = set()
@@ -560,6 +573,10 @@ class MegaMoeTPEngine:
     def _cfg_sched(self, cfg: LaunchCfg) -> _Sched:
         return self._sched(0 if cfg.dyn else cfg.xb)
 
+    def _arll(self, cfg: LaunchCfg) -> bool:
+        sc = self._cfg_sched(cfg)
+        return self.ar and cfg.ll and cfg.llr and (cfg.dyn or sc.npieces <= 1)
+
     def _xl(self, cfg: LaunchCfg) -> bool:
         return not cfg.dyn and not cfg.ll and self._cfg_sched(cfg).xl_e0 > 0
 
@@ -602,6 +619,7 @@ class MegaMoeTPEngine:
                 xl=self._xl(cfg),
                 xl_s0=sc.xl_s0 if self._xl(cfg) else 0,
                 comm_bf16=self.comm_bf16,
+                xrep=self.xrep,
                 **static,
             )
             self._launchers[cfg] = fn
@@ -631,20 +649,45 @@ class MegaMoeTPEngine:
         if not topk_weights.is_floating_point():
             raise ValueError(f"topk_weights: need float32, got {topk_weights.dtype}")
         m = rows
-        if self.ar:
+        if self.rrep:
             if m % self.tp:
                 raise ValueError(
-                    f"ar_ar: {m} tokens are not a multiple of tp={self.tp}"
+                    f"{self.mode}: {m} tokens are not a multiple of tp={self.tp}"
                 )
             m //= self.tp
         if m > self.mmax:
             raise ValueError(f"{m} local tokens exceed max_local_tokens {self.mmax}")
-        if _CHECK and not self.ar and dist.is_initialized() and self.arena.ipc:
-            ms = [None] * self.tp
-            dist.all_gather_object(ms, m, group=self.arena.group)
-            if len(set(ms)) > 1:
-                raise ValueError(f"ag_rs: local token counts differ across ranks: {ms}")
+        if (
+            self.check
+            and dist.is_initialized()
+            and self.arena.ipc
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            self._check_replicas(m, x, topk_weights, topk_ids)
         return m
+
+    def _check_replicas(self, m, x, topk_weights, topk_ids) -> None:
+        """Debug: the inputs every rank must agree on (one collective per call)."""
+        if self.rrep:
+            # cheap fingerprints of the replicated inputs (and routing)
+            fp = [
+                float(t.double().sum())
+                for t in (x, topk_weights, topk_ids, (x.float() * x.float()).sum(1))
+            ]
+        else:
+            fp = []
+        got = [None] * self.tp
+        dist.all_gather_object(got, (m, fp), group=self.arena.group)
+        if len({g[0] for g in got}) > 1:
+            raise ValueError(
+                f"{self.mode}: local token counts differ across ranks: "
+                f"{[g[0] for g in got]}"
+            )
+        if self.rrep and any(g[1] != fp for g in got):
+            raise ValueError(
+                f"{self.mode}: x / topk_ids / topk_weights must be the same on every "
+                "rank (replicated input)"
+            )
 
     def prepare(self, local_tokens) -> None:
         """Compile and arm the kernel for these local token counts (collective:
@@ -719,7 +762,7 @@ class MegaMoeTPEngine:
         out: torch.Tensor | None = None,
     ):
         m = self._local_tokens(x_local, topk_weights, topk_ids)
-        rows = m * self.tp if self.ar else m
+        rows = m * self.tp if self.ar else m  # output rows
         if out is not None and (
             tuple(out.shape) != (rows, self.H)
             or out.dtype != torch.bfloat16
@@ -733,7 +776,10 @@ class MegaMoeTPEngine:
         ids = topk_ids.to(torch.int32).contiguous()
         tw = topk_weights.to(torch.float32).contiguous()
         cfg = self.config(m)
-        y = out if out is not None and not self.ar else self.y
+        # output written in place: ag_rs / rs, and ar when the all-reduce ends
+        # locally (one-shot LL); else it lands in the peers' symmetric buffer
+        local_y = not self.ar or self._arll(cfg)
+        y = out if out is not None and local_y else self.y
         key = (m, x.data_ptr(), ids.data_ptr(), tw.data_ptr(), y.data_ptr(), cfg)
         if self._args[0] != key:
             args = self._launch_args(m, cfg, y, x, ids, tw)
@@ -743,12 +789,12 @@ class MegaMoeTPEngine:
         _run_compiled(
             self._launcher(cfg), *self._args[1][0], torch.cuda.current_stream()
         )
-        if _CHECK and not torch.cuda.is_current_stream_capturing():
+        if self.check and not torch.cuda.is_current_stream_capturing():
             self.check_errors()
-        if self.ar:
-            y = self._yall.local[: m * self.tp]
+        if not local_y:
+            y = self._yall.local[:rows]
             return y if out is None else out.copy_(y)
-        return y[:m] if out is None else out
+        return y[:rows] if out is None else out
 
     __call__ = forward
 

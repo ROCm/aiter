@@ -9,9 +9,9 @@ watchdog, replay == eager) and merge the fastest of those within --acc-slack of
 the most accurate into the tuned CSV::
 
     python op_tests/tuners/tune_mega_moe_tp.py --models glm5 m3 \\
-        --tokens 8 16 32 64 96 128 256 512 1024 2048 --comm-modes ag_rs ar_ar
+        --tokens 8 16 32 64 96 128 256 512 1024 2048 --comm-modes ag_rs ar
 
-One process drives all --tp GPUs (like ``test_mega_moe_TP.py --single-process``);
+One process drives all --tp GPUs (like ``bench_mega_moe_TP.py --single-process``);
 each cell runs in its own subprocess. HIP_VISIBLE_DEVICES pins the GPUs.
 """
 
@@ -29,9 +29,11 @@ import time
 
 sys.path.insert(
     0,
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "multigpu_tests"),
+    os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "op_benchmarks", "flydsl"
+    ),
 )
-import test_mega_moe_TP as T
+import bench_mega_moe_TP as T
 import torch
 
 from aiter.jit.core import AITER_CONFIG_MEGAMOE_TP
@@ -266,7 +268,7 @@ def main() -> int:
         nargs="+",
         default=[8, 16, 32, 64, 96, 128, 256, 512, 1024, 2048],
     )
-    p.add_argument("--comm-modes", nargs="+", default=["ag_rs", "ar_ar"])
+    p.add_argument("--comm-modes", nargs="+", default=["ag_rs", "ar"])
     p.add_argument("--tp", type=int, default=4)
     p.add_argument("--iters", type=int, default=20)
     p.add_argument("--rounds", type=int, default=5)

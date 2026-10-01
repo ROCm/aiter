@@ -263,6 +263,7 @@ def compile_mega_moe_tp(
     xl: bool = False,
     xl_s0: int = 0,
     comm_bf16: bool = False,
+    xrep: bool = False,
 ):
     """Build the launcher for one (shape, variant) instance.
 
@@ -276,6 +277,10 @@ def compile_mega_moe_tp(
         expert, column-split experts, column-slice width in groups).
     ll_rs: LL ReduceScatter packets; ll_route: LL route rows too.
     comm_bf16: bf16 (not MXFP8) ReduceScatter / all-reduce partials (no LL).
+    xrep: every rank holds the same full input and routing of all tokens
+        (each rank quantizes and all-gathers its 1/tp of the rows); with ar
+        this is the standard TP layer (only the output is all-reduced), without
+        it the output is reduce-scattered.
     """
     DYN = dyn_e > 0
     if swiglu_limit is None:
@@ -305,7 +310,12 @@ def compile_mega_moe_tp(
     DYN_PS = [p for p in range(1, KS2 + 1) if KS2 % p == 0]
     DLL = LL and bool(ll_route) and (DYN or NPC == 1)
     assert not DLL or FP8R
-    MLL = DLL and not ar
+    XREP = bool(xrep)
+    # routing of every token on every rank (no routing all-gather)
+    RREP = bool(ar) or XREP
+    # input is each rank's partial of every token: reduce it before quantizing
+    AIN = bool(ar) and not XREP
+    MLL = DLL and not RREP
     ARLL = DLL and bool(ar)
     ROW_B = 2 * H if DLL else (H + H // 32 if FP8R else 2 * H)
     XSPLIT = xsplit > 0
@@ -335,6 +345,7 @@ def compile_mega_moe_tp(
         + ("_llr" if DLL else "")
         + (f"_xl{xl_s0}" if XL else "")
         + ("_cb16" if CB16 else "")
+        + ("_xrep" if XREP else "")
     )
     const_expr = fx.const_expr
     # flydsl's cache key ignores module constants: the kernel references this tag
@@ -1430,17 +1441,17 @@ def compile_mega_moe_tp(
         w = tid // i32(64)
         if const_expr(MLL):
             meta_ll_wait(tid, a)
-        elif const_expr(not AR):
+        elif const_expr(not RREP):
             ag_wait_meta(a, tid, a["epoch"])
         _stale_dropped(tid, a)
         # ag_rs: after the cbar, i.e. after every wave's routing wait
-        if const_expr(AR and not DLL):
+        if const_expr(RREP and not DLL):
             zero_masked(L, tid % i32(64), a, tid // i32(64), NW)
         cbar(L, tid)
         if const_expr(MLL):  # noqa: SIM102 (compile-time guard)
             if tid == i32(0):
                 lds_st_rel(L, L_CTL + C_RLAND * 4, i32(1))
-        if const_expr(not AR and not DLL):
+        if const_expr(not RREP and not DLL):
             zero_masked(L, tid % i32(64), a, tid // i32(64), NW)
         if const_expr(DYN):
             dyn_plan(L, tid, a)
@@ -1717,7 +1728,7 @@ def compile_mega_moe_tp(
     @traced
     def classify_tokens(L, lane, a):
         if const_expr(XL):
-            if const_expr(not AR):
+            if const_expr(not RREP):
                 pend = _meta_pending(a, lane, a["epoch"])
                 t0 = _now()
                 while (pend != i32(0)) & _alive(t0):
@@ -2438,7 +2449,7 @@ def compile_mega_moe_tp(
         return (ag_split(a) > i32(1)).select(i32(1), i32(PRE_CH))
 
     def ag_npar(a):
-        return ((ag_split(a) > i32(1)) & fx.Boolean(AR)).select(i32(2), i32(1))
+        return ((ag_split(a) > i32(1)) & fx.Boolean(AIN)).select(i32(2), i32(1))
 
     def _row32(rs, row, g, aux):
         f = []
@@ -2455,8 +2466,8 @@ def compile_mega_moe_tp(
         return f
 
     def ag_row_vals(a, rxl, i, g):
-        if const_expr(not AR):
-            return _row32(rxl, i, g, 0)
+        if const_expr(not AIN):
+            return _row32(rxl, (a["rank"] * a["m"] if RREP else i32(0)) + i, g, 0)
         f = _row32(rxl, a["rank"] * a["m"] + i, g, 0)
         rpre = own_rs(a, "off_pre")
         for src in range_constexpr(TPC):
@@ -2557,7 +2568,7 @@ def compile_mega_moe_tp(
         row0, stride_r, nrows, qb, qstep, cnt = ag_rows(a)
         k_hi = fx.min(k_hi, cnt)
         nk = fx.max(k_hi - k_lo, i32(0))
-        rxl = rsrc(a["x"], (a["ttot"] if AR else a["m"]) * i32(H * 2))
+        rxl = rsrc(a["x"], (a["ttot"] if RREP else a["m"]) * i32(H * 2))
         for q_ in range(t0, nrows * nk * i32(8), i32(stride)):
             q = i32(q_)
             r = q // (nk * i32(8))
@@ -2580,7 +2591,7 @@ def compile_mega_moe_tp(
     def ag_send(L, lane, a, par=0):
         row0, stride, nrows, qb, qs, cnt = ag_rows(a)
         rank = a["rank"]
-        if const_expr(not AR and par == 0 and not MLL):
+        if const_expr(not RREP and par == 0 and not MLL):
             mp = (ag_split(a) > i32(1)).select(
                 i32(0), _meta_pending(a, lane, a["epoch"], own=True)
             )
@@ -2599,14 +2610,14 @@ def compile_mega_moe_tp(
         rs = [peer_rs(a, p, "off_xs", xs_bytes) for p in range(TPC)]
         pc = ag_group(a)
         split = ag_split(a) > i32(1)
-        pipe = (split & fx.Boolean(AR)) == fx.Boolean(False)
+        pipe = (split & fx.Boolean(AIN)) == fx.Boolean(False)
         npar = ag_npar(a)
         part = i32(par) < npar
         for k in range_constexpr(NCHA):
             mine = (i32(k) % npar) == i32(par)
             kl = (i32(k) < cnt) & mine
             q = fx.min(qb + i32(k) * qs, i32(NCHA - 1))
-            if const_expr(AR and k >= 1):  # noqa: SIM102 (compile-time guard)
+            if const_expr(AIN and k >= 1):  # noqa: SIM102 (compile-time guard)
                 if split & mine & (i32(k) >= npar) & (i32(k) - npar < cnt):
                     wait_vm(0)
                     _ag_bump(a, lane, qb + (i32(k) - npar) * qs)
@@ -2614,7 +2625,7 @@ def compile_mega_moe_tp(
                 ag_chunk(
                     L, lane, a, k, q, pc, r, j, rok, gslot, rx, rs, x_bytes, xs_bytes
                 )
-            if const_expr(AR):
+            if const_expr(AIN):
                 _agk_note(L, lane, kl)
             if const_expr(k == NCHA - 1):
                 wait_lgkm0()
@@ -2634,7 +2645,7 @@ def compile_mega_moe_tp(
 
     @traced
     def ag_chunk(L, lane, a, k, q, pc, r, j, rok, gslot, rx, rs, x_bytes, xs_bytes):
-        if const_expr(AR):
+        if const_expr(AIN):
             if (i32(k) % pc) == i32(0):
                 pre_wait(lane, a, i32(k) // pc)
                 quant_chunks(L, lane, 64, a, i32(k), i32(k) + pc)
@@ -2949,7 +2960,7 @@ def compile_mega_moe_tp(
         ttot = a["ttot"]
         trows = a["mmax"] * a["tp"]
         r_recv = own_rs(a, "off_part")
-        ry = own_rs(a, "off_yall")
+        ry = rsrc(a["y"], ttot * i32(H * 2))
         it0, istep = _dll_items(ws)
         for it_ in range(it0, ttot * i32(NCK), istep):
             it = i32(it_)
@@ -3002,7 +3013,7 @@ def compile_mega_moe_tp(
             else:
                 if tid >= i32(NT + 192):
                     classify_tokens(L, tid % i32(64), a)
-                if const_expr(AR):
+                if const_expr(AIN):
                     if tid < i32(NT + 192):
                         pre_send(L, tid % i32(64), a)
                     else:
@@ -3113,7 +3124,7 @@ def compile_mega_moe_tp(
         # at the start suffices
         _drop_stale(tid, a)
         claim_reset(tid, a)
-        if const_expr(AR):
+        if const_expr(RREP):
             a["ids"] = fx.Int64(ids_in)
             a["tw"] = fx.Int64(tw_in)
         else:
@@ -3127,6 +3138,7 @@ def compile_mega_moe_tp(
                     _ag_send_meta_ll(tid % i32(64), a)
                 else:
                     _ag_send_meta(tid % i32(64), a)
+        if const_expr(not AIN):
             quant_chunks(L, tid, NTT, a, i32(0), i32(NCHA))
         gpu.barrier()
         a["ax"] = fx.Int64(mine) + off_x
