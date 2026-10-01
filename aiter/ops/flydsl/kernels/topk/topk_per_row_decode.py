@@ -60,7 +60,8 @@ _STATE_REMAINING_K = 2
 _STATE_WRITE_COUNTER = 3
 _STATE_EQ_COUNTER = 4
 _STATE_DIRECT = 5
-_STATE_SIZE = 6
+_STATE_ACTIVE_CHUNKS = 6
+_STATE_SIZE = 7
 
 
 def topk_per_row_decode_workspace_shapes(
@@ -164,6 +165,21 @@ def _row_length(row, row_ends, width, next_n):
     row_len = row_ends[request] - next_n + offset + 1
     row_len = (row_len < 0).select(fx.Int32(0), row_len)
     return (row_len > width).select(width, row_len)
+
+
+def _active_chunks(row_len, chunks_per_row, block_threads, stable):
+    """Chunks with work at the live row length, not the captured row width.
+
+    The unstable scan already hands tail chunks nothing to read when the row is
+    short, so skipping them changes no result, only the traffic. The stable
+    path splits the row evenly, so every chunk is live.
+    """
+    if const_expr(stable):
+        return fx.Int32(chunks_per_row)
+    row_vectors = (row_len + fx.Int32(_VEC - 1)) // fx.Int32(_VEC)
+    active = (row_vectors + fx.Int32(block_threads - 1)) // fx.Int32(block_threads)
+    active = (active < fx.Int32(1)).select(fx.Int32(1), active)
+    return (active > fx.Int32(chunks_per_row)).select(fx.Int32(chunks_per_row), active)
 
 
 def _load_f32x4(tensor, vec_idx):
@@ -343,6 +359,7 @@ def build_topk_per_row_decode_module(
         row_values = fx.slice(values, (row, None))
         row_len = _row_length(row, row_ends, n, next_n)
         direct = row_len <= fx.Int32(k)
+        active_chunks = _active_chunks(row_len, chunks_per_row, block_threads, stable)
         row_state = fx.slice(state, (row, None))
         chunk_hist = fx.slice(partial_hist, (row, chunk, None))
         if first_pass != 0 and chunk == 0 and tid == 0:
@@ -350,6 +367,7 @@ def build_topk_per_row_decode_module(
             row_state[_STATE_MASK] = 0
             row_state[_STATE_REMAINING_K] = (row_len < k).select(row_len, fx.Int32(k))
             row_state[_STATE_DIRECT] = direct.select(fx.Int32(1), fx.Int32(0))
+            row_state[_STATE_ACTIVE_CHUNKS] = active_chunks
         if first_pass != 0 and chunk == 0 and direct:
             for output_step in range_constexpr(output_steps):
                 out_pos = fx.Int32(output_step * block_threads) + fx.Int32(tid)
@@ -367,7 +385,7 @@ def build_topk_per_row_decode_module(
         s_hist = storage.bins.peek().view(fx.make_layout(max_n_hist_bins, 1))
         s_scan = storage.scan.peek().view(fx.make_layout(block_num_waves + 1, 1))
 
-        if direct == 0:
+        if (direct == 0) & (chunk < active_chunks):
             # Preserve each chunk's values eliminated above the selected radix bin.
             if stable:
                 if first_pass != 0:
@@ -516,6 +534,7 @@ def build_topk_per_row_decode_module(
             return result
 
         if row_state[_STATE_DIRECT] == 0:
+            active_chunks = row_state[_STATE_ACTIVE_CHUNKS]
             bins_per_thread = num_bins // reduce_threads
             select_bin = fx.Int32(num_bins - 1) - tid * fx.Int32(bins_per_thread)
             bin_counts = fx.make_rmem_tensor(bins_per_thread, Int32)
@@ -527,14 +546,15 @@ def build_topk_per_row_decode_module(
             # descending-bin order expected by the block prefix scan.
             group_low = select_bin - fx.Int32(bins_per_thread - 1)
             for chunk in range_constexpr(chunks_per_row):
-                for vec_item in range_constexpr(bins_per_thread // _VEC):
-                    values = load_hist_vec(
-                        fx.Int32(chunk),
-                        (group_low // fx.Int32(_VEC)) + fx.Int32(vec_item),
-                    )
-                    for vi in range_constexpr(_VEC):
-                        bin_item = bins_per_thread - 1 - (vec_item * _VEC + vi)
-                        bin_counts[bin_item] = bin_counts[bin_item] + values[vi]
+                if fx.Int32(chunk) < active_chunks:
+                    for vec_item in range_constexpr(bins_per_thread // _VEC):
+                        values = load_hist_vec(
+                            fx.Int32(chunk),
+                            (group_low // fx.Int32(_VEC)) + fx.Int32(vec_item),
+                        )
+                        for vi in range_constexpr(_VEC):
+                            bin_item = bins_per_thread - 1 - (vec_item * _VEC + vi)
+                            bin_counts[bin_item] = bin_counts[bin_item] + values[vi]
             for bin_item in range_constexpr(bins_per_thread):
                 count = count + bin_counts[bin_item]
 
@@ -605,6 +625,7 @@ def build_topk_per_row_decode_module(
         row_indices = fx.slice(indices, (row, None))
         row_values = fx.slice(values, (row, None))
         row_state = fx.slice(state, (row, None))
+        active_chunks = row_state[_STATE_ACTIVE_CHUNKS]
 
         if chunk == 0 and row_len < fx.Int32(k):
             for output_step in range_constexpr(output_steps):
@@ -642,7 +663,7 @@ def build_topk_per_row_decode_module(
                 if pos < fx.Int32(k):
                     equal_idxs[pos] = idx
 
-        if row_state[_STATE_DIRECT] == 0:
+        if (row_state[_STATE_DIRECT] == 0) & (chunk < active_chunks):
             row_vectors = (row_len + fx.Int32(_VEC - 1)) // fx.Int32(_VEC)
             for vec_idx in range(
                 chunk * fx.Int32(block_threads) + tid,
