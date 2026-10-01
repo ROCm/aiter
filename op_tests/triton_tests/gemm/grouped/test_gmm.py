@@ -17,13 +17,13 @@ import torch
 from torch import Tensor
 
 # AITER: Triton kernel wrappers
-from aiter.ops.triton.gmm import (
+from aiter.ops.triton.gemm.grouped.gmm import (
     gmm as triton_gmm,
 )
-from aiter.ops.triton.gmm import (
+from aiter.ops.triton.gemm.grouped.gmm import (
     nptgmm as triton_nptgmm,
 )
-from aiter.ops.triton.gmm import (
+from aiter.ops.triton.gemm.grouped.gmm import (
     ptgmm as triton_ptgmm,
 )
 
