@@ -609,7 +609,8 @@ def build_qsa_k2_module(
         # needs them. Only VMEM reads may cross, so the page-table load still
         # floats up to the moment its index lands. Decode only: prefill has
         # enough tiles to hide the chain and loses 6% at L32768 if pinned.
-        if const_expr(decode_tr_pv):
+        pin_q = decode_tr_pv or gfx942_v_pf
+        if const_expr(pin_q):
             fx.rocdl.sched_barrier("vmem_read")
         phys0 = load_page(tok0)
 
