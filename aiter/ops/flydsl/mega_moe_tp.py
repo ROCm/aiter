@@ -19,6 +19,30 @@ inter slice (the intermediate stays in LDS), dispatched on ``comm_mode``:
 
 Weights are MXFP4 (``shuffle_weight(16, 16)`` + ``e8m0_shuffle`` scales), the
 layout the flydsl MoE kernels take. See ``kernels/mega_moe_tp/mega_moe_tp_kernel.py``.
+
+Contract (the kernel synchronizes the ranks through flags in each other's memory):
+
+* ``forward`` is a collective: every rank of the group calls it the same number
+  of times, in the same order, with the same number of local tokens ``m``
+  (ag_rs: pad to a common ``m``). ``m == 0`` returns an empty tensor. A rank
+  that falls out of step makes the waits time out (2 s each); ``poll_errors`` /
+  ``check_errors`` (or ``AITER_MEGAMOE_TP_CHECK=1``: check after every eager
+  forward) report it, and ``reset()`` (collective) restarts the layer.
+* ``topk_ids`` outside ``[0, experts)`` are masked (the route adds nothing);
+  a token must not repeat an expert.
+* The result is a view of an internal buffer, valid until the next forward of
+  this layer (ar_ar: peers write into it during that forward); pass ``out=`` to
+  get it in a buffer of your own.
+* The kernel keeps every CU busy and spins on peers: do not overlap it with
+  another persistent / communication kernel (e.g. another layer's, a custom
+  all-reduce on a side stream).
+* The first forward with a new launch config compiles and synchronizes the
+  ranks; ``prepare(local_token_counts)`` does that ahead of CUDA graph capture.
+* ``comm_dtype="fp8"`` (default): the reduce-scatter / all-reduce partials and
+  the per-route GEMM2 rows are MXFP8 (E4M3 + E8M0 per 32): rel L2 ~0.038
+  against a bf16-math torch reference (glm5 / m3), vs ~0.003 with ``"bf16"``
+  (bf16 partials and route rows, no LL packets: ~3-14% slower, more at large M).
+* Launch epochs are int32: ``reset()`` at least every 2**31 forwards per layer.
 """
 
 from __future__ import annotations
@@ -34,11 +58,7 @@ from .kernels.mega_moe_tp.mega_moe_tp import MegaMoeTPEngine
 __all__ = ["COMM_MODES", "MegaMoeTP", "MegaMoeTPConfig", "mega_moe_tp_supported"]
 
 COMM_MODES = ("ag_rs", "ar_ar")
-_ACTS = {
-    ActivationType.Silu: "silu",
-    ActivationType.Swiglu: "swiglu",
-    ActivationType.Situv2: "situv2",
-}
+_ACTS = (ActivationType.Silu, ActivationType.Swiglu, ActivationType.Situv2)
 
 
 def mega_moe_tp_supported(gfx: str | None = None) -> bool:
@@ -62,10 +82,14 @@ class MegaMoeTPConfig:
     activation: ActivationType = ActivationType.Silu
     beta: float | None = None
     linear_beta: float | None = None
+    swiglu_limit: float | None = None
     comm_mode: str = "ag_rs"
+    comm_dtype: str = "fp8"
 
 
 class MegaMoeTP:
+    """Per layer: scratch of about ``max_local_tokens * world_size * topk *
+    model_dim * 2`` bytes plus the symmetric arena."""
 
     def __init__(
         self,
@@ -78,9 +102,13 @@ class MegaMoeTP:
         group=None,
         device: torch.device | None = None,
     ):
-        act = _ACTS.get(cfg.activation)
-        if act is None:
+        if cfg.activation not in _ACTS:
             raise ValueError(f"MegaMoeTP: unsupported activation {cfg.activation}")
+        if not mega_moe_tp_supported():
+            raise ValueError("MegaMoeTP: needs gfx950")
+        act = cfg.activation.name.lower()
+        if cfg.comm_mode not in COMM_MODES:
+            raise ValueError(f"MegaMoeTP: unknown comm_mode {cfg.comm_mode!r}")
         situ = act == "situv2"
         self.cfg = cfg
         self.engine = MegaMoeTPEngine(
@@ -100,7 +128,9 @@ class MegaMoeTP:
             situ_linear_beta=(
                 cfg.linear_beta if situ and cfg.linear_beta is not None else 1.0
             ),
+            swiglu_limit=cfg.swiglu_limit,
             comm_mode=cfg.comm_mode,
+            comm_dtype=cfg.comm_dtype,
             group=group,
             device=device,
         )
@@ -110,13 +140,31 @@ class MegaMoeTP:
         x_local: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """ag_rs: x_local [m, H] bf16 (this rank's tokens), topk_* [m, topk].
-        ar_ar: x [M, H] bf16 (this rank's partial of every token), topk_* [M, topk]."""
-        return self.engine(x_local, topk_weights, topk_ids)
+        ar_ar: x [M, H] bf16 (this rank's partial of every token), topk_* [M, topk]
+        (the same routing on every rank). topk_ids int32, topk_weights float32
+        (others are converted per call)."""
+        return self.engine(x_local, topk_weights, topk_ids, out)
 
     __call__ = forward
+
+    def prepare(self, local_tokens) -> None:
+        """Collective: compile + arm the launch configs of these local token counts."""
+        self.engine.prepare(local_tokens)
 
     def poll_errors(self) -> int:
         """Nonzero if a wait inside the kernel gave up (a peer never arrived)."""
         return self.engine.poll_errors()
+
+    def check_errors(self) -> None:
+        """Raise RuntimeError (and clear) if a wait gave up since the last check."""
+        self.engine.check_errors()
+
+    def clear_errors(self) -> None:
+        self.engine.clear_errors()
+
+    def reset(self) -> None:
+        """Collective: restart the cross-rank state (after a timeout / desync)."""
+        self.engine.reset()

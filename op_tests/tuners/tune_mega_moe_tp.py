@@ -4,10 +4,11 @@
 
 Per cell: sweep the :class:`LaunchCfg` variants (row tile, dynamic vs static
 schedule, E4M3 vs bf16 route rows, LL packets), time each (CUDA graph, slowest
-rank, best of --rounds), gate on the split path's output (rel L2 < --rtol, no
-watchdog, replay == eager) and merge the fastest into the tuned CSV::
+rank, best of --rounds), gate on the torch reference (rel L2 < --rtol, no
+watchdog, replay == eager) and merge the fastest of those within --acc-slack of
+the most accurate into the tuned CSV::
 
-    python op_tests/multigpu_tests/tune_mega_moe_tp.py --models glm5 m3 \\
+    python op_tests/tuners/tune_mega_moe_tp.py --models glm5 m3 \\
         --tokens 8 16 32 64 96 128 256 512 1024 2048 --comm-modes ag_rs ar_ar
 
 One process drives all --tp GPUs (like ``test_mega_moe_TP.py --single-process``);
@@ -26,16 +27,19 @@ import subprocess
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(
+    0,
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "multigpu_tests"),
+)
 import test_mega_moe_TP as T
 import torch
 
+from aiter.jit.core import AITER_CONFIG_MEGAMOE_TP
 from aiter.ops.flydsl.kernels.mega_moe_tp.mega_moe_tp import (
     CSV_CFG,
     CSV_KEY,
     LDS_LIMIT,
     LaunchCfg,
-    tuned_config_path,
 )
 
 CSV_COLS = [
@@ -68,9 +72,7 @@ def idle_gpus(n: int, wait_s: int = 1800) -> str:
                 or float(v.get("GPU Memory Allocated (VRAM%)", 0)) >= 2
             }
             time.sleep(0.4)
-        free = sorted(
-            (g for g in cards if g not in busy), key=lambda g: not 4 <= g <= 7
-        )
+        free = [g for g in cards if g not in busy]
         if len(free) >= n:
             return ",".join(map(str, sorted(free[:n])))
         if time.time() - t0 > wait_s:
@@ -94,6 +96,7 @@ def schedules(eng, m: int) -> list[LaunchCfg]:
     rpe = (tot * eng.K + eng.E - 1) // eng.E
     out = []
     for dyn in (False, True):
+        # twice the routes per expert the heuristic (default_config) allows
         if dyn and not (
             tot <= eng.dyn_max and eng.I // 128 >= 2 and tot * eng.K <= 4 * eng.E
         ):
@@ -151,9 +154,7 @@ def merge_csv(path: str, rows: list[dict]) -> None:
 
 def tune_cell(a, name: str, mode: str, tok: int) -> dict | None:
     T._flydsl_multi_device()
-    from p2p_collectives import P2PGroup
-
-    from aiter.ops.flydsl.kernels.symmetric_arena import PeerArenaGroup
+    from p2p_collectives import P2PGroup, PeerArenaGroup
 
     tp, m = a.tp, tok // a.tp
     devices = [torch.device("cuda", i) for i in range(tp)]
@@ -173,7 +174,7 @@ def tune_cell(a, name: str, mode: str, tok: int) -> dict | None:
     for r, c in enumerate(ctxs):
         with torch.cuda.device(c.device):
             split.append(split_cls(weights[r], c, m, comm=p2p.comm(r)))
-    y = [t.clone() for t in T._sp_run(devices, lambda r: split[r](inputs[r]))]
+    ref = T._sp_reference(weights, ctxs, inputs, tok)
     split_us = float("nan")
     if not a.no_split:
         split_us, _ = T._sp_time_graph(devices, lambda r: split[r](inputs[r]), targs)
@@ -182,20 +183,27 @@ def tune_cell(a, name: str, mode: str, tok: int) -> dict | None:
         with torch.cuda.device(c.device):
             fused.append(T.MegaMoeTP(weights[r], c, m, group=group, comm_mode=mode))
     engs = [f.engine.engine for f in fused]
-    best, tried = None, set()
+    done: dict = {}
     tag = f"[tune] {name} {mode} M={tok}"
 
+    def pick():
+        if not done:
+            return None
+        floor = min(err for _, err in done.values()) + a.acc_slack
+        return min(
+            ((us, cfg) for cfg, (us, err) in done.items() if err <= floor),
+            key=lambda t: t[0],
+        )
+
     def run(cfg) -> bool:
-        nonlocal best
-        if cfg in tried or not _valid(engs[0], cfg):
+        if cfg in done or not _valid(engs[0], cfg):
             return True
-        tried.add(cfg)
         for e in engs:
             e._cfgs[m] = cfg
         try:
             yf = [t.clone() for t in T._sp_run(devices, lambda r: fused[r](inputs[r]))]
             errs = [e.poll_errors() for e in engs]
-            err = T._sp_rel_l2(yf, y)
+            err = T._sp_rel_l2(yf, ref)
             if any(errs) or not err < a.rtol:
                 print(f"{tag} {cfg}: rejected errs={errs} rel_l2={err:.4f}", flush=True)
                 return not any(errs)
@@ -207,15 +215,15 @@ def tune_cell(a, name: str, mode: str, tok: int) -> dict | None:
         except Exception as exc:  # noqa: BLE001 - a variant that fails is skipped
             print(f"{tag} {cfg}: failed {exc}", flush=True)
             return True
-        print(f"{tag} {cfg}: {us:.1f} us (rel_l2 {err:.4f})", flush=True)
-        if best is None or us < best[0] * 0.99:
-            best = (us, cfg)
+        print(f"{tag} {cfg}: {us:.1f} us (rel_l2 vs torch {err:.4f})", flush=True)
+        done[cfg] = (us, err)
         return True
 
-    if all(run(c) for c in schedules(engs[0], m)) and best is not None:
-        for c in refinements(best[1]):
+    if all(run(c) for c in schedules(engs[0], m)) and done:
+        for c in refinements(pick()[1]):
             if not run(c):
                 break
+    best = pick()
     if best is None:
         print(f"{tag}: no valid config", flush=True)
         return None
@@ -263,9 +271,15 @@ def main() -> int:
     p.add_argument("--iters", type=int, default=20)
     p.add_argument("--rounds", type=int, default=5)
     p.add_argument(
-        "--rtol", type=float, default=0.06, help="fused vs split rel L2 gate"
+        "--rtol", type=float, default=0.06, help="fused vs torch rel L2 gate"
     )
-    p.add_argument("--out", default=tuned_config_path())
+    p.add_argument(
+        "--acc-slack",
+        type=float,
+        default=0.002,
+        help="keep the fastest config within this rel L2 of the most accurate",
+    )
+    p.add_argument("--out", default=AITER_CONFIG_MEGAMOE_TP)
     p.add_argument("--no-split", action="store_true", help="skip timing the split path")
     p.add_argument(
         "--cell", nargs=3, metavar=("MODEL", "MODE", "TOKENS"), help=argparse.SUPPRESS
@@ -297,6 +311,8 @@ def main() -> int:
             str(a.rounds),
             "--rtol",
             str(a.rtol),
+            "--acc-slack",
+            str(a.acc_slack),
             "--out",
             a.out,
         ] + (["--no-split"] if a.no_split else [])

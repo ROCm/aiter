@@ -158,6 +158,11 @@ AITER_CONFIG_COMM_FUSED_MOE = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/comm_fused_moe.csv",
 )
 
+AITER_CONFIG_MEGAMOE_TP = os.getenv(
+    "AITER_CONFIG_MEGAMOE_TP",
+    f"{AITER_ROOT_DIR}/aiter/configs/mega_moe_tp_a4w4_tuned.csv",
+)
+
 AITER_CONFIG_FHMOE = os.getenv(
     "AITER_CONFIG_FHMOE",
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_fhmoe.csv",
@@ -319,6 +324,14 @@ class AITER_CONFIG:
             "AITER_CONFIG_COMM_FUSED_MOE",
             AITER_CONFIG_COMM_FUSED_MOE,
             "tuned_comm_fused_moe",
+        )
+
+    @property
+    def AITER_CONFIG_MEGAMOE_TP_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_MEGAMOE_TP",
+            AITER_CONFIG_MEGAMOE_TP,
+            "mega_moe_tp_a4w4_tuned",
         )
 
     @property

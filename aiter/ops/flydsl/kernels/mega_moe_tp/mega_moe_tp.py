@@ -3,9 +3,9 @@
 """Host side of the single-kernel TP MegaMoE (:mod:`.mega_moe_tp_kernel`).
 
 The launch config (:class:`LaunchCfg`) comes from the tuned CSV
-``aiter/configs/model_configs/mega_moe_tp_a4w4_tuned.csv`` (by
-``op_tests/multigpu_tests/tune_mega_moe_tp.py``; ``AITER_MEGAMOE_TP_CONFIG``
-points elsewhere), else from a heuristic.
+``aiter/configs/mega_moe_tp_a4w4_tuned.csv`` (by
+``op_tests/tuners/tune_mega_moe_tp.py``; ``AITER_CONFIG_MEGAMOE_TP`` points
+elsewhere, as for the other AITER_CONFIG_* tables), else from a heuristic.
 """
 
 from __future__ import annotations
@@ -18,12 +18,18 @@ import os
 from dataclasses import dataclass
 
 import torch
+import torch.distributed as dist
 
 from ..symmetric_arena import SymmetricArena
 from ..tensor_shim import _preload_compiled, _run_compiled
 from .mega_moe_tp_kernel import (
     CTRL_ERR,
     CTRL_INTS,
+    ERR_CHUNK,
+    ERR_COMM,
+    ERR_FLAG,
+    ERR_META,
+    ERR_YAG,
     FLAG_INTS,
     MAX_TP,
     NCTA_MAX,
@@ -49,8 +55,15 @@ __all__ = [
 ]
 
 LDS_LIMIT = 160 * 1024
+_CHECK = os.environ.get("AITER_MEGAMOE_TP_CHECK", "0") == "1"
+_ERR_NAMES = (
+    (ERR_FLAG, "flag"),
+    (ERR_META, "routing"),
+    (ERR_CHUNK, "input chunk"),
+    (ERR_COMM, "reduce"),
+    (ERR_YAG, "output gather"),
+)
 DYN_MAX = 256
-TUNED_CSV = "mega_moe_tp_a4w4_tuned.csv"
 CSV_KEY = (
     "gfx",
     "cu_num",
@@ -86,16 +99,9 @@ class LaunchCfg:
 
 
 def tuned_config_path() -> str:
-    return os.environ.get("AITER_MEGAMOE_TP_CONFIG") or os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        "..",
-        "..",
-        "..",
-        "..",
-        "configs",
-        "model_configs",
-        TUNED_CSV,
-    )
+    from aiter.jit.core import AITER_CONFIGS
+
+    return AITER_CONFIGS.AITER_CONFIG_MEGAMOE_TP_FILE
 
 
 @functools.cache
@@ -103,20 +109,32 @@ def _tuned_rows(path: str) -> dict:
     rows: dict = {}
     if not os.path.exists(path):
         return rows
+
+    def num(r, k, default=0):
+        # merged tables (pandas) can carry "4.0" / "" for integer columns
+        v = (r.get(k) or "").strip()
+        return int(float(v)) if v and v.lower() != "nan" else default
+
+    def key(v):
+        try:
+            return str(int(float(v)))
+        except ValueError:
+            return v
+
     with open(path) as f:
         for r in csv.DictReader(f):
             cfg = LaunchCfg(
-                mt=int(r["block_m"]) // 16,
-                dyn=r["dyn"] == "1",
-                route_fp8=r["route_fp8"] == "1",
-                ll=r["ll"] == "1",
-                llr=r["llr"] == "1",
-                nsk=int(r.get("nsk") or 4),
-                npp=int(r.get("npp") or 1),
-                xb=int(r.get("xb") or 0),
+                mt=num(r, "block_m") // 16,
+                dyn=num(r, "dyn") == 1,
+                route_fp8=num(r, "route_fp8") == 1,
+                ll=num(r, "ll") == 1,
+                llr=num(r, "llr") == 1,
+                nsk=num(r, "nsk", 4),
+                npp=num(r, "npp", 1),
+                xb=num(r, "xb"),
             )
-            rows.setdefault(tuple(r[k] for k in CSV_KEY), []).append(
-                (int(r["token"]), cfg)
+            rows.setdefault(tuple(key(r[k]) for k in CSV_KEY), []).append(
+                (num(r, "token"), cfg)
             )
     for v in rows.values():
         v.sort(key=lambda t: t[0])
@@ -162,7 +180,9 @@ class MegaMoeTPEngine:
         activation: str = "silu",
         situ_beta: float = 1.0,
         situ_linear_beta: float = 1.0,
+        swiglu_limit: float | None = None,
         comm_mode: str = "ag_rs",
+        comm_dtype: str = "fp8",
         group=None,
         device: torch.device | None = None,
     ):
@@ -172,24 +192,65 @@ class MegaMoeTPEngine:
             )
         if comm_mode not in ("ag_rs", "ar_ar"):
             raise ValueError(f"unknown comm_mode {comm_mode!r}")
+        if comm_dtype not in ("fp8", "bf16"):
+            raise ValueError(f"unknown comm_dtype {comm_dtype!r}")
+        self.comm_bf16 = comm_dtype == "bf16"
+        if not 1 <= topk <= experts or max_local_tokens < 1:
+            raise ValueError(
+                f"need 1 <= topk ({topk}) <= experts ({experts}), max_local_tokens >= 1"
+            )
         self.ar = comm_mode == "ar_ar"
         self.rank, self.tp = int(rank), int(world_size)
         self.H, self.I, self.E, self.K = model_dim, inter_dim, experts, topk
         self.mmax = int(max_local_tokens)
-        self.device = device or torch.device("cuda", torch.cuda.current_device())
+        device = torch.device(device if device is not None else "cuda")
+        if device.index is None:
+            device = torch.device(device.type, torch.cuda.current_device())
+        self.device = device
         self.activation = activation
         self.situ = (float(situ_beta), float(situ_linear_beta))
+        if swiglu_limit is None:
+            swiglu_limit = 7.0 if activation == "swiglu" else float("inf")
+        self.swiglu_limit = float(swiglu_limit)
         self.w1, self.w1s, self.w2, self.w2s = (
             t.view(torch.uint8) for t in (w1, w1_scale, w2, w2_scale)
         )
+        I2, E = inter_dim, experts
+        for name, t, n in (
+            ("w1", self.w1, E * 2 * I2 * model_dim // 2),
+            ("w1_scale", self.w1s, E * 2 * I2 * model_dim // 32),
+            ("w2", self.w2, E * model_dim * I2 // 2),
+            ("w2_scale", self.w2s, E * model_dim * I2 // 32),
+        ):
+            if t.device != self.device or not t.is_contiguous() or t.numel() < n:
+                raise ValueError(
+                    f"{name}: need a contiguous tensor of >= {n} bytes on {self.device}"
+                )
+
+        props = torch.cuda.get_device_properties(self.device)
+        self.n_cta = int(props.multi_processor_count)
+        if self.n_cta > NCTA_MAX:
+            raise ValueError(f"at most {NCTA_MAX} CTAs (flag layout)")
+        self.gfx = getattr(props, "gcnArchName", "").split(":")[0]
+        if self.gfx != "gfx950":
+            raise ValueError(f"fused TP MegaMoE needs gfx950, not {self.gfx}")
+        self.agr = max(1, -(-self.mmax // self.n_cta))
+        if self._lds(1, False) > LDS_LIMIT:
+            ok = self.mmax
+            while ok > 1 and self._lds(1, False, mmax=ok) > LDS_LIMIT:
+                ok -= max(1, ok // 64)
+            raise ValueError(
+                f"max_local_tokens={self.mmax} does not fit in LDS for h{model_dim} "
+                f"i{inter_dim} e{experts} k{topk} tp{world_size}: at most {ok}"
+            )
 
         tot = self.mmax * self.tp
         H, K = model_dim, topk
         arena = SymmetricArena(group=group, device=self.device)
         self._x = arena.reserve("x", (tot, H // 2), torch.uint8)
         self._xs = arena.reserve("xs", (tot, H // 32), torch.uint8)
-        self._ids = arena.reserve("ids", (tot, 4 * K), torch.int32)
-        self._w = arena.reserve("w", (tot, K), torch.float32)
+        self._ids = arena.reserve("ids", (2, tot, 4 * K), torch.int32)
+        self._w = arena.reserve("w", (2, tot, K), torch.float32)
         self._recv = arena.reserve(
             "recv", (self.tp, tot if self.ar else self.mmax, H), torch.bfloat16
         )
@@ -203,17 +264,11 @@ class MegaMoeTPEngine:
         arena.commit()
         self.arena = arena
         self.ctrl = torch.zeros(CTRL_INTS, dtype=torch.int32, device=self.device)
-        self.routes = torch.empty(
+        self.routes = torch.zeros(
             (tot * topk + 1, H), dtype=torch.bfloat16, device=self.device
         )
         self.y = torch.empty((self.mmax, H), dtype=torch.bfloat16, device=self.device)
 
-        props = torch.cuda.get_device_properties(self.device)
-        self.n_cta = int(props.multi_processor_count)
-        if self.n_cta > NCTA_MAX:
-            raise ValueError(f"at most {NCTA_MAX} CTAs (flag layout)")
-        self.gfx = getattr(props, "gcnArchName", "").split(":")[0]
-        self.agr = max(1, -(-self.mmax // self.n_cta))
         self._scheds: dict = {}
         self.sched = self._sched(0)
         self.dyn_max = min(tot, DYN_MAX)
@@ -226,7 +281,7 @@ class MegaMoeTPEngine:
         )
         if extra * H * 2 >= 1 << 31:
             raise ValueError("split-expert partial rows exceed 32-bit buffer offsets")
-        self.proutes = torch.empty(
+        self.proutes = torch.zeros(
             (extra + 1, H), dtype=torch.bfloat16, device=self.device
         )
         self.xg = (
@@ -423,23 +478,28 @@ class MegaMoeTPEngine:
             for j in range(rem)
         ]
 
-    def _consts(self, mt: int, dyn: bool, nab: int = 4, nsk: int = 4) -> dict:
+    def _consts(
+        self, mt: int, dyn: bool, nab: int = 4, nsk: int = 4, mmax: int = 0
+    ) -> dict:
+        mmax = mmax or self.mmax
         return mega_moe_tp_consts(
             self.H,
             self.I,
             mt,
-            self.mmax * self.tp,
-            self.agr,
+            mmax * self.tp,
+            max(1, -(-mmax // self.n_cta)),
             self.E if dyn else 0,
             nab,
             nsk,
         )
 
-    def _nab(self, mt: int, dyn: bool, nsk: int = 4) -> int:
-        return 4 if self._consts(mt, dyn, 4, nsk)["LDS_BYTES"] <= LDS_LIMIT else 3
+    def _nab(self, mt: int, dyn: bool, nsk: int = 4, mmax: int = 0) -> int:
+        lds = self._consts(mt, dyn, 4, nsk, mmax)["LDS_BYTES"]
+        return 4 if lds <= LDS_LIMIT else 3
 
-    def _lds(self, mt: int, dyn: bool, nsk: int = 4) -> int:
-        return self._consts(mt, dyn, self._nab(mt, dyn, nsk), nsk)["LDS_BYTES"]
+    def _lds(self, mt: int, dyn: bool, nsk: int = 4, mmax: int = 0) -> int:
+        nab = self._nab(mt, dyn, nsk, mmax)
+        return self._consts(mt, dyn, nab, nsk, mmax)["LDS_BYTES"]
 
     def _fit_mt(self, mt: int, dyn: bool, nsk: int = 4) -> int:
         mt = max(1, min(6, int(mt)))
@@ -480,14 +540,16 @@ class MegaMoeTPEngine:
             else:
                 cfg = self.default_config(m)
             dyn = cfg.dyn and tot <= self.dyn_max and self.I // 128 >= 2
+            dyn = dyn and self._lds(1, True) <= LDS_LIMIT
             mt = self._fit_mt(cfg.mt, dyn)
             nsk = self._fit_nsk(mt, dyn, cfg.nsk)
+            fp8 = not self.comm_bf16
             cfg = LaunchCfg(
                 mt,
                 dyn,
-                cfg.route_fp8,
-                cfg.ll,
-                cfg.ll and cfg.llr,
+                cfg.route_fp8 and fp8,
+                cfg.ll and fp8,
+                cfg.ll and cfg.llr and fp8,
                 nsk,
                 self._fit_npp(cfg.npp, nsk),
                 cfg.xb if cfg.xb % 2 == 0 and 0 <= cfg.xb < self.H // 512 else 0,
@@ -521,9 +583,11 @@ class MegaMoeTPEngine:
                 TOPK=self.K,
                 MT=cfg.mt,
                 TMAX=self.mmax * self.tp,
+                E=self.E,
                 act=self.activation,
                 situ_beta=self.situ[0],
                 situ_linear_beta=self.situ[1],
+                swiglu_limit=self.swiglu_limit,
                 route_fp8=cfg.route_fp8
                 or (cfg.ll and cfg.llr and (cfg.dyn or sc.npieces <= 1)),
                 agr=self.agr,
@@ -537,15 +601,36 @@ class MegaMoeTPEngine:
                 ll_route=cfg.ll and cfg.llr,
                 xl=self._xl(cfg),
                 xl_s0=sc.xl_s0 if self._xl(cfg) else 0,
+                comm_bf16=self.comm_bf16,
                 **static,
             )
             self._launchers[cfg] = fn
         return fn
 
-    def forward(
-        self, x_local: torch.Tensor, topk_weights: torch.Tensor, topk_ids: torch.Tensor
-    ):
-        m = int(x_local.shape[0])
+    def _local_tokens(self, x, topk_weights, topk_ids) -> int:
+        rows = int(x.shape[0]) if x.dim() == 2 else -1
+        for name, t in (
+            ("x", x),
+            ("topk_weights", topk_weights),
+            ("topk_ids", topk_ids),
+        ):
+            if t.device != self.device:
+                raise ValueError(f"{name} is on {t.device}, the layer on {self.device}")
+        if x.dim() != 2 or x.shape[1] != self.H or x.dtype != torch.bfloat16:
+            raise ValueError(
+                f"x: need bf16 [tokens, {self.H}], got {x.dtype} {tuple(x.shape)}"
+            )
+        want = (rows, self.K)
+        if tuple(topk_ids.shape) != want or tuple(topk_weights.shape) != want:
+            raise ValueError(
+                f"topk_ids / topk_weights: need {list(want)}, got "
+                f"{list(topk_ids.shape)} / {list(topk_weights.shape)}"
+            )
+        if topk_ids.dtype not in (torch.int32, torch.int64):
+            raise ValueError(f"topk_ids: need int32 (or int64), got {topk_ids.dtype}")
+        if not topk_weights.is_floating_point():
+            raise ValueError(f"topk_weights: need float32, got {topk_weights.dtype}")
+        m = rows
         if self.ar:
             if m % self.tp:
                 raise ValueError(
@@ -554,59 +639,116 @@ class MegaMoeTPEngine:
             m //= self.tp
         if m > self.mmax:
             raise ValueError(f"{m} local tokens exceed max_local_tokens {self.mmax}")
+        if _CHECK and not self.ar and dist.is_initialized() and self.arena.ipc:
+            ms = [None] * self.tp
+            dist.all_gather_object(ms, m, group=self.arena.group)
+            if len(set(ms)) > 1:
+                raise ValueError(f"ag_rs: local token counts differ across ranks: {ms}")
+        return m
+
+    def prepare(self, local_tokens) -> None:
+        """Compile and arm the kernel for these local token counts (collective:
+        every rank, same list). forward() does this on first use of a launch
+        config, which must not happen inside CUDA graph capture."""
+        for m in local_tokens:
+            if 0 < m <= self.mmax:
+                self._arm(self.config(int(m)))
+
+    def _arm(self, cfg: LaunchCfg) -> None:
+        if cfg in self._armed:
+            return
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                f"MegaMoeTP: launch config {cfg} first used inside CUDA graph "
+                "capture; call prepare(local_tokens) (or run it eagerly) first"
+            )
+        fn = self._launcher(cfg)
+        m = next(m for m, c in self._cfgs.items() if c == cfg)
+        args = self._launch_args(m, cfg, self.y, None, None, None)
+        _preload_compiled(fn, *args, torch.cuda.current_stream())
+        torch.cuda.synchronize(self.device)
+        self.arena.barrier()
+        self._armed.add(cfg)
+
+    def _launch_args(self, m, cfg, y, x, ids, tw):
+        sc = self._cfg_sched(cfg)
+        peers = [int(b) for b in self.arena.base_ptrs] + [0] * (MAX_TP - self.tp)
+
+        def ptr(t):
+            return 0 if t is None else t.data_ptr()
+
+        return (
+            self.w1.data_ptr(),
+            self.w1s.data_ptr(),
+            self.w2.data_ptr(),
+            self.w2s.data_ptr(),
+            ptr(x),
+            ptr(ids),
+            ptr(tw),
+            y.data_ptr(),
+            self.routes.data_ptr(),
+            self.proutes.data_ptr(),
+            self.ctrl.data_ptr(),
+            sc.units.data_ptr(),
+            sc.recs.data_ptr(),
+            *peers,
+            self._x.offset,
+            self._xs.offset,
+            self._ids.offset,
+            self._w.offset,
+            self._recv.offset,
+            self._flag.offset,
+            self._pre.offset,
+            self._yall.offset,
+            self.rank,
+            self.tp,
+            m,
+            self.mmax,
+            sc.xl_e0 if self._xl(cfg) else (0 if cfg.dyn else sc.piece_e0),
+            0 if self.xg is None else self.xg.data_ptr(),
+            0 if cfg.dyn else sc.col0,
+            0 if cfg.dyn else sc.ncol,
+            self.n_cta,
+        )
+
+    def forward(
+        self,
+        x_local: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        out: torch.Tensor | None = None,
+    ):
+        m = self._local_tokens(x_local, topk_weights, topk_ids)
+        rows = m * self.tp if self.ar else m
+        if out is not None and (
+            tuple(out.shape) != (rows, self.H)
+            or out.dtype != torch.bfloat16
+            or out.device != self.device
+            or not out.is_contiguous()
+        ):
+            raise ValueError(f"out: need a contiguous bf16 [{rows}, {self.H}]")
+        if m == 0:
+            return x_local.new_empty((0, self.H)) if out is None else out
         x = x_local.contiguous()
         ids = topk_ids.to(torch.int32).contiguous()
         tw = topk_weights.to(torch.float32).contiguous()
         cfg = self.config(m)
-        key = (m, x.data_ptr(), ids.data_ptr(), tw.data_ptr(), cfg)
+        y = out if out is not None and not self.ar else self.y
+        key = (m, x.data_ptr(), ids.data_ptr(), tw.data_ptr(), y.data_ptr(), cfg)
         if self._args[0] != key:
-            sc = self._cfg_sched(cfg)
-            peers = [int(b) for b in self.arena.base_ptrs] + [0] * (MAX_TP - self.tp)
-            args = (
-                self.w1.data_ptr(),
-                self.w1s.data_ptr(),
-                self.w2.data_ptr(),
-                self.w2s.data_ptr(),
-                x.data_ptr(),
-                ids.data_ptr(),
-                tw.data_ptr(),
-                self.y.data_ptr(),
-                self.routes.data_ptr(),
-                self.proutes.data_ptr(),
-                self.ctrl.data_ptr(),
-                sc.units.data_ptr(),
-                sc.recs.data_ptr(),
-                *peers,
-                self._x.offset,
-                self._xs.offset,
-                self._ids.offset,
-                self._w.offset,
-                self._recv.offset,
-                self._flag.offset,
-                self._pre.offset,
-                self._yall.offset,
-                self.rank,
-                self.tp,
-                m,
-                self.mmax,
-                sc.xl_e0 if self._xl(cfg) else (0 if cfg.dyn else sc.piece_e0),
-                0 if self.xg is None else self.xg.data_ptr(),
-                0 if cfg.dyn else sc.col0,
-                0 if cfg.dyn else sc.ncol,
-                self.n_cta,
-            )
+            args = self._launch_args(m, cfg, y, x, ids, tw)
             # the inputs stay referenced while their pointers are cached
             self._args = (key, (args, x, ids, tw))
-        fn = self._launcher(cfg)
-        if cfg not in self._armed:
-            _preload_compiled(fn, *self._args[1][0], torch.cuda.current_stream())
-            torch.cuda.synchronize(self.device)
-            self.arena.barrier()
-            self._armed.add(cfg)
-        _run_compiled(fn, *self._args[1][0], torch.cuda.current_stream())
+        self._arm(cfg)
+        _run_compiled(
+            self._launcher(cfg), *self._args[1][0], torch.cuda.current_stream()
+        )
+        if _CHECK and not torch.cuda.is_current_stream_capturing():
+            self.check_errors()
         if self.ar:
-            return self._yall.local[: m * self.tp]
-        return self.y[:m]
+            y = self._yall.local[: m * self.tp]
+            return y if out is None else out.copy_(y)
+        return y[:m] if out is None else out
 
     __call__ = forward
 
@@ -615,5 +757,31 @@ class MegaMoeTPEngine:
 
     def poll_errors(self) -> int:
         """OR of the watchdog codes of every wait that gave up (0 when healthy);
-        a launch with a nonzero code produced invalid output."""
+        a launch with a nonzero code produced invalid output. Synchronizes."""
         return int(self.ctrl[CTRL_ERR].item())
+
+    def check_errors(self) -> None:
+        """Raise (and clear) if a launch since the last check hit the watchdog.
+        Synchronizes; runs after every forward with AITER_MEGAMOE_TP_CHECK=1."""
+        err = self.poll_errors()
+        if err:
+            self.clear_errors()
+            what = [n for b, n in _ERR_NAMES if err & b]
+            raise RuntimeError(
+                f"MegaMoeTP rank {self.rank}: a wait inside the kernel timed out "
+                f"({'|'.join(what)}); the output is invalid. Ranks out of step "
+                "(different call counts or local token counts) need reset()."
+            )
+
+    def reset(self) -> None:
+        """Collective (every rank): drop all cross-rank state and restart the
+        launch epoch, e.g. after a watchdog timeout or ranks calling forward a
+        different number of times."""
+        torch.cuda.synchronize(self.device)
+        self.arena.barrier()
+        self.arena.storage.zero_()
+        self.ctrl.zero_()
+        self.routes.zero_()
+        self.proutes.zero_()
+        torch.cuda.synchronize(self.device)
+        self.arena.barrier()

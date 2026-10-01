@@ -1,10 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""One-shot P2P collectives for one process driving every TP GPU.
+"""Single-process harness: one process driving every TP GPU (no torchrun).
 
-The single-process mode of ``test_mega_moe_TP.py`` runs the split baseline's
-AllGather / ReduceScatter / AllReduce on these kernels (the multi-process
-one-shot collectives need one process per rank). Each call is one launch per
+Used by ``test_mega_moe_TP.py --single-process`` and the tuner:
+
+* :class:`PeerArenaGroup`: the in-process group for ``SymmetricArena`` (peer
+  access instead of IPC);
+* :func:`flydsl_multi_device`: lets one compiled flydsl kernel launch on every
+  device of the process (flydsl binds an artifact to the device it loaded on);
+* :class:`P2PGroup`: one-shot collectives for the split baseline's AllGather /
+  ReduceScatter / AllReduce (the multi-process one-shot collectives need one
+  process per rank). Each call is one launch per
 rank: the sender pushes its rows into every peer's staging buffer with
 system-scope stores, raises one epoch flag per (peer, CTA), and the receiver
 reads its staging back with cache-bypassing loads once its flags are up --
@@ -17,6 +23,7 @@ on the device, so CUDA-graph replays stay correct.
 from __future__ import annotations
 
 import functools
+import pickle
 import threading
 
 import flydsl.compiler as flyc
@@ -31,7 +38,7 @@ from flydsl.expr.typing import T
 from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
-__all__ = ["P2PGroup"]
+__all__ = ["P2PGroup", "PeerArenaGroup", "flydsl_multi_device"]
 
 MAX_TP = 8
 NT = 256
@@ -41,6 +48,108 @@ AUX_SYS = 1 | 16
 KIND_AG, KIND_RS, KIND_AR = 0, 1, 2
 POLL_LIMIT = 1 << 24  # a peer that never shows up: give up instead of hanging the GPU
 traced = ASTRewriter.transform
+
+
+class PeerArenaGroup:
+    """Every rank of a TP group driven by this one process (peer access, no IPC).
+    Pass it as ``group=``; the rank is the device's index in ``devices``."""
+
+    def __init__(self, devices):
+        from aiter.ops.flydsl.kernels.symmetric_arena import _hip
+
+        self.devices = [torch.device(d) for d in devices]
+        self.world_size = len(self.devices)
+        self._base: dict[int, int] = {}
+        self._barrier = threading.Barrier(self.world_size)
+        hip = _hip()
+        prev = torch.cuda.current_device()
+        for d in self.devices:
+            torch.cuda.set_device(d)
+            for peer in self.devices:
+                if peer != d:
+                    err = hip.hipDeviceEnablePeerAccess(peer.index, 0)
+                    if err not in (0, 704):  # 704: already enabled
+                        raise RuntimeError(
+                            f"hipDeviceEnablePeerAccess({d} -> {peer}) = {err}"
+                        )
+                    if err:
+                        hip.hipGetLastError()
+        torch.cuda.set_device(prev)
+
+    def rank_of(self, device: torch.device) -> int:
+        return self.devices.index(torch.device(device))
+
+    def barrier(self, timeout: float = 60.0) -> None:
+        try:
+            self._barrier.wait(timeout)
+        except threading.BrokenBarrierError:
+            self._barrier.reset()
+            raise TimeoutError(
+                f"PeerArenaGroup.barrier: ranks did not meet within {timeout:.0f} s"
+            ) from None
+
+    def register(self, rank: int, base_ptr: int) -> None:
+        self._base[rank] = base_ptr
+
+    def base_ptrs(self) -> tuple[int, ...]:
+        if len(self._base) != self.world_size:
+            raise RuntimeError(
+                f"{len(self._base)} of {self.world_size} ranks committed"
+            )
+        return tuple(self._base[r] for r in range(self.world_size))
+
+
+def flydsl_multi_device() -> None:
+    """Patch flydsl (private API) so one artifact runs on every device: calls
+    are serialized, and each device gets its own loaded copy of the module."""
+    from flydsl.compiler import jit_executor, jit_function
+
+    art_cls = jit_executor.CompiledArtifact
+    if getattr(art_cls, "_mega_moe_multi_device", False):
+        return
+    lock = threading.RLock()
+    jf_call = jit_function.JitFunction.__call__
+
+    def _locked_call(self, *a, **k):
+        with lock:
+            return jf_call(self, *a, **k)
+
+    jit_function.JitFunction.__call__ = _locked_call
+    orig = art_cls._get_func_exe
+
+    class _PerDevice:
+        def __init__(self, art):
+            self.art = art
+            self.home = torch.cuda.current_device()
+            self.fns, self.keep = {}, []
+
+        def __call__(self, packed):
+            dev = torch.cuda.current_device()
+            fn = self.fns.get(dev)
+            if fn is None:
+                with lock:
+                    fn = self.fns.get(dev) or self._build(dev)
+            return fn(packed)
+
+        def _build(self, dev):
+            if dev == self.home:
+                fn = orig(self.art)
+            else:
+                twin = pickle.loads(pickle.dumps(self.art))
+                twin._post_load_processors = list(self.art._post_load_processors)
+                fn = orig(twin)
+                self.keep.append(twin)
+            self.fns[dev] = fn
+            return fn
+
+    def _get_func_exe(self):
+        disp = getattr(self, "_per_device_exe", None)
+        if disp is None:
+            disp = self._per_device_exe = _PerDevice(self)
+        return disp
+
+    art_cls._get_func_exe = _get_func_exe
+    art_cls._mega_moe_multi_device = True
 
 
 def _u(v):

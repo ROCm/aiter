@@ -15,13 +15,15 @@ graph replay:
 Gates: split vs torch, fused vs split, fused vs torch rel L2 < --rtol, no NaN,
 graph replay == eager. Weights: each rank's inter-dim shard, preshuffled.
 
-Usage (one cell per process is the robust way; repeated graph capture in one
-torchrun process can kill a rank)::
+Usage::
 
     torchrun --nproc_per_node=8 op_tests/multigpu_tests/test_mega_moe_TP.py \\
-        --models glm5 --tokens 256 --impl both
+        --models glm5 --tokens 256
     python op_tests/multigpu_tests/test_mega_moe_TP.py --single-process --tp 4 \\
-        --models m3 --tokens 64 --impl both --comm-mode ar_ar
+        --models m3 --tokens 64 --comm-mode ar_ar
+
+The single-process mode (one process drives every GPU through peer access,
+``p2p_collectives.py``) also checks masked expert ids and empty batches.
 """
 
 from __future__ import annotations
@@ -39,6 +41,8 @@ from typing import ClassVar
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if os.path.isdir(os.path.join(_REPO_ROOT, "aiter")) and _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
+# the split baseline runs the fused kernel's recipe: MXFP4 activations
+# (SiTUv2 too) and FP8 stage-2 route rows at every token count
 for _key, _value in {
     "AITER_USE_SYSTEM_TRITON": "1",
     "AITER_SITUV2_A4W4": "1",
@@ -726,6 +730,7 @@ class MegaMoeTP:
         max_local_tokens: int,
         group=None,
         comm_mode="ag_rs",
+        comm_dtype="fp8",
     ):
         shape = weights.shape
         situ = _situ(shape)
@@ -741,6 +746,7 @@ class MegaMoeTP:
             beta=situ[0] if situ else None,
             linear_beta=situ[1] if situ else None,
             comm_mode=comm_mode,
+            comm_dtype=comm_dtype,
         )
         self.engine = MegaMoeTPLayer(
             config,
@@ -989,9 +995,6 @@ def _time_graph(impl, inputs, args, ctx) -> tuple[float, torch.Tensor | None]:
         graph.replay()
         torch.cuda.synchronize()
         return us, out.clone()
-    except Exception as exc:  # noqa: BLE001 - diagnostic column only
-        logger.warning("[TP-MOE] graph capture failed: %s", exc)
-        return float("nan"), None
     finally:
         # a live graph while the next capture warms up is fatal
         graph = out = None
@@ -1003,7 +1006,7 @@ def run_case(shape, weights, ctx, args, global_tokens, max_local_tokens) -> dict
     tp = args.tp
     ar = args.comm_mode == "ar_ar"
     inputs = make_inputs(
-        shape, ctx, tp, global_tokens, args.seed, "balanced", args.comm_mode
+        shape, ctx, tp, global_tokens, args.seed, args.route, args.comm_mode
     )
     moe = (SplitTpMoeAR if ar else SplitTpMoe)(
         weights, ctx, max_local_tokens, args.comm_backend
@@ -1040,7 +1043,13 @@ def run_case(shape, weights, ctx, args, global_tokens, max_local_tokens) -> dict
 
     fused = None
     if args.impl in ("fused", "both"):
-        fused = MegaMoeTP(weights, ctx, max_local_tokens, comm_mode=args.comm_mode)
+        fused = MegaMoeTP(
+            weights,
+            ctx,
+            max_local_tokens,
+            comm_mode=args.comm_mode,
+            comm_dtype=args.comm_dtype,
+        )
         gate(
             row,
             "fused_rel_l2",
@@ -1048,13 +1057,19 @@ def run_case(shape, weights, ctx, args, global_tokens, max_local_tokens) -> dict
             args.fused_rtol,
             "fused vs split",
         )
+        err = fused.engine.poll_errors()
+        if not all_ranks_ok(err == 0, ctx.device):
+            raise AssertionError(
+                f"{shape.tag(tp)} tokens={global_tokens}: fused watchdog fired "
+                f"(rank {ctx.rank}: {err})"
+            )
         if check_ref:
             ref = torch_reference(weights, ctx, inputs, moe.gather)
             gate(
                 row,
                 "fused_ref_rel_l2",
                 rel_l2(fused(inputs), ref),
-                args.rtol,
+                args.fused_ref_rtol,
                 "fused vs torch",
             )
             del ref
@@ -1244,9 +1259,6 @@ def _sp_time_graph(devices, fn, args) -> tuple[float, list | None]:
         for d in devices:
             torch.cuda.synchronize(d)
         return best, [o.clone() for o in outs]
-    except Exception as exc:  # noqa: BLE001 - diagnostic column only
-        logger.warning("[TP-MOE] single-process graph timing failed: %s", exc)
-        return float("nan"), None
     finally:
         graphs = None
         gc.collect()
@@ -1289,7 +1301,7 @@ def run_case_sp(
     devices = [c.device for c in ctxs]
     inputs = [
         make_inputs(
-            shape, c, args.tp, global_tokens, args.seed, "balanced", args.comm_mode
+            shape, c, args.tp, global_tokens, args.seed, args.route, args.comm_mode
         )
         for c in ctxs
     ]
@@ -1334,6 +1346,7 @@ def run_case_sp(
                         max_local_tokens,
                         group=group,
                         comm_mode=args.comm_mode,
+                        comm_dtype=args.comm_dtype,
                     )
                 )
         _sp_run(devices, lambda r: fused[r](inputs[r]))
@@ -1351,9 +1364,25 @@ def run_case_sp(
                 row,
                 "fused_ref_rel_l2",
                 _sp_rel_l2(yf, expected),
-                args.rtol,
+                args.fused_ref_rtol,
                 "fused vs torch",
             )
+            masked = _masked_inputs(inputs, shape.experts)
+            ym = _sp_run(devices, lambda r: fused[r](masked[r][0]))
+            errs = [f.engine.poll_errors() for f in fused]
+            if any(errs):
+                raise AssertionError(f"masked ids: fused watchdog fired {errs}")
+            gate(
+                row,
+                "fused_masked_rel_l2",
+                _sp_rel_l2(
+                    ym,
+                    _sp_reference(weights, ctxs, [m for _, m in masked], global_tokens),
+                ),
+                args.fused_ref_rtol,
+                "fused (masked ids) vs torch",
+            )
+        _sp_empty_batch(fused, devices, shape, args.comm_mode)
     if not args.no_perf:
         row["ag_wire"] = split[0].plans(global_tokens).ag_wire
         row["split_graph_us"], rep = float("nan"), None
@@ -1385,64 +1414,57 @@ def run_case_sp(
     return row
 
 
+def _masked_inputs(inputs, experts):
+    """(ids with ~20% set to -1 / >= experts, the same with those routes as
+    expert 0 at weight 0 for the reference) per rank."""
+    out = []
+    for i in inputs:
+        g = torch.Generator(device=i.topk_ids_local.device).manual_seed(77)
+        sel = torch.rand(
+            i.topk_ids_local.shape, device=i.topk_ids_local.device, generator=g
+        )
+        ids = torch.where(sel < 0.1, -1, i.topk_ids_local)
+        ids = torch.where((sel >= 0.1) & (sel < 0.2), experts + 3, ids)
+        drop = sel < 0.2
+        w0 = torch.where(drop, 0.0, i.topk_weights_local)
+        ref_ids = torch.where(drop, 0, i.topk_ids_local)
+        meta = torch.cat([ref_ids, w0.view(torch.int32)], 1).to(torch.int32)
+        out.append(
+            (
+                replace(i, topk_ids_local=ids.to(i.topk_ids_local.dtype)),
+                replace(
+                    i,
+                    topk_ids_local=ref_ids,
+                    topk_weights_local=w0,
+                    route_meta_local=meta,
+                ),
+            )
+        )
+    return out
+
+
+def _sp_empty_batch(fused, devices, shape, comm_mode) -> None:
+    def run(r):
+        x = torch.empty((0, shape.model_dim), dtype=dtypes.bf16, device=devices[r])
+        ids = torch.empty((0, shape.topk), dtype=torch.int32, device=devices[r])
+        w = torch.empty((0, shape.topk), dtype=torch.float32, device=devices[r])
+        return fused[r].engine(x, w, ids)
+
+    ys = _sp_run(devices, run)
+    if any(tuple(y.shape) != (0, shape.model_dim) for y in ys):
+        raise AssertionError(f"{comm_mode} empty batch: {[y.shape for y in ys]}")
+
+
 def _flydsl_multi_device() -> None:
-    import pickle
+    from p2p_collectives import flydsl_multi_device
 
-    from flydsl.compiler import jit_executor, jit_function
-
-    art_cls = jit_executor.CompiledArtifact
-    if getattr(art_cls, "_mega_moe_multi_device", False):
-        return
-    lock = threading.RLock()
-    jf_call = jit_function.JitFunction.__call__
-
-    def _locked_call(self, *a, **k):
-        with lock:
-            return jf_call(self, *a, **k)
-
-    jit_function.JitFunction.__call__ = _locked_call
-    orig = art_cls._get_func_exe
-
-    class _PerDevice:
-        def __init__(self, art):
-            self.art = art
-            self.home = torch.cuda.current_device()
-            self.fns, self.keep = {}, []
-
-        def __call__(self, packed):
-            dev = torch.cuda.current_device()
-            fn = self.fns.get(dev)
-            if fn is None:
-                with lock:
-                    fn = self.fns.get(dev) or self._build(dev)
-            return fn(packed)
-
-        def _build(self, dev):
-            if dev == self.home:
-                fn = orig(self.art)
-            else:
-                twin = pickle.loads(pickle.dumps(self.art))
-                twin._post_load_processors = list(self.art._post_load_processors)
-                fn = orig(twin)
-                self.keep.append(twin)
-            self.fns[dev] = fn
-            return fn
-
-    def _get_func_exe(self):
-        disp = getattr(self, "_per_device_exe", None)
-        if disp is None:
-            disp = self._per_device_exe = _PerDevice(self)
-        return disp
-
-    art_cls._get_func_exe = _get_func_exe
-    art_cls._mega_moe_multi_device = True
+    flydsl_multi_device()
 
 
 def main_single_process(args) -> int:
-    from p2p_collectives import P2PGroup
+    from p2p_collectives import P2PGroup, PeerArenaGroup
 
     _flydsl_multi_device()
-    from aiter.ops.flydsl.kernels.symmetric_arena import PeerArenaGroup
 
     args.tp = args.tp or torch.cuda.device_count()
     devices = [torch.device("cuda", i) for i in range(args.tp)]
@@ -1515,7 +1537,19 @@ def parse_args(argv=None):
         default="ag_rs",
         help="ag_rs: AllGather before, ReduceScatter after; ar_ar: AllReduce both.",
     )
-    p.add_argument("--impl", choices=["unfused", "fused", "both"], default="unfused")
+    p.add_argument("--impl", choices=["unfused", "fused", "both"], default="both")
+    p.add_argument(
+        "--comm-dtype",
+        choices=["fp8", "bf16"],
+        default="fp8",
+        help="fused: dtype of the reduce partials and route rows.",
+    )
+    p.add_argument(
+        "--route",
+        choices=["random", "balanced"],
+        default="random",
+        help="random: top-k of random scores; balanced: every expert equally loaded.",
+    )
     p.add_argument(
         "--single-process",
         action="store_true",
@@ -1551,8 +1585,14 @@ def parse_args(argv=None):
     p.add_argument(
         "--fused-rtol",
         type=float,
-        default=0.06,
-        help="rel_l2 gate fused vs split (both carry their own FP8 route error).",
+        default=0.08,
+        help="rel_l2 gate fused vs split (each carries its own FP4/FP8 error).",
+    )
+    p.add_argument(
+        "--fused-ref-rtol",
+        type=float,
+        default=0.0,
+        help="rel_l2 gate fused vs torch; 0: 0.045 (--comm-dtype fp8) / 0.01 (bf16).",
     )
     p.add_argument("--no-perf", action="store_true", help="Accuracy only.")
     p.add_argument("--csv", default=None, help="Write the result table here.")
@@ -1561,6 +1601,8 @@ def parse_args(argv=None):
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+    if not args.fused_ref_rtol:
+        args.fused_ref_rtol = 0.045 if args.comm_dtype == "fp8" else 0.01
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     if args.single_process:
         return main_single_process(args)

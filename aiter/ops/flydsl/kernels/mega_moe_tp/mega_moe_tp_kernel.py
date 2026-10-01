@@ -109,7 +109,10 @@ def mega_moe_tp_shape_supported(model_dim: int, inter_dim: int, tp: int) -> bool
     return (
         model_dim % 512 == 0
         and (model_dim // 64) % NW == 0
+        and model_dim // 256 <= NCHA_MAX
+        and model_dim // 256 // gemm2_chunk_groups(model_dim, inter_dim) <= 31
         and inter_dim % 128 == 0
+        and inter_dim > 0
         and 1 <= tp <= MAX_TP
     )
 
@@ -217,6 +220,7 @@ C_AGK = 37
 C_CLS = 38
 C_YAGM = 39
 C_PRDY, C_FRDY, C_PBITS = 60, 61, 62
+C_RLAND = 63
 C_AGFREE = 41
 C_PLAN, C_NACT = 42, 43
 C_ARDY = 44
@@ -237,9 +241,11 @@ def compile_mega_moe_tp(
     TOPK: int,
     MT: int,
     TMAX: int,
+    E: int,
     act: str = "silu",
     situ_beta: float = 1.0,
     situ_linear_beta: float = 1.0,
+    swiglu_limit: float | None = None,
     npieces: int = 0,
     route_fp8: bool = False,
     agr: int = 1,
@@ -256,6 +262,7 @@ def compile_mega_moe_tp(
     ll_route: bool = False,
     xl: bool = False,
     xl_s0: int = 0,
+    comm_bf16: bool = False,
 ):
     """Build the launcher for one (shape, variant) instance.
 
@@ -268,8 +275,11 @@ def compile_mega_moe_tp(
     xsplit/xrem/xw: static column split of leftover experts (GEMM1 slices per
         expert, column-split experts, column-slice width in groups).
     ll_rs: LL ReduceScatter packets; ll_route: LL route rows too.
+    comm_bf16: bf16 (not MXFP8) ReduceScatter / all-reduce partials (no LL).
     """
     DYN = dyn_e > 0
+    if swiglu_limit is None:
+        swiglu_limit = 7.0 if act == "swiglu" else float("inf")
     c = mega_moe_tp_consts(H, I, MT, TMAX, agr, dyn_e, nab, nsk)
     RG, KS1, NCH, KS2, G2 = c["RG"], c["KS1"], c["NCH"], c["KS2"], c["G2"]
     CH1, CH2, SI_STRIDE = c["CH1"], c["CH2"], c["SI_STRIDE"]
@@ -289,6 +299,8 @@ def compile_mega_moe_tp(
     assert not DYN or xsplit == 0
     FP8R = bool(route_fp8)
     LL = bool(ll_rs)
+    CB16 = bool(comm_bf16)
+    assert not (CB16 and LL)
     TB = 1 if DYN else max(1, (RED_INFLIGHT // 2 if NPC > 2 else RED_INFLIGHT) // TOPK)
     DYN_PS = [p for p in range(1, KS2 + 1) if KS2 % p == 0]
     DLL = LL and bool(ll_route) and (DYN or NPC == 1)
@@ -308,7 +320,8 @@ def compile_mega_moe_tp(
     TPC = int(tp)
     AGR = int(agr)
     name = (
-        f"mega_moe_tp_fused_h{H}_i{I}_k{TOPK}_mt{MT}_t{TMAX}_{act}"
+        f"mega_moe_tp_fused_h{H}_i{I}_e{E}_k{TOPK}_mt{MT}_t{TMAX}_{act}"
+        + (f"_lim{swiglu_limit:g}" if math.isfinite(swiglu_limit) else "")
         + (f"_p{NPC}" if NPC > 1 else "")
         + ("_r8" if route_fp8 else "")
         + f"_ag{agr}_tp{tp}"
@@ -321,6 +334,7 @@ def compile_mega_moe_tp(
         + ("_ll" if LL else "")
         + ("_llr" if DLL else "")
         + (f"_xl{xl_s0}" if XL else "")
+        + ("_cb16" if CB16 else "")
     )
     const_expr = fx.const_expr
     # flydsl's cache key ignores module constants: the kernel references this tag
@@ -589,18 +603,18 @@ def compile_mega_moe_tp(
     def sum_live(acc, vals, live):
         return [x + live.select(y, fx.Float32(0.0)) for x, y in zip(acc, vals)]
 
-    # LL packets [d0, tag, d1, tag]: tag = epoch << 8 | E8M0 of the 8 E4M3 in d0, d1
-    def ll_tag(a, e8):
-        return ((a["epoch"] & i32(0xFFFFFF)) << i32(8)) | e8
+    # LL packets [d0, epoch, d1, tag]: tag = epoch << 8 | E8M0 of the 8 E4M3 in d0, d1
+    def ll_pkt(a, d0, d1, e8):
+        tag = ((a["epoch"] & i32(0xFFFFFF)) << i32(8)) | e8
+        return fx.Vector.from_elements([d0, a["epoch"], d1, tag], fx.Int32)
 
     def ll_ok(a, q):
-        want = a["epoch"] & i32(0xFFFFFF)
-        return (fx.Int32(q[1]).shrui(i32(8)) == want) & (
-            fx.Int32(q[3]).shrui(i32(8)) == want
+        return (fx.Int32(q[1]) == a["epoch"]) & (
+            fx.Int32(q[3]).shrui(i32(8)) == (a["epoch"] & i32(0xFFFFFF))
         )
 
     def ll_vals(q):
-        sc = e8_scale(q[1])
+        sc = e8_scale(q[3])
         return fp8x4_unpack(fx.Int32(q[0]), sc) + fp8x4_unpack(fx.Int32(q[2]), sc)
 
     def ll_pending(a, lane, pkts):
@@ -668,7 +682,7 @@ def compile_mega_moe_tp(
             act=act,
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
-            swiglu_limit=7.0 if act == "swiglu" else float("inf"),
+            swiglu_limit=swiglu_limit,
         )
 
     @traced
@@ -721,13 +735,16 @@ def compile_mega_moe_tp(
         if const_expr(a is not None):
             _report_if(a, cur < target, ERR_FLAG)
 
+    def masked(e):
+        return fx.Int32(e).bitcast(fx.Uint32) >= fx.Uint32(E)
+
     @traced
     def gather_routes(L, tid, ids_addr, tw_addr, ttot, expert):
         if tid == i32(0):
             lds_st(L, L_CTL + C_CNT * 4, i32(0))
         cbar(L, tid)
         n = ttot * i32(TOPK)
-        rid = rsrc(ids_addr)
+        rid = rsrc(ids_addr, n * i32(16 if MLL else 4))
         if const_expr(MLL):
             for i_ in range(tid, n, i32(NT)):
                 i = i32(i_)
@@ -735,7 +752,7 @@ def compile_mega_moe_tp(
                 _gather_one(L, i, fx.Int32(pk[0]) == expert, fx.Int32(pk[2]))
         else:
             n4 = n // i32(4)
-            rtw = rsrc(tw_addr)
+            rtw = rsrc(tw_addr, n * i32(4))
             for g0 in range_constexpr(0, SCAN_IT, SCAN_G):
                 its = list(range(g0, min(g0 + SCAN_G, SCAN_IT)))
                 vs, ws = [], []
@@ -757,6 +774,56 @@ def compile_mega_moe_tp(
         cnt = lds_ld_i32(L, L_CTL + C_CNT * 4)
         cbar(L, tid)
         return fx.min(cnt, i32(TMAX))
+
+    @traced
+    def zero_masked(L, lane, a, w0, nw):
+        # no expert writes the route rows of ids outside [0, E) (masked
+        # routes): waves w0.. of this CTA zero those of its share of the ids,
+        # after they landed and before any of its chunk signals (LL rows: any
+        # time before the push, which checks their epoch tags)
+        n = a["ttot"] * i32(TOPK)
+        nblk = i32(gpu.grid_dim.x)
+        per = (n + nblk - i32(1)) // nblk
+        lo = i32(gpu.block_id("x")) * per
+        hi = fx.min(lo + per, n)
+        rid = rsrc(a["ids"], n * i32(16 if MLL else 4))
+        if const_expr(MLL):
+            # the compute waves saw every routing packet land
+            if lane == i32(0):
+                spin_lds_ge(L, L_CTL + C_RLAND * 4, i32(1))
+            rocdl.sched_barrier(0)
+        for b_ in range(lo + i32(w0 * 64), hi, i32(nw * 64)):
+            i = i32(b_) + lane
+            off = fx.min(i, n - i32(1)) * i32(16 if MLL else 4)
+            e = fx.Int32(bld(rid, off, 0, T.i32, 0))
+            bal = fx.Int64(rocdl.ballot(T.i64, _u((i < hi) & masked(e))))
+            if bal != fx.Int64(0):
+                for j_ in range(i32(0), i32(64), i32(1)):
+                    j = i32(j_)
+                    if ((bal >> fx.Int64(j)) & fx.Int64(1)) != fx.Int64(0):
+                        _zero_route(a, lane, i32(b_) + j)
+                wait_vm(0)
+
+    @traced
+    def _zero_route(a, lane, ridx):
+        rb = route_region_bytes(a["ttot"])
+        z = fx.Vector.from_elements([i32(0)] * 4, fx.Int32)
+        for p in range_constexpr(NPC):
+            rs = rsrc(a["routes"], rb) if p == 0 else rsrc(a["proutes"], i32(p) * rb)
+            base = i32(0) if p == 0 else i32(p - 1) * rb
+            for q_ in range(lane, i32(H // 8), i32(64)):
+                q = i32(q_)
+                if const_expr(DLL):
+                    v = ll_pkt(a, i32(0), i32(0), i32(0))
+                    bst(v, rs, base + (ridx * i32(H) + q * i32(8)) * i32(2), 0, AUX_SC1)
+                elif const_expr(FP8R):
+                    if q < i32(H // 16):
+                        bst(z, rs, base + ridx * i32(H) + q * i32(16), 0, AUX_SC1)
+                    if q < i32(H // 512):
+                        soff = a["ttot"] * i32(TOPK * H) + ridx * i32(H // 32)
+                        bst(z, rs, base + soff + q * i32(16), 0, AUX_SC1)
+                else:
+                    bst(z, rs, base + (ridx * i32(H) + q * i32(8)) * i32(2), 0, AUX_SC1)
 
     @traced
     def _gather_one(L, idx, hit, wv):
@@ -1105,11 +1172,11 @@ def compile_mega_moe_tp(
             hi.append(y)
         col = n0 + (q4 >> i32(1)) * i32(32) + (q4 & i32(1)) * i32(16)
         if const_expr(DLL):
-            tag = ll_tag(a, ((q4 >> i32(1)) == i32(0)).select(e8s[0], e8s[1]))
+            e8 = ((q4 >> i32(1)) == i32(0)).select(e8s[0], e8s[1])
             off = (rix * i32(H) + col) * i32(2)
             for h in range_constexpr(2):
                 d = lo if h == 0 else hi
-                pkt = fx.Vector.from_elements([d[0], tag, d[1], tag], fx.Int32)
+                pkt = ll_pkt(a, d[0], d[1], e8)
                 bst(pkt, rs, ok.select(off + i32(16 * h), oob), 0, AUX_SC1)
             return
         ov = fx.Vector.from_elements(lo + hi, fx.Int32)
@@ -1366,7 +1433,15 @@ def compile_mega_moe_tp(
         elif const_expr(not AR):
             ag_wait_meta(a, tid, a["epoch"])
         _stale_dropped(tid, a)
+        # ag_rs: after the cbar, i.e. after every wave's routing wait
+        if const_expr(AR and not DLL):
+            zero_masked(L, tid % i32(64), a, tid // i32(64), NW)
         cbar(L, tid)
+        if const_expr(MLL):  # noqa: SIM102 (compile-time guard)
+            if tid == i32(0):
+                lds_st_rel(L, L_CTL + C_RLAND * 4, i32(1))
+        if const_expr(not AR and not DLL):
+            zero_masked(L, tid % i32(64), a, tid // i32(64), NW)
         if const_expr(DYN):
             dyn_plan(L, tid, a)
         ub = lds_ld_i32(L, L_CTL + C_UNIT * 4)
@@ -1405,12 +1480,14 @@ def compile_mega_moe_tp(
             # column slices units[col0 : col0 + ncol] are claimed at run time
             # by the CTAs that run out of work first. Bounded loop (a dynamic
             # while around barriers + atomics miscompiles): at most twice the
-            # mean per CTA, so the CTAs together always take all of them.
+            # mean per CTA, so the CTAs together always take all of them; each
+            # unit claims the next one, except in the last iteration (that
+            # claim would never run).
             nblk = i32(gpu.grid_dim.x)
             cap = (a["ncol"] + nblk - i32(1)) // nblk * i32(2) + i32(2)
             col_claim(L, tid, a)
             for it_ in range(i32(0), cap, i32(1)):
-                _col_unit(L, tid, a)
+                _col_unit(L, tid, a, i32(it_) < cap - i32(1))
         if const_expr(DLL):
             _cdone(tid, L)
 
@@ -1422,11 +1499,14 @@ def compile_mega_moe_tp(
     @traced
     def dyn_plan(L, tid, a):
         n = a["ttot"] * i32(TOPK)
-        rid = rsrc(a["ids"])
+        rid = rsrc(a["ids"], n * i32(16 if MLL else 4))
         for idx_ in range(tid, n, i32(NT)):
             idx = i32(idx_)
             e = fx.Int32(bld(rid, idx * i32(16 if MLL else 4), 0, T.i32, 0))
-            lds_atomic_or(L, L_DYN + (e >> i32(5)) * i32(4), i32(1) << (e & i32(31)))
+            if masked(e) == fx.Boolean(False):
+                lds_atomic_or(
+                    L, L_DYN + (e >> i32(5)) * i32(4), i32(1) << (e & i32(31))
+                )
         cbar(L, tid)
         _dyn_prefix(L, tid)
         cbar(L, tid)
@@ -1588,7 +1668,7 @@ def compile_mega_moe_tp(
                 _signal_col(a, a["epoch"], i32(c_), kind.shrui(i32(XQ_SHIFT)))
 
     @traced
-    def _col_unit(L, tid, a):
+    def _col_unit(L, tid, a, more):
         c = lds_ld_i32(L, L_CTL + C_CLAIM * 4)
         if c < a["ncol"]:
             u = a["col0"] + c
@@ -1601,7 +1681,8 @@ def compile_mega_moe_tp(
                 cbar(L, tid)
             if const_expr(not DLL):
                 _xcol_empty(a, tid, kind, i0, R)
-            col_claim(L, tid, a)
+            if more:
+                col_claim(L, tid, a)
 
     def claim_addr(a, bank_off):
         bank = (a["epoch"] + i32(bank_off)) & i32(1)
@@ -1801,14 +1882,21 @@ def compile_mega_moe_tp(
     @traced
     def _push_store(a, r_dst, prow, c0, v, acc, ok):
         col = c0 + v * i32(8)
+        if const_expr(CB16):
+            if ok:
+                bst(pack_bf16x8(acc), r_dst, (prow * i32(H) + col) * i32(2), 0, AUX_SYS)
+        else:
+            _push_store_fp8(a, r_dst, prow, col, v, acc, ok)
+
+    @traced
+    def _push_store_fp8(a, r_dst, prow, col, v, acc, ok):
         am = amax(acc)
         am = am.maximumf(am.shuffle_xor(i32(1), i32(64)))
         am = am.maximumf(am.shuffle_xor(i32(2), i32(64)))
         e8, qs = _e8m0_from_amax(am, max_norm=448.0)
         d0, d1 = fp8x4_pack(acc[0:4], qs), fp8x4_pack(acc[4:8], qs)
         if const_expr(LL):
-            tag = ll_tag(a, fx.Int32(e8) & i32(0xFF))
-            pkt = fx.Vector.from_elements([d0, tag, d1, tag], fx.Int32)
+            pkt = ll_pkt(a, d0, d1, fx.Int32(e8) & i32(0xFF))
             if ok:
                 bst(pkt, r_dst, (prow * i32(H) + col) * i32(2), 0, AUX_SYS)
         else:
@@ -1898,19 +1986,26 @@ def compile_mega_moe_tp(
                 if const_expr(LL):
                     _final_ll(tid, a, r_recv, row, c0, v, vc)
                     continue
-                lds_ = []
-                for p in range_constexpr(MAX_TP):
-                    pc = fx.min(i32(p), a["tp"] - i32(1))
-                    doff, soff = part_offs(a, pc * a["mmax"] + row, c0 + vc * i32(8))
-                    lds_.append(
-                        (
-                            bld(r_recv, doff, 0, V2I, AUX_SYS),
-                            bld(r_recv, soff, 0, T.i8, AUX_SYS),
-                        )
-                    )
                 acc = [fx.Float32(0.0)] * 8
-                for p in range_constexpr(MAX_TP):
-                    acc = sum_live(acc, fp8x8_decode(lds_[p]), i32(p) < a["tp"])
+                if const_expr(CB16):
+                    pk = recv_pkts(a, r_recv, row, a["mmax"], c0, vc)
+                    for p in range_constexpr(MAX_TP):
+                        acc = sum_live(acc, bf16x8_to_f32(pk[p]), i32(p) < a["tp"])
+                else:
+                    lds_ = []
+                    for p in range_constexpr(MAX_TP):
+                        pc = fx.min(i32(p), a["tp"] - i32(1))
+                        doff, soff = part_offs(
+                            a, pc * a["mmax"] + row, c0 + vc * i32(8)
+                        )
+                        lds_.append(
+                            (
+                                bld(r_recv, doff, 0, V2I, AUX_SYS),
+                                bld(r_recv, soff, 0, T.i8, AUX_SYS),
+                            )
+                        )
+                    for p in range_constexpr(MAX_TP):
+                        acc = sum_live(acc, fp8x8_decode(lds_[p]), i32(p) < a["tp"])
                 _y_store(a, row, c0, v, pack_bf16x8(acc))
 
     @traced
@@ -2104,9 +2199,7 @@ def compile_mega_moe_tp(
                     (pc * a["mmax"] + fin_key(a)) * i32(H) + c * i32(CW) + i32(CW - 8)
                 ) * i32(2)
                 t = fx.Int32(bld(r_recv, off + i32(4), 0, T.i32, AUX_SYS))
-                r1 = r1 & (
-                    (i32(p) >= a["tp"]) | (t.shrui(i32(8)) == (epoch & i32(0xFFFFFF)))
-                )
+                r1 = r1 & ((i32(p) >= a["tp"]) | (t == epoch))
             return r1
         rf = own_rs(a, "off_flag")
         fo = (i32(FLAG_RDY) + c * i32(MAX_TP)) * i32(4)
@@ -2464,7 +2557,7 @@ def compile_mega_moe_tp(
         row0, stride_r, nrows, qb, qstep, cnt = ag_rows(a)
         k_hi = fx.min(k_hi, cnt)
         nk = fx.max(k_hi - k_lo, i32(0))
-        rxl = rsrc(a["x"])
+        rxl = rsrc(a["x"], (a["ttot"] if AR else a["m"]) * i32(H * 2))
         for q_ in range(t0, nrows * nk * i32(8), i32(stride)):
             q = i32(q_)
             r = q // (nk * i32(8))
@@ -2612,8 +2705,9 @@ def compile_mega_moe_tp(
         if bid < _ag_nmeta(a):
             n = a["m"] * i32(TOPK)
             n4 = n // i32(4)
-            rid = rsrc(a["ids_in"])
-            rtw = rsrc(a["tw_in"])
+            # lanes past the input read 0 (their stores are dropped)
+            rid = rsrc(a["ids_in"], n * i32(4))
+            rtw = rsrc(a["tw_in"], n * i32(4))
             dst0 = a["rank"] * n * i32(4)
             v = bid * i32(64) + lane
             idv = bld(rid, v * i32(16), 0, V4I, 0)
@@ -2643,8 +2737,8 @@ def compile_mega_moe_tp(
     @traced
     def _ag_send_meta_ll(lane, a):
         n = a["m"] * i32(TOPK)
-        rid = rsrc(a["ids_in"])
-        rtw = rsrc(a["tw_in"])
+        rid = rsrc(a["ids_in"], n * i32(4))
+        rtw = rsrc(a["tw_in"], n * i32(4))
         big = i32(1 << 30)
         for i_ in range(
             i32(gpu.block_id("x")) * i32(64) + lane, n, i32(gpu.grid_dim.x) * i32(64)
@@ -2915,6 +3009,7 @@ def compile_mega_moe_tp(
                         ag_send(L, tid % i32(64), a, 1)
                 if const_expr(DLL):
                     if tid < i32(NT + 192):
+                        zero_masked(L, tid % i32(64), a, 0, 1)
                         push_dll(L, tid, a, 2)
                     else:
                         push_dll(L, tid, a, 3)
@@ -3022,8 +3117,11 @@ def compile_mega_moe_tp(
             a["ids"] = fx.Int64(ids_in)
             a["tw"] = fx.Int64(tw_in)
         else:
-            a["ids"] = fx.Int64(mine) + off_ids
-            a["tw"] = fx.Int64(mine) + off_w
+            par = fx.Int64(epoch & i32(1)) * fx.Int64(a["tp"] * a["mmax"] * i32(TOPK))
+            a["off_ids"] = off_ids + par * fx.Int64(16)
+            a["off_w"] = off_w + par * fx.Int64(4)
+            a["ids"] = fx.Int64(mine) + a["off_ids"]
+            a["tw"] = fx.Int64(mine) + a["off_w"]
             if (tid >= i32(NT)) & (tid < i32(NT + 64)):
                 if const_expr(MLL):
                     _ag_send_meta_ll(tid % i32(64), a)

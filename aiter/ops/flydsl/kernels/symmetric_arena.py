@@ -4,16 +4,16 @@
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import functools
-import logging
-import threading
+import os
 from dataclasses import dataclass, field
 
 import torch
 import torch.distributed as dist
 
-__all__ = ["PeerArenaGroup", "SymmetricArena"]
+__all__ = ["SymmetricArena"]
 
 _ALIGN = 256
 _IPC_HANDLE_BYTES = 64
@@ -39,6 +39,7 @@ def _hip():
         _IpcHandle,
         ctypes.c_uint,
     ]
+    lib.hipIpcCloseMemHandle.argtypes = [ctypes.c_void_p]
     lib.hipMemGetAddressRange.argtypes = [
         ctypes.POINTER(ctypes.c_void_p),
         ctypes.POINTER(ctypes.c_size_t),
@@ -73,63 +74,49 @@ def _ipc_handle(ptr: int) -> bytes:
     return bytes(bytearray(h.reserved))
 
 
-@functools.cache
+# a peer allocation maps once per process (arenas can share one): handle -> [ptr, refs]
+_OPEN: dict[bytes, list] = {}
+
+
 def _ipc_open(handle: bytes) -> int:
-    h = _IpcHandle()
-    ctypes.memmove(ctypes.byref(h), handle, _IPC_HANDLE_BYTES)
-    peer = ctypes.c_void_p()
-    _check(
-        _hip().hipIpcOpenMemHandle(ctypes.byref(peer), h, ctypes.c_uint(1)),
-        "hipIpcOpenMemHandle",
+    ent = _OPEN.get(handle)
+    if ent is None:
+        h = _IpcHandle()
+        ctypes.memmove(ctypes.byref(h), handle, _IPC_HANDLE_BYTES)
+        peer = ctypes.c_void_p()
+        _check(
+            _hip().hipIpcOpenMemHandle(ctypes.byref(peer), h, ctypes.c_uint(1)),
+            "hipIpcOpenMemHandle",
+        )
+        ent = _OPEN[handle] = [int(peer.value or 0), 0]
+    ent[1] += 1
+    return ent[0]
+
+
+def _ipc_close(handle: bytes) -> None:
+    ent = _OPEN[handle]
+    ent[1] -= 1
+    if ent[1] == 0:
+        del _OPEN[handle]
+        _check(
+            _hip().hipIpcCloseMemHandle(ctypes.c_void_p(ent[0])), "hipIpcCloseMemHandle"
+        )
+
+
+@contextlib.contextmanager
+def _no_expandable_segments():
+    """hipIpcGetMemHandle cannot export expandable-segment (VMM) memory."""
+    conf = os.environ.get("PYTORCH_HIP_ALLOC_CONF") or os.environ.get(
+        "PYTORCH_CUDA_ALLOC_CONF", ""
     )
-    return int(peer.value or 0)
-
-
-class PeerArenaGroup:
-    """Every rank of a TP group driven by this one process (peer access, no IPC).
-    Pass it as ``group=``; the rank is the device's index in ``devices``."""
-
-    def __init__(self, devices):
-        self.devices = [torch.device(d) for d in devices]
-        self.world_size = len(self.devices)
-        self._base: dict[int, int] = {}
-        self._barrier = threading.Barrier(self.world_size)
-        hip = _hip()
-        prev = torch.cuda.current_device()
-        for d in self.devices:
-            torch.cuda.set_device(d)
-            for peer in self.devices:
-                if peer != d:
-                    err = hip.hipDeviceEnablePeerAccess(peer.index, 0)
-                    if err not in (0, 704):  # 704: already enabled
-                        raise RuntimeError(
-                            f"hipDeviceEnablePeerAccess({d} -> {peer}) = {err}"
-                        )
-                    if err:
-                        hip.hipGetLastError()
-        torch.cuda.set_device(prev)
-
-    def rank_of(self, device: torch.device) -> int:
-        return self.devices.index(torch.device(device))
-
-    def barrier(self, timeout: float = 60.0) -> None:
-        try:
-            self._barrier.wait(timeout)
-        except threading.BrokenBarrierError:
-            logging.getLogger(__name__).warning(
-                "PeerArenaGroup.barrier: ranks did not meet within %.0f s", timeout
-            )
-            self._barrier.reset()
-
-    def register(self, rank: int, base_ptr: int) -> None:
-        self._base[rank] = base_ptr
-
-    def base_ptrs(self) -> tuple[int, ...]:
-        if len(self._base) != self.world_size:
-            raise RuntimeError(
-                f"{len(self._base)} of {self.world_size} ranks committed"
-            )
-        return tuple(self._base[r] for r in range(self.world_size))
+    on = "expandable_segments:true" in conf.replace(" ", "").lower()
+    if on:
+        torch.cuda.memory._set_allocator_settings("expandable_segments:False")
+    try:
+        yield
+    finally:
+        if on:
+            torch.cuda.memory._set_allocator_settings("expandable_segments:True")
 
 
 @dataclass
@@ -143,12 +130,18 @@ class SymmetricSlice:
 
 
 class SymmetricArena:
-    """A same-layout-on-every-rank device arena, mapped into all peers."""
+    """A same-layout-on-every-rank device arena, mapped into all peers.
+
+    ``group``: a torch.distributed group (one process per rank, IPC), or an
+    in-process group driving every rank's device from one process, with
+    ``world_size``, ``rank_of(device)``, ``register(rank, ptr)``,
+    ``base_ptrs()`` and ``barrier()`` (e.g. the single-process test harness).
+    """
 
     def __init__(self, *, group=None, device: torch.device | None = None):
         self.group = group
         self.device = device or torch.device("cuda", torch.cuda.current_device())
-        if isinstance(group, PeerArenaGroup):
+        if not self.ipc:
             self.rank, self.world_size = group.rank_of(self.device), group.world_size
         else:
             self.rank = dist.get_rank(group=group)
@@ -157,6 +150,7 @@ class SymmetricArena:
         self._cursor = 0
         self._storage: torch.Tensor | None = None
         self._base_ptrs: tuple[int, ...] = ()
+        self._opened: list[bytes] = []
 
     def reserve(self, name: str, shape, dtype: torch.dtype) -> SymmetricSlice:
         """Carve out a named region. Must run in the same order on every rank."""
@@ -171,7 +165,8 @@ class SymmetricArena:
 
     def commit(self) -> SymmetricArena:
         total = (self._cursor + _ALIGN - 1) // _ALIGN * _ALIGN
-        self._storage = torch.zeros(total, dtype=torch.uint8, device=self.device)
+        with _no_expandable_segments() if self.ipc else contextlib.nullcontext():
+            self._storage = torch.zeros(total, dtype=torch.uint8, device=self.device)
         base_ptr = int(self._storage.data_ptr())
         for s in self._slices.values():
             s.local = (
@@ -179,7 +174,7 @@ class SymmetricArena:
                 .view(s.dtype)
                 .view(s.shape)
             )
-        if isinstance(self.group, PeerArenaGroup):
+        if not self.ipc:
             self.group.register(self.rank, base_ptr)
             return self
         with torch.cuda.device(self.device):
@@ -198,19 +193,45 @@ class SymmetricArena:
                     raise RuntimeError(
                         f"arena size disagrees: rank {self.rank} {total} B, rank {r} {size} B"
                     )
-                ptrs.append(base_ptr if r == self.rank else _ipc_open(handle) + off)
+                if r == self.rank:
+                    ptrs.append(base_ptr)
+                else:
+                    ptrs.append(_ipc_open(handle) + off)
+                    self._opened.append(handle)
         self._base_ptrs = tuple(ptrs)
         dist.barrier(group=self.group)
         return self
 
+    def close(self) -> None:
+        """Unmap the peers' arenas (no kernel may use them any more)."""
+        if self._opened:
+            torch.cuda.synchronize(self.device)
+            for handle in self._opened:
+                _ipc_close(handle)
+            self._opened = []
+            self._base_ptrs = ()
+
+    def __del__(self):
+        with contextlib.suppress(Exception):
+            self.close()
+
     def barrier(self) -> None:
-        if isinstance(self.group, PeerArenaGroup):
+        if not self.ipc:
             self.group.barrier()
         else:
             dist.barrier(group=self.group)
 
     @property
+    def ipc(self) -> bool:
+        """Ranks are processes (not one process driving every device)."""
+        return not hasattr(self.group, "register")
+
+    @property
+    def storage(self) -> torch.Tensor:
+        return self._storage
+
+    @property
     def base_ptrs(self) -> tuple[int, ...]:
-        if isinstance(self.group, PeerArenaGroup):
+        if not self.ipc:
             return self.group.base_ptrs()
         return self._base_ptrs

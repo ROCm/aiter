@@ -42,6 +42,7 @@ skip_tests=(
     "op_tests/multigpu_tests/test_mori_all2all.py"
     "op_tests/multigpu_tests/test_fused_ar_rms.py"
     "op_tests/multigpu_tests/test_mega_moe_v2.py"
+    "op_tests/multigpu_tests/p2p_collectives.py"
     "op_tests/multigpu_tests/triton_test/test_reduce_scatter_all_gather.py"
     "op_tests/multigpu_tests/triton_test/test_fused_rs_rmsnorm_quant_ag.py"
 )
@@ -118,6 +119,33 @@ for file in "${sharded_files[@]}"; do
                 --standalone
                 --nproc_per_node=8
                 "$file"
+            )
+            ;;
+        op_tests/multigpu_tests/test_mega_moe_TP.py)
+            {
+                echo "Running fused TP MegaMoE accuracy (one process, 4 GPUs) when supported"
+            } | tee -a latest_test.log
+            test_cmd=(
+                timeout 60m
+                bash -c '
+                    set -euo pipefail
+                    test_file=$1
+                    arch=$(python3 -c \
+                        "from aiter.jit.utils.chip_info import get_gfx; print(get_gfx())")
+                    if [[ "$arch" != "gfx950" ]]; then
+                        echo "Skipping $test_file: requires gfx950, got $arch"
+                        exit 0
+                    fi
+                    for mode in ag_rs ar_ar; do
+                        python3 "$test_file" --single-process --tp 4 \
+                            --models glm5 m3 --tokens 8 64 128 512 \
+                            --comm-mode "$mode" --no-perf
+                        python3 "$test_file" --single-process --tp 4 \
+                            --models glm5 --tokens 8 512 \
+                            --comm-mode "$mode" --no-perf --comm-dtype bf16
+                    done
+                '
+                _ "$file"
             )
             ;;
         op_tests/test_mla_persistent.py|op_tests/test_mla_persistent_round_robin.py)
