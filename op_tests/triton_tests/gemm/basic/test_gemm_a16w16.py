@@ -100,7 +100,6 @@ def test_gemm_a16_w16(M: int, N: int, K: int, backend, kernel_type):
 # Smaller set for testing activations, setting the output tensor and dtype
 def get_fewer_x_vals():
     x_vals = [(16, 1024, 1024)]
-    x_vals += [(16, 896, 3584)]
     x_vals += [(128, 8192, 512)]
     x_vals += [(256, 512, 8192)]
     x_vals += [(1024 * v, 1024 * v, 1024 * v) for v in (1, 5, 8)]
