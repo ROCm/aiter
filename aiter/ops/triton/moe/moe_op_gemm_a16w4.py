@@ -487,7 +487,8 @@ def moe_gemm_a16w4(
             expert_map.is_contiguous()
             and expert_map.dtype == torch.int32
             and expert_map.device == x.device
-        ), "expert_map must be a contiguous int32 tensor on x.device"
+            and expert_map.numel() == routing_data.n_expts_tot
+        ), "expert_map must be a contiguous int32 [n_expts_tot] tensor on x.device"
     stride_bias = None if bias is None else bias.stride(0)
 
     # moe metadata

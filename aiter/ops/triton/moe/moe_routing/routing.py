@@ -67,9 +67,10 @@ class RoutingData:
     n_expts_tot: int = field()
     n_expts_act: int = field()
     expt_data: ExptData = None
-    # Per-token selected expert ids [n_tokens, n_expts_act], in the original topk
-    # order (matches scatter_indx grouping). Used by callers to build an
-    # expert-parallel gate-validity mask; None on paths that don't populate it.
+    # Per-token selected expert ids [n_tokens, n_expts_act] (int16, as produced by
+    # topk), in the original topk order (matches scatter_indx grouping). Used by
+    # callers to build an expert-parallel gate-validity mask, e.g.
+    # `expert_map[topk_ids.long()] >= 0`.
     topk_ids: torch.Tensor = None
 
     def n_blocks(self, n_rows, block_m):
