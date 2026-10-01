@@ -143,8 +143,8 @@
       },
       "64": {
         "method": "splitk",
-        "_us": 42.3,
-        "split_k": 16,
+        "_us": 35.0,
+        "split_k": 32,
         "sk_block_m": 32,
         "block_k": 64,
         "dn_block_n": 96,
@@ -153,8 +153,8 @@
       },
       "128": {
         "method": "splitk",
-        "_us": 48.6,
-        "split_k": 16,
+        "_us": 41.5,
+        "split_k": 20,
         "sk_block_m": 32,
         "block_k": 64,
         "dn_block_n": 128,
@@ -163,8 +163,8 @@
       },
       "256": {
         "method": "splitk",
-        "_us": 54.0,
-        "split_k": 16,
+        "_us": 47.2,
+        "split_k": 20,
         "sk_block_m": 64,
         "block_k": 64,
         "dn_block_n": 128,

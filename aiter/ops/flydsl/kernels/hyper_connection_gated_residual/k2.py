@@ -265,7 +265,11 @@ def flydsl_up_gate_mix_norm(
     materialized ``xn`` -- removing the ``xn`` HBM round-trip and the norm-rebuild
     launch. Returns ``block_input`` [M, stream_dim] bf16.
     """
-    assert lora.dtype == torch.bfloat16 and lora.is_contiguous()
+    # lora may be a strided view of K1's packed [M, lowrank+hc] output (the
+    # first ``lowrank`` columns). Only the inner (lowrank) dim must be
+    # contiguous; a non-unit row stride (= packed width) is read directly, so
+    # the fused tail skips a full ``.contiguous()`` copy of lora.
+    assert lora.dtype == torch.bfloat16 and lora.stride(1) == 1
     assert r2.dtype == torch.bfloat16 and r2.is_contiguous()
     assert rrms.dtype == torch.float32 and rrms.is_contiguous()
     tokens, lowrank = lora.shape

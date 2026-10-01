@@ -152,11 +152,14 @@ def _k1_then_k2(
         gemm_pad=gemm_pad,
         stream=stream,
     )
+    # Views, not copies: K2 reads lora with K1's packed row stride (only the
+    # inner lowrank dim must be contiguous), and the next layer's prologue reads
+    # inj_next strided (same zero-copy contract as the skinny decode path). This
+    # drops a full ``.contiguous()`` of the [P, lowrank] lora between K1 and K2.
     if need_inj:
-        lora, inj = split_down_inject(packed, lowrank, hc_count)
-        lora, inj_next = lora.contiguous(), inj.contiguous()
+        lora, inj_next = split_down_inject(packed, lowrank, hc_count)
     else:
-        lora, inj_next = packed[:, :lowrank].contiguous(), None
+        lora, inj_next = packed[:, :lowrank], None
     block_input = flydsl_up_gate_mix_norm(
         lora, r2, rrms, norm_weight, w_up, hc_count, stream=stream
     )
