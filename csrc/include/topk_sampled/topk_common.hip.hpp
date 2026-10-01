@@ -236,40 +236,16 @@ __device__ __forceinline__ void emit_identity_row(int* __restrict__ out,
 // LDS capacity for the Phase C candidate set (keys + indices).
 constexpr int PHASE_C_CAP = 4096;
 
-// Borrowed from the per-row backend (aiter 3d40280db / f0818e31d): the final
-// top-k write is the kernel's answer and is never read back, so it should not
-// allocate against a cache the row data still wants. Behind a define so the two
-// halves can be priced apart.
-#ifndef OPT_NT_OUT
-#define OPT_NT_OUT 0
-#endif
+// The top-k output store: a plain store. The non-temporal form borrowed from
+// the per-row backend (aiter 3d40280db / f0818e31d) is not the shipped one.
 template <typename T>
 __device__ __forceinline__ void out_store(T* p, T v)
-{
-#if OPT_NT_OUT
-    __builtin_nontemporal_store(v, p);
-#else
-    *p = v;
-#endif
-}
+{ *p = v; }
 
-// Borrowed from aiter 2f2314596 / 68ae4c238: one 16-byte LDS store per thread
-// covers four bins, against four strided dword stores. HIST_SLOTS is 1024 and
-// divisible by 4, and every s_hist is declared __align__(16) for this.
-#ifndef OPT_VEC_CLEAR
-#define OPT_VEC_CLEAR 0
-#endif
 __device__ __forceinline__ void clear_hist(uint32_t* __restrict__ s_hist)
 {
-#if OPT_VEC_CLEAR
-    using u32x4   = __attribute__((__ext_vector_type__(4))) uint32_t;
-    const u32x4 z = {0u, 0u, 0u, 0u};
-    for(int i = threadIdx.x; i < HIST_SLOTS / 4; i += blockDim.x)
-        reinterpret_cast<u32x4*>(s_hist)[i] = z;
-#else
     for(int i = threadIdx.x; i < HIST_SLOTS; i += blockDim.x)
         s_hist[i] = 0u;
-#endif
 }
 // 4096 * (4+4) B = 32 KB LDS
 
@@ -492,9 +468,6 @@ __device__ __host__ __forceinline__ int common_prefix_passes(uint32_t mn, uint32
     return start;
 }
 
-#ifndef BCAST_RL
-#define BCAST_RL 1
-#endif
 #ifndef BCAST_RL_MUTANT
 #define BCAST_RL_MUTANT 0
 #endif
@@ -505,11 +478,7 @@ __device__ __forceinline__ uint32_t wave_bcast(uint32_t v, int src)
 #if BCAST_RL_MUTANT // gate self-test only: reads the neighbouring lane
     src = (src + 1) & (WAVE_SIZE - 1);
 #endif
-#if BCAST_RL
     return (uint32_t)__builtin_amdgcn_readlane((int)v, src);
-#else
-    return (uint32_t)__shfl((int)v, src);
-#endif
 }
 
 // Tie-correct gather shared by Phase C and the fallback: emits the indices of
@@ -584,67 +553,6 @@ __device__ __forceinline__ void block_gather_topk(int c,
     }
 }
 
-// Pointer form (no lambdas): prefer this under PHASE_C_OCCUPANCY. Named
-// distinctly so it does not collide with the KeyFn/IdxFn template above when
-// pointers are passed.
-template <bool WRITE_VALUES>
-__device__ __forceinline__ void block_gather_topk_ptrs(int c,
-                                                       uint32_t pivot,
-                                                       int ngt,
-                                                       int eq_needed,
-                                                       int* __restrict__ out,
-                                                       float* __restrict__ out_val,
-                                                       unsigned* __restrict__ s_wgt,
-                                                       unsigned* __restrict__ s_weq,
-                                                       const uint32_t* __restrict__ keys,
-                                                       const int* __restrict__ idxs)
-{
-    const int lane    = threadIdx.x & (WAVE_SIZE - 1);
-    const uint64_t lt = (1ull << lane) - 1ull;
-    for(int i0 = 0; i0 < c; i0 += blockDim.x)
-    {
-        const int i       = i0 + threadIdx.x;
-        const bool has    = (i < c);
-        const uint32_t k  = has ? keys[i] : 0u;
-        const bool gt     = has && (k > pivot);
-        const bool eq     = has && (k == pivot);
-        const uint64_t bg = __ballot(gt);
-        const uint64_t be = __ballot(eq);
-        const int tg      = __popcll(bg);
-        const int te      = __popcll(be);
-        unsigned baseg = 0, basee = 0;
-        if(lane == 0)
-        {
-            if(tg)
-                baseg = atomicAdd(s_wgt, (unsigned)tg);
-            if(te)
-                basee = atomicAdd(s_weq, (unsigned)te);
-        }
-        baseg = wave_bcast(baseg, 0);
-        basee = wave_bcast(basee, 0);
-        if(gt)
-        {
-            unsigned p = baseg + (unsigned)__popcll(bg & lt);
-            if(p < (unsigned)ngt)
-            {
-                out_store(out + p, idxs[i]);
-                if(WRITE_VALUES)
-                    out_store(out_val + p, sortable_to_fp32(k));
-            }
-        }
-        if(eq)
-        {
-            unsigned p = basee + (unsigned)__popcll(be & lt);
-            if(p < (unsigned)eq_needed)
-            {
-                out_store(out + ngt + p, idxs[i]);
-                if(WRITE_VALUES)
-                    out_store(out_val + ngt + p, sortable_to_fp32(k));
-            }
-        }
-    }
-}
-
 template <bool WRITE_VALUES>
 __device__ __forceinline__ void block_gather_topk_ragged(int c,
                                                          uint32_t pivot,
@@ -706,19 +614,6 @@ __device__ __forceinline__ void block_gather_topk_ragged(int c,
 
 // Byte offset of radix pass p (MSB first).
 __device__ __host__ __forceinline__ int radix_shift(int pass) { return 24 - 8 * pass; }
-
-// Grid.y for the fallback kernel. Blocks loop over the compacted row list, so
-// any number of fallback rows is handled; this only bounds the dispatch cost.
-// grid.y = M would dispatch 4096 blocks to do work for a handful of rows.
-constexpr int FB_GRID = 64;
-
-// Wave-private candidate regions (Phase B variant 3). Each wave in the row's
-// block owns a fixed slice, so it needs no atomic at all -- just a wave-uniform
-// register counter. The PHYSICAL stride is deliberately generous: only the
-// occupied slots are ever written or read, so a wide stride costs address space
-// and nothing else, while making per-wave overflow ~25 sigma away instead of
-// ~0 sigma (expected passers/wave is ~178 +/- 13 at K=2048).
-constexpr int CAND_SLOTS_PER_ROW = 8192;
 
 // Turns s_hist[256] (per-bucket counts) into an INCLUSIVE SUFFIX sum in place,
 // then finds the bucket where the running count from the top first reaches ek.
@@ -783,9 +678,6 @@ __device__ __forceinline__ void hist_add_aggregated(
         atomicAdd(&s_hist[bucket * HIST_REP + rep], 1u);
 }
 
-#ifndef SCAN_DPP
-#define SCAN_DPP 1
-#endif
 template <int ctrl, int row_mask, int bank_mask>
 __device__ __forceinline__ uint32_t dpp_add_u32(uint32_t x)
 { return x + (uint32_t)__builtin_amdgcn_update_dpp(0, (int)x, ctrl, row_mask, bank_mask, false); }
@@ -795,7 +687,6 @@ __device__ __forceinline__ uint32_t dpp_add_u32(uint32_t x)
 // the __shfl_down tree it replaces is six ds_bpermute + lgkmcnt(0) round trips.
 __device__ __forceinline__ uint32_t wave_suffix_sum(uint32_t v)
 {
-#if SCAN_DPP
     uint32_t x = v;
     x          = dpp_add_u32<0x111, 0xf, 0xf>(x); // row_shr:1
     x          = dpp_add_u32<0x112, 0xf, 0xf>(x); // row_shr:2
@@ -807,18 +698,6 @@ __device__ __forceinline__ uint32_t wave_suffix_sum(uint32_t v)
 #endif
     const uint32_t tot = (uint32_t)__builtin_amdgcn_readlane((int)x, WAVE_SIZE - 1);
     return tot - x + v;
-#else
-    const int lane = (int)(threadIdx.x & (WAVE_SIZE - 1));
-    uint32_t x     = v;
-#pragma unroll
-    for(int off = 1; off < WAVE_SIZE; off <<= 1)
-    {
-        const uint32_t up = (uint32_t)__shfl_down((int)x, off);
-        if(lane + off < WAVE_SIZE)
-            x += up;
-    }
-    return x;
-#endif
 }
 
 // Single-wave form of the scan: wave 0 alone reduces the replicas, scans all 256
@@ -847,9 +726,6 @@ __device__ __forceinline__ uint32_t wave_suffix_sum(uint32_t v)
 // which takes phase_a from 4 to 3 blocks/CU at S=8192 (163840/42008 vs
 // 163840/37912) for a barrier that g_14 measured at -0.35% on the anchor.
 template <bool CLEAR = false>
-#ifndef ABLATE_SCAN
-#define ABLATE_SCAN 0
-#endif
 __device__ __forceinline__ void
 block_find_pivot_bucket_wave0(uint32_t* __restrict__ s_hist, uint32_t* __restrict__ s_scan, int ek)
 {
@@ -936,9 +812,6 @@ constexpr int WIDE_WORDS        = WIDE_COARSE_SLOTS + WIDE_FINE;
 static_assert(WIDE_COARSE == WAVE_SIZE && WIDE_FINE == WIDE_COARSE * WAVE_SIZE,
               "the two-level scan puts one bucket per lane at each level");
 
-#ifndef PC_WIDE_REUSE
-#define PC_WIDE_REUSE 1
-#endif
 __host__ __device__ static inline constexpr int wide_buffer_count(int nwide, bool reuse)
 { return reuse && nwide > 0 ? 1 : nwide; }
 
@@ -1039,9 +912,7 @@ block_find_pivot_bucket_rep(uint32_t* __restrict__ s_hist, uint32_t* __restrict_
             for(int r = 0; r < HIST_REP; r++)
                 s_hist[t * HIST_REP + r] = 0u;
         }
-#if ABLATE_SCAN == 0
         x = wave_suffix_sum(x);
-#endif
         if(lane == 0)
             s_wavetot[wv] = x;
     }
@@ -1076,9 +947,7 @@ block_find_pivot_bucket(const uint32_t* __restrict__ s_hist, uint32_t* __restric
     uint32_t x     = (t < 256) ? s_hist[t] : 0u;
     if(t < 256)
     {
-#if ABLATE_SCAN == 0
         x = wave_suffix_sum(x);
-#endif
         if(lane == 0)
             s_wavetot[wv] = x;
     }

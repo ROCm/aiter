@@ -24,17 +24,26 @@ constexpr int R_TARGET     = 179;
 // small_n stages the WHOLE row in LDS, so N sets its LDS footprint directly and
 // the boundary is a measured occupancy tradeoff, not a capacity one.
 //
-// Measured at N=16384 (64 KB per row, 2 blocks/CU), small_n vs the sampled path:
-//   M=1 -1.8%, M=8 -7.3%, M=64 -15.1%, M=256 -18.0%   <- small_n wins
-//   M=1024 +17.1%, M=4096 +18.7%                      <- sampled path wins
-// At small M there are too few blocks for occupancy to bind, so skipping three
-// kernel launches and all the candidate traffic is free. At large M the
-// 2-blocks/CU ceiling costs more than the pipeline does.
-//
-// At N=32768 (128 KB per row) small_n loses at EVERY M (+3.8% to +45.7%), so
-// 16384 is the end of it, not a point on a continuing trend.
-constexpr int N_LDS_MAX           = 8192;  // small_n at any M
-constexpr int N_LDS_MAX_SMALL_M   = 16384; // small_n only while M is small
+// v8 crossover against the coop pipeline, run_perftest, both entries, small_n
+// time over sampled time (log/v8/snb_*.json, 324 points at N = 8193..16384):
+//   N <= 9000              0.73-0.99 at every M; 0.71-0.75 at M = 32768..65536,
+//                          where topk_select reaches it (log/v8/sn_prod.json)
+//   N = 11000              0.80-0.95 at M <= 768, 0.91-1.17 above
+//   N = 12001..16384       at M <= 256 small_n wins 53 of 96 points; above 256
+//                          it is 0.99 at best (N=12289, M=300..512), up to 1.76;
+//                          at M <= 4 it is 0.95-1.30, rising with N and falling
+//                          with M (log/v8/tinym_*.json, 18 N in that range)
+// Short rows favour small_n: one LDS pass against three kernels and the
+// candidate traffic. Past 9000 a row leaves 3 blocks per CU, which is one round
+// only up to M = 768. At M <= 256 every row has its own CU and small_n holds to
+// 16384, except at M <= 4, where a single block per row loses to the pipeline's
+// G blocks past 12000. The sampled path is bumpy in N there (its sample size
+// follows N's divisors). At N=32768 small_n loses at every M.
+constexpr int N_LDS_MAX           = 9000;  // small_n at any M
+constexpr int N_LDS_MAX_ONE_ROUND = 12000; // ... up to here while M <= 768
+constexpr int N_LDS_ONE_ROUND_M   = 768;
+constexpr int N_LDS_MAX_SMALL_M   = 16384; // ... and here while 4 < M <= 256
+constexpr int N_LDS_SMALL_M_FLOOR = 4;
 constexpr int N_LDS_SMALL_M_LIMIT = 256;
 
 // Hardware cap on the dynamic LDS one block may request. Asking for more makes
@@ -50,11 +59,6 @@ constexpr int PHASE_C_CAP_MAX = 8192;
 // to go, and a row with nowhere to go costs a flat ~350 us in the exact
 // fallback.
 constexpr double CAP_SAFE_FILL = 0.85;
-#ifndef WSTAGE_WAVES_OVERRIDE
-#define WSTAGE_WAVES_OVERRIDE 8
-#endif
-constexpr int WSTAGE_WAVES = WSTAGE_WAVES_OVERRIDE;
-constexpr int WSTAGE_CAP   = 320;
 // Per-row reservation counters (cand_reserved, cand_bad) sit one 128-byte line
 // apart, in uints. Packed, 32 rows share a line and phase_b's atomicAdds from
 // different rows serialize on it: ATT at M=4 N=131072 puts that atomic at 26.8%
@@ -65,15 +69,19 @@ constexpr int WSTAGE_CAP   = 320;
 constexpr int CTR_STRIDE = CTR_STRIDE_OVERRIDE;
 // phase_b_filter_coop's per-wave staging entries (dynamic LDS, so only that
 // kernel pays). A wave drains to global once more than CAP - 256 are staged,
-// and each drain waits on a global atomicAdd in the middle of the stream:
-// ABLATE_TH=1 prices candidate handling at 7.5 us of phase_b at M=512
-// N=131072 (coop_g=2, ~181 candidates per wave), of which the epilogue copy is
-// 0.7 us (log/v7/price_ablth.json, price_ablepi.json). 576 x 8 B x 8 waves =
-// 36.9 KB keeps 4 512-thread blocks per CU inside 160 KB.
+// and each drain waits on a global atomicAdd in the middle of the stream: a
+// +inf threshold (nothing passes) prices candidate handling at 7.5 us of
+// phase_b at M=512 N=131072 (coop_g=2, ~181 candidates per wave), of which the
+// epilogue copy is 0.7 us (log/v7/price_ablth.json, price_ablepi.json).
+// 576 x 8 B x 8 waves = 36.9 KB keeps 4 512-thread blocks per CU inside 160 KB.
 #ifndef WSTAGE_CAP_COOP_OVERRIDE
 #define WSTAGE_CAP_COOP_OVERRIDE 576
 #endif
 constexpr int WSTAGE_CAP_COOP = WSTAGE_CAP_COOP_OVERRIDE;
+// phase_b's block size, a compile-time constant inside the kernel so its
+// prologue reads neither blockDim nor the hidden workgroup-size argument. The
+// coop_g table was fitted at this size.
+constexpr int PB_BLOCK = 512;
 
 // The K the GEOMETRY has to serve on a ragged launch, which is not the caller's
 // K. A ragged row ranks min(K, row_len) <= min(K, N) elements and pads the rest
@@ -93,6 +101,11 @@ __host__ inline int geometry_k_ragged(int K, int N) { return K < N ? K : N; }
 constexpr int LDS_BYTES_PER_CU    = 160 * 1024;
 constexpr int CU_COUNT            = 256;
 constexpr int TARGET_WAVES_PER_CU = 32;
+// phase_b blocks resident across the GPU at once: its staging LDS and its waves
+// each allow four per CU.
+constexpr int PB_RESIDENT_BLOCKS =
+    CU_COUNT * std::min(LDS_BYTES_PER_CU / ((PB_BLOCK / WAVE_SIZE) * WSTAGE_CAP_COOP * 8),
+                        TARGET_WAVES_PER_CU / (PB_BLOCK / WAVE_SIZE));
 
 // Static __shared__ footprints, read off .group_segment_fixed_size with the
 // dynamic buffer excluded. Used only to estimate LDS-limited residency.
@@ -343,7 +356,7 @@ static inline bool sample_stride_exact(int N, int S)
 }
 
 // How S is chosen: 0 = constant R_TARGET, 1 = derive S from the acceptance
-// window, -1 = per-region (shipped).
+// window; which one is per region.
 //
 // Rule 1 is FALSIFIED as a GLOBAL replacement and always was: it regresses
 // M=64 N=262144 and M=256 N=262144 hard. But it is right in a region, and the
@@ -373,16 +386,18 @@ static inline bool sample_stride_exact(int N, int S)
 //
 // The v3-era note also reported the anchor at +3.9% under rule 1; it measures
 // +1.7% on g_22. Either way the anchor keeps rule 0.
-static int g_s_rule         = -1;
+//
+// v8 re-measured the small-M region on the current kernels (standalone, inputs
+// rotated, rule 1 time / rule 0 time, M = 1 / 8 / 32, plain and ragged alike):
+// equal (0.97-1.01) up to N = 327683, rule 1 better at N = 196611 (0.90-0.95),
+// mixed at N = 393219 (0.98 / 1.03 / 1.03), and rule 0 better from N = 458755
+// up (1.03-1.10): rule 1's margin of 2.46 there costs phase_c more candidates
+// than rule 0's S = 16384 costs phase_a. Rule 1 keeps N below 393216.
 constexpr int S_RULE1_M_MAX = 32;
+constexpr int S_RULE1_N_MAX = 393215;
 
-static inline int effective_s_rule(int M)
-{ return g_s_rule >= 0 ? g_s_rule : (M <= S_RULE1_M_MAX ? 1 : 0); }
-
-// 1 = search for the smallest exact-stride S at or above the law's S (v5
-// Stage 3); 0 = the v4 behaviour, which offered a single candidate and so took
-// the largest one. Kept as a knob so the +29% cliff stays reproducible.
-static int g_s_repair_search = 1;
+static inline int effective_s_rule(int M, int N)
+{ return M <= S_RULE1_M_MAX && N <= S_RULE1_N_MAX ? 1 : 0; }
 
 // Smallest sample count whose 3-sigma candidate window still fits under the
 // largest cap Phase C can hold.
@@ -404,7 +419,7 @@ static inline int derive_sample_s_for_n(int M, int N, int K, float margin_unused
         const int chunks = std::max(1, N / SAMPLE_CHUNK_ELEMS);
         return align_sample_s(chunks * SAMPLE_CHUNK_ELEMS);
     }
-    if(effective_s_rule(M) == 0)
+    if(effective_s_rule(M, N) == 0)
     {
         const float m  = auto_margin(K, SAMPLE_S_MAX, N);
         const double s = R_TARGET * (double)N / ((double)m * (double)K);
@@ -456,66 +471,72 @@ static inline int derive_cap(int K, float margin, int S, int N)
 // workaround for what was recorded as "coop_g=2 is broken". That diagnosis was
 // wrong: the real fault was an unbounded LDS staging buffer in
 // phase_b_filter_coop (see knowledge/known_bad.md), which corrupted counts at
-// any G once a wave produced more than WSTAGE_CAP passers. With that fixed,
+// any G once a wave produced more passers than its staging held. With that fixed,
 // every G from 1 to 256 gives identical, correct candidate counts, so the
 // restriction is gone and G is a free tuning knob again.
+//
+// Clamp first, then snap: phase_b takes G as a shift, so a G that is not a power
+// of two runs on its lowest set bit only (G=9 is one working block and eight idle).
 static inline int snap_coop_g(int g, int max_g)
 {
+    g     = std::max(1, std::min(g, max_g));
     int p = 1;
     while(p * 2 <= g)
         p *= 2;
-    return std::max(1, std::min(p, max_g));
+    return p;
 }
 
-// Measured best log2(coop_g) over the customer pow2 grid: full sweeps at
-// M=1..128 (2026-09-17) and M=256..4096 x N=131072..1048576 (v4, 2026-09-17).
+// Base log2(coop_g) per cell; coop_g_from_table moves a shape to G/2 or 2G when
+// that costs fewer resident rounds. Both were fitted in v8 on the acceptance
+// metric itself -- run_perftest device time, cold inputs, both entries -- from G
+// curves measured at 1270 (M, N) points: per row M = 2^r and 1.25 / 1.5 / 1.75 x
+// 2^r, per column its lower edge and an odd midpoint, every G within two steps
+// of the previous table's timed against it (scripts/coop_curves.py,
+// log/v8/curves/). Per cell, the base with the smallest worst-point regret among
+// those within 1% of the best geomean (scripts/coop_fit_policy.py). Minimax
+// because a cell serves EVERY shape in it: argmin at one N is how M=1024 col11
+// once came out as G=1, which led G=16 by 0.2% at N=786432 and lost 12.6% at
+// N=1048572. Against the best measured G: 0.25% geomean, p90 1.0%, worst 6.2%;
+// fitted on half the M samples and scored on the other half 0.67% (p90
+// 2.4-2.9%), where a table without the rounds step reads 1.2-1.4% (p90 4.6-5.0%).
 //
 // This is a table and not a formula on purpose. The best G falls roughly as
 // M^-0.3 and saturates differently per N, which no simple closed form
-// reproduces: the best two-parameter fit over this same data still leaves
-// +27% worst case, and the rule it replaces (target 256 total blocks) leaves
-// +77% -- measured at M=128 N=1048576, where it picked G=2 for 225 us against
-// 127 us at G=16.
+// reproduces: the best two-parameter fit over the v4 sweep left +27% worst
+// case, and the rule it replaced (target 256 total blocks) +77% -- measured at
+// M=128 N=1048576, where it picked G=2 for 225 us against 127 us at G=16. The
+// rounds cost alone leaves 0.7% (p90 3.1%), and 9-11% at M >= 4096, where it
+// always takes G=1 and the measured best is 2-8.
 //
-// Rows are log2(M) for M = 1..4096. Columns are HALF-octaves of N from 16384:
+// Rows are log2(M) for M = 1..4096; M above 4096 takes the last row (fitted at
+// M = 4096..7168, and below N = 131072 also at 12288..32768, where topk_select
+// reaches it). Columns are HALF-octaves of N from 16384:
 // column 2i is [2^k, 1.5 * 2^k) and column 2i+1 is [1.5 * 2^k, 2^(k+1)), with
 // k = 14 + i. N <= 8192 takes the small_n path and never reaches here.
 //
-// A full octave per column is measurably too coarse. Refitting this same data
-// with one column per octave costs up to **+5.42%** (M=64 over [16384, 32768))
+// A full octave per column is measurably too coarse. Refitting the v4 sweep
+// with one column per octave cost up to **+5.42%** (M=64 over [16384, 32768))
 // and more than 1% on 12 of the (M, octave) pairs, worst in
 // [524288, 1048576) at large M -- which is exactly where the octave table put
 // M=1024 N=1048572 on G=1 and paid +8.2%.
-//
-// Fitted by bench/coop_fit.py from 2093 measured points across 13 M, 23 N and 7
-// G (log/coop_sweep_{half,hole,mid,base16k}.tsv). Two rules, both there because
-// a cell serves EVERY N in its bucket and not just the one it was measured at:
-//   - minimax, not argmin: the G with the smallest worst-case cost over the
-//     bucket's measured N. Argmin at a single N is how M=1024 col11 first came
-//     out as G=1, which led G=16 by 0.2% at N=786432 and lost 12.6% at
-//     N=1048572 in the same bucket.
-//   - ties within 1% resolved toward monotone-in-N, evaluated across the bucket
-//     as well. Cells where monotonicity costs more are left alone, which is why
-//     M=32 and M=64 still dip at column 1 (G=16 costs +5.2% and +9.4% there).
-// Residual: no fitted cell is worse than +3.4% against any N measured inside it.
 constexpr int COOP_TAB_M       = 13;
 constexpr int COOP_TAB_N       = 13;
 constexpr int COOP_N_LOG2_BASE = 14;
 
 static const signed char kCoopLog2G[COOP_TAB_M][COOP_TAB_N] = {
-    /* M=1    */ {4, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 6},
-    /* M=2    */ {4, 5, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6},
-    /* M=4    */ {4, 4, 5, 5, 4, 4, 5, 5, 5, 5, 6, 6, 6},
-    /* M=8    */ {5, 5, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 6},
-    /* M=16   */ {4, 3, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5},
-    /* M=32   */ {5, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4},
-    /* M=64   */ {4, 3, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4},
-    /* M=128  */ {0, 0, 3, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4},
-    /* M=256  */ {0, 0, 3, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4},
-    /* M=512  */ {0, 0, 0, 0, 0, 1, 1, 3, 2, 3, 3, 4, 4},
-    /* M=1024 */ {0, 0, 0, 0, 0, 1, 1, 3, 3, 3, 3, 4, 4},
-    /* M=2048 */ {0, 0, 0, 1, 1, 1, 3, 3, 3, 3, 3, 4, 4},
-    /* M=4096 */ {0, 0, 1, 1, 1, 1, 3, 3, 3, 3, 3, 4, 4},
+    /* M=1    */ {2, 1, 3, 3, 4, 4, 5, 5, 6, 6, 6, 6, 6},
+    /* M=2    */ {2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 6, 6, 6},
+    /* M=4    */ {2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 6, 6, 6},
+    /* M=8    */ {2, 2, 3, 3, 4, 4, 5, 5, 5, 6, 6, 6, 6},
+    /* M=16   */ {2, 2, 3, 3, 4, 4, 4, 5, 5, 5, 5, 5, 5},
+    /* M=32   */ {2, 2, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 5},
+    /* M=64   */ {2, 2, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4},
+    /* M=128  */ {2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 4, 4},
+    /* M=256  */ {1, 1, 1, 1, 2, 1, 2, 2, 2, 3, 3, 3, 3},
+    /* M=512  */ {0, 0, 2, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3},
+    /* M=1024 */ {0, 0, 0, 0, 0, 1, 1, 1, 2, 2, 2, 2, 5},
+    /* M=2048 */ {0, 0, 0, 0, 2, 2, 0, 0, 0, 0, 1, 5, 4},
+    /* M=4096 */ {2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 4, 5, 5},
 };
 
 // Half-octave column for N: 0 = [16384, 24576), 1 = [24576, 32768),
@@ -531,19 +552,38 @@ static inline int coop_bucket_of(int N)
 constexpr int COOP_TARGET_BLOCKS      = 1024;
 constexpr int COOP_MIN_VEC4_PER_BLOCK = 256;
 
-// Shapes between grid points round DOWN on both axes, which keeps the value on
-// the conservative side of the measured optimum.
+// phase_b's time steps with the rounds of PB_RESIDENT_BLOCKS its grid takes, so
+// the best G is periodic in M with period PB_RESIDENT_BLOCKS / G, finer than any
+// table row. The table's G is a base; of G/2, G and 2G the shape runs the one
+// with the cheapest rounds x (a block's fixed cost + its chunk of float4 loads),
+// plus a fifth of a chunk once blocks start staggered over several rounds.
+constexpr int COOP_BLOCK_COST_N4   = 1000;
+constexpr double COOP_STAGGER_TAIL = 0.2;
+static inline double coop_rounds_cost(int M, int n4, int g)
+{
+    const long rounds = ((long)M * g + PB_RESIDENT_BLOCKS - 1) / PB_RESIDENT_BLOCKS;
+    const long chunk  = (n4 + g - 1) / g;
+    return (double)(rounds * (COOP_BLOCK_COST_N4 + chunk)) +
+           (rounds > 1 ? COOP_STAGGER_TAIL * chunk : 0.0);
+}
+
 static inline int coop_g_from_table(int M, int N, int max_g)
 {
-    if(M < 1 || M > 4096 || N < (1 << COOP_N_LOG2_BASE))
+    if(M < 1 || N < (1 << COOP_N_LOG2_BASE))
         return -1;
-    const int mi = ilog2_floor(M);
+    const int mi = std::min(ilog2_floor(M), COOP_TAB_M - 1);
     int ni       = coop_bucket_of(N);
     if(mi >= COOP_TAB_M || ni < 0)
         return -1;
     if(ni >= COOP_TAB_N)
         ni = COOP_TAB_N - 1;
-    return std::max(1, std::min(1 << (int)kCoopLog2G[mi][ni], max_g));
+    const int base = snap_coop_g(1 << (int)kCoopLog2G[mi][ni], max_g);
+    const int n4   = N / FP32_EPT;
+    int g          = base;
+    for(const int c : {base / 2, base * 2})
+        if(c >= 1 && c <= max_g && coop_rounds_cost(M, n4, c) < coop_rounds_cost(M, n4, g))
+            g = c;
+    return g;
 }
 
 static inline int choose_coop_g(int M, int N, int n4_per_row, int block, int override_g)
@@ -578,7 +618,8 @@ static inline ShapeParams derive_shape_params(int M,
     const bool small_n_fits =
         (N * (int)sizeof(uint32_t)) <= (LDS_BYTES_PER_BLOCK_MAX - SMALL_N_STATIC_LDS);
     const bool small_n_wins =
-        N <= N_LDS_MAX || (N <= N_LDS_MAX_SMALL_M && M <= N_LDS_SMALL_M_LIMIT);
+        N <= N_LDS_MAX || (N <= N_LDS_MAX_ONE_ROUND && M <= N_LDS_ONE_ROUND_M) ||
+        (N <= N_LDS_MAX_SMALL_M && M > N_LDS_SMALL_M_FLOOR && M <= N_LDS_SMALL_M_LIMIT);
     if(small_n_fits && (small_n_wins || path_override == PATH_SMALL_N) &&
        (path_override == PATH_AUTO || path_override == PATH_SMALL_N))
     {
@@ -646,7 +687,7 @@ static inline ShapeParams derive_shape_params(int M,
                 break;
             }
         }
-        if(g_s_repair_search != 0 && best > 0)
+        if(best > 0)
             S = best;
         else if(sample_stride_exact(N, repaired) || !sampling_geometry_ok(N, S))
             S = repaired;
@@ -681,7 +722,7 @@ static inline ShapeParams derive_shape_params(int M,
     p.geom_ok     = sampling_geometry_ok(N, S) && K <= cap;
 
     const int n4 = N / FP32_EPT;
-    p.coop_g     = choose_coop_g(M, N, n4, 512, coop_g_override);
+    p.coop_g     = choose_coop_g(M, N, n4, PB_BLOCK, coop_g_override);
 
     if(path_override == PATH_AUTO)
     {
@@ -694,7 +735,7 @@ static inline ShapeParams derive_shape_params(int M,
     {
         p.path = path_override;
         if(p.path == PATH_DECODE && p.coop_g <= 1)
-            p.coop_g = choose_coop_g(M, N, n4, 512, 64);
+            p.coop_g = choose_coop_g(M, N, n4, PB_BLOCK, 64);
         if(p.path == PATH_PREFILL)
             p.coop_g = 1;
     }
