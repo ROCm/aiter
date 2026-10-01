@@ -686,6 +686,15 @@ def qsa_sparse_paged_attention(
     token_to_req = token_to_req.contiguous()
     if out is None:
         out = torch.empty_like(q)
+    elif out.shape != q.shape or out.dtype != q.dtype or not out.is_contiguous():
+        raise ValueError(
+            "QSA sparse attention out must be contiguous "
+            f"{q.dtype} {tuple(q.shape)}, got {out.dtype} {tuple(out.shape)}"
+        )
+    elif out.device != q.device:
+        raise ValueError(
+            f"QSA sparse attention out must be on {q.device}, got {out.device}"
+        )
     if not q.shape[0]:
         return out
 
