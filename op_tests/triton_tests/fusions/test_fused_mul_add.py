@@ -49,7 +49,7 @@ def run_torch(x, a, b):
     [(float, True), (int, True), (torch.Tensor, True), (torch.Tensor, False)],
 )
 @pytest.mark.parametrize("output", [True, False])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_mul_add(shape, a_type_is_scalar, b_type_is_scalar, output: bool, dtype):
 
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests

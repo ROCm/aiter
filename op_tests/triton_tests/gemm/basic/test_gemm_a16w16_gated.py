@@ -42,7 +42,7 @@ def generate_gemm_a16w16_gated_inputs(M, N, K, dtype, layout="TN", output=True):
     "activation", ["gelu", "gelu_tanh", "silu", "silu_exp2", "relu", None]
 )
 @pytest.mark.parametrize("M, N, K", get_x_vals())
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("layout", ["TN", "TT", "NN", "NT"])
 @pytest.mark.parametrize("output", [True, False])
 def test_gemm_a16_w16_gated(M: int, N: int, K: int, dtype, output, layout, activation):

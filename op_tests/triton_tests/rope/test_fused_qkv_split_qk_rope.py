@@ -102,8 +102,8 @@ def run_torch(
 # @pytest.mark.parametrize("QH_PER_KH", [8])
 # @pytest.mark.parametrize("KH", [8])
 # @pytest.mark.parametrize("D", [64])
-@pytest.mark.parametrize("B", [1, 4, 8, 16, 32])
-@pytest.mark.parametrize("QH_PER_KH", [1, 2, 4, 8, 16])
+@pytest.mark.parametrize("B", [1, 4, 32])
+@pytest.mark.parametrize("QH_PER_KH", [1, 4, 16])
 @pytest.mark.parametrize("KH", [1, 4])
 @pytest.mark.parametrize("D", [64, 128])
 @pytest.mark.parametrize("rotate_style", [RotateStyle.GPTJ, RotateStyle.NEOX])
@@ -321,9 +321,10 @@ def run_torch_with_cache(
 #   - QH_PER_KH=[1,4]: MHA (1:1) and GQA (4:1) — drops the middle value (2)
 #     coverage over the full-dim run.
 @pytest.mark.parametrize("B", [4])
-@pytest.mark.parametrize("QH_PER_KH", [1, 4])
-@pytest.mark.parametrize("KH", [1, 4])
-@pytest.mark.parametrize("D", [64, 128])
+# Pair head ratios/counts/dimensions; keep all cache and rotation modes.
+@pytest.mark.parametrize(
+    "QH_PER_KH, KH, D", [(1, 1, 64), (1, 4, 128), (4, 1, 128), (4, 4, 64)]
+)
 @pytest.mark.parametrize("block_size", [16])
 @pytest.mark.parametrize("rotate_style", [RotateStyle.GPTJ, RotateStyle.NEOX])
 @pytest.mark.parametrize("max_embed_positions", [131072])

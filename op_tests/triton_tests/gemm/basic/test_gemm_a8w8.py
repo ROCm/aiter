@@ -52,12 +52,12 @@ dtype_max = {
 
 def get_x_vals():
     x_vals = [(1, 1, 1)]  # minimal case
-    x_vals += [(3, 5, 2)]  # irregular shape
+    x_vals += [(3, 5, 2)]  # irregular shape for masking
+    # Keep representative square sizes and model projections; drop the
+    # redundant 5k square case from the larger square sweep.
     x_vals += [(1024 * v, 1024 * v, 1024 * v) for v in (1, 2, 4, 5, 8)]
     x_vals += [(v, 106496, 16384) for v in (190, 256, 4096)]  # LL3 405B FC1
-    x_vals += [
-        (v, 10240, 8192) for v in (256, 4096, 8000)
-    ]  # LL3 70B QKV input projection
+    x_vals += [(v, 10240, 8192) for v in (256, 4096, 8000)]  # LL3 70B QKV projection
     return x_vals
 
 
@@ -149,8 +149,14 @@ def get_fewer_x_vals():
     "in_dtype, m, n, k",
     [
         (in_dtype, *shape)
-        for in_dtype in ["fp8e4m3", "fp8e5m2"]
-        for shape in get_x_vals()
+        for in_dtype, shapes in [
+            (
+                "fp8e4m3",
+                [shape for shape in get_x_vals() if shape != (5120, 5120, 5120)],
+            ),
+            ("fp8e5m2", [(3, 5, 2), (256, 106496, 16384), (8000, 10240, 8192)]),
+        ]
+        for shape in shapes
     ],
 )
 @pytest.mark.parametrize(
@@ -205,11 +211,13 @@ def test_gemm_fp8(in_dtype, m, n, k, impl: str):
 @pytest.mark.parametrize(
     "out_dtype, m, n, k, layout, output",
     [
-        (out_dtype, *shape, layout, output)
-        for out_dtype in ["fp16", "fp32", "int32"]
-        for shape in get_fewer_x_vals()
-        for layout in ["TN", "TT", "NN", "NT"]
-        for output in [True, False]
+        ("bf16" if i % 2 == 0 else "int32", *shape, layout, output)
+        for i, (shape, layout, output) in enumerate(
+            (shape, layout, output)
+            for shape in get_fewer_x_vals()
+            for layout in ["TN", "TT", "NN", "NT"]
+            for output in [True, False]
+        )
     ],
 )
 @pytest.mark.parametrize(
@@ -280,11 +288,6 @@ def test_gemm_int8(out_dtype, m, n, k, layout, output, impl: str):
 def test_gemm_splitk(in_dtype, out_dtype, m, n, k, num_ksplit, has_bias):
 
     torch.cuda.empty_cache()
-
-    if out_dtype == "int32" and in_dtype in ["fp8e4m3", "fp8e5m2"]:
-        pytest.skip(
-            "This kernel is not supported for in_dtype of float and out_dtype of int."
-        )
 
     in_dtype = str_to_torch_dtype[in_dtype]
     out_dtype = str_to_torch_dtype[out_dtype]

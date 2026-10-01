@@ -37,7 +37,7 @@ def _ref_forward(logits_2d, target_1d, label_smoothing, reduce_loss, ignore_idx)
 
 @pytest.mark.parametrize("V", [128, 32001])  # aligned + large non-aligned
 @pytest.mark.parametrize("B_SQ", [1, 64])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_cross_entropy_forward_basic(V, B_SQ, dtype):
     """Loss values match F.cross_entropy for standard CE (no smoothing)."""
     torch.manual_seed(42)

@@ -1075,8 +1075,7 @@ def prepare_gluon_query_and_scale(
     return quantized_query_gluon, query_scale_gluon, output_gluon
 
 
-@perftest()
-def run_gluon_kernel(
+def _run_gluon_kernel(
     output: torch.Tensor,
     query: torch.Tensor,
     key_cache: torch.Tensor,
@@ -1125,7 +1124,6 @@ def run_gluon_kernel(
 
     Returns:
         None (modifies output in-place)
-        Note: The @perftest() decorator wraps this to return (None, avg_time)
     """
     if pa_decode_gluon is not None:
         pa_decode_gluon(
@@ -1155,6 +1153,16 @@ def run_gluon_kernel(
         raise RuntimeError(
             "This version triton does not support gluon; please upgrade to 3.5.0 or higher!"
         )
+
+
+_timed_gluon_kernel = perftest()(_run_gluon_kernel)
+
+
+def run_gluon_kernel(*args, **kwargs):
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        # Correctness tests need one invocation, not benchmark repetitions.
+        return _run_gluon_kernel(*args, **kwargs), float("nan")
+    return _timed_gluon_kernel(*args, **kwargs)
 
 
 @benchmark()
