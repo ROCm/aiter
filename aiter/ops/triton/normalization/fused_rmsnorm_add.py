@@ -6,7 +6,7 @@ import torch
 import triton
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
-from aiter.ops.triton._gluon_kernels.gfx1250.norm.fused_rmsnorm_add import (
+from aiter.ops.triton._gluon_kernels.gfx1250.normalization.fused_rmsnorm_add import (
     _gluon_fused_rms_kernel,
 )
 from aiter.ops.triton._triton_kernels.normalization.fused_rmsnorm_add import (

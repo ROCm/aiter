@@ -16,8 +16,9 @@ from aiter.ops.triton._triton_kernels.fusions.fused_clamp_act_mul import (
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.config_utils import (
-    AITER_TRITON_CONFIGS_PATH,
     load_config_json,
+    resolve_config_dir,
+    select_leq_config,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -43,23 +44,16 @@ def _get_config(M: int, N: int, block_size_n: int, backend: str) -> dict:
     Returns:
         The config dict for this shape.
     """
-    arch = get_arch()
-    base = f"{AITER_TRITON_CONFIGS_PATH}/{arch}/{backend}/fusions/fused_clamp_act_mul"
+    base = resolve_config_dir("fusions", "FUSED_CLAMP_ACT_MUL", backend=backend)
 
     if backend == "triton":
         raw = load_config_json(f"{base}/DEFAULT.json", required=False)
         if raw is None:
-            raw = load_config_json(
-                f"{AITER_TRITON_CONFIGS_PATH}/gfx950/{backend}/fusions/"
-                f"fused_clamp_act_mul/DEFAULT.json",
-                required=True,
+            fallback = resolve_config_dir(
+                "fusions", "FUSED_CLAMP_ACT_MUL", backend=backend, arch="gfx950"
             )
-        for bound in sorted(
-            int(k[len("N_LEQ_") :]) for k in raw if k.startswith("N_LEQ_")
-        ):
-            if block_size_n <= bound:
-                return dict(raw[f"N_LEQ_{bound}"])
-        return dict(raw["any"])
+            raw = load_config_json(f"{fallback}/DEFAULT.json", required=True)
+        return select_leq_config(raw, block_size_n)
 
     config = None
     specialized = load_config_json(
