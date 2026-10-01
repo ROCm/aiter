@@ -9,8 +9,8 @@ additional state/layout checks; captured real-weight qualification is mandatory.
 
 import torch
 
-import aiter
 from aiter import ActivationType, QuantType
+from aiter.fused_moe import fused_moe
 from aiter.ops.flydsl.kernels.mxmoe_tiny_m4 import make_operator
 
 
@@ -50,7 +50,7 @@ def main():
     initial_x, initial_ids = x.clone(), ids.clone()
 
     def native():
-        return aiter.fused_moe(
+        return fused_moe(
             x,
             w1,
             w2,
