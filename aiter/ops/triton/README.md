@@ -146,6 +146,16 @@ Attention and GMM kernels read their single `DEFAULT.json` straight off the
 core (`resolve_config_dir()` + `load_config_json()`); a family module earns
 its place once a family grows real selection logic.
 
+GMM's `get_config()` (`_triton_kernels/gmm.py`) supports an optional
+`"dispatch"` list per variant: each rule is
+`{"config": <name>, "min_K": int, "min_N": int, "min_avg_rows_per_group": int}`
+(omitted thresholds are 0), and the first rule with `K >= min_K`,
+`N >= min_N` and `M >= min_avg_rows_per_group * G` returns the named config
+from the same variant section. Rows are averaged (`M / G`) because the actual
+`group_sizes` stay on the device. Rules are skipped when `accumulate=True`;
+with no match, or no `"dispatch"` key, the variant's `"default"` (or
+`"accumulate"`) config is used.
+
 ### How GEMM configs resolve — `get_gemm_config()`
 
 All GEMM-family kernels load configs through one function,
