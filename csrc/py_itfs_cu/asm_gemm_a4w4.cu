@@ -56,8 +56,10 @@ struct __attribute__((packed)) KernelArgs
     unsigned int stride_ScaleB1;
     p3 _p22;
     int log2_k_split;
-    // p3 _p23;
+    unsigned int num_cu; // persistent kernels: the device CU count, sizes the grid to min(tiles, num_cu)
 };
+// The persistent .co is prebuilt and reads num_cu at this fixed offset.
+static_assert(offsetof(KernelArgs, num_cu) == 372, "persistent f4gemm kernarg layout");
 
 static CFG* get_cfg(AiterDtype inp_dtype, AiterDtype out_dtype)
 {
@@ -265,6 +267,26 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
 
     int gdx = (Ndim + SUBN - 1) / SUBN;
     int gdy = (Mdim + SUBM - 1) / SUBM;
+    if(it->second.persistent)
+    {
+        // One workgroup per CU loops over the tiles; buffer offsets are 32-bit (A and B under 4 GB, as before). It
+        // ignores bias and beta, like the non-persistent 256x256 kernel before it.
+        const int64_t lim = int64_t(1) << 32;
+        AITER_CHECK(bpreshuffle, __func__, " ", kname, ": B preshuffled");
+        AITER_CHECK(Kdim % 64 == 0 && Ndim % 16 == 0 && args.stride_A0 % 32 == 0 && args.stride_B0 == Kdim &&
+                        A_scale->size(0) >= gdy * SUBM && B_scale->size(0) >= gdx * SUBN &&
+                        int64_t(Mdim) * args.stride_A0 / 2 < lim && int64_t(Ndim) * Kdim / 2 < lim &&
+                        int64_t(SUBM) * args.stride_C0 * 4 < lim,
+                    __func__,
+                    " ",
+                    kname,
+                    ": needs K % 64 == 0, N % 16 == 0, contiguous B, scales padded to 256 rows, A and B "
+                    "tensors under 4 GB");
+        args.num_cu = get_num_cu_func();
+        gdx         = std::min<int64_t>(int64_t(gdx) * gdy * gdz, args.num_cu); // tiles x K slices
+        gdy         = 1;
+        gdz         = 1;
+    }
 
     impl_ptr->launch_kernel({&args,
                              &arg_size,
