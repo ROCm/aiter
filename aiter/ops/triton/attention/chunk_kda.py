@@ -234,6 +234,7 @@ def chunk_kda_walk(
                 s.dtype == torch.float32 and s.shape[1:] == state_shape
             ), f"state must be fp32 [*, {H}, {V}, {K}]"
             assert s.stride()[1:] == (V * K, K, 1), "state must be dense [*, H, V, K]"
+            assert s.stride(0) >= H * V * K, "state rows must not overlap"
     if fuse_norm:
         _check_tokens("out_gate", out_gate, V)
         assert norm_weight.numel() == V and norm_weight.is_contiguous()
@@ -378,8 +379,34 @@ def chunk_kda(
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Chunked KDA prefill from raw projections: chunk_kda_prepare, then chunk_kda_walk.
 
-    q/k/v/g are [1, T, H, 128]; the fp32 V-first state is paged in state_cache at
-    state_indices (rows outside [0, slots) are skipped) or passed as initial_state.
+    Gluon on gfx950 and gfx1250. Other archs (gfx942) run aiter's Triton
+    chunk_kimi_delta_attn: no fused norm (out_gate), config is ignored, and every
+    state_indices row must be valid.
+
+    Args:
+        q, k, v: [1, T, H, 128] raw projections; token rows may be strided.
+        g: [1, T, H, 128] raw gate projection. beta: [1, T, H] raw beta projection.
+        A_log: [H] gate parameter. dt_bias: [H * 128] gate bias.
+        lower_bound: gate floor; g = lower_bound * sigmoid(exp(A_log) * (g + dt_bias)).
+        cu_seqlens: int32 / int64 [N + 1] sequence offsets.
+        chunk_indices, chunk_offsets: [NT, 2] (sequence, chunk) and [N + 1] first chunk
+            per sequence; built by prepare_chunk_kda_metadata (a host sync) if None.
+        scale: q scale, K**-0.5 if None.
+        out: [1, T, H, 128] output, may alias v; allocated if None.
+        initial_state: fp32 [N, H, V, K] start state, zeros if None.
+        output_final_state: return a new fp32 [N, H, V, K] final state.
+        state_cache: fp32 [slots, H, V, K] paged state, read and written in place at
+            state_indices; replaces initial_state and output_final_state.
+        state_indices: [N] distinct cache rows; a row outside [0, slots) is not read or
+            written (that sequence starts from zeros).
+        has_initial_state: bool [N]; False starts that sequence from zeros.
+        out_gate, norm_weight, norm_eps: fused output norm,
+            o = rmsnorm(o) * norm_weight * sigmoid(out_gate).
+        config: overrides of the tuned walk config.
+
+    Returns:
+        (o, final_state); final_state is None unless output_final_state is set without
+        state_cache.
     """
     if _ARCH not in ("gfx1250", "gfx950"):
         from aiter.ops.triton.kimi_delta_attn import chunk_kimi_delta_attn

@@ -8,7 +8,6 @@ import pytest
 import torch
 
 import aiter.ops.triton.attention.chunk_kda as chunk_kda_module
-from aiter.ops.triton._gluon_kernels.gfx1250.attention.chunk_kda.walk import _get_config
 from aiter.ops.triton.attention.chunk_kda import (
     CHUNK_SIZE,
     chunk_kda,
@@ -35,40 +34,6 @@ K3_H = 24
 K3_PAGE = 442368
 K3_STATE_OFF = 13824
 K3_SLOTS = 64
-if ARCH == "gfx950":
-    WALK_TIERS = [
-        {"BV": 16, "num_warps": 2, "KS": 2},
-        {"BV": 32, "num_warps": 4, "KS": 2},
-        {"BV": 64, "num_warps": 8, "KS": 2},
-        {"BV": 128, "num_warps": 4, "KS": 1},
-    ]
-    WALK_EXTRA = [
-        {"G": 4},
-        {"G": 4, "BV": 128, "num_warps": 4, "KS": 1},
-        {
-            "G": 3,
-            "num_stages": 1,
-            "num_stages_scan": 1,
-            "KS_pass1": 2,
-            "BV_pass1": 64,
-            "num_warps_pass1": 4,
-        },
-        {"BV": 64, "num_warps": 4, "KS": 1, "num_stages": 1},
-    ]
-else:
-    # the tuned gfx1250 tiers
-    WALK_TIERS = [
-        {"BV": 16, "num_warps": 1},
-        {"BV": 32, "num_warps": 2},
-        {"BV": 64, "num_warps": 4, "waves_per_eu": 2},
-        {"BV": 128, "num_warps": 4},
-    ]
-    WALK_EXTRA = [
-        {"BV": 64, "num_warps": 4, "waves_per_eu": 3},
-        {"BV": 128, "num_warps": 2},
-    ]
-WALK_WIDE = WALK_TIERS[-1]
-WALK_CONFIGS = [None, *WALK_TIERS, *WALK_EXTRA]
 
 
 def err_ratio(ref, tri):
@@ -274,13 +239,12 @@ def workspace_ref(inp, scale):
     "seqlens",
     [[64], [1], [63], [65], [300], [1, 64, 130, 7], [1000], [5, 0, 70]],
 )
-@pytest.mark.parametrize("config", WALK_CONFIGS)
-def test_chunk_kda(seqlens, config):
+def test_chunk_kda(seqlens):
     H = 4
     inp = make_inputs(seqlens, H)
     h0 = torch.randn(len(seqlens), H, D, D, device=DEVICE)
     o_ref, s_ref = run_ref(inp, h0)
-    o, s = run_kernel(inp, initial_state=h0, output_final_state=True, config=config)
+    o, s = run_kernel(inp, initial_state=h0, output_final_state=True)
     assert_close("o", o_ref, o)
     assert_close("final_state", s_ref, s)
 
@@ -297,9 +261,8 @@ def test_chunk_kda_workspace(seqlens):
     assert_close("decay", ref["decay"], ws["decay"])
 
 
-@pytest.mark.parametrize("config", [None, WALK_WIDE])
 @pytest.mark.parametrize("padded", [False, True])
-def test_chunk_kda_paged(padded, config):
+def test_chunk_kda_paged(padded):
     """State cache in place, out aliasing v; ``padded`` gives a hybrid-page slot stride."""
     seqlens, H = [130, 1, 64, 257], 24
     inp = make_inputs(seqlens, H, seed=1)
@@ -322,7 +285,6 @@ def test_chunk_kda_paged(padded, config):
         state_cache=cache,
         state_indices=slots,
         has_initial_state=has_init,
-        config=config,
     )
     assert s is None and o.data_ptr() == inp["v"].data_ptr()
     assert_close("o", o_ref, o)
@@ -332,9 +294,8 @@ def test_chunk_kda_paged(padded, config):
     ).all(), "cache memory outside the used slots was written"
 
 
-# None: the tuned default must take BV = V by itself when the norm is fused
-@pytest.mark.parametrize("config", [{"BV": 128, "num_warps": 4}, None])
-def test_chunk_kda_fused_norm(config):
+def test_chunk_kda_fused_norm():
+    """Fused output norm; the resolved config must give it BV = V."""
     seqlens, H = [200, 70], 4
     inp = make_inputs(seqlens, H, seed=2)
     og = torch.randn_like(inp["v"])
@@ -353,7 +314,6 @@ def test_chunk_kda_fused_norm(config):
         out_gate=og,
         norm_weight=nw,
         norm_eps=eps,
-        config=config,
     )
     assert_close("o", o_ref, o)
 
@@ -383,7 +343,6 @@ VLLM_CASES = {
         "seqlens": [2048, 2048],
         "nd_tok": 7,
         "has_init": [False, True],
-        "config": WALK_WIDE,
     },
     "split_6": {
         "seqlens": [2, 130, 1, 64, 257, 3],
@@ -395,6 +354,7 @@ VLLM_CASES = {
         "spec": True,
         "has_init": [True] * 10 + [False, True, False],
     },
+    "empty_no_init": {"seqlens": [130, 0, 64], "has_init": [True, False, True]},
 }
 
 
@@ -419,7 +379,6 @@ def test_chunk_kda_vllm_layout(case):
         state_cache=cache,
         state_indices=slots,
         has_initial_state=has_init,
-        config=c.get("config"),
     )
     assert s is None
     check_paged(o_ref, s_ref, o, raw, cache, slots, written, valid)
@@ -473,13 +432,11 @@ def test_chunk_kda_strided_state_indices(nd_tok):
     ],
     ids=["mixed_8", "spec_40"],
 )
-@pytest.mark.parametrize("config", [None, WALK_WIDE])
-def test_chunk_kda_paged_many_seqs(seqlens, config):
+def test_chunk_kda_paged_many_seqs(seqlens):
     """Enough prefills at H = 24 to overfill the GPU at BV 64."""
     N = len(seqlens)
     if ARCH == "gfx1250":
         assert N * K3_H * (D // 64) > get_num_sms(), "too few pairs for the widest tier"
-        assert _get_config(N, K3_H)["BV"] == 128
     inp, kw, _ = make_vllm_inputs(seqlens, nd_tok=2, seed=6)
     raw, cache = make_page_cache(K3_SLOTS)
     slots = (torch.randperm(K3_SLOTS - 1, device=DEVICE)[:N] + 1).int()
@@ -493,7 +450,6 @@ def test_chunk_kda_paged_many_seqs(seqlens, config):
         state_cache=cache,
         state_indices=slots,
         has_initial_state=has_init,
-        config=config,
     )
     check_paged(o_ref, s_ref, o, raw, cache, slots, written, valid)
 
@@ -652,17 +608,3 @@ def test_chunk_kda_walk_host_checks(bad):
     )
     with pytest.raises(AssertionError):
         chunk_kda_walk(**ws, cu_seqlens=inp["cu_seqlens"])
-
-
-@pytest.mark.skipif(ARCH != "gfx1250", reason="gfx1250 walk tiers")
-@pytest.mark.parametrize("N", [1, 2, 3, 5, 6, 11, 40])
-def test_chunk_kda_walk_config_tiers(N):
-    """config None takes the narrowest tier that fits the CUs; a BV override starts from it."""
-    cus = get_num_sms()
-    fits = [t["BV"] for t in WALK_TIERS if N * K3_H * (D // t["BV"]) <= cus]
-    expect = fits[0] if fits else WALK_TIERS[-1]["BV"]
-    config = _get_config(N, K3_H)
-    tier = next(t for t in WALK_TIERS if t["BV"] == config["BV"])
-    assert config["BV"] == expect and config["num_warps"] == tier["num_warps"]
-    assert _get_config(N, K3_H, {"BV": 16})["num_warps"] == 1
-    assert _get_config(N, K3_H, {"BV": 64, "num_warps": 2})["num_warps"] == 2

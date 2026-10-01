@@ -871,12 +871,12 @@ def chunk_kda_walk_kernel(
             )
     elif STORE_FINAL_STATE:
         last = (c_hi == nc) & (ncg > 0)
+        do_store = last | ((nc == 0) & (i_g == 0))
         if IS_PAGED:
             slot1 = gl.load(state_indices_ptr + i_n * stride_indices).to(gl.int64)
-            do_store = last & (slot1 >= 0) & (slot1 < num_slots)
+            do_store = do_store & (slot1 >= 0) & (slot1 < num_slots)
         else:
             slot1 = i_n.to(gl.int64)
-            do_store = last | ((nc == 0) & (i_g == 0))
         if do_store:
             gl.amd.cdna4.buffer_store(
                 S, state_out_ptr + slot1 * stride_state_out_n + s_head, s_off
