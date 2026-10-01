@@ -227,12 +227,15 @@ def _indexer_uses_prefill_scorer(
 
     A tile gathers K once per request it spans and runs the MFMA for all 16
     rows each time, so it pays off from two rows per request on average.
-    One-row decode stays on the one-row scorer. So does gfx942 H=8, which
-    has not been measured on the 16-row scorer.
+    One-row decode stays on the one-row scorer. gfx942 H=8 also stays there
+    because its tile exceeds LDS capacity. gfx942 H=4 fits, so it starts at
+    8 rows with the tail masked; all other supported configurations start at
+    16 rows.
     """
-    if rows < 16 or rows < _ROWS_SCORER_MIN_ROWS_PER_REQUEST * n_requests:
+    if arch.startswith("gfx942") and n_heads == 8:
         return False
-    return not (arch.startswith("gfx942") and n_heads == 8)
+    min_rows = 8 if arch.startswith("gfx942") and n_heads == 4 else 16
+    return rows >= min_rows and rows >= _ROWS_SCORER_MIN_ROWS_PER_REQUEST * n_requests
 
 
 _ROWS_SCORER_TILES_PER_WG = 4
@@ -450,9 +453,10 @@ def qsa_indexer_score_and_select(
 ) -> torch.Tensor:
     """Score long rows into ``[M, n_columns]`` and write top-512 ids into ``out``.
 
-    ``n_heads`` is 4 or 8, each a separate compile. ``M >= 16`` rows
-    averaging two or more per request use the 16-row scorer, except
-    gfx942 H=8, which stays on the one-row scorer. ``live_columns`` is
+    ``n_heads`` is 4 or 8, each a separate compile. Rows averaging two or
+    more per request use the 16-row scorer from ``M >= 16``. gfx942 H=4
+    starts that tile at 8 rows; gfx942 H=8 stays on the one-row scorer.
+    ``live_columns`` is
     the widest visible row. The score buffer stays the width of the
     table, and the selector sees that prefix. A padded table with at
     most 64 rows and at most 20000 live columns uses the one-workgroup
