@@ -820,11 +820,16 @@ def _k1_uses_prefill_scorer(
     """Whether this launch uses the 16-row scorer.
 
     gfx942 H=8 stays on the one-row scorer. That tile is 73792 bytes and
-    gfx942 has 65536. gfx950 H=8 keeps the 16-row tile.
+    gfx942 has 65536. gfx950 H=8 keeps the 16-row tile, and still starts
+    at 16 rows. gfx942 H=4 fits the tile, so an 8-row decode uses one
+    16-row workgroup with the tail masked.
     """
-    if n_requests != 1 or rows < 16:
+    if n_requests != 1:
         return False
-    return not (arch.startswith("gfx942") and n_heads == 8)
+    if arch.startswith("gfx942") and n_heads == 8:
+        return False
+    min_rows = 8 if arch.startswith("gfx942") and n_heads == 4 else 16
+    return rows >= min_rows
 
 
 @lru_cache(maxsize=1)
@@ -937,16 +942,17 @@ def qsa_k1_score_and_select(
     """Score long rows into ``[M, n_columns]`` and write top-512 ids into ``out``.
 
     ``n_heads`` is 4 or 8, each a separate compile. One request with
-    ``M >= 16`` uses the 16-row scorer, except gfx942 H=8, which stays
-    on the one-row scorer. ``live_columns`` is the widest visible row.
-    The score buffer stays the width of the table, and the selector sees
-    that prefix. A padded table with at most 64 rows and at most 20000
-    live columns uses the one-workgroup decode radix. More rows keep the
-    streaming selector. A packed table keeps the old split: stable decode
-    radix below 32768 columns, streaming radix (``tie='low'``) at or
-    above that. ``row_bounded`` runs the one-workgroup decode radix on
-    the full width instead: it stops at each row's ``row_lens``, so it
-    needs no readback of the widest row.
+    ``M >= 16`` uses the 16-row scorer. gfx942 H=4 starts that tile at
+    8 rows. gfx942 H=8 stays on the one-row scorer. ``live_columns`` is
+    the widest visible row. The score buffer stays the width of the
+    table, and the selector sees that prefix. A padded table with at
+    most 64 rows and at most 20000 live columns uses the one-workgroup
+    decode radix. More rows keep the streaming selector. A packed table
+    keeps the old split: stable decode radix below 32768 columns,
+    streaming radix (``tie='low'``) at or above that. ``row_bounded``
+    runs the one-workgroup decode radix on the full width instead: it
+    stops at each row's ``row_lens``, so it needs no readback of the
+    widest row.
     """
     if n_heads not in _SCORE_HEADS:
         raise ValueError(f"score heads must be {_SCORE_HEADS}, got {n_heads}")
