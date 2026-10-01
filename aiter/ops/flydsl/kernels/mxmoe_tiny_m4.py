@@ -99,8 +99,8 @@ def compile_tiny_m4(*, down_n=128, down_waves=4):
         tile = fx.Int32(gpu.block_id("x"))
         split = fx.Int32(gpu.block_id("z"))
         token, slot = route // 9, route % 9
-        expert = rocdl.readfirstlane(
-            T.i32, as_ir_value(global_typed_ptr(IDS, T.i32)[route])
+        expert = fx.Int32(
+            rocdl.readfirstlane(T.i32, as_ir_value(global_typed_ptr(IDS, T.i32)[route]))
         )
         raw = load4(X, (token * 6144 + split * 1024 + tid * 16) // 2)
         raw_hi = load4(X, (token * 6144 + split * 1024 + tid * 16) // 2 + 4)
@@ -244,8 +244,8 @@ def compile_tiny_m4(*, down_n=128, down_waves=4):
         lane, wave = tid % 64, tid // 64
         route = fx.Int32(gpu.block_id("y"))
         tile = fx.Int32(gpu.block_id("x"))
-        expert = rocdl.readfirstlane(
-            T.i32, as_ir_value(global_typed_ptr(IDS, T.i32)[route])
+        expert = fx.Int32(
+            rocdl.readfirstlane(T.i32, as_ir_value(global_typed_ptr(IDS, T.i32)[route]))
         )
         routing = global_typed_ptr(RW, T.f32)[route]
         blocks = down_n // down_waves // 16
