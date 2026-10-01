@@ -67,3 +67,13 @@ get_mla_decode_head_plan_v1(const int64_t num_heads_k,
                             const bool has_scales,
                             const bool use_opus,
                             const bool use_ps1_asm);
+
+int64_t mla_metadata_cluster_multiplier_v1(const std::string& arch,
+                                           const int64_t enable_experimental,
+                                           const int64_t num_heads,
+                                           const int64_t max_seqlen_qo,
+                                           const int64_t mla_version,
+                                           const int64_t dtype_q_nope,
+                                           const int64_t dtype_q_rope,
+                                           const int64_t dtype_kv_nope,
+                                           const int64_t dtype_kv_rope);

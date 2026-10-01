@@ -2413,6 +2413,18 @@ namespace py = pybind11;
           "mla_reduce_v1_supports",                      \
           py::arg("num_heads"),                          \
           py::arg("head_dim"));                          \
+    m.def("mla_metadata_cluster_multiplier_v1",          \
+          &mla_metadata_cluster_multiplier_v1,           \
+          "mla_metadata_cluster_multiplier_v1",          \
+          py::arg("arch"),                               \
+          py::arg("enable_experimental"),                \
+          py::arg("num_heads"),                          \
+          py::arg("max_seqlen_qo"),                      \
+          py::arg("mla_version"),                        \
+          py::arg("dtype_q_nope"),                       \
+          py::arg("dtype_q_rope"),                       \
+          py::arg("dtype_kv_nope"),                      \
+          py::arg("dtype_kv_rope"));                     \
     m.def("get_mla_metadata_v1",                         \
           &get_mla_metadata_v1,                          \
           "get_mla_metadata_v1",                         \

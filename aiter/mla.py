@@ -753,7 +753,14 @@ def mla_decode_fwd(
     else:
         if num_kv_splits is None:
             num_kv_splits = get_mla_decode_fwd_max_splits(
-                ori_nhead, max_seqlen_q, q.dtype, kv_buffer.dtype
+                ori_nhead,
+                max_seqlen_q,
+                q.dtype,
+                (
+                    dtypes.fp8
+                    if kv_buffer.dtype in (torch.int8, torch.uint8)
+                    else kv_buffer.dtype
+                ),
             )
         head_plan = _mla_decode_head_plan(
             ori_nhead,

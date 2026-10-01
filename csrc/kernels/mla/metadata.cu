@@ -262,6 +262,32 @@ get_mla_decode_head_plan_v1(const int64_t num_heads_k,
             static_cast<int64_t>(backend)};
 }
 
+int64_t mla_metadata_cluster_multiplier_v1(const std::string& arch,
+                                           const int64_t enable_experimental,
+                                           const int64_t num_heads,
+                                           const int64_t max_seqlen_qo,
+                                           const int64_t mla_version,
+                                           const int64_t dtype_q_nope,
+                                           const int64_t dtype_q_rope,
+                                           const int64_t dtype_kv_nope,
+                                           const int64_t dtype_kv_rope)
+{
+    const char* env           = std::getenv("AITER_ENABLE_EXPERIMENTAL");
+    const bool experimental   = enable_experimental < 0 ? (env != nullptr && std::atoi(env) != 0)
+                                                        : (enable_experimental != 0);
+    const std::string arch_id = arch.empty() ? get_gpu_arch() : arch;
+
+    return mla_metadata_cluster_multiplier(arch_id,
+                                           experimental,
+                                           static_cast<int32_t>(num_heads),
+                                           static_cast<int32_t>(max_seqlen_qo),
+                                           static_cast<MlaVersion>(mla_version),
+                                           static_cast<AiterDtype>(dtype_q_nope),
+                                           static_cast<AiterDtype>(dtype_q_rope),
+                                           static_cast<AiterDtype>(dtype_kv_nope),
+                                           static_cast<AiterDtype>(dtype_kv_rope));
+}
+
 void get_pa_metadata_v1(
     const aiter_tensor_t& seqlens_qo_indptr,     // [batch size + 1]
     const aiter_tensor_t& pages_kv_indptr,       // [batch size + 1]

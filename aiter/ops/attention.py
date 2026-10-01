@@ -17,7 +17,7 @@ from aiter import dtypes
 from aiter.ops.enum import Enum, MlaVersion, QuantType
 from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon
 from aiter.utility.aiter_types import aiter_dtypes as _aiter_dtype_ids
-from aiter.utility.dtypes import _aiter_dtype_id
+from aiter.utility.dtypes import _aiter_dtype_id, _torch_to_aiter_dtype
 from csrc.cpp_itfs.pa.pa import paged_attention_rocm as paged_attention_rocm_core
 from csrc.cpp_itfs.pa.pa_ragged import (
     paged_attention_ragged as paged_attention_ragged_core,
@@ -1744,31 +1744,68 @@ get_mla_decode_shape_support.cache_clear = (  # type: ignore[attr-defined]
 )
 
 
+@compile_ops("module_mla_metadata")
+def mla_metadata_cluster_multiplier_v1(
+    arch: str,
+    enable_experimental: int,
+    num_heads: int,
+    max_seqlen_qo: int,
+    mla_version: int,
+    dtype_q_nope: int,
+    dtype_q_rope: int,
+    dtype_kv_nope: int,
+    dtype_kv_rope: int,
+) -> int: ...
+
+
+def _mla_metadata_dtype_id(dtype: torch.dtype) -> int:
+    if dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+        return _aiter_dtype_ids["fp8"]
+    return _torch_to_aiter_dtype.get(dtype, _aiter_dtype_ids["u8"])
+
+
+@_functools.lru_cache(maxsize=1024)
+def _mla_metadata_cluster_multiplier_cached(*args: str | int) -> int:
+    return mla_metadata_cluster_multiplier_v1(*args)
+
+
 def get_mla_decode_fwd_occupancy(
     num_head_qo: int,
     max_seqlen_qo: int,
     q_dtype: torch.dtype,
     kv_dtype: torch.dtype,
+    mla_version: int | MlaVersion = MlaVersion.V32.value,
+    q_rope_dtype: torch.dtype | None = None,
+    kv_rope_dtype: torch.dtype | None = None,
 ) -> int:
     """Occupancy of the HK MLA decode fwd kernel that will be dispatched for
     these (num_head_qo, max_seqlen_qo, dtypes). The m16x4 kernel (gfx950 +
     fp8/fp8, 64 q-tokens per tile, gated on AITER_ENABLE_EXPERIMENTAL) runs at
     occupancy=2; all other kernels run at occupancy=1.
 
+    mla_version and the rope dtypes select the dtype rule (V32: all fp8; V40:
+    fp8 nope with bf16 rope); the rope dtypes default to the nope dtypes.
+
     Used wherever code must agree with the metadata kernel's cluster count
     (which is `multiProcessorCount * occupancy / num_heads_k`):
       - get_mla_metadata_info_v1 (buffer sizing)
       - mla_decode_fwd (per-tile num_kv_splits upper bound for the reduce)
-      - C++ metadata at csrc/kernels/mla/metadata/v1_2_device.cuh
+      - C++ metadata, via mla_metadata_cluster_multiplier in
+        csrc/include/mla_decode_shape.h
     """
-    is_hk_m16x4 = (
-        get_gfx() == "gfx950"
-        and q_dtype == dtypes.fp8
-        and kv_dtype == dtypes.fp8
-        and (num_head_qo * max_seqlen_qo == 64)
-        and is_experimental_enabled()
+    q_rope_dtype = q_dtype if q_rope_dtype is None else q_rope_dtype
+    kv_rope_dtype = kv_dtype if kv_rope_dtype is None else kv_rope_dtype
+    return _mla_metadata_cluster_multiplier_cached(
+        _mla_resolve_arch(None),
+        int(env_flag_atoi("AITER_ENABLE_EXPERIMENTAL")),
+        int(num_head_qo),
+        int(max_seqlen_qo),
+        int(getattr(mla_version, "value", mla_version)),
+        _mla_metadata_dtype_id(q_dtype),
+        _mla_metadata_dtype_id(q_rope_dtype),
+        _mla_metadata_dtype_id(kv_dtype),
+        _mla_metadata_dtype_id(kv_rope_dtype),
     )
-    return 2 if is_hk_m16x4 else 1
 
 
 def get_mla_decode_fwd_max_splits(
@@ -1776,6 +1813,9 @@ def get_mla_decode_fwd_max_splits(
     max_seqlen_qo: int,
     q_dtype: torch.dtype,
     kv_dtype: torch.dtype,
+    mla_version: int = MlaVersion.V32.value,
+    q_rope_dtype: torch.dtype | None = None,
+    kv_rope_dtype: torch.dtype | None = None,
 ) -> int:
     """Upper bound on per-tile num_splits produced by the metadata kernel for
     the HK MLA decode fwd dispatch. Equals `cu_num * occupancy` (num_heads_k=1
@@ -1785,38 +1825,54 @@ def get_mla_decode_fwd_max_splits(
     emit.
     """
     occupancy = get_mla_decode_fwd_occupancy(
-        num_head_qo, max_seqlen_qo, q_dtype, kv_dtype
+        num_head_qo,
+        max_seqlen_qo,
+        q_dtype,
+        kv_dtype,
+        mla_version=mla_version,
+        q_rope_dtype=q_rope_dtype,
+        kv_rope_dtype=kv_rope_dtype,
     )
     return get_cu_num() * occupancy
 
 
-def get_mla_metadata_info_v1(
-    batch_size: int,
+def _mla_metadata_head_plan(
+    num_head_qo: int,
+    max_seqlen_qo: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    fast_mode: bool,
+    intra_batch_mode: bool,
+) -> _MlaHeadPlan:
+    return _mla_decode_head_plan_cached(
+        int(num_head_qo),
+        max(1, int(max_seqlen_qo)),
+        _mla_metadata_dtype_id(q_dtype),
+        _mla_metadata_dtype_id(kv_dtype),
+        bool(fast_mode),
+        bool(intra_batch_mode),
+        _mla_resolve_arch(None),
+        env_flag_atoi("AITER_ENABLE_EXPERIMENTAL"),
+        env_flag_atoi("AITER_MLA_DECODE_PS1_FLYDSL"),
+        512,
+        1,
+        1,
+        False,
+        True,
+        False,
+        False,
+        False,
+    )
+
+
+def _mla_legacy_max_qo_tiles_per_batch(
     max_seqlen_qo: int,
     num_head_qo: int,
     q_dtype: torch.dtype,
     kv_dtype: torch.dtype,
     is_sparse: bool,
-    fast_mode: bool = True,
-    num_kv_splits: int = 32,
-    intra_batch_mode: bool = False,
-    max_split_per_batch: int = -1,
-):
-    """
-    Returns:
-        1. Shape of work_metadata_ptrs followed by its scalar type.
-        2. Shape of work_indptr followed by its scalar type.
-        3. Shape of work_info_set followed by its scalar type.
-        4. Shape of reduce_indptr followed by its scalar type.
-        5. Shape of reduce_final_map followed by its scalar type.
-        6. Shape of reduce_partial_map followed by its scalar type.
-    """
-
-    assert num_head_qo % 4 == 0
-    max_splits = get_mla_decode_fwd_max_splits(
-        num_head_qo, max_seqlen_qo, q_dtype, kv_dtype
-    )
-
+    fast_mode: bool,
+) -> int:
     effective_seqlen_qo = 1 if is_sparse else max_seqlen_qo
     packed_qo_len = effective_seqlen_qo * num_head_qo
     max_qo_tiles_per_batch = math.ceil(packed_qo_len / 16)
@@ -1922,7 +1978,105 @@ def get_mla_metadata_info_v1(
         else:
             max_qo_tiles_per_batch = math.ceil(packed_qo_len / 128)
 
-    batch_size = batch_size * max_seqlen_qo if is_sparse else batch_size
+    return max_qo_tiles_per_batch
+
+
+def get_mla_metadata_info_v1(
+    batch_size: int,
+    max_seqlen_qo: int,
+    num_head_qo: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    is_sparse: bool,
+    fast_mode: bool = True,
+    num_kv_splits: int = 32,
+    intra_batch_mode: bool = False,
+    max_split_per_batch: int = -1,
+):
+    """
+    Returns:
+        1. Shape of work_metadata_ptrs followed by its scalar type.
+        2. Shape of work_indptr followed by its scalar type.
+        3. Shape of work_info_set followed by its scalar type.
+        4. Shape of reduce_indptr followed by its scalar type.
+        5. Shape of reduce_final_map followed by its scalar type.
+        6. Shape of reduce_partial_map followed by its scalar type.
+    """
+
+    if is_sparse or num_head_qo < 1:
+        assert num_head_qo % 4 == 0
+    max_splits = get_mla_decode_fwd_max_splits(
+        num_head_qo, max_seqlen_qo, q_dtype, kv_dtype
+    )
+    sizes = _functools.partial(
+        _mla_metadata_info_sizes,
+        max_splits=max_splits,
+        fast_mode=fast_mode,
+        num_kv_splits=num_kv_splits,
+        intra_batch_mode=intra_batch_mode,
+        max_split_per_batch=max_split_per_batch,
+    )
+    legacy_tiles = None
+    if num_head_qo % 4 == 0:
+        legacy_tiles = _mla_legacy_max_qo_tiles_per_batch(
+            max_seqlen_qo=max_seqlen_qo,
+            num_head_qo=num_head_qo,
+            q_dtype=q_dtype,
+            kv_dtype=kv_dtype,
+            is_sparse=is_sparse,
+            fast_mode=fast_mode,
+        )
+
+    if is_sparse:
+        return sizes(batch_size * max_seqlen_qo, legacy_tiles)
+    if num_head_qo < 1:
+        return sizes(batch_size, legacy_tiles)
+
+    plan = _mla_metadata_head_plan(
+        num_head_qo=num_head_qo,
+        max_seqlen_qo=max_seqlen_qo,
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
+        fast_mode=fast_mode,
+        intra_batch_mode=intra_batch_mode,
+    )
+    if plan.plan == _MlaHeadPlanKind.UNSUPPORTED:
+        assert num_head_qo % 4 == 0
+    if plan.kernel_num_heads * 2 > plan.packed_qo_len_per_wg:
+        max_qo_tiles_per_batch = max_seqlen_qo
+    else:
+        max_qo_tiles_per_batch = math.ceil(
+            max_seqlen_qo * plan.kernel_num_heads / plan.packed_qo_len_per_wg
+        )
+    planned = sizes(
+        batch_size * plan.qk_batch_ratio, max_qo_tiles_per_batch, v12_intra=True
+    )
+    if legacy_tiles is None:
+        return planned
+    return tuple(
+        (_mla_max_shape(a[0], b[0]), a[1])
+        for a, b in zip(planned, sizes(batch_size, legacy_tiles))
+    )
+
+
+def _mla_max_shape(
+    a: int | tuple[int, ...], b: int | tuple[int, ...]
+) -> int | tuple[int, ...]:
+    if isinstance(a, tuple):
+        return tuple(max(x, y) for x, y in zip(a, b))
+    return max(a, b)
+
+
+def _mla_metadata_info_sizes(
+    batch_size: int,
+    max_qo_tiles_per_batch: int,
+    max_splits: int,
+    fast_mode: bool,
+    num_kv_splits: int,
+    intra_batch_mode: bool,
+    max_split_per_batch: int,
+    v12_intra: bool = False,
+) -> tuple[tuple[int | tuple[int, ...], torch.dtype], ...]:
     tile_cnt = batch_size * max_qo_tiles_per_batch
 
     if fast_mode:
@@ -1960,13 +2114,16 @@ def get_mla_metadata_info_v1(
             (max_split_tiles, torch.int32),  # reduce_partial_map
         )
     else:
+        intra_tiles = tile_cnt * num_kv_splits
+        if fast_mode and v12_intra:
+            intra_tiles = max(intra_tiles, max_work, max_split_tiles)
         return (
             ((2), torch.uint64),  # work_metadata_ptrs
             (max_splits + 1, torch.int32),  # work_indptr
-            ((tile_cnt * num_kv_splits, 8), torch.int32),  # work_info_set
+            ((intra_tiles, 8), torch.int32),  # work_info_set
             ((tile_cnt + 1), torch.int32),  # reduce_indptr
             ((tile_cnt, 2), torch.int32),  # reduce_final_map
-            (tile_cnt * num_kv_splits, torch.int32),  # reduce_partial_map
+            (intra_tiles, torch.int32),  # reduce_partial_map
         )
 
 
