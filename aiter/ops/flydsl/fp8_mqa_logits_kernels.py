@@ -347,9 +347,11 @@ def _parse_variant(tag):
 def _auto_variant(seq_len, seq_len_kv, num_heads):
     """Pick a variant from the problem shape.
 
-    gfx942 (unchanged): RPB=2 always; WPB=2 packs more column tiles per wave
-    when M and N are both large, else WPB=4 for more wavefronts on small-M /
-    short-window shapes.
+    gfx942: RPB from ``seq_len * seq_len_kv`` thresholds; in the middle band an
+        odd ``seq_len`` drops RPB to 1, since padding costs a fixed host-side
+        overhead that only the largest shapes outgrow. WPB=2 packs more column
+        tiles per wave when M and N are both large, else WPB=4 for more
+        wavefronts on small-M / short-window shapes.
 
     gfx950 H>=128: mfma32x32x64 at r=1 always -- ample compute, more blocks.
 
@@ -364,8 +366,17 @@ def _auto_variant(seq_len, seq_len_kv, num_heads):
         shapes (KV pressure high), r=1 otherwise.
     """
     if _ARCH == "gfx942":
+        rpb2_min_elems = 2**19
+        rpb4_min_elems = 2**21
+        elems = seq_len * seq_len_kv
+        if elems < rpb2_min_elems:
+            rpb = 1
+        elif elems < rpb4_min_elems:
+            rpb = 2 if seq_len % 2 == 0 else 1
+        else:
+            rpb = 4
         wpb = 2 if (seq_len >= 2048 and seq_len_kv >= 8192) else 4
-        return f"mfma_r2_w{wpb}"
+        return f"mfma_r{rpb}_w{wpb}"
     if _ARCH == "gfx950":
         if num_heads >= 128:
             return "mfma32x32x64_bkv64_r1_w2_lds3"
