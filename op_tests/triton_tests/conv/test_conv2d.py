@@ -170,6 +170,95 @@ def test_conv2d_weight_pack_cache_clear_is_scoped(monkeypatch):
     )
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(None, False), ("0", False), ("false", False), ("1", True), ("TRUE", True)],
+)
+def test_inference_weight_immutability_environment_policy(monkeypatch, value, expected):
+    name = conv_prepack._TORCH_INFERENCE_TENSOR_WEIGHTS_IMMUTABLE_ENV
+    if value is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, value)
+
+    assert conv_prepack._read_torch_inference_tensor_weights_immutable() is expected
+
+
+def test_inference_weight_bypasses_pack_cache_and_observes_updates(monkeypatch):
+    cache = conv_prepack._LRUPackCache(maxsize=2)
+    monkeypatch.setattr(conv_prepack, "_PACK_CACHE_3x3", cache)
+    monkeypatch.setattr(
+        conv_prepack, "_TORCH_INFERENCE_TENSOR_WEIGHTS_IMMUTABLE", False
+    )
+
+    with torch.inference_mode():
+        weight = torch.arange(18, dtype=torch.float16, device="cpu").reshape(2, 1, 3, 3)
+        first, _ = conv_prepack.get_or_make_weight_pack_3x3(weight, block_c=4)
+        second, _ = conv_prepack.get_or_make_weight_pack_3x3(weight, block_c=4)
+        weight.add_(10)
+        refreshed, _ = conv_prepack.get_or_make_weight_pack_3x3(weight, block_c=4)
+
+    assert not cache._d, "inference weights must not enter the global cache"
+    assert second is not first, "inference weight unexpectedly reused a pack"
+    assert refreshed is not second, "updated inference weight reused a stale pack"
+    expected = weight.reshape(2, 1, 9).permute(0, 2, 1)
+    torch.testing.assert_close(refreshed[:, :, :1], expected)
+
+
+def test_immutable_inference_weight_reuses_pack_cache(monkeypatch):
+    cache = conv_prepack._LRUPackCache(maxsize=2)
+    monkeypatch.setattr(conv_prepack, "_PACK_CACHE_3x3", cache)
+    monkeypatch.setattr(conv_prepack, "_TORCH_INFERENCE_TENSOR_WEIGHTS_IMMUTABLE", True)
+
+    with torch.inference_mode():
+        weight = torch.arange(18, dtype=torch.float16, device="cpu").reshape(2, 1, 3, 3)
+        first, _ = conv_prepack.get_or_make_weight_pack_3x3(weight, block_c=4)
+        cached, _ = conv_prepack.get_or_make_weight_pack_3x3(weight, block_c=4)
+
+    assert cached is first
+    assert len(cache._d) == 1
+
+
+def test_normal_weight_pack_cache_still_reuses_and_invalidates(monkeypatch):
+    cache = conv_prepack._LRUPackCache(maxsize=2)
+    monkeypatch.setattr(conv_prepack, "_PACK_CACHE_3x3", cache)
+    monkeypatch.setattr(conv_prepack, "_TORCH_INFERENCE_TENSOR_WEIGHTS_IMMUTABLE", True)
+    weight = torch.arange(18, dtype=torch.float16, device="cpu").reshape(2, 1, 3, 3)
+
+    first, _ = conv_prepack.get_or_make_weight_pack_3x3(weight, block_c=4)
+    cached, _ = conv_prepack.get_or_make_weight_pack_3x3(weight, block_c=4)
+    weight.add_(10)
+    refreshed, _ = conv_prepack.get_or_make_weight_pack_3x3(weight, block_c=4)
+
+    assert cached is first
+    assert refreshed is not first
+    expected = weight.reshape(2, 1, 9).permute(0, 2, 1)
+    torch.testing.assert_close(refreshed[:, :, :1], expected)
+
+
+def test_conv2d_inference_weight_observes_updates(monkeypatch):
+    monkeypatch.setattr(
+        conv_prepack, "_TORCH_INFERENCE_TENSOR_WEIGHTS_IMMUTABLE", False
+    )
+    torch.manual_seed(0)
+    with torch.inference_mode():
+        x = torch.randn(1, 64, 16, 16, device="cuda", dtype=torch.float16)
+        weight = torch.randn(32, 64, 3, 3, device="cuda", dtype=torch.float16)
+
+        output = conv2d_module.conv2d(x, weight, padding=1)
+        reference = F.conv2d(x.float(), weight.float(), padding=1)
+
+        weight.add_(0.25)
+        output_after_update = conv2d_module.conv2d(x, weight, padding=1)
+        reference_after_update = F.conv2d(x.float(), weight.float(), padding=1)
+
+    rtol, atol = dynamic_conv_tolerances(torch.float16, 64 * 3 * 3)
+    torch.testing.assert_close(output.float(), reference, rtol=rtol, atol=atol)
+    torch.testing.assert_close(
+        output_after_update.float(), reference_after_update, rtol=rtol, atol=atol
+    )
+
+
 # -- Configuration lookup and routing (no kernel launches) -------------------
 
 _GFX1100_PINNED = {
