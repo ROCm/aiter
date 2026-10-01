@@ -10,11 +10,11 @@ from collections.abc import Iterable
 
 import torch
 
-from .kernels.kda_decode_gfx950 import (
-    create_kda_decode_kernel,
-)
 from .kernels.kda_decode_fused_projection_gfx950 import (
     create_kda_decode_fused_projection_kernel,
+)
+from .kernels.kda_decode_gfx950 import (
+    create_kda_decode_kernel,
 )
 from .kernels.tensor_shim import _run_compiled
 
