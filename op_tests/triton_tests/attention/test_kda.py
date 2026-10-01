@@ -22,14 +22,13 @@ pytestmark = pytest.mark.skipif(
     arch not in ("gfx950", "gfx1250"),
     reason=f"KDA gluon decode needs gfx950/gfx1250, got {arch}",
 )
-# gfx950 runs the vLLM decode path only: V-first state, head_dim 128, no spec
-# decoding, cache_state_updates or tiling knobs
+
 gfx1250_only = pytest.mark.skipif(arch != "gfx1250", reason="gfx1250-only feature")
 
 
 def skip_on_gfx950(D=128, spec=False):
-    if arch == "gfx950" and (D != 128 or spec):
-        pytest.skip("gfx950 KDA decode needs head_dim 128 and no spec decoding")
+    if arch == "gfx950" and D != 128:
+        pytest.skip("gfx950 KDA decode needs head_dim 128")
 
 
 DEVICE = "cuda"
@@ -1497,6 +1496,86 @@ def test_fused_conv_rms_gate(N, T, H):
     ref = ob * torch.rsqrt(ob.square().mean(-1, keepdim=True) + eps) * nw
     ref = ref * torch.sigmoid(shp(og).float())
     assert torch.equal(cs1, cs2), "conv state roll"
+    assert_close("o", ref, o1)
+    assert_close("ht", S2, S1)
+
+
+@pytest.mark.parametrize("N, k", [(3, 3), (2, 7), (5, 1)])
+@pytest.mark.parametrize(
+    "config", [None, {"use_tdm_load": False, "use_tdm_store": False}]
+)
+def test_fused_conv_rms_gate_spec(N, k, config):
+    """vLLM's spec conv window: W-1+k taps in slot column 0, read from
+    num_accepted-1; the step leaves taps 1..W-2 followed by its inputs."""
+    if config is not None and arch != "gfx1250":
+        pytest.skip("TDM load/store is gfx1250-only")
+    D, W, eps, lb, H = 128, 4, 1e-6, -5.0, 8
+    T = k + 1
+    lp, TT, NS = H * D, N * T, N * T + 4
+    torch.manual_seed(N * 11 + k)
+    mixed = torch.randn(TT, 3 * lp, dtype=torch.bfloat16, device=DEVICE)
+    cw = torch.randn(3 * lp, W, dtype=torch.bfloat16, device=DEVICE) * 0.1
+    cs = torch.randn(NS, W - 1 + k, 3 * lp, dtype=torch.bfloat16, device=DEVICE)
+    cs = cs.transpose(-1, -2) * 0.1  # vLLM's SD storage, seen as (dim, taps)
+    g = torch.randn(1, TT, H, D, dtype=torch.bfloat16, device=DEVICE) * 0.5
+    beta = torch.randn(1, TT, H, dtype=torch.bfloat16, device=DEVICE)
+    og = torch.randn(1, TT, H, D, dtype=torch.bfloat16, device=DEVICE)
+    A_log = torch.randn(H, dtype=torch.float32, device=DEVICE) * 0.1
+    dt_bias = torch.randn(lp, dtype=torch.float32, device=DEVICE) * 0.1
+    S = torch.randn(NS, H, D, D, dtype=torch.float32, device=DEVICE) * 0.01
+    nw = torch.rand(D, dtype=torch.float32, device=DEVICE) + 0.5
+    idx = (torch.randperm(NS - 1, device=DEVICE)[:TT] + 1).int().view(N, T)
+    acc = torch.randint(1, T + 1, (N,), dtype=torch.int32, device=DEVICE)
+    kw = {
+        "g": g,
+        "beta": beta,
+        "A_log": A_log,
+        "dt_bias": dt_bias,
+        "lower_bound": lb,
+        "use_qk_l2norm_in_kernel": True,
+        "use_gate_in_kernel": True,
+        "use_beta_sigmoid_in_kernel": True,
+        "pad_slot_guard": True,
+        "cu_seqlens": torch.arange(0, TT + 1, T, dtype=torch.int64, device=DEVICE),
+        "ssm_state_indices": idx,
+        "num_accepted_tokens": acc,
+    }
+    view = lambda off: mixed.as_strided((1, TT, H, D), (TT * 3 * lp, 3 * lp, D, 1), off)
+    S1, cs1 = S.clone(), cs.clone()
+    o1, _ = fused_recurrent_kda(
+        q=view(0),
+        k=view(lp),
+        v=view(2 * lp),
+        initial_state=S1,
+        conv_state=cs1,
+        conv_weight=cw.view(3, lp, W).permute(0, 2, 1).contiguous().float(),
+        out_gate=og,
+        norm_weight=nw,
+        norm_eps=eps,
+        config=config,
+        **kw,
+    )
+    # reference: torch conv under vLLM's window rules, then the recurrence alone
+    x, w, S2, cs2 = mixed.float(), cw.float(), S.clone(), cs.clone()
+    y = torch.empty(TT, 3 * lp, device=DEVICE)
+    for n in range(N):
+        c, off, rows = int(idx[n, 0]), int(acc[n]) - 1, slice(n * T, (n + 1) * T)
+        h = cs2[c].float()
+        taps = h[:, off : off + W - 1]
+        for t in range(T):
+            y[n * T + t] = (taps * w[:, : W - 1]).sum(-1) + x[n * T + t] * w[:, W - 1]
+            taps = torch.cat([taps[:, 1:], x[n * T + t, :, None]], -1)
+        window = torch.cat([h[:, off + 1 : off + W - 1], x[rows].T], -1)
+        cs2[c][:, : W - 2 + T] = window.to(cs.dtype)
+    y = y * torch.sigmoid(y)
+    q2, k2, v2 = (
+        y[None, :, i * lp : (i + 1) * lp].reshape(1, TT, H, D) for i in range(3)
+    )
+    o2, _ = fused_recurrent_kda(q=q2, k=k2, v=v2, initial_state=S2, **kw)
+    ob = o2.to(torch.bfloat16).float()
+    ref = ob * torch.rsqrt(ob.square().mean(-1, keepdim=True) + eps) * nw
+    ref = ref * torch.sigmoid(og.float())
+    assert torch.equal(cs1, cs2), "conv window"
     assert_close("o", ref, o1)
     assert_close("ht", S2, S1)
 

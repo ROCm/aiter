@@ -2,6 +2,8 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 
+import math
+
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.language.extra.hip import libdevice
@@ -12,6 +14,7 @@ from aiter.ops.triton._gluon_kernels.common.utils import (
     softplus,
 )
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 
 _TDM = gl.amd.gfx1250.tdm
 
@@ -211,27 +214,62 @@ def _conv_qkv_load(
                 ).to(gl.float32),
                 hist_off,
                 mask,
+                x_off,
             ),
         )
     return loads
 
 
 @gluon.jit
+def _conv_qkv_roll(q_ptr, k_ptr, v_ptr, loads):
+    rolled = ()
+    for qkv in gl.static_range(3):
+        x, _h0, h1, h2, w0, w1, w2, w3, hist_off, mask, x_off = loads[qkv]
+        if qkv == 2:
+            x_ptr = v_ptr
+        else:
+            x_ptr = q_ptr if qkv == 0 else k_ptr
+        rolled = rolled + (
+            (
+                gl.amd.gfx1250.buffer_load(x_ptr, x_off, mask=mask, other=0),
+                h1,
+                h2,
+                x.to(h2.dtype),
+                w0,
+                w1,
+                w2,
+                w3,
+                hist_off,
+                mask,
+                x_off,
+            ),
+        )
+    return rolled
+
+
+@gluon.jit
 def _conv_qkv_finish(
-    raw, loads, hist_ptr, pos_stride, K_LAYOUT: gl.constexpr, V_LAYOUT: gl.constexpr
+    raw,
+    loads,
+    hist_ptr,
+    pos_stride,
+    pos,
+    ROLL: gl.constexpr,
+    K_LAYOUT: gl.constexpr,
+    V_LAYOUT: gl.constexpr,
 ):
-    # causal conv + SiLU for q, k, v, and roll each history window by one token
     conv_out = ()
     for qkv in gl.static_range(3):
-        x, h0, h1, h2, w0, w1, w2, w3, hist_off, mask = loads[qkv]
+        x, h0, h1, h2, w0, w1, w2, w3, hist_off, mask, _x_off = loads[qkv]
         acc = h0.to(gl.float32) * w0 + h1.to(gl.float32) * w1
         acc += h2.to(gl.float32) * w2 + x.to(gl.float32) * w3
-        gl.amd.gfx1250.buffer_store(h1, hist_ptr, hist_off, mask=mask)
-        gl.amd.gfx1250.buffer_store(h2, hist_ptr, hist_off + pos_stride, mask=mask)
+        if ROLL:
+            gl.amd.gfx1250.buffer_store(h1, hist_ptr, hist_off, mask=mask)
+            gl.amd.gfx1250.buffer_store(h2, hist_ptr, hist_off + pos_stride, mask=mask)
         gl.amd.gfx1250.buffer_store(
             x.to(hist_ptr.dtype.element_ty),
             hist_ptr,
-            hist_off + 2 * pos_stride,
+            hist_off + pos * pos_stride,
             mask=mask,
         )
         conv_out = conv_out + (acc * sigmoid(acc),)
@@ -406,6 +444,10 @@ def fused_recurrent_kda_packed_decode_kernel(
         "USE_CONV/USE_RMS_GATE run on the register-prefetch path",
     )
     gl.static_assert((not USE_CONV) or USE_INITIAL_STATE, "USE_CONV needs a state slot")
+    gl.static_assert(
+        (not (USE_CONV and IS_SPEC_DECODING)) or IS_CONTINUOUS_BATCHING,
+        "spec decoding's conv window lives in paged state slots",
+    )
     CR: gl.constexpr = (32 * NUM_WARPS) // K if 32 * NUM_WARPS > K else 1
     gl.static_assert(
         (not USE_CONV)
@@ -451,11 +493,9 @@ def fused_recurrent_kda_packed_decode_kernel(
         )
         if pad_slot <= 0:
             zero = gl.full([BV], 0.0, o_ptr.dtype.element_ty, V_LAYOUT)
-            gl.amd.gfx1250.buffer_store(
-                zero,
-                o_ptr + bos.to(gl.int64) * stride_o_token + i_hv * V + i_v * BV,
-                off_v,
-            )
+            o_z = o_ptr + bos.to(gl.int64) * stride_o_token + i_hv * V + i_v * BV
+            for t in range(n_tok):
+                gl.amd.gfx1250.buffer_store(zero, o_z + t * stride_o_token, off_v)
             return
 
     col = 0 if STATE_V_FIRST else i_v * BV
@@ -598,13 +638,20 @@ def fused_recurrent_kda_packed_decode_kernel(
                 [CR, NUM_WARPS // CR],
                 [1, 0],
             )
-            hb = conv_state_ptr + slot.to(gl.int64) * stride_cs_slot
-            # conv loads first, then the state stream, the conv math and its history stores run under the state load
+            if IS_SPEC_DECODING:
+                cslot = gl.load(state_indices_ptr + i_n * stride_indices_seq).to(
+                    gl.int32
+                )
+                hb = conv_state_ptr + cslot.to(gl.int64) * stride_cs_slot
+                hb_in = hb + seed * stride_cs_pos
+            else:
+                hb = conv_state_ptr + slot.to(gl.int64) * stride_cs_slot
+                hb_in = hb
             conv_loads = _conv_qkv_load(
                 q_p,
                 k_p,
                 v_p,
-                hb,
+                hb_in,
                 conv_weight_ptr,
                 i_h,
                 i_hv,
@@ -650,7 +697,7 @@ def fused_recurrent_kda_packed_decode_kernel(
             _TDM.async_load(desc_in, [row_in, col], smem_in)
             if USE_CONV:
                 nxt = _conv_qkv_finish(
-                    nxt, conv_loads, hb, stride_cs_pos, K_LAYOUT, V_LAYOUT
+                    nxt, conv_loads, hb, stride_cs_pos, W - 2, True, K_LAYOUT, V_LAYOUT
                 )
             _TDM.async_wait(0)
             S = smem_in.load(STATE_LAYOUT)
@@ -660,7 +707,7 @@ def fused_recurrent_kda_packed_decode_kernel(
             ).to(gl.float32)
             if USE_CONV:
                 nxt = _conv_qkv_finish(
-                    nxt, conv_loads, hb, stride_cs_pos, K_LAYOUT, V_LAYOUT
+                    nxt, conv_loads, hb, stride_cs_pos, W - 2, True, K_LAYOUT, V_LAYOUT
                 )
         if CACHE_STATE_UPDATES and IS_SPEC_DECODING:
             for j in range(1, seed + 1):
@@ -761,27 +808,47 @@ def fused_recurrent_kda_packed_decode_kernel(
                         q_p, k_p, v_p, g_p, b_p, off_k, off_v, IS_BETA_HEADWISE
                     )
                     if USE_CONV:
-                        conv_loads = _conv_qkv_load(
-                            q_p,
-                            k_p,
-                            v_p,
-                            hb,
-                            conv_weight_ptr,
-                            i_h,
-                            i_hv,
-                            stride_cs_dim,
-                            stride_cs_pos,
-                            H * K,
-                            W,
-                            CR,
-                            K,
-                            V,
-                            FLATK,
-                            FLATV,
-                        )
-                        nxt = _conv_qkv_finish(
-                            nxt, conv_loads, hb, stride_cs_pos, K_LAYOUT, V_LAYOUT
-                        )
+                        if IS_SPEC_DECODING:  # token t+1's input lands at W-1+t
+                            conv_loads = _conv_qkv_roll(q_p, k_p, v_p, conv_loads)
+                            nxt = _conv_qkv_finish(
+                                nxt,
+                                conv_loads,
+                                hb,
+                                stride_cs_pos,
+                                W - 1 + t,
+                                False,
+                                K_LAYOUT,
+                                V_LAYOUT,
+                            )
+                        else:
+                            conv_loads = _conv_qkv_load(
+                                q_p,
+                                k_p,
+                                v_p,
+                                hb,
+                                conv_weight_ptr,
+                                i_h,
+                                i_hv,
+                                stride_cs_dim,
+                                stride_cs_pos,
+                                H * K,
+                                W,
+                                CR,
+                                K,
+                                V,
+                                FLATK,
+                                FLATV,
+                            )
+                            nxt = _conv_qkv_finish(
+                                nxt,
+                                conv_loads,
+                                hb,
+                                stride_cs_pos,
+                                W - 2,
+                                True,
+                                K_LAYOUT,
+                                V_LAYOUT,
+                            )
                     if USE_RMS_GATE:
                         og_p += stride_og_token
                         og_nxt = gl.amd.gfx1250.buffer_load(og_p, off_v)
@@ -917,3 +984,44 @@ def fused_recurrent_kda_packed_decode_kernel(
                 state_out_ptr + row_out.to(gl.int64) * ROWLEN + col,
                 off_s,
             )
+
+
+def get_kda_config(
+    avg_T: int,
+    num_seqs: int,
+    HV: int,
+    K: int,
+    V: int,
+    overrides: dict | None = None,
+    fused: bool = False,
+) -> dict:
+    cfg_dir = resolve_config_dir("attention", "KDA_DECODE", backend="gluon")
+    tuned = load_config_json(f"{cfg_dir}/DEFAULT.json")
+    num_seq_heads = num_seqs * HV
+    aligned = K % 32 == 0 and V % 32 == 0
+    if fused:
+        multi = avg_T > 1 and num_seq_heads < 3072 and "fused_t_gt1" in tuned
+        bucket = "fused_t_gt1" if multi else "fused"
+    elif avg_T > 1:
+        if aligned and num_seq_heads >= 3072 and V % 128 == 0:
+            bucket = "t_gt1_seq_heads_geq_3072"
+        elif aligned and num_seq_heads >= 384:
+            bucket = "t_gt1_seq_heads_geq_384"
+        elif K % 16 == 0:
+            bucket = "t_gt1_default"
+        else:
+            bucket = "default"
+    elif aligned and 256 <= num_seq_heads <= 512:
+        bucket = "t1_seq_heads_256_to_512"
+    else:
+        bucket = "default"
+    config = dict(tuned[bucket])
+    overrides = overrides or {}
+    config.update(overrides)
+    if "SK" not in overrides:
+        config["SK"] = min(config["SK"], math.gcd(32, K))
+        if "num_warps" not in overrides:
+            config["num_warps"] = max(
+                1, min(config["num_warps"], config["BV"] * config["SK"] // 32)
+            )
+    return config
