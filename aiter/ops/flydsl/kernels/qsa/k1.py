@@ -136,12 +136,26 @@ def build_qsa_k1_emit_module(page_size: int):
     return launch_qsa_k1_emit
 
 
+def _dense_indexer_strides(page_size: int) -> tuple[int, int, int]:
+    """Element strides of a packed ``[pages, page_size, 1, D]`` cache."""
+    return (page_size * _KV_HEADS * _D, _KV_HEADS * _D, _D)
+
+
+def _span_bytes(t: torch.Tensor) -> int:
+    """Bytes from ``t``'s first element to one past its last, for any strides."""
+    if t.numel() == 0:
+        return 0
+    last = sum((size - 1) * stride for size, stride in zip(t.shape, t.stride()))
+    return (last + 1) * t.element_size()
+
+
 def build_qsa_k1_scores_module(
     page_size: int,
     use_k32: bool,
     block_n: int,
     n_heads: int = _H,
     wide_cache: bool = False,
+    k_strides: tuple[int, int, int] | None = None,
 ):
     """Build a long-context paged MFMA scorer."""
     if page_size < 1:
@@ -150,6 +164,14 @@ def build_qsa_k1_scores_module(
         raise ValueError(f"score block_n must be 16 or 32, got {block_n}")
     if n_heads not in _SCORE_HEADS:
         raise ValueError(f"score heads must be {_SCORE_HEADS}, got {n_heads}")
+    dense_k_strides = _dense_indexer_strides(page_size)
+    if k_strides is None:
+        k_strides = dense_k_strides
+    else:
+        k_strides = tuple(int(s) for s in k_strides)
+    # Page, token, and head strides are constants only on the wide path.
+    # The narrow descriptor reads them from the tensor layout.
+    strided_wide = wide_cache and k_strides != dense_k_strides
 
     block_threads = 128
     head_pad = 16
@@ -180,6 +202,7 @@ def build_qsa_k1_scores_module(
             blk=block_threads,
             qkk=qk_k,
             wide=int(wide_cache),
+            **({"kvs": "x".join(str(s) for s in k_strides)} if strided_wide else {}),
         ),
         known_block_size=[block_threads, 1, 1],
     )
@@ -221,9 +244,9 @@ def build_qsa_k1_scores_module(
                 address_space=fx.AddressSpace.Global,
                 alignment=16,
             )
-            page_elems64 = Int64(page_size * _KV_HEADS * _D)
-            token_elems64 = Int64(_KV_HEADS * _D)
-            head_elems64 = Int64(_D)
+            page_elems64 = Int64(k_strides[0])
+            token_elems64 = Int64(k_strides[1])
+            head_elems64 = Int64(k_strides[2])
             row_bytes = _D * 2
 
             def k_page_row(phys, page_off):
@@ -407,12 +430,19 @@ def build_qsa_k1_prefill_scores_module(
     use_k32: bool,
     n_heads: int = _H,
     wide_cache: bool = False,
+    k_strides: tuple[int, int, int] | None = None,
 ):
     """Build the single-request, 16-row by 32-column MFMA scorer."""
     if page_size < 1:
         raise ValueError(f"page_size must be positive, got {page_size}")
     if n_heads not in _SCORE_HEADS:
         raise ValueError(f"score heads must be {_SCORE_HEADS}, got {n_heads}")
+    dense_k_strides = _dense_indexer_strides(page_size)
+    if k_strides is None:
+        k_strides = dense_k_strides
+    else:
+        k_strides = tuple(int(s) for s in k_strides)
+    strided_wide = wide_cache and k_strides != dense_k_strides
 
     block_m = 16
     block_n = 32
@@ -449,6 +479,7 @@ def build_qsa_k1_prefill_scores_module(
             blk=block_threads,
             qkk=qk_k,
             wide=int(wide_cache),
+            **({"kvs": "x".join(str(s) for s in k_strides)} if strided_wide else {}),
         ),
         known_block_size=[block_threads, 1, 1],
     )
@@ -488,9 +519,9 @@ def build_qsa_k1_prefill_scores_module(
                 address_space=fx.AddressSpace.Global,
                 alignment=16,
             )
-            page_elems64 = Int64(page_size * _KV_HEADS * _D)
-            token_elems64 = Int64(_KV_HEADS * _D)
-            head_elems64 = Int64(_D)
+            page_elems64 = Int64(k_strides[0])
+            token_elems64 = Int64(k_strides[1])
+            head_elems64 = Int64(k_strides[2])
             row_bytes = _D * 2
 
             def k_page_row(phys, page_off):
@@ -703,8 +734,11 @@ def _scores_plan(
     block_n: int,
     n_heads: int = _H,
     wide_cache: bool = False,
+    k_strides: tuple[int, int, int] | None = None,
 ):
-    return build_qsa_k1_scores_module(page_size, use_k32, block_n, n_heads, wide_cache)
+    return build_qsa_k1_scores_module(
+        page_size, use_k32, block_n, n_heads, wide_cache, k_strides
+    )
 
 
 @lru_cache(maxsize=8)
@@ -713,8 +747,11 @@ def _prefill_scores_plan(
     use_k32: bool,
     n_heads: int = _H,
     wide_cache: bool = False,
+    k_strides: tuple[int, int, int] | None = None,
 ):
-    return build_qsa_k1_prefill_scores_module(page_size, use_k32, n_heads, wide_cache)
+    return build_qsa_k1_prefill_scores_module(
+        page_size, use_k32, n_heads, wide_cache, k_strides
+    )
 
 
 def _k1_prefill_lds_bytes(n_heads: int) -> int:
@@ -780,10 +817,13 @@ def qsa_k1_score_and_select(
     scores = torch.empty(m, n_columns, dtype=torch.float32, device=q.device)
     row_lens = torch.empty(m, dtype=torch.int32, device=q.device)
     score_tiles = (n_columns + score_block_n - 1) // score_block_n
-    wide_cache = k_cache.numel() * k_cache.element_size() > (1 << 32)
+    # numel() is the packed page. A vLLM layer view pads the page stride,
+    # so the bytes the descriptor has to cover are the span.
+    wide_cache = _span_bytes(k_cache) > (1 << 32)
+    k_strides = tuple(int(s) for s in k_cache.stride()[:3]) if wide_cache else None
     if _k1_uses_prefill_scorer(int(context_lens.shape[0]), m, n_heads, arch):
         _run_compiled(
-            _prefill_scores_plan(page_size, use_k32, n_heads, wide_cache),
+            _prefill_scores_plan(page_size, use_k32, n_heads, wide_cache, k_strides),
             q,
             k_cache,
             page_table,
@@ -802,7 +842,9 @@ def qsa_k1_score_and_select(
         )
     else:
         _run_compiled(
-            _scores_plan(page_size, use_k32, score_block_n, n_heads, wide_cache),
+            _scores_plan(
+                page_size, use_k32, score_block_n, n_heads, wide_cache, k_strides
+            ),
             q,
             k_cache,
             page_table,
@@ -864,6 +906,15 @@ def qsa_k1_serves(
         return f"k_cache must be [pages, page_size, H, D], got {tuple(k_cache.shape)}"
     if k_cache.shape[2] != _KV_HEADS or k_cache.shape[3] != _D:
         return f"k_cache KV/D must be ({_KV_HEADS}, {_D}), got {k_cache.shape[2:]}"
+    # Read in place. vLLM's per-layer view keeps D contiguous and the token
+    # stride at D; the page stride is padded. The gather is a 16-byte load,
+    # so that stride has to be a multiple of 8 elements. A copy is not.
+    if k_cache.stride(3) != 1:
+        return f"k_cache needs a unit D stride, got {k_cache.stride()}"
+    if any(s % 8 for s in k_cache.stride()[:3]):
+        return (
+            f"k_cache strides must be multiples of 8 elements, got {k_cache.stride()}"
+        )
     if page_table.dim() != 2 or page_table.dtype != torch.int32:
         return (
             f"page_table must be int32 [n_req, n_pages], got {tuple(page_table.shape)}"
@@ -917,7 +968,8 @@ def qsa_k1_block_ids(
         raise ValueError("every tensor must be on the same GPU")
     qsa_device_arch(torch.cuda.get_device_properties(q.device).gcnArchName)
     q = q.contiguous()
-    k_cache = k_cache.contiguous()
+    # Leave k_cache strided. contiguous() would copy a vLLM layer view into
+    # every captured decode graph.
     page_table = page_table.contiguous()
     token_to_req = token_to_req.contiguous()
     query_positions = query_positions.contiguous()
