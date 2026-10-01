@@ -13,6 +13,7 @@ import torch
 from torch import Tensor
 
 from aiter import logger
+from aiter.flydsl_gemm_registry import DECODE_MAX_M
 from aiter.jit.utils.chip_info import (
     get_cu_num,
     get_gfx,
@@ -160,7 +161,7 @@ def _normalize_launch_stream(
     return launch_stream
 
 
-def _validate_hgemm_bias(
+def _validate_decode_bias(
     a: torch.Tensor,
     bias: torch.Tensor | None,
     n: int,
@@ -201,13 +202,9 @@ def flydsl_hgemm(
 
     if policy not in ("ft", "ht", "hti"):
         raise ValueError(f"Unsupported FlyDSL HGEMM policy: {policy!r}")
-    launch_stream = (
-        torch.cuda.current_stream(device=a.device) if stream is None else stream
-    )
-    if launch_stream.device != a.device:
-        raise ValueError(f"`stream` must be on {a.device}, got {launch_stream.device}")
+    launch_stream = _normalize_launch_stream(a.device, stream)
 
-    gfx = get_gfx()
+    gfx = get_gfx_runtime()
     if gfx == "gfx1250":
         if k_waves != 1:
             raise ValueError("The gfx1250 FlyDSL A16W16 kernel supports k_waves=1 only")
@@ -281,14 +278,15 @@ def validate_gemm_decode_tensors(
     C: torch.Tensor,
     bias: torch.Tensor | None = None,
     arch: str | None = None,
-    check_overlap: bool = True,
 ) -> tuple[int, int, int]:
-    """Validate the packed real-tensor ABI shared by both kernel families.
+    """Validate the real-tensor ABI shared by both kernel families.
+
+    B and C must be packed row-major. A may have any row stride ``>= K`` with a
+    unit column stride, e.g. a column slice of a wider activation; the stride
+    of a size-1 M dimension is ignored, as PyTorch does.
 
     This runs per launch on the decode path, so it is deliberately flat: no
-    dicts, no helper calls, no tuple building. Same checks and messages as
-    before. `check_overlap` exists for callers that allocated C themselves and
-    therefore already know it cannot alias A or B.
+    dicts, no tuple building.
     """
     for name, t in (("A", A), ("B", B), ("C", C)):
         if not isinstance(t, torch.Tensor):
@@ -302,15 +300,15 @@ def validate_gemm_decode_tensors(
 
     m, k = A.shape
     n, b_k = B.shape
-    if not (1 <= m <= 5):
-        raise ValueError("decode GEMM supports exact M in [1, 5]")
+    if not (1 <= m <= DECODE_MAX_M):
+        raise ValueError(f"decode GEMM supports exact M in [1, {DECODE_MAX_M}]")
     if n <= 0 or k <= 0:
         raise ValueError("decode GEMM requires positive N and K")
     if b_k != k:
         raise ValueError(f"B must have shape ({n}, {k}), got {tuple(B.shape)}")
     if A.device != B.device or A.device != C.device:
         raise ValueError("A, B, and C must be on the same device")
-    _validate_hgemm_bias(A, bias, n)
+    _validate_decode_bias(A, bias, n)
 
     for name, t, rows, cols in (("A", A, m, k), ("B", B, n, k), ("C", C, m, n)):
         shape = t.shape
@@ -319,11 +317,19 @@ def validate_gemm_decode_tensors(
                 f"{name} must have shape {(rows, cols)}, got {tuple(shape)}"
             )
         stride = t.stride()
-        if stride[0] != cols or stride[1] != 1:
+        if name == "A":
+            if stride[1] != 1 or (rows > 1 and stride[0] < cols):
+                raise ValueError(
+                    "A must be row-major with a unit column stride and a row "
+                    f"stride of at least K, got strides {tuple(stride)}"
+                )
+        elif stride[0] != cols or stride[1] != 1:
             raise ValueError(f"{name} must use packed row-major storage")
 
-    if check_overlap and (_overlaps(C, A) or _overlaps(C, B)):
+    if _overlaps(C, A) or _overlaps(C, B):
         raise ValueError("C must not overlap A or B")
+    if bias is not None and _overlaps(C, bias):
+        raise ValueError("C must not overlap bias")
     gfx = get_gfx_runtime() if arch is None else arch
     if gfx not in ("gfx942", "gfx950"):
         raise ValueError(f"decode GEMM requires gfx942 or gfx950, got {gfx}")
@@ -339,8 +345,12 @@ def compile_gemm_decode_bf16(
     arch: str,
     num_cus: int | None = None,
     has_bias: bool = False,
+    strided_a: bool = False,
 ):
-    """Compile one exact unified ``(arch, M, N, K, config)`` identity."""
+    """Compile one exact unified ``(arch, M, N, K, config)`` identity.
+
+    ``strided_a`` selects the variant that accepts an A row stride other than K.
+    """
     if isinstance(config, WaveDecodeConfig):
         return compile_gemm_decode_wave_bf16(
             m,
@@ -349,6 +359,7 @@ def compile_gemm_decode_bf16(
             config,
             arch,
             has_bias=has_bias,
+            strided_a=strided_a,
         )
     if isinstance(config, BlockMfmaDecodeConfig):
         return compile_gemm_decode_block_mfma_bf16(
@@ -359,6 +370,7 @@ def compile_gemm_decode_bf16(
             arch,
             num_cus=num_cus,
             has_bias=has_bias,
+            strided_a=strided_a,
         )
     raise TypeError(f"unsupported decode config type: {type(config).__name__}")
 
@@ -384,6 +396,11 @@ def gemm_decode_bf16(
     if bias is not None and not bias.is_contiguous():
         raise ValueError("bias must be contiguous")
     launch_stream = _normalize_launch_stream(A.device, stream)
+    if m == 1 and A.stride() != (k, 1):
+        # A size-1 row has no meaningful row stride; give it the packed one so
+        # the packed kernel serves it (zero copy).
+        A = A.as_strided((1, k), (k, 1))
+    strided_a = A.stride(0) != k
     launcher = compile_gemm_decode_bf16(
         m,
         n,
@@ -392,6 +409,7 @@ def gemm_decode_bf16(
         arch=runtime_arch,
         num_cus=get_cu_num(),
         has_bias=bias is not None,
+        strided_a=strided_a,
     )
     launcher(A, B, C, bias=bias, stream=fx.Stream(launch_stream))
     return C

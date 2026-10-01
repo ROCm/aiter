@@ -21,6 +21,7 @@ from .gemm_decode_common import (
     convert_bf16,
     gemm_decode_kernel_name,
     k_element,
+    load_scalar,
     load_vector,
     make_buffer_matrix,
     make_buffer_vector,
@@ -106,6 +107,7 @@ def _load_tail_a_vectors(
     m: int,
     k: int,
     staged_k: int,
+    a_stride,
 ):
     if use_lds:
         values = []
@@ -129,6 +131,7 @@ def _load_tail_a_vectors(
             k_base,
             MFMA_K,
             k,
+            row_stride=a_stride,
         )
         for row in range_constexpr(m)
     ]
@@ -143,6 +146,7 @@ def _compute_column_tile(
     b_global,
     column_base,
     lane,
+    a_stride,
 ):
     """Compute one logical N tile and return values for guarded stores."""
     columns = config.columns_per_wave
@@ -182,7 +186,7 @@ def _compute_column_tile(
                     a_smem=a_smem,
                     k_base=k_base,
                     m=geometry.m,
-                    row_stride=(geometry.staged_k if geometry.use_lds else geometry.k),
+                    row_stride=(geometry.staged_k if geometry.use_lds else a_stride),
                     width=geometry.width,
                 )
             )
@@ -227,6 +231,7 @@ def _compute_column_tile(
             m=geometry.m,
             k=geometry.k,
             staged_k=geometry.staged_k,
+            a_stride=a_stride,
         )
         b_vectors = [
             masked_bf16_vector(
@@ -267,6 +272,7 @@ def _make_block_kernel(
     kernel_name: str,
     persistent_turns: int,
     has_bias: bool,
+    strided_a: bool = False,
 ):
     """Build one selected BlockMFMA specialization."""
     waves = config.waves_per_workgroup
@@ -318,7 +324,8 @@ def _make_block_kernel(
             first_column = gpu.block_idx.x * fx.Int32(
                 waves * columns
             ) + wave * fx.Int32(columns)
-            a_global = make_buffer_matrix(A, m, k)
+            a_row_stride = fx.Int32(fx.get_scalar(A.stride[0])) if strided_a else k
+            a_global = make_buffer_matrix(A, m, k, a_row_stride if strided_a else None)
             b_global = make_buffer_matrix(B, n, k)
             c_global = make_buffer_matrix(C, m, n)
             if const_expr(has_bias):
@@ -338,7 +345,7 @@ def _make_block_kernel(
                             activation_vectors_per_row,
                         )
                         column = row_vector * fx.Int32(8)
-                        staged = load_vector(a_global, row, column, k, 8)
+                        staged = load_vector(a_global, row, column, a_row_stride, 8)
                         make_vector_view(
                             a_smem,
                             row,
@@ -373,7 +380,15 @@ def _make_block_kernel(
                             m,
                             global_tail_per_row,
                         )
-                        a_smem_tail[row, row_tail] = a_global_tail[row, row_tail]
+                        if const_expr(strided_a):
+                            a_smem_tail[row, row_tail] = load_scalar(
+                                a_global,
+                                row,
+                                fx.Int32(vector_prefix) + row_tail,
+                                a_row_stride,
+                            )
+                        else:
+                            a_smem_tail[row, row_tail] = a_global_tail[row, row_tail]
                 if shared_padding_elements:
                     a_smem_padding = fx.make_view(
                         fx.add_offset(
@@ -401,22 +416,18 @@ def _make_block_kernel(
                 b_global=b_global,
                 column_base=first_column,
                 lane=lane,
+                a_stride=a_row_stride,
             )
             for row in range_constexpr(m):
                 for column in range_constexpr(columns):
                     column_coord = logical_columns[column]
                     if (lane == fx.Int32(WAVE_SIZE - 1)) & (column_coord < fx.Int32(n)):
-                        element = fx.Int32(row) * fx.Int32(n) + fx.Int32(column_coord)
                         value = reduced[row][column]
                         if const_expr(has_bias):
                             value = fx.Float32(value) + bias_global[column_coord].to(
                                 fx.Float32
                             )
-                        output = convert_bf16(
-                            value,
-                            element,
-                            config.output_rounding,
-                        )
+                        output = convert_bf16(value)
                         c_global[row, column_coord] = output
 
     else:
@@ -435,7 +446,8 @@ def _make_block_kernel(
             first_column = gpu.block_idx.x * fx.Int32(
                 waves * columns
             ) + wave * fx.Int32(columns)
-            a_global = make_buffer_matrix(A, m, k)
+            a_row_stride = fx.Int32(fx.get_scalar(A.stride[0])) if strided_a else k
+            a_global = make_buffer_matrix(A, m, k, a_row_stride if strided_a else None)
             b_global = make_buffer_matrix(B, n, k)
             c_global = make_buffer_matrix(C, m, n)
             if const_expr(has_bias):
@@ -455,7 +467,7 @@ def _make_block_kernel(
                             activation_vectors_per_row,
                         )
                         column = row_vector * fx.Int32(8)
-                        staged = load_vector(a_global, row, column, k, 8)
+                        staged = load_vector(a_global, row, column, a_row_stride, 8)
                         make_vector_view(
                             a_smem,
                             row,
@@ -490,7 +502,15 @@ def _make_block_kernel(
                             m,
                             global_tail_per_row,
                         )
-                        a_smem_tail[row, row_tail] = a_global_tail[row, row_tail]
+                        if const_expr(strided_a):
+                            a_smem_tail[row, row_tail] = load_scalar(
+                                a_global,
+                                row,
+                                fx.Int32(vector_prefix) + row_tail,
+                                a_row_stride,
+                            )
+                        else:
+                            a_smem_tail[row, row_tail] = a_global_tail[row, row_tail]
                 if shared_padding_elements:
                     a_smem_padding = fx.make_view(
                         fx.add_offset(
@@ -523,6 +543,7 @@ def _make_block_kernel(
                         b_global=b_global,
                         column_base=column_base,
                         lane=lane,
+                        a_stride=a_row_stride,
                     )
                     for row in range_constexpr(m):
                         for column in range_constexpr(columns):
@@ -530,19 +551,12 @@ def _make_block_kernel(
                             if (lane == fx.Int32(WAVE_SIZE - 1)) & (
                                 column_coord < fx.Int32(n)
                             ):
-                                element = fx.Int32(row) * fx.Int32(n) + fx.Int32(
-                                    column_coord
-                                )
                                 value = reduced[row][column]
                                 if const_expr(has_bias):
                                     value = fx.Float32(value) + bias_global[
                                         column_coord
                                     ].to(fx.Float32)
-                                output = convert_bf16(
-                                    value,
-                                    element,
-                                    config.output_rounding,
-                                )
+                                output = convert_bf16(value)
                                 c_global[row, column_coord] = output
                 turn = turn + fx.Int32(1)
 
@@ -559,8 +573,13 @@ def compile_gemm_decode_block_mfma_bf16(
     num_cus: int | None = None,
     *,
     has_bias: bool = False,
+    strided_a: bool = False,
 ):
-    """Compile one work-sized or grid-capped persistent BlockMFMA kernel."""
+    """Compile one work-sized or grid-capped persistent BlockMFMA kernel.
+
+    ``strided_a`` compiles a variant that reads A's row stride at run time; the
+    packed variant keeps it a compile-time constant.
+    """
     config.validate(m=m, n=n, k=k, arch=arch)
     kernel_name = gemm_decode_kernel_name(
         arch,
@@ -570,6 +589,8 @@ def compile_gemm_decode_block_mfma_bf16(
         config,
         has_bias=has_bias,
     )
+    if strided_a:
+        kernel_name += "_sA"
     waves = config.waves_per_workgroup
     columns = config.columns_per_wave
     block_threads = waves * WAVE_SIZE
@@ -595,6 +616,7 @@ def compile_gemm_decode_block_mfma_bf16(
         kernel_name=kernel_name,
         persistent_turns=persistent_turns,
         has_bias=has_bias,
+        strided_a=strided_a,
     )
     kernel_attributes = (
         {"rocdl.waves_per_eu": config.waves_per_eu} if config.waves_per_eu else {}

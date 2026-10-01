@@ -103,7 +103,6 @@ class FlydslGemmFamily:
     candidates: Callable[[GemmProblem, str], list[Candidate]] | None = None
     aot_job: Callable[[dict, str], dict] | None = None
     exact_m: bool = False
-    tuner_tolerance: tuple[float, float] | None = None  # (rtol, atol); None = default
 
 
 _FAMILIES: list[FlydslGemmFamily] = []
@@ -193,7 +192,7 @@ def _no_scaling(scale_a, scale_b, scale_c) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# hgemm: gfx950 A16W16 GEMM (Yutao Xu) and gfx1250 A16W16 GEMM (Omar Muhammad)
+# hgemm: gfx950 and gfx1250 A16W16 GEMM
 # ---------------------------------------------------------------------------
 
 
@@ -324,9 +323,10 @@ def _hgemm_aot_job(row: dict, kernel_name: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# decode: exact-M BF16 decode GEMM for M=1..5 (Sami Remes)
+# decode: exact-M BF16 decode GEMM for M=1..DECODE_MAX_M
 # ---------------------------------------------------------------------------
 
+# Largest M the exact-M decode kernels are built for.
 DECODE_MAX_M = 5
 
 
@@ -436,14 +436,9 @@ def _round_robin_representatives(items, *, limit, bucket_key, priority_key):
 def _bounded_decode_configs(configs: Iterable, limit: int = 12) -> list:
     """Pick a small but representative set of decode candidates.
 
-    The catalog enumerates every Wave configuration before any BlockMFMA one,
-    so a plain prefix (`list(configs)[:limit]`) is not a sample: it is always
-    Wave-only, and BlockMFMA is never timed. Measured on gfx950, that excluded
-    38% of the catalog on all 84 shape/M cells; on gfx942 the excluded family
-    turned out to win 81 of 84 cells.
-
-    Bucketing by family first and round-robining across buckets keeps the same
-    candidate budget while guaranteeing both families are represented.
+    The catalog lists every Wave configuration before any BlockMFMA one, so a
+    plain prefix would time Wave only. Round-robining across family buckets
+    keeps the budget and times both families.
     """
     from aiter.ops.flydsl.gemm_kernels import WaveDecodeConfig
 
@@ -493,10 +488,13 @@ def _decode_candidates(problem: GemmProblem, policy: str) -> list[Candidate]:
 
     runtime_arch = get_gfx_runtime()
     if problem.arch != runtime_arch:
-        raise ValueError(
-            f"FlyDSL decode tuner row targets {problem.arch}, "
-            f"but the runtime device is {runtime_arch}"
+        from aiter import logger
+
+        logger.warning(
+            f"FlyDSL decode: row targets {problem.arch}, device is "
+            f"{runtime_arch}; no decode candidates"
         )
+        return []
     gemm_kernels = _gemm_kernels()
     configs = list(
         gemm_kernels.iter_gemm_decode_configs(
@@ -606,6 +604,5 @@ register(
         candidates=_decode_candidates,
         aot_job=_decode_aot_job,
         exact_m=True,
-        tuner_tolerance=(0.01, 0.125),
     )
 )

@@ -13,11 +13,11 @@ from itertools import product
 from typing import TypeAlias
 
 import flydsl.expr as fx
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import range_constexpr
 from flydsl.expr.typing import T
 
-from aiter.jit.utils.chip_info import get_lds_capacity_bytes
+from aiter.flydsl_gemm_registry import DECODE_MAX_M
+from aiter.jit.utils.chip_info import get_cu_num, get_lds_capacity_bytes
 
 # Host configuration, validation, naming, and enumeration.
 WAVE_SIZE = 64
@@ -36,7 +36,6 @@ def validate_cache_policy(cache_policy: int) -> None:
 
 class OutputRounding(str, Enum):
     RNE = "rne"
-    STOCHASTIC = "stochastic"
 
 
 class ReductionMode(str, Enum):
@@ -59,7 +58,6 @@ class ActivationSource(str, Enum):
 class DecodeArchTraits:
     arch: str
     supports_dot2: bool
-    supports_stochastic: bool
     supports_two_stage: bool
 
 
@@ -67,13 +65,11 @@ ARCH_TRAITS = {
     "gfx942": DecodeArchTraits(
         arch="gfx942",
         supports_dot2=False,
-        supports_stochastic=False,
         supports_two_stage=False,
     ),
     "gfx950": DecodeArchTraits(
         arch="gfx950",
         supports_dot2=True,
-        supports_stochastic=True,
         supports_two_stage=True,
     ),
 }
@@ -127,11 +123,6 @@ class WaveDecodeConfig:
             raise ValueError("dot2 BF16 contraction requires gfx950")
         if arch == "gfx950" and self.contraction != ContractionMode.DOT2_BF16:
             raise ValueError("gfx950 wave policy uses native dot2 BF16 contraction")
-        if (
-            self.output_rounding == OutputRounding.STOCHASTIC
-            and not traits.supports_stochastic
-        ):
-            raise ValueError("stochastic BF16 conversion requires gfx950")
         if self.reduction == ReductionMode.DPP and k % self.kvec:
             raise ValueError("DPP reduction requires K divisible by kvec")
 
@@ -185,11 +176,6 @@ class BlockMfmaDecodeConfig:
         if self.waves_per_eu not in (0, 1, 2, 4):
             raise ValueError("waves_per_eu must be 0, 1, 2, or 4")
         validate_cache_policy(self.b_cache_modifier)
-        if (
-            self.output_rounding == OutputRounding.STOCHASTIC
-            and not traits.supports_stochastic
-        ):
-            raise ValueError("stochastic BF16 conversion requires gfx950")
         if self.activation_source == ActivationSource.FULL_LDS:
             required = block_mfma_lds_bytes(m, k)
             lds_limit = get_lds_capacity_bytes(arch)
@@ -204,7 +190,7 @@ DecodeConfig: TypeAlias = WaveDecodeConfig | BlockMfmaDecodeConfig
 
 
 def _validate_problem(m: int, n: int, k: int) -> None:
-    if not 1 <= m <= 5:
+    if not 1 <= m <= DECODE_MAX_M:
         raise ValueError("BF16 decode GEMM supports exact M in [1, 5]")
     if n <= 0 or k <= 0:
         raise ValueError("BF16 decode GEMM requires positive N and K")
@@ -236,7 +222,6 @@ def block_mfma_lds_bytes(m: int, k: int) -> int:
     return m * block_mfma_staged_k(k) * BF16_BYTES
 
 
-_DEFAULT_CUS_BY_ARCH = {"gfx942": 304, "gfx950": 256}
 _NON_TEMPORAL_WEIGHT_BYTES = 8 * 1024 * 1024
 _BLOCK_TILE_PRESETS = (
     (4, 1),
@@ -317,7 +302,7 @@ def iter_gemm_decode_configs(
     _validate_problem(m, n, k)
     get_decode_arch_traits(arch)
     if num_cus is None:
-        num_cus = _DEFAULT_CUS_BY_ARCH[arch]
+        num_cus = get_cu_num()
     if not isinstance(num_cus, int) or num_cus <= 0:
         raise ValueError(f"num_cus must be a positive integer, got {num_cus!r}")
 
@@ -527,11 +512,25 @@ def make_buffer_matrix(
     tensor,
     rows: int,
     columns: int,
+    row_stride=None,
 ):
+    """Buffer-backed ``rows x columns`` view of a row-major tensor.
+
+    ``row_stride`` is the distance between rows in elements, a runtime value for
+    an activation that is a slice of a wider tensor. Callers that pass it address
+    the view with an explicit row stride; the layout below only fixes the shape.
+    """
+    if row_stride is None:
+        num_records_bytes = rows * columns * BF16_BYTES
+    else:
+        # Bytes from the first to the last element of the strided matrix.
+        num_records_bytes = (
+            fx.Int64(fx.Int32(row_stride)) * fx.Int64(rows - 1) + fx.Int64(columns)
+        ) * fx.Int64(BF16_BYTES)
     buffer = fx.rocdl.make_buffer_tensor(
         tensor,
         max_size=False,
-        num_records_bytes=rows * columns * BF16_BYTES,
+        num_records_bytes=num_records_bytes,
     )
     return fx.make_view(
         fx.get_iter(buffer),
@@ -779,46 +778,14 @@ def reduce_wave_accumulator(accumulator, lane, contraction, reduction):
     return fx.Float32(lo) + fx.Float32(hi)
 
 
-def convert_bf16(value, element, rounding: OutputRounding):
-    if rounding == OutputRounding.RNE:
-        # Explicit rounding_mode lowers to constrained.fptrunc, which aborts
-        # AMDGPU ISA translation on FlyDSL 0.3.1. Default .to() is already RNE.
-        return fx.Float32(value).to(fx.BFloat16)
-    element = fx.Int32(element)
-    seed = (
-        (element * fx.Int32(0x45D9F3B))
-        ^ (element << fx.Int32(16))
-        ^ fx.Int32(0x27D4EB2D)
-    )
-    # FlyDSL has no bf16 stochastic-rounding wrapper, so call the LLVM intrinsic
-    # directly. It writes one half of a bf16 pair; the low half is selected.
-    old_pair = fx.Vector.filled(2, 0.0, fx.BFloat16)
-    converted = llvm.call_intrinsic(
-        T.vec(2, T.bf16),
-        "llvm.amdgcn.cvt.sr.bf16.f32",
-        [
-            old_pair.ir_value(),
-            fx.Float32(value).ir_value(),
-            seed.ir_value(),
-            fx.Boolean(False).ir_value(),
-        ],
-        [],
-        [],
-    )
-    return fx.Vector(converted)[0]
+def convert_bf16(value):
+    # Round to nearest even. An explicit rounding_mode lowers to
+    # constrained.fptrunc, which aborts AMDGPU ISA translation; .to() is RNE.
+    return fx.Float32(value).to(fx.BFloat16)
 
 
-def store_bf16(
-    value,
-    tensor,
-    row,
-    column,
-    row_stride: int,
-    rounding: OutputRounding,
-) -> None:
-    element = fx.Int32(row) * fx.Int32(row_stride) + fx.Int32(column)
-    output = convert_bf16(value, element, rounding)
-    tensor[row, column] = output
+def store_bf16(value, tensor, row, column) -> None:
+    tensor[row, column] = convert_bf16(value)
 
 
 def mfma_4x4x4_bf16(a_fragment, b_fragment, accumulator):
@@ -865,8 +832,14 @@ def masked_bf16_vector(
     width: int,
     row_size: int,
     cache_modifier: int = 0,
+    row_stride=None,
 ):
-    """Load a compile-time BF16 vector with safe N/K tail masking."""
+    """Load a compile-time BF16 vector with safe N/K tail masking.
+
+    ``row_size`` bounds the columns; ``row_stride`` (default ``row_size``) is the
+    distance between rows in elements.
+    """
+    row_stride = row_size if row_stride is None else row_stride
     zero = fx.BFloat16(0.0)
     values = []
     for offset in range_constexpr(width):
@@ -877,7 +850,7 @@ def masked_bf16_vector(
             tensor,
             row,
             safe_column,
-            row_size,
+            row_stride,
             cache_modifier,
         )
         values.append(valid.select(loaded, zero))

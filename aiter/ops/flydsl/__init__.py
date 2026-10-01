@@ -27,9 +27,7 @@ if _base_version < _MIN_FLYDSL_VERSION:
     )
 
 _LAZY_IMPORTS = {
-    "ActivationSource": (".gemm_kernels", "ActivationSource"),
     "BlockMfmaDecodeConfig": (".gemm_kernels", "BlockMfmaDecodeConfig"),
-    "ContractionMode": (".gemm_kernels", "ContractionMode"),
     "DecodeConfig": (".gemm_kernels", "DecodeConfig"),
     "FP8_MQA_LOGITS_DEFAULT_VARIANT": (
         ".fp8_mqa_logits_kernels",
@@ -39,11 +37,8 @@ _LAZY_IMPORTS = {
         ".fp8_mqa_logits_kernels",
         "KERNEL_VARIANTS",
     ),
-    "OutputRounding": (".gemm_kernels", "OutputRounding"),
     "QuickAllReduceInt4": (".quick_allreduce_int4", "QuickAllReduceInt4"),
-    "ReductionMode": (".gemm_kernels", "ReductionMode"),
     "WaveDecodeConfig": (".gemm_kernels", "WaveDecodeConfig"),
-    "compile_gemm_decode_bf16": (".gemm_kernels", "compile_gemm_decode_bf16"),
     "compute_varqlen_windows": (
         ".kernels.mqa_logits.pa_mqa_logits_fp4_prefill",
         "compute_varqlen_windows",
@@ -107,13 +102,6 @@ _LAZY_IMPORTS = {
         "gather_kv_b_proj_flydsl_supported",
     ),
     "gemm_decode_bf16": (".gemm_kernels", "gemm_decode_bf16"),
-    "gemm_decode_kernel_name": (".gemm_kernels", "gemm_decode_kernel_name"),
-    "get_decode_arch_traits": (".gemm_kernels", "get_decode_arch_traits"),
-    "iter_gemm_decode_configs": (".gemm_kernels", "iter_gemm_decode_configs"),
-    "parse_gemm_decode_kernel_name": (
-        ".gemm_kernels",
-        "parse_gemm_decode_kernel_name",
-    ),
     "pa_decode": (".pa_decode", "pa_decode"),
     "gather_kv_b_proj_flydsl_fp8_supported": (
         ".gather_kv_b_proj",
@@ -124,16 +112,11 @@ _LAZY_IMPORTS = {
 __all__ = [
     "FP8_MQA_LOGITS_DEFAULT_VARIANT",
     "FP8_MQA_LOGITS_VARIANTS",
-    "ActivationSource",
     "BlockMfmaDecodeConfig",
-    "ContractionMode",
     "DecodeConfig",
     "GateMode",
-    "OutputRounding",
     "QuickAllReduceInt4",
-    "ReductionMode",
     "WaveDecodeConfig",
-    "compile_gemm_decode_bf16",
     "compute_varqlen_windows",
     "flydsl_conv_implicit",
     "flydsl_flash_attn_fp8_func",
@@ -156,11 +139,7 @@ __all__ = [
     "gather_kv_b_proj_flydsl_fp8_supported",
     "gather_kv_b_proj_flydsl_supported",
     "gemm_decode_bf16",
-    "gemm_decode_kernel_name",
-    "get_decode_arch_traits",
-    "iter_gemm_decode_configs",
     "pa_decode",
-    "parse_gemm_decode_kernel_name",
 ]
 
 _fused_moe_impl_path = "aiter.ops.flydsl.fused_moe_gfx942:run_flydsl_moe_gfx942_impl"

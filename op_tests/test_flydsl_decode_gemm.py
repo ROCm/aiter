@@ -15,6 +15,7 @@ import argparse
 
 import pandas as pd
 import torch
+import torch.nn.functional as F
 
 import aiter
 import aiter.ops.flydsl.gemm_kernels as flydsl_gemm_kernels
@@ -60,7 +61,7 @@ def _bias(n: int) -> torch.Tensor:
     )
 
 
-def _reference(
+def run_torch(
     a: torch.Tensor,
     b: torch.Tensor,
     bias: torch.Tensor | None = None,
@@ -151,7 +152,7 @@ def _run_config(
     )
     torch.cuda.synchronize()
     assert returned is output
-    _assert_output(output, _reference(a, b, bias))
+    _assert_output(output, run_torch(a, b, bias))
 
 
 def check_wave_no_bias() -> None:
@@ -161,7 +162,7 @@ def check_wave_no_bias() -> None:
     returned = gemm_decode_bf16(a, b, output, _wave_config(m, k))
     torch.cuda.synchronize()
     assert returned is output
-    _assert_output(output, _reference(a, b))
+    _assert_output(output, run_torch(a, b))
 
 
 def check_wave_bias_and_odd_tails() -> None:
@@ -178,7 +179,7 @@ def check_wave_bias_and_odd_tails() -> None:
     )
     torch.cuda.synchronize()
     assert returned is output
-    _assert_output(output, _reference(a, b, bias))
+    _assert_output(output, run_torch(a, b, bias))
 
 
 def check_block_mfma_global() -> None:
@@ -216,32 +217,40 @@ def check_block_mfma_persistent_n() -> None:
 
 @benchmark()
 def test_gemm_decode(m, n, k, dtype):
-    a, b = _inputs(m, n, k)
-    output = _output(m, n)
-    config = _wave_config(m, k)
-    ref = a.float() @ b.float().T
+    """Time the deployed path against the previous default, rotating inputs.
 
-    candidates = {
-        "flydsl": lambda: gemm_decode_bf16(a, b, output, config),
-        "torch_mm": lambda: torch.mm(a, b.T),
-    }
+    `tgemm.mm` is what callers run: it looks up the tuned row and launches the
+    decode kernel it names. `F.linear` is what these shapes ran before the
+    decode rows existed. Tensors are passed to `run_perftest` so it can rotate
+    copies of them and the weight is not served from cache on every iteration.
+    Each candidate is timed with eager launches and under CUDA-graph replay, and
+    must match the reference with the same tolerance as the correctness cases.
+    """
+    a, b = _inputs(m, n, k)
+    ref = run_torch(a, b).to(dtypes.fp32)
+    row = get_GEMM_A16W16_config(m, n, k, False, str(dtype), str(dtype))
+    candidates = {"aiter_tuned": tgemm.mm, "torch_linear": F.linear}
     flops = 2 * m * n * k
     nbytes = (m * k + n * k + m * n) * a.element_size()
 
-    ret = {"gfx": ARCH}
+    ret = {"gfx": ARCH, "aiter row": row.get("kernelName") or row.get("libtype")}
     for name, fn in candidates.items():
-        out, us = run_perftest(fn)
+        out, us = run_perftest(fn, a, b, num_warmup=10)
+        _, us_graph = run_perftest(fn, a, b, num_warmup=10, testGraph=True)
         err = checkAllclose(
             ref,
             out.to(dtypes.fp32),
             rtol=RTOL,
             atol=ATOL,
-            msg=f"{name}: gemm_decode_bf16 {m}x{n}x{k} {dtype}",
+            msg=f"{name}: {m}x{n}x{k} {dtype}",
         )
+        assert err == 0, f"{name} mismatched the reference on {err:.2%} of elements"
         ret[f"{name} us"] = us
-        ret[f"{name} TFLOPS"] = flops / us / 1e6 if us else 0
+        ret[f"{name} graph us"] = us_graph
         ret[f"{name} TB/s"] = nbytes / us / 1e6 if us else 0
-        ret[f"{name} err"] = err
+    ret["TFLOPS (aiter graph)"] = (
+        flops / ret["aiter_tuned graph us"] / 1e6 if ret["aiter_tuned graph us"] else 0
+    )
     return ret
 
 
@@ -312,7 +321,7 @@ def check_tuned_rows_dispatch() -> None:
             assert (
                 calls["n"] == before + 1
             ), f"tgemm.mm did not route M={m} ({n},{k}) to the decode kernel"
-            _assert_output(out, _reference(a, b))
+            _assert_output(out, run_torch(a, b))
     finally:
         flydsl_gemm_kernels.gemm_decode_bf16 = real
     aiter.logger.info(
@@ -322,6 +331,55 @@ def check_tuned_rows_dispatch() -> None:
     )
 
 
+def _strided_layouts(a: torch.Tensor) -> dict[str, torch.Tensor]:
+    """The same values as ``a`` in layouts a caller can legally pass.
+
+    A column slice of a wider tensor (for example a fused projection output)
+    has a row stride above K; a size-1 row may carry any row stride.
+    """
+    m, k = a.shape
+    wide = torch.zeros((m, 2 * k + 3), device=a.device, dtype=a.dtype)
+    wide[:, 5 : 5 + k] = a
+    layouts = {"column slice": wide[:, 5 : 5 + k]}
+    if m == 1:
+        layouts["transposed column vector"] = a.reshape(k, 1).T
+    return layouts
+
+
+def check_strided_activation() -> None:
+    """A with a row stride above K gives the same C as packed A, bit for bit.
+
+    Covers both policies directly and the tuned path through `tgemm.mm`, with
+    no copy of A: the result must not depend on how A is laid out.
+    """
+    m_wave, m_block, k, n = 2, 3, 1536, 1536
+    cases = [
+        (m_wave, _wave_config(m_wave, k)),
+        (1, _wave_config(1, k)),
+        (m_block, _block_config(ActivationSource.GLOBAL, columns_per_wave=1)),
+        (m_block, _block_config(ActivationSource.FULL_LDS, columns_per_wave=1)),
+    ]
+    for m, config in cases:
+        a, b = _inputs(m, n, k)
+        packed = gemm_decode_bf16(a, b, _output(m, n), config)
+        _assert_output(packed, run_torch(a, b))
+        for name, view in _strided_layouts(a).items():
+            strided = gemm_decode_bf16(view, b, _output(m, n), config)
+            assert torch.equal(
+                strided, packed
+            ), f"{type(config).__name__} M={m}: {name} A differs from packed A"
+
+    rows = _shipped_decode_rows()
+    for key in rows[:1] + rows[-1:]:
+        m, n, k = key[2], key[3], key[4]
+        a, b = _inputs(m, n, k)
+        packed = tgemm.mm(a, b)
+        for name, view in _strided_layouts(a).items():
+            assert torch.equal(
+                tgemm.mm(view, b), packed
+            ), f"tgemm.mm M={m} ({n},{k}): {name} A differs from packed A"
+
+
 CORRECTNESS_CASES = (
     check_wave_no_bias,
     check_wave_bias_and_odd_tails,
@@ -329,6 +387,7 @@ CORRECTNESS_CASES = (
     check_block_mfma_lds_k_padding,
     check_block_mfma_persistent_n,
     check_tuned_rows_dispatch,
+    check_strided_activation,
 )
 
 
@@ -342,6 +401,19 @@ def _run_correctness_cases() -> None:
     for case in CORRECTNESS_CASES:
         aiter.logger.info("running %s", case.__name__)
         case()
+
+
+def _default_sweep_shapes() -> list[tuple[int, int, int]]:
+    """For each M, the smallest and the largest shipped decode shape."""
+    by_m = {}
+    for key in _shipped_decode_rows():
+        if key[5] is False:
+            by_m.setdefault(key[2], set()).add((key[2], key[3], key[4]))
+    shapes = []
+    for m in sorted(by_m):
+        ordered = sorted(by_m[m], key=lambda s: s[1] * s[2])
+        shapes += sorted({ordered[0], ordered[-1]})
+    return shapes
 
 
 def main():
@@ -371,30 +443,20 @@ def main():
         "--mnk",
         type=dtypes.str2tuple,
         nargs="*",
-        default=[
-            (1, 64, 128),
-            (3, 1536, 128),
-            (1, 896, 7168),
-        ],
-        help="""Shape of mnk. Tiny-K plus a large-K decode cell.
-    e.g.:   -s 1,64,128
-            --mnk 1,896,7168""",
+        default=None,
+        help="""Shape of mnk. Default: for each M, the smallest and the largest
+    shape that has a tuned decode row on this GPU.
+    e.g.:   -s 1,896,7168""",
     )
     args = parser.parse_args()
 
+    mnk = args.mnk or _default_sweep_shapes()
     for dtype in args.dtype:
         df = []
-        for m, n, k in args.mnk:
+        for m, n, k in mnk:
             if not 1 <= m <= 5:
                 aiter.logger.warning(
                     "gemm_decode_bf16 supports M in [1, 5]; skipping m=%s", m
-                )
-                continue
-            try:
-                _wave_config(m, k).validate(m=m, n=n, k=k, arch=ARCH)
-            except ValueError as err:
-                aiter.logger.warning(
-                    "gemm_decode_bf16 skipping %sx%sx%s: %s", m, n, k, err
                 )
                 continue
             df.append(test_gemm_decode(m, n, k, dtype))

@@ -87,7 +87,7 @@ from aiter.ops.flydsl.kernels.gemm_a16w16_kernel_gfx1250 import (
 )
 from aiter.ops.flydsl.kernels.kernels_common import run_cached
 from aiter.ops.flydsl.kernels.preshuffle_gemm import compile_preshuffle_gemm
-from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg, unused_tensor_arg
+from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 from aiter.ops.flydsl.mxfp8_128_bpreshuffle_gemm_gfx1250 import (
     BLOCK_K as SCALE_BLOCK_SIZE,
 )
@@ -632,7 +632,7 @@ def _compile_preshuffle_to_cache(
     )
     scale_a = torch.empty((max(m, 1),), device=dev, dtype=torch.float32)
     scale_b = torch.empty((max(n, 1),), device=dev, dtype=torch.float32)
-    bias = unused_tensor_arg(None, torch.empty(0, device=dev, dtype=out_torch_dtype))
+    bias = torch.empty(0, device=dev, dtype=out_torch_dtype)
     stream = fx.Stream(0)
 
     exe = compile_preshuffle_gemm(
@@ -872,11 +872,11 @@ def _compile_ptpc_wmma_to_cache(
 
     with compile_only_env():
         launch_gemm_a8w8(
-            ptr_arg(out),
-            ptr_arg(xq),
-            ptr_arg(wq),
-            ptr_arg(scale_a),
-            ptr_arg(scale_b),
+            _ptr_view_safe(out),
+            _ptr_view_safe(xq),
+            _ptr_view_safe(wq),
+            _ptr_view_safe(scale_a),
+            _ptr_view_safe(scale_b),
             m,
             stream,
             n,
@@ -942,11 +942,7 @@ def _compile_decode_to_cache(
         num_cus=cu_num,
         has_bias=has_bias,
     )
-    # Pass `bias` through as-is. The decode launcher rejects a non-None bias when
-    # it was compiled without bias support, and substitutes its own placeholder
-    # for the unused slot; wrapping it here in unused_tensor_arg() applied that
-    # substitution twice, so every bias-free row arrived as a real tensor and
-    # failed AOT with "This decode launcher was compiled without bias support."
+    # The launcher substitutes its own placeholder when bias is None.
     _compile_executable_to_cache(
         launcher,
         a,

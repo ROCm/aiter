@@ -72,8 +72,14 @@ def compile_gemm_decode_wave_bf16(
     arch: str,
     *,
     has_bias: bool = False,
+    strided_a: bool = False,
 ):
-    """Compile one exact shape/config with the architecture in the cache key."""
+    """Compile one exact shape/config with the architecture in the cache key.
+
+    ``strided_a`` compiles a variant that reads A's row stride at run time. The
+    packed variant keeps the stride a compile-time constant, so its code is
+    unchanged by stride support.
+    """
     config.validate(m=m, n=n, k=k, arch=arch)
     kernel_name = gemm_decode_kernel_name(
         arch,
@@ -93,6 +99,8 @@ def compile_gemm_decode_wave_bf16(
     # output columns in Y. Multi-row waves keep columns in X.
     use_column_grid_y = mp == 1
     store_lane = 63 if config.reduction == ReductionMode.DPP else 0
+    if strided_a:
+        kernel_name += "_sA"
     cache_tag = kernel_name
 
     @flyc.kernel(name=kernel_name, known_block_size=[64, 1, 1])
@@ -116,7 +124,8 @@ def compile_gemm_decode_wave_bf16(
         row_base = fx.Int32(
             fx.get_scalar(fx.crd2idx((row_block, fx.Int32(0)), row_owner_layout))
         )
-        a_global = make_buffer_matrix(A, m, k)
+        a_row_stride = fx.Int32(fx.get_scalar(A.stride[0])) if strided_a else k
+        a_global = make_buffer_matrix(A, m, k, a_row_stride if strided_a else None)
         b_global = make_buffer_matrix(B, n, k)
         c_global = make_buffer_matrix(C, m, n)
         if const_expr(has_bias):
@@ -151,7 +160,7 @@ def compile_gemm_decode_wave_bf16(
                         a_global,
                         row_base + fx.Int32(row),
                         k_base,
-                        k,
+                        a_row_stride,
                         kvec,
                     )
                     for row in range_constexpr(mp)
@@ -198,7 +207,7 @@ def compile_gemm_decode_wave_bf16(
                                 a_global,
                                 row_base + fx.Int32(row),
                                 k_base,
-                                k,
+                                a_row_stride,
                                 kvec,
                             )
                             for row in range_constexpr(mp)
@@ -241,6 +250,7 @@ def compile_gemm_decode_wave_bf16(
                     k_base,
                     kvec,
                     k,
+                    row_stride=a_row_stride,
                 )
                 for row in range_constexpr(mp)
             ]
@@ -287,8 +297,6 @@ def compile_gemm_decode_wave_bf16(
                         c_global,
                         row_base + fx.Int32(row),
                         columns[column],
-                        n,
-                        config.output_rounding,
                     )
 
     default_stream = fx.Stream(None)

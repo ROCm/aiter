@@ -716,7 +716,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
             except ImportError as exc:
                 logger.warning(f"FlyDSL {family.name} not available, skip: {exc}")
                 continue
-            rtol, atol = family.tuner_tolerance or _default_tol(outdtype)
+            rtol, atol = _default_tol(outdtype)
             for cand in candidates:
                 info = (
                     info_keys,
@@ -914,15 +914,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
             )
         gfx = self.get_gfx()
         cu_num = self.get_cu_num()
-        # Time every provider on the shared profiler path, which reports
-        # self_device_time_total (GPU kernel time) and excludes host launch
-        # gaps. Per-call wall clock charges each provider its own host launch
-        # cost, which differs between backends and therefore does not cancel
-        # when candidates are ranked against each other.
-        run_kwargs = {
-            "num_warmup": 10,
-            "num_iters": 101,
-        }
+        run_kwargs = {"num_warmup": 10, "num_iters": 101}
 
         task = []
         tasks_data = []
@@ -1000,10 +992,6 @@ class GemmA16W16Tuner(GemmCommonTuner):
             )
 
         return ret + hipblaslt_rets
-
-    def post_process(self, rets, args, topk=-1, fast_mode=False):
-        # Comparison-only vLLM rows must not win the tuned CSV.
-        return super().post_process(rets, args, topk, fast_mode)
 
     def result_to_df(self, results):
         resultdf = pd.DataFrame(columns=self.columns)
