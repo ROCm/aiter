@@ -165,5 +165,49 @@ def test_source_preserves_native_numerical_helpers_and_two_launches():
     assert "0x400000" not in SOURCE.read_text()
 
 
+def test_host_factory_defers_device_ir_and_uses_native_compiled_dispatch():
+    # These operations require an MLIR context, unavailable at host factory time.
+    # Inspect direct factory statements only: nested kernel/helper bodies are
+    # intentionally emitted later by FlyDSL and may build those operations.
+    tree = ast.parse(SOURCE.read_text())
+    factory = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "compile_tiny_m4"
+    )
+    for statement in factory.body:
+        if isinstance(statement, (ast.FunctionDef, ast.ClassDef)):
+            continue
+        for node in ast.walk(statement):
+            if isinstance(node, ast.Call):
+                name = (
+                    node.func.attr
+                    if isinstance(node.func, ast.Attribute)
+                    else (node.func.id if isinstance(node.func, ast.Name) else None)
+                )
+                assert name not in {"make_layout", "make_type", "_scale_mma_atoms"}
+    run = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "run"
+    )
+    calls = [node for node in ast.walk(run) if isinstance(node, ast.Call)]
+    compiled = [
+        node
+        for node in calls
+        if isinstance(node.func, ast.Name) and node.func.id == "_run_compiled"
+    ]
+    assert len(compiled) == 1
+    assert isinstance(compiled[0].args[0], ast.Name)
+    assert compiled[0].args[0].id == "launcher"
+    assert not any(
+        isinstance(node.func, ast.Name) and node.func.id == "launcher" for node in calls
+    )
+    assert not any(
+        isinstance(node, ast.Attribute) and node.attr == "cuda_stream"
+        for node in ast.walk(run)
+    )
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))

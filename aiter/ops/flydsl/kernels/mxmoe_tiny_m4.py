@@ -62,20 +62,18 @@ def compile_tiny_m4(*, down_n=128, down_waves=4):
 
     if (down_n, down_waves) not in ((128, 4), (256, 4), (128, 2)):
         raise ValueError("unsupported static M4 consumer tile")
-    vec4 = fx.make_layout(4, 1)
-    v4i = fx.Vector.make_type(4, fx.Int32)
-    v2f = fx.Vector.make_type(2, fx.Float32)
-    atoms = _scale_mma_atoms("fp4")
 
     def load4(arg, index):
-        fragment = fx.make_rmem_tensor(vec4, fx.Int32)
+        # Build device IR only while FlyDSL emits a kernel in its MLIR context.
+        fragment = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
+        v4i = fx.Vector.make_type(4, fx.Int32)
         fragment.store(
             fx.ptr_load(global_typed_ptr(arg, T.i32, 16) + index, result_type=v4i)
         )
         return fragment
 
     def zero_frag(dtype):
-        fragment = fx.make_rmem_tensor(vec4, dtype)
+        fragment = fx.make_rmem_tensor(fx.make_layout(4, 1), dtype)
         fragment.store(fx.Vector.filled(4, 0, dtype))
         return fragment
 
@@ -94,6 +92,8 @@ def compile_tiny_m4(*, down_n=128, down_waves=4):
         PART: fx.Int64,
         OUT: fx.Int64,
     ):
+        v4i = fx.Vector.make_type(4, fx.Int32)
+        atoms = _scale_mma_atoms("fp4")
         tid = fx.Int32(gpu.thread_id("x"))
         route = fx.Int32(gpu.block_id("y"))
         tile = fx.Int32(gpu.block_id("x"))
@@ -240,6 +240,9 @@ def compile_tiny_m4(*, down_n=128, down_waves=4):
         RW: fx.Int64,
         OUT: fx.Int64,
     ):
+        v4i = fx.Vector.make_type(4, fx.Int32)
+        v2f = fx.Vector.make_type(2, fx.Float32)
+        atoms = _scale_mma_atoms("fp4")
         tid = fx.Int32(gpu.thread_id("x"))
         lane, wave = tid % 64, tid // 64
         route = fx.Int32(gpu.block_id("y"))
@@ -440,6 +443,8 @@ def compile_tiny_m4(*, down_n=128, down_waves=4):
 def make_operator(*, weights, rows, down_n=128, down_waves=4):
     import torch
 
+    from .tensor_shim import _run_compiled
+
     if rows != 4:
         raise ValueError("this prepared specialization is exact M4 only")
     w1, w2, s1, s2 = (weights[key] for key in ("w1", "w2", "w1_scale", "w2_scale"))
@@ -508,8 +513,9 @@ def make_operator(*, weights, rows, down_n=128, down_waves=4):
                 raise ValueError(
                     "prepared M4 inputs must be contiguous on the weight device"
                 )
-            stream = torch.cuda.current_stream(w1.device).cuda_stream
-            launcher(
+            stream = torch.cuda.current_stream(w1.device)
+            _run_compiled(
+                launcher,
                 x.data_ptr(),
                 w1.data_ptr(),
                 s1.data_ptr(),
