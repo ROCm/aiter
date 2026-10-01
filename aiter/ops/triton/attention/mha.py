@@ -19,8 +19,7 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
-# gfx1250 gluon forward. Signature-compatible with `_attn_fwd`, so dispatch is a
-# callable swap at the launch site (same pattern as attention/pa_decode_sparse.py).
+# gfx1250 gluon forward, signature-compatible with `_attn_fwd`.
 _gluon_attn_fwd = None
 if arch_info.get_arch() == "gfx1250":
     try:
@@ -30,8 +29,7 @@ if arch_info.get_arch() == "gfx1250":
     except Exception:  # noqa: BLE001 - any import/compile issue falls back to Triton
         _gluon_attn_fwd = None
 
-# Escape hatch for benchmarking/debugging: 0 forces Triton, 1 forces gluon
-# (subject to the support gate below), unset auto-selects.
+# Escape hatch for benchmarking/debugging: 0 forces the Triton kernel.
 _MHA_GLUON_ENV = os.environ.get("AITER_TRITON_MHA_GLUON")
 
 _USE_FUSED_BWD_KERNEL = False
@@ -327,7 +325,7 @@ def _flash_attn_forward(
         fwd_impl = (
             _gluon_attn_fwd
             if _use_gluon_fwd(q, k, v, IS_FP8, config)
-            else _gluon_attn_fwd
+            else _attn_fwd
         )
 
         fwd_impl[grid](

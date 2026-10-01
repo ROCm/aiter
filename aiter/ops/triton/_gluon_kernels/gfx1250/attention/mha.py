@@ -13,14 +13,11 @@ from aiter.ops.triton.utils._triton.mha_kernel_utils import (
 
 @gluon.jit
 def _cdiv_fn(x, y):
-    # Mirrors _triton_kernels/attention/mha.py:_cdiv_fn. Both operands are
-    # non-negative here, so the truncating `//` is a true ceiling divide.
     return (x + y - 1) // y
 
 
 @gluon.jit
 def _attn_fwd_inner(
-    # Mirrors the parameter order of _triton_kernels/attention/mha.py::_attn_fwd_inner.
     acc,
     l_i,
     m_i,
@@ -58,7 +55,7 @@ def _attn_fwd_inner(
     IS_FP8: gl.constexpr,
     FP8_MAX: gl.constexpr,
     SLIDING_WINDOW: gl.constexpr,
-    # Gluon-only: the hand-rolled LDS pipeline and the layouts Triton infers.
+    # Gluon-only: the LDS pipeline buffers and the layouts Triton would infer.
     k_smem,
     k_pe_smem,
     v_smem,
@@ -73,9 +70,7 @@ def _attn_fwd_inner(
 ):
     RCP_LN2 = gl.constexpr(1.4426950408889634)
     HAS_PE: gl.constexpr = BLOCK_DMODEL_PE > 0
-    # Async ops issued per block. All wait counts derive from this so the
-    # bookkeeping stays in one place (getting it wrong reads a half-written
-    # LDS buffer silently, with no fault).
+    # Async loads issued per block; all wait counts derive from this.
     ASYNC_OPS: gl.constexpr = 3 if HAS_PE else 2
 
     for start_n in range(block_min, block_max, BLOCK_N):
@@ -106,14 +101,10 @@ def _attn_fwd_inner(
         # -- compute qk ----
         qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=QK_LAYOUT)
         if HAS_PE:
-            # PE contribution accumulates first, matching the Triton kernel's
-            # dot order so the two agree to fp32 rounding.
             qk = gl.amd.gfx1250.wmma(q_pe, k_pe, qk)
         qk = gl.amd.gfx1250.wmma(q, k, qk)
-        # Relabel into the PV layout so the softmax, the mask and `acc` all
-        # share one layout. Only the instruction K dim differs between the two,
-        # which does not affect the [M, N] accumulator distribution -- hence
-        # trivial. The assert is the canary if that ever stops being true.
+        # Relabel into the PV layout so the softmax, the mask and acc share one
+        # layout. Only the instruction K dim differs, so the relabel is trivial.
         qk = gl.convert_layout(qk, PV_LAYOUT, assert_trivial=True)
         if IS_FP8:
             qk = qk * (qk_scale * descale_q * descale_k)
@@ -125,8 +116,7 @@ def _attn_fwd_inner(
         if need_mask:
             mask = gl.full([BLOCK_M, BLOCK_N], 1, gl.int1, layout=PV_LAYOUT)
             if MASK_STEPS:
-                # Partial trailing tile. Applied unconditionally in this phase:
-                # it is a no-op for full tiles and avoids a branch.
+                # Mask the partial trailing tile (no-op for full tiles).
                 mask = mask & ((start_n + offs_n)[None, :] < seqlen_k)
             if IS_CAUSAL:
                 # Bottom-right aligned diagonal when seqlen_q != seqlen_k.
@@ -140,15 +130,12 @@ def _attn_fwd_inner(
             qk = gl.where(mask, qk, float("-inf"))
 
         if alibi_slope is not None:
-            # Distance from the diagonal, which stays bottom-right aligned when
-            # seqlen_q != seqlen_k (same alignment as the causal mask). The
-            # diagonal itself gets no penalty; it grows with distance.
-            # ``offs_m`` is already global; ``offs_n`` is tile-local.
+            # Penalty grows with distance from the diagonal, which is
+            # bottom-right aligned when seqlen_q != seqlen_k.
             relative_pos = (
                 offs_m[:, None] + seqlen_k - seqlen_q - (start_n + offs_n)[None, :]
             )
             alibi_block = -1 * alibi_slope * gl.abs(relative_pos)
-            # Added after the -inf masking: a finite bias leaves -inf intact.
             qk += alibi_block * RCP_LN2
 
         # get max scores so far
@@ -162,12 +149,10 @@ def _attn_fwd_inner(
             # exp2(-inf - -inf) = NaN. Zero those elements.
             p = gl.where(mask, p, 0.0)
 
-        # CAVEAT: l_ij must be summed before dropout is applied -- the LSE is
-        # the pre-dropout normalizer.
+        # CAVEAT: Must update l_ij before applying dropout
         l_ij = gl.sum(p, axis=1)
 
         if ENABLE_DROPOUT or RETURN_SCORES:
-            # Element (m, n) of the score matrix for this (batch, q head).
             sd_offs = (
                 offs_m[:, None] * stride_sd_m
                 + (start_n + offs_n)[None, :] * stride_sd_n
@@ -177,22 +162,15 @@ def _attn_fwd_inner(
             )[None, :]
 
         if ENABLE_DROPOUT:
-            # Philox is counter-based: the draw for element (m, n) depends only
-            # on the seed and that element's offset, so the mask is
-            # reproducible without storing it. `tl.rand` is a @triton.jit
-            # device helper -- it inlines into gluon and needs no gl.* port.
-            #
-            # NOTE: this diverges from the Triton kernel. Triton advances its
-            # philox pointer for the skipped blocks but not across the
-            # full/masked phase boundary, so its RNG stream repeats over the
-            # trailing blocks. Deriving the offset from `start_n` avoids that,
-            # at the cost of the two kernels drawing different masks.
+            # NOTE: the philox offset is derived from `start_n`, so the RNG
+            # stream (and therefore the dropout mask) differs from the Triton
+            # kernel's.
             keep = (
                 tl.rand(philox_seed, philox_base + sd_offs) > dropout_p
-            ) # TODO: use tl.randint for better performance
+            )  # TODO: use tl.randint for better performance
             gl.store(dm_ptr + sd_offs, keep.to(gl.float32), mask=p_mask)
-            # Dropped scores are returned negated so the caller can recover the
-            # mask from the sign.
+
+            # return scores with negative values for dropped vals
             gl.store(sd_ptr + sd_offs, gl.where(keep, p, -p), mask=p_mask)
             p = gl.where(keep, p, 0.0)
         elif RETURN_SCORES:
@@ -215,10 +193,6 @@ def _attn_fwd_inner(
         v = v_smem.index(buf).load(layout=v_layout)
 
         if IS_FP8:
-            # p is rescaled into the fp8 range per block, so the dot cannot
-            # accumulate into `acc` directly -- it runs into a fresh zero
-            # accumulator and the result is descaled before being added. Same
-            # shape as the Triton kernel's `acc += dot(...) * dp * dv`.
             scale_p, descale_p = _compute_fp8_scaling_factors(p, FP8_MAX)
             p_fp8 = gl.convert_layout((p * scale_p).to(v.dtype), p_layout)
             acc += (
@@ -244,9 +218,6 @@ def _attn_fwd_inner(
 
 
 _attn_fwd_repr = make_kernel_repr(
-    # Deliberately distinct from the Triton kernel's "_attn_fwd" so the two are
-    # distinguishable in profiles, cache dumps and logs -- the dispatch between
-    # them is otherwise silent.
     "_attn_fwd_gluon",
     [
         "IS_CAUSAL",
@@ -335,7 +306,6 @@ def _attn_fwd(
     SLIDING_WINDOW: gl.constexpr,
     HEAD_STRIDE_ALIGNED_8: gl.constexpr = False,
 ):
-    # ---- unsupported-feature gates ----
     gl.static_assert(SWIZZLE == "default", "gluon MHA: only the default swizzle")
 
     NUM_BLOCKS = (SEQLEN_Q + BLOCK_M - 1) // BLOCK_M
@@ -351,10 +321,8 @@ def _attn_fwd(
 
     HAS_PE: gl.constexpr = BLOCK_DMODEL_PE > 0
 
-    # Head dim not a power of two: the tiles are BLOCK_DMODEL_POW2 wide and the
-    # trailing columns carry no data. Q is zero-masked at the load, K/V are
-    # zero-filled by the TDM descriptor bound (CDNA5 descriptors pad with zero),
-    # and the O store drops them again.
+    # Non-pow2 head dim: Q is zero-masked at the load, K/V are zero-filled by
+    # the TDM descriptor bound, and the O store drops the trailing columns.
     PADDED_HEAD: gl.constexpr = BLOCK_DMODEL != BLOCK_DMODEL_POW2
 
     NUM_WARPS: gl.constexpr = gl.num_warps()
@@ -431,7 +399,6 @@ def _attn_fwd(
         stride_descale_v_z = stride_descale_v_z_in
         philox_offset_base = philox_offset_base_in
 
-    # ---- layouts: ONE mma layout, M-split, shared by QK and PV ----
     if NUM_WARPS == 1:
         warp_bases: gl.constexpr = []
     elif NUM_WARPS == 2:
@@ -441,11 +408,9 @@ def _attn_fwd(
     else:
         warp_bases: gl.constexpr = [[1, 0], [2, 0], [4, 0]]
 
-    # Two MMA layouts, one per dot. FP8 WMMA reduces a deeper K per instruction,
-    # and the two dots reduce over different extents -- QK over the head dim, PV
-    # over BLOCK_N -- so their instruction shapes can differ. In bf16 both are
-    # [16, 16, 32] and the pair collapses to a single layout, which is why the
-    # QK->PV relabel in the inner loop is a no-op there (and asserted as such).
+    # Two MMA layouts, one per dot: QK reduces over the head dim and PV over
+    # BLOCK_N, so their instruction K shapes can differ under fp8. In bf16 both
+    # are [16, 16, 32] and the QK->PV relabel in the inner loop is a no-op.
     K_WIDTH: gl.constexpr = 16 if IS_FP8 else 8
     QK_INSTR_K: gl.constexpr = (128 if BLOCK_DMODEL_POW2 > 64 else 64) if IS_FP8 else 32
     PV_INSTR_K: gl.constexpr = (128 if BLOCK_N > 64 else 64) if IS_FP8 else 32
@@ -578,7 +543,7 @@ def _attn_fwd(
 
             return
 
-    # ---- Q: loaded once, straight into registers ----
+    # Q is loaded once, straight into registers.
     offs_m_q = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, blocked_q))
     offs_d_q = gl.arange(0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(0, blocked_q))
     q_base = (
@@ -597,8 +562,7 @@ def _attn_fwd(
     q = gl.convert_layout(q, q_layout)
 
     if HAS_PE:
-        # The PE columns sit immediately after the BLOCK_DMODEL data columns of
-        # the same Q tensor, so this is one more strided load, not a new tensor.
+        # The PE columns sit immediately after the BLOCK_DMODEL columns of Q.
         PE_SIZE_DIV: gl.constexpr = BLOCK_DMODEL_PE // SIZE_PER_THREAD
         blocked_q_pe: gl.constexpr = gl.BlockedLayout(
             size_per_thread=[1, SIZE_PER_THREAD],
@@ -622,15 +586,11 @@ def _attn_fwd(
     else:
         q_pe = None
 
-    # ---- K/V: TDM descriptors bounded by this sequence's length ----
-    # The per-sequence `shape` bound removes the OOB row mask from the loads;
-    # trailing rows of a partial tile are zero-filled and masked out of the
-    # scores anyway. Requires the head-dim stride to be 1 (checked by caller).
+    # K/V TDM descriptors: rows past seqlen_k and columns past BLOCK_DMODEL are
+    # zero-filled by the descriptor, so the loads need no OOB masks. Requires
+    # the head-dim stride to be 1 (checked by the caller).
     k_base = off_z * stride_kz + off_k_head * stride_kh + cu_seqlens_k_start * stride_kn
     v_base = off_z * stride_vz + off_k_head * stride_vh + cu_seqlens_k_start * stride_vn
-    # `shape` is the real extent in both axes: rows past seqlen_k and columns
-    # past BLOCK_DMODEL are zero-filled by the descriptor, which is what makes
-    # the OOB row mask and the padded-head column mask unnecessary here.
     k_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=k_ptr + k_base,
         shape=[seqlen_k, BLOCK_DMODEL],
@@ -666,7 +626,6 @@ def _attn_fwd(
         k_pe_desc = None
         k_pe_smem = None
 
-    # ---- accumulators ----
     if ENABLE_SINK:
         RCP_LN2 = gl.constexpr(1.4426950408889634)
         m_i_value = gl.load(sink_ptr + off_q_head).to(gl.float32) * RCP_LN2
@@ -680,7 +639,6 @@ def _attn_fwd(
     )
     acc = gl.zeros([BLOCK_M, BLOCK_DMODEL_POW2], dtype=gl.float32, layout=PV_LAYOUT)
 
-    # ---- fp8 per-tensor descale factors ----
     if IS_FP8:
         descale_q = gl.load(descale_q_ptr + off_z * stride_descale_q_z + off_q_head)
         descale_k = gl.load(descale_k_ptr + off_z * stride_descale_k_z + off_k_head)
@@ -690,10 +648,7 @@ def _attn_fwd(
         descale_k = 1.0
         descale_v = 1.0
 
-    # ---- s_dmask / dropout: base offset for this (batch, q head) ----
-    # s_dmask is allocated whenever scores are returned *or* dropout is on, so
-    # the gate is the pointer itself rather than RETURN_SCORES (mirrors the
-    # Triton kernel).
+    # s_dmask (return_scores) / dropout
     sd_base = off_z * stride_sd_z + off_q_head * stride_sd_h
     if s_dmask_ptr is not None:
         sd_ptr = s_dmask_ptr + sd_base
@@ -706,7 +661,7 @@ def _attn_fwd(
         dm_ptr = None
         philox_base = 0
 
-    # ---- alibi: one scalar slope per (batch, q head) ----
+    # alibi slopes
     if alibi_slopes_ptr is not None:
         alibi_slope = gl.load(
             alibi_slopes_ptr + off_z * stride_alibi_z + off_q_head * stride_alibi_h
@@ -714,7 +669,7 @@ def _attn_fwd(
     else:
         alibi_slope = None
 
-    # ---- full / masked block split (mirrors _attn_fwd) ----
+    # Here we compute how many full and masked blocks we have.
     n_extra_tokens = 0
     if seqlen_k < BLOCK_N:
         n_extra_tokens = BLOCK_N - seqlen_k
@@ -756,9 +711,8 @@ def _attn_fwd(
     gl.amd.gfx1250.tdm.async_load(v_desc, [block_min, 0], v_smem.index(0))
     buf: gl.int32 = 0
 
-    # n_blocks == 0 only for a zero-length KV sequence (varlen). Fall through
-    # with acc=0, l_i=1, m_i=-inf so the epilogue emits out=0 / lse=-inf, which
-    # is what the Triton kernel produces for that case.
+    # n_blocks == 0 only for a zero-length KV sequence (varlen); fall through
+    # so the epilogue emits out=0 / lse=-inf.
     if n_blocks > 0:
         if block_full_end > block_min:
             acc, l_i, m_i, buf = _attn_fwd_inner(
@@ -917,21 +871,18 @@ def _attn_fwd(
 
     gl.amd.gfx1250.tdm.async_wait(0)
 
-    # ---- epilogue ----
-    # Reciprocal on l_i (BLOCK_M) rather than acc (BLOCK_M x D) so the compiler's
-    # Newton-Raphson runs on the small tensor.
+    # epilogue
+    # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.
     acc = acc * (1.0 / l_i[:, None])
     if ENABLE_DROPOUT:
-        # The surviving scores carry the full row mass, so scale back up. LSE is
-        # deliberately left alone -- it is the pre-dropout normalizer.
         acc = acc * (1.0 / (1.0 - dropout_p))
 
     start_m_idx = start_m * BLOCK_M
     end_m_idx = (start_m + 1) * BLOCK_M
     causal_start_idx = seqlen_q - seqlen_k
     if IS_CAUSAL:
-        # Rows entirely above the diagonal softmax'd a row of -inf -> NaN.
-        # They should be zero.
+        # Rows fully above the diagonal softmax'd a row of all -infs (NaN);
+        # they should be zero.
         if causal_start_idx > start_m_idx and causal_start_idx < end_m_idx:
             acc = gl.where(offs_m[:, None] >= causal_start_idx, acc, 0.0)
 
