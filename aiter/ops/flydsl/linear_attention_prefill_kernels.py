@@ -17,6 +17,7 @@ import itertools
 import math
 import os
 import warnings
+from collections import OrderedDict
 from collections.abc import Sequence
 
 # NOTE: ``get_rocm_arch`` is side-effect-free and does NOT raise on
@@ -303,8 +304,10 @@ def _tuned_bv(
 _INT32_ATTR = "_flydsl_int32_view"
 _PROLOGUE_ATTR = "_flydsl_prologue_cache"
 _ADAPTIVE_K5_META_ATTR = "_aiter_gdn_k5_adaptive_meta"
-# Keeps dense offsets alive so the attribute cache above can hit.
-_DENSE_K5_OFFSETS = {}
+# Keeps dense offsets alive so the attribute cache above can hit; LRU-bounded
+# because each tensor retains its uploaded schedule.
+_DENSE_K5_OFFSETS_MAX = 32
+_DENSE_K5_OFFSETS = OrderedDict()
 
 
 def _as_int32(t: torch.Tensor) -> torch.Tensor:
@@ -413,10 +416,14 @@ def _resolve_adaptive_k5_metadata(
         lengths = _gdn_k5_sequence_lengths(cu_seqlens, T)
     if cu_seqlens is None:
         key = (device, T)
-        if key not in _DENSE_K5_OFFSETS:
+        if key in _DENSE_K5_OFFSETS:
+            _DENSE_K5_OFFSETS.move_to_end(key)
+        else:
             _DENSE_K5_OFFSETS[key] = torch.tensor(
                 [0, T], device=device, dtype=torch.int32
             )
+            if len(_DENSE_K5_OFFSETS) > _DENSE_K5_OFFSETS_MAX:
+                _DENSE_K5_OFFSETS.popitem(last=False)
         cu_seqlens = _DENSE_K5_OFFSETS[key]
     cache_key = (64, 0, 0, T, lengths, target_segments)
     version = _tensor_version(cu_seqlens)

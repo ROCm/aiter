@@ -642,7 +642,7 @@ def ref_chunk_gated_delta_rule_fwd_h(
 
 @benchmark()
 def test_chunk_gdn_prefill_h_blocked(
-    case_name, context_lens, state_dtype=torch.float32
+    case_name, context_lens, state_dtype=torch.float32, dense=False, use_h0=True
 ):
     """Check cross-block state coupling and empty requests."""
     case = PrefillArgs(
@@ -653,6 +653,7 @@ def test_chunk_gdn_prefill_h_blocked(
         tp=1,
         full_prompt_len=max(context_lens),
         model_name="K5-blocked",
+        is_varlen=not dense,
         max_num_batched_tokens=sum(context_lens),
         context_lens=list(context_lens),
         trace_tag=case_name,
@@ -663,6 +664,8 @@ def test_chunk_gdn_prefill_h_blocked(
     k, w_orig, u_orig, w_c, u_c, g, h0, cu = _make_inputs(
         case, context_lens, stable_coupling=True
     )
+    if not use_h0:
+        h0 = None  # exercises the use_initial_state=False specialization
     # Production and oracle gates use log2 and natural-log scales, respectively.
     g_log2 = g * math.log2(math.e)
     metadata = _build_prefill_metadata(context_lens, cu, build_blocks=True)
@@ -696,11 +699,14 @@ def test_chunk_gdn_prefill_h_blocked(
     total_chunks = sum(ceildiv(length, case.BT) for length in context_lens)
     flops = 4 * total_chunks * case.BT * case.H * case.K * case.V
     nbytes = sum(
-        tensor.numel() * tensor.element_size() for tensor in (k, w_c, u_c, g_log2, h0)
+        tensor.numel() * tensor.element_size()
+        for tensor in (k, w_c, u_c, g_log2, h0)
+        if tensor is not None
     )
     nbytes += u_c.numel() * u_c.element_size()
     nbytes += total_chunks * case.H * case.V * case.K * k.element_size()
-    nbytes += h0.numel() * h0.element_size()
+    if h0 is not None:
+        nbytes += h0.numel() * h0.element_size()
     ret = {"gfx": get_gfx_runtime()}
     for name, fn in candidates.items():
         (h, vn, fs), us = run_perftest(fn)
@@ -727,7 +733,7 @@ def test_chunk_gdn_prefill_h_blocked(
                 msg=f"{case_name}: K5 final_state",
             ),
         )
-        if 0 in context_lens:
+        if 0 in context_lens and h0 is not None:
             empty_idx = context_lens.index(0)
             assert torch.equal(
                 fs[empty_idx], h0[empty_idx]
@@ -1016,6 +1022,9 @@ def main():
             ("empty_sequence", [8192, 0]),
             ("two_requests", [8257, 4097]),
             ("two_requests_bf16", [8257, 4097], torch.bfloat16),
+            # dense B=1: synthetic [0, T] offsets path; no-h0: USE_INITIAL_STATE=False
+            ("dense_single", [8257], torch.float32, True),
+            ("no_h0_two_requests", [8257, 4097], torch.float32, False, False),
         ]
         df = pd.DataFrame([test_chunk_gdn_prefill_h_blocked(*case) for case in cases])
         aiter.logger.info(
