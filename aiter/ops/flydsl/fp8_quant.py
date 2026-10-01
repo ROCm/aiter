@@ -3,6 +3,7 @@
 
 """Native gfx1201 Q/K/V FP8 quantization for FlyDSL flash attention."""
 
+import warnings
 from functools import lru_cache
 
 import torch
@@ -71,24 +72,38 @@ def flydsl_fp8_quant(
             f"FWHT rotation requires a power-of-two head_dim, got {head_dim}; "
             "pass rotation=False to quantize without rotation"
         )
+    if not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous()):
+        warnings.warn(
+            "flydsl_fp8_quant materializes non-contiguous Q/K/V inputs; "
+            "provide contiguous tensors to avoid the copy",
+            stacklevel=2,
+        )
+        q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
 
     # Same-shape D64 BSHD inputs share one 96-thread workgroup per row: wave 0
     # quantizes Q, wave 1 K, and wave 2 V. Cross-attention and all other shapes
     # use the per-tensor implementation.
     if head_dim == 64 and q.shape == k.shape == v.shape:
         return flydsl_fp8_qkv_d64_quant(q, k, v, rotate=rotation)
+    padded_dim = 1 << (head_dim - 1).bit_length()
+    if head_dim not in (64, 128, 256, 512, 1024):
+        if padded_dim > 1024:
+            raise ValueError(
+                f"native FP8 quant has no packed specialization for head_dim={head_dim}"
+            )
+        warnings.warn(
+            f"flydsl_fp8_quant pads head_dim={head_dim} to {padded_dim} for "
+            "the native packed quantizer; use a supported power-of-two head "
+            "dimension to avoid the materialization",
+            stacklevel=2,
+        )
 
     def quant_one(x: torch.Tensor, *, do_rotate: bool):
         if head_dim in (64, 128, 256, 512, 1024):
             return flydsl_fp8_pertensor_quant(x, rotate=do_rotate)
 
         # Non-power-of-two dimensions use the unrotated packed specializations.
-        padded_dim = 1 << (head_dim - 1).bit_length()
-        if padded_dim > 1024:
-            raise ValueError(
-                f"native FP8 quant has no packed specialization for head_dim={head_dim}"
-            )
-        padded = F.pad(x.contiguous(), (0, padded_dim - head_dim))
+        padded = F.pad(x, (0, padded_dim - head_dim))
         quantized, scale = flydsl_fp8_pertensor_quant(padded, rotate=False)
         return quantized[..., :head_dim].contiguous(), scale
 

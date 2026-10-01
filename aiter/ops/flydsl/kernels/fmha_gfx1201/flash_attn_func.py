@@ -17,13 +17,11 @@ from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import Vector as Vec
 
 from ..kernels_common import LOG2E as _LOG2E
-from ..tensor_shim import _run_compiled
+from ..tensor_shim import _run_compiled, buf_base_i64
 from .flash_attn_func_common import (
     flatten_scores,
     kv_load_schedule,
     mask_scores,
-    pointer_arg,
-    wrap_pointer_args,
 )
 
 NUM_PREFETCH_K = 1
@@ -156,10 +154,10 @@ def build_flash_attn_func_module(
 
     @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
     def flash_attn_func_kernel(
-        Q: fx.Pointer,
-        K: fx.Pointer,
-        V: fx.Pointer,
-        O: fx.Pointer,
+        Q: fx.Tensor,
+        K: fx.Tensor,
+        V: fx.Tensor,
+        O: fx.Tensor,
         seq_len: fx.Int32,
         seq_len_kv_real: fx.Int32,
         seq_len_kv: fx.Int32,
@@ -169,11 +167,12 @@ def build_flash_attn_func_module(
         def _fmax(a, b):
             return fx.Float32(a).maximumf(fx.Float32(b))
 
-        def _as_elem_ptr(ptr):
-            return fx.recast_iter(
-                fx.PointerType.get(elem_dtype.ir_type, ptr.address_space),
-                ptr,
+        def _as_elem_ptr(tensor):
+            ptr_ty = fx.PointerType.get(
+                elem_dtype.ir_type,
+                address_space=fx.AddressSpace.Global,
             )
+            return fx.inttoptr(ptr_ty, buf_base_i64(tensor))
 
         q_elem_ptr = _as_elem_ptr(Q)
         k_elem_ptr = _as_elem_ptr(K)
@@ -659,10 +658,10 @@ def build_flash_attn_func_module(
 
     @flyc.jit
     def launch_flash_attn_func(
-        Q: fx.Pointer,
-        K: fx.Pointer,
-        V: fx.Pointer,
-        O: fx.Pointer,
+        Q: fx.Tensor,
+        K: fx.Tensor,
+        V: fx.Tensor,
+        O: fx.Tensor,
         batch_size: fx.Int32,
         seq_len: fx.Int32,
         seq_len_kv_real: fx.Int32,
@@ -713,7 +712,6 @@ def build_flash_attn_func_module(
     launch_flash_attn_func.compile_hints = dict(_fmha_compile_hints)
 
     def _launch(*args, **kwargs):
-        args, kwargs = wrap_pointer_args(args, kwargs, range(4), ("Q", "K", "V", "O"))
         stream = kwargs.pop("stream", fx.Stream(None))
         _run_compiled(launch_flash_attn_func, *args, stream)
 
@@ -730,10 +728,10 @@ def build_flash_attn_func_module(
     ):
         return flyc.compile(
             launch_flash_attn_func,
-            pointer_arg(Q),
-            pointer_arg(K),
-            pointer_arg(V),
-            pointer_arg(O),
+            Q,
+            K,
+            V,
+            O,
             batch_size,
             seq_len,
             seq_len_kv_real,

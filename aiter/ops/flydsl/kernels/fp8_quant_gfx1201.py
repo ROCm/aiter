@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Fully FlyDSL per-tensor FP8 (e4m3) quantization with optional Hadamard rotation.
+"""FlyDSL per-tensor FP8 (e4m3) quantization with optional Hadamard rotation.
 
 gfx1201 / RDNA4, wave32. One wave (32 lanes) owns one row (= one token-head,
 ``head_dim`` elements); each lane holds ``VEC = head_dim // 32`` contiguous
@@ -41,7 +41,7 @@ from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import Stream
 
-from .tensor_shim import _run_compiled
+from .tensor_shim import _run_compiled, buf_copy_load, buf_copy_store, ptr_buf_tensor
 
 BLOCK_THREADS = 32  # 1 wave32
 _FP8_MAX = 448.0  # e4m3fn max normal (gfx1201 native fp8)
@@ -93,23 +93,24 @@ def _build_kernel(*, head_dim: int, rotate: bool, mode: str):
 
     @flyc.kernel(name=_kname, known_block_size=[BLOCK_THREADS, 1, 1])
     def kernel(
-        x_in: fx.Pointer,  # [M, D] bf16, contiguous
-        x_out: fx.Pointer,  # [M, D] fp8 (scale mode); unused (amax mode)
-        scale_io: fx.Pointer,  # amax: [M] f32 out partials; scale: [1] f32 in descale
+        x_in: fx.Tensor,  # [M, D] bf16, contiguous
+        x_out: fx.Tensor,  # [M, D] fp8 (scale mode); unused (amax mode)
+        scale_io: fx.Tensor,  # amax: [M] f32 out partials; scale: [1] f32 in descale
     ):
         # One wave per row; grid is exactly M blocks so no bounds guard on M.
         row = fx.block_idx.x  # one wave per row
         tid = fx.thread_idx.x  # 0..31 lane
         row_idx = fx.Int64(row)
+        x_i32 = ptr_buf_tensor(x_in, fx.Int32, unit_elems=VEC // 2, unit_stride=1)
+        out_i32 = ptr_buf_tensor(x_out, fx.Int32)
+        scale_f32 = ptr_buf_tensor(scale_io, fx.Float32)
 
         # ---- load VEC bf16 for this lane: elems [row*D + tid*VEC, +VEC) ----
         row_off_elems = row_idx * D + fx.Int64(tid) * VEC
         row_off_dw = fx.Int32(row_off_elems // 2)
-        x_raw = (
-            (fx.recast_iter(fx.Int32, x_in) + row_off_dw)
-            .view(fx.make_layout(VEC // 2, 1))
-            .load()
-        )
+        x_raw = buf_copy_load(x_i32, row_off_dw, unit_elems=VEC // 2)
+        if const_expr(VEC == 2):
+            x_raw = fx.Vector.from_elements([x_raw], fx.Int32)
         x_bf16 = fx.Vector(x_raw).bitcast(fx.BFloat16)
         xf = [x_bf16[p].to(fx.Float32) for p in range_constexpr(VEC)]
 
@@ -150,11 +151,11 @@ def _build_kernel(*, head_dim: int, rotate: bool, mode: str):
                 peer = am.shuffle_xor(off, BLOCK_THREADS)
                 am = am.maximumf(peer)
             if tid == fx.Int32(0):
-                fx.recast_iter(fx.Float32, scale_io)[fx.Int32(row)] = am
+                buf_copy_store(scale_f32, fx.Int32(row), am, elem=fx.Float32)
             return
 
         # mode == "scale": read the single global descale (all lanes broadcast).
-        scale = fx.recast_iter(fx.Float32, scale_io).load()
+        scale = buf_copy_load(scale_f32, fx.Int32(0), elem=fx.Float32)
         inv_scale = fx.Float32(1.0) / scale
 
         # Scale, clamp, then pack to FP8.
@@ -174,8 +175,10 @@ def _build_kernel(*, head_dim: int, rotate: bool, mode: str):
             peer_pk = fx.Int32(pk).shuffle_xor(1, BLOCK_THREADS)
             if tid % fx.Int32(2) == fx.Int32(0):
                 out_off_dw = fx.Int32(row_idx * (D // 4) + tid // fx.Int32(2))
-                fx.recast_iter(fx.Int32, x_out)[out_off_dw] = fx.Int32(pk) | (
-                    fx.Int32(peer_pk) << fx.Int32(16)
+                buf_copy_store(
+                    out_i32,
+                    out_off_dw,
+                    fx.Int32(pk) | (fx.Int32(peer_pk) << fx.Int32(16)),
                 )
         else:
             for dword_idx in range_constexpr(VEC // 4):
@@ -195,13 +198,13 @@ def _build_kernel(*, head_dim: int, rotate: bool, mode: str):
                     1,
                 )
                 out_off_dw = fx.Int32(row_off_elems // 4 + dword_idx)
-                fx.recast_iter(fx.Int32, x_out)[out_off_dw] = pk
+                buf_copy_store(out_i32, out_off_dw, pk)
 
     @flyc.jit
     def launch(
-        x_in: fx.Pointer,
-        x_out: fx.Pointer,
-        scale_io: fx.Pointer,
+        x_in: fx.Tensor,
+        x_out: fx.Tensor,
+        scale_io: fx.Tensor,
         M: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
@@ -239,13 +242,13 @@ def _build_qkv_d64_kernel(*, rotate: bool, mode: str):
 
     @flyc.kernel(name=_kname, known_block_size=[96, 1, 1])
     def kernel(
-        q_in: fx.Pointer,
-        k_in: fx.Pointer,
-        v_in: fx.Pointer,
-        q_out: fx.Pointer,
-        k_out: fx.Pointer,
-        v_out: fx.Pointer,
-        partials_or_scales: fx.Pointer,
+        q_in: fx.Tensor,
+        k_in: fx.Tensor,
+        v_in: fx.Tensor,
+        q_out: fx.Tensor,
+        k_out: fx.Tensor,
+        v_out: fx.Tensor,
+        partials_or_scales: fx.Tensor,
         M: fx.Int32,
     ):
         row = fx.block_idx.x
@@ -253,18 +256,22 @@ def _build_qkv_d64_kernel(*, rotate: bool, mode: str):
         wave = tid // fx.Int32(32)
         lane = tid % fx.Int32(32)
         row_idx = fx.Int64(row)
+        q_in_i32 = ptr_buf_tensor(q_in, fx.Int32)
+        k_in_i32 = ptr_buf_tensor(k_in, fx.Int32)
+        v_in_i32 = ptr_buf_tensor(v_in, fx.Int32)
+        q_out_i32 = ptr_buf_tensor(q_out, fx.Int32)
+        k_out_i32 = ptr_buf_tensor(k_out, fx.Int32)
+        v_out_i32 = ptr_buf_tensor(v_out, fx.Int32)
+        partials_or_scales_f32 = ptr_buf_tensor(partials_or_scales, fx.Float32)
 
         # This helper is called only from wave-uniform branches below. In
         # particular, use lane (not workgroup tid) for all row-local offsets and
         # wave shuffles: wave 1/2 otherwise address and shuffle the wrong row.
-        def process(x_in, x_out, partials_io, row_count, do_rotate):
+        def process(x_in_i32, x_out_i32, row_count, do_rotate):
             row_off_elems = row_idx * D + fx.Int64(lane) * VEC
             row_off_dw = fx.Int32(row_off_elems // 2)
-            x_raw = (
-                (fx.recast_iter(fx.Int32, x_in) + row_off_dw)
-                .view(fx.make_layout(1, 1))
-                .load()
-            )
+            x_raw = buf_copy_load(x_in_i32, row_off_dw)
+            x_raw = fx.Vector.from_elements([x_raw], fx.Int32)
             x_bf16 = fx.Vector(x_raw).bitcast(fx.BFloat16)
             x0 = x_bf16[0].to(fx.Float32)
             x1 = x_bf16[1].to(fx.Float32)
@@ -297,9 +304,14 @@ def _build_qkv_d64_kernel(*, rotate: bool, mode: str):
                     am = am.maximumf(am.shuffle_xor(off, 32))
                 if lane == fx.Int32(0):
                     partial_idx = fx.Int64(wave) * fx.Int64(row_count) + row_idx
-                    fx.recast_iter(fx.Float32, partials_io)[fx.Int32(partial_idx)] = am
+                    buf_copy_store(
+                        partials_or_scales_f32,
+                        fx.Int32(partial_idx),
+                        am,
+                        elem=fx.Float32,
+                    )
             else:
-                scale = fx.recast_iter(fx.Float32, partials_io)[wave]
+                scale = buf_copy_load(partials_or_scales_f32, wave, elem=fx.Float32)
                 inv_scale = fx.Float32(1.0) / scale
                 c_max = fx.Float32(_FP8_MAX)
                 c_min = fx.Float32(-_FP8_MAX)
@@ -316,26 +328,28 @@ def _build_qkv_d64_kernel(*, rotate: bool, mode: str):
                 peer_pk = fx.Int32(pk).shuffle_xor(1, 32)
                 if lane % fx.Int32(2) == fx.Int32(0):
                     out_off_dw = fx.Int32(row_idx * (D // 4) + lane // fx.Int32(2))
-                    fx.recast_iter(fx.Int32, x_out)[out_off_dw] = fx.Int32(pk) | (
-                        fx.Int32(peer_pk) << fx.Int32(16)
+                    buf_copy_store(
+                        x_out_i32,
+                        out_off_dw,
+                        fx.Int32(pk) | (fx.Int32(peer_pk) << fx.Int32(16)),
                     )
 
         if wave == fx.Int32(0):
-            process(q_in, q_out, partials_or_scales, M, rotate)
+            process(q_in_i32, q_out_i32, M, rotate)
         elif wave == fx.Int32(1):
-            process(k_in, k_out, partials_or_scales, M, rotate)
+            process(k_in_i32, k_out_i32, M, rotate)
         else:
-            process(v_in, v_out, partials_or_scales, M, False)
+            process(v_in_i32, v_out_i32, M, False)
 
     @flyc.jit
     def launch(
-        q_in: fx.Pointer,
-        k_in: fx.Pointer,
-        v_in: fx.Pointer,
-        q_out: fx.Pointer,
-        k_out: fx.Pointer,
-        v_out: fx.Pointer,
-        partials_or_scales: fx.Pointer,
+        q_in: fx.Tensor,
+        k_in: fx.Tensor,
+        v_in: fx.Tensor,
+        q_out: fx.Tensor,
+        k_out: fx.Tensor,
+        v_out: fx.Tensor,
+        partials_or_scales: fx.Tensor,
         M: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
@@ -361,13 +375,11 @@ def flydsl_fp8_qkv_d64_quant(
 ):
     """Fused same-shape D64 Q/K/V FP8 producer with three independent scales."""
     assert q.shape == k.shape == v.shape and q.shape[-1] == 64
-
-    def _ptr(t, dtype):
-        return flyc.from_c_void_p(dtype, t.data_ptr())
+    if not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous()):
+        raise ValueError("flydsl_fp8_qkv_d64_quant requires contiguous Q/K/V")
 
     stream = torch.cuda.current_stream(q.device)
     with torch.cuda.device(q.device), torch.cuda.stream(stream):
-        q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
         M = q.numel() // 64
         q8 = torch.empty_like(q, dtype=_FP8_DTYPE)
         k8 = torch.empty_like(k, dtype=_FP8_DTYPE)
@@ -381,13 +393,13 @@ def flydsl_fp8_qkv_d64_quant(
         )
         _run_compiled(
             amax_k,
-            _ptr(q, fx.Int32),
-            _ptr(k, fx.Int32),
-            _ptr(v, fx.Int32),
-            _ptr(q8, fx.Int32),
-            _ptr(k8, fx.Int32),
-            _ptr(v8, fx.Int32),
-            _ptr(partials, fx.Float32),
+            q,
+            k,
+            v,
+            q8,
+            k8,
+            v8,
+            partials,
             M,
             fx_stream,
         )
@@ -397,13 +409,13 @@ def flydsl_fp8_qkv_d64_quant(
         )
         _run_compiled(
             scale_k,
-            _ptr(q, fx.Int32),
-            _ptr(k, fx.Int32),
-            _ptr(v, fx.Int32),
-            _ptr(q8, fx.Int32),
-            _ptr(k8, fx.Int32),
-            _ptr(v8, fx.Int32),
-            _ptr(scales, fx.Float32),
+            q,
+            k,
+            v,
+            q8,
+            k8,
+            v8,
+            scales,
             M,
             fx_stream,
         )
@@ -437,6 +449,8 @@ def flydsl_fp8_pertensor_quant(
         )
     if x.numel() == 0:
         raise ValueError("flydsl_fp8_pertensor_quant requires a non-empty tensor")
+    if not x.is_contiguous():
+        raise ValueError("flydsl_fp8_pertensor_quant requires a contiguous input")
 
     D = x.shape[-1]
     if rotate and x.shape[-1] & (x.shape[-1] - 1):
@@ -457,12 +471,8 @@ def flydsl_fp8_pertensor_quant(
     if caller_out is not None and _storage_overlaps(x, caller_out):
         raise ValueError("out must not overlap input storage")
 
-    def _ptr(t, dtype):
-        return flyc.from_c_void_p(dtype, t.data_ptr())
-
     stream = torch.cuda.current_stream(x.device)
     with torch.cuda.device(x.device), torch.cuda.stream(stream):
-        x = x.contiguous()
         M = x.numel() // D
         if caller_out is None:
             out = torch.empty_like(x, dtype=_FP8_DTYPE)
@@ -477,9 +487,9 @@ def flydsl_fp8_pertensor_quant(
         )
         _run_compiled(
             amax_k,
-            _ptr(x, fx.Int32),
-            _ptr(x, fx.Int32),
-            _ptr(partials, fx.Float32),
+            x,
+            x,
+            partials,
             M,
             fx_stream,
         )
@@ -491,9 +501,9 @@ def flydsl_fp8_pertensor_quant(
         )
         _run_compiled(
             scale_k,
-            _ptr(x, fx.Int32),
-            _ptr(out, fx.Int32),
-            _ptr(scale, fx.Float32),
+            x,
+            out,
+            scale,
             M,
             fx_stream,
         )

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import math
 import os
+import warnings
 from functools import lru_cache
 
 import torch
@@ -363,6 +364,22 @@ def flydsl_flash_attn_func(
             alias_inputs.extend((q_descale, k_descale, v_descale))
         if any(_storage_overlaps(out, tensor) for tensor in alias_inputs):
             raise ValueError("out must not overlap q, k, v, or FP8 descale storage")
+    materialized_inputs = not (
+        q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
+    )
+    temporary_output = out is not None and not out.is_contiguous()
+    if materialized_inputs or temporary_output:
+        parts = []
+        if materialized_inputs:
+            parts.append("non-contiguous Q/K/V")
+        if temporary_output:
+            parts.append("a non-contiguous out")
+        warnings.warn(
+            "flydsl_flash_attn_func materializes "
+            + " and ".join(parts)
+            + "; provide contiguous tensors to avoid the copy",
+            stacklevel=2,
+        )
 
     block_m, block_n = _pick_gfx1201_tiles(seq_len_real, head_dim, causal)
     lds_bytes = _gfx1201_fmha_lds_bytes(head_dim, block_n, fp8=is_fp8)

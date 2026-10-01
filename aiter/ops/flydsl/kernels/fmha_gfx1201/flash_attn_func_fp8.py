@@ -272,13 +272,14 @@ def build_flash_attn_func_module(
 
         def wmma_acc_fp8(k_v2i32_raw, q_pk_pair, c_v8):
             """Execute the gfx1201 FP8 WMMA through FlyDSL's typed atom."""
-            a_frag = fx.make_rmem_tensor(8, fx.Float8E4M3FN)
-            b_frag = fx.make_rmem_tensor(8, fx.Float8E4M3FN)
+            # gfx1201 FP8 WMMA consumes each eight-element operand fragment as
+            # two packed i32 registers. Keep that native representation through
+            # the typed atom instead of bitcasting it through an FP8 rmem view.
+            a_frag = fx.make_rmem_tensor(2, fx.Int32)
+            b_frag = fx.make_rmem_tensor(2, fx.Int32)
             c_frag = fx.make_rmem_tensor(8, fx.Float32)
-            a_frag.store(Vec(k_v2i32_raw).bitcast(fx.Float8E4M3FN))
-            b_frag.store(
-                Vec.from_elements(q_pk_pair, fx.Int32).bitcast(fx.Float8E4M3FN)
-            )
+            a_frag.store(Vec(k_v2i32_raw))
+            b_frag.store(Vec.from_elements(q_pk_pair, fx.Int32))
             c_frag.store(Vec(c_v8))
             fx.gemm(wmma_atom, c_frag, a_frag, b_frag, c_frag)
             return c_frag.load().ir_value()
