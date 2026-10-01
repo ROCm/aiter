@@ -293,8 +293,8 @@ def _mxscale_operands(m=3, n=256, k=512, x_block=32, w_rows=32, scale_dtype=None
 
 
 @pytest.mark.parametrize("row", [None, BMM_ROW])
-@pytest.mark.parametrize("block", [32, 128])
-def test_mxscale_bpreshuffle_route(monkeypatch, row, block):
+@pytest.mark.parametrize("block, w_rows", [(32, 32), (32, 1), (128, 128)])
+def test_mxscale_bpreshuffle_route(monkeypatch, row, block, w_rows):
     from aiter.ops.flydsl import batched_gemm_a8w8 as bmm
 
     calls = []
@@ -311,18 +311,18 @@ def test_mxscale_bpreshuffle_route(monkeypatch, row, block):
     monkeypatch.setattr(gemm_op_a8w8, "get_gfx", lambda: "gfx950")
     monkeypatch.setattr(gemm_op_a8w8, "get_mxscale_bpreshuffle_config", lookup)
     monkeypatch.setattr(bmm, "run_bmm_a8w8_mxfp8", run)
-    x, w, xs, ws = _mxscale_operands(x_block=block, w_rows=block)
+    x, w, xs, ws = _mxscale_operands(x_block=block, w_rows=w_rows)
     y = gemm_op_a8w8.gemm_a8w8_blockscale_bpreshuffle(x, w, xs, ws)
     kb = 512 // block
     assert y.shape == (3, 256) and y.dtype == torch.bfloat16
     assert calls == [
-        ("lookup", 3, 256, 512, f"{block}x{block}", True),
+        ("lookup", 3, 256, 512, f"{w_rows}x{block}", True),
         (
             "bmm",
             (3, 1, 512),
             (1, 256, 512),
             (3, 1, kb),
-            (1, 256 // block, kb),
+            (1, 256 // w_rows, kb),
             (3, 1, 256),
         ),
         (None if row is None else row["kernelName"], block == 128),
@@ -345,8 +345,10 @@ def test_mxscale_bpreshuffle_rejects_row_scales(monkeypatch):
     monkeypatch.setattr(
         gemm_op_a8w8, "get_mxscale_bpreshuffle_config", lambda *a, **kw: None
     )
-    with pytest.raises(NotImplementedError, match="1x32"):
-        gemm_op_a8w8.gemm_a8w8_blockscale_bpreshuffle(*_mxscale_operands(w_rows=1))
+    with pytest.raises(NotImplementedError, match="1x128"):
+        gemm_op_a8w8.gemm_a8w8_blockscale_bpreshuffle(
+            *_mxscale_operands(x_block=128, w_rows=1)
+        )
 
 
 def test_blockscale_preshuffled_group32_forwards_e8m0_views(monkeypatch):

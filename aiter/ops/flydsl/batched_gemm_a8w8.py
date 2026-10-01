@@ -30,6 +30,7 @@ _GFX1250 = ("batched_gemm_a8w8_gfx1250", "run_bmm_a8w8_mxfp8_128_gfx1250")
 # argument). Only the running arch's module is ever imported.
 _RUNNERS = {
     ("gfx950", "32x32", False): (*_GFX950, {}),
+    ("gfx950", "1x32", False): (*_GFX950, {}),
     ("gfx950", "128x128", False): (*_GFX950, {}),
     ("gfx950", "128x128", True): (*_GFX950, {"x_scale_transposed": True}),
     ("gfx1250", "128x128", False): (*_GFX1250, {}),
