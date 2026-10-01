@@ -29,6 +29,10 @@ from .row_lens import row_len_slot
 
 # Widths up to this value use the persistent one-workgroup kernel.
 _ONE_WORKGROUP_MAX_ROW_WIDTH = 20_000
+# gfx942, k=512, width >= 8192: one scatter scan of two contiguous float4s.
+# Narrower rows and every other arch keep one float4 per scan step.
+_PAIR_SCATTER_MIN_WIDTH = 8192
+_PAIR_SCATTER_K = 512
 _SHORT_ROWS_1024_THREAD_MAX_ROWS = 256
 
 
@@ -381,6 +385,11 @@ def flydsl_top_k_per_row_decode(
     len_slot = row_len_slot(seq_lens, logits.device)
     starts = row_starts if packed else len_slot
     if width <= _ONE_WORKGROUP_MAX_ROW_WIDTH:
+        pair_scatter = (
+            arch.startswith("gfx942")
+            and k == _PAIR_SCATTER_K
+            and width >= _PAIR_SCATTER_MIN_WIDTH
+        )
         launcher = build_topk_per_row_decode_one_workgroup_module(
             k,
             wave_size=wave_size,
@@ -388,6 +397,7 @@ def flydsl_top_k_per_row_decode(
             packed_rows=packed,
             full_rows=full_rows,
             exact_rows=full_rows and one_workgroup_rows_are_exact(width),
+            pair_scatter=pair_scatter,
         )
         _run_compiled(
             launcher,
