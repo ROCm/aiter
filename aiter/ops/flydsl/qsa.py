@@ -22,10 +22,13 @@ validated against are test fixtures in ``op_tests/qsa_shapes.py``.
 ``qsa_layer`` is the ``qwen4_exp`` opt-in. ``backend`` is ``auto``,
 ``flydsl``, or ``triton``. The default is ``auto``: FlyDSL for the query
 shapes whose end-to-end layer was measured to beat live AMD, and Triton
-for every other shape. ``triton`` is live AMD paged MQA, HIP top-k,
-expand+tail, and sparse GQA. ``flydsl`` runs K1, the same vendored
-expand+tail, and K2. Sigmoid and partial RoPE stay outside the layer.
+for every other shape. A GQA query missing from that table logs once.
+``triton`` is live AMD paged MQA, HIP top-k, expand+tail, and sparse GQA.
+``flydsl`` runs K1, the same vendored expand+tail, and K2. Sigmoid and
+partial RoPE stay outside the layer.
 """
+
+import functools
 
 import torch
 
@@ -130,6 +133,24 @@ def _measured_heads(
     if q_indexer.dim() != 3 or q_indexer.shape[0] != q_gqa.shape[0]:
         return None
     return _MEASURED_QUERIES.get(tuple(q_gqa.shape[1:]))
+
+
+def _gqa_table_key(q_gqa: torch.Tensor) -> tuple[int, ...] | None:
+    """Per-rank GQA query ``(n_q_heads, head_dim)``, or None if not a query."""
+    if q_gqa.dim() != 3:
+        return None
+    return tuple(int(s) for s in q_gqa.shape[1:])
+
+
+@functools.cache
+def _log_unmeasured_gqa_query(shape: tuple[int, ...]) -> None:
+    """Log one table miss. The same shape does not log again."""
+    from aiter import logger
+
+    logger.warning(
+        "QSA auto: GQA query shape %s is not in the measured table; using Triton",
+        shape,
+    )
 
 
 def qsa_auto_uses_flydsl(
@@ -300,12 +321,17 @@ def qsa_layer(
     """Run one QSA layer: indexer select, expand+tail, sparse GQA.
 
     ``backend="auto"`` (the default) uses FlyDSL only when
-    ``qsa_auto_uses_flydsl`` is set, and Triton otherwise.
+    ``qsa_auto_uses_flydsl`` is set, and Triton otherwise. A GQA query
+    that is not in the measured table logs once on this path.
     ``backend="flydsl"`` is K1 + vendored expand + K2.
     ``backend="triton"`` is the live AMD path.
     """
     selected = normalize_qsa_backend(backend)
     if selected == "auto":
+        key = _gqa_table_key(q_gqa)
+        if key is None or key not in _MEASURED_QUERIES:
+            missed = key if key is not None else tuple(int(s) for s in q_gqa.shape)
+            _log_unmeasured_gqa_query(missed)
         width = token_topk + compress_ratio - 1
         rows = q_indexer.shape[0]
         probe = indices
