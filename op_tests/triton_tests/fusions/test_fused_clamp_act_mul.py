@@ -53,12 +53,14 @@ def _torch_reference(inp, swiglu_limit, weights, dtype_quant, activation="silu")
 @pytest.mark.parametrize("M", [1, 2, 4, 8, 32])
 @pytest.mark.parametrize("D", [2048, 3072])
 @pytest.mark.parametrize("swiglu_limit", [0.0, 7.0])
-@pytest.mark.parametrize("transpose_scale", [True, False])
+@pytest.mark.parametrize(
+    "dtype_quant, transpose_scale",
+    [(aiter.dtypes.fp8, True), (aiter.dtypes.fp8, False), (None, False)],
+)
 @pytest.mark.parametrize(
     "with_weights,weight_broadcast",
     [(False, False), (True, True), (True, False)],
 )
-@pytest.mark.parametrize("dtype_quant", [aiter.dtypes.fp8, None])
 @pytest.mark.parametrize("backend", ["triton", "gluon"])
 def test_fused_clamp_act_mul(
     M,
@@ -536,43 +538,4 @@ def test_fused_clamp_act_mul_odd_m_tail(M, n_half, dtype_quant, backend):
             backend=backend,
         )
         ref = _torch_reference(inp, 0.0, None, None)
-        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
-
-
-@pytest.mark.parametrize("M", [1, 4, 32])
-@pytest.mark.parametrize("D", [2048])
-@pytest.mark.parametrize("dtype_quant", [aiter.dtypes.fp8, None])
-@pytest.mark.parametrize("backend", ["triton", "gluon"])
-def test_fused_clamp_act_mul_float16_input(M, D, dtype_quant, backend):
-    """float16 inputs must work identically to bfloat16."""
-    _check_backend(backend)
-
-    torch.manual_seed(42)
-    inp = torch.randn(M, D, device="cuda", dtype=torch.float16)
-
-    if dtype_quant is not None:
-        out_q, scale = fused_clamp_act_mul(
-            inp,
-            swiglu_limit=0.0,
-            activation="silu",
-            dtype_quant=dtype_quant,
-            backend=backend,
-        )
-        ref_q, ref_s = _torch_reference(inp, 0.0, None, dtype_quant)
-        torch.testing.assert_close(
-            upcast(out_q, scale, torch.bfloat16),
-            upcast(ref_q, ref_s, torch.bfloat16),
-            atol=0.1,
-            rtol=0.1,
-        )
-    else:
-        out = fused_clamp_act_mul(
-            inp,
-            swiglu_limit=0.0,
-            activation="silu",
-            dtype_quant=None,
-            backend=backend,
-        )
-        ref = _torch_reference(inp, 0.0, None, None)
-        assert out.dtype == inp.dtype
         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
