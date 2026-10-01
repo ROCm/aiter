@@ -91,7 +91,6 @@ NONE_WRAPPED_OP = [
     "fused_qknorm_allreduce",
     "get_mla_decode_head_plan_v1",
     "mla_metadata_cluster_multiplier_v1",
-    "mla_decode_asm_query",
     "mla_reduce_v1_supports",
 ]
 
