@@ -18,6 +18,9 @@ from .topk_per_row_decode import (
 )
 
 _BLOCK_THREADS = 1024
+# Two contiguous float4s per thread, so an 8192-wide row is one scatter scan
+# instead of two. Column order stays thread-major: thread t walks [2t, 2t+2).
+_SCATTER_PAIR = 2
 _VEC = 4
 _RADIX_BITS = 11
 _NUM_BUCKETS = 1 << _RADIX_BITS
@@ -46,11 +49,20 @@ def build_topk_per_row_decode_one_workgroup_module(
     wave_size: int,
     write_values: bool = False,
     compact: bool = False,
+    pair_scatter: bool = False,
 ):
     if wave_size not in (32, 64):
         raise ValueError("wave size must be 32 or 64")
     num_waves = _BLOCK_THREADS // wave_size
     output_steps = (k + _BLOCK_THREADS - 1) // _BLOCK_THREADS
+    name_params = {
+        "k": k,
+        "wave": wave_size,
+        "wv": write_values,
+        "compact": compact,
+    }
+    if pair_scatter:
+        name_params["pair"] = _SCATTER_PAIR
 
     if compact:
 
@@ -71,8 +83,7 @@ def build_topk_per_row_decode_one_workgroup_module(
             metadata: fx.Array[fx.Int32, 8, 16]
 
     @flyc.kernel(
-        name="topk_per_row_decode_1wg_"
-        + kernel_signature(k=k, wave=wave_size, wv=write_values, compact=compact),
+        name="topk_per_row_decode_1wg_" + kernel_signature(**name_params),
         known_block_size=[_BLOCK_THREADS, 1, 1],
     )
     def topk_per_row_decode_one_workgroup_kernel(
@@ -316,61 +327,143 @@ def build_topk_per_row_decode_one_workgroup_module(
                 metadata[_RUNNING_EQUAL] = zero
             gpu.barrier()
 
-            num_steps = (row_vectors + block_threads - one) // block_threads
-            for step in range(zero, num_steps, one):
-                vector_idx = step * block_threads + tid
-                active_vector = vector_idx < row_vectors
-                safe_vector_idx = active_vector.select(vector_idx, zero)
-                col_base = safe_vector_idx * vec_width
-                rvals = _load_f32x4(input_resource, safe_vector_idx)
-                classes = fx.make_rmem_tensor(_VEC, fx.Int32)
-                local_above = zero
-                local_equal = zero
-                for lane_idx in range_constexpr(_VEC):
-                    col = col_base + lane_idx
-                    above, equal = classify(
-                        rvals[lane_idx],
-                        first_threshold,
-                        second_threshold,
-                        third_threshold,
-                    )
-                    active = active_vector & (col < row_len)
-                    above_i32 = (active & above).select(one, zero)
-                    equal_i32 = (active & equal).select(one, zero)
-                    classes[lane_idx] = above_i32 * two + equal_i32
-                    local_above = local_above + above_i32
-                    local_equal = local_equal + equal_i32
+            if const_expr(pair_scatter):
+                span = fx.Int32(_BLOCK_THREADS * _SCATTER_PAIR)
+                num_steps = (row_vectors + span - one) // span
+                classes = fx.make_rmem_tensor(_SCATTER_PAIR * _VEC, fx.Int32)
+                stored = fx.make_rmem_tensor(_SCATTER_PAIR * _VEC, fx.Float32)
+                for step in range(zero, num_steps, one):
+                    vector_base = step * span + tid * fx.Int32(_SCATTER_PAIR)
+                    local_above = zero
+                    local_equal = zero
+                    for vec_offset in range_constexpr(_SCATTER_PAIR):
+                        vector_idx = vector_base + vec_offset
+                        active_vector = vector_idx < row_vectors
+                        safe_vector_idx = active_vector.select(vector_idx, zero)
+                        col_base = safe_vector_idx * vec_width
+                        rvals = _load_f32x4(input_resource, safe_vector_idx)
+                        for lane_idx in range_constexpr(_VEC):
+                            col = col_base + lane_idx
+                            above, equal = classify(
+                                rvals[lane_idx],
+                                first_threshold,
+                                second_threshold,
+                                third_threshold,
+                            )
+                            active = active_vector & (col < row_len)
+                            above_i32 = (active & above).select(one, zero)
+                            equal_i32 = (active & equal).select(one, zero)
+                            slot = vec_offset * _VEC + lane_idx
+                            classes[slot] = above_i32 * two + equal_i32
+                            stored[slot] = rvals[lane_idx]
+                            local_above = local_above + above_i32
+                            local_equal = local_equal + equal_i32
 
-                (
-                    above_prefix,
-                    equal_prefix,
-                    block_above,
-                    block_equal,
-                ) = block_exclusive_scan_pair(local_above, local_equal, scan, metadata)
-                my_above = metadata[_RUNNING_ABOVE] + above_prefix
-                my_equal = metadata[_RUNNING_EQUAL] + equal_prefix
-                for lane_idx in range_constexpr(_VEC):
-                    cls = classes[lane_idx]
-                    col = col_base + lane_idx
-                    accepted_equal = (my_equal < num_needed).select(
-                        my_equal, num_needed
+                    (
+                        above_prefix,
+                        equal_prefix,
+                        block_above,
+                        block_equal,
+                    ) = block_exclusive_scan_pair(
+                        local_above, local_equal, scan, metadata
                     )
-                    out_pos = my_above + accepted_equal
-                    if cls == two:
-                        row_indices[out_pos] = col
-                        if const_expr(write_values):
-                            row_values[out_pos] = rvals[lane_idx]
-                        my_above = my_above + one
-                    elif cls == one:
-                        if my_equal < num_needed:
+                    my_above = metadata[_RUNNING_ABOVE] + above_prefix
+                    my_equal = metadata[_RUNNING_EQUAL] + equal_prefix
+                    for vec_offset in range_constexpr(_SCATTER_PAIR):
+                        vector_idx = vector_base + vec_offset
+                        safe_vector_idx = (vector_idx < row_vectors).select(
+                            vector_idx, zero
+                        )
+                        col_base = safe_vector_idx * vec_width
+                        for lane_idx in range_constexpr(_VEC):
+                            slot = vec_offset * _VEC + lane_idx
+                            cls = classes[slot]
+                            col = col_base + lane_idx
+                            accepted_equal = (my_equal < num_needed).select(
+                                my_equal, num_needed
+                            )
+                            out_pos = my_above + accepted_equal
+                            if cls == two:
+                                row_indices[out_pos] = col
+                                if const_expr(write_values):
+                                    row_values[out_pos] = stored[slot]
+                                my_above = my_above + one
+                            elif cls == one:
+                                if my_equal < num_needed:
+                                    row_indices[out_pos] = col
+                                    if const_expr(write_values):
+                                        row_values[out_pos] = stored[slot]
+                                my_equal = my_equal + one
+                    if tid == 0:
+                        metadata[_RUNNING_ABOVE] = (
+                            metadata[_RUNNING_ABOVE] + block_above
+                        )
+                        metadata[_RUNNING_EQUAL] = (
+                            metadata[_RUNNING_EQUAL] + block_equal
+                        )
+                    gpu.barrier()
+            else:
+                num_steps = (row_vectors + block_threads - one) // block_threads
+                for step in range(zero, num_steps, one):
+                    vector_idx = step * block_threads + tid
+                    active_vector = vector_idx < row_vectors
+                    safe_vector_idx = active_vector.select(vector_idx, zero)
+                    col_base = safe_vector_idx * vec_width
+                    rvals = _load_f32x4(input_resource, safe_vector_idx)
+                    classes = fx.make_rmem_tensor(_VEC, fx.Int32)
+                    local_above = zero
+                    local_equal = zero
+                    for lane_idx in range_constexpr(_VEC):
+                        col = col_base + lane_idx
+                        above, equal = classify(
+                            rvals[lane_idx],
+                            first_threshold,
+                            second_threshold,
+                            third_threshold,
+                        )
+                        active = active_vector & (col < row_len)
+                        above_i32 = (active & above).select(one, zero)
+                        equal_i32 = (active & equal).select(one, zero)
+                        classes[lane_idx] = above_i32 * two + equal_i32
+                        local_above = local_above + above_i32
+                        local_equal = local_equal + equal_i32
+
+                    (
+                        above_prefix,
+                        equal_prefix,
+                        block_above,
+                        block_equal,
+                    ) = block_exclusive_scan_pair(
+                        local_above, local_equal, scan, metadata
+                    )
+                    my_above = metadata[_RUNNING_ABOVE] + above_prefix
+                    my_equal = metadata[_RUNNING_EQUAL] + equal_prefix
+                    for lane_idx in range_constexpr(_VEC):
+                        cls = classes[lane_idx]
+                        col = col_base + lane_idx
+                        accepted_equal = (my_equal < num_needed).select(
+                            my_equal, num_needed
+                        )
+                        out_pos = my_above + accepted_equal
+                        if cls == two:
                             row_indices[out_pos] = col
                             if const_expr(write_values):
                                 row_values[out_pos] = rvals[lane_idx]
-                        my_equal = my_equal + one
-                if tid == 0:
-                    metadata[_RUNNING_ABOVE] = metadata[_RUNNING_ABOVE] + block_above
-                    metadata[_RUNNING_EQUAL] = metadata[_RUNNING_EQUAL] + block_equal
-                gpu.barrier()
+                            my_above = my_above + one
+                        elif cls == one:
+                            if my_equal < num_needed:
+                                row_indices[out_pos] = col
+                                if const_expr(write_values):
+                                    row_values[out_pos] = rvals[lane_idx]
+                            my_equal = my_equal + one
+                    if tid == 0:
+                        metadata[_RUNNING_ABOVE] = (
+                            metadata[_RUNNING_ABOVE] + block_above
+                        )
+                        metadata[_RUNNING_EQUAL] = (
+                            metadata[_RUNNING_EQUAL] + block_equal
+                        )
+                    gpu.barrier()
 
         def finish_global(
             first_threshold,
