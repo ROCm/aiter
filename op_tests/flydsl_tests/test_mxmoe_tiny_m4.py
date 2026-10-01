@@ -7,14 +7,88 @@ leave these independently constructed values invariant. These fixtures are
 additional state/layout checks; captured real-weight qualification is mandatory.
 """
 
-import torch
+import argparse
 
-from aiter import ActivationType, QuantType
-from aiter.fused_moe import fused_moe
-from aiter.ops.flydsl.kernels.mxmoe_tiny_m4 import make_operator
+
+def arguments():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="time synthetic native/candidate graph replays after correctness checks",
+    )
+    parser.add_argument("--samples", type=int, default=40)
+    parser.add_argument("--warmups", type=int, default=10)
+    args = parser.parse_args()
+    if args.samples < 1 or args.warmups < 0:
+        parser.error("samples must be positive and warmups nonnegative")
+    return args
+
+
+def benchmark(native, candidate, args):
+    """Synthetic full-operator graph timing, not captured-model table reproduction."""
+    import random
+    import statistics
+    import torch
+
+    graphs, outputs = {}, {}
+    for name, call in (("native", native), ("candidate", candidate)):
+        for _ in range(3):
+            call()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            outputs[name] = call()
+        graphs[name] = graph
+        graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(
+        outputs["candidate"], outputs["native"], atol=0.02, rtol=0.02
+    )
+    for _ in range(args.warmups):
+        for graph in graphs.values():
+            graph.replay()
+    torch.cuda.synchronize()
+    events = {
+        name: (
+            torch.cuda.Event(enable_timing=True),
+            torch.cuda.Event(enable_timing=True),
+        )
+        for name in graphs
+    }
+    samples = {name: [] for name in graphs}
+    rng = random.Random(355052)
+    for _ in range(args.samples):
+        order = list(graphs)
+        rng.shuffle(order)
+        for name in order:
+            start, end = events[name]
+            start.record()
+            graphs[name].replay()
+            end.record()
+            end.synchronize()
+            samples[name].append(start.elapsed_time(end) * 1000)
+    before, after = (
+        statistics.median(samples[name]) for name in ("native", "candidate")
+    )
+    print(
+        f"SYNTHETIC graph replay: native={before:.3f} us candidate={after:.3f} us "
+        f"saved={before-after:.3f} us reduction={100*(before-after)/before:.3f}%"
+    )
+    print(
+        f"{args.samples} randomized paired samples; {args.warmups} warmups; "
+        "not the captured 480-case performance table"
+    )
 
 
 def main():
+    args = arguments()
+    import torch
+
+    from aiter import ActivationType, QuantType
+    from aiter.fused_moe import fused_moe
+    from aiter.ops.flydsl.kernels.mxmoe_tiny_m4 import make_operator
+
     if torch.cuda.get_device_properties(0).gcnArchName.split(":")[0] != "gfx950":
         print("SKIP: exact M4 fixtures require gfx950")
         return
@@ -96,6 +170,10 @@ def main():
             weights[key].view(torch.uint8), before, atol=0, rtol=0
         )
     print("PASS: native M4 route/reset/two-workspace graph fixtures")
+    if args.benchmark:
+        x.copy_(initial_x)
+        ids.copy_(initial_ids)
+        benchmark(native, lambda: first.run(x, ids, route_weights), args)
 
 
 if __name__ == "__main__":
