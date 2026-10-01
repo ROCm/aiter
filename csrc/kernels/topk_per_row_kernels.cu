@@ -4724,6 +4724,602 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
     }
 }
 
+// Sampled-stage form of the LDS tail (see lds_tail_sampled_stage).
+constexpr int kSampledStageTarget  = 3000;
+constexpr int kSampledFineBits     = 13;
+constexpr int kSampledDigitBits    = 15;
+constexpr int kSampledWindowBins   = 2048;
+constexpr int kSampledBinCapacity  = 2 * 64;
+constexpr int kSampledMaxBatches   = 5;
+
+// The row scan of lds_tail_sampled_stage, unrolled for `Batches` batches of
+// four 16-byte vectors per lane, so that each batch waits only for its own
+// loads while the next batch's are in flight.
+template <typename T,
+          typename IdxT,
+          int BlockSize,
+          int StageCapacity,
+          int PoolCapacity,
+          int Batches>
+__device__ __forceinline__ bool lds_tail_sampled_stage_n(T const* in,
+                                                         IdxT const row_len,
+                                                         IdxT const skip,
+                                                         IdxT const len4,
+                                                         IdxT const k,
+                                                         IdxT* out_idx,
+                                                         IdxT* histogram,
+                                                         unsigned long long* staged_packed,
+                                                         IdxT* window_histogram,
+                                                         T* candidate_values,
+                                                         IdxT* candidate_indices,
+                                                         IdxT* staged_count,
+                                                         uint32_t* per_wave,
+                                                         uint32_t* state)
+{
+    using Bits = uint32_t;
+    using U4   = __attribute__((__ext_vector_type__(4))) uint32_t;
+    constexpr int Waves         = BlockSize / WARP_SIZE;
+    constexpr int FineShift     = 32 - kSampledFineBits;
+    constexpr int DigitShift    = 32 - kSampledDigitBits;
+    constexpr int BatchVecs     = 4 * BlockSize;
+    // Each wave stages into its own slice of the staging array, so the scan
+    // needs no LDS atomics; a vector that would overflow the slice goes to a
+    // shared pool in the candidate arrays instead.
+    constexpr int Region       = StageCapacity / Waves;
+    constexpr int RegionLoads  = Region / WARP_SIZE;
+    constexpr int PoolLoads    = PoolCapacity / BlockSize;
+    static_assert((1 << kSampledFineBits) == 2 * 4 * BlockSize);
+    static_assert(Batches >= 1 && Batches <= kSampledMaxBatches);
+    static_assert(Region % WARP_SIZE == 0 && PoolCapacity % BlockSize == 0);
+
+    int const tid          = static_cast<int>(threadIdx.x);
+    int const lane         = tid % WARP_SIZE;
+    int const wave         = tid / WARP_SIZE;
+    uint32_t* const fine   = reinterpret_cast<uint32_t*>(histogram);
+    uint32_t* const window = reinterpret_cast<uint32_t*>(window_histogram);
+    // Values and indices in separate halves of the staging array, so each
+    // staged key is one two-address store of the registers it arrived in.
+    uint32_t* const stage_val = reinterpret_cast<uint32_t*>(staged_packed);
+    IdxT* const stage_idx     = reinterpret_cast<IdxT*>(stage_val + StageCapacity);
+    uint32_t* const pool_val  = reinterpret_cast<uint32_t*>(candidate_values);
+    IdxT* const pool_idx      = candidate_indices;
+    WideT const* const body   = reinterpret_cast<WideT const*>(in + skip);
+    IdxT const tail_begin     = skip + len4 * 4;
+    int const region_base     = wave * Region;
+
+    auto fall_back = [&]() {
+        if(tid == 0) *staged_count = 0;
+        __syncthreads();
+        return false;
+    };
+
+    // Only the last batch can reach past the row.  Its lanes past the row
+    // reload the row's last vector and are masked out of every count.
+    auto load_batch = [&](WideT(&w)[4], auto batch) {
+        constexpr int B = decltype(batch)::value;
+#pragma unroll
+        for(int q = 0; q < 4; ++q)
+        {
+            IdxT v = static_cast<IdxT>(B * BatchVecs + q * BlockSize) + tid;
+            if constexpr(B == Batches - 1) v = v < len4 ? v : len4 - 1;
+            w[q] = body[v];
+        }
+    };
+    auto in_row = [&](auto batch, int q) {
+        constexpr int B = decltype(batch)::value;
+        if constexpr(B < Batches - 1)
+            return true;
+        else
+            return static_cast<IdxT>(B * BatchVecs + q * BlockSize) + tid < len4;
+    };
+    // In the last batch a wave skips the staging work of the vectors that
+    // start past the row (their loads stay unconditional and hit one line).
+    auto wave_live = [&](auto batch, int q) {
+        constexpr int B = decltype(batch)::value;
+        if constexpr(B < Batches - 1)
+            return true;
+        else
+            return static_cast<IdxT>(B * BatchVecs + q * BlockSize + wave * WARP_SIZE) < len4;
+    };
+
+    WideT wa[4], wb[4];
+    load_batch(wa, std::integral_constant<int, 0>{});
+    {
+        U4 const zero = {0u, 0u, 0u, 0u};
+        reinterpret_cast<U4*>(fine)[tid] = zero;
+        window[tid]                      = 0u;
+        window[tid + BlockSize]          = 0u;
+        if(tid < 8) state[tid] = 0u;
+    }
+    __syncthreads();
+    if constexpr(Batches > 1) load_batch(wb, std::integral_constant<int, 1>{});
+
+    // Sample the row's first vector per lane (the first 4K values), and the
+    // second as well past 48K columns: an eighth to a sixteenth of the row.
+    bool const two_vectors = row_len > 48 * 1024;
+    IdxT samples           = 4 * (len4 < BlockSize ? len4 : BlockSize);
+    if(two_vectors)
+    {
+        IdxT const second = len4 - BlockSize;
+        samples += 4 * (second < 0 ? 0 : (second > BlockSize ? BlockSize : second));
+    }
+    auto sample_one = [&](T x) {
+        uint32_t const fbin = twiddle_in(x, false) >> FineShift;
+        atomicAdd(fine + (fbin >> 1), (fbin & 1u) ? 0x10000u : 1u);
+    };
+    if(in_row(std::integral_constant<int, 0>{}, 0))
+    {
+#pragma unroll
+        for(int e = 0; e < 4; ++e)
+            sample_one(wa[0][e]);
+    }
+    if(two_vectors && in_row(std::integral_constant<int, 0>{}, 1))
+    {
+#pragma unroll
+        for(int e = 0; e < 4; ++e)
+            sample_one(wa[1][e]);
+    }
+    __syncthreads();
+
+    // The bound: each wave totals its slice of the 13-bit histogram (eight
+    // bins per lane), then every wave finds the slice, the lane and the bin
+    // that hold the rank, so no barrier separates the bound from the scan.
+    constexpr int WaveDwords = 4 * WARP_SIZE;
+    static_assert(WaveDwords * Waves == 4 * BlockSize);
+    auto dword_pair_sum = [](U4 v) {
+        uint32_t const t = v[0] + v[1] + v[2] + v[3];
+        return static_cast<int>((t & 0xffffu) + (t >> 16));
+    };
+    {
+        int const lane_sum = dword_pair_sum(reinterpret_cast<U4 const*>(fine)[tid]);
+        int const wave_sum = __builtin_amdgcn_readlane(wave_inclusive_sum_dpp(lane_sum),
+                                                       WARP_SIZE - 1);
+        if(lane == 0) per_wave[wave] = static_cast<uint32_t>(wave_sum);
+    }
+    __syncthreads();
+    uint32_t stage_last;
+    {
+        IdxT rank = static_cast<IdxT>(
+            (static_cast<int64_t>(kSampledStageTarget) * samples + row_len / 2) / row_len);
+        rank = rank < 1 ? 1 : (rank > samples ? samples : rank);
+        int const wsum = lane < Waves ? static_cast<int>(per_wave[lane]) : 0;
+        int const winc = wave_inclusive_sum_dpp(wsum);
+        int const wexc = winc - wsum;
+        int const cw   = __builtin_ctzll(
+            static_cast<uint64_t>(__ballot(lane < Waves && wexc < rank && rank <= winc)));
+        int const wave_before = __builtin_amdgcn_readlane(wexc, cw);
+        U4 const v   = reinterpret_cast<U4 const*>(fine)[cw * WARP_SIZE + lane];
+        int const ls = dword_pair_sum(v);
+        int const li = wave_before + wave_inclusive_sum_dpp(ls);
+        int const le = li - ls;
+        int const cl = __builtin_ctzll(static_cast<uint64_t>(__ballot(le < rank && rank <= li)));
+        int const lane_before = __builtin_amdgcn_readlane(le, cl);
+        // Lanes 0..7 take the crossing lane's eight bins.
+        uint32_t const dw = fine[(cw * WARP_SIZE + cl) * 4 + ((lane >> 1) & 3)];
+        int const bc      = lane < 8 ? static_cast<int>((lane & 1) ? (dw >> 16) : (dw & 0xffffu)) : 0;
+        int b             = bc;
+        b = dpp_add<0x111, 0xf, 0xf>(b); // row_shr:1
+        b = dpp_add<0x112, 0xf, 0xf>(b); // row_shr:2
+        b = dpp_add<0x114, 0xf, 0xe>(b); // row_shr:4
+        int const bi = lane_before + b;
+        int const be = bi - bc;
+        int const bl = __builtin_ctzll(
+            static_cast<uint64_t>(__ballot(lane < 8 && be < rank && rank <= bi)));
+        int const bin_before  = __builtin_amdgcn_readlane(be, bl);
+        int const bin_through = __builtin_amdgcn_readlane(bi, bl);
+        uint32_t const bin    = static_cast<uint32_t>((cw * WARP_SIZE + cl) * 8 + bl);
+        // Nearest rank: end the staged range after the rank's bin or before it.
+        uint32_t const end_bin = bin_through - rank <= rank - bin_before ? bin + 1u : bin;
+        stage_last             = (end_bin << FineShift) - 1u;
+    }
+    Bits const raw_bound = (stage_last >> 31) ? stage_last : (stage_last ^ 0x7fffffffu);
+    // A NaN or empty bound stages nothing useful; the full-row form handles it.
+    if((raw_bound & 0x7fffffffu) > 0x7f800000u || stage_last == ~0u) return fall_back();
+    T const bound = __uint_as_float(raw_bound);
+
+    // One full-row pass: compare, and stage each wave's keys at or above the
+    // bound into its slice by ballot rank.  Pool slots past PoolCapacity are
+    // reserved but not written, so the final count detects an overflow.
+    uint32_t const bound_digit = stage_last >> DigitShift;
+    // Count one staged key in the digit window, or as staged beyond the
+    // bound, or as past the window.
+    auto count_key = [&](Bits key) {
+        if(key > stage_last)
+        {
+            atomicAdd(state + 0, 1u);
+        }
+        else
+        {
+            uint32_t const d = bound_digit - (key >> DigitShift);
+            if(d < static_cast<uint32_t>(kSampledWindowBins))
+                atomicAdd(window + d, 1u);
+            else
+                atomicAdd(state + 1, 1u);
+        }
+    };
+    auto lane_rank = [](uint64_t mask) {
+        return static_cast<IdxT>(__builtin_amdgcn_mbcnt_hi(
+            static_cast<uint32_t>(mask >> 32),
+            __builtin_amdgcn_mbcnt_lo(static_cast<uint32_t>(mask), 0u)));
+    };
+    int run = 0;
+    auto stage_batch = [&](WideT(&w)[4], auto batch) {
+        constexpr int B = decltype(batch)::value;
+        IdxT const idx0 = skip + (static_cast<IdxT>(B * BatchVecs) + tid) * 4;
+#pragma unroll
+        for(int q = 0; q < 4; ++q)
+        {
+            if(!wave_live(batch, q)) continue;
+            bool st[4];
+            uint64_t m[4];
+            int total = 0;
+#pragma unroll
+            for(int e = 0; e < 4; ++e)
+            {
+                st[e] = in_row(batch, q) && !(w[q][e] < bound);
+                m[e]  = static_cast<uint64_t>(__ballot(st[e]));
+                total += __builtin_popcountll(m[e]);
+            }
+            IdxT const idx_q = idx0 + q * 4 * BlockSize;
+            if(run + total <= Region)
+            {
+                int pos = region_base + run;
+#pragma unroll
+                for(int e = 0; e < 4; ++e)
+                {
+                    if(st[e])
+                    {
+                        IdxT const p = pos + lane_rank(m[e]);
+                        stage_val[p] = __float_as_uint(w[q][e]);
+                        stage_idx[p] = idx_q + e;
+                    }
+                    pos += __builtin_popcountll(m[e]);
+                }
+                run += total;
+            }
+            else
+            {
+                IdxT base = 0;
+                if(lane == 0) base = atomicAdd(state + 3, static_cast<uint32_t>(total));
+                base = __builtin_amdgcn_readfirstlane(base);
+#pragma unroll
+                for(int e = 0; e < 4; ++e)
+                {
+                    IdxT const p = base + lane_rank(m[e]);
+                    if(st[e])
+                    {
+                        count_key(twiddle_in(w[q][e], false));
+                        if(p < PoolCapacity)
+                        {
+                            pool_val[p] = __float_as_uint(w[q][e]);
+                            pool_idx[p] = idx_q + e;
+                        }
+                    }
+                    base += __builtin_popcountll(m[e]);
+                }
+            }
+        }
+    };
+    auto step = [&](auto batch) {
+        constexpr int B = decltype(batch)::value;
+        if constexpr(B % 2 == 0)
+        {
+            stage_batch(wa, batch);
+            if constexpr(B + 2 < Batches) load_batch(wa, std::integral_constant<int, B + 2>{});
+        }
+        else
+        {
+            stage_batch(wb, batch);
+            if constexpr(B + 2 < Batches) load_batch(wb, std::integral_constant<int, B + 2>{});
+        }
+    };
+    static_assert(kSampledMaxBatches == 5);
+    step(std::integral_constant<int, 0>{});
+    if constexpr(Batches > 1) step(std::integral_constant<int, 1>{});
+    if constexpr(Batches > 2) step(std::integral_constant<int, 2>{});
+    if constexpr(Batches > 3) step(std::integral_constant<int, 3>{});
+    if constexpr(Batches > 4) step(std::integral_constant<int, 4>{});
+    {
+        // The unaligned head and the tail, both in wave 0: one more vector.
+        IdxT const ti      = tail_begin + tid;
+        T const xh         = tid < skip ? in[tid] : -__builtin_huge_valf();
+        T const xt         = ti < row_len ? in[ti] : -__builtin_huge_valf();
+        bool const sh      = tid < skip && !(xh < bound);
+        bool const stl     = ti < row_len && !(xt < bound);
+        uint64_t const mh  = static_cast<uint64_t>(__ballot(sh));
+        uint64_t const mt  = static_cast<uint64_t>(__ballot(stl));
+        int const total    = __builtin_popcountll(mh) + __builtin_popcountll(mt);
+        if(total != 0)
+        {
+            IdxT base = 0;
+            if(lane == 0) base = atomicAdd(state + 3, static_cast<uint32_t>(total));
+            base = __builtin_amdgcn_readfirstlane(base);
+            IdxT const ph = base + lane_rank(mh);
+            IdxT const pt = base + __builtin_popcountll(mh) + lane_rank(mt);
+            if(sh)
+            {
+                count_key(twiddle_in(xh, false));
+                if(ph < PoolCapacity)
+                {
+                    pool_val[ph] = __float_as_uint(xh);
+                    pool_idx[ph] = tid;
+                }
+            }
+            if(stl)
+            {
+                count_key(twiddle_in(xt, false));
+                if(pt < PoolCapacity)
+                {
+                    pool_val[pt] = __float_as_uint(xt);
+                    pool_idx[pt] = ti;
+                }
+            }
+        }
+    }
+
+    // A wave's slice is complete when its own scan is: each lane takes its
+    // slice entries (lane, lane + 64, ...) and counts their digits before the
+    // barrier, which then covers the window as well.  The pool's keys were
+    // counted as they were written.
+    constexpr int Held = RegionLoads + PoolLoads;
+    Bits key[Held];
+    IdxT key_index[Held];
+#pragma unroll
+    for(int j = 0; j < RegionLoads; ++j)
+    {
+        key[j]       = ~0u;
+        key_index[j] = 0;
+        if(j * WARP_SIZE < run && lane + j * WARP_SIZE < run)
+        {
+            int const at = region_base + lane + j * WARP_SIZE;
+            key_index[j] = stage_idx[at];
+            key[j]       = twiddle_in(__uint_as_float(stage_val[at]), false);
+            count_key(key[j]);
+        }
+    }
+    if(lane == 0 && run != 0) atomicAdd(staged_count, static_cast<IdxT>(run));
+    __syncthreads();
+
+    IdxT const in_pool = static_cast<IdxT>(__builtin_amdgcn_readfirstlane(state[3]));
+    IdxT const staged =
+        static_cast<IdxT>(__builtin_amdgcn_readfirstlane(*staged_count)) + in_pool;
+    if(in_pool > PoolCapacity || staged < k) return fall_back();
+#pragma unroll
+    for(int j = RegionLoads; j < Held; ++j)
+    {
+        int const at = tid + (j - RegionLoads) * BlockSize;
+        key[j]       = ~0u;
+        key_index[j] = 0;
+        if((j - RegionLoads) * BlockSize < in_pool && at < in_pool)
+        {
+            key_index[j] = pool_idx[at];
+            key[j]       = twiddle_in(__uint_as_float(pool_val[at]), false);
+        }
+    }
+
+    // Every wave finds the crossing bin: the first digit whose running count
+    // from the bound exceeds the keys to drop.
+    int const first_bins = static_cast<int>(window[lane]);
+    IdxT const within    = staged - static_cast<IdxT>(state[0]);
+    if(within < k) return fall_back();
+    IdxT const drop = within - k;
+    int cross = -1, cross_count = 0, through = 0;
+    {
+        int acc = 0;
+        for(int d0 = 0; d0 < kSampledWindowBins; d0 += WARP_SIZE)
+        {
+            int const c        = d0 == 0 ? first_bins : static_cast<int>(window[d0 + lane]);
+            int const inc      = acc + wave_inclusive_sum_dpp(c);
+            uint64_t const hit = static_cast<uint64_t>(__ballot(inc > drop));
+            if(hit != 0)
+            {
+                int const l = __builtin_ctzll(hit);
+                cross       = d0 + l;
+                cross_count = __builtin_amdgcn_readlane(c, l);
+                through     = __builtin_amdgcn_readlane(inc, l);
+                break;
+            }
+            acc = __builtin_amdgcn_readlane(inc, WARP_SIZE - 1);
+        }
+    }
+    if(cross < 0 || cross_count > kSampledBinCapacity) return fall_back();
+    IdxT const before = within - through;
+
+    // Keys above the crossing bin are compacted into a per-wave list, which
+    // half the waves flush after the barrier while the other half rank the
+    // bin; the bin's keys go to the candidate arrays.  One returning LDS
+    // atomic per wave reserves the wave's output range and its candidate
+    // slots.  The staging array is free once every lane holds its keys: each
+    // wave's list takes 2 * StageCapacity / Waves slots, more than it holds.
+    IdxT* const winner_list  = reinterpret_cast<IdxT*>(stage_val) + wave * (2 * Region);
+    uint32_t* const wave_out = per_wave + Waves;
+    static_assert(2 * Region >= Held * WARP_SIZE);
+    int winners = 0;
+    IdxT out_base = 0;
+    {
+        int bin_count = 0;
+        // A lane's candidate slot within the wave, or -1.
+        int cand_at[Held];
+#pragma unroll
+        for(int j = 0; j < Held; ++j)
+        {
+            cand_at[j] = -1;
+            if(j < RegionLoads ? j * WARP_SIZE >= run : (j - RegionLoads) * BlockSize >= in_pool)
+                continue;
+            uint32_t const d = bound_digit - (key[j] >> DigitShift);
+            bool const valid = key[j] <= stage_last;
+            bool const win   = valid && d > static_cast<uint32_t>(cross);
+            bool const cand  = valid && d == static_cast<uint32_t>(cross);
+            uint64_t const wm = static_cast<uint64_t>(__ballot(win));
+            uint64_t const cm = static_cast<uint64_t>(__ballot(cand));
+            if(win) winner_list[winners + lane_rank(wm)] = key_index[j];
+            if(cand) cand_at[j] = bin_count + lane_rank(cm);
+            winners += __builtin_popcountll(wm);
+            bin_count += __builtin_popcountll(cm);
+        }
+        uint32_t base = 0;
+        if(lane == 0)
+            base = atomicAdd(state + 2, static_cast<uint32_t>(winners) |
+                                            (static_cast<uint32_t>(bin_count) << 16));
+        base     = static_cast<uint32_t>(__builtin_amdgcn_readfirstlane(static_cast<int>(base)));
+        out_base = static_cast<IdxT>(base & 0xffffu);
+        int const cpos = static_cast<int>(base >> 16);
+        if(bin_count != 0)
+        {
+#pragma unroll
+            for(int j = 0; j < Held; ++j)
+            {
+                if(cand_at[j] >= 0)
+                {
+                    candidate_values[cpos + cand_at[j]]  = __builtin_bit_cast(T, key[j]);
+                    candidate_indices[cpos + cand_at[j]] = key_index[j];
+                }
+            }
+        }
+        if(lane == 0)
+            wave_out[wave] = static_cast<uint32_t>(out_base) |
+                             (static_cast<uint32_t>(winners) << 16);
+        // Keys past the bin's count sort after every key in it.
+        if(tid >= cross_count && tid < kSampledBinCapacity)
+            candidate_values[tid] = __builtin_bit_cast(T, ~0u);
+    }
+    __syncthreads();
+
+    constexpr int RankParts = 4;
+    constexpr int RankThreads = kSampledBinCapacity * RankParts;
+    static_assert(RankThreads <= BlockSize / 2 && RankThreads % WARP_SIZE == 0);
+    if(tid < RankThreads)
+    {
+        // The bin's rank for each of its keys, four lanes per key: position
+        // among the bin's keys by (key, slot), so ties go in slot order.
+        constexpr int Slice = kSampledBinCapacity / RankParts;
+        using U4v           = __attribute__((__ext_vector_type__(4))) uint32_t;
+        int const i         = tid / RankParts;
+        int const part      = tid % RankParts;
+        Bits const key_i    = __builtin_bit_cast(Bits, candidate_values[i]);
+        int below           = 0;
+        // A part whose slice starts past the bin compares nothing.
+        if(part * Slice < cross_count)
+        {
+            U4v slice[Slice / 4];
+#pragma unroll
+            for(int v = 0; v < Slice / 4; ++v)
+                slice[v] = reinterpret_cast<U4v const*>(candidate_values)[part * (Slice / 4) + v];
+#pragma unroll
+            for(int v = 0; v < Slice / 4; ++v)
+            {
+#pragma unroll
+                for(int e = 0; e < 4; ++e)
+                {
+                    int const j      = part * Slice + 4 * v + e;
+                    Bits const key_j = slice[v][e];
+                    below += (key_j < key_i || (key_j == key_i && j < i)) ? 1 : 0;
+                }
+            }
+        }
+        below += __builtin_amdgcn_update_dpp(0, below, 0xb1, 0xf, 0xf, false); // quad_perm:[1,0,3,2]
+        below += __builtin_amdgcn_update_dpp(0, below, 0x4e, 0xf, 0xf, false); // quad_perm:[2,3,0,1]
+        if(part == 0 && i < cross_count && below < k - before)
+            __builtin_nontemporal_store(candidate_indices[i], out_idx + before + below);
+    }
+    else
+    {
+        // The other waves write every wave's keys above the bin.
+#pragma unroll 1
+        for(int w = wave - RankThreads / WARP_SIZE; w < Waves;
+            w += (BlockSize - RankThreads) / WARP_SIZE)
+        {
+            uint32_t const range = wave_out[w];
+            int const base       = static_cast<int>(range & 0xffffu);
+            int const count      = static_cast<int>(range >> 16);
+            IdxT const* list     = reinterpret_cast<IdxT const*>(stage_val) + w * (2 * Region);
+            for(int i = lane; i < count; i += WARP_SIZE)
+                __builtin_nontemporal_store(list[i], out_idx + base + i);
+        }
+    }
+    return true;
+}
+
+/**
+ * Sampled-stage fast path of the LDS-tail kernel for select-max fp32 rows of
+ * up to 5 * 16K columns.
+ *
+ * The full-row form histograms every element to find its staging bound.  This
+ * form predicts the bound from the row's first 4K values (8K past 48K
+ * columns), with a 13-bit histogram and nearest rank to about
+ * kSampledStageTarget staged keys, so its one full-row pass only compares
+ * each value against a float threshold and stages the keys at or above it
+ * into the wave's own slice of the staging array by ballot rank, with the
+ * next batch's loads in flight and no LDS atomics.  A vector that would
+ * overflow its wave's slice goes to a shared pool in the candidate arrays.
+ * A float compare stages a superset of the keys whose radix bits are within
+ * the bound (it also takes NaNs and flushed subnormals); only keys within the
+ * bound are counted, and when at least k of them were staged the staged set
+ * holds the whole answer.  A 15-bit digit of those keys, counted downward
+ * from the bound in a window of kSampledWindowBins bins, finds the crossing
+ * bin.  Four lanes per key rank the bin's keys by (key, slot) against each
+ * other while the other half of the block flushes the keys above the bin.
+ *
+ * Nothing is written to the output unless every check passes: the staged
+ * count at least k, the pool within its capacity, the crossing bin inside the
+ * window and at most kSampledBinCapacity keys.  Otherwise the function
+ * resets the staging counter, synchronizes the block and returns false, and
+ * the caller runs its unchanged full-row form from the start.
+ *
+ * LDS: the caller's 4096-entry staging array, its 4096-bin histogram (the
+ * 13-bit sample counts, two 16-bit bins per dword), its 2048-entry winner
+ * array (the digit window) and its candidate arrays (the pool, then the
+ * crossing bin's keys), plus 96 bytes here.
+ */
+template <typename T, typename IdxT, int BlockSize, int StageCapacity, int PoolCapacity>
+__device__ __forceinline__ bool lds_tail_sampled_stage(T const* in,
+                                                       IdxT const row_len,
+                                                       IdxT const k,
+                                                       IdxT* out_idx,
+                                                       IdxT* histogram,
+                                                       unsigned long long* staged_packed,
+                                                       IdxT* window_histogram,
+                                                       T* candidate_values,
+                                                       IdxT* candidate_indices,
+                                                       IdxT* staged_count)
+{
+    static_assert(std::is_same_v<T, float> && std::is_same_v<IdxT, int>);
+    static_assert(BlockSize == 1024 && WARP_SIZE == 64);
+    static_assert(StageCapacity == 4 * BlockSize);
+    static_assert(kSampledWindowBins == 2 * BlockSize);
+    // Per wave: its sample-histogram total, then its output range.
+    __shared__ uint32_t per_wave[2 * (BlockSize / WARP_SIZE)];
+    // [0] staged keys beyond the bound, [1] keys past the digit window,
+    // [2] packed output/candidate reservation, [3] pool reservation.
+    __shared__ uint32_t state[8];
+
+    // An unaligned head, 16-byte vectors, and a tail of at most three values.
+    IdxT skip = (reinterpret_cast<size_t>(in) % sizeof(WideT))
+                    ? static_cast<IdxT>((sizeof(WideT) -
+                                         reinterpret_cast<size_t>(in) % sizeof(WideT)) /
+                                        sizeof(T))
+                    : 0;
+    if(skip > row_len) skip = row_len;
+    IdxT const len4   = (row_len - skip) / 4;
+    int const batches = static_cast<int>((len4 + 4 * BlockSize - 1) / (4 * BlockSize));
+#define TOPK_SAMPLED_STAGE_CASE(n)                                                             \
+    case n:                                                                                    \
+        return lds_tail_sampled_stage_n<T, IdxT, BlockSize, StageCapacity, PoolCapacity, n>(   \
+            in, row_len, skip, len4, k, out_idx, histogram, staged_packed, window_histogram,   \
+            candidate_values, candidate_indices, staged_count, per_wave, state)
+    static_assert(kSampledMaxBatches == 5);
+    switch(batches)
+    {
+        TOPK_SAMPLED_STAGE_CASE(1);
+        TOPK_SAMPLED_STAGE_CASE(2);
+        TOPK_SAMPLED_STAGE_CASE(3);
+        TOPK_SAMPLED_STAGE_CASE(4);
+        TOPK_SAMPLED_STAGE_CASE(5);
+    default: return false;
+    }
+#undef TOPK_SAMPLED_STAGE_CASE
+}
+
 /**
  * Short-row one-block radix specialization for fp32/k=2048 on BPP=12 parts.
  *
@@ -4748,7 +5344,7 @@ template <typename T, typename IdxT, int BlockSize, bool WRITE_TOPK_VALUES,
           unsigned ExactFirstBucket = 0, bool CacheExactStageBits = false,
           bool UseSplitExactStage = false, bool DirectKnownWinners = false,
           bool UseHigh5DirectTail = false, bool UseWaveB128ExactStage = false,
-          bool UseWaveB128Prefetch = false>
+          bool UseWaveB128Prefetch = false, bool UseSampledStage = false>
 __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
                                                      const int64_t len,
                                                      const IdxT k,
@@ -4830,6 +5426,8 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
                   (UseWaveB128ExactStage && StaticRowLen == 16384 &&
                    BlockSize == 1024 && CacheExactStageBits &&
                    !UseSplitExactStage && !DirectKnownWinners));
+    static_assert(!UseSampledStage ||
+                  (BlockSize == 1024 && WARP_SIZE == 64 && !UseExactHighBucketPredictor));
 
     __shared__ Counter<T, IdxT> counter;
     __shared__ Counter<T, IdxT> pre_counter;
@@ -4900,6 +5498,15 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
     if constexpr(WRITE_TOPK_VALUES)
     {
         out += batch_id * k;
+    }
+
+    if constexpr(UseSampledStage)
+    {
+        if(!select_min &&
+           lds_tail_sampled_stage<T, IdxT, BlockSize, StageCapacity, CandidateCapacity>(
+               in, row_len, k, out_idx, histogram, staged_packed, winner_indices,
+               candidate_values, candidate_indices, &staged_count))
+            return;
     }
 
     // Pass 0: find the high 12-bit crossing prefix.  Keep this scan local to
@@ -7058,6 +7665,9 @@ inline bool topk_oneblock_reg_launch(int ept, int batch_size, hipStream_t stream
 //    (2560 * 2048 / len), and with fewer rows than CUs the generic kernel is
 //    as fast.  With at least one row per CU the LDS tail stays at least as
 //    fast (up to 40% faster) through the widest row measured, 128 * 1024 - 1.
+//  - Up to 80 * 1024 columns (five batches of its scan) the LDS tail first
+//    runs its sampled stage (lds_tail_sampled_stage); any miss falls back to
+//    the full-row form.
 template <typename T, typename IdxT, bool WRITE_TOPK_VALUES>
 inline bool dispatch_topk_plain_gfx950(T const* in, int batch_size, int64_t len, IdxT k, T* out,
                                        IdxT* out_idx, bool select_min, hipStream_t stream)
@@ -7081,11 +7691,19 @@ inline bool dispatch_topk_plain_gfx950(T const* in, int batch_size, int64_t len,
     }
     if(len <= 22 * 1024)
     {
-        radix_topk_one_block_lds_tail_kernel<T, IdxT, 1024, WRITE_TOPK_VALUES, true>
+        radix_topk_one_block_lds_tail_kernel<T, IdxT, 1024, WRITE_TOPK_VALUES, true, 270, 0, 0u,
+                                             0u, false, false, false, false, false, false, true>
             <<<batch_size, 1024, 0, stream>>>(in, len, k, out, out_idx, select_min);
         return true;
     }
-    if(len <= 80 * 1024 || (batch_size >= topk_oneblock_num_cu() && len < 128 * 1024))
+    if(len <= 80 * 1024)
+    {
+        radix_topk_one_block_lds_tail_kernel<T, IdxT, 1024, WRITE_TOPK_VALUES, false, 270, 0, 0u,
+                                             0u, false, false, false, false, false, false, true>
+            <<<batch_size, 1024, 0, stream>>>(in, len, k, out, out_idx, select_min);
+        return true;
+    }
+    if(batch_size >= topk_oneblock_num_cu() && len < 128 * 1024)
     {
         radix_topk_one_block_lds_tail_kernel<T, IdxT, 1024, WRITE_TOPK_VALUES>
             <<<batch_size, 1024, 0, stream>>>(in, len, k, out, out_idx, select_min);
