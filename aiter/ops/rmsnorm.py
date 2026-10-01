@@ -594,6 +594,7 @@ def add_rmsnorm_quant(
     group_size: int = 0,
     shuffle_scale: bool = False,
     gemma_norm: bool = False,
+    scale_layout_m32k4: bool = False,
 ) -> None: ...
 
 
@@ -619,7 +620,16 @@ def rmsnorm_quant(
     group_size: int = 0,
     shuffle_scale: bool = False,
     gemma_norm: bool = False,
-) -> None: ...
+    scale_layout_m32k4: bool = False,
+) -> None:
+    """Fused RMSNorm + quant.
+
+    ``scale_layout_m32k4=True`` (fp8 ``out``, e8m0 ``scale``, ``group_size == 32``)
+    writes the scale directly in the gfx1250 MXFP8 ASM GEMM A-scale layout, i.e.
+    the bytes of :func:`aiter.ops.shuffle.shuffle_mxfp8fp4_scale`. ``scale`` must
+    be a contiguous ``(pad32(M), N // 32)`` byte tensor; the kernel writes the pad
+    rows as 0x7F. ``shuffle_scale`` is ignored.
+    """
 
 
 @compile_ops("module_rmsnorm_quant", develop=True)
