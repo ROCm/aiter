@@ -13,7 +13,7 @@ Minimal test suite for validating the aiter tuning infrastructure.
 | `test_mha_tuner_logic.py` | 1 | No | MHA forward tuner: problem keys, candidate enumeration, gating, runtime CSV, selection proof |
 | `test_mha_search_and_promotion.py` | 1 | No | MHA forward candidate sample, `--backends` restriction, skipping already-tuned shapes unless `--all`, and the gate against the incumbent |
 | `test_mha_store_agreement.py` | 1 | No | `aiter.ops.mha` and the Triton entry point resolve the same tile from one runtime CSV |
-| `test_mp_tuner_fault.py` | 2 | Yes | `mp_tuner` with a candidate that faults in-process or kills its worker: untyped callers get the whole group failed, `return_status` callers keep what was measured and see `not_run` behind the fault, and a shape queued behind a dead worker still finishes |
+| `test_mp_tuner_fault.py` | 2 | Yes | `mp_tuner` with a candidate that faults in-process, kills its worker, or fails while its inputs are prepared: untyped callers get the whole group failed, `return_status` callers keep what was measured and see `not_run` behind the fault, and a shape queued behind a dead worker still finishes |
 | `test_tuning_policy.py` | 1 | No | `aiter/utility/tuning_policy.py`: measurement, run and promotion defaults reach `ARG_DEFAULTS`, policy validation, `gate_against_incumbent` boundaries |
 | `test_online_tune.py` | 1 | No | `AITER_ONLINE_TUNE` decision logic, `mp_lock` synchronization, MainFunc CSV write, cfg_2stages reload |
 | `test_tune_pipeline.py` | 2 | Yes | End-to-end: run each tuner on small shapes (mp=1 + mp=default), verify output CSV; `--compare --update_improved`; `AITER_ONLINE_TUNE` e2e |
