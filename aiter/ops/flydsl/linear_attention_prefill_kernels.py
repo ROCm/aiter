@@ -308,6 +308,12 @@ _ADAPTIVE_K5_META_ATTR = "_aiter_gdn_k5_adaptive_meta"
 # because each tensor retains its uploaded schedule.
 _DENSE_K5_OFFSETS_MAX = 32
 _DENSE_K5_OFFSETS = OrderedDict()
+# Serial K5 cost scales with the longest sequence's chunks (~1.6 us/chunk);
+# blocked scales with total_blocks * H (~0.18 us/block/head) plus a fixed carry
+# pass (~25 chunks). gfx950 break-even is ratio ~9 and ~40 chunks, so 6 and 64
+# leave margin; the ratio also bounds the maps/entry scratch.
+_BLOCKED_MIN_CHUNKS = 64
+_BLOCKED_MAX_WORK_PER_CHUNK = 6
 
 
 def _as_int32(t: torch.Tensor) -> torch.Tensor:
@@ -975,23 +981,28 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
     ):
         lengths = _gdn_k5_sequence_lengths(cu_seqlens, T, prefill_metadata)
         chunk_counts = tuple(triton.cdiv(length, BT) for length in lengths)
-        if all(length > 0 for length in lengths) and max(chunk_counts) > 1:
+        if (
+            all(length > 0 for length in lengths)
+            and max(chunk_counts) >= _BLOCKED_MIN_CHUNKS
+        ):
             target_segments = _gdn_k5_target_segments()
             # K5 requires its own blocks when shared metadata uses scalar sizing.
             adaptive_metadata = _resolve_adaptive_k5_metadata(
                 cu_seqlens, T_flat, k.device, target_segments, lengths=lengths
             )
-            return _chunk_gated_delta_rule_fwd_h_blocked(
-                k,
-                w,
-                u,
-                g,
-                initial_state,
-                cu_seqlens=cu_seqlens,
-                prefill_metadata=adaptive_metadata,
-                target_segments=target_segments,
-                state_dtype=resolved_state_dtype,
-            )
+            total_blocks = adaptive_metadata.get_chunk_schedule(64).total_blocks
+            if total_blocks * H <= _BLOCKED_MAX_WORK_PER_CHUNK * max(chunk_counts):
+                return _chunk_gated_delta_rule_fwd_h_blocked(
+                    k,
+                    w,
+                    u,
+                    g,
+                    initial_state,
+                    cu_seqlens=cu_seqlens,
+                    prefill_metadata=adaptive_metadata,
+                    target_segments=target_segments,
+                    state_dtype=resolved_state_dtype,
+                )
 
     h = k.new_empty(h_shape, dtype=resolved_snapshot_dtype)
     v_new_buf = k.new_empty(vn_shape, dtype=vn_dtype)
