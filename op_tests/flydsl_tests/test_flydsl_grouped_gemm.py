@@ -246,8 +246,6 @@ def _pattern_packed(
     generator: torch.Generator,
 ) -> torch.Tensor:
     """Build packed MXFP4 weights with the shared benchmark initializer."""
-    if data_init == "zero":
-        return torch.zeros((experts, rows, k_pack), dtype=torch.uint8)
     if data_init == "constant":
         return torch.full((experts, rows, k_pack), 0x11, dtype=torch.uint8)
     packed = bench_init.fill_fp4((experts * rows, k_pack * 2), data_init, generator)
@@ -263,8 +261,6 @@ def init_weight_scales(
     generator: torch.Generator,
 ) -> torch.Tensor:
     """Build E8M0 weight scales with the shared benchmark initializer."""
-    if scale_init == "zero":
-        return torch.zeros((experts, rows, n_blocks), dtype=torch.uint8)
     if scale_init == "constant":
         return torch.full(
             (experts, rows, n_blocks), DEFAULT_SCALE_BYTE, dtype=torch.uint8
@@ -279,8 +275,6 @@ def _init_hidden(
     generator: torch.Generator,
 ) -> torch.Tensor:
     """Build BF16 activations using the selected low-precision data model."""
-    if data_init == "zero":
-        return torch.zeros(shape, dtype=torch.bfloat16)
     if data_init == "constant":
         return torch.full(shape, 0.5, dtype=torch.bfloat16)
     if data_format == "a4w4":
@@ -1247,7 +1241,7 @@ def main() -> None:
         "--data-init",
         dest="data_init",
         nargs="+",
-        choices=("zero", *bench_init.DATA_DISTS),
+        choices=bench_init.DATA_DISTS,
         default=None,
         help="DATA initialization distribution(s), paired position-wise with "
         "--scale-init (length-1 broadcasts). Default: constant uniform",
@@ -1291,7 +1285,7 @@ def main() -> None:
         "--scale-init",
         dest="scale_init",
         nargs="+",
-        choices=("zero", *bench_init.E8M0_SCALE_DISTS),
+        choices=bench_init.E8M0_SCALE_DISTS,
         default=None,
         help="E8M0 SCALE initialization distribution(s), paired position-wise "
         "with --data-init (length-1 broadcasts). Default: constant auto",

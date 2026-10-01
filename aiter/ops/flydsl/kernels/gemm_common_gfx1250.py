@@ -147,19 +147,6 @@ def fclamp_f32(x, lo, hi):
     )
 
 
-def _fma_f32(a, b, c):
-    """Evaluate ``a * b + c`` as one fused f32 operation."""
-    return fx.Float32(
-        llvm_dialect.call_intrinsic(
-            T.f32,
-            "llvm.fma.f32",
-            [as_ir_value(a), as_ir_value(b), as_ir_value(c)],
-            [],
-            [],
-        )
-    )
-
-
 def fused_silu_swiglu_elem(g, u, *, swiglu, limit_f32, neg_limit_f32):
     """One (gate, up) pair -> fused silu or swiglu scalar (gpt-oss clamp).
 
@@ -170,12 +157,14 @@ def fused_silu_swiglu_elem(g, u, *, swiglu, limit_f32, neg_limit_f32):
     _half = fx.Float32(0.5)
     g = fmin_f32(g, limit_f32)
     u = fclamp_f32(u, neg_limit_f32, limit_f32)
-    half_gate = g * _half
     if swiglu:
-        th = fx.Float32(rocdl.tanh(T.f32, as_ir_value(half_gate * fx.Float32(1.702))))
-        return _fma_f32(half_gate, th, half_gate) * (u + _one)
-    th = fx.Float32(rocdl.tanh(T.f32, as_ir_value(half_gate)))
-    return _fma_f32(half_gate, th, half_gate) * u
+        _half_beta = fx.Float32(1.702 * 0.5)
+        th = fx.Float32(rocdl.tanh(T.f32, as_ir_value(g * _half_beta)))
+        sig = _half * (_one + th)
+        return g * sig * (u + _one)
+    th = fx.Float32(rocdl.tanh(T.f32, as_ir_value(g * _half)))
+    sig = _half * (_one + th)
+    return g * sig * u
 
 
 def _tanh_f32(x, tanh_mul):
