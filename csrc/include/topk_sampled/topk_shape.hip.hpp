@@ -660,8 +660,14 @@ static inline ShapeParams derive_shape_params(int M,
         margin = std::max(margin, 1.625f);
     const double cap_margin = CAP_SAFE_FILL * (double)PHASE_C_CAP_MAX / (double)K;
     const double eff_margin = std::min((double)margin, cap_margin);
-    const int rank          = std::max(1, (int)(eff_margin * (double)K * (double)S / (double)N));
-    const int cap           = derive_cap(K, margin, S, N);
+    // Gate self-test only: a scale below 1 lifts the sampled threshold so gaussian
+    // rows undershoot K and every one of them takes phase_c's fallback.
+#ifndef FB_FORCE_RANK_SCALE
+#define FB_FORCE_RANK_SCALE 1
+#endif
+    const int rank =
+        std::max(1, (int)(eff_margin * FB_FORCE_RANK_SCALE * (double)K * (double)S / (double)N));
+    const int cap = derive_cap(K, margin, S, N);
 
     p.S      = S;
     p.margin = margin;

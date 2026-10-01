@@ -702,7 +702,8 @@ phase_c_select_contig(const float* __restrict__ input,
                       int* __restrict__ fb_count,
                       int npasses,
                       bool keys_only,
-                      int nwide)
+                      int nwide,
+                      const uint32_t* __restrict__ threshold)
 {
     const int row       = blockIdx.x;
     const int row_start = RAGGED ? extents.row_start(row, pitch) : 0;
@@ -731,15 +732,74 @@ phase_c_select_contig(const float* __restrict__ input,
     const int k_out = RAGGED ? k_take_dev(K, len) : K;
     // See phase_c_select_waveseg: len <= K routes unconditionally so the identity
     // emit cannot be diverted by a cand_count the +inf threshold let through.
+    int c_band = (int)c_raw;
     if((RAGGED && len <= K) || c_raw < (unsigned)k_out || c_raw > (unsigned)cap)
     {
         if(threadIdx.x == 0)
             fb_rows[atomicAdd(fb_count, 1)] = row;
+#if FB_BAND
+        const float* rif0 = input + (size_t)row * pitch + row_start;
+        if(RAGGED && len <= K)
+        {
+            emit_identity_row<WRITE_VALUES>(out, val, rif0, row_start, len, K);
+            return;
+        }
+        uint64_t* cand_w = const_cast<uint64_t*>(cand_pack) + (size_t)row * cap;
+        // An overflowed row's answer lies at or above phase_a's threshold, where only
+        // a few thousand of its keys are.
+        const uint32_t tmin = FB_BAND_TFILTER && c_raw > (unsigned)cap ? threshold[row] : 0u;
+        // Same loader choice as exact_row_select: a plain row whose width is not a
+        // multiple of FP32_EPT is read bounds-checked, or its last columns are lost.
+        int got;
+        if(!RAGGED && (len % FP32_EPT) != 0)
+            got = radix_fallback_row<true, WRITE_VALUES>(rif0,
+                                                         n4_cover(len),
+                                                         len,
+                                                         row_start,
+                                                         k_out,
+                                                         cap,
+                                                         tmin,
+                                                         cand_w,
+                                                         out,
+                                                         val,
+                                                         s_hist,
+                                                         s_dyn,
+                                                         s_scan,
+                                                         s_mm,
+                                                         &s_wgt,
+                                                         &s_weq);
+        else
+            got =
+                radix_fallback_row<RAGGED, WRITE_VALUES>(rif0,
+                                                         RAGGED ? n4_cover(len) : pitch / FP32_EPT,
+                                                         len,
+                                                         row_start,
+                                                         k_out,
+                                                         cap,
+                                                         tmin,
+                                                         cand_w,
+                                                         out,
+                                                         val,
+                                                         s_hist,
+                                                         s_dyn,
+                                                         s_scan,
+                                                         s_mm,
+                                                         &s_wgt,
+                                                         &s_weq);
+#if FB_BAND_PROBE
+        if(threadIdx.x == 0)
+            printf("FBBAND row=%d c_raw=%u got=%d\n", row, c_raw, got);
+#endif
+        if(got < 0)
+            return; // emitted; len > K here, so k_out == K and nothing to pad
+        c_band = got;
+#else
         exact_row_select<RAGGED, WRITE_VALUES>(
             input, pitch, extents, K, row, out, val, s_hist, s_red, s_scan, &s_wgt, &s_weq, s_dyn);
         return;
+#endif
     }
-    const int c          = (int)c_raw;
+    const int c          = c_band;
     const uint64_t* base = cand_pack + (size_t)row * cap;
 
     // Prices the other half of fusing phase_b into phase_c: if the candidates were

@@ -1291,9 +1291,10 @@ __device__ __forceinline__ void block_gather_stream(const float* __restrict__ ro
     }
 }
 
-// Exact full-row select for ONE row, streaming it from global memory. Shared by
-// the fallback branch inside Phase C and by the standalone Phase D oracle, so
-// the two can never drift apart. All threads of the block must call.
+// Exact full-row select for ONE row, streaming it from global memory: Phase D
+// (the direct pipeline and the verification oracle) and phase_c_select_waveseg.
+// phase_c_select_contig uses radix_fallback_row instead (FB_BAND=0 restores this),
+// so the oracle is an independent implementation. All threads must call.
 template <bool RAGGED, bool WRITE_VALUES>
 __device__ __forceinline__ void exact_row_select(const float* __restrict__ input,
                                                  int pitch,
@@ -1398,6 +1399,493 @@ __device__ __forceinline__ void exact_row_select(const float* __restrict__ input
         __syncthreads();
         pad_topk_tail<WRITE_VALUES>(out, out_val, k_out, K);
     }
+}
+
+// Fallback for a row whose sampled threshold missed, in two streamed reads where
+// exact_row_select takes four (three radix passes and a gather): one pass
+// histograms the top WIDE_BITS of every key, the bucket holding rank k_out is
+// found, and a second pass writes every key in that bucket or above to the
+// row's candidate area in phase_b's record format, so phase_c's own LDS select
+// finishes the row. Smooth rows land a few thousand keys there, under cap.
+// Returns the new candidate count, -1 when the row was emitted here (every key
+// one value), or -2 when the keys at and above the crossing bucket exceed cap
+// and exact_row_select has to take the row.
+#ifndef FB_BAND
+#define FB_BAND 1
+#endif
+// Gate self-test only: collects nothing from the crossing bucket but still
+// reports it collected. Must turn the gate red.
+#ifndef FB_BAND_MUTANT
+#define FB_BAND_MUTANT 0
+#endif
+// 0 counts every key of an overflowed row too (pricing knob).
+#ifndef FB_BAND_TFILTER
+#define FB_BAND_TFILTER 1
+#endif
+// Pricing / census only: prints every fallback row's outcome from phase_c.
+#ifndef FB_BAND_PROBE
+#define FB_BAND_PROBE 0
+#endif
+constexpr int FB_BAND_SH = 32 - WIDE_BITS;
+static_assert(WIDE_FINE <= FB_SCRATCH_WORDS, "the band histogram lives in the fallback scratch");
+
+// One block streams the whole row here, so these passes are bound by VALU work
+// per key, not by the read: exact_row_select's pass 0 is ~6 VALU a key. A
+// wave-level vote per key (a leader election, or a ballot per key slot) cost
+// 1.6-3x of one of its passes.
+//
+// Histogram: each lane counts a run of keys in one bucket and adds the run when
+// the bucket changes. A tie-dense or locally sorted row then costs a compare and
+// an add per key instead of every atomic of the row queueing on one LDS word.
+// SINK (an overflowed row): every bucket below sink + 1, phase_a's threshold
+// bucket, is counted as bucket sink, so the background keys that cannot win
+// form one long run per lane instead of an atomic each.
+template <bool LR, bool SINK>
+__device__ __forceinline__ void band_hist_vec(uint32_t* __restrict__ s_fine,
+                                              const vfloat4& v,
+                                              int i,
+                                              int n4,
+                                              int len,
+                                              uint32_t sink,
+                                              uint32_t& run_d,
+                                              uint32_t& run_n)
+{
+#pragma unroll
+    for(int e = 0; e < FP32_EPT; e++)
+    {
+        if(i < n4 && (!LR || i * FP32_EPT + e < len))
+        {
+            uint32_t d = fp32_to_sortable(v[e]) >> FB_BAND_SH;
+            if(SINK)
+                d = max(d, sink);
+            if(d != run_d)
+            {
+                if(run_n)
+                    atomicAdd(&s_fine[run_d], run_n);
+                run_d = d;
+                run_n = 0u;
+            }
+            run_n++;
+        }
+    }
+}
+
+// One histogram pass over the row: main trips while every lane of this wave has
+// a vector in every slot, so the loads go out unpredicated; the rest of the row
+// in live-predicated trips.
+template <bool LR, bool SINK>
+__device__ __forceinline__ void band_hist_pass(const float* __restrict__ row,
+                                               int n4,
+                                               int len,
+                                               uint32_t sink,
+                                               uint32_t* __restrict__ s_fine,
+                                               uint32_t& run_d,
+                                               uint32_t& run_n)
+{
+    const int step      = FB_SEL_LOADS * (int)blockDim.x;
+    const int wave_last = (int)threadIdx.x | (WAVE_SIZE - 1);
+    int i0              = 0;
+    for(; i0 + wave_last + (FB_SEL_LOADS - 1) * (int)blockDim.x < n4; i0 += step)
+    {
+        vfloat4 v[FB_SEL_LOADS];
+#pragma unroll
+        for(int u = 0; u < FB_SEL_LOADS; u++)
+            v[u] = load_row_f4<LR>(row, i0 + u * (int)blockDim.x + (int)threadIdx.x, len);
+#pragma unroll
+        for(int u = 0; u < FB_SEL_LOADS; u++)
+            band_hist_vec<LR, SINK>(s_fine,
+                                    v[u],
+                                    i0 + u * (int)blockDim.x + (int)threadIdx.x,
+                                    n4,
+                                    len,
+                                    sink,
+                                    run_d,
+                                    run_n);
+    }
+    for(; i0 < n4; i0 += step)
+    {
+        vfloat4 v[FB_SEL_LOADS];
+#pragma unroll
+        for(int u = 0; u < FB_SEL_LOADS; u++)
+        {
+            const int i = i0 + u * (int)blockDim.x + (int)threadIdx.x;
+            v[u]        = i < n4 ? load_row_f4<LR>(row, i, len) : vfloat4{0.f, 0.f, 0.f, 0.f};
+        }
+#pragma unroll
+        for(int u = 0; u < FB_SEL_LOADS; u++)
+            band_hist_vec<LR, SINK>(s_fine,
+                                    v[u],
+                                    i0 + u * (int)blockDim.x + (int)threadIdx.x,
+                                    n4,
+                                    len,
+                                    sink,
+                                    run_d,
+                                    run_n);
+    }
+}
+
+// Appends the keys of one vector whose prefix key >> csh is at least cthr to the
+// candidate records. A few thousand keys of the row qualify, so each reserves its
+// own slot.
+template <bool LR>
+__device__ __forceinline__ void band_take_vec(uint64_t* __restrict__ cand_w,
+                                              unsigned* __restrict__ s_cnt,
+                                              const vfloat4& v,
+                                              int i,
+                                              int n4,
+                                              int len,
+                                              uint32_t csh,
+                                              uint32_t cthr,
+                                              int cap)
+{
+#pragma unroll
+    for(int e = 0; e < FP32_EPT; e++)
+    {
+        const int col    = i * FP32_EPT + e;
+        const uint32_t d = fp32_to_sortable(v[e]) >> csh;
+        if(i < n4 && (!LR || col < len) && (FB_BAND_MUTANT == 1 ? d > cthr : d >= cthr))
+        {
+            const unsigned p = atomicAdd(s_cnt, 1u);
+            if(p < (unsigned)cap)
+                cand_w[p] = ((uint64_t)__float_as_uint(v[e]) << 32) | (uint32_t)col;
+        }
+    }
+}
+
+// Histogram of digit (key >> dsh) & dmask over the keys with key >> fsh == fpfx,
+// for refining inside a crossing bucket too full to collect, plus those keys'
+// min and max: a bucket of one value is answered without another read. Most keys
+// fail the prefix test, so this costs about what a filtered radix pass does.
+#ifndef FB_REFINE_LOADS
+#define FB_REFINE_LOADS 1
+#endif
+template <bool LR>
+__device__ __forceinline__ void band_refine_pass(const float* __restrict__ row,
+                                                 int n4,
+                                                 int len,
+                                                 uint32_t fsh,
+                                                 uint32_t fpfx,
+                                                 uint32_t dsh,
+                                                 uint32_t dmask,
+                                                 uint32_t* __restrict__ s_fine,
+                                                 uint32_t& kmin,
+                                                 uint32_t& kmax)
+{
+    const int step = FB_REFINE_LOADS * (int)blockDim.x;
+    uint32_t run_d = 0xFFFFFFFFu, run_n = 0u;
+    for(int i0 = 0; i0 < n4; i0 += step)
+    {
+        vfloat4 v[FB_REFINE_LOADS];
+#pragma unroll
+        for(int u = 0; u < FB_REFINE_LOADS; u++)
+        {
+            const int i = i0 + u * (int)blockDim.x + (int)threadIdx.x;
+            v[u]        = i < n4 ? load_row_f4<LR>(row, i, len) : vfloat4{0.f, 0.f, 0.f, 0.f};
+        }
+#pragma unroll
+        for(int u = 0; u < FB_REFINE_LOADS; u++)
+        {
+            const int i = i0 + u * (int)blockDim.x + (int)threadIdx.x;
+#pragma unroll
+            for(int e = 0; e < FP32_EPT; e++)
+            {
+                const uint32_t key = fp32_to_sortable(v[u][e]);
+                if(i < n4 && (!LR || i * FP32_EPT + e < len) && (key >> fsh) == fpfx)
+                {
+                    const uint32_t d = (key >> dsh) & dmask;
+                    if(d != run_d)
+                    {
+                        if(run_n)
+                            atomicAdd(&s_fine[run_d], run_n);
+                        run_d = d;
+                        run_n = 0u;
+                    }
+                    run_n++;
+                    kmin = min(kmin, key);
+                    kmax = max(kmax, key);
+                }
+            }
+        }
+    }
+    if(run_n)
+        atomicAdd(&s_fine[run_d], run_n);
+}
+
+// Coarse buckets from the fine ones, then the fine bucket holding rank `rank`
+// (s_scan[0], or 0xFFFFFFFF when the histogram holds fewer keys) and the count
+// above it (s_scan[1]). Ends with a barrier.
+__device__ __forceinline__ void band_find(uint32_t* __restrict__ s_hist,
+                                          uint32_t* __restrict__ s_x,
+                                          uint32_t* __restrict__ s_scan,
+                                          int rank)
+{
+    using u32x4 = __attribute__((__ext_vector_type__(4))) uint32_t;
+    // Coarse bucket cb is the sum of fine buckets [64 cb, 64 cb + 64), written to
+    // replica 0; 16 lanes of 4 fine buckets each.
+    for(int t0 = 0; t0 < WIDE_FINE / 4; t0 += blockDim.x)
+    {
+        const int t = t0 + (int)threadIdx.x;
+        uint32_t s  = 0u;
+        if(t < WIDE_FINE / 4)
+        {
+            const u32x4 f = reinterpret_cast<const u32x4*>(s_x)[t];
+            s             = f[0] + f[1] + f[2] + f[3];
+        }
+        s += (uint32_t)__shfl_xor((int)s, 1);
+        s += (uint32_t)__shfl_xor((int)s, 2);
+        s += (uint32_t)__shfl_xor((int)s, 4);
+        s += (uint32_t)__shfl_xor((int)s, 8);
+        if(t < WIDE_FINE / 4 && (t & 15) == 0)
+            s_hist[(t >> 4) * HIST_REP] = s;
+    }
+    __syncthreads();
+    block_find_pivot_wide_wave0(s_hist, s_x, s_scan, rank);
+}
+
+// Clears the histogram buffers and the search result. Every wave must have read
+// the previous search result before this runs.
+__device__ __forceinline__ void
+band_clear(uint32_t* __restrict__ s_hist, uint32_t* __restrict__ s_x, uint32_t* __restrict__ s_scan)
+{
+    using u32x4   = __attribute__((__ext_vector_type__(4))) uint32_t;
+    const u32x4 z = {0u, 0u, 0u, 0u};
+    for(int j = threadIdx.x; j < WIDE_FINE / 4; j += blockDim.x)
+        reinterpret_cast<u32x4*>(s_x)[j] = z;
+    for(int j = threadIdx.x; j < WIDE_COARSE_SLOTS; j += blockDim.x)
+        s_hist[j] = 0u;
+    if(threadIdx.x == 0)
+    {
+        s_scan[0] = 0xFFFFFFFFu;
+        s_scan[1] = 0u;
+    }
+    __syncthreads();
+}
+
+// The whole fallback of phase_c for one row (every thread of the block calls):
+// an MSD radix select streamed from the row, 12 + 12 + 8 bits, that stops as soon
+// as it can.
+//   level 1: histogram of the top 12 bits of every key (an overflowed row,
+//            tmin > 0, counts the buckets below phase_a's threshold as one);
+//   level 2: bits [8, 20) of the keys in the crossing bucket only;
+//   level 3: bits [0, 8) of the keys in the crossing 24-bit bucket only.
+// After each level: if the keys at and above the crossing bucket fit cap they
+// are collected into the row's candidate records and phase_c's own LDS select
+// finishes the row (returns their count); if the crossing bucket is one value,
+// or level 3 has pinned the k-th key, block_gather_stream emits the row
+// (returns -1). Every level drops only keys that cannot be among the top k_out,
+// so the row is exact on every exit; at most four reads of the row.
+template <bool LR, bool WRITE_VALUES>
+__device__ __forceinline__ int radix_fallback_row(const float* __restrict__ row,
+                                                  int n4,
+                                                  int len,
+                                                  int row_start,
+                                                  int k_out,
+                                                  int cap,
+                                                  uint32_t tmin,
+                                                  uint64_t* __restrict__ cand_w,
+                                                  int* __restrict__ out,
+                                                  float* __restrict__ out_val,
+                                                  uint32_t* __restrict__ s_hist,
+                                                  uint32_t* __restrict__ s_x,
+                                                  uint32_t* __restrict__ s_scan,
+                                                  uint32_t* __restrict__ s_amm,
+                                                  unsigned* __restrict__ s_wgt,
+                                                  unsigned* __restrict__ s_weq)
+{
+    const int step = FB_SEL_LOADS * (int)blockDim.x;
+    // The collect pass trips the same way as band_hist_pass.
+    const int wave_last = (int)threadIdx.x | (WAVE_SIZE - 1);
+
+    // Level 1. The merged bucket stands for every key below phase_a's threshold;
+    // landing in it means the k-th key is below that threshold after all (only a
+    // row full of negative NaNs, which phase_b counts), and the row is counted
+    // again without it. Straight-line on purpose: a loop around these passes kept
+    // their state live across the back edge and cost phase_c 36-104 B/lane scratch.
+    const uint32_t tb = tmin >> FB_BAND_SH;
+    bool sink         = tb > 0u;
+    uint32_t bstar    = 0xFFFFFFFFu;
+    int above = 0, in_b = 0;
+    if(sink)
+    {
+        band_clear(s_hist, s_x, s_scan);
+        uint32_t run_d = 0xFFFFFFFFu, run_n = 0u;
+        band_hist_pass<LR, true>(row, n4, len, tb - 1u, s_x, run_d, run_n);
+        if(run_n)
+            atomicAdd(&s_x[run_d], run_n);
+        __syncthreads();
+        band_find(s_hist, s_x, s_scan, k_out);
+        bstar = s_scan[0];
+        above = (int)s_scan[1];
+        in_b  = bstar != 0xFFFFFFFFu ? (int)s_x[bstar] : 0;
+        // Every wave reads the search result before any wave moves on: the next pass
+        // clears s_scan and s_x, and a wave that read them late took a different
+        // branch from the rest of its block (wrong rows and memory faults at M >= 512,
+        // where blocks share a CU).
+        __syncthreads();
+        sink = bstar != 0xFFFFFFFFu && bstar != tb - 1u;
+    }
+    if(!sink)
+    {
+        band_clear(s_hist, s_x, s_scan);
+        uint32_t run_d = 0xFFFFFFFFu, run_n = 0u;
+        band_hist_pass<LR, false>(row, n4, len, 0u, s_x, run_d, run_n);
+        if(run_n)
+            atomicAdd(&s_x[run_d], run_n);
+        __syncthreads();
+        band_find(s_hist, s_x, s_scan, k_out);
+        bstar = s_scan[0];
+        above = (int)s_scan[1];
+        in_b  = bstar != 0xFFFFFFFFu ? (int)s_x[bstar] : 0;
+        __syncthreads(); // as above
+    }
+#ifndef FB_BAND_ABLATE
+#define FB_BAND_ABLATE 0
+#endif
+    // Pricing only, WRONG RESULTS: 1 stops after the level-1 pass.
+    if(FB_BAND_ABLATE == 1)
+        return -1;
+    // Every key of the row was counted and len > k_out, so rank k_out exists.
+    if(bstar == 0xFFFFFFFFu)
+        __builtin_trap();
+
+    uint32_t csh = FB_BAND_SH, cthr = bstar; // collect keys with key >> csh >= cthr
+    int ngt        = above;                  // keys known to rank above the current prefix
+    uint32_t pivot = 0u;
+    bool emit      = false;
+    if(above + in_b > cap)
+    {
+        // The whole row in one bucket: a min/max read settles one value for less
+        // than a refine pass, whose prefix test every key of such a row passes.
+        emit = above == 0 && in_b == len &&
+               row_prefix_single_value<LR>(
+                   row, n4, len, bstar << FB_BAND_SH, FB_BAND_SH, s_amm, pivot);
+        uint32_t fsh = FB_BAND_SH, pfx = bstar; // keys with key >> fsh == pfx are refined
+#pragma unroll 1
+        for(int lvl = 0; lvl < 2 && !emit; lvl++)
+        {
+            const uint32_t dsh   = lvl == 0 ? 8u : 0u;
+            const uint32_t dmask = lvl == 0 ? 0xFFFu : 0xFFu;
+            band_clear(s_hist, s_x, s_scan);
+            uint32_t kmin = 0xFFFFFFFFu, kmax = 0u;
+            band_refine_pass<LR>(row, n4, len, fsh, pfx, dsh, dmask, s_x, kmin, kmax);
+#pragma unroll
+            for(int off = 1; off < WAVE_SIZE; off <<= 1)
+            {
+                kmin = min(kmin, (uint32_t)__shfl_xor((int)kmin, off));
+                kmax = max(kmax, (uint32_t)__shfl_xor((int)kmax, off));
+            }
+            if((threadIdx.x & (WAVE_SIZE - 1)) == 0)
+            {
+                s_amm[threadIdx.x / WAVE_SIZE]                       = kmin;
+                s_amm[MAX_WAVES_PER_BLOCK + threadIdx.x / WAVE_SIZE] = kmax;
+            }
+            __syncthreads();
+            kmin = 0xFFFFFFFFu;
+            kmax = 0u;
+            for(int w = 0; w < (int)(blockDim.x / WAVE_SIZE); w++)
+            {
+                kmin = min(kmin, s_amm[w]);
+                kmax = max(kmax, s_amm[MAX_WAVES_PER_BLOCK + w]);
+            }
+            if(kmin == kmax)
+            {
+                // Every key of the prefix is one value: ngt keys above it, the rest copies.
+                pivot = kmin;
+                emit  = true;
+                break;
+            }
+            band_find(s_hist, s_x, s_scan, k_out - ngt);
+            const uint32_t b = s_scan[0];
+            const int a      = (int)s_scan[1];
+            const int in     = b != 0xFFFFFFFFu ? (int)s_x[b] : 0;
+            __syncthreads(); // as at level 1: everyone has the result before the next clear
+            pfx = (pfx << (fsh - dsh)) | (b & dmask);
+            fsh = dsh;
+            ngt += a;
+            if(lvl == 0 && ngt + in <= cap)
+            {
+                csh  = dsh;
+                cthr = pfx;
+                break;
+            }
+            if(lvl == 1)
+            {
+                pivot = pfx; // all 32 bits: the k-th key itself
+                emit  = true;
+            }
+        }
+    }
+    if(emit)
+    {
+        if(FB_BAND_MUTANT == 2)
+            ngt++;
+        if(threadIdx.x == 0)
+        {
+            *s_wgt = 0u;
+            *s_weq = 0u;
+        }
+        __syncthreads();
+        block_gather_stream<WRITE_VALUES>(
+            row, len, row_start, pivot, ngt, k_out - ngt, out, out_val, s_wgt, s_weq);
+        return -1;
+    }
+
+    if(threadIdx.x == 0)
+        *s_wgt = 0u;
+    __syncthreads();
+    int i0 = 0;
+    for(; i0 + wave_last + (FB_SEL_LOADS - 1) * (int)blockDim.x < n4; i0 += step)
+    {
+        vfloat4 v[FB_SEL_LOADS];
+#pragma unroll
+        for(int u = 0; u < FB_SEL_LOADS; u++)
+            v[u] = load_row_f4<LR>(row, i0 + u * (int)blockDim.x + (int)threadIdx.x, len);
+#pragma unroll
+        for(int u = 0; u < FB_SEL_LOADS; u++)
+            band_take_vec<LR>(cand_w,
+                              s_wgt,
+                              v[u],
+                              i0 + u * (int)blockDim.x + (int)threadIdx.x,
+                              n4,
+                              len,
+                              csh,
+                              cthr,
+                              cap);
+    }
+    for(; i0 < n4; i0 += step)
+    {
+        vfloat4 v[FB_SEL_LOADS];
+#pragma unroll
+        for(int u = 0; u < FB_SEL_LOADS; u++)
+        {
+            const int i = i0 + u * (int)blockDim.x + (int)threadIdx.x;
+            v[u]        = i < n4 ? load_row_f4<LR>(row, i, len) : vfloat4{0.f, 0.f, 0.f, 0.f};
+        }
+#pragma unroll
+        for(int u = 0; u < FB_SEL_LOADS; u++)
+            band_take_vec<LR>(cand_w,
+                              s_wgt,
+                              v[u],
+                              i0 + u * (int)blockDim.x + (int)threadIdx.x,
+                              n4,
+                              len,
+                              csh,
+                              cthr,
+                              cap);
+    }
+    // phase_c reads these records back in this workgroup, on this CU, so the
+    // barrier's workgroup-scope fence is enough. An agent-scope __threadfence()
+    // here writes back and invalidates the XCD's L2 under every other block.
+    __syncthreads();
+    const int got = (int)*s_wgt;
+    if(FB_BAND_MUTANT == 1)
+        return got + 1;
+    // Every key at or above the collect prefix was taken, and all of them were
+    // written when got <= cap, so the records hold the top k_out whatever the
+    // histogram counted; outside that the row changed between two reads.
+    if(got < k_out || got > cap)
+        __builtin_trap();
+    return got;
 }
 
 #include "topk_sampled/topk_generalize.hip.hpp"
@@ -2655,7 +3143,8 @@ static void topk_fused_impl(const float* d_in,
                                                           b.fb_count,
                                                           g_phase_c_passes,
                                                           keys_only_c,
-                                                          nwide_c);
+                                                          nwide_c,
+                                                          b.threshold);
         };
         if(reuse_wide_c)
             launch_phase_c(std::true_type{});
