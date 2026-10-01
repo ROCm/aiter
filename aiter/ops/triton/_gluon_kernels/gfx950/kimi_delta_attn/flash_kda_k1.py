@@ -6,7 +6,7 @@ import math
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-from aiter.ops.triton._triton_kernels.chunk_delta_attn.fast_launch import fast_launch
+from aiter.ops.triton._triton_kernels.kimi_delta_attn.fast_launch import fast_launch
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 _BLK_WARP_K: gl.constexpr = gl.BlockedLayout([1, 8], [8, 8], [1, 2], [1, 0])
