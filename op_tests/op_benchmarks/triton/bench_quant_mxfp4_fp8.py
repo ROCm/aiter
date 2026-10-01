@@ -96,7 +96,6 @@ def run_benchmark(args):
         raise ValueError("--use-sr requires --dtype bf16 or fp32")
     if args.use_sr and any(M <= 0 or N <= 0 or N % 32 != 0 for _, M, N in x_vals):
         raise ValueError("--use-sr requires positive shapes with N divisible by 32")
-    line_vals = get_line_vals(args)
 
     if args.metric == "time":
         ylabel = "Time (ms)"
@@ -129,7 +128,9 @@ def run_benchmark(args):
         x = torch.randn((M, N), dtype=dtype, device="cuda")
         quant_fn = get_provider(fmt, provider)
 
-        # Rotates input copies past L2 so timings are not cache-hot.
+        # run_perftest rotates through enough distinct input copies to exceed
+        # L2 capacity and measures actual device kernel time via the
+        # profiler, so results aren't inflated by cache/address locality.
         if use_sr:
             _, us = run_perftest(quant_fn, x, use_sr=True, philox_seed=1234)
         else:
