@@ -15,13 +15,14 @@ This test pins the a8w4 path the model will run:
   3. ``flydsl_batched_gemm_a8w4_v2`` (layout='mbn', preallocated ``out=``),
 and the a8w8 path ``batched_gemm_a8w8_mxscale_bpreshuffle`` with each e8m0
 block the arch runs: 1x32 / 32x32 and 1x128 / 128x128 on gfx950 and gfx1250,
-plus gfx1250's 1x32 (n32k4-shuffled) weight scale. A K that 128 does not divide
-runs only on 1x32 / 32x32 (a ragged last k-tile); DeepSeek-V4.1's shared-expert
-down projection has K = 576 at TP4.
+plus gfx1250's 1x32 (n32k4-shuffled) weight scale. gfx950 also runs 1x32 /
+1x32. A K that 128 does not divide runs only on 1x32 / 32x32 (a ragged last
+k-tile); DeepSeek-V4.1's shared-expert down projection has K = 576 at TP4.
 
 Input magnitudes change every 32 K (and every 32 weight rows), so the e8m0
 scales differ block to block and a scale applied to the wrong block shows up
 in the cosine gate.
+On gfx950 the weight magnitudes change every row instead, for 1x32.
 
 Shape mapping (V4-Pro, ``config.json``):
   b = n_local_groups = o_groups // tp  (swept via ``-b``)
@@ -58,8 +59,12 @@ torch.set_default_device("cuda")
 SUPPORTED_GFX = ["gfx950", "gfx1250"]
 A8W4_GFX = ["gfx1250"]  # flydsl_batched_gemm_a8w4_v2
 SEED = 0
-# a8w8 e8m0 blocks per arch: 1xBLOCK on the activation, BLOCKxBLOCK on the weight.
-A8W8_BLOCKS = {"gfx950": (32, 128), "gfx1250": (32, 128)}
+# a8w8 e8m0 blocks per arch as (rows, block): 1xBLOCK on the activation,
+# ROWSxBLOCK on the weight.
+A8W8_BLOCKS = {
+    "gfx950": ((32, 32), (1, 32), (128, 128)),
+    "gfx1250": ((32, 32), (128, 128)),
+}
 # Archs whose a8w8 GEMM also reads a 1x32 weight scale (n32k4-shuffled).
 A8W8_1X32_GFX = ["gfx1250"]
 # Archs whose a8w8 32x32 GEMM runs a ragged last k-tile (K not a multiple of 128).
@@ -82,16 +87,16 @@ def quant_act_e8m0(x_bf16, block):
     return q.view(m, b, k).contiguous(), e8m0.squeeze(-1)
 
 
-def quant_weight_e8m0(w_bf16, block):
-    """[B,N,K] bf16 -> fp8 [B,N,K] + e8m0 [B,N/block,K/block]."""
+def quant_weight_e8m0(w_bf16, rows, block):
+    """[B,N,K] bf16 -> fp8 [B,N,K] + e8m0 [B,N/rows,K/block]."""
     b, n, k = w_bf16.shape
-    wb = w_bf16.to(dtypes.fp32).view(b, n // block, block, k // block, block)
+    wb = w_bf16.to(dtypes.fp32).view(b, n // rows, rows, k // block, block)
     raw = wb.abs().amax(dim=(2, 4), keepdim=True).clamp(min=1e-8) / 448.0
     e8m0, scale = _to_e8m0_scale(raw)
     q = (wb / scale).clamp(-448.0, 448.0).to(dtypes.fp8)
     return (
         q.view(b, n, k).contiguous(),
-        e8m0.view(b, n // block, k // block).contiguous(),
+        e8m0.view(b, n // rows, k // block).contiguous(),
     )
 
 
@@ -115,14 +120,14 @@ def _ref_quant_n32k4_mbn(o_mbn: torch.Tensor):
     return a_fp8, a_sh
 
 
-def blockwise_randn(*shape, dtype):
+def blockwise_randn(*shape, dtype, rows=32):
     """randn * 0.1 whose magnitude changes by 2**[-2, 2] every 32 elements along
-    the last dim and every 32 along the one before it (the rows of a weight)."""
+    the last dim and every ``rows`` along the one before it (the rows of a weight)."""
     x = torch.randn(*shape) * 0.1
     lead, k = shape[:-1], shape[-1]
-    mag_shape = (*lead[:-1], -(-lead[-1] // 32), k // 32)
+    mag_shape = (*lead[:-1], -(-lead[-1] // rows), k // 32)
     mag = torch.exp2(torch.randint(-2, 3, mag_shape).float())
-    mag = mag.repeat_interleave(32, -1).repeat_interleave(32, -2)[..., : lead[-1], :]
+    mag = mag.repeat_interleave(32, -1).repeat_interleave(rows, -2)[..., : lead[-1], :]
     return (x * mag).to(dtype)
 
 
@@ -202,8 +207,10 @@ def test_batched_gemm(b, m, n, k, dtype, layout):
     torch.manual_seed(SEED)
     # Model path: o is physically [m, b, k] (mbn); kernel out is a transposed
     # view of preallocated [m, b, n] — same as test_batched_gemm_bf16 mbn case.
+    a8w8_blocks = A8W8_BLOCKS[get_gfx()] if layout == "mbn" else ()
     o_mbn = blockwise_randn(m, b, k, dtype=dtype)
-    w_bnk = blockwise_randn(b, n, k, dtype=dtype)
+    w_rows = min((r for r, _ in a8w8_blocks), default=32)
+    w_bnk = blockwise_randn(b, n, k, dtype=dtype, rows=w_rows)
 
     if layout == "mbn":
         y_phys = torch.empty(m, b, n, dtype=dtype)
@@ -247,13 +254,12 @@ def test_batched_gemm(b, m, n, k, dtype, layout):
             + b * m * n * y_phys.element_size()  # bf16 out
         )
 
-    a8w8_blocks = A8W8_BLOCKS[get_gfx()] if layout == "mbn" else ()
-    for block in a8w8_blocks:
-        if ragged_k and (block != 32 or get_gfx() not in RAGGED_K_GFX):
+    for rows, block in a8w8_blocks:
+        if ragged_k and (rows != 32 or block != 32 or get_gfx() not in RAGGED_K_GFX):
             continue
         x8, xs8 = quant_act_e8m0(o_mbn, block)
-        w8, ws8 = quant_weight_e8m0(w_bnk, block)
-        name = f"a8w8_{block}"
+        w8, ws8 = quant_weight_e8m0(w_bnk, rows, block)
+        name = f"a8w8_{rows}x{block}"
         candidates[name] = functools.partial(
             _a8w8, x8, shuffle_weight(w8), xs8, ws8, dtype
         )
@@ -261,10 +267,10 @@ def test_batched_gemm(b, m, n, k, dtype, layout):
             m * b * k  # fp8 A
             + b * n * k  # fp8 B (twice the fp4 codes)
             + m * b * (k // block)  # A scale (1 x block)
-            + b * (n // block) * (k // block)  # B scale (block x block)
+            + b * (n // rows) * (k // block)  # B scale (rows x block)
             + b * m * n * y_phys.element_size()
         )
-        if block == 32 and get_gfx() in A8W8_1X32_GFX and not ragged_k:
+        if rows == block == 32 and get_gfx() in A8W8_1X32_GFX and not ragged_k:
             candidates["a8w8_1x32"] = functools.partial(
                 _a8w8, x8, shuffle_weight(w8), xs8, expand_32x32_to_n32k4(ws8), dtype
             )

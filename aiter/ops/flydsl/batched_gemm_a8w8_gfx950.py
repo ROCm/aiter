@@ -9,7 +9,7 @@ operand      shape                          notes
 ``XQ``       ``[M, B, K]`` fp8              M-outer, K-contiguous
 ``WQ``       ``[B, N, K]`` fp8              16x16 preshuffled (ops.shuffle.shuffle_weight)
 ``x_scale``  ``[M, B, K//XK]`` e8m0         row-major, XK = 32 or 128
-``w_scale``  ``[B, N//WN, K//WK]`` e8m0     WN x WK = 32x32 or 128x128
+``w_scale``  ``[B, N//WN, K//WK]`` e8m0     WN x WK = 32x32, 128x128 or 1xXK
 ``Out``      ``[M, B, N]`` bf16
 ===========  =============================  ================================
 
@@ -36,6 +36,7 @@ from aiter.utility.graph_alloc import persistent_alloc
 
 from .kernels.bmm_a8w8_mxscale_gfx950 import (
     SCALE_BLOCKS,
+    W_SCALE_ROWS,
     check_bmm_config,
     launch_bmm_a8w8_mxscale,
 )
@@ -48,7 +49,8 @@ _BMM_KERNEL_NAME_RE = re.compile(
     rf"^{re.escape(BMM_MFMA_NAME_PREFIX)}"
     r"_t(?P<tile_m>\d+)x(?P<tile_n>\d+)x(?P<tile_k>\d+)"
     r"_w(?P<m_warp>\d+)x(?P<n_warp>\d+)_nb(?P<num_buffers>\d+)_sk(?P<splits>\d+)"
-    r"(?:_bd(?P<b_ahead>\d+))?(?P<b_nt>_nt)?(?P<xcd_order>_xcd)?(?P<per_stage>_sps)?$"
+    r"(?:_bd(?P<b_ahead>\d+))?(?P<b_nt>_nt)?(?P<xcd_order>_xcd(?P<xcd_swizzle>\d*))?"
+    r"(?P<per_stage>_sps)?$"
 )
 
 
@@ -62,12 +64,14 @@ def _launch_config(name: str) -> MappingProxyType | None:
     b_ahead = groups.pop("b_ahead")
     b_nt = groups.pop("b_nt")
     xcd_order = groups.pop("xcd_order")
+    xcd_swizzle = groups.pop("xcd_swizzle")
     per_stage = groups.pop("per_stage")
     cfg = {key: int(value) for key, value in groups.items()}
     cfg["b_direct"] = b_ahead is not None
     cfg["b_ahead"] = int(b_ahead or 1)
     cfg["b_nt"] = b_nt is not None
     cfg["xcd_order"] = xcd_order is not None
+    cfg["xcd_swizzle"] = int(xcd_swizzle or 0)
     cfg["scale_preload"] = per_stage is None
     return MappingProxyType(cfg)
 
@@ -92,15 +96,17 @@ def bmm_kernel_name(
     b_ahead: int = 1,
     scale_preload: bool = True,
     b_nt: bool = False,
+    xcd_swizzle: int = 0,
 ) -> str:
     """Canonical tuned-CSV name of a config. ``_bd<n>`` marks B read straight
     into registers ``n`` K tiles ahead, ``_nt`` B loaded non-temporal,
+    ``_xcd<g>`` the XCD tile order with an xcd_swizzle of ``g``,
     ``_sps`` scales loaded per stage instead of preloaded."""
     return (
         f"{BMM_MFMA_NAME_PREFIX}_t{tile_m}x{tile_n}x{tile_k}"
         f"_w{m_warp}x{n_warp}_nb{num_buffers}_sk{splits}"
         f"{f'_bd{b_ahead}' if b_direct else ''}{'_nt' if b_nt else ''}"
-        f"{'_xcd' if xcd_order else ''}"
+        f"{'_xcd' if xcd_order else ''}{xcd_swizzle or ''}"
         f"{'' if scale_preload else '_sps'}"
     )
 
@@ -196,8 +202,9 @@ def pick_bmm_kernel_name(
             f"with 1x{x_scale_k} / {w_scale_n}x{w_scale_k} scale blocks"
         )
     # The XCD tile order wants the N x batch tiles in 8s, as split K does.
-    xcd_order = cfg["b_direct"] and runs({**cfg, "xcd_order": True})
-    return bmm_kernel_name(**cfg, splits=splits, xcd_order=xcd_order)
+    xcd = {"xcd_order": True, "xcd_swizzle": 4}
+    xcd = xcd if cfg["b_direct"] and runs({**cfg, **xcd}) else {}
+    return bmm_kernel_name(**cfg, splits=splits, **xcd)
 
 
 def _x_scale_column_major(m: int, x_scale_transposed: bool) -> bool:
@@ -218,13 +225,13 @@ def _split_counters(device: int, stream: int) -> Tensor:
         return torch.zeros(_SPLIT_COUNTERS, dtype=torch.int32, device=device)
 
 
-def _scale_block(extent: int, blocks: int, what: str) -> int:
-    """The block edge that splits extent into blocks: 32 or 128."""
-    if blocks and extent % blocks == 0 and extent // blocks in SCALE_BLOCKS:
+def _scale_block(extent: int, blocks: int, what: str, edges=SCALE_BLOCKS) -> int:
+    """The block edge that splits extent into blocks: one of edges."""
+    if blocks and extent % blocks == 0 and extent // blocks in edges:
         return extent // blocks
     raise RuntimeError(
         f"[FlyDSL gfx950 bmm] {what} of {extent} in {blocks} scale blocks is not "
-        f"a {SCALE_BLOCKS} block"
+        f"a {edges} block"
     )
 
 
@@ -285,14 +292,23 @@ def compile_bmm_a8w8_mxfp8_gfx950(
     k: int,
     scale_block: int,
     x_scale_transposed: bool = False,
+    w_scale_n: int | None = None,
 ) -> None:
     """Compile ``kernel_name`` for ``[B, N, K]`` with square ``scale_block``
     e8m0 blocks (1 x block for x_scale, column-major if x_scale_transposed),
     as run_bmm_a8w8_mxfp8_gfx950 would launch it. M is a runtime argument, so
     this serves every M. Call it under
-    ``aiter.aot.flydsl.common.compile_only_env``."""
+    ``aiter.aot.flydsl.common.compile_only_env``.
+    w_scale_n overrides the w_scale block's rows (1 for a scale per B row)."""
     constexprs = _constexprs(
-        kernel_name, n, k, b, scale_block, scale_block, scale_block, x_scale_transposed
+        kernel_name,
+        n,
+        k,
+        b,
+        scale_block,
+        w_scale_n or scale_block,
+        scale_block,
+        x_scale_transposed,
     )
     placeholder = torch.empty(0, dtype=torch.uint8)
     _launch((placeholder,) * 7, 1, fx.Stream(0), constexprs)
@@ -311,6 +327,7 @@ def run_bmm_a8w8_mxfp8_gfx950(
     and returns it. The e8m0 block edges (1x32 or 1x128 for ``x_scale``, 32x32
     or 128x128 for ``w_scale``) are read off the scale shapes. ``kernel_name``
     is a tuned row's kernelName, else :func:`pick_bmm_kernel_name` chooses.
+    A ``w_scale`` block may also be a single row, 1x32 only.
     x_scale_transposed (B = 1, 1x128 blocks) reads ``x_scale``'s bytes
     column-major, [K / 128, M], the blockscale convention, under its
     [M, 1, K / 128] shape; a single row takes the row-major kernel."""
@@ -350,7 +367,7 @@ def run_bmm_a8w8_mxfp8_gfx950(
     check_e8m0(w_scale, "w_scale", "FlyDSL gfx950 bmm")
     scale_args = (
         _scale_block(k, x_scale.shape[2], "x_scale K"),
-        _scale_block(n, w_scale.shape[1], "w_scale N"),
+        _scale_block(n, w_scale.shape[1], "w_scale N", W_SCALE_ROWS),
         _scale_block(k, w_scale.shape[2], "w_scale K"),
         _x_scale_column_major(m, x_scale_transposed),
     )
