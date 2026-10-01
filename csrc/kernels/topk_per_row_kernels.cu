@@ -3133,13 +3133,14 @@ __device__ __forceinline__ uint32_t* wide_digit_lds()
 }
 
 // Row placement of a register-copy launch (topk_oneblock_reg_placement): run
-// `rows` rows in groups of `period` workgroups whose first half take
+// `rows` rows in groups of `period` workgroups whose first `width` take
 // consecutive rows.  An unplaced launch passes no placement argument, so it
 // keeps the kernel signature, and the code, it had before placement existed.
 struct TopkRowPlacement
 {
     int rows;
     int period;
+    int width;
 };
 
 /**
@@ -3273,11 +3274,11 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
     __shared__ IdxT winner_indices[WinnerCapacity];
     __shared__ IdxT candidate_count;
 
-    // A placed launch (one TopkRowPlacement argument) takes the first half of
-    // each group of `period` workgroups for consecutive rows; the rest exit
+    // A placed launch (one TopkRowPlacement argument) takes the first `width`
+    // of each group of `period` workgroups for consecutive rows; the rest exit
     // before touching LDS or memory.  Every row still maps to exactly one
-    // workgroup, whatever the hardware placement.  Which physical XCCs that
-    // first half lands on depends on the queue's round-robin start, and only
+    // workgroup, whatever the hardware placement.  Which physical XCCs those
+    // first workgroups land on depends on the queue's round-robin start, and only
     // the speed depends on it (see topk_oneblock_reg_placement).  The division
     // runs on VALU; readfirstlane keeps the row and the exit test scalar, so
     // the row pointers stay in SGPRs.
@@ -3286,7 +3287,7 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
     {
         TopkRowPlacement const place = (placement, ...);
         unsigned const period = static_cast<unsigned>(place.period);
-        unsigned const width  = period / 2u;
+        unsigned const width  = static_cast<unsigned>(place.width);
         int const slot = __builtin_amdgcn_readfirstlane(static_cast<int>(blockIdx.x % period));
         int const row  = __builtin_amdgcn_readfirstlane(
             static_cast<int>((blockIdx.x / period) * width) + slot);
@@ -7554,28 +7555,36 @@ inline int topk_oneblock_num_xcd()
 
 // XCD-subset placement.  On a cold dispatch (the launch reaches an idle GPU)
 // the XCDs do not start together: on MI355X, XCCs 0-3 start first and XCCs
-// 4-7 about 0.4-0.8 us later (1.0-1.4 us on a low-priority queue), and a
-// kernel ends with its latest-starting working XCD.  From one row per XCD up to
-// one row per CU of half the XCDs, place the rows on the first half of every
-// group of XCD-count workgroups; the other half exit at once.  Limits:
+// 4-7 about 0.4-0.8 us later (1.0-1.4 us on a low-priority queue), XCCs 1-3
+// themselves about 0.2, 0.4 and 0.6 us after XCC0, and a kernel ends with its
+// latest-starting working XCD.  From three rows up to one row per CU of one
+// XCD, only the first workgroup of every group of XCD-count workgroups takes a
+// row, so the rows run on the first XCD alone.  Otherwise, from one row per XCD
+// up to one row per CU of half the XCDs, the first half of every group take
+// rows.  Concentrating two-row grids, or grids larger than one XCD's CUs,
+// measured slower at some row lengths.  The other workgroups exit at once.
+// Limits:
 //  - Workgroups go to the XCCs round-robin from a starting XCC that depends on
-//    the hardware queue, so "first half of each group" means XCCs 0-3 only on
-//    a queue that starts at XCC 0.  PyTorch's default stream does; other queues
+//    the hardware queue, so "the first of each group" means the first XCCs only
+//    on a queue that starts at XCC 0.  PyTorch's default stream does; other queues
 //    were seen starting at XCC 3, 5, 6 or 7, where most of the gain is lost.
 //  - Queued launches and HIP graphs start all XCDs together; there it is
 //    neutral.
 //  - Validated only in SPX / NPS1 mode on MI355X.
 // Correctness never depends on placement: each row maps to exactly one
 // workgroup.  Diagnosis: XCD start-skew report REPORT_XCD.md (2026-09-30).
-// With one XCD (CPX) or an unknown count, or outside that row range, `rows` is
-// 0 and the launch is unplaced.
+// With one XCD (CPX) or an unknown count, or outside those row counts, `rows`
+// is 0 and the launch is unplaced.
 inline TopkRowPlacement topk_oneblock_reg_placement(int batch_size)
 {
-    int const xcds = topk_oneblock_num_xcd();
-    int const half = xcds / 2;
-    if(xcds >= 2 && batch_size >= xcds && batch_size <= topk_oneblock_num_cu() / xcds * half)
-        return {batch_size, xcds};
-    return {0, 0};
+    int const xcds    = topk_oneblock_num_xcd();
+    int const half    = xcds / 2;
+    int const per_xcd = topk_oneblock_num_cu() / xcds;
+    if(xcds >= 2 && batch_size >= 3 && batch_size <= per_xcd)
+        return {batch_size, xcds, 1};
+    if(xcds >= 2 && batch_size >= xcds && batch_size <= per_xcd * half)
+        return {batch_size, xcds, half};
+    return {0, 0, 0};
 }
 
 // Per-wave winner reservation, the twiddled register cache and the Wave0
@@ -7627,8 +7636,8 @@ inline bool topk_oneblock_reg_launch(int ept, int batch_size, hipStream_t stream
             TopkRowPlacement const place = topk_oneblock_reg_placement(batch_size);
             if(place.rows > 0)
             {
-                unsigned const half   = static_cast<unsigned>(place.period / 2);
-                unsigned const groups = (static_cast<unsigned>(batch_size) + half - 1) / half;
+                unsigned const width  = static_cast<unsigned>(place.width);
+                unsigned const groups = (static_cast<unsigned>(batch_size) + width - 1) / width;
                 radix_topk_one_block_reg_kernel<T, IdxT, BlockSize, WRITE_TOPK_VALUES, MinEPT,
                                                 MainBits, TailBits, 0, Wave, Wave, false, Wave,
                                                 false, 0x40du, false, 0, false, Wide>
