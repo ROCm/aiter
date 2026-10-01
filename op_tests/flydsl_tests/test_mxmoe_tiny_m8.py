@@ -73,6 +73,11 @@ def main():
 
     for operator in operators:
         check(operator)
+    # Gate/up=6144*(1/128)*(1/4)=12: reject accidental compiler-default clamp7.
+    x.fill_(1 / 4)
+    for operator in operators:
+        check(operator)
+    x.fill_(1 / 128)
     ids[:, :8].copy_(torch.arange(64, dtype=torch.int32, device=device).reshape(8, 8))
     for operator in operators:
         check(operator)
