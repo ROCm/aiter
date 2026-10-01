@@ -10,6 +10,7 @@ from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels import buffer_ops
 
+from .mxmoe_routes8 import expert_group, route_row
 from .mxfp4_gemm_common import (
     _buffer_rsrc,
     _e8m0_from_amax,
@@ -88,7 +89,12 @@ def compile_gemm2_a4w4_port(
     BN=256,
     BK=256,
     xcd_swizzle=0,
+    merge_routes8=False,
 ):
+    if merge_routes8:
+        assert (BM, NE, N_OUT, D_INTER, BN, BK) == (16, 257, 6144, 256, 256, 256)
+        assert epilog == "atomic" and not xcd_swizzle
+        assert D_INTER_REAL in (None, 256)
     assert BN == 256 and BK == 256, f"only BN==BK==256 supported, got BN={BN} BK={BK}"
     KH_TILE = BK // 2
     _K = D_INTER
@@ -124,6 +130,8 @@ def compile_gemm2_a4w4_port(
     _tag = f"ne{NE}_h{N_OUT}_i{_K}{_rtag}_bm{BM}{'_nt' if use_nt else ''}_{_epi_tag}"
     if xcd_swizzle > 0:
         _tag += f"_xcd{xcd_swizzle}"
+    if merge_routes8:
+        _tag += "_merge8"
     _name = f"gemm2_a4w4_port_{_tag}"
 
     @fx.struct
@@ -178,7 +186,7 @@ def compile_gemm2_a4w4_port(
                         k_half=_K_HALF,
                     )
 
-        def _run_tile(tile_i32):
+        def _run_tile(tile_i32, route_expert=None, merge_mask=None, merge_slot=None):
             _gemm2_body(
                 lds_raw_ptr,
                 arg_ascale,
@@ -206,9 +214,20 @@ def compile_gemm2_a4w4_port(
                 BN=BN,
                 BK=BK,
                 KH_TILE=KH_TILE,
+                route_expert=route_expert,
+                merge_mask=merge_mask,
+                merge_slot=merge_slot,
             )
 
-        if const_expr(_persistent):
+        if const_expr(merge_routes8):
+            slot = _udiv(bx_i32, _num_n_blocks)
+            expert, matches, active = expert_group(arg_stids, slot, lane)
+            if active:
+                if wave < fx.Int32(_n_load_waves):
+                    _issue_all_a_loads(slot * fx.Int32(BM))
+                rocdl.sched_barrier(0)
+                _run_tile(bx_i32, expert, matches, slot)
+        elif const_expr(_persistent):
             cumsum0 = fx.ptr_load(global_typed_ptr(arg_cumsum, T.i32))
             total_m_blocks = _udiv(cumsum0, BM)
             bound = total_m_blocks * fx.Int32(_num_n_blocks)
@@ -337,6 +356,9 @@ def _gemm2_body(
     BN,
     BK,
     KH_TILE,
+    route_expert=None,
+    merge_mask=None,
+    merge_slot=None,
 ):
     _aStages = aStages
     _kMChunks = kmchunks_for(BM)
@@ -360,10 +382,13 @@ def _gemm2_body(
 
     m_block_idx = _udiv(bx_i32, _num_n_blocks)
     n_block_idx = bx_i32 - m_block_idx * fx.Int32(_num_n_blocks)
-    e = fx.ptr_load(
-        global_typed_ptr(arg_eids, T.i32, byte_offset=m_block_idx * fx.Int32(4))
-    )
-    e = rocdl.readfirstlane(T.i32, e)
+    if const_expr(route_expert is None):
+        e = fx.ptr_load(
+            global_typed_ptr(arg_eids, T.i32, byte_offset=m_block_idx * fx.Int32(4))
+        )
+        e = rocdl.readfirstlane(T.i32, e)
+    else:
+        e = route_expert
     m_row = m_block_idx * fx.Int32(BM)
 
     _asc_num = arith.index_cast(T.index, _raw(i32_max_m_blocks)) * fx.Index(_asc_per_mb)
@@ -622,6 +647,8 @@ def _gemm2_body(
             BM,
             N_OUT,
             BN,
+            merge_mask=merge_mask,
+            merge_slot=merge_slot,
         )
 
 
@@ -828,6 +855,8 @@ def _atomic_bf16_epilog(
     BM,
     N_OUT,
     BN,
+    merge_mask=None,
+    merge_slot=None,
 ):
     _kMChunks = kmchunks_for(BM)
     M_REPS = BM // 8
@@ -845,17 +874,31 @@ def _atomic_bf16_epilog(
     packed = []
     weight = []
     for mr in range_constexpr(M_REPS):
-        sorted_pos = m_row + fx.Int32(mr * 8) + m_lane
-        packed.append(
-            llvm.load(
-                T.i32, _gep1(stids_base, sorted_pos * fx.Int32(4)), invariant=True
+        if const_expr(merge_mask is None):
+            sorted_pos = m_row + fx.Int32(mr * 8) + m_lane
+            packed.append(
+                llvm.load(
+                    T.i32, _gep1(stids_base, sorted_pos * fx.Int32(4)), invariant=True
+                )
             )
-        )
-        weight.append(
-            llvm.load(
-                T.f32, _gep1(sweights_base, sorted_pos * fx.Int32(4)), invariant=True
+            weight.append(
+                llvm.load(
+                    T.f32,
+                    _gep1(sweights_base, sorted_pos * fx.Int32(4)),
+                    invariant=True,
+                )
             )
-        )
+        else:
+            mapped, index, valid = route_row(
+                merge_mask, merge_slot, fx.Int32(mr * 8) + m_lane
+            )
+            packed.append(mapped)
+            value = fx.Float32(
+                llvm.load(
+                    T.f32, _gep1(sweights_base, index * fx.Int32(4)), invariant=True
+                )
+            )
+            weight.append(valid.select(value, fx.Float32(0.0)))
 
     for i in range_constexpr(_kMChunks):
         row_base = fx.Int32(i * 16) + lane_div_16 * fx.Int32(4)

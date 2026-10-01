@@ -1,0 +1,228 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marlowe AI
+"""CPU tests of the actual emitter's grouping/address logic without ROCm imports."""
+
+import ast
+import random
+import types
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class Predicate:
+    def __init__(self, value):
+        self.value = bool(value)
+
+    def __bool__(self):
+        return self.value
+
+    def select(self, yes, no):
+        return yes if self.value else no
+
+    def __or__(self, other):
+        return Predicate(self.value or bool(other))
+
+
+class Scalar(int):
+    def __eq__(self, other):
+        return Predicate(int(self) == int(other))
+
+    def __lt__(self, other):
+        return Predicate(int(self) < int(other))
+
+    def __add__(self, other):
+        return Scalar(int(self) + int(other))
+
+    def __sub__(self, other):
+        return Scalar(int(self) - int(other))
+
+    def __mul__(self, other):
+        return Scalar(int(self) * int(other))
+
+    def __floordiv__(self, other):
+        return Scalar(int(self) // int(other))
+
+    def __mod__(self, other):
+        return Scalar(int(self) % int(other))
+
+    def __and__(self, other):
+        return Scalar(int(self) & int(other))
+
+    def __or__(self, other):
+        return Scalar(int(self) | int(other))
+
+    def __lshift__(self, other):
+        return Scalar(int(self) << int(other))
+
+
+class Vector:
+    def __init__(self, values):
+        self.values = list(values)
+
+    def __add__(self, other):
+        right = other.values if isinstance(other, Vector) else [other] * 64
+        return Vector([a + b for a, b in zip(self.values, right)])
+
+    def __floordiv__(self, other):
+        return Vector([a // int(other) for a in self.values])
+
+    def __eq__(self, other):
+        return Vector([a == int(other) for a in self.values])
+
+
+def cttz(value):
+    value = int(value) & ((1 << 64) - 1)
+    if not value:
+        raise AssertionError("emitter must not rely on cttz(0) semantics")
+    return Scalar((value & -value).bit_length() - 1)
+
+
+def load_functions(path, environment):
+    tree = ast.parse(path.read_text())
+    tree.body = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
+    exec(compile(tree, str(path), "exec"), environment)
+    return environment
+
+
+def emitters():
+    def gather(ids, index):
+        if isinstance(index, Vector):
+            return Vector([ids[i] for i in index.values])
+        return Scalar(ids[int(index)])
+
+    env = {
+        "fx": types.SimpleNamespace(
+            Int32=Scalar,
+            Int64=Scalar,
+            min=min,
+            cttz=cttz,
+            ctpop=lambda v: Scalar((int(v) & ((1 << 64) - 1)).bit_count()),
+        ),
+        "rocdl": types.SimpleNamespace(
+            readfirstlane=lambda _t, v: v,
+            ballot=lambda _t, p: Scalar(
+                sum(1 << i for i, v in enumerate(p.values) if v)
+            ),
+        ),
+        "T": types.SimpleNamespace(i32=None, i64=None),
+        "as_ir_value": lambda v: v,
+        "range_constexpr": range,
+        "_global_i32_at": gather,
+    }
+    return load_functions(ROOT / "aiter/ops/flydsl/kernels/mxmoe_routes8.py", env)
+
+
+class RouteMergeTests(unittest.TestCase):
+    def check_distribution(self, rows):
+        self.assertEqual(len(rows), 8)
+        for row in rows:
+            self.assertEqual(len(set(row)), 8, "supplied native top8 contract")
+        ids = [v for row in rows for v in [*row, 256]]
+        compact = [v for row in rows for v in row]
+        functions = emitters()
+        observed = []
+        leaders = []
+        for slot in range(65):
+            expert, mask, active = functions["expert_group"](
+                ids, Scalar(slot), Vector(range(64))
+            )
+            expert, mask = int(expert), int(mask)
+            expected = [i for i, v in enumerate(compact) if v == expert]
+            expected_active = slot == 64 or slot == expected[0]
+            self.assertEqual(bool(active), expected_active)
+            if not active:
+                continue
+            leaders.append(expert)
+            for row in range(16):
+                packed, index, valid = functions["route_row"](
+                    Scalar(mask), Scalar(slot), Scalar(row)
+                )
+                packed, index = int(packed), int(index)
+                if slot == 64:
+                    expected_pair = (row, 8) if row < 8 else None
+                elif row < len(expected):
+                    expected_pair = divmod(expected[row], 8)
+                else:
+                    expected_pair = None
+                self.assertEqual(bool(valid), expected_pair is not None)
+                if expected_pair is None:
+                    self.assertEqual(packed, (9 << 24) | 8)
+                    self.assertEqual(index, 0)
+                else:
+                    token, choice = expected_pair
+                    self.assertEqual(packed, token | (choice << 24))
+                    self.assertEqual(index, token * 9 + choice)
+                    self.assertEqual(ids[index], expert)
+                    observed.append((token, choice))
+        self.assertEqual(len(leaders), len(set(compact)) + 1)
+        self.assertCountEqual(observed, [(t, k) for t in range(8) for k in range(9)])
+
+    def test_all_distinct_and_last_lane(self):
+        self.check_distribution([[t * 8 + k for k in range(8)] for t in range(8)])
+
+    def test_identical_expert_sets_and_permuted_slots(self):
+        self.check_distribution([[(k + t) % 8 for k in range(8)] for t in range(8)])
+
+    def test_one_expert_in_every_token(self):
+        self.check_distribution([[255, *range(t * 7, t * 7 + 7)] for t in range(8)])
+
+    def test_seeded_native_routes(self):
+        rng = random.Random(35508)
+        for _ in range(120):
+            self.check_distribution([rng.sample(range(256), 8) for _ in range(8)])
+
+    def test_zero_ballot_shared_and_sparse_masks(self):
+        resolve = emitters()["route_row"]
+        masks = [0, 1, 1 << 63, (1 << 63) | 1, sum(1 << (8 * k) for k in range(8))]
+        for mask in masks:
+            selected = [i for i in range(64) if mask & (1 << i)]
+            for row in range(16):
+                packed, _, valid = resolve(Scalar(mask), Scalar(0), Scalar(row))
+                self.assertEqual(bool(valid), row < len(selected))
+                if valid:
+                    token, choice = divmod(selected[row], 8)
+                    self.assertEqual(int(packed), token | (choice << 24))
+
+    def test_only_exact_m8_geometry(self):
+        namespace = load_functions(ROOT / "aiter/ops/flydsl/mxmoe_tiny_m8.py", {})
+        support = namespace["supported_geometry"]
+        args = [8, "gfx950", (257, 512, 3072), (257, 6144, 128), True, True]
+        self.assertTrue(support(*args))
+        for rows in [1, 4, 7, 9, 16, 32, 64, 128, 256]:
+            self.assertFalse(support(rows, *args[1:]))
+        for index, value in [
+            (1, "gfx942"),
+            (2, (256, 512, 3072)),
+            (4, False),
+            (5, False),
+        ]:
+            changed = list(args)
+            changed[index] = value
+            self.assertFalse(support(*changed))
+
+    def test_default_off_compiler_and_atomic_math(self):
+        for name in ["mxfp4_gemm1.py", "mxfp4_gemm2.py"]:
+            source = (ROOT / "aiter/ops/flydsl/kernels" / name).read_text()
+            tree = ast.parse(source)
+            compiler = next(
+                n
+                for n in tree.body
+                if isinstance(n, ast.FunctionDef) and n.name.startswith("compile_gemm")
+            )
+            defaults = dict(
+                zip(
+                    (a.arg for a in compiler.args.kwonlyargs), compiler.args.kw_defaults
+                )
+            )
+            self.assertIs(defaults["merge_routes8"].value, False)
+            self.assertIn('"_merge8"', source)
+        body = (ROOT / "aiter/ops/flydsl/kernels/mxfp4_gemm2.py").read_text()
+        self.assertIn("[v2[0] * weight[mr], v2[1] * weight[mr]], fx.Float32", body)
+        self.assertIn("llvm.AtomicBinOp.fadd", body)
+        self.assertIn('syncscope="agent"', body)
+
+
+if __name__ == "__main__":
+    unittest.main()
