@@ -2289,10 +2289,6 @@ def _sparse_mla(
         "UNPEEL prefetches past the last tile, which only UNI_TILE's clamp keeps in range",
     )
     gl.static_assert(
-        not (FP8_MFMA and HAS_EXTRA),
-        "FP8_MFMA defers the V-side scale to the epilogue, so it needs one segment",
-    )
-    gl.static_assert(
         (not PIPE) or (UNI_TILE and not ASYNC_LDS and not FP8_MFMA),
         "fp8_dsv4_mla takes the pipelined UNI_TILE walk (bf16 dots)",
     )
@@ -2612,6 +2608,12 @@ def _sparse_mla(
         )
 
     if HAS_EXTRA:
+        if FP8_MFMA:
+            # The fp8 PV dot accumulates raw code points and the V-side scale
+            # comes off in the epilogue, which applies the extra segment's.
+            # Rebase the main segment's sum onto it; the online-softmax
+            # rescales after this are linear, so it stays exact.
+            acc = acc * (main_v_scale / extra_v_scale)
         extra_seg = Seg(
             extra_fmt,
             extra_cache_ptr,
@@ -2667,7 +2669,7 @@ def _sparse_mla(
         # The fp8 PV dot ran on raw code points, so the V-side scale comes off
         # here, once per program instead of once per tile. l is untouched, so
         # out = acc*s/l is what the bf16 path computes.
-        acc = acc * main_v_scale
+        acc = acc * (extra_v_scale if HAS_EXTRA else main_v_scale)
 
     # Move the row reductions into pv-slice space for output/partials.
     m_pv = gl.convert_layout(m_i, gl.SliceLayout(1, cfg.pv_layout))

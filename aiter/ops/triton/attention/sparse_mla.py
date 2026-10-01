@@ -420,7 +420,8 @@ def sparse_mla_fwd(
         extra_kv, extra_indptr, extra_indices: a second segment attended in the
             same pass, for the SWA-window + top-k two-loop. All three together.
             Either both segments are fp8_scalar block caches (each with its own
-            [1] f32 scale) or both are fp8_dsv4_mla / bf16 block caches.
+            [1] f32 scale; either dot_precision) or both are fp8_dsv4_mla / bf16
+            block caches (bf16 dots).
         extra_kv_scale: the extra segment's [1] f32 scale when it is
             fp8_scalar; defaults to kv_scale.
         dot_precision: what the QK and PV matrix-core ops run in.
@@ -503,11 +504,6 @@ def sparse_mla_fwd(
                 raise ValueError(
                     "an fp8_scalar kv_buffer needs a 3-D fp8_scalar extra_kv, got "
                     f"{extra_fmt}"
-                )
-            if dot_precision != "bf16":
-                raise ValueError(
-                    "the fp8_scalar two-loop runs bf16 dots: dot_precision='fp8' "
-                    "folds the V scale after the loop, which needs one segment"
                 )
         else:
             extra_fmt = _classify_cache(

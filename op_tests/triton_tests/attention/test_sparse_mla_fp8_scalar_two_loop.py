@@ -51,6 +51,9 @@ def reference(q, segs, sm_scale, sink):
             sel = sel[sel >= 0]
             rows.append(truth.reshape(-1, D)[sel])
         kv = torch.cat(rows)
+        if kv.shape[0] == 0:
+            out[c] = 0.0  # only the sink: no value rows to mix
+            continue
         logits = qf[c] @ kv.T * sm_scale  # [H, n]
         m = torch.maximum(logits.max(-1).values, sink)
         p = torch.exp(logits - m[:, None])
@@ -63,7 +66,8 @@ def reference(q, segs, sm_scale, sink):
 @pytest.mark.parametrize("H", [16, 32])
 @pytest.mark.parametrize("fp8_q", [False, True])
 @pytest.mark.parametrize("pad", [0, 256])
-def test_fp8_scalar_two_loop(C, H, fp8_q, pad):
+@pytest.mark.parametrize("dots", ["bf16", "fp8"])
+def test_fp8_scalar_two_loop(C, H, fp8_q, pad, dots):
     _skip_unless_gfx950()
     dev = "cuda"
     gen = torch.Generator(device=dev).manual_seed(C * 1000 + H + pad)
@@ -103,6 +107,7 @@ def test_fp8_scalar_two_loop(C, H, fp8_q, pad):
         extra_indptr=cmp_ptr,
         extra_indices=cmp_idx,
         extra_kv_scale=cmp_scale,
+        dot_precision=dots,
     )
     q_ref = q.float() * (q_scale if fp8_q else 1.0)
     ref = reference(
@@ -111,6 +116,15 @@ def test_fp8_scalar_two_loop(C, H, fp8_q, pad):
         sm_scale,
         sink,
     )
+    if dots == "fp8":
+        # P is rounded to e4m3 (and a bf16 q too), ~2% relative L2 against the
+        # fp32 reference, the level of the one-segment fp8 path. A V-scale
+        # mistake shows up as a slope away from 1.
+        o = out.float()
+        rel = ((o - ref).norm() / ref.norm()).item()
+        slope = ((o * ref).sum() / (ref * ref).sum()).item()
+        assert rel < 0.035 and abs(slope - 1) < 0.005, f"relL2 {rel} slope {slope}"
+        return
     err = (out.float() - ref).abs().max().item()
     assert err < 2e-2, f"max abs err {err}"
 
