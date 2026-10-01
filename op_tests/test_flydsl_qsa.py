@@ -885,6 +885,68 @@ def test_k1_page_past_4gib():
         )
 
 
+def test_expand_rejects_out_that_cannot_hold_the_stores():
+    """A caller ``out`` is stored across ``token_topk + compress_ratio - 1`` columns.
+
+    The kernel's store mask uses that width, not ``out.shape``. A narrower
+    buffer, a non-int32 buffer, or a buffer on another device is rejected
+    before launch.
+    """
+    if not torch.cuda.is_available():
+        return
+    rows, compress_ratio, token_topk = 2, 4, 8
+    output_width = token_topk + compress_ratio - 1
+    device = torch.device("cuda")
+    block_indices = torch.zeros(
+        (rows, token_topk // compress_ratio), dtype=torch.int32, device=device
+    )
+    query_positions = torch.zeros(rows, dtype=torch.int32, device=device)
+    sequence_lengths = torch.zeros(1, dtype=torch.int32, device=device)
+    token_to_req = torch.zeros(rows, dtype=torch.int32, device=device)
+
+    def expand(out):
+        return expand_qsa_block_indices_cuda(
+            block_indices,
+            query_positions,
+            sequence_lengths,
+            token_to_req,
+            compress_ratio,
+            token_topk,
+            out,
+        )
+
+    rejected = (
+        torch.empty((rows, 1), dtype=torch.int32, device=device),
+        torch.empty((rows, output_width), dtype=torch.int64, device=device),
+        torch.empty((rows, output_width), dtype=torch.int32),
+    )
+    for out in rejected:
+        try:
+            expand(out)
+        except ValueError as exc:
+            if "QSA expand out" not in str(exc):
+                raise
+        else:
+            raise AssertionError(
+                f"accepted out {out.dtype} {tuple(out.shape)} {out.device}"
+            )
+    empty_rows = torch.zeros(
+        (0, token_topk // compress_ratio), dtype=torch.int32, device=device
+    )
+    empty_out = torch.empty((0, output_width), dtype=torch.int32, device=device)
+    got = expand_qsa_block_indices_cuda(
+        empty_rows,
+        query_positions[:0],
+        sequence_lengths,
+        token_to_req[:0],
+        compress_ratio,
+        token_topk,
+        empty_out,
+    )
+    if got.data_ptr() != empty_out.data_ptr():
+        raise AssertionError("a matching caller out was replaced")
+
+
 def test_k1_serves_padded_page_and_rejects_misaligned():
     """A padded page stride is in contract; a 16-byte gather that cannot align is not.
 
@@ -2894,6 +2956,7 @@ def _run_unit_cases():
     test_k1_k2_sweep_keeps_requested_m_and_fails_on_mismatch()
     test_qsa_arch_allowlist()
     test_k1_page_past_4gib()
+    test_expand_rejects_out_that_cannot_hold_the_stores()
     test_k1_serves_padded_page_and_rejects_misaligned()
     test_k1_padded_page_stride_matches_packed()
     test_k1_wide_padded_page_does_not_alias()
