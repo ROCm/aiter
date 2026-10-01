@@ -82,6 +82,9 @@ def _build_kernel(*, head_dim: int, rotate: bool, mode: str):
     assert mode in ("amax", "scale")
     D = head_dim
     VEC = D // BLOCK_THREADS
+    DWORDS_PER_LANE = VEC // 2
+    LOAD_DWORDS = min(DWORDS_PER_LANE, 4)
+    NUM_LOADS = DWORDS_PER_LANE // LOAD_DWORDS
     assert D % BLOCK_THREADS == 0, f"head_dim {D} must be a multiple of {BLOCK_THREADS}"
     assert VEC in (2, 4, 8, 16, 32), f"unsupported elements per lane: {VEC}"
     assert (D & (D - 1)) == 0, f"head_dim {D} must be a power of 2 for WHT"
@@ -101,16 +104,27 @@ def _build_kernel(*, head_dim: int, rotate: bool, mode: str):
         row = fx.block_idx.x  # one wave per row
         tid = fx.thread_idx.x  # 0..31 lane
         row_idx = fx.Int64(row)
-        x_i32 = ptr_buf_tensor(x_in, fx.Int32, unit_elems=VEC // 2, unit_stride=1)
+        # V# copy atoms cap at dwordx4 (16 bytes). Larger head dimensions
+        # therefore assemble the lane fragment from adjacent dwordx4 loads.
+        x_i32 = ptr_buf_tensor(x_in, fx.Int32, unit_elems=LOAD_DWORDS, unit_stride=1)
         out_i32 = ptr_buf_tensor(x_out, fx.Int32)
         scale_f32 = ptr_buf_tensor(scale_io, fx.Float32)
 
         # ---- load VEC bf16 for this lane: elems [row*D + tid*VEC, +VEC) ----
         row_off_elems = row_idx * D + fx.Int64(tid) * VEC
         row_off_dw = fx.Int32(row_off_elems // 2)
-        x_raw = buf_copy_load(x_i32, row_off_dw, unit_elems=VEC // 2)
-        if const_expr(VEC == 2):
-            x_raw = fx.Vector.from_elements([x_raw], fx.Int32)
+        x_dwords = []
+        for load_idx in range_constexpr(NUM_LOADS):
+            x_raw = buf_copy_load(
+                x_i32,
+                row_off_dw + fx.Int32(load_idx * LOAD_DWORDS),
+                unit_elems=LOAD_DWORDS,
+            )
+            if const_expr(LOAD_DWORDS == 1):
+                x_raw = fx.Vector.from_elements([x_raw], fx.Int32)
+            for dword_idx in range_constexpr(LOAD_DWORDS):
+                x_dwords.append(x_raw[dword_idx])
+        x_raw = fx.Vector.from_elements(x_dwords, fx.Int32)
         x_bf16 = fx.Vector(x_raw).bitcast(fx.BFloat16)
         xf = [x_bf16[p].to(fx.Float32) for p in range_constexpr(VEC)]
 

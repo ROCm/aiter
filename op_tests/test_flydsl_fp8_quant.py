@@ -22,11 +22,14 @@ FP8_MAX = 448.0
 SEED = 0
 
 # D64 same-shape selects the fused producer; D64 cross-attention selects three
-# VEC2 producers; D96 exercises the padded, unrotated generic fallback.
+# VEC2 producers; D96 exercises the padded, unrotated generic fallback; D512
+# and D1024 exercise the split dwordx4 loads used by wider lane fragments.
 SHAPES = [
     ("d64_fused", 1, 128, 128, 4, 64, True),
     ("d64_cross", 1, 192, 128, 4, 64, False),
     ("d96_padded", 1, 128, 160, 4, 96, False),
+    ("d512", 1, 32, 32, 2, 512, True),
+    ("d1024", 1, 16, 16, 1, 1024, True),
 ]
 
 
