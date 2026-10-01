@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import bisect
 import functools
 
 import pandas as pd
@@ -448,6 +449,42 @@ def compute_gemm_SplitK(M: int, N: int, K: int, tile_m: int, tile_n: int, tile_k
 
 _CKGEMM_CONFIG_CACHE: dict = {}
 _CKGEMM_HAS_GFX: dict = {}
+# Per tuned_file, maps a shape key (gfx, cu_num, N, K) -- or (cu_num, N, K) for
+# gfx-less CSVs -- to the sorted list of tuned M buckets present for that shape.
+# Used to pick a neighboring bucket when the padded_M candidates all miss.
+_CKGEMM_M_INDEX: dict = {}
+
+
+def _build_m_index(config_dict: dict, has_gfx: bool) -> dict:
+    """Index tuned M buckets per shape key so a gap can fall back to a neighbor.
+
+    The lookup pads M up to a grid (fine, then nextPow2); if the resulting
+    bucket is simply absent for an otherwise-tuned shape, every candidate
+    misses and the caller drops to the untuned default. Grouping the available
+    M per (..., N, K) lets us instead reuse the closest tuned bucket.
+    """
+    m_index: dict = {}
+    for key_tuple in config_dict:
+        if has_gfx:
+            gfx_, cu_, m_, n_, k_ = key_tuple
+            shape_key = (gfx_, cu_, n_, k_)
+        else:
+            cu_, m_, n_, k_ = key_tuple
+            shape_key = (cu_, n_, k_)
+        m_index.setdefault(shape_key, []).append(m_)
+    return {shape_key: sorted(set(ms)) for shape_key, ms in m_index.items()}
+
+
+def _nearest_tuned_m(sorted_ms, M: int):
+    """Largest tuned bucket <= M, else the smallest available bucket.
+
+    Returns None only when no bucket exists for the shape (a genuinely
+    untuned (N, K)), which the caller still reports as a default-config miss.
+    """
+    if not sorted_ms:
+        return None
+    i = bisect.bisect_right(sorted_ms, M)
+    return sorted_ms[i - 1] if i > 0 else sorted_ms[0]
 
 
 @functools.lru_cache(maxsize=1024)
@@ -472,6 +509,9 @@ def get_CKGEMM_config(M: int, N: int, K: int, tuned_file=None):
                 ["cu_num", "M", "N", "K"]
             ).to_dict("index")
             _CKGEMM_HAS_GFX[tuned_file] = False
+        _CKGEMM_M_INDEX[tuned_file] = _build_m_index(
+            _CKGEMM_CONFIG_CACHE[tuned_file], _CKGEMM_HAS_GFX[tuned_file]
+        )
 
     gfx = get_gfx()
     cu_num = get_cu_num()
@@ -489,6 +529,26 @@ def get_CKGEMM_config(M: int, N: int, K: int, tuned_file=None):
                 )
             break
     if config is None:
+        # The padded_M candidates landed on a hole in this shape's M grid even
+        # though the (N, K) is tuned (e.g. nextPow2(M) == a missing bucket).
+        # Reuse the nearest tuned bucket rather than dropping to the untuned
+        # default; a config tuned for a neighboring M is still correct.
+        shape_key = (gfx, cu_num, N, K) if has_gfx else (cu_num, N, K)
+        nearest_M = _nearest_tuned_m(_CKGEMM_M_INDEX[tuned_file].get(shape_key), M)
+        if nearest_M is not None:
+            key = (
+                (gfx, cu_num, nearest_M, N, K)
+                if has_gfx
+                else (cu_num, nearest_M, N, K)
+            )
+            config = _CKGEMM_CONFIG_CACHE[tuned_file].get(key, None)
+            if config is not None and AITER_LOG_TUNED_CONFIG:
+                logger.info(
+                    f"shape is M:{M}, N:{N}, K:{K}, no exact tuned M bucket; "
+                    f"using nearest tuned M:{nearest_M} in {tuned_file}, "
+                    f"kernel name is {config['kernelName']}!"
+                )
+    if config is None:
         logger.info(
             f"shape is M:{M}, N:{N}, K:{K}, not found tuned config in {tuned_file}, will use default config!"
         )
@@ -497,6 +557,9 @@ def get_CKGEMM_config(M: int, N: int, K: int, tuned_file=None):
 
 _GEMM_QUANT_TYPE_CACHE: dict = {}
 _GEMM_QUANT_TYPE_HAS_GFX: dict = {}
+# Shape key (gfx, cu_num, N, K, q_dtype_w) -- or without gfx -- to sorted tuned
+# M buckets, mirroring _CKGEMM_M_INDEX for the quant-typed lookup.
+_GEMM_QUANT_TYPE_M_INDEX: dict = {}
 
 
 @functools.lru_cache(maxsize=1024)
@@ -528,6 +591,18 @@ def get_GEMM_config_with_quant_type(
                 ["cu_num", "M", "N", "K", "q_dtype_w"]
             ).to_dict("index")
             _GEMM_QUANT_TYPE_HAS_GFX[tuned_file] = False
+        q_m_index: dict = {}
+        for key_tuple in _GEMM_QUANT_TYPE_CACHE[tuned_file]:
+            if _GEMM_QUANT_TYPE_HAS_GFX[tuned_file]:
+                gfx_, cu_, m_, n_, k_, qdw_ = key_tuple
+                shape_key = (gfx_, cu_, n_, k_, qdw_)
+            else:
+                cu_, m_, n_, k_, qdw_ = key_tuple
+                shape_key = (cu_, n_, k_, qdw_)
+            q_m_index.setdefault(shape_key, []).append(m_)
+        _GEMM_QUANT_TYPE_M_INDEX[tuned_file] = {
+            shape_key: sorted(set(ms)) for shape_key, ms in q_m_index.items()
+        }
 
     gfx = get_gfx()
     cu_num = get_cu_num()
@@ -551,6 +626,32 @@ def get_GEMM_config_with_quant_type(
                     msg += f" kernelName is {config['kernelName']} (kernelId {config.get('kernelId')})!"
                 logger.info(msg)
             break
+    if config is None:
+        # Reuse the nearest tuned M bucket for this (N, K, q_dtype_w) when the
+        # padded_M candidates land on a gap, instead of the untuned default.
+        shape_key = (
+            (gfx, cu_num, N, K, str(q_dtype_w))
+            if has_gfx
+            else (cu_num, N, K, str(q_dtype_w))
+        )
+        nearest_M = _nearest_tuned_m(
+            _GEMM_QUANT_TYPE_M_INDEX[tuned_file].get(shape_key), M
+        )
+        if nearest_M is not None:
+            key = (
+                (gfx, cu_num, nearest_M, N, K, str(q_dtype_w))
+                if has_gfx
+                else (cu_num, nearest_M, N, K, str(q_dtype_w))
+            )
+            config = _GEMM_QUANT_TYPE_CACHE[tuned_file].get(key, None)
+            if config is not None and AITER_LOG_TUNED_CONFIG:
+                msg = (
+                    f"shape M:{M}, N:{N}, K:{K} q_dtype_w:{q_dtype_w}, no exact "
+                    f"tuned M bucket; using nearest tuned M:{nearest_M} in {tuned_file}!"
+                )
+                if "kernelName" in config:
+                    msg += f" kernelName is {config['kernelName']}!"
+                logger.info(msg)
     if config is None:
         logger.info(
             f"shape is M:{M}, N:{N}, K:{K}, q_dtype_w:{q_dtype_w}, not found tuned config in {tuned_file}, will use default config!"
