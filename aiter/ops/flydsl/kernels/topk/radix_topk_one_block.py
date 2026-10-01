@@ -1466,36 +1466,38 @@ def build_radix_topk_one_block_module(
             else:
                 write_direct_vector(row_indices, row_values)
 
-        # Kernel control flow
-        def run_row():
-            if row_len <= top_k:
-                write_direct_output(row_indices, row_values)
+        # Kernel control flow. Surplus split blocks fall out of both branches;
+        # folding that into the conditions keeps them block-uniform and keeps
+        # the LDS writes below in the scope that owns them.
+        if const_expr(split_mode == "split"):
+            owns_slice = split_idx < active_splits
+            direct_row = owns_slice & (row_len <= top_k)
+            radix_row = owns_slice & (row_len > top_k)
+        else:
+            direct_row = row_len <= top_k
+            radix_row = row_len > top_k
 
-            if row_len > top_k:
-                if tid < _METADATA_SIZE:
-                    metadata[tid] = zero
-                gpu.barrier()
+        if direct_row:
+            write_direct_output(row_indices, row_values)
 
-                if const_expr(short_rows):
+        if radix_row:
+            if tid < _METADATA_SIZE:
+                metadata[tid] = zero
+            gpu.barrier()
+
+            if const_expr(short_rows):
+                run_cached_path(short_histograms)
+            else:
+                if row_len <= fx.Int32(_COMPACT_CAPACITY):
                     run_cached_path(short_histograms)
                 else:
-                    if row_len <= fx.Int32(_COMPACT_CAPACITY):
-                        run_cached_path(short_histograms)
-                    else:
-                        run_streaming_path(
-                            long_histograms,
-                            histogram,
-                            candidate_ordered_keys,
-                            candidate_local_indices,
-                            staged_local_indices,
-                        )
-
-        if const_expr(split_mode == "split"):
-            # Block-uniform, so the barriers inside stay legal.
-            if split_idx < active_splits:
-                run_row()
-        else:
-            run_row()
+                    run_streaming_path(
+                        long_histograms,
+                        histogram,
+                        candidate_ordered_keys,
+                        candidate_local_indices,
+                        staged_local_indices,
+                    )
 
     grid_y = split_blocks if split_mode == "split" else 1
 
