@@ -922,6 +922,23 @@ def qsa_k1_serves(
     return None
 
 
+def qsa_k1_selection_serves(token_topk: int, compress_ratio: int) -> str | None:
+    """Why this token budget is outside the baked K1 contract, or None.
+
+    K1 writes ``[_K]`` block ids and divides positions by ``_R``. Expand
+    then expects ``token_topk // compress_ratio`` columns, so a budget of
+    1024 tokens at ratio 4 is rejected there, while 4096 tokens at ratio 8
+    still has 512 columns and would be attended at the wrong positions.
+    """
+    if compress_ratio != _R or token_topk != _K * _R:
+        return (
+            f"FlyDSL K1 selects {_K} blocks at compress ratio {_R} "
+            f"(token_topk={_K * _R}), got token_topk={token_topk} "
+            f"compress_ratio={compress_ratio}"
+        )
+    return None
+
+
 def qsa_k1_block_ids(
     q: torch.Tensor,
     k_cache: torch.Tensor,
