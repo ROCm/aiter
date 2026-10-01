@@ -557,13 +557,23 @@ def expand_qsa_block_indices_cuda(
     output_width = token_topk + compress_ratio - 1
     if block_indices.shape != (query_positions.numel(), block_topk):
         raise ValueError("QSA compressed top-k has an invalid shape")
+    rows = block_indices.shape[0]
     if out is None:
         out = torch.empty(
-            (block_indices.shape[0], output_width),
+            (rows, output_width),
             dtype=torch.int32,
             device=block_indices.device,
         )
-    if not block_indices.shape[0]:
+    elif out.shape != (rows, output_width) or out.dtype != torch.int32:
+        raise ValueError(
+            "QSA expand out must be int32 "
+            f"[{rows}, {output_width}], got {out.dtype} {tuple(out.shape)}"
+        )
+    elif out.device != block_indices.device:
+        raise ValueError(
+            f"QSA expand out must be on {block_indices.device}, got {out.device}"
+        )
+    if not rows:
         return out
     column_block = 256
     _expand_qsa_indices_kernel[
