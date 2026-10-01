@@ -33,6 +33,7 @@ namespace py = pybind11;
         .value("Swiglu", ActivationType::Swiglu)                                            \
         .value("Situv2", ActivationType::Situv2)                                            \
         .value("GeluTanh", ActivationType::GeluTanh)                                        \
+        .value("Relu2", ActivationType::Relu2)                                              \
         .export_values();                                                                   \
     pybind11::enum_<MlaVersion>(m, "MlaVersion")                                            \
         .value("V32", MlaVersion::V32)                                                      \
@@ -1695,7 +1696,8 @@ namespace py = pybind11;
           py::arg("group_size")      = 32,                               \
           py::arg("shuffle_scale")   = true,                             \
           py::arg("num_rows")        = std::nullopt,                     \
-          py::arg("num_rows_factor") = 1);                               \
+          py::arg("num_rows_factor") = 1,                                \
+          py::arg("scale_layout_m32k4") = false);                        \
     m.def("dynamic_per_group_scaled_quant_fp4",                          \
           &aiter::dynamic_per_group_scaled_quant_fp4,                    \
           py::arg("out"),                                                \
@@ -2510,7 +2512,8 @@ namespace py = pybind11;
           py::arg("epsilon"),                \
           py::arg("group_size")    = 0,      \
           py::arg("shuffle_scale") = false,  \
-          py::arg("gemma_norm") = false);    \
+          py::arg("gemma_norm") = false,     \
+          py::arg("scale_layout_m32k4") = false); \
     m.def("add_rmsnorm",                     \
           &aiter::add_rmsnorm,               \
           py::arg("out"),                    \
@@ -2529,7 +2532,8 @@ namespace py = pybind11;
           py::arg("epsilon"),                \
           py::arg("group_size")    = 0,      \
           py::arg("shuffle_scale") = false,  \
-          py::arg("gemma_norm") = false);    \
+          py::arg("gemma_norm") = false,     \
+          py::arg("scale_layout_m32k4") = false); \
     m.def("rmsnorm",                         \
           &aiter::rmsnorm,                   \
           py::arg("out"),                    \
