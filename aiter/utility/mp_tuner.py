@@ -153,7 +153,8 @@ def _failed_group_results(
     status="crash",
     detail="",
 ):
-    """Stand-in results for a group the worker pool never returned.
+    """Stand-in results for a group that stopped before every candidate ran,
+    whether the worker pool lost it or work_group aborted it.
 
     Returns the results in task order plus the subset to checkpoint. With
     return_status, a candidate the worker already measured keeps its real
@@ -426,10 +427,10 @@ def work_group(
             cached_ref_key = None
         return data
 
+    rets = []
     try:
         gpu_id = gpuID
 
-        rets = []
         solutions = 1 if not shape_grouped else kernels_num
         for i in range(solutions):
             (
@@ -526,31 +527,17 @@ def work_group(
             else "crash"
         )
         detail = f"work_group aborted before launch: {_candidate_failure_detail(e)}"
-        if isinstance(tasks, list):
-            results = [
-                _format_worker_result(
-                    task[0] if task else "unknown",
-                    float("inf"),
-                    1.0,
-                    status,
-                    return_status,
-                    detail,
-                )
-                for task in tasks
-            ]
-        else:
-            results = [
-                _format_worker_result(
-                    tasks[0] if tasks else "unknown",
-                    float("inf"),
-                    1.0,
-                    status,
-                    return_status,
-                    detail,
-                )
-            ]
+        results, to_publish = _failed_group_results(
+            tasks,
+            shape_grouped,
+            {ret[0]: ret for ret in rets},
+            return_status,
+            "unknown",
+            status,
+            detail,
+        )
         if progress_queue is not None:
-            for result in results:
+            for result in to_publish:
                 progress_queue.put(result)
         return results
     finally:

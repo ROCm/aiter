@@ -24,6 +24,10 @@ def _make_inputs(device=None):
     return {"x": torch.ones(1024, device=device)}
 
 
+def _boom_inputs(device=None):
+    raise RuntimeError("boom before launch")
+
+
 def _copy(x):
     return x.clone()
 
@@ -58,11 +62,11 @@ def _deadline(seconds):
         signal.signal(signal.SIGALRM, previous)
 
 
-def _candidate(name, func, shape=SHAPE):
+def _candidate(name, func, shape=SHAPE, gen_data=_make_inputs):
     # mp_tuner groups a shape's candidates by the first element of info.
     return (
         (shape, name),
-        _make_inputs,
+        gen_data,
         (),
         func,
         (("x",),),
@@ -169,6 +173,62 @@ class TestWorkerDeath(unittest.TestCase):
         us, _err, status, _detail = by_name["next"]
         self.assertEqual(status, "ok")
         self.assertTrue(math.isfinite(us) and us > 0, us)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
+class TestPreLaunchAbort(unittest.TestCase):
+    """A later candidate raises in gen_data, before worker() runs.
+
+    That is not an accelerator fault, so work_group's except swallows it and
+    returns a list. The parent treats that list as a finished group. Typed
+    callers must still keep the candidate already measured; the one that
+    aborted is crash; the one behind it is not_run.
+    """
+
+    GROUP = (
+        _candidate("fast", _copy),
+        _candidate("prelaunch", _copy, gen_data=_boom_inputs),
+        _candidate("behind", _copy),
+    )
+
+    def _run(self, **kwargs):
+        from aiter.utility.mp_tuner import mp_tuner
+
+        return mp_tuner(
+            list(self.GROUP),
+            [(len(self.GROUP), None)],
+            1,
+            False,
+            True,
+            timeout=120,
+            **kwargs,
+        )
+
+    def test_legacy_callers_get_the_whole_group_failed(self):
+        results = self._run()
+        self.assertEqual(
+            [name for (_, name), *_ in results], ["fast", "prelaunch", "behind"]
+        )
+        self.assertTrue(all(math.isinf(us) for _, us, _ in results), results)
+
+    def test_typed_callers_keep_the_candidate_measured_before_the_abort(self):
+        published = []
+        results = self._run(return_status=True, result_callback=published.append)
+        by_name = {name: rest for (_, name), *rest in results}
+        us, _err, status, _detail = by_name["fast"]
+        self.assertEqual(status, "ok", results)
+        self.assertTrue(math.isfinite(us) and us > 0, us)
+        us, _err, status, detail = by_name["prelaunch"]
+        self.assertEqual(status, "crash", results)
+        self.assertIn("boom before launch", detail)
+        self.assertTrue(math.isinf(us))
+        self.assertEqual(by_name["behind"][2], "not_run", results)
+        # A checkpointing caller sees each candidate that ran exactly once, and
+        # never the one behind the abort, so a resume retries it.
+        self.assertEqual(
+            [(name, status) for (_, name), _us, _err, status, _ in published],
+            [("fast", "ok"), ("prelaunch", "crash")],
+        )
 
 
 if __name__ == "__main__":
