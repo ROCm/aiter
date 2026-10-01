@@ -788,7 +788,8 @@ def build_qsa_sparse_gqa_module(
         # needs them. Only VMEM reads may cross, so the page-table load still
         # floats up to the moment its index lands. Decode only: prefill has
         # enough tiles to hide the chain and loses 6% at L32768 if pinned.
-        if const_expr(decode_tr_pv):
+        pin_q = decode_tr_pv or gfx942_v_pf
+        if const_expr(pin_q):
             # sched_barrier is not in the stable rocdl export. sched_vmem is
             # a counted group barrier, not this mask.
             fx.rocdl.sched_barrier("vmem_read")
