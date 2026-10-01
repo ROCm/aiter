@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
+import json
 import sys
 
 import torch
@@ -12,11 +13,12 @@ from aiter.ops.triton.attention.chunk_kda import (
     chunk_kda,
     chunk_kda_prepare,
     chunk_kda_walk,
+    prepare_chunk_kda_metadata,
 )
 from aiter.ops.triton.utils._triton import arch_info
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
 
-try:  # the Triton chunk path vLLM runs on gfx1250 today
+try:  # the Triton chunk path vLLM runs today
     from vllm.models.kimi_k3.amd.ops.third_party.kda import chunk_kda_with_fused_gate
 
     HAS_VLLM = True
@@ -36,16 +38,16 @@ def make_inputs(B, T, H, device):
     q, k, v = (
         mixed[..., i * H * D : (i + 1) * H * D].unflatten(-1, (H, D)) for i in range(3)
     )
-    return dict(
-        q=q,
-        k=k,
-        v=v,
-        g=torch.randn(1, total, H, D, dtype=torch.bfloat16, device=device),
-        beta=torch.randn(1, total, H, dtype=torch.bfloat16, device=device),
-        A_log=torch.log(torch.empty(H, device=device).uniform_(1, 16)),
-        dt_bias=torch.randn(H * D, device=device),
-        cu_seqlens=torch.arange(0, total + 1, T, dtype=torch.int32, device=device),
-    )
+    return {
+        "q": q,
+        "k": k,
+        "v": v,
+        "g": torch.randn(1, total, H, D, dtype=torch.bfloat16, device=device),
+        "beta": torch.randn(1, total, H, dtype=torch.bfloat16, device=device),
+        "A_log": torch.log(torch.empty(H, device=device).uniform_(1, 16)),
+        "dt_bias": torch.randn(H * D, device=device),
+        "cu_seqlens": torch.arange(0, total + 1, T, dtype=torch.int32, device=device),
+    }
 
 
 def traffic_bytes(B, T, H, stage):
@@ -62,7 +64,6 @@ def traffic_bytes(B, T, H, stage):
 
 
 def _time(fn, args):
-    """One measurement in ms; cudagraph keeps host launch cost out of the span."""
     if args.timing == "cudagraph":
         return _bench_graph(fn, args.graph_ms, args.n_replays)
     return triton.testing.do_bench(
@@ -71,7 +72,7 @@ def _time(fn, args):
 
 
 def _bench_graph(fn, graph_ms, n_replays):
-    """Replay a graph of ~graph_ms of launches; returns (median, p20, p80) ms."""
+    # replay a graph of ~graph_ms of launches; (median, p20, p80) ms
     for _ in range(5):
         fn()
     torch.cuda.synchronize()
@@ -141,32 +142,47 @@ def benchmark(args):
         state = torch.randn(B, H, K3_HEAD_DIM, K3_HEAD_DIM, device=args.device)
         idx = torch.arange(B, dtype=torch.int32, device=args.device)
         has_init = torch.ones(B, dtype=torch.bool, device=args.device)
-        paged = dict(state_cache=state, state_indices=idx, has_initial_state=has_init)
+        paged = {
+            "state_cache": state,
+            "state_indices": idx,
+            "has_initial_state": has_init,
+        }
+        # built once: the metadata syncs the host, which a graph capture rejects
+        ci, co = prepare_chunk_kda_metadata(inp["cu_seqlens"])
         stage = "total"
         if provider == "gluon":
             out = torch.empty_like(inp["v"])
 
             def fn():
-                chunk_kda(**inp, lower_bound=K3_LOWER_BOUND, out=out, **paged)
+                chunk_kda(
+                    **inp,
+                    lower_bound=K3_LOWER_BOUND,
+                    chunk_indices=ci,
+                    chunk_offsets=co,
+                    out=out,
+                    config=args.config,
+                    **paged,
+                )
 
         elif provider == "gluon_prepare":
             stage = "prepare"
 
             def fn():
-                chunk_kda_prepare(**inp, lower_bound=K3_LOWER_BOUND)
+                chunk_kda_prepare(**inp, lower_bound=K3_LOWER_BOUND, chunk_indices=ci)
 
         elif provider.startswith("gluon_walk:"):
             stage = "walk"
             bv, nw = (int(x) for x in provider.split(":")[1].split(","))
-            ws = chunk_kda_prepare(**inp, lower_bound=K3_LOWER_BOUND)
+            ws = chunk_kda_prepare(**inp, lower_bound=K3_LOWER_BOUND, chunk_indices=ci)
             out = torch.empty_like(ws["u"])
 
             def fn():
                 chunk_kda_walk(
                     **ws,
                     cu_seqlens=inp["cu_seqlens"],
+                    chunk_offsets=co,
                     out=out,
-                    config={"BV": bv, "num_warps": nw},
+                    config={**args.config, "BV": bv, "num_warps": nw},
                     **paged,
                 )
 
@@ -213,6 +229,12 @@ def parse_args():
         help="walk BV,num_warps points to time on their own",
     )
     parser.add_argument("--backends", nargs="+", default=["gluon", "vllm"])
+    parser.add_argument(
+        "--config",
+        type=json.loads,
+        default={},
+        help="json overrides of the tuned walk config",
+    )
     parser.add_argument("--metric", choices=["time", "throughput"], default="time")
     parser.add_argument(
         "--timing", choices=["cudagraph", "do_bench"], default="do_bench"
@@ -229,8 +251,8 @@ def parse_args():
 
 
 def main():
-    if arch_info.get_arch() != "gfx1250":
-        sys.exit(f"chunk KDA gluon needs gfx1250, got {arch_info.get_arch()}")
+    if arch_info.get_arch() not in ("gfx1250", "gfx950"):
+        sys.exit(f"chunk KDA gluon needs gfx1250 or gfx950, got {arch_info.get_arch()}")
     if not HAS_VLLM:
         print("vllm not importable -- dropping the Triton chunk baseline.")
     benchmark(parse_args())

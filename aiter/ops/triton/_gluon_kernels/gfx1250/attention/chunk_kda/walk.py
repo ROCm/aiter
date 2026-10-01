@@ -5,20 +5,22 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 from aiter.ops.triton._gluon_kernels.common.utils import sigmoid
-from aiter.ops.triton._gluon_kernels.gfx1250.attention.chunk_kda.prepare import _smem
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
+from aiter.ops.triton.utils.device_info import get_num_sms
 
-_TDM = gl.amd.gfx1250.tdm
 
-
-@gluon.constexpr_function
-def _state_mma(num_warps):
-    return gl.amd.AMDWMMALayout(
-        version=3,
-        transposed=True,
-        warp_bases=[[1 << i, 0] for i in range(num_warps.bit_length() - 1)],
-        instr_shape=[16, 16, 32],
+def _get_config(num_seqs, H, overrides=None):
+    cfg_dir = resolve_config_dir("attention", "CHUNK_KDA", backend="gluon")
+    tiers = sorted(
+        load_config_json(f"{cfg_dir}/DEFAULT.json")["walk"], key=lambda c: c["BV"]
     )
+    # the walk is serial in chunks: the narrowest BV whose programs each get a CU (V = 128)
+    fits = [c for c in tiers if num_seqs * H * (128 // c["BV"]) <= get_num_sms()]
+    config = fits[0] if fits else tiers[-1]
+    if overrides and "BV" in overrides:
+        config = next((c for c in tiers if c["BV"] == overrides["BV"]), config)
+    return {**config, **(overrides or {})}
 
 
 @gluon.jit
@@ -43,16 +45,26 @@ def _load_chunk(
     NUM_WARPS: gl.constexpr,
 ):
     s = i % NUM_STAGES
-    uw = _TDM.update_tensor_descriptor(dw, add_offsets=[i * BT, 0], clamp_bounds=True)
-    uq = _TDM.update_tensor_descriptor(dq, add_offsets=[i * BT, 0], clamp_bounds=True)
-    uk = _TDM.update_tensor_descriptor(
+    uw = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+        dw, add_offsets=[i * BT, 0], clamp_bounds=True
+    )
+    uq = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+        dq, add_offsets=[i * BT, 0], clamp_bounds=True
+    )
+    uk = gl.amd.gfx1250.tdm.update_tensor_descriptor(
         dk, add_offsets=[i * (H * K), 0], clamp_bounds=True
     )
-    uu = _TDM.update_tensor_descriptor(du, add_offsets=[i * BT, 0], clamp_bounds=True)
-    ua = _TDM.update_tensor_descriptor(da, add_offsets=[i * BT, 0], clamp_bounds=True)
-    ud = _TDM.update_tensor_descriptor(dd, add_offsets=[i, 0], clamp_bounds=True)
+    uu = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+        du, add_offsets=[i * BT, 0], clamp_bounds=True
+    )
+    ua = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+        da, add_offsets=[i * BT, 0], clamp_bounds=True
+    )
+    ud = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+        dd, add_offsets=[i, 0], clamp_bounds=True
+    )
     if NUM_WARPS == 4:
-        _TDM.async_load_fused(
+        gl.amd.gfx1250.tdm.async_load_fused(
             [
                 (uw, w_s.index(s), 0b0001),
                 (uq, q_s.index(s), 0b0010),
@@ -61,15 +73,19 @@ def _load_chunk(
             ]
         )
     elif NUM_WARPS == 2:
-        _TDM.async_load_fused([(uw, w_s.index(s), 0b01), (uq, q_s.index(s), 0b10)])
-        _TDM.async_load_fused([(uk, k_s.index(s), 0b01), (uu, u_s.index(s), 0b10)])
+        gl.amd.gfx1250.tdm.async_load_fused(
+            [(uw, w_s.index(s), 0b01), (uq, q_s.index(s), 0b10)]
+        )
+        gl.amd.gfx1250.tdm.async_load_fused(
+            [(uk, k_s.index(s), 0b01), (uu, u_s.index(s), 0b10)]
+        )
     else:
-        _TDM.async_load(uw, dest=w_s.index(s))
-        _TDM.async_load(uq, dest=q_s.index(s))
-        _TDM.async_load(uk, dest=k_s.index(s))
-        _TDM.async_load(uu, dest=u_s.index(s))
-    _TDM.async_load(ua, dest=a_s.index(s))
-    _TDM.async_load(ud, dest=d_s.index(s))
+        gl.amd.gfx1250.tdm.async_load(uw, dest=w_s.index(s))
+        gl.amd.gfx1250.tdm.async_load(uq, dest=q_s.index(s))
+        gl.amd.gfx1250.tdm.async_load(uk, dest=k_s.index(s))
+        gl.amd.gfx1250.tdm.async_load(uu, dest=u_s.index(s))
+    gl.amd.gfx1250.tdm.async_load(ua, dest=a_s.index(s))
+    gl.amd.gfx1250.tdm.async_load(ud, dest=d_s.index(s))
 
 
 @gluon.jit
@@ -90,8 +106,7 @@ def _chunk(
     BV: gl.constexpr,
     BT: gl.constexpr,
 ):
-    # V-first, by token half h: v_h^T = u_h^T - S w_h^T, S = S diag(decay) + sum_h v_h^T kg_h,
-    # o_i^T = scale S qg_i^T + sum_{h <= i} v_h^T aqk_ih^T (aqk_01 = 0); halves halve the B operands
+    # by token half h: v_h^T = u_h^T - S w_h^T, o_i^T = scale S qg_i^T + sum_{h <= i} v_h^T aqk_ih^T
     TH: gl.constexpr = BT // 2
     w = w_s.index(s)
     q = q_s.index(s)
@@ -189,11 +204,11 @@ def _store_o(
     BV: gl.constexpr,
     FUSE_NORM: gl.constexpr,
 ):
-    # o^T staged in LDS, read back transposed: 8 channels per lane, 16 B stores along the token row
+    # o^T read back transposed: 16 B stores along the token row
     o = o_s.permute([1, 0]).load(A_OP)
     r = gl.arange(0, BT, gl.SliceLayout(1, A_OP))[:, None]
     c = gl.arange(0, BV, gl.SliceLayout(0, A_OP))[None, :]
-    # gated RMSNorm over the head, on the bf16-rounded output as in decode
+    # gated RMSNorm on the bf16-rounded output, as in decode
     if FUSE_NORM:
         of = o.to(gl.float32)
         of = of * (
@@ -260,11 +275,21 @@ def chunk_kda_walk_kernel(
     gl.static_assert(NUM_WARPS == 1 or NUM_WARPS == 2 or NUM_WARPS == 4)
     gl.static_assert(BV % (16 * NUM_WARPS) == 0, "warps split the state rows")
     gl.static_assert((not FUSE_NORM) or BV == V, "FUSE_NORM needs the whole head")
-    MMA: gl.constexpr = _state_mma(NUM_WARPS)
+    if NUM_WARPS == 1:
+        warp_bases: gl.constexpr = []
+    elif NUM_WARPS == 2:
+        warp_bases: gl.constexpr = [[1, 0]]
+    else:
+        warp_bases: gl.constexpr = [[1, 0], [2, 0]]
+    MMA: gl.constexpr = gl.amd.AMDWMMALayout(
+        version=3, transposed=True, warp_bases=warp_bases, instr_shape=[16, 16, 32]
+    )
     A_OP: gl.constexpr = gl.DotOperandLayout(0, MMA, 8)
     B_OP: gl.constexpr = gl.DotOperandLayout(1, MMA, 8)
     NV: gl.constexpr = V // BV
-    STAGE_OPS: gl.constexpr = 3 if NUM_WARPS == 4 else (4 if NUM_WARPS == 2 else 6)  # TDM ops per warp
+    STAGE_OPS: gl.constexpr = (
+        3 if NUM_WARPS == 4 else (4 if NUM_WARPS == 2 else 6)
+    )  # TDM ops per warp
     P: gl.constexpr = NUM_STAGES - 1  # chunks in flight ahead of the one computing
 
     pid = gl.program_id(0)
@@ -281,11 +306,9 @@ def chunk_kda_walk_kernel(
     s_off = rv[:, None] * K + ck[None, :]
     if IS_PAGED:
         slot = gl.load(state_indices_ptr + i_n).to(gl.int64)
-        # a pad (-1) or out-of-range slot never touches the cache: zeros in, final state dropped
         valid = (slot >= 0) & (slot < num_slots)
     else:
         slot = i_n.to(gl.int64)
-    # rows step by the cache's own slot stride: vLLM's hybrid pages pad and share each slot
     s_head = (i_h * V + i_v * BV) * K
     s_row = slot * stride_state_n + s_head
     if USE_INITIAL_STATE:
@@ -296,10 +319,21 @@ def chunk_kda_walk_kernel(
     else:
         S = gl.zeros([BV, K], gl.float32, MMA)
 
-    SL_K: gl.constexpr = _smem([BT, K], 8)
-    SL_T: gl.constexpr = _smem([K, BT], 8)
-    SL_V: gl.constexpr = _smem([BT, BV], 8)
-    SL_A: gl.constexpr = _smem([BT, BT], 8)
+    SL_K: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[K, 8]], [BT, K], [1, 0]
+    )
+    SL_T: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[BT, 8]], [K, BT], [1, 0]
+    )
+    SL_V: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[BV, 8]], [BT, BV], [1, 0]
+    )
+    SL_A: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[BT, 8]], [BT, BT], [1, 0]
+    )
+    SL_O: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[BT, 8]], [BV, BT], [1, 0]
+    )
     w_s = gl.allocate_shared_memory(w_ptr.dtype.element_ty, [NUM_STAGES, BT, K], SL_K)
     q_s = gl.allocate_shared_memory(qg_ptr.dtype.element_ty, [NUM_STAGES, BT, K], SL_K)
     k_s = gl.allocate_shared_memory(
@@ -309,11 +343,7 @@ def chunk_kda_walk_kernel(
     a_s = gl.allocate_shared_memory(
         aqk_ptr.dtype.element_ty, [NUM_STAGES, BT, BT], SL_A
     )
-    o_s = gl.allocate_shared_memory(
-        o_ptr.dtype.element_ty, [BV, BT], _smem([BV, BT], 8)
-    )
-    # the chunk decay rides in the ring: every lane needs 64 of its 128 values, so a
-    # direct load costs 16 address registers per chunk
+    o_s = gl.allocate_shared_memory(o_ptr.dtype.element_ty, [BV, BT], SL_O)
     SL_D: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
     d_s = gl.allocate_shared_memory(gl.float32, [NUM_STAGES, 1, K], SL_D)
     d_1 = d_s._reinterpret(
@@ -321,42 +351,42 @@ def chunk_kda_walk_kernel(
     )
     # descriptors span the sequence, so the clamp zero-fills a partial last chunk
     tok = bos.to(gl.int64)
-    dw = _TDM.make_tensor_descriptor(
+    dw = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=w_ptr + tok * (H * K) + i_h * K,
         shape=(T_n, K),
         strides=(H * K, 1),
         block_shape=(BT, K),
         layout=SL_K,
     )
-    dq = _TDM.make_tensor_descriptor(
+    dq = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=qg_ptr + tok * (H * K) + i_h * K,
         shape=(T_n, K),
         strides=(H * K, 1),
         block_shape=(BT, K),
         layout=SL_K,
     )
-    dk = _TDM.make_tensor_descriptor(
+    dk = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=kg_t_ptr + (c0 * H + i_h).to(gl.int64) * (K * BT),
         shape=(nc * (H * K), BT),
         strides=(BT, 1),
         block_shape=(K, BT),
         layout=SL_T,
     )
-    du = _TDM.make_tensor_descriptor(
+    du = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=u_ptr + tok * (H * V) + i_h * V + i_v * BV,
         shape=(T_n, BV),
         strides=(H * V, 1),
         block_shape=(BT, BV),
         layout=SL_V,
     )
-    da = _TDM.make_tensor_descriptor(
+    da = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=aqk_ptr + tok * (H * BT) + i_h * BT,
         shape=(T_n, BT),
         strides=(H * BT, 1),
         block_shape=(BT, BT),
         layout=SL_A,
     )
-    dd = _TDM.make_tensor_descriptor(
+    dd = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=decay_ptr + (c0 * H + i_h).to(gl.int64) * K,
         shape=(nc, K),
         strides=(H * K, 1),
@@ -395,8 +425,7 @@ def chunk_kda_walk_kernel(
                 NUM_STAGES,
                 NUM_WARPS,
             )
-    # steady state: chunk i + P is issued in the same block as the wait, so the
-    # wait count stays exact; the tail drains what is left
+
     for i in range(nc - P):
         _load_chunk(
             dw,
@@ -418,17 +447,59 @@ def chunk_kda_walk_kernel(
             NUM_STAGES,
             NUM_WARPS,
         )
-        _TDM.async_wait(P * STAGE_OPS)
+        gl.amd.gfx1250.tdm.async_wait(P * STAGE_OPS)
         S = _step(
-            S, i, d_1, w_s, q_s, k_s, u_s, a_s, o_s, o_p, og_p, nw, T_n, norm_eps,
-            stride_o_token, stride_og_token, scale, MMA, A_OP, B_OP, BV, BT, NUM_STAGES,
+            S,
+            i,
+            d_1,
+            w_s,
+            q_s,
+            k_s,
+            u_s,
+            a_s,
+            o_s,
+            o_p,
+            og_p,
+            nw,
+            T_n,
+            norm_eps,
+            stride_o_token,
+            stride_og_token,
+            scale,
+            MMA,
+            A_OP,
+            B_OP,
+            BV,
+            BT,
+            NUM_STAGES,
             FUSE_NORM,
         )
     for i in range(gl.maximum(nc - P, 0), nc):
-        _TDM.async_wait(0)
+        gl.amd.gfx1250.tdm.async_wait(0)
         S = _step(
-            S, i, d_1, w_s, q_s, k_s, u_s, a_s, o_s, o_p, og_p, nw, T_n, norm_eps,
-            stride_o_token, stride_og_token, scale, MMA, A_OP, B_OP, BV, BT, NUM_STAGES,
+            S,
+            i,
+            d_1,
+            w_s,
+            q_s,
+            k_s,
+            u_s,
+            a_s,
+            o_s,
+            o_p,
+            og_p,
+            nw,
+            T_n,
+            norm_eps,
+            stride_o_token,
+            stride_og_token,
+            scale,
+            MMA,
+            A_OP,
+            B_OP,
+            BV,
+            BT,
+            NUM_STAGES,
             FUSE_NORM,
         )
 

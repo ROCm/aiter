@@ -1,84 +1,30 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import logging
+"""Chunked Kimi Delta Attention prefill, Gluon on gfx1250 and gfx950: prepare, then the walk."""
 
 import torch
 
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.config_utils import (
-    AITER_TRITON_CONFIGS_PATH,
-    load_config_json,
-)
-from aiter.ops.triton.utils.device_info import get_num_sms
-from aiter.ops.triton.utils.logger import AiterTritonLogger
-
-_LOGGER = AiterTritonLogger()
-_LOG_INFO = _LOGGER._logger.isEnabledFor(logging.INFO)
 
 _ARCH = arch_info.get_arch()
+if _ARCH == "gfx950":
+    from aiter.ops.triton._gluon_kernels.gfx950.attention.chunk_kda import prepare, walk
+else:
+    from aiter.ops.triton._gluon_kernels.gfx1250.attention.chunk_kda import (
+        prepare,
+        walk,
+    )
 
 CHUNK_SIZE = 64
 HEAD_DIM = 128
 _INDEX_DTYPES = (torch.int32, torch.int64)
 
-chunk_kda_prepare_kernel = chunk_kda_walk_kernel = None
-if _ARCH == "gfx1250":
-    from aiter.ops.triton._gluon_kernels.gfx1250.attention.chunk_kda.prepare import (
-        chunk_kda_prepare_kernel,
-    )
-    from aiter.ops.triton._gluon_kernels.gfx1250.attention.chunk_kda.walk import (
-        chunk_kda_walk_kernel,
-    )
-
-
-def _tuned() -> dict:
-    return load_config_json(f"{AITER_TRITON_CONFIGS_PATH}/{_ARCH}-CHUNK_KDA-DEFAULT.json")
-
-
-def get_chunk_kda_config(num_seqs: int, H: int, overrides: dict | None = None) -> dict:
-    """Walk launch config: one tier per value-block width BV in the tuned JSON.
-
-    The walk is serial in chunks, so its time is one program's chain: take the narrowest
-    BV whose num_seqs * H * (HEAD_DIM / BV) programs still get a CU each (the widest when
-    none does). An override naming BV starts from that tier.
-    """
-    tiers = sorted(_tuned()["walk"], key=lambda c: c["BV"])
-    if overrides and "BV" in overrides:
-        base = next((c for c in tiers if c["BV"] == overrides["BV"]), {})
-    else:
-        fits = [c for c in tiers if num_seqs * H * (HEAD_DIM // c["BV"]) <= get_num_sms()]
-        base = fits[0] if fits else tiers[-1]
-    config = dict(base)
-    config.update(overrides or {})
-    return config
-
-
-def get_chunk_kda_prepare_config(overrides: dict | None = None) -> dict:
-    config = dict(_tuned().get("prepare", {}))
-    config.update(overrides or {})
-    return config
-
-
-def _launch_opts(config: dict) -> dict:
-    """waves_per_eu / sched_strategy from a config, as kernel launch options."""
-    opts = {}
-    if config.get("waves_per_eu"):
-        opts["waves_per_eu"] = config["waves_per_eu"]
-    if config.get("sched_strategy"):
-        opts["llvm_fn_attrs"] = f"amdgpu-sched-strategy={config['sched_strategy']}"
-    return opts
-
 
 def prepare_chunk_kda_metadata(
     cu_seqlens: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """int32 chunk_indices [NT, 2] of (sequence, chunk) and int64 chunk_offsets [N + 1].
-
-    A zero-length sequence owns no chunk and the ones after it keep their ids
-    (``prepare_chunk_indices`` shifts them). Reads NT back to the host, so callers
-    on a hot path (vLLM) pass their own device-built metadata.
-    """
+    """int32 chunk_indices [NT, 2] and int64 chunk_offsets [N + 1]; syncs to read NT."""
     counts = torch.div(
         (cu_seqlens[1:] - cu_seqlens[:-1]).long() + CHUNK_SIZE - 1,
         CHUNK_SIZE,
@@ -118,39 +64,20 @@ def chunk_kda_prepare(
     scale: float | None = None,
     config: dict | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Per-chunk operands of the chunked KDA walk, one launch (gfx1250 Gluon).
-
-    Fuses the q/k l2norm, the lower-bounded gate, its cumsum, the intra-chunk
-    L / Aqk products, the (I + L)^-1 solve and w/u. The workspace matches the
-    ROCm HIP prologue: qg, w, u token-major [1, T, H, 128]; aqk token-major
-    [1, T, H, 64] (scale folded in, qg unscaled); kg_t chunk-major
-    [NT, H, 128, 64]; decay fp32 [NT, H, 128].
-
-    Args:
-        q, k, v: [1, T, H, 128] raw projections; may be strided token-major views.
-        g: [1, T, H, 128] raw gate projection, before the activation.
-        beta: [1, T, H] raw beta projection, before the sigmoid.
-        A_log: [H] gate parameter.
-        dt_bias: [H * 128] gate bias.
-        lower_bound: gate floor; g = lower_bound * sigmoid(exp(A_log) (g + dt_bias)).
-        cu_seqlens: int32 / int64 [N + 1] varlen offsets.
-        chunk_indices: int [NT, 2] (sequence, chunk) pairs for 64-token chunks;
-            ``prepare_chunk_kda_metadata`` if None.
-        scale: q scale, K**-0.5 by default.
-        config: launch overrides (waves_per_eu, sched_strategy) over the tuned
-            ``prepare`` entry.
-    """
-    if chunk_kda_prepare_kernel is None:
-        raise RuntimeError(f"chunk kda gluon requires gfx1250 (found {_ARCH})")
+    """The walk's workspace in one launch; see chunk_kda."""
+    assert _ARCH in (
+        "gfx1250",
+        "gfx950",
+    ), f"chunk kda needs gfx1250 or gfx950, got {_ARCH}"
     _, T, H, K = q.shape
     V = v.shape[-1]
     assert K == HEAD_DIM and V == HEAD_DIM, "chunk kda is specialised to K = V = 128"
-    # 16-token bands keep 2^(pivot - G) below 2^116 only while each gate step is >= lb log2(e)
+    # the prepare's 16-token bands keep 2^-G finite only down to this floor
     assert -5.5 <= lower_bound < 0, "lower_bound must be in [-5.5, 0)"
     for name, x, D in (("q", q, K), ("k", k, K), ("v", v, V), ("g", g, K)):
         _check_tokens(name, x, D)
         assert x.shape[1:3] == (T, H), f"{name} must share [T, H] with q"
-        assert x.stride(1) % 8 == 0, f"{name} rows must be 16-byte aligned for TDM"
+        assert x.stride(1) % 8 == 0, f"{name} rows must be 16-byte aligned"
     assert beta.shape == (1, T, H) and beta.stride(2) == 1, "beta must be [1, T, H]"
     assert A_log.numel() == H and A_log.is_contiguous(), "A_log must be [H]"
     assert (
@@ -172,9 +99,8 @@ def chunk_kda_prepare(
         "aqk": q.new_empty(1, T, H, CHUNK_SIZE),
         "decay": q.new_empty(NT, H, K, dtype=torch.float32),
     }
-    if _LOG_INFO:
-        _LOGGER.info(f"CHUNK_KDA_PREPARE: T={T} NT={NT} H={H}")
-    chunk_kda_prepare_kernel[(NT, H)](
+    config = prepare._get_config(config)
+    prepare.chunk_kda_prepare_kernel[(NT, H)](
         q_ptr=q,
         k_ptr=k,
         v_ptr=v,
@@ -201,8 +127,10 @@ def chunk_kda_prepare(
         K=K,
         V=V,
         BT=CHUNK_SIZE,
-        num_warps=4,
-        **_launch_opts(get_chunk_kda_prepare_config(config)),
+        NUM_WARPS=config["num_warps"],
+        NC=config["nc"],
+        num_warps=config["num_warps"],
+        waves_per_eu=config["waves_per_eu"],
     )
     return ws
 
@@ -228,35 +156,11 @@ def chunk_kda_walk(
     norm_eps: float = 1e-5,
     config: dict | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Chunk recurrence and output from the ``chunk_kda_prepare`` workspace, one launch.
-
-    Per chunk, with the fp32 V-first state S [V, K]:
-    v_new = u - w S^T, o = scale qg S^T + aqk v_new, S = S diag(decay) + v_new^T kg.
-
-    Args:
-        chunk_offsets: int32 / int64 [N + 1] first chunk of each sequence;
-            ``prepare_chunk_kda_metadata`` if None.
-        out: [1, T, H, 128] destination, may alias the dead v; allocated if None.
-        initial_state: fp32 [N, H, V, K] per-sequence start state, zeros if None.
-        output_final_state: return a fresh fp32 [N, H, V, K] final state.
-        state_cache: fp32 [slots, H, V, K] paged state, dense within a slot but with
-            any slot stride (vLLM pads and shares hybrid cache pages); read and
-            written in place at ``state_indices``; replaces initial_state /
-            output_final_state.
-        state_indices: int32 / int64 [N] cache row per sequence, any stride (vLLM
-            passes a block-table column; it is copied dense). Valid rows must be
-            distinct. A row outside [0, slots), e.g. PAD_SLOT_ID -1, is never read
-            or written: that sequence starts from zeros whatever has_initial_state
-            says, its output is still written, and its final state is dropped.
-        has_initial_state: bool [N], any stride; False starts that sequence from zeros.
-        out_gate, norm_weight: fuse o = rmsnorm(o) * norm_weight * sigmoid(out_gate).
-        config: overrides for BV, num_warps, num_stages, waves_per_eu, sched_strategy.
-
-    Returns:
-        (out, final_state); final_state is None when the state lives in state_cache.
-    """
-    if chunk_kda_walk_kernel is None:
-        raise RuntimeError(f"chunk kda gluon requires gfx1250 (found {_ARCH})")
+    """Chunk recurrence and output from the chunk_kda_prepare workspace; see chunk_kda."""
+    assert _ARCH in (
+        "gfx1250",
+        "gfx950",
+    ), f"chunk kda needs gfx1250 or gfx950, got {_ARCH}"
     _, T, H, K = qg.shape
     V = u.shape[-1]
     N = cu_seqlens.numel() - 1
@@ -264,7 +168,6 @@ def chunk_kda_walk(
     paged = state_cache is not None
     fuse_norm = out_gate is not None
     _check_index("cu_seqlens", cu_seqlens, (N + 1,))
-    # the TDM descriptors assume the dense workspace chunk_kda_prepare allocates
     for name, x, shape in (
         ("qg", qg, (1, T, H, K)),
         ("w", w, (1, T, H, K)),
@@ -295,12 +198,11 @@ def chunk_kda_walk(
             state_indices is not None and has_initial_state is not None
         ), "state_cache needs state_indices and has_initial_state"
         assert (
-            state_indices.numel() == N and state_indices.dtype in _INDEX_DTYPES
+            state_indices.dim() == 1
+            and state_indices.numel() == N
+            and state_indices.dtype in _INDEX_DTYPES
         ), "state_indices must be int32 / int64 [N]"
         assert has_initial_state.numel() == N, "has_initial_state must be [N]"
-        # vLLM passes block_table[:, 0] of an [N, 1 + num_spec] table; the kernel
-        # reads unit stride, and N elements copy without a sync
-        state_indices = state_indices.contiguous()
         has_initial_state = has_initial_state.contiguous()
         state_in = state_out = state_cache
         num_slots = state_cache.shape[0]
@@ -325,60 +227,119 @@ def chunk_kda_walk(
     if fuse_norm:
         _check_tokens("out_gate", out_gate, V)
         assert norm_weight.numel() == V and norm_weight.is_contiguous()
+        config = {"BV": V, "num_warps": 4, "KS": 1, **(config or {})}
 
-    # the fused norm reduces over whole value rows, so it takes the BV == V tier
-    config = get_chunk_kda_config(N, H, {"BV": V, **(config or {})} if fuse_norm else config)
-    BV = config["BV"]
-    num_warps = config["num_warps"]
-    assert (
-        V % BV == 0 and BV % (16 * num_warps) == 0
-    ), f"illegal BV={BV}, warps={num_warps}"
-    assert not fuse_norm or BV == V, "the fused norm needs BV == V"
-    opts = _launch_opts(config)
+    args = {
+        "qg_ptr": qg,
+        "w_ptr": w,
+        "u_ptr": u,
+        "kg_t_ptr": kg_t,
+        "aqk_ptr": aqk,
+        "decay_ptr": decay,
+        "o_ptr": out,
+        "state_ptr": state_in,
+        "state_out_ptr": state_out,
+        "cu_seqlens_ptr": cu_seqlens,
+        "chunk_offsets_ptr": chunk_offsets,
+        "state_indices_ptr": state_indices,
+        "has_initial_state_ptr": has_initial_state,
+        "out_gate_ptr": out_gate,
+        "norm_weight_ptr": norm_weight,
+        "norm_eps": norm_eps,
+        "stride_state_n": state_in.stride(0) if state_in is not None else 0,
+        "stride_state_out_n": state_out.stride(0) if state_out is not None else 0,
+        "num_slots": num_slots,
+        "stride_o_token": out.stride(1),
+        "stride_og_token": out_gate.stride(1) if fuse_norm else 0,
+        "scale": scale,
+        "H": H,
+        "K": K,
+        "V": V,
+        "BT": CHUNK_SIZE,
+        "IS_PAGED": paged,
+        "FUSE_NORM": fuse_norm,
+    }
+    if _ARCH == "gfx950":
+        _walk_gfx950(args, walk._get_config(N, H, NT, config), N)
+        return out, final_state
 
-    if _LOG_INFO:
-        _LOGGER.info(
-            f"CHUNK_KDA_WALK: T={T} N={N} H={H} BV={BV} warps={num_warps} "
-            f"paged={paged} fuse_norm={fuse_norm}"
-        )
-    chunk_kda_walk_kernel[(N * H * (V // BV),)](
-        qg_ptr=qg,
-        w_ptr=w,
-        u_ptr=u,
-        kg_t_ptr=kg_t,
-        aqk_ptr=aqk,
-        decay_ptr=decay,
-        o_ptr=out,
-        state_ptr=state_in,
-        state_out_ptr=state_out,
-        cu_seqlens_ptr=cu_seqlens,
-        chunk_offsets_ptr=chunk_offsets,
-        state_indices_ptr=state_indices,
-        has_initial_state_ptr=has_initial_state,
-        out_gate_ptr=out_gate,
-        norm_weight_ptr=norm_weight,
-        norm_eps=norm_eps,
-        stride_state_n=state_in.stride(0) if state_in is not None else 0,
-        stride_state_out_n=state_out.stride(0) if state_out is not None else 0,
-        num_slots=num_slots,
-        stride_o_token=out.stride(1),
-        stride_og_token=out_gate.stride(1) if fuse_norm else 0,
-        scale=scale,
-        H=H,
-        K=K,
-        V=V,
-        BT=CHUNK_SIZE,
-        BV=BV,
-        NUM_WARPS=num_warps,
-        NUM_STAGES=config.get("num_stages", 2),
-        IS_PAGED=paged,
+    config = walk._get_config(N, H, config)
+    if paged:
+        args["state_indices_ptr"] = state_indices.contiguous()
+    walk.chunk_kda_walk_kernel[(N * H * (V // config["BV"]),)](
+        **args,
+        BV=config["BV"],
+        NUM_WARPS=config["num_warps"],
+        NUM_STAGES=config["num_stages"],
         USE_INITIAL_STATE=state_in is not None,
         STORE_FINAL_STATE=state_out is not None,
-        FUSE_NORM=fuse_norm,
-        num_warps=num_warps,
-        **opts,
+        num_warps=config["num_warps"],
+        waves_per_eu=config["waves_per_eu"],
     )
     return out, final_state
+
+
+def _walk_gfx950(args: dict, config: dict, N: int) -> None:
+    H, K, V, G = args["H"], args["K"], args["V"], config["G"]
+    qg, state_in, state_out = args["qg_ptr"], args["state_ptr"], args["state_out_ptr"]
+    paged = args["IS_PAGED"]
+    args = {
+        **args,
+        "stride_indices": args["state_indices_ptr"].stride(0) if paged else 0,
+        "n_seq": N,
+    }
+
+    def launch(PASS, bufs, use_init, store_final):
+        s = "_pass1" if PASS == 1 else ""
+        bv, nw = config["BV" + s], config["num_warps" + s]
+        grid = N * H * G * (V // bv)
+        if PASS == 1:
+            grid = N * H * (V // bv + (G - 2) * ((V + K) // bv))
+        walk.chunk_kda_walk_kernel[(grid,)](
+            **args,
+            bg_ptr=bufs[0],
+            mg_ptr=bufs[1],
+            sin_ptr=bufs[2],
+            n_groups=G,
+            BV=bv,
+            NUM_WARPS=nw,
+            KS=config["KS" + s],
+            NUM_STAGES=config["num_stages" + s],
+            PASS=PASS,
+            USE_INITIAL_STATE=use_init,
+            STORE_FINAL_STATE=store_final,
+            num_warps=nw,
+            waves_per_eu=config["waves_per_eu" + s],
+        )
+
+    if G == 1:
+        launch(0, (qg,) * 3, state_in is not None, state_out is not None)
+        return
+
+    bufs = (
+        qg.new_empty(G, N, H, V, K, dtype=torch.float32),  # B_g
+        qg.new_empty(G, N, H, K, K),  # M_g^T
+        qg.new_empty(G, N, H, V, K, dtype=torch.float32),  # entry states
+    )
+    launch(1, bufs, state_in is not None, False)
+    if G > 2:
+        grid = N * H * (V // config["BV_scan"])
+        walk.chunk_kda_scan_kernel[(grid,)](
+            bg_ptr=bufs[0],
+            mg_ptr=bufs[1],
+            sin_ptr=bufs[2],
+            n_seq=N,
+            n_groups=G,
+            H=H,
+            K=K,
+            V=V,
+            BV=config["BV_scan"],
+            NUM_WARPS=config["num_warps_scan"],
+            NUM_STAGES=config["num_stages_scan"],
+            num_warps=config["num_warps_scan"],
+            waves_per_eu=config["waves_per_eu_scan"],
+        )
+    launch(2, bufs, False, state_out is not None)
 
 
 def chunk_kda(
@@ -405,10 +366,38 @@ def chunk_kda(
     norm_eps: float = 1e-5,
     config: dict | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Chunked Kimi Delta Attention prefill from raw projections, gfx1250 Gluon.
+    """Chunked Kimi Delta Attention prefill from raw projections (Gluon, gfx1250 / gfx950).
 
-    Two launches, ``chunk_kda_prepare`` then ``chunk_kda_walk``; see both for
-    the arguments. Returns (o, final_state) like ``chunk_kda_walk``.
+    Two launches. ``chunk_kda_prepare`` fuses the q/k l2norm, the gate and its cumsum, the
+    intra-chunk products and the (I + L)^-1 solve into a workspace: qg, w, u [1, T, H, 128],
+    aqk [1, T, H, 64], kg_t [NT, H, 128, 64], fp32 decay [NT, H, 128]. ``chunk_kda_walk``
+    then runs the recurrence on the fp32 V-first state S [V, K], per chunk
+    v = u - w S^T, o = scale qg S^T + aqk v, S = S diag(decay) + v^T kg.
+
+    Args:
+        q, k, v: [1, T, H, 128] raw projections; token rows may be strided (16 B aligned).
+        g: [1, T, H, 128] raw gate projection, before the activation.
+        beta: [1, T, H] raw beta projection, before the sigmoid.
+        A_log: [H] gate parameter. dt_bias: [H * 128] gate bias.
+        lower_bound: gate floor in [-5.5, 0); g = lower_bound * sigmoid(exp(A_log) (g + dt_bias)).
+        cu_seqlens: int32 / int64 [N + 1] varlen offsets.
+        chunk_indices, chunk_offsets: int [NT, 2] (sequence, chunk) and [N + 1] first chunk
+            per sequence; ``prepare_chunk_kda_metadata`` (a host sync) if None.
+        scale: q scale, K**-0.5 by default.
+        out: [1, T, H, 128] destination, may alias the dead v; allocated if None.
+        initial_state: fp32 [N, H, V, K] start state, zeros if None.
+        output_final_state: return a fresh fp32 [N, H, V, K] final state.
+        state_cache: fp32 [slots, H, V, K] paged state, any slot stride, read and written in
+            place at ``state_indices``; replaces initial_state / output_final_state.
+        state_indices: int32 / int64 [N] cache row per sequence, any stride. Valid rows must
+            be distinct; a row outside [0, slots) (PAD_SLOT_ID) is never read or written:
+            that sequence starts from zeros and its final state is dropped.
+        has_initial_state: bool [N]; False starts that sequence from zeros.
+        out_gate, norm_weight, norm_eps: fuse o = rmsnorm(o) * norm_weight * sigmoid(out_gate).
+        config: overrides of the tuned walk config (the kernels' DEFAULT.json).
+
+    Returns:
+        (o, final_state); final_state is None when the state lives in state_cache.
     """
     if scale is None:
         scale = q.shape[-1] ** -0.5

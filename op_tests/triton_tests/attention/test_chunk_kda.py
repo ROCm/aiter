@@ -7,51 +7,67 @@ import math
 import pytest
 import torch
 
+from aiter.ops.triton._gluon_kernels.gfx1250.attention.chunk_kda.walk import _get_config
 from aiter.ops.triton.attention.chunk_kda import (
     CHUNK_SIZE,
     chunk_kda,
     chunk_kda_prepare,
     chunk_kda_walk,
-    get_chunk_kda_config,
     prepare_chunk_kda_metadata,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.device_info import get_num_sms
 from op_tests.triton_tests.utils.kda_ref import chunk_kda_ref, kda_gate_ref, l2norm_ref
 
+ARCH = get_arch()
 pytestmark = pytest.mark.skipif(
-    get_arch() != "gfx1250", reason=f"chunk KDA gluon needs gfx1250, got {get_arch()}"
+    ARCH not in ("gfx1250", "gfx950"),
+    reason=f"chunk KDA gluon needs gfx1250 or gfx950, got {ARCH}",
 )
 
 DEVICE = "cuda"
 D = 128
 LOWER_BOUND = -5.0
-# bf16 chunk operands and a bf16 state in the walk MMAs, as in the HIP / FLA chunk paths: a
-# CPU mirror of this exact algorithm lands at 0.003-0.0045 against the fp32 token loop
 RATIO = 0.008
 POISON = 1e30
-# Kimi-K3 at TP4 as vLLM lays it out: 24 local heads, fp32 recurrent state in hybrid cache
-# pages of K3_PAGE elements (bf16 conv state first, so the state view starts K3_STATE_OFF in)
 K3_H = 24
 K3_PAGE = 442368
 K3_STATE_OFF = 13824
-K3_SLOTS = 64  # 909 in serving: same geometry, fewer pages
-# the tuned walk tiers (gfx1250-CHUNK_KDA-DEFAULT.json): config None takes the narrowest whose
-# N * H * (D / BV) programs get a CU each; WALK_WIDE is forced where few sequences pick another
-WALK_TIERS = [
-    {"BV": 16, "num_warps": 1},
-    {"BV": 32, "num_warps": 2},
-    {"BV": 64, "num_warps": 4, "waves_per_eu": 2},
-    {"BV": 128, "num_warps": 4},
-]
+K3_SLOTS = 64
+if ARCH == "gfx950":
+    WALK_TIERS = [
+        {"BV": 16, "num_warps": 2, "KS": 2},
+        {"BV": 32, "num_warps": 4, "KS": 2},
+        {"BV": 64, "num_warps": 8, "KS": 2},
+        {"BV": 128, "num_warps": 4, "KS": 1},
+    ]
+    WALK_EXTRA = [
+        {"G": 4},
+        {"G": 4, "BV": 128, "num_warps": 4, "KS": 1},
+        {
+            "G": 3,
+            "num_stages": 1,
+            "num_stages_scan": 1,
+            "KS_pass1": 2,
+            "BV_pass1": 64,
+            "num_warps_pass1": 4,
+        },
+        {"BV": 64, "num_warps": 4, "KS": 1, "num_stages": 1},
+    ]
+else:
+    # the tuned gfx1250 tiers
+    WALK_TIERS = [
+        {"BV": 16, "num_warps": 1},
+        {"BV": 32, "num_warps": 2},
+        {"BV": 64, "num_warps": 4, "waves_per_eu": 2},
+        {"BV": 128, "num_warps": 4},
+    ]
+    WALK_EXTRA = [
+        {"BV": 64, "num_warps": 4, "waves_per_eu": 3},
+        {"BV": 128, "num_warps": 2},
+    ]
 WALK_WIDE = WALK_TIERS[-1]
-
-WALK_CONFIGS = [
-    None,
-    *WALK_TIERS,
-    {"BV": 64, "num_warps": 4, "waves_per_eu": 3},
-    {"BV": 128, "num_warps": 2},
-]
+WALK_CONFIGS = [None, *WALK_TIERS, *WALK_EXTRA]
 
 
 def err_ratio(ref, tri):
@@ -102,13 +118,8 @@ def cdiv(a, b):
 
 
 def make_vllm_inputs(seqlens, H=K3_H, nd_tok=0, spec=False, pad_tok=3, seed=0):
-    """The operands vLLM's K3 layer hands the prefill (kda.py _forward).
-
-    q/k/v are dense conv outputs and g the f_b_proj output, viewed past nd_tok decode rows;
-    beta is a column slice of the in_proj row (stride 12448 at H = 24); out is
-    core_attn_out[:, nd_tok:num_actual_tokens] of a buffer with padding rows. On the spec path
-    they are index_select copies (beta stride H) and out is None. vLLM's chunk metadata:
-    int32 indices, int64 offsets. Returns (inputs, extra kwargs, core_attn_out).
+    """vLLM K3 operands: views past nd_tok decode rows, beta an in_proj column, out a
+    core_attn_out slice (spec: index_select copies, out None). Returns (inp, kw, core).
     """
     torch.manual_seed(seed)
     T = sum(seqlens)
@@ -166,9 +177,7 @@ def make_vllm_inputs(seqlens, H=K3_H, nd_tok=0, spec=False, pad_tok=3, seed=0):
 
 
 def make_page_cache(num_slots, H=K3_H, guard=0):
-    """vLLM's hybrid cache pages: conv state, the [H, 128, 128] recurrent state at K3_STATE_OFF,
-    padding. ``guard`` POISON pages on each side keep a stray -1 / num_slots row inside the
-    allocation, where the POISON check sees it."""
+    """vLLM hybrid pages; ``guard`` POISON pages on each side catch -1 / num_slots rows."""
     raw = torch.full(((num_slots + 2 * guard) * K3_PAGE,), POISON, device=DEVICE)
     cache = raw.as_strided(
         (num_slots, H, D, D), (K3_PAGE, D * D, D, 1), guard * K3_PAGE + K3_STATE_OFF
@@ -177,9 +186,7 @@ def make_page_cache(num_slots, H=K3_H, guard=0):
 
 
 def seed_slots(raw, cache, slots, has_init):
-    """Random states in the valid slots. Returns the start state the kernel must use (zeros
-    for has_init False or an invalid slot), the mask of raw it may write, and the valid rows.
-    """
+    """Random valid slots; returns (expected start state, writable mask of raw, valid)."""
     valid = (slots >= 0) & (slots < cache.shape[0])
     rows = slots[valid].long()
     cache[rows] = torch.randn(len(rows), *cache.shape[1:], device=DEVICE)
@@ -292,9 +299,7 @@ def test_chunk_kda_workspace(seqlens):
 @pytest.mark.parametrize("config", [None, WALK_WIDE])
 @pytest.mark.parametrize("padded", [False, True])
 def test_chunk_kda_paged(padded, config):
-    """vLLM path: state cache read and written in place, out aliasing the dead v. ``padded`` lays the
-    cache out like vLLM's hybrid pages: each slot's page holds the conv state first, then the
-    recurrent state, then padding, so the slot stride is not H * D * D (nor a multiple of 16)."""
+    """State cache in place, out aliasing v; ``padded`` gives a hybrid-page slot stride."""
     seqlens, H = [130, 1, 64, 257], 24
     inp = make_inputs(seqlens, H, seed=1)
     N = len(seqlens)
@@ -326,7 +331,9 @@ def test_chunk_kda_paged(padded, config):
     ).all(), "cache memory outside the used slots was written"
 
 
-def test_chunk_kda_fused_norm():
+# None: the tuned default must take BV = V by itself when the norm is fused
+@pytest.mark.parametrize("config", [{"BV": 128, "num_warps": 4}, None])
+def test_chunk_kda_fused_norm(config):
     seqlens, H = [200, 70], 4
     inp = make_inputs(seqlens, H, seed=2)
     og = torch.randn_like(inp["v"])
@@ -345,7 +352,7 @@ def test_chunk_kda_fused_norm():
         out_gate=og,
         norm_weight=nw,
         norm_eps=eps,
-        config={"BV": 128, "num_warps": 4},
+        config=config,
     )
     assert_close("o", o_ref, o)
 
@@ -354,7 +361,7 @@ def test_chunk_kda_fused_norm():
     "dup_keys, gate_shift", [(True, 0.0), (False, 6.0), (True, 6.0)]
 )
 def test_chunk_kda_stress(dup_keys, gate_shift):
-    """Near-duplicate keys and gates pinned at the lower bound: conditioning and pivot range."""
+    """Near-duplicate keys and gates pinned at the lower bound."""
     seqlens, H = [512, 77], 4
     inp = make_inputs(seqlens, H, seed=3, dup_keys=dup_keys, gate_shift=gate_shift)
     h0 = torch.randn(len(seqlens), H, D, D, device=DEVICE)
@@ -365,28 +372,23 @@ def test_chunk_kda_stress(dup_keys, gate_shift):
 
 
 VLLM_CASES = {
-    # the run-2 crash step: 114 decode rows ahead of four ~1k-token prompts, one continuing
     "split_4x1k": {
         "seqlens": [1030, 990, 956, 1005],
         "nd_tok": 114,
         "has_init": [False, True, False, False],
     },
-    # a 4096-token chunk continuing a cached prefix: 64 chunks in one program
     "single_4096": {"seqlens": [4096], "has_init": [True]},
-    # long walks through the widest tier, which two sequences would not select
     "long_default": {
         "seqlens": [2048, 2048],
         "nd_tok": 7,
         "has_init": [False, True],
         "config": WALK_WIDE,
     },
-    # six prefills at H = 24 overfill the GPU at BV 64, so config None takes BV 128
     "split_6": {
         "seqlens": [2, 130, 1, 64, 257, 3],
         "nd_tok": 5,
         "has_init": [True, False, True, True, False, False],
     },
-    # spec path: index_select copies, out None, reclassified 1-token decodes, an empty row
     "spec": {
         "seqlens": [1] * 10 + [300, 0, 65],
         "spec": True,
@@ -397,9 +399,7 @@ VLLM_CASES = {
 
 @pytest.mark.parametrize("case", list(VLLM_CASES))
 def test_chunk_kda_vllm_layout(case):
-    """Operands in the exact forms vLLM passes (strided beta column, decode-row offsets, out as
-    a core_attn_out slice, int64 chunk_offsets, padded hybrid pages): o and the state against the
-    fp32 token loop, and no write outside the used slots' states or the out slice."""
+    """vLLM's exact operand forms; no write outside the used slots or the out slice."""
     c = VLLM_CASES[case]
     seqlens, nd_tok = c["seqlens"], c.get("nd_tok", 0)
     N, T = len(seqlens), sum(seqlens)
@@ -431,8 +431,7 @@ def test_chunk_kda_vllm_layout(case):
 
 @pytest.mark.parametrize("nd_tok", [0, 3])
 def test_chunk_kda_strided_state_indices(nd_tok):
-    """With spec decode configured, a step without drafts passes block_table[:, 0] of an
-    [R, 1 + num_spec] table, sliced past the decodes when mixed: stride 3 here."""
+    """block_table[:, 0] of an [R, 1 + num_spec] table: stride 3."""
     seqlens = [130, 2, 64, 257]
     N = len(seqlens)
     inp, kw, _ = make_vllm_inputs(seqlens, nd_tok=nd_tok, seed=4)
@@ -465,11 +464,11 @@ def test_chunk_kda_strided_state_indices(nd_tok):
 )
 @pytest.mark.parametrize("config", [None, WALK_WIDE])
 def test_chunk_kda_paged_many_seqs(seqlens, config):
-    """Enough prefills at H = 24 to overfill the GPU at BV 64: config None must select the
-    widest tier (BV 128, 4 warps) in the paged specialisation vLLM runs."""
+    """Enough prefills at H = 24 to overfill the GPU at BV 64."""
     N = len(seqlens)
-    assert N * K3_H * (D // 64) > get_num_sms(), "too few pairs for the widest tier"
-    assert get_chunk_kda_config(N, K3_H)["BV"] == 128
+    if ARCH == "gfx1250":
+        assert N * K3_H * (D // 64) > get_num_sms(), "too few pairs for the widest tier"
+        assert _get_config(N, K3_H)["BV"] == 128
     inp, kw, _ = make_vllm_inputs(seqlens, nd_tok=2, seed=6)
     raw, cache = make_page_cache(K3_SLOTS)
     slots = (torch.randperm(K3_SLOTS - 1, device=DEVICE)[:N] + 1).int()
@@ -490,9 +489,7 @@ def test_chunk_kda_paged_many_seqs(seqlens, config):
 
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
 def test_chunk_kda_invalid_slots(dtype):
-    """Slots -1 (PAD_SLOT_ID) and num_slots: those sequences start from zeros although
-    has_initial_state is set, still write o, and leave the cache and its guard pages alone.
-    """
+    """Slots -1 and num_slots start from zeros, still write o, and touch no cache page."""
     seqlens = [130, 64, 1, 257, 65]
     N = len(seqlens)
     inp, kw, _ = make_vllm_inputs(seqlens, seed=5)
@@ -513,9 +510,7 @@ def test_chunk_kda_invalid_slots(dtype):
 
 
 def test_chunk_kda_chunked_prefill():
-    """Prompts split at a 1536-token mamba block: the second call continues from the states the
-    first left in the cache (has_initial_state True), as chunked prefill or a prefix hit does. The
-    first call starts from zeros without reading the POISON rows."""
+    """Prompts split at a 1536-token block: the second call continues from the cached states."""
     first, rest = [1536, 300], [500, 1]
     inp = make_inputs([a + b for a, b in zip(first, rest)], K3_H, seed=7)
     o_ref, s_ref = run_ref(inp)
@@ -594,7 +589,7 @@ HOST_CHECK_CASES = [
 
 @pytest.mark.parametrize("bad", HOST_CHECK_CASES)
 def test_chunk_kda_host_checks(bad):
-    """Malformed metadata, out or state operands fail on the host, before the walk launches."""
+    """Malformed metadata, out or state operands fail on the host."""
     seqlens, H = [65, 1, 130], 4
     N, T = len(seqlens), sum(seqlens)
     inp = make_inputs(seqlens, H)
@@ -648,15 +643,15 @@ def test_chunk_kda_walk_host_checks(bad):
         chunk_kda_walk(**ws, cu_seqlens=inp["cu_seqlens"])
 
 
+@pytest.mark.skipif(ARCH != "gfx1250", reason="gfx1250 walk tiers")
 @pytest.mark.parametrize("N", [1, 2, 3, 5, 6, 11, 40])
 def test_chunk_kda_walk_config_tiers(N):
-    """config None: the narrowest tier whose N * H * (D / BV) programs get a CU each, else
-    the widest; an override naming BV starts from that tier's warps."""
+    """config None takes the narrowest tier that fits the CUs; a BV override starts from it."""
     cus = get_num_sms()
     fits = [t["BV"] for t in WALK_TIERS if N * K3_H * (D // t["BV"]) <= cus]
     expect = fits[0] if fits else WALK_TIERS[-1]["BV"]
-    config = get_chunk_kda_config(N, K3_H)
+    config = _get_config(N, K3_H)
     tier = next(t for t in WALK_TIERS if t["BV"] == config["BV"])
     assert config["BV"] == expect and config["num_warps"] == tier["num_warps"]
-    assert get_chunk_kda_config(N, K3_H, {"BV": 16})["num_warps"] == 1
-    assert get_chunk_kda_config(N, K3_H, {"BV": 64, "num_warps": 2})["num_warps"] == 2
+    assert _get_config(N, K3_H, {"BV": 16})["num_warps"] == 1
+    assert _get_config(N, K3_H, {"BV": 64, "num_warps": 2})["num_warps"] == 2

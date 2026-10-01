@@ -1,14 +1,21 @@
 {
+  "prepare": {
+    "num_warps": 4,
+    "nc": 32,
+    "waves_per_eu": 0
+  },
   "walk": [
     {
       "BV": 16,
       "num_warps": 1,
-      "num_stages": 2
+      "num_stages": 2,
+      "waves_per_eu": 0
     },
     {
       "BV": 32,
       "num_warps": 2,
-      "num_stages": 2
+      "num_stages": 2,
+      "waves_per_eu": 0
     },
     {
       "BV": 64,
@@ -19,7 +26,8 @@
     {
       "BV": 128,
       "num_warps": 4,
-      "num_stages": 2
+      "num_stages": 2,
+      "waves_per_eu": 0
     }
   ]
 }
