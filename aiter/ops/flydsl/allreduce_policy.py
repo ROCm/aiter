@@ -177,17 +177,15 @@ FUSED_FAMILY_POLICY: dict[tuple[str, int], FusedPolicy] = {
         oneshot_max=64 << 10, oneshot_max_exact=64 << 10, mesh_max=128 << 20, ring_max=None
     ),
     # --- xGMI: Policy from measurements (on gfx942/MI300X) --------------------
-    # No ring algorithm, mesh is always better.
+    # No ring algorithm, mesh is always better above oneshot_max.
     ("xgmi", 2): FusedPolicy(
-        oneshot_max=1 << 20, oneshot_max_exact=1 << 20, mesh_max=None,
+        oneshot_max=2 << 20, oneshot_max_exact=32 << 20, mesh_max=None,
     ),
     ("xgmi", 4): FusedPolicy(
-        oneshot_max=3 << 20, oneshot_max_exact=3 << 20, mesh_max=None,
-        min_bytes=3 << 20,
+        oneshot_max=1376256, oneshot_max_exact=512 << 10, mesh_max=None,
     ),
     ("xgmi", 8): FusedPolicy(
-        oneshot_max=7 << 20, oneshot_max_exact=7 << 20, mesh_max=None,
-        min_bytes=7 << 20,
+        oneshot_max=448 << 10, oneshot_max_exact=128 << 10, mesh_max=None,
     ),
 }
 

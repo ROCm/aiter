@@ -196,10 +196,11 @@ FUSED_ONESHOT_LADDER = {
     ("pcie", 2): ((0, 2, 128, "peer", True, 1),),
     ("pcie", 4): ((0, 2, 64, "peer", False, 1),),
     ("pcie", 8): ((0, 4, 64, "peer", False, 1), (8 << 10, 2, 64, "peer", True, 1)),
-    # xGMI: from measurements on MI300X
-    ("xgmi", 2): ((0, 2, 128, "peer", True, 1),),
-    ("xgmi", 4): ((0, 2, 64, "peer", False, 1),),   # window empty; placeholder kept for schema
-    ("xgmi", 8): ((0, 4, 64, "peer", False, 1),),   # window empty; placeholder kept for schema
+    # xGMI: from measurements on MI325X.
+    # Split (k > 1) wins at TP4/TP8 for small M, TP2 never benefits from spliting hidden dim.
+    ("xgmi", 2): ((0, 1, 128, "peer", True, 1),),
+    ("xgmi", 4): ((0, 1, 128, "peer", True, 16), (144 << 10, 1, 128, "peer", True, 1)),
+    ("xgmi", 8): ((0, 1, 64, "peer", True, 16), (56 << 10, 1, 128, "peer", True, 16)),
 }
 
 
