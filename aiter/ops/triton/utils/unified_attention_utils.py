@@ -33,7 +33,8 @@ that.
 A section with no axes, like reduce above, is just a config.
 
 Tile size and number of splits (segments) are derived from the following parameters:
-TILE_SIZE_MIN/MAX, and MIN_SEGMENTS/MAX_SEGMENTS/SEGMENTS_PER_CU.
+TILE_SIZE_MIN/MAX, and MIN_SEGMENTS/MAX_SEGMENTS/SEGMENTS_PER_CU, plus MFMA_DIM
+and the SPLIT_MIN_* floors; see compute_segment_params.
 
 An "<op>.OPT_IN" section holds entries that exist only when the user opts in
 (_load); a LARGE_KV block inside one applies only above a KV cache size
@@ -257,6 +258,9 @@ def compute_segment_params(config: dict, params) -> dict:
     cap = config.pop("MAX_SEGMENTS", None)
     tile_lo = config.pop("SEGMENT_TILE_MIN", 1)
     tile_hi = config.pop("SEGMENT_TILE_MAX", None)
+    mfma_dim = config.pop("MFMA_DIM", None)
+    min_tiles = config.pop("SPLIT_MIN_TILES", 0)
+    min_share = config.pop("SPLIT_MIN_SHARE", 0)
 
     # tokens one segment must cover, so the split never outruns the context
     tile = triton.next_power_of_2(params.block_size)
@@ -267,8 +271,18 @@ def compute_segment_params(config: dict, params) -> dict:
 
     budget = params.num_sms * per_cu
     prgms = max(1, params.num_2d_prgms)
+    # this is specific to gfx950 gluon as the num waves depends on mfma dim there
+    if mfma_dim:
+        num_waves = max(
+            1, triton.next_power_of_2(params.num_queries_per_kv) // mfma_dim
+        )
+        budget //= num_waves
     share = triton.cdiv(budget, prgms)
-    segments = triton.next_power_of_2(max(min(lo, limit), min(limit, max(1, share))))
+    if limit <= min_tiles or share < min_share:
+        segments = 1
+    else:
+        claim = max(min(lo, limit), min(limit, max(1, share)))
+        segments = triton.next_power_of_2(claim)
     if small_split_max is None:
         config["NUM_SEGMENTS"] = segments
     elif segments <= min(small_split_max, limit):

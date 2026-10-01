@@ -32,7 +32,7 @@ namespace py = pybind11;
         .value("Gelu", ActivationType::Gelu)                                                \
         .value("Swiglu", ActivationType::Swiglu)                                            \
         .value("Situv2", ActivationType::Situv2)                                            \
-        .value("GeluTanh", ActivationType::GeluTanh)                                         \
+        .value("GeluTanh", ActivationType::GeluTanh)                                        \
         .export_values();                                                                   \
     pybind11::enum_<MlaVersion>(m, "MlaVersion")                                            \
         .value("V32", MlaVersion::V32)                                                      \
@@ -161,6 +161,11 @@ namespace py = pybind11;
           "Activation function used in GELU fast.",      \
           py::arg("out"),                                \
           py::arg("input"));                             \
+    m.def("relu2",                                       \
+          &aiter::relu2,                                 \
+          "Plain ReLU^2 activation (no gating multiply).",\
+          py::arg("out"),                                 \
+          py::arg("input"));                              \
     m.def("gelu_tanh_and_mul",                           \
           &aiter::gelu_tanh_and_mul,                     \
           "Activation function used in GELU tanh.",      \
@@ -1374,6 +1379,21 @@ namespace py = pybind11;
           py::arg("num_shared_experts")         = 0,                           \
           py::arg("shared_expert_scoring_func") = "",                          \
           "Apply topk softmax to the gating outputs.");                        \
+    m.def("topk_softmax_fused_shared_gate",                                     \
+          &aiter::topk_softmax_fused_shared_gate,                               \
+          py::arg("topk_weights"),                                             \
+          py::arg("topk_indices"),                                             \
+          py::arg("token_expert_indices"),                                     \
+          py::arg("gating_output"),                                            \
+          py::arg("need_renorm"),                                              \
+          py::arg("num_shared_experts"),                                       \
+          py::arg("shared_expert_scoring_func"),                               \
+          py::arg("hidden_states"),                                            \
+          py::arg("gate_weight"),                                              \
+          py::arg("shared_expert_scale")        = 1.0f,                        \
+          py::arg("shared_expert_base")         = -1,                          \
+          "Apply topk softmax with in-kernel shared-expert gate GEMV "         \
+          "(Option A fuse-gate).");                                            \
     m.def("grouped_topk",                                                      \
           &grouped_topk,                                                       \
           py::arg("gating_output"),                                            \
@@ -1531,6 +1551,47 @@ namespace py = pybind11;
           py::arg("attn_sink"),                     \
           py::arg("out"),                           \
           py::arg("softmax_scale"));
+
+#define PA_MQA_LOGITS_MXFP4_PYBIND                       \
+    m.def("pa_mqa_logits_mxfp4_build_tiles",             \
+          &pa_mqa_logits_mxfp4_build_tiles,              \
+          py::arg("cu_seq_q"),                           \
+          py::arg("cu_tiles"),                           \
+          py::arg("total_q"),                            \
+          py::arg("max_tiles"),                          \
+          py::arg("q_per_block"));                       \
+    m.def("pa_mqa_logits_mxfp4_build_sched",             \
+          &pa_mqa_logits_mxfp4_build_sched,              \
+          py::arg("cu_tiles"),                           \
+          py::arg("local_starts"),                       \
+          py::arg("local_ends"),                         \
+          py::arg("row_to_batch"),                       \
+          py::arg("cta_info"),                           \
+          py::arg("num_tiles"),                          \
+          py::arg("num_rows"),                           \
+          py::arg("num_ctas"),                           \
+          py::arg("cta_resident"),                       \
+          py::arg("block_k"),                            \
+          py::arg("q_per_block"));                       \
+    m.def("pa_mqa_logits_mxfp4_fwd_sched",               \
+          &pa_mqa_logits_mxfp4_fwd_sched,                \
+          py::arg("q"),                                  \
+          py::arg("q_scale"),                            \
+          py::arg("kv_cache"),                           \
+          py::arg("kv_scale"),                           \
+          py::arg("block_tables"),                       \
+          py::arg("weights"),                            \
+          py::arg("local_starts"),                       \
+          py::arg("local_ends"),                         \
+          py::arg("cta_info"),                           \
+          py::arg("out"),                                \
+          py::arg("num_rows"),                           \
+          py::arg("num_ctas"),                           \
+          py::arg("weight_scale"),                       \
+          py::arg("kv_block_size"),                      \
+          py::arg("max_seq_len"),                        \
+          py::arg("q_per_block"),                        \
+          py::arg("block_k"));
 
 #define FMHA_FWD_BF16_OPUS_PYBIND                   \
     m.def("fmha_fwd_bf16_opus_fwd",                 \
@@ -1730,7 +1791,13 @@ namespace py = pybind11;
           &aiter::quant_mxfp6_gemm_hip,                                  \
           py::arg("input"),                                              \
           py::arg("packed"),                                             \
-          py::arg("packed_scale"));
+          py::arg("packed_scale"));                                       \
+    m.def("quant_mxfp4_gemm_hip_out",                                    \
+          &aiter::quant_mxfp4_gemm_hip_out,                              \
+          py::arg("input"),                                              \
+          py::arg("packed"),                                             \
+          py::arg("packed_scale"),                                       \
+          py::arg("round_mode") = 1);
 
 #define DSV4_ROTATE_QUANT_PYBIND                                                             \
     m.def("rotate_activation_fp4quant",                                                      \
@@ -1789,6 +1856,18 @@ namespace py = pybind11;
           py::arg("group_size")    = 32,                                                     \
           py::arg("shuffle_scale") = true,                                                   \
           py::arg("do_rotate_act") = false);
+
+#define DSV4_DEQUANT_GATHER_K_PYBIND                                                       \
+    m.def("dsv4_dequantize_and_gather_k",                                                  \
+          &aiter::dsv4_dequantize_and_gather_k,                                            \
+          py::arg("out"),                                                                  \
+          py::arg("k_cache"),                                                              \
+          py::arg("seq_lens"),                                                             \
+          py::arg("gather_lens"),                                                          \
+          py::arg("block_table"),                                                          \
+          py::arg("block_size"),                                                           \
+          py::arg("offset")   = 0,                                                         \
+          py::arg("use_fnuz") = false);
 
 #define QUICK_ALL_REDUCE_PYBIND                                                            \
     AITER_SET_STREAM_PYBIND;                                                               \
