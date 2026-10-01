@@ -947,6 +947,52 @@ def test_expand_rejects_out_that_cannot_hold_the_stores():
         raise AssertionError("a matching caller out was replaced")
 
 
+def test_sparse_attention_rejects_out_that_does_not_match_q():
+    """The GQA store writes ``HEAD_DIM`` elements at unit stride.
+
+    A caller ``out`` has to be the contiguous ``q`` tensor: same shape, dtype,
+    and GPU. ``[M, Hq, 1]`` is rejected before launch.
+    """
+    if not torch.cuda.is_available():
+        return
+    device = torch.device("cuda")
+    rows, n_heads, head_dim = 2, 2, 16
+    q = torch.empty((rows, n_heads, head_dim), dtype=torch.bfloat16, device=device)
+    k_cache = torch.empty((1, 16, 1, head_dim), dtype=torch.bfloat16, device=device)
+    indices = torch.zeros((rows, 4), dtype=torch.int32, device=device)
+    block_table = torch.zeros((1, 1), dtype=torch.int32, device=device)
+    token_to_req = torch.zeros(rows, dtype=torch.int32, device=device)
+    strided = torch.empty(
+        (rows, n_heads, head_dim * 2), dtype=torch.bfloat16, device=device
+    )[..., ::2]
+
+    def attend(query, idx, req, out):
+        return qsa_sparse_paged_attention(
+            query, k_cache, k_cache.clone(), idx, block_table, req, out
+        )
+
+    rejected = (
+        torch.empty((rows, n_heads, 1), dtype=torch.bfloat16, device=device),
+        torch.empty((rows, n_heads, head_dim), dtype=torch.float32, device=device),
+        torch.empty((rows, n_heads, head_dim), dtype=torch.bfloat16),
+        strided,
+    )
+    for out in rejected:
+        try:
+            attend(q, indices, token_to_req, out)
+        except ValueError as exc:
+            if "QSA sparse attention out" not in str(exc):
+                raise
+        else:
+            raise AssertionError(
+                f"accepted out {out.dtype} {tuple(out.shape)} {out.device}"
+            )
+    empty_out = torch.empty((0, n_heads, head_dim), dtype=torch.bfloat16, device=device)
+    got = attend(q[:0], indices[:0], token_to_req[:0], empty_out)
+    if got.data_ptr() != empty_out.data_ptr():
+        raise AssertionError("a matching caller out was replaced")
+
+
 def test_k1_serves_padded_page_and_rejects_misaligned():
     """A padded page stride is in contract; a 16-byte gather that cannot align is not.
 
@@ -2957,6 +3003,7 @@ def _run_unit_cases():
     test_qsa_arch_allowlist()
     test_k1_page_past_4gib()
     test_expand_rejects_out_that_cannot_hold_the_stores()
+    test_sparse_attention_rejects_out_that_does_not_match_q()
     test_k1_serves_padded_page_and_rejects_misaligned()
     test_k1_padded_page_stride_matches_packed()
     test_k1_wide_padded_page_does_not_alias()
