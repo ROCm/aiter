@@ -3092,7 +3092,20 @@ def _get_compiled_fused_quant_preshuffle(
     wmma_rep: int,
     quant_mode: str = "fp4",
     skip_padding: bool = False,
+    a_preshuffle: bool = False,
 ):
+    if a_preshuffle:
+        from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
+            build_moe_fused_quant_preshuffle_module_apre,
+        )
+
+        return build_moe_fused_quant_preshuffle_module_apre(
+            feat_dim=feat_dim,
+            wmma_rep=wmma_rep,
+            quant_mode=quant_mode,
+            skip_padding=skip_padding,
+            a_preshuffle=True,
+        )
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
         build_moe_fused_quant_preshuffle_module,
     )
@@ -3113,6 +3126,71 @@ _TOKEN_MULTIDEST_MIN_TOKENS = 64
 # Every destination costs a buffer descriptor held live across the store pass,
 # so the saving stops being free once they crowd the register budget.
 _TOKEN_MULTIDEST_MAX_TOPK = 8
+
+
+@functools.cache
+def _get_compiled_quant_token_fp4(feat_dim: int, tdm_hidden_chunks: int = 0):
+    from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
+        build_moe_quant_token_fp4_module,
+    )
+
+    return build_moe_quant_token_fp4_module(
+        feat_dim=feat_dim,
+        tdm_hidden_chunks=tdm_hidden_chunks,
+    )
+
+
+@functools.cache
+def _get_compiled_invert_route_rows(source_topk: int = 0):
+    from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
+        build_moe_invert_route_rows_module,
+    )
+
+    return build_moe_invert_route_rows_module(source_topk=source_topk)
+
+
+@functools.cache
+def _get_compiled_scatter_preshuffled_a_lds(
+    feat_dim: int,
+    payload_tiles_per_epoch: int = 1,
+    stage_scale_in_lds: bool = False,
+    skip_empty_row_tiles: bool = False,
+):
+    from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
+        build_moe_scatter_preshuffled_a_lds_module,
+    )
+
+    return build_moe_scatter_preshuffled_a_lds_module(
+        feat_dim=feat_dim,
+        payload_tiles_per_epoch=payload_tiles_per_epoch,
+        stage_scale_in_lds=stage_scale_in_lds,
+        skip_empty_row_tiles=skip_empty_row_tiles,
+    )
+
+
+@functools.cache
+def _get_compiled_quant_preshuffled_a_rowgroup(
+    feat_dim: int,
+    n_experts: int,
+    expert_tile_m: int,
+    rows_per_wave: int,
+    prefetch_depth: int,
+    tdm_hidden_chunks: int = 0,
+    tdm_payload_store: bool = False,
+):
+    from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
+        build_moe_quant_preshuffled_a_rowgroup_module,
+    )
+
+    return build_moe_quant_preshuffled_a_rowgroup_module(
+        feat_dim=feat_dim,
+        n_experts=n_experts,
+        expert_tile_m=expert_tile_m,
+        rows_per_wave=rows_per_wave,
+        prefetch_depth=prefetch_depth,
+        tdm_hidden_chunks=tdm_hidden_chunks,
+        tdm_payload_store=tdm_payload_store,
+    )
 
 
 def token_multidest_eligible(token_num: int, topk: int) -> bool:
@@ -3184,7 +3262,28 @@ def _get_compiled_fused_quant_preshuffle_route_ksplit(
     prequantized: bool = False,
     src_scale_bytes_per_row: int = 0,
     fuse_ep_psum: bool = False,
+    a_preshuffle: bool = False,
+    compact_output: bool = False,
 ):
+    if a_preshuffle or compact_output:
+        if prequantized or fuse_ep_psum:
+            raise ValueError(
+                "A-preshuffle route quant does not support prequantized or EP-psum input"
+            )
+        from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
+            build_moe_fused_quant_preshuffle_route_ksplit_module_apre,
+        )
+
+        return build_moe_fused_quant_preshuffle_route_ksplit_module_apre(
+            feat_dim=feat_dim,
+            wmma_rep=wmma_rep,
+            quant_mode=quant_mode,
+            source_topk=source_topk,
+            remap_rows=remap_rows,
+            ksplit=ksplit,
+            a_preshuffle=a_preshuffle,
+            compact_output=compact_output,
+        )
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
         build_moe_fused_quant_preshuffle_route_ksplit_module,
     )
@@ -3258,6 +3357,10 @@ def flydsl_moe_fused_quant_preshuffle(
     # caller rebuilds the GEMM's layout with flydsl_moe_scatter_preshuffle_scale.
     row_to_token: torch.Tensor | None = None,
     ep_psum_params: dict | None = None,
+    a_preshuffle: bool = False,
+    m_tile_map: torch.Tensor | None = None,
+    n_experts: int = 0,
+    expert_tile_m: int = 0,
 ):
     """Fused grouped quant + e8m0 scale-preshuffle.
 
@@ -3271,6 +3374,10 @@ def flydsl_moe_fused_quant_preshuffle(
     # A quantizing EP dispatch (fp8 or fp4) already put the payload and its e8m0
     # row on the wire: nothing left to convert, only scatter + preshuffle.
     prequantized = prequantized_scale is not None
+    if a_preshuffle and prequantized:
+        raise NotImplementedError(
+            "A-preshuffle currently requires bf16 input rather than a prequantized wire payload"
+        )
     if prequantized:
         # torch dtypes, not aiter.dtypes: this module deliberately imports only
         # torch and the tensor shim.
@@ -3361,9 +3468,272 @@ def flydsl_moe_fused_quant_preshuffle(
         else:
             row_starts_i32 = masked_m
             route_max_m_arg = 1
+        if num_valid_routes is None:
+            num_valid_routes_i32 = torch.empty(0, dtype=torch.int32, device=device)
+            assert num_valid_routes_i32.data_ptr() == 0, "expected a null data_ptr"
+        else:
+            num_valid_routes_i32 = (
+                num_valid_routes.reshape(-1)[:1].to(device=device, dtype=torch.int32)
+            ).contiguous()
+
+        # GEMM1 A-preshuffle fast path: quantize each source token once, invert
+        # route->row, then transpose 32 grouped rows through LDS into the exact
+        # ABpreShuffle payload and ScaleA layouts consumed by the tuned GEMM.
+        if (
+            a_preshuffle
+            and quant_mode == "fp4"
+            and source_topk > 1
+            and not remap_rows
+            and not fuse_ep_psum
+            and num_valid_routes is None
+            and feat_dim % 1024 == 0
+            and n_rows % 32 == 0
+            and (numel // source_topk) * Pb < 0x80000000
+            and (numel // source_topk) * Ws < 0x80000000
+            and n_rows * Pb < 0x80000000
+            and n_rows * Ws < 0x80000000
+        ):
+            if numel % source_topk:
+                raise ValueError(
+                    f"route count {numel} must be divisible by source_topk "
+                    f"{source_topk}"
+                )
+            token_rows = numel // source_topk
+            token_input = grouped_in.contiguous().view(-1, feat_dim)[:token_rows]
+            token_payload = torch.empty(
+                (token_rows, Pb), dtype=torch.uint8, device=device
+            )
+            token_scale = torch.empty(
+                (token_rows, Ws), dtype=torch.uint8, device=device
+            )
+            default_tdm_chunks = (
+                7
+                if feat_dim == 7168
+                and token_rows >= 1024
+                and token_rows % warps_per_block == 0
+                else 0
+            )
+            try:
+                tdm_hidden_chunks = int(
+                    os.environ.get(
+                        "AITER_FLYDSL_GEMM1_APRE_TDM_HIDDEN_CHUNKS",
+                        str(default_tdm_chunks),
+                    )
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "AITER_FLYDSL_GEMM1_APRE_TDM_HIDDEN_CHUNKS must be an integer"
+                ) from exc
+            if token_rows % warps_per_block:
+                tdm_hidden_chunks = 0
+            token_grid = (token_rows + warps_per_block - 1) // warps_per_block
+            _get_compiled_quant_token_fp4(feat_dim, tdm_hidden_chunks)(
+                ptr_arg(token_input.view(-1)),
+                ptr_arg(token_payload.view(-1)),
+                ptr_arg(token_scale.view(-1)),
+                token_rows,
+                token_grid,
+                stream=torch.cuda.current_stream(),
+            )
+            rows_to_tokens = torch.full((n_rows,), -1, dtype=torch.int32, device=device)
+            invert_grid = (numel + 255) // 256
+            _get_compiled_invert_route_rows(source_topk)(
+                ptr_arg(topids_to_rows_i32),
+                ptr_arg(rows_to_tokens),
+                numel,
+                ptr_arg(num_valid_routes_i32),
+                invert_grid,
+                stream=torch.cuda.current_stream(),
+            )
+            scatter_grid = (n_rows + 31) // 32
+            default_scatter_tiles_per_epoch = 7 if feat_dim == 7168 else 1
+            try:
+                scatter_tiles_per_epoch = int(
+                    os.environ.get(
+                        "AITER_FLYDSL_GEMM1_APRE_SCATTER_TILES_PER_EPOCH",
+                        str(default_scatter_tiles_per_epoch),
+                    )
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "AITER_FLYDSL_GEMM1_APRE_SCATTER_TILES_PER_EPOCH must be an integer"
+                ) from exc
+            scatter_scale_lds = os.environ.get(
+                "AITER_FLYDSL_GEMM1_APRE_SCATTER_SCALE_LDS",
+                "1" if feat_dim == 7168 else "0",
+            ) in ("1", "true", "True")
+            scatter_skip_empty = os.environ.get(
+                "AITER_FLYDSL_GEMM1_APRE_SCATTER_SKIP_EMPTY",
+                "1" if feat_dim == 7168 else "0",
+            ) in ("1", "true", "True")
+            _get_compiled_scatter_preshuffled_a_lds(
+                feat_dim,
+                scatter_tiles_per_epoch,
+                scatter_scale_lds,
+                scatter_skip_empty,
+            )(
+                ptr_arg(token_payload.view(torch.uint8)),
+                ptr_arg(token_scale.view(torch.uint8)),
+                ptr_arg(out_payload.view(-1)),
+                ptr_arg(out_scale.view(-1)),
+                ptr_arg(rows_to_tokens),
+                scatter_grid,
+                stream=torch.cuda.current_stream(),
+            )
+            return out_payload, out_scale
+
+        # GEMM2 A-preshuffle fast path. The retained default processes one
+        # expert-local rowgroup per block and writes both final layouts directly.
+        if (
+            a_preshuffle
+            and quant_mode == "fp4"
+            and source_topk == 0
+            and not remap_rows
+            and not fuse_ep_psum
+            and feat_dim % 128 == 0
+            and n_rows % 32 == 0
+            and numel * Pb < 0x80000000
+            and numel * Ws < 0x80000000
+            and n_rows * Pb < 0x80000000
+            and n_rows * Ws < 0x80000000
+        ):
+            producer_mode = (
+                os.environ.get("AITER_FLYDSL_GEMM2_A_PRESHUFFLE_PRODUCER", "rowgroup")
+                .strip()
+                .lower()
+            )
+            if producer_mode not in ("rowgroup", "three_kernel"):
+                raise ValueError(
+                    "AITER_FLYDSL_GEMM2_A_PRESHUFFLE_PRODUCER must be "
+                    f"'rowgroup' or 'three_kernel', got {producer_mode!r}"
+                )
+            if producer_mode == "rowgroup":
+                rows_per_wave = int(
+                    os.environ.get("AITER_FLYDSL_GEMM2_A_PRESHUFFLE_RPW", "2")
+                )
+                prefetch_depth = int(
+                    os.environ.get("AITER_FLYDSL_GEMM2_A_PRESHUFFLE_PREFETCH", "2")
+                )
+                use_target_tdm_defaults = (
+                    feat_dim in (2048, 3072)
+                    and rows_per_wave == 2
+                    and prefetch_depth == 2
+                )
+                try:
+                    rowgroup_tdm_chunks = int(
+                        os.environ.get(
+                            "AITER_FLYDSL_GEMM2_A_PRESHUFFLE_TDM_CHUNKS",
+                            str(feat_dim // 512) if use_target_tdm_defaults else "0",
+                        )
+                    )
+                except ValueError as exc:
+                    raise ValueError(
+                        "AITER_FLYDSL_GEMM2_A_PRESHUFFLE_TDM_CHUNKS must be an integer"
+                    ) from exc
+                rowgroup_tdm_payload_store = os.environ.get(
+                    "AITER_FLYDSL_GEMM2_A_PRESHUFFLE_TDM_STORE",
+                    "1" if use_target_tdm_defaults else "0",
+                ) in ("1", "true", "True")
+                if not rowgroup_tdm_chunks:
+                    rowgroup_tdm_payload_store = False
+                rows_per_block = warps_per_block * rows_per_wave
+                if rows_per_wave not in (1, 2, 4, 8):
+                    raise ValueError(
+                        "AITER_FLYDSL_GEMM2_A_PRESHUFFLE_RPW must be one of "
+                        f"1, 2, 4, 8; got {rows_per_wave}"
+                    )
+                if prefetch_depth not in (1, 2, 4, 8):
+                    raise ValueError(
+                        "AITER_FLYDSL_GEMM2_A_PRESHUFFLE_PREFETCH must be one of "
+                        f"1, 2, 4, 8; got {prefetch_depth}"
+                    )
+                k_blocks_per_wave = 8 // rows_per_wave
+                loop_iters = (feat_dim // 32) // k_blocks_per_wave
+                rowgroup_supported = (
+                    m_tile_map is not None
+                    and n_experts > 0
+                    and expert_tile_m > 0
+                    and feat_dim % 256 == 0
+                    and (feat_dim // 32) % k_blocks_per_wave == 0
+                    and loop_iters % prefetch_depth == 0
+                    and expert_tile_m % rows_per_block == 0
+                    and n_rows * feat_dim * 2 < 0x80000000
+                )
+                if rowgroup_supported:
+                    launch_rowgroup = _get_compiled_quant_preshuffled_a_rowgroup(
+                        feat_dim=feat_dim,
+                        n_experts=int(n_experts),
+                        expert_tile_m=int(expert_tile_m),
+                        rows_per_wave=rows_per_wave,
+                        prefetch_depth=prefetch_depth,
+                        tdm_hidden_chunks=rowgroup_tdm_chunks,
+                        tdm_payload_store=rowgroup_tdm_payload_store,
+                    )
+                    rowgroup_grid = (n_rows + rows_per_block - 1) // rows_per_block
+                    launch_rowgroup(
+                        ptr_arg(grouped_in.contiguous().view(-1)),
+                        ptr_arg(out_payload.view(-1)),
+                        ptr_arg(out_scale.view(-1)),
+                        ptr_arg(
+                            m_tile_map.to(device=device, dtype=torch.int32).reshape(-1)
+                        ),
+                        n_rows,
+                        rowgroup_grid,
+                        stream=torch.cuda.current_stream(),
+                    )
+                    return out_payload, out_scale
+
+            use_ksplit = grid_blocks < _ROUTEKS_KSPLIT_GRID_THRESHOLD
+            route_payload = torch.empty((numel, Pb), dtype=torch.uint8, device=device)
+            route_scale = torch.empty((numel, Ws), dtype=torch.uint8, device=device)
+            rows_to_routes = torch.full((n_rows,), -1, dtype=torch.int32, device=device)
+            launch_compact = _get_compiled_fused_quant_preshuffle_route_ksplit(
+                feat_dim=feat_dim,
+                wmma_rep=wmma_rep,
+                quant_mode=quant_mode,
+                source_topk=0,
+                remap_rows=False,
+                ksplit=use_ksplit,
+                a_preshuffle=False,
+                compact_output=True,
+            )
+            launch_compact(
+                ptr_arg(grouped_in.contiguous().view(-1)),
+                ptr_arg(route_payload.view(-1)),
+                ptr_arg(route_scale.view(-1)),
+                ptr_arg(topids_to_rows_i32),
+                ptr_arg(row_starts_i32),
+                route_max_m_arg,
+                numel,
+                ptr_arg(num_valid_routes_i32),
+                grid_blocks,
+                stream=torch.cuda.current_stream(),
+            )
+            invert_grid = (numel + 255) // 256
+            _get_compiled_invert_route_rows(0)(
+                ptr_arg(topids_to_rows_i32),
+                ptr_arg(rows_to_routes),
+                numel,
+                ptr_arg(num_valid_routes_i32),
+                invert_grid,
+                stream=torch.cuda.current_stream(),
+            )
+            scatter_grid = (n_rows + 31) // 32
+            _get_compiled_scatter_preshuffled_a_lds(feat_dim)(
+                ptr_arg(route_payload.view(-1)),
+                ptr_arg(route_scale.view(-1)),
+                ptr_arg(out_payload.view(-1)),
+                ptr_arg(out_scale.view(-1)),
+                ptr_arg(rows_to_routes),
+                scatter_grid,
+                stream=torch.cuda.current_stream(),
+            )
+            return out_payload, out_scale
+
         token_num = numel // int(source_topk) if source_topk > 0 else 0
         use_token_multidest = (
-            not prequantized
+            not a_preshuffle
+            and not prequantized
             and not remap_rows
             and not fuse_ep_psum
             and num_valid_routes is None
@@ -3426,6 +3796,30 @@ def flydsl_moe_fused_quant_preshuffle(
                 stream=torch.cuda.current_stream(),
             )
             return out_payload, out_scale
+        if a_preshuffle:
+            use_ksplit = grid_blocks < _ROUTEKS_KSPLIT_GRID_THRESHOLD
+            launch_apre = _get_compiled_fused_quant_preshuffle_route_ksplit(
+                feat_dim=feat_dim,
+                wmma_rep=wmma_rep,
+                quant_mode=quant_mode,
+                source_topk=source_topk,
+                remap_rows=remap_rows,
+                ksplit=use_ksplit,
+                a_preshuffle=True,
+            )
+            launch_apre(
+                ptr_arg(grouped_in.contiguous().view(-1)),
+                ptr_arg(out_payload.view(-1)),
+                ptr_arg(out_scale.view(-1)),
+                ptr_arg(topids_to_rows_i32),
+                ptr_arg(row_starts_i32),
+                route_max_m_arg,
+                numel,
+                ptr_arg(num_valid_routes_i32),
+                grid_blocks,
+                stream=torch.cuda.current_stream(),
+            )
+            return out_payload, out_scale
         use_ksplit = grid_blocks < _ROUTEKS_KSPLIT_GRID_THRESHOLD
         launch = _get_compiled_fused_quant_preshuffle_route_ksplit(
             feat_dim=feat_dim,
@@ -3443,13 +3837,6 @@ def flydsl_moe_fused_quant_preshuffle(
         # Dead-tail skip (EP dynamic token count): routes >= num_valid_routes are
         # padding rows of the dispatch buffer and are not gathered/quantized. When
         # not provided, pass a null pointer (0-element tensor -> data_ptr() == 0).
-        if num_valid_routes is None:
-            num_valid_routes_i32 = torch.empty(0, dtype=torch.int32, device=device)
-            assert num_valid_routes_i32.data_ptr() == 0, "expected a null data_ptr"
-        else:
-            num_valid_routes_i32 = (
-                num_valid_routes.reshape(-1)[:1].to(device=device, dtype=torch.int32)
-            ).contiguous()
         launch(
             ptr_arg(grouped_in.contiguous().view(-1)),
             ptr_arg(out_payload.view(-1)),
@@ -3477,6 +3864,7 @@ def flydsl_moe_fused_quant_preshuffle(
         wmma_rep=wmma_rep,
         quant_mode=quant_mode,
         skip_padding=skip_padding,
+        a_preshuffle=a_preshuffle,
     )
     launch(
         ptr_arg(grouped_in.contiguous().view(-1)),

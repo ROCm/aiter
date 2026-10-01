@@ -1,1 +1,9 @@
 *.csv text eol=lf
+*.s text eol=lf
+*.py text eol=lf
+*.cpp text eol=lf
+*.cc text eol=lf
+*.md text eol=lf
+*.sh text eol=lf
+*.json text eol=lf
+*.log text eol=lf

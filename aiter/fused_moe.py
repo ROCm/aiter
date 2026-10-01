@@ -4852,6 +4852,7 @@ def torch_moe_stage2(
     a2_scale=None,  # [expert]]'
     w2_bias=None,
     doweight=True,
+    return_per_route=False,
 ):
     ctype = dtypes.fp32  # compute type
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
@@ -4960,6 +4961,7 @@ def torch_moe_stage2(
             out[mask] = act_input
             if w2_bias is not None:
                 out[mask] = out[mask] + w2_bias[E_id].view(1, -1)
+    per_route_out = out.to(dtype=dtype, copy=True) if return_per_route else None
     if doweight:
         # In-place: out and topk_weights are both fp32 (ctype), so this is
         # numerically identical to `out = out * ...` but avoids allocating a
@@ -4967,7 +4969,10 @@ def torch_moe_stage2(
         # is the largest single allocation in the stage-2 reference (tens of GiB
         # for large-token FP4 shapes) and was the site of the CI OOM.
         out.mul_(topk_weights.view(token_num, -1, 1))
-    return out.sum(1).to(dtype)
+    reduced_out = out.sum(1).to(dtype)
+    if return_per_route:
+        return per_route_out, reduced_out
+    return reduced_out
 
 
 def ck_moe_stage1(

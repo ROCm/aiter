@@ -1,0 +1,525 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+cd "$REPO_ROOT"
+
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+ROUNDS="${ROUNDS:-2}"
+MODE=e2e-const0
+mode_seen=0
+
+usage() {
+  cat <<'EOF'
+usage: bash my_code/run_moe_prefill_switch_ab.sh [MODE]
+
+Modes:
+  e2e-const0   Run both shapes with --const-init 0 (default)
+  e2e-random   Run both shapes with random initialization
+  e2e-both     Run random followed by const0
+
+Environment:
+  ROUNDS=N     Number of rounds for every data/shape/mode case (default: 2)
+  PYTHON_BIN   Python executable (default: python3)
+  LOG_DIR      Output directory override
+EOF
+}
+
+for arg in "$@"; do
+  case "$arg" in
+    -h|--help|help)
+      usage
+      exit 0
+      ;;
+    e2e-const0|e2e-random|e2e-both)
+      if [[ "$mode_seen" == 1 ]]; then
+        printf 'Only one MODE may be specified.\n' >&2
+        usage >&2
+        exit 2
+      fi
+      MODE="$arg"
+      mode_seen=1
+      ;;
+    *)
+      printf 'Unknown argument: %s\n' "$arg" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
+LOG_DIR="${LOG_DIR:-$SCRIPT_DIR/moe_prefill_switch_ab_runs/$RUN_ID}"
+mkdir -p "$LOG_DIR"
+
+if [[ ! "$ROUNDS" =~ ^[1-9][0-9]*$ ]]; then
+  printf 'ROUNDS must be a positive integer, got %q\n' "$ROUNDS" >&2
+  exit 2
+fi
+
+RESULTS_TSV="$LOG_DIR/results.tsv"
+SUMMARY_MD="$LOG_DIR/summary.md"
+printf 'data\tround\torder\tcase\tshape\tmode\treturn_code\tgemm1_us\tgemm1_tflops\tgemm1_rw_tbps\tgemm1_ref_output_hash128\tgemm1_output_hash128\tgemm2_us\tgemm2_tflops\tgemm2_rw_tbps\tgemm2_ref_output_hash128\tgemm2_output_hash128\tmoe_e2e_us\tlogits_diff\trel_l2\tpass\tgemm1_symbol\tgemm2_symbol\tlog_file\n' \
+  >"$RESULTS_TSV"
+
+# Common environment for all four cases.
+export ENABLE_CK=0
+export AITER_MOE_EXPERT_BALANCE=true
+export AITER_LOG_MORE=1
+export AITER_USE_GROUPED_GEMM=1
+export AITER_GROUPED_DEBUG=0
+export AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE=1
+
+OPT_ENV_VARS=(
+  AITER_FLYDSL_MXFP4_CLUSTER_N
+  AITER_TDM_NEXT_STAGE_PREFETCH
+  AITER_FLYDSL_GEMM1_A_PRESHUFFLE
+  AITER_FLYDSL_GEMM1_WAVES_PER_TENSOR_TDM
+  AITER_FLYDSL_GEMM1_MMA_GROUP
+  AITER_FLYDSL_GEMM1_FENCE_COVER_MMA
+  AITER_FLYDSL_GEMM1_DISABLE_XDL_ARB_STALL
+  AITER_FLYDSL_GEMM1_WMMA_REUSE
+  AITER_FLYDSL_GEMM1_OVERLAP_OUTPUT_STORE
+  AITER_FLYDSL_GEMM2_A_PRESHUFFLE
+  AITER_FLYDSL_GEMM2_A_PRESHUFFLE_PRODUCER
+  AITER_FLYDSL_GEMM2_A_PRESHUFFLE_RPW
+  AITER_FLYDSL_GEMM2_A_PRESHUFFLE_PREFETCH
+  AITER_FLYDSL_GEMM2_WAVES_PER_TENSOR_TDM
+  AITER_FLYDSL_GEMM2_SCHEDULE_HINTS
+  AITER_FLYDSL_GEMM2_MMA_GROUP
+  AITER_FLYDSL_GEMM2_FENCE_COVER_MMA
+  AITER_FLYDSL_GEMM2_OVERLAP_OUTPUT_STORE
+  AITER_FLYDSL_GEMM2_OUTPUT_SPLIT_WM
+  AITER_FLYDSL_GEMM2_OUTPUT_WAVE_SPLIT
+)
+
+disable_optimizations() {
+  local var
+  for var in "${OPT_ENV_VARS[@]}"; do
+    unset "$var"
+  done
+}
+
+enable_optimizations() {
+  export AITER_FLYDSL_MXFP4_CLUSTER_N=4
+  export AITER_TDM_NEXT_STAGE_PREFETCH=1
+  export AITER_FLYDSL_GEMM1_A_PRESHUFFLE=1
+  export AITER_FLYDSL_GEMM1_WAVES_PER_TENSOR_TDM=2
+  export AITER_FLYDSL_GEMM1_MMA_GROUP=4
+  export AITER_FLYDSL_GEMM1_FENCE_COVER_MMA=28
+  export AITER_FLYDSL_GEMM1_DISABLE_XDL_ARB_STALL=0
+  export AITER_FLYDSL_GEMM1_WMMA_REUSE=1
+  export AITER_FLYDSL_GEMM1_OVERLAP_OUTPUT_STORE=1
+  export AITER_FLYDSL_GEMM2_A_PRESHUFFLE=1
+  export AITER_FLYDSL_GEMM2_A_PRESHUFFLE_PRODUCER=rowgroup
+  export AITER_FLYDSL_GEMM2_A_PRESHUFFLE_RPW=2
+  export AITER_FLYDSL_GEMM2_A_PRESHUFFLE_PREFETCH=2
+  export AITER_FLYDSL_GEMM2_WAVES_PER_TENSOR_TDM=2
+  export AITER_FLYDSL_GEMM2_SCHEDULE_HINTS=1
+  export AITER_FLYDSL_GEMM2_MMA_GROUP=4
+  export AITER_FLYDSL_GEMM2_FENCE_COVER_MMA=28
+  export AITER_FLYDSL_GEMM2_OVERLAP_OUTPUT_STORE=1
+  export AITER_FLYDSL_GEMM2_OUTPUT_SPLIT_WM=3
+  export AITER_FLYDSL_GEMM2_OUTPUT_WAVE_SPLIT=1
+}
+
+print_case_environment() {
+  local mode="$1"
+
+  printf 'mode=%s\n' "$mode"
+  printf 'ENABLE_CK=%s\n' "$ENABLE_CK"
+  printf 'AITER_MOE_EXPERT_BALANCE=%s\n' "$AITER_MOE_EXPERT_BALANCE"
+  printf 'AITER_LOG_MORE=%s\n' "$AITER_LOG_MORE"
+  printf 'AITER_USE_GROUPED_GEMM=%s\n' "$AITER_USE_GROUPED_GEMM"
+  printf 'AITER_GROUPED_DEBUG=%s\n' "$AITER_GROUPED_DEBUG"
+  printf 'AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE=%s\n' \
+    "$AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE"
+
+  local var
+  for var in "${OPT_ENV_VARS[@]}"; do
+    if [[ -v "$var" ]]; then
+      printf '%s=%s\n' "$var" "${!var}"
+    else
+      printf '%s=<unset>\n' "$var"
+    fi
+  done
+}
+
+extract_precision_metrics() {
+  local log_file="$1"
+  "$PYTHON_BIN" - "$log_file" <<'PY'
+import sys
+import re
+from pathlib import Path
+
+
+def cells(line: str) -> list[str]:
+    return [part.strip() for part in line.strip().strip("|").split("|")]
+
+
+lines = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace").splitlines()
+header = None
+row = None
+for line in lines:
+    if not line.lstrip().startswith("|"):
+        continue
+    values = cells(line)
+    if "data_format" in values and "logits_diff" in values and "pass" in values:
+        header = values
+        continue
+    if header and values and values[0] == "a4w4" and len(values) == len(header):
+        row = dict(zip(header, values))
+
+if row is None:
+    print("NA\tNA\tNA\tNA\tNA\tNA\tNA")
+    raise SystemExit(0)
+
+
+def rate(column: str, unit: str) -> str:
+    match = re.search(
+        r"([0-9][0-9,]*(?:\.[0-9]+)?)\s+" + re.escape(unit),
+        row[column],
+    )
+    return "NA" if match is None else match.group(1).replace(",", "")
+
+
+print(
+    "\t".join(
+        (
+            row["logits_diff"],
+            row["rel_l2"],
+            row["pass"],
+            rate("gemm1 executed", "TFLOP/s"),
+            rate("gemm1 effective R+W", "TB/s"),
+            rate("gemm2 executed", "TFLOP/s"),
+            rate("gemm2 effective R+W", "TB/s"),
+        )
+    )
+)
+PY
+}
+
+run_case() {
+  local case_name="$1"
+  local shape="$2"
+  local data="$3"
+  local mode="$4"
+  local round="$5"
+  local order="$6"
+  shift 6
+
+  disable_optimizations
+  if [[ "$mode" == "optimized" ]]; then
+    enable_optimizations
+  elif [[ "$mode" != "baseline" ]]; then
+    printf 'Unknown mode: %s\n' "$mode" >&2
+    return 2
+  fi
+
+  local log_file="$LOG_DIR/${data}_r${round}_o${order}_${case_name}.log"
+  local rc gemm1_us gemm2_us moe_e2e_us logits_diff rel_l2 pass
+  local gemm1_tflops gemm1_rw_tbps gemm2_tflops gemm2_rw_tbps
+  local gemm1_ref_hash gemm1_out_hash gemm2_ref_hash gemm2_out_hash
+  local gemm1_symbol gemm2_symbol
+
+  set +e
+  (
+    printf '\n============================================================\n'
+    printf 'case: %s\n' "$case_name"
+    printf 'shape: %s\n' "$shape"
+    printf 'data: %s\n' "$data"
+    printf 'round: %s/%s\n' "$round" "$ROUNDS"
+    printf 'order: %s\n' "$order"
+    printf 'started_utc: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'repository: %s\n' "$REPO_ROOT"
+    printf 'command:'
+    printf ' %q' "$PYTHON_BIN" "$@"
+    printf '\n'
+    print_case_environment "$mode"
+    printf '============================================================\n\n'
+
+    "$PYTHON_BIN" "$@"
+    rc=$?
+
+    printf '\nfinished_utc: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    exit "$rc"
+  ) 2>&1 | tee "$log_file"
+  rc=${PIPESTATUS[0]}
+  set -e
+
+  gemm1_us="$(sed -n 's/.*gemm1: device_time_avg=\([0-9.]*\) us.*/\1/p' "$log_file" | tail -1)"
+  gemm2_us="$(sed -n 's/.*gemm2: device_time_avg=\([0-9.]*\) us.*/\1/p' "$log_file" | tail -1)"
+  moe_e2e_us="$(sed -n 's/.*fused_moe end-to-end us = \([0-9.]*\).*/\1/p' "$log_file" | tail -1)"
+  gemm1_symbol="$(sed -n 's/.*gemm1: device_time_avg=[0-9.]* us count=[0-9]* symbol=//p' "$log_file" | tail -1)"
+  gemm2_symbol="$(sed -n 's/.*gemm2: device_time_avg=[0-9.]* us count=[0-9]* symbol=//p' "$log_file" | tail -1)"
+  gemm1_ref_hash="$(sed -n 's/.*gemm1_ref_output_hash128=//p' "$log_file" | tail -1)"
+  gemm1_out_hash="$(sed -n 's/.*gemm1_output_hash128=//p' "$log_file" | tail -1)"
+  gemm2_ref_hash="$(sed -n 's/.*gemm2_ref_output_hash128=//p' "$log_file" | tail -1)"
+  gemm2_out_hash="$(sed -n 's/.*gemm2_output_hash128=//p' "$log_file" | tail -1)"
+  IFS=$'\t' read -r logits_diff rel_l2 pass \
+    gemm1_tflops gemm1_rw_tbps gemm2_tflops gemm2_rw_tbps \
+    < <(extract_precision_metrics "$log_file")
+
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$data" "$round" "$order" "$case_name" "$shape" "$mode" "$rc" \
+    "${gemm1_us:-NA}" "${gemm1_tflops:-NA}" "${gemm1_rw_tbps:-NA}" \
+    "${gemm1_ref_hash:-NA}" "${gemm1_out_hash:-NA}" \
+    "${gemm2_us:-NA}" "${gemm2_tflops:-NA}" "${gemm2_rw_tbps:-NA}" \
+    "${gemm2_ref_hash:-NA}" "${gemm2_out_hash:-NA}" \
+    "${moe_e2e_us:-NA}" "${logits_diff:-NA}" "${rel_l2:-NA}" "${pass:-NA}" \
+    "${gemm1_symbol:-NA}" "${gemm2_symbol:-NA}" \
+    "$log_file" >>"$RESULTS_TSV"
+
+  if [[ "$rc" -ne 0 || -z "$gemm1_us" || -z "$gemm2_us" || -z "$moe_e2e_us" \
+        || "$gemm1_tflops" == "NA" || "$gemm1_rw_tbps" == "NA" \
+        || "$gemm2_tflops" == "NA" || "$gemm2_rw_tbps" == "NA" ]]; then
+    printf 'Case failed or timing extraction failed: %s round=%s\n' \
+      "$case_name" "$round" >&2
+    exit 4
+  fi
+
+  if [[ "$pass" != "True" ]]; then
+    printf 'Correctness check failed: %s round=%s pass=%s\n' \
+      "$case_name" "$round" "$pass" >&2
+    exit 4
+  fi
+
+  if [[ ! "$gemm1_ref_hash" =~ ^[0-9a-f]{32}$ \
+        || ! "$gemm1_out_hash" =~ ^[0-9a-f]{32}$ \
+        || ! "$gemm2_ref_hash" =~ ^[0-9a-f]{32}$ \
+        || ! "$gemm2_out_hash" =~ ^[0-9a-f]{32}$ ]]; then
+    printf 'Hash extraction failed: %s round=%s\n' "$case_name" "$round" >&2
+    exit 4
+  fi
+}
+
+E96_COMMAND=(
+  -u
+  my_code/test_flydsl_grouped_gemm_gfx1250.py
+  --scenario bench
+  --data-format a4w4
+  --experts 96
+  --tokens 16384
+  --topk 6
+  --iters 20
+  --model-dim 7168
+  --inter-dim 3072
+  --act silu
+  --no-bias
+  --no-check-aot-cache
+)
+
+E256_COMMAND=(
+  -u
+  my_code/test_flydsl_grouped_gemm_gfx1250.py
+  --scenario bench
+  --data-format a4w4
+  --experts 256
+  --tokens 16384
+  --topk 8
+  --iters 100
+  --model-dim 7168
+  --inter-dim 2048
+  --act silu
+  --no-bias
+  --no-check-aot-cache
+)
+
+run_named_case() {
+  local case_name="$1"
+  local data="$2"
+  local round="$3"
+  local order="$4"
+  local -a data_args=()
+
+  case "$data" in
+    const0)
+      data_args=(--const-init 0)
+      ;;
+    random)
+      ;;
+    *)
+      printf 'Unknown data mode: %s\n' "$data" >&2
+      exit 2
+      ;;
+  esac
+
+  case "$case_name" in
+    e96_baseline)
+      run_case "$case_name" "E96/T16384/topk6/I3072" "$data" baseline \
+        "$round" "$order" "${E96_COMMAND[@]}" "${data_args[@]}"
+      ;;
+    e96_optimized)
+      run_case "$case_name" "E96/T16384/topk6/I3072" "$data" optimized \
+        "$round" "$order" "${E96_COMMAND[@]}" "${data_args[@]}"
+      ;;
+    e256_baseline)
+      run_case "$case_name" "E256/T16384/topk8/I2048" "$data" baseline \
+        "$round" "$order" "${E256_COMMAND[@]}" "${data_args[@]}"
+      ;;
+    e256_optimized)
+      run_case "$case_name" "E256/T16384/topk8/I2048" "$data" optimized \
+        "$round" "$order" "${E256_COMMAND[@]}" "${data_args[@]}"
+      ;;
+    *)
+      printf 'Unknown case: %s\n' "$case_name" >&2
+      exit 2
+      ;;
+  esac
+}
+
+write_summary() {
+  "$PYTHON_BIN" - "$RESULTS_TSV" <<'PY' >"$SUMMARY_MD"
+import csv
+import statistics
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+
+path = Path(sys.argv[1])
+with path.open(newline="", encoding="utf-8") as handle:
+    rows = list(csv.DictReader(handle, delimiter="\t"))
+
+if not rows:
+    raise SystemExit(0)
+
+grouped = defaultdict(list)
+data_order = []
+shape_order = []
+for row in rows:
+    key = (row["data"], row["shape"], row["mode"])
+    grouped[key].append(row)
+    if row["data"] not in data_order:
+        data_order.append(row["data"])
+    if row["shape"] not in shape_order:
+        shape_order.append(row["shape"])
+
+
+def values(case_rows, key):
+    return [float(row[key]) for row in case_rows]
+
+
+def samples(vals, digits):
+    return ", ".join(f"{value:.{digits}f}" for value in vals)
+
+
+def gain(baseline, value):
+    return (baseline - value) / baseline * 100.0
+
+
+def hashes(case_rows, key):
+    return "<br>".join(dict.fromkeys(row[key] for row in case_rows))
+
+
+print(
+    "| data | shape | mode | GEMM1 samples (us) | GEMM1 median us | GEMM1 vs baseline | "
+    "GEMM1 TFLOP/s | GEMM1 effective R+W (TB/s) | "
+    "GEMM1 ref out hash128 | GEMM1 out hash128 | "
+    "GEMM2 samples (us) | GEMM2 median us | GEMM2 vs baseline | "
+    "GEMM2 TFLOP/s | GEMM2 effective R+W (TB/s) | "
+    "GEMM2 ref out hash128 | GEMM2 out hash128 | "
+    "MoE e2e samples (us) | MoE e2e median us | MoE e2e vs baseline | "
+    "pass | logits_diff | rel_l2 |"
+)
+print(
+    "|---|---|---|---|---:|---:|---:|---:|---|---|"
+    "---|---:|---:|---:|---:|---|---|"
+    "---|---:|---:|:---:|---:|---:|"
+)
+
+for data in data_order:
+    for shape in shape_order:
+        baseline_rows = grouped.get((data, shape, "baseline"), [])
+        if not baseline_rows:
+            continue
+
+        baseline_g1 = statistics.median(values(baseline_rows, "gemm1_us"))
+        baseline_g2 = statistics.median(values(baseline_rows, "gemm2_us"))
+        baseline_e2e = statistics.median(values(baseline_rows, "moe_e2e_us"))
+
+        for mode in ("baseline", "optimized"):
+            case_rows = grouped.get((data, shape, mode), [])
+            if not case_rows:
+                continue
+
+            g1 = values(case_rows, "gemm1_us")
+            g2 = values(case_rows, "gemm2_us")
+            e2e = values(case_rows, "moe_e2e_us")
+            g1_med = statistics.median(g1)
+            g2_med = statistics.median(g2)
+            e2e_med = statistics.median(e2e)
+            g1_tflops = statistics.median(values(case_rows, "gemm1_tflops"))
+            g1_rw_tbps = statistics.median(values(case_rows, "gemm1_rw_tbps"))
+            g2_tflops = statistics.median(values(case_rows, "gemm2_tflops"))
+            g2_rw_tbps = statistics.median(values(case_rows, "gemm2_rw_tbps"))
+            last = case_rows[-1]
+
+            print(
+                f"| {data} | {shape} | {mode} | {samples(g1, 3)} | "
+                f"{g1_med:.3f} | {gain(baseline_g1, g1_med):+.2f}% | "
+                f"{g1_tflops:.1f} | {g1_rw_tbps:.3f} | "
+                f"{hashes(case_rows, 'gemm1_ref_output_hash128')} | "
+                f"{hashes(case_rows, 'gemm1_output_hash128')} | "
+                f"{samples(g2, 3)} | {g2_med:.3f} | "
+                f"{gain(baseline_g2, g2_med):+.2f}% | "
+                f"{g2_tflops:.1f} | {g2_rw_tbps:.3f} | "
+                f"{hashes(case_rows, 'gemm2_ref_output_hash128')} | "
+                f"{hashes(case_rows, 'gemm2_output_hash128')} | "
+                f"{samples(e2e, 2)} | {e2e_med:.2f} | "
+                f"{gain(baseline_e2e, e2e_med):+.2f}% | "
+                f"{last['pass']} | {last['logits_diff']} | {last['rel_l2']} |"
+            )
+PY
+
+  printf '\n==================== Summary ====================\n'
+  cat "$SUMMARY_MD"
+  printf '=================================================\n'
+}
+
+ODD_CASES=(e96_baseline e96_optimized e256_baseline e256_optimized)
+EVEN_CASES=(e256_optimized e256_baseline e96_optimized e96_baseline)
+
+case "$MODE" in
+  e2e-random)
+    DATA_MODES=(random)
+    ;;
+  e2e-const0)
+    DATA_MODES=(const0)
+    ;;
+  e2e-both)
+    DATA_MODES=(random const0)
+    ;;
+esac
+
+trap disable_optimizations EXIT
+
+printf 'MODE=%s\n' "$MODE"
+printf 'ROUNDS=%s\n' "$ROUNDS"
+printf 'Logs: %s\n' "$LOG_DIR"
+printf 'Raw results: %s\n' "$RESULTS_TSV"
+
+for data in "${DATA_MODES[@]}"; do
+  for ((round = 1; round <= ROUNDS; ++round)); do
+    if ((round % 2 == 1)); then
+      ROUND_CASES=("${ODD_CASES[@]}")
+    else
+      ROUND_CASES=("${EVEN_CASES[@]}")
+    fi
+
+    order=0
+    for case_name in "${ROUND_CASES[@]}"; do
+      order=$((order + 1))
+      run_named_case "$case_name" "$data" "$round" "$order"
+    done
+  done
+done
+
+disable_optimizations
+
+write_summary
+
+printf '\nAll cases completed. Logs: %s\n' "$LOG_DIR"
+printf 'Summary: %s\n' "$SUMMARY_MD"
