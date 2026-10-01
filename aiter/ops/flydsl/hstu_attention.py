@@ -640,25 +640,39 @@ def _get_bwd_tuned_config(
 
 @functools.lru_cache(maxsize=64)
 def _balance_gather_index(B: int, groups: int, device: str) -> torch.Tensor:
-    """Cached round-robin-deal gather index for `_build_balance_perm`.
+    """Cached snake (boustrophedon) deal gather index for `_build_balance_perm`.
 
     The deal is a *fixed* permutation of (B, groups) with no dependence on the
     sequence lengths, so it is built once per shape instead of once per backward
     call. The scatter form it replaces,
 
-        slot = (rank % groups) * (B // groups) + (rank // groups)
+        slot = group * (B // groups) + round
         perm[slot] = order
 
     is equivalent to the gather `perm = order[inv]` with `inv[slot] = rank`, which
-    lets the whole index computation (arange, remainder, mul, floor_divide, add,
-    scatter -- six device ops) collapse to one cached `index_select`.
+    lets the whole index computation collapse to one cached `index_select`.
+
+    `group` alternates direction every round. A plain round-robin deal
+    (`group = rank % groups`) hands group 0 the longest sequence of *every* round and
+    group 7 the shortest, so group 0 ends up systematically the heaviest -- measured
+    +0.99% over a perfect partition at B=1024 and +8.45% at B=120, against +0.04% /
+    +2.29% for the snake. Reversing every other round costs nothing: it is still a
+    fixed permutation of the shape and still cached here.
+
+    The groups are the unit that matters because `grid_group = block_id % 8` is how
+    MI300X spreads blocks over its 8 XCDs, so each group runs on its own ~38 CUs with
+    its own L2 and the kernel ends when the *busiest group* ends. A model that instead
+    pools all 608 resident workgroups and lets them rebalance globally predicts the
+    sort is worth only 0.5% at B=1024; it is measured at 6.7%.
 
     Cached by device *string* so one entry per (shape, device) rather than one per
     tensor, and so a `torch.device` object cannot keep a context alive. B is bounded
     by the batch sizes a process actually runs, and each entry is 8*B bytes.
     """
     rank = torch.arange(B, device=device)
-    slot = (rank % groups) * (B // groups) + (rank // groups)
+    rnd, pos = rank // groups, rank % groups
+    group = torch.where(rnd % 2 == 0, pos, (groups - 1) - pos)
+    slot = group * (B // groups) + rnd
     inv = torch.empty_like(rank)
     inv[slot] = rank
     return inv
@@ -678,9 +692,10 @@ def _build_balance_perm(
     FlyDSL's grid uses `grid_group = block_id % NUM_GRID_GROUPS`, which partitions
     the batch into `groups` contiguous chunks. A *naive* descending sort would pile
     all the long sequences into one group and starve the rest (measured ~2.5x
-    slower). Instead, deal the length-sorted sequences round-robin across the
-    groups so every group gets a Sum(n^2)-balanced, longest-first (LPT) set. The
-    kernel remaps `batch_idx = perm[batch_idx]`.
+    slower). Instead, deal the length-sorted sequences across the groups in a snake
+    order so every group gets a Sum(n^2)-balanced, longest-first (LPT) set -- see
+    `_balance_gather_index` for why the deal snakes rather than cycling. The kernel
+    remaps `batch_idx = perm[batch_idx]`.
 
     Returns an int32 tensor `perm` of length B where `perm[slot]` is the sequence
     that grid slot should process. Falls back to identity when the group
