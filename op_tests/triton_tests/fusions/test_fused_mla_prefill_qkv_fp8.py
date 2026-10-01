@@ -8,6 +8,12 @@ from aiter import dtypes
 from aiter.ops.triton.fusions.fused_mla_prefill_qkv_fp8 import (
     fused_mla_prefill_qkv_fp8,
 )
+from aiter.ops.triton.utils._triton import arch_info
+
+pytestmark = pytest.mark.skipif(
+    arch_info.get_arch() not in ("gfx950", "gfx1250"),
+    reason="fused_mla_prefill_qkv_fp8 configs ship for gfx950 and gfx1250 only",
+)
 
 # Kimi-K3: qk_nope 128, qk_rope 64, v 128.
 _NOPE, _ROPE, _V = 128, 64, 128

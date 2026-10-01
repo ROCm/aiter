@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""
-Builds the FP8 q/k/v an MLA prefill attention kernel takes in one pass,
-"""
+"""One-launch FP8 q/k/v prep for MLA prefill attention."""
 
 import torch
 import triton
@@ -20,10 +18,6 @@ __all__ = ["fused_mla_prefill_qkv_fp8"]
 
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
 _INT32_MAX = 2**31 - 1
-
-
-def _is_pow2(n: int) -> bool:
-    return n > 0 and n & (n - 1) == 0
 
 
 def _check_out(name, t, shape, dtype, device):
@@ -44,37 +38,9 @@ def fused_mla_prefill_qkv_fp8(
     k_out: torch.Tensor | None = None,
     v_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    MLA prefill attends per head over the decompressed latent: q holds
-    [nope | rope] per head, K is [k_nope | k_pe] with k_pe shared by every
-    head, and V is per head. Kernels such as ``mla_prefill_ps_asm_fwd`` take
-    these packed, in FP8, at a head count that is a multiple of 16, so models
-    with fewer heads per rank (Kimi-K3 at TP8: 12) replicate-pad. In one launch:
+    """Build the packed FP8 q, k = [k_nope | k_pe] and v of MLA prefill in one launch.
 
-        q_out[t, h] = q[t, h % H]
-        k_out[t, h] = cat(k_nope[t, h % H], k_pe[t])
-        v_out[t, h] = v[t, h % H]
-
-    for h in [0, num_heads_out), cast to ``out_dtype`` without scaling (the
-    same as ``tensor.to(out_dtype)``).
-
-    Args:
-        q: [T, H, nope + rope], fp16/bf16. Any strides; last dim dense.
-        k_nope: [T, H, nope], same dtype. Any strides (typically a view of the
-            kv_b_proj output); last dim dense.
-        v: [T, H, v_dim], same dtype and layout rules as k_nope.
-        k_pe: [T, 1, rope] or [T, rope], same dtype; last dim dense. rope may be 0.
-        num_heads_out: output head count, >= H. Padded head h duplicates head h % H,
-            so the real heads come first.
-        out_dtype: torch.float8_e4m3fn or torch.float8_e4m3fnuz.
-        q_out, k_out, v_out: optional contiguous destinations.
-
-    Returns:
-        (q_out, k_out, v_out), contiguous [T, num_heads_out, D].
-
-    Constraints:
-        nope, v_dim and (when non-zero) rope are powers of two; every offset
-        fits in int32.
+    Padded head h copies head h % H; outputs are contiguous [T, num_heads_out, D].
     """
     _LOGGER.info(
         "FUSED_MLA_PREFILL_QKV_FP8: q=%s k_nope=%s v=%s k_pe=%s heads_out=%d",
@@ -93,8 +59,8 @@ def fused_mla_prefill_qkv_fp8(
     assert v.shape[:2] == (T, H), f"v shape mismatch: {tuple(v.shape)}"
     assert k_pe.shape[:2] == (T, 1), f"k_pe shape mismatch: {tuple(k_pe.shape)}"
     assert qk_dim == nope + rope, f"q head dim {qk_dim} != nope {nope} + rope {rope}"
-    assert (
-        _is_pow2(nope) and _is_pow2(v_dim) and (rope == 0 or _is_pow2(rope))
+    assert all(
+        triton.next_power_of_2(d) == d for d in (nope, v_dim, rope or 1)
     ), f"head dims must be powers of two: nope={nope} rope={rope} v={v_dim}"
     assert num_heads_out >= H, f"num_heads_out {num_heads_out} < heads {H}"
     assert q.dtype in (torch.float16, torch.bfloat16), f"unsupported dtype {q.dtype}"

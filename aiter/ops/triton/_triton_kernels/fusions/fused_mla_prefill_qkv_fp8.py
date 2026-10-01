@@ -9,7 +9,16 @@ from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config
 
 _fused_mla_prefill_qkv_fp8_repr = make_kernel_repr(
     "_fused_mla_prefill_qkv_fp8_kernel",
-    ["NUM_HEADS", "NUM_HEADS_OUT", "BLOCK_T", "NEED_MASK", "num_warps"],
+    [
+        "NUM_HEADS",
+        "NUM_HEADS_OUT",
+        "NOPE_DIM",
+        "ROPE_DIM",
+        "V_DIM",
+        "BLOCK_T",
+        "NEED_MASK",
+        "num_warps",
+    ],
 )
 
 
@@ -44,15 +53,9 @@ def _fused_mla_prefill_qkv_fp8_kernel(
     BLOCK_T: tl.constexpr,
     NEED_MASK: tl.constexpr,
 ):
-    """
-    One program per BLOCK_T tokens, covering every output head h of each token
-    (padded heads read head h % H, so their duplicate reads hit cache):
-      q_out[t, h] = q[t, h % H]
-      k_out[t, h] = cat(k_nope[t, h % H], k_pe[t])
-      v_out[t, h] = v[t, h % H]
-    Outputs are packed [T, NUM_HEADS_OUT, D] in the output dtype, so a program's
-    stores cover one contiguous span. Offsets stay int32 (the wrapper checks the
-    bound) so loads and stores lower to buffer ops.
+    """BLOCK_T tokens x all output heads per program; padded head h reads head h % H.
+
+    Offsets stay int32 (the wrapper checks the bound), so memory ops lower to buffer ops.
     """
     tl.assume(stride_q_t > 0)
     tl.assume(stride_q_h > 0)

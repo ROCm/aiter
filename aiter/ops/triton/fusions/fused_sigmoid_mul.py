@@ -10,7 +10,6 @@ import torch
 import triton
 
 from aiter.ops.triton._triton_kernels.fusions.fused_sigmoid_mul import (
-    _fused_sigmoid_mul_2d_kernel,
     _fused_sigmoid_mul_kernel,
     _get_config,
 )
@@ -30,21 +29,9 @@ def fused_sigmoid_mul(
     gate: torch.Tensor,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """
-    Fused elementwise ``out = x * sigmoid(gate)``.
+    """``out = x * sigmoid(gate)`` in one pass; writes into x when out is None.
 
-    Args:
-        x: any shape, contiguous; or a 2-D row-strided view (see below)
-        gate: same shape and dtype as x
-        out: optional destination
-
-    Returns:
-        out if given, else x (in place).
-
-    Constraints:
-        x and gate must be the same shape and dtype. When x, gate and out are
-        all contiguous a flat 1-D kernel runs. Otherwise each must be 2-D with
-        a dense last dimension
+    x, gate and out are contiguous, or 2-D views with a dense last dimension.
     """
     _LOGGER.info("FUSED_SIGMOID_MUL: x=%s dtype=%s", tuple(x.shape), x.dtype)
 
@@ -65,52 +52,33 @@ def fused_sigmoid_mul(
         assert out.dtype == x.dtype, f"out dtype mismatch: {out.dtype} vs {x.dtype}"
         assert out.device == x.device, "out must be on the same device as x"
 
-    if not (x.is_contiguous() and gate.is_contiguous() and out.is_contiguous()):
+    if x.is_contiguous() and gate.is_contiguous() and out.is_contiguous():
+        # Any contiguous shape runs as one row of x.numel() elements.
+        x, gate, out_2d = (t.view(1, -1) for t in (x, gate, out))
+        config = _get_config()
+    else:
         assert all(
             _is_row_strided_2d(t) for t in (x, gate, out)
         ), "x, gate and out must be contiguous, or 2-D with a dense last dimension"
-        return _fused_sigmoid_mul_2d(x, gate, out)
+        out_2d = out
+        config = _get_config("strided")
 
-    N = x.numel()
-    if N == 0:
-        return out
-
-    config = _get_config()
-    BLOCK_SIZE_N = config.pop("BLOCK_SIZE_N")
-
-    _fused_sigmoid_mul_kernel[(triton.cdiv(N, BLOCK_SIZE_N),)](
-        x,
-        gate,
-        out,
-        N,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        NEED_MASK=N % BLOCK_SIZE_N != 0,
-        **config,
-    )
-    return out
-
-
-def _fused_sigmoid_mul_2d(
-    x: torch.Tensor, gate: torch.Tensor, out: torch.Tensor
-) -> torch.Tensor:
     M, N = x.shape
     if M == 0 or N == 0:
         return out
 
-    config = _get_config("strided")
     BLOCK_SIZE_M = config.pop("BLOCK_SIZE_M")
     BLOCK_SIZE_N = config.pop("BLOCK_SIZE_N")
-
-    grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
-    _fused_sigmoid_mul_2d_kernel[grid](
+    grid = (triton.cdiv(N, BLOCK_SIZE_N), triton.cdiv(M, BLOCK_SIZE_M))
+    _fused_sigmoid_mul_kernel[grid](
         x,
         gate,
-        out,
+        out_2d,
         M,
         N,
         x.stride(0),
         gate.stride(0),
-        out.stride(0),
+        out_2d.stride(0),
         BLOCK_SIZE_M=BLOCK_SIZE_M,
         BLOCK_SIZE_N=BLOCK_SIZE_N,
         NEED_MASK=(M % BLOCK_SIZE_M != 0) or (N % BLOCK_SIZE_N != 0),
