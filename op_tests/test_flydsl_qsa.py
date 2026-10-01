@@ -2467,6 +2467,60 @@ def test_qsa_auto_admits_only_measured_pairs():
     assert qsa_auto_uses_flydsl(*untuned) is False
 
 
+def test_qsa_auto_rejects_a_selection_k1_cannot_build():
+    """K1 writes 512 block ids and divides positions by 4.
+
+    ``token_topk=1024`` at ratio 4 asks expand for 256 columns.
+    ``token_topk=4096`` at ratio 8 still has 512 columns, so expand would
+    accept K1's ratio-4 ids. auto stays on Triton. Explicit flydsl raises.
+    """
+    measured = _policy_args(1, 24, 256, 128, 16, 4, 128)
+    if not qsa_auto_uses_flydsl(*measured, token_topk=2048, compress_ratio=4):
+        raise AssertionError("the K1 selection contract was rejected")
+    rows = torch.zeros(1, dtype=torch.int32)
+    for token_topk, compress_ratio in ((1024, 4), (4096, 8)):
+        if qsa_auto_uses_flydsl(
+            *measured, token_topk=token_topk, compress_ratio=compress_ratio
+        ):
+            raise AssertionError(
+                f"auto accepted token_topk={token_topk} compress_ratio={compress_ratio}"
+            )
+        (
+            q_indexer,
+            index_cache,
+            index_table,
+            q_gqa,
+            k_cache,
+            v_cache,
+            kv_table,
+            indices,
+        ) = measured
+        try:
+            qsa_layer(
+                q_indexer,
+                index_cache,
+                index_table,
+                q_gqa,
+                k_cache,
+                v_cache,
+                kv_table,
+                rows,
+                rows,
+                torch.ones(1, dtype=torch.int32),
+                indices=indices,
+                token_topk=token_topk,
+                compress_ratio=compress_ratio,
+                backend="flydsl",
+            )
+        except ValueError as exc:
+            if "FlyDSL K1 selects" not in str(exc):
+                raise
+        else:
+            raise AssertionError(
+                f"flydsl accepted token_topk={token_topk} compress_ratio={compress_ratio}"
+            )
+
+
 def test_k2_serves_rejects_shapes_the_builder_rejects():
     """A geometry ``build_qsa_k2_module`` raises on is a reason here.
 
@@ -3073,6 +3127,7 @@ def _run_unit_cases():
     test_k2_caller_workspace_is_the_only_partial_buffer()
     test_qsa_backend_default_is_auto()
     test_qsa_auto_admits_only_measured_pairs()
+    test_qsa_auto_rejects_a_selection_k1_cannot_build()
     test_k2_serves_rejects_shapes_the_builder_rejects()
     test_qsa_auto_logs_unmeasured_query_once()
     test_qsa_aot_collector_lists_family_a_launches()
