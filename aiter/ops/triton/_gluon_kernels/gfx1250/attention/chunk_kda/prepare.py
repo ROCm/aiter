@@ -51,11 +51,8 @@ def chunk_kda_prepare_kernel(
     NUM_WARPS: gl.constexpr,
     NC: gl.constexpr,
 ):
-    """One (chunk, head) per program, log2 units, G = in-chunk cumsum of the gate.
-
-    qg = q^ 2^G, kg_t = (k^ 2^(G_last - G))^T, decay = 2^G_last,
-    aqk = scale tril(q^ 2^G (k^ 2^-G)^T), w = A_inv diag(beta) k^ 2^G, u = A_inv diag(beta) v,
-    A_inv = (I + L)^-1, L = strict_tril(diag(beta) k^ 2^G (k^ 2^-G)^T).
+    """One (chunk, head) per program: l2norm, gate cumsum, the intra-chunk products and
+    the (I + L)^-1 solve, written as the walk's workspace (qg, w, u, aqk, kg_t, decay).
     """
     gl.static_assert(
         BT == 64 and K == 128 and V == 128, "specialised to BT=64, K=V=128"

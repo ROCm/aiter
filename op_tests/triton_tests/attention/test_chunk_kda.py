@@ -7,6 +7,7 @@ import math
 import pytest
 import torch
 
+import aiter.ops.triton.attention.chunk_kda as chunk_kda_module
 from aiter.ops.triton._gluon_kernels.gfx1250.attention.chunk_kda.walk import _get_config
 from aiter.ops.triton.attention.chunk_kda import (
     CHUNK_SIZE,
@@ -427,6 +428,16 @@ def test_chunk_kda_vllm_layout(case):
         rest = torch.ones(core.shape[1], dtype=torch.bool, device=DEVICE)
         rest[nd_tok : nd_tok + T] = False
         assert torch.equal(core[:, rest], core_before[:, rest]), "wrote outside out"
+
+
+# The Triton path expects every sequence to have a chunk: no empty-sequence cases.
+@pytest.mark.parametrize(
+    "case", [c for c, v in VLLM_CASES.items() if 0 not in v["seqlens"]]
+)
+def test_chunk_kda_triton_fallback(case, monkeypatch):
+    """Archs without a Gluon build (gfx942) take the Triton path; forced here."""
+    monkeypatch.setattr(chunk_kda_module, "_ARCH", "gfx942")
+    test_chunk_kda_vllm_layout(case)
 
 
 @pytest.mark.parametrize("nd_tok", [0, 3])

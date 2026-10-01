@@ -486,9 +486,7 @@ def chunk_kda_walk_kernel(
 ):
     """One (sequence, head, V slice[, group]) per program, the state in MFMA accumulators.
 
-    PASS 0 walks the whole sequence. PASS 1 walks one chunk group from zero (state slices:
-    B_g) or from I with u = 0 (transfer slices: M_g). PASS 2 re-walks each group from its
-    scanned entry state. KS warps share each 16 state rows, splitting K (and the tokens).
+    PASS 0 walks the whole sequence; PASS 1 and PASS 2 walk the chunk groups around the scan.
     """
     gl.static_assert(
         BT == 64 and K == 128 and V == 128, "specialised to BT=64, K=V=128"
@@ -942,13 +940,7 @@ def chunk_kda_scan_kernel(
     NUM_WARPS: gl.constexpr,
     NUM_STAGES: gl.constexpr,
 ):
-    """Group scan from PASS 1's sin_[1]: sin_[g + 1] = sin_[g] @ M_g + B_g, g = 1 .. G - 2.
-
-    A warp owns K / NUM_WARPS output columns of a BV-row slice: M_g^T loads straight into
-    its MFMA operand and the bf16 state crosses warps through a double-buffered LDS tile.
-    NUM_STAGES 2 has the next two steps' operands in flight, 1 loads each step's just
-    before it runs.
-    """
+    """Group scan of the PASS 1 results: sin_[g + 1] = sin_[g] @ M_g + B_g, g = 1 .. G - 2."""
     gl.static_assert(K == 128 and V == 128)
     gl.static_assert(BV % 16 == 0 and K % (16 * NUM_WARPS) == 0)
     gl.static_assert(NUM_STAGES == 1 or NUM_STAGES == 2)

@@ -1,16 +1,20 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Chunked Kimi Delta Attention prefill, Gluon on gfx1250 and gfx950: prepare, then the walk."""
+"""Chunked Kimi Delta Attention prefill, Gluon on gfx1250 and gfx950: prepare, then the walk.
+
+Runs on gluon for 950/1250, takes the triton path for 942
+"""
 
 import torch
+import triton
 
 from aiter.ops.triton.utils._triton import arch_info
 
 _ARCH = arch_info.get_arch()
 if _ARCH == "gfx950":
     from aiter.ops.triton._gluon_kernels.gfx950.attention.chunk_kda import prepare, walk
-else:
+elif _ARCH == "gfx1250":
     from aiter.ops.triton._gluon_kernels.gfx1250.attention.chunk_kda import (
         prepare,
         walk,
@@ -37,6 +41,12 @@ def prepare_chunk_kda_metadata(
     )
     chunk = torch.arange(NT, device=counts.device) - chunk_offsets[seq]
     return torch.stack([seq, chunk], 1).int(), chunk_offsets
+
+
+def _empty(shape: tuple, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    n = torch.Size(shape).numel() * dtype.itemsize
+    buf = torch.empty(triton.next_power_of_2(n), dtype=torch.uint8, device=device)
+    return buf[:n].view(dtype).view(shape)
 
 
 def _check_tokens(name: str, x: torch.Tensor, D: int) -> None:
@@ -92,12 +102,12 @@ def chunk_kda_prepare(
     _check_index("chunk_indices", chunk_indices, (NT, 2))
 
     ws = {
-        "qg": q.new_empty(1, T, H, K),
-        "w": q.new_empty(1, T, H, K),
-        "u": q.new_empty(1, T, H, V),
-        "kg_t": q.new_empty(NT, H, K, CHUNK_SIZE),
-        "aqk": q.new_empty(1, T, H, CHUNK_SIZE),
-        "decay": q.new_empty(NT, H, K, dtype=torch.float32),
+        "qg": _empty((1, T, H, K), q.dtype, q.device),
+        "w": _empty((1, T, H, K), q.dtype, q.device),
+        "u": _empty((1, T, H, V), q.dtype, q.device),
+        "kg_t": _empty((NT, H, K, CHUNK_SIZE), q.dtype, q.device),
+        "aqk": _empty((1, T, H, CHUNK_SIZE), q.dtype, q.device),
+        "decay": _empty((NT, H, K), torch.float32, q.device),
     }
     config = prepare._get_config(config)
     prepare.chunk_kda_prepare_kernel[(NT, H)](
@@ -317,9 +327,9 @@ def _walk_gfx950(args: dict, config: dict, N: int) -> None:
         return
 
     bufs = (
-        qg.new_empty(G, N, H, V, K, dtype=torch.float32),  # B_g
-        qg.new_empty(G, N, H, K, K),  # M_g^T
-        qg.new_empty(G, N, H, V, K, dtype=torch.float32),  # entry states
+        _empty((G, N, H, V, K), torch.float32, qg.device),  # B_g
+        _empty((G, N, H, K, K), qg.dtype, qg.device),  # M_g^T
+        _empty((G, N, H, V, K), torch.float32, qg.device),  # entry states
     )
     launch(1, bufs, state_in is not None, False)
     if G > 2:
@@ -366,39 +376,41 @@ def chunk_kda(
     norm_eps: float = 1e-5,
     config: dict | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Chunked Kimi Delta Attention prefill from raw projections (Gluon, gfx1250 / gfx950).
+    """Chunked KDA prefill from raw projections: chunk_kda_prepare, then chunk_kda_walk.
 
-    Two launches. ``chunk_kda_prepare`` fuses the q/k l2norm, the gate and its cumsum, the
-    intra-chunk products and the (I + L)^-1 solve into a workspace: qg, w, u [1, T, H, 128],
-    aqk [1, T, H, 64], kg_t [NT, H, 128, 64], fp32 decay [NT, H, 128]. ``chunk_kda_walk``
-    then runs the recurrence on the fp32 V-first state S [V, K], per chunk
-    v = u - w S^T, o = scale qg S^T + aqk v, S = S diag(decay) + v^T kg.
-
-    Args:
-        q, k, v: [1, T, H, 128] raw projections; token rows may be strided (16 B aligned).
-        g: [1, T, H, 128] raw gate projection, before the activation.
-        beta: [1, T, H] raw beta projection, before the sigmoid.
-        A_log: [H] gate parameter. dt_bias: [H * 128] gate bias.
-        lower_bound: gate floor in [-5.5, 0); g = lower_bound * sigmoid(exp(A_log) (g + dt_bias)).
-        cu_seqlens: int32 / int64 [N + 1] varlen offsets.
-        chunk_indices, chunk_offsets: int [NT, 2] (sequence, chunk) and [N + 1] first chunk
-            per sequence; ``prepare_chunk_kda_metadata`` (a host sync) if None.
-        scale: q scale, K**-0.5 by default.
-        out: [1, T, H, 128] destination, may alias the dead v; allocated if None.
-        initial_state: fp32 [N, H, V, K] start state, zeros if None.
-        output_final_state: return a fresh fp32 [N, H, V, K] final state.
-        state_cache: fp32 [slots, H, V, K] paged state, any slot stride, read and written in
-            place at ``state_indices``; replaces initial_state / output_final_state.
-        state_indices: int32 / int64 [N] cache row per sequence, any stride. Valid rows must
-            be distinct; a row outside [0, slots) (PAD_SLOT_ID) is never read or written:
-            that sequence starts from zeros and its final state is dropped.
-        has_initial_state: bool [N]; False starts that sequence from zeros.
-        out_gate, norm_weight, norm_eps: fuse o = rmsnorm(o) * norm_weight * sigmoid(out_gate).
-        config: overrides of the tuned walk config (the kernels' DEFAULT.json).
-
-    Returns:
-        (o, final_state); final_state is None when the state lives in state_cache.
+    q/k/v/g are [1, T, H, 128]; the fp32 V-first state is paged in state_cache at
+    state_indices (rows outside [0, slots) are skipped) or passed as initial_state.
     """
+    if _ARCH not in ("gfx1250", "gfx950"):
+        from aiter.ops.triton.kimi_delta_attn import chunk_kimi_delta_attn
+
+        assert out_gate is None, "the fused output norm needs the Gluon path"
+        if state_cache is not None:
+            out = v.new_empty(v.shape) if out is None else out
+            state_indices = state_indices.int()
+        return chunk_kimi_delta_attn(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=True,
+            use_gate_in_kernel=True,
+            use_beta_sigmoid_in_kernel=True,
+            safe_gate=True,
+            lower_bound=lower_bound,
+            state_v_first=True,
+            cu_seqlens=cu_seqlens,
+            out=out,
+            state_cache=state_cache,
+            state_indices=state_indices,
+            has_initial_state=has_initial_state,
+        )
     if scale is None:
         scale = q.shape[-1] ** -0.5
     if chunk_indices is None or chunk_offsets is None:
@@ -406,7 +418,17 @@ def chunk_kda(
         chunk_indices = ci if chunk_indices is None else chunk_indices
         chunk_offsets = co if chunk_offsets is None else chunk_offsets
     ws = chunk_kda_prepare(
-        q, k, v, g, beta, A_log, dt_bias, lower_bound, cu_seqlens, chunk_indices, scale
+        q,
+        k,
+        v,
+        g,
+        beta,
+        A_log,
+        dt_bias,
+        lower_bound,
+        cu_seqlens,
+        chunk_indices,
+        scale,
     )
     return chunk_kda_walk(
         **ws,

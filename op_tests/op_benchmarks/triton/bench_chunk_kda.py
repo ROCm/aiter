@@ -15,16 +15,9 @@ from aiter.ops.triton.attention.chunk_kda import (
     chunk_kda_walk,
     prepare_chunk_kda_metadata,
 )
+from aiter.ops.triton.kimi_delta_attn import chunk_kimi_delta_attn
 from aiter.ops.triton.utils._triton import arch_info
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
-
-try:  # the Triton chunk path vLLM runs today
-    from vllm.models.kimi_k3.amd.ops.third_party.kda import chunk_kda_with_fused_gate
-
-    HAS_VLLM = True
-except ImportError:
-    chunk_kda_with_fused_gate = None
-    HAS_VLLM = False
 
 K3_HEAD_DIM = 128
 K3_NUM_HEADS = [24, 12]  # 96 heads sharded tp4 / tp8
@@ -32,18 +25,21 @@ K3_LOWER_BOUND = -5.0
 
 
 def make_inputs(B, T, H, device):
-    """B sequences of T tokens, raw projections; q/k/v are bands of one fused projection."""
+    """B sequences of T tokens in vLLM's layout: dense q/k/v/g, beta a column of in_proj."""
     D, total = K3_HEAD_DIM, B * T
-    mixed = torch.randn(1, total, 3 * H * D, dtype=torch.bfloat16, device=device)
-    q, k, v = (
-        mixed[..., i * H * D : (i + 1) * H * D].unflatten(-1, (H, D)) for i in range(3)
-    )
+    width = 4 * H * D + D + H
+    width += -width % 16
+    in_proj = torch.randn(1, total, width, dtype=torch.bfloat16, device=device)
+
+    def dense():
+        return torch.randn(1, total, H, D, dtype=torch.bfloat16, device=device)
+
     return {
-        "q": q,
-        "k": k,
-        "v": v,
-        "g": torch.randn(1, total, H, D, dtype=torch.bfloat16, device=device),
-        "beta": torch.randn(1, total, H, dtype=torch.bfloat16, device=device),
+        "q": dense(),
+        "k": dense(),
+        "v": dense(),
+        "g": dense(),
+        "beta": in_proj[..., 4 * H * D + D : 4 * H * D + D + H],
         "A_log": torch.log(torch.empty(H, device=device).uniform_(1, 16)),
         "dt_bias": torch.randn(H * D, device=device),
         "cu_seqlens": torch.arange(0, total + 1, T, dtype=torch.int32, device=device),
@@ -66,13 +62,11 @@ def traffic_bytes(B, T, H, stage):
 def _time(fn, args):
     if args.timing == "cudagraph":
         return _bench_graph(fn, args.graph_ms, args.n_replays)
-    return triton.testing.do_bench(
-        fn, warmup=args.warmup, rep=args.rep, quantiles=[0.5, 0.2, 0.8]
-    )
+    return triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
 
 
 def _bench_graph(fn, graph_ms, n_replays):
-    # replay a graph of ~graph_ms of launches; (median, p20, p80) ms
+    # replay a graph of ~graph_ms of launches; mean ms per launch
     for _ in range(5):
         fn()
     torch.cuda.synchronize()
@@ -106,16 +100,13 @@ def _bench_graph(fn, graph_ms, n_replays):
         e.record()
         torch.cuda.synchronize()
         per_iter.append(s.elapsed_time(e) / n_per_graph)
-    per_iter.sort()
-    lo = per_iter[int(0.2 * (len(per_iter) - 1))]
-    hi = per_iter[int(0.8 * (len(per_iter) - 1))]
-    return per_iter[len(per_iter) // 2], lo, hi
+    return sum(per_iter) / len(per_iter)
 
 
 def benchmark(args):
     lines = ["gluon", "gluon_prepare"] + [f"gluon_walk:{c}" for c in args.walk_configs]
-    if HAS_VLLM and "vllm" in args.backends:
-        lines.append("vllm")
+    if "triton" in args.backends:
+        lines.append("triton")
     configs = [
         triton.testing.Benchmark(
             x_names=["H", "B", "T"],
@@ -187,28 +178,32 @@ def benchmark(args):
                 )
 
         else:
+            out = torch.empty_like(inp["v"])
 
             def fn():
-                chunk_kda_with_fused_gate(
-                    q=inp["q"],
-                    k=inp["k"],
-                    v=inp["v"],
-                    raw_g=inp["g"],
-                    raw_beta=inp["beta"],
+                chunk_kimi_delta_attn(
+                    inp["q"],
+                    inp["k"],
+                    inp["v"],
+                    inp["g"],
+                    inp["beta"],
                     A_log=inp["A_log"],
-                    g_bias=inp["dt_bias"],
-                    initial_state=state,
-                    output_final_state=True,
-                    lower_bound=K3_LOWER_BOUND,
+                    dt_bias=inp["dt_bias"],
                     use_qk_l2norm_in_kernel=True,
+                    use_gate_in_kernel=True,
+                    use_beta_sigmoid_in_kernel=True,
+                    safe_gate=True,
+                    lower_bound=K3_LOWER_BOUND,
+                    state_v_first=True,
                     cu_seqlens=inp["cu_seqlens"],
+                    out=out,
+                    **paged,
                 )
 
-        ms, lo, hi = _time(fn, args)
+        ms = _time(fn, args)
         if args.metric == "time":
-            return ms * 1e3, lo * 1e3, hi * 1e3
-        mem = traffic_bytes(B, T, H, stage)
-        return mem / ms * 1e-9, mem / hi * 1e-9, mem / lo * 1e-9
+            return ms * 1e3
+        return traffic_bytes(B, T, H, stage) / ms * 1e-9
 
     bench_chunk_kda.run(
         save_path="." if args.o else None, print_data=True, show_plots=False
@@ -225,10 +220,10 @@ def parse_args():
     parser.add_argument(
         "--walk_configs",
         nargs="+",
-        default=["32,2", "64,4", "128,4"],
+        default=None,
         help="walk BV,num_warps points to time on their own",
     )
-    parser.add_argument("--backends", nargs="+", default=["gluon", "vllm"])
+    parser.add_argument("--backends", nargs="+", default=["gluon", "triton"])
     parser.add_argument(
         "--config",
         type=json.loads,
@@ -253,9 +248,13 @@ def parse_args():
 def main():
     if arch_info.get_arch() not in ("gfx1250", "gfx950"):
         sys.exit(f"chunk KDA gluon needs gfx1250 or gfx950, got {arch_info.get_arch()}")
-    if not HAS_VLLM:
-        print("vllm not importable -- dropping the Triton chunk baseline.")
-    benchmark(parse_args())
+    args = parse_args()
+    if args.walk_configs is None:
+        # BV 128 with KS 2 needs more LDS than gfx950 has.
+        args.walk_configs = ["32,2", "64,4"]
+        if arch_info.get_arch() == "gfx1250":
+            args.walk_configs.append("128,4")
+    benchmark(args)
 
 
 if __name__ == "__main__":
