@@ -158,15 +158,16 @@ def use_2d_kernel(params: _UAParams, backend: str = "triton"):
     if backend == "gluon" and _gfx950_gluon_supported(params):
         return not params.all_decode
 
-    # head_size >= 512 keeps the 2D kernel for prefill. Short-query steps (decode
-    # with speculative verify tokens) fall through to the split-KV 3D kernel: with
-    # a few queries per sequence the 2D grid is num_seqs x num_kv_heads programs,
-    # each walking the whole context, which leaves most CUs idle.
+    # head_size >= 512 keeps the 2D kernel for prefill. On gfx950, short-query
+    # steps (decode with speculative verify tokens) fall through to the split-KV
+    # 3D kernel: with a few queries per sequence the 2D grid is num_seqs x
+    # num_kv_heads programs, each walking the whole context, which leaves most
+    # CUs idle. Only gfx950's split-KV table is tuned for these steps.
     if (
         params.head_size >= 512
         and not get_arch().is_rdna
         and not params.all_decode
-        and params.max_seqlen_q > 16
+        and (DEVICE_ARCH != "gfx950" or params.max_seqlen_q > 16)
     ):
         return True
 

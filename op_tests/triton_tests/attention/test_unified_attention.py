@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import aiter.ops.triton.attention.unified_attention as unified_attention_module
 from aiter.ops.triton.attention.unified_attention import (
     _is_gluon_available,
     is_2d_gluon_available,
@@ -765,3 +766,86 @@ def test_triton_unified_attn_short_query_head512(
         shuffled_kv_cache=False,
         backend="triton",
     )
+
+
+@pytest.mark.skipif(
+    DEVICE_ARCH != "gfx950", reason="runs the gfx950 kernels under both dispatches"
+)
+@pytest.mark.parametrize(
+    "dispatch_arch, max_query_len, expected",
+    [
+        ("gfx950", 16, "3d"),
+        ("gfx950", 17, "2d"),
+        ("gfx942", 16, "2d"),
+    ],
+)
+@torch.inference_mode()
+def test_unified_attn_short_query_head512_dispatch(
+    monkeypatch, dispatch_arch: str, max_query_len: int, expected: str
+) -> None:
+    """head_size 512 steps of up to 16 query tokens take the split-KV 3D kernel
+    on gfx950 only; longer steps, and other archs, keep the 2D kernel."""
+    launched = []
+    for kind in ("2d", "3d"):
+        name = f"_unified_attention_{kind}_triton"
+        kernel = getattr(unified_attention_module, name)
+
+        def record(*args, _kind=kind, _kernel=kernel, **kwargs):
+            launched.append(_kind)
+            return _kernel(*args, **kwargs)
+
+        monkeypatch.setattr(unified_attention_module, name, record)
+    monkeypatch.setattr(unified_attention_module, "DEVICE_ARCH", dispatch_arch)
+
+    seq_lens = [(max_query_len, 4096)] + [(3, 4096)] * 3
+    (
+        query,
+        _key_cache_orig,
+        _value_cache_orig,
+        key_cache,
+        value_cache,
+        _sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_seqlen_q,
+        max_seqlen_k,
+        scale,
+        window_size,
+        block_tables,
+        _maybe_quant_query,
+        _query_scales,
+        q_descale,
+        k_descale,
+        v_descale,
+        _output_scale,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=1024,
+        block_size=64,
+        head_size=512,
+        num_heads=(32, 4),
+        q_dtype=e4m3_dtype,
+        kv_dtype=e4m3_dtype,
+        device="cuda",
+    )
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        backend="triton",
+    )
+    assert launched == [expected]
