@@ -22,7 +22,7 @@ model_dim, inter_dim, expert, topk). Token counts without a row use
 names:
 
 - the gate kernel (`decode`, `nobarrier`, `prefill`) and its grid;
-- the down kernel (`route9`, `packed`, `ordered`, `prefill`) and its grid;
+- the down kernel (`route9`, `single`, `packed`, `ordered`, `prefill`) and its grid;
 - the number of prefill down chunks.
 
 `AITER_CONFIG_IQ2R_GLM53` points the lookup at a different CSV. To tune
@@ -82,11 +82,10 @@ TP8, ISL 1024 (IQ2R peak weights 32.7 GB/GPU, 230.5k KV blocks):
 | 128 | 4532.0 | 26.98 | 4089.4 | +10.8% |
 | 256 | 6330.3 | 38.79 | 5808.4 | +9.0% |
 
-A rerun of the tuner reproduces the TP4 rows to within 0.6%. For TP8 it
-picks different launches at some token counts (up to 4.9% faster in
-isolation), but serving with those rows is within noise of the committed
-CSV (−4.1% at C16, +2.3% at C64, within 1% elsewhere), so the committed rows
-are kept.
+The tuner times each candidate by CUDA graph replay, as serving runs it;
+eager timing adds host overhead that hides the best small-M launches. The
+decode kernels accept up to 1024 tokens so the CSV can choose them for MTP
+verify batches, which are (1 + speculative tokens) x concurrency.
 
 ## Tests
 

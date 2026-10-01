@@ -4439,7 +4439,7 @@ __device__ __forceinline__ void glm53_cross_k_decode_mfma(
     }
 }
 
-template<int MAtoms,bool XCD,int LoadMode,int Batch>
+template<int MAtoms,bool XCD,int LoadMode,int Batch,int NT=8>
 __global__ __launch_bounds__(512,1) void glm53_gate_decode_nobarrier_kernel(
     const opus::fp8_t* __restrict__ activations,
     const uint8_t* __restrict__ scales,
@@ -4466,14 +4466,14 @@ __global__ __launch_bounds__(512,1) void glm53_gate_decode_nobarrier_kernel(
     const int lane=threadIdx.x,wave=threadIdx.y,linear=wave*64+lane;
     const int lane_row=lane%16,lane_group=lane/16;
     const int num_tasks=task_count[0];
-    const int total=num_tasks*Subtasks*8;
+    const int total=num_tasks*Subtasks*NT;
     int previous_expert=-1;
     for(int work=blockIdx.x;work<total;work+=gridDim.x)
     {
         const int index=XCD?glm53_remap8(work,total):work;
-        const int task=XCD?index/(8*Subtasks):(work/Subtasks)%num_tasks;
-        const int sub=XCD?(index/8)%Subtasks:work%Subtasks;
-        const int n_tile=XCD?index%8:work/(num_tasks*Subtasks);
+        const int task=XCD?index/(NT*Subtasks):(work/Subtasks)%num_tasks;
+        const int sub=XCD?(index/NT)%Subtasks:work%Subtasks;
+        const int n_tile=XCD?index%NT:work/(num_tasks*Subtasks);
         const int row_begin=tasks[task*3]+sub*Rows;
         const int row_end=min(row_begin+Rows,tasks[task*3]+tasks[task*3+1]);
         const int expert=tasks[task*3+2];
@@ -4484,11 +4484,11 @@ __global__ __launch_bounds__(512,1) void glm53_gate_decode_nobarrier_kernel(
         // Task expert and validity are uniform across this workgroup.
         // The previous item ends in a barrier. Codebook storage is disjoint
         // from the partial-output union, and is valid only in this invocation.
-        if(expert!=previous_expert) {
-            shared.codebook[linear]=reinterpret_cast<const uint64_t*>(aux)[linear];
-            __syncthreads();
-            previous_expert=expert;
-        }
+        // Issue the codebook, bases, gather and first weight loads together;
+        // only the codebook is waited on before the LDS store and barrier.
+        const bool new_expert=expert!=previous_expert;
+        uint64_t book=0;
+        if(new_expert) book=reinterpret_cast<const uint64_t*>(aux)[linear];
         const int nbase=n_tile*4;
         uint32_t bases=0;
 #pragma unroll
@@ -4503,7 +4503,12 @@ __global__ __launch_bounds__(512,1) void glm53_gate_decode_nobarrier_kernel(
         IQ2RCompressedQuad pending;
         uint64_t pending_book[4]={};
         if constexpr(LoadMode==1)pending=iq2r_scheduled_load_quad(data,data_bytes,base,lane);
-        else iq2r_issue_quad(buffer,shared.reuse.cache[wave],lane,base);
+        if(new_expert) {
+            shared.codebook[linear]=book;
+            __syncthreads();
+            previous_expert=expert;
+        }
+        if constexpr(LoadMode!=1)iq2r_issue_quad(buffer,shared.reuse.cache[wave],lane,base);
         for(int iteration=0;iteration<6;++iteration)
         {
             const int kt=wave*6+iteration;
@@ -4585,8 +4590,8 @@ __global__ __launch_bounds__(512,1) void glm53_gate_decode_nobarrier_kernel(
                         const float inverse=1.0f/bs.dq_scale;
 #pragma unroll
                         for(int atom=0;atom<4;++atom)
-                            output[static_cast<int64_t>(output_row)*256+n_tile*32+atom*8+lane_row/2]=opus::fp32_to_fp8(activated[atom]*inverse);
-                        if(lane_row==0) output_scales[static_cast<int64_t>(output_row)*8+n_tile]=bs.byte;
+                            output[static_cast<int64_t>(output_row)*(NT*32)+n_tile*32+atom*8+lane_row/2]=opus::fp32_to_fp8(activated[atom]*inverse);
+                        if(lane_row==0) output_scales[static_cast<int64_t>(output_row)*NT+n_tile]=bs.byte;
                     }
                 }
             }
@@ -5413,7 +5418,7 @@ void iq2r_glm53_gate_out(const aiter_tensor_t& activations,
                 "GLM-5.3 IQ2R gate gather must be int32 [routes]");
     AITER_CHECK(grid_multiplier >= 1 && grid_multiplier <= 8, "GLM-5.3 IQ2R gate grid multiplier");
     const bool prefill = kernel == kGlm53GatePrefill;
-    AITER_CHECK(kernel == kGlm53GateDecode || prefill || (kernel == kGlm53GateDecodeNoBarrier && !tp4),
+    AITER_CHECK(kernel == kGlm53GateDecode || prefill || kernel == kGlm53GateDecodeNoBarrier,
                 "GLM-5.3 IQ2R gate kernel id");
     AITER_CHECK(tokens >= 2 && tokens <= (prefill ? 4096 : 1024),
                 "GLM-5.3 IQ2R gate token range: decode 2..1024, prefill 2..4096");
@@ -5432,7 +5437,8 @@ void iq2r_glm53_gate_out(const aiter_tensor_t& activations,
         waves  = 4;
     }
     else if(kernel == kGlm53GateDecodeNoBarrier)
-        launch = glm53_gate_decode_nobarrier_kernel<1, true, 1, 4>;
+        launch = tp4 ? glm53_gate_decode_nobarrier_kernel<1, true, 1, 4, 16>
+                     : glm53_gate_decode_nobarrier_kernel<1, true, 1, 4, 8>;
     else
         launch = tp4 ? glm53_gate_decode_kernel<1, true, 0, 4, 16> : glm53_gate_decode_kernel<1, false, 0, 4, 8>;
     hipLaunchKernelGGL(launch,
@@ -5474,7 +5480,7 @@ void iq2r_glm53_down_out(const aiter_tensor_t& activations,
     AITER_CHECK(output.dtype() == AITER_DTYPE_bf16 && output.dim() == 2 && output.size(0) == routes &&
                     output.size(1) == kGlm53Hidden,
                 "GLM-5.3 IQ2R down output must be BF16 [routes, 6144]");
-    AITER_CHECK(kernel == kGlm53DownPacked || (kernel == kGlm53DownOrdered && !tp4), "GLM-5.3 IQ2R down kernel id");
+    AITER_CHECK(kernel == kGlm53DownPacked || kernel == kGlm53DownSingle || (kernel == kGlm53DownOrdered && !tp4), "GLM-5.3 IQ2R down kernel id");
     AITER_CHECK(grid_multiplier >= 1 && grid_multiplier <= 16, "GLM-5.3 IQ2R down grid multiplier");
     HipDeviceGuard device_guard(data.device_id);
     const dim3 grid(static_cast<int>(grid_multiplier) * static_cast<int>(get_num_cu_func()));
@@ -5487,7 +5493,14 @@ void iq2r_glm53_down_out(const aiter_tensor_t& activations,
         static_cast<const int32_t*>(task_count.data_ptr()), nullptr,                        \
         static_cast<__hip_bfloat16*>(output.data_ptr()), routes, kGlm53Hidden, K, kGlm53Experts, \
         static_cast<int>(data.size(1)), static_cast<int>(auxiliary.size(1))
-    if(tp4)
+    // Single: one 16-row atom per pass for decode-sized tasks, three workgroups per CU.
+    if(tp4 && kernel == kGlm53DownSingle)
+        hipLaunchKernelGGL((glm53_down_tp4_kernel<4, 1, 2, 8, 4, 4, 1, false, 3>),
+                           grid, dim3(64, 4), 0, getCurrentHIPStream(), GLM53_DOWN_ARGS, 0);
+    else if(kernel == kGlm53DownSingle)
+        hipLaunchKernelGGL((glm53_down_tp8_ordered_kernel<4, 1, 2, true, 8, 4, true>),
+                           grid, dim3(64, 4), 0, getCurrentHIPStream(), GLM53_DOWN_ARGS);
+    else if(tp4)
         hipLaunchKernelGGL((glm53_down_tp4_kernel<4, 2, 2, 8, 4, 4>),
                            grid, dim3(64, 4), 0, getCurrentHIPStream(), GLM53_DOWN_ARGS, 0);
     else if(kernel == kGlm53DownOrdered)

@@ -59,7 +59,7 @@ _RECORD_BYTES = 3584
 _QUAD_BYTES = 48 * 2304
 
 GATE_KERNELS = {"decode": 0, "nobarrier": 1, "prefill": 2}
-DOWN_KERNELS = {"packed": 0, "ordered": 1}
+DOWN_KERNELS = {"packed": 0, "ordered": 1, "single": 2}
 
 
 # --------------------------------------------------------------------------

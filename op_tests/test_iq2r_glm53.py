@@ -269,9 +269,11 @@ def _slice_rows(data, metadata, start, length):
 def test_glm53_tuned_config():
     for intermediate in (256, 512):
         assert iq2r_glm53_config(1, intermediate).down_kernel == "route9"
-        assert iq2r_glm53_config(64, intermediate).down_kernel == "packed"
+        assert iq2r_glm53_config(64, intermediate).gate_kernel == "nobarrier"
+        assert iq2r_glm53_config(1024, intermediate).down_kernel == "prefill"
         assert iq2r_glm53_config(4096, intermediate).down_chunks == 2
         # Untuned token counts fall back to the default heuristic.
         assert iq2r_glm53_config(77, intermediate) == _default_config(77, intermediate)
-    assert iq2r_glm53_config(128, 256).gate_kernel == "nobarrier"
+    assert iq2r_glm53_config(16, 512).down_kernel == "single"
+    assert iq2r_glm53_config(128, 256).down_kernel == "packed"
     assert iq2r_glm53_config(256, 256).down_kernel == "ordered"

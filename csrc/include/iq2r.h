@@ -159,6 +159,7 @@ enum Glm53DownKernel : int64_t
 {
     kGlm53DownPacked  = 0,
     kGlm53DownOrdered = 1,
+    kGlm53DownSingle  = 2,
 };
 
 void iq2r_glm53_sort_quant_out(const aiter_tensor_t& input,

@@ -68,9 +68,9 @@ def candidates(tokens: int, intermediate_size: int):
         yield IQ2RGlm53Config("decode", 2, "route9", 4, 1)
         return
     if tokens <= MAX_DECODE_TOKENS:
-        gates = ("decode", "nobarrier") if tp8 else ("decode",)
+        gates = ("decode", "nobarrier")
         downs = [("route9", 4)] if tokens in (2, 4) else []
-        down_kernels = ("packed", "ordered") if tp8 else ("packed",)
+        down_kernels = ("packed", "ordered", "single") if tp8 else ("packed", "single")
         downs += list(itertools.product(down_kernels, (2, 4, 8)))
         for gate, grid in itertools.product(gates, (1, 2, 4)):
             for down, down_grid in downs:
