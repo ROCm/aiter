@@ -9,6 +9,10 @@ uses ST=1 when ``num_tiles ≤`` the occupancy-clamped persistent grid.
 Payload HBM is bf16; in-kernel math is packed fp16. Each rank owns
 ``atoms / world_size`` atoms of a tile (8 GPUs → 1, 4 → 2, 2 → 4); LDS
 stays ``atoms * 1152``.
+
+``divisor`` defaults to 1. Loaded fp16 is divided by it before the first
+pack; the gathered sum is multiplied by it once, through the all-gather
+dequant scale, before the bf16 store. The second pack is left unchanged.
 """
 
 import flydsl.compiler as flyc
@@ -16,7 +20,7 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import gpu, range_constexpr, rocdl
-from flydsl.expr.typing import Int32, Int64, Stream, T, as_ir_value
+from flydsl.expr.typing import Float32, Int32, Int64, Stream, T, as_ir_value
 
 from . import buffer_ops
 
@@ -332,6 +336,7 @@ def make_quick_allreduce_int4_kernel(
         out_ptr: Int64,
         peer_ptrs: Int64,
         colors_ptr: Int64,
+        divisor: Float32 = Float32(1.0),  # noqa: B008
     ):
         _clamp_fp16_overflow()
         tid = fx.Int32(gpu.thread_id("x"))
@@ -451,6 +456,23 @@ def make_quick_allreduce_int4_kernel(
                 fx.copy(hbm_copy_atom, src, frag)
                 atoms.append(_atom_bf16_to_f16(fx.Vector(frag.load())))
             return atoms
+
+        # One shared divisor. Scale before the first pack so the group max and
+        # E4M3 byte see the scaled values; _codec_quant is used by both packs,
+        # so it must not scale. A packed fp16 divide expands per element, so
+        # multiply by a reciprocal taken once.
+        inv_div_h = _splat_f16x2((fx.Float32(1.0) / divisor).to(fx.Float16))
+        div_h = _splat_f16x2(divisor.to(fx.Float16))
+
+        def _div_fp16_atoms(atoms):
+            scaled = []
+            for i in range_constexpr(ATOMS):
+                atom = atoms[i]
+                parts = []
+                for j in range_constexpr(4):
+                    parts.append(_i32(_f16x2(atom[j]) * inv_div_h))
+                scaled.append(fx.Vector.from_elements(parts, fx.Int32))
+            return scaled
 
         def _store_tile_atoms(tile, atoms):
             for atom in range_constexpr(ATOMS):
@@ -608,14 +630,18 @@ def make_quick_allreduce_int4_kernel(
             return accs
 
         def _recv_all_gather(sub):
-            """Dequantize every peer's all-gather packet back into full-tile atoms."""
+            """Dequantize every peer's all-gather packet back into full-tile atoms.
+
+            The divisor multiply is folded into each packet's group scale:
+            one packed multiply per packet instead of one per fp16 pair.
+            """
             gathered = []
             for src in range_constexpr(world_size):
                 for k in range_constexpr(rank_atoms):
                     packed, scale = _recv_quantized(
                         PHASE_ALL_GATHER, fx.Int32(src), sub, k
                     )
-                    gathered.append(_codec_dequant(packed, scale))
+                    gathered.append(_codec_dequant(packed, scale * div_h))
             return gathered
 
         n_block_tiles = (num_tiles - bid + fx.Int32(grid - 1)) // fx.Int32(grid)
@@ -623,7 +649,7 @@ def make_quick_allreduce_int4_kernel(
         if super_tile == 1:
             for i in range(fx.Int32(0), n_block_tiles, fx.Int32(1)):
                 tile = bid + i * fx.Int32(grid)
-                atoms = _load_tile_atoms(tile)
+                atoms = _div_fp16_atoms(_load_tile_atoms(tile))
                 _pack_reduce_scatter(atoms)
                 gpu.barrier()
                 _fanout_nt(PHASE_REDUCE_SCATTER, rank, fx.Int32(0))
@@ -652,7 +678,7 @@ def make_quick_allreduce_int4_kernel(
 
                 for s in range(fx.Int32(0), n_this, fx.Int32(1)):
                     tile = bid + (i + s) * fx.Int32(grid)
-                    atoms = _load_tile_atoms(tile)
+                    atoms = _div_fp16_atoms(_load_tile_atoms(tile))
                     _pack_reduce_scatter(atoms)
                     gpu.barrier()
                     _fanout_nt(PHASE_REDUCE_SCATTER, rank, s)
@@ -704,6 +730,7 @@ def make_quick_allreduce_int4_kernel(
         peer_ptrs: Int64,
         colors_ptr: Int64,
         grid_x: Int32,
+        divisor: Float32 = 1.0,
         stream: Stream = Stream(None),  # noqa: B008
     ):
         quick_allreduce_int4(
@@ -714,6 +741,7 @@ def make_quick_allreduce_int4_kernel(
             out_ptr,
             peer_ptrs,
             colors_ptr,
+            divisor,
             value_attrs={"rocdl.flat_work_group_size": flat_wg},
         ).launch(
             grid=(grid_x, 1, 1),
