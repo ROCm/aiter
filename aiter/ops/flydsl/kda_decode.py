@@ -264,8 +264,8 @@ def flydsl_kda_decode(
 
     Requires gfx950, 12 heads, and 128-dim state (Kimi-K3 TP8). Check
     :func:`is_flydsl_kda_decode_supported` before dispatch.
-    Uses RMSNorm/sigmoid gating. Non-positive ``state_indices`` produce zero
-    output and leave both caches unchanged.
+    Uses RMSNorm/sigmoid gating. Cache slot zero is reserved: non-positive
+    ``state_indices`` produce zero output and leave both caches unchanged.
     """
     if x.ndim != 2:
         raise ValueError(f"`x` must have rank 2, got rank {x.ndim}.")
