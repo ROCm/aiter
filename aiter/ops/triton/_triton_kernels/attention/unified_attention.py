@@ -61,6 +61,8 @@ _kernel_unified_attention_2d_repr = make_kernel_repr(
         "TILE_SIZE",
         "HEAD_SIZE",
         "HEAD_SIZE_PADDED",
+        "HEAD_SIZE_V",
+        "HEAD_SIZE_V_PADDED",
         "USE_ALIBI_SLOPES",
         "USE_QQ_BIAS",
         "USE_SOFTCAP",
@@ -105,6 +107,8 @@ def kernel_unified_attention_2d(
     TILE_SIZE: tl.constexpr,  # int must be power of 2
     HEAD_SIZE: tl.constexpr,  # int
     HEAD_SIZE_PADDED: tl.constexpr,  # int, must be power of 2
+    HEAD_SIZE_V: tl.constexpr,  # int
+    HEAD_SIZE_V_PADDED: tl.constexpr,  # int, must be power of 2
     USE_ALIBI_SLOPES: tl.constexpr,  # bool
     USE_QQ_BIAS: tl.constexpr,  # bool
     USE_SOFTCAP: tl.constexpr,  # bool
@@ -165,6 +169,7 @@ def kernel_unified_attention_2d(
 
     offs_m = tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, HEAD_SIZE_PADDED)
+    offs_d_v = tl.arange(0, HEAD_SIZE_V_PADDED)
     offs_t = tl.arange(0, TILE_SIZE)
     query_pos = q_block_local_idx * BLOCK_Q + offs_m // num_queries_per_kv
 
@@ -184,6 +189,10 @@ def kernel_unified_attention_2d(
         dim_mask = offs_d < HEAD_SIZE
     else:
         dim_mask = tl.full((1,), 1, dtype=tl.int1)
+    if HEAD_SIZE_V_PADDED != HEAD_SIZE_V:
+        dim_mask_v = offs_d_v < HEAD_SIZE_V
+    else:
+        dim_mask_v = tl.full((1,), 1, dtype=tl.int1)
     query_mask_0 = query_pos < cur_batch_query_len
     query_mask_1 = query_offset_1 < num_query_heads
 
@@ -215,7 +224,7 @@ def kernel_unified_attention_2d(
         )
 
     L = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
-    acc = tl.zeros([BLOCK_M, HEAD_SIZE_PADDED], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_SIZE_V_PADDED], dtype=tl.float32)
 
     # sequence len for this particular sequence
     seq_len = tl.load(seq_lens_ptr + seq_idx)
@@ -303,7 +312,7 @@ def kernel_unified_attention_2d(
             v_offset = (
                 physical_block_idx[:, None] * stride_v_cache_0
                 + kv_head_idx * stride_v_cache_2
-                + offs_d[None, :] * stride_v_cache_3
+                + offs_d_v[None, :] * stride_v_cache_3
                 + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
             )
             k_offset = (
@@ -323,7 +332,7 @@ def kernel_unified_attention_2d(
 
             V_load = tl.load(
                 value_cache_ptr + v_offset,
-                mask=dim_mask[None, :],
+                mask=dim_mask_v[None, :],
                 other=0.0,
                 cache_modifier=KV_cache_modifier,
             )
@@ -393,10 +402,10 @@ def kernel_unified_attention_2d(
             v_offset = (
                 physical_block_idx[:, None] * stride_v_cache_0
                 + kv_head_idx * stride_v_cache_2
-                + offs_d[None, :] * stride_v_cache_3
+                + offs_d_v[None, :] * stride_v_cache_3
                 + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
             )
-            v_mask = dim_mask[None, :] & tile_mask[:, None]
+            v_mask = dim_mask_v[None, :] & tile_mask[:, None]
 
             k_offset = (
                 physical_block_idx[None, :] * stride_k_cache_0
@@ -441,11 +450,11 @@ def kernel_unified_attention_2d(
             V = (
                 V.reshape(
                     TILE_SIZE // K_WIDTH,
-                    HEAD_SIZE_PADDED,
+                    HEAD_SIZE_V_PADDED,
                     K_WIDTH,
                 )
                 .permute(0, 2, 1)
-                .reshape(TILE_SIZE, HEAD_SIZE_PADDED)
+                .reshape(TILE_SIZE, HEAD_SIZE_V_PADDED)
             )
 
         # S : (BLOCK_M, TILE_SIZE)
@@ -529,13 +538,13 @@ def kernel_unified_attention_2d(
     output_offset = (
         query_offset_0[:, None] * output_stride_0
         + query_offset_1[:, None] * output_stride_1
-        + offs_d[None, :]
+        + offs_d_v[None, :]
     )
 
     tl.store(
         output_ptr + output_offset,
         acc,
-        mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
+        mask=dim_mask_v[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
     )
 
 
@@ -547,6 +556,7 @@ kernel_unified_attention_3d_repr = make_kernel_repr(
         "BLOCK_SIZE",
         "TILE_SIZE",
         "HEAD_SIZE",
+        "HEAD_SIZE_V",
         "NUM_SEGMENTS_PER_SEQ",
         "num_warps",
         "waves_per_eu",
@@ -589,6 +599,8 @@ def kernel_unified_attention_3d(
     TILE_SIZE: tl.constexpr,  # int, must be power of 2
     HEAD_SIZE: tl.constexpr,  # int
     HEAD_SIZE_PADDED: tl.constexpr,  # int, must be power of 2
+    HEAD_SIZE_V: tl.constexpr,  # int
+    HEAD_SIZE_V_PADDED: tl.constexpr,  # int, must be power of 2
     USE_ALIBI_SLOPES: tl.constexpr,  # bool
     USE_QQ_BIAS: tl.constexpr,  # bool
     USE_SOFTCAP: tl.constexpr,  # bool
@@ -658,6 +670,7 @@ def kernel_unified_attention_3d(
 
     offs_m = tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, HEAD_SIZE_PADDED)
+    offs_d_v = tl.arange(0, HEAD_SIZE_V_PADDED)
     offs_t = tl.arange(0, TILE_SIZE)
 
     offs_shfl = None
@@ -678,6 +691,10 @@ def kernel_unified_attention_3d(
         dim_mask = offs_d < HEAD_SIZE
     else:
         dim_mask = tl.full((1,), 1, dtype=tl.int1)
+    if HEAD_SIZE_V_PADDED != HEAD_SIZE_V:
+        dim_mask_v = offs_d_v < HEAD_SIZE_V
+    else:
+        dim_mask_v = tl.full((1,), 1, dtype=tl.int1)
     query_mask_0 = query_pos < cur_batch_query_len
     query_mask_1 = query_offset_1 < num_query_heads
 
@@ -707,7 +724,7 @@ def kernel_unified_attention_3d(
         M = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
 
     L = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
-    acc = tl.zeros([BLOCK_M, HEAD_SIZE_PADDED], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_SIZE_V_PADDED], dtype=tl.float32)
 
     # context length for this particular sequences
     context_len = seq_len - cur_batch_query_len
@@ -799,10 +816,10 @@ def kernel_unified_attention_3d(
             v_offset = (
                 physical_block_idx[:, None] * stride_v_cache_0
                 + kv_head_idx * stride_v_cache_2
-                + offs_d[None, :] * stride_v_cache_3
+                + offs_d_v[None, :] * stride_v_cache_3
                 + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
             )
-            v_mask = dim_mask[None, :] & tile_mask[:, None]
+            v_mask = dim_mask_v[None, :] & tile_mask[:, None]
 
             k_offset = (
                 physical_block_idx[None, :] * stride_k_cache_0
@@ -847,11 +864,11 @@ def kernel_unified_attention_3d(
             V = (
                 V.reshape(
                     TILE_SIZE // K_WIDTH,
-                    HEAD_SIZE_PADDED,
+                    HEAD_SIZE_V_PADDED,
                     K_WIDTH,
                 )
                 .permute(0, 2, 1)
-                .reshape(TILE_SIZE, HEAD_SIZE_PADDED)
+                .reshape(TILE_SIZE, HEAD_SIZE_V_PADDED)
             )
 
         seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
@@ -927,15 +944,15 @@ def kernel_unified_attention_3d(
 
     segm_output_offset = (
         query_offset_0[:, None].to(tl.int64)
-        * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
-        + query_offset_1[:, None] * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
-        + segm_idx * HEAD_SIZE_PADDED
-        + tl.arange(0, HEAD_SIZE_PADDED)[None, :]
+        * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_V_PADDED)
+        + query_offset_1[:, None] * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_V_PADDED)
+        + segm_idx * HEAD_SIZE_V_PADDED
+        + tl.arange(0, HEAD_SIZE_V_PADDED)[None, :]
     )
     tl.store(
         segm_output_ptr + segm_output_offset,
         acc,
-        mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
+        mask=dim_mask_v[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
     )
     if NUM_SEGMENTS_PER_SEQ > 1:
         segm_offset = (
