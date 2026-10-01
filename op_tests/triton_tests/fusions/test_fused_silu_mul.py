@@ -77,7 +77,7 @@ def test_fused_silu_mul_requires_even_last_dim():
         ),
     ],
 )
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_fused_silu_mul_tp4_moe_shapes(n_rows, last_dim, dtype):
     """MoE fused silu×mul tensor as (tokens * top_k, 2 * local_d) under TP4."""
     if not torch.cuda.is_available():

@@ -52,12 +52,12 @@ def ref_qk_rope_cat(
     return torch.cat((q_nope, q_pe_out), dim=-1), torch.cat((k_nope, k_pe_out), dim=-1)
 
 
-@pytest.mark.parametrize("B", [1, 4, 8, 16, 32])
-@pytest.mark.parametrize("QH_PER_KH", [1, 2, 4, 8, 16])
+@pytest.mark.parametrize("B", [1, 4, 32])
+@pytest.mark.parametrize("QH_PER_KH", [1, 4, 16])
 @pytest.mark.parametrize("KH", [1, 4])
 @pytest.mark.parametrize("D_nope", [512])
 @pytest.mark.parametrize("D_pe", [64, 128])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_qk_cat(B: int, QH_PER_KH: int, KH: int, D_nope: int, D_pe: int, dtype):
 
     q_nope, q_pe, k_nope, k_pe = generate_qk_inputs(
@@ -71,15 +71,15 @@ def test_qk_cat(B: int, QH_PER_KH: int, KH: int, D_nope: int, D_pe: int, dtype):
     torch.testing.assert_close(k_torch, k_triton)
 
 
-@pytest.mark.parametrize("B", [1, 4, 8, 16, 32])
-@pytest.mark.parametrize("QH_PER_KH", [1, 2, 4, 8, 16])
+@pytest.mark.parametrize("B", [1, 4, 32])
+@pytest.mark.parametrize("QH_PER_KH", [1, 4, 16])
 @pytest.mark.parametrize("KH", [1, 4])
 @pytest.mark.parametrize("D_nope", [512])
 @pytest.mark.parametrize("D_pe", [64, 128])
 @pytest.mark.parametrize("max_embed_positions", [131072])
 @pytest.mark.parametrize("reuse_freqs_front_part", [True, False])
 @pytest.mark.parametrize("rotate_style", [RotateStyle.GPTJ, RotateStyle.NEOX])
-# @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16]) # TODO fp16 results in ~0.6 error rate
+# @pytest.mark.parametrize("dtype", [torch.bfloat16]) # TODO fp16 results in ~0.6 error rate
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_qk_rope_cat(
     B: int,

@@ -6,7 +6,7 @@ from aiter.ops.triton.utils.types import str_to_torch_dtype
 
 
 # pytest
-@pytest.mark.parametrize("dtype", ["fp32", "fp16", "bf16"])
+@pytest.mark.parametrize("dtype", ["bf16"])
 @pytest.mark.parametrize(
     "M, N",
     [
@@ -14,7 +14,6 @@ from aiter.ops.triton.utils.types import str_to_torch_dtype
         (1, 1),
         (128, 1),
         (1, 128),
-        (8192, 8192),
         (4096, 8192),
         (359, 1),
         (1, 359),

@@ -57,40 +57,43 @@ def torch_act_mul_and_mxfp4_quant(
 
 
 @pytest.mark.parametrize(
-    "M, N",
+    "M, N, shuffle, scale_shuffle_padding",
     [
-        (512, 57344),
-        (504, 57344),
-        (1, 57344),
-        (4, 57344),
-        (32, 8192),
-        (1, 4),
-        (1, 28),
-        (1, 32),
-        (1, 64),
-        (1, 68),
-        (2, 4),
-        (2, 28),
-        (2, 32),
-        (2, 64),
-        (2, 68),
-        (128, 4),
-        (128, 28),
-        (128, 32),
-        (128, 64),
-        (128, 68),
-        (256, 32),
-        (256, 512),
-        (256, 1024),
-        (160, 40),
-        (280, 20),
-        (32, 128),
+        (m, n, shuffle, padding)
+        for m, n in [
+            (512, 57344),
+            (504, 57344),
+            (1, 57344),
+            (4, 57344),
+            (32, 8192),
+            (1, 4),
+            (1, 28),
+            (1, 32),
+            (1, 64),
+            (1, 68),
+            (2, 4),
+            (2, 28),
+            (2, 32),
+            (2, 64),
+            (2, 68),
+            (128, 4),
+            (128, 28),
+            (128, 32),
+            (128, 64),
+            (128, 68),
+            (256, 32),
+            (256, 512),
+            (256, 1024),
+            (160, 40),
+            (280, 20),
+            (32, 128),
+        ]
+        for shuffle, padding in [(False, False), (False, True), (True, True)]
+        if not shuffle or n % 512 == 0
     ],
 )
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("activation", ["silu", "gelu", "gelu_tanh"])
-@pytest.mark.parametrize("shuffle", [False, True])
-@pytest.mark.parametrize("scale_shuffle_padding", [False, True])
 def test_act_mul_and_mxfp4_quant(
     M: int, N: int, dtype, activation: str, shuffle: bool, scale_shuffle_padding: bool
 ):

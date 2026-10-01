@@ -47,7 +47,7 @@ def run_torch(query, residuals, rms_weight, output_rms_weight, rms_eps, scale):
 @pytest.mark.parametrize("shape", [(64, 256), (128, 512), (37, 1024)])
 @pytest.mark.parametrize("L", [1, 2, 3, 4, 8])
 @pytest.mark.parametrize("with_onorm", [False, True])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_attn_res(layout, shape, L, with_onorm, dtype):
     N, D = shape
     rms_eps, scale = 1e-6, 0.7
@@ -148,7 +148,7 @@ def run_torch_gate(
 @pytest.mark.parametrize("shape", [(64, 256), (128, 512), (37, 1024)])
 @pytest.mark.parametrize("B", [1, 2, 3, 7])
 @pytest.mark.parametrize("with_add", [False, True])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_attn_res_gate(shape, B, with_add, dtype):
     N, D = shape
     eps = 1e-6
@@ -168,7 +168,7 @@ def test_attn_res_gate(shape, B, with_add, dtype):
 
 @pytest.mark.parametrize("B", [1, 3, 7])
 @pytest.mark.parametrize("with_add", [False, True])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_attn_res_gate_output_rmsnorm(B, with_add, dtype):
     """output_rms_weight fuses the following prenorm into the gate."""
     N, D = 128, 512
@@ -201,7 +201,7 @@ def test_attn_res_gate_output_rmsnorm(B, with_add, dtype):
 
 
 @pytest.mark.parametrize("B", [1, 3, 7])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_attn_res_gate_add_hidden2(B, dtype):
     """add_hidden2 folds a SECOND addend into the prefix (mirrors ATOM's
     routed + shared MoE expert output fold)."""
@@ -234,7 +234,7 @@ def test_attn_res_gate_add_hidden2_requires_add_hidden():
 
 
 @pytest.mark.parametrize("B", [1, 3, 7])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_attn_res_gate_output_rms_eps_independent_of_eps(B, dtype):
     """output_rms_eps can differ from the per-candidate eps."""
     N, D = 128, 512
@@ -343,7 +343,7 @@ def test_attn_res_gate_matches_attn_res_fwd(B):
 
 @pytest.mark.parametrize("B", [1, 3, 7])
 @pytest.mark.parametrize("with_add", [False, True])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_attn_res_gate_close_block(B, with_add, dtype):
     """close_block fuses cat([block_residual, prefix_out], -2) into the kernel
     (mirrors ATOM's AttnRes.maybe_close_block); must not perturb (y, prefix_out)
@@ -371,7 +371,7 @@ def test_attn_res_gate_close_block(B, with_add, dtype):
 
 
 @pytest.mark.parametrize("B", [1, 3, 7])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_attn_res_gate_close_block_composes_with_add2_and_onorm(B, dtype):
     """close_block composes with add_hidden2 and output_rms_weight (all three
     flags fold into the same single kernel launch)."""

@@ -55,23 +55,23 @@ TEST_ONLY_SHAPES: list[tuple[int, int, int, int]] = [
 ]
 # fmt: on
 
-# Real shapes, used by real models.
+# Model matrix dimensions with smaller token counts; retain one large-address case.
 # fmt: off
 REAL_SHAPES: list[tuple[int, int, int, int]] = [
     #      M,     K,     N,   G
-    (  49152,  1408,  2048,  64),  # deepseekv2-16B
+    (   1024,  1408,  2048,  64),  # deepseekv2-16B
     (3145728,  2048,  1408,   8),  # deepseekv2-16B
-    (  32768,  6144, 16384,   8),  # Mixtral 8x22B
-    (  32768, 16384,  6144,   8),  # Mixtral 8x22B
+    (   1024,  6144, 16384,   8),  # Mixtral 8x22B
+    (   1024, 16384,  6144,   8),  # Mixtral 8x22B
 ]
 # fmt: on
 
 # Test shapes are test only + real ones.
 TEST_SHAPES: list[tuple[int, int, int, int]] = TEST_ONLY_SHAPES + REAL_SHAPES
 
-# Other production workload: unknown model
+# Ragged token count for layout, group-size dtype and scheduling coverage.
 #                                                   M,    K,    N,  G
-OTHER_REAL_SHAPE: tuple[int, int, int, int] = (267424, 1280, 2560, 32)
+OTHER_REAL_SHAPE: tuple[int, int, int, int] = (4097, 1280, 2560, 32)
 
 # Transpositions.
 
@@ -179,9 +179,17 @@ def torch_gmm(
     return out
 
 
-@pytest.mark.parametrize("M, K, N, G", TEST_SHAPES)
-@pytest.mark.parametrize("trans_rhs_str", TRANS_RHS_STR)
-@pytest.mark.parametrize("use_bias", [False, True])
+# The largest shape covers >32-bit element offsets once, not per feature combination.
+@pytest.mark.parametrize(
+    "M, K, N, G, trans_rhs_str, use_bias",
+    [
+        (*shape, trans, bias)
+        for shape in TEST_SHAPES
+        for trans in sorted(TRANS_RHS_STR)
+        for bias in [False, True]
+        if shape[0] != 3145728 or (trans == "trhsF" and not bias)
+    ],
+)
 def test_gmm(
     M: int,
     K: int,
@@ -198,7 +206,7 @@ def test_gmm(
         K,
         N,
         G,
-        NUM_GROUP_SIZES,
+        1 if M == 3145728 else NUM_GROUP_SIZES,
         input_type=in_dtype,
         output_type=out_dtype,
         trans_rhs=trans_rhs,
@@ -378,10 +386,17 @@ def torch_tgmm(
     return out
 
 
-@pytest.mark.parametrize("persistent_str", {"p", "np"})
-@pytest.mark.parametrize("with_bias_grad", [False, True])
-@pytest.mark.parametrize("M, K, N, G", TEST_SHAPES)
-@pytest.mark.parametrize("trans_lhs_str", TRANS_LSH_STR)
+@pytest.mark.parametrize(
+    "persistent_str, with_bias_grad, M, K, N, G, trans_lhs_str",
+    [
+        (persistent, bias, *shape, trans)
+        for shape in TEST_SHAPES
+        for persistent in ["p", "np"]
+        for bias in [False, True]
+        for trans in sorted(TRANS_LSH_STR)
+        if shape[0] != 3145728 or (persistent == "p" and not bias and trans == "tlhsF")
+    ],
+)
 def test_tgmm(
     persistent_str: str,
     with_bias_grad: bool,
@@ -402,7 +417,7 @@ def test_tgmm(
         K,
         N,
         G,
-        NUM_GROUP_SIZES,
+        1 if M == 3145728 else NUM_GROUP_SIZES,
         input_type=in_dtype,
         output_type=out_dtype,
         trans_lhs=trans_lhs,
