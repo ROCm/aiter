@@ -80,7 +80,7 @@ class PreparedRouteMerge8:
         )
         self.g1 = compile_gemm1_a4w4_port(
             BM=16,
-            use_nt=False,
+            use_nt=True,
             inline_quant=True,
             prefetch_hidden=prefetch_hidden,
             D_HIDDEN=6144,

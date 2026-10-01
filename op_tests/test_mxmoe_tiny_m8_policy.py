@@ -202,6 +202,35 @@ class RouteMergeTests(unittest.TestCase):
             changed[index] = value
             self.assertFalse(support(*changed))
 
+    def test_factory_uses_an_existing_native_g1_variant(self):
+        factory = ast.parse((ROOT / "aiter/ops/flydsl/mxmoe_tiny_m8.py").read_text())
+        call = next(
+            node
+            for node in ast.walk(factory)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "compile_gemm1_a4w4_port"
+        )
+        settings = {
+            keyword.arg: ast.literal_eval(keyword.value)
+            for keyword in call.keywords
+            if keyword.arg in ("BM", "use_nt", "inline_quant")
+        }
+        table = ast.parse((ROOT / "aiter/ops/flydsl/mxfp4_kname.py").read_text())
+        variants = next(
+            ast.literal_eval(node.value)
+            for node in table.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "MXFP4_G1_VARIANTS"
+                for target in node.targets
+            )
+        )
+        self.assertIn(
+            tuple(settings[key] for key in ("BM", "use_nt", "inline_quant")),
+            variants["fp4"],
+        )
+
     def test_default_off_compiler_and_atomic_math(self):
         for name in ["mxfp4_gemm1.py", "mxfp4_gemm2.py"]:
             source = (ROOT / "aiter/ops/flydsl/kernels" / name).read_text()
