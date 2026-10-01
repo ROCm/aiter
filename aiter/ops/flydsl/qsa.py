@@ -47,7 +47,11 @@ from .kernels.qsa import (
     qsa_visible_blocks,
 )
 from .kernels.qsa.arch import qsa_arch_is_supported
-from .kernels.qsa.k1 import qsa_k1_block_ids, qsa_k1_serves
+from .kernels.qsa.k1 import (
+    qsa_k1_block_ids,
+    qsa_k1_selection_serves,
+    qsa_k1_serves,
+)
 from .kernels.qsa.k2 import qsa_k2, qsa_k2_serves
 
 # GQA query ``(n_q_heads, head_dim)`` -> the indexer head counts swept with
@@ -173,17 +177,22 @@ def qsa_auto_uses_flydsl(
     v_cache: torch.Tensor,
     kv_page_table: torch.Tensor,
     indices: torch.Tensor,
+    token_topk: int = 2048,
+    compress_ratio: int = 4,
 ) -> bool:
     """Whether ``auto`` may launch FlyDSL.
 
     Any query pair but a measured one stays on Triton. So does a shape the
-    kernels cannot serve, and a GPU outside gfx942/gfx950. Those keep
-    ``auto`` from turning a dispatch miss into an exception. An explicit
-    ``flydsl`` backend does not consult this predicate, so it still raises
-    on an unsupported arch. Host tensors have no arch and are judged on
-    shape alone. ``M`` and the selection width are not filters: the sweep
-    above won at every one it measured.
+    kernels cannot serve, a GPU outside gfx942/gfx950, and a token budget
+    other than K1's 512 blocks at ratio 4. Those keep ``auto`` from turning
+    a dispatch miss into an exception. An explicit ``flydsl`` backend does
+    not consult this predicate: it still raises on an unsupported arch and
+    on any other selection budget. Host tensors have no arch and are judged
+    on shape alone. ``M`` is not a filter: the sweep above won at every one
+    it measured.
     """
+    if qsa_k1_selection_serves(token_topk, compress_ratio) is not None:
+        return False
     arch = _gqa_device_arch(q_gqa)
     if arch is not None and not qsa_arch_is_supported(arch):
         return False
@@ -340,12 +349,17 @@ def qsa_layer(
     ``backend="auto"`` (the default) uses FlyDSL only when
     ``qsa_auto_uses_flydsl`` is set, and Triton otherwise. A GQA query
     that is not in the measured table logs once on this path. A GPU
-    outside gfx942/gfx950 also stays on Triton. ``backend="flydsl"`` is
-    K1 + vendored expand + K2, and that override still raises on an
-    unsupported arch.
+    outside gfx942/gfx950 also stays on Triton, as does a token budget
+    other than 512 blocks at compress ratio 4. ``backend="flydsl"`` is
+    K1 + vendored expand + K2. That override still raises on an
+    unsupported arch, and on any other selection budget.
     ``backend="triton"`` is the live AMD path.
     """
     selected = normalize_qsa_backend(backend)
+    if selected == "flydsl":
+        reason = qsa_k1_selection_serves(token_topk, compress_ratio)
+        if reason is not None:
+            raise ValueError(reason)
     if selected == "auto":
         key = _gqa_table_key(q_gqa)
         if key is None or key not in _MEASURED_QUERIES:
@@ -367,6 +381,8 @@ def qsa_layer(
                 v_cache,
                 kv_page_table,
                 probe,
+                token_topk,
+                compress_ratio,
             )
             else "triton"
         )
