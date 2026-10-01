@@ -476,6 +476,11 @@ def moe_gemm_a16w4(
         assert (
             backend == "triton"
         ), "expert_map (EP) is only supported on the triton backend"
+        # Non-local experts' output rows are left unwritten (no zero-fill), so the
+        # combine must skip their gates -- gate_valid is required to do that.
+        assert (
+            gate_valid is not None
+        ), "expert_map (EP) requires gate_valid so the combine skips non-local gates"
         # The kernel indexes ExpertMap as a flat pointer, so enforce the same
         # contiguous int32 contract the fused routing path uses.
         assert (
