@@ -10,12 +10,9 @@ import torch
 import triton
 
 from aiter.ops.triton._triton_kernels.fusions.fused_sigmoid_mul import (
+    _fused_sigmoid_mul_2d_kernel,
     _fused_sigmoid_mul_kernel,
-)
-from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.utils.config_utils import (
-    AITER_TRITON_CONFIGS_PATH,
-    load_config_json,
+    _get_config,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -24,9 +21,8 @@ _LOGGER = AiterTritonLogger()
 __all__ = ["fused_sigmoid_mul"]
 
 
-def _get_config() -> dict:
-    base = f"{AITER_TRITON_CONFIGS_PATH}/{get_arch()}/triton/fusions/fused_sigmoid_mul"
-    return dict(load_config_json(f"{base}/DEFAULT.json", required=True)["any"])
+def _is_row_strided_2d(t: torch.Tensor) -> bool:
+    return t.dim() == 2 and t.stride(1) == 1 and t.stride(0) >= t.shape[1]
 
 
 def fused_sigmoid_mul(
@@ -38,15 +34,17 @@ def fused_sigmoid_mul(
     Fused elementwise ``out = x * sigmoid(gate)``.
 
     Args:
-        x: any shape, contiguous
-        gate: same shape and dtype as x, contiguous.
+        x: any shape, contiguous; or a 2-D row-strided view (see below)
+        gate: same shape and dtype as x
         out: optional destination
 
     Returns:
         out if given, else x (in place).
 
     Constraints:
-        x and gate must be contiguous, same shape, same dtype
+        x and gate must be the same shape and dtype. When x, gate and out are
+        all contiguous a flat 1-D kernel runs. Otherwise each must be 2-D with
+        a dense last dimension
     """
     _LOGGER.info("FUSED_SIGMOID_MUL: x=%s dtype=%s", tuple(x.shape), x.dtype)
 
@@ -59,8 +57,6 @@ def fused_sigmoid_mul(
     ), f"unsupported dtype: {x.dtype}"
     assert x.shape == gate.shape, f"shape mismatch: {x.shape} vs {gate.shape}"
     assert x.dtype == gate.dtype, f"dtype mismatch: {x.dtype} vs {gate.dtype}"
-    assert x.is_contiguous(), "x must be contiguous"
-    assert gate.is_contiguous(), "gate must be contiguous"
 
     if out is None:
         out = x
@@ -68,7 +64,12 @@ def fused_sigmoid_mul(
         assert out.shape == x.shape, f"out shape mismatch: {out.shape} vs {x.shape}"
         assert out.dtype == x.dtype, f"out dtype mismatch: {out.dtype} vs {x.dtype}"
         assert out.device == x.device, "out must be on the same device as x"
-        assert out.is_contiguous(), "out must be contiguous"
+
+    if not (x.is_contiguous() and gate.is_contiguous() and out.is_contiguous()):
+        assert all(
+            _is_row_strided_2d(t) for t in (x, gate, out)
+        ), "x, gate and out must be contiguous, or 2-D with a dense last dimension"
+        return _fused_sigmoid_mul_2d(x, gate, out)
 
     N = x.numel()
     if N == 0:
@@ -84,6 +85,35 @@ def fused_sigmoid_mul(
         N,
         BLOCK_SIZE_N=BLOCK_SIZE_N,
         NEED_MASK=N % BLOCK_SIZE_N != 0,
+        **config,
+    )
+    return out
+
+
+def _fused_sigmoid_mul_2d(
+    x: torch.Tensor, gate: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    M, N = x.shape
+    if M == 0 or N == 0:
+        return out
+
+    config = _get_config("strided")
+    BLOCK_SIZE_M = config.pop("BLOCK_SIZE_M")
+    BLOCK_SIZE_N = config.pop("BLOCK_SIZE_N")
+
+    grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
+    _fused_sigmoid_mul_2d_kernel[grid](
+        x,
+        gate,
+        out,
+        M,
+        N,
+        x.stride(0),
+        gate.stride(0),
+        out.stride(0),
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        NEED_MASK=(M % BLOCK_SIZE_M != 0) or (N % BLOCK_SIZE_N != 0),
         **config,
     )
     return out
