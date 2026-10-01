@@ -641,10 +641,11 @@ def ref_chunk_gated_delta_rule_fwd_h(
 
 
 @benchmark()
-def test_chunk_gdn_prefill_h_blocked(
-    case_name, context_lens, state_dtype=torch.float32, dense=False, use_h0=True
-):
+def test_chunk_gdn_prefill_h_blocked(context_lens, mode, state_dtype, init_state):
     """Check cross-block state coupling and empty requests."""
+    tag = f"blocked_{mode}_{state_dtype}_h0{init_state}"
+    context_lens = list(context_lens)
+    state_dtype = _STATE_DTYPES[state_dtype]
     case = PrefillArgs(
         K=128,
         V=128,
@@ -653,10 +654,10 @@ def test_chunk_gdn_prefill_h_blocked(
         tp=1,
         full_prompt_len=max(context_lens),
         model_name="K5-blocked",
-        is_varlen=not dense,
+        is_varlen=mode == "varlen",
         max_num_batched_tokens=sum(context_lens),
-        context_lens=list(context_lens),
-        trace_tag=case_name,
+        context_lens=context_lens,
+        trace_tag=tag,
         output_final_state=True,
         g_head_major=True,
         ssm_state_dtype=state_dtype,
@@ -664,7 +665,7 @@ def test_chunk_gdn_prefill_h_blocked(
     k, w_orig, u_orig, w_c, u_c, g, h0, cu = _make_inputs(
         case, context_lens, stable_coupling=True
     )
-    if not use_h0:
+    if not init_state:
         h0 = None  # exercises the use_initial_state=False specialization
     # Production and oracle gates use log2 and natural-log scales, respectively.
     g_log2 = g * math.log2(math.e)
@@ -716,28 +717,28 @@ def test_chunk_gdn_prefill_h_blocked(
                 h.to(dtypes.fp32),
                 rtol=2e-2,
                 atol=2e-2,
-                msg=f"{case_name}: K5 h snapshots",
+                msg=f"{tag}: K5 h snapshots",
             ),
             checkAllclose(
                 ref_vn.to(dtypes.fp32),
                 _normalize_opt_v_new(vn).to(dtypes.fp32),
                 rtol=2e-2,
                 atol=2e-2,
-                msg=f"{case_name}: K5 v_new",
+                msg=f"{tag}: K5 v_new",
             ),
             checkAllclose(
                 ref_fs.to(dtypes.fp32),
                 fs.to(dtypes.fp32),
                 rtol=2e-2,
                 atol=2e-2,
-                msg=f"{case_name}: K5 final_state",
+                msg=f"{tag}: K5 final_state",
             ),
         )
         if 0 in context_lens and h0 is not None:
             empty_idx = context_lens.index(0)
             assert torch.equal(
                 fs[empty_idx], h0[empty_idx]
-            ), f"{case_name}: empty-sequence final state must equal initial state"
+            ), f"{tag}: empty-sequence final state must equal initial state"
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
@@ -936,6 +937,23 @@ def _sweep_rows(args, model):
     return rows
 
 
+def _blocked_sweep_rows(args):
+    """Cartesian sweep of the blocked-dispatch CLI axes."""
+    rows = []
+    for lens, mode, state, init in itertools.product(
+        args.context_lens,
+        args.blocked_mode,
+        args.blocked_state_dtype,
+        args.init_state,
+    ):
+        # str2tuple returns a bare int for a single value ("8257" -> 8257).
+        lens = (lens,) if isinstance(lens, int) else tuple(lens)
+        if mode == "dense" and len(lens) != 1:
+            continue  # dense is a single prompt
+        rows.append((lens, mode, state, init))
+    return rows
+
+
 def main():
     gfx = get_gfx_runtime()
     if gfx not in SUPPORTED_GFX:
@@ -1014,19 +1032,52 @@ def main():
         help="""Persistent SSM initial/final state dtype.
         e.g.: --state-dtype fp32 bf16""",
     )
+    parser.add_argument(
+        "--context-lens",
+        type=dtypes.str2tuple,
+        nargs="*",
+        default=[(8257,), (8192, 0), (8257, 4097)],
+        help="""Per-request prompt lengths of one blocked-sweep batch
+        (comma-separated; 0 = empty request, varlen only).
+        e.g.: --context-lens 8257 8192,0 8257,4097""",
+    )
+    parser.add_argument(
+        "--blocked-mode",
+        type=str,
+        choices=["dense", "varlen"],
+        nargs="*",
+        default=["dense", "varlen"],
+        help="""Blocked sweep launch path. dense = one prompt (B=1, no
+        cu_seqlens), final state written back; varlen = cu_seqlens batch.
+        e.g.: --blocked-mode varlen""",
+    )
+    parser.add_argument(
+        "--blocked-state-dtype",
+        type=str,
+        choices=list(_STATE_DTYPES),
+        nargs="*",
+        default=["bf16", "fp32"],
+        help="""SSM initial/final state dtype for the blocked sweep.
+        e.g.: --blocked-state-dtype bf16 fp32""",
+    )
+    parser.add_argument(
+        "--init-state",
+        type=int,
+        choices=[1, 0],
+        nargs="*",
+        default=[1, 0],
+        help="""Pass an initial state (1) or none (0) in the blocked sweep.
+        e.g.: --init-state 1 0""",
+    )
     args = parser.parse_args()
 
     if gfx == "gfx950" and not _flydsl_run_only():
-        cases = [
-            ("ragged_coupling", [8257]),
-            ("empty_sequence", [8192, 0]),
-            ("two_requests", [8257, 4097]),
-            ("two_requests_bf16", [8257, 4097], torch.bfloat16),
-            # dense B=1: synthetic [0, T] offsets path; no-h0: USE_INITIAL_STATE=False
-            ("dense_single", [8257], torch.float32, True),
-            ("no_h0_two_requests", [8257, 4097], torch.float32, False, False),
-        ]
-        df = pd.DataFrame([test_chunk_gdn_prefill_h_blocked(*case) for case in cases])
+        df = pd.DataFrame(
+            [
+                test_chunk_gdn_prefill_h_blocked(*row)
+                for row in _blocked_sweep_rows(args)
+            ]
+        )
         aiter.logger.info(
             "chunk_gdn_prefill_h blocked dispatch summary (markdown):\n%s",
             df.to_markdown(index=False),
