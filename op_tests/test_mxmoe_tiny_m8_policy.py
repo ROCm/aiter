@@ -309,6 +309,49 @@ class RouteMergeTests(unittest.TestCase):
         self.assertEqual(expected, float("inf"))
         self.assertNotEqual(expected, 7.0)
 
+    def test_input_aliases_are_rejected_before_launch(self):
+        namespace = load_functions(ROOT / "aiter/ops/flydsl/mxmoe_tiny_m8.py", {})
+        check = namespace["_check_disjoint"]
+
+        def tensor(start, size):
+            return types.SimpleNamespace(
+                data_ptr=lambda: start, numel=lambda: size, element_size=lambda: 1
+            )
+
+        scratch = [tensor(100, 100), tensor(300, 40), tensor(500, 60)]
+        check([tensor(0, 100), tensor(200, 100), tensor(340, 160)], scratch)
+        for start, size in [(100, 100), (99, 2), (199, 2), (90, 600), (310, 4)]:
+            with self.assertRaisesRegex(ValueError, "must not alias"):
+                check([tensor(start, size)], scratch)
+        # The actual run rejects aliases before either G1 or G2 is launched.
+        factory = ast.parse((ROOT / "aiter/ops/flydsl/mxmoe_tiny_m8.py").read_text())
+        run = next(
+            node
+            for node in ast.walk(factory)
+            if isinstance(node, ast.FunctionDef) and node.name == "run"
+        )
+        guard = next(
+            index
+            for index, node in enumerate(run.body)
+            if any(
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name)
+                and call.func.id == "_check_disjoint"
+                for call in ast.walk(node)
+            )
+        )
+        launch = next(
+            index
+            for index, node in enumerate(run.body)
+            if any(
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name)
+                and call.func.id == "_run_compiled"
+                for call in ast.walk(node)
+            )
+        )
+        self.assertLess(guard, launch)
+
     def test_default_off_compiler_and_atomic_math(self):
         for name in ["mxfp4_gemm1.py", "mxfp4_gemm2.py"]:
             source = (ROOT / "aiter/ops/flydsl/kernels" / name).read_text()

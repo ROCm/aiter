@@ -6,6 +6,8 @@ Opt-in only. Supplied native top-8 IDs are distinct within each token; column
 eight is expert 256. The actual FP32 weight of that shared route is preserved.
 No router or collective is owned here. Other shapes retain public fused_moe.
 Handles own per-layer scratch and support serial eager/captured-graph reuse.
+Inputs must be disjoint from that handle's output and other scratch; aliases
+are rejected before launch. Concurrent reuse of one handle is unsupported.
 """
 
 
@@ -18,6 +20,17 @@ def supported_geometry(rows, arch, w1_shape, w2_shape, fp4_weights, shuffled):
         and fp4_weights
         and shuffled
     )
+
+
+def _check_disjoint(inputs, scratch):
+    scratch_ranges = [
+        (v.data_ptr(), v.data_ptr() + v.numel() * v.element_size()) for v in scratch
+    ]
+    for value in inputs:
+        begin = value.data_ptr()
+        end = begin + value.numel() * value.element_size()
+        if any(begin < stop and start < end for start, stop in scratch_ranges):
+            raise ValueError("M8 inputs must not alias this handle's output or scratch")
 
 
 class PreparedRouteMerge8:
@@ -131,6 +144,7 @@ class PreparedRouteMerge8:
                 quant_type=aiter.QuantType.per_1x32,
                 gate_mode=GateMode.SEPARATED.value,
             )
+        _check_disjoint((x, ids, route_weights), self.scratch)
         if torch.cuda.current_device() != self.device.index:
             raise ValueError("M8 handle must execute on its weight device")
         stream = torch.cuda.current_stream(self.device)
