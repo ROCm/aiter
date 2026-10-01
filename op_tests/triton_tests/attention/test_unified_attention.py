@@ -884,7 +884,13 @@ def test_triton_unified_attn_gfx942_large_prefill(
         expected_key = f"D_GEQ_{head_size}.Q_GEQ_1024.SHUF.DT_{dt_tag}"
         expected_block_m = 16
     else:
-        expected_key = f"D_GEQ_{head_size}.Q_GEQ_1024.DT_{dt_tag}"
+        # the windowed d512 fp8 composite is a separate SW-scoped entry
+        # without SPLIT_UNMASKED_LOOP (the kernel static-asserts the split
+        # loop off for sliding windows)
+        if sliding_window is not None and head_size == 512 and dt_tag == "fp8_fp8":
+            expected_key = "D_GEQ_512.Q_GEQ_1024.SW.DT_fp8_fp8"
+        else:
+            expected_key = f"D_GEQ_{head_size}.Q_GEQ_1024.DT_{dt_tag}"
         # all composites tuned to M64 (d512 fp8 retuned from M128 to M64
         # with TILE 32 / waves 1 per review measurement)
         expected_block_m = 64
