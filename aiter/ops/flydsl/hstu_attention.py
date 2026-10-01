@@ -638,6 +638,38 @@ def _get_bwd_tuned_config(
     return _bwd_tuned_config_map().get((problem_key, kernel), {})
 
 
+@functools.lru_cache(maxsize=64)
+def _balance_gather_index(B: int, groups: int, device: str) -> torch.Tensor:
+    """Cached round-robin-deal gather index for `_build_balance_perm`.
+
+    The deal is a *fixed* permutation of (B, groups) with no dependence on the
+    sequence lengths, so it is built once per shape instead of once per backward
+    call. The scatter form it replaces,
+
+        slot = (rank % groups) * (B // groups) + (rank // groups)
+        perm[slot] = order
+
+    is equivalent to the gather `perm = order[inv]` with `inv[slot] = rank`, which
+    lets the whole index computation (arange, remainder, mul, floor_divide, add,
+    scatter -- six device ops) collapse to one cached `index_select`.
+
+    Cached by device *string* so one entry per (shape, device) rather than one per
+    tensor, and so a `torch.device` object cannot keep a context alive. B is bounded
+    by the batch sizes a process actually runs, and each entry is 8*B bytes.
+    """
+    rank = torch.arange(B, device=device)
+    slot = (rank % groups) * (B // groups) + (rank // groups)
+    inv = torch.empty_like(rank)
+    inv[slot] = rank
+    return inv
+
+
+@functools.lru_cache(maxsize=64)
+def _identity_perm(B: int, device: str) -> torch.Tensor:
+    """Cached identity perm for the unaligned-batch fallback (read-only)."""
+    return torch.arange(B, dtype=torch.int32, device=device)
+
+
 def _build_balance_perm(
     seq_offsets: torch.Tensor, groups: int = NUM_GRID_GROUPS
 ) -> torch.Tensor:
@@ -653,19 +685,20 @@ def _build_balance_perm(
     Returns an int32 tensor `perm` of length B where `perm[slot]` is the sequence
     that grid slot should process. Falls back to identity when the group
     boundaries don't align to whole batches (B not divisible by `groups`).
+
+    Only the sort is data-dependent; the deal is a fixed permutation of the shape
+    and is cached (see `_balance_gather_index`). That leaves three torch calls --
+    lengths, argsort, gather+cast -- which dispatch 6 device ops rather than 13,
+    since argsort itself expands to a radix sort plus an arange and a memcpy.
     """
     lengths = seq_offsets[1:] - seq_offsets[:-1]
     B = int(lengths.numel())
     device = seq_offsets.device
     if B % groups != 0:
-        return torch.arange(B, dtype=torch.int32, device=device)
-    per = B // groups
+        return _identity_perm(B, str(device))
     order = torch.argsort(lengths, descending=True)  # sequence indices, longest first
-    rank = torch.arange(B, device=device)
-    slot = (rank % groups) * per + (rank // groups)
-    perm = torch.empty(B, dtype=torch.int32, device=device)
-    perm[slot] = order.to(torch.int32)
-    return perm
+    inv = _balance_gather_index(B, groups, str(device))
+    return order[inv].to(torch.int32)
 
 
 # Fallback tiles tried after the per-kernel pick, in descending size order. A
