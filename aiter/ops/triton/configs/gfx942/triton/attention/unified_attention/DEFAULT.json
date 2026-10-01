@@ -106,7 +106,8 @@
       "num_stages": 2,
       "waves_per_eu": 1,
       "TILE_SIZE_MIN": 32,
-      "TILE_SIZE_MAX": 32
+      "TILE_SIZE_MAX": 32,
+      "SPLIT_UNMASKED_LOOP": true
     },
     "D_GEQ_512.Q_GEQ_1024.DT_bf16_bf16": {
       "BLOCK_M": 64,
