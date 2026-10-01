@@ -9,6 +9,9 @@ import aiter
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops import topk
 from aiter.ops.flydsl.kernels.tensor_shim import wave_size_of
+from aiter.ops.flydsl.kernels.topk import (
+    topk_per_row_decode_adaptive as adaptive_kernel,
+)
 from aiter.ops.flydsl.topk import topk_per_row as flydsl_decode_host
 from aiter.ops.flydsl.topk.topk_per_row import _FLYDSL_TOPK_ONE_BLOCK_ARCHES
 from aiter.ops.topk import _FLYDSL_TOPK_DECODE_GATES
@@ -560,6 +563,72 @@ def test_top_k_per_row_decode_bounded_graph(
     }
 
 
+def short_tier_exit_pass(logits: torch.Tensor, top_k: int) -> torch.Tensor:
+    """Per row, the radix pass whose boundary bucket holds exactly the count still
+    needed: 1 or 2, or 3 when only the last pass settles the row."""
+    bits = logits.view(torch.int32).long() & 0xFFFFFFFF
+    key = torch.where(bits >= 1 << 31, 0xFFFFFFFF - bits, bits | 1 << 31)
+    kth = key.topk(top_k, dim=-1).values[:, -1:]
+    exit_pass = torch.full((key.shape[0],), 3, device=key.device)
+    for radix_pass, shift in ((2, 10), (1, 21)):
+        exact = ((key >> shift) >= (kth >> shift)).sum(-1) == top_k
+        exit_pass[exact] = radix_pass
+    return exit_pass
+
+
+@benchmark()
+def test_top_k_per_row_decode_short_rows(
+    batch_size: int, context_len: int, top_k: int, data: str
+) -> dict:
+    """Bounded decode whose rows all fit the single-workgroup short tier, on data
+    that settles a row after the first radix pass (`planted`), mostly after the
+    second (`random`), or only after the last (`ties`)."""
+    short_max = adaptive_kernel.decode_adaptive_short_max(batch_size)
+    seq_lens = torch.randint(
+        top_k + 1,
+        min(short_max, context_len) + 1,
+        (batch_size,),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    width = 4 * context_len
+    if data == "planted":
+        logits = create_planted_logits(seq_lens, width, top_k)
+    else:
+        shape = (batch_size, width)
+        if data == "random":
+            logits = torch.randn(shape, device="cuda")
+        else:
+            logits = torch.randint(0, 50, shape, device="cuda").float()
+        live = torch.arange(width, device="cuda")[None, :] < seq_lens[:, None]
+        logits = torch.where(live, logits, 1e4)
+    indices = torch.empty((batch_size, top_k), dtype=torch.int32, device="cuda")
+    args = (logits, 1, seq_lens, indices, batch_size, *logits.stride())
+
+    _, us = run_top_k_per_row_decode(
+        *args, False, k=top_k, stable=False, max_row_len=context_len
+    )
+    torch.cuda.synchronize()
+
+    row_starts = torch.zeros(batch_size, dtype=torch.int32, device="cuda")
+    live = torch.arange(width, device="cuda")[None, :] < seq_lens[:, None]
+    masked = torch.where(live, logits, float("-inf"))
+    torch_indices = masked.topk(top_k, dim=-1)[1]
+    exits = short_tier_exit_pass(masked[:, : int(seq_lens.max())], top_k)
+
+    return {
+        "backend": topk.decode_backend_for_call(
+            *args, top_k, False, max_row_len=context_len
+        ),
+        "data": data,
+        "exit_passes": "".join(str(p) for p in sorted(set(exits.tolist()))),
+        "all_close": compare_topk_results(
+            masked, indices, torch_indices, row_starts, seq_lens, top_k
+        ),
+        "us": us,
+    }
+
+
 def adaptive_band_cells(card):
     """One bounded cell per band `card` ships, at the band's smallest corner, with
     each k group's members taken in turn across its bands."""
@@ -890,6 +959,24 @@ if card in topk._ADAPTIVE_BANDS_BY_K_GROUP:
         assert (
             df["backend"] == topk.BACKEND_ADAPTIVE
         ).all(), f"{name} decode left the adaptive kernel:\n{df_md}"
+    # The short tier is unordered only, so it runs under the unstable bands.
+    rows, context_len, top_k, _ = next(c for c in adaptive_band_cells(card) if not c[3])
+    torch.manual_seed(0)
+    df = pd.DataFrame(
+        [
+            test_top_k_per_row_decode_short_rows(rows, context_len, top_k, data)
+            for data in ("planted", "random", "ties")
+        ]
+    )
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("topk_per_row_decode short rows summary (markdown):\n%s", df_md)
+    assert df["all_close"].all(), f"short-row decode mismatch:\n{df_md}"
+    assert (
+        df["backend"] == topk.BACKEND_ADAPTIVE
+    ).all(), f"short-row decode left the adaptive kernel:\n{df_md}"
+    assert set("".join(df["exit_passes"])) == set(
+        "123"
+    ), f"short-row decode does not reach every radix pass exit:\n{df_md}"
     test_decode_bound_entry_points(card)
 else:
     aiter.logger.warning(

@@ -140,6 +140,11 @@ SMEM_META_SHORT_THIRD_ABOVE = 4
 SMEM_META_SHORT_THIRD_THRESHOLD = 5
 SMEM_META_SHORT_FRONT_COUNT = 6
 SMEM_META_SHORT_BACK_COUNT = 7
+# Size of the boundary bucket each of the first two passes settled on. When it
+# equals the count still needed, the whole bucket is the rest of the top k.
+SMEM_META_SHORT_FIRST_LEN = 8
+SMEM_META_SHORT_SECOND_LEN = 9
+SMEM_META_SLOTS = 10
 
 
 EARLY_STOP_DEFAULT = True
@@ -358,7 +363,8 @@ def decode_adaptive_config(
     if early_stop is None:
         early_stop = early_stop_default()
     # Left out where the build cannot reach it, which would only split the JIT cache.
-    if early_stop and not ordered and not compact and kw["tier_mode"] != "short":
+    # The short tier reaches it under `compact` too, since it never uses the buffer.
+    if early_stop and not ordered:
         kw["early_stop"] = True
     if decode_adaptive_certificate(seq, parts):
         kw["histogram_certificate"] = True
@@ -451,8 +457,9 @@ def create_topk_per_row_decode_adaptive_kernel(
       is asking to diverge from both.
     - `compact_cap_mult` trades workspace for how often the buffer path is taken,
       never correctness: a row that overflows rescans instead.
-    - `early_stop` is silently dropped under `ordered` or `compact`, which are the
-      two ways the last pass stops being a row walk it can replace.
+    - `early_stop` is silently dropped from the multi-block tiers under `ordered`
+      or `compact`, which are the two ways the last pass stops being a row walk it
+      can replace. The short tier takes it whenever it is compiled in.
     - `mid_cap` / `long_cap` are clamped to `blocks_per_row`.
 
     The module docstring describes what each tier, the candidate buffer and the
@@ -504,6 +511,10 @@ def create_topk_per_row_decode_adaptive_kernel(
         short_tier = False
     else:
         short_tier = tier_mode in ("auto", "short") and bits_per_pass == 11
+    # The short tier reads the row on every pass and never orders, so it can stop
+    # after any pass whose boundary bucket falls whole.
+    short_early_stop = bool(early_stop) and short_tier
+    meta_slots = SMEM_META_SLOTS if short_early_stop else 8
     # Early stop replaces the last pass with one row walk, so it needs that pass to
     # be reading the row: under `ordered` the last pass is what produces the order,
     # and under `compact` it reads the candidate buffer instead.
@@ -579,6 +590,7 @@ def create_topk_per_row_decode_adaptive_kernel(
         f"{'_1wg' if short_tier else ''}"
         f"{'_mf' if mask_non_finite else ''}"
         f"{'_es' if early_stop else ''}"
+        f"{'_ses' if short_early_stop else ''}"
         f"{'_ord' if ordered else ''}"
         f"{f'_cmp{compact_cap_mult}' if compact else ''}"
         f"{f'_fv{compact_fill_vecs}' if compact else ''}"
@@ -593,7 +605,7 @@ def create_topk_per_row_decode_adaptive_kernel(
     class SharedStorage:
         s_hist: fx.Array[fx.Int32, num_buckets, 16]
         s_scan: fx.Array[fx.Int32, red_slots * 2, 16]
-        s_meta: fx.Array[fx.Int32, 8, 16]
+        s_meta: fx.Array[fx.Int32, meta_slots, 16]
         # 0..5 ordered emit carry / run bases; 6..7 compact append carry / overflow
         s_run: fx.Array[fx.Int32, 8 if compact else 6, 16]
         s_own_hist: fx.Array[fx.Int32, num_buckets if ordered else 1, 16]
@@ -646,7 +658,7 @@ def create_topk_per_row_decode_adaptive_kernel(
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         s_hist = lds.s_hist.view(fx.make_layout(num_buckets, 1))
         s_scan = lds.s_scan.view(fx.make_layout((red_slots, 2), (1, red_slots)))
-        s_meta = lds.s_meta.view(fx.make_layout(8, 1))
+        s_meta = lds.s_meta.view(fx.make_layout(meta_slots, 1))
         s_run = lds.s_run.view(fx.make_layout(8 if compact else 6, 1))
         s_own_hist = lds.s_own_hist.view(
             fx.make_layout(num_buckets if ordered else 1, 1)
@@ -1866,7 +1878,7 @@ def create_topk_per_row_decode_adaptive_kernel(
                     fx.memref_store(c_zero, s_hist, fx.Int32(h))
                 gpu.barrier()
 
-            def choose_threshold(target_k, above_slot, threshold_slot):
+            def choose_threshold(target_k, above_slot, threshold_slot, len_slot=None):
                 # Hierarchical inclusive block scan over the 2048-bin histogram;
                 # each thread owns the contiguous bin pair (2*tid, 2*tid+1). The
                 # kth-largest boundary is the first bucket whose inclusive prefix
@@ -1908,6 +1920,8 @@ def create_topk_per_row_decode_adaptive_kernel(
                     if crosses:
                         fx.memref_store(b, s_meta, threshold_slot)
                         fx.memref_store(total - incl, s_meta, above_slot)
+                        if const_expr(len_slot is not None):
+                            fx.memref_store(incl - excl, s_meta, len_slot)
 
                 emit_find(two_tid, excl0, incl0)
                 emit_find(two_tid + c_one, incl0, incl1)
@@ -2000,47 +2014,87 @@ def create_topk_per_row_decode_adaptive_kernel(
                 c_top_k,
                 fx.Int32(SMEM_META_SHORT_FIRST_ABOVE),
                 fx.Int32(SMEM_META_SHORT_FIRST_THRESHOLD),
+                fx.Int32(SMEM_META_SHORT_FIRST_LEN) if short_early_stop else None,
             )
             first_threshold = s_meta[fx.Int32(SMEM_META_SHORT_FIRST_THRESHOLD)]
-
-            # Pass 2: mid 11 bits within the high boundary bucket.
-            clear_hist()
-            reread_pass(lambda cb, v: hist_pass2_chunk(cb, v, first_threshold))
-            gpu.barrier()
-            first_above = s_meta[fx.Int32(SMEM_META_SHORT_FIRST_ABOVE)]
-            need_after_first = c_top_k - first_above
-            choose_threshold(
-                need_after_first,
-                fx.Int32(SMEM_META_SHORT_SECOND_ABOVE),
-                fx.Int32(SMEM_META_SHORT_SECOND_THRESHOLD),
-            )
-            second_threshold = s_meta[fx.Int32(SMEM_META_SHORT_SECOND_THRESHOLD)]
-
-            # Pass 3: low 10 bits within the high+mid boundary.
-            # Bits 10..31 of the key that pass 3 must match, assembled once so the
-            # scan compares one field instead of two digits.
-            high_mid_prefix = arith.shli(first_threshold, c_bin_bits) | second_threshold
-            clear_hist()
-            reread_pass(lambda cb, v: hist_pass3_chunk(cb, v, high_mid_prefix))
-            gpu.barrier()
-            second_above = s_meta[fx.Int32(SMEM_META_SHORT_SECOND_ABOVE)]
-            need_after_second = need_after_first - second_above
-            choose_threshold(
-                need_after_second,
-                fx.Int32(SMEM_META_SHORT_THIRD_ABOVE),
-                fx.Int32(SMEM_META_SHORT_THIRD_THRESHOLD),
-            )
-            third_threshold = s_meta[fx.Int32(SMEM_META_SHORT_THIRD_THRESHOLD)]
-            third_above = s_meta[fx.Int32(SMEM_META_SHORT_THIRD_ABOVE)]
-            num_needed = need_after_second - third_above
+            # A boundary bucket holding exactly the count still needed ends the
+            # selection: every key from the bucket's first one up is top k and none
+            # ties, so the scatter takes the key below it and no boundary slots.
+            # That first key is never zero, since the short tier has row_len > top_k.
+            # The test reads LDS after the scan's barrier, so the workgroup agrees
+            # and the barriers in the passes it skips stay uniform.
+            never = c_one == c_zero
+            first_settled = never
+            kth_signed = c_zero
+            num_needed = c_zero
+            if const_expr(short_early_stop):
+                need_after_first = (
+                    c_top_k - s_meta[fx.Int32(SMEM_META_SHORT_FIRST_ABOVE)]
+                )
+                first_settled = (
+                    s_meta[fx.Int32(SMEM_META_SHORT_FIRST_LEN)] == need_after_first
+                )
+                kth_signed = (arith.shli(first_threshold, c_shift) ^ c_sign_bit) - c_one
+            if ~first_settled:
+                # Pass 2: mid 11 bits within the high boundary bucket.
+                clear_hist()
+                reread_pass(lambda cb, v: hist_pass2_chunk(cb, v, first_threshold))
+                gpu.barrier()
+                if const_expr(not short_early_stop):
+                    need_after_first = (
+                        c_top_k - s_meta[fx.Int32(SMEM_META_SHORT_FIRST_ABOVE)]
+                    )
+                choose_threshold(
+                    need_after_first,
+                    fx.Int32(SMEM_META_SHORT_SECOND_ABOVE),
+                    fx.Int32(SMEM_META_SHORT_SECOND_THRESHOLD),
+                    fx.Int32(SMEM_META_SHORT_SECOND_LEN) if short_early_stop else None,
+                )
+                second_threshold = s_meta[fx.Int32(SMEM_META_SHORT_SECOND_THRESHOLD)]
+                # Bits 10..31 of the key that pass 3 must match, assembled once so
+                # the scan compares one field instead of two digits.
+                high_mid_prefix = (
+                    arith.shli(first_threshold, c_bin_bits) | second_threshold
+                )
+                second_settled = never
+                if const_expr(short_early_stop):
+                    need_after_second = (
+                        need_after_first
+                        - s_meta[fx.Int32(SMEM_META_SHORT_SECOND_ABOVE)]
+                    )
+                    second_settled = (
+                        s_meta[fx.Int32(SMEM_META_SHORT_SECOND_LEN)]
+                        == need_after_second
+                    )
+                    kth_signed = (
+                        arith.shli(high_mid_prefix, c_low_bits) ^ c_sign_bit
+                    ) - c_one
+                if ~second_settled:
+                    # Pass 3: low 10 bits within the high+mid boundary.
+                    clear_hist()
+                    reread_pass(lambda cb, v: hist_pass3_chunk(cb, v, high_mid_prefix))
+                    gpu.barrier()
+                    if const_expr(not short_early_stop):
+                        need_after_second = (
+                            need_after_first
+                            - s_meta[fx.Int32(SMEM_META_SHORT_SECOND_ABOVE)]
+                        )
+                    choose_threshold(
+                        need_after_second,
+                        fx.Int32(SMEM_META_SHORT_THIRD_ABOVE),
+                        fx.Int32(SMEM_META_SHORT_THIRD_THRESHOLD),
+                    )
+                    third_threshold = s_meta[fx.Int32(SMEM_META_SHORT_THIRD_THRESHOLD)]
+                    third_above = s_meta[fx.Int32(SMEM_META_SHORT_THIRD_ABOVE)]
+                    num_needed = need_after_second - third_above
+                    # The three settled digits are the three fields of one key.
+                    # Biasing it the way `signed_key` biases an element turns the
+                    # scatter's ranking test into a single compare.
+                    kth_signed = (
+                        arith.shli(high_mid_prefix, c_low_bits) | third_threshold
+                    ) ^ c_sign_bit
 
             # Final phase: direct atomic-append write (LDS counters only).
-            # The three settled digits are the three fields of one key. Biasing it
-            # the way `signed_key` biases an element turns the scatter's ranking
-            # test into a single compare.
-            kth_signed = (
-                arith.shli(high_mid_prefix, c_low_bits) | third_threshold
-            ) ^ c_sign_bit
             reread_pass(
                 lambda cb, v: final_scatter_chunk(cb, v, kth_signed, num_needed)
             )
