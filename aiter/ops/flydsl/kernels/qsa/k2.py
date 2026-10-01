@@ -1311,6 +1311,22 @@ def qsa_k2_serves(
         return f"k_cache must be [pages, page_size, H, D], got {tuple(k_cache.shape)}"
     if k_cache.shape[3] != q.shape[2]:
         return f"k_cache D must be q's {q.shape[2]}, got {k_cache.shape[3]}"
+    # The same geometries build_qsa_k2_module rejects. BLOCK_N, the workgroup,
+    # and the split count come from _launch_config inside that builder's
+    # ranges, so they are not properties of these tensors. A reason here is
+    # what keeps auto on Triton instead of launching a compile that raises.
+    n_q_heads = int(q.shape[1])
+    n_kv_heads = int(k_cache.shape[2])
+    head_dim = int(q.shape[2])
+    page_size = int(k_cache.shape[1])
+    if n_kv_heads < 1 or n_q_heads % n_kv_heads:
+        return f"{n_q_heads} query heads do not group over {n_kv_heads} KV heads"
+    if n_q_heads // n_kv_heads > 16:
+        return f"group must fit one MFMA M dim, got {n_q_heads // n_kv_heads}"
+    if head_dim % 32:
+        return f"head_dim must be a multiple of 32, got {head_dim}"
+    if page_size < 1:
+        return f"page_size must be positive, got {page_size}"
     # Paged caches are read in place. A K|V-interleaved view (vLLM's
     # [pages, page_size, H, 2 * D] split in two) is fine; a copy is not.
     if k_cache.stride(3) != 1 or v_cache.stride(3) != 1:
