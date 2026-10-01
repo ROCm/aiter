@@ -17,12 +17,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from aiter.ops.triton._triton_kernels.chunk_delta_attn import chunk_delta_attn_fwd
-from aiter.ops.triton._triton_kernels.chunk_delta_attn.gate import beta_sigmoid_fwd
-from aiter.ops.triton._triton_kernels.chunk_delta_attn.utils.cumsum import (
+from aiter.ops.triton._triton_kernels.kimi_delta_attn import chunk_delta_attn_fwd
+from aiter.ops.triton._triton_kernels.kimi_delta_attn.gate import beta_sigmoid_fwd
+from aiter.ops.triton._triton_kernels.kimi_delta_attn.utils.cumsum import (
     chunk_gate_cumsum,
 )
-from aiter.ops.triton._triton_kernels.chunk_delta_attn.utils.l2norm import l2norm_fwd
+from aiter.ops.triton._triton_kernels.kimi_delta_attn.utils.l2norm import l2norm_fwd
 from op_tests.triton_tests.utils.kda_ref import chunk_kda_ref
 
 device = "cuda"
