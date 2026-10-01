@@ -290,7 +290,9 @@ class CaseFailure(AssertionError):
     pass
 
 
-def new_layer(shape, wt, ctx, mode, max_local_tokens, comm_dtype="fp8"):
+def new_layer(
+    shape, wt, ctx, mode, max_local_tokens, comm_dtype="fp8", ar_gather="bf16"
+):
     beta = situ(shape)
     cfg = MegaMoeTPConfig(
         rank=ctx.rank,
@@ -305,6 +307,7 @@ def new_layer(shape, wt, ctx, mode, max_local_tokens, comm_dtype="fp8"):
         linear_beta=beta[1] if beta else None,
         comm_mode=mode,
         comm_dtype=comm_dtype,
+        ar_gather=ar_gather,
     )
     return MegaMoeTP(
         cfg,
@@ -339,17 +342,23 @@ def check(y, c: Case, rtol, what="fused vs torch"):
     return e
 
 
-def rtol_of(args, comm_dtype):
+def rtol_of(args, comm_dtype, ar_gather="bf16"):
+    if ar_gather == "fp8":
+        return args.rtol_ag8
     return args.rtol if comm_dtype == "fp8" else args.rtol_bf16
 
 
-def case_accuracy(shape, wt, ctx, args, mode, tokens, kind, comm_dtype="fp8"):
-    layer = new_layer(shape, wt, ctx, mode, args.max_local_tokens, comm_dtype)
+def case_accuracy(
+    shape, wt, ctx, args, mode, tokens, kind, comm_dtype="fp8", ar_gather="bf16"
+):
+    layer = new_layer(
+        shape, wt, ctx, mode, args.max_local_tokens, comm_dtype, ar_gather
+    )
     worst = 0.0
     for s in range(args.seeds if kind != "balanced" else 1):
         c = make_case(shape, wt, ctx, mode, tokens, kind, args.seed + 1000 * s + tokens)
         y = call(layer, c).clone()
-        worst = max(worst, check(y, c, rtol_of(args, comm_dtype)))
+        worst = max(worst, check(y, c, rtol_of(args, comm_dtype, ar_gather)))
         if mode in ("ar", "ar_ar") and not identical_across_ranks(y):
             raise CaseFailure("all-reduce output differs across ranks")
     return worst
@@ -555,6 +564,20 @@ def run_model(name, ctx, args, results):
                     "random",
                     cd,
                 )
+        if mode in ("ar", "ar_ar"):
+            tokens = args.tokens[-1]
+            run(
+                f"{name} {mode} M={tokens} random ar_gather fp8",
+                ctx,
+                results,
+                case_accuracy,
+                *common,
+                mode,
+                tokens,
+                "random",
+                "fp8",
+                "fp8",
+            )
         for what, fn in (
             ("varying m", case_varying_m),
             ("new / freed layers", case_layers),
@@ -584,6 +607,9 @@ def main(argv=None) -> int:
     p.add_argument("--rtol", type=float, default=0.045, help="fp8 comm: fused vs torch")
     p.add_argument(
         "--rtol-bf16", type=float, default=0.01, help="bf16 comm: fused vs torch"
+    )
+    p.add_argument(
+        "--rtol-ag8", type=float, default=0.05, help="ar_gather fp8: fused vs torch"
     )
     p.add_argument("--seed", type=int, default=123)
     args = p.parse_args(argv)

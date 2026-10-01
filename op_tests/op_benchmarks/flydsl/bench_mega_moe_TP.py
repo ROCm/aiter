@@ -96,6 +96,8 @@ from aiter.utility import fp4_utils
 logger = logging.getLogger("aiter")
 
 SUPPORTED_GFX = ("gfx950",)
+# every rank holds every token (and its routing)
+REPLICATED = ("rs", "ar", "ar_ar")
 QUANT_TYPE = aiter.QuantType.per_1x32
 AQ_DTYPE = dtypes.fp4x2
 WQ_DTYPE = dtypes.fp4x2
@@ -334,7 +336,7 @@ def make_inputs(
             f"global tokens={global_tokens} must be divisible by TP={tp_size}"
         )
     m = global_tokens // tp_size
-    ar = comm_mode in ("ar", "ar_ar")
+    ar = comm_mode in REPLICATED
     E, K = shape.experts, shape.topk
     if ar:
         rows = global_tokens
@@ -723,6 +725,10 @@ class SplitTpMoeAR(SplitTpMoe):
     def __call__(self, inputs: TpMoeInputs) -> torch.Tensor:
         plan, w_all, i_all, sorted_ret, a1, a1_scale = self.steps(inputs)
         partial = self.gemms(a1, a1_scale, w_all, i_all, sorted_ret, plan)
+        if inputs.comm_mode == "rs":
+            return self.comm.reduce_scatter(
+                partial.contiguous(), out=self._y[: inputs.local_tokens]
+            )
         return self.comm.all_reduce(partial, out=self._yall[: inputs.global_tokens])
 
 
@@ -736,6 +742,7 @@ class MegaMoeTP:
         group=None,
         comm_mode="ag_rs",
         comm_dtype="fp8",
+        ar_gather="bf16",
     ):
         shape = weights.shape
         situ = _situ(shape)
@@ -752,6 +759,7 @@ class MegaMoeTP:
             linear_beta=situ[1] if situ else None,
             comm_mode=comm_mode,
             comm_dtype=comm_dtype,
+            ar_gather=ar_gather,
         )
         self.engine = MegaMoeTPLayer(
             config,
@@ -814,7 +822,7 @@ def torch_partial(
 def torch_reference(
     weights, ctx, inputs: TpMoeInputs, gather: TokenGather
 ) -> torch.Tensor:
-    if inputs.comm_mode in ("ar", "ar_ar"):
+    if inputs.comm_mode in REPLICATED:
         xs = inputs.x_local.float()
         if inputs.comm_mode == "ar_ar":
             dist.all_reduce(xs)
@@ -1010,7 +1018,7 @@ def _time_graph(impl, inputs, args, ctx) -> tuple[float, torch.Tensor | None]:
 
 def run_case(shape, weights, ctx, args, global_tokens, max_local_tokens) -> dict:
     tp = args.tp
-    ar = args.comm_mode in ("ar", "ar_ar")
+    ar = args.comm_mode in REPLICATED
     inputs = make_inputs(
         shape, ctx, tp, global_tokens, args.seed, args.route, args.comm_mode
     )
@@ -1055,6 +1063,7 @@ def run_case(shape, weights, ctx, args, global_tokens, max_local_tokens) -> dict
             max_local_tokens,
             comm_mode=args.comm_mode,
             comm_dtype=args.comm_dtype,
+            ar_gather=args.ar_gather,
         )
         gate(
             row,
@@ -1274,7 +1283,7 @@ def _sp_time_graph(devices, fn, args) -> tuple[float, list | None]:
 
 def _sp_reference(weights, ctxs, inputs, global_tokens):
     dev0 = ctxs[0].device
-    if inputs[0].comm_mode in ("ar", "ar_ar"):
+    if inputs[0].comm_mode in REPLICATED:
         if inputs[0].comm_mode == "ar_ar":
             x_all = sum(i.x_local.float().to(dev0) for i in inputs).to(dtypes.bf16)
         else:
@@ -1314,7 +1323,7 @@ def run_case_sp(
         )
         for c in ctxs
     ]
-    split_cls = SplitTpMoeAR if args.comm_mode in ("ar", "ar_ar") else SplitTpMoe
+    split_cls = SplitTpMoeAR if args.comm_mode in REPLICATED else SplitTpMoe
     split = []
     for r, c in enumerate(ctxs):
         with torch.cuda.device(c.device):
@@ -1356,6 +1365,7 @@ def run_case_sp(
                         group=group,
                         comm_mode=args.comm_mode,
                         comm_dtype=args.comm_dtype,
+                        ar_gather=args.ar_gather,
                     )
                 )
         _sp_run(devices, lambda r: fused[r](inputs[r]))
@@ -1542,10 +1552,11 @@ def parse_args(argv=None):
     )
     p.add_argument(
         "--comm-mode",
-        choices=["ag_rs", "ar", "ar_ar"],
+        choices=["ag_rs", "rs", "ar", "ar_ar"],
         default="ag_rs",
-        help="ag_rs: AllGather before, ReduceScatter after; ar: AllReduce after "
-        "(input replicated); ar_ar: AllReduce of input partials and output.",
+        help="ag_rs: AllGather before, ReduceScatter after; rs: ReduceScatter after "
+        "(input replicated); ar: AllReduce after (input replicated); ar_ar: AllReduce "
+        "of input partials and output.",
     )
     p.add_argument("--impl", choices=["unfused", "fused", "both"], default="both")
     p.add_argument(
@@ -1553,6 +1564,12 @@ def parse_args(argv=None):
         choices=["fp8", "bf16"],
         default="fp8",
         help="fused: dtype of the reduce partials and route rows.",
+    )
+    p.add_argument(
+        "--ar-gather",
+        choices=["bf16", "fp8"],
+        default="bf16",
+        help="fused ar / ar_ar: dtype of the all-reduce's gathered rows.",
     )
     p.add_argument(
         "--route",

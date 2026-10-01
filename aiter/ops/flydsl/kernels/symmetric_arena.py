@@ -8,6 +8,7 @@ import contextlib
 import ctypes
 import functools
 import os
+import warnings
 from dataclasses import dataclass, field
 
 import torch
@@ -46,6 +47,54 @@ def _hip():
         ctypes.c_void_p,
     ]
     return lib
+
+
+_MORI_RANK_STRIDE = 1 << 32
+# one mori CCO communicator per process group: (group id) -> Communicator
+_MORI_COMMS: dict = {}
+
+
+class _DeviceBytes:
+    def __init__(self, ptr: int, nbytes: int):
+        self.__cuda_array_interface__ = {
+            "shape": (nbytes,),
+            "typestr": "|u1",
+            "data": (ptr, False),
+            "version": 3,
+        }
+
+
+def _clear_hip_error() -> None:
+    # mori's allocator probes HIP features and leaves the failure in
+    # hipGetLastError, which the next torch launch check would report
+    _hip().hipGetLastError()
+
+
+def _mori_comm(group, rank: int, world_size: int):
+    comm = _MORI_COMMS.get(id(group))
+    if comm is None:
+        # intra-node only: without these, window allocation probes fabric /
+        # GPU-direct RDMA handles and hipMemCreate fails on hosts lacking them
+        os.environ.setdefault("MORI_CCO_FABRIC_DISABLE", "1")
+        os.environ.setdefault("CCO_GDR_CAPABLE", "0")
+        from mori.cco import Communicator
+
+        uid = [Communicator.get_unique_id() if rank == 0 else None]
+        dist.broadcast_object_list(
+            uid, src=dist.get_global_rank(group, 0) if group else 0, group=group
+        )
+        comm = _MORI_COMMS[id(group)] = Communicator.init(
+            world_size, rank, uid[0], per_rank_vmm=_MORI_RANK_STRIDE
+        )
+        _clear_hip_error()
+    return comm
+
+
+def _backend() -> str:
+    name = os.environ.get("AITER_SYMM_BACKEND", "ipc")
+    if name not in ("ipc", "mori"):
+        raise ValueError(f"AITER_SYMM_BACKEND must be ipc or mori, not {name!r}")
+    return name
 
 
 def _check(status: int, what: str) -> None:
@@ -151,6 +200,8 @@ class SymmetricArena:
         self._storage: torch.Tensor | None = None
         self._base_ptrs: tuple[int, ...] = ()
         self._opened: list[bytes] = []
+        self.backend = _backend() if self.ipc else "p2p"
+        self._mori: tuple = ()
 
     def reserve(self, name: str, shape, dtype: torch.dtype) -> SymmetricSlice:
         """Carve out a named region. Must run in the same order on every rank."""
@@ -165,6 +216,10 @@ class SymmetricArena:
 
     def commit(self) -> SymmetricArena:
         total = (self._cursor + _ALIGN - 1) // _ALIGN * _ALIGN
+        if self.backend == "mori":
+            if self._commit_mori(total):
+                return self
+            self.backend = "ipc"
         with _no_expandable_segments() if self.ipc else contextlib.nullcontext():
             self._storage = torch.zeros(total, dtype=torch.uint8, device=self.device)
         base_ptr = int(self._storage.data_ptr())
@@ -202,8 +257,62 @@ class SymmetricArena:
         dist.barrier(group=self.group)
         return self
 
+    def _commit_mori(self, total: int) -> bool:
+        """mori CCO window: every rank's arena at flat_base + rank * 4 GiB.
+
+        False (nothing allocated, on every rank) when any rank's window fails:
+        on ROCm 7.1 hipMemCreate of an exportable VMM block of a few hundred
+        MB can fail with "out of memory" while plenty is free.
+        """
+        with torch.cuda.device(self.device):
+            comm = _mori_comm(self.group, self.rank, self.world_size)
+            mem, err = None, ""
+            try:
+                mem = comm.alloc_mem(total)
+            except RuntimeError as exc:
+                err = str(exc)
+            _clear_hip_error()
+            errs = [None] * self.world_size
+            dist.all_gather_object(errs, err, group=self.group)
+            if any(errs):
+                if mem is not None:
+                    mem.close()
+                bad = [r for r, e in enumerate(errs) if e]
+                warnings.warn(
+                    f"mori window of {total} B failed on ranks {bad} ({errs[bad[0]]}); "
+                    "using hipIpc for this arena"
+                )
+                return False
+            win = comm.register_window(mem.ptr, total)
+            _clear_hip_error()
+            self._mori = (win, mem)
+            self._storage = torch.as_tensor(
+                _DeviceBytes(mem.ptr, total), device=self.device
+            )
+            self._storage.zero_()
+        for s in self._slices.values():
+            s.local = (
+                self._storage[s.offset : s.offset + s.nbytes]
+                .view(s.dtype)
+                .view(s.shape)
+            )
+        flat = win.local_ptr - self.rank * _MORI_RANK_STRIDE
+        self._base_ptrs = tuple(
+            flat + r * _MORI_RANK_STRIDE for r in range(self.world_size)
+        )
+        torch.cuda.synchronize(self.device)
+        dist.barrier(group=self.group)
+        return True
+
     def close(self) -> None:
         """Unmap the peers' arenas (no kernel may use them any more)."""
+        if self._mori:
+            torch.cuda.synchronize(self.device)
+            self._storage = None
+            for res in self._mori:
+                res.close()
+            self._mori = ()
+            self._base_ptrs = ()
         if self._opened:
             torch.cuda.synchronize(self.device)
             for handle in self._opened:

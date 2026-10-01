@@ -184,6 +184,7 @@ class MegaMoeTPEngine:
         swiglu_limit: float | None = None,
         comm_mode: str = "ag_rs",
         comm_dtype: str = "fp8",
+        ar_gather: str = "bf16",
         group=None,
         device: torch.device | None = None,
     ):
@@ -196,12 +197,16 @@ class MegaMoeTPEngine:
         if comm_dtype not in ("fp8", "bf16"):
             raise ValueError(f"unknown comm_dtype {comm_dtype!r}")
         self.comm_bf16 = comm_dtype == "bf16"
+        if ar_gather not in ("bf16", "fp8"):
+            raise ValueError(f"unknown ar_gather {ar_gather!r}")
+        self.ag_fp8 = ar_gather == "fp8"
         if not 1 <= topk <= experts or max_local_tokens < 1:
             raise ValueError(
                 f"need 1 <= topk ({topk}) <= experts ({experts}), max_local_tokens >= 1"
             )
         self.mode = comm_mode
         self.check = os.environ.get("AITER_MEGAMOE_TP_CHECK", "0") == "1"
+        self.dx = os.environ.get("AITER_MEGAMOE_TP_DX", "1") == "1"
         self.ar = comm_mode in ("ar", "ar_ar")
         self.xrep = comm_mode in ("ar", "rs")
         # inputs and routing of every token on every rank
@@ -300,7 +305,7 @@ class MegaMoeTPEngine:
                 dtype=torch.uint8,
                 device=self.device,
             )
-            if self.sched.xsplit
+            if self.sched.xsplit or self.dx
             else None
         )
         key = (
@@ -577,6 +582,9 @@ class MegaMoeTPEngine:
         sc = self._cfg_sched(cfg)
         return self.ar and cfg.ll and cfg.llr and (cfg.dyn or sc.npieces <= 1)
 
+    def _ag8(self, cfg: LaunchCfg) -> bool:
+        return self.ar and self.ag_fp8 and not self._arll(cfg)
+
     def _xl(self, cfg: LaunchCfg) -> bool:
         return not cfg.dyn and not cfg.ll and self._cfg_sched(cfg).xl_e0 > 0
 
@@ -620,6 +628,8 @@ class MegaMoeTPEngine:
                 xl_s0=sc.xl_s0 if self._xl(cfg) else 0,
                 comm_bf16=self.comm_bf16,
                 xrep=self.xrep,
+                ag8=self._ag8(cfg),
+                dx=self.dx and cfg.dyn and cfg.ll and cfg.llr,
                 **static,
             )
             self._launchers[cfg] = fn
@@ -778,7 +788,7 @@ class MegaMoeTPEngine:
         cfg = self.config(m)
         # output written in place: ag_rs / rs, and ar when the all-reduce ends
         # locally (one-shot LL); else it lands in the peers' symmetric buffer
-        local_y = not self.ar or self._arll(cfg)
+        local_y = not self.ar or self._arll(cfg) or self._ag8(cfg)
         y = out if out is not None and local_y else self.y
         key = (m, x.data_ptr(), ids.data_ptr(), tw.data_ptr(), y.data_ptr(), cfg)
         if self._args[0] != key:

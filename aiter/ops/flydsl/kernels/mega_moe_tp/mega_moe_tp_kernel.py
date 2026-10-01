@@ -228,6 +228,7 @@ C_DYNP = 45
 C_CDONE = 46
 C_COLJ = 47
 C_UNIT = 48
+C_DXON = 54
 C_CLAIM = 56
 C_XC, C_XC_N = 64, 32
 C_UL = 96
@@ -264,6 +265,8 @@ def compile_mega_moe_tp(
     xl_s0: int = 0,
     comm_bf16: bool = False,
     xrep: bool = False,
+    ag8: bool = False,
+    dx: bool = False,
 ):
     """Build the launcher for one (shape, variant) instance.
 
@@ -281,6 +284,12 @@ def compile_mega_moe_tp(
         (each rank quantizes and all-gathers its 1/tp of the rows); with ar
         this is the standard TP layer (only the output is all-reduced), without
         it the output is reduce-scattered.
+    ag8: all-reduce whose second hop (owner -> every rank) carries MXFP8 rows
+        (else bf16); every rank decodes them into ``y``.
+    dx: (dynamic schedule, LL route rows) when the units overflow the CTAs by
+        at most half a round, every unit only runs GEMM1 and exports its
+        quantized intermediate; the GEMM2 column halves of all units are then
+        claimed by whichever CTAs are free.
     """
     DYN = dyn_e > 0
     if swiglu_limit is None:
@@ -317,6 +326,18 @@ def compile_mega_moe_tp(
     AIN = bool(ar) and not XREP
     MLL = DLL and not RREP
     ARLL = DLL and bool(ar)
+    AG8 = bool(ag8) and bool(ar) and not ARLL
+
+    def _g2_step(n):
+        nsk2 = _nsk2_for(n, G2)
+        return nsk2 * n // math.gcd(nsk2, n) // n
+
+    # GEMM2 column halves of a DX unit, in groups of NW * 64 columns: a
+    # multiple of every piece width's group step (the second may be shorter)
+    DX_STEP = math.lcm(*[_g2_step(KS2 // q) for q in DYN_PS]) if DYN else G2
+    DX_CG = ((G2 + 1) // 2 + DX_STEP - 1) // DX_STEP * DX_STEP
+    DX_NG = (G2 + DX_CG - 1) // DX_CG
+    DX = bool(dx) and DYN and DLL and KS2 <= XQ_P and G2 % DX_STEP == 0
     ROW_B = 2 * H if DLL else (H + H // 32 if FP8R else 2 * H)
     XSPLIT = xsplit > 0
     assert not XSPLIT or (xw % gemm2_group_step(H, I) == 0 and xw % GPC == 0)
@@ -346,6 +367,8 @@ def compile_mega_moe_tp(
         + (f"_xl{xl_s0}" if XL else "")
         + ("_cb16" if CB16 else "")
         + ("_xrep" if XREP else "")
+        + ("_ag8" if AG8 else "")
+        + (f"_dx{DX_NG}" if DX else "")
     )
     const_expr = fx.const_expr
     # flydsl's cache key ignores module constants: the kernel references this tag
@@ -1481,8 +1504,13 @@ def compile_mega_moe_tp(
                     unit_tile_x(L, tid, a, expert, i0, icnt, kind, r0, rows, R)
                 else:
                     sig = (u == ue - i32(1)) & (r0 + i32(RG) >= R)
-                    unit_tile(L, tid, a, expert, i0, icnt, r0, rows, sig)
+                    if const_expr(DX):
+                        unit_tile_dx(L, tid, a, expert, i0, icnt, kind, r0, rows, sig)
+                    else:
+                        unit_tile(L, tid, a, expert, i0, icnt, r0, rows, sig)
                 cbar(L, tid)
+            if const_expr(DX):
+                _dx_flag(a, tid, kind)
             if const_expr(XSPLIT):
                 _xq_flag(a, tid, i0, icnt, kind)
                 if const_expr(not DLL):
@@ -1499,8 +1527,112 @@ def compile_mega_moe_tp(
             col_claim(L, tid, a)
             for it_ in range(i32(0), cap, i32(1)):
                 _col_unit(L, tid, a, i32(it_) < cap - i32(1))
+        if const_expr(DX):  # noqa: SIM102 (compile-time guard)
+            if lds_ld_i32(L, L_CTL + C_DXON * 4) != i32(0):
+                dx_cols(L, tid, a)
         if const_expr(DLL):
             _cdone(tid, L)
+
+    @traced
+    def unit_tile_dx(L, tid, a, expert, i0, icnt, kind, r0, rows, sig):
+        if (kind & i32(0xFF)) == i32(UNIT_G1X):
+            gemm1(L, tid, a, expert, i0, icnt // i32(128))
+            xq_export(L, tid, a, i0, icnt, r0, rows)
+        else:
+            unit_tile(L, tid, a, expert, i0, icnt, r0, rows, sig)
+
+    def _dx_flag_addr(a, j, s):
+        return ctrl_at(a, i32(CTRL_XQ) + j * i32(XQ_P) + s)
+
+    @traced
+    def _dx_flag(a, tid, kind):
+        if ((kind & i32(0xFF)) == i32(UNIT_G1X)) & (tid == i32(0)):
+            j = kind.shrui(i32(XQ_SHIFT))
+            g_st_sys(_dx_flag_addr(a, j, kind.shrui(i32(8)) & i32(0xFF)), a["epoch"])
+
+    @traced
+    def dx_cols(L, tid, a):
+        # bounded like the static column claims: at most twice the mean per CTA
+        P = lds_ld_i32(L, L_CTL + C_DYNP * 4)
+        ncol = lds_ld_i32(L, L_CTL + C_NACT * 4) * P * i32(DX_NG)
+        nblk = i32(gpu.grid_dim.x)
+        cap = (ncol + nblk - i32(1)) // nblk * i32(2) + i32(2)
+        col_claim(L, tid, a)
+        for it_ in range(i32(0), cap, i32(1)):
+            _dx_col(L, tid, a, ncol, P, i32(it_) < cap - i32(1))
+
+    @traced
+    def _dx_col(L, tid, a, ncol, P, more):
+        c = lds_ld_i32(L, L_CTL + C_CLAIM * 4)
+        if c < ncol:
+            u = c // i32(DX_NG)
+            g = c - u * i32(DX_NG)
+            j = u // P
+            s = u - j * P
+            expert = lds_ld_i32(L, L_DYN + (i32(2 * NBW) + j) * i32(4))
+            if tid == i32(0):
+                spin_sys_ge(_dx_flag_addr(a, j, s), a["epoch"], a)
+            cbar(L, tid)
+            R = gather_routes(L, tid, a["ids"], a["tw"], a["ttot"], expert)
+            for r0_ in range(i32(0), R, i32(RG)):
+                r0 = i32(r0_)
+                _dx_gemm2(L, tid, a, expert, P, s, g, r0, fx.min(R - r0, i32(RG)))
+                cbar(L, tid)
+            if more:
+                col_claim(L, tid, a)
+
+    @traced
+    def _dx_gemm2(L, tid, a, expert, P, s, g, r0, rows):
+        for q in DYN_PS:
+            if P == i32(q):
+                icnt = I // q
+                i0 = s * i32(icnt)
+                gemm2(
+                    L,
+                    tid,
+                    a,
+                    expert,
+                    s * i32(KS2 // q),
+                    r0,
+                    rows,
+                    fx.Boolean(False),
+                    KS2 // q,
+                    s,
+                    g * i32(DX_CG),
+                    fx.min((g + i32(1)) * i32(DX_CG), i32(G2)),
+                    pre=functools.partial(xq_import_dx, L, tid, a, i0, icnt, r0, rows),
+                )
+
+    @traced
+    def xq_import_dx(L, tid, a, i0, icnt, r0, rows):
+        ag_stage_free(L, tid % i32(64), a)
+        cbar(L, tid)
+        u16 = icnt // 32
+        rx, rxs = xg_rs(a)
+        for q_ in range(tid, rows * i32(u16), i32(NT)):
+            q = i32(q_)
+            row = q // i32(u16)
+            c = q - row * i32(u16)
+            rix = lds_ld_i32(L, L_RIX + (r0 + row) * i32(4))
+            v = bld(rx, rix * i32(I // 2) + i0 // i32(2) + c * i32(16), 0, V4I, AUX_SYS)
+            lds_st(L, i32(L_INTER) + row * i32(SI_STRIDE) + c * i32(16), v, 16)
+        nsd = icnt // 128
+        for q_ in range(tid, rows * i32(nsd), i32(NT)):
+            q = i32(q_)
+            row = q // i32(nsd)
+            c = q - row * i32(nsd)
+            rix = lds_ld_i32(L, L_RIX + (r0 + row) * i32(4))
+            sv = fx.Int32(
+                bld(
+                    rxs,
+                    rix * i32(I // 32) + i0 // i32(32) + c * i32(4),
+                    0,
+                    T.i32,
+                    AUX_SYS,
+                )
+            )
+            lds_st(L, i32(L_INTERS) + row * i32(I // 32) + c * i32(4), sv)
+        cbar(L, tid)
 
     @traced
     def _cdone(tid, L):
@@ -1564,6 +1696,12 @@ def compile_mega_moe_tp(
             u_lo = bid * U // C
             u_hi = (bid + i32(1)) * U // C
             icnt = i32(I) // P
+            use_x = fx.Boolean(False)
+            if const_expr(DX):
+                # one full round and a tail of at most half a round: GEMM2 of
+                # the units moves off their CTAs to the ones the tail leaves idle
+                use_x = (U > C) & ((U - C) * i32(2) <= C) & (nact <= i32(XQ_MAX))
+                lds_st(L, L_CTL + C_DXON * 4, use_x.select(i32(1), i32(0)))
             for u_ in range(u_lo, u_hi, i32(1)):
                 u = i32(u_)
                 j = u // P
@@ -1571,7 +1709,8 @@ def compile_mega_moe_tp(
                 lds_st(L, ul, lds_ld_i32(L, L_DYN + (i32(2 * NBW) + j) * i32(4)))
                 lds_st(L, ul + i32(4), (u - j * P) * icnt)
                 lds_st(L, ul + i32(8), icnt)
-                lds_st(L, ul + i32(12), i32(0))
+                kind = i32(UNIT_G1X) | ((u - j * P) << i32(8)) | (j << i32(XQ_SHIFT))
+                lds_st(L, ul + i32(12), use_x.select(kind, i32(0)))
             lds_st(L, L_CTL + C_DYNP * 4, P)
             lds_st(L, L_CTL + C_UNIT * 4, i32(0))
             lds_st(L, L_CTL + (C_UNIT + 1) * 4, u_hi - u_lo)
@@ -2017,7 +2156,7 @@ def compile_mega_moe_tp(
                         )
                     for p in range_constexpr(MAX_TP):
                         acc = sum_live(acc, fp8x8_decode(lds_[p]), i32(p) < a["tp"])
-                _y_store(a, row, c0, v, pack_bf16x8(acc))
+                _y_store(a, row, c0, v, acc)
 
     @traced
     def _final_ll(tid, a, r_recv, row, c0, v, vc):
@@ -2034,10 +2173,17 @@ def compile_mega_moe_tp(
         acc = [fx.Float32(0.0)] * 8
         for p in range_constexpr(MAX_TP):
             acc = sum_live(acc, ll_vals(pk[p]), i32(p) < a["tp"])
-        _y_store(a, row, c0, v, pack_bf16x8(acc))
+        _y_store(a, row, c0, v, acc)
 
     @traced
-    def _y_store(a, row, c0, v, o):
+    def _y_store(a, row, c0, v, acc):
+        if const_expr(AG8):
+            _y_store_ag8(a, row, c0, v, acc)
+        else:
+            _y_store_bf16(a, row, c0, v, pack_bf16x8(acc))
+
+    @traced
+    def _y_store_bf16(a, row, c0, v, o):
         if v < i32(CW // 8):
             if const_expr(AR):
                 off = ((a["rank"] * a["m"] + row) * i32(H) + c0 + v * i32(8)) * i32(2)
@@ -2045,6 +2191,70 @@ def compile_mega_moe_tp(
                     bst(o, peer_rs(a, p, "off_yall"), off, 0, AUX_SYS)
             else:
                 bst(o, rsrc(a["y"]), (row * i32(H) + c0 + v * i32(8)) * i32(2), 0, 0)
+
+    def ag8_offs(a, grow, col):
+        soff = a["tp"] * a["mmax"] * i32(H) + grow * i32(H // 32) + col // i32(32)
+        return grow * i32(H) + col, soff
+
+    @traced
+    def _y_store_ag8(a, row, c0, v, acc):
+        # the owner's final row: MXFP8 to the peers (decoded there by
+        # ag8_convert) and decoded here, so every rank holds the same bf16
+        col = c0 + v * i32(8)
+        grow = a["rank"] * a["m"] + row
+        am = amax(acc)
+        am = am.maximumf(am.shuffle_xor(i32(1), i32(64)))
+        am = am.maximumf(am.shuffle_xor(i32(2), i32(64)))
+        e8, qs = _e8m0_from_amax(am, max_norm=448.0)
+        d0, d1 = fp8x4_pack(acc[0:4], qs), fp8x4_pack(acc[4:8], qs)
+        e8i = fx.Int32(e8) & i32(0xFF)
+        e = e8i.bitcast(fx.Float32)
+        sc = e8i
+        for k in range_constexpr(1, 4):
+            sc = sc | (
+                e.shuffle_xor(i32(4 * k), i32(64)).bitcast(fx.Int32) << i32(8 * k)
+            )
+        f = fp8x4_unpack(d0, e8_scale(e8i)) + fp8x4_unpack(d1, e8_scale(e8i))
+        if v < i32(CW // 8):
+            bst(pack_bf16x8(f), rsrc(a["y"]), (grow * i32(H) + col) * i32(2), 0, 0)
+            doff, soff = ag8_offs(a, grow, col)
+            dv = fx.Vector.from_elements([d0, d1], fx.Int32)
+            for p in range_constexpr(TPC):
+                if i32(p) != a["rank"]:
+                    rd = peer_rs(a, p, "off_yall")
+                    bst(dv, rd, doff, 0, AUX_SYS)
+                    if (v & i32(15)) == i32(0):
+                        bst(sc, rd, soff, 0, AUX_SYS)
+
+    @traced
+    def ag8_convert(tid, a):
+        # this CTA's output rows of every other owner (their YAG flags are in)
+        bid = i32(gpu.block_id("x"))
+        if bid < a["m"]:
+            step = (fin_split(a) > i32(1)).select(a["m"], i32(gpu.grid_dim.x))
+            ry = own_rs(a, "off_yall")
+            yo = rsrc(a["y"])
+            nq = i32(H // 8)
+            for row_ in range(bid, a["m"], step):
+                row = i32(row_)
+                for q_ in range(tid, i32(TPC * (H // 8)), i32(NTT)):
+                    q = i32(q_)
+                    p = q // nq
+                    col = (q - p * nq) * i32(8)
+                    if p != a["rank"]:
+                        grow = p * a["m"] + row
+                        doff, soff = ag8_offs(a, grow, col)
+                        ld = (
+                            bld(ry, doff, 0, V2I, AUX_SYS),
+                            bld(ry, soff, 0, T.i8, AUX_SYS),
+                        )
+                        bst(
+                            pack_bf16x8(fp8x8_decode(ld)),
+                            yo,
+                            (grow * i32(H) + col) * i32(2),
+                            0,
+                            0,
+                        )
 
     @traced
     def _yag_note(L, lane, cidx):
@@ -3150,6 +3360,9 @@ def compile_mega_moe_tp(
         if const_expr(AR and not ARLL):
             yag_flush(L, tid, a)
             yag_wait(tid, a, epoch)
+        if const_expr(AG8):
+            gpu.barrier()
+            ag8_convert(tid, a)
         finish(tid, a, epoch)
 
     @flyc.jit
