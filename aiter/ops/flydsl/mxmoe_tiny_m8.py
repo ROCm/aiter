@@ -87,6 +87,9 @@ class PreparedRouteMerge8:
             D_INTER=256,
             NE=257,
             native_scale_layout=True,
+            # Ordinary GLM SiLU matches runtime_swiglu_limit(None, "silu").
+            # The direct compiler default7 belongs to clamped model families.
+            swiglu_limit=float("inf"),
             merge_routes8=True,
         )
         self.g2 = compile_gemm2_a4w4_port(

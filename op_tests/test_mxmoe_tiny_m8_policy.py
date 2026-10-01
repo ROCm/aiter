@@ -231,6 +231,34 @@ class RouteMergeTests(unittest.TestCase):
             variants["fp4"],
         )
 
+    def test_factory_preserves_native_unclamped_silu(self):
+        factory = ast.parse((ROOT / "aiter/ops/flydsl/mxmoe_tiny_m8.py").read_text())
+        call = next(
+            node
+            for node in ast.walk(factory)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "compile_gemm1_a4w4_port"
+        )
+        bound = next(
+            keyword.value for keyword in call.keywords if keyword.arg == "swiglu_limit"
+        )
+        actual = eval(
+            compile(ast.Expression(bound), "factory-limit", "eval"), {"float": float}
+        )
+        native = ast.parse((ROOT / "aiter/ops/flydsl/moe_kernels.py").read_text())
+        normalize = next(
+            node
+            for node in native.body
+            if isinstance(node, ast.FunctionDef) and node.name == "runtime_swiglu_limit"
+        )
+        namespace = {}
+        exec(compile(ast.Module([normalize], []), "native-limit", "exec"), namespace)
+        expected = namespace["runtime_swiglu_limit"](None, "silu")
+        self.assertEqual(actual, expected)
+        self.assertEqual(expected, float("inf"))
+        self.assertNotEqual(expected, 7.0)
+
     def test_default_off_compiler_and_atomic_math(self):
         for name in ["mxfp4_gemm1.py", "mxfp4_gemm2.py"]:
             source = (ROOT / "aiter/ops/flydsl/kernels" / name).read_text()
