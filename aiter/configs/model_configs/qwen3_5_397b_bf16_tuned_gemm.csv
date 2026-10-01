@@ -126,8 +126,3 @@ gfx950,256,1024,10240,4096,False,torch.bfloat16,torch.bfloat16,False,False,torch
 gfx950,256,2048,10240,4096,False,torch.bfloat16,torch.bfloat16,False,False,torch,0,0,152.1333,native,0.0,1129.26,937.38
 gfx950,256,4096,10240,4096,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,1,1,263.455,flydsl_hgemm_abf16_wbf16_bf16_t256x256x64x2_ks1_w2x4x1_bias0_ktail0_gm4_pht_gfx950,0.0,1304.2,764.18
 gfx950,256,8192,10240,4096,False,torch.bfloat16,torch.bfloat16,False,False,torch,0,0,457.306,native,0.0,1502.7,697.05
-gfx1250,256,1,128,4096,False,torch.bfloat16,torch.bfloat16,False,False,opus,20129,16,5.833,opus_gemm_gfx1250_splitk_cluster_tdm_ws_kid20129_sk16,0.0,0.1798,179.77
-gfx1250,256,2,128,4096,False,torch.bfloat16,torch.bfloat16,False,False,opus,20001,16,5.662,opus_gemm_gfx1250_splitk_cluster_tdm_ws_kid20001_sk16,0.0,0.3704,185.20
-gfx1250,256,4,128,4096,False,torch.bfloat16,torch.bfloat16,False,False,opus,20001,16,5.797,opus_gemm_gfx1250_splitk_cluster_tdm_ws_kid20001_sk16,0.0,0.7235,180.88
-gfx1250,256,8,128,4096,False,torch.bfloat16,torch.bfloat16,False,False,opus,20001,16,5.775,opus_gemm_gfx1250_splitk_cluster_tdm_ws_kid20001_sk16,0.0,1.4526,181.57
-gfx1250,256,16,128,4096,False,torch.bfloat16,torch.bfloat16,False,False,opus,20001,16,5.775,opus_gemm_gfx1250_splitk_cluster_tdm_ws_kid20001_sk16,0.0,2.9051,181.57
