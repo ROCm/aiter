@@ -1638,10 +1638,11 @@ def qsa_k2(
     page_size = k_cache.shape[1]
     use_k32 = arch == "gfx950"
     n_sel = int(indices.shape[1])
-    # gfx950 keeps the fitted 128-split tiny band. On gfx942 the M=1
-    # workgroup at 128 splits loses to the 2-tile workgroup live AMD runs
-    # at 64, and the merge pays for the extra partials.
-    tiny_splits = _TINY_SPLITS if use_k32 else 64
+    # gfx950 keeps the fitted 128-split tiny band. On gfx942, 129 BN16
+    # tiles at 64 splits leave one workgroup with 3 tiles, and that group
+    # sets M=1. 65 splits caps every group at 2. The merge widens to 256
+    # threads at that point; 128 splits widened it further and lost.
+    tiny_splits = _TINY_SPLITS if use_k32 else 65
     block_n, block_threads, n_splits = _launch_config(
         rows, n_sel, n_kv_heads, head_dim, tiny_splits
     )
