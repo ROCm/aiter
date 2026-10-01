@@ -60,8 +60,11 @@ DS_FIRST_N = int(os.environ.get("AITER_FLYDSL_DS_FIRST_N", "0"))
 EXPLICIT_VGPR_PARTITION = int(
     os.environ.get("AITER_FLYDSL_EXPLICIT_VGPR_PARTITION", "0")
 )
-PLANAR_LDS = int(os.environ.get("AITER_FLYDSL_PLANAR_LDS", "1"))
-INTERLEAVED_LDS_LOAD = int(os.environ.get("AITER_FLYDSL_INTERLEAVED_LDS_LOAD", "1"))
+PLANAR_LDS = int(os.environ.get("AITER_FLYDSL_PLANAR_LDS", "0"))
+INTERLEAVED_LDS_LOAD = int(os.environ.get("AITER_FLYDSL_INTERLEAVED_LDS_LOAD", "0"))
+LDS_SOA_LOAD_INTERLEAVE = os.environ.get("LDS_SOA_LOAD_INTERLEAVE")
+if LDS_SOA_LOAD_INTERLEAVE is not None:
+    LDS_SOA_LOAD_INTERLEAVE = int(LDS_SOA_LOAD_INTERLEAVE)
 FORCE_1X4_CLUSTER = int(os.environ.get("AITER_FLYDSL_FORCE_1X4_CLUSTER", "0"))
 DISABLE_CLUSTER_SYNC = int(os.environ.get("AITER_FLYDSL_DISABLE_CLUSTER_SYNC", "0"))
 if MMA_GROUP < 1 or MMA_FIRST_GROUP < 1:
@@ -74,6 +77,8 @@ if PLANAR_LDS not in (0, 1):
     raise ValueError("AITER_FLYDSL_PLANAR_LDS must be 0 or 1")
 if INTERLEAVED_LDS_LOAD not in (0, 1):
     raise ValueError("AITER_FLYDSL_INTERLEAVED_LDS_LOAD must be 0 or 1")
+if LDS_SOA_LOAD_INTERLEAVE not in (None, 0, 1):
+    raise ValueError("LDS_SOA_LOAD_INTERLEAVE must be 0 or 1")
 if FORCE_1X4_CLUSTER not in (0, 1):
     raise ValueError("AITER_FLYDSL_FORCE_1X4_CLUSTER must be 0 or 1")
 if DISABLE_CLUSTER_SYNC not in (0, 1):
@@ -163,6 +168,7 @@ def launch_gemm_a8w4_tdm(
     row_major_ascale: Constexpr[int] = 0,
     a_row_stride_bytes: Constexpr[int] = 0,
     a_scale_row_stride_bytes: Constexpr[int] = 0,
+    lds_soa_load_interleave: Constexpr[int] = 0,
 ):
     """Launch the grouped contiguous-M a8w4 MoE GEMM for gfx1250.
 
@@ -190,6 +196,19 @@ def launch_gemm_a8w4_tdm(
        check -- so the callers that choose cluster_n enforce it
        (batched_gemm_mxfp4._pick_cluster_n and its assert).
     """
+    # Resolve per-row settings before specializing the layout and cache key.
+    lds_soa_load_interleave_on = (
+        lds_soa_load_interleave
+        if LDS_SOA_LOAD_INTERLEAVE is None
+        else LDS_SOA_LOAD_INTERLEAVE
+    )
+    assert lds_soa_load_interleave_on in (0, 1), (
+        "lds_soa_load_interleave must be 0 or 1"
+    )
+    planar_lds_on = int(bool(PLANAR_LDS or lds_soa_load_interleave_on))
+    interleaved_lds_load_on = int(
+        bool(INTERLEAVED_LDS_LOAD or lds_soa_load_interleave_on)
+    )
     WMMA_M = 16
     WMMA_N = 32 if a_is_fp4 else 16
     WMMA_K = 128
@@ -235,8 +254,8 @@ def launch_gemm_a8w4_tdm(
         MMA_FIRST_GROUP,
         DS_FIRST_N,
         SUPPORT_EXPLICIT_VGPR_PARTITION,
-        PLANAR_LDS,
-        INTERLEAVED_LDS_LOAD,
+        planar_lds_on,
+        interleaved_lds_load_on,
         row_major_ascale,
         a_row_stride_bytes,
         a_scale_row_stride_bytes,
@@ -330,15 +349,15 @@ def launch_gemm_a8w4_tdm(
     PLANAR_SB_OFF = PLANAR_A_OFF + num_buffers * STAGE_A
     PLANAR_B_OFF = ((PLANAR_SB_OFF + num_buffers * STAGE_SB + 65535) // 65536) * 65536
     PLANAR_END = PLANAR_B_OFF + num_buffers * STAGE_B
-    A_LDS_OFF = PLANAR_A_OFF if PLANAR_LDS else 0
-    B_LDS_OFF = PLANAR_B_OFF if PLANAR_LDS else STAGE_A
-    SA_LDS_OFF = PLANAR_SA_OFF if PLANAR_LDS else STAGE_A + STAGE_B
-    SB_LDS_OFF = PLANAR_SB_OFF if PLANAR_LDS else STAGE_A + STAGE_B + STAGE_SA
-    A_LDS_STAGE = STAGE_A if PLANAR_LDS else PITCH
-    B_LDS_STAGE = STAGE_B if PLANAR_LDS else PITCH
-    SA_LDS_STAGE = STAGE_SA if PLANAR_LDS else PITCH
-    SB_LDS_STAGE = STAGE_SB if PLANAR_LDS else PITCH
-    INPUT_LDS_B = PLANAR_END if PLANAR_LDS else num_buffers * PITCH
+    A_LDS_OFF = PLANAR_A_OFF if planar_lds_on else 0
+    B_LDS_OFF = PLANAR_B_OFF if planar_lds_on else STAGE_A
+    SA_LDS_OFF = PLANAR_SA_OFF if planar_lds_on else STAGE_A + STAGE_B
+    SB_LDS_OFF = PLANAR_SB_OFF if planar_lds_on else STAGE_A + STAGE_B + STAGE_SA
+    A_LDS_STAGE = STAGE_A if planar_lds_on else PITCH
+    B_LDS_STAGE = STAGE_B if planar_lds_on else PITCH
+    SA_LDS_STAGE = STAGE_SA if planar_lds_on else PITCH
+    SB_LDS_STAGE = STAGE_SB if planar_lds_on else PITCH
+    INPUT_LDS_B = PLANAR_END if planar_lds_on else num_buffers * PITCH
 
     out_elem = T.f16 if out_is_f16 else T.bf16
 
@@ -402,8 +421,8 @@ def launch_gemm_a8w4_tdm(
     )
     _ds_first = f"_dsfirst{DS_FIRST_N}" if DS_FIRST_N else ""
     _explicit_vgpr_partition = "_regpart" if SUPPORT_EXPLICIT_VGPR_PARTITION else ""
-    _planar_lds = "_planarlds" if PLANAR_LDS else ""
-    _interleaved_lds_load = "_interleavelds" if INTERLEAVED_LDS_LOAD else ""
+    _planar_lds = "_planarlds" if planar_lds_on else ""
+    _interleaved_lds_load = "_interleavelds" if interleaved_lds_load_on else ""
     _epq = f"_epq{ep_quant_bits}" if ep_quant_bits else ""
     _kname = (
         f"a8w4_tdm_{_afp}"
@@ -1591,7 +1610,7 @@ def launch_gemm_a8w4_tdm(
 
             # This is a compile-time selection. The interleaved version has one
             # mainloop body and no wave-parity branch.
-            run_mainloop(bool(INTERLEAVED_LDS_LOAD))
+            run_mainloop(bool(interleaved_lds_load_on))
 
             accs = []
             output_fragments_per_acc = WMMA_N // 16

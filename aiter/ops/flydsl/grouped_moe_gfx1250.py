@@ -583,6 +583,7 @@ def _grouped_a8w4_tdm_moe(
     next_stage_prefetch=0,
     tdm_as_in_prologue=0,
     tdm_b_th=0,
+    lds_soa_load_interleave=0,
     data_format="a8w4",
     expert_mask=None,
     num_local_tokens=None,
@@ -1058,6 +1059,7 @@ def _grouped_a8w4_tdm_moe(
             next_stage_prefetch=next_stage_prefetch,
             tdm_as_in_prologue=tdm_as_in_prologue,
             tdm_b_th=tdm_b_th,
+            lds_soa_load_interleave=lds_soa_load_interleave,
             row_major_ascale=int(_row_major_ascale),
             a_row_stride_bytes=_a1_wire_stride,
             a_scale_row_stride_bytes=_a1_wire_stride,
@@ -1094,6 +1096,7 @@ def _grouped_a8w4_tdm_moe(
             next_stage_prefetch=next_stage_prefetch,
             tdm_as_in_prologue=tdm_as_in_prologue,
             tdm_b_th=tdm_b_th,
+            lds_soa_load_interleave=lds_soa_load_interleave,
             row_major_ascale=int(_row_major_ascale),
             a_row_stride_bytes=_a1_wire_stride,
             a_scale_row_stride_bytes=_a1_wire_stride,
@@ -1139,6 +1142,7 @@ def _grouped_a8w4_tdm_moe(
         next_stage_prefetch=next_stage_prefetch,
         tdm_as_in_prologue=tdm_as_in_prologue,
         tdm_b_th=tdm_b_th,
+        lds_soa_load_interleave=lds_soa_load_interleave,
         **_ep_gemm2_kwargs,
     )
 
@@ -1217,6 +1221,7 @@ def _grouped_a8w4_tdm_moe(
                         next_stage_prefetch=next_stage_prefetch,
                         tdm_as_in_prologue=tdm_as_in_prologue,
                         tdm_b_th=tdm_b_th,
+                        lds_soa_load_interleave=lds_soa_load_interleave,
                         **_situ_kw,
                     ),
                 )
@@ -1254,6 +1259,7 @@ def _grouped_a8w4_tdm_moe(
                         next_stage_prefetch=next_stage_prefetch,
                         tdm_as_in_prologue=tdm_as_in_prologue,
                         tdm_b_th=tdm_b_th,
+                        lds_soa_load_interleave=lds_soa_load_interleave,
                         **_situ_kw,
                     ),
                 )
@@ -1289,6 +1295,7 @@ def _grouped_a8w4_tdm_moe(
                     next_stage_prefetch=next_stage_prefetch,
                     tdm_as_in_prologue=tdm_as_in_prologue,
                     tdm_b_th=tdm_b_th,
+                    lds_soa_load_interleave=lds_soa_load_interleave,
                 ),
             )
         )
@@ -1565,6 +1572,9 @@ def grouped_gemm_gfx1250_a8w4(
                 cfg_row.get("tdm_as_in_prologue"), 0
             )
             _tdm_kw["tdm_b_th"] = _as_int(cfg_row.get("tdm_b_th"), 0)
+            _tdm_kw["lds_soa_load_interleave"] = _as_int(
+                cfg_row.get("lds_soa_load_interleave"), 0
+            )
 
         # Env overrides for tuning (present-check so any set value wins over CSV /
         # defaults). Stage2 (*2) falls back to the stage1 value when unset. Set

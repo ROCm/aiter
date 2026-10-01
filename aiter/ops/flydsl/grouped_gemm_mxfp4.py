@@ -130,6 +130,7 @@ def flydsl_grouped_gemm_a8w4_masked(
     next_stage_prefetch=0,
     tdm_as_in_prologue=0,
     tdm_b_th=0,
+    lds_soa_load_interleave=0,
     stage2_scatter: Stage2ScatterContext | None = None,
     ep_destination_stride=0,
     ep_row_map=None,
@@ -228,5 +229,6 @@ def flydsl_grouped_gemm_a8w4_masked(
         row_major_ascale=int(row_major_ascale),
         a_row_stride_bytes=int(a_row_stride_bytes),
         a_scale_row_stride_bytes=int(a_scale_row_stride_bytes),
+        lds_soa_load_interleave=int(lds_soa_load_interleave),
     )
     return out
