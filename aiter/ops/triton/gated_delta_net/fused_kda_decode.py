@@ -9,7 +9,7 @@ eliminating q/k/v intermediate HBM traffic and kernel launch overhead.
 
 import torch
 
-from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.fused_conv_recurrent_norm import (
+from aiter.ops.triton._triton_kernels.gated_delta_net.decode.fused_conv_recurrent_norm import (
     fused_conv_recurrent_norm_kernel,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
