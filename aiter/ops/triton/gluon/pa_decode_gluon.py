@@ -1851,19 +1851,23 @@ def paged_attention_decode_sliding_window_head_1(
         if QUERY_SEQ_LEN_POW2 == 1:
             if IS_CAUSAL:
                 sequence_position_extension = query_seq_len - 1 - mtp_idx
-                causal_mask = (
-                    sequence_position_extension + qk_column_offsets[None, :]
-                    < sequence_end_idx
-                )
                 if SLIDING_WINDOW > 0:
-                    causal_mask = causal_mask & (
+                    causal_mask = (
+                        sequence_position_extension + qk_column_offsets[None, :]
+                        < sequence_end_idx
+                    ) & (
                         sequence_position_extension + qk_column_offsets[None, :]
                         >= sequence_start_idx + query_seq_len
                     )
                 else:
-                    causal_mask = causal_mask & (
-                        sequence_position_extension + qk_column_offsets[None, :]
-                        >= sequence_start_idx
+                    # Keep this split's own keys; the causal cut is global.
+                    causal_mask = (
+                        (qk_column_offsets[None, :] >= sequence_start_idx)
+                        & (qk_column_offsets[None, :] < sequence_end_idx)
+                        & (
+                            sequence_position_extension + qk_column_offsets[None, :]
+                            < context_length
+                        )
                     )
             else:
                 causal_mask = qk_column_offsets[None, :] < sequence_end_idx
@@ -1879,21 +1883,25 @@ def paged_attention_decode_sliding_window_head_1(
 
             if IS_CAUSAL:
                 sequence_position_extension = query_seq_len - 1 - query_token_idx
-                causal_mask = (
-                    sequence_position_extension[:, None] + qk_column_offsets[None, :]
-                    < sequence_end_idx
-                )
                 if SLIDING_WINDOW > 0:
-                    causal_mask = causal_mask & (
+                    causal_mask = (
+                        sequence_position_extension[:, None]
+                        + qk_column_offsets[None, :]
+                        < sequence_end_idx
+                    ) & (
                         sequence_position_extension[:, None]
                         + qk_column_offsets[None, :]
                         >= sequence_start_idx + query_seq_len
                     )
                 else:
-                    causal_mask = causal_mask & (
-                        sequence_position_extension[:, None]
-                        + qk_column_offsets[None, :]
-                        >= sequence_start_idx
+                    causal_mask = (
+                        (qk_column_offsets[None, :] >= sequence_start_idx)
+                        & (qk_column_offsets[None, :] < sequence_end_idx)
+                        & (
+                            sequence_position_extension[:, None]
+                            + qk_column_offsets[None, :]
+                            < context_length
+                        )
                     )
             else:
                 causal_mask = qk_column_offsets[None, :] < sequence_end_idx
@@ -2940,19 +2948,24 @@ def paged_attention_decode_sliding_window(
         if IS_CAUSAL:
             # Compute causal mask based on sequence positions
             sequence_position_extension = query_seq_len - 1 - query_token_idx
-            causal_mask = (
-                sequence_position_extension[:, None] + qk_column_offsets[None, :]
-                < sequence_end_idx
-            )
             if SLIDING_WINDOW > 0:
-                causal_mask = causal_mask & (
+                causal_mask = (
+                    sequence_position_extension[:, None] + qk_column_offsets[None, :]
+                    < sequence_end_idx
+                ) & (
                     sequence_position_extension[:, None] + qk_column_offsets[None, :]
                     >= sequence_start_idx + query_seq_len
                 )
             else:
-                causal_mask = causal_mask & (
-                    sequence_position_extension[:, None] + qk_column_offsets[None, :]
-                    >= sequence_start_idx
+                # Keep this split's own keys; the causal cut is global.
+                causal_mask = (
+                    (qk_column_offsets[None, :] >= sequence_start_idx)
+                    & (qk_column_offsets[None, :] < sequence_end_idx)
+                    & (
+                        sequence_position_extension[:, None]
+                        + qk_column_offsets[None, :]
+                        < context_length
+                    )
                 )
         else:
             causal_mask = qk_column_offsets[None, :] < sequence_end_idx
