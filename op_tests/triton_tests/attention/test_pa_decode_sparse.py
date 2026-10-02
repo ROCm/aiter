@@ -705,7 +705,7 @@ def _vllm_pool_skip(T, splits):
         pytest.skip("CUDA required")
     if arch_info.get_arch() != "gfx950":
         pytest.skip("the packed fp8_dsv4_mla cache is a gfx950 gluon path")
-    if T == 2100 and splits == 3:
+    if T == 2100 and splits is not None and splits > 1:
         pytest.skip("prefill takes one split")
 
 
@@ -738,3 +738,66 @@ def test_pa_decode_sparse_two_loop_vllm_pool_asm_dequant(
     out_asm = _vllm_pool_run(args, splits)
     assert torch.equal(out_asm.view(torch.int16), out.view(torch.int16))
     torch.testing.assert_close(out_asm, ref, atol=1e-2, rtol=1e-2)
+
+
+def _inv_rope_mxfp8_ref(o, pos, cos_sin, mxfp8):
+    """vLLM's pass over the bf16 rows o [T, H, D] before wo_a, in torch (each
+    product rounded on its own, as there): the inverse GPT-J RoPE on the trailing
+    rope lanes (rocm_inverse_rope_rows_), then with mxfp8 one E8M0 scale per 32
+    lanes (rocm_inverse_rope_mxfp8_rows, which also rotates the NoPE pairs, by
+    cos 1 and sin 0)."""
+    T, H, D = o.shape
+    half = cos_sin.shape[1] // 2
+    x = o.float()
+    even, odd = x[..., 0::2], x[..., 1::2]
+    cos = torch.ones(T, 1, D // 2, device=o.device)
+    sin = torch.zeros(T, 1, D // 2, device=o.device)
+    cos[..., D // 2 - half :] = cos_sin[pos, None, :half]
+    sin[..., D // 2 - half :] = cos_sin[pos, None, half:]
+    re, ro = even * cos + odd * sin, odd * cos - even * sin
+    if not mxfp8:
+        re[..., : D // 2 - half] = even[..., : D // 2 - half]
+        ro[..., : D // 2 - half] = odd[..., : D // 2 - half]
+        return torch.stack([re, ro], dim=-1).reshape(T, H, D).to(torch.bfloat16)
+    blocks = torch.stack([re, ro], dim=-1).reshape(T, H, D // 32, 32)
+    amax = blocks.abs().amax(dim=-1).clamp_min(1.1754943508222875e-38)
+    bits = (torch.ceil(torch.log2(amax / 448.0)) + 127.0).clamp(0.0, 254.0)
+    data = (blocks * torch.exp2(127.0 - bits)[..., None]).reshape(T, H * D)
+    return data.to(torch.float8_e4m3fn), bits.to(torch.uint8).reshape(T, H * D // 32)
+
+
+@pytest.mark.parametrize("T", [1, 37, 192, 2100])
+@pytest.mark.parametrize("H", [8, 16, 32, 64])
+@pytest.mark.parametrize("splits", [None, 3, 8])
+@pytest.mark.parametrize("mxfp8", [True, False])
+def test_pa_decode_sparse_inv_rope_mxfp8_epilogue(T, H, splits, mxfp8):
+    """The inverse-RoPE / MXFP8 output epilogue, without and with split-K, against
+    vLLM's pass run on the kernel's own bf16 output: bit-identical."""
+    _vllm_pool_skip(T, splits)
+    args, _ = _vllm_pool_case(T, H, "some")
+    q, main_pool, mi, mp, sink, scale, extra_pool, ei, ep = args
+    gen = torch.Generator(device="cuda").manual_seed(T * 7 + H)
+    ang = torch.rand(4096, 32, device="cuda", generator=gen) * 6.2831853
+    cos_sin = torch.cat([ang.cos(), ang.sin()], dim=1).contiguous()
+    pos = torch.randint(0, 4096, (T,), device="cuda", generator=gen)
+    ref = _inv_rope_mxfp8_ref(_vllm_pool_run(args, splits), pos, cos_sin, mxfp8)
+    kw = {
+        "kv_splits": splits,
+        "extra_cache": extra_pool,
+        "extra_indices": ei,
+        "extra_indptr": ep,
+        "inv_rope_positions": pos,
+        "inv_rope_cos_sin_cache": cos_sin,
+    }
+    if mxfp8:
+        data = torch.empty(T, H * 512, dtype=torch.float8_e4m3fn, device="cuda")
+        scl = torch.empty(T, H * 16, dtype=torch.uint8, device="cuda")
+        out = pa_decode_sparse(
+            q, main_pool, mi, mp, sink, scale, out_mxfp8=(data, scl), **kw
+        )
+        assert out.data_ptr() == data.data_ptr() and out.shape == (T, H, 512)
+        assert torch.equal(data.view(torch.uint8), ref[0].view(torch.uint8))
+        assert torch.equal(scl, ref[1])
+    else:
+        out = pa_decode_sparse(q, main_pool, mi, mp, sink, scale, **kw)
+        assert torch.equal(out.view(torch.int16), ref.view(torch.int16))

@@ -89,6 +89,9 @@ def pa_decode_sparse(
     extra_indices: torch.Tensor | None = None,
     extra_indptr: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
+    inv_rope_positions: torch.Tensor | None = None,
+    inv_rope_cos_sin_cache: torch.Tensor | None = None,
+    out_mxfp8: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Sparse paged-decode attention with split-K + widened BLOCK_H.
 
@@ -117,6 +120,8 @@ def pa_decode_sparse(
             isolation and for callers that fold the reduce into a downstream op.
         extra_cache/extra_indices/extra_indptr: gfx950 packed-only — the SWA+top-k
             two-loop's second (top-k) cache + index set; must be None otherwise.
+        inv_rope_positions/inv_rope_cos_sin_cache/out_mxfp8: gfx950 gluon only —
+            the output epilogue (see _pa_decode_sparse_gfx950_gluon).
 
     On gfx950 the DSv4 gluon driver handles this: a 3D ``unified_kv`` selects the
     packed fp8_dsv4_mla (584 B rows) / bf16 block cache (``extra_*`` = the
@@ -186,11 +191,17 @@ def pa_decode_sparse(
                 skip_reduce=skip_reduce,
                 has_invalid=bool(has_invalid),
                 out=out,
+                inv_rope_positions=inv_rope_positions,
+                inv_rope_cos_sin_cache=inv_rope_cos_sin_cache,
+                out_mxfp8=out_mxfp8,
             )
 
     assert (
         extra_cache is None and extra_indices is None and extra_indptr is None
     ), "extra_cache/extra_indices/extra_indptr are gfx950 packed-only"
+    assert (
+        inv_rope_positions is None and out_mxfp8 is None
+    ), "the output epilogue is gfx950 gluon-only"
 
     quant_kv = kv_scales is not None
     if quant_kv:
@@ -491,6 +502,9 @@ def _pa_decode_sparse_gfx950_gluon(
     skip_reduce=False,
     out=None,
     has_invalid=False,
+    inv_rope_positions=None,
+    inv_rope_cos_sin_cache=None,
+    out_mxfp8=None,
 ):
     """Merged gfx950 gluon DSv4 sparse-MLA decode driver. Format from cache.ndim:
     3D [nb, block, 584] -> packed fp8_dsv4_mla (uint8: 448 NoPE fp8 e4m3 OCP +
@@ -499,6 +513,13 @@ def _pa_decode_sparse_gfx950_gluon(
                            else a single segment.
     2D [pages, D]       -> uniform pool: fp8 (uint8) + cache_scales
                            [pages, D//64] fp32, or bf16 (cache_scales None).
+
+    The output epilogue applies what vLLM runs on the rows before wo_a:
+    inv_rope_positions [N] with inv_rope_cos_sin_cache [P, 64] f32 (cos | sin)
+    rotate the trailing 64 lanes of each row back (inverse GPT-J RoPE), and
+    out_mxfp8 = (data [N, H * D] e4m3, scale [N, H * D // 32] uint8 E8M0)
+    replaces out with its MXFP8 quantization; data viewed as [N, H, D] is
+    returned.
     """
     assert q.ndim == 3, f"expected q=[b,h,d], got {q.shape}"
     assert DEVICE_ARCH == "gfx950", "gluon DSv4 decode kernel is gfx950-only"
@@ -634,7 +655,39 @@ def _pa_decode_sparse_gfx950_gluon(
             BLOCK_M, num_warps = 32, 8
     HEAD_ALIGNED = num_heads % BLOCK_M == 0
     heads_blocks = (num_heads + BLOCK_M - 1) // BLOCK_M
-    out = _check_out(out, q, torch.bfloat16)
+    inv_rope = inv_rope_positions is not None
+    assert inv_rope == (
+        inv_rope_cos_sin_cache is not None
+    ), "inv_rope_positions and inv_rope_cos_sin_cache go together"
+    assert not (
+        skip_reduce and (inv_rope or out_mxfp8 is not None)
+    ), "the output epilogue runs in the reduce, so skip_reduce cannot be set"
+    if inv_rope:
+        assert inv_rope_positions.shape == (num_queries,)
+        assert inv_rope_positions.stride(0) == 1
+        assert inv_rope_cos_sin_cache.dtype == torch.float32
+        assert inv_rope_cos_sin_cache.shape[-1] == ROPE_DIM
+        assert inv_rope_cos_sin_cache.stride(-1) == 1
+    if out_mxfp8 is not None:
+        assert out is None, "out and out_mxfp8 are mutually exclusive"
+        out_data, out_scale = out_mxfp8
+        assert out_data.dtype == torch.float8_e4m3fn and out_scale.dtype == torch.uint8
+        assert out_data.shape == (num_queries, num_heads * head_dim)
+        assert out_scale.shape == (num_queries, num_heads * head_dim // 32)
+        assert out_data.stride(-1) == 1 and out_scale.stride(-1) == 1
+        out = out_data.view(num_queries, num_heads, head_dim)
+    else:
+        out_scale = None
+        out = _check_out(out, q, torch.bfloat16)
+    epilogue = {
+        "pos_ptr": inv_rope_positions,
+        "cos_sin_ptr": inv_rope_cos_sin_cache,
+        "cs_stride": inv_rope_cos_sin_cache.stride(0) if inv_rope else 0,
+        "out_scale_ptr": out_scale,
+        "os_stride0": out_scale.stride(0) if out_scale is not None else 0,
+        "INV_ROPE": inv_rope,
+        "OUT_MXFP8": out_scale is not None,
+    }
 
     if kv_splits is not None:
         num_splits = max(1, int(kv_splits))
@@ -811,6 +864,8 @@ def _pa_decode_sparse_gfx950_gluon(
         num_warps=num_warps,
         waves_per_eu=waves_per_eu,
         **prefill_kw,
+        # The epilogue runs where the output is written.
+        **(epilogue if num_splits == 1 else {}),
     )
 
     if num_splits == 1:
@@ -840,6 +895,8 @@ def _pa_decode_sparse_gfx950_gluon(
         NUM_SPLITS=grid_splits,
         HEAD_ALIGNED=True,
         ADAPTIVE_SPLITS=adaptive_splits,
+        ROPE_DIM=ROPE_DIM,
+        **epilogue,
         # A 2-split tile spans two warps; more warps would hold duplicate lanes.
         num_warps=min(4, grid_splits),
     )

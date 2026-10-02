@@ -287,6 +287,9 @@ def _forward_paged(
     extra_kv,
     extra_indptr,
     extra_indices,
+    inv_rope_positions,
+    inv_rope_cos_sin_cache,
+    out_mxfp8,
 ):
     """dsv4 and the SWA+top-k two-loop, until the two launchers merge."""
     from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
@@ -319,6 +322,9 @@ def _forward_paged(
         extra_indices=extra_indices,
         extra_indptr=extra_indptr,
         out=out,
+        inv_rope_positions=inv_rope_positions,
+        inv_rope_cos_sin_cache=inv_rope_cos_sin_cache,
+        out_mxfp8=out_mxfp8,
     )
     return res if isinstance(res, tuple) else (res, None)
 
@@ -344,6 +350,9 @@ def sparse_mla_fwd(
     extra_kv: torch.Tensor | None = None,
     extra_indptr: torch.Tensor | None = None,
     extra_indices: torch.Tensor | None = None,
+    inv_rope_positions: torch.Tensor | None = None,
+    inv_rope_cos_sin_cache: torch.Tensor | None = None,
+    out_mxfp8: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Sparse (top-k gathered) MLA attention.
 
@@ -420,6 +429,16 @@ def sparse_mla_fwd(
         return_lse: also return the natural-log log-sum-exp, [C, H] f32, for
             merging partials across context-parallel ranks. A fully masked row
             reports -inf.
+        inv_rope_positions, inv_rope_cos_sin_cache: [C] positions and [P, 64]
+            f32 (cos | sin). The trailing 64 lanes of each output row are
+            rotated back (inverse GPT-J RoPE) before the store. DeepSeek-V4
+            caches only (fp8_dsv4_mla, fp8_g64, the two-loop), whose rope lives
+            inside the row.
+        out_mxfp8: (data [C, H * D] e4m3, scale [C, H * D // 32] uint8 E8M0) in
+            place of out, for the same caches: the output is stored
+            MXFP8-quantized, one scale per 32 lanes, and data viewed as
+            [C, H, D] is returned. The arithmetic is that of vLLM's
+            inverse-RoPE + MXFP8 pass on the bf16 rows.
 
     Returns:
         (out, lse), out is
@@ -486,6 +505,14 @@ def sparse_mla_fwd(
             extra_kv,
             extra_indptr,
             extra_indices,
+            inv_rope_positions,
+            inv_rope_cos_sin_cache,
+            out_mxfp8,
+        )
+    if inv_rope_positions is not None or out_mxfp8 is not None:
+        raise ValueError(
+            "the inverse-RoPE / MXFP8 output epilogue needs a DeepSeek-V4 cache, "
+            f"got {fmt}"
         )
     assert arch_info.get_arch() == "gfx950", "sparse_mla_fwd is gfx950-only"
     q_is_fp8 = q.dtype == torch.float8_e4m3fn

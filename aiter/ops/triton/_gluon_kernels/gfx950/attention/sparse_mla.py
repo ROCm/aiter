@@ -1938,6 +1938,107 @@ def _pipe_segment(
 
 
 @gluon.jit
+def _mul_rn(a, b):
+    """a * b rounded on its own. vLLM's pass rounds each product, and an FMA
+    would round differently at e4m3 ties."""
+    return gl.inline_asm_elementwise(
+        "v_mul_f32 $0, $1, $2", "=v,v,v", [a, b], dtype=gl.float32, is_pure=True, pack=1
+    )
+
+
+@gluon.jit
+def _inv_rope(
+    x, pos_ptr, cs_ptr, cs_stride, row, ROPE_DIM: gl.constexpr, MXFP8: gl.constexpr
+):
+    """Inverse GPT-J RoPE on the trailing ROPE_DIM lanes of x [M, D] f32:
+    even * cos + odd * sin, odd * cos - even * sin. As in vLLM's passes, MXFP8
+    rows rotate the NoPE pairs too, by cos 1 and sin 0, and bf16 rows keep them."""
+    M: gl.constexpr = x.shape[0]
+    D: gl.constexpr = x.shape[1]
+    even, odd = gl.split(gl.reshape(x, [M, D // 2, 2]))
+    k = gl.arange(0, D // 2, layout=gl.SliceLayout(0, even.type.layout))
+    k = k - (D - ROPE_DIM) // 2
+    cs_row = cs_ptr + gl.load(pos_ptr + row).to(gl.int64) * cs_stride
+    cos = gl.load(cs_row + k, mask=k >= 0, other=1.0)[None, :].broadcast_to(even.shape)
+    sin = gl.load(cs_row + ROPE_DIM // 2 + k, mask=k >= 0, other=0.0)[None, :]
+    sin = sin.broadcast_to(even.shape)
+    re = _mul_rn(even, cos) + _mul_rn(odd, sin)
+    ro = _mul_rn(odd, cos) - _mul_rn(even, sin)
+    if not MXFP8:
+        re = gl.where((k >= 0)[None, :], re, even)
+        ro = gl.where((k >= 0)[None, :], ro, odd)
+    return gl.reshape(gl.join(re, ro), [M, D])
+
+
+@gluon.jit
+def _mxfp8(x, scale_ptr, h0, num_heads):
+    """MXFP8 of x [M, D] f32, heads h0 onwards of one row: one E8M0 byte per 32
+    lanes, stored to scale_ptr [H, D // 32]. Returns the values to store as e4m3."""
+    M: gl.constexpr = x.shape[0]
+    D: gl.constexpr = x.shape[1]
+    blocks = gl.reshape(x, [M, D // 32, 32])
+    amax = gl.maximum(gl.max(gl.abs(blocks), axis=2), 1.1754943508222875e-38)
+    bits = gl.ceil(gl.log2(amax / 448.0)) + 127.0
+    bits = gl.minimum(gl.maximum(bits, 0.0), 254.0)
+    scl_l: gl.constexpr = bits.type.layout
+    hs = h0 + gl.arange(0, M, layout=gl.SliceLayout(1, scl_l))
+    gs = gl.arange(0, D // 32, layout=gl.SliceLayout(0, scl_l))
+    gl.amd.cdna4.buffer_store(
+        bits.to(gl.uint8),
+        ptr=scale_ptr,
+        offsets=(hs[:, None] * (D // 32) + gs[None, :]).to(gl.int32),
+        mask=(hs < num_heads)[:, None],
+    )
+    # The reciprocal, since a divisor of 2^-127 would flush to zero.
+    return gl.reshape(blocks * gl.exp2(127.0 - bits)[:, :, None], [M, D])
+
+
+@gluon.jit
+def _out_store(
+    x,
+    out_ptr,
+    out_stride0,
+    out_stride1,
+    row,
+    h0,
+    num_heads,
+    work_l: gl.constexpr,
+    pos_ptr,
+    cs_ptr,
+    cs_stride,
+    scale_ptr,
+    scale_stride0,
+    ROPE_DIM: gl.constexpr,
+    INV_ROPE: gl.constexpr,
+    OUT_MXFP8: gl.constexpr,
+):
+    """Store rows x [M, D] of one query row, heads h0 onwards. With INV_ROPE or
+    OUT_MXFP8 they are stored as vLLM leaves them before wo_a: rounded to bf16,
+    rotated back by the inverse RoPE, and quantized to e4m3 with one E8M0 byte
+    per 32 lanes. The arithmetic is that of rocm_inverse_rope_rows_ and
+    rocm_inverse_rope_mxfp8_rows, so the output is bit-identical to running
+    them after the kernel. That work is done in work_l."""
+    M: gl.constexpr = x.shape[0]
+    D: gl.constexpr = x.shape[1]
+    if INV_ROPE or OUT_MXFP8:
+        x = gl.convert_layout(x.to(gl.bfloat16), work_l).to(gl.float32)
+        if INV_ROPE:
+            x = _inv_rope(x, pos_ptr, cs_ptr, cs_stride, row, ROPE_DIM, OUT_MXFP8)
+        if OUT_MXFP8:
+            x = _mxfp8(x, scale_ptr + row * scale_stride0, h0, num_heads)
+    hs = h0 + gl.arange(0, M, layout=gl.SliceLayout(1, x.type.layout))
+    ds = gl.arange(0, D, layout=gl.SliceLayout(0, x.type.layout))
+    gl.amd.cdna4.buffer_store(
+        x.to(out_ptr.dtype.element_ty),
+        ptr=out_ptr,
+        offsets=(row * out_stride0 + hs[:, None] * out_stride1 + ds[None, :]).to(
+            gl.int32
+        ),
+        mask=(hs < num_heads)[:, None],
+    )
+
+
+@gluon.jit
 def _xcd_work(GRID_ORDER: gl.constexpr, NUM_XCDS: gl.constexpr):
     """(query, split, head block) of this program, remapped with remap_xcd so
     the programs that read the same KV rows share an XCD and its L2."""
@@ -2066,6 +2167,17 @@ def _sparse_mla(
     XCD_REMAP: gl.constexpr = 0,
     # fp8_dsv4_mla walk: gather a tile ahead (see _pipe_segment)
     PIPE_PREFETCH: gl.constexpr = False,
+    # Output epilogue without SPLIT_K (with it, the reduce's): INV_ROPE rotates
+    # the trailing ROPE_DIM lanes of each row back (pos_ptr [C] positions,
+    # cos_sin_ptr [P, ROPE_DIM] f32 cos | sin), and OUT_MXFP8 stores e4m3 to
+    # out_ptr plus one E8M0 byte per 32 lanes to out_scale_ptr [C, H * S // 32].
+    pos_ptr=None,
+    cos_sin_ptr=None,
+    cs_stride: gl.constexpr = 0,
+    out_scale_ptr=None,
+    os_stride0: gl.constexpr = 0,
+    INV_ROPE: gl.constexpr = False,
+    OUT_MXFP8: gl.constexpr = False,
 ):
     """One program = (query, split, head-block). Two-loop: main (SWA) then
     extra (top-k). Without SPLIT_K it writes the output directly; otherwise it
@@ -2136,6 +2248,10 @@ def _sparse_mla(
     gl.static_assert(
         (not PIPE) or (UNI_TILE and not ASYNC_LDS and not FP8_MFMA),
         "fp8_dsv4_mla takes the pipelined UNI_TILE walk (bf16 dots)",
+    )
+    gl.static_assert(
+        (not INV_ROPE) or (ROPE_DIM > 0 and not ROPE_SEPARATE),
+        "INV_ROPE needs the rope lanes inside the output row",
     )
     if SLOT_U32:
         # No-op given the pitch guarantee; lets block * cs0 use a 24-bit multiply.
@@ -2524,16 +2640,28 @@ def _sparse_mla(
             m_final = m_pv
             l_final = l_pv
         one_over_l = 1.0 / l_final
-        out = acc * one_over_l[:, None]
-        offs_d_o = gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(0, cfg.pv_layout))
-        o_off = (
-            query_idx * out_stride0 + h_pv[:, None] * out_stride1 + offs_d_o[None, :]
-        ).to(gl.int32)
-        gl.amd.cdna4.buffer_store(
-            out.to(out_ptr.dtype.element_ty),
-            ptr=out_ptr,
-            offsets=o_off,
-            mask=head_mask_pv[:, None],
+        # The epilogue works on 32 consecutive lanes per thread, so lane pairs
+        # and scale groups stay in registers.
+        EPI_L: gl.constexpr = gl.BlockedLayout(
+            [1, 32], [16, 4], [NUM_WARPS // cfg.N_WARPS, cfg.N_WARPS], [1, 0]
+        )
+        _out_store(
+            acc * one_over_l[:, None],
+            out_ptr,
+            out_stride0,
+            out_stride1,
+            query_idx,
+            h_off,
+            num_heads,
+            EPI_L,
+            pos_ptr,
+            cos_sin_ptr,
+            cs_stride,
+            out_scale_ptr,
+            os_stride0,
+            ROPE_DIM,
+            INV_ROPE,
+            OUT_MXFP8,
         )
         if HAS_LSE:
             # m is base-2, so sum_j exp(s_j) = 2^m * l and ln of it is
@@ -2609,6 +2737,15 @@ def _sparse_mla_reduce(
     ADAPTIVE_SPLITS: gl.constexpr,
     lse_ptr=None,
     HAS_LSE: gl.constexpr = False,
+    # Output epilogue, as in _sparse_mla
+    pos_ptr=None,
+    cos_sin_ptr=None,
+    cs_stride: gl.constexpr = 0,
+    out_scale_ptr=None,
+    os_stride0: gl.constexpr = 0,
+    ROPE_DIM: gl.constexpr = 0,
+    INV_ROPE: gl.constexpr = False,
+    OUT_MXFP8: gl.constexpr = False,
 ):
     """Split-KV combine: merge per-split partials, fold the sink, write the
     output. Identical for both geometries (partials are HEAD_SIZE = V wide).
@@ -2683,12 +2820,24 @@ def _sparse_mla_reduce(
                 (m_final + gl.log2(l_final)) * LN2,
                 mask=h < num_heads,
             )
-        # One reciprocal per row instead of a per-element f32 divide.
-        out = acc * (1.0 / l_final)
-        o_off = (query_idx * out_stride0 + h * out_stride1 + offs_d).to(gl.int32)
-        gl.amd.cdna4.buffer_store(
-            out.to(out_ptr.dtype.element_ty),
-            ptr=out_ptr,
-            offsets=o_off,
-            mask=(offs_d < HEAD_SIZE) & (h < num_heads),
+        # One reciprocal per row instead of a per-element f32 divide. The
+        # epilogue stays in the tile layout: each split lane's copy of the row
+        # can differ by a rounding, and the stores keep split 0's, as before.
+        _out_store(
+            gl.expand_dims(acc * (1.0 / l_final), 0),
+            out_ptr,
+            out_stride0,
+            out_stride1,
+            query_idx,
+            h,
+            num_heads,
+            TILE,
+            pos_ptr,
+            cos_sin_ptr,
+            cs_stride,
+            out_scale_ptr,
+            os_stride0,
+            ROPE_DIM,
+            INV_ROPE,
+            OUT_MXFP8,
         )
