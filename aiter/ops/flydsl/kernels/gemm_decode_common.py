@@ -16,7 +16,6 @@ import flydsl.expr as fx
 from flydsl.expr import range_constexpr
 from flydsl.expr.typing import T
 
-from aiter.flydsl_gemm_registry import DECODE_MAX_M
 from aiter.jit.utils.chip_info import get_cu_num, get_lds_capacity_bytes
 
 # Host configuration, validation, naming, and enumeration.
@@ -187,6 +186,10 @@ class BlockMfmaDecodeConfig:
 
 
 DecodeConfig: TypeAlias = WaveDecodeConfig | BlockMfmaDecodeConfig
+
+
+# The decode kernels are exact-M specializations for M = 1..DECODE_MAX_M.
+DECODE_MAX_M = 5
 
 
 def _validate_problem(m: int, n: int, k: int) -> None:

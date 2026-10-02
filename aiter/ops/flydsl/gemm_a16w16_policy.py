@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 import torch
 
-from aiter.jit.utils.chip_info import get_gfx, get_lds_capacity_bytes
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx, get_lds_capacity_bytes
 
 from .kernels.gemm_a16w16_gfx950 import (
     GEMM_A16W16_DTYPE_BF16,
@@ -17,7 +17,11 @@ from .kernels.gemm_a16w16_gfx950 import (
     make_gemm_a16w16_param_and_validate,
 )
 
-__all__ = ["GemmConfigPruner", "get_flydsl_a16w16_configs"]
+__all__ = [
+    "GemmConfigPruner",
+    "get_flydsl_a16w16_configs",
+    "get_flydsl_a16w16_decode_configs",
+]
 
 
 @dataclass(frozen=True)
@@ -216,3 +220,111 @@ def get_flydsl_a16w16_configs(
         ):
             valid_configs.append(config)
     return valid_configs
+
+
+def _round_robin_representatives(items, *, limit, bucket_key, priority_key):
+    buckets = {}
+    for item in items:
+        buckets.setdefault(bucket_key(item), []).append(item)
+    for bucket in buckets.values():
+        bucket.sort(key=priority_key)
+
+    keys = sorted(buckets, key=str)
+    offsets = {key: 0 for key in keys}
+    selected = []
+    while keys and len(selected) < limit:
+        next_keys = []
+        for key in keys:
+            offset = offsets[key]
+            bucket = buckets[key]
+            if offset >= len(bucket):
+                continue
+            selected.append(bucket[offset])
+            offsets[key] = offset + 1
+            if offsets[key] < len(bucket):
+                next_keys.append(key)
+            if len(selected) >= limit:
+                break
+        keys = next_keys
+    return selected
+
+
+def _bounded_decode_configs(configs, limit: int = 12) -> list:
+    """Pick a small but representative set of decode candidates.
+
+    The catalog lists every Wave configuration before any BlockMFMA one, so a
+    plain prefix would time Wave only. Round-robining across family buckets
+    keeps the budget and times both families.
+    """
+    from .gemm_kernels import WaveDecodeConfig
+
+    def bucket(config):
+        if isinstance(config, WaveDecodeConfig):
+            return ("wave", config.contraction.value)
+        return ("block", config.activation_source.value, bool(config.persistent_n))
+
+    def priority(config):
+        if isinstance(config, WaveDecodeConfig):
+            return (
+                -config.m_per_wave,
+                config.n_per_wave != 1,
+                config.kvec != 8,
+                config.prefetch_depth != 1,
+                config.waves_per_eu != 2,
+                config.b_cache_modifier != 0,
+                config.reduction.value != "dpp",
+                repr(config),
+            )
+        return (
+            config.waves_per_workgroup != 8,
+            config.columns_per_wave != 1,
+            config.b_load_width != 8,
+            config.k_unroll != 2,
+            config.waves_per_eu != 2,
+            config.workgroups_per_cu != 1,
+            config.b_cache_modifier != 0,
+            repr(config),
+        )
+
+    return _round_robin_representatives(
+        list(configs), limit=limit, bucket_key=bucket, priority_key=priority
+    )
+
+
+def get_flydsl_a16w16_decode_configs(
+    m: int,
+    n: int,
+    k: int,
+    out_dtype: torch.dtype,
+    has_bias: bool,
+    policy: str = "bounded",
+):
+    """Exact-M decode candidates as ``(solidx, kernel_name, config)``.
+
+    ``bounded`` keeps a small representative sample; ``deep`` keeps the full
+    catalog. Empty outside M = 1..DECODE_MAX_M, gfx942/gfx950 and BF16 output.
+    """
+    from .gemm_kernels import (
+        DECODE_MAX_M,
+        gemm_decode_kernel_name,
+        iter_gemm_decode_configs,
+    )
+
+    arch = get_gfx()
+    if (
+        not 1 <= m <= DECODE_MAX_M
+        or arch not in ("gfx942", "gfx950")
+        or out_dtype != torch.bfloat16
+    ):
+        return []
+    configs = list(iter_gemm_decode_configs(m, n, k, arch, num_cus=get_cu_num()))
+    if policy == "bounded":
+        configs = _bounded_decode_configs(configs)
+    return [
+        (
+            solidx,
+            gemm_decode_kernel_name(arch, m, n, k, config, has_bias=has_bias),
+            config,
+        )
+        for solidx, config in enumerate(configs)
+    ]

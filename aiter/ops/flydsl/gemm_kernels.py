@@ -13,7 +13,6 @@ import torch
 from torch import Tensor
 
 from aiter import logger
-from aiter.flydsl_gemm_registry import DECODE_MAX_M
 from aiter.jit.utils.chip_info import (
     get_cu_num,
     get_gfx,
@@ -28,6 +27,7 @@ from .kernels.gemm_a16w16_gfx950 import (
 )
 from .kernels.gemm_decode_block_mfma import compile_gemm_decode_block_mfma_bf16
 from .kernels.gemm_decode_common import (
+    DECODE_MAX_M,
     ActivationSource,
     BlockMfmaDecodeConfig,
     ContractionMode,
@@ -52,13 +52,16 @@ __all__ = [
     "OutputRounding",
     "ReductionMode",
     "WaveDecodeConfig",
+    "check_flydsl_decode_row",
     "compile_gemm_decode_bf16",
+    "flydsl_decode_gemm",
     "flydsl_hgemm",
     "flydsl_hgemm_kernel_name",
     "flydsl_preshuffle_gemm_a8",
     "gemm_decode_bf16",
     "gemm_decode_kernel_name",
     "get_decode_arch_traits",
+    "get_flydsl_decode_kernel_params",
     "get_flydsl_hgemm_kernel_params",
     "iter_gemm_decode_configs",
     "parse_gemm_decode_kernel_name",
@@ -413,6 +416,78 @@ def gemm_decode_bf16(
     )
     launcher(A, B, C, bias=bias, stream=fx.Stream(launch_stream))
     return C
+
+
+def get_flydsl_decode_kernel_params(name: str) -> dict | None:
+    """Parse a decode kernel name; None if it is not a valid decode name."""
+    try:
+        arch, m, n, k, config, has_bias = parse_gemm_decode_kernel_name(name)
+    except ValueError:
+        return None
+    return {
+        "arch": arch,
+        "m": m,
+        "n": n,
+        "k": k,
+        "config": config,
+        "has_bias": has_bias,
+    }
+
+
+def check_flydsl_decode_row(
+    params: dict,
+    m: int,
+    n: int,
+    k: int,
+    arch: str,
+    has_bias: bool,
+    in_dtype: torch.dtype,
+    out_dtype: torch.dtype,
+    scaled: bool,
+    preshuffled: bool,
+) -> str | None:
+    """None if a decode row fits the call, otherwise the reason it does not."""
+    if (in_dtype, out_dtype) != (torch.bfloat16, torch.bfloat16):
+        return f"decode is BF16 only, call is {in_dtype}->{out_dtype}"
+    if scaled or preshuffled:
+        return "decode supports neither scaling nor preshuffled weights"
+    got = (params["arch"], params["m"], params["n"], params["k"], params["has_bias"])
+    want = (arch, m, n, k, has_bias)
+    if got != want:
+        return f"kernel identity {got} does not match the call {want}"
+    return None
+
+
+def flydsl_decode_gemm(
+    inp: torch.Tensor,
+    weights: torch.Tensor,
+    kernel_name: str,
+    bias: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Launch the exact-M/N/K decode kernel that a tuned row names."""
+    params = get_flydsl_decode_kernel_params(kernel_name)
+    if params is None:
+        raise ValueError(f"invalid FlyDSL decode kernel name: {kernel_name!r}")
+    expected = (
+        get_gfx_runtime(),
+        int(inp.shape[0]),
+        int(weights.shape[0]),
+        int(inp.shape[1]),
+    )
+    kernel = (params["arch"], params["m"], params["n"], params["k"])
+    if kernel != expected:
+        raise ValueError(
+            "FlyDSL decode tuned kernel does not match the runtime "
+            f"exact identity: kernel={kernel}, runtime={expected}"
+        )
+    if params["has_bias"] != (bias is not None):
+        raise ValueError("FlyDSL decode kernel bias identity does not match launch")
+    if out is None:
+        out = torch.empty(
+            (params["m"], params["n"]), dtype=torch.bfloat16, device=inp.device
+        )
+    return gemm_decode_bf16(inp, weights, out, params["config"], bias=bias)
 
 
 @functools.lru_cache(maxsize=1)

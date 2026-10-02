@@ -47,7 +47,6 @@ from contextlib import nullcontext
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 
-from aiter import flydsl_gemm_registry
 from aiter.aot.flydsl.common import (
     collect_aot_jobs,
     compile_only_env,
@@ -56,7 +55,6 @@ from aiter.aot.flydsl.common import (
     override_env,
     run_jobs_parallel,
 )
-from aiter.flydsl_gemm_registry import A16W16
 from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.batched_gemm_a8w8_gfx950 import (
     BMM_MFMA_NAME_PREFIX,
@@ -73,6 +71,8 @@ from aiter.ops.flydsl.gemm_a8w8_bpreshuffle_8wave import (
 from aiter.ops.flydsl.gemm_kernels import (
     SPLIT_K_SEMAPHORE_MAX_LEN,
     compile_gemm_decode_bf16,
+    get_flydsl_decode_kernel_params,
+    get_flydsl_hgemm_kernel_params,
 )
 from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 import (
     GEMM_A16W16_DTYPE_BF16,
@@ -216,6 +216,35 @@ def _bmm_mfma_job(
     }
 
 
+def _decode_aot_params(row: dict, kernel_name: str) -> dict | None:
+    """AOT params of a decode row, checked against the row; None for a bad name."""
+    params = get_flydsl_decode_kernel_params(kernel_name)
+    if params is None:
+        return None
+    m, n, k = int(row["M"]), int(row["N"]), int(row["K"])
+    csv_arch = (row.get("gfx") or "").strip()
+    if (params["m"], params["n"], params["k"]) != (m, n, k):
+        raise ValueError(
+            "FlyDSL decode kernel name shape does not match CSV row: "
+            f"name={(params['m'], params['n'], params['k'])}, row={(m, n, k)}"
+        )
+    if csv_arch and csv_arch != params["arch"]:
+        raise ValueError(
+            f"FlyDSL decode architecture mismatch: name={params['arch']}, csv={csv_arch}"
+        )
+    if params["has_bias"] != _parse_bool(row.get("bias")):
+        raise ValueError("FlyDSL decode CSV bias metadata does not match kernel name")
+    if (row.get("dtype") or "").strip() != "torch.bfloat16":
+        raise ValueError("FlyDSL decode AOT requires BF16 input dtype")
+    if (row.get("outdtype") or "").strip() != "torch.bfloat16":
+        raise ValueError("FlyDSL decode AOT requires BF16 output dtype")
+    if _parse_bool(row.get("scaleAB")):
+        raise ValueError("FlyDSL decode AOT does not support scaling")
+    if _parse_bool(row.get("bpreshuffle")):
+        raise ValueError("FlyDSL decode AOT does not support preshuffled weights")
+    return {"kind": "decode", "config": params["config"]}
+
+
 def parse_csv(csv_path: str):
     """Parse a GEMM tuned CSV and return a list of unique FlyDSL compile jobs."""
     jobs = []
@@ -225,37 +254,8 @@ def parse_csv(csv_path: str):
     with open(csv_path, newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            kernel_name = (row.get("kernelName") or "").strip()
-            libtype = (row.get("libtype") or "").strip()
-            family = None
-            if libtype == flydsl_gemm_registry.FLYDSL_LIBTYPE:
-                family = flydsl_gemm_registry.family_for_kernel(
-                    A16W16, kernel_name, (row.get("gfx") or "").strip() or None
-                )
-            if family is not None:
-                if family.aot_job is None:
-                    continue
-                if family.parse(kernel_name) is None:
-                    print(
-                        f"  [WARN] Unknown FlyDSL GEMM kernel name: {kernel_name}, skipping"
-                    )
-                    continue
-                params = family.aot_job(row, kernel_name)
-                job = {
-                    **params,
-                    "kernel_name": kernel_name,
-                    "m": int(row["M"]),
-                    "n": int(row["N"]),
-                    "k": int(row["K"]),
-                    "cu_num": int(row.get("cu_num", "0")),
-                    "gfx": params.get("gfx") or (row.get("gfx") or "").strip(),
-                    "has_bias": _parse_bool(row.get("bias")),
-                }
-                key = job_identity(job)
-                if key not in seen:
-                    seen.add(key)
-                    jobs.append(job)
-                continue
+            kernel_name = row.get("kernelName", "").strip()
+            libtype = row.get("libtype", "").strip()
             if libtype != "flydsl" or not kernel_name.startswith("flydsl_"):
                 continue
 
@@ -315,6 +315,17 @@ def parse_csv(csv_path: str):
                 if params is not None:
                     params = dict(params)
                     params["kind"] = "ptpc_wmma"
+            elif kernel_name.startswith("flydsl_hgemm"):
+                params = get_flydsl_hgemm_kernel_params(kernel_name)
+                if params is not None:
+                    params = dict(params)
+                    params["kind"] = (
+                        "a16w16_gfx1250"
+                        if params["target_gfx"] == "gfx1250"
+                        else "hgemm"
+                    )
+            elif kernel_name.startswith("flydsl_decode_"):
+                params = _decode_aot_params(row, kernel_name)
             else:
                 params = None
 
@@ -323,8 +334,8 @@ def parse_csv(csv_path: str):
                     f"  [WARN] Unknown FlyDSL GEMM kernel name: {kernel_name}, skipping"
                 )
                 continue
+
             job = {
-                **params,
                 "kernel_name": kernel_name,
                 "m": m,
                 "n": n,
@@ -332,6 +343,7 @@ def parse_csv(csv_path: str):
                 "cu_num": cu_num,
                 "gfx": gfx,
                 "has_bias": _parse_bool(row.get("bias")),
+                **params,
             }
             key = job_identity(job)
             if key in seen:
@@ -987,7 +999,6 @@ def compile_one_config(
         ):
             if kind == "hgemm":
                 hgemm_kwargs = dict(kwargs)
-                hgemm_kwargs.pop("kernel_family", None)
                 hgemm_kwargs["target_gfx"] = aot_arch
                 _compile_hgemm_to_cache(m=m, n=n, k=k, **hgemm_kwargs)
             elif kind == "a16w16_gfx1250":

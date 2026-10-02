@@ -84,11 +84,6 @@ If you have built kernels before tuning, add `AITER_REBUILD=1` to rebuild with n
 - **Default**: `bounded`
 - **Description**: How many FlyDSL decode (M = 1..5) configurations to time per shape. `bounded` times a small sample (12 per shape). `deep` times the full catalog, from about 170 to about 1000 configurations per shape. The decode rows in `aiter/configs/model_configs/kimik3_bf16_tuned_gemm.csv` were found with `deep`. Most of them are not in the `bounded` sample.
 
-### `--flydsl-family`
-- **Type**: Comma-separated string
-- **Default**: every FlyDSL family registered for the GPU
-- **Description**: Restrict FlyDSL candidates to the named families, e.g. `decode` or `hgemm_gfx950`. It is meant for quick runs while working on one family's kernels. Do not use it to produce tuned rows: a row should win against every backend.
-
 ### Re-tuning the small-M decode rows
 The decode rows are meant to win a fair comparison against every backend. To regenerate them, tune every backend with the full decode catalog:
 ```bash
