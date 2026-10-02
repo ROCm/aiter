@@ -23,8 +23,20 @@ from aiter.ops.triton.attention.mha_fused_bwd import flash_attn_fused_backward
 from aiter.ops.triton.attention.mha_onekernel_bwd import flash_attn_onekernel_backward
 from aiter.ops.triton.utils import types
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.utils.device_info import get_num_xcds
+from aiter.ops.triton.utils.device_info import get_num_sms, get_num_xcds
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+# gfx1250
+try:
+    from aiter.ops.triton._gluon_kernels.gfx1250.attention.mha_prefill import (
+        _get_config as _get_gfx1250_gluon_config,
+    )
+    from aiter.ops.triton._gluon_kernels.gfx1250.attention.mha_prefill import (
+        _mha_prefill_gfx1250,
+    )
+except Exception:  # noqa: BLE001
+    _get_gfx1250_gluon_config = None
+    _mha_prefill_gfx1250 = None
 
 _LOGGER = AiterTritonLogger()
 
@@ -37,16 +49,23 @@ _LOGGER = AiterTritonLogger()
 # call?" and are shared by the wrappers below (to reject unsupported calls) and
 # the unit tests (to skip unsupported parametrizations).
 # ---------------------------------------------------------------------------
-_GLUON_SUPPORTED_ARCHS = ("gfx950",)
+_GLUON_SUPPORTED_ARCHS = ("gfx950", "gfx1250")
 _TRITON_GE_36 = Version(triton.__version__) >= Version("3.6.0")
+_GFX1250_GLUON_HEAD_DIMS = (64, 128)
 
 _USE_FUSED_BWD_KERNEL = False
+
+
+def _is_gfx1250() -> bool:
+    return get_arch() == "gfx1250"
 
 
 def is_gluon_available() -> bool:
     """True when the Gluon MHA forward kernel can actually run on this device."""
     if not _TRITON_GE_36:
         return False
+    if _is_gfx1250():
+        return _mha_prefill_gfx1250 is not None
     arch = get_arch() or ""
     return any(supported in arch for supported in _GLUON_SUPPORTED_ARCHS)
 
@@ -197,8 +216,15 @@ def gluon_forward_unsupported_reason(
     bias=None,
     alibi_slopes=None,
     block_table=None,
+    head_dim: int | None = None,
+    v_head_dim: int | None = None,
+    return_attn_probs: bool = False,
 ):
-    """Reason (str) why the Gluon forward backend can't serve this config, else None."""
+    """Reason (str) why the Gluon forward backend can't serve this config, else None.
+
+    ``head_dim``/``v_head_dim`` (q/k and v head sizes) and ``return_attn_probs``
+    only restrict the gfx1250 kernel; leave them unset to skip those checks.
+    """
     if not is_gluon_available():
         return (
             f"Gluon MHA backend requires one of {_GLUON_SUPPORTED_ARCHS} with "
@@ -212,6 +238,19 @@ def gluon_forward_unsupported_reason(
         return "Gluon MHA backend does not support alibi slopes"
     if block_table is not None:
         return "Gluon MHA backend does not support paged KV (block_table)"
+    if _is_gfx1250():
+        if return_attn_probs:
+            return "Gluon MHA backend on gfx1250 does not support return_attn_probs"
+        if head_dim is not None and head_dim not in _GFX1250_GLUON_HEAD_DIMS:
+            return (
+                f"Gluon MHA backend on gfx1250 supports head_dim in "
+                f"{_GFX1250_GLUON_HEAD_DIMS}, got {head_dim}"
+            )
+        if head_dim is not None and v_head_dim is not None and v_head_dim != head_dim:
+            return (
+                "Gluon MHA backend on gfx1250 needs equal q/k and v head_dim "
+                f"(no positional encoding), got {head_dim} and {v_head_dim}"
+            )
     return None
 
 
@@ -282,6 +321,8 @@ def _gluon_flash_attn_forward(
             ``return_lse`` is False.
         s_dmask: fp32 (batch, num_q_heads, max_seqlen_q, max_seqlen_k) softmax
             probabilities, or None when ``return_softmax`` is False.
+
+    gfx1250 runs a separate kernel, see ``_gluon_gfx1250_flash_attn_forward``.
     """
     varlen = cu_seqlens_q is not None
 
@@ -289,6 +330,27 @@ def _gluon_flash_attn_forward(
         f"Gluon MHA backend requires one of {_GLUON_SUPPORTED_ARCHS} with "
         f"Triton>=3.6 (arch={get_arch()!r}, triton={triton.__version__})"
     )
+    if _is_gfx1250():
+        return _gluon_gfx1250_flash_attn_forward(
+            q,
+            k,
+            v,
+            sm_scale,
+            causal,
+            window_size,
+            return_lse,
+            return_softmax,
+            max_seqlen_q,
+            max_seqlen_k,
+            o=o,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            descale_q=descale_q,
+            descale_k=descale_k,
+            descale_v=descale_v,
+            sink=sink,
+            config=config,
+        )
     assert q.shape[-1] == k.shape[-1], "q/k head_dim mismatch"
 
     if int(window_size[1]) != -1:
@@ -489,6 +551,280 @@ def _gluon_flash_attn_forward(
     )
 
     return o, softmax_lse, s_dmask
+
+
+_INT32_MAX = (1 << 31) - 1
+_GFX1250_INV_LN2 = 1.4426950408889634
+
+
+def _gfx1250_fold_batch(x: torch.Tensor) -> torch.Tensor:
+    """The gfx1250 kernel walks bshd as packed tokens (batch b starts at token
+    b * seqlen), so batch and sequence must share one token stride."""
+    batch, seqlen = x.shape[:2]
+    if x.stride(-1) != 1 or (batch > 1 and x.stride(0) != seqlen * x.stride(1)):
+        x = x.contiguous()
+    return x
+
+
+def _gfx1250_fp8_descale(
+    descale: torch.Tensor, batch: int, heads: int, name: str
+) -> tuple[torch.Tensor, tuple[int, int]]:
+    """A per-tensor (one element) or per-(batch, head) descale and its strides."""
+    if descale.dtype != torch.float32:
+        descale = descale.to(torch.float32)
+    if descale.numel() == 1:
+        return descale, (0, 0)
+    if tuple(descale.shape) != (batch, heads):
+        raise ValueError(
+            f"{name} must have one element or shape ({batch}, {heads}), "
+            f"got {tuple(descale.shape)}"
+        )
+    return descale, descale.stride()
+
+
+def _gfx1250_tile_fits_int32(x: torch.Tensor, block_m: int) -> bool:
+    """Buffer ops reach the rows of one (query tile, head) through 32-bit byte
+    offsets from a 64-bit base."""
+    last = (block_m - 1) * x.stride(-3) + (x.shape[-1] - 1) * x.stride(-1)
+    return last * x.element_size() <= _INT32_MAX
+
+
+def _get_gfx1250_launch_config(
+    batch: int,
+    num_q_heads: int,
+    seqlen_q: int,
+    head_dim: int,
+    sliding_window: int,
+    causal: bool,
+    config: dict | None,
+) -> tuple[tuple[int, int, int], dict]:
+    """Grid and kernel knobs. Tiles and thresholds live in the JSON config."""
+    table = _get_gfx1250_gluon_config()
+    dispatch = table["dispatch"]
+    num_cus = get_num_sms()
+    if config is None:
+        # The wide tile (256 rows, 8 warps) is ~1.4x faster than the narrow one
+        # (128 rows, 4 warps), but it halves the grid and doubles the masked
+        # part of the causal diagonal block, so short or small launches stay
+        # narrow.
+        wide = table["wide"]
+        wide_grid = batch * num_q_heads * triton.cdiv(seqlen_q, wide["BLOCK_M"])
+        use_wide = seqlen_q >= dispatch["wide_min_seqlen_q"] and wide_grid >= num_cus
+        config = wide if use_wide else table["narrow"]
+    config = dict(config)
+    grid = (batch, num_q_heads, triton.cdiv(seqlen_q, config["BLOCK_M"]))
+    # Producer-warp TDM loads and longest-first causal order only pay off when
+    # the grid fills the device and there is no window.
+    full_grid = sliding_window == 0 and math.prod(grid) >= num_cus
+    config["TDM_WARP_HINT"] = bool(config.get("TDM_WARP_HINT", False)) and full_grid
+    config["REVERSE_Q_BLOCKS"] = causal and full_grid and seqlen_q > config["BLOCK_M"]
+    if (
+        head_dim == dispatch["sched_head_dim"]
+        and seqlen_q >= dispatch["sched_min_seqlen_q"]
+        and sliding_window == 0
+    ):
+        config["llvm_fn_attrs"] = f"amdgpu-sched-strategy={dispatch['sched_strategy']}"
+    return grid, config
+
+
+def _gluon_gfx1250_flash_attn_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    sm_scale: float,
+    causal: bool,
+    window_size: tuple[int, int],
+    return_lse: bool,
+    return_softmax: bool,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    o: torch.Tensor | None = None,
+    cu_seqlens_q: torch.Tensor | None = None,
+    cu_seqlens_k: torch.Tensor | None = None,
+    descale_q: torch.Tensor | None = None,
+    descale_k: torch.Tensor | None = None,
+    descale_v: torch.Tensor | None = None,
+    sink: torch.Tensor | None = None,
+    config: dict[str, any] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None, None]:
+    """gfx1250 Gluon forward, with the arguments of ``_gluon_flash_attn_forward``.
+
+    Supports fp16/bf16 and e4m3 FP8 q/k/v with head_dim 64 or 128, MQA/GQA, a
+    bottom-right aligned causal mask, a left sliding window, sinks and LSE.
+    FP8 descales are per-tensor (one element) or per-(batch, head). FP8 writes
+    bf16 by default; a caller ``o`` may be bf16, fp16 or fp32. Positional
+    encoding and ``return_softmax`` are not supported. ``config`` replaces the
+    JSON tile (``BLOCK_M``, ``BLOCK_N``, ``NUM_BUFFERS``, ``num_warps``,
+    ``waves_per_eu`` and optionally ``TDM_WARP_HINT``).
+    """
+    varlen = cu_seqlens_q is not None
+    if return_softmax:
+        raise ValueError(
+            "Gluon MHA backend on gfx1250 does not support return_attn_probs"
+        )
+    if int(window_size[1]) != -1:
+        raise ValueError("window_size_right is not supported yet in the Gluon Backend")
+    sliding_window = _get_sliding_window_size(window_size)
+
+    supported_dtypes = (torch.float16, torch.bfloat16, types.e4m3_dtype)
+    if q.dtype not in supported_dtypes or k.dtype != q.dtype or v.dtype != q.dtype:
+        raise TypeError(
+            f"Gluon MHA on gfx1250 needs q/k/v of one dtype in {supported_dtypes}, "
+            f"got q={q.dtype}, k={k.dtype}, v={v.dtype}"
+        )
+    is_fp8 = q.dtype == types.e4m3_dtype
+
+    ndim = 3 if varlen else 4
+    if q.ndim != ndim or k.ndim != ndim or v.ndim != ndim:
+        raise ValueError(
+            f"expected {ndim}D q/k/v, got {q.ndim}D/{k.ndim}D/{v.ndim}D tensors"
+        )
+    head_dim = q.shape[-1]
+    if head_dim not in _GFX1250_GLUON_HEAD_DIMS:
+        raise ValueError(
+            f"Gluon MHA on gfx1250 supports head_dim in {_GFX1250_GLUON_HEAD_DIMS}, "
+            f"got {head_dim}"
+        )
+    if k.shape != v.shape or k.shape[-1] != head_dim:
+        raise ValueError(
+            "Gluon MHA on gfx1250 needs k and v of one shape with q's head_dim, "
+            f"got q={tuple(q.shape)}, k={tuple(k.shape)}, v={tuple(v.shape)}"
+        )
+    num_q_heads, num_k_heads = q.shape[-2], k.shape[-2]
+    if num_q_heads % num_k_heads != 0:
+        raise ValueError(
+            f"num_q_heads ({num_q_heads}) must be divisible by "
+            f"num_k_heads ({num_k_heads})"
+        )
+
+    if varlen:
+        if cu_seqlens_k is None or cu_seqlens_k.numel() != cu_seqlens_q.numel():
+            raise ValueError("cu_seqlens_k must match cu_seqlens_q in length")
+        if cu_seqlens_q.dtype != torch.int32 or cu_seqlens_k.dtype != torch.int32:
+            raise TypeError("cu_seqlens_q/cu_seqlens_k must be int32")
+        batch = cu_seqlens_q.numel() - 1
+        seqlen_q, seqlen_k = int(max_seqlen_q), int(max_seqlen_k)
+        q, k, v = (x if x.stride(-1) == 1 else x.contiguous() for x in (q, k, v))
+    else:
+        batch, seqlen_q = q.shape[:2]
+        seqlen_k = k.shape[1]
+        if k.shape[0] != batch:
+            raise ValueError(f"q has batch {batch} but k/v have batch {k.shape[0]}")
+        q, k, v = (_gfx1250_fold_batch(x) for x in (q, k, v))
+
+    if sink is not None:
+        if sink.dim() != 1 or sink.shape[0] != num_q_heads:
+            raise ValueError("Sink must be 1D and have one element per query head.")
+        sink = sink.contiguous()
+
+    if is_fp8:
+        if descale_q is None or descale_k is None or descale_v is None:
+            raise ValueError("FP8 Gluon MHA requires descale_q/descale_k/descale_v")
+        descale_q, q_ds = _gfx1250_fp8_descale(
+            descale_q, batch, num_q_heads, "descale_q"
+        )
+        descale_k, k_ds = _gfx1250_fp8_descale(
+            descale_k, batch, num_k_heads, "descale_k"
+        )
+        descale_v, v_ds = _gfx1250_fp8_descale(
+            descale_v, batch, num_k_heads, "descale_v"
+        )
+    else:
+        descale_q = descale_k = descale_v = q
+        q_ds = k_ds = v_ds = (0, 0)
+
+    out_dtypes = (
+        (torch.bfloat16, torch.float16, torch.float32) if is_fp8 else (q.dtype,)
+    )
+    if o is None:
+        o = torch.empty(q.shape, dtype=out_dtypes[0], device=q.device)
+    elif o.shape != q.shape or o.dtype not in out_dtypes or o.stride(-1) != 1:
+        raise ValueError(
+            f"Gluon MHA out must be {tuple(q.shape)} with dtype in {out_dtypes} "
+            f"and unit head_dim stride, got {tuple(o.shape)} {o.dtype} "
+            f"strides {o.stride()}"
+        )
+    elif not varlen and batch > 1 and o.stride(0) != seqlen_q * o.stride(1):
+        raise ValueError("Gluon MHA out must fold batch and sequence into tokens")
+
+    if return_lse:
+        if varlen:
+            softmax_lse = torch.empty(
+                (q.shape[0], num_q_heads), device=q.device, dtype=torch.float32
+            )
+            lse_strides = (0, softmax_lse.stride(1), softmax_lse.stride(0))
+        else:
+            softmax_lse = torch.empty(
+                (batch, num_q_heads, seqlen_q), device=q.device, dtype=torch.float32
+            )
+            lse_strides = softmax_lse.stride()
+    else:
+        softmax_lse = None
+        lse_strides = (0, 0, 0)
+
+    grid, launch = _get_gfx1250_launch_config(
+        batch, num_q_heads, seqlen_q, head_dim, sliding_window, causal, config
+    )
+    if not _gfx1250_tile_fits_int32(q, launch["BLOCK_M"]):
+        q = q.contiguous()
+    if not _gfx1250_tile_fits_int32(o, launch["BLOCK_M"]):
+        raise ValueError(
+            "Gluon MHA on gfx1250 addresses one out tile with 32-bit byte "
+            f"offsets; out strides {o.stride()} are too large"
+        )
+    num_warps = launch.pop("num_warps")
+    llvm_fn_attrs = launch.pop("llvm_fn_attrs", None)
+    _mha_prefill_gfx1250[grid](
+        q,
+        k,
+        v,
+        o,
+        sink if sink is not None else q,
+        softmax_lse if softmax_lse is not None else q,
+        cu_seqlens_q if varlen else q,
+        cu_seqlens_k if varlen else q,
+        seqlen_q,
+        seqlen_k,
+        descale_q,
+        descale_k,
+        descale_v,
+        *q_ds,
+        *k_ds,
+        *v_ds,
+        *lse_strides,
+        Q_STRIDE_T=q.stride(-3),
+        Q_STRIDE_H=q.stride(-2),
+        Q_STRIDE_D=q.stride(-1),
+        K_STRIDE_T=k.stride(-3),
+        K_STRIDE_H=k.stride(-2),
+        K_STRIDE_D=k.stride(-1),
+        V_STRIDE_T=v.stride(-3),
+        V_STRIDE_H=v.stride(-2),
+        V_STRIDE_D=v.stride(-1),
+        O_STRIDE_T=o.stride(-3),
+        O_STRIDE_H=o.stride(-2),
+        O_STRIDE_D=o.stride(-1),
+        N_HEADS=num_q_heads,
+        N_KV_HEADS=num_k_heads,
+        HEAD_DIM=head_dim,
+        SM_SCALE=sm_scale * _GFX1250_INV_LN2,
+        BLOCK_M=launch["BLOCK_M"],
+        BLOCK_N=launch["BLOCK_N"],
+        IS_FP8=is_fp8,
+        IS_VARLEN=varlen,
+        HAS_SINK=sink is not None,
+        HAS_LSE=return_lse,
+        SLIDING_WINDOW=sliding_window,
+        IS_CAUSAL=causal,
+        TDM_WARP_HINT=launch["TDM_WARP_HINT"],
+        REVERSE_Q_BLOCKS=launch["REVERSE_Q_BLOCKS"],
+        NUM_WARPS=num_warps,
+        NUM_BUFFERS=launch["NUM_BUFFERS"],
+        num_warps=num_warps,
+        waves_per_eu=launch["waves_per_eu"],
+        **({"llvm_fn_attrs": llvm_fn_attrs} if llvm_fn_attrs else {}),
+    )
+    return o, softmax_lse, None
 
 
 def _flash_attn_forward(
@@ -1039,15 +1375,16 @@ def flash_attn_func(
         sink: (nheads,), attention sink scores (one per Q head), or None
         q_descale, k_descale, v_descale: optional fp8 dequant scalars, honored only
             by the "gluon" backend when q/k/v are fp8. Shapes (batch, num_q_heads)
-            for q and (batch, num_k_heads) for k/v; the output is fp32.
-        backend: "triton" (default) or "gluon". The "gluon" backend runs the
-            forward-only gfx950 Gluon kernel and supports the base feature set
-            plus FP8, positional encoding, attention sink, a left sliding window
-            and return_lse/return_attn_probs (no dropout/bias/alibi, no right
-            window and no backward pass). For FP8, pass pre-quantized fp8 q/k/v
-            with q_descale/k_descale/v_descale. Note that the Gluon backend fills
-            in S_dmask even at dropout_p == 0, where the Triton backend leaves it
-            zeroed.
+            for q and (batch, num_k_heads) for k/v; gfx1250 also takes one-element
+            per-tensor descales. The output is fp32 on gfx950 and bf16 on gfx1250.
+        backend: "triton" (default) or "gluon". The "gluon" backend is
+            forward-only (no dropout/bias/alibi, no right window and no backward
+            pass) and supports FP8, attention sink, a left sliding window and
+            return_lse. For FP8, pass pre-quantized e4m3 q/k/v with
+            q_descale/k_descale/v_descale. On gfx950 it also supports
+            positional encoding and return_attn_probs, and fills in S_dmask even
+            at dropout_p == 0, where the Triton backend leaves it zeroed. On
+            gfx1250 it needs head_dim 64 or 128 with equal q/k and v head_dim.
     Return:
         out: (batch_size, seqlen, nheads, headdim).
         softmax_lse [optional, if return_lse=True]: (batch_size, nheads, seqlen). The
@@ -1071,6 +1408,9 @@ def flash_attn_func(
             dropout_p=dropout_p,
             bias=bias,
             alibi_slopes=alibi_slopes,
+            head_dim=q.shape[-1],
+            v_head_dim=v.shape[-1],
+            return_attn_probs=return_attn_probs,
         )
         softmax_scale = _get_softmax_scale(q, softmax_scale)
         out, softmax_lse, s_dmask = _gluon_flash_attn_forward(
@@ -1394,15 +1734,17 @@ def flash_attn_varlen_func(
         sink: (nheads,), attention sink scores (one per Q head), or None
         q_descale, k_descale, v_descale: optional fp8 dequant scalars, honored only
             by the "gluon" backend when q/k/v are fp8. Shapes (batch, num_q_heads)
-            for q and (batch, num_k_heads) for k/v; the output is fp32.
-        backend: "triton" (default) or "gluon". The "gluon" backend runs the
-            forward-only gfx950 Gluon kernel and supports the base feature set
-            plus FP8, positional encoding, attention sink, a left sliding window
-            and return_lse/return_attn_probs (no dropout/bias/alibi, no right
-            window and no backward pass). For FP8, pass pre-quantized fp8 q/k/v
-            with q_descale/k_descale/v_descale. Note that the Gluon backend fills
-            in S_dmask even at dropout_p == 0, where the Triton backend leaves it
-            zeroed.
+            for q and (batch, num_k_heads) for k/v; gfx1250 also takes one-element
+            per-tensor descales. The output is fp32 on gfx950 and bf16 on gfx1250
+            (on gfx1250 an fp8 ``out`` may also be fp16 or fp32).
+        backend: "triton" (default) or "gluon". The "gluon" backend is
+            forward-only (no dropout/bias/alibi, no paged KV, no right window and
+            no backward pass) and supports FP8, attention sink, a left sliding
+            window and return_lse. For FP8, pass pre-quantized e4m3 q/k/v with
+            q_descale/k_descale/v_descale. On gfx950 it also supports
+            positional encoding and return_attn_probs, and fills in S_dmask even
+            at dropout_p == 0, where the Triton backend leaves it zeroed. On
+            gfx1250 it needs head_dim 64 or 128 with equal q/k and v head_dim.
     Return:
         out: (total, nheads, headdim).
         softmax_lse [optional, if return_lse=True]: (total_q, nheads). The
@@ -1427,6 +1769,9 @@ def flash_attn_varlen_func(
             bias=bias,
             alibi_slopes=alibi_slopes,
             block_table=block_table,
+            head_dim=q.shape[-1],
+            v_head_dim=v.shape[-1],
+            return_attn_probs=return_attn_probs,
         )
         softmax_scale = _get_softmax_scale(q, softmax_scale)
         attn_out, softmax_lse, s_dmask = _gluon_flash_attn_forward(

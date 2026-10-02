@@ -12,6 +12,7 @@ from aiter.ops.triton.attention.mha import (
     mha_set_use_fused_bwd_kernel,
     mha_set_use_int64_strides,
 )
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from aiter.test_mha_common import (
     attention_ref,
@@ -41,7 +42,13 @@ def _test_mha_impl(
     backend: str = "triton",
     dtype=torch.bfloat16,
 ):
-    skip_if_gluon_unsupported(backend, dropout_p=DROPOUT)
+    skip_if_gluon_unsupported(
+        backend,
+        dropout_p=DROPOUT,
+        head_dim=HEAD_SZ,
+        v_head_dim=HEAD_SZ,
+        return_attn_probs=RETURN_SOFTMAX,
+    )
 
     torch.manual_seed(20)
     torch.cuda.empty_cache()
@@ -295,6 +302,173 @@ def test_mha_varlen_fp8_gluon(
     _fp8_assert_close(gluon_out, torch_out.to(gluon_out.dtype))
 
 
+def _fake_quantize_fp8_per_tensor(x, fp8_dtype):
+    """Per-tensor FP8 quantization. Returns the dequantized values and the
+    descale; ``(x_dq / descale).to(fp8_dtype)`` recovers the FP8 tensor."""
+    descale = (x.abs().amax().float() / torch.finfo(fp8_dtype).max).reshape(1)
+    x_fp8 = (x.float() / descale).to(fp8_dtype)
+    return x_fp8.float() * descale, descale
+
+
+def _assert_lse_close(lse, lse_ref):
+    # Rows with no visible key (causal with SEQLEN_Q > SEQLEN_K) are -inf.
+    finite = torch.isfinite(lse_ref)
+    assert torch.equal(torch.isfinite(lse), finite)
+    torch.testing.assert_close(lse[finite], lse_ref[finite], atol=1e-2, rtol=1e-2)
+
+
+# The reference runs on the dequantized inputs, so the tolerances only cover the
+# kernel itself (mostly P rounded to FP8).
+@pytest.mark.skipif(
+    get_arch() != "gfx1250", reason="per-tensor FP8 Gluon MHA runs on gfx1250"
+)
+@pytest.mark.parametrize("BATCH", [1, 3])
+@pytest.mark.parametrize(
+    "SEQLEN_Q, SEQLEN_K", [(128, 128), (100, 300), (300, 100), (1024, 1024)]
+)
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(8, 8), (16, 4)])
+@pytest.mark.parametrize("HEAD_SZ", [64, 128])
+@pytest.mark.parametrize("CAUSAL", [True, False])
+def test_mha_fp8_pertensor_gluon(
+    BATCH: int,
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    HEAD_SZ: int,
+    CAUSAL: bool,
+):
+    skip_if_gluon_unsupported("gluon", head_dim=HEAD_SZ, v_head_dim=HEAD_SZ)
+
+    torch.manual_seed(20)
+    torch.cuda.empty_cache()
+    fp8_dtype = get_fp8_e4m3_dtype()
+    q, q_descale = _fake_quantize_fp8_per_tensor(
+        torch.randn((BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ), device="cuda"), fp8_dtype
+    )
+    k, k_descale = _fake_quantize_fp8_per_tensor(
+        torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda"), fp8_dtype
+    )
+    v, v_descale = _fake_quantize_fp8_per_tensor(
+        torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda"), fp8_dtype
+    )
+
+    gluon_out, gluon_lse = flash_attn_func(
+        (q / q_descale).to(fp8_dtype),
+        (k / k_descale).to(fp8_dtype),
+        (v / v_descale).to(fp8_dtype),
+        causal=CAUSAL,
+        return_lse=True,
+        backend="gluon",
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+    torch_out, _, torch_lse = attention_ref(q, k, v, causal=CAUSAL)
+
+    assert gluon_out.dtype == torch.bfloat16
+    _fp8_assert_close(gluon_out, torch_out, atol=0.25, cos_sim_threshold=0.999)
+    _assert_lse_close(gluon_lse, torch_lse)
+
+
+@pytest.mark.skipif(
+    get_arch() != "gfx1250", reason="per-tensor FP8 Gluon MHA runs on gfx1250"
+)
+@pytest.mark.parametrize("BATCH", [1, 4])
+@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(128, 128), (100, 300), (300, 100)])
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(8, 8), (16, 4)])
+@pytest.mark.parametrize("HEAD_SZ", [64, 128])
+@pytest.mark.parametrize(
+    "CAUSAL, WINDOW_SIZE_LEFT, SINK",
+    [(False, -1, False), (True, -1, False), (True, -1, True), (True, 32, True)],
+)
+def test_mha_varlen_fp8_pertensor_gluon(
+    BATCH: int,
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    HEAD_SZ: int,
+    CAUSAL: bool,
+    WINDOW_SIZE_LEFT: int,
+    SINK: bool,
+):
+    skip_if_gluon_unsupported("gluon", head_dim=HEAD_SZ, v_head_dim=HEAD_SZ)
+
+    torch.manual_seed(20)
+    torch.cuda.empty_cache()
+    fp8_dtype = get_fp8_e4m3_dtype()
+    q, q_descale = _fake_quantize_fp8_per_tensor(
+        torch.randn((BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ), device="cuda"), fp8_dtype
+    )
+    k, k_descale = _fake_quantize_fp8_per_tensor(
+        torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda"), fp8_dtype
+    )
+    v, v_descale = _fake_quantize_fp8_per_tensor(
+        torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda"), fp8_dtype
+    )
+    sink = torch.randn((NUM_Q_HEADS,), device="cuda") if SINK else None
+    query_padding_mask = generate_random_padding_mask(
+        SEQLEN_Q, BATCH, "cuda", mode="random"
+    )
+    key_padding_mask = generate_random_padding_mask(
+        SEQLEN_K, BATCH, "cuda", mode="random"
+    )
+    (
+        q_unpad,
+        k_unpad,
+        v_unpad,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        _,
+        _,
+        _,
+        output_pad_fn,
+        _,
+        _,
+    ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
+
+    gluon_out, gluon_lse = flash_attn_varlen_func(
+        (q_unpad.detach() / q_descale).to(fp8_dtype),
+        (k_unpad.detach() / k_descale).to(fp8_dtype),
+        (v_unpad.detach() / v_descale).to(fp8_dtype),
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        causal=CAUSAL,
+        window_size=(WINDOW_SIZE_LEFT, -1),
+        return_lse=True,
+        sink=sink,
+        backend="gluon",
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+    torch_out, _, torch_lse = attention_ref(
+        q,
+        k,
+        v,
+        query_padding_mask=query_padding_mask,
+        key_padding_mask=key_padding_mask,
+        causal=CAUSAL,
+        window_size=(WINDOW_SIZE_LEFT, -1),
+        sink=sink,
+    )
+    seqlens_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).tolist()
+    torch_lse = torch.cat(
+        [torch_lse[b, :, :n].transpose(0, 1) for b, n in enumerate(seqlens_q)]
+    )
+
+    assert gluon_out.dtype == torch.bfloat16
+    _fp8_assert_close(
+        output_pad_fn(gluon_out), torch_out, atol=0.25, cos_sim_threshold=0.999
+    )
+    _assert_lse_close(gluon_lse, torch_lse)
+
+
 @pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (8, 1)])
 @pytest.mark.parametrize("DROPOUT, RETURN_LSE, RETURN_SOFTMAX, ", [(0.2, True, True)])
 @pytest.mark.parametrize("CAUSAL", [(True), (False)])
@@ -465,7 +639,13 @@ def _test_mha_varlen_impl(
     backend: str = "triton",
     dtype=torch.bfloat16,
 ):
-    skip_if_gluon_unsupported(backend, dropout_p=DROPOUT)
+    skip_if_gluon_unsupported(
+        backend,
+        dropout_p=DROPOUT,
+        head_dim=HEAD_SZ,
+        v_head_dim=HEAD_SZ,
+        return_attn_probs=RETURN_SOFTMAX,
+    )
 
     torch.set_printoptions(threshold=10000)
     torch.cuda.empty_cache()

@@ -1,0 +1,24 @@
+{
+  "narrow": {
+    "BLOCK_M": 128,
+    "BLOCK_N": 64,
+    "NUM_BUFFERS": 2,
+    "TDM_WARP_HINT": false,
+    "num_warps": 4,
+    "waves_per_eu": 1
+  },
+  "wide": {
+    "BLOCK_M": 256,
+    "BLOCK_N": 64,
+    "NUM_BUFFERS": 2,
+    "TDM_WARP_HINT": true,
+    "num_warps": 8,
+    "waves_per_eu": 1
+  },
+  "dispatch": {
+    "wide_min_seqlen_q": 1024,
+    "sched_strategy": "max-ilp",
+    "sched_head_dim": 128,
+    "sched_min_seqlen_q": 512
+  }
+}

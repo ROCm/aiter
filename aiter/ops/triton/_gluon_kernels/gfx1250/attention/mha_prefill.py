@@ -5,39 +5,44 @@
 
 """MHA prefill Gluon kernel for AMD GFX1250.
 
-Packed/ragged prefill API backed by GFX1250 WMMA. Optional causal masking
-(default on), optional sliding window, optional sinks, and optional
-natural-log LSE output. ``is_causal=False`` attends to the full K/V sequence.
-Packed equal-length ``cu_seqlens`` is the dense self-attn layout. Optional
-``cu_seqlens_k`` / ``max_seqlen_k`` allow ``S_q != S_k``; K and V stay the
-same length as each other. Per-tensor FP8 descales are runtime scalars
-(Q/K into softmax, V on the output) so they do not specialize the kernel.
+Forward-only flash attention on GFX1250 WMMA over dense or packed varlen
+Q/K/V with head_dim 64 or 128 and MQA/GQA. Optional causal mask (bottom-right
+aligned when S_q != S_k), optional left sliding window, optional sinks, and
+optional natural-log LSE. FP8 Q/K/V take per-tensor or per-(batch, head)
+descales (Q/K into softmax, V on the output) as runtime values, so they do not
+specialize the kernel.
+
+The host wrapper is ``aiter.ops.triton.attention.mha`` (``backend="gluon"``).
 """
 
-from __future__ import annotations
-
-import math
-from typing import NamedTuple
-
-import torch
 import triton.experimental.gluon.language as gl
 import triton.language as tl
 from triton.experimental import gluon
 
-_INV_LN2_VALUE = 1.4426950408889634
-_INV_LN2 = tl.constexpr(_INV_LN2_VALUE)
-_LN2_VALUE = 0.6931471805599453
-_LN2 = tl.constexpr(_LN2_VALUE)
+from aiter.ops.triton._gluon_kernels.common.utils import (
+    elementwise_max_prop_nan,
+    reduce_max_prop_nan,
+)
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
+
+_INV_LN2 = tl.constexpr(1.4426950408889634)
+_LN2 = tl.constexpr(0.6931471805599453)
+# FP8 P keeps 3 mantissa bits, so each KV tile shifts every row to put its
+# largest P at 2**_P_SCALE_LOG2: exact, under the e4m3 max of 448, and far from
+# the subnormals. acc and l carry the same shift, which cancels in acc / l.
+_P_SCALE_LOG2 = tl.constexpr(8.0)
+# Tiles further below the running max than this are under fp32 resolution of
+# acc anyway; the cap keeps the shifted acc and l finite.
+_P_SHIFT_MAX = tl.constexpr(24.0)
+
+cdna5 = gl.amd.cdna5
 
 
-@gluon.jit
-def maximum(a, b, propagate_nan: gl.constexpr = tl.PropagateNan.ALL):
-    return gl.maximum(a, b, propagate_nan=propagate_nan)
-
-
-@gluon.jit
-def max(input, axis=None, keep_dims=False):
-    return gl.reduce(input, axis, maximum, keep_dims=keep_dims)
+def _get_config() -> dict:
+    """Tile configs and dispatch thresholds. Shared cache: copy before mutating."""
+    cfg_dir = resolve_config_dir("attention", "MHA", backend="gluon")
+    return load_config_json(f"{cfg_dir}/DEFAULT.json")
 
 
 @gluon.aggregate
@@ -47,15 +52,15 @@ class InputStrides:
     stride_d: gl.constexpr
 
     @gluon.jit
-    def offsets(self, token, head, dim):
-        return (token * self.stride_t + head * self.stride_h + dim * self.stride_d).to(
-            gl.int32
+    def head_ptr(self, ptr, token, head):
+        """Base of (token, head) in 64-bit so tile offsets can stay 32-bit."""
+        return ptr + (
+            token.to(gl.int64) * self.stride_t + head.to(gl.int64) * self.stride_h
         )
 
-
-cdna5 = gl.amd.cdna5
-
-_GFX1250_NUM_CUS = 256
+    @gluon.jit
+    def offsets(self, token, dim):
+        return (token * self.stride_t + dim * self.stride_d).to(gl.int32)
 
 
 @gluon.aggregate
@@ -69,15 +74,17 @@ class AttentionConfig:
     NUM_BUFFERS: gl.constexpr
     NUM_WARPS: gl.constexpr
     IS_FP8: gl.constexpr
+    IS_VARLEN: gl.constexpr
     HAS_SINK: gl.constexpr
     HAS_LSE: gl.constexpr
-    WINDOW_LEFT: gl.constexpr
+    SLIDING_WINDOW: gl.constexpr
     IS_CAUSAL: gl.constexpr
     TDM_WARP_HINT: gl.constexpr
     REVERSE_Q_BLOCKS: gl.constexpr
     q_strides: InputStrides
     k_strides: InputStrides
     v_strides: InputStrides
+    o_strides: InputStrides
     qk_layout: gl.constexpr
     pv_layout: gl.constexpr
     q_layout: gl.constexpr
@@ -100,15 +107,17 @@ class AttentionConfig:
         NUM_BUFFERS,
         NUM_WARPS,
         IS_FP8,
+        IS_VARLEN,
         HAS_SINK,
         HAS_LSE,
-        WINDOW_LEFT,
+        SLIDING_WINDOW,
         IS_CAUSAL,
         TDM_WARP_HINT,
         REVERSE_Q_BLOCKS,
         q_strides,
         k_strides,
         v_strides,
+        o_strides,
     ):
         assert HEAD_DIM in (64, 128)
         assert BLOCK_M % 16 == 0
@@ -148,15 +157,17 @@ class AttentionConfig:
         self.NUM_BUFFERS = gl.constexpr(NUM_BUFFERS)
         self.NUM_WARPS = gl.constexpr(NUM_WARPS)
         self.IS_FP8 = gl.constexpr(IS_FP8)
+        self.IS_VARLEN = gl.constexpr(IS_VARLEN)
         self.HAS_SINK = gl.constexpr(HAS_SINK)
         self.HAS_LSE = gl.constexpr(HAS_LSE)
-        self.WINDOW_LEFT = gl.constexpr(WINDOW_LEFT)
+        self.SLIDING_WINDOW = gl.constexpr(SLIDING_WINDOW)
         self.IS_CAUSAL = gl.constexpr(IS_CAUSAL)
         self.TDM_WARP_HINT = gl.constexpr(TDM_WARP_HINT)
         self.REVERSE_Q_BLOCKS = gl.constexpr(REVERSE_Q_BLOCKS)
         self.q_strides = q_strides
         self.k_strides = k_strides
         self.v_strides = v_strides
+        self.o_strides = o_strides
         self.qk_layout = gl.constexpr(qk_layout)
         self.pv_layout = gl.constexpr(pv_layout)
         self.q_layout = gl.constexpr(
@@ -165,6 +176,7 @@ class AttentionConfig:
         self.k_layout = gl.constexpr(
             gl.DotOperandLayout(1, qk_layout, qk_operand_width)
         )
+        # k_width 8 matches the WMMA accumulator, so P converts in registers.
         self.p_layout = gl.constexpr(gl.DotOperandLayout(0, pv_layout, 8))
         self.v_layout = gl.constexpr(gl.DotOperandLayout(1, pv_layout, 8))
         self.k_smem_layout = gl.constexpr(
@@ -193,20 +205,17 @@ class AttentionConfig:
 class AttentionProgram:
     cfg: gl.constexpr
     q_ptr: gl.tensor
-    k_ptr: gl.tensor
-    v_ptr: gl.tensor
     output_ptr: gl.tensor
     sink_ptr: gl.tensor
     lse_ptr: gl.tensor
-    seq_base: gl.tensor
+    stride_lse_t: gl.tensor
     seq_len: gl.tensor
-    kv_base: gl.tensor
     kv_len: gl.tensor
+    diag_offset: gl.tensor
     qk_descale: gl.tensor
     v_descale: gl.tensor
     q_start: gl.tensor
     q_head: gl.tensor
-    kv_head: gl.tensor
     k_desc: gl.amd.cdna5.tdm.tensor_descriptor
     k_buffer: gl.shared_memory_descriptor
     v_desc: gl.amd.cdna5.tdm.tensor_descriptor
@@ -217,20 +226,17 @@ class AttentionProgram:
         self,
         cfg,
         q_ptr,
-        k_ptr,
-        v_ptr,
         output_ptr,
         sink_ptr,
         lse_ptr,
-        seq_base,
+        stride_lse_t,
         seq_len,
-        kv_base,
         kv_len,
+        diag_offset,
         qk_descale,
         v_descale,
         q_start,
         q_head,
-        kv_head,
         k_desc,
         k_buffer,
         v_desc,
@@ -238,20 +244,17 @@ class AttentionProgram:
     ):
         self.cfg = gl.constexpr(cfg)
         self.q_ptr = q_ptr
-        self.k_ptr = k_ptr
-        self.v_ptr = v_ptr
         self.output_ptr = output_ptr
         self.sink_ptr = sink_ptr
         self.lse_ptr = lse_ptr
-        self.seq_base = seq_base
+        self.stride_lse_t = stride_lse_t
         self.seq_len = seq_len
-        self.kv_base = kv_base
         self.kv_len = kv_len
+        self.diag_offset = diag_offset
         self.qk_descale = qk_descale
         self.v_descale = v_descale
         self.q_start = q_start
         self.q_head = q_head
-        self.kv_head = kv_head
         self.k_desc = k_desc
         self.k_buffer = k_buffer
         self.v_desc = v_desc
@@ -272,26 +275,69 @@ class AttentionProgram:
         lse_ptr,
         cu_seqlens_q_ptr,
         cu_seqlens_k_ptr,
-        qk_descale_ptr,
+        seqlen_q,
+        seqlen_k,
+        q_descale_ptr,
+        k_descale_ptr,
         v_descale_ptr,
+        stride_q_descale_b,
+        stride_q_descale_h,
+        stride_k_descale_b,
+        stride_k_descale_h,
+        stride_v_descale_b,
+        stride_v_descale_h,
+        stride_lse_b,
+        stride_lse_h,
+        stride_lse_t,
     ):
         batch = gl.program_id(0)
         q_head = gl.program_id(1)
         q_block = gl.program_id(2)
         if cfg.REVERSE_Q_BLOCKS:
             q_block = gl.num_programs(axis=2) - 1 - q_block
-        kv_head = q_head // (cfg.N_HEADS // cfg.N_KV_HEADS)
-        seq_base = gl.load(cu_seqlens_q_ptr + batch)
-        seq_end = gl.load(cu_seqlens_q_ptr + batch + 1)
-        seq_len = seq_end - seq_base
-        kv_base = gl.load(cu_seqlens_k_ptr + batch)
-        kv_end = gl.load(cu_seqlens_k_ptr + batch + 1)
-        kv_len = kv_end - kv_base
-        qk_descale = gl.load(qk_descale_ptr).to(gl.float32)
-        v_descale = gl.load(v_descale_ptr).to(gl.float32)
         q_start = q_block * cfg.BLOCK_M
+        kv_head = q_head // (cfg.N_HEADS // cfg.N_KV_HEADS)
+        if cfg.IS_VARLEN:
+            seq_base = gl.load(cu_seqlens_q_ptr + batch)
+            seq_len = gl.load(cu_seqlens_q_ptr + batch + 1) - seq_base
+            kv_base = gl.load(cu_seqlens_k_ptr + batch)
+            kv_len = gl.load(cu_seqlens_k_ptr + batch + 1) - kv_base
+            lse_row = seq_base
+        else:
+            # Dense batches are packed along tokens: batch b starts at b * S.
+            seq_base = batch * seqlen_q
+            seq_len = gl.to_tensor(seqlen_q)
+            kv_base = batch * seqlen_k
+            kv_len = gl.to_tensor(seqlen_k)
+            lse_row = 0
+        # Q, O and LSE are based at this program's query tile, so their 32-bit
+        # buffer offsets only span BLOCK_M rows.
+        q_token = seq_base + q_start
+        lse_ptr += (
+            batch.to(gl.int64) * stride_lse_b
+            + q_head.to(gl.int64) * stride_lse_h
+            + (lse_row + q_start).to(gl.int64) * stride_lse_t
+        )
+        if cfg.IS_FP8:
+            q_descale = gl.load(
+                q_descale_ptr + batch * stride_q_descale_b + q_head * stride_q_descale_h
+            ).to(gl.float32)
+            k_descale = gl.load(
+                k_descale_ptr
+                + batch * stride_k_descale_b
+                + kv_head * stride_k_descale_h
+            ).to(gl.float32)
+            v_descale = gl.load(
+                v_descale_ptr
+                + batch * stride_v_descale_b
+                + kv_head * stride_v_descale_h
+            ).to(gl.float32)
+            qk_descale = q_descale * k_descale
+        else:
+            qk_descale = gl.to_tensor(1.0)
+            v_descale = gl.to_tensor(1.0)
         k_desc = cdna5.tdm.make_tensor_descriptor(
-            base=k_ptr + cfg.k_strides.offsets(kv_base, kv_head, 0),
+            base=cfg.k_strides.head_ptr(k_ptr, kv_base, kv_head),
             shape=(kv_len, cfg.HEAD_DIM),
             strides=(cfg.k_strides.stride_t, cfg.k_strides.stride_d),
             block_shape=(cfg.BLOCK_N, cfg.HEAD_DIM),
@@ -303,7 +349,7 @@ class AttentionProgram:
             layout=k_desc.layout,
         )
         v_desc = cdna5.tdm.make_tensor_descriptor(
-            base=v_ptr + cfg.v_strides.offsets(kv_base, kv_head, 0),
+            base=cfg.v_strides.head_ptr(v_ptr, kv_base, kv_head),
             shape=(kv_len, cfg.HEAD_DIM),
             strides=(cfg.v_strides.stride_t, cfg.v_strides.stride_d),
             block_shape=(cfg.BLOCK_N, cfg.HEAD_DIM),
@@ -316,21 +362,18 @@ class AttentionProgram:
         )
         return AttentionProgram(
             cfg,
-            q_ptr,
-            k_ptr,
-            v_ptr,
-            output_ptr,
+            cfg.q_strides.head_ptr(q_ptr, q_token, q_head),
+            cfg.o_strides.head_ptr(output_ptr, q_token, q_head),
             sink_ptr,
             lse_ptr,
-            seq_base,
+            gl.to_tensor(stride_lse_t),
             seq_len,
-            kv_base,
             kv_len,
+            kv_len - seq_len,
             qk_descale,
             v_descale,
             q_start,
             q_head,
-            kv_head,
             k_desc,
             k_buffer,
             v_desc,
@@ -340,41 +383,11 @@ class AttentionProgram:
     @gluon.jit
     def load_q(self):
         cfg = self.cfg
-        offs_m = self.q_start + gl.arange(
-            0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.q_layout)
-        )
+        rows = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.q_layout))
         offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.q_layout))
-        offsets = cfg.q_strides.offsets(
-            self.seq_base + offs_m[:, None], self.q_head, offs_d[None, :]
-        )
-        mask = offs_m[:, None] < self.seq_len
+        offsets = cfg.q_strides.offsets(rows[:, None], offs_d[None, :])
+        mask = rows[:, None] < self.seq_len - self.q_start
         return cdna5.buffer_load(self.q_ptr, offsets, mask=mask, other=0.0)
-
-    @gluon.jit
-    def load_k(self, kv_start):
-        cfg = self.cfg
-        offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(1, cfg.k_layout))
-        offs_n = kv_start + gl.arange(
-            0, cfg.BLOCK_N, layout=gl.SliceLayout(0, cfg.k_layout)
-        )
-        offsets = cfg.k_strides.offsets(
-            self.kv_base + offs_n[None, :], self.kv_head, offs_d[:, None]
-        )
-        mask = offs_n[None, :] < self.kv_len
-        return cdna5.buffer_load(self.k_ptr, offsets, mask=mask, other=0.0)
-
-    @gluon.jit
-    def load_v(self, kv_start):
-        cfg = self.cfg
-        offs_n = kv_start + gl.arange(
-            0, cfg.BLOCK_N, layout=gl.SliceLayout(1, cfg.v_layout)
-        )
-        offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.v_layout))
-        offsets = cfg.v_strides.offsets(
-            self.kv_base + offs_n[:, None], self.kv_head, offs_d[None, :]
-        )
-        mask = offs_n[:, None] < self.kv_len
-        return cdna5.buffer_load(self.v_ptr, offsets, mask=mask, other=0.0)
 
     @gluon.jit
     def tdm_load_global_to_shared_k(self, kv_start, buffer_index):
@@ -425,15 +438,11 @@ class AttentionProgram:
     @gluon.jit
     def init_attention_state(self):
         cfg = self.cfg
+        row_layout: gl.constexpr = gl.SliceLayout(1, cfg.pv_layout)
         if cfg.HAS_SINK:
             sink_log2 = gl.load(self.sink_ptr + self.q_head).to(gl.float32) * _INV_LN2
             sink_unscaled = sink_log2 / self.qk_scale()
-            m_i = gl.full(
-                [cfg.BLOCK_M],
-                value=0,
-                dtype=gl.float32,
-                layout=gl.SliceLayout(1, cfg.pv_layout),
-            )
+            m_i = gl.full([cfg.BLOCK_M], value=0, dtype=gl.float32, layout=row_layout)
             m_i += sink_unscaled
         else:
             sink_log2 = 0.0
@@ -441,18 +450,21 @@ class AttentionProgram:
                 [cfg.BLOCK_M],
                 value=-float("inf"),
                 dtype=gl.float32,
-                layout=gl.SliceLayout(1, cfg.pv_layout),
+                layout=row_layout,
             )
-        l_i = gl.full(
-            [cfg.BLOCK_M],
-            value=0,
-            dtype=gl.float32,
-            layout=gl.SliceLayout(1, cfg.pv_layout),
-        )
+        l_i = gl.full([cfg.BLOCK_M], value=0, dtype=gl.float32, layout=row_layout)
+        if cfg.IS_FP8:
+            p_shift = gl.full(
+                [cfg.BLOCK_M], value=_P_SCALE_LOG2, dtype=gl.float32, layout=row_layout
+            )
+        else:
+            p_shift = gl.full(
+                [cfg.BLOCK_M], value=0, dtype=gl.float32, layout=row_layout
+            )
         acc = gl.zeros(
             [cfg.BLOCK_M, cfg.HEAD_DIM], dtype=gl.float32, layout=cfg.pv_layout
         )
-        return m_i, l_i, acc, sink_log2
+        return m_i, l_i, acc, sink_log2, p_shift
 
     @gluon.jit
     def apply_mask(self, qk, kv_start):
@@ -465,46 +477,51 @@ class AttentionProgram:
         )
         valid = offs_m[:, None] < self.seq_len
         valid &= offs_n[None, :] < self.kv_len
-        # Causal upper bound only when requested. Non-causal still pads past
-        # seq_len_k; window lower edge is independent (same layering as gfx950 extend).
+        # Bottom-right aligned like FlashAttention: query m sits on key
+        # m + kv_len - seq_len, which moves both the causal and window edges.
+        diag = offs_m[:, None] + self.diag_offset
         if cfg.IS_CAUSAL:
-            valid &= offs_n[None, :] <= offs_m[:, None]
-        if cfg.WINDOW_LEFT >= 0:
-            valid &= offs_m[:, None] <= offs_n[None, :] + cfg.WINDOW_LEFT
+            valid &= offs_n[None, :] <= diag
+        if cfg.SLIDING_WINDOW > 0:
+            valid &= offs_n[None, :] >= diag - cfg.SLIDING_WINDOW
         return gl.where(valid, qk, -float("inf"))
 
     @gluon.jit
-    def softmax(self, qk, m_i, l_i, acc):
+    def apply_mask_if_needed(self, qk, kv_start):
+        """Window always masks. Causal masks tiles that reach the block's
+        diagonal. Non-causal only pads when the tile runs past seq_len_k."""
         cfg = self.cfg
-        row_max = max(qk, 1)
-        m_new = maximum(m_i, row_max)
-        invalid = m_new == -float("inf")
-        m_new_scaled = gl.where(invalid, 0.0, m_new * self.qk_scale())
-
-        qk_shifted = qk * self.qk_scale() - m_new_scaled[:, None]
-        p = gl.exp2(qk_shifted)
-        m_diff = gl.where(invalid, 0.0, m_i * self.qk_scale() - m_new_scaled)
-        alpha = gl.exp2(m_diff)
-
-        l_ij = gl.sum(p, axis=1)
-        l_i = l_i * alpha + l_ij
-        acc = acc * alpha[:, None]
-        p = p.to(self.q_ptr.dtype.element_ty)
-        p = gl.convert_layout(p, cfg.p_layout)
-        return p, m_new, l_i, acc
+        if cfg.SLIDING_WINDOW > 0:
+            qk = self.apply_mask(qk, kv_start)
+        elif cfg.IS_CAUSAL:
+            if kv_start + cfg.BLOCK_N > self.q_start + self.diag_offset:
+                qk = self.apply_mask(qk, kv_start)
+        else:
+            if kv_start + cfg.BLOCK_N > self.kv_len:
+                qk = self.apply_mask(qk, kv_start)
+        return qk
 
     @gluon.jit
-    def softmax_part0(self, qk, m_i):
-        row_max = max(qk, 1)
-        m_new = maximum(m_i, row_max)
+    def softmax_part0(self, qk, m_i, p_shift):
+        cfg = self.cfg
+        qk_scale = self.qk_scale()
+        row_max = reduce_max_prop_nan(qk, 1)
+        m_new = elementwise_max_prop_nan(m_i, row_max)
         invalid = m_new == -float("inf")
-        m_new_scaled = gl.where(invalid, 0.0, m_new * self.qk_scale())
+        m_new_scaled = gl.where(invalid, 0.0, m_new * qk_scale)
+        m_diff = gl.where(invalid, 0.0, m_i * qk_scale - m_new_scaled)
+        if cfg.IS_FP8:
+            p_shift_new = _P_SCALE_LOG2 + gl.minimum(
+                m_new_scaled - row_max * qk_scale, _P_SHIFT_MAX
+            )
+            m_diff += p_shift_new - p_shift
+            m_new_scaled -= p_shift_new
+            p_shift = p_shift_new
 
-        qk_shifted = qk * self.qk_scale() - m_new_scaled[:, None]
+        qk_shifted = qk * qk_scale - m_new_scaled[:, None]
         p = gl.exp2(qk_shifted)
-        m_diff = gl.where(invalid, 0.0, m_i * self.qk_scale() - m_new_scaled)
         alpha = gl.exp2(m_diff)
-        return p, alpha, m_new
+        return p, alpha, m_new, p_shift
 
     @gluon.jit
     def softmax_part1(self, p, l_i, acc, alpha):
@@ -513,54 +530,48 @@ class AttentionProgram:
         l_i = l_i * alpha + l_ij
         acc = acc * alpha[:, None]
         p = p.to(self.q_ptr.dtype.element_ty)
-        p = gl.convert_layout(p, cfg.p_layout)
+        p = gl.convert_layout(p, cfg.p_layout, assert_trivial=True)
         return p, l_i, acc
 
     @gluon.jit
-    def apply_sinks(self, l_i, m_i, sink_log2):
+    def store_result(self, m_i, l_i, acc, sink_log2, p_shift):
+        """Fold in sinks, then write the LSE and acc / l. l carries p_shift."""
         cfg = self.cfg
         if cfg.HAS_SINK:
-            l_i += gl.exp2(sink_log2 - m_i * self.qk_scale())
-        return l_i
-
-    @gluon.jit
-    def store_lse(self, l_i, m_i):
-        cfg = self.cfg
+            l_i += gl.exp2(sink_log2 - m_i * self.qk_scale() + p_shift)
         if cfg.HAS_LSE:
-            offs_m = self.q_start + gl.arange(
-                0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.pv_layout)
-            )
-            offsets = ((self.seq_base + offs_m) * cfg.N_HEADS + self.q_head).to(
-                gl.int32
-            )
-            mask = offs_m < self.seq_len
+            rows = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.pv_layout))
+            offsets = (rows * self.stride_lse_t).to(gl.int32)
+            mask = rows < self.seq_len - self.q_start
             safe_l = gl.where(l_i > 0.0, l_i, 1.0)
-            lse = (m_i * self.qk_scale() + gl.log2(safe_l)) * _LN2
+            lse = (m_i * self.qk_scale() + gl.log2(safe_l) - p_shift) * _LN2
             cdna5.buffer_store(lse, self.lse_ptr, offsets, mask=mask)
 
-    @gluon.jit
-    def store_output(self, output):
-        cfg = self.cfg
-        offs_m = self.q_start + gl.arange(
-            0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.store_layout)
-        )
+        denom = gl.where(l_i > 0.0, l_i, 1.0)
+        output = acc * (1.0 / denom)[:, None]
+        output = gl.convert_layout(output, cfg.store_layout)
+        rows = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.store_layout))
         offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.store_layout))
-        offsets = (
-            ((self.seq_base + offs_m[:, None]) * cfg.N_HEADS + self.q_head)
-            * cfg.HEAD_DIM
-            + offs_d[None, :]
-        ).to(gl.int32)
-        mask = offs_m[:, None] < self.seq_len
-        output = output * self.v_descale
+        offsets = cfg.o_strides.offsets(rows[:, None], offs_d[None, :])
+        mask = rows[:, None] < self.seq_len - self.q_start
+        if cfg.IS_FP8:
+            output = output * self.v_descale
         output = output.to(self.output_ptr.dtype.element_ty)
         cdna5.buffer_store(output, self.output_ptr, offsets, mask=mask)
 
 
 @gluon.jit
+def process_empty_attention(program: AttentionProgram):
+    # No key is visible to this query block (e.g. causal with S_q > S_k): the
+    # output is zero and the LSE is the sink alone, or -inf.
+    m_i, l_i, acc, sink_log2, p_shift = program.init_attention_state()
+    program.store_result(m_i, l_i, acc, sink_log2, p_shift)
+
+
+@gluon.jit
 def process_single_attention_tile(program: AttentionProgram, kv_start):
-    cfg = program.cfg
     q = program.load_q()
-    m_i, l_i, acc, sink_log2 = program.init_attention_state()
+    m_i, l_i, acc, sink_log2, p_shift = program.init_attention_state()
 
     # Single-tile fallback: no pipeline to fill or drain.
     program.tdm_load_global_to_shared_k(kv_start, 0)
@@ -570,26 +581,21 @@ def process_single_attention_tile(program: AttentionProgram, kv_start):
     k = program.tdm_shared_load_k(0, wait_count=1)
     qk = program.compute_qk(q, k)
     qk = program.apply_mask(qk, kv_start)
-    p, alpha, m_i = program.softmax_part0(qk, m_i)
+    p, alpha, m_i, p_shift = program.softmax_part0(qk, m_i, p_shift)
 
     # SM1, LR_V, PV
     p, l_i, acc = program.softmax_part1(p, l_i, acc, alpha)
     v = program.tdm_shared_load_v(0, wait_count=0)
     acc = program.compute_pv(p, v, acc)
 
-    l_i = program.apply_sinks(l_i, m_i, sink_log2)
-    program.store_lse(l_i, m_i)
-    denom = gl.where(l_i > 0.0, l_i, 1.0)
-    output = acc * (1.0 / denom)[:, None]
-    output = gl.convert_layout(output, cfg.store_layout)
-    program.store_output(output)
+    program.store_result(m_i, l_i, acc, sink_log2, p_shift)
 
 
 @gluon.jit
 def process_attention_tile(program: AttentionProgram, kv_start, num_tiles):
     cfg = program.cfg
     q = program.load_q()
-    m_i, l_i, acc, sink_log2 = program.init_attention_state()
+    m_i, l_i, acc, sink_log2, p_shift = program.init_attention_state()
 
     """
     Prologue:
@@ -606,18 +612,10 @@ def process_attention_tile(program: AttentionProgram, kv_start, num_tiles):
     # LR_K_t0
     k = program.tdm_shared_load_k(0, wait_count=2)
 
-    # QK_t0, SM0_t0. Window always masks. Causal masks the diagonal tile.
-    # Non-causal only pads when the tile runs past seq_len_k.
+    # QK_t0, SM0_t0
     qk = program.compute_qk(q, k)
-    if cfg.WINDOW_LEFT >= 0:
-        qk = program.apply_mask(qk, kv_start)
-    elif cfg.IS_CAUSAL:
-        if kv_start + cfg.BLOCK_N > program.q_start:
-            qk = program.apply_mask(qk, kv_start)
-    else:
-        if kv_start + cfg.BLOCK_N > program.kv_len:
-            qk = program.apply_mask(qk, kv_start)
-    p, alpha, m_i = program.softmax_part0(qk, m_i)
+    qk = program.apply_mask_if_needed(qk, kv_start)
+    p, alpha, m_i, p_shift = program.softmax_part0(qk, m_i, p_shift)
 
     # GLDS_V_t1, LR_K_t1
     program.tdm_load_global_to_shared_v(kv_start + cfg.BLOCK_N, 1)
@@ -639,14 +637,7 @@ def process_attention_tile(program: AttentionProgram, kv_start, num_tiles):
 
         # QK, SM0
         qk = program.compute_qk(q, k)
-        if cfg.WINDOW_LEFT >= 0:
-            qk = program.apply_mask(qk, cur_kv_start)
-        elif cfg.IS_CAUSAL:
-            if cur_kv_start + cfg.BLOCK_N > program.q_start:
-                qk = program.apply_mask(qk, cur_kv_start)
-        else:
-            if cur_kv_start + cfg.BLOCK_N > program.kv_len:
-                qk = program.apply_mask(qk, cur_kv_start)
+        qk = program.apply_mask_if_needed(qk, cur_kv_start)
 
         # SM1, LR_V, PV
         p, l_i, acc = program.softmax_part1(p, l_i, acc, alpha)
@@ -658,7 +649,7 @@ def process_attention_tile(program: AttentionProgram, kv_start, num_tiles):
         program.tdm_load_global_to_shared_v(next_kv_start, next_buffer_index)
 
         # SM0, LR_K for t+1
-        p, alpha, m_i = program.softmax_part0(qk, m_i)
+        p, alpha, m_i, p_shift = program.softmax_part0(qk, m_i, p_shift)
         k = program.tdm_shared_load_k(next_buffer_index, wait_count=1)
 
     """
@@ -683,31 +674,60 @@ def process_attention_tile(program: AttentionProgram, kv_start, num_tiles):
     acc = program.compute_pv(p, v, acc)
 
     # SM0, SM1, LR_V, PV for t_last
-    p, alpha, m_i = program.softmax_part0(qk, m_i)
+    p, alpha, m_i, p_shift = program.softmax_part0(qk, m_i, p_shift)
     p, l_i, acc = program.softmax_part1(p, l_i, acc, alpha)
     v = program.tdm_shared_load_v(last_buffer_index, wait_count=0)
     acc = program.compute_pv(p, v, acc)
 
-    l_i = program.apply_sinks(l_i, m_i, sink_log2)
-    program.store_lse(l_i, m_i)
-    denom = gl.where(l_i > 0.0, l_i, 1.0)
-    output = acc * (1.0 / denom)[:, None]
-    output = gl.convert_layout(output, cfg.store_layout)
-    program.store_output(output)
+    program.store_result(m_i, l_i, acc, sink_log2, p_shift)
 
 
-@gluon.jit
+_mha_prefill_gfx1250_repr = make_kernel_repr(
+    "_mha_prefill_gfx1250",
+    [
+        "N_HEADS",
+        "N_KV_HEADS",
+        "HEAD_DIM",
+        "BLOCK_M",
+        "BLOCK_N",
+        "NUM_WARPS",
+        "NUM_BUFFERS",
+        "IS_FP8",
+        "IS_VARLEN",
+        "IS_CAUSAL",
+        "SLIDING_WINDOW",
+        "HAS_SINK",
+        "HAS_LSE",
+        "TDM_WARP_HINT",
+        "REVERSE_Q_BLOCKS",
+    ],
+)
+
+
+@gluon.jit(repr=_mha_prefill_gfx1250_repr)
 def _mha_prefill_gfx1250(
     q_ptr,
     k_ptr,
     v_ptr,
-    cu_seqlens_q_ptr,
-    cu_seqlens_k_ptr,
     output_ptr,
     sink_ptr,
     lse_ptr,
-    qk_descale_ptr,
+    cu_seqlens_q_ptr,
+    cu_seqlens_k_ptr,
+    seqlen_q,
+    seqlen_k,
+    q_descale_ptr,
+    k_descale_ptr,
     v_descale_ptr,
+    stride_q_descale_b,
+    stride_q_descale_h,
+    stride_k_descale_b,
+    stride_k_descale_h,
+    stride_v_descale_b,
+    stride_v_descale_h,
+    stride_lse_b,
+    stride_lse_h,
+    stride_lse_t,
     Q_STRIDE_T: gl.constexpr,
     Q_STRIDE_H: gl.constexpr,
     Q_STRIDE_D: gl.constexpr,
@@ -717,6 +737,9 @@ def _mha_prefill_gfx1250(
     V_STRIDE_T: gl.constexpr,
     V_STRIDE_H: gl.constexpr,
     V_STRIDE_D: gl.constexpr,
+    O_STRIDE_T: gl.constexpr,
+    O_STRIDE_H: gl.constexpr,
+    O_STRIDE_D: gl.constexpr,
     N_HEADS: gl.constexpr,
     N_KV_HEADS: gl.constexpr,
     HEAD_DIM: gl.constexpr,
@@ -724,9 +747,10 @@ def _mha_prefill_gfx1250(
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     IS_FP8: gl.constexpr,
+    IS_VARLEN: gl.constexpr,
     HAS_SINK: gl.constexpr,
     HAS_LSE: gl.constexpr,
-    WINDOW_LEFT: gl.constexpr,
+    SLIDING_WINDOW: gl.constexpr,
     IS_CAUSAL: gl.constexpr,
     TDM_WARP_HINT: gl.constexpr,
     REVERSE_Q_BLOCKS: gl.constexpr,
@@ -743,15 +767,17 @@ def _mha_prefill_gfx1250(
         NUM_BUFFERS,
         NUM_WARPS,
         IS_FP8,
+        IS_VARLEN,
         HAS_SINK,
         HAS_LSE,
-        WINDOW_LEFT,
+        SLIDING_WINDOW,
         IS_CAUSAL,
         TDM_WARP_HINT,
         REVERSE_Q_BLOCKS,
         InputStrides(Q_STRIDE_T, Q_STRIDE_H, Q_STRIDE_D),
         InputStrides(K_STRIDE_T, K_STRIDE_H, K_STRIDE_D),
         InputStrides(V_STRIDE_T, V_STRIDE_H, V_STRIDE_D),
+        InputStrides(O_STRIDE_T, O_STRIDE_H, O_STRIDE_D),
     )
     program = AttentionProgram.create(
         cfg,
@@ -763,400 +789,45 @@ def _mha_prefill_gfx1250(
         lse_ptr,
         cu_seqlens_q_ptr,
         cu_seqlens_k_ptr,
-        qk_descale_ptr,
+        seqlen_q,
+        seqlen_k,
+        q_descale_ptr,
+        k_descale_ptr,
         v_descale_ptr,
+        stride_q_descale_b,
+        stride_q_descale_h,
+        stride_k_descale_b,
+        stride_k_descale_h,
+        stride_v_descale_b,
+        stride_v_descale_h,
+        stride_lse_b,
+        stride_lse_h,
+        stride_lse_t,
     )
     if program.q_start < program.seq_len:
+        # Key index that the block's first query row lines up with.
+        diag_start = program.q_start + program.diag_offset
         kv_start = 0
-        if cfg.WINDOW_LEFT >= 0:
-            kv_start = program.q_start - cfg.WINDOW_LEFT
+        if cfg.SLIDING_WINDOW > 0:
+            kv_start = diag_start - cfg.SLIDING_WINDOW
             kv_start = gl.where(
                 kv_start > 0, (kv_start // cfg.BLOCK_N) * cfg.BLOCK_N, 0
             )
 
-        # Causal: only K/V up to this query tile. Non-causal: the full K/V
-        # sequence (one IS_CAUSAL flag drives both mask and KV range).
+        # Causal: only K/V up to this query tile's diagonal. Non-causal: the
+        # full K/V sequence (one IS_CAUSAL flag drives both mask and KV range).
         if cfg.IS_CAUSAL:
-            kv_end = program.q_start + cfg.BLOCK_M
+            kv_end = diag_start + cfg.BLOCK_M
             kv_end = gl.where(kv_end < program.kv_len, kv_end, program.kv_len)
+            kv_end = gl.where(kv_end > 0, kv_end, 0)
         else:
             kv_end = program.kv_len
         kv_end = ((kv_end + cfg.BLOCK_N - 1) // cfg.BLOCK_N) * cfg.BLOCK_N
 
         num_tiles = (kv_end - kv_start) // cfg.BLOCK_N
-        if num_tiles == 1:
+        if num_tiles <= 0:
+            process_empty_attention(program)
+        elif num_tiles == 1:
             process_single_attention_tile(program, kv_start)
         else:
             process_attention_tile(program, kv_start, num_tiles)
-
-
-class LaunchConfig(NamedTuple):
-    n_heads: int
-    n_kv_heads: int
-    head_dim: int
-    sm_scale: float
-    block_m: int
-    block_n: int
-    num_warps: int
-    num_buffers: int
-    waves_per_eu: int
-    batch_size: int
-    max_seqlen: int
-    window_left: int
-    grid: tuple[int, ...]
-
-
-def _select_llvm_fn_attrs(*, head_dim: int, max_seqlen: int, window_left: int) -> str:
-    """Use max-ILP where it reduces scheduler overhead without regressions.
-
-    It wins for full D=128 attention once fixed scheduling overhead is amortized.
-    D=64, very short sequences, and medium/large sliding windows regress.
-    """
-    use_max_ilp = head_dim == 128 and max_seqlen >= 512 and window_left < 0
-    return "amdgpu-sched-strategy=max-ilp" if use_max_ilp else ""
-
-
-def _select_tdm_warp_hint(
-    *,
-    block_m: int,
-    block_n: int,
-    num_warps: int,
-    window_left: int,
-    workgroups: int,
-) -> bool:
-    """Use four TDM producer warps for the fully occupied eight-warp tile.
-
-    Without the hint all eight warps participate in each descriptor load.
-    Sliding-window and underfilled launches do not amortize this specialization
-    and retain the original all-warp behavior.
-    """
-    return (
-        block_m == 256
-        and block_n == 64
-        and num_warps == 8
-        and window_left < 0
-        and workgroups >= _GFX1250_NUM_CUS
-    )
-
-
-def _select_reverse_q_blocks(
-    *,
-    block_m: int,
-    max_seqlen: int,
-    window_left: int,
-    workgroups: int,
-    causal: bool = True,
-) -> bool:
-    """Schedule long causal workgroups first to minimize the dispatch tail."""
-    return (
-        causal
-        and window_left < 0
-        and workgroups >= _GFX1250_NUM_CUS
-        and max_seqlen > block_m
-    )
-
-
-def _select_m_tile(
-    *, batch_size: int, n_heads: int, max_seqlen: int
-) -> tuple[int, int]:
-    """Pick (BLOCK_M, num_warps) for prefill, measured on gfx1250.
-
-    A 256-row tile is worth ~1.4x over a 128-row one, but only together with 8
-    warps: warps tile M only, so doubling them halves the registers each lane
-    holds for the fp32 accumulator and keeps the tile off the spill cliff.
-    Either change alone is neutral or slower.
-
-    The wide tile costs two things, and both bound where it pays:
-
-      * it halves the launch grid, so the device must still be filled;
-      * it doubles the causally-masked half of the diagonal BLOCK_M x BLOCK_M
-        block, and that waste is proportional to BLOCK_M / seqlen, so short
-        sequences pay a larger fraction of it.
-
-    Below either bound the narrow tile wins by up to 1.2x, so keep it there.
-    """
-    wide_m, wide_warps = 256, 8
-    narrow_m, narrow_warps = 128, 4
-    if max_seqlen < 1024:
-        return narrow_m, narrow_warps
-    workgroups = batch_size * n_heads * triton_cdiv(max_seqlen, wide_m)
-    if workgroups < _GFX1250_NUM_CUS:
-        return narrow_m, narrow_warps
-    return wide_m, wide_warps
-
-
-def get_config(
-    *,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cu_seqlens_q: torch.Tensor,
-    max_seqlen: int,
-    window_left: int,
-    softmax_scale: float | None,
-) -> LaunchConfig:
-    n_heads = q.shape[1]
-    n_kv_heads = k.shape[1]
-    head_dim = q.shape[2]
-    batch_size = cu_seqlens_q.numel() - 1
-    block_n = 64
-    num_buffers = 2
-    waves_per_eu = 1
-    block_m, num_warps = _select_m_tile(
-        batch_size=batch_size, n_heads=n_heads, max_seqlen=max_seqlen
-    )
-    if softmax_scale is None:
-        softmax_scale = 1.0 / math.sqrt(head_dim)
-    sm_scale = softmax_scale * _INV_LN2_VALUE
-    return LaunchConfig(
-        n_heads=n_heads,
-        n_kv_heads=n_kv_heads,
-        head_dim=head_dim,
-        sm_scale=sm_scale,
-        block_m=block_m,
-        block_n=block_n,
-        num_warps=num_warps,
-        num_buffers=num_buffers,
-        waves_per_eu=waves_per_eu,
-        batch_size=batch_size,
-        max_seqlen=max_seqlen,
-        window_left=window_left if window_left >= 0 else -1,
-        grid=(batch_size, n_heads, triton_cdiv(max_seqlen, block_m)),
-    )
-
-
-def triton_cdiv(x: int, y: int) -> int:
-    return (x + y - 1) // y
-
-
-def _count_live_workgroups(
-    *, cu_seqlens_cpu: list[int], n_heads: int, block_m: int
-) -> int:
-    return n_heads * sum(
-        triton_cdiv(seq_end - seq_start, block_m)
-        for seq_start, seq_end in zip(cu_seqlens_cpu, cu_seqlens_cpu[1:])
-    )
-
-
-def gluon_mha_prefill_gfx1250(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    cu_seqlens_cpu: list[int],
-    max_seqlen: int,
-    window_left: int = -1,
-    logit_cap: float = 0.0,
-    sinks: torch.Tensor | None = None,
-    return_lse: bool = False,
-    softmax_scale: float | None = None,
-    is_causal: bool = True,
-    cu_seqlens_k: torch.Tensor | None = None,
-    cu_seqlens_k_cpu: list[int] | None = None,
-    max_seqlen_k: int | None = None,
-    q_descale: torch.Tensor | None = None,
-    k_descale: torch.Tensor | None = None,
-    v_descale: torch.Tensor | None = None,
-) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    if logit_cap != 0.0:
-        raise NotImplementedError("GFX1250 Gluon prefill does not support logit_cap")
-    supported_dtypes = (
-        torch.float16,
-        torch.bfloat16,
-        torch.float8_e4m3fn,
-        torch.float8_e5m2,
-    )
-    if q.dtype not in supported_dtypes:
-        raise TypeError(f"GFX1250 Gluon prefill supports fp16/bf16/fp8, got {q.dtype}")
-    if k.dtype != q.dtype or v.dtype != q.dtype:
-        raise TypeError("Q, K, and V must use the same dtype")
-    if q.shape[2] not in (64, 128):
-        raise ValueError(f"unsupported head_dim={q.shape[2]}; expected 64 or 128")
-    if k.shape[0] != v.shape[0]:
-        raise ValueError("K and V must have the same packed length")
-
-    if cu_seqlens_k is None:
-        cu_seqlens_k = cu_seqlens
-        if cu_seqlens_k_cpu is None:
-            cu_seqlens_k_cpu = cu_seqlens_cpu
-        if max_seqlen_k is None:
-            max_seqlen_k = max_seqlen
-    if cu_seqlens_k_cpu is None:
-        raise ValueError("cu_seqlens_k_cpu is required when cu_seqlens_k is set")
-    if cu_seqlens_k.numel() != cu_seqlens.numel():
-        raise ValueError("cu_seqlens_k must contain the same batch as cu_seqlens")
-    if max_seqlen_k is None:
-        max_seqlen_k = max(
-            end - start for start, end in zip(cu_seqlens_k_cpu, cu_seqlens_k_cpu[1:])
-        )
-    if max_seqlen_k < 1:
-        raise ValueError("max_seqlen_k must be >= 1")
-    if cu_seqlens_k_cpu[-1] != k.shape[0]:
-        raise ValueError(
-            f"cu_seqlens_k packed length {cu_seqlens_k_cpu[-1]} != k.shape[0] {k.shape[0]}"
-        )
-
-    total_tokens, n_heads, _ = q.shape
-    config = get_config(
-        q=q,
-        k=k,
-        cu_seqlens_q=cu_seqlens,
-        max_seqlen=max_seqlen,
-        window_left=window_left,
-        softmax_scale=softmax_scale,
-    )
-    is_fp8 = q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
-    output_dtype = torch.bfloat16 if is_fp8 else q.dtype
-    output = torch.empty(q.shape, dtype=output_dtype, device=q.device)
-    lse = (
-        torch.empty((total_tokens, n_heads), device=q.device, dtype=torch.float32)
-        if return_lse
-        else None
-    )
-    sink_arg = sinks if sinks is not None else q
-    lse_arg = lse if lse is not None else q
-    one = torch.ones((1,), device=q.device, dtype=torch.float32)
-    if q_descale is None:
-        qk_descale = one
-    else:
-        if k_descale is None:
-            raise ValueError("k_descale is required when q_descale is set")
-        qk_descale = (
-            q_descale.to(dtype=torch.float32).reshape(-1)[:1]
-            * k_descale.to(dtype=torch.float32).reshape(-1)[:1]
-        ).contiguous()
-    if v_descale is None:
-        v_descale_arg = one
-    else:
-        v_descale_arg = v_descale.to(dtype=torch.float32).reshape(-1)[:1].contiguous()
-    tdm_warp_hint = _select_tdm_warp_hint(
-        block_m=config.block_m,
-        block_n=config.block_n,
-        num_warps=config.num_warps,
-        window_left=config.window_left,
-        workgroups=math.prod(config.grid),
-    )
-    reverse_q_blocks = _select_reverse_q_blocks(
-        block_m=config.block_m,
-        max_seqlen=config.max_seqlen,
-        window_left=config.window_left,
-        workgroups=_count_live_workgroups(
-            cu_seqlens_cpu=cu_seqlens_cpu,
-            n_heads=config.n_heads,
-            block_m=config.block_m,
-        ),
-        causal=is_causal,
-    )
-
-    _mha_prefill_gfx1250[config.grid](
-        q,
-        k,
-        v,
-        cu_seqlens,
-        cu_seqlens_k,
-        output,
-        sink_arg,
-        lse_arg,
-        qk_descale,
-        v_descale_arg,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        k.stride(0),
-        k.stride(1),
-        k.stride(2),
-        v.stride(0),
-        v.stride(1),
-        v.stride(2),
-        config.n_heads,
-        config.n_kv_heads,
-        config.head_dim,
-        config.sm_scale,
-        config.block_m,
-        config.block_n,
-        is_fp8,
-        sinks is not None,
-        return_lse,
-        config.window_left,
-        is_causal,
-        tdm_warp_hint,
-        reverse_q_blocks,
-        config.num_warps,
-        config.num_buffers,
-        num_warps=config.num_warps,
-        waves_per_eu=config.waves_per_eu,
-        llvm_fn_attrs=_select_llvm_fn_attrs(
-            head_dim=config.head_dim,
-            max_seqlen=config.max_seqlen,
-            window_left=config.window_left,
-        ),
-    )
-    if return_lse:
-        return output, lse
-    return output
-
-
-def _pack_dense_bshd(x: torch.Tensor):
-    batch, seqlen, n_heads, _ = x.shape
-    packed = x.reshape(batch * seqlen, n_heads, x.shape[-1]).contiguous()
-    cu_cpu = [i * seqlen for i in range(batch + 1)]
-    cu = torch.tensor(cu_cpu, device=x.device, dtype=torch.int32)
-    return packed, cu, cu_cpu, seqlen
-
-
-def gluon_mha_prefill_gfx1250_dense(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    *,
-    causal: bool = False,
-    softmax_scale: float | None = None,
-    q_descale: torch.Tensor | None = None,
-    k_descale: torch.Tensor | None = None,
-    v_descale: torch.Tensor | None = None,
-    return_lse: bool = False,
-):
-    """Dense ``[B, S, H, D]`` wrapper around packed gfx1250 Gluon prefill.
-
-    ``causal`` defaults to False (FA API). Per-tensor descales are applied
-    inside the kernel: Q/K into softmax, V on the output.
-    """
-    if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
-        raise ValueError("expected dense q/k/v as [batch, seqlen, nheads, head_dim]")
-    if softmax_scale is None:
-        softmax_scale = q.shape[-1] ** (-0.5)
-    q = q.contiguous()
-    k = k.contiguous()
-    v = v.contiguous()
-    batch, seqlen_q, n_heads, _ = q.shape
-    q_pack, cu_q, cu_q_cpu, max_q = _pack_dense_bshd(q)
-    k_pack, cu_k, cu_k_cpu, max_k = _pack_dense_bshd(k)
-    v_pack, _, _, _ = _pack_dense_bshd(v)
-    kwargs = {}
-    if max_k != max_q or k_pack.shape[0] != q_pack.shape[0]:
-        kwargs = {
-            "cu_seqlens_k": cu_k,
-            "cu_seqlens_k_cpu": cu_k_cpu,
-            "max_seqlen_k": max_k,
-        }
-    out = gluon_mha_prefill_gfx1250(
-        q_pack,
-        k_pack,
-        v_pack,
-        cu_q,
-        cu_q_cpu,
-        max_q,
-        is_causal=causal,
-        softmax_scale=softmax_scale,
-        return_lse=return_lse,
-        q_descale=q_descale,
-        k_descale=k_descale,
-        v_descale=v_descale,
-        **kwargs,
-    )
-    if return_lse:
-        out, lse = out
-        return (
-            out.view(batch, seqlen_q, n_heads, out.shape[-1]),
-            lse.view(batch, seqlen_q, n_heads),
-        )
-    return out.view(batch, seqlen_q, n_heads, out.shape[-1])
