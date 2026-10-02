@@ -437,8 +437,8 @@ def sparse_mla_fwd(
         out_mxfp8: (data [C, H * D] e4m3, scale [C, H * D // 32] uint8 E8M0) in
             place of out, for the same caches: the output is stored
             MXFP8-quantized, one scale per 32 lanes, and data viewed as
-            [C, H, D] is returned. The arithmetic is that of vLLM's
-            inverse-RoPE + MXFP8 pass on the bf16 rows.
+            [C, H, D] is returned. It matches vLLM's inverse-RoPE + MXFP8
+            pass on the bf16 rows up to rounding.
 
     Returns:
         (out, lse), out is
