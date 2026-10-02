@@ -1,12 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Latency benchmark for the two-stage HC Gated-Residual op (SILOTIGER-1042).
+"""Latency benchmark for the two-stage HC Gated-Residual operator.
 
-Times the shipped fused two-stage ``combine_and_mix`` (fold_w=True, pre-folded
-weight -- the production configuration) across a token sweep, and validates each
-timed shape against the float32 oracle. Self-contained: no external baseline
-(the vLLM/Triton comparison that gated the ticket lives in the legacy bench).
+Times fused two-stage ``combine_and_mix`` with a pre-folded weight across a token
+sweep and validates each shape against the float32 oracle.
 
     HIP_VISIBLE_DEVICES=2 python op_tests/flydsl_tests/bench_hc_gated_residual.py
     HIP_VISIBLE_DEVICES=2 python op_tests/flydsl_tests/bench_hc_gated_residual.py --tokens 512 4096 8192
@@ -106,7 +104,7 @@ def _time_us(inp, iters, warmup_s):
         _run(inp)
         e.record()
         e.synchronize()
-        samples.append(s.elapsed_time(e) * 1.0e3)  # ms -> us
+        samples.append(s.elapsed_time(e) * 1.0e3)
     return statistics.median(samples)
 
 

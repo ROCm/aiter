@@ -10,12 +10,11 @@ helpers -- the merged down+inject weight pack/slice (:func:`merge_down_inject`,
 :func:`split_down_inject`) and the split-K cross-reduction + SiLU epilogue
 (:func:`_build_reduce_silu`).
 
-The GEMMs are tall-and-skinny -- down contracts the full hidden (10240) into the
-~320-wide low-rank bottleneck; up contracts the 320 bottleneck back into 10240 --
-so the matrix-core shape and wave tiling matter and differ by ASIC. gfx950 (CDNA4)
-uses the bf16 ``16x16x32`` matrix core; gfx942 (CDNA3) exposes ``16x16x16``. Both
-accumulate in float32. The ``k_group`` field is ``mma_k // 4`` -- the
-per-instruction K packing the tiled-MMA layout expects.
+The down and up GEMMs contract between the hidden dimension and a much narrower
+low-rank dimension. Matrix-core shape and wave tiling therefore differ by ASIC.
+gfx950 (CDNA4) uses the bf16 ``16x16x32`` matrix core; gfx942 (CDNA3) exposes
+``16x16x16``. Both accumulate in float32. The ``k_group`` field is ``mma_k // 4``,
+the per-instruction K packing expected by the tiled-MMA layout.
 """
 
 from dataclasses import dataclass
@@ -87,8 +86,8 @@ def ab_k_perm(mma_k: int, *, dtype_width: int = 16, copy_bits: int = 128):
     tiled-copy partition derived from this tiled-MMA matches the wide load
     instead of emitting a mismatched-width fragment cast.
 
-    Collapses to the original ``(k_group, 4):(1, k_group)`` layout whenever a
-    load is one K-group (``num_frgv <= 1``), so gfx950 codegen is unchanged.
+    Uses the flat ``(k_group, 4):(1, k_group)`` layout when one load contains one
+    K-group (``num_frgv <= 1``).
     """
     k_group = mma_k // 4
     num_frgv = copy_bits // (k_group * dtype_width)
@@ -147,9 +146,7 @@ def _build_reduce_silu(
 ):
     inv_hc = 1.0 / hc_count
     all_silu = silu_cols >= row_width
-    # One workgroup per element-group so the reduction is fully parallel across
-    # CUs; a single grid-strided workgroup (the naive grid) serializes the whole
-    # output and dominates wall time at large M.
+    # One workgroup per element group exposes the full reduction grid to the CUs.
     n_iters = 1
     assert (
         total % (block_threads * vec) == 0

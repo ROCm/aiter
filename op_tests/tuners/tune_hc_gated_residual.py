@@ -1,16 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Joint (cartesian) tuner + exporter for the fused-K1 config of the two-stage
-HC Gated-Residual op (SILOTIGER-1042).
+"""Joint tuner and exporter for two-stage HC Gated-Residual K1.
 
-Coordinate-descent misses cross-dimension interactions (the 2x2-wave win was
-invisible to it, §6.7d), so this sweeps the K1 GEMM dimensions jointly:
+The Cartesian sweep captures interactions among K1 GEMM dimensions:
   split-K:   split_k x sk_block_m x dn_block_n x (dn_m_waves, dn_n_waves)
   decouple:  block_k x dn_block_m x dn_block_n x (dn_m_waves, dn_n_waves)
-For each token count it validates every candidate against the trusted heuristic
-default, times the K1 call (combine+norm+down, fold_w=True -- the shipped config),
-and keeps the fastest. ``--export`` writes the winners into the package's
+For each token count it validates candidates against the heuristic, times K1
+with folded weights, and keeps the fastest. ``--export`` writes the winners to
 ``aiter/configs/model_configs/hc_gated_residual_tuned.json`` "k1" table (which
 flydsl_k1_combine_norm_down consults:
 explicit arg > tuned plan > heuristic).
@@ -86,8 +83,7 @@ def timeit(fn, iters=60, warmup=20):
 
 
 def k1(inp, **cfg):
-    # Tune the SHIPPED configuration: folded weights + fold_w=True, so the table
-    # reflects the metric _k1_then_k2 actually runs.
+    # Tune the folded-weight configuration used by the two-stage operator.
     cfg = {k: v for k, v in cfg.items() if k != "method"}
     return flydsl_k1_combine_norm_down(
         inp["residual"],

@@ -21,17 +21,14 @@ produces the next block input. For one token row (``s`` indexes the stream):
     gated mean  x        = mean_s sigmoid(gate[s]) * xn[s]         # [stream_dim]
     injection   inj_next = xn @ w_inject.T                         # [hc_count]
 
-In the shipped model ``w_down`` and ``w_inject`` are one merged projection; this
-reference keeps them as separate tensors and reproduces the merge by
-concatenation order. ``w_inject`` is ``None`` for the final mixer, which emits no
-new injection.
+The kernel accepts ``w_down`` and ``w_inject`` as one merged projection. This
+reference keeps them separate and preserves their concatenation order.
+``w_inject`` is ``None`` for the final mixer, which emits no new injection.
 
-The reference is deliberately pure PyTorch and dependency-free so it can act as
-the single shared oracle for every combine-and-mix kernel variant. It follows the
-shipped kernels' numerics: the combined residual is rounded to bfloat16 before
-normalization, and the GEMM operands are rounded to bfloat16 with float32
-accumulation. Pass ``round_bf16=False`` to get the clean float32 math (useful for
-cross-checking against a reference module or for error attribution).
+The pure-PyTorch implementation is the shared oracle for each kernel variant.
+It matches kernel numerics by rounding the combined residual and GEMM operands
+to bfloat16 while accumulating GEMMs in float32. Pass ``round_bf16=False`` to
+evaluate the operator entirely in float32.
 """
 
 from __future__ import annotations

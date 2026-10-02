@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Two-kernel skinny (GEMV) Gated Residual for decode M <= DECODE_MAX_M.
+"""Two-kernel skinny (GEMV) Gated Residual for small-M decode.
 
 Kernel A (:func:`_build_down_fused`) is combine + per-stream RMS + down/inject
 GEMV + split-K reduce + SiLU. One wave owns one merged-weight column ``n`` of one
@@ -80,9 +80,8 @@ def _build_down_fused(
     assert stream_dim % per_iter == 0, f"stream_dim={stream_dim} % {per_iter}"
     assert n_pad % cols_per_block == 0
     # A 16-byte coherent store carries PART_M f32 dots; more rows spill into
-    # consecutive chunks (one extra store each). Beyond ~2 chunks the GEMV's
-    # redundant r2 re-reads (no operand reuse) overtake the weight load, so the
-    # tiled MMA path wins -- this stays a small-M (decode) schedule.
+    # consecutive chunks. Repeated r2 reads grow with the chunk count, so this
+    # schedule is restricted to small M.
     n_chunks = (m_rows + PART_M - 1) // PART_M
     # The arrival counters are never reset; they only have to wrap cleanly.
     assert hc_count & (hc_count - 1) == 0, "hc_count must be a power of two"
@@ -138,9 +137,7 @@ def _build_down_fused(
         gate = []
         for m in range_constexpr(m_rows):
             gm = m_base + m
-            iv = fx.BFloat16(inj_g.load(gm * inj_stride + s, vec_size=1)).to(
-                fx.Float32
-            )
+            iv = fx.BFloat16(inj_g.load(gm * inj_stride + s, vec_size=1)).to(fx.Float32)
             gate.append(fx.Float32(2.0) * sigmoid_f32(iv * fx.Float32(inv_hc)))
 
         # One r2 re-form feeds cols_per_wave weight rows.
@@ -239,7 +236,7 @@ def _build_down_fused(
                     unit_elems=PART_M,
                     cache_modifier=CPOL_COHERENT,
                 )
-        # Our partial must be visible before we announce it.
+        # Publish the partial before incrementing its arrival counter.
         rocdl.s_waitcnt(0)
 
         # One counter per lane of a column, so lanes don't contend on an address.
@@ -391,11 +388,7 @@ def _build_up_mix_grouped(
             for i in range_constexpr(k_iters)
         ]
         wv_raw = w_g.load(c if shared_w else n, vec_size=1)
-        wv = (
-            fx.BFloat16(wv_raw).to(fx.Float32)
-            if w_bf16
-            else fx.Float32(wv_raw)
-        )
+        wv = fx.BFloat16(wv_raw).to(fx.Float32) if w_bf16 else fx.Float32(wv_raw)
         rr_raw = [
             rrms_g.load((m_base + m) * hc_count + g, vec_size=1)
             for m in range_constexpr(m_rows)
@@ -554,13 +547,10 @@ def skinny_chunked_two_kernel(
     waves_per_block: int = 4,
     cols_per_wave: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Prototype true-M schedule for low prefill.
+    """Run low-prefill GEMV in independent ``chunk_m`` row groups.
 
-    The original skinny kernel holds every token accumulator in one wave and
-    spills badly above M=8. This variant maps independent ``chunk_m`` token
-    groups onto grid.y, keeping the same register footprint while increasing
-    parallelism. It intentionally trades repeated weight reads between groups
-    against avoiding the MMA path's 64-row padding.
+    Mapping row groups onto ``grid.y`` bounds each wave's accumulator count and
+    increases parallelism. Groups reread weights to avoid 64-row MMA padding.
     """
     tokens, hidden = residual.shape
     assert tokens % chunk_m == 0

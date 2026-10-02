@@ -1,15 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""TEMPORARY, HC-internal gfx942/CDNA3 bf16 a16w16 GEMM.
+"""Internal a16w16 GEMM supporting the gated-residual K1 path on gfx942.
 
-A near-verbatim copy of the gfx950 reference (``kernels/gemm_a16w16_gfx950.py``)
-with the three CDNA3 adaptations only: 32-bit ``buffer_load...lds`` async DMA (no
-128-bit async on CDNA3), the ``16x16x16`` bf16 MFMA shape, and the 64 KB LDS
-budget. It lives *inside* the ``hyper_connection_gated_residual`` package on
-purpose: it is consumed **only** by this kernel's K1 and must NOT be imported
-elsewhere. It will be deleted once a proper standalone bf16 gfx942 GEMM lands
-under ``kernels/`` for general use (that is the file others should build on).
+The implementation uses gfx942's 32-bit asynchronous LDS loads, ``16x16x16``
+bf16 MFMA shape, and 64 KiB LDS limit. It remains package-internal because its
+interface and scheduling constraints are specific to K1.
 """
 
 import functools
@@ -62,7 +58,7 @@ class GemmA16W16Gfx950Param:
     mma_m: fx.Constexpr[int]
     mma_n: fx.Constexpr[int]
     mma_k: fx.Constexpr[int]
-    # derived params
+    # Values derived once and reused by the generated kernel.
     async_load_bytes: fx.Constexpr[int]
     in_data_bytes: fx.Constexpr[int]
     out_data_bytes: fx.Constexpr[int]
@@ -187,11 +183,8 @@ def make_gemm_a16w16_gfx950_param(
             f"block_k={block_k}, smem_bytes={smem_bytes}, "
             f"capacity={smem_capacity} for arch={arch}"
         )
-    # async global->LDS DMA width: gfx950/CDNA4 has the 128-bit
-    # buffer_load_async.lds; gfx942/CDNA3 only supports the 32-bit
-    # buffer_load_dword...lds, so the async panel loads are 32-bit there.
+    # gfx942 uses 32-bit asynchronous LDS loads; gfx950 uses 128-bit loads.
     async_bytes = 4 if arch == "gfx942" else GFX950_DMA_BYTES
-    # async load check
     async_load_vec_size = async_bytes // in_dbytes
     ldg_x_threads = block_k // async_load_vec_size
     if ldg_x_threads * async_load_vec_size != block_k:
@@ -1136,7 +1129,6 @@ def gemm_a16w16_hti_gfx950_kernel(
     main_loop_end = k_tiles - 2
     for k_tile in range(0, main_loop_end, 2):
         next_k_tile = k_tile + 2
-        # 0
         b0 = load_b_fragment(0, 0)
         a0 = load_a_fragment(0, 0)
         async_load_a_to_lds(1, k_tile + 1, 1)
@@ -1158,7 +1150,6 @@ def gemm_a16w16_hti_gfx950_kernel(
         wait_vmcnt_and_barrier(2 * half_ldg_b_iters + half_ldg_a_iters)
         consume(c11, a1, b1, True)
         rocdl.s_barrier()
-        # 1
         a0 = load_a_fragment(0, 1)
         async_load_a_to_lds(1, next_k_tile, 0)
         rocdl.s_barrier()
@@ -1180,7 +1171,6 @@ def gemm_a16w16_hti_gfx950_kernel(
         rocdl.s_barrier()
 
     k_tile = main_loop_end
-    # 0
     if const_expr(is_split_k):
         wait_vmcnt_and_barrier(0)
     b0 = load_b_fragment(0, 0)
@@ -1201,7 +1191,6 @@ def gemm_a16w16_hti_gfx950_kernel(
     rocdl.s_barrier()
     consume(c11, a1, b1, True)
     wait_vmcnt_and_barrier(0)
-    # 1
     a0 = load_a_fragment(0, 1)
     rocdl.s_barrier()
     consume(c00, a0, b0, True)

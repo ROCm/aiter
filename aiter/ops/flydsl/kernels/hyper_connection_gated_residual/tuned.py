@@ -1,25 +1,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Data-driven kernel-config selection from the offline tuning sweep.
+"""Select measured kernel configurations by architecture and tensor shape.
 
-Loads a distilled, per-architecture lookup table (produced by
-``op_tests/flydsl_tests/tune.py --export``, see also the scratch tuner) and
-returns the best-measured block config for a given ``(kernel, token count)``.
-Shapes that were not tuned resolve to the nearest tuned token count in log
-space, which is the natural interpolation for GEMM-like latency curves.
-
-This replaces hand-tuned dispatch thresholds (e.g. a fixed split-K vs pipeline
-cutover) with the actual measurements. When the table is missing an arch or
-kernel the lookups return ``None`` so callers fall back to their heuristic
-defaults, keeping the kernels usable on untuned hardware.
+Untuned token counts use the nearest measured count in log space. Missing
+architecture or kernel tables return ``None`` so callers can use heuristics.
 
 Table schema (``aiter/configs/model_configs/hc_gated_residual_tuned.json``)::
 
     {
       "gfx950": {
         "up_gate_mix": {"256": {"block_m": 64, "block_n": 32,
-                                 "m_waves": 1, "n_waves": 2, "_us": 13.14}, ...},
+                                 "m_waves": 1, "n_waves": 2, "_us": ...}, ...},
         "up_gate_mix_n336": {"256": {"block_m": 32, "block_n": 16,
                                       "m_waves": 1, "n_waves": 1, ...}, ...},
         "k1":          {"256": {"method": "splitk", ...}, ...},
@@ -36,8 +28,6 @@ import json
 import math
 import os
 
-# Tuned table lives with the other tuned model configs (aiter convention), not
-# in-package: aiter/configs/model_configs/ is four levels up from this kernel dir.
 _TABLE_PATH = os.path.normpath(
     os.path.join(
         os.path.dirname(__file__),
@@ -81,9 +71,7 @@ def _entry(arch: str, kernel: str, tokens: int):
     return tbl[str(key)] if key is not None else None
 
 
-def up_gate_mix_config(
-    arch: str, tokens: int, packed_width: int | None = None
-):
+def up_gate_mix_config(arch: str, tokens: int, packed_width: int | None = None):
     """Tuned ``{block_m, block_n, m_waves, n_waves}`` or ``None``."""
     arch_table = _table().get(arch, {})
     specific = (
@@ -91,8 +79,8 @@ def up_gate_mix_config(
         if packed_width is not None
         else None
     )
-    # K2's best plan can depend on the packed K1 row stride. Shape-specific
-    # overrides are exact-only so a partial table cannot perturb untuned sizes.
+    # K1's packed row stride changes K2's memory access pattern. Apply
+    # stride-specific entries only to measured token counts.
     e = specific.get(str(tokens)) if specific else None
     if not e:
         e = _entry(arch, "up_gate_mix", tokens)
@@ -107,20 +95,15 @@ def k1_plan(arch: str, tokens: int, n_pad: int | None = None):
     Entry is a flat dict: ``method`` (``"decouple"`` or ``"splitk"``) plus the
     kwargs :func:`flydsl_k1_combine_norm_down` consumes -- ``split_k`` (split-K
     only), ``stages``, ``block_k``, ``sk_block_m`` (split-K partial tile height),
-    ``dn_block_n``/``dn_block_m``/``dn_m_waves``/``dn_n_waves``.     Missing keys let
-    the kernel keep its heuristic default for that dimension, so a partial entry
-    is valid. ``_us`` is provenance only.
+    ``dn_block_n``/``dn_block_m``/``dn_m_waves``/``dn_n_waves``. Missing keys
+    keep the kernel's heuristic default. ``_us`` is provenance only.
 
-    Unlike the other tables this does **not** extrapolate below its smallest
-    tuned token: the low/mid-M split-K heuristic is already tuned and must
-    not be overwritten by a nearest-snap onto a large-M decouple entry. Below the
-    tuned range this returns ``None`` (kernel keeps its heuristic).
+    Counts below the smallest measured entry return ``None`` to preserve the
+    low-token split-K heuristic.
     """
     arch_table = _table().get(arch, {})
-    # Shape-specific tables are additive: vLLM's 16-row-padded merged weight
-    # uses n_pad=336, while AITER's native merged weight uses the default
-    # n_pad=384 table. Once a shape table exists, keep using it outside its
-    # measured range: a generic plan can have incompatible N-wave geometry.
+    # A shape-specific table must remain active outside its measured range
+    # because the generic table may use incompatible N-wave geometry.
     specific = arch_table.get(f"k1_n{n_pad}") if n_pad is not None else None
     tbl = specific or arch_table.get("k1")
     if not tbl:

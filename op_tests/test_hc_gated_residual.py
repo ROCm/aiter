@@ -4,16 +4,9 @@
 """Correctness test for the two-stage Hyper-Connection Gated-Residual op
 (``aiter.ops.flydsl.kernels.hyper_connection_gated_residual``).
 
-Exercises the three entry points (``combine_and_mix`` / ``mix`` / ``combine``),
-the final mixer (no inject), the decode tail, and the full-width norm weight --
-all against the shared float32 oracle in the package's ``reference`` module. Both
-weight modes are covered: ``fold_w=False`` (K1 applies the RMSNorm affine) and
-``fold_w=True`` ((1+w) pre-folded into the down weight). The tile-aligned sweep
-spans both K1 reduction branches: split-K (M<3072) and the decoupled pipe (M>=3072).
-
-Aiter script convention (run directly, not pytest): the run loop is under
-``if __name__ == "__main__"`` so importing the file has no side effects and CI's
-``python3 <file>`` runs the checks. Exits non-zero on failure.
+Checks all public entry points, the no-injection final mixer, decode and tiled
+token counts, both norm-weight layouts, and folded/unfolded weights against the
+float32 oracle.
 
     python op_tests/test_hc_gated_residual.py
     python op_tests/test_hc_gated_residual.py --tokens 512 4096
@@ -40,7 +33,7 @@ from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.common import (
 )
 from aiter.test_common import checkAllclose
 
-# Shipped model dimensions (Qwen3.8-Flash-Next).
+# Model dimensions covered by this test.
 HC, HS, LOWRANK = 4, 2560, 320
 EPS = 1e-6
 
@@ -69,8 +62,7 @@ def _make_inputs(tokens, *, with_inject=True, full_norm=False, seed=0):
         "residual": _rand(tokens, hidden),
         "block_output": _rand(tokens, HS),
         "injection": _rand(tokens, HC),
-        # full_norm -> [hidden] (per-stream-per-channel weight); else the shared
-        # [stream_dim]. The [hidden] form exercises the w_len==hidden codegen branch.
+        # full_norm selects per-stream weights instead of one shared stream weight.
         "norm_weight": _rand(hidden if full_norm else HS, scale=0.1),
         "w_down": _rand(LOWRANK, hidden, scale=hidden**-0.5),
         "w_up": _rand(hidden, LOWRANK, scale=LOWRANK**-0.5),
@@ -79,7 +71,7 @@ def _make_inputs(tokens, *, with_inject=True, full_norm=False, seed=0):
 
 
 def _ref(inp, which):
-    """Oracle output for the given entry point (production bf16 numerics)."""
+    """Oracle output with the kernel's bf16 rounding order."""
     if which == "combine_and_mix":
         return gr_combine_and_mix(
             inp["residual"],
@@ -232,10 +224,7 @@ def _run_final_mixer_no_inject(tokens, fold_w):
 
 
 def _run_decode(tokens, fold_w):
-    """Decode M vs the oracle, both weight modes. ``fold_w=True`` takes the skinny
-    GEMV two-stage; ``fold_w=False`` is *not* skinny (the skinny down assumes the
-    folded weight) -- it exercises the padded low-M tail of the split-K/decouple
-    path instead."""
+    """Check skinny folded decode and the padded unfolded path."""
     tag = "fold" if fold_w else "nofold"
     inp = _make_inputs(tokens, seed=7)
     r2, x, inj = flydsl_gr_two_stage_combine_and_mix(
@@ -266,9 +255,7 @@ def _run_decode(tokens, fold_w):
 
 
 def _run_full_norm_weight(tokens, fold_w):
-    """Full-width norm_weight ([hidden]) instead of the shared [stream_dim] -- covers
-    the ``w_len==hidden`` branch in the down norm_A, K2, and the skinny up-GEMV
-    (``shared_w=False``), which the [stream_dim] inputs never reach."""
+    """Check per-stream norm weights in K1, K2, and skinny decode."""
     tag = "fold" if fold_w else "nofold"
     inp = _make_inputs(tokens, full_norm=True, seed=5)
     r2, x, inj = flydsl_gr_two_stage_combine_and_mix(
@@ -298,8 +285,8 @@ def _run_full_norm_weight(tokens, fold_w):
     )
 
 
-def _run_pad16_merged(tokens):
-    """Exercise vLLM's caller-padded 336-column merged weight."""
+def _run_pad336_merged(tokens):
+    """Check a caller-padded 336-column merged weight."""
     inp = _make_inputs(tokens, seed=11)
     merged = merge_down_inject(inp["w_down"], inp["w_inject"], 336)
     r2, x, inj = flydsl_gr_two_stage_combine_and_mix(
@@ -317,12 +304,12 @@ def _run_pad16_merged(tokens):
     )
     torch.cuda.synchronize()
     r2_ref, x_ref, inj_ref = _ref(inp, "combine_and_mix")
-    _check(r2_ref.to(r2.dtype), r2, f"pad16[M={tokens}] r2", atol=0.05, rtol=0.02)
-    _check(x_ref.to(x.dtype), x, f"pad16[M={tokens}] x")
+    _check(r2_ref.to(r2.dtype), r2, f"pad336[M={tokens}] r2", atol=0.05, rtol=0.02)
+    _check(x_ref.to(x.dtype), x, f"pad336[M={tokens}] x")
     _check(
         inj_ref.to(inj.dtype),
         inj.contiguous(),
-        f"pad16[M={tokens}] inj",
+        f"pad336[M={tokens}] inj",
         atol=0.05,
     )
 
@@ -336,14 +323,14 @@ def main():
         type=int,
         nargs="+",
         default=[512, 2048, 4096],
-        help="tile-aligned token counts (spans split-K <3072 and decouple >=3072).",
+        help="tile-aligned token counts covering split-K and decoupled K1 paths.",
     )
     parser.add_argument(
         "--decode-tokens",
         type=int,
         nargs="+",
         default=[1, 3, 4, 5, 6, 7, 8, 32],
-        help="small (decode) token counts; 4/5 pin the skinny<->tail DECODE_MAX_M boundary.",
+        help="small token counts covering skinny and padded decode paths.",
     )
     args = parser.parse_args()
 
@@ -360,15 +347,13 @@ def main():
             _run_mix(m, fold_w)
             _run_final_mixer_no_inject(m, fold_w)
         _run_combine(m)
-    _run_combine(64)  # extra tile-aligned combine size
+    _run_combine(64)
     for m in args.decode_tokens:
-        for fold_w in (False, True):  # cover the non-skinny nofold tail at decode M
+        # Unfolded decode uses the padded tail because skinny K1 requires folding.
+        for fold_w in (False, True):
             _run_decode(m, fold_w)
-        # final mixer (w_inject=None -> n_pad=lowrank) at decode/small M: covers the
-        # skinny/tail need_inj=False path and the n_pad divisor fallbacks at tiny M.
+        # The final mixer exercises the narrower no-injection output.
         _run_final_mixer_no_inject(m, True)
-    # Full-width norm_weight ([hidden]) -- the w_len==hidden branch the shared
-    # [stream_dim] inputs never hit.
     for m in (3, 512):
         for fold_w in (False, True):
             _run_full_norm_weight(m, fold_w)
@@ -392,7 +377,7 @@ def main():
         4096,
         8192,
     ):
-        _run_pad16_merged(m)
+        _run_pad336_merged(m)
 
     if _FAILURES:
         print(f"\n{len(_FAILURES)} check(s) FAILED: {_FAILURES}")

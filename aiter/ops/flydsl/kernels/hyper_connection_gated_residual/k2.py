@@ -3,10 +3,8 @@
 
 """Fused up-projection + gated-mean for the Gated-Residual mix.
 
-This is the memory-heavy tail of ``combine_and_mix``. The shipped path runs the
-up-GEMM and the gated mean as two launches that round-trip the full
-``hc_count*stream_dim`` gate tensor through HBM. Here the gate is produced by an
-MFMA up-GEMM and consumed immediately in registers, so it never touches memory:
+The gate is produced by an MFMA up-GEMM and consumed immediately in registers,
+avoiding a ``hc_count*stream_dim`` gate tensor in global memory:
 
     gate[m, s*stream_dim + c] = lora[m, :] . w_up[s*stream_dim + c, :]
     block_input[m, c]         = mean_s sigmoid(gate[...]) * xn[m, s*stream_dim + c]
@@ -178,13 +176,12 @@ def _build_up_gate_mix_norm(
                     smem + local_m * block_n + c0,
                     result_type=fx.Vector.make_type(VEC, fx.Float32),
                 )
-                # Re-form xn on the fly: widen r2, * rrms * (1+w), re-round to bf16
-                # (reference order), then back to f32 for the gated-mean multiply.
+                # Match the reference order: normalize in f32, round to bf16,
+                # then widen for the gated-mean multiply.
                 r2_vec = fx.Vector(r2_g.load(g_m * hidden + col, vec_size=VEC)).to(
                     fx.Float32
                 )
-                # Measurement-only: skip the rrms*(1+w) reform + bf16 round to
-                # isolate the K2 normalize tax (mirrors K1's _skip_norm).
+                # The diagnostic path omits normalization to isolate its cost.
                 xn_vec = r2_vec
                 if not _skip_norm:
                     rr = fx.Float32(rrms_g.load(g_m * hc_count + s, vec_size=1))
@@ -196,8 +193,7 @@ def _build_up_gate_mix_norm(
                         for e in range_constexpr(VEC):
                             wv.append(w8[e])
                     else:
-                        # f32 buffer loads are 128-bit max (v8f32 won't isel), so
-                        # read the VEC-wide (1+w) slice in dwordx4 chunks.
+                        # Read the VEC-wide f32 (1+w) slice in 128-bit chunks.
                         for c4 in range_constexpr(VEC // 4):
                             w4 = fx.Vector(
                                 w_g.load((col + c4 * 4) % w_len, vec_size=4)
@@ -268,10 +264,8 @@ def flydsl_up_gate_mix_norm(
 ) -> torch.Tensor:
     """K2: fused up-GEMM + gated mean that re-forms ``xn`` from ``r2`` + ``rrms``.
 
-    Drop-in for :func:`flydsl_up_gate_mix` where the caller has ``r2`` (K1's
-    stored combined residual) and ``rrms`` (K1's per-stream 1/rms) instead of a
-    materialized ``xn`` -- removing the ``xn`` HBM round-trip and the norm-rebuild
-    launch. Returns ``block_input`` [M, stream_dim] bf16.
+    Takes K1's stored combined residual and per-stream reciprocal RMS instead of
+    a materialized ``xn``. Returns ``block_input`` [M, stream_dim] bf16.
     """
     # lora may be a strided view of K1's packed [M, lowrank+hc] output (the
     # first ``lowrank`` columns). Only the inner (lowrank) dim must be

@@ -3,10 +3,10 @@
 
 """Two-stage Gated-Residual ``combine_and_mix`` op.
 
-The shipped, fully-fused two-stage kernel: ``K1`` = combine + grouped-RMSNorm +
-down GEMM (:func:`~.k1.flydsl_k1_combine_norm_down`), ``K2`` = silu + up GEMM +
-gated mean (:func:`~.k2.flydsl_up_gate_mix_norm`), with ``xn`` re-formed from the
-stored ``r2`` inside K2 so it never touches HBM.
+The fused two-stage kernel uses ``K1`` for combine + grouped-RMSNorm + down GEMM
+(:func:`~.k1.flydsl_k1_combine_norm_down`) and ``K2`` for SiLU + up GEMM + gated
+mean (:func:`~.k2.flydsl_up_gate_mix_norm`). K2 re-forms ``xn`` from stored
+``r2``, so ``xn`` never touches HBM.
 """
 
 from __future__ import annotations
@@ -110,10 +110,8 @@ def _k1_then_k2(
     norm-rebuild launch ever exists.
     """
     tokens = residual.shape[0]
-    # Decode M: the fully-skinny MMA-free GEMV two-stage does true-M work (no
-    # 64-row pad, xn never materialized) and beats the padding-MMA tail at small M.
-    # Gated to fold_w (the GEMV down assumes the folded weight) and M<=DECODE_MAX_M
-    # (the GEMV holds M accumulators per lane, so it spills above that).
+    # The skinny path avoids row padding and requires the folded down weight.
+    # Limit it to DECODE_MAX_M because each lane holds one accumulator per row.
     if fold_w and 1 <= tokens <= DECODE_MAX_M:
         return flydsl_k1k2_skinny_decode(
             residual,
@@ -128,10 +126,8 @@ def _k1_then_k2(
             need_inj,
             stream=stream,
         )
-    # Low-M tail path: when tokens is not a tile multiple, run the GEMM stages
-    # over a padded row count P while the combine prologue reads only the true
-    # tokens rows. All K1->K2 bridge buffers (r2, rrms, packed) live at P; the
-    # final views slice back to [:tokens]. Replaces a caller-side pad-memcpy.
+    # GEMM stages use a padded row count while the combine prologue reads only
+    # real tokens. K1-to-K2 buffers retain the padded shape until the final slice.
     PAD = 64
     pad_tokens = ((tokens + PAD - 1) // PAD) * PAD
     gemm_pad = None if pad_tokens == tokens else pad_tokens
@@ -189,7 +185,7 @@ def flydsl_gr_two_stage_combine_and_mix(
     mixer, ``w_inject=None``). Matches :func:`.reference.gr_combine_and_mix`.
 
     ``fold_w=True`` bakes ``(1 + norm_weight)`` into the down weight so K1 skips
-    the per-element affine (a small win); pass a pre-folded ``w_down_merged`` (see
+    the per-element affine; pass a pre-folded ``w_down_merged`` (see
     :func:`fold_norm_weight`) to keep the fold off the timed path, or let this
     build it. ``fold_w=False`` (default) applies the affine inside K1.
     """
@@ -227,9 +223,8 @@ def flydsl_gr_two_stage_mix(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """No pending combine: normalize ``residual`` directly, then mix.
 
-    Returns ``(residual, block_input, inj_next)`` -- ``r2`` is ``residual``
-    unchanged (1042: "mix skips steps 1 and 2"). Runs the fused two-stage with a
-    zero block output (so ``r2 == residual`` up to the bf16 store).
+    Returns ``(residual, block_input, inj_next)``. A zero block output lets the
+    fused path normalize and mix without changing the residual.
     """
     lowrank = w_down.shape[0]
     tokens, hidden = residual.shape
@@ -267,9 +262,8 @@ def flydsl_gr_two_stage_combine(
 ) -> torch.Tensor:
     """Write-only combine: inject the pending block output, return ``R2``.
 
-    ``R2`` is the delayed residual write vLLM flushes on PLE / deepstack / PP
-    handoff. Runs K1's combine+RMS prologue and keeps only ``r2`` (``norm_weight``
-    is unused here -- the combine does not normalize its output).
+    Runs K1's combine+RMS prologue and keeps only ``r2``. ``norm_weight`` is
+    unused because the combine result is not normalized.
     """
     tokens, hidden = residual.shape
     stream_dim = hidden // hc_count
