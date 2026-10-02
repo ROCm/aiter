@@ -380,7 +380,14 @@ def test_mha_fp8_pertensor_gluon(
 @pytest.mark.parametrize("HEAD_SZ", [64, 128])
 @pytest.mark.parametrize(
     "CAUSAL, WINDOW_SIZE_LEFT, SINK",
-    [(False, -1, False), (True, -1, False), (True, -1, True), (True, 32, True)],
+    [
+        (False, -1, False),
+        (True, -1, False),
+        (True, -1, True),
+        (True, 32, True),
+        (False, 0, False),
+        (True, 0, True),
+    ],
 )
 def test_mha_varlen_fp8_pertensor_gluon(
     BATCH: int,

@@ -664,7 +664,9 @@ def _gluon_gfx1250_flash_attn_forward(
         )
     if int(window_size[1]) != -1:
         raise ValueError("window_size_right is not supported yet in the Gluon Backend")
-    sliding_window = _get_sliding_window_size(window_size)
+    # SLIDING_WINDOW counts the diagonal key, so a zero left window stays on;
+    # 0 means no window.
+    sliding_window = max(int(window_size[0]) + 1, 0)
 
     supported_dtypes = (torch.float16, torch.bfloat16, types.e4m3_dtype)
     if q.dtype not in supported_dtypes or k.dtype != q.dtype or v.dtype != q.dtype:

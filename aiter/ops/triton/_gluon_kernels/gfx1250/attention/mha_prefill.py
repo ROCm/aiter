@@ -77,6 +77,7 @@ class AttentionConfig:
     IS_VARLEN: gl.constexpr
     HAS_SINK: gl.constexpr
     HAS_LSE: gl.constexpr
+    # Left window including the diagonal key (window_size_left + 1); 0 is off.
     SLIDING_WINDOW: gl.constexpr
     IS_CAUSAL: gl.constexpr
     TDM_WARP_HINT: gl.constexpr
@@ -483,7 +484,7 @@ class AttentionProgram:
         if cfg.IS_CAUSAL:
             valid &= offs_n[None, :] <= diag
         if cfg.SLIDING_WINDOW > 0:
-            valid &= offs_n[None, :] >= diag - cfg.SLIDING_WINDOW
+            valid &= offs_n[None, :] > diag - cfg.SLIDING_WINDOW
         return gl.where(valid, qk, -float("inf"))
 
     @gluon.jit
@@ -809,7 +810,7 @@ def _mha_prefill_gfx1250(
         diag_start = program.q_start + program.diag_offset
         kv_start = 0
         if cfg.SLIDING_WINDOW > 0:
-            kv_start = diag_start - cfg.SLIDING_WINDOW
+            kv_start = diag_start - cfg.SLIDING_WINDOW + 1
             kv_start = gl.where(
                 kv_start > 0, (kv_start // cfg.BLOCK_N) * cfg.BLOCK_N, 0
             )
