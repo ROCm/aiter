@@ -66,7 +66,6 @@ __device__ __forceinline__ void block_select_lds(const uint32_t* __restrict__ s_
                                                  int c,
                                                  int K,
                                                  uint32_t* __restrict__ s_hist,
-                                                 uint32_t* __restrict__ s_red,
                                                  uint32_t* __restrict__ s_scan,
                                                  uint32_t* __restrict__ s_mm,
                                                  uint32_t& pivot,
@@ -272,7 +271,6 @@ template <int KPT>
 __device__ __forceinline__ void block_select_reg(const uint32_t keys[KPT],
                                                  int K,
                                                  uint32_t* __restrict__ s_hist,
-                                                 uint32_t* __restrict__ s_red,
                                                  uint32_t* __restrict__ s_scan,
                                                  uint32_t& pivot,
                                                  int& eq_needed,
@@ -427,9 +425,6 @@ __device__ __forceinline__ bool row_prefix_single_value(const float* __restrict_
                                                         uint32_t* __restrict__ s_amm,
                                                         uint32_t& value)
 {
-    const int lane   = threadIdx.x & (WAVE_SIZE - 1);
-    const int wv     = threadIdx.x / WAVE_SIZE;
-    const int nwaves = blockDim.x / WAVE_SIZE;
     uint32_t amn = 0xFFFFFFFFu, amx = 0u;
     for(int j = threadIdx.x; j < n4; j += blockDim.x)
     {
@@ -443,27 +438,10 @@ __device__ __forceinline__ bool row_prefix_single_value(const float* __restrict_
             amx              = max(amx, act ? k : 0u);
         }
     }
-#pragma unroll
-    for(int off = 1; off < WAVE_SIZE; off <<= 1)
-    {
-        amn = min(amn, (uint32_t)__shfl_xor((int)amn, off));
-        amx = max(amx, (uint32_t)__shfl_xor((int)amx, off));
-    }
-    if(lane == 0)
-    {
-        s_amm[wv]                       = amn;
-        s_amm[MAX_WAVES_PER_BLOCK + wv] = amx;
-    }
-    __syncthreads();
-    uint32_t bmn = 0xFFFFFFFFu, bmx = 0u;
-    for(int w = 0; w < nwaves; w++)
-    {
-        bmn = min(bmn, s_amm[w]);
-        bmx = max(bmx, s_amm[MAX_WAVES_PER_BLOCK + w]);
-    }
+    block_minmax(amn, amx, s_amm);
     __syncthreads(); // s_amm is rewritten by the next call
-    value = bmn;
-    return bmn == bmx;
+    value = amn;
+    return amn == amx;
 }
 
 // block_gather_topk over a row streamed from global memory, a vector at a time:
@@ -541,9 +519,9 @@ __device__ __forceinline__ void block_gather_stream(const float* __restrict__ ro
                     const unsigned p = baseg + (unsigned)__popcll(bg & lt);
                     if(p < (unsigned)ngt)
                     {
-                        out_store(out + p, idx_base + col);
+                        out[p] = idx_base + col;
                         if(WRITE_VALUES)
-                            out_store(out_val + p, sortable_to_fp32(k));
+                            out_val[p] = sortable_to_fp32(k);
                     }
                 }
                 if(eq)
@@ -551,9 +529,9 @@ __device__ __forceinline__ void block_gather_stream(const float* __restrict__ ro
                     const unsigned p = basee + (unsigned)__popcll(be & lt);
                     if(p < (unsigned)eq_needed)
                     {
-                        out_store(out + ngt + p, idx_base + col);
+                        out[ngt + p] = idx_base + col;
                         if(WRITE_VALUES)
-                            out_store(out_val + ngt + p, sortable_to_fp32(k));
+                            out_val[ngt + p] = sortable_to_fp32(k);
                     }
                 }
             }
@@ -772,7 +750,6 @@ __device__ __forceinline__ void band_find(uint32_t* __restrict__ s_hist,
                                           uint32_t* __restrict__ s_scan,
                                           int rank)
 {
-    using u32x4 = __attribute__((__ext_vector_type__(4))) uint32_t;
     // Coarse bucket cb is the sum of fine buckets [64 cb, 64 cb + 64), written to
     // replica 0; 16 lanes of 4 fine buckets each.
     for(int t0 = 0; t0 < WIDE_FINE / 4; t0 += blockDim.x)
@@ -781,8 +758,8 @@ __device__ __forceinline__ void band_find(uint32_t* __restrict__ s_hist,
         uint32_t s  = 0u;
         if(t < WIDE_FINE / 4)
         {
-            const u32x4 f = reinterpret_cast<const u32x4*>(s_x)[t];
-            s             = f[0] + f[1] + f[2] + f[3];
+            const opus::u32x4_t f = reinterpret_cast<const opus::u32x4_t*>(s_x)[t];
+            s                     = f[0] + f[1] + f[2] + f[3];
         }
         s += (uint32_t)__shfl_xor((int)s, 1);
         s += (uint32_t)__shfl_xor((int)s, 2);
@@ -800,10 +777,9 @@ __device__ __forceinline__ void band_find(uint32_t* __restrict__ s_hist,
 __device__ __forceinline__ void
 band_clear(uint32_t* __restrict__ s_hist, uint32_t* __restrict__ s_x, uint32_t* __restrict__ s_scan)
 {
-    using u32x4   = __attribute__((__ext_vector_type__(4))) uint32_t;
-    const u32x4 z = {0u, 0u, 0u, 0u};
+    const opus::u32x4_t z = {0u, 0u, 0u, 0u};
     for(int j = threadIdx.x; j < WIDE_FINE / 4; j += blockDim.x)
-        reinterpret_cast<u32x4*>(s_x)[j] = z;
+        reinterpret_cast<opus::u32x4_t*>(s_x)[j] = z;
     for(int j = threadIdx.x; j < WIDE_COARSE_SLOTS; j += blockDim.x)
         s_hist[j] = 0u;
     if(threadIdx.x == 0)
@@ -916,25 +892,7 @@ __device__ __forceinline__ int radix_fallback_row(const float* __restrict__ row,
             band_clear(s_hist, s_x, s_scan);
             uint32_t kmin = 0xFFFFFFFFu, kmax = 0u;
             band_refine_pass<LR>(row, n4, len, fsh, pfx, dsh, dmask, s_x, kmin, kmax);
-#pragma unroll
-            for(int off = 1; off < WAVE_SIZE; off <<= 1)
-            {
-                kmin = min(kmin, (uint32_t)__shfl_xor((int)kmin, off));
-                kmax = max(kmax, (uint32_t)__shfl_xor((int)kmax, off));
-            }
-            if((threadIdx.x & (WAVE_SIZE - 1)) == 0)
-            {
-                s_amm[threadIdx.x / WAVE_SIZE]                       = kmin;
-                s_amm[MAX_WAVES_PER_BLOCK + threadIdx.x / WAVE_SIZE] = kmax;
-            }
-            __syncthreads();
-            kmin = 0xFFFFFFFFu;
-            kmax = 0u;
-            for(int w = 0; w < (int)(blockDim.x / WAVE_SIZE); w++)
-            {
-                kmin = min(kmin, s_amm[w]);
-                kmax = max(kmax, s_amm[MAX_WAVES_PER_BLOCK + w]);
-            }
+            block_minmax(kmin, kmax, s_amm);
             if(kmin == kmax)
             {
                 // Every key of the prefix is one value: ngt keys above it, the rest copies.
@@ -1118,7 +1076,6 @@ __global__ __launch_bounds__(1024) PHASE_A_OCCUPANCY
     uint32_t* s_keys = s_dyn;
     uint32_t* s_wide = (KPT > 0) ? s_dyn : (s_keys + S);
     __shared__ __align__(16) uint32_t s_hist[HIST_SLOTS];
-    __shared__ uint32_t s_red[256];
     __shared__ uint32_t s_scan[2];
     __shared__ uint32_t s_mm[2 * MAX_WAVES_PER_BLOCK];
 
@@ -1235,8 +1192,7 @@ __global__ __launch_bounds__(1024) PHASE_A_OCCUPANCY
         }
         else
         {
-            block_select_reg<KPT>(
-                keys, rank_row, s_hist, s_red, s_scan, pivot, eq_needed, npasses, true);
+            block_select_reg<KPT>(keys, rank_row, s_hist, s_scan, pivot, eq_needed, npasses, true);
         }
     }
     else if(nwide > 0)
@@ -1256,18 +1212,8 @@ __global__ __launch_bounds__(1024) PHASE_A_OCCUPANCY
     }
     else
     {
-        block_select_lds(s_keys,
-                         S,
-                         rank_row,
-                         s_hist,
-                         s_red,
-                         s_scan,
-                         s_mm,
-                         pivot,
-                         eq_needed,
-                         npasses,
-                         false,
-                         true);
+        block_select_lds(
+            s_keys, S, rank_row, s_hist, s_scan, s_mm, pivot, eq_needed, npasses, false, true);
     }
 #endif
     if(threadIdx.x == 0)

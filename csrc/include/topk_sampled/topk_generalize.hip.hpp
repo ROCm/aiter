@@ -44,7 +44,6 @@ __global__ void phase_small_n_topk(const float* __restrict__ input,
     }
     extern __shared__ uint32_t s_keys[];
     __shared__ __align__(16) uint32_t s_hist[HIST_SLOTS];
-    __shared__ uint32_t s_red[256];
     __shared__ uint32_t s_scan[2];
     __shared__ uint32_t s_mm[2 * MAX_WAVES_PER_BLOCK];
     __shared__ unsigned s_wgt, s_weq;
@@ -64,8 +63,7 @@ __global__ void phase_small_n_topk(const float* __restrict__ input,
     const int k_out = RAGGED ? k_take_dev(K, len) : K;
     uint32_t pivot;
     int eq_needed;
-    block_select_lds(
-        s_keys, len, k_out, s_hist, s_red, s_scan, s_mm, pivot, eq_needed, npasses, true);
+    block_select_lds(s_keys, len, k_out, s_hist, s_scan, s_mm, pivot, eq_needed, npasses, true);
 
     int* out = dst.idx_row(row, K);
     if(threadIdx.x == 0)
@@ -76,8 +74,6 @@ __global__ void phase_small_n_topk(const float* __restrict__ input,
     __syncthreads();
     if constexpr(RAGGED)
     {
-        // Identity column = row_start + i; build a tiny idx view via s_red reused? Keep
-        // functor form here: small_n is not under PHASE_C_OCCUPANCY.
         block_gather_topk<WRITE_VALUES>(
             len,
             pivot,
@@ -476,7 +472,6 @@ phase_c_select_contig(const float* __restrict__ input,
     // nwide * WIDE_WORDS words after the keys (and the indices unless keys_only).
     uint32_t* s_wide = s_dyn + (keys_only ? cap : 2 * cap);
     __shared__ __align__(16) uint32_t s_hist[HIST_SLOTS];
-    __shared__ uint32_t s_red[256];
     __shared__ uint32_t s_scan[2];
     __shared__ uint32_t s_mm[2 * MAX_WAVES_PER_BLOCK];
     __shared__ unsigned s_wgt, s_weq;
@@ -636,18 +631,8 @@ phase_c_select_contig(const float* __restrict__ input,
                                           false,
                                           true);
     else
-        block_select_lds(s_keys_ext,
-                         c,
-                         k_out,
-                         s_hist,
-                         s_red,
-                         s_scan,
-                         s_mm,
-                         pivot,
-                         eq_needed,
-                         npasses,
-                         true,
-                         true);
+        block_select_lds(
+            s_keys_ext, c, k_out, s_hist, s_scan, s_mm, pivot, eq_needed, npasses, true, true);
 #endif
 
     if(threadIdx.x == 0)
@@ -673,17 +658,17 @@ phase_c_select_contig(const float* __restrict__ input,
     }
     else
     {
-        block_gather_topk_ragged<WRITE_VALUES>(c,
-                                               pivot,
-                                               k_out - eq_needed,
-                                               eq_needed,
-                                               out,
-                                               val,
-                                               &s_wgt,
-                                               &s_weq,
-                                               s_keys_ext,
-                                               s_idx,
-                                               row_start);
+        block_gather_topk<WRITE_VALUES>(
+            c,
+            pivot,
+            k_out - eq_needed,
+            eq_needed,
+            out,
+            val,
+            &s_wgt,
+            &s_weq,
+            [&](int i) { return s_keys_ext[i]; },
+            [&](int i) { return row_start + s_idx[i]; });
     }
     if(RAGGED && k_out < K)
     {
