@@ -8,6 +8,7 @@ import triton
 from aiter.ops.triton._triton_kernels.fusions.fused_reduce_qk_norm_rope_swa_write import (
     _fused_reduce_qk_norm_rope_swa_write_kernel,
 )
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -30,8 +31,10 @@ def _pick_block_size_m(M: int, num_local_heads: int, num_splitk: int) -> int:
     else:
         cap = 16
 
+    is_gfx950 = arch_info.get_arch() == "gfx950"
+
     if num_local_heads >= 64:
-        target = 16
+        target = 8 if is_gfx950 else 16
     elif num_local_heads >= 16:
         target = 8
     else:
@@ -45,7 +48,8 @@ def _pick_block_size_m(M: int, num_local_heads: int, num_splitk: int) -> int:
         bm //= 2
 
     num_warps = 4
-    waves_per_eu = 1
+    # Tuned on gfx950 only, other archs keep 1.
+    waves_per_eu = 0 if is_gfx950 else 1
 
     return bm, num_warps, waves_per_eu
 
