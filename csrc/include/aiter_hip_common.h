@@ -596,6 +596,18 @@ static uint32_t get_warp_size_func()
     return warp_size;
 }
 
+static size_t get_smem_size_func()
+{
+    static const size_t smem_size = []() {
+        hipDevice_t dev;
+        hipDeviceProp_t dev_prop;
+        HIP_CALL(hipGetDevice(&dev));
+        HIP_CALL(hipGetDeviceProperties(&dev_prop, dev));
+        return dev_prop.sharedMemPerBlock;
+    }();
+    return smem_size;
+}
+
 struct WarpSizeValue
 {
     __host__ __device__ constexpr operator int() const

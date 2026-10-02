@@ -1597,6 +1597,8 @@ OPUS_H_D constexpr index_t get_smem_size()
 {
 #if defined(__gfx950__)
     return 163840;  // 160KB (CDNA4)
+#elif defined(__gfx1250__)
+    return 327680;  // 320KB (CDNA5)
 #else
     return 65536;   // 64KB
 #endif

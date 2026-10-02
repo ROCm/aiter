@@ -105,26 +105,27 @@ def run_edge_shapes():
         LINEAR_BETA,
     )
 
-    for d in (16384, 20000, 33792, 65536):
-        x = torch.randn((2, 2 * d), dtype=dtypes.bf16)
-        ref = run_torch(x)
-        out = torch.empty((2, d), dtype=dtypes.fp8)
-        scale = torch.empty((2, 1), dtype=dtypes.fp32)
-        situv2_and_mul_quant(out, x, scale, d, BETA, LINEAR_BETA)
-        checkAllclose(
-            ref,
-            out.to(dtypes.fp32) * scale,
-            rtol=8e-2,
-            atol=3e-1,
-            msg=f"situv2_and_mul_quant d={d} out",
-        )
-        checkAllclose(
-            ref.abs().amax(dim=-1, keepdim=True) / torch.finfo(dtypes.fp8).max,
-            scale,
-            rtol=2e-5,
-            atol=3e-8,
-            msg=f"situv2_and_mul_quant d={d} scale",
-        )
+    if get_gfx() == "gfx1250":
+        for d in (33792, 81912):
+            x = torch.randn((2, 2 * d), dtype=dtypes.bf16)
+            ref = run_torch(x)
+            out = torch.empty((2, d), dtype=dtypes.fp8)
+            scale = torch.empty((2, 1), dtype=dtypes.fp32)
+            situv2_and_mul_quant(out, x, scale, d, BETA, LINEAR_BETA)
+            checkAllclose(
+                ref,
+                out.to(dtypes.fp32) * scale,
+                rtol=8e-2,
+                atol=3e-1,
+                msg=f"situv2_and_mul_quant d={d} out",
+            )
+            checkAllclose(
+                ref.abs().amax(dim=-1, keepdim=True) / torch.finfo(dtypes.fp8).max,
+                scale,
+                rtol=2e-5,
+                atol=3e-8,
+                msg=f"situv2_and_mul_quant d={d} scale",
+            )
     aiter.logger.info("situv2_and_mul_quant edge shapes passed")
 
 
