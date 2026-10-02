@@ -822,11 +822,14 @@ situv2_activate_scalar(const opus::vector_t<opus::bf16_t, VecSize>& gate,
 //        * linear_beta * tanh(u / linear_beta)
 //
 // One CTA owns one token row. When one chunk per thread covers the row
-// (single pass) the activations stay in VGPRs; otherwise they are staged in
-// FP32 LDS. WARP_SIZE is a device compile-time constant (32 on gfx12, 64 on
-// gfx9/gfx950), so the reduction follows the native wave topology on both, and
-// a single-wave block skips the cross-wave stage entirely.
-template <int32_t BlockSize, int32_t VecSize, int32_t StaticD = 0, bool SinglePass = false>
+// (single pass) the activations stay in VGPRs; the Kimi-K3 large-D
+// specialization packs them as BF16 in VGPRs; otherwise they use FP32 LDS.
+// WARP_SIZE is a device compile-time constant (32 on gfx12, 64 on gfx9/gfx950).
+template <int32_t BlockSize,
+          int32_t VecSize,
+          int32_t StaticD = 0,
+          bool SinglePass = false,
+          bool RegisterMultiPass = false>
 __global__ __launch_bounds__(BlockSize) void situv2_and_mul_quant_kernel(
     opus::fp8_t* __restrict__ out,
     const opus::bf16_t* __restrict__ input,
@@ -850,6 +853,10 @@ __global__ __launch_bounds__(BlockSize) void situv2_and_mul_quant_kernel(
     // proves it at compile time. This is independent of wave size.
     constexpr bool register_resident =
         SinglePass || (StaticD > 0 && BlockSize * VecSize >= StaticD);
+    static_assert(!RegisterMultiPass || StaticD > BlockSize * VecSize,
+                  "register multi-pass requires a static multi-chunk row");
+    constexpr int32_t iterations =
+        StaticD > 0 ? (StaticD + BlockSize * VecSize - 1) / (BlockSize * VecSize) : 1;
     // A single-wave block needs no cross-wave stage at all: the DPP wave
     // reduction broadcasts the row max to every lane with no LDS and no
     // barrier. BlockSize is always a whole number of waves (checked host side),
@@ -873,12 +880,15 @@ __global__ __launch_bounds__(BlockSize) void situv2_and_mul_quant_kernel(
         out_ptr, dim * sizeof(opus::fp8_t));
 
     extern __shared__ float activated[];
-    auto* reduce_scratch = activated + (register_resident ? 0 : dim);
+    auto* reduce_scratch =
+        activated + ((register_resident || RegisterMultiPass) ? 0 : dim);
     float thread_max = 0.0f;
     using vec_f       = opus::vector_t<float, VecSize>;
+    using vec_bf16    = opus::vector_t<opus::bf16_t, VecSize>;
     vec_f register_values{};
+    vec_bf16 register_chunks[RegisterMultiPass ? iterations : 1]{};
 
-    auto activate_chunk = [&](int idx) {
+    auto activate_chunk = [&](int idx, int iter) {
         auto gate = load_vector_nbytes<
             opus::bf16_t, VecSize, load_chunk_bytes, GROUP_NT>(gate_buffer, idx);
         auto up = load_vector_nbytes<
@@ -904,6 +914,14 @@ __global__ __launch_bounds__(BlockSize) void situv2_and_mul_quant_kernel(
         {
             register_values = act_values;
         }
+        else if constexpr(RegisterMultiPass)
+        {
+#pragma unroll
+            for(int j = 0; j < VecSize; ++j)
+            {
+                register_chunks[iter][j] = opus::cast<opus::bf16_t>(act_values[j]);
+            }
+        }
         else if constexpr(VecSize == 8 && StaticD != 0)
         {
             using vec_f4 = opus::vector_t<float, 4>;
@@ -922,13 +940,11 @@ __global__ __launch_bounds__(BlockSize) void situv2_and_mul_quant_kernel(
         const int idx = threadIdx.x * VecSize;
         if(idx < dim)
         {
-            activate_chunk(idx);
+            activate_chunk(idx, 0);
         }
     }
     else if constexpr(StaticD != 0)
     {
-        constexpr int32_t iterations =
-            (StaticD + BlockSize * VecSize - 1) / (BlockSize * VecSize);
 #pragma unroll
         for(int iter = 0; iter < iterations; ++iter)
         {
@@ -936,7 +952,7 @@ __global__ __launch_bounds__(BlockSize) void situv2_and_mul_quant_kernel(
                 threadIdx.x * VecSize + iter * BlockSize * VecSize;
             if(idx < StaticD)
             {
-                activate_chunk(idx);
+                activate_chunk(idx, iter);
             }
         }
     }
@@ -945,7 +961,7 @@ __global__ __launch_bounds__(BlockSize) void situv2_and_mul_quant_kernel(
         for(int idx = threadIdx.x * VecSize; idx < dim;
             idx += BlockSize * VecSize)
         {
-            activate_chunk(idx);
+            activate_chunk(idx, 0);
         }
     }
 
@@ -992,11 +1008,19 @@ __global__ __launch_bounds__(BlockSize) void situv2_and_mul_quant_kernel(
         scale[token_idx] = row_scale;
     }
 
-    auto quantize_chunk = [&](int idx) {
+    auto quantize_chunk = [&](int idx, int iter) {
         vec_f values{};
         if constexpr(register_resident)
         {
             values = register_values;
+        }
+        else if constexpr(RegisterMultiPass)
+        {
+#pragma unroll
+            for(int j = 0; j < VecSize; ++j)
+            {
+                values[j] = opus::cast<float>(register_chunks[iter][j]);
+            }
         }
         else if constexpr(VecSize == 8 && StaticD != 0)
         {
@@ -1024,13 +1048,11 @@ __global__ __launch_bounds__(BlockSize) void situv2_and_mul_quant_kernel(
         const int idx = threadIdx.x * VecSize;
         if(idx < dim)
         {
-            quantize_chunk(idx);
+            quantize_chunk(idx, 0);
         }
     }
     else if constexpr(StaticD != 0)
     {
-        constexpr int32_t iterations =
-            (StaticD + BlockSize * VecSize - 1) / (BlockSize * VecSize);
 #pragma unroll
         for(int iter = 0; iter < iterations; ++iter)
         {
@@ -1038,7 +1060,7 @@ __global__ __launch_bounds__(BlockSize) void situv2_and_mul_quant_kernel(
                 threadIdx.x * VecSize + iter * BlockSize * VecSize;
             if(idx < StaticD)
             {
-                quantize_chunk(idx);
+                quantize_chunk(idx, iter);
             }
         }
     }
@@ -1047,7 +1069,7 @@ __global__ __launch_bounds__(BlockSize) void situv2_and_mul_quant_kernel(
         for(int idx = threadIdx.x * VecSize; idx < dim;
             idx += BlockSize * VecSize)
         {
-            quantize_chunk(idx);
+            quantize_chunk(idx, 0);
         }
     }
 }
@@ -1732,7 +1754,11 @@ void silu_and_mul_quant(const aiter_tensor_t& out,
     }
 }
 
-template <int32_t BlockSize, int32_t VecSize, int32_t StaticD = 0, bool SinglePass = false>
+template <int32_t BlockSize,
+          int32_t VecSize,
+          int32_t StaticD = 0,
+          bool SinglePass = false,
+          bool RegisterMultiPass = false>
 static void launch_situv2_and_mul_quant(const aiter_tensor_t& out,
                                         const aiter_tensor_t& input,
                                         const aiter_tensor_t& scale,
@@ -1745,7 +1771,7 @@ static void launch_situv2_and_mul_quant(const aiter_tensor_t& out,
     constexpr float two_log2e = 2.8853900817779268f;
     const float gate_tanh_mul = -two_log2e / beta;
     const float up_tanh_mul   = -two_log2e / linear_beta;
-    const uint32_t wave_size = get_warp_size_func();
+    const uint32_t wave_size  = get_warp_size_func();
     // The DPP wave reduction reads every lane of the hardware wave, so a block
     // that is not a whole number of waves would fold in never-launched lanes
     // and silently produce a wrong row max (measured: BlockSize 96 and 224 on
@@ -1757,17 +1783,17 @@ static void launch_situv2_and_mul_quant(const aiter_tensor_t& out,
         SinglePass || (StaticD > 0 && BlockSize * VecSize >= StaticD);
     const bool single_wave  = BlockSize <= wave_size;
     const size_t num_waves  = (BlockSize + wave_size - 1) / wave_size;
-    // Activations need d floats unless they stay in registers; the cross-wave
-    // scratch needs num_waves floats unless the block is a single wave.
-    const size_t lds_bytes = (static_cast<size_t>(register_resident ? 0 : d) +
-                              (single_wave ? 0 : num_waves)) *
-                             sizeof(float);
+    const size_t lds_values =
+        ((register_resident || RegisterMultiPass) ? 0 : d) +
+        (single_wave ? 0 : num_waves);
+    const size_t lds_bytes = lds_values * sizeof(float);
     // Both live in one dynamic allocation, so a wide row plus its scratch can
     // outgrow the 64 KB budget even though d alone fits. Catch it here instead
     // of at the launch, which would only report hipErrorInvalidValue.
     AITER_CHECK(lds_bytes <= static_cast<size_t>(opus::get_smem_size()),
                 "situv2_and_mul_quant: d is too large for the LDS budget");
-    situv2_and_mul_quant_kernel<BlockSize, VecSize, StaticD, SinglePass>
+    situv2_and_mul_quant_kernel<
+        BlockSize, VecSize, StaticD, SinglePass, RegisterMultiPass>
         <<<dim3(num_tokens), dim3(BlockSize), lds_bytes, stream>>>(
             reinterpret_cast<opus::fp8_t*>(out.data_ptr()),
             reinterpret_cast<const opus::bf16_t*>(input.data_ptr()),
@@ -1815,8 +1841,9 @@ void situv2_and_mul_quant(const aiter_tensor_t& out,
     // of the same allocation -- four of them for the widest such block (256
     // threads on wave64) -- so the usable bound is the largest multiple of 8
     // below 16384 - 4.
-    AITER_CHECK(d > 0 && d <= 16376 && d % 8 == 0,
-                "situv2_and_mul_quant: d must be divisible by 8 and in (0, 16376]");
+    AITER_CHECK(d > 0 && (d <= 16376 || d == 33792) && d % 8 == 0,
+                "situv2_and_mul_quant: d must be divisible by 8 and either "
+                "in (0, 16376] or 33792");
     AITER_CHECK(group_size == d,
                 "situv2_and_mul_quant: only per-token quantization "
                 "(group_size == d) is implemented");
@@ -1843,6 +1870,15 @@ void situv2_and_mul_quant(const aiter_tensor_t& out,
 #define LAUNCH_SITUV2_SP(BLOCK_SIZE, VEC_SIZE, STATIC_D)                                   \
     launch_situv2_and_mul_quant<BLOCK_SIZE, VEC_SIZE, STATIC_D, true>(                     \
         out, input, scale, d, num_tokens, beta, linear_beta, stream)
+#define LAUNCH_SITUV2_REG(BLOCK_SIZE, VEC_SIZE, STATIC_D)                                  \
+    launch_situv2_and_mul_quant<BLOCK_SIZE, VEC_SIZE, STATIC_D, false, true>(               \
+        out, input, scale, d, num_tokens, beta, linear_beta, stream)
+
+    if(d == 33792)
+    {
+        LAUNCH_SITUV2_REG(1024, 8, 33792);
+        return;
+    }
 
     if(d == 768)
     {
@@ -1935,6 +1971,7 @@ void situv2_and_mul_quant(const aiter_tensor_t& out,
 
 #undef LAUNCH_SITUV2
 #undef LAUNCH_SITUV2_SP
+#undef LAUNCH_SITUV2_REG
 }
 
 void gelu_and_mul(const aiter_tensor_t& out,   // [..., d]
