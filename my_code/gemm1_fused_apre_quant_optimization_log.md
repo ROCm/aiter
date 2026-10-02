@@ -10,6 +10,37 @@
   preserving the A-preshuffle payload and ScaleA layouts consumed by the
   baseline optimized GEMM2.
 
+## Current frozen implementation
+
+The fused implementation is frozen at the validated v21 code. Its production
+kernel suffix no longer carries an experimental version number:
+
+```text
+apreqb16batchs16direct_scaletdm
+```
+
+`AITER_FLYDSL_GEMM1_FUSED_QUANT=1` selects this implementation and remains the
+default. `AITER_FLYDSL_GEMM1_FUSED_QUANT=0` retains the original two-kernel
+GEMM1 plus standalone quant pipeline. There is no runtime selector for any
+other fused optimization version.
+
+After the rename, random seed 0 and const0 again produced bitwise-identical
+payload, ScaleA, GEMM2 valid rows, and MoE output. A three-round const0
+performance regression run produced:
+
+```text
+fused GEMM1 samples: 94.570, 94.728, 92.666 us
+fused GEMM1 median:  94.570 us
+MoE samples:         228.04, 227.19, 221.71 us
+MoE median:          227.19 us
+```
+
+The final source SHA256 is:
+
+```text
+964651c9d75565f8ea416f252714d0dacdfd2bdd06fab1962735bbc2dddbbf96
+```
+
 This document records only:
 
 1. the first implementation that passes correctness;
@@ -216,6 +247,77 @@ The following alternatives were rejected:
 The cache-policy experiments follow the CDNA5 ISA cache-control definitions in
 `mi400_hw_wiki/raw/papers/mi400_hd_txt/MI450/amd-instinct-cdna5-instruction-set-architecture.txt`,
 section 4.1.1 (pages 44-46): `HT=2`, `WB=3`, and `NT_HT=6`.
+
+### Re-measured and rejected ScaleA TDM-store experiment
+
+`scaletdmv20` staged the 768-byte ScaleA tile in the unused tail of the
+existing output LDS arena and replaced the six per-wave `global_store_b16`
+operations with one collective `tensor_store_from_lds`. The payload store and
+its `HT` temporal hint were unchanged.
+
+The generated E64 ISA confirmed that the intended instruction changes were
+present:
+
+| Static item | `htv10` | `scaletdmv20` |
+|---|---:|---:|
+| Instructions | 4,982 | 4,879 |
+| `global_store_b16` | 6 | 0 |
+| `s_wait_xcnt 0x0` | 6 | 0 |
+| `s_wait_storecnt_dscnt 0x0` | 1 | 0 |
+| `tensor_store_from_lds` | 1 | 2 |
+| LDS bytes | 243,712 | 243,712 |
+| VGPRs | 640 | 640 |
+| SGPRs | 62 | 64 |
+
+Random seeds 0, 1, and 2 and const0 all produced exact payload bytes, exact
+ScaleA bytes, bitwise-identical GEMM2 valid rows, and bitwise-identical MoE
+output.
+
+The earlier interleaved-run numbers reported for v20 are superseded. The
+authoritative remeasurement used the requested `run_moe_prefill_switch_ab.sh`
+path with its default 20 profiler iterations. A standalone-quant baseline was
+measured immediately before v20 and again immediately after it. Each command
+was gated by a host GPU/KFD idle check, and the post-run check was also idle.
+
+Commands:
+
+```bash
+AITER_FLYDSL_GEMM1_FUSED_QUANT=0 \
+ROUNDS=3 bash ./my_code/run_moe_prefill_switch_ab.sh \
+  e2e-const0 \
+  --experts 64 \
+  --tokens 1536 \
+  --topk 8 \
+  --model-dim 7168 \
+  --inter-dim 2048
+
+ROUNDS=3 bash ./my_code/run_moe_prefill_switch_ab.sh \
+  e2e-const0 \
+  --experts 64 \
+  --tokens 1536 \
+  --topk 8 \
+  --model-dim 7168 \
+  --inter-dim 2048
+```
+
+| Case | GEMM1 samples (us) | GEMM1 median (us) | quant samples (us) | GEMM1 + quant median (us) | GEMM2 samples (us) | GEMM2 median (us) | MoE samples (us) | MoE median (us) | Correctness |
+|---|---|---:|---|---:|---|---:|---|---:|---|
+| baseline before | 78.784, 81.215, 79.290 | 79.290 | 13.200, 12.500, 13.900 | 93.190 | 58.817, 60.551, 60.449 | 60.449 | 212.21, 215.27, 214.32 | 214.32 | bitwise equal |
+| fused `scaletdmv20` | 94.093, 98.333, 94.068 | 94.093 | removed | 94.093 | 72.400, 69.480, 69.528 | 69.528 | 226.79, 228.99, 226.98 | 226.98 | bitwise equal |
+| baseline after | 79.862, 78.171, 79.758 | 79.758 | 11.800, 12.900, 14.300 | 91.662 | 61.071, 59.511, 60.043 | 60.043 | 211.49, 209.83, 220.64 | 211.49 | bitwise equal |
+
+Against the baseline immediately before it, v20 regressed the producer by
+0.903 us (0.97%), GEMM2 by 9.079 us (15.02%), and MoE by 12.660 us (5.91%).
+Against the baseline immediately after it, v20 regressed the producer by
+2.431 us (2.65%), GEMM2 by 9.485 us (15.80%), and MoE by 15.490 us (7.32%).
+Removing the explicit vector-store waits did not improve the requested MoE
+benchmark, so v20 was rejected and `htv10` was restored.
+
+The tested v20 source SHA256 was:
+
+```text
+5ae9c1bd7c1c320f3c88d10b3418d70798b1d37177b0990c9dcb41b4df2b8564
+```
 
 ### Rejected fused-output `TILES_PER_GROUP=8` experiment
 
@@ -559,3 +661,118 @@ b803747520dc4c712acf2935054de0d3a18fcf8901deec02417fb8067eb27f00  aiter/ops/flyd
 9747ff59e0f76f6001d6a45ebb6917ce6a60cebf42966b2a86e3886073d12e60  my_code/run_gemm1_fused_apre_quant_validation.sh
 6222007e50df27bb9973790f3b73536572cb4b0e1d7465c7abf6f962dfd1a351  my_code/verify_gemm1_fused_apre_quant.py
 ```
+
+## Post-reboot three-group remeasurement: unfused baseline versus v21
+
+The a07-3 machine was rebooted before this measurement, so both the unfused
+pipeline and the retained v21 fused kernel were remeasured under the new machine
+state. Each table row is one independent invocation containing three profiler
+rounds. Host-side GPU/KFD checks were idle immediately before each invocation.
+The checks after each invocation either remained idle or showed an unrelated
+process whose reported start time was after the measured command had completed.
+
+Unfused baseline command:
+
+```bash
+AITER_FLYDSL_GEMM1_FUSED_QUANT=0 ROUNDS=3 \
+  bash ./my_code/run_moe_prefill_switch_ab.sh \
+  e2e-const0 \
+  --experts 64 --tokens 1536 --topk 8 \
+  --model-dim 7168 --inter-dim 2048
+```
+
+v21 command:
+
+```bash
+AITER_FLYDSL_GEMM1_FUSED_QUANT=1 ROUNDS=3 \
+  bash ./my_code/run_moe_prefill_switch_ab.sh \
+  e2e-const0 \
+  --experts 64 --tokens 1536 --topk 8 \
+  --model-dim 7168 --inter-dim 2048
+```
+
+The tested v21 kernel suffix and source hash were:
+
+```text
+apreqb16batchs16direct_scaletdmrtv21
+9e5def358591ab7e79c251b2d83748c13786fea32702fd19a2535827d2199fd9
+```
+
+| Pipeline | Group | Producer samples (us) | Producer median (us) | MoE samples (us) | MoE median (us) | Result |
+|---|---:|---|---:|---|---:|---|
+| unfused GEMM1 + quant | 1 | GEMM1 80.158, 77.721, 77.906; quant 11.900, 12.500, 11.900 | **90.221** | 212.26, 206.96, 208.33 | **208.33** | bitwise equal |
+| unfused GEMM1 + quant | 2 | GEMM1 81.912, 79.569, 78.631; quant 10.900, 11.800, 13.700 | **92.331** | 213.70, 218.96, 213.52 | **213.70** | bitwise equal |
+| unfused GEMM1 + quant | 3 | GEMM1 80.549, 79.680, 78.223; quant 12.100, 11.500, 12.400 | **91.180** | 221.95, 212.74, 211.35 | **212.74** | bitwise equal |
+| fused v21 | 1 | 92.185, 92.050, 88.835 | **92.050** | 224.24, 220.57, 219.19 | **220.57** | bitwise equal |
+| fused v21 | 2 | 99.138, 92.016, 98.847 | **98.847** | 227.49, 231.68, 228.82 | **228.82** | bitwise equal |
+| fused v21 | 3 | 97.323, 95.537, 88.786 | **95.537** | 230.23, 225.94, 219.84 | **225.94** | bitwise equal |
+
+Across the three group medians:
+
+| Pipeline | Producer median of group medians (us) | MoE median of group medians (us) |
+|---|---:|---:|
+| unfused GEMM1 + quant | **91.180** | **212.74** |
+| fused v21 | **95.537** | **225.94** |
+
+Under this post-reboot machine state, v21 regressed producer latency by
+4.357 us (4.78%) and MoE latency by 13.20 us (6.20%) relative to the unfused
+pipeline. The older 83.794/87.193 us v21 measurements therefore must not be
+used as the current performance baseline.
+
+All six accepted groups reported `logits_diff=0`, `rel_l2=0`, matching GEMM1
+and GEMM2 hashes, and matching MoE/reference output hashes. An earlier baseline
+attempt at `20261002T141054Z` hit a GPU page fault during round 2 and is excluded
+from every table and aggregate above.
+
+## Rejected v46 experiment: v21 with tanh chunk 8
+
+This experiment copied the validated v21 source and changed only the fused
+optimized SiLU/quant path from a tanh scheduling chunk of 4 to 8. The common
+helper gained an optional `chunk_size` argument whose default remains 4, so the
+generic launcher and non-quant paths kept their existing schedule. A new kernel
+suffix prevented reuse of the v21 JIT artifact:
+
+```text
+apreqb16batchs16direct_scaletdmrtv21_tanhc8v46
+```
+
+The tested source hashes were:
+
+```text
+888c03949b195b26508a73d00976fb3c873f79454b9684189799b6805028c7d0  aiter/ops/flydsl/kernels/mxfp4_preshuffle_gfx1250_tdm.py
+e3819ad372c38e4cd5ae5b1ecd3dae56fbbc66c333aed191c77d3094b6aab8c6  aiter/ops/flydsl/kernels/gemm_common_gfx1250.py
+```
+
+Correctness was checked before performance measurement with random seeds 0, 1,
+and 2 and with const0. Every run had bitwise-identical quant payload, ScaleA,
+GEMM2 valid rows, and MoE output relative to the unfused reference.
+
+Each performance group used:
+
+```bash
+AITER_FLYDSL_GEMM1_FUSED_QUANT=1 ROUNDS=3 \
+  bash ./my_code/run_moe_prefill_switch_ab.sh \
+  e2e-const0 \
+  --experts 64 --tokens 1536 --topk 8 \
+  --model-dim 7168 --inter-dim 2048
+```
+
+| Version | Group | Fused GEMM1 samples (us) | Fused GEMM1 median (us) | MoE samples (us) | MoE median (us) |
+|---|---:|---|---:|---|---:|
+| v21, tanh chunk 4 | 1 | 92.185, 92.050, 88.835 | **92.050** | 224.24, 220.57, 219.19 | **220.57** |
+| v21, tanh chunk 4 | 2 | 99.138, 92.016, 98.847 | **98.847** | 227.49, 231.68, 228.82 | **228.82** |
+| v21, tanh chunk 4 | 3 | 97.323, 95.537, 88.786 | **95.537** | 230.23, 225.94, 219.84 | **225.94** |
+| v46, tanh chunk 8 | 1 | 87.062, 95.146, 93.236 | **93.236** | 211.61, 230.87, 219.11 | **219.11** |
+| v46, tanh chunk 8 | 2 | 95.080, 96.837, 98.614 | **96.837** | 232.22, 227.77, 229.35 | **229.35** |
+| v46, tanh chunk 8 | 3 | 100.988, 91.397, 96.860 | **96.860** | 238.97, 217.14, 233.03 | **233.03** |
+
+| Version | GEMM1 median of group medians (us) | MoE median of group medians (us) |
+|---|---:|---:|
+| v21, tanh chunk 4 | **95.537** | **225.94** |
+| v46, tanh chunk 8 | **96.837** | **229.35** |
+
+Tanh chunk 8 regressed the fused GEMM1 by 1.300 us (1.36%) and MoE by
+3.41 us (1.51%) on the median of the three independent group medians. Only one
+of the three paired GEMM1 groups improved, and only one paired MoE group
+improved. The change therefore has no stable performance benefit and was
+rejected; the active source was restored to v21 after measurement.

@@ -2109,10 +2109,14 @@ def launch_gemm_a8w4_tdm_optimized(
     Q_MX_BLOCK_BYTES = 16 * 16
     Q_ROW_TILE_BYTES = Q_MX_BLOCKS_PER_WG * Q_MX_BLOCK_BYTES
     Q_M16_TILES = tile_m // 16
+    Q_SCALE_ROW_BYTES = 16 * 4
+    Q_SCALE_TILE_BYTES = quant_wmma_rep * Q_SCALE_ROW_BYTES
+    Q_SCALE_LDS_OFF = Q_M16_TILES * Q_ROW_TILE_BYTES
+    assert Q_SCALE_LDS_OFF + m_warp * Q_SCALE_TILE_BYTES <= ARENA_B
 
     _act = f"_act{stage1_act}" if stage1_act else ""
     _qout = (
-        f"_q{stage1_quant_out}r{quant_wmma_rep}_apreqb16batchs16direct_htv10"
+        f"_q{stage1_quant_out}r{quant_wmma_rep}_apreqb16batchs16direct_scaletdm"
         if stage1_quant_out
         else ""
     )
@@ -3199,7 +3203,7 @@ def launch_gemm_a8w4_tdm_optimized(
                         None,
                     ],
                     num_warps=num_waves,
-                    cache_modifier=2,
+                    cache_modifier=0,
                 )
                 src_quant = lds_view(
                     fx.recast_iter(fx.Int8, base_ptr),
@@ -3211,23 +3215,55 @@ def launch_gemm_a8w4_tdm_optimized(
             # -- Activate + stage to LDS --
             if const_expr(stage1_quant_out and stage1_act):
                 # Fused SiLU -> BF16-rounded FP4 quant. Payload is staged in
-                # GEMM2's A-preshuffle layout; ScaleA uses the matching
-                # shuffle_scale_f4 layout directly in global memory.
+                # GEMM2's A-preshuffle layout. ScaleA is staged immediately
+                # after the payload and emitted by one collective TDM store.
                 i32_ptr_g = fx.PointerType.get(
                     elem_ty=fx.Int8.ir_type,
                     address_space=fx.AddressSpace.Global,
                     alignment=1,
-                )
-                i16_ptr_g = fx.PointerType.get(
-                    elem_ty=fx.Int16.ir_type,
-                    address_space=fx.AddressSpace.Global,
-                    alignment=2,
                 )
                 scale_ptr = fx.recast_iter(i32_ptr_g, fx.get_iter(arg_quant_scale))
                 is_kgrp0 = fx.Int32(kgrp) == fx.Int32(0)
                 # i32_n is the pre-activation gate+up width; the quantized
                 # output has half as many columns and one scale dword per K128.
                 q_dst_scale_dwpr = i32_n // 256
+
+                def issue_quant_scale_output():
+                    global_scale_tile_stride = (
+                        fx.Int64(q_dst_scale_dwpr) * Q_SCALE_TILE_BYTES
+                    )
+                    global_scale_off = (
+                        (fx.Int64(blk_m) // QUANT_ROWS_PER_TILE)
+                        * global_scale_tile_stride
+                        + (fx.Int64(blk_n) // 256) * Q_SCALE_TILE_BYTES
+                    )
+                    gt_scale = global_view(
+                        scale_ptr,
+                        global_scale_off,
+                        (m_warp, quant_wmma_rep, Q_SCALE_ROW_BYTES),
+                        (
+                            global_scale_tile_stride,
+                            Q_SCALE_ROW_BYTES,
+                            1,
+                        ),
+                    )
+                    atom_scale = fx.rocdl.make_tdm_atom(
+                        gt_scale,
+                        [None, None, None],
+                        strides=[
+                            global_scale_tile_stride,
+                            Q_SCALE_ROW_BYTES,
+                            None,
+                        ],
+                        num_warps=num_waves,
+                        cache_modifier=0,
+                    )
+                    src_scale = lds_view(
+                        fx.recast_iter(fx.Int8, base_ptr) + Q_SCALE_LDS_OFF,
+                        (m_warp, quant_wmma_rep, Q_SCALE_ROW_BYTES),
+                        (Q_SCALE_TILE_BYTES, Q_SCALE_ROW_BYTES, 1),
+                    )
+                    fx.copy(atom_scale, src_scale, gt_scale)
 
                 N_MX_BLKS = wmma_n_rep // WN_PER_MX_BLOCK
                 assert N_MX_BLKS == 2
@@ -3237,15 +3273,6 @@ def launch_gemm_a8w4_tdm_optimized(
                     # this costs one scalar branch instead of per-lane masking.
                     if wmb + wm * 16 < mn_oob:
                         row_rel = wmb + wm * 16 + lane16
-                        row_i32 = fx.Int32(blk_m + row_rel)
-                        scale_tile = row_i32 // QUANT_ROWS_PER_TILE
-                        row_in_tile = (
-                            wm * 16 + lane16
-                            if QUANT_ROWS_PER_TILE == warp_tile_m
-                            else row_i32 - scale_tile * QUANT_ROWS_PER_TILE
-                        )
-                        wmma_row = row_in_tile >> 4
-                        scale_lane = row_in_tile & 15
 
                         # Match the tuned BF16 epilogue's eight-WN activation
                         # batch so TRANS work from both MX blocks overlaps.
@@ -3263,7 +3290,6 @@ def launch_gemm_a8w4_tdm_optimized(
                         )
 
                         e8m0_bytes = []
-                        mx_blk_is = []
                         for mx_blk in range_constexpr(N_MX_BLKS):
                             value_base = mx_blk * WN_PER_MX_BLOCK * 4
                             all_vals = [
@@ -3287,10 +3313,7 @@ def launch_gemm_a8w4_tdm_optimized(
                                 wave_size=WAVE,
                                 dtype=MxDtype.FP4_E2M1,
                             )
-                            mx_col = blk_n + wnb + mx_blk * WN_PER_MX_BLOCK * 16
-                            mx_blk_i = fx.Int32(mx_col) >> 6
                             e8m0_bytes.append(e8m0_byte)
-                            mx_blk_is.append(mx_blk_i)
 
                             local_m16 = wave_m * wmma_m_rep + wm
                             local_mx = wave_n * N_MX_BLKS + mx_blk
@@ -3334,28 +3357,23 @@ def launch_gemm_a8w4_tdm_optimized(
 
                         # Preshuffled e8m0 scale: one branch per wm (not per mx_blk).
                         if row_rel < mn_oob and is_kgrp0:
-                            scale_dw = mx_blk_is[0] >> 2
-                            byte_in_dw = mx_blk_is[0] & 3
-                            dst_byte = (
-                                (
-                                    (scale_tile * q_dst_scale_dwpr + scale_dw)
-                                    * quant_wmma_rep
-                                    + wmma_row
-                                )
-                                * 16
-                                + scale_lane
-                            ) * 4 + byte_in_dw
                             packed_scale = fx.Int32(
                                 arith.extui(T.i32, _raw(e8m0_bytes[0]))
                             ) | (
                                 fx.Int32(arith.extui(T.i32, _raw(e8m0_bytes[1])))
                                 << fx.Int32(8)
                             )
-                            fx.ptr_store(
-                                fx.Int16(packed_scale),
-                                fx.recast_iter(i16_ptr_g, scale_ptr + dst_byte),
+                            scale_lds_byte = Q_SCALE_LDS_OFF + (
+                                (
+                                    (wave_m * quant_wmma_rep + wm) * 16
+                                    + lane16
+                                )
+                                * 4
+                                + wave_n * 2
                             )
+                            lds_store_b16(stC_idx, scale_lds_byte, packed_scale)
                 workgroup_barrier()
+                issue_quant_scale_output()
                 issue_quant_output()
             else:
                 # bf16/f16 activation (or passthrough) -> stage to LDS.
