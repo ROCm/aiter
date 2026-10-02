@@ -897,7 +897,8 @@ __global__ __launch_bounds__(BlockSize) void situv2_and_mul_quant_kernel(
             opus::bf16_t, VecSize, load_chunk_bytes, GROUP_NT>(up_buffer, idx);
 
         vec_f act_values{};
-        if constexpr(StaticD == 768 && (VecSize == 8 || VecSize == 4))
+        if constexpr(
+            (StaticD == 768 || StaticD == 33792) && (VecSize == 8 || VecSize == 4))
         {
             act_values = situv2_activate_packed<VecSize>(gate,
                                                          up,
