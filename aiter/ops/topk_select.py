@@ -204,6 +204,14 @@ _PLAIN_K2048_MAX_WIDTH = 131071
 # two rows to its multi-block kernel (`should_use_mulblocks`), 1.7x--2.8x
 # slower than `sampled` through the few-row band, ragged or not, so `sampled`
 # takes those.
+#
+# Past the few-row band plain declines and decode took those rows, which
+# `sampled` serves 1.47x--2.56x faster on every measured cell of 1..128 rows
+# and 81921..131071 columns, uniform and ragged, so it takes them as well. It
+# loses only where a row's sample undershoots k and that row takes the exact
+# fallback, 25-31us flat, up to 1.32x decode's time. That follows the values,
+# not the shape: 3 of 480 seeded runs over the band (30 cells x 16 seeds), all
+# seed 0 at 106496 columns, which the other 15 seeds ran in 15-18us.
 _PLAIN_K2048_MULTIBLOCK_ROWS = 2
 _PLAIN_K2048_MULTIBLOCK_MIN_WIDTH = 65536
 
@@ -549,18 +557,19 @@ def _sampled_takes(rows: int, width: int, k: int, yield_to_plain: bool = False) 
     kernels beat it there and on every other cell the work door took below the
     width door (200 against 268us at 4096x64K), so there the work door yields
     to plain's band when `yield_to_plain` -- uniform rows, plain available. The
-    door added for that k points the other way: at most two rows from 65536
-    columns through the few-row band, where plain's own dispatch goes
-    multi-block. See `_PLAIN_K2048_MULTIBLOCK_ROWS`.
+    doors added for that k point the other way: at most two rows from 65536
+    columns, where plain's own dispatch goes multi-block, and the few-row band's
+    rows past its width, which decode served 1.47x-2.56x slower. See
+    `_PLAIN_K2048_MULTIBLOCK_ROWS`.
     """
     if k == 2048 and width < _SAMPLED_MIN_WIDTH and get_gfx_runtime() == "gfx950":
         if (
             rows <= _PLAIN_K2048_MULTIBLOCK_ROWS
             and width >= _PLAIN_K2048_MULTIBLOCK_MIN_WIDTH
+        ) or (
+            rows <= _PLAIN_K2048_FEW_ROWS and width > _PLAIN_K2048_FEW_ROWS_MAX_WIDTH
         ):
-            return width <= _PLAIN_K2048_FEW_ROWS_MAX_WIDTH and bool(
-                topk_sampled_supports(rows, width, k)
-            )
+            return bool(topk_sampled_supports(rows, width, k))
         if yield_to_plain and _plain_takes(rows, width, k):
             return False
     if not (
