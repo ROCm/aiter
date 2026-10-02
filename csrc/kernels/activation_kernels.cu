@@ -1925,7 +1925,14 @@ void situv2_and_mul_quant(const aiter_tensor_t& out,
     {
         if(d == 33792)
         {
-            LAUNCH_SITUV2_REG(1024, 8, 33792);
+            if(num_tokens <= 256)
+            {
+                LAUNCH_SITUV2_REG(1024, 8, 33792);
+            }
+            else
+            {
+                LAUNCH_SITUV2_REG(512, 8, 33792);
+            }
         }
         else
         {
