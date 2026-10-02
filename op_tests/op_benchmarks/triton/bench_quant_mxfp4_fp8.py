@@ -3,12 +3,12 @@
 
 import argparse
 import sys
+from functools import partial
 
 import torch
 import triton
 
-from aiter.ops.triton.quant import dynamic_mxfp4_quant as triton_dynamic_mxfp4_quant
-from aiter.ops.triton.quant import dynamic_mxfp8_quant as triton_dynamic_mxfp8_quant
+from aiter.ops.triton.quant import dynamic_mxfp4_quant, dynamic_mxfp8_quant
 from aiter.test_common import run_perftest
 from aiter.utility.fp4_utils import dynamic_mxfp4_quant as fp4_utils_dynamic_mxfp4_quant
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
@@ -48,14 +48,11 @@ def get_dtype(dtype_str: str) -> torch.dtype:
 
 
 def get_provider(fmt: str, provider: str):
-    if fmt == "mxfp8":
-        if provider == "triton":
-            return triton_dynamic_mxfp8_quant
-        raise ValueError(f"Unknown provider: {provider}")
-    if provider == "triton":
-        return triton_dynamic_mxfp4_quant
-    if provider == "fp4_utils":
+    if fmt == "mxfp4" and provider == "fp4_utils":
         return fp4_utils_dynamic_mxfp4_quant
+    if provider in ("triton", "gluon"):
+        quant = dynamic_mxfp4_quant if fmt == "mxfp4" else dynamic_mxfp8_quant
+        return partial(quant, backend=provider)
     raise ValueError(f"Unknown provider: {provider}")
 
 
@@ -128,9 +125,7 @@ def run_benchmark(args):
         x = torch.randn((M, N), dtype=dtype, device="cuda")
         quant_fn = get_provider(fmt, provider)
 
-        # run_perftest rotates through enough distinct input copies to exceed
-        # L2 capacity and measures actual device kernel time via the
-        # profiler, so results aren't inflated by cache/address locality.
+        # run_perftest rotates input copies beyond L2 size and times device kernels only.
         if use_sr:
             _, us = run_perftest(quant_fn, x, use_sr=True, philox_seed=1234)
         else:
@@ -194,8 +189,8 @@ def parse_args(args: list[str] | None = None):
         type=str,
         default="triton",
         help="Provider(s) to benchmark, applied to each --format. Comma-separated "
-        "values from: triton,fp4_utils (fp4_utils only valid for mxfp4; silently "
-        "skipped for other formats).",
+        "values from: triton,gluon,fp4_utils (triton and gluon force that backend; "
+        "fp4_utils only valid for mxfp4; silently skipped for other formats).",
     )
     parser.add_argument(
         "--dtype",

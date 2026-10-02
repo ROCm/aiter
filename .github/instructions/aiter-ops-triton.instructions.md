@@ -48,7 +48,7 @@ to extend or import the existing implementation, not to add a parallel copy.
 (`resolve_config_dir`, `load_config_json`, `select_leq_config`, the path
 constants) and each family keeps its own loader module (`gemm_config_utils`,
 `conv_config_utils`, `mhc_config_utils`, `moe_config_utils`,
-`tuned_config_utils`) on top of it.
+`quant_config_utils`, `tuned_config_utils`) on top of it.
 Flag a function given a second home — a re-export, a wrapper that only
 forwards to another module, or a copy of a core helper inside a family module.
 
@@ -105,7 +105,7 @@ their tuned configs can be imported by a framework that is not PyTorch
 Every tuned config lives in one nested layout:
 `configs/<arch>/<backend>/<op>/<d_type>/`, e.g.
 `configs/gfx950/triton/gemm/gemm_afp4wfp4/DEFAULT.json`. `<op>` is `gemm`,
-`moe`, `conv`, `mhc`, `attention`, `gmm` or `fusions`; `<d_type>` is
+`moe`, `conv`, `mhc`, `attention`, `gmm`, `fusions` or `quant`; `<d_type>` is
 `config_name.lower().replace("-", "_")`. The flat arch-prefixed directories
 and every fallback that reached them are gone. Flag:
 
@@ -217,7 +217,8 @@ values for either backend live in JSON, never in Python. Flag:
   second place the layout is encoded, and it skips the argument validation
   that makes a wrong value fail closed.
 - A hand-written loop selecting the smallest matching `N_LEQ_*` (or another
-  upper-bound prefix) entry — use `select_leq_config()` so threshold ordering,
+  upper-bound prefix) entry, or a hand-written multi-axis bucket walk — use
+  `select_leq_config()` (`axes=` for several axes) so threshold ordering,
   fallback, and copying semantics have one implementation.
 - A second MOE config reader. `utils/moe_config_utils.py::get_moe_dispatch` is
   the only MOE fetcher; flag any new MOE path built by hand, any direct
