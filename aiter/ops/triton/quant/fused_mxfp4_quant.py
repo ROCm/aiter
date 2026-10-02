@@ -397,7 +397,7 @@ def fused_reduce_act_mul_and_mxfp4_quant(
 
     # a 1x128 tile on 4 warps leaves most lanes idle and launches M * N_half / 128
     # programs. One warp over a wider row measured 1.02-3.8x faster on gfx950 for
-    # N_half 2048..28672 and M 1..8192, the tile doesnt change the output bytes.
+    # N_half 2048..28672 and M 1..8192, the tile doesn't change the output bytes.
     if not use_scale_shuffle_padding and not X_HAS_SPLITK and N_half > 1024:
         BLOCK_SIZE_M1 = 1
         BLOCK_SIZE_N1 = 256 if M <= 64 else 512
