@@ -573,6 +573,10 @@ def expand_qsa_block_indices_cuda(
     token_topk: int,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    if compress_ratio <= 0:
+        raise ValueError("QSA compression ratio must be positive")
+    if token_topk <= 0:
+        raise ValueError("QSA token top-k must be positive")
     if token_topk % compress_ratio:
         raise ValueError("QSA token top-k must be divisible by compression ratio")
     block_topk = token_topk // compress_ratio
