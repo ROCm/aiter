@@ -397,13 +397,16 @@ class Cfg:
         MFMA_K = 32 if FP8_MFMA else 16
         self.MFMA_K = gl.constexpr(MFMA_K)
 
-        self.N_WARPS = gl.constexpr(NUM_WARPS)  # warps tile the dots' N
+        # Warps tile the dots' N. With more than 16 heads per program they also
+        # tile M, 16 heads per warp, so each wave keeps one 16-head slice.
+        M_WARPS = max(1, min(BLOCK_M // 16, NUM_WARPS))
+        self.N_WARPS = gl.constexpr(NUM_WARPS // M_WARPS)
         self.qk_layout = gl.constexpr(
             gl.amd.AMDMFMALayout(
                 version=4,
                 instr_shape=[16, 16, MFMA_K],
                 transposed=True,
-                warps_per_cta=[1, NUM_WARPS],
+                warps_per_cta=[M_WARPS, NUM_WARPS // M_WARPS],
             )
         )
         self.pv_layout = gl.constexpr(
@@ -411,7 +414,7 @@ class Cfg:
                 version=4,
                 instr_shape=[16, 16, MFMA_K],
                 transposed=True,
-                warps_per_cta=[1, NUM_WARPS],
+                warps_per_cta=[M_WARPS, NUM_WARPS // M_WARPS],
             )
         )
         KW = MFMA_K // 2
