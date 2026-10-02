@@ -458,16 +458,13 @@ def _as_int32_contiguous_1d(x: torch.Tensor) -> torch.Tensor:
     return x.to(torch.int32).contiguous()
 
 
-def _decode_num_splits_occ(
-    num_queries, heads_blocks, avg_main, avg_extra, block_k, wg_per_cu=2
-):
+def _decode_num_splits_occ(num_queries, heads_blocks, avg_main, avg_extra, block_k):
     """Split-K count for the gfx950 gluon kernel: fill the machine, but never
-    split a segment finer than one BLOCK_K tile or past _MAX_SPLITS. wg_per_cu is
-    how many programs a CU holds at once (2 at 4 warps, 1 at 8).
+    split a segment finer than one BLOCK_K tile or past _MAX_SPLITS.
     """
     num_sms = get_num_sms()
     base_wg = max(1, num_queries * heads_blocks)
-    cta_cap = max(1, (wg_per_cu * num_sms) // base_wg)
+    cta_cap = max(1, (2 * num_sms) // base_wg)
     main_tiles = max(1, math.ceil(avg_main / block_k)) if avg_main > 0 else 0
     extra_tiles = max(1, math.ceil(avg_extra / block_k)) if avg_extra > 0 else 0
     tiles = max(1, main_tiles, extra_tiles)
@@ -624,34 +621,30 @@ def _pa_decode_sparse_gfx950_gluon(
         and main_fmt == "fp8_dsv4_mla"
         and (not has_extra or extra_fmt == "fp8_dsv4_mla")
     )
-    # At 32 heads, one 8-warp program covers both 16-head blocks, so each key row
-    # is gathered once. Only used when the 16-head grid would overfill the GPU
-    # with at least two tiles per program.
     prefill = num_queries >= _PREFILL_MIN_ROWS
     row_tiles = max(avg_main, avg_extra) / BLOCK_K
-    if packed_fp8 and num_heads == 32:
-        if kv_splits is not None:
-            splits16 = max(1, int(kv_splits))
-        else:
-            splits16 = _decode_num_splits_occ(
-                num_queries, 2, avg_main, avg_extra, BLOCK_K
-            )
-        if prefill or (
-            num_queries * 2 * splits16 > get_num_sms() and row_tiles >= 2 * splits16
-        ):
-            BLOCK_M, num_warps = 32, 8
-    # At 64 heads, top-k launches use 32-head programs when their last round on
-    # the CUs is more than half full or there are at least four rounds. SWA-only
-    # launches stay on 16 heads. Both grids get the same split count.
-    if packed_fp8 and num_heads == 64 and has_extra:
-        if kv_splits is not None:
-            splits16 = max(1, int(kv_splits))
-        else:
-            splits16 = _decode_num_splits_occ(
-                num_queries, 4, avg_main, avg_extra, BLOCK_K
-            )
-        rounds, left = divmod(num_queries * 2 * splits16, get_num_sms())
-        if left == 0 or 2 * left > get_num_sms() or rounds >= 4:
+    # Split count from the 16-head grid. A 32-head grid gets the same count: half
+    # the programs, but one per CU instead of two.
+    if kv_splits is not None:
+        num_splits = max(1, int(kv_splits))
+    else:
+        num_splits = _decode_num_splits_occ(
+            num_queries,
+            (num_heads + BLOCK_M - 1) // BLOCK_M,
+            avg_main,
+            avg_extra,
+            BLOCK_K,
+        )
+    # A 32-head program (8 warps) gathers each key row once for 32 heads instead
+    # of twice. Use it when each program has more than one tile and, for grids of
+    # up to four rounds, the last round is more than half full. Bigger grids only
+    # need long programs (four tiles or more).
+    if packed_fp8 and num_heads in (32, 64):
+        tiles = row_tiles / num_splits
+        programs = num_queries * (num_heads // 32) * num_splits
+        left = programs % get_num_sms()
+        fills = left == 0 or 2 * left > get_num_sms()
+        if tiles > 1 and (fills if programs <= 4 * get_num_sms() else tiles >= 4):
             BLOCK_M, num_warps = 32, 8
     HEAD_ALIGNED = num_heads % BLOCK_M == 0
     heads_blocks = (num_heads + BLOCK_M - 1) // BLOCK_M
@@ -688,18 +681,6 @@ def _pa_decode_sparse_gfx950_gluon(
         "INV_ROPE": inv_rope,
         "OUT_MXFP8": out_scale is not None,
     }
-
-    if kv_splits is not None:
-        num_splits = max(1, int(kv_splits))
-    else:
-        num_splits = _decode_num_splits_occ(
-            num_queries,
-            heads_blocks,
-            avg_main,
-            avg_extra,
-            BLOCK_K,
-            wg_per_cu=2 if num_warps <= 4 else 1,
-        )
 
     # Q is read once per query without split-K, and re-read by every split
     q_cache = ".cg" if num_splits == 1 else ""
