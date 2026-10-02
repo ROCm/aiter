@@ -76,6 +76,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self.ca_comm = reuse_from.ca_comm
             self.qr_comm = reuse_from.qr_comm
             self.symm_mem_comm = reuse_from.symm_mem_comm
+            self.fly_a2a_comm = reuse_from.fly_a2a_comm
             return
 
         # lazy import to avoid documentation build error
@@ -134,6 +135,17 @@ class CudaCommunicator(DeviceCommunicatorBase):
             #     # If it's a rocm, 'use_custom_allreduce==True' means it must
             #     # currently be an MI300 series.
             self.qr_comm = QuickAllReduce(group=self.cpu_group, device=self.device)
+
+        # FlyDSL all-to-all, opt-in via AITER_FLY_A2A=1. Kept only when every
+        # rank built it; otherwise all-to-all stays on RCCL.
+        self.fly_a2a_comm = None
+        if self.world_size > 1:
+            from aiter.dist.device_communicators.quick_all_to_all import (
+                QuickAllToAll,
+            )
+
+            fly_a2a = QuickAllToAll(group=self.cpu_group, device=self.device)
+            self.fly_a2a_comm = None if fly_a2a.disabled else fly_a2a
 
     @property
     def all2all_manager(self):
@@ -292,7 +304,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             if self._ar_1stage_override is not None
             else (total_bytes <= total_bytes_limit)
         )
-        
+
         qr_comm = self.qr_comm
 
         # FlyDSL fused first when enabled, ahead of the use_1stage gate. Its
@@ -935,6 +947,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
             if self._owns_comms:
                 self.ca_comm.close()
             self.ca_comm = None
+        if getattr(self, "fly_a2a_comm", None) is not None:
+            if self._owns_comms:
+                self.fly_a2a_comm.close()
+            self.fly_a2a_comm = None
         if self._all2all_manager is not None:
             self._all2all_manager.destroy()
             self._all2all_manager = None
@@ -986,6 +1002,35 @@ class CudaCommunicator(DeviceCommunicatorBase):
         pynccl_comm.group_end()
 
         return output_list
+
+    def all_to_all(
+        self, input_: torch.Tensor, output_: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Equal-split all-to-all: ``all_to_all_single`` without split sizes.
+
+        *input_* is split into ``world_size`` equal chunks along its flattened
+        element order; chunk ``j`` goes to rank ``j``, and chunk ``i`` of the
+        result came from rank ``i``. FlyDSL first (opt-in, inside its size
+        window), then PyNccl, then c10d.
+        """
+        assert input_.numel() % self.world_size == 0, (
+            f"{input_.numel()} elements do not split into {self.world_size} "
+            "equal chunks"
+        )
+        input_ = input_.contiguous()
+        if output_ is None:
+            output_ = torch.empty_like(input_)
+        fly_a2a_comm = self.fly_a2a_comm
+        if fly_a2a_comm is not None and fly_a2a_comm.should_all_to_all(input_):
+            return fly_a2a_comm.all_to_all(input_, output_)
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is not None and not pynccl_comm.disabled:
+            pynccl_comm.all_to_all(output_, input_)
+            return output_
+        torch.distributed.all_to_all_single(
+            output_.view(-1), input_.view(-1), group=self.device_group
+        )
+        return output_
 
     def dispatch(
         self,

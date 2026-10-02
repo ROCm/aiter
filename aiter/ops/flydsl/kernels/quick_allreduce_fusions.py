@@ -42,13 +42,13 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import ReductionOp
 
-from .quick_allreduce_codec import BLOCK_ALIGN, MAX_BLOCK
-from .quick_allreduce_shared import (
+from .collectives_shared import (
     ATOMS,
     WAVE,
     atom_bf16_to_f32,
     atom_f32_to_bf16,
 )
+from .quick_allreduce_codec import BLOCK_ALIGN, MAX_BLOCK
 
 #: Epilogues a kernel factory may be asked to build. ``"none"`` is the plain
 #: all-reduce, and is not a special case anywhere except in the factories'
@@ -357,7 +357,7 @@ def quick_reduce_row_block_at(
     """``(block, atoms_per_row)`` for a fused mesh or ring build, block optional.
 
     ``None`` keeps :func:`quick_reduce_row_block`'s widest pick, which is what
-    every caller got before the block was tunable. 
+    every caller got before the block was tunable.
     """
     if block is None:
         return quick_reduce_row_block(hidden, world_size)

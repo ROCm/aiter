@@ -30,6 +30,7 @@ from .allreduce_shared import (
     kernel_symbol,
     payload_probes,
 )
+from .kernels.collectives_shared import SUPPORTED_WORLDS
 from .kernels.one_shot_allreduce import (
     DEFAULT_ATOMS,
     DEFAULT_BLOCK,
@@ -52,7 +53,6 @@ from .kernels.one_shot_allreduce import (
 from .kernels.quick_allreduce_fusions import (
     PAD_MASK_MAX_BYTES as _PAD_MASK_MAX_BYTES,
 )
-from .kernels.quick_allreduce_shared import SUPPORTED_WORLDS
 from .kernels.tensor_shim import _preload_compiled, _run_compiled
 
 logger = logging.getLogger("aiter")

@@ -69,7 +69,7 @@ chunk is reported at the end and retried by simply running the command again. `-
 ./tune.sh --tp "8" sweep        # just TP8
 ```
 
-For each world size and each shape set, runs `bench_comm_allreduce.py` (`--timing graph`, 5 warmup /
+For each world size and each shape set, runs `bench_comm.py` (`--operation ar`) (`--timing graph`, 5 warmup /
 50 iterations, `--fly-accuracy fast`) over ~40 candidates: aiter references (`cdr`, `cdr_naive`,
 `qr_int4`), the shipped dispatcher (`fly_auto`, `fly_1stage`) and every pinned FlyDSL instance
 (one-shot, mesh, ring). Outputs `out/<host>/sweep/tp<N>_fast_<shapes>.{csv,md,log}`.
@@ -209,7 +209,7 @@ Writes markdown tables of `fly_auto` against `cdr`, `cdr_naive`, `qr_int4`, `rcc
   uses the pinned rows only.
 * Run-to-run noise: very small payloads (<20 us) are sensitive to host load. The fit uses `median us`
   (median across ranks), not the max.
-* Adding a kernel knob or candidate: add it to `CANDIDATES` in `../bench_comm_allreduce.py`, then to the
+* Adding a kernel knob or candidate: add it to `CANDIDATES` in `../bench_comm_ar.py`, then to the
   candidate lists at the top of `tune.sh` (`MESH_PINNED`, `ONESHOT_PINNED`, ...). The fused sweep enumerates
   `fused_fly1s` candidates automatically.
 * Everything here is read-only with respect to the source tree: nothing but you edits the policy tables.
@@ -218,7 +218,7 @@ Writes markdown tables of `fly_auto` against `cdr`, `cdr_naive`, `qr_int4`, `rcc
 
 ```
 tune.sh                     driver (setup/check/sweep/fit/fused-*/validate/audit/report)
-fit_allreduce_policy.py     plain fit + --audit-auto (imports CANDIDATES from ../bench_comm_allreduce.py)
+fit_allreduce_policy.py     plain fit + --audit-auto (imports CANDIDATES from ../bench_comm_ar.py)
 shapes/                     plain sweep shape sets (M,K,label)
 fused/analyze_fused.py      per-shape summary of the fused sweep
 fused/fit_fused.py          fused ladder / window fit

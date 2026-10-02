@@ -13,7 +13,7 @@ Payload HBM is bf16; in-kernel math is packed fp16. Each rank owns
 stays ``ATOMS * rank_tile_bytes``.
 
 Geometry, cache policy and the wire codec live in
-``quick_allreduce_shared`` and ``quick_allreduce_codec``, which the ring
+``collectives_shared`` and ``quick_allreduce_codec``, which the ring
 and one-shot schedules share byte for byte.
 
 Two tuning knobs besides the super-tile:
@@ -31,6 +31,35 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Float32, Int32, Int64, Stream, T
 
+from .collectives_shared import (
+    _INBOX_POLICY,
+    ATOMS,
+    BLOCK,
+    DEFAULT_GRID_CAP,
+    QUAD_LANES,
+    QUADS_PER_WAVE,
+    SUPPORTED_WORLDS,
+    TILE_BYTES,
+    WAVE,
+    WORLD,
+    _buffer_load,
+    _buffer_ptr,
+    _color_io,
+    _i32_to_bytes,
+    _load_peers,
+    _payload_io,
+    _to_sgpr_i64,
+    fanout_quads,
+    fanout_sectors,
+    lds_write_packet,
+    make_pack_storage,
+    make_payload_tensor,
+    next_color,
+    publish_flags,
+    select_peer_base,
+    stripes_for,
+    wait_flags,
+)
 from .quick_allreduce_codec import (
     SUPER_TILES,
     SUPPORTED_BLOCKS,
@@ -38,11 +67,11 @@ from .quick_allreduce_codec import (
     _atom_f16_to_bf16,
     _clamp_fp16_overflow,
     _codec_dequant,
-    _codec_load,
     _codec_quant,
     _f16x2,
     _i32,
     _scale_from_word,
+    codec_recv,
     codecs_for_block,
     scale_slot_of,
     thread_lane,
@@ -58,34 +87,6 @@ from .quick_allreduce_fusions import (
     rms_rstd,
     scale_by_weight,
 )
-from .quick_allreduce_shared import (
-    _INBOX_POLICY,
-    ATOMS,
-    BLOCK,
-    DEFAULT_GRID_CAP,
-    FLAG_I32_PER_LANE,
-    FLAG_LANES,
-    QUAD_LANES,
-    QUADS_PER_WAVE,
-    SUPPORTED_WORLDS,
-    TILE_BYTES,
-    WAVE,
-    WORLD,
-    _acquire_inbox,
-    _buffer_load,
-    _buffer_ptr,
-    _color_io,
-    _i32_to_bytes,
-    _load_flag,
-    _load_peers,
-    _payload_io,
-    _release_inbox,
-    _store_flag_peer,
-    _store_v4i32_peer,
-    _to_sgpr_i64,
-    make_pack_storage,
-    make_payload_tensor,
-)
 
 # Re-exported for the host, which imports its tile math from this module.
 __all__ = [
@@ -97,7 +98,6 @@ __all__ = [
     "SUPPORTED_WORLDS",
     "TILE_BYTES",
     "WORLD",
-    "clamp_grid_cap",
     "make_quick_allreduce_mesh_kernel",
     "mesh_st_ladder",
 ]
@@ -105,72 +105,6 @@ __all__ = [
 PHASES = 2
 PHASE_REDUCE_SCATTER = 0
 PHASE_ALL_GATHER = 1
-
-# (world_size, super_tile) → VGPR-limited workgroups per CU, measured on the
-# mesh kernel. Super-tile widens the live atom list, so residency falls as it
-# grows; world size narrows each rank's share of a tile, so it rises with N.
-_RESIDENT_WGS_PER_CU = {
-    (2, 1): 3,
-    (2, 8): 4,
-    (4, 1): 4,
-    (4, 8): 5,
-    (8, 1): 4,
-    (8, 8): 6,
-}
-
-
-def clamp_grid_cap(
-    requested: int,
-    *,
-    arch: str,
-    world_size: int,
-    super_tile: int,
-    cu_count: int,
-    block: int = BLOCK,
-) -> int:
-    """Clamp a requested persistent grid to what actually fits on the device.
-
-    A persistent kernel deadlocks if it launches more workgroups than can be
-    co-resident, so the cap has to respect VGPR-limited occupancy.
-
-    An unmeasured *super_tile* -- the ring runs ST=16 and ST=32, which this
-    table does not cover -- falls back to the smallest measurement for that
-    world size rather than raising. Under-launching a persistent kernel is
-    always safe (each block simply loops over more tiles); over-launching is
-    the failure mode, so the fallback has to err small. An unknown *arch* or
-    *world_size* still raises, because there is nothing to be conservative
-    with.
-
-    *block* wider than the measured 256 scales the answer down: the table is
-    VGPR- and wave-slot-limited workgroups per CU at four waves, and a 14-wave
-    workgroup takes 3.5x the slots. That scaling is a **model**, not a
-    measurement, and over-estimating residency here is a hang rather than a
-    slowdown -- so a fused build must not rely on it alone. The host bounds
-    those launches at one workgroup per CU as well; see
-    ``FlyQuickAllReduceRMSNorm``.
-    """
-    if requested < 1 or cu_count < 1:
-        raise ValueError("grid_cap and cu_count must be positive")
-    if block < 1:
-        raise ValueError("block must be positive")
-    if arch not in ("gfx942", "gfx950"):
-        raise ValueError(
-            f"quick_allreduce_mesh has no residency measurement for {arch!r}"
-        )
-    key = (int(world_size), int(super_tile))
-    resident = _RESIDENT_WGS_PER_CU.get(key)
-    if resident is None:
-        for_world = [v for (w, _st), v in _RESIDENT_WGS_PER_CU.items() if w == key[0]]
-        if not for_world:
-            raise ValueError(
-                "quick_allreduce_mesh has no residency measurement for "
-                f"world_size={world_size}"
-            )
-        resident = min(for_world)
-    if block > BLOCK:
-        resident = max(1, (resident * BLOCK) // int(block))
-    return min(int(requested), resident * int(cu_count))
-
 
 # Per-``(link, world_size)`` tuning ladder: ``(min_bytes, super_tile, grid_cap,
 # block, skip_self)`` rungs, ascending.
@@ -215,9 +149,9 @@ def mesh_fanout_quads(block: int, world_size: int, codec: str) -> tuple[int, int
     ``(peer, sector)`` of a stripe, in a single pass. A block with fewer quads
     than that would silently drop the sectors past the end.
     """
-    c = codecs_for_block(int(block))[codec]
-    stripes = [(b, min(8, c.n_sectors - b)) for b in range(0, c.n_sectors, 8)]
-    return int(block) // QUAD_LANES, max(int(world_size) * w for _, w in stripes)
+    return fanout_quads(
+        block, world_size, codecs_for_block(int(block))[codec].n_sectors
+    )
 
 
 def mesh_fanout_fits(block: int, world_size: int, codec: str) -> bool:
@@ -336,7 +270,7 @@ def make_quick_allreduce_mesh_kernel(
     # the ring, which loops rounds. A block narrower than the shipped 256 would
     # run out of quads and silently drop the sectors past the end, so a fused
     # build that lands there is rejected rather than built. (The plain path can
-    # still narrow ``stripe_width`` below; only fused derives its own block.)
+    # still narrow the stripe width below; only fused derives its own block.)
     if const_expr(fused):
         _, need_quads = mesh_fanout_quads(block, world_size, codec)
         if quads_per_block < need_quads:
@@ -348,11 +282,7 @@ def make_quick_allreduce_mesh_kernel(
 
     # A rank-tile's sectors, in stripes of up to 8, one quad per (destination,
     # sector) of a stripe, in a single pass.
-    stripe_width = min(8, quads_per_block // n_push)
-    stripes = [
-        (b, min(stripe_width, c.n_sectors - b))
-        for b in range(0, c.n_sectors, stripe_width)
-    ]
+    stripes = stripes_for(c.n_sectors, n_push, block)
     sector_fastest = policy["fanout"] != "peer"
 
     # One pack row per (destination, rank-atom).
@@ -410,9 +340,6 @@ def make_quick_allreduce_mesh_kernel(
         quad_id = wave * fx.Int32(QUADS_PER_WAVE) + quad
 
         pack_layout = fx.make_layout((pack_rows, c.rank_tile_i32), (c.rank_tile_i32, 1))
-        # 64 B NT sectors of one rank-tile: (sector, lane-in-quad) -> i32
-        # start of the dwordx4. Isolated NT store stays explicit.
-        nt_own_layout = fx.make_layout((c.n_sectors, QUAD_LANES), (16, 4))
         # The fused epilogue reaches its HBM operands (residual, weight, final
         # output) as raw bf16 atoms through a tiled copy; the plain reduce path
         # uses the shared ``_payload_io`` helpers below and never builds these.
@@ -472,11 +399,7 @@ def make_quick_allreduce_mesh_kernel(
 
         def _push_base(j):
             """Inbox base of destination *j*, a lane-varying ``push_peers`` index."""
-
-            base = peers[push_peers[0]]
-            for i in range_constexpr(1, n_push):
-                base = (j == fx.Int32(i)).select(peers[push_peers[i]], base)
-            return base
+            return select_peer_base(peers, push_peers, j)
 
         # The plain reduce path moves whole tiles through the shared payload
         # helpers; the fused epilogue below reaches the same rows as raw bf16
@@ -538,9 +461,6 @@ def make_quick_allreduce_mesh_kernel(
             res_in_buf = _operand(res_in_ptr)
             res_out_buf = _operand(res_out_ptr)
             w_buf = _operand(w_ptr, records=fx.Int64(hidden * 2))
-
-        def _pack_off(peer, i32_idx):
-            return fx.get_scalar(fx.crd2idx((peer, i32_idx), pack_layout))
 
         def _sub_tile_i32(phase, src, sub):
             slot = fx.get_scalar(
@@ -662,14 +582,7 @@ def make_quick_allreduce_mesh_kernel(
                 _store_tile_atoms(tile, gathered)
 
         def _lds_write_packet(slot, words, scale, is_leader):
-            for (off, pred), word in zip(c.plane_slots(tid), words):
-                if pred:
-                    fx.memref_store(word, pack, (slot, off))
-            if const_expr(c.has_scale):  # noqa: SIM102
-                if is_leader:
-                    fx.memref_store(
-                        scale, pack, (slot, fx.Int32(c.scale_i32_off) + scale_slot)
-                    )
+            lds_write_packet(c, pack, slot, words, scale, is_leader, tid, scale_slot)
 
         def _pack_reduce_scatter(atoms):
             """Quantize each destination's slice of this tile into LDS.
@@ -712,132 +625,63 @@ def make_quick_allreduce_mesh_kernel(
             return own
 
         def _fanout_nt(phase, inbox_src, sub):
-            """NT-store one rank-tile from LDS to every destination's inbox.
-
-            Lockstep stripes of up to 8 sectors cover the rank-tile: at the
-            default block INT4 is 8+8+2 (16 nibble sectors then the 2-sector
-            E4M3 tail), fp16 is eight full stripes. ``sector_base`` is the first
-            sector of each stripe.
-
-            One quad per (destination, sector) of a stripe; leftover quads sit
-            idle. Which axis runs fastest across consecutive quads is a fabric
-            question.
-                - "sector": consecutive quads target consecutive peers of
-                  one sector, so a single store instruction hits every GPU
-                  -- ideal on xGMI, whose native packet is exactly the 64 B
-                  a quad writes.
-                - "peer": consecutive quads walk the sectors of one peer,
-                  giving each destination a ``64 * width`` B contiguous run
-                  -- ideal on PCIe.
-            """
-            for k in range_constexpr(rank_atoms):
-                for sector_base, width in stripes:
-                    n_quads = fx.Int32(n_push * width)
-                    safe = (quad_id < n_quads).select(quad_id, fx.Int32(0))
-                    if const_expr(sector_fastest):
-                        # sector fastest
-                        j = safe % fx.Int32(n_push)
-                        sector_in_stripe = safe // fx.Int32(n_push)
-                    else:
-                        # peer fastest
-                        j = safe // fx.Int32(width)
-                        sector_in_stripe = safe % fx.Int32(width)
-                    sector = fx.Int32(sector_base) + sector_in_stripe
-                    if quad_id < n_quads:
-                        vec_idx = fx.get_scalar(
-                            fx.crd2idx((sector, lane_in_quad), nt_own_layout)
-                        )
-                        pack_row = j
-                        wire_idx = vec_idx
-                        if const_expr(rank_atoms != 1):
-                            pack_row = j * fx.Int32(rank_atoms) + fx.Int32(k)
-                            wire_idx = vec_idx + fx.Int32(k * c.rank_tile_i32)
-                        # 4xi32 NT vector cannot go through the i32 pack view.
-                        v4 = fx.ptr_load(
-                            smem_ptr + _pack_off(pack_row, vec_idx),
-                            result_type=fx.Vector.make_type(4, fx.Int32),
-                        )
-                        byte_off = _i32_to_bytes(
-                            _sub_tile_i32(phase, inbox_src, sub) + wire_idx
-                        )
-                        _store_v4i32_peer(_push_base(j) + byte_off, v4, payload_policy)
+            """NT-store one rank-tile from LDS to every destination's inbox."""
+            fanout_sectors(
+                codec=c,
+                n_dest=n_push,
+                n_atoms=rank_atoms,
+                stripes=stripes,
+                sector_fastest=sector_fastest,
+                quad_id=quad_id,
+                lane_in_quad=lane_in_quad,
+                smem_ptr=smem_ptr,
+                pack_layout=pack_layout,
+                slot_i32=_sub_tile_i32(phase, inbox_src, sub),
+                dest_base=_push_base,
+                payload_policy=payload_policy,
+            )
 
         def _publish(phase, inbox_src, color):
-            """Drain payload NT stores, then write *color* into every peer inbox.
+            """Drain the payload, then colour this rank's slot in every peer.
 
-            Last 64 B of this rank's slot (after the ST rank-tiles) is the
-            handshake: 16 i32s all equal to *color*. Peers spin on that
-            sector in their copy of our slot; seeing *color* means our
-            payload is visible.
-
-            ``vmcnt(0)``: this 64-lane wave's NT payload stores are done.
-            The workgroup barrier: the other three 64-lane waves issued
-            payload too; ``vmcnt`` is per-wave, so without the join a
-            wave-0 handshake could race stores still in flight. Neither
-            can move after the color store, and neither can be dropped.
-
-            On a cacheable inbox retiring the stores is not enough -- they
-            can be sitting in this XCD's L2. The release fence after the join
-            writes them back (``buffer_wbl2``) and waits for that to land
-            before the flag goes out. Every workgroup issues its own: L2 is
-            per-XCD.
-
-            ``FLAG_LANES`` lanes per destination, 8 B each, so at most 64
-            lanes: the whole handshake is one store instruction from wave 0.
+            The last 64 B of the slot (after the ST rank-tiles) is the
+            handshake: peers spin on it in their copy of our slot, and seeing
+            *color* there means our payload is visible.
             """
-            rocdl.s_waitcnt(vmcnt=0)
-            gpu.barrier()
-            if const_expr(release_scope is not None):
-                _release_inbox(release_scope)
-            limit = fx.Int32(n_push)
-            dest = tid // fx.Int32(FLAG_LANES)
-            safe = (dest < limit).select(dest, fx.Int32(0))
-            if dest < limit:
-                elem = (
-                    _sub_tile_i32(phase, inbox_src, fx.Int32(0))
-                    + fx.Int32(release_i32_off)
-                    + (tid % fx.Int32(FLAG_LANES)) * fx.Int32(FLAG_I32_PER_LANE)
-                )
-                _store_flag_peer(
-                    _push_base(safe) + _i32_to_bytes(elem), color, flag_policy
-                )
-
-        def _wait_flag(flag, color):
-            # No fence in the loop body: _load_flag carries `sc0 sc1`, so a
-            # retry cannot be served from a stale line. The acquire that
-            # orders the payload reads is in _wait_release, once, after the
-            # join.
-            current = _load_flag(flag)
-            while current != color:
-                current = _load_flag(flag)
+            publish_flags(
+                tid=tid,
+                n_dest=n_push,
+                dest_base=_push_base,
+                flag_i32=_sub_tile_i32(phase, inbox_src, fx.Int32(0))
+                + fx.Int32(release_i32_off),
+                color=color,
+                flag_policy=flag_policy,
+                release_scope=release_scope,
+            )
 
         def _wait_release(phase, color):
-            # Lane ``t`` watches one source. Without skip_self that is source
-            # ``t``; with it our own flag is never published, so the N-1 lanes
-            # step over our own index.
-            spin_src = tid
-            if const_expr(self_rank is not None):  # noqa: SIM102
-                if tid >= fx.Int32(self_rank):
-                    spin_src = tid + fx.Int32(1)
-            if tid < n_push:
-                elem = _sub_tile_i32(phase, spin_src, fx.Int32(0)) + fx.Int32(
-                    release_i32_off
+            """Spin until every source has coloured its slot in our inbox.
+
+            On a fine-grained inbox the acquire is system scope, an L1+L2
+            invalidate, which the `nt` payload loads rely on. On an uncached
+            inbox it is workgroup scope, which invalidates nothing and is only
+            a compiler barrier; that is safe because the policy pairs it with
+            `sc0 sc1` payload loads (`recv_policy`), which bypass both caches.
+            """
+
+            def _flag(src):
+                return peer_vec[rank] + _i32_to_bytes(
+                    _sub_tile_i32(phase, src, fx.Int32(0)) + fx.Int32(release_i32_off)
                 )
-                _wait_flag(peer_vec[rank] + _i32_to_bytes(elem), color)
-            gpu.barrier()
-            # Unconditional and after the join. Only `tid < n_push` spun,
-            # so scoping the acquire to the spin would leave the other waves
-            # of this workgroup reading the payload unordered after it -- and
-            # would also skip it entirely in the common case where the flag is
-            # already set on the first read.
-            #
-            # The scope is the inbox policy's. On a fine-grained inbox it is
-            # system scope, an L1+L2 invalidate, which the `nt` payload loads
-            # rely on. On an uncached inbox it is workgroup scope, which
-            # invalidates nothing and is only a compiler barrier; that is safe
-            # because the policy pairs it with `sc0 sc1` payload loads
-            # (`recv_policy`), which bypass both caches.
-            _acquire_inbox(acquire_scope)
+
+            wait_flags(
+                tid=tid,
+                n_src=n_push,
+                skip_rank=self_rank,
+                flag_addr=_flag,
+                color=color,
+                acquire_scope=acquire_scope,
+            )
 
         def _recv_quantized(phase, src, sub, k=0):
             base = _sub_tile_i32(phase, src, sub)
@@ -847,8 +691,7 @@ def make_quick_allreduce_mesh_kernel(
             def _get(off):
                 return _buffer_load(inbox, base + off, 1, fx.Int32, recv_policy)[0]
 
-            words, word = _codec_load(c, _get, tid, scale_slot)
-            return words, _scale_from_word(c, word, pair_in_slot)
+            return codec_recv(c, _get, tid, scale_slot, pair_in_slot)
 
         def _reduce_scattered(sub, own=None):
             """Dequant-accumulate every peer's reduce-scatter packet for *sub*."""
@@ -965,9 +808,7 @@ def make_quick_allreduce_mesh_kernel(
                 gathered = _recv_all_gather(fx.Int32(0), own_ag)
                 _finish_tile(tile, gathered, w_atoms)
 
-                color = color + fx.Int32(1)
-                if color == fx.Int32(0):  # 0 is unset sentinel
-                    color = fx.Int32(1)
+                color = next_color(color, parity_safe=False)
         else:
             st_i = fx.Int32(super_tile)
             for i in range(fx.Int32(0), n_block_tiles, st_i):
@@ -1025,9 +866,7 @@ def make_quick_allreduce_mesh_kernel(
                     gathered = _recv_all_gather(s, _unstash_own(tile))
                     _finish_tile(tile, gathered, w_atoms)
 
-                color = color + fx.Int32(1)
-                if color == fx.Int32(0):  # 0 is unset sentinel
-                    color = fx.Int32(1)
+                color = next_color(color, parity_safe=False)
         if tid == 0:
             _store_color(color)
         gpu.barrier()

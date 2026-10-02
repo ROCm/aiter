@@ -19,7 +19,7 @@ alignment that constrains it is the 64 B fabric sector: see
 geometry exactly (INT4 1152 B, INT6 1664 B, FP16 4096 B).
 
 Imported by the mesh and ring kernels, which must agree on it byte for byte.
-Depends on ``quick_allreduce_shared`` for ``BLOCK``, ``WAVE`` and ``I32_BYTES``.
+Depends on ``collectives_shared`` for ``BLOCK``, ``WAVE`` and ``I32_BYTES``.
 
 Note: Editing the shared modules doesn't invalidate the FlyDSL compiler cache.
 Hence, one may end up running stale kernels unless one sets
@@ -33,8 +33,8 @@ import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import gpu, range_constexpr
 
+from .collectives_shared import BLOCK, I32_BYTES, WAVE
 from .kernels_common import ceildiv
-from .quick_allreduce_shared import BLOCK, I32_BYTES, WAVE
 
 SUPER_TILES = (1, 8)
 # Two threads (PAIR) share one E4M3; GROUP threads share the i32 slot.
@@ -558,3 +558,13 @@ def _codec_load(codec, get, tid, scale_slot):
         get(fx.Int32(codec.scale_i32_off) + scale_slot) if codec.has_scale else None
     )
     return words, scale_word
+
+
+def codec_recv(codec, get, tid, scale_slot, pair_in_slot):
+    """Read one packet through ``get(i32_off_in_tile) -> i32`` and resolve its
+    decoding scale: ``(words, scale)``, ready for :func:`_codec_dequant`.
+
+    ``scale`` is ``None`` for a codec with no scale plane (fp16 passthrough).
+    """
+    words, word = _codec_load(codec, get, tid, scale_slot)
+    return words, _scale_from_word(codec, word, pair_in_slot)

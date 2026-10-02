@@ -235,6 +235,18 @@ class DeviceCommunicatorBase:
             output_tensor = None
         return output_tensor
 
+    def all_to_all(
+        self, input_: torch.Tensor, output_: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Equal-split all-to-all: ``all_to_all_single`` without split sizes."""
+        input_ = input_.contiguous()
+        if output_ is None:
+            output_ = torch.empty_like(input_)
+        dist.all_to_all_single(
+            output_.view(-1), input_.view(-1), group=self.device_group
+        )
+        return output_
+
     def send(self, tensor: torch.Tensor, dst: int | None = None) -> None:
         """Sends a tensor to the destination rank in a blocking way"""
         """NOTE: `dst` is the local rank of the destination rank."""

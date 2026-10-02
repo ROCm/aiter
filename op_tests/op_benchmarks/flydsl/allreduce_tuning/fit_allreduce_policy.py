@@ -2,7 +2,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Fit the FlyDSL all-reduce dispatch tables from a benchmark sweep.
 
-Reads the ``--output-csv`` files produced by ``bench_comm_allreduce.py`` and
+Reads the ``--output-csv`` files produced by ``bench_comm.py --operation ar`` and
 emits the two levels of heuristic the dispatch needs, as paste-ready Python
 literals:
 
@@ -63,9 +63,9 @@ from itertools import combinations, pairwise
 
 import pandas as pd
 
-# bench_comm_allreduce.py lives one directory up (op_tests/op_benchmarks/flydsl).
+# bench_comm_ar.py lives one directory up (op_tests/op_benchmarks/flydsl).
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from bench_comm_allreduce import CANDIDATES
+from bench_comm_ar import CANDIDATES
 
 logging.basicConfig(format="%(message)s", level=logging.INFO)
 logger = logging.getLogger("fit")
@@ -188,7 +188,7 @@ def load(paths, metric: str, *, require_timing: str | None = None):
     if not keys:
         raise SystemExit(
             f"no '<candidate> {metric}' columns in the input; was the sweep run "
-            "with --output-csv from a current bench_comm_allreduce.py?"
+            "with --output-csv from a current bench_comm.py --operation ar?"
         )
     # A shape measured in more than one input file (the small and large ladders
     # overlap at 3.5 MiB by construction) keeps its fastest reading per

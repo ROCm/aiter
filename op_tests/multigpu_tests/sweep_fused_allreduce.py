@@ -19,7 +19,7 @@ Two questions, one sweep:
    the kernel comparison from the dispatch one). They can disagree a lot: aiter
    sometimes dispatches to a kernel that is not its own fastest option.
 
-This drives ``bench_comm_allreduce.py`` once per (TP, hidden) and reduces the
+This drives ``bench_comm.py`` (``--operation ar``) once per (TP, hidden) and reduces the
 per-run CSVs; it measures nothing itself, so the numbers are exactly what the
 bench reports and the commands it ran are printed for reproduction.
 
@@ -74,15 +74,16 @@ from pathlib import Path
 import pandas as pd
 
 _HERE = Path(__file__).resolve().parent
-_BENCH = _HERE / "bench_comm_allreduce.py"
+_BENCH_DIR = _HERE.parent / "op_benchmarks" / "flydsl"
+_BENCH = _BENCH_DIR / "bench_comm.py"
 
-if str(_HERE) not in sys.path:
-    sys.path.insert(0, str(_HERE))
+if str(_BENCH_DIR) not in sys.path:
+    sys.path.insert(0, str(_BENCH_DIR))
 # Reuse the bench's own prod-path parser rather than re-deriving it: it
 # already handles every `production_fused_path()` string, including
 # `qr_fused:<regime>` for any regime, not just the ones this sweep exercises.
-from bench_comm_allreduce import CANDIDATES as _BENCH_CANDIDATES
-from bench_comm_allreduce import _prod_candidate_key
+from bench_comm_ar import CANDIDATES as _BENCH_CANDIDATES
+from bench_comm_ar import _prod_candidate_key
 
 # Decode through prefill, ~4 points per octave at the bottom. The density is
 # what lets `fit_allreduce_policy.py` place a threshold: measured points have to
@@ -324,9 +325,9 @@ def _winner_table(df: pd.DataFrame, min_sqnr: float | None) -> pd.DataFrame:
                 "aiter": ait,
                 "aiter us": ait_us if ait else float("nan"),
                 "aiter dB": ait_db,
-                "speedup": (ait_us / fly_us)
-                if (fly and ait and fly_us > 0)
-                else float("nan"),
+                "speedup": (
+                    (ait_us / fly_us) if (fly and ait and fly_us > 0) else float("nan")
+                ),
             }
         )
     return pd.DataFrame(rows)
@@ -336,7 +337,7 @@ def _prod_dispatch_table(df: pd.DataFrame, min_sqnr: float | None) -> pd.DataFra
     """Best FlyDSL-fused against what aiter's *actual dispatch heuristic*
     would run at this shape today -- the fair comparison, not an oracle.
 
-    ``prod path`` (from ``bench_comm_allreduce.py``'s own
+    ``prod path`` (from ``bench_comm_ar.py``'s own
     ``production_fused_path()``) says which kernel ``CudaCommunicator``
     would pick, independent of which one happens to measure fastest; this
     looks up *that* candidate's own measured time and SQNR rather than
@@ -366,9 +367,11 @@ def _prod_dispatch_table(df: pd.DataFrame, min_sqnr: float | None) -> pd.DataFra
                 "prod path": path,
                 "aiter us": ait_us,
                 "aiter dB": ait_db,
-                "speedup": (ait_us / fly_us)
-                if (fly and pd.notna(ait_us) and fly_us > 0)
-                else float("nan"),
+                "speedup": (
+                    (ait_us / fly_us)
+                    if (fly and pd.notna(ait_us) and fly_us > 0)
+                    else float("nan")
+                ),
             }
         )
     return pd.DataFrame(rows)

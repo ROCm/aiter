@@ -59,46 +59,42 @@ import itertools
 import json
 import math
 import os
-import sys
-from multiprocessing import Pool, freeze_support, set_start_method
+from multiprocessing import freeze_support
 
-_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
-
-import pandas as pd
 import torch
+from flydsl_comm_test_utils import (
+    ARCH,
+    SUPPORTED_ARCHS,
+    FailureLog,
+    SpawnRegistry,
+    fmt_bytes,
+    lanes_differing,
+    min_tile_sqnr_db,
+    rel_mae,
+    run_on_ranks,
+    sqnr_db,
+    summarize,
+    worst,
+)
 
 import aiter
 from aiter import dtypes
-from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
-from aiter.jit.utils.chip_info import get_gfx_runtime
-from aiter.test_common import benchmark, checkAllclose, run_perftest
-
-set_start_method("spawn", force=True)
-
 from aiter.ops.flydsl import allreduce_policy as fly_policy
-from aiter.ops.flydsl.kernels.quick_allreduce_codec import SUPPORTED_BLOCKS
-from aiter.ops.flydsl.kernels.quick_allreduce_mesh import (
-    clamp_grid_cap,
-    mesh_st_ladder,
-)
-from aiter.ops.flydsl.kernels.quick_allreduce_ring import ring_st_ladder
-from aiter.ops.flydsl.kernels.quick_allreduce_shared import (
+from aiter.ops.flydsl.kernels.collectives_shared import (
     ATOMS,
     DEFAULT_GRID_CAP,
     SUPPORTED_WORLDS,
+    clamp_grid_cap,
 )
+from aiter.ops.flydsl.kernels.quick_allreduce_codec import SUPPORTED_BLOCKS
+from aiter.ops.flydsl.kernels.quick_allreduce_mesh import mesh_st_ladder
+from aiter.ops.flydsl.kernels.quick_allreduce_ring import ring_st_ladder
 from aiter.ops.flydsl.quick_allreduce import (
     _resolve_inbox_flags,
     batches_publishes,
 )
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
-try:
-    ARCH = get_gfx_runtime()
-except (KeyError, RuntimeError):
-    ARCH = None
-SUPPORTED_ARCHS = ("gfx942", "gfx950")
 ALGORITHMS = ("mesh", "ring")
 
 # One SQNR floor for both schedules, in their shipping configuration.
@@ -239,9 +235,6 @@ EXTENDED_KNOB_CASES = (
     (2, "ring", 9216, 4096, 128, False),
 )
 
-# Seconds to wait for each rank of a spawn. The kernels spin on flags written
-# by peers, so a protocol bug or a dead rank hangs the rest.
-SPAWN_TIMEOUT_S = 600
 
 _FILLS = (
     "normal",
@@ -458,67 +451,6 @@ def _ship_payloads(
     return [by_cfg.get((st, b, ss), min(by_cfg.values()))], None
 
 
-def _fmt_bytes(nbytes: int) -> str:
-    if nbytes >= fly_policy.NO_MAX:
-        return "inf"
-    for unit, shift in (("MiB", 20), ("KiB", 10)):
-        if nbytes >= 1 << shift:
-            return f"{nbytes / (1 << shift):g} {unit}"
-    return f"{nbytes} B"
-
-
-def _sqnr(ref_pow: torch.Tensor, mse: torch.Tensor) -> torch.Tensor:
-    score = torch.where(
-        (ref_pow <= 0) & (mse <= 0),
-        torch.full_like(mse, float("inf")),
-        10.0 * torch.log10(ref_pow / mse),
-    )
-    return torch.nan_to_num(score, nan=float("-inf"), neginf=float("-inf"))
-
-
-def _sqnr_db(got: torch.Tensor, reference: torch.Tensor) -> float:
-    return float(
-        _sqnr((reference * reference).mean(), ((got - reference) ** 2).mean()).item()
-    )
-
-
-def _min_tile_sqnr_db(
-    got: torch.Tensor, reference: torch.Tensor, tile_bytes: int
-) -> float:
-    """Worst per-tile SQNR, so one unwritten tile cannot be averaged away."""
-    tile_elems = tile_bytes // 2
-    g = got.reshape(-1)
-    r = reference.reshape(-1)
-    n = int(g.numel())
-    n_full = (n // tile_elems) * tile_elems
-    vals = []
-    if n_full:
-        gt = g[:n_full].view(-1, tile_elems)
-        rt = r[:n_full].view(-1, tile_elems)
-        mse = ((gt - rt) ** 2).mean(dim=1)
-        pow_ = (rt * rt).mean(dim=1)
-        vals.append(float(_sqnr(pow_, mse).min().item()))
-    if n > n_full:
-        vals.append(_sqnr_db(g[n_full:], r[n_full:]))
-    return min(vals) if vals else _sqnr_db(got, reference)
-
-
-def _rel_mae(got: torch.Tensor, reference: torch.Tensor) -> float:
-    scale = float(reference.abs().mean().item())
-    err = float((got - reference).abs().mean().item())
-    return err / scale if scale else 0.0
-
-
-def _lanes_differing(out: torch.Tensor, group) -> int:
-    """bf16 lanes where any rank's output differs, bit for bit, from rank 0's."""
-    import torch.distributed as dist
-
-    gathered = [torch.empty_like(out) for _ in range(dist.get_world_size(group))]
-    dist.all_gather(gathered, out.contiguous(), group=group)
-    bits = [g.view(torch.int16) for g in gathered]
-    return max(int((b != bits[0]).sum().item()) for b in bits)
-
-
 def _metrics(
     out: torch.Tensor, ref: torch.Tensor, rank: int, tile_bytes: int, group
 ) -> dict:
@@ -539,30 +471,15 @@ def _metrics(
         msg=f"quick_allreduce rank {rank}",
     )
     return {
-        "sqnr_db": _sqnr_db(got, ref),
-        "min_tile_sqnr_db": _min_tile_sqnr_db(got, ref, tile_bytes),
-        "lanes_differing": _lanes_differing(out, group),
-        "rel_mae": _rel_mae(got, ref),
+        "sqnr_db": sqnr_db(got, ref),
+        "min_tile_sqnr_db": min_tile_sqnr_db(got, ref, tile_bytes),
+        "lanes_differing": lanes_differing(out, group),
+        "rel_mae": rel_mae(got, ref),
         "err": float(err),
         "n_mismatch": n_mismatch,
         "max_abs_err": float(diff.max().item()) if diff.numel() else 0.0,
         "first_bad": first_bad,
     }
-
-
-def _worst(a: dict, b: dict) -> dict:
-    """Per-field worst of two metric dicts, for a row checked several times."""
-    out = dict(a)
-    for key in ("sqnr_db", "min_tile_sqnr_db"):
-        out[key] = min(a[key], b[key])
-    for key in ("err", "n_mismatch", "max_abs_err", "lanes_differing"):
-        out[key] = max(a[key], b[key])
-    # NaN must win, so compare with isfinite rather than max().
-    if not math.isfinite(b["rel_mae"]) or b["rel_mae"] > a["rel_mae"]:
-        out["rel_mae"] = b["rel_mae"]
-    if a["first_bad"] < 0:
-        out["first_bad"] = b["first_bad"]
-    return out
 
 
 def _run_rank(
@@ -647,7 +564,7 @@ def _run_rank(
                     g.replay()
                     torch.cuda.synchronize()
                     dist.barrier()
-                    m = _worst(m, _metrics(out, ref, rank, tile_bytes, group))
+                    m = worst(m, _metrics(out, ref, rank, tile_bytes, group))
 
             st_used, block_used, skip_used = cfg_used
             row = {
@@ -693,81 +610,13 @@ def _run_rank(
     return rows
 
 
-def _spawn(
-    world_size: int,
-    engine_kw: dict,
-    cases: list[tuple],
-    window: tuple[int, int] | None = None,
-) -> list[list[dict]]:
-    if world_size not in SUPPORTED_WORLDS:
-        raise ValueError(f"unsupported world_size={world_size}")
-    init_method = get_distributed_init_method(get_ip(), get_open_port())
-    pool = Pool(processes=world_size)
-    try:
-        results = [
-            pool.apply_async(
-                _run_rank,
-                kwds={
-                    "rank": rank,
-                    "tp": world_size,
-                    "init_method": init_method,
-                    "engine_kw": engine_kw,
-                    "cases": cases,
-                    "window": window,
-                },
-            )
-            for rank in range(world_size)
-        ]
-        ranks = [fut.get(timeout=SPAWN_TIMEOUT_S) for fut in results]
-    except Exception:
-        pool.terminate()
-        raise
-    else:
-        pool.close()
-    finally:
-        pool.join()
-    return ranks
-
-
 # Rows are registered up front, grouped by the engine they need, so that each
-# engine is built by exactly one spawn however many tables read from it.
-# A spawn key is ``(tp, sorted engine kwargs)``; a case is
-# ``(tokens, hidden, fill, graph, time_it)``.
-_CASES: dict[tuple, list[tuple]] = {}
-# Production dispatch window of a shipping engine whose kernel coverage is
-# checked, per spawn key.
-_WINDOWS: dict[tuple, tuple[int, int]] = {}
-_RESULTS: dict[tuple, dict[tuple, list[dict]]] = {}
-_FAILURES: list[str] = []
-
-
-def _key(tp: int, **engine_kw) -> tuple:
-    return (tp, tuple(sorted(engine_kw.items())))
-
-
-def _register(key: tuple, case: tuple) -> None:
-    cases = _CASES.setdefault(key, [])
-    if case not in cases:
-        cases.append(case)
-
-
-def _result(key: tuple, case: tuple) -> list[dict]:
-    """Per-rank rows for *case*, spawning *key*'s engine on first use."""
-    if key not in _RESULTS:
-        cases = _CASES[key]
-        ranks = _spawn(key[0], dict(key[1]), cases, _WINDOWS.get(key))
-        _RESULTS[key] = {
-            c: [rank_rows[i] for rank_rows in ranks] for i, c in enumerate(cases)
-        }
-    return _RESULTS[key][case]
-
-
-def _check(label: str, fails: list[str]) -> bool:
-    if fails:
-        msg = f"{label}: " + "; ".join(fails)
-        aiter.logger.error(msg)
-        _FAILURES.append(msg)
-    return not fails
+# engine is built by exactly one spawn however many tables read from it. A case
+# is ``(tokens, hidden, fill, graph, time_it)``; ``registry.windows`` holds the
+# production dispatch window of a shipping engine whose kernel coverage is
+# checked.
+registry = SpawnRegistry(_run_rank)
+failures = FailureLog()
 
 
 def _identity_fails(rows: list[dict], algorithm: str) -> list[str]:
@@ -807,7 +656,7 @@ def _check_sqnr(
             fails.append(
                 f"rank {rank}: checkAllclose err {row['err']:.3f} >= {CLOSE_ERR_RATIO}"
             )
-    return _check(label, fails)
+    return failures.check(label, fails)
 
 
 def _shipping_st(
@@ -861,7 +710,7 @@ def _ship_key(
     ):
         if val is not None:
             kw[name] = val
-    return _key(tp, **kw)
+    return registry.key(tp, **kw)
 
 
 def _transport_key(
@@ -881,7 +730,7 @@ def _transport_key(
             block=block,
             skip_self=skip_self,
         )
-    return _key(tp, **kw)
+    return registry.key(tp, **kw)
 
 
 # ---------------------------------------------------------------------------
@@ -1049,13 +898,13 @@ def _run_rank_fused(
                     "tokens": tokens,
                     "hidden": hidden,
                     "variant": eng.variant(hidden, int(inp.numel()) * 2),
-                    "out_sqnr_db": _sqnr_db(
+                    "out_sqnr_db": sqnr_db(
                         out.to(torch.float32), out_ref.to(torch.float32)
                     ),
-                    "res_sqnr_db": _sqnr_db(
+                    "res_sqnr_db": sqnr_db(
                         res_out.to(torch.float32), res_ref.to(torch.float32)
                     ),
-                    "self_sqnr_db": _sqnr_db(
+                    "self_sqnr_db": sqnr_db(
                         out.to(torch.float32), out_self.to(torch.float32)
                     ),
                     "res_exact": bool(torch.equal(res_out, res_ref)),
@@ -1091,39 +940,20 @@ def _spawn_fused(
     n_gpu = torch.cuda.device_count()
     if n_gpu < world_size:
         pytest.skip(f"FlyQuickAllReduceRMSNorm needs {world_size} GPUs, have {n_gpu}")
-    init_method = get_distributed_init_method(get_ip(), get_open_port())
-    timeout = float(os.environ.get("FLYDSL_QR_TIMEOUT", "3600"))
-    pool = Pool(processes=world_size)
-    try:
-        futs = [
-            pool.apply_async(
-                _run_rank_fused,
-                kwds={
-                    "rank": rank,
-                    "tp": world_size,
-                    "init_method": init_method,
-                    "cases": cases,
-                    "algorithm": algorithm,
-                    "codecs": codecs,
-                    "solo": solo,
-                    "engine_kw": engine_kw,
-                },
-            )
-            for rank in range(world_size)
-        ]
-        # A fused build is a persistent kernel whose blocks wait on the same
-        # block id at every peer, so a co-residency bug hangs rather than
-        # returning a wrong number. The timeout is what turns that into a
-        # failed test instead of a wedged run.
-        ranks = [f.get(timeout=timeout) for f in futs]
-    except Exception:
-        pool.terminate()
-        raise
-    else:
-        pool.close()
-    finally:
-        pool.join()
-    return ranks
+    # A fused build is a persistent kernel whose blocks wait on the same block
+    # id at every peer, so a co-residency bug hangs rather than returning a
+    # wrong number. The timeout is what turns that into a failed test instead
+    # of a wedged run.
+    return run_on_ranks(
+        world_size,
+        _run_rank_fused,
+        timeout=float(os.environ.get("FLYDSL_QR_TIMEOUT", "3600")),
+        cases=cases,
+        algorithm=algorithm,
+        codecs=codecs,
+        solo=solo,
+        engine_kw=engine_kw,
+    )
 
 
 _FUSED_BATCH_CACHE: dict[tuple, dict[tuple[int, int], list[dict]]] = {}
@@ -1580,7 +1410,7 @@ def test_quick_allreduce(
     skip_self=None,
 ):
     """Shipping configuration: no codec or super-tile pinned."""
-    rows = _result(
+    rows = registry.result(
         _ship_key(tp, algorithm, grid_cap, block, skip_self),
         (tokens, hidden, "normal", graph, True),
     )
@@ -1611,13 +1441,15 @@ def test_quick_allreduce(
 @benchmark()
 def test_quick_allreduce_edge_inputs(tokens, hidden, tp, algorithm, fill):
     """Edge-case payloads on the shipping engine; correctness only."""
-    rows = _result(_ship_key(tp, algorithm, None), (tokens, hidden, fill, False, False))
+    rows = registry.result(
+        _ship_key(tp, algorithm, None), (tokens, hidden, fill, False, False)
+    )
     label = f"tp={tp} {algorithm} {tokens}x{hidden} fill={fill}"
     if fill == "degenerate":
         # A group whose extremum is zero decodes to a zero scale, so the encode
         # reciprocal saturates; before it was clamped, that reached the codec
         # as Inf and 0 * Inf poisoned the tile. Only finiteness is asserted.
-        _check(
+        failures.check(
             label,
             [
                 f"rank {rank}: rel MAE {row['rel_mae']}"
@@ -1641,8 +1473,8 @@ def test_quick_allreduce_edge_inputs(tokens, hidden, tp, algorithm, fill):
 @benchmark()
 def test_quick_allreduce_pinned_codec(tokens, hidden, tp, rs_codec, ag_codec):
     """The ring with both laps' wire formats pinned; correctness only."""
-    key = _key(tp, algorithm="ring", rs_codec=rs_codec, ag_codec=ag_codec)
-    rows = _result(key, (tokens, hidden, "normal", False, False))
+    key = registry.key(tp, algorithm="ring", rs_codec=rs_codec, ag_codec=ag_codec)
+    rows = registry.result(key, (tokens, hidden, "normal", False, False))
     label = f"tp={tp} ring {tokens}x{hidden} rs={rs_codec} ag={ag_codec}"
     _check_sqnr(
         label,
@@ -1651,7 +1483,7 @@ def test_quick_allreduce_pinned_codec(tokens, hidden, tp, rs_codec, ag_codec):
         expected_st=_shipping_st(rows, tokens * hidden * 2, "ring", tp),
         algorithm="ring",
     )
-    _check(
+    failures.check(
         label,
         [
             f"rank {rank}: resolved codecs {row['rs_codec']}/{row['ag_codec']}"
@@ -1673,11 +1505,11 @@ def test_quick_allreduce_transport(
     super_tile None the engine walks its ladder, and the ``*_used`` columns
     name the geometry that ran; pinned, there is no selection to check.
     """
-    rows = _result(
+    rows = registry.result(
         _transport_key(tp, algorithm, super_tile, block, skip_self),
         (tokens, hidden, "exact", False, False),
     )
-    _check(
+    failures.check(
         f"tp={tp} {algorithm} {tokens}x{hidden} st={super_tile} block={block} "
         f"skip_self={skip_self} fp16-exact",
         [
@@ -1708,7 +1540,7 @@ def test_quick_allreduce_coverage(tp, algorithm, window):
     silently leaving a kernel untested.
     """
     key = _ship_key(tp, algorithm, None)
-    by_case = {c: _result(key, c) for c in _CASES[key]}
+    by_case = {c: registry.result(key, c) for c in registry.cases[key]}
     production = set(next(iter(by_case.values()))[0]["production_cfgs"])
     ran = {
         (rows[0]["st_used"], rows[0]["block_used"], rows[0]["skip_self_used"])
@@ -1716,7 +1548,7 @@ def test_quick_allreduce_coverage(tp, algorithm, window):
         if case[2] == "normal"
     }
     missing = sorted(production - ran)
-    _check(
+    failures.check(
         f"tp={tp} {algorithm} coverage of {window}",
         [f"production kernels never run: {missing}"] if missing else [],
     )
@@ -1725,15 +1557,6 @@ def test_quick_allreduce_coverage(tp, algorithm, window):
         "production_kernels": sorted(production),
         "missing": missing,
     }
-
-
-def _summarize(name: str, rows: list[dict]) -> None:
-    if rows:
-        aiter.logger.info(
-            "%s summary (markdown):\n%s",
-            name,
-            pd.DataFrame(rows).to_markdown(index=False),
-        )
 
 
 def main():
@@ -1888,9 +1711,9 @@ def main():
                 (tokens, hidden, tp, algorithm, args.grid_cap[0], True, None, None)
             )
             if shipping_engine:
-                _WINDOWS[_ship_key(tp, algorithm, None)] = window
+                registry.windows[_ship_key(tp, algorithm, None)] = window
                 lo, hi = window
-                label = f"({_fmt_bytes(lo - 1)}, {_fmt_bytes(hi)}]"
+                label = f"({fmt_bytes(lo - 1, inf_at=fly_policy.NO_MAX)}, {fmt_bytes(hi, inf_at=fly_policy.NO_MAX)}]"
                 coverage.append((tp, algorithm, label))
     # Knob rows only in a default run: pinning --block or --skip-self already
     # sweeps them over the shipping shapes.
@@ -1905,19 +1728,21 @@ def main():
         ]
     if dts:
         for tokens, hidden, tp, algorithm, grid_cap, graph, block, ss in ship + knobs:
-            _register(
+            registry.register(
                 _ship_key(tp, algorithm, grid_cap, block, ss),
                 (tokens, hidden, "normal", graph, True),
             )
     edge = [c for c in EDGE_CASES if c[0] in tps and c[1] in algos]
     for tp, algorithm, tokens, hidden, fill in edge:
-        _register(_ship_key(tp, algorithm, None), (tokens, hidden, fill, False, False))
+        registry.register(
+            _ship_key(tp, algorithm, None), (tokens, hidden, fill, False, False)
+        )
     pinned = []
     if args.extended:
         pinned = [c for c in PINNED_CODEC_CASES if c[0] in tps and "ring" in algos]
     for tp, tokens, hidden, rs, ag in pinned:
-        _register(
-            _key(tp, algorithm="ring", rs_codec=rs, ag_codec=ag),
+        registry.register(
+            registry.key(tp, algorithm="ring", rs_codec=rs, ag_codec=ag),
             (tokens, hidden, "normal", False, False),
         )
     # The fp16 wire through each production schedule's own ladder, on the
@@ -1931,7 +1756,7 @@ def main():
     if args.extended:
         transport += [c for c in TRANSPORT_CASES if c[0] in tps and c[1] in algos]
     for tp, algorithm, tokens, hidden, st, block, ss in transport:
-        _register(
+        registry.register(
             _transport_key(tp, algorithm, st, block, ss),
             (tokens, hidden, "exact", False, False),
         )
@@ -1954,15 +1779,15 @@ def main():
 
     for dtype in dts:
         rows = _int4_rows(ship)
-        _summarize("flydsl quick allreduce INT4", rows)
-        _summarize(
+        summarize("flydsl quick allreduce INT4", rows)
+        summarize(
             "flydsl quick allreduce INT4 production kernel coverage",
             [
                 test_quick_allreduce_coverage(tp, algorithm, window)
                 for tp, algorithm, window in coverage
             ],
         )
-        _summarize("flydsl quick allreduce INT4 block/skip_self", _int4_rows(knobs))
+        summarize("flydsl quick allreduce INT4 block/skip_self", _int4_rows(knobs))
         if args.out and rows:
             os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
             with open(args.out, "w") as fh:
@@ -1976,21 +1801,21 @@ def main():
                     default=str,
                 )
             aiter.logger.info("wrote %s", args.out)
-    _summarize(
+    summarize(
         "flydsl quick allreduce INT4 edge inputs",
         [
             test_quick_allreduce_edge_inputs(tokens, hidden, tp, algorithm, fill)
             for tp, algorithm, tokens, hidden, fill in edge
         ],
     )
-    _summarize(
+    summarize(
         "flydsl quick allreduce INT4 pinned codec",
         [
             test_quick_allreduce_pinned_codec(tokens, hidden, tp, rs, ag)
             for tp, tokens, hidden, rs, ag in pinned
         ],
     )
-    _summarize(
+    summarize(
         "flydsl quick allreduce transport (fp16 wire, bit-exact)",
         [
             test_quick_allreduce_transport(tokens, hidden, tp, algorithm, st, block, ss)
@@ -1998,11 +1823,7 @@ def main():
         ],
     )
 
-    if _FAILURES:
-        raise SystemExit(
-            f"{len(_FAILURES)} FlyQuickAllReduce check(s) failed:\n  "
-            + "\n  ".join(_FAILURES)
-        )
+    failures.raise_if_failed("FlyQuickAllReduce")
 
 
 if __name__ == "__main__":

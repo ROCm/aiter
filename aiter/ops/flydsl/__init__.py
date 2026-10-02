@@ -37,6 +37,7 @@ _LAZY_IMPORTS = {
     ),
     "OneShotAllReduce": (".one_shot_allreduce", "OneShotAllReduce"),
     "FlyQuickAllReduce": (".quick_allreduce", "FlyQuickAllReduce"),
+    "FlyQuickAllToAll": (".quick_alltoall", "FlyQuickAllToAll"),
     "compute_varqlen_windows": (
         ".kernels.mqa_logits.pa_mqa_logits_fp4_prefill",
         "compute_varqlen_windows",

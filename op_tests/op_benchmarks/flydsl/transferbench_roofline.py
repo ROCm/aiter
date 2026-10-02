@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""TransferBench-backed bandwidth roofline for ``bench_comm_allreduce.py``.
+"""TransferBench-backed bandwidth roofline for ``bench_comm.py --operation ar``.
 
-``bench_comm_allreduce.py`` compares aiter's all-reduce candidates against each
+``bench_comm_ar.py`` compares aiter's all-reduce candidates against each
 other and against RCCL. Both of those are *floors*: they tell you whether a
 kernel beats another kernel, not how much of the fabric any of them is
 actually using. This module supplies the ceiling, by asking TransferBench
@@ -107,7 +107,7 @@ from pathlib import Path
 
 logger = logging.getLogger("aiter")
 
-# Wire bytes per payload byte, per bench_comm_allreduce.py candidate key. This
+# Wire bytes per payload byte, per bench_comm_ar.py candidate key. This
 # is what the candidate actually puts on the fabric relative to its (bf16/fp16)
 # input, and it is the only thing that distinguishes one candidate's roofline
 # from another's -- the pattern and the CU count are shared.
@@ -131,7 +131,7 @@ WIRE_RATIO = {
     # tuning suffix, and here `_st8`/`_st32` sits in the middle with `_int6`
     # after it. The mean of a 6-bit reduce-scatter lap and a 4-bit all-gather
     # lap, since a ring moves the same bytes on each -- see the `rs_codec`
-    # comment on these rows in bench_comm_allreduce.py.
+    # comment on these rows in bench_comm_ar.py.
     "fly_int4_ring_st8_int6": 5.0 / 16.0,
     "fly_int4_ring_st32_int6": 5.0 / 16.0,
     # Exact, bf16 on the wire -- no codec, so the payload dtype is the wire
@@ -289,7 +289,7 @@ def base_key(cand_key: str) -> str:
     trip through its own inbox, neither of which is a wire format.
 
     Resolving by prefix matters because the lookup below falls back to a
-    *silent* default of 1.0. A variant added in ``bench_comm_allreduce.py`` and
+    *silent* default of 1.0. A variant added in ``bench_comm_ar.py`` and
     forgotten here is then graded against a 4x-too-large roof and quietly
     reports several times its real efficiency`.
     """
@@ -507,7 +507,7 @@ class TestResult:
     def slowest_exec_ms(self) -> float:
         """The executor the collective would actually wait on.
 
-        Matches bench_comm_allreduce.py's ``max(per_rank)``, and unlike
+        Matches bench_comm_ar.py's ``max(per_rank)``, and unlike
         ``total_ms`` it excludes the host-side barrier and launch overhead that
         the benchmark's own hipEvent bracket does not contain either.
 

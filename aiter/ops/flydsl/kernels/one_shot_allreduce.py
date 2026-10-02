@@ -33,6 +33,31 @@ from flydsl.expr.typing import (
     T,
 )
 
+# The peer-store/load primitives, the cache-policy table and the inbox-memory
+# taxonomy are shared with the quantized kernels verbatim.
+from .collectives_shared import (
+    _INBOX_POLICY,
+    RECV_BYPASS,
+    SUPPORTED_WORLDS,
+    WAVE,
+    _buffer_load,
+    _buffer_ptr,
+    _color_io,
+    _global_ptr,
+    _i32_to_bytes,
+    _load_peers,
+    _payload_io,
+    _to_sgpr_i64,
+    atom_bf16_to_f32,
+    atom_f32_to_bf16,
+    fanout_registers,
+    make_payload_tensor,
+    next_color,
+    parity_slot_i32,
+    publish_flags_unrolled,
+    wait_flags,
+)
+
 # The fused epilogue and the row-to-workgroup geometry are shared with the
 # quantized schedules.
 from .quick_allreduce_fusions import (
@@ -57,34 +82,6 @@ from .quick_allreduce_fusions import (
     xchg_clamp_units,
     xchg_contribution,
     xchg_total,
-)
-
-# The peer-store/load primitives, the cache-policy table and the inbox-memory
-# taxonomy are shared with the quantized kernels verbatim.
-from .quick_allreduce_shared import (
-    _CM_SC0,
-    _CM_SC1,
-    _INBOX_POLICY,
-    FLAG_I32_PER_LANE,
-    FLAG_LANES,
-    SUPPORTED_WORLDS,
-    WAVE,
-    _acquire_inbox,
-    _buffer_load,
-    _buffer_ptr,
-    _color_io,
-    _global_ptr,
-    _i32_to_bytes,
-    _load_flag,
-    _load_peers,
-    _payload_io,
-    _release_inbox,
-    _store_flag_peer,
-    _store_v4i32_peer,
-    _to_sgpr_i64,
-    atom_bf16_to_f32,
-    atom_f32_to_bf16,
-    make_payload_tensor,
 )
 
 DEFAULT_BLOCK = 256
@@ -289,7 +286,7 @@ PARITIES = 2
 # colour -- one 8 B store from each of ``FLAG_LANES`` lanes.
 FLAG_I32 = 16
 # Read our own inbox with the caches bypassed (avoids reading stale values).
-_RECV_POLICY = _CM_SC0 | _CM_SC1
+_RECV_POLICY = RECV_BYPASS
 
 # Which axis of the (peer, atom) fanout runs fastest across consecutive stores.
 #
@@ -601,17 +598,14 @@ def make_one_shot_allreduce_kernel(
             part = bid % fx.Int32(split)
 
         def _slot_i32(parity, src):
-            """i32 offset of the wire slot ``[parity][bid][src]``.
-
-            Plain arithmetic rather than ``crd2idx`` on a 3-D layout: at
-            ``grid == 1`` the middle mode is unit and gets coalesced away,
-            after which a three-coordinate lookup silently returns a wrong
-            (negative) index. The ring kernel hit exactly this.
-            """
-            return (
-                parity * fx.Int32(grid * world_size * wire_tile_i32)
-                + bid * fx.Int32(world_size * wire_tile_i32)
-                + src * fx.Int32(wire_tile_i32)
+            """i32 offset of the wire slot ``[parity][bid][src]``."""
+            return parity_slot_i32(
+                parity,
+                bid,
+                src,
+                grid=grid,
+                n_src=world_size,
+                wire_tile_i32=wire_tile_i32,
             )
 
         def _hbm_atom_row(buf, tile, atom):
@@ -659,59 +653,46 @@ def make_one_shot_allreduce_kernel(
             dropping it removes 1/N of the stores, 1/N of the reduce's loads and
             1/N of the flags, at the cost of one kernel binary per rank.
             """
-            for peer, atom in fanout_pairs:
-                _store_v4i32_peer(
-                    peer_vec[peer]
-                    + _i32_to_bytes(
-                        _slot_i32(parity, rank)
-                        + fx.Int32(atom * block * ATOM_I32)
-                        + tid * fx.Int32(ATOM_I32)
-                    ),
-                    my_atoms[atom],
-                    payload_policy,
-                )
+            fanout_registers(
+                [
+                    (
+                        peer_vec[peer]
+                        + _i32_to_bytes(
+                            _slot_i32(parity, rank)
+                            + fx.Int32(atom * block * ATOM_I32)
+                            + tid * fx.Int32(ATOM_I32)
+                        ),
+                        my_atoms[atom],
+                    )
+                    for peer, atom in fanout_pairs
+                ],
+                payload_policy,
+            )
 
         def _publish(parity, color):
             """Drain the payload stores, then write *color* into every peer.
 
-            ``vmcnt(0)`` retires this wave's stores; the barrier joins the other
-            waves, whose ``vmcnt`` is separate. On a cacheable inbox retiring is
-            not enough -- the lines can sit in this XCD's L2 -- so the release
-            fence writes them back and waits for that before the flag goes out.
-            Every workgroup issues its own writeback: L2 is per-XCD.
+            The destinations are unrolled at trace time. An earlier version
+            keyed the peer off the lane (``peer = tid // 4``, 4 lanes per
+            destination), which made ``peer_vec[peer]`` a *lane-varying* extract
+            from a 4xi64 vector. That lowers to a scratch round-trip, and at
+            ``atoms>1`` the register pressure made it land in the payload: 8 B
+            of peer pointer at 16 B stride over a 64 B span, once per 256 B, in
+            atom 0 of the highest-numbered rank's inbox. See the
+            ``SUPPORTED_ATOMS`` note. ``_fanout`` always unrolled; this is now
+            consistent with it.
             """
-            rocdl.s_waitcnt(vmcnt=0)
-            gpu.barrier()
-            if const_expr(release_scope is not None):
-                _release_inbox(release_scope)
-            # FLAG_LANES lanes, 8 B each -> the 64 B sector, unrolled over the
-            # destinations. The peer index must be a trace-time constant: an
-            # earlier version keyed it off the lane (``peer = tid // 4``, 4 lanes
-            # per destination), which made ``peer_vec[peer]`` a *lane-varying*
-            # extract from a 4xi64 vector. That lowers to a scratch round-trip,
-            # and at ``atoms>1`` the register pressure made it land in the
-            # payload: 8 B of peer pointer at 16 B stride over a 64 B span, once
-            # per 256 B, in atom 0 of the highest-numbered rank's inbox. See the
-            # ``SUPPORTED_ATOMS`` note. ``_fanout`` always unrolled; this is now
-            # consistent with it.
-            if tid < fx.Int32(FLAG_LANES):
-                elem = (
-                    _slot_i32(parity, rank)
-                    + fx.Int32(tile_i32)
-                    + tid * fx.Int32(FLAG_I32_PER_LANE)
-                )
-                for peer in push_peers:
-                    _store_flag_peer(
-                        peer_vec[peer] + _i32_to_bytes(elem), color, flag_policy
-                    )
+            publish_flags_unrolled(
+                tid=tid,
+                dest_bases=[peer_vec[peer] for peer in push_peers],
+                flag_i32=_slot_i32(parity, rank) + fx.Int32(tile_i32),
+                color=color,
+                flag_policy=flag_policy,
+                release_scope=release_scope,
+            )
 
         def _wait(parity, color):
             """Spin until every rank's flag in our own inbox shows *color*.
-
-            One spinner per source. The fences after the join are placed there,
-            not inside the spin, on purpose: if the flag is already present the
-            loop body never runs, and a fence placed only inside it would be
-            skipped in the common case.
 
             The fences depend on the inbox type (``_INBOX_POLICY``). A cacheable
             inbox gets a writeback then a system-scope acquire, i.e., an L1+L2
@@ -722,36 +703,23 @@ def make_one_shot_allreduce_kernel(
             (``_RECV_POLICY``). It gets a workgroup-scope acquire, which only
             keeps the payload loads below the spin.
             """
-            # Lane ``t`` watches one source. Without ``skip_self`` that is
-            # source ``t``; with it our own flag is never published, so the
-            # N-1 lanes step over our own index and the last lane sits out.
-            # Computed before the guard rather than nested inside it, so the
-            # remap is a flat ``scf.if`` yielding one value.
-            spin_src = tid
-            if const_expr(skip_self):  # noqa: SIM102
-                if tid >= fx.Int32(self_rank):
-                    spin_src = tid + fx.Int32(1)
-            if tid < fx.Int32(len(push_peers)):
-                flag = peer_vec[rank] + _i32_to_bytes(
-                    _slot_i32(parity, spin_src) + fx.Int32(tile_i32)
+
+            def _flag(src):
+                return peer_vec[rank] + _i32_to_bytes(
+                    _slot_i32(parity, src) + fx.Int32(tile_i32)
                 )
-                # `sc0 sc1`, so each retry is fetched past L1 and L2 and no
-                # fence is needed in the loop; the fences below order the
-                # payload reads after it, once, after the join.
-                current = _load_flag(flag)
-                while current != color:
-                    if const_expr(spin_sleep):
-                        # Back off between polls. Each iteration is a load that
-                        # bypasses both caches, and under arrival skew that runs
-                        # for the whole skew window against the same line the
-                        # peer is trying to write.
-                        rocdl.s_sleep(spin_sleep)
-                    current = _load_flag(flag)
-            gpu.barrier()
-            rocdl.s_waitcnt(vmcnt=0)
-            if const_expr(release_scope is not None):
-                _release_inbox(release_scope)
-            _acquire_inbox(acquire_scope)
+
+            wait_flags(
+                tid=tid,
+                n_src=len(push_peers),
+                skip_rank=self_rank,
+                flag_addr=_flag,
+                color=color,
+                acquire_scope=acquire_scope,
+                writeback_scope=release_scope,
+                drain=True,
+                spin_sleep=spin_sleep,
+            )
 
         def _reduce_f32(parity, my_atoms):
             """Sum this thread's atom across all N contributions, in rank order.
@@ -875,7 +843,9 @@ def make_one_shot_allreduce_kernel(
                 rstd = rstd_from_total(total, eps, hidden)
             else:
                 # One block covers one row, so there is a single row to reduce.
-                rstd = rms_rstd([accs], eps, hidden, tid=tid, block=block, lds=sq_lds)[0]
+                rstd = rms_rstd([accs], eps, hidden, tid=tid, block=block, lds=sq_lds)[
+                    0
+                ]
             _store_tile(tile, scale_by_weight(accs, rstd, w_atoms))
             return done
 
@@ -913,12 +883,15 @@ def make_one_shot_allreduce_kernel(
                 + fx.Int64(bid) * fx.Int64(PARITIES * 8)
             )
             prev_same = fx.generic_load(
-                _global_ptr(prev_base + fx.Int64(color & fx.Int32(1)) * fx.Int64(8), T.i64, 8),
+                _global_ptr(
+                    prev_base + fx.Int64(color & fx.Int32(1)) * fx.Int64(8), T.i64, 8
+                ),
                 dtype=fx.Int64,
             )
             prev_other = fx.generic_load(
                 _global_ptr(
-                    prev_base + fx.Int64((color + fx.Int32(1)) & fx.Int32(1)) * fx.Int64(8),
+                    prev_base
+                    + fx.Int64((color + fx.Int32(1)) & fx.Int32(1)) * fx.Int64(8),
                     T.i64,
                     8,
                 ),
@@ -946,14 +919,9 @@ def make_one_shot_allreduce_kernel(
                     prev_other = done
             else:
                 _store_tile(tile, _reduce(parity, my_atoms))
-            color = color + fx.Int32(1)
-            # 0 is the unset sentinel. The
-            # inbox slot is `color & 1`, and the colour before the wrap is -1,
-            # which is odd: resuming at 1 would put two consecutive tiles in
-            # the same slot, and a rank one tile ahead would overwrite data a
-            # peer is still reading.
-            if color == fx.Int32(0):
-                color = fx.Int32(2)
+            # The inbox slot is `color & 1`, so the wrap must keep parities
+            # alternating; see ``next_color``.
+            color = next_color(color, parity_safe=True)
         if tid == 0:
             _store_color(color)
             if const_expr(split > 1):
@@ -962,12 +930,17 @@ def make_one_shot_allreduce_kernel(
                 # parities alternating, so ``color``'s parity is still
                 # ``prev_same``'s.
                 fx.generic_store(
-                    _global_ptr(prev_base + fx.Int64(color & fx.Int32(1)) * fx.Int64(8), T.i64, 8),
+                    _global_ptr(
+                        prev_base + fx.Int64(color & fx.Int32(1)) * fx.Int64(8),
+                        T.i64,
+                        8,
+                    ),
                     prev_same,
                 )
                 fx.generic_store(
                     _global_ptr(
-                        prev_base + fx.Int64((color + fx.Int32(1)) & fx.Int32(1)) * fx.Int64(8),
+                        prev_base
+                        + fx.Int64((color + fx.Int32(1)) & fx.Int32(1)) * fx.Int64(8),
                         T.i64,
                         8,
                     ),

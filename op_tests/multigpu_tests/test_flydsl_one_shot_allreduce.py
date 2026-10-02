@@ -64,24 +64,27 @@ import subprocess
 import sys
 import tempfile
 import time
-from multiprocessing import Pool, freeze_support, set_start_method
+from multiprocessing import freeze_support
 
-_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
-
-import pandas as pd
 import torch
+from flydsl_comm_test_utils import (
+    _REPO_ROOT,
+    ARCH,
+    SPAWN_TIMEOUT_S,
+    SUPPORTED_ARCHS,
+    FailureLog,
+    SpawnRegistry,
+    lanes_differing,
+    sqnr_db,
+    summarize,
+    worst,
+)
 
 import aiter
 from aiter import dtypes
 from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
-from aiter.jit.utils.chip_info import get_gfx_runtime
-from aiter.test_common import benchmark, checkAllclose, run_perftest
-
-set_start_method("spawn", force=True)
-
 from aiter.ops.flydsl import allreduce_policy as fly_policy
+from aiter.ops.flydsl.kernels.collectives_shared import SUPPORTED_WORLDS
 from aiter.ops.flydsl.kernels.one_shot_allreduce import (
     DEFAULT_ATOMS,
     DEFAULT_FANOUT,
@@ -89,13 +92,7 @@ from aiter.ops.flydsl.kernels.one_shot_allreduce import (
     SUPPORTED_BLOCKS,
     oneshot_ladder,
 )
-from aiter.ops.flydsl.kernels.quick_allreduce_shared import SUPPORTED_WORLDS
-
-try:
-    ARCH = get_gfx_runtime()
-except (KeyError, RuntimeError):
-    ARCH = None
-SUPPORTED_ARCHS = ("gfx942", "gfx950")
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 HIDDEN = 7168
 
@@ -153,11 +150,6 @@ RUN_AHEAD_M = 5
 RUN_AHEAD_ITERS = 200
 SQNR_FLOOR_DB = 45.0
 
-# Seconds to wait for each rank of a spawn. The kernels spin on flags written
-# by peers, so a protocol bug or a dead rank hangs the rest; this fails the
-# spawn instead of leaving it to CI's per-file timeout. A full default run of
-# either FlyDSL all-reduce test takes a few minutes, JIT included.
-SPAWN_TIMEOUT_S = 600
 
 # Fused (all-reduce + residual add + RMSNorm) coverage. The tile is one token
 # row there, so `hidden` is baked into the kernel and every distinct width is a
@@ -187,9 +179,7 @@ _FUSED_SHAPE_CASES = tuple(
 # reads live data and a leaked store corrupts a neighbour.
 FUSED_PAD_HIDDENS = (896, 2304, 2880)
 _FUSED_PAD_SHAPE_CASES = tuple(
-    (m, hidden, f"{m}x{hidden}pad")
-    for hidden in FUSED_PAD_HIDDENS
-    for m in (1, 5, 32)
+    (m, hidden, f"{m}x{hidden}pad") for hidden in FUSED_PAD_HIDDENS for m in (1, 5, 32)
 )
 
 # `atoms` sets the *block width* in a fused build (BLOCK = hidden/(8*atoms)),
@@ -256,16 +246,6 @@ def _production_payloads(tp: int, link: str) -> tuple[list[int], tuple[int, int]
     return sorted(payloads), (lo, hi)
 
 
-def _sqnr_db(ref: torch.Tensor, got: torch.Tensor) -> float:
-    ref = ref.double()
-    err = ref - got.double()
-    p = (ref * ref).mean().item()
-    e = (err * err).mean().item()
-    if e == 0:
-        return float("inf")
-    return 10.0 * torch.log10(torch.tensor(p / e)).item()
-
-
 def _parts(m: int, hidden: int, tp: int, seed: int, device) -> list[torch.Tensor]:
     """Every rank's contribution, generated identically on every rank.
 
@@ -281,29 +261,13 @@ def _parts(m: int, hidden: int, tp: int, seed: int, device) -> list[torch.Tensor
 
 def _metrics(out, ref, tp: int) -> dict:
     """Accuracy against fp32, then bit-identity across ranks."""
-    import torch.distributed as dist
-
-    # Widened to int32 because gloo rejects int16 ("Invalid scalar type"); the
-    # widening is exact, so the comparison is still on bits.
-    bits = out.view(torch.int16).to(torch.int32).cpu()
-    gathered = [torch.empty_like(bits) for _ in range(tp)]
-    dist.all_gather(gathered, bits)
-    lanes_differing = max(int((g != gathered[0]).sum()) for g in gathered)
     err = checkAllclose(
         ref, out.float(), printLog=False, msg="one_shot_allreduce vs fp32"
     )
     return {
-        "sqnr_db": _sqnr_db(ref, out),
-        "lanes_differing": lanes_differing,
+        "sqnr_db": sqnr_db(out, ref),
+        "lanes_differing": lanes_differing(out),
         "err": float(err),
-    }
-
-
-def _worst(a: dict, b: dict) -> dict:
-    return {
-        "sqnr_db": min(a["sqnr_db"], b["sqnr_db"]),
-        "lanes_differing": max(a["lanes_differing"], b["lanes_differing"]),
-        "err": max(a["err"], b["err"]),
     }
 
 
@@ -476,7 +440,9 @@ def _fused_spawn(
         )
         logs.append(log)
     rc = 0
-    deadline = time.time() + float(os.environ.get("FLYDSL_QR_TIMEOUT", str(SPAWN_TIMEOUT_S)))
+    deadline = time.time() + float(
+        os.environ.get("FLYDSL_QR_TIMEOUT", str(SPAWN_TIMEOUT_S))
+    )
     for proc in procs:
         try:
             rc |= proc.wait(timeout=max(1.0, deadline - time.time()))
@@ -494,9 +460,7 @@ def _fused_spawn(
                     tails.append(f"===== rank {rank} =====\n{fh.read()[-4000:]}")
             except OSError:
                 pass
-        raise RuntimeError(
-            "OneShotAllReduceRMSNorm ranks failed\n" + "\n".join(tails)
-        )
+        raise RuntimeError("OneShotAllReduceRMSNorm ranks failed\n" + "\n".join(tails))
     with open(out_path) as fh:
         payload = json.load(fh)
     ranks = payload["ranks"]
@@ -585,7 +549,7 @@ def _run_rank_fused(args, rank, device, dist) -> None:
 
         out_ref, res_ref = _fused_reference(parts, residual, weight, RMS_EPS)
 
-        db = _sqnr_db(out_ref.float(), out.float())
+        db = sqnr_db(out, out_ref)
         if db < SQNR_FLOOR_DB:
             bad.append(
                 f"{tag}: out SQNR {db:.2f} dB below the {SQNR_FLOOR_DB} dB floor"
@@ -631,14 +595,12 @@ def _run_rank_fused(args, rank, device, dist) -> None:
             if it % 25 == 0:
                 torch.cuda.synchronize()
                 checks += 1
-                if _sqnr_db(
-                    out_ref.float(), out.float()
-                ) < SQNR_FLOOR_DB or not torch.equal(
+                if sqnr_db(out, out_ref) < SQNR_FLOOR_DB or not torch.equal(
                     res_out.view(torch.int16), res_ref.view(torch.int16)
                 ):
                     bad += 1
         torch.cuda.synchronize()
-        if bad or _sqnr_db(out_ref.float(), out.float()) < SQNR_FLOOR_DB:
+        if bad or sqnr_db(out, out_ref) < SQNR_FLOOR_DB:
             failures.append(f"{args.mode} loop: {bad} bad checks of {checks}")
     else:
         for m, hidden in zip(args.tokens, args.hiddens, strict=True):
@@ -758,7 +720,7 @@ def _run_rank(
                     out.zero_()
                     g.replay()
                     torch.cuda.synchronize()
-                    res = _worst(res, _metrics(out, ref, tp))
+                    res = worst(res, _metrics(out, ref, tp))
                 fn = g.replay
             else:
 
@@ -797,10 +759,10 @@ def _run_rank(
             if it % 25 == 0:
                 torch.cuda.synchronize()
                 checks += 1
-                bad += _sqnr_db(ref, out) < SQNR_FLOOR_DB
+                bad += sqnr_db(out, ref) < SQNR_FLOOR_DB
         torch.cuda.synchronize()
         checks += 1
-        bad += _sqnr_db(ref, out) < SQNR_FLOOR_DB
+        bad += sqnr_db(out, ref) < SQNR_FLOOR_DB
         run_ahead = {"checks": checks, "bad_checks": bad}
     finally:
         dist.barrier()
@@ -809,56 +771,14 @@ def _run_rank(
     return {"rows": rows, "run_ahead": run_ahead, "production_cfgs": production_cfgs}
 
 
-def _spawn_pool(
-    world_size: int,
-    engine_kw: dict,
-    cases: list[tuple],
-    window: tuple[int, int] | None = None,
-) -> list[dict]:
-    """Pool-based spawn for plain ``OneShotAllReduce`` tests.
-
-    Returns a list of dicts (one per rank) each with ``rows``, ``run_ahead``
-    and ``production_cfgs`` keys.
-    """
-    if world_size not in SUPPORTED_WORLDS:
-        raise ValueError(f"unsupported world_size={world_size}")
-    init_method = get_distributed_init_method(get_ip(), get_open_port())
-    pool = Pool(processes=world_size)
-    try:
-        results = [
-            pool.apply_async(
-                _run_rank,
-                kwds={
-                    "rank": rank,
-                    "tp": world_size,
-                    "init_method": init_method,
-                    "engine_kw": engine_kw,
-                    "cases": cases,
-                    "window": window,
-                },
-            )
-            for rank in range(world_size)
-        ]
-        ranks = [fut.get(timeout=SPAWN_TIMEOUT_S) for fut in results]
-    except Exception:
-        pool.terminate()
-        raise
-    else:
-        pool.close()
-    finally:
-        pool.join()
-    return ranks
-
-
 # Rows are registered up front, grouped by engine, so each engine is built by
 # exactly one spawn. A spawn key is ``(tp, sorted engine kwargs)``; a case is
-# ``(tokens, hidden, graph)``.
-_CASES: dict[tuple, list[tuple]] = {}
-# Production dispatch window of an unpinned engine whose rung coverage is
-# checked, per spawn key.
-_WINDOWS: dict[tuple, tuple[int, int]] = {}
-_RESULTS: dict[tuple, list[dict]] = {}
-_FAILURES: list[str] = []
+# ``(tokens, hidden, graph)``; ``registry.windows`` holds the production
+# dispatch window of an unpinned engine whose rung coverage is checked. The
+# worker returns one dict per rank with ``rows``, ``run_ahead`` and
+# ``production_cfgs``.
+registry = SpawnRegistry(_run_rank)
+failure_log = FailureLog()
 
 # Tuning knobs the command line can pin. They are test-function arguments, so
 # they select the engine, but not table columns: the ``variant`` column names
@@ -876,23 +796,6 @@ def _engine_kw(atoms, grid_cap, fanout, block, skip_self) -> dict:
         "skip_self": skip_self,
     }
     return {k: v for k, v in kw.items() if v is not None}
-
-
-def _key(tp: int, engine_kw: dict) -> tuple:
-    return (tp, tuple(sorted(engine_kw.items())))
-
-
-def _ranks(key: tuple) -> list[dict]:
-    if key not in _RESULTS:
-        _RESULTS[key] = _spawn_pool(key[0], dict(key[1]), _CASES[key], _WINDOWS.get(key))
-    return _RESULTS[key]
-
-
-def _check(label: str, fails: list[str]) -> None:
-    if fails:
-        msg = f"{label}: " + "; ".join(fails)
-        aiter.logger.error(msg)
-        _FAILURES.append(msg)
 
 
 # ---------------------------------------------------------------------------
@@ -914,9 +817,9 @@ def test_one_shot_allreduce(
     skip_self=None,
 ):
     engine_kw = _engine_kw(atoms, grid_cap, fanout, block, skip_self)
-    key = _key(tp, engine_kw)
-    i = _CASES[key].index((tokens, hidden, graph))
-    rows = [r["rows"][i] for r in _ranks(key)]
+    key = registry.key(tp, **engine_kw)
+    i = registry.cases[key].index((tokens, hidden, graph))
+    rows = [r["rows"][i] for r in registry.ranks(key)]
     fails = []
     for rank, row in enumerate(rows):
         if row["sqnr_db"] < SQNR_FLOOR_DB:
@@ -929,7 +832,7 @@ def test_one_shot_allreduce(
                 f"rank {rank}: {row['lanes_differing']} bf16 lanes differ between "
                 "ranks (accumulation order is not rank-stable)"
             )
-    _check(f"tp={tp} {tokens}x{hidden} graph={graph} {engine_kw}", fails)
+    failure_log.check(f"tp={tp} {tokens}x{hidden} graph={graph} {engine_kw}", fails)
     nbytes = tokens * hidden * 2
     # (tp - 1) adds per element.
     flops = tokens * hidden * (tp - 1)
@@ -959,8 +862,8 @@ def test_one_shot_allreduce_run_ahead(
     skip_self=None,
 ):
     engine_kw = _engine_kw(atoms, grid_cap, fanout, block, skip_self)
-    runs = [r["run_ahead"] for r in _ranks(_key(tp, engine_kw))]
-    _check(
+    runs = [r["run_ahead"] for r in registry.ranks(registry.key(tp, **engine_kw))]
+    failure_log.check(
         f"tp={tp} run-ahead {engine_kw}",
         [
             f"rank {rank}: {r['bad_checks']} bad checks of {r['checks']}"
@@ -983,12 +886,12 @@ def test_one_shot_allreduce_coverage(tp, window):
     The engine's own ``cfgs_for`` is the reference, so a retuned ladder or
     policy that ``_production_payloads`` does not follow fails here.
     """
-    key = _key(tp, {})
-    ranks = _ranks(key)
+    key = registry.key(tp)
+    ranks = registry.ranks(key)
     production = set(ranks[0]["production_cfgs"])
     ran = {row["cfg"] for row in ranks[0]["rows"]}
     missing = sorted(production - ran)
-    _check(
+    failure_log.check(
         f"tp={tp} coverage of {window}",
         [f"production rungs never run: {missing}"] if missing else [],
     )
@@ -1350,7 +1253,9 @@ def test_one_shot_allreduce_rmsnorm_split_options():
     for hidden in range(512, 16385, 512):
         opts = fused_split_options(hidden)
         # split=1 is exactly the unsplit geometry, in the same order.
-        assert [(b, a) for k, b, a in opts if k == 1] == list(fused_block_options(hidden))
+        assert [(b, a) for k, b, a in opts if k == 1] == list(
+            fused_block_options(hidden)
+        )
         for k, b, a in opts:
             assert k in SUPPORTED_SPLITS
             assert k * b * a * 8 == hidden and b % 64 == 0, (hidden, k, b, a)
@@ -1375,7 +1280,15 @@ def test_one_shot_allreduce_rmsnorm_split_factory():
     with pytest.raises(ValueError, match="split must be one of"):
         mk(**base, split=3)
     with pytest.raises(ValueError, match="needs a native geometry"):
-        mk(world_size=4, grid=64, fusion="rmsnorm", hidden=3072, h_pad=4096, atoms=2, split=2)
+        mk(
+            world_size=4,
+            grid=64,
+            fusion="rmsnorm",
+            hidden=3072,
+            h_pad=4096,
+            atoms=2,
+            split=2,
+        )
     with pytest.raises(ValueError, match="does not divide"):
         mk(world_size=4, grid=63, fusion="rmsnorm", hidden=4096, atoms=1, split=7)
     with pytest.raises(ValueError, match="not a multiple of split"):
@@ -1428,7 +1341,10 @@ def test_one_shot_allreduce_rmsnorm_split_host_resolution():
 
     row = lambda h: h * 2  # noqa: E731 -- bytes per token
     assert E._tiles_and_grid({"grid": 63, "split": 7}, 7168, 3 * row(7168)) == (21, 21)
-    assert E._tiles_and_grid({"grid": 64, "split": 4}, 8192, 40 * row(8192)) == (160, 64)
+    assert E._tiles_and_grid({"grid": 64, "split": 4}, 8192, 40 * row(8192)) == (
+        160,
+        64,
+    )
     assert E._tiles_and_grid({"grid": 64}, 7168, 3 * row(7168)) == (3, 3)  # unsplit
 
 
@@ -1471,8 +1387,13 @@ def test_one_shot_allreduce_rmsnorm_split_exchange_word():
             for _call in range(3):
                 partials = [
                     rng.choice(
-                        (0.0, rng.random() * 10.0 ** rng.randint(-6, 12), 1e30,
-                         float("inf"), float("nan"))
+                        (
+                            0.0,
+                            rng.random() * 10.0 ** rng.randint(-6, 12),
+                            1e30,
+                            float("inf"),
+                            float("nan"),
+                        )
                     )
                     for _ in range(n)
                 ]
@@ -1507,11 +1428,9 @@ def test_one_shot_allreduce_rmsnorm_ladder_rungs():
 
 
 def _summarize(name: str, rows: list[dict]) -> None:
-    if rows:
-        df = pd.DataFrame(rows).drop(columns=list(KNOBS), errors="ignore")
-        aiter.logger.info(
-            "%s summary (markdown):\n%s", name, df.to_markdown(index=False)
-        )
+    # The knob columns are engine selectors, not results; ``variant`` names
+    # the binary they picked.
+    summarize(name, rows, drop=KNOBS)
 
 
 def main():
@@ -1628,7 +1547,7 @@ def main():
             shapes += [s for s in SPOT_SHAPES if s not in shapes]
         spawns.append((tp, knobs, shapes, True))
         if ladder and given is None:
-            _WINDOWS[_key(tp, {})] = window
+            registry.windows[registry.key(tp)] = window
             coverage.append((tp, f"{window[0]}..{window[1]} B"))
     # Nothing pinned on the command line: the shipped ladder, plus spot checks
     # of the widths it does not use yet.
@@ -1643,7 +1562,7 @@ def main():
         if graph:
             # Captured at every world size, on the smallest shape.
             cases.append((*shapes[0], True))
-        _CASES[_key(tp, _engine_kw(**knobs))] = cases
+        registry.cases[registry.key(tp, **_engine_kw(**knobs))] = cases
         rows += [(tp, knobs, case) for case in cases]
 
     for dtype in dts:
@@ -1686,14 +1605,10 @@ def main():
                 if bad
             ]
             if fused_fails:
-                _FAILURES.extend(fused_fails)
+                failure_log.failures.extend(fused_fails)
             aiter.logger.info("fused tp=%s: %d failures", tp, len(fused_fails))
 
-    if _FAILURES:
-        raise SystemExit(
-            f"{len(_FAILURES)} OneShotAllReduce check(s) failed:\n  "
-            + "\n  ".join(_FAILURES)
-        )
+    failure_log.raise_if_failed("OneShotAllReduce")
 
 
 if __name__ == "__main__":

@@ -29,6 +29,32 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Float32, Int32, Int64, Stream, T
 
+from .collectives_shared import (
+    _INBOX_POLICY,
+    _SYSTEM_SYNC_SCOPE,
+    ATOMS,
+    BLOCK,
+    DEFAULT_GRID_CAP,  # noqa: F401  -- re-exported for host symmetry
+    QUAD_LANES,
+    QUADS_PER_WAVE,
+    RECV_BYPASS,
+    SUPPORTED_WORLDS,
+    WAVE,
+    _buffer_ptr,
+    _color_io,
+    _i32_to_bytes,
+    _load_peers,
+    _payload_io,
+    _to_sgpr_i64,
+    fanout_contiguous,
+    lds_write_packet,
+    load_i32_drained,
+    make_pack_storage,
+    make_payload_tensor,
+    next_color,
+    publish_flags,
+    wait_flags,
+)
 from .quick_allreduce_codec import (
     GROUP,
     SUPPORTED_BLOCKS,
@@ -53,35 +79,6 @@ from .quick_allreduce_fusions import (
     residual_add,
     rms_rstd,
     scale_by_weight,
-)
-from .quick_allreduce_shared import (
-    _CM_SC0,
-    _CM_SC1,
-    _INBOX_POLICY,
-    _SYSTEM_SYNC_SCOPE,
-    ATOMS,
-    BLOCK,
-    DEFAULT_GRID_CAP,  # noqa: F401  -- re-exported for host symmetry
-    FLAG_I32_PER_LANE,
-    FLAG_LANES,
-    QUAD_LANES,
-    QUADS_PER_WAVE,
-    SUPPORTED_WORLDS,
-    WAVE,
-    _acquire_inbox,
-    _buffer_load,
-    _buffer_ptr,
-    _color_io,
-    _i32_to_bytes,
-    _load_flag,
-    _load_peers,
-    _payload_io,
-    _release_inbox,
-    _store_flag_peer,
-    _store_v4i32_peer,
-    _to_sgpr_i64,
-    make_pack_storage,
-    make_payload_tensor,
 )
 
 # Super-tile values the ring accepts.
@@ -145,19 +142,7 @@ AG_CODECS = ("int4", "int6", "fp16")
 # fine-grained inbox -- only a non-temporal hint, not a bypass. For the ring
 # algorithm a hint is never enough: `sc0 sc1` makes the load actually go to
 # memory.
-_RECV_POLICY = _CM_SC0 | _CM_SC1
-
-
-def _load_i32_at(ptr, elem_off, cache_modifier):
-    """One i32 from the buffer pointer *ptr* at an element offset, drained
-    before it is read.
-
-    The ring always has the inbox pointer in hand and only the offset
-    varies, so its payload reads go through the one shared descriptor.
-    """
-    val = _buffer_load(ptr, elem_off, 1, fx.Int32, cache_modifier)[0]
-    rocdl.s_waitcnt(vmcnt=0)
-    return val
+_RECV_POLICY = RECV_BYPASS
 
 
 def ring_steps(world_size: int) -> int:
@@ -316,8 +301,6 @@ def make_quick_allreduce_ring_kernel(
     # per-sender axis collapses away entirely. That is what keeps the
     # atomics-free design sound here (there are no peer atomics over PCIe), and
     # it makes the buffer (N-1)/N of the mesh's rather than larger.
-    total_sectors = [rank_atoms * c.n_sectors for c in step_codec]
-    fanout_rounds = [-(-t // quads_per_block) for t in total_sectors]
 
     # One staging buffer, sized for whichever codec needs more. Only
     # ``rank_atoms`` rows: a ring stages one destination's packet, not every
@@ -574,18 +557,16 @@ def make_quick_allreduce_ring_kernel(
 
         def _lds_write_packet(codec, j, words, scale_word, is_leader):
             """Stage one packet of *codec* into the row this hop will send."""
-            pack = pack_views[codec.name]
-            row = fx.Int32(j)
-            for (off, pred), word in zip(codec.plane_slots(tid), words):
-                if pred:
-                    fx.memref_store(word, pack, (row, off))
-            if const_expr(codec.has_scale):  # noqa: SIM102
-                if is_leader:
-                    fx.memref_store(
-                        scale_word,
-                        pack,
-                        (row, fx.Int32(codec.scale_i32_off) + scale_slot),
-                    )
+            lds_write_packet(
+                codec,
+                pack_views[codec.name],
+                fx.Int32(j),
+                words,
+                scale_word,
+                is_leader,
+                tid,
+                scale_slot,
+            )
 
         def _recv_raw(codec, step, sub, j):
             """This rank's inbox slot for *step*, exactly as the predecessor wrote it.
@@ -598,7 +579,7 @@ def make_quick_allreduce_ring_kernel(
             base = _slot_i32(step, sub) + fx.Int32(j * codec.rank_tile_i32)
 
             def _get(off):
-                return _load_i32_at(inbox, base + off, _RECV_POLICY)
+                return load_i32_drained(inbox, base + off, _RECV_POLICY)
 
             return _codec_load(codec, _get, tid, scale_slot)
 
@@ -606,73 +587,44 @@ def make_quick_allreduce_ring_kernel(
             return _scale_from_word(codec, word, pair_in_slot)
 
         def _fanout_to_next(step, sub):
-            """Push the staged rank-tiles from LDS into the successor's inbox.
-
-            One destination, sectors in address order, so the whole
-            ``rank_atoms * rank_tile B`` lands as a single contiguous run. Quads
-            past the sector count sit idle rather than branching -- ``safe``
-            keeps their address arithmetic in range, mirroring the mesh.
+            """Push the staged rank-tiles from LDS into the successor's inbox,
+            as one contiguous run.
 
             INT6 is 26 sectors to INT4's 18, so a TP8 hop drives 26 of the 64
             quads rather than 18: the wider codec uses the fanout better.
             """
-            codec = step_codec[step]
-            n_sectors = codec.n_sectors
-            n_total = total_sectors[step]
-            for rnd in range_constexpr(fanout_rounds[step]):
-                s = quad_id + fx.Int32(rnd * quads_per_block)
-                in_range = s < fx.Int32(n_total)
-                safe = in_range.select(s, fx.Int32(0))
-                # Flat sector id -> (rank-atom, sector), then -> i32 offset. Both
-                # by arithmetic, for the same reason as _slot_i32: at TP8
-                # rank_atoms is 1, and a unit mode in a layout does not survive
-                # coalescing intact. The same offset addresses LDS and the
-                # wire, because this codec's LDS view and its wire rank-tiles
-                # share a row stride.
-                j = safe // fx.Int32(n_sectors)
-                sector = safe % fx.Int32(n_sectors)
-                if s < fx.Int32(n_total):
-                    flat = (
-                        j * fx.Int32(codec.rank_tile_i32)
-                        + sector * fx.Int32(16)
-                        + lane_in_quad * fx.Int32(4)
-                    )
-                    v4 = fx.ptr_load(
-                        smem_ptr + flat,
-                        result_type=fx.Vector.make_type(4, fx.Int32),
-                    )
-                    byte_off = _i32_to_bytes(_slot_i32(step, sub) + flat)
-                    _store_v4i32_peer(next_base + byte_off, v4, payload_policy)
+            fanout_contiguous(
+                codec=step_codec[step],
+                n_atoms=rank_atoms,
+                quad_id=quad_id,
+                lane_in_quad=lane_in_quad,
+                quads_per_block=quads_per_block,
+                smem_ptr=smem_ptr,
+                slot_i32=_slot_i32(step, sub),
+                dest_base=next_base,
+                payload_policy=payload_policy,
+            )
 
         def _publish(step, color):
             """Drain the payload, make it visible, then colour the slot tail.
 
-            Identical in shape to the mesh's publish and for the same
-            reasons -- ``vmcnt`` is per-wave so the workgroup has to join before
-            the flag goes out, and on a cacheable inbox a retired store is not
-            yet a visible one, so the release needs an explicit L2 writeback.
-            What differs is the width: one quad, one destination, where the mesh
-            needs one quad per peer.
+            The mesh's publish with one destination: one quad, where the mesh
+            needs one per peer.
             """
-            rocdl.s_waitcnt(vmcnt=0)
-            gpu.barrier()
-            if const_expr(release_scope is not None):
-                _release_inbox(release_scope)
-            if tid < fx.Int32(FLAG_LANES):
-                elem = (
-                    _slot_i32(step, fx.Int32(0))
-                    + fx.Int32(release_i32_off[step])
-                    + tid * fx.Int32(FLAG_I32_PER_LANE)
-                )
-                _store_flag_peer(next_base + _i32_to_bytes(elem), color, flag_policy)
+            publish_flags(
+                tid=tid,
+                n_dest=1,
+                dest_base=lambda _j: next_base,
+                flag_i32=_slot_i32(step, fx.Int32(0)) + fx.Int32(release_i32_off[step]),
+                color=color,
+                flag_policy=flag_policy,
+                release_scope=release_scope,
+            )
 
         def _wait(step, color):
             """Spin until the predecessor has coloured *step*'s slot in our inbox.
 
-            One source, so one thread spins where the mesh needs one per
-            peer. The poll must bypass the caches (``_load_flag`` is ``sc0
-            sc1``): a load answered from a stale line would spin forever, which
-            is a hang rather than a slowdown.
+            One source, so one thread spins where the mesh needs one per peer.
 
             One colour covers all ``2(N-1)`` slots of a super-tile group. That is
             safe without extra sequencing because the ring's own dependency
@@ -682,47 +634,28 @@ def make_quick_allreduce_ring_kernel(
             transitively requires us to have completed op ``N`` -- i.e. to be
             past the read we are blocked on.
 
-            Polls through a global address rather than a buffer descriptor:
-            a descriptor built from ``self_base + elem*4`` would be a uniform
-            value LLVM cannot prove uniform, sourcing all four descriptor
-            dwords from VGPRs and serializing the wave around them.
+            ``_RECV_POLICY`` is ``sc0 sc1``, so the payload loads bypass both
+            caches on every inbox; an uncached inbox therefore gets the policy's
+            workgroup-scope acquire (no invalidate), every other inbox a
+            system-scope one. That one must be preceded by a writeback: the ring
+            stores one chunk per all-gather op and then waits again, so an
+            invalidate here sits directly on top of dirty output lines, and
+            discarding them silently loses whole chunks.
             """
-            if tid == fx.Int32(0):
-                flag = self_base + _i32_to_bytes(
+            wait_flags(
+                tid=tid,
+                n_src=1,
+                skip_rank=None,
+                flag_addr=lambda _src: self_base
+                + _i32_to_bytes(
                     _slot_i32(step, fx.Int32(0)) + fx.Int32(release_i32_off[step])
-                )
-                # `sc0 sc1`, so each retry is fetched past L1 and L2 and no
-                # fence is needed in the loop; the acquire below orders the
-                # payload reads after it, once, after the join.
-                current = _load_flag(flag)
-                while current != color:
-                    current = _load_flag(flag)
-            gpu.barrier()
-            # Unconditional, *after* the join, and not just inside the spin.
-            # Only `tid == 0` spins, so an acquire inside the loop would cover
-            # one lane of one wave and leave the rest of the workgroup reading
-            # the payload unordered after it -- and would be skipped entirely
-            # in the common case where the flag is already set on the first
-            # read.
-            #
-            # The scope is the inbox policy's. `_RECV_POLICY` is `sc0 sc1`, so
-            # the payload loads below bypass both caches on every inbox and
-            # cannot be served a stale line on their own. On an uncached inbox
-            # the policy therefore gives a workgroup-scope acquire: no
-            # invalidate, only a compiler barrier that keeps those loads below
-            # the spin. Every other inbox keeps the system-scope acquire, an
-            # L1+L2 invalidate, as a defence against a silent wrong result.
-            #
-            # A system-scope acquire must be preceded by a writeback. The ring
-            # stores one chunk per all-gather op and then waits again -- so an
-            # invalidate here sits directly on top of dirty output lines, and
-            # discarding them silently loses whole chunks. A workgroup-scope
-            # acquire invalidates nothing, so it needs neither the writeback
-            # nor the drain before it.
-            if const_expr(acquire_scope == _SYSTEM_SYNC_SCOPE):
-                rocdl.s_waitcnt(vmcnt=0)
-                _release_inbox(_SYSTEM_SYNC_SCOPE)
-            _acquire_inbox(acquire_scope)
+                ),
+                color=color,
+                acquire_scope=acquire_scope,
+                writeback_scope=(
+                    _SYSTEM_SYNC_SCOPE if acquire_scope == _SYSTEM_SYNC_SCOPE else None
+                ),
+            )
 
         def _atom_f16_to_f32(atom):
             """Packed fp16 -> 8 f32. A widening move; exact, no rounding."""
@@ -956,9 +889,7 @@ def make_quick_allreduce_ring_kernel(
             remain = n_block_tiles - i
             n_this = (remain < st_i).select(remain, st_i)
             _ring_group(i, n_this, color, w_atoms)
-            color = color + fx.Int32(1)
-            if color == fx.Int32(0):  # 0 is the unset sentinel
-                color = fx.Int32(1)
+            color = next_color(color, parity_safe=False)
         if tid == 0:
             _store_color(color)
         gpu.barrier()
@@ -1052,9 +983,7 @@ def make_quick_allreduce_ring_kernel(
         if padded:
             tag += f"_p{h_pad}"
     launcher = (
-        launch_quick_allreduce_ring_fused
-        if fused
-        else launch_quick_allreduce_ring
+        launch_quick_allreduce_ring_fused if fused else launch_quick_allreduce_ring
     )
     launcher.func.__name__ = f"launch_quick_allreduce_ring_{tag}"
     try:

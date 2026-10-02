@@ -1,15 +1,21 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Shared assets for all-reduce host wrappers."""
+"""Shared assets for the IPC collective host wrappers (all-reduce, all-to-all)."""
 
 import ctypes
 import logging
+from collections.abc import Callable
 from pathlib import Path
 
 import torch
 import torch.distributed as dist
+from flydsl.expr.typing import Int32, Int64, Stream
 
+from aiter.jit.utils.chip_info import get_lds_capacity_bytes
+
+from .kernels.collectives_shared import ATOMS, clamp_grid_cap
+from .kernels.tensor_shim import _preload_compiled, _run_compiled
 from .quick_allreduce_ipc import UncachedIpcHeap
 
 logger = logging.getLogger("aiter")
@@ -116,7 +122,9 @@ class _StEngine:
             # zero ``prev`` are a consistent start.
             xchg_bytes = int(spec.get("xchg_bytes", 0))
             xchg_off = (peer_bytes + color_bytes + 127) // 128 * 128
-            meta_bytes = xchg_off + xchg_bytes if xchg_bytes else peer_bytes + color_bytes
+            meta_bytes = (
+                xchg_off + xchg_bytes if xchg_bytes else peer_bytes + color_bytes
+            )
             # Peer-pointer table and per-block colours: written by the host once
             # and by this rank's own kernel, never by a peer. Stays uncached in
             # every mode -- no cross-GPU visibility question, and it is a few
@@ -265,3 +273,310 @@ def payload_probes(floors, lo: int, hi: int) -> tuple[int, ...]:
         if lo < first <= hi:
             probes.update((first - step, first))
     return tuple(sorted(probes))
+
+
+class _LadderedIpcOp:
+    """A set of IPC engines, one per ladder rung, and the launch that picks one.
+
+    Everything an IPC collective does *around* its kernel: one ``_StEngine``
+    (inbox + compiled binary) per distinct ``(super_tile, block, skip_self)``,
+    selection by payload size, the persistent-grid launch, preload and cleanup.
+    Subclasses validate their payload, call :meth:`_init_engines` once, and
+    launch through :meth:`_launch_eng`. A subclass whose kernel sees something
+    other than the whole payload overrides :meth:`_kernel_nbytes`.
+    """
+
+    def _init_engines(
+        self,
+        *,
+        group,
+        device_index: int,
+        rank: int,
+        world_size: int,
+        ladder: tuple,
+        laddered: bool,
+        build: Callable[..., dict],
+        inbox_flags: int,
+        arch: str,
+        batch_publishes: bool,
+        min_batch_blocks: int,
+        grid_cap: int,
+        label: str,
+    ) -> None:
+        """Build every engine the *ladder* rungs need.
+
+        *ladder* is ``((min_bytes, super_tile, grid_cap, block, skip_self),
+        ...)``, ascending; *laddered* says whether to select among the rungs
+        by payload (``False`` pins the first). *build* is called with
+        ``super_tile``, ``grid``, ``block`` and ``skip_self`` and returns a
+        kernel spec.
+
+        One engine per distinct ``(super_tile, block, skip_self)``, keyed that
+        way in ``_by_cfg``. Each ``(block, skip_self)`` also gets an ST=1
+        engine: ``_pick_cfg`` falls back to it when a payload has fewer tiles
+        than the chosen super-tile, and the fallback has to share the rung's
+        block -- a different tile size would change the tile count it was
+        picked for. Engines are built in a fixed order because each does its
+        own IPC handle exchange, which is a collective -- ranks disagreeing on
+        the order would deadlock.
+
+        The rungs go in first so an ST=1 that the ladder *sites* keeps its own
+        cap. Only then is the fallback filled in, and at the smallest cap among
+        its rungs rather than at the global default: the fallback fires only
+        when a payload has fewer tiles than the super-tile it would otherwise
+        take, so ``_grid_x`` there is bounded by that super-tile (<= 32) with a
+        release fence, and by the chosen rung's own cap without one -- under
+        128 either way. Seeding it with the 1216 default instead built a 194
+        MiB inbox to launch at most 32 blocks into, and did it on every object
+        ever constructed.
+        """
+        self.group = group
+        self._device_index = int(device_index)
+        self.rank = int(rank)
+        self.world_size = int(world_size)
+        self._grid = int(grid_cap)
+        self._batch_publishes = bool(batch_publishes)
+        self._min_batch_blocks = int(min_batch_blocks)
+        self._has_launched = False
+        self._ladder = ladder if laddered else ()
+        self._primary = ladder[0][1:2] + ladder[0][3:]
+        self._by_cfg = {}
+
+        caps = {}
+        for _floor, st, rung_cap, b, ss in ladder:
+            caps.setdefault((st, b, ss), rung_cap)
+        for b, ss in {(b, ss) for _st, b, ss in list(caps)}:
+            caps.setdefault(
+                (1, b, ss),
+                min(c for (_st, cb, css), c in caps.items() if (cb, css) == (b, ss)),
+            )
+        cu_count = int(
+            torch.cuda.get_device_properties(self._device_index).multi_processor_count
+        )
+        lds_capacity = get_lds_capacity_bytes(arch)
+        try:
+            with torch.cuda.device(self._device_index):
+                for key in sorted(caps):
+                    st, b, ss = key
+                    # A persistent kernel deadlocks if it launches more workgroups
+                    # than fit, and the ranks have to agree on the number: take the
+                    # minimum across the group so a heterogeneous node converges.
+                    grid = clamp_grid_cap(
+                        caps[key],
+                        arch=arch,
+                        world_size=self.world_size,
+                        super_tile=st,
+                        cu_count=cu_count,
+                        block=b,
+                    )
+                    shared_grid = torch.tensor(grid, dtype=torch.int64)
+                    dist.all_reduce(shared_grid, op=dist.ReduceOp.MIN, group=group)
+                    spec = build(
+                        super_tile=st,
+                        grid=int(shared_grid.item()),
+                        block=b,
+                        skip_self=ss,
+                    )
+                    if spec["lds_bytes"] > lds_capacity:
+                        raise ValueError(
+                            f"{label} at block={b} needs {spec['lds_bytes']} B of "
+                            f"LDS, over the {lds_capacity} B {arch} has"
+                        )
+                    self._by_cfg[key] = _StEngine(
+                        spec=spec,
+                        group=self.group,
+                        rank=self.rank,
+                        world_size=self.world_size,
+                        inbox_flags=inbox_flags,
+                    )
+        except Exception:
+            self.close()
+            raise
+
+        primary = self._by_cfg[self._primary]
+        self.super_tile, self.block, self.skip_self = self._primary
+        self.buf_bytes = primary.buf_bytes
+        self.lds_bytes = primary.lds_bytes
+        self.tile_bytes = primary.tile_bytes
+        self.tile_fp16 = primary.tile_fp16
+        self.rank_tile_bytes = primary.rank_tile_bytes
+        self.wire_tile_bytes = primary.wire_tile_bytes
+
+    @property
+    def inbox_bytes(self) -> int:
+        """IPC inbox bytes this object holds on *this* rank, across every rung.
+
+        ``buf_bytes`` is the primary engine's alone, which understates a
+        ladder-driven object by however many rungs it built. The total is what
+        actually has to fit, and a sweep holding several tuning variants live
+        at once is the realistic way to exhaust a device.
+        """
+        return sum(eng.buf_bytes for eng in self._by_cfg.values())
+
+    def _kernel_nbytes(self, live_bytes: int) -> int:
+        """Bytes the kernel's ``nbytes`` argument covers for a *live_bytes*
+        payload: the whole payload here."""
+        return int(live_bytes)
+
+    def _ladder_cfg(self, live_bytes: int) -> tuple[int, int, bool]:
+        """``(super_tile, block, skip_self)`` the ladder assigns to *live_bytes*.
+
+        Publishes per rank fall as the super-tile grows, and on a cacheable
+        inbox each costs a full L2 writeback, so a bigger payload wants a bigger
+        ST -- but ST also divides the block count, so it cannot simply be
+        maximised. The rungs are the measured trade.
+        """
+        cfg = self._primary
+        for floor, st, _cap, b, ss in self._ladder:
+            if live_bytes >= floor:
+                cfg = (st, b, ss)
+        return cfg
+
+    @staticmethod
+    def _num_tiles(live_bytes: int, block: int) -> int:
+        """Tiles a *live_bytes* payload spans.
+
+        The same for every schedule: an all-reduce tile is ``ATOMS`` atoms of
+        the payload, an all-to-all tile is ``ATOMS / N`` atoms of each of the
+        ``N`` chunks.
+        """
+        tile_bytes = int(block) * ATOMS * 16
+        return max(1, (live_bytes + tile_bytes - 1) // tile_bytes)
+
+    def _pick_cfg(self, live_bytes: int) -> tuple[tuple[int, int, bool], int]:
+        """Engine key for a *live_bytes* payload, and its tile count.
+
+        The ladder chooses the rung, which fixes the block and so the tile
+        count; the tile count then only has to confirm there is a whole
+        super-tile to take, falling back to the same block's ST=1 engine when
+        there is not.
+
+        Without a release fence a publish is nearly free, so the only reason to
+        batch tiles is when there are more of them than blocks -- prefer ST=1
+        and the parallelism it buys.
+
+        With one, that trade inverts: every publish costs a full L2 writeback,
+        and ST=1 pays one per tile per phase. Take a super-tile as soon as
+        there is a whole one to take. Measured on MI350P at 1024x7168, TP4:
+        577.71 us at ST=1 against 269.01 at ST=8.
+        """
+        want, b, ss = self._ladder_cfg(live_bytes)
+        num_tiles = self._num_tiles(live_bytes, b)
+        if want == 1:
+            st = 1
+        elif self._batch_publishes:
+            st = want if num_tiles >= want else 1
+        else:
+            st = want if num_tiles > self._by_cfg[(want, b, ss)].grid else 1
+        return (st, b, ss), num_tiles
+
+    def _grid_x(self, num_tiles: int, super_tile: int, grid: int | None = None) -> int:
+        """Blocks to launch for *num_tiles* tiles under *super_tile*.
+
+        *grid* is the compile-time cap of the engine that will run, which is
+        per-super-tile once a ladder is in play -- the wire buffer scales with
+        ``ST * grid``, so a high rung pairs a large ST with a small cap.
+
+        Batching publishes only pays if a block actually owns a super-tile's
+        worth of work: ST=8 across 448 blocks holding one tile each still
+        publishes per tile. Hand each block a full super-tile instead, which
+        cuts publishes to ``num_tiles / ST`` per phase.
+
+        Bounded below by ``min_batch_blocks``, because that trade inverts at
+        small sizes: 14 tiles over 2 blocks saves a handful of fences and gives
+        up the whole machine to do it. Measured on MI350P at 32x7168, TP4,
+        61.95 us unbounded against 23.98 with the grid left alone.
+        """
+        if self._batch_publishes and super_tile != 1:
+            batched = max(-(-num_tiles // super_tile), self._min_batch_blocks)
+            num_tiles = min(num_tiles, batched)
+        return max(1, min(num_tiles, self._grid if grid is None else grid))
+
+    def _launch_args(
+        self, eng: _StEngine, inp_ptr, out_ptr, stream, *, live_bytes, num_tiles
+    ):
+        if stream is None:
+            stream = Stream(torch.cuda.current_stream(self._device_index))
+        elif not isinstance(stream, Stream):
+            stream = Stream(stream)
+        return (
+            Int32(self.rank),
+            Int64(self._kernel_nbytes(live_bytes)),
+            Int32(num_tiles),
+            Int64(inp_ptr),
+            Int64(out_ptr),
+            Int64(int(eng._gpu_peer_ptrs)),
+            Int64(int(eng._colors)),
+            Int32(self._grid_x(num_tiles, eng.super_tile, eng.grid)),
+            stream,
+        )
+
+    def _launch_eng(self, eng: _StEngine, inp, out, stream, *, live_bytes: int) -> None:
+        kernel_bytes = self._kernel_nbytes(live_bytes)
+        num_tiles = max(1, (kernel_bytes + eng.tile_bytes - 1) // eng.tile_bytes)
+        args = self._launch_args(
+            eng,
+            int(inp.data_ptr()),
+            int(out.data_ptr()),
+            stream,
+            live_bytes=live_bytes,
+            num_tiles=num_tiles,
+        )
+        # A launch may still be using the raw HIP allocations when Python drops
+        # the communicator. Keep cleanup conservative even if launch raises.
+        self._has_launched = True
+        with torch.cuda.device(self._device_index):
+            _run_compiled(eng.launch, *args)
+
+    def cfgs_for(self, lo: int, hi: int) -> list[tuple[int, int, bool]]:
+        """``_by_cfg`` keys a payload of ``lo..hi`` bytes (inclusive) can
+        select, in build order."""
+        floors = [rung[0] for rung in self._ladder]
+        picked = {self._pick_cfg(n)[0] for n in payload_probes(floors, lo, hi)}
+        return [key for key in self._by_cfg if key in picked]
+
+    def preload(self, *, payload_range=None) -> None:
+        """JIT-compile engine binaries without launching any of them.
+
+        ``payload_range=(lo, hi)`` takes only the binaries a payload of
+        ``lo..hi`` bytes (inclusive) would run; ``None`` takes every one. The
+        ladder builds engines for the whole size range, while a dispatcher
+        routes only its own window here, so the rest never run.
+
+        Local to this rank, not a collective. Dispatchers call it once at init,
+        via ``preload_fly_engines``, to keep JIT compiles out of CUDA graph
+        capture; the benchmark and the op tests call it before timing or
+        correctness checks begin. The HIP module load still happens on each
+        binary's first launch.
+        """
+        keys = self._by_cfg if payload_range is None else self.cfgs_for(*payload_range)
+        for key in keys:
+            eng = self._by_cfg[key]
+            args = self._launch_args(eng, 0, 0, None, live_bytes=0, num_tiles=0)
+            _preload_compiled(eng.launch, *args)
+
+    def close(self):
+        engines = getattr(self, "_by_cfg", None)
+        if not engines:
+            return
+        with torch.cuda.device(self._device_index):
+            if getattr(self, "_has_launched", False):
+                torch.cuda.synchronize(self._device_index)
+                self._has_launched = False
+            for eng in engines.values():
+                eng.close()
+            engines.clear()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:  # noqa: BLE001
+            # Destructors must not raise, especially during interpreter shutdown.
+            return
+
+    def variant(self, nbytes: int) -> str:
+        """Identity of the binary an *nbytes* payload would actually run."""
+        cfg, num_tiles = self._pick_cfg(int(nbytes))
+        eng = self._by_cfg[cfg]
+        grid_x = self._grid_x(num_tiles, eng.super_tile, eng.grid)
+        return f"{kernel_symbol(eng.launch)}/grid_x{grid_x}"

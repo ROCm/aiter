@@ -1141,6 +1141,32 @@ class GroupCoordinator:
             return input_
         return self.reduce_scatter_tensor(input_, dim=dim)
 
+    def all_to_all(
+        self, input_: torch.Tensor, output_: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Equal-split all-to-all over this group.
+
+        *input_* is split into ``world_size`` equal chunks along its flattened
+        element order; chunk ``j`` goes to rank ``j``, and chunk ``i`` of the
+        result came from rank ``i`` -- ``all_to_all_single`` without split
+        sizes. The device communicator picks the implementation (FlyDSL when
+        ``AITER_FLY_A2A=1`` and the payload is in its window, else RCCL).
+        """
+        if self.world_size == 1:
+            if output_ is None:
+                return input_
+            output_.copy_(input_)
+            return output_
+        if self.device_communicator is None:
+            input_ = input_.contiguous()
+            if output_ is None:
+                output_ = torch.empty_like(input_)
+            torch.distributed.all_to_all_single(
+                output_.view(-1), input_.view(-1), group=self.device_group
+            )
+            return output_
+        return self.device_communicator.all_to_all(input_, output_)
+
     def all_gather(
         self,
         input_: torch.Tensor,

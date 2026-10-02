@@ -29,7 +29,7 @@ set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO=$(git -C "$HERE" rev-parse --show-toplevel)
-BENCH="$(dirname "$HERE")/bench_comm_allreduce.py"
+BENCH="$(dirname "$HERE")/bench_comm.py"  # --operation ar, the default
 PY=${PYTHON:-python}
 
 OUT=""; TPS="8 4 2"; LINK="auto"; WIDTHS="3072 4096 7168 8192"; SMOKE=0; FORCE=0
