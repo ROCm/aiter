@@ -8,6 +8,7 @@ from torch import Tensor
 
 from ..jit.core import AITER_CSRC_DIR, compile_ops
 from ..utility import dtypes
+from ..utility.graph_alloc import persistent_alloc
 from .enum import ActivationType, QuantType
 
 torch.int4 = getattr(torch, "int4", torch.uint32)
@@ -127,6 +128,91 @@ def topk_softmax_asm(
     gating_output: Tensor,
     need_renorm: bool,
 ) -> None: ...
+
+
+@compile_ops(
+    "module_router_gemm_topk_softmax_asm",
+    fc_name="router_gemm_topk_softmax_asm",
+    ffi_type="ctypes",
+)
+def _router_gemm_topk_softmax_asm(
+    hidden_states: Tensor,
+    gate_weight: Tensor,
+    topk_weights: Tensor,
+    topk_ids: Tensor,
+    token_expert_indices: Tensor,
+    workspace: Tensor,
+) -> None: ...
+
+
+# The kernel keeps the BF16 logits of up to 8 tokens in the workspace, 520
+# floats per token, and a 32-bit workgroup counter right after them. The
+# counter starts at zero and the last workgroup of every launch sets it back to
+# zero. 128 bytes are reserved for the counter.
+_ROUTER_TOPK_WORKSPACE_BYTES = 8 * 520 * 4 + 128
+
+
+@functools.lru_cache(maxsize=64)
+def _get_router_topk_workspace_keyed(device: torch.device, stream_id: int) -> Tensor:
+    with persistent_alloc(device):
+        return torch.zeros(
+            _ROUTER_TOPK_WORKSPACE_BYTES // 4, dtype=dtypes.i32, device=device
+        )
+
+
+def get_router_topk_workspace(device: torch.device) -> Tensor:
+    """Return the zero-initialized workspace of router_gemm_topk_softmax_asm for
+    the current stream of this device.
+
+    The kernel finds its last workgroup with an atomic counter in this
+    workspace. Two launches that run at the same time on different streams
+    would count into the same counter and both get wrong results, so every
+    stream gets its own workspace. Launches on the same stream run one after
+    the other, and the kernel sets the counter back to zero at the end of
+    every launch, so they can share one workspace.
+    """
+    stream = torch.cuda.current_stream(device)
+    return _get_router_topk_workspace_keyed(device, stream.cuda_stream)
+
+
+def router_gemm_topk_softmax_asm(
+    hidden_states: Tensor,
+    gate_weight: Tensor,
+    topk_weights: Tensor,
+    topk_ids: Tensor,
+    token_expert_indices: Tensor,
+) -> None:
+    """Router GEMM, softmax top-k and the shared expert gate in one gfx950 kernel.
+
+    The logits are summed in fp32 and rounded to BF16, as F.linear(hidden_states,
+    gate_weight) does in BF16, but they stay inside the kernel. From those BF16
+    logits the kernel writes the same outputs as topk_softmax(topk_weights,
+    topk_ids, token_expert_indices, logits, need_renorm=True,
+    num_shared_experts=1, shared_expert_scoring_func="sigmoid").
+
+    hidden_states: [M, 8192] bf16, contiguous, with M from 1 to 8.
+    gate_weight: [513, 8192] bf16, contiguous. Rows 0 to 511 are the routed
+        experts and row 512 is the shared expert gate.
+    topk_weights: [M, 11] fp32, contiguous. Columns 0 to 9 get the softmax
+        weights of the top 10 routed experts, renormalized over those 10.
+        Column 10 gets sigmoid(shared expert logit).
+    topk_ids: int32 with row stride 11, either [M, 11] or a [M, 10] view of
+        it. Columns 0 to 9 get the expert ids in descending logit order, and a
+        tie goes to the lower id. Column 10 is not written, so the caller can
+        fill it with the shared expert id once.
+    token_expert_indices: [M, 10] int32, contiguous. Entry [i, k] gets k * M + i.
+
+    Other shapes, other GPUs and M above 8 raise a RuntimeError.
+    """
+    workspace = get_router_topk_workspace(hidden_states.device)
+    _router_gemm_topk_softmax_asm(
+        hidden_states,
+        gate_weight,
+        topk_weights,
+        topk_ids,
+        token_expert_indices,
+        workspace,
+    )
 
 
 @compile_ops("module_moe_topk_ck")
