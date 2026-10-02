@@ -596,18 +596,6 @@ static uint32_t get_warp_size_func()
     return warp_size;
 }
 
-static size_t get_smem_size_func()
-{
-    static const size_t smem_size = []() {
-        hipDevice_t dev;
-        hipDeviceProp_t dev_prop;
-        HIP_CALL(hipGetDevice(&dev));
-        HIP_CALL(hipGetDeviceProperties(&dev_prop, dev));
-        return dev_prop.sharedMemPerBlock;
-    }();
-    return smem_size;
-}
-
 struct WarpSizeValue
 {
     __host__ __device__ constexpr operator int() const
@@ -691,3 +679,15 @@ struct SynchronizedCache
     std::mutex map_mu;
     std::unordered_map<Key, T, Hash, KeyEqual> map;
 };
+
+static size_t get_smem_size_func()
+{
+    static SynchronizedCache<int, size_t> cache;
+    int device = -1;
+    HIP_CALL(hipGetDevice(&device));
+    return cache.get_or_create(device, [device]() {
+        hipDeviceProp_t prop{};
+        HIP_CALL(hipGetDeviceProperties(&prop, device));
+        return prop.sharedMemPerBlock;
+    });
+}
