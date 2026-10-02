@@ -315,7 +315,12 @@ def _gluon_flash_attn_forward(
         )
 
     if config is None:
-        config = _get_gluon_config(is_fp8=IS_FP8, has_pe=pe_head_dim > 0)
+        config = _get_gluon_config(
+            is_fp8=IS_FP8,
+            has_pe=pe_head_dim > 0,
+            causal=causal,
+            v_head_dim=v_head_dim,
+        )
     config = dict(config)
     BLOCK_M = config.pop("BLOCK_M")
     BLOCK_N = config.pop("BLOCK_N")
@@ -439,7 +444,28 @@ def _gluon_flash_attn_forward(
     # so this is always a valid alignment hint for the kernel's head offsets.
     head_stride_align = math.gcd(16, q_strides[1], k_strides[1], v_strides[1])
 
+    # Largest power of two, in elements, dividing every K/V stride that reaches the
+    # base pointer of a global->LDS copy -- batch, head and sequence alike, since all
+    # three are summed into it.  This is the alignment the copy's 128-bit-per-lane
+    # chunks depend on.  The last axis must also be contiguous, or the copy's whole
+    # addressing model is wrong; 0 disables the async copy outright in that case.
+    if k_strides[3] == 1 and v_strides[3] == 1:
+        kv_stride_align = math.gcd(16, *k_strides[:3], *v_strides[:3])
+    else:
+        kv_stride_align = 0
+
     grid = (batch * num_q_heads * triton.cdiv(seqlen_q, BLOCK_M), 1)
+
+    # `amdgpu-agpr-alloc=0,0` keeps the accumulators in architected VGPRs: on CDNA4
+    # the register file is unified, so an AGPR-resident accumulator buys no extra
+    # capacity and every VALU that reads it pays a v_accvgpr move.  The softmax reads
+    # the accumulator on every tile, so those moves would land on the critical path.
+    #
+    # No `amdgpu-sched-strategy` is set: the default (max-occupancy) balances ILP
+    # against register pressure.  `iterative-minreg` removes this kernel's spills but
+    # shortens live ranges to do it, which is the opposite of what the rotated
+    # pipeline needs -- vector work spread across the MFMA shadows.
+    _LLVM_FN_ATTRS = (("amdgpu-agpr-alloc", "0,0"),)
 
     _gluon_attn_fwd[grid](
         q,
@@ -485,6 +511,11 @@ def _gluon_flash_attn_forward(
         SLIDING_WINDOW=sliding_window,
         RETURN_SCORES=return_softmax,
         HEAD_STRIDE_ALIGN=head_stride_align,
+        KV_STRIDE_ALIGN=kv_stride_align,
+        # fp8 keeps the per-tile scale: q is already fp8, so re-rounding q*scale back
+        # into fp8 would throw away far more than the multiply costs.
+        SCALE_ON_Q=not IS_FP8,
+        llvm_fn_attrs=_LLVM_FN_ATTRS,
         **config,
     )
 
