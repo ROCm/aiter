@@ -117,6 +117,16 @@ DEFAULT_N_BLOCK = 64
 # Ping-pong K LDS buffers the main loop rotates through (double-buffered prefetch).
 N_KV_PP = 2
 
+# Wave groups splitting one q tile's KV tiles (compile-time). With 2, the LO and HI
+# halves (waves 0..3 / 4..7) both own the same BLOCK_M/2 packed rows and consume the
+# two n_block halves of every 2*n_block KV load with independent online-softmax state,
+# merged through LDS before the epilogue. That halves a q tile's KV walk while each
+# wave keeps the unsplit tile's 32-row x n_block working set, so it pays off when the
+# longest causal q tile, not total work, bounds the launch.
+KV_SPLIT_CHOICES = (1, 2)
+# Shortest KV walk that amortizes a second workgroup per CU (see _select_kv_split).
+_KV_SPLIT_MIN_SEQLEN = 1024
+
 # Each K/V ping-pong block is floored to this many bytes (reserved headroom).
 MIN_KV_BLK_BYTES = 64 * 1024
 
@@ -233,7 +243,7 @@ def _workgroup_coords():
     return block_x, kv_head, batch
 
 
-def _packed_tile_indices(gqa_ratio, block_x, kv_head, warp_idx, lane_idx):
+def _packed_tile_indices(gqa_ratio, block_m, block_x, kv_head, row_warp, lane_idx):
     """Map this lane's rows in the packed ``(seq, q_head_in_group)`` tile to global
     indices; returns ``(q_head_idx, seq_idx)``, length-R lists (one per
     q-WMMA-tile owned by this wave; R = WMMA_ROW_PER_WAVE).
@@ -241,12 +251,12 @@ def _packed_tile_indices(gqa_ratio, block_x, kv_head, warp_idx, lane_idx):
     GQA head x seq packing: ``block_x`` tiles one kv-head's
     ``(seq, q_head_in_group)`` plane. ``q_head_in_group`` is the fast axis, so the
     ``% / //`` use the small (often power-of-two) ``gqa_ratio``. Each of the
-    ``BLOCK_M`` rows is an independent query sharing this kv-head's K/V. The R
+    ``block_m`` rows is an independent query sharing this kv-head's K/V. The R
     tiles a wave owns are contiguous:
-    ``warp_row0 = block_x*BLOCK_M + warp_idx*(R*WMMA_M)`` and tile ``qt`` starts
+    ``warp_row0 = block_x*block_m + row_warp*(R*WMMA_M)`` and tile ``qt`` starts
     at ``warp_row0 + qt*WMMA_M``.
     """
-    warp_row0 = block_x * BLOCK_M + warp_idx * (WMMA_ROW_PER_WAVE * WMMA_M)
+    warp_row0 = block_x * block_m + row_warp * (WMMA_ROW_PER_WAVE * WMMA_M)
     q_head_idx = []
     seq_idx = []
     for qt in range(WMMA_ROW_PER_WAVE):
@@ -616,6 +626,82 @@ def _pv_gemm(*, v_values, p_list, v_hdim, n_block, o_acc_list=None):
     return out_list
 
 
+def _kv_merge_bytes(row_waves, d_tiles):
+    """LDS bytes of one KV group's (m, d, O) state over ``row_waves`` waves."""
+    per_lane_f32 = WMMA_ROW_PER_WAVE * (2 + d_tiles * 8)
+    return row_waves * WAVE_SIZE * per_lane_f32 * 4
+
+
+def _merge_kv_groups(*, state, qs, d_tiles, kv_group, row_warp, lane_idx, merge_lds):
+    """Merge the HI KV group's online-softmax state into the LO group's.
+
+    Both groups own the same rows with the same lane layout, so lane ``l`` of row-wave
+    ``w`` in HI hands its (m, d, O) to lane ``l`` of row-wave ``w`` in LO through
+    ``merge_lds``: each O v8 is two 512 B lane-contiguous b128 planes and m/d are 128 B
+    planes. HI stores and returns None; LO waits on the workgroup barrier, rescales
+    both partial states to the common max, and returns the merged state list.
+    """
+    R = WMMA_ROW_PER_WAVE
+    o_plane = WAVE_SIZE * 16
+    o_bytes = R * d_tiles * 2 * o_plane
+    wave_bytes = o_bytes + R * 2 * WAVE_SIZE * 4
+    wave_base = merge_lds + row_warp * fx.Int32(wave_bytes)
+    o_ptr = create_llvm_ptr(wave_base + lane_idx * fx.Int32(16), address_space=3)
+    md_ptr = create_llvm_ptr(
+        wave_base + fx.Int32(o_bytes) + lane_idx * fx.Int32(4), address_space=3
+    )
+
+    def at(ptr, imm):
+        return (
+            ptr if imm == 0 else buffer_ops.get_element_ptr(ptr, static_byte_offset=imm)
+        )
+
+    def o_imm(qt, dt, half):
+        return ((qt * d_tiles + dt) * 2 + half) * o_plane
+
+    def md_imm(qt, j):
+        return (qt * 2 + j) * WAVE_SIZE * 4
+
+    if kv_group != 0:
+        for qt in range(R):
+            for j in range(2):
+                llvm_dialect.store(state[qt * qs + j], at(md_ptr, md_imm(qt, j)))
+            for dt in range(d_tiles):
+                o = fx.Vector(state[qt * qs + 2 + dt])
+                for half in range(2):
+                    part = o.shuffle(o, list(range(half * 4, half * 4 + 4)))
+                    llvm_dialect.store(
+                        _ir(part), at(o_ptr, o_imm(qt, dt, half)), alignment=16
+                    )
+        rocdl.s_wait_dscnt(0)
+        gpu.barrier()
+        return None
+
+    gpu.barrier()
+    fast = arith.FastMathFlags.fast
+    log2e = fx.Float32(LOG2E)
+    v4_ty = fx.Vector.make_type(4, fx.Float32)
+    merged = []
+    for qt in range(R):
+        m_a = fx.Float32(state[qt * qs])
+        d_a = fx.Float32(state[qt * qs + 1])
+        m_b = fx.Float32(llvm_dialect.load(T.f32, at(md_ptr, md_imm(qt, 0))))
+        d_b = fx.Float32(llvm_dialect.load(T.f32, at(md_ptr, md_imm(qt, 1))))
+        m = fx.Float32(arith.MaxNumFOp(_raw(m_a), _raw(m_b), fastmath=fast).result)
+        c_a = fx.Float32(rocdl.exp2(T.f32, _raw((m_a - m) * log2e)))
+        c_b = fx.Float32(rocdl.exp2(T.f32, _raw((m_b - m) * log2e)))
+        c_a_vec = fx.Vector.from_elements([c_a], fx.Float32).broadcast_to(8)
+        c_b_vec = fx.Vector.from_elements([c_b], fx.Float32).broadcast_to(8)
+        merged += [_raw(m), _raw(d_a * c_a + d_b * c_b)]
+        for dt in range(d_tiles):
+            lo = fx.Vector(llvm_dialect.load(v4_ty, at(o_ptr, o_imm(qt, dt, 0))))
+            hi = fx.Vector(llvm_dialect.load(v4_ty, at(o_ptr, o_imm(qt, dt, 1))))
+            o_b = lo.shuffle(hi, list(range(8)))
+            o_a = fx.Vector(state[qt * qs + 2 + dt])
+            merged.append(_raw(o_a * c_a_vec + o_b * c_b_vec))
+    return merged
+
+
 # ============================================================================
 # Shared, layout-agnostic compute core
 # ============================================================================
@@ -677,6 +763,7 @@ def _core_attention(
     warp_type,  # compile-time WarpType (LO_WARP / HI_WARP)
     lds_base,  # LDS base (fx.Int32), allocated once by the caller (_alloc_lds)
     elem_dtype,  # compile-time fx.BFloat16 / fx.Float16 for Q/K/V/P/O fragments
+    kv_split=1,  # compile-time wave groups splitting the KV tiles (KV_SPLIT_CHOICES)
 ):
     """Layout-agnostic m32x8 compute — empty scaffold.
 
@@ -688,22 +775,31 @@ def _core_attention(
     body TWICE (once per compile-time ``warp_type``); the two instantiations differ in
     the ``main_loop`` preamble ordering (LO drives K load, HI shadows it) and rendezvous
     on a 2-wave named barrier (``_named_barrier_pair``, currently a no-op stub).
+    With ``kv_split == 2`` the LO and HI halves are also the two KV groups.
     """
+    assert kv_split in KV_SPLIT_CHOICES, f"kv_split must be in {KV_SPLIT_CHOICES}"
+    assert kv_split == 1 or USE_TDM_LOADER, "kv_split > 1 needs the TDM loaders"
+    row_waves = NUM_WAVES // kv_split  # waves tiling the q rows of one KV group
+    block_m = WMMA_M * WMMA_ROW_PER_WAVE * row_waves
+    kv_group = int(warp_type) if kv_split > 1 else 0
+    load_block = n_block * kv_split  # KV rows per TDM load / ping-pong slot
     lane_idx = _lane_id()
+    row_warp = warp_idx - fx.Int32(kv_group * row_waves)
     q_head_idx, seq_idx = _packed_tile_indices(
-        gqa_ratio, block_x, kv_head, warp_idx, lane_idx
+        gqa_ratio, block_m, block_x, kv_head, row_warp, lane_idx
     )
 
     # K/V staging: N_KV_PP ping-pong slots ([K.pp0|V.pp0][K.pp1|V.pp1]), blocks floored
     # at 64KB. O reuses a non-current slot; Q time-shares slot 1, so the slot must also
     # be >= the Q staging footprint (at qk_hdim=256 that exceeds K|V+128KB -> we grow the
     # slot, "allocating additional space for K|V"; still occupancy=1). slot_bytes is
-    # compile-time (no allocation; lds_base is passed in).
+    # compile-time (no allocation; lds_base is passed in). A slot holds load_block KV
+    # rows; KV group g reads the n_block rows at g*n_block.
     if USE_TDM_LOADER:
         q_mgr = QManager16bV2(
             qk_hdim=qk_hdim,
             gqa_ratio=gqa_ratio,
-            num_waves=NUM_WAVES,
+            num_waves=row_waves,
             q_tiles_per_wave=WMMA_ROW_PER_WAVE,
             elem_dtype=elem_dtype,
         )
@@ -716,6 +812,20 @@ def _core_attention(
         v_mgr = VManager16bV2(
             v_hdim=v_hdim, n_block=n_block, num_waves=NUM_WAVES, elem_dtype=elem_dtype
         )
+        k_load_mgr, v_load_mgr = k_mgr, v_mgr
+        if kv_split > 1:
+            k_load_mgr = KManager16bV2(
+                qk_hdim=qk_hdim,
+                n_block=load_block,
+                num_waves=NUM_WAVES,
+                elem_dtype=elem_dtype,
+            )
+            v_load_mgr = VManager16bV2(
+                v_hdim=v_hdim,
+                n_block=load_block,
+                num_waves=NUM_WAVES,
+                elem_dtype=elem_dtype,
+            )
     else:
         q_mgr = QManager16bV1(
             qk_hdim=qk_hdim,
@@ -733,9 +843,13 @@ def _core_attention(
         v_mgr = VManager16bV1(
             v_hdim=v_hdim, n_block=n_block, num_waves=NUM_WAVES, elem_dtype=elem_dtype
         )
-    k_blk_bytes = max(k_mgr.get_lds_size_in_byte(), MIN_KV_BLK_BYTES)
-    v_blk_bytes = max(v_mgr.get_lds_size_in_byte(), MIN_KV_BLK_BYTES)
-    slot_bytes = max(k_blk_bytes + v_blk_bytes, q_mgr.get_lds_size_in_byte())
+        k_load_mgr, v_load_mgr = k_mgr, v_mgr
+    k_blk_bytes = max(k_load_mgr.get_lds_size_in_byte(), MIN_KV_BLK_BYTES)
+    v_blk_bytes = max(v_load_mgr.get_lds_size_in_byte(), MIN_KV_BLK_BYTES)
+    q_group_bytes = q_mgr.get_lds_size_in_byte()
+    slot_bytes = max(k_blk_bytes + v_blk_bytes, kv_split * q_group_bytes)
+    k_group_off = kv_group * k_mgr.get_lds_size_in_byte()
+    v_group_off = kv_group * v_mgr.get_lds_size_in_byte()
 
     def _k_lds_buf(
         pp,
@@ -754,8 +868,9 @@ def _core_attention(
     # main loop's first slot-1 prefetch reuses the region. Safe with zero new sync —
     # the prologue drains Q (part2) -> s_wait_asynccnt(0) -> gpu.barrier() BEFORE the
     # loop, and prologue K/V loads target slot 0. slot_bytes >= Q footprint by
-    # construction (see above), so Q always fits in slot 1. ----
-    q_lds_base = lds_base + fx.Int32(slot_bytes)
+    # construction (see above), so Q always fits in slot 1. Each KV group stages its
+    # own copy of the shared Q rows. ----
+    q_lds_base = lds_base + fx.Int32(slot_bytes + kv_group * q_group_bytes)
 
     q_mgr.load_q_to_vgpr_part1(
         ptr_Q=ptr_Q,
@@ -765,7 +880,7 @@ def _core_attention(
         q_len=q_len,
         kv_head=kv_head,
         block_x=block_x,
-        warp_idx=warp_idx,
+        warp_idx=row_warp,
         lane_idx=lane_idx,
         ptr_lds=q_lds_base,
     )
@@ -780,7 +895,7 @@ def _core_attention(
     # band start. Non-mask_left: start at tile 0.
     causal_off = kv_len - q_len
     if mask_right:
-        wg_max_seq = (block_x * fx.Int32(BLOCK_M) + fx.Int32(BLOCK_M - 1)) // fx.Int32(
+        wg_max_seq = (block_x * fx.Int32(block_m) + fx.Int32(block_m - 1)) // fx.Int32(
             gqa_ratio
         )
         wg_max_seq = fx.min(wg_max_seq, q_len - fx.Int32(1))
@@ -796,19 +911,22 @@ def _core_attention(
     # WG whose whole band is empty (its per-element masks zero the work anyway).
     n_tiles = fx.ceildiv(kv_len_wg, fx.Int32(n_block))
     if mask_left:
-        wg_min_seq = (block_x * fx.Int32(BLOCK_M)) // fx.Int32(gqa_ratio)
+        wg_min_seq = (block_x * fx.Int32(block_m)) // fx.Int32(gqa_ratio)
         kv_lo = fx.max(wg_min_seq + causal_off - window_left, fx.Int32(0))
         start_tile = kv_lo // fx.Int32(n_block)
         start_tile = fx.min(start_tile, fx.Int32(n_tiles) - fx.Int32(1))
     else:
         start_tile = fx.Int32(0)
+    # Local iterations over load_block-row KV loads; the last one may end in an
+    # n_block sub-tile past kv_len_wg, which the right-edge masks zero out.
+    n_iter = fx.ceildiv(fx.Int32(n_tiles) - start_tile, fx.Int32(kv_split))
 
     def _kv_valid(blk_row0):
-        # How many rows of [blk_row0, blk_row0+n_block) are in-bounds, clamped to
-        # the WG's effective KV length kv_len_wg (0..n_block). Past the end -> 0 (a
-        # harmless clamped load that is never consumed).
+        # How many rows of [blk_row0, blk_row0+load_block) are in-bounds, clamped to
+        # the WG's effective KV length kv_len_wg (0..load_block). Past the end -> 0
+        # (a harmless clamped load that is never consumed).
         rem = fx.max(kv_len_wg - blk_row0, fx.Int32(0))
-        return fx.min(rem, fx.Int32(n_block))
+        return fx.min(rem, fx.Int32(load_block))
 
     # ---- Prologue (reordered for the mode-2 hang investigation): compute all K/V
     # addresses AND the loop-init in the Q global-load shadow, then run part2 (Q
@@ -829,9 +947,10 @@ def _core_attention(
     start_pp = 0
     start_row0 = start_tile * fx.Int32(n_block)
     if USE_TDM_LOADER:
-        # V2: build the TDM copy views for the first tile (pure), run Q part2, then issue
-        # the K/V TDM copies and drain with tensor_wait before the prologue barrier.
-        k_views = k_mgr.load_views(
+        # V2: build the TDM copy views for the first tile (pure) and issue them behind
+        # the Q copy so both global round trips overlap; part2's tensor_wait(0) drains
+        # this wave's Q and K/V copies, and the barrier publishes every wave's K/V.
+        k_views = k_load_mgr.load_views(
             ptr_lds=_k_lds_buf(start_pp),
             ptr_K=ptr_K,
             stride_k_seq=stride_k_seq,
@@ -840,7 +959,7 @@ def _core_attention(
             kv_row0=kv_start + start_row0,
             kv_valid=_kv_valid(start_row0),
         )
-        v_views = v_mgr.load_views(
+        v_views = v_load_mgr.load_views(
             ptr_lds=_v_lds_buf(start_pp),
             ptr_V=ptr_V,
             stride_v_seq=stride_v_seq,
@@ -849,12 +968,11 @@ def _core_attention(
             kv_row0=kv_start + start_row0,
             kv_valid=_kv_valid(start_row0),
         )
-        q_frags = q_mgr.load_q_to_vgpr_part2(scale=softmax_scale)
         for _v in k_views:
             fx.copy_atom_call(*_v)
         for _v in v_views:
             fx.copy_atom_call(*_v)
-        tdm_ops.tensor_wait(0)
+        q_frags = q_mgr.load_q_to_vgpr_part2(scale=softmax_scale)
         gpu.barrier()
     else:
         k_gptrs, k_lds_ptrs, k_imm_offs = k_mgr.global_load_ptrs(
@@ -908,7 +1026,8 @@ def _core_attention(
     d_tiles = v_hdim // WMMA_M
     R = WMMA_ROW_PER_WAVE
     _QS = 2 + d_tiles  # per-q-tile carried state: [m, d, O_0 .. O_{d_tiles-1}]
-    if has_sink:
+    # Only KV group 0 carries the sink term so the merge counts it once.
+    if has_sink and kv_group == 0:
         num_heads_q = num_heads_kv * fx.Int32(gqa_ratio)
         m_init = [
             _load_sink_logit(ptr_sink, q_head_idx[qt], num_heads_q) for qt in range(R)
@@ -931,10 +1050,20 @@ def _core_attention(
     # swapped curr<->next each iteration (buffer selected by pointer). Base count per mgr
     # is manager-defined (V1: 2, V2: 1) — carried generically. Same machinery for V1/V2;
     # only the global->LDS ISSUE (_addr_phase/_prefetch/_drain) differs. ----
-    k_lds_ld_curr = k_mgr.ds_load_ptrs(ptr_lds=_k_lds_buf(0), lane_idx=lane_idx)
-    v_lds_ld_curr = v_mgr.ds_load_ptrs(ptr_lds=_v_lds_buf(0), lane_idx=lane_idx)
-    k_lds_ld_next = k_mgr.ds_load_ptrs(ptr_lds=_k_lds_buf(1), lane_idx=lane_idx)
-    v_lds_ld_next = v_mgr.ds_load_ptrs(ptr_lds=_v_lds_buf(1), lane_idx=lane_idx)
+    def _k_ds_ptrs(pp):
+        return k_mgr.ds_load_ptrs(
+            ptr_lds=_k_lds_buf(pp) + fx.Int32(k_group_off), lane_idx=lane_idx
+        )
+
+    def _v_ds_ptrs(pp):
+        return v_mgr.ds_load_ptrs(
+            ptr_lds=_v_lds_buf(pp) + fx.Int32(v_group_off), lane_idx=lane_idx
+        )
+
+    k_lds_ld_curr = _k_ds_ptrs(0)
+    v_lds_ld_curr = _v_ds_ptrs(0)
+    k_lds_ld_next = _k_ds_ptrs(1)
+    v_lds_ld_next = _v_ds_ptrs(1)
     _NKB = len(k_lds_ld_curr)  # ds bases per K buffer (V1: 2, V2: 1)
     _NVB = len(v_lds_ld_curr)
     _PTR_BASE = len(_init)
@@ -954,18 +1083,21 @@ def _core_attention(
     # TODO(perf): go finer still -- per-write-tile async_load interleaved between the
     # QK/softmax/PV ops (order tuned by thread trace) rather than one bulk burst.
     # ========================================================================
-    def main_loop(t, state, *, mask_left, mask_right, kv_len):
+    def main_loop(u, state, *, mask_left, mask_right, kv_len):
         # mask_left/mask_right/kv_len shadow the closure flags: the caller splits the
         # tile stream into a mask-free clean region + boundary loops and passes None for
         # any edge this sub-loop provably doesn't cross (compile-time gate).
         #
+        # ``u`` is the LOCAL load index: load u holds batch-relative KV rows
+        # [start_row0 + u*load_block, +load_block); this KV group computes its n_block.
         # Runtime ping-pong: this tile reads its curr buffer (carried curr pointers); the
-        # tile t+1 prefetch writes the next buffer, and curr<->next are swapped in the yield.
-        nxt_pp = (t - start_tile + fx.Int32(1)) % fx.Int32(2)
+        # load u+1 prefetch writes the next buffer, and curr<->next are swapped in the yield.
+        nxt_pp = (u + fx.Int32(1)) % fx.Int32(2)
 
-        kv_tile_start = t * fx.Int32(
-            n_block
-        )  # this tile's first (batch-relative) kv row
+        blk_row0 = start_row0 + u * fx.Int32(load_block)
+        kv_tile_start = blk_row0 + fx.Int32(
+            kv_group * n_block
+        )  # this group's first (batch-relative) kv row
 
         # Unpack loop-carried state — R independent per-q-tile (m, d, O) groups,
         # then the shared K/V ds pointers.
@@ -987,15 +1119,15 @@ def _core_attention(
         # barrier); the rendezvous is a perf-only stagger. The READ (load_k_to_reg(k_curr))
         # and ping-pong pointer machinery are UNIFORM; only the global->LDS ISSUE branches
         # by USE_TDM_LOADER (V1 cluster_load_async / V2 TDM copy).
-        nxt = t + fx.Int32(1)
-        nxt_row0 = nxt * fx.Int32(n_block)
+        nxt = u + fx.Int32(1)
+        nxt_row0 = blk_row0 + fx.Int32(load_block)
         nxt_valid = _kv_valid(nxt_row0)
 
         def _addr_phase():
             # Pure (no memory op) -> hoistable: V2 the TDM copy views, V1 the per-lane
-            # global/LDS pointer lists, for tile t+1's K/V into the nxt_pp buffer.
+            # global/LDS pointer lists, for load u+1's K/V into the nxt_pp buffer.
             if USE_TDM_LOADER:
-                k_views = k_mgr.load_views(
+                k_views = k_load_mgr.load_views(
                     ptr_lds=_k_lds_buf(nxt_pp),
                     ptr_K=ptr_K,
                     stride_k_seq=stride_k_seq,
@@ -1004,7 +1136,7 @@ def _core_attention(
                     kv_row0=kv_start + nxt_row0,
                     kv_valid=nxt_valid,
                 )
-                v_views = v_mgr.load_views(
+                v_views = v_load_mgr.load_views(
                     ptr_lds=_v_lds_buf(nxt_pp),
                     ptr_V=ptr_V,
                     stride_v_seq=stride_v_seq,
@@ -1048,11 +1180,11 @@ def _core_attention(
             rocdl.sched_barrier(0)
 
         def _prefetch(addr):
-            # Skip t+1 prefetch on the last tile: a dead copy into the O-epilogue slot
-            # races the epilogue O write across waves.
+            # Skip the u+1 prefetch on the last load: a dead copy into the O-epilogue
+            # slot races the epilogue O write across waves.
             @flyc.jit
             def _issue():
-                if nxt < fx.Int32(n_tiles):
+                if nxt < n_iter:
                     if USE_TDM_LOADER:
                         k_views, v_views = addr
                         for _v in k_views:
@@ -1186,14 +1318,15 @@ def _core_attention(
     #   [start_tile, clean_lo) left boundary   (emitted only when mask_left)
     #   [clean_lo,   clean_hi) clean, no mask
     #   [clean_hi,   n_tiles)  right boundary + kv_len tail (last tile)
-    n_iter = fx.Int32(n_tiles) - start_tile
+    # The sub-loops iterate local loads; a load is clean only if all its kv_split
+    # sub-tiles are, so the last load always runs in the right-boundary loop.
     n_last = fx.Int32(n_tiles) - fx.Int32(1)  # last tile always carries the kv_len tail
 
     # clean_hi = first tile that could need RIGHT masking = the WG's earliest query's
     # diagonal tile ((min q_max + 1)//n_block). Kept <= n_last so the tail tile stays in
     # the right loop, and >= start_tile for a valid partition.
     if mask_right:
-        wg_min_seq = (block_x * fx.Int32(BLOCK_M)) // fx.Int32(gqa_ratio)
+        wg_min_seq = (block_x * fx.Int32(block_m)) // fx.Int32(gqa_ratio)
         qmax_min = fx.max(wg_min_seq + causal_off + window_right, fx.Int32(0))
         clean_hi = (qmax_min + fx.Int32(1)) // fx.Int32(n_block)
     else:
@@ -1204,7 +1337,7 @@ def _core_attention(
     # (ceildiv(max q_min, n_block)); clamped into [start_tile, clean_hi].
     if mask_left:
         wg_max_seq = fx.min(
-            (block_x * fx.Int32(BLOCK_M) + fx.Int32(BLOCK_M - 1))
+            (block_x * fx.Int32(block_m) + fx.Int32(block_m - 1))
             // fx.Int32(gqa_ratio),
             q_len - fx.Int32(1),
         )
@@ -1213,6 +1346,13 @@ def _core_attention(
     else:
         clean_lo = start_tile
     clean_lo = fx.min(fx.max(clean_lo, start_tile), clean_hi)
+
+    clean_hi_u = fx.min(
+        (clean_hi - start_tile) // fx.Int32(kv_split), n_iter - fx.Int32(1)
+    )
+    clean_lo_u = fx.min(
+        fx.ceildiv(clean_lo - start_tile, fx.Int32(kv_split)), clean_hi_u
+    )
 
     @flyc.jit
     def _run_tiles(state, lo_i32, hi_i32, *, mask_left, mask_right, kv_len):
@@ -1232,19 +1372,19 @@ def _core_attention(
     if mask_left:
         state = _run_tiles(
             state,
-            start_tile,
-            clean_lo,
+            fx.Int32(0),
+            clean_lo_u,
             mask_left=mask_left,
             mask_right=mask_right,
             kv_len=None,
         )
     state = _run_tiles(
-        state, clean_lo, clean_hi, mask_left=None, mask_right=None, kv_len=None
+        state, clean_lo_u, clean_hi_u, mask_left=None, mask_right=None, kv_len=None
     )
     state = _run_tiles(
         state,
-        clean_hi,
-        fx.Int32(n_tiles),
+        clean_hi_u,
+        n_iter,
         mask_left=mask_left,
         mask_right=mask_right,
         kv_len=kv_len,
@@ -1273,22 +1413,38 @@ def _core_attention(
     o_mgr = _OMgr(
         v_hdim=v_hdim,
         gqa_ratio=gqa_ratio,
-        num_waves=NUM_WAVES,
+        num_waves=row_waves,
         q_tiles_per_wave=R,
         elem_dtype=elem_dtype,
     )
-    assert (
-        o_mgr.get_lds_size_in_byte() <= slot_bytes
-    ), f"O ring budget {o_mgr.get_lds_size_in_byte()}B exceeds K|V slot {slot_bytes}B"
+    # With kv_split the HI group's merge state goes to the same idle slot, ahead of O.
+    merge_bytes = _kv_merge_bytes(row_waves, d_tiles) if kv_split > 1 else 0
+    assert merge_bytes + o_mgr.get_lds_size_in_byte() <= slot_bytes, (
+        f"merge {merge_bytes}B + O ring {o_mgr.get_lds_size_in_byte()}B exceeds "
+        f"K|V slot {slot_bytes}B"
+    )
+    assert 2 * slot_bytes <= get_lds_capacity_bytes("gfx1250"), "K/V slots exceed LDS"
     non_cur_pp = n_iter % fx.Int32(N_KV_PP)
     if not USE_TDM_LOADER:
         rocdl.s_wait_asynccnt(
             0
         )  # V1-only WAR: retire inflight async loads before slot reuse
+    if kv_split > 1:
+        final = _merge_kv_groups(
+            state=final,
+            qs=_QS,
+            d_tiles=d_tiles,
+            kv_group=kv_group,
+            row_warp=row_warp,
+            lane_idx=lane_idx,
+            merge_lds=_k_lds_buf(non_cur_pp),
+        )
+        if kv_group != 0:
+            return
     # O strides are in ELEMENTS (OManager multiplies by _BF16_BYTES itself). Both V1/V2
     # take ptr_O and build their own store descriptor internally (V1 a bounded buffer
     # resource for the masked buffer_store; V2 the TDM store atom with HW OOB drop).
-    o_lds_base = _k_lds_buf(non_cur_pp)
+    o_lds_base = _k_lds_buf(non_cur_pp) + fx.Int32(merge_bytes)
     for qt in range(R):
         # Normalize this q-tile's O by its running denom d, then reshape+store to VRAM.
         # o_final[dt] lane l elem si = sum_kv P[q,kv] V[kv, dt*16+(l//16)*8+si]
@@ -1317,7 +1473,7 @@ def _core_attention(
             q_len=q_len,
             kv_head=kv_head,
             block_x=block_x,
-            warp_idx=warp_idx,
+            warp_idx=row_warp,
             lane_idx=lane_idx,
             ptr_lds=o_lds_base,
             o_frags=o_norm,
@@ -1377,6 +1533,7 @@ def _zero_fill_attention(
     block_x,
     kv_head,
     num_heads_kv,
+    block_m,
     elem_dtype,
 ):
     """q_len>0 with kv_len==0 (cross-attention): softmax over an empty KV set, so O=0 for
@@ -1384,7 +1541,7 @@ def _zero_fill_attention(
     surviving softmax term is exp(sink) (sink value is 0, O stays 0). Flat coalesced b128
     write — consecutive lanes write consecutive 16-byte O chunks (no WMMA layout)."""
     tid = _warp_id() * fx.Int32(WAVE_SIZE) + _lane_id()
-    row0 = block_x * fx.Int32(BLOCK_M)
+    row0 = block_x * fx.Int32(block_m)
     g = fx.Int32(gqa_ratio)
     _CH = 8  # bf16 per b128 store
     cpr = v_hdim // _CH  # b128 chunks per O row
@@ -1398,7 +1555,7 @@ def _zero_fill_attention(
         ptr_O, num_records_bytes=o_num_records_bytes
     )
     zero_o = fx.Vector.filled(_CH, 0.0, elem_dtype)
-    for r in range(BLOCK_M * cpr // BLOCK_SIZE):
+    for r in range(block_m * cpr // BLOCK_SIZE):
         cix = fx.Int32(r * BLOCK_SIZE) + tid  # flat b128-chunk index this round
         prow = row0 + cix // fx.Int32(cpr)
         d = (cix % fx.Int32(cpr)) * fx.Int32(_CH)
@@ -1414,7 +1571,7 @@ def _zero_fill_attention(
         lse_rsrc = buffer_ops.create_buffer_resource(
             ptr_LSE, num_records_bytes=lse_num_records_bytes
         )
-        prow = row0 + tid  # one LSE per packed row (BLOCK_SIZE threads == BLOCK_M)
+        prow = row0 + tid  # one LSE per packed row (threads >= block_m write nothing)
         seq = prow // g
         head = kv_head * g + prow % g
         if has_sink:
@@ -1423,7 +1580,8 @@ def _zero_fill_attention(
         else:
             lse_val = fx.Float32(float("-inf"))
         off = (q_start + seq) * stride_lse_seq + head * stride_lse_head
-        off_masked = (seq < q_len).select(off * fx.Int32(4), fx.Int32(0x7FFFFFFF))
+        live = (seq < q_len) & (tid < fx.Int32(block_m))
+        off_masked = live.select(off * fx.Int32(4), fx.Int32(0x7FFFFFFF))
         buffer_ops.buffer_store(
             lse_val, lse_rsrc, off_masked, mask=None, offset_is_bytes=True
         )
@@ -1447,15 +1605,18 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
     return_lse: bool = False,
     has_sink: bool = False,
     gqa_ratio: int = 1,
+    kv_split: int = 1,
 ):
     """Build the m32x8 device kernel for a given layout + config.
 
     ``layout`` is ``"thd"`` (varlen) or ``"bshd"`` (batched). Compile-time
     parameters are captured here and baked into the traced kernel. ``gqa_ratio``
     (= ``nheads_q // nheads_kv``) is compile-time so the per-lane ``% / //`` fold
-    to shift/and when it is a power of two.
+    to shift/and when it is a power of two. ``kv_split`` (``KV_SPLIT_CHOICES``)
+    makes each workgroup own ``BLOCK_M // kv_split`` packed rows.
     """
     assert layout in ("thd", "bshd"), f"layout must be thd|bshd, got {layout!r}"
+    assert kv_split in KV_SPLIT_CHOICES, f"kv_split must be in {KV_SPLIT_CHOICES}"
     # qk_hdim in {128,192,256} (D_qk, WMMA_K multiple); v_hdim fixed at 128 (D_v).
     assert (
         qk_hdim in SUPPORTED_QK_HDIM and v_hdim == 128
@@ -1477,6 +1638,8 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
     RET_LSE = bool(return_lse)
     HAS_SINK = bool(has_sink)
     GQA_RATIO = int(gqa_ratio)
+    KV_SPLIT = int(kv_split)
+    WG_BLOCK_M = BLOCK_M // KV_SPLIT
 
     if layout == "thd":
 
@@ -1531,12 +1694,13 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
             # genuinely empty work. (varlen may carry a per-batch kv_len==0 tail.)
             # The grid covers max_seqlen_q, so tiles past this batch's packed rows
             # exit here instead of streaming the whole KV for fully masked rows.
-            tile_live = block_x * fx.Int32(BLOCK_M) < q_len * fx.Int32(GQA_RATIO)
+            tile_live = block_x * fx.Int32(WG_BLOCK_M) < q_len * fx.Int32(GQA_RATIO)
             if tile_live & (kv_len > fx.Int32(0)):
                 _ca_kw = {
                     "qk_hdim": QK_HDIM,
                     "v_hdim": V_HDIM,
                     "n_block": N_BLOCK,
+                    "kv_split": KV_SPLIT,
                     "mask_left": MASK_LEFT,
                     "mask_right": MASK_RIGHT,
                     "return_lse": RET_LSE,
@@ -1609,6 +1773,7 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
                     block_x=block_x,
                     kv_head=kv_head,
                     num_heads_kv=num_heads_kv,
+                    block_m=WG_BLOCK_M,
                     elem_dtype=ELEM_DTYPE,
                 )
 
@@ -1659,6 +1824,7 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
             "qk_hdim": QK_HDIM,
             "v_hdim": V_HDIM,
             "n_block": N_BLOCK,
+            "kv_split": KV_SPLIT,
             "mask_left": MASK_LEFT,
             "mask_right": MASK_RIGHT,
             "return_lse": RET_LSE,
@@ -1695,7 +1861,7 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
             "elem_dtype": ELEM_DTYPE,
         }
         # The grid rounds q tiles up to a multiple of NUM_XCC.
-        if block_x * fx.Int32(BLOCK_M) < seq_len_q * fx.Int32(GQA_RATIO):
+        if block_x * fx.Int32(WG_BLOCK_M) < seq_len_q * fx.Int32(GQA_RATIO):
             # Warp specialization: LO warp (waves 0..N/2-1) vs HI warp (N/2..N-1).
             lds_base = _alloc_lds()
             warp_idx = _warp_id()
@@ -1723,7 +1889,19 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
 
 _launch_fns = (
     {}
-)  # {(layout, mask_left, mask_right, return_lse, has_sink, gqa_ratio): fn}
+)  # {(layout, mask_left, mask_right, return_lse, has_sink, gqa_ratio, ...): fn}
+
+
+def _llvm_options(mask_left):
+    """LLVM options of one launch variant.
+
+    max-ILP scheduling measured +2-3% on sliding-window (finite left) launches and
+    up to -3% on causal ones, so only windowed variants take it.
+    """
+    opts = {"amdgpu-expert-scheduling-mode": ENABLE_SCHED_MODE2}
+    if mask_left:
+        opts["amdgpu-sched-strategy"] = "max-ilp"
+    return opts
 
 
 def _ensure_thd_kernel(
@@ -1734,6 +1912,7 @@ def _ensure_thd_kernel(
     gqa_ratio: int,
     qk_hdim: int = DEFAULT_QK_HDIM,
     dtype_str: str = DEFAULT_DTYPE,
+    kv_split: int = 1,
 ):
     key = (
         "thd",
@@ -1744,9 +1923,10 @@ def _ensure_thd_kernel(
         int(gqa_ratio),
         int(qk_hdim),
         str(dtype_str),
+        int(kv_split),
     )
     if key in _launch_fns:
-        return
+        return key
     kernel = build_fmha_fwd_prefill_a16w16_m32x8(
         layout="thd",
         qk_hdim=qk_hdim,
@@ -1756,7 +1936,9 @@ def _ensure_thd_kernel(
         has_sink=has_sink,
         gqa_ratio=gqa_ratio,
         dtype_str=dtype_str,
+        kv_split=kv_split,
     )
+    wg_block_m = BLOCK_M // kv_split
 
     @flyc.jit
     def _launch(
@@ -1789,7 +1971,9 @@ def _ensure_thd_kernel(
     ):
         # Grid (XCC phase x kv_head, batch, tile group), decoded by
         # _workgroup_coords. block = 256 (8 waves x wave32).
-        n_q_tiles = fx.ceildiv(fx.Uint32(max_seqlen_q * gqa_ratio), fx.Uint32(BLOCK_M))
+        n_q_tiles = fx.ceildiv(
+            fx.Uint32(max_seqlen_q * gqa_ratio), fx.Uint32(wg_block_m)
+        )
         grid_x = fx.Index(fx.Uint32(NUM_XCC) * fx.Uint32(num_heads_kv))
         grid_y = fx.Index(batch_size)
         grid_z = fx.Index(fx.ceildiv(n_q_tiles, fx.Uint32(NUM_XCC)))
@@ -1826,12 +2010,10 @@ def _ensure_thd_kernel(
             stream=stream,
         )
 
-    _launch.compile_hints["llvm_options"] = {
-        "amdgpu-expert-scheduling-mode": ENABLE_SCHED_MODE2,
-        # "amdgpu-sched-strategy": "coexec",  # gfx1250 co-exec sched; revisit after named barrier
-    }
+    _launch.compile_hints["llvm_options"] = _llvm_options(mask_left)
     _launch.compile_hints["waves_per_eu"] = 2
     _launch_fns[key] = _launch
+    return key
 
 
 def _ensure_bshd_kernel(
@@ -1842,6 +2024,7 @@ def _ensure_bshd_kernel(
     gqa_ratio: int,
     qk_hdim: int = DEFAULT_QK_HDIM,
     dtype_str: str = DEFAULT_DTYPE,
+    kv_split: int = 1,
 ):
     key = (
         "bshd",
@@ -1852,9 +2035,10 @@ def _ensure_bshd_kernel(
         int(gqa_ratio),
         int(qk_hdim),
         str(dtype_str),
+        int(kv_split),
     )
     if key in _launch_fns:
-        return
+        return key
     kernel = build_fmha_fwd_prefill_a16w16_m32x8(
         layout="bshd",
         qk_hdim=qk_hdim,
@@ -1864,7 +2048,9 @@ def _ensure_bshd_kernel(
         has_sink=has_sink,
         gqa_ratio=gqa_ratio,
         dtype_str=dtype_str,
+        kv_split=kv_split,
     )
+    wg_block_m = BLOCK_M // kv_split
 
     @flyc.jit
     def _launch(
@@ -1896,7 +2082,7 @@ def _ensure_bshd_kernel(
     ):
         # Grid (XCC phase x kv_head, batch, tile group), decoded by
         # _workgroup_coords. block = 256 (8 waves x wave32).
-        n_q_tiles = fx.ceildiv(fx.Uint32(seq_len_q * gqa_ratio), fx.Uint32(BLOCK_M))
+        n_q_tiles = fx.ceildiv(fx.Uint32(seq_len_q * gqa_ratio), fx.Uint32(wg_block_m))
         grid_x = fx.Index(fx.Uint32(NUM_XCC) * fx.Uint32(num_heads_kv))
         grid_y = fx.Index(batch_size)
         grid_z = fx.Index(fx.ceildiv(n_q_tiles, fx.Uint32(NUM_XCC)))
@@ -1932,12 +2118,41 @@ def _ensure_bshd_kernel(
             stream=stream,
         )
 
-    _launch.compile_hints["llvm_options"] = {
-        "amdgpu-expert-scheduling-mode": ENABLE_SCHED_MODE2,
-        # "amdgpu-sched-strategy": "coexec",  # gfx1250 co-exec sched; revisit after named barrier
-    }
+    _launch.compile_hints["llvm_options"] = _llvm_options(mask_left)
     _launch.compile_hints["waves_per_eu"] = 2
     _launch_fns[key] = _launch
+    return key
+
+
+@functools.cache
+def _num_cus(device_index):
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _select_kv_split(
+    *, mask_left, mask_right, qk_hdim, packed_rows, uniform, max_seqlen_k, device
+):
+    """``kv_split`` for one launch (see ``KV_SPLIT_CHOICES``), measured on gfx1250.
+
+    Splitting doubles the workgroups and halves the longest q tile's KV walk, so it
+    pays when that walk, not total work, bounds a causal launch: always while the
+    split grid still fits one wave per CU, and for at most one unsplit wave (1.5 for
+    ragged batches, whose packed rows overstate the work) once the walk is long
+    enough to amortize a second workgroup per CU. Windowed (finite left) launches
+    have near-uniform per-tile cost and keep the unsplit tile.
+    """
+    if not mask_right or mask_left or qk_hdim != DEFAULT_QK_HDIM:
+        return 1
+    if max_seqlen_k <= DEFAULT_N_BLOCK:
+        return 1
+    workgroups = -(-packed_rows // BLOCK_M)
+    cus = _num_cus(device.index)
+    if workgroups <= cus // 2:
+        return 2
+    max_workgroups = cus if uniform else cus * 3 // 2
+    if max_seqlen_k >= _KV_SPLIT_MIN_SEQLEN and workgroups <= max_workgroups:
+        return 2
+    return 1
 
 
 def flash_attn_varlen_m32x8(
@@ -2040,7 +2255,7 @@ def flash_attn_varlen_m32x8(
     stride_v_head = v.stride(1)
     stride_o_head = out.stride(1)
 
-    _ensure_thd_kernel(
+    key = _ensure_thd_kernel(
         mask_left,
         mask_right,
         bool(return_lse),
@@ -2048,21 +2263,19 @@ def flash_attn_varlen_m32x8(
         gqa,
         qk_hdim=qk_hdim,
         dtype_str=dtype_str,
+        kv_split=_select_kv_split(
+            mask_left=mask_left,
+            mask_right=mask_right,
+            qk_hdim=qk_hdim,
+            packed_rows=total_q_tokens * nheads_q,
+            uniform=total_q_tokens == batch * max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            device=q.device,
+        ),
     )
 
     _run_compiled(
-        _launch_fns[
-            (
-                "thd",
-                mask_left,
-                mask_right,
-                bool(return_lse),
-                has_sink,
-                gqa,
-                qk_hdim,
-                dtype_str,
-            )
-        ],
+        _launch_fns[key],
         out,
         q,
         k,
@@ -2215,7 +2428,7 @@ def flash_attn_batch_m32x8(
     stride_v_head = v.stride(2)
     stride_o_head = out.stride(2)
 
-    _ensure_bshd_kernel(
+    key = _ensure_bshd_kernel(
         mask_left,
         mask_right,
         bool(return_lse),
@@ -2223,21 +2436,19 @@ def flash_attn_batch_m32x8(
         gqa,
         qk_hdim=qk_hdim,
         dtype_str=dtype_str,
+        kv_split=_select_kv_split(
+            mask_left=mask_left,
+            mask_right=mask_right,
+            qk_hdim=qk_hdim,
+            packed_rows=batch * seq_len_q * nheads_q,
+            uniform=True,
+            max_seqlen_k=seq_len_k,
+            device=q.device,
+        ),
     )
 
     _run_compiled(
-        _launch_fns[
-            (
-                "bshd",
-                mask_left,
-                mask_right,
-                bool(return_lse),
-                has_sink,
-                gqa,
-                qk_hdim,
-                dtype_str,
-            )
-        ],
+        _launch_fns[key],
         out,
         q,
         k,

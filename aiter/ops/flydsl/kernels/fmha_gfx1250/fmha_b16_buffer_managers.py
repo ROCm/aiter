@@ -997,6 +997,9 @@ class QManager16bV2:
     A 3-D ``[n_seq, gqa_ratio, hdim]`` descriptor carries the GQA row-packing (packed row
     ``pr`` -> seq ``pr//gqa``, head ``kv_head*gqa + pr%gqa``); it degenerates to ``[rows, 1, hdim]``
     at gqa==1. LDS is plain row-major with ``hdim + _Q_PAD_ELEMS`` element row stride (matches K).
+
+    ``num_waves`` is the number of waves tiling the Q rows (``block_m = rows_per_warp *
+    num_waves``); a workgroup that splits KV across wave groups passes its per-group count.
     """
 
     def __init__(
@@ -1012,8 +1015,10 @@ class QManager16bV2:
         self.elem_dtype = elem_dtype
         if qk_hdim % _WMMA_K != 0:
             raise ValueError(f"qk_hdim must be a multiple of {_WMMA_K}; got {qk_hdim}")
-        if num_waves != _DEFAULT_NUM_WAVES:
-            raise NotImplementedError("V2 TDM loader assumes 8 waves")
+        if _DEFAULT_NUM_WAVES % num_waves != 0:
+            raise NotImplementedError(
+                f"Q row waves must divide {_DEFAULT_NUM_WAVES}; got {num_waves}"
+            )
         self.qk_hdim = qk_hdim  # compile-time
         self.gqa_ratio = gqa_ratio  # compile-time
         self.num_waves = num_waves
@@ -1731,6 +1736,9 @@ class OManager16bV3:
     LDS->global over ``n_rounds`` waves of 32 lanes: round r lane l -> chunk c=r*32+l, row=c//cpr,
     d_chunk=c%cpr (cpr = v_hdim/8) -> coalesced (consecutive lanes = consecutive global).
     Rows at seq>=q_len are masked off because async stores have no bounds check.
+
+    ``num_waves`` is the number of waves owning O rows (``block_m = rows_per_warp *
+    num_waves``); a workgroup that splits KV across wave groups passes its per-group count.
     """
 
     def __init__(
@@ -1745,8 +1753,10 @@ class OManager16bV3:
         self.elem_dtype = elem_dtype
         if v_hdim % _WMMA_M != 0:
             raise ValueError(f"v_hdim must be a multiple of {_WMMA_M}; got {v_hdim}")
-        if num_waves != _DEFAULT_NUM_WAVES:
-            raise NotImplementedError("V3 assumes 8 waves")
+        if _DEFAULT_NUM_WAVES % num_waves != 0:
+            raise NotImplementedError(
+                f"O row waves must divide {_DEFAULT_NUM_WAVES}; got {num_waves}"
+            )
         self.v_hdim = v_hdim
         self.gqa_ratio = gqa_ratio
         self.num_waves = num_waves
