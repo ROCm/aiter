@@ -549,7 +549,7 @@ def compress_norm_rope_store_triton(
             f"got {head_dim}; use vLLM's launcher for the indexer path"
         )
     kernel = _fused_kv_compress_norm_rope_insert_sparse_attn
-    num_warps = 4
+    num_warps = 8
     kernel_kwargs = {"SANITIZE_CACHE_NANS": _ON_GFX950}
 
     kernel[(num_actual,)](

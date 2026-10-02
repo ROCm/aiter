@@ -861,26 +861,34 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
         # NaN and 0 * NaN poisons a whole score row
         tl.store(scale_ptr + N_NOPE_BLOCKS, tl.zeros((), dtype=tl.uint8))
 
-    # Register-based GPT-J RoPE in fp32.
+    # GPT-J RoPE, full width. Splitting the pair into even and odd halves and
+    # rebuilding a full-width value from them costs registers. The identity
+    # used by _triton_kernels/rope/rope.py needs neither: for a pair (x0, x1)
+    # the rotation is
+    #
+    #     out = x * cos + rot * sin,      rot = (-x1, x0)
+    #
+    # and rot is just a sign flip on the even lane followed by a flip of the
+    # minor axis, so every value stays in its own lane. cos/sin are loaded per
+    # LANE (index lane//2) rather than per pair, which reads each entry twice
+    # from cache but removes the broadcast.
     NUM_PAIRS: tl.constexpr = TRITON_BLOCK_SIZE // 2
     NOPE_PAIRS: tl.constexpr = NOPE_HEAD_DIM // 2
 
-    pair_2d = tl.reshape(normed, (NUM_PAIRS, 2))
-    even, odd = tl.split(pair_2d)  # each [NUM_PAIRS] fp32
-
-    pair_idx = tl.arange(0, NUM_PAIRS)
-    rope_pair_local = pair_idx - NOPE_PAIRS
-    is_rope_pair = rope_pair_local >= 0
+    rope_pair_local = (block // 2) - NOPE_PAIRS
+    is_rope_lane = rope_pair_local >= 0
     cs_idx = tl.maximum(rope_pair_local, 0)
 
     compressed_pos = (position // COMPRESS_RATIO) * COMPRESS_RATIO
     cache_base = cos_sin_cache_ptr + compressed_pos * cos_sin_stride
-    cos_v = tl.load(cache_base + cs_idx, mask=is_rope_pair, other=1.0)
-    sin_v = tl.load(cache_base + HALF_ROPE + cs_idx, mask=is_rope_pair, other=0.0)
+    cos_v = tl.load(cache_base + cs_idx, mask=is_rope_lane, other=1.0)
+    sin_v = tl.load(cache_base + HALF_ROPE + cs_idx, mask=is_rope_lane, other=0.0)
 
-    new_even = even * cos_v - odd * sin_v
-    new_odd = odd * cos_v + even * sin_v
-    result = tl.interleave(new_even, new_odd)  # [TRITON_BLOCK_SIZE] fp32
+    rot = tl.where(block % 2 == 0, normed, -normed)
+    rot = tl.reshape(rot, (NUM_PAIRS, 2))
+    rot = tl.flip(rot, 1)
+    rot = tl.reshape(rot, (TRITON_BLOCK_SIZE,))
+    result = normed * cos_v + rot * sin_v
     if SANITIZE_CACHE_NANS:
         result = tl.where(result == result, result, 0.0)
 
@@ -1072,20 +1080,34 @@ def _finalize_norm_rope_quant_store_sparse_attn(
     else:
         tl.store(scale_ptr + N_NOPE_BLOCKS, tl.zeros((), dtype=tl.uint8))
 
+    # GPT-J RoPE, full width. Splitting the pair into even and odd halves and
+    # rebuilding a full-width value from them costs registers. The identity
+    # used by _triton_kernels/rope/rope.py needs neither: for a pair (x0, x1)
+    # the rotation is
+    #
+    #     out = x * cos + rot * sin,      rot = (-x1, x0)
+    #
+    # and rot is just a sign flip on the even lane followed by a flip of the
+    # minor axis, so every value stays in its own lane. cos/sin are loaded per
+    # LANE (index lane//2) rather than per pair, which reads each entry twice
+    # from cache but removes the broadcast.
     NUM_PAIRS: tl.constexpr = TRITON_BLOCK_SIZE // 2
     NOPE_PAIRS: tl.constexpr = NOPE_HEAD_DIM // 2
-    even, odd = tl.split(tl.reshape(normed, (NUM_PAIRS, 2)))
-    pair_idx = tl.arange(0, NUM_PAIRS)
-    rope_pair_local = pair_idx - NOPE_PAIRS
-    is_rope_pair = rope_pair_local >= 0
+
+    rope_pair_local = (block // 2) - NOPE_PAIRS
+    is_rope_lane = rope_pair_local >= 0
     cs_idx = tl.maximum(rope_pair_local, 0)
+
     compressed_pos = (position // COMPRESS_RATIO) * COMPRESS_RATIO
     cache_base = cos_sin_cache_ptr + compressed_pos * cos_sin_stride
-    cos_v = tl.load(cache_base + cs_idx, mask=is_rope_pair, other=1.0)
-    sin_v = tl.load(cache_base + HALF_ROPE + cs_idx, mask=is_rope_pair, other=0.0)
-    new_even = even * cos_v - odd * sin_v
-    new_odd = odd * cos_v + even * sin_v
-    result = tl.interleave(new_even, new_odd)
+    cos_v = tl.load(cache_base + cs_idx, mask=is_rope_lane, other=1.0)
+    sin_v = tl.load(cache_base + HALF_ROPE + cs_idx, mask=is_rope_lane, other=0.0)
+
+    rot = tl.where(block % 2 == 0, normed, -normed)
+    rot = tl.reshape(rot, (NUM_PAIRS, 2))
+    rot = tl.flip(rot, 1)
+    rot = tl.reshape(rot, (TRITON_BLOCK_SIZE,))
+    result = normed * cos_v + rot * sin_v
     if SANITIZE_CACHE_NANS:
         result = tl.where(result == result, result, 0.0)
     bf16_ptr = (fp8_ptr + ROPE_IN_REC).to(tl.pointer_type(tl.bfloat16))
