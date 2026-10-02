@@ -22,6 +22,7 @@ from flydsl._mlir.dialects import llvm as _llvm_d
 from flydsl._mlir.dialects import rocdl as _rocdl_d
 from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import arith
+from flydsl.expr.rocdl import readfirstlane
 from flydsl.expr.typing import T
 
 __all__ = [
@@ -64,7 +65,15 @@ __all__ = [
     "wait_i64_until_equals",
     "waitcnt_all",
     "waitcnt_stores",
+    "wave_uniform_i64",
 ]
+
+
+def wave_uniform_i64(addr):
+    v = fx.Uint64(addr)
+    lo = readfirstlane(T.i32, fx.Uint32(v))  # low 32 bits
+    hi = readfirstlane(T.i32, fx.Uint32(v >> 32))  # high 32 bits (unsigned shift)
+    return (fx.Uint64(hi) << 32) | fx.Uint64(lo)
 
 
 def _to_ptr_global(v):
