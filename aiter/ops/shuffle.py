@@ -65,6 +65,18 @@ def shuffle_mxfp8fp4_scale(src: torch.Tensor) -> torch.Tensor:
     return out.view(x_type)
 
 
+def shuffle_blockscale_to_mxfp8_scale(scale: torch.Tensor, n: int) -> torch.Tensor:
+    """128x128 e8m0 block scale [ceil(n/128), K/128] -> shuffled 1x32 [pad32(n), K/32].
+
+    Lossless (each 1x32 block repeats its 128x128 block's exponent): the n32k4
+    B-scale of the 1x32 MXFP8 GEMM, built once at weight load.
+    """
+    s = scale.view(torch.uint8).repeat_interleave(128, dim=0)[:n]
+    return shuffle_mxfp8fp4_scale(s.repeat_interleave(4, dim=1).contiguous()).view(
+        scale.dtype
+    )
+
+
 def shuffle_weight_gfx1250(w: torch.Tensor) -> torch.Tensor:
     """
     Preshuffle weights for gfx1250 WMMA.

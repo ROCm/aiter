@@ -45,9 +45,10 @@ that duplicates functionality already in the tree, even partially — the fix is
 to extend or import the existing implementation, not to add a parallel copy.
 
 `utils/` is layered on purpose: `config_utils.py` holds the shared core
-(`resolve_config_dir`, `load_config_json`, the path constants) and each family
-keeps its own loader module (`gemm_config_utils`, `conv_config_utils`,
-`mhc_config_utils`, `moe_config_utils`, `tuned_config_utils`) on top of it.
+(`resolve_config_dir`, `load_config_json`, `select_leq_config`, the path
+constants) and each family keeps its own loader module (`gemm_config_utils`,
+`conv_config_utils`, `mhc_config_utils`, `moe_config_utils`,
+`tuned_config_utils`) on top of it.
 Flag a function given a second home — a re-export, a wrapper that only
 forwards to another module, or a copy of a core helper inside a family module.
 
@@ -69,6 +70,19 @@ and tuned JSON in `configs/`. Flag:
   Gluon bodies under `_gluon_kernels/<arch>/`, mirroring the wrapper's
   category path. JIT-decorated device helpers that are called only from
   another kernel may remain with the entry kernel they support.
+- A kernel module or directory whose path under `_triton_kernels/`
+  (`_gluon_kernels/<arch>/`) differs from the folder of the wrapper that
+  launches it. A kernel directory is named after the wrapper folder, never
+  after the kernel family or a topic: `normalization/`, not `norm/`. One
+  existing directory predates this rule and is grandfathered until a
+  dedicated follow-up moves it and all its importers: the vendored
+  `_triton_kernels/flash_attn_triton_amd/` (launched by `attention/mha.py`).
+  Do not flag code in it; flag any new mismatched directory. A kernel that
+  wrappers in several folders reuse lives with the wrapper that owns it, or in
+  `_triton_kernels/common/` when none does (`common/splitk_reduce.py`);
+  importing it across folders is fine. A PR that moves a wrapper into another
+  folder moves its kernels too and updates every importer of the old module
+  path (`grep -rn "_triton_kernels.<old>"`).
 - Generic helpers (config loading, shuffling, arch detection, logging)
   re-implemented inside a kernel file instead of imported from `utils/`.
 - New code importing via the legacy flat paths
@@ -215,14 +229,18 @@ values for either backend live in JSON, never in Python. Flag:
   family loader or `resolve_config_dir()` would work — a hand-built path is a
   second place the layout is encoded, and it skips the argument validation
   that makes a wrong value fail closed.
+- A hand-written loop selecting the smallest matching `N_LEQ_*` (or another
+  upper-bound prefix) entry — use `select_leq_config()` so threshold ordering,
+  fallback, and copying semantics have one implementation.
 - A second MOE config reader. `utils/moe_config_utils.py::get_moe_dispatch` is
   the only MOE fetcher; flag any new MOE path built by hand, any direct
   `load_config_json` on a `moe/` file, and any reintroduced per-wrapper MOE
   loader.
 - A new arch- or backend-fallback chain inside a loader (try this arch, then
-  that one; try triton, then gluon). Resolution is deterministic. MHC's gfx942
-  fallback is the one documented exception and it goes through the `arch=`
-  override, not through a probe.
+  that one; try triton, then gluon). Resolution is deterministic. The
+  documented compatibility exceptions are MHC's gfx942 fallback and Triton
+  `fused_clamp_act_mul`'s legacy gfx950 fallback; both use the `arch=` override
+  instead of a probe.
 - A raw config list handed to `@triton.autotune`. Route it through
   `autotune_configs` from `aiter.ops.triton.utils.tuned_config_utils`:
 
@@ -349,6 +367,31 @@ All weight/scale pre-shuffle helpers are unified in
   inside the category folder, shared helpers in the existing
   `*_test_utils.py` / `utils/` modules. Flag tests added flat at the
   `op_tests/triton_tests/` root or as one-off scripts.
+- A test's folder is the folder of the wrapper it imports. The path under
+  `op_tests/triton_tests/` mirrors the wrapper's path under
+  `aiter/ops/triton/`: a test of `aiter/ops/triton/attention/mla.py` is
+  `op_tests/triton_tests/attention/test_mla.py`, a test of
+  `gemm/basic/gemm_a8w8.py` is `gemm/basic/test_gemm_a8w8.py`, a test of
+  `gated_delta_net/fused_kda_decode.py` is
+  `gated_delta_net/test_fused_kda_decode.py`. The wrapper's folder decides
+  the test folder, not the kernel directory: `attention/mha.py` keeps its
+  tests in `triton_tests/attention/` even though its kernels sit in the
+  vendored `_triton_kernels/flash_attn_triton_amd/`; a sub-package counts as
+  a folder (`moe/moe_routing/routing.py` → `triton_tests/moe/moe_routing/`).
+  The few wrappers that still sit flat at `aiter/ops/triton/<op>.py`
+  (`activation.py`, `topk.py`, ...) keep their tests flat at the
+  `triton_tests/` root; `utils/` helpers are tested under
+  `triton_tests/utils/`; `torch_compile/` and `triton_metadata_redirect/`
+  are infrastructure suites, not op folders. Flag:
+  - A test whose folder differs from the folder of the wrapper it imports
+    (`from aiter.ops.triton.gated_delta_net...` in a test under
+    `triton_tests/attention/` or at the root).
+  - A test placed by kernel directory or by topic instead of by wrapper
+    folder, and a new test folder that does not match a folder under
+    `aiter/ops/triton/` (every op test folder also carries an `__init__.py`).
+  - A PR that moves a wrapper into another folder without moving its kernels
+    and its test, or that moves a test without updating every importer of the old module
+    path (`grep -rn "triton_tests.<old>"`).
 - No kernel tuning configs in test files: flag test code that hardcodes
   config dicts (`BLOCK_SIZE_*`, `num_warps`, `waves_per_eu`, ...) or passes
   literal `config=` overrides to a wrapper. Tests exercise the wrapper's own
