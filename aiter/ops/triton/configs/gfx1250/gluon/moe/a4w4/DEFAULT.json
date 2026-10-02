@@ -2233,7 +2233,7 @@
     },
     "bm16_n7168_k768_medium2": {
         "block_n": 256,
-        "block_k": 256,
+        "block_k": 512,
         "num_buffers": 1,
         "num_warps": 4
     },
@@ -2245,7 +2245,7 @@
     },
     "bm16_n7168_k768_large": {
         "block_n": 256,
-        "block_k": 256,
+        "block_k": 512,
         "num_buffers": 1,
         "num_warps": 4
     },
@@ -2257,8 +2257,20 @@
     },
     "bm16_n7168_k768_xlarge": {
         "block_n": 256,
-        "block_k": 256,
+        "block_k": 512,
         "num_buffers": 1,
+        "num_warps": 4
+    },
+    "bm128_n1536_k7168_xlarge": {
+        "block_n": 128,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm128_n7168_k768_xlarge": {
+        "block_n": 256,
+        "block_k": 256,
+        "num_buffers": 2,
         "num_warps": 4
     }
 }
