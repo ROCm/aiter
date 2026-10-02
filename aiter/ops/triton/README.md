@@ -507,16 +507,16 @@ pytest op_tests/triton_tests/gemm/basic/   # one subset
     functionality and performance? Does everything that worked before still work? Pay attention to
     GPU architectures other than your target.
   - **Test results:** Share the outcome of your test plan.
-- Assignment:
+- Be responsible for your PR:
   - You, as the PR author, should be listed in the **Assignees** field. Add someone else from your
     team if you're going to be absent (vacation, PTO, extended holidays) and hand over to them the
     responsibility for moving the PR forward
   - Be a responsive collaborator. Answer questions asked by reviewers and address the suggestions
     that make sense. Code owners can, and will, close the PR if it's stale for a long time.
   - Do not let your coding agents open a PR and leave it rotting. Please follow along.
-- Labels:
-  - Add **Triton/Gluon** label to your PR.
-  - **gfx942** CI is now opt-in, add **ci:triton-300x** label if you are touching anything
+- Add labels:
+  - Add **Triton/Gluon** label to your PR. This enables quick search from maintainer's part.
+  - **gfx942** Triton CI is now opt-in, add **ci:triton-300x** label if you are touching anything
     **gfx942**-related.
 - PR size:
   - Do not blindly submit a giant AI-slop mess. Code owners will close the PR if they judge it
@@ -526,6 +526,12 @@ pytest op_tests/triton_tests/gemm/basic/   # one subset
     outcome incrementally.
 - Perform a first round of code review by yourself, to catch basic mistakes, before asking a review
   from someone else. Reviewer time is precious in the age of agentic coding tools.
+- Sometimes, as the PR evolves, its title and decription get outdated. Please double check if the PR
+  information is up to date before merging.
+- If you have write access to [AITER ROCm fork](https://github.com/ROCm/aiter), PR from it instead
+  of your own fork. When PR-ing from a fork, Docker access is unauthenticated. This may cause CI
+  issues to to rate limiting.
+- Strip the **Co-authored-by: AI agent** part of your commits before merging.
 
 **Warning:** PRs that don't comply with the checklist won't be reviewed or merged. Please be a good
 AITER citizen and follow best practices.
