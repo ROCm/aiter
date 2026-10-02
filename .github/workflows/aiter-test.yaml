@@ -8,13 +8,27 @@ on:
     branches: [main]  # Triggers on PRs targeting `main`
 
   workflow_dispatch:
+    inputs:
+      asan:
+        description: 'Run the experimental GPU ASan checks instead of the regular test suite'
+        type: boolean
+        default: false
+      asan_op_tests:
+        description: 'Also build Aiter with ASan and run the activation op-test smoke selection'
+        type: boolean
+        default: false
+      asan_gpu:
+        description: 'GPU target for the experimental ASan run'
+        type: choice
+        options: [both, MI300X, MI355]
+        default: both
   schedule:
     - cron: '0 22 * * *'  # 6:00 AM Beijing Time (UTC+8)
 
 concurrency:
   # Keep scheduled main runs from blocking push-triggered validation.
   # Keep opt-in label runs from canceling normal PR validation.
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}-${{ github.event.action == 'labeled' && github.event.label.name || 'default' }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}-${{ github.event.action == 'labeled' && github.event.label.name || 'default' }}${{ inputs.asan && format('-asan-{0}', inputs.asan_gpu) || '' }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
@@ -24,7 +38,18 @@ env:
   AITER_PREBUILD_MAX_JOBS: "64"
 
 jobs:
+  asan:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.asan }}
+    uses: ./.github/workflows/asan-test.yaml
+    with:
+      op_tests: ${{ inputs.asan_op_tests }}
+      gpu: ${{ inputs.asan_gpu }}
+    permissions:
+      contents: read
+    secrets: inherit
+
   detect_aiter_test_scope:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.asan) }}
     name: Detect Aiter Test Scope
     runs-on: ubuntu-latest
     permissions:
@@ -1457,7 +1482,7 @@ jobs:
 
   aiter-test-gate:
     name: Aiter Test Gate
-    if: always()
+    if: ${{ always() && !(github.event_name == 'workflow_dispatch' && inputs.asan) }}
     runs-on: ubuntu-latest
     needs:
       - detect_aiter_test_scope

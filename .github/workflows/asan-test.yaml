@@ -1,0 +1,194 @@
+name: Aiter ASan Test
+
+on:
+  workflow_call:
+    inputs:
+      op_tests:
+        type: boolean
+        default: false
+      gpu:
+        type: string
+        default: both
+
+permissions:
+  contents: read
+
+jobs:
+  ci_config:
+    uses: ./.github/workflows/ci-config.yaml
+
+  select_runners:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
+    steps:
+      - name: Select ASan runners
+        id: select
+        env:
+          GPU: ${{ inputs.gpu }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+
+          target = os.environ["GPU"]
+          if target not in ("both", "MI300X", "MI355"):
+              raise SystemExit(f"Unsupported ASan target: {target}")
+          runners = [
+              {"runner": "linux-aiter-oci-mi300x-1", "label": "MI300X", "arch": "gfx942"},
+              {"runner": "linux-aiter-mi355-1", "label": "MI355", "arch": "gfx950"},
+          ]
+          selected = [runner for runner in runners if target == "both" or runner["label"] == target]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              print("matrix=" + json.dumps({"include": selected}), file=output)
+          PY
+
+  qualify:
+    name: GPU ASan Qualification (${{ matrix.label }})
+    needs: [ci_config, select_runners]
+    timeout-minutes: 120
+    concurrency:
+      group: aiter-asan-${{ matrix.label }}
+      cancel-in-progress: false
+    env:
+      DOCKER_IMAGE: ${{ needs.ci_config.outputs.pytorch_py310_image }}
+      GPU_ARCHS: ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix: ${{ fromJSON(needs.select_runners.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        env:
+          # Bypass the unreachable MI355 Git cache only for this checkout.
+          GIT_CONFIG_GLOBAL: ${{ runner.temp }}/asan-gitconfig
+          GIT_CONFIG_NOSYSTEM: "1"
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Docker login
+        env:
+          DOCKER_USERNAME: ${{ secrets[needs.ci_config.outputs.docker_username_secret] }}
+          DOCKER_PASSWORD: ${{ secrets[needs.ci_config.outputs.docker_password_secret] }}
+        run: |
+          for attempt in 1 2 3; do
+            if echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin; then
+              echo "Docker login succeeded on attempt ${attempt}"
+              exit 0
+            fi
+            echo "Docker login attempt ${attempt} failed"
+            if [ "${attempt}" != 3 ]; then
+              sleep 10
+            fi
+          done
+          echo "Docker login failed after 3 attempts, continuing anyway"
+          exit 0
+
+      - name: Sync submodules for Aiter smoke tests
+        if: ${{ inputs.op_tests }}
+        env:
+          GIT_CONFIG_GLOBAL: ${{ runner.temp }}/asan-gitconfig
+          GIT_CONFIG_NOSYSTEM: "1"
+        run: |
+          set -euo pipefail
+          git submodule sync
+          git submodule update --init --recursive --depth 1 --jobs 4
+
+      - name: Build ASan container
+        timeout-minutes: 75
+        run: |
+          set -euo pipefail
+          mkdir -p asan_logs
+          bash .github/scripts/docker_pull_with_retry.sh "${DOCKER_IMAGE}" \
+            2>&1 | tee asan_logs/image-pull.log
+          docker image inspect "${DOCKER_IMAGE}" \
+            --format '{{json .RepoDigests}}' | tee asan_logs/base-image.json
+          docker build \
+            --build-arg BASE_IMAGE="${DOCKER_IMAGE}" \
+            -f .github/docker/Dockerfile.asan \
+            -t aiter_asan_test_image .github/docker 2>&1 | tee asan_logs/image-build.log
+
+      - name: Run the container
+        run: |
+          set -euo pipefail
+          if [ ! -s /etc/podinfo/gha-render-devices ]; then
+            echo "::error::Missing assigned render devices; refusing to expose every GPU"
+            exit 1
+          fi
+          DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+
+          docker run -dt \
+          --device=/dev/kfd $DEVICE_FLAG \
+          --shm-size=16G \
+          --cpus=16 --memory=80g --memory-swap=80g --pids-limit=4096 \
+          --network=host \
+          --group-add $(getent group render | cut -d: -f3) \
+          --group-add $(getent group video | cut -d: -f3) \
+          -e GPU_ARCHS \
+          -e HSA_XNACK=1 \
+          -e MAX_JOBS=4 \
+          -v "${{ github.workspace }}:/workspace" \
+          -w /workspace \
+          --name aiter_asan_test \
+          aiter_asan_test_image
+
+      - name: Qualify GPU AddressSanitizer
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          docker exec -w /workspace aiter_asan_test \
+            bash .github/scripts/qualify_gpu_asan.sh 2>&1 | tee asan_logs/qualification.log
+
+      - name: Install Aiter for ASan smoke tests
+        if: ${{ inputs.op_tests }}
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          docker exec -w /workspace aiter_asan_test bash -lc '
+            set -euo pipefail
+            git config --global --add safe.directory /workspace
+            pip install -r requirements.txt
+            pip install setuptools_scm tabulate
+            PREBUILD_KERNELS=0 AITER_USE_SYSTEM_TRITON=1 \
+              pip install --no-build-isolation --no-deps -e .
+          ' 2>&1 | tee asan_logs/aiter-install.log
+
+      - name: Aiter ASan activation smoke tests
+        id: asan_smoke
+        if: ${{ inputs.op_tests }}
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+          docker exec -w /workspace aiter_asan_test \
+            bash .github/scripts/aiter_asan_smoke.sh 2>&1 | tee asan_logs/aiter-smoke.log
+
+      - name: Diagnose activation failure without ASan
+        if: ${{ failure() && inputs.op_tests && steps.asan_smoke.outcome == 'failure' }}
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+          docker exec -w /workspace aiter_asan_test \
+            bash .github/scripts/aiter_asan_smoke.sh baseline 2>&1 | tee asan_logs/aiter-baseline.log
+
+      - name: Upload ASan logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: asan-qualification-${{ matrix.label }}
+          path: |
+            asan_logs/
+            asan_jit/**/build.ninja
+            baseline_jit/**/build.ninja
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Cleanup container
+        if: always()
+        run: |
+          docker rm -f aiter_asan_test || true
+          docker image rm aiter_asan_test_image || true
+          docker logout || true

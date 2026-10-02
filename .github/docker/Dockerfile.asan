@@ -1,0 +1,14 @@
+ARG BASE_IMAGE=rocm/pytorch:rocm7.2.4_ubuntu22.04_py3.10_pytorch_release_2.10.0
+FROM ${BASE_IMAGE}
+
+USER root
+
+# Match the shared CI image. ASan libraries coexist with the ordinary runtimes.
+RUN test "$(dpkg-query -W -f='${Version}' rocm-core)" = '7.2.4.70204-93~22.04' \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends --no-remove \
+        hip-runtime-amd-asan=7.2.53211.70204-93~22.04 \
+        hsa-rocr-asan=1.18.0.70204-93~22.04 \
+        comgr-asan=3.0.0.70204-93~22.04 \
+        rocm-core-asan=7.2.4.70204-93~22.04 \
+    && rm -rf /var/lib/apt/lists/*
