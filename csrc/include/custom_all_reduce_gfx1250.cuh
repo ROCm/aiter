@@ -316,11 +316,11 @@ DINLINE void start_sync(const RankSignals& sg, Signal* self_sg, int rank)
     {
         __scoped_atomic_store_n(&sg.signals[threadIdx.x]->start[blockIdx.x][rank],
                                 flag,
-                                __ATOMIC_RELAXED,
+                                __ATOMIC_RELEASE,
                                 __MEMORY_SCOPE_SYSTEM);
         while(__scoped_atomic_load_n(&self_sg->start[blockIdx.x][threadIdx.x],
-                                     __ATOMIC_RELAXED,
-                                     __MEMORY_SCOPE_DEVICE) < flag)
+                                     __ATOMIC_ACQUIRE,
+                                     __MEMORY_SCOPE_SYSTEM) < flag)
             ;
     }
     __syncthreads();
