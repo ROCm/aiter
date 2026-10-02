@@ -194,6 +194,18 @@ _PLAIN_K2048_NARROW_WIDTH = 8192
 _PLAIN_K2048_FEW_ROWS = 128
 _PLAIN_K2048_FEW_ROWS_MAX_WIDTH = 80 * 1024
 _PLAIN_K2048_MAX_WIDTH = 131071
+# Below sampled's width door these kernels beat `sampled` on every measured
+# uniform cell its work door took -- 2049..131072 rows of 2100..131071 columns,
+# 0.41x--0.97x (seed-0 randn, MI355X); 4096 rows of 65536 columns ran 200
+# against 268us -- so for uniform rows that door yields to plain's band there.
+# Ragged rows run plain's ranged form, which has none of these kernels and
+# measured 0.96x--1.50x of `sampled` on those cells, so they keep the work door.
+# The exception is plain's own dispatch: from 65536 columns it hands at most
+# two rows to its multi-block kernel (`should_use_mulblocks`), 1.7x--2.8x
+# slower than `sampled` through the few-row band, ragged or not, so `sampled`
+# takes those.
+_PLAIN_K2048_MULTIBLOCK_ROWS = 2
+_PLAIN_K2048_MULTIBLOCK_MIN_WIDTH = 65536
 
 # small_k narrows by dropping chunks below the cut, and a chunk is a lane: at k
 # equal to the wave width it drops none. Survivors at 8192 columns run 18 at
@@ -487,10 +499,10 @@ def _choose(
             f"no backend serves rows={rows} width={width} topk={k} "
             f"tie={tie!r} deterministic={deterministic} fp32={fp32}"
         )
-    return topk_select_backend(rows, width, k, available)
+    return topk_select_backend(rows, width, k, available, ragged=ragged)
 
 
-def _sampled_takes(rows: int, width: int, k: int) -> bool:
+def _sampled_takes(rows: int, width: int, k: int, yield_to_plain: bool = False) -> bool:
     """Total work past which `sampled` measured fastest of every backend here.
 
     The threshold is on `rows * width`, not on either alone, and it is sharp:
@@ -532,7 +544,25 @@ def _sampled_takes(rows: int, width: int, k: int) -> bool:
     on one row in 32. `CAP_SAFE_FILL` made the S-rule leave headroom instead
     (measured after: 0 fallback rows in 384 there), so the floor came out and
     72 more cells changed hands at a median 0.711x, none slower.
+
+    The 4096x64K point no longer holds on gfx950 at k=2048: plain's one-block
+    kernels beat it there and on every other cell the work door took below the
+    width door (200 against 268us at 4096x64K), so there the work door yields
+    to plain's band when `yield_to_plain` -- uniform rows, plain available. The
+    door added for that k points the other way: at most two rows from 65536
+    columns through the few-row band, where plain's own dispatch goes
+    multi-block. See `_PLAIN_K2048_MULTIBLOCK_ROWS`.
     """
+    if k == 2048 and width < _SAMPLED_MIN_WIDTH and get_gfx_runtime() == "gfx950":
+        if (
+            rows <= _PLAIN_K2048_MULTIBLOCK_ROWS
+            and width >= _PLAIN_K2048_MULTIBLOCK_MIN_WIDTH
+        ):
+            return width <= _PLAIN_K2048_FEW_ROWS_MAX_WIDTH and bool(
+                topk_sampled_supports(rows, width, k)
+            )
+        if yield_to_plain and _plain_takes(rows, width, k):
+            return False
     if not (
         rows * width >= _SAMPLED_MIN_WORK
         or (width >= _SAMPLED_MIN_WIDTH and rows >= _SAMPLED_MIN_ROWS)
@@ -583,9 +613,13 @@ def _decode_takes(rows: int, width: int, k: int) -> bool:
 
 
 def topk_select_backend(
-    rows: int, width: int, k: int, available: frozenset[str]
+    rows: int, width: int, k: int, available: frozenset[str], ragged: bool = False
 ) -> str:
     """Name the backend to use for this shape among those that can serve it.
+
+    `ragged` is whether the caller gave row ends. Ragged rows run plain's ranged
+    form, so `sampled`'s work door does not yield to plain's gfx950 k=2048 band
+    for them; see `_PLAIN_K2048_MULTIBLOCK_ROWS`.
 
     The shape of the answer: `plain` takes the many-row middle, where it is the
     only one that scales with rows rather than against them; the small-k selector
@@ -622,7 +656,9 @@ def topk_select_backend(
     # the answer does not need, and lose 1.3x to 12x doing so.
     if "argmax" in available:
         return "argmax"
-    if "sampled" in available and _sampled_takes(rows, width, k):
+    if "sampled" in available and _sampled_takes(
+        rows, width, k, yield_to_plain="plain" in available and not ragged
+    ):
         return "sampled"
     if "plain" in available and _plain_takes(rows, width, k):
         return "plain"
