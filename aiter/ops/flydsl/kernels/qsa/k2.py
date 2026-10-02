@@ -46,7 +46,7 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
     buf_copy_atom,
 )
 
-# 256 CUs on MI355X times four BN32 prefill workgroups each. Unlike the decode
+# 256 CUs on gfx950 times four BN32 prefill workgroups each. Unlike the decode
 # bands below this one does not move with head_dim: halving D halves the LDS
 # tile, so residency alone predicts eight, but 8 per CU measured slower than 4
 # at D=128 on every M from 16 to 512. Whatever sets this number, it is not the
