@@ -57,7 +57,7 @@ question instead: all-reduce + residual add + RMSNorm.
 | ``fused_fly_mesh``    | same, mesh schedule                     | yes |
 | ``fused_fly_auto``    | ``FlyDSLAllReduceRMSNorm`` -- the shipped fused policy | yes |
 | ``separate_cdr``      | ``cross_device_reduce`` + ``rmsnorm2d_fwd_with_add`` | no |
-| ``separate_rccl``     | ``dist.all_reduce`` + ditto             | no |
+| ``separate_rccl``     | PyNccl ``all_reduce`` (out-of-place) + ditto | no |
 | ``separate_fly1s``    | plain FlyDSL one-shot + ditto           | no |
 | ``separate_flyring``  | plain FlyDSL ring + ditto               | no |
 | ``separate_flymesh``  | plain FlyDSL mesh + ditto               | no |
@@ -389,10 +389,14 @@ except Exception:  # noqa: BLE001
     HAS_FLY_INT4 = False
 
 # The FlyDSL schedules are opt-in and self-disabling; the bench turns them on
-# for its own `fly_auto` row the same way it forces a quick-reduce regime for
-# the qr_* rows, and for the same reason -- measuring a path production can
-# reach requires enabling it.
+# for its own `fly_auto` / `fused_fly_auto` rows the same way it forces a
+# quick-reduce regime for the qr_* rows, and for the same reason -- measuring a
+# path production can reach requires enabling it.
 _FLY_ENV = "AITER_FLY_AR"
+# What the *user* had in _FLY_ENV before main() overrode it, as "1" or "0", for
+# the fused `prod path` column -- production only takes the FlyDSL fused path
+# when the deployment opts in, whatever this bench enabled for its own rows.
+_PROD_FLY_ENV = "AITER_BENCH_PROD_FLY_AR"
 
 # Whether `fly_auto` opens the quantized window. In production this is
 # AITER_QUICK_REDUCE_QUANTIZATION: INT4 opens the quick-reduce slot to the
@@ -1804,13 +1808,21 @@ def _fused_1stage_policy(world_size: int):
     return override, limit
 
 
-def production_fused_path(ca_comm, qr_comm, x, weight, world_size: int, prod_regime):
+def production_fused_path(
+    ca_comm, qr_comm, x, residual, weight, world_size: int, prod_regime
+):
     """What CudaCommunicator.fused_allreduce_rmsnorm would dispatch for *x*.
 
-    Mirrors the gate chain in communicator_cuda.py: quick-reduce's fused kernel
-    first (2-stage sizes only), then the custom fused AR, then the unfused
-    all-reduce + rmsnorm split. Reported so a row can say `prod path = separate`
-    while still carrying fused timings -- which is the point of the column.
+    Mirrors the gate chain in communicator_cuda.py: the FlyDSL fused
+    dispatcher first (ahead of the 1stage gate, only when the deployment opts
+    in), then quick-reduce's fused kernel (2-stage sizes only), then the custom
+    fused AR, then the unfused all-reduce + rmsnorm split. Reported so a row
+    can say `prod path = separate` while still carrying fused timings -- which
+    is the point of the column.
+
+    The FlyDSL step is gated on the *user's* AITER_FLY_AR (``_PROD_FLY_ENV``),
+    not on the one this bench sets for its own rows. Its window comes from
+    ``qr_comm``'s dispatcher, i.e. under the ``--fly-accuracy`` regime.
     """
     from aiter.dist.device_communicators.quick_all_reduce import QuickReduceRegime
 
@@ -1820,12 +1832,25 @@ def production_fused_path(ca_comm, qr_comm, x, weight, world_size: int, prod_reg
     override, limit = _fused_1stage_policy(world_size)
     use_1stage = override if override is not None else (total_bytes <= limit)
 
-    if not use_1stage and qr_comm is not None and not qr_comm.disabled:
+    qr_usable = qr_comm is not None and not qr_comm.disabled
+    if (
+        os.environ.get(_PROD_FLY_ENV) == "1"
+        and qr_usable
+        and qr_comm.should_fly_allreduce_rmsnorm(x, residual, weight)
+    ):
+        return f"fly_fused:{qr_comm._fly_rms.family_for(total_bytes)}"
+
+    if not use_1stage and qr_usable:
         saved = qr_comm.qr_quant_level
         try:
             if prod_regime in QuickReduceRegime.__members__ and prod_regime != "NONE":
                 qr_comm.qr_quant_level = QuickReduceRegime[prod_regime]
-                if qr_comm.should_quick_allreduce_rmsnorm(x, x, weight, hidden):
+                row = hidden * x.element_size()
+                if (
+                    qr_comm._should_hip(x)
+                    and 0 < row <= 32768
+                    and 32768 % row == 0
+                ):
                     return f"qr_fused:{prod_regime.lower()}"
         finally:
             qr_comm.qr_quant_level = saved
@@ -1915,7 +1940,7 @@ def _variant_of(
     return eng.variant(int(nbytes)) if eng is not None else None
 
 
-def _ran_exact(cand: Candidate, flyauto, nbytes: int) -> bool:
+def _ran_exact(cand: Candidate, flyauto, nbytes: int, fused_flyauto=None) -> bool:
     """Whether *cand* is bit-accurate **at this shape**.
 
     For every other family exactness is a property of the candidate, because
@@ -1924,12 +1949,20 @@ def _ran_exact(cand: Candidate, flyauto, nbytes: int) -> bool:
     above it, so a single ``Candidate.exact`` flag cannot describe it.
     ``separate_fly_auto`` drives the same policy object and needs the same
     treatment -- it is the one ``separate`` row whose kernel is not fixed.
+    ``fused_fly_auto`` is the fused policy and is decided the same way, by its
+    own dispatcher.
 
     ``Candidate.exact`` stays the static answer and still drives the accuracy
     *floor*: ``fly_auto``'s floor has to stay the quantized one, since one
     column spans both accuracy classes and the floor has to admit the worst of
     them.
     """
+    if cand.family == "fused_flyauto":
+        # The one-shot carries no codec in either accuracy mode.
+        return (
+            fused_flyauto is not None
+            and fused_flyauto.family_for(int(nbytes)) == "oneshot"
+        )
     if cand.family != "flyauto" and not (
         cand.family == "separate" and cand.sep_ar == "flyauto"
     ):
@@ -2021,11 +2054,27 @@ def _fusion_reference(tp_size, tokens, hidden, dtype, device, residual, weight):
     return out_ref.to(dtypes.fp32), s.to(dtype).to(dtypes.fp32)
 
 
+def _cdr_registered(ca_comm) -> bool:
+    """Whether a ``cdr`` call may use its input in place, as production does.
+
+    Mirrors ``CustomAllreduce.custom_all_reduce`` / ``custom_fused_ar_rms``:
+    while a graph is being captured the input is used in place and its address
+    IPC-registered when the capture exits; otherwise it is staged through the
+    pre-registered pool. Passing ``registered=False`` unconditionally would
+    charge every captured ``cdr`` call a copy production never makes.
+    """
+    return (
+        ca_comm.enable_register_for_capturing
+        and torch.cuda.is_current_stream_capturing()
+    )
+
+
 def _build_fused_thunks(
     cands,
     *,
     ca_comm,
     qr_comm,
+    pynccl_comm,
     fly,
     fly1s,
     fly1s_rms,
@@ -2036,14 +2085,22 @@ def _build_fused_thunks(
     x,
     residual,
     weight,
+    cdr_out,
 ):
     """Zero-arg thunks returning ``(out, residual_out)`` for the fused mode.
 
     Every thunk preallocates **both** outputs and passes them in. That is not
     tidiness: ``ca_comm.fused_ar_rms`` allocates whatever it is not given, and
     an allocation inside a HIP-graph capture is at best a surprise.
+
+    The ``cdr`` calls register their input under capture, as production does
+    (see ``_cdr_registered``). *x* is the sweep-lifetime input from
+    ``_PersistentBuffers``, so its registration never goes stale. The fused
+    kernel registers only its input; the plain all-reduce behind
+    ``separate_cdr`` can also register its output, so that one writes into the
+    shared *cdr_out* rather than a per-shape buffer.
     """
-    from aiter import rmsnorm2d_fwd_with_add
+    from aiter import qr_all_reduce_rmsnorm, rmsnorm2d_fwd_with_add
     from aiter.dist.device_communicators.quick_all_reduce import QuickReduceRegime
 
     thunks = {}
@@ -2063,21 +2120,26 @@ def _build_fused_thunks(
                     out=o,
                     w=weight,
                     eps=FUSION_EPS,
-                    registered=False,
+                    registered=_cdr_registered(ca_comm),
                     use_1stage=c.use_1stage,
                 )
                 return o, ro
 
             thunks[cand.key] = _f
         elif cand.family == "fused_qr":
-
             def _f(o=out, ro=res_out, lvl=QuickReduceRegime[cand.quant], h=hidden):
-                qr_comm.qr_quant_level = lvl
-                a, b = qr_comm.quick_all_reduce_rmsnorm(
-                    x, residual, weight, FUSION_EPS, h
+                qr_all_reduce_rmsnorm(
+                    qr_comm._ptr,
+                    x,
+                    residual,
+                    ro,
+                    o,
+                    weight,
+                    FUSION_EPS,
+                    h,
+                    lvl.value,
+                    qr_comm.use_fp16_kernels,
                 )
-                o.copy_(a)
-                ro.copy_(b)
                 return o, ro
 
             thunks[cand.key] = _f
@@ -2108,16 +2170,25 @@ def _build_fused_thunks(
 
             thunks[cand.key] = _f
         else:  # separate: all-reduce, then a standalone norm
-            ar_buf = torch.empty_like(x)
+            ar_buf = cdr_out if cand.sep_ar == "cdr" else torch.empty_like(x)
             buffers.append(ar_buf)
 
             if cand.sep_ar == "cdr":
 
                 def _ar(b=ar_buf):
-                    return ca_comm.all_reduce(x, out=b)
+                    return ca_comm.all_reduce(
+                        x, out=b, registered_input=_cdr_registered(ca_comm)
+                    )
+
+            elif cand.sep_ar == "rccl" and pynccl_comm is not None:
+                # What CudaCommunicator.all_reduce falls back to, as in the
+                # plain `rccl` row: out-of-place PyNccl, no copy.
+                def _ar(b=ar_buf):
+                    pynccl_comm.all_reduce(x, b)
+                    return b
 
             elif cand.sep_ar == "rccl":
-
+                # Production's last resort when PyNccl is unavailable.
                 def _ar(b=ar_buf):
                     b.copy_(x)
                     dist.all_reduce(b, group=group)
@@ -2303,16 +2374,12 @@ def _build_thunks(
             # its address -- and the output's -- is IPC-registered when the
             # capture exits.
             def _cdr(o=out, c=cand):
-                reg = (
-                    ca_comm.enable_register_for_capturing
-                    and torch.cuda.is_current_stream_capturing()
-                )
                 return ca_comm.all_reduce(
                     x,
                     out=o,
                     use_new=c.use_new,
                     open_fp8_quant=c.fp8,
-                    registered_input=reg,
+                    registered_input=_cdr_registered(ca_comm),
                 )
 
             thunks[cand.key] = _cdr
@@ -2446,6 +2513,7 @@ def _bench_shape(
             cands,
             ca_comm=ca_comm,
             qr_comm=qr_comm,
+            pynccl_comm=pynccl_comm,
             fly=fly,
             fly1s=fly1s,
             fly1s_rms=fly1s_rms,
@@ -2456,6 +2524,7 @@ def _bench_shape(
             x=x,
             residual=residual,
             weight=weight,
+            cdr_out=bufs.cdr_out(tokens, hidden, dtype),
         )
         ref, res_ref = _fusion_reference(
             tp_size, tokens, hidden, dtype, device, residual, weight
@@ -2482,7 +2551,9 @@ def _bench_shape(
     ret = {
         "nbytes": nbytes,
         "prod": (
-            production_fused_path(ca_comm, qr_comm, x, weight, tp_size, prod_regime)
+            production_fused_path(
+                ca_comm, qr_comm, x, residual, weight, tp_size, prod_regime
+            )
             if fused
             else production_path(ca_comm, qr_comm, x, tp_size, prod_regime)
         ),
@@ -2570,14 +2641,14 @@ def _bench_shape(
             got, res_got = got
 
         sqnr = sqnr_db(got, ref)
-        if sqnr >= cand.sqnr_floor: 
+        if sqnr >= cand.sqnr_floor:
             logger.warning(
                 f"{cand.key} tp{tp_size} {tokens}x{hidden} rank{rank}: "
                 f"SQNR {sqnr:.2f} dB below the {cand.sqnr_floor} dB floor"
             )
-        # Per shape, not per candidate: fly_auto is exact only where its policy
-        # reaches the one-shot.
-        ran_exact = _ran_exact(cand, flyauto, nbytes)
+        # Per shape, not per candidate: fly_auto and fused_fly_auto are exact
+        # only where their policy reaches the one-shot.
+        ran_exact = _ran_exact(cand, flyauto, nbytes, fused_flyauto)
         if ran_exact:
             checkAllclose(
                 ref,
@@ -2586,11 +2657,14 @@ def _bench_shape(
                 atol=1e-2,
                 msg=f"{cand.key} tp{tp_size} {tokens}x{hidden} rank{rank}",
             )
-        if fused and cand.exact:
-            # The second output is graded too. An epilogue can get `out` right
-            # and `residual_out` wrong -- they come from different points in the
-            # dataflow -- and a fused kernel that corrupts the residual poisons
-            # every later layer while looking fine here.
+        if fused:
+            # The second output is graded too, for every candidate against its
+            # own floor. An epilogue can get `out` right and `residual_out`
+            # wrong -- they come from different points in the dataflow -- and a
+            # fused kernel that corrupts the residual poisons every later layer
+            # while looking fine here. The quantized rows are no exception:
+            # `residual_out` carries their codec error unnormalized, so it only
+            # ever lands above the `out` SQNR their floor was set for.
             res_sqnr = sqnr_db(res_got, res_ref)
             if res_sqnr >= cand.sqnr_floor: 
                 logger.warning(
@@ -2980,6 +3054,10 @@ def _worker(
                 flyauto.fly_all_reduce(t, out=torch.empty_like(t))
                 del t
 
+    # The shipped fused dispatcher. Self-disables unless AITER_FLY_AR is set,
+    # which main() does whenever this row is in the sweep, and reads its
+    # accuracy regime from AITER_FLY_AR_ACCURACY, which main() sets from
+    # --fly-accuracy.
     fused_flyauto = None
     if (
         _wants_fused_flyauto(keys)
@@ -3525,6 +3603,9 @@ def _prod_candidate_key(prod_path: str) -> str | None:
         return f"fused_cdr_{prod_path.split(':', 1)[1]}"
     if prod_path.startswith("qr_fused:"):
         return f"fused_qr_{prod_path.split(':', 1)[1]}"
+    if prod_path.startswith("fly_fused:"):
+        # The shipped fused dispatcher, whichever family it picked here.
+        return "fused_fly_auto"
     return None
 
 
@@ -4339,11 +4420,16 @@ def main():
             logger.info("TransferBench: using %s", roofline_bin)
     # Remember what the deployment would do before overriding the environment
     # for our own QR candidates; `prod path` is reported against this value.
+    # The fused `prod path` asks whether the *deployment* opted in to FlyDSL,
+    # so record that before the override below.
+    os.environ[_PROD_FLY_ENV] = (
+        "1" if os.environ.get(_FLY_ENV, "").strip() == "1" else "0"
+    )
     if _wants_flyauto(keys) or _wants_fused_flyauto(keys):
         # FlyDSLAllReduce and FlyDSLAllReduceRMSNorm are opt-in; set it before
         # the ranks are spawned so the children inherit it. Unlike _QR_ENV this
-        # does not change `prod path`, which reports the custom-AR/quick-reduce
-        # dispatch only.
+        # does not change the non-fused `prod path`, which reports the
+        # custom-AR/quick-reduce dispatch only.
         os.environ[_FLY_ENV] = "1"
     # --fly-accuracy, not whatever accuracy mode the launching shell happens to
     # have exported -- a report's accuracy regime should be exactly what its own
