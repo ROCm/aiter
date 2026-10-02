@@ -595,6 +595,11 @@ def _pa_decode_sparse_gfx950_gluon(
         and max_addressable_bytes(extra_indices) < MAX_BYTES
     )
     use_buffer_load = main_use_buffer_load and extra_use_buffer_load
+    packed_fp8 = (
+        not FLAT_POOL
+        and main_fmt == "fp8_dsv4_mla"
+        and (not has_extra or extra_fmt == "fp8_dsv4_mla")
+    )
     prefill = num_queries >= _PREFILL_MIN_ROWS
     HEAD_ALIGNED = num_heads % BLOCK_M == 0
     heads_blocks = (num_heads + BLOCK_M - 1) // BLOCK_M
@@ -685,6 +690,10 @@ def _pa_decode_sparse_gfx950_gluon(
         deq = "asm"
     else:
         deq = "none"
+
+    if packed_fp8:
+        # Rows that share KV rows reuse them through the cache, so skip .cg.
+        prefill_kw["GATHER_CACHE"] = ""
 
     # Put programs that read the same KV rows on one XCD so they share an L2.
     # Not for SWA-only or 16-head prefill, or for launches padded past the
