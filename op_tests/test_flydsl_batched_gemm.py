@@ -21,8 +21,8 @@ k-tile); DeepSeek-V4.1's shared-expert down projection has K = 576 at TP4.
 
 Input magnitudes change every 32 K (and every 32 weight rows), so the e8m0
 scales differ block to block and a scale applied to the wrong block shows up
-in the cosine gate.
-On gfx950 the weight magnitudes change every row instead, for 1x32.
+in the cosine gate. Each a8w8 candidate gets its own weight and reference,
+whose magnitudes change every row for 1x32.
 
 Shape mapping (V4-Pro, ``config.json``):
   b = n_local_groups = o_groups // tp  (swept via ``-b``)
@@ -207,10 +207,8 @@ def test_batched_gemm(b, m, n, k, dtype, layout):
     torch.manual_seed(SEED)
     # Model path: o is physically [m, b, k] (mbn); kernel out is a transposed
     # view of preallocated [m, b, n] — same as test_batched_gemm_bf16 mbn case.
-    a8w8_blocks = A8W8_BLOCKS[get_gfx()] if layout == "mbn" else ()
     o_mbn = blockwise_randn(m, b, k, dtype=dtype)
-    w_rows = min((r for r, _ in a8w8_blocks), default=32)
-    w_bnk = blockwise_randn(b, n, k, dtype=dtype, rows=w_rows)
+    w_bnk = blockwise_randn(b, n, k, dtype=dtype)
 
     if layout == "mbn":
         y_phys = torch.empty(m, b, n, dtype=dtype)
@@ -220,7 +218,7 @@ def test_batched_gemm(b, m, n, k, dtype, layout):
         y_out = y_phys
 
     ref = run_torch_wo_a(o_mbn, w_bnk, dtype)
-    candidates, nbytes = {}, {}
+    candidates, nbytes, refs = {}, {}, {}
 
     # A ragged K (not a multiple of 128) has no whole n32k4 scale group, so
     # a8w4, a8w8_128 and the n32k4 1x32 scale do not run it; 32x32 does, on the
@@ -254,12 +252,15 @@ def test_batched_gemm(b, m, n, k, dtype, layout):
             + b * m * n * y_phys.element_size()  # bf16 out
         )
 
+    a8w8_blocks = A8W8_BLOCKS[get_gfx()] if layout == "mbn" else ()
     for rows, block in a8w8_blocks:
         if ragged_k and (rows != 32 or block != 32 or get_gfx() not in RAGGED_K_GFX):
             continue
-        x8, xs8 = quant_act_e8m0(o_mbn, block)
-        w8, ws8 = quant_weight_e8m0(w_bnk, rows, block)
         name = f"a8w8_{rows}x{block}"
+        w_blk = blockwise_randn(b, n, k, dtype=dtype, rows=min(rows, 32))
+        refs[name] = run_torch_wo_a(o_mbn, w_blk, dtype)
+        x8, xs8 = quant_act_e8m0(o_mbn, block)
+        w8, ws8 = quant_weight_e8m0(w_blk, rows, block)
         candidates[name] = functools.partial(
             _a8w8, x8, shuffle_weight(w8), xs8, ws8, dtype
         )
@@ -277,6 +278,7 @@ def test_batched_gemm(b, m, n, k, dtype, layout):
             nbytes["a8w8_1x32"] = (
                 nbytes[name] - b * (n // 32) * (k // 32) + b * n * (k // 32)
             )
+            refs["a8w8_1x32"] = refs[name]
 
     flops = 2 * b * m * n * k
 
@@ -287,7 +289,7 @@ def test_batched_gemm(b, m, n, k, dtype, layout):
             out_mbn = out.transpose(0, 1).contiguous()
         else:
             out_mbn = out
-        ref_f = ref.to(dtypes.fp32).flatten()
+        ref_f = refs.get(name, ref).to(dtypes.fp32).flatten()
         out_f = out_mbn.to(dtypes.fp32).flatten()
         cos = torch.nn.functional.cosine_similarity(ref_f, out_f, dim=0).item()
         denom = ref_f.abs().mean().clamp_min(1e-6)
