@@ -710,25 +710,48 @@ class opus_gemm_codegen:
     {{ {kid}, &{kernel_name}<CTYPE> }},  \\
 """
 
+        # The scale-shape check runs before the kid is dispatched, and what shape
+        # is correct depends on the kid: GROUP_N and GROUP_K are 128 or 32. So
+        # the table below travels with the dispatch table rather than the check
+        # hardcoding 128, which is what rejected the first GROUP_K=32 launch.
+        group_entry = """\
+    {{ {kid}, {{ {group_n}, {group_k} }} }},  \\
+"""
+
         rows = sorted(
-            (kid, instance.name)
+            (kid, instance.name, instance.GROUP_N, instance.GROUP_K)
             for family in a8w8_mxscale_bmm_kernel_lists
             for kid, instance in family.items()
             if "fp32_t" in instance.output_dtypes
         )
+
+        def emit(f, macro, fmt, fields):
+            f.write(f"#define {macro} \\\n")
+            for index, row in enumerate(rows):
+                line = fmt.format(**fields(row))
+                if index == len(rows) - 1:
+                    line = line.rstrip().rstrip("\\").rstrip() + "\n"
+                f.write(line)
+            f.write("\n")
+
         with open(
             os.path.join(self.working_path, "opus_bmm_mxscale_kid_dispatch.h"),
             "w",
         ) as f:
             f.write(header)
             f.write(f"#define GENERATE_BMM_MXSCALE_KID_DISPATCH_SIZE {len(rows)}\n")
-            f.write("#define GENERATE_BMM_MXSCALE_KID_DISPATCH(CTYPE) \\\n")
-            for index, (kid, name) in enumerate(rows):
-                line = entry.format(kid=kid, kernel_name=name)
-                if index == len(rows) - 1:
-                    line = line.rstrip().rstrip("\\").rstrip() + "\n"
-                f.write(line)
-            f.write("\n")
+            emit(
+                f,
+                "GENERATE_BMM_MXSCALE_KID_DISPATCH(CTYPE)",
+                entry,
+                lambda r: {"kid": r[0], "kernel_name": r[1]},
+            )
+            emit(
+                f,
+                "GENERATE_BMM_MXSCALE_KID_GROUPS",
+                group_entry,
+                lambda r: {"kid": r[0], "group_n": r[2], "group_k": r[3]},
+            )
 
     def gen_manifest_head(self, kernels_dict):
         # Forward declarations for every launcher symbol the dispatcher references.

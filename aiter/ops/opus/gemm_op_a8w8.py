@@ -11,6 +11,10 @@
 import torch
 from torch import Tensor
 
+from csrc.opus_gemm.opus_gemm_common import (
+    a8w8_mxscale_bmm_kernels_list,
+)
+
 from ...jit.core import compile_ops
 from ._arch import _device_arch
 from .launch_plan import (
@@ -368,6 +372,7 @@ def _validate_a8w8_mxscale_bmm_tensors(
     Y: Tensor,
     x_scale: Tensor,
     w_scale: Tensor,
+    kid: int,
 ) -> None:
     entry = "opus_gemm_a8w8_mxscale_bmm_launch"
     tensors = (XQ, WQ, Y, x_scale, w_scale)
@@ -395,8 +400,16 @@ def _validate_a8w8_mxscale_bmm_tensors(
     w_batch, N, w_K = map(int, WQ.shape)
     if min(M, batch, N, K) <= 0:
         raise ValueError(f"{entry}: M, batch, N and K must be positive")
-    if N % 128 or K % 128:
-        raise ValueError(f"{entry}: N and K must be multiples of 128; got N={N}, K={K}")
+    # The kid's own quantisation block, read off the same instance table the
+    # generated kid->group table in C++ is built from. It used to be a literal
+    # 128 here and in opus_bmm_a8w8_common_checks, and fixing only the C++ copy
+    # left this one rejecting every correct GROUP_K=32 launch that reached it --
+    # the same rule living in two places and drifting.
+    group = a8w8_mxscale_bmm_kernels_list[int(kid)].GROUP_K
+    if N % group or K % group:
+        raise ValueError(
+            f"{entry}: N and K must be multiples of {group}; got N={N}, K={K}"
+        )
     if (w_batch, w_K) != (batch, K):
         raise ValueError(
             f"{entry}: WQ must have shape [{batch},N,{K}], got {tuple(WQ.shape)}"
@@ -405,8 +418,8 @@ def _validate_a8w8_mxscale_bmm_tensors(
         raise ValueError(
             f"{entry}: Y must have shape {(M, batch, N)}, got {tuple(Y.shape)}"
         )
-    expected_x_scale = (M, batch, K // 128)
-    expected_w_scale = (batch, N // 128, K // 128)
+    expected_x_scale = (M, batch, K // group)
+    expected_w_scale = (batch, N // group, K // group)
     if tuple(x_scale.shape) != expected_x_scale:
         raise ValueError(
             f"{entry}: x_scale must have shape {expected_x_scale}, "
@@ -450,17 +463,21 @@ def _launch_a8w8_mxscale_bmm(
     launch_y = Y.transpose(0, 1)
     launch_x_scale = x_scale.transpose(0, 1)
 
-    if instance is not None and workspace is None and split_k <= 1:
-        # The checked C++ entry owns the dynamic tensor contract.  Public
-        # routing already validated the immutable family/kid contract, so the
-        # common split-one path need not repeat the Python registry/planner.
+    if instance is not None and (workspace is not None or split_k <= 1):
+        # The checked C++ entry validates tensors and caller-owned workspace,
+        # including device, dtype, layout, capacity and alignment. Planning is
+        # only needed below when Python must allocate the workspace itself.
+        if workspace is not None and not isinstance(workspace, Tensor):
+            raise TypeError(
+                "opus_gemm_a8w8_mxscale_bmm_launch: workspace must be a Tensor"
+            )
         _launch_a8w8_backend(
             launch_x,
             WQ,
             launch_y,
             launch_x_scale,
             w_scale,
-            None,
+            workspace,
             _A8W8_MXSCALE_BMM_FAMILY,
             kid,
             max(1, split_k),
@@ -493,6 +510,7 @@ def _launch_a8w8_mxscale_bmm(
             launch_y,
             launch_x_scale,
             w_scale,
+            int(kid),
         )
         required_numel = workspace_spec.shape[0]
         if launch_workspace is None:
