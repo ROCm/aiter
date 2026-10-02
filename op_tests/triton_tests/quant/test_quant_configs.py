@@ -101,9 +101,8 @@ def test_quant_config_table(path):
         required.add("NUM_STAGES")
     for key, cfg in table.items():
         assert _KEY_RE.match(key), f"bad bucket key {key!r}"
-        assert required <= set(cfg) <= required | _OPTIONAL, (
-            f"{key}: keys {sorted(cfg)}"
-        )
+        keys = set(cfg)
+        assert required <= keys <= required | _OPTIONAL, f"{key}: keys {sorted(keys)}"
         assert all(isinstance(v, int) for v in cfg.values()), key
         assert is_power_of_2(cfg["BLOCK_SIZE_M"]), key
         assert is_power_of_2(cfg["BLOCK_SIZE_N"]), key
