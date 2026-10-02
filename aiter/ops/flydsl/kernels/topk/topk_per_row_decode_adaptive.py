@@ -37,6 +37,7 @@ Constraints:
     occupancy deadlock guard rely on it.
   - workspace must be zeroed before any launch that enters a multi-block tier; its
     counters and histograms accumulate from zero (needs_workspace_zero reports when).
+    Only the leading workspace_zero_row_slots of each row need it.
   - The row barrier spins (s_sleep), so a row's blocks_per_row workgroups must be
     co-resident. This is a regular launch, not hipLaunchCooperativeKernel, and is safe
     only because the grid is flattened x-fastest: a row's parts launch contiguously
@@ -412,6 +413,12 @@ def topk_workspace_slots(
     row_slots = COUNTER_SLOTS + _num_passes(bits_per_pass) * (1 << bits_per_pass)
     row_slots += _compact_row_slots(compact, compact_cap)
     return int(num_rows) * row_slots
+
+
+def workspace_zero_row_slots(bits_per_pass: int = 11, compact: bool = False) -> int:
+    """Leading int32 slots of each row that must start at zero; compact data may not."""
+    slots = COUNTER_SLOTS + _num_passes(bits_per_pass) * (1 << bits_per_pass)
+    return slots + (COMPACT_HDR_SLOTS if compact else 0)
 
 
 def needs_workspace_zero(

@@ -736,6 +736,59 @@ def test_decode_bound_entry_points(card):
     )
 
 
+def test_adaptive_compact_garbage(card):
+    """The adaptive launch clears only the leading slots of each workspace row, so
+    run a compact cell twice on a workspace whose every slot is garbage first."""
+    rows, width, top_k = next(
+        (m, n, 2048)
+        for m in (64, 128, 256)
+        for n in (65536, 131072)
+        if adaptive_kernel.decode_adaptive_config(
+            m, n, 2048, ordered=False, cu_count=card[1]
+        )["compact"]
+    )
+    cfg = adaptive_kernel.decode_adaptive_config(
+        rows, width, top_k, ordered=False, cu_count=card[1]
+    )
+    slots = adaptive_kernel.topk_workspace_slots(
+        rows, 11, compact=True, compact_cap=cfg["kw"]["compact_cap_mult"] * top_k
+    )
+    workspace = flydsl_decode_host._get_adaptive_workspace(
+        torch.device("cuda", torch.cuda.current_device()),
+        torch.cuda.current_stream().cuda_stream,
+        slots,
+    )
+    seq_lens = torch.full((rows,), width, dtype=torch.int32, device="cuda")
+    row_starts = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    for seed in (1, 2):
+        torch.manual_seed(seed)
+        logits = torch.randn(rows, width, device="cuda")
+        indices = torch.empty((rows, top_k), dtype=torch.int32, device="cuda")
+        workspace.fill_(-1)
+        flydsl_decode_host._decode_with_backend(
+            logits,
+            1,
+            seq_lens,
+            indices,
+            rows,
+            *logits.stride(),
+            top_k,
+            False,
+            None,
+            topk.BACKEND_ADAPTIVE,
+            width,
+        )
+        torch.cuda.synchronize()
+        # The launch cleared this buffer's leading slots, so it is the one it used.
+        lead = adaptive_kernel.workspace_zero_row_slots(11, compact=True)
+        assert (workspace.view(rows, -1)[:, :lead] >= 0).all()
+        torch_indices = logits.topk(top_k, dim=-1)[1]
+        assert compare_topk_results(
+            logits, indices, torch_indices, row_starts, seq_lens, top_k
+        ), f"compact garbage mismatch at rows={rows} width={width} seed={seed}"
+    print(f"[adaptive_compact_garbage] PASS: rows={rows} width={width} k={top_k}")
+
+
 def test_mb_workspace_reuse():
     """Regression for the persistent multi-block workspace + kernel self-reset.
 
@@ -978,6 +1031,7 @@ if card in topk._ADAPTIVE_BANDS_BY_K_GROUP:
         "123"
     ), f"short-row decode does not reach every radix pass exit:\n{df_md}"
     test_decode_bound_entry_points(card)
+    test_adaptive_compact_garbage(card)
 else:
     aiter.logger.warning(
         "%s at %d CU carries no adaptive decode bands; bounded decode skipped", *card

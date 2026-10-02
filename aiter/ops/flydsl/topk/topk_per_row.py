@@ -441,7 +441,11 @@ def _run_adaptive(
         tier_mode=kw.get("tier_mode", "auto"),
         bits_per_pass=11,
     ):
-        workspace.zero_()
+        if cfg["compact"]:
+            lead = _adaptive.workspace_zero_row_slots(11, compact=True)
+            workspace.view(rows, -1)[:, :lead].zero_()
+        else:
+            workspace.zero_()
     _run_compiled(
         launcher,
         logits,
