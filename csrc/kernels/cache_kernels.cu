@@ -1301,6 +1301,108 @@ __global__ void concat_and_cache_mla_seg_opt_kernel(
     copy(k_pe, k_pe_stride, pe_dim, pe_base);
 }
 
+// The layout fused_qk_rope_concat_and_cache_mla_seg writes (kv_lora 512, pe 64,
+// page 64), TPB tokens per block. Same data movement as the kernel above; what
+// changes is when the loads go out.
+//
+// There, a block is one token, so a lane has a single 16 B load in flight, and
+// that load waits behind slot_mapping[token] and a 64-bit divide by the
+// runtime page_size -- neither of which the source address depends on. Here
+// every source load issues first, from token_idx alone, and the slot lookup
+// (now a shift, the page being a compile-time 64) overlaps it. A block takes
+// TPB tokens so a lane carries TPB independent nope loads; each token's pe is
+// spread over its own PE_CHUNKS lanes rather than stacked on lanes
+// 0..PE_CHUNKS-1, so a lane holds one token's pe however large TPB is.
+template <typename scalar_t, typename cache_t, vllm::Fp8KVCacheDataType kv_dt, int TPB>
+__global__ void concat_and_cache_mla_seg_512_kernel(
+    const scalar_t* __restrict__ kv_c,        // [num_tokens, 512]
+    const scalar_t* __restrict__ k_pe,        // [num_tokens, 64]
+    cache_t* __restrict__ kv_cache,           // [num_blocks, block_stride] flat
+    const int64_t* __restrict__ slot_mapping, // [num_tokens]
+    const int num_tokens,
+    const int64_t block_stride,
+    const int64_t kv_c_stride,
+    const int64_t k_pe_stride,
+    const float* scale)
+{
+    constexpr int KV_LORA   = 512;
+    constexpr int PE_DIM    = 64;
+    constexpr int PAGE_SIZE = 64;
+    constexpr int VEC       = 8;
+    constexpr int NUM_VEC   = KV_LORA / VEC; // == blockDim.x
+    constexpr int PE_CHUNKS = PE_DIM / VEC;
+    constexpr int PE_TOKENS_PER_ROUND = NUM_VEC / PE_CHUNKS;
+    static_assert(TPB <= PE_TOKENS_PER_ROUND, "a token's pe needs its own PE_CHUNKS lanes");
+    using in_vec_t  = opus::vector_t<scalar_t, VEC>;
+    using out_vec_t = opus::vector_t<cache_t, VEC>;
+
+    const int64_t tok0          = static_cast<int64_t>(blockIdx.x) * TPB;
+    const float inverted_kscale = 1.0f / *scale;
+
+    auto convert = [&](const in_vec_t& vin) -> out_vec_t {
+        if constexpr(kv_dt == vllm::Fp8KVCacheDataType::kAuto)
+        {
+            out_vec_t vout;
+#pragma unroll
+            for(int j = 0; j < VEC; ++j)
+                vout[j] = static_cast<cache_t>(vin[j]);
+            return vout;
+        }
+        else
+        {
+            return aiter::scaled_cast<cache_t>(vin, inverted_kscale);
+        }
+    };
+
+    // ---- issue: every source load, then the slots ----
+    in_vec_t nope_in[TPB];
+#pragma unroll
+    for(int k = 0; k < TPB; ++k)
+    {
+        const int64_t t = tok0 + k;
+        if(t < num_tokens)
+            nope_in[k] = reinterpret_cast<const in_vec_t*>(kv_c + t * kv_c_stride)[threadIdx.x];
+    }
+    const int pe_tok   = threadIdx.x / PE_CHUNKS;
+    const int pe_chunk = threadIdx.x % PE_CHUNKS;
+    const int64_t pe_t = tok0 + pe_tok;
+    const bool pe_lane = pe_tok < TPB && pe_t < num_tokens;
+    in_vec_t pe_in{};
+    int64_t pe_slot = -1;
+    if(pe_lane)
+    {
+        pe_in   = reinterpret_cast<const in_vec_t*>(k_pe + pe_t * k_pe_stride)[pe_chunk];
+        pe_slot = slot_mapping[pe_t];
+    }
+
+    int64_t slot[TPB];
+#pragma unroll
+    for(int k = 0; k < TPB; ++k)
+    {
+        const int64_t t = tok0 + k;
+        slot[k]         = t < num_tokens ? slot_mapping[t] : -1;
+    }
+
+    // ---- emit ----
+#pragma unroll
+    for(int k = 0; k < TPB; ++k)
+    {
+        // Uniform over the block: slot and t come from blockIdx and k.
+        if(slot[k] < 0)
+            continue;
+        const int64_t base =
+            (slot[k] / PAGE_SIZE) * block_stride + (slot[k] % PAGE_SIZE) * KV_LORA;
+        reinterpret_cast<out_vec_t*>(kv_cache + base)[threadIdx.x] = convert(nope_in[k]);
+    }
+    if(pe_slot >= 0)
+    {
+        const int64_t base = (pe_slot / PAGE_SIZE) * block_stride +
+                             static_cast<int64_t>(PAGE_SIZE) * KV_LORA +
+                             (pe_slot % PAGE_SIZE) * PE_DIM;
+        reinterpret_cast<out_vec_t*>(kv_cache + base)[pe_chunk] = convert(pe_in);
+    }
+}
+
 template <typename scalar_t,
           typename cache_t,
           vllm::Fp8KVCacheDataType kv_dt,
@@ -2402,8 +2504,18 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
 // loads/stores (128-bit for 16-bit inputs); the pe segment is RoPE'd per
 // element (PE_DIM threads).
 // ============================================================================
+// Which heads-per-block instantiations stage Q through TDM on gfx1250: bit HPT
+// set means that HPT does. Read by the kernel and by the host's dynamic-LDS
+// sizing, so the two cannot disagree. Not HPT=1: that path serves the small
+// launches sitting on the latency floor, where the tensor issue-and-wait costs
+// more than the direct loads it replaces (+2..+5%, H=16..128 at T<=192 and
+// H=3 T=1536). HPT=2/4/8 gain 3/11/6%.
+#ifndef AITER_MLA_SEG_TDM_HPT_MASK
+#define AITER_MLA_SEG_TDM_HPT_MASK 0x114
+#endif
+
 template <typename scalar_t, typename cache_t, int KV_LORA, int PE_DIM,
-          int PAGE_SIZE, bool IS_NEOX, int VEC>
+          int PAGE_SIZE, bool IS_NEOX, int VEC, int HPT>
 __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
     const scalar_t* __restrict__ q_nope,    // [T, H, KV_LORA]
     const scalar_t* __restrict__ q_pe,      // [T, H, PE_DIM]
@@ -2425,82 +2537,393 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
     const int64_t k_pe_stride,
     const int64_t cos_stride0,
     const int64_t sin_stride0,
-    const int64_t block_stride)
+    const int64_t block_stride,
+    const int max_position)
 {
     constexpr int HALF    = PE_DIM / 2;
     constexpr int NUM_VEC = KV_LORA / VEC; // nope vectors per row
     using in_vec_t  = opus::vector_t<scalar_t, VEC>;
     using out_vec_t = opus::vector_t<cache_t, VEC>;
 
-    const int64_t token_idx = blockIdx.x / num_heads;
-    const int     head_idx  = blockIdx.x % num_heads;
+    // Two-dimensional grid so the coordinates arrive directly. A flat grid has
+    // to divide and modulo by num_heads, which is a runtime value, and
+    // token_idx heads every address chain in the block -- so that divide sits
+    // at the front of the critical path, once per block, across T*H blocks.
+    // x is the head so that consecutive blocks stay within one token and keep
+    // sharing its slot, position and cos/sin row, which is the order the flat
+    // grid already produced.
+    const int64_t token_idx = blockIdx.y;
+    const int     head_base = blockIdx.x * HPT;
 
+    // The slot only gates the writes. Every Q load is addressed from
+    // token/head alone and stays in bounds for a padded token too, so on the
+    // one-head-per-block path -- on its latency floor -- the early return waits
+    // until they are issued: taken first, it held every Q load behind the
+    // slot_mapping round trip (H=16 T=192 -8.3%, H=32 T=192 -7.3%). With more
+    // heads per block the op is bandwidth-bound, and deferring it measured ~1%
+    // slower there, so that path returns up front as before.
     const int64_t slot_idx = slot_mapping[token_idx];
-    if(slot_idx < 0)
-        return; // uniform across the block (same token)
+    if constexpr(HPT > 1)
+    {
+        if(slot_idx < 0)
+            return; // uniform across the block (same token)
+    }
 
-    const int64_t pos       = positions[token_idx];
-    const scalar_t* cos_ptr = cos_cache + pos * cos_stride0;
-    const scalar_t* sin_ptr = sin_cache + pos * sin_stride0;
+    // cos/sin are read at <buf>[<row> + i]; <end> is an offset past the buffer.
+    // A padded token reaches this on the one-head path and may carry a stale
+    // position, so there the descriptors span the whole cache with the row in
+    // the offset: the hardware range check then covers the row too, and any
+    // position reads in bounds or not at all. Clamping it instead cost that
+    // path 3-5% (H=16/32 T=192), and gating it on the slot would put the slot
+    // round trip back in front of the cos/sin loads. With more heads per block
+    // a padded token has already returned, and a per-row descriptor keeps the
+    // row offset scalar (~2% at H=128 T=1536).
+    const int64_t pos = positions[token_idx];
+    const scalar_t* cos_base = cos_cache;
+    const scalar_t* sin_base = sin_cache;
+    int cos_row = 0, sin_row = 0, cos_end = HALF, sin_end = HALF;
+    if constexpr(HPT == 1)
+    {
+        cos_row = static_cast<int>(pos * cos_stride0);
+        sin_row = static_cast<int>(pos * sin_stride0);
+        cos_end = static_cast<int>(max_position * cos_stride0);
+        sin_end = static_cast<int>(max_position * sin_stride0);
+    }
+    else
+    {
+        cos_base += pos * cos_stride0;
+        sin_base += pos * sin_stride0;
+    }
+    auto cos_buf = opus::make_gmem<scalar_t>(cos_base, cos_end * sizeof(scalar_t));
+    auto sin_buf = opus::make_gmem<scalar_t>(sin_base, sin_end * sizeof(scalar_t));
 
-    // ---- helper: RoPE on the pe segment for output element d (< PE_DIM) ----
-    auto rope_pe = [&](const scalar_t* pe_ptr, int d) -> float {
-        int pair_dim, cos_idx;
-        if constexpr(IS_NEOX)
-        {
-            pair_dim = d < HALF ? d + HALF : d - HALF;
-            cos_idx  = d < HALF ? d : d - HALF;
-        }
-        else
-        {
-            pair_dim = (d % 2 == 0) ? d + 1 : d - 1;
-            cos_idx  = d / 2;
-        }
-        const float xv   = static_cast<float>(pe_ptr[d]);
-        const float yv   = static_cast<float>(pe_ptr[pair_dim]);
-        const float cosv = static_cast<float>(cos_ptr[cos_idx]);
-        const float sinv = static_cast<float>(sin_ptr[cos_idx]);
-        // Standard RoPE pair transform (a,b) -> (a*cos - b*sin, b*cos + a*sin).
-        // xv is always the current element pe[d]; yv is its pair pe[pair_dim].
-        // For the "first" element of a pair (d<HALF / even d) output is
-        // xv*cos - yv*sin; for the "second" element output is xv*cos + yv*sin
-        // (i.e. b*cos + a*sin). The cos/sin operands must NOT be swapped here.
-        if constexpr(IS_NEOX)
-            return d < HALF ? (xv * cosv - yv * sinv) : (xv * cosv + yv * sinv);
-        else
-            return (d % 2 == 0) ? (xv * cosv - yv * sinv) : (xv * cosv + yv * sinv);
+    // ---- helper: the whole pe segment, VEC elements per thread ----
+    //
+    // The segment is walked a chunk at a time rather than an element at a
+    // time. Taken per element it costs four narrow loads and a one-byte store
+    // for every 2 bytes of input, against one wide load per 8 elements on the
+    // nope path; the segment is an eighth of Q's bytes and was measuring ~30%
+    // of the kernel.
+    //
+    // Both pairings keep a chunk's operands inside one load. NEOX pairs across
+    // HALF, a multiple of VEC, so a chunk's partner is a whole chunk and its
+    // cos/sin indices are the chunk's own folded into the low half. GPT-J
+    // pairs adjacent elements, so a chunk already holds both halves of every
+    // pair and only cos/sin narrows, to VEC/2.
+    constexpr int PE_CHUNKS = PE_DIM / VEC;
+    static_assert(PE_DIM % VEC == 0 && HALF % VEC == 0);
+    using half_vec_t = opus::vector_t<scalar_t, VEC / 2>;
+    using pe_cs_t    = std::conditional_t<IS_NEOX, in_vec_t, half_vec_t>;
+
+    // Issue and consume are split so the caller can put the segment's loads in
+    // front of the nope pass. Every operand address is known as soon as the
+    // token is -- pe from the row, cos/sin from positions[token] -- so nothing
+    // here has to wait for nope, and the four loads then overlap it instead of
+    // starting a fresh dependency chain after it.
+    // With more than one head per block the NEOX partner chunk is taken
+    // across lanes (see rope_pe_emit); with one, the op is on its latency
+    // floor and a second parallel load beats waiting on x to exchange it
+    // (H=32 T=192: +0.7% exchanged, against -6..-8.5% at HPT > 1).
+    constexpr bool PE_EXCHANGE = IS_NEOX && HPT > 1;
+    struct PeOperands
+    {
+        in_vec_t x, y;
+        pe_cs_t c, s;
     };
 
-    // ================= Q (every block) =================
+    // `active` masks like rope_pe_emit's: an inactive lane reads past
+    // num_records, which returns zero without touching the cache -- no branch,
+    // and no extra requests either (clamping to a live row instead cost the
+    // one-head path eight times its pe loads).
+    //
+    // pe_ptr is the wave's first head row and row_off (elements) the lane's
+    // own row within the `extent` elements after it. The buffer descriptor has
+    // to stay wave-uniform: built from a lane-derived head, it landed in VGPRs
+    // and the compiler wrapped every access in a readfirstlane waterfall loop.
+    auto rope_pe_issue = [&](const scalar_t* pe_ptr, int row_off, int extent, int chunk,
+                             bool active) -> PeOperands {
+        PeOperands o{};
+        const int d0 = chunk * VEC;
+        auto pe_buf  = opus::make_gmem<scalar_t>(pe_ptr, extent * sizeof(scalar_t));
+        o.x = pe_buf.template load<VEC>(active ? row_off + d0 : extent);
+        if constexpr(IS_NEOX)
+        {
+            const int cidx = d0 < HALF ? d0 : d0 - HALF;
+            if constexpr(!PE_EXCHANGE)
+                o.y = pe_buf.template load<VEC>(active ? row_off + (d0 ^ HALF) : extent);
+            o.c = cos_buf.template load<VEC>(active ? cos_row + cidx : cos_end);
+            o.s = sin_buf.template load<VEC>(active ? sin_row + cidx : sin_end);
+        }
+        else
+        {
+            o.c = cos_buf.template load<VEC / 2>(active ? cos_row + d0 / 2 : cos_end);
+            o.s = sin_buf.template load<VEC / 2>(active ? sin_row + d0 / 2 : sin_end);
+        }
+        return o;
+    };
+    // Same row_off / extent convention as rope_pe_issue.
+
+    // `active` masks the store without touching EXEC: an inactive lane writes
+    // at PE_DIM, past the buffer's num_records, which the hardware drops. A
+    // divergent `if` here put s_and_saveexec right behind the nope store, and
+    // EXEC being an operand of that in-flight store it had to drain the whole
+    // address queue first -- s_wait_xcnt, 18% of the wave at H=32 T=192 in ATT.
+    auto rope_pe_emit = [&](const PeOperands& o, cache_t* out_ptr, int row_off, int extent,
+                            float inv_scale, int chunk, bool active) {
+        const int d0 = chunk * VEC;
+        auto out_buf = opus::make_gmem<cache_t>(out_ptr, extent * sizeof(cache_t));
+        out_vec_t vout;
+        if constexpr(IS_NEOX)
+        {
+            // The partner chunk is the one lane chunk^HALF/VEC already loaded
+            // -- the same 128 B row -- so take it across lanes instead of
+            // reading it again. Loaded twice, it went to GL2 as a second
+            // 128 B request per head (34% of read requests at H=128, against
+            // 4 x 256 B for the nope row). Done here rather than at issue so
+            // the exchange does not force a wait on x before the nope loads go
+            // out. Partners share a PE_CHUNKS-lane group on every caller.
+            in_vec_t y = o.y;
+            if constexpr(PE_EXCHANGE)
+            {
+                constexpr int PARTNER = HALF / VEC;
+                using u32x4 = uint32_t __attribute__((ext_vector_type(4)));
+                static_assert(sizeof(in_vec_t) == sizeof(u32x4));
+                const u32x4 xw = __builtin_bit_cast(u32x4, o.x);
+                u32x4 yw;
+#pragma unroll
+                for(int w = 0; w < 4; ++w)
+                    yw[w] = static_cast<uint32_t>(
+                        __shfl_xor(static_cast<int>(xw[w]), PARTNER, PE_CHUNKS));
+                y = __builtin_bit_cast(in_vec_t, yw);
+            }
+            const bool low   = d0 < HALF;
+#pragma unroll
+            for(int i = 0; i < VEC; ++i)
+            {
+                const float xv = static_cast<float>(o.x[i]);
+                const float yv = static_cast<float>(y[i]);
+                const float cv = static_cast<float>(o.c[i]);
+                const float sv = static_cast<float>(o.s[i]);
+                const float r  = low ? (xv * cv - yv * sv) : (xv * cv + yv * sv);
+                vout[i]        = opus::cast<cache_t>(r * inv_scale);
+            }
+        }
+        else
+        {
+#pragma unroll
+            for(int k = 0; k < VEC / 2; ++k)
+            {
+                const float a  = static_cast<float>(o.x[2 * k]);
+                const float b  = static_cast<float>(o.x[2 * k + 1]);
+                const float cv = static_cast<float>(o.c[k]);
+                const float sv = static_cast<float>(o.s[k]);
+                vout[2 * k]     = opus::cast<cache_t>((a * cv - b * sv) * inv_scale);
+                vout[2 * k + 1] = opus::cast<cache_t>((b * cv + a * sv) * inv_scale);
+            }
+        }
+        out_buf.template store<VEC, out_vec_t>(vout, active ? row_off + d0 : extent);
+    };
+
+    auto rope_pe_seg = [&](const scalar_t* pe_ptr, cache_t* out_ptr, float inv_scale) {
+        if(threadIdx.x < PE_CHUNKS)
+            rope_pe_emit(rope_pe_issue(pe_ptr, 0, PE_DIM, threadIdx.x, true), out_ptr, 0,
+                         PE_DIM, inv_scale, threadIdx.x, true);
+    };
+
+    // ================= Q (HPT heads per block) =================
+    //
+    // The block is one thread per nope vector, so a thread carries a single
+    // 16 B load per head. With one head per block that is all it ever has in
+    // flight, which is far short of what it takes to cover memory latency on
+    // this part: a plain bf16->fp8 cast of the same footprint runs ~1.7x
+    // faster. So each block takes HPT heads of one token and issues every
+    // head's nope and pe loads before consuming any -- HPT independent 16 B
+    // requests per thread instead of one. The head index comes from blockIdx
+    // and the unrolled loop counter, so it stays scalar; widening the block
+    // with more threads instead made it thread-derived, pushed the address
+    // chain into VGPRs and measured slower at every width.
+#if defined(__gfx1250__)
+    // gfx1250, eight heads: stage Q through the tensor engine. Each wave owns
+    // half the nope columns of all eight heads plus four heads' pe rows, and
+    // issues them as two tiles (256 x 8 and 64 x 4) -- within the three tensor
+    // ops a wave can hold in flight. A wave consumes only what it staged, so
+    // there is no block barrier, just the tensor wait. The host sizes the
+    // dynamic LDS to match (two waves x WAVE_ELEMS).
+    if constexpr(((AITER_MLA_SEG_TDM_HPT_MASK >> HPT) & 1) != 0)
+    {
+        constexpr int W          = 32;
+        constexpr int COLS       = KV_LORA / 2;
+        // pe lanes are threadIdx.x / PE_CHUNKS, so a wave's 32 lanes carry at
+        // most four heads' pe: all of them in wave 0 for HPT <= 4, four each
+        // for HPT == 8.
+        constexpr int PE_ROWS    = HPT < 4 ? HPT : 4;
+        constexpr int WAVE_ELEMS = HPT * COLS + PE_ROWS * PE_DIM;
+        static_assert(NUM_VEC == 2 * W && COLS == W * VEC && 4 * PE_CHUNKS == W);
+        extern __shared__ char mla_seg_lds[];
+        using NopeWin = opus::tdm<scalar_t, opus::seq<COLS, HPT>>;
+        using PeWin   = opus::tdm<scalar_t, opus::seq<PE_DIM, PE_ROWS>>;
+#if defined(__HIP_DEVICE_COMPILE__)
+        const int wave = __builtin_amdgcn_readfirstlane(threadIdx.x / W);
+#else
+        const int wave = threadIdx.x / W;
+#endif
+        const opus::u32_t lds_base =
+            static_cast<opus::u32_t>(reinterpret_cast<__UINTPTR_TYPE__>(mla_seg_lds));
+        const opus::u32_t wave_off = static_cast<opus::u32_t>(wave * WAVE_ELEMS);
+
+        auto wn = opus::make_tdm<NopeWin>(lds_base, q_nope + token_idx * q_nope_stride_0,
+                                          KV_LORA, num_heads, q_nope_stride_1,
+                                          wave * COLS, head_base);
+        wn.async_load(wave_off);
+        const bool wave_has_pe = wave * PE_ROWS < HPT;
+        if(wave_has_pe)
+        {
+            auto wp = opus::make_tdm<PeWin>(lds_base, q_pe + token_idx * q_pe_stride_0,
+                                            PE_DIM, num_heads, q_pe_stride_1,
+                                            0, head_base + wave * PE_ROWS);
+            wp.async_load(wave_off + HPT * COLS);
+        }
+
+        // cos/sin go the ordinary way, issued while the tiles are in flight.
+        const int pe_row   = (threadIdx.x % W) / PE_CHUNKS;
+        const int pe_chunk = threadIdx.x % PE_CHUNKS;
+        const int d0       = pe_chunk * VEC;
+        PeOperands pe_op{};
+        if constexpr(IS_NEOX)
+        {
+            const int cidx = d0 < HALF ? d0 : d0 - HALF;
+            pe_op.c        = cos_buf.template load<VEC>(cos_row + cidx);
+            pe_op.s        = sin_buf.template load<VEC>(sin_row + cidx);
+        }
+        else
+        {
+            pe_op.c = cos_buf.template load<VEC / 2>(cos_row + d0 / 2);
+            pe_op.s = sin_buf.template load<VEC / 2>(sin_row + d0 / 2);
+        }
+        const float inv_qscale = 1.0f / (*q_scale);
+        opus::s_wait_tensorcnt<0>();
+        // One head per block defers the padded-token return until the loads
+        // are out (see slot_idx); it must also wait for them, or the block
+        // could retire with a tensor DMA still writing its LDS.
+        if constexpr(HPT == 1)
+        {
+            if(slot_idx < 0)
+                return;
+        }
+
+        const __UINTPTR_TYPE__ lds = reinterpret_cast<__UINTPTR_TYPE__>(mla_seg_lds);
+        auto lds_vec = [&](int elem) -> in_vec_t {
+            return *reinterpret_cast<const OPUS_LDS_ADDR in_vec_t*>(
+                lds + static_cast<__UINTPTR_TYPE__>(wave_off + elem) * sizeof(scalar_t));
+        };
+        const int col = (threadIdx.x % W) * VEC;
+        // Every head is converted before any is stored. Converted and stored
+        // one at a time, each head's store data landed in the registers the
+        // next head's was about to use, and the wave sat in s_wait_xcnt behind
+        // every store until the memory pipe had read it out.
+        out_vec_t nope_out[HPT];
+#pragma unroll
+        for(int k = 0; k < HPT; ++k)
+            nope_out[k] = aiter::scaled_cast<cache_t>(lds_vec(k * COLS + col), inv_qscale);
+        cache_t* q_out_tok = q_out + token_idx * q_out_stride_0;
+#pragma unroll
+        for(int k = 0; k < HPT; ++k)
+        {
+            auto out_buf = opus::make_gmem<cache_t>(q_out_tok + (head_base + k) * q_out_stride_1,
+                                                    KV_LORA * sizeof(cache_t));
+            out_buf.template store<VEC, out_vec_t>(nope_out[k], wave * COLS + col);
+        }
+        {
+            const bool pe_active = wave * PE_ROWS + pe_row < HPT;
+            const int  pe_r      = pe_active ? pe_row : 0; // keep the LDS read in range
+            pe_op.x = lds_vec(HPT * COLS + pe_r * PE_DIM + d0);
+            // Without the lane exchange rope_pe_emit reads the NEOX partner
+            // from o.y; here it is the same staged row, HALF elements over.
+            if constexpr(IS_NEOX && !PE_EXCHANGE)
+                pe_op.y = lds_vec(HPT * COLS + pe_r * PE_DIM + (d0 ^ HALF));
+            rope_pe_emit(pe_op,
+                         q_out_tok + (head_base + wave * PE_ROWS) * q_out_stride_1 + KV_LORA,
+                         static_cast<int>(pe_r * q_out_stride_1),
+                         static_cast<int>((PE_ROWS - 1) * q_out_stride_1) + PE_DIM,
+                         inv_qscale, pe_chunk, pe_active);
+        }
+    }
+    else
+#endif
     {
         const float inv_qscale = 1.0f / (*q_scale);
-        const scalar_t* q_nope_row =
-            q_nope + token_idx * q_nope_stride_0 + head_idx * q_nope_stride_1;
-        cache_t* q_out_row =
-            q_out + token_idx * q_out_stride_0 + head_idx * q_out_stride_1;
 
-        // nope: vectorized static quant.
-        auto in_buf  = opus::make_gmem<scalar_t>(q_nope_row, KV_LORA * sizeof(scalar_t));
-        auto out_buf = opus::make_gmem<cache_t>(q_out_row, KV_LORA * sizeof(cache_t));
-        for(int v = threadIdx.x; v < NUM_VEC; v += blockDim.x)
-        {
-            in_vec_t  vin  = in_buf.template load<VEC>(v * VEC);
-            out_vec_t vout = aiter::scaled_cast<cache_t>(vin, inv_qscale);
-            out_buf.template store<VEC, out_vec_t>(vout, v * VEC);
-        }
+        // pe is spread across the block, one head per PE_CHUNKS lanes, rather
+        // than every head's pe queued on lanes 0..PE_CHUNKS-1. A head's pe
+        // operands are four VEC-wide vectors, and VGPRs are allocated per
+        // wave however few lanes use them, so stacking HPT heads on the same
+        // lanes costs 16*HPT registers for the whole wave -- the reason HPT=8
+        // collapsed. Spread, each lane holds at most one head's pe whatever
+        // HPT is. pe_head is lane-derived, which is fine: pe addressing was
+        // per-lane already, and the nope path keeps its scalar head index.
+        static_assert(HPT * PE_CHUNKS <= NUM_VEC, "pe lanes must fit in the block");
+        const int pe_head  = threadIdx.x / PE_CHUNKS;
+        const int pe_chunk = threadIdx.x % PE_CHUNKS;
+        const bool pe_lane = pe_head < HPT;
+        // Lanes past the last head are masked by offset, not by a branch: no
+        // EXEC write near in-flight memory ops.
+        const int pe_h     = pe_lane ? pe_head : 0;
+        // A wave holding no pe lane at all skips the segment outright. The
+        // test is on the wave's first lane, so it is uniform and compiles to a
+        // scalar branch -- it moves SCC, not EXEC, and costs no drain. Without
+        // it the one-head path's second wave ran the whole pe segment masked
+        // off, which cost more than the drain saved once the grid reached
+        // ~6K blocks (+2.6% at H=32 T=192).
+#if defined(__HIP_DEVICE_COMPILE__)
+        const bool wave_pe =
+            __builtin_amdgcn_readfirstlane(static_cast<int>(threadIdx.x)) < HPT * PE_CHUNKS;
+#else
+        const bool wave_pe = true;
+#endif
+        PeOperands pe_op{};
+        if(wave_pe)
+            pe_op = rope_pe_issue(q_pe + token_idx * q_pe_stride_0 + head_base * q_pe_stride_1,
+                                  static_cast<int>(pe_h * q_pe_stride_1),
+                                  static_cast<int>((HPT - 1) * q_pe_stride_1) + PE_DIM,
+                                  pe_chunk, pe_lane);
 
-        // pe: RoPE then static quant (per element).
-        const scalar_t* q_pe_row =
-            q_pe + token_idx * q_pe_stride_0 + head_idx * q_pe_stride_1;
-        for(int d = threadIdx.x; d < PE_DIM; d += blockDim.x)
+        in_vec_t nope_in[HPT];
+#pragma unroll
+        for(int k = 0; k < HPT; ++k)
         {
-            const float roped = rope_pe(q_pe_row, d);
-            q_out_row[KV_LORA + d] = opus::cast<cache_t>(roped * inv_qscale);
+            const int h = head_base + k;
+            auto in_buf = opus::make_gmem<scalar_t>(
+                q_nope + token_idx * q_nope_stride_0 + h * q_nope_stride_1,
+                KV_LORA * sizeof(scalar_t));
+            nope_in[k] = in_buf.template load<VEC>(threadIdx.x * VEC);
         }
+        // A padded token (HPT > 1 returned up front) is dropped the same way,
+        // by an out-of-bounds offset: a return here is a branch the compiler
+        // may sink the nope load past, which ATT showed it doing.
+        const bool q_live = HPT > 1 || slot_idx >= 0; // uniform over the block
+#pragma unroll
+        for(int k = 0; k < HPT; ++k)
+        {
+            const int h        = head_base + k;
+            cache_t* q_out_row = q_out + token_idx * q_out_stride_0 + h * q_out_stride_1;
+            auto out_buf = opus::make_gmem<cache_t>(q_out_row, KV_LORA * sizeof(cache_t));
+            out_buf.template store<VEC, out_vec_t>(
+                aiter::scaled_cast<cache_t>(nope_in[k], inv_qscale),
+                q_live ? static_cast<int>(threadIdx.x) * VEC : KV_LORA);
+        }
+        if(wave_pe)
+            rope_pe_emit(pe_op,
+                         q_out + token_idx * q_out_stride_0 + head_base * q_out_stride_1 +
+                             KV_LORA,
+                         static_cast<int>(pe_h * q_out_stride_1),
+                         static_cast<int>((HPT - 1) * q_out_stride_1) + PE_DIM,
+                         inv_qscale, pe_chunk, pe_lane && q_live);
     }
 
     // ================= K (only head 0, kv=1) =================
-    if(head_idx == 0)
+    // A scalar branch (SCC, not EXEC), so no WAR drain: the one-head direct
+    // path no longer returns early for a padded token.
+    if(blockIdx.x == 0 && slot_idx >= 0)
     {
         const float inv_kscale = 1.0f / (*k_scale);
         const int64_t block_idx    = slot_idx / PAGE_SIZE;
@@ -2520,13 +2943,9 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
             out_buf.template store<VEC, out_vec_t>(vout, v * VEC);
         }
 
-        // pe: RoPE then static quant (per element).
+        // pe: RoPE then static quant.
         const scalar_t* k_pe_row = k_pe + token_idx * k_pe_stride;
-        for(int d = threadIdx.x; d < PE_DIM; d += blockDim.x)
-        {
-            const float roped = rope_pe(k_pe_row, d);
-            kv_cache[rope_base + d] = opus::cast<cache_t>(roped * inv_kscale);
-        }
+        rope_pe_seg(k_pe_row, kv_cache + rope_base, inv_kscale);
     }
 }
 
@@ -3865,6 +4284,32 @@ void reshape_and_cache_flash(
                                      page_size,                                       \
                                      reinterpret_cast<const float*>(scale.data_ptr()));
 
+// 16-bit inputs only (the host never selects this for fp32), so fp32 is not
+// instantiated at all.
+#define CALL_CONCAT_AND_CACHE_MLA_SEG_512(KV_T, CACHE_T, KV_DTYPE)                    \
+    if constexpr(sizeof(KV_T) == 2)                                                   \
+    {                                                                                 \
+        switch(tpb)                                                                   \
+        {                                                                             \
+        case 8: CALL_CONCAT_AND_CACHE_MLA_SEG_512_TPB(KV_T, CACHE_T, KV_DTYPE, 8); break; \
+        case 4: CALL_CONCAT_AND_CACHE_MLA_SEG_512_TPB(KV_T, CACHE_T, KV_DTYPE, 4); break; \
+        default: CALL_CONCAT_AND_CACHE_MLA_SEG_512_TPB(KV_T, CACHE_T, KV_DTYPE, 1); break;\
+        }                                                                             \
+    }
+
+#define CALL_CONCAT_AND_CACHE_MLA_SEG_512_TPB(KV_T, CACHE_T, KV_DTYPE, TPB_)          \
+    aiter::concat_and_cache_mla_seg_512_kernel<KV_T, CACHE_T, KV_DTYPE, TPB_>         \
+        <<<dim3((num_tokens + TPB_ - 1) / TPB_), dim3(64), 0, stream>>>(              \
+            reinterpret_cast<KV_T*>(kv_c.data_ptr()),                                 \
+            reinterpret_cast<KV_T*>(k_pe.data_ptr()),                                 \
+            reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()),                          \
+            reinterpret_cast<int64_t*>(slot_mapping.data_ptr()),                      \
+            num_tokens,                                                               \
+            (int64_t)block_stride,                                                    \
+            (int64_t)kv_c_stride,                                                     \
+            (int64_t)k_pe_stride,                                                     \
+            reinterpret_cast<const float*>(scale.data_ptr()));
+
 // Macro to dispatch the kernel based on the data type.
 #define CALL_INDEXER_K_QUANT_AND_CACHE(KV_T, CACHE_T, KV_DTYPE)                                   \
     aiter::indexer_k_quant_and_cache_kernel<KV_T,                                                 \
@@ -4373,7 +4818,24 @@ void concat_and_cache_mla_seg(aiter_tensor_t& kv_c,         // [num_tokens, kv_l
     HipDeviceGuard device_guard(kv_c.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
-    if((pe_dim & 0x7) == 0 && (kv_lora_rank & 0x7) == 0)
+    // The fused seg op's own layout gets a dedicated kernel (see its comment);
+    // any other rank/pe/page keeps the generic vectorized one. 16-bit inputs
+    // only, since the dedicated kernel moves 8 elements as one 16 B load.
+    const bool seg_512 = kv_lora_rank == 512 && pe_dim == 64 && page_size == 64 &&
+                         kv_c.element_size() == 2 && num_tokens > 0;
+    if(seg_512)
+    {
+        // Tokens per block: a token is only ~1.7 KB, so below ~48 per CU the
+        // op sits on its launch floor and one token per block is the shortest
+        // path; more loads in flight pay from there, and eight from ~96 per CU
+        // (256 CUs: T=8192 1->4.41 us 8->4.78, T=16384 4->5.30 8->5.48,
+        // T=65536 4->11.65 8->11.02).
+        const int64_t per_cu = num_tokens / static_cast<int64_t>(get_num_cu_func());
+        const int tpb        = per_cu >= 96 ? 8 : (per_cu >= 48 ? 4 : 1);
+        DISPATCH_BY_KV_CACHE_DTYPE_OPUS_rmTorch(
+            kv_c.dtype(), kv_cache_dtype, CALL_CONCAT_AND_CACHE_MLA_SEG_512);
+    }
+    else if((pe_dim & 0x7) == 0 && (kv_lora_rank & 0x7) == 0)
     {
         dim3 grid(num_tokens);
         dim3 block(std::min(kv_lora_rank / 8, 1024));
@@ -5016,6 +5478,12 @@ void fused_qk_rope_concat_and_cache_mla_seg(
     const int64_t cos_stride0     = cos_cache.stride(0);
     const int64_t sin_stride0     = sin_cache.stride(0);
     const int64_t block_stride    = kv_cache.stride(0);
+    const int max_position        = std::min(cos_cache.size(0), sin_cache.size(0));
+    AITER_CHECK(max_position > 0, "cos_cache and sin_cache must not be empty");
+    // The kernel reads cos/sin through one buffer descriptor per cache.
+    AITER_CHECK(max_position * std::max(cos_stride0, sin_stride0) * cos_cache.element_size() <=
+                    std::numeric_limits<int32_t>::max(),
+                "cos/sin cache too large for a buffer descriptor");
 
     HipDeviceGuard device_guard(kv_c.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
@@ -5024,13 +5492,43 @@ void fused_qk_rope_concat_and_cache_mla_seg(
     constexpr int VEC = 8;
     static_assert(KV_LORA % VEC == 0, "KV_LORA must be divisible by VEC");
 
-    dim3 grid((unsigned)(num_tokens * num_heads));
+    // Heads per block (see the kernel). Only worth it once there is enough
+    // work to be bandwidth-bound: below ~32 (token, head) rows per CU the op
+    // sits on its latency floor, and there the shortest per-block path wins --
+    // H=32 T=192 runs 6.34 us at one head per block and 6.75 us at eight.
+    // Above it, take the largest power of two up to 8 that divides num_heads,
+    // so every block is full; 8 is also the most heads whose pe the block's
+    // lanes can hold (8 x PE_CHUNKS). H=128 T=768: 35.3 us at 1, 20.0 us at 8.
+    const int64_t rows = static_cast<int64_t>(num_tokens) * num_heads;
+    int hpt            = 1;
+    if(rows >= 32 * static_cast<int64_t>(get_num_cu_func()))
+    {
+        for(int h = 8; h >= 2; h >>= 1)
+        {
+            if(num_heads % h == 0)
+            {
+                hpt = h;
+                break;
+            }
+        }
+    }
+
+    // The eight-head path stages Q through TDM on gfx1250 (see the kernel):
+    // two waves, each 8 x 256 nope plus 4 x 64 pe elements.
+    static const bool tdm_arch = get_gpu_arch() == "gfx1250";
+    const bool tdm_q = tdm_arch && ((AITER_MLA_SEG_TDM_HPT_MASK >> hpt) & 1) != 0;
+    const size_t tdm_lds_bytes =
+        tdm_q ? size_t(2) * (hpt * 256 + std::min(hpt, 4) * 64) * q_nope.element_size() : 0;
+
+    // The kernel indexes nope vectors by threadIdx.x, one per thread.
+    dim3 grid((unsigned)(num_heads / hpt), (unsigned)num_tokens);
     dim3 block(KV_LORA / VEC);
 
-#define LAUNCH_MLA_NORM_ROPE(SCALAR_T, NEOX)                                              \
+#define LAUNCH_MLA_NORM_ROPE(SCALAR_T, NEOX, HPT_)                                        \
     aiter::fused_qk_rope_concat_and_cache_mla_seg_kernel<SCALAR_T, opus::fp8_t, KV_LORA,  \
-                                                         PE_DIM, PAGE_SIZE, NEOX, VEC>    \
-        <<<grid, block, 0, stream>>>(                                                     \
+                                                         PE_DIM, PAGE_SIZE, NEOX, VEC,    \
+                                                         HPT_>                            \
+        <<<grid, block, tdm_lds_bytes, stream>>>(                                         \
             reinterpret_cast<SCALAR_T*>(q_nope.data_ptr()),                               \
             reinterpret_cast<SCALAR_T*>(q_pe.data_ptr()),                                 \
             reinterpret_cast<SCALAR_T*>(kv_c.data_ptr()),                                 \
@@ -5049,20 +5547,30 @@ void fused_qk_rope_concat_and_cache_mla_seg(
             q_out_stride_0, q_out_stride_1,                                               \
             kv_c_stride, k_pe_stride,                                                     \
             cos_stride0, sin_stride0,                                                     \
-            block_stride);
+            block_stride, max_position);
+
+#define LAUNCH_MLA_NORM_ROPE_HPT(SCALAR_T, NEOX)                                          \
+    switch(hpt)                                                                           \
+    {                                                                                     \
+    case 8: LAUNCH_MLA_NORM_ROPE(SCALAR_T, NEOX, 8); break;                               \
+    case 4: LAUNCH_MLA_NORM_ROPE(SCALAR_T, NEOX, 4); break;                               \
+    case 2: LAUNCH_MLA_NORM_ROPE(SCALAR_T, NEOX, 2); break;                               \
+    default: LAUNCH_MLA_NORM_ROPE(SCALAR_T, NEOX, 1); break;                              \
+    }
 
     AITER_DISPATCH_FLOATING16_TYPES_rmTorch(
         q_nope.dtype(), "fused_qk_rope_concat_and_cache_mla_seg", [&] {
             using input_dtype = typename aiter::hip2opus<scalar_t>::type;
             if(is_neox)
             {
-                LAUNCH_MLA_NORM_ROPE(input_dtype, true);
+                LAUNCH_MLA_NORM_ROPE_HPT(input_dtype, true);
             }
             else
             {
-                LAUNCH_MLA_NORM_ROPE(input_dtype, false);
+                LAUNCH_MLA_NORM_ROPE_HPT(input_dtype, false);
             }
         });
+#undef LAUNCH_MLA_NORM_ROPE_HPT
 #undef LAUNCH_MLA_NORM_ROPE
 }
 
