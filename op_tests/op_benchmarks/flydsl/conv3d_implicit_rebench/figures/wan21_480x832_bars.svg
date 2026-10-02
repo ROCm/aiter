@@ -1,0 +1,430 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1510" height="654" viewBox="0 0 1510 654" font-family="Helvetica,Arial,sans-serif">
+<rect width="1510" height="654" fill="#ffffff"/>
+<text x="10" y="22" font-size="14" font-weight="bold" fill="#333333">Wan2.1 VAE 480x832 @81f: measured conv3d kernels (gfx950, HIP 0 / PCI 0000:78:00)</text>
+<text x="638" y="36" font-size="12" fill="#333333">Kernel time per call (us)</text>
+<text x="934" y="36" font-size="12" fill="#333333">Kernel time per pass (ms)</text>
+<text x="1230" y="36" font-size="12" fill="#333333">Utilisation vs theoretical peak (%)</text>
+<text x="10" y="48" text-anchor="start" font-size="10.5" font-weight="bold" fill="#777777">case</text>
+<text x="196" y="48" text-anchor="end" font-size="10.5" font-weight="bold" fill="#777777">Cin→Cout</text>
+<text x="252" y="48" text-anchor="end" font-size="10.5" font-weight="bold" fill="#777777">kernel</text>
+<text x="304" y="48" text-anchor="end" font-size="10.5" font-weight="bold" fill="#777777">stride</text>
+<text x="352" y="48" text-anchor="end" font-size="10.5" font-weight="bold" fill="#777777">pad</text>
+<text x="452" y="48" text-anchor="end" font-size="10.5" font-weight="bold" fill="#777777">input N×D×H×W</text>
+<text x="568" y="48" text-anchor="end" font-size="10.5" font-weight="bold" fill="#777777">GEMM M×N×K</text>
+<text x="612" y="48" text-anchor="end" font-size="10.5" font-weight="bold" fill="#777777">calls</text>
+<line x1="10" y1="54" x2="624" y2="54" stroke="#e6e6e6"/>
+<rect x="4" y="80" width="1502" height="22" fill="#f7f7f7"/>
+<rect x="4" y="124" width="1502" height="22" fill="#f7f7f7"/>
+<rect x="4" y="168" width="1502" height="22" fill="#f7f7f7"/>
+<rect x="4" y="212" width="1502" height="22" fill="#f7f7f7"/>
+<rect x="4" y="256" width="1502" height="22" fill="#f7f7f7"/>
+<rect x="4" y="300" width="1502" height="22" fill="#f7f7f7"/>
+<rect x="4" y="344" width="1502" height="22" fill="#f7f7f7"/>
+<rect x="4" y="388" width="1502" height="22" fill="#f7f7f7"/>
+<rect x="4" y="432" width="1502" height="22" fill="#f7f7f7"/>
+<rect x="4" y="476" width="1502" height="22" fill="#f7f7f7"/>
+<rect x="4" y="520" width="1502" height="22" fill="#f7f7f7"/>
+<line x1="638.0" y1="52" x2="638.0" y2="542" stroke="#e6e6e6"/>
+<text x="638.0" y="557" text-anchor="middle" font-size="10.5" fill="#777777">0</text>
+<line x1="688.0" y1="52" x2="688.0" y2="542" stroke="#e6e6e6"/>
+<text x="688.0" y="557" text-anchor="middle" font-size="10.5" fill="#777777">300</text>
+<line x1="738.0" y1="52" x2="738.0" y2="542" stroke="#e6e6e6"/>
+<text x="738.0" y="557" text-anchor="middle" font-size="10.5" fill="#777777">600</text>
+<line x1="788.0" y1="52" x2="788.0" y2="542" stroke="#e6e6e6"/>
+<text x="788.0" y="557" text-anchor="middle" font-size="10.5" fill="#777777">900</text>
+<line x1="838.0" y1="52" x2="838.0" y2="542" stroke="#e6e6e6"/>
+<text x="838.0" y="557" text-anchor="middle" font-size="10.5" fill="#777777">1200</text>
+<line x1="888.0" y1="52" x2="888.0" y2="542" stroke="#e6e6e6"/>
+<text x="888.0" y="557" text-anchor="middle" font-size="10.5" fill="#777777">1500</text>
+<line x1="638" y1="52" x2="638" y2="542" stroke="#444444"/>
+<line x1="934.0" y1="52" x2="934.0" y2="542" stroke="#e6e6e6"/>
+<text x="934.0" y="557" text-anchor="middle" font-size="10.5" fill="#777777">0</text>
+<line x1="984.0" y1="52" x2="984.0" y2="542" stroke="#e6e6e6"/>
+<text x="984.0" y="557" text-anchor="middle" font-size="10.5" fill="#777777">20</text>
+<line x1="1034.0" y1="52" x2="1034.0" y2="542" stroke="#e6e6e6"/>
+<text x="1034.0" y="557" text-anchor="middle" font-size="10.5" fill="#777777">40</text>
+<line x1="1084.0" y1="52" x2="1084.0" y2="542" stroke="#e6e6e6"/>
+<text x="1084.0" y="557" text-anchor="middle" font-size="10.5" fill="#777777">60</text>
+<line x1="1134.0" y1="52" x2="1134.0" y2="542" stroke="#e6e6e6"/>
+<text x="1134.0" y="557" text-anchor="middle" font-size="10.5" fill="#777777">80</text>
+<line x1="1184.0" y1="52" x2="1184.0" y2="542" stroke="#e6e6e6"/>
+<text x="1184.0" y="557" text-anchor="middle" font-size="10.5" fill="#777777">100</text>
+<line x1="934" y1="52" x2="934" y2="542" stroke="#444444"/>
+<line x1="1230.0" y1="52" x2="1230.0" y2="542" stroke="#e6e6e6"/>
+<text x="1230.0" y="557" text-anchor="middle" font-size="10.5" fill="#777777">0</text>
+<line x1="1280.0" y1="52" x2="1280.0" y2="542" stroke="#e6e6e6"/>
+<text x="1280.0" y="557" text-anchor="middle" font-size="10.5" fill="#777777">10</text>
+<line x1="1330.0" y1="52" x2="1330.0" y2="542" stroke="#e6e6e6"/>
+<text x="1330.0" y="557" text-anchor="middle" font-size="10.5" fill="#777777">20</text>
+<line x1="1380.0" y1="52" x2="1380.0" y2="542" stroke="#e6e6e6"/>
+<text x="1380.0" y="557" text-anchor="middle" font-size="10.5" fill="#777777">30</text>
+<line x1="1430.0" y1="52" x2="1430.0" y2="542" stroke="#e6e6e6"/>
+<text x="1430.0" y="557" text-anchor="middle" font-size="10.5" fill="#777777">40</text>
+<line x1="1480.0" y1="52" x2="1480.0" y2="542" stroke="#e6e6e6"/>
+<text x="1480.0" y="557" text-anchor="middle" font-size="10.5" fill="#777777">50</text>
+<line x1="1230" y1="52" x2="1230" y2="542" stroke="#444444"/>
+<text x="10" y="73.0" text-anchor="start" font-size="10.5" fill="#333333">down_0_1</text>
+<text x="196" y="73.0" text-anchor="end" font-size="10.5" fill="#777777">96→96</text>
+<text x="252" y="73.0" text-anchor="end" font-size="10.5" fill="#777777">3×3×3</text>
+<text x="304" y="73.0" text-anchor="end" font-size="10.5" fill="#777777">1</text>
+<text x="352" y="73.0" text-anchor="end" font-size="10.5" fill="#777777">0</text>
+<text x="452" y="73.0" text-anchor="end" font-size="10.5" fill="#777777">1×6×482×834</text>
+<text x="568" y="73.0" text-anchor="end" font-size="10.5" fill="#333333">1597440×96×2592</text>
+<text x="612" y="73.0" text-anchor="end" font-size="10.5" fill="#777777">×80</text>
+<rect x="638" y="62.5" width="169.5" height="13" fill="#2f6f9f"/>
+<line x1="835.7" y1="60.5" x2="835.7" y2="77.5" stroke="#222222" stroke-width="2"/>
+<text x="840.7" y="73.0" font-size="10.5" fill="#333333">1017</text>
+<rect x="934" y="62.5" width="203.4" height="13" fill="#2f6f9f"/>
+<text x="1142.4" y="73.0" font-size="10.5" fill="#333333">81.4 <tspan fill="#777777">(32.8%)</tspan></text>
+<rect x="1230" y="62.5" width="156.3" height="13" fill="#2f6f9f"/>
+<path d="M1277.3,64.5 L1281.8,69.0 L1277.3,73.5 L1272.8,69.0 Z" fill="#c0392b" stroke="#ffffff" stroke-width="0.8"/>
+<text x="1391.3" y="73.0" font-size="10.5" fill="#333333">31.3 / <tspan fill="#c0392b">9.5</tspan></text>
+<text x="10" y="95.0" text-anchor="start" font-size="10.5" fill="#333333">down_3_4</text>
+<text x="196" y="95.0" text-anchor="end" font-size="10.5" fill="#777777">192→192</text>
+<text x="252" y="95.0" text-anchor="end" font-size="10.5" fill="#777777">3×3×3</text>
+<text x="304" y="95.0" text-anchor="end" font-size="10.5" fill="#777777">1</text>
+<text x="352" y="95.0" text-anchor="end" font-size="10.5" fill="#777777">0</text>
+<text x="452" y="95.0" text-anchor="end" font-size="10.5" fill="#777777">1×6×242×418</text>
+<text x="568" y="95.0" text-anchor="end" font-size="10.5" fill="#333333">399360×192×5184</text>
+<text x="612" y="95.0" text-anchor="end" font-size="10.5" fill="#777777">×60</text>
+<rect x="638" y="84.5" width="147.0" height="13" fill="#2f6f9f"/>
+<line x1="812.0" y1="82.5" x2="812.0" y2="99.5" stroke="#222222" stroke-width="2"/>
+<text x="817.0" y="95.0" font-size="10.5" fill="#333333">882</text>
+<rect x="934" y="84.5" width="132.3" height="13" fill="#2f6f9f"/>
+<text x="1071.3" y="95.0" font-size="10.5" fill="#333333">52.9 <tspan fill="#777777">(21.4%)</tspan></text>
+<rect x="1230" y="84.5" width="180.3" height="13" fill="#2f6f9f"/>
+<path d="M1257.5,86.5 L1262.0,91.0 L1257.5,95.5 L1253.0,91.0 Z" fill="#c0392b" stroke="#ffffff" stroke-width="0.8"/>
+<text x="1415.3" y="95.0" font-size="10.5" fill="#333333">36.1 / <tspan fill="#c0392b">5.5</tspan></text>
+<text x="10" y="117.0" text-anchor="start" font-size="10.5" fill="#333333">down_6_7</text>
+<text x="196" y="117.0" text-anchor="end" font-size="10.5" fill="#777777">384→384</text>
+<text x="252" y="117.0" text-anchor="end" font-size="10.5" fill="#777777">3×3×3</text>
+<text x="304" y="117.0" text-anchor="end" font-size="10.5" fill="#777777">1</text>
+<text x="352" y="117.0" text-anchor="end" font-size="10.5" fill="#777777">0</text>
+<text x="452" y="117.0" text-anchor="end" font-size="10.5" fill="#777777">1×4×122×210</text>
+<text x="568" y="117.0" text-anchor="end" font-size="10.5" fill="#333333">49920×384×10368</text>
+<text x="612" y="117.0" text-anchor="end" font-size="10.5" fill="#777777">×60</text>
+<rect x="638" y="106.5" width="74.8" height="13" fill="#2f6f9f"/>
+<line x1="723.7" y1="104.5" x2="723.7" y2="121.5" stroke="#222222" stroke-width="2"/>
+<text x="728.7" y="117.0" font-size="10.5" fill="#333333">449</text>
+<rect x="934" y="106.5" width="67.3" height="13" fill="#2f6f9f"/>
+<text x="1006.3" y="117.0" font-size="10.5" fill="#333333">26.9 <tspan fill="#777777">(10.9%)</tspan></text>
+<rect x="1230" y="106.5" width="177.1" height="13" fill="#2f6f9f"/>
+<path d="M1247.4,108.5 L1251.9,113.0 L1247.4,117.5 L1242.9,113.0 Z" fill="#c0392b" stroke="#ffffff" stroke-width="0.8"/>
+<text x="1412.1" y="117.0" font-size="10.5" fill="#333333">35.4 / <tspan fill="#c0392b">3.5</tspan></text>
+<text x="10" y="139.0" text-anchor="start" font-size="10.5" fill="#333333">down_9_10_mid</text>
+<text x="196" y="139.0" text-anchor="end" font-size="10.5" fill="#777777">384→384</text>
+<text x="252" y="139.0" text-anchor="end" font-size="10.5" fill="#777777">3×3×3</text>
+<text x="304" y="139.0" text-anchor="end" font-size="10.5" fill="#777777">1</text>
+<text x="352" y="139.0" text-anchor="end" font-size="10.5" fill="#777777">0</text>
+<text x="452" y="139.0" text-anchor="end" font-size="10.5" fill="#777777">1×3×62×106</text>
+<text x="568" y="139.0" text-anchor="end" font-size="10.5" fill="#333333">6240×384×10368</text>
+<text x="612" y="139.0" text-anchor="end" font-size="10.5" fill="#777777">×160</text>
+<rect x="638" y="128.5" width="20.1" height="13" fill="#2f6f9f"/>
+<line x1="657.9" y1="126.5" x2="657.9" y2="143.5" stroke="#222222" stroke-width="2"/>
+<text x="663.1" y="139.0" font-size="10.5" fill="#333333">121</text>
+<rect x="934" y="128.5" width="48.3" height="13" fill="#2f6f9f"/>
+<text x="987.3" y="139.0" font-size="10.5" fill="#333333">19.3 <tspan fill="#777777">(7.8%)</tspan></text>
+<rect x="1230" y="128.5" width="82.2" height="13" fill="#2f6f9f"/>
+<path d="M1244.4,130.5 L1248.9,135.0 L1244.4,139.5 L1239.9,135.0 Z" fill="#c0392b" stroke="#ffffff" stroke-width="0.8"/>
+<text x="1317.2" y="139.0" font-size="10.5" fill="#333333">16.4 / <tspan fill="#c0392b">2.9</tspan></text>
+<text x="10" y="161.0" text-anchor="start" font-size="10.5" fill="#333333">wdec_up_192_L0</text>
+<text x="196" y="161.0" text-anchor="end" font-size="10.5" fill="#777777">192→96</text>
+<text x="252" y="161.0" text-anchor="end" font-size="10.5" fill="#777777">1×3×3</text>
+<text x="304" y="161.0" text-anchor="end" font-size="10.5" fill="#777777">1</text>
+<text x="352" y="161.0" text-anchor="end" font-size="10.5" fill="#777777">0,1,1</text>
+<text x="452" y="161.0" text-anchor="end" font-size="10.5" fill="#777777">4×1×480×832</text>
+<text x="568" y="161.0" text-anchor="end" font-size="10.5" fill="#333333">1597440×96×1728</text>
+<text x="612" y="161.0" text-anchor="end" font-size="10.5" fill="#777777">×20</text>
+<rect x="638" y="150.5" width="123.4" height="13" fill="#2f6f9f"/>
+<line x1="783.9" y1="148.5" x2="783.9" y2="165.5" stroke="#222222" stroke-width="2"/>
+<text x="788.9" y="161.0" font-size="10.5" fill="#333333">741</text>
+<rect x="934" y="150.5" width="37.0" height="13" fill="#2f6f9f"/>
+<text x="976.0" y="161.0" font-size="10.5" fill="#333333">14.8 <tspan fill="#777777">(6.0%)</tspan></text>
+<rect x="1230" y="150.5" width="143.1" height="13" fill="#2f6f9f"/>
+<path d="M1307.7,152.5 L1312.2,157.0 L1307.7,161.5 L1303.2,157.0 Z" fill="#c0392b" stroke="#ffffff" stroke-width="0.8"/>
+<text x="1378.1" y="161.0" font-size="10.5" fill="#333333">28.6 / <tspan fill="#c0392b">15.5</tspan></text>
+<text x="10" y="183.0" text-anchor="start" font-size="10.5" fill="#333333">wdec_up_384_L1</text>
+<text x="196" y="183.0" text-anchor="end" font-size="10.5" fill="#777777">384→192</text>
+<text x="252" y="183.0" text-anchor="end" font-size="10.5" fill="#777777">1×3×3</text>
+<text x="304" y="183.0" text-anchor="end" font-size="10.5" fill="#777777">1</text>
+<text x="352" y="183.0" text-anchor="end" font-size="10.5" fill="#777777">0,1,1</text>
+<text x="452" y="183.0" text-anchor="end" font-size="10.5" fill="#777777">4×1×240×416</text>
+<text x="568" y="183.0" text-anchor="end" font-size="10.5" fill="#333333">399360×192×3456</text>
+<text x="612" y="183.0" text-anchor="end" font-size="10.5" fill="#777777">×20</text>
+<rect x="638" y="172.5" width="105.3" height="13" fill="#2f6f9f"/>
+<line x1="761.8" y1="170.5" x2="761.8" y2="187.5" stroke="#222222" stroke-width="2"/>
+<text x="766.8" y="183.0" font-size="10.5" fill="#333333">632</text>
+<rect x="934" y="172.5" width="31.6" height="13" fill="#2f6f9f"/>
+<text x="970.6" y="183.0" font-size="10.5" fill="#333333">12.6 <tspan fill="#777777">(5.1%)</tspan></text>
+<rect x="1230" y="172.5" width="167.8" height="13" fill="#2f6f9f"/>
+<path d="M1275.6,174.5 L1280.1,179.0 L1275.6,183.5 L1271.1,179.0 Z" fill="#c0392b" stroke="#ffffff" stroke-width="0.8"/>
+<text x="1402.8" y="183.0" font-size="10.5" fill="#333333">33.6 / <tspan fill="#c0392b">9.1</tspan></text>
+<text x="10" y="205.0" text-anchor="start" font-size="10.5" fill="#333333">wdec_conv_out</text>
+<text x="196" y="205.0" text-anchor="end" font-size="10.5" fill="#777777">96→3</text>
+<text x="252" y="205.0" text-anchor="end" font-size="10.5" fill="#777777">3×3×3</text>
+<text x="304" y="205.0" text-anchor="end" font-size="10.5" fill="#777777">1</text>
+<text x="352" y="205.0" text-anchor="end" font-size="10.5" fill="#777777">0</text>
+<text x="452" y="205.0" text-anchor="end" font-size="10.5" fill="#777777">1×6×482×834</text>
+<text x="568" y="205.0" text-anchor="end" font-size="10.5" fill="#333333">1597440×3×2592</text>
+<text x="612" y="205.0" text-anchor="end" font-size="10.5" fill="#777777">×20</text>
+<rect x="638" y="194.5" width="99.4" height="13" fill="#b5651d"/>
+<line x1="748.1" y1="192.5" x2="748.1" y2="209.5" stroke="#222222" stroke-width="2"/>
+<text x="753.1" y="205.0" font-size="10.5" fill="#333333">596</text>
+<rect x="934" y="194.5" width="29.8" height="13" fill="#b5651d"/>
+<text x="968.8" y="205.0" font-size="10.5" fill="#333333">11.9 <tspan fill="#777777">(4.8%)</tspan></text>
+<rect x="1230" y="194.5" width="8.3" height="13" fill="#b5651d"/>
+<path d="M1279.5,196.5 L1284.0,201.0 L1279.5,205.5 L1275.0,201.0 Z" fill="#c0392b" stroke="#ffffff" stroke-width="0.8"/>
+<text x="1289.0" y="205.0" font-size="10.5" fill="#333333">1.7 / <tspan fill="#c0392b">9.9</tspan></text>
+<text x="10" y="227.0" text-anchor="start" font-size="10.5" fill="#333333">down_3_in</text>
+<text x="196" y="227.0" text-anchor="end" font-size="10.5" fill="#777777">96→192</text>
+<text x="252" y="227.0" text-anchor="end" font-size="10.5" fill="#777777">3×3×3</text>
+<text x="304" y="227.0" text-anchor="end" font-size="10.5" fill="#777777">1</text>
+<text x="352" y="227.0" text-anchor="end" font-size="10.5" fill="#777777">0</text>
+<text x="452" y="227.0" text-anchor="end" font-size="10.5" fill="#777777">1×6×242×418</text>
+<text x="568" y="227.0" text-anchor="end" font-size="10.5" fill="#333333">399360×192×2592</text>
+<text x="612" y="227.0" text-anchor="end" font-size="10.5" fill="#777777">×20</text>
+<rect x="638" y="216.5" width="78.3" height="13" fill="#2f6f9f"/>
+<line x1="727.4" y1="214.5" x2="727.4" y2="231.5" stroke="#222222" stroke-width="2"/>
+<text x="732.4" y="227.0" font-size="10.5" fill="#333333">470</text>
+<rect x="934" y="216.5" width="23.5" height="13" fill="#2f6f9f"/>
+<text x="962.5" y="227.0" font-size="10.5" fill="#333333">9.39 <tspan fill="#777777">(3.8%)</tspan></text>
+<rect x="1230" y="216.5" width="169.3" height="13" fill="#2f6f9f"/>
+<path d="M1266.0,218.5 L1270.5,223.0 L1266.0,227.5 L1261.5,223.0 Z" fill="#c0392b" stroke="#ffffff" stroke-width="0.8"/>
+<text x="1404.3" y="227.0" font-size="10.5" fill="#333333">33.9 / <tspan fill="#c0392b">7.2</tspan></text>
+<text x="10" y="249.0" text-anchor="start" font-size="10.5" fill="#333333">down_6_in</text>
+<text x="196" y="249.0" text-anchor="end" font-size="10.5" fill="#777777">192→384</text>
+<text x="252" y="249.0" text-anchor="end" font-size="10.5" fill="#777777">3×3×3</text>
+<text x="304" y="249.0" text-anchor="end" font-size="10.5" fill="#777777">1</text>
+<text x="352" y="249.0" text-anchor="end" font-size="10.5" fill="#777777">0</text>
+<text x="452" y="249.0" text-anchor="end" font-size="10.5" fill="#777777">1×4×122×210</text>
+<text x="568" y="249.0" text-anchor="end" font-size="10.5" fill="#333333">49920×384×5184</text>
+<text x="612" y="249.0" text-anchor="end" font-size="10.5" fill="#777777">×20</text>
+<rect x="638" y="238.5" width="38.1" height="13" fill="#2f6f9f"/>
+<line x1="680.2" y1="236.5" x2="680.2" y2="253.5" stroke="#222222" stroke-width="2"/>
+<text x="685.2" y="249.0" font-size="10.5" fill="#333333">229</text>
+<rect x="934" y="238.5" width="11.4" height="13" fill="#2f6f9f"/>
+<text x="950.4" y="249.0" font-size="10.5" fill="#333333">4.57 <tspan fill="#777777">(1.8%)</tspan></text>
+<rect x="1230" y="238.5" width="173.9" height="13" fill="#2f6f9f"/>
+<path d="M1252.3,240.5 L1256.8,245.0 L1252.3,249.5 L1247.8,245.0 Z" fill="#c0392b" stroke="#ffffff" stroke-width="0.8"/>
+<text x="1408.9" y="249.0" font-size="10.5" fill="#333333">34.8 / <tspan fill="#c0392b">4.5</tspan></text>
+<text x="10" y="271.0" text-anchor="start" font-size="10.5" fill="#333333">resample_96</text>
+<text x="196" y="271.0" text-anchor="end" font-size="10.5" fill="#777777">96→96</text>
+<text x="252" y="271.0" text-anchor="end" font-size="10.5" fill="#777777">1×3×3</text>
+<text x="304" y="271.0" text-anchor="end" font-size="10.5" fill="#777777">1,2,2</text>
+<text x="352" y="271.0" text-anchor="end" font-size="10.5" fill="#777777">0</text>
+<text x="452" y="271.0" text-anchor="end" font-size="10.5" fill="#777777">4×1×481×833</text>
+<text x="568" y="271.0" text-anchor="end" font-size="10.5" fill="#333333">399360×96×864</text>
+<text x="612" y="271.0" text-anchor="end" font-size="10.5" fill="#777777">×20</text>
+<rect x="638" y="260.5" width="24.2" height="13" fill="#b5651d"/>
+<line x1="664.3" y1="258.5" x2="664.3" y2="275.5" stroke="#222222" stroke-width="2"/>
+<text x="669.3" y="271.0" font-size="10.5" fill="#333333">145</text>
+<rect x="934" y="260.5" width="7.3" height="13" fill="#b5651d"/>
+<text x="946.3" y="271.0" font-size="10.5" fill="#333333">2.90 <tspan fill="#777777">(1.2%)</tspan></text>
+<rect x="1230" y="260.5" width="91.2" height="13" fill="#b5651d"/>
+<path d="M1395.5,262.5 L1400.0,267.0 L1395.5,271.5 L1391.0,267.0 Z" fill="#c0392b" stroke="#ffffff" stroke-width="0.8"/>
+<text x="1405.0" y="271.0" font-size="10.5" fill="#333333">18.2 / <tspan fill="#c0392b">33.1</tspan></text>
+<text x="10" y="293.0" text-anchor="start" font-size="10.5" fill="#333333">conv_in</text>
+<text x="196" y="293.0" text-anchor="end" font-size="10.5" fill="#777777">3→96</text>
+<text x="252" y="293.0" text-anchor="end" font-size="10.5" fill="#777777">3×3×3</text>
+<text x="304" y="293.0" text-anchor="end" font-size="10.5" fill="#777777">1</text>
+<text x="352" y="293.0" text-anchor="end" font-size="10.5" fill="#777777">0</text>
+<text x="452" y="293.0" text-anchor="end" font-size="10.5" fill="#777777">1×6×482×834</text>
+<text x="568" y="293.0" text-anchor="end" font-size="10.5" fill="#333333">1597440×96×81</text>
+<text x="612" y="293.0" text-anchor="end" font-size="10.5" fill="#777777">×20</text>
+<rect x="638" y="282.5" width="23.8" height="13" fill="#b5651d"/>
+<line x1="663.0" y1="280.5" x2="663.0" y2="297.5" stroke="#222222" stroke-width="2"/>
+<text x="668.0" y="293.0" font-size="10.5" fill="#333333">143</text>
+<rect x="934" y="282.5" width="7.1" height="13" fill="#b5651d"/>
+<text x="946.1" y="293.0" font-size="10.5" fill="#333333">2.85 <tspan fill="#777777">(1.2%)</tspan></text>
+<rect x="1230" y="282.5" width="34.8" height="13" fill="#b5651d"/>
+<path d="M1370.8,284.5 L1375.3,289.0 L1370.8,293.5 L1366.3,289.0 Z" fill="#c0392b" stroke="#ffffff" stroke-width="0.8"/>
+<text x="1380.3" y="293.0" font-size="10.5" fill="#333333">7.0 / <tspan fill="#c0392b">28.2</tspan></text>
+<text x="10" y="315.0" text-anchor="start" font-size="10.5" fill="#333333">resample_192</text>
+<text x="196" y="315.0" text-anchor="end" font-size="10.5" fill="#777777">192→192</text>
+<text x="252" y="315.0" text-anchor="end" font-size="10.5" fill="#777777">1×3×3</text>
+<text x="304" y="315.0" text-anchor="end" font-size="10.5" fill="#777777">1,2,2</text>
+<text x="352" y="315.0" text-anchor="end" font-size="10.5" fill="#777777">0</text>
+<text x="452" y="315.0" text-anchor="end" font-size="10.5" fill="#777777">4×1×241×417</text>
+<text x="568" y="315.0" text-anchor="end" font-size="10.5" fill="#333333">99840×192×1728</text>
+<text x="612" y="315.0" text-anchor="end" font-size="10.5" fill="#777777">×20</text>
+<rect x="638" y="304.5" width="18.7" height="13" fill="#2f6f9f"/>
+<line x1="656.9" y1="302.5" x2="656.9" y2="319.5" stroke="#222222" stroke-width="2"/>
+<text x="661.9" y="315.0" font-size="10.5" fill="#333333">112</text>
+<rect x="934" y="304.5" width="5.6" height="13" fill="#2f6f9f"/>
+<text x="944.6" y="315.0" font-size="10.5" fill="#333333">2.25 <tspan fill="#777777">(0.9%)</tspan></text>
+<rect x="1230" y="304.5" width="117.8" height="13" fill="#2f6f9f"/>
+<path d="M1337.4,306.5 L1341.9,311.0 L1337.4,315.5 L1332.9,311.0 Z" fill="#c0392b" stroke="#ffffff" stroke-width="0.8"/>
+<text x="1352.8" y="315.0" font-size="10.5" fill="#333333">23.6 / <tspan fill="#c0392b">21.5</tspan></text>
+<text x="10" y="337.0" text-anchor="start" font-size="10.5" fill="#333333">wdec_up_384_L2</text>
+<text x="196" y="337.0" text-anchor="end" font-size="10.5" fill="#777777">384→192</text>
+<text x="252" y="337.0" text-anchor="end" font-size="10.5" fill="#777777">1×3×3</text>
+<text x="304" y="337.0" text-anchor="end" font-size="10.5" fill="#777777">1</text>
+<text x="352" y="337.0" text-anchor="end" font-size="10.5" fill="#777777">0,1,1</text>
+<text x="452" y="337.0" text-anchor="end" font-size="10.5" fill="#777777">2×1×120×208</text>
+<text x="568" y="337.0" text-anchor="end" font-size="10.5" fill="#333333">49920×192×3456</text>
+<text x="612" y="337.0" text-anchor="end" font-size="10.5" fill="#777777">×20</text>
+<rect x="638" y="326.5" width="15.9" height="13" fill="#2f6f9f"/>
+<line x1="654.0" y1="324.5" x2="654.0" y2="341.5" stroke="#222222" stroke-width="2"/>
+<text x="659.0" y="337.0" font-size="10.5" fill="#333333">95.4</text>
+<rect x="934" y="326.5" width="4.8" height="13" fill="#2f6f9f"/>
+<text x="943.8" y="337.0" font-size="10.5" fill="#333333">1.91 <tspan fill="#777777">(0.8%)</tspan></text>
+<rect x="1230" y="326.5" width="138.9" height="13" fill="#2f6f9f"/>
+<path d="M1268.5,328.5 L1273.0,333.0 L1268.5,337.5 L1264.0,333.0 Z" fill="#c0392b" stroke="#ffffff" stroke-width="0.8"/>
+<text x="1373.9" y="337.0" font-size="10.5" fill="#333333">27.8 / <tspan fill="#c0392b">7.7</tspan></text>
+<text x="10" y="359.0" text-anchor="start" font-size="10.5" fill="#333333">conv_out</text>
+<text x="196" y="359.0" text-anchor="end" font-size="10.5" fill="#777777">384→32</text>
+<text x="252" y="359.0" text-anchor="end" font-size="10.5" fill="#777777">3×3×3</text>
+<text x="304" y="359.0" text-anchor="end" font-size="10.5" fill="#777777">1</text>
+<text x="352" y="359.0" text-anchor="end" font-size="10.5" fill="#777777">0</text>
+<text x="452" y="359.0" text-anchor="end" font-size="10.5" fill="#777777">1×3×62×106</text>
+<text x="568" y="359.0" text-anchor="end" font-size="10.5" fill="#333333">6240×32×10368</text>
+<text x="612" y="359.0" text-anchor="end" font-size="10.5" fill="#777777">×20</text>
+<rect x="638" y="348.5" width="15.6" height="13" fill="#b5651d"/>
+<line x1="653.6" y1="346.5" x2="653.6" y2="363.5" stroke="#222222" stroke-width="2"/>
+<text x="658.6" y="359.0" font-size="10.5" fill="#333333">93.8</text>
+<rect x="934" y="348.5" width="4.7" height="13" fill="#b5651d"/>
+<text x="943.7" y="359.0" font-size="10.5" fill="#333333">1.88 <tspan fill="#777777">(0.8%)</tspan></text>
+<rect x="1230" y="348.5" width="8.8" height="13" fill="#b5651d"/>
+<path d="M1240.8,350.5 L1245.3,355.0 L1240.8,359.5 L1236.3,355.0 Z" fill="#c0392b" stroke="#ffffff" stroke-width="0.8"/>
+<text x="1250.3" y="359.0" font-size="10.5" fill="#333333">1.8 / <tspan fill="#c0392b">2.2</tspan></text>
+<text x="10" y="381.0" text-anchor="start" font-size="10.5" fill="#333333">resample_384</text>
+<text x="196" y="381.0" text-anchor="end" font-size="10.5" fill="#777777">384→384</text>
+<text x="252" y="381.0" text-anchor="end" font-size="10.5" fill="#777777">1×3×3</text>
+<text x="304" y="381.0" text-anchor="end" font-size="10.5" fill="#777777">1,2,2</text>
+<text x="352" y="381.0" text-anchor="end" font-size="10.5" fill="#777777">0</text>
+<text x="452" y="381.0" text-anchor="end" font-size="10.5" fill="#777777">2×1×121×209</text>
+<text x="568" y="381.0" text-anchor="end" font-size="10.5" fill="#333333">12480×384×3456</text>
+<text x="612" y="381.0" text-anchor="end" font-size="10.5" fill="#777777">×20</text>
+<rect x="638" y="370.5" width="10.7" height="13" fill="#2f6f9f"/>
+<line x1="648.2" y1="368.5" x2="648.2" y2="385.5" stroke="#222222" stroke-width="2"/>
+<text x="653.7" y="381.0" font-size="10.5" fill="#333333">64.2</text>
+<rect x="934" y="370.5" width="3.2" height="13" fill="#2f6f9f"/>
+<text x="942.2" y="381.0" font-size="10.5" fill="#333333">1.28 <tspan fill="#777777">(0.5%)</tspan></text>
+<rect x="1230" y="370.5" width="103.2" height="13" fill="#2f6f9f"/>
+<path d="M1279.7,372.5 L1284.2,377.0 L1279.7,381.5 L1275.2,377.0 Z" fill="#c0392b" stroke="#ffffff" stroke-width="0.8"/>
+<text x="1338.2" y="381.0" font-size="10.5" fill="#333333">20.6 / <tspan fill="#c0392b">9.9</tspan></text>
+<text x="10" y="403.0" text-anchor="start" font-size="10.5" fill="#333333">wdec_conv_in</text>
+<text x="196" y="403.0" text-anchor="end" font-size="10.5" fill="#777777">16→384</text>
+<text x="252" y="403.0" text-anchor="end" font-size="10.5" fill="#777777">3×3×3</text>
+<text x="304" y="403.0" text-anchor="end" font-size="10.5" fill="#777777">1</text>
+<text x="352" y="403.0" text-anchor="end" font-size="10.5" fill="#777777">0</text>
+<text x="452" y="403.0" text-anchor="end" font-size="10.5" fill="#777777">1×3×62×106</text>
+<text x="568" y="403.0" text-anchor="end" font-size="10.5" fill="#333333">6240×384×432</text>
+<text x="612" y="403.0" text-anchor="end" font-size="10.5" fill="#777777">×20</text>
+<rect x="638" y="392.5" width="1.7" height="13" fill="#2f6f9f"/>
+<line x1="639.6" y1="390.5" x2="639.6" y2="407.5" stroke="#222222" stroke-width="2"/>
+<text x="644.7" y="403.0" font-size="10.5" fill="#333333">10.1</text>
+<rect x="934" y="392.5" width="0.5" height="13" fill="#2f6f9f"/>
+<text x="939.5" y="403.0" font-size="10.5" fill="#333333">0.20 <tspan fill="#777777">(0.1%)</tspan></text>
+<rect x="1230" y="392.5" width="41.1" height="13" fill="#2f6f9f"/>
+<path d="M1265.7,394.5 L1270.2,399.0 L1265.7,403.5 L1261.2,399.0 Z" fill="#c0392b" stroke="#ffffff" stroke-width="0.8"/>
+<text x="1276.1" y="403.0" font-size="10.5" fill="#333333">8.2 / <tspan fill="#c0392b">7.1</tspan></text>
+<text x="10" y="425.0" text-anchor="start" font-size="10.5" fill="#333333">wdec_up_192_L0_t1</text>
+<text x="196" y="425.0" text-anchor="end" font-size="10.5" fill="#777777">192→96</text>
+<text x="252" y="425.0" text-anchor="end" font-size="10.5" fill="#777777">1×3×3</text>
+<text x="304" y="425.0" text-anchor="end" font-size="10.5" fill="#777777">1</text>
+<text x="352" y="425.0" text-anchor="end" font-size="10.5" fill="#777777">0,1,1</text>
+<text x="452" y="425.0" text-anchor="end" font-size="10.5" fill="#777777">1×1×480×832</text>
+<text x="568" y="425.0" text-anchor="end" font-size="10.5" fill="#333333">399360×96×1728</text>
+<text x="612" y="425.0" text-anchor="end" font-size="10.5" fill="#777777">×1</text>
+<rect x="638" y="414.5" width="32.4" height="13" fill="#2f6f9f"/>
+<line x1="674.2" y1="412.5" x2="674.2" y2="429.5" stroke="#222222" stroke-width="2"/>
+<text x="679.2" y="425.0" font-size="10.5" fill="#333333">194</text>
+<rect x="934" y="414.5" width="0.5" height="13" fill="#2f6f9f"/>
+<text x="939.5" y="425.0" font-size="10.5" fill="#333333">0.19 <tspan fill="#777777">(0.1%)</tspan></text>
+<rect x="1230" y="414.5" width="136.3" height="13" fill="#2f6f9f"/>
+<path d="M1304.1,416.5 L1308.6,421.0 L1304.1,425.5 L1299.6,421.0 Z" fill="#c0392b" stroke="#ffffff" stroke-width="0.8"/>
+<text x="1371.3" y="425.0" font-size="10.5" fill="#333333">27.3 / <tspan fill="#c0392b">14.8</tspan></text>
+<text x="10" y="447.0" text-anchor="start" font-size="10.5" fill="#333333">wdec_up_384_L1_t1</text>
+<text x="196" y="447.0" text-anchor="end" font-size="10.5" fill="#777777">384→192</text>
+<text x="252" y="447.0" text-anchor="end" font-size="10.5" fill="#777777">1×3×3</text>
+<text x="304" y="447.0" text-anchor="end" font-size="10.5" fill="#777777">1</text>
+<text x="352" y="447.0" text-anchor="end" font-size="10.5" fill="#777777">0,1,1</text>
+<text x="452" y="447.0" text-anchor="end" font-size="10.5" fill="#777777">1×1×240×416</text>
+<text x="568" y="447.0" text-anchor="end" font-size="10.5" fill="#333333">99840×192×3456</text>
+<text x="612" y="447.0" text-anchor="end" font-size="10.5" fill="#777777">×1</text>
+<rect x="638" y="436.5" width="31.3" height="13" fill="#2f6f9f"/>
+<line x1="671.4" y1="434.5" x2="671.4" y2="451.5" stroke="#222222" stroke-width="2"/>
+<text x="676.4" y="447.0" font-size="10.5" fill="#333333">188</text>
+<rect x="934" y="436.5" width="0.5" height="13" fill="#2f6f9f"/>
+<text x="939.5" y="447.0" font-size="10.5" fill="#333333">0.19 <tspan fill="#777777">(0.1%)</tspan></text>
+<rect x="1230" y="436.5" width="141.0" height="13" fill="#2f6f9f"/>
+<path d="M1268.7,438.5 L1273.2,443.0 L1268.7,447.5 L1264.2,443.0 Z" fill="#c0392b" stroke="#ffffff" stroke-width="0.8"/>
+<text x="1376.0" y="447.0" font-size="10.5" fill="#333333">28.2 / <tspan fill="#c0392b">7.7</tspan></text>
+<text x="10" y="469.0" text-anchor="start" font-size="10.5" fill="#333333">wdec_up_384_L2_t1</text>
+<text x="196" y="469.0" text-anchor="end" font-size="10.5" fill="#777777">384→192</text>
+<text x="252" y="469.0" text-anchor="end" font-size="10.5" fill="#777777">1×3×3</text>
+<text x="304" y="469.0" text-anchor="end" font-size="10.5" fill="#777777">1</text>
+<text x="352" y="469.0" text-anchor="end" font-size="10.5" fill="#777777">0,1,1</text>
+<text x="452" y="469.0" text-anchor="end" font-size="10.5" fill="#777777">1×1×120×208</text>
+<text x="568" y="469.0" text-anchor="end" font-size="10.5" fill="#333333">24960×192×3456</text>
+<text x="612" y="469.0" text-anchor="end" font-size="10.5" fill="#777777">×1</text>
+<rect x="638" y="458.5" width="9.3" height="13" fill="#2f6f9f"/>
+<line x1="646.7" y1="456.5" x2="646.7" y2="473.5" stroke="#222222" stroke-width="2"/>
+<text x="652.3" y="469.0" font-size="10.5" fill="#333333">56.0</text>
+<rect x="934" y="458.5" width="0.1" height="13" fill="#2f6f9f"/>
+<text x="939.1" y="469.0" font-size="10.5" fill="#333333">0.06 <tspan fill="#777777">(0.0%)</tspan></text>
+<rect x="1230" y="458.5" width="118.3" height="13" fill="#2f6f9f"/>
+<path d="M1263.6,460.5 L1268.1,465.0 L1263.6,469.5 L1259.1,465.0 Z" fill="#c0392b" stroke="#ffffff" stroke-width="0.8"/>
+<text x="1353.3" y="469.0" font-size="10.5" fill="#333333">23.7 / <tspan fill="#c0392b">6.7</tspan></text>
+<text x="10" y="491.0" text-anchor="start" font-size="10.5" fill="#333333">resample_96_t1</text>
+<text x="196" y="491.0" text-anchor="end" font-size="10.5" fill="#777777">96→96</text>
+<text x="252" y="491.0" text-anchor="end" font-size="10.5" fill="#777777">1×3×3</text>
+<text x="304" y="491.0" text-anchor="end" font-size="10.5" fill="#777777">1,2,2</text>
+<text x="352" y="491.0" text-anchor="end" font-size="10.5" fill="#777777">0</text>
+<text x="452" y="491.0" text-anchor="end" font-size="10.5" fill="#777777">1×1×481×833</text>
+<text x="568" y="491.0" text-anchor="end" font-size="10.5" fill="#333333">99840×96×864</text>
+<text x="612" y="491.0" text-anchor="end" font-size="10.5" fill="#777777">×1</text>
+<rect x="638" y="480.5" width="7.8" height="13" fill="#b5651d"/>
+<line x1="645.7" y1="478.5" x2="645.7" y2="495.5" stroke="#222222" stroke-width="2"/>
+<text x="650.8" y="491.0" font-size="10.5" fill="#333333">47.0</text>
+<rect x="934" y="480.5" width="0.1" height="13" fill="#b5651d"/>
+<text x="939.1" y="491.0" font-size="10.5" fill="#333333">0.05 <tspan fill="#777777">(0.0%)</tspan></text>
+<rect x="1230" y="480.5" width="70.4" height="13" fill="#b5651d"/>
+<path d="M1357.9,482.5 L1362.4,487.0 L1357.9,491.5 L1353.4,487.0 Z" fill="#c0392b" stroke="#ffffff" stroke-width="0.8"/>
+<text x="1367.4" y="491.0" font-size="10.5" fill="#333333">14.1 / <tspan fill="#c0392b">25.6</tspan></text>
+<text x="10" y="513.0" text-anchor="start" font-size="10.5" fill="#333333">resample_384_t1</text>
+<text x="196" y="513.0" text-anchor="end" font-size="10.5" fill="#777777">384→384</text>
+<text x="252" y="513.0" text-anchor="end" font-size="10.5" fill="#777777">1×3×3</text>
+<text x="304" y="513.0" text-anchor="end" font-size="10.5" fill="#777777">1,2,2</text>
+<text x="352" y="513.0" text-anchor="end" font-size="10.5" fill="#777777">0</text>
+<text x="452" y="513.0" text-anchor="end" font-size="10.5" fill="#777777">1×1×121×209</text>
+<text x="568" y="513.0" text-anchor="end" font-size="10.5" fill="#333333">6240×384×3456</text>
+<text x="612" y="513.0" text-anchor="end" font-size="10.5" fill="#777777">×1</text>
+<rect x="638" y="502.5" width="7.7" height="13" fill="#2f6f9f"/>
+<line x1="645.4" y1="500.5" x2="645.4" y2="517.5" stroke="#222222" stroke-width="2"/>
+<text x="650.7" y="513.0" font-size="10.5" fill="#333333">46.0</text>
+<rect x="934" y="502.5" width="0.1" height="13" fill="#2f6f9f"/>
+<text x="939.1" y="513.0" font-size="10.5" fill="#333333">0.05 <tspan fill="#777777">(0.0%)</tspan></text>
+<rect x="1230" y="502.5" width="72.1" height="13" fill="#2f6f9f"/>
+<path d="M1266.5,504.5 L1271.0,509.0 L1266.5,513.5 L1262.0,509.0 Z" fill="#c0392b" stroke="#ffffff" stroke-width="0.8"/>
+<text x="1307.1" y="513.0" font-size="10.5" fill="#333333">14.4 / <tspan fill="#c0392b">7.3</tspan></text>
+<text x="10" y="535.0" text-anchor="start" font-size="10.5" fill="#333333">resample_192_t1</text>
+<text x="196" y="535.0" text-anchor="end" font-size="10.5" fill="#777777">192→192</text>
+<text x="252" y="535.0" text-anchor="end" font-size="10.5" fill="#777777">1×3×3</text>
+<text x="304" y="535.0" text-anchor="end" font-size="10.5" fill="#777777">1,2,2</text>
+<text x="352" y="535.0" text-anchor="end" font-size="10.5" fill="#777777">0</text>
+<text x="452" y="535.0" text-anchor="end" font-size="10.5" fill="#777777">1×1×241×417</text>
+<text x="568" y="535.0" text-anchor="end" font-size="10.5" fill="#333333">24960×192×1728</text>
+<text x="612" y="535.0" text-anchor="end" font-size="10.5" fill="#777777">×1</text>
+<rect x="638" y="524.5" width="6.0" height="13" fill="#2f6f9f"/>
+<line x1="643.6" y1="522.5" x2="643.6" y2="539.5" stroke="#222222" stroke-width="2"/>
+<text x="649.0" y="535.0" font-size="10.5" fill="#333333">35.7</text>
+<rect x="934" y="524.5" width="0.1" height="13" fill="#2f6f9f"/>
+<text x="939.1" y="535.0" font-size="10.5" fill="#333333">0.04 <tspan fill="#777777">(0.0%)</tspan></text>
+<rect x="1230" y="524.5" width="92.7" height="13" fill="#2f6f9f"/>
+<path d="M1315.5,526.5 L1320.0,531.0 L1315.5,535.5 L1311.0,531.0 Z" fill="#c0392b" stroke="#ffffff" stroke-width="0.8"/>
+<text x="1327.7" y="535.0" font-size="10.5" fill="#333333">18.5 / <tspan fill="#c0392b">17.1</tspan></text>
+<rect x="638" y="573" width="14" height="11" fill="#2f6f9f"/>
+<text x="658" y="582" font-size="11" fill="#333333">compute-bound (AI &gt;= 312.5)</text>
+<rect x="875" y="573" width="14" height="11" fill="#b5651d"/>
+<text x="895" y="582" font-size="11" fill="#333333">memory-bound</text>
+<line x1="1014" y1="571" x2="1014" y2="585" stroke="#222222" stroke-width="2"/>
+<text x="1027" y="582" font-size="11" fill="#333333">sustained (after 1 s of the same conv)</text>
+<path d="M1328,573 L1333,578 L1328,583 L1323,578 Z" fill="#c0392b"/>
+<text x="1341" y="582" font-size="11" fill="#333333">HBM% (label: MFMA% / HBM%)</text>
+<text x="638" y="600" font-size="10.5" fill="#777777">Bars: kernel-only, weight cache warm, burst (1 s idle before each window); median of 3 windows x 101 calls.</text>
+<text x="638" y="614" font-size="10.5" fill="#777777">Rows sorted by ms/pass; xN = calls per pass; % in panel 2 = share of this resolution's total. Peaks: 2500 TFLOPS / 8000 GB/s.</text>
+<text x="638" y="628" font-size="10.5" fill="#777777">Implicit GEMM: M = N·Do·Ho·Wo, N = Cout / groups, K = (Cin / groups)·kT·kH·kW.</text>
+<text x="638" y="642" font-size="10.5" fill="#777777">Stride / pad: one value when equal in D, H, W, else D,H,W. Dilation and groups are 1 unless shown after the kernel.</text>
+</svg>
