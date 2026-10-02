@@ -3,7 +3,7 @@
 
 """fp32 QSA oracle: block-causal ReLU-sum -> top-k -> expand+tail -> sparse GQA.
 
-Authoritative math: Qwen3.8-Next tech report ?2.1 (QSA). This path *may*
+Authoritative math: Qwen3.8-Next tech report §2.1 (QSA). This path *may*
 materialize ``[M, n_blocks]`` scores; FlyDSL K1 must not.
 
 Tie-break (locked to the live AMD HIP selector ``top_k_per_row_decode``): among
