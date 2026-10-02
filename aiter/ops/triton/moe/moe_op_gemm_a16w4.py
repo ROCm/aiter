@@ -354,6 +354,8 @@ def moe_gemm_a16w4(
     unpadded_N=None,
     unpadded_K=None,
     backend: str | None = None,
+    expert_map=None,
+    gate_valid=None,
 ):
     """
     Computes MoE GEMM with 16-bit activations and MxFP4 weights
@@ -493,6 +495,23 @@ def moe_gemm_a16w4(
         config["split_k"],
         x.device,
     )
+    if expert_map is not None:
+        assert (
+            backend == "triton"
+        ), "expert_map (EP) is only supported on the triton backend"
+        # Non-local experts' output rows are left unwritten (no zero-fill), so the
+        # combine must skip their gates -- gate_valid is required to do that.
+        assert (
+            gate_valid is not None
+        ), "expert_map (EP) requires gate_valid so the combine skips non-local gates"
+        # The kernel indexes ExpertMap as a flat pointer, so enforce the same
+        # contiguous int32 contract the fused routing path uses.
+        assert (
+            expert_map.is_contiguous()
+            and expert_map.dtype == torch.int32
+            and expert_map.device == x.device
+            and expert_map.numel() == routing_data.n_expts_tot
+        ), "expert_map must be a contiguous int32 [n_expts_tot] tensor on x.device"
     stride_bias = None if bias is None else bias.stride(0)
 
     # moe metadata
@@ -702,6 +721,7 @@ def moe_gemm_a16w4(
             expt_token_offs_raw,
             expt_hist_sum,
             expt_block_pid_map,
+            expert_map,
             grid_m,
             grid_n,
             apply_swiglu_matmul,
@@ -710,6 +730,7 @@ def moe_gemm_a16w4(
             reduction_n_matmul,
             swiglu_add_residual,
             routing_data.n_expts_act,
+            expert_map is not None,
             config["block_m"],
             config["block_n"],
             config["block_k"],
@@ -734,6 +755,13 @@ def moe_gemm_a16w4(
         if scatter_indx is None
         else scatter_indx.view(-1, routing_data.n_expts_act)
     )
+    # Expert parallelism: skip gates whose expert is not on this rank instead of
+    # zero-filling their (unwritten) output rows, so the combine never reads them.
+    group_valid = (
+        None
+        if (gate_valid is None or scatter_indx is None)
+        else gate_valid.view(-1, routing_data.n_expts_act)
+    )
     y_final = reduce_grouped(
         y,
         group_indx,
@@ -744,6 +772,7 @@ def moe_gemm_a16w4(
         reduction_n_reduction,
         out_dtype=out_dtype,
         swiglu_add_residual=swiglu_add_residual,
+        indx_valid=group_valid,
     )
 
     return y_final
