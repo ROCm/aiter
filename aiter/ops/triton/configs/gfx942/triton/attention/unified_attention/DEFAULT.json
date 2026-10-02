@@ -8,8 +8,7 @@
       "DT"
     ],
     "attn_3d": [
-      "D",
-      "SHUF"
+      "D"
     ],
     "reduce": [
       "D"
@@ -106,7 +105,8 @@
       "num_stages": 2,
       "waves_per_eu": 1,
       "TILE_SIZE_MIN": 32,
-      "TILE_SIZE_MAX": 32
+      "TILE_SIZE_MAX": 32,
+      "SPLIT_UNMASKED_LOOP": true
     },
     "D_GEQ_512.Q_GEQ_1024.DT_bf16_bf16": {
       "BLOCK_M": 64,
@@ -188,7 +188,7 @@
       "TILE_SIZE_MIN": 64,
       "TILE_SIZE_MAX": 64
     },
-    "D_GEQ_256.SHUF.DT_fp8_fp8": {
+    "D_GEQ_512.Q_GEQ_1024.SHUF.DT_fp8_fp8": {
       "BLOCK_M": 16,
       "num_warps": 4,
       "num_stages": 1,
@@ -196,23 +196,7 @@
       "TILE_SIZE_MIN": 64,
       "TILE_SIZE_MAX": 64
     },
-    "D_GEQ_256.SHUF.DT_bf16_bf16": {
-      "BLOCK_M": 16,
-      "num_warps": 4,
-      "num_stages": 1,
-      "waves_per_eu": 2,
-      "TILE_SIZE_MIN": 64,
-      "TILE_SIZE_MAX": 64
-    },
-    "D_GEQ_512.SHUF.DT_fp8_fp8": {
-      "BLOCK_M": 16,
-      "num_warps": 4,
-      "num_stages": 1,
-      "waves_per_eu": 2,
-      "TILE_SIZE_MIN": 64,
-      "TILE_SIZE_MAX": 64
-    },
-    "D_GEQ_512.SHUF.DT_bf16_bf16": {
+    "D_GEQ_512.Q_GEQ_1024.SHUF.DT_bf16_bf16": {
       "BLOCK_M": 16,
       "num_warps": 4,
       "num_stages": 1,
@@ -235,30 +219,6 @@
       "waves_per_eu": 2,
       "TILE_SIZE_MIN": 64,
       "TILE_SIZE_MAX": 64
-    },
-    "D_GEQ_512.Q_GEQ_1024.SHUF.DT_fp8_fp8": {
-      "BLOCK_M": 16,
-      "num_warps": 4,
-      "num_stages": 1,
-      "waves_per_eu": 2,
-      "TILE_SIZE_MIN": 64,
-      "TILE_SIZE_MAX": 64
-    },
-    "D_GEQ_512.Q_GEQ_1024.SHUF.DT_bf16_bf16": {
-      "BLOCK_M": 16,
-      "num_warps": 4,
-      "num_stages": 1,
-      "waves_per_eu": 2,
-      "TILE_SIZE_MIN": 64,
-      "TILE_SIZE_MAX": 64
-    },
-    "D_GEQ_256.Q_LEQ_1.SHUF": {
-      "BLOCK_M": 16,
-      "num_warps": 4,
-      "num_stages": 1,
-      "waves_per_eu": 2,
-      "TILE_SIZE_MIN": 1,
-      "TILE_SIZE_MAX": 64
     }
   },
   "attn_3d": {
@@ -266,18 +226,12 @@
       "BLOCK_M": 16,
       "num_warps": 4,
       "num_stages": 1,
-      "waves_per_eu": 2
+      "waves_per_eu": 1
     },
     "any": {
       "BLOCK_M": 16,
       "num_warps": 2,
       "num_stages": 2,
-      "waves_per_eu": 2
-    },
-    "D_GEQ_256.SHUF": {
-      "BLOCK_M": 16,
-      "num_warps": 4,
-      "num_stages": 1,
       "waves_per_eu": 2
     }
   },
