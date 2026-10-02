@@ -16,6 +16,7 @@
                       const int num_kv_heads,           \
                       const int num_heads,              \
                       const int max_num_blocks_per_seq, \
+                      const int num_kv_blocks,          \
                       const int q_stride,               \
                       const int kv_block_stride,        \
                       const int kv_head_stride,         \
@@ -72,7 +73,8 @@ FUNCTION_DEFINE
                                     block_tables_ptr,                  
                                     context_lens_ptr,
                                     nullptr,            
-                                    max_num_blocks_per_seq,          
+                                    max_num_blocks_per_seq,
+                                    num_kv_blocks,
                                     alibi_slopes_ptr,               
                                     q_stride,                       
                                     kv_block_stride,                
