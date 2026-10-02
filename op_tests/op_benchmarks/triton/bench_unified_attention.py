@@ -299,9 +299,58 @@ def run_benchmark(custom, args):
                 v_descale=inputs["v_descale"],
                 output_scale=inputs["out_scale"],
                 backend=args.backend,
+                block_skip_threshold=args.block_skip_threshold,
             )
 
         ms = triton.testing.do_bench_cudagraph(fn)
+
+        if args.block_skip_threshold > 0.0:
+            # Achieved elision, from the kernel's own counter.
+            #
+            # Deliberately a SEPARATE, UNTIMED launch: passing the counter into
+            # `fn` would add two atomics per program to the very measurement
+            # this is meant to explain. The threshold alone does not tell you
+            # what it bought -- a calibrated value can legitimately elide 0% on
+            # random inputs -- so report the two together or neither.
+            counter = torch.zeros(2, dtype=torch.int64, device=q_tensor.device)
+            unified_attention(
+                q=q_tensor,
+                k=k_tensor,
+                v=v_tensor,
+                out=inputs["output"],
+                cu_seqlens_q=inputs["cu_query_lens"],
+                seqused_k=inputs["kv_lens"],
+                max_seqlen_q=inputs["max_query_len"],
+                max_seqlen_k=inputs["max_kv_len"],
+                softmax_scale=inputs["scale"],
+                causal=True,
+                window_size=window_size,
+                block_table=inputs["block_tables"],
+                softcap=0,
+                q_descale=inputs["q_descale"],
+                k_descale=inputs["k_descale"],
+                v_descale=inputs["v_descale"],
+                output_scale=inputs["out_scale"],
+                backend=args.backend,
+                block_skip_threshold=args.block_skip_threshold,
+                skip_counter=counter,
+            )
+            torch.cuda.synchronize()
+            seen, elided = (int(x) for x in counter.cpu())
+            pct = 100.0 * elided / seen if seen else float("nan")
+            print(
+                f"    block_skip: threshold={args.block_skip_threshold:g}  "
+                f"tiles visited={seen}  elided={elided} ({pct:.1f}%)"
+                + (
+                    "  [0 tiles counted: this shape did not reach the 2D kernel, "
+                    "where skipping lives. Decode, sliding-window and 3D-routed "
+                    "shapes run dense. Note the default varlen mode spreads -sq "
+                    "over random per-sequence lengths, which usually routes to "
+                    "3D; try -equal_seqlens with a large -sq.]"
+                    if seen == 0
+                    else ""
+                )
+            )
 
         if args.test:
             fn()
@@ -452,6 +501,18 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         default=None,
         choices=["triton", "gluon"],
         help="Kernel backend",
+    )
+    parser.add_argument(
+        "-block_skip_threshold",
+        type=float,
+        default=0.0,
+        help=(
+            "Block-skip threshold (default: 0.0 = disabled). Above 0, a K/V tile "
+            "whose scores are all below `running_max + log2(threshold)` is "
+            "skipped. The useful value is model- and sequence-length-dependent "
+            "and must be calibrated; skipping is approximate, so the output "
+            "changes. Achieved tile elision is reported alongside the timing."
+        ),
     )
 
     return parser.parse_args(args=args)
