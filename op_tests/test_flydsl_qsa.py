@@ -2619,6 +2619,75 @@ def test_qsa_layer_triton_threads_scales():
         amd.qsa_sparse_paged_attention = old_attend
 
 
+def test_qsa_metadata_strided_view_matches_packed():
+    """Request and position vectors are loaded as ``ptr + index``.
+
+    A view such as ``base[::2]`` has to score the same request as its
+    packed copy. A non-int32 vector is rejected before launch.
+    """
+    from aiter.ops.triton.attention.qsa_vllm_amd import qsa_mqa_paged
+
+    q = torch.zeros(2, 1, 16, dtype=torch.bfloat16)
+    cache = torch.zeros(1, 16, 1, 16, dtype=torch.bfloat16)
+    table = torch.zeros(2, 1, dtype=torch.int32)
+    positions = torch.zeros(2, dtype=torch.int32)
+    lengths = torch.zeros(2, dtype=torch.int32)
+    try:
+        qsa_mqa_paged(
+            q,
+            cache,
+            table,
+            torch.zeros(2, dtype=torch.int64),
+            positions,
+            lengths,
+            4,
+        )
+    except ValueError as exc:
+        if "token_to_req" not in str(exc):
+            raise
+    else:
+        raise AssertionError("int64 token_to_req was accepted")
+    if not torch.cuda.is_available():
+        return
+
+    device = torch.device("cuda")
+    q = torch.zeros(2, 1, 16, dtype=torch.bfloat16, device=device)
+    cache = torch.zeros(1, 16, 1, 16, dtype=torch.bfloat16, device=device)
+    table = torch.zeros(2, 1, dtype=torch.int32, device=device)
+    requests = torch.tensor([0, 9, 1, 9], dtype=torch.int32, device=device)[::2]
+    positions = torch.tensor([7, 0, 3, 0], dtype=torch.int32, device=device)[::2]
+    lengths = torch.tensor([20, 1, 8, 1], dtype=torch.int32, device=device)[::2]
+    if requests.is_contiguous():
+        raise AssertionError("the metadata fixture is already packed")
+    _logits, visible = qsa_mqa_paged(q, cache, table, requests, positions, lengths, 4)
+    _logits, visible_ref = qsa_mqa_paged(
+        q,
+        cache,
+        table,
+        requests.contiguous(),
+        positions.contiguous(),
+        lengths.contiguous(),
+        4,
+    )
+    if not torch.equal(visible, visible_ref) or not torch.equal(
+        visible, torch.tensor([2, 1], dtype=torch.int32, device=device)
+    ):
+        raise AssertionError(f"strided metadata scored {visible.tolist()}")
+
+    blocks = torch.zeros(2, 1, dtype=torch.int32, device=device)
+    expanded = expand_qsa_block_indices_cuda(blocks, positions, lengths, requests, 4, 4)
+    expanded_ref = expand_qsa_block_indices_cuda(
+        blocks,
+        positions.contiguous(),
+        lengths.contiguous(),
+        requests.contiguous(),
+        4,
+        4,
+    )
+    if not torch.equal(expanded, expanded_ref):
+        raise AssertionError("strided expand disagreed with the packed metadata")
+
+
 def test_k2_serves_rejects_shapes_the_builder_rejects():
     """A geometry ``build_qsa_k2_module`` raises on is a reason here.
 
@@ -3227,6 +3296,7 @@ def _run_unit_cases():
     test_qsa_auto_admits_only_measured_pairs()
     test_qsa_auto_rejects_a_selection_k1_cannot_build()
     test_qsa_layer_triton_threads_scales()
+    test_qsa_metadata_strided_view_matches_packed()
     test_k2_serves_rejects_shapes_the_builder_rejects()
     test_qsa_auto_logs_unmeasured_query_once()
     test_qsa_aot_collector_lists_family_a_launches()
