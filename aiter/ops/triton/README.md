@@ -40,7 +40,9 @@ Public wrapper modules live in the categorized folders; the kernel bodies live
 in `_triton_kernels/` at the same relative category path, or in
 `_gluon_kernels/<arch>/` at the same relative category path when the Gluon
 implementation is architecture-specific.
-Tests mirror the same categories under `op_tests/triton_tests/<category>/`.
+Tests mirror the wrapper folders under `op_tests/triton_tests/`, including
+nested wrapper subpackages (for example,
+`moe/moe_routing/test_moe_routing.py`).
 Kernel bodies are internal: tests, benchmarks, and external code call the
 public wrappers only — never `_triton_kernels/` / `_gluon_kernels/` directly.
 
@@ -146,6 +148,16 @@ module on top of it, and every function has exactly one home:
 Attention and GMM kernels read their single `DEFAULT.json` straight off the
 core (`resolve_config_dir()` + `load_config_json()`); a family module earns
 its place once a family grows real selection logic.
+
+GMM's `get_config()` (`_triton_kernels/gmm.py`) supports an optional
+`"dispatch"` list per variant: each rule is
+`{"config": <name>, "min_K": int, "min_N": int, "min_avg_rows_per_group": int}`
+(omitted thresholds are 0), and the first rule with `K >= min_K`,
+`N >= min_N` and `M >= min_avg_rows_per_group * G` returns the named config
+from the same variant section. Rows are averaged (`M / G`) because the actual
+`group_sizes` stay on the device. Rules are skipped when `accumulate=True`;
+with no match, or no `"dispatch"` key, the variant's `"default"` (or
+`"accumulate"`) config is used.
 
 ### How GEMM configs resolve — `get_gemm_config()`
 
@@ -448,8 +460,8 @@ never call `logging.basicConfig(...)` from library code.
 
 ## Tests
 
-Tests live under `op_tests/triton_tests/<category>/`, mirroring this
-directory's categories:
+Tests live under `op_tests/triton_tests/`, mirroring the wrapper folder
+structure in this directory, including nested wrapper subpackages:
 
 ```bash
 pytest op_tests/triton_tests/              # everything
