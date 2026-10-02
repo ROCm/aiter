@@ -80,7 +80,8 @@ def _build(block_size=16, shuffled_kv_cache=False, sliding_window=None,
     )
 
 
-def _run(data, threshold, out=None, skip_counter=None, sliding_window=None):
+def _run(data, threshold, out=None, skip_counter=None, sliding_window=None,
+         backend="triton"):
     """One unified_attention call on prepared data, returning the output."""
     (query, _kc_orig, _vc_orig, key_cache, value_cache, sinks, output,
      cu_query_lens, kv_lens, max_query_len, max_kv_len, scale, window_size,
@@ -97,14 +98,20 @@ def _run(data, threshold, out=None, skip_counter=None, sliding_window=None):
         sinks=sinks, output_scale=output_scale,
         block_skip_threshold=threshold,
         skip_counter=skip_counter,
-        backend="triton",
+        backend=backend,
     )
     return dst.clone()
 
 
 def _skipif_gfx12():
-    if IS_DEVICE_ARCH_GFX12:
-        pytest.skip("block skipping is rejected on the gfx1250 Gluon path")
+    """Deprecated: skipping by ARCHITECTURE was too broad.
+
+    The threshold is rejected on the GLUON backend, not on gfx1250 as such, and
+    every test here drives `backend="triton"`. Skipping the whole architecture
+    therefore deleted all coverage of the supported Triton path on gfx1250.
+    Kept as a no-op so call sites stay readable; remove once they are all gone.
+    """
+    return
 
 
 def _require_2d_path(data):
@@ -115,7 +122,7 @@ def _require_2d_path(data):
     did. The counter is the cheapest honest probe: if the 2D kernel ran with
     skipping on, it saw tiles.
     """
-    buf = torch.zeros(2, dtype=torch.int32, device="cuda")
+    buf = torch.zeros(2, dtype=torch.int64, device="cuda")
     _run(data, 1.0, out=torch.empty_like(data[6]), skip_counter=buf)
     seen = int(buf[0])
     assert seen > 0, (
@@ -193,11 +200,13 @@ def test_no_elision_is_dense_within_rounding():
     _require_2d_path(data)
     dense = _run(data, 0.0, out=torch.empty_like(data[6]))
 
+    checked = 0
     for thr in THRESHOLDS_NO_ELISION:
-        buf = torch.zeros(2, dtype=torch.int32, device="cuda")
+        buf = torch.zeros(2, dtype=torch.int64, device="cuda")
         out = _run(data, thr, out=torch.empty_like(data[6]), skip_counter=buf)
         if int(buf[1]):
             continue  # this threshold does elide here; not what this tests
+        checked += 1
         rel = ((out.float() - dense.float()).abs().mean()
                / dense.float().abs().mean().clamp_min(1e-6)).item()
         assert rel < 1e-5, (
@@ -206,6 +215,15 @@ def test_no_elision_is_dense_within_rounding():
             "reassociation. Rows are being masked individually, which costs "
             "accuracy and saves no work."
         )
+
+    # Without this the test passes vacuously: if a bug made every threshold
+    # elide something, every iteration would `continue` and nothing would ever
+    # be compared.
+    assert checked, (
+        "no threshold in THRESHOLDS_NO_ELISION elided zero tiles, so the "
+        "dense-equivalence assertion never ran. Lower the thresholds, or a "
+        "regression has made everything elide."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -275,6 +293,48 @@ def test_sliding_window_falls_back_to_dense():
     )
 
 
+def test_3d_routed_shape_falls_back_to_dense():
+    """A shape that routes to the 3D kernel must run dense and leave the
+    counter alone.
+
+    The 3D kernel splits the key sequence into segments and restarts the
+    running maximum in each one, so `tile_max - running_max` means something
+    different there and the first tile of every segment could never skip. The
+    wrapper force-disables skipping on that path; this checks that it does.
+
+    ROUTING, which this test has to PROVE rather than assume: use_2d_kernel()
+    picks 2D when total_num_q_blocks * num_kv_heads exceeds num_sms * 4. At 256
+    query tokens with 1 KV head and BLOCK_Q=32 that is ~9 programs against a
+    target of ~1024 on MI355X and ~1216 on MI300X, so this lands on 3D by a
+    wide margin. max_seqlen_k is 1024, above the 512 cutoff that would
+    otherwise force 2D regardless of program count.
+
+    `tiles visited == 0` IS the routing proof. On the 2D path COUNT_SKIPS is on
+    whenever the threshold is positive and a counter is passed, and it counts
+    every tile it inspects -- including ones it does not elide. So a non-zero
+    count can only mean the 2D kernel ran, i.e. this test is not exercising
+    what it claims. The 3D path never writes the counter at all. That single
+    assertion therefore covers both the routing and the fact that the 3D
+    branch drops skip_counter.
+    """
+    _skipif_gfx12()
+    data = _build(seq_lens=[(256, 1024)], num_heads=(4, 1))
+    buf = torch.zeros(2, dtype=torch.int64, device="cuda")
+
+    dense = _run(data, 0.0, out=torch.empty_like(data[6]))
+    asked = _run(data, 0.3, out=torch.empty_like(data[6]), skip_counter=buf)
+
+    assert int(buf[0]) == 0, (
+        f"the 2D kernel ran ({int(buf[0])} tiles counted), so this shape no "
+        "longer routes to 3D and the test is not exercising the 3D fallback. "
+        "Shrink the shape until it does."
+    )
+    assert torch.equal(dense, asked), (
+        "a 3D-routed shape changed its output once a threshold was set, so the "
+        "force-disable on the 3D path is incomplete"
+    )
+
+
 def test_decode_falls_back_to_dense():
     """One query row per sequence: there is no prior maximum to be far below,
     so nothing can skip and the check would be pure cost. Disabled silently
@@ -294,7 +354,10 @@ def test_gluon_backend_rejects_threshold():
     so any speedup they then measured would be against the wrong baseline."""
     data = _build()
     with pytest.raises(AssertionError, match="not supported on the Gluon backend"):
-        _run(data, 0.3, out=torch.empty_like(data[6]))
+        # backend="gluon" explicitly: _run defaults to Triton, so without this
+        # the call takes the Triton path and the test passes for the wrong
+        # reason -- it never exercises the Gluon rejection it is named for.
+        _run(data, 0.3, out=torch.empty_like(data[6]), backend="gluon")
 
 
 # ---------------------------------------------------------------------------
@@ -333,7 +396,7 @@ def test_skip_counter_reports_elision():
 
     prev = -1.0
     for thr in THRESHOLDS_ELIDE:
-        buf = torch.zeros(2, dtype=torch.int32, device="cuda")
+        buf = torch.zeros(2, dtype=torch.int64, device="cuda")
         _run(data, thr, out=torch.empty_like(data[6]), skip_counter=buf)
         seen, elided = (int(x) for x in buf.cpu())
         assert seen > 0, f"threshold={thr}: counter recorded 0 tiles visited"
@@ -352,7 +415,7 @@ def test_skip_counter_untouched_when_disabled():
     be paying for atomics it does not need."""
     _skipif_gfx12()
     data = _build()
-    buf = torch.zeros(2, dtype=torch.int32, device="cuda")
+    buf = torch.zeros(2, dtype=torch.int64, device="cuda")
     _run(data, 0.0, out=torch.empty_like(data[6]), skip_counter=buf)
     assert int(buf.sum()) == 0, "counter was written with block skipping disabled"
 
@@ -364,7 +427,13 @@ def test_skip_counter_rejects_bad_buffer():
     data = _build()
     for bad, why in (
         (torch.zeros(2, dtype=torch.float32, device="cuda"), "dtype"),
-        (torch.zeros(1, dtype=torch.int32, device="cuda"), "too small"),
+        # int32 is specifically rejected: the count is global and a long prefill
+        # overflows it, so accepting one would hand back a wrong ratio.
+        (torch.zeros(2, dtype=torch.int32, device="cuda"), "narrow dtype"),
+        (torch.zeros(1, dtype=torch.int64, device="cuda"), "too small"),
+        # Expanded view: numel() == 2 but both elements share ONE element of
+        # storage, so the kernel's ptr+1 atomic would write out of bounds.
+        (torch.zeros(1, dtype=torch.int64, device="cuda").expand(2), "non-contiguous"),
     ):
         with pytest.raises(AssertionError, match="skip_counter"):
             _run(data, 0.3, out=torch.empty_like(data[6]), skip_counter=bad)
