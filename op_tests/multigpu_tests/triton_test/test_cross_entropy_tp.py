@@ -21,8 +21,10 @@ import sys
 import traceback
 
 import torch
+import torch.distributed as dist
 
 import aiter
+from aiter import logger
 from aiter.dist.parallel_state import get_tp_group
 from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
 from aiter.ops.triton.cross_entropy import cross_entropy_forward
@@ -83,6 +85,16 @@ def _worker(
         )
         raise
     finally:
+        # Align ranks before the eager IPC/message-queue teardown in
+        # destroy_dist_env(); an unsynchronized free intermittently hangs the
+        # comm UTs when they run back-to-back in CI.
+        if dist.is_initialized():
+            torch.cuda.synchronize()
+            try:
+                dist.barrier()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("barrier before teardown failed: %s", e)
+            torch.cuda.synchronize()
         aiter.destroy_dist_env()
 
 
@@ -181,7 +193,7 @@ def test_cross_entropy_tp_grad(world_size: int = 2):
     print(
         f"PASSED test_cross_entropy_tp_grad  "
         f"world_size={world_size}  "
-        f"max_diffs={[f'{results[r][1].float().sub(ref_grad[..., r*V_local:(r+1)*V_local]).abs().max().item():.2e}' for r in range(world_size)]}"
+        f"max_diffs={[f'{results[r][1].float().sub(ref_grad[..., r * V_local : (r + 1) * V_local]).abs().max().item():.2e}' for r in range(world_size)]}"
     )
 
 
