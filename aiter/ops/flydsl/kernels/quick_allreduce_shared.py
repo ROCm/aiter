@@ -205,6 +205,27 @@ def _load_flag(addr_i64):
     )
 
 
+def _poll_v4i32(addr_i64):
+    """Re-read 16 B of an inbox that a peer writes without a flag.
+
+    Two relaxed system-scope atomic i64 loads, ``global_load_dwordx2 ... sc0
+    sc1``, so each retry is fetched past L1 and L2. The atomic is what keeps a
+    spin on it alive: a side-effect-free loop over a plain or buffer load may be
+    assumed to terminate, and the compiler is then free to delete it. A 128-bit
+    atomic would be lowered to a library call, and ``volatile`` would add a
+    ``vmcnt(0)`` after every load.
+    """
+    halves = [
+        fx.generic_load(
+            _global_ptr(addr_i64 + fx.Int64(8 * h), T.i64, 8),
+            dtype=fx.Int64,
+            memory_order=fx.AtomicOrdering.Monotonic,
+        )
+        for h in range(2)
+    ]
+    return fx.Vector.from_elements(halves, fx.Int64).bitcast(fx.Int32)
+
+
 def _buffer_ptr(addr_i64, elem_ty, alignment, num_records_bytes=None):
     """A buffer-descriptor pointer at a raw global byte address.
 

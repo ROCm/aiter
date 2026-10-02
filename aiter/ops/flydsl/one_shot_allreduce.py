@@ -34,6 +34,7 @@ from .kernels.one_shot_allreduce import (
     DEFAULT_BLOCK,
     DEFAULT_FANOUT,
     DEFAULT_GRID_CAP,
+    DEFAULT_LAMPORT,
     DEFAULT_SKIP_SELF,
     SUPPORTED_ATOMS,
     SUPPORTED_BLOCKS,
@@ -85,6 +86,10 @@ class OneShotAllReduce:
     It specialises the kernel to this rank, so the JIT symbol carries an ``_r<n>_``
     field and the binary is not shared across ranks -- one extra compile per process,
     not per world.
+
+    ``lamport`` builds the flagless variant, where the payload is its own flag
+    (see ``kernels/one_shot_allreduce.py``). Like ``skip_self``, ``None`` means
+    "whatever the rung says". It needs the uncached inbox.
     """
 
     def __init__(
@@ -102,6 +107,7 @@ class OneShotAllReduce:
         max_bytes: int | None = None,
         link: str | None = None,
         skip_self: bool | None = None,
+        lamport: bool | None = None,
     ):
         if world_size not in SUPPORTED_WORLDS:
             raise ValueError(
@@ -158,8 +164,9 @@ class OneShotAllReduce:
             max_payload_bytes(world_size, link) if max_bytes is None else int(max_bytes)
         )
 
-        # ``skip_self``: None means "whatever the rung says".
+        # ``skip_self`` and ``lamport``: None means "whatever the rung says".
         ss = None if skip_self is None else bool(skip_self)
+        lp = None if lamport is None else bool(lamport)
         if pinned:
             self._ladder = (
                 (
@@ -169,6 +176,7 @@ class OneShotAllReduce:
                     fanout,
                     int(block),
                     DEFAULT_SKIP_SELF if ss is None else ss,
+                    DEFAULT_LAMPORT if lp is None else lp,
                 ),
             )
         else:
@@ -181,8 +189,9 @@ class OneShotAllReduce:
                     f,
                     b,
                     s if ss is None else ss,
+                    lam if lp is None else lp,
                 )
-                for floor, a, rung_cap, f, b, s in oneshot_ladder(world_size, link)
+                for floor, a, rung_cap, f, b, s, lam in oneshot_ladder(world_size, link)
             )
 
         # One engine per distinct rung config, built in a fixed sorted order:
@@ -209,6 +218,7 @@ class OneShotAllReduce:
                         block=key[3],
                         skip_self=key[4],
                         rank=self.rank,
+                        lamport=key[5],
                     )
                     self._by_cfg[key] = (
                         _StEngine(
@@ -235,6 +245,7 @@ class OneShotAllReduce:
         self.fanout = first[2]
         self.block = first[3]
         self.skip_self = first[4]
+        self.lamport = first[5]
         self.tile_bytes = spec["tile_bytes"]
         self.wire_tile_bytes = spec["wire_tile_bytes"]
         self.buf_bytes = eng.buf_bytes
@@ -247,12 +258,19 @@ class OneShotAllReduce:
     @staticmethod
     def _cfg_of(rung) -> tuple:
         """A ladder rung's engine key: everything but its ``min_bytes``."""
-        _floor, atoms, cap, fanout, block, skip_self = rung
-        return (int(atoms), int(cap), fanout, int(block), bool(skip_self))
+        _floor, atoms, cap, fanout, block, skip_self, lamport = rung
+        return (
+            int(atoms),
+            int(cap),
+            fanout,
+            int(block),
+            bool(skip_self),
+            bool(lamport),
+        )
 
     def _pick_cfg(self, live_bytes: int) -> tuple:
-        """``(atoms, grid_cap, fanout, block, skip_self)`` the ladder assigns to
-        *live_bytes*."""
+        """``(atoms, grid_cap, fanout, block, skip_self, lamport)`` the ladder
+        assigns to *live_bytes*."""
         chosen = self._ladder[0]
         for rung in self._ladder:
             if live_bytes >= rung[0]:

@@ -90,7 +90,9 @@ class _StEngine:
         try:
             # The inbox is the only allocation peers write into, so it is the
             # only one whose memory type matters for fabric throughput.
-            self._buf_ptr = UncachedIpcHeap.alloc(self.buf_bytes, inbox_flags)
+            self._buf_ptr = UncachedIpcHeap.alloc(
+                self.buf_bytes, inbox_flags, fill=spec.get("inbox_fill", 0)
+            )
             my_handle = UncachedIpcHeap.get_mem_handle_bytes(self._buf_ptr)
             all_meta = UncachedIpcHeap.gather_object_list_via_broadcast(
                 group, (my_handle, 0)

@@ -117,6 +117,7 @@ FAMILY_POLICY: dict[tuple[str, int], FamilyPolicy] = {
 ENABLE_VAR = "AITER_FLY_AR"
 ONESHOT_MAX_VAR = "AITER_FLY_AR_ONESHOT_MAX_BYTES"
 ONESHOT_MIN_VAR = "AITER_FLY_AR_ONESHOT_MIN_BYTES"
+ONESHOT_LAMPORT_VAR = "AITER_FLY_AR_ONESHOT_LAMPORT"
 MESH_MAX_VAR = "AITER_FLY_AR_MESH_MAX_BYTES"
 
 
@@ -131,6 +132,18 @@ def _env_int(name: str) -> int | None:
         logger.warning("FlyDSL QR: ignoring %s=%r, expected an integer", name, raw)
         return None
     return None if val < 0 else val
+
+
+def _env_bool(name: str) -> bool | None:
+    """``"1"`` -> True, ``"0"`` -> False, unset or ``"-1"`` -> None ("use the
+    table")."""
+    val = _env_int(name)
+    if val is None:
+        return None
+    if val not in (0, 1):
+        logger.warning("FlyDSL QR: ignoring %s=%r, expected 0 or 1", name, val)
+        return None
+    return bool(val)
 
 
 def enabled() -> bool:
@@ -178,6 +191,9 @@ class OneShotPolicy:
 
     max_bytes: int
     min_bytes: int = 0
+    # Pins every one-shot rung to the Lamport (True) or flag (False) variant;
+    # None leaves it to ``ONESHOT_LADDER``.
+    lamport: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -200,7 +216,8 @@ def resolve_oneshot(link: str, world_size: int) -> OneShotPolicy:
     ``ONESHOT_MIN_VAR`` overrides the small-payload floor below which the
     one-shot declines (the custom-AR slot then falls through to ``cdr``);
     ``ONESHOT_MAX_VAR`` overrides the ceiling. ``-1`` on either means "use the
-    table".
+    table". ``ONESHOT_LAMPORT_VAR`` pins the Lamport variant on (``1``) or off
+    (``0``) at every rung.
     """
 
     base = _base(link, world_size)
@@ -209,6 +226,7 @@ def resolve_oneshot(link: str, world_size: int) -> OneShotPolicy:
     return OneShotPolicy(
         max_bytes=base.oneshot_max_exact if max_override is None else max_override,
         min_bytes=base.min_bytes if min_override is None else min_override,
+        lamport=_env_bool(ONESHOT_LAMPORT_VAR),
     )
 
 
