@@ -72,6 +72,19 @@ def generate_batched_gemm_a16w8_inputs(
     return x, weight, w_scale, bias, y
 
 
+def prepare_batched_gemm_input(x, transpose_bm_in=False, input_pad=0, pad_value=0):
+    """Prepare the actual input layout, optionally retaining padded row strides."""
+    assert input_pad >= 0
+    if transpose_bm_in:
+        x = x.transpose(0, 1).contiguous()
+    if input_pad:
+        k = x.shape[-1]
+        storage = x.new_full((*x.shape[:-1], k + input_pad), pad_value)
+        storage[..., :k].copy_(x)
+        x = storage[..., :k]
+    return x
+
+
 def run_torch(x, weight, w_scale, bias=None, dtype=torch.bfloat16, transpose_bm=True):
     B = x.size(0)
     M = x.size(1)
@@ -108,6 +121,129 @@ def run_triton(
     )
 
 
+@pytest.fixture
+def gfx950_lookup(monkeypatch):
+    from aiter.ops.triton.utils import config_utils, gemm_config_utils
+    from aiter.ops.triton.utils._triton import arch_info
+
+    monkeypatch.setattr(arch_info, "get_arch", lambda: "gfx950")
+    config_utils.load_config_json.cache_clear()
+    gemm_config_utils._get_gemm_config_cached.cache_clear()
+    yield
+    config_utils.load_config_json.cache_clear()
+    gemm_config_utils._get_gemm_config_cached.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "n, k, m, bm, bn",
+    [
+        (512, 192, 32, 32, 128),
+        (512, 192, 33, 16, 64),
+        (512, 192, 64, 16, 64),
+        (512, 192, 65, 32, 128),
+        (512, 192, 128, 32, 128),
+        (512, 192, 129, 64, 256),
+        (512, 192, 257, 32, 128),
+        (256, 512, 32, 32, 128),
+        (256, 512, 33, 16, 64),
+        (256, 512, 64, 16, 64),
+        (256, 512, 128, 16, 64),
+        (256, 512, 129, 32, 128),
+        (256, 512, 256, 32, 128),
+        (256, 512, 257, 32, 128),
+    ],
+)
+def test_config_boundaries(n, k, m, bm, bn, gfx950_lookup):
+    from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
+        _get_config,
+    )
+
+    config, tuned = _get_config(m, n, k)
+    assert (config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"]) == (bm, bn)
+    assert tuned == (m != 257)
+    if m == 33:
+        original = config.copy()
+        config["BLOCK_SIZE_M"] = -1
+        assert _get_config(m, n, k)[0] == original
+        neighbor, tuned = _get_config(m, n, k + 1)
+        default, default_tuned = _get_config(m, n + 1, k)
+        assert not (tuned or default_tuned) and neighbor == default
+
+
+def test_explicit_config_bypasses_lookup(monkeypatch, gfx950_lookup):
+    op = batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant
+    config, _ = op.__globals__["_get_config"](64, 256, 512)
+    launches = []
+
+    class Kernel:
+        def __getitem__(self, grid):
+            return lambda *args, **kwargs: launches.append(kwargs)
+
+    monkeypatch.setitem(
+        op.__globals__,
+        "_get_config",
+        lambda *_: pytest.fail("Explicit config must bypass lookup"),
+    )
+    monkeypatch.setitem(
+        op.__globals__,
+        "_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_kernel",
+        Kernel(),
+    )
+    x = torch.zeros((1, 64, 512), dtype=torch.bfloat16)
+    w = torch.zeros((1, 256, 512), dtype=e4m3_type)
+    y = torch.empty((1, 64, 256), dtype=torch.bfloat16)
+    assert op(x, w, torch.ones(()), YQ=y, config=config) is y
+    assert len(launches) == 1 and all(
+        launches[0][key] == value for key, value in config.items()
+    )
+
+
+def group_quantized_reference(x, weight, w_scale, group_size=128):
+    out = torch.zeros(
+        (*x.shape[:2], weight.shape[1]), dtype=torch.float32, device=x.device
+    )
+    limit = torch.finfo(weight.dtype).max
+    for start in range(0, x.shape[-1], group_size):
+        a = x[..., start : start + group_size].float()
+        scale = a.abs().amax(-1, keepdim=True).clamp_min(1e-10) * (1.0 / limit)
+        quantized = (a * scale.reciprocal()).clamp(-limit, limit).to(weight.dtype)
+        out += (
+            torch.bmm(
+                quantized.float(),
+                weight[..., start : start + group_size].float().transpose(1, 2),
+            )
+            * scale
+        )
+    return out * w_scale
+
+
+@pytest.mark.parametrize("m, n, k", [(65, 512, 192), (129, 256, 512)])
+def test_token_first_query_and_value_layout(m, n, k):
+    transpose_output = k == 512
+    x, weight, scale, _, y = generate_batched_gemm_a16w8_inputs(
+        8, m, n, k, "bf16", False, transpose_output, transpose_bm=transpose_output
+    )
+    x = (x - 0.05).contiguous()
+    inputs = prepare_batched_gemm_input(x, True, 64 if k == 192 else 0, pad_value=1024)
+    if k == 192:
+        assert inputs.stride() == (8 * 256, 256, 1) and not inputs.is_contiguous()
+    op = batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant
+    actual = op(
+        inputs, weight, scale, YQ=y, transpose_bm=transpose_output, transpose_bm_in=True
+    )
+    contiguous = op(x, weight, scale, transpose_bm=transpose_output)
+    torch.testing.assert_close(actual, contiguous, atol=0, rtol=0)
+    if y is not None:
+        assert actual is y
+        actual = actual.transpose(0, 1)
+    torch.testing.assert_close(
+        actual.float(),
+        group_quantized_reference(x, weight, scale),
+        atol=0.02,
+        rtol=0.02,
+    )
+
+
 def get_x_vals():
 
     x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in range(1, 9)]
@@ -141,6 +277,13 @@ def get_x_vals():
     ]
     x_vals += [(v**2, 128, 512) for v in range(7)]
     x_vals += [(v**2, 512, 128) for v in range(7)]
+    x_vals += [
+        (64, 512, 192),
+        (128, 512, 192),
+        (64, 256, 512),
+        (128, 256, 512),
+        (256, 256, 512),
+    ]
     x_vals += [(1, 128, 1)]  # minimal case
     return x_vals
 
