@@ -256,13 +256,52 @@ def test_paged_attn(
     torch.testing.assert_close(triton_output, torch_output, rtol=1e-02, atol=1e-02)
 
 
+# test_paged_attn stops at SEQ_LEN=1024, a single 1024-token partition, so it
+# only ever reaches the V1 kernels. SEQ_LEN=4096 spans four partitions, which
+# dispatches to the V2 (partitioned + reduce) kernels; the spy fails the test
+# if a dispatch change ever routes these cases back to V1.
+@pytest.mark.parametrize("B", [1, 4])
+@pytest.mark.parametrize("H_Q, H_KV", [(1, 1), (8, 1)])
+@pytest.mark.parametrize(
+    "dtype, kv_cache_dtype, compute_type, output_type",
+    [
+        (torch.bfloat16, torch.bfloat16, tl.bfloat16, torch.bfloat16),
+        (torch.bfloat16, torch.float8_e4m3fnuz, tl.bfloat16, torch.bfloat16),
+    ],
+)
+def test_paged_attn_v2(
+    B, H_Q, H_KV, dtype, kv_cache_dtype, compute_type, output_type, monkeypatch
+):
+    # paged_attention_decode looks up paged_attn_decode_v2 in its module globals.
+    v2_calls = []
+    paged_attn_decode_v2 = paged_attention_decode.__globals__["paged_attn_decode_v2"]
+
+    def spy(*args, **kwargs):
+        v2_calls.append(True)
+        return paged_attn_decode_v2(*args, **kwargs)
+
+    monkeypatch.setitem(paged_attention_decode.__globals__, "paged_attn_decode_v2", spy)
+
+    test_paged_attn(
+        B,
+        H_Q,
+        H_KV,
+        KV_BLK_SZ=16,
+        SEQ_LEN=4096,
+        NUM_BLK=16,
+        dtype=dtype,
+        kv_cache_dtype=kv_cache_dtype,
+        compute_type=compute_type,
+        output_type=output_type,
+    )
+    assert v2_calls, "SEQ_LEN=4096 was expected to dispatch to the V2 kernels"
+
+
 @pytest.mark.parametrize("B, H_Q, H_KV", [(1, 8, 1), (4, 16, 16), (64, 16, 16)])
 @pytest.mark.parametrize("SEQ_LEN", [2048, 8192])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_paged_attn_multi_partition_dispatch(B, H_Q, H_KV, SEQ_LEN, dtype, monkeypatch):
-    """Scalar-scale bf16/fp16 caches spanning several partitions: the result
-    must match the reference and the wrapper must pick the expected V1/V2 path
-    (a PA-DECODE rule where configured, the fallback heuristic otherwise)."""
+    """Check output and V1/V2 choice for bf16/fp16 caches above 1024 tokens."""
     head_size, kv_blk_sz = 128, 16
     compute_type = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16}[dtype]
     num_blocks = (SEQ_LEN + kv_blk_sz - 1) // kv_blk_sz
