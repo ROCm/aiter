@@ -702,6 +702,95 @@ def test_k1_prefill_padded_page_table():
         )
 
 
+def test_k1_table_padded_to_max_model_len():
+    """A block table far wider than any request selects what the trimmed one does.
+
+    vLLM sizes the block table for max_model_len and zero-fills past each
+    request's pages, so K1 sees tens of thousands of columns no row can see.
+    The table here is 4096 pages of 16 wide, which also crosses into the
+    streaming selector. Every request shares one packed cache and differs in
+    its length. Covers the one-row scorer (decode, and decode mixed with a
+    prefill chunk) and the 16-row scorer (one request).
+    """
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    idx = FAMILY_A_INDEXER
+    device = torch.device("cuda")
+    page_size, max_pages, context = 16, 4096, 65536
+    n_blocks = context // idx.compress_ratio
+    assert max_pages * page_size >= 32768
+    torch.manual_seed(0)
+    k_bar = torch.randn(n_blocks, idx.head_dim, dtype=dtypes.bf16, device=device)
+    gen = torch.Generator(device=device)
+    gen.manual_seed(1)
+    index_cache, index_table = pack_paged_cache(
+        k_bar.unsqueeze(1), page_size, generator=gen
+    )
+
+    def run(seq_lens, token_to_req, qpos, what):
+        n_req = len(seq_lens)
+        slen = torch.tensor(seq_lens, dtype=dtypes.i32, device=device)
+        m = token_to_req.shape[0]
+        q = torch.randn(m, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device)
+        ref_ids = qsa_topk_blocks(
+            qsa_indexer_scores(
+                q,
+                k_bar,
+                qpos,
+                slen,
+                token_to_req,
+                idx.compress_ratio,
+                score_scale=FAMILY_A_SCORE_SCALE,
+            ),
+            idx.block_budget,
+        )
+        table = torch.zeros(n_req, max_pages, dtype=dtypes.i32, device=device)
+        table[:, : index_table.shape[1]] = index_table
+        got = qsa_k1_block_ids(
+            q, index_cache, table, token_to_req, qpos, slen, heads=(4,)
+        )
+        _assert_k1_block_ids(ref_ids, got, what)
+
+    decode_lens = [3000, 9000, 30000, context]
+    t2r = torch.arange(len(decode_lens), dtype=dtypes.i32, device=device)
+    run(
+        decode_lens,
+        t2r,
+        torch.tensor(decode_lens, dtype=dtypes.i32, device=device) - 1,
+        "K1 decode on a max_model_len table diverged from the oracle",
+    )
+
+    chunk = 64
+    mixed_lens = [chunk] + decode_lens
+    mixed_t2r = torch.cat(
+        (torch.zeros(chunk, dtype=dtypes.i32, device=device), t2r + 1)
+    )
+    mixed_pos = torch.cat(
+        (
+            torch.arange(chunk, dtype=dtypes.i32, device=device),
+            torch.tensor(decode_lens, dtype=dtypes.i32, device=device) - 1,
+        )
+    )
+    run(
+        mixed_lens,
+        mixed_t2r,
+        mixed_pos,
+        "K1 mixed prefill+decode on a max_model_len table diverged",
+    )
+
+    # Within a 16-row block the last row sees 4 blocks more than the first.
+    # Starting at 2559 puts the first row of every eighth block exactly on a
+    # 32-column tile edge (640 + 32k visible), so a tile skip keyed on the
+    # wrong row drops blocks the later rows must select from (> 512 visible).
+    m, start = 256, 2559
+    run(
+        [start + m],
+        torch.zeros(m, dtype=dtypes.i32, device=device),
+        torch.arange(start, start + m, dtype=dtypes.i32, device=device),
+        "K1 16-row prefill on a max_model_len table diverged",
+    )
+
+
 def test_k1_decode_rejects_invalid_page_ids():
     """The one-row scorer must not load a page id that is not in the cache.
 
