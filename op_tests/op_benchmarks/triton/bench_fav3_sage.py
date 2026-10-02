@@ -13,7 +13,9 @@ import torch
 import triton
 
 import aiter
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
+from aiter.ops.triton._triton_kernels.attention.flash_attn_triton_amd import (
+    flash_attn_3,
+)
 from aiter.ops.triton.attention.fav3_sage import (
     fav3_sage_wrapper_func,
     get_sage_fwd_configs,

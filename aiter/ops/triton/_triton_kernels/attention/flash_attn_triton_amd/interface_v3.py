@@ -2,16 +2,16 @@ from typing import Literal
 
 import torch
 
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.bwd import (
+from aiter.ops.triton._triton_kernels.attention.flash_attn_triton_amd.bwd import (
     attention_backward_triton_impl,
 )
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.fwd_decode import (
+from aiter.ops.triton._triton_kernels.attention.flash_attn_triton_amd.fwd_decode import (
     attention_forward_decode_triton_impl,
 )
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.fwd_prefill import (
+from aiter.ops.triton._triton_kernels.attention.flash_attn_triton_amd.fwd_prefill import (
     attention_forward_prefill_triton_impl,
 )
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import (
+from aiter.ops.triton._triton_kernels.attention.flash_attn_triton_amd.utils import (
     BWD_MODE,
     DEBUG,
     PHILOX_OFFSET,
