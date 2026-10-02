@@ -123,8 +123,8 @@ def run_torch_gather_reduce(grouped, rmap, w, dtype):
 # ------------------------------------------------------------------- tests
 @benchmark()
 def test_g2l_lut(n, E, topk):
-    """EP global->local expert LUT build (single-block Hillis-Steele scan)."""
-    launch = build_moe_g2l_lut_module()
+    """EP global->local expert LUT build (single-block hierarchical scan)."""
+    launch = build_moe_g2l_lut_module(max_experts=512 if n <= 512 else 1024)
     nvt = max(1, n // 4)
     mask = (torch.rand(n) < 0.6).to(I32)
     nvt_t = torch.tensor([nvt], dtype=I32)
@@ -1022,14 +1022,24 @@ def main():
     args = parser.parse_args()
     dmap = {"bf16": torch.bfloat16, "f16": torch.float16}
 
-    # n <= 512: the LUT scan is single-workgroup (MAX_G2L_EXPERTS).
+    # n <= 1024: the LUT scan is single-workgroup (MAX_G2L_EXPERTS).
     summarize(
         "moe_g2l_lut",
         [
             test_g2l_lut(n, E, topk)
-            for n, E, topk in itertools.product(
-                [64, 512], [e for e in args.experts if e <= 512], [2, 8]
-            )
+            for n, E, topk in [
+                *itertools.product(
+                    [64, 512], [e for e in args.experts if e <= 512], [2, 8]
+                ),
+                (511, 128, 8),
+                (513, 128, 8),
+                (640, 160, 8),
+                (768, 192, 8),
+                (896, 56, 16),
+                (1023, 256, 8),
+                (1024, 256, 8),
+                (1024, 512, 8),
+            ]
             if E <= n
         ],
     )

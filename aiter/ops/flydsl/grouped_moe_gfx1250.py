@@ -364,16 +364,18 @@ def _use_fused_quant_preshuffle(
 
 
 @functools.cache
-def _get_compiled_g2l_lut(clear_counter: bool = True):
+def _get_compiled_g2l_lut(max_experts: int = 512, clear_counter: bool = True):
     """Compile and cache the single-block FlyDSL g2l-LUT builder."""
     from aiter.ops.flydsl.kernels.moe_g2l_lut import build_moe_g2l_lut_module
 
-    return build_moe_g2l_lut_module(clear_counter=clear_counter)
+    return build_moe_g2l_lut_module(
+        clear_counter=clear_counter, max_experts=max_experts
+    )
 
 
 # Single-workgroup scan ceiling (matches moe_g2l_lut.MAX_G2L_EXPERTS); larger
 # masks fall back to the torch chain.
-_G2L_MAX_N = 512
+_G2L_MAX_N = 1024
 
 
 _G2L_COUNTER_CACHE: dict[tuple[int, str], torch.Tensor] = {}
@@ -472,11 +474,12 @@ def _build_g2l_lut(
             )
             nvr = torch.empty(1, dtype=torch.int32, device=device)
             _get_compiled_g2l_lut(
+                max_experts=512 if n <= 512 else 1024,
                 clear_counter=not (
                     _flydsl_dispatch_context() is not None
                     and os.environ.get("AITER_TDM_DIRECT_EP_MASK", "1")
                     in ("1", "true", "True")
-                )
+                ),
             )(
                 ptr_arg(mask),
                 ptr_arg(lut),
