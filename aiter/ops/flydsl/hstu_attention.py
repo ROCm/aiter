@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""High-level FlyDSL HSTU Attention Forward API."""
+"""High-level FlyDSL HSTU attention API."""
 
 from __future__ import annotations
 
@@ -43,9 +43,7 @@ _GPU_ARCH = get_rocm_arch()
 
 
 def _str2bool(v: bool | str) -> bool:
-    # Local copy to avoid importing aiter.utility.dtypes at module load: that
-    # pulls in aiter.ops.enum, which triggers a JIT get_module() during the AOT
-    # build (setup.py run_aot) before the module exists -> import-time failure.
+    # Avoid utility.dtypes here because its imports require the AOT module to exist.
     if isinstance(v, bool):
         return v
     if v.lower() in ("yes", "true", "t", "y", "1"):
@@ -55,8 +53,7 @@ def _str2bool(v: bool | str) -> bool:
     raise ValueError(f"Boolean value expected, got {v!r}.")
 
 
-# Tuned kernel configs
-# list of column names in the tuned csv file
+# Tuned forward-kernel CSV schema.
 _CSV_COLUMNS: list[str] = [
     "arch",
     "dtype",
@@ -180,9 +177,7 @@ def _get_tuned_config(
     contextual_seq_len: int,
     has_targets: bool,
 ) -> dict:
-    """
-    Returns the tuned kernel config if it exists for the given parameters.
-    """
+    """Return the tuned forward config for this problem, if present."""
 
     problem_key = _problem_key(
         _GPU_ARCH,
@@ -205,10 +200,7 @@ def _get_default_config(
     head_dim: int,
     hidden_dim: int,
 ) -> dict:
-    """
-    Heuristic config for when tuning is unavailable.
-    Derived from a device sweep over shapes on MI300X.
-    """
+    """Return a forward config for problems without a tuned entry."""
 
     def as_dict(
         block_m: int,
@@ -224,8 +216,7 @@ def _get_default_config(
             "waves_per_eu": waves_per_eu,
         }
 
-    # hidden_dims 96/160/192 don't divide the K/V DMA pass with num_waves=4
-    # This map is required so the kernel still runs for these values.
+    # These dimensions need non-default wave counts to divide the K/V DMA pass.
     non_64_divisible_map = {
         96: (96, 48, 3, 0),
         160: (160, 80, 5, 0),
@@ -234,10 +225,7 @@ def _get_default_config(
     if hidden_dim in non_64_divisible_map:
         return as_dict(*non_64_divisible_map[hidden_dim])
 
-    # Key on the K stride the kernel actually processes: head_dim is rounded up to a
-    # multiple of 64 (HEAD_DIM_K) for the swizzled K LDS tile. Using the unrounded
-    # head_dim here picks too-large a block_n for non-64-aligned dims in the 128-192
-    # (and 192-256) band, which measured ~34% slower on gfx942 (144/176 head dims).
+    # Select by the padded K stride used by the swizzled LDS tile.
     head_dim_k = ((head_dim + 63) // 64) * 64
     dim = max(hidden_dim, head_dim_k)
     if dim >= 256:
@@ -268,7 +256,6 @@ def _compile_launcher(
     num_waves: int | None,
     waves_per_eu: int | None,
 ) -> Callable:
-    #  Config overrides (if provided)
     custom_config: dict = {
         "block_m": block_m,
         "block_n": block_n,
@@ -277,7 +264,6 @@ def _compile_launcher(
     }
     custom_config = {k: v for k, v in custom_config.items() if v is not None}
 
-    # Tuned config entry
     tuned_config = _get_tuned_config(
         dtype_str=dtype_str,
         num_heads=num_heads,
@@ -290,7 +276,6 @@ def _compile_launcher(
         has_targets=has_targets,
     )
 
-    # Default heuristic config
     default_config = _get_default_config(
         hidden_dim=hidden_dim,
         head_dim=head_dim,
@@ -470,7 +455,7 @@ def _validate_bwd_inputs(
     num_targets: torch.Tensor | None,
     max_seq_len: int,
 ) -> tuple[int, int, int, int, str]:
-    """Validate backward inputs, reusing the forward's q/k/v checks.
+    """Validate backward inputs with the shared q/k/v checks.
 
     dout is the upstream gradient of the forward output O, so it must match v's
     (total_tokens, num_heads, hidden_dim) shape and dtype exactly.
@@ -503,13 +488,9 @@ def _validate_bwd_inputs(
     return batch, num_heads, head_dim, hidden_dim, dtype_str
 
 
-# Backward tuned-config plumbing. The backward is two single-writer, fully
-# tile-parallel kernels: a fused dV+dK kernel (KV-owned, both reduce over the query
-# index and share one S recompute) and dQ (Q-owned, reduces over the key index).
-# The two kernels have *different* optimal tile configs, so the tuned CSV carries a `kernel`
-# discriminator column ("dvdk" | "dq") and each resolves its own config independently.
-# There is no dQ read-modify-write to synchronize and thus no sequence-parallel knob
-# to tune.
+# dV/dK owns KV rows; dQ owns query rows. Each single-writer kernel has an
+# independent tuned configuration.
+# CSV tags identify the fused dV+dK kernel and the dQ kernel.
 _BWD_KERNEL_DVDK = "dvdk"
 _BWD_KERNEL_DQ = "dq"
 _BWD_KERNELS = (_BWD_KERNEL_DVDK, _BWD_KERNEL_DQ)
@@ -533,8 +514,7 @@ _BWD_CSV_COLUMNS: list[str] = [
     "duration_us",
 ]
 
-# Columns that identify the *problem* (everything except the tuned tile params +
-# duration_us).
+# Tile columns are excluded from the backward problem key.
 _BWD_TILE_COLUMNS = ("block_m", "block_n", "num_waves", "waves_per_eu")
 
 
@@ -570,7 +550,6 @@ def _bwd_tuned_config_map(tuned_file: str | None = None) -> dict[tuple, dict]:
             "num_waves": int(row["num_waves"]),
             "waves_per_eu": int(row["waves_per_eu"]),
         }
-        # Key on (problem, kernel) so dVdK and dQ tune independently.
         return (problem_key, kernel), duration, kernel_config
 
     default_tuned_file = (
@@ -621,8 +600,7 @@ def _get_bwd_tuned_config(
     contextual_seq_len: int,
     has_targets: bool,
 ) -> dict:
-    """Returns the tuned config for one backward kernel ("dvdk" | "dq"), if the
-    CSV has an entry for this (problem, kernel)."""
+    """Return a backward kernel's tuned config, if present."""
     problem_key = _problem_key(
         _GPU_ARCH,
         dtype_str,
@@ -640,34 +618,10 @@ def _get_bwd_tuned_config(
 
 @functools.lru_cache(maxsize=64)
 def _balance_gather_index(B: int, groups: int, device: str) -> torch.Tensor:
-    """Cached snake (boustrophedon) deal gather index for `_build_balance_perm`.
+    """Map sorted ranks to grid groups with a cached alternating-direction deal.
 
-    The deal is a *fixed* permutation of (B, groups) with no dependence on the
-    sequence lengths, so it is built once per shape instead of once per backward
-    call. The scatter form it replaces,
-
-        slot = group * (B // groups) + round
-        perm[slot] = order
-
-    is equivalent to the gather `perm = order[inv]` with `inv[slot] = rank`, which
-    lets the whole index computation collapse to one cached `index_select`.
-
-    `group` alternates direction every round. A plain round-robin deal
-    (`group = rank % groups`) hands group 0 the longest sequence of *every* round and
-    group 7 the shortest, so group 0 ends up systematically the heaviest -- measured
-    +0.99% over a perfect partition at B=1024 and +8.45% at B=120, against +0.04% /
-    +2.29% for the snake. Reversing every other round costs nothing: it is still a
-    fixed permutation of the shape and still cached here.
-
-    The groups are the unit that matters because `grid_group = block_id % 8` is how
-    MI300X spreads blocks over its 8 XCDs, so each group runs on its own ~38 CUs with
-    its own L2 and the kernel ends when the *busiest group* ends. A model that instead
-    pools all 608 resident workgroups and lets them rebalance globally predicts the
-    sort is worth only 0.5% at B=1024; it is measured at 6.7%.
-
-    Cached by device *string* so one entry per (shape, device) rather than one per
-    tensor, and so a `torch.device` object cannot keep a context alive. B is bounded
-    by the batch sizes a process actually runs, and each entry is 8*B bytes.
+    Alternating the group direction each round distributes long and short
+    sequences across the hardware groups. The mapping depends only on shape.
     """
     rank = torch.arange(B, device=device)
     rnd, pos = rank // groups, rank % groups
@@ -680,31 +634,18 @@ def _balance_gather_index(B: int, groups: int, device: str) -> torch.Tensor:
 
 @functools.lru_cache(maxsize=64)
 def _identity_perm(B: int, device: str) -> torch.Tensor:
-    """Cached identity perm for the unaligned-batch fallback (read-only)."""
+    """Return a cached identity permutation."""
     return torch.arange(B, dtype=torch.int32, device=device)
 
 
 def _build_balance_perm(
     seq_offsets: torch.Tensor, groups: int = NUM_GRID_GROUPS
 ) -> torch.Tensor:
-    """Group-aware sort-by-length permutation for the bwd grid.
+    """Balance quadratic sequence work across contiguous grid groups.
 
-    FlyDSL's grid uses `grid_group = block_id % NUM_GRID_GROUPS`, which partitions
-    the batch into `groups` contiguous chunks. A *naive* descending sort would pile
-    all the long sequences into one group and starve the rest (measured ~2.5x
-    slower). Instead, deal the length-sorted sequences across the groups in a snake
-    order so every group gets a Sum(n^2)-balanced, longest-first (LPT) set -- see
-    `_balance_gather_index` for why the deal snakes rather than cycling. The kernel
-    remaps `batch_idx = perm[batch_idx]`.
-
-    Returns an int32 tensor `perm` of length B where `perm[slot]` is the sequence
-    that grid slot should process. Falls back to identity when the group
-    boundaries don't align to whole batches (B not divisible by `groups`).
-
-    Only the sort is data-dependent; the deal is a fixed permutation of the shape
-    and is cached (see `_balance_gather_index`). That leaves three torch calls --
-    lengths, argsort, gather+cast -- which dispatch 6 device ops rather than 13,
-    since argsort itself expands to a radix sort plus an arange and a memcpy.
+    Sequences are sorted by length, then dealt across groups in alternating
+    directions. `perm[slot]` is the sequence processed by that grid slot.
+    Unaligned batches use identity order because group boundaries split the deal.
     """
     lengths = seq_offsets[1:] - seq_offsets[:-1]
     B = int(lengths.numel())
@@ -716,13 +657,7 @@ def _build_balance_perm(
     return order[inv].to(torch.int32)
 
 
-# Fallback tiles tried after the per-kernel pick, in descending size order. A
-# hidden_dim that is not a multiple of 64 constrains the V DMA (the hidden_dim /
-# vec_v lanes per row must divide the thread block), and on gfx950 the wider dwordx4
-# DMA makes the dO tile divide a 4x larger pass -- num_waves is what buys back both,
-# so these trade block size for a wave count that fits. The forward's equivalent map
-# only has to cover 96/160/192; the backward streams a second (dO) tile, so more of
-# the dim space needs a non-default wave count.
+# Fallbacks trade tile size for wave counts that satisfy K/V and dO DMA divisibility.
 _BWD_FALLBACK_TILES = (
     (96, 48, 3, 0),
     (160, 80, 5, 0),
@@ -739,20 +674,8 @@ _BWD_FALLBACK_TILES = (
 def _get_bwd_default_config(
     kernel: str, *, head_dim: int, hidden_dim: int, arch: str | None = None
 ) -> dict:
-    """Conservative heuristic default when no tuned entry exists.
-
-    Picks the first candidate tile this (head_dim, hidden_dim, arch) actually
-    validates for, so the fallback cannot advertise a config the kernel refuses to
-    build. Per-kernel tuned CSV entries override the result; the per-kernel win
-    comes from the tuned CSV, whose entries are validated per shape.
-
-    The probe passes neutral values for the args that do not enter the tile
-    geometry (head/batch counts, mask extents, alpha, seq len) -- only the dims,
-    the tile, and the arch's DMA width and LDS budget do.
-    """
-    base = (
-        (128, 32, 4, 0) if kernel == _BWD_KERNEL_DVDK else (64, 32, 4, 0)
-    )  # historical pick, kept first so 64-aligned dims are unaffected
+    """Return the first fallback tile valid for these dimensions and architecture."""
+    base = (128, 32, 4, 0) if kernel == _BWD_KERNEL_DVDK else (64, 32, 4, 0)
     candidates = (base, *_BWD_FALLBACK_TILES)
     last_error = None
     for block_m, block_n, num_waves, waves_per_eu in candidates:
@@ -809,15 +732,11 @@ def _compile_bwd_launcher(
     waves_per_eu: int | None,
     has_perm: bool = False,
 ) -> tuple[Callable, Callable]:
-    """Builds the (dV+dK, dQ) launcher pair, resolving tuned -> default -> custom
-    per kernel.
+    """Build dV/dK and dQ launchers with independent kernel configurations.
 
-    Returns two launchers: the fused KV-owned kernel producing BOTH dV and dK from
-    one S recompute (reducing over the query index) and the Q-owned kernel producing
-    dQ. Each resolves its own tile config independently.
+    Explicit overrides take precedence over tuned entries and defaults.
     """
-    # Explicit overrides apply to BOTH kernels (this is what the block-size
-    # override tests and the tuner's per-kernel timing rely on).
+    # Explicit overrides apply to both kernels.
     custom_config: dict = {
         "block_m": block_m,
         "block_n": block_n,
@@ -827,7 +746,6 @@ def _compile_bwd_launcher(
     custom_config = {k: v for k, v in custom_config.items() if v is not None}
 
     def _resolve(kernel: str) -> dict:
-        # Precedence per kernel: explicit override > tuned CSV entry > default.
         tuned_config = _get_bwd_tuned_config(
             kernel=kernel,
             dtype_str=dtype_str,
@@ -889,10 +807,8 @@ def flydsl_hstu_attention_bwd(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """HSTU attention backward: returns (dq, dk, dv).
 
-    Recomputes S = alpha*Q*K^T and sigma from Q,K (nothing is stashed by the
-    forward), then dV = A^T dO, dS = M .* (1/N) sigma(1+S(1-sigma)) .* (dO V^T),
-    dQ = alpha dS K, dK = alpha dS^T Q. Mirrors the forward's conventions
-    (causal-only, {f16,bf16}, alpha-in-score, 1/N on dS, fast-math SiLU).
+    Recomputes `Z = alpha * Q * K^T`, then applies the mask, SiLU derivative,
+    and `1/N` normalization. dV/dK share one score pass; dQ uses a second pass.
     """
     batch, num_heads, head_dim, hidden_dim, dtype_str = _validate_bwd_inputs(
         q=q,
@@ -904,10 +820,6 @@ def flydsl_hstu_attention_bwd(
         max_seq_len=N,
     )
 
-    # Two single-writer kernels (no atomics): the fused dV+dK kernel reduces over
-    # the query index (KV-owned) and produces both families from one S recompute;
-    # dQ reduces over the key index (Q-owned).
-    # Config precedence: explicit overrides > per-kernel tuned CSV > default heuristic.
     dvdk_launcher, dq_launcher = _compile_bwd_launcher(
         batch=batch,
         max_seq_len=N,
@@ -942,8 +854,7 @@ def flydsl_hstu_attention_bwd(
     so_c = seq_offsets.contiguous()
     nt_c = nt.contiguous()
 
-    # Optional group-aware sort-by-length load balancing (see _build_balance_perm).
-    # A dummy 1-elem perm is passed (and never indexed) when disabled.
+    # Disabled kernels receive a dummy permutation that compile-time guards never read.
     if sort_by_length:
         perm_c = _build_balance_perm(so_c).contiguous()
     else:
@@ -1003,16 +914,9 @@ def _make_bwd_kernel_runners(
     sort_by_length: bool = True,
     stream: torch.cuda.Stream | None = None,
 ) -> dict:
-    """Tuning/profiling helper: build the (dV+dK, dQ) launcher pair with an
-    explicit tile config forced on both, and return, per kernel, a zero-arg
-    callable that launches ONLY that kernel plus the output tensors it writes:
-    {"dvdk": (fn, (dv, dk)), "dq": (fn, (dq,))}.
+    """Build independent runners for tuning and validating each backward kernel.
 
-    This lets the tuner time the two backward kernels independently (they have
-    different optimal configs) without going through the public entry point,
-    which always launches both, and read back each kernel's output so a config
-    that compiles but computes garbage can be rejected before it is timed. Not
-    part of the public API.
+    Returns `{"dvdk": (runner, (dv, dk)), "dq": (runner, (dq,))}`.
     """
     batch, num_heads, head_dim, hidden_dim, dtype_str = _validate_bwd_inputs(
         q=q,
@@ -1106,13 +1010,7 @@ def _make_bwd_kernel_runners(
 
 
 class FlydslHstuAttention(torch.autograd.Function):
-    """Differentiable HSTU attention: FlyDSL forward + backward as one autograd op.
-
-    Mirrors the Triton `_AttentionFunction`. forward calls
-    `flydsl_hstu_attention_fwd`; backward calls `flydsl_hstu_attention_bwd` (which
-    launches the KV-owned dV/dK kernel and the Q-owned dQ kernel) and returns grads
-    for (q, k, v) only, with None for the non-tensor / non-differentiable args.
-    """
+    """Differentiable FlyDSL HSTU attention with gradients for q, k, and v."""
 
     @staticmethod
     def forward(
@@ -1128,8 +1026,7 @@ class FlydslHstuAttention(torch.autograd.Function):
         max_attn_len: int,
         contextual_seq_len: int,
     ) -> torch.Tensor:
-        # Supports only the causal and hstu (causal + targets) masks; reject here
-        # rather than in backward.
+        # Reject unsupported masks before saving autograd state.
         if not causal:
             raise ValueError("flydsl_hstu_attention requires causal=True")
 
@@ -1174,8 +1071,7 @@ class FlydslHstuAttention(torch.autograd.Function):
                 ctx.max_attn_len,
                 ctx.contextual_seq_len,
             )
-        # Grad positions match forward args:
-        # (N, alpha, q, k, v, seq_offsets, causal, num_targets, max_attn_len, contextual_seq_len)
+        # Gradient positions match the forward arguments.
         return None, None, dq, dk, dv, None, None, None, None, None
 
 
