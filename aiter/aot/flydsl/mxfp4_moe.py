@@ -183,7 +183,12 @@ def parse_csv(csv_path: str):
                                 "act": p1["act"],
                                 "situ_beta": situ_beta,
                                 "situ_linear_beta": situ_linear_beta,
-                                "swiglu_limit": 7.0,
+                                # The limit is a compile-time closure scalar in
+                                # MXMOE. +inf preserves historical unclamped
+                                # SiLU; SwiGLU retains its default limit of 7.
+                                "swiglu_limit": (
+                                    7.0 if p1["act"] == "swiglu" else float("inf")
+                                ),
                                 "enable_bias": p1["enable_bias"],
                                 "interleave": interleave,
                                 "native_scale_layout": native_scale_layout_for(

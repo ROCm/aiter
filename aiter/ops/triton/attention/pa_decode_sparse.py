@@ -457,6 +457,9 @@ def _decode_num_splits_occ(num_queries, heads_blocks, avg_main, avg_extra, block
     main_tiles = max(1, math.ceil(avg_main / block_k)) if avg_main > 0 else 0
     extra_tiles = max(1, math.ceil(avg_extra / block_k)) if avg_extra > 0 else 0
     tiles = max(1, main_tiles, extra_tiles)
+    if tiles <= 2:
+        # Splitting two tiles saves less than the reduce launch costs.
+        return 1
     if base_wg >= num_sms:
         # Already at least one workgroup per CU without splitting
         return max(1, min(cta_cap, tiles // 4))
@@ -644,7 +647,9 @@ def _pa_decode_sparse_gfx950_gluon(
         prefill_kw["GATHER_CACHE"] = ""
         if main_fmt == extra_fmt == "fp8_dsv4_mla":
             prefill_kw.update(
-                IDX_PREFETCH=True,
+                # Over 64-bit gathers the prefetched ids and the has_invalid redirect
+                # together spill the tile loop.
+                IDX_PREFETCH=use_buffer_load or not has_invalid,
                 SLOT_U32=max(s0, s1) < (1 << 24),
                 KV_LDS_PAD=16,
             )
@@ -656,6 +661,12 @@ def _pa_decode_sparse_gfx950_gluon(
     )
     if one_wg_per_cu:
         waves_per_eu = 1
+
+    # Unpeeled is faster at prefill and, on the 64-bit gathers, unless split-K
+    # leaves each program a few tiles. Decode on buffer loads is faster peeled.
+    row_tiles = max(avg_main, avg_extra) / BLOCK_K
+    short_splits = num_splits > 1 and row_tiles <= 4 * num_splits
+    unpeel = num_queries >= _PREFILL_MIN_ROWS if use_buffer_load else not short_splits
 
     main_splits = num_splits
     if has_extra and avg_main > 0:
@@ -743,6 +754,7 @@ def _pa_decode_sparse_gfx950_gluon(
         EXTRA_USE_BUFFER_LOAD=extra_use_buffer_load,
         IDX_BUFFER_LOAD=idx_use_buffer_load,
         HAS_INVALID=has_invalid,
+        UNPEEL=unpeel,
         num_warps=num_warps,
         waves_per_eu=waves_per_eu,
         **prefill_kw,
@@ -775,6 +787,7 @@ def _pa_decode_sparse_gfx950_gluon(
         NUM_SPLITS=grid_splits,
         HEAD_ALIGNED=True,
         ADAPTIVE_SPLITS=adaptive_splits,
-        num_warps=1,
+        # A 2-split tile spans two warps; more warps would hold duplicate lanes.
+        num_warps=min(4, grid_splits),
     )
     return out
