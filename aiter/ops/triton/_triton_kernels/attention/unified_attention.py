@@ -72,12 +72,15 @@ _kernel_unified_attention_2d_repr = make_kernel_repr(
         "SHUFFLED_KV_CACHE",
         "SPLIT_UNMASKED_LOOP",
         "K_WIDTH",
-        # Block skipping. Both change codegen, so they belong in the name; the
+        # Block skipping. These change codegen, so they belong in the name; the
         # threshold itself does not, because it is a runtime scalar.
         "ENABLE_BLOCK_SKIP",
         "PRELOAD_V",
         "DESCENDING_Q",
         "DYNAMIC_SCHED",
+        # COUNT_SKIPS adds the final atomics, so counted and uncounted builds
+        # are different kernels and must not share a trace name.
+        "COUNT_SKIPS",
     ],
 )
 
@@ -663,10 +666,17 @@ def kernel_unified_attention_2d(
             acc = tl.dot(P.to(V.dtype), V, acc=acc)
 
     if COUNT_SKIPS:
-        # One flush per program, covering both loops. int32 is ample: this
-        # counts TILES, and overflow would need ~2.1e9 of them.
-        tl.atomic_add(skip_counter_ptr + 0, n_tiles_seen)
-        tl.atomic_add(skip_counter_ptr + 1, n_tiles_elided)
+        # One flush per program, covering both loops.
+        #
+        # The ACCUMULATORS above stay int32 -- a single program cannot visit
+        # 2^31 tiles. The DESTINATION is int64 because it is global across every
+        # program, so per-program flushing does not bound it: at BLOCK_Q=32,
+        # TILE_SIZE=64 and 8 KV heads, a 1,048,576-token causal prefill visits
+        # 32768 x 8192 x 8 = 2,147,483,648 tiles, exactly signed-int32 max. An
+        # int32 destination would wrap and the elision ratio this exists to
+        # report would be silently wrong.
+        tl.atomic_add(skip_counter_ptr + 0, n_tiles_seen.to(tl.int64))
+        tl.atomic_add(skip_counter_ptr + 1, n_tiles_elided.to(tl.int64))
 
     # epilogue
     # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.

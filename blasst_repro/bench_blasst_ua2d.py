@@ -69,7 +69,7 @@ def elide_from_kernel(case, threshold):
     """
     if threshold <= 0:
         return 0.0
-    buf = torch.zeros(2, dtype=torch.int32, device=case["q"].device)
+    buf = torch.zeros(2, dtype=torch.int64, device=case["q"].device)
     unified_attention(backend="triton", block_skip_threshold=threshold,
                       skip_counter=buf, **case)
     torch.cuda.synchronize()

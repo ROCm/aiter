@@ -115,7 +115,7 @@ class _UAParams(NamedTuple):
     # Block skipping. 0.0 disables it; see `unified_attention` for what it means
     # and for the paths where it is force-disabled.
     block_skip_threshold: float = 0.0
-    # Optional int32 [2] buffer: [tiles visited, tiles elided].
+    # Optional int64 [2] buffer: [tiles visited, tiles elided].
     skip_counter: torch.Tensor | None = None
 
 
@@ -159,6 +159,14 @@ def unified_attention(
     sinks=None,
     shuffled_kv_cache: bool = False,
     skip_reduce: bool = False,
+    # backend
+    backend: str | None = None,  # "triton" | "gluon"
+    # NOTE: these two come AFTER `backend` deliberately. This function is not
+    # keyword-only, so inserting them before it would re-bind an existing
+    # positional call that passed "triton"/"gluon" as the final argument -- the
+    # string would land in block_skip_threshold and fail the numeric comparison.
+    # New optional parameters go at the end.
+    #
     # Block skipping (off at 0.0). A K/V tile is skipped when every query row in
     # the tile has `tile_max - running_max < log2(threshold)`, i.e. its softmax
     # weights cannot contribute meaningfully. Only whole-tile skips save work,
@@ -171,15 +179,15 @@ def unified_attention(
     # Force-disabled on decode and on sliding-window attention, and rejected on
     # the Gluon backend (see below).
     block_skip_threshold: float = 0.0,
-    # Optional int32 tensor with at least 2 elements, accumulated in place as
+    # Optional int64 tensor with at least 2 elements, accumulated in place as
     # [tiles visited, tiles elided]; their ratio is the achieved elision rate.
+    # int64 because the count is global across all programs: a long-enough
+    # prefill overflows int32 and the ratio goes silently wrong.
     # Passing a buffer IS the opt-in -- there is no flag and no default one,
     # because a module-level buffer would be shared mutable state.
     #
     # Zero it before the launches you want to measure; it is never reset here.
     skip_counter: torch.Tensor | None = None,
-    # backend
-    backend: str | None = None,  # "triton" | "gluon"
 ):
     assert causal, "Only causal attention is supported"
 
@@ -274,10 +282,19 @@ def unified_attention(
     # every decode step for a flag that only ever targeted prefill.
     if block_skip_threshold > 0.0:
         if skip_counter is not None:
-            assert skip_counter.dtype == torch.int32 and skip_counter.numel() >= 2, (
-                "skip_counter must be an int32 tensor with at least 2 elements "
-                f"[tiles_visited, tiles_elided]; got {skip_counter.dtype} with "
-                f"{skip_counter.numel()}"
+            # Contiguity is load-bearing, not hygiene: the kernel indexes this
+            # as a flat pointer (ptr+0, ptr+1). An expanded two-element view
+            # backed by one element satisfies numel() >= 2, and the second
+            # atomic would then write outside its storage.
+            assert (
+                skip_counter.dtype == torch.int64
+                and skip_counter.numel() >= 2
+                and skip_counter.is_contiguous()
+            ), (
+                "skip_counter must be a CONTIGUOUS int64 tensor with at least 2 "
+                f"elements [tiles_visited, tiles_elided]; got {skip_counter.dtype} "
+                f"with {skip_counter.numel()} elements, "
+                f"contiguous={skip_counter.is_contiguous()}"
             )
             assert skip_counter.device == q.device, (
                 f"skip_counter is on {skip_counter.device} but q is on {q.device}"
