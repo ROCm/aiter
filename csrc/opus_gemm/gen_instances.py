@@ -187,11 +187,23 @@ INPUT_DTYPE_MAP = {
     "a8w8_scale": ("fp8_t", "fp8_t"),
     "a8w8_mxscale": ("fp8_t", "fp8_t"),
     "a8w8_mxscale_bmm_flatmm_splitk": ("fp8_t", "fp8_t"),
+    "a8w8_mxscale_bmm_bpreshuffle": ("fp8_t", "fp8_t"),
+    "a8w8_mxscale_bmm_bpreshuffle_bcast": ("fp8_t", "fp8_t"),
+    "a8w8_mxscale_bmm_bpreshuffle_bdirect": ("fp8_t", "fp8_t"),
+    "a8w8_mxscale_bmm_bpreshuffle_bdirect_tilen": ("fp8_t", "fp8_t"),
+    "a8w8_mxscale_bmm_bpreshuffle_blds": ("fp8_t", "fp8_t"),
+    "a8w8_mxscale_bmm_bpreshuffle_allwave": ("fp8_t", "fp8_t"),
+    "a8w8_mxscale_bmm_bpreshuffle_sfmpack": ("fp8_t", "fp8_t"),
+    "a8w8_mxscale_bmm_bpreshuffle_wave8n4": ("fp8_t", "fp8_t"),
+    "a8w8_mxscale_bmm_bpreshuffle_wavetm1": ("fp8_t", "fp8_t"),
+    "a8w8_mxscale_bmm_bpreshuffle_wavetm1_blds": ("fp8_t", "fp8_t"),
+    "a8w8_mxscale_bmm_bpreshuffle_wave1": ("fp8_t", "fp8_t"),
     "a8w8_mxscale_bmm_fused": ("fp8_t", "fp8_t"),
     "a8w8_mxscale_bmm_minterleave": ("fp8_t", "fp8_t"),
     "a8w8_mxscale_bmm_mouter": ("fp8_t", "fp8_t"),
     "a8w8_mxscale_bmm_mouter_tunable": ("fp8_t", "fp8_t"),
     "a8w8_mxscale_bmm_pipeline": ("fp8_t", "fp8_t"),
+    "a8w8_mxscale_bmm_pipeline_bpreshuffle": ("fp8_t", "fp8_t"),
     "a8w8_mxscale_bmm_wave8n2": ("fp8_t", "fp8_t"),
     "a8w8_mxscale_bmm_wave4m2_selfload": ("fp8_t", "fp8_t"),
     "a8w8": ("fp8_t", "fp8_t"),
@@ -232,18 +244,75 @@ KARGS_NAME_MAP = {
 
 
 def _kargs_template_vars(kernel_tag, kargs_name):
+    # a8w8_mxscale BMM flatmm splitK kernel has two extra compile-time booleans
+    # (DIRECT_ONLY, PREFETCH_SCALE) plus a non-void D_OUT after Traits. The fused
+    # host TU must forward-declare all four template params so the launcher body
+    # (which launches gemm_a8w8_mxscale_flatmm_splitk_kernel<Traits, D_OUT, dir,
+    # pfk>) compiles without pulling in the device pipeline header.
+    # The tags sharing gemm_a8w8_mxscale_flatmm_splitk_kernel carry a 6th and 7th
+    # parameter, SHUFFLE_SCALE and SF_SHUF_IN_LDS, which the others' kernels do not
+    # declare -- so this list tracks the KERNEL_FUNC_MAP grouping and not the
+    # parameter count. No defaults, deliberately: a missing site must be a
+    # compile error rather than a silent link against the non-panel kernel.
     if kernel_tag in (
         "a8w8_mxscale_bmm_flatmm_splitk",
         "a8w8_mxscale_bmm_fused",
+        "a8w8_mxscale_bmm_bpreshuffle_bdirect",
+        "a8w8_mxscale_bmm_bpreshuffle_bdirect_tilen",
+        "a8w8_mxscale_bmm_bpreshuffle_blds",
+        "a8w8_mxscale_bmm_bpreshuffle_allwave",
+    ):
+        return (
+            "",
+            (
+                ", typename D_OUT, bool DIRECT_ONLY, bool PREFETCH_SCALE,"
+                " bool PRELOAD_SF_LDS, bool SHUFFLE_SCALE, bool SF_SHUF_IN_LDS"
+            ),
+            kargs_name,
+        )
+    if kernel_tag in (
+        "a8w8_mxscale_bmm_bpreshuffle",
+        "a8w8_mxscale_bmm_bpreshuffle_bcast",
+        "a8w8_mxscale_bmm_bpreshuffle_sfmpack",
+        "a8w8_mxscale_bmm_bpreshuffle_wave1",
     ):
         return (
             "",
             ", typename D_OUT, bool DIRECT_ONLY, bool PREFETCH_SCALE, bool PRELOAD_SF_LDS",
             kargs_name,
         )
+    # The wave8 family shares one kernel that carries a 6th through 9th
+    # parameter: SFA_MPACK_GLOBAL, XCD_WGM, SHUFFLE_SCALE and SF_SHUF_IN_LDS. No
+    # defaults here either -- the fused host TU pulls in one decl per kid and a
+    # default argument may appear only once per TU. The launchers pass all four.
+    if kernel_tag in (
+        "a8w8_mxscale_bmm_bpreshuffle_wave8n4",
+        "a8w8_mxscale_bmm_bpreshuffle_wavetm1",
+        "a8w8_mxscale_bmm_bpreshuffle_wavetm1_blds",
+    ):
+        return (
+            "",
+            (
+                ", typename D_OUT, bool DIRECT_ONLY, bool PREFETCH_SCALE,"
+                " bool PRELOAD_SF_LDS, bool SFA_MPACK_GLOBAL, int XCD_WGM,"
+                " bool SHUFFLE_SCALE, bool SF_SHUF_IN_LDS"
+            ),
+            kargs_name,
+        )
+    # BMM M-tile-interleaved kernel: <Traits, D_OUT, bool SKIP_SCALE_WAIT>. The
+    # fused host TU must forward-declare all three template params so the launcher
+    # body's gemm_a8w8_mxscale_flatmm_minterleave_kernel<Traits, D_OUT, skip>
+    # <<<...>>> call compiles without the device pipeline header.
     if kernel_tag == "a8w8_mxscale_bmm_minterleave":
         return "", ", typename D_OUT, bool SKIP_SCALE_WAIT", kargs_name
-    if kernel_tag == "a8w8_mxscale_bmm_pipeline":
+    # BMM specialized pipelines: forward-declare the exact kernel template params
+    # so the fused host TU's <<<...>>> call compiles against only the traits header.
+    if kernel_tag in (
+        "a8w8_mxscale_bmm_pipeline",
+        "a8w8_mxscale_bmm_pipeline_bpreshuffle",
+    ):
+        # scale-pipeline kernels are templated on a single Traits (output dtype is
+        # baked into the traits tuple) -> no extra template params.
         return "", "", kargs_name
     if kernel_tag in (
         "a8w8_mxscale_bmm_mouter",
@@ -710,25 +779,40 @@ class opus_gemm_codegen:
     {{ {kid}, &{kernel_name}<CTYPE> }},  \\
 """
 
+        # The scale-shape check runs before the kid is dispatched, and what shape
+        # is correct depends on the kid: GROUP_N and GROUP_K are 128 or 32. So
+        # the table below travels with the dispatch table rather than the check
+        # hardcoding 128, which is what rejected the first GROUP_K=32 launch.
+        group_entry = """\
+    {{ {kid}, {{ {group_n}, {group_k} }} }},  \\
+"""
+
         rows = sorted(
-            (kid, instance.name)
+            (kid, instance.name, instance.GROUP_N, instance.GROUP_K)
             for family in a8w8_mxscale_bmm_kernel_lists
             for kid, instance in family.items()
             if "fp32_t" in instance.output_dtypes
         )
+
+        def emit(f, macro, fmt, fields):
+            f.write(f"#define {macro} \\\n")
+            for index, row in enumerate(rows):
+                line = fmt.format(**fields(row))
+                if index == len(rows) - 1:
+                    line = line.rstrip().rstrip("\\").rstrip() + "\n"
+                f.write(line)
+            f.write("\n")
+
         with open(
             os.path.join(self.working_path, "opus_bmm_mxscale_kid_dispatch.h"),
             "w",
         ) as f:
             f.write(header)
             f.write(f"#define GENERATE_BMM_MXSCALE_KID_DISPATCH_SIZE {len(rows)}\n")
-            f.write("#define GENERATE_BMM_MXSCALE_KID_DISPATCH(CTYPE) \\\n")
-            for index, (kid, name) in enumerate(rows):
-                line = entry.format(kid=kid, kernel_name=name)
-                if index == len(rows) - 1:
-                    line = line.rstrip().rstrip("\\").rstrip() + "\n"
-                f.write(line)
-            f.write("\n")
+            emit(f, "GENERATE_BMM_MXSCALE_KID_DISPATCH(CTYPE)", entry,
+                 lambda r: {"kid": r[0], "kernel_name": r[1]})
+            emit(f, "GENERATE_BMM_MXSCALE_KID_GROUPS", group_entry,
+                 lambda r: {"kid": r[0], "group_n": r[2], "group_k": r[3]})
 
     def gen_manifest_head(self, kernels_dict):
         # Forward declarations for every launcher symbol the dispatcher references.
