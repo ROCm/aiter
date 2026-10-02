@@ -1149,9 +1149,15 @@ def qsa_k1_block_ids(
     # wider allocation is the padded max_model_len table. Decode (at most
     # 64 rows) reads the widest visible row and dispatches on that. A
     # prefill has too many rows for that readback to pay, and its selector
-    # is already the streaming one, so it keeps the allocation width.
+    # is already the streaming one, so it keeps the allocation width. So
+    # does a graph capture: the readback is not allowed there, and the
+    # graph would replay the width of the capture batch.
     live_columns = n_columns
-    if n_columns > _ONE_WORKGROUP_MAX_ROW_WIDTH and m <= _DECODE_MAX_ROWS:
+    if (
+        n_columns > _ONE_WORKGROUP_MAX_ROW_WIDTH
+        and m <= _DECODE_MAX_ROWS
+        and not torch.cuda.is_current_stream_capturing()
+    ):
         live_columns = _k1_max_visible_columns(
             token_to_req, query_positions, context_lens, n_columns
         )
