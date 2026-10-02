@@ -225,16 +225,23 @@ def _load_sink_logit(ptr_sink, q_head_idx, num_heads_q):
     return fx.Float32(llvm_dialect.load(T.f32, gptr))
 
 
-def _workgroup_coords():
-    """Decode the ``(NUM_XCC * nheads_kv, batch, ceil(n_q_tiles / NUM_XCC))`` grid
-    into ``(block_x, kv_head, batch)``.
+def _workgroup_coords(longest_first):
+    """Decode the launch grid into ``(block_x, kv_head, batch)``.
 
-    Consecutive workgroups are dispatched round-robin over the XCCs, so grid-x
-    phase ``k`` always lands on XCC ``k``: it owns the q tiles ``= k mod NUM_XCC``
-    of every sequence, which balances ragged batches across XCCs. Grid z runs the
-    tile groups in descending order; causal work grows with the q tile, so every
-    XCC dispatches its longest workgroups first and the short ones fill the tail.
+    ``longest_first`` grids are ``(NUM_XCC * nheads_kv, batch, ceil(n_q_tiles /
+    NUM_XCC))``. Consecutive workgroups are dispatched round-robin over the XCCs, so
+    grid-x phase ``k`` always lands on XCC ``k``: it owns the q tiles ``= k mod
+    NUM_XCC`` of every sequence, which balances ragged batches across XCCs. Grid z
+    runs the tile groups in descending order; causal work grows with the q tile, so
+    every XCC dispatches its longest workgroups first and the short ones fill the
+    tail. Other grids are ``(n_q_tiles, nheads_kv, batch)``.
     """
+    if not longest_first:
+        return (
+            fx.Int32(gpu.block_id("x")),
+            fx.Int32(gpu.block_id("y")),
+            fx.Int32(gpu.block_id("z")),
+        )
     gx = fx.Int32(gpu.block_id("x"))
     tile_group = fx.Int32(gpu.grid_dim.z) - fx.Int32(1) - fx.Int32(gpu.block_id("z"))
     block_x = tile_group * fx.Int32(NUM_XCC) + gx % fx.Int32(NUM_XCC)
@@ -1674,7 +1681,7 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
 
             THD: this batch's token ranges come from cu_seqlens.
             """
-            block_x, kv_head, batch = _workgroup_coords()
+            block_x, kv_head, batch = _workgroup_coords(not MASK_LEFT)
             q_start, q_end = _load_seqlen_pair(ptr_cu_seqlens_q, batch)
             kv_start, kv_end = _load_seqlen_pair(ptr_cu_seqlens_k, batch)
             q_len = q_end - q_start
@@ -1811,7 +1818,7 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
         cu_seqlens — nothing transient, so this path is CUDA-graph safe.
         Token base is batch_idx * seq_len.
         """
-        block_x, kv_head, batch = _workgroup_coords()
+        block_x, kv_head, batch = _workgroup_coords(not MASK_LEFT)
 
         # LSE is [B, nheads_q, seq_q]: base = batch*stride_lse_batch; every valid
         # element offset is < base + stride_lse_batch (< the 0x7FFFFFFF drop).
@@ -1892,6 +1899,21 @@ _launch_fns = (
 )  # {(layout, mask_left, mask_right, return_lse, has_sink, gqa_ratio, ...): fn}
 
 
+def _launch_grid(longest_first, n_q_tiles, num_heads_kv, batch_size):
+    """Launch grid decoded by ``_workgroup_coords(longest_first)``.
+
+    Sliding windows have near-uniform per-tile cost, so they keep the tile-major
+    order, whose consecutive workgroups share their overlapping KV windows in L2.
+    """
+    if not longest_first:
+        return fx.Index(n_q_tiles), fx.Index(num_heads_kv), fx.Index(batch_size)
+    return (
+        fx.Index(fx.Uint32(NUM_XCC) * fx.Uint32(num_heads_kv)),
+        fx.Index(batch_size),
+        fx.Index(fx.ceildiv(n_q_tiles, fx.Uint32(NUM_XCC))),
+    )
+
+
 def _llvm_options(mask_left):
     """LLVM options of one launch variant.
 
@@ -1969,14 +1991,13 @@ def _ensure_thd_kernel(
         batch_size: fx.Int32,
         stream: fx.Stream,
     ):
-        # Grid (XCC phase x kv_head, batch, tile group), decoded by
-        # _workgroup_coords. block = 256 (8 waves x wave32).
+        # block = 256 (8 waves x wave32).
         n_q_tiles = fx.ceildiv(
             fx.Uint32(max_seqlen_q * gqa_ratio), fx.Uint32(wg_block_m)
         )
-        grid_x = fx.Index(fx.Uint32(NUM_XCC) * fx.Uint32(num_heads_kv))
-        grid_y = fx.Index(batch_size)
-        grid_z = fx.Index(fx.ceildiv(n_q_tiles, fx.Uint32(NUM_XCC)))
+        grid_x, grid_y, grid_z = _launch_grid(
+            not mask_left, n_q_tiles, num_heads_kv, batch_size
+        )
 
         launcher = kernel(
             ptr_O,
@@ -2080,12 +2101,11 @@ def _ensure_bshd_kernel(
         batch_size: fx.Int32,
         stream: fx.Stream,
     ):
-        # Grid (XCC phase x kv_head, batch, tile group), decoded by
-        # _workgroup_coords. block = 256 (8 waves x wave32).
+        # block = 256 (8 waves x wave32).
         n_q_tiles = fx.ceildiv(fx.Uint32(seq_len_q * gqa_ratio), fx.Uint32(wg_block_m))
-        grid_x = fx.Index(fx.Uint32(NUM_XCC) * fx.Uint32(num_heads_kv))
-        grid_y = fx.Index(batch_size)
-        grid_z = fx.Index(fx.ceildiv(n_q_tiles, fx.Uint32(NUM_XCC)))
+        grid_x, grid_y, grid_z = _launch_grid(
+            not mask_left, n_q_tiles, num_heads_kv, batch_size
+        )
 
         launcher = kernel(
             ptr_O,
