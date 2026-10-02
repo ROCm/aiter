@@ -34,6 +34,9 @@ CLIB_PREFIX = "lib"
 CLIB_EXT = ".so"
 SHARED_FLAG = "-shared"
 
+_SYSTEM_ROCM_INCLUDE = "/opt/rocm/include"
+_ROCPRIM_HEADER = os.path.join("rocprim", "rocprim.hpp")
+
 SUBPROCESS_DECODE_ARGS = ()
 MINIMUM_GCC_VERSION = (5, 0, 0)
 MINIMUM_MSVC_VERSION = (19, 0, 24215)
@@ -196,6 +199,51 @@ def _find_rocm_devel_include() -> str | None:
         if os.path.isdir(inc):
             return inc
     return None
+
+
+def _read_hip_header_version(include_dir: str) -> tuple[int, int] | None:
+    """Read the HIP major/minor version from a ROCm include tree."""
+    version_header = os.path.join(include_dir, "hip", "hip_version.h")
+    try:
+        with open(version_header) as header:
+            content = header.read()
+    except (OSError, UnicodeError):
+        return None
+
+    major = re.search(
+        r"^\s*#\s*define\s+HIP_VERSION_MAJOR\s+(\d+)", content, re.MULTILINE
+    )
+    minor = re.search(
+        r"^\s*#\s*define\s+HIP_VERSION_MINOR\s+(\d+)", content, re.MULTILINE
+    )
+    if major is None or minor is None:
+        return None
+    return int(major.group(1)), int(minor.group(1))
+
+
+def _find_matching_system_rocm_include() -> str | None:
+    """Use system rocPRIM headers only if their HIP version matches hipcc."""
+    if not os.path.isfile(os.path.join(_SYSTEM_ROCM_INCLUDE, _ROCPRIM_HEADER)):
+        return None
+    header_version = _read_hip_header_version(_SYSTEM_ROCM_INCLUDE)
+    if header_version is None:
+        return None
+
+    # ROCM_VERSION can come from an unrelated hipconfig on PATH or even the
+    # system headers themselves. Query the compiler used by the build instead.
+    try:
+        output = subprocess.check_output(
+            [_join_rocm_home("bin", "hipcc"), "--version"],
+            text=True,
+            stderr=subprocess.STDOUT,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError, UnicodeError):
+        return None
+    version = re.search(r"HIP version:\s*(\d+)\.(\d+)\b", output)
+    if version is None or header_version != tuple(map(int, version.groups())):
+        return None
+    return _SYSTEM_ROCM_INCLUDE
 
 
 def _join_rocm_home(*paths) -> str:
@@ -1013,6 +1061,16 @@ def include_paths(cuda: bool = False) -> list[str]:
         devel_include = _find_rocm_devel_include()
         if devel_include is not None and devel_include != rocm_include:
             paths.append(devel_include)
+        # In mixed installations, hipcc may come from the Python ROCm SDK while
+        # rocPRIM and the other development headers come from matching system
+        # packages. Add that tree only when the selected paths lack rocPRIM and
+        # the system headers match the active compiler version.
+        if not any(
+            os.path.isfile(os.path.join(path, _ROCPRIM_HEADER)) for path in paths
+        ):
+            system_include = _find_matching_system_rocm_include()
+            if system_include is not None:
+                paths.append(system_include)
     return paths
 
 
