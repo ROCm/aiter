@@ -198,8 +198,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
         ca_fp8_quant: bool = False,
         prefill_support: bool = False,
     ) -> torch.Tensor:
-        # always try quick reduce first, then custom allreduce,
-        # and then pynccl. (quick reduce just for ROCM MI3*)
+        # Quick reduce, then custom allreduce, then pynccl. (quick reduce just
+        # for ROCM MI3*)
         qr_comm = self.qr_comm
         if (
             qr_comm is not None
