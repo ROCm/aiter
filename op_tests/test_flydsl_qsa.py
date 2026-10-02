@@ -403,16 +403,60 @@ def bench_qsa_family_a_plumbing(m, seq_len, page_size, dtype, rotate=0):
     }
 
 
-def _set_mismatch_ratio(ref: torch.Tensor, got: torch.Tensor) -> float:
-    """Fraction of rows whose non-(-1) id sets differ."""
-    miss = 0
-    rows = ref.shape[0]
-    for i in range(rows):
-        a = set(ref[i].tolist()) - {-1}
-        b = set(got[i].tolist()) - {-1}
-        if a != b:
-            miss += 1
-    return miss / rows if rows else 0.0
+def _set_mismatch_ratio(
+    ref: torch.Tensor,
+    got: torch.Tensor,
+    scores: torch.Tensor | None = None,
+) -> float:
+    """Fraction of rows whose selected ids are not the oracle top-k.
+
+    Without ``scores`` the id sets must be equal. With ``scores`` (the
+    oracle row that produced ``ref``), a different id is accepted when
+    its score is at least one fp32 ulp below the worst score ``ref``
+    kept and every strictly better id is still kept. That is an exact
+    tie, or the one-ulp boundary a bf16 dot can land on either side of.
+    A block any lower still counts as a miss.
+    """
+    if scores is None:
+        miss = 0
+        rows = ref.shape[0]
+        for i in range(rows):
+            a = set(ref[i].tolist()) - {-1}
+            b = set(got[i].tolist()) - {-1}
+            if a != b:
+                miss += 1
+        return miss / rows if rows else 0.0
+
+    rows, n_blocks = scores.shape
+    if rows == 0:
+        return 0.0
+    in_range = ((ref < 0) | (ref < n_blocks)).all(dim=1) & (
+        (got < 0) | (got < n_blocks)
+    ).all(dim=1)
+    last = n_blocks - 1
+    ref_idx = ref.clamp(0, last)
+    got_idx = got.clamp(0, last)
+    ref_scores = scores.gather(1, ref_idx).masked_fill(ref < 0, float("inf"))
+    kth = ref_scores.min(dim=1).values
+    floor = torch.nextafter(kth, torch.full_like(kth, float("-inf")))
+    got_scores = scores.gather(1, got_idx)
+    got_valid = got >= 0
+    bad_score = got_valid & (
+        ~torch.isfinite(got_scores) | (got_scores < floor.unsqueeze(1))
+    )
+    selected = torch.zeros(rows, n_blocks, dtype=torch.bool, device=scores.device)
+    # A padded slot clamps to column 0. Scatter that False and it wipes a
+    # real selection of block 0, so only the in-range ids are marked.
+    safe = got_valid & (got < n_blocks)
+    row_idx = torch.arange(rows, device=scores.device).unsqueeze(1).expand_as(got)
+    selected[row_idx[safe], got[safe]] = True
+    n_got = got_valid.sum(dim=1)
+    n_ref = (ref >= 0).sum(dim=1)
+    count_bad = (selected.sum(dim=1) != n_got) | (n_got != n_ref)
+    required = torch.isfinite(scores) & (scores > kth.unsqueeze(1))
+    missing = (required & ~selected).any(dim=1)
+    miss = bad_score.any(dim=1) | ~in_range | count_bad | missing
+    return float(miss.sum().item()) / rows
 
 
 def _k1_row_is_packed(row: torch.Tensor) -> str | None:
@@ -1984,7 +2028,7 @@ def bench_qsa_family_a_k1(m, seq_len, page_size, dtype, rotate=0, pad_pages=0):
         rotate=rotate,
         heads=(4,),
     )
-    k1_err = _set_mismatch_ratio(ref_ids, block_ids)
+    k1_err = _set_mismatch_ratio(ref_ids, block_ids, ref_scores)
 
     (_indices, vllm_ids), vllm_us = _time(
         qsa_select_paged_tokens,
@@ -1998,7 +2042,7 @@ def bench_qsa_family_a_k1(m, seq_len, page_size, dtype, rotate=0, pad_pages=0):
         idx.compress_ratio,
         rotate=rotate,
     )
-    vllm_err = _set_mismatch_ratio(ref_ids, vllm_ids)
+    vllm_err = _set_mismatch_ratio(ref_ids, vllm_ids, ref_scores)
 
     flops = 2 * m * idx.n_heads * idx.head_dim * n_blocks
     nbytes = (m * idx.n_heads * idx.head_dim + n_blocks * idx.head_dim) * dtype.itemsize
@@ -2399,7 +2443,7 @@ def bench_qsa_family_b_k1(
         rotate=rotate,
         score_scale=score_scale,
     )
-    k1_err = _set_mismatch_ratio(ref_ids, block_ids)
+    k1_err = _set_mismatch_ratio(ref_ids, block_ids, ref_scores)
 
     flops = 2 * m * idx.n_heads * idx.head_dim * n_blocks
     nbytes = (m * idx.n_heads * idx.head_dim + n_blocks * idx.head_dim) * dtype.itemsize
