@@ -3,15 +3,20 @@
 
 """FlyDSL QSA K1: short-context emit or unfused score + top-512.
 
-When ``n_columns <= 512``, every visible block is selected and the emit
-kernel writes its id without scoring. Longer rows use independent
-16/32-column BF16 MFMA scorer workgroups, an fp32 ``[M, n_columns]`` score
-buffer, and a per-row selector. Rows narrower than 32768 columns use the
-stable decode radix; wider rows use streaming radix with ``tie='low'``.
-Single-request prefill batches 16 rows per scorer workgroup, except
-gfx942 with 8 heads: that tile is 73792 bytes and gfx942 has 65536, so
-it stays on the one-row scorer. Decode and multi-request inputs keep the
-one-row scorer. BLOCK_N=32 is the measured default for both.
+When every row has at most 512 visible blocks, the emit kernel writes
+those ids without scoring. A block table padded out to ``max_model_len``
+still emits: the decision is the widest visible row, not the allocation.
+Longer rows use independent 16/32-column BF16 MFMA scorer workgroups and
+an fp32 score buffer the width of the table. The selector sees only the
+live prefix. A padded allocation with at most 64 rows and at most
+20000 live columns uses the one-workgroup decode radix; more rows keep
+the streaming selector. A wider live prefix uses the stable decode
+radix below 32768 columns and streaming radix (``tie='low'``) at or
+above that. Single-request prefill batches 16
+rows per scorer workgroup, except gfx942 with 8 heads: that tile is
+73792 bytes and gfx942 has 65536, so it stays on the one-row scorer.
+Decode and multi-request inputs keep the one-row scorer. BLOCK_N=32 is
+the measured default for both.
 
 Every shape this serves shares one indexer contract, so the only thing that
 varies is the accepted head count. Callers pin it through ``heads``: pass
@@ -41,7 +46,10 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
     buf_base_i64,
     buf_copy_atom,
 )
-from aiter.ops.flydsl.topk.topk_per_row import flydsl_top_k_per_row_decode
+from aiter.ops.flydsl.topk.topk_per_row import (
+    _ONE_WORKGROUP_MAX_ROW_WIDTH,
+    flydsl_top_k_per_row_decode,
+)
 from aiter.ops.topk_select import topk_select
 
 # The indexer contract this module implements, rather than any one model's
@@ -57,6 +65,9 @@ _D = 128
 _R = 4
 _KV_HEADS = 1
 _STREAM_SELECT_MIN_COLUMNS = 32768
+# topk_select's decode gate for k=512 is rows <= 64. Above that, one
+# workgroup per row loses to the streaming selector.
+_DECODE_MAX_ROWS = 64
 _SCORE_HEADS = (4, 8)
 _SCORE_SCALE = _D**-0.5
 
@@ -808,6 +819,99 @@ def _k1_uses_prefill_scorer(
     return not (arch.startswith("gfx942") and n_heads == 8)
 
 
+@lru_cache(maxsize=1)
+def _active_columns_plan():
+    """One thread, the widest visible column count, matching the scorers."""
+
+    @flyc.kernel(
+        name="qsa_k1_active_columns",
+        known_block_size=[1, 1, 1],
+    )
+    def qsa_k1_active_columns_kernel(
+        token_to_req: fx.Tensor,
+        query_positions: fx.Tensor,
+        context_lens: fx.Tensor,
+        out: fx.Tensor,
+        n_columns: Int32,
+        n_req: Int32,
+        rows: Int32,
+    ):
+        zero = Int32(0)
+        one = Int32(1)
+        for _row, state in range(zero, rows, one, init=[zero]):
+            local = state[0]
+            row = Int32(_row)
+            req = token_to_req[row]
+            valid_req = (req >= zero) & (req < n_req)
+            safe_req = valid_req.select(req, zero)
+            qpos = query_positions[row]
+            slen = valid_req.select(context_lens[safe_req], zero)
+            vis_q = _idiv(qpos + one, Int32(_R))
+            vis_s = _idiv(slen, Int32(_R))
+            visible = (vis_q < vis_s).select(vis_q, vis_s)
+            visible = (visible < n_columns).select(visible, n_columns)
+            visible = valid_req.select(visible, zero)
+            local = (visible > local).select(visible, local)
+            results = yield [local]
+        out[zero] = results
+
+    @flyc.jit
+    def launch_qsa_k1_active_columns(
+        token_to_req: fx.Tensor,
+        query_positions: fx.Tensor,
+        context_lens: fx.Tensor,
+        out: fx.Tensor,
+        n_columns: Int32,
+        n_req: Int32,
+        rows: Int32,
+        stream: fx.Stream,
+    ):
+        qsa_k1_active_columns_kernel(
+            token_to_req,
+            query_positions,
+            context_lens,
+            out,
+            n_columns,
+            n_req,
+            rows,
+        ).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
+
+    return launch_qsa_k1_active_columns
+
+
+def _k1_max_visible_columns(
+    token_to_req: torch.Tensor,
+    query_positions: torch.Tensor,
+    context_lens: torch.Tensor,
+    n_columns: int,
+) -> int:
+    """Widest visible column count, using the scorer's per-row formula.
+
+    One device reduction and one 4-byte readback. Callers only pay it for
+    a decode-sized batch whose allocation is wider than the one-workgroup
+    selector, which is the padded ``max_model_len`` table. A packed table
+    at or under that width already dispatches on its real column count,
+    and a prefill keeps the allocation width.
+    """
+    rows = int(token_to_req.shape[0])
+    n_req = int(context_lens.shape[0])
+    if rows == 0 or n_req == 0 or n_columns <= 0:
+        return 0
+    scratch = torch.empty(1, dtype=torch.int32, device=token_to_req.device)
+    _run_compiled(
+        _active_columns_plan(),
+        token_to_req,
+        query_positions,
+        context_lens,
+        scratch,
+        int(n_columns),
+        n_req,
+        rows,
+        torch.cuda.current_stream(token_to_req.device),
+    )
+    return int(scratch.item())
+
+
 def qsa_k1_score_and_select(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -819,14 +923,19 @@ def qsa_k1_score_and_select(
     n_columns: int,
     score_scale: float,
     n_heads: int,
+    live_columns: int | None = None,
 ) -> torch.Tensor:
     """Score long rows into ``[M, n_columns]`` and write top-512 ids into ``out``.
 
     ``n_heads`` is 4 or 8, each a separate compile. One request with
     ``M >= 16`` uses the 16-row scorer, except gfx942 H=8, which stays
-    on the one-row scorer. Selection is the stable decode radix below
-    32768 columns and streaming radix (``tie='low'``) at or above that
-    width.
+    on the one-row scorer. ``live_columns`` is the widest visible row.
+    The score buffer stays the width of the table, and the selector sees
+    that prefix. A padded table with at most 64 rows and at most 20000
+    live columns uses the one-workgroup decode radix. More rows keep the
+    streaming selector. A packed table keeps the old split: stable decode
+    radix below 32768 columns, streaming radix (``tie='low'``) at or
+    above that.
     """
     if n_heads not in _SCORE_HEADS:
         raise ValueError(f"score heads must be {_SCORE_HEADS}, got {n_heads}")
@@ -884,25 +993,44 @@ def qsa_k1_score_and_select(
             score_tiles,
             torch.cuda.current_stream(q.device),
         )
-    if n_columns >= _STREAM_SELECT_MIN_COLUMNS:
-        topk_select(
-            scores,
-            _K,
-            end=row_lens,
-            output_idx=out,
-            tie="low",
+    select_columns = n_columns if live_columns is None else int(live_columns)
+    if select_columns < 1 or select_columns > n_columns:
+        raise ValueError(
+            f"live_columns must be in 1..{n_columns}, got {select_columns}"
         )
-    else:
+    # The prefix is contiguous in each row (stride 1). Narrowing it is what
+    # lets a padded allocation take the short-row selector: that dispatch
+    # reads the tensor width, not row_lens. One workgroup per row is the
+    # decode shape (at most 64 rows). A prefill has too many rows for that
+    # kernel, so it keeps the streaming selector, on the live prefix.
+    scored = (
+        scores if select_columns == n_columns else scores.narrow(1, 0, select_columns)
+    )
+    narrowed = select_columns < n_columns
+    one_workgroup = (
+        narrowed
+        and select_columns <= _ONE_WORKGROUP_MAX_ROW_WIDTH
+        and m <= _DECODE_MAX_ROWS
+    )
+    if one_workgroup or (not narrowed and select_columns < _STREAM_SELECT_MIN_COLUMNS):
         flydsl_top_k_per_row_decode(
-            scores,
+            scored,
             1,
             row_lens,
             out,
             m,
-            scores.stride(0),
-            scores.stride(1),
+            scored.stride(0),
+            scored.stride(1),
             k=_K,
             stable=True,
+        )
+    else:
+        topk_select(
+            scored,
+            _K,
+            end=row_lens,
+            output_idx=out,
+            tie="low",
         )
     return out
 
@@ -1016,7 +1144,18 @@ def qsa_k1_block_ids(
     context_lens = context_lens.contiguous()
     page_size = k_cache.shape[1]
     n_columns = page_table.shape[1] * page_size
-    if n_columns <= _K:
+    # A packed table at or under the one-workgroup cutoff already names its
+    # real width, so emit and the selector see it without a readback. A
+    # wider allocation is the padded max_model_len table. Decode (at most
+    # 64 rows) reads the widest visible row and dispatches on that. A
+    # prefill has too many rows for that readback to pay, and its selector
+    # is already the streaming one, so it keeps the allocation width.
+    live_columns = n_columns
+    if n_columns > _ONE_WORKGROUP_MAX_ROW_WIDTH and m <= _DECODE_MAX_ROWS:
+        live_columns = _k1_max_visible_columns(
+            token_to_req, query_positions, context_lens, n_columns
+        )
+    if live_columns <= _K:
         _run_compiled(
             _emit_plan(page_size),
             token_to_req,
@@ -1040,5 +1179,6 @@ def qsa_k1_block_ids(
             int(n_columns),
             float(score_scale),
             int(q.shape[1]),
+            live_columns=live_columns,
         )
     return out
