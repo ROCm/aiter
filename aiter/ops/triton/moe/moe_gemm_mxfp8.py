@@ -138,6 +138,9 @@ def moe_gemm_mxfp8(
         None,
         None,
         None,
+        # per-token / per-expert scales (not used)
+        None,
+        None,
         # bias
         bias,
         bias_stride,
