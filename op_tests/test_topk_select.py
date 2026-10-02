@@ -191,7 +191,7 @@ def test_half_invariants(m, n):
     return failures
 
 
-def _run_single_backend(x, row_lens, k, backend):
+def _run_single_backend(x, row_lens, k, backend, end=None, output_idx=None):
     """Call one backend through the entry by hiding the others from it.
 
     Asserts that the entry really used it. It did not, once: the dispatch tail
@@ -212,14 +212,77 @@ def _run_single_backend(x, row_lens, k, backend):
     try:
         rows, width = x.shape
         wave = wave_size_of(x.device.index)
-        served = ts._available(width, k, wave, False) & {backend}
+        served = ts._available(width, k, wave, end is not None) & {backend}
         picked = ts.topk_select_backend(rows, width, k, served)
         if picked != backend:
             raise AssertionError(f"asked for {backend}, the dispatch chose {picked}")
-        return topk_select(x, k)[1]
+        return topk_select(x, k, end=end, output_idx=output_idx)[1]
     finally:
         ts._BACKENDS_BY_TIE = keep
         ts._choose.cache_clear()
+
+
+# One shape per route, each forced onto the backend named.
+_STRIDED_ROUTES = (
+    ("argmax", 8, 4096, 1, dtypes.fp32),
+    ("argmax", 8, 4096, 1, dtypes.bf16),
+    ("small_k", 8, 4096, 16, dtypes.fp32),
+    ("plain", 8, 4096, 2048, dtypes.fp32),  # register copy, 4 per lane
+    ("plain", 64, 8192, 2048, dtypes.fp32),  # register copy, wide first digit
+    ("plain", 8, 16384, 2048, dtypes.fp32),  # LDS tail with the sampled stage
+    ("plain", 8, 32768, 2048, dtypes.fp32),  # LDS tail
+    ("plain", 64, 32768, 512, dtypes.fp32),  # generic radix
+    ("sampled", 64, 32768, 2048, dtypes.fp32),
+    ("stream", 64, 32768, 512, dtypes.fp32),
+    ("stream", 8, 2050, 2048, dtypes.fp32),  # small reject on gfx950
+    ("decode", 4, 32768, 2048, dtypes.fp32),
+)
+
+
+def test_strided_layouts():
+    """Row-strided `input`, `end` and `output_idx` on every route.
+
+    The entry checks their shapes and dtypes and nothing about their strides.
+    `plain` read a column slice of a wider tensor as dense rows, several
+    backends wrote dense rows into a strided `output_idx` or read a strided
+    `end` as dense, and all of them returned plausible tensors.
+    """
+    failures = []
+    for backend, m, n, k, dtype in _STRIDED_ROUTES:
+        for layout in ("input", "input+end", "output", "end"):
+            torch.manual_seed(0)
+            x = torch.randn(m, n, dtype=dtype)
+            if layout.startswith("input"):
+                x = torch.zeros(m, n + 64, dtype=dtype)[:, :n].copy_(x)
+            ragged = layout in ("input+end", "end")
+            lens = (
+                torch.randint(k, n + 1, (m,), dtype=dtypes.i32)
+                if ragged
+                else torch.full((m,), n, dtype=dtypes.i32)
+            )
+            end = None
+            if ragged:
+                end = lens if layout == "input+end" else torch.stack([lens, lens], 1)[:, 0]
+            guard, out = None, None
+            if layout == "output":
+                guard = torch.full((m, k + 32), -7, dtype=dtypes.i32)
+                out = guard[:, :k]
+            label = f"{backend} {m}x{n} k={k} {dtype} strided {layout}"
+            try:
+                idx = _run_single_backend(x, lens, k, backend, end=end, output_idx=out)
+                torch.cuda.synchronize()
+            except Exception as e:
+                failures.append(f"{label}: {type(e).__name__}: {e}")
+                continue
+            if not torch.equal(_sorted_values(x, idx), run_torch(x, lens, k)):
+                failures.append(f"{label}: wrong selection")
+            if guard is not None and not (
+                bool((guard[:, k:] == -7).all()) and idx.data_ptr() == out.data_ptr()
+            ):
+                failures.append(f"{label}: not written into output_idx in place")
+    for label in failures:
+        aiter.logger.error("STRIDED LAYOUT FAILED: %s", label)
+    return failures
 
 
 def test_lds_sizing():
@@ -463,6 +526,11 @@ def main():
         "half-format invariants: %s",
         "all hold" if not bad else f"{len(bad)} FAILED: {bad}",
     )
+    bad = test_strided_layouts()
+    aiter.logger.info(
+        "strided layouts: %s", "all hold" if not bad else f"{len(bad)} FAILED: {bad}"
+    )
+    assert not bad, f"strided layouts: {len(bad)} failed"
 
     df = [
         test_topk_argmax_half(m, n, dtype)

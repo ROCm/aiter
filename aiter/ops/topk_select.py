@@ -771,14 +771,15 @@ def topk_select(
     most of the time spent. Pass ``return_value=True`` to get them.
 
     Args:
-        input: ``[rows, width]``, inner stride 1. float32 at any ``topk``;
-            bfloat16 and float16 at ``topk=1`` only.
+        input: ``[rows, width]``, inner stride 1, any row stride. float32 at
+            any ``topk``; bfloat16 and float16 at ``topk=1`` only.
         topk: elements to select per row.
         sorted: sort the returned values descending. Done on the host.
         end: ``[rows]`` int32 exclusive right bound per row, DeepSelect's
             ``end``; this is each row's live length. Defaults to the full width.
         sorted_index: sort the returned indices ascending. Done on the host.
-        output_idx: ``[rows, topk]`` int32 to write into; allocated if omitted.
+        output_idx: ``[rows, topk]`` int32 to write into, any layout; allocated
+            if omitted.
         output_idx_offset: ``[rows]`` int32 added to every live index.
         return_value: gather the selected scores and return them. Off by
             default; see above. ``sorted`` still works without it -- the values
@@ -825,6 +826,8 @@ def topk_select(
     row_lens = _full_rows(rows, width, input.device) if end is None else end
     if row_lens.shape != (rows,) or row_lens.dtype != torch.int32:
         raise ValueError(f"end must be int32 [{rows}], got {tuple(row_lens.shape)}")
+    # Every backend reads the row ends as one dense array.
+    row_lens = row_lens.contiguous()
     idx = (
         torch.empty((rows, topk), dtype=torch.int32, device=input.device)
         if output_idx is None
@@ -834,6 +837,10 @@ def topk_select(
         raise ValueError(
             f"output_idx must be int32 [{rows}, {topk}], got {tuple(idx.shape)}"
         )
+    if not idx.is_contiguous():
+        # The backends write dense rows of `topk`; the answer is copied into the
+        # caller's buffer at the end, like a reordered one.
+        idx = torch.empty((rows, topk), dtype=torch.int32, device=input.device)
 
     backend = _choose(
         rows,

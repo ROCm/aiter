@@ -101,6 +101,9 @@ def topk_plain(
 
     `topk_out` may be None where `topk_plain_values_optional` holds; the C++
     side refuses it elsewhere rather than writing through a null.
+
+    `x` may have any layout. With `stride0 < 0` the row pitch is taken from `x`
+    itself, not assumed to be the width.
     """
     if topk > _MAX_CAPACITY:
         # `AdaptiveTopK` asserts this at its entry, ahead of any dtype branch,
@@ -110,6 +113,24 @@ def topk_plain(
         raise ValueError(
             f"topk={topk} exceeds this kernel's capacity of {_MAX_CAPACITY}"
         )
+    if not x.is_contiguous():
+        # Only the ranged form reads row r at `r * stride0`, and it also sizes
+        # its launch and scratch by `stride0`, so a strided row is read in place
+        # only there, at unit inner stride and a pitch at least the width. The
+        # uniform form reads rows `width` apart and takes no pitch at all; it,
+        # and every other layout, gets the rows densely.
+        ranged = (
+            rowStarts is not None
+            and rowEnds is not None
+            and rowStarts.numel() > 0
+            and rowEnds.numel() > 0
+        )
+        if ranged and x.stride(-1) == 1 and x.stride(0) >= x.shape[-1]:
+            if stride0 < 0:
+                stride0 = x.stride(0)
+        else:
+            x = x.contiguous()
+            stride0 = -1
     workspace = None
     if x.dtype == torch.float32:
         # Mirror the C++ default: stride0 < 0 means a contiguous last dim.
