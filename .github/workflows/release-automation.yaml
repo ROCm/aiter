@@ -296,6 +296,7 @@ jobs:
       build_py310: true
       build_py312: true
       gpu_archs: 'gfx942;gfx950'
+      gpu_targets: 'gfx942:304;gfx950:256'
       runner: build-only-aiter
       add_date_stamp: false
       use_manylinux: true

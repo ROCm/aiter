@@ -49,10 +49,16 @@ AITER_PYTHON_ROOT_DIR = (
 )
 sys.path.insert(0, os.path.join(AITER_PYTHON_ROOT_DIR, "aiter", "jit", "utils"))
 
+from build_targets import KNOWN_GFX, get_build_archs_env
 from chip_info import get_gfx_runtime
 
-GPU_ARCH = os.environ.get("GPU_ARCHS")
-if GPU_ARCH is None:
+# AITER_GPU_TARGETS outranks GPU_ARCHS for the arch set, as in aiter/jit/core.py.
+# HSACO paths are keyed separately by the live GPU.
+GPU_ARCH = (os.environ.get("GPU_ARCHS") or "").strip()
+_named = get_build_archs_env()
+if _named:
+    GPU_ARCH = ";".join(_named)
+elif not GPU_ARCH:
     GPU_ARCH = get_gfx_runtime()
 AITER_REBUILD = int(os.environ.get("AITER_REBUILD", "0"))
 
@@ -144,16 +150,7 @@ def hip_flag_checker(flag_hip: str) -> bool:
 def validate_and_update_archs():
     archs = GPU_ARCH.split(";")
     archs = [arch.strip().split(":")[0] for arch in archs]
-    # List of allowed architectures
-    allowed_archs = [
-        "native",
-        "gfx90a",
-        "gfx940",
-        "gfx941",
-        "gfx942",
-        "gfx950",
-        "gfx1151",
-    ]
+    allowed_archs = {"native", *KNOWN_GFX}
 
     # Validate if each element in archs is in allowed_archs
     assert all(
@@ -163,11 +160,23 @@ def validate_and_update_archs():
         if archs[i] == "native":
             archs[i] = get_gfx_runtime()
 
-    return archs
+    return sorted(set(archs))
+
+
+@lru_cache(maxsize=1)
+def get_arch_key():
+    """Filename-safe identity of the resolved arch set, for cache paths."""
+    return "+".join(validate_and_update_archs())
+
+
+def get_template_build_dir(folder):
+    # Template libraries contain device code, so a specialization built for one
+    # arch set must never satisfy not_built() for another.
+    return f"{BUILD_DIR}/template_libs/{get_arch_key()}/{folder}"
 
 
 def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
-    sub_build_dir = os.path.join(BUILD_DIR, folder)
+    sub_build_dir = get_template_build_dir(folder)
     include_dir = f"{sub_build_dir}/include"
     if not os.path.exists(include_dir):
         os.makedirs(include_dir, exist_ok=True)
@@ -273,7 +282,7 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
 def run_lib(func_name, folder=None):
     if folder is None:
         folder = func_name
-    lib = ctypes.CDLL(f"{BUILD_DIR}/{folder}/lib.so", os.RTLD_LAZY)
+    lib = ctypes.CDLL(f"{get_template_build_dir(folder)}/lib.so", os.RTLD_LAZY)
     return getattr(lib, func_name)
 
 
@@ -288,7 +297,7 @@ def get_default_func_name(md_name, args: tuple):
 
 
 def not_built(folder):
-    return not os.path.exists(f"{BUILD_DIR}/{folder}/lib.so")
+    return not os.path.exists(f"{get_template_build_dir(folder)}/lib.so")
 
 
 def compile_template_op(
@@ -386,10 +395,14 @@ def compile_hsaco(
     kernel_name,
     hsaco,
     shared=0,
-    gcnArchName=GPU_ARCH,
+    gcnArchName=None,
     constexprs=None,
     extra_metadata=None,
 ):
+    # Default to the live device: HSACOs are compiled and looked up by it, and a
+    # multi-arch GPU_ARCHS has no single directory to write into.
+    if gcnArchName is None:
+        gcnArchName = get_gfx_runtime()
     build_dir = f"{BUILD_DIR}/{gcnArchName}"
     constexprs = OrderedDict(constexprs or {})
     func_name = get_default_func_name(kernel_name, tuple(constexprs.values()))
@@ -421,14 +434,16 @@ def compile_hsaco(
 def check_hsaco(func_name, constexprs=None):
     constexprs = OrderedDict(constexprs or {})
     hsaco_name = get_default_func_name(func_name, tuple(constexprs.values()))
-    return os.path.exists(f"{BUILD_DIR}/{GPU_ARCH}/{hsaco_name}.hsaco")
+    return os.path.exists(f"{BUILD_DIR}/{get_gfx_runtime()}/{hsaco_name}.hsaco")
 
 
 @cache
 def get_hsaco_launcher(hsaco_name, kernel_name):
     from csrc.cpp_itfs.hsaco_launcher import HsacoLauncher, read_hsaco
 
-    hsaco = read_hsaco(f"{BUILD_DIR}/{GPU_ARCH}/{hsaco_name}.hsaco")
+    # Live arch, not the build target: a cross-arch build has no HSACO for the
+    # composite path. get_gfx_runtime() is cached, so it need not be a cache key.
+    hsaco = read_hsaco(f"{BUILD_DIR}/{get_gfx_runtime()}/{hsaco_name}.hsaco")
     hsaco_launcher = HsacoLauncher()
     hsaco_launcher.load_module(hsaco)
     hsaco_launcher.get_function(kernel_name)
@@ -440,7 +455,7 @@ def run_hsaco(
 ):
     constexprs = OrderedDict(constexprs or {})
     hsaco_name = get_default_func_name(func_name, tuple(constexprs.values()))
-    metadata_path = f"{BUILD_DIR}/{GPU_ARCH}/{hsaco_name}.json"
+    metadata_path = f"{BUILD_DIR}/{get_gfx_runtime()}/{hsaco_name}.json"
     if not os.path.exists(metadata_path):
         raise FileNotFoundError(f"Metadata file not found: {metadata_path}")
     with open(metadata_path, "r") as f:

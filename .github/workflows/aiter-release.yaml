@@ -82,6 +82,11 @@ on:
         type: string
         required: false
         default: 'gfx942;gfx950'
+      gpu_targets:
+        description: 'Explicit gfx:cu_num build targets; overrides gpu_archs when set'
+        type: string
+        required: false
+        default: ''
       runner:
         description: 'Build host'
         type: string
@@ -162,6 +167,9 @@ jobs:
       BUILD_DOCKER_IMAGE: ${{ matrix.docker_image }}
       PYTHON_VERSION: ${{ matrix.python_version }}
       GPU_ARCHS: ${{ inputs.gpu_archs || github.event.inputs.gpu_archs }}
+      # workflow_call only, since workflow_dispatch is at GitHub's 10-input cap;
+      # blank resolves to unset, leaving GPU_ARCHS in charge of target selection.
+      AITER_GPU_TARGETS: ${{ inputs.gpu_targets || '' }}
       RELEASE_TYPE: ${{ inputs.release_type || github.event.inputs.release_type || 'none' }}
       ADD_DATE_STAMP: ${{ inputs.add_date_stamp || github.event.inputs.add_date_stamp }}
       USE_MANYLINUX: ${{ inputs.use_manylinux || github.event.inputs.use_manylinux || (startsWith(matrix.docker_image, 'pytorch/manylinux') && 'true') || 'false' }}
@@ -305,6 +313,7 @@ jobs:
             -e SETUPTOOLS_SCM_PRETEND_VERSION="${{ steps.version.outputs.nightly_version }}" \
             -e PREBUILD_KERNELS=1 \
             -e GPU_ARCHS="${{ env.GPU_ARCHS }}" \
+            -e AITER_GPU_TARGETS="${{ env.AITER_GPU_TARGETS }}" \
             -w /workspace \
             aiter_build_${{ matrix.python_version }} \
             bash -c "python3 setup.py bdist_wheel && ls dist/*.whl"
@@ -312,6 +321,7 @@ jobs:
             docker exec \
             -e PREBUILD_KERNELS=1 \
             -e GPU_ARCHS="${{ env.GPU_ARCHS }}" \
+            -e AITER_GPU_TARGETS="${{ env.AITER_GPU_TARGETS }}" \
             -w /workspace \
             aiter_build_${{ matrix.python_version }} \
             bash -c "python3 setup.py bdist_wheel && ls dist/*.whl"
@@ -412,6 +422,7 @@ jobs:
             -e SETUPTOOLS_SCM_PRETEND_VERSION="${PRETEND_VER}" \
             -e PREBUILD_KERNELS=1 \
             -e GPU_ARCHS="${GPU_ARCHS}" \
+            -e AITER_GPU_TARGETS="${AITER_GPU_TARGETS}" \
             -e PYBIN="${PYBIN}" \
             -w /workspace \
             aiter_build_${{ matrix.python_version }} \
