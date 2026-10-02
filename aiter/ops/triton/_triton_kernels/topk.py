@@ -8,7 +8,7 @@
 import triton
 import triton.language as tl
 from triton.language import core
-from triton.language.standard import _log2, zeros_like
+from triton.language.standard import _log2
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
@@ -76,19 +76,22 @@ def _topk_kernel(
         # FILL_VALUE = tl.constexpr(torch.finfo(torch.float32).min)
         vals = tl.load(row_ptr + offs, mask=mask, other=FILL_VALUE).to(tl.float32)
 
+    # Track candidates by index, not by value: a value sentinel cannot be told
+    # apart from a real input equal to it (e.g. -inf in masked logits).
+    valid = offs < M
+    vals = tl.where(valid, vals, FILL_VALUE)
+
     # unrolled exactly K iterations -- no break/continue needed
     for j in core.static_range(0, K):
         vmax = tl.max(vals, axis=0)
-        eq = vals == vmax
-        big = tl.where(
-            eq, tl.zeros_like(idxs), tl.zeros_like(idxs) + BLOCK
-        )  # BLOCK as int64
-        arg = tl.min(idxs + big, axis=0)
+        # lowest index among the remaining candidates equal to the max
+        arg = tl.min(tl.where(valid & (vals == vmax), idxs, BLOCK), axis=0)
 
         tl.store(out_v_ptr + j, vmax)
         tl.store(out_i_ptr + j, arg)
 
-        vals = tl.where(idxs == arg, FILL_VALUE, vals)
+        valid = valid & (idxs != arg)
+        vals = tl.where(valid, vals, FILL_VALUE)
 
 
 # 2-STAGE KERNEL (large rows)
@@ -129,33 +132,29 @@ def topk_stage1_kernel(
         #    torch.finfo(torch.float32).min if DESCENDING else torch.finfo(torch.float32).max
         # )
         x_val = tl.load(x_ptr + cols, mask=mask, other=FILL_VALUE).to(tl.float32)
+
+    # Track candidates by index, not by value: a value sentinel cannot be told
+    # apart from a real input equal to it (e.g. -inf in masked logits).
+    valid = (chunk_offset + cols) < N
+    x_val = tl.where(valid, x_val, FILL_VALUE)
     for k_idx in range(k):
         if DESCENDING:
-            chunk_select_val, chunk_select_idx = tl.max(
-                x_val, axis=0, return_indices=True
-            )
+            chunk_select_val = tl.max(x_val, axis=0)
         else:
-            chunk_select_val, chunk_select_idx = tl.min(
-                x_val, axis=0, return_indices=True
-            )
+            chunk_select_val = tl.min(x_val, axis=0)
+        # lowest index among the remaining candidates equal to the extremum.
+        # Only the last chunk can run out of candidates (CHUNK_SIZE >= k); it
+        # then yields CHUNK_SIZE, i.e. a global index >= N, which stage 2
+        # ranks below every in-range index of equal value.
+        chunk_select_idx = tl.min(
+            tl.where(valid & (x_val == chunk_select_val), cols, CHUNK_SIZE), axis=0
+        )
 
         tl.store(y_ptr + k_idx, chunk_select_val)
         tl.store(index_ptr + k_idx, chunk_select_idx + chunk_offset)
 
-        if DESCENDING:
-            x_val = tl.where(
-                cols == chunk_select_idx,
-                FILL_VALUE,
-                # tl.constexpr(torch.finfo(torch.float32).min),
-                x_val,
-            )
-        else:
-            x_val = tl.where(
-                cols == chunk_select_idx,
-                FILL_VALUE,
-                # tl.constexpr(torch.finfo(torch.float32).max),
-                x_val,
-            )
+        valid = valid & (cols != chunk_select_idx)
+        x_val = tl.where(valid, x_val, FILL_VALUE)
 
 
 @triton.jit
@@ -163,26 +162,6 @@ def _compare_and_swap(x, ids, flip, i: core.constexpr, n_dims: core.constexpr):
     n_outer: core.constexpr = x.numel >> n_dims
     shape: core.constexpr = [n_outer * 2**i, 2, 2 ** (n_dims - i - 1)]
 
-    y = core.reshape(x, shape)
-    y_idx = core.reshape(ids, shape)
-
-    # slice left/right with 'stride' 2**(n_dims - i - 1)
-    mask = core.arange(0, 2)[None, :, None]
-    left = core.broadcast_to(tl.sum(y * (1 - mask), 1)[:, None, :], shape).to(x.dtype)
-    right = core.broadcast_to(tl.sum(y * mask, 1)[:, None, :], shape).to(x.dtype)
-    left = core.reshape(left, x.shape)
-    right = core.reshape(right, x.shape)
-
-    left_idx = core.broadcast_to(tl.sum(y_idx * (1 - mask), 1)[:, None, :], shape).to(
-        ids.dtype
-    )
-    right_idx = core.broadcast_to(tl.sum(y_idx * mask, 1)[:, None, :], shape).to(
-        ids.dtype
-    )
-    left_idx = core.reshape(left_idx, ids.shape)
-    right_idx = core.reshape(right_idx, ids.shape)
-
-    # actual compare-and-swap
     if core.constexpr(x.dtype.primitive_bitwidth) == 8:
         idtype = core.int8
     elif core.constexpr(x.dtype.primitive_bitwidth) == 16:
@@ -193,13 +172,6 @@ def _compare_and_swap(x, ids, flip, i: core.constexpr, n_dims: core.constexpr):
         idtype = core.int64
     else:
         raise ValueError("Unsupported dtype")
-
-    ileft = left.to(idtype, bitcast=True)
-    iright = right.to(idtype, bitcast=True)
-    ix = x.to(idtype, bitcast=True)
-
-    cond = (left > right) ^ flip
-    ret = ix ^ core.where(cond, ileft ^ iright, zeros_like(ix))
 
     if core.constexpr(ids.dtype.primitive_bitwidth) == 8:
         idx_dtype = core.int8
@@ -212,12 +184,37 @@ def _compare_and_swap(x, ids, flip, i: core.constexpr, n_dims: core.constexpr):
     else:
         raise ValueError("Unsupported dtype")
 
-    ileft_idx = left_idx.to(idx_dtype, bitcast=True)
-    iright_idx = right_idx.to(idx_dtype, bitcast=True)
-    ix_idx = ids.to(idx_dtype, bitcast=True)
-    ret_idx = ix_idx ^ core.where(cond, ileft_idx ^ iright_idx, zeros_like(ix_idx))
+    # Fetch the partner at 'stride' 2**(n_dims - i - 1) by xor-reducing the bit
+    # patterns of each pair: exact for every value, unlike slicing the floats
+    # with a 0/1 multiply, which turns -inf into NaN and -0.0 into +0.0.
+    ix = x.to(idtype, bitcast=True)
+    ix_pair = core.reshape(ix, shape)
+    iy = ix_pair ^ tl.xor_sum(ix_pair, 1, keep_dims=True)
+    y = core.reshape(iy, x.shape).to(x.dtype, bitcast=True)
 
-    return ret.to(x.dtype, bitcast=True), ret_idx.to(ids.dtype, bitcast=True)
+    ix_idx = ids.to(idx_dtype, bitcast=True)
+    ix_idx_pair = core.reshape(ix_idx, shape)
+    iy_idx = ix_idx_pair ^ tl.xor_sum(ix_idx_pair, 1, keep_dims=True)
+    y_ids = core.reshape(iy_idx, ids.shape).to(ids.dtype, bitcast=True)
+
+    # Rank the pair as (left, right) in both slots, so that both agree on the
+    # swap even when the values are unordered (NaN).
+    is_right = core.reshape(
+        core.broadcast_to(core.arange(0, 2)[None, :, None] == 1, shape), x.shape
+    )
+    left = core.where(is_right, y, x)
+    right = core.where(is_right, x, y)
+    left_ids = core.where(is_right, y_ids, ids)
+    right_ids = core.where(is_right, ids, y_ids)
+
+    # Order by value, ties by lower index. Padding and exhausted-chunk entries
+    # carry indices >= N, so they rank below in-range entries of equal value.
+    left_first = (left > right) | ((left == right) & (left_ids < right_ids))
+    swap = left_first != (flip == 1)
+
+    ret = core.where(swap, y, x)
+    ret_idx = core.where(swap, y_ids, ids)
+    return ret, ret_idx
 
 
 @triton.jit
@@ -293,6 +290,10 @@ def topk_stage2_kernel(
         )
         chunk_x_val = tl.reshape(cx_desc.load([0, 0]), (BLOCK_SIZE,)).to(tl.float32)
         chunk_index_val = tl.reshape(ci_desc.load([0, 0]), (BLOCK_SIZE,)).to(tl.int32)
+        # out-of-range lanes of the descriptor load are zero-filled; mark them as
+        # padding like the masked load below does
+        chunk_x_val = tl.where(cols < N, chunk_x_val, FILL_VALUE)
+        chunk_index_val = tl.where(cols < N, chunk_index_val, MASK_INDEX_VAL)
     else:
         chunk_x += cur_batch * N
         chunk_index += cur_batch * N
