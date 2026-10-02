@@ -822,20 +822,19 @@ situv2_activate_scalar(const opus::vector_t<opus::bf16_t, VecSize>& gate,
 //        * linear_beta * tanh(u / linear_beta)
 //
 // One CTA owns one token row. When one chunk per thread covers the row
-// (single pass) the activations stay in VGPRs. Large rows use BF16 LDS and
-// recompute only its overflow; Kimi-K3's static large row stays in BF16 VGPRs.
+// (single pass) the activations stay in VGPRs. Large dynamic rows recompute
+// after the row-max reduction; Kimi-K3's static large row stays in FP32 VGPRs.
 template <int32_t BlockSize,
           int32_t VecSize,
           int32_t StaticD = 0,
           bool SinglePass = false,
-          bool Bf16Lds = false,
+          bool RecomputeMultiPass = false,
           bool RegisterMultiPass = false>
 __global__ __launch_bounds__(BlockSize) void situv2_and_mul_quant_kernel(
     opus::fp8_t* __restrict__ out,
     const opus::bf16_t* __restrict__ input,
     float* __restrict__ scale,
     const int d,
-    const int staged_dim,
     const float beta,
     const float gate_tanh_mul,
     const float linear_beta,
@@ -882,17 +881,14 @@ __global__ __launch_bounds__(BlockSize) void situv2_and_mul_quant_kernel(
 
     extern __shared__ char smem[];
     auto* activated = reinterpret_cast<float*>(smem);
-    auto* activated_bf16 = reinterpret_cast<opus::bf16_t*>(smem);
     auto* reduce_scratch = reinterpret_cast<float*>(
-        smem + ((register_resident || RegisterMultiPass)
+        smem + ((register_resident || RecomputeMultiPass || RegisterMultiPass)
                     ? 0
-                    : (Bf16Lds ? staged_dim * sizeof(opus::bf16_t)
-                               : dim * sizeof(float))));
+                    : dim * sizeof(float)));
     float thread_max = 0.0f;
     using vec_f       = opus::vector_t<float, VecSize>;
-    using vec_bf16    = opus::vector_t<opus::bf16_t, VecSize>;
     vec_f register_values{};
-    vec_bf16 register_chunks[RegisterMultiPass ? iterations : 1]{};
+    vec_f register_chunks[RegisterMultiPass ? iterations : 1]{};
 
     auto compute_chunk = [&](int idx) {
         auto gate = load_vector_nbytes<
@@ -927,25 +923,11 @@ __global__ __launch_bounds__(BlockSize) void situv2_and_mul_quant_kernel(
         }
         else if constexpr(RegisterMultiPass)
         {
-#pragma unroll
-            for(int j = 0; j < VecSize; ++j)
-            {
-                register_chunks[iter][j] = opus::cast<opus::bf16_t>(act_values[j]);
-            }
+            register_chunks[iter] = act_values;
         }
-        else if constexpr(Bf16Lds)
+        else if constexpr(RecomputeMultiPass)
         {
-            if(idx >= staged_dim)
-            {
-                return;
-            }
-            vec_bf16 staged{};
-#pragma unroll
-            for(int j = 0; j < VecSize; ++j)
-            {
-                staged[j] = opus::cast<opus::bf16_t>(act_values[j]);
-            }
-            *reinterpret_cast<vec_bf16*>(activated_bf16 + idx) = staged;
+            return;
         }
         else if constexpr(VecSize == 8 && StaticD != 0)
         {
@@ -1041,28 +1023,11 @@ __global__ __launch_bounds__(BlockSize) void situv2_and_mul_quant_kernel(
         }
         else if constexpr(RegisterMultiPass)
         {
-#pragma unroll
-            for(int j = 0; j < VecSize; ++j)
-            {
-                values[j] = opus::cast<float>(register_chunks[iter][j]);
-            }
+            values = register_chunks[iter];
         }
-        else if constexpr(Bf16Lds)
+        else if constexpr(RecomputeMultiPass)
         {
-            if(idx < staged_dim)
-            {
-                vec_bf16 staged =
-                    *reinterpret_cast<const vec_bf16*>(activated_bf16 + idx);
-#pragma unroll
-                for(int j = 0; j < VecSize; ++j)
-                {
-                    values[j] = opus::cast<float>(staged[j]);
-                }
-            }
-            else
-            {
-                values = compute_chunk(idx);
-            }
+            values = compute_chunk(idx);
         }
         else if constexpr(VecSize == 8 && StaticD != 0)
         {
@@ -1800,7 +1765,7 @@ template <int32_t BlockSize,
           int32_t VecSize,
           int32_t StaticD = 0,
           bool SinglePass = false,
-          bool Bf16Lds = false,
+          bool RecomputeMultiPass = false,
           bool RegisterMultiPass = false>
 static void launch_situv2_and_mul_quant(const aiter_tensor_t& out,
                                         const aiter_tensor_t& input,
@@ -1827,15 +1792,10 @@ static void launch_situv2_and_mul_quant(const aiter_tensor_t& out,
     const bool single_wave  = BlockSize <= wave_size;
     const size_t num_waves  = (BlockSize + wave_size - 1) / wave_size;
     const size_t scratch_bytes = (single_wave ? 0 : num_waves) * sizeof(float);
-    const size_t smem_bytes     = opus::get_smem_size();
-    const int bf16_capacity =
-        static_cast<int>((smem_bytes - scratch_bytes) / sizeof(opus::bf16_t)) /
-        VecSize * VecSize;
-    const int staged_dim = Bf16Lds ? (d < bf16_capacity ? d : bf16_capacity) : 0;
     const size_t activation_bytes =
-        (register_resident || RegisterMultiPass)
+        (register_resident || RecomputeMultiPass || RegisterMultiPass)
             ? 0
-            : (Bf16Lds ? staged_dim * sizeof(opus::bf16_t) : d * sizeof(float));
+            : d * sizeof(float);
     const size_t lds_bytes = activation_bytes + scratch_bytes;
     // Both live in one dynamic allocation, so a wide row plus its scratch can
     // outgrow the 64 KB budget even though d alone fits. Catch it here instead
@@ -1843,13 +1803,12 @@ static void launch_situv2_and_mul_quant(const aiter_tensor_t& out,
     AITER_CHECK(lds_bytes <= static_cast<size_t>(opus::get_smem_size()),
                 "situv2_and_mul_quant: d is too large for the LDS budget");
     situv2_and_mul_quant_kernel<
-        BlockSize, VecSize, StaticD, SinglePass, Bf16Lds, RegisterMultiPass>
+        BlockSize, VecSize, StaticD, SinglePass, RecomputeMultiPass, RegisterMultiPass>
         <<<dim3(num_tokens), dim3(BlockSize), lds_bytes, stream>>>(
             reinterpret_cast<opus::fp8_t*>(out.data_ptr()),
             reinterpret_cast<const opus::bf16_t*>(input.data_ptr()),
             reinterpret_cast<float*>(scale.data_ptr()),
             d,
-            staged_dim,
             beta,
             gate_tanh_mul,
             linear_beta,
@@ -1914,7 +1873,7 @@ void situv2_and_mul_quant(const aiter_tensor_t& out,
 #define LAUNCH_SITUV2_SP(BLOCK_SIZE, VEC_SIZE, STATIC_D)                                   \
     launch_situv2_and_mul_quant<BLOCK_SIZE, VEC_SIZE, STATIC_D, true>(                     \
         out, input, scale, d, num_tokens, beta, linear_beta, stream)
-#define LAUNCH_SITUV2_BF16_LDS(BLOCK_SIZE, VEC_SIZE, STATIC_D)                             \
+#define LAUNCH_SITUV2_RECOMPUTE(BLOCK_SIZE, VEC_SIZE, STATIC_D)                            \
     launch_situv2_and_mul_quant<BLOCK_SIZE, VEC_SIZE, STATIC_D, false, true>(               \
         out, input, scale, d, num_tokens, beta, linear_beta, stream)
 #define LAUNCH_SITUV2_REG(BLOCK_SIZE, VEC_SIZE, STATIC_D)                                  \
@@ -1936,7 +1895,7 @@ void situv2_and_mul_quant(const aiter_tensor_t& out,
         }
         else
         {
-            LAUNCH_SITUV2_BF16_LDS(1024, 8, 0);
+            LAUNCH_SITUV2_RECOMPUTE(1024, 8, 0);
         }
         return;
     }
@@ -2032,7 +1991,7 @@ void situv2_and_mul_quant(const aiter_tensor_t& out,
 
 #undef LAUNCH_SITUV2
 #undef LAUNCH_SITUV2_SP
-#undef LAUNCH_SITUV2_BF16_LDS
+#undef LAUNCH_SITUV2_RECOMPUTE
 #undef LAUNCH_SITUV2_REG
 }
 
