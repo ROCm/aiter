@@ -758,14 +758,13 @@ def _pa_decode_sparse_gfx950_gluon(
         # Rows that share KV rows reuse them through the cache, so skip .cg.
         prefill_kw["GATHER_CACHE"] = ""
 
-    # Put programs that read the same KV rows on one XCD so they share an L2.
-    # Not for SWA-only or 16-head prefill, or for launches padded past the
-    # split count, where it does not help.
+    # Put a row's head blocks, which read the same KV rows, on one XCD so they
+    # share an L2. With one head block per row it slows plain decode more than
+    # it speeds up spec decode. Not for SWA-only prefill, or for launches padded
+    # past the split count.
     xcd_remap = (
         get_num_xcds()
-        if grid_splits == num_splits
-        and (has_extra or not prefill)
-        and not (prefill and num_heads <= 16)
+        if heads_blocks > 1 and grid_splits == num_splits and (has_extra or not prefill)
         else 0
     )
 
