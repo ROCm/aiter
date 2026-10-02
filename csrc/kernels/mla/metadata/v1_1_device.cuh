@@ -275,7 +275,11 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
             params.p_seqlens_qo_indptr[bid_ori + 1] - params.p_seqlens_qo_indptr[bid_ori];
     }
     QoState<Traits> qo_state(
-        params.uni_seqlen_qo, params.ori_seqlen_qo, p_lds_qo_lens, params.p_seqlens_qo_indptr);
+        params.uni_seqlen_qo,
+        params.ori_seqlen_qo,
+        params.qk_batch_ratio,
+        p_lds_qo_lens,
+        params.p_seqlens_qo_indptr);
 
     // Step.1. Calculate the size of cluster and some related information. The size is the number of
     // workgroups

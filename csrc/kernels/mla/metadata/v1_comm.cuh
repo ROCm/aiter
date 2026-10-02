@@ -278,10 +278,12 @@ class QoState
     public:
     __device__ explicit QoState(const int32_t uni_seqlen_qo,
                                 const int32_t ori_seqlen_qo,
+                                const int32_t qk_batch_ratio,
                                 const int32_t* p_lds_seqlens_qo,
                                 const int32_t* p_seqlens_qo_indptr)
         : uni_seqlen_qo_(uni_seqlen_qo),
           ori_seqlen_qo_(ori_seqlen_qo),
+          qk_batch_ratio_(qk_batch_ratio),
           p_lds_seqlens_qo_(p_lds_seqlens_qo),
           p_seqlens_qo_indptr_(p_seqlens_qo_indptr)
     {
@@ -314,8 +316,13 @@ class QoState
         }
         else if constexpr(Traits::kUniSeqlenQo <= -1)
         {
-            const int32_t bid = Traits::kIsSparse ? (batch_idx / ori_seqlen_qo_) : batch_idx;
-            return p_seqlens_qo_indptr_[bid];
+            if constexpr(Traits::kIsSparse)
+            {
+                return p_seqlens_qo_indptr_[batch_idx / ori_seqlen_qo_];
+            }
+            int32_t folded_begin, folded_end;
+            dense_folded_range(batch_idx, folded_begin, folded_end);
+            return folded_begin;
         }
         else
         {
@@ -331,8 +338,13 @@ class QoState
         }
         else if constexpr(Traits::kUniSeqlenQo <= -1)
         {
-            const int32_t bid = Traits::kIsSparse ? (batch_idx / ori_seqlen_qo_) : batch_idx;
-            return p_seqlens_qo_indptr_[bid + 1];
+            if constexpr(Traits::kIsSparse)
+            {
+                return p_seqlens_qo_indptr_[batch_idx / ori_seqlen_qo_ + 1];
+            }
+            int32_t folded_begin, folded_end;
+            dense_folded_range(batch_idx, folded_begin, folded_end);
+            return folded_end;
         }
         else
         {
@@ -347,8 +359,34 @@ class QoState
     }
 
     private:
+    // seqlens_qo_indptr has one entry per original request. Head folding
+    // (qk_batch_ratio > 1) addresses pseudo-batches, so a direct index walks
+    // off that table. Rebuild the row range in the folded Q layout instead.
+    // ratio == 1 keeps the original absolute indptr values.
+    __device__ void dense_folded_range(const int32_t batch_idx,
+                                       int32_t& folded_begin,
+                                       int32_t& folded_end) const
+    {
+        const int32_t ratio = qk_batch_ratio_;
+        if(ratio <= 1)
+        {
+            folded_begin = p_seqlens_qo_indptr_[batch_idx];
+            folded_end   = p_seqlens_qo_indptr_[batch_idx + 1];
+            return;
+        }
+
+        const int32_t bid      = batch_idx / ratio;
+        const int32_t subgroup = batch_idx - bid * ratio;
+        const int32_t begin    = p_seqlens_qo_indptr_[bid];
+        const int32_t seqlen   = p_seqlens_qo_indptr_[bid + 1] - begin;
+        const int32_t base     = p_seqlens_qo_indptr_[0];
+        folded_begin           = (begin - base) * ratio + subgroup * seqlen;
+        folded_end             = folded_begin + seqlen;
+    }
+
     const int32_t uni_seqlen_qo_;
     const int32_t ori_seqlen_qo_;
+    const int32_t qk_batch_ratio_;
     const int32_t* const p_lds_seqlens_qo_;
     const int32_t* const p_seqlens_qo_indptr_;
 };
