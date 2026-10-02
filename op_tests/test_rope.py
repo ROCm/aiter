@@ -1270,6 +1270,133 @@ dim_freqs: {freqs_h.shape!s:<20}
     )
 
 
+def test_deepseek_scaling_rope_single_token(
+    dtype, head_size, num_heads, num_kv_heads, scaling_factor, positions_dtype
+):
+    from aiter.rotary_embedding import DeepseekScalingRotaryEmbedding
+
+    max_position = 256
+    input_msg = f"""
+dtype: {dtype}, \
+head_size: {head_size}, \
+num_heads: {num_heads}, \
+num_kv_heads: {num_kv_heads}, \
+scaling_factor: {scaling_factor}, \
+positions_dtype: {positions_dtype}
+"""
+
+    # The YaRN inv_freq helpers mix explicit-cuda and default-device tensors,
+    # so build the module under a cuda default device like model loaders do.
+    with torch.device("cuda"):
+        rope = DeepseekScalingRotaryEmbedding(
+            head_size,
+            head_size,
+            max_position,
+            10000,
+            True,
+            scaling_factor,
+            dtype,
+            mscale=1,
+            mscale_all_dim=0,
+        )
+
+    # Positions reach into the scaled part of the cos/sin cache.
+    all_positions = torch.tensor(
+        [0, 7, max_position + 3, int(max_position * scaling_factor) - 1],
+        dtype=positions_dtype,
+        device="cuda",
+    )
+    num_tokens = all_positions.numel()
+    all_query = torch.randn(
+        (num_tokens, num_heads, head_size), dtype=dtype, device="cuda"
+    )
+    all_key = torch.randn(
+        (num_tokens, num_kv_heads, head_size), dtype=dtype, device="cuda"
+    )
+
+    ref_query, ref_key = rope.forward_native(
+        all_positions, all_query.clone(), all_key.clone()
+    )
+
+    # Multi-token call.
+    multi_query, multi_key = rope.forward(
+        all_positions, all_query.clone(), all_key.clone()
+    )
+    assert (
+        checkAllclose(
+            ref_query,
+            multi_query,
+            rtol=5e-2,
+            atol=5e-2,
+            msg=f"deepseek_rope_multi_token_q - {input_msg}\n",
+        )
+        == 0
+    )
+    assert (
+        checkAllclose(
+            ref_key,
+            multi_key,
+            rtol=5e-2,
+            atol=5e-2,
+            msg=f"deepseek_rope_multi_token_k - {input_msg}\n",
+        )
+        == 0
+    )
+
+    # Single-token calls (positions.numel() == 1) must hand back a key that does
+    # not alias the caller's key and still carries the same rotated values.
+    for i in range(num_tokens):
+        positions = all_positions[i : i + 1].clone()
+        query = all_query[i : i + 1].clone()
+        key = all_key[i : i + 1].clone()
+
+        out_query, out_key = rope.forward(positions, query, key)
+
+        assert out_key.data_ptr() != key.data_ptr(), (
+            "single-token DeepseekScalingRotaryEmbedding.forward returned a key "
+            f"aliasing the input key - {input_msg}"
+        )
+        key_snapshot = key.clone()
+        out_key_snapshot = out_key.clone()
+        out_key.zero_()
+        assert torch.equal(key, key_snapshot), (
+            "writing to the returned single-token key modified the input key "
+            f"- {input_msg}"
+        )
+        out_key = out_key_snapshot
+
+        assert (
+            checkAllclose(
+                ref_query[i : i + 1],
+                out_query,
+                rtol=5e-2,
+                atol=5e-2,
+                msg=f"deepseek_rope_single_token_q pos={i} - {input_msg}\n",
+            )
+            == 0
+        )
+        assert (
+            checkAllclose(
+                ref_key[i : i + 1],
+                out_key,
+                rtol=5e-2,
+                atol=5e-2,
+                msg=f"deepseek_rope_single_token_k pos={i} - {input_msg}\n",
+            )
+            == 0
+        )
+        assert (
+            checkAllclose(
+                multi_key[i : i + 1],
+                out_key,
+                rtol=5e-2,
+                atol=5e-2,
+                msg=f"deepseek_rope_single_vs_multi_k pos={i} - {input_msg}\n",
+            )
+            == 0
+        )
+
+
 if __name__ == "__main__":
     l_dtype = ("fp16", "bf16")
     parser = argparse.ArgumentParser(
@@ -1755,3 +1882,10 @@ if __name__ == "__main__":
             )
             grad = torch.randn((b, height * width, h, d), dtype=dtype, device="cuda")
             test_rope_2d(input, height, width, freqs_h, freqs_w, grad)
+
+    # Test DeepseekScalingRotaryEmbedding single-token (positions.numel() == 1) path
+    if not args.no_check:
+        for dtype, scaling_factor in itertools.product(l_dtype, (40.0,)):
+            test_deepseek_scaling_rope_single_token(
+                dtype, 64, 16, 1, scaling_factor, positions_torch_dtype
+            )
