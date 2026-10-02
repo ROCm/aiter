@@ -619,6 +619,19 @@ def _pa_decode_sparse_gfx950_gluon(
             num_queries * 2 * splits16 > get_num_sms() and row_tiles >= 2 * splits16
         ):
             BLOCK_M, num_warps = 32, 8
+    # At 64 heads, top-k launches use 32-head programs when their last round on
+    # the CUs is more than half full or there are at least four rounds. SWA-only
+    # launches stay on 16 heads. Both grids get the same split count.
+    if packed_fp8 and num_heads == 64 and has_extra:
+        if kv_splits is not None:
+            splits16 = max(1, int(kv_splits))
+        else:
+            splits16 = _decode_num_splits_occ(
+                num_queries, 4, avg_main, avg_extra, BLOCK_K
+            )
+        rounds, left = divmod(num_queries * 2 * splits16, get_num_sms())
+        if left == 0 or 2 * left > get_num_sms() or rounds >= 4:
+            BLOCK_M, num_warps = 32, 8
     HEAD_ALIGNED = num_heads % BLOCK_M == 0
     heads_blocks = (num_heads + BLOCK_M - 1) // BLOCK_M
     out = _check_out(out, q, torch.bfloat16)
