@@ -458,10 +458,7 @@ def test_weight_prepack_cache_reuses_and_invalidates(monkeypatch):
     ), "refreshed K-padding region contains nonzero values"
 
 
-def test_conv3d_inference_weight_observes_updates(monkeypatch):
-    monkeypatch.setattr(
-        conv_prepack, "_TORCH_INFERENCE_TENSOR_WEIGHTS_IMMUTABLE", False
-    )
+def test_conv3d_inference_weight_observes_updates():
     torch.manual_seed(0)
     with torch.inference_mode():
         x = torch.randn(1, 64, 4, 8, 8, device="cuda", dtype=torch.float16)

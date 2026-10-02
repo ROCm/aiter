@@ -66,25 +66,12 @@ y = conv2d(
 
 ### Inference tensors
 
-PyTorch tensors created inside `torch.inference_mode()` do not have a version
-counter. AITER therefore cannot safely place an inference weight in the pack
-cache: an in-place update inside inference mode would otherwise reuse stale
-packed data. Inference weights are supported transparently, but their required
-layout is packed on each call.
-
-Deployments whose PyTorch inference-tensor weights remain fixed can opt into
-the versionless pack cache by setting this environment variable before
-importing AITER:
-
-```bash
-export AITER_TRITON_CONV_TORCH_INFERENCE_TENSOR_WEIGHTS_IMMUTABLE=1
-```
-
-This setting applies only to weights for which `weight.is_inference()` is
-`True`; normal tensors always use their version-aware cache. The default is
-`0`, which preserves in-place update semantics. When enabled, mutating an
-inference weight after its first packed convolution is unsupported and can
-reuse stale packed values.
+Convolution weights created inside `torch.inference_mode()` are inference
+tensors and do not have a version counter. AITER therefore repacks those
+weights on every convolution call rather than placing them in the pack cache:
+an in-place update inside inference mode would otherwise reuse stale packed
+data. Merely running a convolution inside `torch.inference_mode()` does not
+disable caching for a normal weight created outside that context.
 
 For repeated inference, create and load long-lived model weights before
 entering inference mode. Such weights remain normal versioned tensors and use
