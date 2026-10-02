@@ -230,24 +230,25 @@ DEVICE void run(const Args& args, uint8_t* lds, int wave, int lane) {
     }
 
     // ---- global loads: one buffer per tensor; lane offsets (tile, K panel, lane) move on after each load ------------
-    const Buf a_rsrc = rsrc(args.a, args.m * args.a_stride);
-    const Buf a_scale_rsrc = rsrc(args.sa, tiles_m * TileM * args.sa_stride);
-    const Buf b_rsrc = rsrc(args.b, args.n * (args.k / 2));         // < 2 GB: no int overflow
-    const Buf b_scale_rsrc = rsrc(args.sb, tiles_n * TileN * args.sb_stride);
-    const int tile_bytes[Tensors] = {args.a_stride, args.sa_stride, args.k / 2, args.sb_stride};   // per row
+    const uint32_t row_bytes[Tensors] = {(uint32_t)args.a_stride, (uint32_t)args.sa_stride, (uint32_t)args.k / 2,
+                                         (uint32_t)args.sb_stride};   // uint32_t: buffers reach 4 GiB (no int overflow)
+    const Buf a_rsrc = rsrc(args.a, args.m * row_bytes[TensorA]);
+    const Buf a_scale_rsrc = rsrc(args.sa, tiles_m * TileM * row_bytes[TensorAScale]);
+    const Buf b_rsrc = rsrc(args.b, args.n * row_bytes[TensorB]);
+    const Buf b_scale_rsrc = rsrc(args.sb, tiles_n * TileN * row_bytes[TensorBScale]);
     const int panel_bytes[Tensors] = {ARowBytes, ScaleBytes, BStepBytes, ScaleBytes};             // per K step
     uint32_t dma_lane[Loads], b_lane[BTiles], b_scale_lane[2];       // [window DMA], [B tile], [B tile pair]
     for (int d = 0; d < Loads; ++d) {                // A rows: 32 chunk + 8 wave + lane / 8, swizzled 16 B pieces
         const int chunk = dma_chunk(d), half = dma_half(d);
-        if (dma_is_scale(d)) dma_lane[d] = (tile_m + 32 * (4 * half + lane % 4)) * args.sa_stride + 64 * wave
+        if (dma_is_scale(d)) dma_lane[d] = (tile_m + 32 * (4 * half + lane % 4)) * row_bytes[TensorAScale] + 64 * wave
                                            + 4 * (lane / 4) + k0 * ScaleBytes;
-        else dma_lane[d] = (tile_m + 8 * (Waves * chunk + wave) + lane / 8) * args.a_stride
+        else dma_lane[d] = (tile_m + 8 * (Waves * chunk + wave) + lane / 8) * row_bytes[TensorA]
                            + 16 * ((lane % 8) ^ (lane / 8 & 6)) + k0 * ARowBytes;
     }
     for (int tile = 0; tile < BTiles; ++tile)
-        b_lane[tile] = (tile_n + 16 * (BTiles * wave + tile)) * (args.k / 2) + 16 * lane + k0 * BStepBytes;
+        b_lane[tile] = (tile_n + 16 * (BTiles * wave + tile)) * row_bytes[TensorB] + 16 * lane + k0 * BStepBytes;
     for (int pair = 0; pair < 2; ++pair)
-        b_scale_lane[pair] = (tile_n + 64 * wave + 32 * pair) * args.sb_stride + 4 * lane + k0 * ScaleBytes;
+        b_scale_lane[pair] = (tile_n + 64 * wave + 32 * pair) * row_bytes[TensorBScale] + 4 * lane + k0 * ScaleBytes;
     // Per tensor: K step now and next round (odd rounds walk back from L2-warm panels; K tail: forward), tile jump.
     int step_now[Tensors], step_next[Tensors], jump[Tensors];
     for (int tensor = 0; tensor < Tensors; ++tensor) step_now[tensor] = panel_bytes[tensor];
@@ -399,7 +400,7 @@ DEVICE void run(const Args& args, uint8_t* lds, int wave, int lane) {
                 if (unit == 0 && slot == 3) {
                     tile_of(round + 1, next_m, next_n);
                     for (int tensor = 0; tensor < Tensors; ++tensor)   // K: back to k0 (K tail), else stay on the panel
-                        jump[tensor] = (tensor <= TensorAScale ? next_m - tile_m : next_n - tile_n) * tile_bytes[tensor]
+                        jump[tensor] = (tensor <= TensorAScale ? next_m - tile_m : next_n - tile_n) * row_bytes[tensor]
                                        + (k_tail ? 1 - steps : 0) * panel_bytes[tensor];
                     c_rows = max(min(m_rows - tile_m, TileM), 0);
                     c_lane = tile_n + c_col < args.n ? c_lane0 : c_lane0 | Oob;
