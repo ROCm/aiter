@@ -653,9 +653,6 @@ def _pa_decode_sparse_gfx950_gluon(
         prefill_kw["GATHER_CACHE"] = ""
         if main_fmt == extra_fmt == "fp8_dsv4_mla":
             prefill_kw.update(
-                # Over 64-bit gathers the prefetched ids and the has_invalid redirect
-                # together spill the tile loop.
-                IDX_PREFETCH=use_buffer_load or not has_invalid,
                 SLOT_U32=max(s0, s1) < (1 << 24),
                 KV_LDS_PAD=16,
             )
@@ -682,15 +679,12 @@ def _pa_decode_sparse_gfx950_gluon(
     # than one split to give back.
     adaptive_splits = num_splits > 1
 
-    # Fuse the dsv4 dequant into v_cvt_scalef32_pk_bf16_fp8. The asm fallback
-    # gathers an extra int16 tile, so it only pays off at one workgroup per CU.
-    if _HAS_SCALED_UPCAST:
-        deq = "upcast"
-    elif one_wg_per_cu:
-        deq = "asm"
-    else:
-        deq = "none"
+    # dsv4 dequant: the scaled upcast if this Triton has it, else inline asm.
+    deq = "upcast" if _HAS_SCALED_UPCAST else "asm"
 
+    # The 16-lane row gather needs row-axis dequant chunks of 4+ rows per warp.
+    if packed_fp8 and chunk_axis == 0:
+        nope_chunk = max(nope_chunk, 4 * num_warps)
     if packed_fp8:
         # Rows that share KV rows reuse them through the cache, so skip .cg.
         prefill_kw["GATHER_CACHE"] = ""

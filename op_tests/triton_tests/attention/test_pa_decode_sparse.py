@@ -7,6 +7,7 @@ import pytest
 import torch
 import triton
 
+import aiter.ops.triton.attention.pa_decode_sparse as pa_decode_sparse_mod
 from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
@@ -606,3 +607,134 @@ def test_pa_decode_sparse_global_gather(T, has_invalid):
         q, cache, idx, indptr, attn_sink, softmax_scale, has_invalid=has_invalid
     )
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+def _packed_pool(num_blocks, block, pitch_bytes, device="cuda", seed=0):
+    """A DSv4 packed fp8 pool laid out as in vLLM: [nb, block, 584] uint8 with
+    blocks pitch_bytes apart. Returns the strided view and the dequantized
+    [nb * block, 512] f32 rows."""
+    g = torch.Generator(device=device).manual_seed(seed)
+    nope, rope = 448, 64
+    blk = block * 584
+    raw = torch.zeros(
+        pitch_bytes * (num_blocks - 1) + blk, dtype=torch.uint8, device=device
+    )
+    view = raw.as_strided((num_blocks, block, 584), (pitch_bytes, 584, 1))
+    flat = raw.as_strided((num_blocks, blk), (pitch_bytes, 1))
+    data = flat[:, : block * 576].view(num_blocks, block, 576)
+    scl = flat[:, block * 576 :].view(num_blocks, block, 8)
+    q8 = (torch.randn(num_blocks, block, nope, device=device, generator=g) * 0.4).to(
+        torch.float8_e4m3fn
+    )
+    rb = (torch.randn(num_blocks, block, rope, device=device, generator=g) * 0.4).to(
+        torch.bfloat16
+    )
+    data[:, :, :nope] = q8.view(torch.uint8)
+    data[:, :, nope:] = rb.view(torch.uint8).view(num_blocks, block, 2 * rope)
+    exps = torch.randint(
+        124, 130, (num_blocks, block, 7), device=device, generator=g, dtype=torch.uint8
+    )
+    scl[:, :, :7] = exps
+    deq = torch.cat(
+        [
+            q8.float() * torch.exp2(exps.float() - 127.0).repeat_interleave(64, dim=2),
+            rb.float(),
+        ],
+        dim=2,
+    )
+    return view, deq.reshape(num_blocks * block, 512)
+
+
+def _ragged(lens, pool_rows, device, gen, sentinel_rows=(), lead_invalid=0):
+    """Ragged slot lists: row r draws lens[r] distinct slots; rows in sentinel_rows get
+    a -1 in every other entry, and every row's first lead_invalid entries are -1."""
+    rows = []
+    for r, n in enumerate(lens):
+        sel = torch.randperm(pool_rows, generator=gen)[:n].to(torch.int32)
+        if r in sentinel_rows:
+            sel[::2] = -1
+        sel[: min(n, lead_invalid)] = -1
+        rows.append(sel)
+    ptr = torch.zeros(len(lens) + 1, dtype=torch.int32)
+    ptr[1:] = torch.tensor(lens, dtype=torch.int32).cumsum(0)
+    return torch.cat(rows).to(device), ptr.to(device)
+
+
+def _vllm_pool_case(T, H, sentinels):
+    """Inputs and reference of one DSv4.1 vLLM-pool case (see the test below)."""
+    device = "cuda"
+    torch.manual_seed(0)
+    gen = torch.Generator().manual_seed(T * 131 + H)
+    D = 512
+    q = torch.randn(T, H, D, dtype=torch.bfloat16, device=device) * 0.125
+    sink = torch.randn(H, dtype=torch.float32, device=device) * 0.1
+    scale = float(D) ** -0.5
+    edge = [0, 1, 63, 64, 65, 127, 128, 129]
+    main_lens = [edge[(t * 7) % len(edge)] if t % 3 else 128 for t in range(T)]
+    extra_lens = [
+        ([0, 1, 64, 65, 192, 511, 512, 640] * 3)[(t * 5) % 24] for t in range(T)
+    ]
+    main_pool, main_deq = _packed_pool(64, 32, 32 * 584 + 192, device, seed=1)
+    extra_pool, extra_deq = _packed_pool(48, 128, 128 * 584 + 448, device, seed=2)
+    srows = set(range(0, T, 4)) if sentinels == "some" else ()
+    lead = 130 if sentinels == "lead" else 0
+    mi, mp = _ragged(main_lens, 64 * 32, device, gen, srows, lead)
+    ei, ep = _ragged(extra_lens, 48 * 128, device, gen, srows, lead)
+    ref = two_loop_reference(q, main_deq, mi, mp, extra_deq, ei, ep, sink, scale)
+    return (q, main_pool, mi, mp, sink, scale, extra_pool, ei, ep), ref
+
+
+def _vllm_pool_run(args, splits):
+    q, main_pool, mi, mp, sink, scale, extra_pool, ei, ep = args
+    return pa_decode_sparse(
+        q,
+        main_pool,
+        mi,
+        mp,
+        sink,
+        scale,
+        kv_splits=splits,
+        extra_cache=extra_pool,
+        extra_indices=ei,
+        extra_indptr=ep,
+    )
+
+
+def _vllm_pool_skip(T, splits):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    if arch_info.get_arch() != "gfx950":
+        pytest.skip("the packed fp8_dsv4_mla cache is a gfx950 gluon path")
+    if T == 2100 and splits == 3:
+        pytest.skip("prefill takes one split")
+
+
+@pytest.mark.parametrize("T", [1, 6, 37, 192, 2100])
+@pytest.mark.parametrize("H", [8, 16, 32, 64])
+@pytest.mark.parametrize("sentinels", ["none", "some", "lead"])
+@pytest.mark.parametrize("splits", [None, 1, 3])
+def test_pa_decode_sparse_two_loop_vllm_pool(T, H, sentinels, splits):
+    """DSv4.1 vLLM-pool shapes: page-pitched SWA and top-k pools, ragged lengths on
+    every tile edge, sentinels including whole leading tiles, split-K on and off."""
+    _vllm_pool_skip(T, splits)
+    args, ref = _vllm_pool_case(T, H, sentinels)
+    out = _vllm_pool_run(args, splits)
+    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("T", [1, 37, 192, 2100])
+@pytest.mark.parametrize("H", [16, 32, 64])
+@pytest.mark.parametrize("sentinels", ["some", "lead"])
+@pytest.mark.parametrize("splits", [None, 3])
+def test_pa_decode_sparse_two_loop_vllm_pool_asm_dequant(
+    T, H, sentinels, splits, monkeypatch
+):
+    """The inline asm dequant used without cdna4.scaled_upcast, forced by hiding
+    the upcast from the driver. Must match the upcast bit for bit."""
+    _vllm_pool_skip(T, splits)
+    args, ref = _vllm_pool_case(T, H, sentinels)
+    out = _vllm_pool_run(args, splits)
+    monkeypatch.setattr(pa_decode_sparse_mod, "_HAS_SCALED_UPCAST", False)
+    out_asm = _vllm_pool_run(args, splits)
+    assert torch.equal(out_asm.view(torch.int16), out.view(torch.int16))
+    torch.testing.assert_close(out_asm, ref, atol=1e-2, rtol=1e-2)
