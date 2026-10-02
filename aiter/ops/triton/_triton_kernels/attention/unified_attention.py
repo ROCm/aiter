@@ -308,11 +308,8 @@ def kernel_unified_attention_2d(
     masked_tile_start = tile_start
     if SPLIT_UNMASKED_LOOP:
         if CAUSAL:
-            # The first row has the tightest limit; tiles below it are admitted
-            # by every row in the q-block.
             unmasked_limit = context_len + q_block_local_idx * BLOCK_Q + 1
         else:
-            # Non-causal can use no masks for entire seq_len
             unmasked_limit = seq_len
         unmasked_tile_end = tl.minimum(unmasked_limit // TILE_SIZE, tile_end)
         unmasked_tile_end = tl.maximum(unmasked_tile_end, tile_start)
