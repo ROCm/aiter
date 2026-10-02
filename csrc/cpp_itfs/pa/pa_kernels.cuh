@@ -2,6 +2,23 @@
 
 #include "pa_common.cuh"
 
+// Target magnitude for the FP8 softmax-probability rescale (see the comment at
+// `logits_fp8_scale` below). Deliberately the largest POWER OF TWO inside the
+// e4m3 normal range rather than the range maximum itself, for two reasons:
+//   * a power-of-two scale is exact in binary, so the multiply before the cast
+//     and the divide after it introduce no rounding of their own;
+//   * it leaves headroom below the maximum, so fp32 rounding of the rescale
+//     cannot push the cast into saturation.
+// gfx950 uses OCP e4m3 (max 448); earlier CDNA uses e4m3fnuz (max 240). Both
+// __builtin_amdgcn_cvt_pk_fp8_f32 and the __hip_fp8_e4m3 mfma follow the
+// per-arch convention, so this constant must too.
+#if defined(__gfx950__)
+constexpr float FP8_E4M3_SCALE = 256.0f;
+#else
+constexpr float FP8_E4M3_SCALE = 128.0f;
+#endif
+constexpr float FP8_E4M3_SCALE_INV = 1.0f / FP8_E4M3_SCALE;
+
 template <typename scalar_t,
           typename cache_t,
           vllm::Fp8KVCacheDataType KV_DTYPE,
@@ -555,6 +572,19 @@ _paged_attention_kernel(const int* block_table_seq,
     float inv_sum_scale[GQA_RATIO_LOOP][MTP_PER_THREAD]     = {{0.0f}};
     float partition_qk_max[GQA_RATIO_LOOP][MTP_PER_THREAD]  = {{-FLT_MAX}};
     float partition_exp_sum[GQA_RATIO_LOOP][MTP_PER_THREAD] = {{0.0f}};
+    // FP8 logits path only. The probabilities are rebased to the partition max
+    // and scaled to the top of the e4m3 NORMAL range before the cast, and the
+    // 1/exp_sum is folded back into the fp32 accumulator after the P*V mfma.
+    //
+    // Normalizing to sum=1 first -- which is what the bf16 path below does, and
+    // what this path used to do -- leaves every probability near
+    // 1/PARTITION_SIZE. At the default partition of 256 that is ~2^-8, which is
+    // SUBNORMAL in e4m3 (smallest normal 2^-6, subnormal step 2^-9), so the
+    // relative ulp is 1/2 and the cast injects ~15% RMS error into P. bf16 has
+    // the exponent range to hold 2^-8 exactly, which is why only this branch
+    // needs the rescale.
+    float logits_fp8_scale[GQA_RATIO_LOOP][MTP_PER_THREAD] = {{0.0f}};
+    float out_fp8_scale[GQA_RATIO_LOOP][MTP_PER_THREAD]    = {{0.0f}};
 
     for(int mtp = 0; mtp < mtp_loop; mtp++)
     {
@@ -586,6 +616,21 @@ _paged_attention_kernel(const int* block_table_seq,
             inv_sum_scale[gqa_ratio_loop][mtp] =
                 __fdividef(1.f, partition_exp_sum[gqa_ratio_loop][mtp] + 1e-6f) *
                 warp_qk_max_exp[warpid];
+
+            if constexpr(KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto)
+            {
+                // Split inv_sum_scale into a pre-cast and a post-mfma factor.
+                // warp_qk_max_exp[warpid] rebases this warp's exponentials onto
+                // the partition max, so the largest probability becomes exactly
+                // 1.0; multiplying by FP8_E4M3_SCALE lifts it well inside the
+                // representable normal range. The two factors multiply back to
+                // inv_sum_scale exactly, so the result is unchanged in exact
+                // arithmetic -- only the rounding is better.
+                logits_fp8_scale[gqa_ratio_loop][mtp] = warp_qk_max_exp[warpid] * FP8_E4M3_SCALE;
+                out_fp8_scale[gqa_ratio_loop][mtp] =
+                    __fdividef(1.f, partition_exp_sum[gqa_ratio_loop][mtp] + 1e-6f) *
+                    FP8_E4M3_SCALE_INV;
+            }
         }
     }
 
@@ -630,7 +675,10 @@ _paged_attention_kernel(const int* block_table_seq,
             {
                 for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
                 {
-                    d_out[gqa_ratio_loop][mtp][token_depth] *= inv_sum_scale[gqa_ratio_loop][mtp];
+                    // scaled to the e4m3 normal range, NOT to sum=1; the
+                    // 1/exp_sum is applied after the P*V mfma below
+                    d_out[gqa_ratio_loop][mtp][token_depth] *=
+                        logits_fp8_scale[gqa_ratio_loop][mtp];
                     // cast _B16x4* to _B8x8*
                     _T8x8& logits_8x8 =
                         *reinterpret_cast<_T8x8*>(&shared_logits[gqa_ratio_loop][0][mtp][warpid]
@@ -807,7 +855,10 @@ _paged_attention_kernel(const int* block_table_seq,
                 // apply post Softmax V mfma v_scale
                 if constexpr(KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto)
                 {
-                    tmp_out *= *v_scale_ptr;
+                    // out_fp8_scale carries the 1/exp_sum that was deliberately
+                    // NOT applied before the e4m3 cast, plus the 1/FP8_E4M3_SCALE
+                    // undoing the normal-range rescale.
+                    tmp_out *= *v_scale_ptr * out_fp8_scale[gqa_ratio_loop][mtp];
                 }
                 outelems[gqa_ratio_loop][mtp][vhe_depth] = from_floatx4<scalar_t>(tmp_out);
             }
