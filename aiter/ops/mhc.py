@@ -539,6 +539,13 @@ _MHC_FUSED_POST_PRE_CONFIG = {
     ("gfx1250", 256): _mhc_fused_config_gfx1250_256,
 }
 
+_MHC_GFX950_GLM_PACKED_BF16_PREFILL_CONFIG = {
+    4096: (4, 32, 32, 64),
+    8192: (4, 32, 32, 64),
+    16384: (2, 32, 32, 64),
+    131072: (8, 32, 32, 64),
+}
+
 
 @functools.lru_cache(maxsize=1024)
 def get_mhc_fused_post_pre_config(
@@ -561,6 +568,16 @@ def get_mhc_fused_post_pre_config(
     _check_mhc_res_preshuffle_arch(res_preshuffle, arch)
     policy = _MHC_FUSED_POST_PRE_CONFIG.get((arch, num_cu), _mhc_fused_config_default)
     split_k, tile_m, tile_n, tile_k = policy(m, hidden_size, num_cu)
+    if (
+        w_preshuffle_bf16
+        and not res_preshuffle
+        and arch == "gfx950"
+        and num_cu == 256
+        and hidden_size == 4096
+    ):
+        config = _MHC_GFX950_GLM_PACKED_BF16_PREFILL_CONFIG.get(m)
+        if config is not None:
+            return config
     if (
         w_preshuffle_bf16
         and res_preshuffle
@@ -885,9 +902,10 @@ def mhc_fused_post_pre(
     Returns ``(post_mix, comb_mix, layer_input_out, next_residual)`` -- next pre mixes,
     folded layer input, and the new residual stream for the following layer's post.
 
-    ``force_fused``: when True, select the fused HIP path, except for the existing
-    gfx950 large-M post+pre specialization with plain residuals. When False
-    (default), larger ``m`` with plain residuals falls back to ``mhc_post`` +
+    ``force_fused``: when True, select the fused HIP path. The measured gfx950
+    GLM-5.3 packed-BF16 prefill cells retain fusion; other large-M plain residual
+    shapes use the existing tuned ``mhc_post`` + ``mhc_pre`` specialization. When
+    False (default), larger ``m`` with plain residuals fall back to ``mhc_post`` +
     ``mhc_pre`` (threshold depends on the detected GPU arch).
     A ``res_preshuffle`` request uses that same fuse/unfuse boundary.
 
@@ -906,6 +924,15 @@ def mhc_fused_post_pre(
     _check_mhc_res_preshuffle_arch(res_preshuffle, arch)
     res_preshuffle = res_preshuffle and mhc_res_shuffle_enabled(m, arch)
     fused_m_upper_bound = MHC_FUSED_POST_PRE_M_UPPER_BOUND.get(arch, 1024)
+    use_gfx950_glm_large_m_fused = (
+        force_fused
+        and w_preshuffle_bf16
+        and not res_preshuffle
+        and arch == "gfx950"
+        and hc_mult == 4
+        and hidden_size == 4096
+        and m in _MHC_GFX950_GLM_PACKED_BF16_PREFILL_CONFIG
+    )
 
     # At the shared bound the input is already in ordinary layout.
     if not force_fused and not res_preshuffle and m >= fused_m_upper_bound:
@@ -938,6 +965,7 @@ def mhc_fused_post_pre(
         and not res_preshuffle
         and arch == "gfx950"
         and m > fused_m_upper_bound
+        and not use_gfx950_glm_large_m_fused
     ):
         return mhc_fused_post_pre_large_m(
             layer_input,
