@@ -160,8 +160,8 @@ def moe_gemm_a8w8(
         Y[idxs_y_m(e), :] += matmul(X[idxs_x_m(e), :], W[e, :, :])
 
     x_token_scale: optional fp32 per-token activation scale, one entry per row
-        of `x`; applied to the accumulator before bias / activation.
-    w_expt_scale: optional fp32 per-expert weight scale `[n_expts]`.
+        of x; applied to the accumulator before bias / activation.
+    w_expt_scale: optional fp32 per-expert weight scale [n_expts].
     """
     if x_token_scale is not None:
         assert (
