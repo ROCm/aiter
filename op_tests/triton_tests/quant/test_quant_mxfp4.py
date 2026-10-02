@@ -391,7 +391,9 @@ def test_dynamic_mxfp4_quant_sr_validates_contract():
 
 @_REQUIRES_GFX950
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("shape", [(1, 32), (6, 96), (64, 256)])
+@pytest.mark.parametrize(
+    "shape", [(1, 32), (6, 96), (64, 256), (40, 4128), (64, 14336)]
+)
 def test_dynamic_mxfp4_quant_sr_is_reproducible_and_reuses_rtn_scales(
     shape,
     dtype,
