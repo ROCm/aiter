@@ -70,6 +70,8 @@ hipblasLtMatmulPreference_t preference;
 size_t workspace_size = 2 * 128 * 1024 * 1024;
 // uint64_t workspace_size = 0;
 void* d_workspace;
+// One resource set per module. Lifecycle calls retain the Python GIL.
+int extension_device  = -1;
 int request_solutions = 1;
 int returnedAlgoCount = 0;
 
@@ -1377,6 +1379,18 @@ std::vector<int> hipb_findallsols(const aiter_tensor_t& mat1,
 
 void hipb_create_extension()
 {
+    aiter_detail::g_aiter_can_throw = true;
+    int device;
+    HIP_CALL(hipGetDevice(&device));
+    if(extension_device != -1)
+    {
+        AITER_CHECK(extension_device == device,
+                    "hipBLASLt extension is already initialized on device ",
+                    extension_device,
+                    "; destroy it before initializing on another device");
+        return;
+    }
+
     // CHECK_HIP_ERROR(hipStreamCreate(&weight_stream));
     // CHECK_HIP_ERROR(hipEventCreateWithFlags(&event, cudaEventDisableTiming));
 
@@ -1390,6 +1404,8 @@ void hipb_create_extension()
                                               &workspace_size,
                                               sizeof(workspace_size)));
 
+    extension_device = device;
+
     // CHECK_HIP_ERROR(hipEventCreate(&start));
     // CHECK_HIP_ERROR(hipEventCreate(&stop));
 }
@@ -1398,6 +1414,11 @@ void hipb_create_extension()
 
 void hipb_destroy_extension()
 {
+    if(extension_device == -1)
+        return;
+
+    // Release resources on their owning device, preserving the caller's device.
+    HipDeviceGuard device_guard(extension_device);
     // CHECK_HIP_ERROR(hipStreamDestroy(weight_stream));
     // CHECK_HIP_ERROR(hipEventDestroy(event));
 
@@ -1405,6 +1426,11 @@ void hipb_destroy_extension()
     CHECK_HIPBLAS_ERROR(hipblasLtDestroy(hipblaslt_handle));
     CHECK_HIPBLAS_ERROR(hipblasLtMatmulPreferenceDestroy(preference));
     CHECK_HIP_ERROR(hipFree(d_workspace));
+
+    hipblaslt_handle = nullptr;
+    preference       = nullptr;
+    d_workspace      = nullptr;
+    extension_device = -1;
 
     // CHECK_HIP_ERROR(hipEventDestroy(start));
     // CHECK_HIP_ERROR(hipEventDestroy(stop));

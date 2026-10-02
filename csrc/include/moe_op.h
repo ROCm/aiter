@@ -44,6 +44,25 @@ void topk_softmax(const aiter_tensor_t& topk_weights,
                   int num_shared_experts                        = 0,
                   const std::string& shared_expert_scoring_func = "");
 
+// Option A ("fuse-gate") SEPARATE OP: always fuse-gate. The shared-expert weight is
+// computed in-kernel as sigmoid(hidden_states @ gate_weight.T) * shared_expert_scale
+// (scale applied AFTER the sigmoid) and the shared id (shared_expert_base + s) is
+// written by the kernel. gating_output holds routed experts only. hidden_states /
+// gate_weight are REQUIRED. Physically duplicated from topk_softmax so base callers
+// carry no shared-gate LDS penalty.
+void topk_softmax_fused_shared_gate(
+    const aiter_tensor_t& topk_weights,          // [num_tokens, topk + num_shared_experts]
+    const aiter_tensor_t& topk_indices,          // [num_tokens, topk + num_shared_experts]
+    const aiter_tensor_t& token_expert_indices,  // [num_tokens, topk]  (written stride = topk)
+    const aiter_tensor_t& gating_output,         // [num_tokens, num_experts]  routed only
+    bool need_renorm,
+    int num_shared_experts,
+    const std::string& shared_expert_scoring_func,
+    const aiter_tensor_t& hidden_states,         // [num_tokens, hidden]
+    const aiter_tensor_t& gate_weight,           // [num_shared_experts, hidden]
+    float shared_expert_scale = 1.0f,
+    int shared_expert_base    = -1);
+
 void moe_align_block_size(const aiter_tensor_t& topk_ids,
                           int64_t num_experts,
                           int64_t block_size,

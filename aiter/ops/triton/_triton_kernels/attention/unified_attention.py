@@ -129,9 +129,14 @@ def kernel_unified_attention_2d(
     SPLIT_UNMASKED_LOOP: tl.constexpr = False,  # bool
     K_WIDTH: tl.constexpr = 0,  # int
 ):
+    # SPLIT_UNMASKED_LOOP does not support SHUFFLED_KV_CACHE or SLIDING_WINDOW.
     tl.static_assert(
         not (SPLIT_UNMASKED_LOOP and SHUFFLED_KV_CACHE),
-        "SPLIT_UNMASKED_LOOP is incompatible with SHUFFLED_KV_CACHE",
+        "SPLIT_UNMASKED_LOOP does not support SHUFFLED_KV_CACHE",
+    )
+    tl.static_assert(
+        not (SPLIT_UNMASKED_LOOP and SLIDING_WINDOW > 0),
+        "SPLIT_UNMASKED_LOOP does not support sliding-window attention",
     )
 
     kv_head_idx = tl.program_id(0)

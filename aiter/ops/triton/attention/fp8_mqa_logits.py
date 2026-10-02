@@ -265,13 +265,17 @@ def fp8_mqa_logits(
             # 32x32x64 over 16x16x128: its output layout leaves only one head
             # bit in lanes, so the head sum needs one cross-lane step
             mfma_nonk_dim = 32 if (head_size <= 64 or num_heads >= 32) else 16
-            # Fold one head chunk at a time to lower reg. pressure
-            m_chunk = (
-                mfma_nonk_dim
-                if (num_heads > mfma_nonk_dim and block_m == 1 and mfma_nonk_dim == 32)
-                else 0
-            )
             num_chains = (2 if block_m == 2 else 1) if USE_FOLDED_REDUCTION else 0
+            # Fold one head chunk at a time to lower reg. pressure
+            if (
+                num_chains >= 1
+                and num_heads > mfma_nonk_dim
+                and block_m == 1
+                and mfma_nonk_dim == 32
+            ):
+                m_chunk = mfma_nonk_dim
+            else:
+                m_chunk = 0
             # Relax the store masking if we don't have to provide clean logits
             relaxed_store = 0 if clean_logits else 1
             other = {

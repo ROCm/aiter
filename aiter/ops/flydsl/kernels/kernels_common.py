@@ -105,6 +105,11 @@ def atomic_add_i32(memref, val, offset, syncscope):
     return _atomic_rmw_i32(_llvm.AtomicBinOp.add, memref, val, offset, syncscope)
 
 
+def atomic_or_i32(memref, val, offset, syncscope):
+    """Atomically OR an int32 value in and return the previous value."""
+    return _atomic_rmw_i32(_llvm.AtomicBinOp._or, memref, val, offset, syncscope)
+
+
 def atomic_max_i32(memref, val, offset, syncscope):
     """Atomically take the signed max and return the previous value.
 

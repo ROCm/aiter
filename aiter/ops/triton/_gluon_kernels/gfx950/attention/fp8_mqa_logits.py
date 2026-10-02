@@ -944,6 +944,11 @@ def _gluon_fp8_mqa_logits_kernel(
         M_CHUNK == 0 or BLOCK_M == 1,
         "chunked head fold is only wired up for BLOCK_M == 1",
     )
+    gl.static_assert(
+        M_CHUNK == 0 or NUM_CHAINS >= 1,
+        "chunked head fold only has a folded-reduction path, so it needs "
+        "NUM_CHAINS >= 1; pass M_CHUNK == 0 when the fold is unavailable",
+    )
 
     # Reversed so the longest segments (highest row ids in a causal layout) are
     # dispatched first. With BLOCK_M > 1 the reversal is at block granularity.

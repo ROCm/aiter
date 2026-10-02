@@ -29,7 +29,10 @@ def fused_mul_add(
     - out: same shape as x
     """
     _LOGGER.info(
-        f"FUSED_MUL_ADD: x={tuple(x.shape)} a={tuple(a.shape) if isinstance(a, torch.Tensor) else a} b={tuple(b.shape) if isinstance(b, torch.Tensor) else b}"
+        "FUSED_MUL_ADD: x=%s a=%s b=%s",
+        tuple(x.shape),
+        tuple(a.shape) if isinstance(a, torch.Tensor) else a,
+        tuple(b.shape) if isinstance(b, torch.Tensor) else b,
     )
 
     N = x.numel()
