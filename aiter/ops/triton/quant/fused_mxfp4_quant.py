@@ -210,8 +210,15 @@ def fused_rms_gated_mxfp4_quant(
 
     Key parameters:
     - x, z: Matrices with shape (M, N), contiguous.
-    - weight: Vector with shape (group_size,) or (N,) if group_size is None.
-    - activation: "silu" (or "swish") or "sigmoid".
+    - weight: Vector with shape (group_size,) or (N,) if group_size is None,
+      shared by every group.
+    - eps: Added to the mean of squares before the reciprocal square root.
+    - norm_before_gate: Selects between the two formulas above. The default,
+      True, is the order of RMSNormGated(norm_before_gate=True).
+    - activation: "silu" (or "swish") or "sigmoid", applied to z.
+    - group_size: Length of each RMS group along N, or None for the whole row.
+      It must divide N and be a multiple of 32, so that no MXFP4 block spans
+      two groups.
 
     Returns:
     - out_fp4: The output matrix with shape (M, N // 2).
@@ -220,9 +227,17 @@ def fused_rms_gated_mxfp4_quant(
     _LOGGER.info("FUSED_RMS_GATED_MXFP4_QUANT: inp=%s", tuple(x.shape))
 
     MXFP4_QUANT_BLOCK_SIZE = 32
-    assert x.is_contiguous() and z.is_contiguous()
-    assert x.shape == z.shape, "x and z must have the same shape"
-    assert activation in ("silu", "swish", "sigmoid"), f"unsupported {activation=}"
+    if x.dim() != 2 or x.shape != z.shape:
+        raise ValueError(
+            f"x and z must be 2-D with the same shape, got {tuple(x.shape)} "
+            f"and {tuple(z.shape)}"
+        )
+    if not (x.is_contiguous() and z.is_contiguous()):
+        raise ValueError("x and z must be contiguous")
+    if activation not in ("silu", "swish", "sigmoid"):
+        raise ValueError(
+            f"activation must be 'silu', 'swish' or 'sigmoid', got {activation!r}"
+        )
     M, N = x.shape
     G = N if group_size is None else int(group_size)
     if G <= 0 or N % G != 0 or G % MXFP4_QUANT_BLOCK_SIZE != 0:
@@ -230,7 +245,10 @@ def fused_rms_gated_mxfp4_quant(
             f"group_size ({G}) must divide N ({N}) and be a multiple of "
             f"{MXFP4_QUANT_BLOCK_SIZE}"
         )
-    assert weight.numel() == G, "weight must have group_size elements"
+    if weight.numel() != G:
+        raise ValueError(
+            f"weight must have group_size ({G}) elements, got {weight.numel()}"
+        )
 
     x = x.view(-1, G)
     z = z.view(-1, G)

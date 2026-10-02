@@ -297,6 +297,39 @@ def test_fused_rms_gated_mxfp4_quant(
     torch.testing.assert_close(ref, out, atol=0.5, rtol=0.5)
 
 
+@pytest.mark.parametrize(
+    "case",
+    [
+        "shape_mismatch",
+        "not_2d",
+        "not_contiguous",
+        "activation",
+        "group_size",
+        "weight_size",
+    ],
+)
+def test_fused_rms_gated_mxfp4_quant_rejects_bad_inputs(case: str):
+    # Validation runs before any launch, so CPU tensors are enough.
+    x = torch.randn((4, 256), dtype=torch.bfloat16, device="cpu")
+    z = torch.randn_like(x)
+    w = torch.randn(128, dtype=torch.bfloat16, device="cpu")
+    kwargs = {"group_size": 128}
+    if case == "shape_mismatch":
+        z = z[:, :128]
+    elif case == "not_2d":
+        x, z = x.view(4, 2, 128), z.view(4, 2, 128)
+    elif case == "not_contiguous":
+        x = torch.randn((256, 4), dtype=torch.bfloat16, device="cpu").t()
+    elif case == "activation":
+        kwargs["activation"] = "gelu"
+    elif case == "group_size":
+        kwargs["group_size"] = 96
+    elif case == "weight_size":
+        w = w[:64]
+    with pytest.raises(ValueError):
+        fused_rms_gated_mxfp4_quant(x, w, z, 1e-6, **kwargs)
+
+
 def run_torch_reduce_act_mul_mxfp4_group_quant(x, x2, activation, dtype, shuffle):
     x = x.to(torch.float32)
     d = x.shape[-1] // 2
