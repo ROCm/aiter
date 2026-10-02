@@ -839,6 +839,69 @@ def test_k1_table_padded_to_max_model_len():
     )
 
 
+def test_k1_padded_decode_graph_capture():
+    """Decode on a max_model_len table captures into a HIP graph and replays.
+
+    vLLM captures decode into full graphs, where the padded-table width
+    readback is not allowed. Replays twice, the second time with new queries
+    written into the captured buffer, against the oracle.
+    """
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    idx = FAMILY_A_INDEXER
+    device = torch.device("cuda")
+    page_size, max_pages, context = 16, 4096, 65536
+    n_blocks = context // idx.compress_ratio
+    torch.manual_seed(0)
+    k_bar = torch.randn(n_blocks, idx.head_dim, dtype=dtypes.bf16, device=device)
+    gen = torch.Generator(device=device)
+    gen.manual_seed(1)
+    index_cache, index_table = pack_paged_cache(
+        k_bar.unsqueeze(1), page_size, generator=gen
+    )
+    decode_lens = [3000, 9000, 30000, context]
+    m = len(decode_lens)
+    slen = torch.tensor(decode_lens, dtype=dtypes.i32, device=device)
+    t2r = torch.arange(m, dtype=dtypes.i32, device=device)
+    qpos = slen - 1
+    table = torch.zeros(m, max_pages, dtype=dtypes.i32, device=device)
+    table[:, : index_table.shape[1]] = index_table
+    q = torch.randn(m, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device)
+    out = torch.empty(m, k1_kernel._K, dtype=dtypes.i32, device=device)
+
+    def oracle():
+        return qsa_topk_blocks(
+            qsa_indexer_scores(
+                q,
+                k_bar,
+                qpos,
+                slen,
+                t2r,
+                idx.compress_ratio,
+                score_scale=FAMILY_A_SCORE_SCALE,
+            ),
+            idx.block_budget,
+        )
+
+    def launch():
+        qsa_k1_block_ids(q, index_cache, table, t2r, qpos, slen, out=out, heads=(4,))
+
+    launch()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+    for replay in range(2):
+        if replay:
+            q.copy_(torch.randn_like(q))
+        out.fill_(-2)
+        graph.replay()
+        torch.cuda.synchronize()
+        _assert_k1_block_ids(
+            oracle(), out, f"K1 padded decode graph replay {replay} diverged"
+        )
+
+
 def test_k1_decode_rejects_invalid_page_ids():
     """The one-row scorer must not load a page id that is not in the cache.
 
