@@ -150,6 +150,23 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
                     const int32_t consuming_blks = remain_kv_blocks;
                     const int32_t num_splits     = curr_n_split_idx + 1;
 
+                    if(curr_n_split_idx > 0)
+                    {
+                        for(int32_t qo_tile_idx = lane_idx; qo_tile_idx < num_qo_tiles;
+                            qo_tile_idx += opus::get_warp_size())
+                        {
+                            const int32_t reduce_tile_idx = global_reduce_tile_idx + qo_tile_idx;
+                            const int32_t qo_start =
+                                qo_state.get_begin(curr_batch) + qo_tile_idx * qo_tile_size;
+                            params.p_reduce_indptr[reduce_tile_idx + 1] =
+                                last_reduce_indptr + (qo_tile_idx + 1) * num_splits;
+                            params.p_reduce_final_map[reduce_tile_idx * 2] = qo_start;
+                            params.p_reduce_final_map[reduce_tile_idx * 2 + 1] =
+                                opus::min(qo_start + qo_tile_size, qo_state.get_end(curr_batch));
+                        }
+                        global_reduce_tile_idx += num_qo_tiles;
+                    }
+
                     auto fill_work_info = [&](const int32_t qo_tile_idx,
                                               const int32_t split_idx,
                                               const int32_t khead_idx = 0) {
@@ -175,18 +192,6 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
                         {
                             // set work info
                             work_info.partial_qo_loc = partial_idx + qo_tile_idx * qo_tile_size;
-
-                            // set reduce info
-                            if(lane_idx == 0)
-                            {
-                                params.p_reduce_indptr[global_reduce_tile_idx + 1] =
-                                    last_reduce_indptr + (qo_tile_idx + 1) * num_splits;
-                                params.p_reduce_final_map[global_reduce_tile_idx * 2] =
-                                    work_info.qo_start;
-                                params.p_reduce_final_map[global_reduce_tile_idx * 2 + 1] =
-                                    work_info.qo_end;
-                                global_reduce_tile_idx += 1;
-                            }
 
                             if constexpr(Traits::kQoSplits)
                             {

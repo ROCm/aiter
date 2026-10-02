@@ -201,6 +201,26 @@ void get_pa_metadata_v1(
     AITER_CHECK(pages_kv_indptr.dtype() == AITER_DTYPE_i32,
                 __func__, ": seqlens_kv_indptr's element type should be int!");
 
+    const int64_t packed_query_length = int64_t(max_seqlen_qo) * num_heads_per_head_k;
+    if(packed_query_length > 128)
+    {
+        const int64_t query_tiles = (packed_query_length + 127) / 128;
+        const int64_t batch_size = context_lens.size(0);
+        const int64_t num_cu = get_num_cu_func();
+        const int64_t max_work = (batch_size + num_cu - 1) * query_tiles * num_heads_k;
+        const int64_t max_partials =
+            std::min(batch_size + num_cu - 1, (num_cu - 1) * 2) * query_tiles;
+        if(reduce_indptr.numel() < size_t(batch_size * query_tiles + 1) ||
+           reduce_final_map.numel() < size_t(batch_size * query_tiles * 2) ||
+           work_info_set.numel() < size_t(max_work * 8) ||
+           reduce_partial_map.numel() < size_t(max_partials))
+        {
+            throw std::invalid_argument(
+                "metadata buffers are too small for the maximum query tile count; "
+                "use get_pa_metadata_info_v1 with max_seqlen_qo and num_heads_per_head_k");
+        }
+    }
+
     get_pa_metadata_v1_2_device(
         seqlens_qo_indptr,
         pages_kv_indptr,
