@@ -817,6 +817,39 @@ def _mla_softmax_reducev_kernel(
 # fmt: on
 
 
+# Coefficients for the bh16 split budget, fitted on gfx950 (MI355X). Only
+# their ratio selects a split count, so the absolute scale is arbitrary.
+_SPLIT_WAVE_WGS = 256
+_SPLIT_WALK_COST = 2.2799  # per wave x BLOCK_N iteration
+_SPLIT_PARTIAL_COST = 0.053446  # per partial written by stage 1 and reduced by stage 2
+_SPLIT_MAX = 8
+
+
+def _bh16_num_kv_splits(base_grid, block_n, kv_len=None):
+    """Split count minimizing wave-quantized KV walk plus the cost of splitting.
+
+    `base_grid` is the unsplit workgroup count (batch x qlen x head blocks).
+    Launching `base_grid * s` workgroups occupies cdiv(base_grid * s, 256)
+    waves and each workgroup walks cdiv(kv_len / s, BLOCK_N) iterations, so the
+    walk costs their product -- splitting only pays off when it buys a wave it
+    does not also have to fill. Against that, stage 1 writes `base_grid * s`
+    partials that stage 2 reads back, which is why more splits eventually lose.
+
+    `kv_len=None` means the caller has told us nothing about the context, and
+    there is no sound way to weigh a walk against a reduce without it; fall
+    back to the occupancy-only budget rather than guess.
+    """
+    if kv_len is None:
+        return max(1, 256 // base_grid)
+
+    def cost(s):
+        iters = triton.cdiv(max(block_n, kv_len // s), block_n)
+        c = _SPLIT_WALK_COST * triton.cdiv(base_grid * s, _SPLIT_WAVE_WGS) * iters
+        return c + (_SPLIT_PARTIAL_COST * base_grid * s if s > 1 else 0.0)
+
+    return min(range(1, _SPLIT_MAX + 1), key=lambda s: (cost(s), s))
+
+
 def mla_gluon(
     q_nope,  # [batch, nhead, kv_lora_rank] or MTP [batch, qlen, nhead, kv_lora_rank]
     q_pe,  # [batch, nhead, qk_rope_head_dim] or MTP [batch, qlen, nhead, qk_rope_head_dim]
@@ -836,6 +869,7 @@ def mla_gluon(
     return_lse=False,
     has_pe=True,
     attn_sink=None,  # [nhead] fp32 per-head sink bias, None means no sink
+    kv_len_hint=None,  # bh16: representative KV length for the split budget
 ):
     """Unified Gluon MLA entry (gfx950 / CDNA4) — decode and DeepSeek V4 sparse prefill.
 
@@ -855,6 +889,12 @@ def mla_gluon(
 
     return_lse=True: additionally returns the merged log-sum-exp, a separate
         fp32 tensor [batch, qlen, nhead]
+
+    kv_len_hint (bh16 regimes only): a representative KV length for the launch,
+        used to pick NUM_KV_SPLITS from a cost model instead of from occupancy
+        alone. It is a caller-supplied scalar, not a device tensor, so a
+        CUDA-graph caller can pass its capacity and keep the pick fixed across
+        replays. Left as None the budget is exactly what it is today.
 
     DSv4 Sparse prefill packs NoPE and RoPE in to one contiguous row (448+64).
     To run DSv4 prefill, it requires has_pe=False, prepares valid Q / K in q_nope / kv_c,
@@ -954,7 +994,9 @@ def mla_gluon(
         # partition from the runtime KV length. Head blocks and MTP qlen already
         # consume part of the wave, so the budget divides by them too.
         NUM_M_BLOCKS = triton.cdiv(nhead, BLOCK_H)
-        NUM_KV_SPLITS = max(1, 256 // (batch_size * qlen * NUM_M_BLOCKS))
+        NUM_KV_SPLITS = _bh16_num_kv_splits(
+            batch_size * qlen * NUM_M_BLOCKS, BLOCK_N, kv_len_hint
+        )
         assert (
             q_nope.dtype == torch.bfloat16 and q_pe.dtype == torch.bfloat16
         ), f"q_nope/q_pe must be bf16, got {q_nope.dtype}/{q_pe.dtype}"
