@@ -783,6 +783,10 @@ def qsa_sparse_paged_attention(
         block_n, target_splits, partial_warps = 64, 1, 2
     partial_stages = 1
 
+    # Sparse attention over an empty index list should return zeros.
+    if logical_indices.shape[1] == 0:
+        return out.zero_()
+
     num_tiles = triton.cdiv(logical_indices.shape[1], block_n)
     max_useful_splits = 1 << (num_tiles.bit_length() - 1)
     num_splits = min(max_useful_splits, target_splits)
