@@ -262,7 +262,11 @@ def test_strided_layouts():
             )
             end = None
             if ragged:
-                end = lens if layout == "input+end" else torch.stack([lens, lens], 1)[:, 0]
+                end = (
+                    lens
+                    if layout == "input+end"
+                    else torch.stack([lens, lens], 1)[:, 0]
+                )
             guard, out = None, None
             if layout == "output":
                 guard = torch.full((m, k + 32), -7, dtype=dtypes.i32)
@@ -271,7 +275,7 @@ def test_strided_layouts():
             try:
                 idx = _run_single_backend(x, lens, k, backend, end=end, output_idx=out)
                 torch.cuda.synchronize()
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 failures.append(f"{label}: {type(e).__name__}: {e}")
                 continue
             if not torch.equal(_sorted_values(x, idx), run_torch(x, lens, k)):
