@@ -1,5 +1,5 @@
 ---
-applyTo: "aiter/ops/flydsl/**,aiter/ops/*.py,op_tests/test_flydsl*.py,op_tests/flydsl_tests/**,aiter/aot/flydsl/**"
+applyTo: "aiter/ops/flydsl/**,aiter/ops/*.py,op_tests/test_flydsl*.py,op_tests/flydsl_tests/**,aiter/aot/flydsl/**,aiter/jit/utils/chip_info.py"
 ---
 
 # AITER FlyDSL / ops wrappers — PR review rules
