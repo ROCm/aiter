@@ -35,6 +35,9 @@ from aiter.ops.flydsl.kernels.hyper_connection_gated_residual import (
     gr_mix,
     merge_gr_two_stage_weight,
 )
+from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.common import (
+    merge_down_inject,
+)
 from aiter.test_common import checkAllclose
 
 # Shipped model dimensions (Qwen3.8-Flash-Next).
@@ -295,6 +298,35 @@ def _run_full_norm_weight(tokens, fold_w):
     )
 
 
+def _run_pad16_merged(tokens):
+    """Exercise vLLM's caller-padded 336-column merged weight."""
+    inp = _make_inputs(tokens, seed=11)
+    merged = merge_down_inject(inp["w_down"], inp["w_inject"], 336)
+    r2, x, inj = flydsl_gr_two_stage_combine_and_mix(
+        inp["residual"],
+        inp["block_output"],
+        inp["injection"],
+        inp["norm_weight"],
+        inp["w_down"],
+        inp["w_up"],
+        inp["w_inject"],
+        HC,
+        EPS,
+        w_down_merged=fold_norm_weight(merged, inp["norm_weight"], HC),
+        fold_w=True,
+    )
+    torch.cuda.synchronize()
+    r2_ref, x_ref, inj_ref = _ref(inp, "combine_and_mix")
+    _check(r2_ref.to(r2.dtype), r2, f"pad16[M={tokens}] r2", atol=0.05, rtol=0.02)
+    _check(x_ref.to(x.dtype), x, f"pad16[M={tokens}] x")
+    _check(
+        inj_ref.to(inj.dtype),
+        inj.contiguous(),
+        f"pad16[M={tokens}] inj",
+        atol=0.05,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Correctness test for the two-stage HC Gated-Residual op."
@@ -310,7 +342,7 @@ def main():
         "--decode-tokens",
         type=int,
         nargs="+",
-        default=[1, 3, 4, 5, 8, 32],
+        default=[1, 3, 4, 5, 6, 7, 8, 32],
         help="small (decode) token counts; 4/5 pin the skinny<->tail DECODE_MAX_M boundary.",
     )
     args = parser.parse_args()
@@ -340,6 +372,8 @@ def main():
     for m in (3, 512):
         for fold_w in (False, True):
             _run_full_norm_weight(m, fold_w)
+    for m in (1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 512, 4096):
+        _run_pad16_merged(m)
 
     if _FAILURES:
         print(f"\n{len(_FAILURES)} check(s) FAILED: {_FAILURES}")

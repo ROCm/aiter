@@ -20,8 +20,8 @@ Table schema (``aiter/configs/model_configs/hc_gated_residual_tuned.json``)::
       "gfx950": {
         "up_gate_mix": {"256": {"block_m": 64, "block_n": 32,
                                  "m_waves": 1, "n_waves": 2, "_us": 13.14}, ...},
-        "down":        {"256": {"method": "splitk",
-                                 "config": {...}, "_us": 18.88}, ...}
+        "k1":          {"256": {"method": "splitk", ...}, ...},
+        "k1_n336":     {"256": {"method": "splitk", ...}, ...}
       }
     }
 
@@ -87,7 +87,7 @@ def up_gate_mix_config(arch: str, tokens: int):
     return {k: e[k] for k in ("block_m", "block_n", "m_waves", "n_waves")}
 
 
-def k1_plan(arch: str, tokens: int):
+def k1_plan(arch: str, tokens: int, n_pad: int | None = None):
     """Tuned fused-K1 (combine+norm+down) plan or ``None``.
 
     Entry is a flat dict: ``method`` (``"decouple"`` or ``"splitk"``) plus the
@@ -102,7 +102,13 @@ def k1_plan(arch: str, tokens: int):
     not be overwritten by a nearest-snap onto a large-M decouple entry. Below the
     tuned range this returns ``None`` (kernel keeps its heuristic).
     """
-    tbl = _table().get(arch, {}).get("k1")
+    arch_table = _table().get(arch, {})
+    # Shape-specific tables are additive: vLLM's 16-row-padded merged weight
+    # uses n_pad=336, while AITER's native merged weight uses the default
+    # n_pad=384 table. Once a shape table exists, keep using it outside its
+    # measured range: a generic plan can have incompatible N-wave geometry.
+    specific = arch_table.get(f"k1_n{n_pad}") if n_pad is not None else None
+    tbl = specific or arch_table.get("k1")
     if not tbl:
         return None
     keys = sorted(int(k) for k in tbl)

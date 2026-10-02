@@ -191,6 +191,140 @@
         "dn_m_waves": 2,
         "dn_n_waves": 2
       }
+    },
+    "k1_n336": {
+      "64": {
+        "method": "splitk",
+        "_us": 22.24,
+        "split_k": 32,
+        "sk_block_m": 32,
+        "block_k": 64,
+        "dn_block_n": 112,
+        "dn_m_waves": 2,
+        "dn_n_waves": 1
+      },
+      "128": {
+        "method": "splitk",
+        "_us": 24.96,
+        "split_k": 32,
+        "sk_block_m": 32,
+        "block_k": 64,
+        "dn_block_n": 48,
+        "dn_m_waves": 1,
+        "dn_n_waves": 1
+      },
+      "256": {
+        "method": "splitk",
+        "_us": 28.02,
+        "split_k": 20,
+        "sk_block_m": 64,
+        "block_k": 64,
+        "dn_block_n": 112,
+        "dn_m_waves": 2,
+        "dn_n_waves": 1
+      },
+      "512": {
+        "method": "splitk",
+        "_us": 34.0,
+        "split_k": 20,
+        "sk_block_m": 32,
+        "block_k": 64,
+        "dn_block_n": 112,
+        "dn_m_waves": 1,
+        "dn_n_waves": 1
+      },
+      "1024": {
+        "method": "splitk",
+        "_us": 44.84,
+        "split_k": 16,
+        "sk_block_m": 64,
+        "block_k": 64,
+        "dn_block_n": 112,
+        "dn_m_waves": 2,
+        "dn_n_waves": 1
+      },
+      "2048": {
+        "method": "splitk",
+        "_us": 68.6,
+        "split_k": 8,
+        "sk_block_m": 64,
+        "block_k": 64,
+        "dn_block_n": 112,
+        "dn_m_waves": 2,
+        "dn_n_waves": 1
+      },
+      "4096": {
+        "method": "decouple",
+        "_us": 115.22,
+        "block_k": 128,
+        "dn_block_m": 64,
+        "dn_block_n": 48,
+        "dn_m_waves": 2,
+        "dn_n_waves": 1
+      },
+      "8192": {
+        "method": "decouple",
+        "_us": 214.52,
+        "block_k": 64,
+        "dn_block_m": 64,
+        "dn_block_n": 112,
+        "dn_m_waves": 2,
+        "dn_n_waves": 1
+      },
+      "12288": {
+        "method": "decouple",
+        "_us": 289.02,
+        "block_k": 64,
+        "dn_block_m": 128,
+        "dn_block_n": 112,
+        "dn_m_waves": 2,
+        "dn_n_waves": 1
+      },
+      "16384": {
+        "method": "decouple",
+        "_us": 325.94,
+        "block_k": 64,
+        "dn_block_m": 128,
+        "dn_block_n": 112,
+        "dn_m_waves": 2,
+        "dn_n_waves": 1
+      },
+      "24576": {
+        "method": "decouple",
+        "_us": 546.71,
+        "block_k": 64,
+        "dn_block_m": 128,
+        "dn_block_n": 112,
+        "dn_m_waves": 2,
+        "dn_n_waves": 1
+      },
+      "32768": {
+        "method": "decouple",
+        "_us": 730.27,
+        "block_k": 64,
+        "dn_block_m": 128,
+        "dn_block_n": 112,
+        "dn_m_waves": 2,
+        "dn_n_waves": 1
+      },
+      "49152": {
+        "method": "decouple",
+        "_us": 1130.31,
+        "block_k": 64,
+        "dn_block_m": 128,
+        "dn_block_n": 112,
+        "dn_m_waves": 2,
+        "dn_n_waves": 1
+      },
+      "65536": {
+        "method": "decouple",
+        "_us": 1459.07,
+        "block_k": 64,
+        "dn_block_m": 128,
+        "dn_block_n": 112,
+        "dn_m_waves": 2,
+        "dn_n_waves": 1
+      }
     }
   },
   "gfx942": {

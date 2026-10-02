@@ -1048,8 +1048,13 @@ def flydsl_k1k2_skinny_decode(
             skinny_two_kernel,
         )
 
-        skinny_impl = skinny_chunked_two_kernel if tokens == 8 else skinny_two_kernel
-        skinny_kwargs = {"chunk_m": 2} if tokens == 8 else {}
+        # From M=3 the one-group kernel loses to grid.y token groups: use two
+        # rows per group for even M and one for odd M.
+        chunked = tokens >= 3
+        skinny_impl = skinny_chunked_two_kernel if chunked else skinny_two_kernel
+        skinny_kwargs = (
+            {"chunk_m": 2 if tokens % 2 == 0 else 1} if chunked else {}
+        )
         r2, x, packed = skinny_impl(
             residual,
             block_output,
@@ -1472,6 +1477,7 @@ def flydsl_k1_combine_norm_down(
     assert injection.dtype == torch.bfloat16 and injection.is_contiguous()
     assert w_dn_merged.dtype == torch.bfloat16 and w_dn_merged.is_contiguous()
     tokens, hidden = residual.shape
+    n_pad = w_dn_merged.shape[0]
     # Default tile height. The async-LDS pipeline (stages>=2) needs
     # block_m*block_k >= block_threads*async_vec (block_m>=32 here) for the async
     # loads to be whole-thread-covered, and pipe@32 beats the non-pipe body at
@@ -1493,7 +1499,7 @@ def flydsl_k1_combine_norm_down(
     # absent entry -> plan is None -> pure heuristic (behavior-preserving). Keyed
     # on gemm_tokens so a padded low-M tail resolves like its padded size.
     arch = arch_name(residual.device)
-    plan = k1_plan(arch, gemm_tokens) if use_tuned else None
+    plan = k1_plan(arch, gemm_tokens, n_pad) if use_tuned else None
     # gfx942: the aiter async-LDS pipe now lowers on CDNA3 via the
     # 32-bit buffer_load...lds DMA (gemm_a16w16_gfx950 async width is arch-aware),
     # so the decouple/monolithic *pipe* is enabled (it wins at large M, 8192 K1
@@ -1562,7 +1568,6 @@ def flydsl_k1_combine_norm_down(
             f"block_threads*async_vec; got block_m={block_m}, block_k={block_k}"
         )
     stream_dim = hidden // hc_count
-    n_pad = w_dn_merged.shape[0]
     assert w_dn_merged.shape == (n_pad, hidden)
     assert block_output.shape == (tokens, stream_dim)
     assert injection.shape == (tokens, hc_count)
@@ -1640,6 +1645,10 @@ def flydsl_k1_combine_norm_down(
         # than the default 1x4 for the pipelined split-K partial at mid M.
         _sk_mw = dn_m_waves if dn_m_waves is not None else 2
         _sk_nw = dn_n_waves if dn_n_waves is not None else 2
+        # A caller's own padding (vLLM folds to 16 rows: n_pad=336) can leave a
+        # full-width tile that no 2-wave split divides.
+        while _sk_nw > 1 and sk_bn % (_sk_nw * mma.mma_n):
+            _sk_nw //= 2
         if _gfx942_regp_partial:
             part = _build_down_norm_partial(
                 hidden,
@@ -1720,6 +1729,8 @@ def flydsl_k1_combine_norm_down(
         # per-dimension tuning missed. dn_m/n_waves override for tuning.
         _dn_mw = dn_m_waves if dn_m_waves is not None else 2
         _dn_nw = dn_n_waves if dn_n_waves is not None else 2
+        while _dn_nw > 1 and _dn_bn % (_dn_nw * mma.mma_n):
+            _dn_nw //= 2
         downpipe = _build_down_norm_pipe(
             hidden,
             n_pad,
