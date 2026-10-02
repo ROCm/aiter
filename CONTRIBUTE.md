@@ -92,7 +92,7 @@ pip install -e .
 AITER uses `pre-commit` to maintain code quality. Install it before making changes:
 
 ```bash
-pip install black==26.3.0 ruff==0.15.7
+pip install black==26.3.0 ruff==0.16.0
 apt install clang-format-18
 
 # Install pre-commit hooks
