@@ -38,6 +38,7 @@ from triton.language.core import PropagateNan
 from triton.language.core import _aggregate as aggregate
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
 from aiter.ops.triton.utils.common_utils import strip_annotate
 
 # Triton's default max ignores NaN, which on AMD costs a canonicalize per
@@ -1774,6 +1775,20 @@ def _process_segment(
     return m_i, l_i, acc
 
 
+@gluon.jit
+def _xcd_work(GRID_ORDER: gl.constexpr, NUM_XCDS: gl.constexpr):
+    """(query, split, head block) of this program, remapped with remap_xcd so
+    the programs that read the same KV rows share an XCD and its L2."""
+    n0 = gl.num_programs(0)
+    n1 = gl.num_programs(1)
+    n2 = gl.num_programs(2)
+    lid = gl.program_id(0) + n0 * (gl.program_id(1) + n1 * gl.program_id(2))
+    w = remap_xcd(lid, n0 * n1 * n2, NUM_XCDS)
+    nh = gl.num_programs(GRID_ORDER.index("h"))
+    ns = gl.num_programs(GRID_ORDER.index("s"))
+    return w // (nh * ns), (w // nh) % ns, w % nh
+
+
 _sparse_mla_repr = make_kernel_repr(
     "_sparse_mla",
     ["BLOCK_M", "BLOCK_K", "HEAD_SIZE", "SPLIT_K", "MAIN_FMT", "ROPE_SEPARATE"],
@@ -1886,6 +1901,8 @@ def _sparse_mla(
     IDX_PREFETCH: gl.constexpr = False,
     KV_LDS_PAD: gl.constexpr = 0,
     UNPEEL: gl.constexpr = False,
+    # XCD count to remap program ids over (see _xcd_work); 0 keeps grid order.
+    XCD_REMAP: gl.constexpr = 0,
 ):
     """One program = (query, split, head-block). Two-loop: main (SWA) then
     extra (top-k). Without SPLIT_K it writes the output directly; otherwise it
@@ -1969,9 +1986,12 @@ def _sparse_mla(
         extra_cs0 = gl.multiple_of(extra_cs0, CS0_ALIGN)
     # GRID_ORDER names the launch axes in grid-dim order; dim 0 varies fastest,
     # which decides XCD/L2 sharing.
-    query_idx = gl.program_id(GRID_ORDER.index("q"))
-    split_id = gl.program_id(GRID_ORDER.index("s"))
-    pid_h = gl.program_id(GRID_ORDER.index("h"))
+    if XCD_REMAP > 0:
+        query_idx, split_id, pid_h = _xcd_work(GRID_ORDER, XCD_REMAP)
+    else:
+        query_idx = gl.program_id(GRID_ORDER.index("q"))
+        split_id = gl.program_id(GRID_ORDER.index("s"))
+        pid_h = gl.program_id(GRID_ORDER.index("h"))
 
     cfg = Cfg(
         BLOCK_M,

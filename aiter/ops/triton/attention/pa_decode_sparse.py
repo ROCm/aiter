@@ -32,7 +32,7 @@ from aiter.ops.triton._triton_kernels.attention.pa_decode_sparse import (
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.common_utils import max_addressable_bytes
-from aiter.ops.triton.utils.device_info import get_num_sms
+from aiter.ops.triton.utils.device_info import get_num_sms, get_num_xcds
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 
@@ -595,6 +595,7 @@ def _pa_decode_sparse_gfx950_gluon(
         and max_addressable_bytes(extra_indices) < MAX_BYTES
     )
     use_buffer_load = main_use_buffer_load and extra_use_buffer_load
+    prefill = num_queries >= _PREFILL_MIN_ROWS
     HEAD_ALIGNED = num_heads % BLOCK_M == 0
     heads_blocks = (num_heads + BLOCK_M - 1) // BLOCK_M
     out = _check_out(out, q, torch.bfloat16)
@@ -685,6 +686,17 @@ def _pa_decode_sparse_gfx950_gluon(
     else:
         deq = "none"
 
+    # Put programs that read the same KV rows on one XCD so they share an L2.
+    # Not for SWA-only or 16-head prefill, or for launches padded past the
+    # split count, where it does not help.
+    xcd_remap = (
+        get_num_xcds()
+        if grid_splits == num_splits
+        and (has_extra or not prefill)
+        and not (prefill and num_heads <= 16)
+        else 0
+    )
+
     # Grid dim 0 varies fastest and XCD assignment is round-robin over the linear
     # workgroup id, so the axis order decides what shares an XCD's L2.
     grid = (num_queries, grid_splits, heads_blocks)
@@ -755,6 +767,7 @@ def _pa_decode_sparse_gfx950_gluon(
         IDX_BUFFER_LOAD=idx_use_buffer_load,
         HAS_INVALID=has_invalid,
         UNPEEL=unpeel,
+        XCD_REMAP=xcd_remap,
         num_warps=num_warps,
         waves_per_eu=waves_per_eu,
         **prefill_kw,
