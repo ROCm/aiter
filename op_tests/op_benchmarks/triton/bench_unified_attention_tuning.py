@@ -363,8 +363,10 @@ def parse_args(args=None):
         action="append",
         metavar="NAME=JSON",
         help="A named attn_2d config override, repeatable. The first is the "
-        "baseline every later one is divided by. Example: "
-        "--config 'split={\"SPLIT_UNMASKED_LOOP\": true}'",
+        "baseline every later one is divided by, and each is layered on top of "
+        "the resolved table entry. To A/B a flag the table already sets, make "
+        "the baseline the arm that turns it off: "
+        "--config 'nosplit={\"SPLIT_UNMASKED_LOOP\": false}' --config 'split={}'",
     )
     parser.add_argument("--warmup", type=int, default=200, help="do_bench warmup (ms)")
     parser.add_argument("--rep", type=int, default=800, help="do_bench rep (ms)")
