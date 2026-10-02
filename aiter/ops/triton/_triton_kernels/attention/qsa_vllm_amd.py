@@ -462,6 +462,24 @@ def _validate_mqa(q: torch.Tensor) -> None:
         raise ValueError("QSA query must be [rows, heads, head_dim]")
 
 
+def _unit_stride_int32(
+    name: str, tensor: torch.Tensor, length: int, device: torch.device
+) -> torch.Tensor:
+    """Return a contiguous int32 vector of ``length``.
+
+    The scorer and expand kernels load these as ``ptr + index`` and do not
+    take a stride. A view such as ``base[::2]`` would otherwise read the
+    neighboring element.
+    """
+    if tensor.dtype != torch.int32 or tensor.shape != (length,):
+        raise ValueError(
+            f"{name} must be int32 [{length}], got {tensor.dtype} {tuple(tensor.shape)}"
+        )
+    if tensor.device != device:
+        raise ValueError(f"{name} must be on {device}, got {tensor.device}")
+    return tensor.contiguous()
+
+
 def qsa_mqa_paged(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -479,20 +497,23 @@ def qsa_mqa_paged(
     Zero is rejected. A negative divisor flips the score sign.
     """
     _validate_mqa(q)
-    if not q.is_cuda:
-        raise RuntimeError("paged QSA scoring requires a GPU")
     if k_cache.ndim != 4 or k_cache.shape[2] != 1:
         raise ValueError("QSA cache must be [pages, page_size, 1, head_dim]")
     if k_cache.shape[3] != q.shape[2]:
         raise ValueError("QSA query and cache dimensions must match")
     if page_table.ndim != 2:
         raise ValueError("QSA page table must be two-dimensional")
-    if token_to_req.shape != (q.shape[0],):
-        raise ValueError("QSA request mapping must match query rows")
-    if query_positions.shape != (q.shape[0],):
-        raise ValueError("QSA query positions must match query rows")
-    if sequence_lengths.shape != (page_table.shape[0],):
-        raise ValueError("QSA sequence lengths must match page-table requests")
+    token_to_req = _unit_stride_int32(
+        "token_to_req", token_to_req, q.shape[0], q.device
+    )
+    query_positions = _unit_stride_int32(
+        "query_positions", query_positions, q.shape[0], q.device
+    )
+    sequence_lengths = _unit_stride_int32(
+        "sequence_lengths", sequence_lengths, page_table.shape[0], q.device
+    )
+    if not q.is_cuda:
+        raise RuntimeError("paged QSA scoring requires a GPU")
     if compress_ratio <= 0:
         raise ValueError("QSA compression ratio must be positive")
     score_divisor = math.sqrt(q.shape[2]) if score_scale is None else score_scale
@@ -552,15 +573,32 @@ def expand_qsa_block_indices_cuda(
     token_topk: int,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    if not block_indices.is_cuda:
-        raise RuntimeError("QSA index expansion requires a GPU")
     if token_topk % compress_ratio:
         raise ValueError("QSA token top-k must be divisible by compression ratio")
     block_topk = token_topk // compress_ratio
     output_width = token_topk + compress_ratio - 1
-    if block_indices.shape != (query_positions.numel(), block_topk):
-        raise ValueError("QSA compressed top-k has an invalid shape")
     rows = block_indices.shape[0]
+    query_positions = _unit_stride_int32(
+        "query_positions", query_positions, rows, block_indices.device
+    )
+    token_to_req = _unit_stride_int32(
+        "token_to_req", token_to_req, rows, block_indices.device
+    )
+    if sequence_lengths.dim() != 1:
+        raise ValueError(
+            "sequence_lengths must be a 1-D int32 vector, "
+            f"got {sequence_lengths.dtype} {tuple(sequence_lengths.shape)}"
+        )
+    sequence_lengths = _unit_stride_int32(
+        "sequence_lengths",
+        sequence_lengths,
+        sequence_lengths.shape[0],
+        block_indices.device,
+    )
+    if block_indices.shape != (rows, block_topk):
+        raise ValueError("QSA compressed top-k has an invalid shape")
+    if not block_indices.is_cuda:
+        raise RuntimeError("QSA index expansion requires a GPU")
     if out is None:
         out = torch.empty(
             (rows, output_width),
@@ -624,6 +662,16 @@ def qsa_select_paged_tokens(
     output_width = token_topk + compress_ratio - 1
     if out is None:
         out = torch.empty((rows, output_width), dtype=torch.int32, device=q.device)
+    if page_table.ndim != 2:
+        raise ValueError("QSA page table must be two-dimensional")
+    # One copy for every chunk. The kernels index these with a unit stride.
+    token_to_req = _unit_stride_int32("token_to_req", token_to_req, rows, q.device)
+    query_positions = _unit_stride_int32(
+        "query_positions", query_positions, rows, q.device
+    )
+    sequence_lengths = _unit_stride_int32(
+        "sequence_lengths", sequence_lengths, page_table.shape[0], q.device
+    )
     if not rows:
         blocks = torch.empty(
             (0, token_topk // compress_ratio), dtype=torch.int32, device=q.device
