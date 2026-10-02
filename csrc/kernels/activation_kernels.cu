@@ -826,7 +826,11 @@ situv2_activate_scalar(const opus::vector_t<opus::bf16_t, VecSize>& gate,
 // FP32 LDS. WARP_SIZE is a device compile-time constant (32 on gfx12, 64 on
 // gfx9/gfx950), so the reduction follows the native wave topology on both, and
 // a single-wave block skips the cross-wave stage entirely.
-template <int32_t BlockSize, int32_t VecSize, int32_t StaticD = 0, bool SinglePass = false>
+template <int32_t BlockSize,
+          int32_t VecSize,
+          int32_t StaticD = 0,
+          bool SinglePass = false,
+          bool RecomputeMultiPass = false>
 __global__ __launch_bounds__(BlockSize) void situv2_and_mul_quant_kernel(
     opus::fp8_t* __restrict__ out,
     const opus::bf16_t* __restrict__ input,
@@ -873,12 +877,13 @@ __global__ __launch_bounds__(BlockSize) void situv2_and_mul_quant_kernel(
         out_ptr, dim * sizeof(opus::fp8_t));
 
     extern __shared__ float activated[];
-    auto* reduce_scratch = activated + (register_resident ? 0 : dim);
+    auto* reduce_scratch =
+        activated + ((register_resident || RecomputeMultiPass) ? 0 : dim);
     float thread_max = 0.0f;
     using vec_f       = opus::vector_t<float, VecSize>;
     vec_f register_values{};
 
-    auto activate_chunk = [&](int idx) {
+    auto compute_chunk = [&](int idx) {
         auto gate = load_vector_nbytes<
             opus::bf16_t, VecSize, load_chunk_bytes, GROUP_NT>(gate_buffer, idx);
         auto up = load_vector_nbytes<
@@ -901,9 +906,18 @@ __global__ __launch_bounds__(BlockSize) void situv2_and_mul_quant_kernel(
             act_values = situv2_activate_scalar<VecSize>(
                 gate, up, beta, gate_tanh_mul, linear_beta, up_tanh_mul, thread_max);
         }
+        return act_values;
+    };
+
+    auto activate_chunk = [&](int idx) {
+        vec_f act_values = compute_chunk(idx);
         if constexpr(register_resident)
         {
             register_values = act_values;
+        }
+        else if constexpr(RecomputeMultiPass)
+        {
+            return;
         }
         else if constexpr(VecSize == 8 && StaticD != 0)
         {
@@ -998,6 +1012,10 @@ __global__ __launch_bounds__(BlockSize) void situv2_and_mul_quant_kernel(
         if constexpr(register_resident)
         {
             values = register_values;
+        }
+        else if constexpr(RecomputeMultiPass)
+        {
+            values = compute_chunk(idx);
         }
         else if constexpr(VecSize == 8 && StaticD != 0)
         {
@@ -1733,7 +1751,11 @@ void silu_and_mul_quant(const aiter_tensor_t& out,
     }
 }
 
-template <int32_t BlockSize, int32_t VecSize, int32_t StaticD = 0, bool SinglePass = false>
+template <int32_t BlockSize,
+          int32_t VecSize,
+          int32_t StaticD = 0,
+          bool SinglePass = false,
+          bool RecomputeMultiPass = false>
 static void launch_situv2_and_mul_quant(const aiter_tensor_t& out,
                                         const aiter_tensor_t& input,
                                         const aiter_tensor_t& scale,
@@ -1760,15 +1782,17 @@ static void launch_situv2_and_mul_quant(const aiter_tensor_t& out,
     const size_t num_waves  = (BlockSize + wave_size - 1) / wave_size;
     // Activations need d floats unless they stay in registers; the cross-wave
     // scratch needs num_waves floats unless the block is a single wave.
-    const size_t lds_bytes = (static_cast<size_t>(register_resident ? 0 : d) +
+    const size_t lds_bytes =
+        (static_cast<size_t>((register_resident || RecomputeMultiPass) ? 0 : d) +
                               (single_wave ? 0 : num_waves)) *
-                             sizeof(float);
+        sizeof(float);
     // Both live in one dynamic allocation, so a wide row plus its scratch can
     // outgrow the 64 KB budget even though d alone fits. Catch it here instead
     // of at the launch, which would only report hipErrorInvalidValue.
     AITER_CHECK(lds_bytes <= get_smem_size_func(),
                 "situv2_and_mul_quant: d is too large for the LDS budget");
-    situv2_and_mul_quant_kernel<BlockSize, VecSize, StaticD, SinglePass>
+    situv2_and_mul_quant_kernel<
+        BlockSize, VecSize, StaticD, SinglePass, RecomputeMultiPass>
         <<<dim3(num_tokens), dim3(BlockSize), lds_bytes, stream>>>(
             reinterpret_cast<opus::fp8_t*>(out.data_ptr()),
             reinterpret_cast<const opus::bf16_t*>(input.data_ptr()),
@@ -1838,10 +1862,23 @@ void situv2_and_mul_quant(const aiter_tensor_t& out,
 #define LAUNCH_SITUV2_SP(BLOCK_SIZE, VEC_SIZE, STATIC_D)                                   \
     launch_situv2_and_mul_quant<BLOCK_SIZE, VEC_SIZE, STATIC_D, true>(                     \
         out, input, scale, d, num_tokens, beta, linear_beta, stream)
+#define LAUNCH_SITUV2_RECOMPUTE(BLOCK_SIZE, VEC_SIZE)                                      \
+    launch_situv2_and_mul_quant<BLOCK_SIZE, VEC_SIZE, 0, false, true>(                      \
+        out, input, scale, d, num_tokens, beta, linear_beta, stream)
 
-    if(d == 33792)
+    const size_t smem_size = get_smem_size_func();
+    const size_t static_scratch = (1024 / wave_size) * sizeof(float);
+    if(d == 33792 &&
+       static_cast<size_t>(d) * sizeof(float) + static_scratch <= smem_size)
     {
         LAUNCH_SITUV2(1024, 8, 33792);
+        return;
+    }
+    const size_t generic_block = wave_size == 32 ? 96 : 256;
+    const size_t generic_scratch = generic_block / wave_size * sizeof(float);
+    if(static_cast<size_t>(d) * sizeof(float) + generic_scratch > smem_size)
+    {
+        LAUNCH_SITUV2_RECOMPUTE(1024, 8);
         return;
     }
 
@@ -1936,6 +1973,7 @@ void situv2_and_mul_quant(const aiter_tensor_t& out,
 
 #undef LAUNCH_SITUV2
 #undef LAUNCH_SITUV2_SP
+#undef LAUNCH_SITUV2_RECOMPUTE
 }
 
 void gelu_and_mul(const aiter_tensor_t& out,   // [..., d]

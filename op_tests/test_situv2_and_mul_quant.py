@@ -106,7 +106,7 @@ def run_edge_shapes():
     )
 
     if get_gfx() == "gfx1250":
-        for d in (33792, 81912):
+        for d in (33792, 81912, 81920, 100000):
             x = torch.randn((2, 2 * d), dtype=dtypes.bf16)
             ref = run_torch(x)
             out = torch.empty((2, d), dtype=dtypes.fp8)
