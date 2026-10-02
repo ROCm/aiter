@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import os  # [tl]
 import math
 
 import flydsl.compiler as flyc
@@ -229,6 +230,7 @@ C_CDONE = 46
 C_COLJ = 47
 C_UNIT = 48
 C_DXON = 54
+C_VBON = 55
 C_CLAIM = 56
 C_XC, C_XC_N = 64, 32
 C_UL = 96
@@ -327,6 +329,14 @@ def compile_mega_moe_tp(
     MLL = DLL and not RREP
     ARLL = DLL and bool(ar)
     AG8 = bool(ag8) and bool(ar) and not ARLL
+    TLX = os.environ.get("AITER_MEGAMOE_TP_TL", "0") == "1"  # [tl]
+    # dynamic schedule: when the units take at most ~1.5 rounds of the CTAs
+    # (C_VBON), the weights of single-block units go straight into VGPRs (an
+    # LDS-DMA ring caps a wave at ~9 GB/s; with few units that, not HBM, bounds
+    # the GEMMs, with more of them the VGPR path only costs)
+    VBS = os.environ.get("AITER_MEGAMOE_TP_VBS") == "1"  # [exp]
+    VB = DYN or VBS  # [exp]
+    AUX_B = int(os.environ.get("AITER_MEGAMOE_TP_VBAUX", "0"))  # [exp]
 
     def _g2_step(n):
         nsk2 = _nsk2_for(n, G2)
@@ -368,7 +378,9 @@ def compile_mega_moe_tp(
         + ("_cb16" if CB16 else "")
         + ("_xrep" if XREP else "")
         + ("_ag8" if AG8 else "")
+        + ("_tlx" if TLX else "")  # [tl]
         + (f"_dx{DX_NG}" if DX else "")
+        + (f"_vbs{AUX_B}" if VBS else f"_a{AUX_B}")  # [exp]
     )
     const_expr = fx.const_expr
     # flydsl's cache key ignores module constants: the kernel references this tag
@@ -756,6 +768,17 @@ def compile_mega_moe_tp(
             _llvm.call_intrinsic(T.i64, "llvm.amdgcn.s.memrealtime", [], [], [])
         )
 
+    @traced  # [tl]
+    def tlx(a, k):  # [tl]
+        if const_expr(TLX):  # [tl]
+            off = i32(CTRL_INTS) + i32(gpu.block_id("x")) * i32(16) + i32(k)  # [tl]
+            g_st_sys(ctrl_at(a, off), fx.Int32(_now()))  # [tl]
+  # [tl]
+    @traced  # [tl]
+    def tlx0(a, tid, k):  # [tl]
+        if tid == i32(0):  # [tl]
+            tlx(a, k)  # [tl]
+  # [tl]
     def _alive(t0):
         return (_now() - t0) < fx.Int64(DEADLINE)
 
@@ -904,14 +927,40 @@ def compile_mega_moe_tp(
 
     @traced
     def wait_a_chunk(L, lane, buf, q):
-        if lane == i32(0):
-            spin_lds_ge(L, L_CTL + (C_ASEQ * 4) + buf * i32(4), q + i32(1))
+        if const_expr(VB):
+            # a spin loop the compiler sees makes it drain the weight loads in
+            # flight (vmcnt(0)) before every A chunk
+            _llvm.inline_asm(
+                T.i32,
+                [_u(L + i32(L_CTL + C_ASEQ * 4) + buf * i32(4)), _u(q + i32(1))],
+                "1:\n\tds_read_b32 $0, $1\n\ts_waitcnt lgkmcnt(0)\n\t"
+                "v_cmp_lt_i32 vcc, $0, $2\n\ts_cbranch_vccz 2f\n\t"
+                "s_sleep 0\n\ts_branch 1b\n2:",
+                "=&v,v,v,~{vcc},~{memory}",
+                has_side_effects=True,
+            )
+        else:
+            if lane == i32(0):
+                spin_lds_ge(L, L_CTL + (C_ASEQ * 4) + buf * i32(4), q + i32(1))
         rocdl.sched_barrier(0)
 
     @traced
     def release_a_chunk(L, lane, buf):
-        if lane == i32(0):
-            lds_atomic_add(L, L_CTL + C_AFREE * 4 + buf * i32(4), 1, REL)
+        if const_expr(VB):
+            # branch-free (a branch splits the GEMM1 step loop and the merge
+            # drains the weight loads too); after this wave's reads of the
+            # chunk, as LDS executes a wave's ops in order
+            asm(
+                "ds_add_u32 $0, $1",
+                "v,v,~{memory}",
+                (
+                    L + i32(L_CTL + C_AFREE * 4) + buf * i32(4),
+                    (lane == i32(0)).select(i32(1), i32(0)),
+                ),
+            )
+        else:
+            if lane == i32(0):
+                lds_atomic_add(L, L_CTL + C_AFREE * 4 + buf * i32(4), 1, REL)
 
     def g1_group(nnb):
         if const_expr(npp > 1):
@@ -921,7 +970,12 @@ def compile_mega_moe_tp(
     @traced
     def gemm1(L, tid, a, expert, i0, nnb):
         nnb = uni(nnb)
-        if const_expr(npp > 1):
+        if const_expr(VB):
+            if ((nnb == i32(1)) & (lds_ld_i32(L, L_CTL + C_VBON * 4) != i32(0))) | VBS:
+                _gemm1_vb(L, tid, a, expert, i0, nnb, 1)
+            else:
+                _gemm1(L, tid, a, expert, i0, nnb, 1)
+        elif const_expr(npp > 1):
             if (nnb % i32(npp)) == i32(0):
                 _gemm1(L, tid, a, expert, i0, nnb, npp)
             else:
@@ -1050,6 +1104,116 @@ def compile_mega_moe_tp(
                     res[o + 2 * MT : o + NA],
                     grp * i32(P) + i32(pp),
                 )
+        _store_qbase(L, lane, w, qbase + (nnb // i32(P)) * i32(NCH))
+
+    @traced
+    def _gemm1_vb(L, tid, a, expert, i0, nnb, P):
+        # _gemm1 with the weight ring in VGPRs, carried by the loops; the K
+        # steps of a column block are unrolled (across a loop back-edge the
+        # compiler's vmcnt bookkeeping gives up and drains the ring)
+        lane = tid % i32(64)
+        w = uni(tid // i32(64))
+        e = uni(expert)
+        rw = rsrc(fx.Int64(a["w1"]) + fx.Int64(e) * fx.Int64(2 * I * (H // 2)))
+        rws = rsrc(a["w1s"])
+        icol0 = uni(i0) + w * i32(32)
+        vg0 = icol0 * i32(H // 2) + lane * i32(16)
+        vg1 = vg0 + i32(16 * (H // 2))
+        vu0 = vg0 + i32(I * (H // 2))
+        vu1 = vu0 + i32(16 * (H // 2))
+        vsl = lane * i32(4)
+        sg0 = uni((e * i32(2 * I) + icol0) // i32(32)) * i32(CH1 * 256)
+        su0 = uni((e * i32(2 * I) + i32(I) + icol0) // i32(32)) * i32(CH1 * 256)
+        total = nnb * i32(KS1)
+        qbase = lds_ld_i32(L, L_CTL + C_QBASE * 4 + w * i32(4))
+        GS = KS1 * P
+
+        def load_b(g):
+            gc = fx.min(g, total - i32(1))
+            grp = gc // i32(GS)
+            r = gc - grp * i32(GS)
+            kk = r // i32(P)
+            pas = grp * i32(P) + (r - kk * i32(P))
+            so = pas * i32(128 * (H // 2)) + kk * i32(1024)
+            sso = pas * i32((128 // 32) * CH1 * 256) + (kk // i32(2)) * i32(256)
+            return [bld(rw, v, so, V4I, AUX_B) for v in (vg0, vg1, vu0, vu1)] + [
+                bld(rws, vsl, sg0 + sso, T.i32, 0),
+                bld(rws, vsl, su0 + sso, T.i32, 0),
+            ]
+
+        ring0 = []
+        for kk in range_constexpr(nsk):
+            ring0 += load_b(i32(kk))
+        zero = fx.Vector.filled(4, 0.0, fx.Float32)
+        NA = 4 * MT
+        for grp_, ost in range(i32(0), nnb // i32(P), i32(1), init=ring0):
+            grp = i32(grp_)
+            acc = [zero] * (NA * P)
+            ring = list(ost)
+            for g0c in range_constexpr(0, GS, nsk):
+                g0 = grp * i32(GS) + i32(g0c)
+                qb = qbase + grp * i32(NCH) + i32(g0c // (P * KCS))
+                for ks in range_constexpr(nsk // P):
+                    k = ks % KCS
+                    q = qb + i32(ks // KCS)
+                    buf = q % i32(NAB)
+                    rocdl.sched_barrier(0)
+                    if k == 0:
+                        wait_a_chunk(L, lane, buf, q)
+                    abuf = L + i32(L_A) + buf * i32(RG * ACB)
+                    asbuf = (
+                        L
+                        + i32(L_AS)
+                        + buf * i32(KCS * NSC_BLK * 64 * 4)
+                        + i32(k * NSC_BLK * 64 * 4)
+                    )
+                    kh = ks & 1
+                    for pp in range_constexpr(P):
+                        s_ = ks * P + pp
+                        g = g0 + i32(s_)
+                        b = ring[6 * s_ : 6 * s_ + 4]
+                        sgw = fx.Int32(ring[6 * s_ + 4])
+                        suw = fx.Int32(ring[6 * s_ + 5])
+                        g0s = (sgw >> i32(8 * (kh * 2))) & i32(0xFF)
+                        g1s = (sgw >> i32(8 * (kh * 2 + 1))) & i32(0xFF)
+                        u0s = (suw >> i32(8 * (kh * 2))) & i32(0xFF)
+                        u1s = (suw >> i32(8 * (kh * 2 + 1))) & i32(0xFF)
+                        o = pp * NA
+                        for m in range_constexpr(MT):
+                            row = i32(m * 16) + lane % i32(16)
+                            col = (i32(k * 4) + lane // i32(16)) ^ (row & i32(7))
+                            af = lds_ld(abuf, row * i32(ACB) + col * i32(16), V4I, 16)
+                            sa = fx.Int32(
+                                lds_ld(asbuf, row * i32(4) + lane // i32(16), T.i8, 1)
+                            ) & i32(0xFF)
+                            acc[o + m * 2 + 0] = mfma(
+                                b[0], af, acc[o + m * 2 + 0], g0s, sa
+                            )
+                            acc[o + m * 2 + 1] = mfma(
+                                b[1], af, acc[o + m * 2 + 1], g1s, sa
+                            )
+                            acc[o + 2 * MT + m * 2 + 0] = mfma(
+                                b[2], af, acc[o + 2 * MT + m * 2 + 0], u0s, sa
+                            )
+                            acc[o + 2 * MT + m * 2 + 1] = mfma(
+                                b[3], af, acc[o + 2 * MT + m * 2 + 1], u1s, sa
+                            )
+                        ring[6 * s_ : 6 * s_ + 6] = load_b(g + i32(nsk))
+                        rocdl.sched_barrier(0)
+                    if k == KCS - 1:
+                        release_a_chunk(L, lane, buf)
+            ag_stage_free(L, lane, a)
+            for pp in range_constexpr(P):
+                o = pp * NA
+                act_quant_store(
+                    L,
+                    lane,
+                    w,
+                    acc[o : o + 2 * MT],
+                    acc[o + 2 * MT : o + NA],
+                    grp * i32(P) + i32(pp),
+                )
+            _ = yield ring
         _store_qbase(L, lane, w, qbase + (nnb // i32(P)) * i32(NCH))
 
     @traced
@@ -1189,22 +1353,30 @@ def compile_mega_moe_tp(
             wait_vm(rlag_wait)
             report_chunk(L, lane, w, (gi // i32(GPC)) - i32(lag))
 
-    def store_route_fp8(rs, halves, rix, n0, q4, ok, oob, a):
-        packs, e8s = [], []
+    def store_route_fp8(rs, accs, wt, rix, n0, q4, ok, oob, a):
+        # accs: the 4 column tiles of a row; lane row q4 holds columns
+        # 16 t + 4 q4 + i of tile t. Quantize each 32-column half (its rows'
+        # amax across the 4 lane rows), then transpose the 4 x 4 dwords across
+        # the lane rows: row q4 ends with the 16 columns of tile q4
+        d, e8s = [], []
         for half in range_constexpr(2):
-            f = bf16x8_to_f32(fx.Vector.from_elements(halves[half], fx.Int32))
+            f = [
+                fx.Float32(fx.Vector(accs[2 * half + h])[i]) * wt
+                for h in range(2)
+                for i in range(4)
+            ]
             am = amax(f)
             am = am.maximumf(am.shuffle_xor(i32(16), i32(64)))
             am = am.maximumf(am.shuffle_xor(i32(32), i32(64)))
             e8, qs = _e8m0_from_amax(am, max_norm=448.0)
-            packs.append([fp8x4_pack(f[0:4], qs), fp8x4_pack(f[4:8], qs)])
+            d += [fp8x4_pack(f[0:4], qs), fp8x4_pack(f[4:8], qs)]
             e8s.append(fx.Int32(e8) & i32(0xFF))
-        lo, hi = [], []
-        for dw in range_constexpr(2):
-            x, y = swap32(packs[0][dw], packs[1][dw])
-            lo.append(x)
-            hi.append(y)
-        col = n0 + (q4 >> i32(1)) * i32(32) + (q4 & i32(1)) * i32(16)
+        d0, d1 = swap16(d[0], d[1])
+        d2, d3 = swap16(d[2], d[3])
+        d0, d2 = swap32(d0, d2)
+        d1, d3 = swap32(d1, d3)
+        lo, hi = [d0, d1], [d2, d3]
+        col = n0 + q4 * i32(16)
         if const_expr(DLL):
             e8 = ((q4 >> i32(1)) == i32(0)).select(e8s[0], e8s[1])
             off = (rix * i32(H) + col) * i32(2)
@@ -1235,7 +1407,46 @@ def compile_mega_moe_tp(
         gi_hi=None,
         colsig=None,
         pre=None,
+        span=None,
     ):
+        # groups this call covers when known at trace time (unrolled loop)
+        span = G2 if gi_lo is None else span
+        args = (L, tid, a, expert, ks0, r0, rows, signal, NKS, pidx)
+        kw = {
+            "gi_lo": gi_lo,
+            "gi_hi": gi_hi,
+            "colsig": colsig,
+            "pre": pre,
+            "span": span,
+        }
+        if const_expr(VB and span is not None):
+            if (lds_ld_i32(L, L_CTL + C_VBON * 4) != i32(0)) | VBS:
+                _gemm2(*args, vb2=True, **kw)
+            else:
+                _gemm2(*args, **kw)
+        else:
+            _gemm2(*args, **kw)
+
+    @traced
+    def _gemm2(
+        L,
+        tid,
+        a,
+        expert,
+        ks0,
+        r0,
+        rows,
+        signal,
+        NKS,
+        pidx,
+        gi_lo=None,
+        gi_hi=None,
+        colsig=None,
+        pre=None,
+        span=None,
+        vb2=False,
+    ):
+        VB2 = vb2
         NSK2 = _nsk2_for(NKS, G2)
         GPI = (NSK2 * NKS // math.gcd(NSK2, NKS)) // NKS
         assert G2 % GPI == 0
@@ -1266,6 +1477,30 @@ def compile_mega_moe_tp(
             gi = qc // i32(NKS)
             k = ks0 + qc - gi * i32(NKS)
             n0 = (w + i32(NW) * gi) * i32(64)
+            if const_expr(VB2):
+                return [
+                    bld(
+                        rw,
+                        lane * i32(16),
+                        (n0 + i32(t * 16)) * i32(I // 2) + k * i32(1024),
+                        V4I,
+                        AUX_B,
+                    )
+                    for t in range(4)
+                ] + [
+                    bld(
+                        rws,
+                        lane * i32(4),
+                        (
+                            ((e * i32(H) + n0 + i32(p * 32)) // i32(32)) * i32(CH2)
+                            + k // i32(2)
+                        )
+                        * i32(256),
+                        T.i32,
+                        0,
+                    )
+                    for p in range(2)
+                ]
             slot = ring + i32(slot_idx * SLOT)
             for t in range_constexpr(4):
                 dma16(
@@ -1284,26 +1519,47 @@ def compile_mega_moe_tp(
                     (rb * i32(CH2) + k // i32(2)) * i32(256),
                 )
 
+        rr = []
         for qq in range_constexpr(NSK2):
-            issue(g_lo * i32(NKS) + i32(qq), qq)
+            rr += issue(g_lo * i32(NKS) + i32(qq), qq) or []
         if const_expr(pre is not None):
             pre()
         zero = fx.Vector.filled(4, 0.0, fx.Float32)
-        for gi0_ in range(g_lo, g_hi, i32(GPI)):
-            gi0 = i32(gi0_)
+
+        # each lane's row (weight, route index): the same for every group
+        row_meta = []
+        for m in range_constexpr(MT):
+            R = i32(m * 16) + lane % i32(16)
+            ok = R < rows
+            Rc = ok.select(R, i32(0))
+            row_meta.append(
+                (
+                    ok,
+                    fx.Float32(lds_ld(L, i32(L_WT) + (r0 + Rc) * i32(4), T.f32)),
+                    lds_ld_i32(L, L_RIX + (r0 + Rc) * i32(4)),
+                )
+            )
+
+        def groups(gi0, rr):
+            rr = list(rr)
             for j in range_constexpr(GPI):
                 gi = gi0 + i32(j)
                 acc = [zero] * (4 * MT)
                 for k in range_constexpr(NKS):
                     sidx = (j * NKS + k) % NSK2
-                    wait_vm(WAIT_B2)
-                    slot = ring + i32(sidx * SLOT)
-                    b = [
-                        lds_ld(slot, i32(t * 1024) + lane * i32(16), V4I, 16)
-                        for t in range(4)
-                    ]
-                    s0 = lds_ld_i32(slot, i32(4096) + lane * i32(4))
-                    s1 = lds_ld_i32(slot, i32(4096 + 256) + lane * i32(4))
+                    if const_expr(VB2):
+                        b = rr[6 * sidx : 6 * sidx + 4]
+                        s0 = fx.Int32(rr[6 * sidx + 4])
+                        s1 = fx.Int32(rr[6 * sidx + 5])
+                    else:
+                        wait_vm(WAIT_B2)
+                        slot = ring + i32(sidx * SLOT)
+                        b = [
+                            lds_ld(slot, i32(t * 1024) + lane * i32(16), V4I, 16)
+                            for t in range(4)
+                        ]
+                        s0 = lds_ld_i32(slot, i32(4096) + lane * i32(4))
+                        s1 = lds_ld_i32(slot, i32(4096 + 256) + lane * i32(4))
                     sh0 = ((ks0 + i32(k)) & i32(1)) * i32(16)
                     sb = [
                         (s0 >> sh0) & i32(0xFF),
@@ -1349,49 +1605,63 @@ def compile_mega_moe_tp(
                     rocdl.s_setprio(0)
                     wait_lgkm0()
                     rocdl.sched_barrier(0)
-                    issue(gi * i32(NKS) + i32(k + NSK2), (j * NKS + k + NSK2) % NSK2)
+                    nxt = issue(gi * i32(NKS) + i32(k + NSK2), sidx)
+                    if const_expr(VB2):
+                        rr[6 * sidx : 6 * sidx + 6] = nxt
                     rocdl.sched_barrier(0)
                 n0 = (w + i32(NW) * gi) * i32(64)
                 ccol = (q4 & i32(1)) * i32(16) + (q4 >> i32(1)) * i32(8)
                 for m in range_constexpr(MT):
-                    R = i32(m * 16) + lane % i32(16)
-                    ok = R < rows
-                    Rc = ok.select(R, i32(0))
-                    wt = fx.Float32(lds_ld(L, i32(L_WT) + (r0 + Rc) * i32(4), T.f32))
-                    rix = lds_ld_i32(L, L_RIX + (r0 + Rc) * i32(4))
-                    pk = []
-                    for t in range_constexpr(4):
-                        av = fx.Vector(acc[m * 4 + t])
-                        pk.append(
-                            [
-                                pack_bf16x2(
-                                    fx.Float32(av[2 * h]) * wt,
-                                    fx.Float32(av[2 * h + 1]) * wt,
-                                )
-                                for h in range(2)
-                            ]
+                    ok, wt, rix = row_meta[m]
+                    if const_expr(FP8R):
+                        store_route_fp8(
+                            r_routes,
+                            acc[m * 4 : m * 4 + 4],
+                            wt,
+                            rix,
+                            n0,
+                            q4,
+                            ok,
+                            oob,
+                            a,
                         )
-                    halves = []
-                    for half in range_constexpr(2):
-                        ta, tb = 2 * half, 2 * half + 1
-                        lo, hi = [], []
-                        for h in range_constexpr(2):
-                            x, y = swap16(pk[ta][h], pk[tb][h])
-                            lo.append(x)
-                            hi.append(y)
-                        if const_expr(FP8R):
-                            halves.append(lo + hi)
-                        else:
+                    else:
+                        pk = []
+                        for t in range_constexpr(4):
+                            av = fx.Vector(acc[m * 4 + t])
+                            pk.append(
+                                [
+                                    pack_bf16x2(
+                                        fx.Float32(av[2 * h]) * wt,
+                                        fx.Float32(av[2 * h + 1]) * wt,
+                                    )
+                                    for h in range(2)
+                                ]
+                            )
+                        for half in range_constexpr(2):
+                            ta, tb = 2 * half, 2 * half + 1
+                            lo, hi = [], []
+                            for h in range_constexpr(2):
+                                x, y = swap16(pk[ta][h], pk[tb][h])
+                                lo.append(x)
+                                hi.append(y)
                             ov = fx.Vector.from_elements(lo + hi, fx.Int32)
                             col = n0 + i32(half * 32) + ccol
                             voff = (rix * i32(H) + col) * i32(2)
                             bst(ov, r_routes, ok.select(voff, oob), 0, AUX_SC1)
-                    if const_expr(FP8R):
-                        store_route_fp8(r_routes, halves, rix, n0, q4, ok, oob, a)
                 if const_expr(not DLL):
                     maybe_report(L, lane, w, gi, signal, LAG * RLAG, LAG)
                     if const_expr(colsig is not None):
                         col_report(L, a, lane, gi, g_lo, colsig, RLAG)
+            return rr
+
+        if const_expr(VB2):
+            # unrolled: a loop back-edge makes the compiler drain the ring
+            for gi0c in range_constexpr(0, span, GPI):
+                rr = groups(g_lo + i32(gi0c), rr)
+        else:
+            for gi0_ in range(g_lo, g_hi, i32(GPI)):
+                groups(i32(gi0_), rr)
         wait_vm(0)
         if const_expr(not DLL):
             _final_report(L, lane, w, signal)
@@ -1456,6 +1726,7 @@ def compile_mega_moe_tp(
 
     def unit_tile(L, tid, a, expert, i0, icnt, r0, rows, sig):
         gemm1(L, tid, a, expert, i0, icnt // i32(128))
+        tlx0(a, tid, 4)  # [tl]
         gemm2_dispatch(L, tid, a, expert, i0 // i32(128), icnt, r0, rows, sig)
 
     @traced
@@ -1485,7 +1756,9 @@ def compile_mega_moe_tp(
         for u_ in range(ub, ue, i32(1)):
             u = i32(u_)
             expert, i0, icnt, kind = unit_fields(L, a, u, ub)
+            _tl_unit(a, tid, u - ub, 6)  # [tl]
             R = gather_routes(L, tid, a["ids"], a["tw"], a["ttot"], expert)
+            _tl_unit(a, tid, u - ub, 13)  # [tl2]
             if tid == i32(0):
                 lds_st(L, L_CTL + C_UROWS * 4, R)
                 lds_st_rel(L, L_CTL + C_USEQ * 4, u - ub + i32(1))
@@ -1511,6 +1784,7 @@ def compile_mega_moe_tp(
                 cbar(L, tid)
             if const_expr(DX):
                 _dx_flag(a, tid, kind)
+            _tl_unit(a, tid, u - ub, 7)  # [tl]
             if const_expr(XSPLIT):
                 _xq_flag(a, tid, i0, icnt, kind)
                 if const_expr(not DLL):
@@ -1527,16 +1801,24 @@ def compile_mega_moe_tp(
             col_claim(L, tid, a)
             for it_ in range(i32(0), cap, i32(1)):
                 _col_unit(L, tid, a, i32(it_) < cap - i32(1))
+        tlx0(a, tid, 1)  # [tl]
         if const_expr(DX):  # noqa: SIM102 (compile-time guard)
             if lds_ld_i32(L, L_CTL + C_DXON * 4) != i32(0):
                 dx_cols(L, tid, a)
+        tlx0(a, tid, 5)  # [tl]
         if const_expr(DLL):
             _cdone(tid, L)
 
+    @traced  # [tl]
+    def _tl_unit(a, tid, du, k):  # [tl]
+        if (tid == i32(0)) & (du < i32(2)):  # [tl]
+            tlx(a, i32(k) + du * i32(2))  # [tl]
+  # [tl]
     @traced
     def unit_tile_dx(L, tid, a, expert, i0, icnt, kind, r0, rows, sig):
         if (kind & i32(0xFF)) == i32(UNIT_G1X):
             gemm1(L, tid, a, expert, i0, icnt // i32(128))
+            tlx0(a, tid, 4)  # [tl]
             xq_export(L, tid, a, i0, icnt, r0, rows)
         else:
             unit_tile(L, tid, a, expert, i0, icnt, r0, rows, sig)
@@ -1601,6 +1883,7 @@ def compile_mega_moe_tp(
                     g * i32(DX_CG),
                     fx.min((g + i32(1)) * i32(DX_CG), i32(G2)),
                     pre=functools.partial(xq_import_dx, L, tid, a, i0, icnt, r0, rows),
+                    span=DX_CG if DX_CG * DX_NG == G2 else None,
                 )
 
     @traced
@@ -1693,9 +1976,21 @@ def compile_mega_moe_tp(
                 best = better.select(cost, best)
             U = nact * P
             bid = i32(gpu.block_id("x"))
+            # CTAs ranked XCD by XCD (bid % N_XCD is the XCD), so that when the
+            # units do not fill the CTAs every XCD (its share of the memory
+            # bandwidth) gets the same number of them
+            bid = (C % i32(N_XCD) == i32(0)).select(
+                (bid % i32(N_XCD)) * (C // i32(N_XCD)) + bid // i32(N_XCD), bid
+            )
             u_lo = bid * U // C
             u_hi = (bid + i32(1)) * U // C
             icnt = i32(I) // P
+            if const_expr(VB):
+                lds_st(
+                    L,
+                    L_CTL + C_VBON * 4,
+                    (U * i32(2) <= C * i32(3)).select(i32(1), i32(0)),
+                )
             use_x = fx.Boolean(False)
             if const_expr(DX):
                 # one full round and a tail of at most half a round: GEMM2 of
@@ -3324,6 +3619,7 @@ def compile_mega_moe_tp(
             "col0": col0,
             "ncol": ncol,
         }
+        tlx0(a, tid, 10)  # [tl2]
         if const_expr(DYN):
             _dyn_zero(L, tid)
         init_lds(L, tid, a)
@@ -3353,6 +3649,7 @@ def compile_mega_moe_tp(
         gpu.barrier()
         a["ax"] = fx.Int64(mine) + off_x
         a["axs"] = fx.Int64(mine) + off_xs
+        tlx0(a, tid, 0)  # [tl]
         roles(L, tid, a, epoch)
         if const_expr(AR and not ARLL):
             wait_vm(0)
@@ -3360,9 +3657,11 @@ def compile_mega_moe_tp(
         if const_expr(AR and not ARLL):
             yag_flush(L, tid, a)
             yag_wait(tid, a, epoch)
+        tlx0(a, tid, 2)  # [tl]
         if const_expr(AG8):
             gpu.barrier()
             ag8_convert(tid, a)
+        tlx0(a, tid, 3)  # [tl]
         finish(tid, a, epoch)
 
     @flyc.jit

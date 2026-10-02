@@ -276,7 +276,7 @@ class MegaMoeTPEngine:
         )
         arena.commit()
         self.arena = arena
-        self.ctrl = torch.zeros(CTRL_INTS, dtype=torch.int32, device=self.device)
+        self.ctrl = torch.zeros(CTRL_INTS + 256 * 16, dtype=torch.int32, device=self.device)  # [tl]
         self.routes = torch.zeros(
             (tot * topk + 1, H), dtype=torch.bfloat16, device=self.device
         )
