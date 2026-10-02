@@ -9,7 +9,7 @@ operand      shape                          notes
 ``XQ``       ``[M, B, K]`` fp8              M-outer, K-contiguous
 ``WQ``       ``[B, N, K]`` fp8              16x16 preshuffled (ops.shuffle.shuffle_weight)
 ``x_scale``  ``[M, B, K//XK]`` e8m0         row-major, XK = 32 or 128
-``w_scale``  ``[B, N//WN, K//WK]`` e8m0     WN x WK = 32x32, 128x128 or 1xXK
+``w_scale``  ``[B, N//WN, K//WK]`` e8m0     WN x WK = 32x32, 128x128 or 1x32
 ``Out``      ``[M, B, N]`` bf16
 ===========  =============================  ================================
 
@@ -102,6 +102,9 @@ def bmm_kernel_name(
     into registers ``n`` K tiles ahead, ``_nt`` B loaded non-temporal,
     ``_xcd<g>`` the XCD tile order with an xcd_swizzle of ``g``,
     ``_sps`` scales loaded per stage instead of preloaded."""
+    # Without _xcd the swizzle digits would parse back as part of _sk<splits>.
+    if xcd_swizzle < 0 or (xcd_swizzle and not xcd_order):
+        raise ValueError("[FlyDSL gfx950] xcd_swizzle re-tiles the xcd_order run")
     return (
         f"{BMM_MFMA_NAME_PREFIX}_t{tile_m}x{tile_n}x{tile_k}"
         f"_w{m_warp}x{n_warp}_nb{num_buffers}_sk{splits}"
