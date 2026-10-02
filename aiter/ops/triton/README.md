@@ -40,7 +40,9 @@ Public wrapper modules live in the categorized folders; the kernel bodies live
 in `_triton_kernels/` at the same relative category path, or in
 `_gluon_kernels/<arch>/` at the same relative category path when the Gluon
 implementation is architecture-specific.
-Tests mirror the same categories under `op_tests/triton_tests/<category>/`.
+Tests mirror the wrapper folders under `op_tests/triton_tests/`, including
+nested wrapper subpackages (for example,
+`moe/moe_routing/test_moe_routing.py`).
 Kernel bodies are internal: tests, benchmarks, and external code call the
 public wrappers only — never `_triton_kernels/` / `_gluon_kernels/` directly.
 
@@ -455,8 +457,8 @@ never call `logging.basicConfig(...)` from library code.
 
 ## Tests
 
-Tests live under `op_tests/triton_tests/<category>/`, mirroring this
-directory's categories:
+Tests live under `op_tests/triton_tests/`, mirroring the wrapper folder
+structure in this directory, including nested wrapper subpackages:
 
 ```bash
 pytest op_tests/triton_tests/              # everything
