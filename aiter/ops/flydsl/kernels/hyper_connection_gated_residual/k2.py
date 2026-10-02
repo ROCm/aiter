@@ -291,7 +291,7 @@ def flydsl_up_gate_mix_norm(
     assert w_len in (stream_dim, hidden)
 
     arch = arch_name(lora.device)
-    tuned = up_gate_mix_config(arch, tokens)
+    tuned = up_gate_mix_config(arch, tokens, lora.stride(0))
     block_m, block_n, m_waves, n_waves = _resolve_up_gate_cfg(
         tuned,
         tokens,

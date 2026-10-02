@@ -1436,7 +1436,7 @@ def flydsl_k1_combine_norm_down(
     block_k: int | None = None,
     m_waves: int = 1,
     n_waves: int = 4,
-    stages: int = 2,
+    stages: int | None = None,
     split_k: int | str = "auto",
     dn_block_n: int | None = None,
     dn_block_m: int | None = None,
@@ -1478,14 +1478,6 @@ def flydsl_k1_combine_norm_down(
     assert w_dn_merged.dtype == torch.bfloat16 and w_dn_merged.is_contiguous()
     tokens, hidden = residual.shape
     n_pad = w_dn_merged.shape[0]
-    # Default tile height. The async-LDS pipeline (stages>=2) needs
-    # block_m*block_k >= block_threads*async_vec (block_m>=32 here) for the async
-    # loads to be whole-thread-covered, and pipe@32 beats the non-pipe body at
-    # every M, so the pipe default is 32. The rolled single-buffer fallback
-    # (stages<2) keeps the token-adaptive height (block_m=16 wins for small/mid
-    # M, 32 for large; crossover between 4096 and 8192 tokens). An explicit block_m always wins.
-    if block_m is None:
-        block_m = 32 if stages >= 2 else (16 if tokens <= 4096 else 32)
     # Tail path (low-M): when the true token count is not a tile
     # multiple, the GEMM stages run over a padded row count ``gemm_tokens`` while
     # the combine prologue still reads only the true ``tokens`` input rows (it is
@@ -1500,6 +1492,17 @@ def flydsl_k1_combine_norm_down(
     # on gemm_tokens so a padded low-M tail resolves like its padded size.
     arch = arch_name(residual.device)
     plan = k1_plan(arch, gemm_tokens, n_pad) if use_tuned else None
+    if stages is None:
+        stages = int(plan.get("stages", 2)) if plan is not None else 2
+    # Default tile height. The async-LDS pipeline (stages>=2) needs
+    # block_m*block_k >= block_threads*async_vec (block_m>=32 here) for the async
+    # loads to be whole-thread-covered, and pipe@32 beats the non-pipe body at
+    # every M, so the pipe default is 32. The rolled single-buffer fallback
+    # (stages<2) keeps the token-adaptive height (block_m=16 wins for small/mid
+    # M, 32 for large; crossover between 4096 and 8192 tokens). An explicit
+    # block_m always wins.
+    if block_m is None:
+        block_m = 32 if stages >= 2 else (16 if tokens <= 4096 else 32)
     # gfx942: the aiter async-LDS pipe now lowers on CDNA3 via the
     # 32-bit buffer_load...lds DMA (gemm_a16w16_gfx950 async width is arch-aware),
     # so the decouple/monolithic *pipe* is enabled (it wins at large M, 8192 K1

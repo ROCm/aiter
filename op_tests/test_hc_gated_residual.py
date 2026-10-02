@@ -372,7 +372,26 @@ def main():
     for m in (3, 512):
         for fold_w in (False, True):
             _run_full_norm_weight(m, fold_w)
-    for m in (1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 512, 4096):
+    for m in (
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        16,
+        32,
+        64,
+        128,
+        256,
+        512,
+        1024,
+        2048,
+        4096,
+        8192,
+    ):
         _run_pad16_merged(m)
 
     if _FAILURES:

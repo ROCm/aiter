@@ -20,6 +20,8 @@ Table schema (``aiter/configs/model_configs/hc_gated_residual_tuned.json``)::
       "gfx950": {
         "up_gate_mix": {"256": {"block_m": 64, "block_n": 32,
                                  "m_waves": 1, "n_waves": 2, "_us": 13.14}, ...},
+        "up_gate_mix_n336": {"256": {"block_m": 32, "block_n": 16,
+                                      "m_waves": 1, "n_waves": 1, ...}, ...},
         "k1":          {"256": {"method": "splitk", ...}, ...},
         "k1_n336":     {"256": {"method": "splitk", ...}, ...}
       }
@@ -79,9 +81,21 @@ def _entry(arch: str, kernel: str, tokens: int):
     return tbl[str(key)] if key is not None else None
 
 
-def up_gate_mix_config(arch: str, tokens: int):
+def up_gate_mix_config(
+    arch: str, tokens: int, packed_width: int | None = None
+):
     """Tuned ``{block_m, block_n, m_waves, n_waves}`` or ``None``."""
-    e = _entry(arch, "up_gate_mix", tokens)
+    arch_table = _table().get(arch, {})
+    specific = (
+        arch_table.get(f"up_gate_mix_n{packed_width}")
+        if packed_width is not None
+        else None
+    )
+    # K2's best plan can depend on the packed K1 row stride. Shape-specific
+    # overrides are exact-only so a partial table cannot perturb untuned sizes.
+    e = specific.get(str(tokens)) if specific else None
+    if not e:
+        e = _entry(arch, "up_gate_mix", tokens)
     if not e:
         return None
     return {k: e[k] for k in ("block_m", "block_n", "m_waves", "n_waves")}
@@ -92,7 +106,7 @@ def k1_plan(arch: str, tokens: int, n_pad: int | None = None):
 
     Entry is a flat dict: ``method`` (``"decouple"`` or ``"splitk"``) plus the
     kwargs :func:`flydsl_k1_combine_norm_down` consumes -- ``split_k`` (split-K
-    only), ``block_k``, ``sk_block_m`` (split-K partial tile height),
+    only), ``stages``, ``block_k``, ``sk_block_m`` (split-K partial tile height),
     ``dn_block_n``/``dn_block_m``/``dn_m_waves``/``dn_n_waves``.     Missing keys let
     the kernel keep its heuristic default for that dimension, so a partial entry
     is valid. ``_us`` is provenance only.

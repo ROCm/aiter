@@ -58,6 +58,15 @@
         "_us": 165.803
       }
     },
+    "up_gate_mix_n336": {
+      "64": {
+        "block_m": 64,
+        "block_n": 16,
+        "m_waves": 2,
+        "n_waves": 1,
+        "_us": 14.64
+      }
+    },
     "k1": {
       "4096": {
         "method": "decouple",
@@ -195,11 +204,12 @@
     "k1_n336": {
       "64": {
         "method": "splitk",
-        "_us": 22.24,
+        "_us": 22.481,
+        "stages": 3,
         "split_k": 32,
-        "sk_block_m": 32,
+        "sk_block_m": 64,
         "block_k": 64,
-        "dn_block_n": 112,
+        "dn_block_n": 48,
         "dn_m_waves": 2,
         "dn_n_waves": 1
       },
@@ -215,7 +225,8 @@
       },
       "256": {
         "method": "splitk",
-        "_us": 28.02,
+        "_us": 28.6,
+        "stages": 3,
         "split_k": 20,
         "sk_block_m": 64,
         "block_k": 64,
@@ -235,8 +246,9 @@
       },
       "1024": {
         "method": "splitk",
-        "_us": 44.84,
-        "split_k": 16,
+        "_us": 45.68,
+        "stages": 3,
+        "split_k": 10,
         "sk_block_m": 64,
         "block_k": 64,
         "dn_block_n": 112,
@@ -264,10 +276,11 @@
       },
       "8192": {
         "method": "decouple",
-        "_us": 214.52,
+        "_us": 220.962,
+        "stages": 3,
         "block_k": 64,
-        "dn_block_m": 64,
-        "dn_block_n": 112,
+        "dn_block_m": 128,
+        "dn_block_n": 48,
         "dn_m_waves": 2,
         "dn_n_waves": 1
       },
