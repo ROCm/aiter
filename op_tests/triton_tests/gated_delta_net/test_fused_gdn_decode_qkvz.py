@@ -26,6 +26,16 @@ ATOL = 0.05
 FP8_DTYPE = torch.float8_e4m3fn
 FP8_MAX = 448.0
 
+# One batch per dispatch branch in the wrapper, rather than a scaled ladder --
+# sizes within a branch are duplicates of each other:
+#   1    -> _fused_decode,       grid (batch, k_heads)
+#   32   -> _fused_decode_tiled, B32=True, flattened 1-D grid
+#   64   -> _fused_decode,       transposed grid (k_heads, batch)
+#   127  -> _fused_decode_tiled, B32=False, 2-D grid (also INDEX64=True)
+#   128  -> _decode_group,       4 warps
+#   256  -> _decode_group,       8 warps
+_BATCHES = [1, 32, 64, 127, 128, 256]
+
 
 def split_qkvz(projected_qkvz, num_k_heads, num_v_heads, head_k_dim, head_v_dim):
     """Unpack the interleaved ``in_proj_qkvz`` output.
@@ -242,7 +252,7 @@ def _requires_gfx950():
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("batch", [1, 2, 4, 8, 16, 32, 64, 128, 192, 256])
+@pytest.mark.parametrize("batch", _BATCHES)
 def test_reference_shapes_and_finiteness(batch):
     inp = make_inputs(batch)
     normalized, quantized, scales = ref_gdn_decode(
@@ -314,7 +324,7 @@ def test_reference_bf16_and_fp8_are_consistent():
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("batch", [1, 2, 4, 8, 16, 32, 64, 128, 192, 256])
+@pytest.mark.parametrize("batch", _BATCHES)
 def test_fused_gdn_decode_correctness(batch):
     fused_gdn_decode_qkvz = _import_op()
     _requires_gfx950()

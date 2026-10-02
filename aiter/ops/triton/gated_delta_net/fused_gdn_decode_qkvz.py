@@ -23,14 +23,17 @@ hand-written ``v_exp_f32``/``v_rcp_f32`` inline asm and explicit register
 layouts.
 """
 
+import functools
+import re
+
 import torch
 
-from aiter.ops.triton._gluon_kernels.gfx950.gated_delta_net.fused_gdn_decode_qkvz import (
-    _decode_group,
-    _fused_decode,
-    _fused_decode_tiled,
-)
-from aiter.ops.triton.utils._triton.arch_info import get_arch
+# The Gluon tile kernels are imported lazily, at each launch site below, rather
+# than here. This module has to stay importable on a build without
+# ``triton.experimental.gluon`` so that :func:`fused_gdn_decode_qkvz_supported`
+# can report the reason and the caller can take its fallback; a module-level
+# import would raise before the probe is reachable, on exactly the platforms the
+# probe exists for. Mirrors ``fused_gdn_prefill_qkvz.py``.
 
 # SGLang's convention for a padded CUDA-graph row; kernels skip these rows.
 PAD_SLOT_ID = -1
@@ -44,6 +47,53 @@ _HEAD_DIM = 128
 # register-resident tile does. See notes/gdn-perf-matrix.md.
 _LARGE_BATCH = 128
 _CONV_WIDTH = 4
+
+
+def _arch_supported() -> tuple[bool, str]:
+    """gfx950 probe, guarded so architecture detection never raises at import.
+
+    ``arch_info`` detection can touch the driver, so it is imported and called
+    *here*, on the gate path, and any failure is reported as unsupported --
+    keeping this module import-safe on CPU-only / non-ROCm workers where the
+    caller simply takes the fallback chain.
+    """
+    try:
+        from aiter.ops.triton.utils._triton.arch_info import get_arch
+
+        arch = get_arch()
+    except Exception as exc:  # noqa: BLE001
+        # Defensive: any detection failure (driver/subprocess/import) => unsupported.
+        return False, f"architecture detection failed ({exc})"
+    if arch != "gfx950":
+        return False, f"gfx950 only, got {arch}"
+    return True, ""
+
+
+@functools.lru_cache(maxsize=1)
+def _gluon_supported() -> tuple[bool, str]:
+    """Cached probe: can this Triton compile the kernels' Gluon dialect?
+
+    gfx950 alone is not enough. These kernels use the Gluon dialect as it stands
+    in Triton **3.8**; ROCm backported an *earlier, incompatible* Gluon into some
+    3.7 builds where ``triton.experimental.gluon`` imports fine but the layout
+    ops fail to compile. The decode kernels are built from exactly those
+    primitives -- ``gl.BlockedLayout``, ``gl.convert_layout``, ``gl.amd.slice``
+    and ``gl.amd.cdna3.buffer_load``/``store`` -- so the gate is an explicit
+    ``>= 3.8`` version check, not just an import probe.
+    """
+    try:
+        import triton
+    except ImportError as exc:
+        return False, f"triton not importable ({exc})"
+    version = triton.__version__
+    matched = re.match(r"(\d+)\.(\d+)", version or "")
+    if matched is None or (int(matched.group(1)), int(matched.group(2))) < (3, 8):
+        return False, f"Triton >= 3.8 required for this Gluon dialect, got {version}"
+    try:
+        import triton.experimental.gluon
+    except ImportError:
+        return False, f"triton.experimental.gluon unavailable (Triton {version})"
+    return True, ""
 
 
 def fused_gdn_decode_qkvz_supported(
@@ -64,8 +114,13 @@ def fused_gdn_decode_qkvz_supported(
     Returns ``(True, "")`` or ``(False, reason)``. The reason is meant to be
     logged once by the caller on its fallback path.
     """
-    if get_arch() != "gfx950":
-        return False, f"gfx950 only, got {get_arch()}"
+    ok, reason = _arch_supported()
+    if not ok:
+        return False, reason
+
+    ok, reason = _gluon_supported()
+    if not ok:
+        return False, reason
 
     tensors = (
         projected_qkvz,
@@ -286,6 +341,10 @@ def fused_gdn_decode_qkvz(
         # threshold the kernel is bandwidth-bound, where that reaches a better
         # fraction of peak than the latency-hiding decomposition below; under it
         # the reverse holds. A range check, so there are no uncovered sizes.
+        from aiter.ops.triton._gluon_kernels.gfx950.gated_delta_net.fused_gdn_decode_qkvz import (
+            _decode_group,
+        )
+
         _decode_group[(tokens * k_heads,)](
             projected_qkvz,
             projected_ba,
@@ -315,6 +374,10 @@ def fused_gdn_decode_qkvz(
             num_warps=4 if tokens <= 128 else 8,
         )
     elif tokens == 32 or tokens > 64:
+        from aiter.ops.triton._gluon_kernels.gfx950.gated_delta_net.fused_gdn_decode_qkvz import (
+            _fused_decode_tiled,
+        )
+
         grid = (tokens * k_heads,) if tokens == 32 else (tokens, k_heads)
         _fused_decode_tiled[grid](
             *launch_args,
@@ -325,6 +388,10 @@ def fused_gdn_decode_qkvz(
             num_warps=8,
         )
     else:
+        from aiter.ops.triton._gluon_kernels.gfx950.gated_delta_net.fused_gdn_decode_qkvz import (
+            _fused_decode,
+        )
+
         grid = (k_heads, tokens) if tokens == 64 else (tokens, k_heads)
         _fused_decode[grid](
             *launch_args,
