@@ -20,10 +20,10 @@ Plus test_cross_method (differential correctness) that runs every NCHW
 kernel on shapes routable by all of them and verifies they all match
 F.conv2d. NCHW-only by design; 2 cases (one per dtype).
 
-Plus 7 exact-route and configuration-precedence regression cases, and 2
-scalar-parameter cases (one per layout).
+Plus 7 exact-route and configuration-precedence regression cases, 2
+scalar-parameter cases, 1 cache-clear case, and 2 inference-tensor cases.
 
-Total: 12 + 12 + 12 + 36 + 2 + 7 + 2 = 83 cases.
+Total: 12 + 12 + 12 + 36 + 2 + 7 + 2 + 1 + 2 = 86 cases.
 
 Where a kernel's guard rejects a shape (e.g. winograd on a 5x5), the
 shape is silently skipped inside run_all_methods.
