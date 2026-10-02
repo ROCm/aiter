@@ -36,19 +36,19 @@ void top_k_per_row_decode(const aiter_tensor_t& logits,
 // rows selected over their full `stride0` extent (rowStarts/rowEnds contents are
 // not yet honoured). Ask topk_sampled_supports() before calling.
 void top_k_per_row_prefill_sampled(const aiter_tensor_t& logits,
-                               const aiter_tensor_t& rowStarts,
-                               const aiter_tensor_t& rowEnds,
-                               aiter_tensor_t& indices,
-                               std::optional<aiter_tensor_t> values,
-                               int64_t numRows,
-                               int64_t stride0,
-                               int64_t stride1,
-                               int64_t k                               = 2048,
-                               std::optional<aiter_tensor_t> workspace = std::nullopt,
-                               // Whether the caller actually supplied per-row bounds.
-                               // False picks the kernels that do not bounds-check
-                               // every element; the default keeps today's behaviour.
-                               bool ragged                             = true);
+                                   const aiter_tensor_t& rowStarts,
+                                   const aiter_tensor_t& rowEnds,
+                                   aiter_tensor_t& indices,
+                                   std::optional<aiter_tensor_t> values,
+                                   int64_t numRows,
+                                   int64_t stride0,
+                                   int64_t stride1,
+                                   int64_t k                               = 2048,
+                                   std::optional<aiter_tensor_t> workspace = std::nullopt,
+                                   // Whether the caller actually supplied per-row bounds.
+                                   // False picks the kernels that do not bounds-check
+                                   // every element; the default keeps today's behaviour.
+                                   bool ragged = true);
 
 int64_t topk_sampled_workspace_size(int64_t numRows, int64_t stride0, int64_t k);
 bool topk_sampled_supports(int64_t numRows, int64_t stride0, int64_t k);

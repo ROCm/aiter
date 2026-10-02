@@ -13,7 +13,7 @@
 // reading was reformatted to aiter's .clang-format on the way in, so this file
 // does not line up line-for-line with the source.
 //
-// Formatted by: AMD clang-format version 22.0.0git
+// Formatted by: clang-format version 18.1.8
 
 // benchmark_topk.hip.cpp -- fp32 per-row top-k indices for prefill.
 // Contract: input fp32 [M,N], output int32 indices [M,K].
@@ -1276,20 +1276,28 @@ static TopkOut<WRITE_VALUES> make_topk_out(int* d_idx, float* d_val);
 
 template <>
 TopkOut<false> make_topk_out<false>(int* d_idx, float*)
-{ return TopkOut<false>{d_idx}; }
+{
+    return TopkOut<false>{d_idx};
+}
 
 template <>
 TopkOut<true> make_topk_out<true>(int* d_idx, float* d_val)
-{ return TopkOut<true>{d_idx, d_val}; }
+{
+    return TopkOut<true>{d_idx, d_val};
+}
 
 template <bool RAGGED>
 static RowExtents<RAGGED> make_row_extents(const int* d_starts, const int* d_ends);
 template <>
 RowExtents<false> make_row_extents<false>(const int*, const int*)
-{ return RowExtents<false>{nullptr}; }
+{
+    return RowExtents<false>{nullptr};
+}
 template <>
 RowExtents<true> make_row_extents<true>(const int* d_starts, const int* d_ends)
-{ return RowExtents<true>{d_starts, d_ends}; }
+{
+    return RowExtents<true>{d_starts, d_ends};
+}
 
 template <bool RAGGED, bool WRITE_VALUES>
 static void topk_small_n(const float* d_in,
@@ -1620,7 +1628,9 @@ static inline WsLayout ws_layout(int M, int cap)
 // Every call here is ragged, so the geometry is sized by geometry_k_ragged()
 // (topk_shape.hip.hpp) rather than the caller's k.
 static inline ShapeParams params_for(int M, int N, int K)
-{ return derive_shape_params(M, N, geometry_k_ragged(K, N), 0.0f, 0, 0, PATH_AUTO); }
+{
+    return derive_shape_params(M, N, geometry_k_ragged(K, N), 0.0f, 0, 0, PATH_AUTO);
+}
 
 static inline Bufs bind_bufs(void* ws, const WsLayout& L, int cap)
 {

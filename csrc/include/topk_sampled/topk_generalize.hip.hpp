@@ -13,7 +13,7 @@
 // reading was reformatted to aiter's .clang-format on the way in, so this file
 // does not line up line-for-line with the source.
 //
-// Formatted by: AMD clang-format version 22.0.0git
+// Formatted by: clang-format version 18.1.8
 
 #pragma once
 

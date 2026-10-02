@@ -13,7 +13,7 @@
 // reading was reformatted to aiter's .clang-format on the way in, so this file
 // does not line up line-for-line with the source.
 //
-// Formatted by: AMD clang-format version 22.0.0git
+// Formatted by: clang-format version 18.1.8
 
 #pragma once
 
@@ -131,7 +131,9 @@ static inline bool wide_select_fits(int M, int lds_bytes, int wide_bytes)
 
 constexpr int LDS_ALLOC_GRANULE = 1280;
 static inline int lds_allocated_bytes(int bytes)
-{ return ((bytes + LDS_ALLOC_GRANULE - 1) / LDS_ALLOC_GRANULE) * LDS_ALLOC_GRANULE; }
+{
+    return ((bytes + LDS_ALLOC_GRANULE - 1) / LDS_ALLOC_GRANULE) * LDS_ALLOC_GRANULE;
+}
 static inline bool wide_select_fits_allocated(int M, int lds_bytes, int wide_bytes)
 {
     const int base_alloc = lds_allocated_bytes(lds_bytes);
@@ -397,7 +399,9 @@ constexpr int S_RULE1_M_MAX = 32;
 constexpr int S_RULE1_N_MAX = 393215;
 
 static inline int effective_s_rule(int M, int N)
-{ return M <= S_RULE1_M_MAX && N <= S_RULE1_N_MAX ? 1 : 0; }
+{
+    return M <= S_RULE1_M_MAX && N <= S_RULE1_N_MAX ? 1 : 0;
+}
 
 // Smallest sample count whose 3-sigma candidate window still fits under the
 // largest cap Phase C can hold.

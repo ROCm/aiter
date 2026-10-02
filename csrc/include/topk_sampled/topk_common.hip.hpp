@@ -13,7 +13,7 @@
 // reading was reformatted to aiter's .clang-format on the way in, so this file
 // does not line up line-for-line with the source.
 //
-// Formatted by: AMD clang-format version 22.0.0git
+// Formatted by: clang-format version 18.1.8
 
 #pragma once
 
@@ -74,7 +74,9 @@ constexpr int SAMPLE_S_MAX       = 16384;
 // chunk in the row: it reads [(chunks-1)*stride, +CHUNK), and
 // (chunks-1)*(N/chunks) + CHUNK <= N - N/chunks + CHUNK <= N once N/chunks >= CHUNK.
 __host__ __device__ inline int sample_chunk_stride(int N, int chunks)
-{ return (N / chunks) & ~(FP32_EPT - 1); }
+{
+    return (N / chunks) & ~(FP32_EPT - 1);
+}
 
 // Per-row window bundled like TopkOut: uniform keeps one 8 B null ends pointer;
 // ragged carries starts+ends (16 B). Valid slice is [starts[row], ends[row]).
@@ -167,7 +169,9 @@ struct TopkOut<true>
     float* val;
     __device__ __forceinline__ int* idx_row(int row, int K) const { return idx + (size_t)row * K; }
     __device__ __forceinline__ float* val_row(int row, int K) const
-    { return val + (size_t)row * K; }
+    {
+        return val + (size_t)row * K;
+    }
 };
 
 // The value padding is -inf, NOT 0, and that is aiter's rule rather than a
@@ -229,10 +233,14 @@ __device__ __forceinline__ void clear_hist(uint32_t* __restrict__ s_hist)
 // (csrc/hip_kernels/bit_utils_hip.cuh): a positive NaN lands above +INF, a
 // negative one below -INF.
 __host__ __device__ __forceinline__ uint32_t fp32_to_sortable_bits(uint32_t u)
-{ return (u & 0x80000000u) ? ~u : (u ^ 0x80000000u); }
+{
+    return (u & 0x80000000u) ? ~u : (u ^ 0x80000000u);
+}
 
 __device__ __forceinline__ uint32_t fp32_to_sortable(float v)
-{ return fp32_to_sortable_bits(__float_as_uint(v)); }
+{
+    return fp32_to_sortable_bits(__float_as_uint(v));
+}
 
 __device__ __forceinline__ float sortable_to_fp32(uint32_t s)
 {
@@ -608,7 +616,9 @@ static_assert(WIDE_COARSE == WAVE_SIZE && WIDE_FINE == WIDE_COARSE * WAVE_SIZE,
               "the two-level scan puts one bucket per lane at each level");
 
 __host__ __device__ static inline constexpr int wide_buffer_count(int nwide, bool reuse)
-{ return reuse && nwide > 0 ? 1 : nwide; }
+{
+    return reuse && nwide > 0 ? 1 : nwide;
+}
 
 // One counted key: its coarse bucket (replica `rep`) and its fine bucket.
 __device__ __forceinline__ void wide_count(uint32_t* __restrict__ s_w, uint32_t d, int rep)
@@ -663,4 +673,6 @@ __device__ __forceinline__ void block_find_pivot_wide_wave0(const uint32_t* __re
 
 __device__ __forceinline__ void
 block_find_pivot_wide_wave0(const uint32_t* __restrict__ s_w, uint32_t* __restrict__ s_scan, int ek)
-{ block_find_pivot_wide_wave0(s_w, s_w + WIDE_COARSE_SLOTS, s_scan, ek); }
+{
+    block_find_pivot_wide_wave0(s_w, s_w + WIDE_COARSE_SLOTS, s_scan, ek);
+}
