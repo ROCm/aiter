@@ -793,6 +793,8 @@ def _pa_decode_sparse_gfx950_gluon(
         HAS_INVALID=has_invalid,
         UNPEEL=unpeel,
         XCD_REMAP=xcd_remap,
+        # Gather a tile ahead only for 8-warp programs below prefill size.
+        PIPE_PREFETCH=num_warps == 8 and not prefill,
         num_warps=num_warps,
         waves_per_eu=waves_per_eu,
         **prefill_kw,

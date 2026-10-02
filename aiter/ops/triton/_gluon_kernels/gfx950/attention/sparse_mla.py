@@ -1618,7 +1618,8 @@ def _process_segment(
 
 
 # The fp8_dsv4_mla tile walk: a tile's slot ids for all its layouts come in one
-# round trip, a tile ahead, and a row is gathered with 16 lanes.
+# round trip, a tile ahead, and a row is gathered with 16 lanes. With PREFETCH
+# the gathers also run a tile ahead, so nothing waits at the back edge.
 
 
 @gluon.jit
@@ -1782,9 +1783,12 @@ def _pipe_segment(
     kv_smem,
     rope_smem,
     red_smem=None,
+    PREFETCH: gl.constexpr = False,
 ):
     """_process_segment for fp8_dsv4_mla under UNI_TILE, with slot ids read a
-    tile ahead. Same tiles and math, so the result is bit-identical."""
+    tile ahead. Same tiles and math, so the result is bit-identical. With
+    PREFETCH the tile itself is gathered a tile ahead too, so the loop-carried
+    tile needs no copy at the back edge."""
     BK: gl.constexpr = cfg.BLOCK_K
     offs_full = gl.arange(0, cfg.KV_DIM, layout=gl.SliceLayout(0, cfg.gather_l))
     offs_rope = gl.arange(0, cfg.ROPE_L, layout=gl.SliceLayout(0, cfg.gather_rope_l))
@@ -1795,6 +1799,8 @@ def _pipe_segment(
     if n > 0:
         base = seg.indices_ptr + seg.seg_start
         s0 = _pipe_slots(cfg, base, lo, hi, k_rng_slot, k_rng_rope, k_rng_col)
+        if PREFETCH:
+            s1 = _pipe_slots(cfg, base, lo + BK, hi, k_rng_slot, k_rng_rope, k_rng_col)
         if cfg.HAS_INVALID:
             # Invalid lanes gather the first tile's largest slot id, a key the
             # range attends anyway; search only if that tile is all sentinels.
@@ -1819,53 +1825,115 @@ def _pipe_segment(
                 target,
             )
         if n > 0:
-            s1 = s0  # the ids of the next tile to gather
-            for t in range(n):
-                k_t = lo + t * BK
+            if PREFETCH:
                 a = _pipe_gather(
                     cfg,
                     seg,
-                    k_t,
+                    lo,
                     hi,
                     offs_full,
                     offs_rope,
                     k_rng_slot,
                     k_rng_rope,
                     k_rng_col,
-                    s1,
+                    s0,
                 )
-                _stage(
-                    cfg,
-                    seg,
-                    a[0],
-                    _pipe_scales(cfg, seg, a[1]),
-                    a[2],
-                    kv_smem,
-                    rope_smem,
-                )
-                valid = a[3] != 0
-                # The next tile's slot ids, in flight while this tile's dots run.
-                s1 = _pipe_slots(
-                    cfg, base, k_t + BK, hi, k_rng_slot, k_rng_rope, k_rng_col
-                )
-                m_i, l_i, acc = _qkpv_lds(
-                    cfg,
-                    seg,
-                    valid,
-                    q_dot,
-                    q_rope_dot,
-                    m_i,
-                    l_i,
-                    acc,
-                    head_mask,
-                    qk_scale,
-                    v_scale,
-                    kv_smem,
-                    rope_smem,
-                    k_t,
-                    hi,
-                    red_smem,
-                )
+                for t in range(n):
+                    k_t = lo + t * BK
+                    # Stage tile t before issuing tile t+1, so no copy is needed.
+                    _stage(
+                        cfg,
+                        seg,
+                        a[0],
+                        _pipe_scales(cfg, seg, a[1]),
+                        a[2],
+                        kv_smem,
+                        rope_smem,
+                    )
+                    valid = a[3] != 0
+                    # Tile t+1's gathers and tile t+2's slot ids overlap tile t's
+                    # dots; past the range the slot ids clamp to the last one.
+                    a = _pipe_gather(
+                        cfg,
+                        seg,
+                        k_t + BK,
+                        hi,
+                        offs_full,
+                        offs_rope,
+                        k_rng_slot,
+                        k_rng_rope,
+                        k_rng_col,
+                        s1,
+                    )
+                    s1 = _pipe_slots(
+                        cfg, base, k_t + 2 * BK, hi, k_rng_slot, k_rng_rope, k_rng_col
+                    )
+                    m_i, l_i, acc = _qkpv_lds(
+                        cfg,
+                        seg,
+                        valid,
+                        q_dot,
+                        q_rope_dot,
+                        m_i,
+                        l_i,
+                        acc,
+                        head_mask,
+                        qk_scale,
+                        v_scale,
+                        kv_smem,
+                        rope_smem,
+                        k_t,
+                        hi,
+                        red_smem,
+                    )
+            else:
+                s1 = s0  # the ids of the next tile to gather
+                for t in range(n):
+                    k_t = lo + t * BK
+                    a = _pipe_gather(
+                        cfg,
+                        seg,
+                        k_t,
+                        hi,
+                        offs_full,
+                        offs_rope,
+                        k_rng_slot,
+                        k_rng_rope,
+                        k_rng_col,
+                        s1,
+                    )
+                    _stage(
+                        cfg,
+                        seg,
+                        a[0],
+                        _pipe_scales(cfg, seg, a[1]),
+                        a[2],
+                        kv_smem,
+                        rope_smem,
+                    )
+                    valid = a[3] != 0
+                    # The next tile's slot ids, in flight while this tile's dots run.
+                    s1 = _pipe_slots(
+                        cfg, base, k_t + BK, hi, k_rng_slot, k_rng_rope, k_rng_col
+                    )
+                    m_i, l_i, acc = _qkpv_lds(
+                        cfg,
+                        seg,
+                        valid,
+                        q_dot,
+                        q_rope_dot,
+                        m_i,
+                        l_i,
+                        acc,
+                        head_mask,
+                        qk_scale,
+                        v_scale,
+                        kv_smem,
+                        rope_smem,
+                        k_t,
+                        hi,
+                        red_smem,
+                    )
     return m_i, l_i, acc
 
 
@@ -1996,6 +2064,8 @@ def _sparse_mla(
     UNPEEL: gl.constexpr = False,
     # XCD count to remap program ids over (see _xcd_work); 0 keeps grid order.
     XCD_REMAP: gl.constexpr = 0,
+    # fp8_dsv4_mla walk: gather a tile ahead (see _pipe_segment)
+    PIPE_PREFETCH: gl.constexpr = False,
 ):
     """One program = (query, split, head-block). Two-loop: main (SWA) then
     extra (top-k). Without SPLIT_K it writes the output directly; otherwise it
@@ -2335,6 +2405,7 @@ def _sparse_mla(
             kv_smem,
             rope_smem,
             red_smem,
+            PIPE_PREFETCH,
         )
     elif ASYNC_LDS:
         m_i, l_i, acc = _async_segment(
@@ -2403,6 +2474,7 @@ def _sparse_mla(
                 kv_smem,
                 rope_smem,
                 red_smem,
+                PIPE_PREFETCH,
             )
         else:
             m_i, l_i, acc = _process_segment(
