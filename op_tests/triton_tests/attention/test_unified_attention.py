@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import itertools
 from types import SimpleNamespace
 
 import pytest
@@ -953,4 +954,62 @@ def test_triton_unified_attn_gfx942_large_prefill(
     atol, rtol = (1.5e-1, 1.5e-1) if is_fp8 else (1.5e-2, 1e-2)
     torch.testing.assert_close(
         output.to(torch.float32), ref_output.to(torch.float32), atol=atol, rtol=rtol
+    )
+
+
+UNIFIED_ATTENTION_ARCHS = (
+    "gfx1100",
+    "gfx1151",
+    "gfx1200",
+    "gfx1201",
+    "gfx1250",
+    "gfx942",
+    "gfx950",
+)
+
+
+@pytest.mark.parametrize("arch", UNIFIED_ATTENTION_ARCHS)
+def test_unified_attn_split_unmasked_loop_sw_shuf_siblings(arch):
+    """SPLIT_UNMASKED_LOOP must never resolve for a windowed or shuffled call.
+
+    The kernel static-asserts the flag off for both, so any entry carrying it
+    needs SW/SHUF siblings that omit it: a bool axis falls back to the
+    untagged key, which would otherwise hand the flag to a rejected call.
+    """
+    from aiter.ops.triton.utils.unified_attention_utils import (
+        _axis_values,
+        _load,
+        _lookup,
+    )
+
+    dtypes = (torch.bfloat16, e4m3_dtype, torch.uint8)
+    grid = [
+        _axis_values(*args)
+        for args in itertools.product(
+            (32, 64, 128, 192, 256, 512, 576, 1024),
+            (1, 2, 255, 256, 512, 1023, 1024, 2048, 8192),
+            (1024, 4096),
+            (0, 1024),
+            (False, True),
+            (1, 16, 32, 64, 128, 256),
+            dtypes,
+            dtypes,
+        )
+    ]
+
+    hazards = set()
+    for op in ("attn_2d", "attn_3d"):
+        table, axes, _ = _load(op, "triton", arch)
+        for values in grid:
+            key, config = _lookup(table, axes, values)
+            if not config.get("SPLIT_UNMASKED_LOOP"):
+                continue
+            if values["SW"]:
+                hazards.add((op, key, "sliding window"))
+            if values["SHUF"]:
+                hazards.add((op, key, "shuffled kv cache"))
+
+    assert not hazards, (
+        f"{arch}: SPLIT_UNMASKED_LOOP resolves for calls the kernel rejects: "
+        + "; ".join(f"{op}[{key}] with {why}" for op, key, why in sorted(hazards))
     )
