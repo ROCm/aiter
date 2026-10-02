@@ -32,7 +32,7 @@ jobs:
       matrix:
         include:
           - backend: vllm
-            base_image: rocm/vllm-dev:nightly
+            base_image: vllm/vllm-openai-rocm:nightly
             script: kimi_vllm_perf.sh
             # Validated MI350X gfx950 TP8: c=64 output 3126.4 tok/s. Floor =
             # 2250 (~28% margin) absorbs JIT/run-to-run variance.
@@ -75,7 +75,8 @@ jobs:
             -v "${{ github.workspace }}:/workspace" -w /workspace \
             -v /models:/models \
             --name ${CONTAINER} \
-            ${{ matrix.base_image }}
+            --entrypoint /bin/bash \
+            ${{ matrix.base_image }} -lc "sleep infinity"
           docker exec ${CONTAINER} git config --global --add safe.directory /workspace || true
 
       - name: Build & install PR AITER (gfx950)
