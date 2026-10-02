@@ -1,176 +1,108 @@
 Installation
 ============
 
-Requirements
-------------
+Use Linux, Python **3.10 or later**, a ROCm-enabled PyTorch installation and an
+operator-compatible AMD GPU. PyTorch continues to use the ``torch.cuda`` API
+and ``device="cuda"`` on ROCm. Check ``torch.version.hip`` as well as GPU
+availability; a CUDA PyTorch build is not a ROCm build.
 
-System Requirements
-^^^^^^^^^^^^^^^^^^^
+Release wheels
+--------------
 
-* **Operating System**: Linux (Ubuntu 20.04+, RHEL 8+, or SLES 15+)
-* **Python**: 3.8 or later
-* **ROCm**: 5.7 or later (6.0+ recommended)
-* **GPU**: AMD GPU with gfx90a, gfx942, or gfx950 architecture
+The distribution is **amd-aiter**; the Python import is **aiter**. Choose an asset
+from `GitHub Releases <https://github.com/ROCm/aiter/releases>`_ that matches your
+Python ABI, ROCm version, CPU architecture and platform's glibc baseline.
+The current release workflow builds six ``manylinux_2_28`` combinations:
+ROCm 7.0/7.1/7.2 with Python 3.10/3.12. This is an artifact matrix, not a
+promise of compatibility with arbitrary PyTorch versions.
 
-Software Dependencies
-^^^^^^^^^^^^^^^^^^^^^
+After downloading the matching wheel, install its local filename with
+``python -m pip install /path/to/downloaded-wheel.whl``.
 
-* PyTorch 2.0+ with ROCm support
-* ROCm libraries (hipBLAS, rocBLAS, MIOpen)
-* Optional: Triton for Triton-based kernels
+Preserve the framework's PyTorch, Triton and FlyDSL constraints. Record the wheel
+filename and release tag with benchmark and correctness results. Source builds
+are available when no published wheel matches your environment.
 
-Installation Methods
+Development checkout
 --------------------
 
-Method 1: From PyPI (Recommended)
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-.. note::
-   PyPI package is coming soon!
+Start in a working ROCm/PyTorch environment with the ROCm compiler toolchain.
 
 .. code-block:: bash
 
-   pip install amd-aiter
-
-Method 2: From Source
-^^^^^^^^^^^^^^^^^^^^^
-
-Basic Installation
-""""""""""""""""""
-
-.. code-block:: bash
-
-   # Clone the repository
    git clone --recursive https://github.com/ROCm/aiter.git
    cd aiter
-
-   # Install in development mode
    python3 setup.py develop
 
-Development Mode (JIT)
-""""""""""""""""""""""
-
-Kernels are compiled on first use:
+For an existing clone, initialize its dependencies before building:
 
 .. code-block:: bash
 
-   python3 setup.py develop
+   git submodule sync
+   git submodule update --init --recursive
 
-Precompiled Installation
-""""""""""""""""""""""""
+``setup.py develop`` installs required FlyDSL and selects AMD Triton for the
+ROCm installation. The exact Python requirements from this checkout are:
 
-Precompile kernels at install time:
+.. literalinclude:: ../requirements.txt
+   :language: text
+
+Use those constraints rather than copying the version displayed by FlyDSL's
+main-branch documentation. To retain an already matched Triton installation,
+set ``AITER_USE_SYSTEM_TRITON=1`` when running ``setup.py develop``. With an
+editable pip installation, run the Triton installer explicitly:
+
+.. code-block:: bash
+
+   python -m pip install -e .
+   ./.github/scripts/install_triton.sh
+
+JIT and prebuilding
+-------------------
+
+The default ``PREBUILD_KERNELS=0`` compiles kernels on demand. First use can be
+slow; warm up the actual workload before benchmarking. See :doc:`jit_cache` for
+cache behavior. Prebuilding is an installation choice, not a runtime speed switch.
 
 .. code-block:: bash
 
    PREBUILD_KERNELS=2 GPU_ARCHS="gfx942" python3 setup.py install
 
-Environment Variables
-^^^^^^^^^^^^^^^^^^^^^
+``GPU_ARCHS`` accepts semicolon-separated targets or ``native``. The current
+``setup.py`` selects modules as follows; disabling CK further changes the set:
 
-.. list-table::
-   :header-rows: 1
-   :widths: 20 60 20
+* ``1`` excludes tuning modules and retains only FMHA v3 forward MHA modules.
+* ``2`` excludes backward and tuning modules.
+* ``3`` retains only ``module_fmha_v3*`` modules.
 
-   * - Variable
-     - Description
-     - Default
-   * - ``GPU_ARCHS``
-     - Target GPU architecture(s), semicolon-separated. Use ``native`` to auto-detect.
-     - ``native``
-   * - ``PREBUILD_KERNELS``
-     - ``0`` = JIT only, ``1`` = core kernels, ``2`` = inference kernels, ``3`` = MHA only
-     - ``0``
-   * - ``MAX_JOBS``
-     - Max parallel compilation threads
-     - Auto-calculated
+Use ``MAX_JOBS`` to limit compilation parallelism when build memory is limited.
 
-Example Configurations
-""""""""""""""""""""""
+Containers and communication
+----------------------------
+
+:doc:`aiter_container_nonroot_setup` describes building AITER in a ROCm/PyTorch
+container and exposing GPU devices to a non-root user. Pin your base image by
+tag or digest and record it with the installed package versions; the recipe's
+``latest`` example is not a tested-stack guarantee.
+
+For optional Iris/Triton communication dependencies, run from the checkout:
 
 .. code-block:: bash
 
-   # For MI300X with full precompilation
-   PREBUILD_KERNELS=2 GPU_ARCHS="gfx942" python3 setup.py install
+   python -m pip install -r requirements-triton-comms.txt
 
-   # For MI250X + MI300X multi-arch
-   GPU_ARCHS="gfx90a;gfx942" python3 setup.py install
+See :doc:`triton_comms` for launch requirements.
 
-   # Auto-detect current GPU
-   GPU_ARCHS="native" python3 setup.py install
+Verify the environment
+----------------------
 
-Method 3: Docker
-^^^^^^^^^^^^^^^^
+.. literalinclude:: examples/quickstart.py
+   :language: python
+   :start-after: # BEGIN environment
+   :end-before: # END environment
 
-.. code-block:: bash
-
-   # Coming soon
-   docker pull amd/aiter:latest
-   docker run --device=/dev/kfd --device=/dev/dri amd/aiter:latest
-
-Verifying Installation
------------------------
-
-.. code-block:: python
-
-   import aiter
-   import torch
-
-   # Check ROCm availability
-   print(f"PyTorch version: {torch.__version__}")
-   print(f"ROCm available: {torch.cuda.is_available()}")
-   print(f"ROCm version: {torch.version.hip if hasattr(torch.version, 'hip') else 'N/A'}")
-
-   # Verify AITER can import key operators
-   from aiter import flash_attn_with_kvcache, rmsnorm
-   print("AITER operators loaded successfully!")
-
-Optional: Triton Communication Support
----------------------------------------
-
-For Triton-based communication primitives:
-
-.. code-block:: bash
-
-   pip install -r requirements-triton-comms.txt
-
-See :doc:`tutorials/triton_comms` for more details.
-
-Troubleshooting
----------------
-
-ROCm Not Found
-^^^^^^^^^^^^^^
-
-If ROCm is not detected:
-
-.. code-block:: bash
-
-   export ROCM_PATH=/opt/rocm
-   export PATH=$ROCM_PATH/bin:$PATH
-
-Compilation Errors
-^^^^^^^^^^^^^^^^^^
-
-For compilation issues:
-
-1. Ensure ROCm is properly installed: ``rocm-smi``
-2. Check Python version: ``python3 --version``
-3. Verify GPU architecture: ``rocminfo | grep gfx``
-
-Import Errors
-^^^^^^^^^^^^^
-
-If you get import errors:
-
-.. code-block:: bash
-
-   # Ensure ROCm libraries are in library path
-   export LD_LIBRARY_PATH=$ROCM_PATH/lib:$LD_LIBRARY_PATH
-
-Next Steps
-----------
-
-* :doc:`quickstart` - Get started with your first AITER program
-* :doc:`tutorials/index` - Learn through examples
-* :doc:`api/attention` - Explore the API reference
+Then run :doc:`quickstart` to check numerical results. If import fails, first
+confirm that installation and execution use the same Python interpreter. If
+HIP libraries cannot be loaded, verify ``ROCM_PATH`` and the runtime library
+path. For JIT errors, retain the compiler output, target reported by
+``rocminfo``, package versions and source revision in the issue report.

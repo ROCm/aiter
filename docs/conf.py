@@ -1,84 +1,51 @@
-# Configuration file for the Sphinx documentation builder.
-# For the full list of built-in configuration values, see the documentation:
-# https://www.sphinx-doc.org/en/master/usage/configuration.html
-
-import os
+# CPU-only documentation build: never import GPU packages.
+import subprocess
 import sys
+from datetime import datetime, timezone
+from pathlib import Path
 
-# Add the parent directory to the path so we can import aiter
-sys.path.insert(0, os.path.abspath(".."))
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(Path(__file__).parent / "_ext"))
 
-# -- Project information -----------------------------------------------------
+
+def git_output(*args):
+    try:
+        return subprocess.check_output(
+            ["git", "-C", str(ROOT), *args], text=True, stderr=subprocess.DEVNULL
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+
+
 project = "AITER"
-copyright = "2026, AMD"
 author = "AMD ROCm Team"
-release = "0.1.0"
-
-# -- General configuration ---------------------------------------------------
-extensions = [
-    "sphinx.ext.autodoc",
-    "sphinx.ext.napoleon",
-    "sphinx.ext.viewcode",
-    "sphinx.ext.intersphinx",
-    "sphinx.ext.mathjax",
-    "sphinx_rtd_theme",
+copyright = "2026, AMD"
+source_revision = git_output("rev-parse", "HEAD")
+release = git_output("describe", "--tags", "--always")
+version = release
+extensions = ["myst_parser", "sphinx.ext.mathjax", "aiter_source"]
+source_suffix = {".rst": "restructuredtext", ".md": "markdown"}
+myst_heading_anchors = 3
+exclude_patterns = [
+    "_build",
+    "Thumbs.db",
+    ".DS_Store",
+    "README.md",
+    "DEPLOYMENT.md",
+    "DOCUMENTATION_AUDIT_REPORT.md",
 ]
-
-templates_path = ["_templates"]
-exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
-
-# -- Options for HTML output -------------------------------------------------
 html_theme = "sphinx_rtd_theme"
-html_static_path = ["_static"]
-
-html_theme_options = {
-    "logo_only": False,
-    "display_version": True,
-    "prev_next_buttons_location": "bottom",
-    "style_external_links": False,
-    "vcs_pageview_mode": "",
-    "style_nav_header_background": "#C00000",  # AMD Red
-    # Toc options
-    "collapse_navigation": False,
-    "sticky_navigation": True,
-    "navigation_depth": 4,
-    "includehidden": True,
-    "titles_only": False,
+html_theme_options = {"collapse_navigation": False, "navigation_depth": 3}
+html_logo = "assets/aiter_logo.png"
+html_last_updated_fmt = "%Y-%m-%d %H:%M UTC"
+html_context = {
+    "display_github": True,
+    "github_user": "ROCm",
+    "github_repo": "aiter",
+    "github_version": source_revision,
+    "conf_py_path": "/docs/",
 }
-
-html_logo = None  # Add logo path when available
-html_favicon = None  # Add favicon when available
-
-# -- Extension configuration -------------------------------------------------
-
-# Napoleon settings
-napoleon_google_docstring = True
-napoleon_numpy_docstring = True
-napoleon_include_init_with_doc = True
-napoleon_include_private_with_doc = False
-napoleon_include_special_with_doc = True
-napoleon_use_admonition_for_examples = False
-napoleon_use_admonition_for_notes = False
-napoleon_use_admonition_for_references = False
-napoleon_use_ivar = False
-napoleon_use_param = True
-napoleon_use_rtype = True
-napoleon_preprocess_types = False
-napoleon_type_aliases = None
-napoleon_attr_annotations = True
-
-# Intersphinx configuration
-intersphinx_mapping = {
-    "python": ("https://docs.python.org/3", None),
-    "torch": ("https://pytorch.org/docs/stable/", None),
-    "numpy": ("https://numpy.org/doc/stable/", None),
-}
-
-# Autodoc settings
-autodoc_default_options = {
-    "members": True,
-    "member-order": "bysource",
-    "special-members": "__init__",
-    "undoc-members": True,
-    "exclude-members": "__weakref__",
-}
+rst_epilog = f"""
+.. |source_revision| replace:: {source_revision[:12]}
+.. |build_date| replace:: {datetime.now(timezone.utc).strftime('%Y-%m-%d UTC')}
+"""
