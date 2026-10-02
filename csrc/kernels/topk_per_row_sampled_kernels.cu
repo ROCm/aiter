@@ -705,6 +705,10 @@ __device__ __forceinline__ void band_take_vec(uint64_t* __restrict__ cand_w,
 // for refining inside a crossing bucket too full to collect, plus those keys'
 // min and max: a bucket of one value is answered without another read. Most keys
 // fail the prefix test, so this costs about what a filtered radix pass does.
+//
+// The refine and collect passes re-read a row the histogram pass just read, and
+// load it non-temporal; the histogram pass does not. Non-temporal there too was
+// 5-8% slower at M <= 64, where those re-reads hit what it left in cache.
 #ifndef FB_REFINE_LOADS
 #define FB_REFINE_LOADS 1
 #endif
@@ -729,7 +733,7 @@ __device__ __forceinline__ void band_refine_pass(const float* __restrict__ row,
         for(int u = 0; u < FB_REFINE_LOADS; u++)
         {
             const int i = i0 + u * (int)blockDim.x + (int)threadIdx.x;
-            v[u]        = i < n4 ? load_row_f4<LR>(row, i, len) : vfloat4{0.f, 0.f, 0.f, 0.f};
+            v[u]        = i < n4 ? load_row_f4<LR, true>(row, i, len) : vfloat4{0.f, 0.f, 0.f, 0.f};
         }
 #pragma unroll
         for(int u = 0; u < FB_REFINE_LOADS; u++)
@@ -983,7 +987,7 @@ __device__ __forceinline__ int radix_fallback_row(const float* __restrict__ row,
         vfloat4 v[FB_SEL_LOADS];
 #pragma unroll
         for(int u = 0; u < FB_SEL_LOADS; u++)
-            v[u] = load_row_f4<LR>(row, i0 + u * (int)blockDim.x + (int)threadIdx.x, len);
+            v[u] = load_row_f4<LR, true>(row, i0 + u * (int)blockDim.x + (int)threadIdx.x, len);
 #pragma unroll
         for(int u = 0; u < FB_SEL_LOADS; u++)
             band_take_vec<LR>(cand_w,
@@ -1003,7 +1007,7 @@ __device__ __forceinline__ int radix_fallback_row(const float* __restrict__ row,
         for(int u = 0; u < FB_SEL_LOADS; u++)
         {
             const int i = i0 + u * (int)blockDim.x + (int)threadIdx.x;
-            v[u]        = i < n4 ? load_row_f4<LR>(row, i, len) : vfloat4{0.f, 0.f, 0.f, 0.f};
+            v[u]        = i < n4 ? load_row_f4<LR, true>(row, i, len) : vfloat4{0.f, 0.f, 0.f, 0.f};
         }
 #pragma unroll
         for(int u = 0; u < FB_SEL_LOADS; u++)

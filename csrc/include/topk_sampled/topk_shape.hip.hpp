@@ -593,12 +593,23 @@ static inline int choose_coop_g(int M, int N, int n4_per_row, int block, int ove
         return snap_coop_g(override_g, max_g);
     if(N <= N_LDS_MAX)
         return 1;
+    int g;
     const int t = coop_g_from_table(M, N, max_g);
     if(t > 0)
-        return t;
-    const int by_target = (M <= COOP_TARGET_BLOCKS) ? (COOP_TARGET_BLOCKS / M) : 1;
-    const int by_work   = std::max(1, n4_per_row / COOP_MIN_VEC4_PER_BLOCK);
-    return snap_coop_g(std::min(by_target, by_work), max_g);
+    {
+        g = t;
+    }
+    else
+    {
+        const int by_target = (M <= COOP_TARGET_BLOCKS) ? (COOP_TARGET_BLOCKS / M) : 1;
+        const int by_work   = std::max(1, n4_per_row / COOP_MIN_VEC4_PER_BLOCK);
+        g                   = snap_coop_g(std::min(by_target, by_work), max_g);
+    }
+    // At 2048 <= M <= 4095 below N = 131072 the G = 4 this picks is slower than
+    // G = 2: 5-6% at M = 2816 N = 75369, 3-5% at M = 3840 N = 108137.
+    if(M >= 2048 && M <= 4095 && N < 131072 && g > 2)
+        g = 2;
+    return g;
 }
 
 // A per-region radix scan form (rep vs wave0) was tried in v4 Stage 2 and is
