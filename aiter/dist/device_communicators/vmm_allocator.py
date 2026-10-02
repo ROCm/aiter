@@ -16,28 +16,7 @@ import socket
 import struct
 import threading
 
-
-def load_hip_runtime() -> ctypes.CDLL:
-    """Load the HIP runtime shared library robustly.
-
-    Split rocm-sdk pip layouts (e.g. `_rocm_sdk_core/lib`) ship only the
-    versioned soname `libamdhip64.so.N` on the runtime path; the unversioned
-    `libamdhip64.so` symlink lives in the -devel package which need not be on
-    LD_LIBRARY_PATH at runtime. Try the plain name first, then versioned
-    sonames so it works regardless of which package is present.
-    """
-    candidates = ["libamdhip64.so", "libamdhip64.so.7", "libamdhip64.so.6"]
-    last_err = None
-    for name in candidates:
-        try:
-            return ctypes.CDLL(name)
-        except OSError as e:
-            last_err = e
-    raise OSError(
-        f"Could not load the HIP runtime; tried {candidates}. "
-        f"Last error: {last_err}"
-    )
-
+from aiter.jit.utils.hip_runtime import load_hip_runtime
 
 _hip = load_hip_runtime()
 
