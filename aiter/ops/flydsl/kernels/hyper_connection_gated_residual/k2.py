@@ -53,6 +53,7 @@ def _build_up_gate_mix_norm(
     mma_m: int,
     mma_n: int,
     mma_k: int,
+    w_bf16: bool = False,
     _skip_norm: bool = False,
     _skip_gemm: bool = False,
 ):
@@ -79,14 +80,14 @@ def _build_up_gate_mix_norm(
 
     @flyc.kernel(
         name=f"gr_k2_up_gate_mix_norm_hc{hc_count}_hs{stream_dim}_r{lowrank}"
-        f"_bm{block_m}_bn{block_n}",
+        f"_bm{block_m}_bn{block_n}{'_wbf16' if w_bf16 else ''}",
         known_block_size=[block_threads, 1, 1],
     )
     def kernel(
         lora: fx.Tensor,  # [M, lowrank] bf16
         r2: fx.Tensor,  # [M, hidden] bf16 (un-normalized combined residual)
         rrms: fx.Tensor,  # [M, hc] f32
-        w: fx.Tensor,  # [w_len] f32 (grouped-RMSNorm weight, widened)
+        w: fx.Tensor,  # [w_len] bf16 or f32 grouped-RMSNorm weight
         w_up: fx.Tensor,  # [hidden, lowrank] bf16
         block_input: fx.Tensor,  # [M, stream_dim] bf16
     ):
@@ -99,7 +100,7 @@ def _build_up_gate_mix_norm(
         out_buf = fx.rocdl.make_buffer_tensor(block_input, max_size=True)
         r2_g = GTensor(r2, T.bf16, (1, hidden))
         rrms_g = GTensor(rrms, T.f32, (1, hc_count))
-        w_g = GTensor(w, T.f32, (1, w_len))
+        w_g = GTensor(w, T.bf16 if w_bf16 else T.f32, (1, w_len))
 
         mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(mma_m, mma_n, mma_k, fx.BFloat16))
         tiled_mma = fx.make_tiled_mma(
@@ -187,15 +188,22 @@ def _build_up_gate_mix_norm(
                 xn_vec = r2_vec
                 if not _skip_norm:
                     rr = fx.Float32(rrms_g.load(g_m * hc_count + s, vec_size=1))
-                    # f32 buffer loads are 128-bit max (v8f32 won't isel), so read
-                    # the VEC-wide (1+w) slice in dwordx4 chunks.
                     wv = []
-                    for c4 in range_constexpr(VEC // 4):
-                        w4 = fx.Vector(w_g.load((col + c4 * 4) % w_len, vec_size=4)).to(
+                    if w_bf16:
+                        w8 = fx.Vector(w_g.load(col % w_len, vec_size=VEC)).to(
                             fx.Float32
                         )
-                        for e4 in range_constexpr(4):
-                            wv.append(w4[e4])
+                        for e in range_constexpr(VEC):
+                            wv.append(w8[e])
+                    else:
+                        # f32 buffer loads are 128-bit max (v8f32 won't isel), so
+                        # read the VEC-wide (1+w) slice in dwordx4 chunks.
+                        for c4 in range_constexpr(VEC // 4):
+                            w4 = fx.Vector(
+                                w_g.load((col + c4 * 4) % w_len, vec_size=4)
+                            ).to(fx.Float32)
+                            for e4 in range_constexpr(4):
+                                wv.append(w4[e4])
                     xn_e = [
                         (r2_vec[e] * rr * (fx.Float32(1.0) + wv[e]))
                         for e in range_constexpr(VEC)
@@ -277,7 +285,8 @@ def flydsl_up_gate_mix_norm(
     stream_dim = hidden // hc_count
     assert w_up.shape == (hidden, lowrank)
     assert rrms.shape == (tokens, hc_count)
-    w = norm_weight_f32(norm_weight)
+    w_bf16 = norm_weight.dtype == torch.bfloat16 and norm_weight.is_contiguous()
+    w = norm_weight.reshape(-1) if w_bf16 else norm_weight_f32(norm_weight)
     w_len = w.numel()
     assert w_len in (stream_dim, hidden)
 
@@ -312,6 +321,7 @@ def flydsl_up_gate_mix_norm(
         mma.mma_m,
         mma.mma_n,
         mma.mma_k,
+        w_bf16,
         _skip_norm,
         _skip_gemm,
     )

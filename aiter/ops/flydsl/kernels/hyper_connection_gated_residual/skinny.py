@@ -72,6 +72,7 @@ def _build_down_fused(
     inj_stride: int,
     waves_per_block: int,
     cols_per_wave: int,
+    m_groups: int = 1,
 ):
     stream_dim = hidden // hc_count
     cols_per_block = waves_per_block * cols_per_wave
@@ -90,14 +91,16 @@ def _build_down_fused(
     log2_wave = int(math.log2(WAVE))
     inv_hc = 1.0 / hc_count
     inv_hs = 1.0 / stream_dim
-    r2_elems = m_rows * hidden
-    rrms_elems = m_rows * hc_count
-    part_elems = hc_count * n_pad * PART_M * n_chunks
-    packed_elems = m_rows * n_pad
+    total_rows = m_groups * m_rows
+    r2_elems = total_rows * hidden
+    rrms_elems = total_rows * hc_count
+    part_group_elems = hc_count * n_pad * PART_M * n_chunks
+    part_elems = m_groups * part_group_elems
+    packed_elems = total_rows * n_pad
 
     @flyc.kernel(
         name=f"gr_skinny_down_hc{hc_count}_h{hidden}_np{n_pad}_m{m_rows}"
-        f"_is{inj_stride}_w{waves_per_block}_c{cols_per_wave}",
+        f"_g{m_groups}_is{inj_stride}_w{waves_per_block}_c{cols_per_wave}",
         known_block_size=[block_threads, 1, 1],
     )
     def kernel(
@@ -116,11 +119,13 @@ def _build_down_fused(
         lane = tid % WAVE
         grp = fx.block_idx.x * waves_per_block + wid
         n0 = grp * cols_per_wave
+        mg = fx.block_idx.y
+        m_base = mg * m_rows
         s = fx.block_idx.z
 
         res_g = GTensor(residual, T.bf16, (1, r2_elems))
-        y_g = GTensor(block_output, T.bf16, (1, m_rows * stream_dim))
-        inj_g = GTensor(injection, T.bf16, (1, m_rows * inj_stride))
+        y_g = GTensor(block_output, T.bf16, (1, total_rows * stream_dim))
+        inj_g = GTensor(injection, T.bf16, (1, total_rows * inj_stride))
         w_g = GTensor(w_dn, T.bf16, (1, n_pad * hidden))
         r2_t = _bounded(r2_out, fx.BFloat16, r2_elems, DOWN_VEC)
         rrms_t = _bounded(rrms_out, fx.Float32, rrms_elems)
@@ -132,7 +137,10 @@ def _build_down_fused(
 
         gate = []
         for m in range_constexpr(m_rows):
-            iv = fx.BFloat16(inj_g.load(m * inj_stride + s, vec_size=1)).to(fx.Float32)
+            gm = m_base + m
+            iv = fx.BFloat16(inj_g.load(gm * inj_stride + s, vec_size=1)).to(
+                fx.Float32
+            )
             gate.append(fx.Float32(2.0) * sigmoid_f32(iv * fx.Float32(inv_hc)))
 
         # One r2 re-form feeds cols_per_wave weight rows.
@@ -154,14 +162,17 @@ def _build_down_fused(
         ]
         r_raw = [
             [
-                res_g.load(m * hidden + s * stream_dim + ks[i], vec_size=DOWN_VEC)
+                res_g.load(
+                    (m_base + m) * hidden + s * stream_dim + ks[i],
+                    vec_size=DOWN_VEC,
+                )
                 for m in range_constexpr(m_rows)
             ]
             for i in range_constexpr(iters)
         ]
         y_raw = [
             [
-                y_g.load(m * stream_dim + ks[i], vec_size=DOWN_VEC)
+                y_g.load((m_base + m) * stream_dim + ks[i], vec_size=DOWN_VEC)
                 for m in range_constexpr(m_rows)
             ]
             for i in range_constexpr(iters)
@@ -173,7 +184,8 @@ def _build_down_fused(
                 for cc in range_constexpr(cols_per_wave)
             ]
             for m in range_constexpr(m_rows):
-                off = m * hidden + s * stream_dim + k
+                gm = m_base + m
+                off = gm * hidden + s * stream_dim + k
                 rv = fx.Vector(r_raw[i][m]).to(fx.Float32)
                 yv = fx.Vector(y_raw[i][m]).to(fx.Float32)
                 comb = [rv[e] + yv[e] * gate[m] for e in range_constexpr(DOWN_VEC)]
@@ -200,10 +212,11 @@ def _build_down_fused(
 
         rstds = []
         for m in range_constexpr(m_rows):
+            gm = m_base + m
             rstd = fmath.rsqrt(sq[m] * fx.Float32(inv_hs) + fx.Float32(eps))
             buf_copy_store(
                 rrms_t,
-                is_n0.select(m * hc_count + s, fx.Int32(rrms_elems)),
+                is_n0.select(gm * hc_count + s, fx.Int32(rrms_elems)),
                 rstd,
                 elem=fx.Float32,
             )
@@ -219,7 +232,8 @@ def _build_down_fused(
                     dots.append(fx.Float32(0.0))
                 buf_copy_store(
                     part_t,
-                    ((s * n_pad + n0 + cc) * n_chunks + ch) * PART_M,
+                    mg * part_group_elems
+                    + ((s * n_pad + n0 + cc) * n_chunks + ch) * PART_M,
                     fx.Vector.from_elements(dots, dtype=fx.Float32),
                     elem=fx.Float32,
                     unit_elems=PART_M,
@@ -231,7 +245,7 @@ def _build_down_fused(
         # One counter per lane of a column, so lanes don't contend on an address.
         # Every lane of the last-arriving wave sees hc-1 (mod hc) on its own slot.
         slot = fx.Int64(fx.ptrtoint(fx.get_iter(counters))) + fx.Int64(
-            grp * WAVE + lane
+            (mg * n_pad + grp) * WAVE + lane
         ) * fx.Int64(4)
         arrival = fx.Int32(atomic_add_agent(slot, fx.Int32(1)))
         rocdl.s_waitcnt(0)
@@ -245,7 +259,7 @@ def _build_down_fused(
                 tot = fx.Vector(
                     buf_copy_load(
                         part_t,
-                        (n * n_chunks + ch) * PART_M,
+                        mg * part_group_elems + (n * n_chunks + ch) * PART_M,
                         elem=fx.Float32,
                         unit_elems=PART_M,
                         cache_modifier=CPOL_COHERENT,
@@ -255,7 +269,8 @@ def _build_down_fused(
                     tot = tot + fx.Vector(
                         buf_copy_load(
                             part_t,
-                            ((ss * n_pad + n) * n_chunks + ch) * PART_M,
+                            mg * part_group_elems
+                            + ((ss * n_pad + n) * n_chunks + ch) * PART_M,
                             elem=fx.Float32,
                             unit_elems=PART_M,
                             cache_modifier=CPOL_COHERENT,
@@ -263,11 +278,12 @@ def _build_down_fused(
                     )
                 for mm in range_constexpr(min(PART_M, m_rows - ch * PART_M)):
                     m = ch * PART_M + mm
+                    gm = m_base + m
                     v = tot[mm] * fx.Float32(inv_hc)
                     out = is_lora.select(v * sigmoid_f32(v), tot[mm])
                     buf_copy_store(
                         packed_t,
-                        writer.select(m * n_pad + n, fx.Int32(packed_elems)),
+                        writer.select(gm * n_pad + n, fx.Int32(packed_elems)),
                         out.to(fx.BFloat16),
                         elem=fx.BFloat16,
                     )
@@ -296,7 +312,7 @@ def _build_down_fused(
             packed,
             counters,
         ).launch(
-            grid=(n_pad // cols_per_block, 1, hc_count),
+            grid=(n_pad // cols_per_block, m_groups, hc_count),
             block=(block_threads, 1, 1),
             stream=stream,
         )
@@ -313,6 +329,8 @@ def _build_up_mix_grouped(
     m_rows: int,
     lora_stride: int,
     waves_per_block: int,
+    m_groups: int = 1,
+    w_bf16: bool = False,
 ):
     stream_dim = hidden // hc_count
     group = WAVE // hc_count
@@ -325,17 +343,19 @@ def _build_up_mix_grouped(
     inv_hc = 1.0 / hc_count
     block_threads = waves_per_block * WAVE
     shared_w = w_len != hidden
+    total_rows = m_groups * m_rows
 
     @flyc.kernel(
         name=f"gr_skinny_up_hc{hc_count}_hs{stream_dim}_r{lowrank}_m{m_rows}"
-        f"_ls{lora_stride}_w{waves_per_block}",
+        f"_g{m_groups}_ls{lora_stride}_w{waves_per_block}"
+        f"{'_wbf16' if w_bf16 else ''}",
         known_block_size=[block_threads, 1, 1],
     )
     def kernel(
         packed: fx.Tensor,  # [m_rows, lora_stride] bf16, lora is cols [0, lowrank)
         r2: fx.Tensor,  # [m_rows, hidden] bf16
         rrms: fx.Tensor,  # [m_rows, hc] f32
-        w: fx.Tensor,  # [w_len] f32
+        w: fx.Tensor,  # [w_len] bf16 or f32
         w_up: fx.Tensor,  # [hidden, lowrank] bf16
         block_input: fx.Tensor,  # [m_rows, stream_dim] bf16
     ):
@@ -343,16 +363,18 @@ def _build_up_mix_grouped(
         wid = tid // WAVE
         lane = tid % WAVE
         c = fx.block_idx.x * waves_per_block + wid
+        mg = fx.block_idx.y
+        m_base = mg * m_rows
         g = lane // group
         j = lane % group
         n = g * stream_dim + c
 
-        lora_g = GTensor(packed, T.bf16, (1, m_rows * lora_stride))
-        r2_g = GTensor(r2, T.bf16, (1, m_rows * hidden))
-        rrms_g = GTensor(rrms, T.f32, (1, m_rows * hc_count))
-        w_g = GTensor(w, T.f32, (1, w_len))
+        lora_g = GTensor(packed, T.bf16, (1, total_rows * lora_stride))
+        r2_g = GTensor(r2, T.bf16, (1, total_rows * hidden))
+        rrms_g = GTensor(rrms, T.f32, (1, total_rows * hc_count))
+        w_g = GTensor(w, T.bf16 if w_bf16 else T.f32, (1, w_len))
         wup_g = GTensor(w_up, T.bf16, (1, hidden * lowrank))
-        out_g = GTensor(block_input, T.bf16, (1, m_rows * stream_dim))
+        out_g = GTensor(block_input, T.bf16, (1, total_rows * stream_dim))
 
         acc = [fx.Float32(0.0) for _ in range_constexpr(m_rows)]
         # All loads before the first use; see _build_down_fused.
@@ -363,17 +385,24 @@ def _build_up_mix_grouped(
         ]
         lo_raw = [
             [
-                lora_g.load(m * lora_stride + rs[i], vec_size=UP_VEC)
+                lora_g.load((m_base + m) * lora_stride + rs[i], vec_size=UP_VEC)
                 for m in range_constexpr(m_rows)
             ]
             for i in range_constexpr(k_iters)
         ]
-        wv = w_g.load(c if shared_w else n, vec_size=1)
+        wv_raw = w_g.load(c if shared_w else n, vec_size=1)
+        wv = (
+            fx.BFloat16(wv_raw).to(fx.Float32)
+            if w_bf16
+            else fx.Float32(wv_raw)
+        )
         rr_raw = [
-            rrms_g.load(m * hc_count + g, vec_size=1) for m in range_constexpr(m_rows)
+            rrms_g.load((m_base + m) * hc_count + g, vec_size=1)
+            for m in range_constexpr(m_rows)
         ]
         r2_raw = [
-            r2_g.load(m * hidden + n, vec_size=1) for m in range_constexpr(m_rows)
+            r2_g.load((m_base + m) * hidden + n, vec_size=1)
+            for m in range_constexpr(m_rows)
         ]
         for i in range_constexpr(k_iters):
             wu = fx.Vector(wu_raw[i]).to(fx.Float32)
@@ -396,8 +425,9 @@ def _build_up_mix_grouped(
             for m in range_constexpr(m_rows):
                 mix[m] = mix[m] + fx.gpu.shuffle_xor(mix[m], group << sh, WAVE)
         for m in range_constexpr(m_rows):
+            gm = m_base + m
             out_g.store(
-                m * stream_dim + c,
+                gm * stream_dim + c,
                 (mix[m] * fx.Float32(inv_hc)).to(fx.BFloat16),
                 vec_size=1,
             )
@@ -413,7 +443,7 @@ def _build_up_mix_grouped(
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         kernel(packed, r2, rrms, w, w_up, block_input).launch(
-            grid=(stream_dim // waves_per_block, 1, 1),
+            grid=(stream_dim // waves_per_block, m_groups, 1),
             block=(block_threads, 1, 1),
             stream=stream,
         )
@@ -422,14 +452,14 @@ def _build_up_mix_grouped(
 
 
 _COLS_PER_WAVE = int(os.environ.get("AITER_GR_SKINNY_COLS_PER_WAVE", "2"))
-_COUNTERS: dict[tuple[int, int], torch.Tensor] = {}
+_COUNTERS: dict[tuple[int, int, int], torch.Tensor] = {}
 
 
-def _counters(device: torch.device, n_pad: int) -> torch.Tensor:
-    key = (device.index, n_pad)
+def _counters(device: torch.device, n_pad: int, m_groups: int = 1) -> torch.Tensor:
+    key = (device.index, n_pad, m_groups)
     c = _COUNTERS.get(key)
     if c is None:
-        c = torch.zeros(n_pad * WAVE, dtype=torch.int32, device=device)
+        c = torch.zeros(m_groups * n_pad * WAVE, dtype=torch.int32, device=device)
         _COUNTERS[key] = c
     return c
 
@@ -481,7 +511,14 @@ def skinny_two_kernel(
         cols_per_wave,
     )
     up = _build_up_mix_grouped(
-        hidden, hc_count, lowrank, w.numel(), tokens, n_pad, waves_per_block
+        hidden,
+        hc_count,
+        lowrank,
+        w.numel(),
+        tokens,
+        n_pad,
+        waves_per_block,
+        w_bf16=w.dtype == torch.bfloat16,
     )
     fxs = fx.Stream(stream)
     _run_compiled(
@@ -495,6 +532,93 @@ def skinny_two_kernel(
         partial,
         packed,
         _counters(dev, n_pad),
+        fxs,
+    )
+    _run_compiled(up, packed, r2, rrms, w, w_up, x, fxs)
+    return r2, x, packed
+
+
+def skinny_chunked_two_kernel(
+    residual: torch.Tensor,
+    block_output: torch.Tensor,
+    injection: torch.Tensor,
+    inj_stride: int,
+    w: torch.Tensor,
+    w_up: torch.Tensor,
+    w_down_merged: torch.Tensor,
+    lowrank: int,
+    hc_count: int,
+    eps: float,
+    stream: torch.cuda.Stream,
+    chunk_m: int = 4,
+    waves_per_block: int = 4,
+    cols_per_wave: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Prototype true-M schedule for low prefill.
+
+    The original skinny kernel holds every token accumulator in one wave and
+    spills badly above M=8. This variant maps independent ``chunk_m`` token
+    groups onto grid.y, keeping the same register footprint while increasing
+    parallelism. It intentionally trades repeated weight reads between groups
+    against avoiding the MMA path's 64-row padding.
+    """
+    tokens, hidden = residual.shape
+    assert tokens % chunk_m == 0
+    m_groups = tokens // chunk_m
+    stream_dim = hidden // hc_count
+    n_pad = w_down_merged.shape[0]
+    dev = residual.device
+    r2 = torch.empty(tokens, hidden, dtype=torch.bfloat16, device=dev)
+    rrms = torch.empty(tokens, hc_count, dtype=torch.float32, device=dev)
+    n_chunks = (chunk_m + PART_M - 1) // PART_M
+    partial = torch.empty(
+        m_groups,
+        hc_count,
+        n_pad,
+        n_chunks * PART_M,
+        dtype=torch.float32,
+        device=dev,
+    )
+    packed = torch.empty(tokens, n_pad, dtype=torch.bfloat16, device=dev)
+    x = torch.empty(tokens, stream_dim, dtype=torch.bfloat16, device=dev)
+
+    if cols_per_wave is None:
+        cols_per_wave = _COLS_PER_WAVE
+    down = _build_down_fused(
+        hidden,
+        n_pad,
+        hc_count,
+        lowrank,
+        chunk_m,
+        float(eps),
+        inj_stride,
+        waves_per_block,
+        cols_per_wave,
+        m_groups,
+    )
+    up = _build_up_mix_grouped(
+        hidden,
+        hc_count,
+        lowrank,
+        w.numel(),
+        chunk_m,
+        n_pad,
+        waves_per_block,
+        m_groups,
+        w.dtype == torch.bfloat16,
+    )
+    fxs = fx.Stream(stream)
+    _run_compiled(
+        down,
+        residual,
+        block_output,
+        injection,
+        w_down_merged,
+        r2,
+        rrms,
+        partial,
+        packed,
+        _counters(dev, n_pad, m_groups),
         fxs,
     )
     _run_compiled(up, packed, r2, rrms, w, w_up, x, fxs)

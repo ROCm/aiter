@@ -1034,15 +1034,23 @@ def flydsl_k1k2_skinny_decode(
         n_pad,
         hidden,
     ), f"w_down_merged {tuple(w_down_merged.shape)} must be (n_pad, {hidden})"
-    w = norm_weight_f32(norm_weight)
+    skinny_reads_bf16 = (
+        _SKINNY_TWO_KERNEL
+        and norm_weight.dtype == torch.bfloat16
+        and norm_weight.is_contiguous()
+    )
+    w = norm_weight.reshape(-1) if skinny_reads_bf16 else norm_weight_f32(norm_weight)
     if stream is None:
         stream = torch.cuda.current_stream()
     if _SKINNY_TWO_KERNEL:
         from aiter.ops.flydsl.kernels.hyper_connection_gated_residual.skinny import (
+            skinny_chunked_two_kernel,
             skinny_two_kernel,
         )
 
-        r2, x, packed = skinny_two_kernel(
+        skinny_impl = skinny_chunked_two_kernel if tokens == 8 else skinny_two_kernel
+        skinny_kwargs = {"chunk_m": 2} if tokens == 8 else {}
+        r2, x, packed = skinny_impl(
             residual,
             block_output,
             injection,
@@ -1054,6 +1062,7 @@ def flydsl_k1k2_skinny_decode(
             hc_count,
             eps,
             stream,
+            **skinny_kwargs,
         )
         inj_next = packed[:, lowrank : lowrank + hc_count] if need_inj else None
         return r2, x, inj_next
@@ -1570,7 +1579,10 @@ def flydsl_k1_combine_norm_down(
     # flow through down/K2 as garbage but every op here is per-token (RMS, GEMM
     # rows, gated mean over streams), so pad rows never contaminate a real row and
     # the caller slices them off. torch.empty (no memset) keeps decode M cheap.
-    w = norm_weight_f32(norm_weight)
+    # The folded down weight already contains (1 + norm_weight), so this tensor
+    # is never read by the down GEMM. Avoid launching a bf16->f32 conversion
+    # whose result would only be passed through as an unused kernel argument.
+    w = norm_weight if fold_w else norm_weight_f32(norm_weight)
     if r2_out is None:
         r2_out = torch.empty(
             gemm_tokens, hidden, dtype=residual.dtype, device=residual.device

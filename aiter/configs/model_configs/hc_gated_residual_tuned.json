@@ -2,21 +2,21 @@
   "gfx950": {
     "up_gate_mix": {
       "64": {
-        "block_m": 64,
+        "block_m": 32,
         "block_n": 16,
         "m_waves": 1,
         "n_waves": 1,
         "_us": 11.0
       },
       "128": {
-        "block_m": 64,
+        "block_m": 32,
         "block_n": 16,
         "m_waves": 1,
         "n_waves": 1,
         "_us": 11.0
       },
       "256": {
-        "block_m": 64,
+        "block_m": 32,
         "block_n": 16,
         "m_waves": 1,
         "n_waves": 1,
