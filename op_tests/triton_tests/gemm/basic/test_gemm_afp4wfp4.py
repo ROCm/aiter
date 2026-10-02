@@ -135,6 +135,12 @@ def get_x_vals():
     x_vals += [(v, 8192, 512) for v in (128, 192, 4096, 8000)]
     x_vals += [(2048, 8192, 4096)]
     x_vals += [(1, 256, 512), (16, 256, 256), (31, 7168, 4608)]  # M < 32 case
+    # LL3 8B qkv / o_proj / gate_up / down_proj, one M per tuned M_LEQ bucket
+    x_vals += [
+        (v, n, k)
+        for n, k in ((6144, 4096), (4096, 4096), (28672, 4096), (4096, 14336))
+        for v in (1, 8, 16, 32, 64)
+    ]
     return x_vals
 
 
