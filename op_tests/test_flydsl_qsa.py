@@ -18,9 +18,13 @@ Usage::
     pytest -q op_tests/test_flydsl_qsa.py
     HIP_VISIBLE_DEVICES=6 python3 op_tests/test_flydsl_qsa.py
     HIP_VISIBLE_DEVICES=6 python3 op_tests/test_flydsl_qsa.py --rotate 0 1
+    HIP_VISIBLE_DEVICES=6 python3 op_tests/test_flydsl_qsa.py --pad-pages 4096
 
 Perf rows default to cold weights (``--rotate 0``); pass ``--rotate 1`` to
-reproduce the older hot-cache 1047 tables.
+reproduce the older hot-cache 1047 tables. ``--pad-pages 0`` (the default)
+keeps each K1 block table packed to the context. A positive width zero-fills
+it out to that many pages, which is how vLLM sizes the table for
+``max_model_len``.
 """
 
 from __future__ import annotations
@@ -1897,8 +1901,35 @@ def _flydsl_k1_select(
     return indices, block_ids
 
 
+def _pad_index_table(index_table, pad_pages):
+    """Zero-fill a one-request block table out to ``pad_pages``.
+
+    ``pad_pages <= 0`` leaves the packed table. A wider table is what vLLM
+    allocates for ``max_model_len``: real pages in front, zeros after them.
+    A pad narrower than the packed table is an error; the sweep skips that
+    row before calling.
+    """
+    if pad_pages <= 0:
+        return index_table
+    n_pages = index_table.shape[1]
+    if pad_pages < n_pages:
+        raise ValueError(
+            f"pad_pages={pad_pages} is narrower than the packed table ({n_pages} pages)"
+        )
+    if pad_pages == n_pages:
+        return index_table
+    wide = torch.zeros(
+        index_table.shape[0],
+        pad_pages,
+        dtype=index_table.dtype,
+        device=index_table.device,
+    )
+    wide[:, : index_table.shape[1]] = index_table
+    return wide
+
+
 @benchmark()
-def bench_qsa_family_a_k1(m, seq_len, page_size, dtype, rotate=0):
+def bench_qsa_family_a_k1(m, seq_len, page_size, dtype, rotate=0, pad_pages=0):
     """Family A FlyDSL K1 vs oracle set equality; us vs live AMD.
 
     2d: short rows use fused emit. Long rows use BLOCK_N=32 BF16 MFMA scoring
@@ -1907,7 +1938,9 @@ def bench_qsa_family_a_k1(m, seq_len, page_size, dtype, rotate=0):
     16 query rows per workgroup. The FlyDSL column times block ids and then
     the vendored Triton expand, the same expand live AMD select includes.
     Set equality stays on block ids. Same ``rotate`` on every select column.
-    The layer bench is a separate matched chain and is not changed here.
+    ``pad_pages`` widens the block table every column sees; ``0`` keeps it
+    packed to the context. The layer bench is a separate matched chain and
+    is not changed here.
     """
     idx = FAMILY_A_INDEXER
     device = torch.device("cuda")
@@ -1925,7 +1958,7 @@ def bench_qsa_family_a_k1(m, seq_len, page_size, dtype, rotate=0):
     gen_i.manual_seed(1)
     index_cache, index_table = pack_paged_cache(index_k, page_size, generator=gen_i)
     index_cache = index_cache.contiguous()
-    index_table = index_table.contiguous()
+    index_table = _pad_index_table(index_table.contiguous(), pad_pages)
 
     ref_scores = qsa_indexer_scores(
         q_indexer,
@@ -1972,6 +2005,7 @@ def bench_qsa_family_a_k1(m, seq_len, page_size, dtype, rotate=0):
     return {
         "gfx": get_gfx(),
         "n_blocks": n_blocks,
+        "n_pages": int(index_table.shape[1]),
         "flydsl_k1 us": k1_us,
         "flydsl_k1 TFLOPS": flops / k1_us / 1e6,
         "flydsl_k1 TB/s": nbytes / k1_us / 1e6,
@@ -2313,12 +2347,16 @@ def test_k1_family_b_set_equality_published_indexer_point():
 
 
 @benchmark()
-def bench_qsa_family_b_k1(m, seq_len, page_size, dtype, index_heads, rotate=0):
+def bench_qsa_family_b_k1(
+    m, seq_len, page_size, dtype, index_heads, rotate=0, pad_pages=0
+):
     """Family B FlyDSL K1 vs oracle set equality.
 
     2e/2f: emit on ``n_blocks <= 512``. Longer rows use family A's MFMA
     scorer plus radix (``H=8`` is a second compile). ``H`` 4 and 8 emit
     share one kernel. Separate table from family A. Expand is not fused.
+    ``pad_pages`` widens the block table every column sees; ``0`` keeps it
+    packed to the context.
     """
     idx = _family_b_indexer(index_heads)
     device = torch.device("cuda")
@@ -2336,7 +2374,7 @@ def bench_qsa_family_b_k1(m, seq_len, page_size, dtype, index_heads, rotate=0):
     gen_i.manual_seed(1)
     index_cache, index_table = pack_paged_cache(index_k, page_size, generator=gen_i)
     index_cache = index_cache.contiguous()
-    index_table = index_table.contiguous()
+    index_table = _pad_index_table(index_table.contiguous(), pad_pages)
     score_scale = idx.head_dim**-0.5
 
     ref_scores = qsa_indexer_scores(
@@ -2369,6 +2407,7 @@ def bench_qsa_family_b_k1(m, seq_len, page_size, dtype, index_heads, rotate=0):
         "gfx": get_gfx(),
         "index_heads": idx.n_heads,
         "n_blocks": n_blocks,
+        "n_pages": int(index_table.shape[1]),
         "flydsl_k1 us": k1_us,
         "flydsl_k1 TFLOPS": flops / k1_us / 1e6,
         "flydsl_k1 TB/s": nbytes / k1_us / 1e6,
@@ -3416,6 +3455,27 @@ def _skip_m_past_seq(m, seq_len, where):
     return True
 
 
+def _skip_pad_narrower_than_context(
+    seq_len, page_size, pad_pages, compress_ratio, where
+):
+    """A pad that cannot hold the context would drop real pages."""
+    if pad_pages <= 0:
+        return False
+    n_blocks = seq_len // compress_ratio
+    packed_pages = (n_blocks + page_size - 1) // page_size
+    if packed_pages <= pad_pages:
+        return False
+    aiter.logger.warning(
+        "skip %s L=%s page=%s pad_pages=%s (context needs %s pages)",
+        where,
+        seq_len,
+        page_size,
+        pad_pages,
+        packed_pages,
+    )
+    return True
+
+
 def _raise_if_k1_mismatch(err, m, seq_len):
     if err != 0:
         raise AssertionError(f"FlyDSL K1 set mismatch at M={m} L={seq_len} (err={err})")
@@ -3474,6 +3534,19 @@ def main():
         help="vLLM-style page size (indexer slots and GQA tokens)",
     )
     parser.add_argument(
+        "--pad-pages",
+        type=int,
+        nargs="*",
+        default=[0],
+        help="K1 block-table width in pages. 0 keeps the packed table.\n"
+        "A positive value zero-fills every K1 column's table out to that\n"
+        "many pages, which is how vLLM sizes it for max_model_len. A row\n"
+        "whose context already needs more pages is skipped. Examples:\n"
+        "--pad-pages 4096 with page size 16 is 65536 columns;\n"
+        "--page-size 392 --pad-pages 168 is the Flash-Next TP2 table\n"
+        "(65856 columns). Pass 0 and a width to sweep both.",
+    )
+    parser.add_argument(
         "--rotate",
         type=int,
         nargs="*",
@@ -3530,12 +3603,20 @@ def main():
         decode_m, prefill_m = _k1_k2_sweep_batches(args.batch)
 
         rows = []
-        for m, seq_len, page_size, rotate in itertools.product(
-            decode_m, args.seq, args.page_size, args.rotate
+        for m, seq_len, page_size, rotate, pad_pages in itertools.product(
+            decode_m, args.seq, args.page_size, args.rotate, args.pad_pages
         ):
             if _skip_m_past_seq(m, seq_len, "family A K1 decode"):
                 continue
-            row = bench_qsa_family_a_k1(m, seq_len, page_size, dtype, rotate)
+            if _skip_pad_narrower_than_context(
+                seq_len,
+                page_size,
+                pad_pages,
+                FAMILY_A_INDEXER.compress_ratio,
+                "family A K1 decode",
+            ):
+                continue
+            row = bench_qsa_family_a_k1(m, seq_len, page_size, dtype, rotate, pad_pages)
             _raise_if_k1_mismatch(row["flydsl_k1 err"], m, seq_len)
             rows.append(row)
         if rows:
@@ -3562,12 +3643,20 @@ def main():
             )
 
         rows = []
-        for m, seq_len, page_size, rotate in itertools.product(
-            prefill_m, args.seq, args.page_size, args.rotate
+        for m, seq_len, page_size, rotate, pad_pages in itertools.product(
+            prefill_m, args.seq, args.page_size, args.rotate, args.pad_pages
         ):
             if _skip_m_past_seq(m, seq_len, "family A K1 prefill"):
                 continue
-            row = bench_qsa_family_a_k1(m, seq_len, page_size, dtype, rotate)
+            if _skip_pad_narrower_than_context(
+                seq_len,
+                page_size,
+                pad_pages,
+                FAMILY_A_INDEXER.compress_ratio,
+                "family A K1 prefill",
+            ):
+                continue
+            row = bench_qsa_family_a_k1(m, seq_len, page_size, dtype, rotate, pad_pages)
             _raise_if_k1_mismatch(row["flydsl_k1 err"], m, seq_len)
             rows.append(row)
         if rows:
@@ -3594,15 +3683,26 @@ def main():
             )
 
         rows = []
-        for m, seq_len, page_size, rotate in itertools.product(
+        for m, seq_len, page_size, rotate, pad_pages in itertools.product(
             args.batch,
             [s for s in args.seq if s // FAMILY_B_INDEXER.compress_ratio <= 512],
             args.page_size,
             args.rotate,
+            args.pad_pages,
         ):
             if _skip_m_past_seq(m, seq_len, "family B K1 H=4"):
                 continue
-            row = bench_qsa_family_b_k1(m, seq_len, page_size, dtype, 4, rotate)
+            if _skip_pad_narrower_than_context(
+                seq_len,
+                page_size,
+                pad_pages,
+                FAMILY_B_INDEXER.compress_ratio,
+                "family B K1 H=4",
+            ):
+                continue
+            row = bench_qsa_family_b_k1(
+                m, seq_len, page_size, dtype, 4, rotate, pad_pages
+            )
             _raise_if_k1_mismatch(row["flydsl_k1 err"], m, seq_len)
             rows.append(row)
         if rows:
@@ -3613,15 +3713,26 @@ def main():
             )
 
         rows = []
-        for m, seq_len, page_size, rotate in itertools.product(
+        for m, seq_len, page_size, rotate, pad_pages in itertools.product(
             args.batch,
             [s for s in args.seq if s // FAMILY_B_INDEXER_H8.compress_ratio <= 512],
             args.page_size,
             args.rotate,
+            args.pad_pages,
         ):
             if _skip_m_past_seq(m, seq_len, "family B K1 H=8"):
                 continue
-            row = bench_qsa_family_b_k1(m, seq_len, page_size, dtype, 8, rotate)
+            if _skip_pad_narrower_than_context(
+                seq_len,
+                page_size,
+                pad_pages,
+                FAMILY_B_INDEXER_H8.compress_ratio,
+                "family B K1 H=8",
+            ):
+                continue
+            row = bench_qsa_family_b_k1(
+                m, seq_len, page_size, dtype, 8, rotate, pad_pages
+            )
             _raise_if_k1_mismatch(row["flydsl_k1 err"], m, seq_len)
             rows.append(row)
         if rows:
@@ -3633,28 +3744,46 @@ def main():
 
         # Published indexer point: M=32, H=4, page_size=8, n_blocks=512.
         rows = []
-        for rotate in args.rotate:
-            row = bench_qsa_family_b_k1(32, 2048, 8, dtype, 4, rotate)
+        for rotate, pad_pages in itertools.product(args.rotate, args.pad_pages):
+            if _skip_pad_narrower_than_context(
+                2048,
+                8,
+                pad_pages,
+                FAMILY_B_INDEXER.compress_ratio,
+                "family B K1 published",
+            ):
+                continue
+            row = bench_qsa_family_b_k1(32, 2048, 8, dtype, 4, rotate, pad_pages)
             _raise_if_k1_mismatch(row["flydsl_k1 err"], 32, 2048)
             rows.append(row)
-        df = pd.DataFrame(rows)
-        aiter.logger.info(
-            "QSA family B FlyDSL K1 published indexer point (markdown):\n%s",
-            df.to_markdown(index=False),
-        )
+        if rows:
+            df = pd.DataFrame(rows)
+            aiter.logger.info(
+                "QSA family B FlyDSL K1 published indexer point (markdown):\n%s",
+                df.to_markdown(index=False),
+            )
 
         rows = []
-        for m, seq_len, page_size, index_heads, rotate in itertools.product(
+        for m, seq_len, page_size, index_heads, rotate, pad_pages in itertools.product(
             args.batch,
             [s for s in args.seq if s // FAMILY_B_INDEXER.compress_ratio > 512],
             args.page_size,
             (4, 8),
             args.rotate,
+            args.pad_pages,
         ):
             if _skip_m_past_seq(m, seq_len, "family B K1 long-L"):
                 continue
+            if _skip_pad_narrower_than_context(
+                seq_len,
+                page_size,
+                pad_pages,
+                FAMILY_B_INDEXER.compress_ratio,
+                "family B K1 long-L",
+            ):
+                continue
             row = bench_qsa_family_b_k1(
-                m, seq_len, page_size, dtype, index_heads, rotate
+                m, seq_len, page_size, dtype, index_heads, rotate, pad_pages
             )
             _raise_if_k1_mismatch(row["flydsl_k1 err"], m, seq_len)
             rows.append(row)
