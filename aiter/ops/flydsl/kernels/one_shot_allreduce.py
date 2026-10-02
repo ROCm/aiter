@@ -25,13 +25,7 @@ handling for free (load->0, store dropped), with no exec-mask split. See
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
-from flydsl.expr.typing import (
-    Float32,
-    Int32,
-    Int64,
-    Stream,
-    T,
-)
+from flydsl.expr.typing import T
 
 # The fused epilogue and the row-to-workgroup geometry are shared with the
 # quantized schedules.
@@ -84,7 +78,7 @@ from .quick_allreduce_shared import (
     _to_sgpr_i64,
     atom_bf16_to_f32,
     atom_f32_to_bf16,
-    make_payload_tensor,
+    make_hbm_operand,
 )
 
 DEFAULT_BLOCK = 256
@@ -197,7 +191,8 @@ FUSED_ONESHOT_LADDER = {
     ("pcie", 4): ((0, 2, 64, "peer", False, 1), (168 << 10, 4, 32, "peer", True, 1)),
     ("pcie", 8): ((0, 2, 128, "peer", False, 1), (144 << 10, 2, 8, "peer", True, 1)),
     # xGMI: from measurements on MI325X.
-    # Split (k > 1) wins at TP4/TP8 for small M, TP2 never benefits from spliting hidden dim.
+    # Split (k > 1) wins at TP4/TP8 for small M; TP2 never benefits from splitting
+    # the hidden dim.
     ("xgmi", 2): ((0, 1, 128, "peer", True, 1),),
     ("xgmi", 4): ((0, 1, 128, "peer", True, 16), (144 << 10, 1, 128, "peer", True, 1)),
     ("xgmi", 8): ((0, 1, 64, "peer", True, 16), (56 << 10, 1, 128, "peer", True, 16)),
@@ -492,19 +487,19 @@ def make_one_shot_allreduce_kernel(
     # split build's exchange state, and 0 (never read) in every other build.
     @flyc.kernel(known_block_size=[block, 1, 1])
     def one_shot_allreduce(
-        rank: Int32,
-        nbytes: Int64,
-        num_tiles: Int32,
-        inp_ptr: Int64,
-        out_ptr: Int64,
-        peer_ptrs: Int64,
-        colors_ptr: Int64,
-        n_blocks: Int32,
-        res_in_ptr: Int64,
-        res_out_ptr: Int64,
-        w_ptr: Int64,
-        eps: Float32,
-        xchg_ptr: Int64,
+        rank: fx.Int32,
+        nbytes: fx.Int64,
+        num_tiles: fx.Int32,
+        inp_ptr: fx.Int64,
+        out_ptr: fx.Int64,
+        peer_ptrs: fx.Int64,
+        colors_ptr: fx.Int64,
+        n_blocks: fx.Int32,
+        res_in_ptr: fx.Int64,
+        res_out_ptr: fx.Int64,
+        w_ptr: fx.Int64,
+        eps: fx.Float32,
+        xchg_ptr: fx.Int64,
     ):
         tid = fx.Int32(gpu.thread_id("x"))
         bid = fx.Int32(gpu.block_id("x"))
@@ -514,8 +509,8 @@ def make_one_shot_allreduce_kernel(
         # build addresses each row through a per-row buffer descriptor
         # (``_rowbuf_atom_row``) while an unpadded one slices the whole-tensor
         # buffer tensor (``_hbm_atom_row``). ``hbm_layout`` is the 3-D whole-tensor
-        # layout consumed only by the unpadded ``make_payload_tensor``; a padded
-        # build binds it to None (its ``_payload_tensor`` never reads it).
+        # layout consumed only by the unpadded ``make_hbm_operand``; a padded
+        # build binds it to None (its operand never reads it).
         hbm_layout = None
         if const_expr(not padded):
             hbm_layout = fx.make_layout(
@@ -542,7 +537,10 @@ def make_one_shot_allreduce_kernel(
             T.i32, address_space=fx.AddressSpace.Global, alignment=16
         )
 
-        _payload_tensor = make_payload_tensor(
+        # A padded build keeps the HBM operands as raw ``Int64`` base pointers so
+        # ``_rowbuf_atom_row`` can bound a fresh descriptor per row; an unpadded
+        # build wraps them in the whole-tensor buffer tensor.
+        _operand = make_hbm_operand(
             padded=padded,
             nbytes=nbytes,
             hbm_i32_ptr=hbm_i32_ptr,
@@ -564,12 +562,6 @@ def make_one_shot_allreduce_kernel(
             if padded
             else None
         )
-
-        # A padded build keeps the HBM operands as raw ``Int64`` base pointers so
-        # ``_rowbuf_atom_row`` can bound a fresh descriptor per row; an unpadded
-        # build wraps them in the whole-tensor buffer tensor via ``_payload_tensor``.
-        def _operand(ptr, records=None):
-            return ptr if const_expr(padded) else _payload_tensor(ptr, records)
 
         in_buf = _operand(inp_ptr)
         out_buf = _operand(out_ptr)
@@ -875,7 +867,8 @@ def make_one_shot_allreduce_kernel(
                 rstd = rstd_from_total(total, eps, hidden)
             else:
                 # One block covers one row, so there is a single row to reduce.
-                rstd = rms_rstd([accs], eps, hidden, tid=tid, block=block, lds=sq_lds)[0]
+                rstds = rms_rstd([accs], eps, hidden, tid=tid, block=block, lds=sq_lds)
+                rstd = rstds[0]
             _store_tile(tile, scale_by_weight(accs, rstd, w_atoms))
             return done
 
@@ -912,17 +905,14 @@ def make_one_shot_allreduce_kernel(
                 + fx.Int64(xchg_prev_off)
                 + fx.Int64(bid) * fx.Int64(PARITIES * 8)
             )
-            prev_same = fx.generic_load(
-                _global_ptr(prev_base + fx.Int64(color & fx.Int32(1)) * fx.Int64(8), T.i64, 8),
-                dtype=fx.Int64,
-            )
+
+            def _prev_word(slot):
+                """This workgroup's persisted exchange word for parity *slot*."""
+                return _global_ptr(prev_base + fx.Int64(slot) * fx.Int64(8), T.i64, 8)
+
+            prev_same = fx.generic_load(_prev_word(color & fx.Int32(1)), dtype=fx.Int64)
             prev_other = fx.generic_load(
-                _global_ptr(
-                    prev_base + fx.Int64((color + fx.Int32(1)) & fx.Int32(1)) * fx.Int64(8),
-                    T.i64,
-                    8,
-                ),
-                dtype=fx.Int64,
+                _prev_word((color + fx.Int32(1)) & fx.Int32(1)), dtype=fx.Int64
             )
         for i in range(fx.Int32(0), n_block_tiles, fx.Int32(1)):
             tile = bid + i * n_blocks
@@ -961,17 +951,9 @@ def make_one_shot_allreduce_kernel(
                 # thread's copy is the workgroup's. The wrap above keeps the
                 # parities alternating, so ``color``'s parity is still
                 # ``prev_same``'s.
+                fx.generic_store(_prev_word(color & fx.Int32(1)), prev_same)
                 fx.generic_store(
-                    _global_ptr(prev_base + fx.Int64(color & fx.Int32(1)) * fx.Int64(8), T.i64, 8),
-                    prev_same,
-                )
-                fx.generic_store(
-                    _global_ptr(
-                        prev_base + fx.Int64((color + fx.Int32(1)) & fx.Int32(1)) * fx.Int64(8),
-                        T.i64,
-                        8,
-                    ),
-                    prev_other,
+                    _prev_word((color + fx.Int32(1)) & fx.Int32(1)), prev_other
                 )
         gpu.barrier()
 
@@ -979,20 +961,20 @@ def make_one_shot_allreduce_kernel(
 
     @flyc.jit
     def launch_one_shot_allreduce(
-        rank: Int32,
-        nbytes: Int64,
-        num_tiles: Int32,
-        inp_ptr: Int64,
-        out_ptr: Int64,
-        peer_ptrs: Int64,
-        colors_ptr: Int64,
-        grid_x: Int32,
-        res_in_ptr: Int64,
-        res_out_ptr: Int64,
-        w_ptr: Int64,
-        eps: Float32,
-        xchg_ptr: Int64,
-        stream: Stream = Stream(None),  # noqa: B008
+        rank: fx.Int32,
+        nbytes: fx.Int64,
+        num_tiles: fx.Int32,
+        inp_ptr: fx.Int64,
+        out_ptr: fx.Int64,
+        peer_ptrs: fx.Int64,
+        colors_ptr: fx.Int64,
+        grid_x: fx.Int32,
+        res_in_ptr: fx.Int64,
+        res_out_ptr: fx.Int64,
+        w_ptr: fx.Int64,
+        eps: fx.Float32,
+        xchg_ptr: fx.Int64,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         one_shot_allreduce(
             rank,

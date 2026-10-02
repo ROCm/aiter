@@ -34,6 +34,12 @@ matrix of pinned ``super_tile``/``block``/``skip_self``, and
 ``test_quick_allreduce_pinned_codec`` -- the ring with its wire formats
 pinned per lap: all-INT4 at TP8, and one lap lossless to isolate the other.
 
+The fused epilogue (``FlyQuickAllReduceRMSNorm``: all-reduce + residual add +
+RMSNorm) has its own ``test_quick_allreduce_rmsnorm_*`` sweeps, one table each:
+SQNR against an fp32 oracle, bit-exactness of ``residual_out`` on the lossless
+wire (native, padded-width and self-skip geometries), mesh rank agreement, and
+``test_quick_allreduce_host_checks``.
+
 Every mesh row also checks that all ranks wrote bit-identical output: each
 rank decodes every chunk from the same packets, its own included, and under
 ``skip_self`` it decodes its own from the packet it sent rather than from its
@@ -59,8 +65,9 @@ import itertools
 import json
 import math
 import os
+import re
 import sys
-from multiprocessing import Pool, freeze_support, set_start_method
+from multiprocessing import freeze_support, get_context
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _REPO_ROOT not in sys.path:
@@ -74,8 +81,6 @@ from aiter import dtypes
 from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.test_common import benchmark, checkAllclose, run_perftest
-
-set_start_method("spawn", force=True)
 
 from aiter.ops.flydsl import allreduce_policy as fly_policy
 from aiter.ops.flydsl.kernels.quick_allreduce_codec import SUPPORTED_BLOCKS
@@ -702,7 +707,7 @@ def _spawn(
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(f"unsupported world_size={world_size}")
     init_method = get_distributed_init_method(get_ip(), get_open_port())
-    pool = Pool(processes=world_size)
+    pool = get_context("spawn").Pool(processes=world_size)
     try:
         results = [
             pool.apply_async(
@@ -887,13 +892,6 @@ def _transport_key(
 # ---------------------------------------------------------------------------
 # Fused epilogue: FlyQuickAllReduceRMSNorm (all-reduce + residual add + RMSNorm)
 # ---------------------------------------------------------------------------
-
-import pytest
-
-pytestmark = pytest.mark.skipif(
-    ARCH not in SUPPORTED_ARCHS,
-    reason="FlyQuickAllReduceRMSNorm unsupported arch (need gfx942 or gfx950)",
-)
 
 RMS_EPS = 1e-6
 
@@ -1088,12 +1086,9 @@ def _spawn_fused(
     solo: bool = False,
     engine_kw: dict | None = None,
 ) -> list[list[dict]]:
-    n_gpu = torch.cuda.device_count()
-    if n_gpu < world_size:
-        pytest.skip(f"FlyQuickAllReduceRMSNorm needs {world_size} GPUs, have {n_gpu}")
     init_method = get_distributed_init_method(get_ip(), get_open_port())
     timeout = float(os.environ.get("FLYDSL_QR_TIMEOUT", "3600"))
-    pool = Pool(processes=world_size)
+    pool = get_context("spawn").Pool(processes=world_size)
     try:
         futs = [
             pool.apply_async(
@@ -1132,9 +1127,9 @@ _FUSED_BATCH_CACHE: dict[tuple, dict[tuple[int, int], list[dict]]] = {}
 def _fused_batch(key: tuple, cases: list[tuple[int, int]], **spawn_kwargs) -> dict:
     """One ``_spawn_fused`` per *key*, memoized, indexed by shape.
 
-    Same bargain as ``_batch_cache_lookup`` above and for a sharper reason: a
-    fused engine's IPC inboxes are large, and a pool per test leaves the
-    previous one's still resident when the next allocates.
+    Same bargain as ``_result`` above and for a sharper reason: a fused
+    engine's IPC inboxes are large, and a pool per test leaves the previous
+    one's still resident when the next allocates.
     """
     if key not in _FUSED_BATCH_CACHE:
         ranks = _spawn_fused(key[0], cases, **spawn_kwargs)
@@ -1160,22 +1155,42 @@ _FUSED_CASES = (
 )
 
 
-@pytest.mark.parametrize("algorithm", ("ring", "mesh"))
-@pytest.mark.parametrize("tp,tokens,hidden,label", _FUSED_CASES)
-def test_quick_allreduce_rmsnorm_sqnr(tp, tokens, hidden, label, algorithm):
-    """The fused epilogue against an fp32 oracle, plus its own self-consistency.
+#: Self-skip is tested at both super-tile paths the mesh has: ST=1 carries the
+#: own share and chunk in registers across the waits, ST>1 reloads the share
+#: from the input and parks the chunk in ``out`` between its three loops.
+_FUSED_SKIP_SELF_STS = (1, 8)
 
-    Three gates per rank: ``out`` and ``residual_out`` against the oracle, and
-    ``out`` against a norm recomputed from the kernel's own ``residual_out``.
-    The third is the one that isolates the epilogue -- it is blind to codec
-    noise, so a row-grouping or weight-indexing bug cannot hide behind it.
+#: Widths with no native row geometry, which run on a *padded* workgroup.
+#:
+#: Graded with a **lossless** wire on purpose. Padding must be invisible to the
+#: answer, so under fp16 a padded build has to produce the same bits a native
+#: one would.
+_FUSED_PAD_CASES = (
+    (2, 512, 1536, "tp2-1536pad2048"),
+    (2, 11, 1536, "tp2-1536pad2048-partial-tile"),
+)
 
-    Every case sharing (tp, algorithm) rides one spawn; see ``_fused_batch``.
-    """
-    cases = [(t, h) for w, t, h, _ in _FUSED_CASES if w == tp]
-    batch = _fused_batch((tp, "sqnr", algorithm), cases, algorithm=algorithm)
-    fails = _fused_sqnr_fails(batch[(tokens, hidden)])
-    assert not fails, f"{label}/{algorithm}: " + "; ".join(fails)
+# (tp, tokens, hidden) of the lossless one-live-rank residual equality.
+_FUSED_EXACT_CASES = ((2, 512, 4096),)
+
+# (tp, tokens, hidden) of the mesh cross-rank bit-identity check.
+_FUSED_MESH_AGREE_CASES = ((4, 1024, 5120),)
+
+#: ``tokens`` is large enough that a pinned ST=8 really runs ST=8 at every
+#: world size and inbox type here; the test checks it.
+_FUSED_SKIP_SELF_EXACT_CASES = ((2, 4096, 4096), (4, 4096, 4096), (2, 4096, 1536))
+
+# Off the row-sized-block grid: 2560 and 640 are not multiples of 128 threads
+# per block, 12288 is wider than 1024.
+_FUSED_REJECTED_HIDDENS = (2560, 640, 12288)
+
+# With a lossless wire and one live rank the all-reduce is exact, so ``out``
+# differs from the oracle only by rsqrt's hardware approximation.
+FUSED_EXACT_OUT_SQNR_MIN_DB = 60.0
+
+
+def _skip_self_kw(super_tile: int) -> dict:
+    return {"super_tile": super_tile, "skip_self": True}
 
 
 def _fused_sqnr_fails(rows: list[dict]) -> list[str]:
@@ -1205,30 +1220,68 @@ def _fused_sqnr_fails(rows: list[dict]) -> list[str]:
     return fails
 
 
-#: Widths with no native row geometry, which run on a *padded* workgroup.
-#:
-#: Graded with a **lossless** wire on purpose. Padding must be invisible to the
-#: answer, so under fp16 a padded build has to produce the same bits a native
-#: one would -- an equality, not a tolerance. INT4 would hide a one-atom
-#: addressing slip inside the codec's own 19 dB of noise.
-#:
-#: 1536 pads to 2048 (block 256, the narrowest the mesh fanout accepts) and is
-#: the only width here that fits fp16's LDS at TP2. ``tokens`` is well past one
-#: tile: at ``rows_per_tile = 8`` a single-tile payload puts every pad lane past
-#: the end of the tensor, where the descriptor bound masks it for free, so it
-#: would pass with the per-lane mask removed entirely.
-#:
-#: The second case is the opposite corner: 11 rows is one full 8-row tile and a
-#: partial one with 5 dead rows, whose descriptors must be empty. A row bound
-#: that only clamps the columns lets those rows store past the end of ``out``.
-_FUSED_PAD_CASES = (
-    (2, 512, 1536, "tp2-1536pad2048"),
-    (2, 11, 1536, "tp2-1536pad2048-partial-tile"),
-)
+def _fused_tail_fails(rows: list[dict], why: str) -> list[str]:
+    bad = [r["rank"] for r in rows if not r["tail_intact"]]
+    return [f"stored past the last row on ranks {bad} -- {why}"] if bad else []
 
 
-@pytest.mark.parametrize("algorithm", ("ring", "mesh"))
-@pytest.mark.parametrize("tp,tokens,hidden,label", _FUSED_PAD_CASES)
+def _fused_exact_fails(rows: list[dict], why: str) -> list[str]:
+    """``residual_out`` bit-exact and ``out`` near-exact, on a lossless wire."""
+    bad = [r["rank"] for r in rows if not r["res_exact"]]
+    fails = (
+        [f"residual_out is not bit-exact on ranks {bad} with a lossless wire -- {why}"]
+        if bad
+        else []
+    )
+    fails += [
+        f"rank {r['rank']}: out SQNR {r['out_sqnr_db']:.2f} dB, not above "
+        f"{FUSED_EXACT_OUT_SQNR_MIN_DB}"
+        for r in rows
+        if not r["out_sqnr_db"] > FUSED_EXACT_OUT_SQNR_MIN_DB
+    ]
+    return fails
+
+
+def _fused_disagree_fails(rows: list[dict]) -> list[str]:
+    first = rows[0]
+    return [
+        f"rank {r['rank']} disagrees with rank 0"
+        for r in rows
+        if (r["out_bits"], r["res_bits"]) != (first["out_bits"], first["res_bits"])
+    ]
+
+
+def _fused_summary(rows: list[dict]) -> dict:
+    return {
+        "gfx": ARCH,
+        "variant": rows[0]["variant"],
+        "out_sqnr_db": min(r["out_sqnr_db"] for r in rows),
+        "res_sqnr_db": min(r["res_sqnr_db"] for r in rows),
+        "self_sqnr_db": min(r["self_sqnr_db"] for r in rows),
+        "res_exact": all(r["res_exact"] for r in rows),
+        "tail_intact": all(r["tail_intact"] for r in rows),
+    }
+
+
+@benchmark()
+def test_quick_allreduce_rmsnorm_sqnr(tp, tokens, hidden, label, algorithm):
+    """The fused epilogue against an fp32 oracle, plus its own self-consistency.
+
+    Three gates per rank: ``out`` and ``residual_out`` against the oracle, and
+    ``out`` against a norm recomputed from the kernel's own ``residual_out``.
+    The third is the one that isolates the epilogue -- it is blind to codec
+    noise, so a row-grouping or weight-indexing bug cannot hide behind it.
+
+    Every case sharing (tp, algorithm) rides one spawn; see ``_fused_batch``.
+    """
+    cases = [(t, h) for w, t, h, _ in _FUSED_CASES if w == tp]
+    batch = _fused_batch((tp, "sqnr", algorithm), cases, algorithm=algorithm)
+    rows = batch[(tokens, hidden)]
+    _check(f"{label}/{algorithm}", _fused_sqnr_fails(rows))
+    return _fused_summary(rows)
+
+
+@benchmark()
 def test_quick_allreduce_rmsnorm_padded_is_bit_exact(
     tp, tokens, hidden, label, algorithm
 ):
@@ -1248,22 +1301,16 @@ def test_quick_allreduce_rmsnorm_padded_is_bit_exact(
         solo=True,
     )
     rows = batch[(tokens, hidden)]
-    bad = [r["rank"] for r in rows if not r["tail_intact"]]
-    assert not bad, (
-        f"{label}/{algorithm}: stored past the last row on ranks {bad} -- a "
-        "dead row of the partial last tile is not masked"
+    fails = _fused_tail_fails(
+        rows, "a dead row of the partial last tile is not masked"
     )
-    bad = [r["rank"] for r in rows if not r["res_exact"]]
-    assert not bad, (
-        f"{label}/{algorithm}: residual_out is not bit-exact on ranks {bad} "
-        "with a lossless wire -- a pad lane is reaching the real row"
-    )
-    for row in rows:
-        assert row["out_sqnr_db"] > 60.0, row
+    fails += _fused_exact_fails(rows, "a pad lane is reaching the real row")
+    _check(f"{label}/{algorithm}", fails)
+    return _fused_summary(rows)
 
 
-@pytest.mark.parametrize("algorithm", ("ring", "mesh"))
-def test_quick_allreduce_rmsnorm_residual_is_bit_exact(algorithm):
+@benchmark()
+def test_quick_allreduce_rmsnorm_residual_is_bit_exact(tp, tokens, hidden, algorithm):
     """With a lossless wire and one live rank, ``residual_out`` is exact.
 
     ``out`` still goes through ``rsqrt``, whose hardware approximation
@@ -1273,23 +1320,22 @@ def test_quick_allreduce_rmsnorm_residual_is_bit_exact(algorithm):
     diverge from the unfused path it has to match.
     """
     batch = _fused_batch(
-        (2, "exact", algorithm),
-        [(512, 4096)],
+        (tp, "exact", algorithm),
+        [(tokens, hidden)],
         algorithm=algorithm,
         codecs=("fp16", "fp16"),
         solo=True,
     )
-    rows = batch[(512, 4096)]
-    bad = [r["rank"] for r in rows if not r["res_exact"]]
-    assert not bad, (
-        f"{algorithm}: residual_out is not bit-exact on ranks {bad} with a "
-        "lossless wire -- the bf16 round-trip or the residual add has drifted"
+    rows = batch[(tokens, hidden)]
+    _check(
+        f"tp{tp} {tokens}x{hidden} {algorithm}",
+        _fused_exact_fails(rows, "the bf16 round-trip or the residual add has drifted"),
     )
-    for row in rows:
-        assert row["out_sqnr_db"] > 60.0, row
+    return _fused_summary(rows)
 
 
-def test_quick_allreduce_rmsnorm_mesh_ranks_agree():
+@benchmark()
+def test_quick_allreduce_rmsnorm_mesh_ranks_agree(tp, tokens, hidden):
     """Every mesh rank must compute the same bits.
 
     The mesh dequantizes the same wire bytes for every atom, so its output is a
@@ -1299,30 +1345,14 @@ def test_quick_allreduce_rmsnorm_mesh_ranks_agree():
     receive -- so this gate is mesh-only, and a ring that passed it would mean
     that optimization had been lost.
     """
-    rows = _fused_batch((4, "sqnr", "mesh"), [(1024, 5120)], algorithm="mesh")[
-        (1024, 5120)
+    rows = _fused_batch((tp, "sqnr", "mesh"), [(tokens, hidden)], algorithm="mesh")[
+        (tokens, hidden)
     ]
-    first = rows[0]
-    bad = [
-        r["rank"]
-        for r in rows
-        if (r["out_bits"], r["res_bits"]) != (first["out_bits"], first["res_bits"])
-    ]
-    assert not bad, f"mesh ranks {bad} disagree with rank 0"
+    _check(f"tp{tp} {tokens}x{hidden} mesh", _fused_disagree_fails(rows))
+    return _fused_summary(rows)
 
 
-#: Self-skip is tested at both super-tile paths the mesh has: ST=1 carries the
-#: own share and chunk in registers across the waits, ST>1 reloads the share
-#: from the input and parks the chunk in ``out`` between its three loops.
-_FUSED_SKIP_SELF_STS = (1, 8)
-
-
-def _skip_self_kw(super_tile: int) -> dict:
-    return {"super_tile": super_tile, "skip_self": True}
-
-
-@pytest.mark.parametrize("super_tile", _FUSED_SKIP_SELF_STS)
-@pytest.mark.parametrize("tp,tokens,hidden,label", _FUSED_CASES)
+@benchmark()
 def test_quick_allreduce_rmsnorm_mesh_skip_self(tp, tokens, hidden, label, super_tile):
     """The fused mesh with self-skip: the SQNR gates, and every rank agreeing.
 
@@ -1343,22 +1373,17 @@ def test_quick_allreduce_rmsnorm_mesh_skip_self(tp, tokens, hidden, label, super
         engine_kw=_skip_self_kw(super_tile),
     )
     rows = batch[(tokens, hidden)]
-    fails = _fused_sqnr_fails(rows)
-    first = rows[0]
-    fails += [
-        f"rank {r['rank']} disagrees with rank 0"
-        for r in rows
-        if (r["out_bits"], r["res_bits"]) != (first["out_bits"], first["res_bits"])
-    ]
+    fails = _fused_sqnr_fails(rows) + _fused_disagree_fails(rows)
     fails += [
         f"rank {r['rank']} ran {r['variant']}, not a self-skip build"
         for r in rows
         if "_ss" not in r["variant"]
     ]
-    assert not fails, f"{label}/mesh/skip_self/st{super_tile}: " + "; ".join(fails)
+    _check(f"{label}/mesh/skip_self/st{super_tile}", fails)
+    return _fused_summary(rows)
 
 
-@pytest.mark.parametrize("tp", sorted({w for w, *_ in _FUSED_CASES}))
+@benchmark()
 def test_quick_allreduce_rmsnorm_mesh_skip_self_st8_is_exercised(tp):
     """At least one case per world size really takes the ST>1 self-skip path,
     so the pinned-ST=8 rows above are not all silently ST=1."""
@@ -1366,16 +1391,15 @@ def test_quick_allreduce_rmsnorm_mesh_skip_self_st8_is_exercised(tp):
     batch = _fused_batch(
         (tp, "ss", "mesh", 8), cases, algorithm="mesh", engine_kw=_skip_self_kw(8)
     )
-    variants = {r["variant"] for rows in batch.values() for r in rows}
-    assert any("_st8_" in v for v in variants), variants
+    variants = sorted({r["variant"] for rows in batch.values() for r in rows})
+    fails = []
+    if not any("_st8_" in v for v in variants):
+        fails.append(f"no ST=8 variant: {variants}")
+    _check(f"tp{tp} mesh skip_self ST=8 coverage", fails)
+    return {"gfx": ARCH, "variants": variants}
 
 
-#: ``tokens`` is large enough that a pinned ST=8 really runs ST=8 at every
-#: world size and inbox type here; the test asserts it.
-@pytest.mark.parametrize("super_tile", _FUSED_SKIP_SELF_STS)
-@pytest.mark.parametrize(
-    "tp,tokens,hidden", ((2, 4096, 4096), (4, 4096, 4096), (2, 4096, 1536))
-)
+@benchmark()
 def test_quick_allreduce_rmsnorm_mesh_skip_self_is_bit_exact(
     tp, tokens, hidden, super_tile
 ):
@@ -1395,52 +1419,72 @@ def test_quick_allreduce_rmsnorm_mesh_skip_self_is_bit_exact(
         engine_kw=_skip_self_kw(super_tile),
     )
     rows = batch[(tokens, hidden)]
-    for row in rows:
-        assert f"_st{super_tile}_" in row["variant"], row["variant"]
-    bad = [r["rank"] for r in rows if not r["res_exact"]]
-    assert not bad, (
-        f"tp{tp} {tokens}x{hidden} st{super_tile}: residual_out is not bit-exact "
-        f"on ranks {bad} with a lossless wire under skip_self -- the own slot is "
-        "misplaced"
-    )
-    for row in rows:
-        assert row["out_sqnr_db"] > 60.0, row
+    fails = [
+        f"rank {r['rank']} ran {r['variant']}, not st{super_tile}"
+        for r in rows
+        if f"_st{super_tile}_" not in r["variant"]
+    ]
+    fails += _fused_exact_fails(rows, "under skip_self the own slot is misplaced")
+    _check(f"tp{tp} {tokens}x{hidden} st{super_tile}", fails)
+    return _fused_summary(rows)
 
 
-@pytest.mark.parametrize("hidden", (2560, 640, 12288))
-def test_quick_allreduce_rmsnorm_rejects_unsupported_hidden(hidden):
+def _expect_raises(what: str, pattern: str, fn) -> list[str]:
+    try:
+        fn()
+    except ValueError as exc:
+        if re.search(pattern, str(exc)):
+            return []
+        return [f"{what}: ValueError {str(exc)!r} does not match {pattern!r}"]
+    return [f"{what}: did not raise ValueError"]
+
+
+def _host_rejects_unsupported_hidden() -> list[str]:
     """Widths off the row-sized-block grid raise, naming the constraint.
 
     A fused block is ``hidden/8`` threads and has to be a multiple of 128 (the
     64 B fabric sector grid) and at most 1024, so 2560 and 640 are off-grid and
-    12288 is too wide. Host-side and GPU-free: no engine is built.
+    12288 is too wide.
     """
     from aiter.ops.flydsl.kernels.quick_allreduce_fusions import (
         quick_reduce_hidden_supported,
         quick_reduce_row_block,
     )
 
-    assert not quick_reduce_hidden_supported(hidden, 8)
-    with pytest.raises(ValueError, match="hidden"):
-        quick_reduce_row_block(hidden, 8)
+    fails = []
+    for hidden in _FUSED_REJECTED_HIDDENS:
+        if quick_reduce_hidden_supported(hidden, 8):
+            fails.append(f"hidden={hidden}: reported supported")
+        fails += _expect_raises(
+            f"hidden={hidden}",
+            "hidden",
+            lambda h=hidden: quick_reduce_row_block(h, 8),
+        )
+    return fails
 
 
-def test_quick_allreduce_rmsnorm_supported_hiddens():
+def _host_supported_hiddens() -> list[str]:
     """Every multiple of 1024 up to 8192 builds at every world size."""
     from aiter.ops.flydsl.kernels.quick_allreduce_fusions import quick_reduce_row_block
 
+    fails = []
     for world_size in SUPPORTED_WORLDS:
         for hidden in range(1024, 8192 + 1, 1024):
             block, atoms_per_row = quick_reduce_row_block(hidden, world_size)
-            assert atoms_per_row == 1 and block == hidden // 8, (hidden, world_size)
+            if not (atoms_per_row == 1 and block == hidden // 8):
+                fails.append(
+                    f"hidden={hidden} tp={world_size}: block={block} "
+                    f"atoms_per_row={atoms_per_row}"
+                )
+    return fails
 
 
-def test_quick_reduce_padded_row_block_is_least_wire():
+def _host_padded_row_block_is_least_wire() -> list[str]:
     """The padded pick is the narrowest legal width at or above hidden dim.
 
-    Host-side and GPU-free. Guards the selection rule rather than the kernel:
-    padding costs ``(h_pad-hidden)/hidden`` extra wire on a bandwidth-bound
-    schedule, so taking anything but the least is a silent throughput loss.
+    Guards the selection rule rather than the kernel: padding costs
+    ``(h_pad-hidden)/hidden`` extra wire on a bandwidth-bound schedule, so
+    taking anything but the least is a silent throughput loss.
 
     Also pins the half that matters more -- a width with a native geometry must
     resolve to ``h_pad == hidden`` and the same ``(block, atoms_per_row)`` it
@@ -1451,98 +1495,120 @@ def test_quick_reduce_padded_row_block_is_least_wire():
         quick_reduce_row_block_options,
     )
 
+    fails = []
     for world_size in SUPPORTED_WORLDS:
         for hidden in range(8, 32768 + 1, 8):
             opts = quick_reduce_padded_row_block_options(hidden, world_size)
             if not opts:
                 continue
+            where = f"hidden={hidden} tp={world_size}"
             block, atoms_per_row, h_pad = opts[0]
-            assert h_pad >= hidden and block * atoms_per_row * 8 == h_pad
-            assert h_pad == min(o[2] for o in opts), (hidden, world_size, h_pad)
+            if not (h_pad >= hidden and block * atoms_per_row * 8 == h_pad):
+                fails.append(f"{where}: malformed leading option {opts[0]}")
+            if h_pad != min(o[2] for o in opts):
+                fails.append(f"{where}: leads with h_pad={h_pad}, not the least")
             native = quick_reduce_row_block_options(hidden, world_size)
-            if native:
-                assert (block, atoms_per_row, h_pad) == (*native[0], hidden), (
-                    f"hidden={hidden} tp={world_size} has a native geometry "
-                    f"{native[0]} but the padded list leads with "
-                    f"{(block, atoms_per_row, h_pad)}"
+            if native and (block, atoms_per_row, h_pad) != (*native[0], hidden):
+                fails.append(
+                    f"{where}: native geometry {native[0]} but the padded list "
+                    f"leads with {(block, atoms_per_row, h_pad)}"
                 )
+    return fails
 
 
-def test_mesh_fanout_quad_budget_gates_narrow_blocks():
+def _host_mesh_fanout_quad_budget_gates_narrow_blocks() -> list[str]:
     """The mesh needs a quad per (peer, sector) of a stripe, and the gate knows.
 
     The row geometry is necessary but not sufficient: ``hidden=1024`` at TP8
     gives a 128-thread block, which passes every row constraint and then has
     too few quads for the fanout to issue in one pass. Before this predicate
     existed the host advertised that width and the factory raised on it.
-
-    Host-side and GPU-free.
     """
     from aiter.ops.flydsl.kernels.quick_allreduce_mesh import (
         make_quick_allreduce_mesh_kernel,
         mesh_fanout_fits,
     )
 
-    assert not mesh_fanout_fits(128, 8, "int4")
-    assert mesh_fanout_fits(256, 8, "int4")
+    fails = []
+    if mesh_fanout_fits(128, 8, "int4"):
+        fails.append("mesh_fanout_fits(128, 8, 'int4') is True")
+    if not mesh_fanout_fits(256, 8, "int4"):
+        fails.append("mesh_fanout_fits(256, 8, 'int4') is False")
     # The predicate and the factory must agree, or the gate lies again.
-    with pytest.raises(ValueError, match="quads"):
-        make_quick_allreduce_mesh_kernel(
+    fails += _expect_raises(
+        "hidden=1024 tp=8 factory",
+        "quads",
+        lambda: make_quick_allreduce_mesh_kernel(
             world_size=8, grid=64, fusion="rmsnorm", hidden=1024
-        )
+        ),
+    )
     for world_size in SUPPORTED_WORLDS:
         for block in range(128, 1024 + 1, 128):
-            hidden = block * 8
             fits = mesh_fanout_fits(block, world_size, "int4")
             try:
                 make_quick_allreduce_mesh_kernel(
                     world_size=world_size,
                     grid=64,
                     fusion="rmsnorm",
-                    hidden=hidden,
+                    hidden=block * 8,
                 )
                 built = True
             except ValueError as exc:
                 if "quads" not in str(exc):
-                    continue  # LDS or another limit; not what this test is about
+                    continue  # LDS or another limit; not what this check is about
                 built = False
-            assert built == fits, (world_size, block, fits, built)
+            if built != fits:
+                fails.append(
+                    f"tp={world_size} block={block}: predicate says {fits}, "
+                    f"factory built={built}"
+                )
+    return fails
 
 
-def test_quick_reduce_row_block_is_first_option():
+def _host_row_block_is_first_option() -> list[str]:
     """Enumerating the row geometries did not move the pick.
 
     ``quick_reduce_row_block`` is the widest-block entry of
     ``quick_reduce_row_block_options``, and every existing caller takes it, so
     this is the guard that the refactor is invisible to the shipped kernels.
-    Host-side and GPU-free.
     """
     from aiter.ops.flydsl.kernels.quick_allreduce_fusions import (
         quick_reduce_row_block,
         quick_reduce_row_block_options,
     )
 
+    fails = []
     for world_size in SUPPORTED_WORLDS:
         for hidden in list(range(1024, 16384 + 1, 1024)) + [5120, 7168]:
+            where = f"hidden={hidden} tp={world_size}"
             opts = quick_reduce_row_block_options(hidden, world_size)
             # Widest first, and each entry really is block * 8 * atoms.
-            assert list(opts) == sorted(opts, reverse=True), (hidden, world_size)
-            for block, atoms in opts:
-                assert block * 8 * atoms == hidden, (hidden, world_size, block)
+            if list(opts) != sorted(opts, reverse=True):
+                fails.append(f"{where}: options not widest first: {opts}")
+            fails += [
+                f"{where}: block={block} atoms={atoms} does not cover hidden"
+                for block, atoms in opts
+                if block * 8 * atoms != hidden
+            ]
             if opts:
-                assert quick_reduce_row_block(hidden, world_size) == opts[0]
+                if quick_reduce_row_block(hidden, world_size) != opts[0]:
+                    fails.append(f"{where}: pick is not the first option {opts[0]}")
             else:
-                with pytest.raises(ValueError, match="no fused build"):
-                    quick_reduce_row_block(hidden, world_size)
+                fails += _expect_raises(
+                    where,
+                    "no fused build",
+                    lambda h=hidden, w=world_size: quick_reduce_row_block(h, w),
+                )
+    return fails
 
 
-def test_fused_one_shot_block_options():
+def _host_fused_one_shot_block_options() -> list[str]:
     """The fused one-shot's whole block axis, and its inverse.
 
     ``block * atoms * 8 == hidden`` with atoms in ``SUPPORTED_ATOMS`` and the
     block a whole number of waves at most 1024 -- so the axis is short and
     width-dependent, which is the thing a tuner has to be told rather than
-    allowed to assume. Host-side and GPU-free.
+    allowed to assume.
     """
     from aiter.ops.flydsl.kernels.one_shot_allreduce import (
         fused_atoms_for_block,
@@ -1550,21 +1616,50 @@ def test_fused_one_shot_block_options():
         fused_block_options,
     )
 
-    assert fused_block_options(8192) == ((1024, 1), (512, 2), (256, 4))
-    # atoms=4 would want 224 threads at 7168, which is not a whole wave.
-    assert fused_block_options(7168) == ((896, 1), (448, 2))
-    assert fused_block_options(5120) == ((640, 1), (320, 2))
-    # atoms=1 would want 2048 threads, over the 1024 limit.
-    assert fused_block_options(16384) == ((1024, 2), (512, 4))
-    assert fused_block_options(6000) == ()
-
+    expected = {
+        8192: ((1024, 1), (512, 2), (256, 4)),
+        # atoms=4 would want 224 threads at 7168, which is not a whole wave.
+        7168: ((896, 1), (448, 2)),
+        5120: ((640, 1), (320, 2)),
+        # atoms=1 would want 2048 threads, over the 1024 limit.
+        16384: ((1024, 2), (512, 4)),
+        6000: (),
+    }
+    fails = [
+        f"hidden={hidden}: block options {fused_block_options(hidden)}, "
+        f"expected {want}"
+        for hidden, want in expected.items()
+        if fused_block_options(hidden) != want
+    ]
     for hidden in (2048, 4096, 5120, 7168, 8192, 16384):
         for block, atoms in fused_block_options(hidden):
-            assert fused_atoms_for_block(hidden, block) == atoms
-            assert fused_block(hidden, atoms) == block
+            if fused_atoms_for_block(hidden, block) != atoms:
+                fails.append(f"hidden={hidden} block={block}: atoms inverse differs")
+            if fused_block(hidden, atoms) != block:
+                fails.append(f"hidden={hidden} atoms={atoms}: block inverse differs")
+    fails += _expect_raises(
+        "hidden=7168 block=256", "896, 448", lambda: fused_atoms_for_block(7168, 256)
+    )
+    return fails
 
-    with pytest.raises(ValueError, match="896, 448"):
-        fused_atoms_for_block(7168, 256)
+
+_HOST_CHECKS = {
+    "rejects_unsupported_hidden": _host_rejects_unsupported_hidden,
+    "supported_hiddens": _host_supported_hiddens,
+    "padded_row_block_is_least_wire": _host_padded_row_block_is_least_wire,
+    "mesh_fanout_quad_budget": _host_mesh_fanout_quad_budget_gates_narrow_blocks,
+    "row_block_is_first_option": _host_row_block_is_first_option,
+    "fused_one_shot_block_options": _host_fused_one_shot_block_options,
+}
+
+
+@benchmark()
+def test_quick_allreduce_host_checks(check):
+    """Host-side, GPU-free checks of the fused row-geometry helpers."""
+    fails = _HOST_CHECKS[check]()
+    if len(fails) > 10:
+        fails = fails[:10] + [f"... and {len(fails) - 10} more"]
+    return {"gfx": ARCH, "passed": _check(f"host-side {check}", fails)}
 
 
 @benchmark()
@@ -1996,6 +2091,84 @@ def main():
             test_quick_allreduce_transport(tokens, hidden, tp, algorithm, st, block, ss)
             for tp, algorithm, tokens, hidden, st, block, ss in transport
         ],
+    )
+
+    # Fused all-reduce + residual add + RMSNorm epilogue. The mesh-only rows
+    # need the mesh among the requested schedules.
+    fused = [c for c in _FUSED_CASES if c[0] in tps]
+    pad = [c for c in _FUSED_PAD_CASES if c[0] in tps]
+    mesh = "mesh" in algos
+    _summarize(
+        "flydsl quick allreduce rmsnorm sqnr",
+        [
+            test_quick_allreduce_rmsnorm_sqnr(tp, tokens, hidden, label, algorithm)
+            for (tp, tokens, hidden, label), algorithm in itertools.product(
+                fused, algos
+            )
+        ],
+    )
+    _summarize(
+        "flydsl quick allreduce rmsnorm padded width (fp16 wire, bit-exact)",
+        [
+            test_quick_allreduce_rmsnorm_padded_is_bit_exact(
+                tp, tokens, hidden, label, algorithm
+            )
+            for (tp, tokens, hidden, label), algorithm in itertools.product(pad, algos)
+        ],
+    )
+    _summarize(
+        "flydsl quick allreduce rmsnorm residual (fp16 wire, bit-exact)",
+        [
+            test_quick_allreduce_rmsnorm_residual_is_bit_exact(
+                tp, tokens, hidden, algorithm
+            )
+            for (tp, tokens, hidden), algorithm in itertools.product(
+                [c for c in _FUSED_EXACT_CASES if c[0] in tps], algos
+            )
+        ],
+    )
+    _summarize(
+        "flydsl quick allreduce rmsnorm mesh rank agreement",
+        [
+            test_quick_allreduce_rmsnorm_mesh_ranks_agree(tp, tokens, hidden)
+            for tp, tokens, hidden in _FUSED_MESH_AGREE_CASES
+            if mesh and tp in tps
+        ],
+    )
+    _summarize(
+        "flydsl quick allreduce rmsnorm mesh skip_self",
+        [
+            test_quick_allreduce_rmsnorm_mesh_skip_self(
+                tp, tokens, hidden, label, super_tile
+            )
+            for (tp, tokens, hidden, label), super_tile in itertools.product(
+                fused if mesh else [], _FUSED_SKIP_SELF_STS
+            )
+        ],
+    )
+    _summarize(
+        "flydsl quick allreduce rmsnorm mesh skip_self ST=8 coverage",
+        [
+            test_quick_allreduce_rmsnorm_mesh_skip_self_st8_is_exercised(tp)
+            for tp in sorted({c[0] for c in fused})
+            if mesh
+        ],
+    )
+    _summarize(
+        "flydsl quick allreduce rmsnorm mesh skip_self (fp16 wire, bit-exact)",
+        [
+            test_quick_allreduce_rmsnorm_mesh_skip_self_is_bit_exact(
+                tp, tokens, hidden, super_tile
+            )
+            for (tp, tokens, hidden), super_tile in itertools.product(
+                [c for c in _FUSED_SKIP_SELF_EXACT_CASES if c[0] in tps and mesh],
+                _FUSED_SKIP_SELF_STS,
+            )
+        ],
+    )
+    _summarize(
+        "flydsl quick allreduce rmsnorm host-side geometry checks",
+        [test_quick_allreduce_host_checks(check) for check in _HOST_CHECKS],
     )
 
     if _FAILURES:

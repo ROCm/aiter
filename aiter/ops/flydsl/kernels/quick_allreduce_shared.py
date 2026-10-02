@@ -14,7 +14,7 @@ export FLYDSL_EXTRA_SOURCE_DIRS=$PWD/aiter/ops/flydsl/kernels at the repo root.
 import logging
 
 import flydsl.expr as fx
-from flydsl.expr import const_expr, rocdl
+from flydsl.expr import rocdl
 from flydsl.expr.typing import T, as_ir_value
 
 logger = logging.getLogger("aiter")
@@ -24,8 +24,6 @@ SUPPORTED_WORLDS = (2, 4, 8)
 BLOCK = 256
 ATOMS = 8
 TILE_BYTES = BLOCK * ATOMS * 16
-TILE_I32 = TILE_BYTES // 4
-TILE_FP16 = TILE_BYTES // 2
 DEFAULT_GRID_CAP = 304 * 4
 WAVE = 64
 WAVES = BLOCK // WAVE
@@ -340,31 +338,27 @@ def make_pack_storage(n_i32: int):
     return PackStorage
 
 
-def make_payload_tensor(*, padded, nbytes, hbm_i32_ptr, hbm_layout):
-    """The handle the atom load/store helpers address an HBM operand through.
+def make_hbm_operand(*, padded, nbytes, hbm_i32_ptr, hbm_layout):
+    """``operand(ptr, records=None)``: the handle the atom load/store helpers
+    address an HBM operand through, given its raw ``Int64`` base pointer.
 
-    ``num_records_bytes`` is the live payload, so a partial last tile reads 0
-    and its stores are dropped rather than faulting.
-
-    A padded build hands back a raw buffer descriptor; an unpadded one hands
-    back a tiled-copy tensor (layout + descriptor). The split is because a
-    padded build's pad lanes need a *per-lane* poke out of bounds, which the
-    tiled copy's layout-derived addresses cannot express -- only the raw
-    ``buffer_ops.buffer_load/store`` path takes a ``mask``. Unpadded builds are
-    untouched, so no shipped width changes codegen.
+    A padded build hands the pointer back untouched: its pad lanes need a
+    *per-lane* bound, which a whole-tensor descriptor cannot express, so
+    ``make_rowbuf_atom_row`` builds a bounded descriptor per row from it. An
+    unpadded build hands back a tiled-copy tensor (layout + descriptor) whose
+    ``num_records_bytes`` is *records*, the live payload by default, so a
+    partial last tile reads 0 and its stores are dropped rather than faulting.
 
     ``hbm_i32_ptr``/``hbm_layout`` are only read on the unpadded branch, so a
     padded build may pass ``None`` for ``hbm_layout`` (it is never built there).
     The one-shot, mesh and ring kernels all share this verbatim.
     """
 
-    def _payload_tensor(ptr, records=None):
+    def _operand(ptr, records=None):
+        if padded:
+            return ptr
         n = nbytes if records is None else records
-        if const_expr(padded):
-            return buffer_ops.create_buffer_resource_from_addr(
-                ptr, num_records_bytes=n
-            )
         view = fx.make_view(fx.inttoptr(hbm_i32_ptr, ptr), hbm_layout)
         return rocdl.make_buffer_tensor(view, max_size=False, num_records_bytes=n)
 
-    return _payload_tensor
+    return _operand

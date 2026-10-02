@@ -27,7 +27,7 @@ A third wire format, ``"fp16"``, is a lossless passthrough. Mainly for testing.
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
-from flydsl.expr.typing import Float32, Int32, Int64, Stream, T
+from flydsl.expr.typing import T
 
 from .quick_allreduce_codec import (
     GROUP,
@@ -80,8 +80,8 @@ from .quick_allreduce_shared import (
     _store_flag_peer,
     _store_v4i32_peer,
     _to_sgpr_i64,
+    make_hbm_operand,
     make_pack_storage,
-    make_payload_tensor,
 )
 
 # Super-tile values the ring accepts.
@@ -346,19 +346,19 @@ def make_quick_allreduce_ring_kernel(
 
     @flyc.kernel(known_block_size=[block, 1, 1])
     def quick_allreduce_ring(
-        rank_unused: Int32,
-        nbytes: Int64,
-        num_tiles: Int32,
-        inp_ptr: Int64,
-        out_ptr: Int64,
-        peer_ptrs: Int64,
-        colors_ptr: Int64,
-        n_blocks: Int32,
+        rank_unused: fx.Int32,
+        nbytes: fx.Int64,
+        num_tiles: fx.Int32,
+        inp_ptr: fx.Int64,
+        out_ptr: fx.Int64,
+        peer_ptrs: fx.Int64,
+        colors_ptr: fx.Int64,
+        n_blocks: fx.Int32,
         # These args are discarded for non-fused kernel
-        res_in_ptr: Int64,
-        res_out_ptr: Int64,
-        w_ptr: Int64,
-        eps: Float32,
+        res_in_ptr: fx.Int64,
+        res_out_ptr: fx.Int64,
+        w_ptr: fx.Int64,
+        eps: fx.Float32,
     ):
         _clamp_fp16_overflow()
         tid = fx.Int32(gpu.thread_id("x"))
@@ -377,7 +377,7 @@ def make_quick_allreduce_ring_kernel(
         # descriptor (``_rowbuf_atom_row``), an unpadded one slices the
         # whole-tensor buffer tensor (``_hbm_atom_row``). ``hbm_layout`` is the
         # 3-D whole-tensor layout consumed only by the unpadded
-        # ``make_payload_tensor``; a padded build leaves it None.
+        # ``make_hbm_operand``; a padded build leaves it None.
         hbm_layout = None
         hbm_row_layout = None
         hbm_copy_atom = None
@@ -446,7 +446,10 @@ def make_quick_allreduce_ring_kernel(
             hbm_i32_ptr = fx.PointerType.get(
                 T.i32, address_space=fx.AddressSpace.Global, alignment=16
             )
-            _payload_tensor = make_payload_tensor(
+            # A padded build keeps the HBM operands as raw ``Int64`` base
+            # pointers so ``_rowbuf_atom_row`` can bound a fresh descriptor per
+            # row; an unpadded build wraps them in the whole-tensor buffer tensor.
+            _operand = make_hbm_operand(
                 padded=padded,
                 nbytes=nbytes,
                 hbm_i32_ptr=hbm_i32_ptr,
@@ -471,13 +474,6 @@ def make_quick_allreduce_ring_kernel(
                 if padded
                 else None
             )
-
-            # A padded build keeps the HBM operands as raw ``Int64`` base
-            # pointers so ``_rowbuf_atom_row`` can bound a fresh descriptor per
-            # row; an unpadded build wraps them in the whole-tensor buffer tensor
-            # via ``_payload_tensor``.
-            def _operand(ptr, records=None):
-                return ptr if const_expr(padded) else _payload_tensor(ptr, records)
 
             # residual in/out are (M, hidden) bf16 exactly like the payload, so
             # they ride the same addressing, as does the final output row. The
@@ -973,15 +969,15 @@ def make_quick_allreduce_ring_kernel(
     # only that function's AST is rewritten.
     @flyc.jit
     def launch_quick_allreduce_ring(
-        rank_arg: Int32,
-        nbytes: Int64,
-        num_tiles: Int32,
-        inp_ptr: Int64,
-        out_ptr: Int64,
-        peer_ptrs: Int64,
-        colors_ptr: Int64,
-        grid_x: Int32,
-        stream: Stream = Stream(None),  # noqa: B008
+        rank_arg: fx.Int32,
+        nbytes: fx.Int64,
+        num_tiles: fx.Int32,
+        inp_ptr: fx.Int64,
+        out_ptr: fx.Int64,
+        peer_ptrs: fx.Int64,
+        colors_ptr: fx.Int64,
+        grid_x: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         quick_allreduce_ring(
             rank_arg,
@@ -992,10 +988,10 @@ def make_quick_allreduce_ring_kernel(
             peer_ptrs,
             colors_ptr,
             grid_x,
-            Int64(0),
-            Int64(0),
-            Int64(0),
-            Float32(0.0),
+            fx.Int64(0),
+            fx.Int64(0),
+            fx.Int64(0),
+            fx.Float32(0.0),
             value_attrs={"rocdl.flat_work_group_size": flat_wg},
         ).launch(
             grid=(grid_x, 1, 1),
@@ -1005,19 +1001,19 @@ def make_quick_allreduce_ring_kernel(
 
     @flyc.jit
     def launch_quick_allreduce_ring_fused(
-        rank_arg: Int32,
-        nbytes: Int64,
-        num_tiles: Int32,
-        inp_ptr: Int64,
-        out_ptr: Int64,
-        peer_ptrs: Int64,
-        colors_ptr: Int64,
-        grid_x: Int32,
-        res_in_ptr: Int64,
-        res_out_ptr: Int64,
-        w_ptr: Int64,
-        eps: Float32,
-        stream: Stream = Stream(None),  # noqa: B008
+        rank_arg: fx.Int32,
+        nbytes: fx.Int64,
+        num_tiles: fx.Int32,
+        inp_ptr: fx.Int64,
+        out_ptr: fx.Int64,
+        peer_ptrs: fx.Int64,
+        colors_ptr: fx.Int64,
+        grid_x: fx.Int32,
+        res_in_ptr: fx.Int64,
+        res_out_ptr: fx.Int64,
+        w_ptr: fx.Int64,
+        eps: fx.Float32,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         quick_allreduce_ring(
             rank_arg,
