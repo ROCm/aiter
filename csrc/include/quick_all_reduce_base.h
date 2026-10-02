@@ -47,7 +47,7 @@ static constexpr int kAtomStride = kBlockSize;
 // Workgroup scope = Tile = (256 threads x 8 atoms x 16B)
 static constexpr int kTileSize = kBlockSize * kAtoms * sizeof(int32x4_t);
 
-// Max number of blocks. 304 CUs on MI300
+// Allocation upper bound; gfx950 uses a 256-CU runtime grid cap.
 static constexpr int kMaxNumBlocks = 304 * 4;
 
 // Standard CDNA wavefront size.
