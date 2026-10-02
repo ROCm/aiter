@@ -62,7 +62,6 @@ def mxfp8_attention_forward(
     bias: torch.Tensor | None = None,
     dropout_p: float = 0.0,
     return_softmax: bool = False,
-    use_mxfp8: bool = True,
     block_m: int = 64,
     block_n: int = 64,
     quant_block_size: int = 32,
@@ -81,7 +80,6 @@ def mxfp8_attention_forward(
         bias: Optional attention bias tensor.
         dropout_p: Dropout probability.
         return_softmax: Whether to return softmax scores.
-        use_mxfp8: Whether to use MXFP8 quantization.
         block_m: Block size for query sequence dimension.
         block_n: Block size for key/value sequence dimension.
         quant_block_size: Quantization block size.
@@ -130,7 +128,7 @@ def mxfp8_attention_forward(
     o = torch.empty(
         o_shape,
         device=q.device,
-        dtype=torch.bfloat16 if use_mxfp8 else q.dtype,
+        dtype=torch.bfloat16,
         requires_grad=True,
     )
 
@@ -197,26 +195,15 @@ def mxfp8_attention_forward(
     bias_strides = tuple(bias.stride()) if bias is not None else (0, 0, 0, 0)
     alibi_strides = tuple(alibi_slopes.stride()) if alibi_slopes is not None else (0, 0)
 
-    if use_mxfp8:
-        stride_qdescale_z, stride_qdescale_h, stride_qdescale_m, stride_qdescale_d = (
-            get_strides_from_layout(q_scale, layout)
-        )
-        stride_kdescale_z, stride_kdescale_h, stride_kdescale_m, stride_kdescale_d = (
-            get_strides_from_layout(k_scale, layout)
-        )
-        stride_vdescale_z, stride_vdescale_h, stride_vdescale_m, stride_vdescale_d = (
-            get_strides_from_layout(v_scale, layout)
-        )
-    else:
-        stride_qdescale_z = stride_qdescale_h = stride_qdescale_m = (
-            stride_qdescale_d
-        ) = None
-        stride_kdescale_z = stride_kdescale_h = stride_kdescale_m = (
-            stride_kdescale_d
-        ) = None
-        stride_vdescale_z = stride_vdescale_h = stride_vdescale_m = (
-            stride_vdescale_d
-        ) = None
+    stride_qdescale_z, stride_qdescale_h, stride_qdescale_m, stride_qdescale_d = (
+        get_strides_from_layout(q_scale, layout)
+    )
+    stride_kdescale_z, stride_kdescale_h, stride_kdescale_m, stride_kdescale_d = (
+        get_strides_from_layout(k_scale, layout)
+    )
+    stride_vdescale_z, stride_vdescale_h, stride_vdescale_m, stride_vdescale_d = (
+        get_strides_from_layout(v_scale, layout)
+    )
 
     kernel_kwargs = {}
     if padded_d_model_qk % 128 == 0 and block_n % 128 == 0:
@@ -231,7 +218,6 @@ def mxfp8_attention_forward(
         q_scale,
         k_scale,
         v_scale,
-        use_mxfp8,
         sm_scale,
         softmax_lse,
         o,
@@ -308,7 +294,6 @@ def mxfp8_attention_backward(
     p_scale: int = 127,
     alibi_slopes: torch.Tensor | None = None,
     causal: bool = False,
-    use_mxfp8: bool = True,
     block_m_dq_bwd: int = 64,
     block_n_dq_bwd: int = 64,
     block_m_dkv_bwd: int = 64,
@@ -339,8 +324,8 @@ def mxfp8_attention_backward(
         (dq, dk, dv) gradient tensors in fp32.
 
     Not supported: alibi_slopes, layout='thd'.
-    bias and dropout are handled in the forward but have no backward
-    implementation; pass bias=None and dropout_p=0 to avoid silent errors.
+    Bias and dropout are rejected by the forward wrapper. This backward
+    only covers the MXFP8 path.
     """
     _LOGGER.info(f"MXFP8_ATTENTION_BWD: q={tuple(q.shape)}, k={tuple(k.shape)}")
     assert is_cdna4(), "mxfp8 attention requires gfx950"
@@ -439,40 +424,28 @@ def mxfp8_attention_backward(
     f8_bwd_dtype = _get_f8_bwd_dtype()
     tl_f8_bwd_dtype = _get_tl_f8_bwd_dtype()
 
-    if use_mxfp8:
-        m_blocks_q = triton.cdiv(max_seqlen_q, quant_block_size)
-        dv_blocks = triton.cdiv(head_size_v, quant_block_size)
-        if layout == "bhsd":
-            _shape = (batch, nheads_q, m_blocks_q, dv_blocks)
-        elif layout == "bshd":
-            _shape = (batch, m_blocks_q, nheads_q, dv_blocks)
-        elif layout == "thd":
-            _shape = (q_scale.shape[0], q_scale.shape[1], dv_blocks)
-        else:
-            raise AssertionError(f"Unsupported layout: {layout}")
-        do_fp8 = torch.empty_like(do, dtype=f8_bwd_dtype)
-        do_scale = torch.empty(_shape, dtype=torch.uint8, device=q.device)
-        stride_dodescalez, stride_dodescaleh, stride_dodescalem, stride_dodescaled = (
-            get_strides_from_layout(do_scale, layout)
-        )
-        stride_qdescalez, stride_qdescaleh, stride_qdescalem, stride_qdescaled = (
-            get_strides_from_layout(q_scale, layout)
-        )
-        stride_kdescalez, stride_kdescaleh, stride_kdescalem, stride_kdescaled = (
-            get_strides_from_layout(k_scale, layout)
-        )
-        stride_vdescalez, stride_vdescaleh, stride_vdescalem, stride_vdescaled = (
-            get_strides_from_layout(v_scale, layout)
-        )
+    m_blocks_q = triton.cdiv(max_seqlen_q, quant_block_size)
+    dv_blocks = triton.cdiv(head_size_v, quant_block_size)
+    if layout == "bhsd":
+        _shape = (batch, nheads_q, m_blocks_q, dv_blocks)
+    elif layout == "bshd":
+        _shape = (batch, m_blocks_q, nheads_q, dv_blocks)
     else:
-        do_fp8 = None
-        do_scale = None
-        stride_dodescalez = stride_dodescaleh = stride_dodescalem = (
-            stride_dodescaled
-        ) = None
-        stride_qdescalez = stride_qdescaleh = stride_qdescalem = stride_qdescaled = None
-        stride_kdescalez = stride_kdescaleh = stride_kdescalem = stride_kdescaled = None
-        stride_vdescalez = stride_vdescaleh = stride_vdescalem = stride_vdescaled = None
+        raise AssertionError(f"Unsupported layout: {layout}")
+    do_fp8 = torch.empty_like(do, dtype=f8_bwd_dtype)
+    do_scale = torch.empty(_shape, dtype=torch.uint8, device=q.device)
+    stride_dodescalez, stride_dodescaleh, stride_dodescalem, stride_dodescaled = (
+        get_strides_from_layout(do_scale, layout)
+    )
+    stride_qdescalez, stride_qdescaleh, stride_qdescalem, stride_qdescaled = (
+        get_strides_from_layout(q_scale, layout)
+    )
+    stride_kdescalez, stride_kdescaleh, stride_kdescalem, stride_kdescaled = (
+        get_strides_from_layout(k_scale, layout)
+    )
+    stride_vdescalez, stride_vdescaleh, stride_vdescalem, stride_vdescaled = (
+        get_strides_from_layout(v_scale, layout)
+    )
 
     preprocess_o_block = min(max_seqlen_q, 64)
     preprocess_o_block = max(preprocess_o_block, quant_block_size)
@@ -483,7 +456,6 @@ def mxfp8_attention_backward(
         do_fp8,
         do_scale,
         delta,
-        use_mxfp8,
         stride_oz,
         stride_oh,
         stride_om,
@@ -540,7 +512,7 @@ def mxfp8_attention_backward(
         v_scale,
         do_scale,
         o,
-        do_fp8 if use_mxfp8 else do,
+        do_fp8,
         dq,
         dk,
         dv,
@@ -598,7 +570,6 @@ def mxfp8_attention_backward(
         CAUSAL=causal,
         USE_EXP2=use_exp2,
         IS_VARLEN=is_varlen,
-        use_mxfp8=use_mxfp8,
         F8_BWD_DTYPE=tl_f8_bwd_dtype,
         QUANT_BLOCK_SIZE=quant_block_size,
         QUANT_SIZE=quant_size,
@@ -627,7 +598,7 @@ def mxfp8_attention_backward(
         v_scale,
         do_scale,
         o,
-        do_fp8 if use_mxfp8 else do,
+        do_fp8,
         dq,
         dk,
         dv,
@@ -685,7 +656,6 @@ def mxfp8_attention_backward(
         CAUSAL=causal,
         USE_EXP2=use_exp2,
         IS_VARLEN=is_varlen,
-        use_mxfp8=use_mxfp8,
         F8_BWD_DTYPE=tl_f8_bwd_dtype,
         QUANT_BLOCK_SIZE=quant_block_size,
         QUANT_SIZE=quant_size,
