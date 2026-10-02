@@ -89,11 +89,16 @@ DEFAULT_GRID_CAP = 64
 #                               tile over the rest of the 80 KiB window. The
 #                               wide workgroup wins at every size.
 #
-#   xGMI
+#     PCIe stays on the flag variant: Lamport needs the uncached inbox, which
+#     PCIe TP4/8 do not use, and it has not been measured on PCIe at TP2.
 #
-#     TP2  atoms=1 cap128 b256 -- one rung over the whole window
+#   xGMI -- Lamport and skip_self at every world size. Lamport beats the flag
+#   variant by 3-23% at TP2, 3-14% at TP4 and 19-41% at TP8 on gfx942.
+#
+#     TP2  atoms=1 cap128 b128/b256 -- the 2 KiB tile to 256 KiB, the most it
+#                               covers in one round, then the 4 KiB tile.
 #     TP4  atoms=1 cap128 b256 -- one rung over the whole window
-#     TP8  atoms=1 cap128 b256 -- one rung over the whole window
+#     TP8  atoms=1 cap128 b128 -- one rung over the whole window
 ONESHOT_LADDER = {
     ("pcie", 2): (
         (0, 1, 64, "peer", 512, True, False),
@@ -108,9 +113,12 @@ ONESHOT_LADDER = {
         (0, 1, 64, "peer", 512, True, False),
         (16 << 10, 2, 64, "peer", 512, True, False),
     ),
-    ("xgmi", 2): ((0, 1, 128, "peer", 256, False, False),),
-    ("xgmi", 4): ((0, 1, 128, "peer", 256, False, False),),
-    ("xgmi", 8): ((0, 1, 128, "peer", 256, False, False),),
+    ("xgmi", 2): (
+        (0, 1, 128, "peer", 128, True, True),
+        (256 << 10, 1, 128, "peer", 256, True, True),
+    ),
+    ("xgmi", 4): ((0, 1, 128, "peer", 256, True, True),),
+    ("xgmi", 8): ((0, 1, 128, "peer", 128, True, True),),
 }
 
 

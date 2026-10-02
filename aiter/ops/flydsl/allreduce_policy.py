@@ -92,23 +92,22 @@ FAMILY_POLICY: dict[tuple[str, int], FamilyPolicy] = {
         oneshot_max=16 << 10, oneshot_max_exact=(80 << 10) - 1, mesh_max=24 << 20
     ),
     # --- xGMI: Policy from measurements (on gfx942) --------------------
+    # No floor: the Lamport one-shot ties or beats cross_device_reduce down to
+    # the smallest payload at every world size.
     ("xgmi", 2): FamilyPolicy(
         oneshot_max=384 << 10,
         oneshot_max_exact=1536 << 10,
         mesh_max=128 << 20,
-        min_bytes=56 << 10,
     ),
     ("xgmi", 4): FamilyPolicy(
         oneshot_max=384 << 10,
         oneshot_max_exact=384 << 10,
         mesh_max=128 << 20,
-        min_bytes=48 << 10,
     ),
     ("xgmi", 8): FamilyPolicy(
         oneshot_max=256 << 10,
         oneshot_max_exact=168 << 10,
         mesh_max=128 << 20,
-        min_bytes=112 << 10,
     ),
 }
 
