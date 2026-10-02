@@ -105,12 +105,16 @@ def test_ladders_are_well_formed(ws):
         one = oneshot_ladder(ws, link)
         assert one and one[0][0] == 0, link
         assert [r[0] for r in one] == sorted(r[0] for r in one), link
-        for _floor, atoms, cap, fanout, block, skip_self in one:
+        for _floor, atoms, cap, fanout, block, skip_self, lamport in one:
             assert atoms in SUPPORTED_ATOMS, (link, atoms)
             assert cap >= 1, (link, cap)
             assert fanout in ("peer", "atom"), (link, fanout)
             assert block in SUPPORTED_BLOCKS, (link, block)
             assert isinstance(skip_self, bool), (link, skip_self)
+            assert isinstance(lamport, bool), (link, lamport)
+            # Lamport needs the uncached inbox, which "auto" resolves to on
+            # xGMI and at PCIe TP2 only.
+            assert not (lamport and link == "pcie" and ws > 2), (link, ws)
 
 
 @pytest.mark.parametrize("ws", WORLDS)
@@ -245,6 +249,19 @@ def test_oneshot_min_override():
     # Garbage warns and is ignored.
     with _env(AITER_FLY_AR_ONESHOT_MIN_BYTES="lots"):
         assert P.resolve_oneshot("xgmi", 8).min_bytes == table_min
+
+
+def test_oneshot_lamport_override():
+    """``AITER_FLY_AR_ONESHOT_LAMPORT`` pins the Lamport variant on or off;
+    unset, ``-1`` and garbage leave it to the ladder (None)."""
+    assert P.resolve_oneshot("xgmi", 2).lamport is None
+    with _env(AITER_FLY_AR_ONESHOT_LAMPORT="1"):
+        assert P.resolve_oneshot("xgmi", 2).lamport is True
+    with _env(AITER_FLY_AR_ONESHOT_LAMPORT="0"):
+        assert P.resolve_oneshot("xgmi", 2).lamport is False
+    for raw in ("-1", "2", "yes"):
+        with _env(AITER_FLY_AR_ONESHOT_LAMPORT=raw):
+            assert P.resolve_oneshot("xgmi", 2).lamport is None
 
 
 def test_override_cannot_invert_the_partition():

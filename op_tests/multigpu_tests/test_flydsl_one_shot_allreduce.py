@@ -9,8 +9,8 @@ it walks ``ONESHOT_LADDER`` and picks a rung by payload size -- on payloads
 derived from ``allreduce_policy``: at every world size, both ends of each
 rung's slice of the window the policy routes to the one-shot. Next to it, a
 few spot checks run pinned configurations no shipped rung uses, one world size
-each. ``--atoms``, ``--grid-cap``, ``--fanout``, ``--block`` or ``--skip-self``
-pin a configuration instead.
+each. ``--atoms``, ``--grid-cap``, ``--fanout``, ``--block``, ``--skip-self``
+or ``--lamport`` pin a configuration instead.
 
 ``test_one_shot_allreduce`` checks three things per shape, and the second
 matters more than the first:
@@ -32,6 +32,13 @@ silently leaving a rung untested.
 deliberate rank skew. The inbox is double-buffered by ``colour & 1`` and the
 safety argument depends on a straggler's read of call k finishing before
 anyone's push for call k+2; a quiescent test never exercises that.
+
+``test_one_shot_allreduce_fresh_inputs`` makes back-to-back calls with a new
+input on every call, at varying sizes and under rank skew, and checks each
+result bit for bit against an fp32 rank-order reference. A static input cannot
+see a read of a stale inbox slot: the stale data is the right answer. That
+matters most to the Lamport variant, whose slots are re-armed rather than
+flagged, so its run also feeds it the NaN pattern it uses as a sentinel.
 
 ``--extended`` runs the spot-check configurations at every world size, and the
 spot-check shapes on the production engine too.
@@ -128,10 +135,36 @@ SPOT_CONFIGS = (
             "skip_self": True,
         },
     ),
+    (
+        2,
+        {
+            "atoms": 1,
+            "grid_cap": 128,
+            "fanout": "peer",
+            "block": 256,
+            "skip_self": True,
+            "lamport": True,
+        },
+    ),
+    (
+        8,
+        {
+            "atoms": 2,
+            "grid_cap": 64,
+            "fanout": "peer",
+            "block": 256,
+            "skip_self": False,
+            "lamport": True,
+        },
+    ),
 )
 
 RUN_AHEAD_M = 5
 RUN_AHEAD_ITERS = 200
+# Fresh-input stress: calls, and the token counts they cycle through at HIDDEN.
+# 160 x 7168 is 2.2 MiB, several tiles per block at every rung's grid cap.
+FRESH_ITERS = 300
+FRESH_TOKENS = (1, 2, 3, 8, 1, 160, 4, 1)
 SQNR_FLOOR_DB = 45.0
 
 # Seconds to wait for each rank of a spawn. The kernels spin on flags written
@@ -203,6 +236,46 @@ def _metrics(out, ref, tp: int) -> dict:
         "lanes_differing": lanes_differing,
         "err": float(err),
     }
+
+
+def _rank_order_sum(parts: list[torch.Tensor]) -> torch.Tensor:
+    """fp32 sum in rank order, rounded to bf16 once: what the kernel computes,
+    bit for bit."""
+    acc = parts[0].float()
+    for p in parts[1:]:
+        acc = acc + p.float()
+    return acc.to(torch.bfloat16)
+
+
+def _fresh_inputs(eng, rank: int, tp: int, device) -> dict:
+    """``FRESH_ITERS`` calls, each on a new input and into its own output, with
+    no host sync in between, then every result checked bit for bit.
+
+    Rank 0 is dragged now and then so the others run ahead. Every 7th call
+    carries the bf16 NaN ``0xFFFF`` in some lanes of every rank, which is the
+    Lamport sentinel; the result there need only be NaN.
+    """
+    drag = torch.randn(2048, 2048, device=device, dtype=torch.float32)
+    calls = []
+    for it in range(FRESH_ITERS):
+        m = FRESH_TOKENS[it % len(FRESH_TOKENS)]
+        parts = _parts(m, HIDDEN, tp, 7 + it, device)
+        if it % 7 == 3:
+            for p in parts:
+                p.view(torch.int16).view(-1)[it % 5 :: 97] = -1
+        if rank == 0 and it % 5 == 0:
+            drag = drag @ drag.T * 1e-6
+        inp = parts[rank].contiguous()
+        out = torch.empty_like(inp)
+        eng.allreduce(inp, out)
+        calls.append((out, _rank_order_sum(parts)))
+    torch.cuda.synchronize()
+    mismatches = 0
+    for out, ref in calls:
+        nan = ref.isnan()
+        mismatches += int((out.view(torch.int16) != ref.view(torch.int16))[~nan].sum())
+        mismatches += int((~out.isnan() & nan).sum())
+    return {"calls": len(calls), "mismatches": mismatches}
 
 
 def _worst(a: dict, b: dict) -> dict:
@@ -318,11 +391,17 @@ def _run_rank(
         checks += 1
         bad += _sqnr_db(ref, out) < SQNR_FLOOR_DB
         run_ahead = {"checks": checks, "bad_checks": bad}
+        fresh = _fresh_inputs(eng, rank, tp, device)
     finally:
         dist.barrier()
         eng.close()
         dist.destroy_process_group()
-    return {"rows": rows, "run_ahead": run_ahead, "production_cfgs": production_cfgs}
+    return {
+        "rows": rows,
+        "run_ahead": run_ahead,
+        "fresh": fresh,
+        "production_cfgs": production_cfgs,
+    }
 
 
 def _spawn(
@@ -374,10 +453,10 @@ _FAILURES: list[str] = []
 # Tuning knobs the command line can pin. They are test-function arguments, so
 # they select the engine, but not table columns: the ``variant`` column names
 # the binary that actually ran, which is what a pinned knob changes.
-KNOBS = ("atoms", "grid_cap", "fanout", "block", "skip_self")
+KNOBS = ("atoms", "grid_cap", "fanout", "block", "skip_self", "lamport")
 
 
-def _engine_kw(atoms, grid_cap, fanout, block, skip_self) -> dict:
+def _engine_kw(atoms, grid_cap, fanout, block, skip_self, lamport=None) -> dict:
     """OneShotAllReduce kwargs for the knobs that are pinned (not None)."""
     kw = {
         "atoms": atoms,
@@ -385,6 +464,7 @@ def _engine_kw(atoms, grid_cap, fanout, block, skip_self) -> dict:
         "fanout": fanout,
         "block": block,
         "skip_self": skip_self,
+        "lamport": lamport,
     }
     return {k: v for k, v in kw.items() if v is not None}
 
@@ -418,8 +498,9 @@ def test_one_shot_allreduce(
     fanout=None,
     block=None,
     skip_self=None,
+    lamport=None,
 ):
-    engine_kw = _engine_kw(atoms, grid_cap, fanout, block, skip_self)
+    engine_kw = _engine_kw(atoms, grid_cap, fanout, block, skip_self, lamport)
     key = _key(tp, engine_kw)
     i = _CASES[key].index((tokens, hidden, graph))
     rows = [r["rows"][i] for r in _ranks(key)]
@@ -463,8 +544,9 @@ def test_one_shot_allreduce_run_ahead(
     fanout=None,
     block=None,
     skip_self=None,
+    lamport=None,
 ):
-    engine_kw = _engine_kw(atoms, grid_cap, fanout, block, skip_self)
+    engine_kw = _engine_kw(atoms, grid_cap, fanout, block, skip_self, lamport)
     runs = [r["run_ahead"] for r in _ranks(_key(tp, engine_kw))]
     _check(
         f"tp={tp} run-ahead {engine_kw}",
@@ -478,6 +560,35 @@ def test_one_shot_allreduce_run_ahead(
         "gfx": ARCH,
         "checks": runs[0]["checks"],
         "bad_checks": sum(r["bad_checks"] for r in runs),
+    }
+
+
+@benchmark()
+def test_one_shot_allreduce_fresh_inputs(
+    tp,
+    iters,
+    atoms=None,
+    grid_cap=None,
+    fanout=None,
+    block=None,
+    skip_self=None,
+    lamport=None,
+):
+    engine_kw = _engine_kw(atoms, grid_cap, fanout, block, skip_self, lamport)
+    runs = [r["fresh"] for r in _ranks(_key(tp, engine_kw))]
+    _check(
+        f"tp={tp} fresh inputs {engine_kw}",
+        [
+            f"rank {rank}: {r['mismatches']} bf16 lanes differ from the "
+            f"rank-order reference over {r['calls']} calls"
+            for rank, r in enumerate(runs)
+            if r["mismatches"]
+        ],
+    )
+    return {
+        "gfx": ARCH,
+        "calls": runs[0]["calls"],
+        "mismatches": sum(r["mismatches"] for r in runs),
     }
 
 
@@ -572,6 +683,14 @@ def main():
         help="Pin skip_self off (0) or on (1).",
     )
     parser.add_argument(
+        "--lamport",
+        type=int,
+        nargs="*",
+        default=[None],
+        choices=(0, 1, None),
+        help="Pin the Lamport (flagless) variant off (0) or on (1).",
+    )
+    parser.add_argument(
         "--extended",
         action="store_true",
         help="Run the spot-check configurations at every world size, and the\n"
@@ -602,9 +721,15 @@ def main():
             "fanout": fanout,
             "block": block,
             "skip_self": None if skip_self is None else bool(skip_self),
+            "lamport": None if lamport is None else bool(lamport),
         }
-        for atoms, grid_cap, fanout, block, skip_self in itertools.product(
-            args.atoms, args.grid_cap, args.fanout, args.block, args.skip_self
+        for atoms, grid_cap, fanout, block, skip_self, lamport in itertools.product(
+            args.atoms,
+            args.grid_cap,
+            args.fanout,
+            args.block,
+            args.skip_self,
+            args.lamport,
         )
     ]
     ladder = configs == [dict.fromkeys(KNOBS)]
@@ -658,6 +783,13 @@ def main():
             test_one_shot_allreduce_run_ahead(
                 RUN_AHEAD_M, HIDDEN, tp, RUN_AHEAD_ITERS, **knobs
             )
+            for tp, knobs, _shapes, _graph in spawns
+        ],
+    )
+    _summarize(
+        "flydsl one-shot allreduce fresh inputs",
+        [
+            test_one_shot_allreduce_fresh_inputs(tp, FRESH_ITERS, **knobs)
             for tp, knobs, _shapes, _graph in spawns
         ],
     )

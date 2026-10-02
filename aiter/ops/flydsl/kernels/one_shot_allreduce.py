@@ -14,6 +14,12 @@ rather than ~6.
 
 No LDS is needed: thread ``t``'s 16 B lands at the same offset in every destination,
 so it can be pushed straight from registers.
+
+``lamport=True`` builds the same push without the flags: the payload is its own
+flag. Inbox slots hold a sentinel until a peer's data lands, the receiver polls
+its 16 B per source until no half-word is the sentinel, and then re-arms a slot
+two rounds ahead. That removes the ``vmcnt(0)`` drain, both barriers and the
+flag round trip from every tile.
 """
 
 import flydsl.compiler as flyc
@@ -38,6 +44,7 @@ from .quick_allreduce_shared import (
     _load_flag,
     _load_peers,
     _payload_io,
+    _poll_v4i32,
     _release_inbox,
     _store_flag_peer,
     _store_v4i32_peer,
@@ -62,8 +69,8 @@ SUPPORTED_ATOMS = (1, 2, 4)
 DEFAULT_GRID_CAP = 64
 
 # Per-``(link, world_size)`` tuning ladder: ``(min_bytes, atoms, grid_cap,
-# fanout, block, skip_self)`` rungs. The host builds one engine per rung and
-# selects by payload size at launch. Created from a tuning sweep.
+# fanout, block, skip_self, lamport)`` rungs. The host builds one engine per
+# rung and selects by payload size at launch. Created from a tuning sweep.
 #
 # ``atoms`` and ``block`` both scale the tile, and their product is what
 # matters to the block count; they are separate knobs because only ``block``
@@ -89,21 +96,21 @@ DEFAULT_GRID_CAP = 64
 #     TP8  atoms=1 cap128 b256 -- one rung over the whole window
 ONESHOT_LADDER = {
     ("pcie", 2): (
-        (0, 1, 64, "peer", 512, True),
-        (384 << 10, 4, 128, "peer", 512, True),
+        (0, 1, 64, "peer", 512, True, False),
+        (384 << 10, 4, 128, "peer", 512, True, False),
     ),
     ("pcie", 4): (
-        (0, 1, 64, "peer", 256, True),
-        (48 << 10, 2, 64, "atom", 256, True),
-        (96 << 10, 4, 128, "peer", 256, True),
+        (0, 1, 64, "peer", 256, True, False),
+        (48 << 10, 2, 64, "atom", 256, True, False),
+        (96 << 10, 4, 128, "peer", 256, True, False),
     ),
     ("pcie", 8): (
-        (0, 1, 64, "peer", 512, True),
-        (16 << 10, 2, 64, "peer", 512, True),
+        (0, 1, 64, "peer", 512, True, False),
+        (16 << 10, 2, 64, "peer", 512, True, False),
     ),
-    ("xgmi", 2): ((0, 1, 128, "peer", 256, False),),
-    ("xgmi", 4): ((0, 1, 128, "peer", 256, False),),
-    ("xgmi", 8): ((0, 1, 128, "peer", 256, False),),
+    ("xgmi", 2): ((0, 1, 128, "peer", 256, False, False),),
+    ("xgmi", 4): ((0, 1, 128, "peer", 256, False, False),),
+    ("xgmi", 8): ((0, 1, 128, "peer", 256, False, False),),
 }
 
 
@@ -124,6 +131,7 @@ def oneshot_ladder(world_size: int, link: str = "pcie"):
                 DEFAULT_FANOUT,
                 DEFAULT_BLOCK,
                 DEFAULT_SKIP_SELF,
+                DEFAULT_LAMPORT,
             ),
         ),
     )
@@ -157,6 +165,20 @@ DEFAULT_FANOUT = "peer"
 # registers, which is 1/N of each; dropping it specialises the binary per rank.
 DEFAULT_SKIP_SELF = False
 
+# Lamport mode: the payload is its own flag.
+#
+# Three inbox buffers rotate by colour. Round ``c`` reads buffer ``c``, and
+# re-arms buffer ``c + 2`` (mod 3) with the sentinel. No peer can be writing that
+# one: a peer is at most one round ahead, and that round uses ``c + 1``.
+LAMPORT_BUFFERS = 3
+# The sentinel is bf16 (and fp16) NaN ``0xFFFF`` in every half-word, so an unused
+# inbox is just a ``0xFF`` memset. A sender rewrites a sentinel half-word in its
+# own payload to ``0x7FFF``, which is still NaN, so the result is unchanged.
+LAMPORT_FILL_BYTE = 0xFF
+DEFAULT_LAMPORT = False
+# Bit 15 of both half-words of an i32, as a signed i32.
+_HALF_SIGN_BITS = -0x7FFF8000  # 0x80008000
+
 
 def _atom_bf16_to_f32(atom_i32):
     """16 B of bf16 (8 values) -> 8 f32. bf16 is the high half of f32, so this
@@ -171,6 +193,33 @@ def _atom_f32_to_bf16(acc_f32):
     return acc_f32.to(fx.BFloat16).bitcast(fx.Int32)
 
 
+def _sentinel_mask(atom_i32):
+    """Bit 15 of every half-word of *atom_i32* that is the sentinel ``0xFFFF``.
+
+    Branch-free zero test per 16-bit lane on the complement: a half-word of
+    ``~x`` is non-zero iff adding ``0x7FFF`` to its low 15 bits, or its own bit
+    15, sets bit 15. The low 15 bits are masked first, so no carry crosses into
+    the upper half-word.
+    """
+    x = atom_i32 ^ -1
+    nonzero = ((x & 0x7FFF7FFF) + 0x7FFF7FFF) | x
+    return (nonzero & _HALF_SIGN_BITS) ^ _HALF_SIGN_BITS
+
+
+def _canonicalize(atom_i32):
+    """*atom_i32* with every sentinel half-word ``0xFFFF`` turned into ``0x7FFF``."""
+    return atom_i32 ^ _sentinel_mask(atom_i32)
+
+
+def _has_sentinel(vec_i32):
+    """Whether any half-word of the i32 vector *vec_i32* is still the sentinel."""
+    mask = _sentinel_mask(vec_i32)
+    acc = mask[0]
+    for i in range(1, vec_i32.numel):
+        acc = acc | mask[i]
+    return acc != 0
+
+
 def make_one_shot_allreduce_kernel(
     *,
     world_size: int,
@@ -181,6 +230,7 @@ def make_one_shot_allreduce_kernel(
     skip_self: bool = False,
     rank: int | None = None,
     block: int = DEFAULT_BLOCK,
+    lamport: bool = DEFAULT_LAMPORT,
 ):
     if block not in SUPPORTED_BLOCKS:
         raise ValueError(f"block must be one of {SUPPORTED_BLOCKS}, got {block!r}")
@@ -203,6 +253,13 @@ def make_one_shot_allreduce_kernel(
         raise ValueError(f"fanout must be one of {FANOUT_ORDERS}, got {fanout!r}")
     if grid < 1:
         raise ValueError(f"grid must be positive, got {grid}")
+    if lamport and inbox_memory != "uncached":
+        # The receiver has no flag to order its loads after, so a payload store
+        # must not be able to sit in the writer's L2: only the uncached inbox
+        # guarantees that for an ``nt`` store.
+        raise ValueError(
+            f"lamport needs the uncached inbox, got inbox_memory={inbox_memory!r}"
+        )
 
     policy = _INBOX_POLICY[inbox_memory]
     payload_policy = policy["payload"]
@@ -212,10 +269,12 @@ def make_one_shot_allreduce_kernel(
 
     tile_bytes = block * atoms * ATOM_BYTES
     tile_i32 = tile_bytes // 4
-    # Payload then the 64 B handshake sector.
-    wire_tile_i32 = tile_i32 + FLAG_I32
+    # Payload then the 64 B handshake sector, or the payload alone in Lamport
+    # mode.
+    wire_tile_i32 = tile_i32 + (0 if lamport else FLAG_I32)
     wire_tile_bytes = wire_tile_i32 * 4
-    data_bytes = PARITIES * grid * world_size * wire_tile_bytes
+    buffers = LAMPORT_BUFFERS if lamport else PARITIES
+    data_bytes = buffers * grid * world_size * wire_tile_bytes
 
     # This rank's own index as a trace-time constant, or None when the self
     # slot is being used. It has to be compile-time: the peer fanout, the flag
@@ -378,55 +437,144 @@ def make_one_shot_allreduce_kernel(
                 _release_inbox(release_scope)
             _acquire_inbox(acquire_scope)
 
-        def _reduce(parity, my_atoms):
+        def _recv_i32(parity, src, atom):
+            """i32 offset of this thread's 16 B of *atom* in the slot of *src*."""
+            return (
+                _slot_i32(parity, fx.Int32(src))
+                + fx.Int32(atom * block * ATOM_I32)
+                + tid * fx.Int32(ATOM_I32)
+            )
+
+        def _load_recv(parity, src, atom):
+            return _buffer_load(
+                inbox, _recv_i32(parity, src, atom), ATOM_I32, fx.Int32, _RECV_POLICY
+            )
+
+        def _poll(parity):
+            """Lamport receive: this thread's 16 B of every atom of every source,
+            keyed ``(src, atom)``, once none of them is the sentinel.
+
+            The first reads all go out before any is tested. Until every slot
+            has landed, every slot is then re-read on each pass, together,
+            rather than one source at a time: a serial spin would leave the later
+            sources' reads stale, and pay one more round trip per source after
+            the last one lands. Re-reading a slot that has already landed is
+            harmless, since nobody writes it again this round. The re-reads go
+            through ``_poll_v4i32``, so the spin cannot be deleted.
+            """
+            keys = [
+                (src, atom) for src in push_peers for atom in range_constexpr(atoms)
+            ]
+            addrs = [
+                peer_vec[rank] + _i32_to_bytes(_recv_i32(parity, src, atom))
+                for src, atom in keys
+            ]
+
+            def _pack(vecs):
+                return fx.Vector.from_elements(
+                    [v[e] for v in vecs for e in range_constexpr(ATOM_I32)], fx.Int32
+                )
+
+            got = _pack([_load_recv(parity, src, atom) for src, atom in keys])
+            while _has_sentinel(got):
+                got = _pack([_poll_v4i32(addr) for addr in addrs])
+            return {
+                key: fx.Vector.from_elements(
+                    [got[i * ATOM_I32 + e] for e in range_constexpr(ATOM_I32)],
+                    fx.Int32,
+                )
+                for i, key in enumerate(keys)
+            }
+
+        def _rearm(parity):
+            """Put the sentinel back in every slot this thread reads, in *parity*."""
+            sentinel = fx.Vector.filled((ATOM_I32,), -1, fx.Int32)
+            for src in push_peers:
+                for atom in range_constexpr(atoms):
+                    _store_v4i32_peer(
+                        peer_vec[rank] + _i32_to_bytes(_recv_i32(parity, src, atom)),
+                        sentinel,
+                        payload_policy,
+                    )
+
+        def _reduce(parity, my_atoms, polled=None):
             """Sum this thread's atom across all N contributions, in rank order.
 
             Rank order, not a rotated order: every rank must accumulate in the
             same sequence or the results differ in the last bit across ranks.
             ``cross_device_reduce`` makes the same promise for the same reason.
             Under ``skip_self`` our own contribution comes out of the registers
-            rather than out of the inbox.
+            rather than out of the inbox. *polled* is ``_poll``'s result in
+            Lamport mode, where the inbox has already been read.
             """
             outs = []
             for atom in range_constexpr(atoms):
                 acc = None
                 for src in range_constexpr(world_size):
                     if const_expr(src == self_rank):
-                        v = _atom_bf16_to_f32(my_atoms[atom])
+                        raw = my_atoms[atom]
+                    elif const_expr(polled is not None):
+                        raw = polled[(src, atom)]
                     else:
-                        elem = (
-                            _slot_i32(parity, fx.Int32(src))
-                            + fx.Int32(atom * block * ATOM_I32)
-                            + tid * fx.Int32(ATOM_I32)
-                        )
-                        v = _atom_bf16_to_f32(
-                            _buffer_load(inbox, elem, ATOM_I32, fx.Int32, _RECV_POLICY)
-                        )
+                        raw = _load_recv(parity, src, atom)
+                    v = _atom_bf16_to_f32(raw)
                     acc = v if acc is None else acc + v
                 outs.append(_atom_f32_to_bf16(acc))
             return outs
+
+        def _lamport_round(tile, color, raw_atoms):
+            """One tile in Lamport mode, from its input atoms; returns the next
+            colour. The colour is the buffer index itself, kept in [0, 3), so
+            it never wraps out of step with the rotation."""
+            my_atoms = [_canonicalize(v) for v in raw_atoms]
+            _fanout(color, my_atoms)
+            _store_tile(tile, _reduce(color, my_atoms, _poll(color)))
+            rearm = color + fx.Int32(2)
+            if rearm >= fx.Int32(LAMPORT_BUFFERS):
+                rearm = rearm - fx.Int32(LAMPORT_BUFFERS)
+            _rearm(rearm)
+            color = color + fx.Int32(1)
+            if color == fx.Int32(LAMPORT_BUFFERS):
+                color = fx.Int32(0)
+            return color
 
         # Stride by the *launched* grid, not the compile-time cap: the host may
         # launch fewer blocks than ``grid``, and striding by the cap would leave
         # every tile above n_blocks unprocessed.
         n_block_tiles = (num_tiles - bid + n_blocks - fx.Int32(1)) // n_blocks
-        color = _load_color()
-        for i in range(fx.Int32(0), n_block_tiles, fx.Int32(1)):
-            tile = bid + i * n_blocks
-            parity = color & fx.Int32(1)
-            my_atoms = _load_tile(tile)
-            _fanout(parity, my_atoms)
-            _publish(parity, color)
-            _wait(parity, color)
-            _store_tile(tile, _reduce(parity, my_atoms))
-            color = color + fx.Int32(1)
-            # 0 is the unset sentinel. The
-            # inbox slot is `color & 1`, and the colour before the wrap is -1,
-            # which is odd: resuming at 1 would put two consecutive tiles in
-            # the same slot, and a rank one tile ahead would overwrite data a
-            # peer is still reading.
-            if color == fx.Int32(0):
-                color = fx.Int32(2)
+        if const_expr(lamport):
+            # The host never launches more blocks than tiles, so every block has
+            # a first tile, and its input is read before the colour: the two
+            # loads are then in flight together rather than one after the other.
+            first_atoms = _load_tile(bid)
+            color = _load_color()
+            color = _lamport_round(bid, color, first_atoms)
+            for i in range(fx.Int32(1), n_block_tiles, fx.Int32(1)):
+                # The last round's re-arm must land before this round's push: a
+                # peer that sees the push can be one round further on, writing
+                # into the slot just re-armed. Between calls the kernel boundary
+                # does this.
+                rocdl.s_waitcnt(vmcnt=0)
+                tile = bid + i * n_blocks
+                color = _lamport_round(tile, color, _load_tile(tile))
+        else:
+            color = _load_color()
+            for i in range(fx.Int32(0), n_block_tiles, fx.Int32(1)):
+                tile = bid + i * n_blocks
+                parity = color & fx.Int32(1)
+                my_atoms = _load_tile(tile)
+                _fanout(parity, my_atoms)
+                _publish(parity, color)
+                _wait(parity, color)
+                _store_tile(tile, _reduce(parity, my_atoms))
+                color = color + fx.Int32(1)
+                # 0 is the unset sentinel. The
+                # inbox slot is `color & 1`, and the colour before the wrap is -1,
+                # which is odd: resuming at 1 would put two consecutive tiles in
+                # the same slot, and a rank one tile ahead would overwrite data a
+                # peer is still reading.
+                if color == fx.Int32(0):
+                    color = fx.Int32(2)
         if tid == 0:
             _store_color(color)
         gpu.barrier()
@@ -460,6 +608,8 @@ def make_one_shot_allreduce_kernel(
     tag = f"ws{world_size}_a{atoms}_g{grid}_{inbox_memory}_b{block}"
     if atoms > 1:
         tag += f"_{fanout}"
+    if lamport:
+        tag += "_lp"
     if skip_self:
         # ``_r<n>_`` is the rank field the bench's variant comparison already
         # knows to collapse before checking that the ranks agree; a build
@@ -489,6 +639,9 @@ def make_one_shot_allreduce_kernel(
         "inbox_memory": inbox_memory,
         "fanout": fanout,
         "skip_self": skip_self,
+        "lamport": lamport,
+        # Byte every inbox byte starts as.
+        "inbox_fill": LAMPORT_FILL_BYTE if lamport else 0,
         "grid": grid,
         "block": block,
     }

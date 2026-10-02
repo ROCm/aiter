@@ -197,6 +197,7 @@ Examples::
 """
 
 import argparse
+import itertools
 import logging
 import math
 import os
@@ -380,7 +381,10 @@ class _FlyAutoOracle:
         for family in self.reachable:
             if family == "oneshot":
                 self._engines[family] = OneShotAllReduce(
-                    **common, max_bytes=self.policy.oneshot_max, link=link
+                    **common,
+                    max_bytes=self.policy.oneshot_max,
+                    link=link,
+                    lamport=one.lamport,
                 )
             else:
                 # min_bytes=0: the composed window above already decided this
@@ -536,6 +540,9 @@ class Candidate:
     # is the knob that sets how many blocks a payload gets. None leaves it to
     # the rung.
     block: int | None = None
+    # The flagless (Lamport) one-shot, family == "fly1s". None leaves it to the
+    # rung; False and True both pin it.
+    lamport: bool | None = None
 
     @property
     def fly_cfg(self) -> tuple:
@@ -577,7 +584,14 @@ class Candidate:
     @property
     def fly1s_cfg(self) -> tuple:
         """Identity of the OneShotAllReduce engine this candidate needs."""
-        return (self.atoms, self.grid_cap, self.fanout, self.skip_self, self.block)
+        return (
+            self.atoms,
+            self.grid_cap,
+            self.fanout,
+            self.skip_self,
+            self.block,
+            self.lamport,
+        )
 
     def fly1s_rung(self, min_bytes: int) -> tuple:
         """This candidate as an ``ONESHOT_LADDER`` rung, for the fit's paste."""
@@ -585,7 +599,7 @@ class Candidate:
             raise ValueError(f"{self.key} is not a one-shot candidate")
         unpinned = [
             n
-            for n in ("atoms", "grid_cap", "fanout", "block", "skip_self")
+            for n in ("atoms", "grid_cap", "fanout", "block", "skip_self", "lamport")
             if getattr(self, n) is None
         ]
         if unpinned:
@@ -601,6 +615,7 @@ class Candidate:
             self.fanout,
             self.block,
             self.skip_self,
+            self.lamport,
         )
 
 
@@ -676,15 +691,17 @@ def _fly_grid_rows():
 
 
 def _fly1s_grid_rows():
-    """``_FLY1S_GRID`` x self-skip as Candidates."""
+    """``_FLY1S_GRID`` x self-skip x Lamport as Candidates."""
     rows = []
-    for skip_self in (False, True):
+    for lamport, skip_self in itertools.product((False, True), (False, True)):
         for block, atoms, cap, fanout in _FLY1S_GRID:
             key = f"fly_1stage_b{block}_a{atoms}_g{cap}"
             if atoms > 1 and fanout == "atom":
                 key += "_fa"
             if skip_self:
                 key += "_ss"
+            if lamport:
+                key += "_lp"
             rows.append(
                 Candidate(
                     key,
@@ -696,6 +713,7 @@ def _fly1s_grid_rows():
                     fanout=fanout,
                     block=block,
                     skip_self=skip_self,
+                    lamport=lamport,
                 )
             )
     return tuple(rows)
@@ -737,6 +755,9 @@ CANDIDATES = (
     # by payload size at launch. This is what production gets; the pinned rows
     # below are what it is fitted against.
     Candidate("fly_1stage", "fly1s", 40.0, True),  # 55 / n/a
+    # The same ladder with every rung switched to the flagless (Lamport)
+    # variant, for a side-by-side with the row above.
+    Candidate("fly_1stage_lp", "fly1s", 40.0, True, lamport=True),
     # Pinned rows: the knob grid the ladder is fitted over. See _FLY1S_GRID.
     *_fly1s_grid_rows(),
     # Same kernel family, ring schedule. Its floor is lower than fly_int4's
@@ -1741,7 +1762,9 @@ def _worker(
         and dtype == dtypes.bf16
     ):
         for cfg in wanted_1s:
-            kw = _fly_kwargs(cfg, ("atoms", "grid_cap", "fanout", "skip_self", "block"))
+            kw = _fly_kwargs(
+                cfg, ("atoms", "grid_cap", "fanout", "skip_self", "block", "lamport")
+            )
             fly1s[cfg] = OneShotAllReduce(
                 group=tp_group.cpu_group,
                 device=device,
