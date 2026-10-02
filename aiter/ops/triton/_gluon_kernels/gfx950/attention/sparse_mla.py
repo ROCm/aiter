@@ -2028,7 +2028,7 @@ def _epilogue_store(
 
 
 @gluon.jit
-def _xcd_work(GRID_ORDER: gl.constexpr, NUM_XCDS: gl.constexpr):
+def _xcd_work(GRID_ORDER: gl.constexpr, NUM_XCDS: gl.constexpr, SPLIT_K: gl.constexpr):
     """(query, split, head block) of this program, remapped with remap_xcd so
     the programs that read the same KV rows share an XCD and its L2."""
     n0 = gl.num_programs(0)
@@ -2038,7 +2038,22 @@ def _xcd_work(GRID_ORDER: gl.constexpr, NUM_XCDS: gl.constexpr):
     w = remap_xcd(lid, n0 * n1 * n2, NUM_XCDS)
     nh = gl.num_programs(GRID_ORDER.index("h"))
     ns = gl.num_programs(GRID_ORDER.index("s"))
-    return w // (nh * ns), (w // nh) % ns, w % nh
+    if SPLIT_K:
+        # Rows go in blocks of ceil(nq / NUM_XCDS), about one block per XCD.
+        # Inside a block the order is split-major, head block fastest: running
+        # one row's splits back to back was up to 14 % slower.
+        nq = gl.num_programs(GRID_ORDER.index("q"))
+        t = (nq + NUM_XCDS - 1) // NUM_XCDS
+        per = t * ns * nh
+        blk = w // per
+        i = w % per
+        rows = gl.minimum(t, nq - blk * t)
+        r = i % (rows * nh)
+        q, s, h = blk * t + r // nh, i // (rows * nh), r % nh
+    else:
+        # One split per row: row-major is the same order.
+        q, s, h = w // (nh * ns), (w // nh) % ns, w % nh
+    return q, s, h
 
 
 _sparse_mla_repr = make_kernel_repr(
@@ -2254,7 +2269,7 @@ def _sparse_mla(
     # GRID_ORDER names the launch axes in grid-dim order; dim 0 varies fastest,
     # which decides XCD/L2 sharing.
     if XCD_REMAP > 0:
-        query_idx, split_id, pid_h = _xcd_work(GRID_ORDER, XCD_REMAP)
+        query_idx, split_id, pid_h = _xcd_work(GRID_ORDER, XCD_REMAP, SPLIT_K)
     else:
         query_idx = gl.program_id(GRID_ORDER.index("q"))
         split_id = gl.program_id(GRID_ORDER.index("s"))
