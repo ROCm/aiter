@@ -33,6 +33,9 @@ from aiter.ops.triton.utils.tuned_config_utils import (
 _FWD_FALLBACK = triton.Config({"PRE_LOAD_V": False})
 _BWD_FALLBACK = triton.Config({})
 
+from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.common import (
+    compute_alibi_block,
+)
 from aiter.ops.triton._triton_kernels.quant.quant_mxfp8 import (
     _calculate_scales,
     _pack_fp8,
@@ -126,29 +129,6 @@ def cdiv_fn(x, y):
     return (x + y - 1) // y
 
 
-@triton.jit
-def dropout_offsets(philox_seed, philox_offset, dropout_p, m, n, stride):
-    ms = tl.arange(0, m)
-    ns = tl.arange(0, n)
-    return philox_offset + ms[:, None] * stride + ns[None, :]
-
-
-@triton.jit
-def dropout_rng(philox_seed, philox_offset, dropout_p, m, n, stride):
-    rng_offsets = dropout_offsets(
-        philox_seed, philox_offset, dropout_p, m, n, stride
-    ).to(tl.uint32)
-    # TODO: use tl.randint for better performance
-    return tl.rand(philox_seed, rng_offsets)
-
-
-@triton.jit
-def dropout_mask(philox_seed, philox_offset, dropout_p, m, n, stride):
-    rng_output = dropout_rng(philox_seed, philox_offset, dropout_p, m, n, stride)
-    rng_keep = rng_output > dropout_p
-    return rng_keep
-
-
 # Convenience function to load with optional boundary checks.
 # "First" is the major dim, "second" is the minor dim.
 @triton.jit
@@ -170,41 +150,6 @@ def load_fn(ptrs, offset_first, offset_second, boundary_first, boundary_second):
 
 
 @triton.jit
-def compute_alibi_block(
-    alibi_slope, seqlen_q, seqlen_k, offs_m, offs_n, transpose=False
-):
-    # when seqlen_k and seqlen_q are different we want the diagonal to stick to the bottom right of the attention matrix
-    # for casual mask we want something like this where (1 is kept and 0 is masked)
-    # seqlen_q = 2 and seqlen_k = 5
-    #   1 1 1 1 0
-    #   1 1 1 1 1
-    # seqlen_q = 5 and seqlen_k = 2
-    #        0 0
-    #        0 0
-    #        0 0
-    #        1 0
-    #        1 1
-    # for alibi the diagonal is 0 indicating no penalty for attending to that spot and increasing penalty for attending further from the diagonal
-    # e.g. alibi_slope = 1, seqlen_q = 2, seqlen_k = 5, offs_m = [0, 1, 2, 3], offs_n = [0, 1, 2, 3, 4], transpose = False
-    # 1. offs_m[:,None] = [[0],
-    #                       [1],
-    # 2. offs_m[:,None] + seqlen_k = [[5],
-    #                                  [6],
-    # 3. offs_m[:,None] + seqlen_k - seqlen_q = [[3],
-    #                                             [4],
-    # 4. offs_m[:,None] + seqlen_k - seqlen_q - offs_n[None,:] = [[3], - [[0, 1, 2, 3, 4]] =  [[ 3, 2, 1, 0,-1],
-    #                                                            [4],                           [ 4, 3, 2, 1, 0]]
-    # 5. -1 * alibi_slope * tl.abs(relative_pos_block) = [[ -3, -2, -1, 0,-1],
-    #                                                     [ -4, -3, -2, -1, 0]],
-    relative_pos_block = offs_m[:, None] + seqlen_k - seqlen_q - offs_n[None, :]
-    alibi_block = -1 * alibi_slope * tl.abs(relative_pos_block)
-    if transpose:
-        return alibi_block.T
-    else:
-        return alibi_block
-
-
-@triton.jit
 def _attn_fwd_inner(
     acc,
     l_i,
@@ -214,7 +159,6 @@ def _attn_fwd_inner(
     k_scale_ptr,
     v_scale_ptr,
     p_scale: tl.constexpr,
-    use_mxfp8: tl.constexpr,
     k_ptrs,
     v_ptrs,
     bias_ptrs,
@@ -286,15 +230,11 @@ def _attn_fwd_inner(
     else:
         pass
 
-    if use_mxfp8:
-        p_scale_t = tl.cast(p_scale, tl.uint8)
-        p_scale_b = tl.zeros([BLOCK_M, SCALE_NUM_PER_N], dtype=tl.uint8) + p_scale_t
+    p_scale_t = tl.cast(p_scale, tl.uint8)
+    p_scale_b = tl.zeros([BLOCK_M, SCALE_NUM_PER_N], dtype=tl.uint8) + p_scale_t
 
-        p_scale_f = tl.cast(p_scale, tl.uint32)
-        p_scale_f = (p_scale_f << 23).to(tl.float32, bitcast=True)
-    else:
-        p_scale_b = p_scale
-
+    p_scale_f = tl.cast(p_scale, tl.uint32)
+    p_scale_f = (p_scale_f << 23).to(tl.float32, bitcast=True)
     # loop over k, v, and update accumulator
     for start_n in range(block_min, block_max, BLOCK_N):
         if MASK_STEPS:
@@ -305,14 +245,8 @@ def _attn_fwd_inner(
 
         # For padded blocks, we will overrun the tensor size if
         # we load all BLOCK_N. For others, the blocks are all within range.
-        if use_mxfp8:
-            blk_v_scale = tl.load(v_scale_ptr)
-            blk_k_scale = tl.load(k_scale_ptr)
-
-        else:
-            blk_k_scale = 1.0
-            blk_v_scale = 1.0
-
+        blk_v_scale = tl.load(v_scale_ptr)
+        blk_k_scale = tl.load(k_scale_ptr)
         k_offs_k = None if not PADDED_HEAD_QK else tl.arange(0, BLOCK_DMODEL_QK)
         k = load_fn(k_ptrs, k_offs_k, k_offs_n, ACTUAL_BLOCK_DMODEL_QK, actual_seqlen_k)
 
@@ -323,45 +257,38 @@ def _attn_fwd_inner(
             )
 
         # -- compute qk ----
-        if use_mxfp8:
-            if SCALE_NUM_PER_D_QK % 2 == 0:
-                qk = tl.dot_scaled(
-                    q,
-                    q_scale,
-                    FLOAT_DTYPE,
-                    k,
-                    blk_k_scale,
-                    FLOAT_DTYPE,
-                    out_dtype=tl.float32,
-                )
-            else:
-                q_descaled = _unpack_fp8(
-                    q,
-                    q_scale,
-                    tl.float32,
-                    BLOCK_M,
-                    BLOCK_DMODEL_QK,
-                    QUANT_BLOCK_SIZE,
-                    True,
-                    USE_ASM,
-                )
-                k_descaled = _unpack_fp8(
-                    k,
-                    blk_k_scale,
-                    tl.float32,
-                    BLOCK_DMODEL_QK,
-                    BLOCK_N,
-                    QUANT_BLOCK_SIZE,
-                    True,
-                    USE_ASM,
-                )
-                qk = tl.dot(
-                    q_descaled, k_descaled, out_dtype=tl.float32, allow_tf32=False
-                )
-
+        if SCALE_NUM_PER_D_QK % 2 == 0:
+            qk = tl.dot_scaled(
+                q,
+                q_scale,
+                FLOAT_DTYPE,
+                k,
+                blk_k_scale,
+                FLOAT_DTYPE,
+                out_dtype=tl.float32,
+            )
         else:
-            qk = tl.dot(q, k, out_dtype=tl.float32, allow_tf32=False)
-
+            q_descaled = _unpack_fp8(
+                q,
+                q_scale,
+                tl.float32,
+                BLOCK_M,
+                BLOCK_DMODEL_QK,
+                QUANT_BLOCK_SIZE,
+                True,
+                USE_ASM,
+            )
+            k_descaled = _unpack_fp8(
+                k,
+                blk_k_scale,
+                tl.float32,
+                BLOCK_DMODEL_QK,
+                BLOCK_N,
+                QUANT_BLOCK_SIZE,
+                True,
+                USE_ASM,
+            )
+            qk = tl.dot(q_descaled, k_descaled, out_dtype=tl.float32, allow_tf32=False)
         # We start from end of seqlen_k so only the first iteration would need
         # to be checked for padding if it is not a multiple of block_n
         # TODO: This can be optimized to only be true for the padded block.
@@ -422,27 +349,9 @@ def _attn_fwd_inner(
         else:
             p = tl.math.exp(q_shifted)
 
-        # CAVEAT: Must update l_ij before applying dropout
         l_ij = tl.sum(p, 1)
 
-        if ENABLE_DROPOUT:
-            philox_offset = (
-                batch_philox_offset
-                + start_m * BLOCK_M * actual_seqlen_k
-                + start_n
-                - BLOCK_N
-            )
-            keep = dropout_mask(
-                philox_seed, philox_offset, dropout_p, BLOCK_M, BLOCK_N, actual_seqlen_k
-            )
-            if RETURN_SCORES:
-                # NOTE: the returned score is not the same as the reference because we need to adjust as we find new maxes per block. We are not doing that
-                exp_score_mask = (OFFS_M[:, None] < actual_seqlen_q) & (
-                    (start_n + tl.arange(0, BLOCK_N))[None, :] < actual_seqlen_k
-                )
-                tl.store(exp_scores_ptrs, tl.where(keep, p, -p), mask=exp_score_mask)
-            p = tl.where(keep, p, 0.0)
-        elif RETURN_SCORES:
+        if RETURN_SCORES:
             # NOTE: the returned score is not the same as the reference because we need to adjust as we find new maxes per block. We are not doing that
             exp_score_mask = (OFFS_M[:, None] < actual_seqlen_q) & (
                 (start_n + tl.arange(0, BLOCK_N))[None, :] < actual_seqlen_k
@@ -454,36 +363,31 @@ def _attn_fwd_inner(
                 v_ptrs, k_offs_n, v_offs_k, actual_seqlen_k, ACTUAL_BLOCK_DMODEL_V
             )
 
-        if use_mxfp8:
-            if SCALE_NUM_PER_N % 2 == 0:
-                pv = tl.dot_scaled(
-                    (p).to(q.dtype),
-                    p_scale_b.to(tl.uint8),
-                    FLOAT_DTYPE,
-                    v.to(q.dtype),
-                    blk_v_scale.to(tl.uint8),
-                    FLOAT_DTYPE,
-                    out_dtype=tl.float32,
-                )
-
-            else:
-                v_descaled = _unpack_fp8(
-                    v,
-                    blk_v_scale,
-                    tl.float32,
-                    BLOCK_N,
-                    BLOCK_DMODEL_V,
-                    QUANT_BLOCK_SIZE,
-                    True,
-                    USE_ASM,
-                )
-                pv = tl.dot(
-                    p * p_scale_f, v_descaled, allow_tf32=False, out_dtype=tl.float32
-                )
+        if SCALE_NUM_PER_N % 2 == 0:
+            pv = tl.dot_scaled(
+                (p).to(q.dtype),
+                p_scale_b.to(tl.uint8),
+                FLOAT_DTYPE,
+                v.to(q.dtype),
+                blk_v_scale.to(tl.uint8),
+                FLOAT_DTYPE,
+                out_dtype=tl.float32,
+            )
 
         else:
-            pv = tl.dot(p.to(v.dtype), v, allow_tf32=False, out_dtype=tl.float32)
-
+            v_descaled = _unpack_fp8(
+                v,
+                blk_v_scale,
+                tl.float32,
+                BLOCK_N,
+                BLOCK_DMODEL_V,
+                QUANT_BLOCK_SIZE,
+                True,
+                USE_ASM,
+            )
+            pv = tl.dot(
+                p * p_scale_f, v_descaled, allow_tf32=False, out_dtype=tl.float32
+            )
         # -- update output accumulator --
         # alpha is an adjustment factor for acc and li as we loop and find new maxes
         # store the diff in maxes to adjust acc and li as we discover new maxes
@@ -503,9 +407,8 @@ def _attn_fwd_inner(
 
         k_ptrs += BLOCK_N * stride_kn
         v_ptrs += BLOCK_N * stride_vk
-        if use_mxfp8:
-            k_scale_ptr += scales_num_block_n * stride_kdescale_m
-            v_scale_ptr += scales_num_block_n * stride_vdescale_m
+        k_scale_ptr += scales_num_block_n * stride_kdescale_m
+        v_scale_ptr += scales_num_block_n * stride_vdescale_m
         if bias_ptrs is not None:
             bias_ptrs += BLOCK_N * stride_bn
         if RETURN_SCORES:
@@ -528,7 +431,6 @@ def get_autotune_fwd_configs():
         "VARLEN",
         "HQ",
         "HK",
-        "use_mxfp8",
     ]
 
 
@@ -564,7 +466,6 @@ def attn_fwd_mxfp8(
     q_scale_ptr,
     k_scale_ptr,
     v_scale_ptr,
-    use_mxfp8: tl.constexpr,
     SM_SCALE: tl.constexpr,
     LSE,
     Out,
@@ -680,22 +581,15 @@ def attn_fwd_mxfp8(
         seqlen_k = MAX_SEQLENS_K
 
     # we assume q and k has the same length
-    if use_mxfp8:
-        scales_num_block_m: tl.constexpr = BLOCK_M // QUANT_BLOCK_SIZE
-        scales_num_block_n: tl.constexpr = BLOCK_N // QUANT_BLOCK_SIZE
-        scales_num_block_d_qk: tl.constexpr = BLOCK_DMODEL_QK // QUANT_BLOCK_SIZE
-        scales_num_block_d_v: tl.constexpr = BLOCK_DMODEL_V // QUANT_BLOCK_SIZE
+    scales_num_block_m: tl.constexpr = BLOCK_M // QUANT_BLOCK_SIZE
+    scales_num_block_n: tl.constexpr = BLOCK_N // QUANT_BLOCK_SIZE
+    scales_num_block_d_qk: tl.constexpr = BLOCK_DMODEL_QK // QUANT_BLOCK_SIZE
+    scales_num_block_d_v: tl.constexpr = BLOCK_DMODEL_V // QUANT_BLOCK_SIZE
 
-        scale_offs_m = tl.arange(0, scales_num_block_m)
-        scale_offs_n = tl.arange(0, scales_num_block_n)
-        scale_offs_d_qk = tl.arange(0, scales_num_block_d_qk)
-        scale_offs_d_v = tl.arange(0, scales_num_block_d_v)
-    else:
-        scales_num_block_m = 1
-        scales_num_block_n = 1
-        scales_num_block_d_qk = 1
-        scales_num_block_d_v = 1
-
+    scale_offs_m = tl.arange(0, scales_num_block_m)
+    scale_offs_n = tl.arange(0, scales_num_block_n)
+    scale_offs_d_qk = tl.arange(0, scales_num_block_d_qk)
+    scale_offs_d_v = tl.arange(0, scales_num_block_d_v)
     # scale number per block in this warp tile for mxfp
     SCALE_NUM_PER_QUANT_BLK: tl.constexpr = QUANT_BLOCK_SIZE // QUANT_SIZE
     # scale number per D QK in this warp tile for mxfp
@@ -707,83 +601,73 @@ def attn_fwd_mxfp8(
     # scale number per N in this warp tile for mxfp
     SCALE_NUM_PER_M: tl.constexpr = scales_num_block_m * SCALE_NUM_PER_QUANT_BLK
 
-    if use_mxfp8:
-        scale_offs_m_b = tl.arange(0, BLOCK_M)
-        scale_offs_n_b = tl.arange(0, BLOCK_N)
-        tl.arange(0, BLOCK_DMODEL_QK)
-        scale_offs_d_v_b = tl.arange(0, BLOCK_DMODEL_V)
+    scale_offs_m_b = tl.arange(0, BLOCK_M)
+    scale_offs_n_b = tl.arange(0, BLOCK_N)
+    tl.arange(0, BLOCK_DMODEL_QK)
+    scale_offs_d_v_b = tl.arange(0, BLOCK_DMODEL_V)
 
-        tl.arange(0, SCALE_NUM_PER_M)
-        scale_offs_n_q = tl.arange(0, SCALE_NUM_PER_N)
-        scale_offs_d_qk_q = tl.arange(0, SCALE_NUM_PER_D_QK)
-        tl.arange(0, SCALE_NUM_PER_D_V)
+    tl.arange(0, SCALE_NUM_PER_M)
+    scale_offs_n_q = tl.arange(0, SCALE_NUM_PER_N)
+    scale_offs_d_qk_q = tl.arange(0, SCALE_NUM_PER_D_QK)
+    tl.arange(0, SCALE_NUM_PER_D_V)
 
-        if SCALE_NUM_PER_D_QK % 2 == 0:
-            k_scale_ptr_base = (
-                k_scale_ptr
-                + stride_kdescale_z * off_z
-                + stride_kdescale_h * off_h_k
-                + cu_seqlens_k_start // QUANT_BLOCK_SIZE * stride_kdescale_m
-                + scale_offs_n_b[:, None] // QUANT_BLOCK_SIZE * stride_kdescale_m
-                + scale_offs_d_qk_q[None, :]
-                // SCALE_NUM_PER_QUANT_BLK
-                * stride_kdescale_d
-            )
-            q_scale_offset = (
-                q_scale_ptr
-                + stride_qdescale_z * off_z
-                + stride_qdescale_h * off_h_q
-                + cu_seqlens_q_start // QUANT_BLOCK_SIZE * stride_qdescale_m
-                + start_m * scales_num_block_m * stride_qdescale_m
-                + scale_offs_m_b[:, None] // QUANT_BLOCK_SIZE * stride_qdescale_m
-                + scale_offs_d_qk_q[None, :]
-                // SCALE_NUM_PER_QUANT_BLK
-                * stride_qdescale_d
-            )
+    if SCALE_NUM_PER_D_QK % 2 == 0:
+        k_scale_ptr_base = (
+            k_scale_ptr
+            + stride_kdescale_z * off_z
+            + stride_kdescale_h * off_h_k
+            + cu_seqlens_k_start // QUANT_BLOCK_SIZE * stride_kdescale_m
+            + scale_offs_n_b[:, None] // QUANT_BLOCK_SIZE * stride_kdescale_m
+            + scale_offs_d_qk_q[None, :] // SCALE_NUM_PER_QUANT_BLK * stride_kdescale_d
+        )
+        q_scale_offset = (
+            q_scale_ptr
+            + stride_qdescale_z * off_z
+            + stride_qdescale_h * off_h_q
+            + cu_seqlens_q_start // QUANT_BLOCK_SIZE * stride_qdescale_m
+            + start_m * scales_num_block_m * stride_qdescale_m
+            + scale_offs_m_b[:, None] // QUANT_BLOCK_SIZE * stride_qdescale_m
+            + scale_offs_d_qk_q[None, :] // SCALE_NUM_PER_QUANT_BLK * stride_qdescale_d
+        )
 
-        else:
-            k_scale_ptr_base = (
-                k_scale_ptr
-                + stride_kdescale_z * off_z
-                + stride_kdescale_h * off_h_k
-                + cu_seqlens_k_start // QUANT_BLOCK_SIZE * stride_kdescale_m
-                + scale_offs_d_qk[:, None] * stride_kdescale_d
-                + scale_offs_n[None, :] * stride_kdescale_m
-            )
-            q_scale_offset = (
-                q_scale_ptr
-                + stride_qdescale_z * off_z
-                + stride_qdescale_h * off_h_q
-                + cu_seqlens_q_start // QUANT_BLOCK_SIZE * stride_qdescale_m
-                + start_m * scales_num_block_m * stride_qdescale_m
-                + scale_offs_m[:, None] * stride_qdescale_m
-                + scale_offs_d_qk[None, :] * stride_qdescale_d
-            )
-
-        if SCALE_NUM_PER_N % 2 == 0:
-            v_scale_ptr_base = (
-                v_scale_ptr
-                + stride_vdescale_z * off_z
-                + stride_vdescale_h * off_h_k
-                + cu_seqlens_k_start // QUANT_BLOCK_SIZE * stride_vdescale_m
-                + scale_offs_d_v_b[:, None] // QUANT_BLOCK_SIZE * stride_vdescale_d
-                + scale_offs_n_q[None, :] // SCALE_NUM_PER_QUANT_BLK * stride_vdescale_m
-            )
-        else:
-            v_scale_ptr_base = (
-                v_scale_ptr
-                + stride_vdescale_z * off_z
-                + stride_vdescale_h * off_h_k
-                + cu_seqlens_k_start // QUANT_BLOCK_SIZE * stride_vdescale_m
-                + scale_offs_n[:, None] * stride_vdescale_m
-                + scale_offs_d_v[None, :] * stride_vdescale_d
-            )
-        q_scale = tl.load(q_scale_offset)
     else:
-        q_scale = 1.0
-        k_scale_ptr_base = None
-        v_scale_ptr_base = None
+        k_scale_ptr_base = (
+            k_scale_ptr
+            + stride_kdescale_z * off_z
+            + stride_kdescale_h * off_h_k
+            + cu_seqlens_k_start // QUANT_BLOCK_SIZE * stride_kdescale_m
+            + scale_offs_d_qk[:, None] * stride_kdescale_d
+            + scale_offs_n[None, :] * stride_kdescale_m
+        )
+        q_scale_offset = (
+            q_scale_ptr
+            + stride_qdescale_z * off_z
+            + stride_qdescale_h * off_h_q
+            + cu_seqlens_q_start // QUANT_BLOCK_SIZE * stride_qdescale_m
+            + start_m * scales_num_block_m * stride_qdescale_m
+            + scale_offs_m[:, None] * stride_qdescale_m
+            + scale_offs_d_qk[None, :] * stride_qdescale_d
+        )
 
+    if SCALE_NUM_PER_N % 2 == 0:
+        v_scale_ptr_base = (
+            v_scale_ptr
+            + stride_vdescale_z * off_z
+            + stride_vdescale_h * off_h_k
+            + cu_seqlens_k_start // QUANT_BLOCK_SIZE * stride_vdescale_m
+            + scale_offs_d_v_b[:, None] // QUANT_BLOCK_SIZE * stride_vdescale_d
+            + scale_offs_n_q[None, :] // SCALE_NUM_PER_QUANT_BLK * stride_vdescale_m
+        )
+    else:
+        v_scale_ptr_base = (
+            v_scale_ptr
+            + stride_vdescale_z * off_z
+            + stride_vdescale_h * off_h_k
+            + cu_seqlens_k_start // QUANT_BLOCK_SIZE * stride_vdescale_m
+            + scale_offs_n[:, None] * stride_vdescale_m
+            + scale_offs_d_v[None, :] * stride_vdescale_d
+        )
+    q_scale = tl.load(q_scale_offset)
     # Now we compute whether we need to exit early due to causal masking.
     # This is because for seqlen_q > seqlen_k, M rows of the attn scores
     # are completely masked, resulting in 0s written to the output, and
@@ -921,11 +805,7 @@ def attn_fwd_mxfp8(
         scores_scaled_shifted_ptrs = None
         exp_scores_ptrs = None
 
-    if ENABLE_DROPOUT:
-        off_hz = off_z * HQ + off_h_q
-        batch_philox_offset = philox_offset_base + off_hz * seqlen_q * seqlen_k
-    else:
-        batch_philox_offset = 0
+    batch_philox_offset = 0
     # initialize pointer to m and l
     m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
     l_i = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
@@ -967,7 +847,6 @@ def attn_fwd_mxfp8(
             k_scale_ptr_base,
             v_scale_ptr_base,
             p_scale,
-            use_mxfp8,
             k_ptrs,
             v_ptrs,
             bias_ptrs,
@@ -1035,9 +914,8 @@ def attn_fwd_mxfp8(
             offs_n_causal = 0
         k_ptrs += n_full_blocks * BLOCK_N * stride_kn
         v_ptrs += n_full_blocks * BLOCK_N * stride_vk
-        if use_mxfp8:
-            k_scale_ptr_base += n_full_blocks * scales_num_block_n * stride_kdescale_m
-            v_scale_ptr_base += n_full_blocks * scales_num_block_n * stride_vdescale_m
+        k_scale_ptr_base += n_full_blocks * scales_num_block_n * stride_kdescale_m
+        v_scale_ptr_base += n_full_blocks * scales_num_block_n * stride_vdescale_m
         if USE_BIAS:
             bias_ptrs += n_full_blocks * BLOCK_N * stride_bn
         if RETURN_SCORES:
@@ -1054,7 +932,6 @@ def attn_fwd_mxfp8(
             k_scale_ptr_base,
             v_scale_ptr_base,
             p_scale,
-            use_mxfp8,
             k_ptrs,
             v_ptrs,
             bias_ptrs,
@@ -1110,18 +987,14 @@ def attn_fwd_mxfp8(
             QUANT_SIZE=QUANT_SIZE,
         )
 
-    if use_mxfp8:
-        p_scale_t = tl.cast(p_scale, tl.uint32)
-        p_scale_t = (p_scale_t << 23).to(tl.float32, bitcast=True)
-        # FP8 -> FP32
-        acc = acc / p_scale_t
-
+    p_scale_t = tl.cast(p_scale, tl.uint32)
+    p_scale_t = (p_scale_t << 23).to(tl.float32, bitcast=True)
+    # FP8 -> FP32
+    acc = acc / p_scale_t
     # epilogue
     # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.
     l_recip = 1 / l_i[:, None]
     acc = acc * l_recip
-    if ENABLE_DROPOUT:
-        acc = acc / (1 - dropout_p)
     # If seqlen_q > seqlen_k but the delta is not a multiple of BLOCK_M,
     # then we have one block with a row of all NaNs which come from computing
     # softmax over a row of all -infs (-inf - inf = NaN). We check for that here
@@ -1215,7 +1088,6 @@ def _bwd_preprocess_use_o_mxfp8(
     do_fp8_ptr,
     do_scale_ptr,
     delta_ptr,
-    use_mxfp8: tl.constexpr,
     stride_oz,
     stride_oh,
     stride_om,
@@ -1308,46 +1180,45 @@ def _bwd_preprocess_use_o_mxfp8(
     delta_ptrs = delta_offset + off_d_m * stride_deltam
     tl.store(delta_ptrs, delta, mask=mask_m)
 
-    if use_mxfp8:
-        do_scale = _calculate_scales(
-            do, BLOCK_M, BLOCK_DMODEL_V, QUANT_BLOCK_SIZE, True, F8_BWD_DTYPE
-        )
+    do_scale = _calculate_scales(
+        do, BLOCK_M, BLOCK_DMODEL_V, QUANT_BLOCK_SIZE, True, F8_BWD_DTYPE
+    )
 
-        do_fp8 = _pack_fp8(
-            do,
-            do_scale,
-            None,
-            None,
-            BLOCK_M,
-            BLOCK_DMODEL_V,
-            QUANT_BLOCK_SIZE,
-            True,
-            False,
-            USE_ASM,
-            F8_BWD_DTYPE,
-        )
+    do_fp8 = _pack_fp8(
+        do,
+        do_scale,
+        None,
+        None,
+        BLOCK_M,
+        BLOCK_DMODEL_V,
+        QUANT_BLOCK_SIZE,
+        True,
+        False,
+        USE_ASM,
+        F8_BWD_DTYPE,
+    )
 
-        do_fp8_offset = (
-            do_fp8_ptr + off_z * stride_doz + off_h * stride_doh + q_start * stride_dom
-        )
-        do_fp8_ptrs = (
-            do_fp8_offset + off_m[:, None] * stride_dom + off_d_v[None, :] * stride_dok
-        )
+    do_fp8_offset = (
+        do_fp8_ptr + off_z * stride_doz + off_h * stride_doh + q_start * stride_dom
+    )
+    do_fp8_ptrs = (
+        do_fp8_offset + off_m[:, None] * stride_dom + off_d_v[None, :] * stride_dok
+    )
 
-        tl.store(do_fp8_ptrs, do_fp8, mask=mask_o)
+    tl.store(do_fp8_ptrs, do_fp8, mask=mask_o)
 
-        off_do_scale_m = tl.arange(0, BLOCK_M // QUANT_BLOCK_SIZE)
-        off_do_scale_d = tl.arange(0, BLOCK_DMODEL_V // QUANT_BLOCK_SIZE)
-        do_scale_offset = (
-            do_scale_ptr
-            + off_z * stride_doscalez
-            + off_h * stride_doscaleh
-            + pid_m * BLOCK_M // QUANT_BLOCK_SIZE * stride_doscalem
-            + off_do_scale_m[:, None] * stride_doscalem
-            + off_do_scale_d[None, :] * stride_doscaled
-        )
+    off_do_scale_m = tl.arange(0, BLOCK_M // QUANT_BLOCK_SIZE)
+    off_do_scale_d = tl.arange(0, BLOCK_DMODEL_V // QUANT_BLOCK_SIZE)
+    do_scale_offset = (
+        do_scale_ptr
+        + off_z * stride_doscalez
+        + off_h * stride_doscaleh
+        + pid_m * BLOCK_M // QUANT_BLOCK_SIZE * stride_doscalem
+        + off_do_scale_m[:, None] * stride_doscalem
+        + off_do_scale_d[None, :] * stride_doscaled
+    )
 
-        tl.store(do_scale_offset, do_scale)
+    tl.store(do_scale_offset, do_scale)
 
 
 def get_autotune_bwd_configs():
@@ -1358,7 +1229,6 @@ def get_autotune_bwd_configs():
         "BLOCK_DMODEL_QK",
         "BLOCK_DMODEL_V",
         "CAUSAL",
-        "use_mxfp8",
     ]
 
 
@@ -1428,7 +1298,6 @@ def _attn_bwd_dkdv(
     lo: tl.constexpr,
     num_block_m: tl.constexpr,
     causal_boundary: tl.constexpr,
-    use_mxfp8: tl.constexpr,
     USE_EXP2: tl.constexpr,
     N_CTX_Q: tl.constexpr,
     N_CTX_K: tl.constexpr,
@@ -1455,14 +1324,10 @@ def _attn_bwd_dkdv(
     else:
         TRANS_Q_SCALE_BLK: tl.constexpr = True
 
-    if use_mxfp8:
-        k_scale = k_scale.to(tl.uint8)
-        v_scale = v_scale.to(tl.uint8)
-        p_scale_b = tl.zeros([BLOCK_N, SCALE_NUM_PER_M], dtype=tl.uint8) + 127
-        p_scale_b = p_scale_b.to(tl.uint8)
-    else:
-        p_scale_b = 0.0
-
+    k_scale = k_scale.to(tl.uint8)
+    v_scale = v_scale.to(tl.uint8)
+    p_scale_b = tl.zeros([BLOCK_N, SCALE_NUM_PER_M], dtype=tl.uint8) + 127
+    p_scale_b = p_scale_b.to(tl.uint8)
     # loop over rows
     for start_m in range(lo, num_block_m * BLOCK_M, BLOCK_M):
         # can_skip_causal_block = start_m < causal_boundary
@@ -1477,70 +1342,54 @@ def _attn_bwd_dkdv(
         q_mask = mask_m[:, None] & mask_d_qk[None, :]
         do_mask = mask_m[:, None] & mask_d_v[None, :]
 
-        if use_mxfp8:
-            blk_q_scale_1d_ds = tl.load(q_scale_ptr_1d_ds_base)
-            if TRANS_Q_SCALE_BLK:
-                blk_q_scale_1d_ds_T = tl.load(q_scale_ptr_1d_ds_base_T)
-            else:
-                blk_q_scale_1d_ds_T = blk_q_scale_1d_ds
-            blk_q_scale_2d = tl.load(q_scale_ptr_2d_base)
-
-            blk_do_scale_1d_ds = tl.load(do_scale_ptr_1d_ds_base)
-            if TRANS_Q_SCALE_BLK:
-                blk_do_scale_1d_ds_T = tl.load(do_scale_ptr_1d_ds_base_T)
-            else:
-                blk_do_scale_1d_ds_T = blk_do_scale_1d_ds
-            blk_do_scale_2d = tl.load(do_scale_ptr_2d_base)
-
+        blk_q_scale_1d_ds = tl.load(q_scale_ptr_1d_ds_base)
+        if TRANS_Q_SCALE_BLK:
+            blk_q_scale_1d_ds_T = tl.load(q_scale_ptr_1d_ds_base_T)
         else:
-            blk_q_scale_1d_ds = 1.0
-            blk_q_scale_1d_ds_T = 1.0
-            blk_q_scale_2d = 1.0
-            blk_do_scale_1d_ds = 1.0
-            blk_do_scale_1d_ds_T = 1.0
-            blk_do_scale_2d = 1.0
+            blk_q_scale_1d_ds_T = blk_q_scale_1d_ds
+        blk_q_scale_2d = tl.load(q_scale_ptr_2d_base)
 
+        blk_do_scale_1d_ds = tl.load(do_scale_ptr_1d_ds_base)
+        if TRANS_Q_SCALE_BLK:
+            blk_do_scale_1d_ds_T = tl.load(do_scale_ptr_1d_ds_base_T)
+        else:
+            blk_do_scale_1d_ds_T = blk_do_scale_1d_ds
+        blk_do_scale_2d = tl.load(do_scale_ptr_2d_base)
         q = tl.load(q_ptrs, mask=q_mask, other=0.0)
 
-        if use_mxfp8:
-            if (SCALE_NUM_PER_D_QK) % 2 == 0:
-                qk = tl.dot_scaled(
-                    q,
-                    blk_q_scale_1d_ds,
-                    FLOAT_DTYPE,
-                    k,
-                    k_scale,
-                    FLOAT_DTYPE,
-                    out_dtype=tl.float32,
-                )
-            else:
-                # can fuse with sm_scale
-                q_descaled = _unpack_fp8(
-                    q,
-                    blk_q_scale_2d,
-                    tl.float32,
-                    BLOCK_M,
-                    BLOCK_DMODEL_QK,
-                    QUANT_BLOCK_SIZE,
-                    True,
-                    USE_ASM,
-                )
-                k_descaled = _unpack_fp8(
-                    k,
-                    k_scale,
-                    tl.float32,
-                    BLOCK_DMODEL_QK,
-                    BLOCK_N,
-                    QUANT_BLOCK_SIZE,
-                    True,
-                    USE_ASM,
-                )
-                qk = tl.dot(
-                    q_descaled, k_descaled, out_dtype=tl.float32, allow_tf32=False
-                )
+        if (SCALE_NUM_PER_D_QK) % 2 == 0:
+            qk = tl.dot_scaled(
+                q,
+                blk_q_scale_1d_ds,
+                FLOAT_DTYPE,
+                k,
+                k_scale,
+                FLOAT_DTYPE,
+                out_dtype=tl.float32,
+            )
         else:
-            qk = tl.dot(q, k, out_dtype=tl.float32, allow_tf32=False)
-
+            # can fuse with sm_scale
+            q_descaled = _unpack_fp8(
+                q,
+                blk_q_scale_2d,
+                tl.float32,
+                BLOCK_M,
+                BLOCK_DMODEL_QK,
+                QUANT_BLOCK_SIZE,
+                True,
+                USE_ASM,
+            )
+            k_descaled = _unpack_fp8(
+                k,
+                k_scale,
+                tl.float32,
+                BLOCK_DMODEL_QK,
+                BLOCK_N,
+                QUANT_BLOCK_SIZE,
+                True,
+                USE_ASM,
+            )
+            qk = tl.dot(q_descaled, k_descaled, out_dtype=tl.float32, allow_tf32=False)
         if CAUSAL:
             # if not can_skip_causal_block:
             col_offset = N_CTX_Q - N_CTX_K
@@ -1563,146 +1412,123 @@ def _attn_bwd_dkdv(
         do = tl.load(do_ptrs, mask=do_mask, other=0.0)
 
         # compute dp
-        if use_mxfp8:
-            if (SCALE_NUM_PER_D_V) % 2 == 0:
-                # tranfer non to zero
-                do = do.to(tl.float32).to(F8_BWD_DTYPE)
-                dp = tl.dot_scaled(
-                    do,
-                    blk_do_scale_1d_ds.to(tl.uint8),
-                    DO_DTYPE,
-                    v,
-                    v_scale.to(tl.uint8),
-                    FLOAT_DTYPE,
-                    out_dtype=tl.float32,
-                )
-            else:
-                do_descaled = _unpack_fp8(
-                    do,
-                    blk_do_scale_2d,
-                    tl.float32,
-                    BLOCK_M,
-                    BLOCK_DMODEL_V,
-                    QUANT_BLOCK_SIZE,
-                    True,
-                    DO_USE_ASM,
-                )
-                v_descaled = _unpack_fp8(
-                    v,
-                    v_scale,
-                    tl.float32,
-                    BLOCK_DMODEL_V,
-                    BLOCK_N,
-                    QUANT_BLOCK_SIZE,
-                    True,
-                    USE_ASM,
-                )
-                dp = tl.dot(
-                    do_descaled, v_descaled, allow_tf32=False, out_dtype=tl.float32
-                )
+        if (SCALE_NUM_PER_D_V) % 2 == 0:
+            # tranfer non to zero
+            do = do.to(tl.float32).to(F8_BWD_DTYPE)
+            dp = tl.dot_scaled(
+                do,
+                blk_do_scale_1d_ds.to(tl.uint8),
+                DO_DTYPE,
+                v,
+                v_scale.to(tl.uint8),
+                FLOAT_DTYPE,
+                out_dtype=tl.float32,
+            )
         else:
-            dp = tl.dot(do, v, out_dtype=tl.float32, allow_tf32=False)
-
+            do_descaled = _unpack_fp8(
+                do,
+                blk_do_scale_2d,
+                tl.float32,
+                BLOCK_M,
+                BLOCK_DMODEL_V,
+                QUANT_BLOCK_SIZE,
+                True,
+                DO_USE_ASM,
+            )
+            v_descaled = _unpack_fp8(
+                v,
+                v_scale,
+                tl.float32,
+                BLOCK_DMODEL_V,
+                BLOCK_N,
+                QUANT_BLOCK_SIZE,
+                True,
+                USE_ASM,
+            )
+            dp = tl.dot(do_descaled, v_descaled, allow_tf32=False, out_dtype=tl.float32)
         d_ptrs = d_offset + offs_m * stride_ldm
         Di = tl.load(d_ptrs, mask=mask_m, other=0.0)
         ds = p * (dp - Di[:, None])
 
-        if use_mxfp8:
-            if (SCALE_NUM_PER_M) % 2 == 0:
-                dv = tl.dot_scaled(
-                    tl.trans(p).to(q.dtype),
-                    p_scale_b,
-                    FLOAT_DTYPE,
-                    do,
-                    blk_do_scale_1d_ds_T,
-                    DO_DTYPE,
-                    dv,
-                    out_dtype=tl.float32,
-                )
-            else:
-                # SCALE_NUM_PER_M odd: always unpack. When SCALE_NUM_PER_D_V is
-                # also odd, dp already unpacked do_descaled, but Triton SSA does
-                # not carry that assignment into this branch.
-                do_descaled = _unpack_fp8(
-                    do,
-                    blk_do_scale_2d,
-                    tl.float32,
-                    BLOCK_M,
-                    BLOCK_DMODEL_V,
-                    QUANT_BLOCK_SIZE,
-                    True,
-                    DO_USE_ASM,
-                )
-                dv += tl.dot(
-                    tl.trans(p), do_descaled, out_dtype=tl.float32, allow_tf32=False
-                )
-
+        if (SCALE_NUM_PER_M) % 2 == 0:
+            dv = tl.dot_scaled(
+                tl.trans(p).to(q.dtype),
+                p_scale_b,
+                FLOAT_DTYPE,
+                do,
+                blk_do_scale_1d_ds_T,
+                DO_DTYPE,
+                dv,
+                out_dtype=tl.float32,
+            )
         else:
-            # compute dv
+            # SCALE_NUM_PER_M odd: always unpack. When SCALE_NUM_PER_D_V is
+            # also odd, dp already unpacked do_descaled, but Triton SSA does
+            # not carry that assignment into this branch.
+            do_descaled = _unpack_fp8(
+                do,
+                blk_do_scale_2d,
+                tl.float32,
+                BLOCK_M,
+                BLOCK_DMODEL_V,
+                QUANT_BLOCK_SIZE,
+                True,
+                DO_USE_ASM,
+            )
             dv += tl.dot(
-                tl.trans(p.to(k.dtype)), do, out_dtype=tl.float32, allow_tf32=False
+                tl.trans(p), do_descaled, out_dtype=tl.float32, allow_tf32=False
+            )
+        # compute dk = dot(ds.T, q)
+        if (SCALE_NUM_PER_M) % 2 == 0:
+            ds_T = ds.T
+            ds_scale = _calculate_scales(
+                ds_T, BLOCK_N, BLOCK_M, QUANT_SIZE, False, q.dtype
             )
 
-        # compute dk = dot(ds.T, q)
-        if use_mxfp8:
-            if (SCALE_NUM_PER_M) % 2 == 0:
-                ds_T = ds.T
-                ds_scale = _calculate_scales(
-                    ds_T, BLOCK_N, BLOCK_M, QUANT_SIZE, False, q.dtype
-                )
-
-                ds_scalsed = _pack_fp8(
-                    ds_T,
-                    ds_scale,
-                    None,
-                    None,
-                    BLOCK_N,
-                    BLOCK_M,
-                    QUANT_SIZE,
-                    False,
-                    False,
-                    USE_ASM,
-                    q.dtype,
-                )
-                dk = tl.dot_scaled(
-                    ds_scalsed,
-                    ds_scale,
-                    FLOAT_DTYPE,
-                    q,
-                    blk_q_scale_1d_ds_T,
-                    FLOAT_DTYPE,
-                    dk,
-                    out_dtype=tl.float32,
-                )
-            else:
-                q_descaled = _unpack_fp8(
-                    q,
-                    blk_q_scale_2d,
-                    tl.float32,
-                    BLOCK_M,
-                    BLOCK_DMODEL_QK,
-                    QUANT_BLOCK_SIZE,
-                    True,
-                    USE_ASM,
-                )
-                _dk = tl.dot(
-                    tl.trans(ds), q_descaled, out_dtype=tl.float32, allow_tf32=False
-                )
-                dk += _dk
+            ds_scalsed = _pack_fp8(
+                ds_T,
+                ds_scale,
+                None,
+                None,
+                BLOCK_N,
+                BLOCK_M,
+                QUANT_SIZE,
+                False,
+                False,
+                USE_ASM,
+                q.dtype,
+            )
+            dk = tl.dot_scaled(
+                ds_scalsed,
+                ds_scale,
+                FLOAT_DTYPE,
+                q,
+                blk_q_scale_1d_ds_T,
+                FLOAT_DTYPE,
+                dk,
+                out_dtype=tl.float32,
+            )
         else:
+            q_descaled = _unpack_fp8(
+                q,
+                blk_q_scale_2d,
+                tl.float32,
+                BLOCK_M,
+                BLOCK_DMODEL_QK,
+                QUANT_BLOCK_SIZE,
+                True,
+                USE_ASM,
+            )
             _dk = tl.dot(
-                tl.trans(ds).to(q.dtype), q, out_dtype=tl.float32, allow_tf32=False
+                tl.trans(ds), q_descaled, out_dtype=tl.float32, allow_tf32=False
             )
             dk += _dk
-
-        if use_mxfp8:
-            q_scale_ptr_2d_base += scales_num_block_m * stride_qdescalem
-            q_scale_ptr_1d_ds_base += scales_num_block_m * stride_qdescalem
-            q_scale_ptr_1d_ds_base_T += scales_num_block_m * stride_qdescalem
-            do_scale_ptr_1d_ds_base += scales_num_block_m * stride_dodescalem
-            do_scale_ptr_1d_ds_base_T += scales_num_block_m * stride_dodescalem
-            do_scale_ptr_2d_base += scales_num_block_m * stride_dodescalem
-
+        q_scale_ptr_2d_base += scales_num_block_m * stride_qdescalem
+        q_scale_ptr_1d_ds_base += scales_num_block_m * stride_qdescalem
+        q_scale_ptr_1d_ds_base_T += scales_num_block_m * stride_qdescalem
+        do_scale_ptr_1d_ds_base += scales_num_block_m * stride_dodescalem
+        do_scale_ptr_1d_ds_base_T += scales_num_block_m * stride_dodescalem
+        do_scale_ptr_2d_base += scales_num_block_m * stride_dodescalem
     return dk, dv
 
 
@@ -1796,7 +1622,6 @@ def _bwd_kernel_dkdv_mxfp8(
     CAUSAL: tl.constexpr,
     USE_EXP2: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    use_mxfp8: tl.constexpr,
     F8_BWD_DTYPE: tl.constexpr,
     QUANT_BLOCK_SIZE: tl.constexpr,
     QUANT_SIZE: tl.constexpr,
@@ -1854,27 +1679,15 @@ def _bwd_kernel_dkdv_mxfp8(
         causal_boundary = 0
         lo = 0
 
-    if use_mxfp8:
-        scales_num_block_m: tl.constexpr = BLOCK_M // QUANT_BLOCK_SIZE
-        scales_num_block_n: tl.constexpr = BLOCK_N // QUANT_BLOCK_SIZE
-        scales_num_block_d_qk: tl.constexpr = BLOCK_DMODEL_QK // QUANT_BLOCK_SIZE
-        scales_num_block_d_v: tl.constexpr = BLOCK_DMODEL_V // QUANT_BLOCK_SIZE
+    scales_num_block_m: tl.constexpr = BLOCK_M // QUANT_BLOCK_SIZE
+    scales_num_block_n: tl.constexpr = BLOCK_N // QUANT_BLOCK_SIZE
+    scales_num_block_d_qk: tl.constexpr = BLOCK_DMODEL_QK // QUANT_BLOCK_SIZE
+    scales_num_block_d_v: tl.constexpr = BLOCK_DMODEL_V // QUANT_BLOCK_SIZE
 
-        scale_offs_m = tl.arange(0, scales_num_block_m)
-        scale_offs_n = tl.arange(0, scales_num_block_n)
-        scale_offs_d_qk = tl.arange(0, scales_num_block_d_qk)
-        scale_offs_d_v = tl.arange(0, scales_num_block_d_v)
-    else:
-        scales_num_block_m = 1
-        scales_num_block_n = 1
-        scales_num_block_d_qk = 1
-        scales_num_block_d_v = 1
-
-        scale_offs_m = tl.arange(0, 1)
-        scale_offs_n = tl.arange(0, 1)
-        scale_offs_d_qk = tl.arange(0, 1)
-        scale_offs_d_v = tl.arange(0, 1)
-
+    scale_offs_m = tl.arange(0, scales_num_block_m)
+    scale_offs_n = tl.arange(0, scales_num_block_n)
+    scale_offs_d_qk = tl.arange(0, scales_num_block_d_qk)
+    scale_offs_d_v = tl.arange(0, scales_num_block_d_v)
     # scale number per block in this warp tile for mxfp
     SCALE_NUM_PER_QUANT_BLK: tl.constexpr = QUANT_BLOCK_SIZE // QUANT_SIZE
     # scale number per D QK in this warp tile for mxfp
@@ -1886,75 +1699,66 @@ def _bwd_kernel_dkdv_mxfp8(
     # scale number per N in this warp tile for mxfp
     SCALE_NUM_PER_M: tl.constexpr = scales_num_block_m * SCALE_NUM_PER_QUANT_BLK
 
-    if use_mxfp8:
-        scale_offs_m_b = tl.arange(0, BLOCK_M)
-        scale_offs_n_b = tl.arange(0, BLOCK_N)
-        scale_offs_d_qk_b = tl.arange(0, BLOCK_DMODEL_QK)
-        scale_offs_d_v_b = tl.arange(0, BLOCK_DMODEL_V)
+    scale_offs_m_b = tl.arange(0, BLOCK_M)
+    scale_offs_n_b = tl.arange(0, BLOCK_N)
+    scale_offs_d_qk_b = tl.arange(0, BLOCK_DMODEL_QK)
+    scale_offs_d_v_b = tl.arange(0, BLOCK_DMODEL_V)
 
-        scale_offs_m_q = tl.arange(0, SCALE_NUM_PER_M)
-        tl.arange(0, SCALE_NUM_PER_N)
-        scale_offs_d_qk_q = tl.arange(0, SCALE_NUM_PER_D_QK)
-        scale_offs_d_v_q = tl.arange(0, SCALE_NUM_PER_D_V)
+    scale_offs_m_q = tl.arange(0, SCALE_NUM_PER_M)
+    tl.arange(0, SCALE_NUM_PER_N)
+    scale_offs_d_qk_q = tl.arange(0, SCALE_NUM_PER_D_QK)
+    scale_offs_d_v_q = tl.arange(0, SCALE_NUM_PER_D_V)
 
-        q_scale_ptr_offs = (
-            q_scale_ptr
-            + stride_qdescalez * off_z
-            + stride_qdescaleh * off_h_q
-            + q_start // QUANT_BLOCK_SIZE * stride_qdescalem
-        )
-        q_scale_ptr_2d_base = (
-            q_scale_ptr_offs
-            + scale_offs_m[:, None] * stride_qdescalem
-            + scale_offs_d_qk[None, :] * stride_qdescaled
-        )
-        q_scale_ptr_1d_ds_base = (
-            q_scale_ptr_offs
-            + scale_offs_m_b[:, None] // QUANT_BLOCK_SIZE * stride_qdescalem
-            + scale_offs_d_qk_q[None, :] // SCALE_NUM_PER_QUANT_BLK * stride_qdescaled
-        )
-        q_scale_ptr_1d_ds_base_T = (
-            q_scale_ptr_offs
-            + scale_offs_d_qk_b[:, None] // QUANT_BLOCK_SIZE * stride_qdescaled
-            + scale_offs_m_q[None, :] // SCALE_NUM_PER_QUANT_BLK * stride_qdescalem
-        )
+    q_scale_ptr_offs = (
+        q_scale_ptr
+        + stride_qdescalez * off_z
+        + stride_qdescaleh * off_h_q
+        + q_start // QUANT_BLOCK_SIZE * stride_qdescalem
+    )
+    q_scale_ptr_2d_base = (
+        q_scale_ptr_offs
+        + scale_offs_m[:, None] * stride_qdescalem
+        + scale_offs_d_qk[None, :] * stride_qdescaled
+    )
+    q_scale_ptr_1d_ds_base = (
+        q_scale_ptr_offs
+        + scale_offs_m_b[:, None] // QUANT_BLOCK_SIZE * stride_qdescalem
+        + scale_offs_d_qk_q[None, :] // SCALE_NUM_PER_QUANT_BLK * stride_qdescaled
+    )
+    q_scale_ptr_1d_ds_base_T = (
+        q_scale_ptr_offs
+        + scale_offs_d_qk_b[:, None] // QUANT_BLOCK_SIZE * stride_qdescaled
+        + scale_offs_m_q[None, :] // SCALE_NUM_PER_QUANT_BLK * stride_qdescalem
+    )
 
-        do_scale_ptr_offs = (
-            do_scale_ptr
-            + stride_dodescalez * off_z
-            + stride_dodescaleh * off_h_q
-            + q_start // QUANT_BLOCK_SIZE * stride_dodescalem
-        )
-        do_scale_ptr_1d_ds_base = (
-            do_scale_ptr_offs
-            + scale_offs_m_b[:, None] // QUANT_BLOCK_SIZE * stride_dodescalem
-            + scale_offs_d_v_q[None, :] // SCALE_NUM_PER_QUANT_BLK * stride_dodescaled
-        )
-        do_scale_ptr_1d_ds_base_T = (
-            do_scale_ptr_offs
-            + scale_offs_d_v_b[:, None] // QUANT_BLOCK_SIZE * stride_dodescaled
-            + scale_offs_m_q[None, :] // SCALE_NUM_PER_QUANT_BLK * stride_dodescalem
-        )
-        do_scale_ptr_2d_base = (
-            do_scale_ptr_offs
-            + scale_offs_m[:, None] * stride_dodescalem
-            + scale_offs_d_v[None, :] * stride_dodescaled
-        )
+    do_scale_ptr_offs = (
+        do_scale_ptr
+        + stride_dodescalez * off_z
+        + stride_dodescaleh * off_h_q
+        + q_start // QUANT_BLOCK_SIZE * stride_dodescalem
+    )
+    do_scale_ptr_1d_ds_base = (
+        do_scale_ptr_offs
+        + scale_offs_m_b[:, None] // QUANT_BLOCK_SIZE * stride_dodescalem
+        + scale_offs_d_v_q[None, :] // SCALE_NUM_PER_QUANT_BLK * stride_dodescaled
+    )
+    do_scale_ptr_1d_ds_base_T = (
+        do_scale_ptr_offs
+        + scale_offs_d_v_b[:, None] // QUANT_BLOCK_SIZE * stride_dodescaled
+        + scale_offs_m_q[None, :] // SCALE_NUM_PER_QUANT_BLK * stride_dodescalem
+    )
+    do_scale_ptr_2d_base = (
+        do_scale_ptr_offs
+        + scale_offs_m[:, None] * stride_dodescalem
+        + scale_offs_d_v[None, :] * stride_dodescaled
+    )
 
-        q_scale_ptr_2d_base += (lo // QUANT_BLOCK_SIZE) * stride_qdescalem
-        q_scale_ptr_1d_ds_base += (lo // QUANT_BLOCK_SIZE) * stride_qdescalem
-        q_scale_ptr_1d_ds_base_T += (lo // QUANT_BLOCK_SIZE) * stride_qdescalem
-        do_scale_ptr_1d_ds_base += (lo // QUANT_BLOCK_SIZE) * stride_dodescalem
-        do_scale_ptr_1d_ds_base_T += (lo // QUANT_BLOCK_SIZE) * stride_dodescalem
-        do_scale_ptr_2d_base += (lo // QUANT_BLOCK_SIZE) * stride_dodescalem
-    else:
-        q_scale_ptr_2d_base = q_scale_ptr
-        q_scale_ptr_1d_ds_base = q_scale_ptr
-        q_scale_ptr_1d_ds_base_T = q_scale_ptr
-        do_scale_ptr_1d_ds_base = do_scale_ptr
-        do_scale_ptr_1d_ds_base_T = do_scale_ptr
-        do_scale_ptr_2d_base = do_scale_ptr
-
+    q_scale_ptr_2d_base += (lo // QUANT_BLOCK_SIZE) * stride_qdescalem
+    q_scale_ptr_1d_ds_base += (lo // QUANT_BLOCK_SIZE) * stride_qdescalem
+    q_scale_ptr_1d_ds_base_T += (lo // QUANT_BLOCK_SIZE) * stride_qdescalem
+    do_scale_ptr_1d_ds_base += (lo // QUANT_BLOCK_SIZE) * stride_dodescalem
+    do_scale_ptr_1d_ds_base_T += (lo // QUANT_BLOCK_SIZE) * stride_dodescalem
+    do_scale_ptr_2d_base += (lo // QUANT_BLOCK_SIZE) * stride_dodescalem
     offs_d_qk = tl.arange(0, BLOCK_DMODEL_QK)
     offs_d_v = tl.arange(0, BLOCK_DMODEL_V)
     offs_n = start_n * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -1974,58 +1778,49 @@ def _bwd_kernel_dkdv_mxfp8(
     dk = tl.zeros([BLOCK_N, BLOCK_DMODEL_QK], dtype=tl.float32)
     dv = tl.zeros([BLOCK_N, BLOCK_DMODEL_V], dtype=tl.float32)
 
-    if use_mxfp8:
-        k_scale_offset_base = (
-            k_scale_ptr
-            + off_z * stride_kdescalez
-            + off_h_k * stride_kdescaleh
-            + k_start // QUANT_BLOCK_SIZE * stride_kdescalem
-            + start_n * stride_kdescalem * scales_num_block_n
+    k_scale_offset_base = (
+        k_scale_ptr
+        + off_z * stride_kdescalez
+        + off_h_k * stride_kdescaleh
+        + k_start // QUANT_BLOCK_SIZE * stride_kdescalem
+        + start_n * stride_kdescalem * scales_num_block_n
+    )
+    v_scale_offset_base = (
+        v_scale_ptr
+        + stride_vdescalez * off_z
+        + stride_vdescaleh * off_h_k
+        + k_start // QUANT_BLOCK_SIZE * stride_vdescalem
+        + start_n * stride_vdescalem * scales_num_block_n
+    )
+
+    if (SCALE_NUM_PER_D_QK) % 2 == 0:
+        k_scale_offset = (
+            k_scale_offset_base
+            + scale_offs_n_b[:, None] // QUANT_BLOCK_SIZE * stride_kdescalem
+            + scale_offs_d_qk_q[None, :] // SCALE_NUM_PER_QUANT_BLK * stride_kdescaled
         )
-        v_scale_offset_base = (
-            v_scale_ptr
-            + stride_vdescalez * off_z
-            + stride_vdescaleh * off_h_k
-            + k_start // QUANT_BLOCK_SIZE * stride_vdescalem
-            + start_n * stride_vdescalem * scales_num_block_n
-        )
-
-        if (SCALE_NUM_PER_D_QK) % 2 == 0:
-            k_scale_offset = (
-                k_scale_offset_base
-                + scale_offs_n_b[:, None] // QUANT_BLOCK_SIZE * stride_kdescalem
-                + scale_offs_d_qk_q[None, :]
-                // SCALE_NUM_PER_QUANT_BLK
-                * stride_kdescaled
-            )
-        else:
-            k_scale_offset = (
-                k_scale_offset_base
-                + scale_offs_d_qk[:, None] * stride_kdescaled
-                + scale_offs_n[None, :] * stride_kdescalem
-            )
-
-        if (SCALE_NUM_PER_D_V) % 2 == 0:
-            v_scale_offset = (
-                v_scale_offset_base
-                + scale_offs_n_b[:, None] // QUANT_BLOCK_SIZE * stride_vdescalem
-                + scale_offs_d_v_q[None, :]
-                // SCALE_NUM_PER_QUANT_BLK
-                * stride_vdescaled
-            )
-        else:
-            v_scale_offset = (
-                v_scale_offset_base
-                + scale_offs_d_v[:, None] * stride_vdescaled
-                + scale_offs_n[None, :] * stride_vdescalem
-            )
-
-        blk_k_scale = tl.load(k_scale_offset)
-        blk_v_scale = tl.load(v_scale_offset)
     else:
-        blk_k_scale = 1.0
-        blk_v_scale = 1.0
+        k_scale_offset = (
+            k_scale_offset_base
+            + scale_offs_d_qk[:, None] * stride_kdescaled
+            + scale_offs_n[None, :] * stride_kdescalem
+        )
 
+    if (SCALE_NUM_PER_D_V) % 2 == 0:
+        v_scale_offset = (
+            v_scale_offset_base
+            + scale_offs_n_b[:, None] // QUANT_BLOCK_SIZE * stride_vdescalem
+            + scale_offs_d_v_q[None, :] // SCALE_NUM_PER_QUANT_BLK * stride_vdescaled
+        )
+    else:
+        v_scale_offset = (
+            v_scale_offset_base
+            + scale_offs_d_v[:, None] * stride_vdescaled
+            + scale_offs_n[None, :] * stride_vdescalem
+        )
+
+    blk_k_scale = tl.load(k_scale_offset)
+    blk_v_scale = tl.load(v_scale_offset)
     for group_idx in range(GROUP_SIZE):
         dk, dv = _attn_bwd_dkdv(
             k,
@@ -2075,7 +1870,6 @@ def _bwd_kernel_dkdv_mxfp8(
             lo,
             num_block_m,
             causal_boundary,
-            use_mxfp8,
             USE_EXP2,
             N_CTX_Q,
             N_CTX_K,
@@ -2090,22 +1884,16 @@ def _bwd_kernel_dkdv_mxfp8(
         do_offset += stride_doh
         l_offset += stride_ldh
         d_offset += stride_ldh
-        if use_mxfp8:
-            q_scale_ptr_2d_base += stride_qdescaleh
-            q_scale_ptr_1d_ds_base += stride_qdescaleh
-            q_scale_ptr_1d_ds_base_T += stride_qdescaleh
-            do_scale_ptr_1d_ds_base_T += stride_dodescaleh
-            do_scale_ptr_2d_base += stride_dodescaleh
-            do_scale_ptr_1d_ds_base += stride_dodescaleh
-
-    if use_mxfp8:
-        p_scale_t = tl.cast(p_scale, tl.uint32)
-        p_scale_t = (p_scale_t << 23).to(tl.float32, bitcast=True)
-        # FP8 -> FP32
-        dv /= p_scale_t
-    else:
-        p_scale_t = 1.0
-
+        q_scale_ptr_2d_base += stride_qdescaleh
+        q_scale_ptr_1d_ds_base += stride_qdescaleh
+        q_scale_ptr_1d_ds_base_T += stride_qdescaleh
+        do_scale_ptr_1d_ds_base_T += stride_dodescaleh
+        do_scale_ptr_2d_base += stride_dodescaleh
+        do_scale_ptr_1d_ds_base += stride_dodescaleh
+    p_scale_t = tl.cast(p_scale, tl.uint32)
+    p_scale_t = (p_scale_t << 23).to(tl.float32, bitcast=True)
+    # FP8 -> FP32
+    dv /= p_scale_t
     dk *= sm_scale / p_scale_t
 
     dk_mask = mask_n[:, None] & mask_d_qk[None, :]
@@ -2171,7 +1959,6 @@ def _attn_bwd_dq(
     hi: tl.constexpr,
     num_block_n: tl.constexpr,
     causal_boundary: tl.constexpr,
-    use_mxfp8: tl.constexpr,
     USE_EXP2: tl.constexpr,
     F8_BWD_DTYPE: tl.constexpr,
     N_CTX_Q: tl.constexpr,
@@ -2199,9 +1986,7 @@ def _attn_bwd_dq(
         DO_USE_ASM: tl.constexpr = False
         DO_DTYPE: tl.constexpr = "e5m2"
 
-    if use_mxfp8:
-        do_scale = do_scale.to(tl.uint8)
-
+    do_scale = do_scale.to(tl.uint8)
     # scale number per block in this warp tile for mxfp
     SCALE_NUM_PER_QUANT_BLK: tl.constexpr = QUANT_BLOCK_SIZE // QUANT_SIZE
     # scale number per D QK in this warp tile for mxfp
@@ -2237,51 +2022,45 @@ def _attn_bwd_dq(
         k = tl.load(k_ptrs, mask=mask_k, other=0.0)
         v = tl.load(v_ptrs, mask=mask_v, other=0.0)
 
-        if use_mxfp8:
-            if (SCALE_NUM_PER_D_QK) % 2 == 0:
-                blk_k_scale = tl.load(k_scale_ptr_1d_ds_base)
-                qk = tl.dot_scaled(
-                    q,
-                    q_scale.to(tl.uint8),
-                    FLOAT_DTYPE,
-                    tl.trans(k),
-                    blk_k_scale.to(tl.uint8),
-                    FLOAT_DTYPE,
-                    out_dtype=tl.float32,
-                )
-            else:
-                blk_k_scale = tl.load(k_scale_ptr_2d_base)
-                q_descaled = _unpack_fp8(
-                    q,
-                    q_scale,
-                    tl.float32,
-                    BLOCK_M,
-                    BLOCK_DMODEL_QK,
-                    QUANT_BLOCK_SIZE,
-                    True,
-                    USE_ASM,
-                )
-                k_descaled = _unpack_fp8(
-                    k,
-                    blk_k_scale,
-                    tl.float32,
-                    BLOCK_N,
-                    BLOCK_DMODEL_QK,
-                    QUANT_BLOCK_SIZE,
-                    True,
-                    USE_ASM,
-                )
-                qk = tl.dot(
-                    q_descaled,
-                    tl.trans(k_descaled),
-                    out_dtype=tl.float32,
-                    allow_tf32=False,
-                )
-
+        if (SCALE_NUM_PER_D_QK) % 2 == 0:
+            blk_k_scale = tl.load(k_scale_ptr_1d_ds_base)
+            qk = tl.dot_scaled(
+                q,
+                q_scale.to(tl.uint8),
+                FLOAT_DTYPE,
+                tl.trans(k),
+                blk_k_scale.to(tl.uint8),
+                FLOAT_DTYPE,
+                out_dtype=tl.float32,
+            )
         else:
-            kt = tl.trans(k)
-            qk = tl.dot(q, kt, out_dtype=tl.float32, allow_tf32=False)
-
+            blk_k_scale = tl.load(k_scale_ptr_2d_base)
+            q_descaled = _unpack_fp8(
+                q,
+                q_scale,
+                tl.float32,
+                BLOCK_M,
+                BLOCK_DMODEL_QK,
+                QUANT_BLOCK_SIZE,
+                True,
+                USE_ASM,
+            )
+            k_descaled = _unpack_fp8(
+                k,
+                blk_k_scale,
+                tl.float32,
+                BLOCK_N,
+                BLOCK_DMODEL_QK,
+                QUANT_BLOCK_SIZE,
+                True,
+                USE_ASM,
+            )
+            qk = tl.dot(
+                q_descaled,
+                tl.trans(k_descaled),
+                out_dtype=tl.float32,
+                allow_tf32=False,
+            )
         if CAUSAL:
             # if not can_skip_causal_block:
             col_offset = N_CTX_Q - N_CTX_K
@@ -2297,103 +2076,91 @@ def _attn_bwd_dq(
             p = tl.math.exp(qk - l_i[:, None] + log_p_scale)
 
         # compute dp
-        if use_mxfp8:
-            blk_v_scale = tl.load(v_scale_ptr)
-            if (SCALE_NUM_PER_D_V) % 2 == 0:
-                do = do.to(tl.float32).to(F8_BWD_DTYPE)
-                dp = tl.dot_scaled(
-                    do,
-                    do_scale.to(tl.uint8),
-                    DO_DTYPE,
-                    v,
-                    blk_v_scale.to(tl.uint8),
-                    FLOAT_DTYPE,
-                    out_dtype=tl.float32,
-                )
-            else:
-                do_descaled = _unpack_fp8(
-                    do,
-                    do_scale,
-                    tl.float32,
-                    BLOCK_M,
-                    BLOCK_DMODEL_V,
-                    QUANT_BLOCK_SIZE,
-                    True,
-                    DO_USE_ASM,
-                )
-                v_descaled = _unpack_fp8(
-                    v,
-                    blk_v_scale,
-                    tl.float32,
-                    BLOCK_DMODEL_V,
-                    BLOCK_N,
-                    QUANT_BLOCK_SIZE,
-                    True,
-                    USE_ASM,
-                )
-                dp = tl.dot(
-                    do_descaled, v_descaled, allow_tf32=False, out_dtype=tl.float32
-                )
+        blk_v_scale = tl.load(v_scale_ptr)
+        if (SCALE_NUM_PER_D_V) % 2 == 0:
+            do = do.to(tl.float32).to(F8_BWD_DTYPE)
+            dp = tl.dot_scaled(
+                do,
+                do_scale.to(tl.uint8),
+                DO_DTYPE,
+                v,
+                blk_v_scale.to(tl.uint8),
+                FLOAT_DTYPE,
+                out_dtype=tl.float32,
+            )
         else:
-            dp = tl.dot(do, v, out_dtype=tl.float32, allow_tf32=False)
-
+            do_descaled = _unpack_fp8(
+                do,
+                do_scale,
+                tl.float32,
+                BLOCK_M,
+                BLOCK_DMODEL_V,
+                QUANT_BLOCK_SIZE,
+                True,
+                DO_USE_ASM,
+            )
+            v_descaled = _unpack_fp8(
+                v,
+                blk_v_scale,
+                tl.float32,
+                BLOCK_DMODEL_V,
+                BLOCK_N,
+                QUANT_BLOCK_SIZE,
+                True,
+                USE_ASM,
+            )
+            dp = tl.dot(do_descaled, v_descaled, allow_tf32=False, out_dtype=tl.float32)
         ds = p * (dp - Di[:, None])
 
-        if use_mxfp8:
-            if (SCALE_NUM_PER_N) % 2 == 0:
-                blk_k_scale = tl.load(k_scale_ptr_1d_ds_base_T)
-                ds_scale = _calculate_scales(
-                    ds, BLOCK_M, BLOCK_N, QUANT_SIZE, False, q.dtype
-                )
-                ds = _pack_fp8(
-                    ds,
-                    ds_scale,
-                    None,
-                    None,
-                    BLOCK_M,
-                    BLOCK_N,
-                    QUANT_SIZE,
-                    False,
-                    False,
-                    USE_ASM,
-                    q.dtype,
-                )
+        if (SCALE_NUM_PER_N) % 2 == 0:
+            blk_k_scale = tl.load(k_scale_ptr_1d_ds_base_T)
+            ds_scale = _calculate_scales(
+                ds, BLOCK_M, BLOCK_N, QUANT_SIZE, False, q.dtype
+            )
+            ds = _pack_fp8(
+                ds,
+                ds_scale,
+                None,
+                None,
+                BLOCK_M,
+                BLOCK_N,
+                QUANT_SIZE,
+                False,
+                False,
+                USE_ASM,
+                q.dtype,
+            )
 
-                dq = tl.dot_scaled(
-                    ds,
-                    ds_scale,
-                    FLOAT_DTYPE,
-                    k,
-                    blk_k_scale.to(tl.uint8),
-                    FLOAT_DTYPE,
-                    dq.to(tl.float32),
-                    out_dtype=tl.float32,
-                )
+            dq = tl.dot_scaled(
+                ds,
+                ds_scale,
+                FLOAT_DTYPE,
+                k,
+                blk_k_scale.to(tl.uint8),
+                FLOAT_DTYPE,
+                dq.to(tl.float32),
+                out_dtype=tl.float32,
+            )
 
-            else:
-                blk_k_scale = tl.load(k_scale_ptr_2d_base)
-                k_descaled = _unpack_fp8(
-                    k,
-                    blk_k_scale,
-                    tl.float32,
-                    BLOCK_N,
-                    BLOCK_DMODEL_QK,
-                    QUANT_BLOCK_SIZE,
-                    True,
-                    USE_ASM,
-                )
-                _dq = tl.dot(ds, k_descaled, out_dtype=tl.float32, allow_tf32=False)
-                dq += _dq
-
-            k_scale_ptr_2d_base += stride_kdescalem * scales_num_block_n
-            k_scale_ptr_1d_ds_base += stride_kdescalem * scales_num_block_n
-            k_scale_ptr_1d_ds_base_T += stride_kdescalem * scales_num_block_n
-            v_scale_ptr += stride_vdescalem * scales_num_block_n
         else:
-            ds = ds.to(q.dtype)
-            _dq = tl.dot(ds, k, out_dtype=tl.float32, allow_tf32=False)
+            blk_k_scale = tl.load(k_scale_ptr_2d_base)
+            k_descaled = _unpack_fp8(
+                k,
+                blk_k_scale,
+                tl.float32,
+                BLOCK_N,
+                BLOCK_DMODEL_QK,
+                QUANT_BLOCK_SIZE,
+                True,
+                USE_ASM,
+            )
+            _dq = tl.dot(ds, k_descaled, out_dtype=tl.float32, allow_tf32=False)
             dq += _dq
 
+        k_scale_ptr_2d_base += stride_kdescalem * scales_num_block_n
+        k_scale_ptr_1d_ds_base += stride_kdescalem * scales_num_block_n
+        k_scale_ptr_1d_ds_base_T += stride_kdescalem * scales_num_block_n
+        v_scale_ptr += stride_vdescalem * scales_num_block_n
         k_ptrs += stride_kn * BLOCK_N
         v_ptrs += stride_vn * BLOCK_N
 
@@ -2490,7 +2257,6 @@ def _bwd_kernel_dq_mxfp8(
     CAUSAL: tl.constexpr,
     USE_EXP2: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    use_mxfp8: tl.constexpr,
     F8_BWD_DTYPE: tl.constexpr,
     QUANT_BLOCK_SIZE: tl.constexpr,
     QUANT_SIZE: tl.constexpr,
@@ -2542,27 +2308,15 @@ def _bwd_kernel_dq_mxfp8(
     # output tensor offsets
     dq_offset = DQ + off_z * stride_qz + off_h_q * stride_qh + q_start * stride_qm
 
-    if use_mxfp8:
-        scales_num_block_m: tl.constexpr = BLOCK_M // QUANT_BLOCK_SIZE
-        scales_num_block_n: tl.constexpr = BLOCK_N // QUANT_BLOCK_SIZE
-        scales_num_block_d_qk: tl.constexpr = BLOCK_DMODEL_QK // QUANT_BLOCK_SIZE
-        scales_num_block_d_v: tl.constexpr = BLOCK_DMODEL_V // QUANT_BLOCK_SIZE
+    scales_num_block_m: tl.constexpr = BLOCK_M // QUANT_BLOCK_SIZE
+    scales_num_block_n: tl.constexpr = BLOCK_N // QUANT_BLOCK_SIZE
+    scales_num_block_d_qk: tl.constexpr = BLOCK_DMODEL_QK // QUANT_BLOCK_SIZE
+    scales_num_block_d_v: tl.constexpr = BLOCK_DMODEL_V // QUANT_BLOCK_SIZE
 
-        scale_offs_m = tl.arange(0, scales_num_block_m)
-        scale_offs_n = tl.arange(0, scales_num_block_n)
-        scale_offs_d_qk = tl.arange(0, scales_num_block_d_qk)
-        scale_offs_d_v = tl.arange(0, scales_num_block_d_v)
-    else:
-        scales_num_block_m = 1
-        scales_num_block_n = 1
-        scales_num_block_d_qk = 1
-        scales_num_block_d_v = 1
-
-        scale_offs_m = tl.arange(0, 1)
-        scale_offs_n = tl.arange(0, 1)
-        scale_offs_d_qk = tl.arange(0, 1)
-        scale_offs_d_v = tl.arange(0, 1)
-
+    scale_offs_m = tl.arange(0, scales_num_block_m)
+    scale_offs_n = tl.arange(0, scales_num_block_n)
+    scale_offs_d_qk = tl.arange(0, scales_num_block_d_qk)
+    scale_offs_d_v = tl.arange(0, scales_num_block_d_v)
     # scale number per block in this warp tile for mxfp
     SCALE_NUM_PER_QUANT_BLK: tl.constexpr = QUANT_BLOCK_SIZE // QUANT_SIZE
     # scale number per D QK in this warp tile for mxfp
@@ -2574,65 +2328,56 @@ def _bwd_kernel_dq_mxfp8(
     # scale number per N in this warp tile for mxfp
     SCALE_NUM_PER_M: tl.constexpr = scales_num_block_m * SCALE_NUM_PER_QUANT_BLK
 
-    if use_mxfp8:
-        scale_offs_m_b = tl.arange(0, BLOCK_M)
-        scale_offs_n_b = tl.arange(0, BLOCK_N)
-        scale_offs_d_qk_b = tl.arange(0, BLOCK_DMODEL_QK)
-        tl.arange(0, BLOCK_DMODEL_V)
+    scale_offs_m_b = tl.arange(0, BLOCK_M)
+    scale_offs_n_b = tl.arange(0, BLOCK_N)
+    scale_offs_d_qk_b = tl.arange(0, BLOCK_DMODEL_QK)
+    tl.arange(0, BLOCK_DMODEL_V)
 
-        tl.arange(0, SCALE_NUM_PER_M)
-        scale_offs_n_q = tl.arange(0, SCALE_NUM_PER_N)
-        scale_offs_d_qk_q = tl.arange(0, SCALE_NUM_PER_D_QK)
-        scale_offs_d_v_q = tl.arange(0, SCALE_NUM_PER_D_V)
+    tl.arange(0, SCALE_NUM_PER_M)
+    scale_offs_n_q = tl.arange(0, SCALE_NUM_PER_N)
+    scale_offs_d_qk_q = tl.arange(0, SCALE_NUM_PER_D_QK)
+    scale_offs_d_v_q = tl.arange(0, SCALE_NUM_PER_D_V)
 
-        k_scale_ptr_offs = (
-            k_scale_ptr
-            + stride_kdescalez * off_z
-            + stride_kdescaleh * off_h_k
-            + k_start // QUANT_BLOCK_SIZE * stride_kdescalem
-        )
-        k_scale_ptr_2d_base = (
-            k_scale_ptr_offs
-            + scale_offs_n[:, None] * stride_kdescalem
-            + scale_offs_d_qk[None, :] * stride_kdescaled
-        )
-        k_scale_ptr_1d_ds_base = (
-            k_scale_ptr_offs
-            + scale_offs_n_b[:, None] // QUANT_BLOCK_SIZE * stride_kdescalem
-            + scale_offs_d_qk_q[None, :] // SCALE_NUM_PER_QUANT_BLK * stride_kdescaled
-        )
-        k_scale_ptr_1d_ds_base_T = (
-            k_scale_ptr_offs
-            + scale_offs_d_qk_b[:, None] // QUANT_BLOCK_SIZE * stride_kdescaled
-            + scale_offs_n_q[None, :] // SCALE_NUM_PER_QUANT_BLK * stride_kdescalem
-        )
+    k_scale_ptr_offs = (
+        k_scale_ptr
+        + stride_kdescalez * off_z
+        + stride_kdescaleh * off_h_k
+        + k_start // QUANT_BLOCK_SIZE * stride_kdescalem
+    )
+    k_scale_ptr_2d_base = (
+        k_scale_ptr_offs
+        + scale_offs_n[:, None] * stride_kdescalem
+        + scale_offs_d_qk[None, :] * stride_kdescaled
+    )
+    k_scale_ptr_1d_ds_base = (
+        k_scale_ptr_offs
+        + scale_offs_n_b[:, None] // QUANT_BLOCK_SIZE * stride_kdescalem
+        + scale_offs_d_qk_q[None, :] // SCALE_NUM_PER_QUANT_BLK * stride_kdescaled
+    )
+    k_scale_ptr_1d_ds_base_T = (
+        k_scale_ptr_offs
+        + scale_offs_d_qk_b[:, None] // QUANT_BLOCK_SIZE * stride_kdescaled
+        + scale_offs_n_q[None, :] // SCALE_NUM_PER_QUANT_BLK * stride_kdescalem
+    )
 
-        v_scale_ptr_offs = (
-            v_scale_ptr
-            + stride_vdescalez * off_z
-            + stride_vdescaleh * off_h_k
-            + k_start // QUANT_BLOCK_SIZE * stride_vdescalem
+    v_scale_ptr_offs = (
+        v_scale_ptr
+        + stride_vdescalez * off_z
+        + stride_vdescaleh * off_h_k
+        + k_start // QUANT_BLOCK_SIZE * stride_vdescalem
+    )
+    if (SCALE_NUM_PER_D_V) % 2 == 0:
+        v_scale_ptr_base = (
+            v_scale_ptr_offs
+            + scale_offs_n_b[:, None] // QUANT_BLOCK_SIZE * stride_vdescalem
+            + scale_offs_d_v_q[None, :] // SCALE_NUM_PER_QUANT_BLK * stride_vdescaled
         )
-        if (SCALE_NUM_PER_D_V) % 2 == 0:
-            v_scale_ptr_base = (
-                v_scale_ptr_offs
-                + scale_offs_n_b[:, None] // QUANT_BLOCK_SIZE * stride_vdescalem
-                + scale_offs_d_v_q[None, :]
-                // SCALE_NUM_PER_QUANT_BLK
-                * stride_vdescaled
-            )
-        else:
-            v_scale_ptr_base = (
-                v_scale_ptr_offs
-                + scale_offs_d_v[:, None] * stride_vdescaled
-                + scale_offs_n[None, :] * stride_vdescalem
-            )
     else:
-        k_scale_ptr_2d_base = k_scale_ptr
-        k_scale_ptr_1d_ds_base = k_scale_ptr
-        k_scale_ptr_1d_ds_base_T = k_scale_ptr
-        v_scale_ptr_base = v_scale_ptr
-
+        v_scale_ptr_base = (
+            v_scale_ptr_offs
+            + scale_offs_d_v[:, None] * stride_vdescaled
+            + scale_offs_n[None, :] * stride_vdescalem
+        )
     if CAUSAL:
         causal_boundary = start_m * BLOCK_M - BLOCK_N
         # For a given Q block (start_m), keys up to (start_m+1)*BLOCK_M can contribute under causal masking.
@@ -2663,57 +2408,48 @@ def _bwd_kernel_dq_mxfp8(
     q = tl.load(q_ptrs, mask=mask_q, other=0.0)
     do = tl.load(do_ptrs, mask=mask_do, other=0.0)
 
-    if use_mxfp8:
-        q_scale_offset_base = (
-            q_scale_ptr
-            + off_z * stride_qdescalez
-            + off_h_q * stride_qdescaleh
-            + q_start * scales_num_block_m * stride_qdescalem
-            + start_m * stride_qdescalem * scales_num_block_m
+    q_scale_offset_base = (
+        q_scale_ptr
+        + off_z * stride_qdescalez
+        + off_h_q * stride_qdescaleh
+        + q_start * scales_num_block_m * stride_qdescalem
+        + start_m * stride_qdescalem * scales_num_block_m
+    )
+    if (SCALE_NUM_PER_D_QK) % 2 == 0:
+        q_scale_offset = (
+            q_scale_offset_base
+            + scale_offs_m_b[:, None] // QUANT_BLOCK_SIZE * stride_qdescalem
+            + scale_offs_d_qk_q[None, :] // SCALE_NUM_PER_QUANT_BLK * stride_qdescaled
         )
-        if (SCALE_NUM_PER_D_QK) % 2 == 0:
-            q_scale_offset = (
-                q_scale_offset_base
-                + scale_offs_m_b[:, None] // QUANT_BLOCK_SIZE * stride_qdescalem
-                + scale_offs_d_qk_q[None, :]
-                // SCALE_NUM_PER_QUANT_BLK
-                * stride_qdescaled
-            )
-        else:
-            q_scale_offset = (
-                q_scale_offset_base
-                + scale_offs_m[:, None] * stride_qdescalem
-                + scale_offs_d_qk[None, :] * stride_qdescaled
-            )
-        blk_q_scale = tl.load(q_scale_offset)
-
-        do_scale_offset_base = (
-            do_scale_ptr
-            + off_z * stride_dodescalez
-            + off_h_q * stride_dodescaleh
-            + q_start * scales_num_block_m * stride_dodescalem
-            + start_m * stride_dodescalem * scales_num_block_m
-        )
-        if (SCALE_NUM_PER_D_V) % 2 == 0:
-            do_scale_offset = (
-                do_scale_offset_base
-                + scale_offs_m_b[:, None] // QUANT_BLOCK_SIZE * stride_dodescalem
-                + scale_offs_d_v_q[None, :]
-                // SCALE_NUM_PER_QUANT_BLK
-                * stride_dodescaled
-            )
-        else:
-            do_scale_offset = (
-                do_scale_offset_base
-                + scale_offs_m[:, None] * stride_dodescalem
-                + scale_offs_d_v[None, :] * stride_dodescaled
-            )
-
-        blk_do_scale = tl.load(do_scale_offset)
     else:
-        blk_q_scale = 1.0
-        blk_do_scale = 1.0
+        q_scale_offset = (
+            q_scale_offset_base
+            + scale_offs_m[:, None] * stride_qdescalem
+            + scale_offs_d_qk[None, :] * stride_qdescaled
+        )
+    blk_q_scale = tl.load(q_scale_offset)
 
+    do_scale_offset_base = (
+        do_scale_ptr
+        + off_z * stride_dodescalez
+        + off_h_q * stride_dodescaleh
+        + q_start * scales_num_block_m * stride_dodescalem
+        + start_m * stride_dodescalem * scales_num_block_m
+    )
+    if (SCALE_NUM_PER_D_V) % 2 == 0:
+        do_scale_offset = (
+            do_scale_offset_base
+            + scale_offs_m_b[:, None] // QUANT_BLOCK_SIZE * stride_dodescalem
+            + scale_offs_d_v_q[None, :] // SCALE_NUM_PER_QUANT_BLK * stride_dodescaled
+        )
+    else:
+        do_scale_offset = (
+            do_scale_offset_base
+            + scale_offs_m[:, None] * stride_dodescalem
+            + scale_offs_d_v[None, :] * stride_dodescaled
+        )
+
+    blk_do_scale = tl.load(do_scale_offset)
     l_ptrs = l_offset + offs_m * stride_ldm
     l_i = tl.load(l_ptrs, mask=mask_m, other=0.0)
     d_ptrs = d_offset + offs_m * stride_ldm
@@ -2758,7 +2494,6 @@ def _bwd_kernel_dq_mxfp8(
         hi,
         num_block_n,
         causal_boundary,
-        use_mxfp8,
         USE_EXP2,
         F8_BWD_DTYPE,
         N_CTX_Q,
@@ -2769,11 +2504,8 @@ def _bwd_kernel_dq_mxfp8(
         QUANT_SIZE,
     )
 
-    if use_mxfp8:
-        p_scale_t = tl.cast(p_scale, tl.uint32)
-        p_scale_t = (p_scale_t << 23).to(tl.float32, bitcast=True)
-    else:
-        p_scale_t = 1.0
+    p_scale_t = tl.cast(p_scale, tl.uint32)
+    p_scale_t = (p_scale_t << 23).to(tl.float32, bitcast=True)
     dq_ptrs = dq_offset + offs_m[:, None] * stride_qm + offs_d_qk[None, :] * stride_qk
     dq *= sm_scale / p_scale_t
     tl.store(dq_ptrs, dq.to(DQ.type.element_ty), mask=mask_q)
