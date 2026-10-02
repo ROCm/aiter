@@ -158,7 +158,7 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
 // candidate passing, phase_b ran 100.35 us faster at m=4096 n=131072, while the
 // compaction arithmetic, its LDS write and the drain's LDS read and global write
 // each priced free. cand_reserved[row] is one address per row that every wave
-// of the row's coop_g blocks contends for (knowledge/known_bad.md).
+// of the row's coop_g blocks contends for.
 #define COOP_RESERVE(row, n) atomicAdd(&cand_reserved[(size_t)(row) * CTR_STRIDE], (unsigned)(n))
 #define COOP_DRAIN_BODY(off)                       \
     for(int _j = lane; _j < bcnt; _j += WAVE_SIZE) \
@@ -298,7 +298,7 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
     //
     // Measured before this existed: at m=4 N=131075 the answer was exactly
     // torch.topk over the first 131072 columns, with the 2049th largest value
-    // standing in for the one that fell in the tail (scripts/probe72.py).
+    // standing in for the one that fell in the tail.
     {
         const int tail0 = n4 * FP32_EPT;
         const int ncols = len - tail0;
@@ -392,8 +392,8 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
     // at the other. It is not paying for its own bytes, it is paying to interleave
     // with the read stream, and the bill scales with the reads it interrupts.
     // Bypassing the caches stops the candidate run evicting row data the other
-    // blocks are still reading. knowledge/known_bad.md has the full pricing,
-    // including the three levers that measured nothing.
+    // blocks are still reading. Three other levers were priced and measured
+    // nothing.
     {
         const int cnt = s_local[wid];
         if(cnt > 0)
@@ -506,8 +506,8 @@ phase_c_select_contig(const float* __restrict__ input,
         __syncthreads();
         // Published by the barrier after the read. Folding the first wide pass's
         // digits into this read as well, the way pass 0's are, was measured and is
-        // SLOWER: phase_c +0.2 to +1.0us over the unfolded wide select at m=64..512
-        // (scripts/wide_ab.py, arms acF against acN), against -0.3 to -0.4us unfolded.
+        // SLOWER: phase_c +0.2 to +1.0us over the unfolded wide select at m=64..512,
+        // against -0.3 to -0.4us unfolded.
         if(nwide > 0)
             clear_wide(s_wide, wide_buffer_count(nwide, REUSE_WIDE));
         // PC_B candidate loads per thread go out before the first is used; with one

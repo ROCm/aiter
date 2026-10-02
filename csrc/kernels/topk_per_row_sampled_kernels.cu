@@ -48,9 +48,9 @@
 #endif
 
 // Every radix pass below scans with wave 0 alone and clears each bucket as it
-// reads it, so a pass costs two block barriers. The measured alternatives (a
-// separate HIST_REP reduction, a clear loop, an all-wave scan) and their
-// regime trades are in knowledge/known_bad.md.
+// reads it, so a pass costs two block barriers. The alternatives (a separate
+// HIST_REP reduction, a clear loop, an all-wave scan) were measured and each
+// lost in some regime.
 
 // ---------------------------------------------------------------------------
 // Block-wide exact radix select over keys already resident in LDS.
@@ -133,7 +133,7 @@ __device__ __forceinline__ void block_select_lds(const uint32_t* __restrict__ s_
             // already happening) and breaking when they agree made small_n 21-39%
             // SLOWER and the anchor 615.5 -> 662.8 us. The two extra barriers per pass
             // in the reduction, plus the register pressure in this loop, cost far more
-            // than the single pass the exit saves. See knowledge/known_bad.md.
+            // than the single pass the exit saves.
             for(int i = threadIdx.x; i < c; i += blockDim.x)
             {
                 uint32_t k = s_keys[i];
@@ -240,7 +240,7 @@ __device__ __forceinline__ void block_select_lds_wide(const uint32_t* __restrict
         ek -= (int)s_scan[1];
         // Finishing bits [0,12) with a wave-0 ballot walk over a small crossing
         // bucket was priced: restaging the bucket costs as much as the second wide
-        // pass it replaces (knowledge/known_bad.md).
+        // pass it replaces.
         // All c keys landed in the bucket just picked, so they share every bit at
         // and above `sh`. Without a prefix skip this is where a one-value candidate
         // set (a tie-dense row) shows itself, and one min/max settles it; any other
@@ -384,7 +384,7 @@ __device__ __forceinline__ void block_select_reg_wide(const uint32_t keys[KPT],
 #define FB_LOADS 4
 #endif
 // Loads in flight per thread in the select passes. One fallback row at M=8
-// N=524288 gaussian: 320 / 294 / 284us at 1 / 2 / 4 (scripts/price_fallback.py).
+// N=524288 gaussian: 320 / 294 / 284us at 1 / 2 / 4.
 // They cost registers, and the fallback shares phase_c's register allocation,
 // so its VGPRs set phase_c's occupancy on every call, fallback or not; that is
 // what PHASE_C_OCCUPANCY below holds.
@@ -395,7 +395,7 @@ __device__ __forceinline__ void block_select_reg_wide(const uint32_t keys[KPT],
 // the wide select pass 0 is already counted during the candidate read, so the
 // skip costs a read of every key and two barriers to save one scan: phase_c at
 // m=4/64/128/256/512 was 9.72/11.24/9.12/9.48/12.60us with it and
-// 8.20/9.76/7.68/8.04/10.08 without (scripts/wide_ab.py arms sk1/sk0). Tracking
+// 8.20/9.76/7.68/8.04/10.08 without. Tracking
 // the min/max during the candidate read instead cost ~1us too (9.12us at m=4).
 // What the skip also bought, the exit on a one-value candidate set (m=256
 // n=524288 --dist inf: 6.1us with it, 11.3 without), block_select_lds_wide now
@@ -408,7 +408,7 @@ __device__ __forceinline__ void block_select_reg_wide(const uint32_t keys[KPT],
 // to 70-82 VGPRs (8 -> 5-7 waves/SIMD) and phase_c from 13.4 to 18.2us at m=512
 // n=131072 and 92 to 149us at m=4096 n=524290 with no row falling back. Pinned to
 // 8 waves/SIMD it compiles to 64 VGPRs + 20-24 B/lane of scratch, and phase_c's
-// no-fallback time is back within 1.4% (scripts/wide_ab.py arms x0/x1/xs4).
+// no-fallback time is back within 1.4%.
 #ifndef PHASE_C_WAVES
 #define PHASE_C_WAVES 8
 #endif
@@ -446,7 +446,7 @@ __device__ __forceinline__ bool row_prefix_single_value(const float* __restrict_
 
 // block_gather_topk over a row streamed from global memory, a vector at a time:
 // the element-wise form read 12.8 GB/s on one block, 164us of a 330us fallback
-// row at N=524288 (scripts/price_fallback.py). Same emission rule
+// row at N=524288. Same emission rule
 // and the same one atomic per wave per stream; only the load shape differs.
 // Always the bounds-checked loader and `col < len`, so it reads every column of
 // a plain row whatever len % FP32_EPT is.
@@ -1328,8 +1328,7 @@ struct LaunchOverrides
 };
 
 // Every launch decision for one call of the three-kernel pipeline, made in one
-// place so that the dispatch and scripts/census_shape.hip.cpp read the same
-// policy. Every shape runs phase_b_filter_coop + phase_c_select_contig; g = 1
+// place. Every shape runs phase_b_filter_coop + phase_c_select_contig; g = 1
 // is one block per row.
 struct LaunchPlan
 {
@@ -1404,8 +1403,7 @@ static LaunchPlan plan_launch(int M,
 
     // Stream the row data past the caches: every element is read by exactly
     // one block and never again. Priced on rotated inputs, one fresh buffer
-    // per call, same-process dual-module A/B against cached loads
-    // (log/v7/nt_price_load20.json, nt_region_load20.json, nt_interior_v7c1.json):
+    // per call, same-process dual-module A/B against cached loads:
     //
     //   M*N in [2^26, 2^27)  1.032 .. 1.114   M*N = 2^24  0.987 .. 1.021
     //   M*N in [2^25, 2^26)  1.009 .. 1.068   M*N <= 2^23 0.985 .. 1.002
@@ -1418,7 +1416,7 @@ static LaunchPlan plan_launch(int M,
     //
     // The whole gain is phase_b's (phase_b 1.03-1.15, phase_c 0.97-1.02). Stores
     // stay cached below 2^27: NT loads+stores over NT loads alone is 0.970-0.988
-    // at 2^25 and 0.981-1.011 at 2^26 (log/v7/nt_price_both20.json). This
+    // at 2^25 and 0.981-1.011 at 2^26. This
     // assumes the input is not already in the MALL when the op starts.
     const size_t mn = (size_t)M * (size_t)pitch;
     lp.nt           = ov.nt < 0 ? (mn >= ((size_t)1 << NT_LOAD_LOG2)) : (ov.nt != 0);
@@ -1433,7 +1431,7 @@ static LaunchPlan plan_launch(int M,
     lp.wstage_bytes = (size_t)(PB_BLOCK / WAVE_SIZE) * WSTAGE_CAP_COOP * sizeof(uint64_t);
 #endif
     // Batched filter loads only where at most two blocks share a CU: a
-    // prefetch ring cost the bandwidth-bound grids 1-16% (log/v7/price_pbpf*.json).
+    // prefetch ring cost the bandwidth-bound grids 1-16%.
     // The batch never exceeds a thread's loads: dead slots cost 4-7% at 1-2.
     auto batches = [&](int g) {
         const int it = ((n4 + g - 1) / g + PB_BLOCK - 1) / PB_BLOCK;
@@ -1553,7 +1551,7 @@ static void topk_fused_impl(const float* d_in,
         launch_phase_c(std::false_type{});
 }
 
-// aiter op entry for the AVO fp32 per-row top-k kernels.
+// aiter op entry for the sampled fp32 per-row top-k kernels.
 //
 // scripts/export_aiter_op.py appends this file verbatim after the exported
 // kernel region, so the entry and the kernels it calls live in one repo and

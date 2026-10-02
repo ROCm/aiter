@@ -94,7 +94,7 @@ struct RowExtents<false>
 // (numRows, stride0, k) and never sees the extents -- a decline just routes the
 // same arguments to aiter's mb/ob path, which faults on them too.
 //
-// What it prevents, measured by bench/stress_topk.py on the unclamped build:
+// What it prevents, measured on the unclamped build:
 // rowStarts = -8 and rowEnds = INT32_MAX each took a GPU memory fault, and
 // rowEnds = pitch + 64 was worse than a fault -- it returned indices past the
 // pitch with no error at all.
@@ -581,8 +581,7 @@ block_find_pivot_bucket_wave0(uint32_t* __restrict__ s_hist, uint32_t* __restric
 // 12-bit radix digit for the filtered passes, so an exact 32-bit select is
 // 8 + 12 + 12 bits in three passes instead of four, and phase_a's threshold is
 // 8 + 12 bits in two instead of 8 + 8 + 8 in three. A pass costs its barriers
-// and its scan latency, not its data (knowledge/known_bad.md, "What actually
-// sets phase A and phase C cost"), so the lever is the pass count.
+// and its scan latency, not its data, so the lever is the pass count.
 //
 // A flat 4096-bucket scan would give that back: one wave reading 4096 slots, or
 // a block-wide scan with a third barrier. Instead every counted key bumps two

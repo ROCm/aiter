@@ -24,15 +24,15 @@ constexpr int R_TARGET     = 179;
 // small_n stages the WHOLE row in LDS, so N sets its LDS footprint directly and
 // the boundary is a measured occupancy tradeoff, not a capacity one.
 //
-// v8 crossover against the coop pipeline, run_perftest, both entries, small_n
-// time over sampled time (log/v8/snb_*.json, 324 points at N = 8193..16384):
+// Crossover against the coop pipeline, run_perftest, both entries, small_n
+// time over sampled time (324 points at N = 8193..16384):
 //   N <= 9000              0.73-0.99 at every M; 0.71-0.75 at M = 32768..65536,
-//                          where topk_select reaches it (log/v8/sn_prod.json)
+//                          where topk_select reaches it
 //   N = 11000              0.80-0.95 at M <= 768, 0.91-1.17 above
 //   N = 12001..16384       at M <= 256 small_n wins 53 of 96 points; above 256
 //                          it is 0.99 at best (N=12289, M=300..512), up to 1.76;
 //                          at M <= 4 it is 0.95-1.30, rising with N and falling
-//                          with M (log/v8/tinym_*.json, 18 N in that range)
+//                          with M (18 N in that range)
 // Short rows favour small_n: one LDS pass against three kernels and the
 // candidate traffic. Past 9000 a row leaves 3 blocks per CU, which is one round
 // only up to M = 768. At M <= 256 every row has its own CU and small_n holds to
@@ -62,7 +62,7 @@ constexpr double CAP_SAFE_FILL = 0.85;
 // Per-row reservation counters (cand_reserved, cand_bad) sit one 128-byte line
 // apart, in uints. Packed, 32 rows share a line and phase_b's atomicAdds from
 // different rows serialize on it: ATT at M=4 N=131072 puts that atomic at 26.8%
-// of a phase_b block (log/v7/att_smallm/report.md).
+// of a phase_b block.
 #ifndef CTR_STRIDE_OVERRIDE
 #define CTR_STRIDE_OVERRIDE 32
 #endif
@@ -72,7 +72,7 @@ constexpr int CTR_STRIDE = CTR_STRIDE_OVERRIDE;
 // and each drain waits on a global atomicAdd in the middle of the stream: a
 // +inf threshold (nothing passes) prices candidate handling at 7.5 us of
 // phase_b at M=512 N=131072 (coop_g=2, ~181 candidates per wave), of which the
-// epilogue copy is 0.7 us (log/v7/price_ablth.json, price_ablepi.json).
+// epilogue copy is 0.7 us.
 // 576 x 8 B x 8 waves = 36.9 KB keeps 4 512-thread blocks per CU inside 160 KB.
 #ifndef WSTAGE_CAP_COOP_OVERRIDE
 #define WSTAGE_CAP_COOP_OVERRIDE 576
@@ -277,7 +277,7 @@ static inline int occupancy_block_threads(int M, int lds_per_block, int load_cap
 // that M-dependence; a formula that removes the slack has to put the
 // M-dependence back explicitly, and nothing here does.
 //
-// See knowledge/known_bad.md ("A statistically tighter margin fails the gate").
+// A statistically tighter margin was tried and fails the correctness gate.
 static float auto_margin(int K, int S, int N)
 {
     const double r0 = (double)K * S / (double)N;
@@ -470,7 +470,7 @@ static inline int derive_cap(int K, float margin, int S, int N)
 // Snap to a power of two. This used to skip G=2 and G=8 entirely, as a
 // workaround for what was recorded as "coop_g=2 is broken". That diagnosis was
 // wrong: the real fault was an unbounded LDS staging buffer in
-// phase_b_filter_coop (see knowledge/known_bad.md), which corrupted counts at
+// phase_b_filter_coop, which corrupted counts at
 // any G once a wave produced more passers than its staging held. With that fixed,
 // every G from 1 to 256 gives identical, correct candidate counts, so the
 // restriction is gone and G is a free tuning knob again.
@@ -491,9 +491,9 @@ static inline int snap_coop_g(int g, int max_g)
 // metric itself -- run_perftest device time, cold inputs, both entries -- from G
 // curves measured at 1270 (M, N) points: per row M = 2^r and 1.25 / 1.5 / 1.75 x
 // 2^r, per column its lower edge and an odd midpoint, every G within two steps
-// of the previous table's timed against it (scripts/coop_curves.py,
-// log/v8/curves/). Per cell, the base with the smallest worst-point regret among
-// those within 1% of the best geomean (scripts/coop_fit_policy.py). Minimax
+// of the previous table's timed against it. Per cell,
+// the base with the smallest worst-point regret among those within 1% of the
+// best geomean. Minimax
 // because a cell serves EVERY shape in it: argmin at one N is how M=1024 col11
 // once came out as G=1, which led G=16 by 0.2% at N=786432 and lost 12.6% at
 // N=1048572. Against the best measured G: 0.25% geomean, p90 1.0%, worst 6.2%;
@@ -612,9 +612,9 @@ static inline int choose_coop_g(int M, int N, int n4_per_row, int block, int ove
     return g;
 }
 
-// A per-region radix scan form (rep vs wave0) was tried in v4 Stage 2 and is
+// A per-region radix scan form (rep vs wave0) was tried and is
 // FALSIFIED: once coop_g > 1 reaches the anchor band, the two forms are
-// indistinguishable. See knowledge/known_bad.md.
+// indistinguishable.
 
 static inline ShapeParams derive_shape_params(int M,
                                               int N,
@@ -727,7 +727,7 @@ static inline ShapeParams derive_shape_params(int M,
     p.cap    = cap;
     // Indices stay in LDS whenever phase_c runs one block per CU: keys-only
     // re-reads every index from global inside the gather, which ATT puts at
-    // 22-25% of a small-M phase_c block (log/v7/att_smallm/report.md, PC-3).
+    // 22-25% of a small-M phase_c block.
     // cap 8192 with indices is 64 KB + static + two wide buffers ~ 106 KB.
     p.keys_only_c = cap > PHASE_C_CAP && grid_blocks_per_cu(M) > 1;
     p.geom_ok     = sampling_geometry_ok(N, S) && K <= cap;
