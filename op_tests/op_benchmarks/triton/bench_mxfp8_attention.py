@@ -105,7 +105,6 @@ def benchmark(args):
             v_scale=v_scale,
             sm_scale=sm_scale,
             causal=causal,
-            use_mxfp8=True,
             block_m=64,
             block_n=64,
             quant_block_size=quant_block_size,

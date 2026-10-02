@@ -3,11 +3,8 @@
 
 """Correctness tests for the MXFP8 Flash Attention v2 kernel.
 
-Covers:
-  * non-quantized forward (use_mxfp8=False) vs PyTorch
-  * quantized forward (use_mxfp8=True, e4m3 + e8m0 2D block scales)
-  * backward (preprocess / dq / dkdv) with and without MXFP8, including GQA
-    and causal masks.
+Covers quantized forward and backward (e4m3 + e8m0 2D block scales),
+including GQA and causal masks. bf16 only.
 
 Only runs on gfx950 (CDNA4).
 """
@@ -51,12 +48,6 @@ def _ref_attention(q, k, v, causal=False, sm_scale=None):
         scores = scores.masked_fill(~mask, float("-inf"))
     p = torch.softmax(scores, dim=-1)
     return torch.einsum("bhmn,bhnd->bhmd", p, v.float()).to(q.dtype)
-
-
-def _dummy_scales(b, h, s, d, quant_block_size, device):
-    """Dummy e8m0 scales (all 127 = 1.0) for the use_mxfp8=False path."""
-    scale_blocks = (d + quant_block_size - 1) // quant_block_size
-    return torch.full((b, h, s, scale_blocks), 127, dtype=torch.uint8, device=device)
 
 
 def _quantize_bshd(x, quant_block_size=_QUANT_BLOCK):
@@ -122,7 +113,6 @@ def _fwd(
     v_scale,
     sm_scale,
     causal,
-    use_mxfp8,
     quant_block_size=_QUANT_BLOCK,
 ):
     return mxfp8_attention_forward(
@@ -134,56 +124,10 @@ def _fwd(
         v_scale=v_scale,
         sm_scale=sm_scale,
         causal=causal,
-        use_mxfp8=use_mxfp8,
         block_m=64,
         block_n=64,
         quant_block_size=quant_block_size,
         layout="bshd",
-    )
-
-
-@pytest.mark.parametrize(
-    "B, H, S, D",
-    [
-        (1, 4, 64, 64),
-        (2, 8, 128, 128),
-        (1, 4, 64, 128),
-    ],
-)
-@pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_mxfp8_attn_fwd_nofp8(B, H, S, D, causal, dtype):
-    """mxfp8_attention_forward with use_mxfp8=False matches PyTorch reference."""
-    torch.manual_seed(0)
-    sm_scale = 1.0 / math.sqrt(D)
-
-    q = torch.randn(B, S, H, D, dtype=dtype, device="cuda") * 0.1
-    k = torch.randn(B, S, H, D, dtype=dtype, device="cuda") * 0.1
-    v = torch.randn(B, S, H, D, dtype=dtype, device="cuda") * 0.1
-
-    q_scale = _dummy_scales(B, H, S, D, _QUANT_BLOCK, "cuda")
-    k_scale = _dummy_scales(B, H, S, D, _QUANT_BLOCK, "cuda")
-    v_scale = _dummy_scales(B, H, S, D, _QUANT_BLOCK, "cuda")
-
-    out, _lse, _ = _fwd(
-        q, k, v, q_scale, k_scale, v_scale, sm_scale, causal, use_mxfp8=False
-    )
-
-    ref = _ref_attention(
-        _bshd_to_bhsd(q),
-        _bshd_to_bhsd(k),
-        _bshd_to_bhsd(v),
-        causal=causal,
-        sm_scale=sm_scale,
-    )
-    ref = _bhsd_to_bshd(ref)
-
-    torch.testing.assert_close(
-        out.float(),
-        ref.float(),
-        atol=1e-2,
-        rtol=1e-2,
-        msg=f"Mismatch at (B={B},H={H},S={S},D={D},causal={causal})",
     )
 
 
@@ -196,7 +140,7 @@ def test_mxfp8_attn_fwd_nofp8(B, H, S, D, causal, dtype):
 )
 @pytest.mark.parametrize("causal", [False, True])
 def test_mxfp8_attn_fwd_quantized(B, HQ, HK, S, D, causal):
-    """use_mxfp8=True forward matches PyTorch on dequantized Q/K/V."""
+    """MXFP8 forward matches PyTorch on dequantized Q/K/V."""
     torch.manual_seed(0)
     dtype = torch.bfloat16
     sm_scale = 1.0 / math.sqrt(D)
@@ -209,9 +153,7 @@ def test_mxfp8_attn_fwd_quantized(B, HQ, HK, S, D, causal):
     k, k_scale = _quantize_bshd(k_hp)
     v, v_scale = _quantize_bshd(v_hp)
 
-    out, _lse, _ = _fwd(
-        q, k, v, q_scale, k_scale, v_scale, sm_scale, causal, use_mxfp8=True
-    )
+    out, _lse, _ = _fwd(q, k, v, q_scale, k_scale, v_scale, sm_scale, causal)
 
     q_dq = _dequantize_bshd(q, q_scale, dtype)
     k_dq = _dequantize_bshd(k, k_scale, dtype)
@@ -242,40 +184,25 @@ def test_mxfp8_attn_fwd_quantized(B, HQ, HK, S, D, causal):
     ],
 )
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("use_mxfp8", [False, True])
-def test_mxfp8_attn_bwd(B, HQ, HK, S, D, causal, use_mxfp8):
-    """mxfp8_attention_backward matches autograd on (de)quantized Q/K/V.
-
-    use_mxfp8=True exercises preprocess (do MXFP8), dq, and dkdv kernels.
-    use_mxfp8=False still launches those three kernels on the non-quant path.
-    """
+def test_mxfp8_attn_bwd(B, HQ, HK, S, D, causal):
+    """mxfp8_attention_backward matches autograd on dequantized Q/K/V."""
     torch.manual_seed(1)
     dtype = torch.bfloat16
     sm_scale = 1.0 / math.sqrt(D)
+    atol, rtol = 3.5e-1, 3.5e-1
 
     q_hp = torch.randn(B, S, HQ, D, dtype=dtype, device="cuda") * 0.1
     k_hp = torch.randn(B, S, HK, D, dtype=dtype, device="cuda") * 0.1
     v_hp = torch.randn(B, S, HK, D, dtype=dtype, device="cuda") * 0.1
 
-    if use_mxfp8:
-        q, q_scale = _quantize_bshd(q_hp)
-        k, k_scale = _quantize_bshd(k_hp)
-        v, v_scale = _quantize_bshd(v_hp)
-        q_ref = _dequantize_bshd(q, q_scale, torch.float32)
-        k_ref = _dequantize_bshd(k, k_scale, torch.float32)
-        v_ref = _dequantize_bshd(v, v_scale, torch.float32)
-        atol, rtol = 3.5e-1, 3.5e-1
-    else:
-        q, k, v = q_hp, k_hp, v_hp
-        q_scale = _dummy_scales(B, HQ, S, D, _QUANT_BLOCK, "cuda")
-        k_scale = _dummy_scales(B, HK, S, D, _QUANT_BLOCK, "cuda")
-        v_scale = _dummy_scales(B, HK, S, D, _QUANT_BLOCK, "cuda")
-        q_ref, k_ref, v_ref = q.float(), k.float(), v.float()
-        atol, rtol = 8e-2, 8e-2
+    q, q_scale = _quantize_bshd(q_hp)
+    k, k_scale = _quantize_bshd(k_hp)
+    v, v_scale = _quantize_bshd(v_hp)
+    q_ref = _dequantize_bshd(q, q_scale, torch.float32)
+    k_ref = _dequantize_bshd(k, k_scale, torch.float32)
+    v_ref = _dequantize_bshd(v, v_scale, torch.float32)
 
-    o, lse, _ = _fwd(
-        q, k, v, q_scale, k_scale, v_scale, sm_scale, causal, use_mxfp8=use_mxfp8
-    )
+    o, lse, _ = _fwd(q, k, v, q_scale, k_scale, v_scale, sm_scale, causal)
     do = torch.randn_like(o, dtype=dtype) * 0.1
 
     dq, dk, dv = mxfp8_attention_backward(
@@ -293,7 +220,6 @@ def test_mxfp8_attn_bwd(B, HQ, HK, S, D, causal, use_mxfp8):
         v_scale=v_scale,
         sm_scale=sm_scale,
         causal=causal,
-        use_mxfp8=use_mxfp8,
         quant_block_size=_QUANT_BLOCK,
         layout="bshd",
     )
@@ -308,7 +234,7 @@ def test_mxfp8_attn_bwd(B, HQ, HK, S, D, causal, use_mxfp8):
     dk_ref = _bhsd_to_bshd(k_t.grad)
     dv_ref = _bhsd_to_bshd(v_t.grad)
 
-    tag = f"(B={B},HQ={HQ},HK={HK},S={S},D={D},causal={causal},mxfp8={use_mxfp8})"
+    tag = f"(B={B},HQ={HQ},HK={HK},S={S},D={D},causal={causal})"
     torch.testing.assert_close(
         dq.float(), dq_ref.float(), atol=atol, rtol=rtol, msg=f"dq mismatch {tag}"
     )
