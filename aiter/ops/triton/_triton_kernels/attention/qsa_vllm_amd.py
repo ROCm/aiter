@@ -503,8 +503,8 @@ def qsa_mqa_paged(
 
     capacity = page_table.shape[1] * k_cache.shape[1]
     columns = capacity if num_columns is None else num_columns
-    logits = torch.empty((q.shape[0], columns), dtype=torch.float32, device=q.device)
-    visible_blocks = torch.empty(q.shape[0], dtype=torch.int32, device=q.device)
+    logits = torch.zeros((q.shape[0], columns), dtype=torch.float32, device=q.device)
+    visible_blocks = torch.zeros(q.shape[0], dtype=torch.int32, device=q.device)
     if not q.shape[0] or not columns:
         return logits, visible_blocks
     block_n = 32
