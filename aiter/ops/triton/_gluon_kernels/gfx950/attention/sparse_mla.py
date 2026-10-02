@@ -1981,7 +1981,7 @@ def _mxfp8(x, scale_ptr, h0, num_heads):
 
 
 @gluon.jit
-def _out_store(
+def _epilogue_store(
     x,
     out_ptr,
     out_stride0,
@@ -1999,24 +1999,22 @@ def _out_store(
     INV_ROPE: gl.constexpr,
     OUT_MXFP8: gl.constexpr,
 ):
-    """Store rows x [M, D] of one query row, heads h0 onwards. With INV_ROPE or
-    OUT_MXFP8 they are stored as vLLM's passes before wo_a leave them
-    (rocm_inverse_rope_rows_, rocm_inverse_rope_mxfp8_rows): rotated back by the
-    inverse RoPE, and quantized to e4m3 with one E8M0 byte per 32 lanes. The rows
-    are rounded to bf16 first, as the unfused path stores them, which also halves
-    the move into work_l."""
+    """Store rows x [M, D] of one query row, heads h0 onwards, as vLLM's passes
+    before wo_a leave them (rocm_inverse_rope_rows_, rocm_inverse_rope_mxfp8_rows):
+    rotated back by the inverse RoPE (INV_ROPE), and quantized to e4m3 with one
+    E8M0 byte per 32 lanes (OUT_MXFP8). The rows are rounded to bf16 first, as the
+    unfused path stores them, which also halves the move into work_l."""
     M: gl.constexpr = x.shape[0]
     D: gl.constexpr = x.shape[1]
-    if INV_ROPE or OUT_MXFP8:
-        if INV_ROPE:
-            # The position is read before the move into work_l, which hides its
-            # latency.
-            cs_row = cs_ptr + gl.load(pos_ptr + row).to(gl.int64) * cs_stride
-        x = gl.convert_layout(x.to(gl.bfloat16), work_l).to(gl.float32)
-        if INV_ROPE:
-            x = _inv_rope(x, cs_row, ROPE_DIM)
-        if OUT_MXFP8:
-            x = _mxfp8(x, scale_ptr + row * scale_stride0, h0, num_heads)
+    if INV_ROPE:
+        # The position is read before the move into work_l, which hides its
+        # latency.
+        cs_row = cs_ptr + gl.load(pos_ptr + row).to(gl.int64) * cs_stride
+    x = gl.convert_layout(x.to(gl.bfloat16), work_l).to(gl.float32)
+    if INV_ROPE:
+        x = _inv_rope(x, cs_row, ROPE_DIM)
+    if OUT_MXFP8:
+        x = _mxfp8(x, scale_ptr + row * scale_stride0, h0, num_heads)
     hs = h0 + gl.arange(0, M, layout=gl.SliceLayout(1, x.type.layout))
     ds = gl.arange(0, D, layout=gl.SliceLayout(0, x.type.layout))
     gl.amd.cdna4.buffer_store(
@@ -2631,29 +2629,44 @@ def _sparse_mla(
             m_final = m_pv
             l_final = l_pv
         one_over_l = 1.0 / l_final
-        # The epilogue works on 32 consecutive lanes per thread, so lane pairs
-        # and scale groups stay in registers.
-        EPI_L: gl.constexpr = gl.BlockedLayout(
-            [1, 32], [16, 4], [NUM_WARPS // cfg.N_WARPS, cfg.N_WARPS], [1, 0]
-        )
-        _out_store(
-            acc * one_over_l[:, None],
-            out_ptr,
-            out_stride0,
-            out_stride1,
-            query_idx,
-            h_off,
-            num_heads,
-            EPI_L,
-            pos_ptr,
-            cos_sin_ptr,
-            cs_stride,
-            out_scale_ptr,
-            os_stride0,
-            ROPE_DIM,
-            INV_ROPE,
-            OUT_MXFP8,
-        )
+        out = acc * one_over_l[:, None]
+        if INV_ROPE or OUT_MXFP8:
+            # The epilogue works on 32 consecutive lanes per thread, so lane pairs
+            # and scale groups stay in registers.
+            EPI_L: gl.constexpr = gl.BlockedLayout(
+                [1, 32], [16, 4], [NUM_WARPS // cfg.N_WARPS, cfg.N_WARPS], [1, 0]
+            )
+            _epilogue_store(
+                out,
+                out_ptr,
+                out_stride0,
+                out_stride1,
+                query_idx,
+                h_off,
+                num_heads,
+                EPI_L,
+                pos_ptr,
+                cos_sin_ptr,
+                cs_stride,
+                out_scale_ptr,
+                os_stride0,
+                ROPE_DIM,
+                INV_ROPE,
+                OUT_MXFP8,
+            )
+        else:
+            offs_d_o = gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(0, cfg.pv_layout))
+            o_off = (
+                query_idx * out_stride0
+                + h_pv[:, None] * out_stride1
+                + offs_d_o[None, :]
+            ).to(gl.int32)
+            gl.amd.cdna4.buffer_store(
+                out.to(out_ptr.dtype.element_ty),
+                ptr=out_ptr,
+                offsets=o_off,
+                mask=head_mask_pv[:, None],
+            )
         if HAS_LSE:
             # m is base-2, so sum_j exp(s_j) = 2^m * l and ln of it is
             # (m + log2 l) * ln2. A fully masked row keeps -inf, not NaN.
@@ -2817,21 +2830,31 @@ def _sparse_mla_reduce(
                 mask=h < num_heads,
             )
         # One reciprocal per row instead of a per-element f32 divide.
-        _out_store(
-            gl.expand_dims(acc * (1.0 / l_final), 0),
-            out_ptr,
-            out_stride0,
-            out_stride1,
-            query_idx,
-            h,
-            num_heads,
-            EPI_L,
-            pos_ptr,
-            cos_sin_ptr,
-            cs_stride,
-            out_scale_ptr,
-            os_stride0,
-            ROPE_DIM,
-            INV_ROPE,
-            OUT_MXFP8,
-        )
+        out = acc * (1.0 / l_final)
+        if INV_ROPE or OUT_MXFP8:
+            _epilogue_store(
+                gl.expand_dims(out, 0),
+                out_ptr,
+                out_stride0,
+                out_stride1,
+                query_idx,
+                h,
+                num_heads,
+                EPI_L,
+                pos_ptr,
+                cos_sin_ptr,
+                cs_stride,
+                out_scale_ptr,
+                os_stride0,
+                ROPE_DIM,
+                INV_ROPE,
+                OUT_MXFP8,
+            )
+        else:
+            o_off = (query_idx * out_stride0 + h * out_stride1 + offs_d).to(gl.int32)
+            gl.amd.cdna4.buffer_store(
+                out.to(out_ptr.dtype.element_ty),
+                ptr=out_ptr,
+                offsets=o_off,
+                mask=(offs_d < HEAD_SIZE) & (h < num_heads),
+            )
