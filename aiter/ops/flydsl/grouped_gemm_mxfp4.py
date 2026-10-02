@@ -94,7 +94,6 @@ def _supports_gfx1250_a_preshuffle_resolved(
     common = all(
         (
             a_is_fp4,
-            stage1_quant_out == 0,
             out_is_f16 == 0,
             has_bias == 0,
             n_experts > 0,
@@ -107,8 +106,17 @@ def _supports_gfx1250_a_preshuffle_resolved(
     if not common:
         return False
     if stage1_act == 1:
-        return K == 7168 and N in (4096, 6144)
-    return stage1_act == 0 and N == 7168 and K in (2048, 3072)
+        return (
+            stage1_quant_out in (0, 1)
+            and K == 7168
+            and N in (4096, 6144)
+        )
+    return (
+        stage1_quant_out == 0
+        and stage1_act == 0
+        and N == 7168
+        and K in (2048, 3072)
+    )
 
 
 def supports_gfx1250_a_preshuffle(

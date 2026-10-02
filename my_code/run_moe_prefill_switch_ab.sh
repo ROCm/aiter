@@ -153,6 +153,12 @@ if [[ ! "$ROUNDS" =~ ^[1-9][0-9]*$ ]]; then
   exit 2
 fi
 
+CUSTOM_CURRENT_MODE="current-fused"
+case "${AITER_FLYDSL_GEMM1_FUSED_QUANT-1}" in
+  1|true|True|TRUE|yes|Yes|YES|on|On|ON) ;;
+  *) CUSTOM_CURRENT_MODE="current-baseline" ;;
+esac
+
 if [[ ! -f /.dockerenv ]]; then
   printf 'This script must be run inside the ROCm container.\n' >&2
   exit 2
@@ -179,7 +185,7 @@ mkdir -p "$LOG_DIR"
 
 RESULTS_TSV="$LOG_DIR/results.tsv"
 SUMMARY_MD="$LOG_DIR/summary.md"
-printf 'data\tround\torder\tcase\tshape\tmode\tgit_commit\treturn_code\tgemm1_us\tgemm1_tflops\tgemm1_rw_tbps\tgemm1_ref_output_hash128\tgemm1_output_hash128\tgemm2_us\tgemm2_tflops\tgemm2_rw_tbps\tgemm2_ref_output_hash128\tgemm2_output_hash128\tmoe_e2e_us\tlogits_diff\trel_l2\tpass\tgemm1_symbol\tgemm2_symbol\tlog_file\n' \
+printf 'data\tround\torder\tcase\tshape\tmode\tgit_commit\treturn_code\tgemm1_us\tquant_us\tgemm1_tflops\tgemm1_rw_tbps\tgemm1_ref_output_hash128\tgemm1_output_hash128\tgemm2_us\tgemm2_tflops\tgemm2_rw_tbps\tgemm2_ref_output_hash128\tgemm2_output_hash128\tmoe_e2e_us\tlogits_diff\trel_l2\tpass\tgemm1_symbol\tgemm2_symbol\tlog_file\n' \
   >"$RESULTS_TSV"
 
 # Common environment for every baseline/optimized case.
@@ -194,6 +200,11 @@ clear_legacy_optimization_env() {
   local var
   while IFS='=' read -r var _; do
     case "$var" in
+      AITER_FLYDSL_GEMM1_FUSED_QUANT)
+        # This is a public pipeline selector for the current-worktree custom
+        # shape mode, not a legacy tuning override.  Preserve an explicit 0 so
+        # the same sources can reproduce the standalone-quant baseline.
+        ;;
       AITER_FLYDSL_GEMM1_*|AITER_FLYDSL_GEMM2_*|AITER_FLYDSL_MXFP4_CLUSTER_*|AITER_TDM_*)
         unset "$var"
         ;;
@@ -230,6 +241,12 @@ cleanup() {
 print_case_environment() {
   local mode="$1"
   local tested_commit="$2"
+  local fused_quant="${AITER_FLYDSL_GEMM1_FUSED_QUANT-1}"
+  local gemm1_pipeline="fused-quant"
+  case "$fused_quant" in
+    1|true|True|TRUE|yes|Yes|YES|on|On|ON) ;;
+    *) gemm1_pipeline="standalone-quant-baseline" ;;
+  esac
 
   printf 'mode=%s\n' "$mode"
   printf 'git_commit=%s\n' "$tested_commit"
@@ -240,6 +257,8 @@ print_case_environment() {
   printf 'AITER_GROUPED_DEBUG=%s\n' "$AITER_GROUPED_DEBUG"
   printf 'AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE=%s\n' \
     "$AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE"
+  printf 'AITER_FLYDSL_GEMM1_FUSED_QUANT=%s\n' "$fused_quant"
+  printf 'gemm1_quant_pipeline=%s\n' "$gemm1_pipeline"
   printf 'legacy_gemm_optimization_env=cleared\n'
 }
 
@@ -297,6 +316,27 @@ print(
 PY
 }
 
+extract_standalone_quant_us() {
+  local log_file="$1"
+  "$PYTHON_BIN" - "$log_file" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+
+text = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
+text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+text = " ".join(text.split())
+number = r"[0-9][0-9,]*(?:\.[0-9]+)?"
+matches = re.findall(
+    rf"moe_quant_preshuffled_a_fd2048_[A-Za-z0-9_]+ "
+    rf"({number}) ({number}) ({number}) ({number}) CUDA",
+    text,
+)
+print(matches[-1][3].replace(",", "") if matches else "0")
+PY
+}
+
 run_case() {
   local case_name="$1"
   local shape="$2"
@@ -312,7 +352,7 @@ run_case() {
     baseline)
       tested_commit="$BASELINE_COMMIT"
       ;;
-    optimized|current)
+    optimized|current|current-baseline|current-fused)
       tested_commit="$OPTIMIZED_COMMIT"
       ;;
     *)
@@ -320,13 +360,14 @@ run_case() {
       return 2
       ;;
   esac
-  if [[ "$mode" != current ]]; then
+  if [[ "$mode" != current && "$mode" != current-baseline \
+        && "$mode" != current-fused ]]; then
     checkout_revision "$tested_commit"
   fi
   tested_commit="$(git_repo rev-parse HEAD)"
 
   local log_file="$LOG_DIR/${data}_r${round}_o${order}_${case_name}.log"
-  local rc gemm1_us gemm2_us moe_e2e_us logits_diff rel_l2 pass
+  local rc gemm1_us quant_us gemm2_us moe_e2e_us logits_diff rel_l2 pass
   local gemm1_tflops gemm1_rw_tbps gemm2_tflops gemm2_rw_tbps
   local gemm1_ref_hash gemm1_out_hash gemm2_ref_hash gemm2_out_hash
   local gemm1_symbol gemm2_symbol
@@ -358,6 +399,7 @@ run_case() {
   set -e
 
   gemm1_us="$(sed -n 's/.*gemm1: device_time_avg=\([0-9.]*\) us.*/\1/p' "$log_file" | tail -1)"
+  quant_us="$(extract_standalone_quant_us "$log_file")"
   gemm2_us="$(sed -n 's/.*gemm2: device_time_avg=\([0-9.]*\) us.*/\1/p' "$log_file" | tail -1)"
   moe_e2e_us="$(sed -n 's/.*fused_moe end-to-end us = \([0-9.]*\).*/\1/p' "$log_file" | tail -1)"
   gemm1_symbol="$(sed -n 's/.*gemm1: device_time_avg=[0-9.]* us count=[0-9]* symbol=//p' "$log_file" | tail -1)"
@@ -370,10 +412,11 @@ run_case() {
     gemm1_tflops gemm1_rw_tbps gemm2_tflops gemm2_rw_tbps \
     < <(extract_precision_metrics "$log_file")
 
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$data" "$round" "$order" "$case_name" "$shape" "$mode" \
     "$tested_commit" "$rc" \
-    "${gemm1_us:-NA}" "${gemm1_tflops:-NA}" "${gemm1_rw_tbps:-NA}" \
+    "${gemm1_us:-NA}" "${quant_us:-0}" \
+    "${gemm1_tflops:-NA}" "${gemm1_rw_tbps:-NA}" \
     "${gemm1_ref_hash:-NA}" "${gemm1_out_hash:-NA}" \
     "${gemm2_us:-NA}" "${gemm2_tflops:-NA}" "${gemm2_rw_tbps:-NA}" \
     "${gemm2_ref_hash:-NA}" "${gemm2_out_hash:-NA}" \
@@ -484,7 +527,8 @@ run_named_case() {
         "$round" "$order" "${E256_COMMAND[@]}" "${data_args[@]}"
       ;;
     custom_current)
-      run_case "$case_name" "$CUSTOM_SHAPE_LABEL" "$data" current \
+      run_case "$case_name" "$CUSTOM_SHAPE_LABEL" "$data" \
+        "$CUSTOM_CURRENT_MODE" \
         "$round" "$order" "${CUSTOM_COMMAND[@]}" "${data_args[@]}"
       ;;
     *)
@@ -497,6 +541,7 @@ run_named_case() {
 write_summary() {
   "$PYTHON_BIN" - "$RESULTS_TSV" <<'PY' >"$SUMMARY_MD"
 import csv
+import os
 import statistics
 import sys
 from collections import defaultdict
@@ -509,6 +554,17 @@ with path.open(newline="", encoding="utf-8") as handle:
 
 if not rows:
     raise SystemExit(0)
+
+fused_quant = os.environ.get("AITER_FLYDSL_GEMM1_FUSED_QUANT", "1")
+pipeline = (
+    "fused-quant"
+    if fused_quant.lower() in {"1", "true", "yes", "on"}
+    else "standalone-quant-baseline"
+)
+print(
+    f"AITER_FLYDSL_GEMM1_FUSED_QUANT={fused_quant} "
+    f"(pipeline={pipeline})\n"
+)
 
 grouped = defaultdict(list)
 data_order = []
@@ -542,36 +598,45 @@ def hashes(case_rows, key):
     return "<br>".join(dict.fromkeys(row[key] for row in case_rows))
 
 
-print(
-    "| data | shape | mode | commit | GEMM1 samples (us) | GEMM1 median us | "
-    "GEMM1 vs baseline | "
-    "GEMM1 TFLOP/s | GEMM1 effective R+W (TB/s) | "
-    "GEMM1 ref out hash128 | GEMM1 out hash128 | "
-    "GEMM2 samples (us) | GEMM2 median us | GEMM2 vs baseline | "
-    "GEMM2 TFLOP/s | GEMM2 effective R+W (TB/s) | "
-    "GEMM2 ref out hash128 | GEMM2 out hash128 | "
-    "MoE e2e samples (us) | MoE e2e median us | MoE e2e vs baseline | "
-    "pass | logits_diff | rel_l2 |"
+headers = (
+    "data", "shape", "mode", "commit", "GEMM1 samples (us)",
+    "GEMM1 median us", "standalone quant samples (us)",
+    "GEMM1 + quant median us", "GEMM1 pipeline vs baseline",
+    "GEMM1 TFLOP/s", "GEMM1 effective R+W (TB/s)",
+    "GEMM1 ref out hash128", "GEMM1 out hash128", "GEMM2 samples (us)",
+    "GEMM2 median us", "GEMM2 vs baseline", "GEMM2 TFLOP/s",
+    "GEMM2 effective R+W (TB/s)", "GEMM2 ref out hash128",
+    "GEMM2 out hash128", "MoE e2e samples (us)", "MoE e2e median us",
+    "MoE e2e vs baseline", "pass", "logits_diff", "rel_l2",
 )
-print(
-    "|---|---|---|---|---|---:|---:|---:|---:|---|---|"
-    "---|---:|---:|---:|---:|---|---|"
-    "---|---:|---:|:---:|---:|---:|"
-)
+print("| " + " | ".join(headers) + " |")
+print("|" + "|".join("---" for _ in headers) + "|")
 
 for data in data_order:
     for shape in shape_order:
         baseline_rows = grouped.get((data, shape, "baseline"), [])
         if baseline_rows:
-            baseline_g1 = statistics.median(values(baseline_rows, "gemm1_us"))
+            baseline_g1_pipeline = statistics.median(
+                [
+                    g1 + quant
+                    for g1, quant in zip(
+                        values(baseline_rows, "gemm1_us"),
+                        values(baseline_rows, "quant_us"),
+                    )
+                ]
+            )
             baseline_g2 = statistics.median(values(baseline_rows, "gemm2_us"))
             baseline_e2e = statistics.median(
                 values(baseline_rows, "moe_e2e_us")
             )
             modes = ("baseline", "optimized")
         else:
-            baseline_g1 = baseline_g2 = baseline_e2e = None
-            modes = ("current",)
+            baseline_g1_pipeline = baseline_g2 = baseline_e2e = None
+            modes = tuple(
+                mode
+                for mode in ("current", "current-baseline", "current-fused")
+                if grouped.get((data, shape, mode))
+            )
 
         for mode in modes:
             case_rows = grouped.get((data, shape, mode), [])
@@ -579,9 +644,12 @@ for data in data_order:
                 continue
 
             g1 = values(case_rows, "gemm1_us")
+            quant = values(case_rows, "quant_us")
+            g1_pipeline = [g1_us + quant_us for g1_us, quant_us in zip(g1, quant)]
             g2 = values(case_rows, "gemm2_us")
             e2e = values(case_rows, "moe_e2e_us")
             g1_med = statistics.median(g1)
+            g1_pipeline_med = statistics.median(g1_pipeline)
             g2_med = statistics.median(g2)
             e2e_med = statistics.median(e2e)
             g1_tflops = statistics.median(values(case_rows, "gemm1_tflops"))
@@ -593,7 +661,9 @@ for data in data_order:
             print(
                 f"| {data} | {shape} | {mode} | {last['git_commit'][:12]} | "
                 f"{samples(g1, 3)} | "
-                f"{g1_med:.3f} | {gain_text(baseline_g1, g1_med)} | "
+                f"{g1_med:.3f} | {samples(quant, 3)} | "
+                f"{g1_pipeline_med:.3f} | "
+                f"{gain_text(baseline_g1_pipeline, g1_pipeline_med)} | "
                 f"{g1_tflops:.1f} | {g1_rw_tbps:.3f} | "
                 f"{hashes(case_rows, 'gemm1_ref_output_hash128')} | "
                 f"{hashes(case_rows, 'gemm1_output_hash128')} | "

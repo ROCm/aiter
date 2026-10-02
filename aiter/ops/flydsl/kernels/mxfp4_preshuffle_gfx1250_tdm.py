@@ -1989,17 +1989,22 @@ def launch_gemm_a8w4_tdm_optimized(
             num_buffers == 4,
             next_stage_on == 1,
             num_waves_per_tensor_tdm == 2,
-            stage1_quant_out == 0,
             out_is_f16 == 0,
             has_bias == 0,
             cluster_n == 4,
             n_experts > 0,
         )
     )
-    fp4_prefill_schedule = common_schedule and K == 7168 and stage1_act == 1
+    fp4_prefill_schedule = (
+        common_schedule
+        and stage1_quant_out in (0, 1)
+        and K == 7168
+        and stage1_act == 1
+    )
     gemm2_schedule = all(
         (
             common_schedule,
+            stage1_quant_out == 0,
             K in (2048, 3072),
             stage1_act == 0,
         )
@@ -2100,8 +2105,17 @@ def launch_gemm_a8w4_tdm_optimized(
     # Each wn subtile produces 8 output cols (4 per kgrp) after silu/swiglu;
     # 4 wn subtiles = 32 output cols = 1 MX block for per-32 scaling.
     WN_PER_MX_BLOCK = 4
+    Q_MX_BLOCKS_PER_WG = tile_n // 64
+    Q_MX_BLOCK_BYTES = 16 * 16
+    Q_ROW_TILE_BYTES = Q_MX_BLOCKS_PER_WG * Q_MX_BLOCK_BYTES
+    Q_M16_TILES = tile_m // 16
 
     _act = f"_act{stage1_act}" if stage1_act else ""
+    _qout = (
+        f"_q{stage1_quant_out}r{quant_wmma_rep}_apreqb16batchs16direct_htv10"
+        if stage1_quant_out
+        else ""
+    )
     _grouped = f"_e{n_experts}" if n_experts > 0 else ""
     _epilogue_batch = f"_eb{epilogue_batch_wn}" if epilogue_batch_wn > 1 else ""
     _relax_cluster_wrap = "_rcw" if relax_cluster_wrap_dscnt else ""
@@ -2115,7 +2129,7 @@ def launch_gemm_a8w4_tdm_optimized(
         "a8w4_tdm_fp4"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
         f"_b{num_buffers}_K{K}"
-        f"{_grouped}{_act}_cn4{_cluster_m}_prefetch{_epilogue_batch}_apre_sh{_b_tdm_th}"
+        f"{_grouped}{_act}{_qout}_cn4{_cluster_m}_prefetch{_epilogue_batch}_apre_sh{_b_tdm_th}"
         f"{_relax_cluster_wrap}_mg4_fc{fence_cover_mma}{_xdl_arb}"
         f"{_wmma_reuse}{_overlap_store}{_output_wave_split}"
     )
@@ -2313,9 +2327,19 @@ def launch_gemm_a8w4_tdm_optimized(
         def lds_view(ptr, shape, stride):
             return fx.Tensor(fx.make_view(ptr, fx.make_layout(shape, stride)))
 
-        lds_load_b32, lds_store_b32 = make_lds_copy_ops(32)
+        lds_load_b32, _lds_store_b32 = make_lds_copy_ops(32)
         _, lds_store_b64 = make_lds_copy_ops(64)
         lds_load_b128, lds_store_b128 = make_lds_copy_ops(128)
+
+        i16_lds_ptr_ty = fx.PointerType.get(
+            elem_ty=fx.Int16.ir_type,
+            address_space=fx.AddressSpace.Shared,
+            alignment=2,
+        )
+
+        def lds_store_b16(lds_base_idx, byte_offset, data):
+            addr = fx.Int32(lds_base_idx) + fx.Int32(byte_offset)
+            fx.ptr_store(fx.Int16(data), fx.inttoptr(i16_lds_ptr_ty, addr))
 
         gA_base = fx.recast_iter(fx.Int8, arg_a)
         gB_base = fx.recast_iter(fx.Int8, arg_b)
@@ -3082,13 +3106,21 @@ def launch_gemm_a8w4_tdm_optimized(
             # The epilogue restages C in this arena. Draining our own tensorcnt
             # suffices: peer multicast loads are pairwise matched with ours.
             pipeline_fence(outstanding=0)
-            STORE_N = (tile_n // 2) if stage1_act else tile_n
+            STORE_N = (
+                tile_n // 4
+                if stage1_quant_out and stage1_act
+                else ((tile_n // 2) if stage1_act else tile_n)
+            )
             # Spread the lane16 rows over LDS banks. The activated BF16/F16
             # prefill path stores b64 per lane: +8 elements gives a four-dword row
             # skew, with kgrp selecting the other two dwords. Passthrough
             # uses b128 and needs the existing eight-dword skew. Quantized
             # output keeps its byte-packed layout. Pad cols never reach GM.
-            STORE_PAD = 8 if fp4_prefill_schedule else (16 if not stage1_act else 0)
+            STORE_PAD = (
+                0
+                if stage1_quant_out and stage1_act
+                else (8 if fp4_prefill_schedule else (16 if not stage1_act else 0))
+            )
             STORE_PITCH = STORE_N + STORE_PAD
             neg_limit = fx.Float32(0.0) - f32_swiglu_limit
             oc = fx.Float16 if out_is_f16 else fx.BFloat16
@@ -3139,13 +3171,57 @@ def launch_gemm_a8w4_tdm_optimized(
                     )
                     fx.copy(atom_half, src_half, gt_half)
 
+            def issue_quant_output():
+                """Store FP4 payload in GEMM2's A-preshuffle layout."""
+                payload_bytes_per_row = fx.Int64(i32_n) // 4
+                global_row_tile_stride = payload_bytes_per_row * 16
+                global_off = (
+                    (fx.Int64(blk_m) // 16) * global_row_tile_stride
+                    + (fx.Int64(blk_n) // 64) * Q_MX_BLOCK_BYTES
+                )
+                c_iter = fx.recast_iter(fx.Int8, fx.get_iter(arg_c))
+                gt_quant = global_view(
+                    c_iter,
+                    global_off,
+                    (Q_M16_TILES, Q_MX_BLOCKS_PER_WG, Q_MX_BLOCK_BYTES),
+                    (
+                        global_row_tile_stride,
+                        Q_MX_BLOCK_BYTES,
+                        1,
+                    ),
+                )
+                atom_quant = fx.rocdl.make_tdm_atom(
+                    gt_quant,
+                    [None, None, None],
+                    strides=[
+                        global_row_tile_stride,
+                        Q_MX_BLOCK_BYTES,
+                        None,
+                    ],
+                    num_warps=num_waves,
+                    cache_modifier=2,
+                )
+                src_quant = lds_view(
+                    fx.recast_iter(fx.Int8, base_ptr),
+                    (Q_M16_TILES, Q_MX_BLOCKS_PER_WG, Q_MX_BLOCK_BYTES),
+                    (Q_ROW_TILE_BYTES, Q_MX_BLOCK_BYTES, 1),
+                )
+                fx.copy(atom_quant, src_quant, gt_quant)
+
             # -- Activate + stage to LDS --
             if const_expr(stage1_quant_out and stage1_act):
-                # Fused silu/swiglu -> fp8 quant; payload to LDS, scale to global.
+                # Fused SiLU -> BF16-rounded FP4 quant. Payload is staged in
+                # GEMM2's A-preshuffle layout; ScaleA uses the matching
+                # shuffle_scale_f4 layout directly in global memory.
                 i32_ptr_g = fx.PointerType.get(
                     elem_ty=fx.Int8.ir_type,
                     address_space=fx.AddressSpace.Global,
                     alignment=1,
+                )
+                i16_ptr_g = fx.PointerType.get(
+                    elem_ty=fx.Int16.ir_type,
+                    address_space=fx.AddressSpace.Global,
+                    alignment=2,
                 )
                 scale_ptr = fx.recast_iter(i32_ptr_g, fx.get_iter(arg_quant_scale))
                 is_kgrp0 = fx.Int32(kgrp) == fx.Int32(0)
@@ -3153,9 +3229,8 @@ def launch_gemm_a8w4_tdm_optimized(
                 # output has half as many columns and one scale dword per K128.
                 q_dst_scale_dwpr = i32_n // 256
 
-                v2i32_ty = T.vec(2, T.i32)
-                QRPT_LOG2 = int(math.log2(QUANT_ROWS_PER_TILE))
                 N_MX_BLKS = wmma_n_rep // WN_PER_MX_BLOCK
+                assert N_MX_BLKS == 2
                 for wm in range_constexpr(wmma_m_rep):
                     # A 16-row block entirely past this expert's valid rows has its
                     # output OOB-clamped away, so skip its work. Wave-uniform, so
@@ -3163,72 +3238,125 @@ def launch_gemm_a8w4_tdm_optimized(
                     if wmb + wm * 16 < mn_oob:
                         row_rel = wmb + wm * 16 + lane16
                         row_i32 = fx.Int32(blk_m + row_rel)
-                        scale_tile = row_i32 >> QRPT_LOG2
-                        row_in_tile = row_i32 & (QUANT_ROWS_PER_TILE - 1)
+                        scale_tile = row_i32 // QUANT_ROWS_PER_TILE
+                        row_in_tile = (
+                            wm * 16 + lane16
+                            if QUANT_ROWS_PER_TILE == warp_tile_m
+                            else row_i32 - scale_tile * QUANT_ROWS_PER_TILE
+                        )
                         wmma_row = row_in_tile >> 4
                         scale_lane = row_in_tile & 15
+
+                        # Match the tuned BF16 epilogue's eight-WN activation
+                        # batch so TRANS work from both MX blocks overlaps.
+                        row_pairs = []
+                        for wn in range_constexpr(wmma_n_rep):
+                            acc = Vec(accs[wm * wmma_n_rep + wn])
+                            for p in range_constexpr(4):
+                                row_pairs.append((acc[2 * p], acc[2 * p + 1]))
+                        row_vals = batched_silu_swiglu(
+                            row_pairs,
+                            swiglu=False,
+                            limit_f32=f32_swiglu_limit,
+                            neg_limit_f32=neg_limit,
+                            range_constexpr=range_constexpr,
+                        )
 
                         e8m0_bytes = []
                         mx_blk_is = []
                         for mx_blk in range_constexpr(N_MX_BLKS):
-                            # Gather (gate, up) pairs for this MX block.
-                            pairs = []
-                            for sub_wn in range_constexpr(WN_PER_MX_BLOCK):
-                                wn = mx_blk * WN_PER_MX_BLOCK + sub_wn
-                                acc = Vec(accs[wm * wmma_n_rep + wn])
-                                for p in range_constexpr(4):
-                                    pairs.append((acc[2 * p], acc[2 * p + 1]))
+                            value_base = mx_blk * WN_PER_MX_BLOCK * 4
+                            all_vals = [
+                                row_vals[value_base + i]
+                                for i in range_constexpr(WN_PER_MX_BLOCK * 4)
+                            ]
 
-                            all_vals = batched_silu_swiglu(
-                                pairs,
-                                swiglu=False,
-                                limit_f32=f32_swiglu_limit,
-                                neg_limit_f32=neg_limit,
-                                range_constexpr=range_constexpr,
-                            )
-
+                            # The old two-kernel path materializes BF16 before
+                            # quantization. Preserve that rounding point exactly.
+                            all_vals_bf16 = Vec.from_elements(
+                                all_vals, fx.Float32
+                            ).to(fx.BFloat16)
+                            scale_vals = all_vals_bf16.to(fx.Float32)
                             scale_f32, e8m0_byte = emit_amax_e8m0_native_scale(
-                                all_vals, wave_size=WAVE, dtype=MxDtype.FP8_E4M3
+                                [
+                                    scale_vals[i]
+                                    for i in range_constexpr(
+                                        WN_PER_MX_BLOCK * 4
+                                    )
+                                ],
+                                wave_size=WAVE,
+                                dtype=MxDtype.FP4_E2M1,
                             )
                             mx_col = blk_n + wnb + mx_blk * WN_PER_MX_BLOCK * 16
                             mx_blk_i = fx.Int32(mx_col) >> 6
                             e8m0_bytes.append(e8m0_byte)
                             mx_blk_is.append(mx_blk_i)
 
+                            local_m16 = wave_m * wmma_m_rep + wm
+                            local_mx = wave_n * N_MX_BLKS + mx_blk
+                            payload_byte = (
+                                (local_m16 * Q_MX_BLOCKS_PER_WG + local_mx)
+                                * Q_MX_BLOCK_BYTES
+                                + lane16 * 16
+                            )
+                            # Each kgrp owns two bytes per WN. Pair two WNs for
+                            # one pk8 conversion, then split the packed dword into
+                            # the two non-adjacent 16-bit segments owned by this
+                            # kgrp. This removes the peer shuffles and halves the
+                            # number of native FP4 conversion instructions.
                             for half in range_constexpr(WN_PER_MX_BLOCK // 2):
-                                src_f32 = Vec.from_elements(
-                                    all_vals[half * 8 : half * 8 + 8],
-                                    fx.Float32,
-                                ).ir_value()
-                                packed_v2i32 = emit_cvt_scalef32_pk8_fp8_f32(
-                                    src_f32, scale_f32, v2i32_ty=v2i32_ty, rocdl=rocdl
+                                sub_wn0 = half * 2
+                                sub_wn1 = sub_wn0 + 1
+                                src_bf16 = Vec.from_elements(
+                                    [
+                                        all_vals_bf16[sub_wn0 * 4 + i]
+                                        for i in range_constexpr(4)
+                                    ]
+                                    + [
+                                        all_vals_bf16[sub_wn1 * 4 + i]
+                                        for i in range_constexpr(4)
+                                    ],
+                                    fx.BFloat16,
                                 )
-                                for sub in range_constexpr(2):
-                                    sub_wn = half * 2 + sub
-                                    wn = mx_blk * WN_PER_MX_BLOCK + sub_wn
-                                    packed_i32 = Vec(packed_v2i32)[sub]
-                                    col_fp8 = (wnb + wn * 16 + kgrp * 8) // 2
-                                    lds_store_b32(
-                                        stC_idx,
-                                        row_rel * STORE_N + col_fp8,
-                                        Vec.from_elements([packed_i32], fx.Int32),
-                                    )
+                                packed_i32 = emit_cvt_scalef32_pk8_fp4_bf16(
+                                    src_bf16.ir_value(), scale_f32, i32_ty=T.i32
+                                )
+                                lds_store_b16(
+                                    stC_idx,
+                                    payload_byte + sub_wn0 * 4 + kgrp * 2,
+                                    packed_i32,
+                                )
+                                lds_store_b16(
+                                    stC_idx,
+                                    payload_byte + sub_wn1 * 4 + kgrp * 2,
+                                    packed_i32 >> fx.Int32(16),
+                                )
 
                         # Preshuffled e8m0 scale: one branch per wm (not per mx_blk).
                         if row_rel < mn_oob and is_kgrp0:
-                            for mx_blk in range_constexpr(N_MX_BLKS):
-                                scale_dw = mx_blk_is[mx_blk] >> 2
-                                byte_in_dw = mx_blk_is[mx_blk] & 3
-                                dst_byte = (
-                                    (
-                                        (scale_tile * q_dst_scale_dwpr + scale_dw)
-                                        * quant_wmma_rep
-                                        + wmma_row
-                                    )
-                                    * 16
-                                    + scale_lane
-                                ) * 4 + byte_in_dw
-                                fx.ptr_store(e8m0_bytes[mx_blk], scale_ptr + dst_byte)
+                            scale_dw = mx_blk_is[0] >> 2
+                            byte_in_dw = mx_blk_is[0] & 3
+                            dst_byte = (
+                                (
+                                    (scale_tile * q_dst_scale_dwpr + scale_dw)
+                                    * quant_wmma_rep
+                                    + wmma_row
+                                )
+                                * 16
+                                + scale_lane
+                            ) * 4 + byte_in_dw
+                            packed_scale = fx.Int32(
+                                arith.extui(T.i32, _raw(e8m0_bytes[0]))
+                            ) | (
+                                fx.Int32(arith.extui(T.i32, _raw(e8m0_bytes[1])))
+                                << fx.Int32(8)
+                            )
+                            fx.ptr_store(
+                                fx.Int16(packed_scale),
+                                fx.recast_iter(i16_ptr_g, scale_ptr + dst_byte),
+                            )
+                workgroup_barrier()
+                issue_quant_output()
             else:
                 # bf16/f16 activation (or passthrough) -> stage to LDS.
                 if const_expr(has_bias):
@@ -3316,7 +3444,8 @@ def launch_gemm_a8w4_tdm_optimized(
                                 )
                     if const_expr(wm + 1 == OUTPUT_SPLIT_WM):
                         issue_output_slice(0, OUTPUT_SPLIT_WM)
-            issue_output_slice(OUTPUT_SPLIT_WM, wmma_m_rep - OUTPUT_SPLIT_WM)
+            if const_expr(not (stage1_quant_out and stage1_act)):
+                issue_output_slice(OUTPUT_SPLIT_WM, wmma_m_rep - OUTPUT_SPLIT_WM)
             tdm_ops.tensor_wait(0)
 
     m_tiles = (i32_m + (tile_m - 1)) // tile_m
