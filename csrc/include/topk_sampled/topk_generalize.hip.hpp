@@ -476,13 +476,94 @@ phase_c_select_contig(const float* __restrict__ input,
     __shared__ uint32_t s_mm[2 * MAX_WAVES_PER_BLOCK];
     __shared__ unsigned s_wgt, s_weq;
 
-    int* out        = dst.idx_row(row, K);
-    float* val      = dst.val_row(row, K);
-    const int k_out = RAGGED ? k_take_dev(K, len) : K;
+    int* out             = dst.idx_row(row, K);
+    float* val           = dst.val_row(row, K);
+    const int k_out      = RAGGED ? k_take_dev(K, len) : K;
+    const uint64_t* base = cand_pack + (size_t)row * cap;
+
+    // ATT puts s_waitcnt vmcnt(0) at 20.8% of phase_c's traced latency here, but
+    // unrolling this loop is worth nothing: measured at depth 1, 2, 4 and 8,
+    // phase_c reads 14.24, 14.27, 14.40 and 14.31us at m=512 n=131072. The trace
+    // shows four separate load sites already, and c is about 2867 against a
+    // 1024-thread block, so there are three iterations and nothing left to
+    // overlap. The wait is the latency of the read itself.
+    // Count pass 0's digits while the candidates are being read, the same trade
+    // phase_a's sampler takes. Pass 1 of phase_c's select is the expensive one --
+    // the only unfiltered scan of all c keys, measured at 4.38us against 1.62 /
+    // 1.16 / 1.12 for passes 2, 3 and 4 at m=512 n=131072 -- and the keys are
+    // already in registers here.
+    const int fold_rep = threadIdx.x & (HIST_REP - 1);
+    auto take_cand     = [&](uint64_t p, int i) {
+        const uint32_t kk = fp32_to_sortable_bits((uint32_t)(p >> 32));
+        s_keys_ext[i]     = kk;
+        if(!keys_only)
+            s_idx[i] = (int)(uint32_t)p;
+        // radix_shift(0) is 24, so pass 0's digit is the top byte.
+        atomicAdd(&s_hist[(kk >> 24) * HIST_REP + fold_rep], 1u);
+    };
+    auto read_cands = [&](int c) {
+        clear_hist(s_hist);
+        __syncthreads();
+        // Published by the barrier after the read. Folding the first wide pass's
+        // digits into this read as well, the way pass 0's are, was measured and is
+        // SLOWER: phase_c +0.2 to +1.0us over the unfolded wide select at m=64..512
+        // (scripts/wide_ab.py, arms acF against acN), against -0.3 to -0.4us unfolded.
+        if(nwide > 0)
+            clear_wide(s_wide, wide_buffer_count(nwide, REUSE_WIDE));
+        // PC_B candidate loads per thread go out before the first is used; with one
+        // block per CU nothing else hides their round trips.
+        constexpr int PC_B = 4;
+        for(int i0 = threadIdx.x; i0 < c; i0 += PC_B * (int)blockDim.x)
+        {
+            uint64_t pv[PC_B];
+#pragma unroll
+            for(int u = 0; u < PC_B; u++)
+            {
+                const int i = i0 + u * (int)blockDim.x;
+                pv[u]       = i < c ? base[i] : 0ull;
+            }
+#pragma unroll
+            for(int u = 0; u < PC_B; u++)
+            {
+                const int i = i0 + u * (int)blockDim.x;
+#if PC_BATCH_MUTANT // gate self-test only: never stores a batch's last candidate
+                if(i < c && u != PC_B - 1)
+                    take_cand(pv[u], i);
+#else
+                if(i < c)
+                    take_cand(pv[u], i);
+#endif
+            }
+        }
+        __syncthreads();
+    };
+
     // len <= K routes unconditionally so the identity emit cannot be diverted by
     // a cand_count the +inf threshold let through.
-    int c_band = (int)c_raw;
-    if((RAGGED && len <= K) || c_raw < (unsigned)k_out || c_raw > (unsigned)cap)
+    int c          = (int)c_raw;
+    bool fall_back = (RAGGED && len <= K) || c_raw < (unsigned)k_out || c_raw > (unsigned)cap;
+    if(!fall_back)
+    {
+        read_cands(c);
+        // phase_b's `!(v < th)` keeps a NaN of either sign, and a negative one ranks
+        // below -INF, so NaNs can pad a row whose candidates at or above the
+        // threshold fell short of k_out past the undershoot test above. Pass 0's
+        // bucket 0 holds every key below 0x01000000: the negative NaNs, -INF and
+        // anything at or below -2^127. If the k-th key is down there the row goes to
+        // the whole-row select. No per-candidate work: the bucket was counted by the
+        // read, and checking each candidate in phase_b's drain instead cost phase_b
+        // 2 to 8% at m <= 256. The fallback comes after this read rather than in a
+        // loop around it, which would keep its inputs live through the select.
+        unsigned low = 0u;
+        for(int r = 0; r < HIST_REP; r++)
+            low += s_hist[r];
+        if(c - (int)low < k_out)
+        {
+            fall_back = true;
+            __syncthreads(); // everyone has read bucket 0 before the fallback clears s_hist
+        }
+    }
+    if(fall_back)
     {
         if(threadIdx.x == 0)
             fb_rows[atomicAdd(fb_count, 1)] = row;
@@ -540,65 +621,9 @@ phase_c_select_contig(const float* __restrict__ input,
 #endif
         if(got < 0)
             return; // emitted; len > K here, so k_out == K and nothing to pad
-        c_band = got;
+        c = got;
+        read_cands(c);
     }
-    const int c          = c_band;
-    const uint64_t* base = cand_pack + (size_t)row * cap;
-
-    // ATT puts s_waitcnt vmcnt(0) at 20.8% of phase_c's traced latency here, but
-    // unrolling this loop is worth nothing: measured at depth 1, 2, 4 and 8,
-    // phase_c reads 14.24, 14.27, 14.40 and 14.31us at m=512 n=131072. The trace
-    // shows four separate load sites already, and c is about 2867 against a
-    // 1024-thread block, so there are three iterations and nothing left to
-    // overlap. The wait is the latency of the read itself.
-    // Count pass 0's digits while the candidates are being read, the same trade
-    // phase_a's sampler takes. Pass 1 of phase_c's select is the expensive one --
-    // the only unfiltered scan of all c keys, measured at 4.38us against 1.62 /
-    // 1.16 / 1.12 for passes 2, 3 and 4 at m=512 n=131072 -- and the keys are
-    // already in registers here.
-    const int fold_rep = threadIdx.x & (HIST_REP - 1);
-    clear_hist(s_hist);
-    __syncthreads();
-    // Published by the barrier after the read. Folding the first wide pass's
-    // digits into this read as well, the way pass 0's are, was measured and is
-    // SLOWER: phase_c +0.2 to +1.0us over the unfolded wide select at m=64..512
-    // (scripts/wide_ab.py, arms acF against acN), against -0.3 to -0.4us unfolded.
-    if(nwide > 0)
-        clear_wide(s_wide, wide_buffer_count(nwide, REUSE_WIDE));
-    auto take_cand = [&](uint64_t p, int i) {
-        const uint32_t kk = fp32_to_sortable_bits((uint32_t)(p >> 32));
-        s_keys_ext[i]     = kk;
-        if(!keys_only)
-            s_idx[i] = (int)(uint32_t)p;
-        // radix_shift(0) is 24, so pass 0's digit is the top byte.
-        atomicAdd(&s_hist[(kk >> 24) * HIST_REP + fold_rep], 1u);
-    };
-    // PC_B candidate loads per thread go out before the first is used; with one
-    // block per CU nothing else hides their round trips.
-    constexpr int PC_B = 4;
-    for(int i0 = threadIdx.x; i0 < c; i0 += PC_B * (int)blockDim.x)
-    {
-        uint64_t pv[PC_B];
-#pragma unroll
-        for(int u = 0; u < PC_B; u++)
-        {
-            const int i = i0 + u * (int)blockDim.x;
-            pv[u]       = i < c ? base[i] : 0ull;
-        }
-#pragma unroll
-        for(int u = 0; u < PC_B; u++)
-        {
-            const int i = i0 + u * (int)blockDim.x;
-#if PC_BATCH_MUTANT // gate self-test only: never stores a batch's last candidate
-            if(i < c && u != PC_B - 1)
-                take_cand(pv[u], i);
-#else
-            if(i < c)
-                take_cand(pv[u], i);
-#endif
-        }
-    }
-    __syncthreads();
 
     uint32_t pivot;
     int eq_needed;

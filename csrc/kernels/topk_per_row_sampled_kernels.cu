@@ -1751,6 +1751,11 @@ void top_k_per_row_prefill_sampled(
 
     const ShapeParams sp = sampled::params_for(M, N, K);
 
+    // The plain kernels select K of every row, which a row of N <= K does not
+    // have; the bounded ones emit such a row whole, in column order, and pad
+    // with -1, as aiter's other top-k kernels do.
+    if(N <= K)
+        ragged = true;
     const bool ragged_small = ragged || (N % FP32_EPT) != 0;
     const float* in         = static_cast<const float*>(logits.data_ptr());
     const int* row_starts   = static_cast<const int*>(rowStarts.data_ptr());

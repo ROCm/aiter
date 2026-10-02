@@ -225,8 +225,9 @@ __device__ __forceinline__ void clear_hist(uint32_t* __restrict__ s_hist)
         s_hist[i] = 0u;
 }
 
-// IEEE-754 fp32 -> monotone uint32. NaN lands above +INF, matching the
-// "distort" trick from DeepSelect (csrc/hip_kernels/bit_utils_hip.cuh).
+// IEEE-754 fp32 -> monotone uint32, the "distort" trick from DeepSelect
+// (csrc/hip_kernels/bit_utils_hip.cuh): a positive NaN lands above +INF, a
+// negative one below -INF.
 __host__ __device__ __forceinline__ uint32_t fp32_to_sortable_bits(uint32_t u)
 { return (u & 0x80000000u) ? ~u : (u ^ 0x80000000u); }
 

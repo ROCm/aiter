@@ -769,6 +769,11 @@ def top_k_per_row_prefill_sampled(
             f"top_k_per_row_prefill_sampled: workspace is "
             f"{workspace.numel() * workspace.element_size()} B, needs {size} B"
         )
+    # The non-ragged kernels take every row to be stride0 wide. A row-strided
+    # view -- a column slice of a wider tensor -- is narrower than its pitch, so
+    # they would select from the columns past it; bound the rows instead.
+    if not ragged and logits.dim() == 2 and logits.size(1) != stride0:
+        ragged = True
     return _top_k_per_row_prefill_sampled(
         logits,
         rowStarts,
