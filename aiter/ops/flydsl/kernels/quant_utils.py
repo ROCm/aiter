@@ -280,6 +280,19 @@ def emit_f32_to_e2m3(qx_f32):
     return _emit_f32_to_fp6(qx_f32, mbits=3, bias=1, max_bits=0x40F00000)
 
 
+# Typed FP8 encode/decode remain unlowered in FlyDSL 0.3.4.1.
+def emit_f32_to_fp8(first, second):
+    """Pack two f32 values into the low two bytes of an FP8 dword."""
+    return fx.Int32(
+        fx.rocdl.cvt_pk_fp8_f32(T.i32, _raw(first), _raw(second), _raw(fx.Int32(0)), 0)
+    )
+
+
+def emit_fp8_to_f32(word, high=False):
+    """Decode the selected two FP8 bytes from a packed dword."""
+    return fx.Vector(fx.rocdl.cvt_pk_f32_fp8(T.f32x2, _raw(word), high))
+
+
 def emit_f32_to_e2m3_native(first, second, scale):
     """Convert two 16-value f32 vectors to six packed FP6 dwords on gfx950."""
     from flydsl._mlir.dialects import rocdl as rocdl_dialect

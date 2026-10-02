@@ -559,7 +559,7 @@ class AttentionA2AIntraNodeOp:
             reuse_args = (
                 self.reuse_mem_sets[parity].data_ptr(),
                 self.p2p_reuse_mem_sets[parity].data_ptr(),
-                self.reuse_flags.data_ptr() + parity * self.reuse_flags.element_size(),
+                self.reuse_flags[parity : parity + 1].data_ptr(),
                 stream,
             )
             _run_compiled(

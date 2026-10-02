@@ -10,19 +10,16 @@ import os
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.backends import current_target
-from flydsl.expr import T, const_expr, range_constexpr
+from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import Stream
 
 from aiter.ops.mha_v4 import AttentionPack
 from aiter.utility.mx_types import MxDtypeInt, MxScaleRoundModeInt
 
-from .buffer_ops import buffer_load, buffer_store, create_buffer_resource_from_addr
 from .communication_ops_utils import (
-    atomic_add_global_at,
-    fence_system_acquire,
     spin_until_ge_i64,
-    store_i64_global_system,
+    wait_lds_wave,
     wave_uniform_i64,
 )
 from .kernels_common import ceildiv
@@ -30,6 +27,8 @@ from .quant_utils import (
     emit_f32_to_e2m1,
     emit_f32_to_e2m3,
     emit_f32_to_e2m3_native,
+    emit_f32_to_fp8,
+    emit_fp8_to_f32,
     emit_mx_e8m0_scale,
 )
 from .tensor_shim import buf_copy_load, buf_copy_store, ptr_buf_tensor
@@ -42,6 +41,11 @@ _PUSH_PIPELINE_DEPTH = 16
 # number of independent work items, so smaller tiles trade workspace for
 # parallelism.
 V_PC_TOKEN_TILE = 32
+# Outer extent for an idx2crd mode the index can never wrap. FlyDSL lowers every
+# mode as mod(div(i, stride), shape), so a bounded outer extent leaves a redundant
+# remainder that defeats loop scalarization and load pipelining in hot loops.
+# Use only where the index is guaranteed below outer_extent * outer_stride.
+UNBOUNDED_OUTER_EXTENT = 2**31 - 1
 
 
 def v_pc_partial_elems(seq_len, heads, head_dim):
@@ -72,20 +76,53 @@ def make_attention_a2a_reuse_jit(*, rank, npes):
                 p2p_ready = ptr_buf_tensor(
                     addr_p2p_ready_mem, fx.Int64, num_records_bytes=npes * 8
                 )
-                remote_slot = (
-                    fx.Int64(buf_copy_load(p2p_ready, tid, fx.Int64))
-                    + fx.Int64(rank) * 8
+                remote = fx.inttoptr(
+                    fx.PointerType.get(
+                        fx.Int64.ir_type,
+                        address_space=fx.AddressSpace.Global,
+                        alignment=8,
+                    ),
+                    buf_copy_load(p2p_ready, tid, fx.Int64),
                 )
+                remote_slot = fx.add_offset(remote, rank)
                 # Reaching this launch drains earlier consumers on this stream.
-                store_i64_global_system(remote_slot, generation)
+                fx.generic_store(
+                    remote_slot,
+                    generation,
+                    memory_order=fx.AtomicOrdering.Release,
+                    syncscope=fx.rocdl.SyncScope.OneAs,
+                )
             else:
-                spin_until_ge_i64(addr_ready_mem + fx.Int64(tid) * 8, generation)
-                fence_system_acquire()
+                ready = fx.inttoptr(
+                    fx.PointerType.get(
+                        fx.Int64.ir_type,
+                        address_space=fx.AddressSpace.Global,
+                        alignment=8,
+                    ),
+                    addr_ready_mem,
+                )
+                spin_until_ge_i64(fx.ptrtoint(fx.add_offset(ready, tid)), generation)
+                fx.memory_fence(
+                    ordering=fx.AtomicOrdering.Acquire,
+                    syncscope=fx.rocdl.SyncScope.OneAs,
+                )
         fx.barrier()
         # Nested rather than combined: const_expr must gate the runtime test.
         if const_expr(not publish):  # noqa: SIM102
             if tid == 0:
-                atomic_add_global_at(addr_ready_flag, fx.Int64(1))
+                fx.atomic_add(
+                    fx.inttoptr(
+                        fx.PointerType.get(
+                            fx.Int64.ir_type,
+                            address_space=fx.AddressSpace.Global,
+                            alignment=8,
+                        ),
+                        addr_ready_flag,
+                    ),
+                    fx.Int64(1),
+                    ordering=fx.AtomicOrdering.Monotonic,
+                    syncscope=fx.rocdl.SyncScope.OneAs,
+                )
 
     key = (rank, npes, _JIT_CACHE_TAG)
 
@@ -143,6 +180,23 @@ def _unpack_int8_pair(word, high):
     return fx.Vector.from_elements([first, second], fx.Float32)
 
 
+def _row_field_offset(row, field, fields):
+    row_layout = fx.make_layout((UNBOUNDED_OUTER_EXTENT, fields), (fields, 1))
+    field_layout = fx.slice(row_layout, (row, None))
+    row_base = fx.Int32(fx.get_scalar(fx.crd2idx((row, fx.Int32(0)), row_layout)))
+    return row_base + fx.Int32(fx.get_scalar(fx.crd2idx(field, field_layout)))
+
+
+def _field_view(buffer, base, fields):
+    return fx.slice(
+        fx.make_view(
+            fx.get_iter(buffer),
+            fx.make_layout((UNBOUNDED_OUTER_EXTENT, fields), (1, 1)),
+        ),
+        (base, None),
+    )
+
+
 def _transport_bytes(numel, codec):
     return numel * {"mxfp4": 4, "mxfp6": 6}.get(codec, 8) // 8
 
@@ -178,10 +232,7 @@ def _pack_transport_pair(first, second, codec):
         low = fx.Int32(emit_f32_to_e2m1(first.ir_value()))
         high = fx.Int32(emit_f32_to_e2m1(second.ir_value()))
         return low | (high << 4)
-    word = fx.rocdl.cvt_pk_fp8_f32(
-        T.i32, first.ir_value(), second.ir_value(), fx.Int32(0).ir_value(), 0
-    )
-    return fx.Int32(word).to(fx.Int16)
+    return emit_f32_to_fp8(first, second).to(fx.Int16)
 
 
 def _v4_fp8_scale(amax, fp8_fnuz):
@@ -220,40 +271,136 @@ def _pack_v4_fp6(values, reciprocal):
 
 
 @flyc.jit
-def _store_v4_fp6_q(words, resource, offset, lane):
+def _store_v4_fp6_q(words, dst_words, offset, lane):
+    # Slice the shared row before selecting its unrolled fields.
+    row_words = fx.slice(
+        fx.make_view(
+            fx.get_iter(dst_words), fx.make_layout((UNBOUNDED_OUTER_EXTENT, 3), (1, 1))
+        ),
+        (offset, None),
+    )
     if lane % 4 < 2:
         for i in range_constexpr(3):
-            buffer_store(words[i], resource, offset + i)
+            buf_copy_store(row_words, i, words[i], fx.Int32)
+
+
+def fp6p_source_token(token):
+    frame_token = fx.Int32(
+        fx.get_scalar(
+            fx.crd2idx(token & 63, fx.make_layout((4, 2, 4, 2), (1, 32, 8, 4)))
+        )
+    )
+    return (token & ~63) + frame_token
+
+
+def _k_fp6_scale_slot(token):
+    return fx.Int32(
+        fx.get_scalar(fx.crd2idx(token & 127, fx.make_layout((16, 2, 4), (16, 256, 4))))
+    )
+
+
+def _k_fp6_predecessor(global_token, channel):
+    layout = fx.make_layout((128, 4), (4, 1))
+    flat = fx.Int32(fx.get_scalar(fx.crd2idx((global_token, channel), layout)))
+    # Guard zero before signed decomposition; the token mode repeats every tile.
+    previous = (flat > 0).select(flat - 1, fx.Int32(0))
+    coord = fx.idx2crd(previous, layout)
+    return (
+        fx.Int32(fx.get_scalar(fx.get(coord, 0))),
+        fx.Int32(fx.get_scalar(fx.get(coord, 1))),
+    )
+
+
+def _k_sequence_coord(seq):
+    return fx.idx2crd(
+        fx.Int32(seq),
+        fx.make_layout((UNBOUNDED_OUTER_EXTENT, 128), (128, 1)),
+    )
+
+
+def _k_fp6_band_view(dst_words, tile_word, token, channel, words_per_token):
+    tile = fx.slice(
+        fx.make_view(
+            fx.get_iter(dst_words),
+            fx.make_layout((UNBOUNDED_OUTER_EXTENT, 4352), (1, 1)),
+        ),
+        (tile_word, None),
+    )
+    band = fx.make_view(
+        fx.get_iter(tile),
+        fx.make_layout(
+            (4, 4, 32, words_per_token),
+            (128 * words_per_token, 32 * words_per_token, words_per_token, 1),
+        ),
+    )
+    if words_per_token == 2:
+        band = fx.make_view(fx.add_offset(fx.get_iter(tile), 2048), fx.get_layout(band))
+    # Explicit token // 32, % 32: layout forms drain vmcnt(0) before the first input load.
+    return fx.slice(band, (token // 32, channel, token % 32, None))
+
+
+def _k_fp6_scale_image(dst_bytes, tile_byte, image):
+    tail = _field_view(dst_bytes, tile_byte, 17408)
+    images = fx.make_view(
+        fx.add_offset(fx.get_iter(tail), 16384),
+        fx.make_layout((2, 512), (512, 1)),
+    )
+    return fx.slice(images, (image, None))
+
+
+def _k_fp6_scale_field(slot, channel):
+    return fx.Int32(
+        fx.get_scalar(fx.crd2idx((slot, channel), fx.make_layout((512, 4), (1, 1))))
+    )
 
 
 @flyc.jit
-def _store_v4_fp6_k(words, scale, resource, tile_word, seq, lane):
+def _store_v4_fp6_k(words, scale, dst_words, dst_bytes, tile_word, seq, lane):
+    # Band selection and predecessor replication are codec ownership, not affine rows.
+    # Explicit lane coordinates: layout forms drain vmcnt(0) before the first input load.
     group = lane % 16 // 4
-    token = seq % 128
+    seq_coord = _k_sequence_coord(seq)
+    token = fx.Int32(fx.get_scalar(fx.get(seq_coord, 1)))
+    # Two lanes own the packed six-dword row; unrolled fields stay outside the layout.
     if lane % 4 < 2:
+        band_a = _k_fp6_band_view(dst_words, tile_word, token, group, 4)
+        band_b = _k_fp6_band_view(dst_words, tile_word, token, group, 2)
         for i in range_constexpr(3):
             word = lane % 2 * 3 + i
-            offset = (word < 4).select(
-                token // 32 * 512 + group * 128 + token % 32 * 4 + word,
-                2048 + token // 32 * 256 + group * 64 + token % 32 * 2 + word - 4,
-            )
-            buffer_store(words[i], resource, tile_word + offset)
+            if word < 4:
+                buf_copy_store(band_a, word, words[i], fx.Int32)
+            else:
+                buf_copy_store(band_b, word - 4, words[i], fx.Int32)
     if lane % 4 == 0:
-        scale_slot = token % 32 // 16 * 256 + (token % 16 * 4 + token // 32) * 4
-        buffer_store(scale, resource, tile_word * 4 + 16384 + scale_slot + group)
+        tile_byte = _row_field_offset(tile_word, fx.Int32(0), 4)
+        image_a = _k_fp6_scale_image(dst_bytes, tile_byte, 0)
+        image_b = _k_fp6_scale_image(dst_bytes, tile_byte, 1)
+        scale_slot = _k_fp6_scale_slot(token)
+        buf_copy_store(
+            image_a,
+            _k_fp6_scale_field(scale_slot, group),
+            scale,
+            fx.Int8,
+        )
+        previous_token, previous_channel = _k_fp6_predecessor(seq, group)
         if group > 0:
-            buffer_store(
-                scale, resource, tile_word * 4 + 16896 + scale_slot + group - 1
+            buf_copy_store(
+                image_b,
+                _k_fp6_scale_field(scale_slot, previous_channel),
+                scale,
+                fx.Int8,
             )
         elif seq > 0:
-            previous = (token + 127) % 128
-            previous_slot = (
-                previous % 32 // 16 * 256 + (previous % 16 * 4 + previous // 32) * 4
+            previous_slot = _k_fp6_scale_slot(previous_token)
+            previous_tile = _row_field_offset(tile_word, fx.Int32(0), 4) - (
+                token == 0
+            ).select(fx.Int32(17408), fx.Int32(0))
+            buf_copy_store(
+                _k_fp6_scale_image(dst_bytes, previous_tile, 1),
+                _k_fp6_scale_field(previous_slot, previous_channel),
+                scale,
+                fx.Int8,
             )
-            previous_tile = tile_word * 4 - (token == 0).select(
-                fx.Int32(17408), fx.Int32(0)
-            )
-            buffer_store(scale, resource, previous_tile + 16896 + previous_slot + 3)
 
 
 def _pack_v4_v_pair(first, second):
@@ -289,14 +436,36 @@ def _pack_transport_words(pairs, codec):
 
 
 @flyc.jit
-def _store_fp6(words, resource, chunk):
+def _store_fp6(words, dst_words, chunk):
+    # Adjacent chunks share a 96-bit span; only its even owner writes all three words.
+    record_coord = fx.idx2crd(
+        fx.Int32(chunk), fx.make_layout((UNBOUNDED_OUTER_EXTENT, 2), (2, 1))
+    )
+    record = fx.Int32(fx.get_scalar(fx.get(record_coord, 0)))
+    record_words = fx.slice(
+        fx.make_view(
+            fx.get_iter(dst_words), fx.make_layout((UNBOUNDED_OUTER_EXTENT, 3), (3, 1))
+        ),
+        (record, None),
+    )
     if chunk % 2 == 0:
         for i in range_constexpr(3):
-            buffer_store(words[i], resource, chunk // 2 * 3 + i)
+            buf_copy_store(record_words, i, words[i], fx.Int32)
 
 
 def _load_fp6(payload, chunk):
-    words = buf_copy_load(payload, chunk // 2 * 3 + chunk % 2, fx.Int32, 2)
+    # Odd chunks start one dword into the shared 96-bit span and need realignment.
+    record_coord = fx.idx2crd(
+        fx.Int32(chunk), fx.make_layout((UNBOUNDED_OUTER_EXTENT, 2), (2, 1))
+    )
+    word = fx.Int32(
+        fx.get_scalar(
+            fx.crd2idx(
+                record_coord, fx.make_layout((UNBOUNDED_OUTER_EXTENT, 2), (3, 1))
+            )
+        )
+    )
+    words = buf_copy_load(payload, word, fx.Int32, 2)
     first, second = fx.Uint32(words[0]), fx.Uint32(words[1])
     odd = chunk % 2 != 0
     lo = odd.select((first >> 16) | (second << 16), first)
@@ -337,7 +506,7 @@ def _unpack_transport_pair(word, high, codec):
             bits = bits | ((nibble & 8) << 28)
             values.append(bits.bitcast(fx.Float32))
         return fx.Vector.from_elements(values, fx.Float32)
-    return fx.Vector(fx.rocdl.cvt_pk_f32_fp8(T.f32x2, word, high))
+    return emit_fp8_to_f32(word, high)
 
 
 def _hadamard_head(values, lane, head_dim, registers=8):
@@ -402,21 +571,154 @@ def make_attention_a2a_kernel(
     k_last_tile = ((rank + 1) * seq_len) // 128
     k_own_tiles = max(0, k_last_tile - k_first_tile)
 
+    def input_offset(seq, head, channel, elems_per_unit=1):
+        row = fx.Int32(
+            fx.get_scalar(
+                fx.crd2idx((seq, head), fx.make_layout((seq_len, heads), (heads, 1)))
+            )
+        )
+        return _row_field_offset(row, channel, head_dim // elems_per_unit)
+
+    def row_offset(seq, head, channel, channels, head_major=False):
+        layout = fx.make_layout(
+            (seq_full, heads_local),
+            (1, seq_full) if head_major else (heads_local, 1),
+        )
+        row = fx.Int32(fx.get_scalar(fx.crd2idx((seq, head), layout)))
+        return _row_field_offset(row, channel, channels)
+
+    def wave_chunk(group, lane):
+        return fx.Int32(
+            fx.get_scalar(
+                fx.crd2idx(
+                    (group, lane), fx.make_layout((UNBOUNDED_OUTER_EXTENT, 64), (64, 1))
+                )
+            )
+        )
+
+    def global_head(peer, head):
+        return fx.Int32(
+            fx.get_scalar(
+                fx.crd2idx(
+                    (peer, head), fx.make_layout((npes, heads_local), (heads_local, 1))
+                )
+            )
+        )
+
+    def global_token(seq):
+        return fx.Int32(
+            fx.get_scalar(
+                fx.crd2idx(
+                    (fx.Int32(rank), seq), fx.make_layout((npes, seq_len), (seq_len, 1))
+                )
+            )
+        )
+
+    def partial_offset(source_rank, head, quarter, channel):
+        row = fx.Int32(
+            fx.get_scalar(
+                fx.crd2idx(
+                    (source_rank, head),
+                    fx.make_layout((npes, heads_local), (heads_local, 1)),
+                )
+            )
+        )
+        return _row_field_offset(
+            row, _row_field_offset(fx.Int32(quarter), channel, 128), 256
+        )
+
+    def paired_partial_offset(sender, head, quarter, channel):
+        pair_layout = fx.make_layout(
+            (2, heads_local, 2, 128), (heads_local * 256, 256, 128, 1)
+        )
+        pair_base = partial_offset(rank // 2 * 2, 0, 0, 0)
+        return pair_base + fx.Int32(
+            fx.get_scalar(fx.crd2idx((sender, head, quarter, channel), pair_layout))
+        )
+
+    def amax_partial_offset(dest_pe, part):
+        return 1 + fx.Int32(
+            fx.get_scalar(
+                fx.crd2idx(
+                    (dest_pe, part),
+                    fx.make_layout(
+                        (npes, block_num * warp_num_per_block),
+                        (block_num * warp_num_per_block, 1),
+                    ),
+                )
+            )
+        )
+
+    def pc_partial_offset(dest_pe, part, parts, channels):
+        row = fx.Int32(
+            fx.get_scalar(
+                fx.crd2idx((dest_pe, part), fx.make_layout((npes, parts), (parts, 1)))
+            )
+        )
+        return _row_field_offset(row, fx.Int32(0), channels)
+
+    def ready_offset(source_rank, head):
+        return fx.Int32(
+            fx.get_scalar(
+                fx.crd2idx(
+                    (source_rank, head),
+                    fx.make_layout((npes, heads_local), (heads_local, 1)),
+                )
+            )
+        )
+
+    def k_fp6_tile_offset(head, tile):
+        row = fx.Int32(
+            fx.get_scalar(
+                fx.crd2idx(
+                    (head, tile),
+                    fx.make_layout((heads_local, k_tiles), (k_tiles, 1)),
+                )
+            )
+        )
+        return _row_field_offset(row, fx.Int32(0), 4352)
+
     def v4_word_offset(head, seq, chunk, mode, codec):
         if codec == "mxfp8":
-            return (seq * heads_local + head) * 32 + chunk * 2
+            return row_offset(seq, head, _row_field_offset(chunk, fx.Int32(0), 2), 32)
         if codec == "mxfp6" and mode == "k":
-            return (head * k_tiles + seq // 128) * 4352
+            coord = _k_sequence_coord(seq)
+            return k_fp6_tile_offset(head, fx.Int32(fx.get_scalar(fx.get(coord, 0))))
         if codec == "mxfp6":
-            return (seq * heads_local + head) * 24 + (chunk // 4) * 6 + (chunk % 2) * 3
-        if mode == "k":
-            return (
-                (head * k_tiles + seq // 128) * 2048
-                + (chunk // 4) * 512
-                + (seq % 128) * 4
-                + chunk % 4
+            pair_coord = fx.idx2crd(
+                fx.Int32(chunk), fx.make_layout((4, 2, 2), (4, 2, 1))
             )
-        return (seq * heads_local + head) * 16 + chunk
+            word = fx.Int32(
+                fx.get_scalar(
+                    fx.crd2idx(pair_coord, fx.make_layout((4, 2, 2), (6, 0, 3)))
+                )
+            )
+            return row_offset(seq, head, word, 24)
+        if mode == "k":
+            seq_coord = _k_sequence_coord(seq)
+            tile = fx.Int32(fx.get_scalar(fx.get(seq_coord, 0)))
+            token = fx.Int32(fx.get_scalar(fx.get(seq_coord, 1)))
+            chunk_coord = fx.idx2crd(fx.Int32(chunk), fx.make_layout((4, 4), (1, 4)))
+            row = fx.Int32(
+                fx.get_scalar(
+                    fx.crd2idx(
+                        (head, tile),
+                        fx.make_layout((heads_local, k_tiles), (k_tiles, 1)),
+                    )
+                )
+            )
+            field = fx.Int32(
+                fx.get_scalar(
+                    fx.crd2idx(
+                        chunk_coord,
+                        fx.composition(
+                            fx.make_layout(2048, 1), fx.make_layout((4, 4), (1, 512))
+                        ),
+                    )
+                )
+            )
+            return _row_field_offset(row, _row_field_offset(token, field, 4), 2048)
+        return row_offset(seq, head, chunk, 16)
 
     # Source chunks remain bf16-sized even when the wire payload is quantized.
     elements_per_chunk = _TRANSPORT_CHUNK_BYTES // 2
@@ -475,16 +777,19 @@ def make_attention_a2a_kernel(
     ):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
-        lane = tid & 63
-        warp = tid >> 6
-        global_warp_id = bid * warp_num_per_block + warp
+        warp_coord = fx.idx2crd(
+            fx.Int32(tid), fx.make_layout((warp_num_per_block, 64), (64, 1))
+        )
+        warp = fx.Int32(fx.get_scalar(fx.get(warp_coord, 0)))
+        lane = fx.Int32(fx.get_scalar(fx.get(warp_coord, 1)))
+        global_warp_id = _row_field_offset(bid, warp, warp_num_per_block)
         global_warp_num = block_num * warp_num_per_block
 
         p2p_output_q = ptr_buf_tensor(addr_p2p_output, fx.Int64)
 
         if const_expr(split_v_exchange):
-            rsrc_xdb_flag = create_buffer_resource_from_addr(addr_xdb_flag)
-            partial_generation = buffer_load(rsrc_xdb_flag, 0, vec_width=1, dtype=T.i64)
+            xdb_flag = ptr_buf_tensor(addr_xdb_flag, fx.Int64, num_records_bytes=8)
+            partial_generation = fx.Int64(buf_copy_load(xdb_flag, 0, fx.Int64))
 
         shared = fx.SharedAllocator().allocate(shared_storage).peek()
         p2p_bases_q = shared.p2p_bases_q.view(fx.make_layout(npes, 1))
@@ -510,24 +815,38 @@ def make_attention_a2a_kernel(
             peer_chunks = total_chunks // npes
             peer_group_count = (peer_chunks + 63) // 64
             peer_warp_num = global_warp_num // npes
-            dest_pe = global_warp_id % npes
-            peer_warp_id = global_warp_id // npes
+            peer_coord = fx.idx2crd(
+                fx.Int32(global_warp_id),
+                fx.make_layout((UNBOUNDED_OUTER_EXTENT, npes), (npes, 1)),
+            )
+            peer_warp_id = fx.Int32(fx.get_scalar(fx.get(peer_coord, 0)))
+            dest_pe = fx.Int32(fx.get_scalar(fx.get(peer_coord, 1)))
             peer_base = fx.Uint64(fx.memref_load(p2p_bases, dest_pe))
             uniform_peer_base = wave_uniform_i64(peer_base)
-            rsrc_dst = create_buffer_resource_from_addr(
-                uniform_peer_base,
-                num_records_bytes=(
-                    heads_local * k_tiles * (17408 if codec == "mxfp6" else 8192)
-                    if mode == "k" and codec != "mxfp8"
-                    else total_chunks * wire_bytes
-                ),
+            dst_bytes_extent = (
+                heads_local * k_tiles * (17408 if codec == "mxfp6" else 8192)
+                if mode == "k" and codec != "mxfp8"
+                else total_chunks * wire_bytes
             )
+            if const_expr(quant and codec == "mxfp6"):
+                dst_views = _fp6_output_views(uniform_peer_base, dst_bytes_extent)
+                dst_words, dst_bytes = dst_views[0], dst_views[3]
+            else:
+                # One wire chunk per store: 4 dwords raw, 2 for FP8/INT8, 1 for FP4.
+                dst_words = ptr_buf_tensor(
+                    uniform_peer_base,
+                    fx.Int32,
+                    unit_elems=wire_words,
+                    unit_stride=1,
+                    num_records_bytes=dst_bytes_extent,
+                )
             if const_expr(quant):
                 p2p_scale = ptr_buf_tensor(addr_p2p_scale, fx.Int64)
                 scale_base = fx.Uint64(buf_copy_load(p2p_scale, dest_pe, fx.Int64))
                 uniform_scale_base = wave_uniform_i64(scale_base)
-                rsrc_scale = create_buffer_resource_from_addr(
+                scale_dst = ptr_buf_tensor(
                     uniform_scale_base,
+                    fx.Int8,
                     num_records_bytes=total_chunks * elements_per_chunk // 32,
                 )
             group_step = peer_warp_num * _PUSH_PIPELINE_DEPTH
@@ -538,18 +857,38 @@ def make_attention_a2a_kernel(
                 scales = []
                 scale_destinations = []
                 for batch_idx in range_constexpr(_PUSH_PIPELINE_DEPTH):
-                    group_idx = group_base + batch_idx * peer_warp_num
-                    dest_chunk = group_idx * 64 + lane
+                    group_idx = fx.Int32(
+                        fx.get_scalar(
+                            fx.crd2idx(
+                                (fx.Int32(batch_idx), group_base),
+                                fx.make_layout(
+                                    (_PUSH_PIPELINE_DEPTH, UNBOUNDED_OUTER_EXTENT),
+                                    (peer_warp_num, 1),
+                                ),
+                            )
+                        )
+                    )
+                    dest_chunk = wave_chunk(group_idx, lane)
                     valid = dest_chunk < peer_chunks
                     safe_dest_chunk = valid.select(dest_chunk, 0)
-                    local_head = safe_dest_chunk // (seq_len * chunks_per_row)
-                    seq_chunk = safe_dest_chunk % (seq_len * chunks_per_row)
-                    seq = seq_chunk // chunks_per_row
-                    row_chunk = seq_chunk % chunks_per_row
-                    head = dest_pe * heads_local + local_head
-                    src_chunk = (seq * heads + head) * chunks_per_row + row_chunk
+                    # Decode the owned peer slab before mapping the source/destination rows.
+                    work_coord = fx.idx2crd(
+                        fx.Int32(safe_dest_chunk),
+                        fx.make_layout(
+                            (UNBOUNDED_OUTER_EXTENT, seq_len, chunks_per_row),
+                            (seq_len * chunks_per_row, chunks_per_row, 1),
+                        ),
+                    )
+                    local_head = fx.Int32(fx.get_scalar(fx.get(work_coord, 0)))
+                    seq = fx.Int32(fx.get_scalar(fx.get(work_coord, 1)))
+                    row_chunk = fx.Int32(fx.get_scalar(fx.get(work_coord, 2)))
+                    head = global_head(dest_pe, local_head)
+                    src_chunk = input_offset(seq, head, row_chunk, elements_per_chunk)
                     raw = buf_copy_load(
-                        input_q, src_chunk * chunk_words, fx.Int32, chunk_words
+                        input_q,
+                        _row_field_offset(src_chunk, fx.Int32(0), chunk_words),
+                        fx.Int32,
+                        chunk_words,
                     )
                     if const_expr(quant):
                         decoded = fx.Vector(raw).bitcast(fx.BFloat16).to(fx.Float32)
@@ -596,25 +935,28 @@ def make_attention_a2a_kernel(
                         scales.append(scale.to(fx.Int8))
                     else:
                         values.append(raw)
-                    dst_chunk = (
-                        local_head * seq_full * chunks_per_row
-                        + (rank * seq_len + seq) * chunks_per_row
-                        + row_chunk
+                    dst_chunk = row_offset(
+                        global_token(seq),
+                        local_head,
+                        row_chunk,
+                        chunks_per_row,
+                        head_major=True,
                     )
                     destinations.append(
                         v4_word_offset(
-                            local_head, rank * seq_len + seq, row_chunk, mode, codec
+                            local_head, global_token(seq), row_chunk, mode, codec
                         )
                         if mode
                         else (
                             dst_chunk
                             if quant and codec == "mxfp6"
-                            else dst_chunk * wire_words
+                            else _row_field_offset(dst_chunk, fx.Int32(0), wire_words)
                         )
                     )
+                    # Explicit //4 scale addressing: layout forms add load drains inside the
+                    # 16-load batch and serialize it.
                     scale_destinations.append(
-                        ((rank * seq_len + seq) * heads_local + local_head) * 4
-                        + row_chunk // 4
+                        row_offset(global_token(seq), local_head, row_chunk // 4, 4)
                         if mode
                         else dst_chunk // 4
                     )
@@ -625,7 +967,8 @@ def make_attention_a2a_kernel(
                             _store_v4_fp6_k(
                                 values[batch_idx],
                                 scales[batch_idx],
-                                rsrc_dst,
+                                dst_words,
+                                dst_bytes,
                                 destinations[batch_idx],
                                 scale_destinations[batch_idx] // (heads_local * 4),
                                 lane,
@@ -633,47 +976,74 @@ def make_attention_a2a_kernel(
                         elif const_expr(mode and codec == "mxfp6"):
                             _store_v4_fp6_q(
                                 values[batch_idx],
-                                rsrc_dst,
+                                dst_words,
                                 destinations[batch_idx],
                                 lane,
                             )
                         elif const_expr(quant and codec == "mxfp6"):
                             _store_fp6(
-                                values[batch_idx], rsrc_dst, destinations[batch_idx]
+                                values[batch_idx], dst_words, destinations[batch_idx]
                             )
                         else:
-                            buffer_store(
-                                values[batch_idx], rsrc_dst, destinations[batch_idx]
+                            buf_copy_store(
+                                dst_words,
+                                destinations[batch_idx],
+                                values[batch_idx],
+                                fx.Int32,
+                                wire_words,
                             )
                         # Keep compile-time specialization outside the lane predicate.
                         if const_expr(quant):  # noqa: SIM102
                             if lane % 4 == 0:
-                                buffer_store(
-                                    scales[batch_idx],
-                                    rsrc_scale,
+                                buf_copy_store(
+                                    scale_dst,
                                     scale_destinations[batch_idx],
+                                    scales[batch_idx],
+                                    fx.Int8,
                                 )
 
         @flyc.jit
         def store_dense_fp6(
-            words, output, first_word, coalesced, staging, tiles, warp, lane
+            words,
+            output,
+            first_word,
+            last_word,
+            wave_word,
+            coalesced,
+            staging,
+            tiles,
+            warp,
+            lane,
         ):
             if coalesced:
-                # Each wave owns its staging slab; no cross-wave barrier is needed.
+                # One thread owns one compact six-word LDS record.
+                producer = fx.make_view(
+                    fx.get_iter(staging),
+                    fx.make_layout((warp_num_per_block * 64, 6), (6, 1)),
+                )
                 for word in range_constexpr(6):
-                    fx.memref_store(words[word], staging, warp * 384 + lane * 6 + word)
-                fx.rocdl.s_waitcnt(lgkmcnt=0)
-                wave_word = first_word - lane * 6
-                first = fx.memref_load_vec(fx.slice(tiles, (None, warp * 96 + lane)))
-                buf_copy_store(output[2], wave_word + lane * 4, first, fx.Int32, 4)
+                    fx.memref_store(words[word], producer, (fx.Int32(tid), word))
+                # Drain this wave's LDS writes before other lanes read the staging slab.
+                wait_lds_wave()
+                # Redistribute the six-word lane records into 64 + 32 four-word stores.
+                wave_output = fx.slice(
+                    fx.make_view(
+                        fx.get_iter(output[2]),
+                        fx.make_layout((UNBOUNDED_OUTER_EXTENT, 384), (1, 1)),
+                    ),
+                    (wave_word, None),
+                )
+                lines = fx.logical_divide(wave_output, fx.make_layout(4, 1))
+                line_output = fx.make_view(
+                    fx.get_iter(lines), fx.select(fx.get_layout(lines), [1, 0])
+                )
+                first = fx.memref_load_vec(fx.slice(tiles, (None, warp, lane)))
+                buf_copy_store(line_output, lane, first, fx.Int32, 4)
                 if lane < 32:
-                    last = fx.memref_load_vec(
-                        fx.slice(tiles, (None, warp * 96 + 64 + lane))
-                    )
-                    buf_copy_store(
-                        output[2], wave_word + 256 + lane * 4, last, fx.Int32, 4
-                    )
-                fx.rocdl.s_waitcnt(lgkmcnt=0)
+                    last = fx.memref_load_vec(fx.slice(tiles, (None, warp, 64 + lane)))
+                    buf_copy_store(line_output, 64 + lane, last, fx.Int32, 4)
+                # Drain this wave's LDS reads before the staging slab is overwritten.
+                wait_lds_wave()
             else:
                 buf_copy_store(
                     output[2],
@@ -684,7 +1054,7 @@ def make_attention_a2a_kernel(
                 )
                 buf_copy_store(
                     output[1],
-                    first_word + 4,
+                    last_word,
                     fx.Vector.from_elements([words[i] for i in range(4, 6)], fx.Int32),
                     fx.Int32,
                     2,
@@ -706,12 +1076,27 @@ def make_attention_a2a_kernel(
             scale_only: fx.Constexpr[bool] = False,
         ):
             groups_per_row = head_dim // 32
-            source = (
-                (seq * heads + dest_pe * heads_local + head) * head_dim + channel * 32
-            ) // 2
+            source = input_offset(
+                seq,
+                global_head(dest_pe, head),
+                _row_field_offset(channel, fx.Int32(0), 16),
+                2,
+            )
+            source_row = fx.slice(
+                fx.make_view(
+                    fx.get_iter(input_q),
+                    fx.make_layout((UNBOUNDED_OUTER_EXTENT, 16), (1, 1)),
+                ),
+                (source, None),
+            )
+            source_parts = fx.logical_divide(source_row, fx.make_layout(4, 1))
+            source_fields = fx.make_view(
+                fx.get_iter(source_parts),
+                fx.select(fx.get_layout(source_parts), [1, 0]),
+            )
             vals = []
             for part in range_constexpr(4):
-                raw = buf_copy_load(input_q, source + part * 4, fx.Int32, 4)
+                raw = buf_copy_load(source_fields, part, fx.Int32, 4)
                 decoded = fx.Vector(raw).bitcast(fx.BFloat16).to(fx.Float32)
                 vals.extend([decoded[i] for i in range(8)])
             if const_expr(hadamard):
@@ -735,9 +1120,7 @@ def make_attention_a2a_kernel(
                 if valid:
                     buf_copy_store(
                         scale_output,
-                        (rank * seq_len + seq) * heads_local * groups_per_row
-                        + head * groups_per_row
-                        + channel,
+                        row_offset(global_token(seq), head, channel, groups_per_row),
                         scale.to(fx.Int8),
                         fx.Int8,
                     )
@@ -745,6 +1128,7 @@ def make_attention_a2a_kernel(
                 reciprocal = ((fx.Int32(254) - scale) << 23).bitcast(fx.Float32)
                 # Round the reciprocal product to FP32 before FP6 conversion, including overflow.
                 vals = [value * reciprocal for value in vals]
+                # Native FP6 pack: software is 68-94% slower for packed Q/K recipes at ws8.
                 words = emit_f32_to_e2m3_native(
                     fx.Vector.from_elements(
                         vals[:16] if v4_output else vals[::2], fx.Float32
@@ -754,47 +1138,58 @@ def make_attention_a2a_kernel(
                     ),
                     fx.Float32(1.0),
                 )
-                full_seq = rank * seq_len + seq
-                destination = (
-                    (full_seq * heads_local + head) * groups_per_row + channel
-                    if v4_output
-                    else (head * seq_full + full_seq) * groups_per_row + channel
+                full_seq = global_token(seq)
+                destination = row_offset(
+                    full_seq, head, channel, groups_per_row, head_major=not v4_output
                 )
-                first_word = destination * 6
-                last_word = first_word + 4
+                first_word = _row_field_offset(destination, fx.Int32(0), 6)
+                last_word = _row_field_offset(destination, fx.Int32(4), 6)
                 if const_expr(v4_output == "k"):
-                    tile_word = (head * k_tiles + full_seq // 128) * 4352
-                    token = full_seq % 128
-                    first_word = (
-                        tile_word + token // 32 * 512 + channel * 128 + token % 32 * 4
+                    seq_coord = _k_sequence_coord(full_seq)
+                    tile_word = k_fp6_tile_offset(
+                        head, fx.Int32(fx.get_scalar(fx.get(seq_coord, 0)))
                     )
-                    last_word = (
-                        tile_word
-                        + 2048
-                        + token // 32 * 256
-                        + channel * 64
-                        + token % 32 * 2
-                    )
+                    token = fx.Int32(fx.get_scalar(fx.get(seq_coord, 1)))
+                    band_a = _k_fp6_band_view(output[2], tile_word, token, channel, 4)
+                    band_b = _k_fp6_band_view(output[1], tile_word, token, channel, 2)
+                    first_word = fx.Int32(0)
+                    last_word = fx.Int32(0)
                 if valid:
                     if const_expr(v4_output in ("", "q")):
-                        wave_start = group * 64
+                        wave_start = wave_chunk(group, fx.Int32(0))
                         coalesced = wave_start + 63 < peer_groups
                         if const_expr(not v4_output):
                             # A head boundary skips the other source ranks' sequence slabs.
+                            work_layout = fx.make_layout(
+                                (UNBOUNDED_OUTER_EXTENT, seq_len, groups_per_row),
+                                (seq_len * groups_per_row, groups_per_row, 1),
+                            )
+                            first_coord = fx.idx2crd(fx.Int32(wave_start), work_layout)
+                            last_coord = fx.idx2crd(
+                                fx.Int32(wave_start + 63), work_layout
+                            )
                             coalesced = coalesced & (
-                                wave_start // (seq_len * groups_per_row)
-                                == (wave_start + 63) // (seq_len * groups_per_row)
+                                fx.Int32(fx.get_scalar(fx.get(first_coord, 0)))
+                                == fx.Int32(fx.get_scalar(fx.get(last_coord, 0)))
                             )
                         staging = shared.fp6_words.view(
                             fx.make_layout(warp_num_per_block * 384, 1)
                         )
                         tiles = shared.fp6_words.view(
-                            fx.make_layout((4, warp_num_per_block * 96), (1, 4))
+                            fx.make_layout((4, warp_num_per_block, 96), (1, 384, 4))
+                        )
+                        wave_origin = fx.make_layout(
+                            (UNBOUNDED_OUTER_EXTENT, 64), (6, -6)
+                        )
+                        wave_word = fx.Int32(
+                            fx.get_scalar(fx.crd2idx((destination, lane), wave_origin))
                         )
                         store_dense_fp6(
                             words,
                             output,
                             first_word,
+                            last_word,
+                            wave_word,
                             coalesced,
                             staging,
                             tiles,
@@ -802,8 +1197,14 @@ def make_attention_a2a_kernel(
                             lane,
                         )
                     else:
+                        band_a_wide = fx.make_view(
+                            fx.get_iter(band_a), fx.make_layout((4, 4), (1, 1))
+                        )
+                        band_b_wide = fx.make_view(
+                            fx.get_iter(band_b), fx.make_layout((2, 2), (1, 1))
+                        )
                         buf_copy_store(
-                            output[2],
+                            band_a_wide,
                             first_word,
                             fx.Vector.from_elements(
                                 [words[i] for i in range(4)], fx.Int32
@@ -812,7 +1213,7 @@ def make_attention_a2a_kernel(
                             4,
                         )
                         buf_copy_store(
-                            output[1],
+                            band_b_wide,
                             last_word,
                             fx.Vector.from_elements(
                                 [words[i] for i in range(4, 6)], fx.Int32
@@ -825,68 +1226,82 @@ def make_attention_a2a_kernel(
                             scale_output, destination, scale.to(fx.Int8), fx.Int8
                         )
                     if const_expr(v4_output == "k"):
-                        scale_slot = (
-                            token % 32 // 16 * 256 + (token % 16 * 4 + token // 32) * 4
+                        # B replicates the preceding channel/token, correcting a tile crossing.
+                        tile_byte = _row_field_offset(tile_word, fx.Int32(0), 4)
+                        image_a = _k_fp6_scale_image(output[3], tile_byte, 0)
+                        image_b = _k_fp6_scale_image(output[3], tile_byte, 1)
+                        scale_slot = _k_fp6_scale_slot(token)
+                        previous_token, previous_channel = _k_fp6_predecessor(
+                            full_seq, channel
                         )
-                        previous = (token + 127) % 128
-                        previous_slot = (
-                            previous % 32 // 16 * 256
-                            + (previous % 16 * 4 + previous // 32) * 4
-                        )
-                        previous_tile = tile_word * 4 - (token == 0).select(
-                            fx.Int32(17408), fx.Int32(0)
-                        )
+                        previous_slot = _k_fp6_scale_slot(previous_token)
+                        previous_tile = _row_field_offset(tile_word, fx.Int32(0), 4) - (
+                            token == 0
+                        ).select(fx.Int32(17408), fx.Int32(0))
                         if const_expr(staged):
                             tail_view = shared.k_tail.view(
-                                fx.make_layout(warp_num_per_block * 1024, 1)
+                                fx.make_layout(
+                                    (warp_num_per_block, 2, 512), (1024, 512, 1)
+                                )
                             )
-                            tail_base = warp * 1024
                             fx.memref_store(
                                 scale.to(fx.Int8),
                                 tail_view,
-                                tail_base + scale_slot + channel,
+                                (warp, 0, _k_fp6_scale_field(scale_slot, channel)),
                             )
                             if channel > 0:
                                 fx.memref_store(
                                     scale.to(fx.Int8),
                                     tail_view,
-                                    tail_base + 512 + scale_slot + channel - 1,
+                                    (
+                                        warp,
+                                        1,
+                                        _k_fp6_scale_field(
+                                            scale_slot, previous_channel
+                                        ),
+                                    ),
                                 )
                             elif token > 0:
                                 fx.memref_store(
                                     scale.to(fx.Int8),
                                     tail_view,
-                                    tail_base + 512 + previous_slot + 3,
+                                    (
+                                        warp,
+                                        1,
+                                        _k_fp6_scale_field(
+                                            previous_slot, previous_channel
+                                        ),
+                                    ),
                                 )
                             elif full_seq > 0:
                                 # The previous tile's last B byte may belong to another wave.
                                 buf_copy_store(
-                                    output[3],
-                                    previous_tile + 16896 + previous_slot + 3,
+                                    _k_fp6_scale_image(output[3], previous_tile, 1),
+                                    _k_fp6_scale_field(previous_slot, previous_channel),
                                     scale.to(fx.Int8),
                                     fx.Int8,
                                     1,
                                 )
                         else:
                             buf_copy_store(
-                                output[3],
-                                tile_word * 4 + 16384 + scale_slot + channel,
+                                image_a,
+                                _k_fp6_scale_field(scale_slot, channel),
                                 scale.to(fx.Int8),
                                 fx.Int8,
                                 1,
                             )
                             if channel > 0:
                                 buf_copy_store(
-                                    output[3],
-                                    tile_word * 4 + 16896 + scale_slot + channel - 1,
+                                    image_b,
+                                    _k_fp6_scale_field(scale_slot, previous_channel),
                                     scale.to(fx.Int8),
                                     fx.Int8,
                                     1,
                                 )
                             elif full_seq > 0:
                                 buf_copy_store(
-                                    output[3],
-                                    previous_tile + 16896 + previous_slot + 3,
+                                    _k_fp6_scale_image(output[3], previous_tile, 1),
+                                    _k_fp6_scale_field(previous_slot, previous_channel),
                                     scale.to(fx.Int8),
                                     fx.Int8,
                                     1,
@@ -894,8 +1309,21 @@ def make_attention_a2a_kernel(
 
         @flyc.jit
         def transport_fp6_native(shared):
-            dest_pe = global_warp_id % npes
-            peer_warp = global_warp_id // npes
+            if const_expr(v4_output == "q"):
+                # Layout decomposition adds 26 VGPRs to packed native FP6 Q.
+                native_q_peer = fx.idx2crd(
+                    fx.Int32(global_warp_id),
+                    fx.make_layout((UNBOUNDED_OUTER_EXTENT, npes), (npes, 1)),
+                )
+                peer_warp = fx.Int32(fx.get_scalar(fx.get(native_q_peer, 0)))
+                dest_pe = fx.Int32(fx.get_scalar(fx.get(native_q_peer, 1)))
+            else:
+                peer_coord = fx.idx2crd(
+                    fx.Int32(global_warp_id),
+                    fx.make_layout((UNBOUNDED_OUTER_EXTENT, npes), (npes, 1)),
+                )
+                peer_warp = fx.Int32(fx.get_scalar(fx.get(peer_coord, 0)))
+                dest_pe = fx.Int32(fx.get_scalar(fx.get(peer_coord, 1)))
             peer_warps = global_warp_num // npes
             groups_per_row = head_dim // 32
             peer_groups = heads_local * seq_len * groups_per_row
@@ -906,9 +1334,18 @@ def make_attention_a2a_kernel(
             scale_output = ptr_buf_tensor(wave_uniform_i64(scale_base), fx.Int8)
             if const_expr(v4_output == "k" and k_own_tiles > 0):
                 for item in range(peer_warp, heads_local * k_own_tiles, peer_warps):
-                    head = item // k_own_tiles
-                    tile = k_first_tile + item % k_own_tiles
-                    tile_seq = tile * 128 - rank * seq_len
+                    native_tile_coord = fx.idx2crd(
+                        fx.Int32(item),
+                        fx.make_layout(
+                            (UNBOUNDED_OUTER_EXTENT, k_own_tiles), (k_own_tiles, 1)
+                        ),
+                    )
+                    head = fx.Int32(fx.get_scalar(fx.get(native_tile_coord, 0)))
+                    tile = fx.Int32(fx.get_scalar(fx.get(native_tile_coord, 1)))
+                    tile = k_first_tile + tile
+                    tile_seq = (
+                        _row_field_offset(tile, fx.Int32(0), 128) - rank * seq_len
+                    )
                     for sub in range(fx.Int32(0), fx.Int32(8), fx.Int32(1)):
                         emit_fp6_group(
                             shared,
@@ -918,50 +1355,100 @@ def make_attention_a2a_kernel(
                             peer_groups,
                             dest_pe,
                             head,
-                            tile_seq + sub * 16 + lane // 4,
+                            tile_seq
+                            + fx.Int32(
+                                fx.get_scalar(
+                                    fx.crd2idx(
+                                        (fx.Int32(sub), lane // 4),
+                                        fx.make_layout((8, 16), (16, 1)),
+                                    )
+                                )
+                            ),
                             lane % 4,
                             lane >= 0,
                             True,
                         )
-                    fx.rocdl.s_waitcnt(lgkmcnt=0)
+                    # Drain this wave's LDS writes before other lanes read the staging slab.
+                    wait_lds_wave()
                     tail_view = shared.k_tail.view(
-                        fx.make_layout(warp_num_per_block * 1024, 1)
+                        fx.make_layout((warp_num_per_block, 2, 512), (1024, 512, 1))
                     )
                     lines = shared.k_tail.view(
-                        fx.make_layout((16, warp_num_per_block * 64), (1, 16))
+                        fx.make_layout((16, warp_num_per_block, 64), (1, 1024, 16))
                     )
-                    tile_word = (head * k_tiles + tile) * 4352
+                    tile_word = k_fp6_tile_offset(head, tile)
                     # Lines 0-31 are image A, 32-62 the whole lines of B. B's last
                     # byte is written by the next tile's first token, so line 63
                     # keeps byte stores for its 15 bytes owned here.
                     if lane < 63:
                         packed = fx.Vector(
-                            fx.memref_load_vec(
-                                fx.slice(lines, (None, warp * 64 + lane))
-                            )
+                            fx.memref_load_vec(fx.slice(lines, (None, warp, lane)))
                         ).bitcast(fx.Int32)
-                        buf_copy_store(
-                            output[2], tile_word + 4096 + lane * 4, packed, fx.Int32, 4
+                        tail_tile = _field_view(output[2], tile_word, 4352)
+                        tail_row = fx.make_view(
+                            fx.add_offset(fx.get_iter(tail_tile), 4096),
+                            fx.make_layout(256, 1),
                         )
+                        tail_lines = fx.logical_divide(tail_row, fx.make_layout(4, 1))
+                        tail_output = fx.make_view(
+                            fx.get_iter(tail_lines),
+                            fx.select(fx.get_layout(tail_lines), [1, 0]),
+                        )
+                        buf_copy_store(tail_output, lane, packed, fx.Int32, 4)
                     if lane < 15:
-                        byte = fx.memref_load(tail_view, warp * 1024 + 1008 + lane)
-                        buf_copy_store(
-                            output[3], tile_word * 4 + 17392 + lane, byte, fx.Int8, 1
+                        last_line = fx.slice(
+                            fx.logical_divide(
+                                fx.slice(tail_view, (warp, 1, None)),
+                                fx.make_layout(16, 1),
+                            ),
+                            (None, 31),
                         )
-                    fx.rocdl.s_waitcnt(lgkmcnt=0)
+                        byte = fx.memref_load(last_line, lane)
+                        buf_copy_store(
+                            _field_view(
+                                _k_fp6_scale_image(
+                                    output[3],
+                                    _row_field_offset(tile_word, fx.Int32(0), 4),
+                                    1,
+                                ),
+                                496,
+                                16,
+                            ),
+                            lane,
+                            byte,
+                            fx.Int8,
+                            1,
+                        )
+                    # Drain this wave's LDS reads before the staging slab is overwritten.
+                    wait_lds_wave()
             for group in range(peer_warp, (peer_groups + 63) // 64, peer_warps):
-                index = group * 64 + lane
+                index = wave_chunk(group, lane)
                 valid = index < peer_groups
                 safe = valid.select(index, 0)
                 if const_expr(v4_output == "q"):
                     # Token-major lanes make each wave's packed Q destination one
                     # contiguous slab, so the LDS-coalesced store applies.
-                    seq = safe // (heads_local * groups_per_row)
-                    head = safe // groups_per_row % heads_local
+                    native_q_coord = fx.idx2crd(
+                        fx.Int32(safe),
+                        fx.make_layout(
+                            (UNBOUNDED_OUTER_EXTENT, heads_local, groups_per_row),
+                            (heads_local * groups_per_row, groups_per_row, 1),
+                        ),
+                    )
+                    seq = fx.Int32(fx.get_scalar(fx.get(native_q_coord, 0)))
+                    head = fx.Int32(fx.get_scalar(fx.get(native_q_coord, 1)))
+                    channel = fx.Int32(fx.get_scalar(fx.get(native_q_coord, 2)))
                 else:
-                    head = safe // (seq_len * groups_per_row)
-                    seq = safe // groups_per_row % seq_len
-                channel = safe % groups_per_row
+                    native_k_coord = fx.idx2crd(
+                        fx.Int32(safe),
+                        fx.make_layout(
+                            (UNBOUNDED_OUTER_EXTENT, seq_len, groups_per_row),
+                            (seq_len * groups_per_row, groups_per_row, 1),
+                        ),
+                    )
+                    head = fx.Int32(fx.get_scalar(fx.get(native_k_coord, 0)))
+                    seq = fx.Int32(fx.get_scalar(fx.get(native_k_coord, 1)))
+                    channel = fx.Int32(fx.get_scalar(fx.get(native_k_coord, 2)))
                 if const_expr(v4_output == "k" and k_own_tiles > 0):
                     own_lo = k_first_tile * 128 - rank * seq_len
                     own_hi = k_last_tile * 128 - rank * seq_len
@@ -969,14 +1456,20 @@ def make_attention_a2a_kernel(
                     valid = valid & ((seq < own_lo) | (seq >= own_hi))
                 selected = fx.Int32(1) == 1
                 if const_expr(v4_output == "k" and k_own_tiles > 0):
-                    first = group * 64
+                    first = wave_chunk(group, fx.Int32(0))
                     last = first + 63
-                    first_seq = first // groups_per_row % seq_len
-                    last_seq = last // groups_per_row % seq_len
+                    work_layout = fx.make_layout(
+                        (UNBOUNDED_OUTER_EXTENT, seq_len, groups_per_row),
+                        (seq_len * groups_per_row, groups_per_row, 1),
+                    )
+                    first_coord = fx.idx2crd(fx.Int32(first), work_layout)
+                    last_coord = fx.idx2crd(fx.Int32(last), work_layout)
+                    first_seq = fx.Int32(fx.get_scalar(fx.get(first_coord, 1)))
+                    last_seq = fx.Int32(fx.get_scalar(fx.get(last_coord, 1)))
                     whole = (
                         (
-                            first // (seq_len * groups_per_row)
-                            == last // (seq_len * groups_per_row)
+                            fx.Int32(fx.get_scalar(fx.get(first_coord, 0)))
+                            == fx.Int32(fx.get_scalar(fx.get(last_coord, 0)))
                         )
                         & (first_seq >= own_lo)
                         & (last_seq < own_hi)
@@ -999,9 +1492,16 @@ def make_attention_a2a_kernel(
             if const_expr(v4_output == "k"):
                 # Token-major scales keep remote writes contiguous across heads.
                 for group in range(peer_warp, (peer_groups + 63) // 64, peer_warps):
-                    index = group * 64 + lane
+                    index = wave_chunk(group, lane)
                     valid = index < peer_groups
                     safe = valid.select(index, 0)
+                    scale_coord = fx.idx2crd(
+                        fx.Int32(safe),
+                        fx.make_layout(
+                            (UNBOUNDED_OUTER_EXTENT, heads_local, groups_per_row),
+                            (heads_local * groups_per_row, groups_per_row, 1),
+                        ),
+                    )
                     emit_fp6_group(
                         shared,
                         output,
@@ -1009,9 +1509,9 @@ def make_attention_a2a_kernel(
                         group,
                         peer_groups,
                         dest_pe,
-                        safe // groups_per_row % heads_local,
-                        safe // (heads_local * groups_per_row),
-                        safe % groups_per_row,
+                        fx.Int32(fx.get_scalar(fx.get(scale_coord, 1))),
+                        fx.Int32(fx.get_scalar(fx.get(scale_coord, 0))),
+                        fx.Int32(fx.get_scalar(fx.get(scale_coord, 2))),
                         valid,
                         False,
                         True,
@@ -1025,7 +1525,7 @@ def make_attention_a2a_kernel(
             ):
                 value = buf_copy_load(
                     local_scales,
-                    1 + dest_pe * global_warp_num + fx.Int32(part),
+                    amax_partial_offset(dest_pe, fx.Int32(part)),
                     fx.Float32,
                 )
                 result = yield [state[0].maximumf(value)]
@@ -1041,15 +1541,29 @@ def make_attention_a2a_kernel(
             for shift in (32, 16, 8, 4, 2, 1):
                 maximum = maximum.maximumf(maximum.shuffle_xor(shift, 64))
             if lane == 0:
-                slot = 1 + dest_pe * global_warp_num + rank * peer_warps + peer_warp
+                part = fx.Int32(
+                    fx.get_scalar(
+                        fx.crd2idx(
+                            (fx.Int32(rank), peer_warp),
+                            fx.make_layout((npes, peer_warps), (peer_warps, 1)),
+                        )
+                    )
+                )
+                slot = amax_partial_offset(dest_pe, part)
                 for peer in range_constexpr(npes):
                     base = buf_copy_load(scale_table, peer, fx.Int64)
-                    buffer_store(maximum, create_buffer_resource_from_addr(base), slot)
+                    buf_copy_store(
+                        ptr_buf_tensor(base, fx.Float32), slot, maximum, fx.Float32
+                    )
 
         @flyc.jit
         def transport_v4_per_tensor_qk():
-            dest_pe = global_warp_id % npes
-            peer_warp = global_warp_id // npes
+            peer_coord = fx.idx2crd(
+                fx.Int32(global_warp_id),
+                fx.make_layout((UNBOUNDED_OUTER_EXTENT, npes), (npes, 1)),
+            )
+            peer_warp = fx.Int32(fx.get_scalar(fx.get(peer_coord, 0)))
+            dest_pe = fx.Int32(fx.get_scalar(fx.get(peer_coord, 1)))
             peer_warps = global_warp_num // npes
             scale_table = ptr_buf_tensor(addr_p2p_scale, fx.Int64)
             local_scale_base = buf_copy_load(scale_table, rank, fx.Int64)
@@ -1065,20 +1579,34 @@ def make_attention_a2a_kernel(
                     buf_copy_store(local_scales, 0, scale, fx.Float32)
 
             base = fx.Uint64(fx.memref_load(p2p_bases_q, dest_pe))
-            output = create_buffer_resource_from_addr(wave_uniform_i64(base))
+            output = ptr_buf_tensor(
+                wave_uniform_i64(base), fx.Int32, unit_elems=2, unit_stride=1
+            )
             maximum = fx.Float32(0.0)
             # Each 16-lane group owns one (row, destination head) pair, so every lane loads
             # an owned head and the Hadamard lane groups stay head-aligned.
             groups = 64 * vec // head_dim
             rows = 8
             loads = rows * heads_local // groups
-            group_lane = lane % (head_dim // vec)
+            lane_pair_coord = fx.idx2crd(
+                fx.Int32(lane),
+                fx.make_layout((groups, head_dim // vec), (head_dim // vec, 1)),
+            )
+            lane_pair = fx.Int32(fx.get_scalar(fx.get(lane_pair_coord, 0)))
+            group_lane = fx.Int32(fx.get_scalar(fx.get(lane_pair_coord, 1)))
             pair_rows = []
             pair_heads = []
             for load in range_constexpr(loads):
-                pair = lane // (head_dim // vec) + load * groups
-                pair_rows.append(pair // heads_local)
-                pair_heads.append(pair % heads_local)
+                pair_row_coord = fx.idx2crd(
+                    fx.Int32(lane_pair + load * groups),
+                    fx.make_layout(
+                        (UNBOUNDED_OUTER_EXTENT, heads_local), (heads_local, 1)
+                    ),
+                )
+                pair_row = fx.Int32(fx.get_scalar(fx.get(pair_row_coord, 0)))
+                pair_head = fx.Int32(fx.get_scalar(fx.get(pair_row_coord, 1)))
+                pair_rows.append(pair_row)
+                pair_heads.append(pair_head)
             for seq0, state in range(
                 peer_warp,
                 fx.Int32(seq_len),
@@ -1089,7 +1617,6 @@ def make_attention_a2a_kernel(
                 seqs = []
                 tiles = []
                 # Preload the batch before compute to overlap load latency.
-                # sched_barrier(0) keeps the compiler from sinking loads into compute.
                 for load in range_constexpr(loads):
                     seq = seq0 + pair_rows[load] * peer_warps
                     valid = seq < seq_len
@@ -1099,15 +1626,28 @@ def make_attention_a2a_kernel(
                         fx.Vector(
                             buf_copy_load(
                                 input_q,
-                                seq * hd
-                                + (dest_pe * heads_local + pair_heads[load]) * head_dim
-                                + group_lane * vec,
+                                fx.Int32(
+                                    fx.get_scalar(
+                                        fx.crd2idx(
+                                            (
+                                                seq,
+                                                global_head(dest_pe, pair_heads[load]),
+                                                _row_field_offset(
+                                                    group_lane, fx.Int32(0), vec
+                                                ),
+                                            ),
+                                            fx.make_layout(
+                                                (seq_len, heads, head_dim),
+                                                (hd, head_dim, 1),
+                                            ),
+                                        )
+                                    )
+                                ),
                                 elem=fx.BFloat16,
                                 unit_elems=vec,
                             )
                         ).to(fx.Float32)
                     )
-                fx.rocdl.sched_barrier(0)
                 current = state[0]
                 for load in range_constexpr(loads):
                     seq, valid = seqs[load]
@@ -1140,13 +1680,15 @@ def make_attention_a2a_kernel(
                             for i in range(4)
                         ]
                         if valid:
-                            destination = (
-                                (rank * seq_len + seq) * heads_local + pair_heads[load]
-                            ) * 16 + group_lane
-                            buffer_store(
-                                _pack_transport_words(pairs, codec),
+                            destination = row_offset(
+                                global_token(seq), pair_heads[load], group_lane, 16
+                            )
+                            buf_copy_store(
                                 output,
-                                destination * 2,
+                                _row_field_offset(destination, fx.Int32(0), 2),
+                                _pack_transport_words(pairs, codec),
+                                fx.Int32,
+                                2,
                             )
                 result = yield [current]
             if const_expr(v4_amax):
@@ -1156,13 +1698,22 @@ def make_attention_a2a_kernel(
 
         @flyc.jit
         def transport_v4_fp8_pc_v():
-            dest_pe = global_warp_id % npes
-            peer_warp = global_warp_id // npes
+            peer_coord = fx.idx2crd(
+                fx.Int32(global_warp_id),
+                fx.make_layout((UNBOUNDED_OUTER_EXTENT, npes), (npes, 1)),
+            )
+            peer_warp = fx.Int32(fx.get_scalar(fx.get(peer_coord, 0)))
+            dest_pe = fx.Int32(fx.get_scalar(fx.get(peer_coord, 1)))
             peer_warps = global_warp_num // npes
             channels = heads_local * head_dim
             scale_table = ptr_buf_tensor(addr_p2p_scale, fx.Int64)
             local_scale_base = buf_copy_load(scale_table, rank, fx.Int64)
             local_scales = ptr_buf_tensor(local_scale_base, fx.Float32)
+            descales = _field_view(local_scales, fx.Int32(0), channels)
+            exchange = fx.make_view(
+                fx.add_offset(fx.get_iter(local_scales), channels),
+                fx.make_layout((npes, npes, channels), (npes * channels, channels, 1)),
+            )
             base = fx.Uint64(fx.memref_load(p2p_bases_q, dest_pe))
             output = ptr_buf_tensor(
                 wave_uniform_i64(base), fx.Int32, unit_elems=2, unit_stride=1
@@ -1173,14 +1724,22 @@ def make_attention_a2a_kernel(
             partials = ptr_buf_tensor(addr_p2p_partial, fx.Float32)
             work_items = channel_chunks if pc_reduce else token_tiles * channel_chunks
             for item in range(
-                peer_warp * 64 + lane,
+                wave_chunk(peer_warp, lane),
                 fx.Int32(work_items),
                 fx.Int32(peer_warps * 64),
             ):
                 item = fx.Int32(item)
-                channel = (item % channel_chunks) * 8
-                tile = item // channel_chunks
-                seq_begin = tile * token_tile
+                # Work-item decomposition assigns one channel vector and token tile.
+                pc_work_coord = fx.idx2crd(
+                    fx.Int32(item),
+                    fx.make_layout(
+                        (channel_chunks, UNBOUNDED_OUTER_EXTENT), (1, channel_chunks)
+                    ),
+                )
+                channel_chunk = fx.Int32(fx.get_scalar(fx.get(pc_work_coord, 0)))
+                tile = fx.Int32(fx.get_scalar(fx.get(pc_work_coord, 1)))
+                channel = _row_field_offset(channel_chunk, fx.Int32(0), 8)
+                seq_begin = _row_field_offset(tile, fx.Int32(0), token_tile)
                 seq_end = fx.min(seq_begin + token_tile, fx.Int32(seq_len))
                 if const_expr(v4_amax):
                     maximum = fx.Vector.filled(8, 0.0, fx.Float32)
@@ -1193,13 +1752,20 @@ def make_attention_a2a_kernel(
                             fx.Int32(1),
                             init=[maximum],
                         ):
-                            offset = (dest_pe * token_tiles + fx.Int32(part)) * channels
+                            offset = pc_partial_offset(
+                                dest_pe, fx.Int32(part), token_tiles, channels
+                            )
+                            partial_channels = _field_view(partials, offset, channels)
+                            partial_vectors = fx.logical_divide(
+                                partial_channels, fx.make_layout(8, 1)
+                            )
+                            partial_row = fx.slice(
+                                partial_vectors, (None, channel_chunk)
+                            )
                             combined = fx.Vector.from_elements(
                                 [
                                     fx.Float32(
-                                        buf_copy_load(
-                                            partials, offset + channel + i, fx.Float32
-                                        )
+                                        buf_copy_load(partial_row, i, fx.Float32)
                                     )
                                     for i in range(8)
                                 ],
@@ -1207,14 +1773,25 @@ def make_attention_a2a_kernel(
                             )
                             result = yield [state[0].maximumf(combined)]
                         maximum = fx.Vector(result)
-                        slot = channels + (dest_pe * npes + rank) * channels + channel
                         for peer in range_constexpr(npes):
                             remote = buf_copy_load(scale_table, peer, fx.Int64)
                             resource = ptr_buf_tensor(remote, fx.Float32)
+                            remote_exchange = fx.make_view(
+                                fx.add_offset(fx.get_iter(resource), channels),
+                                fx.make_layout(
+                                    (npes, npes, channels),
+                                    (npes * channels, channels, 1),
+                                ),
+                            )
+                            scale_channels = fx.slice(
+                                remote_exchange, (dest_pe, rank, None)
+                            )
+                            scale_row = fx.slice(
+                                fx.logical_divide(scale_channels, fx.make_layout(8, 1)),
+                                (None, channel_chunk),
+                            )
                             for i in range_constexpr(8):
-                                buf_copy_store(
-                                    resource, slot + i, maximum[i], fx.Float32
-                                )
+                                buf_copy_store(scale_row, i, maximum[i], fx.Float32)
                     else:
                         # Partial producers never wait: each tile publishes one
                         # local maximum per channel before the cross-rank handshake.
@@ -1224,24 +1801,49 @@ def make_attention_a2a_kernel(
                             fx.Int32(1),
                             init=[maximum],
                         ):
-                            source = fx.Int32(seq) * hd + dest_pe * channels + channel
+                            source = fx.Int32(
+                                fx.get_scalar(
+                                    fx.crd2idx(
+                                        (
+                                            fx.Int32(seq),
+                                            global_head(dest_pe, fx.Int32(0)),
+                                            channel,
+                                        ),
+                                        fx.make_layout(
+                                            (seq_len, heads, head_dim),
+                                            (hd, head_dim, 1),
+                                        ),
+                                    )
+                                )
+                            )
                             values = fx.Vector(
                                 buf_copy_load(input_q, source, fx.BFloat16, 8)
                             ).to(fx.Float32)
                             result = yield [state[0].maximumf(fmath.absf(values))]
                         maximum = fx.Vector(result)
-                        offset = (dest_pe * token_tiles + tile) * channels + channel
+                        offset = pc_partial_offset(dest_pe, tile, token_tiles, channels)
+                        partial_channels = _field_view(partials, offset, channels)
+                        partial_row = fx.slice(
+                            fx.logical_divide(partial_channels, fx.make_layout(8, 1)),
+                            (None, channel_chunk),
+                        )
                         for i in range_constexpr(8):
-                            buf_copy_store(partials, offset + i, maximum[i], fx.Float32)
+                            buf_copy_store(partial_row, i, maximum[i], fx.Float32)
                 else:
                     scales = []
+                    channel_scales = fx.slice(
+                        fx.logical_divide(descales, fx.make_layout(8, 1)),
+                        (None, channel_chunk),
+                    )
                     for i in range_constexpr(8):
                         maximum = fx.Float32(0.0)
                         for peer in range_constexpr(npes):
-                            slot = channels + (dest_pe * npes + peer) * channels
-                            partial = buf_copy_load(
-                                local_scales, slot + channel + i, fx.Float32
+                            peer_channels = fx.slice(exchange, (dest_pe, peer, None))
+                            peer_scales = fx.slice(
+                                fx.logical_divide(peer_channels, fx.make_layout(8, 1)),
+                                (None, channel_chunk),
                             )
+                            partial = buf_copy_load(peer_scales, i, fx.Float32)
                             maximum = maximum.maximumf(partial)
                         # The per-channel descale uses a rounded FP32 reciprocal multiply.
                         scale = maximum * fx.Float32(
@@ -1249,13 +1851,15 @@ def make_attention_a2a_kernel(
                         )
                         scales.append(scale)
                         if (dest_pe == rank) & (tile == 0):
-                            buf_copy_store(local_scales, channel + i, scale, fx.Float32)
+                            buf_copy_store(channel_scales, i, scale, fx.Float32)
                     for seq in range(
                         seq_begin,
                         seq_end,
                         fx.Int32(1),
                     ):
-                        source = fx.Int32(seq) * hd + dest_pe * channels + channel
+                        source = input_offset(
+                            fx.Int32(seq), global_head(dest_pe, fx.Int32(0)), channel
+                        )
                         values = fx.Vector(
                             buf_copy_load(input_q, source, fx.BFloat16, 8)
                         ).to(fx.Float32)
@@ -1267,12 +1871,15 @@ def make_attention_a2a_kernel(
                             )
                             for i in range(4)
                         ]
-                        destination = (
-                            rank * seq_len + fx.Int32(seq)
-                        ) * channels + channel
+                        destination = row_offset(
+                            global_token(fx.Int32(seq)),
+                            0,
+                            _row_field_offset(channel_chunk, fx.Int32(0), 2),
+                            head_dim // 4,
+                        )
                         buf_copy_store(
                             output,
-                            destination // 4,
+                            destination,
                             _pack_transport_words(pairs, "e4m3"),
                             fx.Int32,
                             2,
@@ -1282,8 +1889,12 @@ def make_attention_a2a_kernel(
         def transport_v4_fp8_v():
             # Every source owns a token shard of every destination's tensor.
             # Replicate only warp amax metadata so quantization stays send-side.
-            dest_pe = global_warp_id % npes
-            peer_warp = global_warp_id // npes
+            peer_coord = fx.idx2crd(
+                fx.Int32(global_warp_id),
+                fx.make_layout((UNBOUNDED_OUTER_EXTENT, npes), (npes, 1)),
+            )
+            peer_warp = fx.Int32(fx.get_scalar(fx.get(peer_coord, 0)))
+            dest_pe = fx.Int32(fx.get_scalar(fx.get(peer_coord, 1)))
             peer_warps = global_warp_num // npes
             peer_chunks = total_chunks // npes
             scale_table = ptr_buf_tensor(addr_p2p_scale, fx.Int64)
@@ -1292,17 +1903,31 @@ def make_attention_a2a_kernel(
             if const_expr(v4_amax):
                 maximum = fx.Float32(0.0)
                 for chunk, state in range(
-                    peer_warp * 64 + lane,
+                    wave_chunk(peer_warp, lane),
                     fx.Int32(peer_chunks),
                     fx.Int32(peer_warps * 64),
                     init=[maximum],
                 ):
                     chunk = fx.Int32(chunk)
-                    seq = chunk // (heads_local * 16)
-                    head_chunk = chunk % (heads_local * 16)
-                    source = (seq * heads + dest_pe * heads_local) * 16 + head_chunk
+                    v_chunk_coord = fx.idx2crd(
+                        fx.Int32(chunk),
+                        fx.make_layout(
+                            (UNBOUNDED_OUTER_EXTENT, heads_local * 16),
+                            (heads_local * 16, 1),
+                        ),
+                    )
+                    seq = fx.Int32(fx.get_scalar(fx.get(v_chunk_coord, 0)))
+                    head_chunk = fx.Int32(fx.get_scalar(fx.get(v_chunk_coord, 1)))
+                    source = input_offset(
+                        seq, global_head(dest_pe, fx.Int32(0)), head_chunk, 8
+                    )
                     values = fx.Vector(
-                        buf_copy_load(input_q, source * 8, fx.BFloat16, 8)
+                        buf_copy_load(
+                            input_q,
+                            _row_field_offset(source, fx.Int32(0), 8),
+                            fx.BFloat16,
+                            8,
+                        )
                     ).to(fx.Float32)
                     current = state[0]
                     for i in range_constexpr(8):
@@ -1319,18 +1944,34 @@ def make_attention_a2a_kernel(
                 if (dest_pe == rank) & (peer_warp == 0) & (lane == 0):
                     buf_copy_store(local_scales, 0, scale, fx.Float32)
                 base = fx.Uint64(fx.memref_load(p2p_bases_q, dest_pe))
-                output = create_buffer_resource_from_addr(wave_uniform_i64(base))
+                output = ptr_buf_tensor(
+                    wave_uniform_i64(base), fx.Int32, unit_elems=2, unit_stride=1
+                )
                 for chunk in range(
-                    peer_warp * 64 + lane,
+                    wave_chunk(peer_warp, lane),
                     fx.Int32(peer_chunks),
                     fx.Int32(peer_warps * 64),
                 ):
                     chunk = fx.Int32(chunk)
-                    seq = chunk // (heads_local * 16)
-                    head_chunk = chunk % (heads_local * 16)
-                    source = (seq * heads + dest_pe * heads_local) * 16 + head_chunk
+                    v_chunk_coord = fx.idx2crd(
+                        fx.Int32(chunk),
+                        fx.make_layout(
+                            (UNBOUNDED_OUTER_EXTENT, heads_local * 16),
+                            (heads_local * 16, 1),
+                        ),
+                    )
+                    seq = fx.Int32(fx.get_scalar(fx.get(v_chunk_coord, 0)))
+                    head_chunk = fx.Int32(fx.get_scalar(fx.get(v_chunk_coord, 1)))
+                    source = input_offset(
+                        seq, global_head(dest_pe, fx.Int32(0)), head_chunk, 8
+                    )
                     values = fx.Vector(
-                        buf_copy_load(input_q, source * 8, fx.BFloat16, 8)
+                        buf_copy_load(
+                            input_q,
+                            _row_field_offset(source, fx.Int32(0), 8),
+                            fx.BFloat16,
+                            8,
+                        )
                     ).to(fx.Float32)
                     pairs = [
                         _pack_transport_pair(
@@ -1340,9 +1981,20 @@ def make_attention_a2a_kernel(
                         )
                         for i in range(4)
                     ]
-                    destination = rank * peer_chunks + chunk
-                    buffer_store(
-                        _pack_transport_words(pairs, "e4m3"), output, destination * 2
+                    destination = fx.Int32(
+                        fx.get_scalar(
+                            fx.crd2idx(
+                                (rank, chunk),
+                                fx.make_layout((npes, peer_chunks), (peer_chunks, 1)),
+                            )
+                        )
+                    )
+                    buf_copy_store(
+                        output,
+                        _row_field_offset(destination, fx.Int32(0), 2),
+                        _pack_transport_words(pairs, "e4m3"),
+                        fx.Int32,
+                        2,
                     )
 
         @flyc.jit
@@ -1351,29 +2003,53 @@ def make_attention_a2a_kernel(
             ready_base = buf_copy_load(ready_table, dest_pe, fx.Int64)
             # Local and remote publishers finish in an earlier launch.
             if lane < 2:
-                slot = (rank // 2 * 2 + lane) * heads_local + local_head
-                spin_until_ge_i64(ready_base + fx.Int64(slot) * 8, partial_generation)
-                fence_system_acquire()
+                sender = fx.Int32(
+                    fx.get_scalar(
+                        fx.crd2idx(
+                            (fx.Int32(rank // 2), lane),
+                            fx.make_layout((npes // 2, 2), (2, 1)),
+                        )
+                    )
+                )
+                slot = ready_offset(sender, local_head)
+                ready = fx.inttoptr(
+                    fx.PointerType.get(
+                        fx.Int64.ir_type,
+                        address_space=fx.AddressSpace.Global,
+                        alignment=8,
+                    ),
+                    ready_base,
+                )
+                spin_until_ge_i64(
+                    fx.ptrtoint(fx.add_offset(ready, slot)), partial_generation
+                )
+                fx.memory_fence(
+                    ordering=fx.AtomicOrdering.Acquire,
+                    syncscope=fx.rocdl.SyncScope.OneAs,
+                )
             fx.barrier()
 
         @flyc.jit
         def load_v4_v_amax(shared, head, global_start):
-            scratch = shared.v_amax.view(fx.make_layout(512, 1))
-            channel_chunk = tid % 16
-            token_lane = tid // 16
+            scratch = shared.v_amax.view(fx.make_layout((4, 16, 8), (128, 8, 1)))
+            v_amax_thread_coord = fx.idx2crd(
+                fx.Int32(tid), fx.make_layout((warp_num_per_block * 4, 16), (16, 1))
+            )
+            token_lane = fx.Int32(fx.get_scalar(fx.get(v_amax_thread_coord, 0)))
+            channel_chunk = fx.Int32(fx.get_scalar(fx.get(v_amax_thread_coord, 1)))
             values = []
             for half in range_constexpr(2):
+                # Explicit half/token/channel arithmetic: layout forms turn the scalar (SCC)
+                # loop backedge into a per-lane (VCC) branch.
                 token = global_start + token_lane + half * 16
                 if const_expr(v_pack == AttentionPack.V_FOR_FP6_P):
-                    token = (
-                        (token & ~0x24) | ((token & 0x04) << 3) | ((token & 0x20) >> 3)
-                    )
+                    token = fp6p_source_token(token)
                 valid = (token >= rank * seq_len) & (token < (rank + 1) * seq_len)
                 seq = valid.select(token - rank * seq_len, 0)
                 raw = fx.Vector(
                     buf_copy_load(
                         input_q,
-                        (seq * heads + head) * 128 + channel_chunk * 8,
+                        input_offset(seq, head, channel_chunk * 8),
                         elem=fx.BFloat16,
                         unit_elems=8,
                     )
@@ -1384,6 +2060,7 @@ def make_attention_a2a_kernel(
                         fx.Float32,
                     )
                 )
+            scratch_row = fx.slice(scratch, (warp, channel_chunk, None))
             for i in range_constexpr(8):
                 amax = fmath.absf(values[0][i]).maximumf(fmath.absf(values[1][i]))
                 for shift in (16, 32):
@@ -1391,8 +2068,8 @@ def make_attention_a2a_kernel(
                 if lane < 16:
                     fx.memref_store(
                         amax,
-                        scratch,
-                        warp * 128 + channel_chunk * 8 + i,
+                        scratch_row,
+                        i,
                     )
             fx.barrier()
             maxima = []
@@ -1401,8 +2078,8 @@ def make_attention_a2a_kernel(
                 for source_wave in range_constexpr(4):
                     amax = amax.maximumf(
                         fx.memref_load(
-                            scratch,
-                            source_wave * 128 + channel_chunk * 8 + i,
+                            fx.slice(scratch, (source_wave, channel_chunk, None)),
+                            i,
                         )
                     )
                 maxima.append(amax)
@@ -1410,12 +2087,21 @@ def make_attention_a2a_kernel(
 
         @flyc.jit
         def publish_v_partial(shared):
-            channel_chunk = tid % 16
-            token_lane = tid // 16
+            v_partial_thread_coord = fx.idx2crd(
+                fx.Int32(tid), fx.make_layout((warp_num_per_block * 4, 16), (16, 1))
+            )
+            token_lane = fx.Int32(fx.get_scalar(fx.get(v_partial_thread_coord, 0)))
+            channel_chunk = fx.Int32(fx.get_scalar(fx.get(v_partial_thread_coord, 1)))
             partial_table = ptr_buf_tensor(addr_p2p_partial, fx.Int64)
             for head in range(bid, fx.Int32(heads), fx.Int32(block_num)):
-                dest_pe = head // heads_local
-                local_head = head % heads_local
+                v_partial_head_coord = fx.idx2crd(
+                    fx.Int32(head),
+                    fx.make_layout(
+                        (UNBOUNDED_OUTER_EXTENT, heads_local), (heads_local, 1)
+                    ),
+                )
+                dest_pe = fx.Int32(fx.get_scalar(fx.get(v_partial_head_coord, 0)))
+                local_head = fx.Int32(fx.get_scalar(fx.get(v_partial_head_coord, 1)))
                 partial_base = buf_copy_load(partial_table, dest_pe, fx.Int64)
                 partials = ptr_buf_tensor(partial_base, fx.Float32)
                 for quarter in range_constexpr(2):
@@ -1423,23 +2109,47 @@ def make_attention_a2a_kernel(
                         shared, head, split_frame * 64 + quarter * 32
                     )
                     if token_lane == 0:
+                        partial_row = fx.slice(
+                            fx.make_view(
+                                fx.get_iter(partials),
+                                fx.make_layout((UNBOUNDED_OUTER_EXTENT, 8), (1, 1)),
+                            ),
+                            (
+                                partial_offset(
+                                    rank, local_head, quarter, channel_chunk * 8
+                                ),
+                                None,
+                            ),
+                        )
                         for i in range_constexpr(8):
-                            slot = (rank * heads_local + local_head) * 256
                             buf_copy_store(
-                                partials,
-                                slot + quarter * 128 + channel_chunk * 8 + i,
+                                partial_row,
+                                i,
                                 maxima[i],
                                 fx.Float32,
                             )
                     fx.barrier()
-                fx.rocdl.s_waitcnt(vmcnt=0)
+                fx.memory_fence(
+                    ordering=fx.AtomicOrdering.Release,
+                    syncscope=fx.rocdl.SyncScope.OneAs,
+                )
                 fx.barrier()
                 if tid == 0:
                     ready_table = ptr_buf_tensor(addr_p2p_partial_ready, fx.Int64)
                     ready_base = buf_copy_load(ready_table, dest_pe, fx.Int64)
-                    store_i64_global_system(
-                        ready_base + fx.Int64(rank * heads_local + local_head) * 8,
+                    ready = fx.inttoptr(
+                        fx.PointerType.get(
+                            fx.Int64.ir_type,
+                            address_space=fx.AddressSpace.Global,
+                            alignment=8,
+                        ),
+                        ready_base,
+                    )
+                    fx.generic_store(
+                        fx.add_offset(ready, ready_offset(rank, local_head)),
                         partial_generation,
+                        memory_order=fx.AtomicOrdering.Release,
+                        syncscope=fx.rocdl.SyncScope.OneAs,
                     )
 
         @flyc.jit
@@ -1448,8 +2158,11 @@ def make_attention_a2a_kernel(
             first_tile = rank * seq_len // 128
             rank_tiles = ((rank + 1) * seq_len + 127) // 128 - first_tile
             scale_table = ptr_buf_tensor(addr_p2p_scale, fx.Int64)
-            channel_chunk = tid % 16
-            token_lane = tid // 16
+            v_transport_thread_coord = fx.idx2crd(
+                fx.Int32(tid), fx.make_layout((warp_num_per_block * 4, 16), (16, 1))
+            )
+            token_lane = fx.Int32(fx.get_scalar(fx.get(v_transport_thread_coord, 0)))
+            channel_chunk = fx.Int32(fx.get_scalar(fx.get(v_transport_thread_coord, 1)))
             for phase in range_constexpr(2 if split_v_exchange else 1):
                 if const_expr(split_v_exchange and phase == 1):
                     first_tile = split_frame // 2
@@ -1457,20 +2170,36 @@ def make_attention_a2a_kernel(
                 for work in range(
                     bid, fx.Int32(heads * rank_tiles), fx.Int32(block_num)
                 ):
-                    head = work // rank_tiles
-                    tile_id = first_tile + work % rank_tiles
-                    dest_pe = head // heads_local
-                    local_head = head % heads_local
+                    v_work_coord = fx.idx2crd(
+                        fx.Int32(work),
+                        fx.make_layout(
+                            (UNBOUNDED_OUTER_EXTENT, rank_tiles), (rank_tiles, 1)
+                        ),
+                    )
+                    head = fx.Int32(fx.get_scalar(fx.get(v_work_coord, 0)))
+                    tile_id = first_tile + fx.Int32(
+                        fx.get_scalar(fx.get(v_work_coord, 1))
+                    )
+                    v_head_coord = fx.idx2crd(
+                        head,
+                        fx.make_layout(
+                            (UNBOUNDED_OUTER_EXTENT, heads_local), (heads_local, 1)
+                        ),
+                    )
+                    dest_pe = fx.Int32(fx.get_scalar(fx.get(v_head_coord, 0)))
+                    local_head = fx.Int32(fx.get_scalar(fx.get(v_head_coord, 1)))
                     peer_base = fx.Uint64(fx.memref_load(p2p_bases_q, dest_pe))
-                    rsrc_dst = create_buffer_resource_from_addr(
+                    dst_words = ptr_buf_tensor(
                         wave_uniform_i64(peer_base),
+                        fx.Int32,
                         num_records_bytes=heads_local * k_tiles * 8192 + 64,
                     )
                     scale_base = fx.Uint64(
                         buf_copy_load(scale_table, dest_pe, fx.Int64)
                     )
-                    rsrc_scale = create_buffer_resource_from_addr(
+                    scale_dst = ptr_buf_tensor(
                         wave_uniform_i64(scale_base),
+                        fx.Int8,
                         num_records_bytes=heads_local * k_tiles * 512,
                     )
                     if const_expr(split_v_exchange):
@@ -1480,7 +2209,11 @@ def make_attention_a2a_kernel(
                         partial_base = buf_copy_load(partial_table, dest_pe, fx.Int64)
                         partials = ptr_buf_tensor(partial_base, fx.Float32)
                     for quarter in range_constexpr(4):
-                        global_start = tile_id * 128 + quarter * 32
+                        global_start = _row_field_offset(
+                            tile_id,
+                            _row_field_offset(fx.Int32(quarter), fx.Int32(0), 32),
+                            128,
+                        )
                         owned = (global_start >= rank * seq_len) & (
                             global_start
                             < (
@@ -1490,6 +2223,8 @@ def make_attention_a2a_kernel(
                             )
                         )
                         if const_expr(split_v_exchange):
+                            # Explicit //64*64: a layout form here turns the scalar (SCC) loop backedge
+                            # into a per-lane (VCC) branch.
                             frame_start = global_start // 64 * 64
                             owned = (frame_start < (rank + 1) * seq_len) & (
                                 frame_start + 64 > rank * seq_len
@@ -1507,23 +2242,38 @@ def make_attention_a2a_kernel(
                                 wait_v_partial(dest_pe, local_head)
                             values, maxima = load_v4_v_amax(shared, head, global_start)
                             reciprocals = []
+                            if const_expr(split_v_exchange):
+                                pair_row = _field_view(
+                                    partials,
+                                    paired_partial_offset(
+                                        fx.Int32(0),
+                                        local_head,
+                                        quarter % 2,
+                                        channel_chunk * 8,
+                                    ),
+                                    8,
+                                )
+                                peer_row = _field_view(
+                                    partials,
+                                    paired_partial_offset(
+                                        fx.Int32(1),
+                                        local_head,
+                                        quarter % 2,
+                                        channel_chunk * 8,
+                                    ),
+                                    8,
+                                )
                             for i in range_constexpr(8):
                                 amax = maxima[i]
-                                if const_expr(split_v_exchange):
-                                    slot = (
-                                        ((rank // 2 * 2) * heads_local + local_head)
-                                        * 256
-                                        + (quarter % 2) * 128
-                                        + channel_chunk * 8
-                                        + i
-                                    )
+                                if const_expr(split_v_exchange):  # noqa: SIM102
+                                    # The paired sender is one source-rank slab after this slot.
                                     if frame_start == split_frame * 64:
                                         amax = buf_copy_load(
-                                            partials, slot, fx.Float32
+                                            pair_row, i, fx.Float32
                                         ).maximumf(
                                             buf_copy_load(
-                                                partials,
-                                                slot + heads_local * 256,
+                                                peer_row,
+                                                i,
                                                 fx.Float32,
                                             )
                                         )
@@ -1547,17 +2297,44 @@ def make_attention_a2a_kernel(
                                     )
                                 if write_scale:
                                     channel = channel_chunk * 8 + i
-                                    scale_offset = (
-                                        local_head * k_tiles + tile_id
-                                    ) * 512 + quarter * 128
-                                    scale_offset = (
-                                        scale_offset
-                                        + (channel % 32 // 2) * 8
-                                        + channel // 32
-                                        + (channel % 2) * 4
+                                    scale_row = fx.Int32(
+                                        fx.get_scalar(
+                                            fx.crd2idx(
+                                                (local_head, tile_id),
+                                                fx.make_layout(
+                                                    (heads_local, k_tiles), (k_tiles, 1)
+                                                ),
+                                            )
+                                        )
                                     )
-                                    buffer_store(
-                                        scale.to(fx.Int8), rsrc_scale, scale_offset
+                                    scale_tile = fx.slice(
+                                        fx.make_view(
+                                            fx.get_iter(scale_dst),
+                                            fx.make_layout(
+                                                (heads_local * k_tiles, 512), (512, 1)
+                                            ),
+                                        ),
+                                        (scale_row, None),
+                                    )
+                                    scale_fields = fx.make_view(
+                                        fx.get_iter(scale_tile),
+                                        fx.make_layout(
+                                            (4, (2, 16, 4)), (128, (4, 8, 1))
+                                        ),
+                                    )
+                                    scale_offset = fx.Int32(
+                                        fx.get_scalar(
+                                            fx.crd2idx(
+                                                (fx.Int32(quarter), channel),
+                                                fx.get_layout(scale_fields),
+                                            )
+                                        )
+                                    )
+                                    buf_copy_store(
+                                        scale_tile,
+                                        scale_offset,
+                                        scale.to(fx.Int8),
+                                        fx.Int8,
                                     )
                             for half in range_constexpr(2):
                                 pairs = [
@@ -1569,26 +2346,47 @@ def make_attention_a2a_kernel(
                                     for pair in range(4)
                                 ]
                                 token = token_lane + half * 16
-                                column = (
-                                    (quarter % 2) * 32
-                                    + 4 * (token // 8)
-                                    + 16 * ((token // 4) % 2)
-                                    + token % 4
+                                tile_row = fx.Int32(
+                                    fx.get_scalar(
+                                        fx.crd2idx(
+                                            (local_head, tile_id),
+                                            fx.make_layout(
+                                                (heads_local, k_tiles), (k_tiles, 1)
+                                            ),
+                                        )
+                                    )
                                 )
-                                word_offset = (local_head * k_tiles + tile_id) * 2048
-                                word_offset = (
-                                    word_offset
-                                    + (2 * (channel_chunk // 4) + quarter // 2) * 256
-                                    + column * 4
-                                    + channel_chunk % 4
+                                tile_words = fx.slice(
+                                    fx.make_view(
+                                        fx.get_iter(dst_words),
+                                        fx.make_layout(
+                                            (heads_local * k_tiles, 2048), (2048, 1)
+                                        ),
+                                    ),
+                                    (tile_row, None),
+                                )
+                                payload = fx.make_view(
+                                    fx.get_iter(tile_words),
+                                    fx.make_layout(
+                                        ((4, 4), (2, 2), (4, 2, 4)),
+                                        ((1, 512), (128, 256), (4, 64, 16)),
+                                    ),
+                                )
+                                word_offset = fx.Int32(
+                                    fx.get_scalar(
+                                        fx.crd2idx(
+                                            (
+                                                fx.Int32(channel_chunk),
+                                                fx.Int32(quarter),
+                                                fx.Int32(token),
+                                            ),
+                                            fx.get_layout(payload),
+                                        )
+                                    )
                                 )
                                 source_token = global_start + token
                                 if const_expr(v_pack == AttentionPack.V_FOR_FP6_P):
-                                    source_token = (
-                                        (source_token & ~0x24)
-                                        | ((source_token & 0x04) << 3)
-                                        | ((source_token & 0x20) >> 3)
-                                    )
+                                    source_token = fp6p_source_token(source_token)
                                 write_payload = (source_token >= rank * seq_len) & (
                                     source_token < (rank + 1) * seq_len
                                 )
@@ -1597,10 +2395,11 @@ def make_attention_a2a_kernel(
                                         source_token >= seq_full
                                     )
                                 if write_payload:
-                                    buffer_store(
-                                        _pack_transport_words(pairs, "mxfp4"),
-                                        rsrc_dst,
+                                    buf_copy_store(
+                                        tile_words,
                                         word_offset,
+                                        _pack_transport_words(pairs, "mxfp4"),
+                                        fx.Int32,
                                     )
                             # All waves finish reading the reduction before its next use.
                             fx.barrier()
@@ -1611,11 +2410,23 @@ def make_attention_a2a_kernel(
             rank_tiles = ((rank + 1) * seq_len + 127) // 128 - first_tile
             staging = shared.fp6_words.view(fx.make_layout(warp_num_per_block * 384, 1))
             tiles = shared.fp6_words.view(
-                fx.make_layout((4, warp_num_per_block * 96), (1, 4))
+                fx.make_layout((4, warp_num_per_block, 96), (1, 384, 4))
             )
-            scale_image = shared.v_scales.view(fx.make_layout(512, 1))
+            scale_image = shared.v_scales.view(fx.make_layout((2, 64, 4), (256, 4, 1)))
             scale_table = ptr_buf_tensor(addr_p2p_scale, fx.Int64)
-            channel = warp * 32 + lane % 32
+            fp6p_lane_coord = fx.idx2crd(
+                fx.Int32(lane), fx.make_layout((2, 32), (32, 1))
+            )
+            half_wave = fx.Int32(fx.get_scalar(fx.get(fp6p_lane_coord, 0)))
+            channel_lane = fx.Int32(fx.get_scalar(fx.get(fp6p_lane_coord, 1)))
+            channel = fx.Int32(
+                fx.get_scalar(
+                    fx.crd2idx(
+                        (warp, channel_lane),
+                        fx.make_layout((warp_num_per_block, 32), (32, 1)),
+                    )
+                )
+            )
             for phase in range_constexpr(2 if split_v_exchange else 1):
                 if const_expr(split_v_exchange and phase == 1):
                     first_tile = split_frame // 2
@@ -1623,10 +2434,24 @@ def make_attention_a2a_kernel(
                 for work in range(
                     bid, fx.Int32(heads * rank_tiles), fx.Int32(block_num)
                 ):
-                    head = work // rank_tiles
-                    tile_id = first_tile + work % rank_tiles
-                    dest_pe = head // heads_local
-                    local_head = head % heads_local
+                    fp6p_work_coord = fx.idx2crd(
+                        fx.Int32(work),
+                        fx.make_layout(
+                            (UNBOUNDED_OUTER_EXTENT, rank_tiles), (rank_tiles, 1)
+                        ),
+                    )
+                    head = fx.Int32(fx.get_scalar(fx.get(fp6p_work_coord, 0)))
+                    tile_id = first_tile + fx.Int32(
+                        fx.get_scalar(fx.get(fp6p_work_coord, 1))
+                    )
+                    fp6p_head_coord = fx.idx2crd(
+                        head,
+                        fx.make_layout(
+                            (UNBOUNDED_OUTER_EXTENT, heads_local), (heads_local, 1)
+                        ),
+                    )
+                    dest_pe = fx.Int32(fx.get_scalar(fx.get(fp6p_head_coord, 0)))
+                    local_head = fx.Int32(fx.get_scalar(fx.get(fp6p_head_coord, 1)))
                     peer_base = fx.Uint64(fx.memref_load(p2p_bases_q, dest_pe))
                     output = _fp6_output_views(
                         wave_uniform_i64(peer_base),
@@ -1646,7 +2471,11 @@ def make_attention_a2a_kernel(
                             buf_copy_load(partial_table, dest_pe, fx.Int64), fx.Float32
                         )
                     for k in range_constexpr(2):
-                        frame_start = tile_id * 128 + k * 64
+                        frame_start = _row_field_offset(
+                            tile_id,
+                            _row_field_offset(fx.Int32(k), fx.Int32(0), 64),
+                            128,
+                        )
                         owned = (frame_start < (rank + 1) * seq_len) & (
                             frame_start + 64 > rank * seq_len
                         )
@@ -1664,24 +2493,19 @@ def make_attention_a2a_kernel(
                             values = []
                             amax = fx.Float32(0.0)
                             for field in range_constexpr(32):
-                                physical = lane // 32 * 32 + field
-                                paired = (
-                                    (physical & 15)
-                                    | ((physical & 16) << 1)
-                                    | ((physical & 32) >> 1)
+                                # The physical pairing and source-token swaps cancel.
+                                token = fx.Int32(
+                                    fx.get_scalar(
+                                        fx.crd2idx(
+                                            (half_wave, field),
+                                            fx.make_layout(
+                                                (2, (4, 4, 2)),
+                                                (4, (1, 8, 32)),
+                                            ),
+                                        )
+                                    )
                                 )
-                                byte = paired % 32
-                                token = (
-                                    32 * (byte // 16)
-                                    + 8 * ((byte % 16) // 4)
-                                    + byte % 4
-                                    + 4 * (paired // 32)
-                                )
-                                token = frame_start + (
-                                    (token & ~0x24)
-                                    | ((token & 4) << 3)
-                                    | ((token & 32) >> 3)
-                                )
+                                token = frame_start + token
                                 # FP6-P padding repeats the final token through the packed tile.
                                 token = (token < seq_full).select(
                                     token, fx.Int32(seq_full - 1)
@@ -1692,7 +2516,7 @@ def make_attention_a2a_kernel(
                                 seq = valid.select(token - rank * seq_len, fx.Int32(0))
                                 raw = buf_copy_load(
                                     input_q,
-                                    (seq * heads + head) * 128 + channel,
+                                    input_offset(seq, head, channel),
                                     fx.BFloat16,
                                 ).to(fx.Float32)
                                 value = valid.select(raw, fx.Float32(0.0))
@@ -1700,18 +2524,19 @@ def make_attention_a2a_kernel(
                                 amax = amax.maximumf(fmath.absf(value))
                             if const_expr(split_v_exchange):  # noqa: SIM102
                                 if frame_start == split_frame * 64:
-                                    slot = (
-                                        ((rank // 2 * 2) * heads_local + local_head)
-                                        * 256
-                                        + (lane // 32) * 128
-                                        + channel
+                                    # The paired sender is one source-rank slab after this slot.
+                                    slot = paired_partial_offset(
+                                        fx.Int32(0), local_head, half_wave, channel
+                                    )
+                                    paired_slot = paired_partial_offset(
+                                        fx.Int32(1), local_head, half_wave, channel
                                     )
                                     amax = buf_copy_load(
                                         partials, slot, fx.Float32
                                     ).maximumf(
                                         buf_copy_load(
                                             partials,
-                                            slot + heads_local * 256,
+                                            paired_slot,
                                             fx.Float32,
                                         )
                                     )
@@ -1721,6 +2546,7 @@ def make_attention_a2a_kernel(
                             )
                             values = [value * reciprocal for value in values]
                             if const_expr(native_fp6):
+                                # Native FP6 pack: software FP6-P V alone is 0.45% slower at ws8.
                                 words = emit_f32_to_e2m3_native(
                                     fx.Vector.from_elements(values[::2], fx.Float32),
                                     fx.Vector.from_elements(values[1::2], fx.Float32),
@@ -1746,38 +2572,81 @@ def make_attention_a2a_kernel(
                                             )
                                     packed.append(bits)
                                 words = fx.Vector.from_elements(packed, fx.Int32)
-                            first_word = (
-                                (local_head * k_tiles + tile_id) * 3072
-                                + (warp * 2 + k) * 384
-                                + lane * 6
+                            tile_row = fx.Int32(
+                                fx.get_scalar(
+                                    fx.crd2idx(
+                                        (local_head, tile_id),
+                                        fx.make_layout(
+                                            (heads_local, k_tiles), (k_tiles, 1)
+                                        ),
+                                    )
+                                )
+                            )
+                            frame_row = fx.Int32(
+                                fx.get_scalar(
+                                    fx.crd2idx(
+                                        (warp, k),
+                                        fx.make_layout((warp_num_per_block, 2), (2, 1)),
+                                    )
+                                )
+                            )
+                            # Keep the six-word lane span compact for the LDS redistribution.
+                            first_word = _row_field_offset(
+                                tile_row,
+                                _row_field_offset(
+                                    frame_row,
+                                    _row_field_offset(lane, fx.Int32(0), 6),
+                                    384,
+                                ),
+                                3072,
                             )
                             split_payload = fx.Int32(0) == 1
                             if const_expr(split_v_exchange):
                                 split_payload = frame_start == split_frame * 64
                             if split_payload:
                                 # Each sender owns exactly three dwords, never a shared byte.
+                                split_row = fx.slice(
+                                    fx.make_view(
+                                        fx.get_iter(output[0]),
+                                        fx.make_layout(
+                                            (UNBOUNDED_OUTER_EXTENT, 6), (1, 1)
+                                        ),
+                                    ),
+                                    (first_word, None),
+                                )
+                                split_fields = fx.logical_divide(
+                                    split_row, fx.make_layout(3, 1)
+                                )
+                                sender_words = fx.slice(
+                                    split_fields, (None, fx.Int32(rank % 2))
+                                )
                                 for word in range_constexpr(3):
                                     buf_copy_store(
-                                        output[0],
-                                        first_word + rank % 2 * 3 + word,
+                                        sender_words,
+                                        word,
                                         words[rank % 2 * 3 + word],
                                         fx.Int32,
                                         1,
                                     )
                             else:
+                                wave_word = _row_field_offset(
+                                    tile_row,
+                                    _row_field_offset(frame_row, fx.Int32(0), 384),
+                                    3072,
+                                )
                                 store_dense_fp6(
                                     words,
                                     output,
                                     first_word,
+                                    fx.Int32(0),
+                                    wave_word,
                                     True,
                                     staging,
                                     tiles,
                                     warp,
                                     lane,
                                 )
-                            fx.memref_store(
-                                scale & 255, scale_image, k * 256 + lane * 4 + warp
-                            )
+                            fx.memref_store(scale & 255, scale_image, (k, lane, warp))
                             fx.barrier()
                             write_scale = tid < 64
                             if const_expr(split_v_exchange and rank % 2 == 1):
@@ -1785,22 +2654,32 @@ def make_attention_a2a_kernel(
                                     frame_start != split_frame * 64
                                 )
                             if write_scale:
-                                scale_word = fx.Int32(0)
-                                for byte in range_constexpr(4):
-                                    scale_word = scale_word | (
-                                        fx.memref_load(
-                                            scale_image, k * 256 + tid * 4 + byte
+                                scale_word = fx.Vector.from_elements(
+                                    [
+                                        fx.memref_load(scale_image, (k, tid, byte)).to(
+                                            fx.Uint8
                                         )
-                                        << (byte * 8)
-                                    )
-                                buf_copy_store(
-                                    scale_output,
-                                    (local_head * k_tiles + tile_id) * 128
-                                    + k * 64
-                                    + tid,
-                                    scale_word,
-                                    fx.Int32,
+                                        for byte in range_constexpr(4)
+                                    ],
+                                    fx.Uint8,
+                                ).bitcast(fx.Int32)[0]
+                                scale_row = fx.slice(
+                                    fx.make_view(
+                                        fx.get_iter(scale_output),
+                                        fx.make_layout(
+                                            (heads_local, k_tiles, 128),
+                                            (k_tiles * 128, 128, 1),
+                                        ),
+                                    ),
+                                    (local_head, tile_id, None),
                                 )
+                                scale_frames = fx.logical_divide(
+                                    scale_row, fx.make_layout(64, 1)
+                                )
+                                scale_frame = fx.slice(
+                                    scale_frames, (None, fx.Int32(k))
+                                )
+                                buf_copy_store(scale_frame, tid, scale_word, fx.Int32)
                             fx.barrier()
 
         if const_expr(partial_only):
@@ -1849,17 +2728,52 @@ def make_attention_a2a_completion_kernel(*, rank, npes):
                 peers = ptr_buf_tensor(
                     addr_p2p_xdb_mem, fx.Int64, num_records_bytes=npes * 8
                 )
-                remote = fx.Int64(buf_copy_load(peers, tid, fx.Int64))
-                store_i64_global_system(remote + fx.Int64(rank) * 8, generation)
+                remote = fx.inttoptr(
+                    fx.PointerType.get(
+                        fx.Int64.ir_type,
+                        address_space=fx.AddressSpace.Global,
+                        alignment=8,
+                    ),
+                    buf_copy_load(peers, tid, fx.Int64),
+                )
+                fx.generic_store(
+                    fx.add_offset(remote, rank),
+                    generation,
+                    memory_order=fx.AtomicOrdering.Release,
+                    syncscope=fx.rocdl.SyncScope.OneAs,
+                )
             fx.barrier()
             if tid == 0:
-                atomic_add_global_at(addr_xdb_flag, fx.Int64(1))
+                fx.atomic_add(
+                    fx.inttoptr(
+                        fx.PointerType.get(
+                            fx.Int64.ir_type,
+                            address_space=fx.AddressSpace.Global,
+                            alignment=8,
+                        ),
+                        addr_xdb_flag,
+                    ),
+                    fx.Int64(1),
+                    ordering=fx.AtomicOrdering.Monotonic,
+                    syncscope=fx.rocdl.SyncScope.OneAs,
+                )
         else:
             if tid < npes:
-                spin_until_ge_i64(
-                    addr_xdb_mem + fx.Int64(tid) * 8, generation - fx.Int64(1)
+                ready = fx.inttoptr(
+                    fx.PointerType.get(
+                        fx.Int64.ir_type,
+                        address_space=fx.AddressSpace.Global,
+                        alignment=8,
+                    ),
+                    addr_xdb_mem,
                 )
-                fence_system_acquire()
+                spin_until_ge_i64(
+                    fx.ptrtoint(fx.add_offset(ready, tid)), generation - fx.Int64(1)
+                )
+                fx.memory_fence(
+                    ordering=fx.AtomicOrdering.Acquire,
+                    syncscope=fx.rocdl.SyncScope.OneAs,
+                )
             fx.barrier()
 
     return completion
@@ -1995,25 +2909,46 @@ def make_attention_a2a_dequant_jit(*, numel, codec="e4m3", fp8_fnuz=False):
             unit_stride=1,
             num_records_bytes=numel * 2,
         )
-        offset = fx.Int32(
-            (fx.gpu.block_id("x") * block_threads + fx.gpu.thread_id("x")) * vec
+        thread = fx.Int32(
+            fx.get_scalar(
+                fx.crd2idx(
+                    (fx.Int32(fx.gpu.block_id("x")), fx.Int32(fx.gpu.thread_id("x"))),
+                    fx.make_layout(
+                        (ceildiv(numel, block_threads * vec), block_threads),
+                        (block_threads, 1),
+                    ),
+                )
+            )
         )
+        offset = _row_field_offset(thread, fx.Int32(0), vec)
         if offset < numel:
             words = (
-                _load_fp6(payload, offset // 8)
+                _load_fp6(payload, thread)
                 if const_expr(role_codec == "mxfp6")
                 else (
                     fx.Vector.from_elements(
-                        [buf_copy_load(payload, offset // 8)],
+                        [buf_copy_load(payload, thread)],
                         fx.Int32,
                     )
                     if const_expr(packing == 2)
-                    else fx.Vector(buf_copy_load(payload, offset // 4, fx.Int32, 2))
+                    else fx.Vector(
+                        buf_copy_load(
+                            payload,
+                            _row_field_offset(thread, fx.Int32(0), 2),
+                            fx.Int32,
+                            2,
+                        )
+                    )
                 )
             )
             # Four neighboring lanes share a scale; four scales fit in one dword.
-            scale_index = offset // 32
-            scale_word = fx.Uint32(buf_copy_load(scales, scale_index // 4))
+            scale_coord = fx.idx2crd(
+                thread, fx.make_layout((UNBOUNDED_OUTER_EXTENT, 4, 4), (16, 4, 1))
+            )
+            scale_index = fx.Int32(fx.get_scalar(fx.get(scale_coord, 1)))
+            scale_word = fx.Uint32(
+                buf_copy_load(scales, fx.Int32(fx.get_scalar(fx.get(scale_coord, 0))))
+            )
             exponent = (scale_word >> ((scale_index % 4) * 8)) & 255
             scale_bits = (exponent == 0).select(fx.Uint32(0x00400000), exponent << 23)
             scale_bits = (exponent == 255).select(fx.Uint32(0x7FC00000), scale_bits)
@@ -2032,7 +2967,13 @@ def make_attention_a2a_dequant_jit(*, numel, codec="e4m3", fp8_fnuz=False):
                 values.append(pair[0] * scale)
                 values.append(pair[1] * scale)
             bf16 = fx.Vector.from_elements(values, fx.Float32).to(fx.BFloat16)
-            buf_copy_store(output, offset // 2, bf16.bitcast(fx.Int32), fx.Int32, 4)
+            buf_copy_store(
+                output,
+                _row_field_offset(thread, fx.Int32(0), 4),
+                bf16.bitcast(fx.Int32),
+                fx.Int32,
+                4,
+            )
 
     @flyc.kernel(known_block_size=[block_threads, 1, 1])
     def attention_a2a_dequant(

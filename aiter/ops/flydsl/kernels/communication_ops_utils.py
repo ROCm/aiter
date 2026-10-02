@@ -63,10 +63,16 @@ __all__ = [
     "wait_i32_until_equals",
     "wait_i32_until_greater_than",
     "wait_i64_until_equals",
+    "wait_lds_wave",
     "waitcnt_all",
     "waitcnt_stores",
     "wave_uniform_i64",
 ]
+
+
+def wait_lds_wave():
+    # A workgroup barrier would deadlock wave-selected branches.
+    fx.rocdl.s_waitcnt(lgkmcnt=0)
 
 
 def wave_uniform_i64(addr):
