@@ -273,3 +273,219 @@ def test_invalid_byte_scales_never_reach_legacy_dispatch(monkeypatch, invalid):
         xs = xs.float()
     with pytest.raises(AssertionError, match="Expected E8M0 group32 scale shapes"):
         gemm_op_a8w8.gemm_a8w8_blockscale(x, w, xs, ws)
+
+
+BMM_ROW = {
+    "libtype": "flydsl",
+    "kernelId": "bmm",
+    "kernelName": "flydsl_bmm_mxfp8_mfma_t16x32x128_w1x2_nb4_sk1",
+}
+
+
+def _mxscale_operands(m=3, n=256, k=512, x_block=32, w_rows=32, scale_dtype=None):
+    """CPU operands of an e8m0 GEMM."""
+    e8m0 = scale_dtype or torch.float8_e8m0fnu
+    x = torch.empty((m, k), dtype=torch.float8_e4m3fn)
+    w = torch.empty((n, k), dtype=torch.float8_e4m3fn)
+    xs = torch.empty((m, k // x_block), dtype=e8m0)
+    ws = torch.empty((n // w_rows, k // x_block), dtype=e8m0)
+    return x, w, xs, ws
+
+
+@pytest.mark.parametrize("row", [None, BMM_ROW])
+@pytest.mark.parametrize("block", [32, 128])
+def test_mxscale_bpreshuffle_route(monkeypatch, row, block):
+    from aiter.ops.flydsl import batched_gemm_a8w8 as bmm
+
+    calls = []
+
+    def lookup(m, n, k, w_scale_block):
+        calls.append(("lookup", m, n, k, w_scale_block))
+        return row
+
+    def run(x, w, xs, ws, out, kernel_name=None, x_scale_transposed=False):
+        calls.append(("bmm", x.shape, w.shape, xs.shape, ws.shape, out.shape))
+        calls.append((kernel_name, x_scale_transposed))
+        return out
+
+    monkeypatch.setattr(gemm_op_a8w8, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(gemm_op_a8w8, "get_mxscale_bpreshuffle_config", lookup)
+    monkeypatch.setattr(bmm, "run_bmm_a8w8_mxfp8", run)
+    x, w, xs, ws = _mxscale_operands(x_block=block, w_rows=block)
+    y = gemm_op_a8w8.gemm_a8w8_blockscale_bpreshuffle(x, w, xs, ws)
+    kb = 512 // block
+    assert y.shape == (3, 256) and y.dtype == torch.bfloat16
+    assert calls == [
+        ("lookup", 3, 256, 512, f"{block}x{block}"),
+        (
+            "bmm",
+            (3, 1, 512),
+            (1, 256, 512),
+            (3, 1, kb),
+            (1, 256 // block, kb),
+            (3, 1, 256),
+        ),
+        (None if row is None else row["kernelName"], block == 128),
+    ]
+
+
+def test_mxscale_bpreshuffle_rejects_unknown_implementation(monkeypatch):
+    monkeypatch.setattr(gemm_op_a8w8, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(
+        gemm_op_a8w8,
+        "get_mxscale_bpreshuffle_config",
+        lambda *args: {**BMM_ROW, "kernelId": "other"},
+    )
+    with pytest.raises(NotImplementedError, match="flydsl/other"):
+        gemm_op_a8w8.gemm_a8w8_blockscale_bpreshuffle(*_mxscale_operands())
+
+
+def test_mxscale_bpreshuffle_rejects_row_scales(monkeypatch):
+    monkeypatch.setattr(gemm_op_a8w8, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(gemm_op_a8w8, "get_mxscale_bpreshuffle_config", lambda *a: None)
+    with pytest.raises(NotImplementedError, match="1x32"):
+        gemm_op_a8w8.gemm_a8w8_blockscale_bpreshuffle(*_mxscale_operands(w_rows=1))
+
+
+def test_blockscale_preshuffled_group32_forwards_e8m0_views(monkeypatch):
+    calls = []
+    forwarded = torch.full((3, 256), 7.0, dtype=torch.bfloat16)
+
+    def bpreshuffle(x, w, xs, ws, dtype):
+        calls.append((xs.dtype, ws.dtype, dtype))
+        return forwarded
+
+    monkeypatch.setattr(gemm_op_a8w8, "gemm_a8w8_blockscale_bpreshuffle", bpreshuffle)
+    out = gemm_op_a8w8.gemm_a8w8_blockscale(
+        *_mxscale_operands(scale_dtype=torch.uint8),
+        dtype=torch.bfloat16,
+        isBpreshuffled=True,
+    )
+    e8m0 = torch.float8_e8m0fnu
+    assert torch.equal(out, forwarded) and calls == [(e8m0, e8m0, torch.bfloat16)]
+
+
+def _mxscale_gemm_vs_dequant(m, n, k, block):
+    """The public e8m0 GEMM on random operands, and its dequantized FP32
+    reference. A group32 x_scale is row-major, a 128-wide blockscale one
+    column-major bytes."""
+    from aiter.ops.shuffle import shuffle_weight
+    from aiter.utility import dtypes
+
+    x = (torch.randn(m, k, device="cuda") * 2).to(dtypes.fp8)
+    w = (torch.randn(n, k, device="cuda") * 2).to(dtypes.fp8)
+    xs = torch.randint(118, 136, (m, k // block), dtype=torch.uint8, device="cuda")
+    ws = torch.randint(
+        118, 136, (n // block, k // block), dtype=torch.uint8, device="cuda"
+    )
+    e8 = lambda s: torch.exp2(s.float() - 127)
+    ref = (x.float() * e8(xs).repeat_interleave(block, 1)) @ (
+        w.float() * e8(ws).repeat_interleave(block, 0).repeat_interleave(block, 1)
+    ).T
+    xs_arg = xs if block == 32 else xs.t().contiguous().view(-1).view(m, k // block)
+    out = gemm_op_a8w8.gemm_a8w8_blockscale_bpreshuffle(
+        x,
+        shuffle_weight(w, layout=(16, 16)),
+        xs_arg.view(dtypes.fp8_e8m0),
+        ws.view(dtypes.fp8_e8m0),
+    )
+    return out.float(), ref
+
+
+def _assert_matches(out, ref):
+    """Elementwise, so one wrong scale byte fails however few outputs it
+    touches: BF16 rounding stays well inside rtol."""
+    torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2 * ref.abs().max().item())
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or gemm_op_a8w8.get_gfx() != "gfx950",
+    reason="the preshuffled e8m0 GEMM runs on gfx950",
+)
+@pytest.mark.parametrize(
+    "m,n,k,block",
+    [
+        (1, 1152, 5120, 32),
+        (5, 5120, 576, 32),
+        (64, 512, 5120, 32),
+        (1, 6144, 7168, 128),
+        (5, 6144, 7168, 128),
+        (300, 1536, 1024, 128),
+        # 128-wide scale rows ending mid dword (DeepSeek-V4 shared-expert down
+        # at TP4 / TP8); M = 37 leaves a partial column-major x_scale dword.
+        (1, 7168, 768, 128),
+        (37, 7168, 768, 128),
+        (1, 7168, 384, 128),
+        (300, 7168, 384, 128),
+    ],
+)
+@pytest.mark.parametrize("row", [None, BMM_ROW])
+def test_mxscale_bpreshuffle_matches_dequant(monkeypatch, m, n, k, block, row):
+    monkeypatch.setattr(gemm_op_a8w8, "get_mxscale_bpreshuffle_config", lambda *a: row)
+    _assert_matches(*_mxscale_gemm_vs_dequant(m, n, k, block))
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or gemm_op_a8w8.get_gfx() != "gfx950",
+    reason="the preshuffled e8m0 GEMM runs on gfx950",
+)
+@pytest.mark.parametrize(
+    "config",
+    [
+        "t16x32x128_w1x2_nb2_sk1",  # scales preloaded
+        "t16x32x128_w1x1_nb3_sk1_sps",  # a byte of scales per row per stage
+        "t32x64x128_w1x4_nb2_sk3",  # split K
+        "t64x64x128_w2x2_nb3_sk1_bd2",  # B straight to registers
+    ],
+)
+@pytest.mark.parametrize("k", [384, 768])
+@pytest.mark.parametrize("m", [1, 37])
+def test_mxscale_bpreshuffle_mid_dword_scale_rows(monkeypatch, m, k, config):
+    """128-wide scale rows of 3 or 6 bytes start and end mid dword; every
+    kernel layout must read the last row's bytes, not the zeroed straddle."""
+    from aiter.ops.flydsl.batched_gemm_a8w8_gfx950 import parse_bmm_kernel_name
+    from aiter.ops.flydsl.kernels.bmm_a8w8_mxscale_gfx950 import check_bmm_config
+
+    name = f"flydsl_bmm_mxfp8_mfma_{config}"
+    blocks = dict.fromkeys(("x_scale_k", "w_scale_n", "w_scale_k"), 128)
+    check_bmm_config(
+        7168, k, 1, **parse_bmm_kernel_name(name), **blocks, x_scale_transposed=m > 1
+    )
+    row = {**BMM_ROW, "kernelName": name}
+    monkeypatch.setattr(gemm_op_a8w8, "get_mxscale_bpreshuffle_config", lambda *a: row)
+    _assert_matches(*_mxscale_gemm_vs_dequant(m, 7168, k, 128))
+
+
+def _bmm_legal(n, k, block, **cfg):
+    from aiter.ops.flydsl.kernels.bmm_a8w8_mxscale_gfx950 import check_bmm_config
+
+    base = {
+        "tile_m": 128,
+        "tile_n": 128,
+        "tile_k": 128,
+        "m_warp": 1,
+        "n_warp": 4,
+        "num_buffers": 3,
+    }
+    blocks = dict.fromkeys(("x_scale_k", "w_scale_n", "w_scale_k"), block)
+    try:
+        check_bmm_config(n, k, 1, **{**base, **cfg}, **blocks)
+    except ValueError:
+        return False
+    return True
+
+
+def test_bmm_config_rejects_partial_wave_tiles():
+    """A wave's share of the tile must be whole 16-wide MFMA tiles: 112 over
+    four N waves is 28 columns, of which the kernel would compute 16."""
+    assert _bmm_legal(7168, 4096, 32, tile_n=128, n_warp=4)
+    assert not _bmm_legal(7168, 4096, 32, tile_n=112, n_warp=4)
+    assert not _bmm_legal(7168, 4096, 32, tile_m=96, m_warp=4, n_warp=1)
+
+
+def test_bmm_config_rejects_tiles_straddling_w_scale_blocks():
+    """A tile reads whole w_scale blocks or fits in one: 96 rows straddle a
+    128-row block, while 32-row blocks tile them."""
+    assert not _bmm_legal(6144, 4096, 128, tile_n=96, n_warp=2)
+    assert _bmm_legal(6144, 4096, 32, tile_n=96, n_warp=2)
+    assert _bmm_legal(6144, 4096, 128, tile_n=64, n_warp=2)
