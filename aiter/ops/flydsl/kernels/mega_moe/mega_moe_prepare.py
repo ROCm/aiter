@@ -125,8 +125,12 @@ def compile_mega_moe_prepare(
         quant_slot = ticket - fx.Int32(prepare_blocks + 1)
         if const_expr(TRACE_BASE):
             if tid == fx.Int32(0):
-                role = owner.select(fx.Int32(1), producer.select(fx.Int32(2), fx.Int32(3)))
-                _trace.record(TRACE_BASE, fx.block_idx.x, 0, fx.Int64(role) << fx.Int64(32))
+                role = owner.select(
+                    fx.Int32(1), producer.select(fx.Int32(2), fx.Int32(3))
+                )
+                _trace.record(
+                    TRACE_BASE, fx.block_idx.x, 0, fx.Int64(role) << fx.Int64(32)
+                )
                 _trace.record(TRACE_BASE, fx.block_idx.x, 1, _trace.now())
 
         if const_expr(quant_blocks > 0):  # noqa: SIM102 - preserve DSL staging

@@ -529,7 +529,9 @@ def gemm2_compute_v2(
             gpu.barrier()
             issue_a_ds_read(fx.Int32(kt % aStages))
             if const_expr(kt + kStages < K_TILES_STATIC):
-                issue_a_load_lds(fx.Int32((kt + kStages) % aStages), fx.Int32(kt + kStages))
+                issue_a_load_lds(
+                    fx.Int32((kt + kStages) % aStages), fx.Int32(kt + kStages)
+                )
             bqf, bsf = stream_b_tile(kt_rt)
             sa = load_a_scale_tile(kt_rt)
             mfma_cluster(bqf, bsf, sa, kt_rt)
@@ -675,7 +677,9 @@ def gemm2_compute_v2(
                 gpu.barrier()
                 issue_a_ds_read(fx.Int32(kt % aStages))
                 if const_expr(kt + kStages < K_TILES_STATIC):
-                    issue_a_load_lds(fx.Int32((kt + kStages) % aStages), fx.Int32(kt + kStages))
+                    issue_a_load_lds(
+                        fx.Int32((kt + kStages) % aStages), fx.Int32(kt + kStages)
+                    )
                 if const_expr(g2_ascale_pf):
                     sa = [
                         Vec(b_cur[2][sub].load())[0]

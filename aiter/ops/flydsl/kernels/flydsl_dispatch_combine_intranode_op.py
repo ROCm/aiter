@@ -1250,7 +1250,15 @@ class FlyDSLDispatchCombineIntraNodeOp:
         return cur_tok
 
     def _run_combine_kernel(
-        self, cache, key, fn, inp_ptr, wts_ptr, prx_ptr, cur_tok, stream,
+        self,
+        cache,
+        key,
+        fn,
+        inp_ptr,
+        wts_ptr,
+        prx_ptr,
+        cur_tok,
+        stream,
         tok_map_ptr=None,
     ):
         """Compile once and reuse the cached combine launcher."""
