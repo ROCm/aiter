@@ -37,6 +37,7 @@ GFX_MAP = {
 # explicitly alongside GPU_ARCHS to override the default here.
 # Extend this table when adding support for new GPU targets.
 GFX_CU_NUM_MAP = {
+    "gfx90a": 104,  # MI210; MI250 is also 104 per GCD. MI250X is 110 per GCD — use CU_NUM override
     "gfx942": 304,  # MI300X (SPX, full GPU); MI308X shares gfx942 — use CU_NUM override
     "gfx950": 256,  # MI350
     "gfx1250": 256,  # Gfx1250
