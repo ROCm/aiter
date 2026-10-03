@@ -8,8 +8,7 @@
       "DT"
     ],
     "attn_3d": [
-      "D",
-      "Q"
+      "D"
     ],
     "reduce": [
       "D"
@@ -230,12 +229,6 @@
       "num_warps": 4,
       "num_stages": 1,
       "waves_per_eu": 2
-    },
-    "Q_GEQ_2": {
-      "BLOCK_M": 128,
-      "num_warps": 4,
-      "num_stages": 2,
-      "waves_per_eu": 1
     },
     "any": {
       "BLOCK_M": 16,
