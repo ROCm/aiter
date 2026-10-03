@@ -688,9 +688,10 @@ def sparse_mla_fwd(
         block_k=block_k,
     )
 
-    if qk_rope_head_dim == 0 and fmt in ("bf16", "fp8_scalar") and not async_lds_on:
-        # DSv4 rows: 32- or 64-head programs stage each key tile once for all their
-        # heads (see _staged_head_block).
+    staged = fmt == "fp8_scalar" or (fmt == "bf16" and qk_rope_head_dim == 0)
+    if staged and num_heads in (32, 64) and not async_lds_on:
+        # 32- or 64-head programs stage each key tile once for all their heads
+        # (see _staged_head_block).
         block_m = _staged_head_block(
             num_heads, num_queries, num_splits, max(avg_main, avg_extra) / block_k
         )

@@ -478,8 +478,9 @@ def _decode_num_splits_occ(num_queries, heads_blocks, avg_main, avg_extra, block
 
 
 def _staged_head_block(num_heads, num_queries, num_splits, row_tiles):
-    """Heads per program (16, 32 or 64) for bf16 and per-tensor fp8 caches of
-    DSv4 rows, whose walk gathers each key tile into registers and stages it.
+    """Heads per program (16, 32 or 64) for the walks that gather each key tile
+    into registers and stage it: per-tensor fp8 caches, and bf16 caches with the
+    rope inside the row.
 
     A 16-head program stages its tiles for 16 heads, so at 32 or 64 heads each
     tile is staged two or four times per row. Bigger programs stage it once, but

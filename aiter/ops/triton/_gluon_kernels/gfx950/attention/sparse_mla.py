@@ -406,8 +406,8 @@ class Cfg:
         self.UNPEEL = gl.constexpr(UNPEEL)
         ROPE_VEC = 16
         self.ROPE_VEC = gl.constexpr(ROPE_VEC)
-        # The fp8_dsv4_mla walk, and STAGED_K32's (bf16 and per-tensor fp8 caches of
-        # DSv4 rows), run their bf16 dots on 16x16x32 too, gfx950's full bf16 rate
+        # The fp8_dsv4_mla walk, and the STAGED_K32 ones (bf16 and per-tensor fp8
+        # caches), run their bf16 dots on 16x16x32 too, gfx950's full bf16 rate
         # (16x16x16 is half of it).
         MFMA_K = 32 if FP8_MFMA or PIPE or STAGED_K32 else 16
         self.MFMA_K = gl.constexpr(MFMA_K)
@@ -506,8 +506,8 @@ class Cfg:
             )
         # Q staged in LDS (one copy per program) instead of each wave's registers,
         # which a 64-head program with bf16 dots needs; Q and the KV tile fit with
-        # one program per CU.
-        Q_LDS = BLOCK_M >= 64 and not FP8_MFMA and not ROPE_SEPARATE
+        # one program per CU. A separate rope part of Q (64 dims) stays in registers.
+        Q_LDS = BLOCK_M >= 64 and not FP8_MFMA
         self.Q_LDS = gl.constexpr(Q_LDS)
         self.q_shared = gl.constexpr(
             gl.PaddedSharedLayout.with_identity_for(
@@ -868,11 +868,11 @@ def _slots(
 def _qk_scores(cfg, q_dot, q_rope_dot, kv_smem, rope_smem):
     """QK scores for one tile; ROPE_SEPARATE chains a second MFMA over the rope
     buffer (MFMA accumulates natively, so KV_DIM + ROPE_DIM is two dots)."""
+    S = gl.zeros([cfg.BLOCK_M, cfg.BLOCK_K], gl.float32, layout=cfg.qk_layout)
     if cfg.Q_LDS:
         # Q from LDS, 128 dims at a time with the matching K slice: only one
         # chunk of each operand is live.
         QC: gl.constexpr = 128
-        S = gl.zeros([cfg.BLOCK_M, cfg.BLOCK_K], gl.float32, layout=cfg.qk_layout)
         for c in gl.static_range(cfg.KV_DIM // QC):
             q_c = q_dot.slice(c * QC, QC, dim=1).load(cfg.q_layout)
             k_c = kv_smem.slice(c * QC, QC, dim=1).permute([1, 0]).load(cfg.k_layout)
@@ -888,21 +888,17 @@ def _qk_scores(cfg, q_dot, q_rope_dot, kv_smem, rope_smem):
             k = kv_smem.permute([1, 0]).load(cfg.k_layout)  # [KV_DIM, BLOCK_K]
         if cfg.ASYNC_LDS:
             k = k.to(gl.float8e4nv, bitcast=True)  # raw cache bytes; layout-preserving
-        S = gl.amd.cdna4.mfma(
-            q_dot,
-            k,
-            gl.zeros([cfg.BLOCK_M, cfg.BLOCK_K], gl.float32, layout=cfg.qk_layout),
-        )
-        if cfg.ROPE_SEPARATE:
-            if cfg.ASYNC_LDS and cfg.RELAXED_LOAD:
-                k_rope = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                    rope_smem.permute([1, 0]), cfg.k_layout
-                )
-            else:
-                k_rope = rope_smem.permute([1, 0]).load(cfg.k_layout)
-            if cfg.ASYNC_LDS:
-                k_rope = k_rope.to(gl.float8e4nv, bitcast=True)
-            S = gl.amd.cdna4.mfma(q_rope_dot, k_rope, S)
+        S = gl.amd.cdna4.mfma(q_dot, k, S)
+    if cfg.ROPE_SEPARATE:
+        if cfg.ASYNC_LDS and cfg.RELAXED_LOAD:
+            k_rope = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                rope_smem.permute([1, 0]), cfg.k_layout
+            )
+        else:
+            k_rope = rope_smem.permute([1, 0]).load(cfg.k_layout)
+        if cfg.ASYNC_LDS:
+            k_rope = k_rope.to(gl.float8e4nv, bitcast=True)
+        S = gl.amd.cdna4.mfma(q_rope_dot, k_rope, S)
     return S
 
 
@@ -2246,11 +2242,14 @@ def _sparse_mla(
     MAIN_PIPE: gl.constexpr = MAIN_FMT == "fp8_dsv4_mla"
     EXTRA_PIPE: gl.constexpr = HAS_EXTRA and EXTRA_FMT == "fp8_dsv4_mla"
     PIPE: gl.constexpr = MAIN_PIPE or EXTRA_PIPE
-    # bf16 and per-tensor fp8 caches of DSv4 rows (rope inside the row).
+    # Per-tensor fp8 caches (DeepSeek-V4 and GLM-5.3 rows with the rope inside or
+    # none, GLM-5.2 rows with it appended) and bf16 caches with the rope inside.
     STAGED_K32: gl.constexpr = (
-        not ROPE_SEPARATE
-        and (MAIN_FMT == "bf16" or MAIN_FMT == "fp8_scalar")
-        and ((not HAS_EXTRA) or EXTRA_FMT == "bf16" or EXTRA_FMT == "fp8_scalar")
+        MAIN_FMT == "fp8_scalar" and ((not HAS_EXTRA) or EXTRA_FMT == "fp8_scalar")
+    ) or (
+        MAIN_FMT == "bf16"
+        and not ROPE_SEPARATE
+        and ((not HAS_EXTRA) or EXTRA_FMT == "bf16")
     )
     gl.static_assert(
         UNI_TILE or (MAIN_FMT != "fp8_scalar" and MAIN_FMT != "fp8_dsv32_mla"),
@@ -2451,9 +2450,11 @@ def _sparse_mla(
     if Q_FP8:
         # Nothing to quantize
         q_scale = gl.load(q_scl_ptr)
-        if not FP8_MFMA and not cfg.Q_LDS:
-            # fp8 -> bf16 is exact (3 mantissa bits into 8)
-            q_dot = gl.convert_layout(q.to(gl.bfloat16), cfg.q_layout)
+        if not FP8_MFMA:
+            # fp8 -> bf16 is exact (3 mantissa bits into 8). Q in LDS was stored
+            # as bf16 already.
+            if not cfg.Q_LDS:
+                q_dot = gl.convert_layout(q.to(gl.bfloat16), cfg.q_layout)
             if ROPE_SEPARATE:
                 q_rope_dot = gl.convert_layout(q_rope.to(gl.bfloat16), cfg.q_layout)
             else:

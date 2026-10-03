@@ -226,3 +226,12 @@ def test_sparse_mla_rope_free(fmt, dots, tol, H, C, topk, ragged, pool):
         rope=0,
         dot_precision=dots,
     )
+
+
+@pytest.mark.parametrize("rope", [ROPE, 0], ids=["rope", "rope_free"])
+def test_sparse_mla_64_heads(rope):
+    """Per-tensor fp8 at 64 heads (TP1) over a 2,048-row prefill."""
+    _skip_unless_gfx950()
+    _run_and_check(
+        "tensor", C=2048, H=64, topk=256, ragged=True, pool=1 << 13, rope=rope
+    )
