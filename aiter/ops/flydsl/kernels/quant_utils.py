@@ -4,7 +4,7 @@
 """Shared MX-format quantization IR helpers for FlyDSL kernels.
 
 These functions emit MLIR/LLVM IR for the per-block E8M0 scale calculation
-and the f32 -> fp4 (e2m1) conversion. They are *IR builders* -- you must
+and f32 -> fp4 (e2m1) / fp6 (e2m3) conversions. They are *IR builders* -- you must
 call them inside an active ``InsertionPoint`` (i.e. while the FlyDSL DSL
 is mid-build of a kernel function), and they emit the same arith / LLVM
 ops the kernels would otherwise emit inline.
@@ -142,9 +142,7 @@ def emit_mx_e8m0_scale(
     if mode_int == _M.RoundUp:
         # ceil_pow2(amax / max_pos): multiply by reciprocal of max_pos to get
         # the working value, then bump the exponent if any mantissa bit is
-        # set. Bit-equivalent to HIP ``aiter::fp_f32_to_e8m0_scale<RoundUp,
-        # FP4_E2M1>`` and to PyTorch torchao ``_to_mx_rceil`` (modulo
-        # the GPU-vs-CPU fp32 ULP boundary effects documented in the PR).
+        # set.
         c_inv_max_pos = arith.constant(max_pos_inv_bits, type=T.i32)
         inv_max_pos_f32 = c_inv_max_pos.bitcast(T.f32)
         working = local_max * inv_max_pos_f32
@@ -212,7 +210,7 @@ def emit_f32_to_e2m1(qx_f32):
     - HIP gfx950 HW builtin ``v_cvt_pk_fp4_*`` (exact RNE)
     - HIP gfx942 SW fallback ``even_round_e2m1`` (algorithmically equivalent
       RHA; can differ from the CPU ref by <=1 ULP at FP4 round thresholds
-      due to GPU vs CPU fp32 computation order, see PR notes)
+      due to GPU vs CPU fp32 computation order)
 
     Args:
         qx_f32: f32 IR value, the already-scaled value ``act * quant_scale``.
@@ -252,6 +250,34 @@ def emit_f32_to_e2m1(qx_f32):
     e2m1 = normal_mask.select(normal_x, c0x7_i32)
     e2m1 = denormal_mask.select(denormal_x, e2m1)
     return (s >> c28_i32) | e2m1
+
+
+def _emit_f32_to_fp6(qx_f32, *, mbits, bias, max_bits):
+    shift = 23 - mbits
+    cmin = fx.Uint32((128 - bias) << 23)
+    cmax = fx.Uint32(max_bits)
+    # Adding this power of two rounds subnormals directly onto their RNE grid.
+    cden = fx.Uint32((151 - bias - mbits) << 23)
+    cnorm = fx.Uint32((((bias - 127) << 23) + (1 << (shift - 1)) - 1) & 0xFFFFFFFF)
+    bits = fx.Float32(qx_f32).bitcast(fx.Uint32)
+    sign = (bits & fx.Uint32(0x80000000)) >> 26
+    magnitude = bits & fx.Uint32(0x7FFFFFFF)
+    denormal = magnitude < cmin
+    normal = magnitude < cmax
+    denorm_f32 = magnitude.bitcast(fx.Float32) + cden.bitcast(fx.Float32)
+    denorm_code = denorm_f32.bitcast(fx.Uint32) - cden
+    odd = (magnitude >> shift) & fx.Uint32(1)
+    normal_code = (magnitude + cnorm + odd) >> shift
+    code = normal.select(normal_code, fx.Uint32(31))
+    return sign | denormal.select(denorm_code, code)
+
+
+def emit_f32_to_e2m3(qx_f32):
+    """Convert scaled f32 to OCP FP6 E2M3, RNE with finite saturation.
+
+    Returns an i32 six-bit code (sign in bit 5), including signed zero.
+    """
+    return _emit_f32_to_fp6(qx_f32, mbits=3, bias=1, max_bits=0x40F00000)
 
 
 def emit_amax_e8m0_native_scale(
