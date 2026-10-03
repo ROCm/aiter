@@ -12,6 +12,9 @@ fp32 NCCL all-reduce of the same per-rank inputs. INT4 is lossy, so
 validity uses SQNR, a calibrated mismatch ratio, and a per-tile SQNR
 floor.
 
+The divisor case runs an outlier fill at TP 8 that clips the E4M3 scale
+at divisor 1 and must recover SQNR once divided.
+
 hidden=5120 is the width the kernel was tuned on, not a shape the kernel
 requires. QuickAllReduceInt4 runs on gfx942/gfx950 at TP∈{2,4,8}; other
 archs skip, and ``main()`` skips a world size when fewer GPUs are visible
@@ -65,6 +68,7 @@ SUPER_TILE = 8
 TP = WORLD
 _FILLS = (
     "normal",
+    "outlier",
     "pos_underflow",
     "neg_underflow",
     "overflow_512",
@@ -76,6 +80,10 @@ _CODEC_FILL_CASES = (
     ("overflow_512", "overflow-512"),
     ("zeros", "true-zero-scale"),
 )
+# (512, 5120) runs ST=1 and (32768, 5120) runs ST=8.
+_DIVISOR_SHAPES = [(512, 5120), (32768, 5120)]
+# Above TP * peak / 480 (~9.3) for the "outlier" fill.
+_OUTLIER_DIVISOR = 16.0
 # One spawn per world size so compile happens once. hidden=4096 is a width
 # the ST pick was not fitted to; (8, 1024) is smaller than one 32 KiB tile.
 _VALIDITY_SHAPES = {
@@ -89,9 +97,10 @@ def _make_inp(
     tokens: int, hidden: int, fill: str, *, rank: int, device: torch.device
 ) -> torch.Tensor:
     shape = (tokens, hidden)
-    if fill == "normal":
+    if fill in ("normal", "outlier"):
         gen = torch.Generator().manual_seed(1234 + rank)
-        return (torch.randn(shape, generator=gen, dtype=torch.float32) * 0.1).to(
+        std = 0.1 if fill == "normal" else 100.0
+        return (torch.randn(shape, generator=gen, dtype=torch.float32) * std).to(
             device=device, dtype=torch.bfloat16
         )
     if fill == "pos_underflow":
@@ -155,6 +164,7 @@ def _run_rank(
     grid_cap: int,
     fill: str,
     time_it: bool,
+    divisor: float = 1.0,
 ) -> list[dict]:
     import torch.distributed as dist
 
@@ -204,7 +214,7 @@ def _run_rank(
             dist.barrier()
 
             out = torch.empty_like(inp)
-            fly.allreduce(inp, out)
+            fly.allreduce(inp, out, divisor=divisor)
             got = out.to(torch.float32)
             dist.barrier()
 
@@ -230,8 +240,8 @@ def _run_rank(
                 dist.barrier(group=group)
                 torch.cuda.synchronize()
 
-                def _allreduce(eng=fly, src=inp, dst=out):
-                    eng.allreduce(src, dst)
+                def _allreduce(eng=fly, src=inp, dst=out, div=divisor):
+                    eng.allreduce(src, dst, divisor=div)
                     return dst
 
                 # use_cuda_event is mandatory here: run_perftest's default
@@ -257,6 +267,7 @@ def _spawn(
     super_tile: int = SUPER_TILE,
     grid_cap: int = DEFAULT_GRID_CAP,
     fill: str = "normal",
+    divisor: float = 1.0,
 ) -> list[list[dict]]:
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(f"unsupported world_size={world_size}")
@@ -282,6 +293,7 @@ def _spawn(
                     "grid_cap": grid_cap,
                     "fill": fill,
                     "time_it": time_it,
+                    "divisor": divisor,
                 },
             )
             for rank in range(world_size)
@@ -307,6 +319,7 @@ def _assert_validity(
     pairs: list[tuple[int, int]],
     world_size: int,
     label: str,
+    check_close: bool = True,
 ) -> dict:
     if len(ranks) != world_size:
         raise AssertionError(
@@ -326,7 +339,7 @@ def _assert_validity(
                     f"{where}: min-tile SQNR {row['min_tile_sqnr_db']:.2f} dB "
                     f"< {TILE_SQNR_MIN_DB}"
                 )
-            if row["err"] >= CLOSE_ERR_RATIO:
+            if check_close and row["err"] >= CLOSE_ERR_RATIO:
                 fails.append(
                     f"{where}: checkAllclose err {row['err']:.3f} >= {CLOSE_ERR_RATIO}"
                 )
@@ -449,6 +462,50 @@ def main():
             continue
         ranks = _spawn(tp, pairs, time_it=False, grid_cap=args.grid_cap)
         _assert_validity(ranks, pairs=pairs, world_size=tp, label="validity")
+
+    if n_gpu < TP:
+        aiter.logger.warning(
+            "QuickAllReduceInt4 needs %s GPUs for divisor cases, have %s; skipping",
+            TP,
+            n_gpu,
+        )
+    else:
+        outlier = {}
+        for divisor in (1.0, _OUTLIER_DIVISOR):
+            outlier[divisor] = _spawn(
+                TP,
+                _DIVISOR_SHAPES,
+                time_it=False,
+                fill="outlier",
+                grid_cap=args.grid_cap,
+                divisor=divisor,
+            )
+        # CLOSE_ATOL is calibrated to the 0.1-std fill, not to std 100.
+        _assert_validity(
+            outlier[_OUTLIER_DIVISOR],
+            pairs=_DIVISOR_SHAPES,
+            world_size=TP,
+            label=f"outlier divisor={_OUTLIER_DIVISOR}",
+            check_close=False,
+        )
+        for k, (tokens, hidden) in enumerate(_DIVISOR_SHAPES):
+            base = min(r[k]["sqnr_db"] for r in outlier[1.0])
+            fixed = min(r[k]["sqnr_db"] for r in outlier[_OUTLIER_DIVISOR])
+            aiter.logger.info(
+                "outlier tokens=%s hidden=%s: SQNR %.2f dB at divisor 1, "
+                "%.2f dB at divisor %s",
+                tokens,
+                hidden,
+                base,
+                fixed,
+                _OUTLIER_DIVISOR,
+            )
+            if fixed - base < 3.0:
+                raise AssertionError(
+                    f"outlier tokens={tokens} hidden={hidden}: divisor "
+                    f"{_OUTLIER_DIVISOR} gives {fixed:.2f} dB vs {base:.2f} dB "
+                    "at divisor 1; expected the E4M3 clip to be recovered"
+                )
 
     for dtype in args.dtype:
         if dtype != dtypes.bf16:
