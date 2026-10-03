@@ -5,8 +5,9 @@ import torch
 import triton
 
 from aiter.ops.triton._triton_kernels.quant.fused_mxfp8_quant import (
-    quantize_and_insert_k_kernel,
-    _fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_aligned_kernel,
+    _fused_deepseek_v4_dequant_gather_k_cache_kernel,
+    _fused_deepseek_v4_quantize_and_insert_k_kernel,
+    _fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_kernel,
     _fused_deepseek_v4_mxfp8_quant_q_pack_kernel,
     _fused_dual_rmsnorm_mxfp8_quant_kernel,
     _fused_flatten_mxfp8_quant_kernel,
@@ -14,7 +15,11 @@ from aiter.ops.triton._triton_kernels.quant.fused_mxfp8_quant import (
 )
 
 __all__ = [
-    "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_aligned",
+    "fused_deepseek_v4_compress_norm_rope_store",
+    "fused_deepseek_v4_compress_norm_rope_store_two_stage",
+    "fused_deepseek_v4_dequantize_and_gather_k_cache",
+    "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
+    "fused_deepseek_v4_quantize_and_insert_k_cache",
     "fused_deepseek_v4_mxfp8_quant_q_pack",
     "fused_dual_rmsnorm_mxfp8_quant",
     "fused_flatten_mxfp8_quant",
@@ -272,7 +277,7 @@ _V4_SC_IN_REC = _V4_DIM_NOPE  # 448
 _V4_ROPE_IN_REC = 512  # the 2buff row is 512 B; RoPE follows it
 
 
-def fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_aligned(
+def fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
     q: torch.Tensor,
     kv: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -365,7 +370,7 @@ def fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_aligned(
 
     fp8_max = 224.0 if use_fnuz else float(torch.finfo(torch.float8_e4m3fn).max)
     # One extra slot along dim 1 carries the KV row for the token.
-    _fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_aligned_kernel[
+    _fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_kernel[
         (t, padded_heads + 1)
     ](
         q,
@@ -417,11 +422,13 @@ def _rec_geometry(k_cache):
     written twice -- one byte per 32 columns, which is what the decode kernel's
     scaled MMA reads, against a 64-element quant group.
     """
-    rec = int(k_cache.shape[-1]) if k_cache.dim() == 3 else 584
+    # len(shape) rather than .dim(): vLLM's warmup feeds this a
+    # TritonWarmupTensor, which carries a shape but is not a torch.Tensor.
+    rec = int(k_cache.shape[-1]) if len(k_cache.shape) == 3 else 584
     return (640, 448, 512, 2) if rec == 640 else (576, 0, 448, 1)
 
 
-def quantize_and_insert_k_cache(
+def fused_deepseek_v4_quantize_and_insert_k_cache(
     k: torch.Tensor,  # [num_tokens, 512] bf16
     k_cache: torch.Tensor,  # [num_blocks, block_bytes] uint8
     slot_mapping: torch.Tensor,  # [num_tokens] int64
@@ -469,7 +476,7 @@ def quantize_and_insert_k_cache(
 
     grid = (num_tokens,)
 
-    quantize_and_insert_k_kernel[grid](
+    _fused_deepseek_v4_quantize_and_insert_k_kernel[grid](
         k,
         slot_mapping,
         k_cache,
@@ -492,6 +499,65 @@ def quantize_and_insert_k_cache(
     )
 
 
+# One workgroup row per request; the second grid axis splits the gather.
+_V4_GATHER_NUM_WORKERS = 128
+
+
+def fused_deepseek_v4_dequantize_and_gather_k_cache(
+    out: torch.Tensor,
+    k_cache: torch.Tensor,
+    seq_lens: torch.Tensor,
+    gather_lens: torch.Tensor | None,
+    block_table: torch.Tensor,
+    block_size: int,
+    offset: int = 0,
+    use_fnuz: bool = False,
+) -> None:
+    """Dequantize the paged K cache into ``out``, gathering per request.
+
+    Args:
+        out: ``[num_reqs, max_len, 512]`` bf16, written in place.
+        k_cache: the paged cache; dim-0 stride is the block stride. A 3-D
+            cache's last dim selects the record layout (640 aligned, else
+            packed).
+        seq_lens: ``[num_reqs]`` sequence lengths.
+        gather_lens: ``[num_reqs]`` gather counts, or None to use seq_lens.
+        block_table: ``[num_reqs, max_blocks_per_seq]``.
+        offset: first token position to read.
+        use_fnuz: fp8 flavour of the cache's encoder.
+    """
+    num_reqs = seq_lens.shape[0]
+    rec_bytes, sc_in_rec, rope_in_rec, sc_step = _rec_geometry(k_cache)
+    _fused_deepseek_v4_dequant_gather_k_cache_kernel[
+        (num_reqs, _V4_GATHER_NUM_WORKERS)
+    ](
+        out,
+        out.stride(0),
+        out.stride(1),
+        k_cache,
+        seq_lens,
+        block_table,
+        offset,
+        gather_lens,
+        max_blocks_per_seq=block_table.shape[-1],
+        fp8_dim=448,
+        bf16_dim=64,
+        scale_dim=8,
+        quant_block=64,
+        cache_block_size=block_size,
+        token_data_size=576,
+        rec_bytes=rec_bytes,
+        sc_in_rec=sc_in_rec,
+        rope_in_rec=rope_in_rec,
+        sc_step=sc_step,
+        block_stride=k_cache.stride(0),
+        output_dim=512,
+        fp8_max=float(torch.finfo(torch.float8_e4m3fn).max),
+        n_quant_blocks=7,
+        use_fnuz=use_fnuz,
+    )
+
+
 # ---------------------------------------------------------------------------
 # DSv4 KV compressor launchers (ported from vLLM)
 # ---------------------------------------------------------------------------
@@ -510,7 +576,7 @@ from aiter.ops.triton._triton_kernels.quant.fused_mxfp8_quant import (  # noqa: 
     _fused_kv_compress_norm_rope_insert_sparse_attn,
 )
 
-def compress_norm_rope_store_triton(
+def fused_deepseek_v4_compress_norm_rope_store(
     state_cache: torch.Tensor,
     num_actual: int,
     token_to_req_indices: torch.Tensor,
@@ -545,7 +611,7 @@ def compress_norm_rope_store_triton(
         # VllmTritonJitKernel warmup wrapper, which has no aiter equivalent --
         # callers on that path must keep using vLLM's launcher.
         raise NotImplementedError(
-            f"aiter's compress_norm_rope_store_triton supports head_dim 512, "
+            f"aiter's fused_deepseek_v4_compress_norm_rope_store supports head_dim 512, "
             f"got {head_dim}; use vLLM's launcher for the indexer path"
         )
     kernel = _fused_kv_compress_norm_rope_insert_sparse_attn
@@ -690,7 +756,7 @@ def _launch_two_stage_sparse_attn_compressor(
         SANITIZE_CACHE_NANS=_ON_GFX950,
     )
 
-def compress_norm_rope_store_two_stage_triton(
+def fused_deepseek_v4_compress_norm_rope_store_two_stage(
     state_cache: torch.Tensor,
     num_actual: int,
     token_to_req_indices: torch.Tensor,
@@ -748,7 +814,7 @@ def compress_norm_rope_store_two_stage_triton(
             compress_scratch=compress_scratch,
         )
     if num_decodes > 0:
-        compress_norm_rope_store_triton(
+        fused_deepseek_v4_compress_norm_rope_store(
             state_cache=state_cache,
             num_actual=num_decodes,
             token_to_req_indices=token_to_req_indices,

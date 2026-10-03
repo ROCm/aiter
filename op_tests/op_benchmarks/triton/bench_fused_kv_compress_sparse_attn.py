@@ -2,7 +2,7 @@
 """Benchmark the DeepSeek-V4 fused KV compressor.
 
 Drives the public launcher, aiter.ops.triton.quant.fused_mxfp8_quant
-.compress_norm_rope_store_triton, which picks the kernel from head_dim and
+.fused_deepseek_v4_compress_norm_rope_store, which picks the kernel from head_dim and
 dispatches it with the launcher's own num_warps -- so what is measured here is
 what production runs, including any later retune of that launcher.
 
@@ -31,8 +31,34 @@ import torch
 import triton
 
 from aiter.ops.triton.quant.fused_mxfp8_quant import (
-    compress_norm_rope_store_triton,
+    fused_deepseek_v4_compress_norm_rope_store,
+    fused_deepseek_v4_compress_norm_rope_store_two_stage,
 )
+
+
+def emitting_positions(a, device="cuda"):
+    """Positions that actually produce a record, and stay in bounds doing it.
+
+    The kernel returns immediately unless ``(position + 1) % compress_ratio
+    == 0``, so an all-zero positions vector measures a grid of early exits and
+    nothing else -- which is what this benchmark used to do.
+
+    An emitting token then gathers ``position - (1 + overlap) * cr + 1 ..
+    position`` and indexes ``block_table[req, pos // block_size]``, so the
+    first usable position is ``(1 + overlap) * cr - 1`` and the last is bounded
+    by the block table's width. block_table is zero here, so every gather
+    lands in state_cache[0]; block_offsets stays under state_mid by
+    construction.
+    """
+    cr = a.compress_ratio
+    lo = (1 + bool(a.overlap)) * cr - 1
+    hi = a.block_table_width * a.block_size
+    valid = list(range(lo, hi, cr))
+    assert valid, "no emitting position fits the block table"
+    return torch.tensor(
+        [valid[i % len(valid)] for i in range(a.tokens)],
+        dtype=torch.int64, device=device,
+    )
 
 # DeepSeek-V4-Pro tp4, captured from a live run. --variant picks the layer
 # group; everything here is overridable from the command line.
@@ -72,16 +98,25 @@ def build(a, device="cuda"):
     )
     cos_sin_cache[:, : a.rope_dim // 2] = 1.0
 
-    slot_mapping = torch.zeros(a.tokens, dtype=torch.int64, device=device)
+    # Distinct records: slot s lands in block s // kv_page, row s % kv_page,
+    # and s < tokens <= tokens * kv_page keeps every one inside kv_cache.
+    # Pointing every token at slot 0, as this used to, makes the stores
+    # collide on one line and understates the write cost.
+    slot_mapping = torch.arange(a.tokens, dtype=torch.int64, device=device)
     return dict(
         state_cache=state_cache,
         num_actual=a.tokens,
         token_to_req_indices=torch.zeros(a.tokens, dtype=torch.int32,
                                          device=device),
-        positions=torch.zeros(a.tokens, dtype=torch.int64, device=device),
+        positions=emitting_positions(a, device),
         slot_mapping=slot_mapping,
-        block_table=torch.zeros(a.tokens, a.block_table_width,
-                                dtype=torch.int32, device=device),
+        # Spread over the state cache rather than pointing every gather at
+        # row 0: an emitting token reads (1 + overlap) * compress_ratio rows,
+        # and with one shared row they all come from cache, which flatters
+        # the bandwidth. Entries stay below state_cache.shape[0], which is
+        # what bounds the index.
+        block_table=torch.randint(0, a.tokens, (a.tokens, a.block_table_width),
+                                  dtype=torch.int32, device=device),
         block_size=a.block_size,
         state_width=a.state_width,
         cos_sin_cache=cos_sin_cache,
@@ -103,17 +138,25 @@ def build(a, device="cuda"):
 
 
 def counted_bytes(a):
-    """Traffic the kernel must move, per token:
+    """Traffic the kernel must move, per emitting token:
 
-      read   head_dim fp32 from the state cache
+      read   (1 + overlap) * compress_ratio state rows, twice over -- once
+             for the scores and once for the values, head_dim fp32 each
       write  nope fp8 + rope bf16 + the uint8 scale group into the KV record
 
+    The gather dominates by two orders of magnitude, so counting a single
+    state row per token -- as this did while every token was still early
+    exiting, and no traffic was moved at all -- understates the read side by
+    roughly 2 * (1 + overlap) * compress_ratio.
+
     cos/sin are a small cached re-read and are not counted, so the reported
-    TB/s is a floor on achieved bandwidth rather than an exact figure.
+    bandwidth is a floor on what was achieved rather than an exact figure.
     """
+    rows = (1 + bool(a.overlap)) * a.compress_ratio
     nope = a.head_dim - a.rope_dim
-    per_token = a.head_dim * 4 + nope + a.rope_dim * 2 + a.scale_dim
-    return a.tokens * per_token
+    read = 2 * rows * a.head_dim * 4
+    write = nope + a.rope_dim * 2 + a.scale_dim
+    return a.tokens * (read + write)
 
 
 def main():
@@ -164,7 +207,9 @@ def main():
           "state_width=%d compress_ratio=%d overlap=%s"
           % (a.variant, a.head_dim, a.rope_dim, a.token_stride,
              a.state_width, a.compress_ratio, a.overlap))
-    print("%-10s %-12s %-12s %s" % ("tokens", "latency(us)", "GB/s", "us/token"))
+    print("%-10s %-12s %-12s %-12s %-10s %s"
+          % ("tokens", "single(us)", "2stage(us)", "single GB/s", "us/token",
+             "2stage speedup"))
 
     all_tokens = a.tokens
     for n in all_tokens:
@@ -172,15 +217,31 @@ def main():
         kwargs = build(a)
 
         def run():
-            compress_norm_rope_store_triton(**kwargs)
+            fused_deepseek_v4_compress_norm_rope_store(**kwargs)
+
+        # The split exists to fan the compression across CUs when one program
+        # per token cannot fill them, so it is only interesting against the
+        # single-pass launcher at the same shape. num_decode_tokens=0 sends
+        # every token down the split rather than falling back.
+        scratch = torch.zeros(
+            a.tokens, a.head_dim, dtype=torch.float32, device="cuda"
+        )
+
+        def run_two_stage():
+            fused_deepseek_v4_compress_norm_rope_store_two_stage(
+                **kwargs, num_decode_tokens=0, compress_scratch=scratch
+            )
 
         run()                     # compile outside the timed region
+        run_two_stage()
         torch.cuda.synchronize()
         ms = triton.testing.do_bench_cudagraph(run, rep=a.rep)
+        ms2 = triton.testing.do_bench_cudagraph(run_two_stage, rep=a.rep)
 
-        us = ms * 1e3
+        us, us2 = ms * 1e3, ms2 * 1e3
         gbs = counted_bytes(a) / (ms * 1e-3) / 1e9
-        print("%-10d %-12.2f %-12.1f %.4f" % (n, us, gbs, us / n))
+        print("%-10d %-12.2f %-12.2f %-12.1f %-10.4f %.2fx"
+              % (n, us, us2, gbs, us / n, us / us2))
     a.tokens = all_tokens
 
 

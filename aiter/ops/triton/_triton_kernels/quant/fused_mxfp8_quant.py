@@ -368,7 +368,7 @@ def _v4_rope_pair(x_even, x_odd, cos, sin):
 
 
 @triton.jit
-def _fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_aligned_kernel(
+def _fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_kernel(
     q_in_ptr,  # [T, num_heads_q, HEAD] bf16
     q_out_ptr,  # [T, padded_heads, HEAD] bf16
     q_packed_ptr,  # [T, padded_heads, HEAD] uint8 (the 2buff row)
@@ -527,7 +527,7 @@ def _fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_aligned_kernel(
 #           block's scales in a region after all of its token data
 #   aligned 640: fp8 [0,448) | scales [448,462) | pad | bf16 [512,640)
 @triton.jit
-def quantize_and_insert_k_kernel(
+def _fused_deepseek_v4_quantize_and_insert_k_kernel(
     # Input tensors
     k_ptr,  # [num_tokens, 512] bf16
     slot_mapping_ptr,  # [num_tokens] int64
@@ -678,6 +678,142 @@ def quantize_and_insert_k_kernel(
 # ---------------------------------------------------------------------------
 # Both record layouts, chosen by the geometry the launcher passes. DSv4-Pro on
 # ROCm uses the single-pass compressor and the two-stage one.
+
+# ---------------------------------------------------------------------------
+# DSv4 compressed-KV reader: the inverse of the writer above. Ported from
+# vLLM so the ROCm path can source it here and that shared file can stay
+# upstream. Handles both record layouts; see _rec_geometry in the launcher
+# module for the geometry constants.
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _fused_deepseek_v4_dequant_gather_k_cache_kernel(
+    out_ptr,
+    out_stride0,
+    out_stride1,
+    k_cache_ptr,
+    seq_lens_ptr,
+    block_table_ptr,
+    offset,
+    gather_lens_ptr,
+    # Constants
+    max_blocks_per_seq: tl.constexpr,
+    fp8_dim: tl.constexpr,  # 448
+    bf16_dim: tl.constexpr,  # 64
+    scale_dim: tl.constexpr,  # 8
+    quant_block: tl.constexpr,  # 64 (quantization block size)
+    cache_block_size: tl.constexpr,  # 64 or 128 (paged cache block size)
+    token_data_size: tl.constexpr,  # 576 bytes per token data
+    rec_bytes: tl.constexpr,  # 584 packed, 640 aligned
+    sc_in_rec: tl.constexpr,  # 0 packed, 448 aligned
+    rope_in_rec: tl.constexpr,  # 448 packed, 512 aligned
+    sc_step: tl.constexpr,  # 1 packed, 2 aligned
+    block_stride: tl.constexpr,  # total bytes per block (padded) int32
+    output_dim: tl.constexpr,  # 512
+    fp8_max: tl.constexpr,
+    n_quant_blocks: tl.constexpr,  # 7 real blocks
+    use_fnuz: tl.constexpr = False,
+):
+    batch_idx = tl.program_id(0)
+    worker_id = tl.program_id(1)
+    num_workers = tl.num_programs(1)
+
+    seq_len = tl.load(seq_lens_ptr + batch_idx)
+    if gather_lens_ptr is not None:  # noqa: SIM108
+        gather_len = tl.load(gather_lens_ptr + batch_idx)
+    else:
+        # Gather all tokens
+        gather_len = seq_len
+    start_pos = seq_len - gather_len
+
+    for i in range(worker_id, gather_len, num_workers):
+        # Calculate the actual token index in the sequence
+        pos = start_pos + i
+
+        # Calculate which block and position within block
+        block_in_seq = pos // cache_block_size
+        pos_in_block = pos % cache_block_size
+
+        # Get physical block index from block table
+        block_table_row_ptr = block_table_ptr + batch_idx * max_blocks_per_seq
+        physical_block_idx = tl.load(block_table_row_ptr + block_in_seq)  # int32
+
+        # int64: physical_block_idx * block_stride can exceed 2^31 with many
+        # KV-cache blocks (e.g. >= 57K at block_stride ~37K).
+        cache_block_ptr = (
+            k_cache_ptr + physical_block_idx.to(tl.int64) * block_stride
+        )
+
+        # see the writer: sc_in_rec > 0 means the scales are inside the
+        # record rather than in a per-block region
+        token_data_ptr = cache_block_ptr + pos_in_block * rec_bytes
+        if sc_in_rec > 0:
+            token_scale_ptr = token_data_ptr + sc_in_rec
+        else:
+            token_scale_ptr = (
+                cache_block_ptr
+                + cache_block_size * token_data_size
+                + pos_in_block * scale_dim
+            )
+
+        # see the writer: the bf16 half sits at rope_in_rec, which the
+        # aligned record pushes past its inline scales and pad
+        token_fp8_ptr = token_data_ptr
+        token_bf16_ptr = token_data_ptr + rope_in_rec
+
+        # Output pointer for this token (flattened)
+        output_row_ptr = (
+            out_ptr + batch_idx * out_stride0 + (offset + i) * out_stride1
+        )
+
+        # ========== Dequantize FP8 portion using UE8M0 ==========
+        for qblock_idx in tl.static_range(n_quant_blocks):
+            qblock_start = qblock_idx * quant_block
+
+            if qblock_start < fp8_dim:
+                offsets = qblock_start + tl.arange(0, quant_block)
+                mask = offsets < fp8_dim
+
+                # Load quantized fp8 values (stored as uint8)
+                x_uint8 = tl.load(token_fp8_ptr + offsets, mask=mask, other=0)
+
+                # Bitcast uint8 back to fp8 (FNUZ on gfx942, OCP elsewhere).
+                if use_fnuz:
+                    x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
+                else:
+                    x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+
+                # Convert fp8 to float32 for computation
+                x_float = x_fp8.to(tl.float32)
+
+                # Load and decode UE8M0 scale
+                # UE8M0: scale = 2^(stored_value - 127)
+                encoded_scale = tl.load(
+                    token_scale_ptr + qblock_idx * sc_step
+                )
+                exponent = encoded_scale.to(tl.float32) - 127.0
+                scale = tl.exp2(exponent)
+
+                # Dequantize: bf16_value = fp8_value * scale
+                x_dequant = x_float * scale
+
+                # Store as bf16
+                tl.store(
+                    output_row_ptr + offsets, x_dequant.to(tl.bfloat16), mask=mask
+                )
+
+        # ========== Copy BF16 portion directly ==========
+        bf16_output_offset = fp8_dim  # After 448 elements in output
+
+        # Read bf16 from cache
+        bf16_cache_ptr = token_bf16_ptr.to(tl.pointer_type(tl.bfloat16))
+
+        # Process in chunks of 16
+        for j in tl.static_range(bf16_dim // 16):
+            chunk_offsets = j * 16 + tl.arange(0, 16)
+            bf16_vals = tl.load(bf16_cache_ptr + chunk_offsets)
+            tl.store(output_row_ptr + bf16_output_offset + chunk_offsets, bf16_vals)
+
 
 @triton.jit
 def _fused_kv_compress_norm_rope_insert_sparse_attn(
