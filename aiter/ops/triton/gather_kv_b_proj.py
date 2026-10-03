@@ -122,10 +122,16 @@ def gather_kv_b_proj(
     max_kv_chunks = max(1, (total_kv_k + ChunkK - 1) // ChunkK)
     flat_token_grid = block_size == 1 and not is_fp4_weight
     if flat_token_grid:
-        chunk_workers = min(
-            max_kv_chunks,
-            max(1, (get_num_sms() * 6 + tp_k_head_num_k - 1) // tp_k_head_num_k),
-        )
+        if arch_info.get_arch() == "gfx1250":
+            # The gfx1250 compiler rejects the runtime grid-stride loop in the
+            # flat kernel with an LLVM PHI type assertion. One chunk per
+            # workgroup removes that loop while retaining the fused operation.
+            chunk_workers = max_kv_chunks
+        else:
+            chunk_workers = min(
+                max_kv_chunks,
+                max(1, (get_num_sms() * 6 + tp_k_head_num_k - 1) // tp_k_head_num_k),
+            )
         _triton_gather_kv_b_proj_flat[(tp_k_head_num_k * chunk_workers,)](
             total_kv_k,
             k_buffer,
