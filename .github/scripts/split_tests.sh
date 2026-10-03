@@ -160,6 +160,7 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_msa_block_select.py]=39
     FILE_TIMES[op_tests/test_causal_conv1d_update.py]=38
     FILE_TIMES[op_tests/test_mla_prefill_ps.py]=36
+    FILE_TIMES[op_tests/test_unified_attention.py]=36
     FILE_TIMES[op_tests/test_moeTopkSoftmax.py]=36
     FILE_TIMES[op_tests/test_moe_sorting_mxfp4.py]=36
     FILE_TIMES[op_tests/test_pa_ragged.py]=36

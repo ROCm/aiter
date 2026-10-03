@@ -14,6 +14,7 @@ the JIT path hits the cache instead of compiling again.
 | `chunk_gdn_h.py` | `CHUNK_GDN_H` | chunk-gdn-h opt (K5) kernels |
 | `mega_moe.py` | `MEGA_MOE` | MegaMoE A8W4 profile bundles for MTPR 8192/16384/32768 |
 | `fmha_fp8.py` | `FMHA_FP8` | gfx950 FP8 flash-attention forward, per head shape in `DEFAULT_SHAPES` |
+| `unified_attention.py` | `UNIFIED_ATTENTION` | gfx942 FP8 unified attention, per layer shape in `DEFAULT_SHAPES` (no CSV) |
 | `common.py` | — | Shared job collection, the deadlock-free fork pool, and cache-hit checking logic |
 
 ---
@@ -73,6 +74,17 @@ per rank, layout `varlen_cross` for the chunked-prefill serving path).
 python -m aiter.aot.flydsl.fmha_fp8
 # ad hoc shape, without editing DEFAULT_SHAPES
 python -m aiter.aot.flydsl.fmha_fp8 --shape 12:12:192:128
+```
+
+The gfx942 unified-attention kernel compiles in the layer shape, the page size,
+and the K/V strides. `unified_attention` builds every page size the adapter
+serves, for separate contiguous K/V caches and for vLLM's views of one cache,
+for each layer shape in its `DEFAULT_SHAPES` table (`num_heads, num_kv_heads,
+head_dim, window`, heads per rank). It has no CSV and does not accept `--csv`.
+
+```bash
+# Gemma-4-31B at TP1: 8 attention kernels and 2 combine kernels
+python -m aiter.aot.flydsl.unified_attention
 ```
 
 MegaMoE defaults to all three DeepSeek-V4-Pro deployment profiles: r0/r32/r64
