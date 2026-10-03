@@ -14,6 +14,9 @@ import random
 import torch
 
 from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4
+from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4 import (
+    default_varctx_parallel_unit_num,
+)
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.test_common import checkAllclose, run_perftest
 
@@ -24,6 +27,42 @@ MFMA_M = 16
 KVS_NTPW = 4
 DEFAULT_HEADS = 64
 DEFAULT_HEAD_DIM = 128
+
+
+def test_default_varctx_parallel_unit_num():
+    expected_block64 = {
+        128: (64, 128, 256, 256, 128, 128, 256),
+        1024: (128, 128, 256, 256, 384, 512, 1536),
+        2048: (128, 128, 256, 256, 576, 1024, 2048),
+        2304: (128, 128, 256, 512, 1024, 2048, 3072),
+        8192: (256, 512, 1536, 2048, 2048, 3072, 3072),
+        32768: (1536, 2048, 2048, 3072, 3072, 3072, 3072),
+        131072: (3072, 2048, 4096, 4096, 4096, 4096, 4096),
+    }
+    block64_batches = (1, 2, 4, 8, 16, 32, 64)
+    for context, targets in expected_block64.items():
+        actual = tuple(
+            default_varctx_parallel_unit_num(batch, context, block_k=64)
+            for batch in block64_batches
+        )
+        assert actual == targets, f"{context=}, block_k=64: {actual=} != {targets=}"
+
+    expected = {
+        8192: (64, 96, 256, 256, 512, 512),
+        32768: (128, 256, 256, 512, 1024, 2048),
+        65536: (256, 512, 1024, 1280, 1536, 2048),
+        131072: (256, 512, 1280, 1280, 2048, 4096),
+    }
+    batches = (1, 2, 4, 8, 16, 64)
+    for context, targets in expected.items():
+        actual = tuple(
+            default_varctx_parallel_unit_num(batch, context) for batch in batches
+        )
+        assert actual == targets, f"{context=}: {actual=} != {targets=}"
+
+    for next_n in (2, 3, 5):
+        ctas = default_varctx_parallel_unit_num(3, 131072, next_n=next_n)
+        assert ctas >= 3 * next_n and ctas % next_n == 0
 
 
 def setup_seed(seed):
@@ -360,12 +399,12 @@ def test_pa_mqa_logits_fp4_qfp4_kvfp4(
     batch,
     max_ctx,
     kv_block_size=64,
-    block_k=256,
+    block_k=None,
     next_n=1,
     heads=DEFAULT_HEADS,
     num_iters=20,
     num_warmup=3,
-    num_warps=4,
+    num_warps=None,
     parallel_unit_num=None,
     head_dim=DEFAULT_HEAD_DIM,
     bench=True,
@@ -379,6 +418,23 @@ def test_pa_mqa_logits_fp4_qfp4_kvfp4(
     batch_size = batch
     assert heads % 16 == 0 and heads <= 128, f"heads={heads}: multiple of 16, <= 128"
     assert head_dim % 128 == 0, f"head_dim={head_dim}: multiple of 128"
+    if block_k is None and num_warps is None:
+        from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4 import (
+            _default_decode_config,
+        )
+
+        block_k, num_warps = _default_decode_config(
+            batch_size,
+            next_n,
+            heads,
+            head_dim,
+            max_ctx,
+            kv_block_size,
+        )
+    elif block_k is None:
+        block_k = 64 * num_warps
+    elif num_warps is None:
+        num_warps = block_k // 64
     m_tiles = heads // 16
     k_tiles = head_dim // 128
     head_dim_packed = head_dim // 2
@@ -658,7 +714,7 @@ def main():
     parser.add_argument(
         "--block_k",
         type=int,
-        default=256,
+        default=None,
         help="Tokens per chunk (multiple of MFMA_N=16, divisible by num_warps)",
     )
     parser.add_argument("--num_iters", type=int, default=30)
@@ -666,7 +722,7 @@ def main():
     parser.add_argument(
         "--num_warps",
         type=int,
-        default=4,
+        default=None,
         help="warps per CTA (pipelined kernel only); BLOCK=num_warps*64",
     )
     parser.add_argument(
@@ -710,13 +766,14 @@ def main():
         configs = [(args.batch, args.ctx, args.next_n, args.heads)]
     else:
         # Default sweep: correctness + light perf on small/moderate ragged shapes,
-        # exercising next_n=1/2 and heads=64/128. Use --batch/--ctx for a big run.
+        # exercising next_n=1/2/4 and heads=64/128. Use --batch/--ctx for a big run.
         configs = [
             (2, 512, 1, 64),
             (3, 1024, 1, 64),
             (2, 512, 2, 64),
             (2, 768, 1, 128),
             (4, 2048, 1, 64),
+            (4, 2048, 4, 64),
         ]
 
     for b, c, nn, h in configs:
