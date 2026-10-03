@@ -20,13 +20,13 @@ from ..tensor_shim import (
     buf_copy_load,
     ptr_buf_tensor,
 )
+from . import trace as _trace
 from .dispatch import (
     DispatchSlot,
     emit_direct_fixed_slot_finalize,
     emit_direct_fixed_slot_payload,
     emit_dispatch_payload,
 )
-from . import trace as _trace
 from .gemm1 import _LdsF32View, build_fused_gemm1
 from .mega_moe_config import (
     FIXED_GRID_MULT_VALUES,
@@ -357,7 +357,7 @@ def compile_mega_moe_stage1(
                 launch_epoch = fx.Int32(
                     fx.rocdl.readfirstlane(T.i32, launch_epoch_lane)
                 )
-                if const_expr(LAUNCH_HANDSHAKE):
+                if const_expr(LAUNCH_HANDSHAKE):  # noqa: SIM102
                     if tid < fx.Int32(fz_npes):
                         peer = (tid + fx.Int32(fz_rank)) % fx.Int32(fz_npes)
                         comm_ops.fence_system_release()
@@ -371,7 +371,7 @@ def compile_mega_moe_stage1(
                             launch_epoch - fx.Int32(1),
                         )
                         comm_ops.fence_system_acquire()
-                if const_expr(TRACE_BASE):
+                if const_expr(TRACE_BASE):  # noqa: SIM102
                     if tid == fx.Int32(0):
                         _trace.record(TRACE_BASE, fx.block_idx.x, 6, _trace.now())
                 if const_expr(OWNER_LIGHT):
@@ -409,7 +409,7 @@ def compile_mega_moe_stage1(
                         comm_ops.fence_agent_release()
                         comm_ops.store_i32_system(gate_addr, fx.Int32(0), gate_epoch)
                 fx.rocdl.s_waitcnt(0)
-                if const_expr(TRACE_BASE):
+                if const_expr(TRACE_BASE):  # noqa: SIM102
                     if tid == fx.Int32(0):
                         _trace.record(TRACE_BASE, fx.block_idx.x, 7, _trace.now())
                 fx.barrier()
@@ -419,7 +419,7 @@ def compile_mega_moe_stage1(
                     comm_ops.fence_agent_acquire()
                 fx.barrier()
 
-        if const_expr(TRACE_BASE):
+        if const_expr(TRACE_BASE):  # noqa: SIM102
             if tid == fx.Int32(0):
                 role = is_owner.select(fx.Int32(1), is_producer.select(fx.Int32(2), fx.Int32(3)))
                 _trace.record(TRACE_BASE, fx.block_idx.x, 0, fx.Int64(ticket) | (fx.Int64(role) << fx.Int64(32)))
@@ -499,7 +499,7 @@ def compile_mega_moe_stage1(
             addr_tile_expected = _disp_ptr(DispatchSlot.TILE_EXPECTED)
             addr_tile_ready = addr_tile_ready + tile_state_byte_offset
             addr_tile_expected = addr_tile_expected + tile_state_byte_offset
-        if const_expr(TRACE_BASE):
+        if const_expr(TRACE_BASE):  # noqa: SIM102
             if tid == fx.Int32(0):
                 _trace.record(TRACE_BASE, fx.block_idx.x, 3, _trace.now())
         wave_id = fx.thread_idx.x // 64
@@ -566,7 +566,7 @@ def compile_mega_moe_stage1(
             else:
                 comm_ops.fence_agent_acquire()
         fx.barrier()
-        if const_expr(TRACE_BASE):
+        if const_expr(TRACE_BASE):  # noqa: SIM102
             if tid == fx.Int32(0):
                 _trace.record(TRACE_BASE, fx.block_idx.x, 4, _trace.now())
 
@@ -701,7 +701,7 @@ def compile_mega_moe_stage1(
                     comm_ops.fence_system_acquire()
             _run_work_batch(first_work, scheduled_first)
             consumer_active = first_work < total_work
-        if const_expr(TRACE_BASE):
+        if const_expr(TRACE_BASE):  # noqa: SIM102
             if tid == fx.Int32(0):
                 _trace.record(TRACE_BASE, fx.block_idx.x, 5, _trace.now())
 

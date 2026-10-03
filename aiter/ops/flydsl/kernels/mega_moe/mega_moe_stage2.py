@@ -506,7 +506,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
         bx_i32 = fx.block_idx.x
         lane = tx_i32 % fx.Int32(64)
         wave = rocdl.readfirstlane(T.i32, tx_i32 // fx.Int32(64))
-        if const_expr(TRACE_BASE):
+        if const_expr(TRACE_BASE):  # noqa: SIM102
             if tx_i32 == fx.Int32(0):
                 _trace.record(TRACE_BASE, bx_i32, 1, _trace.now())
 
@@ -622,7 +622,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                 i32_kpad, i32_npad, BM=BM, BN=BN, BK=BK, use_nt=use_nt, INTER_MAX=INTER_MAX, aStages=aStages,
                 a_dtype=a_dtype, has_pad=has_pad, SBM=SBM, g2_bhoist=g2_bhoist, g2_ascale_pf=g2_ascale_pf,
                 expert_offset=_expert_offset, static_k=STATIC_K)
-            if const_expr(TRACE_BASE):
+            if const_expr(TRACE_BASE):  # noqa: SIM102
                 if tx_i32 == fx.Int32(0):
                     _trace.record(TRACE_BASE, bx_i32, 3, _trace.now())
             p2p_scatter_epilog(lds_base_i32, accm_vecs, n_block_idx, wave, lane, N_OUT=N_OUT,
@@ -631,7 +631,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                 comb_inp_nbytes=_comb_inp_nbytes, lds_packed_off=lds_packed_off,
                 lds_weight_off=lds_weight_off, lds_peer_off=lds_peer_off, g2_bf16_lds=g2_bf16_lds,
                 p2p_quant_type=p2p_quant_type, scatter_vec=scatter_vec, fast_fp8=FAST_FP8)
-            if const_expr(TRACE_BASE):
+            if const_expr(TRACE_BASE):  # noqa: SIM102
                 if tx_i32 == fx.Int32(0):
                     _trace.record(TRACE_BASE, bx_i32, 4, _trace.now())
             # fmt: on
@@ -735,7 +735,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                 if fx.Int32(m_block) < total_m_blocks:
                     run_unskipped_unit(unit_bx, m_block)
 
-        if const_expr(TRACE_BASE):
+        if const_expr(TRACE_BASE):  # noqa: SIM102
             if tx_i32 == fx.Int32(0):
                 _trace.record(TRACE_BASE, bx_i32, 5, _trace.now())
 

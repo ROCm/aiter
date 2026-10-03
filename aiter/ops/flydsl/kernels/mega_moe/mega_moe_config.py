@@ -321,9 +321,7 @@ def _select_bounded_stage2(
     persist = bucket >= 128 or fixed_slot
     if not persist:
         persist_cu = 0
-    elif bucket < 128:
-        persist_cu = 128
-    elif bucket == 256:
+    elif bucket < 128 or bucket == 256:
         persist_cu = 128
     elif bucket == 1024:
         persist_cu = 256
