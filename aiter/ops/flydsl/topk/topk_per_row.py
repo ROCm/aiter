@@ -15,6 +15,8 @@ from ..kernels.topk.radix_topk_one_block import (
     _COMPACT_CAPACITY,
     _MAX_ROW_ELEMENTS,
     build_radix_topk_one_block_module,
+    decode_split_blocks,
+    decode_split_ladder,
 )
 from ..kernels.topk.topk_per_row_decode import (
     build_topk_per_row_decode_module,
@@ -59,8 +61,42 @@ def _get_topk_workspace(
     return _get_cached_workspace(device, stream_id, hist_shape, state_shape)
 
 
+@lru_cache(maxsize=16)
+def _get_cached_split_workspace(
+    device: torch.device,
+    stream_id: int,
+    rows: int,
+    blocks: int,
+    k: int,
+) -> tuple[torch.Tensor, ...]:
+    return _new_split_workspace(device, rows, blocks, k)
+
+
+def _new_split_workspace(
+    device: torch.device, rows: int, blocks: int, k: int
+) -> tuple[torch.Tensor, ...]:
+    """Slice winners, viewed both per slice (split) and per row (merge)."""
+    aux_indices = torch.empty((rows, blocks * k), device=device, dtype=torch.int32)
+    aux_values = torch.empty((rows, blocks * k), device=device, dtype=torch.float32)
+    return (
+        aux_indices,
+        aux_values,
+        aux_indices.view(rows * blocks, k),
+        aux_values.view(rows * blocks, k),
+    )
+
+
+def _get_split_workspace(
+    device: torch.device, stream_id: int, rows: int, blocks: int, k: int
+) -> tuple[torch.Tensor, ...]:
+    if torch.cuda.is_current_stream_capturing():
+        return _new_split_workspace(device, rows, blocks, k)
+    return _get_cached_split_workspace(device, stream_id, rows, blocks, k)
+
+
 def clear_topk_per_row_decode_workspace_cache() -> None:
     _get_cached_workspace.cache_clear()
+    _get_cached_split_workspace.cache_clear()
 
 
 @lru_cache(maxsize=128)
@@ -189,6 +225,20 @@ def _validate_flydsl_topk_call(
 
 
 _FLYDSL_TOPK_ONE_BLOCK_ARCHES = ("gfx950", "gfx1250")
+_FLYDSL_TOPK_ONE_BLOCK_SPLIT_MAX_K = 1024
+
+
+def prefers_one_block_split_decode(num_rows: int, width: int, k: int) -> bool:
+    """Whether a split decode is available, and so preferable to the chunked path.
+
+    A split row runs two launches where the chunked kernel runs seven, and the
+    chunked gates were tuned before the split existed.
+    """
+    if get_gfx_runtime() not in _FLYDSL_TOPK_ONE_BLOCK_ARCHES:
+        return False
+    if k > _FLYDSL_TOPK_ONE_BLOCK_SPLIT_MAX_K or width <= _COMPACT_CAPACITY:
+        return False
+    return decode_split_blocks(decode_split_ladder(num_rows, width)) > 1
 
 
 def _validate_radix_topk_one_block_call(
@@ -476,6 +526,68 @@ def flydsl_radix_topk_one_block(
     block_threads = (
         1024 if not short_rows or num_rows <= _SHORT_ROWS_1024_THREAD_MAX_ROWS else 256
     )
+    split_ladder = (
+        decode_split_ladder(num_rows, width)
+        if is_decode and not stable and not short_rows and k <= block_threads
+        else ((None, 1),)
+    )
+    split_blocks = decode_split_blocks(split_ladder)
+    if split_blocks > 1:
+        aux_indices, aux_values, split_indices, split_values = _get_split_workspace(
+            logits.device, stream.cuda_stream, num_rows, split_blocks, k
+        )
+        split_launcher = build_radix_topk_one_block_module(
+            k,
+            block_threads=block_threads,
+            write_values=True,
+            stable=False,
+            short_rows=False,
+            is_decode=True,
+            wave_size=wave_size,
+            arch=arch,
+            split_mode="split",
+            split_ladder=split_ladder,
+        )
+        merge_launcher = build_radix_topk_one_block_module(
+            k,
+            block_threads=block_threads,
+            write_values=values is not None,
+            stable=False,
+            short_rows=False,
+            is_decode=True,
+            wave_size=wave_size,
+            arch=arch,
+            split_mode="merge",
+            split_ladder=split_ladder,
+        )
+        _run_compiled(
+            split_launcher,
+            logits,
+            row_starts,
+            row_ends,
+            split_indices,
+            split_values,
+            aux_indices,
+            width,
+            next_n,
+            num_rows,
+            stream,
+        )
+        _run_compiled(
+            merge_launcher,
+            aux_values,
+            row_starts,
+            row_ends,
+            indices,
+            values if values is not None else logits,
+            aux_indices,
+            width,
+            next_n,
+            num_rows,
+            stream,
+        )
+        return
+
     launcher = build_radix_topk_one_block_module(
         k,
         block_threads=block_threads,
@@ -493,6 +605,7 @@ def flydsl_radix_topk_one_block(
         row_ends,
         indices,
         values if values is not None else logits,
+        indices,
         width,
         next_n,
         num_rows,
