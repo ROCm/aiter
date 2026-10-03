@@ -87,20 +87,24 @@ static void _all_reduce(fptr_t _fa, void* inp, void* out,
         break;
     }
     case AITER_DTYPE_fp16: {
+#if defined(__gfx90a__)
+        if(open_fp8_quant && numel >= 128 * 2048)
+            throw std::runtime_error(
+                "FP8 quantized all-reduce is not supported on gfx90a");
+#else
         if(open_fp8_quant && numel >= 128 * 2048)
         {
             fa->runFp8QuantKernel<opus::fp16_t>(stream,
                                         reinterpret_cast<opus::fp16_t*>(inp),
                                         reinterpret_cast<opus::fp16_t*>(out),
                                         numel);
+            break;
         }
-        else
-        {
-            fa->allreduce<opus::fp16_t>(stream,
-                                reinterpret_cast<opus::fp16_t*>(inp),
-                                reinterpret_cast<opus::fp16_t*>(out),
-                                numel, use_new, is_broadcast_reg_outptr);
-        }
+#endif
+        fa->allreduce<opus::fp16_t>(stream,
+                            reinterpret_cast<opus::fp16_t*>(inp),
+                            reinterpret_cast<opus::fp16_t*>(out),
+                            numel, use_new, is_broadcast_reg_outptr);
         break;
     }
 #if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
