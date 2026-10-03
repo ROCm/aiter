@@ -2,6 +2,8 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 """Static MegaMoEV2 configuration rules for MI355X."""
 
+import json
+import os
 from bisect import bisect_left
 from dataclasses import dataclass, replace
 from functools import cache
@@ -25,7 +27,11 @@ TOKEN_BUCKETS = (
 )
 FIXED_GRID_MULT_VALUES = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32)
 P2P_FP8_MIN_MTPR = 1024
-FIXED_SLOT_MAX_MTPR = 255
+# Fixed-slot (direct expert slots, no count exchange) is the default up to MTPR
+# 128. AITER_MEGA_FIXED_SLOT_MAX_MTPR=511 / 1023 / 2047 extends it to the 256 /
+# 512 / 1024-token capacities, validated on the EP8 v4_pro layout
+# (op_tests/multigpu_tests/test_mega_moe_v2.py).
+FIXED_SLOT_MAX_MTPR = int(os.environ.get("AITER_MEGA_FIXED_SLOT_MAX_MTPR", "255"))
 MAX_MTPR_CLASS = 32768
 # Source-indexed payload storage cuts the maximum-capacity activation buffer
 # by roughly ``topk``.  Keep every smaller capacity on the historical layout.
@@ -203,7 +209,10 @@ def _select_fixed_stage1(bucket: int) -> Stage1Config:
         grid_mult=grid_mult,
         num_dispatch_cu=_fixed_dispatch_cu(bucket),
         mfma_amajor=False,
-        async_a_copy=False,
+        # LDS-DMA A copies + the paired K loop keep the B prefetch in flight;
+        # it matters when few tiles are resident (T=3 -12, T=7 -1.6 us/layer;
+        # neutral from 14 up).
+        async_a_copy=bucket <= 8,
         use_tile_resource=bucket <= 16,
         b_nt=0 if bucket == 1 else 3,
         waves_per_eu_hint=1 if bucket == 16 else 2,
@@ -306,10 +315,13 @@ def _select_bounded_stage2(
     )
     if model_dim < 4096:
         block_n = 128
-    persist = bucket >= 128
+    # Fixed-slot buckets below 128 also run persistent: the non-persistent grid
+    # is sized for the MTPR capacity, and its idle CTAs delay the real tiles
+    # (T=7/14/28: -10..-11 us/layer with 128 persistent CTAs).
+    persist = bucket >= 128 or fixed_slot
     if not persist:
         persist_cu = 0
-    elif bucket == 256:
+    elif bucket < 128 or bucket == 256:
         persist_cu = 128
     elif bucket == 1024:
         persist_cu = 256
@@ -320,7 +332,9 @@ def _select_bounded_stage2(
         block_n=block_n,
         persist=persist,
         persist_cu=persist_cu,
-        use_nt=bucket <= 128,
+        # Non-temporal W2 loads also for fixed-slot 256: DP-padded decode graphs
+        # (224 rows, ~84 real) -14 us/layer; fully real 224 rows -2 us.
+        use_nt=bucket <= 128 or (fixed_slot and bucket <= 256),
         persist_strided=512 <= bucket <= 2048,
     )
 
@@ -349,8 +363,50 @@ def _select_large_stage2(
     )
 
 
+def _config_overrides():
+    """Parse AITER_MEGA_CFG_OVERRIDE (tuning aid).
+
+    JSON ``{"<path>:<bucket>": {"stage1": {...}, "stage2": {...}, "p2p_quant": ...}}``
+    where ``<path>`` is ``fixed``, ``bounded`` or ``large`` and ``<bucket>`` a
+    token bucket or ``*``.  Fields replace the selected defaults.
+    """
+    raw = os.environ.get("AITER_MEGA_CFG_OVERRIDE", "")
+    return json.loads(raw) if raw else {}
+
+
+def _apply_override(config: MegaMoEConfig, path: str, bucket: int) -> MegaMoEConfig:
+    overrides = _config_overrides()
+    for key in (f"{path}:*", f"{path}:{bucket}"):
+        patch = overrides.get(key)
+        if not patch:
+            continue
+        config = MegaMoEConfig(
+            stage1=replace(config.stage1, **patch.get("stage1", {})),
+            stage2=replace(config.stage2, **patch.get("stage2", {})),
+            p2p_quant=patch.get("p2p_quant", config.p2p_quant),
+        )
+    return config
+
+
 @cache
 def _select_bucket_config(
+    bucket: int,
+    mtpr_class: int,
+    model_dim: int,
+    inter_dim: int,
+    fixed_slot_dispatch: bool,
+) -> MegaMoEConfig:
+    config = _select_default_bucket_config(
+        bucket, mtpr_class, model_dim, inter_dim, fixed_slot_dispatch
+    )
+    if mtpr_class == MAX_MTPR_CLASS:
+        path = "large"
+    else:
+        path = "fixed" if fixed_slot_dispatch else "bounded"
+    return _apply_override(config, path, bucket)
+
+
+def _select_default_bucket_config(
     bucket: int,
     mtpr_class: int,
     model_dim: int,
@@ -405,7 +461,7 @@ def select_mega_moe_config(
         and world_size == 8
         and experts_per_rank == REFERENCE_EXPERTS_PER_RANK
     )
-    if fixed_slot_dispatch and bucket > 128:
+    if fixed_slot_dispatch and bucket > FIXED_SLOT_MAX_MTPR:
         raise ValueError(f"fixed-slot does not support token bucket {bucket}")
     total_segments = world_size * experts_per_rank + world_size
     if total_segments > MAX_FANOUT_SEGMENTS:

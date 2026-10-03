@@ -12,6 +12,7 @@ from flydsl.expr.typing import T
 
 from .. import communication_ops_utils as comm_ops
 from ..tensor_shim import buf_copy_load, buf_copy_store, ptr_buf_tensor
+from . import trace as _trace
 
 
 class DispatchSlot(IntEnum):
@@ -450,7 +451,8 @@ def _publish_tile_range(
 def emit_direct_fixed_slot_payload(
     *, num_waves, fz_npes, fz_epr, fz_k, fz_cap, fz_mtpr, fz_rank, fz_total_experts, fz_nbytes, fz_n_i32,
     fz_scale_n_i32, fz_enable_scales, addr_disp, addr_in_tok, addr_in_idx, addr_in_wts, addr_in_sc,
-    i32_cur_tok, dispatch_blocks, producer_slot, parity, expected,
+    i32_cur_tok, dispatch_blocks, producer_slot, parity, expected, trace_base=0,
+    producer_fence=True,
 ):
 # fmt: on
     """Allocate and publish routes directly into destination fixed slots."""
@@ -510,6 +512,9 @@ def emit_direct_fixed_slot_payload(
                     )
                 )
         expert_offset = fx.Int32(fx.rocdl.readlane(T.i32, offset_lane, 0))
+        if const_expr(trace_base):
+            if tid == fx.Int32(0):
+                _trace.record(trace_base, fx.block_idx.x, 6, _trace.now())
         publish = assigned & (expert_offset < fx.Int32(fz_cap))
         payload_row = local_expert * fx.Int32(fz_cap) + expert_offset
 
@@ -554,8 +559,15 @@ def emit_direct_fixed_slot_payload(
 
     fx.rocdl.s_waitcnt(0)
     fx.barrier()
+    if const_expr(trace_base):
+        if tid == fx.Int32(0):
+            _trace.record(trace_base, fx.block_idx.x, 7, _trace.now())
     if tid == fx.Int32(0):
-        comm_ops.fence_system_release()
+        # Remote payload stores are visible at the peer once acknowledged (the
+        # s_waitcnt above); without producer_fence only the last producer of a
+        # group releases, instead of every producer CTA writing back L2.
+        if const_expr(producer_fence):
+            comm_ops.fence_system_release()
         done = fx.Int32(
             comm_ops.atomic_add_agent(
                 a_producer_done + fx.Int64(producer_group) * fx.Int64(4), fx.Int32(1)
@@ -563,6 +575,8 @@ def emit_direct_fixed_slot_payload(
         )
         if done == fx.Int32(producers_per_group - 1):
             comm_ops.fence_agent_acquire()
+            if const_expr(not producer_fence):
+                comm_ops.fence_system_release()
             done_index = parity * fx.Int32(fz_npes) + fx.Int32(fz_rank)
             for destination in range_constexpr(fz_npes):
                 if producer_group == fx.Int32(destination % destination_groups):
@@ -1561,9 +1575,12 @@ def emit_dispatch_payload(
     payload_chunk_rows,
     tile_state_stride,
     indexed_payload=False,
+    fast_copy=False,
 ):
 # fmt: on
     """Produce independently publishable expert payloads from a compact plan."""
+    full_units = fz_n_i32 // 4 // 64
+    total_units = (fz_n_i32 // 4 + 63) // 64
     assert payload_chunk_rows > 0 and tile_state_stride > 0
     dispatch_table = ptr_buf_tensor(addr_disp, fx.Int64)
 
@@ -1712,11 +1729,7 @@ def emit_dispatch_payload(
                 remote_scale_vec_buffer = ptr_buf_tensor(
                     scale_table[destination], fx.Int32, unit_elems=4
                 )
-        for row in range(row_begin + row0, row_end, row_stride):
-            wk_lane = fx.Int32(0)
-            if lane == fx.Int32(0):
-                wk_lane = pair_order[source_base + row]
-            wk = fx.Int32(fx.rocdl.readfirstlane(T.i32, wk_lane))
+        def _row_body(row, wk, token_vals):
             source_token = wk // fx.Int32(fz_k)
             topk_slot = wk % fx.Int32(fz_k)
             group_member_slots = (wk >> fx.Int32(24)) & fx.Int32(0xFF)
@@ -1853,13 +1866,65 @@ def emit_dispatch_payload(
                     fx.Int32,
                     unit_elems=4,
                 )
-            _copy_token_row(
-                source_buffer,
-                destination_buffer,
-                lane,
-                fz_safe_end_i32=fz_safe_end_i32,
-                fz_n_i32=fz_n_i32,
+            if const_expr(fast_copy):
+                for j in range_constexpr(len(token_vals)):
+                    unit = lane + fx.Int32(j * 64)
+                    if const_expr(j < full_units):
+                        buf_copy_store(destination_buffer, unit, token_vals[j], fx.Int32, unit_elems=4)
+                    else:
+                        if unit < fx.Int32(fz_n_i32 // 4):
+                            buf_copy_store(destination_buffer, unit, token_vals[j], fx.Int32, unit_elems=4)
+            else:
+                _copy_token_row(
+                    source_buffer,
+                    destination_buffer,
+                    lane,
+                    fz_safe_end_i32=fz_safe_end_i32,
+                    fz_n_i32=fz_n_i32,
+                )
+
+
+        def _load_token(wk):
+            token = group_task.select(wk & fx.Int32(0xFFFFFF), wk // fx.Int32(fz_k))
+            source_row = ptr_buf_tensor(
+                addr_in_tok + fx.Int64(token) * fx.Int64(fz_nbytes),
+                fx.Int32,
+                unit_elems=4,
             )
+            vals = []
+            for j in range_constexpr(total_units):
+                unit = lane + fx.Int32(j * 64)
+                if const_expr(j >= full_units):
+                    unit = (unit < fx.Int32(fz_n_i32 // 4)).select(unit, fx.Int32(0))
+                vals.append(buf_copy_load(source_row, unit, fx.Int32, unit_elems=4))
+            return vals
+
+        if const_expr(fast_copy):
+            # Two rows per step: both route ids are read back to back and both
+            # rows' loads are in flight before either is stored, instead of one
+            # dependent id read plus ~4 load round trips per row.
+            for row in range(row_begin + row0, row_end, row_stride * fx.Int32(2)):
+                row_b = row + row_stride
+                has_b = row_b < row_end
+                wk_a_lane = fx.Int32(0)
+                wk_b_lane = fx.Int32(0)
+                if lane == fx.Int32(0):
+                    wk_a_lane = pair_order[source_base + row]
+                    wk_b_lane = pair_order[source_base + has_b.select(row_b, row)]
+                wk_a = fx.Int32(fx.rocdl.readfirstlane(T.i32, wk_a_lane))
+                wk_b = fx.Int32(fx.rocdl.readfirstlane(T.i32, wk_b_lane))
+                vals_a = _load_token(wk_a)
+                vals_b = _load_token(wk_b)
+                _row_body(row, wk_a, vals_a)
+                if has_b:
+                    _row_body(row_b, wk_b, vals_b)
+        else:
+            for row in range(row_begin + row0, row_end, row_stride):
+                wk_lane = fx.Int32(0)
+                if lane == fx.Int32(0):
+                    wk_lane = pair_order[source_base + row]
+                wk = fx.Int32(fx.rocdl.readfirstlane(T.i32, wk_lane))
+                _row_body(row, wk, None)
 
         if chunk_active:
             fx.rocdl.s_waitcnt(0)
