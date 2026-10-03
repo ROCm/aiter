@@ -490,7 +490,7 @@ def _moe_sorting_impl(
 
     if use_opus:
         ws_size = aiter.moe_sorting_opus_get_workspace_size(
-            M, num_experts, topk, dispatch_policy
+            M, num_experts, topk, dispatch_policy, topk_ids.get_device()
         )
         workspace = (
             torch.empty(ws_size, dtype=torch.uint8, device=device)
