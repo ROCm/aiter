@@ -145,6 +145,11 @@ Also exempt: arch strings used only in comments, docstrings, or directory path s
 Real examples: `'gfx1250'` new to `fused_mxfp4_quant.py` dispatch logic where no prior arch literals existed (aiter#3937 → fire C4); `'gfx1201'` added to `unified_attention.py` where `'gfx1250'` was already on line 79 (aiter#3956 → skip, pre-existing style); `get_gfx() == "gfx1250"` inside FlyDSL wrapper `flydsl_flash_attn_batch_func` (aiter#3870 → skip, capability guard not centralized dispatch).
 → `⚠️ C4: new arch string '[gfxNNNN]' hardcoded in dispatch — route through arch registry or named constant`
 
+**C5 — Shared chip_info helpers are the ISA gate** ⚠️
+Policy: `.github/instructions/aiter-ops-flydsl.instructions.md`. Do not invent a mixed-device, process-global, or first-`rocminfo`-agent finding against ordinary `get_gfx_runtime()` / `get_gfx()`.
+CLEAR when the wrapper, kernel, or test uses those helpers. FIRE when this PR **adds** a local ISA probe (`gcnArchName`, `get_device_properties` for architecture) instead of them.
+→ `⚠️ C5: new local ISA probe — use get_gfx_runtime() / get_gfx(); do not reimplement chip_info`
+
 ---
 
 ### D — Uninitialized / Boundary State
