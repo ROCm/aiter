@@ -14,7 +14,9 @@ Record fields:
   status    ready (worker is set up), start (candidate began), ok, error
   baseline  true for the installed config
   config    the raw candidate, never the mutated copy; for the baseline the installed config
-            restricted to the DEFAULT.json keys (dropped_keys lists what was left out)
+            (launched through the wrapper's own config=None path unless keys DEFAULT.json does
+            not have had to be stripped first; dropped_keys lists them)
+  gpu       HIP_VISIBLE_DEVICES of the worker
   is_tuned  baseline only: a specialized file served this shape
   us, us_min, us_max, tflops   per-launch time from graph replay (median, min, max)
   error     the exception text when status is error
@@ -134,11 +136,22 @@ def benchmark(
 ):
     keys, _, _ = load_defaults(spec, backend)
     copies = make_cold_copies(inputs, cold_mb)
-    common = {"kernel": spec.name, "backend": backend, "arch": arch, "shape": shape}
+    common = {
+        "kernel": spec.name,
+        "backend": backend,
+        "arch": arch,
+        "shape": shape,
+        "gpu": os.environ.get("HIP_VISIBLE_DEVICES"),
+    }
     append_record(
         out,
         dict(
-            common, status="ready", n_copies=len(copies), calls=calls, replays=replays
+            common,
+            status="ready",
+            n_copies=len(copies),
+            calls=calls,
+            replays=replays,
+            cold_mb=cold_mb,
         ),
     )
     print("ready", flush=True)  # the driver's watchdog reads the worker's log
@@ -151,14 +164,13 @@ def benchmark(
         t0 = time.time()
         try:
             if is_baseline:
-                # the installed config, without keys that DEFAULT.json does not have:
-                # those are not tunable here and the kernel may not take them
                 installed, record["is_tuned"] = resolve_installed(spec, shape, backend)
                 dropped = sorted(k for k in installed if k not in keys)
-                candidate = {k: v for k, v in installed.items() if k in keys}
-                record["config"] = candidate
-                if dropped:
+                record["config"] = {k: v for k, v in installed.items() if k in keys}
+                if dropped:  # keys DEFAULT.json does not have are never launched
                     record["dropped_keys"] = dropped
+                    candidate = record["config"]
+                # otherwise candidate stays None: the wrapper's own installed-config path
             median, low, high = time_with_cuda_graph(
                 call, candidate, copies, calls, replays
             )

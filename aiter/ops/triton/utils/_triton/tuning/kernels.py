@@ -45,6 +45,7 @@ it with its config family and where its gluon path exists:
 import argparse
 import os
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from _utils import cdiv, specialized_filename
@@ -56,25 +57,26 @@ KERNELS = {}
 @dataclass(frozen=True)
 class KernelSpec:
     name: str
-    setup: (
-        callable  # the kernel function: (shape, backend) -> (call, inputs, should_skip)
-    )
-    config_name: str  # the config family, exactly as the kernel's _get_config passes it
-    dims: tuple = ("M", "N", "K")  # ("B", "M", "N", "K") for batched kernels
-    bits: tuple = (
-        16,
-        16,
-    )  # bits per element of A and B in LDS (per-32 scales included)
-    gluon_archs: tuple = ()  # archs where backend="gluon" can run at all
-    gluon_default_archs: (
-        tuple
-    ) = ()  # archs where the wrapper picks gluon when none is given
-    backend_kwarg: bool = True  # False: the wrapper takes no backend= and picks by arch
-    bounds: tuple | None = (
-        None  # M bounds the kernel's _get_config passes (None: file/standard)
-    )
-    gluon_ignored_keys: tuple = ()  # DEFAULT.json keys the gluon wrapper never reads
-    gluon_candidates: dict = field(default_factory=dict)  # gluon-only candidate lists
+    # the kernel function: (shape, backend) -> (call, inputs, should_skip)
+    setup: Callable
+    # the config family, exactly as the kernel's _get_config passes it
+    config_name: str
+    # ("B", "M", "N", "K") for batched kernels
+    dims: tuple = ("M", "N", "K")
+    # bits per element of A and B as they sit in LDS (per-32 scales included)
+    bits: tuple = (16, 16)
+    # archs where backend="gluon" can run at all
+    gluon_archs: tuple = ()
+    # archs where the wrapper picks gluon when no backend is given
+    gluon_default_archs: tuple = ()
+    # False: the wrapper takes no backend= and picks by arch
+    backend_kwarg: bool = True
+    # M bounds the kernel's _get_config passes (None: the file's M_BOUNDS or the standard list)
+    bounds: tuple | None = None
+    # DEFAULT.json keys the gluon wrapper never reads
+    gluon_ignored_keys: tuple = ()
+    # gluon-only candidate lists, for keys that mean something else there
+    gluon_candidates: dict = field(default_factory=dict)
 
     def default_backend(self, arch):
         return "gluon" if arch in self.gluon_default_archs else "triton"
@@ -488,10 +490,12 @@ def gemm_a8w8_blockscale(shape, backend):
     from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
         gemm_a8w8_blockscale as gemm,
     )
+    from aiter.ops.triton.utils._triton import arch_info
     from op_tests.triton_tests.gemm.basic.test_gemm_a8w8_blockscale import (
         generate_gemm_a8w8_blockscale_inputs,
     )
 
+    arch = arch_info.get_arch()
     M, N, K = shape["M"], shape["N"], shape["K"]
     x, _, w, _, x_scale, w_scale, y = generate_gemm_a8w8_blockscale_inputs(
         M, N, K, 128, 128, dtype=torch.bfloat16, layout="TN", output=True, shuffle=False
@@ -510,7 +514,17 @@ def gemm_a8w8_blockscale(shape, backend):
         )
 
     def should_skip(config):
-        return config["BLOCK_SIZE_K"] != 128  # the scale block is 128 wide
+        if config["BLOCK_SIZE_K"] != 128:
+            return True  # the scale block is 128 wide
+        if (
+            backend == "gluon" and arch == "gfx950"
+        ):  # that kernel has three fixed tiles, 4 warps
+            tile = (config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"])
+            return (
+                tile not in {(64, 128), (128, 128), (128, 256)}
+                or config["num_warps"] != 4
+            )
+        return False
 
     return call, (x, w, x_scale, w_scale, y), should_skip
 

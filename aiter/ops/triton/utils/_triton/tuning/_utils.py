@@ -33,6 +33,17 @@ def results_path(runs_dir, arch, backend, kernel, shape):
     )
 
 
+def plan_path(runs_dir, arch, backend, kernel, shape):
+    return os.path.join(
+        runs_dir, f"plan-{arch}-{backend}-{kernel}-{shape_tag(shape)}.json"
+    )
+
+
+def final_results_path(out):
+    """Same-device re-timing of the fastest candidates when several GPUs swept an M."""
+    return out[: -len(".jsonl")] + ".final.jsonl"
+
+
 def results_files(runs_dir, arch, backend, kernel, shape_nk):
     """All per-M result files of one (kernel, backend, N, K[, B])."""
     pattern = results_path(runs_dir, arch, backend, kernel, dict(shape_nk, M="*"))
@@ -54,33 +65,44 @@ def bucket_for(M, bounds):
 
 
 def append_record(path, record):
-    with open(path, "a") as f:
+    with open(path, "a+") as f:
+        f.seek(0, 2)
+        if f.tell() and not _ends_with_newline(path):
+            # a worker died mid-line; terminate the fragment so this record stays parsable
+            f.write("\n")
         f.write(json.dumps(record) + "\n")
 
 
-def read_records(path):
-    """Last record per candidate, and how many 'ready' markers the file holds.
+def _ends_with_newline(path):
+    with open(path, "rb") as f:
+        f.seek(-1, 2)
+        return f.read(1) == b"\n"
 
-    A 'start' marker never replaces a final record, so a candidate the worker died on keeps
-    status 'start'. A truncated last line (killed worker) is skipped.
-    """
-    records, n_ready = {}, 0
+
+def iter_records(path):
+    """The parsed JSON lines of a results file; a truncated line (killed worker) is skipped."""
     if not os.path.exists(path):
-        return records, n_ready
+        return
     with open(path) as f:
         for line in f:
             try:
-                record = json.loads(line)
+                yield json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if record["status"] == "ready":
-                n_ready += 1
-                continue
-            key = "baseline" if record.get("baseline") else config_key(record["config"])
-            is_final = record["status"] != "start"
-            if is_final or records.get(key, {}).get("status") in (None, "start"):
-                records[key] = record
-    return records, n_ready
+
+
+def read_records(path):
+    """Last record per candidate. A 'start' marker never replaces a final record, so a candidate
+    the worker died on keeps status 'start'."""
+    records = {}
+    for record in iter_records(path):
+        if record["status"] == "ready":
+            continue
+        key = "baseline" if record.get("baseline") else config_key(record["config"])
+        is_final = record["status"] != "start"
+        if is_final or records.get(key, {}).get("status") in (None, "start"):
+            records[key] = record
+    return records
 
 
 def add_shape_args(parser, with_m=True, multi_m=False):

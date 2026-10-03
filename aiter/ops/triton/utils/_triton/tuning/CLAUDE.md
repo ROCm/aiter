@@ -28,7 +28,8 @@ here. Update this file in the same change as any behaviour change.
 3. The whole `SEARCH_SPACE` is swept. No CLI overrides, no caps, no sampling. Pruning is: the
    shape filters, `should_skip_generic` and `exceeds_lds` in `space.py`, then the kernel's own
    `should_skip(config)`. Every rule returns True to reject; `build_space` reads as separate
-   `if ...: continue` checks. `gluon_candidates` is only for a key whose meaning differs under
+   `if ...: continue` checks. When the kernel rejects every tile that fits the shape, `build_space`
+   allows block sizes above the shape for that M (`oversized_tiles_allowed` in the plan). `gluon_candidates` is only for a key whose meaning differs under
    gluon (gfx1250 a8w8 blockscale `num_stages` is `NUM_BUFFERS`).
 4. Results always install into `resolve_config_dir(op, config_name, backend)`. No export directory,
    no dry run.
@@ -43,7 +44,9 @@ here. Update this file in the same change as any behaviour change.
    restored. Bucket collisions are resolved before writing (largest M wins).
 6. Data contracts: a kernel function returns `(call, inputs, should_skip)`; a result
    record's fields are listed in the `harness.py` docstring; the plan JSON carries the family's
-   `bounds`; the worker prints `ready` and one line per candidate for the driver's watchdog; `config` in a record is the raw
+   `bounds`; the worker prints `ready` and one line per candidate for the driver's watchdog;
+   the plan is kept per (arch, backend, kernel, shape) in the runs dir and the installer only
+   lets its candidates win; resume requires the same `--calls`/`--replays`; `config` in a record is the raw
    candidate. Keys a wrapper derives or clamps (`SPLITK_BLOCK_SIZE`, clamped `NUM_BUFFERS`,
    `GROUP_K`, CTAS-scaled tiles) are never recorded or written. Wrappers mutate their config
    dict, so every launch gets a deep copy; the only framework code that mutates a config is a
@@ -52,7 +55,8 @@ here. Update this file in the same change as any behaviour change.
    discovery runs in the worker (`harness.py --plan`) under `HIP_VISIBLE_DEVICES`.
 8. One GPU op in flight per GPU: each worker is serial and owns one GPU. A driver may use several
    GPUs (`--gpu 0 1 2 3`): candidates are dealt round-robin, then a final round re-times the
-   baseline and the ten fastest on the first GPU so the winner comes from one device. Never two
+   baseline and the ten fastest on the first GPU into `<results>.final.jsonl`; when that file
+   exists the installer uses only it, and an M timed on several GPUs without it is skipped. Never two
    drivers on one GPU.
 9. Call the public wrappers (`aiter.ops.triton.gemm...`) only, never `_triton_kernels` or
    `_gluon_kernels`; pass `backend=` where the wrapper takes it and refuse a backend the wrapper

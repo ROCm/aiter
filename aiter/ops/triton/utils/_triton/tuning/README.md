@@ -12,7 +12,7 @@ per M -> validate and install the config file.
 | Where do I add a kernel? | One function in `kernels.py` decorated with `@kernel(...)`; the module docstring shows a complete example |
 | Where do I change candidate values? | `SEARCH_SPACE` in `space.py` |
 | Why was this config skipped? | `space.py`: the shape filters, `should_skip_generic` and `exceeds_lds`, plus the kernel's own `should_skip` in `kernels.py`. The driver prints how many combinations each rule removed |
-| How did this winner get installed? | `write_best_configs.py`: `load_winners` -> `assign_buckets` -> `build_table` -> `check_table` -> write -> confirmation through `get_gemm_config` |
+| How did this winner get installed? | `write_best_configs.py`: `load_winners` -> `assign_buckets` -> `build_table` -> write -> confirmation through `get_gemm_config` |
 
 | File | What it does |
 | --- | --- |
@@ -37,8 +37,9 @@ it (for fp4 families that is twice the byte width).
 
 `--gpu` takes one or more GPUs. With several, the candidates of each M are dealt round-robin to
 the GPUs, one serial worker per GPU; when all are done a final round re-times the installed
-baseline and the ten fastest candidates on the first GPU, so the winner is picked from numbers
-measured on one device. Never point two drivers at the same GPU.
+baseline and the ten fastest candidates on the first GPU into `<results>.final.jsonl`, and the
+installer uses only that file for the M, so the winner is picked from numbers measured on one
+device. Never point two drivers at the same GPU.
 
 Suggested M lists: `GEMM-AFP4WFP4_PRESHUFFLED` 4 8 16 31 32 64 ... 8192 (31 is a bucket of its
 own because `BLOCK_SIZE_M` must be 16 or less below M=32); standard families 1 4 8 16 ... 8192;
@@ -62,7 +63,8 @@ when the keys exist, and an LDS check: a block-size combination whose buffers x 
 exceed the arch's LDS is never compiled; each kernel declares its element widths as `bits=(a, b)`)
 and the kernel's own `should_skip(config)` in `kernels.py` (what the kernel asserts, and buffer
 counts its wrapper clamps so they would only repeat another candidate). Every rule returns True
-to reject.
+to reject. If the kernel rejects every tile that fits the shape (a kernel that needs 64-row tiles
+at M=16), block sizes above the shape are allowed for that M and the plan says so.
 There are no command-line overrides: edit the table. A one-value list pins a key. Keys the wrapper
 never reads (`ignored_keys` in the spec) and `matrix_instr_nonkdim`/`kpack` under gluon stay at
 their `DEFAULT.json` value. The driver prints the candidates per key, the config count and an ETA
@@ -79,8 +81,10 @@ cannot be forced onto the other backend; the driver refuses.
 
 Each candidate is launched once eagerly (this compiles it), then captured into a CUDA graph of 24
 launches that rotate over cold copies of the inputs (up to `--cold-mb`), replayed 25 times. The
-median per launch is recorded with min, max and TFLOPS. The installed config (`config=None`) is
-always timed first as the baseline. The numbers include dispatch gaps and both split-K kernels, so
+median per launch is recorded with min, max and TFLOPS. The installed config is always timed
+first as the baseline, through the wrapper's own `config=None` path; only when the installed entry
+carries keys that `DEFAULT.json` does not have are those stripped and the rest passed explicitly
+(`dropped_keys` in the record). The numbers include dispatch gaps and both split-K kernels, so
 they are not comparable with the old rocprof logs.
 
 ## Results, resume, failures
@@ -89,8 +93,10 @@ Results go to `runs/sweep-<arch>-<backend>-<kernel>-[B=..-]M=..-N=..-K=..jsonl` 
 `<that file>.gpu<g>.log`), one JSON line per config: `config` (the raw candidate), `status` `ok` (`us`, `us_min`, `us_max`, `tflops`), `error`
 (the exception; the sweep continues), `crashed` or `hung` (the worker died or stalled on it; the
 driver restarts the worker on the remaining configs). The baseline record carries `is_tuned`.
-The full field list is in the `harness.py` docstring. Re-running the same command skips configs that already have a record;
-`--fresh` discards them. `--batch` is the number of configs per worker process, `--stall` the
+The full field list is in the `harness.py` docstring. Re-running the same command skips configs that already have a record, provided `--calls` and
+`--replays` are unchanged (otherwise it refuses); `--fresh` discards them. The plan of each M is
+kept as `runs/plan-<arch>-<backend>-<kernel>-<shape>.json`, and only its candidates (plus the
+baseline) can win at install time. Ctrl-C kills the workers before the driver exits. `--batch` is the number of configs per worker process, `--stall` the
 seconds a worker may spend on one candidate (a huge tile can compile for minutes) before it is
 killed, `--setup-timeout` the time allowed before a worker is ready.
 

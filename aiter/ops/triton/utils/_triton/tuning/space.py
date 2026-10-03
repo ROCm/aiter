@@ -112,20 +112,27 @@ def candidate_values(spec, backend, keys, defaults, default_path):
     return values, pinned
 
 
-def filter_by_shape(key, values, shape, backend):
-    """Drop values the shape makes pointless; always keep at least one."""
+def filter_by_shape(key, values, shape, backend, allow_oversized_tiles):
+    """Drop values the shape makes pointless; always keep at least one.
+
+    Block sizes above the next power of two of their dimension are dropped unless
+    allow_oversized_tiles; NUM_KSPLIT values that do not divide K are always dropped.
+    """
     name = ALIASES.get(key, key)
     M, N, K = shape["M"], shape["N"], shape["K"]
-    if name == "BLOCK_SIZE_M":
-        if backend == "gluon":  # gluon tiles start at 16 rows
-            values = [v for v in values if v >= 16] or values
-        kept = [v for v in values if v <= next_pow2(M)]
-    elif name == "BLOCK_SIZE_N":
-        kept = [v for v in values if v <= next_pow2(N)]
-    elif name == "BLOCK_SIZE_K":
-        kept = [v for v in values if v <= next_pow2(K)]
-    elif name == "NUM_KSPLIT":
+    if name == "NUM_KSPLIT":
         kept = [v for v in values if K % v == 0]
+    elif name in ("BLOCK_SIZE_M", "BLOCK_SIZE_N", "BLOCK_SIZE_K"):
+        if name == "BLOCK_SIZE_M" and backend == "gluon":
+            values = [
+                v for v in values if v >= 16
+            ] or values  # gluon tiles start at 16 rows
+        dim = {"BLOCK_SIZE_M": M, "BLOCK_SIZE_N": N, "BLOCK_SIZE_K": K}[name]
+        kept = (
+            values
+            if allow_oversized_tiles
+            else [v for v in values if v <= next_pow2(dim)]
+        )
     else:
         return values
     return kept or [min(values)]
@@ -154,7 +161,7 @@ def should_skip_generic(shape, config, backend):
     return False
 
 
-def exceeds_lds(config, bits, arch):
+def exceeds_lds(config, bits, arch, backend):
     """True when buffers x (A tile + B tile) cannot fit the LDS; such a config never compiles."""
     from aiter.ops.triton.utils._triton.arch_info import _LDS_CAP_BYTES
 
@@ -163,8 +170,12 @@ def exceeds_lds(config, bits, arch):
     block_k = config.get("BLOCK_SIZE_K", config.get("BLOCK_K"))
     if None in (block_m, block_n, block_k):
         return False
-    # gluon keeps NUM_BUFFERS tile pairs resident; triton keeps num_stages - 1 (lenient bound)
-    buffers = config.get("NUM_BUFFERS", max(config.get("num_stages", 1) - 1, 1))
+    # gluon keeps NUM_BUFFERS (or num_stages, where that is what the key means) tile pairs
+    # resident; the triton pipeliner keeps num_stages - 1 (lenient bound)
+    num_stages = config.get("num_stages", 1)
+    buffers = config.get(
+        "NUM_BUFFERS", num_stages if backend == "gluon" else max(num_stages - 1, 1)
+    )
     tile_bytes = (block_m * block_k * bits[0] + block_n * block_k * bits[1]) / 8
     return buffers * tile_bytes > _LDS_CAP_BYTES.get(arch, 64 * 1024)
 
@@ -174,31 +185,51 @@ def build_space(spec, shape, backend, arch, kernel_should_skip):
     keys, buckets, default_path = load_defaults(spec, backend)
     defaults = default_values(spec, backend, shape["M"], keys, buckets)
     values, pinned = candidate_values(spec, backend, keys, defaults, default_path)
-    for key in keys:
-        if key not in pinned:
-            values[key] = filter_by_shape(key, values[key], shape, backend)
 
-    configs = []
-    skipped = {"generic rules": 0, "LDS": 0, "kernel rules": 0}
-    for combination in itertools.product(*values.values()):
-        config = dict(zip(keys, combination))
-        if should_skip_generic(shape, config, backend):
-            skipped["generic rules"] += 1
-            continue
-        if exceeds_lds(config, spec.bits, arch):
-            skipped["LDS"] += 1
-            continue
-        if kernel_should_skip is not None and kernel_should_skip(config):
-            skipped["kernel rules"] += 1
-            continue
-        configs.append(config)
+    def shape_filtered(allow_oversized_tiles):
+        return {
+            k: (
+                v
+                if k in pinned
+                else filter_by_shape(k, v, shape, backend, allow_oversized_tiles)
+            )
+            for k, v in values.items()
+        }
+
+    def prune(candidate_lists):
+        configs = []
+        skipped = {"generic rules": 0, "LDS": 0, "kernel rules": 0}
+        for combination in itertools.product(*candidate_lists.values()):
+            config = dict(zip(keys, combination))
+            if should_skip_generic(shape, config, backend):
+                skipped["generic rules"] += 1
+                continue
+            if exceeds_lds(config, spec.bits, arch, backend):
+                skipped["LDS"] += 1
+                continue
+            if kernel_should_skip is not None and kernel_should_skip(config):
+                skipped["kernel rules"] += 1
+                continue
+            configs.append(config)
+        return configs, skipped
+
+    allow_oversized_tiles = False
+    shape_filtered_values = shape_filtered(allow_oversized_tiles)
+    configs, skipped = prune(shape_filtered_values)
+    if not configs and skipped["kernel rules"]:
+        # the kernel rejects every tile that fits the shape (it needs 64-row tiles at M=16, say):
+        # allow block sizes above the shape; NUM_KSPLIT must still divide K
+        allow_oversized_tiles = True
+        shape_filtered_values = shape_filtered(allow_oversized_tiles)
+        configs, skipped = prune(shape_filtered_values)
 
     report = {
         "default_path": default_path,
         "keys": keys,
         "pinned": pinned,
-        "candidate_values": values,
-        "raw": math.prod(len(v) for v in values.values()),
+        "candidate_values": shape_filtered_values,
+        "oversized_tiles_allowed": allow_oversized_tiles,
+        "raw": math.prod(len(v) for v in shape_filtered_values.values()),
         "skipped": skipped,
         "final": len(configs),
     }

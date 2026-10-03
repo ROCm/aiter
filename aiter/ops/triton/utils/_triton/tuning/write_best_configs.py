@@ -7,7 +7,6 @@ Flow:  load_winners    fastest ok record per M; the installed baseline competes 
                        "any" is never written
        build_table     seeded with what the loader serves today (this shape's file, for batched
                        shapes the N/K file, else DEFAULT.json)
-       check_table     every assigned M must find its own winner in the table; nothing written yet
        write, confirm  write the file, re-resolve every assigned M through the real loader, and
                        put the previous file back if the loader disagrees
 
@@ -25,18 +24,15 @@ from pathlib import Path
 from _utils import (
     add_shape_args,
     bucket_for,
+    config_key,
+    final_results_path,
+    plan_path,
     read_records,
     results_files,
     shape_from_args,
     specialized_filename,
 )
-from kernels import (
-    ensure_repo_on_path,
-    family_bounds,
-    get_spec,
-    resolve_installed,
-    seed_table,
-)
+from kernels import ensure_repo_on_path, get_spec, resolve_installed, seed_table
 from space import load_defaults
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -47,14 +43,41 @@ Winner = namedtuple(
 
 
 def load_winners(runs_dir, arch, backend, spec, shape_nk):
-    """M -> Winner from every per-M result file of this (kernel, backend, N, K[, B])."""
+    """M -> Winner from every per-M result file of this (kernel, backend, N, K[, B]).
+
+    When several GPUs swept an M, only the final round (<results>.final.jsonl, timed on one
+    GPU) counts. When the M's plan file is present only its candidates (and the baseline) can win,
+    so records of candidates that are no longer in the search space are ignored.
+    """
     winners = {}
     for path in results_files(runs_dir, arch, backend, spec.name, shape_nk):
-        records, _ = read_records(path)
+        records = read_records(path)
         ok = [r for r in records.values() if r["status"] == "ok"]
         if not ok:
             continue
         M = ok[0]["shape"]["M"]
+        if os.path.exists(final_results_path(path)):
+            records = read_records(final_results_path(path))
+            ok = [r for r in records.values() if r["status"] == "ok"]
+        elif (
+            len({r.get("gpu") for r in ok} - {None}) > 1
+        ):  # records without a gpu are from one worker
+            print(
+                f"  M={M}: timed on several GPUs but the final round is missing; rerun the sweep. Skipped."
+            )
+            continue
+        plan_file = plan_path(runs_dir, arch, backend, spec.name, dict(shape_nk, M=M))
+        if os.path.exists(plan_file):
+            with open(plan_file) as f:
+                current = {config_key(c) for c in json.load(f)["configs"]}
+            ok = [
+                r for r in ok if r.get("baseline") or config_key(r["config"]) in current
+            ]
+        else:
+            print(f"  M={M}: no plan file, every recorded candidate may win")
+        if not ok:
+            print(f"  M={M}: no successful record of a current candidate; skipped")
+            continue
         baseline = records.get("baseline")
         if baseline is not None and baseline["status"] != "ok":
             baseline = None
@@ -104,15 +127,6 @@ def build_table(seed, assignments, arch, keys):
     return table
 
 
-def check_table(table, assignments, bounds):
-    """Each assigned M must land on its own bucket in the table; a mismatch is a bug in this file."""
-    for bucket, winner in assignments.items():
-        if bucket_for(winner.M, bounds) != bucket or bucket not in table:
-            sys.exit(
-                f"internal error: M={winner.M} does not resolve to {bucket} in the table"
-            )
-
-
 def ordered(table):
     """M_BOUNDS, M_LEQ ascending, M_GEQ descending, any, rest: the order get_gemm_config walks."""
 
@@ -140,15 +154,15 @@ def install(spec, backend, shape_nk, runs_dir):
     if not winners:
         sys.exit(f"no results for {spec.name} {backend} {shape_nk} in {runs_dir}")
 
-    seed_path, seed = seed_table(spec, backend, shape_nk)
-    print(f"seeding from {seed_path}")
-    bounds = family_bounds(
+    seed_path, seed = seed_table(
         spec, backend, shape_nk
-    )  # the loader takes M_BOUNDS from the file it picks
-    assignments = assign_buckets(winners, bounds)
+    )  # what the loader serves today
+    print(f"seeding from {seed_path}")
+    # the loader walks the kernel's explicit bounds, else the M_BOUNDS of the file it picks
+    bounds = spec.bounds or seed.get("M_BOUNDS") or gemm_config_utils.STANDARD_M_BOUNDS
     keys, _, _ = load_defaults(spec, backend)
+    assignments = assign_buckets(winners, bounds)
     table = build_table(seed, assignments, arch, keys)
-    check_table(table, assignments, bounds)
     for bucket, winner in sorted(assignments.items(), key=lambda kv: kv[1].M):
         gain = ""
         if winner.baseline is not None:
