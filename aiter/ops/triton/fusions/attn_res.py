@@ -170,14 +170,16 @@ def _dtype_max(dtype: torch.dtype) -> float:
 #   4-6x slower than a fixed-BL=2 dispatch. ATOM's own attn_res kernel uses this
 #   fixed-BL-by-token-count shape (not keyed by L at all); the values below are
 #   copied from it since they're already validated in production.
+#
+# N > 256 uses 8 warps vs ATOM's 16: 16 warps caps at 128 VGPRs, spilling at D=7168
 _ATTN_RES_SEQ_CONFIGS = (
     # (max_tokens, num_warps, num_stages)
     (16, 8, 1),
     (64, 8, 1),
     (256, 8, 1),
-    (1024, 16, 1),
+    (1024, 8, 1),
 )
-_ATTN_RES_SEQ_CATCHALL = (16, 1)  # N > largest bucket
+_ATTN_RES_SEQ_CATCHALL = (8, 1)  # N > largest bucket
 
 #
 # Verified 2026-08-13 with a real search, not just inference from the ATOM
@@ -266,6 +268,20 @@ def _pick_attn_res_separate_bl(tokens: int, l2: int, close_block: bool) -> int:
     # The separated loop only covers the L-1 block_residual rows, so a wider tile
     # than that just burns registers on lanes that are masked off anyway.
     return max(1, min(bl, l2))
+
+
+def _pick_attn_res_separate_num_warps(
+    tokens: int, l2: int, close_block: bool, num_warps: int
+) -> int:
+    # SEPARATE-regime num_warps: 8 once there are >= 4 block rows (halves the per-thread
+    # [BL, BD] tile), except close_block at N <= 2048 keeps the packed table's pick.
+    MANY_ROWS_NUM_WARPS = 8
+    MIN_L2 = 4
+    CLOSE_BLOCK_MIN_T = 2048
+
+    if l2 >= MIN_L2 and (not close_block or tokens > CLOSE_BLOCK_MIN_T):
+        return MANY_ROWS_NUM_WARPS
+    return num_warps
 
 
 def _pick_attn_res_seq_config(tokens: int) -> tuple[int, int]:
@@ -785,7 +801,11 @@ def attn_res_gate(
     # rows, so BL=1 is a flat 1-D row load with no candidate-axis raggedness.
     separate = N > _ATTN_RES_PREFILL_T
     if separate:
-        bl = _pick_attn_res_separate_bl(N, _next_pow2(max(L - 1, 1)), close_block)
+        l2_block = _next_pow2(max(L - 1, 1))
+        bl = _pick_attn_res_separate_bl(N, l2_block, close_block)
+        num_warps = _pick_attn_res_separate_num_warps(
+            N, l2_block, close_block, num_warps
+        )
 
     res_stride_n, res_stride_l, _ = br.stride()
     bo_stride_n, bo_stride_l, _ = bo.stride()
