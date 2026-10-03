@@ -138,6 +138,8 @@ def moe_gemm_mxfp8(
         None,
         None,
         None,
+        None,
+        None,
         # bias
         bias,
         bias_stride,
