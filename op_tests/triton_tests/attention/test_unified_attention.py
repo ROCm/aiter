@@ -294,6 +294,8 @@ def ref_paged_attn(
     scale: float,
     out_dtype: torch.dtype,
     sliding_window: int | None = None,
+    mm_prefix_ranges: list[list[tuple[int, int]]] | None = None,
+    mm_prefix_clamp_sliding_window: bool = False,
     soft_cap: float | None = None,
     sinks: torch.Tensor | None = None,
     q_descale: torch.Tensor | None = None,
@@ -347,6 +349,20 @@ def ref_paged_attn(
                 # The window is two-sided: |q_abs - k| < sliding_window.
                 qk_dist = qk_dist.abs()
             mask |= qk_dist >= sliding_window
+        if mm_prefix_ranges is not None:
+            # (causal AND window) OR mm_prefix, matching the kernel.
+            query_pos = torch.arange(query_len, device=q.device) + (kv_len - query_len)
+            key_pos = torch.arange(kv_len, device=q.device)
+            for range_start, range_end in mm_prefix_ranges[i]:
+                if range_start >= range_end:
+                    continue
+                q_in = (query_pos >= range_start) & (query_pos <= range_end)
+                k_in = (key_pos >= range_start) & (key_pos <= range_end)
+                keep = q_in[:, None] & k_in[None, :]
+                if mm_prefix_clamp_sliding_window and sliding_window is not None:
+                    delta = query_pos[:, None] - key_pos[None, :]
+                    keep &= delta < sliding_window
+                mask &= ~keep
         if soft_cap is not None and soft_cap > 0:
             attn = soft_cap * torch.tanh(attn / soft_cap)
         attn.masked_fill_(mask, float("-inf"))
@@ -856,6 +872,119 @@ def test_triton_unified_attn_noncausal(
         k_descale=k_descale,
         v_descale=v_descale,
         causal=0,
+    )
+
+    torch.testing.assert_close(
+        output.to(torch.float32),
+        ref_output.to(torch.float32),
+        atol=1.5e-2,
+        rtol=1e-2,
+    )
+
+
+@pytest.mark.parametrize(
+    "seq_lens, mm_prefix_ranges",
+    [
+        # Spans must cover query positions (context_len .. seq_len), as an
+        # image span does during prefill, or the mask is inert.
+        ([(64, 256)], [[(200, 231)]]),
+        ([(64, 249)], [[(190, 213), (222, 245)]]),
+        ([(64, 256), (17, 97)], [[(200, 231)], [(84, 95)]]),
+    ],
+)
+@pytest.mark.parametrize("sliding_window", [None, 16])
+@pytest.mark.parametrize("mm_prefix_clamp_sliding_window", [False, True])
+@torch.inference_mode()
+def test_triton_unified_attn_mm_prefix(
+    seq_lens: list[tuple[int, int]],
+    mm_prefix_ranges: list[list[tuple[int, int]]],
+    sliding_window: int | None,
+    mm_prefix_clamp_sliding_window: bool,
+) -> None:
+    dtype = torch.bfloat16
+    head_size, block_size, num_heads = 64, 16, (8, 1)
+    torch.manual_seed(0)
+    query_lens = [x[0] for x in seq_lens]
+    kv_lens_list = [x[1] for x in seq_lens]
+    (
+        query,
+        key_cache_orig,
+        value_cache_orig,
+        key_cache,
+        value_cache,
+        sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        _maybe_quant_query,
+        _query_scales,
+        q_descale,
+        k_descale,
+        v_descale,
+        output_scale,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=2048,
+        block_size=block_size,
+        head_size=head_size,
+        num_heads=num_heads,
+        sliding_window=sliding_window,
+        q_dtype=dtype,
+        kv_dtype=dtype,
+        out_dtype=dtype,
+        device="cuda",
+    )
+    max_ranges = max(len(r) for r in mm_prefix_ranges)
+    ranges = torch.zeros(
+        len(seq_lens), max_ranges, 2, dtype=torch.int32, device="cuda"
+    )
+    for i, per_seq in enumerate(mm_prefix_ranges):
+        for j, (lo, hi) in enumerate(per_seq):
+            ranges[i, j, 0] = lo
+            ranges[i, j, 1] = hi
+
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        sinks=sinks,
+        output_scale=output_scale,
+        mm_prefix_range=ranges,
+        mm_prefix_clamp_sliding_window=mm_prefix_clamp_sliding_window,
+        backend="triton",
+    )
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache_orig,
+        value_cache=value_cache_orig,
+        query_lens=query_lens,
+        kv_lens=kv_lens_list,
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=dtype,
+        sliding_window=sliding_window,
+        sinks=sinks,
+        mm_prefix_ranges=mm_prefix_ranges,
+        mm_prefix_clamp_sliding_window=mm_prefix_clamp_sliding_window,
     )
 
     torch.testing.assert_close(

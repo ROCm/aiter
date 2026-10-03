@@ -105,6 +105,9 @@ class _UAParams(NamedTuple):
     kv_cache_dtype: torch.dtype
     all_decode: bool  # max_seqlen_q == 1
     shuffled_kv_cache: bool
+    # [num_seqs, max_ranges, 2] inclusive bidirectional spans, int32
+    mm_prefix_range: torch.Tensor | None
+    mm_prefix_clamp_sliding_window: bool
     use_alibi_slopes: bool  # alibi_slopes is not None
     use_qq_bias: bool  # qq_bias is not None
 
@@ -136,6 +139,7 @@ def _gfx950_gluon_supported(params: _UAParams):
         DEVICE_ARCH == "gfx950"
         and _unified_attention_kernel_gfx950 is not None
         and params.causal
+        and params.mm_prefix_range is None
         # softcap hits an AMDGPU backend assert (GCNRewritePartialRegUses) on Triton 3.8
         and not params.softcap
         and not params.use_qq_bias
@@ -194,11 +198,29 @@ def unified_attention(
     sinks=None,
     shuffled_kv_cache: bool = False,
     skip_reduce: bool = False,
+    # Optional [num_seqs, max_ranges, 2] int32 tensor of inclusive spans that
+    # attend bidirectionally (prefix-LM / multimodal). Padded slots store
+    # start == end == 0 and are skipped.
+    mm_prefix_range=None,
+    mm_prefix_clamp_sliding_window: bool = False,
     # backend
     backend: str | None = None,  # "triton" | "gluon"
 ):
+    use_mm_prefix = mm_prefix_range is not None
+    if use_mm_prefix:
+        assert mm_prefix_range.dim() == 3 and mm_prefix_range.shape[2] == 2, (
+            "mm_prefix_range must be [num_seqs, max_ranges, 2], got "
+            f"{tuple(mm_prefix_range.shape)}"
+        )
+        assert mm_prefix_range.shape[0] == len(seqused_k), (
+            f"mm_prefix_range has {mm_prefix_range.shape[0]} sequences, "
+            f"expected {len(seqused_k)}"
+        )
+
     if backend is None:
-        backend = "gluon" if _is_gluon_available() else "triton"
+        backend = (
+            "gluon" if (_is_gluon_available() and not use_mm_prefix) else "triton"
+        )
     backend = backend.lower()
     assert backend in (
         "triton",
@@ -208,11 +230,14 @@ def unified_attention(
         assert (
             _is_gluon_available()
         ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
+        assert (
+            not use_mm_prefix
+        ), "The gluon backend does not support mm_prefix_range; use backend='triton'"
 
     use_alibi_slopes = alibi_slopes is not None
     assert (
-        causal or not use_alibi_slopes
-    ), "ALiBi is not supported with non-causal attention"
+        causal and not use_mm_prefix or not use_alibi_slopes
+    ), "ALiBi is not supported with non-causal or mm_prefix attention"
 
     use_qq_bias = qq_bias is not None
     SLIDING_WINDOW = 1 + window_size[0]
@@ -321,6 +346,8 @@ def unified_attention(
         kv_cache_dtype=kv_cache_dtype,
         all_decode=ALL_DECODE,
         shuffled_kv_cache=shuffled_kv_cache,
+        mm_prefix_range=mm_prefix_range,
+        mm_prefix_clamp_sliding_window=mm_prefix_clamp_sliding_window,
         use_alibi_slopes=use_alibi_slopes,
         use_qq_bias=use_qq_bias,
         num_sms=cu_count,
@@ -466,6 +493,7 @@ def is_2d_gluon_available(params: _UAParams, backend: str):
         use_gluon_arch = (
             _unified_attention_kernel_2d_gfx1250 is not None
             and params.causal
+            and params.mm_prefix_range is None
             and not params.softcap
             and not params.use_qq_bias
             and not params.use_alibi_slopes
@@ -488,6 +516,7 @@ def is_3d_gluon_available(params: _UAParams, backend: str):
         use_gluon_arch = (
             _unified_attention_kernel_3d_gfx1250 is not None
             and params.causal
+            and params.mm_prefix_range is None
             and params.shuffled_kv_cache
         )
     elif DEVICE_ARCH == "gfx950":
@@ -588,6 +617,14 @@ def _unified_attention_2d_triton(params: _UAParams):
         SHUFFLED_KV_CACHE=params.shuffled_kv_cache,
         K_WIDTH=params.k_width,
         CAUSAL=params.causal,
+        mm_prefix_range_ptr=params.mm_prefix_range,
+        USE_MM_PREFIX=(params.mm_prefix_range is not None),
+        MAX_MM_RANGES=(
+            params.mm_prefix_range.shape[1]
+            if params.mm_prefix_range is not None
+            else 0
+        ),
+        MM_PREFIX_CLAMP_SW=params.mm_prefix_clamp_sliding_window,
         **config,
     )
 
@@ -668,6 +705,14 @@ def _unified_attention_3d_triton(
         NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
         TILE_SIZE=TILE_SIZE,
         CAUSAL=params.causal,
+        mm_prefix_range_ptr=params.mm_prefix_range,
+        USE_MM_PREFIX=(params.mm_prefix_range is not None),
+        MAX_MM_RANGES=(
+            params.mm_prefix_range.shape[1]
+            if params.mm_prefix_range is not None
+            else 0
+        ),
+        MM_PREFIX_CLAMP_SW=params.mm_prefix_clamp_sliding_window,
         **config,
     )
 

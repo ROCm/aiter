@@ -52,6 +52,103 @@ def find_seq_idx(
     return left - 1
 
 
+@triton.jit
+def mm_prefix_seq_mask(
+    seq_mask,
+    query_abs_pos,
+    seq_offset,
+    mm_prefix_range_ptr,
+    seq_idx,
+    SLIDING_WINDOW: tl.constexpr,
+    MAX_MM_RANGES: tl.constexpr,
+    MM_PREFIX_CLAMP_SW: tl.constexpr,
+):
+    """OR the bidirectional multimodal spans into a KV mask.
+
+    Keeps the FlexAttention composition order, ``(causal AND window) OR
+    mm_prefix``, so ``seq_mask`` must already carry the window.
+
+    Args:
+        seq_mask: Base mask, shape (BLOCK_M, TILE_SIZE).
+        query_abs_pos: Absolute query positions, shape (BLOCK_M, 1).
+        seq_offset: Key positions in this tile, shape (TILE_SIZE,).
+        mm_prefix_range_ptr: [num_seqs, MAX_MM_RANGES, 2] inclusive bounds.
+        seq_idx: Sequence owning this q-block.
+        MM_PREFIX_CLAMP_SW: Narrow each span to the window, as Gemma 4 does
+            on its sliding-window layers.
+
+    Returns:
+        The mask widened where query and key share a span.
+    """
+    for i in range(MAX_MM_RANGES):
+        range_ptr = mm_prefix_range_ptr + seq_idx * MAX_MM_RANGES * 2 + i * 2
+        range_start = tl.load(range_ptr)
+        range_end = tl.load(range_ptr + 1)
+        # Padded slots are stored as start == end == 0 and drop out here.
+        is_valid = range_start < range_end
+        q_in_range = (
+            (query_abs_pos >= range_start) & (query_abs_pos <= range_end) & is_valid
+        )
+        k_in_range = (seq_offset[None, :] >= range_start) & (
+            seq_offset[None, :] <= range_end
+        )
+        mm_mask = q_in_range & k_in_range
+        if MM_PREFIX_CLAMP_SW and SLIDING_WINDOW > 0:
+            mm_mask = mm_mask & ((query_abs_pos - seq_offset) < SLIDING_WINDOW)
+        seq_mask = seq_mask | mm_mask
+    return seq_mask
+
+
+@triton.jit
+def mm_prefix_key_bounds(
+    first_allowed_key,
+    last_allowed_key,
+    query_abs_lo,
+    query_abs_hi,
+    mm_prefix_range_ptr,
+    seq_idx,
+    SLIDING_WINDOW: tl.constexpr,
+    MAX_MM_RANGES: tl.constexpr,
+):
+    """Widen the sliding-window key bounds to cover the multimodal spans.
+
+    Only sound when the spans are window-clamped; an unclamped span reaches
+    the whole sequence and leaves nothing to prune.
+
+    Args:
+        first_allowed_key: Leftmost key the window admits.
+        last_allowed_key: Rightmost key the window admits.
+        query_abs_lo: First absolute query position in this q-block.
+        query_abs_hi: Last absolute query position in this q-block.
+        mm_prefix_range_ptr: [num_seqs, MAX_MM_RANGES, 2] inclusive bounds.
+        seq_idx: Sequence owning this q-block.
+
+    Returns:
+        The ``(first_allowed_key, last_allowed_key)`` union over the window
+        and every span intersecting this q-block.
+    """
+    for i in range(MAX_MM_RANGES):
+        range_ptr = mm_prefix_range_ptr + seq_idx * MAX_MM_RANGES * 2 + i * 2
+        range_start = tl.load(range_ptr)
+        range_end = tl.load(range_ptr + 1)
+        intersects = (
+            (range_start < range_end)
+            & (range_start <= query_abs_hi)
+            & (range_end >= query_abs_lo)
+        )
+        # The clamp keeps the span's left edge inside the window.
+        mm_first_key = tl.maximum(range_start, query_abs_lo - SLIDING_WINDOW + 1)
+        first_allowed_key = tl.minimum(
+            first_allowed_key,
+            tl.where(intersects, mm_first_key, first_allowed_key),
+        )
+        last_allowed_key = tl.maximum(
+            last_allowed_key,
+            tl.where(intersects, range_end, last_allowed_key),
+        )
+    return first_allowed_key, last_allowed_key
+
+
 _kernel_unified_attention_2d_repr = make_kernel_repr(
     "kernel_unified_attention_2d",
     [
@@ -73,6 +170,7 @@ _kernel_unified_attention_2d_repr = make_kernel_repr(
         "SPLIT_UNMASKED_LOOP",
         "K_WIDTH",
         "CAUSAL",
+        "USE_MM_PREFIX",
     ],
 )
 
@@ -130,7 +228,16 @@ def kernel_unified_attention_2d(
     SPLIT_UNMASKED_LOOP: tl.constexpr = False,  # bool
     K_WIDTH: tl.constexpr = 0,  # int
     CAUSAL: tl.constexpr = True,  # bool
+    mm_prefix_range_ptr=None,  # [num_seqs, MAX_MM_RANGES, 2], int32
+    USE_MM_PREFIX: tl.constexpr = False,  # bool
+    MAX_MM_RANGES: tl.constexpr = 0,  # int
+    MM_PREFIX_CLAMP_SW: tl.constexpr = False,  # bool
 ):
+    tl.static_assert(
+        not (SPLIT_UNMASKED_LOOP and USE_MM_PREFIX),
+        "SPLIT_UNMASKED_LOOP does not support mm_prefix: a bidirectional span "
+        "admits keys past the prefix every row takes unmasked",
+    )
     # SPLIT_UNMASKED_LOOP does not support SHUFFLED_KV_CACHE or SLIDING_WINDOW.
     tl.static_assert(
         not (SPLIT_UNMASKED_LOOP and SHUFFLED_KV_CACHE),
@@ -244,7 +351,7 @@ def kernel_unified_attention_2d(
 
     # compute the length of the longest sequence prefix spanned by any
     # query token in the current q_block (q_block_local_idx)
-    if CAUSAL:
+    if CAUSAL and not USE_MM_PREFIX:
         max_seq_prefix_len = (
             context_len
             + q_block_local_idx * BLOCK_Q
@@ -268,7 +375,8 @@ def kernel_unified_attention_2d(
     # Default: keep previous global behavior
     tile_start = 0
     tile_end = num_tiles
-    if SLIDING_WINDOW > 0:
+    can_prune_sliding: tl.constexpr = (not USE_MM_PREFIX) or MM_PREFIX_CLAMP_SW
+    if SLIDING_WINDOW > 0 and can_prune_sliding:
         # Query rows covered by this Q-block
         qpos_lo = q_block_local_idx * BLOCK_Q
         qpos_hi = tl.minimum(
@@ -287,6 +395,17 @@ def kernel_unified_attention_2d(
         last_allowed_key = context_len + qpos_hi
         if not CAUSAL:
             last_allowed_key += SLIDING_WINDOW - 1
+        if USE_MM_PREFIX:
+            first_allowed_key, last_allowed_key = mm_prefix_key_bounds(
+                first_allowed_key,
+                last_allowed_key,
+                context_len + qpos_lo,
+                context_len + qpos_hi,
+                mm_prefix_range_ptr,
+                seq_idx,
+                SLIDING_WINDOW,
+                MAX_MM_RANGES,
+            )
 
         # Convert to tile indices and clamp
         tile_start = tl.maximum(0, first_allowed_key // TILE_SIZE)
@@ -479,18 +598,35 @@ def kernel_unified_attention_2d(
         if CAUSAL:
             seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
         else:
-            seq_mask = seq_offset[None, :] < seq_len
-
-        S = tl.where(
-            query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf")
-        )
+            seq_mask = tl.broadcast_to(
+                seq_offset[None, :] < seq_len, (BLOCK_M, TILE_SIZE)
+            )
 
         if SLIDING_WINDOW > 0:
             qk_dist = context_len + query_pos[:, None] - seq_offset
             if not CAUSAL:
                 # The window is two-sided: |q_abs - k| < SLIDING_WINDOW.
                 qk_dist = tl.abs(qk_dist)
-            S = tl.where(qk_dist < SLIDING_WINDOW, S, float("-inf"))
+            seq_mask = seq_mask & (qk_dist < SLIDING_WINDOW)
+
+        if USE_MM_PREFIX:
+            # (causal AND window) OR mm_prefix, matching FlexAttention.
+            seq_mask = mm_prefix_seq_mask(
+                seq_mask,
+                context_len + query_pos[:, None],
+                seq_offset,
+                mm_prefix_range_ptr,
+                seq_idx,
+                SLIDING_WINDOW,
+                MAX_MM_RANGES,
+                MM_PREFIX_CLAMP_SW,
+            )
+            # A span may reach past the written KV; those slots hold garbage.
+            seq_mask = seq_mask & (seq_offset[None, :] < seq_len)
+
+        S = tl.where(
+            query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf")
+        )
 
         if USE_ALIBI_SLOPES:
             # prescale w. RCP_LN2 for later exp2
@@ -579,6 +715,7 @@ kernel_unified_attention_3d_repr = make_kernel_repr(
         "IS_Q_FP8",
         "IS_KV_FP8",
         "CAUSAL",
+        "USE_MM_PREFIX",
     ],
 )
 
@@ -640,6 +777,10 @@ def kernel_unified_attention_3d(
     IS_Q_FP8: tl.constexpr = False,  # bool
     IS_KV_FP8: tl.constexpr = False,  # bool
     CAUSAL: tl.constexpr = True,  # bool
+    mm_prefix_range_ptr=None,  # [num_seqs, MAX_MM_RANGES, 2], int32
+    USE_MM_PREFIX: tl.constexpr = False,  # bool
+    MAX_MM_RANGES: tl.constexpr = 0,  # int
+    MM_PREFIX_CLAMP_SW: tl.constexpr = False,  # bool
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -751,7 +892,7 @@ def kernel_unified_attention_3d(
 
     # compute the length of the longest sequence prefix spanned by any
     # query token in the current q_block (q_block_local_idx)
-    if CAUSAL:
+    if CAUSAL and not USE_MM_PREFIX:
         max_seq_prefix_len = (
             context_len
             + q_block_local_idx * BLOCK_Q
@@ -886,7 +1027,9 @@ def kernel_unified_attention_3d(
         if CAUSAL:
             seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
         else:
-            seq_mask = seq_offset[None, :] < seq_len
+            seq_mask = tl.broadcast_to(
+                seq_offset[None, :] < seq_len, (BLOCK_M, TILE_SIZE)
+            )
 
         # S : (BLOCK_M, TILE_SIZE)
         # qk_scale = scale * RCP_LN2 (log_2 e) so that we can use exp2 later
@@ -897,16 +1040,31 @@ def kernel_unified_attention_3d(
             # multiply by RCP_LN2 again to be used in later exp2
             S = apply_softcap(S, softcap) * RCP_LN2
 
-        S = tl.where(
-            query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf")
-        )
-
         if SLIDING_WINDOW > 0:
             qk_dist = context_len + query_pos[:, None] - seq_offset
             if not CAUSAL:
                 # The window is two-sided: |q_abs - k| < SLIDING_WINDOW.
                 qk_dist = tl.abs(qk_dist)
-            S = tl.where(qk_dist < SLIDING_WINDOW, S, float("-inf"))
+            seq_mask = seq_mask & (qk_dist < SLIDING_WINDOW)
+
+        if USE_MM_PREFIX:
+            # (causal AND window) OR mm_prefix, matching FlexAttention.
+            seq_mask = mm_prefix_seq_mask(
+                seq_mask,
+                context_len + query_pos[:, None],
+                seq_offset,
+                mm_prefix_range_ptr,
+                seq_idx,
+                SLIDING_WINDOW,
+                MAX_MM_RANGES,
+                MM_PREFIX_CLAMP_SW,
+            )
+            # A span may reach past the written KV; those slots hold garbage.
+            seq_mask = seq_mask & (seq_offset[None, :] < seq_len)
+
+        S = tl.where(
+            query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf")
+        )
 
         if USE_ALIBI_SLOPES:
             # prescale w. RCP_LN2 for later exp2
