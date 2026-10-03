@@ -477,10 +477,40 @@ def _decode_num_splits_occ(num_queries, heads_blocks, avg_main, avg_extra, block
     return max(1, min(cta_cap, tiles, _MAX_SPLITS))
 
 
+def _last_round_fills(programs, num_sms):
+    """The grid's last round of programs is full or more than half full."""
+    left = programs % num_sms
+    return left == 0 or 2 * left > num_sms
+
+
+def _packed_head_block(num_heads, num_queries, num_splits, row_tiles, has_extra):
+    """Heads per program (16, 32 or 64) for fp8_dsv4_mla caches at 32 or 64 heads.
+
+    A 32-head program (8 warps) gathers each key row once for 32 heads instead of
+    twice. It pays when each program has more than one tile and, for grids of up
+    to four rounds, the last round is more than half full; bigger grids only need
+    long programs (four tiles or more). At 64 heads, a top-k launch without
+    split-K and with at least one full round of programs runs one 64-head program
+    per row (Q in LDS), so each key tile is staged once for all 64 heads; up to
+    four rounds, the last one must be more than half full.
+    """
+    num_sms = get_num_sms()
+    if num_heads == 64 and has_extra and num_splits == 1:
+        fills = _last_round_fills(num_queries, num_sms)
+        if num_queries >= num_sms and (fills or num_queries > 4 * num_sms):
+            return 64
+    tiles = row_tiles / num_splits
+    programs = num_queries * (num_heads // 32) * num_splits
+    fills = _last_round_fills(programs, num_sms)
+    if tiles > 1 and (fills if programs <= 4 * num_sms else tiles >= 4):
+        return 32
+    return 16
+
+
 def _staged_head_block(num_heads, num_queries, num_splits, row_tiles):
-    """Heads per program (16, 32 or 64) for the walks that gather each key tile
-    into registers and stage it: per-tensor fp8 caches, and bf16 caches with the
-    rope inside the row.
+    """Heads per program (16, 32 or 64) at 32 or 64 heads for the walks that
+    gather each key tile into registers and stage it: per-tensor fp8 caches, and
+    bf16 caches with the rope inside the row.
 
     A 16-head program stages its tiles for 16 heads, so at 32 or 64 heads each
     tile is staged two or four times per row. Bigger programs stage it once, but
@@ -493,12 +523,9 @@ def _staged_head_block(num_heads, num_queries, num_splits, row_tiles):
     num_sms = get_num_sms()
     if num_heads == 64 and num_splits == 1 and 2 * num_queries > num_sms:
         return 64
-    if num_heads not in (32, 64):
-        return 16
     tiles = row_tiles / num_splits
     programs = num_queries * (num_heads // 32) * num_splits
-    left = programs % num_sms
-    fills = left == 0 or 2 * left > num_sms
+    fills = _last_round_fills(programs, num_sms)
     if tiles >= 2 and (fills if programs <= 4 * num_sms else tiles >= 4):
         return 32
     return 16
@@ -662,33 +689,20 @@ def _pa_decode_sparse_gfx950_gluon(
             avg_extra,
             BLOCK_K,
         )
-    # A 32-head program (8 warps) gathers each key row once for 32 heads instead
-    # of twice. Use it when each program has more than one tile and, for grids of
-    # up to four rounds, the last round is more than half full. Bigger grids only
-    # need long programs (four tiles or more).
-    if packed_fp8 and num_heads in (32, 64):
-        tiles = row_tiles / num_splits
-        programs = num_queries * (num_heads // 32) * num_splits
-        left = programs % get_num_sms()
-        fills = left == 0 or 2 * left > get_num_sms()
-        if tiles > 1 and (fills if programs <= 4 * get_num_sms() else tiles >= 4):
-            BLOCK_M, num_warps = 32, 8
-    # At 64 heads, a top-k launch without split-K and with at least one full round
-    # of programs runs one 64-head program per row (Q in LDS), so each key tile is
-    # staged once for all 64 heads. Up to four rounds, the last one must be more
-    # than half full.
-    if packed_fp8 and num_heads == 64 and has_extra and num_splits == 1:
-        programs = num_queries
-        left = programs % get_num_sms()
-        fills = left == 0 or 2 * left > get_num_sms()
-        if programs >= get_num_sms() and (fills or programs > 4 * get_num_sms()):
-            BLOCK_M, num_warps = 64, 8
     staged_bf16 = (
         not FLAT_POOL and main_fmt == "bf16" and (not has_extra or extra_fmt == "bf16")
     )
-    if staged_bf16:
-        BLOCK_M = _staged_head_block(num_heads, num_queries, num_splits, row_tiles)
-        num_warps = 8 if BLOCK_M > 16 else num_warps
+    # 32- and 64-head programs (8 warps) gather and stage each key tile once for
+    # all their heads; when that pays depends on the walk.
+    if num_heads in (32, 64):
+        if packed_fp8:
+            BLOCK_M = _packed_head_block(
+                num_heads, num_queries, num_splits, row_tiles, has_extra
+            )
+        elif staged_bf16:
+            BLOCK_M = _staged_head_block(num_heads, num_queries, num_splits, row_tiles)
+    if BLOCK_M > 16:
+        num_warps = 8
     HEAD_ALIGNED = num_heads % BLOCK_M == 0
     heads_blocks = (num_heads + BLOCK_M - 1) // BLOCK_M
     inv_rope = inv_rope_positions is not None
@@ -883,8 +897,9 @@ def _pa_decode_sparse_gfx950_gluon(
         HAS_INVALID=has_invalid,
         UNPEEL=unpeel,
         XCD_REMAP=xcd_remap,
-        # Gather a tile ahead only for 8-warp programs of 32 heads below prefill size.
-        PIPE_PREFETCH=num_warps == 8 and BLOCK_M < 64 and not prefill,
+        # Gather a tile ahead only for fp8_dsv4_mla's 32-head programs below prefill
+        # size.
+        PIPE_PREFETCH=packed_fp8 and BLOCK_M == 32 and not prefill,
         num_warps=num_warps,
         waves_per_eu=waves_per_eu,
         **prefill_kw,
