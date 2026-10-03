@@ -371,6 +371,15 @@ parser.add_argument(
     default=20,
     help="number of changing-input iterations per regression shape (default: 20)",
 )
+parser.add_argument(
+    "--transport",
+    type=str,
+    choices=["auto", "symm"],
+    default="auto",
+    help="peer-buffer transport: 'auto' keeps the arch/ROCm default (IPC or "
+    "VMM), 'symm' requests torch.symm_mem. A failed probe falls back silently, "
+    "so check the log for 'using torch.symm_mem transport' (default: auto)",
+)
 
 
 if __name__ == "__main__":
@@ -378,6 +387,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.iterations < 1:
         parser.error("--iterations must be positive")
+    if args.transport == "symm":
+        # Read at import time, so it must be set before the workers spawn.
+        os.environ["AITER_CUSTOM_AR_USE_SYMM_MEM"] = "1"
     dtype = dtypes.d_dtypes[args.dtype]
     if args.regression or args.shape is None:
         test_allreduce_tail_regression(
