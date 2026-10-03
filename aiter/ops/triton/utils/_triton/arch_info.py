@@ -32,4 +32,8 @@ def is_tdm_avail():
     return get_arch() in ("gfx1250",)
 
 
+def is_cdna4():
+    return get_arch() == "gfx950"
+
+
 _LDS_CAP_BYTES = {"gfx1250": 327680, "gfx950": 163840, "gfx942": 65536}
