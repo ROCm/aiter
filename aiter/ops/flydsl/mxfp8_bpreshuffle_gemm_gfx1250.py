@@ -397,11 +397,7 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
         )
         _run_compiled(
             _launch_gemm_a8w8,
-            launch_args[0],
-            launch_args[0],
-            *launch_args[1:12],
-            ldc,
-            *launch_args[12:],
+            *launch_args,
             scale_block,
             split_k,
             False,  # batched

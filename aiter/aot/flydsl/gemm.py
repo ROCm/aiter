@@ -896,15 +896,8 @@ def _compile_mxfp8_wmma_to_cache(
                         bounded_m,
                     )
             else:
-                std_args = (
-                    variant_args[0],
-                    variant_args[0],
-                    *variant_args[1:12],
-                    variant_args[11],
-                    *variant_args[12:],
-                )
                 launch(
-                    *std_args,
+                    *variant_args,
                     scale_block,
                     split_k,
                     False,
@@ -960,7 +953,6 @@ def _compile_ptpc_wmma_to_cache(
     with compile_only_env():
         launch_gemm_a8w8(
             _ptr_view_safe(out),
-            _ptr_view_safe(out),
             _ptr_view_safe(xq),
             _ptr_view_safe(wq),
             _ptr_view_safe(scale_a),
@@ -971,7 +963,6 @@ def _compile_ptpc_wmma_to_cache(
             k,
             0,
             xq.stride(0),
-            out.stride(0),
             out.stride(0),
             tile_m,
             tile_n,

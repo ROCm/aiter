@@ -286,11 +286,21 @@ def _check_output(case):
                 == 0
             )
         else:
-            checkAllclose(ref, actual, atol=1e-2, rtol=1e-2, msg=key)
+            assert (
+                checkAllclose(
+                    ref,
+                    actual,
+                    atol=1e-2,
+                    rtol=1e-2,
+                    tol_err_ratio=0,
+                    msg=key,
+                )
+                == 0
+            )
 
 
 @_SKIP_GFX1250
-@pytest.mark.parametrize("num_tokens", [512, 4096])
+@pytest.mark.parametrize("num_tokens", [512, 2048, 4096])
 def test_gather_kv_b_proj_flydsl_gfx1250_kimi_ptpc(num_tokens):
     case = _make_case(num_tokens, 96)
     case["k_scale"] = torch.tensor(1.0)
@@ -312,7 +322,6 @@ def test_gather_kv_b_proj_flydsl_gfx1250_kimi_ptpc(num_tokens):
         case["weight_scale"],
         case["k_prefix"],
         case["v_prefix"],
-        flydsl_min_rows=0,
     )
     _check_output(case)
 

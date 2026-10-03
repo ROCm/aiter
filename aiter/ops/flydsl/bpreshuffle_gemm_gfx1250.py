@@ -166,7 +166,6 @@ def run_preshuffle_gemm_a8_gfx1250(
     stream = _fx.Stream(torch.cuda.current_stream(device=XQ.device))
     _launch_gemm_a8w8(
         _ptr_arg(gemm_out),
-        _ptr_arg(gemm_out),
         _ptr_arg(XQ),
         _ptr_arg(WQ),
         _ptr_arg(sa),
@@ -177,7 +176,6 @@ def run_preshuffle_gemm_a8_gfx1250(
         K,
         0,
         lda,
-        ldc,
         ldc,
         tile_m,
         tile_n,
@@ -250,65 +248,4 @@ def run_gemm_a8w8_bpreshuffle_gfx1250(
         cluster_n=cfg["cluster_n"],
         m_warp=cfg["m_warp"],
         n_warp=cfg["n_warp"],
-    )
-
-
-def run_kimi_gather_gemm_a8w8_gfx1250(
-    XQ: Tensor,
-    WQ: Tensor,
-    x_scale: Tensor,
-    w_scale: Tensor,
-    KOut: Tensor,
-    VOut: Tensor,
-    kernel_name: str,
-) -> None:
-    """Kimi TP1 projection with the WMMA epilogue split directly into K/V."""
-    _lazy_import()
-    cfg = parse_wmma_kernel_name(kernel_name)
-    if cfg is None:
-        raise ValueError(f"[FlyDSL gfx1250] unrecognised kernelName: {kernel_name!r}")
-    m, k = XQ.shape
-    n = WQ.shape[0]
-    if (
-        tuple(WQ.shape) != (24576, 512)
-        or tuple(KOut.shape) != (m, 96, 192)
-        or tuple(VOut.shape) != (m, 96, 128)
-        or cfg["tile_n"] != 256
-        or cfg["split_k"] != 1
-    ):
-        raise ValueError(
-            "Kimi split epilogue requires W=[24576,512], K=[M,96,192], V=[M,96,128]"
-        )
-    sa = _as_1d_fp32(x_scale, m, "x_scale")
-    sb = _as_1d_fp32(w_scale, n, "w_scale")
-    stream = _fx.Stream(torch.cuda.current_stream(device=XQ.device))
-    _launch_gemm_a8w8(
-        _ptr_arg(KOut),
-        _ptr_arg(VOut),
-        _ptr_arg(XQ),
-        _ptr_arg(WQ),
-        _ptr_arg(sa),
-        _ptr_arg(sb),
-        m,
-        stream,
-        n,
-        k,
-        0,
-        XQ.stride(0),
-        KOut.stride(0),
-        VOut.stride(0),
-        cfg["tile_m"],
-        cfg["tile_n"],
-        cfg["tile_k"],
-        cfg["m_warp"],
-        cfg["n_warp"],
-        0,
-        cfg["num_buffers"],
-        cfg["cluster_m"],
-        cfg["cluster_n"],
-        False,
-        SCALE_BLOCK_SIZE,
-        1,
-        a_preshuffle=True,
-        kimi_kv_split=True,
     )
