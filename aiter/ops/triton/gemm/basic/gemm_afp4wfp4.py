@@ -547,13 +547,13 @@ def gemm_afp4wfp4_preshuffle(
 
     config["BLOCK_SIZE_N"] = max(config["BLOCK_SIZE_N"], 32)
     if M < 32:
-        assert (
-            config["BLOCK_SIZE_M"] <= 16
-        ), "for M < 32, BLOCK_SIZE_M must be 16 or less as x_scale are assumed to be un-shuffled"
+        assert config["BLOCK_SIZE_M"] <= 16, (
+            "for M < 32, BLOCK_SIZE_M must be 16 or less as x_scale are assumed to be un-shuffled"
+        )
     else:
-        assert (
-            config["BLOCK_SIZE_M"] >= 32
-        ), "for M >= 32, BLOCK_SIZE_M must be 32 or more as x_scale are assumed to be preshuffled"
+        assert config["BLOCK_SIZE_M"] >= 32, (
+            "for M >= 32, BLOCK_SIZE_M must be 32 or more as x_scale are assumed to be preshuffled"
+        )
 
     # shuffle_scale pads K//32 up to a multiple of 8 (its k-chunk), but the
     # kernels bound the scale reads at (K//32)*32 columns per stripe row. A
@@ -572,8 +572,6 @@ def gemm_afp4wfp4_preshuffle(
         from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_mxfp4 import (
             cluster_shape,
             get_gemm_afp4wfp4_preshuffle_layouts,
-        )
-        from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_mxfp4 import (
             gemm_mxfp4_preshuffle_gfx1250 as _gluon_gemm_mxfp4_preshuffle_gfx1250,
         )
 
