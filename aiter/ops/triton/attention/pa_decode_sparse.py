@@ -477,6 +477,31 @@ def _decode_num_splits_occ(num_queries, heads_blocks, avg_main, avg_extra, block
     return max(1, min(cta_cap, tiles, _MAX_SPLITS))
 
 
+def _staged_head_block(num_heads, num_queries, num_splits, row_tiles):
+    """Heads per program (16, 32 or 64) for bf16 and per-tensor fp8 caches of
+    DSv4 rows, whose walk gathers each key tile into registers and stages it.
+
+    A 16-head program stages its tiles for 16 heads, so at 32 or 64 heads each
+    tile is staged two or four times per row. Bigger programs stage it once, but
+    there are fewer of them: 64 heads without split-K once the rows fill half the
+    CUs; 32 heads when each program has two or more tiles and the grid's last
+    round is more than half full (past four rounds, with four or more tiles). The
+    split count stays the 16-head grid's.
+    """
+    num_sms = get_num_sms()
+    if num_heads == 64 and num_splits == 1 and 2 * num_queries >= num_sms:
+        return 64
+    if num_heads not in (32, 64):
+        return 16
+    tiles = row_tiles / num_splits
+    programs = num_queries * (num_heads // 32) * num_splits
+    left = programs % num_sms
+    fills = left == 0 or 2 * left > num_sms
+    if tiles >= 2 and (fills if programs <= 4 * num_sms else tiles >= 4):
+        return 32
+    return 16
+
+
 def _launch_splits(num_splits):
     """Split programs to launch: past 2, rounded up to a multiple of 4, so the
     reduce (unrolled over the launched count) compiles for few counts. The extra
@@ -656,6 +681,12 @@ def _pa_decode_sparse_gfx950_gluon(
         fills = left == 0 or 2 * left > get_num_sms()
         if programs >= get_num_sms() and (fills or programs > 4 * get_num_sms()):
             BLOCK_M, num_warps = 64, 8
+    staged_bf16 = (
+        not FLAT_POOL and main_fmt == "bf16" and (not has_extra or extra_fmt == "bf16")
+    )
+    if staged_bf16:
+        BLOCK_M = _staged_head_block(num_heads, num_queries, num_splits, row_tiles)
+        num_warps = 8 if BLOCK_M > 16 else num_warps
     HEAD_ALIGNED = num_heads % BLOCK_M == 0
     heads_blocks = (num_heads + BLOCK_M - 1) // BLOCK_M
     inv_rope = inv_rope_positions is not None
@@ -769,9 +800,13 @@ def _pa_decode_sparse_gfx950_gluon(
     # share an L2. With one head block per row it slows plain decode more than
     # it speeds up spec decode. Not for SWA-only prefill, or for launches padded
     # past the split count.
+    # A bf16 row's one 32- or 64-head program is remapped too when there is no
+    # split-K: its neighbours (a request's draft rows, a prefill's rows) read the
+    # same KV rows.
+    rows_share = heads_blocks > 1 or (staged_bf16 and BLOCK_M > 16 and num_splits == 1)
     xcd_remap = (
         get_num_xcds()
-        if heads_blocks > 1 and grid_splits == num_splits and (has_extra or not prefill)
+        if rows_share and grid_splits == num_splits and (has_extra or not prefill)
         else 0
     )
 

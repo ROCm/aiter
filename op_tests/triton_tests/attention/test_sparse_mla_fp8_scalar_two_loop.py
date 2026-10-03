@@ -62,8 +62,10 @@ def reference(q, segs, sm_scale, sink):
     return out
 
 
-@pytest.mark.parametrize("C", [1, 7, 64, 300])
-@pytest.mark.parametrize("H", [16, 32])
+# C 96 / 192 / 300 at 32 / 64 heads take 32- and 64-head programs (_staged_head_block),
+# in the per-tensor launch and in the bf16 two-loop it is checked against.
+@pytest.mark.parametrize("C", [1, 7, 64, 96, 192, 300])
+@pytest.mark.parametrize("H", [16, 32, 64])
 @pytest.mark.parametrize("fp8_q", [False, True])
 @pytest.mark.parametrize("pad", [0, 256])
 @pytest.mark.parametrize("dots", ["bf16", "fp8"])
@@ -145,8 +147,10 @@ def test_fp8_scalar_two_loop(C, H, fp8_q, pad, dots):
         extra_indptr=cmp_ptr,
         extra_indices=cmp_idx,
     )
-    diff = (out.float() - out_bf16.float()).abs().max().item()
-    assert diff < 2e-2, f"fp8_scalar vs bf16 two-loop max abs diff {diff}"
+    # As close to the reference (the two are rounded to bf16 separately, so they
+    # can sit 2e-2 apart on either side of it).
+    err_bf16 = (out_bf16.float() - ref).abs().max().item()
+    assert err_bf16 < 2e-2, f"bf16 two-loop max abs err {err_bf16}"
 
 
 def test_swa_only_padded_pitch():

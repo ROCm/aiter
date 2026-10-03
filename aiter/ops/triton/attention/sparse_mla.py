@@ -15,6 +15,7 @@ from aiter.ops.triton.attention.pa_decode_sparse import (
     _PREFILL_MIN_ROWS,
     _as_int32_contiguous_1d,
     _launch_splits,
+    _staged_head_block,
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.common_utils import max_addressable_bytes
@@ -686,6 +687,17 @@ def sparse_mla_fwd(
         has_extra=has_extra,
         block_k=block_k,
     )
+
+    if qk_rope_head_dim == 0 and fmt in ("bf16", "fp8_scalar") and not async_lds_on:
+        # DSv4 rows: 32- or 64-head programs stage each key tile once for all their
+        # heads (see _staged_head_block).
+        block_m = _staged_head_block(
+            num_heads, num_queries, num_splits, max(avg_main, avg_extra) / block_k
+        )
+        if block_m > 16:
+            num_warps = 8
+            head_aligned = num_heads % block_m == 0
+            heads_blocks = (num_heads + block_m - 1) // block_m
 
     # Q is read once per query without split-K, and re-read by every split
     q_cache = ".cg" if num_splits == 1 else ""

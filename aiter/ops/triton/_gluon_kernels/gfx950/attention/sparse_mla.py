@@ -375,6 +375,7 @@ class Cfg:
         UNPEEL=False,
         PIPE=False,
         SCL_DWORD=False,
+        STAGED_K32=False,
     ):
         self.BLOCK_M = gl.constexpr(BLOCK_M)
         self.BLOCK_K = gl.constexpr(BLOCK_K)
@@ -405,9 +406,10 @@ class Cfg:
         self.UNPEEL = gl.constexpr(UNPEEL)
         ROPE_VEC = 16
         self.ROPE_VEC = gl.constexpr(ROPE_VEC)
-        # The fp8_dsv4_mla walk runs its bf16 dots on 16x16x32 too, gfx950's full
-        # bf16 rate (16x16x16 is half of it).
-        MFMA_K = 32 if FP8_MFMA or PIPE else 16
+        # The fp8_dsv4_mla walk, and STAGED_K32's (bf16 and per-tensor fp8 caches of
+        # DSv4 rows), run their bf16 dots on 16x16x32 too, gfx950's full bf16 rate
+        # (16x16x16 is half of it).
+        MFMA_K = 32 if FP8_MFMA or PIPE or STAGED_K32 else 16
         self.MFMA_K = gl.constexpr(MFMA_K)
 
         # Warps tile the dots' N. With more than 16 heads per program they also
@@ -484,6 +486,15 @@ class Cfg:
                     [[128, 8]], [BLOCK_K, KV_DIM], [1, 0]
                 )
             )
+        elif STAGED_K32 and not FP8_MFMA:
+            # These walks store 32 B per lane, 32 lanes per row. 8 elements after
+            # every 256 and 64 after every 8,192 (16 rows) leave the 16x16x32 V
+            # reads conflict-free, where a pad per row made them the worst access.
+            self.kv_shared = gl.constexpr(
+                gl.PaddedSharedLayout.with_identity_for(
+                    [[256, 8], [8192, 64]], [BLOCK_K, KV_DIM], [1, 0]
+                )
+            )
         else:
             # Row pitch (KV_DIM + LDS_PAD) decides which banks the transposed K
             # read (walks down a column) lands on. KV_LDS_PAD 16 removes those
@@ -494,8 +505,9 @@ class Cfg:
                 )
             )
         # Q staged in LDS (one copy per program) instead of each wave's registers,
-        # which a 64-head program needs; Q and the KV tile fit with one program per CU.
-        Q_LDS = PIPE and BLOCK_M >= 64 and not FP8_MFMA
+        # which a 64-head program with bf16 dots needs; Q and the KV tile fit with
+        # one program per CU.
+        Q_LDS = BLOCK_M >= 64 and not FP8_MFMA and not ROPE_SEPARATE
         self.Q_LDS = gl.constexpr(Q_LDS)
         self.q_shared = gl.constexpr(
             gl.PaddedSharedLayout.with_identity_for(
@@ -2234,6 +2246,12 @@ def _sparse_mla(
     MAIN_PIPE: gl.constexpr = MAIN_FMT == "fp8_dsv4_mla"
     EXTRA_PIPE: gl.constexpr = HAS_EXTRA and EXTRA_FMT == "fp8_dsv4_mla"
     PIPE: gl.constexpr = MAIN_PIPE or EXTRA_PIPE
+    # bf16 and per-tensor fp8 caches of DSv4 rows (rope inside the row).
+    STAGED_K32: gl.constexpr = (
+        not ROPE_SEPARATE
+        and (MAIN_FMT == "bf16" or MAIN_FMT == "fp8_scalar")
+        and ((not HAS_EXTRA) or EXTRA_FMT == "bf16" or EXTRA_FMT == "fp8_scalar")
+    )
     gl.static_assert(
         UNI_TILE or (MAIN_FMT != "fp8_scalar" and MAIN_FMT != "fp8_dsv32_mla"),
         "tensor/dsmla formats require UNI_TILE=1",
@@ -2336,6 +2354,7 @@ def _sparse_mla(
         UNPEEL,
         PIPE,
         CS0_ALIGN >= 4,
+        STAGED_K32,
     )
     main_fmt = Fmt(
         cfg,
@@ -2432,7 +2451,7 @@ def _sparse_mla(
     if Q_FP8:
         # Nothing to quantize
         q_scale = gl.load(q_scl_ptr)
-        if not FP8_MFMA:
+        if not FP8_MFMA and not cfg.Q_LDS:
             # fp8 -> bf16 is exact (3 mantissa bits into 8)
             q_dot = gl.convert_layout(q.to(gl.bfloat16), cfg.q_layout)
             if ROPE_SEPARATE:
