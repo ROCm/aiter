@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import os
+from typing import Optional
 
 import torch
 import triton
@@ -46,9 +47,9 @@ def fused_qk_rope_cat_and_cache_mla_fake_tensor(
     k_pe: torch.Tensor,
     kv_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
-    pos: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
+    pos: Optional[torch.Tensor],
+    cos: Optional[torch.Tensor],
+    sin: Optional[torch.Tensor],
     k_scale: torch.Tensor,
     is_neox: bool,
     num_decode_toks_for_zeros: int = 0,
@@ -105,9 +106,9 @@ def fused_qk_rope_cat_and_cache_mla(
     k_pe: torch.Tensor,
     kv_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
-    pos: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
+    pos: Optional[torch.Tensor],
+    cos: Optional[torch.Tensor],
+    sin: Optional[torch.Tensor],
     k_scale: torch.Tensor,
     is_neox: bool,
     num_decode_toks_for_zeros: int = 0,
@@ -134,19 +135,28 @@ def fused_qk_rope_cat_and_cache_mla(
     B is the number of decode tokens, B_slot is the number of prefill + decode tokens, B_cache is the max number of tokens of kv_cache
     QH must be multiple of KH
 
+    Passing pos=cos=sin=None runs the NoPE variant: the PE halves are copied
+    through unrotated and only the cat and the cache write are fused. This is
+    what models without a rotary embedding (e.g. Kimi-K3) need.
+
     Returns:
     - q_out: The output matrix with shape (B, QH, D1+D2).
     - kv_cache: The output matrix with shape (B_max, KH, D1 + D2) (inplace).
     """
+    apply_rope = cos is not None
+    assert (pos is None) == (cos is None) == (sin is None), (
+        "pos, cos and sin must be given together (rope) or all omitted (nope); "
+        f"got pos={pos is not None} cos={cos is not None} sin={sin is not None}"
+    )
     _LOGGER.info(
         "FUSED_QK_ROPE_CAT_AND_CACHE_MLA: q_nope=%s q_pe=%s k_nope=%s k_pe=%s pos=%s cos=%s sin=%s kv_cache=%s slot_mapping=%s",
         tuple(q_nope.shape),
         tuple(q_pe.shape),
         tuple(k_nope.shape),
         tuple(k_pe.shape),
-        tuple(pos.shape),
-        tuple(cos.shape),
-        tuple(sin.shape),
+        tuple(pos.shape) if apply_rope else None,
+        tuple(cos.shape) if apply_rope else None,
+        tuple(sin.shape) if apply_rope else None,
         tuple(kv_cache.shape),
         tuple(slot_mapping.shape),
     )
@@ -156,7 +166,7 @@ def fused_qk_rope_cat_and_cache_mla(
     bk, kh, dk_nope = k_nope.shape
     bk2, kh2, dk2 = k_pe.shape
     kv_cache_dtype = kv_cache.dtype
-    d_freq = cos.shape[-1]
+    d_freq = cos.shape[-1] if apply_rope else d_pe
     assert kv_cache_dtype in [
         torch.bfloat16,
         e4m3_dtype,
@@ -271,9 +281,18 @@ def fused_qk_rope_cat_and_cache_mla(
     n_pid = b * qh + (b_slot - b) * kh
     grid = (n_pid, 1, 1)
     if DEVICE_ARCH == "gfx1250":
+        assert apply_rope, (
+            "the gfx1250 gluon fused_qk_rope_cat_and_cache_mla kernel has no "
+            "NoPE variant; pass cos/sin or use the Triton kernel"
+        )
         _kernel = gluon_fused_qk_rope_cat_and_cache_mla_kernel
     else:
         _kernel = triton_fused_qk_rope_cat_and_cache_mla_kernel
+
+    # The kernel never dereferences these when APPLY_ROPE is False.
+    pos_stride_b = pos.stride(0) if apply_rope else 0
+    cos_stride_b = cos.stride(0) if apply_rope else 0
+    cos_stride_d = cos.stride(-1) if apply_rope else 0
 
     _kernel[grid](
         q_nope,
@@ -296,9 +315,9 @@ def fused_qk_rope_cat_and_cache_mla(
         *q_pe.stride(),
         *k_nope.stride(),
         *k_pe.stride(),
-        pos.stride(0),
-        cos.stride(0),
-        cos.stride(-1),
+        pos_stride_b,
+        cos_stride_b,
+        cos_stride_d,
         *q_out.stride(),
         *decode_q_pe_out.stride(),
         *k_pe_out.stride(),
@@ -322,6 +341,7 @@ def fused_qk_rope_cat_and_cache_mla(
         OUTPUT_Q_NOPE_ZEROS_AND_Q_PE=(num_decode_toks_for_zeros > 0),
         HAVE_K_SCALE=(k_scale is not None and apply_scale),
         UPCAST_OPERAND=upcast_operand,
+        APPLY_ROPE=apply_rope,
         num_warps=1,
     )
 
