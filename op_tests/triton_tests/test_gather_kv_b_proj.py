@@ -530,22 +530,29 @@ def test_gather_kv_b_proj_per_row_scale(
 
 
 @pytest.mark.parametrize(
-    "batch_size, block_size, num_tp, k_buffer_type, avg_kv_length, scale_mode",
+    "batch_size, block_size, num_tp, total_heads, k_buffer_type, avg_kv_length, scale_mode",
     [
-        (4, 1, 4, torch.bfloat16, 512, "block"),
-        (8, 16, 4, torch.bfloat16, 1024, "block"),
-        (4, 1, 4, dtypes.fp8, 512, "block"),
-        (8, 16, 4, dtypes.fp8, 1024, "block"),
-        (4, 1, 4, torch.bfloat16, 512, "per_row"),
-        (8, 16, 4, torch.bfloat16, 1024, "per_row"),
-        (4, 1, 4, dtypes.fp8, 512, "per_row"),
-        (8, 16, 4, dtypes.fp8, 1024, "per_row"),
+        (4, 1, 4, 128, torch.bfloat16, 512, "block"),
+        (8, 16, 4, 128, torch.bfloat16, 1024, "block"),
+        (4, 1, 4, 128, dtypes.fp8, 512, "block"),
+        (8, 16, 4, 128, dtypes.fp8, 1024, "block"),
+        (4, 1, 4, 128, torch.bfloat16, 512, "per_row"),
+        (8, 16, 4, 128, torch.bfloat16, 1024, "per_row"),
+        (4, 1, 4, 128, dtypes.fp8, 512, "per_row"),
+        (8, 16, 4, 128, dtypes.fp8, 1024, "per_row"),
         # gfx1250 flat-grid path: enough chunks to require GRID_STRIDE on main.
-        (4, 1, 1, dtypes.fp8, 2048, "none"),
+        (4, 1, 1, 96, dtypes.fp8, 2048, "none"),
     ],
 )
 def test_gather_kv_b_proj_bf16_weight(
-    batch_size, block_size, num_tp, k_buffer_type, avg_kv_length, scale_mode, perf=False
+    batch_size,
+    block_size,
+    num_tp,
+    total_heads,
+    k_buffer_type,
+    avg_kv_length,
+    scale_mode,
+    perf=False,
 ):
     """Test gather_kv_b_proj with bf16 weight (no quantization on weight).
 
@@ -558,7 +565,7 @@ def test_gather_kv_b_proj_bf16_weight(
     kv_pe_dim = 64
     qk_nope_head_dim = 128
     v_head_dim = 128
-    tp_k_head_num = 128 // num_tp
+    tp_k_head_num = total_heads // num_tp
     num_block = 2 * avg_kv_length // block_size
     # Kimi-K3's unquantized kv_b_proj stays row-major; the quantized cases use
     # the existing preshuffled path.
