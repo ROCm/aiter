@@ -27,8 +27,10 @@ TOKEN_BUCKETS = (
 )
 FIXED_GRID_MULT_VALUES = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32)
 P2P_FP8_MIN_MTPR = 1024
-# Fixed-slot (direct expert slots, no count exchange) is validated up to MTPR 128;
-# AITER_MEGA_FIXED_SLOT_MAX_MTPR=511 also admits the 256-token capacity.
+# Fixed-slot (direct expert slots, no count exchange) is the default up to MTPR
+# 128. AITER_MEGA_FIXED_SLOT_MAX_MTPR=511 / 1023 / 2047 extends it to the 256 /
+# 512 / 1024-token capacities, validated on the EP8 v4_pro layout
+# (op_tests/multigpu_tests/test_mega_moe_v2.py).
 FIXED_SLOT_MAX_MTPR = int(os.environ.get("AITER_MEGA_FIXED_SLOT_MAX_MTPR", "255"))
 MAX_MTPR_CLASS = 32768
 # Source-indexed payload storage cuts the maximum-capacity activation buffer
