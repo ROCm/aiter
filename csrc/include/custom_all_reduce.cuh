@@ -173,13 +173,20 @@ DINLINE void start_sync(const RankSignals& sg,
         // Latency = 1 p2p write
         __scoped_atomic_store_n(&sg.signals[threadIdx.x]->start[blockIdx.x][rank],
                                 flag,
-                                __ATOMIC_RELAXED,
+                                __ATOMIC_RELEASE,
                                 __MEMORY_SCOPE_SYSTEM);
-        // wait until we got true from all ranks
+        // The flag is written by a peer GPU into this rank's Signal page.
+        // A DEVICE-scope load does not reliably observe that SYSTEM store, so
+        // ranks can leave this wait while a peer has not entered yet. The next
+        // fused AR then spins for milliseconds. SYSTEM + ACQUIRE sees the flag.
+        // s_sleep keeps the miss loop from flooding XGMI probes while a late
+        // rank is still in its producer kernel.
         while(__scoped_atomic_load_n(&self_sg->start[blockIdx.x][threadIdx.x],
-                                     __ATOMIC_RELAXED,
-                                     __MEMORY_SCOPE_DEVICE) < flag)
-            ;
+                                     __ATOMIC_ACQUIRE,
+                                     __MEMORY_SCOPE_SYSTEM) < flag)
+        {
+            __builtin_amdgcn_s_sleep(1);
+        }
     }
     __syncthreads();
     // use one thread to update flag
@@ -223,15 +230,21 @@ DINLINE void end_sync(const RankSignals& sg,
     {
         // simultaneously write to the corresponding flag of all ranks.
         // Latency = 1 p2p write
+        // RELEASE publishes prior IPC reads and writes before the flag. Using
+        // RELAXED when final_sync is true lets a rank publish done while a peer
+        // is still reading the registered input, and DEVICE-scope loads of that
+        // flag often miss the peer write entirely. Both cases let ranks drift
+        // apart across back-to-back fused ARs in one HIP graph.
         __scoped_atomic_store_n(&sg.signals[threadIdx.x]->end[blockIdx.x][rank],
                                 flag,
-                                final_sync ? __ATOMIC_RELAXED : __ATOMIC_RELEASE,
+                                __ATOMIC_RELEASE,
                                 __MEMORY_SCOPE_SYSTEM);
-        // wait until we got true from all ranks
         while(__scoped_atomic_load_n(&self_sg->end[blockIdx.x][threadIdx.x],
-                                     final_sync ? __ATOMIC_RELAXED : __ATOMIC_ACQUIRE,
-                                     __MEMORY_SCOPE_DEVICE) < flag)
-            ;
+                                     __ATOMIC_ACQUIRE,
+                                     __MEMORY_SCOPE_SYSTEM) < flag)
+        {
+            __builtin_amdgcn_s_sleep(1);
+        }
     }
     __syncthreads();
     // use one thread to update flag
@@ -2006,7 +2019,10 @@ __global__ void __launch_bounds__(1024, 1)
         ptrs[i] = (const P*)_dp->ptrs[i];
         tmps[i] = get_tmp_buf<P>(sg.signals[i]);
     }
-    start_sync<ngpus>(sg, self_sg, rank);
+    // start_sync runs in allreduce_start_sync_kernel, launched on this stream
+    // immediately before this kernel. Keeping it out of the reduce kernel
+    // means the wait does not hold RankData IPC mappings, so a late rank can
+    // still run its producer GEMM.
     for(int tidx = blockIdx.x; tidx < token_num; tidx += gridDim.x)
     {
         int input_idx    = tidx * input_hidden_dim + access_id_in_token;
@@ -2445,6 +2461,13 @@ void allreduce_fusion_kernel_2stage_mxfp4_launcher(
             size, hidden_dim, eps, bf16_output);
 }
 
+template <int ngpus>
+__global__ void __launch_bounds__(64, 1)
+    allreduce_start_sync_kernel(RankSignals sg, Signal* self_sg, int rank)
+{
+    start_sync<ngpus>(sg, self_sg, rank);
+}
+
 template <typename T, typename OutT, int NGPUS, bool GEMMA_NORM = false>
 void allreduce_fusion_kernel_1stage_launcher(RankData* _dp,
                                              RankSignals sg,
@@ -2472,6 +2495,7 @@ void allreduce_fusion_kernel_1stage_launcher(RankData* _dp,
     dim3 threadsPerBlock(LAUNCH_THREADS);
     int token_num            = size / hidden_dim;
     dim3 numBlocks(std::min(token_num, kMaxBlocks));
+    allreduce_start_sync_kernel<NGPUS><<<numBlocks, 32, 0, stream>>>(sg, self_sg, rank);
     allreduce_fusion_kernel_1stage<T, OutT, NGPUS, GEMMA_NORM>
         <<<numBlocks, threadsPerBlock, 0, stream>>>(_dp,
                                                     sg,
