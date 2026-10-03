@@ -49,6 +49,7 @@ def pa_prefill_sparse(
     attn_sink: torch.Tensor | None,
     softmax_scale: float,
     has_invalid: bool | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sparse prefill attention over two KV sources with sink.
 
@@ -69,10 +70,20 @@ def pa_prefill_sparse(
         kv_indptr_extend:  [T+1] int32 — true prefix sum. ``None`` for none.
         attn_sink:         [H] fp32 — per-head softmax-denom bias.
         softmax_scale:     float.
+        has_invalid:       whether index lists may hold ``-1`` / out-of-pool
+            slots. ``False`` lets the kernel skip those checks; ``None`` picks
+            a heuristic on gfx1250 and assumes ``True`` elsewhere.
+        out:               optional [T, H, D] output buffer, written in place.
 
     Returns:
         [T, H, D] attention output, same dtype as q.
     """
+    if out is None:
+        out = torch.empty_like(q)
+    else:
+        assert (
+            out.shape == q.shape and out.dtype == q.dtype
+        ), f"out {tuple(out.shape)} {out.dtype} != q {tuple(q.shape)} {q.dtype}"
     if DEVICE_ARCH == "gfx1250":
         if not q.is_cuda:
             raise RuntimeError("pa_prefill_sparse requires CUDA/HIP tensors")
@@ -98,7 +109,6 @@ def pa_prefill_sparse(
             kv_indices_extend.shape[0],
         )
 
-        out = torch.empty_like(q)
         assert (
             kv_indices_prefix.dtype == torch.int32 and kv_indices_prefix.is_contiguous()
         )
@@ -178,7 +188,6 @@ def pa_prefill_sparse(
             kv_indices_extend,
             kv_indptr_extend,
         )
-        out = torch.empty_like(q)
         gluon_mla_sparse_prefill(
             q,  # q_nope = combined-D query (RoPE folded in)
             None,  # q_pe unused in prefill mode
@@ -202,17 +211,14 @@ def pa_prefill_sparse(
             kv_indices_extend,
             kv_indptr_extend,
         )
-        attn_sink = attn_sink or torch.empty(1, device="cuda", dtype=torch.float32)
         has_attn_sink = attn_sink is not None
+        if has_attn_sink:
+            attn_sink = attn_sink.contiguous()
+        else:
+            attn_sink = torch.empty(1, device=q.device, dtype=torch.float32)
         num_queries, num_heads, head_dim = q.shape
         block_d = triton.next_power_of_2(head_dim)
-        out = torch.empty_like(q)
-
-        grid = lambda META: (
-            num_queries,
-            triton.cdiv(num_heads, META["BLOCK_H"]),
-        )
-        _sparse_attn_prefill_kernel[grid](
+        args = (
             q,
             unified_kv,
             kv_indices_prefix,
@@ -231,6 +237,38 @@ def pa_prefill_sparse(
             head_dim,
             unified_kv.shape[0],
             float(softmax_scale),
+        )
+
+        if DEVICE_ARCH == "gfx942" and num_heads <= 16:
+            # Fixed config from a sweep at DSv4.1-Flash TP4 (H=16, D=512,
+            # top-512 + 128 SWA, M=16384) with Triton 3.7.1: ~1.5x over the
+            # autotune default (BLOCK_H=32, 4 warps), which masks half of every
+            # 32-row tile at H=16.
+            block_h = 16
+            _sparse_attn_prefill_kernel.fn[
+                (num_queries, triton.cdiv(num_heads, block_h))
+            ](
+                *args,
+                HAS_ATTN_SINK=has_attn_sink,
+                BLOCK_H=block_h,
+                BLOCK_D=block_d,
+                BLOCK_K=32,
+                HAS_INVALID=True if has_invalid is None else has_invalid,
+                USE_EXP2=True,
+                EVEN_HD=block_d == head_dim and num_heads % block_h == 0,
+                num_warps=2,
+                num_stages=1,
+                waves_per_eu=0,
+                matrix_instr_nonkdim=16,
+            )
+            return out
+
+        grid = lambda META: (
+            num_queries,
+            triton.cdiv(num_heads, META["BLOCK_H"]),
+        )
+        _sparse_attn_prefill_kernel[grid](
+            *args,
             HAS_ATTN_SINK=has_attn_sink,
             BLOCK_D=block_d,
         )

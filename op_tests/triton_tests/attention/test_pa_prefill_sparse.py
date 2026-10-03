@@ -467,3 +467,86 @@ def test_pa_prefill_sparse_gfx950(T, H, D, prefix_len):
     )
 
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+def _sparse_prefill_single_source_torch(q, kv, indices, indptr, attn_sink, scale):
+    """Vectorized fp32 reference for one KV pool: pads each row's ragged slot list
+    to the longest row and masks ``-1`` / padding. ``attn_sink=None`` means no sink."""
+    T, H, _ = q.shape
+    lens = (indptr[1:] - indptr[:-1]).long()
+    K = max(int(lens.max().item()), 1)
+    pos = torch.arange(K, device=q.device)
+    in_row = pos[None, :] < lens[:, None]
+    flat = (indptr[:-1].long()[:, None] + pos[None, :]).clamp(
+        max=max(indices.numel() - 1, 0)
+    )
+    slots = torch.where(in_row, indices.long()[flat] if indices.numel() else -1, -1)
+    valid = slots >= 0
+    kv_g = kv.float()[slots.clamp(min=0)]  # [T, K, D]
+    scores = torch.einsum("thd,tkd->thk", q.float(), kv_g) * scale
+    scores = scores.masked_fill(~valid[:, None, :], float("-inf"))
+    if attn_sink is not None:
+        sink = attn_sink.float()[None, :, None].expand(T, H, 1)
+        scores = torch.cat([scores, sink], dim=-1)
+    cmax = scores.amax(dim=-1, keepdim=True)
+    cmax = torch.where(cmax == float("-inf"), torch.zeros_like(cmax), cmax)
+    w = (scores - cmax).exp()
+    w = w / w.sum(dim=-1, keepdim=True).clamp(min=1e-30)
+    return torch.einsum("thk,tkd->thd", w[..., :K], kv_g).to(q.dtype)
+
+
+# DSv4.1-Flash TP4: H=16 per rank, D=512, top-512 + 128 SWA = 640 slots.
+# Lengths vary per row so the last BLOCK_K tile is usually partial.
+@pytest.mark.parametrize("T", [37, 2048])
+# H=32 exercises the autotuned launch; H<=16 the gfx942 fixed config.
+@pytest.mark.parametrize("H", [8, 16, 32])
+@pytest.mark.parametrize("max_len", [17, 640])
+@pytest.mark.parametrize("sentinels", [True, False])
+@pytest.mark.parametrize("with_sink", [True, False])
+def test_pa_prefill_sparse_single_source(T, H, max_len, sentinels, with_sink):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    if DEVICE_ARCH in ("gfx950", "gfx1250"):
+        pytest.skip("covers the Triton single-source branch")
+
+    D = 512
+    torch.manual_seed(0)
+    dev = "cuda"
+    num_kv = 4096
+    q = torch.randn(T, H, D, dtype=torch.bfloat16, device=dev)
+    kv = torch.randn(num_kv, D, dtype=torch.bfloat16, device=dev)
+    sink = torch.randn(H, dtype=torch.float32, device=dev) if with_sink else None
+    lens = torch.randint(1, max_len + 1, (T,), device=dev)
+    lens[::7] = 0  # empty rows: output is 0 (sink only)
+    indptr = torch.zeros(T + 1, dtype=torch.int32, device=dev)
+    indptr[1:] = lens.cumsum(0)
+    indices = torch.randint(
+        0, num_kv, (int(indptr[-1]),), dtype=torch.int32, device=dev
+    )
+    if sentinels and indices.numel():
+        indices[torch.randperm(indices.numel(), device=dev)[: indices.numel() // 8]] = (
+            -1
+        )
+        row = int(torch.nonzero(lens >= 32)[0]) if bool((lens >= 32).any()) else None
+        if row is not None:  # a whole leading tile of -1
+            s = int(indptr[row])
+            indices[s : s + 16] = -1
+    scale = D**-0.5
+
+    ref = _sparse_prefill_single_source_torch(q, kv, indices, indptr, sink, scale)
+    out = torch.full_like(q, float("nan"))
+    ret = pa_prefill_sparse(
+        q,
+        kv,
+        indices,
+        indptr,
+        None,
+        None,
+        None,
+        sink,
+        scale,
+        has_invalid=sentinels,
+        out=out,
+    )
+    assert ret is out
+    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)

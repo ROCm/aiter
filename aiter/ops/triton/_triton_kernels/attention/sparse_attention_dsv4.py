@@ -227,6 +227,13 @@ def _combine_topk_swa_indices_ragged_kernel(
 # ---------------------------------------------------------------------------
 
 
+@triton.jit
+def _exp(x, USE_EXP2: tl.constexpr):
+    if USE_EXP2:
+        return tl.math.exp2(x)
+    return tl.exp(x)
+
+
 def _prefill_prune_configs(configs, named_args, **kwargs):
     BLOCK_D = kwargs.get("BLOCK_D", named_args.get("BLOCK_D"))
     pruned = []
@@ -304,6 +311,12 @@ def _sparse_attn_prefill_kernel(
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    # False promises every slot in [indptr[i], indptr[i+1]) is a valid row, so
+    # the -1 / out-of-pool check drops out of the inner loop.
+    HAS_INVALID: tl.constexpr = True,
+    USE_EXP2: tl.constexpr = False,
+    # head_dim == BLOCK_D and num_heads % BLOCK_H == 0: no q/kv/out masks.
+    EVEN_HD: tl.constexpr = False,
 ):
     # 64-bit before the multiply, same reasoning as `slot_off` below: the
     # program id fits 32 bits, but `query_idx * q_stride_t` does not once
@@ -318,6 +331,10 @@ def _sparse_attn_prefill_kernel(
     head_mask = head_offsets < num_heads
     dim_mask = dim_offsets < head_dim
 
+    if EVEN_HD:
+        # Constant all-true masks fold away in the q load and out store.
+        head_mask = tl.full((BLOCK_H,), True, tl.int1)
+        dim_mask = tl.full((BLOCK_D,), True, tl.int1)
     q = tl.load(
         q_ptr
         + query_idx * q_stride_t
@@ -327,7 +344,12 @@ def _sparse_attn_prefill_kernel(
         other=0.0,
     )
 
-    m_i = tl.full((BLOCK_H,), float("-inf"), dtype=tl.float32)
+    if USE_EXP2:
+        scale = scale * 1.4426950408889634  # log2(e): softmax runs in base 2
+    # Finite start for the running max: masked (-inf) scores then exponentiate
+    # to exactly 0 and exp(m_i - m_new) never sees -inf - -inf, so a tile with
+    # no valid slot needs no NaN guard.
+    m_i = tl.full((BLOCK_H,), -1.0e30, dtype=tl.float32)
     l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
     acc = tl.zeros((BLOCK_H, BLOCK_D), dtype=tl.float32)
 
@@ -338,13 +360,23 @@ def _sparse_attn_prefill_kernel(
     k_offsets = tl.arange(0, BLOCK_K)
     # Prefetch first tile's slot indices so the indirect int32 load can overlap
     # the next iteration's QK MFMA latency.
+    # Out-of-range lanes read row 0 rather than -1, so the gather needs no mask
+    # (the scores are masked instead), which keeps it vectorized.
     slot = tl.load(
-        kv_indices_ptr + kv_start + k_offsets, mask=k_offsets < kv_len, other=-1
+        kv_indices_ptr + kv_start + k_offsets, mask=k_offsets < kv_len, other=0
     )
     for k_start in tl.range(0, kv_len, BLOCK_K):
         k_pos = k_start + k_offsets
         in_range = k_pos < kv_len
-        valid = in_range & (slot >= 0) & (slot < num_kv)
+        if HAS_INVALID:
+            # One unsigned compare covers both -1 (wraps to 2^32 - 1) and slots
+            # past the pool; two signed compares cost ~10% of the kernel.
+            valid = in_range & (slot.to(tl.uint32, bitcast=True) < num_kv)
+            # Point invalid lanes at row 0 so the gather stays unmasked (and
+            # vectorized); their scores are masked to -inf below.
+            slot = tl.where(valid, slot, 0)
+        else:
+            valid = in_range
 
         # 64-bit before the multiply, same as the decode kernel: a slot index
         # fits 32 bits (the index buffer is int32 by ABI) but `slot *
@@ -353,32 +385,33 @@ def _sparse_attn_prefill_kernel(
         # bad read is silent.
         slot_off = slot.to(tl.int64)
 
-        kv = tl.load(
+        kv_ptrs = (
             kv_ptr
             + slot_off[:, None] * kv_stride_n
-            + dim_offsets[None, :] * kv_stride_d,
-            mask=valid[:, None] & dim_mask[None, :],
-            other=0.0,
+            + dim_offsets[None, :] * kv_stride_d
         )
+        if EVEN_HD:
+            kv = tl.load(kv_ptrs)
+        else:
+            kv = tl.load(kv_ptrs, mask=valid[:, None] & dim_mask[None, :], other=0.0)
 
         # Prefetch next tile's indices before heavy compute on current tile.
         next_k_pos = k_start + BLOCK_K + k_offsets
         slot = tl.load(
             kv_indices_ptr + kv_start + next_k_pos,
             mask=next_k_pos < kv_len,
-            other=-1,
+            other=0,
         )
 
-        scores = tl.dot(q, tl.trans(kv)) * scale
+        # Scale after the row max (valid since scale > 0) so that
+        # `scores * scale - m_new` below fuses into one v_fma_f32 per score.
+        scores = tl.dot(q, tl.trans(kv))
         scores = tl.where(head_mask[:, None] & valid[None, :], scores, float("-inf"))
 
-        m_block = tl.max(scores, axis=1)
+        m_block = tl.max(scores, axis=1) * scale
         m_new = tl.maximum(m_i, m_block)
-        alpha = tl.where(m_new == float("-inf"), 0.0, tl.exp(m_i - m_new))
-        p = tl.where(
-            m_new[:, None] == float("-inf"), 0.0, tl.exp(scores - m_new[:, None])
-        )
-        p = tl.where(head_mask[:, None] & valid[None, :], p, 0.0)
+        alpha = _exp(m_i - m_new, USE_EXP2)
+        p = _exp(scores * scale - m_new[:, None], USE_EXP2)
         l_new = l_i * alpha + tl.sum(p, axis=1)
 
         acc = acc * alpha[:, None] + tl.dot(p.to(kv.dtype), kv)
@@ -389,9 +422,11 @@ def _sparse_attn_prefill_kernel(
         sink = tl.load(
             attn_sink_ptr + head_offsets, mask=head_mask, other=float("-inf")
         ).to(tl.float32)
+        if USE_EXP2:
+            sink = sink * 1.4426950408889634
         m_final = tl.maximum(m_i, sink)
-        alpha = tl.where(m_final == float("-inf"), 0.0, tl.exp(m_i - m_final))
-        exp_sink = tl.where(sink == float("-inf"), 0.0, tl.exp(sink - m_final))
+        alpha = tl.where(m_final == float("-inf"), 0.0, _exp(m_i - m_final, USE_EXP2))
+        exp_sink = tl.where(sink == float("-inf"), 0.0, _exp(sink - m_final, USE_EXP2))
         l_final = l_i * alpha + exp_sink
         denom = tl.maximum(l_final, 1.0e-30)
         out = tl.where(
