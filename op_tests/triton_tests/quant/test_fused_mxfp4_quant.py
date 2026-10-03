@@ -307,6 +307,8 @@ def generate_fused_reduce_act_mul_mxfp4_group_quant(
         (128, 64, 256),
         (128, 68, 256),
         (256, 32, 256),
+        (64, 5760, 256),
+        (256, 4096, 256),
     ],
 )
 @pytest.mark.parametrize("SPK", [1, 4])
@@ -365,6 +367,62 @@ def test_fused_reduce_act_mul_mxfp4_group_quant(
 
     torch.testing.assert_close(y_q_triton, y_q_torch)
     torch.testing.assert_close(y_s_triton, y_s_torch)
+
+
+@pytest.mark.parametrize("M", [1, 4, 33, 64, 256])
+@pytest.mark.parametrize("N", [256, 4096, 14336])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_fused_silu_mul_mxfp4_quant_round_to_input_dtype(M, N, dtype):
+    # round_to_input_dtype=True has to give the same bytes as silu_mul in the
+    # input dtype followed by a separate mxfp4 quant. gelu is left out, the
+    # kernel gelu and F.gelu are not bitwise equal so fp16 refs miss by a rounding
+    if not (arch_info.is_fp4_avail()):
+        pytest.skip("MXFP4 not supported on this architecture")
+
+    torch.manual_seed(0)
+    x = torch.randn((M, 2 * N), dtype=dtype).cuda() * 2
+    a, b = x.float().split([N, N], dim=-1)
+    y_q_torch, y_s_torch = torch_dynamic_mxfp4_quant((F.silu(a) * b).to(dtype).float())
+
+    (y_q, y_s), _ = fused_reduce_act_mul_and_mxfp4_quant(
+        x, activation="silu", round_to_input_dtype=True
+    )
+
+    torch.testing.assert_close(y_q, y_q_torch)
+    torch.testing.assert_close(y_s[:M, : N // 32], y_s_torch)
+
+
+@pytest.mark.parametrize("M", [1, 4, 33, 64, 256])
+@pytest.mark.parametrize("N", [256, 4096, 14336])
+@pytest.mark.parametrize("res1", [True, False])
+def test_fused_mxfp4_quant_transpose_scale(M, N, res1):
+    # transpose_scale only changes the memory layout of the e8m0 scales (to the
+    # column-major one dynamic_mxfp4_quant returns), the bytes must not change
+    if not (arch_info.is_fp4_avail()):
+        pytest.skip("MXFP4 not supported on this architecture")
+
+    torch.manual_seed(0)
+    x = torch.randn((M, 2 * N), dtype=torch.bfloat16).cuda()
+    (y_q, y_s), _ = fused_reduce_act_mul_and_mxfp4_quant(
+        x, activation="silu", round_to_input_dtype=True
+    )
+    (y_q_t, y_s_t), _ = fused_reduce_act_mul_and_mxfp4_quant(
+        x, activation="silu", round_to_input_dtype=True, transpose_scale=True
+    )
+    assert y_s_t.shape == y_s.shape and y_s_t.stride() == (1, M)
+    assert torch.equal(y_q_t, y_q) and torch.equal(y_s_t, y_s)
+
+    x1, _, rms1_w, _, resid1 = generate_fused_rms_quant_data(
+        x1_shape=(M, N), x1_stride=(N, 1), res1=res1
+    )
+    (r_q, r_s), _, _, r_res = fused_rms_mxfp4_quant(x1, rms1_w, 1e-6, res1=resid1)
+    (r_q_t, r_s_t), _, _, r_res_t = fused_rms_mxfp4_quant(
+        x1, rms1_w, 1e-6, res1=resid1, transpose_scale=True
+    )
+    assert r_s_t.shape == r_s.shape and r_s_t.stride() == (1, M)
+    assert torch.equal(r_q_t, r_q) and torch.equal(r_s_t, r_s)
+    if res1:
+        assert torch.equal(r_res_t, r_res)
 
 
 def generate_fused_reduce_rms_quant_data(M, N1, N2, N3, SPK, dtype=torch.bfloat16):
