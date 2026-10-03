@@ -31,6 +31,9 @@ from aiter.ops.flydsl.gather_kv_b_proj import (
     gather_kv_b_proj_flydsl_fp8_supported,
     gather_kv_b_proj_flydsl_supported,
 )
+from aiter.ops.flydsl.gather_kv_b_proj_gfx1250 import (
+    gather_kv_b_proj_flydsl_gfx1250,
+)
 from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.gather_kv_b_proj import (
     gather_kv_b_proj as triton_gather_kv_b_proj,
@@ -114,6 +117,10 @@ SUPPORTED_GFX = ("gfx950",)
 _SKIP = pytest.mark.skipif(
     get_gfx() not in SUPPORTED_GFX,
     reason="gfx950 FlyDSL required",
+)
+_SKIP_GFX1250 = pytest.mark.skipif(
+    get_gfx() != "gfx1250",
+    reason="gfx1250 FlyDSL required",
 )
 
 
@@ -280,6 +287,33 @@ def _check_output(case):
             )
         else:
             checkAllclose(ref, actual, atol=1e-2, rtol=1e-2, msg=key)
+
+
+@_SKIP_GFX1250
+def test_gather_kv_b_proj_flydsl_gfx1250_kimi_ptpc():
+    case = _make_case(512, 96)
+    case["k_scale"] = torch.tensor(1.0)
+    weight = shuffle_weight(case["weight"], layout=(16, 16))
+    assert gather_kv_b_proj_flydsl_supported(
+        case["k_buffer"],
+        weight,
+        case["weight_scale"],
+        case["k_prefix"],
+        case["v_prefix"],
+    )
+    gather_kv_b_proj_flydsl_gfx1250(
+        case["k_buffer"],
+        case["k_scale"],
+        case["kv_indptr"],
+        case["kv_indices"],
+        case["cu_seqlens_k"],
+        weight,
+        case["weight_scale"],
+        case["k_prefix"],
+        case["v_prefix"],
+        flydsl_min_rows=0,
+    )
+    _check_output(case)
 
 
 @_SKIP

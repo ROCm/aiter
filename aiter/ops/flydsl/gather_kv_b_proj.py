@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 
-"""FlyDSL backend for the MLA fused gather + kv_b_proj expansion (gfx950).
+"""FlyDSL backend for the MLA fused gather + kv_b_proj expansion.
 
 Supported: fp8 KV cache (OCP e4m3), fp8 weight in either row-major or
 ``shuffle_weight((16,16))`` layout, per-output-row *or* 128x128 block weight
-scale, per-tensor activation scale, page_size 1, bf16 or scaled fp8 outputs, gfx950.
+scale, per-tensor activation scale, page_size 1, bf16 or scaled fp8 outputs on
+gfx950. The gfx1250 Kimi-K3 ptpc specialization is dispatched separately.
 
 The cache has no size limit: up to 4 GiB it is reached through one buffer
 descriptor, beyond that through 64-bit per-lane addresses. Output width is
@@ -189,6 +190,17 @@ def _unsupported_reason(
         return f"k_buffer last dim must be {KV_ROW_ELEMS}, got {k_buffer.shape[2]}"
 
     arch = _arch_of(k_buffer.device.index)
+    if arch == "gfx1250":
+        from .gather_kv_b_proj_gfx1250 import unsupported_reason
+
+        return unsupported_reason(
+            k_buffer,
+            kv_proj_weight,
+            kv_proj_scale,
+            k_prefix,
+            v_prefix,
+            shuffled_kv_cache=shuffled_kv_cache,
+        )
     if arch != "gfx950":
         return f"gfx950 only (OCP e4m3 + CDNA4 MFMA_Scale + 128 KB LDS), got {arch}"
     for name, t in (("k_buffer", k_buffer), ("kv_proj_weight", kv_proj_weight)):
@@ -464,6 +476,23 @@ def gather_kv_b_proj_flydsl(
     )
     if reason is not None:
         _raise(reason)
+
+    if _arch_of(k_buffer.device.index) == "gfx1250":
+        from .gather_kv_b_proj_gfx1250 import gather_kv_b_proj_flydsl_gfx1250
+
+        return gather_kv_b_proj_flydsl_gfx1250(
+            k_buffer,
+            k_scale,
+            kv_indptr,
+            kv_indices,
+            kv_prefix_sum_context_lens,
+            kv_proj_weight,
+            kv_proj_scale,
+            k_prefix,
+            v_prefix,
+            weight_preshuffle=weight_preshuffle,
+            shuffled_kv_cache=shuffled_kv_cache,
+        )
 
     output_fp8 = k_prefix.dtype == torch.float8_e4m3fn
     reason = _output_scale_reason(k_buffer, k_prefix, k_out_scale, v_out_scale)
