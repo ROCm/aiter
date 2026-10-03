@@ -22,6 +22,11 @@ from packaging.version import Version, parse
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f"{this_dir}/utils/")
+# json blob_gen_cmd eval() needs these names in module globals.
+from build_targets import (  # noqa: F401
+    ck_fmha_batch_prefill_gen_targets,
+    ck_fmha_targets,
+)
 from chip_info import get_gfx, get_gfx_list, get_gfx_runtime
 from cpp_extension import _jit_compile, executable_path, get_hip_version
 from file_baton import FileBaton

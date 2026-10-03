@@ -254,6 +254,12 @@ def get_exclude_ops():
         exclude_ops.extend(sorted(core._get_ck_exclude_modules()))
         return exclude_ops
 
+    # CK fmha is unsupported on some archs (gfx1250 uses ASM/FlyDSL/Triton).
+    # Drop its modules at selection time rather than generating kernels that
+    # cannot run.
+    if not ck_fmha_enabled():
+        exclude_ops.extend(sorted(CK_FMHA_MODULES))
+
     for module in all_modules:
         if PREBUILD_KERNELS == 1:
             # Exclude tune modules; for MHA keep only fmha_v3 fwd variants
@@ -293,6 +299,7 @@ if PREBUILD_KERNELS != 0:
             "skip precompilation in this environment"
         )
     else:
+        from jit.utils.build_targets import CK_FMHA_MODULES, ck_fmha_enabled
         from jit.utils.mha_recipes import (
             get_mha_varlen_prebuild_variants_by_names,
         )
@@ -325,7 +332,7 @@ if PREBUILD_KERNELS != 0:
                     }
                 )
 
-        if PREBUILD_KERNELS == 1 and ENABLE_CK:
+        if PREBUILD_KERNELS == 1 and ENABLE_CK and ck_fmha_enabled():
             extra_args_build = []
 
             req_md_names = [
