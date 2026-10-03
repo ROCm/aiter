@@ -1,16 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""
-Gated Delta Net K5 hidden-state recurrence kernel (@flyc.kernel API).
+"""GDN K5 hidden-state recurrence for 64-token chunks.
 
-HIP-aligned fork: same ``mfma_f32_16x16x16bf16_1k`` instruction and warp
-partition (BT split-M, K split across waves, V not split) as the hand-tuned
-HIP/C++ K5 kernel; writes the public [..., V, K] layout through a [V][K]
-transpose buffer + b128 store (fp32 snapshots use two half-BV LDS rounds).
-Serially over the NT chunks: store the h snapshot for K6,
-v_new = u - w @ h, then
-h = h * exp(g_last) + k^T @ (v_new * exp(g_last - g_cumsum)).
+Uses bf16 MFMA and a [V, K] transpose buffer for public state stores.
 """
 
 import flydsl.compiler as flyc
@@ -34,6 +27,9 @@ def _make_fast_exp(g_is_log2_scaled: bool):
 # Truncation keeps outputs bit-identical to the HIP/C++ K5 kernel; RNE is closer
 # to the fp32 reference but does NOT bit-match HIP.
 _BF16_CONVERT_TRUNC_DEFAULT = True
+
+PHASE_EMIT = "emit"
+PHASE_BUILD_MAP = "build_map"
 
 
 def _make_bf16_converter(trunc: bool):
@@ -68,20 +64,29 @@ def compile_chunk_gated_delta_h(
     SCHED_GFX942: bool = False,
     G_HEAD_MAJOR: bool = False,
     BF16_CONVERT_TRUNC: bool = _BF16_CONVERT_TRUNC_DEFAULT,
+    PHASE: str = PHASE_EMIT,
+    BLOCK_ENTRY_SEED: bool = False,
 ):
-    """Compile the GDN K5 kernel into the @flyc.jit launcher below.
+    """Compile GDN K5; BF16-rounded basis states approximate serial carry.
 
-    ``STATE_DTYPE_BF16`` puts ``h0`` / ``ht`` in bf16 (promote on load, demote
-    on store); the f32 accumulator and the LDS layouts are unchanged.
-
-    ``SNAPSHOT_DTYPE_BF16=False`` writes fp32 snapshots in two half-BV LDS rounds.
+    FP32 snapshots require two half-BV LDS rounds.
     """
-    # BT=64 is baked into the wave mapping / load batching / BT_STEPS, gated_v
-    # alias-reuses h_state panel 1, and the LDS layout is validated at K=V=128.
+    if PHASE not in (PHASE_EMIT, PHASE_BUILD_MAP):
+        raise ValueError(f"Unknown GDN phase: {PHASE}")
+    if BLOCK_ENTRY_SEED:
+        assert PHASE == PHASE_EMIT and IS_VARLEN and USE_INITIAL_STATE
+        assert not USE_STATE_INDICES
+    if PHASE == PHASE_BUILD_MAP:
+        assert V > K and K % BV == 0
+        assert not USE_INITIAL_STATE and not USE_STATE_INDICES
+        assert STORE_FINAL_STATE and not STATE_DTYPE_BF16 and not SAVE_NEW_VALUE
+
+    # BT=64 fixes wave mapping and LDS aliasing; K=128 fixes the layout.
     assert BT == 64, f"chunk_gated_delta_h only supports BT=64, got BT={BT}"
     assert K == 128, f"chunk_gated_delta_h only supports K=128, got K={K}"
     assert BV % 16 == 0, f"BV must be a multiple of the MFMA N of 16, got BV={BV}"
     NUM_K_BLOCKS = K // 64
+    U_WIDTH = V - K if PHASE == PHASE_BUILD_MAP else V
 
     # ``_gview`` re-describes shape/stride, so only the memref ELEMENT TYPE
     # comes from the tensor: placeholders for unused slots must match dtypes.
@@ -164,12 +169,16 @@ def compile_chunk_gated_delta_h(
         cu_seqlens_tensor: fx.Tensor,
         chunk_offsets_tensor: fx.Tensor,
         state_indices_tensor: fx.Tensor,
+        block_seq_id_tensor: fx.Tensor,
+        block_chunk_base_tensor: fx.Tensor,
+        block_nchunks_tensor: fx.Tensor,
+        NB_val: fx.Int32,
         T_val: fx.Int32,
         T_flat: fx.Int32,
-        # Only bounds the cu_seqlens / chunk_offsets / state_indices views; the
-        # sequence count itself is carried by the grid.y extent.
         N_val: fx.Int32,
+        phase: fx.Constexpr[str],
     ):
+        assert phase in (PHASE_EMIT, PHASE_BUILD_MAP)
         i_v = fx.block_idx.x
         i_nh = fx.block_idx.y
         i_n = i_nh // H
@@ -179,6 +188,19 @@ def compile_chunk_gated_delta_h(
         cp_f32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
         cp_bf16 = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), fx.BFloat16)
         cp_bf16x8 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
+
+        if const_expr(phase == PHASE_BUILD_MAP or BLOCK_ENTRY_SEED):
+            block_id = i_n
+            seq_view = _gview(block_seq_id_tensor, None, (NB_val, 1), (1, 1))
+            base_view = _gview(block_chunk_base_tensor, None, (NB_val, 1), (1, 1))
+            count_view = _gview(block_nchunks_tensor, None, (NB_val, 1), (1, 1))
+            i_n = _load_vec(cp_i32, fx.slice(seq_view, (block_id, None)), 1, fx.Int32)
+            chunk_base = _load_vec(
+                cp_i32, fx.slice(base_view, (block_id, None)), 1, fx.Int32
+            )
+            block_nt = _load_vec(
+                cp_i32, fx.slice(count_view, (block_id, None)), 1, fx.Int32
+            )
 
         # State-pool gather: the slot is ``state_indices[i_n]`` into a
         # [pool_size, H, V, K] pool. Only h0 / ht use it; the snapshot is dense.
@@ -206,12 +228,9 @@ def compile_chunk_gated_delta_h(
             cu_view = _gview(cu_seqlens_tensor, None, (N_val + 1, 1), (1, 1))
             co_view = _gview(chunk_offsets_tensor, None, (N_val, 1), (1, 1))
 
-        # -- LDS -- every MMA operand panel is a view in the shape the tiled MMA
-        # expects (A as (M, K), B as (N, K)), so partition_S computes per-lane
-        # addresses once outside the chunk loop. K nests as (4, k_groups,
-        # panels): the inner 4 = one k_group = one MFMA operand = one b64, kept
-        # contiguous by the base=2 of every swizzle.
-        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
+        # Contiguous K4 groups permit hoisting partition_S addresses.
+        allocator = fx.SharedAllocator()
+        lds = allocator.allocate(SharedStorage).peek()
 
         KG_PER_BLOCK = 64 // 4  # k_groups per 64-K panel
 
@@ -240,13 +259,8 @@ def compile_chunk_gated_delta_h(
             fx.make_layout((BV, (4, BT // 4)), (4, (1, BV * 4))),
         )
 
-        # GEMM2 A -- k panels as (64, BT), one panel being k^T of a 64-K block:
-        # [64][BT] row-major + S<2,2,8> + S<4,2,4>, the layout form of HIP's
-        # ``k_panel_rotating_pair_addr_bytes``. Two swizzles because the store
-        # (K-row bits 3..5) and the MFMA A read (bits 0..3) must both stay
-        # conflict-free, folding six row bits into the four usable bits 3..6.
-        # Index with fx.slice: partition_S mishandles a NESTED composed layout
-        # and silently produces wrong addresses.
+        # Dual swizzles avoid store/read bank conflicts; partition_S misaddresses
+        # the nested layout, so use fx.slice.
         def _k_panel_view(kb, group):
             """k panel ``kb`` as (64, (group, BT/group)): same addresses either
             way -- group=4 is the MFMA A operand, group=2 the store pair."""
@@ -352,6 +366,14 @@ def compile_chunk_gated_delta_h(
             NT = (T_local + (BT - 1)) // BT
             boh = i_n * NT
 
+        if const_expr(phase == PHASE_BUILD_MAP or BLOCK_ENTRY_SEED):
+            last_block = chunk_base + block_nt == NT
+            bos = bos + chunk_base * BT
+            boh = boh + chunk_base
+            remaining = T_local - chunk_base * BT
+            T_local = (remaining < block_nt * BT).select(remaining, block_nt * BT)
+            NT = block_nt
+
         # Rows past the sequence end clamp to 0 rather than being masked -- with
         # max_size descriptors that is what keeps w / k / u in range.
         def _clamp_row(row):
@@ -387,22 +409,22 @@ def compile_chunk_gated_delta_h(
 
         if const_expr(WU_CONTIGUOUS):
             if const_expr(IS_VARLEN):
-                v_base = (i_h64 * t_flat64 + bos64) * V
+                v_base = (i_h64 * t_flat64 + bos64) * U_WIDTH
                 w_base = (i_h64 * t_flat64 + bos64) * K
             else:
-                v_base = ((i_n64 * H + i_h64) * t_flat64) * V
+                v_base = ((i_n64 * H + i_h64) * t_flat64) * U_WIDTH
                 w_base = ((i_n64 * H + i_h64) * t_flat64) * K
-            stride_v = V
+            stride_v = U_WIDTH
             stride_w = K
         else:
-            v_base = (bos64 * H + i_h64) * V
+            v_base = (bos64 * H + i_h64) * U_WIDTH
             w_base = (bos64 * H + i_h64) * K
-            stride_v = H * V
+            stride_v = H * U_WIDTH
             stride_w = H * K
         w_view = _gview(w_tensor, w_base, (T_local, K // VEC, VEC), (stride_w, VEC, 1))
         # u / v_new are accessed one element at a time, so their innermost mode
         # is a single element rather than a vector.
-        u_view = _gview(v_tensor, v_base, (T_local, V, 1), (stride_v, 1, 1))
+        u_view = _gview(v_tensor, v_base, (T_local, U_WIDTH, 1), (stride_v, 1, 1))
 
         if const_expr(IS_VARLEN):
             vn_base = (i_h64 * t_flat64 + bos64) * V
@@ -413,10 +435,22 @@ def compile_chunk_gated_delta_h(
         # h0/ht: the [V, K] state slot for this (state, head), K split into the
         # 4 contiguous elements of one state vector access.
         state_slot_base = fx.Int64(state_nh) * (V * K)
+        if const_expr(phase == PHASE_BUILD_MAP or BLOCK_ENTRY_SEED):
+            state_slot_base = (fx.Int64(block_id) * H + i_h64) * (V * K)
         if const_expr(USE_INITIAL_STATE):
-            h0_view = _gview(h0_tensor, state_slot_base, (V, K // 4, 4), (K, 4, 1))
+            if const_expr(BLOCK_ENTRY_SEED):
+                # Carry's [K,V] layout transposes the public state.
+                h0_view = _gview(
+                    h0_tensor, state_slot_base, (V, K // 4, 4, 1), (1, 4 * V, V, 1)
+                )
+            else:
+                h0_view = _gview(h0_tensor, state_slot_base, (V, K // 4, 4), (K, 4, 1))
         if const_expr(STORE_FINAL_STATE):
-            ht_view = _gview(ht_tensor, state_slot_base, (V, K // 4, 4), (K, 4, 1))
+            if const_expr(BLOCK_ENTRY_SEED):
+                ht_base = fx.Int64(state_nh) * (V * K)
+            else:
+                ht_base = state_slot_base
+            ht_view = _gview(ht_tensor, ht_base, (V, K // 4, 4), (K, 4, 1))
 
         # g strides (g_stride_h, g_stride_t): head-major [B, H, T_flat] is
         # (T_flat, 1), token-major [B, T_flat, H] is (1, H). varlen flattens to
@@ -456,24 +490,57 @@ def compile_chunk_gated_delta_h(
         for kb in range_constexpr(NUM_K_BLOCKS):
             frag_h_accs[kb].fill(0.0)
 
-        # h0 is [V, K], so 4 consecutive K are one buffer_load_dwordx4.
-        if const_expr(USE_INITIAL_STATE):
+        def _seed_accumulators(accs, seed_view, seed_copy, seed_num):
             for kb in range_constexpr(NUM_K_BLOCKS):
                 for slot in range_constexpr(N_REPEAT):
-                    h0_col, h0_kgroup = _state_coord(kb, slot)
-                    loaded_vec = _load_vec(
-                        cp_state_x4,
-                        fx.slice(h0_view, (h0_col, h0_kgroup, None)),
-                        4,
-                        state_num,
-                    )
-                    if const_expr(STATE_DTYPE_BF16):
+                    seed_col, seed_kgroup = _state_coord(kb, slot)
+                    if const_expr(BLOCK_ENTRY_SEED):
+                        loaded_vec = fx.Vector.from_elements(
+                            [
+                                _load_vec(
+                                    seed_copy,
+                                    fx.slice(
+                                        seed_view, (seed_col, seed_kgroup, j, None)
+                                    ),
+                                    1,
+                                    seed_num,
+                                )
+                                for j in range_constexpr(4)
+                            ],
+                            dtype=seed_num,
+                        )
+                    else:
+                        loaded_vec = _load_vec(
+                            seed_copy,
+                            fx.slice(seed_view, (seed_col, seed_kgroup, None)),
+                            4,
+                            seed_num,
+                        )
+                    if const_expr(seed_num == fx.BFloat16):
                         loaded_vec = loaded_vec.to(fx.Float32)
-                    _acc_cell = frag_h_accs[kb][None, None, slot]
+                    _acc_cell = accs[kb][None, None, slot]
                     _acc_cell.store(fx.Vector(_acc_cell.load()) + loaded_vec)
 
-        # Pipelined chunk loop: the prologue stages chunk 0's w/k, then each
-        # iteration prefetches the next chunk's w/k and publishes it at the end.
+        if const_expr(phase == PHASE_EMIT and USE_INITIAL_STATE):
+            if const_expr(BLOCK_ENTRY_SEED):
+                _seed_accumulators(frag_h_accs, h0_view, cp_f32, fx.Float32)
+            else:
+                _seed_accumulators(frag_h_accs, h0_view, cp_state_x4, state_num)
+        if const_expr(phase == PHASE_BUILD_MAP):
+            for kb in range_constexpr(NUM_K_BLOCKS):
+                for slot in range_constexpr(N_REPEAT):
+                    col, kgroup = _state_coord(kb, slot)
+                    elems = []
+                    for elem in range_constexpr(4):
+                        elems.append(
+                            (col == kgroup * 4 + elem).select(
+                                fx.Float32(1.0), fx.Float32(0.0)
+                            )
+                        )
+                    frag_h_accs[kb][None, None, slot].store(
+                        fx.Vector.from_elements(elems, dtype=fx.Float32)
+                    )
+
         GEMM1_PF_SPLIT = 1
         k_vec_group_pf = lane & 7
         k_row_base_pf = k_vec_group_pf * 8
@@ -545,10 +612,7 @@ def compile_chunk_gated_delta_h(
         c_one = fx.Int64(1)
         nt_idx = fx.Int64(NT)
 
-        # PROLOGUE: stage chunk 0's w/k under a block-uniform NT>0 guard -- an
-        # empty varlen sequence has bos == T_flat, so its clamped w/k address
-        # would run past the input, and skipping is correct since the loop then
-        # runs 0 times. Closures keep views/atoms out of the scf.if state.
+        # Empty requests would prefetch beyond the input despite clamping.
         has_work = NT > 0
         if has_work:
             _store_w_rows(_load_w_rows())
@@ -617,14 +681,14 @@ def compile_chunk_gated_delta_h(
                         fx.slice(sH, (hp_col, (None, row_block, kb))), acc_bf16
                     )
 
-                    if const_expr(SNAPSHOT_DTYPE_BF16):
+                    if const_expr(phase == PHASE_EMIT and SNAPSHOT_DTYPE_BF16):
                         # The sHT swizzle breaks bank conflicts on this scatter
                         # write while keeping a k_group contiguous -> one b64.
                         _lds_write_x4(
                             fx.slice(sHT, (hp_col, kb * 16 + row_block, None)), acc_bf16
                         )
 
-            if const_expr(not SNAPSHOT_DTYPE_BF16):
+            if const_expr(phase == PHASE_EMIT and not SNAPSHOT_DTYPE_BF16):
                 _snap_stage_round(0)
 
             # w/k for this chunk already in LDS (prologue or prev GEMM2 end).
@@ -638,18 +702,35 @@ def compile_chunk_gated_delta_h(
             # Issue every u / g load before GEMM1 so the 64-MFMA chain hides the
             # latency; left alone LLVM sinks them into the middle of GEMM1.
             u_cols = [i_v * BV + idx * 16 + lane_n for idx in range(N_REPEAT)]
-            u_prefetch = []  # N_REPEAT x 4 bf16 scalars
-            for idx in range_constexpr(N_REPEAT):
-                for elem_i in range_constexpr(4):
-                    safe_u_row = _clamp_row(_bt_abs_row(elem_i))
-                    u_prefetch.append(
-                        _load_vec(
-                            cp_bf16,
-                            fx.slice(u_view, (safe_u_row, u_cols[idx], None)),
-                            1,
-                            fx.BFloat16,
+            u_prefetch_reg = fx.make_rmem_tensor(N_REPEAT * 4, fx.BFloat16)
+
+            def _prefetch_u(col_offset, u_cols=u_cols, u_prefetch_reg=u_prefetch_reg):
+                values = []
+                for idx in range_constexpr(N_REPEAT):
+                    for elem_i in range_constexpr(4):
+                        safe_u_row = _clamp_row(_bt_abs_row(elem_i))
+                        values.append(
+                            _load_vec(
+                                cp_bf16,
+                                fx.slice(
+                                    u_view,
+                                    (safe_u_row, u_cols[idx] - col_offset, None),
+                                ),
+                                1,
+                                fx.BFloat16,
+                            )
                         )
-                    )
+                u_prefetch_reg.store(fx.Vector.from_elements(values, fx.BFloat16))
+
+            if const_expr(phase == PHASE_BUILD_MAP):
+                # A uniform guard avoids per-load branching.
+                if i_v < K // BV:
+                    u_prefetch_reg.fill(0.0)
+                else:
+                    _prefetch_u(K)
+            else:
+                _prefetch_u(0)
+            u_prefetch = fx.Vector(u_prefetch_reg.load())
 
             if const_expr(USE_G):
                 g_last = _load_vec(
@@ -713,14 +794,14 @@ def compile_chunk_gated_delta_h(
             for kb in range_constexpr(GEMM1_PF_SPLIT, NUM_K_BLOCKS):
                 _gemm1_kblock(kb)
 
-            if const_expr(not SNAPSHOT_DTYPE_BF16):
+            if const_expr(phase == PHASE_EMIT and not SNAPSHOT_DTYPE_BF16):
                 _snap_flush_round(0)
 
             # WAR barrier: GEMM1 is done reading the h_state panels, so gated_v
             # may now overwrite panel 1.
             gpu.barrier()
 
-            if const_expr(SNAP_ROUNDS > 1):
+            if const_expr(phase == PHASE_EMIT and SNAP_ROUNDS > 1):
                 _snap_stage_round(1)
 
             if const_expr(USE_G):
@@ -742,13 +823,27 @@ def compile_chunk_gated_delta_h(
                     )
                 gate_vec = fx.Vector.from_elements(mask_elems, dtype=fx.Float32)
 
+            def _subtract_u(u_prefetch=u_prefetch):
+                for idx in range_constexpr(N_REPEAT):
+                    bv_val = fx.Vector(frag_bv[None, None, idx].load())
+                    u_f32_elems = []
+                    for elem_i in range_constexpr(4):
+                        u_f32_elems.append(u_prefetch[idx * 4 + elem_i].to(fx.Float32))
+                    u_f32 = fx.Vector.from_elements(u_f32_elems, dtype=fx.Float32)
+                    frag_bv[None, None, idx].store(u_f32 - bv_val)
+
+            if const_expr(phase == PHASE_BUILD_MAP):
+                if i_v < K // BV:
+                    for idx in range_constexpr(N_REPEAT):
+                        bv_val = fx.Vector(frag_bv[None, None, idx].load())
+                        frag_bv[None, None, idx].store(-bv_val)
+                else:
+                    _subtract_u()
+            else:
+                _subtract_u()
+
             for idx in range_constexpr(N_REPEAT):
-                bv_val = fx.Vector(frag_bv[None, None, idx].load())
-                u_f32_elems = []
-                for elem_i in range_constexpr(4):
-                    u_f32_elems.append(u_prefetch[idx * 4 + elem_i].to(fx.Float32))
-                u_f32 = fx.Vector.from_elements(u_f32_elems, dtype=fx.Float32)
-                vn_val = u_f32 - bv_val
+                vn_val = fx.Vector(frag_bv[None, None, idx].load())
 
                 if const_expr(SAVE_NEW_VALUE):
                     vn_bf16 = _f32x4_to_bf16x4(vn_val)
@@ -802,10 +897,10 @@ def compile_chunk_gated_delta_h(
 
             # h snapshot store: the transpose buffer is read-only from here and
             # gated_v is in a different LDS region, so the two do not conflict.
-            if const_expr(SNAP_ROUNDS > 1):
+            if const_expr(phase == PHASE_EMIT and SNAP_ROUNDS > 1):
                 _snap_flush_round(1)
 
-            if const_expr(SNAPSHOT_DTYPE_BF16):
+            if const_expr(phase == PHASE_EMIT and SNAPSHOT_DTYPE_BF16):
                 K_VECS = K // LOAD_VEC_WIDTH
                 NUM_HT_VECS = BV * K_VECS
                 for vbase in range_constexpr(0, NUM_HT_VECS, BLOCK_THREADS):
@@ -871,23 +966,24 @@ def compile_chunk_gated_delta_h(
         # -- Epilogue -- acc_val is already f32x4 with element i at K offset i,
         # so the final state stores as one buffer_store_dwordx4.
         if const_expr(STORE_FINAL_STATE):
-            for kb in range_constexpr(NUM_K_BLOCKS):
-                for slot in range_constexpr(N_REPEAT):
-                    acc_val = fx.Vector(frag_h_accs[kb][None, None, slot].load())
-                    ht_col, ht_kgroup = _state_coord(kb, slot)
-                    if const_expr(STATE_DTYPE_BF16):
-                        out_vec = _f32x4_to_bf16x4(acc_val)
-                    else:
-                        out_vec = acc_val
-                    _store_vec(
-                        cp_state_x4,
-                        fx.slice(ht_view, (ht_col, ht_kgroup, None)),
-                        out_vec,
-                        4,
-                        state_num,
-                    )
+            write_final = last_block if BLOCK_ENTRY_SEED else fx.Int32(1) == 1
+            if write_final:
+                for kb in range_constexpr(NUM_K_BLOCKS):
+                    for slot in range_constexpr(N_REPEAT):
+                        acc_val = fx.Vector(frag_h_accs[kb][None, None, slot].load())
+                        ht_col, ht_kgroup = _state_coord(kb, slot)
+                        if const_expr(STATE_DTYPE_BF16):
+                            out_vec = _f32x4_to_bf16x4(acc_val)
+                        else:
+                            out_vec = acc_val
+                        _store_vec(
+                            cp_state_x4,
+                            fx.slice(ht_view, (ht_col, ht_kgroup, None)),
+                            out_vec,
+                            4,
+                            state_num,
+                        )
 
-    # -- Host launcher ------------------------------------------------------
     @flyc.jit
     def launch_gdn_h(
         k_tensor: fx.Tensor,
@@ -922,9 +1018,14 @@ def compile_chunk_gated_delta_h(
             cu_seqlens_tensor,
             chunk_offsets_tensor,
             state_indices_tensor,
+            state_indices_tensor,
+            state_indices_tensor,
+            state_indices_tensor,
+            N_val,
             T_val,
             T_flat,
             N_val,
+            PHASE,
         )
         launcher.launch(
             grid=(grid_v, grid_nh, 1),
@@ -932,12 +1033,66 @@ def compile_chunk_gated_delta_h(
             stream=stream,
         )
 
-    return launch_gdn_h
+    @flyc.jit
+    def launch_gdn_h_blocked(
+        k_tensor: fx.Tensor,
+        v_tensor: fx.Tensor,
+        w_tensor: fx.Tensor,
+        v_new_tensor: fx.Tensor,
+        g_tensor: fx.Tensor,
+        gk_tensor: fx.Tensor,
+        h_tensor: fx.Tensor,
+        h0_tensor: fx.Tensor,
+        ht_tensor: fx.Tensor,
+        cu_seqlens_tensor: fx.Tensor,
+        chunk_offsets_tensor: fx.Tensor,
+        state_indices_tensor: fx.Tensor,
+        block_seq_id_tensor: fx.Tensor,
+        block_chunk_base_tensor: fx.Tensor,
+        block_nchunks_tensor: fx.Tensor,
+        NB_val: fx.Int32,
+        T_val: fx.Int32,
+        T_flat: fx.Int32,
+        N_val: fx.Int32,
+        grid_v: fx.Int32,
+        grid_nh: fx.Int32,
+        stream: fx.Stream,
+    ):
+        gdn_h_kernel(
+            k_tensor,
+            v_tensor,
+            w_tensor,
+            v_new_tensor,
+            g_tensor,
+            gk_tensor,
+            h_tensor,
+            h0_tensor,
+            ht_tensor,
+            cu_seqlens_tensor,
+            chunk_offsets_tensor,
+            state_indices_tensor,
+            block_seq_id_tensor,
+            block_chunk_base_tensor,
+            block_nchunks_tensor,
+            NB_val,
+            T_val,
+            T_flat,
+            N_val,
+            PHASE,
+        ).launch(
+            grid=(grid_v, grid_nh, 1),
+            block=(BLOCK_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    return (
+        launch_gdn_h_blocked
+        if PHASE == PHASE_BUILD_MAP or BLOCK_ENTRY_SEED
+        else launch_gdn_h
+    )
 
 
-# NOTE: the host wrapper, BV autotune and kernel cache live in
-# ``aiter.ops.flydsl.linear_attention_prefill_kernels`` (no torch/triton here).
-# This file is the device kernel; sibling ``gdn_prepare.py`` is the prepare stage.
+# Host launch, autotuning and caching live in linear_attention_prefill_kernels.py.
 
 
 __all__ = ["compile_chunk_gated_delta_h"]
