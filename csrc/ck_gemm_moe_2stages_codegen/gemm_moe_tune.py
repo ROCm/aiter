@@ -34,6 +34,7 @@ from aiter.fused_moe import (
     cktile_moe_stage2,
     fused_moe,
     fused_topk,
+    get_padded_M,
     moe_sorting,
     torch_moe,
     torch_moe_stage1,
@@ -80,7 +81,7 @@ from aiter.ops.shuffle import (
     shuffle_weight_a16w4,
 )
 from aiter.utility import fp4_utils
-from aiter.utility.base_tuner import TunerCommon
+from aiter.utility.base_tuner import TunerCommon, _read_csv
 from aiter.utility.dtypes import str2ActivationType, str2Dtype
 from aiter.utility.fp4_utils import moe_mxfp4_sort
 from aiter.utility.mp_tuner import mp_tuner
@@ -484,6 +485,49 @@ class FmoeTuner(TunerCommon):
         if hasattr(fmoe_module, "get_2stage_cfgs"):
             fmoe_module.get_2stage_cfgs.cache_clear()
 
+    @staticmethod
+    def _normalize_tuning_tokens(untunedf, token_bucket_contract="runtime"):
+        """Use the same token buckets as the runtime config lookup.
+
+        ``fused_moe`` indexes tuned rows with ``get_padded_M(M)``.  Keeping a
+        raw non-power-of-two token count in the tuner input therefore creates a
+        row that the runtime can never select.  Tune the canonical bucket while
+        retaining the runtime's actual M handling when the kernel is launched.
+
+        The DP-shared expert path has a separate bucket contract and passes
+        ``token_bucket_contract="dp_shared"`` for its online tuning request.
+        Its caller has already converted the raw token count to that contract,
+        so this normalizer must leave the row unchanged.  A runtime bucket is a
+        representative benchmark size: for example, 65536 maps to the 32768
+        row for config lookup, while a serving call still keeps its raw M.
+        """
+        if token_bucket_contract == "dp_shared":
+            return untunedf
+        if token_bucket_contract != "runtime":
+            raise ValueError(f"unknown token bucket contract: {token_bucket_contract}")
+        if "token" not in untunedf.columns or untunedf.empty:
+            return untunedf
+        normalized = untunedf.copy()
+        normalized["token"] = normalized["token"].map(
+            lambda token: get_padded_M(int(token))
+        )
+        # Keep the newest row when an online request (for example raw M=96)
+        # canonicalizes to a row already present in the file (token=128).
+        # ``--last`` must then tune the request that was just appended.
+        return normalized.drop_duplicates(keep="last").reset_index(drop=True)
+
+    def get_untuned_gemm_list(self, untuned_gemm_file):
+        assert os.path.exists(
+            untuned_gemm_file
+        ), f"Not exist untuned file: {untuned_gemm_file}"
+        # The base reader keeps the first duplicate, losing an already-canonical
+        # request appended for --last before the normalizer can keep it.
+        untunedf = _read_csv(untuned_gemm_file).drop_duplicates(keep="last")
+        untunedf = untunedf.reset_index(drop=True)
+        return self._normalize_tuning_tokens(
+            untunedf, getattr(self, "_token_bucket_contract", "runtime")
+        )
+
     def _setup_specific_arguments(self):
 
         self.parser.add_argument(
@@ -491,6 +535,13 @@ class FmoeTuner(TunerCommon):
             action="store_true",
             required=False,
             help="Only last kernel is tuned, if not, only kernels that are not in the tuned_fmoe.csv are tuned",
+        )
+        self.parser.add_argument(
+            "--token-bucket-contract",
+            choices=("runtime", "dp_shared"),
+            default="runtime",
+            help="Token bucket contract used by the input rows. The dp_shared "
+            "online tuner uses its own 16-to-1024 contract.",
         )
         self.parser.add_argument(
             "--grouped-gemm",
@@ -513,6 +564,7 @@ class FmoeTuner(TunerCommon):
 
     def parse_args(self) -> argparse.Namespace:
         args = super().parse_args()
+        self._token_bucket_contract = args.token_bucket_contract
         # None distinguishes an omitted mode from an explicit prune request.
         if args.mxfp4_search_mode is not None and (
             not args.mxfp4_flydsl
