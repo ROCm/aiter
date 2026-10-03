@@ -1,350 +1,241 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Profile a selected kernel; only its case imports GPU and operator modules."""
+"""Worker: plans the search space (--plan) or benchmarks candidate configs on one GPU.
+
+Flow: set the kernel up once (inputs, call, should_skip), then
+  --plan     build the space (space.build_space) and write it as JSON for the driver
+  --configs  for each candidate: warm up (compiles) -> capture a CUDA graph over cold input
+             copies -> replay -> append one record to --out
+
+--configs is a JSON list of config dicts; null is the baseline, the wrapper called with
+config=None (the installed config). Records are appended as soon as a candidate finishes.
+
+Record fields:
+  status    ready (worker is set up), start (candidate began), ok, error
+  baseline  true for the installed config
+  config    the raw candidate, never the mutated copy; for the baseline the installed config
+            restricted to the DEFAULT.json keys (dropped_keys lists what was left out)
+  is_tuned  baseline only: a specialized file served this shape
+  us, us_min, us_max, tflops   per-launch time from graph replay (median, min, max)
+  error     the exception text when status is error
+  dur_s     wall time of the candidate
+"""
 
 import argparse
-from functools import partial
-from pathlib import Path
+import copy
+import gc
+import json
+import os
+import sys
+import time
 
-KERNEL_CONFIG_NAMES = {
-    "batched_gemm_bf16": "BATCHED_GEMM-A16W16",
-    "gemm_a16w16": "GEMM-A16W16",
-    "gemm_a16w16_atomic": "GEMM-A16W16-ATOMIC",
-    "gemm_a16w16_gated": "GEMM-A16W16-gated",
-    "gemm_a16w8_blockscale": "GEMM-A16W8_BLOCKSCALE",
-    "gemm_a16w8_blockscale_preshuffle": "GEMM-A16W8_BLOCKSCALE_PRESHUFFLED",
-    "gemm_a16wfp4": "GEMM-A16WFP4",
-    "gemm_a8w8": "GEMM-A8W8",
-    "gemm_a8w8_blockscale": "GEMM-A8W8_BLOCKSCALE",
-    "gemm_a8w8_blockscale_preshuffle": "GEMM-A8W8_BLOCKSCALE_PRESHUFFLED",
-    "gemm_a8w8_per_token_scale": "GEMM-A8W8_PER_TOKEN_SCALE",
-    "gemm_a8wfp4": "GEMM-A8WFP4",
-    "gemm_afp4wfp4": "GEMM-AFP4WFP4",
-    "gemm_afp4wfp4_pre_quant_atomic": "GEMM-A16WFP4",
-    "gemm_afp4wfp4_preshuffle": "GEMM-AFP4WFP4_PRESHUFFLED",
-    "gemm_afp8wfp8_preshuffle": "GEMM-AFP8WFP8_PRESHUFFLED",
-}
+from _utils import add_shape_args, append_record, shape_from_args
+from kernels import (
+    check_backend,
+    ensure_repo_on_path,
+    family_bounds,
+    flops,
+    get_spec,
+    resolve_installed,
+)
+from space import UnknownConfigKey, build_space, load_defaults
 
 
-def kernel_name(value):
-    """Accept kernel names and legacy harness filenames in the tuning CLIs."""
-    name = Path(value).stem.removeprefix("harness_")
-    if name not in KERNEL_CONFIG_NAMES:
-        raise argparse.ArgumentTypeError(
-            f"Unknown kernel {value!r}; choose from {list(KERNEL_CONFIG_NAMES)}"
+def make_cold_copies(inputs, cold_mb):
+    """copies[0] is the original input tuple; the rest are clones, within the byte budget."""
+    import torch
+
+    def clone(a):
+        if not isinstance(a, torch.Tensor):
+            return a
+        return torch.empty_strided(
+            a.shape, a.stride(), dtype=a.dtype, device=a.device
+        ).copy_(a)
+
+    per_copy = sum(
+        a.numel() * a.element_size() for a in inputs if isinstance(a, torch.Tensor)
+    )
+    budget = min(cold_mb << 20, torch.cuda.mem_get_info()[0] // 4)
+    n = max(1, min(64, budget // max(per_copy, 1)))
+    return [tuple(inputs)] + [tuple(clone(a) for a in inputs) for _ in range(n - 1)]
+
+
+def time_with_cuda_graph(call, config, copies, calls=24, replays=25):
+    """Median/min/max microseconds per launch: one eager warm-up (compiles), then graph replay.
+
+    Every launch gets a deep copy of config because the wrappers mutate it.
+    """
+    import torch
+
+    stream = torch.cuda.Stream()
+    n_calls = max(calls, len(copies))
+    with torch.cuda.stream(stream):
+        call(copy.deepcopy(config), *copies[0])
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        gc.disable()
+        try:
+            with torch.cuda.graph(graph, stream=stream):
+                for i in range(n_calls):
+                    call(copy.deepcopy(config), *copies[i % len(copies)])
+        finally:
+            gc.enable()
+    torch.cuda.synchronize()
+    for _ in range(3):
+        graph.replay()
+    torch.cuda.synchronize()
+    times = []
+    for _ in range(replays):
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
+            enable_timing=True
         )
-    return name
+        start.record()
+        graph.replay()
+        end.record()
+        end.synchronize()
+        times.append(start.elapsed_time(end) * 1e3 / n_calls)
+    times.sort()
+    return times[len(times) // 2], times[0], times[-1]
 
 
-def get_kernel_runner(kernel, input_shape):
-    """Create inputs once and bind them to the selected kernel's config argument."""
-    M, N, K = input_shape
+def gpu_alive():
+    import torch
 
-    match kernel:
-        case "batched_gemm_bf16":
-            import torch
+    try:
+        torch.cuda.synchronize()
+        (torch.ones(1, device="cuda") + 1).item()
+        return True
+    except Exception:  # noqa: BLE001
+        return False
 
-            from aiter.ops.triton.gemm.batched.batched_gemm_bf16 import (
-                batched_gemm_bf16,
+
+def plan(spec, shape, backend, arch, should_skip, space_out):
+    try:
+        configs, report = build_space(spec, shape, backend, arch, should_skip)
+    except UnknownConfigKey as e:
+        print(e, file=sys.stderr)
+        return 2
+    plan_ = dict(
+        report,
+        arch=arch,
+        backend=backend,
+        kernel=spec.name,
+        shape=shape,
+        bounds=list(family_bounds(spec, backend, shape)),
+        configs=configs,
+    )
+    with open(space_out, "w") as f:
+        json.dump(plan_, f)
+    return 0
+
+
+def benchmark(
+    spec, shape, backend, arch, call, inputs, candidates, out, calls, replays, cold_mb
+):
+    keys, _, _ = load_defaults(spec, backend)
+    copies = make_cold_copies(inputs, cold_mb)
+    common = {"kernel": spec.name, "backend": backend, "arch": arch, "shape": shape}
+    append_record(
+        out,
+        dict(
+            common, status="ready", n_copies=len(copies), calls=calls, replays=replays
+        ),
+    )
+    print("ready", flush=True)  # the driver's watchdog reads the worker's log
+    for candidate in candidates:
+        is_baseline = candidate is None
+        append_record(
+            out, dict(common, status="start", baseline=is_baseline, config=candidate)
+        )
+        record = dict(common, status="ok", baseline=is_baseline, config=candidate)
+        t0 = time.time()
+        try:
+            if is_baseline:
+                # the installed config, without keys that DEFAULT.json does not have:
+                # those are not tunable here and the kernel may not take them
+                installed, record["is_tuned"] = resolve_installed(spec, shape, backend)
+                dropped = sorted(k for k in installed if k not in keys)
+                candidate = {k: v for k, v in installed.items() if k in keys}
+                record["config"] = candidate
+                if dropped:
+                    record["dropped_keys"] = dropped
+            median, low, high = time_with_cuda_graph(
+                call, candidate, copies, calls, replays
             )
-            from op_tests.triton_tests.gemm.batched.test_batched_gemm_bf16 import (
-                generate_batched_gemm_a16w16_inputs,
+            record.update(
+                us=round(median, 3),
+                us_min=round(low, 3),
+                us_max=round(high, 3),
+                tflops=round(flops(shape) / median / 1e6, 2),
             )
-
-            dtype = torch.bfloat16
-            B = 8 if K == 4096 else 16
-            x, w, bias, y = generate_batched_gemm_a16w16_inputs(
-                B, M, N, K, dtype, output=True
+        except Exception as e:  # noqa: BLE001
+            # a failing candidate is a result, not a crash
+            record.update(
+                status="error",
+                error=f"{type(e).__name__}: {' '.join(str(e).split())[:300]}",
             )
-            return partial(batched_gemm_bf16, x, w, bias, dtype, YQ=y)
-
-        case "gemm_a16w16":
-            import torch
-
-            from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
-            from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import (
-                generate_gemm_a16w16_inputs,
+        record["dur_s"] = round(time.time() - t0, 1)
+        append_record(out, record)
+        print(record["status"], json.dumps(record["config"]), flush=True)
+        if record["status"] == "error" and not gpu_alive():
+            print(
+                f"GPU unusable after: {record['error']}; exiting for a clean restart",
+                file=sys.stderr,
             )
-
-            dtype = torch.bfloat16
-            x, w, bias, _, y = generate_gemm_a16w16_inputs(
-                M, N, K, dtype, output=True, bias=True
-            )
-            return partial(gemm_a16w16, x, w, bias, dtype, y)
-
-        case "gemm_a16w16_atomic":
-            import torch
-
-            from aiter.ops.triton.gemm.basic.gemm_a16w16_atomic import (
-                gemm_a16w16_atomic,
-            )
-            from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import (
-                generate_gemm_a16w16_inputs,
-            )
-
-            dtype = torch.bfloat16
-            x, w, _, _, y = generate_gemm_a16w16_inputs(M, N, K, dtype, output=True)
-
-            def run(config):
-                y.zero_()
-                gemm_a16w16_atomic(x, w, dtype, y, config=config)
-
-            return run
-
-        case "gemm_a16w16_gated":
-            import torch
-
-            from aiter.ops.triton.gemm.basic.gemm_a16w16_gated import gemm_a16w16_gated
-            from op_tests.triton_tests.gemm.basic.test_gemm_a16w16_gated import (
-                generate_gemm_a16w16_gated_inputs,
-            )
-
-            dtype = torch.bfloat16
-            x, w, _, y = generate_gemm_a16w16_gated_inputs(M, N, K, dtype, output=True)
-            return partial(gemm_a16w16_gated, x, w, dtype, y)
-
-        case "gemm_a16w8_blockscale" | "gemm_a16w8_blockscale_preshuffle":
-            import torch
-
-            from aiter.ops.triton.gemm.basic.gemm_a16w8_blockscale import (
-                gemm_a16w8_blockscale,
-                gemm_a16w8_blockscale_preshuffle,
-            )
-            from op_tests.triton_tests.gemm.basic.test_gemm_a16w8_blockscale import (
-                generate_gemm_a16w8_blockscale_inputs,
-            )
-
-            dtype = torch.bfloat16
-            shuffle = kernel == "gemm_a16w8_blockscale_preshuffle"
-            gemm = (
-                gemm_a16w8_blockscale_preshuffle if shuffle else gemm_a16w8_blockscale
-            )
-            x, _, w, w_scale, y = generate_gemm_a16w8_blockscale_inputs(
-                M, N, K, 128, 128, dtype=dtype, output=True, shuffle=shuffle
-            )
-            return partial(gemm, x, w, w_scale, dtype, y, prequant=False)
-
-        case "gemm_a16wfp4":
-            import torch
-
-            from aiter.ops.triton.gemm.basic.gemm_a16wfp4 import gemm_a16wfp4
-            from op_tests.triton_tests.gemm.basic.test_gemm_a16wfp4 import (
-                generate_gemm_a16wfp4_inputs,
-            )
-
-            dtype = torch.bfloat16
-            x, w, _, _, w_scales, _, y = generate_gemm_a16wfp4_inputs(
-                M,
-                N,
-                K,
-                output=True,
-                atomic_add=False,
-                dtype=dtype,
-                layout="TN",
-                shuffle=False,
-            )
-            return partial(gemm_a16wfp4, x, w, w_scales, False, dtype, y)
-
-        case "gemm_a8w8":
-            import torch
-
-            from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8
-            from aiter.ops.triton.utils.types import get_fp8_dtypes
-            from op_tests.triton_tests.gemm.basic.test_gemm_a8w8 import (
-                generate_gemm_a8w8_inputs,
-            )
-
-            _, fp8_dtype = get_fp8_dtypes()
-            dtype = torch.bfloat16
-            x, _, w, x_scale, w_scale, _, y = generate_gemm_a8w8_inputs(
-                M, N, K, in_dtype=fp8_dtype, out_dtype=dtype, layout="TN", output=True
-            )
-            return partial(gemm_a8w8, x, w, x_scale, w_scale, None, dtype, y)
-
-        case "gemm_a8w8_blockscale" | "gemm_a8w8_blockscale_preshuffle":
-            import torch
-
-            from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
-                gemm_a8w8_blockscale,
-                gemm_a8w8_blockscale_preshuffle,
-            )
-            from op_tests.triton_tests.gemm.basic.test_gemm_a8w8_blockscale import (
-                generate_gemm_a8w8_blockscale_inputs,
-            )
-
-            dtype = torch.bfloat16
-            shuffle = kernel == "gemm_a8w8_blockscale_preshuffle"
-            gemm = gemm_a8w8_blockscale_preshuffle if shuffle else gemm_a8w8_blockscale
-            x, _, w, _, x_scale, w_scale, y = generate_gemm_a8w8_blockscale_inputs(
-                M,
-                N,
-                K,
-                128,
-                128,
-                dtype=dtype,
-                layout="TN",
-                output=True,
-                shuffle=shuffle,
-            )
-            return partial(gemm, x, w, x_scale, w_scale, dtype, y)
-
-        case "gemm_a8w8_per_token_scale":
-            import torch
-
-            from aiter.ops.triton.gemm.basic.gemm_a8w8_per_token_scale import (
-                gemm_a8w8_per_token_scale,
-            )
-            from op_tests.triton_tests.gemm.basic.test_gemm_a8w8_per_token_scale import (
-                generate_gemm_a8w8_per_token_scale_inputs,
-            )
-
-            dtype = torch.bfloat16
-            x, w, x_scale, w_scale, y = generate_gemm_a8w8_per_token_scale_inputs(
-                M, N, K, dtype=dtype, layout="TN", output=True
-            )
-            return partial(gemm_a8w8_per_token_scale, x, w, x_scale, w_scale, dtype, y)
-
-        case "gemm_a8wfp4":
-            import torch
-
-            from aiter.ops.triton.gemm.basic.gemm_a8wfp4 import gemm_a8wfp4
-            from aiter.ops.triton.utils.types import get_fp8_dtypes
-            from op_tests.triton_tests.gemm.basic.test_gemm_a8wfp4 import (
-                generate_gemm_a8wfp4_inputs,
-            )
-
-            _, fp8_dtype = get_fp8_dtypes()
-            dtype = torch.float16
-            x, w, x_scales, w_scales, _, _, y = generate_gemm_a8wfp4_inputs(
-                M, N, K, fp8_dtype, dtype, layout="TN", output=True
-            )
-            return partial(gemm_a8wfp4, x, w, y, x_scales, w_scales, dtype)
-
-        case "gemm_afp4wfp4" | "gemm_afp4wfp4_preshuffle":
-            import torch
-
-            from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
-                gemm_afp4wfp4,
-                gemm_afp4wfp4_preshuffle,
-            )
-            from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
-                generate_gemm_afp4wfp4_inputs,
-            )
-
-            dtype = torch.bfloat16
-            shuffle = kernel == "gemm_afp4wfp4_preshuffle"
-            gemm = gemm_afp4wfp4_preshuffle if shuffle else gemm_afp4wfp4
-            x, _, w, _, _, x_scales, w_scales, _, y = generate_gemm_afp4wfp4_inputs(
-                M,
-                N,
-                K,
-                dtype,
-                output=True,
-                shuffle_scales_fg=shuffle,
-                shuffle_weight_fg=shuffle,
-            )
-            return partial(gemm, x, w, x_scales, w_scales, dtype, y)
-
-        case "gemm_afp4wfp4_pre_quant_atomic":
-            import torch
-
-            from aiter.ops.triton.gemm.basic.gemm_afp4wfp4_pre_quant_atomic import (
-                gemm_afp4wfp4_pre_quant,
-            )
-            from op_tests.triton_tests.gemm.basic.test_gemm_a16wfp4 import (
-                generate_gemm_a16wfp4_inputs,
-            )
-
-            dtype = torch.float32
-            x, w, _, _, w_scales, _, y = generate_gemm_a16wfp4_inputs(
-                M,
-                N,
-                K,
-                output=True,
-                atomic_add=True,
-                dtype=dtype,
-                layout="TN",
-                shuffle=False,
-            )
-            return partial(gemm_afp4wfp4_pre_quant, x, w, w_scales, dtype, y)
-
-        case "gemm_afp8wfp8_preshuffle":
-            import torch
-
-            from aiter.ops.triton.gemm.basic.gemm_afp8wfp8 import (
-                gemm_afp8wfp8_preshuffle,
-            )
-            from aiter.ops.triton.utils.types import get_fp8_dtypes
-            from op_tests.triton_tests.gemm.basic.test_gemm_afp8wfp8 import (
-                generate_inputs,
-            )
-
-            get_fp8_dtypes()
-            dtype = torch.bfloat16
-            x, _, w, x_scales, w_scales = generate_inputs(M, N, K, shuffle=True)
-            return partial(
-                gemm_afp8wfp8_preshuffle, x, w, x_scales, w_scales, dtype=dtype
-            )
-
-        case _:
-            raise ValueError(f"Unknown kernel: {kernel}")
-
-
-def _prepare_config(kernel, K, config):
-    """Apply kernel-specific config adjustments before the timed call."""
-    if config is None:
-        return None
-
-    match kernel:
-        case "batched_gemm_bf16" | "gemm_a16w16" | "gemm_a16w16_atomic" | "gemm_a8wfp4":
-            import triton
-
-            config = config.copy()
-            config["SPLITK_BLOCK_SIZE"] = triton.cdiv(K, config["NUM_KSPLIT"])
-        case "gemm_a16w16_gated":
-            config = config.copy()
-            config.pop("NUM_KSPLIT", None)
-            config.pop("SPLITK_BLOCK_SIZE", None)
-        case "gemm_a8w8" | "gemm_afp8wfp8_preshuffle":
-            from aiter.ops.triton.utils.gemm_config_utils import compute_splitk_params
-
-            compute_splitk_params(config, K)
-        case (
-            "gemm_a16w8_blockscale"
-            | "gemm_a16w8_blockscale_preshuffle"
-            | "gemm_a8w8_blockscale"
-            | "gemm_a8w8_blockscale_preshuffle"
-        ):
-            assert config["BLOCK_SIZE_K"] == 128
-
-    return config
-
-
-def get_profile_functions(kernel, input_shape, config_list):
-    """Reuse one set of inputs across all configs, preparing each outside profiling."""
-    run = get_kernel_runner(kernel, input_shape)
-    for config in config_list:
-        yield partial(run, config=_prepare_config(kernel, input_shape[2], config))
+            os._exit(3)
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("kernel", type=kernel_name, choices=KERNEL_CONFIG_NAMES)
-    parser.add_argument("M", type=int)
-    parser.add_argument("N", type=int)
-    parser.add_argument("K", type=int)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("kernel", type=get_spec)
+    add_shape_args(parser)
+    parser.add_argument("--backend", choices=("triton", "gluon"))
     parser.add_argument(
-        "configs", nargs="*", help="Ten values per candidate, in config_parms_key order"
+        "--plan", action="store_true", help="only build the search space"
+    )
+    parser.add_argument("--space-out", help="where --plan writes the space (JSON)")
+    parser.add_argument("--configs", help="JSON list of candidates, null = baseline")
+    parser.add_argument("--out", help="JSONL results file, appended")
+    parser.add_argument("--replays", type=int, default=25)
+    parser.add_argument(
+        "--calls", type=int, default=24, help="launches captured per graph"
+    )
+    parser.add_argument(
+        "--cold-mb", type=int, default=1024, help="byte budget for cold input copies"
     )
     args = parser.parse_args(argv)
 
-    from _utils import get_config_list, run_profile
+    spec = args.kernel
+    shape = shape_from_args(args, spec.dims)
+    ensure_repo_on_path()
+    from aiter.ops.triton.utils._triton import arch_info
 
-    for fn in get_profile_functions(
-        args.kernel, [args.M, args.N, args.K], get_config_list(args.configs)
-    ):
-        run_profile(fn)
+    arch = arch_info.get_arch()
+    backend = args.backend or spec.default_backend(arch)
+    check_backend(spec, arch, backend)
+    call, inputs, should_skip = spec.setup(shape, backend)
+
+    if args.plan:
+        return plan(spec, shape, backend, arch, should_skip, args.space_out)
+    with open(args.configs) as f:
+        candidates = json.load(f)
+    benchmark(
+        spec,
+        shape,
+        backend,
+        arch,
+        call,
+        inputs,
+        candidates,
+        args.out,
+        args.calls,
+        args.replays,
+        args.cold_mb,
+    )
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

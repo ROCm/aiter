@@ -1,97 +1,119 @@
-# Triton GEMM tuning scripts
+# Triton / Gluon GEMM tuning scripts
 
-Run every command from this directory. List the available kernel names with `python3 harness.py --help`.
+Run everything from this directory with `PYTHONPATH=<aiter root>` (the input generators live in
+`op_tests`). `python3 sweep_configs.py --help` lists the kernels.
 
-`sweep_configs.py`, `verify_configs.py`, and `write_best_configs.py` accept a kernel name in place of the old harness filename. They also accept legacy names such as `harness_gemm_a16w16.py`; existing `screen-harness_<kernel>.py-<M>-<N>-<K>.log` filenames are preserved. For direct profiling, use `harness.py <kernel> M N K ...`.
+The flow of one sweep: load the family's `DEFAULT.json` (which keys are tunable) -> generate
+all combinations from `SEARCH_SPACE` -> prune -> benchmark every survivor -> select the winner
+per M -> validate and install the config file.
+
+| Question | Answer |
+| --- | --- |
+| Where do I add a kernel? | One function in `kernels.py` decorated with `@kernel(...)`; the module docstring shows a complete example |
+| Where do I change candidate values? | `SEARCH_SPACE` in `space.py` |
+| Why was this config skipped? | `space.py`: the shape filters, `should_skip_generic` and `exceeds_lds`, plus the kernel's own `should_skip` in `kernels.py`. The driver prints how many combinations each rule removed |
+| How did this winner get installed? | `write_best_configs.py`: `load_winners` -> `assign_buckets` -> `build_table` -> `check_table` -> write -> confirmation through `get_gemm_config` |
 
 | File | What it does |
 | --- | --- |
-| `sweep_configs.py` | Profiles every candidate config for one `M N K` on one GPU and logs the runtimes to `screen-<harness>-<M>-<N>-<K>.log` |
-| `write_best_configs.py` | Picks the fastest config per `M` from those logs and writes `<arch>-<config name>-N=<N>-K=<K>.json` |
-| `verify_configs.py` | Profiles a harness with the configs installed in the config tree and prints the kernel name and runtime |
-| `parse_kernel_trace.py` | Reduces a `rocprofv3 --kernel-trace` CSV to the median kernel runtime per config; called by the scripts above |
-| `harness.py` | Selects a kernel by name, imports its dependencies inside that case, and runs each supplied config (or installed configs if none are given); the scripts above run it under `rocprofv3` |
-| `_utils.py` | Helpers shared by the harnesses and scripts |
+| `sweep_configs.py` | Driver: builds the search space for each M, times every candidate on one GPU, then installs the best configs into the config tree |
+| `harness.py` | Worker: `--plan` builds the space; otherwise times a JSON list of candidates with CUDA-graph replay and writes JSONL |
+| `write_best_configs.py` | Install step; the driver runs it, rerun it by hand to re-install from existing results |
+| `verify_configs.py` | Resolves the installed config for one shape through the real loader and times it |
+| `space.py` | `SEARCH_SPACE`: the candidate values per config key; the only place that decides what is swept |
+| `kernels.py` | One function per kernel: inputs, the launch, output resets, derived keys and its own `should_skip(config)` rules, registered with `@kernel(...)` (config family, backends, M bounds, element widths) |
+| `_utils.py` | Small helpers |
 
-Profiling a single config: `harness.py` takes a kernel name and `M N K` followed by the ten config values, in the order of `config_parms_key` in `_utils.py`:
+## Quick start
 
-    rocprofv3 --kernel-trace -f csv -o res -- python3 harness.py gemm_afp4wfp4 4 2112 7168 8 32 1024 1 2 1 1 16 0 7
-    python3 parse_kernel_trace.py res_kernel_trace.csv -k gemm
+    export PYTHONPATH=/path/to/aiter
+    python3 sweep_configs.py gemm_afp4wfp4_preshuffle --M 1536 --N 7168 --K 16384 --gpu 0
+    python3 sweep_configs.py gemm_afp4wfp4_preshuffle --all-buckets --N 7168 --K 16384 --gpu 0 1 2 3
+    python3 verify_configs.py gemm_afp4wfp4_preshuffle --M 64 --N 7168 --K 16384
 
-**Running the sweep**
+`--M` sweeps the listed M values; `--all-buckets` sweeps every M bucket of the family up to 4096
+(`TOP_BUCKET_M` in `_utils.py`); `any` is left as installed either way. Batched kernels take `--B`. `K` is the logical K, as the input generators take
+it (for fp4 families that is twice the byte width).
 
-Example 1: Tuning for A16W16 GEMM using default BLOCK_SIZE ranges using GPU 0, see sweep_configs.py for the default ranges
+`--gpu` takes one or more GPUs. With several, the candidates of each M are dealt round-robin to
+the GPUs, one serial worker per GPU; when all are done a final round re-times the installed
+baseline and the ten fastest candidates on the first GPU, so the winner is picked from numbers
+measured on one device. Never point two drivers at the same GPU.
 
-    python3 sweep_configs.py \
-        64 8192 3584 0 \
-        gemm_a16w16 \
-        > example1.out
+Suggested M lists: `GEMM-AFP4WFP4_PRESHUFFLED` 4 8 16 31 32 64 ... 8192 (31 is a bucket of its
+own because `BLOCK_SIZE_M` must be 16 or less below M=32); standard families 1 4 8 16 ... 8192;
+`GEMM-A16W16-gated` 64 128 256 512 2048.
 
-Example 2: Background tuning for A8W8 GEMM blockscale using specific `BLOCK_SIZE_K` ranges using GPU 0 ~ 6, because A8W8 blockscale gemm requires only `BLOCK_SIZE_K=128`
+## How the tunable keys are found
 
-    N=2112
-    K=7168
-    for M_G in "8 0" "16 1" "32 2" "64 3" "128 4" "256 5" "8192 6"; do
-        set -- $M_G
-        M=$1
-        G=$2
-        nohup python3 sweep_configs.py \
-            $M $N $K $G \
-            gemm_a8w8_blockscale \
-            --block-size-k-range 128 \
-            > example2-M=$M-N=$N-K=$K-G=$G.out &
-    done
+The keys are the union of the bucket keys in the kernel family's `DEFAULT.json`
+(`configs/<arch>/<backend>/gemm/<family>/DEFAULT.json`, read through the normal config loader).
+Every key must have an entry in `SEARCH_SPACE`; otherwise the run stops with
+`Unknown config key 'X' in ...: add it to SEARCH_SPACE in space.py first`. A key that only a
+specialized file carries is not tunable until it is in `DEFAULT.json`; the installed baseline
+is timed with such keys stripped (the record lists them as `dropped_keys`).
 
-Example 3: Background tuning for AFP4WFP4 GEMM. In this case `BLOCK_SIZE_M` has to meet the following requirements: `1) BLOCK_SIZE_M < 32 for M < 32, 2) BLOCK_SIZE_M >= 32 for M >= 32`. `BLOCK_SIZE_K` has to meet the following requirements: `BLOCK_SIZE_K >= 256`. If we still use the default settings, GEMM will give assertion errors, sweep_configs.py will skip those cases first time it hits assert errors and skip all other cases that shares the same BLOCK_SIZE. See the generated *.log files and terminal output (example3.out) for more details. It will take a few minutes for sweep_configs.py to skip through those failed configs, so if you want to save those few minutes, you have to set dedicated `--block-size-m-range` for each `M` to skip invalid `BLOCK_SIZE_M`. This example also enables verbose printout that shows the pre-pruned cases and the error messages that triggers exclusions of cases on-the-fly.
+## The search space
 
-    N=7168
-    K=2048
-    G=0
-    python3 sweep_configs.py \
-        64 $N $K $G \
-        gemm_afp4wfp4_preshuffle \
-        --block-size-k-range 256 512 1024 \
-        --overwrite \
-        --verbose \
-        > example3.out
+`SEARCH_SPACE` is always swept in full: the cartesian product of its lists for the discovered keys,
+minus shape filters (block sizes above the next power of two of the dimension, `NUM_KSPLIT` values
+that do not divide K), the generic rules in `space.py` (the old split-K pruning rules, applied only
+when the keys exist, and an LDS check: a block-size combination whose buffers x (A tile + B tile)
+exceed the arch's LDS is never compiled; each kernel declares its element widths as `bits=(a, b)`)
+and the kernel's own `should_skip(config)` in `kernels.py` (what the kernel asserts, and buffer
+counts its wrapper clamps so they would only repeat another candidate). Every rule returns True
+to reject.
+There are no command-line overrides: edit the table. A one-value list pins a key. Keys the wrapper
+never reads (`ignored_keys` in the spec) and `matrix_instr_nonkdim`/`kpack` under gluon stay at
+their `DEFAULT.json` value. The driver prints the candidates per key, the config count and an ETA
+before it starts, with the number of combinations each rule removed; a full Triton space (10 keys)
+is around 10^5 configs per M, a gluon family a few hundred to a few thousand.
 
-**Writing the JSON config files**
+## Backends
 
-`write_best_configs.py` prints the fastest config found for each `M` and names the JSON files after the config family the harness tunes, listed in `KERNEL_CONFIG_NAMES` in `harness.py` (`--json-prefix` overrides it).
+`--backend` defaults to what the wrapper picks on this arch (gluon on gfx1250 for the families that
+have a gluon kernel). Wrappers without a `backend=` argument, such as `gemm_afp4wfp4_preshuffle`,
+cannot be forced onto the other backend; the driver refuses.
 
-Example 1:
+## Timing
 
-    python3 write_best_configs.py gemm_a16w16 --n-list 8192 --k-list 3584
+Each candidate is launched once eagerly (this compiles it), then captured into a CUDA graph of 24
+launches that rotate over cold copies of the inputs (up to `--cold-mb`), replayed 25 times. The
+median per launch is recorded with min, max and TFLOPS. The installed config (`config=None`) is
+always timed first as the baseline. The numbers include dispatch gaps and both split-K kernels, so
+they are not comparable with the old rocprof logs.
 
-Example 2:
+## Results, resume, failures
 
-    N=2112
-    K=7168
-    python3 write_best_configs.py gemm_a8w8_blockscale --n-list $N --k-list $K
+Results go to `runs/sweep-<arch>-<backend>-<kernel>-[B=..-]M=..-N=..-K=..jsonl` (worker output in
+`<that file>.gpu<g>.log`), one JSON line per config: `config` (the raw candidate), `status` `ok` (`us`, `us_min`, `us_max`, `tflops`), `error`
+(the exception; the sweep continues), `crashed` or `hung` (the worker died or stalled on it; the
+driver restarts the worker on the remaining configs). The baseline record carries `is_tuned`.
+The full field list is in the `harness.py` docstring. Re-running the same command skips configs that already have a record;
+`--fresh` discards them. `--batch` is the number of configs per worker process, `--stall` the
+seconds a worker may spend on one candidate (a huge tile can compile for minutes) before it is
+killed, `--setup-timeout` the time allowed before a worker is ready.
 
-Example 3:
+## Install
 
-    N=7168
-    K=2048
-    python3 write_best_configs.py gemm_afp4wfp4_preshuffle --n-list $N --k-list $K
+When every M is done the driver writes `<CONFIG>-[B=..-]N=..-K=..json` into
+`configs/<arch>/<backend>/gemm/<family>/`, the directory the loader reads. The file is seeded with
+what the loader serves today, in its own lookup order: the installed file for that shape, for
+batched shapes the N/K file, else `DEFAULT.json`, so no bucket loses its tuning; the M bounds are
+the kernel's explicit bounds, else the seed file's `M_BOUNDS`, else the standard list. Each swept M
+replaces its `M_LEQ_<smallest family bound >= M>` bucket with the fastest `ok` record, the
+installed baseline included; when several swept Ms share a bucket the largest M wins. `any` is never
+modified and an M above the largest bound is not written. Every swept M is then re-read
+through `get_gemm_config` and must come back `is_tuned`; if not, the previous file is put back and
+the command fails.
+Config reads are cached per process, so restart Python to pick up a new file.
 
-**Verifying the configs**
+## Adding a kernel or a key
 
-To verify that your tuned JSON config files actually are performant and can be correctly picked up by AITER, first you have to copy the generated JSON config files into the config tree. Every family lives in one nested layout, `configs/<arch>/<backend>/<op>/<d_type>/` (`<path_to_aiter_root>/aiter/ops/triton/configs/CLAUDE.md` is the authoritative rulebook). Files there carry **no arch prefix** — the arch is the directory — and the default file is named exactly `DEFAULT.json`, so drop the arch prefix when copying:
-
-    cp gfx950-GEMM-AFP4WFP4_PRESHUFFLED-N=7168-K=2048.json \
-        <path_to_aiter_root>/aiter/ops/triton/configs/gfx950/triton/gemm/gemm_afp4wfp4_preshuffled/GEMM-AFP4WFP4_PRESHUFFLED-N=7168-K=2048.json
-
-`<d_type>` is the config name lowercased with dashes folded to underscores (`GEMM-AFP4WFP4_PRESHUFFLED` → `gemm_afp4wfp4_preshuffled`), and `<backend>` is `triton` unless you tuned the gluon kernel — the two backends read separate directories and never fall back to each other.
-
-Two gotchas: a family's `DEFAULT.json` must be in place before any specialized file resolves, and config reads are cached per path (including missing files), so restart the Python process after copying for the new files to be picked up.
-
-then, you can run, for example,
-
-    python3 verify_configs.py 32 2112 7168 gemm_a8w8_blockscale_preshuffle
-
-and check the kernel name (with config suffix) and runtime to see if both kernel name and runtime match those inside the JSON config files. If the kernel name and runtime do not match, it could be that your JSON file name is wrong. You have to go to the file where the kernel resides and check the `_get_config` function to check the `config_name` arguments.
-
-**Adding a harness**
-
-Add a `case` to `get_kernel_runner()` in `harness.py`: keep imports inside the case, generate inputs once, and return the kernel call with its inputs bound using `partial`. The shared `get_profile_functions()` loop supplies each config. Add any config adjustments to `_prepare_config()` so they run outside profiling. Add the kernel name to `KERNEL_CONFIG_NAMES` in the same file, using the `config_name` passed to `get_gemm_config`. No separate harness file is needed.
+Kernel: add one function to `kernels.py`, decorated with `@kernel(<config family>, ...)` giving the
+dims, the element widths, where the gluon path exists and the M bounds the kernel's `_get_config`
+passes. The function generates the inputs once and returns `(call, inputs, should_skip)`:
+`call(config, *inputs)` launches the public wrapper with `config=config` (and resets outputs or adds
+derived keys there), `should_skip(config)` returns True for configs the kernel would reject (or is
+`None`). The `kernels.py` docstring has a complete example. Key: add it to `SEARCH_SPACE` in
+`space.py`.

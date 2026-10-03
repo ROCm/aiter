@@ -1,425 +1,347 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+"""Driver: sweep the full search space for one kernel and shape, then install the winners.
+
+Flow, per M:   plan       harness.py --plan: load defaults, generate combinations, prune
+               benchmark  harness.py --configs ...: the candidates are dealt round-robin to the
+                          GPUs, one serial worker per GPU, with crash and hang recovery; with
+                          several GPUs a final round re-times the baseline and the ten fastest
+                          on the first GPU, so the winner is picked from same-device numbers
+               summary
+Afterwards:    install    write_best_configs.py: select winners, merge buckets, validate, write
+
+--all-buckets sweeps every M bucket of the family up to TOP_BUCKET_M (4096); "any" is left as
+installed. The driver never imports torch or aiter: every step is a subprocess that sees
+HIP_VISIBLE_DEVICES=<gpu>. It resumes from the records in --runs-dir.
+"""
+
 import argparse
+import glob
+import json
 import os
+import signal
 import subprocess
 import sys
-from itertools import product
+import time
+from concurrent.futures import ThreadPoolExecutor
 
-import triton
-from _utils import pre_pruning_rules
-from harness import kernel_name
+from _utils import (
+    FINAL_STATUSES,
+    TOP_BUCKET_M,
+    add_shape_args,
+    append_record,
+    config_key,
+    read_records,
+    results_path,
+    shape_from_args,
+    shape_tag,
+)
+from kernels import get_spec
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+FINAL_ROUND_SIZE = 10
 
 
-def echo_to_file(msg: str, filename: str, clear: bool = False):
-    if clear:
-        os.popen(f"echo '{msg}' > {filename}").read()
-    else:
-        os.popen(f"echo '{msg}' >> {filename}").read()
+def worker_command(spec, shape, backend, extra):
+    command = [sys.executable, os.path.join(HERE, "harness.py"), spec.name]
+    for d in spec.dims:
+        command += [f"--{d}", str(shape[d])]
+    if backend:
+        command += ["--backend", backend]
+    return command + extra
 
 
-def date_to_file(filename: str):
-    os.popen(f"date >> {filename}").read()
+def plan(spec, shape, backend, gpu, runs_dir):
+    space_file = os.path.join(runs_dir, f"plan-{spec.name}-{shape_tag(shape)}.json")
+    command = worker_command(
+        spec, shape, backend, ["--plan", "--space-out", space_file]
+    )
+    env = dict(os.environ, HIP_VISIBLE_DEVICES=str(gpu))
+    result = subprocess.run(
+        command, env=env, capture_output=True, text=True, check=False
+    )
+    if result.returncode:
+        message = result.stderr.strip() or result.stdout.strip() or "planning failed"
+        sys.exit(message.splitlines()[-1])
+    with open(space_file) as f:
+        return json.load(f)
 
 
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("M", type=int, help="M dim")
-    parser.add_argument("N", type=int, help="N dim")
-    parser.add_argument("K", type=int, help="K dim")
-    parser.add_argument("G", type=int, help="GPU card ID")
-    parser.add_argument(
-        "F", type=kernel_name, help="Kernel name (see harness.py --help)"
+def print_plan(plan_, shape):
+    print(
+        f"{plan_['kernel']} {plan_['backend']} {plan_['arch']} {shape}: keys from {plan_['default_path']}"
     )
-    parser.add_argument(
-        "--block-size-m-range",
-        nargs="+",
-        type=int,
-        help="BLOCK_SIZE_M range",
-        default=[],
-    )
-    parser.add_argument(
-        "--block-size-n-range",
-        nargs="+",
-        type=int,
-        help="BLOCK_SIZE_N range",
-        default=[],
-    )
-    parser.add_argument(
-        "--block-size-k-range",
-        nargs="+",
-        type=int,
-        help="BLOCK_SIZE_K range",
-        default=[],
-    )
-    parser.add_argument(
-        "--num-ksplit-range",
-        nargs="+",
-        type=int,
-        help="NUM_KSPLIT range (only included the elements by which K is divisible)",
-        default=[3, 4, 7, 8, 14, 16, 28],
-    )
-    parser.add_argument(
-        "--group-size-m-range",
-        nargs="+",
-        type=int,
-        help="GROUP_SIZE_M range",
-        default=[1, 4, 8],
-    )
-    parser.add_argument(
-        "--num-warps-range",
-        nargs="+",
-        type=int,
-        help="GROUP_SIZE_M range",
-        default=[1, 4, 8],
-    )
-    parser.add_argument(
-        "--num-stages-range",
-        nargs="+",
-        type=int,
-        help="GROUP_SIZE_M range",
-        default=[1, 2],
-    )
-    parser.add_argument(
-        "--waves-per-eu-range",
-        nargs="+",
-        type=int,
-        help="GROUP_SIZE_M range",
-        default=[1, 2, 4, 6, 8],
-    )
-    parser.add_argument(
-        "--matrix-instr-nonkdim-range",
-        nargs="+",
-        type=int,
-        help="matrix_instr_nonkdim range",
-        default=[16],
-    )
-    parser.add_argument(
-        "--cache-modifier-range",
-        nargs="+",
-        type=int,
-        help="cache_modifier range (0 = '.cg', 1 = null)",
-        default=[0, 1],
-    )
-    parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Force overwrite log files",
-        default=False,
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="verbose print",
-        default=False,
-    )
-    parser.add_argument(
-        "--timeout",
-        type=int,
-        help="Timeout in seconds per batch of rocprofv3 (default: 900)",
-        default=900,
+    for key, values in plan_["candidate_values"].items():
+        print(f"  {key}: {values}" + ("  (pinned)" if key in plan_["pinned"] else ""))
+    skipped = ", ".join(f"{n} by {why}" for why, n in plan_["skipped"].items())
+    print(
+        f"  {plan_['raw']} combinations, skipped {skipped} -> {plan_['final']} configs, "
+        f"~{plan_['final'] * 5 / 3600:.1f} GPU-hours at 5 s/config",
+        flush=True,
     )
 
-    args = parser.parse_args()
-    return args
 
+def run_worker_with_watchdog(command, env, log_path, stall, setup_timeout):
+    """Run the worker; kill its process group when its log stops growing.
 
-def main():
-    args = parse_args()
-    M = args.M
-    N = args.N
-    K = args.K
-    G = args.G
-    kernel = args.F
-    harness_filename = f"harness_{kernel}.py"  # Keep existing log filenames.
-    block_size_m_range = args.block_size_m_range
-    block_size_n_range = args.block_size_n_range
-    block_size_k_range = args.block_size_k_range
-    num_ksplit_range = args.num_ksplit_range
-    group_size_m_range = args.group_size_m_range
-    num_warps_range = args.num_warps_range
-    num_stages_range = args.num_stages_range
-    waves_per_eu_range = args.waves_per_eu_range
-    matrix_instr_nonkdim_range = args.matrix_instr_nonkdim_range
-    cache_modifier_range = args.cache_modifier_range
+    The worker prints "ready" once it is set up and one line per finished candidate. Until
+    "ready" the limit is setup_timeout (imports, inputs, first compile), afterwards stall seconds
+    per candidate. Returns (returncode, ready, killed).
+    """
 
-    force_overwrite = args.overwrite
-    verbose = args.verbose
-    batch_timeout = args.timeout
+    def size():
+        return os.path.getsize(log_path) if os.path.exists(log_path) else 0
 
-    assert M == triton.next_power_of_2(M), "M has to be power of 2"
-    assert all(
-        v == triton.next_power_of_2(v) for v in block_size_m_range
-    ), "All possible BLOCK_SIZE_M must be power of 2"
-    assert all(
-        v == triton.next_power_of_2(v) for v in block_size_n_range
-    ), "All possible BLOCK_SIZE_N must be power of 2"
-    assert all(
-        v == triton.next_power_of_2(v) for v in block_size_k_range
-    ), "All possible BLOCK_SIZE_K must be power of 2"
+    def became_ready():
+        with open(log_path) as f:
+            f.seek(start)
+            return any(line.startswith("ready") for line in f)
 
-    # default m, n, k, split-k range
-    if len(block_size_m_range) == 0:
-        block_size_m_range = [4, 8]
-        possible_ms = [16, 32, 64, 128, 256, 512]
-        block_size_m_range += [v for v in possible_ms if v <= M]
-
-    if len(block_size_n_range) == 0:
-        block_size_n_range = [16]
-        possible_ns = [32, 64, 128, 256]
-        block_size_n_range += [v for v in possible_ns if v <= N]
-
-    if len(block_size_k_range) == 0:
-        block_size_k_range = [128]
-        possible_ks = [256, 512, 1024]
-        block_size_k_range += [v for v in possible_ks if v <= K]
-
-    spk_range = [1]
-    for spk in num_ksplit_range:
-        if K % spk == 0 and spk not in spk_range:
-            spk_range.append(spk)
-
-    ############################################################
-    # # for AFP4WFP4_GEMM_preshuffe
-    # if M >= 256:
-    #     Ms = [32, 64, 128, 256]
-    # elif M >= 128:
-    #     Ms = [32, 64, 128]
-    # elif M >= 64:
-    #     Ms = [32, 64]
-    # elif M >= 32:
-    #     Ms = [32]
-    # else:
-    #     Ms = [4, 8, 16]
-    # Ns = [32, 64, 128]
-    # Ks = [256, 512, 1024]
-    ############################################################
-
-    ############################################################
-    # # for a8w8_GEMM_blockscale/a8w8_GEMM_blockscale_preshuffe/a16w8_GEMM_blockscale/a16w8_GEMM_blockscale_preshuffe, Ks can only be 128
-    # k_range = [128]
-    ############################################################
-
-    parms = {
-        "BLOCK_SIZE_M": block_size_m_range,
-        "BLOCK_SIZE_N": block_size_n_range,
-        "BLOCK_SIZE_K": block_size_k_range,
-        "GROUP_SIZE_M": group_size_m_range,
-        "num_warps": num_warps_range,
-        "num_stages": num_stages_range,
-        "waves_per_eu": waves_per_eu_range,
-        "matrix_instr_nonkdim": matrix_instr_nonkdim_range,
-        "cache_modifier": cache_modifier_range,
-        "NUM_KSPLIT": spk_range,
-    }
-    print("Raw tuning space:", flush=True)
-    for k, v in parms.items():
-        print(f"\t{k} = {v}", flush=True)
-
-    parms_comb_list = list(product(*parms.values()))
-    parms_comb_list_pruned = []
-    print()
-    print("Pre-pruning cases...", flush=True)
-    n_case_remove = 0
-    for config_list in parms_comb_list:
-        if pre_pruning_rules(M, N, K, config_list, verbose=verbose):
-            n_case_remove += 1
-            continue
-        parms_comb_list_pruned.append(config_list)
-    print(f"{n_case_remove} cases are removed during pre-pruning", flush=True)
-    print(f"Total number of cases to run: {len(parms_comb_list_pruned)}", flush=True)
-    print()
-    parms_comb_list = parms_comb_list_pruned
-    file_tag = f"{harness_filename}-{M}-{N}-{K}"
-    log_filename = f"screen-{file_tag}.log"
-    print(f"Screening results will be output to {log_filename}", flush=True)
-    print()
-    assert force_overwrite or not os.path.isfile(
-        log_filename
-    ), f"{log_filename} exists, please save your file somewhere else or use --overwrite to force overwrite log files"
-    s = " ".join([str(v) for v in parms])
-    echo_to_file(f"Number of combinations = {len(parms_comb_list)}", log_filename, True)
-    echo_to_file(f"{s}", log_filename)
-    i_comb_start = 0
-    comb_max_batch = int(os.environ.get("SCREEN_MAX_BATCH", "100"))
-    date_to_file(log_filename)
-    env = os.environ.copy()
-    env["HIP_VISIBLE_DEVICES"] = f"{G}"
-    exclude_mnk = {}
-    while i_comb_start < len(parms_comb_list):
-        skip_i_comb_start = i_comb_start
-        skip_i_comb_end = i_comb_start
-        while (
-            i_comb_start < len(parms_comb_list)
-            and tuple(parms_comb_list[i_comb_start][0:3]) in exclude_mnk
-        ):
-            skip_i_comb_end = i_comb_start
-            i_comb_start += 1
-        if skip_i_comb_end > skip_i_comb_start:
-            mnk_str = f"(BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K) = {parms_comb_list[skip_i_comb_start][:3]}"
-            print(
-                f"Skipping case {skip_i_comb_start} ~ {skip_i_comb_end}: {mnk_str}",
-                flush=True,
-            )
-        if i_comb_start >= len(parms_comb_list):
-            break
-        i_comb_end = i_comb_start + 1
-        while (
-            i_comb_end < len(parms_comb_list)
-            and i_comb_end - i_comb_start < comb_max_batch
-            and parms_comb_list[i_comb_start][0:3] == parms_comb_list[i_comb_end][0:3]
-        ):
-            i_comb_end += 1
-
-        mnk_str = f"(BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K) = {parms_comb_list[i_comb_start][:3]}"
-        print(f"Running case {i_comb_start} ~ {i_comb_end - 1}: {mnk_str}", flush=True)
-        echo_to_file(
-            f"Running case {i_comb_start} ~ {i_comb_end - 1}: {mnk_str}", log_filename
+    start = last = size()
+    t_last = time.time()
+    ready = False
+    with open(log_path, "a") as log:
+        proc = subprocess.Popen(
+            command,
+            env=env,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
         )
-        comb_str = ""
-        for a_comb in parms_comb_list[i_comb_start:i_comb_end]:
-            comb_str += " ".join([str(v) for v in a_comb])
-            comb_str += " "
-        comb_str = comb_str.strip()
+        while proc.poll() is None:
+            time.sleep(2)
+            if size() != last:
+                last, t_last = size(), time.time()
+                ready = ready or became_ready()
+            if time.time() - t_last > (stall if ready else setup_timeout):
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait()
+                return proc.returncode, ready, True
+    return proc.returncode, ready or became_ready(), False
 
-        cmd = [
-            "rocprofv3",
-            "--kernel-trace",
-            "-f",
-            "csv",
-            "-o",
-            f"res-{file_tag}",
-            "--",
-            sys.executable,
-            os.path.join(os.path.dirname(__file__), "harness.py"),
-            kernel,
-            str(M),
-            str(N),
-            str(K),
-            *comb_str.split(),
+
+def run_batch(spec, shape, backend, batch, out, gpu, args):
+    """One worker process on one GPU for these candidates; marks the candidate it died on."""
+    env = dict(os.environ, HIP_VISIBLE_DEVICES=str(gpu))
+    todo_file, log_path = f"{out}.gpu{gpu}.todo.json", f"{out}.gpu{gpu}.log"
+    with open(todo_file, "w") as f:
+        json.dump(batch, f)
+    command = worker_command(
+        spec,
+        shape,
+        backend,
+        [
+            "--replays",
+            str(args.replays),
+            "--calls",
+            str(args.calls),
+            "--cold-mb",
+            str(args.cold_mb),
+            "--configs",
+            todo_file,
+            "--out",
+            out,
+        ],
+    )
+    rc, ready, killed = run_worker_with_watchdog(
+        command, env, log_path, args.stall, args.setup_timeout
+    )
+    if rc == 0:
+        return
+    if not ready:
+        sys.exit(
+            f"worker on gpu {gpu} failed before it was ready (rc={rc}); see {log_path}"
+        )
+    records, _ = read_records(out)
+    for (
+        candidate
+    ) in batch:  # a start marker without a final record: the one the worker died on
+        if records.get(config_key(candidate), {}).get("status") == "start":
+            status = "hung" if killed else "crashed"
+            append_record(
+                out,
+                {
+                    "status": status,
+                    "baseline": candidate is None,
+                    "config": candidate,
+                    "error": f"worker rc={rc}",
+                },
+            )
+            print(f"  gpu {gpu}: {status}: {json.dumps(candidate)}", flush=True)
+
+
+def benchmark_shard(spec, shape, backend, candidates, out, gpu, args):
+    """Run every candidate of this shard that has no final record yet, in batches, on one GPU."""
+    while True:
+        records, _ = read_records(out)
+        todo = [
+            c
+            for c in candidates
+            if records.get(config_key(c), {}).get("status") not in FINAL_STATUSES
         ]
-
-        rocprof_filename = f"res-{file_tag}_kernel_trace.csv"
-
-        if os.path.isfile(rocprof_filename):
-            process = subprocess.Popen(
-                ["rm", rocprof_filename],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            process.communicate()
-
-        process = subprocess.Popen(
-            cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        if not todo:
+            return
+        print(
+            f"  gpu {gpu}: {len(candidates) - len(todo)}/{len(candidates)} done, "
+            f"running {min(len(todo), args.batch)}",
+            flush=True,
         )
-        try:
-            stdout_data, stderr_data = process.communicate(timeout=batch_timeout)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            stdout_data, stderr_data = process.communicate()
-            if verbose:
-                print(
-                    f"[Error]: rocprofv3 timed out after {batch_timeout}s for {mnk_str}",
-                    flush=True,
-                )
-            stderr_data = "TimeoutExpired"
+        run_batch(spec, shape, backend, todo[: args.batch], out, gpu, args)
 
-        if process.returncode == 0:
-            if os.path.isfile(rocprof_filename):
-                cmd_parse = f"python3 parse_kernel_trace.py {rocprof_filename} -k gemm"
-                cmd_parse = cmd_parse.split(" ")
-                process = subprocess.Popen(
-                    cmd_parse, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-                )
-                stdout_data, stderr_data = process.communicate()
-                if process.returncode == 0:
-                    prof_output = stdout_data.split("\n")
-                    if prof_output[-1].strip() == "":
-                        prof_output.pop()
-                    number_of_kernel_runtime = prof_output.count("Kernel detected:")
-                    assert (i_comb_end - i_comb_start) == number_of_kernel_runtime
 
-                    prof_output_i = 0
+def benchmark(spec, shape, backend, candidates, out, gpus, args):
+    """Deal the candidates to the GPUs; with several GPUs, re-time the fastest on the first one."""
+    shards = [candidates[i :: len(gpus)] for i in range(len(gpus))]
+    with ThreadPoolExecutor(len(gpus)) as pool:
+        futures = [
+            pool.submit(benchmark_shard, spec, shape, backend, shard, out, gpu, args)
+            for shard, gpu in zip(shards, gpus)
+        ]
+        for future in futures:
+            future.result()
+    if len(gpus) > 1:
+        records, _ = read_records(out)
+        ok = sorted(
+            (
+                r
+                for r in records.values()
+                if r["status"] == "ok" and not r.get("baseline")
+            ),
+            key=lambda r: r["us"],
+        )
+        fastest = [r["config"] for r in ok[:FINAL_ROUND_SIZE]]
+        print(
+            f"  final round on gpu {gpus[0]}: re-timing the baseline and the {len(fastest)} fastest",
+            flush=True,
+        )
+        run_batch(spec, shape, backend, [None] + fastest, out, gpus[0], args)
 
-                    for a_comb in parms_comb_list[i_comb_start:i_comb_end]:
-                        s = " ".join([str(v) for v in a_comb])
-                        echo_to_file(f"screencase {s}", log_filename)
-                        assert prof_output[prof_output_i] == "Kernel detected:"
-                        prof_output_i += 1
-                        while (
-                            prof_output_i < len(prof_output)
-                            and prof_output[prof_output_i] != "Kernel detected:"
-                        ):
-                            echo_to_file(prof_output[prof_output_i], log_filename)
-                            prof_output_i += 1
-                else:
-                    if verbose:
-                        print(f"[Error]: {rocprof_filename} reading error:", flush=True)
-                        for stderr_str in stderr_data:
-                            print(f"\t{stderr_str}", flush=True)
-            else:
-                if verbose:
-                    print(f"[Error]: {rocprof_filename} not found", flush=True)
-        else:
-            stderr_data = stderr_data.split("\n")
-            if verbose:
-                print("[Error]: when running rocprof, error message:", flush=True)
-            # Determine if this is a block-size-dependent error (exclude block)
-            # or a param-specific error (skip batch, don't exclude block)
-            is_block_size_error = False
-            for i_line, aline in enumerate(stderr_data):
-                if (
-                    "exceeds triton maximum tensor numel" in aline
-                    or "OutOfResources" in aline
-                ):
-                    is_block_size_error = True
-                    if verbose:
-                        print("\t...", flush=True)
-                        for j_line in range(
-                            max(0, i_line - 5), min(len(stderr_data), i_line + 5)
-                        ):
-                            print(f"\t{stderr_data[j_line]}", flush=True)
-                        print("\t...", flush=True)
-                    break
-                elif (
-                    "PassManager::run failed" in aline
-                    or "RuntimeError" in aline
-                    or "AssertionError" in aline
-                    or "TimeoutExpired" in aline
-                ):
-                    # Compilation or runtime error for specific param combo,
-                    # not necessarily all configs with this block size
-                    if verbose:
-                        print(
-                            "\tParam-specific error (not excluding block size):",
-                            flush=True,
-                        )
-                        for j_line in range(
-                            max(0, i_line - 5), min(len(stderr_data), i_line + 5)
-                        ):
-                            print(f"\t{stderr_data[j_line]}", flush=True)
-                    break
-            else:
-                if verbose:
-                    print("\tUn-identified error:", flush=True)
-                    for stderr_str in stderr_data:
-                        print(f"\t{stderr_str}", flush=True)
 
-            if is_block_size_error:
-                exclude_mnk[tuple(parms_comb_list[i_comb_start][:3])] = 1
-                if verbose:
-                    print(f"Excluding all {mnk_str} cases", flush=True)
-                    print()
-            else:
-                if verbose:
-                    print(
-                        f"Skipping batch {i_comb_start}~{i_comb_end-1} (block size NOT excluded)",
-                        flush=True,
-                    )
-                    print()
+def summarize(out, candidates):
+    records, _ = read_records(out)
+    baseline = records.get("baseline", {})
+    if baseline.get("status") == "ok":
+        print(
+            f"  baseline (installed, is_tuned={baseline.get('is_tuned')}): "
+            f"{baseline['us']:.3f} us  {json.dumps(baseline['config'])}"
+        )
+    ok = sorted(
+        (r for r in records.values() if r["status"] == "ok" and not r.get("baseline")),
+        key=lambda r: r["us"],
+    )
+    for record in ok[:10]:
+        print(
+            f"  {record['us']:10.3f} us  {record['tflops']:8.1f} TFLOPS  {json.dumps(record['config'])}"
+        )
+    counts = {}
+    for candidate in candidates:
+        status = records.get(config_key(candidate), {}).get("status", "missing")
+        counts[status] = counts.get(status, 0) + 1
+    print(f"  {counts}", flush=True)
 
-        i_comb_start = i_comb_end
-        date_to_file(log_filename)
-    echo_to_file("Screen complete", log_filename)
+
+def install(spec, args, backend, gpu):
+    command = [
+        sys.executable,
+        os.path.join(HERE, "write_best_configs.py"),
+        spec.name,
+        "--N",
+        str(args.N),
+        "--K",
+        str(args.K),
+    ]
+    if "B" in spec.dims:
+        command += ["--B", str(args.B)]
+    command += ["--backend", backend, "--runs-dir", args.runs_dir]
+    print("\ninstalling:", " ".join(command[1:]), flush=True)
+    env = dict(os.environ, HIP_VISIBLE_DEVICES=str(gpu))
+    return subprocess.run(command, env=env, check=False).returncode
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("kernel", type=get_spec)
+    add_shape_args(parser, with_m=False)
+    parser.add_argument("--M", type=int, nargs="+", help="M values to sweep")
+    parser.add_argument(
+        "--all-buckets",
+        action="store_true",
+        help=f"sweep every M bucket of the family up to {TOP_BUCKET_M}",
+    )
+    parser.add_argument(
+        "--gpu",
+        type=int,
+        nargs="+",
+        required=True,
+        help="GPUs to use; candidates are dealt round-robin, one serial worker per GPU",
+    )
+    parser.add_argument(
+        "--backend",
+        choices=("triton", "gluon"),
+        help="default: what the wrapper picks on this arch",
+    )
+    parser.add_argument("--runs-dir", default=os.path.join(HERE, "runs"))
+    parser.add_argument(
+        "--batch", type=int, default=100, help="configs per worker process"
+    )
+    parser.add_argument(
+        "--stall",
+        type=int,
+        default=300,
+        help="seconds without a finished candidate before a worker is killed",
+    )
+    parser.add_argument(
+        "--setup-timeout",
+        type=int,
+        default=600,
+        help="seconds allowed before a worker is ready",
+    )
+    parser.add_argument("--replays", type=int, default=25)
+    parser.add_argument("--calls", type=int, default=24)
+    parser.add_argument("--cold-mb", type=int, default=1024)
+    parser.add_argument(
+        "--fresh", action="store_true", help="discard existing records for these shapes"
+    )
+    args = parser.parse_args(argv)
+    if bool(args.M) == args.all_buckets:
+        parser.error("give --M values or --all-buckets, not both")
+
+    spec = args.kernel
+    gpus = args.gpu
+    os.makedirs(args.runs_dir, exist_ok=True)
+
+    Ms = args.M
+    if (
+        args.all_buckets
+    ):  # every bucket of the family up to TOP_BUCKET_M; "any" stays as installed
+        bounds = plan(
+            spec,
+            shape_from_args(args, spec.dims, 1),
+            args.backend,
+            gpus[0],
+            args.runs_dir,
+        )["bounds"]
+        Ms = [b for b in bounds if b <= TOP_BUCKET_M]
+        print(f"all buckets: M = {Ms}", flush=True)
+
+    for M in Ms:
+        shape = shape_from_args(args, spec.dims, M)
+        plan_ = plan(spec, shape, args.backend, gpus[0], args.runs_dir)
+        backend = plan_["backend"]
+        print_plan(plan_, shape)
+
+        out = results_path(args.runs_dir, plan_["arch"], backend, spec.name, shape)
+        if args.fresh:
+            for path in [out] + glob.glob(out + ".*"):
+                os.remove(path)
+        candidates = [None] + plan_["configs"]  # None is the installed baseline
+        print(f"  results: {out}", flush=True)
+        benchmark(spec, shape, backend, candidates, out, gpus, args)
+        summarize(out, candidates)
+
+    return install(spec, args, backend, gpus[0])
 
 
 if __name__ == "__main__":
