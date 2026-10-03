@@ -34,6 +34,7 @@ _TDM_MAX_PAD_INTERVAL_BYTES = 1024
 @flyc.jit
 def launch_gemm_a8w8(
     arg_c: fx.Pointer,
+    arg_v: fx.Pointer,
     arg_a: fx.Pointer,
     arg_b: fx.Pointer,
     arg_scale_a: fx.Pointer,
@@ -45,6 +46,7 @@ def launch_gemm_a8w8(
     stride_ascale_k: fx.Int32,
     i32_lda: fx.Int32,
     i32_ldc: fx.Int32,
+    i32_ldv: fx.Int32,
     tile_m: Constexpr[int],
     tile_n: Constexpr[int],
     tile_k: Constexpr[int],
@@ -61,6 +63,7 @@ def launch_gemm_a8w8(
     preload_ks: Constexpr[int] = 0,
     batch: fx.Int32 = 1,
     a_preshuffle: Constexpr[bool] = False,
+    kimi_kv_split: Constexpr[bool] = False,
 ):
     mx32 = is_mxscale and block_size == 32
     mx128 = is_mxscale and block_size == 128
@@ -75,6 +78,11 @@ def launch_gemm_a8w8(
     if a_preshuffle and tile_m % 2 != 0:
         raise ValueError(
             f"[FlyDSL gfx1250] a_preshuffle needs an even tile_m, got {tile_m}"
+        )
+    if kimi_kv_split and (tile_n != 256 or split_k != 1 or batched):
+        raise ValueError(
+            "[FlyDSL gfx1250] Kimi split epilogue needs tile_n=256, "
+            f"split_k=1 and batched=False; got {tile_n=}, {split_k=}, {batched=}"
         )
     if batched and not (mx128 and split_k == 1):
         raise ValueError(
@@ -174,6 +182,7 @@ def launch_gemm_a8w8(
     @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
     def kernel_gemm_a8w8(
         arg_c: fx.Pointer,
+        arg_v: fx.Pointer,
         arg_a: fx.Pointer,
         arg_b: fx.Pointer,
         arg_scale_a: fx.Pointer,
@@ -184,6 +193,7 @@ def launch_gemm_a8w8(
         i32_stride_ascale_k: fx.Int32,
         i32_lda: fx.Int32,
         i32_ldc: fx.Int32,
+        i32_ldv: fx.Int32,
     ):
         K_TILES = i32_k // (tile_k * split_k)
         k64 = fx.Int64(i32_k)
@@ -243,6 +253,9 @@ def launch_gemm_a8w8(
         gB_base = fx.recast_iter(fx.Int8, arg_b)
         gC_base = fx.recast_iter(
             fx.PointerType.get(out_cls.ir_type, arg_c.address_space), arg_c
+        )
+        gV_base = fx.recast_iter(
+            fx.PointerType.get(out_cls.ir_type, arg_v.address_space), arg_v
         )
         a_off0 = blk_m64 * lda64
         b_off0 = blk_n64 // 16 * (k64 * 16)
@@ -770,24 +783,67 @@ def launch_gemm_a8w8(
                     h.bitcast(fx.Int8), base_ptr + (row_rel * C_LDS_ROW + col_rel) * 2
                 )
         workgroup_barrier(use_cluster=False)
-        c_off_rt = blk_m64 * ldc64 + blk_n64
-        if const_expr(batched):
-            c_off_rt = c_off_rt + bz64 * fx.Int64(i32_n)
-        if const_expr(split_k > 1):
-            c_off_rt = c_off_rt + fx.Int64(bid_z) * fx.Int64(i32_m) * ldc64
-        gtC = _gv(gC_base, c_off_rt, (tile_m, C_LDS_ROW), (C_LDS_ROW, 1))
-        atomC = fx.rocdl.make_tdm_atom(
-            gtC,
-            [mn_oob, tile_n if C_PAD else None],
-            strides=[ldc64, None],
-            num_warps=num_waves,
-            early_timeout=False,
+        lC = _lv(
+            fx.recast_iter(out_cls, base_ptr),
+            (tile_m, C_LDS_ROW),
+            (C_LDS_ROW, 1),
         )
-        fx.copy(
-            atomC,
-            _lv(fx.recast_iter(out_cls, base_ptr), (tile_m, C_LDS_ROW), (C_LDS_ROW, 1)),
-            gtC,
-        )
+        if const_expr(kimi_kv_split):
+            head = bid_y
+            ldv64 = fx.Int64(i32_ldv)
+            gtK = _gv(
+                gC_base,
+                blk_m64 * ldc64 + fx.Int64(head * 192),
+                (tile_m, 128),
+                (128, 1),
+            )
+            gtV = _gv(
+                gV_base,
+                blk_m64 * ldv64 + fx.Int64(head * 128),
+                (tile_m, 128),
+                (128, 1),
+            )
+            atomK = fx.rocdl.make_tdm_atom(
+                gtK,
+                [mn_oob, None],
+                strides=[ldc64, None],
+                num_warps=num_waves,
+                early_timeout=False,
+            )
+            atomV = fx.rocdl.make_tdm_atom(
+                gtV,
+                [mn_oob, None],
+                strides=[ldv64, None],
+                num_warps=num_waves,
+                early_timeout=False,
+            )
+            lK = _lv(
+                fx.recast_iter(out_cls, base_ptr),
+                (tile_m, 128),
+                (C_LDS_ROW, 1),
+            )
+            lV = _lv(
+                fx.add_offset(fx.recast_iter(out_cls, base_ptr), 128),
+                (tile_m, 128),
+                (C_LDS_ROW, 1),
+            )
+            fx.copy(atomK, lK, gtK)
+            fx.copy(atomV, lV, gtV)
+        else:
+            c_off_rt = blk_m64 * ldc64 + blk_n64
+            if const_expr(batched):
+                c_off_rt = c_off_rt + bz64 * fx.Int64(i32_n)
+            if const_expr(split_k > 1):
+                c_off_rt = c_off_rt + fx.Int64(bid_z) * fx.Int64(i32_m) * ldc64
+            gtC = _gv(gC_base, c_off_rt, (tile_m, C_LDS_ROW), (C_LDS_ROW, 1))
+            atomC = fx.rocdl.make_tdm_atom(
+                gtC,
+                [mn_oob, tile_n if C_PAD else None],
+                strides=[ldc64, None],
+                num_warps=num_waves,
+                early_timeout=False,
+            )
+            fx.copy(atomC, lC, gtC)
         tdm_ops.tensor_wait(0)
 
     gx = (i32_m + (tile_m - 1)) // tile_m
@@ -797,6 +853,7 @@ def launch_gemm_a8w8(
     cluster_arg = (cluster_m, cluster_n, 1) if use_cluster else None
     kernel_gemm_a8w8(
         arg_c,
+        arg_v,
         arg_a,
         arg_b,
         arg_scale_a,
@@ -807,6 +864,7 @@ def launch_gemm_a8w8(
         stride_ascale_k,
         i32_lda,
         i32_ldc,
+        i32_ldv,
         value_attrs={
             "rocdl.cluster_dims": f"{cluster_m},{cluster_n},1" if use_cluster else None
         },

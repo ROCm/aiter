@@ -290,6 +290,7 @@ def run_bmm_a8w8_mxfp8_128_gfx1250(
     _run_compiled(
         _launch_gemm_a8w8,
         _ptr_arg(Out),
+        _ptr_arg(Out),
         _ptr_arg(XQ),
         _ptr_arg(WQ),
         _ptr_arg(x_scale),
@@ -301,6 +302,7 @@ def run_bmm_a8w8_mxfp8_128_gfx1250(
         b * k_blocks,  # stride_ascale_k: x_scale row stride, [M, B, K//128]
         b * k,  # lda: XQ is [M, B, K]
         b * n,  # ldc: Out is [M, B, N]
+        b * n,  # ldv: unused outside the Kimi specialization
         cfg["tile_m"],
         tile_n,
         tile_k,

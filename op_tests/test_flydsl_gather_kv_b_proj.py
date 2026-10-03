@@ -290,8 +290,9 @@ def _check_output(case):
 
 
 @_SKIP_GFX1250
-def test_gather_kv_b_proj_flydsl_gfx1250_kimi_ptpc():
-    case = _make_case(512, 96)
+@pytest.mark.parametrize("num_tokens", [512, 4096])
+def test_gather_kv_b_proj_flydsl_gfx1250_kimi_ptpc(num_tokens):
+    case = _make_case(num_tokens, 96)
     case["k_scale"] = torch.tensor(1.0)
     weight = shuffle_weight(case["weight"], layout=(16, 16))
     assert gather_kv_b_proj_flydsl_supported(
