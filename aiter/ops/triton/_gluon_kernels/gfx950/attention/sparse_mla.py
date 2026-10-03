@@ -85,13 +85,22 @@ def _xwarp_rowred(cfg, x, red_smem, IS_MAX: gl.constexpr):
     NW: gl.constexpr = cfg.N_WARPS
     BM: gl.constexpr = cfg.BLOCK_M
     BK: gl.constexpr = cfg.BLOCK_K
-    gl.static_assert(BK == 16 * NW, "one 16-key MFMA column per key warp")
+    # The 16-key MFMA columns are dealt to the key warps in turn: key = (rep, warp, 16).
+    REP: gl.constexpr = BK // (16 * NW)
+    gl.static_assert(BK == 16 * NW * REP, "16-key MFMA columns per key warp")
     lin: gl.constexpr = gl.to_linear_layout(cfg.qk_layout, [BM, BK])
-    x3 = gl.reshape(gl.convert_layout(x, lin), [BM, NW, BK // NW])
-    if IS_MAX:
-        part = _rmax(x3, 2)
+    if REP == 1:
+        x3 = gl.reshape(gl.convert_layout(x, lin), [BM, NW, BK // NW])
+        if IS_MAX:
+            part = _rmax(x3, 2)
+        else:
+            part = gl.sum(x3, axis=2)
     else:
-        part = gl.sum(x3, axis=2)
+        x4 = gl.reshape(gl.convert_layout(x, lin), [BM, REP, NW, 16])
+        if IS_MAX:
+            part = _rmax(_rmax(x4, 3), 1)
+        else:
+            part = gl.sum(gl.sum(x4, axis=3), axis=1)
     red_smem.store(part)
     LD: gl.constexpr = _xwarp_ld_layout(lin, NW)
     allp = red_smem.load(LD)
@@ -338,6 +347,8 @@ class Cfg:
     slot_l: gl.constexpr
     blocked_q: gl.constexpr
     kv_shared: gl.constexpr
+    Q_LDS: gl.constexpr
+    q_shared: gl.constexpr
     rope_shared: gl.constexpr
 
     @gluon.constexpr_function
@@ -482,6 +493,15 @@ class Cfg:
                     [[KV_DIM, KV_LDS_PAD or LDS_PAD]], [BLOCK_K, KV_DIM], [1, 0]
                 )
             )
+        # Q staged in LDS (one copy per program) instead of each wave's registers,
+        # which a 64-head program needs; Q and the KV tile fit with one program per CU.
+        Q_LDS = PIPE and BLOCK_M >= 64 and not FP8_MFMA
+        self.Q_LDS = gl.constexpr(Q_LDS)
+        self.q_shared = gl.constexpr(
+            gl.PaddedSharedLayout.with_identity_for(
+                [[128, 8]], [BLOCK_M, KV_DIM], [1, 0]
+            )
+        )
         # The rope buffer (K-only) exists when ROPE_SEPARATE, dead otherwise.
         # compiler removes the dead code, so no side effect beyond eliminating errors
         ROPE_L = ROPE_DIM if ROPE_DIM > 0 else 64
@@ -836,31 +856,41 @@ def _slots(
 def _qk_scores(cfg, q_dot, q_rope_dot, kv_smem, rope_smem):
     """QK scores for one tile; ROPE_SEPARATE chains a second MFMA over the rope
     buffer (MFMA accumulates natively, so KV_DIM + ROPE_DIM is two dots)."""
-    if cfg.ASYNC_LDS and cfg.RELAXED_LOAD:
-        # the async_wait already ordered the copy; stops the backend re-inserting
-        # a conservative vmcnt(0) before every LDS read
-        k = gl.amd.cdna4.async_copy.load_shared_relaxed(
-            kv_smem.permute([1, 0]), cfg.k_layout
-        )
+    if cfg.Q_LDS:
+        # Q from LDS, 128 dims at a time with the matching K slice: only one
+        # chunk of each operand is live.
+        QC: gl.constexpr = 128
+        S = gl.zeros([cfg.BLOCK_M, cfg.BLOCK_K], gl.float32, layout=cfg.qk_layout)
+        for c in gl.static_range(cfg.KV_DIM // QC):
+            q_c = q_dot.slice(c * QC, QC, dim=1).load(cfg.q_layout)
+            k_c = kv_smem.slice(c * QC, QC, dim=1).permute([1, 0]).load(cfg.k_layout)
+            S = gl.amd.cdna4.mfma(q_c, k_c, S)
     else:
-        k = kv_smem.permute([1, 0]).load(cfg.k_layout)  # [KV_DIM, BLOCK_K]
-    if cfg.ASYNC_LDS:
-        k = k.to(gl.float8e4nv, bitcast=True)  # raw cache bytes; layout-preserving
-    S = gl.amd.cdna4.mfma(
-        q_dot,
-        k,
-        gl.zeros([cfg.BLOCK_M, cfg.BLOCK_K], gl.float32, layout=cfg.qk_layout),
-    )
-    if cfg.ROPE_SEPARATE:
         if cfg.ASYNC_LDS and cfg.RELAXED_LOAD:
-            k_rope = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                rope_smem.permute([1, 0]), cfg.k_layout
+            # the async_wait already ordered the copy; stops the backend re-inserting
+            # a conservative vmcnt(0) before every LDS read
+            k = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                kv_smem.permute([1, 0]), cfg.k_layout
             )
         else:
-            k_rope = rope_smem.permute([1, 0]).load(cfg.k_layout)
+            k = kv_smem.permute([1, 0]).load(cfg.k_layout)  # [KV_DIM, BLOCK_K]
         if cfg.ASYNC_LDS:
-            k_rope = k_rope.to(gl.float8e4nv, bitcast=True)
-        S = gl.amd.cdna4.mfma(q_rope_dot, k_rope, S)
+            k = k.to(gl.float8e4nv, bitcast=True)  # raw cache bytes; layout-preserving
+        S = gl.amd.cdna4.mfma(
+            q_dot,
+            k,
+            gl.zeros([cfg.BLOCK_M, cfg.BLOCK_K], gl.float32, layout=cfg.qk_layout),
+        )
+        if cfg.ROPE_SEPARATE:
+            if cfg.ASYNC_LDS and cfg.RELAXED_LOAD:
+                k_rope = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                    rope_smem.permute([1, 0]), cfg.k_layout
+                )
+            else:
+                k_rope = rope_smem.permute([1, 0]).load(cfg.k_layout)
+            if cfg.ASYNC_LDS:
+                k_rope = k_rope.to(gl.float8e4nv, bitcast=True)
+            S = gl.amd.cdna4.mfma(q_rope_dot, k_rope, S)
     return S
 
 
@@ -2381,7 +2411,13 @@ def _sparse_mla(
         # (nope and rope), so the fold below is one extra factor on qk_scale.
         E4M3_MAX: gl.constexpr = 448.0
         q_amax = gl.max(gl.max(gl.abs(q).to(gl.float32), axis=1), axis=0)
-    q_dot = gl.convert_layout(q, cfg.q_layout)
+    if cfg.Q_LDS:
+        q_dot = gl.allocate_shared_memory(
+            gl.bfloat16, [BLOCK_M, HEAD_SIZE], cfg.q_shared
+        )
+        q_dot.store(q.to(gl.bfloat16))
+    else:
+        q_dot = gl.convert_layout(q, cfg.q_layout)
     if ROPE_SEPARATE:
         offs_d_qr = gl.arange(0, ROPE_DIM, layout=gl.SliceLayout(0, cfg.blocked_q))
         qr_off = (

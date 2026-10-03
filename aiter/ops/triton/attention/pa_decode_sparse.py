@@ -646,6 +646,16 @@ def _pa_decode_sparse_gfx950_gluon(
         fills = left == 0 or 2 * left > get_num_sms()
         if tiles > 1 and (fills if programs <= 4 * get_num_sms() else tiles >= 4):
             BLOCK_M, num_warps = 32, 8
+    # At 64 heads, a top-k launch without split-K and with at least one full round
+    # of programs runs one 64-head program per row (Q in LDS), so each key tile is
+    # staged once for all 64 heads. Up to four rounds, the last one must be more
+    # than half full.
+    if packed_fp8 and num_heads == 64 and has_extra and num_splits == 1:
+        programs = num_queries
+        left = programs % get_num_sms()
+        fills = left == 0 or 2 * left > get_num_sms()
+        if programs >= get_num_sms() and (fills or programs > 4 * get_num_sms()):
+            BLOCK_M, num_warps = 64, 8
     HEAD_ALIGNED = num_heads % BLOCK_M == 0
     heads_blocks = (num_heads + BLOCK_M - 1) // BLOCK_M
     inv_rope = inv_rope_positions is not None
@@ -836,8 +846,8 @@ def _pa_decode_sparse_gfx950_gluon(
         HAS_INVALID=has_invalid,
         UNPEEL=unpeel,
         XCD_REMAP=xcd_remap,
-        # Gather a tile ahead only for 8-warp programs below prefill size.
-        PIPE_PREFETCH=num_warps == 8 and not prefill,
+        # Gather a tile ahead only for 8-warp programs of 32 heads below prefill size.
+        PIPE_PREFETCH=num_warps == 8 and BLOCK_M < 64 and not prefill,
         num_warps=num_warps,
         waves_per_eu=waves_per_eu,
         **prefill_kw,
