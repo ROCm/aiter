@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Tests for the FlyDSL flash-attention kernels: gfx1201 bf16/f16 and gfx950 fp8."""
+"""Tests for the FlyDSL flash-attention kernels: gfx1201 bf16/f16, gfx1151 bf16
+and gfx950 fp8."""
 
 from __future__ import annotations
 
@@ -12,7 +13,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from aiter.ops.flydsl import flydsl_flash_attn_func
+from aiter.ops.flydsl import (
+    flydsl_flash_attn_func,
+    flydsl_flash_attn_func_gfx1151,
+    flydsl_flash_attn_gfx1151_supported,
+)
 
 
 def _arch() -> str:
@@ -1917,3 +1922,182 @@ def test_fp8_repeat_launch_is_bit_exact_under_load():
     base = outs[100]
     bad = sum(1 for o in outs if not torch.equal(o, base))
     assert bad == 0, f"{bad}/200 launches differed bitwise from the reference launch"
+
+
+_gfx1151_only = pytest.mark.skipif(
+    not _arch().startswith("gfx1151"),
+    reason="flydsl_flash_attn_func_gfx1151 is gfx1151/GFX11 wave32 only",
+)
+
+
+def _make_qkv_cross(
+    batch: int,
+    seq_len_q: int,
+    seq_len_k: int,
+    num_heads: int,
+    head_dim: int,
+    packed: bool = False,
+    seed: int = 0,
+    device: str = "cuda",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    g = torch.Generator(device=device).manual_seed(seed)
+    if packed:
+        qkv = torch.randn(
+            (batch, max(seq_len_q, seq_len_k), 3, num_heads, head_dim),
+            generator=g,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        return qkv[:, :seq_len_q, 0], qkv[:, :seq_len_k, 1], qkv[:, :seq_len_k, 2]
+    q = torch.randn(
+        (batch, seq_len_q, num_heads, head_dim),
+        generator=g,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    k = torch.randn(
+        (batch, seq_len_k, num_heads, head_dim),
+        generator=g,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    v = torch.randn_like(k)
+    return q, k, v
+
+
+def _rel_rmse(got: torch.Tensor, ref: torch.Tensor) -> float:
+    got = got.float()
+    ref = ref.float()
+    return ((got - ref).pow(2).mean().sqrt() / ref.pow(2).mean().sqrt()).item()
+
+
+def _assert_matches_sdpa(out, q, k, v, head_dim):
+    ref = _ref_sdpa_bshd(q.float(), k.float(), v.float())
+    assert out.shape == q.shape
+    assert out.dtype == torch.bfloat16
+    assert torch.isfinite(out.float()).all()
+    rel = _rel_rmse(out, ref)
+    assert rel < 5e-3, f"rel_rmse={rel:.6g}"
+    cos = F.cosine_similarity(
+        out.float().reshape(-1, head_dim), ref.reshape(-1, head_dim), dim=1
+    )
+    assert cos.min().item() > 0.99, f"min_cos={cos.min().item():.6f}"
+    assert cos.mean().item() > 0.999, f"mean_cos={cos.mean().item():.6f}"
+
+
+@_gfx1151_only
+@pytest.mark.parametrize(
+    "batch,seq_len_q,seq_len_k,num_heads,head_dim",
+    [
+        # Qwen-Image 2.1: Sq != Sk, neither a tile multiple.
+        (1, 130, 147, 32, 128),
+        (1, 1024, 1152, 32, 128),
+        (1, 3136, 3267, 32, 128),
+        # Batched, Sk < Sq.
+        (3, 200, 77, 8, 128),
+        # Non-128 head_dim, including non-powers of two.
+        (1, 130, 147, 2, 64),
+        (1, 65, 33, 4, 96),
+        (2, 129, 65, 3, 112),
+        # Single key.
+        (1, 17, 1, 4, 128),
+    ],
+)
+@pytest.mark.parametrize("packed", [False, True])
+def test_gfx1151_correctness_bf16(
+    batch, seq_len_q, seq_len_k, num_heads, head_dim, packed
+):
+    q, k, v = _make_qkv_cross(
+        batch, seq_len_q, seq_len_k, num_heads, head_dim, packed=packed
+    )
+    out = flydsl_flash_attn_func_gfx1151(q, k, v)
+    _assert_matches_sdpa(out, q, k, v, head_dim)
+
+
+@_gfx1151_only
+def test_gfx1151_accepts_noncontiguous_qkv_views():
+    q, k, v = _make_qkv_cross(1, 256, 320, 8, 128, packed=True)
+    assert not q.is_contiguous()
+    assert q.stride(1) != q.shape[2] * q.shape[3]
+    out = flydsl_flash_attn_func_gfx1151(q, k, v)
+    _assert_matches_sdpa(out, q, k, v, 128)
+
+
+@_gfx1151_only
+@pytest.mark.parametrize("waves,key_tiles", [(2, 1), (8, 1), (4, 2), (2, 2)])
+def test_gfx1151_tuning_parameters_stay_correct(waves, key_tiles):
+    q, k, v = _make_qkv_cross(1, 130, 147, 8, 128)
+    out = flydsl_flash_attn_func_gfx1151(q, k, v, waves=waves, key_tiles=key_tiles)
+    _assert_matches_sdpa(out, q, k, v, 128)
+
+
+@_gfx1151_only
+@pytest.mark.parametrize("num_heads,head_group", [(12, 8), (12, 32), (8, 1), (7, 3)])
+def test_gfx1151_head_group_stays_correct(num_heads, head_group):
+    q, k, v = _make_qkv_cross(2, 130, 147, num_heads, 64)
+    out = flydsl_flash_attn_func_gfx1151(q, k, v, head_group=head_group)
+    _assert_matches_sdpa(out, q, k, v, 64)
+
+
+@_gfx1151_only
+def test_gfx1151_writes_into_provided_out():
+    q, k, v = _make_qkv_cross(1, 130, 147, 8, 128)
+    out = torch.empty_like(q)
+    returned = flydsl_flash_attn_func_gfx1151(q, k, v, out=out)
+    assert returned.data_ptr() == out.data_ptr()
+    _assert_matches_sdpa(out, q, k, v, 128)
+
+
+@_gfx1151_only
+def test_gfx1151_is_bitwise_deterministic():
+    q, k, v = _make_qkv_cross(1, 1024, 1152, 8, 128)
+    base = flydsl_flash_attn_func_gfx1151(q, k, v).clone()
+    for _ in range(20):
+        assert torch.equal(flydsl_flash_attn_func_gfx1151(q, k, v), base)
+
+
+@_gfx1151_only
+def test_gfx1151_rejects_head_dim_not_multiple_of_16():
+    q = torch.randn(1, 128, 4, 24, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="head_dim"):
+        flydsl_flash_attn_func_gfx1151(q, q.clone(), q.clone())
+
+
+@_gfx1151_only
+def test_gfx1151_rejects_non_bf16():
+    q = torch.randn(1, 128, 4, 128, dtype=torch.float16, device="cuda")
+    with pytest.raises(ValueError, match="bfloat16"):
+        flydsl_flash_attn_func_gfx1151(q, q.clone(), q.clone())
+
+
+@_gfx1151_only
+def test_gfx1151_rejects_head_major_layout():
+    q = torch.randn(1, 4, 128, 128, dtype=torch.bfloat16, device="cuda").transpose(1, 2)
+    with pytest.raises(ValueError, match="strides"):
+        flydsl_flash_attn_func_gfx1151(q, q.clone(), q.clone())
+
+
+@_gfx1151_only
+def test_gfx1151_rejects_mismatched_kv():
+    q, k, v = _make_qkv_cross(1, 128, 128, 4, 128)
+    with pytest.raises(ValueError, match="k and v"):
+        flydsl_flash_attn_func_gfx1151(q, k, v[:, :64])
+
+
+@_gfx1151_only
+def test_gfx1151_rejects_head_count_mismatch():
+    q = torch.randn(1, 128, 8, 128, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(1, 128, 4, 128, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="num_heads"):
+        flydsl_flash_attn_func_gfx1151(q, k, k.clone())
+
+
+def test_gfx1151_supported_rejects_cpu_and_bad_head_dim():
+    assert not flydsl_flash_attn_gfx1151_supported(torch.device("cpu"), 128)
+    assert not flydsl_flash_attn_gfx1151_supported(torch.device("cpu"), 24)
+
+
+@_gfx1151_only
+def test_gfx1151_supported_on_this_device():
+    assert flydsl_flash_attn_gfx1151_supported(torch.device("cuda"), 128)
+    assert not flydsl_flash_attn_gfx1151_supported(torch.device("cuda"), 24)
