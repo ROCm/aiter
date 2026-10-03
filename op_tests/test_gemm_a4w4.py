@@ -122,6 +122,17 @@ def test_gemm(dtype, M, N, K):
     ret["TB/s"] = (x.nbytes + w.nbytes) / us / 1e6
     ret["err"] = err
 
+    # the 256x256 asm kernel (persistent) by name, on every shape (it needs A and B under 4 GB)
+    if max(M, N) * K // 2 < 2**32:
+        kernelName = "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_256x256E"
+        out = torch.empty((M + 31) // 32 * 32, N, dtype=dtype)
+        d, us = run_gemm_asm(
+            x, wshuffle, x_scales_shuffle, w_scales_shuffle, out, kernelName
+        )
+        err = checkAllclose(a, d[:M], msg="asm 256x256", catastrophic_check=True)
+        ret["us 256x256"] = us
+        ret["err 256x256"] = err
+
     # kernelName = "" # "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_128x512E"
     # log2_k_split = 1
     # out2 = torch.empty((M + 31) // 32 * 32, N, dtype=dtype)
