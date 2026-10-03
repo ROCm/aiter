@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 
-"""FP8 paged-attention tile kernel.
+"""Paged-attention tile kernel with FP8 and BF16 K/V specializations.
 
-K/V use e4m3 (FNUZ on gfx942, OCP on gfx950); BF16/FP16 Q and probabilities P
-are quantized to FP8. Q/key scales fold into QK, value scale and 1/FP8_MAX into
-the epilogue; softmax max/sum stay f32. Tuned gfx950 BF16 per-token MTP3/MTP4
+FP8 K/V use E4M3 (FNUZ on gfx942, OCP on gfx950); BF16/FP16 Q and
+probabilities P are quantized to FP8. Q/key scales fold into QK, value scale
+and 1/FP8_MAX into the epilogue; softmax max/sum stay f32. Native BF16 K/V
+keeps Q/P in BF16, uses K16 MFMA, and needs no K/V scales. Tuned gfx950
+BF16-query per-token FP8 MTP3/MTP4
 uses K128 MFMA instead of K32, preserving normalized Q/P and operand layouts.
 Tuned gfx950 BF16 scalar decode casts Q/P directly, without normalization or
 1/FP8_MAX compensation: Q must fit FP8, and small Q/probabilities may underflow.
@@ -14,17 +16,20 @@ Per-token scales retain range normalization.
 Logical layouts (not preshuffled):
 
 * ``query``        [num_seqs, num_q_heads, head_dim]  f16/bf16 (head_dim contiguous)
-* ``key_cache``    [num_blocks, num_kv_heads, head_dim//16, block_size, 16]  fp8
-* ``value_cache``  [num_blocks, num_kv_heads, block_size//16, head_dim, 16] (trans_v)
-                   or [num_blocks, num_kv_heads, head_dim, block_size] (plain), by rank
+* ``key_cache``    [num_blocks, num_kv_heads, head_dim//x, block_size, x]
+* ``value_cache``  [num_blocks, num_kv_heads, block_size//x, value_dim, x] (trans_v)
+                   or [num_blocks, num_kv_heads, value_dim, block_size] (FP8 plain)
+                   where x=16 for FP8 and x=8 for BF16
 * ``block_tables`` [num_seqs, max_blocks_per_seq]  int32
 * ``context_lengths`` [num_seqs]  int32
-* ``output``       [num_seqs, num_q_heads, head_dim]  same dtype as query
-* K/V scales      [1] per-tensor or [num_blocks, num_kv_heads, block_size] per-token
+* ``output``       [num_seqs, num_q_heads, value_dim]  same dtype as query
+* FP8 K/V scales  [1] per-tensor or [num_blocks, num_kv_heads, block_size] per-token
 
 Four-wave CTAs process 256-token blocks: QK splits tokens, PV splits head dim,
 and P passes through LDS to transpose ownership between the MMAs.
 """
+
+import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -36,12 +41,28 @@ from flydsl.expr.typing import ReductionOp, T
 from flydsl.runtime.device import get_rocm_arch
 
 from . import dpp_utils
-from .tensor_shim import buf_base_i64, buf_copy_store, ptr_buf_tensor
+from .pa_decode_common import (
+    BF16_CONTEXT_LIMIT,
+    async_load_lds_nt,
+    cdiv,
+    exp2_amdgcn_scalar,
+    exp2_f32_fast,
+    load_lds_words,
+    make_flat_loader,
+    page_resource,
+    reduce_lane_pair,
+    swap_lane_pair,
+)
+from .pa_decode_common import (
+    rcp_f32 as fp8_qlen8_rcp_f32,
+)
+from .tensor_shim import buf_base_i64, buf_copy_store, buf_scalar_load, ptr_buf_tensor
 from .utils import rcp_f32
 
 MFMA_MNK = 16  # M=N=16; query rows are padded to M-tiles.
 # One i64 operand pack/lane covers K32, including in K128 layouts.
 FP8_PACK_K = 32
+BF16_PACK_K = 16
 WAVE = 64
 # Accumulator elements/lane are independent of MFMA K.
 MFMA_ACC_ELEMS = MFMA_MNK * MFMA_MNK // WAVE
@@ -54,6 +75,7 @@ _PA_DECODE_TILE_CACHE = {}
 def compile_pa_decode_tile(
     *,
     head_dim: int,
+    value_dim: int | None = None,
     query_group_size: int,
     block_size: int,
     num_seqs: int,
@@ -62,6 +84,7 @@ def compile_pa_decode_tile(
     num_partitions: int = 1,
     softmax_scale: float | None = None,
     query_dtype: str = "f16",
+    kv_dtype: str = "fp8",
     per_token_kv: bool = False,
     query_length: int = 1,
     trans_v: bool = True,
@@ -90,6 +113,8 @@ def compile_pa_decode_tile(
 
     Positive ``sliding_window`` requires a plan and includes the query token.
     Plans cover the MTP window union; scores are masked per query row.
+    The qualified asymmetric planned shape supports FP8 or BF16 K/V with
+    Q/K192-V128, Qlen8, page64, GQA16, and W128 on gfx950.
     ``use_sinks`` adds a zero-value per-head logit only to direct NP=1 output;
     partitioned/planned output adds it once in the reducer, not in partials.
 
@@ -100,9 +125,36 @@ def compile_pa_decode_tile(
     """
     if sliding_window > 0 and not use_work_plan:
         raise ValueError("positive sliding_window requires work_plan")
-    is_gfx950 = "gfx95" in get_rocm_arch()
+    value_dim = head_dim if value_dim is None else value_dim
+    arch = str(get_rocm_arch()).split(":", 1)[0]
+    is_gfx950 = "gfx95" in arch
+    if kv_dtype not in ("fp8", "bf16"):
+        raise ValueError(f"kv_dtype must be 'fp8' or 'bf16', got {kv_dtype!r}")
+    is_bf16_kv = kv_dtype == "bf16"
+    if is_bf16_kv and (arch not in ("gfx942", "gfx950") or query_dtype != "bf16"):
+        raise ValueError("BF16 KV requires gfx942/gfx950 and a BF16 query")
+    if value_dim != head_dim and not (
+        arch == "gfx950"
+        and kv_dtype in ("fp8", "bf16")
+        and query_dtype == "bf16"
+        and head_dim == 192
+        and value_dim == 128
+        and block_size == 64
+        and query_group_size == 16
+        and num_kv_heads == 1
+        and query_length == 8
+        and sliding_window == 128
+        and trans_v
+        and use_work_plan
+        and not per_token_kv
+    ):
+        raise ValueError(
+            "asymmetric V requires gfx950 FP8/BF16 Qlen8/GQA16/page64 D192/V128 W128"
+        )
     IS_BF16 = query_dtype == "bf16"
-    TUNED_SHAPE = is_gfx950 and head_dim == 128 and block_size in (16, 128)
+    TUNED_SHAPE = (
+        not is_bf16_kv and is_gfx950 and head_dim == 128 and block_size in (16, 128)
+    )
     TUNED_PER_TOKEN = TUNED_SHAPE and IS_BF16 and per_token_kv
     # Scalar scheduling is broader than the BF16 single-query numerical fast path.
     TUNED_SCALAR = TUNED_SHAPE and trans_v and not per_token_kv
@@ -186,11 +238,13 @@ def compile_pa_decode_tile(
     )
     cache_key = (
         head_dim,
+        value_dim,
         query_group_size,
         block_size,
         num_partitions,
         softmax_scale,
         query_dtype,
+        kv_dtype,
         per_token_kv,
         query_length,
         trans_v,
@@ -213,7 +267,7 @@ def compile_pa_decode_tile(
         and is_gfx950
         and head_dim == 128
         and IS_BF16
-        and 0 < TOTAL_ROWS * head_dim * 2 <= 0x7FFFFFFF
+        and 0 < TOTAL_ROWS * value_dim * 2 <= 0x7FFFFFFF
     )
     # Larger windows have identical visibility for int32 context lengths.
     sliding_window = min(sliding_window, 2**31 - 1)
@@ -262,8 +316,9 @@ def compile_pa_decode_tile(
     WIDE_FP8_MFMA = (
         TUNED_PER_TOKEN and query_length in (3, 4) and query_group_size == 16
     )
-    MFMA_K = 128 if WIDE_FP8_MFMA else FP8_PACK_K
-    PACKS_PER_MFMA = MFMA_K // FP8_PACK_K
+    MFMA_K = BF16_PACK_K if is_bf16_kv else 128 if WIDE_FP8_MFMA else FP8_PACK_K
+    PACK_K = BF16_PACK_K if is_bf16_kv else FP8_PACK_K
+    PACKS_PER_MFMA = MFMA_K // PACK_K
     MTP4_FUSED = WIDE_FP8_MFMA and M_TILES == 4
     # Wide page128 addresses make carrying V across QK too register-heavy.
     MTP4_PREFETCH_V = MTP4_FUSED and (block_size == 16 or not wide_kv_addressing)
@@ -289,8 +344,8 @@ def compile_pa_decode_tile(
     PAGES_PER_CHUNK = (TOK_PER_WARP + block_size - 1) // block_size
     KV_EXTENT = (1 << 42) if wide_kv_addressing else (1 << 30)
     assert (
-        head_dim % (NWARP * MFMA_MNK) == 0
-    ), "head_dim must split across the 4 warps for PV"
+        value_dim % (NWARP * MFMA_MNK) == 0
+    ), "value_dim must split across the 4 warps for PV"
 
     # Four 16-element QK loads form each 64-element fetch group.
     RGROUP_QUARTERS = 4
@@ -300,7 +355,7 @@ def compile_pa_decode_tile(
         QKHE_LOOP >= 1
     ), f"head_dim {head_dim} must be at least {RGROUP_QUARTERS * QK_CHUNK_ELEMS}"
     # QK operand-pack count, not the number of MFMA instructions.
-    N_SUBCHUNKS = head_dim // FP8_PACK_K
+    N_SUBCHUNKS = head_dim // PACK_K
     assert N_SUBCHUNKS % PACKS_PER_MFMA == 0, "QK packs must fill whole MFMA atoms"
     assert TILE_TOK % MFMA_K == 0, "PV tokens must fill whole MFMA atoms"
 
@@ -309,21 +364,22 @@ def compile_pa_decode_tile(
     QCHUNK = (
         head_dim // NQCHUNK
     )  # f16 elements per lane's load chunk (8 for head_dim=128, 4 for head_dim=64)
-    # Loads are at most 128 bits; larger chunks must not leave an unloaded tail.
-    assert QCHUNK <= 8 or QCHUNK % 8 == 0, (
+    # D192 stages each lane's 12 elements with three 64-bit loads.
+    # Other loads are at most 128 bits and must not leave an unloaded tail.
+    assert QCHUNK <= 8 or QCHUNK % 8 == 0 or QCHUNK == 12, (
         f"head_dim {head_dim} is unsupported: head_dim//{NQCHUNK} ({QCHUNK}) must "
-        f"be <= 8 or a multiple of 8"
+        f"be <= 8, a multiple of 8, or 12"
     )
-    QLOAD_UNIT = min(8, QCHUNK)
+    QLOAD_UNIT = 4 if QCHUNK == 12 else min(8, QCHUNK)
     N_QLOADS = QCHUNK // QLOAD_UNIT
 
-    VHE_CHUNKS = head_dim // (NWARP * MFMA_MNK)  # 2 for head_dim=128, 1 for head_dim=64
-    VHE_SIZE = head_dim // VHE_CHUNKS
+    VHE_CHUNKS = value_dim // (NWARP * MFMA_MNK)
+    VHE_SIZE = value_dim // VHE_CHUNKS
     OP_ELEMS = MFMA_ACC_ELEMS  # PV C-fragment elements/lane/chunk
-    # Eight i64 packs/lane: eight K32 or two K128 PV instructions.
-    NVOPS = TILE_TOK // FP8_PACK_K
-    STEPS_PER_PAGE = block_size // MFMA_MNK
-    STEPS_PER_CHUNK = min(block_size, TOK_PER_WARP) // MFMA_MNK
+    # Token operands are i64 packs: K32 FP8 or K16 BF16 per MFMA.
+    NVOPS = TILE_TOK // PACK_K
+    STEPS_PER_PAGE = block_size // (8 if is_bf16_kv else MFMA_MNK)
+    STEPS_PER_CHUNK = min(block_size, TOK_PER_WARP) // (8 if is_bf16_kv else MFMA_MNK)
 
     if softmax_scale is None:
         softmax_scale = 1.0 / (head_dim**0.5)
@@ -347,15 +403,16 @@ def compile_pa_decode_tile(
     # LDS holds Q/P, cross-wave max/sum, V page IDs and per-token scales.
     # PV output and online-softmax state remain in registers.
     f32 = 4
-    sQ_bytes = ROWS_PADDED * head_dim * 1  # fp8
+    QP_ELEM_BYTES = 2 if is_bf16_kv else 1
+    sQ_bytes = ROWS_PADDED * head_dim * QP_ELEM_BYTES
     # First-QK's max barrier retires all sQ reads before P overwrites it.
     # Still-live Q scales stay outside the aliased, 16-byte-aligned Q/P regions.
     sP_off = 0
     # Padding avoids 32-bank conflicts while preserving ds_read_b128 alignment.
-    SP_ROW_BYTES = TILE_TOK + 16
-    sP_bytes = P_BUFFERS * MFMA_MNK * SP_ROW_BYTES  # fp8, padded rows
+    SP_ROW_BYTES = TILE_TOK * QP_ELEM_BYTES + 16
+    sP_bytes = P_BUFFERS * MFMA_MNK * SP_ROW_BYTES
     sQscale_off = max(sQ_bytes, sP_bytes)
-    sQscale_bytes = 0 if SCALAR_FP8_DECODE else ROWS_PADDED * f32
+    sQscale_bytes = 0 if is_bf16_kv or SCALAR_FP8_DECODE else ROWS_PADDED * f32
     # Tuned rows need 16-byte vector alignment; other paths use bank padding.
     NWARP_PAD = NWARP if TUNE_PAGE128 or PER_TOKEN_M1 or MTP4_FUSED else NWARP + 1
     # Phase-split slices sLmax per M-tile so all pass-1 writes share one barrier.
@@ -386,7 +443,7 @@ def compile_pa_decode_tile(
         # Static partials: [B,H,NP,rows]; planned: [H,capacity,rows].
         pmax_ptr: fx.Pointer,  # Natural-log row max.
         psum_ptr: fx.Pointer,  # Row sum.
-        pout_ptr: fx.Pointer,  # Adds head_dim; Q_DTYPE normalized O_p/l_p.
+        pout_ptr: fx.Pointer,  # Adds value_dim; Q_DTYPE normalized O_p/l_p.
         query_ptr: fx.Pointer,
         key_cache_ptr: fx.Pointer,
         value_cache_ptr: fx.Pointer,
@@ -448,12 +505,12 @@ def compile_pa_decode_tile(
                 ) + fx.Int64(part)
             else:
                 pout_slot = fx.Int64(kv_h) * fx.Int64(gpu.grid_dim.x) + fx.Int64(part)
-            pout_slot_bytes = TOTAL_ROWS * head_dim * 2
+            pout_slot_bytes = TOTAL_ROWS * value_dim * 2
             pout_base = buf_base_i64(pout_ptr) + pout_slot * fx.Int64(pout_slot_bytes)
             pout_buffer = ptr_buf_tensor(
                 pout_base,
                 Q_DTYPE,
-                n=TOTAL_ROWS * head_dim,
+                n=TOTAL_ROWS * value_dim,
                 unit_elems=OP_ELEMS,
                 # BF16 views may be only 2-byte aligned, even for 8-byte stores.
                 unit_stride=1,
@@ -483,7 +540,7 @@ def compile_pa_decode_tile(
         _v_load_fp8x16 = _make_raw_flat_loader(value_cache_ptr, FP8, 16, KV_EXTENT)
 
         def _kv_addr(phys, page_elems, rest):
-            # Widen before the page product reaches 2^31 FP8 elements.
+            # Widen before the physical-page offset reaches 2 GiB of K/V data.
             if const_expr(wide_kv_addressing):
                 return fx.Int64(phys) * fx.Int64(page_elems) + fx.Int64(rest)
             return phys * page_elems + rest
@@ -534,6 +591,16 @@ def compile_pa_decode_tile(
         def _v_load16(byte_off):
             return _v_load_fp8x16(byte_off).bitcast(fx.Int64)
 
+        def _k_load_bf16_words(elem_off):
+            return _make_raw_flat_loader(key_cache_ptr, fx.BFloat16, 8, KV_EXTENT)(
+                elem_off
+            ).bitcast(fx.Int64)
+
+        def _v_load_bf16_words(elem_off):
+            return _make_raw_flat_loader(value_cache_ptr, fx.BFloat16, 8, KV_EXTENT)(
+                elem_off
+            ).bitcast(fx.Int64)
+
         if const_expr(use_work_plan):
             context_len = planned_context
         else:
@@ -556,7 +623,7 @@ def compile_pa_decode_tile(
             unit_stride=1,
             num_records_bytes=bt_num_records_bytes,
         )
-        if const_expr(not per_token_kv):
+        if const_expr(not per_token_kv and not is_bf16_kv):
             key_scale_buf = ptr_buf_tensor(key_scale_ptr, fx.Float32)
             value_scale_buf = ptr_buf_tensor(value_scale_ptr, fx.Float32)
             key_scale = fx.Float32(key_scale_buf[0])
@@ -730,9 +797,20 @@ def compile_pa_decode_tile(
                 sVScale_off, a, buf_off
             )
 
-        def _mfma_fp8(a_ops, b_ops, a_base, b_base, k_packs, acc):
+        def _mfma(a_ops, b_ops, a_base, b_base, k_packs, acc):
             # Counts and offsets are i64 operand packs, not MFMA instructions.
-            if const_expr(WIDE_FP8_MFMA):
+            if const_expr(is_bf16_kv):
+                for pack in range_constexpr(k_packs):
+                    a = fx.Vector.from_elements(
+                        [a_ops[a_base + pack]], dtype=fx.Int64
+                    ).bitcast(fx.Int16)
+                    b = fx.Vector.from_elements(
+                        [b_ops[b_base + pack]], dtype=fx.Int64
+                    ).bitcast(fx.Int16)
+                    acc = fx.rocdl.mfma_f32_16x16x16bf16_1k(
+                        T.f32x4, [a, b, acc, 0, 0, 0]
+                    )
+            elif const_expr(WIDE_FP8_MFMA):
                 for inst in range_constexpr(k_packs // PACKS_PER_MFMA):
                     a_pack = fx.Vector.from_elements(
                         [
@@ -777,17 +855,31 @@ def compile_pa_decode_tile(
             ops = []
             for qkhe in range_constexpr(QKHE_LOOP):
                 he_idx = qkhe * RGROUP_QUARTERS + rgroup
-                base = _kv_addr(
-                    phys,
-                    n_kv * (QCHUNK * block_size * QK_CHUNK_ELEMS),
-                    ((kv_h * QCHUNK + he_idx) * block_size + within_page_tok)
-                    * QK_CHUNK_ELEMS,
-                )
-                w = _k_load16(base)  # head[he_idx*16 : +16] -> two K32 operand packs
+                if const_expr(is_bf16_kv):
+                    for half in range_constexpr(2):
+                        he8_idx = he_idx * 2 + half
+                        base = _kv_addr(
+                            phys,
+                            n_kv * (head_dim * block_size),
+                            (
+                                (kv_h * (head_dim // 8) + he8_idx) * block_size
+                                + within_page_tok
+                            )
+                            * 8,
+                        )
+                        words = _k_load_bf16_words(base)
+                        ops.extend([words[0], words[1]])
+                else:
+                    base = _kv_addr(
+                        phys,
+                        n_kv * (QCHUNK * block_size * QK_CHUNK_ELEMS),
+                        ((kv_h * QCHUNK + he_idx) * block_size + within_page_tok)
+                        * QK_CHUNK_ELEMS,
+                    )
+                    w = _k_load16(base)
+                    ops.extend([w[0], w[1]])
                 if const_expr(block_size == 16):
-                    # Overlap page16 gathers.
                     fx.rocdl.sched_barrier(fx.rocdl.mask_vmem_rd)
-                ops.extend([w[0], w[1]])
             return ops  # N_SUBCHUNKS i64 operands
 
         def _k_ops_from_phys(phys_vec):
@@ -831,8 +923,10 @@ def compile_pa_decode_tile(
             )
 
         # Per-token scales fold into logits/P rather than scalar QK/epilogue scales.
-        if const_expr(per_token_kv):
+        if const_expr(per_token_kv or is_bf16_kv):
             scale_qk = fx.Float32(softmax_scale * LOG2E)
+            if const_expr(is_bf16_kv):
+                v_scale_f = fx.Float32(1.0)
         else:
             scale_qk = fx.Float32(softmax_scale * LOG2E) * fx.Float32(key_scale)
             v_scale_f = fx.Float32(value_scale)
@@ -889,7 +983,11 @@ def compile_pa_decode_tile(
 
         # M-tiles quantize disjoint rows, requiring no inter-tile barrier.
         def _quant_q_row(m, q_row_off, q_units):
-            if const_expr(SCALAR_FP8_DECODE):
+            if const_expr(is_bf16_kv):
+                for u in range_constexpr(N_QLOADS):
+                    elem_off = qh_local * head_dim + lane16 * QCHUNK + u * QLOAD_UNIT
+                    _lds_store(q_row_off + elem_off * 2, fx.BFloat16, q_units[u])
+            elif const_expr(SCALAR_FP8_DECODE):
                 for u in range_constexpr(N_QLOADS):
                     _st_words(
                         q_row_off
@@ -931,7 +1029,7 @@ def compile_pa_decode_tile(
             flat_idx = m * MFMA_MNK + qh_local
             qi = flat_idx // query_group_size
             gs_head = flat_idx - qi * query_group_size
-            q_row_off = m * MFMA_MNK * head_dim
+            q_row_off = m * MFMA_MNK * head_dim * QP_ELEM_BYTES
             # Only the final M-tile can need a runtime row guard.
             if const_expr((m + 1) * MFMA_MNK <= CTA_ROWS):
                 q_units = (
@@ -943,12 +1041,23 @@ def compile_pa_decode_tile(
             elif flat_idx < CTA_ROWS:
                 _quant_q_row(m, q_row_off, _load_q_row(qi, gs_head))
             else:
-                _st_words(
-                    q_row_off + qh_local * head_dim + lane16 * QCHUNK,
-                    fx.Vector.filled(QCHUNK // 4, 0, fx.Int32),
-                )
-                if const_expr(not SCALAR_FP8_DECODE) and lane16 == 0:
-                    _st1(sQscale_off, qh_local * M_TILES + m, ZERO_F)
+                if const_expr(is_bf16_kv):
+                    for u in range_constexpr(N_QLOADS):
+                        elem_off = (
+                            qh_local * head_dim + lane16 * QCHUNK + u * QLOAD_UNIT
+                        )
+                        _lds_store(
+                            q_row_off + elem_off * 2,
+                            fx.BFloat16,
+                            fx.Vector.filled(QLOAD_UNIT, 0.0, fx.BFloat16),
+                        )
+                else:
+                    _st_words(
+                        q_row_off + qh_local * head_dim + lane16 * QCHUNK,
+                        fx.Vector.filled(QCHUNK // 4, 0, fx.Int32),
+                    )
+                    if const_expr(not SCALAR_FP8_DECODE) and lane16 == 0:
+                        _st1(sQscale_off, qh_local * M_TILES + m, ZERO_F)
 
         gpu.barrier()
 
@@ -957,13 +1066,17 @@ def compile_pa_decode_tile(
         # Register-resident Q (B operand) must match _k_ops' head-dim permutation.
         q_ops_all = []
         for m in range_constexpr(M_TILES):
-            q_row_off = m * MFMA_MNK * head_dim
+            q_row_off = m * MFMA_MNK * head_dim * QP_ELEM_BYTES
             for qkhe in range_constexpr(QKHE_LOOP):
                 he_idx = qkhe * RGROUP_QUARTERS + rgroup
                 chunk = _lds_load(
-                    q_row_off + lane16 * head_dim + he_idx * QK_CHUNK_ELEMS, fx.Int64, 2
+                    q_row_off
+                    + (lane16 * head_dim + he_idx * QK_CHUNK_ELEMS) * QP_ELEM_BYTES,
+                    fx.Int64,
+                    4 if is_bf16_kv else 2,
                 )
-                q_ops_all.extend([chunk[0], chunk[1]])
+                for qkr in range_constexpr(4 if is_bf16_kv else 2):
+                    q_ops_all.append(chunk[qkr])
         _ct = [
             fx.Vector.from_elements(
                 [float(a * MFMA_MNK + r) for r in range_constexpr(4)]
@@ -977,7 +1090,7 @@ def compile_pa_decode_tile(
                 valid = valid & (_ct[a] >= lower)
             return valid
 
-        # Load one 16-token FP8 vector per head element; trans_v selects offsets.
+        # Load one 16-token FP8 or 8-token BF16 vector per head element.
         def _v_ops(phys_row, vh):
             head_group = ((vh * VHE_SIZE) // 16) + warp
             head_element = head_group * 16 + lane16
@@ -985,29 +1098,35 @@ def compile_pa_decode_tile(
             for sub in range_constexpr(PAGES_PER_CHUNK):
                 for step in range_constexpr(STEPS_PER_CHUNK):
                     # PV's token chunk is owned by rgroup after the LDS transpose.
-                    page_step = ((rgroup * TOK_PER_WARP) % block_size) // 16 + step
+                    page_step = ((rgroup * TOK_PER_WARP) % block_size) // (
+                        8 if is_bf16_kv else 16
+                    ) + step
                     if const_expr(trans_v):
                         base = _kv_addr(
                             phys_row[sub],
-                            n_kv * (STEPS_PER_PAGE * head_dim * 16),
+                            n_kv * (value_dim * block_size),
                             (
-                                (kv_h * STEPS_PER_PAGE + page_step) * head_dim
+                                (kv_h * STEPS_PER_PAGE + page_step) * value_dim
                                 + head_element
                             )
-                            * 16,
+                            * (8 if is_bf16_kv else 16),
                         )
                     else:
                         base = _kv_addr(
                             phys_row[sub],
-                            n_kv * (head_dim * block_size),
-                            (kv_h * head_dim + head_element) * block_size
+                            n_kv * (value_dim * block_size),
+                            (kv_h * value_dim + head_element) * block_size
                             + page_step * 16,
                         )
-                    w = _v_load16(base)
+                    if const_expr(is_bf16_kv):
+                        words = _v_load_bf16_words(base)
+                        ops.extend([words[0], words[1]])
+                    else:
+                        words = _v_load16(base)
+                        ops.extend([words[0], words[1]])
                     if const_expr(block_size == 16):
                         fx.rocdl.sched_barrier(fx.rocdl.mask_vmem_rd)
-                    ops.extend([w[0], w[1]])
-            if const_expr(head_dim == 64):
+            if const_expr(value_dim == 64):
                 fx.rocdl.sched_vmem(len(ops) // 2)
             return ops  # NVOPS i64, the 64-token contiguous run for this head
 
@@ -1069,8 +1188,8 @@ def compile_pa_decode_tile(
                 else fx.Int32(loop_i)
             )
             tok0 = tt * TILE_TOK
-            # Interleave MFMA with VALU/LDS or page16 V loads.
-            if const_expr((not per_token_kv and M_TILES > 1) or PAGE16_VPIPE):
+            # Short M groups retain the established instruction interleave.
+            if const_expr((not per_token_kv and 1 < M_TILES <= 4) or PAGE16_VPIPE):
                 fx.rocdl.iglp_opt(0)
 
             tt1 = tt + 1
@@ -1136,7 +1255,7 @@ def compile_pa_decode_tile(
                 ]
 
             q_scale_vec = None
-            if const_expr(M_TILES > 1):
+            if const_expr(M_TILES > 1 and not is_bf16_kv):
                 q_scale_vec = _lds_load(
                     sQscale_off + lane16 * (M_TILES * f32), fx.Float32, M_TILES
                 )
@@ -1173,7 +1292,7 @@ def compile_pa_decode_tile(
                     frag_Ss = []
                     for a in range_constexpr(NCHUNK):
                         acc = fx.Vector.filled(MFMA_ACC_ELEMS, 0.0, fx.Float32)
-                        acc = _mfma_fp8(
+                        acc = _mfma(
                             k_cur,
                             q_ops_all,
                             a * N_SUBCHUNKS,
@@ -1183,7 +1302,11 @@ def compile_pa_decode_tile(
                         )
                         frag_Ss.append(fx.Vector(acc))
 
-                    scale = scale_qk * fx.Float32(q_scale_vec[m])
+                    scale = (
+                        scale_qk
+                        if const_expr(is_bf16_kv)
+                        else scale_qk * fx.Float32(q_scale_vec[m])
+                    )
                     n_valid_tile = (tile_valid - causal_offset[m]).to(fx.Float32)
                     base_tok_f = fx.Int32(warp * TOK_PER_WARP + rgroup * 4).to(
                         fx.Float32
@@ -1424,7 +1547,7 @@ def compile_pa_decode_tile(
                         for vh in range_constexpr(VHE_CHUNKS):
                             v_vh = v_vh_shared[vh]
                             acc = fx.Vector.filled(MFMA_ACC_ELEMS, 0.0, fx.Float32)
-                            acc = _mfma_fp8(v_vh, p_ops, 0, 0, NVOPS, acc)
+                            acc = _mfma(v_vh, p_ops, 0, 0, NVOPS, acc)
                             op = fx.Vector(acc) * fx.Vector.from_elements(
                                 [v_max_scaled], dtype=fx.Float32
                             ).broadcast_to(OP_ELEMS)
@@ -1506,7 +1629,7 @@ def compile_pa_decode_tile(
                             [safe_max], dtype=fx.Float32
                         ).broadcast_to(4)
                         ls = fx.Float32(0.0)
-                        words = []
+                        p_chunks = []
                         for a in range_constexpr(NCHUNK):
                             Pa = fx.Vector(
                                 fx.exp2(masked_chunks[a] - m_new_b, fastmath="fast")
@@ -1519,23 +1642,36 @@ def compile_pa_decode_tile(
                                     else v_scale_shared[a]
                                 )
                                 p_scaled = Pa * v_sc * norm_factor_b
+                            elif const_expr(is_bf16_kv):
+                                p_scaled = Pa
                             else:
                                 p_scaled = Pa * fx.Vector.filled(4, FP8_MAX, fx.Float32)
-                            words.append(_f32_to_fp8_words(p_scaled)[0])
+                            if const_expr(is_bf16_kv):
+                                p_chunks.append(p_scaled.to(fx.BFloat16))
+                            else:
+                                p_chunks.append(_f32_to_fp8_words(p_scaled)[0])
 
                         p_off0 = (
                             p_base
                             + lane16 * SP_ROW_BYTES
-                            + warp * TOK_PER_WARP
-                            + rgroup * 4
+                            + (warp * TOK_PER_WARP + rgroup * 4) * QP_ELEM_BYTES
                         )
                         # Scatter P words in the interleave expected by PV reads.
                         for a in range_constexpr(NCHUNK):
-                            _lds_store(
-                                p_off0 + a * (MFMA_MNK // 4) * f32,
-                                fx.Int32,
-                                fx.Vector.from_elements([words[a]], dtype=fx.Int32),
-                            )
+                            if const_expr(is_bf16_kv):
+                                _lds_store(
+                                    p_off0 + a * MFMA_MNK * QP_ELEM_BYTES,
+                                    fx.BFloat16,
+                                    p_chunks[a],
+                                )
+                            else:
+                                _lds_store(
+                                    p_off0 + a * (MFMA_MNK // 4) * f32,
+                                    fx.Int32,
+                                    fx.Vector.from_elements(
+                                        [p_chunks[a]], dtype=fx.Int32
+                                    ),
+                                )
                         for sh in (16, 32):
                             ls = ls + ls.shuffle_xor(sh, WAVE)
                         # Empty history must contribute exp2(-inf-safe_max)=0;
@@ -1556,7 +1692,9 @@ def compile_pa_decode_tile(
                         )
 
                         p_ops = _lds_load(
-                            p_base + lane16 * SP_ROW_BYTES + rgroup * 64,
+                            p_base
+                            + lane16 * SP_ROW_BYTES
+                            + rgroup * 64 * QP_ELEM_BYTES,
                             fx.Int64,
                             NVOPS,
                         )
@@ -1567,7 +1705,7 @@ def compile_pa_decode_tile(
                         for vh in range_constexpr(VHE_CHUNKS):
                             v_vh = v_vh_shared[vh]
                             acc = fx.Vector.filled(MFMA_ACC_ELEMS, 0.0, fx.Float32)
-                            acc = _mfma_fp8(v_vh, p_ops, 0, 0, NVOPS, acc)
+                            acc = _mfma(v_vh, p_ops, 0, 0, NVOPS, acc)
                             op = fx.Vector(acc)
                             if const_expr(per_token_kv):
                                 op = op * fx.Vector.from_elements(
@@ -1581,11 +1719,12 @@ def compile_pa_decode_tile(
                         next_state.extend([*o_acc, m_new, l_new])
                         # Single P/Lsum slots need a read-retirement barrier.
                         # Alternating slots use the next write barrier; Phase A
-                        # protects loop boundaries. The fence bounds live registers.
+                        # protects loop boundaries.
                         if const_expr(m < M_TILES - 1):
                             if const_expr(P_BUFFERS == 1):
                                 gpu.barrier()
-                            fx.rocdl.sched_barrier(0)
+                            if const_expr(M_TILES <= 4):
+                                fx.rocdl.sched_barrier(0)
             else:
                 o_acc = [ostate[_o_slot(0, vh)] for vh in range_constexpr(VHE_CHUNKS)]
                 m_prev = ostate[_m_slot(0)]  # running max, carried from last tile
@@ -1593,9 +1732,7 @@ def compile_pa_decode_tile(
                 frag_Ss = []
                 for a in range_constexpr(NCHUNK):
                     acc = fx.Vector.filled(MFMA_ACC_ELEMS, 0.0, fx.Float32)
-                    acc = _mfma_fp8(
-                        k_cur, q_ops_all, a * N_SUBCHUNKS, 0, N_SUBCHUNKS, acc
-                    )
+                    acc = _mfma(k_cur, q_ops_all, a * N_SUBCHUNKS, 0, N_SUBCHUNKS, acc)
                     frag_Ss.append(fx.Vector(acc))
                 k_next = k_cur
                 if const_expr(not single_tile_plan) and tt1 < part_end:
@@ -1830,7 +1967,7 @@ def compile_pa_decode_tile(
                 for vh in range_constexpr(VHE_CHUNKS):
                     v_vh = v_vh_batch[vh]
                     acc = fx.Vector.filled(MFMA_ACC_ELEMS, 0.0, fx.Float32)
-                    acc = _mfma_fp8(v_vh, p_ops, 0, 0, NVOPS, acc)
+                    acc = _mfma(v_vh, p_ops, 0, 0, NVOPS, acc)
                     op = fx.Vector(acc)
                     if const_expr(per_token_kv):
                         op = op * fx.Vector.from_elements(
@@ -1878,7 +2015,7 @@ def compile_pa_decode_tile(
                     denominator, fx.Float32(1.0)
                 )
                 inv_l = kv_mass * fx.Float32(rcp_f32(safe_denominator))
-            if const_expr(per_token_kv):
+            if const_expr(per_token_kv or is_bf16_kv):
                 o_scale = inv_l
             elif const_expr(SCALAR_FP8_DECODE):
                 # Direct P conversion needs no compensating 1/FP8_MAX.
@@ -1899,7 +2036,7 @@ def compile_pa_decode_tile(
                     fx.ptr_store(o_norm, fx.add_offset(output, out_offset))
                 elif const_expr(buffer_plan_output):
                     # Row guards keep the full 8-byte store within this slot.
-                    pout_offset = global_row * head_dim + sub * OP_ELEMS  # noqa: B023
+                    pout_offset = global_row * value_dim + sub * OP_ELEMS  # noqa: B023
                     buf_copy_store(
                         pout_buffer,
                         pout_offset,
@@ -1910,7 +2047,7 @@ def compile_pa_decode_tile(
                     )
                 else:
                     base = partial_slot * TOTAL_ROWS + global_row  # noqa: B023
-                    pout_offset = base * head_dim + sub * OP_ELEMS
+                    pout_offset = base * value_dim + sub * OP_ELEMS
                     fx.ptr_store(
                         o_norm,
                         fx.add_offset(pout, pout_offset),
@@ -2079,3 +2216,1243 @@ def compile_pa_decode_tile(
         "kernel": pa_decode_tile_kernel,
     }
     return _PA_DECODE_TILE_CACHE.setdefault(cache_key, compiled)
+
+
+# gfx950 FP8 Qlen8 schedules for full attention.
+
+
+@functools.cache
+def compile_pa_decode_fp8_wave(head_dim, num_partitions, softmax_scale):
+    D = head_dim
+    NP = num_partitions
+    SCALE = softmax_scale if softmax_scale is not None else D**-0.5
+    KG = D // 64
+    BKG = D // 16
+    BKV_BYTES = (D + 128) * 64
+    KV_BYTES = (D + 128) * 128
+
+    @fx.struct
+    class SharedStorage:
+        data: fx.Array[fx.Int32, 2 * KV_BYTES // 4, 16]
+
+    @flyc.kernel(known_block_size=(256, 1, 1))
+    def pa_decode_fp8_wave32_kernel(
+        output_ptr: fx.Tensor,
+        pmax_ptr: fx.Tensor,
+        psum_ptr: fx.Tensor,
+        pout_ptr: fx.Tensor,
+        query_ptr: fx.Tensor,
+        key_ptr: fx.Tensor,
+        value_ptr: fx.Tensor,
+        tables_ptr: fx.Tensor,
+        lengths_ptr: fx.Tensor,
+        key_scale_ptr: fx.Tensor,
+        value_scale_ptr: fx.Tensor,
+        max_blocks: fx.Int32,
+        stride_q_row: fx.Int32,
+        stride_q_head: fx.Int32,
+    ):
+        shared = fx.SharedAllocator().allocate(SharedStorage).peek()
+        lds_base = fx.recast_iter(fx.Int8, shared.data.ptr)
+
+        # Writable scalar outputs must be explicit DSL helper arguments.
+        def _fp8_path(pmax_ptr, psum_ptr):
+            tid = fx.Int32(gpu.thread_id("x"))
+            wave = tid // 64
+            lane = tid % 64
+            col = lane % 32
+            half = lane // 32
+            seq = fx.Int32(gpu.block_id("x"))
+            kv_h = fx.Int32(gpu.block_id("y"))
+            part = fx.Int32(gpu.block_id("z"))
+            n_kv = fx.Int32(gpu.grid_dim.y)
+            row = wave * 32 + col
+            qi = row // 16
+            qh = kv_h * 16 + row % 16
+
+            q_load = make_flat_loader(query_ptr, fx.BFloat16, 8, fx.UniversalCopy128b())
+
+            tables = fx.rocdl.make_buffer_tensor(
+                tables_ptr,
+                max_size=False,
+                num_records_bytes=fx.Int64(gpu.grid_dim.x) * fx.Int64(max_blocks) * 4,
+            )
+            lengths = fx.rocdl.make_buffer_tensor(lengths_ptr, max_size=True)
+            ks = fx.rocdl.make_buffer_tensor(key_scale_ptr, max_size=True)
+            vs = fx.rocdl.make_buffer_tensor(value_scale_ptr, max_size=True)
+            context = fx.Int32(buf_scalar_load(lengths, seq))
+            key_scale = fx.Int32(buf_scalar_load(ks, fx.Int32(0))).bitcast(fx.Float32)
+            value_scale = fx.Int32(buf_scalar_load(vs, fx.Int32(0))).bitcast(fx.Float32)
+
+            def _page(tt):
+                return fx.Int64(
+                    fx.Int32(buf_scalar_load(tables, seq * max_blocks + tt))
+                )
+
+            def _stage_kv(tt, buf):
+                for pg in range_constexpr(2):
+                    page = _page(fx.min(tt * 2 + pg, cdiv(context, 64) - 1))
+                    k_src = page_resource(
+                        key_ptr, (page * n_kv + kv_h) * (D * 64), D * 64
+                    )
+                    v_src = page_resource(value_ptr, (page * n_kv + kv_h) * 8192, 8192)
+                    for u in range_constexpr(KG):
+                        local = tid * 16 + u * 4096
+                        async_load_lds_nt(
+                            k_src,
+                            local,
+                            lds_base,
+                            buf * KV_BYTES + pg * D * 64 + wave * 1024 + u * 4096,
+                        )
+                    for u in range_constexpr(2):
+                        local = tid * 16 + u * 4096
+                        async_load_lds_nt(
+                            v_src,
+                            local,
+                            lds_base,
+                            buf * KV_BYTES
+                            + D * 128
+                            + pg * 8192
+                            + wave * 1024
+                            + u * 4096,
+                        )
+                fx.rocdl.asyncmark()
+
+            def _k_ops(buf, nt, kg):
+                ops = []
+                for u in range_constexpr(2):
+                    off = (
+                        buf * KV_BYTES
+                        + (nt // 2) * D * 64
+                        + ((kg * 4 + half * 2 + u) * 64 + (nt % 2) * 32 + col) * 16
+                    )
+                    words = load_lds_words(lds_base, off)
+                    ops.extend([words[i] for i in range_constexpr(4)])
+                return fx.Vector.from_elements(ops, dtype=fx.Int32)
+
+            def _v_tile(buf, vh, step):
+                words = []
+                for u in range_constexpr(2):
+                    token_group = half * 2 + u
+                    off = (
+                        buf * KV_BYTES
+                        + D * 128
+                        + step * 8192
+                        + (token_group * 128 + vh * 32 + col) * 16
+                    )
+                    chunk = load_lds_words(lds_base, off)
+                    words.extend([chunk[i] for i in range_constexpr(4)])
+                return fx.Vector.from_elements(words, dtype=fx.Int32)
+
+            def _pack(values):
+                words = []
+                for g in range_constexpr(len(values) // 4):
+                    j = 4 * g
+                    lo = fx.rocdl.cvt_pk_fp8_f32(
+                        T.i32, values[j], values[j + 1], 0, False
+                    )
+                    words.append(
+                        fx.Int32(
+                            fx.rocdl.cvt_pk_fp8_f32(
+                                T.i32, values[j + 2], values[j + 3], lo, True
+                            )
+                        )
+                    )
+                return fx.Vector.from_elements(words, dtype=fx.Int32)
+
+            def _pack_p(values):
+                words = []
+                for g in range_constexpr(4):
+                    j = 4 * g
+                    word = fx.Vector.filled(2, 0, fx.Int16).ir_value()
+                    word = fx.rocdl.cvt_scalef32_pk_fp8_f32(
+                        T.vec(2, T.i16),
+                        word,
+                        values[j].ir_value(),
+                        values[j + 1].ir_value(),
+                        fx.Float32(1.0 / 256.0).ir_value(),
+                        False,
+                    )
+                    word = fx.rocdl.cvt_scalef32_pk_fp8_f32(
+                        T.vec(2, T.i16),
+                        word,
+                        values[j + 2].ir_value(),
+                        values[j + 3].ir_value(),
+                        fx.Float32(1.0 / 256.0).ir_value(),
+                        True,
+                    )
+                    words.append(fx.Vector(word).bitcast(fx.Int32)[0])
+                return fx.Vector.from_elements(words, dtype=fx.Int32)
+
+            def _mma(a, b, acc):
+                return fx.Vector(
+                    fx.rocdl.mfma_scale_f32_32x32x64_f8f6f4(
+                        T.vec(16, T.f32),
+                        [
+                            a,
+                            b,
+                            acc,
+                            0,
+                            0,
+                            0,
+                            fx.Int32(0x7F7F7F7F),
+                            0,
+                            fx.Int32(0x7F7F7F7F),
+                        ],
+                    )
+                )
+
+            q_units = []
+            q_base = (seq * 8 + qi) * stride_q_row + qh * stride_q_head
+            for kg in range_constexpr(KG):
+                for u in range_constexpr(4):
+                    q_units.append(q_load(q_base + kg * 64 + half * 32 + u * 8))
+            amax = fx.Float32(0.0)
+            for u in range_constexpr(KG * 4):
+                amax = fx.maxnumf(
+                    amax, fx.absf(q_units[u].to(fx.Float32)).reduce(ReductionOp.MAX)
+                )
+            amax_lo, amax_hi = reduce_lane_pair(amax)
+            amax = fx.maxnumf(amax_lo, amax_hi)
+            q_scale = fx.maxnumf(amax * fx.Float32(1.0 / 448.0), fx.Float32(1e-20))
+            inv_q = fx.Float32(fp8_qlen8_rcp_f32(q_scale))
+            q_ops = []
+            for kg in range_constexpr(KG):
+                values = []
+                for u in range_constexpr(4):
+                    for i in range_constexpr(8):
+                        values.append(q_units[kg * 4 + u][i].to(fx.Float32) * inv_q)
+                q_ops.append(_pack(values))
+            scale = fx.Float32(SCALE * LOG2E) * key_scale * q_scale
+            zero = fx.Float32(0.0)
+            neg_inf = fx.Float32(float("-inf"))
+            num_tiles = cdiv(context, 128)
+            per_part = cdiv(num_tiles, NP)
+            begin = part * per_part
+            end = fx.min(begin + per_part, num_tiles)
+            if begin < end:
+                _stage_kv(begin, fx.Int32(0))
+                fx.rocdl.wait_asyncmark(0)
+            gpu.barrier()
+            out_zero = fx.Vector.filled(16, 0.0, fx.Float32)
+            init = [neg_inf, zero, out_zero, out_zero, out_zero, out_zero]
+            for tt, state in range(begin, end, 1, init=init):
+                tt = fx.Int32(tt)
+                buf = (tt - begin) & fx.Int32(1)
+                if tt + 1 < end:
+                    _stage_kv(tt + 1, buf ^ fx.Int32(1))
+                scores = []
+                for nt in range_constexpr(4):
+                    acc = fx.Vector.filled(16, 0.0, fx.Float32)
+                    for kg in range_constexpr(KG):
+                        a = _k_ops(buf, nt, kg)
+                        acc = _mma(a, q_ops[kg], acc)
+                    score = acc
+                    if (tt + 1) * 128 > context - 7:
+                        tokens = fx.Vector.from_elements(
+                            [
+                                tt * 128 + nt * 32 + half * 4 + (i % 4) + (i // 4) * 8
+                                for i in range_constexpr(16)
+                            ],
+                            dtype=fx.Int32,
+                        )
+                        bound = fx.Vector.from_elements(
+                            [context - 7 + qi], dtype=fx.Int32
+                        ).broadcast_to(16)
+                        score = (tokens < bound).select(
+                            acc, fx.Vector.filled(16, float("-inf"), fx.Float32)
+                        )
+                    scores.append(score)
+
+                local_max = fx.maxnumf(
+                    scores[0].reduce(ReductionOp.MAX), scores[1].reduce(ReductionOp.MAX)
+                )
+                for nt in range_constexpr(2, 4):
+                    local_max = fx.maxnumf(
+                        local_max, scores[nt].reduce(ReductionOp.MAX)
+                    )
+                max_lo, max_hi = reduce_lane_pair(local_max)
+                tile_max = fx.maxnumf(max_lo, max_hi) * scale
+                new_max = fx.maxnumf(state[0], tile_max)
+                safe_max = (new_max > neg_inf).select(new_max, zero)
+                max_vec = fx.Vector.from_elements(
+                    [safe_max], dtype=fx.Float32
+                ).broadcast_to(16)
+                probs = [
+                    fx.Vector(
+                        exp2_f32_fast(
+                            scores[nt]
+                            * fx.Vector.from_elements(
+                                [scale], dtype=fx.Float32
+                            ).broadcast_to(16)
+                            - max_vec
+                        )
+                    )
+                    for nt in range_constexpr(4)
+                ]
+                local_sum = probs[0].reduce(ReductionOp.ADD) + probs[1].reduce(
+                    ReductionOp.ADD
+                )
+                for nt in range_constexpr(2, 4):
+                    local_sum = local_sum + probs[nt].reduce(ReductionOp.ADD)
+                sum_lo, sum_hi = reduce_lane_pair(local_sum)
+                tile_sum = sum_lo + sum_hi
+                corr = fx.Float32(exp2_amdgcn_scalar(state[0] - safe_max))
+                new_sum = state[1] * corr + tile_sum
+                p_words = [
+                    _pack_p([probs[nt][i] for i in range_constexpr(16)])
+                    for nt in range_constexpr(4)
+                ]
+                p = []
+                for step in range_constexpr(2):
+                    packed = []
+                    for g in range_constexpr(4):
+                        low, high = swap_lane_pair(
+                            p_words[2 * step][g], p_words[2 * step + 1][g]
+                        )
+                        packed.extend([low, high])
+                    p.append(fx.Vector.from_elements(packed, dtype=fx.Int32))
+                updated = []
+                corr_vec = fx.Vector.from_elements(
+                    [corr], dtype=fx.Float32
+                ).broadcast_to(16)
+                for vh in range_constexpr(4):
+                    out = state[2 + vh] * corr_vec
+                    for step in range_constexpr(2):
+                        out = _mma(_v_tile(buf, vh, step), p[step], out)
+                    updated.append(out)
+                fx.rocdl.wait_asyncmark(0)
+                gpu.barrier()
+                results = yield [new_max, new_sum, *updated]
+
+            denom = results[1]
+            safe_denom = (denom > zero).select(denom, fx.Float32(1.0))
+            out_scale = (
+                fx.Float32(fp8_qlen8_rcp_f32(safe_denom))
+                * value_scale
+                * fx.Float32(1.0 / 256.0)
+            )
+            for vh in range_constexpr(4):
+                for g in range_constexpr(4):
+                    norm = fx.Vector.from_elements(
+                        [
+                            results[2 + vh][g * 4 + i] * out_scale
+                            for i in range_constexpr(4)
+                        ],
+                        dtype=fx.Float32,
+                    ).to(fx.BFloat16)
+                    sub = (vh * 32 + half * 4 + g * 8) // 4
+                    if const_expr(NP == 1):
+                        out_row = output_ptr[seq * 8 + qi, qh, None]
+                        fx.slice(
+                            fx.logical_divide(out_row, fx.make_layout(4, 1)),
+                            (None, sub),
+                        ).store(norm)
+                    else:
+                        base = ((seq * n_kv + kv_h) * NP + part) * 128 + row
+                        div = fx.logical_divide(pout_ptr, fx.make_layout(4, 1))
+                        fx.slice(div, (None, base * 32 + sub)).store(norm)
+            if const_expr(NP > 1):  # noqa: SIM102 - Static NP, dynamic lane mask.
+                if half == 0:
+                    base = ((seq * n_kv + kv_h) * NP + part) * 128 + row
+                    pmax_ptr[base] = results[0] * fx.Float32(1.0 / LOG2E)
+                    psum_ptr[base] = denom
+
+        def _bf16_path(pmax_ptr, psum_ptr):
+            tid = fx.Int32(gpu.thread_id("x"))
+            wave = tid // 64
+            lane = tid % 64
+            col = lane % 32
+            half = lane // 32
+            seq = fx.Int32(gpu.block_id("x"))
+            kv_h = fx.Int32(gpu.block_id("y"))
+            part = fx.Int32(gpu.block_id("z"))
+            n_kv = fx.Int32(gpu.grid_dim.y)
+            row = wave * 32 + col
+            qi = row // 16
+            qh = kv_h * 16 + row % 16
+
+            q_load = make_flat_loader(query_ptr, fx.BFloat16, 8, fx.UniversalCopy128b())
+
+            tables = fx.rocdl.make_buffer_tensor(
+                tables_ptr,
+                max_size=False,
+                num_records_bytes=fx.Int64(gpu.grid_dim.x) * fx.Int64(max_blocks) * 4,
+            )
+            lengths = fx.rocdl.make_buffer_tensor(lengths_ptr, max_size=True)
+            context = fx.Int32(buf_scalar_load(lengths, seq))
+            ks = fx.rocdl.make_buffer_tensor(key_scale_ptr, max_size=True)
+            vs = fx.rocdl.make_buffer_tensor(value_scale_ptr, max_size=True)
+            key_scale = fx.Int32(buf_scalar_load(ks, fx.Int32(0))).bitcast(fx.Float32)
+            value_scale = fx.Int32(buf_scalar_load(vs, fx.Int32(0))).bitcast(fx.Float32)
+
+            def _page(tt):
+                return fx.Int64(
+                    fx.Int32(buf_scalar_load(tables, seq * max_blocks + tt))
+                )
+
+            def _stage_kv(tt, buf):
+                page = _page(tt)
+                # Rebase each bounded descriptor at a 64-bit physical-page address.
+                k_src = page_resource(key_ptr, (page * n_kv + kv_h) * (D * 64), D * 64)
+                v_src = page_resource(value_ptr, (page * n_kv + kv_h) * 8192, 8192)
+                for u in range_constexpr(D // 64):
+                    local = tid * 16 + u * 4096
+                    async_load_lds_nt(
+                        k_src, local, lds_base, buf * BKV_BYTES + wave * 1024 + u * 4096
+                    )
+                for u in range_constexpr(2):
+                    local = tid * 16 + u * 4096
+                    async_load_lds_nt(
+                        v_src,
+                        local,
+                        lds_base,
+                        buf * BKV_BYTES + D * 64 + wave * 1024 + u * 4096,
+                    )
+                fx.rocdl.asyncmark()
+
+            def _decode(words):
+                values = []
+                for word in range_constexpr(2):
+                    for hi in range_constexpr(2):
+                        pair = fx.Vector(
+                            fx.rocdl.cvt_scalef32_pk_bf16_fp8(
+                                T.vec(2, T.bf16),
+                                words[word].ir_value(),
+                                fx.Float32(1.0).ir_value(),
+                                bool(hi),
+                            )
+                        )
+                        values.extend([pair[0], pair[1]])
+                return fx.Vector.from_elements(values, dtype=fx.BFloat16)
+
+            def _k_ops(buf, nt, kg):
+                off = buf * BKV_BYTES + (kg * 64 + nt * 32 + col) * 16 + half * 8
+                return _decode(load_lds_words(lds_base, off, words=2))
+
+            def _v_tile(buf, vh, step):
+                off = (
+                    buf * BKV_BYTES
+                    + D * 64
+                    + (step * 128 + vh * 32 + col) * 16
+                    + half * 8
+                )
+                return _decode(load_lds_words(lds_base, off, words=2))
+
+            def _mma(a, b, acc):
+                return fx.Vector(
+                    fx.rocdl.mfma_f32_32x32x16_bf16(
+                        T.vec(16, T.f32), [a, b, acc, 0, 0, 0]
+                    )
+                )
+
+            q_base = (seq * 8 + qi) * stride_q_row + qh * stride_q_head
+            q_ops = [q_load(q_base + kg * 16 + half * 8) for kg in range_constexpr(BKG)]
+            scale = fx.Float32(SCALE * LOG2E) * key_scale
+            zero = fx.Float32(0.0)
+            neg_inf = fx.Float32(float("-inf"))
+            num_tiles = cdiv(context, 64)
+            per_part = cdiv(num_tiles, NP)
+            begin = part * per_part
+            end = fx.min(begin + per_part, num_tiles)
+            if begin < end:
+                _stage_kv(begin, fx.Int32(0))
+                fx.rocdl.wait_asyncmark(0)
+            gpu.barrier()
+            out_zero = fx.Vector.filled(16, 0.0, fx.Float32)
+            init = [neg_inf, zero, out_zero, out_zero, out_zero, out_zero]
+            for tt, state in range(begin, end, 1, init=init):
+                tt = fx.Int32(tt)
+                buf = (tt - begin) & fx.Int32(1)
+                if tt + 1 < end:
+                    _stage_kv(tt + 1, buf ^ fx.Int32(1))
+                qk = [
+                    fx.Vector.filled(16, 0.0, fx.Float32) for nt in range_constexpr(2)
+                ]
+                for kg in range_constexpr(BKG):
+                    operands = [_k_ops(buf, nt, kg) for nt in range_constexpr(2)]
+                    qk = [
+                        _mma(operands[nt], q_ops[kg], qk[nt])
+                        for nt in range_constexpr(2)
+                    ]
+                scores = []
+                for nt in range_constexpr(2):
+                    acc = qk[nt]
+                    score = acc
+                    if (tt + 1) * 64 > context - 7:
+                        tokens = fx.Vector.from_elements(
+                            [
+                                tt * 64 + nt * 32 + half * 4 + (i % 4) + (i // 4) * 8
+                                for i in range_constexpr(16)
+                            ],
+                            dtype=fx.Int32,
+                        )
+                        bound = fx.Vector.from_elements(
+                            [context - 7 + qi], dtype=fx.Int32
+                        ).broadcast_to(16)
+                        score = (tokens < bound).select(
+                            acc, fx.Vector.filled(16, float("-inf"), fx.Float32)
+                        )
+                    scores.append(score)
+
+                local_max = fx.maxnumf(
+                    scores[0].reduce(ReductionOp.MAX), scores[1].reduce(ReductionOp.MAX)
+                )
+                max_lo, max_hi = reduce_lane_pair(local_max)
+                tile_max = fx.maxnumf(max_lo, max_hi) * scale
+                new_max = fx.maxnumf(state[0], tile_max)
+                safe_max = (new_max > neg_inf).select(new_max, zero)
+                max_vec = fx.Vector.from_elements(
+                    [safe_max], dtype=fx.Float32
+                ).broadcast_to(16)
+                probs = [
+                    fx.Vector(
+                        exp2_f32_fast(
+                            scores[nt]
+                            * fx.Vector.from_elements(
+                                [scale], dtype=fx.Float32
+                            ).broadcast_to(16)
+                            - max_vec
+                        )
+                    )
+                    for nt in range_constexpr(2)
+                ]
+                local_sum = probs[0].reduce(ReductionOp.ADD) + probs[1].reduce(
+                    ReductionOp.ADD
+                )
+                sum_lo, sum_hi = reduce_lane_pair(local_sum)
+                tile_sum = sum_lo + sum_hi
+                # Keep the initial previous max at -inf, including for negative logits.
+                corr = fx.Float32(exp2_amdgcn_scalar(state[0] - safe_max))
+                new_sum = state[1] * corr + tile_sum
+                p_words = [
+                    probs[nt].to(fx.BFloat16).bitcast(fx.Int32)
+                    for nt in range_constexpr(2)
+                ]
+                p = []
+                for step in range_constexpr(4):
+                    nt = step // 2
+                    group = (step % 2) * 2
+                    low = []
+                    high = []
+                    for word in range_constexpr(2):
+                        a = p_words[nt][group * 2 + word]
+                        b = p_words[nt][(group + 1) * 2 + word]
+                        low_word, high_word = swap_lane_pair(a, b)
+                        low.append(low_word)
+                        high.append(high_word)
+                    p.append(
+                        fx.Vector.from_elements([*low, *high], dtype=fx.Int32).bitcast(
+                            fx.BFloat16
+                        )
+                    )
+                corr_vec = fx.Vector.from_elements(
+                    [corr], dtype=fx.Float32
+                ).broadcast_to(16)
+                updated = [state[2 + vh] * corr_vec for vh in range_constexpr(4)]
+                for step in range_constexpr(4):
+                    v_ops = [_v_tile(buf, vh, step) for vh in range_constexpr(4)]
+                    updated = [
+                        _mma(v_ops[vh], p[step], updated[vh])
+                        for vh in range_constexpr(4)
+                    ]
+                    # Finish next-tile DMA and all current-tile reads before reusing LDS.
+                fx.rocdl.wait_asyncmark(0)
+                gpu.barrier()
+                results = yield [new_max, new_sum, *updated]
+
+            denom = results[1]
+            safe_denom = (denom > zero).select(denom, fx.Float32(1.0))
+            out_scale = fx.Float32(fp8_qlen8_rcp_f32(safe_denom)) * value_scale
+            for vh in range_constexpr(4):
+                for g in range_constexpr(4):
+                    norm = fx.Vector.from_elements(
+                        [
+                            results[2 + vh][g * 4 + i] * out_scale
+                            for i in range_constexpr(4)
+                        ],
+                        dtype=fx.Float32,
+                    ).to(fx.BFloat16)
+                    sub = (vh * 32 + half * 4 + g * 8) // 4
+                    if const_expr(NP == 1):
+                        out_row = output_ptr[seq * 8 + qi, qh, None]
+                        fx.slice(
+                            fx.logical_divide(out_row, fx.make_layout(4, 1)),
+                            (None, sub),
+                        ).store(norm)
+                    else:
+                        base = ((seq * n_kv + kv_h) * NP + part) * 128 + row
+                        div = fx.logical_divide(pout_ptr, fx.make_layout(4, 1))
+                        fx.slice(div, (None, base * 32 + sub)).store(norm)
+            if const_expr(NP > 1):  # noqa: SIM102 - Static NP, dynamic lane mask.
+                if half == 0:
+                    base = ((seq * n_kv + kv_h) * NP + part) * 128 + row
+                    pmax_ptr[base] = results[0] * fx.Float32(1.0 / LOG2E)
+                    psum_ptr[base] = denom
+
+        lengths_resource = fx.rocdl.make_buffer_tensor(lengths_ptr, max_size=True)
+        sequence_context = fx.Int32(
+            buf_scalar_load(lengths_resource, fx.Int32(gpu.block_id("x")))
+        )
+        # Short contexts amplify Q/P quantization error; keep KV storage FP8.
+        if sequence_context <= fx.Int32(BF16_CONTEXT_LIMIT):
+            _bf16_path(pmax_ptr, psum_ptr)
+        else:
+            _fp8_path(pmax_ptr, psum_ptr)
+
+    @flyc.jit
+    def launch(
+        output: fx.Tensor,
+        pmax: fx.Tensor,
+        psum: fx.Tensor,
+        pout: fx.Tensor,
+        query: fx.Tensor,
+        key: fx.Tensor,
+        value: fx.Tensor,
+        tables: fx.Tensor,
+        lengths: fx.Tensor,
+        key_scale: fx.Tensor,
+        value_scale: fx.Tensor,
+        max_blocks: fx.Int32,
+        num_seqs: fx.Int32,
+        num_kv: fx.Int32,
+        stride_ks_block: fx.Int32,
+        stride_ks_head: fx.Int32,
+        stride_q_row: fx.Int32,
+        stride_q_head: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008 - FlyDSL ABI default.
+    ):
+        with CompilationContext.compile_hints(
+            {"fastmath": arith.FastMathFlags.contract}
+        ):
+            pa_decode_fp8_wave32_kernel(
+                output,
+                pmax,
+                psum,
+                pout,
+                query,
+                key,
+                value,
+                tables,
+                lengths,
+                key_scale,
+                value_scale,
+                max_blocks,
+                stride_q_row,
+                stride_q_head,
+            ).launch(grid=(num_seqs, num_kv, NP), block=(256, 1, 1), stream=stream)
+
+    return {"launch": launch, "kernel": pa_decode_fp8_wave32_kernel}
+
+
+@functools.cache
+def compile_pa_decode_fp8_small(head_dim, num_partitions, softmax_scale):
+    D = head_dim
+    NP = num_partitions
+    SCALE = softmax_scale if softmax_scale is not None else D**-0.5
+    NKG = cdiv(D, 128)
+    BKG = D // 32
+    BKV_BYTES = (D + 128) * 64
+    KV_BYTES = (D + 128) * 128
+
+    @fx.struct
+    class SharedStorage:
+        data: fx.Array[fx.Int32, 2 * KV_BYTES // 4, 16]
+
+    @flyc.kernel(known_block_size=(256, 1, 1))
+    def pa_decode_fp8_small_kernel(
+        output_ptr: fx.Tensor,
+        pmax_ptr: fx.Tensor,
+        psum_ptr: fx.Tensor,
+        pout_ptr: fx.Tensor,
+        query_ptr: fx.Tensor,
+        key_ptr: fx.Tensor,
+        value_ptr: fx.Tensor,
+        tables_ptr: fx.Tensor,
+        lengths_ptr: fx.Tensor,
+        key_scale_ptr: fx.Tensor,
+        value_scale_ptr: fx.Tensor,
+        max_blocks: fx.Int32,
+        stride_q_row: fx.Int32,
+        stride_q_head: fx.Int32,
+    ):
+        shared = fx.SharedAllocator().allocate(SharedStorage).peek()
+        lds_base = fx.recast_iter(fx.Int8, shared.data.ptr)
+        block = fx.Int32(gpu.block_id("x"))
+        num_sequences = fx.Int32(gpu.grid_dim.x) // 2
+        sequence_base = (block // 16) * 8
+        live_sequences = fx.min(fx.Int32(8), num_sequences - sequence_base)
+        sequence = sequence_base + (block % 16) % live_sequences
+        query_group = (block % 16) // live_sequences
+
+        def _fp8_path(pmax_ptr, psum_ptr):
+            tid = fx.Int32(gpu.thread_id("x"))
+            wave = tid // 64
+            lane = tid % 64
+            col = lane % 16
+            rg = lane // 16
+            seq = sequence
+            kv_h = fx.Int32(gpu.block_id("y"))
+            part = fx.Int32(gpu.block_id("z"))
+            n_kv = fx.Int32(gpu.grid_dim.y)
+            row = query_group * 64 + wave * 16 + col
+            qi = row // 16
+            qh = kv_h * 16 + col
+
+            _q_load = make_flat_loader(
+                query_ptr, fx.BFloat16, 8, fx.UniversalCopy128b()
+            )
+
+            tables = fx.rocdl.make_buffer_tensor(
+                tables_ptr,
+                max_size=False,
+                num_records_bytes=fx.Int64(gpu.grid_dim.x)
+                // 2
+                * fx.Int64(max_blocks)
+                * 4,
+            )
+            lengths = fx.rocdl.make_buffer_tensor(lengths_ptr, max_size=True)
+            ks = fx.rocdl.make_buffer_tensor(key_scale_ptr, max_size=True)
+            vs = fx.rocdl.make_buffer_tensor(value_scale_ptr, max_size=True)
+            context = fx.Int32(buf_scalar_load(lengths, seq))
+            key_scale = fx.Int32(buf_scalar_load(ks, fx.Int32(0))).bitcast(fx.Float32)
+            value_scale = fx.Int32(buf_scalar_load(vs, fx.Int32(0))).bitcast(fx.Float32)
+
+            def _page(tt):
+                return fx.Int64(
+                    fx.Int32(buf_scalar_load(tables, seq * max_blocks + tt))
+                )
+
+            def _stage_kv(tt, buf):
+                # Every 1024-byte wave chunk stays within a single physical page.
+                for u in range_constexpr(D // 32):
+                    wave_offset = wave * 1024 + u * 4096
+                    pg = wave_offset // (D * 64)
+                    page = _page(fx.min(tt * 2 + pg, cdiv(context, 64) - 1))
+                    src = page_resource(
+                        key_ptr, (page * n_kv + kv_h) * (D * 64), D * 64
+                    )
+                    async_load_lds_nt(
+                        src,
+                        tid * 16 + u * 4096 - pg * (D * 64),
+                        lds_base,
+                        buf * KV_BYTES + wave_offset,
+                    )
+                for pg in range_constexpr(2):
+                    page = _page(fx.min(tt * 2 + pg, cdiv(context, 64) - 1))
+                    src = page_resource(value_ptr, (page * n_kv + kv_h) * 8192, 8192)
+                    for u in range_constexpr(2):
+                        async_load_lds_nt(
+                            src,
+                            tid * 16 + u * 4096,
+                            lds_base,
+                            buf * KV_BYTES
+                            + D * 128
+                            + pg * 8192
+                            + wave * 1024
+                            + u * 4096,
+                        )
+                fx.rocdl.asyncmark()
+
+            def _k_ops(buf, nt, kg):
+                words = []
+                for u in range_constexpr(2):
+                    if const_expr((kg * 2 + u) * 64 < D):
+                        off = (
+                            buf * KV_BYTES
+                            + (nt // 4) * D * 64
+                            + (((kg * 2 + u) * 4 + rg) * 64 + (nt % 4) * 16 + col) * 16
+                        )
+                        chunk = load_lds_words(lds_base, off)
+                    else:
+                        chunk = fx.Vector.filled(4, 0, fx.Int32)
+                    words.extend([chunk[i] for i in range_constexpr(4)])
+                return fx.Vector.from_elements(words, dtype=fx.Int32)
+
+            def _v_ops(buf, vh):
+                words = []
+                for u in range_constexpr(2):
+                    off = (
+                        buf * KV_BYTES
+                        + D * 128
+                        + (rg // 2) * 8192
+                        + (((rg % 2) * 2 + u) * 128 + vh * 16 + col) * 16
+                    )
+                    chunk = load_lds_words(lds_base, off)
+                    words.extend([chunk[i] for i in range_constexpr(4)])
+                return fx.Vector.from_elements(words, dtype=fx.Int32)
+
+            def _pack(values):
+                words = []
+                for g in range_constexpr(len(values) // 4):
+                    i = g * 4
+                    lo = fx.rocdl.cvt_pk_fp8_f32(
+                        T.i32, values[i], values[i + 1], 0, False
+                    )
+                    words.append(
+                        fx.Int32(
+                            fx.rocdl.cvt_pk_fp8_f32(
+                                T.i32, values[i + 2], values[i + 3], lo, True
+                            )
+                        )
+                    )
+                return fx.Vector.from_elements(words, dtype=fx.Int32)
+
+            def _pack_p(prob):
+                word = fx.Vector.filled(2, 0, fx.Int16).ir_value()
+                word = fx.rocdl.cvt_scalef32_pk_fp8_f32(
+                    T.vec(2, T.i16),
+                    word,
+                    prob[0].ir_value(),
+                    prob[1].ir_value(),
+                    fx.Float32(1.0 / 256.0).ir_value(),
+                    False,
+                )
+                word = fx.rocdl.cvt_scalef32_pk_fp8_f32(
+                    T.vec(2, T.i16),
+                    word,
+                    prob[2].ir_value(),
+                    prob[3].ir_value(),
+                    fx.Float32(1.0 / 256.0).ir_value(),
+                    True,
+                )
+                return fx.Vector(word).bitcast(fx.Int32)[0]
+
+            def _mma(a, b, acc):
+                return fx.Vector(
+                    fx.rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                        T.f32x4,
+                        [
+                            a,
+                            b,
+                            acc,
+                            0,
+                            0,
+                            0,
+                            fx.Int32(0x7F7F7F7F),
+                            0,
+                            fx.Int32(0x7F7F7F7F),
+                        ],
+                    )
+                )
+
+            q_base = (
+                fx.Int64(seq * 8 + qi) * stride_q_row + fx.Int64(qh) * stride_q_head
+            )
+            units = []
+            for kg in range_constexpr(NKG):
+                for u in range_constexpr(4):
+                    vals = fx.Vector.filled(8, 0.0, fx.BFloat16)
+                    if const_expr((kg * 2 + u // 2) * 64 < D):
+                        vals = _q_load(
+                            q_base + (kg * 2 + u // 2) * 64 + rg * 16 + (u % 2) * 8
+                        )
+                    units.append(vals)
+            amax = fx.Float32(0.0)
+            for u in range_constexpr(NKG * 4):
+                amax = fx.maxnumf(
+                    amax, fx.absf(units[u].to(fx.Float32)).reduce(ReductionOp.MAX)
+                )
+            for bit in (1, 2):
+                lo, hi = reduce_lane_pair(amax, bit)
+                amax = fx.maxnumf(lo, hi)
+            qscale = fx.maxnumf(amax * fx.Float32(1.0 / 448.0), fx.Float32(1e-20))
+            invq = fx.Float32(fp8_qlen8_rcp_f32(qscale))
+            q_ops = []
+            for kg in range_constexpr(NKG):
+                q_ops.append(
+                    _pack(
+                        [
+                            units[kg * 4 + i // 8][i % 8].to(fx.Float32) * invq
+                            for i in range_constexpr(32)
+                        ]
+                    )
+                )
+            scale = fx.Float32(SCALE * LOG2E) * key_scale * qscale
+            zero = fx.Float32(0.0)
+            neg_inf = fx.Float32(float("-inf"))
+            num_tiles = cdiv(context, 128)
+            per_part = cdiv(num_tiles, NP)
+            begin = part * per_part
+            end = fx.min(begin + per_part, num_tiles)
+            if begin < end:
+                _stage_kv(begin, fx.Int32(0))
+                fx.rocdl.wait_asyncmark(0)
+            gpu.barrier()
+            out_zero = fx.Vector.filled(4, 0.0, fx.Float32)
+            init = [neg_inf, zero, *([out_zero] * 8)]
+            for tt, state in range(begin, end, 1, init=init):
+                tt = fx.Int32(tt)
+                buf = (tt - begin) & fx.Int32(1)
+                if tt + 1 < end:
+                    _stage_kv(tt + 1, buf ^ fx.Int32(1))
+                scores = []
+                local_max = neg_inf
+                for nt in range_constexpr(8):
+                    acc = fx.Vector.filled(4, 0.0, fx.Float32)
+                    for kg in range_constexpr(NKG):
+                        acc = _mma(_k_ops(buf, nt, kg), q_ops[kg], acc)
+                    score = acc
+                    if (tt + 1) * 128 > context - 7:
+                        tokens = fx.Vector.from_elements(
+                            [
+                                tt * 128 + nt * 16 + rg * 4 + i
+                                for i in range_constexpr(4)
+                            ],
+                            dtype=fx.Int32,
+                        )
+                        bound = fx.Vector.from_elements(
+                            [context - 7 + qi], dtype=fx.Int32
+                        ).broadcast_to(4)
+                        score = (tokens < bound).select(
+                            acc, fx.Vector.filled(4, float("-inf"), fx.Float32)
+                        )
+                    local_max = fx.maxnumf(local_max, score.reduce(ReductionOp.MAX))
+                    scores.append(score)
+                for bit in (1, 2):
+                    lo, hi = reduce_lane_pair(local_max, bit)
+                    local_max = fx.maxnumf(lo, hi)
+                new_max = fx.maxnumf(state[0], local_max * scale)
+                safe_max = (new_max > neg_inf).select(new_max, zero)
+                max_vec = fx.Vector.from_elements(
+                    [safe_max], dtype=fx.Float32
+                ).broadcast_to(4)
+                scale_vec = fx.Vector.from_elements(
+                    [scale], dtype=fx.Float32
+                ).broadcast_to(4)
+                local_sum = zero
+                p_words = []
+                for nt in range_constexpr(8):
+                    prob = fx.Vector(exp2_f32_fast(scores[nt] * scale_vec - max_vec))
+                    local_sum = local_sum + prob.reduce(ReductionOp.ADD)
+                    p_words.append(_pack_p(prob))
+                for bit in (1, 2):
+                    lo, hi = reduce_lane_pair(local_sum, bit)
+                    local_sum = lo + hi
+                corr = fx.Float32(exp2_amdgcn_scalar(state[0] - safe_max))
+                new_sum = state[1] * corr + local_sum
+                packed = []
+                for nt_half in range_constexpr(2):
+                    values = [p_words[2 * g + nt_half] for g in range_constexpr(4)]
+                    for bit in (1, 2):
+                        transposed = [None] * 4
+                        for g in range_constexpr(4):
+                            if const_expr((g & bit) == 0):
+                                transposed[g], transposed[g + bit] = swap_lane_pair(
+                                    values[g], values[g + bit], bit
+                                )
+                        values = transposed
+                    packed.extend(values)
+                p = fx.Vector.from_elements(packed, dtype=fx.Int32)
+                corr_vec = fx.Vector.from_elements(
+                    [corr], dtype=fx.Float32
+                ).broadcast_to(4)
+                updated = []
+                for vh in range_constexpr(8):
+                    updated.append(_mma(_v_ops(buf, vh), p, state[2 + vh] * corr_vec))
+                fx.rocdl.wait_asyncmark(0)
+                gpu.barrier()
+                results = yield [new_max, new_sum, *updated]
+            denom = results[1]
+            inv = (
+                fx.Float32(
+                    fp8_qlen8_rcp_f32((denom > zero).select(denom, fx.Float32(1.0)))
+                )
+                * value_scale
+                * fx.Float32(1.0 / 256.0)
+            )
+            for vh in range_constexpr(8):
+                norm = (
+                    results[2 + vh]
+                    * fx.Vector.from_elements([inv], dtype=fx.Float32).broadcast_to(4)
+                ).to(fx.BFloat16)
+                sub = vh * 4 + rg
+                if const_expr(NP == 1):
+                    out_row = output_ptr[seq * 8 + qi, qh, None]
+                    fx.slice(
+                        fx.logical_divide(out_row, fx.make_layout(4, 1)), (None, sub)
+                    ).store(norm)
+                else:
+                    base = ((seq * n_kv + kv_h) * NP + part) * 128 + row
+                    fx.slice(
+                        fx.logical_divide(pout_ptr, fx.make_layout(4, 1)),
+                        (None, base * 32 + sub),
+                    ).store(norm)
+            if const_expr(NP > 1):  # noqa: SIM102 - Static NP, dynamic lane mask.
+                if rg == 0:
+                    base = ((seq * n_kv + kv_h) * NP + part) * 128 + row
+                    pmax_ptr[base] = results[0] * fx.Float32(1.0 / LOG2E)
+                    psum_ptr[base] = denom
+
+        def _bf16_path(pmax_ptr, psum_ptr):
+            tid = fx.Int32(gpu.thread_id("x"))
+            wave = tid // 64
+            lane = tid % 64
+            col = lane % 16
+            rg = lane // 16
+            seq = sequence
+            kv_h = fx.Int32(gpu.block_id("y"))
+            part = fx.Int32(gpu.block_id("z"))
+            n_kv = fx.Int32(gpu.grid_dim.y)
+            row = query_group * 64 + wave * 16 + col
+            qi = row // 16
+            qh = kv_h * 16 + row % 16
+
+            q_load = make_flat_loader(query_ptr, fx.BFloat16, 8, fx.UniversalCopy128b())
+
+            tables = fx.rocdl.make_buffer_tensor(
+                tables_ptr,
+                max_size=False,
+                num_records_bytes=fx.Int64(gpu.grid_dim.x)
+                // 2
+                * fx.Int64(max_blocks)
+                * 4,
+            )
+            lengths = fx.rocdl.make_buffer_tensor(lengths_ptr, max_size=True)
+            context = fx.Int32(buf_scalar_load(lengths, seq))
+            ks = fx.rocdl.make_buffer_tensor(key_scale_ptr, max_size=True)
+            vs = fx.rocdl.make_buffer_tensor(value_scale_ptr, max_size=True)
+            key_scale = fx.Int32(buf_scalar_load(ks, fx.Int32(0))).bitcast(fx.Float32)
+            value_scale = fx.Int32(buf_scalar_load(vs, fx.Int32(0))).bitcast(fx.Float32)
+
+            def _page(tt):
+                return fx.Int64(
+                    fx.Int32(buf_scalar_load(tables, seq * max_blocks + tt))
+                )
+
+            def _stage_kv(tt, buf):
+                page = _page(tt)
+                # Rebase each bounded descriptor at a 64-bit physical-page address.
+                k_src = page_resource(key_ptr, (page * n_kv + kv_h) * (D * 64), D * 64)
+                v_src = page_resource(value_ptr, (page * n_kv + kv_h) * 8192, 8192)
+                for u in range_constexpr(D // 64):
+                    local = tid * 16 + u * 4096
+                    async_load_lds_nt(
+                        k_src, local, lds_base, buf * BKV_BYTES + wave * 1024 + u * 4096
+                    )
+                for u in range_constexpr(2):
+                    local = tid * 16 + u * 4096
+                    async_load_lds_nt(
+                        v_src,
+                        local,
+                        lds_base,
+                        buf * BKV_BYTES + D * 64 + wave * 1024 + u * 4096,
+                    )
+                fx.rocdl.asyncmark()
+
+            def _decode(words):
+                values = []
+                for word in range_constexpr(2):
+                    for hi in range_constexpr(2):
+                        pair = fx.Vector(
+                            fx.rocdl.cvt_scalef32_pk_bf16_fp8(
+                                T.vec(2, T.bf16),
+                                words[word].ir_value(),
+                                fx.Float32(1.0).ir_value(),
+                                bool(hi),
+                            )
+                        )
+                        values.extend([pair[0], pair[1]])
+                return fx.Vector.from_elements(values, dtype=fx.BFloat16)
+
+            def _k_ops(buf, nt, kg):
+                off = (
+                    buf * BKV_BYTES
+                    + ((kg * 2 + rg // 2) * 64 + nt * 16 + col) * 16
+                    + (rg % 2) * 8
+                )
+                return _decode(load_lds_words(lds_base, off, words=2))
+
+            def _v_tile(buf, vh, step):
+                off = (
+                    buf * BKV_BYTES
+                    + D * 64
+                    + ((step * 2 + rg // 2) * 128 + vh * 16 + col) * 16
+                    + (rg % 2) * 8
+                )
+                return _decode(load_lds_words(lds_base, off, words=2))
+
+            def _mma(a, b, acc):
+                return fx.Vector(
+                    fx.rocdl.mfma_f32_16x16x32_bf16(T.f32x4, [a, b, acc, 0, 0, 0])
+                )
+
+            q_base = (
+                fx.Int64(seq * 8 + qi) * stride_q_row + fx.Int64(qh) * stride_q_head
+            )
+            q_ops = [q_load(q_base + kg * 32 + rg * 8) for kg in range_constexpr(BKG)]
+            scale = fx.Float32(SCALE * LOG2E) * key_scale
+            zero = fx.Float32(0.0)
+            neg_inf = fx.Float32(float("-inf"))
+            num_tiles = cdiv(context, 64)
+            per_part = cdiv(num_tiles, NP)
+            begin = part * per_part
+            end = fx.min(begin + per_part, num_tiles)
+            if begin < end:
+                _stage_kv(begin, fx.Int32(0))
+                fx.rocdl.wait_asyncmark(0)
+            gpu.barrier()
+            out_zero = fx.Vector.filled(4, 0.0, fx.Float32)
+            init = [neg_inf, zero, *([out_zero] * 8)]
+            for tt, state in range(begin, end, 1, init=init):
+                tt = fx.Int32(tt)
+                buf = (tt - begin) & fx.Int32(1)
+                if tt + 1 < end:
+                    _stage_kv(tt + 1, buf ^ fx.Int32(1))
+                scores = []
+                local_max = neg_inf
+                for nt in range_constexpr(4):
+                    acc = fx.Vector.filled(4, 0.0, fx.Float32)
+                    for kg in range_constexpr(BKG):
+                        acc = _mma(_k_ops(buf, nt, kg), q_ops[kg], acc)
+                    score = acc
+                    if (tt + 1) * 64 > context - 7:
+                        tokens = fx.Vector.from_elements(
+                            [
+                                tt * 64 + nt * 16 + rg * 4 + i
+                                for i in range_constexpr(4)
+                            ],
+                            dtype=fx.Int32,
+                        )
+                        bound = fx.Vector.from_elements(
+                            [context - 7 + qi], dtype=fx.Int32
+                        ).broadcast_to(4)
+                        score = (tokens < bound).select(
+                            acc, fx.Vector.filled(4, float("-inf"), fx.Float32)
+                        )
+                    scores.append(score)
+                    local_max = fx.maxnumf(local_max, score.reduce(ReductionOp.MAX))
+                for bit in (1, 2):
+                    lo, hi = reduce_lane_pair(local_max, bit)
+                    local_max = fx.maxnumf(lo, hi)
+                new_max = fx.maxnumf(state[0], local_max * scale)
+                safe_max = (new_max > neg_inf).select(new_max, zero)
+                scale_vec = fx.Vector.from_elements(
+                    [scale], dtype=fx.Float32
+                ).broadcast_to(4)
+                max_vec = fx.Vector.from_elements(
+                    [safe_max], dtype=fx.Float32
+                ).broadcast_to(4)
+                probs = [
+                    fx.Vector(exp2_f32_fast(scores[nt] * scale_vec - max_vec))
+                    for nt in range_constexpr(4)
+                ]
+                local_sum = zero
+                for nt in range_constexpr(4):
+                    local_sum = local_sum + probs[nt].reduce(ReductionOp.ADD)
+                for bit in (1, 2):
+                    lo, hi = reduce_lane_pair(local_sum, bit)
+                    local_sum = lo + hi
+                corr = fx.Float32(exp2_amdgcn_scalar(state[0] - safe_max))
+                new_sum = state[1] * corr + local_sum
+                p_words = [
+                    probs[nt].to(fx.BFloat16).bitcast(fx.Int32)
+                    for nt in range_constexpr(4)
+                ]
+                p = []
+                for step in range_constexpr(2):
+                    first, second = [], []
+                    for word in range_constexpr(2):
+                        lo, hi = swap_lane_pair(
+                            p_words[step * 2][word], p_words[step * 2 + 1][word], 2
+                        )
+                        a, b = swap_lane_pair(lo, hi, 1)
+                        first.append(a)
+                        second.append(b)
+                    p.append(
+                        fx.Vector.from_elements(
+                            [*first, *second], dtype=fx.Int32
+                        ).bitcast(fx.BFloat16)
+                    )
+                corr_vec = fx.Vector.from_elements(
+                    [corr], dtype=fx.Float32
+                ).broadcast_to(4)
+                updated = []
+                for vh in range_constexpr(8):
+                    out = state[2 + vh] * corr_vec
+                    for step in range_constexpr(2):
+                        out = _mma(_v_tile(buf, vh, step), p[step], out)
+                    updated.append(out)
+                fx.rocdl.wait_asyncmark(0)
+                gpu.barrier()
+                results = yield [new_max, new_sum, *updated]
+            denom = results[1]
+            inv = (
+                fx.Float32(
+                    fp8_qlen8_rcp_f32((denom > zero).select(denom, fx.Float32(1.0)))
+                )
+                * value_scale
+            )
+            for vh in range_constexpr(8):
+                norm = (
+                    results[2 + vh]
+                    * fx.Vector.from_elements([inv], dtype=fx.Float32).broadcast_to(4)
+                ).to(fx.BFloat16)
+                sub = vh * 4 + rg
+                if const_expr(NP == 1):
+                    out_row = output_ptr[seq * 8 + qi, qh, None]
+                    fx.slice(
+                        fx.logical_divide(out_row, fx.make_layout(4, 1)), (None, sub)
+                    ).store(norm)
+                else:
+                    base = ((seq * n_kv + kv_h) * NP + part) * 128 + row
+                    fx.slice(
+                        fx.logical_divide(pout_ptr, fx.make_layout(4, 1)),
+                        (None, base * 32 + sub),
+                    ).store(norm)
+            if const_expr(NP > 1):  # noqa: SIM102 - Static NP, dynamic lane mask.
+                if rg == 0:
+                    base = ((seq * n_kv + kv_h) * NP + part) * 128 + row
+                    pmax_ptr[base] = results[0] * fx.Float32(1.0 / LOG2E)
+                    psum_ptr[base] = denom
+
+        lengths_resource = fx.rocdl.make_buffer_tensor(lengths_ptr, max_size=True)
+        context = fx.Int32(buf_scalar_load(lengths_resource, sequence))
+        if context <= fx.Int32(BF16_CONTEXT_LIMIT):
+            _bf16_path(pmax_ptr, psum_ptr)
+        else:
+            _fp8_path(pmax_ptr, psum_ptr)
+
+    @flyc.jit
+    def launch(
+        output: fx.Tensor,
+        pmax: fx.Tensor,
+        psum: fx.Tensor,
+        pout: fx.Tensor,
+        query: fx.Tensor,
+        key: fx.Tensor,
+        value: fx.Tensor,
+        tables: fx.Tensor,
+        lengths: fx.Tensor,
+        key_scale: fx.Tensor,
+        value_scale: fx.Tensor,
+        max_blocks: fx.Int32,
+        num_seqs: fx.Int32,
+        num_kv: fx.Int32,
+        stride_ks_block: fx.Int32,
+        stride_ks_head: fx.Int32,
+        stride_q_row: fx.Int32,
+        stride_q_head: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008 - FlyDSL ABI default.
+    ):
+        with CompilationContext.compile_hints(
+            {"fastmath": arith.FastMathFlags.contract}
+        ):
+            pa_decode_fp8_small_kernel(
+                output,
+                pmax,
+                psum,
+                pout,
+                query,
+                key,
+                value,
+                tables,
+                lengths,
+                key_scale,
+                value_scale,
+                max_blocks,
+                stride_q_row,
+                stride_q_head,
+            ).launch(grid=(num_seqs * 2, num_kv, NP), block=(256, 1, 1), stream=stream)
+
+    return {"launch": launch, "kernel": pa_decode_fp8_small_kernel}
