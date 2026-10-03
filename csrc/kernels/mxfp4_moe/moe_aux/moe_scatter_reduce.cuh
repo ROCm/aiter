@@ -36,8 +36,14 @@ __global__ void scatter_reduce_kernel_impl(
 
     #pragma unroll
     for (int i = 0; i < TOPK; i++) {
-        int sorted_pos = reverse_sorted[token * TOPK + i];
-        const float w = sorted_weights[sorted_pos];
+        // A route the sort dropped (reverse_sorted -1, an invalid expert id)
+        // loads row 0 like any route, so all TOPK loads still issue together,
+        // and its bits are masked to 0: it adds exactly 0, even if row 0 holds
+        // NaN. A select on a load would become a branch that serializes them.
+        const int raw_pos = reverse_sorted[token * TOPK + i];
+        const uint32_t keep = raw_pos >= 0 ? 0xFFFFFFFFu : 0u;
+        const int sorted_pos = max(raw_pos, 0);
+        const float w = __uint_as_float(__float_as_uint(sorted_weights[sorted_pos]) & keep);
 
         #pragma unroll
         for (int j = 0; j < N_INT4; ++j) {
@@ -50,8 +56,8 @@ __global__ void scatter_reduce_kernel_impl(
                 packed = *row_ptr;
             }
 
-            uint32_t w0 = (uint32_t)packed[0], w1 = (uint32_t)packed[1];
-            uint32_t w2 = (uint32_t)packed[2], w3 = (uint32_t)packed[3];
+            uint32_t w0 = (uint32_t)packed[0] & keep, w1 = (uint32_t)packed[1] & keep;
+            uint32_t w2 = (uint32_t)packed[2] & keep, w3 = (uint32_t)packed[3] & keep;
             const int b = j * 8;
             acc[b+0] = fmaf(__uint_as_float((w0 & 0xFFFFu) << 16), w, acc[b+0]);
             acc[b+1] = fmaf(__uint_as_float(w0 & 0xFFFF0000u),     w, acc[b+1]);
@@ -123,11 +129,15 @@ __global__ void scatter_reduce_mxfp4_kernel(
     const int blk = col_base / 32;
     #pragma unroll
     for (int i = 0; i < TOPK; i++) {
-        const int sorted_pos = reverse_sorted[token * TOPK + i];
-        const float w = sorted_weights[sorted_pos];
+        // Dropped route (-1): load row 0 and mask weight and scale to 0, as in
+        // the bf16 kernel. fp4 values are finite, so it adds exactly 0.
+        const int raw_pos = reverse_sorted[token * TOPK + i];
+        const uint32_t keep = raw_pos >= 0 ? 0xFFFFFFFFu : 0u;
+        const int sorted_pos = max(raw_pos, 0);
+        const float w = __uint_as_float(__float_as_uint(sorted_weights[sorted_pos]) & keep);
         const uint32_t sw = *reinterpret_cast<const uint32_t*>(
             &flat_out_scale[(long long)sorted_pos * SCOLS + (blk & ~3)]);
-        const uint8_t e8 = (uint8_t)(sw >> ((blk & 3) * 8));
+        const uint8_t e8 = (uint8_t)((sw >> ((blk & 3) * 8)) & keep);
         const float s = __uint_as_float((uint32_t)e8 << 23);
 
         const uint8_t* qbase = &flat_out_q[(long long)sorted_pos * QCOLS + col_base / 2];

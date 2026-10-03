@@ -28,8 +28,11 @@ __global__ void sort_count_kernel_impl(
     const int start   = cta * per_cta;
     const int end     = min(start + per_cta, total_pairs);
 
+    // Routes outside [0, NE) (vLLM's -1 padding rows) are dropped, as in opus.
     for (int i = start + tid; i < end; i += THREADS_PER_CTA) {
-        atomicAdd(&local_count[topk_ids[i]], 1);
+        const int eid = topk_ids[i];
+        if (static_cast<unsigned>(eid) < static_cast<unsigned>(NE))
+            atomicAdd(&local_count[eid], 1);
     }
     __syncthreads();
 
@@ -126,6 +129,10 @@ __global__ void sort_place_pad_kernel_impl(
 
     for (int i = start + tid; i < end; i += THREADS_PER_CTA) {
         int eid = topk_ids[i];
+        if (static_cast<unsigned>(eid) >= static_cast<unsigned>(NE)) {
+            reverse_sorted[i] = -1;  // scatter_reduce skips the route
+            continue;
+        }
         int sp  = atomicAdd(&local_offsets[eid], 1);
         int token_id = i / TOPK;
         int topk_id  = i % TOPK;

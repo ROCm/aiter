@@ -14,6 +14,18 @@ Covers two operations, dispatched by ``--quant-dtype``:
         e8m0 scale. Compared paths: ref / split / HIP-fused / Triton.
       - ``--quant-dtype fp8``: MXFP8, fp8 e4m3 output + e8m0 scale.
         Compared paths: ref / split / HIP-fused (no Triton).
+
+Also covers the MXFP4 aux kernels (``module_moe_mxfp4_aux``) behind
+``fused_moe``'s A4W4 inline-sort path, gfx950 only, with invalid expert ids.
+Callers mark padding rows with ``topk_ids = -1`` (e.g. vLLM's CUDA-graph
+padding with ``VLLM_MOE_SKIP_PADDING=1``); the sorts must drop those routes
+like ``moe_sorting`` does, and the scatter-reduce must add 0 for them:
+
+  * ``test_moe_mxfp4_aux_sort``: ``_adaptive_moe_sort`` (one-CTA sort at
+    block 16, three-stage sort at block 32/64/128).
+  * ``test_moe_mxfp4_aux_sort_quant``: ``mxfp4_moe_sort_quant``.
+  * ``test_moe_mxfp4_aux_scatter_reduce``: ``mxfp4_moe_scatter_reduce`` and
+    ``mxfp4_moe_scatter_reduce_q``.
 """
 
 import argparse
@@ -23,6 +35,7 @@ import pandas as pd
 import torch
 
 import aiter
+import aiter.fused_moe as fm
 from aiter import dtypes, get_torch_quant
 from aiter.fused_moe import fused_topk, moe_sorting
 from aiter.jit.utils.chip_info import get_gfx
@@ -335,6 +348,251 @@ def test_moe_mx_quant_sort(
     return result
 
 
+# MXFP4 aux kernels with invalid expert ids (see the module docstring). The
+# shapes are the DSv4.1 target and DSpark draft MoE, which have generated aux
+# instances; block_size 16 runs the one-CTA sort, 32/64/128 the three-stage sort.
+AUX_MODEL_DIM = 5120
+AUX_SHAPES = [(384, 6), (128, 3)]
+AUX_SORT_CASES = [(16, 8), (16, 64), (16, 256), (32, 512), (64, 2048), (128, 4096)]
+AUX_ROUTING_CASES = ["valid", "mixed", "all-empty", "padded-rows"]
+
+
+def _aux_routing(token_num, model_dim, E, topk, dtype, routing_case):
+    input = torch.randn((token_num, model_dim), dtype=dtype)
+    score = torch.randn((token_num, E), dtype=dtype)
+    topk_weights, topk_ids = fused_topk(input, score, topk, True)
+    if routing_case == "mixed":  # every other route invalid
+        invalid = torch.arange(token_num * topk).view(token_num, topk) % 2 == 1
+        topk_ids.masked_fill_(invalid, -1)
+        topk_weights.masked_fill_(invalid, 0)
+    elif routing_case == "all-empty":
+        topk_ids.fill_(-1)
+        topk_weights.zero_()
+    elif routing_case == "padded-rows":  # whole trailing rows, as vLLM pads
+        topk_ids[token_num // 2 :] = -1
+        topk_weights[token_num // 2 :] = 0
+    elif routing_case != "valid":
+        raise ValueError(f"unknown routing case: {routing_case}")
+    return topk_ids, topk_weights
+
+
+def _check_aux_sort(sort_out, topk_ids, topk_weights, E, block_size):
+    """Mismatches of an aux sort against a torch reference.
+
+    The reference drops routes outside [0, E). Within an expert the sort places
+    routes in atomic order and pads with token id M, so each expert's routes
+    are compared as a set; `reverse_sorted` must be -1 for a dropped route.
+    """
+    ids, w, eids, nv, m_indices, reverse_sorted = sort_out
+    M, topk = topk_ids.shape
+    flat = topk_ids.reshape(-1).long()
+    valid = (flat >= 0) & (flat < E)
+    route = torch.arange(M * topk)[valid]
+    eid = flat[valid]
+    packed = ((route % topk) << 24) | (route // topk)
+    counts = torch.bincount(eid, minlength=E)
+    blocks = (counts + block_size - 1) // block_size
+    total = int(blocks.sum()) * block_size
+    errs = {}
+    if int(nv[0]) != total or int(nv[1]) != M:
+        return {"num_valid_ids": (nv.tolist(), [total, M])}
+    block_eids = torch.repeat_interleave(torch.arange(E), blocks)
+    if not torch.equal(eids[: block_eids.numel()].long(), block_eids):
+        errs["sorted_expert_ids"] = True
+    r = ids[:total].long()
+    keep = (r & 0xFFFFFF) < M
+    slot_e = torch.repeat_interleave(block_eids, block_size)
+    got = ((slot_e[keep] << 32) | r[keep]).sort().values
+    if not torch.equal(got, ((eid << 32) | packed).sort().values):
+        errs["sorted_ids"] = True
+    rs = reverse_sorted.long()
+    if (rs[~valid] != -1).any():
+        errs["reverse_sorted(dropped)"] = int((rs[~valid] != -1).sum())
+    pos = rs[valid]
+    if ((pos < 0) | (pos >= total)).any():
+        errs["reverse_sorted(range)"] = int(((pos < 0) | (pos >= total)).sum())
+        return errs
+    if not torch.equal(ids[pos].long(), packed):
+        errs["reverse_sorted(valid)"] = True
+    if not torch.equal(m_indices[pos].long(), route // topk):
+        errs["m_indices"] = True
+    if not torch.equal(w[pos], topk_weights.reshape(-1)[valid]):
+        errs["sorted_weights"] = True
+    return errs
+
+
+def test_moe_mxfp4_aux_sort(
+    dtype, token_num, model_dim, E, topk, block_size, routing_case, atomic
+):
+    """MXFP4 aux sort via `_adaptive_moe_sort(emit_aux=True)`.
+
+    block_size 16 runs the one-CTA sort (with or without the atomic zero-init),
+    32/64/128 the three-stage sort.
+    """
+    topk_ids, topk_weights = _aux_routing(
+        token_num, model_dim, E, topk, dtype, routing_case
+    )
+    out = fm._adaptive_moe_sort(
+        topk_ids,
+        topk_weights,
+        E,
+        topk,
+        block_size,
+        model_dim,
+        atomic=atomic,
+        emit_aux=True,
+    )
+    ids, w, eids, nv, _moe_buf, m_indices, reverse_sorted = out
+    errs = _check_aux_sort(
+        (ids, w, eids, nv, m_indices, reverse_sorted),
+        topk_ids,
+        topk_weights,
+        E,
+        block_size,
+    )
+    assert not errs, (
+        f"MXFP4 aux sort mismatch for E={E}, topk={topk}, block_size={block_size}, "
+        f"token={token_num}, atomic={atomic}, routing_case={routing_case}: {errs}"
+    )
+
+
+def test_moe_mxfp4_aux_sort_quant(dtype, token_num, model_dim, E, topk, routing_case):
+    """One-CTA sort fused with the MXFP4 activation quant (block 32).
+
+    The sort is checked like `test_moe_mxfp4_aux_sort`; the quant output of
+    `mxfp4_moe_sort_quant` must match `mxfp4_moe_quant` byte for byte.
+    """
+    block_size = 32
+    topk_ids, topk_weights = _aux_routing(
+        token_num, model_dim, E, topk, dtype, routing_case
+    )
+    x = torch.randn((token_num, model_dim), dtype=dtype)
+    active = min(E, token_num * topk)
+    max_sorted = (
+        (token_num * topk + active * (block_size - 1) + block_size - 1)
+        // block_size
+        * block_size
+    )
+    ids = torch.empty(max_sorted, dtype=dtypes.i32)
+    eids = torch.empty(max_sorted // block_size, dtype=dtypes.i32)
+    nv = torch.empty(2, dtype=dtypes.i32)
+    reverse_sorted = torch.empty(token_num * topk, dtype=dtypes.i32)
+    w = torch.empty(max_sorted, dtype=dtypes.fp32)
+    m_indices = torch.empty(max_sorted, dtype=dtypes.i32)
+    aq = torch.empty(token_num * model_dim // 2, dtype=torch.uint8)
+    a_scale = torch.empty(token_num * model_dim // 32, dtype=torch.uint8)
+    no_zero = torch.empty(0, dtype=dtypes.bf16)
+    aiter.mxfp4_moe_sort_quant(
+        a_input=x,
+        topk_ids=topk_ids,
+        topk_weight=topk_weights,
+        sorted_token_ids=ids,
+        sorted_expert_ids=eids,
+        cumsum_tensor=nv,
+        reverse_sorted=reverse_sorted,
+        sorted_weights=w,
+        a_quant=aq,
+        a_scale=a_scale,
+        m_indices=m_indices,
+        bf16_zero_out=no_zero,
+        NE=E,
+        TOPK=topk,
+        D_HIDDEN=model_dim,
+        MB=block_size,
+    )
+    errs = _check_aux_sort(
+        (ids, w, eids, nv, m_indices, reverse_sorted),
+        topk_ids,
+        topk_weights,
+        E,
+        block_size,
+    )
+    ref_q, ref_scale = torch.empty_like(aq), torch.empty_like(a_scale)
+    aiter.mxfp4_moe_quant(
+        a_input=x,
+        a_quant=ref_q,
+        a_scale=ref_scale,
+        bf16_zero_out=no_zero,
+        NE=E,
+        TOPK=topk,
+        D_HIDDEN=model_dim,
+        MB=block_size,
+    )
+    if not (torch.equal(aq, ref_q) and torch.equal(a_scale, ref_scale)):
+        errs["quant"] = True
+    assert not errs, (
+        f"mxfp4_moe_sort_quant mismatch for E={E}, topk={topk}, "
+        f"token={token_num}, routing_case={routing_case}: {errs}"
+    )
+
+
+def test_moe_mxfp4_aux_scatter_reduce(
+    dtype, token_num, model_dim, E, topk, routing_case, quant_dtype
+):
+    """Scatter-reduce of the per-route rows back to tokens.
+
+    `mxfp4_moe_scatter_reduce` (bf16 rows) or `mxfp4_moe_scatter_reduce_q`
+    (MXFP4 rows): out[t] = sum over t's routes of weight * row. A route the
+    sort dropped (`reverse_sorted` -1) adds 0.
+    """
+    block_size = 32
+    topk_ids, topk_weights = _aux_routing(
+        token_num, model_dim, E, topk, dtype, routing_case
+    )
+    ids, w, _eids, _nv, _moe_buf, _m_indices, reverse_sorted = fm._adaptive_moe_sort(
+        topk_ids, topk_weights, E, topk, block_size, model_dim, emit_aux=True
+    )
+    rows = ids.numel()
+    out = torch.empty((token_num, model_dim), dtype=dtype)
+    rs = reverse_sorted.view(token_num, topk).long()
+    keep = (rs >= 0).unsqueeze(-1)
+    pos = rs.clamp(min=0)
+    if quant_dtype == dtypes.fp4x2:
+        flat_q = torch.randint(0, 256, (rows, model_dim // 2), dtype=torch.uint8)
+        flat_scale = torch.randint(118, 127, (rows, model_dim // 32), dtype=torch.uint8)
+        aiter.mxfp4_moe_scatter_reduce_q(
+            flat_out_q=flat_q,
+            flat_out_scale=flat_scale,
+            reverse_sorted=reverse_sorted,
+            sorted_weights=w,
+            out=out,
+            NE=E,
+            TOPK=topk,
+            D_HIDDEN=model_dim,
+            MB=block_size,
+        )
+        scale = (flat_scale[pos].to(torch.int32) << 23).view(torch.float32)
+        rows_f = fp4_utils.mxfp4_to_f32(flat_q[pos]) * scale.repeat_interleave(32, -1)
+    else:
+        flat = torch.randn((rows, model_dim), dtype=dtype)
+        aiter.mxfp4_moe_scatter_reduce(
+            flat_out=flat,
+            reverse_sorted=reverse_sorted,
+            sorted_weights=w,
+            out=out,
+            NE=E,
+            TOPK=topk,
+            D_HIDDEN=model_dim,
+            MB=block_size,
+        )
+        rows_f = flat[pos].float()
+    # `torch.where`, not `* keep`: a dropped route's `sorted_weights` slot is
+    # never written and may hold NaN.
+    ref = torch.where(keep, rows_f * w[pos].unsqueeze(-1), 0.0).sum(1)
+    err = checkAllclose(
+        ref,
+        out.float(),
+        atol=5e-2,
+        rtol=1e-2,
+        msg=f"scatter_reduce {quant_dtype} E={E} token={token_num} {routing_case}",
+    )
+    empty = (rs < 0).all(dim=1)
+    assert err == 0 and not out[empty].any(), (
+        f"mxfp4_moe_scatter_reduce mismatch for E={E}, topk={topk}, "
+        f"token={token_num}, routing_case={routing_case}, quant={quant_dtype}"
+    )
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -469,3 +727,28 @@ for dtype in args.dtype:
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info("moe_%s_quant_sort_stage2 summary (markdown):\n%s", _label, df_md)
+
+# MXFP4 aux sorts and scatter-reduce with invalid expert ids: correctness only,
+# each case asserts. gfx950 only, like the MXFP4 fused-MoE paths that use
+# `module_moe_mxfp4_aux`.
+if get_gfx() == "gfx950":
+    for dtype in args.dtype:
+        for (E, topk), (block_size, m), routing_case, atomic in itertools.product(
+            AUX_SHAPES, AUX_SORT_CASES, AUX_ROUTING_CASES, [False, True]
+        ):
+            test_moe_mxfp4_aux_sort(
+                dtype, m, AUX_MODEL_DIM, E, topk, block_size, routing_case, atomic
+            )
+        for (E, topk), m, routing_case in itertools.product(
+            AUX_SHAPES, [32, 512], AUX_ROUTING_CASES
+        ):
+            test_moe_mxfp4_aux_sort_quant(
+                dtype, m, AUX_MODEL_DIM, E, topk, routing_case
+            )
+        for (E, topk), m, routing_case, quant_dtype in itertools.product(
+            AUX_SHAPES, [64, 512], AUX_ROUTING_CASES, [dtypes.bf16, dtypes.fp4x2]
+        ):
+            test_moe_mxfp4_aux_scatter_reduce(
+                dtype, m, AUX_MODEL_DIM, E, topk, routing_case, quant_dtype
+            )
+    aiter.logger.info("moe_mxfp4_aux sort / sort_quant / scatter_reduce: all passed")
