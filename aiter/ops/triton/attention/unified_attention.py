@@ -135,6 +135,8 @@ def _gfx950_gluon_supported(params: _UAParams):
     return (
         DEVICE_ARCH == "gfx950"
         and _unified_attention_kernel_gfx950 is not None
+        # non-causal Gluon kernel not implemented
+        and params.causal
         # softcap hits an AMDGPU backend assert (GCNRewritePartialRegUses) on Triton 3.8
         and not params.softcap
         and not params.use_qq_bias
@@ -462,6 +464,8 @@ def is_2d_gluon_available(params: _UAParams, backend: str):
     if DEVICE_ARCH == "gfx1250":
         use_gluon_arch = (
             _unified_attention_kernel_2d_gfx1250 is not None
+            # non-causal Gluon kernel not implemented
+            and params.causal
             and not params.softcap
             and not params.use_qq_bias
             and not params.use_alibi_slopes
@@ -483,6 +487,8 @@ def is_3d_gluon_available(params: _UAParams, backend: str):
     if DEVICE_ARCH == "gfx1250":
         use_gluon_arch = (
             _unified_attention_kernel_3d_gfx1250 is not None
+            # non-causal Gluon kernel not implemented
+            and params.causal
             and params.shuffled_kv_cache
         )
     elif DEVICE_ARCH == "gfx950":
