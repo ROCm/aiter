@@ -27,7 +27,7 @@ def ref_gather_kv_b_proj(
     kv_indices: torch.Tensor,  # len(kv_indices) = kv_indptr[-1]
     kv_prefix_sum_context_lens: torch.Tensor,  # [batch_size + 1]
     kv_proj_weight: torch.Tensor,  # [tp_heads * (qk_nope_head_dim + v_head_dim), kv_c_dim]
-    kv_proj_scale: torch.Tensor,  # [weight_n] per-row or [N//128, K//128] block
+    kv_proj_scale: torch.Tensor | None,  # None, [weight_n], or [N//128, K//128]
     qk_nope_head_dim: int = 128,
     v_head_dim: int | None = None,
 ):
@@ -41,13 +41,17 @@ def ref_gather_kv_b_proj(
 
     _num_block, _block_size, hidden_dim = k_buffer.shape
     weight_n, weight_k = kv_proj_weight.shape
-    per_row_scale = kv_proj_scale.dim() == 1 or (
-        kv_proj_scale.dim() == 2 and kv_proj_scale.shape[1] == 1
+    no_scale = kv_proj_scale is None
+    per_row_scale = not no_scale and (
+        kv_proj_scale.dim() == 1
+        or (kv_proj_scale.dim() == 2 and kv_proj_scale.shape[1] == 1)
     )
 
     assert hidden_dim == kv_c_dim + kv_pe_dim
     assert weight_k == kv_c_dim
-    if per_row_scale:
+    if no_scale:
+        pass
+    elif per_row_scale:
         assert kv_proj_scale.numel() == weight_n
     else:
         scale_granularity_n = weight_n // kv_proj_scale.shape[0]
@@ -74,7 +78,7 @@ def ref_gather_kv_b_proj(
     k_prefix_tp = k_prefix.view(total_kv, tp_k_head_num, qk_nope_head_dim + kv_pe_dim)
     v_prefix_tp = v_prefix.view(total_kv, tp_k_head_num, v_head_dim)
 
-    if not per_row_scale:
+    if not no_scale and not per_row_scale:
         kv_proj_scale_repeat = kv_proj_scale.repeat_interleave(
             scale_granularity_n, dim=0
         )
@@ -105,7 +109,9 @@ def ref_gather_kv_b_proj(
             -1, kv_c_dim
         )[: context_end - context_start, :]
 
-        if per_row_scale:
+        if no_scale:
+            kv_proj = k_data.to(torch.float32) @ kv_proj_weight.to(torch.float32).T
+        elif per_row_scale:
             kv_proj = (
                 k_data.to(torch.float32) @ kv_proj_weight.to(torch.float32).T
             ) * (kv_proj_scale.to(torch.float32).reshape(1, -1))
@@ -534,6 +540,8 @@ def test_gather_kv_b_proj_per_row_scale(
         (8, 16, 4, torch.bfloat16, 1024, "per_row"),
         (4, 1, 4, dtypes.fp8, 512, "per_row"),
         (8, 16, 4, dtypes.fp8, 1024, "per_row"),
+        # gfx1250 flat-grid path: enough chunks to require GRID_STRIDE on main.
+        (4, 1, 1, dtypes.fp8, 2048, "none"),
     ],
 )
 def test_gather_kv_b_proj_bf16_weight(
@@ -552,7 +560,9 @@ def test_gather_kv_b_proj_bf16_weight(
     v_head_dim = 128
     tp_k_head_num = 128 // num_tp
     num_block = 2 * avg_kv_length // block_size
-    weight_preshuffle = True
+    # Kimi-K3's unquantized kv_b_proj stays row-major; the quantized cases use
+    # the existing preshuffled path.
+    weight_preshuffle = scale_mode != "none"
     device = "cuda"
     weight_dtype = torch.bfloat16
     weight_n = tp_k_head_num * (qk_nope_head_dim + v_head_dim)
@@ -603,10 +613,13 @@ def test_gather_kv_b_proj_bf16_weight(
     # Use all-ones scale to simulate no weight quantization
     if scale_mode == "per_row":
         kv_proj_scale = torch.ones((weight_n, 1), device=device, dtype=torch.float32)
-    else:
+    elif scale_mode == "block":
         kv_proj_scale = torch.ones(
             (weight_n // 128, kv_c_dim // 128), device=device, dtype=torch.float32
         )
+    else:
+        assert scale_mode == "none"
+        kv_proj_scale = None
 
     k_ref, v_ref = ref_gather_kv_b_proj(
         k_buffer,
