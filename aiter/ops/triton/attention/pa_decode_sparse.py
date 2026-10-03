@@ -722,10 +722,7 @@ def _pa_decode_sparse_gfx950_gluon(
         # Prefill rows re-read each other's KV rows, so cache the gather instead of .cg.
         prefill_kw["GATHER_CACHE"] = ""
         if main_fmt == extra_fmt == "fp8_dsv4_mla":
-            prefill_kw.update(
-                SLOT_U32=max(s0, s1) < (1 << 24),
-                KV_LDS_PAD=16,
-            )
+            prefill_kw["SLOT_U32"] = max(s0, s1) < (1 << 24)
             nope_chunk = max(1, BLOCK_K // 8)
 
     waves_per_eu = 2

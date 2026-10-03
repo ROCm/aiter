@@ -394,7 +394,9 @@ class Cfg:
         self.UNPEEL = gl.constexpr(UNPEEL)
         ROPE_VEC = 16
         self.ROPE_VEC = gl.constexpr(ROPE_VEC)
-        MFMA_K = 32 if FP8_MFMA else 16
+        # The fp8_dsv4_mla walk runs its bf16 dots on 16x16x32 too, gfx950's full
+        # bf16 rate (16x16x16 is half of it).
+        MFMA_K = 32 if FP8_MFMA or PIPE else 16
         self.MFMA_K = gl.constexpr(MFMA_K)
 
         # Warps tile the dots' N. With more than 16 heads per program they also
@@ -461,14 +463,25 @@ class Cfg:
                 order=[1, 0],
             )
         )
-        # Row pitch (KV_DIM + LDS_PAD) decides which banks the transposed K
-        # read (walks down a column) lands on. KV_LDS_PAD 16 removes those
-        # conflicts; it only pays when the loop is LDS-bound.
-        self.kv_shared = gl.constexpr(
-            gl.PaddedSharedLayout.with_identity_for(
-                [[KV_DIM, KV_LDS_PAD or LDS_PAD]], [BLOCK_K, KV_DIM], [1, 0]
+        if PIPE:
+            # 8 elements (16 B, so 128-bit accesses stay aligned) after every 128:
+            # each lane stores a 64 B run of its row, and without it lanes 4 apart
+            # landed on the same banks. Also the fewest conflicts for the K and V
+            # reads of the 16x16x32 operands.
+            self.kv_shared = gl.constexpr(
+                gl.PaddedSharedLayout.with_identity_for(
+                    [[128, 8]], [BLOCK_K, KV_DIM], [1, 0]
+                )
             )
-        )
+        else:
+            # Row pitch (KV_DIM + LDS_PAD) decides which banks the transposed K
+            # read (walks down a column) lands on. KV_LDS_PAD 16 removes those
+            # conflicts; it only pays when the loop is LDS-bound.
+            self.kv_shared = gl.constexpr(
+                gl.PaddedSharedLayout.with_identity_for(
+                    [[KV_DIM, KV_LDS_PAD or LDS_PAD]], [BLOCK_K, KV_DIM], [1, 0]
+                )
+            )
         # The rope buffer (K-only) exists when ROPE_SEPARATE, dead otherwise.
         # compiler removes the dead code, so no side effect beyond eliminating errors
         ROPE_L = ROPE_DIM if ROPE_DIM > 0 else 64
