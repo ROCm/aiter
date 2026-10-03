@@ -85,6 +85,8 @@ class MLAConfig:
     BLOCK_SCALES_SIZE: gl.constexpr
 
     HEAD_SIZE_SPLIT: gl.constexpr
+    USE_LDS_PIPELINE: gl.constexpr
+    P_SHARED_LAYOUT: gl.constexpr
 
     @gluon.constexpr_function
     def __init__(
@@ -112,7 +114,9 @@ class MLAConfig:
         SCALE_K_WIDTH_LORA,
         SCALE_K_WIDTH_ROPE,
         BLOCK_SCALES_SIZE,
+        USE_LDS_PIPELINE=False,
     ):
+        self.USE_LDS_PIPELINE = gl.constexpr(USE_LDS_PIPELINE)
         # Constants
         self.KV_LORA_RANK = gl.constexpr(KV_LORA_RANK)
         self.QK_ROPE_HEAD_DIM = gl.constexpr(QK_ROPE_HEAD_DIM)
@@ -246,6 +250,9 @@ class MLAConfig:
         else:
             self.QK_WMMA_UNPACKED_LAYOUT = self.QK_WMMA_LAYOUT
 
+        # Cache shuffling uses K_WIDTH; the LDS pipeline widens register
+        # operands independently to retain its vectorized LDS loads.
+        register_k_width = 32 if USE_LDS_PIPELINE else self.K_WIDTH
         self.Q_DOT_LAYOUT = gl.constexpr(
             gl.DotOperandLayout(
                 operand_index=0,
@@ -254,12 +261,12 @@ class MLAConfig:
                     if self.QUERY_DTYPE == "fp8"
                     else self.QK_WMMA_LAYOUT
                 ),
-                k_width=self.K_WIDTH,
+                k_width=register_k_width,
             )
         )
         self.K_DOT_LAYOUT = gl.constexpr(
             gl.DotOperandLayout(
-                operand_index=1, parent=self.QK_WMMA_LAYOUT, k_width=self.K_WIDTH
+                operand_index=1, parent=self.QK_WMMA_LAYOUT, k_width=register_k_width
             )
         )
         self.P_DOT_LAYOUT = gl.constexpr(
@@ -267,9 +274,9 @@ class MLAConfig:
                 operand_index=0,
                 parent=self.PV_WMMA_LAYOUT,
                 k_width=(
-                    self.K_WIDTH
+                    register_k_width
                     if self.KV_CACHE_DTYPE != "nvfp4"
-                    else (self.K_WIDTH * 2)
+                    else (register_k_width * 2)
                 ),
             )
         )
@@ -278,9 +285,9 @@ class MLAConfig:
                 operand_index=1,
                 parent=self.PV_WMMA_LAYOUT,
                 k_width=(
-                    self.K_WIDTH
+                    register_k_width
                     if self.KV_CACHE_DTYPE != "nvfp4"
-                    else (self.K_WIDTH * 2)
+                    else (register_k_width * 2)
                 ),
             )
         )
@@ -467,6 +474,27 @@ class MLAConfig:
                 ],
                 warps_per_cta=[NUM_WARPS, 1],
                 order=[1, 0],
+            )
+        )
+
+        # Full-tile P exchange for the four-stage FP8 schedule.
+        self.P_SHARED_LAYOUT = gl.constexpr(
+            gl.SharedLinearLayout(
+                [
+                    [0, 1],
+                    [0, 2],
+                    [0, 4],
+                    [0, 16],
+                    [1, 0],
+                    [2, 0],
+                    [4, 0],
+                    [8, 0],
+                    [16, 0],
+                    [32, 0],
+                    [0, 8],
+                    [0, 32],
+                    [64, 0],
+                ]
             )
         )
 
@@ -1166,7 +1194,17 @@ class MLAProgram:
         else:
             # A16W16
             p = p.to(gl.bfloat16, fp_downcast_rounding="rtz")
-        p = gl.convert_layout(p, self.cfg.P_DOT_LAYOUT)
+        if self.cfg.USE_LDS_PIPELINE:
+            # Publish P in one tile instead of recycling half-size scratch.
+            p_shared = gl.allocate_shared_memory(
+                p.dtype,
+                (self.cfg.BLOCK_M, self.cfg.TILE_SIZE),
+                self.cfg.P_SHARED_LAYOUT,
+            )
+            p_shared.store(p)
+            p = p_shared.load(self.cfg.P_DOT_LAYOUT)
+        else:
+            p = gl.convert_layout(p, self.cfg.P_DOT_LAYOUT)
         acc = gl.amd.gfx1250.wmma(p, kv_lora_trans, acc)
         return acc
 
@@ -1436,6 +1474,68 @@ class MLAProgram:
         else:
             gl.store(self.output_ptr + o_offs, casted_out, mask=o_mask)
 
+    @gluon.jit
+    def process_lds_tile(
+        self,
+        buffer_id,
+        tile_idx,
+        qk_factor,
+        seq_len,
+        L,
+        M,
+        acc,
+        wait_rope: gl.constexpr,
+        IS_LAST: gl.constexpr,
+    ):
+        cfg = self.cfg
+        S = gl.zeros(
+            [cfg.BLOCK_M, cfg.BLOCK_SIZE], dtype=tl.float32, layout=cfg.QK_WMMA_LAYOUT
+        )
+        # RoPE follows LoRA in TDM issue order. Wait for both before issuing the
+        # LDS reads, so their latency can overlap with independent QK matrix work.
+        gl.amd.gfx1250.tdm.async_wait(wait_rope)
+        k_lora = self.lds_unshuffle_kv_lora(buffer_id).load(cfg.K_DOT_LAYOUT)
+        k_rope = self.lds_unshuffle_k_rope(buffer_id).load(cfg.K_DOT_LAYOUT)
+        S = self.compute_qk_lora(k_lora, None, None, S)
+        S = self.compute_qk_rope(k_rope, None, None, S) * qk_factor
+
+        if IS_LAST:
+            pos = tile_idx * cfg.BLOCK_SIZE + gl.arange(
+                0, cfg.BLOCK_SIZE, layout=gl.SliceLayout(0, cfg.QK_WMMA_LAYOUT)
+            )
+            S = gl.where(pos[None, :] < seq_len, S, float("-inf"))
+
+        # Issue V's LDS read before the independent softmax arithmetic.
+        v = self.lds_unshuffle_kv_lora_trans(buffer_id).load(cfg.V_DOT_LAYOUT)
+        p, alpha, M = self.softmax_part0(S, M)
+        p, L, acc = self.softmax_part1(p, L, acc, alpha)
+        acc = self.compute_pkv_lora_trans(p, v, None, acc)
+        return L, M, acc
+
+    @gluon.jit
+    def process_lds_short(
+        self,
+        qk_factor,
+        seq_len,
+        L,
+        M,
+        acc,
+        N_TILES: gl.constexpr,
+    ):
+        for tile in gl.static_range(N_TILES):
+            L, M, acc = self.process_lds_tile(
+                tile,
+                tile,
+                qk_factor,
+                seq_len,
+                L,
+                M,
+                acc,
+                wait_rope=2 * (N_TILES - tile) - 2,
+                IS_LAST=(tile == N_TILES - 1),
+            )
+        return L, M, acc
+
 
 @gluon.jit
 def fast_exp(x):
@@ -1479,6 +1579,154 @@ def _find_seq_idx(
     return left - 1
 
 
+@gluon.jit
+def _mla_decode_lds_pipeline(
+    pgm: MLAProgram,
+    seq_idx,
+    seq_len,
+    qk_factor,
+    out_factor,
+    block_tables_ptr: tl.const,
+    block_tables_stride: gl.int32,
+    output_stride_0: gl.int32,
+    output_stride_1: gl.int32,
+    TDM_STORE: gl.constexpr,
+    FP8_MIN: gl.constexpr,
+    FP8_MAX: gl.constexpr,
+):
+    cfg = pgm.cfg
+    num_tiles = pgm.tile_end
+    kv_head_idx = pgm.kv_head_idx
+    q_start_idx = seq_idx
+    head_base = kv_head_idx * cfg.BLOCK_M
+    output_ptr = pgm.output_ptr
+
+    table = block_tables_ptr + seq_idx * block_tables_stride
+    for prime in gl.static_range(3):
+        if num_tiles > prime:
+            _, page = pgm.load_physical_block_idx(prime, table, 0)
+            row = pgm.get_kv_buffer_row_offsets(page)
+            pgm.tdm_load_global_to_shared_kv_lora(row, prime)
+            pgm.tdm_load_global_to_shared_k_rope(row, prime)
+
+    L, M, acc = pgm.allocate_accumulator()
+
+    if num_tiles > 3:
+        slot: gl.int32 = 0
+        _, page = pgm.load_physical_block_idx(3, table, 0)
+        for tile in range(num_tiles - 3):
+            fill_slot = (slot + 3) % cfg.NUM_STAGES
+            row = pgm.get_kv_buffer_row_offsets(page)
+            pgm.tdm_load_global_to_shared_kv_lora(row, fill_slot)
+            pgm.tdm_load_global_to_shared_k_rope(row, fill_slot)
+            _, page = pgm.load_physical_block_idx_with_mod(
+                tile + 4, table, 0, num_tiles
+            )
+            L, M, acc = pgm.process_lds_tile(
+                slot,
+                tile,
+                qk_factor,
+                seq_len,
+                L,
+                M,
+                acc,
+                wait_rope=6,
+                IS_LAST=False,
+            )
+            slot = (slot + 1) % cfg.NUM_STAGES
+
+        for k in gl.static_range(3):
+            L, M, acc = pgm.process_lds_tile(
+                slot,
+                num_tiles - 3 + k,
+                qk_factor,
+                seq_len,
+                L,
+                M,
+                acc,
+                wait_rope=2 * (3 - k) - 2,
+                IS_LAST=(k == 2),
+            )
+            slot = (slot + 1) % cfg.NUM_STAGES
+    elif num_tiles > 2:
+        L, M, acc = pgm.process_lds_short(
+            qk_factor,
+            seq_len,
+            L,
+            M,
+            acc,
+            N_TILES=3,
+        )
+    elif num_tiles > 1:
+        L, M, acc = pgm.process_lds_short(
+            qk_factor,
+            seq_len,
+            L,
+            M,
+            acc,
+            N_TILES=2,
+        )
+    else:
+        L, M, acc = pgm.process_lds_short(
+            qk_factor,
+            seq_len,
+            L,
+            M,
+            acc,
+            N_TILES=1,
+        )
+
+    output_base = (
+        output_ptr + q_start_idx * output_stride_0 + head_base * output_stride_1
+    )
+    factor = gl.convert_layout(1.0 / L[:, None], layout=cfg.PV_WMMA_LAYOUT) * out_factor
+    if TDM_STORE:
+        # Stage four independent slices, starting each TDM store before the
+        # next slice is written. Dead attention buffers supply the LDS space.
+        STORE_N: gl.constexpr = 128
+        O_LAYOUT: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+            [[STORE_N, 8]],
+            [cfg.BLOCK_M, STORE_N],
+            [1, 0],
+        )
+        o_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=output_base,
+            shape=(cfg.BLOCK_M, cfg.KV_LORA_RANK),
+            strides=(output_stride_1, 1),
+            block_shape=(cfg.BLOCK_M, STORE_N),
+            layout=O_LAYOUT,
+        )
+        output_buffers = ()
+        for n in gl.static_range(0, cfg.KV_LORA_RANK, STORE_N):
+            part = gl.amd.slice(acc, [cfg.BLOCK_M, STORE_N], [0, n])
+            result = (part * factor).to(output_ptr.type.element_ty)
+            o_smem = gl.allocate_shared_memory(
+                output_ptr.type.element_ty,
+                [cfg.BLOCK_M, STORE_N],
+                O_LAYOUT,
+            )
+            output_buffers += (o_smem,)
+            o_smem.store(result)
+            gl.amd.gfx1250.tdm.async_store(o_desc, [0, n], o_smem)
+        # Keep sources disjoint until kernel exit drains outstanding TDM stores.
+        for i in gl.static_range(len(output_buffers)):
+            output_buffers[i]._keep_alive()
+    else:
+        acc *= factor
+        if output_ptr.type.element_ty.is_fp8():
+            acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
+        offs_m_o = gl.arange(
+            0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.PV_WMMA_LAYOUT)
+        )
+        offs_d_o = gl.arange(
+            0, cfg.KV_LORA_RANK, layout=gl.SliceLayout(0, cfg.PV_WMMA_LAYOUT)
+        )
+        gl.store(
+            output_base + offs_m_o[:, None] * output_stride_1 + offs_d_o[None, :],
+            acc.to(output_ptr.type.element_ty),
+        )
+
+
 _mla_decode_fwd_kernel_repr = make_kernel_repr(
     "_mla_decode_fwd_kernel",
     [
@@ -1508,7 +1756,7 @@ def _mla_decode_fwd_kernel(
     query_ptr,  # [total_num_tokens, num_query_heads, head_size]
     query_scales_ptr,
     kv_buffer_ptr,  # [num_blks, blk_size, num_kv_heads, head_size]
-    block_tables_ptr,  # [num_seqs, max_num_blocks_per_seq]
+    block_tables_ptr: tl.const,  # [num_seqs, max_num_blocks_per_seq]
     seq_lens_ptr,  # [num_seqs]
     SCALE: gl.constexpr,  # float32
     q_scale_ptr,  # float32
@@ -1546,12 +1794,13 @@ def _mla_decode_fwd_kernel(
     KV_CACHE_DTYPE: gl.constexpr = "bf16",  # bool
     BLOCK_SCALES_SIZE: gl.constexpr = 4,  # int
     NUM_HEAD_BLOCKS: gl.constexpr = 1,  # int
+    USE_LDS_PIPELINE: gl.constexpr = False,
+    TDM_STORE: gl.constexpr = False,
+    output_stride_0: gl.int32 = 0,
+    output_stride_1: gl.int32 = 0,
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
 ):
-    assert SHUFFLED_KV_CACHE
-    assert num_stages == 2
-
     cfg = MLAConfig(
         KV_LORA_RANK,
         QK_ROPE_HEAD_DIM,
@@ -1576,12 +1825,28 @@ def _mla_decode_fwd_kernel(
         SCALE_K_WIDTH_LORA,
         SCALE_K_WIDTH_ROPE,
         BLOCK_SCALES_SIZE,
+        USE_LDS_PIPELINE,
     )
+
+    if USE_LDS_PIPELINE:
+        gl.static_assert(ALL_DECODE and SHUFFLED_KV_CACHE)
+        gl.static_assert(QUERY_DTYPE == "fp8" and KV_CACHE_DTYPE == "fp8")
+        gl.static_assert(KV_LORA_RANK == 512 and QK_ROPE_HEAD_DIM == 64)
+        gl.static_assert(TILE_SIZE == 64 and BLOCK_M == 128 and BLOCK_Q == 1)
+        gl.static_assert(NUM_SEGMENTS_PER_SEQ == 1 and NUM_HEAD_BLOCKS == 1)
+        gl.static_assert(num_warps == 4 and num_stages == 4)
+        # Match the single-segment indexing widths checked by the wrapper.
+        block_tables_stride = block_tables_stride.to(gl.int32)
+        query_stride_0 = query_stride_0.to(gl.int32)
+        query_stride_1 = query_stride_1.to(gl.int32)
+    else:
+        assert SHUFFLED_KV_CACHE
+        assert num_stages == 2
 
     # Workgroup offsets
     q_block_global_idx = gl.program_id(0)
-    kv_head_idx = gl.program_id(1)
-    segm_idx = gl.program_id(2)
+    kv_head_idx = 0 if USE_LDS_PIPELINE and num_kv_heads == 1 else gl.program_id(1)
+    segm_idx = 0 if USE_LDS_PIPELINE else gl.program_id(2)
 
     num_token_blocks_per_seq = cdiv_fn(num_tokens_per_seq, BLOCK_Q)
     num_q_blocks_per_seq = num_token_blocks_per_seq * NUM_HEAD_BLOCKS
@@ -1592,7 +1857,11 @@ def _mla_decode_fwd_kernel(
         seq_idx = q_block_global_idx // num_q_blocks_per_seq
     q_block_local_idx = q_block_global_idx - seq_idx * num_q_blocks_per_seq
 
-    q_start_idx = gl.load(query_start_len_ptr + seq_idx)
+    if USE_LDS_PIPELINE:
+        # The wrapper guarantees one packed query row per sequence.
+        q_start_idx = seq_idx
+    else:
+        q_start_idx = gl.load(query_start_len_ptr + seq_idx)
 
     token_q_block_local_idx = q_block_local_idx // NUM_HEAD_BLOCKS
     head_block_idx = q_block_local_idx % NUM_HEAD_BLOCKS
@@ -1605,7 +1874,7 @@ def _mla_decode_fwd_kernel(
     num_segments = NUM_SEGMENTS_PER_SEQ
     tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
 
-    if segm_idx * tiles_per_segment * TILE_SIZE >= seq_len:
+    if not USE_LDS_PIPELINE and segm_idx * tiles_per_segment * TILE_SIZE >= seq_len:
         return
 
     qk_factor: gl.float32 = cfg.QK_SCALE
@@ -1681,8 +1950,12 @@ def _mla_decode_fwd_kernel(
     # Q_lora : (BLOCK_M, KV_LORA_RANK)
     Q_lora_load = gl.load(
         query_ptr + query_offset_lora + offs_q_d_lora[None, :],
-        mask=query_mask_0_lora[:, None] & query_mask_1_lora[:, None],
-        other=0.0,
+        mask=(
+            None
+            if USE_LDS_PIPELINE
+            else query_mask_0_lora[:, None] & query_mask_1_lora[:, None]
+        ),
+        other=None if USE_LDS_PIPELINE else 0.0,
     )
     q_lora_shared.store(Q_lora_load)
     Q_lora = q_lora_shared.load(layout=cfg.Q_DOT_LAYOUT)
@@ -1706,8 +1979,12 @@ def _mla_decode_fwd_kernel(
     # Q_rope : (BLOCK_M, QK_ROPE_HEAD_DIM)
     Q_rope_load = gl.load(
         query_ptr + query_offset_rope + (KV_LORA_RANK_LOAD + offs_q_d_rope)[None, :],
-        mask=query_mask_0_rope[:, None] & query_mask_1_rope[:, None],
-        other=0.0,
+        mask=(
+            None
+            if USE_LDS_PIPELINE
+            else query_mask_0_rope[:, None] & query_mask_1_rope[:, None]
+        ),
+        other=None if USE_LDS_PIPELINE else 0.0,
     )
     q_rope_shared.store(Q_rope_load)
     Q_rope = q_rope_shared.load(layout=cfg.Q_DOT_LAYOUT)
@@ -1853,6 +2130,23 @@ def _mla_decode_fwd_kernel(
         stride_kv_buffer_2,
         stride_kv_buffer_3,
     )
+
+    if USE_LDS_PIPELINE:
+        _mla_decode_lds_pipeline(
+            pgm,
+            seq_idx,
+            seq_len,
+            qk_factor,
+            out_factor,
+            block_tables_ptr,
+            block_tables_stride,
+            output_stride_0,
+            output_stride_1,
+            TDM_STORE,
+            FP8_MIN,
+            FP8_MAX,
+        )
+        return
 
     if KV_CACHE_DTYPE == "nvfp4":
         L, M, acc0, acc1 = pgm.allocate_accumulator()
