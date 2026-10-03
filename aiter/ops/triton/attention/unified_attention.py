@@ -60,6 +60,20 @@ _GLUON_SUPPORTED_ARCHS = ("gfx1250", "gfx950")
 _GFX950_LDS_BUDGET = 160 * 1024
 
 
+def _no_async_copy_on_gfx1250(launch):
+    # On gfx1250, async copy lowers masked KV loads to global_load_async_to_lds,
+    # which has no bounds check and faults on unmapped pages.
+    if DEVICE_ARCH != "gfx1250":
+        return launch
+
+    def run(*args, **kwargs):
+        with triton.knobs.amd.scope():
+            triton.knobs.amd.use_async_copy = False
+            return launch(*args, **kwargs)
+
+    return run
+
+
 def _is_gluon_available():
     return any(supported in DEVICE_ARCH for supported in _GLUON_SUPPORTED_ARCHS)
 
@@ -213,6 +227,11 @@ def unified_attention(
     use_alibi_slopes = alibi_slopes is not None
     use_qq_bias = qq_bias is not None
     SLIDING_WINDOW = 1 + window_size[0]
+
+    # gfx1250 fp8 dots with K >= 128 (v_wmma_f32_16x16x128_fp8_fp8) return wrong
+    # results; q_descale is still applied in-kernel.
+    if DEVICE_ARCH == "gfx1250" and q.dtype == e4m3_dtype:
+        q = q.to(torch.bfloat16)
 
     q_dtype = q.dtype
     kv_cache_dtype = k.dtype
@@ -532,12 +551,12 @@ def _unified_attention_2d_triton(params: _UAParams):
     else:
         total_num_q_blocks = params.num_tokens // config["BLOCK_Q"] + params.num_seqs
 
-    kernel_unified_attention_2d[
+    _no_async_copy_on_gfx1250(kernel_unified_attention_2d[
         (
             params.num_kv_heads,
             total_num_q_blocks,
         )
-    ](
+    ])(
         output_ptr=params.out,
         query_ptr=params.q,
         key_cache_ptr=params.k,
@@ -606,9 +625,9 @@ def _unified_attention_3d_triton(
     else:
         total_num_q_blocks = params.num_tokens // config["BLOCK_Q"] + params.num_seqs
 
-    kernel_unified_attention_3d[
+    _no_async_copy_on_gfx1250(kernel_unified_attention_3d[
         (total_num_q_blocks, params.num_kv_heads, NUM_SEGMENTS)
-    ](
+    ])(
         segm_output_ptr=segm_output,
         segm_max_ptr=segm_max,
         segm_expsum_ptr=segm_expsum,
