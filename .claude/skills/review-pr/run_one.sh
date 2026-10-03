@@ -110,17 +110,20 @@ if [ -d "$W/merge-target" ]; then
 fi
 say "WORK=$W"
 
-# The GLM backend can be slow or time out on a shared box; a single request timeout must not
-# kill the whole review. Retry the agent up to AITER_REVIEW_RETRIES (default 1) with backoff,
-# requiring its output file to exist and be non-empty before counting the attempt as success.
+# The GLM backend can be slow or time out on a shared box. Give each agent AITER_AGENT_TIMEOUT
+# (default 2400s / 40min). A *timeout* is never retried -- a slow generation is slow on retry too;
+# only a transient failure (dropped connection / 5xx) is retried, up to AITER_REVIEW_RETRIES
+# (default 2) attempts, requiring a non-empty output file to count the attempt as success.
 run_agent() {  # <label> <prompt-file> <out-file> <cmd...>
   local label="$1" pf="$2" out="$3"; shift 3
-  local n=0 max="${AITER_REVIEW_RETRIES:-1}"
+  local n=0 max="${AITER_REVIEW_RETRIES:-2}" rc
   while :; do
     n=$((n + 1)); rm -f "$out"
-    if (cd "$PROJ" && timeout "${AITER_AGENT_TIMEOUT:-1500}" "$@" "$(cat "$pf")") && [ -s "$out" ]; then return 0; fi
-    if [ "$n" -ge "$max" ]; then say "$label failed after $max attempts (GLM error/timeout?)"; return 1; fi
-    say "$label attempt $n failed (GLM slow/timeout?); retrying in $((n * 10))s"; sleep $((n * 10))
+    (cd "$PROJ" && timeout "${AITER_AGENT_TIMEOUT:-2400}" "$@" "$(cat "$pf")"); rc=$?
+    [ "$rc" -eq 0 ] && [ -s "$out" ] && return 0
+    if [ "$rc" -eq 124 ]; then say "$label hit the ${AITER_AGENT_TIMEOUT:-2400}s timeout -- not retrying a timeout"; return 1; fi
+    if [ "$n" -ge "$max" ]; then say "$label failed after $max attempts (GLM error?)"; return 1; fi
+    say "$label attempt $n failed (rc=$rc, transient?); retrying in $((n * 10))s"; sleep $((n * 10))
   done
 }
 
