@@ -6,6 +6,8 @@ from dataclasses import dataclass
 BLOCK = 256
 SLOTS = 2
 PRODUCER_COUNTER_STRIDE = 64
+DIRECT_BLOCK = 512
+DIRECT_GRID_CAP = 80
 
 SUPPORTED_TP_SIZES = (2, 4, 8)
 
@@ -19,6 +21,7 @@ class Shape:
     experts: int
     topk: int
     tp_size: int = 8
+    add_shared: bool = True
 
     def __post_init__(self):
         for name, value in (
@@ -45,13 +48,16 @@ class Shape:
                 f"{SUPPORTED_TP_SIZES}, "
                 f"got {self.tp_size}"
             )
+        if not isinstance(self.add_shared, bool):
+            raise TypeError(f"add_shared must be bool, got {self.add_shared!r}")
 
     @property
     def tag(self) -> str:
-        return (
+        tag = (
             f"h{self.model_dim}_i{self.inter_dim}_e{self.experts}"
             f"_k{self.topk}_tp{self.tp_size}"
         )
+        return tag if self.add_shared else f"{tag}_no_shared"
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -87,9 +93,10 @@ class MegakernelConfig:
     collective: str = "direct"
     service_groups: int = 1
     service_tile_group: int = 1
-    producer_mode: str = "routes"
     flat_producer_grid: bool = False
     sorted_input: bool = False
+    wide_partial_scales: bool = False
+    coherent_direct_handoff: bool = False
 
     def __post_init__(self):
         if self.m <= 0:
@@ -215,26 +222,27 @@ class MegakernelConfig:
                 "grouped service synchronization requires collective='rsag' "
                 "and service_groups > 1"
             )
-        if self.producer_mode not in ("routes", "atomic_shared"):
-            raise ValueError(
-                "producer_mode must be 'routes' or 'atomic_shared', got "
-                f"{self.producer_mode!r}"
-            )
         if self.flat_producer_grid and self.collective == "direct":
             raise ValueError("flat_producer_grid requires a dynamic collective path")
         if self.flat_producer_grid and self.n_tile_cohort:
             raise ValueError(
                 "flat_producer_grid and n_tile_cohort are mutually exclusive"
             )
-        if self.collective == "direct" and self.producer_mode != "routes":
-            raise ValueError("direct production path requires producer_mode='routes'")
         if self.collective != "rsag" and self.gather_load_cache_modifier != -1:
             raise ValueError("gather_load_cache_modifier only applies to rsag")
         if self.collective == "direct" and self.remote_store_cache_modifier != 0:
             raise ValueError("remote_store_cache_modifier does not apply to direct")
-        if self.producer_mode == "atomic_shared" and self.collective != "rs_broadcast":
+        if self.wide_partial_scales and (
+            self.collective != "direct" or self.tile_n != 256
+        ):
             raise ValueError(
-                "atomic_shared production requires collective='rs_broadcast'"
+                "wide_partial_scales requires collective='direct' and tile_n=256"
+            )
+        if self.coherent_direct_handoff and (
+            self.collective != "direct" or not self.single_pass_direct
+        ):
+            raise ValueError(
+                "coherent_direct_handoff requires a single-pass direct collective"
             )
         if self.uses_rsag and self.m % self.shape.tp_size:
             raise ValueError(
@@ -260,18 +268,6 @@ class MegakernelConfig:
         return self.collective == "rs_broadcast"
 
     @property
-    def wide_partial_scales(self) -> bool:
-        return (
-            self.collective == "direct"
-            and self.tile_n == 256
-            and (
-                self.m == 4
-                or (self.m in (1, 2) and self.vector_width == 8)
-                or (self.m == 8 and self.vector_width == 16)
-            )
-        )
-
-    @property
     def single_pass_direct(self) -> bool:
         return bool(
             self.collective == "direct"
@@ -293,6 +289,14 @@ class MegakernelConfig:
     @property
     def payload_bytes(self) -> int:
         return self.m * self.shape.model_dim * 2
+
+    @property
+    def output_rows(self) -> int:
+        return self.m
+
+    @property
+    def requires_exact_m(self) -> bool:
+        return False
 
     @property
     def partial_bytes(self) -> int:
@@ -337,9 +341,7 @@ class MegakernelConfig:
 
     @property
     def route_bytes(self) -> int:
-        if self.producer_mode == "routes":
-            return self.m * self.shape.topk * self.shape.model_dim * 2
-        return SLOTS * self.payload_bytes
+        return self.m * self.shape.topk * self.shape.model_dim * 2
 
     @property
     def output_offset(self) -> int:
@@ -350,19 +352,12 @@ class MegakernelConfig:
         return self.output_offset + self.payload_bytes
 
     @property
-    def producer_counter_slots(self) -> int:
-        return SLOTS if self.producer_mode == "atomic_shared" else 1
-
-    @property
     def epoch_offset(self) -> int:
         return self.gather_service_done_offset + self.n_tiles * 8
 
     @property
     def service_done_offset(self) -> int:
-        return (
-            self.producer_done_offset
-            + self.n_tiles * self.producer_counter_slots * PRODUCER_COUNTER_STRIDE
-        )
+        return self.producer_done_offset + self.n_tiles * PRODUCER_COUNTER_STRIDE
 
     @property
     def reduce_done_offset(self) -> int:
@@ -410,35 +405,6 @@ class MegakernelConfig:
 
 
 @dataclass(frozen=True)
-class AtomicConfig:
-    shape: Shape
-    m: int
-    reduce_scatter_grid: int
-    all_gather_grid: int
-
-    def __post_init__(self):
-        if self.m <= 0 or self.m % self.shape.tp_size:
-            raise ValueError(
-                f"m={self.m} must be a positive multiple of " f"TP={self.shape.tp_size}"
-            )
-        if self.reduce_scatter_grid <= 0:
-            raise ValueError(
-                "reduce_scatter_grid must be positive, got "
-                f"{self.reduce_scatter_grid}"
-            )
-        source_count = self.shape.tp_size - 1
-        if self.all_gather_grid < source_count or self.all_gather_grid % source_count:
-            raise ValueError(
-                "all_gather_grid must be a positive multiple of TP-1, got "
-                f"all_gather_grid={self.all_gather_grid}, TP={self.shape.tp_size}"
-            )
-
-    @property
-    def shard_rows(self) -> int:
-        return self.m // self.shape.tp_size
-
-
-@dataclass(frozen=True)
 class WindowConfig:
     shape: Shape
     m: int
@@ -451,8 +417,28 @@ class WindowConfig:
     reduce_scatter_grid: int
     all_gather_grid: int
     sorted_input: bool = False
+    gather_output: bool = True
+    collective_order: str = "reduce_first"
+    local_load_cache_modifier: int = 2
+    local_rows_per_cta: int = 1
+    producer_spatial_partition: int = 0
+    producer_spatial_alt_partition: int = 0
+    producer_spatial_switch_rows: int = 0
+    # Window partial and reduced handoffs independently select per-group
+    # dynamic MXFP4 or MXFP8 payloads.
+    partial_payload_bits: int = 8
+    reduced_payload_bits: int = 8
+    reduce_scatter_load_cache_modifier: int = 2
+    all_gather_load_cache_modifier: int = 2
+    drain_reduce_scatter_grid: int = 0
+    drain_all_gather_grid: int = 0
 
     def __post_init__(self):
+        self._validate_geometry()
+        self._validate_payload()
+        self._validate_collective()
+
+    def _validate_geometry(self) -> None:
         if self.m <= 0:
             raise ValueError(f"m must be positive, got {self.m}")
         for name, value in (
@@ -467,6 +453,45 @@ class WindowConfig:
         ):
             if value <= 0:
                 raise ValueError(f"{name} must be positive, got {value}")
+        if self.local_load_cache_modifier not in (0, 1, 2, 3):
+            raise ValueError("local_load_cache_modifier must be in [0, 3]")
+        if self.local_rows_per_cta not in (1, 2):
+            raise ValueError("local_rows_per_cta must be 1 or 2")
+        if self.producer_spatial_partition < 0:
+            raise ValueError("producer_spatial_partition must be non-negative")
+        if self.producer_spatial_partition and (
+            self.producer_spatial_partition < 101
+            or self.producer_spatial_partition % 100 == 0
+        ):
+            raise ValueError(
+                "producer_spatial_partition must encode positive group and "
+                "M01 values"
+            )
+        if bool(self.producer_spatial_alt_partition) != bool(
+            self.producer_spatial_switch_rows
+        ):
+            raise ValueError(
+                "producer_spatial_alt_partition and "
+                "producer_spatial_switch_rows must be enabled together"
+            )
+        if self.producer_spatial_alt_partition:
+            if not self.producer_spatial_partition:
+                raise ValueError(
+                    "adaptive spatial partition requires a primary partition"
+                )
+            if (
+                self.producer_spatial_alt_partition < 101
+                or self.producer_spatial_alt_partition % 100 == 0
+            ):
+                raise ValueError(
+                    "producer_spatial_alt_partition must encode positive group "
+                    "and M01 values"
+                )
+            if (
+                self.producer_spatial_alt_partition % 100
+                != self.producer_spatial_partition % 100
+            ):
+                raise ValueError("adaptive spatial partitions must use the same M01")
         if self.tile_m not in (16, 32, 64, 128):
             raise ValueError(f"unsupported tile_m={self.tile_m}")
         if self.tile_n not in (128, 256, 512):
@@ -487,16 +512,10 @@ class WindowConfig:
                     f"{value_name}={value} must be divisible by "
                     f"{divisor_name}={divisor}"
                 )
-        if self.shape.model_dim // self.window < 3:
+        if self.phase_count < 3:
             raise ValueError(
                 "window pipeline requires at least three phases, got "
                 f"model_dim={self.shape.model_dim}, window={self.window}"
-            )
-        source_count = self.shape.tp_size - 1
-        if self.all_gather_grid % source_count:
-            raise ValueError(
-                "all_gather_grid must be a multiple of TP-1, got "
-                f"all_gather_grid={self.all_gather_grid}, TP={self.shape.tp_size}"
             )
         if self.local_workers > self.compute_workers:
             raise ValueError(
@@ -504,7 +523,65 @@ class WindowConfig:
                 f"local_workers={self.local_workers}, "
                 f"compute_workers={self.compute_workers}"
             )
-        service_grid = max(self.reduce_scatter_grid, self.all_gather_grid)
+
+    def _validate_payload(self) -> None:
+        # Window communication deliberately supports only dynamic
+        # MXFP4/MXFP8. Do not reintroduce fixed-scale or FP6 handoffs.
+        if self.partial_payload_bits not in (4, 8):
+            raise ValueError("partial_payload_bits must be 4 or 8")
+        if self.reduced_payload_bits not in (4, 8):
+            raise ValueError("reduced_payload_bits must be 4 or 8")
+        if self.reduced_payload_bits != 8 and not self.gather_output:
+            raise ValueError("compressed reduced payload requires gather_output=True")
+
+    def _validate_collective(self) -> None:
+        if self.drain_reduce_scatter_grid < 0:
+            raise ValueError(
+                "drain_reduce_scatter_grid must be non-negative, got "
+                f"{self.drain_reduce_scatter_grid}"
+            )
+        if self.drain_all_gather_grid < 0:
+            raise ValueError(
+                "drain_all_gather_grid must be non-negative, got "
+                f"{self.drain_all_gather_grid}"
+            )
+        if self.drain_all_gather_grid and not self.gather_output:
+            raise ValueError("drain_all_gather_grid requires gather_output=True")
+        if self.collective_order not in (
+            "reduce_first",
+            "alternating",
+            "gather_first",
+        ):
+            raise ValueError(
+                "collective_order must be 'reduce_first', 'alternating', or "
+                f"'gather_first', got {self.collective_order!r}"
+            )
+        if self.collective_order != "reduce_first" and not self.gather_output:
+            raise ValueError("non-default collective_order requires gather_output=True")
+        if self.reduce_scatter_load_cache_modifier not in (0, 1, 2, 3):
+            raise ValueError("reduce_scatter_load_cache_modifier must be in [0, 3]")
+        if self.all_gather_load_cache_modifier not in (0, 1, 2, 3):
+            raise ValueError("all_gather_load_cache_modifier must be in [0, 3]")
+        source_count = self.shape.tp_size - 1
+        if self.gather_output and self.all_gather_grid % source_count:
+            raise ValueError(
+                "all_gather_grid must be a multiple of TP-1, got "
+                f"all_gather_grid={self.all_gather_grid}, TP={self.shape.tp_size}"
+            )
+        if (
+            self.gather_output
+            and self.drain_all_gather_grid
+            and self.drain_all_gather_grid % source_count
+        ):
+            raise ValueError(
+                "drain_all_gather_grid must be a multiple of TP-1, got "
+                f"drain_all_gather_grid={self.drain_all_gather_grid}, "
+                f"TP={self.shape.tp_size}"
+            )
+        service_grid = max(
+            self.reduce_scatter_grid,
+            self.all_gather_grid if self.gather_output else 0,
+        )
         if self.compute_workers < 2 * service_grid:
             raise ValueError(
                 "paired window services require at least two compute workers "
@@ -517,12 +594,67 @@ class WindowConfig:
         return self.m // self.shape.tp_size
 
     @property
+    def output_rows(self) -> int:
+        return self.m if self.gather_output else self.shard_rows
+
+    @property
+    def requires_exact_m(self) -> bool:
+        # Padding only the global tail changes which rows belong to each rank.
+        # Compact ragged calls bypass this fixed-layout mapping and provide
+        # explicit per-rank sizes instead.
+        return not self.gather_output
+
+    @property
+    def phase_count(self) -> int:
+        return self.shape.model_dim // self.window
+
+    @property
     def tiles_per_window(self) -> int:
         return self.window // self.tile_n
 
     @property
+    def route_row_bytes(self) -> int:
+        return self.window + self.window // 8
+
+    @property
     def groups_per_row(self) -> int:
         return self.window // 32
+
+    @property
+    def partial_row_bytes(self) -> int:
+        return self.window * self.partial_payload_bits // 8
+
+    @property
+    def partial_payload_bytes(self) -> int:
+        return self.m * self.partial_row_bytes
+
+    @property
+    def partial_scale_bytes(self) -> int:
+        return self.m * self.groups_per_row
+
+    @property
+    def partial_epoch_offset(self) -> int:
+        return self.partial_payload_bytes + self.partial_scale_bytes
+
+    @property
+    def partial_buffer_bytes(self) -> int:
+        return _align_up(self.partial_epoch_offset + 8, 256)
+
+    @property
+    def reduced_row_bytes(self) -> int:
+        return self.window * self.reduced_payload_bits // 8
+
+    @property
+    def reduced_epoch_offset(self) -> int:
+        return self.shard_rows * self.reduced_row_bytes
+
+    @property
+    def reduced_buffer_bytes(self) -> int:
+        return _align_up(self.reduced_epoch_offset + 8, 256)
+
+    @property
+    def reduced_scale_bytes(self) -> int:
+        return self.shard_rows * self.groups_per_row
 
     @property
     def compute_workers(self) -> int:
@@ -536,4 +668,78 @@ class WindowConfig:
         return producer_rows * self.tiles_per_window
 
 
-PipelineConfig = MegakernelConfig | AtomicConfig | WindowConfig
+@dataclass(frozen=True)
+class DirectConfig:
+    """Ordinary Stage2 followed by direct collective postprocessing."""
+
+    shape: Shape
+    m: int
+    sort_block_m: int
+    grid_cap: int = DIRECT_GRID_CAP
+    vector_width: int = 8
+
+    def __post_init__(self):
+        if not self.shape.add_shared:
+            raise ValueError("direct collective requires add_shared=True")
+        for name, value in (
+            ("m", self.m),
+            ("sort_block_m", self.sort_block_m),
+            ("grid_cap", self.grid_cap),
+            ("vector_width", self.vector_width),
+        ):
+            if value <= 0:
+                raise ValueError(f"{name} must be positive, got {value}")
+        if self.vector_width not in (4, 8):
+            raise ValueError(
+                "direct vector_width must be 4 or 8, got " f"{self.vector_width}"
+            )
+        if self.m % self.shape.tp_size:
+            raise ValueError(f"m={self.m} must be divisible by TP={self.shape.tp_size}")
+        if self.shape.model_dim % self.vector_width:
+            raise ValueError(
+                f"model_dim={self.shape.model_dim} must be divisible by "
+                f"vector_width={self.vector_width}"
+            )
+
+    @property
+    def output_rows(self) -> int:
+        return self.m // self.shape.tp_size
+
+    @property
+    def requires_exact_m(self) -> bool:
+        return True
+
+    @property
+    def vectors(self) -> int:
+        return self.output_rows * self.shape.model_dim // self.vector_width
+
+    @property
+    def grid(self) -> int:
+        return min(
+            self.grid_cap,
+            (self.vectors + DIRECT_BLOCK - 1) // DIRECT_BLOCK,
+        )
+
+    @property
+    def partial_bytes(self) -> int:
+        return self.m * self.shape.model_dim * 2
+
+    @property
+    def ready_offset(self) -> int:
+        return _align_up(self.partial_bytes, 256)
+
+    @property
+    def completion_counter_offset(self) -> int:
+        # The direct readiness protocol owns three i32 words at ready_offset.
+        return self.ready_offset + 12
+
+    @property
+    def done_epoch_offset(self) -> int:
+        return _align_up(self.completion_counter_offset + 4, 8)
+
+    @property
+    def workspace_bytes(self) -> int:
+        return _align_up(self.done_epoch_offset + 8, 256)
+
+
+PipelineConfig = MegakernelConfig | WindowConfig | DirectConfig
