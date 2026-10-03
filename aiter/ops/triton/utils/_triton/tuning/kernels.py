@@ -63,7 +63,7 @@ class KernelSpec:
     config_name: str
     # ("B", "M", "N", "K") for batched kernels
     dims: tuple = ("M", "N", "K")
-    # bits per element of A and B as they sit in LDS (per-32 scales included)
+    # bits per element of A and B as they sit in LDS (scales not counted)
     bits: tuple = (16, 16)
     # archs where backend="gluon" can run at all
     gluon_archs: tuple = ()
@@ -77,6 +77,8 @@ class KernelSpec:
     gluon_ignored_keys: tuple = ()
     # gluon-only candidate lists, for keys that mean something else there
     gluon_candidates: dict = field(default_factory=dict)
+    # (config) -> (ctas_m, ctas_n): how the kernel splits BLOCK_SIZE_M/N over a CTA cluster
+    cta_split: Callable | None = None
 
     def default_backend(self, arch):
         return "gluon" if arch in self.gluon_default_archs else "triton"
@@ -616,7 +618,7 @@ def gemm_a8wfp4(shape, backend):
     return call, (x, w, x_scales, w_scales, y), None
 
 
-@kernel("GEMM-AFP4WFP4", bits=(4.25, 4.25), gluon_archs=("gfx950",))
+@kernel("GEMM-AFP4WFP4", bits=(4, 4), gluon_archs=("gfx950",))
 def gemm_afp4wfp4(shape, backend):
     import torch
 
@@ -688,9 +690,23 @@ def gemm_afp4wfp4_pre_quant_atomic(shape, backend):
     return call, (x, w, w_scales, y), None
 
 
+def mxfp4_cta_split(config):
+    """num_ctas makes BLOCK_SIZE_M/N a cluster tile; each CTA computes its share of it."""
+    if config.get("num_ctas", 1) == 1:
+        return 1, 1
+    from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_mxfp4 import (
+        cluster_shape,
+    )
+
+    return cluster_shape(
+        config["num_ctas"], config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"]
+    )
+
+
 @kernel(
     "GEMM-AFP4WFP4_PRESHUFFLED",
-    bits=(4.25, 4.25),
+    bits=(4, 4),
+    cta_split=mxfp4_cta_split,
     gluon_archs=("gfx1250",),
     gluon_default_archs=("gfx1250",),
     backend_kwarg=False,
@@ -726,12 +742,17 @@ def gemm_afp4wfp4_preshuffle(shape, backend):
             config["BLOCK_SIZE_N"],
             config["BLOCK_SIZE_K"],
         )
+        ctas_m, ctas_n = mxfp4_cta_split(config)
+        cta_m, cta_n = (
+            block_m // ctas_m,
+            block_n // ctas_n,
+        )  # one CTA's share of the tile
         if (M < 32) != (block_m <= 16):
             return True  # x_scales are un-shuffled below M=32: BLOCK_SIZE_M <= 16 there, >= 32 above
-        if block_m >= 32 and block_m % 32:
-            return True  # preshuffled scales come in 32-row stripes
-        if block_n % 32:
-            return True  # the wrapper raises BLOCK_SIZE_N to 32 anyway
+        if M >= 32 and (cta_m < 32 or cta_m % 32):
+            return True  # preshuffled scales come in 32-row stripes per CTA
+        if cta_n % 32:
+            return True  # w_scales come in 32-row stripes per CTA
         if backend == "triton":
             return block_k < 128  # the triton wrapper raises it to 128 anyway
         if block_k % 256 or K % block_k:
