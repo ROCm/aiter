@@ -8,21 +8,52 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
-from aiter.ops.flydsl.bpreshuffle_gemm_gfx1250 import (
-    run_kimi_gather_gemm_a8w8_gfx1250,
-)
-from aiter.ops.triton.gather_kv_b_proj import gather_kv_b_proj
-
 _HEADS = 96
 _KV_C = 512
 _KV_PE = 64
 _NOPE = 128
 _V_DIM = 128
 _WEIGHT_N = _HEADS * (_NOPE + _V_DIM)
-_FLYDSL_MIN_ROWS = 4096
-_GEMM_CONFIG = {
-    "kernelName": "flydsl_bpreshuffle_wmma_t256x256x128_" "mw2_nw2_nb4_sk1_cm1_cn1"
-}
+
+_launch_projection = None
+_ptr_arg = None
+_fx = None
+
+
+def _run_projection(
+    xq: Tensor,
+    weight: Tensor,
+    x_scale: Tensor,
+    weight_scale: Tensor,
+    k_out: Tensor,
+    v_out: Tensor,
+) -> None:
+    """Launch the fixed Kimi TP1 WMMA kernel without using the GEMM ABI."""
+    global _launch_projection, _ptr_arg, _fx
+    if _launch_projection is None:
+        import flydsl.expr as fx
+
+        from .kernels.gather_kv_b_proj_gfx1250 import (
+            launch_kimi_k3_gather_kv_b_proj_8wave_gfx1250,
+        )
+        from .kernels.tensor_shim import ptr_arg
+
+        _launch_projection = launch_kimi_k3_gather_kv_b_proj_8wave_gfx1250
+        _ptr_arg = ptr_arg
+        _fx = fx
+
+    sa = x_scale.reshape(-1).to(torch.float32).contiguous()
+    sb = weight_scale.reshape(-1).to(torch.float32).contiguous()
+    _launch_projection(
+        _ptr_arg(k_out),
+        _ptr_arg(v_out),
+        _ptr_arg(xq),
+        _ptr_arg(weight),
+        _ptr_arg(sa),
+        _ptr_arg(sb),
+        xq.shape[0],
+        _fx.Stream(torch.cuda.current_stream(device=xq.device)),
+    )
 
 
 def unsupported_reason(
@@ -78,7 +109,6 @@ def _gather_latent(
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
     SCALE_IS_PTR: tl.constexpr,
-    A_PRESHUFFLE: tl.constexpr,
 ):
     rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
     cols = tl.arange(0, BLOCK_K)
@@ -90,15 +120,12 @@ def _gather_latent(
         mask=row_mask[:, None],
         other=0.0,
     )
-    if A_PRESHUFFLE:
-        x_off = (
-            (safe_rows[:, None] // 2) * 512
-            + (cols[None, :] // 128) * 256
-            + (safe_rows[:, None] % 2) * 128
-            + cols[None, :] % 128
-        )
-    else:
-        x_off = safe_rows[:, None] * 512 + cols[None, :]
+    x_off = (
+        (safe_rows[:, None] // 2) * 1024
+        + (cols[None, :] // 128) * 256
+        + (safe_rows[:, None] % 2) * 128
+        + cols[None, :] % 128
+    )
     tl.store(xq + x_off, values, mask=row_mask[:, None])
     scale = tl.load(cache_scale) if SCALE_IS_PTR else cache_scale
     tl.store(x_scale + safe_rows, scale, mask=row_mask)
@@ -158,9 +185,8 @@ def gather_kv_b_proj_flydsl_gfx1250(
     *,
     weight_preshuffle: bool = True,
     shuffled_kv_cache: bool = False,
-    flydsl_min_rows: int = _FLYDSL_MIN_ROWS,
 ) -> None:
-    """Use FlyDSL WMMA for long Kimi-K3 ptpc prefixes, Triton below crossover."""
+    """Use the dedicated gfx1250 FlyDSL WMMA path for Kimi-K3 ptpc prefixes."""
     reason = unsupported_reason(
         k_buffer,
         kv_proj_weight,
@@ -175,20 +201,6 @@ def gather_kv_b_proj_flydsl_gfx1250(
         )
 
     m = k_prefix.shape[0]
-    if m < flydsl_min_rows:
-        gather_kv_b_proj(
-            k_buffer,
-            k_scale,
-            kv_indptr,
-            kv_indices,
-            kv_prefix_sum_context_lens,
-            kv_proj_weight,
-            kv_proj_scale,
-            k_prefix,
-            v_prefix,
-            weight_preshuffle=True,
-        )
-        return
     if kv_indices.numel() < m:
         raise ValueError(f"kv_indices has {kv_indices.numel()} entries, need {m}")
     if k_scale.numel() != 1 or k_scale.device not in (
@@ -212,16 +224,14 @@ def gather_kv_b_proj_flydsl_gfx1250(
         BLOCK_M=16,
         BLOCK_K=_KV_C,
         SCALE_IS_PTR=scale_is_ptr,
-        A_PRESHUFFLE=True,
     )
-    run_kimi_gather_gemm_a8w8_gfx1250(
+    _run_projection(
         xq,
         kv_proj_weight,
         x_scale,
         kv_proj_scale,
         k_prefix,
         v_prefix,
-        _GEMM_CONFIG["kernelName"],
     )
     _copy_rope[(triton.cdiv(m, 16), triton.cdiv(_HEADS, 8))](
         k_buffer,
