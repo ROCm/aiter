@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "mla_decode_shape.h"
 #include "v1_comm.cuh"
 
 __device__ int32_t get_local_splits(int32_t seqlen_kv,
@@ -180,7 +181,7 @@ void get_mla_metadata_v1_0_device(const aiter_tensor_t& seqlens_qo_indptr, // [b
                                   aiter_tensor_t& reduce_final_map,
                                   aiter_tensor_t& reduce_partial_map)
 {
-    constexpr int32_t kPackedQoLenPerWg = 128;
+    constexpr int32_t kPackedQoLenPerWg = kMlaMetadataV10V11PackedQoLenPerWg;
 
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
@@ -196,26 +197,21 @@ void get_mla_metadata_v1_0_device(const aiter_tensor_t& seqlens_qo_indptr, // [b
     int32_t qk_batch_ratio = 1;
     int32_t uni_seqlen_qo  = ori_uni_seqlen_qo;
 
-    int32_t fixed_num_batches = reduce_indptr.size(0) - 1;
-    // In the following cases, we use #head=16 to simulate cases which is not natively supported by
-    // mla main kernel.
-    if((num_heads != 16) &&
-       (num_heads != 128) && // main kernel natively supports #head=16 or #head=128
-       (num_heads % 16 == 0) && (num_heads < 128))
-    {
-        qk_batch_ratio = num_heads / 16;
-        num_heads      = 16;
-        num_batches *= qk_batch_ratio;
-    }
+    int32_t fixed_num_batches         = reduce_indptr.size(0) - 1;
+    const MlaDecodeHeadPlan head_plan = mla_decode_head_plan_v1_0(num_heads, uni_seqlen_qo);
+
+    qk_batch_ratio = head_plan.qk_batch_ratio;
+    num_heads      = head_plan.kernel_num_heads;
+    num_batches *= qk_batch_ratio;
 
     if(num_heads == 128)
     {
-        qk_batch_ratio = uni_seqlen_qo;
+        qk_batch_ratio = head_plan.seqlen_fold;
         uni_seqlen_qo  = 1;
         num_batches *= qk_batch_ratio;
     }
 
-    AITER_CHECK((num_heads == 16) || (num_heads == 128),
+    AITER_CHECK(head_plan.plan != MlaHeadPlan::Unsupported,
                 __func__,
                 ": only supports #heads in [16, 128], or (#head, uni_seqlen_qo) = (16*N, 1) where "
                 "N is in [2, 8).");
