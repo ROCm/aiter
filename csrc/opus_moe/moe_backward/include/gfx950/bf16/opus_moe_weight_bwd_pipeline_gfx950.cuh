@@ -1551,13 +1551,6 @@ weight_bwd_k64_process_tile_gfx950(WeightBwdKernelArgs kargs)
         if(route_count > T::MAX_ROUTE_COUNT)
             return;
     }
-    if constexpr(requires { T::EXCLUDED_MIN_ROUTE_COUNT;
-                            T::EXCLUDED_MAX_ROUTE_COUNT; })
-    {
-        if(route_count >= T::EXCLUDED_MIN_ROUTE_COUNT &&
-           route_count <= T::EXCLUDED_MAX_ROUTE_COUNT)
-            return;
-    }
     const int tid = static_cast<int>(thread_id_x());
     const int lane_id = tid % get_warp_size();
     const int wave_id = __builtin_amdgcn_readfirstlane(tid / get_warp_size());

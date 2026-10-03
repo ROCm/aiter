@@ -248,6 +248,38 @@ def test_large_partial_autograd_route_policy_is_retained():
     assert_output(actual, expected)
 
 
+@pytest.mark.parametrize('routes', [30720, 30721, 30752])
+def test_adaptive_dw2_route_boundary(routes):
+    # K5's threshold applies to padded expert intervals (multiples of 32),
+    # so 30721 live rows becomes the first representable >30720 interval.
+    # A single active expert also checks exact-zero output for empty experts.
+    torch.manual_seed(20261003)
+    d, i, e = 256, 128, 4
+    padded = ((routes + 31) // 32) * 32
+    dout = torch.randn(routes, d, device='cuda', dtype=torch.bfloat16)
+    scaled = torch.zeros(padded, i, device='cuda', dtype=torch.bfloat16)
+    scaled[:routes] = torch.randn(routes, i, device='cuda', dtype=torch.bfloat16)
+    ids = torch.full((padded,), routes | (1 << 24), device='cuda', dtype=torch.int32)
+    ids[:routes] = torch.arange(routes, device='cuda', dtype=torch.int32)
+    valid = torch.tensor([padded, routes], device='cuda', dtype=torch.int32)
+    offsets = torch.tensor([0, padded, padded, padded, padded], device='cuda', dtype=torch.int32)
+    def launch():
+        return opus.opus_moe_dw2_backward(dout, scaled, ids, valid, offsets,
+            topk=1, block_m=32, kernel_id=10)
+    actual = launch()
+    expected = torch.zeros(e, d, i, device='cuda', dtype=torch.bfloat16)
+    expected[0] = (dout.float().T @ scaled[:routes].float()).bfloat16()
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=0.02, atol=0.25)
+    assert torch.count_nonzero(actual[1:]) == 0
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = launch()
+    for _ in range(100):
+        graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(actual, captured)
+
+
 def test_compact_router_and_empty_token_segments():
     torch.manual_seed(42)
     logits = torch.randn(9, 7, device='cuda', requires_grad=True)
