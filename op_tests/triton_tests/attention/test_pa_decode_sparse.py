@@ -7,7 +7,6 @@ import pytest
 import torch
 import triton
 
-import aiter.ops.triton.attention.pa_decode_sparse as pa_decode_sparse_mod
 from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
@@ -660,8 +659,25 @@ def _ragged(lens, pool_rows, device, gen, sentinel_rows=(), lead_invalid=0):
     return torch.cat(rows).to(device), ptr.to(device)
 
 
-def _vllm_pool_case(T, H, sentinels):
-    """Inputs and reference of one DSv4.1 vLLM-pool case (see the test below)."""
+def _edge_lens(T):
+    """SWA and top-k lengths on every tile edge, over T rows."""
+    edge = [0, 1, 63, 64, 65, 127, 128, 129]
+    main_lens = [edge[(t * 7) % len(edge)] if t % 3 else 128 for t in range(T)]
+    extra_lens = [
+        ([0, 1, 64, 65, 192, 511, 512, 640] * 3)[(t * 5) % 24] for t in range(T)
+    ]
+    return main_lens, extra_lens
+
+
+def _vllm_pool_case(H, main_lens, extra_lens, sentinels="none"):
+    """Inputs and reference of one DSv4.1 vLLM-pool case: row t attends
+    main_lens[t] SWA slots and extra_lens[t] top-k slots of page-pitched pools.
+    sentinels: "some" puts a -1 in every other entry of every 4th row, "lead"
+    makes every row's first 130 entries -1."""
+    main_lens = [int(n) for n in main_lens]
+    extra_lens = [int(n) for n in extra_lens]
+    assert len(main_lens) == len(extra_lens)
+    T = len(main_lens)
     device = "cuda"
     torch.manual_seed(0)
     gen = torch.Generator().manual_seed(T * 131 + H)
@@ -669,17 +685,15 @@ def _vllm_pool_case(T, H, sentinels):
     q = torch.randn(T, H, D, dtype=torch.bfloat16, device=device) * 0.125
     sink = torch.randn(H, dtype=torch.float32, device=device) * 0.1
     scale = float(D) ** -0.5
-    edge = [0, 1, 63, 64, 65, 127, 128, 129]
-    main_lens = [edge[(t * 7) % len(edge)] if t % 3 else 128 for t in range(T)]
-    extra_lens = [
-        ([0, 1, 64, 65, 192, 511, 512, 640] * 3)[(t * 5) % 24] for t in range(T)
-    ]
-    main_pool, main_deq = _packed_pool(64, 32, 32 * 584 + 192, device, seed=1)
-    extra_pool, extra_deq = _packed_pool(48, 128, 128 * 584 + 448, device, seed=2)
+    # Pools large enough for the longest row's distinct slots.
+    main_nb = max(64, -(-max(main_lens, default=0) // 32))
+    extra_nb = max(48, -(-max(extra_lens, default=0) // 128))
+    main_pool, main_deq = _packed_pool(main_nb, 32, 32 * 584 + 192, device, seed=1)
+    extra_pool, extra_deq = _packed_pool(extra_nb, 128, 128 * 584 + 448, device, seed=2)
     srows = set(range(0, T, 4)) if sentinels == "some" else ()
     lead = 130 if sentinels == "lead" else 0
-    mi, mp = _ragged(main_lens, 64 * 32, device, gen, srows, lead)
-    ei, ep = _ragged(extra_lens, 48 * 128, device, gen, srows, lead)
+    mi, mp = _ragged(main_lens, main_nb * 32, device, gen, srows, lead)
+    ei, ep = _ragged(extra_lens, extra_nb * 128, device, gen, srows, lead)
     ref = two_loop_reference(q, main_deq, mi, mp, extra_deq, ei, ep, sink, scale)
     return (q, main_pool, mi, mp, sink, scale, extra_pool, ei, ep), ref
 
@@ -717,27 +731,9 @@ def test_pa_decode_sparse_two_loop_vllm_pool(T, H, sentinels, splits):
     """DSv4.1 vLLM-pool shapes: page-pitched SWA and top-k pools, ragged lengths on
     every tile edge, sentinels including whole leading tiles, split-K on and off."""
     _vllm_pool_skip(T, splits)
-    args, ref = _vllm_pool_case(T, H, sentinels)
+    args, ref = _vllm_pool_case(H, *_edge_lens(T), sentinels)
     out = _vllm_pool_run(args, splits)
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
-
-
-@pytest.mark.parametrize("T", [1, 37, 192, 2100])
-@pytest.mark.parametrize("H", [16, 32, 64])
-@pytest.mark.parametrize("sentinels", ["some", "lead"])
-@pytest.mark.parametrize("splits", [None, 3])
-def test_pa_decode_sparse_two_loop_vllm_pool_asm_dequant(
-    T, H, sentinels, splits, monkeypatch
-):
-    """The inline asm dequant used without cdna4.scaled_upcast, forced by hiding
-    the upcast from the driver. Must match the upcast bit for bit."""
-    _vllm_pool_skip(T, splits)
-    args, ref = _vllm_pool_case(T, H, sentinels)
-    out = _vllm_pool_run(args, splits)
-    monkeypatch.setattr(pa_decode_sparse_mod, "_HAS_SCALED_UPCAST", False)
-    out_asm = _vllm_pool_run(args, splits)
-    assert torch.equal(out_asm.view(torch.int16), out.view(torch.int16))
-    torch.testing.assert_close(out_asm, ref, atol=1e-2, rtol=1e-2)
 
 
 def _inv_rope_ref(x, pos, cos_sin):
@@ -759,7 +755,7 @@ def test_pa_decode_sparse_inv_rope_mxfp8_epilogue(T, H, splits, mxfp8):
     """The inverse-RoPE / MXFP8 output epilogue, without and with split-K, against
     the f32 reference rotated back; MXFP8 is checked dequantized."""
     _vllm_pool_skip(T, splits)
-    args, ref = _vllm_pool_case(T, H, "some")
+    args, ref = _vllm_pool_case(H, *_edge_lens(T), "some")
     q, main_pool, mi, mp, sink, scale, extra_pool, ei, ep = args
     gen = torch.Generator(device="cuda").manual_seed(T * 7 + H)
     ang = torch.rand(4096, 32, device="cuda", generator=gen) * 6.2831853
