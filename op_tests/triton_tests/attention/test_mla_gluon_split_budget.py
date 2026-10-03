@@ -215,6 +215,148 @@ def test_single_block_context_is_never_split(rows):
     assert _bh16_num_kv_splits(rows * MEASURED_M_BLOCKS, BLOCK_N, BLOCK_N) == 1
 
 
+# A second shape family, measured after the coefficients were fixed: 12 heads
+# zero-padded to 16 (ONE head block, where DCP gives six), DSpark verify
+# qlen=5, no DCP so each rank walks the whole context. base_grid is conc*5.
+# This is the shape sgl-project/sglang#41388 routes onto the asm path.
+# {(kv_len, base_grid): {splits: us}}
+MEASURED_QH16 = {
+    (32768, 5): {
+        1: 658,
+        2: 334,
+        3: 228,
+        4: 172,
+        6: 119,
+        8: 91,
+        12: 66,
+        16: 51,
+        24: 51,
+        32: 51,
+        43: 50,
+        48: 50,
+        51: 50,
+        64: 50,
+        96: 50,
+        128: 51,
+        192: 53,
+        256: 51,
+    },
+    (32768, 40): {
+        1: 666,
+        2: 339,
+        3: 234,
+        4: 178,
+        6: 136,
+        8: 184,
+        12: 142,
+        16: 153,
+        24: 148,
+        32: 147,
+        48: 176,
+        64: 172,
+        96: 208,
+    },
+    (32768, 80): {
+        1: 670,
+        2: 343,
+        3: 256,
+        4: 352,
+        6: 264,
+        8: 280,
+        12: 270,
+        16: 265,
+        24: 294,
+        32: 288,
+        48: 327,
+    },
+    (32768, 320): {1: 1356, 2: 1042, 3: 1001, 4: 973, 6: 1025, 8: 1001, 12: 1044},
+    (131072, 5): {
+        1: 2623,
+        2: 1315,
+        3: 888,
+        4: 667,
+        6: 451,
+        8: 341,
+        12: 232,
+        16: 177,
+        24: 122,
+        32: 94,
+        48: 74,
+        49: 82,
+        51: 73,
+        64: 99,
+        96: 79,
+        128: 87,
+        192: 97,
+        256: 95,
+    },
+    (131072, 40): {
+        1: 2634,
+        2: 1321,
+        3: 893,
+        4: 675,
+        6: 497,
+        8: 685,
+        12: 503,
+        16: 532,
+        24: 511,
+        32: 496,
+        48: 533,
+        64: 518,
+        96: 556,
+    },
+    (131072, 80): {
+        1: 2639,
+        2: 1329,
+        3: 976,
+        4: 1362,
+        6: 985,
+        8: 1042,
+        12: 991,
+        16: 967,
+        24: 1006,
+        32: 989,
+        48: 1027,
+    },
+    (131072, 320): {1: 6000, 2: 4585, 3: 4059, 4: 3826, 6: 4128, 8: 3852, 12: 3890},
+}
+
+
+@pytest.mark.parametrize("key", sorted(MEASURED_QH16))
+def test_pick_generalizes_to_the_one_head_block_shape(key):
+    """The coefficients were fitted at nhead=96 and a single context length.
+    They have to hold at one head block and two other contexts without refit,
+    or they are describing one benchmark rather than the hardware."""
+    kv_len, base_grid = key
+    times = MEASURED_QH16[key]
+    picked = _bh16_num_kv_splits(base_grid, BLOCK_N, kv_len)
+    assert picked in times, f"pick s={picked} is outside the measured sweep"
+    best = min(times.values())
+    shipped = times[_shipped(base_grid)]
+    assert times[picked] <= best * MAX_LOSS_VS_BEST
+    assert times[picked] <= shipped * MAX_LOSS_VS_SHIPPED
+
+
+@pytest.mark.parametrize("kv_len", [32768, 131072])
+def test_recovers_the_high_concurrency_collapse_at_one_head_block(kv_len):
+    """conc 64 x qlen 5 is 320 workgroups, so the shipped budget floors to one
+    split and the whole context is walked by every workgroup."""
+    times = MEASURED_QH16[(kv_len, 320)]
+    assert _shipped(320) == 1
+    picked = _bh16_num_kv_splits(320, BLOCK_N, kv_len)
+    assert times[1] / times[picked] >= 1.35
+
+
+def test_margin_keeps_the_shipped_pick_on_a_modelled_tie():
+    """base_grid 5 at 128k is the case that forced the margin: the model saw a
+    1.01x gain in moving 51 -> 49 and the measured curve is jagged enough there
+    that 49 reads 11% slower than 51. A predicted tie is not worth the risk."""
+    times = MEASURED_QH16[(131072, 5)]
+    picked = _bh16_num_kv_splits(5, BLOCK_N, 131072)
+    assert picked == _shipped(5) == 51
+    assert times[49] / times[51] > 1.10  # what the margin is protecting against
+
+
 @pytest.mark.parametrize("base_grid", [1, 5, 10, 16, 40])
 @pytest.mark.parametrize("kv_len", [32768, 131072])
 def test_small_grids_keep_their_many_splits(base_grid, kv_len):

@@ -823,6 +823,9 @@ _SPLIT_WAVE_WGS = 256
 _SPLIT_WALK_COST = 2.2799  # per wave x BLOCK_N iteration
 _SPLIT_PARTIAL_COST = 0.053446  # per partial written by stage 1 and reduced by stage 2
 _SPLIT_MIN_MAX = 8  # floor on the search bound; see _bh16_split_search_bound
+# Predicted gain required to move off the occupancy budget. Measured results
+# are flat for anything in 1.02-1.08, so this is not a knife edge.
+_SPLIT_MARGIN = 1.05
 
 
 def _bh16_num_kv_splits(base_grid, block_n, kv_len=None):
@@ -848,7 +851,15 @@ def _bh16_num_kv_splits(base_grid, block_n, kv_len=None):
         return c + (_SPLIT_PARTIAL_COST * base_grid * s if s > 1 else 0.0)
 
     hi = _bh16_split_search_bound(base_grid, block_n, kv_len)
-    return min(range(1, hi + 1), key=lambda s: (cost(s), s))
+    best = min(range(1, hi + 1), key=lambda s: (cost(s), s))
+    # Only leave the occupancy budget for a gain large enough to be worth the
+    # model being wrong. Where the two are close the measured curve is jagged
+    # enough that a modelled tie can read 10% either way, and today's pick is
+    # the one with the track record.
+    occupancy = max(1, 256 // base_grid)
+    if cost(occupancy) < cost(best) * _SPLIT_MARGIN:
+        return occupancy
+    return best
 
 
 def _bh16_split_search_bound(base_grid, block_n, kv_len):
