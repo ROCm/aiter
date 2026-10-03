@@ -31,7 +31,10 @@ import torch
 
 import aiter
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.grouped_moe_gfx1250 import _grouped_a8w4_preshuffle_e8m0_scale
+from aiter.ops.flydsl.grouped_moe_gfx1250 import (
+    _build_g2l_lut,
+    _grouped_a8w4_preshuffle_e8m0_scale,
+)
 from aiter.ops.flydsl.kernels.moe_contiguous_psum import (
     build_moe_contiguous_psum_module,
     build_moe_contiguous_psum_remap_ep_module,
@@ -123,8 +126,8 @@ def run_torch_gather_reduce(grouped, rmap, w, dtype):
 # ------------------------------------------------------------------- tests
 @benchmark()
 def test_g2l_lut(n, E, topk):
-    """EP global->local expert LUT build (single-block Hillis-Steele scan)."""
-    launch = build_moe_g2l_lut_module()
+    """EP global->local expert LUT build (single-block hierarchical scan)."""
+    launch = build_moe_g2l_lut_module(max_experts=512 if n <= 512 else 1024)
     nvt = max(1, n // 4)
     mask = (torch.rand(n) < 0.6).to(I32)
     nvt_t = torch.tensor([nvt], dtype=I32)
@@ -175,6 +178,32 @@ def test_g2l_lut(n, E, topk):
         ret[f"{name} TB/s"] = nbytes / us / 1e6
         ret[f"{name} err"] = err
     return ret
+
+
+def test_g2l_lut_dispatch(n, E, topk):
+    """Exercise production variant selection and the >1024 torch fallback."""
+    nvt = max(1, n // 4)
+    mask = (torch.rand(n) < 0.6).to(I32)
+    nvt_t = torch.tensor([nvt], dtype=I32)
+    ref_lut, ref_cnt, ref_nvr = run_torch_g2l_lut(mask, E, nvt, topk)
+
+    lut, counter, nvr = _build_g2l_lut(mask, E, mask.device, nvt_t, topk)
+    checkAllclose(ref_lut.float(), lut.float(), rtol=0, atol=0, msg="dispatch lut")
+    if n <= 1024:
+        assert counter is not None and nvr is not None
+        checkAllclose(
+            ref_cnt.float(), counter.float(), rtol=0, atol=0, msg="dispatch counter"
+        )
+        checkAllclose(
+            torch.tensor([float(ref_nvr)]),
+            nvr.float(),
+            rtol=0,
+            atol=0,
+            msg="dispatch nvr",
+        )
+    else:
+        assert counter is None and nvr is None
+    return {"gfx": get_gfx(), "n": n, "path": "flydsl" if n <= 1024 else "torch"}
 
 
 @benchmark()
@@ -1022,16 +1051,30 @@ def main():
     args = parser.parse_args()
     dmap = {"bf16": torch.bfloat16, "f16": torch.float16}
 
-    # n <= 512: the LUT scan is single-workgroup (MAX_G2L_EXPERTS).
+    # n <= 1024: the LUT scan is single-workgroup (MAX_G2L_EXPERTS).
     summarize(
         "moe_g2l_lut",
         [
             test_g2l_lut(n, E, topk)
-            for n, E, topk in itertools.product(
-                [64, 512], [e for e in args.experts if e <= 512], [2, 8]
-            )
+            for n, E, topk in [
+                *itertools.product(
+                    [64, 512], [e for e in args.experts if e <= 512], [2, 8]
+                ),
+                (511, 128, 8),
+                (513, 128, 8),
+                (640, 160, 8),
+                (768, 192, 8),
+                (896, 56, 16),
+                (1023, 256, 8),
+                (1024, 256, 8),
+                (1024, 512, 8),
+            ]
             if E <= n
         ],
+    )
+    summarize(
+        "moe_g2l_lut dispatch boundaries",
+        [test_g2l_lut_dispatch(n, min(n, 256), 8) for n in [512, 513, 1024, 1025]],
     )
     summarize(
         "moe_contiguous_psum",
