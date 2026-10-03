@@ -96,6 +96,29 @@ K1 `12` remains a no-cache auto target but is no longer accepted with
 `saved_a_scaled`; use cache auto or `13/16` instead. Removed IDs are not
 renumbered or silently mapped to different kernels.
 
+### Configuration and low-level maintenance
+
+Treat the registry as an entry-point list, not a complete device call graph.
+K5 kid `10` also instantiates `SwizzledRouteLe30720` and
+`SwizzledRouteGt30720` internally; its split uses padded expert route counts.
+These helper traits and the long-route wave4x2 geometry are live even without
+standalone IDs. Python partial-autograd selection, compact routing, uncached
+paths and flat-address fallbacks must be audited alongside the host selector.
+
+Traits express supported configurations rather than an optimization history.
+Literal-only intermediate layers may be folded into their consumers while
+keeping registered names/IDs stable. Do not mechanically move derived constexpr
+expressions: overriding a base parameter does not re-evaluate expressions
+already bound in that base. Compare every effective constant/type and generated
+kernel before accepting such a change. Geometry/layout bases remain shared where
+they carry expressions or invariants; do not grow an arbitrary policy matrix.
+
+Packed BF16 conversion must preserve operand order, rounding, register constraints
+and emitted instructions. K1's lane-swap asm is a separate compiler workaround
+for two-output register coalescing with MFMA accumulators; do not replace it merely
+because another pipeline uses a builtin. Synchronization, cache control and
+addressing fallbacks are pipeline semantics, not dead experiment scaffolding.
+
 ## Validation and benchmark
 
 Run in a ROCm PyTorch environment on an authorized idle gfx950 GPU:

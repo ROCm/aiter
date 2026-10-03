@@ -80,18 +80,12 @@ struct DownBwdBf16Gfx950Bm32Bn128Bk64Padded
     static_assert(SMEM_B_GROUPS == 16);
 };
 
-struct DownBwdBf16Gfx950Bm32Bn128Bk64PaddedCohort2
-    : DownBwdBf16Gfx950Bm32Bn128Bk64Padded
-{
-    static constexpr int ROUTE_COHORT_TILES = 2;
-};
-
 // Halving BK leaves enough LDS to keep five adjacent route tiles live while
 // reusing one W2 tile.  A twenty-tile launch cohort aligns four such groups,
 // keeping W2 reuse close without giving up dO locality.  The extra K-loop
 // boundaries are amortized once the routed activation footprint is beyond L2.
 struct DownBwdBf16Gfx950Bm32Bn128Bk32PaddedM5Cohort20
-    : DownBwdBf16Gfx950Bm32Bn128Bk64PaddedCohort2
+    : DownBwdBf16Gfx950Bm32Bn128Bk64Padded
 {
     static constexpr int B_K = 32;
     static constexpr int E_K = 2;
@@ -160,19 +154,14 @@ struct DownBwdBf16Gfx950Bm32Bn256Bk32M6SavedAScaled
     static constexpr bool WRITE_A_SCALED = false;
 };
 
-struct DownBwdBf16Gfx950Bm32Bn256Bk32M6DeferredZWaitSavedAScaled
-    : DownBwdBf16Gfx950Bm32Bn256Bk32M6SavedAScaled
-{
-    static constexpr bool DEFER_Z_LDS_WAIT = true;
-};
-
 // Preserve the production BN256/M6 compute geometry while encoding W2 as
 // four independently swizzled [K32,N64] slabs.  This removes the 64-byte pad
 // from every four-row group and gives each native N32 MFMA tile the same
 // low-conflict transpose-read layout used by the production K4 pipeline.
 struct DownBwdBf16Gfx950Bm32Bn256Bk32M6SplitBN64DeferredZWaitSavedAScaled
-    : DownBwdBf16Gfx950Bm32Bn256Bk32M6DeferredZWaitSavedAScaled
+    : DownBwdBf16Gfx950Bm32Bn256Bk32M6SavedAScaled
 {
+    static constexpr bool DEFER_Z_LDS_WAIT = true;
     static constexpr bool SPLIT_B_N64_SWIZZLE = true;
     static constexpr int SMEM_B_BYTES = B_N * B_K * sizeof(D_B);
 };
@@ -193,18 +182,13 @@ struct DownBwdBf16Gfx950Bm32Bn256Bk32M6SplitBN64PipelinedZSavedAScaled
 // Private producer/consumer layout for the fused full backward pipeline.
 // Paired K2/K4 instances invert the address mapping while preserving the
 // production LDS and MFMA schedules.
-struct DownBwdBf16Gfx950Bm32Bn256Bk32M6SplitBN64PipelinedZBlockedDzG2
-    : DownBwdBf16Gfx950Bm32Bn256Bk32M6SplitBN64PipelinedZSavedAScaled
-{
-    static constexpr bool BLOCKED_DZ_G2 = true;
-};
-
 // The compact launch already reserves one sparse key per expert.  Recover the
 // owning expert with an upper_bound over those keys instead of scanning every
 // earlier expert and accumulating its ceil-divided group count.
 struct DownBwdBf16Gfx950Bm32Bn256Bk32M6BlockedDzG2SparseOwner
-    : DownBwdBf16Gfx950Bm32Bn256Bk32M6SplitBN64PipelinedZBlockedDzG2
+    : DownBwdBf16Gfx950Bm32Bn256Bk32M6SplitBN64PipelinedZSavedAScaled
 {
+    static constexpr bool BLOCKED_DZ_G2 = true;
     static constexpr bool SPARSE_COMPACT_OWNER = true;
 };
 
@@ -268,15 +252,10 @@ struct RouteDxBf16Gfx950Bm32Bn128Bk64WideStore
     static_assert(SMEM_B_GROUPS == 16);
 };
 
-struct RouteDxBf16Gfx950Bm32Bn128Bk64WideStoreCohort4
+struct RouteDxBf16Gfx950Bm32Bn128Bk32WideStoreCohort4
     : RouteDxBf16Gfx950Bm32Bn128Bk64WideStore
 {
     static constexpr int ROUTE_COHORT_TILES = 4;
-};
-
-struct RouteDxBf16Gfx950Bm32Bn128Bk32WideStoreCohort4
-    : RouteDxBf16Gfx950Bm32Bn128Bk64WideStoreCohort4
-{
     // Preserve the two-stage pipeline while halving each stage's LDS
     // footprint.  The extra K-loop boundaries trade more barriers for higher
     // residency; auto-dispatch can select it only if the measured trade wins.
@@ -287,20 +266,15 @@ struct RouteDxBf16Gfx950Bm32Bn128Bk32WideStoreCohort4
         SMEM_B_GROUPS * SMEM_B_GROUP_BYTES;
 };
 
-struct RouteDxBf16Gfx950Bm32Bn128Bk32WideStoreM5Cohort10
-    : RouteDxBf16Gfx950Bm32Bn128Bk32WideStoreCohort4
-{
-    static constexpr int ROUTE_COHORT_TILES = 10;
-    static constexpr int ROUTE_M_TILES = 5;
-};
-
 // Match the forward GEMM-style LDS policy: add 32 bytes after each 16-row dZ
 // slab.  Direct global-to-LDS loads remain lane-linear inside a slab while
 // successive slabs rotate by eight banks.  The full double buffer still fits
 // four workgroups per CU.
 struct RouteDxBf16Gfx950Bm32Bn128Bk32WideStoreM5Cohort10ASlabPad
-    : RouteDxBf16Gfx950Bm32Bn128Bk32WideStoreM5Cohort10
+    : RouteDxBf16Gfx950Bm32Bn128Bk32WideStoreCohort4
 {
+    static constexpr int ROUTE_COHORT_TILES = 10;
+    static constexpr int ROUTE_M_TILES = 5;
     static constexpr int SMEM_A_SLAB_PAD = 16;
 };
 
@@ -448,22 +422,17 @@ struct RouteReduceBf16Gfx950Bm16Bn128SortedInput
 // wave broadcasts one route id instead of issuing 64 duplicate metadata
 // loads.  This keeps the same 2048 output elements per CTA as BM16xBN128 but
 // lowers both VGPR pressure and random-memory scheduling overhead.
-struct RouteReduceBf16Gfx950Bm1Bn2048SortedInput
-    : RouteReduceBf16Gfx950Bm16Bn128SortedInput
-{
-    static constexpr int B_M = 1;
-    static constexpr int B_N = 2048;
-    static constexpr bool BROADCAST_ROUTE_ID = true;
-};
-
 // The full-row kernel needs the same TopK route ids in every lane of a wave.
 // Have the first TopK lanes fetch one id each in a single coalesced VMEM issue,
 // then broadcast lane `slot`, instead of masking lane zero around TopK separate
 // scalar loads.  The route-row accumulation order and data traffic are
 // unchanged, and the mechanism is generic for every supported fixed TopK.
 struct RouteReduceBf16Gfx950Bm1Bn2048SortedInputDistributedIds
-    : RouteReduceBf16Gfx950Bm1Bn2048SortedInput
+    : RouteReduceBf16Gfx950Bm16Bn128SortedInput
 {
+    static constexpr int B_M = 1;
+    static constexpr int B_N = 2048;
+    static constexpr bool BROADCAST_ROUTE_ID = true;
     static constexpr bool DISTRIBUTE_ROUTE_IDS = true;
 };
 
@@ -677,19 +646,14 @@ struct Dw1Bf16Gfx950Bm256Bn128Bk32Wave4Cohort2DoubleLds
     static_assert(BLOCK_SIZE / opus::get_warp_size() == T_M * T_N);
 };
 
-struct Dw1Bf16Gfx950Bm256Bn128Bk32Wave4ReverseCohort4DoubleLds
-    : Dw1Bf16Gfx950Bm256Bn128Bk32Wave4Cohort2DoubleLds
-{
-    static constexpr int EXPERT_COHORT = 4;
-    static constexpr bool REVERSE_EXPERT_ORDER = true;
-};
-
 // Keep the same output and LDS geometry as the production wave4 kernel, but
 // issue the second K16 dZ fragment before the first fragment's MFMA.  X is
 // read after that MFMA so only the larger A fragment remains live early.
 struct Dw1Bf16Gfx950Bm256Bn128Bk32Wave4ReverseCohort4PrefetchADoubleLds
-    : Dw1Bf16Gfx950Bm256Bn128Bk32Wave4ReverseCohort4DoubleLds
+    : Dw1Bf16Gfx950Bm256Bn128Bk32Wave4Cohort2DoubleLds
 {
+    static constexpr int EXPERT_COHORT = 4;
+    static constexpr bool REVERSE_EXPERT_ORDER = true;
     static constexpr bool PREFETCH_REDUCTION_A = true;
 };
 
@@ -718,18 +682,13 @@ struct Dw1Bf16Gfx950Bm256Bn128Bk32Wave4ReverseCohort4PrefetchABSortedXBFirstDoub
 // The wave4 accumulator footprint already limits this path to two CTAs/CU.
 // A third 24-KiB stage therefore preserves occupancy while allowing two
 // future BK32 tiles to remain in flight behind the current 16 MFMAs.
-struct Dw1Bf16Gfx950Bm256Bn128Bk32Wave4ReverseCohort4PrefetchABSortedXBFirstTripleLds
-    : Dw1Bf16Gfx950Bm256Bn128Bk32Wave4ReverseCohort4PrefetchABSortedXBFirstDoubleLds
-{
-    static constexpr bool TRIPLE_BUFFER = true;
-};
-
 // Queue both K16 LDS fragments before one full wait.  This exposes all 24
 // transpose reads to the LDS scheduler at once and removes the otherwise
 // redundant wait between the two unchanged MFMA chains.
 struct Dw1Bf16Gfx950Bm256Bn128Bk32Wave4ReverseCohort4PrefetchABEagerSortedXBFirstTripleLds
-    : Dw1Bf16Gfx950Bm256Bn128Bk32Wave4ReverseCohort4PrefetchABSortedXBFirstTripleLds
+    : Dw1Bf16Gfx950Bm256Bn128Bk32Wave4ReverseCohort4PrefetchABSortedXBFirstDoubleLds
 {
+    static constexpr bool TRIPLE_BUFFER = true;
     static constexpr bool EAGER_PREFETCH_REDUCTION_AB = true;
 };
 
@@ -738,54 +697,22 @@ struct Dw1Bf16Gfx950Bm256Bn128Bk32Wave4ReverseCohort4PrefetchABEagerSortedXBFirs
 // the conflict-free 16-row x 32-column transpose-read swizzle also used by
 // the gfx950 MLA BF16 path.  This changes only the physical LDS encoding;
 // global traffic, MFMA order, accumulator layout, and stage size stay fixed.
-struct Dw1Bf16Gfx950Bm256Bn128Bk32Wave4ReverseCohort4Native32SwizzleTripleLds
-    : Dw1Bf16Gfx950Bm256Bn128Bk32Wave4ReverseCohort4PrefetchABEagerSortedXBFirstTripleLds
-{
-    static constexpr bool NATIVE_M32_LDS_SWIZZLE = true;
-};
-
-struct Dw1Bf16Gfx950Bm256Bn128Bk32Wave4ReverseCohort4Native32SwizzleTripleLdsBlockedDzG2
-    : Dw1Bf16Gfx950Bm256Bn128Bk32Wave4ReverseCohort4Native32SwizzleTripleLds
-{
-    static constexpr bool BLOCKED_DZ_G2 = true;
-};
-
-struct Dw1Bf16Gfx950Bm256Bn128Bk32Wave4ReverseCohort4Native32SwizzleTripleLdsBlockedDzG2BlockedXG2
-    : Dw1Bf16Gfx950Bm256Bn128Bk32Wave4ReverseCohort4Native32SwizzleTripleLdsBlockedDzG2
-{
-    // Forward owns this cache and writes x[token] directly in the same G2
-    // row-pair encoding.  K4 must never reinterpret an ordinary row-major
-    // saved-X tensor as this physical layout.
-    static constexpr bool BLOCKED_SORTED_B_G2 = true;
-};
-
-struct Dw1Bf16Gfx950Bm256Bn128Bk32Wave4ReverseCohort4Native32SwizzleTripleLdsBlockedDzG2BlockedXG2NFast
-    : Dw1Bf16Gfx950Bm256Bn128Bk32Wave4ReverseCohort4Native32SwizzleTripleLdsBlockedDzG2BlockedXG2
-{
-    static constexpr bool COMPACT_OUTPUT_N_FAST = true;
-};
-
-struct Dw1Bf16Gfx950Bm256Bn128Bk32Wave4BlockedG2NFastGrid3D
-    : Dw1Bf16Gfx950Bm256Bn128Bk32Wave4ReverseCohort4Native32SwizzleTripleLdsBlockedDzG2BlockedXG2NFast
-{
-    static constexpr bool COHORT_NFAST_GRID_3D = true;
-};
-
 // The blocked-G2 address within each native M32 tile is identical across the
 // unrolled operand loads.  Retain one 32-bit byte base per operand and express
 // the remaining native-tile displacement as a compile-time immediate.
-struct Dw1Bf16Gfx950Bm256Bn128Bk32Wave4BlockedG2FactoredGrid3D
-    : Dw1Bf16Gfx950Bm256Bn128Bk32Wave4BlockedG2NFastGrid3D
-{
-    static constexpr bool FACTOR_BLOCKED_G2_LOAD_OFFSETS = true;
-};
-
 // The unrolled native-tile increment is uniform across a wave.  Keep the
 // lane-varying byte base in MUBUF voffset and carry each 4-KiB increment in
 // soffset instead of materializing another vector address.
 struct Dw1Bf16Gfx950Bm256Bn128Bk32Wave4BlockedG2FactoredSoffsetGrid3D
-    : Dw1Bf16Gfx950Bm256Bn128Bk32Wave4BlockedG2FactoredGrid3D
+    : Dw1Bf16Gfx950Bm256Bn128Bk32Wave4ReverseCohort4PrefetchABEagerSortedXBFirstTripleLds
 {
+    static constexpr bool NATIVE_M32_LDS_SWIZZLE = true;
+    static constexpr bool BLOCKED_DZ_G2 = true;
+    // Forward supplies G2 row-pair encoded X; never accept row-major saved X.
+    static constexpr bool BLOCKED_SORTED_B_G2 = true;
+    static constexpr bool COMPACT_OUTPUT_N_FAST = true;
+    static constexpr bool COHORT_NFAST_GRID_3D = true;
+    static constexpr bool FACTOR_BLOCKED_G2_LOAD_OFFSETS = true;
     static constexpr bool FACTOR_BLOCKED_G2_LOAD_SOFFSETS = true;
 };
 
