@@ -42,6 +42,13 @@ def _get_flydsl_gemm_kernels():
     return gemm_kernels
 
 
+# A FlyDSL kernel can be present in the tuning catalog yet fail while its code
+# object is being linked on a particular compiler/runtime combination.  Keep a
+# process-local denylist so every layer using the same shape does not repeat the
+# expensive failed compilation before taking the safe native PyTorch fallback.
+_flydsl_compile_failures: set[str] = set()
+
+
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
 extensions_created = False
@@ -537,10 +544,23 @@ def flydsl_gemm(
     assert (
         scale_a is None and scale_b is None and scale_c is None
     ), "FlyDSL hgemm does not support scaling yet."
+    kernel_name = config["kernelName"]
+    if kernel_name in _flydsl_compile_failures:
+        return torch_gemm(
+            inp,
+            weights,
+            solidx,
+            bias,
+            otype,
+            scale_a,
+            scale_b,
+            scale_c,
+            bpreshuffle,
+            config,
+        )
+
     flydsl_gemm_kernels = _get_flydsl_gemm_kernels()
-    flydsl_config = flydsl_gemm_kernels.get_flydsl_hgemm_kernel_params(
-        config["kernelName"]
-    )
+    flydsl_config = flydsl_gemm_kernels.get_flydsl_hgemm_kernel_params(kernel_name)
     fused_bias = None
     if (
         bias is not None
@@ -548,22 +568,51 @@ def flydsl_gemm(
         and bias.dtype == inp.dtype
     ):
         fused_bias = bias
-    out = flydsl_gemm_kernels.flydsl_hgemm(
-        inp,
-        weights,
-        bias=fused_bias,
-        block_m=flydsl_config["block_m"],
-        block_n=flydsl_config["block_n"],
-        block_k=flydsl_config["block_k"],
-        split_k=flydsl_config["split_k"],
-        m_waves=flydsl_config["m_waves"],
-        n_waves=flydsl_config["n_waves"],
-        k_waves=flydsl_config["k_waves"],
-        stages=flydsl_config["stages"],
-        group_m=flydsl_config["group_m"],
-        policy=("ht" if flydsl_config["use_half_tile_interleaved"] else "ft"),
-        out_dtype=otype,
-    )
+    try:
+        out = flydsl_gemm_kernels.flydsl_hgemm(
+            inp,
+            weights,
+            bias=fused_bias,
+            block_m=flydsl_config["block_m"],
+            block_n=flydsl_config["block_n"],
+            block_k=flydsl_config["block_k"],
+            split_k=flydsl_config["split_k"],
+            m_waves=flydsl_config["m_waves"],
+            n_waves=flydsl_config["n_waves"],
+            k_waves=flydsl_config["k_waves"],
+            stages=flydsl_config["stages"],
+            group_m=flydsl_config["group_m"],
+            policy=("ht" if flydsl_config["use_half_tile_interleaved"] else "ft"),
+            out_dtype=otype,
+        )
+    except Exception as exc:
+        # Do not hide launch/runtime failures: after a kernel has executed the
+        # stream may no longer be safe to reuse.  A compile failure, however,
+        # happens before launch and can safely fall back to the native GEMM.
+        if not (
+            exc.__class__.__name__ == "DSLCompileError"
+            and exc.__class__.__module__.startswith("flydsl.")
+        ):
+            raise
+        _flydsl_compile_failures.add(kernel_name)
+        logger.warning(
+            "FlyDSL failed to compile tuned kernel '%s'; falling back to "
+            "native PyTorch GEMM for this process: %s",
+            kernel_name,
+            exc,
+        )
+        return torch_gemm(
+            inp,
+            weights,
+            solidx,
+            bias,
+            otype,
+            scale_a,
+            scale_b,
+            scale_c,
+            bpreshuffle,
+            config,
+        )
 
     if bias is not None and fused_bias is None:
         out = out.to(bias.dtype) + bias
