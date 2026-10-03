@@ -822,7 +822,7 @@ def _mla_softmax_reducev_kernel(
 _SPLIT_WAVE_WGS = 256
 _SPLIT_WALK_COST = 2.2799  # per wave x BLOCK_N iteration
 _SPLIT_PARTIAL_COST = 0.053446  # per partial written by stage 1 and reduced by stage 2
-_SPLIT_MAX = 8
+_SPLIT_MIN_MAX = 8  # floor on the search bound; see _bh16_split_search_bound
 
 
 def _bh16_num_kv_splits(base_grid, block_n, kv_len=None):
@@ -847,7 +847,20 @@ def _bh16_num_kv_splits(base_grid, block_n, kv_len=None):
         c = _SPLIT_WALK_COST * triton.cdiv(base_grid * s, _SPLIT_WAVE_WGS) * iters
         return c + (_SPLIT_PARTIAL_COST * base_grid * s if s > 1 else 0.0)
 
-    return min(range(1, _SPLIT_MAX + 1), key=lambda s: (cost(s), s))
+    hi = _bh16_split_search_bound(base_grid, block_n, kv_len)
+    return min(range(1, hi + 1), key=lambda s: (cost(s), s))
+
+
+def _bh16_split_search_bound(base_grid, block_n, kv_len):
+    """Largest split count worth considering.
+
+    A small grid genuinely wants many splits -- one query position of 16 heads
+    is a single workgroup, so filling the machine takes ~256 of them -- and the
+    bound must not sit below what the occupancy budget already does today, or
+    passing a hint would be a regression for exactly the shape this regime was
+    written for. Splitting past one BLOCK_N per split buys nothing either way.
+    """
+    return min(triton.cdiv(kv_len, block_n), max(_SPLIT_MIN_MAX, 256 // base_grid))
 
 
 def mla_gluon(

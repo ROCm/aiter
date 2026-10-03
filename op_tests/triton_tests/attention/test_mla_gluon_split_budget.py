@@ -215,6 +215,19 @@ def test_single_block_context_is_never_split(rows):
     assert _bh16_num_kv_splits(rows * MEASURED_M_BLOCKS, BLOCK_N, BLOCK_N) == 1
 
 
+@pytest.mark.parametrize("base_grid", [1, 5, 10, 16, 40])
+@pytest.mark.parametrize("kv_len", [32768, 131072])
+def test_small_grids_keep_their_many_splits(base_grid, kv_len):
+    """A single query position of 16 heads is one workgroup, so filling the
+    machine takes ~256 of them. The hint must not pull such a launch down to a
+    handful of splits -- that is the shape this regime was written for."""
+    shipped = _shipped(base_grid)
+    picked = _bh16_num_kv_splits(base_grid, BLOCK_N, kv_len)
+    assert (
+        picked >= shipped // 2
+    ), f"base_grid={base_grid}: hint drops {shipped} splits to {picked}"
+
+
 @pytest.mark.parametrize("rows", [8, 16, 24, 32, 48, 64])
 def test_pick_is_monotone_in_context_length(rows):
     """At a fixed grid a longer context can only justify more splits."""
