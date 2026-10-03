@@ -1,0 +1,11 @@
+{
+    "fused_kda_spec_parallel_v_kernel": {
+        "BV": 16,
+        "num_warps": 2,
+        "num_stages": 2
+    },
+    "fused_kda_spec_finalize_kernel": {
+        "num_warps": 2,
+        "num_stages": 2
+    }
+}
