@@ -358,7 +358,7 @@ def _batched_gemm_a8w8_mxscale_bpreshuffle_impl(
     """Eager tuned-CSV lookup + libtype dispatch; returns token-major [M, G, N].
 
     The arch and the w_scale block pick the kernel (flydsl.batched_gemm_a8w8),
-    and the block the tuned rows: gfx950 reads 32x32 and 128x128, gfx1250
+    and the block the tuned rows: gfx950 reads 32x32, 1x32 and 128x128, gfx1250
     128x128.
     """
     from .flydsl.batched_gemm_a8w8 import bmm_a8w8_mxfp8_supported, run_bmm_a8w8_mxfp8
@@ -406,12 +406,13 @@ def batched_gemm_a8w8_mxscale_bpreshuffle(
     * ``x``       : [M, G, K] fp8 activation, token-major and contiguous.
     * ``wo_a``    : [G, N, K] fp8 weight, ``shuffle_weight(w, layout=(16, 16))``.
     * ``x_scale`` : [M, G, K/block] uint8 e8m0, row-major.
-    * ``w_scale`` : [G, N/block, K/block] uint8 e8m0.
+    * ``w_scale`` : [G, N/block, K/block] uint8 e8m0, [G, N, K/32] for 1x32.
 
     The arch and the w_scale block select the kernel:
 
     * gfx950, 32x32 or 128x128 with a 1x32 or 1x128 ``x_scale``: DeepSeek-V4.1's
       original wo_a weight (32x32) and V4's (128x128) both run as is.
+    * gfx950, 1x32 with a 1x32 ``x_scale``: OCP MXFP8 weights (MiniMax-M3).
     * gfx1250, 128x128: ``x_scale`` is 1x128 -- exactly what
       ``inverse_rope_group_quant(..., quant_group_size=128, scale_layout="row")``
       emits, so no transpose on this path.
