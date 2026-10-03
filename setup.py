@@ -249,6 +249,20 @@ def get_exclude_ops():
     all_modules = _load_modules_from_config()
     exclude_ops = []
 
+    # FlashKDA contains CDNA3/CDNA4 MFMA ISA and is intentionally unavailable
+    # on every other target. The explicit Python API rejects unsupported
+    # devices before launch, but wheel prebuild enumerates every config entry
+    # eagerly, so filter it here before hipcc sees an incompatible RDNA/gfx1250
+    # target. A mixed target list must
+    # also be entirely supported because a single extension is built for the
+    # full GPU_ARCHS list.
+    try:
+        prebuild_archs = set(core.get_gfx_list())
+    except Exception:  # noqa: BLE001
+        prebuild_archs = set()
+    if not prebuild_archs or not prebuild_archs.issubset({"gfx942", "gfx950"}):
+        exclude_ops.append("module_flash_kda_hip_v2")
+
     # When CK is disabled, exclude all CK-dependent modules
     if not ENABLE_CK:
         exclude_ops.extend(sorted(core._get_ck_exclude_modules()))
