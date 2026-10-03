@@ -60,9 +60,7 @@ is timed with such keys stripped (the record lists them as `dropped_keys`).
 minus shape filters (block sizes above the next power of two of the dimension, `NUM_KSPLIT` values
 that do not divide K), the generic rules in `space.py` (the old split-K pruning rules, applied only
 when the keys exist, and an LDS check: a block-size combination whose buffers x (A tile + B tile)
-exceed the arch's LDS is never compiled; each kernel declares its element widths as `bits=(a, b)`,
-and a kernel whose `num_ctas` splits the tile over a CTA cluster declares `cta_split`, so the
-check counts one CTA's share)
+exceed the arch's LDS is never compiled; each kernel declares its element widths as `bits=(a, b)`)
 and the kernel's own `should_skip(config)` in `kernels.py` (what the kernel asserts, and buffer
 counts its wrapper clamps so they would only repeat another candidate). Every rule returns True
 to reject. If the kernel rejects every tile that fits the shape (a kernel that needs 64-row tiles
