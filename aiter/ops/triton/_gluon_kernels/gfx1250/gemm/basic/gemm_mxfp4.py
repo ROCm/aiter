@@ -4,7 +4,7 @@ from triton.experimental import gluon
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 SCALE_GROUP_ELEMS = 32
-PRESHUFFLE_FACTOR = 16  # rows packed per scale-preshuffle stripe
+PRESHUFFLE_FACTOR = 32  # rows packed per scale-preshuffle stripe
 
 
 def get_gemm_afp4wfp4_preshuffle_layouts(num_warps, BLOCK_M, BLOCK_N, BLOCK_K):
@@ -47,8 +47,10 @@ def get_gemm_afp4wfp4_preshuffle_layouts(num_warps, BLOCK_M, BLOCK_N, BLOCK_K):
     shared_B = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
     shared_S = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
 
-    # Output staging layout for the TDM store (acc -> LDS -> HBM)
-    shared_C = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
+    # Output staging layout for the TDM store (acc -> LDS -> HBM).
+    shared_C = gl.PaddedSharedLayout.with_identity_for(
+        [[BLOCK_N, 8]], [BLOCK_M, BLOCK_N], [1, 0]
+    )
 
     # Register layouts for WMMA operands
     dot_a = gl.DotOperandLayout(operand_index=0, parent=wmma_layout, k_width=16)
@@ -89,19 +91,30 @@ def depreshuffle_scales(
     BLOCK_M: gl.constexpr,
     K_GROUPS: gl.constexpr,
     PRESHUFFLE_FACTOR: gl.constexpr,
+    SCALE_KWIDTH: gl.constexpr,
 ):
-    # Inverse of host aiter.ops.triton.utils.shuffle.shuffle_scale_gemm
-    # (gfx1250 path): PRESHUFFLE_FACTOR rows are packed per stripe, SCALE_KWIDTH
-    # scale-groups contiguous per row. PRESHUFFLE_FACTOR == 1 means un-shuffled
-    SCALE_KWIDTH: gl.constexpr = 4
-    NUM_STRIPES: gl.constexpr = K_GROUPS // SCALE_KWIDTH
-    return (
-        smem_scales.reshape(
-            (BLOCK_M // PRESHUFFLE_FACTOR, NUM_STRIPES, PRESHUFFLE_FACTOR, SCALE_KWIDTH)
+    # Inverse of host aiter.ops.shuffle.shuffle_scale
+    # PRESHUFFLE_FACTOR == 1 means un-shuffled (BLOCK_M, K_GROUPS) row-major.
+    if PRESHUFFLE_FACTOR == 1:
+        return smem_scales
+    else:
+        gl.static_assert(PRESHUFFLE_FACTOR == 32)
+        gl.static_assert(SCALE_KWIDTH == 8)
+        NUM_KCHUNKS: gl.constexpr = K_GROUPS // SCALE_KWIDTH
+        return (
+            smem_scales.reshape(
+                (
+                    BLOCK_M // PRESHUFFLE_FACTOR,
+                    NUM_KCHUNKS,
+                    SCALE_KWIDTH // 2,
+                    PRESHUFFLE_FACTOR // 2,
+                    2,
+                    2,
+                )
+            )
+            .permute((0, 5, 3, 1, 4, 2))
+            .reshape((BLOCK_M, K_GROUPS))
         )
-        .permute((0, 2, 1, 3))
-        .reshape((BLOCK_M, K_GROUPS))
-    )
 
 
 @gluon.jit
@@ -117,6 +130,37 @@ def depreshuffle_b_raw_to_kn(
         .reshape((BLOCK_N, BLOCK_K_BYTES))
         .permute((1, 0))
     )
+
+
+@gluon.jit
+def _issue_tdm_stage(
+    a_desc,
+    b_desc,
+    as_desc,
+    bs_desc,
+    a_slot,
+    b_slot,
+    as_slot,
+    bs_slot,
+    off_a,
+    off_b,
+    off_as,
+    off_bs,
+):
+    # Movbe all descriptors before the four copies then the compiler fuses all TDM copies
+    a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(a_desc, add_offsets=[0, off_a])
+    b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(b_desc, add_offsets=[0, off_b])
+    as_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+        as_desc, add_offsets=[0, off_as]
+    )
+    bs_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+        bs_desc, add_offsets=[0, off_bs]
+    )
+
+    gl.amd.gfx1250.tdm.async_load(a_desc, dest=a_slot)
+    gl.amd.gfx1250.tdm.async_load(b_desc, dest=b_slot)
+    gl.amd.gfx1250.tdm.async_load(as_desc, dest=as_slot)
+    gl.amd.gfx1250.tdm.async_load(bs_desc, dest=bs_slot)
 
 
 _gemm_mxfp4_preshuffle_gfx1250_repr = make_kernel_repr(
@@ -168,6 +212,13 @@ def gemm_mxfp4_preshuffle_gfx1250(
     a_scale_layout: gl.constexpr,
     b_scale_layout: gl.constexpr,
 ):
+    # async_wait counts TDM ops in flight. The compiler fuses each stage's four
+    # copies into one op (two with 2 warps, which fuse in pairs).
+    if num_warps == 2:
+        TDM_OPS_PER_STAGE: gl.constexpr = 2
+    else:
+        TDM_OPS_PER_STAGE: gl.constexpr = 1
+
     # Compile-time constants
     FP4_ELEMS_PER_BYTE: gl.constexpr = 2
     SCALE_GROUP_ELEMS: gl.constexpr = 32
@@ -175,10 +226,10 @@ def gemm_mxfp4_preshuffle_gfx1250(
     BLOCK_K_BYTES: gl.constexpr = BLOCK_SIZE_K // FP4_ELEMS_PER_BYTE
     K_GROUPS: gl.constexpr = BLOCK_SIZE_K // SCALE_GROUP_ELEMS
     # Scale preshuffle: PRESHUFFLE_FACTOR rows packed per stripe, SCALE_KWIDTH
-    # scale-groups contiguous per row (must match the host
-    # aiter.ops.triton.utils.shuffle.shuffle_scale_gemm, gfx1250 path).
-    PRESHUFFLE_FACTOR: gl.constexpr = 16
-    SCALE_KWIDTH: gl.constexpr = 4
+    # scale-groups per stripe k-chunk (must match the host
+    # aiter.ops.shuffle.shuffle_scale layout, identical on gfx950 and gfx1250).
+    PRESHUFFLE_FACTOR: gl.constexpr = 32
+    SCALE_KWIDTH: gl.constexpr = 8
 
     # A scales are  preshuffled only for M >= 32; for M < 32 (BLOCK_SIZE_M == 16) they are
     # un-shuffled (M, K_elems // 32) row-major, i.e. a stripe size of 1.
@@ -304,14 +355,11 @@ def gemm_mxfp4_preshuffle_gfx1250(
         off_b = load_idx * BLOCK_K_BYTES * 16
         off_as = load_idx * K_GROUPS * A_PRESHUFFLE_FACTOR
         off_bs = load_idx * K_GROUPS * PRESHUFFLE_FACTOR
-        gl.amd.gfx1250.tdm.async_load(a_desc, [0, off_a], a_slot)
-        gl.amd.gfx1250.tdm.async_load(b_desc, [0, off_b], b_slot)
-        gl.amd.gfx1250.tdm.async_load(as_desc, [0, off_as], as_slot)
-        gl.amd.gfx1250.tdm.async_load(bs_desc, [0, off_bs], bs_slot)
+        _issue_tdm_stage(a_desc, b_desc, as_desc, bs_desc, a_slot, b_slot, as_slot, bs_slot, off_a, off_b, off_as, off_bs)  # fmt: skip
         load_idx += 1
 
     # --- 2. Pre-load tile 0 from LDS into registers ---
-    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 4)
+    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * TDM_OPS_PER_STAGE)
 
     slot_c = compute_idx % NUM_BUFFERS
     cur_A = smem_A.index(slot_c).load(layout=dot_a_layout)
@@ -319,10 +367,10 @@ def gemm_mxfp4_preshuffle_gfx1250(
         smem_B.index(slot_c), BLOCK_N=BLOCK_SIZE_N, BLOCK_K_BYTES=BLOCK_K_BYTES
     ).load(layout=dot_b_layout)
     cur_AS = depreshuffle_scales(
-        smem_AS.index(slot_c), BLOCK_SIZE_M, K_GROUPS, A_PRESHUFFLE_FACTOR
+        smem_AS.index(slot_c), BLOCK_SIZE_M, K_GROUPS, A_PRESHUFFLE_FACTOR, SCALE_KWIDTH
     ).load(layout=a_scale_layout)
     cur_BS = depreshuffle_scales(
-        smem_BS.index(slot_c), BLOCK_SIZE_N, K_GROUPS, PRESHUFFLE_FACTOR
+        smem_BS.index(slot_c), BLOCK_SIZE_N, K_GROUPS, PRESHUFFLE_FACTOR, SCALE_KWIDTH
     ).load(layout=b_scale_layout)
 
     # --- 3. Main loop: WMMA(cur) → TDM(future) → wait → pre-load(next) ---
@@ -344,12 +392,9 @@ def gemm_mxfp4_preshuffle_gfx1250(
         off_b = load_idx * BLOCK_K_BYTES * 16
         off_as = load_idx * K_GROUPS * A_PRESHUFFLE_FACTOR
         off_bs = load_idx * K_GROUPS * PRESHUFFLE_FACTOR
-        gl.amd.gfx1250.tdm.async_load(a_desc, [0, off_a], a_slot)
-        gl.amd.gfx1250.tdm.async_load(b_desc, [0, off_b], b_slot)
-        gl.amd.gfx1250.tdm.async_load(as_desc, [0, off_as], as_slot)
-        gl.amd.gfx1250.tdm.async_load(bs_desc, [0, off_bs], bs_slot)
+        _issue_tdm_stage(a_desc, b_desc, as_desc, bs_desc, a_slot, b_slot, as_slot, bs_slot, off_a, off_b, off_as, off_bs)  # fmt: skip
 
-        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 4)
+        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * TDM_OPS_PER_STAGE)
         load_idx += 1
 
         # Pre-load next tile from LDS into registers
@@ -361,10 +406,18 @@ def gemm_mxfp4_preshuffle_gfx1250(
             BLOCK_K_BYTES=BLOCK_K_BYTES,
         ).load(layout=dot_b_layout)
         cur_AS = depreshuffle_scales(
-            smem_AS.index(next_slot), BLOCK_SIZE_M, K_GROUPS, A_PRESHUFFLE_FACTOR
+            smem_AS.index(next_slot),
+            BLOCK_SIZE_M,
+            K_GROUPS,
+            A_PRESHUFFLE_FACTOR,
+            SCALE_KWIDTH,
         ).load(layout=a_scale_layout)
         cur_BS = depreshuffle_scales(
-            smem_BS.index(next_slot), BLOCK_SIZE_N, K_GROUPS, PRESHUFFLE_FACTOR
+            smem_BS.index(next_slot),
+            BLOCK_SIZE_N,
+            K_GROUPS,
+            PRESHUFFLE_FACTOR,
+            SCALE_KWIDTH,
         ).load(layout=b_scale_layout)
         compute_idx += 1
 
@@ -374,7 +427,7 @@ def gemm_mxfp4_preshuffle_gfx1250(
             cur_A, cur_AS, "e2m1", cur_B, cur_BS, "e2m1", acc
         )
 
-        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2 - i) * 4)
+        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2 - i) * TDM_OPS_PER_STAGE)
 
         next_slot = (compute_idx + 1) % NUM_BUFFERS
         cur_A = smem_A.index(next_slot).load(layout=dot_a_layout)
@@ -384,10 +437,18 @@ def gemm_mxfp4_preshuffle_gfx1250(
             BLOCK_K_BYTES=BLOCK_K_BYTES,
         ).load(layout=dot_b_layout)
         cur_AS = depreshuffle_scales(
-            smem_AS.index(next_slot), BLOCK_SIZE_M, K_GROUPS, A_PRESHUFFLE_FACTOR
+            smem_AS.index(next_slot),
+            BLOCK_SIZE_M,
+            K_GROUPS,
+            A_PRESHUFFLE_FACTOR,
+            SCALE_KWIDTH,
         ).load(layout=a_scale_layout)
         cur_BS = depreshuffle_scales(
-            smem_BS.index(next_slot), BLOCK_SIZE_N, K_GROUPS, PRESHUFFLE_FACTOR
+            smem_BS.index(next_slot),
+            BLOCK_SIZE_N,
+            K_GROUPS,
+            PRESHUFFLE_FACTOR,
+            SCALE_KWIDTH,
         ).load(layout=b_scale_layout)
         compute_idx += 1
 

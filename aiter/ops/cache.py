@@ -122,11 +122,12 @@ def indexer_k_quant_and_cache(
 @compile_ops("module_cache", develop=True)
 def indexer_qk_rope_quant_and_cache(
     q: Tensor,
-    q_out: Tensor,
+    q_out: Tensor,  # fp8 [T, H, head_dim] | fp4 u8 [T, H, head_dim // 2]
     weights: Tensor,
-    weights_out: Tensor,
+    weights_out: Tensor,  # fp8: fp32 w * q_scale * weights_scale; fp4: q.dtype plain w
     k: Tensor,
-    kv_cache: Tensor,
+    kv_cache: Tensor,  # fp8 [num_blocks, block_size, cache_stride]
+    # fp4 u8 [num_blocks, k_tiles, 4, kv_block_size, 16]
     slot_mapping: Tensor,
     norm_weight: Tensor,
     norm_bias: Tensor,
@@ -134,11 +135,18 @@ def indexer_qk_rope_quant_and_cache(
     cos_cache: Tensor,
     sin_cache: Tensor,
     epsilon: float,
-    quant_block_size: int,
+    quant_block_size: int,  # fp8: head_dim; fp4: 32
     scale_fmt: str,
     weights_scale: float,
     preshuffle: bool = False,
     is_neox: bool = True,
+    # False (default): slot<0 rows skip the whole fused op.
+    # True (DCP): compute Q/weights for every row; only valid slots write K cache.
+    compute_all_q_rope: bool = False,
+    # Supplying both scale buffers switches the op to the packed e2m1 + e8m0
+    # layout that flydsl_pa_mqa_logits_fp4 consumes directly.
+    q_scale_out: Tensor | None = None,  # u8 [T, k_tiles, 4, 16, round_up(H // 16, 4)]
+    kv_cache_scale: Tensor | None = None,  # u8 [num_blocks, k_tiles, 4, kv_block_size]
 ) -> None: ...
 
 
@@ -192,3 +200,27 @@ def fused_qk_rope_concat_and_cache_mla_seg(
     is_neox: bool,
     is_nope_first: bool = True,
 ) -> None: ...
+
+
+@compile_ops("module_dsv4_dequant_gather_k", develop=True)
+def dsv4_dequantize_and_gather_k(
+    out: Tensor,
+    k_cache: Tensor,
+    seq_lens: Tensor,
+    gather_lens: Tensor | None,
+    block_table: Tensor,
+    block_size: int,
+    offset: int = 0,
+    use_fnuz: bool = False,
+) -> None:
+    """Gather and dequantize the DeepSeek V4 paged K record into bf16.
+
+    ``k_cache`` is ``[num_blocks, block_size, 584]`` uint8: per token 448 fp8
+    e4m3 NoPE dims then 64 bf16 RoPE dims, with the block's 8-byte-per-token
+    UE8M0 scale region (7 scales of 64 dims + pad) after all of its token data.
+
+    Writes ``out[r, offset + i, :512]`` for ``i`` in ``[0, gather_lens[r])``,
+    reading sequence positions ``seq_lens[r] - gather_lens[r]`` onward.
+    ``gather_lens=None`` gathers the whole sequence. ``use_fnuz`` must match
+    the encoder of this cache: e4m3fnuz when True, OCP e4m3 when False.
+    """

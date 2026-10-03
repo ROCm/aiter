@@ -10,7 +10,6 @@ from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight
 
 # matmul utilities
 from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
-    is_gluon_supported,
     moe_gemm_a4w4,
     moe_gemm_torch,
     mxfp4_quant,
@@ -20,14 +19,13 @@ from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
 from aiter.ops.triton.moe.moe_routing.routing import routing
 
 # numerics utilities
-from aiter.ops.triton.moe.quant_moe import (
-    downcast_to_mxfp,
-    upcast_from_mxfp,
-)
+from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 
 # target-specific utilities
 from aiter.ops.triton.utils._triton.arch_info import get_arch, is_fp4_avail
 from aiter.ops.triton.utils.shuffle import moe_weight_decode_view, shuffle_scale_moe
+from op_tests.triton_tests.moe.moe_test_utils import assert_close
+from op_tests.triton_tests.utils.mxfp_ref import upcast_from_mxfp
 
 
 def preshuffle_moe_weight(w: torch.Tensor) -> torch.Tensor:
@@ -113,76 +111,6 @@ def dtype_str_to_torch(dtype_str: str) -> torch.dtype:
     return torch.uint8 if dtype_str == "float4_e2m1" else getattr(torch, dtype_str)
 
 
-def assert_close(ref, tri, maxtol=None, rmstol=None, description="--", verbose=True):
-    if tri.dtype.itemsize == 1:
-        ref_as_type = ref.to(tri.dtype)
-        if ref.dtype == tri.dtype:
-            assert torch.all(ref_as_type == tri)
-            return
-        ref = ref_as_type
-
-    if ref.numel() == 0:
-        return
-
-    if maxtol is None:
-        maxtol = 2e-2
-    if rmstol is None:
-        rmstol = 4e-3
-    """
-    Compare reference values against obtained values.
-    """
-
-    # cast to float32:
-    ref = ref.to(torch.float32).detach()
-    tri = tri.to(torch.float32).detach()
-    assert (
-        ref.shape == tri.shape
-    ), f"Tensors must have same size {ref.shape=} {tri.shape=}"
-
-    # deal with infinite elements:
-    inf_mask_ref = torch.isinf(ref)
-    inf_mask_tri = torch.isinf(tri)
-    assert torch.equal(
-        inf_mask_ref, inf_mask_tri
-    ), "Tensor must have same infinite elements"
-    refn = torch.where(inf_mask_ref, 0, ref)
-    trin = torch.where(inf_mask_tri, 0, tri)
-
-    # normalise so that RMS calculation doesn't overflow:
-    eps = 1.0e-30
-    multiplier = 1.0 / (torch.max(torch.abs(refn)) + eps)
-    refn *= multiplier
-    trin *= multiplier
-
-    ref_rms = torch.sqrt(torch.square(refn).mean()) + eps
-
-    rel_err = torch.abs(refn - trin) / torch.maximum(ref_rms, torch.abs(refn))
-    max_err = torch.max(rel_err).item()
-    rms_err = torch.sqrt(torch.square(rel_err).mean()).item()
-
-    if verbose:
-        print(
-            f"{description} maximum relative error = {max_err} (threshold = {maxtol})"
-        )
-        print(f"{description} RMS relative error = {rms_err} (threshold = {rmstol})")
-
-    if max_err > maxtol:
-        bad_idxs = torch.nonzero(rel_err > maxtol)
-        num_nonzero = bad_idxs.size(0)
-        bad_idxs = bad_idxs[:1000]
-        print(
-            f"{num_nonzero} / {rel_err.numel()} mismatched elements "
-            f"(shape = {tuple(rel_err.shape)}) at coords {bad_idxs.tolist()}"
-        )
-
-        bad_idxs = bad_idxs.unbind(-1)
-        print("ref values: ", ref[tuple(bad_idxs)].cpu())
-        print("tri values: ", tri[tuple(bad_idxs)].cpu())
-
-    assert max_err <= maxtol
-    assert rms_err <= rmstol
-
-
 # ---------------
 # unit tests
 # ---------------
@@ -227,6 +155,8 @@ class Case:
             Case(16, 1024, 1024, 128, 4, preshuffle_weights=True),
             Case(1024, 7168, 2048, 256, 8, hbm_swizzling=True, preshuffle_weights=True),
             Case(256, 1024, 1024, 8, 4, preshuffle_weights=True),
+            Case(16, 1536, 7168, 256, 8, hbm_swizzling=True, preshuffle_weights=True),
+            Case(16, 7168, 768, 256, 8, hbm_swizzling=True, preshuffle_weights=True),
         ]
     ],
 )
@@ -241,7 +171,7 @@ class Case:
 )
 @pytest.mark.parametrize("has_y_gammas", [False, True])
 @pytest.mark.parametrize("apply_swiglu", [False, True])
-@pytest.mark.parametrize("backend", ["triton", "gluon"])
+@pytest.mark.parametrize("backend", ["gluon", "triton"])
 def test_op(
     m,
     n,
@@ -257,8 +187,13 @@ def test_op(
     backend,
     device="cuda",
 ):
+    if get_arch() != "gfx950" and get_arch() != "gfx1250":
+        pytest.skip("Kernel not supported on this GPU.")
     if not is_fp4_avail():
         pytest.skip(f"FP4 kernels are not supported on {get_arch()}.")
+
+    if backend == "gluon" and get_arch() != "gfx1250":
+        pytest.skip(f"Gluon backend requires gfx1250, got {get_arch()}.")
     if hbm_swizzling:
         if get_arch() == "gfx950" and (n % 32 != 0 or k % (32 * 8) != 0):
             pytest.skip(
@@ -274,17 +209,13 @@ def test_op(
     if preshuffle_weights:
         if get_arch() != "gfx1250":
             pytest.skip("Preshuffling weights is only supported on gfx1250")
-        if backend != "gluon":
-            pytest.skip("Preshuffling weights is only supported on gluon backend")
+        if backend == "triton":
+            pytest.skip("Preshuffled weights are decoded by the gluon kernel only")
         if n % 16 != 0 or (k // 2) % 32 != 0:
             pytest.skip(
                 f"Preshuffling weights requires n divisible by 16 and k//2 divisible "
                 f"by 32, got n={n}, k//2={k // 2}"
             )
-
-    # skip gluon backend if not supported
-    if backend == "gluon" and not is_gluon_supported():
-        pytest.skip(f"Gluon backend is not supported on {get_arch()}")
 
     torch.manual_seed(0)
 
@@ -318,9 +249,12 @@ def test_op(
             swizzle_mx_scale = "GFX1250_SCALE"
             w_scale_tri = preshuffle_moe_wscale(w_scale_tri)
         elif get_arch() == "gfx950":
-            swizzle_mx_scale = "CDNA4_SCALE"
-            w_scale_tri = shuffle_scale_moe(
-                w_scale_tri, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
+            w_scale_tri, swizzle_mx_scale = shuffle_scale_moe(
+                w_scale_tri,
+                arch="gfx950",
+                preshuffle_factor=32,
+                scale_kwidth=8,
+                return_layout=True,
             )
         else:
             assert False, "Unsupported architecture"

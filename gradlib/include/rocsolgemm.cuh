@@ -4,15 +4,7 @@
 #define ROCBLAS_NO_DEPRECATED_WARNINGS
 #define ROCBLAS_BETA_FEATURES_API
 
-#include <ATen/ATen.h>
-#include <ATen/autocast_mode.h>
-#include <ATen/hip/HIPContext.h>
-#include <c10/hip/HIPFunctions.h>
-#include <torch/extension.h>
-#include <torch/torch.h>
-#include <c10/hip/HIPStream.h>
-#include <c10/macros/Export.h>
-#include <c10/util/irange.h>
+#include "aiter_tensor.h"
 
 #include <hip/hip_runtime.h>
 // #include <hipblaslt/hipblaslt-ext.hpp>
@@ -22,8 +14,10 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <optional>
 #include <string>
 #include <tuple>
+#include <vector>
 
 #include <rocblas/rocblas.h>
 
@@ -31,8 +25,11 @@ void rocb_create_extension();
 
 void rocb_destroy_extension();
 
-torch::Tensor RocSolIdxBlas(const torch::Tensor& mat1,
-                            const torch::Tensor& mat2,
-                            const int32_t solution_index = 0);
+// Torch-free: `result` is caller-allocated (Python side); see gradlib/csrc/rocsolgemm.cu.
+void RocSolIdxBlas(const aiter_tensor_t& mat1,
+                   const aiter_tensor_t& mat2,
+                   aiter_tensor_t& result,
+                   const int32_t solution_index = 0);
 
-std::vector<rocblas_int> RocFindAllSolIdxBlas(const torch::Tensor& mat1, const torch::Tensor& mat2);
+std::vector<rocblas_int>
+RocFindAllSolIdxBlas(const aiter_tensor_t& mat1, const aiter_tensor_t& mat2, aiter_tensor_t& result);

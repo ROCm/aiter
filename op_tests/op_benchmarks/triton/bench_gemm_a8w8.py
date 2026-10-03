@@ -1,3 +1,4 @@
+import functools
 import math
 import sys
 from collections.abc import Callable
@@ -5,10 +6,7 @@ from collections.abc import Callable
 import triton
 
 from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8 as triton_gemm_a8w8
-from aiter.ops.triton.gluon.gemm_a8w8 import (
-    gemm_a8w8 as gluon_gemm_a8w8,
-)
-from aiter.ops.triton.gluon.gemm_a8w8 import (
+from aiter.ops.triton.gemm.basic.gemm_a8w8 import (
     gemm_a8w8_preshuffle as gluon_gemm_a8w8_preshuffle,
 )
 from aiter.ops.triton.utils.types import str_to_torch_dtype
@@ -131,7 +129,7 @@ def run_benchmark(args, defaults):
         if args.shuffle:
             impl = gluon_gemm_a8w8_preshuffle
         else:
-            impl = gluon_gemm_a8w8
+            impl = functools.partial(triton_gemm_a8w8, backend="gluon")
     else:
         if args.shuffle:
             raise RuntimeError(

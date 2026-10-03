@@ -6,11 +6,13 @@
 
 enum class ActivationType : int
 {
-    No     = -1,
-    Silu   = 0,
-    Gelu   = 1,
-    Swiglu = 2,
-    Situv2 = 3,
+    No       = -1,
+    Silu     = 0,
+    Gelu     = 1,
+    Swiglu   = 2,
+    Situv2   = 3,
+    GeluTanh = 4,
+    Relu2    = 5,
 };
 
 enum class QuantType : int

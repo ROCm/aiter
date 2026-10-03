@@ -1,0 +1,1063 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "validation_report",
+  "description": "Machine-readable output of validate-kernel-pr. review-pr consumes this as the evidence base for any finding that asserts runtime behaviour. Fields that describe coverage are required precisely so a report cannot overclaim by omission.",
+  "type": "object",
+  "required": [
+    "label",
+    "started_utc",
+    "finished_utc",
+    "isolation",
+    "arch_coverage",
+    "arch_coverage_basis",
+    "degraded_mode",
+    "repo",
+    "runtime_identity",
+    "test_selection",
+    "stages",
+    "findings",
+    "verdict",
+    "process_exit_code"
+  ],
+  "additionalProperties": true,
+  "definitions": {
+    "stage": {
+      "type": "object",
+      "required": [
+        "status"
+      ],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": [
+            "pass",
+            "fail",
+            "skip",
+            "info"
+          ]
+        },
+        "note": {
+          "type": "string"
+        },
+        "log": {
+          "type": "string",
+          "description": "Path to the retained stage log."
+        }
+      },
+      "additionalProperties": true
+    },
+    "execution_stats": {
+      "type": "object",
+      "required": [
+        "tests",
+        "failures",
+        "errors",
+        "skipped",
+        "executed"
+      ],
+      "properties": {
+        "tests": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "failures": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "errors": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "skipped": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "executed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "junit_xml": {
+          "type": "string"
+        },
+        "observed_work": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Route calls counted in this run's own execution receipt. `null` means no route was named, so nothing was watched; 0 means a route was watched for and never reached. A script target's `executed` is a liveness signal and is not a case count."
+        }
+      }
+    },
+    "passing_correctness_stage": {
+      "description": "What a correctness stage has to look like for the report to be PASS: it ran, it exited 0, and it executed at least one test. Referenced by both correctness stages -- they were spelled out twice, and divergence between two copies of the PASS gate would silently change what earns a clearance.",
+      "required": [
+        "status",
+        "exit",
+        "stats"
+      ],
+      "properties": {
+        "status": {
+          "const": "pass"
+        },
+        "exit": {
+          "const": 0
+        },
+        "stats": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/execution_stats"
+            }
+          ],
+          "properties": {
+            "failures": {
+              "const": 0
+            },
+            "errors": {
+              "const": 0
+            },
+            "executed": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        }
+      }
+    }
+  },
+  "properties": {
+    "label": {
+      "type": "string",
+      "description": "Run identifier, e.g. the PR number or a candidate name."
+    },
+    "started_utc": {
+      "type": "string",
+      "description": "ISO-8601 UTC timestamp at run start."
+    },
+    "finished_utc": {
+      "type": "string"
+    },
+    "isolation": {
+      "type": "object",
+      "description": "The isolation actually achieved, not the isolation intended.",
+      "required": [
+        "level",
+        "container"
+      ],
+      "properties": {
+        "level": {
+          "type": "string",
+          "examples": [
+            "git-worktree + private caches",
+            "container"
+          ]
+        },
+        "container": {
+          "type": "boolean"
+        },
+        "reason": {
+          "type": "string",
+          "description": "Why the level is what it is, when it is not container-level."
+        }
+      }
+    },
+    "arch_coverage": {
+      "type": "object",
+      "description": "Per-architecture coverage. 'runtime' means at least one selected correctness test was collected and executed with that claimed device visible; GPU claim alone is insufficient. 'compile-only' means an explicit architecture-specific compile ran without execution. An untested architecture is 'not-covered' or absent.",
+      "additionalProperties": {
+        "type": "string",
+        "enum": [
+          "runtime",
+          "compile-only",
+          "not-covered"
+        ]
+      },
+      "examples": [
+        {
+          "gfx950": "runtime",
+          "gfx942": "not-covered"
+        }
+      ]
+    },
+    "arch_coverage_basis": {
+      "type": "object",
+      "description": "Per-architecture evidence used to claim runtime coverage.",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "degraded_mode": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "NO_GPU",
+        null
+      ],
+      "description": "NO_GPU means no verified-idle device was claimed. It does not imply that architecture-specific compilation ran."
+    },
+    "repo": {
+      "type": "object",
+      "required": [
+        "worktree",
+        "base",
+        "head",
+        "kind"
+      ],
+      "properties": {
+        "worktree": {
+          "type": "string"
+        },
+        "base": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{40}$",
+          "description": "Commit onto which the candidate patch was applied."
+        },
+        "head": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-fA-F]{40}$",
+          "description": "Exact PR head supplied by the caller, or the directly checked-out commit. Null means the report cannot be matched to a remote PR head."
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "aiter",
+            "flydsl",
+            "unknown"
+          ]
+        },
+        "patch_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "runtime_identity": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "Interpreter, package and loaded native-library identity used by the runtime probe. Null when compatibility was not established; trusted source-to-binary provenance is not yet implemented.",
+      "properties": {
+        "module": {
+          "type": "string"
+        },
+        "module_path": {
+          "type": "string"
+        },
+        "module_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "expected_root": {
+          "type": "string"
+        },
+        "python_executable": {
+          "type": "string"
+        },
+        "python_version": {
+          "type": "string"
+        },
+        "source_sha": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Commit of the checkout the resolved module came from, suffixed '-dirty' when that tree has uncommitted changes -- which the head phase always does, since it runs with the candidate patch applied. Null when the module resolved to an installed package with no source checkout to name; attributing a commit to a prebuilt binary is the provenance claim this validator does not make."
+        },
+        "native_artifacts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "path",
+              "size",
+              "sha256"
+            ],
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "size": {
+                "type": "integer"
+              },
+              "sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              }
+            }
+          }
+        }
+      }
+    },
+    "test_selection": {
+      "type": "object",
+      "required": [
+        "target",
+        "shape_env",
+        "grid",
+        "expected_route",
+        "shape_vars",
+        "runner",
+        "runner_reason"
+      ],
+      "properties": {
+        "target": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Exact script file or pytest node/file selected by the caller."
+        },
+        "shape_env": {
+          "type": "string",
+          "description": "Environment variable used to inject the independent grid, or an empty string."
+        },
+        "shape_arg": {
+          "type": "string",
+          "description": "The target's own CLI flag used to inject the independent grid, or an empty string when the environment-variable channel or no channel was used."
+        },
+        "gpu_requirement": {
+          "type": "string",
+          "enum": [
+            "required",
+            "not-required"
+          ],
+          "description": "Whether this target needs a GPU. 'not-required' is only recorded after the target was observed to pass with no visible device, never inferred from the diff."
+        },
+        "gpu_requirement_basis": {
+          "type": "string",
+          "description": "How gpu_requirement was established, including the executed-test count that rules out a suite which merely skipped everything."
+        },
+        "grid": {
+          "type": "string",
+          "description": "Independent shape grid supplied by the caller, or an empty string."
+        },
+        "expected_route": {
+          "type": "string",
+          "description": "Kernel or dispatch route that the execution receipt must prove."
+        },
+        "shape_vars": {
+          "type": "string",
+          "description": "Comma-separated local variable names captured from each observed route call."
+        },
+        "runner": {
+          "type": "string",
+          "enum": [
+            "pytest",
+            "script",
+            "none",
+            "unresolved"
+          ]
+        },
+        "runner_reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "shape_argnames": {
+          "type": "string",
+          "description": "Comma-separated pytest parameter names the independent grid replaced, or an empty string when another channel or no channel was used."
+        },
+        "grid_channel": {
+          "type": "string",
+          "enum": [
+            "",
+            "cli",
+            "env",
+            "pytest"
+          ],
+          "description": "Which channel actually delivered the independent grid. Empty when none was established. Declared but deliberately NOT required, so reports from earlier validators stay valid."
+        },
+        "grid_channel_reason": {
+          "type": "string",
+          "description": "When no channel was established, names each channel tried and what was found in the target -- so a limit of the validator is never published as a property of the target."
+        },
+        "grid_independence": {
+          "type": "string",
+          "enum": [
+            "adds-coverage",
+            "duplicates-target-defaults",
+            "unknown"
+          ],
+          "description": "Whether the requested grid cells ask for anything outside the target's own declared default for the same channel. A proven hook says the target CONSUMES the grid; this says whether the grid adds coverage."
+        },
+        "grid_independence_reason": {
+          "type": "string"
+        },
+        "axis_state": {
+          "type": "string",
+          "enum": [
+            "none",
+            "declared",
+            "proven",
+            "hook-not-found",
+            "hook-not-consumed",
+            "unusable"
+          ],
+          "description": "How far the requested extra axes got. Only `proven` means every axis flag was observed refusing a deliberately invalid value and its values rode the grid run."
+        },
+        "axis_state_reason": {
+          "type": "string"
+        },
+        "runner_risk": {
+          "type": "string",
+          "description": "A structural reason the SELECTED runner may be unable to run this target, e.g. a module body that parses argv, which pytest executes at collection with its own argv."
+        },
+        "axes": {
+          "type": "array",
+          "description": "Extra independent test axes, each on its own CLI flag. The shape grid is one ordered tuple on one channel; an axis is a separate knob the shape flag cannot reach, such as a head count.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "flag": {
+                "type": "string"
+              },
+              "values": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "hook_proof": {
+                "type": "string",
+                "enum": [
+                  "flag-declared-in-add_argument",
+                  "flag-not-declared",
+                  "malformed-axis-spec",
+                  "not-evaluated"
+                ]
+              },
+              "target_defaults": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "novel_values": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "independence": {
+                "type": "string",
+                "enum": [
+                  "adds-coverage",
+                  "duplicates-target-defaults",
+                  "unknown"
+                ]
+              }
+            },
+            "required": [
+              "name",
+              "flag",
+              "values",
+              "hook_proof"
+            ]
+          }
+        },
+        "runner_risk": {
+          "type": "string",
+          "description": "A structural reason the SELECTED runner may be unable to run this target, e.g. a module body that parses argv, which pytest executes at collection with its own argv."
+        }
+      }
+    },
+    "stages": {
+      "type": "object",
+      "description": "One entry per stage. A stage that could not run reports 'skip' with a note; it never reports 'pass' for work it did not do.",
+      "required": [
+        "merge_sim",
+        "gpu_claim",
+        "runtime_compat",
+        "test_policy",
+        "baseline_control",
+        "correctness_repo_tests",
+        "correctness_s1_grid",
+        "execution_receipt",
+        "index_width_scan"
+      ],
+      "additionalProperties": {
+        "$ref": "#/definitions/stage"
+      },
+      "properties": {
+        "merge_sim": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/stage"
+            }
+          ],
+          "description": "Candidate patch applied onto the recorded base; conflict short-circuits the run."
+        },
+        "gpu_claim": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/stage"
+            }
+          ],
+          "description": "GPU claimed over a sampling window and held under flock for the whole run.",
+          "properties": {
+            "hip_index": {
+              "type": "integer",
+              "description": "Translated HIP index; amd-smi numbering can differ."
+            },
+            "amd_smi_index": {
+              "type": "integer"
+            },
+            "model": {
+              "type": "string"
+            },
+            "arch": {
+              "type": "string"
+            },
+            "bdf": {
+              "type": "string"
+            },
+            "idleness_basis": {
+              "type": "string",
+              "enum": [
+                "activity+vram",
+                "vram-only",
+                "unknown"
+              ],
+              "description": "Evidence the idleness claim rests on. 'vram-only' means the activity API was unavailable, so a null gfx_activity_before_pct is unknown rather than a measured zero."
+            },
+            "gfx_activity_before_pct": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "gfx_activity_after_pct": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "host": {
+              "type": "string"
+            },
+            "post_run_note": {
+              "type": "string"
+            },
+            "requirement_note": {
+              "type": "string"
+            }
+          }
+        },
+        "runtime_compat": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/stage"
+            }
+          ],
+          "description": "Whether the repository's own package imports from the supplied checkout. A mismatch is skipped and is not attributed to the PR."
+        },
+        "test_policy": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/stage"
+            }
+          ],
+          "description": "Checks run BEFORE the suite, because a suite that cannot fail still reports green.",
+          "properties": {
+            "tolerances_base": {
+              "type": "array",
+              "items": {
+                "type": "number"
+              }
+            },
+            "tolerances_head": {
+              "type": "array",
+              "items": {
+                "type": "number"
+              }
+            },
+            "reference_tolerances": {
+              "type": "object",
+              "description": "Tolerances named by --tol-table, recorded as context only. The gate is the head-vs-base comparison above; this table is keyed by dtype while the scraped tolerances are a positional list, so the two cannot be matched up and no verdict is drawn from this field."
+            },
+            "loosened": {
+              "type": "array",
+              "description": "(base, head) pairs where this change widened a tolerance."
+            },
+            "commented_out_shape_rows_base": {
+              "type": "integer"
+            },
+            "commented_out_shape_rows": {
+              "type": "integer"
+            },
+            "commented_out_shape_rows_added": {
+              "type": "integer"
+            },
+            "kernel_files_changed": {
+              "type": "boolean"
+            }
+          }
+        },
+        "baseline_control": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/stage"
+            }
+          ],
+          "description": "The same targets executed after reversing the exact candidate patch. A missing newly added target is distinct from a failing baseline."
+        },
+        "correctness_repo_tests": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/stage"
+            }
+          ],
+          "description": "The target the PR itself ships. Pytest uses JUnit counters; script runners use process-based execution counters and an explicit basis.",
+          "properties": {
+            "stats": {
+              "$ref": "#/definitions/execution_stats"
+            }
+          }
+        },
+        "correctness_s1_grid": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/stage"
+            }
+          ],
+          "description": "A shape grid this skill owns, independent of what the PR chose to test: non-toy, boundary/odd, long-context. 'skip' with repo-default-only when the kernel exposes no shape override.",
+          "properties": {
+            "grid": {
+              "type": "string"
+            },
+            "stats": {
+              "$ref": "#/definitions/execution_stats"
+            }
+          }
+        },
+        "execution_receipt": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/stage"
+            }
+          ],
+          "description": "Machine-readable proof from the selected test naming the observed route, kernel symbols and every executed grid shape.",
+          "properties": {
+            "route": {
+              "type": "string"
+            },
+            "producer": {
+              "type": "string"
+            },
+            "kernel_symbols": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "required_shapes": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "executed_shapes": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "shape_namespace": {
+              "type": "string",
+              "minLength": 1
+            },
+            "shape_capture": {
+              "type": "object",
+              "description": "Present only when shape capture was requested and produced no rows. A receipt carrying this asserts route execution and makes no claim about shapes.",
+              "properties": {
+                "requested": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "observed": {
+                  "type": "integer"
+                },
+                "note": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "required": [
+                "requested",
+                "observed",
+                "note"
+              ]
+            },
+            "receipt_sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "receipt_scope": {
+              "type": "string",
+              "description": "Which of the head-phase runs the published receipt describes."
+            }
+          }
+        },
+        "index_width_scan": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/stage"
+            }
+          ],
+          "description": "Structural candidates for 32-bit index/stride overflow. Informational: the reviewer judges each, the count does not move the verdict.",
+          "properties": {
+            "index_stride_candidates": {
+              "type": "integer"
+            },
+            "untyped_stride_parameters": {
+              "type": "integer"
+            },
+            "total_candidates": {
+              "type": "integer"
+            }
+          }
+        },
+        "perf": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/stage"
+            }
+          ],
+          "description": "Base vs head timing of the same target, taken back to back on the same locked GPU with the patch reversed for the base side. `median_ratio` is the head speedup over base, oriented so >1 is faster and <1 is a regression whichever way the column reads, and taken as the MINIMUM over per-column medians -- an aiter timing table carries reference columns the PR does not touch, and averaging them in would pull a real regression back toward 1.0. status=fail means a measured regression below `threshold` and carries a should-fix finding; status=skip covers every 'could not measure' case, including a nonzero exit on either side. `median_ratio` is absent, never null, whenever no comparison was made. Not a required stage: a perf run that could not happen never downgrades a correctness verdict.",
+          "properties": {
+            "baseline": {
+              "type": "string"
+            },
+            "median_ratio": {
+              "type": "number"
+            },
+            "threshold": {
+              "type": "number"
+            },
+            "worst_column": {
+              "type": "string"
+            },
+            "matched_rows": {
+              "type": "integer"
+            },
+            "command": {
+              "type": "string"
+            },
+            "harness": {
+              "type": "string"
+            },
+            "base_log": {
+              "type": "string"
+            },
+            "head_log": {
+              "type": "string"
+            },
+            "columns": {
+              "type": "object",
+              "description": "Per-timing-column medians. `eligible` is false when the column has fewer usable samples than the minimum row count, in which case it is reported but cannot set the verdict.",
+              "additionalProperties": {
+                "type": "object",
+                "properties": {
+                  "median_ratio": {
+                    "type": "number"
+                  },
+                  "samples": {
+                    "type": "integer"
+                  },
+                  "eligible": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            },
+            "regressed_rows": {
+              "type": "array",
+              "description": "The worst rows of the worst column, kept so a regression finding ships its own reproducer.",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "row": {
+                    "type": "string"
+                  },
+                  "column": {
+                    "type": "string"
+                  },
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "latency",
+                      "throughput"
+                    ]
+                  },
+                  "base": {
+                    "type": "number"
+                  },
+                  "head": {
+                    "type": "number"
+                  },
+                  "ratio": {
+                    "type": "number"
+                  },
+                  "base_repeats": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "head_repeats": {
+                    "type": "integer",
+                    "minimum": 1
+                  }
+                }
+              }
+            },
+            "repeats": {
+              "type": "object",
+              "description": "How many repeat runs backed each side, and how they were reduced. The threshold is only defensible as a best-of-N comparison, so N is part of the result.",
+              "properties": {
+                "base": {
+                  "type": "integer"
+                },
+                "head": {
+                  "type": "integer"
+                },
+                "reduction": {
+                  "type": "string"
+                }
+              }
+            },
+            "baseline_method": {
+              "type": "string",
+              "enum": [
+                "patch-reversed-same-worktree",
+                "target-transplant"
+              ],
+              "description": "How the baseline was obtained. `target-transplant` copies a PR-added target into the base tree to time the pre-PR implementation through the same harness, and is only reported alongside a control column that reproduced across the two trees."
+            },
+            "control_column": {
+              "type": "string"
+            },
+            "control_ratio": {
+              "type": "number"
+            },
+            "control_note": {
+              "type": "string"
+            },
+            "row_key_basis": {
+              "type": "string",
+              "description": "How rows were paired across base and head; a relaxed key means the target printed an unlabeled measurement column."
+            }
+          }
+        }
+      }
+    },
+    "findings": {
+      "type": "array",
+      "description": "Machine-generated findings from the stages above. These are evidence, not review prose; review-pr turns them into reviewer-facing findings.",
+      "items": {
+        "type": "object",
+        "required": [
+          "severity",
+          "stage",
+          "detail"
+        ],
+        "properties": {
+          "severity": {
+            "type": "string",
+            "enum": [
+              "blocker",
+              "should-fix",
+              "note"
+            ]
+          },
+          "stage": {
+            "type": "string"
+          },
+          "detail": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "verdict": {
+      "type": "string",
+      "enum": [
+        "PASS",
+        "NEEDS_WORK",
+        "BLOCK",
+        "INCONCLUSIVE"
+      ],
+      "description": "BLOCK is a reproducible candidate defect; INCONCLUSIVE means required evidence did not run. PASS is possible only when every required validation stage completed."
+    },
+    "process_exit_code": {
+      "type": "integer",
+      "enum": [
+        0,
+        1,
+        2
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "verdict": {
+            "const": "PASS"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "process_exit_code": {
+            "const": 0
+          },
+          "arch_coverage": {
+            "minProperties": 1
+          },
+          "arch_coverage_basis": {
+            "minProperties": 1
+          },
+          "runtime_identity": {
+            "type": "object",
+            "required": [
+              "module",
+              "module_path",
+              "python_executable",
+              "python_version",
+              "native_artifacts"
+            ]
+          },
+          "test_selection": {
+            "properties": {
+              "expected_route": {
+                "minLength": 1
+              },
+              "shape_vars": {
+                "minLength": 1
+              },
+              "runner": {
+                "enum": [
+                  "pytest",
+                  "script"
+                ]
+              }
+            }
+          },
+          "stages": {
+            "properties": {
+              "merge_sim": {
+                "properties": {
+                  "status": {
+                    "const": "pass"
+                  }
+                }
+              },
+              "gpu_claim": {
+                "required": [
+                  "status",
+                  "hip_index",
+                  "arch",
+                  "bdf"
+                ],
+                "properties": {
+                  "status": {
+                    "const": "pass"
+                  }
+                }
+              },
+              "runtime_compat": {
+                "properties": {
+                  "status": {
+                    "const": "pass"
+                  }
+                }
+              },
+              "test_policy": {
+                "properties": {
+                  "status": {
+                    "const": "pass"
+                  }
+                }
+              },
+              "baseline_control": {
+                "properties": {
+                  "status": {
+                    "const": "pass"
+                  }
+                }
+              },
+              "correctness_repo_tests": {
+                "$ref": "#/definitions/passing_correctness_stage"
+              },
+              "correctness_s1_grid": {
+                "$ref": "#/definitions/passing_correctness_stage"
+              },
+              "execution_receipt": {
+                "required": [
+                  "status",
+                  "producer",
+                  "route",
+                  "kernel_symbols",
+                  "required_shapes",
+                  "executed_shapes",
+                  "receipt_sha256"
+                ],
+                "properties": {
+                  "status": {
+                    "const": "pass"
+                  },
+                  "producer": {
+                    "const": "validate-kernel-pr.validation_probe"
+                  },
+                  "route": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "kernel_symbols": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  },
+                  "required_shapes": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  },
+                  "executed_shapes": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  }
+                }
+              },
+              "index_width_scan": {
+                "properties": {
+                  "status": {
+                    "const": "info"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

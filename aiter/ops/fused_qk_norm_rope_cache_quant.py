@@ -251,6 +251,7 @@ def fused_qk_norm_rope_cache_pts_quant_shuffle(
     block_size: int,
     x: int,
     rotary_dim: int = 0,
+    v_norm: bool = False,
 ) -> None: ...
 
 

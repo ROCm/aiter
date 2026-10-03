@@ -8,18 +8,25 @@ Gated Delta Net Operations (Forward Only).
 This module provides high-level Triton implementations for gated delta rule.
 """
 
-from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import (
+from aiter.ops.triton._triton_kernels.gated_delta_net.utils import (
     GatedDeltaRulePrefillMetadata,
     build_gated_delta_rule_prefill_metadata,
 )
-
-from .causal_conv1d_decode import causal_conv1d_update_split_qkv
-from .causal_conv1d_prefill import (
+from aiter.ops.triton.gated_delta_net.causal_conv1d_decode import (
+    causal_conv1d_update_split_qkv,
+)
+from aiter.ops.triton.gated_delta_net.causal_conv1d_prefill import (
     causal_conv1d_split_qkv_triton_fn,
     causal_conv1d_split_qkv_triton_tile_fn,
 )
-from .fused_rearrange_sigmoid_gdr import fused_rearrange_sigmoid_gated_delta_rule
-from .gated_delta_rule import (
+from aiter.ops.triton.gated_delta_net.fused_gdn_prefill_qkvz import (
+    fused_gdn_prefill_qkvz,
+    fused_gdn_prefill_qkvz_supported,
+)
+from aiter.ops.triton.gated_delta_net.fused_rearrange_sigmoid_gdr import (
+    fused_rearrange_sigmoid_gated_delta_rule,
+)
+from aiter.ops.triton.gated_delta_net.gated_delta_rule import (
     chunk_gated_delta_rule,
     chunk_gated_delta_rule_opt,
     chunk_gated_delta_rule_opt_vk,
@@ -35,6 +42,8 @@ __all__ = [
     "chunk_gated_delta_rule",
     "chunk_gated_delta_rule_opt",
     "chunk_gated_delta_rule_opt_vk",
+    "fused_gdn_prefill_qkvz",
+    "fused_gdn_prefill_qkvz_supported",
     "fused_rearrange_sigmoid_gated_delta_rule",
     "fused_recurrent_gated_delta_rule",
 ]

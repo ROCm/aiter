@@ -7,13 +7,7 @@ import pytest
 import torch
 from scipy import stats
 
-try:
-    from aiter.ops import sampling
-except ImportError as exc:
-    if "cpp_itfs sampling is disabled on ROCm 10" not in str(exc):
-        raise
-    sampling = None
-    pytestmark = pytest.mark.skip(reason=str(exc))
+from aiter.ops import sampling  # noqa: F401
 
 torch.set_default_device("cuda")
 

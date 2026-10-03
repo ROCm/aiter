@@ -139,7 +139,7 @@ def flydsl_a16w4_gemm1(
         w_dtype=w_dtype,
         w_layout=w_layout,
         k_wave=k_wave,
-        use_k16="gfx95" not in str(get_rocm_arch()),
+        rocm_arch=str(get_rocm_arch()),
     )
     max_m_blocks = int(sorted_expert_ids.numel())
     grid = gemm1_a16w4_grid(BM, INTER=D_INTER, TILE_N=TILE_N, max_m_blocks=max_m_blocks)
@@ -198,6 +198,7 @@ def flydsl_a16w4_gemm2(
     xcd_swizzle=1,
     w_dtype="fp4",
     persist=None,
+    epilog="atomic",
     stream=None,
 ):
     """a16w4/a16wi4/a16w16 fused stage2 (down-proj). Consumes the bf16 [sorted_size,
@@ -245,7 +246,9 @@ def flydsl_a16w4_gemm2(
         waves_per_eu=waves_per_eu,
         w_dtype=w_dtype,
         persist=_persist,
-        use_k16="gfx95" not in str(get_rocm_arch()),
+        rocm_arch=str(get_rocm_arch()),
+        epilog=epilog,
+        topk=topk,
     )
     grid = gemm2_a16w4_grid(
         BM, N_OUT=D_HIDDEN, TILE_N=TILE_N, max_m_blocks=max_m_blocks, persist=_persist

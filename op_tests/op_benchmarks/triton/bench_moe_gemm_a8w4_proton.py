@@ -234,6 +234,7 @@ def bench_mlp_single_weight_init(
     op_regex,
     routed_experts=None,
     preshuffle=False,
+    backend=None,
 ):
     rank = 0
     dev = f"cuda:{rank}"
@@ -321,6 +322,7 @@ def bench_mlp_single_weight_init(
                 out_dtype=x_dtype,
                 apply_swiglu=True,
                 preshuffled=preshuffle,
+                backend=backend,
             )
             x = moe_gemm_a8w4(
                 x,
@@ -334,6 +336,7 @@ def bench_mlp_single_weight_init(
                 scatter_indx=scatter_indx,
                 swizzle_mx_scale=swizzle_mx_scale2,
                 preshuffled=preshuffle,
+                backend=backend,
             )
         else:
             assert x_dtype_str == "mx8"
@@ -351,6 +354,7 @@ def bench_mlp_single_weight_init(
                 swizzle_mx_scale=swizzle_mx_scale1,
                 apply_swiglu=True,
                 preshuffled=preshuffle,
+                backend=backend,
             )
             x, x_scale = quantize(x, x_dtype_str)
             x = moe_gemm_a8w4(
@@ -365,6 +369,7 @@ def bench_mlp_single_weight_init(
                 scatter_indx=scatter_indx,
                 swizzle_mx_scale=swizzle_mx_scale2,
                 preshuffled=preshuffle,
+                backend=backend,
             )
     proton.finalize()
     return parse_profile(
@@ -385,6 +390,7 @@ def bench_mlp(
     routed_experts=None,
     num_weight_inits=1,
     preshuffle=False,
+    backend=None,
 ):
     all_results = []
     for _ in range(num_weight_inits):
@@ -400,6 +406,7 @@ def bench_mlp(
             op_regex,
             routed_experts=routed_experts,
             preshuffle=preshuffle,
+            backend=backend,
         )
         all_results.append(result)
 
@@ -429,6 +436,7 @@ def roofline_mlp(
     name="",
     num_weight_inits=1,
     preshuffle=False,
+    backend=None,
 ):
     # Avoid creating an empty directory named like the output CSV stem.
     out_dir = Path("logs") / name
@@ -448,6 +456,7 @@ def roofline_mlp(
         routed_experts,  # fixed args
         num_weight_inits,
         preshuffle,
+        backend,
         bench_fn=bench_mlp,  # function to benchmark
         intensity_proxy_name="batch",  # intensity proxy name
         intensity_proxy_values=batch_sizes,  # intensity proxy values to sweep
@@ -504,6 +513,13 @@ def parse_args(args: list[str] | None = None):
         "experts.",
     )
     parser.add_argument(
+        "--backend",
+        choices=["triton", "gluon"],
+        default=None,
+        help="Kernel backend for moe_gemm_a8w4. Default: unset, i.e. the arch "
+        "default (gluon on gfx1250, triton elsewhere). gluon requires gfx1250.",
+    )
+    parser.add_argument(
         "--num-weight-inits",
         type=int,
         default=1,
@@ -554,6 +570,7 @@ def main(args: list[str] | None = None) -> None:
         name="gpt-oss-x2",
         num_weight_inits=parsed_args.num_weight_inits,
         preshuffle=parsed_args.preshuffle,
+        backend=parsed_args.backend,
     )
 
 

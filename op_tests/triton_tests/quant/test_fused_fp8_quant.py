@@ -13,7 +13,7 @@ from aiter.ops.triton.quant.fused_fp8_quant import (
     fused_silu_mul_fp8_per_tensor_static_quant,
 )
 from aiter.test_common import (
-    checkAllclose,
+    assertAllclose,
 )
 
 rocm_aiter_fp8_dtype = rocm_aiter.dtypes.fp8
@@ -248,8 +248,8 @@ def test_rmsnorm_quant_fuse(m, n):
         x, w, x_scale, eps, rocm_fp8_dtype
     )
 
-    checkAllclose(rms_out, rms_out_ref)
-    checkAllclose(fp8_x.to(torch.float32), fp8_x_ref.to(torch.float32))
+    assertAllclose(rms_out, rms_out_ref)
+    assertAllclose(fp8_x.to(torch.float32), fp8_x_ref.to(torch.float32))
 
 
 def _assert_transpose_scale_layout(
@@ -383,6 +383,7 @@ def run_torch_flatten_fp8_group_quant(x, dtype_quant, group_size):
 @pytest.mark.parametrize("N1, N2", [(16, 128), (16, 7168)])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_fused_flatten_fp8_group_quant(M: int, N1: int, N2: int, dtype):
+    torch.manual_seed(0)
     group_size = 128
     dtype_quant = aiter.dtypes.fp8
     x = torch.randn((N1, M, N2), dtype=dtype, device="cuda") / 10
@@ -787,4 +788,4 @@ def test_silu_mul_quant_fuse(m, n):
     fp8_x_ref = silu_mul_fp8_quantization_ref(x, x_scale, rocm_fp8_dtype)
     fp8_x = triton_silu_mul_fp8_quantization_fuse(x, x_scale, rocm_fp8_dtype)
 
-    checkAllclose(fp8_x.to(torch.float32), fp8_x_ref.to(torch.float32))
+    assertAllclose(fp8_x.to(torch.float32), fp8_x_ref.to(torch.float32))
