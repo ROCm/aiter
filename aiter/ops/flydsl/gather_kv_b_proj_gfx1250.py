@@ -8,7 +8,9 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
-from aiter.ops.gemm_op_a8w8 import gemm_a8w8_bpreshuffle_flydsl
+from aiter.ops.flydsl.bpreshuffle_gemm_gfx1250 import (
+    run_kimi_gather_gemm_a8w8_gfx1250,
+)
 from aiter.ops.triton.gather_kv_b_proj import gather_kv_b_proj
 
 _HEADS = 96
@@ -19,7 +21,7 @@ _V_DIM = 128
 _WEIGHT_N = _HEADS * (_NOPE + _V_DIM)
 _FLYDSL_MIN_ROWS = 4096
 _GEMM_CONFIG = {
-    "kernelName": "flydsl_bpreshuffle_wmma_t256x128x128_" "mw4_nw1_nb3_sk1_cm1_cn1"
+    "kernelName": "flydsl_bpreshuffle_wmma_t256x256x128_" "mw2_nw2_nb4_sk1_cm1_cn1"
 }
 
 
@@ -76,6 +78,7 @@ def _gather_latent(
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
     SCALE_IS_PTR: tl.constexpr,
+    A_PRESHUFFLE: tl.constexpr,
 ):
     rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
     cols = tl.arange(0, BLOCK_K)
@@ -87,42 +90,37 @@ def _gather_latent(
         mask=row_mask[:, None],
         other=0.0,
     )
-    tl.store(
-        xq + safe_rows[:, None] * 512 + cols[None, :],
-        values,
-        mask=row_mask[:, None],
-    )
+    if A_PRESHUFFLE:
+        x_off = (
+            (safe_rows[:, None] // 2) * 512
+            + (cols[None, :] // 128) * 256
+            + (safe_rows[:, None] % 2) * 128
+            + cols[None, :] % 128
+        )
+    else:
+        x_off = safe_rows[:, None] * 512 + cols[None, :]
+    tl.store(xq + x_off, values, mask=row_mask[:, None])
     scale = tl.load(cache_scale) if SCALE_IS_PTR else cache_scale
     tl.store(x_scale + safe_rows, scale, mask=row_mask)
 
 
 @triton.jit
-def _split_projected_and_rope(
-    projected,
+def _copy_rope(
     cache,
     indices,
     cache_scale,
     k_out,
-    v_out,
     M: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    BLOCK_H: tl.constexpr,
     SCALE_IS_PTR: tl.constexpr,
 ):
     rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
-    head = tl.program_id(1)
+    heads = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
     cols = tl.arange(0, BLOCK_D)
     row_mask = rows < M
     safe_rows = tl.where(row_mask, rows, 0)
-    mask = row_mask[:, None] & (cols[None, :] < 128)
-    proj_base = safe_rows[:, None] * 24576 + head * 256
-    k = tl.load(projected + proj_base + cols[None, :], mask=mask, other=0.0)
-    v = tl.load(projected + proj_base + 128 + cols[None, :], mask=mask, other=0.0)
-    k_base = safe_rows[:, None] * 18432 + head * 192
-    v_base = safe_rows[:, None] * 12288 + head * 128
-    tl.store(k_out + k_base + cols[None, :], k, mask=mask)
-    tl.store(v_out + v_base + cols[None, :], v, mask=mask)
-
     rope_mask = row_mask[:, None] & (cols[None, :] < 64)
     slots = tl.load(indices + safe_rows, mask=row_mask, other=0)
     rope = tl.load(
@@ -132,7 +130,19 @@ def _split_projected_and_rope(
     ).to(tl.float32)
     scale = tl.load(cache_scale) if SCALE_IS_PTR else cache_scale
     rope *= scale
-    tl.store(k_out + k_base + 128 + cols[None, :], rope, mask=rope_mask)
+    out = (
+        k_out
+        + safe_rows[:, None, None] * 18432
+        + heads[None, :, None] * 192
+        + 128
+        + cols[None, None, :]
+    )
+    out_mask = (
+        row_mask[:, None, None]
+        & (heads[None, :, None] < 96)
+        & (cols[None, None, :] < 64)
+    )
+    tl.store(out, rope[:, None, :], mask=out_mask)
 
 
 def gather_kv_b_proj_flydsl_gfx1250(
@@ -189,15 +199,8 @@ def gather_kv_b_proj_flydsl_gfx1250(
     scale_is_ptr = k_scale.device.type != "cpu"
     scale_arg = k_scale if scale_is_ptr else float(k_scale)
 
-    # Reuse k_prefix before its final write for the small gather/scale workspaces.
-    raw = k_prefix.view(torch.uint8).view(-1)
-    x_bytes = m * _KV_C
-    scale_bytes = m * torch.float32.itemsize
-    xq = raw[:x_bytes].view(torch.float8_e4m3fn).view(m, _KV_C)
-    x_scale = raw[x_bytes : x_bytes + scale_bytes].view(torch.float32).view(m, 1)
-    projected = torch.empty(
-        (m, _WEIGHT_N), dtype=torch.bfloat16, device=k_buffer.device
-    )
+    xq = torch.empty((m, _KV_C), dtype=torch.float8_e4m3fn, device=k_buffer.device)
+    x_scale = torch.empty((m, 1), dtype=torch.float32, device=k_buffer.device)
 
     _gather_latent[(triton.cdiv(m, 16),)](
         k_buffer,
@@ -209,24 +212,25 @@ def gather_kv_b_proj_flydsl_gfx1250(
         BLOCK_M=16,
         BLOCK_K=_KV_C,
         SCALE_IS_PTR=scale_is_ptr,
+        A_PRESHUFFLE=True,
     )
-    gemm_a8w8_bpreshuffle_flydsl(
+    run_kimi_gather_gemm_a8w8_gfx1250(
         xq,
         kv_proj_weight,
         x_scale,
         kv_proj_scale,
-        projected,
-        _GEMM_CONFIG,
+        k_prefix,
+        v_prefix,
+        _GEMM_CONFIG["kernelName"],
     )
-    _split_projected_and_rope[(triton.cdiv(m, 16), _HEADS)](
-        projected,
+    _copy_rope[(triton.cdiv(m, 16), triton.cdiv(_HEADS, 8))](
         k_buffer,
         kv_indices,
         scale_arg,
         k_prefix,
-        v_prefix,
         M=m,
         BLOCK_M=16,
-        BLOCK_D=128,
+        BLOCK_D=64,
+        BLOCK_H=8,
         SCALE_IS_PTR=scale_is_ptr,
     )
