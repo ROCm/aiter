@@ -6011,7 +6011,7 @@ class FmoeTuner(TunerCommon):
                         model_dim=int(row["model_dim"]),
                         inter_dim=int(row["inter_dim"]),
                         topk=int(row["topk"]),
-                        quant_type="",
+                        quant_type=("no" if row["q_type"] == str(QuantType.No) else ""),
                     )
                 )
                 is None
