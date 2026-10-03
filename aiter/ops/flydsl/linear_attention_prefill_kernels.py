@@ -503,6 +503,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
     prefill_metadata: GatedDeltaRulePrefillMetadata | None = None,
     seq_lens_cpu: Sequence[int] | None = None,
     snapshot_dtype: torch.dtype | None = None,
+    wu_head_major: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """K5 opt implementation: NON-VWARP only -- uses the
     16x16x16 bf16 MFMA and the SAME split-M warp partition (BT split-M, K split
@@ -515,7 +516,9 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
     BV is ``_tuned_bv`` then ``_hipeq_select_bv``; ``FLYDSL_K5_OPT_BV``
     (in {16,32,64}) overrides both for A/B sweeps.
     ``AITER_K5_OPT_CHECK=1`` enables the dtype/shape/device audit (off by
-    default). k/w/u must still be contiguous.
+    default). k/w/u must still be contiguous. ``wu_head_major=True`` expects
+    w/u as ``[B, H, T, K/V]``; False expects ``[B, T, H, K/V]``. ``v_new``
+    follows u's layout. ``g_head_major`` selects g's layout independently.
 
     ``state_dtype`` controls the persistent initial/final state, while
     ``snapshot_dtype`` independently controls the per-chunk ``h`` snapshots and
@@ -568,9 +571,9 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
     snapshot_bf16 = resolved_snapshot_dtype is torch.bfloat16
 
     B, T, Hg, K = k.shape
-    H = w.shape[1]
+    H = w.shape[1] if wu_head_major else w.shape[2]
     V = u.shape[-1]
-    T_flat = w.shape[2]
+    T_flat = w.shape[2] if wu_head_major else w.shape[1]
     BT = chunk_size
     is_varlen = cu_seqlens is not None
 
@@ -588,10 +591,13 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
         )
 
     if _opt_check():
+        wu_layout = "B,H,T" if wu_head_major else "B,T,H"
+        expected_w_shape = (B, H, T_flat, K) if wu_head_major else (B, T_flat, H, K)
+        expected_u_shape = (B, H, T_flat, V) if wu_head_major else (B, T_flat, H, V)
         if k.dim() != 4 or w.dim() != 4 or u.dim() != 4:
             raise ValueError(
                 "FlyDSL K5 opt: k/w/u must be 4-D (k=[B,T,Hg,K], "
-                f"w=[B,H,T,K], u=[B,H,T,V]); got k={tuple(k.shape)}, "
+                f"w=[{wu_layout},K], u=[{wu_layout},V]); got k={tuple(k.shape)}, "
                 f"w={tuple(w.shape)}, u={tuple(u.shape)}."
             )
         if not (k.dtype == w.dtype == u.dtype):
@@ -613,14 +619,14 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
             raise ValueError(
                 f"FlyDSL K5 opt: k T dim ({k.shape[1]}) must equal w/u T ({T_flat})."
             )
-        if w.shape != (B, H, T_flat, K):
+        if w.shape != expected_w_shape:
             raise ValueError(
-                f"FlyDSL K5 opt: expected w=[B,H,T,K]=({B},{H},{T_flat},{K}), "
+                f"FlyDSL K5 opt: expected w=[{wu_layout},K]={expected_w_shape}, "
                 f"got {tuple(w.shape)}."
             )
-        if u.shape != (B, H, T_flat, V):
+        if u.shape != expected_u_shape:
             raise ValueError(
-                f"FlyDSL K5 opt: expected u=[B,H,T,V]=({B},{H},{T_flat},{V}), "
+                f"FlyDSL K5 opt: expected u=[{wu_layout},V]={expected_u_shape}, "
                 f"got {tuple(u.shape)}."
             )
         if H % Hg != 0:
@@ -808,7 +814,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
         output_final_state,
         save_new_value,
         is_varlen,
-        True,
+        wu_head_major,
         state_bf16=state_bf16,
         g_log2_scaled=g_log2_scaled,
         use_state_indices=use_state_indices,
@@ -830,7 +836,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
 
     # opt writes the public VK layout ([..., V, K]) directly.
     h_shape = (B, NT, H, V, K)
-    vn_shape = (B, H, T_flat, V)
+    vn_shape = (B, H, T_flat, V) if wu_head_major else (B, T_flat, H, V)
     vn_dtype = u.dtype
     fs_shape = (N, H, V, K) if output_final_state else None
     fs_dtype = resolved_state_dtype if output_final_state else None

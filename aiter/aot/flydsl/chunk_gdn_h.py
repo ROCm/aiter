@@ -59,12 +59,12 @@ DEFAULT_CSVS = [AITER_CONFIGS.AITER_CONFIG_GDN_K5_OPT_FILE]
 # the tuned table never measured can resolve to any of these.
 _BV_CANDIDATES = (16, 32, 64)
 _G_HEAD_MAJOR = (True, False)
+_WU_CONTIG = (True, False)
 _USE_STATE_INDICES = (False, True)
 _FIXED_SWITCHES: dict[str, bool] = {
     "use_g": True,
     "use_gk": False,
     "save_vn": True,
-    "wu_contig": True,
     "g_log2_scaled": True,
     "bf16_convert_trunc": True,
 }
@@ -101,9 +101,9 @@ def parse_csv(csv_path: str) -> list[dict[str, Any]]:
     batch shape (tuned lookup, else the CU heuristic), so a sequence length the
     table never measured can resolve to any candidate. Emitting all of them
     keeps arbitrary ``T``/seqlens off the JIT path, and costs only compile time
-    because a row's own tuned ``BV`` is always among them. ``g_head_major`` and
-    ``use_state_indices`` are fanned out for a related reason: they are not
-    tuned dimensions, but they do fork the compiled artifact.
+    because a row's own tuned ``BV`` is always among them. ``g_head_major``,
+    ``use_state_indices``, and ``wu_contig`` are fanned out for a related reason:
+    they are not tuned dimensions, but they do fork the compiled artifact.
     """
     jobs: list[dict[str, Any]] = []
     seen: set[tuple] = set()
@@ -141,8 +141,8 @@ def parse_csv(csv_path: str) -> list[dict[str, Any]]:
                 continue
 
             indices = _USE_STATE_INDICES if (use_h0 and store_fs) else (False,)
-            for BV, g_head_major, use_state_indices in itertools.product(
-                bvs, _G_HEAD_MAJOR, indices
+            for BV, g_head_major, use_state_indices, wu_contig in itertools.product(
+                bvs, _G_HEAD_MAJOR, indices, _WU_CONTIG
             ):
                 job = {
                     "kernel_name": _KERNEL_NAME,
@@ -161,6 +161,7 @@ def parse_csv(csv_path: str) -> list[dict[str, Any]]:
                     "state_bf16": state_bf16,
                     "g_head_major": g_head_major,
                     "use_state_indices": use_state_indices,
+                    "wu_contig": wu_contig,
                     **_FIXED_SWITCHES,
                 }
                 key = job_identity(job)
@@ -213,9 +214,10 @@ def _compile_to_cache(
     int32_dummy = torch.empty(1, device=dev, dtype=torch.int32)
 
     k = torch.empty((B, T, Hg, K), device=dev, dtype=torch_dtype)
-    u = torch.empty((B, H, T_flat, V), device=dev, dtype=torch_dtype)
-    w = torch.empty((B, H, T_flat, K), device=dev, dtype=torch_dtype)
-    v_new = torch.empty((B, H, T_flat, V), device=dev, dtype=torch_dtype)
+    wu_shape = (B, H, T_flat) if wu_contig else (B, T_flat, H)
+    u = torch.empty((*wu_shape, V), device=dev, dtype=torch_dtype)
+    w = torch.empty((*wu_shape, K), device=dev, dtype=torch_dtype)
+    v_new = torch.empty((*wu_shape, V), device=dev, dtype=torch_dtype)
     g_shape = (B, H, T_flat) if g_head_major else (B, T_flat, H)
     g = torch.empty(g_shape, device=dev, dtype=torch.float32) if use_g else dummy
     gk = (
