@@ -139,25 +139,21 @@ def resolve_installed(spec, shape, backend):
 
 
 def seed_table(spec, backend, shape_nk):
-    """(path, table) of what the loader serves for this N/K today: this shape's own file, for
-    batched shapes the N/K file, else the DEFAULT.json buckets and M_BOUNDS."""
+    """(path, table) to install into: this shape's own file, else a new DEFAULT_FALLBACK table."""
     from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 
     config_dir = resolve_config_dir("gemm", spec.config_name, backend=backend)
-    paths = [f"{config_dir}/{specialized_filename(spec.config_name, shape_nk)}"]
-    if "B" in shape_nk:
-        nk = {d: shape_nk[d] for d in ("N", "K")}
-        paths.append(f"{config_dir}/{specialized_filename(spec.config_name, nk)}")
-    for path in paths:
-        table = load_config_json(path, required=False)
-        if table is not None:
-            return path, table
+    path = f"{config_dir}/{specialized_filename(spec.config_name, shape_nk)}"
+    table = load_config_json(path, required=False)
+    if table is not None:
+        return path, table
     default_path = f"{config_dir}/DEFAULT.json"
     default = load_config_json(default_path, required=False)
     if default is None:
         raise SystemExit(f"Required config file doesn't exist: {default_path}")
     return default_path, {
-        k: v for k, v in default.items() if isinstance(v, dict) or k == "M_BOUNDS"
+        "DEFAULT_FALLBACK": True,
+        **{k: v for k, v in default.items() if k == "M_BOUNDS"},
     }
 
 

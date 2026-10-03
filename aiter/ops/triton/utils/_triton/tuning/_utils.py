@@ -7,7 +7,7 @@ import json
 import os
 
 FINAL_STATUSES = ("ok", "error", "crashed", "hung")
-TOP_BUCKET_M = 4096  # --all-buckets sweeps the family's M_LEQ buckets up to here
+TOP_BUCKET_M = 8192  # --all-buckets sweeps the family's M_LEQ buckets up to here
 
 
 def cdiv(a, b):

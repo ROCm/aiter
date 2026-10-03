@@ -31,8 +31,8 @@ per M -> validate and install the config file.
     python3 sweep_configs.py gemm_afp4wfp4_preshuffle --all-buckets --N 7168 --K 16384 --gpu 0 1 2 3
     python3 verify_configs.py gemm_afp4wfp4_preshuffle --M 64 --N 7168 --K 16384
 
-`--M` sweeps the listed M values; `--all-buckets` sweeps every M bucket of the family up to 4096
-(`TOP_BUCKET_M` in `_utils.py`); `any` is left as installed either way. Batched kernels take `--B`. `K` is the logical K, as the input generators take
+`--M` sweeps the listed M values; `--all-buckets` sweeps every M bucket of the family up to 8192
+(`TOP_BUCKET_M` in `_utils.py`); `any` is never swept. Batched kernels take `--B`. `K` is the logical K, as the input generators take
 it (for fp4 families that is twice the byte width).
 
 `--gpu` takes one or more GPUs. With several, the candidates of each M are dealt round-robin to
@@ -105,13 +105,14 @@ killed, `--setup-timeout` the time allowed before a worker is ready.
 ## Install
 
 When every M is done the driver writes `<CONFIG>-[B=..-]N=..-K=..json` into
-`configs/<arch>/<backend>/gemm/<family>/`, the directory the loader reads. The file is seeded with
-what the loader serves today, in its own lookup order: the installed file for that shape, for
-batched shapes the N/K file, else `DEFAULT.json`, so no bucket loses its tuning; the M bounds are
-the kernel's explicit bounds, else the seed file's `M_BOUNDS`, else the standard list. Each swept M
-replaces its `M_LEQ_<smallest family bound >= M>` bucket with the fastest `ok` record, the
-installed baseline included; when several swept Ms share a bucket the largest M wins. `any` is never
-modified and an M above the largest bound is not written. Every swept M is then re-read
+`configs/<arch>/<backend>/gemm/<family>/`, the directory the loader reads. An existing file for
+that shape is updated in place; a new file holds only the tuned buckets plus
+`"DEFAULT_FALLBACK": true` (and `DEFAULT.json`'s `M_BOUNDS`, if any), and the loader serves every
+bucket it lacks from `DEFAULT.json`. The M bounds are the kernel's explicit bounds, else the file's
+`M_BOUNDS`, else the standard list. Each swept M replaces its `M_LEQ_<smallest family bound >= M>`
+bucket with the fastest `ok` record, the installed baseline included; when several swept Ms share a
+bucket the largest M wins. Ms above the largest bound (8192) are not tuned. Every installed file
+ships an `any`: a copy of its highest `M_LEQ` bucket. `DEFAULT.json` is never written. Every swept M is then re-read
 through `get_gemm_config` and must come back `is_tuned`; if not, the previous file is put back and
 the command fails.
 Config reads are cached per process, so restart Python to pick up a new file.

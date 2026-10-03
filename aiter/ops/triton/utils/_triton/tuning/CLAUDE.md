@@ -33,12 +33,15 @@ here. Update this file in the same change as any behaviour change.
    gluon (gfx1250 a8w8 blockscale `num_stages` is `NUM_BUFFERS`).
 4. Results always install into `resolve_config_dir(op, config_name, backend)`. No export directory,
    no dry run.
-5. The installed file is seeded with what the loader serves today, in the loader's lookup order
-   (this shape's file, for batched shapes the N/K file, else `DEFAULT.json`), and keeps every
-   bucket it does not replace. Bounds: the kernel's explicit `bounds`, else the seed file's
-   `M_BOUNDS`, else `STANDARD_M_BOUNDS`, because the loader reads `M_BOUNDS` from the file it picks.
-   `--all-buckets` only chooses the M list (the family's buckets up to `TOP_BUCKET_M`, 4096); it
-   never touches `any` either. `any` is never modified; `M_GEQ_*` is never generated;
+5. The installed file is seeded with this shape's file if it exists (keeping every bucket it does
+   not replace), else it starts with only `"DEFAULT_FALLBACK": true` and `DEFAULT.json`'s
+   `M_BOUNDS`: never copy untuned buckets (another shape's or `DEFAULT.json`'s) into a shape file.
+   The loader serves the buckets a `DEFAULT_FALLBACK` file lacks from `DEFAULT.json`. Bounds: the
+   kernel's explicit `bounds`, else the seed's `M_BOUNDS`, else `STANDARD_M_BOUNDS`.
+   `--all-buckets` only chooses the M list (the family's buckets up to `TOP_BUCKET_M`, 8192). Ms
+   above the largest bound are not tuned. Every installed file ships an `any`: a copy of its
+   highest `M_LEQ` bucket, rewritten on every install. `DEFAULT.json` is never written, so its
+   `any` never changes; `M_GEQ_*` is never generated;
    `kpack` is dropped outside gfx942 and `persistent` always. After writing, clear both loader
    caches and re-resolve every swept M; `is_tuned` must be True, otherwise the previous file is
    restored. Bucket collisions are resolved before writing (largest M wins).
@@ -107,6 +110,7 @@ Add it to `SEARCH_SPACE`; add an alias if a family spells it differently. Nothin
 
 - Bring back rocprof, positional config tuples, per-key CLI flags, or the old block-size group
   exclusion heuristic.
-- Put an arch prefix on an installed file, write to the current directory, or touch `any`.
+- Put an arch prefix on an installed file, write to the current directory, write `DEFAULT.json`,
+  or copy untuned buckets into a shape file.
 - Add tuned values to Python; `SEARCH_SPACE` is a search space, not a tuned value.
 - Run two drivers on one GPU.

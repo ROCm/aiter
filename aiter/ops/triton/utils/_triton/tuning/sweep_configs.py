@@ -12,8 +12,8 @@ Per M:   plan            harness.py --plan: load defaults, generate combinations
          summarize
 Then:    install         write_best_configs.py: select winners, merge buckets, validate, write
 
---all-buckets sweeps every M bucket of the family up to TOP_BUCKET_M (4096); "any" is left as
-installed. The driver never imports torch or aiter: every step is a subprocess that sees
+--all-buckets sweeps every M bucket of the family up to TOP_BUCKET_M (8192); the installer
+sets "any" to a copy of the highest tuned bucket. The driver never imports torch or aiter: every step is a subprocess that sees
 HIP_VISIBLE_DEVICES=<gpu>. It resumes from the records in --runs-dir.
 """
 
@@ -148,7 +148,7 @@ def plan(spec, shape, backend, gpu, runs_dir, timeout):
 
 
 def all_bucket_ms(spec, args, gpu):
-    """Every bucket of the family up to TOP_BUCKET_M; "any" stays as installed."""
+    """Every bucket of the family up to TOP_BUCKET_M; the installer copies the highest into "any"."""
     first = plan(
         spec,
         shape_from_args(args, spec.dims, 1),

@@ -18,9 +18,9 @@ import math
 from _utils import cdiv, next_pow2
 
 SEARCH_SPACE = {
-    "BLOCK_SIZE_M": [8, 16, 32, 64, 128, 256, 512],
-    "BLOCK_SIZE_N": [8, 16, 32, 64, 128, 256, 512, 1024],
-    "BLOCK_SIZE_K": [8, 16, 32, 64, 128, 256, 512, 1024],
+    "BLOCK_SIZE_M": [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096],
+    "BLOCK_SIZE_N": [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096],
+    "BLOCK_SIZE_K": [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096],
     "GROUP_SIZE_M": [1, 4, 8, 16],
     "num_warps": [1, 2, 4, 8],
     "num_stages": [1, 2],

@@ -4,9 +4,10 @@
 
 Flow:  load_winners    fastest ok record per M; the installed baseline competes too
        assign_buckets  M -> M_LEQ_<smallest family bound >= M>; the largest M wins a shared bucket;
-                       "any" is never written
-       build_table     seeded with what the loader serves today (this shape's file, for batched
-                       shapes the N/K file, else DEFAULT.json)
+                       an M above the largest bound is not written
+       build_table     seeded with this shape's file if it exists, else a new file marked
+                       DEFAULT_FALLBACK (the loader serves its missing buckets from DEFAULT.json);
+                       "any" copies the highest M_LEQ bucket; DEFAULT.json is never written
        write, confirm  write the file, re-resolve every assigned M through the real loader, and
                        put the previous file back if the loader disagrees
 
@@ -92,7 +93,7 @@ def assign_buckets(winners, bounds):
         bucket = bucket_for(M, bounds)
         if bucket is None:
             print(
-                f"  M={M}: above the largest bound {bounds[-1]}, not written ('any' is never modified)"
+                f"  M={M}: above the largest bound {bounds[-1]}, not written ('any' copies the highest bucket)"
             )
             continue
         if bucket in assignments:
@@ -131,7 +132,7 @@ def ordered(table):
     """M_BOUNDS, M_LEQ ascending, M_GEQ descending, any, rest: the order get_gemm_config walks."""
 
     def rank(key):
-        if key == "M_BOUNDS":
+        if key in ("DEFAULT_FALLBACK", "M_BOUNDS"):
             return (0, 0)
         if key.startswith("M_LEQ_"):
             return (1, int(key[6:]))
@@ -154,15 +155,22 @@ def install(spec, backend, shape_nk, runs_dir):
     if not winners:
         sys.exit(f"no results for {spec.name} {backend} {shape_nk} in {runs_dir}")
 
-    seed_path, seed = seed_table(
-        spec, backend, shape_nk
-    )  # what the loader serves today
+    seed_path, seed = seed_table(spec, backend, shape_nk)
     print(f"seeding from {seed_path}")
     # the loader walks the kernel's explicit bounds, else the M_BOUNDS of the file it picks
     bounds = spec.bounds or seed.get("M_BOUNDS") or gemm_config_utils.STANDARD_M_BOUNDS
     keys, _, _ = load_defaults(spec, backend)
     assignments = assign_buckets(winners, bounds)
+    if not assignments:
+        sys.exit(
+            f"no swept M is within the bounds (largest {bounds[-1]}); nothing installed"
+        )
     table = build_table(seed, assignments, arch, keys)
+    # every file ships an "any": a copy of its highest tuned M_LEQ bucket
+    highest = max(
+        (k for k in table if k.startswith("M_LEQ_")), key=lambda k: int(k[6:])
+    )
+    table["any"] = dict(table[highest])
     for bucket, winner in sorted(assignments.items(), key=lambda kv: kv[1].M):
         gain = ""
         if winner.baseline is not None:
