@@ -135,11 +135,9 @@ def run_torch(a, w, dtype):
     return torch.mm(a.to(dtypes.fp32), w.t().to(dtypes.fp32)).to(dtype)
 
 
-def _atol_rtol(k, split_k, k_waves, dtype):
-    k_scale = (k / 8192) ** 0.5 * split_k * k_waves
-    if dtype is dtypes.bf16:
-        return 2e-1 * k_scale, 2e-1
-    return 5e-2 * k_scale, 5e-2
+# Split-K partials are reduced in fp32 and rounded once, so the output is within
+# a rounding step of the fp32 reference for any split_k.
+ATOL, RTOL = 3e-2, 3e-2
 
 
 @benchmark()
@@ -183,7 +181,6 @@ def test_hgemm(m, n, k, dtype, policy, split_k):
     nbytes = (
         m * k * a.element_size() + n * k * w.element_size() + m * n * out.element_size()
     )
-    atol, rtol = _atol_rtol(k, split_k, tile["k_waves"], dtype)
     ret = {
         "gfx": get_gfx(),
         "tile": (
@@ -198,8 +195,8 @@ def test_hgemm(m, n, k, dtype, policy, split_k):
         err = checkAllclose(
             ref.to(dtypes.fp32),
             y.to(dtypes.fp32),
-            rtol=rtol,
-            atol=atol,
+            rtol=RTOL,
+            atol=ATOL,
             msg=f"{name}: flydsl hgemm",
         )
         ret[f"{name} us"] = us

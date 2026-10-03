@@ -190,8 +190,16 @@ def test_gemm_a16w16_config(
 ):
     x, w, _ = generate_inputs(m, n, k, dtype)
     ref = run_torch(x, w, dtype=otype)
-    parent = torch.full((m + block_m, n + block_n), SENTINEL, dtype=otype)
-    y = parent[:m, :n]
+    if get_gfx() == "gfx950":
+        # The gfx950 kernel needs a contiguous C, so guard it with a sentinel tail
+        # instead of the padded rows and columns of a strided view.
+        parent = torch.full((m * n + block_m * block_n,), SENTINEL, dtype=otype)
+        y = parent[: m * n].view(m, n)
+        outside = parent[m * n :]
+    else:
+        parent = torch.full((m + block_m, n + block_n), SENTINEL, dtype=otype)
+        y = parent[:m, :n]
+        outside = torch.cat((parent[m:].flatten(), parent[:m, n:].flatten()))
     cfg = {
         "out": y,
         "out_dtype": otype,
@@ -206,7 +214,8 @@ def test_gemm_a16w16_config(
         "group_m": 0,
         "policy": "ht" if unroll else "ft",
     }
-    assert flydsl_hgemm(x, w, **cfg) is y
+    out = flydsl_hgemm(x, w, **cfg)
+    assert out.data_ptr() == y.data_ptr() and out.shape == y.shape
     candidates = {
         "flydsl": lambda: flydsl_hgemm(x, w, **cfg),
         "triton": lambda: triton_gemm_a16w16(x, w, dtype=otype),
@@ -221,9 +230,7 @@ def test_gemm_a16w16_config(
         ref.element_size(),
         "gemm a16w16 config",
     )
-    assert torch.all(parent[m:] == SENTINEL) and torch.all(
-        parent[:, n:] == SENTINEL
-    ), "flydsl wrote outside the [m, n] output view"
+    assert torch.all(outside == SENTINEL), "flydsl wrote outside the [m, n] output view"
     return ret
 
 

@@ -9,6 +9,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
 
 from aiter.utility.graph_alloc import persistent_alloc
@@ -26,7 +27,9 @@ from .gemm_a16w16_gfx950_utils import (
     transposed_contiguous_idx,
     wait_vmcnt_and_barrier,
 )
+from . import communication_ops_utils as comm_ops
 from .kernels_common import run_cached
+from .splitk_epilogue import CPOL_COHERENT, pairwise_sum
 
 GEMM_A16W16_DTYPE_FP32 = 1
 GEMM_A16W16_DTYPE_BF16 = 2
@@ -42,6 +45,9 @@ class GemmA16W16Gfx950Param:
     block_k: fx.Constexpr[int]
     stages: fx.Constexpr[int]
     is_split_k: fx.Constexpr[bool]
+    split_k: fx.Constexpr[int]
+    splitk_workspace: fx.Constexpr[bool]
+    splitk_ws_planes: fx.Constexpr[int]
     m_waves: fx.Constexpr[int]
     n_waves: fx.Constexpr[int]
     k_waves: fx.Constexpr[int]
@@ -57,6 +63,7 @@ class GemmA16W16Gfx950Param:
     async_load_bytes: fx.Constexpr[int]
     in_data_bytes: fx.Constexpr[int]
     out_data_bytes: fx.Constexpr[int]
+    c_data_bytes: fx.Constexpr[int]
     cshuffle_r2g_vec_size: fx.Constexpr[int]
     ldg_x_threads: fx.Constexpr[int]
     block_threads: fx.Constexpr[int]
@@ -105,6 +112,7 @@ def make_gemm_a16w16_gfx950_param(
     a_is_transposed: bool = False,
     b_is_transposed: bool = True,
     has_bias: bool = False,
+    splitk_workspace: bool = True,
     mma_m: int = 16,
     mma_n: int = 16,
     mma_k: int = 32,
@@ -129,7 +137,8 @@ def make_gemm_a16w16_gfx950_param(
         raise ValueError("the workgroup cannot contain more than 16 waves")
     if group_m < 0:
         raise ValueError("group_m must be non-negative")
-    in_dbytes = 2  # Shared C remains in the 16-bit input dtype.
+    in_dbytes = 2
+    splitk_workspace = split_k > 1 and splitk_workspace
     out_dbytes = 4 if out_dtype_id == GEMM_A16W16_DTYPE_FP32 else 2
     block_threads = m_waves * n_waves * k_waves * GFX950_WAVE_SIZE
     max_cshuffle_r2g_vec_size = 16 // out_dbytes
@@ -160,14 +169,29 @@ def make_gemm_a16w16_gfx950_param(
             else max_cshuffle_r2g_vec_size
         )
         assert block_n % cshuffle_r2g_vec_size == 0
-    smem_bytes = stages * (block_m + block_n) * block_k * in_dbytes
-    smem_bytes = max(smem_bytes, k_waves * block_m * block_n * in_dbytes)
     arch = get_rocm_arch()
     SMEM_CAPACITY_MAP = {
         "gfx942": 65536,
         "gfx950": 163840,
     }
     smem_capacity = SMEM_CAPACITY_MAP[arch]
+    # Shared C is 16-bit, except for fp32 output or a split-K fp32 workspace: there
+    # it stays fp32 if it fits, so the result is not rounded to 16 bits on the way.
+    c_dbytes = (
+        4
+        if (splitk_workspace or out_dtype_id == GEMM_A16W16_DTYPE_FP32)
+        and k_waves * block_m * block_n * 4 + 16 <= smem_capacity
+        else 2
+    )
+    if splitk_workspace and c_dbytes == 2 and use_half_tile_interleaved:
+        splitk_workspace = False  # the half-tile kernel has no direct-store path
+    # Without room for fp32 shared C, each k-slice stores its partial straight from
+    # the accumulators into its own workspace plane.
+    splitk_ws_planes = (
+        split_k * (k_waves if c_dbytes == 2 else 1) if splitk_workspace else 0
+    )
+    smem_bytes = stages * (block_m + block_n) * block_k * in_dbytes
+    smem_bytes = max(smem_bytes, k_waves * block_m * block_n * c_dbytes + 16)
     if smem_bytes > smem_capacity:
         raise ValueError(
             "staged LDS buffers exceed the device shared-memory capacity: "
@@ -269,6 +293,9 @@ def make_gemm_a16w16_gfx950_param(
         block_k=block_k,
         stages=stages,
         is_split_k=split_k > 1,
+        split_k=split_k,
+        splitk_workspace=splitk_workspace,
+        splitk_ws_planes=splitk_ws_planes,
         m_waves=m_waves,
         n_waves=n_waves,
         k_waves=k_waves,
@@ -280,6 +307,7 @@ def make_gemm_a16w16_gfx950_param(
         async_load_bytes=GFX950_DMA_BYTES,
         in_data_bytes=in_dbytes,
         out_data_bytes=out_dbytes,
+        c_data_bytes=c_dbytes,
         cshuffle_r2g_vec_size=cshuffle_r2g_vec_size,
         ldg_x_threads=ldg_x_threads,
         block_threads=block_threads,
@@ -295,7 +323,10 @@ def make_gemm_a16w16_gfx950_kernel_name(param: GemmA16W16Gfx950Param):
     dtype_str = "fp16" if param.in_dtype_id == GEMM_A16W16_DTYPE_FP16 else "bf16"
     out_suffix = "_fp32" if param.out_dtype_id == GEMM_A16W16_DTYPE_FP32 else ""
     name = f"hgemm_{dtype_str}{out_suffix}_t{param.block_m}x{param.block_n}x{param.block_k}x{param.stages}"
-    name += "_ksd" if param.is_split_k else "_ks1"
+    if param.splitk_workspace:
+        name += f"_ksw{param.split_k}"
+    else:
+        name += "_ksd" if param.is_split_k else "_ks1"
     name += f"_w{param.m_waves}x{param.n_waves}x{param.k_waves}"
     name += f"_gm{param.group_m}"
     name += f"_bias{int(param.has_bias)}"
@@ -477,6 +508,124 @@ def write_cshuffle_vec_to_global(
         fx.ptr_store(c_vec, fx.get_iter(out) + global_offset)
 
 
+@flyc.jit
+def store_splitk_partial(ws_buf, ws_offset, c_vec):
+    """Store a vector of this split's fp32 partial, written through to memory."""
+    vec_size = c_vec.numel
+    c_vec_f32 = c_vec.to(fx.Float32)
+    store_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(CPOL_COHERENT), fx.Float32)
+    chunk_layout = fx.make_layout(4, 1)
+    chunk_frag = fx.make_rmem_tensor(chunk_layout, fx.Float32)
+    for chunk_idx in range_constexpr(vec_size // 4):
+        chunk_frag.store(
+            fx.Vector.from_elements(
+                [
+                    c_vec_f32[chunk_idx * 4],
+                    c_vec_f32[chunk_idx * 4 + 1],
+                    c_vec_f32[chunk_idx * 4 + 2],
+                    c_vec_f32[chunk_idx * 4 + 3],
+                ],
+                fx.Float32,
+            )
+        )
+        chunk_dst = fx.make_view(
+            fx.get_iter(ws_buf) + ws_offset + chunk_idx * 4, chunk_layout
+        )
+        fx.copy_atom_call(store_atom, chunk_frag, chunk_dst)
+
+
+@flyc.jit
+def store_splitk_partial_scalar(ws_buf, ws_offset, value):
+    """Store one fp32 partial element, written through to memory."""
+    store_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(CPOL_COHERENT), fx.Float32)
+    scalar_layout = fx.make_layout(1, 1)
+    scalar_frag = fx.make_rmem_tensor(scalar_layout, fx.Float32)
+    scalar_frag.store(fx.Vector.from_elements([value], fx.Float32))
+    fx.copy_atom_call(
+        store_atom,
+        scalar_frag,
+        fx.make_view(fx.get_iter(ws_buf) + ws_offset, scalar_layout),
+    )
+
+
+@flyc.jit
+def splitk_workspace_reduce(
+    out,
+    ws_buf,
+    bias_buf,
+    semaphore,
+    flag_ptr,
+    tid,
+    tile_idx,
+    block_m_offset,
+    block_n_offset,
+    m,
+    n,
+    block_m,
+    block_n,
+    block_threads,
+    split_k,
+    num_planes,
+    has_bias,
+    out_dtype,
+):
+    """Last arriving split sums the fp32 partials in a fixed order and stores once.
+
+    Like hipBLASLt's Stream-K / GSU fix-up and ``splitk_epilogue``: no atomics on C,
+    one rounding to the output dtype, the same result on every run. The partials
+    were stored with ``CPOL_COHERENT``; waiting on them is the release.
+    """
+    rocdl.s_waitcnt(0)
+    gpu.barrier()
+    sem_addr = fx.Int64(fx.ptrtoint(fx.get_iter(semaphore))) + fx.Int64(
+        tile_idx
+    ) * fx.Int64(4)
+    if tid == fx.Int32(0):
+        arrival = fx.Int32(comm_ops.atomic_add_agent(sem_addr, fx.Int32(1)))
+        is_last = (arrival == fx.Int32(split_k - 1)).select(fx.Int32(1), fx.Int32(0))
+        fx.ptr_store(Vec.from_elements([is_last], fx.Int32), flag_ptr)
+    gpu.barrier()
+
+    is_last = Vec(fx.make_view(flag_ptr, fx.make_layout(1, 1)).load())[0]
+    if is_last != fx.Int32(0):
+        load_atom = fx.make_copy_atom(
+            fx.rocdl.BufferCopy128b(CPOL_COHERENT), fx.Float32
+        )
+        vec_layout = fx.make_layout(4, 1)
+        if const_expr(has_bias):
+            bias_vecs = fx.logical_divide(bias_buf, vec_layout)
+        plane = m * n
+        x_threads = block_n // 4
+        vectors = block_m * block_n // 4
+        for i in range_constexpr((vectors + block_threads - 1) // block_threads):
+            vector_idx = block_threads * i + tid
+            if vector_idx < vectors:
+                global_row = block_m_offset + vector_idx // x_threads
+                global_col = block_n_offset + vector_idx % x_threads * 4
+                if (global_row < m) and (global_col < n):
+                    offset = global_row * n + global_col
+                    parts = []
+                    for s in range_constexpr(num_planes):
+                        part = fx.make_rmem_tensor(vec_layout, fx.Float32)
+                        fx.copy_atom_call(
+                            load_atom,
+                            fx.make_view(
+                                fx.get_iter(ws_buf) + s * plane + offset, vec_layout
+                            ),
+                            part,
+                        )
+                        parts.append(Vec(part.load()))
+                    acc = pairwise_sum(parts)
+                    if const_expr(has_bias):
+                        acc = acc + bias_vecs[None, global_col // 4].load().to(
+                            fx.Float32
+                        )
+                    fx.ptr_store(acc.to(out_dtype), fx.get_iter(out) + offset)
+        if tid == fx.Int32(0):
+            # Undo this tile's arrivals with the same atomic, as splitk_epilogue does.
+            comm_ops.atomic_add_agent(sem_addr, fx.Int32(-split_k))
+
+
 @flyc.kernel
 def gemm_a16w16_gfx950_kernel(
     out: fx.Tensor,
@@ -485,6 +634,7 @@ def gemm_a16w16_gfx950_kernel(
     bias: fx.Tensor,
     semaphore: fx.Tensor,
     signal: fx.Tensor,
+    workspace: fx.Tensor,
     m: fx.Int32,
     n: fx.Int32,
     k: fx.Int32,
@@ -517,6 +667,7 @@ def gemm_a16w16_gfx950_kernel(
         if const_expr(param.out_dtype_id == GEMM_A16W16_DTYPE_FP32)
         else elem_dtype
     )
+    c_smem_dtype = fx.Float32 if const_expr(param.c_data_bytes == 4) else elem_dtype
     if const_expr(is_split_k):
         splitk_protocol = SplitKProtocol(
             block_m,
@@ -550,19 +701,27 @@ def gemm_a16w16_gfx950_kernel(
         a: fx.Array[elem_dtype, stages * block_m * block_k, 16]
         b: fx.Array[elem_dtype, stages * block_n * block_k, 16]
 
+    @fx.struct
+    class SharedCStorage:
+        c: fx.Array[c_smem_dtype, k_waves * block_m * block_n, 16]
+        split_flag: fx.Array[fx.Int32, 1, 4]
+
     @fx.union
     class SharedStorage:
         ab: SharedABStorage
-        c: fx.Array[elem_dtype, k_waves * block_m * block_n, 16]
+        c: SharedCStorage
 
     storage = fx.SharedAllocator().allocate(SharedStorage)
     smem_a = storage.ab.a.peek().ptr
     smem_b = storage.ab.b.peek().ptr
-    smem_c = storage.c.peek().ptr
+    smem_c = storage.c.c.peek().ptr
+    split_flag_ptr = storage.c.split_flag.peek().ptr
 
     a_buf = fx.rocdl.make_buffer_tensor(a, max_size=True)
     b_buf = fx.rocdl.make_buffer_tensor(b, max_size=True)
     out_buf = fx.rocdl.make_buffer_tensor(out, max_size=True)
+    if const_expr(param.splitk_workspace):
+        ws_buf = fx.rocdl.make_buffer_tensor(workspace, max_size=True)
     if const_expr(param.has_bias):
         bias_buf = fx.rocdl.make_buffer_tensor(bias, max_size=True)
     else:
@@ -635,7 +794,8 @@ def gemm_a16w16_gfx950_kernel(
 
     if const_expr(is_split_k):
         frag_C.fill(0.0)
-        splitk_protocol.zero_c()
+        if const_expr(not param.splitk_workspace):
+            splitk_protocol.zero_c()
     elif const_expr(param.has_bias):
         for i in range_constexpr(fx.size(frag_C.shape).unpack()):
             col_idx = fx.get_scalar(thr_mma_cCol[i])
@@ -745,57 +905,113 @@ def gemm_a16w16_gfx950_kernel(
         compute_stage(current_stage, main_loop_end + s)
         current_stage = (current_stage + 1) % stages
 
-    frag_C_out = fx.make_fragment_like(frag_C, elem_dtype)
-    frag_C_out.store(frag_C.load().to(elem_dtype))
-
-    gpu.barrier()
-    for i in range_constexpr(fx.size(frag_C_out.shape).unpack()):
-        row = fx.get_scalar(thr_mma_cRow[i])
-        col = fx.get_scalar(thr_mma_cCol[i])
-        sC_write[row, col] = frag_C_out[i]
-
-    if const_expr(is_split_k):
-        splitk_protocol.wait_until_initialized()
-    else:
-        gpu.barrier()
-
-    cshuffle_r2g_x_threads = block_n // cshuffle_r2g_vec_size
-    cshuffle_vectors = block_m * block_n // cshuffle_r2g_vec_size
-    cshuffle_iters = (cshuffle_vectors + block_threads - 1) // block_threads
-    for i in range_constexpr(cshuffle_iters):
-        vector_idx = block_threads * i + tid
-        if vector_idx < cshuffle_vectors:
-            local_row = vector_idx // cshuffle_r2g_x_threads
-            local_col = vector_idx % cshuffle_r2g_x_threads * cshuffle_r2g_vec_size
-            global_row = block_m_offset + local_row
-            global_col = block_n_offset + local_col
+    if const_expr(param.splitk_workspace and param.c_data_bytes != 4):
+        # fp32 shared C does not fit: store each k-slice's partial straight from the
+        # accumulators into its own workspace plane, so nothing is rounded early.
+        plane_offset = (ks_idx * k_waves + k_wave_idx) * m * n
+        for i in range_constexpr(fx.size(frag_C.shape).unpack()):
+            global_row = block_m_offset + fx.get_scalar(thr_mma_cRow[i])
+            global_col = block_n_offset + fx.get_scalar(thr_mma_cCol[i])
             if (global_row < m) and (global_col < n):
-                c_vec = fx.ptr_load(
-                    smem_c + local_row * block_n + local_col,
-                    result_type=fx.Vector.make_type(cshuffle_r2g_vec_size, elem_dtype),
+                store_splitk_partial_scalar(
+                    ws_buf, plane_offset + global_row * n + global_col, frag_C[i]
                 )
-                for k_slice in range_constexpr(1, k_waves):
-                    peer_c_vec = fx.ptr_load(
-                        smem_c
-                        + k_slice * block_m * block_n
-                        + local_row * block_n
-                        + local_col,
-                        result_type=fx.Vector.make_type(
-                            cshuffle_r2g_vec_size, elem_dtype
-                        ),
+        splitk_workspace_reduce(
+            out,
+            ws_buf,
+            bias_buf,
+            semaphore,
+            split_flag_ptr,
+            tid,
+            fx.block_idx.x,
+            block_m_offset,
+            block_n_offset,
+            m,
+            n,
+            block_m,
+            block_n,
+            block_threads,
+            param.split_k,
+            param.splitk_ws_planes,
+            param.has_bias,
+            global_output_dtype,
+        )
+    else:
+        frag_C_out = fx.make_fragment_like(frag_C, c_smem_dtype)
+        frag_C_out.store(frag_C.load().to(c_smem_dtype))
+
+        gpu.barrier()
+        for i in range_constexpr(fx.size(frag_C_out.shape).unpack()):
+            row = fx.get_scalar(thr_mma_cRow[i])
+            col = fx.get_scalar(thr_mma_cCol[i])
+            sC_write[row, col] = frag_C_out[i]
+
+        if const_expr(is_split_k and not param.splitk_workspace):
+            splitk_protocol.wait_until_initialized()
+        else:
+            gpu.barrier()
+
+        cshuffle_r2g_x_threads = block_n // cshuffle_r2g_vec_size
+        cshuffle_vectors = block_m * block_n // cshuffle_r2g_vec_size
+        cshuffle_iters = (cshuffle_vectors + block_threads - 1) // block_threads
+        for i in range_constexpr(cshuffle_iters):
+            vector_idx = block_threads * i + tid
+            if vector_idx < cshuffle_vectors:
+                local_row = vector_idx // cshuffle_r2g_x_threads
+                local_col = vector_idx % cshuffle_r2g_x_threads * cshuffle_r2g_vec_size
+                global_row = block_m_offset + local_row
+                global_col = block_n_offset + local_col
+                if (global_row < m) and (global_col < n):
+                    c_vec = fx.ptr_load(
+                        smem_c + local_row * block_n + local_col,
+                        result_type=fx.Vector.make_type(cshuffle_r2g_vec_size, c_smem_dtype),
                     )
-                    c_vec = c_vec + peer_c_vec
-                global_offset = global_row * n + global_col
-                write_cshuffle_vec_to_global(
-                    out,
-                    out_buf,
-                    global_offset,
-                    c_vec,
-                    is_split_k,
-                    param.out_dtype_id == GEMM_A16W16_DTYPE_FP32,
-                )
-    if const_expr(is_split_k):
-        splitk_protocol.finish_split(split_k)
+                    for k_slice in range_constexpr(1, k_waves):
+                        peer_c_vec = fx.ptr_load(
+                            smem_c
+                            + k_slice * block_m * block_n
+                            + local_row * block_n
+                            + local_col,
+                            result_type=fx.Vector.make_type(
+                                cshuffle_r2g_vec_size, c_smem_dtype
+                            ),
+                        )
+                        c_vec = c_vec + peer_c_vec
+                    global_offset = global_row * n + global_col
+                    if const_expr(param.splitk_workspace):
+                        store_splitk_partial(ws_buf, ks_idx * m * n + global_offset, c_vec)
+                    else:
+                        write_cshuffle_vec_to_global(
+                            out,
+                            out_buf,
+                            global_offset,
+                            c_vec,
+                            is_split_k,
+                            param.out_dtype_id == GEMM_A16W16_DTYPE_FP32,
+                        )
+        if const_expr(param.splitk_workspace):
+            splitk_workspace_reduce(
+                out,
+                ws_buf,
+                bias_buf,
+                semaphore,
+                split_flag_ptr,
+                tid,
+                fx.block_idx.x,
+                block_m_offset,
+                block_n_offset,
+                m,
+                n,
+                block_m,
+                block_n,
+                block_threads,
+                param.split_k,
+                param.splitk_ws_planes,
+                param.has_bias,
+                global_output_dtype,
+            )
+        elif const_expr(is_split_k):
+            splitk_protocol.finish_split(split_k)
 
 
 @flyc.kernel
@@ -806,6 +1022,7 @@ def gemm_a16w16_hti_gfx950_kernel(
     bias: fx.Tensor,
     semaphore: fx.Tensor,
     signal: fx.Tensor,
+    workspace: fx.Tensor,
     m: fx.Int32,
     n: fx.Int32,
     k: fx.Int32,
@@ -838,6 +1055,7 @@ def gemm_a16w16_hti_gfx950_kernel(
         if const_expr(param.out_dtype_id == GEMM_A16W16_DTYPE_FP32)
         else elem_dtype
     )
+    c_smem_dtype = fx.Float32 if const_expr(param.c_data_bytes == 4) else elem_dtype
     if const_expr(is_split_k):
         splitk_protocol = SplitKProtocol(
             block_m,
@@ -869,19 +1087,27 @@ def gemm_a16w16_hti_gfx950_kernel(
         a: fx.Array[elem_dtype, stages * block_m * block_k, 16]
         b: fx.Array[elem_dtype, stages * block_n * block_k, 16]
 
+    @fx.struct
+    class SharedCStorage:
+        c: fx.Array[c_smem_dtype, block_m * block_n, 16]
+        split_flag: fx.Array[fx.Int32, 1, 4]
+
     @fx.union
     class SharedStorage:
         ab: SharedABStorage
-        c: fx.Array[elem_dtype, block_m * block_n, 16]
+        c: SharedCStorage
 
     storage = fx.SharedAllocator().allocate(SharedStorage)
     smem_a = storage.ab.a.peek().ptr
     smem_b = storage.ab.b.peek().ptr
-    smem_c = storage.c.peek().ptr
+    smem_c = storage.c.c.peek().ptr
+    split_flag_ptr = storage.c.split_flag.peek().ptr
 
     a_buf = fx.rocdl.make_buffer_tensor(a, max_size=True)
     b_buf = fx.rocdl.make_buffer_tensor(b, max_size=True)
     out_buf = fx.rocdl.make_buffer_tensor(out, max_size=True)
+    if const_expr(param.splitk_workspace):
+        ws_buf = fx.rocdl.make_buffer_tensor(workspace, max_size=True)
     if const_expr(param.has_bias):
         bias_buf = fx.rocdl.make_buffer_tensor(bias, max_size=True)
     else:
@@ -1029,8 +1255,8 @@ def gemm_a16w16_hti_gfx950_kernel(
 
     def store_half_tile_to_lds(m_part, n_part, frag_C):
         sC = fx.make_view(half_c_base(m_part, n_part), c_lds_layout)
-        frag_C_out = fx.make_fragment_like(frag_C, elem_dtype)
-        frag_C_out.store(frag_C.load().to(elem_dtype))
+        frag_C_out = fx.make_fragment_like(frag_C, c_smem_dtype)
+        frag_C_out.store(frag_C.load().to(c_smem_dtype))
 
         for i in range_constexpr(fx.size(frag_C_out.shape).unpack()):
             row = fx.get_scalar(thr_mma_cRow[i])
@@ -1053,18 +1279,23 @@ def gemm_a16w16_hti_gfx950_kernel(
                     c_vec = fx.ptr_load(
                         sC_base + local_row * half_block_n + local_col,
                         result_type=fx.Vector.make_type(
-                            cshuffle_r2g_vec_size, elem_dtype
+                            cshuffle_r2g_vec_size, c_smem_dtype
                         ),
                     )
                     global_offset = global_row * n + global_col
-                    write_cshuffle_vec_to_global(
-                        out,
-                        out_buf,
-                        global_offset,
-                        c_vec,
-                        is_split_k,
-                        param.out_dtype_id == GEMM_A16W16_DTYPE_FP32,
-                    )
+                    if const_expr(param.splitk_workspace):
+                        store_splitk_partial(
+                            ws_buf, ks_idx * m * n + global_offset, c_vec
+                        )
+                    else:
+                        write_cshuffle_vec_to_global(
+                            out,
+                            out_buf,
+                            global_offset,
+                            c_vec,
+                            is_split_k,
+                            param.out_dtype_id == GEMM_A16W16_DTYPE_FP32,
+                        )
 
     c00 = make_c_fragment(0, 0)
     c01 = make_c_fragment(0, 1)
@@ -1076,7 +1307,8 @@ def gemm_a16w16_hti_gfx950_kernel(
         c01.fill(0.0)
         c10.fill(0.0)
         c11.fill(0.0)
-        splitk_protocol.zero_c()
+        if const_expr(not param.splitk_workspace):
+            splitk_protocol.zero_c()
     elif const_expr(param.has_bias):
         for i in range_constexpr(fx.size(c00.shape).unpack()):
             col_idx = fx.get_scalar(thr_mma_cCol[i])
@@ -1206,13 +1438,42 @@ def gemm_a16w16_hti_gfx950_kernel(
         rocdl.s_barrier()
         store_half_tile_to_lds(1, 0, c10)
         store_half_tile_to_lds(1, 1, c11)
-        splitk_protocol.wait_until_initialized()
+        if const_expr(param.splitk_workspace):
+            gpu.barrier()
+        else:
+            splitk_protocol.wait_until_initialized()
         store_half_tile_to_global(0, 0)
         store_half_tile_to_global(0, 1)
         store_half_tile_to_global(1, 0)
         store_half_tile_to_global(1, 1)
-        splitk_protocol.finish_split(split_k)
+        if const_expr(param.splitk_workspace):
+            splitk_workspace_reduce(
+                out,
+                ws_buf,
+                bias_buf,
+                semaphore,
+                split_flag_ptr,
+                tid,
+                fx.block_idx.x,
+                block_m_offset,
+                block_n_offset,
+                m,
+                n,
+                block_m,
+                block_n,
+                block_threads,
+                param.split_k,
+                param.splitk_ws_planes,
+                param.has_bias,
+                global_output_dtype,
+            )
+        else:
+            splitk_protocol.finish_split(split_k)
     else:
+        # Waves in the second M half ran one extra barrier before the main loop;
+        # even the count before the half tiles are handed through LDS.
+        if wid // n_waves == 0:
+            rocdl.s_barrier()
         wait_vmcnt_and_barrier(0)
         store_half_tile_to_global(0, 0)
         store_half_tile_to_global(0, 1)
@@ -1232,6 +1493,7 @@ def gemm_a16w16_gfx950(
     bias: fx.Tensor,
     semaphore: fx.Tensor,
     signal: fx.Tensor,
+    workspace: fx.Tensor,
     split_k: fx.Int32,
     param: GemmA16W16Gfx950Param,
     stream: fx.Stream = fx.Stream(None),  # noqa: B008
@@ -1288,6 +1550,7 @@ def gemm_a16w16_gfx950(
         bias,
         semaphore,
         signal,
+        workspace,
         m,
         n,
         k,
@@ -1530,6 +1793,8 @@ def gemm_a16w16(
     )
     kwargs["has_bias"] = bias is not None
     split_k = kwargs["split_k"]
+    if split_k > 1 and split_k * kwargs["k_waves"] * m * n * 4 >= 2**31:
+        kwargs["splitk_workspace"] = False  # past the 32-bit buffer offset range
     assert_no_k_tail(k, kwargs)
 
     if bias is not None:
@@ -1543,6 +1808,13 @@ def gemm_a16w16(
     b_arg = _dynamic_tensor_arg(b, 0 if b_is_transposed else 1)
     out_arg = _dynamic_tensor_arg(out, 1)
     bias_arg = a_arg if bias is None else _dynamic_tensor_arg(bias, 0)
+    if param.splitk_workspace:
+        with torch.cuda.stream(stream):
+            workspace = torch.empty(
+                param.splitk_ws_planes * m * n, dtype=torch.float32, device=device
+            )
+    else:
+        workspace = semaphore
     dispatch_args = (
         out_arg,
         a_arg,
@@ -1550,6 +1822,7 @@ def gemm_a16w16(
         bias_arg,
         semaphore,
         signal,
+        _dynamic_tensor_arg(workspace, 0),
         split_k,
         param,
         stream,
