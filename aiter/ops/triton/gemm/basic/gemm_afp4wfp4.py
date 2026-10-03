@@ -570,11 +570,10 @@ def gemm_afp4wfp4_preshuffle(
 
     if use_gluon:
         from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_mxfp4 import (
-            cluster_shape,
-            get_gemm_afp4wfp4_preshuffle_layouts,
+            gemm_mxfp4_preshuffle_gfx1250 as _gluon_gemm_mxfp4_preshuffle_gfx1250,
         )
         from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_mxfp4 import (
-            gemm_mxfp4_preshuffle_gfx1250 as _gluon_gemm_mxfp4_preshuffle_gfx1250,
+            get_gemm_afp4wfp4_preshuffle_layouts,
         )
 
         grid = lambda META: (
@@ -592,22 +591,11 @@ def gemm_afp4wfp4_preshuffle(
         k_tiles = triton.cdiv(K_bytes, BLOCK_K_BYTES)
         config["NUM_BUFFERS"] = min(config["NUM_BUFFERS"], k_tiles)
 
-        num_ctas = config["num_ctas"]
-        ctas_m, _ = cluster_shape(
-            num_ctas, config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"]
-        )
-        # The kernel takes a CTA's A scales as preshuffled iff it has 32+ rows.
-        assert M < 32 or config["BLOCK_SIZE_M"] // ctas_m >= 32, (
-            f"for M >= 32, each CTA needs 32 or more rows of BLOCK_SIZE_M="
-            f"{config['BLOCK_SIZE_M']}, which num_ctas={num_ctas} splits {ctas_m} ways"
-        )
-
         layouts = get_gemm_afp4wfp4_preshuffle_layouts(
             config["num_warps"],
             config["BLOCK_SIZE_M"],
             config["BLOCK_SIZE_N"],
             config["BLOCK_SIZE_K"],
-            num_ctas,
         )
 
         _gluon_gemm_mxfp4_preshuffle_gfx1250[grid](
