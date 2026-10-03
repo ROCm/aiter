@@ -720,9 +720,9 @@ def _vllm_pool_skip():
         pytest.skip("the packed fp8_dsv4_mla cache is a gfx950 gluon path")
 
 
-# One shape per program kind: decode with split-K (16 heads), 32-head programs, and
-# prefill on 64-head programs.
-@pytest.mark.parametrize("T, H", [(6, 16), (192, 32), (2100, 64)])
+# One shape per program kind: decode with split-K (16 heads, and 8 heads in a 16-head
+# program), 32-head programs, and prefill on 64-head programs.
+@pytest.mark.parametrize("T, H", [(6, 16), (37, 8), (192, 32), (2100, 64)])
 @pytest.mark.parametrize("sentinels", ["some", "lead"])
 def test_pa_decode_sparse_two_loop_vllm_pool(T, H, sentinels):
     """DSv4.1 vLLM-pool shapes: page-pitched SWA and top-k pools, ragged lengths on
