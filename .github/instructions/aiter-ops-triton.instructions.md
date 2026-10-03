@@ -357,3 +357,7 @@ Flag:
 - Coding rules in `aiter/ops/triton/CLAUDE.md`. It only has a short note and
   the imports. Rules go in an `AGENTS.md` file or in a README.
 - A new `AGENTS.md` file without an import in `aiter/ops/triton/CLAUDE.md`.
+
+Architecture guards for inputs on a non-current device use the shared
+`arch_info.get_arch(refresh=True)` inside the framework's input-device context.
+The default call retains the cached target; the refresh path stays torch-free.

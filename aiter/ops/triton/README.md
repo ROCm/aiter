@@ -198,3 +198,7 @@ pytest op_tests/triton_tests/              # all tests
 pytest op_tests/triton_tests/gemm/basic/   # one folder
 python op_tests/op_benchmarks/triton/bench_gemm_a16w16.py
 ```
+
+Architecture guards for inputs on a non-current device use the shared
+`arch_info.get_arch(refresh=True)` inside the framework's input-device context.
+The default call retains the cached target; the refresh path stays torch-free.
