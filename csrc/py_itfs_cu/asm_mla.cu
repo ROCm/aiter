@@ -14,8 +14,33 @@ namespace mla_dsl {
 #include <cstdio>
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>
 
 AITER_CTYPES_ERROR_DEF
+
+// gfx950 MLA .co files that address KV with 32-bit offsets; they read the wrong
+// KV rows when kv_buffer spans more than 0xFFFFFFF0 bytes.
+static const std::unordered_set<std::string> kGfx950MlaKv32BitCo = {
+    "mla/MLA_A16W16_1TG_4W_16mx4_32nx1_Coex0_Msk1_QH16.co",
+    "mla/MLA_A16W16_1TG_4W_64mx1_16nx1_Coex0_Msk1_QH16.co",
+    "mla/mla_a16w16_qh16_m16x4_n16x1_coex0_mask1.co",
+    "mla/mla_a16w16_qh16_m16x4_n16x1_coex0_mask1_lse_ps.co",
+    "mla/mla_a16w16_qh16_m16x4_n16x1_coex0_mask1_ps.co",
+    "mla/mla_a16w16_qh16_m32x4_n16x1_coex0_mask1.co",
+    "mla/mla_a16w16_qh8_qseqlen1_gqaratio8_v3.co",
+    "mla/mla_a16w16_qh8_qseqlen2_gqaratio8.co",
+    "mla/mla_a16w16_qh8_qseqlen2_gqaratio8_causal.co",
+    "mla/mla_a16w8_qh16_m16x4_n16x1_coex0_mask1_ps.co",
+    "mla/mla_a8w8_qh128_m32x4_n16x2_msk0.co",
+    "mla/mla_a8w8_qh128_m32x4_n16x2_msk1.co",
+    "mla/mla_a8w8_qh16_qseqlen2_gqaratio16.co",
+    "mla/mla_a8w8_qh16_qseqlen2_gqaratio16_ps.co",
+    "mla/mla_a8w8_qh32_qseqlen1_gqaratio32_lse_ps.co",
+    "mla/mla_a8w8_qh32_qseqlen1_gqaratio32_ps.co",
+    "mla/mla_a8w8_qh8_qseqlen1_gqaratio8_v3.co",
+    "mla/mla_dec_stage1_bf16_a16w16_subQ128_mqa128.co",
+    "mla/mla_dec_stage1_bf16_a16w16_subQ16_mqa16.co",
+};
 
 // Debug instrumentation (host prints + post-launch sync/error checks + raw
 // buffer dumps) for the gfx1250 gfx1250 MLA dispatch is compiled ONLY when
@@ -876,6 +901,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     int config_max_seqlen_q = max_seqlen_q;
     int config_gqa_ratio = gqa_ratio;
     int sub_Q = 128; // default value
+    const uint64_t kv_bytes = static_cast<uint64_t>(KV->size(0)) * KV->stride(0) * KV->element_size();
     
     if(gqa_ratio == 128){
         config_max_seqlen_q = 0;
@@ -1011,6 +1037,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     } else if (arch_id == "gfx950" && q_type == "fp8" && kv_type == "fp8" && persistent
         && ((gqa_ratio == 16 && (max_seqlen_q == 3 || max_seqlen_q == 4))
             || (gqa_ratio == 32 && (max_seqlen_q == 2 || max_seqlen_q == 3))
+            || (gqa_ratio == 32 && max_seqlen_q == 1 && kv_bytes > 0xFFFFFFF0ull)
             || (gqa_ratio == 64 && max_seqlen_q == 1))){
         config_max_seqlen_q = 4;
         config_gqa_ratio = 16;
@@ -1035,6 +1062,10 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         const auto& cfg     = it->second;
         const char* name    = cfg.knl_name.c_str();
         const char* co_name = cfg.co_name.c_str();
+
+        AITER_CHECK(arch_id != "gfx950" || kv_bytes <= 0xFFFFFFF0ull || !kGfx950MlaKv32BitCo.count(cfg.co_name),
+                    __func__, ": ", co_name, " uses 32-bit KV offsets but kv_buffer spans ", kv_bytes,
+                    " bytes (max 4294967280)");
 
         impl_ptr =
             &impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name, co_name); });

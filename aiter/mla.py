@@ -391,7 +391,15 @@ def _fold_seqlen_indptr(indptr, fold_factor):
     return out
 
 
-def _use_persistent_mla_decode(bs, nhead, max_seqlen_q, q_dtype, kv_dtype):
+# Max kv_buffer bytes for kernels that address KV with 32-bit offsets.
+_MLA_KV_32BIT_SPAN = (1 << 32) - 16
+
+
+def _kv_span_bytes(kv_buffer):
+    return kv_buffer.size(0) * kv_buffer.stride(0) * kv_buffer.element_size()
+
+
+def _use_persistent_mla_decode(bs, nhead, max_seqlen_q, q_dtype, kv_dtype, kv_bytes=0):
     """Whether to keep the persistent MLA decode kernel.
 
     True keeps the caller's persistent request; False falls back to the
@@ -408,12 +416,86 @@ def _use_persistent_mla_decode(bs, nhead, max_seqlen_q, q_dtype, kv_dtype):
     if not is_regression_profile:
         return True
 
+    # The non-persistent fallback addresses KV with 32-bit offsets.
+    if kv_bytes > _MLA_KV_32BIT_SPAN:
+        return True
+
     max_batch = _persistent_mla_decode_max_batch()
 
     # max_batch <= 0 disables the gate (always keep persistent).
     if max_batch <= 0:
         return True
     return bs < max_batch
+
+
+def _nps_needs_persistent(nhead, nhead_kv, max_seqlen_q, q_dtype, kv_dtype, kv_bytes):
+    """Whether a gfx950 non-persistent decode past the 32-bit KV span should run on
+    the persistent asm kernels, which use 64-bit KV addresses for these shapes.
+    Single-token only, where the causal mask is a no-op."""
+    if get_gfx() != "gfx950" or kv_bytes <= _MLA_KV_32BIT_SPAN:
+        return False
+    if is_experimental_enabled():  # HK also uses 32-bit KV offsets
+        return False
+    if max_seqlen_q != 1 or nhead_kv != 1:
+        return False
+    if q_dtype == dtypes.bf16 and kv_dtype == dtypes.bf16:
+        return nhead in (16, 32, 128)
+    if q_dtype == dtypes.fp8 and kv_dtype == dtypes.fp8:
+        return nhead == 128
+    return False
+
+
+def _persistent_schedule(
+    qo_indptr,
+    kv_indptr,
+    kv_last_page_lens,
+    nhead,
+    nhead_kv,
+    max_seqlen_q,
+    q_dtype,
+    kv_dtype,
+    page_size,
+    causal,
+):
+    """Returns (work_meta_data, work_indptr, work_info_set, reduce_indptr,
+    reduce_final_map, reduce_partial_map)."""
+    bs = qo_indptr.shape[0] - 1
+    info = aiter.get_mla_metadata_info_v1(
+        bs, max_seqlen_q, nhead, q_dtype, kv_dtype, is_sparse=False, fast_mode=True
+    )
+    bufs = [
+        torch.empty(size, dtype=dtype, device=qo_indptr.device) for size, dtype in info
+    ]
+    (
+        work_meta_data,
+        work_indptr,
+        work_info_set,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+    ) = bufs
+    aiter.get_mla_metadata_v1(
+        qo_indptr,
+        kv_indptr,
+        kv_last_page_lens,
+        nhead // nhead_kv,
+        nhead_kv,
+        causal,
+        work_meta_data,
+        work_info_set,
+        work_indptr,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+        page_size=page_size,
+        kv_granularity=max(page_size, 16),
+        max_seqlen_qo=max_seqlen_q,
+        uni_seqlen_qo=max_seqlen_q,
+        fast_mode=True,
+        dtype_q=q_dtype,
+        dtype_kv=kv_dtype,
+    )
+    return bufs
 
 
 def mla_decode_fwd_ds32(
@@ -574,8 +656,44 @@ def mla_decode_fwd(
     # return wrong results, so never downgrade them.
     if persistent_mode and num_kv_splits is None:
         persistent_mode = _use_persistent_mla_decode(
-            bs, nhead, max_seqlen_q, q.dtype, kv_buffer.dtype
+            bs, nhead, max_seqlen_q, q.dtype, kv_buffer.dtype, _kv_span_bytes(kv_buffer)
         )
+    elif (
+        not persistent_mode
+        and num_kv_splits is None
+        and num_kv_splits_indptr is None
+        and not return_logits
+        and not intra_batch_mode
+        and cp_world_size == 1
+        and _nps_needs_persistent(
+            nhead,
+            nhead_kv,
+            max_seqlen_q,
+            q.dtype,
+            kv_buffer.dtype,
+            _kv_span_bytes(kv_buffer),
+        )
+    ):
+        (
+            work_meta_data,
+            work_indptr,
+            work_info_set,
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map,
+        ) = _persistent_schedule(
+            qo_indptr,
+            kv_indptr,
+            kv_last_page_lens,
+            nhead,
+            nhead_kv,
+            max_seqlen_q,
+            q.dtype,
+            kv_buffer.dtype,
+            page_size,
+            causal,
+        )
+        persistent_mode = True
 
     io_transformed = False
     qseqlen_folded = False
