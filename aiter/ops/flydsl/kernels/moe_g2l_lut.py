@@ -42,14 +42,15 @@ def build_moe_g2l_lut_module(
     """JIT launcher: single-block build of the EP global->local expert LUT."""
     wave_size = get_warp_size()
     if (
-        max_experts <= 0
+        max_experts < wave_size
         or max_experts > MAX_G2L_EXPERTS
         or max_experts & (max_experts - 1)
         or max_experts > wave_size * wave_size
     ):
         raise ValueError(
-            f"max_experts must be a power of two <= "
-            f"min({MAX_G2L_EXPERTS}, wave_size**2), got {max_experts}"
+            f"max_experts must be a power of two in "
+            f"[{wave_size}, min({MAX_G2L_EXPERTS}, wave_size**2)], "
+            f"got {max_experts}"
         )
     num_waves = max_experts // wave_size
 
