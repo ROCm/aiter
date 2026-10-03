@@ -1,0 +1,11 @@
+{"X_TAG": "baseline"}
+{"X_TAG": "compute_only", "X_ABL_LOAD": true, "X_ABL_STORE": 2}
+{"X_TAG": "no_store", "X_ABL_STORE": 2}
+{"X_TAG": "stage_no_global_store", "X_ABL_STORE": 1}
+{"X_TAG": "load_only", "X_ABL_MMA": true, "X_ABL_STORE": 2}
+{"X_TAG": "store_only", "X_ABL_MMA": true, "X_ABL_LOAD": true}
+{"X_TAG": "skeleton", "X_ABL_MMA": true, "X_ABL_LOAD": true, "X_ABL_STORE": 2}
+{"X_TAG": "epi_wait_exact", "X_EPI_WAIT": 2, "X_EPI_N": 4}
+{"X_TAG": "store_mode1", "STORE_MODE": 1}
+{"X_TAG": "bk128_sm1", "BLOCK_SIZE_K": 128, "NUM_BUFFERS": 2, "STORE_MODE": 1}
+{"X_TAG": "bk128_sm1_compute_only", "BLOCK_SIZE_K": 128, "NUM_BUFFERS": 2, "STORE_MODE": 1, "X_ABL_LOAD": true, "X_ABL_STORE": 2}

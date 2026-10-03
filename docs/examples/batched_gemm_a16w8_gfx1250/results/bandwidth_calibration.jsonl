@@ -1,0 +1,16 @@
+{"gpu": 0, "name": "AMD Radeon Graphics", "cus": 256, "gcn": "gfx1250"}
+{"gpu": 0, "test": "zero_201MB", "us": 423.19, "TBps": 0.476}
+{"gpu": 0, "test": "copy_130MB", "us": 560.28, "TBps": 0.487}
+{"gpu": 0, "test": "sustain_zero", "launches": 23600, "us_per": 425.47}
+{"gpu": 1, "name": "AMD Radeon Graphics", "cus": 256, "gcn": "gfx1250"}
+{"gpu": 1, "test": "zero_201MB", "us": 561.94, "TBps": 0.358}
+{"gpu": 1, "test": "copy_130MB", "us": 671.21, "TBps": 0.406}
+{"gpu": 1, "test": "sustain_zero", "launches": 17800, "us_per": 566.31}
+{"gpu": 2, "name": "AMD Radeon Graphics", "cus": 256, "gcn": "gfx1250"}
+{"gpu": 2, "test": "zero_201MB", "us": 448.56, "TBps": 0.449}
+{"gpu": 2, "test": "copy_130MB", "us": 563.45, "TBps": 0.484}
+{"gpu": 2, "test": "sustain_zero", "launches": 22200, "us_per": 451.7}
+{"gpu": 3, "name": "AMD Radeon Graphics", "cus": 256, "gcn": "gfx1250"}
+{"gpu": 3, "test": "zero_201MB", "us": 486.07, "TBps": 0.414}
+{"gpu": 3, "test": "copy_130MB", "us": 608.18, "TBps": 0.448}
+{"gpu": 3, "test": "sustain_zero", "launches": 20600, "us_per": 488.8}

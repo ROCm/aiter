@@ -1,0 +1,4 @@
+{"gpu": 1, "kind": "bf16", "iters": 12, "grid": 256, "num_warps": 4, "us": 360.12, "TFLOPs": 71.56, "wmma_per_wave": 1536, "static_wmma_instrs_in_asm": 128, "n_regs": 522, "n_spills": 0}
+{"gpu": 1, "kind": "bf16", "iters": 120, "grid": 256, "num_warps": 4, "us": 2756.28, "TFLOPs": 93.49, "wmma_per_wave": 15360, "static_wmma_instrs_in_asm": 128, "n_regs": 522, "n_spills": 0}
+{"gpu": 1, "kind": "fp8", "iters": 12, "grid": 256, "num_warps": 4, "us": 230.57, "TFLOPs": 223.53, "wmma_per_wave": 1536, "static_wmma_instrs_in_asm": 128, "n_regs": 522, "n_spills": 0}
+{"gpu": 1, "kind": "fp8", "iters": 120, "grid": 256, "num_warps": 4, "us": 1444.13, "TFLOPs": 356.89, "wmma_per_wave": 15360, "static_wmma_instrs_in_asm": 128, "n_regs": 522, "n_spills": 0}

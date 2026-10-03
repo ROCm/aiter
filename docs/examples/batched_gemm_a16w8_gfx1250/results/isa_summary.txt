@@ -1,0 +1,88 @@
+# Compiled ISA summary: _batched_gemm_a16w8_gfx1250_persistent_kernel
+# tuned config for (B=128, M=1536, N=512, K=128): BM=256 BN=256 BK=64 num_warps=4 NUM_BUFFERS=3 WG_PER_CU=1 STORE_MODE=2
+
+## Resources
+; NumVgprs: 808
+; Occupancy: 1
+.sgpr_count:     88
+.vgpr_count:     808
+.vgpr_spill_count: 0
+LDS (from compiled metadata): 305096 bytes per workgroup
+
+## Opcode histogram (whole kernel, top 30)
+    508 v_dual_mov_b32
+    395 s_set_vgpr_msb
+    256 v_pk_mul_f32
+    256 v_cvt_pk_bf16_f32
+    128 v_wmma_f32_16x16x32_bf16
+    121 s_wait_alu
+     65 s_sub_co_i32
+     64 ds_store_b128
+     44 s_add_co_i32
+     40 v_add_nc_u32_e32
+     39 s_lshl_b32
+     39 s_cselect_b32
+     39 s_ashr_i32
+     37 s_mov_b32
+     32 v_cvt_scale_pk8_bf16_fp8
+     32 s_and_b32
+     32 ds_load_b128
+     30 s_mul_i32
+     28 s_or_b32
+     26 s_add_nc_u64
+     25 s_lshr_b32
+     21 s_max_i32
+     21 s_cmp_ge_u32
+     19 s_xor_b32
+     19 s_wait_dscnt
+     17 s_mul_u64
+     16 ds_load_2addr_b64
+     14 s_mul_hi_u32
+     12 s_abs_i32
+     11 s_lshr_b64
+
+## Control flow and wait points (line numbers in the full dump)
+317:	tensor_load_to_lds s[52:55], s[36:43]
+345:	s_wait_tensorcnt 0xa
+346:	tensor_load_to_lds s[56:59], s[44:51]
+494:	s_wait_tensorcnt 0xa
+495:	tensor_load_to_lds s[20:23], s[36:43]
+524:	s_wait_tensorcnt 0xa
+525:	tensor_load_to_lds s[20:23], s[44:51]
+528:	s_cbranch_scc1 .LBB0_5
+885:	s_branch .LBB0_3
+886:.LBB0_2:                                ;   in Loop: Header=BB0_3 Depth=1
+890:	s_cbranch_scc0 .LBB0_5
+891:.LBB0_3:                                ; =>This Inner Loop Header: Depth=1
+894:	s_barrier_signal -1
+948:	s_barrier_wait -1
+1110:	s_wait_tensorcnt 0xa
+1111:	tensor_load_to_lds s[60:63], s[36:43]
+1166:	s_wait_tensorcnt 0xa
+1167:	tensor_load_to_lds s[60:63], s[44:51]
+1173:	s_wait_tensorcnt 0x4
+1174:	s_barrier_signal -1
+1189:	s_barrier_wait -1
+1532:	s_cbranch_scc1 .LBB0_2
+1535:	s_wait_tensorcnt 0x0
+1536:	s_barrier_signal -1
+1584:	s_barrier_wait -1
+3318:	s_barrier_signal -1
+3321:	s_barrier_wait -1
+3322:	tensor_store_from_lds s[28:31], s[20:27]
+3324:	s_branch .LBB0_2
+3325:.LBB0_5:                                ; %._crit_edge
+3327:	s_wait_tensorcnt 0x0
+3328:	s_barrier_signal -1
+3329:	s_barrier_wait -1
+3331:	s_endpgm
+
+## Epilogue entry: waits for ALL outstanding TDM ops, incl. next tile's prefetched loads
+	s_set_vgpr_msb 0x5a00                   ;  msbs: dst=0 src0=0 src1=0 src2=0
+	.loc	1 169 9 is_stmt 1               ; batched_gemm_a16w8.py:169:9
+	s_cbranch_scc1 .LBB0_2
+; %bb.4:                                ;   in Loop: Header=BB0_3 Depth=1
+	.loc	1 174 17                        ; batched_gemm_a16w8.py:174:17
+	s_wait_tensorcnt 0x0
+	s_barrier_signal -1
+	.loc	1 171 20                        ; batched_gemm_a16w8.py:171:20

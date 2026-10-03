@@ -1,0 +1,5 @@
+{"X_TAG": "mla_baseline"}
+{"X_TAG": "mla_compute_only", "X_ABL_LOAD": true, "X_ABL_STORE": 2}
+{"X_TAG": "mla_no_store", "X_ABL_STORE": 2}
+{"X_TAG": "mla_epi_wait_exact", "X_EPI_WAIT": 2, "X_EPI_N": 4}
+{"X_TAG": "mla_bk128_sm1", "BLOCK_SIZE_K": 128, "NUM_BUFFERS": 2, "STORE_MODE": 1}

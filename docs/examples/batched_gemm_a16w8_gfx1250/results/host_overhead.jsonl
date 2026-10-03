@@ -1,0 +1,2 @@
+{"gpu": 0, "wrapper_total": 82.12, "get_gemm_config": 0.55, "build_layouts": 45.38, "get_num_sms": 0.02, "jit_launch_prebuilt_layouts": 22.46, "compiled_kernel_launch": 8.14, "gpu_kernel_graph_us": 653.45}
+{"gpu": 1, "wrapper_total": 85.73, "get_gemm_config": 0.54, "build_layouts": 45.53, "get_num_sms": 0.02, "jit_launch_prebuilt_layouts": 26.27, "compiled_kernel_launch": 12.04, "gpu_kernel_graph_us": 851.89}

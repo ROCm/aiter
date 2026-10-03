@@ -1,0 +1,33 @@
+# Machine state captured 2026-10-03 17:55:11 UTC (read-only queries)
+
+## Device
+MARKET_NAME: AMD Radeon Graphics
+NUM_COMPUTE_UNITS: 256
+TARGET_GRAPHICS_VERSION: gfx1250
+NAME: AMD MI450X_GENERIC
+MAX_BANDWIDTH: 23347 GB/s
+
+## Kernel log: throttle onset and frequency
+boot: 2026-10-01 18:53:31 UTC
+[ 6464.773844] amdgpu 0001:01:00.0: WARN: GPU is throttled, expect performance decrease. VR.
+[ 6467.851188] amdgpu 0002:01:00.0: WARN: GPU is throttled, expect performance decrease. VR.
+total 'GPU is throttled' messages so far: 11021
+latest:
+[169242.185585] amdgpu 0002:01:00.0: WARN: GPU is throttled, expect performance decrease. .
+[169245.821987] amdgpu 0003:01:00.0: WARN: GPU is throttled, expect performance decrease. .
+[169252.665043] amdgpu 0001:01:00.0: WARN: GPU is throttled, expect performance decrease. .
+[169279.256612] amdgpu 0004:01:00.0: WARN: GPU is throttled, expect performance decrease. .
+
+## pp_dpm_sclk (current level marked *) per card
+/sys/class/drm/card1/device/pp_dpm_sclk: S: 66Mhz * 1: 500Mhz  2: 2400Mhz  
+/sys/class/drm/card17/device/pp_dpm_sclk: S: 60Mhz * 1: 500Mhz  2: 2400Mhz  
+/sys/class/drm/card25/device/pp_dpm_sclk: S: 58Mhz * 1: 500Mhz  2: 2400Mhz  
+/sys/class/drm/card9/device/pp_dpm_sclk: S: 61Mhz * 1: 500Mhz  2: 2400Mhz  
+
+## Perf level
+      4 auto
+
+## Sample taken during a sustained write load on GPU 0 (this session)
+GFX_ACTIVITY 100 %, GFX clocks 53-69 MHz (max 2400), FCLK_0 111 MHz, SOCKET_POWER 750 W,
+HOTSPOT 56 C, PERF_LEVEL AUTO, no active PROCHOT/PPT/thermal violation flags.
+Shader clock measured in-kernel (clock64 vs wall_clock64): see shader_clock.jsonl (65 MHz).

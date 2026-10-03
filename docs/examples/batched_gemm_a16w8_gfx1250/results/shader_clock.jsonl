@@ -1,0 +1,3 @@
+{"gpu": 0, "raw": "grid=1 block=32 iters=200000 cycles=4400603 wall_ticks=6768343 wall_khz=100000 attr_clk_khz=2400000 event_ms=67.873 shader_MHz_by_wallclock=65.0"}
+{"gpu": 0, "raw": "grid=1 block=32 iters=2000000 cycles=44000513 wall_ticks=67682839 wall_khz=100000 attr_clk_khz=2400000 event_ms=677.930 shader_MHz_by_wallclock=65.0"}
+{"gpu": 0, "raw": "grid=1024 block=128 iters=2000000 cycles=9891923 wall_ticks=68744226 wall_khz=100000 attr_clk_khz=2400000 event_ms=741.635 shader_MHz_by_wallclock=14.4"}
