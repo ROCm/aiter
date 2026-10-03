@@ -572,6 +572,8 @@ def gemm_afp4wfp4_preshuffle(
         from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_mxfp4 import (
             cluster_shape,
             get_gemm_afp4wfp4_preshuffle_layouts,
+        )
+        from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_mxfp4 import (
             gemm_mxfp4_preshuffle_gfx1250 as _gluon_gemm_mxfp4_preshuffle_gfx1250,
         )
 
