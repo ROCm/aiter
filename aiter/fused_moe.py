@@ -684,7 +684,8 @@ def get_topk_valid_mask(
 def stage2_uses_route_reduce(stage2: Callable) -> bool:
     """Return True when stage2 writes per-slot route output then reduces it."""
     func = getattr(stage2, "func", stage2)
-    kernel_name = getattr(stage2, "keywords", {}).get("kernelName", "")
+    kw = getattr(stage2, "keywords", {}) or {}
+    kernel_name = kw.get("kernelName") or kw.get("kernelName2", "")
     if func is _flydsl_stage2_wrapper or getattr(func, "_is_flydsl_stage2", False):
         parsed = _get_flydsl_moe_kernels().get_flydsl_kernel_params(kernel_name)
         if parsed is None:
@@ -701,7 +702,27 @@ def stage2_uses_route_reduce(stage2: Callable) -> bool:
     if func is _flydsl_v2_stage2_wrapper:
         cfg = parse_flydsl_v2_gemm2_kernel(kernel_name)
         return cfg is not None and cfg.get("epilog") == "reduce"
+    if func is _mxfp4_a4w4_stage2_fw:
+        parsed = parse_g2_kname_any(kernel_name)
+        return parsed is not None and not parsed.get("atomic", True)
     return False
+
+
+def _rewrite_flydsl_force_reduce(kernel_name: str) -> str:
+    """Rewrite a FlyDSL stage2 kernel name to its reduce-epilogue sibling.
+
+    When AITER_FLYDSL_FORCE_REDUCE=1 is requested, configuration resolution
+    rewrites atomic Stage-2 kernel names to their reduction-epilogue sibling.
+    Native MXMOE omits the '_atomic' token entirely in reduction mode, while
+    standard and modern V2 FlyDSL replace '_atomic' with '_reduce'.
+    Non-FlyDSL kernels (e.g. CK-Tile, Opus) and kernels already using reduce
+    are returned unchanged.
+    """
+    if not isinstance(kernel_name, str) or not kernel_name.startswith("flydsl_"):
+        return kernel_name
+    if kernel_name.startswith("flydsl_mxmoe_g2_"):
+        return re.sub(r"_atomic(?=(_|$))", "", kernel_name, count=1)
+    return re.sub(r"_atomic(?=(_|$))", "_reduce", kernel_name, count=1)
 
 
 # Lru cache will using hash to create key, which makes error when w1,w2 shape is symint.
@@ -3449,6 +3470,9 @@ def get_2stage_cfgs(
     ):
         kernelName2 = kernelName2.replace("_afp4_", "_afp8_", 1)
 
+    if os.environ.get("AITER_FLYDSL_FORCE_REDUCE", "0") == "1":
+        kernelName2 = _rewrite_flydsl_force_reduce(kernelName2)
+
     tag = f"({kernelName1=}, {kernelName2=})"
     logger.info(
         f"[fused_moe] using {'1stage' if run_1stage else '2stage'}{' xbf16' if run_1stage_xbf16 else ''} {'default' if cfg is None else tag} for {keys} "
@@ -3839,6 +3863,9 @@ def get_2stage_cfgs(
         if _a_type == "fp8":
             kn1 = f"{kn1}_gui"
             _base_kn1 = f"{_base_kn1}_gui"
+        if os.environ.get("AITER_FLYDSL_FORCE_REDUCE", "0") == "1":
+            kn2 = _rewrite_flydsl_force_reduce(kn2)
+            _base_kn2 = _rewrite_flydsl_force_reduce(_base_kn2)
         if get_flydsl_kernel_params(kn1) is None:
             kn1 = _base_kn1
         if get_flydsl_kernel_params(kn2) is None:
