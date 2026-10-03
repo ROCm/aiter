@@ -7677,6 +7677,11 @@ inline bool topk_oneblock_reg_launch(int ept, int batch_size, hipStream_t stream
 //  - Up to 80 * 1024 columns (five batches of its scan) the LDS tail first
 //    runs its sampled stage (lds_tail_sampled_stage); any miss falls back to
 //    the full-row form.
+// From three elements per lane up to the sampled-stage LDS tail's last column
+// a launch is made at every row count.
+constexpr int64_t kTopkPlainGfx950AnyRowsMinLen = 2 * 1024 + 1;
+constexpr int64_t kTopkPlainGfx950AnyRowsMaxLen = 80 * 1024;
+
 template <typename T, typename IdxT, bool WRITE_TOPK_VALUES>
 inline bool dispatch_topk_plain_gfx950(T const* in, int batch_size, int64_t len, IdxT k, T* out,
                                        IdxT* out_idx, bool select_min, hipStream_t stream)
@@ -7705,7 +7710,7 @@ inline bool dispatch_topk_plain_gfx950(T const* in, int batch_size, int64_t len,
             <<<batch_size, 1024, 0, stream>>>(in, len, k, out, out_idx, select_min);
         return true;
     }
-    if(len <= 80 * 1024)
+    if(len <= kTopkPlainGfx950AnyRowsMaxLen)
     {
         radix_topk_one_block_lds_tail_kernel<T, IdxT, 1024, WRITE_TOPK_VALUES, false, 270, 0, 0u,
                                              0u, false, false, false, false, false, false, true>
@@ -7719,6 +7724,20 @@ inline bool dispatch_topk_plain_gfx950(T const* in, int batch_size, int64_t len,
         return true;
     }
     return false;
+}
+
+// Whether dispatch_topk_oneblock<float, int, 1024, WRITE_TOPK_VALUES, Prefill>
+// serves this call from dispatch_topk_plain_gfx950 whatever the row count:
+// its `specialized` conditions plus a row length inside the any-rows range.
+// Measured with all 256 CUs of an MI355X only, so smaller parts and
+// partitions answer false.
+inline bool topk_oneblock_plain_gfx950_serves(int64_t len, int k, bool ranged,
+                                              bool write_values, bool select_min)
+{
+    return !ranged && !write_values && !select_min && k == 2048 &&
+           len >= kTopkPlainGfx950AnyRowsMinLen && len <= kTopkPlainGfx950AnyRowsMaxLen &&
+           topk_oneblock_num_cu() >= 256 && topk_oneblock_use_large_bpp() &&
+           topk_oneblock_is_gfx950();
 }
 
 // Thin wrapper dispatching to the correct BPP at runtime.
@@ -7839,6 +7858,20 @@ inline bool should_use_mulblocks(int batch_size, int64_t seq_len)
     return batch_size * 8 <= active_blocks_total();
 }
 
+// plain's choice (radix_topk_dispatch).  The thresholds above were measured
+// against the generic one-block kernel; a row that plain's gfx950 one-block
+// kernels serve at any row count (ob::topk_oneblock_plain_gfx950_serves) must
+// outgrow them before plain goes multi-block.  At one and two rows of 65536 to
+// 65538 columns the sampled-stage LDS tail ran 10.7-11.2us against 25.6-26.4us
+// for the multi-block kernel (MI355X, randn, method B).  The overrides above
+// still win.
+inline bool plain_should_use_mulblocks(int batch_size, int64_t seq_len, bool tuned_oneblock)
+{
+    if(tuned_oneblock && !std::getenv("TOPK_FORCE_PATH") && !std::getenv("TOPK_DISPATCH_FACTOR"))
+        return false;
+    return should_use_mulblocks(batch_size, seq_len);
+}
+
 enum class Phase
 {
     Prefill,
@@ -7954,8 +7987,10 @@ void radix_topk_dispatch(void* buf,
                          hipStream_t stream)
 {
     const bool select_min = !greater;
+    const bool tuned_oneblock = aiter::ob::topk_oneblock_plain_gfx950_serves(
+        len, k, rowStarts != nullptr || rowEnds != nullptr, out != nullptr, select_min);
 
-    if (aiter::should_use_mulblocks(batch_size, len)) {
+    if (aiter::plain_should_use_mulblocks(batch_size, len, tuned_oneblock)) {
         if (out) {
             aiter::mb::standalone_stable_radix_topk<float, int, true, true,
                 aiter::mb::Phase::Prefill>(

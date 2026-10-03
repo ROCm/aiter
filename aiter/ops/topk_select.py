@@ -202,8 +202,13 @@ _PLAIN_K2048_MAX_WIDTH = 131071
 # measured 0.96x--1.50x of `sampled` on those cells, so they keep the work door.
 # The exception is plain's own dispatch: from 65536 columns it hands at most
 # two rows to its multi-block kernel (`should_use_mulblocks`), 1.7x--2.8x
-# slower than `sampled` through the few-row band, ragged or not, so `sampled`
-# takes those.
+# slower than `sampled` through the few-row band, so `sampled` takes those --
+# but on gfx950 only ragged rows, or rows past the few-row band's width. A
+# uniform row its one-block kernels serve at any row count stays one-block
+# (`plain_should_use_mulblocks`), and there plain is the fastest backend: at
+# one and two rows of 65536..65538 columns 10.7-11.2us against 16.2-17.3us for
+# `sampled` and 25.6-26.4us for the multi-block kernel. See
+# `_plain_k2048_multiblock`.
 #
 # Past the few-row band plain declines and decode took those rows, which
 # `sampled` serves 1.47x--2.56x faster on every measured cell of 1..128 rows
@@ -214,6 +219,8 @@ _PLAIN_K2048_MAX_WIDTH = 131071
 # seed 0 at 106496 columns, which the other 15 seeds ran in 15-18us.
 _PLAIN_K2048_MULTIBLOCK_ROWS = 2
 _PLAIN_K2048_MULTIBLOCK_MIN_WIDTH = 65536
+# Mirrors `kTopkPlainGfx950AnyRowsMaxLen` in csrc/kernels/topk_per_row_kernels.cu.
+_PLAIN_K2048_ONEBLOCK_MAX_WIDTH = 80 * 1024
 
 # small_k narrows by dropping chunks below the cut, and a chunk is a lane: at k
 # equal to the wave width it drops none. Survivors at 8192 columns run 18 at
@@ -510,7 +517,25 @@ def _choose(
     return topk_select_backend(rows, width, k, available, ragged=ragged)
 
 
-def _sampled_takes(rows: int, width: int, k: int, yield_to_plain: bool = False) -> bool:
+def _plain_k2048_multiblock(rows: int, width: int, ragged: bool) -> bool:
+    """Whether plain's gfx950 k=2048 dispatch takes its multi-block kernel here.
+
+    `plain_should_use_mulblocks` in csrc/kernels/topk_per_row_kernels.cu, for
+    the row counts this file can still route to plain (`_plain_takes` leaves
+    more than two rows to others before `should_use_mulblocks` turns to them).
+    Ragged rows reach the generic one-block kernel, so the one-block range does
+    not keep them.
+    """
+    return (
+        rows <= _PLAIN_K2048_MULTIBLOCK_ROWS
+        and width >= _PLAIN_K2048_MULTIBLOCK_MIN_WIDTH
+        and (ragged or width > _PLAIN_K2048_ONEBLOCK_MAX_WIDTH)
+    )
+
+
+def _sampled_takes(
+    rows: int, width: int, k: int, yield_to_plain: bool = False, ragged: bool = False
+) -> bool:
     """Total work past which `sampled` measured fastest of every backend here.
 
     The threshold is on `rows * width`, not on either alone, and it is sharp:
@@ -557,16 +582,13 @@ def _sampled_takes(rows: int, width: int, k: int, yield_to_plain: bool = False) 
     kernels beat it there and on every other cell the work door took below the
     width door (200 against 268us at 4096x64K), so there the work door yields
     to plain's band when `yield_to_plain` -- uniform rows, plain available. The
-    doors added for that k point the other way: at most two rows from 65536
-    columns, where plain's own dispatch goes multi-block, and the few-row band's
-    rows past its width, which decode served 1.47x-2.56x slower. See
+    doors added for that k point the other way: where plain's own dispatch goes
+    multi-block (`_plain_k2048_multiblock`), and the few-row band's rows past
+    its width, which decode served 1.47x-2.56x slower. See
     `_PLAIN_K2048_MULTIBLOCK_ROWS`.
     """
     if k == 2048 and width < _SAMPLED_MIN_WIDTH and get_gfx_runtime() == "gfx950":
-        if (
-            rows <= _PLAIN_K2048_MULTIBLOCK_ROWS
-            and width >= _PLAIN_K2048_MULTIBLOCK_MIN_WIDTH
-        ) or (
+        if _plain_k2048_multiblock(rows, width, ragged) or (
             rows <= _PLAIN_K2048_FEW_ROWS and width > _PLAIN_K2048_FEW_ROWS_MAX_WIDTH
         ):
             return bool(topk_sampled_supports(rows, width, k))
@@ -666,7 +688,7 @@ def topk_select_backend(
     if "argmax" in available:
         return "argmax"
     if "sampled" in available and _sampled_takes(
-        rows, width, k, yield_to_plain="plain" in available and not ragged
+        rows, width, k, yield_to_plain="plain" in available and not ragged, ragged=ragged
     ):
         return "sampled"
     if "plain" in available and _plain_takes(rows, width, k):
