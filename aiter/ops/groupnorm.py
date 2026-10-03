@@ -39,10 +39,11 @@ def _groupnorm_ws_slots(input: Tensor, num_groups: int) -> int:
     STEPS_PER_THREAD = 8
     outer = input.shape[0] * num_groups
     inner = input.numel() // outer
+    numel_per_channel = input.numel() // input.shape[0] // input.shape[1]
     gridx = (inner + STEPS_PER_THREAD * THREADS_PER_BLOCK - 1) // (
         STEPS_PER_THREAD * THREADS_PER_BLOCK
     )
-    if inner % 4 == 0 and gridx >= 16:
+    if numel_per_channel % 4 == 0 and gridx >= 16:
         gridx = max(1, gridx // 4)
     gridx = min((4096 + outer - 1) // outer, gridx)
     return 2 * gridx * outer
