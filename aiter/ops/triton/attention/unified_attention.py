@@ -211,6 +211,10 @@ def unified_attention(
         ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
 
     use_alibi_slopes = alibi_slopes is not None
+    assert (
+        causal or not use_alibi_slopes
+    ), "ALiBi is not supported with non-causal attention"
+
     use_qq_bias = qq_bias is not None
     SLIDING_WINDOW = 1 + window_size[0]
 
