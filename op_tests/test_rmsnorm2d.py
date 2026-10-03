@@ -92,10 +92,24 @@ def test_rmsnorm2d_fuseAdd(dtype, m, n):
 
     msg = f"[perf] dim: {dim!s:<20}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, cu avg: {avg_c:<8.2f} us,uplift: {avg_a/avg_b-1:<5.1%}"
     checkAllclose(a, b, atol=0.03, msg=msg)
-    checkAllclose(res_a, res_b, msg="ck res check (NO_SPECIFIC_MODEL)")
+    checkAllclose(
+        res_a,
+        res_b,
+        rtol=0,
+        atol=0,
+        tol_err_ratio=0,
+        msg="ck res check (NO_SPECIFIC_MODEL)",
+    )
 
     checkAllclose(a, c, atol=0.03, msg=msg)
-    checkAllclose(res_a, res_c, msg="ck res check (T5_MODEL_LIKE)")
+    checkAllclose(
+        res_a,
+        res_c,
+        rtol=0,
+        atol=0,
+        tol_err_ratio=0,
+        msg="ck res check (T5_MODEL_LIKE)",
+    )
     # checkAllclose(a, d, atol=0.03, msg='cu')
     # checkAllclose(res_a, res_d, atol=0.01, msg='cu res check')
 
@@ -108,7 +122,9 @@ def test_rmsnorm2d_fuseAdd(dtype, m, n):
     aiter.rmsnorm2d_fwd_with_add(gout, gx, gr, gres, weight, 1e-5, gemma_norm=True)
     (g, gres_ref, *_), _ = run_torch(gx, (weight + 1).to(dtype), 1e-5, residual=gr)
     checkAllclose(g, gout, atol=0.03, msg="gemma out")
-    checkAllclose(gres_ref, gres, msg="gemma res check")
+    checkAllclose(
+        gres_ref, gres, rtol=0, atol=0, tol_err_ratio=0, msg="gemma res check"
+    )
 
 
 # for dtype in [dtypes.fp16, dtypes.bf16]:
