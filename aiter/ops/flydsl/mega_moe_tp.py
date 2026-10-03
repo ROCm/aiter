@@ -56,7 +56,8 @@ Contract (the kernel synchronizes the ranks through flags in each other's memory
   against a bf16-math torch reference (glm5 / m3), vs ~0.003 with ``"bf16"``
   (bf16 partials and route rows, no LL packets: ~3-14% slower, more at large M).
 * ``ar_gather`` (ar / ar_ar, from ~128 tokens up, where the all-reduce runs as
-  reduce-scatter + all-gather): ``"bf16"`` (default) or ``"fp8"``: the gathered
+  reduce-scatter + all-gather): ``"bf16"``, ``"fp8"`` or ``"auto"`` (default:
+  fp8 from ``AITER_MEGAMOE_TP_AG8_MIN`` = 512 global tokens up): the gathered
   rows travel as MXFP8, half the bytes (e.g. glm5 tp4 2048 tokens 472 -> 430 us)
   at rel L2 ~0.046 instead of ~0.038 against the torch reference.
 * Launch epochs are int32: ``reset()`` at least every 2**31 forwards per layer.
@@ -101,7 +102,7 @@ class MegaMoeTPConfig:
     swiglu_limit: float | None = None
     comm_mode: str = "ag_rs"
     comm_dtype: str = "fp8"
-    ar_gather: str = "bf16"
+    ar_gather: str = "auto"
 
 
 class MegaMoeTP:

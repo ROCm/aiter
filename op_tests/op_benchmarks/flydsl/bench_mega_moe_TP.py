@@ -1567,9 +1567,10 @@ def parse_args(argv=None):
     )
     p.add_argument(
         "--ar-gather",
-        choices=["bf16", "fp8"],
-        default="bf16",
-        help="fused ar / ar_ar: dtype of the all-reduce's gathered rows.",
+        choices=["bf16", "fp8", "auto"],
+        default="auto",
+        help="fused ar / ar_ar: dtype of the all-reduce's gathered rows "
+        "(auto: fp8 from 512 global tokens up).",
     )
     p.add_argument(
         "--route",

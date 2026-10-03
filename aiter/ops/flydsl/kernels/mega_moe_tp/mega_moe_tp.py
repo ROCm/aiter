@@ -93,6 +93,7 @@ class LaunchCfg:
     nsk: int = 4
     npp: int = 1
     xb: int = 0
+    ag8: bool = False  # ar / ar_ar: MXFP8 all-gather rows (ar_gather="auto")
 
     @property
     def block_m(self) -> int:
@@ -184,7 +185,7 @@ class MegaMoeTPEngine:
         swiglu_limit: float | None = None,
         comm_mode: str = "ag_rs",
         comm_dtype: str = "fp8",
-        ar_gather: str = "bf16",
+        ar_gather: str = "auto",
         group=None,
         device: torch.device | None = None,
     ):
@@ -197,9 +198,16 @@ class MegaMoeTPEngine:
         if comm_dtype not in ("fp8", "bf16"):
             raise ValueError(f"unknown comm_dtype {comm_dtype!r}")
         self.comm_bf16 = comm_dtype == "bf16"
-        if ar_gather not in ("bf16", "fp8"):
+        if ar_gather not in ("bf16", "fp8", "auto"):
             raise ValueError(f"unknown ar_gather {ar_gather!r}")
         self.ag_fp8 = ar_gather == "fp8"
+        # auto: MXFP8 gathered rows from AG8_MIN global tokens up, where the
+        # second all-reduce hop is link bound (as comm-fused MoE's reduced payload)
+        self.ag_auto = (
+            int(os.environ.get("AITER_MEGAMOE_TP_AG8_MIN", "512"))
+            if ar_gather == "auto"
+            else 0
+        )
         if not 1 <= topk <= experts or max_local_tokens < 1:
             raise ValueError(
                 f"need 1 <= topk ({topk}) <= experts ({experts}), max_local_tokens >= 1"
@@ -276,7 +284,7 @@ class MegaMoeTPEngine:
         )
         arena.commit()
         self.arena = arena
-        self.ctrl = torch.zeros(CTRL_INTS + 256 * 16, dtype=torch.int32, device=self.device)  # [tl]
+        self.ctrl = torch.zeros(CTRL_INTS + 256 * 16 + 128, dtype=torch.int32, device=self.device)  # [tl]
         self.routes = torch.zeros(
             (tot * topk + 1, H), dtype=torch.bfloat16, device=self.device
         )
@@ -571,6 +579,7 @@ class MegaMoeTPEngine:
                 nsk,
                 self._fit_npp(cfg.npp, nsk),
                 cfg.xb if cfg.xb % 2 == 0 and 0 <= cfg.xb < self.H // 512 else 0,
+                bool(self.ag_auto) and tot >= self.ag_auto,
             )
             self._cfgs[m] = cfg
         return cfg
@@ -583,7 +592,7 @@ class MegaMoeTPEngine:
         return self.ar and cfg.ll and cfg.llr and (cfg.dyn or sc.npieces <= 1)
 
     def _ag8(self, cfg: LaunchCfg) -> bool:
-        return self.ar and self.ag_fp8 and not self._arll(cfg)
+        return self.ar and (self.ag_fp8 or cfg.ag8) and not self._arll(cfg)
 
     def _xl(self, cfg: LaunchCfg) -> bool:
         return not cfg.dyn and not cfg.ll and self._cfg_sched(cfg).xl_e0 > 0

@@ -232,6 +232,8 @@ C_UNIT = 48
 C_DXON = 54
 C_VBON = 55
 C_CLAIM = 56
+# expert + 1 whose routes L_RIX / L_WT / C_CNT hold (0: none; zeroed per launch)
+C_GEXP = 57
 C_XC, C_XC_N = 64, 32
 C_UL = 96
 
@@ -310,7 +312,7 @@ def compile_mega_moe_tp(
     NE = dyn_e
     VPL = (CW // 8 + 63) // 64
     SCAN_IT = (TMAX * TOPK // 4 + NT - 1) // NT
-    SCAN_G = 8
+    SCAN_G = 16
     NPC = KS2 if DYN else max(npieces, 1)
     assert not DYN or xsplit == 0
     FP8R = bool(route_fp8)
@@ -768,11 +770,18 @@ def compile_mega_moe_tp(
             _llvm.call_intrinsic(T.i64, "llvm.amdgcn.s.memrealtime", [], [], [])
         )
 
+    _TLA = [None]  # [tl] the kernel's arg dict, for helpers without it
+  # [tl]
     @traced  # [tl]
     def tlx(a, k):  # [tl]
         if const_expr(TLX):  # [tl]
             off = i32(CTRL_INTS) + i32(gpu.block_id("x")) * i32(16) + i32(k)  # [tl]
             g_st_sys(ctrl_at(a, off), fx.Int32(_now()))  # [tl]
+  # [tl]
+    @traced  # [tl]
+    def tlc(a, slot):  # [tl] per-chunk stamps after the per-CTA ones
+        if const_expr(TLX):  # [tl]
+            g_st_sys(ctrl_at(a, i32(CTRL_INTS + NCTA_MAX * 16) + slot), fx.Int32(_now()))  # [tl]
   # [tl]
     @traced  # [tl]
     def tlx0(a, tid, k):  # [tl]
@@ -797,9 +806,21 @@ def compile_mega_moe_tp(
 
     @traced
     def gather_routes(L, tid, ids_addr, tw_addr, ttot, expert):
+        # consecutive units of one expert (pair / split schedules: its GEMM1
+        # slice, then its GEMM2 columns) reuse the routes already in LDS
+        if lds_ld_i32(L, L_CTL + C_GEXP * 4) != expert + i32(1):
+            _gather_scan(L, tid, ids_addr, tw_addr, ttot, expert)
+        return fx.min(lds_ld_i32(L, L_CTL + C_CNT * 4), i32(TMAX))
+
+    @traced
+    def _gather_scan(L, tid, ids_addr, tw_addr, ttot, expert):
+        # every wave read the previous count before it is reset
+        tlx0(_TLA[0], tid, 12)  # [tl]
+        cbar(L, tid)
         if tid == i32(0):
             lds_st(L, L_CTL + C_CNT * 4, i32(0))
         cbar(L, tid)
+        tlx0(_TLA[0], tid, 14)  # [tl]
         n = ttot * i32(TOPK)
         rid = rsrc(ids_addr, n * i32(16 if MLL else 4))
         if const_expr(MLL):
@@ -817,20 +838,30 @@ def compile_mega_moe_tp(
                     q = fx.min(tid + i32(it * NT), n4 - i32(1))
                     vs.append(fx.Vector(bld(rid, q * i32(16), 0, V4I, 0)))
                     ws.append(fx.Vector(bld(rtw, q * i32(16), 0, V4I, 0)))
+                # wave-compacted: slots from ballot / mbcnt, one LDS atomic
+                # per wave and group (per-hit atomics serialize: ~20 us at
+                # 2k tokens)
+                hits, run = [], i32(0)
                 for x, it in enumerate(its):
                     q = tid + i32(it * NT)
                     for j in range_constexpr(4):
                         hit = (q < n4) & (fx.Int32(vs[x][j]) == expert)
-                        _gather_one(L, q * i32(4) + i32(j), hit, fx.Int32(ws[x][j]))
+                        pos, n = _wave_rank(hit)
+                        hits.append((hit, run + pos, q * i32(4) + i32(j), ws[x][j]))
+                        run = run + n
+                base = _wave_claim(L, tid, run)
+                for hit, pos, idx, wv in hits:
+                    _gather_put(L, hit, base + pos, idx, fx.Int32(wv))
             for idx_ in range(n4 * i32(4) + tid, n, i32(NT)):
                 idx = i32(idx_)
                 e = g_ld_i32(fx.Int64(ids_addr) + fx.Int64(idx) * fx.Int64(4))
                 wv = g_ld_i32(fx.Int64(tw_addr) + fx.Int64(idx) * fx.Int64(4))
                 _gather_one(L, idx, e == expert, wv)
         cbar(L, tid)
-        cnt = lds_ld_i32(L, L_CTL + C_CNT * 4)
+        tlx0(_TLA[0], tid, 11)  # [tl]
+        if tid == i32(0):
+            lds_st(L, L_CTL + C_GEXP * 4, expert + i32(1))
         cbar(L, tid)
-        return fx.min(cnt, i32(TMAX))
 
     @traced
     def zero_masked(L, lane, a, w0, nw):
@@ -881,6 +912,27 @@ def compile_mega_moe_tp(
                         bst(z, rs, base + soff + q * i32(16), 0, AUX_SC1)
                 else:
                     bst(z, rs, base + (ridx * i32(H) + q * i32(8)) * i32(2), 0, AUX_SC1)
+
+    def _wave_rank(hit):
+        b = fx.Int64(rocdl.ballot(T.i64, _u(hit)))
+        lo = i32(b & fx.Int64(0xFFFFFFFF))
+        hi = i32(b >> fx.Int64(32))
+        below = rocdl.mbcnt_lo(T.i32, _u(lo), _u(i32(0)))
+        below = i32(rocdl.mbcnt_hi(T.i32, _u(hi), below))
+        return below, _ctpop(lo) + _ctpop(hi)
+
+    @traced
+    def _wave_claim(L, tid, n):
+        got = i32(0)
+        if ((tid % i32(64)) == i32(0)) & (n > i32(0)):
+            got = lds_atomic_add(L, L_CTL + C_CNT * 4, n)
+        return uni(got)
+
+    @traced
+    def _gather_put(L, hit, slot, idx, wv):
+        if hit & (slot < i32(TMAX)):
+            lds_st(L, L_RIX + slot * i32(4), idx)
+            lds_st(L, L_WT + slot * i32(4), wv)
 
     @traced
     def _gather_one(L, idx, hit, wv):
@@ -2867,6 +2919,7 @@ def compile_mega_moe_tp(
             ) + i32(min(xl_s0, N_XCD)):
                 g_st_sys(ea, i32(0))
                 g_st_sys(ctrl_at(a, i32(CTRL_LRDY) + cidx * i32(LRDY_STRIDE)), epoch)
+                tlc(a, cidx)  # [tl]
 
     @traced
     def _signal_count(a, epoch, cidx):
@@ -2881,6 +2934,7 @@ def compile_mega_moe_tp(
             g_st_sys(cnt_addr, i32(0))
             vc = (cidx + i32(NCK)) if XL else cidx
             g_st_sys(ctrl_at(a, i32(CTRL_LRDY) + vc * i32(LRDY_STRIDE)), epoch)
+            tlc(a, vc)  # [tl]
 
     @traced
     def signal_loop(L, tid, a, epoch):
@@ -3619,6 +3673,7 @@ def compile_mega_moe_tp(
             "col0": col0,
             "ncol": ncol,
         }
+        _TLA[0] = a  # [tl]
         tlx0(a, tid, 10)  # [tl2]
         if const_expr(DYN):
             _dyn_zero(L, tid)
