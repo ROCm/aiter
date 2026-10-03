@@ -1,0 +1,32 @@
+{
+  "M_LEQ_4": {
+    "BLOCK_M": 16,
+    "BLOCK_N": 32,
+    "BLOCK_K": 256,
+    "NUM_BUFFERS": 3,
+    "num_warps": 2,
+    "kernel_type": "bandwidth_bound"
+  },
+  "any": {
+    "BLOCK_M": 32,
+    "BLOCK_N": 64,
+    "BLOCK_K": 64,
+    "NUM_BUFFERS": 5,
+    "num_warps": 2,
+    "kernel_type": "bandwidth_bound"
+  },
+  "M_GEQ_2048": {
+    "backend": "triton",
+    "BLOCK_SIZE_M": 64,
+    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_K": 256,
+    "GROUP_SIZE_M": 8,
+    "num_warps": 4,
+    "num_stages": 3,
+    "waves_per_eu": 2,
+    "matrix_instr_nonkdim": 16,
+    "cache_modifier": null,
+    "NUM_KSPLIT": 1,
+    "SPLITK_BLOCK_SIZE": 4096
+  }
+}
