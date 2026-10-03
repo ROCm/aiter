@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
+import re
 import sys
 import time
 import traceback
@@ -84,9 +86,23 @@ def _scheduler_variants(row, base_job):
     return variants
 
 
+def _target_gfx_archs() -> set[str] | None:
+    arch_str = os.environ.get("GPU_ARCHS")
+    if not arch_str or not arch_str.strip():
+        return None
+
+    arch_str = arch_str.strip()
+    if arch_str.lower() == "native":
+        return None
+
+    res = {a.strip() for a in re.split(r"[;,]", arch_str) if a.strip()}
+    return res or None
+
+
 def parse_csv(csv_path: str):
     jobs = []
     seen = set()
+    target_archs = _target_gfx_archs()
     with open(csv_path, newline="") as f:
         for row in csv.DictReader(f):
             if not row:
@@ -96,6 +112,9 @@ def parse_csv(csv_path: str):
                 row.get(col) is None or str(row.get(col)).strip() == ""
                 for col in ("model_dim", "inter_dim", "expert", "token")
             ):
+                continue
+            row_arch = (row.get("gfx") or "").strip() or GROUPED_MOE_AOT_ARCH_DEFAULT
+            if target_archs is not None and row_arch not in target_archs:
                 continue
             n_warp = int(row.get("n_warp") or 4)
             token_num = int(row["token"])
@@ -136,7 +155,7 @@ def parse_csv(csv_path: str):
                 "data_format": (
                     "fp4" if "float4" in row.get("q_dtype_a", "") else "a8w4"
                 ),
-                "gfx": row.get("gfx", ""),
+                "gfx": row_arch,
             }
             for job in _scheduler_variants(row, base_job):
                 key = job_identity(job)
