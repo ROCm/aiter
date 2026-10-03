@@ -16,15 +16,6 @@ namespace opus_moe_backward::gfx950
 
 #ifdef __HIP_DEVICE_COMPILE__
 
-inline __device__ uint32_t weight_bwd_cvt_pk_bf16_f32(float lo, float hi)
-{
-    uint32_t packed;
-    asm volatile("v_cvt_pk_bf16_f32 %0, %1, %2"
-                 : "=v"(packed)
-                 : "v"(lo), "v"(hi));
-    return packed;
-}
-
 template<RouteLayout Layout, bool GatherToken>
 inline __device__ int weight_bwd_source_row(const RouteMetadata& route,
                                              int sorted_row,
@@ -187,7 +178,7 @@ inline __device__ void weight_bwd_store_wide(Accum& accum,
                 uint32_t packed[4];
 #pragma unroll
                 for(int i = 0; i < 4; ++i)
-                    packed[i] = weight_bwd_cvt_pk_bf16_f32(
+                    packed[i] = cvt_pk_bf16_f32(
                         static_cast<float>(accum[accum_base + 2 * i]),
                         static_cast<float>(accum[accum_base + 2 * i + 1]));
                 auto swap02 = __builtin_amdgcn_permlane32_swap(

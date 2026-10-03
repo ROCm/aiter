@@ -16,15 +16,6 @@ namespace opus_moe_backward::gfx950
 
 #ifdef __HIP_DEVICE_COMPILE__
 
-inline __device__ uint32_t route_dx_cvt_pk_bf16_f32(float lo, float hi)
-{
-    uint32_t packed;
-    asm volatile("v_cvt_pk_bf16_f32 %0, %1, %2"
-                 : "=v"(packed)
-                 : "v"(lo), "v"(hi));
-    return packed;
-}
-
 template<typename T, typename Mma>
 inline __device__ auto route_dx_load_rb_tr(
     opus::smem<typename T::D_B>& s_b,
@@ -683,7 +674,7 @@ route_dx_process_tile_gfx950(RouteDxKargs kargs)
             uint32_t packed[8];
 #pragma unroll
             for(int i = 0; i < 8; ++i)
-                packed[i] = route_dx_cvt_pk_bf16_f32(
+                packed[i] = cvt_pk_bf16_f32(
                     static_cast<float>(
                         v_c[route_group.value][en.value * 16 + 2 * i]),
                     static_cast<float>(

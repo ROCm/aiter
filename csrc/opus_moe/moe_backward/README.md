@@ -126,6 +126,9 @@ Run in a ROCm PyTorch environment on an authorized idle gfx950 GPU:
 ```bash
 PYTHONPATH=. python -m pytest -q op_tests/test_opus_moe_backward.py
 PYTHONPATH=. python op_tests/op_benchmarks/bench_opus_moe_backward.py
+hipcc -std=c++20 -O3 --offload-arch=gfx950 -Icsrc/include \
+  op_tests/test_opus_moe_backward_primitives.hip -o /tmp/opus_primitives
+/tmp/opus_primitives
 ```
 
 The suite checks fixed K variants, skew/empty experts, unused sorted capacity,
@@ -133,6 +136,11 @@ intermediate dZ, cached/full-chain gradients, bias, compact routes, selected
 softmax, autograd attachment and 100 graph replays against FP32 PyTorch equations
 with explicit BF16 intermediate rounding. The benchmark also compares the branch
 Triton path on small, 16K and 32K shapes.
+
+The standalone primitive probe checks packed BF16 bit order, halfway rounding,
+signed zero/subnormal/Inf/NaN handling and the K1 lane-swap layout against host
+integer references. It does not reproduce the MFMA accumulator compiler bug and
+is not evidence that the lane-swap builtin can replace the asm workaround.
 
 Graph timing excludes Python/allocator work; direct Opus timing includes the
 allocating wrapper while Triton uses preallocated outputs. Sorting and forward

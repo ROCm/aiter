@@ -13,6 +13,20 @@ constexpr uint32_t kPackedTokenMask = 0x00ffffffu;
 constexpr int kPackedTopkBits = 8;
 constexpr int kMaxPackedTopk = 1 << kPackedTopkBits;
 
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx950__)
+// gfx950 packed round-to-nearest BF16 conversion: lo occupies bits [15:0],
+// hi bits [31:16]. Keep the instruction/constraints shared across pipelines;
+// two scalar casts are not an instruction-equivalent replacement.
+inline __device__ uint32_t cvt_pk_bf16_f32(float lo, float hi)
+{
+    uint32_t packed;
+    asm volatile("v_cvt_pk_bf16_f32 %0, %1, %2"
+                 : "=v"(packed)
+                 : "v"(lo), "v"(hi));
+    return packed;
+}
+#endif
+
 enum class Family : int
 {
     DownBwd = 0,

@@ -16,15 +16,6 @@ namespace opus_moe_backward::gfx950
 
 #ifdef __HIP_DEVICE_COMPILE__
 
-inline __device__ uint32_t down_bwd_cvt_pk_bf16_f32(float lo, float hi)
-{
-    uint32_t packed;
-    asm volatile("v_cvt_pk_bf16_f32 %0, %1, %2"
-                 : "=v"(packed)
-                 : "v"(lo), "v"(hi));
-    return packed;
-}
-
 inline __device__ void down_bwd_permlane32_swap(uint32_t& lo, uint32_t& hi)
 {
     asm volatile("v_permlane32_swap_b32 %0, %1" : "+v"(lo), "+v"(hi));
@@ -1145,14 +1136,14 @@ down_bwd_process_tile_gfx950(DownBwdKargs kargs)
                             q * z_up_pair * sigmoid *
                             (one + z_gate_pair * (one - sigmoid));
                         const down_bwd_f32x2 d_up = q * silu;
-                        d_gate_store[pair] = down_bwd_cvt_pk_bf16_f32(
+                        d_gate_store[pair] = cvt_pk_bf16_f32(
                             d_gate[0], d_gate[1]);
-                        d_up_store[pair] = down_bwd_cvt_pk_bf16_f32(
+                        d_up_store[pair] = cvt_pk_bf16_f32(
                             d_up[0], d_up[1]);
                         if constexpr(write_a_scaled)
                         {
                             const down_bwd_f32x2 scaled = score2 * activation;
-                            scaled_store[pair] = down_bwd_cvt_pk_bf16_f32(
+                            scaled_store[pair] = cvt_pk_bf16_f32(
                                 scaled[0], scaled[1]);
                         }
                         ds_partial += g[0] * activation[0] +

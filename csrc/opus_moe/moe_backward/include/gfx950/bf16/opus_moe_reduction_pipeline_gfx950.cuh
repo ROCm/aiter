@@ -231,20 +231,11 @@ namespace opus_moe_backward::gfx950
 
 #ifdef __HIP_DEVICE_COMPILE__
 
-inline __device__ uint32_t route_reduce_cvt_pk_bf16_f32(float lo, float hi)
-{
-    uint32_t packed;
-    asm volatile("v_cvt_pk_bf16_f32 %0, %1, %2"
-                 : "=v"(packed)
-                 : "v"(lo), "v"(hi));
-    return packed;
-}
-
 inline __device__ uint64_t
 route_reduce_pack_bf16x4(float v0, float v1, float v2, float v3)
 {
-    const uint32_t packed01 = route_reduce_cvt_pk_bf16_f32(v0, v1);
-    const uint32_t packed23 = route_reduce_cvt_pk_bf16_f32(v2, v3);
+    const uint32_t packed01 = cvt_pk_bf16_f32(v0, v1);
+    const uint32_t packed23 = cvt_pk_bf16_f32(v2, v3);
     return static_cast<uint64_t>(packed01) |
            (static_cast<uint64_t>(packed23) << 32);
 }
