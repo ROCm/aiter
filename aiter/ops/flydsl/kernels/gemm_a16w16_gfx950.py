@@ -14,6 +14,7 @@ from flydsl.runtime.device import get_rocm_arch
 
 from aiter.utility.graph_alloc import persistent_alloc
 
+from . import communication_ops_utils as comm_ops
 from .gemm_a16w16_gfx950_utils import (
     GFX950_DMA_BYTES,
     GFX950_WAVE_SIZE,
@@ -27,7 +28,6 @@ from .gemm_a16w16_gfx950_utils import (
     transposed_contiguous_idx,
     wait_vmcnt_and_barrier,
 )
-from . import communication_ops_utils as comm_ops
 from .kernels_common import run_cached
 from .splitk_epilogue import CPOL_COHERENT, pairwise_sum
 
@@ -964,7 +964,9 @@ def gemm_a16w16_gfx950_kernel(
                 if (global_row < m) and (global_col < n):
                     c_vec = fx.ptr_load(
                         smem_c + local_row * block_n + local_col,
-                        result_type=fx.Vector.make_type(cshuffle_r2g_vec_size, c_smem_dtype),
+                        result_type=fx.Vector.make_type(
+                            cshuffle_r2g_vec_size, c_smem_dtype
+                        ),
                     )
                     for k_slice in range_constexpr(1, k_waves):
                         peer_c_vec = fx.ptr_load(
@@ -979,7 +981,9 @@ def gemm_a16w16_gfx950_kernel(
                         c_vec = c_vec + peer_c_vec
                     global_offset = global_row * n + global_col
                     if const_expr(param.splitk_workspace):
-                        store_splitk_partial(ws_buf, ks_idx * m * n + global_offset, c_vec)
+                        store_splitk_partial(
+                            ws_buf, ks_idx * m * n + global_offset, c_vec
+                        )
                     else:
                         write_cshuffle_vec_to_global(
                             out,
