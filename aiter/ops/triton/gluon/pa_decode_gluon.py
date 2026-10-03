@@ -2068,13 +2068,9 @@ def paged_attention_decode_sliding_window_head_1(
         else:
             attention_accumulator += attention_output
         max_logits = new_max_logits
-        if (
-            sequence_partition_idx + CONTEXT_PARTITION_SIZE_PER_BLOCK
-            < sequence_partition_end_idx
-        ):
-            kv_block_numbers = kv_block_numbers2
-            key_tensor = key_tensor2
-            kv_block_start_idx = kv_block_start_idx2
+        kv_block_numbers = kv_block_numbers2
+        key_tensor = key_tensor2
+        kv_block_start_idx = kv_block_start_idx2
 
     # ==================== SINKS HANDLING ====================
     # Add sinks contribution to exp_sums (does not contribute to attention output)
@@ -3054,14 +3050,10 @@ def paged_attention_decode_sliding_window(
         else:
             attention_accumulator += attention_output
         max_logits = new_max_logits
-        if (
-            sequence_partition_idx + CONTEXT_PARTITION_SIZE_PER_BLOCK
-            < sequence_partition_end_idx
-        ):
-            kv_block_numbers = kv_block_numbers2
-            key_tensor = key_tensor2
-            kv_block_start_idx = kv_block_start_idx2
-            page_offset = page_offset2
+        kv_block_numbers = kv_block_numbers2
+        key_tensor = key_tensor2
+        kv_block_start_idx = kv_block_start_idx2
+        page_offset = page_offset2
 
     # ==================== SINKS HANDLING ====================
     # Add sinks contribution to exp_sums (does not contribute to attention output)
