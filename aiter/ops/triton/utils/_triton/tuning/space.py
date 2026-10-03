@@ -18,9 +18,9 @@ import math
 from _utils import cdiv, next_pow2
 
 SEARCH_SPACE = {
-    "BLOCK_SIZE_M": [4, 8, 16, 32, 64, 128, 256, 512, 1024],
-    "BLOCK_SIZE_N": [4, 8, 16, 32, 64, 128, 256, 512, 1024],
-    "BLOCK_SIZE_K": [4, 8, 16, 32, 64, 128, 256, 512, 1024],
+    "BLOCK_SIZE_M": [8, 16, 32, 64, 128, 256, 512],
+    "BLOCK_SIZE_N": [8, 16, 32, 64, 128, 256, 512, 1024],
+    "BLOCK_SIZE_K": [8, 16, 32, 64, 128, 256, 512, 1024],
     "GROUP_SIZE_M": [1, 4, 8, 16],
     "num_warps": [1, 2, 4, 8],
     "num_stages": [1, 2],
@@ -30,13 +30,13 @@ SEARCH_SPACE = {
     "NUM_KSPLIT": [1, 3, 4, 7, 8, 14, 16, 28],
     "NUM_BUFFERS": [1, 2, 3, 4, 6, 8],
     "kernel_type": ["bandwidth_bound", "compute_bound"],
-    "num_ctas": [1, 2, 4, 8],
+    "num_ctas": [1, 2, 4, 8, 16],
     "CTAS_M": [1, 2, 4],
     "CTAS_N": [1, 2, 4],
     "LOOP_UNROLL_FACTOR": [1, 2],
     "B_SCALE_TDM": [True, False],
     "kpack": [1, 2],
-    "persistent": [False],
+    "persistent": [True, False],
 }
 
 # Families that spell a key differently share its table row and shape rules;
@@ -161,7 +161,7 @@ def should_skip_generic(shape, config, backend):
     return False
 
 
-def exceeds_lds(config, bits, arch, backend):
+def exceeds_lds(config, spec, arch, backend):
     """True when buffers x (A tile + B tile) cannot fit the LDS; such a config never compiles."""
     from aiter.ops.triton.utils._triton.arch_info import _LDS_CAP_BYTES
 
@@ -170,13 +170,20 @@ def exceeds_lds(config, bits, arch, backend):
     block_k = config.get("BLOCK_SIZE_K", config.get("BLOCK_K"))
     if None in (block_m, block_n, block_k):
         return False
+    if (
+        spec.cta_split is not None
+    ):  # each CTA of a cluster keeps only its share of the tile
+        ctas_m, ctas_n = spec.cta_split(config)
+        block_m, block_n = block_m // ctas_m, block_n // ctas_n
     # gluon keeps NUM_BUFFERS (or num_stages, where that is what the key means) tile pairs
     # resident; the triton pipeliner keeps num_stages - 1 (lenient bound)
     num_stages = config.get("num_stages", 1)
     buffers = config.get(
         "NUM_BUFFERS", num_stages if backend == "gluon" else max(num_stages - 1, 1)
     )
-    tile_bytes = (block_m * block_k * bits[0] + block_n * block_k * bits[1]) / 8
+    tile_bytes = (
+        block_m * block_k * spec.bits[0] + block_n * block_k * spec.bits[1]
+    ) / 8
     return buffers * tile_bytes > _LDS_CAP_BYTES.get(arch, 64 * 1024)
 
 
@@ -204,7 +211,7 @@ def build_space(spec, shape, backend, arch, kernel_should_skip):
             if should_skip_generic(shape, config, backend):
                 skipped["generic rules"] += 1
                 continue
-            if exceeds_lds(config, spec.bits, arch, backend):
+            if exceeds_lds(config, spec, arch, backend):
                 skipped["LDS"] += 1
                 continue
             if kernel_should_skip is not None and kernel_should_skip(config):
