@@ -26,6 +26,7 @@ from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.gemm_tune.flydsl_gemm_mxscale_preshuffle_common import (
     _DTYPE_SHORT,
+    W_SCALE_BLOCKS,
     make_kernel_name,
 )
 from aiter.ops.flydsl.kernels.communication_ops_utils import (
@@ -129,7 +130,7 @@ def _launch_gemm_impl(
     waves_per_eu: Constexpr[int],
     xcd_swizzle: Constexpr[int],
     k_batch: Constexpr[int] = 1,
-    blockscale: Constexpr[str] = "none",
+    w_scale_block: Constexpr[str] = "1x32",
     multi_row_tile: Constexpr[bool] = False,
 ):
     """Direct @flyc.jit launcher. Operands are fx.Pointer (pass ptr_arg(t): raw data_ptr, no
@@ -140,9 +141,11 @@ def _launch_gemm_impl(
     the [M,B,*] mbn layout. waves_per_eu<=0 = unset.
     """
     BM, BN, BK = tile_m, tile_n, tile_k
+    _wsb = W_SCALE_BLOCKS[w_scale_block]
+    _bs_a, _bs_b = _wsb.bs_a, _wsb.bs_b
     small_m_bf16 = (
         BM == 16
-        and blockscale != "none"
+        and _bs_a
         and out_dtype == "bf16"
         and batch == 1
         and c_row_stride < 0
@@ -194,16 +197,11 @@ def _launch_gemm_impl(
     num_acc_n = (BN // num_waves) // 16  # 16-col n-subblocks per wave
     _scale_chunk_dw = ((K + 255) // 256) * 64  # e8m0 stride in dwords
     _scale_k0_dw = 64
-    # blockscale (A 1x128 / B 128x128): feed the coarse scale to the 1x32 MFMA by
-    # broadcasting in the load ADDRESS. A drops K_Lane(4); B drops K_Lane*N_Lane(64)
-    # and reads one word per 128-N-block (nsb//4).
-    _bs_a = blockscale in ("a", "ab")
-    _bs_b = blockscale in ("b", "ab")
-    _sc_k0_a = 16 if _bs_a else 64  # per-256K-chunk dword stride (A: drop K_Lane=4)
-    _sc_k0_b = 1 if _bs_b else 64  # (B: drop K_Lane*N_Lane=64)
+    _sc_k0_a = _wsb.dw_a  # per-256K-chunk dword stride (A: drop K_Lane=4 if bs_a)
+    _sc_k0_b = _wsb.dw_b  # (B: drop K_Lane*N_Lane=64 if bs_b)
     _scale_chunk_dw_a = ((K + 255) // 256) * _sc_k0_a
     _scale_chunk_dw_b = ((K + 255) // 256) * _sc_k0_b
-    _b_sc_rows = (N // 128) if _bs_b else (N // 32)  # B scale super-rows
+    _b_sc_rows = N // _wsb.b_rows  # B scale super-rows
     a_copy_granularity = num_threads * 16
     assert A_LDS_B % a_copy_granularity == 0, (
         f"A_LDS_B ({A_LDS_B}B) must be divisible by num_threads*16 "
@@ -240,7 +238,7 @@ def _launch_gemm_impl(
         waves_per_eu,
         xcd_swizzle,
         k_batch,
-        blockscale,
+        w_scale_block,
     )
     if splitk_fused:
         _kname += "_fused_reduce"
@@ -523,8 +521,9 @@ def _launch_gemm_impl(
         a_sc_base = [(bx_m // 32 + mp) * sca_rstride for mp in range_constexpr(m_pairs)]
         nsb = (by_n + wave * (BN // num_waves)) // 32
         # B blockscale: 4 consecutive 32-N super-rows share one 128-N block scale.
+        _b_grp = _wsb.b_rows // 32  # 32-N super-rows sharing one B scale word
         b_sc_base = [
-            ((nsb + np) // 4 if _bs_b else (nsb + np)) * _scale_chunk_dw_b
+            ((nsb + np) // _b_grp) * _scale_chunk_dw_b
             for np in range_constexpr(n_pairs)
         ]
         sc_lane = lane_div_16 * 16 + lane_mod_16
@@ -1040,7 +1039,7 @@ def launch_gemm(
     waves_per_eu: Constexpr[int],
     xcd_swizzle: Constexpr[int],
     k_batch: Constexpr[int] = 1,
-    blockscale: Constexpr[str] = "none",
+    w_scale_block: Constexpr[str] = "1x32",
     multi_row_tile: Constexpr[bool] = False,
 ):
     """Launch the established non-fused GEMM ABI used by existing configs."""
@@ -1073,7 +1072,7 @@ def launch_gemm(
         waves_per_eu,
         xcd_swizzle,
         k_batch,
-        blockscale,
+        w_scale_block,
         multi_row_tile,
     )
 
@@ -1108,7 +1107,7 @@ def launch_gemm_fused(
     waves_per_eu: Constexpr[int],
     xcd_swizzle: Constexpr[int],
     k_batch: Constexpr[int] = 1,
-    blockscale: Constexpr[str] = "none",
+    w_scale_block: Constexpr[str] = "1x32",
     multi_row_tile: Constexpr[bool] = False,
 ):
     """Launch the M<=16 split-K GEMM with its fused reduction arguments."""
@@ -1141,7 +1140,7 @@ def launch_gemm_fused(
         waves_per_eu,
         xcd_swizzle,
         k_batch,
-        blockscale,
+        w_scale_block,
         multi_row_tile,
     )
 

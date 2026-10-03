@@ -22,6 +22,7 @@ from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_ck, gemm_a8w8_blockscale_cktile
 from aiter.ops.shuffle import (
     shuffle_mxfp8fp4_a,
+    shuffle_scale_a16w4,
     shuffle_scale_blockscale_a,
     shuffle_scale_blockscale_b,
     shuffle_weight,
@@ -30,6 +31,9 @@ from aiter.test_common import benchmark, checkAllclose, perftest
 from aiter.utility import fp4_utils
 
 block_shape = (128, 128)
+# The gfx950 FlyDSL mxpsh GEMM reads either block; --w_scale_block switches
+# block_shape, which every scale shape and the reference dequant follow.
+W_SCALE_BLOCKS = {"128x128": (128, 128), "1x32": (1, 32)}
 TEST_NUM_ITERS = 100
 
 
@@ -158,8 +162,17 @@ def test_gemm(
     x_scale_t = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
     gemm_weight = shuffle_weight(weight, layout=(16, 16)) if ck_preshuffle else weight
     if use_flydsl_fp8_scale and get_gfx() == "gfx950":
-        gemm_x_scale = shuffle_scale_blockscale_a(x_scale, k)
-        gemm_w_scale = shuffle_scale_blockscale_b(w_scale, n, k)
+        if block_shape == W_SCALE_BLOCKS["1x32"]:
+            x_scale_mx = x_scale
+            if m % 32:  # pad to a whole 32-row super-block (0x7F = E8M0 1.0)
+                x_scale_mx = F.pad(
+                    x_scale.view(torch.uint8), (0, 0, 0, -m % 32), value=0x7F
+                ).view(dtypes.fp8_e8m0)
+            gemm_x_scale = shuffle_scale_a16w4(x_scale_mx, 1, False).flatten()
+            gemm_w_scale = shuffle_scale_a16w4(w_scale, 1, False).flatten()
+        else:
+            gemm_x_scale = shuffle_scale_blockscale_a(x_scale, k)
+            gemm_w_scale = shuffle_scale_blockscale_b(w_scale, n, k)
     elif use_flydsl_fp8_scale:
         gemm_x_scale = x_scale
         gemm_w_scale = w_scale
@@ -265,7 +278,9 @@ def test_splitk_correctness(m=4, n=2112, k=7168, dtype=dtypes.bf16, splitK=1):
     reduction order.  We therefore use a relaxed tolerance that matches the cumulative
     rounding error introduced by K-splitting.
     """
-    block_shape_n, block_shape_k = block_shape
+    # CK / CK-Tile only read the FP32 128x128 blockscale, so this check keeps that
+    # block even when --w_scale_block points the mxpsh benchmark elsewhere.
+    block_shape_n, block_shape_k = W_SCALE_BLOCKS["128x128"]
     scale_n = (n + block_shape_n - 1) // block_shape_n
     scale_k = (k + block_shape_k - 1) // block_shape_k
 
@@ -420,6 +435,15 @@ parser.add_argument(
     help="use flydsl fp8 e8m0 scale path (requires --ck_preshuffle True)",
 )
 parser.add_argument(
+    "--w_scale_block",
+    type=str,
+    choices=sorted(W_SCALE_BLOCKS),
+    default="128x128",
+    help="""e8m0 weight-scale block of the FlyDSL mxpsh path (gfx950).
+    "1x32" is the MX microscale format (x_scale (M, K//32), w_scale (N, K//32));
+    requires --flydsl --ck_preshuffle True.""",
+)
+parser.add_argument(
     "--apre",
     type=dtypes.str2bool,
     nargs="*",
@@ -460,6 +484,17 @@ parser.add_argument(
 )
 
 args = parser.parse_args()
+
+block_shape = W_SCALE_BLOCKS[args.w_scale_block]
+if args.w_scale_block != "128x128":
+    if not args.flydsl:
+        parser.error(f"--w_scale_block {args.w_scale_block} requires --flydsl")
+    if any(args.apre if isinstance(args.apre, list) else [args.apre]):
+        parser.error(f"--w_scale_block {args.w_scale_block} has no --apre kernel")
+    if get_gfx() != "gfx950":
+        parser.error(
+            f"--w_scale_block {args.w_scale_block} is gfx950-only, got {get_gfx()}"
+        )
 
 data_init_list = args.data_init or ["constant", "uniform"]
 scale_init_list = args.scale_init or ["constant", "auto"]

@@ -7,9 +7,9 @@ Operand convention (all preshuffling is caller-side, as for the weight itself):
     A       : [M, K]   row-major, NOT preshuffled  (fp8/fp6 = 1 byte/code, fp4 = 2 codes/byte)
     B       : preshuffled via aiter.ops.shuffle.shuffle_weight(., (16, 16))  (fp4 or fp8 weight)
     a_scale : blockscale -> aiter.ops.shuffle.shuffle_scale_blockscale_a(a_1x128, K)
-              MX         -> per-1x32 E8M0, shuffle_scale_a16w4'd
+              MX 1x32    -> aiter.ops.shuffle.shuffle_scale_a16w4(a_1x32, 1, False)
     b_scale : blockscale -> aiter.ops.shuffle.shuffle_scale_blockscale_b(b_128x128, N, K)
-              MX         -> per-1x32 E8M0, shuffle_scale_a16w4'd
+              MX 1x32    -> aiter.ops.shuffle.shuffle_scale_a16w4(b_1x32, 1, False)
     Out     : [M, N]   bf16 / fp16
 
 ``shuffle_scale_blockscale_a`` takes the LOGICAL ``(M, K//128)`` scale, not the
@@ -30,7 +30,47 @@ import functools
 
 import torch
 
+from .gemm_tune.flydsl_gemm_mxscale_preshuffle_common import (
+    DEFAULT_W_SCALE_BLOCK,
+    W_SCALE_BLOCKS,
+)
+
 _OUT_DTYPE_STR = {torch.bfloat16: "bf16", torch.float16: "fp16"}
+
+
+def mxpsh_scale_elems(M: int, N: int, K: int, w_scale_block: str) -> tuple[int, int]:
+    """(a_scale, b_scale) element counts of the flat buffers this op reads.
+
+    Every layout is indexed by 32-row super-block x 256-K chunk; the block sets
+    how many dwords of each the kernel reads there (see :data:`W_SCALE_BLOCKS`).
+    """
+    k_chunks = (K + 255) // 256
+    blk = W_SCALE_BLOCKS[w_scale_block]
+    return (
+        ((M + 31) // 32) * blk.dw_a * 4 * k_chunks,
+        (N // blk.b_rows) * blk.dw_b * 4 * k_chunks,
+    )
+
+
+def mxpsh_w_scale_block(M: int, N: int, K: int, x_scale, w_scale) -> str:
+    """Which scale contract a pair of flat buffers spells, by element count.
+
+    Returns the tuned table's ``w_scale_block`` ("128x128" or "1x32"). Raises
+    when neither matches -- a mis-sized buffer must not pick the other layout
+    and read garbage.
+    """
+    got = (int(x_scale.numel()), int(w_scale.numel()))
+    want = {block: mxpsh_scale_elems(M, N, K, block) for block in W_SCALE_BLOCKS}
+    for block, elems in want.items():
+        if got == elems:
+            return block
+    raise RuntimeError(
+        f"[FlyDSL gfx950 mxpsh] (x_scale, w_scale) of {got} elements at "
+        f"M={M} N={N} K={K} is neither "
+        + " nor ".join(f"{block} {elems}" for block, elems in want.items())
+        + ". Prepare them with aiter.ops.shuffle.shuffle_scale_blockscale_a/_b "
+        "(128x128) or shuffle_scale_a16w4 (1x32)."
+    )
 
 
 @functools.cache
@@ -83,7 +123,7 @@ def flydsl_mxscale_preshuffle_gemm(
     waves_per_eu: int = 0,
     xcd_swizzle: int = 0,
     split_k: int = 1,
-    blockscale: bool = True,
+    w_scale_block: str = DEFAULT_W_SCALE_BLOCK,
     stream=None,
 ) -> torch.Tensor:
     """Run the gfx950 MXFP4/6/8 preshuffle GEMM. a8w8 = a_dtype="fp8", b_dtype="fp8".
@@ -95,15 +135,19 @@ def flydsl_mxscale_preshuffle_gemm(
     arriving block for each output tile reduces them in FP32 and writes Out.
     Other shapes write fp32 partial slabs and launch a separate reduce kernel.
 
-    blockscale selects the scale format and **defaults to True** -- the coarse
-    blockscale path is the one this op is tuned for. It is a8w8-only and needs
-    N%128==0; fp4/fp6 operands (a4w4 / a6w4) must pass blockscale=False.
+    w_scale_block is the scale block -- the same string the tuned table, this op
+    and the kernel's Constexpr all use -- and **defaults to "128x128"**, the
+    historical default of this op.
 
-    * blockscale=True: a_scale/b_scale are the *compact-shuffled* blockscale buffers
-      the caller built via aiter.ops.shuffle.shuffle_scale_blockscale_a/_b from the
-      coarse E8M0 (A 1x128 [rows, K//128], B 128x128 [N//128, K//128]).
-    * blockscale=False: a_scale/b_scale are per-1x32 E8M0 run through
-      `shuffle_scale_a16w4`.
+    * "128x128": a_scale/b_scale are the *compact-shuffled* blockscale buffers
+      the caller built via aiter.ops.shuffle.shuffle_scale_blockscale_a/_b from
+      the coarse E8M0 (A 1x128 [rows, K//128], B 128x128 [N//128, K//128]).
+      a8w8-only, N%128==0.
+    * "1x32": a_scale/b_scale are per-1x32 E8M0 (A [pad32(M), K//32],
+      B [N, K//32]) run through aiter.ops.shuffle.shuffle_scale_a16w4(., 1, False)
+      and flattened. This is the MX format the scaled MFMA consumes natively, so
+      the shuffle is the MoE weight-scale one; N only needs %32. fp4/fp6 operands
+      (a4w4 / a6w4) always take this block.
 
     Either way the op does NOT repack -- the caller pre-shuffles. For blockscale the
     kernel broadcasts to the 1x32 scaled-MFMA via the scale load address. Prepare the
@@ -138,24 +182,31 @@ def flydsl_mxscale_preshuffle_gemm(
             f"unsupported Out dtype {Out.dtype}; expected bfloat16 or float16"
         )
 
-    # blockscale is the default path; an unsupported shape is an error rather than
-    # a silent downgrade, so a4w4/a6w4 callers have to opt out explicitly.
-    if blockscale:
-        if a_dtype != "fp8" or b_dtype != "fp8":
-            raise ValueError(
-                f"blockscale is a8w8-only; got a_dtype={a_dtype!r} b_dtype={b_dtype!r}"
-            )
-        if N % 128 != 0:
-            raise ValueError(f"blockscale requires N ({N}) to be a multiple of 128")
-    # a_scale/b_scale are already compact-shuffled by the caller
-    # (shuffle_scale_blockscale_a/_b). No per-call repack here.
-    bs_mode = "ab" if blockscale else "none"
+    blk = W_SCALE_BLOCKS.get(w_scale_block)
+    if blk is None:
+        raise ValueError(
+            f"unsupported w_scale_block {w_scale_block!r}; expected one of "
+            f"{sorted(W_SCALE_BLOCKS)}"
+        )
+    # An unsupported shape is an error rather than a silent downgrade, so an
+    # a4w4/a6w4 caller has to pick its block explicitly.
+    if blk.bs_b and (a_dtype != "fp8" or b_dtype != "fp8"):
+        raise ValueError(
+            f"a coarse B scale ({w_scale_block}) is a8w8-only; got "
+            f"a_dtype={a_dtype!r} b_dtype={b_dtype!r}"
+        )
+    if N % blk.b_rows != 0:
+        raise ValueError(
+            f"w_scale_block {w_scale_block} indexes B scales by {blk.b_rows}-N "
+            f"super-row; N ({N}) must be a multiple of {blk.b_rows}"
+        )
+    # a_scale/b_scale are already compact-shuffled by the caller. No repack here.
     split_k = int(split_k)
     # For the latency-sensitive M<=16 path, keep the split partials in BF16 and
     # let the last arriving GEMM block reduce them. This avoids a second launch
     # without introducing output atomics or a grid-wide spin wait.
     splitk_fused = (
-        blockscale
+        blk.bs_a  # the fused M<=16 reduce needs the broadcast A scale
         and split_k > 1
         and M <= 16
         and int(tile_m) == 16
@@ -196,7 +247,7 @@ def flydsl_mxscale_preshuffle_gemm(
         int(waves_per_eu),
         int(xcd_swizzle),
         split_k,  # k_batch
-        bs_mode,  # blockscale
+        w_scale_block,
     )
     multi_row = int(tile_m) == 16 and M > 1
     gemm_exe = _gemm_exe(cfg, splitk_fused, multi_row)
@@ -307,12 +358,12 @@ def _warn_untuned(M, N, K, a_dtype, b_dtype, kernel_name):
 
 
 @functools.lru_cache(maxsize=1024)
-def _heuristic_tile(a_dtype, b_dtype, M, N, K):
+def _heuristic_tile(a_dtype, b_dtype, M, N, K, w_scale_block):
     from aiter.jit.utils.chip_info import get_cu_num
 
     from .gemm_tune.flydsl_gemm_mxscale_preshuffle_common import candidates_for
 
-    cands = [ki for _, ki in candidates_for(a_dtype, b_dtype, M, N, K)]
+    cands = [ki for _, ki in candidates_for(a_dtype, b_dtype, M, N, K, w_scale_block)]
     if not cands:
         return None
 
@@ -340,14 +391,20 @@ def _heuristic_tile(a_dtype, b_dtype, M, N, K):
     )
 
 
-def run_gemm_a8w8_mxscale_preshuffle_gfx950(XQ, WQ, x_scale, w_scale, Out, kernel_name):
+def run_gemm_a8w8_mxscale_preshuffle_gfx950(
+    XQ, WQ, x_scale, w_scale, Out, kernel_name, w_scale_block=None
+):
     """Dispatch the gfx950 mxpsh GEMM by tuned kernelName.
 
-    ``x_scale`` / ``w_scale`` must ALREADY be shuffled by
-    ``aiter.ops.shuffle.shuffle_scale_blockscale_a`` / ``_b`` -- caller-side prep,
+    ``x_scale`` / ``w_scale`` must ALREADY be shuffled -- caller-side prep,
     exactly like ``shuffle_weight`` for B. B's scale is a weight, so it is shuffled
     once at weight-prep time; A's is an activation, so it is shuffled per call
-    alongside quantization. Both are flat fp8_e8m0 buffers.
+    alongside quantization. Both are flat fp8_e8m0 buffers, either
+    ``shuffle_scale_blockscale_a`` / ``_b`` (coarse 1x128 / 128x128) or
+    ``shuffle_scale_a16w4(., 1, False)`` (per-1x32 MX, see the module docstring).
+
+    ``w_scale_block`` names which of the two, as the tuned table spells it;
+    None reads it off the buffer sizes, which the two layouts never share.
     """
     from .gemm_tune.flydsl_gemm_mxscale_preshuffle_common import parse_kernel_name
 
@@ -374,19 +431,21 @@ def run_gemm_a8w8_mxscale_preshuffle_gfx950(XQ, WQ, x_scale, w_scale, Out, kerne
 
     M, K = int(XQ.shape[0]), int(XQ.shape[-1])
     N = int(Out.shape[-1])
-    k_chunks = (K + 255) // 256
-    want_a = (M + 31) // 32 * 32 * 2 * k_chunks
-    want_b = (N // 128) * 4 * k_chunks
-    for name, s, want, helper in (
-        ("x_scale", x_scale, want_a, "shuffle_scale_blockscale_a(x_scale, K)"),
-        ("w_scale", w_scale, want_b, "shuffle_scale_blockscale_b(w_scale, N, K)"),
-    ):
+    if w_scale_block is None:
+        w_scale_block = mxpsh_w_scale_block(M, N, K, x_scale, w_scale)
+    if w_scale_block not in W_SCALE_BLOCKS:
+        raise ValueError(
+            f"[FlyDSL gfx950 mxpsh] w_scale_block {w_scale_block!r} is not one of "
+            f"{sorted(W_SCALE_BLOCKS)}"
+        )
+    want_a, want_b = mxpsh_scale_elems(M, N, K, w_scale_block)
+    for name, s, want in (("x_scale", x_scale, want_a), ("w_scale", w_scale, want_b)):
         if s.dim() != 1 or s.numel() != want or not s.is_contiguous():
             raise RuntimeError(
-                f"[FlyDSL gfx950 mxpsh] {name} must be the shuffled flat buffer "
-                f"({want} contiguous elements, 1-D), got {tuple(s.shape)} "
-                f"stride {tuple(s.stride())}. Prepare it with "
-                f"aiter.ops.shuffle.{helper}."
+                f"[FlyDSL gfx950 mxpsh] {name} must be the {w_scale_block} shuffled "
+                f"flat buffer ({want} contiguous elements, 1-D), got "
+                f"{tuple(s.shape)} stride {tuple(s.stride())}; this module's "
+                f"docstring spells the shuffle for each block."
             )
 
     return flydsl_mxscale_preshuffle_gemm(
@@ -403,5 +462,5 @@ def run_gemm_a8w8_mxscale_preshuffle_gfx950(XQ, WQ, x_scale, w_scale, Out, kerne
         waves_per_eu=p["waves_per_eu"],
         xcd_swizzle=p["xcd_swizzle"],
         split_k=p["split_k"],
-        blockscale=True,
+        w_scale_block=w_scale_block,
     )

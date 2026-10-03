@@ -27,6 +27,7 @@ from ..ops.gemm_op_common import (
     find_padded_m_row,
     get_padded_m,
     mxscale_w_scale_block,
+    with_mxscale_w_scale_block,
 )
 from ..utility import dtypes
 from ..utility.graph_alloc import persistent_alloc
@@ -263,8 +264,14 @@ def gemm_a8w8_mxscale_preshuffle_flydsl(
     w_scale: Tensor,
     Out: Tensor,
     config: dict,
+    w_scale_block: str | None = None,
 ) -> Tensor:
-    """gfx950 FlyDSL MX-microscale preshuffle GEMM (CDNA4 scaled-MFMA)."""
+    """gfx950 FlyDSL MX-microscale preshuffle GEMM (CDNA4 scaled-MFMA).
+
+    ``w_scale_block`` is the scale contract of the flat ``x_scale``/``w_scale``
+    buffers, as the tuned table spells it ("128x128" or "1x32"); None reads it
+    off their sizes.
+    """
     kernel_name = str(config.get("kernelName", ""))
     if get_gfx() != "gfx950":
         raise RuntimeError(
@@ -275,7 +282,7 @@ def gemm_a8w8_mxscale_preshuffle_flydsl(
     )
 
     return run_gemm_a8w8_mxscale_preshuffle_gfx950(
-        XQ, WQ, x_scale, w_scale, Out, kernel_name
+        XQ, WQ, x_scale, w_scale, Out, kernel_name, w_scale_block
     )
 
 
@@ -925,6 +932,7 @@ def _load_mxscale_bpreshuffle_tuned(bmm: bool) -> dict:
     (``bmm``) or to the shuffled-scale 2D-GEMM rows."""
     path = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE_FILE
     df = pd.read_csv(path).drop_duplicates()
+    df = with_mxscale_w_scale_block(df, path)
     is_bmm = (df["libtype"].astype(str) == "flydsl") & (
         df["kernelId"].astype(str) == MXSCALE_BMM_KERNEL_ID
     )
@@ -970,8 +978,6 @@ def get_mxscale_bpreshuffle_config(
 
 # The blockscale x_scale block: a 1x128 x_scale has column-major bytes.
 _BLOCKSCALE_X_BLOCK = 128
-
-MXPSH_W_SCALE_BLOCK = "128x128"
 
 
 def _gemm_mxscale_bpreshuffle(XQ, WQ, x_scale, w_scale, Y):
@@ -1287,8 +1293,9 @@ def gemm_a8w8_blockscale_bpreshuffle(
             )
 
     # gfx950 e8m0 has two implementations; the scale layout tells them apart.
-    #   1-D flat -> the caller pre-shuffled with shuffle_scale_blockscale_a/_b,
-    #               a layout only the mxpsh 2D GEMM reads.
+    #   1-D flat -> the caller pre-shuffled with shuffle_scale_blockscale_a/_b
+    #               (128x128) or shuffle_scale_mx_a/_b (1x32), layouts only the
+    #               mxpsh 2D GEMM reads. Which of the two is read off their size.
     #   2-D raw  -> the batched-B=1 path, which also covers group32 (1x32).
     if (
         get_gfx() == "gfx950"
@@ -1296,30 +1303,40 @@ def gemm_a8w8_blockscale_bpreshuffle(
         and w_scale.dtype == dtypes.fp8_e8m0
     ):
         if x_scale.dim() == 1 and w_scale.dim() == 1:
+            from ..ops.flydsl.mxscale_preshuffle_kernels import (
+                _heuristic_tile,
+                mxpsh_w_scale_block,
+            )
+
+            w_scale_block = mxpsh_w_scale_block(m, n, k, x_scale, w_scale)
             config = get_mxscale_bpreshuffle_config(
-                m, n, k, MXPSH_W_SCALE_BLOCK, False  # not bmm
+                m, n, k, w_scale_block, False  # not bmm
             )
             if config is not None and config["libtype"] == "flydsl":
                 return gemm_a8w8_mxscale_preshuffle_flydsl(
-                    XQ, WQ, x_scale, w_scale, Y, config
+                    XQ, WQ, x_scale, w_scale, Y, config, w_scale_block
                 )
 
-            from ..ops.flydsl.mxscale_preshuffle_kernels import _heuristic_tile
-
-            ki = _heuristic_tile("fp8", "fp8", m, n, k)
+            ki = _heuristic_tile("fp8", "fp8", m, n, k, w_scale_block)
             if ki is None:
                 # Cannot fall through: the scales are the MX kernel's shuffled
                 # flat buffers, which the fp32 backends below would read as
                 # garbage.
+                from ..ops.flydsl.gemm_tune import (
+                    flydsl_gemm_mxscale_preshuffle_common as _mxpsh_cat,
+                )
+
+                b_rows = _mxpsh_cat.W_SCALE_BLOCKS[w_scale_block].b_rows
                 raise RuntimeError(
                     f"gemm_a8w8_blockscale_bpreshuffle: no legal gfx950 MX tile "
-                    f"for M={m}, N={n}, K={k} (needs N%128==0 and K%128==0)"
+                    f"for M={m}, N={n}, K={k} at w_scale_block {w_scale_block} "
+                    f"(needs N%{b_rows}==0 and K%128==0)"
                 )
             _warn_untuned_flydsl_fallback(
                 "gfx950", "gemm_a8w8_blockscale_bpreshuffle", n, k
             )
             return gemm_a8w8_mxscale_preshuffle_flydsl(
-                XQ, WQ, x_scale, w_scale, Y, {"kernelName": ki.name}
+                XQ, WQ, x_scale, w_scale, Y, {"kernelName": ki.name}, w_scale_block
             )
         return _gemm_mxscale_bpreshuffle(XQ, WQ, x_scale, w_scale, Y)
 

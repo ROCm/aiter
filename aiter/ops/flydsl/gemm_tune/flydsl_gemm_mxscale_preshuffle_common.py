@@ -19,26 +19,43 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass
+from typing import NamedTuple
 
 _DTYPE_SHORT = {"fp8": "F8", "fp6": "F6", "fp4": "F4", "bf16": "B16", "fp16": "F16"}
 _SHORT_DTYPE = {v: k for k, v in _DTYPE_SHORT.items()}
 
+
+class WScaleBlock(NamedTuple):
+    """What one e8m0 w_scale block means to this kernel.
+
+    ``bs_a`` / ``bs_b``: the scale broadcasts over A's K lanes / over B's N
+    block, i.e. the kernel's ``_bs_a`` / ``_bs_b``. ``dw_a`` / ``dw_b``: the
+    A / B scale dwords it then reads per 32-row super-block and 256-K chunk
+    (``_sc_k0_a`` / ``_sc_k0_b``). ``b_rows``: the N one B scale super-row spans
+    (``_b_sc_rows``), which is also the N granularity a shape must meet.
+    """
+
+    bs_a: bool
+    bs_b: bool
+    dw_a: int
+    dw_b: int
+    b_rows: int
+
+
+# The blocks the kernel reads, and the one string that names each of them all the
+# way down: the tuned table's column, the op's argument, the kernel's Constexpr
+# and the GPU symbol suffix. Supporting a new block (32x32 is next) is one row.
+W_SCALE_BLOCKS = {
+    "128x128": WScaleBlock(bs_a=True, bs_b=True, dw_a=16, dw_b=1, b_rows=128),
+    "1x32": WScaleBlock(bs_a=False, bs_b=False, dw_a=64, dw_b=64, b_rows=32),
+}
+DEFAULT_W_SCALE_BLOCK = "128x128"
+
 # a/b operand combos the kernel supports (a4w4 / a6w4 / a8w8).
 _COMBOS = [("fp4", "fp4"), ("fp6", "fp4"), ("fp8", "fp8")]
-# Keep 16 last so adding the M=1-specialized blockscale tile does not renumber
-# existing kernel IDs recorded in tuned CSVs.
 _TILE_M = (32, 64, 96, 128, 256, 16)
-# tile_n=16/32 use fewer N-waves (block 64/128) so wide-N small-M shapes launch more
-# workgroups (WG=N/tile_n) and fill the CUs; tile_n>=64 keeps 4 waves / block 256.
 _TILE_N = (16, 32, 64, 128, 256, 512)
 _TILE_K = (128, 256)
-# Occupancy hints, following the (0, 2, 4) selection
-# flydsl/kernels/small_m_hgemm.py already uses: 0 (no hint) is a distinct mode,
-# and the odd values in between duplicate their neighbours rather than adding
-# reach. Measured over 197500 tuned candidates / 80 shapes, all five values won
-# about equally often (18/13/15/16/18) -- they supply extra draws, not extra
-# coverage -- and dropping 1 and 3 costs a median 0.01% / worst 1.55%, well
-# inside the +-7-10% run-to-run spread a re-tune of the same space shows.
 _WAVES_PER_EU = (0, 2, 4)
 _XCD_SWIZZLE = (0, 4)  # L2-rasterization XCD swizzle group size (0=off)
 MAX_SPLIT_K = 32
@@ -86,25 +103,28 @@ def make_kernel_name(
     waves_per_eu: int,
     xcd_swizzle: int = 0,
     split_k: int = 1,
-    blockscale: str = "none",
+    w_scale_block: str | None = None,
 ) -> str:
     """The one place the mxpsh kernelName is spelled.
 
     Shared by the tune catalog (`kernelInstance.name` -> the tuned CSV) and by the
     kernel itself (`@flyc.kernel(name=...)` -> the GPU symbol), so a profile line
-    can be matched back to its CSV row. `blockscale != "none"` is a distinct
-    Constexpr -> distinct binary, so the GPU symbol gets a suffix to keep profiles
-    apart. The suffix is deliberately NOT part of the CSV grammar
-    (`parse_kernel_name` returns None for it) and never reaches `kernelInstance.name`:
-    the CSV keeps one spelling per launch config, so CSVs tuned before the suffix
-    existed keep working unchanged.
+    can be matched back to its CSV row.
+
+    `w_scale_block=None` is the CSV spelling: the tuned table keeps one row per
+    launch config and names the block in its own column, so the name must not
+    repeat it. Passing a block gives the GPU symbol, which always names it --
+    each block is a distinct Constexpr and therefore a distinct binary, and a
+    profile line has no column to read it from. The suffix is deliberately NOT
+    part of the CSV grammar (`parse_kernel_name` returns None for it) and never
+    reaches `kernelInstance.name`, so CSVs tuned before it existed keep working.
     """
     a, b, o = _DTYPE_SHORT[a_dtype], _DTYPE_SHORT[b_dtype], _DTYPE_SHORT[out_dtype]
     name = (
         f"flydsl_mxpsh_{tile_m}x{tile_n}x{tile_k}"
         f"_{a}_{b}_{o}_w{waves_per_eu}_x{xcd_swizzle}_sk{split_k}"
     )
-    return name if blockscale == "none" else f"{name}_bs{blockscale}"
+    return name if w_scale_block is None else f"{name}_bs{w_scale_block}"
 
 
 @dataclass
@@ -185,7 +205,8 @@ def instance_valid(ki: kernelInstance) -> bool:
         ki.tile_m == 16 and (ki.a_dtype, ki.b_dtype) == ("fp8", "fp8")
     ):
         # The per-1x32 MX path packs M chunks in pairs. The M=16 exception is
-        # reserved for the blockscale a8w8 path, where one A scale broadcasts.
+        # reserved for the blockscale a8w8 path, where one A scale broadcasts;
+        # ``fits_shape`` keeps it out of the MX candidate set.
         return False
     if ki.tile_n % 16 != 0:  # MFMA emits 16 N-cols; tile_n must be a multiple of 16
         return False
@@ -204,23 +225,19 @@ def instance_valid(ki: kernelInstance) -> bool:
     return not estimated_lds_bytes(ki) > _max_lds_bytes()
 
 
-def fits_shape(ki: kernelInstance, M: int, N: int, K: int) -> bool:
-    """M is ragged (grid ceil + OOB clip). K must be a multiple of 128: each e8m0
-    microscale half is 128-K, and tile_k=128 pairs two halves into one 256-K scale
-    word (shuffle_scale rounds K up to a whole 256-K chunk). K%tile_k excludes
-    tile_k=256 when K%256!=0, so a K=384 shape only matches tile_k=128 kernels.
-
-    split-K legality (split_k>1): the per-split K length (K/split_k) must stay a
-    whole number of tile_k K-tiles AND a whole number of 256-K e8m0 scale chunks,
-    so the split boundary never straddles a tile or a microscale word."""
+def fits_shape(ki: kernelInstance, M: int, N: int, K: int, w_scale_block: str) -> bool:
+    blk = W_SCALE_BLOCKS.get(w_scale_block)
+    if blk is None:
+        raise ValueError(
+            f"w_scale_block {w_scale_block!r} is not one of {sorted(W_SCALE_BLOCKS)}"
+        )
     if K % 128 != 0:
         return False
-    if ki.tile_m == 16 and M > 16:
+    if ki.tile_m == 16 and (M > 16 or not blk.bs_a):
         return False
-    # blockscale is a8w8-only and needs whole 128-N blocks: shuffle_scale_blockscale_b
-    # takes (N//128, K//128) and the kernel reads 4 dwords per 128-N block. fp4/fp6
-    # combos run the per-1x32 MX path (blockscale=False) and are exempt.
-    if (ki.a_dtype, ki.b_dtype) == ("fp8", "fp8") and N % 128 != 0:
+    if blk.bs_b and (ki.a_dtype, ki.b_dtype) != ("fp8", "fp8"):
+        return False
+    if N % blk.b_rows != 0:
         return False
     if (N % ki.tile_n != 0) or (K % ki.tile_k != 0):
         return False
@@ -264,10 +281,20 @@ def _build_kernels_list():
 kernels_list = _build_kernels_list()
 
 
-def candidates_for(a_dtype: str, b_dtype: str, M: int, N: int, K: int):
-    """(kernel_id, kernelInstance) that match the dtypes and fit the shape."""
+def candidates_for(
+    a_dtype: str,
+    b_dtype: str,
+    M: int,
+    N: int,
+    K: int,
+    w_scale_block: str,
+):
+    """(kernel_id, kernelInstance) that match the dtypes and fit the shape under
+    ``w_scale_block``."""
     return [
         (i, ki)
         for i, ki in kernels_list.items()
-        if ki.a_dtype == a_dtype and ki.b_dtype == b_dtype and fits_shape(ki, M, N, K)
+        if ki.a_dtype == a_dtype
+        and ki.b_dtype == b_dtype
+        and fits_shape(ki, M, N, K, w_scale_block)
     ]
