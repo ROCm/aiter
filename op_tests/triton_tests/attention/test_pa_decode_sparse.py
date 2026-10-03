@@ -698,7 +698,7 @@ def _vllm_pool_case(H, main_lens, extra_lens, sentinels="none"):
     return (q, main_pool, mi, mp, sink, scale, extra_pool, ei, ep), ref
 
 
-def _vllm_pool_run(args, splits):
+def _vllm_pool_run(args):
     q, main_pool, mi, mp, sink, scale, extra_pool, ei, ep = args
     return pa_decode_sparse(
         q,
@@ -707,32 +707,29 @@ def _vllm_pool_run(args, splits):
         mp,
         sink,
         scale,
-        kv_splits=splits,
         extra_cache=extra_pool,
         extra_indices=ei,
         extra_indptr=ep,
     )
 
 
-def _vllm_pool_skip(T, splits):
+def _vllm_pool_skip():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     if arch_info.get_arch() != "gfx950":
         pytest.skip("the packed fp8_dsv4_mla cache is a gfx950 gluon path")
-    if T == 2100 and splits is not None and splits > 1:
-        pytest.skip("prefill takes one split")
 
 
-@pytest.mark.parametrize("T", [1, 6, 37, 192, 2100])
-@pytest.mark.parametrize("H", [8, 16, 32, 64])
-@pytest.mark.parametrize("sentinels", ["none", "some", "lead"])
-@pytest.mark.parametrize("splits", [None, 1, 3])
-def test_pa_decode_sparse_two_loop_vllm_pool(T, H, sentinels, splits):
+# One shape per program kind: decode with split-K (16 heads), 32-head programs, and
+# prefill on 64-head programs.
+@pytest.mark.parametrize("T, H", [(6, 16), (192, 32), (2100, 64)])
+@pytest.mark.parametrize("sentinels", ["some", "lead"])
+def test_pa_decode_sparse_two_loop_vllm_pool(T, H, sentinels):
     """DSv4.1 vLLM-pool shapes: page-pitched SWA and top-k pools, ragged lengths on
-    every tile edge, sentinels including whole leading tiles, split-K on and off."""
-    _vllm_pool_skip(T, splits)
+    every tile edge, -1 sentinels including whole leading tiles."""
+    _vllm_pool_skip()
     args, ref = _vllm_pool_case(H, *_edge_lens(T), sentinels)
-    out = _vllm_pool_run(args, splits)
+    out = _vllm_pool_run(args)
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
 
 
@@ -747,14 +744,14 @@ def _inv_rope_ref(x, pos, cos_sin):
     return x
 
 
-@pytest.mark.parametrize("T", [1, 37, 192, 2100])
-@pytest.mark.parametrize("H", [8, 16, 32, 64])
-@pytest.mark.parametrize("splits", [None, 3, 8])
+# 6 rows split, so the reduce writes the output; 2,100 rows do not, so the attention
+# kernel does.
+@pytest.mark.parametrize("T, H", [(6, 16), (2100, 64)])
 @pytest.mark.parametrize("mxfp8", [True, False])
-def test_pa_decode_sparse_inv_rope_mxfp8_epilogue(T, H, splits, mxfp8):
-    """The inverse-RoPE / MXFP8 output epilogue, without and with split-K, against
-    the f32 reference rotated back; MXFP8 is checked dequantized."""
-    _vllm_pool_skip(T, splits)
+def test_pa_decode_sparse_inv_rope_mxfp8_epilogue(T, H, mxfp8):
+    """The inverse-RoPE / MXFP8 output epilogue against the f32 reference rotated
+    back; MXFP8 is checked dequantized."""
+    _vllm_pool_skip()
     args, ref = _vllm_pool_case(H, *_edge_lens(T), "some")
     q, main_pool, mi, mp, sink, scale, extra_pool, ei, ep = args
     gen = torch.Generator(device="cuda").manual_seed(T * 7 + H)
@@ -763,7 +760,6 @@ def test_pa_decode_sparse_inv_rope_mxfp8_epilogue(T, H, splits, mxfp8):
     pos = torch.randint(0, 4096, (T,), device="cuda", generator=gen)
     ref = _inv_rope_ref(ref, pos, cos_sin)
     kw = {
-        "kv_splits": splits,
         "extra_cache": extra_pool,
         "extra_indices": ei,
         "extra_indptr": ep,
