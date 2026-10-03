@@ -1089,6 +1089,7 @@ def gen_fmha_v3_varlen_fwd_fake_tensor(
     gen: torch.Generator | None = None,
     cu_seqlens_q_padded: torch.Tensor | None = None,
     cu_seqlens_k_padded: torch.Tensor | None = None,
+    num_splits: int = 0,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     device = q.device
     dtype = q.dtype
@@ -1115,7 +1116,7 @@ def gen_fmha_v3_varlen_fwd_fake_tensor(
         p_shape = (num_heads, total_q, max_seqlen_k)
         p_tensor = torch.empty(p_shape, device=device, dtype=torch.uint8)
     else:
-        p_tensor = torch.empty((0,), device=device)
+        p_tensor = torch.empty((0,), device=device, dtype=dtype)
 
     rng_state_tensor = torch.empty((2,), device=device, dtype=torch.int64)
 
@@ -1156,6 +1157,7 @@ def fmha_v3_varlen_fwd(
     gen: torch.Generator | None = None,
     cu_seqlens_q_padded: torch.Tensor | None = None,
     cu_seqlens_k_padded: torch.Tensor | None = None,
+    num_splits: int = 0,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
