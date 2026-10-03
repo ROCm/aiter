@@ -42,6 +42,18 @@ def _get_flydsl_gemm_kernels():
     return gemm_kernels
 
 
+def is_flydsl_decode_config(config: dict | None) -> bool:
+    """True when a tuned row selects a FlyDSL exact-M decode kernel.
+
+    For callers outside aiter (vLLM) that must not match on libtype labels.
+    """
+    return bool(
+        config
+        and config.get("libtype") == "flydsl"
+        and (config.get("kernelName") or "").startswith("flydsl_decode_")
+    )
+
+
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
 extensions_created = False
@@ -108,6 +120,37 @@ def is_skinny_default_shape(
     )
 
 
+def _check_flydsl_decode_row(
+    config, M, N, K, gfx, bias, dtype, otype, scaleAB, bpreshuffle
+):
+    """Return the tuned decode row if its kernel fits this call, else None."""
+    gemm_kernels = _get_flydsl_gemm_kernels()
+    name = config["kernelName"]
+    params = gemm_kernels.get_flydsl_decode_kernel_params(name)
+    if params is None:
+        reason = "is not a valid decode kernel name"
+    else:
+        reason = gemm_kernels.check_flydsl_decode_row(
+            params,
+            M,
+            N,
+            K,
+            gfx,
+            bias,
+            eval(dtype),
+            eval(otype),
+            scaleAB,
+            bpreshuffle,
+        )
+    if reason is None:
+        return config
+    logger.warning(
+        f"FlyDSL kernel '{name}' from tuned config {reason}; "
+        "falling back to next candidate."
+    )
+    return None
+
+
 @functools.lru_cache(maxsize=4096)
 def get_GEMM_A16W16_config(
     M: int,
@@ -143,7 +186,15 @@ def get_GEMM_A16W16_config(
             None,
         )
         if config is not None:
-            if config["libtype"] == "flydsl":
+            if is_flydsl_decode_config(config):
+                # Exact-M kernels are never reused for a padded M.
+                if padded_M != M:
+                    config = None
+                else:
+                    config = _check_flydsl_decode_row(
+                        config, M, N, K, gfx, bias, dtype, otype, scaleAB, bpreshuffle
+                    )
+            elif config["libtype"] == "flydsl":
                 flydsl_config = (
                     _get_flydsl_gemm_kernels().get_flydsl_hgemm_kernel_params(
                         config["kernelName"]
@@ -538,6 +589,10 @@ def flydsl_gemm(
         scale_a is None and scale_b is None and scale_c is None
     ), "FlyDSL hgemm does not support scaling yet."
     flydsl_gemm_kernels = _get_flydsl_gemm_kernels()
+    if is_flydsl_decode_config(config):
+        return flydsl_gemm_kernels.flydsl_decode_gemm(
+            inp, weights, config["kernelName"], bias=bias
+        )
     flydsl_config = flydsl_gemm_kernels.get_flydsl_hgemm_kernel_params(
         config["kernelName"]
     )

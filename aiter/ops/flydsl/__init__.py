@@ -27,6 +27,8 @@ if _base_version < _MIN_FLYDSL_VERSION:
     )
 
 _LAZY_IMPORTS = {
+    "BlockMfmaDecodeConfig": (".gemm_kernels", "BlockMfmaDecodeConfig"),
+    "DecodeConfig": (".gemm_kernels", "DecodeConfig"),
     "FP8_MQA_LOGITS_DEFAULT_VARIANT": (
         ".fp8_mqa_logits_kernels",
         "DEFAULT_VARIANT",
@@ -36,6 +38,7 @@ _LAZY_IMPORTS = {
         "KERNEL_VARIANTS",
     ),
     "QuickAllReduceInt4": (".quick_allreduce_int4", "QuickAllReduceInt4"),
+    "WaveDecodeConfig": (".gemm_kernels", "WaveDecodeConfig"),
     "compute_varqlen_windows": (
         ".kernels.mqa_logits.pa_mqa_logits_fp4_prefill",
         "compute_varqlen_windows",
@@ -106,6 +109,7 @@ _LAZY_IMPORTS = {
         ".gather_kv_b_proj",
         "gather_kv_b_proj_flydsl_supported",
     ),
+    "gemm_decode_bf16": (".gemm_kernels", "gemm_decode_bf16"),
     "pa_decode": (".pa_decode", "pa_decode"),
     "gather_kv_b_proj_flydsl_fp8_supported": (
         ".gather_kv_b_proj",
@@ -116,8 +120,11 @@ _LAZY_IMPORTS = {
 __all__ = [
     "FP8_MQA_LOGITS_DEFAULT_VARIANT",
     "FP8_MQA_LOGITS_VARIANTS",
+    "BlockMfmaDecodeConfig",
+    "DecodeConfig",
     "GateMode",
     "QuickAllReduceInt4",
+    "WaveDecodeConfig",
     "compute_varqlen_windows",
     "flydsl_conv_implicit",
     "flydsl_flash_attn_fp8_func",
@@ -141,6 +148,7 @@ __all__ = [
     "gather_kv_b_proj_flydsl",
     "gather_kv_b_proj_flydsl_fp8_supported",
     "gather_kv_b_proj_flydsl_supported",
+    "gemm_decode_bf16",
     "pa_decode",
 ]
 
