@@ -188,8 +188,15 @@ _PLAIN_K2048_SHORT_MAX_ROWS = 128
 # 129..255 rows from 8192 to 65536 columns (0.37x--0.85x) and at 129..4000
 # rows from 65537 to 131071 columns (0.42x--0.89x).  Past 80 * 1024 columns
 # plain falls back to its generic kernel and decode is faster again at 8..32
-# rows from 100000 columns, so the few-row band stops there.  Widths the
-# stream small-reject path serves stay with it.
+# rows from 100000 columns, so the few-row band stops there.  Rows the
+# stream small-reject path serves with its specialised branch -- one or two
+# rejected columns (`REJECTS <= 2` in `_stream_small_reject_kernel`) -- stay
+# with it: 1.09x-1.60x faster than plain at 1..16384 rows, bar 6..8 rows at two
+# rejects (2-4% slower).  From three rejects on, its rejection mask and prefix
+# scan run slower than plain at every row count measured, 1..16384 (plain
+# 0.54x-0.94x of it at 2051..2056 columns), so plain keeps those rows; the
+# kernel's wider limits (`_stream_small_reject`) still serve `stream` itself.
+_PLAIN_K2048_SMALL_REJECT_YIELD_MAX = 2
 _PLAIN_K2048_NARROW_WIDTH = 8192
 _PLAIN_K2048_FEW_ROWS = 128
 _PLAIN_K2048_FEW_ROWS_MAX_WIDTH = 80 * 1024
@@ -615,7 +622,11 @@ def _plain_takes(rows: int, width: int, k: int) -> bool:
     """Enough rows for the row-scaling selector, on a width it is tuned for."""
     if k == 2048 and get_gfx_runtime() == "gfx950":
         if width < _PLAIN_K2048_NARROW_WIDTH:
-            return width > k and not _stream_small_reject(rows, width - k)
+            rejects = width - k
+            return rejects > 0 and not (
+                rejects <= _PLAIN_K2048_SMALL_REJECT_YIELD_MAX
+                and _stream_small_reject(rows, rejects)
+            )
         if rows <= _PLAIN_K2048_FEW_ROWS:
             return width <= _PLAIN_K2048_FEW_ROWS_MAX_WIDTH
         return width <= _PLAIN_K2048_MAX_WIDTH
