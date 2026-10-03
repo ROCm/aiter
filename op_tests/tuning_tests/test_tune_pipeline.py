@@ -33,6 +33,15 @@ def _gpu_available():
         return False
 
 
+def _get_gfx():
+    try:
+        from aiter.jit.utils.chip_info import get_gfx
+
+        return get_gfx()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _get_platform_dtypes():
     """Return (fp8_str, quant_type_str) based on GPU arch."""
     try:
@@ -286,6 +295,72 @@ class TestTunePipeline(unittest.TestCase):
                 "timeout": 1800,
                 "timeout_mp1": 2400,
             },
+            "fhmoe": {
+                "script": "op_tests/tuners/tune_fhmoe.py",
+                "header": [
+                    "gfx",
+                    "cu_num",
+                    "token",
+                    "model_dim",
+                    "inter_dim",
+                    "expert",
+                    "topk",
+                    "shared_expert_id",
+                    "act_type",
+                    "dtype",
+                    "q_dtype_a",
+                    "q_dtype_w",
+                    "q_type",
+                    "use_g1u1",
+                    "doweight_stage1",
+                    "hidden_pad",
+                    "intermediate_pad",
+                    "gate_mode",
+                    "block_m",
+                    "ksplit",
+                    "kernelName1",
+                    "kernelName2",
+                ],
+                "shapes": [
+                    (
+                        "gfx950",
+                        256,
+                        32,
+                        6144,
+                        256,
+                        257,
+                        9,
+                        256,
+                        "ActivationType.Silu",
+                        "torch.bfloat16",
+                        "torch.float8_e4m3fn",
+                        "torch.float8_e4m3fn",
+                        "QuantType.per_1x32",
+                        1,
+                        0,
+                        0,
+                        0,
+                        "GateMode.INTERLEAVE",
+                        32,
+                        0,
+                        "flydsl_moe1_afp8_wfp8_bf16_t32x64x256_w3_gui_fp8",
+                        "flydsl_moe2_afp8_wfp8_bf16_t32x128x256_atomic",
+                    )
+                ],
+                "keys": [
+                    "gfx",
+                    "cu_num",
+                    "token",
+                    "model_dim",
+                    "inter_dim",
+                    "expert",
+                    "topk",
+                    "shared_expert_id",
+                ],
+                "extra_args": ["--tokens", "32", "--quick"],
+                "timeout": 900,
+                "timeout_mp1": 900,
+            },
             "gdn_k5_opt": {
                 "script": "csrc/gdn_k5/chunk_gdn_h_opt_tune.py",
                 "header": [
@@ -503,6 +578,11 @@ class TestTunePipeline(unittest.TestCase):
                 self.assertIn(
                     key, df.columns, f"{name} ({mp_label}): missing column {key}"
                 )
+            if name == "fhmoe":
+                self.assertIn("kernelName1", df.columns)
+                self.assertIn("kernelName2", df.columns)
+                self.assertTrue(df["kernelName1"].fillna("").str.strip().ne("").all())
+                self.assertTrue(df["kernelName2"].fillna("").str.strip().ne("").all())
             for _, row in df.iterrows():
                 us = float(row.get("us", -1))
                 self.assertNotEqual(
@@ -583,6 +663,11 @@ class TestTunePipeline(unittest.TestCase):
 
     def test_fmoe_mp_default(self):
         self._run_one("fmoe", mp=None)
+
+    def test_fhmoe_mp1(self):
+        if _get_gfx() != "gfx950":
+            self.skipTest("FHMoE tuning requires gfx950")
+        self._run_one("fhmoe", mp=1)
 
     def test_a6w6_blockscale_mp1(self):
         self._run_one("a6w6_blockscale", mp=1)

@@ -59,6 +59,7 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
             printf '%s\n' \
                 "$TEST_DIR/tuning_tests/test_csv_validation.py" \
                 "$TEST_DIR/tuning_tests/test_config_shape_collision.py" \
+                "$TEST_DIR/tuning_tests/test_fhmoe_tuner.py" \
                 "$TEST_DIR/tuning_tests/test_mixed_mxfp_tuning.py"
         } | LC_ALL=C sort -u
     )
@@ -221,6 +222,7 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_quant_mxfp6_gemm.py]=6
     FILE_TIMES[op_tests/tuning_tests/test_config_shape_collision.py]=4
     FILE_TIMES[op_tests/tuning_tests/test_csv_validation.py]=4
+    FILE_TIMES[op_tests/tuning_tests/test_fhmoe_tuner.py]=4
     FILE_TIMES[op_tests/tuning_tests/test_mixed_mxfp_tuning.py]=4
     FILE_TIMES[op_tests/test_fused_qk_rmsnorm_per_token_quant.py]=5
     FILE_TIMES[op_tests/test_groupnorm.py]=5
@@ -235,7 +237,7 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_asm_guard.py]=4
     FILE_TIMES[op_tests/test_dsv4_rotate_quant.py]=4
     FILE_TIMES[op_tests/test_f4gemm.py]=4
-    FILE_TIMES[op_tests/test_fhmoe.py]=4
+    FILE_TIMES[op_tests/test_fhmoe.py]=40
     FILE_TIMES[op_tests/test_flydsl_batched_gemm.py]=4
     FILE_TIMES[op_tests/test_flydsl_fmha.py]=4
     FILE_TIMES[op_tests/test_fmha_fwd_mxfp8_asm.py]=4

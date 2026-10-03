@@ -65,6 +65,11 @@ DEFAULT_CSVS = [
 MOE_AOT_ARCH_DEFAULT = "gfx950"
 
 
+def _mx_w2_scale_numel(experts: int, model_dim: int, inter_dim: int) -> int:
+    scale_k = (inter_dim + 255) // 256 * 256
+    return experts * model_dim * (scale_k // 32)
+
+
 def parse_csv(csv_path: str):
     """Parse the CSV and return a list of unique compile jobs.
 
@@ -90,6 +95,8 @@ def parse_csv(csv_path: str):
             cu_num = int(row.get("cu_num", "0"))
             block_m = int(row.get("block_m", "0") or "0")
             shared_expert_id = int(row.get("shared_expert_id", "-1") or "-1")
+            model_dim_pad = int(row.get("hidden_pad", "0") or "0")
+            inter_dim_pad = int(row.get("intermediate_pad", "0") or "0")
             act_type = row.get("act_type", "")
             act_name = act_type.strip().split(".")[-1].lower()
             act = act_name if act_name in ("swiglu", "situv2") else "silu"
@@ -181,6 +188,8 @@ def parse_csv(csv_path: str):
                         "enable_bias": enable_bias,
                         "token_num": token,
                         "block_m": block_m,
+                        "model_dim_pad": model_dim_pad,
+                        "inter_dim_pad": inter_dim_pad,
                     }
                     if shared_expert_id >= 0:
                         job["shared_expert_id"] = shared_expert_id
@@ -239,6 +248,8 @@ def _precompile_to_cache(
     cu_num: int = 0,
     token_num: int = 0,
     block_m: int = 0,
+    model_dim_pad: int = 0,
+    inter_dim_pad: int = 0,
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
     enable_bias: bool = False,
@@ -324,7 +335,7 @@ def _precompile_to_cache(
         return None
 
     def _make_a1_scale():
-        """Mirror fused_moe_2stages a1_scale construction (per_1x32 + fp4-weight path)."""
+        """Mirror per-1x32 MXFP4/MXFP8 runtime a1_scale construction."""
         if not use_mx_gemm:
             return None
         if a_dtype == "fp8":
@@ -400,7 +411,7 @@ def _precompile_to_cache(
         return None
 
     def _make_w_scale(scale_storage_numel: int):
-        # mxfp4 e8m0 scale -- viewed as uint8 by _view_safe before kernel launch.
+        # MX E8M0 scale storage is viewed as uint8 before kernel launch.
         return torch.zeros(scale_storage_numel, dtype=torch.uint8, device=dev)
 
     def _make_a_user(a_dtype_user_shape):
@@ -619,6 +630,8 @@ def _precompile_to_cache(
                 waves_per_eu=waves_per_eu,
                 b_nt=b_nt,
                 gate_mode=gate_mode,
+                model_dim_pad=model_dim_pad,
+                inter_dim_pad=inter_dim_pad,
                 enable_bias=(kernel_bias is not None),
                 a_scale_one=a_scale_one,
                 xcd_swizzle=xcd_swizzle,
@@ -682,7 +695,7 @@ def _precompile_to_cache(
 
             a2_scale = _make_a2_scale_for_stage2()
             if use_mx_gemm:
-                w2_scale = _make_w_scale(E * model_dim * (inter_dim // 32))
+                w2_scale = _make_w_scale(_mx_w2_scale_numel(E, model_dim, inter_dim))
             else:
                 w2_scale = torch.zeros(1, device=dev, dtype=torch.float32)
 
@@ -810,6 +823,8 @@ def _precompile_to_cache(
                 use_global_a=requires_flydsl_stage2_global_a(a),
                 cu_num_mul=cu_num_mul,
                 b_nt=b_nt,
+                model_dim_pad=model_dim_pad,
+                inter_dim_pad=inter_dim_pad,
                 xcd_swizzle=xcd_swizzle,
                 enable_bias=enable_bias,
             )

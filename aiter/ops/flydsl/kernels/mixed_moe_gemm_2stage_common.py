@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 
-"""Shared MXFP4/FP8 MoE and heterogeneous MoE kernel builders."""
+"""Shared MXFP4/MXFP8 MoE and heterogeneous MoE kernel builders."""
 
 """MoE GEMM stage1/stage2 kernel implementations (FlyDSL MFMA FP8/FP16/FP4).
 
@@ -138,6 +138,7 @@ def compile_mixed_moe_gemm1_common(
     xcd_swizzle: int = 0,
     k_wave: int = 1,
     shared_expert_id: int | None = None,
+    clamp_shared: bool = True,
     v2_output_layout: bool = False,
 ):
     """Compile stage1 kernel: act(X @ W_gate.T, X @ W_up.T) -> [tokens*topk, inter_dim]."""
@@ -160,9 +161,6 @@ def compile_mixed_moe_gemm1_common(
     is_f4_a = a_dtype == "fp4"
     is_f4_b = b_dtype == "fp4"
     is_f8_b = b_dtype == "fp8"
-    if heterogeneous_b and not is_f4_b:
-        raise ValueError("Heterogeneous B requires MXFP4 routed weights")
-
     sort_block_m = tile_m
     num_waves = min(4, tile_n // 32)
     # K-wave groups reduce accumulators in LDS before the epilogue.
@@ -272,12 +270,17 @@ def compile_mixed_moe_gemm1_common(
     # therefore must not be part of the on-disk symbol/cache identity.
     act_tag = "" if act == "silu" else f"_{act}"
     heterogeneous_tag = f"_shared_fp8_e{shared_expert_id}" if heterogeneous_b else ""
-    # ABI v33 adds four runtime SiTUv2 beta scalars; heterogeneous ABI tracks one
-    # version ahead of the ordinary kernel.
-    kernel_version = 34 if heterogeneous_b else 33
+    # Keep the existing MXFP4/FP8 DSV4 cache identity unchanged. The no-clamp
+    # tag is HY4-specific; heterogeneous MXFP8 kernels use the v35 revision.
+    shared_clamp_tag = "_shared_noclamp" if heterogeneous_b and not clamp_shared else ""
+    # ABI v33 adds four runtime SiTUv2 beta scalars. Heterogeneous MXFP4 keeps
+    # v34; v35 identifies the MXFP8 routed/shared K-offset implementation.
+    kernel_version = (
+        35 if heterogeneous_b and is_f8_b else (34 if heterogeneous_b else 33)
+    )
     module_name = (
         f"mfma_moe1_silu_mul_a{a_dtype}_w{b_dtype}_{out_s}"
-        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}{act_tag}{v2out_tag}{heterogeneous_tag}_v{kernel_version}"
+        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}{act_tag}{v2out_tag}{heterogeneous_tag}{shared_clamp_tag}_v{kernel_version}"
     ).replace("-", "_")
 
     cshuffle_elem_bytes = 4 if need_quant else (4 if out_is_f32 else 2)
@@ -928,7 +931,10 @@ def compile_mixed_moe_gemm1_common(
                         ku * b_cells_per_ku, index=True
                     )
                     if const_expr(shared_b):
-                        shared_k0_base = (base_k * arith.index(2)) // c64
+                        # ``base_k`` is expressed in routed-weight storage
+                        # elements. Convert it back to the logical K offset
+                        # before indexing the always-FP8 shared weights.
+                        shared_k0_base = (base_k * arith.index(b_byte_div)) // c64
                         shared_k0_base += arith.constant(ku * 2, index=True)
                         s0, s1 = load_cell(
                             shared_w_rsrc,
@@ -1951,7 +1957,15 @@ def compile_mixed_moe_gemm1_common(
 
                 def activate_pair(g, u):
                     if const_expr(act == "silu"):
-                        g, u = clamp_gate_up(g, u, swiglu_neg_limit)
+                        # Some models leave the dense shared expert unclamped.
+                        # ``shared_b`` specializes the whole tile, so
+                        # disabling the clamp here adds no per-lane divergence.
+                        activation_neg_limit = (
+                            fx.Float32(float("-inf"))
+                            if const_expr(shared_b and not clamp_shared)
+                            else swiglu_neg_limit
+                        )
+                        g, u = clamp_gate_up(g, u, activation_neg_limit)
                         return silu_mul_batch([g], [u])[0]
                     return gate_up_act(act, [g], [u], activation_params)[0]
 
@@ -3189,8 +3203,6 @@ def compile_mixed_moe_gemm2_common(
     is_f4_a = a_dtype == "fp4"
     is_f4_b = b_dtype == "fp4"
     is_f8_b = b_dtype == "fp8"
-    if heterogeneous_b and not is_f4_b:
-        raise ValueError("Heterogeneous B requires MXFP4 routed weights")
     serial_shared_n = heterogeneous_b and tile_n == 256
 
     scale_pack_m = 2
@@ -3332,7 +3344,12 @@ def compile_mixed_moe_gemm2_common(
     xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
     heterogeneous_tag = f"_shared_fp8_e{shared_expert_id}" if heterogeneous_b else ""
     serial_n_tag = "_serialn128" if serial_shared_n else ""
-    if heterogeneous_b:
+    if heterogeneous_b and is_f8_b:
+        variant_tags = (
+            f"_vscale_fix3_fp4opt_v3{pm_tag}{sbm_tag}{wpe_tag}{async_tag}"
+            f"{cumul_tag}{acc_tag}{xcd_tag}{heterogeneous_tag}{serial_n_tag}"
+        )
+    elif heterogeneous_b:
         variant_tags = (
             f"_vscale_fix3_fp4opt_v2{pm_tag}{sbm_tag}{wpe_tag}{async_tag}"
             f"{cumul_tag}{acc_tag}{xcd_tag}{heterogeneous_tag}{serial_n_tag}"
@@ -3886,7 +3903,9 @@ def compile_mixed_moe_gemm2_common(
                         )
 
                     if const_expr(shared_b):
-                        shared_k0_base = _div_pow2(base_k * arith.index(2), 64)
+                        # ``base_k`` uses the routed-weight storage width;
+                        # recover the logical K offset for FP8 shared weights.
+                        shared_k0_base = _div_pow2(base_k * arith.index(b_byte_div), 64)
                         shared_k0_base += arith.constant(ku * 2, index=True)
                         s0, s1 = load_cell(
                             shared_w_rsrc,

@@ -287,10 +287,74 @@ class TestConfigShapeCollision(unittest.TestCase):
         )
         with open(merged, newline="") as f:
             rows = list(csv.DictReader(f))
+        dsv4_rows = [
+            row
+            for row in rows
+            if (
+                row["model_dim"],
+                row["inter_dim"],
+                row["expert"],
+                row["topk"],
+                row["shared_expert_id"],
+                row["q_dtype_w"],
+            )
+            == (
+                "7168",
+                "384",
+                "385",
+                "7",
+                "384",
+                "torch.float4_e2m1fn_x2",
+            )
+        ]
+        hy4_rows = [
+            row
+            for row in rows
+            if (
+                row["model_dim"],
+                row["inter_dim"],
+                row["expert"],
+                row["topk"],
+                row["shared_expert_id"],
+                row["q_dtype_w"],
+            )
+            == (
+                "6144",
+                "256",
+                "257",
+                "9",
+                "256",
+                "torch.float8_e4m3fn",
+            )
+        ]
         self.assertEqual(
-            {int(row["token"]) for row in rows},
+            {int(row["token"]) for row in dsv4_rows},
             {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048},
         )
+        self.assertEqual(
+            {int(row["token"]) for row in hy4_rows},
+            {
+                1,
+                2,
+                4,
+                8,
+                16,
+                32,
+                64,
+                128,
+                256,
+                512,
+                1024,
+                2048,
+                4096,
+                8192,
+                16384,
+                32768,
+                131072,
+            },
+        )
+        self.assertEqual(len(dsv4_rows), 12)
+        self.assertEqual(len(hy4_rows), 17)
 
     def test_grouped_fmoe(self):
         self._check_family("AITER_CONFIG_GROUPED_FMOE", "tuned_grouped_fmoe")
