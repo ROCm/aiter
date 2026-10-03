@@ -483,13 +483,14 @@ def _staged_head_block(num_heads, num_queries, num_splits, row_tiles):
 
     A 16-head program stages its tiles for 16 heads, so at 32 or 64 heads each
     tile is staged two or four times per row. Bigger programs stage it once, but
-    there are fewer of them: 64 heads without split-K once the rows fill half the
-    CUs; 32 heads when each program has two or more tiles and the grid's last
-    round is more than half full (past four rounds, with four or more tiles). The
+    there are fewer of them: 64 heads without split-K once the 16-head grid
+    overflows one round of two programs per CU (more rows than half the CUs);
+    32 heads when each program has two or more tiles and the grid's last round
+    is more than half full (past four rounds, with four or more tiles). The
     split count stays the 16-head grid's.
     """
     num_sms = get_num_sms()
-    if num_heads == 64 and num_splits == 1 and 2 * num_queries >= num_sms:
+    if num_heads == 64 and num_splits == 1 and 2 * num_queries > num_sms:
         return 64
     if num_heads not in (32, 64):
         return 16
