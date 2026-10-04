@@ -91,6 +91,24 @@ def _supports_gfx1250_a_preshuffle_resolved(
     n_experts: int,
 ) -> bool:
     """Check an A-preshuffle schedule after launch options are resolved."""
+    gemm2_eight_wave = all(
+        (
+            a_is_fp4,
+            stage1_act == 0,
+            stage1_quant_out == 0,
+            out_is_f16 == 0,
+            has_bias == 0,
+            n_experts == 64,
+            N == 7168,
+            K == 2048,
+            (tile_m, tile_n, tile_k) == (192, 256, 256),
+            (m_warp, n_warp, num_buffers) == (2, 4, 4),
+            cluster_n == 4,
+            next_stage_prefetch == 1,
+        )
+    )
+    if gemm2_eight_wave:
+        return True
     fused_quant_w2x4 = all(
         (
             stage1_quant_out == 1,
@@ -225,6 +243,9 @@ def flydsl_grouped_gemm_a8w4_masked(
     from .kernels.mxfp4_preshuffle_gfx1250_tdm_fused_persistent import (
         launch_gemm_a8w4_tdm_fused_persistent,
     )
+    from .kernels.mxfp4_preshuffle_gfx1250_tdm_gemm2_persistent import (
+        launch_gemm_a8w4_tdm_gemm2_persistent,
+    )
 
     if stream is None:
         stream = torch.cuda.current_stream()
@@ -311,11 +332,27 @@ def flydsl_grouped_gemm_a8w4_masked(
                 cluster_m == 1,
             )
         )
-        optimized_launcher = (
-            launch_gemm_a8w4_tdm_fused_persistent
-            if use_fused_persistent
-            else launch_gemm_a8w4_tdm_optimized
+        use_gemm2_persistent = stage1_act == 0 and K == 2048 and N == 7168 and (
+            (
+                tile_m,
+                tile_n,
+                tile_k,
+                m_warp,
+                n_warp,
+                num_buffers,
+                n_experts,
+            )
+            in (
+                (192, 256, 256, 2, 2, 4, 64),
+                (192, 256, 256, 2, 4, 4, 64),
+            )
         )
+        if use_fused_persistent:
+            optimized_launcher = launch_gemm_a8w4_tdm_fused_persistent
+        elif use_gemm2_persistent:
+            optimized_launcher = launch_gemm_a8w4_tdm_gemm2_persistent
+        else:
+            optimized_launcher = launch_gemm_a8w4_tdm_optimized
         optimized_launcher(
             out,
             ptr_arg(a),
