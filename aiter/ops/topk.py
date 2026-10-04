@@ -29,6 +29,77 @@ def topk_gating_fwd(
 
 
 _VALID_SCORE_FUNCS = {"sqrtsoftplus", "sigmoid", "softmax"}
+_EXACT_SIGMOID_EXPERTS = 896
+_EXACT_SIGMOID_TOPK = 16
+
+
+@functools.lru_cache(maxsize=16)
+def _is_gfx1250_device(device_index: int) -> bool:
+    arch = getattr(torch.cuda.get_device_properties(device_index), "gcnArchName", "")
+    return arch.split(":", 1)[0] == "gfx1250"
+
+
+def _can_use_gfx1250_exact_sigmoid_topk(
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> bool:
+    """Whether tensors satisfy the measured gfx1250 exact-contract fast path."""
+    if (
+        not gating_output.is_cuda
+        or gating_output.ndim != 2
+        or gating_output.shape[0] == 0
+        or gating_output.shape[1] != _EXACT_SIGMOID_EXPERTS
+        or gating_output.dtype != torch.bfloat16
+        or gating_output.stride(1) != 1
+        or gating_output.stride(0) < _EXACT_SIGMOID_EXPERTS
+        or correction_bias.shape != (_EXACT_SIGMOID_EXPERTS,)
+        or correction_bias.dtype != torch.bfloat16
+        or correction_bias.stride(0) != 1
+        or topk_weights.shape != (gating_output.shape[0], _EXACT_SIGMOID_TOPK)
+        or topk_weights.dtype != torch.float32
+        or topk_weights.stride(1) != 1
+        or topk_weights.stride(0) < _EXACT_SIGMOID_TOPK
+        or topk_ids.shape != (gating_output.shape[0], _EXACT_SIGMOID_TOPK)
+        or topk_ids.dtype != torch.int32
+        or topk_ids.stride(1) != 1
+        or topk_ids.stride(0) < _EXACT_SIGMOID_TOPK
+    ):
+        return False
+    if not (
+        correction_bias.device
+        == topk_weights.device
+        == topk_ids.device
+        == gating_output.device
+    ):
+        return False
+    device_index = gating_output.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    return _is_gfx1250_device(device_index)
+
+
+def _gfx1250_exact_sigmoid_topk(
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    need_renorm: bool,
+    routed_scaling_factor: float,
+) -> None:
+    from .triton.moe.moe_routing.exact_sigmoid_topk import (
+        exact_sigmoid_biased_topk,
+    )
+
+    exact_sigmoid_biased_topk(
+        gating_output,
+        correction_bias,
+        topk_weights,
+        topk_ids,
+        need_renorm,
+        routed_scaling_factor,
+    )
 
 
 def _valid_bias_dtypes(gating_dtype: torch.dtype) -> tuple[torch.dtype, ...]:
@@ -71,6 +142,20 @@ def topk_gating(
         assert correction_bias.dtype in valid, (
             f"correction_bias dtype {correction_bias.dtype} is not supported for "
             f"{gating_output.dtype} gating_output, expected one of {valid}"
+        )
+    if score_func == "sigmoid" and _can_use_gfx1250_exact_sigmoid_topk(
+        gating_output,
+        correction_bias,
+        topk_weights,
+        topk_indices,
+    ):
+        return _gfx1250_exact_sigmoid_topk(
+            gating_output,
+            correction_bias,
+            topk_weights,
+            topk_indices,
+            need_renorm,
+            routed_scaling_factor,
         )
     topk_gating_fwd(
         topk_weights,
@@ -187,6 +272,24 @@ def biased_grouped_topk(
 ):
     token_num = gating_output.shape[0]
     num_experts = gating_output.shape[1]
+    if (
+        num_expert_group == 1
+        and topk_group == 1
+        and _can_use_gfx1250_exact_sigmoid_topk(
+            gating_output,
+            correction_bias,
+            topk_weights,
+            topk_ids,
+        )
+    ):
+        return _gfx1250_exact_sigmoid_topk(
+            gating_output,
+            correction_bias,
+            topk_weights,
+            topk_ids,
+            need_renorm,
+            routed_scaling_factor,
+        )
     cu_num = get_cu_num()
     if token_num <= cu_num * 212 or num_experts // num_expert_group > 32:
         return biased_grouped_topk_hip(
