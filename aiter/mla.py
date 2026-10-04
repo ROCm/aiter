@@ -604,6 +604,15 @@ def mla_decode_fwd(
             )
             else mgc
         )
+        # gfx950 fp8 qh64 (qt64) kernel interleaves SUB_KV=64 tiles across splits and
+        # skips splits without a tile, so only the first cdiv(kv, 64) splits are written.
+        if (
+            nhead == 64
+            and q.dtype == dtypes.fp8
+            and kv_buffer.dtype == dtypes.fp8
+            and max_seqlen_q == 1
+        ):
+            mgc = 64
 
         MAYBE_FINAL_OUT = True
 

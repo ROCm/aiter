@@ -959,9 +959,17 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                 } else {
                     config_max_seqlen_q = 4;
                 }
+            } else if (max_seqlen_q == 1 && arch_id == "gfx950"){
+                // qt64 kernel: one WG handles 1 token x 64 heads
+                config_max_seqlen_q = 1;
+                sub_Q = 64;
+                // fp32 split output [tokens, kv_split, 64, 512] is addressed with 32-bit offsets
+                AITER_CHECK(kv_split == 1 || (int64_t)Q->size(0) * kv_split <= 32768, __func__,
+                    ": fp8/fp8 gqa_ratio=64 with kv_split>1 requires total_q * kv_split <= 32768, got total_q=",
+                    Q->size(0), " kv_split=", kv_split);
             } else {
                 AITER_CHECK(false, __func__,
-                    ": fp8/fp8 with gqa_ratio=64 only supports persistent mode");
+                    ": fp8/fp8 with gqa_ratio=64 only supports decode_qlen=1 on gfx950 in non-persistent mode");
             }
         }
     } else if (gqa_ratio == 8){
