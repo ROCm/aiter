@@ -205,6 +205,7 @@ def _build_kernel():
         stride_q_batch: fx.Int32,
         max_block_len: fx.Int32,
         stride_out: fx.Int32,
+        ctx_stride: fx.Int32,
     ):
         tid = fx.Int32(fx.thread_idx.x)
         wave = udiv(tid, 64)
@@ -228,7 +229,7 @@ def _build_kernel():
 
         ragged_nn = _imin(fx.Int32(nn_t[pid_batch]), rows_per_batch)
         nn = (has_next_n_lens != 0).select(ragged_nn, rows_per_batch)
-        context_len = fx.Int32(context_t[pid_batch])
+        context_len = fx.Int32(context_t[pid_batch * ctx_stride + ctx_stride - 1])
         page_count = uceildiv(context_len, fx.Int32(KV_BLOCK_SIZE))
         pages_per_split = uceildiv(page_count, split_kv)
         page_lo = pid_split * pages_per_split
@@ -438,6 +439,7 @@ def _build_kernel():
         stride_q_batch,
         max_block_len,
         stride_out,
+        ctx_stride,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         kernel._func.__name__ = kernel_name
@@ -456,6 +458,7 @@ def _build_kernel():
             stride_q_batch,
             max_block_len,
             stride_out,
+            ctx_stride,
         ).launch(
             grid=(fx.Int64(grid_blocks), 1, 1),
             block=(THREADS, 1, 1),
@@ -524,14 +527,18 @@ def flydsl_fp8_paged_mqa_logits(
     if out_logits.shape[0] != batch_size * next_n:
         raise ValueError(f"out_logits first dimension must be {batch_size * next_n}")
 
-    if context_lens.dim() == 2 and context_lens.shape[1] > 1:
-        context_lens = context_lens[:, -1].contiguous()
-    context_lens = context_lens.reshape(batch_size)
+    ctx_stride = context_lens.shape[1] if context_lens.dim() == 2 else 1
+    if (
+        not context_lens.is_contiguous()
+        or context_lens.numel() != batch_size * ctx_stride
+    ):
+        raise ValueError("context_lens must be contiguous [B] or [B, n]")
+    context_lens = context_lens.reshape(-1)
     max_block_len = kv_indices.shape[-1]
     kv_indices = kv_indices.reshape(batch_size, max_block_len)
     has_next_n_lens = next_n_lens is not None
     if next_n_lens is None:
-        next_n_lens = context_lens
+        next_n_lens = context_lens[:batch_size]
     next_n_lens = next_n_lens.reshape(batch_size)
     if next_n_lens.dtype != torch.int32 or next_n_lens.device != q_fp8.device:
         raise ValueError("next_n_lens must be int32 on the same device as q_fp8")
@@ -578,6 +585,7 @@ def flydsl_fp8_paged_mqa_logits(
             int(q_fp8.stride(0)),
             int(max_block_len),
             int(out_logits.stride(0)),
+            int(ctx_stride),
             stream,
         )
     return out_logits
