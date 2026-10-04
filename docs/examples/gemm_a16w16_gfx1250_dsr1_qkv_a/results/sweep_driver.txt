@@ -1,0 +1,957 @@
+gemm_a16w16 gluon gfx1250 {'M': 1024, 'N': 2112, 'K': 7168}: keys from /app/aiter/aiter/ops/triton/configs/gfx1250/gluon/gemm/gemm_a16w16/DEFAULT.json
+  BLOCK_M: [16, 32, 64, 128, 256, 512, 1024]
+  BLOCK_N: [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+  BLOCK_K: [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+  NUM_BUFFERS: [1, 2, 3, 4, 6, 8]
+  num_warps: [1, 2, 4, 8]
+  kernel_type: ['bandwidth_bound', 'compute_bound']
+  persistent: [False]  (pinned)
+  33600 combinations, skipped 0 by generic rules, 19376 by LDS, 7789 by kernel rules -> 6435 configs, ~8.9 GPU-hours at 5 s/config
+  results: /app/aiter/aiter/ops/triton/utils/_triton/tuning/runs/sweep-gfx1250-gluon-gemm_a16w16-M=1024-N=2112-K=7168.jsonl
+  gpu 0: 0/1609 done, running 100
+  gpu 1: 0/1609 done, running 100
+  gpu 2: 0/1609 done, running 100
+  gpu 3: 0/1609 done, running 100
+  gpu 1: 100/1609 done, running 100
+  gpu 3: 100/1609 done, running 100
+  gpu 2: 100/1609 done, running 100
+  gpu 0: 100/1609 done, running 100
+  gpu 3: 200/1609 done, running 100
+  gpu 1: 200/1609 done, running 100
+  gpu 2: 200/1609 done, running 100
+  gpu 0: 200/1609 done, running 100
+  gpu 3: 300/1609 done, running 100
+  gpu 0: 300/1609 done, running 100
+  gpu 2: 300/1609 done, running 100
+  gpu 3: 400/1609 done, running 100
+  gpu 1: 300/1609 done, running 100
+  gpu 0: 400/1609 done, running 100
+  gpu 3: 500/1609 done, running 100
+  gpu 3: 600/1609 done, running 100
+  gpu 0: 500/1609 done, running 100
+  gpu 2: 400/1609 done, running 100
+  gpu 3: 700/1609 done, running 100
+  gpu 0: 600/1609 done, running 100
+  gpu 2: 500/1609 done, running 100
+  gpu 2: 600/1609 done, running 100
+  gpu 1: 400/1609 done, running 100
+  gpu 3: 800/1609 done, running 100
+  gpu 2: 700/1609 done, running 100
+  gpu 1: 500/1609 done, running 100
+  gpu 2: 800/1609 done, running 100
+  gpu 3: 900/1609 done, running 100
+  gpu 1: 600/1609 done, running 100
+  gpu 2: 900/1609 done, running 100
+  gpu 0: 700/1609 done, running 100
+  gpu 1: 700/1609 done, running 100
+  gpu 0: 800/1609 done, running 100
+  gpu 1: 800/1609 done, running 100
+  gpu 0: 900/1609 done, running 100
+  gpu 3: 1000/1609 done, running 100
+  gpu 1: 900/1609 done, running 100
+  gpu 0: 1000/1609 done, running 100
+  gpu 1: 1000/1609 done, running 100
+  gpu 3: 1100/1609 done, running 100
+  gpu 2: hung: {"BLOCK_M": 64, "BLOCK_N": 256, "BLOCK_K": 512, "NUM_BUFFERS": 1, "num_warps": 1, "kernel_type": "bandwidth_bound", "persistent": false}
+  gpu 2: 976/1609 done, running 100
+  gpu 3: 1200/1609 done, running 100
+  gpu 0: 1100/1609 done, running 100
+  gpu 1: 1100/1609 done, running 100
+  gpu 3: 1300/1609 done, running 100
+  gpu 1: 1200/1609 done, running 100
+  gpu 0: 1200/1609 done, running 100
+  gpu 2: 1076/1609 done, running 100
+  gpu 3: 1400/1609 done, running 100
+  gpu 2: 1176/1609 done, running 100
+  gpu 2: 1276/1609 done, running 100
+  gpu 3: 1500/1609 done, running 100
+  gpu 2: 1376/1609 done, running 100
+  gpu 1: 1300/1609 done, running 100
+  gpu 0: 1300/1609 done, running 100
+  gpu 2: 1476/1609 done, running 100
+  gpu 1: 1400/1609 done, running 100
+  gpu 0: hung: {"BLOCK_M": 256, "BLOCK_N": 64, "BLOCK_K": 512, "NUM_BUFFERS": 1, "num_warps": 1, "kernel_type": "bandwidth_bound", "persistent": false}
+  gpu 0: 1392/1609 done, running 100
+  gpu 2: hung: {"BLOCK_M": 512, "BLOCK_N": 128, "BLOCK_K": 256, "NUM_BUFFERS": 1, "num_warps": 2, "kernel_type": "bandwidth_bound", "persistent": false}
+  gpu 2: 1549/1609 done, running 60
+  gpu 1: 1500/1609 done, running 100
+  gpu 3: 1600/1609 done, running 9
+  gpu 0: 1492/1609 done, running 100
+  gpu 1: 1600/1609 done, running 9
+  gpu 0: 1592/1609 done, running 17
+  final round on gpu 0: re-timing the baseline and the 10 fastest
+  gpu 0: 0/11 done, running 11
+  final round (same-device numbers the installer uses):
+  baseline (installed, is_tuned=False): 48.259 us  {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 128, "NUM_BUFFERS": 2, "num_warps": 2, "kernel_type": "bandwidth_bound"}
+      33.570 us     923.6 TFLOPS  {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 128, "NUM_BUFFERS": 4, "num_warps": 4, "kernel_type": "compute_bound", "persistent": false}
+      35.028 us     885.1 TFLOPS  {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 128, "NUM_BUFFERS": 4, "num_warps": 8, "kernel_type": "compute_bound", "persistent": false}
+      35.301 us     878.3 TFLOPS  {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 128, "NUM_BUFFERS": 4, "num_warps": 4, "kernel_type": "bandwidth_bound", "persistent": false}
+      35.424 us     875.2 TFLOPS  {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 128, "NUM_BUFFERS": 3, "num_warps": 2, "kernel_type": "bandwidth_bound", "persistent": false}
+      35.532 us     872.6 TFLOPS  {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 128, "NUM_BUFFERS": 3, "num_warps": 4, "kernel_type": "bandwidth_bound", "persistent": false}
+      36.075 us     859.4 TFLOPS  {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 128, "NUM_BUFFERS": 4, "num_warps": 8, "kernel_type": "bandwidth_bound", "persistent": false}
+      36.187 us     856.8 TFLOPS  {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 128, "NUM_BUFFERS": 3, "num_warps": 8, "kernel_type": "bandwidth_bound", "persistent": false}
+      36.595 us     847.2 TFLOPS  {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 128, "NUM_BUFFERS": 3, "num_warps": 4, "kernel_type": "bandwidth_bound", "persistent": false}
+      37.102 us     835.7 TFLOPS  {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 128, "NUM_BUFFERS": 3, "num_warps": 2, "kernel_type": "compute_bound", "persistent": false}
+      37.402 us     829.0 TFLOPS  {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "NUM_BUFFERS": 8, "num_warps": 8, "kernel_type": "compute_bound", "persistent": false}
+  {'ok': 5929, 'error': 504, 'hung': 3}
+gemm_a16w16 gluon gfx1250 {'M': 2048, 'N': 2112, 'K': 7168}: keys from /app/aiter/aiter/ops/triton/configs/gfx1250/gluon/gemm/gemm_a16w16/DEFAULT.json
+  BLOCK_M: [16, 32, 64, 128, 256, 512, 1024, 2048]
+  BLOCK_N: [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+  BLOCK_K: [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+  NUM_BUFFERS: [1, 2, 3, 4, 6, 8]
+  num_warps: [1, 2, 4, 8]
+  kernel_type: ['bandwidth_bound', 'compute_bound']
+  persistent: [False]  (pinned)
+  38400 combinations, skipped 0 by generic rules, 23288 by LDS, 8621 by kernel rules -> 6491 configs, ~9.0 GPU-hours at 5 s/config
+  results: /app/aiter/aiter/ops/triton/utils/_triton/tuning/runs/sweep-gfx1250-gluon-gemm_a16w16-M=2048-N=2112-K=7168.jsonl
+  gpu 0: 0/1623 done, running 100
+  gpu 1: 0/1623 done, running 100
+  gpu 3: 0/1623 done, running 100
+  gpu 2: 0/1623 done, running 100
+  gpu 1: 100/1623 done, running 100
+  gpu 2: 100/1623 done, running 100
+  gpu 3: 100/1623 done, running 100
+  gpu 1: 200/1623 done, running 100
+  gpu 2: 200/1623 done, running 100
+  gpu 1: 300/1623 done, running 100
+  gpu 0: 100/1623 done, running 100
+  gpu 2: 300/1623 done, running 100
+  gpu 3: 200/1623 done, running 100
+  gpu 3: 300/1623 done, running 100
+  gpu 1: 400/1623 done, running 100
+  gpu 2: 400/1623 done, running 100
+  gpu 0: 200/1623 done, running 100
+  gpu 1: 500/1623 done, running 100
+  gpu 3: 400/1623 done, running 100
+  gpu 1: 600/1623 done, running 100
+  gpu 0: 300/1623 done, running 100
+  gpu 2: 500/1623 done, running 100
+  gpu 2: 600/1623 done, running 100
+  gpu 3: 500/1623 done, running 100
+  gpu 1: 700/1623 done, running 100
+  gpu 2: 700/1623 done, running 100
+  gpu 0: 400/1623 done, running 100
+  gpu 3: 600/1623 done, running 100
+  gpu 2: 800/1623 done, running 100
+  gpu 3: 700/1623 done, running 100
+  gpu 0: 500/1623 done, running 100
+  gpu 1: 800/1623 done, running 100
+  gpu 2: 900/1623 done, running 100
+  gpu 0: 600/1623 done, running 100
+  gpu 1: 900/1623 done, running 100
+  gpu 3: 800/1623 done, running 100
+  gpu 1: 1000/1623 done, running 100
+  gpu 3: 900/1623 done, running 100
+  gpu 0: 700/1623 done, running 100
+  gpu 1: 1100/1623 done, running 100
+  gpu 1: 1200/1623 done, running 100
+  gpu 0: 800/1623 done, running 100
+  gpu 3: 1000/1623 done, running 100
+  gpu 0: 900/1623 done, running 100
+  gpu 0: 1000/1623 done, running 100
+  gpu 3: 1100/1623 done, running 100
+  gpu 0: 1100/1623 done, running 100
+  gpu 3: 1200/1623 done, running 100
+  gpu 0: 1200/1623 done, running 100
+  gpu 1: 1300/1623 done, running 100
+  gpu 1: 1400/1623 done, running 100
+  gpu 3: 1300/1623 done, running 100
+  gpu 3: 1400/1623 done, running 100
+  gpu 0: 1300/1623 done, running 100
+  gpu 3: 1500/1623 done, running 100
+  gpu 1: 1500/1623 done, running 100
+  gpu 2: hung: {"BLOCK_M": 64, "BLOCK_N": 256, "BLOCK_K": 512, "NUM_BUFFERS": 1, "num_warps": 1, "kernel_type": "bandwidth_bound", "persistent": false}
+  gpu 2: 976/1623 done, running 100
+  gpu 1: 1600/1623 done, running 23
+  gpu 2: 1076/1623 done, running 100
+  gpu 3: 1600/1623 done, running 23
+  gpu 2: 1176/1623 done, running 100
+  gpu 2: 1276/1623 done, running 100
+  gpu 2: 1376/1623 done, running 100
+  gpu 2: 1476/1623 done, running 100
+  gpu 0: hung: {"BLOCK_M": 256, "BLOCK_N": 64, "BLOCK_K": 512, "NUM_BUFFERS": 1, "num_warps": 1, "kernel_type": "bandwidth_bound", "persistent": false}
+  gpu 0: 1392/1623 done, running 100
+  gpu 0: 1492/1623 done, running 100
+  gpu 0: 1592/1623 done, running 31
+  gpu 2: 1576/1623 done, running 47
+  final round on gpu 0: re-timing the baseline and the 10 fastest
+  gpu 0: 0/11 done, running 11
+  final round (same-device numbers the installer uses):
+  baseline (installed, is_tuned=False): 51.943 us  {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 128, "NUM_BUFFERS": 2, "num_warps": 2, "kernel_type": "bandwidth_bound"}
+      51.396 us    1206.5 TFLOPS  {"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 128, "NUM_BUFFERS": 3, "num_warps": 4, "kernel_type": "compute_bound", "persistent": false}
+      52.641 us    1178.0 TFLOPS  {"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 64, "NUM_BUFFERS": 4, "num_warps": 4, "kernel_type": "compute_bound", "persistent": false}
+      52.660 us    1177.5 TFLOPS  {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 128, "NUM_BUFFERS": 2, "num_warps": 2, "kernel_type": "bandwidth_bound", "persistent": false}
+      53.675 us    1155.3 TFLOPS  {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 128, "NUM_BUFFERS": 2, "num_warps": 4, "kernel_type": "bandwidth_bound", "persistent": false}
+      54.229 us    1143.5 TFLOPS  {"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 128, "NUM_BUFFERS": 3, "num_warps": 4, "kernel_type": "compute_bound", "persistent": false}
+      55.080 us    1125.8 TFLOPS  {"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 128, "NUM_BUFFERS": 3, "num_warps": 4, "kernel_type": "bandwidth_bound", "persistent": false}
+      55.730 us    1112.7 TFLOPS  {"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 64, "NUM_BUFFERS": 4, "num_warps": 4, "kernel_type": "bandwidth_bound", "persistent": false}
+      56.241 us    1102.5 TFLOPS  {"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 64, "NUM_BUFFERS": 4, "num_warps": 4, "kernel_type": "compute_bound", "persistent": false}
+      56.424 us    1099.0 TFLOPS  {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 128, "NUM_BUFFERS": 2, "num_warps": 4, "kernel_type": "bandwidth_bound", "persistent": false}
+      56.908 us    1089.6 TFLOPS  {"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 64, "NUM_BUFFERS": 4, "num_warps": 8, "kernel_type": "compute_bound", "persistent": false}
+  {'ok': 5957, 'error': 533, 'hung': 2}
+gemm_a16w16 gluon gfx1250 {'M': 4096, 'N': 2112, 'K': 7168}: keys from /app/aiter/aiter/ops/triton/configs/gfx1250/gluon/gemm/gemm_a16w16/DEFAULT.json
+  BLOCK_M: [16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+  BLOCK_N: [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+  BLOCK_K: [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+  NUM_BUFFERS: [1, 2, 3, 4, 6, 8]
+  num_warps: [1, 2, 4, 8]
+  kernel_type: ['bandwidth_bound', 'compute_bound']
+  persistent: [False]  (pinned)
+  43200 combinations, skipped 0 by generic rules, 27584 by LDS, 9115 by kernel rules -> 6501 configs, ~9.0 GPU-hours at 5 s/config
+  results: /app/aiter/aiter/ops/triton/utils/_triton/tuning/runs/sweep-gfx1250-gluon-gemm_a16w16-M=4096-N=2112-K=7168.jsonl
+  gpu 0: 0/1626 done, running 100
+  gpu 1: 0/1626 done, running 100
+  gpu 2: 0/1625 done, running 100
+  gpu 3: 0/1625 done, running 100
+  gpu 1: 100/1626 done, running 100
+  gpu 2: 100/1625 done, running 100
+  gpu 3: 100/1625 done, running 100
+  gpu 1: 200/1626 done, running 100
+  gpu 2: 200/1625 done, running 100
+  gpu 1: 300/1626 done, running 100
+  gpu 2: 300/1625 done, running 100
+  gpu 0: 100/1626 done, running 100
+  gpu 3: 200/1625 done, running 100
+  gpu 3: 300/1625 done, running 100
+  gpu 1: 400/1626 done, running 100
+  gpu 2: 400/1625 done, running 100
+  gpu 1: 500/1626 done, running 100
+  gpu 0: 200/1626 done, running 100
+  gpu 3: 400/1625 done, running 100
+  gpu 1: 600/1626 done, running 100
+  gpu 2: 500/1625 done, running 100
+  gpu 0: 300/1626 done, running 100
+  gpu 2: 600/1625 done, running 100
+  gpu 1: 700/1626 done, running 100
+  gpu 3: 500/1625 done, running 100
+  gpu 2: 700/1625 done, running 100
+  gpu 3: 600/1625 done, running 100
+  gpu 0: 400/1626 done, running 100
+  gpu 2: 800/1625 done, running 100
+  gpu 1: 800/1626 done, running 100
+  gpu 3: 700/1625 done, running 100
+  gpu 2: 900/1625 done, running 100
+  gpu 0: crashed: {"BLOCK_M": 32, "BLOCK_N": 16, "BLOCK_K": 32, "NUM_BUFFERS": 1, "num_warps": 1, "kernel_type": "bandwidth_bound", "persistent": false}
+  gpu 0: 430/1626 done, running 100
+  gpu 1: 900/1626 done, running 100
+  gpu 1: 1000/1626 done, running 100
+  gpu 0: 530/1626 done, running 100
+  gpu 3: 800/1625 done, running 100
+  gpu 0: 630/1626 done, running 100
+  gpu 3: 900/1625 done, running 100
+  gpu 1: 1100/1626 done, running 100
+  gpu 1: 1200/1626 done, running 100
+  gpu 0: 730/1626 done, running 100
+  gpu 3: 1000/1625 done, running 100
+  gpu 0: 830/1626 done, running 100
+  gpu 0: 930/1626 done, running 100
+  gpu 3: 1100/1625 done, running 100
+  gpu 0: 1030/1626 done, running 100
+  gpu 3: 1200/1625 done, running 100
+  gpu 1: 1300/1626 done, running 100
+  gpu 0: 1130/1626 done, running 100
+  gpu 1: 1400/1626 done, running 100
+  gpu 3: 1300/1625 done, running 100
+  gpu 0: 1230/1626 done, running 100
+  gpu 3: 1400/1625 done, running 100
+  gpu 1: 1500/1626 done, running 100
+  gpu 2: 1000/1625 done, running 100
+  gpu 3: 1500/1625 done, running 100
+  gpu 0: 1330/1626 done, running 100
+  gpu 2: 1100/1625 done, running 100
+  gpu 2: 1200/1625 done, running 100
+  gpu 1: 1600/1626 done, running 26
+  gpu 2: 1300/1625 done, running 100
+  gpu 2: 1400/1625 done, running 100
+  gpu 3: 1600/1625 done, running 25
+  gpu 2: 1500/1625 done, running 100
+  gpu 2: 1600/1625 done, running 25
+  gpu 0: hung: {"BLOCK_M": 256, "BLOCK_N": 64, "BLOCK_K": 512, "NUM_BUFFERS": 1, "num_warps": 1, "kernel_type": "bandwidth_bound", "persistent": false}
+  gpu 0: 1392/1626 done, running 100
+  gpu 0: crashed: {"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 32, "NUM_BUFFERS": 3, "num_warps": 1, "kernel_type": "bandwidth_bound", "persistent": false}
+  gpu 0: 1396/1626 done, running 100
+  gpu 0: crashed: {"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 32, "NUM_BUFFERS": 6, "num_warps": 1, "kernel_type": "bandwidth_bound", "persistent": false}
+  gpu 0: 1400/1626 done, running 100
+  gpu 0: 1500/1626 done, running 100
+  gpu 0: 1600/1626 done, running 26
+  final round on gpu 0: re-timing the baseline and the 10 fastest
+  gpu 0: 0/11 done, running 11
+  final round (same-device numbers the installer uses):
+  baseline (installed, is_tuned=False): 109.237 us  {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 128, "NUM_BUFFERS": 2, "num_warps": 2, "kernel_type": "bandwidth_bound"}
+      75.795 us    1636.2 TFLOPS  {"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 64, "NUM_BUFFERS": 4, "num_warps": 4, "kernel_type": "compute_bound", "persistent": false}
+      92.077 us    1346.9 TFLOPS  {"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 64, "NUM_BUFFERS": 3, "num_warps": 4, "kernel_type": "bandwidth_bound", "persistent": false}
+      92.338 us    1343.1 TFLOPS  {"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 64, "NUM_BUFFERS": 4, "num_warps": 8, "kernel_type": "compute_bound", "persistent": false}
+      95.286 us    1301.5 TFLOPS  {"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 64, "NUM_BUFFERS": 4, "num_warps": 4, "kernel_type": "bandwidth_bound", "persistent": false}
+      95.379 us    1300.3 TFLOPS  {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 128, "NUM_BUFFERS": 1, "num_warps": 4, "kernel_type": "bandwidth_bound", "persistent": false}
+      97.914 us    1266.6 TFLOPS  {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "NUM_BUFFERS": 2, "num_warps": 4, "kernel_type": "bandwidth_bound", "persistent": false}
+      98.113 us    1264.0 TFLOPS  {"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 128, "NUM_BUFFERS": 2, "num_warps": 4, "kernel_type": "bandwidth_bound", "persistent": false}
+      98.886 us    1254.1 TFLOPS  {"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 64, "NUM_BUFFERS": 3, "num_warps": 4, "kernel_type": "compute_bound", "persistent": false}
+     100.137 us    1238.5 TFLOPS  {"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 64, "NUM_BUFFERS": 4, "num_warps": 8, "kernel_type": "bandwidth_bound", "persistent": false}
+     100.824 us    1230.0 TFLOPS  {"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 64, "NUM_BUFFERS": 3, "num_warps": 8, "kernel_type": "bandwidth_bound", "persistent": false}
+  {'ok': 5954, 'error': 544, 'crashed': 3, 'hung': 1}
+gemm_a16w16 gluon gfx1250 {'M': 8192, 'N': 2112, 'K': 7168}: keys from /app/aiter/aiter/ops/triton/configs/gfx1250/gluon/gemm/gemm_a16w16/DEFAULT.json
+  BLOCK_M: [16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+  BLOCK_N: [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+  BLOCK_K: [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+  NUM_BUFFERS: [1, 2, 3, 4, 6, 8]
+  num_warps: [1, 2, 4, 8]
+  kernel_type: ['bandwidth_bound', 'compute_bound']
+  persistent: [False]  (pinned)
+  43200 combinations, skipped 0 by generic rules, 27584 by LDS, 9115 by kernel rules -> 6501 configs, ~9.0 GPU-hours at 5 s/config
+  results: /app/aiter/aiter/ops/triton/utils/_triton/tuning/runs/sweep-gfx1250-gluon-gemm_a16w16-M=8192-N=2112-K=7168.jsonl
+  gpu 0: 0/1626 done, running 100
+  gpu 1: 0/1626 done, running 100
+  gpu 2: 0/1625 done, running 100
+  gpu 3: 0/1625 done, running 100
+  gpu 1: 100/1626 done, running 100
+  gpu 2: 100/1625 done, running 100
+  gpu 3: 100/1625 done, running 100
+  gpu 1: 200/1626 done, running 100
+  gpu 2: 200/1625 done, running 100
+  gpu 1: 300/1626 done, running 100
+  gpu 2: 300/1625 done, running 100
+  gpu 0: 100/1626 done, running 100
+  gpu 3: 200/1625 done, running 100
+  gpu 1: 400/1626 done, running 100
+  gpu 3: 300/1625 done, running 100
+  gpu 2: 400/1625 done, running 100
+  gpu 1: 500/1626 done, running 100
+  gpu 0: 200/1626 done, running 100
+  gpu 3: 400/1625 done, running 100
+  gpu 2: 500/1625 done, running 100
+  gpu 1: 600/1626 done, running 100
+  gpu 2: 600/1625 done, running 100
+  gpu 0: 300/1626 done, running 100
+  gpu 1: 700/1626 done, running 100
+  gpu 2: 700/1625 done, running 100
+  gpu 3: 500/1625 done, running 100
+  gpu 3: 600/1625 done, running 100
+  gpu 0: 400/1626 done, running 100
+  gpu 2: 800/1625 done, running 100
+  gpu 1: 800/1626 done, running 100
+  gpu 3: 700/1625 done, running 100
+  gpu 2: 900/1625 done, running 100
+  gpu 1: 900/1626 done, running 100
+  gpu 0: 500/1626 done, running 100
+  gpu 2: crashed: {"BLOCK_M": 64, "BLOCK_N": 512, "BLOCK_K": 32, "NUM_BUFFERS": 4, "num_warps": 1, "kernel_type": "bandwidth_bound", "persistent": false}
+  gpu 2: 982/1625 done, running 100
+  gpu 1: 1000/1626 done, running 100
+  gpu 0: 600/1626 done, running 100
+  gpu 3: 800/1625 done, running 100
+  gpu 3: 900/1625 done, running 100
+  gpu 1: 1100/1626 done, running 100
+  gpu 0: 700/1626 done, running 100
+  gpu 1: 1200/1626 done, running 100
+  gpu 2: 1082/1625 done, running 100
+  gpu 2: 1182/1625 done, running 100
+  gpu 3: 1000/1625 done, running 100
+  gpu 0: 800/1626 done, running 100
+  gpu 2: 1282/1625 done, running 100
+  gpu 0: 900/1626 done, running 100
+  gpu 0: 1000/1626 done, running 100
+  gpu 2: 1382/1625 done, running 100
+  gpu 3: 1100/1625 done, running 100
+  gpu 1: 1300/1626 done, running 100
+  gpu 3: 1200/1625 done, running 100
+  gpu 3: crashed: {"BLOCK_M": 128, "BLOCK_N": 512, "BLOCK_K": 32, "NUM_BUFFERS": 2, "num_warps": 2, "kernel_type": "bandwidth_bound", "persistent": false}
+  gpu 3: 1238/1625 done, running 100
+  gpu 0: 1100/1626 done, running 100
+  gpu 0: 1200/1626 done, running 100
+  gpu 1: 1400/1626 done, running 100
+  gpu 2: 1482/1625 done, running 100
+  gpu 3: 1338/1625 done, running 100
+  gpu 2: 1582/1625 done, running 43
+  gpu 3: 1438/1625 done, running 100
+  gpu 0: 1300/1626 done, running 100
+  gpu 1: 1500/1626 done, running 100
+  gpu 3: 1538/1625 done, running 87
+  gpu 1: 1600/1626 done, running 26
+  gpu 0: hung: {"BLOCK_M": 256, "BLOCK_N": 64, "BLOCK_K": 512, "NUM_BUFFERS": 1, "num_warps": 1, "kernel_type": "bandwidth_bound", "persistent": false}
+  gpu 0: 1392/1626 done, running 100
+  gpu 0: crashed: {"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 32, "NUM_BUFFERS": 3, "num_warps": 1, "kernel_type": "bandwidth_bound", "persistent": false}
+  gpu 0: 1396/1626 done, running 100
+  gpu 0: 1496/1626 done, running 100
+  gpu 0: 1596/1626 done, running 30
+  final round on gpu 0: re-timing the baseline and the 10 fastest
+  gpu 0: 0/11 done, running 11
+  final round (same-device numbers the installer uses):
+  baseline (installed, is_tuned=False): 186.279 us  {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 128, "NUM_BUFFERS": 2, "num_warps": 2, "kernel_type": "bandwidth_bound"}
+     165.518 us    1498.5 TFLOPS  {"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 64, "NUM_BUFFERS": 4, "num_warps": 4, "kernel_type": "compute_bound", "persistent": false}
+     168.812 us    1469.3 TFLOPS  {"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 128, "NUM_BUFFERS": 3, "num_warps": 4, "kernel_type": "compute_bound", "persistent": false}
+     168.937 us    1468.2 TFLOPS  {"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 128, "NUM_BUFFERS": 3, "num_warps": 4, "kernel_type": "compute_bound", "persistent": false}
+     170.630 us    1453.6 TFLOPS  {"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 64, "NUM_BUFFERS": 4, "num_warps": 4, "kernel_type": "compute_bound", "persistent": false}
+     176.492 us    1405.4 TFLOPS  {"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 64, "NUM_BUFFERS": 4, "num_warps": 4, "kernel_type": "compute_bound", "persistent": false}
+     177.652 us    1396.2 TFLOPS  {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 128, "NUM_BUFFERS": 2, "num_warps": 4, "kernel_type": "bandwidth_bound", "persistent": false}
+     181.369 us    1367.6 TFLOPS  {"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 128, "NUM_BUFFERS": 3, "num_warps": 4, "kernel_type": "bandwidth_bound", "persistent": false}
+     183.860 us    1349.0 TFLOPS  {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 128, "NUM_BUFFERS": 2, "num_warps": 2, "kernel_type": "bandwidth_bound", "persistent": false}
+     183.894 us    1348.8 TFLOPS  {"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 64, "NUM_BUFFERS": 3, "num_warps": 4, "kernel_type": "bandwidth_bound", "persistent": false}
+     184.344 us    1345.5 TFLOPS  {"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 64, "NUM_BUFFERS": 4, "num_warps": 4, "kernel_type": "bandwidth_bound", "persistent": false}
+  {'ok': 5954, 'error': 544, 'crashed': 3, 'hung': 1}
+gemm_a16w16 gluon gfx1250 {'M': 1, 'N': 2112, 'K': 7168}: keys from /app/aiter/aiter/ops/triton/configs/gfx1250/gluon/gemm/gemm_a16w16/DEFAULT.json
+  BLOCK_M: [16]
+  BLOCK_N: [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+  BLOCK_K: [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+  NUM_BUFFERS: [1, 2, 3, 4, 6, 8]
+  num_warps: [1, 2, 4, 8]
+  kernel_type: ['bandwidth_bound', 'compute_bound']
+  persistent: [False]  (pinned)
+  4800 combinations, skipped 0 by generic rules, 2240 by LDS, 1109 by kernel rules -> 1451 configs, ~2.0 GPU-hours at 5 s/config
+  results: /app/aiter/aiter/ops/triton/utils/_triton/tuning/runs/sweep-gfx1250-gluon-gemm_a16w16-M=1-N=2112-K=7168.jsonl
+  gpu 0: 0/363 done, running 100
+  gpu 1: 0/363 done, running 100
+  gpu 2: 0/363 done, running 100
+  gpu 3: 0/363 done, running 100
+  gpu 1: 100/363 done, running 100
+  gpu 3: 100/363 done, running 100
+  gpu 0: 100/363 done, running 100
+  gpu 2: 100/363 done, running 100
+  gpu 3: 200/363 done, running 100
+  gpu 2: 200/363 done, running 100
+  gpu 1: 200/363 done, running 100
+  gpu 3: 300/363 done, running 63
+  gpu 0: 200/363 done, running 100
+  gpu 0: 300/363 done, running 63
+  gpu 2: 300/363 done, running 63
+  gpu 1: 300/363 done, running 63
+  final round on gpu 0: re-timing the baseline and the 10 fastest
+  gpu 0: 0/11 done, running 11
+  final round (same-device numbers the installer uses):
+  baseline (installed, is_tuned=True): 6.795 us  {"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 256, "NUM_BUFFERS": 8, "num_warps": 1, "kernel_type": "bandwidth_bound"}
+       5.522 us       5.5 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 8, "BLOCK_K": 512, "NUM_BUFFERS": 6, "num_warps": 1, "kernel_type": "compute_bound", "persistent": false}
+       5.651 us       5.4 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 512, "NUM_BUFFERS": 6, "num_warps": 2, "kernel_type": "compute_bound", "persistent": false}
+       5.686 us       5.3 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 8, "BLOCK_K": 512, "NUM_BUFFERS": 6, "num_warps": 2, "kernel_type": "compute_bound", "persistent": false}
+       5.796 us       5.2 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 8, "BLOCK_K": 512, "NUM_BUFFERS": 6, "num_warps": 1, "kernel_type": "bandwidth_bound", "persistent": false}
+       5.808 us       5.2 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 512, "NUM_BUFFERS": 8, "num_warps": 2, "kernel_type": "compute_bound", "persistent": false}
+       5.891 us       5.1 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 512, "NUM_BUFFERS": 6, "num_warps": 2, "kernel_type": "bandwidth_bound", "persistent": false}
+       5.901 us       5.1 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 512, "NUM_BUFFERS": 6, "num_warps": 1, "kernel_type": "compute_bound", "persistent": false}
+       5.982 us       5.1 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 1024, "NUM_BUFFERS": 4, "num_warps": 1, "kernel_type": "compute_bound", "persistent": false}
+       6.011 us       5.0 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 8, "BLOCK_K": 1024, "NUM_BUFFERS": 3, "num_warps": 1, "kernel_type": "bandwidth_bound", "persistent": false}
+       6.118 us       5.0 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 8, "BLOCK_K": 512, "NUM_BUFFERS": 6, "num_warps": 2, "kernel_type": "bandwidth_bound", "persistent": false}
+  {'ok': 1385, 'error': 67}
+gemm_a16w16 gluon gfx1250 {'M': 4, 'N': 2112, 'K': 7168}: keys from /app/aiter/aiter/ops/triton/configs/gfx1250/gluon/gemm/gemm_a16w16/DEFAULT.json
+  BLOCK_M: [16]
+  BLOCK_N: [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+  BLOCK_K: [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+  NUM_BUFFERS: [1, 2, 3, 4, 6, 8]
+  num_warps: [1, 2, 4, 8]
+  kernel_type: ['bandwidth_bound', 'compute_bound']
+  persistent: [False]  (pinned)
+  4800 combinations, skipped 0 by generic rules, 2240 by LDS, 1109 by kernel rules -> 1451 configs, ~2.0 GPU-hours at 5 s/config
+  results: /app/aiter/aiter/ops/triton/utils/_triton/tuning/runs/sweep-gfx1250-gluon-gemm_a16w16-M=4-N=2112-K=7168.jsonl
+  gpu 0: 0/363 done, running 100
+  gpu 1: 0/363 done, running 100
+  gpu 2: 0/363 done, running 100
+  gpu 3: 0/363 done, running 100
+  gpu 3: 100/363 done, running 100
+  gpu 1: 100/363 done, running 100
+  gpu 0: 100/363 done, running 100
+  gpu 2: 100/363 done, running 100
+  gpu 3: 200/363 done, running 100
+  gpu 1: 200/363 done, running 100
+  gpu 0: 200/363 done, running 100
+  gpu 3: 300/363 done, running 63
+  gpu 2: 200/363 done, running 100
+  gpu 0: 300/363 done, running 63
+  gpu 1: 300/363 done, running 63
+  gpu 2: 300/363 done, running 63
+  final round on gpu 0: re-timing the baseline and the 10 fastest
+  gpu 0: 0/11 done, running 11
+  final round (same-device numbers the installer uses):
+  baseline (installed, is_tuned=True): 7.052 us  {"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 256, "NUM_BUFFERS": 8, "num_warps": 1, "kernel_type": "bandwidth_bound"}
+       6.119 us      19.8 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 8, "BLOCK_K": 512, "NUM_BUFFERS": 6, "num_warps": 1, "kernel_type": "compute_bound", "persistent": false}
+       6.133 us      19.8 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 8, "BLOCK_K": 512, "NUM_BUFFERS": 6, "num_warps": 2, "kernel_type": "compute_bound", "persistent": false}
+       6.171 us      19.6 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 512, "NUM_BUFFERS": 6, "num_warps": 2, "kernel_type": "compute_bound", "persistent": false}
+       6.356 us      19.1 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 8, "BLOCK_K": 512, "NUM_BUFFERS": 6, "num_warps": 1, "kernel_type": "bandwidth_bound", "persistent": false}
+       6.366 us      19.0 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 512, "NUM_BUFFERS": 6, "num_warps": 2, "kernel_type": "bandwidth_bound", "persistent": false}
+       6.371 us      19.0 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 512, "NUM_BUFFERS": 8, "num_warps": 2, "kernel_type": "compute_bound", "persistent": false}
+       6.448 us      18.8 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 1024, "NUM_BUFFERS": 4, "num_warps": 1, "kernel_type": "compute_bound", "persistent": false}
+       6.452 us      18.8 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 8, "BLOCK_K": 1024, "NUM_BUFFERS": 3, "num_warps": 1, "kernel_type": "bandwidth_bound", "persistent": false}
+       6.472 us      18.7 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 512, "NUM_BUFFERS": 6, "num_warps": 4, "kernel_type": "compute_bound", "persistent": false}
+       6.478 us      18.7 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 512, "NUM_BUFFERS": 6, "num_warps": 1, "kernel_type": "compute_bound", "persistent": false}
+  {'ok': 1385, 'error': 67}
+gemm_a16w16 gluon gfx1250 {'M': 8, 'N': 2112, 'K': 7168}: keys from /app/aiter/aiter/ops/triton/configs/gfx1250/gluon/gemm/gemm_a16w16/DEFAULT.json
+  BLOCK_M: [16]
+  BLOCK_N: [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+  BLOCK_K: [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+  NUM_BUFFERS: [1, 2, 3, 4, 6, 8]
+  num_warps: [1, 2, 4, 8]
+  kernel_type: ['bandwidth_bound', 'compute_bound']
+  persistent: [False]  (pinned)
+  4800 combinations, skipped 0 by generic rules, 2240 by LDS, 1109 by kernel rules -> 1451 configs, ~2.0 GPU-hours at 5 s/config
+  results: /app/aiter/aiter/ops/triton/utils/_triton/tuning/runs/sweep-gfx1250-gluon-gemm_a16w16-M=8-N=2112-K=7168.jsonl
+  gpu 0: 0/363 done, running 100
+  gpu 1: 0/363 done, running 100
+  gpu 2: 0/363 done, running 100
+  gpu 3: 0/363 done, running 100
+  gpu 1: 100/363 done, running 100
+  gpu 0: 100/363 done, running 100
+  gpu 3: 100/363 done, running 100
+  gpu 2: 100/363 done, running 100
+  gpu 1: 200/363 done, running 100
+  gpu 0: 200/363 done, running 100
+  gpu 2: 200/363 done, running 100
+  gpu 3: 200/363 done, running 100
+  gpu 1: 300/363 done, running 63
+  gpu 0: 300/363 done, running 63
+  gpu 3: 300/363 done, running 63
+  gpu 2: 300/363 done, running 63
+  final round on gpu 0: re-timing the baseline and the 10 fastest
+  gpu 0: 0/11 done, running 11
+  final round (same-device numbers the installer uses):
+  baseline (installed, is_tuned=True): 7.208 us  {"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 256, "NUM_BUFFERS": 8, "num_warps": 1, "kernel_type": "bandwidth_bound"}
+       6.586 us      36.8 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 8, "BLOCK_K": 512, "NUM_BUFFERS": 6, "num_warps": 2, "kernel_type": "compute_bound", "persistent": false}
+       6.741 us      35.9 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 512, "NUM_BUFFERS": 6, "num_warps": 2, "kernel_type": "compute_bound", "persistent": false}
+       6.785 us      35.7 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 512, "NUM_BUFFERS": 6, "num_warps": 4, "kernel_type": "compute_bound", "persistent": false}
+       6.800 us      35.6 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 8, "BLOCK_K": 512, "NUM_BUFFERS": 6, "num_warps": 1, "kernel_type": "compute_bound", "persistent": false}
+       6.879 us      35.2 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 8, "BLOCK_K": 512, "NUM_BUFFERS": 6, "num_warps": 1, "kernel_type": "bandwidth_bound", "persistent": false}
+       6.896 us      35.1 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 512, "NUM_BUFFERS": 4, "num_warps": 2, "kernel_type": "bandwidth_bound", "persistent": false}
+       6.914 us      35.0 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 512, "NUM_BUFFERS": 6, "num_warps": 2, "kernel_type": "bandwidth_bound", "persistent": false}
+       6.922 us      35.0 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 1024, "NUM_BUFFERS": 4, "num_warps": 1, "kernel_type": "compute_bound", "persistent": false}
+       6.925 us      35.0 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 8, "BLOCK_K": 512, "NUM_BUFFERS": 6, "num_warps": 2, "kernel_type": "bandwidth_bound", "persistent": false}
+       6.954 us      34.8 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 512, "NUM_BUFFERS": 8, "num_warps": 2, "kernel_type": "compute_bound", "persistent": false}
+  {'ok': 1385, 'error': 67}
+gemm_a16w16 gluon gfx1250 {'M': 16, 'N': 2112, 'K': 7168}: keys from /app/aiter/aiter/ops/triton/configs/gfx1250/gluon/gemm/gemm_a16w16/DEFAULT.json
+  BLOCK_M: [16]
+  BLOCK_N: [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+  BLOCK_K: [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+  NUM_BUFFERS: [1, 2, 3, 4, 6, 8]
+  num_warps: [1, 2, 4, 8]
+  kernel_type: ['bandwidth_bound', 'compute_bound']
+  persistent: [False]  (pinned)
+  4800 combinations, skipped 0 by generic rules, 2240 by LDS, 1109 by kernel rules -> 1451 configs, ~2.0 GPU-hours at 5 s/config
+  results: /app/aiter/aiter/ops/triton/utils/_triton/tuning/runs/sweep-gfx1250-gluon-gemm_a16w16-M=16-N=2112-K=7168.jsonl
+  gpu 0: 0/363 done, running 100
+  gpu 1: 0/363 done, running 100
+  gpu 2: 0/363 done, running 100
+  gpu 3: 0/363 done, running 100
+  gpu 0: 100/363 done, running 100
+  gpu 3: 100/363 done, running 100
+  gpu 2: 100/363 done, running 100
+  gpu 1: 100/363 done, running 100
+  gpu 3: 200/363 done, running 100
+  gpu 1: 200/363 done, running 100
+  gpu 0: 200/363 done, running 100
+  gpu 2: 200/363 done, running 100
+  gpu 3: 300/363 done, running 63
+  gpu 1: 300/363 done, running 63
+  gpu 2: 300/363 done, running 63
+  gpu 0: 300/363 done, running 63
+  final round on gpu 0: re-timing the baseline and the 10 fastest
+  gpu 0: 0/11 done, running 11
+  final round (same-device numbers the installer uses):
+  baseline (installed, is_tuned=True): 8.478 us  {"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 256, "NUM_BUFFERS": 8, "num_warps": 1, "kernel_type": "bandwidth_bound"}
+       7.858 us      61.6 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 512, "NUM_BUFFERS": 6, "num_warps": 4, "kernel_type": "compute_bound", "persistent": false}
+       7.889 us      61.4 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 512, "NUM_BUFFERS": 4, "num_warps": 4, "kernel_type": "bandwidth_bound", "persistent": false}
+       7.945 us      61.0 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 256, "NUM_BUFFERS": 8, "num_warps": 2, "kernel_type": "compute_bound", "persistent": false}
+       7.947 us      61.0 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 256, "NUM_BUFFERS": 8, "num_warps": 2, "kernel_type": "bandwidth_bound", "persistent": false}
+       7.962 us      60.9 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 8, "BLOCK_K": 256, "NUM_BUFFERS": 8, "num_warps": 2, "kernel_type": "compute_bound", "persistent": false}
+       7.977 us      60.7 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 8, "BLOCK_K": 512, "NUM_BUFFERS": 6, "num_warps": 2, "kernel_type": "compute_bound", "persistent": false}
+       8.000 us      60.5 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 512, "NUM_BUFFERS": 4, "num_warps": 2, "kernel_type": "bandwidth_bound", "persistent": false}
+       8.005 us      60.5 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 256, "NUM_BUFFERS": 8, "num_warps": 4, "kernel_type": "compute_bound", "persistent": false}
+       8.013 us      60.5 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 256, "NUM_BUFFERS": 6, "num_warps": 2, "kernel_type": "bandwidth_bound", "persistent": false}
+       8.150 us      59.4 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 512, "NUM_BUFFERS": 6, "num_warps": 4, "kernel_type": "bandwidth_bound", "persistent": false}
+  {'ok': 1385, 'error': 67}
+gemm_a16w16 gluon gfx1250 {'M': 32, 'N': 2112, 'K': 7168}: keys from /app/aiter/aiter/ops/triton/configs/gfx1250/gluon/gemm/gemm_a16w16/DEFAULT.json
+  BLOCK_M: [16, 32]
+  BLOCK_N: [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+  BLOCK_K: [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+  NUM_BUFFERS: [1, 2, 3, 4, 6, 8]
+  num_warps: [1, 2, 4, 8]
+  kernel_type: ['bandwidth_bound', 'compute_bound']
+  persistent: [False]  (pinned)
+  9600 combinations, skipped 0 by generic rules, 4576 by LDS, 2207 by kernel rules -> 2817 configs, ~3.9 GPU-hours at 5 s/config
+  results: /app/aiter/aiter/ops/triton/utils/_triton/tuning/runs/sweep-gfx1250-gluon-gemm_a16w16-M=32-N=2112-K=7168.jsonl
+  gpu 0: 0/705 done, running 100
+  gpu 1: 0/705 done, running 100
+  gpu 2: 0/704 done, running 100
+  gpu 3: 0/704 done, running 100
+  gpu 0: 100/705 done, running 100
+  gpu 2: 100/704 done, running 100
+  gpu 3: 100/704 done, running 100
+  gpu 1: 100/705 done, running 100
+  gpu 1: 200/705 done, running 100
+  gpu 0: 200/705 done, running 100
+  gpu 2: 200/704 done, running 100
+  gpu 3: 200/704 done, running 100
+  gpu 1: 300/705 done, running 100
+  gpu 0: 300/705 done, running 100
+  gpu 2: 300/704 done, running 100
+  gpu 3: 300/704 done, running 100
+  gpu 3: 400/704 done, running 100
+  gpu 2: 400/704 done, running 100
+  gpu 0: 400/705 done, running 100
+  gpu 1: 400/705 done, running 100
+  gpu 3: 500/704 done, running 100
+  gpu 2: 500/704 done, running 100
+  gpu 0: 500/705 done, running 100
+  gpu 1: 500/705 done, running 100
+  gpu 3: 600/704 done, running 100
+  gpu 2: 600/704 done, running 100
+  gpu 0: 600/705 done, running 100
+  gpu 1: 600/705 done, running 100
+  gpu 2: 700/704 done, running 4
+  gpu 3: 700/704 done, running 4
+  gpu 1: 700/705 done, running 5
+  gpu 0: 700/705 done, running 5
+  final round on gpu 0: re-timing the baseline and the 10 fastest
+  gpu 0: 0/11 done, running 11
+  final round (same-device numbers the installer uses):
+  baseline (installed, is_tuned=True): 11.300 us  {"BLOCK_M": 16, "BLOCK_N": 32, "BLOCK_K": 512, "NUM_BUFFERS": 5, "num_warps": 2, "kernel_type": "bandwidth_bound"}
+       9.615 us     100.8 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 256, "NUM_BUFFERS": 6, "num_warps": 2, "kernel_type": "bandwidth_bound", "persistent": false}
+       9.696 us      99.9 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 256, "NUM_BUFFERS": 8, "num_warps": 2, "kernel_type": "compute_bound", "persistent": false}
+       9.736 us      99.5 TFLOPS  {"BLOCK_M": 32, "BLOCK_N": 16, "BLOCK_K": 256, "NUM_BUFFERS": 6, "num_warps": 4, "kernel_type": "compute_bound", "persistent": false}
+       9.847 us      98.4 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 256, "NUM_BUFFERS": 8, "num_warps": 2, "kernel_type": "bandwidth_bound", "persistent": false}
+       9.852 us      98.3 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 512, "NUM_BUFFERS": 4, "num_warps": 2, "kernel_type": "compute_bound", "persistent": false}
+       9.864 us      98.2 TFLOPS  {"BLOCK_M": 32, "BLOCK_N": 16, "BLOCK_K": 256, "NUM_BUFFERS": 8, "num_warps": 4, "kernel_type": "compute_bound", "persistent": false}
+       9.867 us      98.2 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 1024, "NUM_BUFFERS": 2, "num_warps": 1, "kernel_type": "bandwidth_bound", "persistent": false}
+       9.960 us      97.3 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 256, "NUM_BUFFERS": 6, "num_warps": 1, "kernel_type": "compute_bound", "persistent": false}
+       9.977 us      97.1 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 256, "NUM_BUFFERS": 8, "num_warps": 1, "kernel_type": "compute_bound", "persistent": false}
+      10.382 us      93.3 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 256, "NUM_BUFFERS": 6, "num_warps": 2, "kernel_type": "compute_bound", "persistent": false}
+  {'ok': 2651, 'error': 167}
+gemm_a16w16 gluon gfx1250 {'M': 64, 'N': 2112, 'K': 7168}: keys from /app/aiter/aiter/ops/triton/configs/gfx1250/gluon/gemm/gemm_a16w16/DEFAULT.json
+  BLOCK_M: [16, 32, 64]
+  BLOCK_N: [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+  BLOCK_K: [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+  NUM_BUFFERS: [1, 2, 3, 4, 6, 8]
+  num_warps: [1, 2, 4, 8]
+  kernel_type: ['bandwidth_bound', 'compute_bound']
+  persistent: [False]  (pinned)
+  14400 combinations, skipped 0 by generic rules, 7056 by LDS, 3309 by kernel rules -> 4035 configs, ~5.6 GPU-hours at 5 s/config
+  results: /app/aiter/aiter/ops/triton/utils/_triton/tuning/runs/sweep-gfx1250-gluon-gemm_a16w16-M=64-N=2112-K=7168.jsonl
+  gpu 0: 0/1009 done, running 100
+  gpu 1: 0/1009 done, running 100
+  gpu 2: 0/1009 done, running 100
+  gpu 3: 0/1009 done, running 100
+  gpu 2: 100/1009 done, running 100
+  gpu 3: 100/1009 done, running 100
+  gpu 1: 100/1009 done, running 100
+  gpu 0: 100/1009 done, running 100
+  gpu 2: 200/1009 done, running 100
+  gpu 3: 200/1009 done, running 100
+  gpu 1: 200/1009 done, running 100
+  gpu 0: 200/1009 done, running 100
+  gpu 2: 300/1009 done, running 100
+  gpu 1: 300/1009 done, running 100
+  gpu 3: 300/1009 done, running 100
+  gpu 0: 300/1009 done, running 100
+  gpu 3: 400/1009 done, running 100
+  gpu 2: 400/1009 done, running 100
+  gpu 3: 500/1009 done, running 100
+  gpu 0: 400/1009 done, running 100
+  gpu 1: 400/1009 done, running 100
+  gpu 2: 500/1009 done, running 100
+  gpu 0: 500/1009 done, running 100
+  gpu 3: 600/1009 done, running 100
+  gpu 1: 500/1009 done, running 100
+  gpu 2: 600/1009 done, running 100
+  gpu 0: 600/1009 done, running 100
+  gpu 1: 600/1009 done, running 100
+  gpu 3: 700/1009 done, running 100
+  gpu 2: 700/1009 done, running 100
+  gpu 2: 800/1009 done, running 100
+  gpu 3: 800/1009 done, running 100
+  gpu 1: 700/1009 done, running 100
+  gpu 2: 900/1009 done, running 100
+  gpu 3: 900/1009 done, running 100
+  gpu 0: 700/1009 done, running 100
+  gpu 1: 800/1009 done, running 100
+  gpu 1: 900/1009 done, running 100
+  gpu 0: 800/1009 done, running 100
+  gpu 0: 900/1009 done, running 100
+  gpu 1: 1000/1009 done, running 9
+  gpu 0: 1000/1009 done, running 9
+  gpu 3: 1000/1009 done, running 9
+  gpu 2: 1000/1009 done, running 9
+  final round on gpu 0: re-timing the baseline and the 10 fastest
+  gpu 0: 0/11 done, running 11
+  final round (same-device numbers the installer uses):
+  baseline (installed, is_tuned=True): 13.039 us  {"BLOCK_M": 32, "BLOCK_N": 16, "BLOCK_K": 256, "NUM_BUFFERS": 4, "num_warps": 2, "kernel_type": "bandwidth_bound"}
+      11.513 us     168.3 TFLOPS  {"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 256, "NUM_BUFFERS": 6, "num_warps": 4, "kernel_type": "compute_bound", "persistent": false}
+      11.919 us     162.6 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 256, "NUM_BUFFERS": 4, "num_warps": 2, "kernel_type": "bandwidth_bound", "persistent": false}
+      11.934 us     162.4 TFLOPS  {"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 128, "NUM_BUFFERS": 8, "num_warps": 4, "kernel_type": "compute_bound", "persistent": false}
+      12.119 us     159.9 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 256, "NUM_BUFFERS": 6, "num_warps": 2, "kernel_type": "compute_bound", "persistent": false}
+      12.162 us     159.3 TFLOPS  {"BLOCK_M": 32, "BLOCK_N": 16, "BLOCK_K": 512, "NUM_BUFFERS": 3, "num_warps": 4, "kernel_type": "bandwidth_bound", "persistent": false}
+      12.218 us     158.6 TFLOPS  {"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 128, "NUM_BUFFERS": 8, "num_warps": 4, "kernel_type": "bandwidth_bound", "persistent": false}
+      12.241 us     158.3 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 256, "NUM_BUFFERS": 6, "num_warps": 2, "kernel_type": "bandwidth_bound", "persistent": false}
+      12.284 us     157.7 TFLOPS  {"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 128, "NUM_BUFFERS": 6, "num_warps": 4, "kernel_type": "bandwidth_bound", "persistent": false}
+      12.364 us     156.7 TFLOPS  {"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 256, "NUM_BUFFERS": 3, "num_warps": 2, "kernel_type": "bandwidth_bound", "persistent": false}
+      12.676 us     152.9 TFLOPS  {"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 256, "NUM_BUFFERS": 4, "num_warps": 4, "kernel_type": "bandwidth_bound", "persistent": false}
+  {'ok': 3777, 'error': 259}
+gemm_a16w16 gluon gfx1250 {'M': 128, 'N': 2112, 'K': 7168}: keys from /app/aiter/aiter/ops/triton/configs/gfx1250/gluon/gemm/gemm_a16w16/DEFAULT.json
+  BLOCK_M: [16, 32, 64, 128]
+  BLOCK_N: [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+  BLOCK_K: [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+  NUM_BUFFERS: [1, 2, 3, 4, 6, 8]
+  num_warps: [1, 2, 4, 8]
+  kernel_type: ['bandwidth_bound', 'compute_bound']
+  persistent: [False]  (pinned)
+  19200 combinations, skipped 0 by generic rules, 9728 by LDS, 4433 by kernel rules -> 5039 configs, ~7.0 GPU-hours at 5 s/config
+  results: /app/aiter/aiter/ops/triton/utils/_triton/tuning/runs/sweep-gfx1250-gluon-gemm_a16w16-M=128-N=2112-K=7168.jsonl
+  gpu 0: 0/1260 done, running 100
+  gpu 1: 0/1260 done, running 100
+  gpu 2: 0/1260 done, running 100
+  gpu 3: 0/1260 done, running 100
+  gpu 2: 100/1260 done, running 100
+  gpu 1: 100/1260 done, running 100
+  gpu 3: 100/1260 done, running 100
+  gpu 0: 100/1260 done, running 100
+  gpu 2: 200/1260 done, running 100
+  gpu 1: 200/1260 done, running 100
+  gpu 3: 200/1260 done, running 100
+  gpu 0: 200/1260 done, running 100
+  gpu 2: 300/1260 done, running 100
+  gpu 1: 300/1260 done, running 100
+  gpu 3: 300/1260 done, running 100
+  gpu 0: 300/1260 done, running 100
+  gpu 3: 400/1260 done, running 100
+  gpu 2: 400/1260 done, running 100
+  gpu 1: 400/1260 done, running 100
+  gpu 3: 500/1260 done, running 100
+  gpu 0: 400/1260 done, running 100
+  gpu 2: 500/1260 done, running 100
+  gpu 1: 500/1260 done, running 100
+  gpu 3: 600/1260 done, running 100
+  gpu 0: 500/1260 done, running 100
+  gpu 2: 600/1260 done, running 100
+  gpu 1: 600/1260 done, running 100
+  gpu 0: 600/1260 done, running 100
+  gpu 3: 700/1260 done, running 100
+  gpu 2: 700/1260 done, running 100
+  gpu 2: 800/1260 done, running 100
+  gpu 3: 800/1260 done, running 100
+  gpu 1: 700/1260 done, running 100
+  gpu 2: 900/1260 done, running 100
+  gpu 3: 900/1260 done, running 100
+  gpu 1: 800/1260 done, running 100
+  gpu 0: 700/1260 done, running 100
+  gpu 1: 900/1260 done, running 100
+  gpu 0: 800/1260 done, running 100
+  gpu 1: 1000/1260 done, running 100
+  gpu 0: 900/1260 done, running 100
+  gpu 0: 1000/1260 done, running 100
+  gpu 3: 1000/1260 done, running 100
+  gpu 1: 1100/1260 done, running 100
+  gpu 2: 1000/1260 done, running 100
+  gpu 1: 1200/1260 done, running 60
+  gpu 0: 1100/1260 done, running 100
+  gpu 0: 1200/1260 done, running 60
+  gpu 3: 1100/1260 done, running 100
+  gpu 2: 1100/1260 done, running 100
+  gpu 3: 1200/1260 done, running 60
+  gpu 2: 1200/1260 done, running 60
+  final round on gpu 0: re-timing the baseline and the 10 fastest
+  gpu 0: 0/11 done, running 11
+  final round (same-device numbers the installer uses):
+  baseline (installed, is_tuned=True): 17.002 us  {"BLOCK_M": 64, "BLOCK_N": 32, "BLOCK_K": 512, "NUM_BUFFERS": 3, "num_warps": 4, "kernel_type": "bandwidth_bound"}
+      15.184 us     255.2 TFLOPS  {"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 256, "NUM_BUFFERS": 3, "num_warps": 4, "kernel_type": "bandwidth_bound", "persistent": false}
+      15.347 us     252.5 TFLOPS  {"BLOCK_M": 32, "BLOCK_N": 16, "BLOCK_K": 128, "NUM_BUFFERS": 6, "num_warps": 4, "kernel_type": "compute_bound", "persistent": false}
+      15.379 us     252.0 TFLOPS  {"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 256, "NUM_BUFFERS": 4, "num_warps": 4, "kernel_type": "bandwidth_bound", "persistent": false}
+      15.412 us     251.5 TFLOPS  {"BLOCK_M": 32, "BLOCK_N": 16, "BLOCK_K": 256, "NUM_BUFFERS": 3, "num_warps": 4, "kernel_type": "bandwidth_bound", "persistent": false}
+      15.463 us     250.6 TFLOPS  {"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 128, "NUM_BUFFERS": 8, "num_warps": 4, "kernel_type": "compute_bound", "persistent": false}
+      15.504 us     250.0 TFLOPS  {"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 128, "NUM_BUFFERS": 8, "num_warps": 2, "kernel_type": "compute_bound", "persistent": false}
+      15.510 us     249.9 TFLOPS  {"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 128, "NUM_BUFFERS": 6, "num_warps": 2, "kernel_type": "compute_bound", "persistent": false}
+      15.518 us     249.8 TFLOPS  {"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 256, "NUM_BUFFERS": 3, "num_warps": 2, "kernel_type": "bandwidth_bound", "persistent": false}
+      15.667 us     247.4 TFLOPS  {"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 256, "NUM_BUFFERS": 4, "num_warps": 2, "kernel_type": "bandwidth_bound", "persistent": false}
+      16.541 us     234.3 TFLOPS  {"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 128, "NUM_BUFFERS": 6, "num_warps": 4, "kernel_type": "compute_bound", "persistent": false}
+  {'ok': 4710, 'error': 330}
+gemm_a16w16 gluon gfx1250 {'M': 256, 'N': 2112, 'K': 7168}: keys from /app/aiter/aiter/ops/triton/configs/gfx1250/gluon/gemm/gemm_a16w16/DEFAULT.json
+  BLOCK_M: [16, 32, 64, 128, 256]
+  BLOCK_N: [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+  BLOCK_K: [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+  NUM_BUFFERS: [1, 2, 3, 4, 6, 8]
+  num_warps: [1, 2, 4, 8]
+  kernel_type: ['bandwidth_bound', 'compute_bound']
+  persistent: [False]  (pinned)
+  24000 combinations, skipped 0 by generic rules, 12640 by LDS, 5582 by kernel rules -> 5778 configs, ~8.0 GPU-hours at 5 s/config
+  results: /app/aiter/aiter/ops/triton/utils/_triton/tuning/runs/sweep-gfx1250-gluon-gemm_a16w16-M=256-N=2112-K=7168.jsonl
+  gpu 0: 0/1445 done, running 100
+  gpu 1: 0/1445 done, running 100
+  gpu 2: 0/1445 done, running 100
+  gpu 3: 0/1444 done, running 100
+  gpu 2: 100/1445 done, running 100
+  gpu 1: 100/1445 done, running 100
+  gpu 3: 100/1444 done, running 100
+  gpu 0: 100/1445 done, running 100
+  gpu 2: 200/1445 done, running 100
+  gpu 1: 200/1445 done, running 100
+  gpu 3: 200/1444 done, running 100
+  gpu 1: 300/1445 done, running 100
+  gpu 2: 300/1445 done, running 100
+  gpu 0: 200/1445 done, running 100
+  gpu 3: 300/1444 done, running 100
+  gpu 0: 300/1445 done, running 100
+  gpu 3: 400/1444 done, running 100
+  gpu 2: 400/1445 done, running 100
+  gpu 1: 400/1445 done, running 100
+  gpu 2: 500/1445 done, running 100
+  gpu 1: 500/1445 done, running 100
+  gpu 3: 500/1444 done, running 100
+  gpu 0: 400/1445 done, running 100
+  gpu 2: 600/1445 done, running 100
+  gpu 1: 600/1445 done, running 100
+  gpu 3: 600/1444 done, running 100
+  gpu 0: 500/1445 done, running 100
+  gpu 0: 600/1445 done, running 100
+  gpu 2: 700/1445 done, running 100
+  gpu 3: 700/1444 done, running 100
+  gpu 1: 700/1445 done, running 100
+  gpu 0: crashed: {"BLOCK_M": 32, "BLOCK_N": 256, "BLOCK_K": 256, "NUM_BUFFERS": 1, "num_warps": 1, "kernel_type": "bandwidth_bound", "persistent": false}
+  gpu 0: 665/1445 done, running 100
+  gpu 2: 800/1445 done, running 100
+  gpu 3: 800/1444 done, running 100
+  gpu 2: 900/1445 done, running 100
+  gpu 3: 900/1444 done, running 100
+  gpu 1: 800/1445 done, running 100
+  gpu 1: 900/1445 done, running 100
+  gpu 1: 1000/1445 done, running 100
+  gpu 0: 765/1445 done, running 100
+  gpu 0: 865/1445 done, running 100
+  gpu 1: 1100/1445 done, running 100
+  gpu 0: 965/1445 done, running 100
+  gpu 3: 1000/1444 done, running 100
+  gpu 1: 1200/1445 done, running 100
+  gpu 2: 1000/1445 done, running 100
+  gpu 0: 1065/1445 done, running 100
+  gpu 0: 1165/1445 done, running 100
+  gpu 2: 1100/1445 done, running 100
+  gpu 3: 1100/1444 done, running 100
+  gpu 2: 1200/1445 done, running 100
+  gpu 3: 1200/1444 done, running 100
+  gpu 2: 1300/1445 done, running 100
+  gpu 3: 1300/1444 done, running 100
+  gpu 1: 1300/1445 done, running 100
+  gpu 2: 1400/1445 done, running 45
+  gpu 3: 1400/1444 done, running 44
+  gpu 1: 1400/1445 done, running 45
+  gpu 0: 1265/1445 done, running 100
+  gpu 0: 1365/1445 done, running 80
+  gpu 0: hung: {"BLOCK_M": 256, "BLOCK_N": 64, "BLOCK_K": 512, "NUM_BUFFERS": 1, "num_warps": 1, "kernel_type": "bandwidth_bound", "persistent": false}
+  gpu 0: 1392/1445 done, running 53
+  final round on gpu 0: re-timing the baseline and the 10 fastest
+  gpu 0: 0/11 done, running 11
+  final round (same-device numbers the installer uses):
+  baseline (installed, is_tuned=True): 21.574 us  {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 256, "NUM_BUFFERS": 4, "num_warps": 4, "kernel_type": "bandwidth_bound"}
+      19.771 us     392.1 TFLOPS  {"BLOCK_M": 64, "BLOCK_N": 32, "BLOCK_K": 256, "NUM_BUFFERS": 3, "num_warps": 8, "kernel_type": "bandwidth_bound", "persistent": false}
+      19.816 us     391.2 TFLOPS  {"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 256, "NUM_BUFFERS": 3, "num_warps": 4, "kernel_type": "bandwidth_bound", "persistent": false}
+      19.895 us     389.6 TFLOPS  {"BLOCK_M": 64, "BLOCK_N": 32, "BLOCK_K": 256, "NUM_BUFFERS": 3, "num_warps": 2, "kernel_type": "bandwidth_bound", "persistent": false}
+      19.999 us     387.6 TFLOPS  {"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 128, "NUM_BUFFERS": 4, "num_warps": 4, "kernel_type": "bandwidth_bound", "persistent": false}
+      20.002 us     387.5 TFLOPS  {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 128, "NUM_BUFFERS": 6, "num_warps": 8, "kernel_type": "compute_bound", "persistent": false}
+      20.008 us     387.4 TFLOPS  {"BLOCK_M": 64, "BLOCK_N": 32, "BLOCK_K": 256, "NUM_BUFFERS": 3, "num_warps": 4, "kernel_type": "compute_bound", "persistent": false}
+      20.224 us     383.3 TFLOPS  {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 256, "NUM_BUFFERS": 4, "num_warps": 8, "kernel_type": "compute_bound", "persistent": false}
+      20.239 us     383.0 TFLOPS  {"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 256, "NUM_BUFFERS": 3, "num_warps": 2, "kernel_type": "bandwidth_bound", "persistent": false}
+      20.357 us     380.8 TFLOPS  {"BLOCK_M": 64, "BLOCK_N": 32, "BLOCK_K": 256, "NUM_BUFFERS": 3, "num_warps": 4, "kernel_type": "bandwidth_bound", "persistent": false}
+      20.359 us     380.7 TFLOPS  {"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 128, "NUM_BUFFERS": 6, "num_warps": 4, "kernel_type": "bandwidth_bound", "persistent": false}
+  {'ok': 5389, 'error': 388, 'crashed': 1, 'hung': 1}
+gemm_a16w16 gluon gfx1250 {'M': 512, 'N': 2112, 'K': 7168}: keys from /app/aiter/aiter/ops/triton/configs/gfx1250/gluon/gemm/gemm_a16w16/DEFAULT.json
+  BLOCK_M: [16, 32, 64, 128, 256, 512]
+  BLOCK_N: [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+  BLOCK_K: [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+  NUM_BUFFERS: [1, 2, 3, 4, 6, 8]
+  num_warps: [1, 2, 4, 8]
+  kernel_type: ['bandwidth_bound', 'compute_bound']
+  persistent: [False]  (pinned)
+  28800 combinations, skipped 0 by generic rules, 15840 by LDS, 6723 by kernel rules -> 6237 configs, ~8.7 GPU-hours at 5 s/config
+  results: /app/aiter/aiter/ops/triton/utils/_triton/tuning/runs/sweep-gfx1250-gluon-gemm_a16w16-M=512-N=2112-K=7168.jsonl
+  gpu 0: 0/1560 done, running 100
+  gpu 1: 0/1560 done, running 100
+  gpu 2: 0/1559 done, running 100
+  gpu 3: 0/1559 done, running 100
+  gpu 1: 100/1560 done, running 100
+  gpu 2: 100/1559 done, running 100
+  gpu 3: 100/1559 done, running 100
+  gpu 1: 200/1560 done, running 100
+  gpu 2: 200/1559 done, running 100
+  gpu 0: 100/1560 done, running 100
+  gpu 3: 200/1559 done, running 100
+  gpu 1: 300/1560 done, running 100
+  gpu 2: 300/1559 done, running 100
+  gpu 3: 300/1559 done, running 100
+  gpu 0: 200/1560 done, running 100
+  gpu 0: 300/1560 done, running 100
+  gpu 2: 400/1559 done, running 100
+  gpu 3: 400/1559 done, running 100
+  gpu 1: 400/1560 done, running 100
+  gpu 2: 500/1559 done, running 100
+  gpu 1: 500/1560 done, running 100
+  gpu 3: 500/1559 done, running 100
+  gpu 2: 600/1559 done, running 100
+  gpu 0: 400/1560 done, running 100
+  gpu 1: 600/1560 done, running 100
+  gpu 3: 600/1559 done, running 100
+  gpu 2: 700/1559 done, running 100
+  gpu 0: 500/1560 done, running 100
+  gpu 3: 700/1559 done, running 100
+  gpu 0: 600/1560 done, running 100
+  gpu 1: 700/1560 done, running 100
+  gpu 2: 800/1559 done, running 100
+  gpu 2: 900/1559 done, running 100
+  gpu 3: 800/1559 done, running 100
+  gpu 1: 800/1560 done, running 100
+  gpu 3: 900/1559 done, running 100
+  gpu 1: 900/1560 done, running 100
+  gpu 0: 700/1560 done, running 100
+  gpu 1: 1000/1560 done, running 100
+  gpu 0: 800/1560 done, running 100
+  gpu 0: 900/1560 done, running 100
+  gpu 1: 1100/1560 done, running 100
+  gpu 3: 1000/1559 done, running 100
+  gpu 2: 1000/1559 done, running 100
+  gpu 0: 1000/1560 done, running 100
+  gpu 1: 1200/1560 done, running 100
+  gpu 2: 1100/1559 done, running 100
+  gpu 0: 1100/1560 done, running 100
+  gpu 3: 1100/1559 done, running 100
+  gpu 2: 1200/1559 done, running 100
+  gpu 0: 1200/1560 done, running 100
+  gpu 3: 1200/1559 done, running 100
+  gpu 2: 1300/1559 done, running 100
+  gpu 3: 1300/1559 done, running 100
+  gpu 1: 1300/1560 done, running 100
+  gpu 2: 1400/1559 done, running 100
+  gpu 3: 1400/1559 done, running 100
+  gpu 1: 1400/1560 done, running 100
+  gpu 0: 1300/1560 done, running 100
+  gpu 2: 1500/1559 done, running 59
+  gpu 3: 1500/1559 done, running 59
+  gpu 1: 1500/1560 done, running 60
+  gpu 0: hung: {"BLOCK_M": 256, "BLOCK_N": 64, "BLOCK_K": 512, "NUM_BUFFERS": 1, "num_warps": 1, "kernel_type": "bandwidth_bound", "persistent": false}
+  gpu 0: 1392/1560 done, running 100
+  gpu 0: 1492/1560 done, running 68
+  final round on gpu 0: re-timing the baseline and the 10 fastest
+  gpu 0: 0/11 done, running 11
+  final round (same-device numbers the installer uses):
+  baseline (installed, is_tuned=True): 27.965 us  {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 128, "NUM_BUFFERS": 4, "num_warps": 2, "kernel_type": "bandwidth_bound"}
+      25.312 us     612.4 TFLOPS  {"BLOCK_M": 64, "BLOCK_N": 32, "BLOCK_K": 256, "NUM_BUFFERS": 2, "num_warps": 2, "kernel_type": "bandwidth_bound", "persistent": false}
+      25.496 us     608.0 TFLOPS  {"BLOCK_M": 64, "BLOCK_N": 32, "BLOCK_K": 128, "NUM_BUFFERS": 4, "num_warps": 2, "kernel_type": "bandwidth_bound", "persistent": false}
+      25.760 us     601.8 TFLOPS  {"BLOCK_M": 64, "BLOCK_N": 32, "BLOCK_K": 128, "NUM_BUFFERS": 3, "num_warps": 2, "kernel_type": "bandwidth_bound", "persistent": false}
+      25.840 us     599.9 TFLOPS  {"BLOCK_M": 64, "BLOCK_N": 32, "BLOCK_K": 128, "NUM_BUFFERS": 4, "num_warps": 2, "kernel_type": "compute_bound", "persistent": false}
+      26.432 us     586.5 TFLOPS  {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 256, "NUM_BUFFERS": 2, "num_warps": 4, "kernel_type": "bandwidth_bound", "persistent": false}
+      26.453 us     586.0 TFLOPS  {"BLOCK_M": 64, "BLOCK_N": 32, "BLOCK_K": 128, "NUM_BUFFERS": 4, "num_warps": 4, "kernel_type": "bandwidth_bound", "persistent": false}
+      26.588 us     583.1 TFLOPS  {"BLOCK_M": 64, "BLOCK_N": 32, "BLOCK_K": 128, "NUM_BUFFERS": 3, "num_warps": 4, "kernel_type": "bandwidth_bound", "persistent": false}
+      26.728 us     580.0 TFLOPS  {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 128, "NUM_BUFFERS": 6, "num_warps": 4, "kernel_type": "compute_bound", "persistent": false}
+      26.830 us     577.8 TFLOPS  {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 128, "NUM_BUFFERS": 4, "num_warps": 4, "kernel_type": "compute_bound", "persistent": false}
+      27.054 us     573.0 TFLOPS  {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 128, "NUM_BUFFERS": 4, "num_warps": 4, "kernel_type": "bandwidth_bound", "persistent": false}
+  {'ok': 5776, 'error': 461, 'hung': 1}
+
+installing: /app/aiter/aiter/ops/triton/utils/_triton/tuning/write_best_configs.py gemm_a16w16 --N 2112 --K 7168 --backend gluon --runs-dir /app/aiter/aiter/ops/triton/utils/_triton/tuning/runs
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /app/aiter/aiter/jit/module_aiter_core.so
+seeding from /app/aiter/aiter/ops/triton/configs/gfx1250/gluon/gemm/gemm_a16w16/GEMM-A16W16-N=2112-K=7168.json
+  note: untouched bucket M_LEQ_16 carries keys not in DEFAULT.json: ['waves_per_eu']
+  note: untouched bucket M_LEQ_64 carries keys not in DEFAULT.json: ['waves_per_eu']
+  note: untouched bucket M_LEQ_256 carries keys not in DEFAULT.json: ['waves_per_eu']
+  M=1      M_LEQ_1           5.522 us  1.231x vs installed 6.795 us         {"BLOCK_M": 16, "BLOCK_N": 8, "BLOCK_K": 512, "NUM_BUFFERS": 6, "num_warps": 1, "kernel_type": "compute_bound"}
+  M=4      M_LEQ_4           6.119 us  1.152x vs installed 7.052 us         {"BLOCK_M": 16, "BLOCK_N": 8, "BLOCK_K": 512, "NUM_BUFFERS": 6, "num_warps": 1, "kernel_type": "compute_bound"}
+  M=8      M_LEQ_8           6.586 us  1.094x vs installed 7.208 us         {"BLOCK_M": 16, "BLOCK_N": 8, "BLOCK_K": 512, "NUM_BUFFERS": 6, "num_warps": 2, "kernel_type": "compute_bound"}
+  M=16     M_LEQ_16          7.858 us  1.079x vs installed 8.478 us         {"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 512, "NUM_BUFFERS": 6, "num_warps": 4, "kernel_type": "compute_bound"}
+  M=32     M_LEQ_32          9.615 us  1.175x vs installed 11.300 us        {"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 256, "NUM_BUFFERS": 6, "num_warps": 2, "kernel_type": "bandwidth_bound"}
+  M=64     M_LEQ_64         11.513 us  1.133x vs installed 13.039 us        {"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 256, "NUM_BUFFERS": 6, "num_warps": 4, "kernel_type": "compute_bound"}
+  M=128    M_LEQ_128        15.184 us  1.120x vs installed 17.002 us        {"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 256, "NUM_BUFFERS": 3, "num_warps": 4, "kernel_type": "bandwidth_bound"}
+  M=256    M_LEQ_256        19.771 us  1.091x vs installed 21.574 us        {"BLOCK_M": 64, "BLOCK_N": 32, "BLOCK_K": 256, "NUM_BUFFERS": 3, "num_warps": 8, "kernel_type": "bandwidth_bound"}
+  M=512    M_LEQ_512        25.312 us  1.105x vs installed 27.965 us        {"BLOCK_M": 64, "BLOCK_N": 32, "BLOCK_K": 256, "NUM_BUFFERS": 2, "num_warps": 2, "kernel_type": "bandwidth_bound"}
+  M=1024   M_LEQ_1024       33.570 us  1.438x vs installed 48.259 us        {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 128, "NUM_BUFFERS": 4, "num_warps": 4, "kernel_type": "compute_bound"}
+  M=2048   M_LEQ_2048       51.396 us  1.011x vs installed 51.943 us        {"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 128, "NUM_BUFFERS": 3, "num_warps": 4, "kernel_type": "compute_bound"}
+  M=4096   M_LEQ_4096       75.795 us  1.441x vs installed 109.237 us       {"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 64, "NUM_BUFFERS": 4, "num_warps": 4, "kernel_type": "compute_bound"}
+  M=8192   M_LEQ_8192      165.518 us  1.125x vs installed 186.279 us       {"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 64, "NUM_BUFFERS": 4, "num_warps": 4, "kernel_type": "compute_bound"}
+installed /app/aiter/aiter/ops/triton/configs/gfx1250/gluon/gemm/gemm_a16w16/GEMM-A16W16-N=2112-K=7168.json
+validated 13 bucket(s) through the loader

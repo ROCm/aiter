@@ -1,0 +1,136 @@
+[
+ {
+  "M": 64,
+  "copies": 34,
+  "speedup": 1.048,
+  "old_bucket": "M_LEQ_64",
+  "old_cfg": {
+   "BLOCK_M": 32,
+   "BLOCK_N": 16,
+   "BLOCK_K": 256,
+   "NUM_BUFFERS": 4,
+   "num_warps": 2,
+   "kernel_type": "bandwidth_bound",
+   "waves_per_eu": 1
+  },
+  "old_us": 12.775,
+  "old_spread": [
+   12.199,
+   12.902
+  ],
+  "new_bucket": "M_LEQ_64",
+  "new_cfg": {
+   "BLOCK_M": 32,
+   "BLOCK_N": 32,
+   "BLOCK_K": 256,
+   "NUM_BUFFERS": 6,
+   "num_warps": 4,
+   "kernel_type": "compute_bound"
+  },
+  "new_us": 12.192,
+  "new_spread": [
+   12.13,
+   12.307
+  ]
+ },
+ {
+  "M": 128,
+  "copies": 32,
+  "speedup": 1.023,
+  "old_bucket": "M_LEQ_128",
+  "old_cfg": {
+   "BLOCK_M": 64,
+   "BLOCK_N": 32,
+   "BLOCK_K": 512,
+   "NUM_BUFFERS": 3,
+   "num_warps": 4,
+   "kernel_type": "bandwidth_bound"
+  },
+  "old_us": 16.788,
+  "old_spread": [
+   16.406,
+   16.963
+  ],
+  "new_bucket": "M_LEQ_128",
+  "new_cfg": {
+   "BLOCK_M": 32,
+   "BLOCK_N": 32,
+   "BLOCK_K": 256,
+   "NUM_BUFFERS": 3,
+   "num_warps": 4,
+   "kernel_type": "bandwidth_bound"
+  },
+  "new_us": 16.405,
+  "new_spread": [
+   15.754,
+   16.56
+  ]
+ },
+ {
+  "M": 256,
+  "copies": 30,
+  "speedup": 0.989,
+  "old_bucket": "M_LEQ_256",
+  "old_cfg": {
+   "BLOCK_M": 64,
+   "BLOCK_N": 64,
+   "BLOCK_K": 256,
+   "NUM_BUFFERS": 4,
+   "num_warps": 4,
+   "kernel_type": "bandwidth_bound",
+   "waves_per_eu": 1
+  },
+  "old_us": 21.394,
+  "old_spread": [
+   20.161,
+   21.433
+  ],
+  "new_bucket": "M_LEQ_256",
+  "new_cfg": {
+   "BLOCK_M": 64,
+   "BLOCK_N": 32,
+   "BLOCK_K": 256,
+   "NUM_BUFFERS": 3,
+   "num_warps": 8,
+   "kernel_type": "bandwidth_bound"
+  },
+  "new_us": 21.643,
+  "new_spread": [
+   20.073,
+   22.499
+  ]
+ },
+ {
+  "M": 2048,
+  "copies": 15,
+  "speedup": 1.017,
+  "old_bucket": "any",
+  "old_cfg": {
+   "BLOCK_M": 128,
+   "BLOCK_N": 128,
+   "BLOCK_K": 128,
+   "NUM_BUFFERS": 2,
+   "num_warps": 2,
+   "kernel_type": "bandwidth_bound"
+  },
+  "old_us": 53.657,
+  "old_spread": [
+   51.959,
+   54.875
+  ],
+  "new_bucket": "M_LEQ_2048",
+  "new_cfg": {
+   "BLOCK_M": 128,
+   "BLOCK_N": 256,
+   "BLOCK_K": 128,
+   "NUM_BUFFERS": 3,
+   "num_warps": 4,
+   "kernel_type": "compute_bound"
+  },
+  "new_us": 52.758,
+  "new_spread": [
+   52.366,
+   53.363
+  ]
+ }
+]

@@ -1,0 +1,15 @@
+M=     1 PASS max_abs_err=0.0000 bit_exact=True is_tuned=True {'BLOCK_M': 16, 'BLOCK_N': 8, 'BLOCK_K': 512, 'NUM_BUFFERS': 6, 'num_warps': 1, 'kernel_type': 'compute_bound'}
+M=     4 PASS max_abs_err=0.0000 bit_exact=True is_tuned=True {'BLOCK_M': 16, 'BLOCK_N': 8, 'BLOCK_K': 512, 'NUM_BUFFERS': 6, 'num_warps': 1, 'kernel_type': 'compute_bound'}
+M=     8 PASS max_abs_err=0.0000 bit_exact=True is_tuned=True {'BLOCK_M': 16, 'BLOCK_N': 8, 'BLOCK_K': 512, 'NUM_BUFFERS': 6, 'num_warps': 2, 'kernel_type': 'compute_bound'}
+M=    16 PASS max_abs_err=0.0000 bit_exact=True is_tuned=True {'BLOCK_M': 16, 'BLOCK_N': 16, 'BLOCK_K': 512, 'NUM_BUFFERS': 6, 'num_warps': 4, 'kernel_type': 'compute_bound'}
+M=    32 PASS max_abs_err=0.0000 bit_exact=True is_tuned=True {'BLOCK_M': 16, 'BLOCK_N': 16, 'BLOCK_K': 256, 'NUM_BUFFERS': 6, 'num_warps': 2, 'kernel_type': 'bandwidth_bound'}
+M=    64 PASS max_abs_err=0.0000 bit_exact=True is_tuned=True {'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 256, 'NUM_BUFFERS': 6, 'num_warps': 4, 'kernel_type': 'compute_bound'}
+M=   128 PASS max_abs_err=0.0000 bit_exact=True is_tuned=True {'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 256, 'NUM_BUFFERS': 3, 'num_warps': 4, 'kernel_type': 'bandwidth_bound'}
+M=   256 PASS max_abs_err=0.0000 bit_exact=True is_tuned=True {'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 256, 'NUM_BUFFERS': 3, 'num_warps': 8, 'kernel_type': 'bandwidth_bound'}
+M=   512 PASS max_abs_err=0.0000 bit_exact=True is_tuned=True {'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 256, 'NUM_BUFFERS': 2, 'num_warps': 2, 'kernel_type': 'bandwidth_bound'}
+M=  1024 PASS max_abs_err=0.0000 bit_exact=True is_tuned=True {'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'NUM_BUFFERS': 4, 'num_warps': 4, 'kernel_type': 'compute_bound'}
+M=  2048 PASS max_abs_err=0.0000 bit_exact=True is_tuned=True {'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 128, 'NUM_BUFFERS': 3, 'num_warps': 4, 'kernel_type': 'compute_bound'}
+M=  4096 PASS max_abs_err=0.0000 bit_exact=True is_tuned=True {'BLOCK_M': 256, 'BLOCK_N': 256, 'BLOCK_K': 64, 'NUM_BUFFERS': 4, 'num_warps': 4, 'kernel_type': 'compute_bound'}
+M=  8192 PASS max_abs_err=0.0000 bit_exact=True is_tuned=True {'BLOCK_M': 256, 'BLOCK_N': 256, 'BLOCK_K': 64, 'NUM_BUFFERS': 4, 'num_warps': 4, 'kernel_type': 'compute_bound'}
+M= 16384 PASS max_abs_err=0.0000 bit_exact=True is_tuned=False {'BLOCK_M': 256, 'BLOCK_N': 256, 'BLOCK_K': 64, 'NUM_BUFFERS': 4, 'num_warps': 4, 'kernel_type': 'compute_bound'}
+FAILED: none

@@ -1,0 +1,48 @@
+# Machine state, read-only queries, 2026-10-04 21:43:39 UTC
+boot: 2026-10-03 15:31:17 UTC
+
+## GPUs (KFD topology)
+node 2: gfx_target_version=120500 simd_count=1024
+node 3: gfx_target_version=120500 simd_count=1024
+node 4: gfx_target_version=120500 simd_count=1024
+node 5: gfx_target_version=120500 simd_count=1024
+
+## Clock levels (current marked *)
+/sys/class/drm/card1/device/pp_dpm_sclk: 0: 500Mhz 1: 2400Mhz *
+/sys/class/drm/card17/device/pp_dpm_sclk: 0: 500Mhz 1: 2400Mhz *
+/sys/class/drm/card25/device/pp_dpm_sclk: 0: 500Mhz 1: 2367Mhz * 2: 2400Mhz
+/sys/class/drm/card9/device/pp_dpm_sclk: 0: 500Mhz 1: 2400Mhz *
+/sys/class/drm/card1/device/pp_dpm_fclk: 0: 1250Mhz 1: 1900Mhz *
+/sys/class/drm/card17/device/pp_dpm_fclk: 0: 1250Mhz 1: 1900Mhz *
+/sys/class/drm/card25/device/pp_dpm_fclk: 0: 1250Mhz 1: 1900Mhz *
+/sys/class/drm/card9/device/pp_dpm_fclk: 0: 1250Mhz 1: 1900Mhz *
+
+## 'GPU is throttled' kernel messages since boot: 3 (first 2026-10-03 15:35:37, last 2026-10-03 15:35:55 UTC)
+
+## GPU page faults since boot (one line per faulting process)
+2026-10-04 19:19:38 UTC  0001:01:00.0  pasid=9348  fault records=1
+2026-10-04 19:31:24 UTC  0001:01:00.0  pasid=10284  fault records=1
+2026-10-04 19:31:47 UTC  0001:01:00.0  pasid=10308  fault records=1
+2026-10-04 19:53:32 UTC  0003:01:00.0  pasid=11212  fault records=1
+2026-10-04 19:59:22 UTC  0004:01:00.0  pasid=11874  fault records=7
+2026-10-04 20:08:24 UTC  0001:01:00.0  pasid=12183  fault records=1
+2026-10-04 21:01:41 UTC  0001:01:00.0  pasid=18084  fault records=1
+2026-10-04 21:30:07 UTC  0003:01:00.0  pasid=20852  fault records=10
+
+## Candidates the sweep recorded as crashed or hung
+M= 1024 hung    gpu=None {'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 512, 'NUM_BUFFERS': 1, 'num_warps': 1, 'kernel_type': 'bandwidth_bound'}
+M= 1024 hung    gpu=None {'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 512, 'NUM_BUFFERS': 1, 'num_warps': 1, 'kernel_type': 'bandwidth_bound'}
+M= 1024 hung    gpu=None {'BLOCK_M': 512, 'BLOCK_N': 128, 'BLOCK_K': 256, 'NUM_BUFFERS': 1, 'num_warps': 2, 'kernel_type': 'bandwidth_bound'}
+M= 2048 hung    gpu=None {'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 512, 'NUM_BUFFERS': 1, 'num_warps': 1, 'kernel_type': 'bandwidth_bound'}
+M= 2048 hung    gpu=None {'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 512, 'NUM_BUFFERS': 1, 'num_warps': 1, 'kernel_type': 'bandwidth_bound'}
+M=  256 crashed gpu=None {'BLOCK_M': 32, 'BLOCK_N': 256, 'BLOCK_K': 256, 'NUM_BUFFERS': 1, 'num_warps': 1, 'kernel_type': 'bandwidth_bound'}
+M=  256 hung    gpu=None {'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 512, 'NUM_BUFFERS': 1, 'num_warps': 1, 'kernel_type': 'bandwidth_bound'}
+M= 4096 crashed gpu=None {'BLOCK_M': 32, 'BLOCK_N': 16, 'BLOCK_K': 32, 'NUM_BUFFERS': 1, 'num_warps': 1, 'kernel_type': 'bandwidth_bound'}
+M= 4096 hung    gpu=None {'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 512, 'NUM_BUFFERS': 1, 'num_warps': 1, 'kernel_type': 'bandwidth_bound'}
+M= 4096 crashed gpu=None {'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 32, 'NUM_BUFFERS': 3, 'num_warps': 1, 'kernel_type': 'bandwidth_bound'}
+M= 4096 crashed gpu=None {'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 32, 'NUM_BUFFERS': 6, 'num_warps': 1, 'kernel_type': 'bandwidth_bound'}
+M=  512 hung    gpu=None {'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 512, 'NUM_BUFFERS': 1, 'num_warps': 1, 'kernel_type': 'bandwidth_bound'}
+M= 8192 crashed gpu=None {'BLOCK_M': 64, 'BLOCK_N': 512, 'BLOCK_K': 32, 'NUM_BUFFERS': 4, 'num_warps': 1, 'kernel_type': 'bandwidth_bound'}
+M= 8192 crashed gpu=None {'BLOCK_M': 128, 'BLOCK_N': 512, 'BLOCK_K': 32, 'NUM_BUFFERS': 2, 'num_warps': 2, 'kernel_type': 'bandwidth_bound'}
+M= 8192 hung    gpu=None {'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 512, 'NUM_BUFFERS': 1, 'num_warps': 1, 'kernel_type': 'bandwidth_bound'}
+M= 8192 crashed gpu=None {'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 32, 'NUM_BUFFERS': 3, 'num_warps': 1, 'kernel_type': 'bandwidth_bound'}

@@ -1,0 +1,1869 @@
+[
+ {
+  "M": 1,
+  "planned": 1451,
+  "counts": {
+   "ok": 1385,
+   "error": 67
+  },
+  "final_round": {
+   "baseline_us": 6.795,
+   "baseline_config": {
+    "BLOCK_M": 16,
+    "BLOCK_N": 16,
+    "BLOCK_K": 256,
+    "NUM_BUFFERS": 8,
+    "num_warps": 1,
+    "kernel_type": "bandwidth_bound"
+   },
+   "dropped_keys": [
+    "waves_per_eu"
+   ],
+   "top": [
+    {
+     "us": 5.522,
+     "tflops": 5.48,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 8,
+      "BLOCK_K": 512,
+      "NUM_BUFFERS": 6,
+      "num_warps": 1,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 5.651,
+     "tflops": 5.36,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 16,
+      "BLOCK_K": 512,
+      "NUM_BUFFERS": 6,
+      "num_warps": 2,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 5.686,
+     "tflops": 5.33,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 8,
+      "BLOCK_K": 512,
+      "NUM_BUFFERS": 6,
+      "num_warps": 2,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 5.796,
+     "tflops": 5.22,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 8,
+      "BLOCK_K": 512,
+      "NUM_BUFFERS": 6,
+      "num_warps": 1,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 5.808,
+     "tflops": 5.21,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 16,
+      "BLOCK_K": 512,
+      "NUM_BUFFERS": 8,
+      "num_warps": 2,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 5.891,
+     "tflops": 5.14,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 16,
+      "BLOCK_K": 512,
+      "NUM_BUFFERS": 6,
+      "num_warps": 2,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 5.901,
+     "tflops": 5.13,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 16,
+      "BLOCK_K": 512,
+      "NUM_BUFFERS": 6,
+      "num_warps": 1,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 5.982,
+     "tflops": 5.06,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 16,
+      "BLOCK_K": 1024,
+      "NUM_BUFFERS": 4,
+      "num_warps": 1,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 6.011,
+     "tflops": 5.04,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 8,
+      "BLOCK_K": 1024,
+      "NUM_BUFFERS": 3,
+      "num_warps": 1,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 6.118,
+     "tflops": 4.95,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 8,
+      "BLOCK_K": 512,
+      "NUM_BUFFERS": 6,
+      "num_warps": 2,
+      "kernel_type": "bandwidth_bound"
+     }
+    }
+   ]
+  }
+ },
+ {
+  "M": 4,
+  "planned": 1451,
+  "counts": {
+   "ok": 1385,
+   "error": 67
+  },
+  "final_round": {
+   "baseline_us": 7.052,
+   "baseline_config": {
+    "BLOCK_M": 16,
+    "BLOCK_N": 16,
+    "BLOCK_K": 256,
+    "NUM_BUFFERS": 8,
+    "num_warps": 1,
+    "kernel_type": "bandwidth_bound"
+   },
+   "dropped_keys": [
+    "waves_per_eu"
+   ],
+   "top": [
+    {
+     "us": 6.119,
+     "tflops": 19.79,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 8,
+      "BLOCK_K": 512,
+      "NUM_BUFFERS": 6,
+      "num_warps": 1,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 6.133,
+     "tflops": 19.75,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 8,
+      "BLOCK_K": 512,
+      "NUM_BUFFERS": 6,
+      "num_warps": 2,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 6.171,
+     "tflops": 19.63,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 16,
+      "BLOCK_K": 512,
+      "NUM_BUFFERS": 6,
+      "num_warps": 2,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 6.356,
+     "tflops": 19.05,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 8,
+      "BLOCK_K": 512,
+      "NUM_BUFFERS": 6,
+      "num_warps": 1,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 6.366,
+     "tflops": 19.03,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 16,
+      "BLOCK_K": 512,
+      "NUM_BUFFERS": 6,
+      "num_warps": 2,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 6.371,
+     "tflops": 19.01,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 16,
+      "BLOCK_K": 512,
+      "NUM_BUFFERS": 8,
+      "num_warps": 2,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 6.448,
+     "tflops": 18.78,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 16,
+      "BLOCK_K": 1024,
+      "NUM_BUFFERS": 4,
+      "num_warps": 1,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 6.452,
+     "tflops": 18.77,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 8,
+      "BLOCK_K": 1024,
+      "NUM_BUFFERS": 3,
+      "num_warps": 1,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 6.472,
+     "tflops": 18.71,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 16,
+      "BLOCK_K": 512,
+      "NUM_BUFFERS": 6,
+      "num_warps": 4,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 6.478,
+     "tflops": 18.7,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 16,
+      "BLOCK_K": 512,
+      "NUM_BUFFERS": 6,
+      "num_warps": 1,
+      "kernel_type": "compute_bound"
+     }
+    }
+   ]
+  }
+ },
+ {
+  "M": 8,
+  "planned": 1451,
+  "counts": {
+   "ok": 1385,
+   "error": 67
+  },
+  "final_round": {
+   "baseline_us": 7.208,
+   "baseline_config": {
+    "BLOCK_M": 16,
+    "BLOCK_N": 16,
+    "BLOCK_K": 256,
+    "NUM_BUFFERS": 8,
+    "num_warps": 1,
+    "kernel_type": "bandwidth_bound"
+   },
+   "dropped_keys": [
+    "waves_per_eu"
+   ],
+   "top": [
+    {
+     "us": 6.586,
+     "tflops": 36.78,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 8,
+      "BLOCK_K": 512,
+      "NUM_BUFFERS": 6,
+      "num_warps": 2,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 6.741,
+     "tflops": 35.93,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 16,
+      "BLOCK_K": 512,
+      "NUM_BUFFERS": 6,
+      "num_warps": 2,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 6.785,
+     "tflops": 35.7,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 16,
+      "BLOCK_K": 512,
+      "NUM_BUFFERS": 6,
+      "num_warps": 4,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 6.8,
+     "tflops": 35.62,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 8,
+      "BLOCK_K": 512,
+      "NUM_BUFFERS": 6,
+      "num_warps": 1,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 6.879,
+     "tflops": 35.21,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 8,
+      "BLOCK_K": 512,
+      "NUM_BUFFERS": 6,
+      "num_warps": 1,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 6.896,
+     "tflops": 35.12,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 16,
+      "BLOCK_K": 512,
+      "NUM_BUFFERS": 4,
+      "num_warps": 2,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 6.914,
+     "tflops": 35.04,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 16,
+      "BLOCK_K": 512,
+      "NUM_BUFFERS": 6,
+      "num_warps": 2,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 6.922,
+     "tflops": 34.99,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 16,
+      "BLOCK_K": 1024,
+      "NUM_BUFFERS": 4,
+      "num_warps": 1,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 6.925,
+     "tflops": 34.98,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 8,
+      "BLOCK_K": 512,
+      "NUM_BUFFERS": 6,
+      "num_warps": 2,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 6.954,
+     "tflops": 34.83,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 16,
+      "BLOCK_K": 512,
+      "NUM_BUFFERS": 8,
+      "num_warps": 2,
+      "kernel_type": "compute_bound"
+     }
+    }
+   ]
+  }
+ },
+ {
+  "M": 16,
+  "planned": 1451,
+  "counts": {
+   "ok": 1385,
+   "error": 67
+  },
+  "final_round": {
+   "baseline_us": 8.478,
+   "baseline_config": {
+    "BLOCK_M": 16,
+    "BLOCK_N": 16,
+    "BLOCK_K": 256,
+    "NUM_BUFFERS": 8,
+    "num_warps": 1,
+    "kernel_type": "bandwidth_bound"
+   },
+   "dropped_keys": [
+    "waves_per_eu"
+   ],
+   "top": [
+    {
+     "us": 7.858,
+     "tflops": 61.65,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 16,
+      "BLOCK_K": 512,
+      "NUM_BUFFERS": 6,
+      "num_warps": 4,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 7.889,
+     "tflops": 61.41,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 16,
+      "BLOCK_K": 512,
+      "NUM_BUFFERS": 4,
+      "num_warps": 4,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 7.945,
+     "tflops": 60.97,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 16,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 8,
+      "num_warps": 2,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 7.947,
+     "tflops": 60.96,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 16,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 8,
+      "num_warps": 2,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 7.962,
+     "tflops": 60.85,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 8,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 8,
+      "num_warps": 2,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 7.977,
+     "tflops": 60.73,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 8,
+      "BLOCK_K": 512,
+      "NUM_BUFFERS": 6,
+      "num_warps": 2,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 8.0,
+     "tflops": 60.55,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 16,
+      "BLOCK_K": 512,
+      "NUM_BUFFERS": 4,
+      "num_warps": 2,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 8.005,
+     "tflops": 60.52,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 16,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 8,
+      "num_warps": 4,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 8.013,
+     "tflops": 60.45,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 16,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 6,
+      "num_warps": 2,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 8.15,
+     "tflops": 59.44,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 16,
+      "BLOCK_K": 512,
+      "NUM_BUFFERS": 6,
+      "num_warps": 4,
+      "kernel_type": "bandwidth_bound"
+     }
+    }
+   ]
+  }
+ },
+ {
+  "M": 32,
+  "planned": 2817,
+  "counts": {
+   "ok": 2651,
+   "error": 167
+  },
+  "final_round": {
+   "baseline_us": 11.3,
+   "baseline_config": {
+    "BLOCK_M": 16,
+    "BLOCK_N": 32,
+    "BLOCK_K": 512,
+    "NUM_BUFFERS": 5,
+    "num_warps": 2,
+    "kernel_type": "bandwidth_bound"
+   },
+   "dropped_keys": null,
+   "top": [
+    {
+     "us": 9.615,
+     "tflops": 100.77,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 16,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 6,
+      "num_warps": 2,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 9.696,
+     "tflops": 99.93,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 16,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 8,
+      "num_warps": 2,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 9.736,
+     "tflops": 99.51,
+     "config": {
+      "BLOCK_M": 32,
+      "BLOCK_N": 16,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 6,
+      "num_warps": 4,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 9.847,
+     "tflops": 98.39,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 16,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 8,
+      "num_warps": 2,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 9.852,
+     "tflops": 98.35,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 16,
+      "BLOCK_K": 512,
+      "NUM_BUFFERS": 4,
+      "num_warps": 2,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 9.864,
+     "tflops": 98.22,
+     "config": {
+      "BLOCK_M": 32,
+      "BLOCK_N": 16,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 8,
+      "num_warps": 4,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 9.867,
+     "tflops": 98.19,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 16,
+      "BLOCK_K": 1024,
+      "NUM_BUFFERS": 2,
+      "num_warps": 1,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 9.96,
+     "tflops": 97.27,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 16,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 6,
+      "num_warps": 1,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 9.977,
+     "tflops": 97.11,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 16,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 8,
+      "num_warps": 1,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 10.382,
+     "tflops": 93.32,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 16,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 6,
+      "num_warps": 2,
+      "kernel_type": "compute_bound"
+     }
+    }
+   ]
+  }
+ },
+ {
+  "M": 64,
+  "planned": 4035,
+  "counts": {
+   "ok": 3777,
+   "error": 259
+  },
+  "final_round": {
+   "baseline_us": 13.039,
+   "baseline_config": {
+    "BLOCK_M": 32,
+    "BLOCK_N": 16,
+    "BLOCK_K": 256,
+    "NUM_BUFFERS": 4,
+    "num_warps": 2,
+    "kernel_type": "bandwidth_bound"
+   },
+   "dropped_keys": [
+    "waves_per_eu"
+   ],
+   "top": [
+    {
+     "us": 11.513,
+     "tflops": 168.31,
+     "config": {
+      "BLOCK_M": 32,
+      "BLOCK_N": 32,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 6,
+      "num_warps": 4,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 11.919,
+     "tflops": 162.58,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 16,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 4,
+      "num_warps": 2,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 11.934,
+     "tflops": 162.37,
+     "config": {
+      "BLOCK_M": 32,
+      "BLOCK_N": 32,
+      "BLOCK_K": 128,
+      "NUM_BUFFERS": 8,
+      "num_warps": 4,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 12.119,
+     "tflops": 159.89,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 16,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 6,
+      "num_warps": 2,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 12.162,
+     "tflops": 159.33,
+     "config": {
+      "BLOCK_M": 32,
+      "BLOCK_N": 16,
+      "BLOCK_K": 512,
+      "NUM_BUFFERS": 3,
+      "num_warps": 4,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 12.218,
+     "tflops": 158.6,
+     "config": {
+      "BLOCK_M": 32,
+      "BLOCK_N": 32,
+      "BLOCK_K": 128,
+      "NUM_BUFFERS": 8,
+      "num_warps": 4,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 12.241,
+     "tflops": 158.3,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 16,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 6,
+      "num_warps": 2,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 12.284,
+     "tflops": 157.74,
+     "config": {
+      "BLOCK_M": 32,
+      "BLOCK_N": 32,
+      "BLOCK_K": 128,
+      "NUM_BUFFERS": 6,
+      "num_warps": 4,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 12.364,
+     "tflops": 156.72,
+     "config": {
+      "BLOCK_M": 16,
+      "BLOCK_N": 16,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 3,
+      "num_warps": 2,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 12.676,
+     "tflops": 152.86,
+     "config": {
+      "BLOCK_M": 32,
+      "BLOCK_N": 32,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 4,
+      "num_warps": 4,
+      "kernel_type": "bandwidth_bound"
+     }
+    }
+   ]
+  }
+ },
+ {
+  "M": 128,
+  "planned": 5039,
+  "counts": {
+   "ok": 4710,
+   "error": 330
+  },
+  "final_round": {
+   "baseline_us": 17.002,
+   "baseline_config": {
+    "BLOCK_M": 64,
+    "BLOCK_N": 32,
+    "BLOCK_K": 512,
+    "NUM_BUFFERS": 3,
+    "num_warps": 4,
+    "kernel_type": "bandwidth_bound"
+   },
+   "dropped_keys": null,
+   "top": [
+    {
+     "us": 15.184,
+     "tflops": 255.23,
+     "config": {
+      "BLOCK_M": 32,
+      "BLOCK_N": 32,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 3,
+      "num_warps": 4,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 15.347,
+     "tflops": 252.53,
+     "config": {
+      "BLOCK_M": 32,
+      "BLOCK_N": 16,
+      "BLOCK_K": 128,
+      "NUM_BUFFERS": 6,
+      "num_warps": 4,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 15.379,
+     "tflops": 252.0,
+     "config": {
+      "BLOCK_M": 32,
+      "BLOCK_N": 32,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 4,
+      "num_warps": 4,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 15.412,
+     "tflops": 251.46,
+     "config": {
+      "BLOCK_M": 32,
+      "BLOCK_N": 16,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 3,
+      "num_warps": 4,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 15.463,
+     "tflops": 250.63,
+     "config": {
+      "BLOCK_M": 32,
+      "BLOCK_N": 32,
+      "BLOCK_K": 128,
+      "NUM_BUFFERS": 8,
+      "num_warps": 4,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 15.504,
+     "tflops": 249.97,
+     "config": {
+      "BLOCK_M": 32,
+      "BLOCK_N": 32,
+      "BLOCK_K": 128,
+      "NUM_BUFFERS": 8,
+      "num_warps": 2,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 15.51,
+     "tflops": 249.87,
+     "config": {
+      "BLOCK_M": 32,
+      "BLOCK_N": 32,
+      "BLOCK_K": 128,
+      "NUM_BUFFERS": 6,
+      "num_warps": 2,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 15.518,
+     "tflops": 249.75,
+     "config": {
+      "BLOCK_M": 32,
+      "BLOCK_N": 32,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 3,
+      "num_warps": 2,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 15.667,
+     "tflops": 247.36,
+     "config": {
+      "BLOCK_M": 32,
+      "BLOCK_N": 32,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 4,
+      "num_warps": 2,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 16.541,
+     "tflops": 234.3,
+     "config": {
+      "BLOCK_M": 32,
+      "BLOCK_N": 32,
+      "BLOCK_K": 128,
+      "NUM_BUFFERS": 6,
+      "num_warps": 4,
+      "kernel_type": "compute_bound"
+     }
+    }
+   ]
+  }
+ },
+ {
+  "M": 256,
+  "planned": 5778,
+  "counts": {
+   "ok": 5389,
+   "error": 388,
+   "crashed": 1,
+   "hung": 1
+  },
+  "final_round": {
+   "baseline_us": 21.574,
+   "baseline_config": {
+    "BLOCK_M": 64,
+    "BLOCK_N": 64,
+    "BLOCK_K": 256,
+    "NUM_BUFFERS": 4,
+    "num_warps": 4,
+    "kernel_type": "bandwidth_bound"
+   },
+   "dropped_keys": [
+    "waves_per_eu"
+   ],
+   "top": [
+    {
+     "us": 19.771,
+     "tflops": 392.05,
+     "config": {
+      "BLOCK_M": 64,
+      "BLOCK_N": 32,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 3,
+      "num_warps": 8,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 19.816,
+     "tflops": 391.16,
+     "config": {
+      "BLOCK_M": 32,
+      "BLOCK_N": 32,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 3,
+      "num_warps": 4,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 19.895,
+     "tflops": 389.59,
+     "config": {
+      "BLOCK_M": 64,
+      "BLOCK_N": 32,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 3,
+      "num_warps": 2,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 19.999,
+     "tflops": 387.58,
+     "config": {
+      "BLOCK_M": 32,
+      "BLOCK_N": 32,
+      "BLOCK_K": 128,
+      "NUM_BUFFERS": 4,
+      "num_warps": 4,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 20.002,
+     "tflops": 387.51,
+     "config": {
+      "BLOCK_M": 64,
+      "BLOCK_N": 64,
+      "BLOCK_K": 128,
+      "NUM_BUFFERS": 6,
+      "num_warps": 8,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 20.008,
+     "tflops": 387.39,
+     "config": {
+      "BLOCK_M": 64,
+      "BLOCK_N": 32,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 3,
+      "num_warps": 4,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 20.224,
+     "tflops": 383.27,
+     "config": {
+      "BLOCK_M": 64,
+      "BLOCK_N": 64,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 4,
+      "num_warps": 8,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 20.239,
+     "tflops": 382.97,
+     "config": {
+      "BLOCK_M": 32,
+      "BLOCK_N": 32,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 3,
+      "num_warps": 2,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 20.357,
+     "tflops": 380.76,
+     "config": {
+      "BLOCK_M": 64,
+      "BLOCK_N": 32,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 3,
+      "num_warps": 4,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 20.359,
+     "tflops": 380.72,
+     "config": {
+      "BLOCK_M": 32,
+      "BLOCK_N": 32,
+      "BLOCK_K": 128,
+      "NUM_BUFFERS": 6,
+      "num_warps": 4,
+      "kernel_type": "bandwidth_bound"
+     }
+    }
+   ]
+  }
+ },
+ {
+  "M": 512,
+  "planned": 6237,
+  "counts": {
+   "ok": 5776,
+   "error": 461,
+   "hung": 1
+  },
+  "final_round": {
+   "baseline_us": 27.965,
+   "baseline_config": {
+    "BLOCK_M": 64,
+    "BLOCK_N": 64,
+    "BLOCK_K": 128,
+    "NUM_BUFFERS": 4,
+    "num_warps": 2,
+    "kernel_type": "bandwidth_bound"
+   },
+   "dropped_keys": null,
+   "top": [
+    {
+     "us": 25.312,
+     "tflops": 612.44,
+     "config": {
+      "BLOCK_M": 64,
+      "BLOCK_N": 32,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 2,
+      "num_warps": 2,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 25.496,
+     "tflops": 608.03,
+     "config": {
+      "BLOCK_M": 64,
+      "BLOCK_N": 32,
+      "BLOCK_K": 128,
+      "NUM_BUFFERS": 4,
+      "num_warps": 2,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 25.76,
+     "tflops": 601.8,
+     "config": {
+      "BLOCK_M": 64,
+      "BLOCK_N": 32,
+      "BLOCK_K": 128,
+      "NUM_BUFFERS": 3,
+      "num_warps": 2,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 25.84,
+     "tflops": 599.93,
+     "config": {
+      "BLOCK_M": 64,
+      "BLOCK_N": 32,
+      "BLOCK_K": 128,
+      "NUM_BUFFERS": 4,
+      "num_warps": 2,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 26.432,
+     "tflops": 586.48,
+     "config": {
+      "BLOCK_M": 64,
+      "BLOCK_N": 64,
+      "BLOCK_K": 256,
+      "NUM_BUFFERS": 2,
+      "num_warps": 4,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 26.453,
+     "tflops": 586.02,
+     "config": {
+      "BLOCK_M": 64,
+      "BLOCK_N": 32,
+      "BLOCK_K": 128,
+      "NUM_BUFFERS": 4,
+      "num_warps": 4,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 26.588,
+     "tflops": 583.06,
+     "config": {
+      "BLOCK_M": 64,
+      "BLOCK_N": 32,
+      "BLOCK_K": 128,
+      "NUM_BUFFERS": 3,
+      "num_warps": 4,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 26.728,
+     "tflops": 580.0,
+     "config": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 64,
+      "BLOCK_K": 128,
+      "NUM_BUFFERS": 6,
+      "num_warps": 4,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 26.83,
+     "tflops": 577.79,
+     "config": {
+      "BLOCK_M": 64,
+      "BLOCK_N": 64,
+      "BLOCK_K": 128,
+      "NUM_BUFFERS": 4,
+      "num_warps": 4,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 27.054,
+     "tflops": 573.01,
+     "config": {
+      "BLOCK_M": 64,
+      "BLOCK_N": 64,
+      "BLOCK_K": 128,
+      "NUM_BUFFERS": 4,
+      "num_warps": 4,
+      "kernel_type": "bandwidth_bound"
+     }
+    }
+   ]
+  }
+ },
+ {
+  "M": 1024,
+  "planned": 6435,
+  "counts": {
+   "ok": 5929,
+   "error": 504,
+   "hung": 3
+  },
+  "final_round": {
+   "baseline_us": 48.259,
+   "baseline_config": {
+    "BLOCK_M": 128,
+    "BLOCK_N": 128,
+    "BLOCK_K": 128,
+    "NUM_BUFFERS": 2,
+    "num_warps": 2,
+    "kernel_type": "bandwidth_bound"
+   },
+   "dropped_keys": null,
+   "top": [
+    {
+     "us": 33.57,
+     "tflops": 923.56,
+     "config": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 128,
+      "BLOCK_K": 128,
+      "NUM_BUFFERS": 4,
+      "num_warps": 4,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 35.028,
+     "tflops": 885.14,
+     "config": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 128,
+      "BLOCK_K": 128,
+      "NUM_BUFFERS": 4,
+      "num_warps": 8,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 35.301,
+     "tflops": 878.29,
+     "config": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 128,
+      "BLOCK_K": 128,
+      "NUM_BUFFERS": 4,
+      "num_warps": 4,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 35.424,
+     "tflops": 875.22,
+     "config": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 64,
+      "BLOCK_K": 128,
+      "NUM_BUFFERS": 3,
+      "num_warps": 2,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 35.532,
+     "tflops": 872.58,
+     "config": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 128,
+      "BLOCK_K": 128,
+      "NUM_BUFFERS": 3,
+      "num_warps": 4,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 36.075,
+     "tflops": 859.44,
+     "config": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 128,
+      "BLOCK_K": 128,
+      "NUM_BUFFERS": 4,
+      "num_warps": 8,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 36.187,
+     "tflops": 856.77,
+     "config": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 128,
+      "BLOCK_K": 128,
+      "NUM_BUFFERS": 3,
+      "num_warps": 8,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 36.595,
+     "tflops": 847.24,
+     "config": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 64,
+      "BLOCK_K": 128,
+      "NUM_BUFFERS": 3,
+      "num_warps": 4,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 37.102,
+     "tflops": 835.66,
+     "config": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 64,
+      "BLOCK_K": 128,
+      "NUM_BUFFERS": 3,
+      "num_warps": 2,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 37.402,
+     "tflops": 828.96,
+     "config": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 128,
+      "BLOCK_K": 64,
+      "NUM_BUFFERS": 8,
+      "num_warps": 8,
+      "kernel_type": "compute_bound"
+     }
+    }
+   ]
+  }
+ },
+ {
+  "M": 2048,
+  "planned": 6491,
+  "counts": {
+   "ok": 5957,
+   "error": 533,
+   "hung": 2
+  },
+  "final_round": {
+   "baseline_us": 51.943,
+   "baseline_config": {
+    "BLOCK_M": 128,
+    "BLOCK_N": 128,
+    "BLOCK_K": 128,
+    "NUM_BUFFERS": 2,
+    "num_warps": 2,
+    "kernel_type": "bandwidth_bound"
+   },
+   "dropped_keys": null,
+   "top": [
+    {
+     "us": 51.396,
+     "tflops": 1206.5,
+     "config": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 256,
+      "BLOCK_K": 128,
+      "NUM_BUFFERS": 3,
+      "num_warps": 4,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 52.641,
+     "tflops": 1177.96,
+     "config": {
+      "BLOCK_M": 256,
+      "BLOCK_N": 128,
+      "BLOCK_K": 64,
+      "NUM_BUFFERS": 4,
+      "num_warps": 4,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 52.66,
+     "tflops": 1177.52,
+     "config": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 128,
+      "BLOCK_K": 128,
+      "NUM_BUFFERS": 2,
+      "num_warps": 2,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 53.675,
+     "tflops": 1155.26,
+     "config": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 128,
+      "BLOCK_K": 128,
+      "NUM_BUFFERS": 2,
+      "num_warps": 4,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 54.229,
+     "tflops": 1143.45,
+     "config": {
+      "BLOCK_M": 256,
+      "BLOCK_N": 128,
+      "BLOCK_K": 128,
+      "NUM_BUFFERS": 3,
+      "num_warps": 4,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 55.08,
+     "tflops": 1125.79,
+     "config": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 256,
+      "BLOCK_K": 128,
+      "NUM_BUFFERS": 3,
+      "num_warps": 4,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 55.73,
+     "tflops": 1112.67,
+     "config": {
+      "BLOCK_M": 256,
+      "BLOCK_N": 128,
+      "BLOCK_K": 64,
+      "NUM_BUFFERS": 4,
+      "num_warps": 4,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 56.241,
+     "tflops": 1102.55,
+     "config": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 256,
+      "BLOCK_K": 64,
+      "NUM_BUFFERS": 4,
+      "num_warps": 4,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 56.424,
+     "tflops": 1098.98,
+     "config": {
+      "BLOCK_M": 64,
+      "BLOCK_N": 128,
+      "BLOCK_K": 128,
+      "NUM_BUFFERS": 2,
+      "num_warps": 4,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 56.908,
+     "tflops": 1089.62,
+     "config": {
+      "BLOCK_M": 256,
+      "BLOCK_N": 128,
+      "BLOCK_K": 64,
+      "NUM_BUFFERS": 4,
+      "num_warps": 8,
+      "kernel_type": "compute_bound"
+     }
+    }
+   ]
+  }
+ },
+ {
+  "M": 4096,
+  "planned": 6501,
+  "counts": {
+   "ok": 5954,
+   "error": 544,
+   "crashed": 3,
+   "hung": 1
+  },
+  "final_round": {
+   "baseline_us": 109.237,
+   "baseline_config": {
+    "BLOCK_M": 128,
+    "BLOCK_N": 128,
+    "BLOCK_K": 128,
+    "NUM_BUFFERS": 2,
+    "num_warps": 2,
+    "kernel_type": "bandwidth_bound"
+   },
+   "dropped_keys": null,
+   "top": [
+    {
+     "us": 75.795,
+     "tflops": 1636.21,
+     "config": {
+      "BLOCK_M": 256,
+      "BLOCK_N": 256,
+      "BLOCK_K": 64,
+      "NUM_BUFFERS": 4,
+      "num_warps": 4,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 92.077,
+     "tflops": 1346.89,
+     "config": {
+      "BLOCK_M": 256,
+      "BLOCK_N": 256,
+      "BLOCK_K": 64,
+      "NUM_BUFFERS": 3,
+      "num_warps": 4,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 92.338,
+     "tflops": 1343.08,
+     "config": {
+      "BLOCK_M": 256,
+      "BLOCK_N": 256,
+      "BLOCK_K": 64,
+      "NUM_BUFFERS": 4,
+      "num_warps": 8,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 95.286,
+     "tflops": 1301.53,
+     "config": {
+      "BLOCK_M": 256,
+      "BLOCK_N": 256,
+      "BLOCK_K": 64,
+      "NUM_BUFFERS": 4,
+      "num_warps": 4,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 95.379,
+     "tflops": 1300.26,
+     "config": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 128,
+      "BLOCK_K": 128,
+      "NUM_BUFFERS": 1,
+      "num_warps": 4,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 97.914,
+     "tflops": 1266.6,
+     "config": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 128,
+      "BLOCK_K": 64,
+      "NUM_BUFFERS": 2,
+      "num_warps": 4,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 98.113,
+     "tflops": 1264.03,
+     "config": {
+      "BLOCK_M": 256,
+      "BLOCK_N": 256,
+      "BLOCK_K": 128,
+      "NUM_BUFFERS": 2,
+      "num_warps": 4,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 98.886,
+     "tflops": 1254.14,
+     "config": {
+      "BLOCK_M": 256,
+      "BLOCK_N": 256,
+      "BLOCK_K": 64,
+      "NUM_BUFFERS": 3,
+      "num_warps": 4,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 100.137,
+     "tflops": 1238.47,
+     "config": {
+      "BLOCK_M": 256,
+      "BLOCK_N": 256,
+      "BLOCK_K": 64,
+      "NUM_BUFFERS": 4,
+      "num_warps": 8,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 100.824,
+     "tflops": 1230.04,
+     "config": {
+      "BLOCK_M": 256,
+      "BLOCK_N": 256,
+      "BLOCK_K": 64,
+      "NUM_BUFFERS": 3,
+      "num_warps": 8,
+      "kernel_type": "bandwidth_bound"
+     }
+    }
+   ]
+  }
+ },
+ {
+  "M": 8192,
+  "planned": 6501,
+  "counts": {
+   "ok": 5954,
+   "error": 544,
+   "crashed": 3,
+   "hung": 1
+  },
+  "final_round": {
+   "baseline_us": 186.279,
+   "baseline_config": {
+    "BLOCK_M": 128,
+    "BLOCK_N": 128,
+    "BLOCK_K": 128,
+    "NUM_BUFFERS": 2,
+    "num_warps": 2,
+    "kernel_type": "bandwidth_bound"
+   },
+   "dropped_keys": null,
+   "top": [
+    {
+     "us": 165.518,
+     "tflops": 1498.53,
+     "config": {
+      "BLOCK_M": 256,
+      "BLOCK_N": 256,
+      "BLOCK_K": 64,
+      "NUM_BUFFERS": 4,
+      "num_warps": 4,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 168.812,
+     "tflops": 1469.29,
+     "config": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 256,
+      "BLOCK_K": 128,
+      "NUM_BUFFERS": 3,
+      "num_warps": 4,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 168.937,
+     "tflops": 1468.2,
+     "config": {
+      "BLOCK_M": 256,
+      "BLOCK_N": 128,
+      "BLOCK_K": 128,
+      "NUM_BUFFERS": 3,
+      "num_warps": 4,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 170.63,
+     "tflops": 1453.64,
+     "config": {
+      "BLOCK_M": 256,
+      "BLOCK_N": 128,
+      "BLOCK_K": 64,
+      "NUM_BUFFERS": 4,
+      "num_warps": 4,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 176.492,
+     "tflops": 1405.36,
+     "config": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 256,
+      "BLOCK_K": 64,
+      "NUM_BUFFERS": 4,
+      "num_warps": 4,
+      "kernel_type": "compute_bound"
+     }
+    },
+    {
+     "us": 177.652,
+     "tflops": 1396.18,
+     "config": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 128,
+      "BLOCK_K": 128,
+      "NUM_BUFFERS": 2,
+      "num_warps": 4,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 181.369,
+     "tflops": 1367.57,
+     "config": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 256,
+      "BLOCK_K": 128,
+      "NUM_BUFFERS": 3,
+      "num_warps": 4,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 183.86,
+     "tflops": 1349.04,
+     "config": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 128,
+      "BLOCK_K": 128,
+      "NUM_BUFFERS": 2,
+      "num_warps": 2,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 183.894,
+     "tflops": 1348.79,
+     "config": {
+      "BLOCK_M": 256,
+      "BLOCK_N": 256,
+      "BLOCK_K": 64,
+      "NUM_BUFFERS": 3,
+      "num_warps": 4,
+      "kernel_type": "bandwidth_bound"
+     }
+    },
+    {
+     "us": 184.344,
+     "tflops": 1345.5,
+     "config": {
+      "BLOCK_M": 256,
+      "BLOCK_N": 256,
+      "BLOCK_K": 64,
+      "NUM_BUFFERS": 4,
+      "num_warps": 4,
+      "kernel_type": "bandwidth_bound"
+     }
+    }
+   ]
+  }
+ }
+]

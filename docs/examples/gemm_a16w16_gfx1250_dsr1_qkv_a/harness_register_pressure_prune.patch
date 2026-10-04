@@ -1,0 +1,44 @@
+diff --git a/aiter/ops/triton/utils/_triton/tuning/CLAUDE.md b/aiter/ops/triton/utils/_triton/tuning/CLAUDE.md
+index 129134770..ad92f793b 100644
+--- a/aiter/ops/triton/utils/_triton/tuning/CLAUDE.md
++++ b/aiter/ops/triton/utils/_triton/tuning/CLAUDE.md
+@@ -79,7 +79,9 @@ check and `should_skip` judge one CTA's share), `gluon_archs` / `gluon_default_a
+ `backend_kwarg` from the wrapper, `bounds` copied from the kernel's `_get_config` (the CLI K is the
+ logical K, so no K transform is needed). The function builds the inputs once with the `op_tests`
+ generator, preallocates the output, and returns `(call, inputs, should_skip)`;
+-`should_skip(config)` holds what the kernel asserts (block multiples, buffer clamps). Output
++`should_skip(config)` holds what the kernel asserts (block multiples, buffer clamps), plus tiles
++the compiler cannot keep in registers: the gfx1250 gluon `gemm_a16w16` rejects tiles over 1024
++fp32 accumulators per lane, which spill and compile for minutes until `--stall` kills them. Output
+ resets and derived keys live in `call`. Keep everything about a kernel inside that one function;
+ the `kernels.py` docstring has a complete example. Then run the checks below.
+ 
+diff --git a/aiter/ops/triton/utils/_triton/tuning/README.md b/aiter/ops/triton/utils/_triton/tuning/README.md
+index 9af341ffa..29eeacbb0 100644
+--- a/aiter/ops/triton/utils/_triton/tuning/README.md
++++ b/aiter/ops/triton/utils/_triton/tuning/README.md
+@@ -64,8 +64,9 @@ when the keys exist, and an LDS check: a block-size combination whose buffers x
+ exceed the arch's LDS is never compiled; each kernel declares its element widths as `bits=(a, b)`,
+ and a kernel whose `num_ctas` splits the tile over a CTA cluster declares `cta_split`, so the
+ check counts one CTA's share)
+-and the kernel's own `should_skip(config)` in `kernels.py` (what the kernel asserts, and buffer
+-counts its wrapper clamps so they would only repeat another candidate). Every rule returns True
++and the kernel's own `should_skip(config)` in `kernels.py` (what the kernel asserts, buffer
++counts its wrapper clamps so they would only repeat another candidate, and for the gluon
++`gemm_a16w16` tiles over 1024 fp32 accumulators per lane, which spill and compile for minutes). Every rule returns True
+ to reject. If the kernel rejects every tile that fits the shape (a kernel that needs 64-row tiles
+ at M=16), block sizes above the shape are allowed for that M and the plan says so.
+ There are no command-line overrides: edit the table. A one-value list pins a key. Keys the wrapper
+diff --git a/aiter/ops/triton/utils/_triton/tuning/kernels.py b/aiter/ops/triton/utils/_triton/tuning/kernels.py
+index 8ead293cd..b99fb3e3a 100644
+--- a/aiter/ops/triton/utils/_triton/tuning/kernels.py
++++ b/aiter/ops/triton/utils/_triton/tuning/kernels.py
+@@ -259,6 +259,8 @@ def gemm_a16w16(shape, backend):
+         k_tiles = cdiv(K, block_k)
+         if block_k % 32:
+             return True  # 16x16x32 instructions
++        if config["BLOCK_M"] * config["BLOCK_N"] > 1024 * 32 * config["num_warps"]:
++            return True  # over 1024 fp32 accumulators per lane (wave32): spills, compiles for minutes
+         if config.get("kernel_type") == "compute_bound":
+             if num_buffers < 2 or k_tiles < 4:
+                 return True  # compute_bound needs a 2-deep pipeline and 4 K tiles

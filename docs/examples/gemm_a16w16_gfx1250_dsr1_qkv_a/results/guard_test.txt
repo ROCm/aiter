@@ -1,0 +1,78 @@
+M=     1 old M_LEQ_16   OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 16, 'BLOCK_N': 16, 'BLOCK_K': 256, 'NUM_BUFFERS': 8, 'num_warps': 1, 'kernel_type': 'bandwidth_bound', 'waves_per_eu': 1}
+M=     1 new M_LEQ_1    OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 16, 'BLOCK_N': 8, 'BLOCK_K': 512, 'NUM_BUFFERS': 6, 'num_warps': 1, 'kernel_type': 'compute_bound'}
+M=     3 old M_LEQ_16   OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 16, 'BLOCK_N': 16, 'BLOCK_K': 256, 'NUM_BUFFERS': 8, 'num_warps': 1, 'kernel_type': 'bandwidth_bound', 'waves_per_eu': 1}
+M=     3 new M_LEQ_4    OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 16, 'BLOCK_N': 8, 'BLOCK_K': 512, 'NUM_BUFFERS': 6, 'num_warps': 1, 'kernel_type': 'compute_bound'}
+M=     4 old M_LEQ_16   OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 16, 'BLOCK_N': 16, 'BLOCK_K': 256, 'NUM_BUFFERS': 8, 'num_warps': 1, 'kernel_type': 'bandwidth_bound', 'waves_per_eu': 1}
+M=     4 new M_LEQ_4    OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 16, 'BLOCK_N': 8, 'BLOCK_K': 512, 'NUM_BUFFERS': 6, 'num_warps': 1, 'kernel_type': 'compute_bound'}
+M=     5 old M_LEQ_16   OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 16, 'BLOCK_N': 16, 'BLOCK_K': 256, 'NUM_BUFFERS': 8, 'num_warps': 1, 'kernel_type': 'bandwidth_bound', 'waves_per_eu': 1}
+M=     5 new M_LEQ_8    OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 16, 'BLOCK_N': 8, 'BLOCK_K': 512, 'NUM_BUFFERS': 6, 'num_warps': 2, 'kernel_type': 'compute_bound'}
+M=     8 old M_LEQ_16   OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 16, 'BLOCK_N': 16, 'BLOCK_K': 256, 'NUM_BUFFERS': 8, 'num_warps': 1, 'kernel_type': 'bandwidth_bound', 'waves_per_eu': 1}
+M=     8 new M_LEQ_8    OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 16, 'BLOCK_N': 8, 'BLOCK_K': 512, 'NUM_BUFFERS': 6, 'num_warps': 2, 'kernel_type': 'compute_bound'}
+M=    13 old M_LEQ_16   OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 16, 'BLOCK_N': 16, 'BLOCK_K': 256, 'NUM_BUFFERS': 8, 'num_warps': 1, 'kernel_type': 'bandwidth_bound', 'waves_per_eu': 1}
+M=    13 new M_LEQ_16   OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 16, 'BLOCK_N': 16, 'BLOCK_K': 512, 'NUM_BUFFERS': 6, 'num_warps': 4, 'kernel_type': 'compute_bound'}
+M=    16 old M_LEQ_16   OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 16, 'BLOCK_N': 16, 'BLOCK_K': 256, 'NUM_BUFFERS': 8, 'num_warps': 1, 'kernel_type': 'bandwidth_bound', 'waves_per_eu': 1}
+M=    16 new M_LEQ_16   OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 16, 'BLOCK_N': 16, 'BLOCK_K': 512, 'NUM_BUFFERS': 6, 'num_warps': 4, 'kernel_type': 'compute_bound'}
+M=    17 old M_LEQ_32   OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 16, 'BLOCK_N': 32, 'BLOCK_K': 512, 'NUM_BUFFERS': 5, 'num_warps': 2, 'kernel_type': 'bandwidth_bound'}
+M=    17 new M_LEQ_32   OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 16, 'BLOCK_N': 16, 'BLOCK_K': 256, 'NUM_BUFFERS': 6, 'num_warps': 2, 'kernel_type': 'bandwidth_bound'}
+M=    31 old M_LEQ_32   OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 16, 'BLOCK_N': 32, 'BLOCK_K': 512, 'NUM_BUFFERS': 5, 'num_warps': 2, 'kernel_type': 'bandwidth_bound'}
+M=    31 new M_LEQ_32   OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 16, 'BLOCK_N': 16, 'BLOCK_K': 256, 'NUM_BUFFERS': 6, 'num_warps': 2, 'kernel_type': 'bandwidth_bound'}
+M=    32 old M_LEQ_32   OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 16, 'BLOCK_N': 32, 'BLOCK_K': 512, 'NUM_BUFFERS': 5, 'num_warps': 2, 'kernel_type': 'bandwidth_bound'}
+M=    32 new M_LEQ_32   OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 16, 'BLOCK_N': 16, 'BLOCK_K': 256, 'NUM_BUFFERS': 6, 'num_warps': 2, 'kernel_type': 'bandwidth_bound'}
+M=    33 old M_LEQ_64   OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 32, 'BLOCK_N': 16, 'BLOCK_K': 256, 'NUM_BUFFERS': 4, 'num_warps': 2, 'kernel_type': 'bandwidth_bound', 'waves_per_eu': 1}
+M=    33 new M_LEQ_64   OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 256, 'NUM_BUFFERS': 6, 'num_warps': 4, 'kernel_type': 'compute_bound'}
+M=    50 old M_LEQ_64   OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 32, 'BLOCK_N': 16, 'BLOCK_K': 256, 'NUM_BUFFERS': 4, 'num_warps': 2, 'kernel_type': 'bandwidth_bound', 'waves_per_eu': 1}
+M=    50 new M_LEQ_64   OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 256, 'NUM_BUFFERS': 6, 'num_warps': 4, 'kernel_type': 'compute_bound'}
+M=    64 old M_LEQ_64   OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 32, 'BLOCK_N': 16, 'BLOCK_K': 256, 'NUM_BUFFERS': 4, 'num_warps': 2, 'kernel_type': 'bandwidth_bound', 'waves_per_eu': 1}
+M=    64 new M_LEQ_64   OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 256, 'NUM_BUFFERS': 6, 'num_warps': 4, 'kernel_type': 'compute_bound'}
+M=    65 old M_LEQ_128  OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 512, 'NUM_BUFFERS': 3, 'num_warps': 4, 'kernel_type': 'bandwidth_bound'}
+M=    65 new M_LEQ_128  OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 256, 'NUM_BUFFERS': 3, 'num_warps': 4, 'kernel_type': 'bandwidth_bound'}
+M=   100 old M_LEQ_128  OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 512, 'NUM_BUFFERS': 3, 'num_warps': 4, 'kernel_type': 'bandwidth_bound'}
+M=   100 new M_LEQ_128  OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 256, 'NUM_BUFFERS': 3, 'num_warps': 4, 'kernel_type': 'bandwidth_bound'}
+M=   128 old M_LEQ_128  OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 512, 'NUM_BUFFERS': 3, 'num_warps': 4, 'kernel_type': 'bandwidth_bound'}
+M=   128 new M_LEQ_128  OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 256, 'NUM_BUFFERS': 3, 'num_warps': 4, 'kernel_type': 'bandwidth_bound'}
+M=   129 old M_LEQ_256  OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 256, 'NUM_BUFFERS': 4, 'num_warps': 4, 'kernel_type': 'bandwidth_bound', 'waves_per_eu': 1}
+M=   129 new M_LEQ_256  OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 256, 'NUM_BUFFERS': 3, 'num_warps': 8, 'kernel_type': 'bandwidth_bound'}
+M=   200 old M_LEQ_256  OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 256, 'NUM_BUFFERS': 4, 'num_warps': 4, 'kernel_type': 'bandwidth_bound', 'waves_per_eu': 1}
+M=   200 new M_LEQ_256  OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 256, 'NUM_BUFFERS': 3, 'num_warps': 8, 'kernel_type': 'bandwidth_bound'}
+M=   256 old M_LEQ_256  OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 256, 'NUM_BUFFERS': 4, 'num_warps': 4, 'kernel_type': 'bandwidth_bound', 'waves_per_eu': 1}
+M=   256 new M_LEQ_256  OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 256, 'NUM_BUFFERS': 3, 'num_warps': 8, 'kernel_type': 'bandwidth_bound'}
+M=   257 old M_LEQ_512  OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 128, 'NUM_BUFFERS': 4, 'num_warps': 2, 'kernel_type': 'bandwidth_bound'}
+M=   257 new M_LEQ_512  OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 256, 'NUM_BUFFERS': 2, 'num_warps': 2, 'kernel_type': 'bandwidth_bound'}
+M=   300 old M_LEQ_512  OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 128, 'NUM_BUFFERS': 4, 'num_warps': 2, 'kernel_type': 'bandwidth_bound'}
+M=   300 new M_LEQ_512  OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 256, 'NUM_BUFFERS': 2, 'num_warps': 2, 'kernel_type': 'bandwidth_bound'}
+M=   512 old M_LEQ_512  OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 128, 'NUM_BUFFERS': 4, 'num_warps': 2, 'kernel_type': 'bandwidth_bound'}
+M=   512 new M_LEQ_512  OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 256, 'NUM_BUFFERS': 2, 'num_warps': 2, 'kernel_type': 'bandwidth_bound'}
+M=   513 old any        OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'NUM_BUFFERS': 2, 'num_warps': 2, 'kernel_type': 'bandwidth_bound'}
+M=   513 new M_LEQ_1024 OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'NUM_BUFFERS': 4, 'num_warps': 4, 'kernel_type': 'compute_bound'}
+M=   777 old any        OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'NUM_BUFFERS': 2, 'num_warps': 2, 'kernel_type': 'bandwidth_bound'}
+M=   777 new M_LEQ_1024 OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'NUM_BUFFERS': 4, 'num_warps': 4, 'kernel_type': 'compute_bound'}
+M=  1000 old any        OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'NUM_BUFFERS': 2, 'num_warps': 2, 'kernel_type': 'bandwidth_bound'}
+M=  1000 new M_LEQ_1024 OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'NUM_BUFFERS': 4, 'num_warps': 4, 'kernel_type': 'compute_bound'}
+M=  1024 old any        OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'NUM_BUFFERS': 2, 'num_warps': 2, 'kernel_type': 'bandwidth_bound'}
+M=  1024 new M_LEQ_1024 OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'NUM_BUFFERS': 4, 'num_warps': 4, 'kernel_type': 'compute_bound'}
+M=  1025 old any        OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'NUM_BUFFERS': 2, 'num_warps': 2, 'kernel_type': 'bandwidth_bound'}
+M=  1025 new M_LEQ_2048 OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 128, 'NUM_BUFFERS': 3, 'num_warps': 4, 'kernel_type': 'compute_bound'}
+M=  1500 old any        OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'NUM_BUFFERS': 2, 'num_warps': 2, 'kernel_type': 'bandwidth_bound'}
+M=  1500 new M_LEQ_2048 OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 128, 'NUM_BUFFERS': 3, 'num_warps': 4, 'kernel_type': 'compute_bound'}
+M=  2047 old any        OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'NUM_BUFFERS': 2, 'num_warps': 2, 'kernel_type': 'bandwidth_bound'}
+M=  2047 new M_LEQ_2048 OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 128, 'NUM_BUFFERS': 3, 'num_warps': 4, 'kernel_type': 'compute_bound'}
+M=  2048 old any        OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'NUM_BUFFERS': 2, 'num_warps': 2, 'kernel_type': 'bandwidth_bound'}
+M=  2048 new M_LEQ_2048 OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 128, 'NUM_BUFFERS': 3, 'num_warps': 4, 'kernel_type': 'compute_bound'}
+M=  2049 old any        OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'NUM_BUFFERS': 2, 'num_warps': 2, 'kernel_type': 'bandwidth_bound'}
+M=  2049 new M_LEQ_4096 OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 256, 'BLOCK_N': 256, 'BLOCK_K': 64, 'NUM_BUFFERS': 4, 'num_warps': 4, 'kernel_type': 'compute_bound'}
+M=  3000 old any        OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'NUM_BUFFERS': 2, 'num_warps': 2, 'kernel_type': 'bandwidth_bound'}
+M=  3000 new M_LEQ_4096 OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 256, 'BLOCK_N': 256, 'BLOCK_K': 64, 'NUM_BUFFERS': 4, 'num_warps': 4, 'kernel_type': 'compute_bound'}
+M=  4096 old any        OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'NUM_BUFFERS': 2, 'num_warps': 2, 'kernel_type': 'bandwidth_bound'}
+M=  4096 new M_LEQ_4096 OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 256, 'BLOCK_N': 256, 'BLOCK_K': 64, 'NUM_BUFFERS': 4, 'num_warps': 4, 'kernel_type': 'compute_bound'}
+M=  4097 old any        OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'NUM_BUFFERS': 2, 'num_warps': 2, 'kernel_type': 'bandwidth_bound'}
+M=  4097 new M_LEQ_8192 OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 256, 'BLOCK_N': 256, 'BLOCK_K': 64, 'NUM_BUFFERS': 4, 'num_warps': 4, 'kernel_type': 'compute_bound'}
+M=  6000 old any        OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'NUM_BUFFERS': 2, 'num_warps': 2, 'kernel_type': 'bandwidth_bound'}
+M=  6000 new M_LEQ_8192 OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 256, 'BLOCK_N': 256, 'BLOCK_K': 64, 'NUM_BUFFERS': 4, 'num_warps': 4, 'kernel_type': 'compute_bound'}
+M=  8192 old any        OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'NUM_BUFFERS': 2, 'num_warps': 2, 'kernel_type': 'bandwidth_bound'}
+M=  8192 new M_LEQ_8192 OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 256, 'BLOCK_N': 256, 'BLOCK_K': 64, 'NUM_BUFFERS': 4, 'num_warps': 4, 'kernel_type': 'compute_bound'}
+M=  8193 old any        OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'NUM_BUFFERS': 2, 'num_warps': 2, 'kernel_type': 'bandwidth_bound'}
+M=  8193 new any        OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 256, 'BLOCK_N': 256, 'BLOCK_K': 64, 'NUM_BUFFERS': 4, 'num_warps': 4, 'kernel_type': 'compute_bound'}
+M= 12000 old any        OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'NUM_BUFFERS': 2, 'num_warps': 2, 'kernel_type': 'bandwidth_bound'}
+M= 12000 new any        OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 256, 'BLOCK_N': 256, 'BLOCK_K': 64, 'NUM_BUFFERS': 4, 'num_warps': 4, 'kernel_type': 'compute_bound'}
+M= 16384 old any        OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'NUM_BUFFERS': 2, 'num_warps': 2, 'kernel_type': 'bandwidth_bound'}
+M= 16384 new any        OK  guard_before=0 guard_after=0 y_exact=True {'BLOCK_M': 256, 'BLOCK_N': 256, 'BLOCK_K': 64, 'NUM_BUFFERS': 4, 'num_warps': 4, 'kernel_type': 'compute_bound'}

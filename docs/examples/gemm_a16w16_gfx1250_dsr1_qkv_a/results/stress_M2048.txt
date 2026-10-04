@@ -1,0 +1,4 @@
+M=2048 new M_LEQ_2048 reps=50 median=52.147 us {'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 128, 'NUM_BUFFERS': 3, 'num_warps': 4, 'kernel_type': 'compute_bound'}
+M=2048 old any reps=50 median=53.074 us {'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'NUM_BUFFERS': 2, 'num_warps': 2, 'kernel_type': 'bandwidth_bound'}
+M=2048 new M_LEQ_2048 reps=50 median=52.361 us {'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 128, 'NUM_BUFFERS': 3, 'num_warps': 4, 'kernel_type': 'compute_bound'}
+M=2048 old any reps=50 median=53.317 us {'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'NUM_BUFFERS': 2, 'num_warps': 2, 'kernel_type': 'bandwidth_bound'}

@@ -1,0 +1,470 @@
+[
+ {
+  "M": 1,
+  "copies": 35,
+  "speedup": 1.225,
+  "old_bucket": "M_LEQ_16",
+  "old_cfg": {
+   "BLOCK_M": 16,
+   "BLOCK_N": 16,
+   "BLOCK_K": 256,
+   "NUM_BUFFERS": 8,
+   "num_warps": 1,
+   "kernel_type": "bandwidth_bound",
+   "waves_per_eu": 1
+  },
+  "old_us": 6.603,
+  "old_spread": [
+   6.56,
+   6.633
+  ],
+  "new_bucket": "M_LEQ_1",
+  "new_cfg": {
+   "BLOCK_M": 16,
+   "BLOCK_N": 8,
+   "BLOCK_K": 512,
+   "NUM_BUFFERS": 6,
+   "num_warps": 1,
+   "kernel_type": "compute_bound"
+  },
+  "new_us": 5.391,
+  "new_spread": [
+   5.372,
+   5.416
+  ]
+ },
+ {
+  "M": 4,
+  "copies": 35,
+  "speedup": 1.108,
+  "old_bucket": "M_LEQ_16",
+  "old_cfg": {
+   "BLOCK_M": 16,
+   "BLOCK_N": 16,
+   "BLOCK_K": 256,
+   "NUM_BUFFERS": 8,
+   "num_warps": 1,
+   "kernel_type": "bandwidth_bound",
+   "waves_per_eu": 1
+  },
+  "old_us": 6.791,
+  "old_spread": [
+   6.755,
+   6.828
+  ],
+  "new_bucket": "M_LEQ_4",
+  "new_cfg": {
+   "BLOCK_M": 16,
+   "BLOCK_N": 8,
+   "BLOCK_K": 512,
+   "NUM_BUFFERS": 6,
+   "num_warps": 1,
+   "kernel_type": "compute_bound"
+  },
+  "new_us": 6.131,
+  "new_spread": [
+   6.078,
+   6.165
+  ]
+ },
+ {
+  "M": 8,
+  "copies": 35,
+  "speedup": 1.044,
+  "old_bucket": "M_LEQ_16",
+  "old_cfg": {
+   "BLOCK_M": 16,
+   "BLOCK_N": 16,
+   "BLOCK_K": 256,
+   "NUM_BUFFERS": 8,
+   "num_warps": 1,
+   "kernel_type": "bandwidth_bound",
+   "waves_per_eu": 1
+  },
+  "old_us": 7.061,
+  "old_spread": [
+   7.051,
+   7.107
+  ],
+  "new_bucket": "M_LEQ_8",
+  "new_cfg": {
+   "BLOCK_M": 16,
+   "BLOCK_N": 8,
+   "BLOCK_K": 512,
+   "NUM_BUFFERS": 6,
+   "num_warps": 2,
+   "kernel_type": "compute_bound"
+  },
+  "new_us": 6.765,
+  "new_spread": [
+   6.73,
+   6.792
+  ]
+ },
+ {
+  "M": 16,
+  "copies": 35,
+  "speedup": 1.051,
+  "old_bucket": "M_LEQ_16",
+  "old_cfg": {
+   "BLOCK_M": 16,
+   "BLOCK_N": 16,
+   "BLOCK_K": 256,
+   "NUM_BUFFERS": 8,
+   "num_warps": 1,
+   "kernel_type": "bandwidth_bound",
+   "waves_per_eu": 1
+  },
+  "old_us": 8.337,
+  "old_spread": [
+   8.309,
+   8.361
+  ],
+  "new_bucket": "M_LEQ_16",
+  "new_cfg": {
+   "BLOCK_M": 16,
+   "BLOCK_N": 16,
+   "BLOCK_K": 512,
+   "NUM_BUFFERS": 6,
+   "num_warps": 4,
+   "kernel_type": "compute_bound"
+  },
+  "new_us": 7.932,
+  "new_spread": [
+   7.9,
+   7.973
+  ]
+ },
+ {
+  "M": 32,
+  "copies": 34,
+  "speedup": 1.092,
+  "old_bucket": "M_LEQ_32",
+  "old_cfg": {
+   "BLOCK_M": 16,
+   "BLOCK_N": 32,
+   "BLOCK_K": 512,
+   "NUM_BUFFERS": 5,
+   "num_warps": 2,
+   "kernel_type": "bandwidth_bound"
+  },
+  "old_us": 11.055,
+  "old_spread": [
+   11.037,
+   11.097
+  ],
+  "new_bucket": "M_LEQ_32",
+  "new_cfg": {
+   "BLOCK_M": 16,
+   "BLOCK_N": 16,
+   "BLOCK_K": 256,
+   "NUM_BUFFERS": 6,
+   "num_warps": 2,
+   "kernel_type": "bandwidth_bound"
+  },
+  "new_us": 10.128,
+  "new_spread": [
+   10.072,
+   10.14
+  ]
+ },
+ {
+  "M": 64,
+  "copies": 34,
+  "speedup": 1.041,
+  "old_bucket": "M_LEQ_64",
+  "old_cfg": {
+   "BLOCK_M": 32,
+   "BLOCK_N": 16,
+   "BLOCK_K": 256,
+   "NUM_BUFFERS": 4,
+   "num_warps": 2,
+   "kernel_type": "bandwidth_bound",
+   "waves_per_eu": 1
+  },
+  "old_us": 12.706,
+  "old_spread": [
+   12.105,
+   12.807
+  ],
+  "new_bucket": "M_LEQ_64",
+  "new_cfg": {
+   "BLOCK_M": 32,
+   "BLOCK_N": 32,
+   "BLOCK_K": 256,
+   "NUM_BUFFERS": 6,
+   "num_warps": 4,
+   "kernel_type": "compute_bound"
+  },
+  "new_us": 12.208,
+  "new_spread": [
+   12.167,
+   12.218
+  ]
+ },
+ {
+  "M": 128,
+  "copies": 32,
+  "speedup": 1.031,
+  "old_bucket": "M_LEQ_128",
+  "old_cfg": {
+   "BLOCK_M": 64,
+   "BLOCK_N": 32,
+   "BLOCK_K": 512,
+   "NUM_BUFFERS": 3,
+   "num_warps": 4,
+   "kernel_type": "bandwidth_bound"
+  },
+  "old_us": 16.773,
+  "old_spread": [
+   16.396,
+   16.843
+  ],
+  "new_bucket": "M_LEQ_128",
+  "new_cfg": {
+   "BLOCK_M": 32,
+   "BLOCK_N": 32,
+   "BLOCK_K": 256,
+   "NUM_BUFFERS": 3,
+   "num_warps": 4,
+   "kernel_type": "bandwidth_bound"
+  },
+  "new_us": 16.264,
+  "new_spread": [
+   15.938,
+   16.427
+  ]
+ },
+ {
+  "M": 256,
+  "copies": 30,
+  "speedup": 0.976,
+  "old_bucket": "M_LEQ_256",
+  "old_cfg": {
+   "BLOCK_M": 64,
+   "BLOCK_N": 64,
+   "BLOCK_K": 256,
+   "NUM_BUFFERS": 4,
+   "num_warps": 4,
+   "kernel_type": "bandwidth_bound",
+   "waves_per_eu": 1
+  },
+  "old_us": 21.217,
+  "old_spread": [
+   19.852,
+   21.296
+  ],
+  "new_bucket": "M_LEQ_256",
+  "new_cfg": {
+   "BLOCK_M": 64,
+   "BLOCK_N": 32,
+   "BLOCK_K": 256,
+   "NUM_BUFFERS": 3,
+   "num_warps": 8,
+   "kernel_type": "bandwidth_bound"
+  },
+  "new_us": 21.741,
+  "new_spread": [
+   20.292,
+   22.484
+  ]
+ },
+ {
+  "M": 512,
+  "copies": 26,
+  "speedup": 1.126,
+  "old_bucket": "M_LEQ_512",
+  "old_cfg": {
+   "BLOCK_M": 64,
+   "BLOCK_N": 64,
+   "BLOCK_K": 128,
+   "NUM_BUFFERS": 4,
+   "num_warps": 2,
+   "kernel_type": "bandwidth_bound"
+  },
+  "old_us": 28.356,
+  "old_spread": [
+   28.303,
+   28.551
+  ],
+  "new_bucket": "M_LEQ_512",
+  "new_cfg": {
+   "BLOCK_M": 64,
+   "BLOCK_N": 32,
+   "BLOCK_K": 256,
+   "NUM_BUFFERS": 2,
+   "num_warps": 2,
+   "kernel_type": "bandwidth_bound"
+  },
+  "new_us": 25.189,
+  "new_spread": [
+   25.066,
+   25.379
+  ]
+ },
+ {
+  "M": 1024,
+  "copies": 21,
+  "speedup": 1.436,
+  "old_bucket": "any",
+  "old_cfg": {
+   "BLOCK_M": 128,
+   "BLOCK_N": 128,
+   "BLOCK_K": 128,
+   "NUM_BUFFERS": 2,
+   "num_warps": 2,
+   "kernel_type": "bandwidth_bound"
+  },
+  "old_us": 47.333,
+  "old_spread": [
+   47.269,
+   47.381
+  ],
+  "new_bucket": "M_LEQ_1024",
+  "new_cfg": {
+   "BLOCK_M": 128,
+   "BLOCK_N": 128,
+   "BLOCK_K": 128,
+   "NUM_BUFFERS": 4,
+   "num_warps": 4,
+   "kernel_type": "compute_bound"
+  },
+  "new_us": 32.959,
+  "new_spread": [
+   32.854,
+   33.146
+  ]
+ },
+ {
+  "M": 2048,
+  "copies": 15,
+  "speedup": 1.024,
+  "old_bucket": "any",
+  "old_cfg": {
+   "BLOCK_M": 128,
+   "BLOCK_N": 128,
+   "BLOCK_K": 128,
+   "NUM_BUFFERS": 2,
+   "num_warps": 2,
+   "kernel_type": "bandwidth_bound"
+  },
+  "old_us": 54.326,
+  "old_spread": [
+   52.864,
+   54.82
+  ],
+  "new_bucket": "M_LEQ_2048",
+  "new_cfg": {
+   "BLOCK_M": 128,
+   "BLOCK_N": 256,
+   "BLOCK_K": 128,
+   "NUM_BUFFERS": 3,
+   "num_warps": 4,
+   "kernel_type": "compute_bound"
+  },
+  "new_us": 53.036,
+  "new_spread": [
+   52.649,
+   53.403
+  ]
+ },
+ {
+  "M": 4096,
+  "copies": 10,
+  "speedup": 1.375,
+  "old_bucket": "any",
+  "old_cfg": {
+   "BLOCK_M": 128,
+   "BLOCK_N": 128,
+   "BLOCK_K": 128,
+   "NUM_BUFFERS": 2,
+   "num_warps": 2,
+   "kernel_type": "bandwidth_bound"
+  },
+  "old_us": 112.437,
+  "old_spread": [
+   110.442,
+   113.316
+  ],
+  "new_bucket": "M_LEQ_4096",
+  "new_cfg": {
+   "BLOCK_M": 256,
+   "BLOCK_N": 256,
+   "BLOCK_K": 64,
+   "NUM_BUFFERS": 4,
+   "num_warps": 4,
+   "kernel_type": "compute_bound"
+  },
+  "new_us": 81.744,
+  "new_spread": [
+   80.713,
+   82.434
+  ]
+ },
+ {
+  "M": 8192,
+  "copies": 5,
+  "speedup": 1.108,
+  "old_bucket": "any",
+  "old_cfg": {
+   "BLOCK_M": 128,
+   "BLOCK_N": 128,
+   "BLOCK_K": 128,
+   "NUM_BUFFERS": 2,
+   "num_warps": 2,
+   "kernel_type": "bandwidth_bound"
+  },
+  "old_us": 184.095,
+  "old_spread": [
+   183.278,
+   185.039
+  ],
+  "new_bucket": "M_LEQ_8192",
+  "new_cfg": {
+   "BLOCK_M": 256,
+   "BLOCK_N": 256,
+   "BLOCK_K": 64,
+   "NUM_BUFFERS": 4,
+   "num_warps": 4,
+   "kernel_type": "compute_bound"
+  },
+  "new_us": 166.214,
+  "new_spread": [
+   164.754,
+   167.661
+  ]
+ },
+ {
+  "M": 16384,
+  "copies": 3,
+  "speedup": 1.275,
+  "old_bucket": "any",
+  "old_cfg": {
+   "BLOCK_M": 128,
+   "BLOCK_N": 128,
+   "BLOCK_K": 128,
+   "NUM_BUFFERS": 2,
+   "num_warps": 2,
+   "kernel_type": "bandwidth_bound"
+  },
+  "old_us": 378.961,
+  "old_spread": [
+   377.646,
+   381.133
+  ],
+  "new_bucket": "any",
+  "new_cfg": {
+   "BLOCK_M": 256,
+   "BLOCK_N": 256,
+   "BLOCK_K": 64,
+   "NUM_BUFFERS": 4,
+   "num_warps": 4,
+   "kernel_type": "compute_bound"
+  },
+  "new_us": 297.276,
+  "new_spread": [
+   290.316,
+   302.407
+  ]
+ }
+]
