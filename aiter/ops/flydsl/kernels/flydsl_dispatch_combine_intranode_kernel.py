@@ -465,9 +465,6 @@ def make_combine_kernel(
         raise ValueError("mask_topk_ids requires skip_stage1=True without zero_copy")
     _xfer_bf16_to_fp8 = fp8_direct_cast
     _transport_dtype = torch.float8_e4m3fn if _xfer_bf16_to_fp8 else data_type
-    from .mega_moe import trace as _trace
-
-    TRACE_BASE = _trace.trace_base("combine") if skip_stage1 else 0
 
     if max_recv is None:
         max_recv = npes * max_tok_per_rank
@@ -662,9 +659,6 @@ def make_combine_kernel(
         lane = tid & 63
         warp = tid >> 6
         global_warp_id = bid * warp_num_per_block + warp
-        if const_expr(TRACE_BASE):
-            if tid == 0:
-                _trace.record(TRACE_BASE, bid, 1, _trace.now())
         global_warp_num = block_num * warp_num_per_block
         grid_thread_id = bid * (warp_num_per_block * 64) + tid  # Stage 2 only
 
@@ -933,9 +927,6 @@ def make_combine_kernel(
         fx.barrier()
         if tid == 0:
             buffer_store(fx.Int32(0), _r_trecv, 0)
-        if const_expr(TRACE_BASE):
-            if tid == 0:
-                _trace.record(TRACE_BASE, bid, 2, _trace.now())
 
         # Stage 3: local read + WarpAccum. hidden-dim splits into warps_per_tok
         # partitions; each warp reduces k partials in f32 -> shmem_comb_out.
@@ -1180,9 +1171,6 @@ def make_combine_kernel(
                             wt_acc = wt_acc + wt_vld.select(wt_val, 0.0)
                     wt_out_off = wt_tok_id * experts_per_token + lane
                     buffer_store(wt_acc, rsrc_out_wts, wt_out_off)
-        if const_expr(TRACE_BASE):
-            if tid == 0:
-                _trace.record(TRACE_BASE, bid, 5, _trace.now())
 
     return ep_combine_intranode
 

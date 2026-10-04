@@ -13,7 +13,6 @@ from flydsl.runtime.device import get_rocm_arch
 
 from .. import communication_ops_utils as comm_ops
 from ..tensor_shim import _preload_compiled, _run_compiled, ptr_buf_tensor
-from . import trace as _trace
 from .dispatch import DispatchSlot, emit_dispatch_group, emit_dispatch_plan
 from .quant import emit_per_1x32_mx_fp8_group
 
@@ -76,9 +75,7 @@ def compile_mega_moe_prepare(
         f"_qcu{quant_blocks}qcap{quant_cu_capacity}"
         "_fov_runtime_dyn"
         f"_tss{tile_state_stride}_v13"
-        f"{'_trace' if _trace.TRACE_ENABLED else ''}"
     )
-    TRACE_BASE = _trace.trace_base("prepare")
 
     @flyc.kernel(name=kernel_name, known_block_size=[block_threads, 1, 1])
     def kernel(
@@ -123,15 +120,6 @@ def compile_mega_moe_prepare(
         producer_slot = ticket - fx.Int32(1)
         quant_producer = ticket > fx.Int32(prepare_blocks)
         quant_slot = ticket - fx.Int32(prepare_blocks + 1)
-        if const_expr(TRACE_BASE):  # noqa: SIM102
-            if tid == fx.Int32(0):
-                role = owner.select(
-                    fx.Int32(1), producer.select(fx.Int32(2), fx.Int32(3))
-                )
-                _trace.record(
-                    TRACE_BASE, fx.block_idx.x, 0, fx.Int64(role) << fx.Int64(32)
-                )
-                _trace.record(TRACE_BASE, fx.block_idx.x, 1, _trace.now())
 
         if const_expr(quant_blocks > 0):  # noqa: SIM102 - preserve DSL staging
             if quant_producer:
@@ -248,9 +236,6 @@ def compile_mega_moe_prepare(
                     expected=expected,
                     count_scratch=count_scratch,
                 )
-        if const_expr(TRACE_BASE):  # noqa: SIM102
-            if tid == fx.Int32(0):
-                _trace.record(TRACE_BASE, fx.block_idx.x, 5, _trace.now())
 
     @flyc.jit
     def launch(

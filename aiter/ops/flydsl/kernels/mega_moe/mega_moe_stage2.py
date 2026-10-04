@@ -22,7 +22,6 @@ from ..tensor_shim import (
     ptr_buf_tensor,
 )
 
-from . import trace as _trace
 from .gemm2 import (
     _resolve_g2_knobs,
     _spart_output_tile_index,
@@ -373,9 +372,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
         f"_bf16lds{int(g2_bf16_lds)}_{p2p_quant_type}"
         f"_rps{int(runtime_pair_skip)}_rtv3{int(runtime_pair_skip)}"
         f"_sv{scatter_vec}_tb2_rsm1"
-        f"{'_trace' if _trace.TRACE_ENABLED else ''}"
     )
-    TRACE_BASE = _trace.trace_base("stage2")
 
     # fmt: off
     @flyc.kernel(name=kernel_name, known_block_size=[256, 1, 1])
@@ -390,9 +387,6 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
         bx_i32 = fx.block_idx.x
         lane = tx_i32 % fx.Int32(64)
         wave = rocdl.readfirstlane(T.i32, tx_i32 // fx.Int32(64))
-        if const_expr(TRACE_BASE):  # noqa: SIM102
-            if tx_i32 == fx.Int32(0):
-                _trace.record(TRACE_BASE, bx_i32, 1, _trace.now())
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         lds_base_i32 = fx.Int32(fx.ptrtoint(lds.buf.ptr))
@@ -506,18 +500,12 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                 i32_kpad, i32_npad, BM=BM, BN=BN, BK=BK, use_nt=use_nt, INTER_MAX=INTER_MAX, aStages=aStages,
                 a_dtype=a_dtype, has_pad=has_pad, SBM=SBM, g2_bhoist=g2_bhoist, g2_ascale_pf=g2_ascale_pf,
                 expert_offset=_expert_offset)
-            if const_expr(TRACE_BASE):  # noqa: SIM102
-                if tx_i32 == fx.Int32(0):
-                    _trace.record(TRACE_BASE, bx_i32, 3, _trace.now())
             p2p_scatter_epilog(lds_base_i32, accm_vecs, n_block_idx, wave, lane, N_OUT=N_OUT,
                 BM=BM, BN=BN, npes=npes, topk=topk,
                 log2_max_tok=log2_max_tok, mask_max_tok=mask_max_tok, recv_cap=_recv_cap,
                 comb_inp_nbytes=_comb_inp_nbytes, lds_packed_off=lds_packed_off,
                 lds_weight_off=lds_weight_off, lds_peer_off=lds_peer_off, g2_bf16_lds=g2_bf16_lds,
                 p2p_quant_type=p2p_quant_type, scatter_vec=scatter_vec)
-            if const_expr(TRACE_BASE):  # noqa: SIM102
-                if tx_i32 == fx.Int32(0):
-                    _trace.record(TRACE_BASE, bx_i32, 4, _trace.now())
             # fmt: on
 
         def run_unskipped_unit(unit_bx, m_block_idx):
@@ -618,10 +606,6 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                 fx.barrier()  # separate prev-iter epilog LDS reads from this iter's A-load into the LDS union
                 if fx.Int32(m_block) < total_m_blocks:
                     run_unskipped_unit(unit_bx, m_block)
-
-        if const_expr(TRACE_BASE):  # noqa: SIM102
-            if tx_i32 == fx.Int32(0):
-                _trace.record(TRACE_BASE, bx_i32, 5, _trace.now())
 
     # fmt: off
     @flyc.jit
