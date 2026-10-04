@@ -2015,6 +2015,53 @@ __global__ void activation_kernel_vec(DTYPE_I* __restrict__ out,
     }
 }
 
+// Bounds-safe variant of activation_kernel_vec: guards both x0 and x1
+// against numel not being a multiple of VEC_SIZE_I * 2, with a scalar
+// tail loop for any remainder. Used by relu2().
+
+template <typename DTYPE_I, float (*ACT_FN)(const DTYPE_I&), int32_t VEC_SIZE_I>
+__global__ void activation_kernel_vec_safe(DTYPE_I* __restrict__ out,
+                                            const DTYPE_I* __restrict__ input,
+                                            const int64_t numel)
+{
+    using vec_i = opus::vector_t<DTYPE_I, VEC_SIZE_I>;
+    const int64_t stride = gridDim.x * blockDim.x * VEC_SIZE_I * 2;
+
+    for(int64_t idx = (blockIdx.x * blockDim.x + threadIdx.x) * VEC_SIZE_I * 2;
+        idx < numel;
+        idx += stride)
+    {
+        bool has_first  = (idx + VEC_SIZE_I <= numel);
+        bool has_second = (idx + 2 * VEC_SIZE_I <= numel);
+
+        vec_i x0{};
+        vec_i x1{};
+        if (has_first)  x0 = *reinterpret_cast<const vec_i*>(&input[idx]);
+        if (has_second) x1 = *reinterpret_cast<const vec_i*>(&input[idx + VEC_SIZE_I]);
+
+        DTYPE_I* x0_ptr = reinterpret_cast<DTYPE_I*>(&x0);
+        DTYPE_I* x1_ptr = reinterpret_cast<DTYPE_I*>(&x1);
+
+        #pragma unroll
+        for(size_t j = 0; j < VEC_SIZE_I; j++) {
+            if (has_first)  x0_ptr[j] = opus::cast<DTYPE_I>(ACT_FN(x0_ptr[j]));
+            if (has_second) x1_ptr[j] = opus::cast<DTYPE_I>(ACT_FN(x1_ptr[j]));
+        }
+
+        if (has_first)  *reinterpret_cast<vec_i*>(&out[idx]) = x0;
+        if (has_second) *reinterpret_cast<vec_i*>(&out[idx + VEC_SIZE_I]) = x1;
+
+        // Scalar tail for any remainder smaller than a full vec_i.
+        if (!has_first) {
+            for(int64_t k = idx; k < numel; k++)
+                out[k] = opus::cast<DTYPE_I>(ACT_FN(input[k]));
+        } else if (!has_second) {
+            for(int64_t k = idx + VEC_SIZE_I; k < numel; k++)
+                out[k] = opus::cast<DTYPE_I>(ACT_FN(input[k]));
+        }
+    }
+}
+
 } // namespace aiter
 
 #define LAUNCH_ACTIVATION_KERNEL_VEC(KERNEL)                                                \
@@ -2039,6 +2086,33 @@ __global__ void activation_kernel_vec(DTYPE_I* __restrict__ out,
         AITER_DISPATCH_CASE_VEC_SIZE_rmTorch(                                                              \
             vec_size,                                                                              \
             aiter::activation_kernel_vec<input_dtype, KERNEL<input_dtype>, VEC_SIZE>               \
+            <<<grid, block, 0, stream>>>(reinterpret_cast<input_dtype*>(out.data_ptr()),           \
+                                         reinterpret_cast<input_dtype*>(input.data_ptr()),         \
+                                         numel);)                                                  \
+    });
+
+#define LAUNCH_ACTIVATION_KERNEL_VEC_SAFE(KERNEL)                                                \
+    int64_t numel      = input.numel();                                                          \
+    int warp_size = static_cast<int>(WARP_SIZE);                                                 \
+    int vec_size       = nextPow2(static_cast<unsigned int>(numel / warp_size));                  \
+    vec_size           = vec_size > max_vec_size ? max_vec_size : vec_size;                        \
+    vec_size           = vec_size < 1 ? 1 : vec_size;                                              \
+    int64_t num_vecs   = (numel + vec_size - 1) / vec_size;                                        \
+    int num_wave       = nextPow2(static_cast<unsigned int>(num_vecs / warp_size));               \
+    num_wave           = num_wave > max_wave_num ? max_wave_num : num_wave;                        \
+    num_wave           = num_wave < 1 ? 1 : num_wave;                                              \
+    int block_size     = num_wave * warp_size;                                                     \
+    int64_t num_blocks = (num_vecs + block_size - 1) / block_size;                                 \
+    num_blocks         = num_blocks > 2048 ? 2048 : num_blocks;                                    \
+    dim3 grid(num_blocks);                                                                         \
+    dim3 block(block_size);                                                                        \
+    HipDeviceGuard device_guard(input.device_id);                                                  \
+    const hipStream_t stream = aiter::getCurrentHIPStream();                                       \
+    AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "activation_kernel_vec_safe", [&] {                  \
+        using input_dtype = typename aiter::hip2opus<scalar_t>::type;                              \
+        AITER_DISPATCH_CASE_VEC_SIZE_rmTorch(                                                              \
+            vec_size,                                                                              \
+            aiter::activation_kernel_vec_safe<input_dtype, KERNEL<input_dtype>, VEC_SIZE>               \
             <<<grid, block, 0, stream>>>(reinterpret_cast<input_dtype*>(out.data_ptr()),           \
                                          reinterpret_cast<input_dtype*>(input.data_ptr()),         \
                                          numel);)                                                  \
@@ -2075,17 +2149,21 @@ __device__ __forceinline__ float relu2_kernel(const T& x)
 void relu2(const aiter_tensor_t& out,   // [..., d]
            const aiter_tensor_t& input) // [..., d]
 {
-    AITER_CHECK(out.is_gpu() && input.is_gpu(),
-                "relu2: input and out must be GPU tensors");
-    AITER_CHECK(out.is_contiguous() && input.is_contiguous(),
-                "relu2: input and out must be contiguous");
-    AITER_CHECK(out.numel() == input.numel(),
-                "relu2: out.numel must match input.numel");
     AITER_CHECK(out.dtype() == input.dtype(),
-                "relu2: out dtype must match input dtype");
+                "relu2: out and input dtype must match");
+    AITER_CHECK(input.is_gpu() && out.is_gpu(),
+                "relu2: out and input must be GPU tensors");
+    AITER_CHECK(input.is_contiguous() && out.is_contiguous(),
+                "relu2: out and input must be contiguous");
     AITER_CHECK(out.device_id == input.device_id,
-                "relu2: input and out must be on the same device");
-    LAUNCH_ACTIVATION_KERNEL_VEC(aiter::relu2_kernel);
+                "relu2: out and input must be on the same device");
+    AITER_CHECK(out.numel() == input.numel(),
+                "relu2: out and input must have the same number of elements");
+    if(input.numel() == 0)
+    {
+        return;
+    }
+    LAUNCH_ACTIVATION_KERNEL_VEC_SAFE(aiter::relu2_kernel);
 }
 
 } // namespace aiter
