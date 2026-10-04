@@ -264,12 +264,12 @@ def flydsl_grouped_gemm_a8w4_masked(
 ):
     """Launches a contiguous-M grouped a8w4 GEMM on the TDM kernel."""
     from .kernels.mxfp4_preshuffle_gfx1250_tdm import launch_gemm_a8w4_tdm
-    from .kernels.mxfp4_preshuffle_gfx1250_tdm_prefill import (
-        launch_gemm_a8w4_tdm_optimized,
-    )
-    from .kernels.mxfp4_preshuffle_gfx1250_tdm_prefill_persistent import (
+    from .kernels.mxfp4_preshuffle_gfx1250_tdm_persistent import (
         launch_gemm_a8w4_tdm_fused_persistent,
         launch_gemm_a8w4_tdm_gemm2_persistent,
+    )
+    from .kernels.mxfp4_preshuffle_gfx1250_tdm_prefill import (
+        launch_gemm_a8w4_tdm_optimized,
     )
 
     if stream is None:
