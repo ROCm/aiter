@@ -93,6 +93,13 @@ def run_torch_g2l_lut(mask, E, nvt, topk):
     return lut, torch.zeros(E, dtype=I32, device=mask.device), nvt * topk
 
 
+def random_expert_mask(n, E):
+    """Build an EP mask with exactly E enabled global experts."""
+    mask = torch.zeros(n, dtype=I32)
+    mask[torch.randperm(n, device="cpu")[:E].to(mask.device)] = 1
+    return mask
+
+
 def run_torch_psum(masked_m, tile_m):
     m = masked_m.to(torch.int64)
     aligned = ((m + tile_m - 1) // tile_m) * tile_m
@@ -129,7 +136,7 @@ def test_g2l_lut(n, E, topk):
     """EP global->local expert LUT build (single-block hierarchical scan)."""
     launch = build_moe_g2l_lut_module(max_experts=512 if n <= 512 else 1024)
     nvt = max(1, n // 4)
-    mask = (torch.rand(n) < 0.6).to(I32)
+    mask = random_expert_mask(n, E)
     nvt_t = torch.tensor([nvt], dtype=I32)
     ref_lut, ref_cnt, ref_nvr = run_torch_g2l_lut(mask, E, nvt, topk)
 
@@ -183,7 +190,7 @@ def test_g2l_lut(n, E, topk):
 def test_g2l_lut_dispatch(n, E, topk):
     """Exercise production variant selection and the >1024 torch fallback."""
     nvt = max(1, n // 4)
-    mask = (torch.rand(n) < 0.6).to(I32)
+    mask = random_expert_mask(n, E)
     nvt_t = torch.tensor([nvt], dtype=I32)
     ref_lut, ref_cnt, ref_nvr = run_torch_g2l_lut(mask, E, nvt, topk)
 
