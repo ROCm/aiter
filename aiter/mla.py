@@ -16,7 +16,10 @@ from aiter import dtypes
 from aiter.jit.core import is_experimental_enabled
 from aiter.jit.utils.asm_guard import require_gfx1250_asm
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
-from aiter.ops.attention import get_mla_decode_fwd_max_splits
+from aiter.ops.attention import (
+    get_mla_decode_fwd_max_splits,
+    mla_ps64_qh128_fp8_asm_fwd,
+)
 
 _FLYDSL_MLA_REDUCE_TARGET_GFX = ("gfx942", "gfx950")
 _FLYDSL_MLA_REDUCE_TARGET_H = 16
@@ -626,6 +629,59 @@ def mla_decode_fwd_ds32(
         final_lse if return_lse else None,
     )
     return o, (final_lse if return_lse else None)
+
+
+@functools.lru_cache(maxsize=16)
+def _mla_ps64_qh128_unit_scale(device):
+    """Reuse a device-side FP32 one when a caller omits Q/KV descales."""
+    return torch.ones(1, dtype=torch.float32, device=device)
+
+
+def mla_decode_fwd_ps64_qh128_asm(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    out: torch.Tensor,
+    q_scale: torch.Tensor | None,
+    kv_scale: torch.Tensor | None,
+    softmax_scale: float,
+    lse: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Write BF16 O and optionally natural-log FP32 LSE, without KV repacking.
+
+    Q is [B,128,576] FP8 E4M3FN, with head stride 576 or 768 bytes. KV is
+    contiguous Gluon-shuffled [pages,1,64,576]. seq_lens is int32 [B];
+    page_table is int32 [B,max_pages] with unit inner stride. Scales are one
+    FP32 scalar each, or None for 1. Used Q/KV/scales must be finite; unused
+    KV/page-table padding may be poisoned. Invalid lengths/page IDs produce
+    O=0 and LSE=-inf. Valid empty sequences have the same output convention.
+
+    No split-K or host metadata synchronization. Warm up on the target device
+    before graph capture. The native launcher uses the current stream.
+    """
+    require_gfx1250_asm("mla_decode_fwd_ps64_qh128_asm")
+    with torch.cuda.device(q.device):
+        q_scale = _mla_ps64_qh128_unit_scale(q.device) if q_scale is None else q_scale
+        kv_scale = (
+            _mla_ps64_qh128_unit_scale(q.device) if kv_scale is None else kv_scale
+        )
+        mla_ps64_qh128_fp8_asm_fwd(
+            q,
+            kv,
+            seq_lens,
+            page_table,
+            out,
+            lse,
+            q_scale,
+            kv_scale,
+            float(softmax_scale),
+        )
+        stream = torch.cuda.current_stream(q.device)
+        for tensor in (q, kv, seq_lens, page_table, out, lse, q_scale, kv_scale):
+            if tensor is not None:
+                tensor.record_stream(stream)
+    return out
 
 
 def mla_decode_fwd(
