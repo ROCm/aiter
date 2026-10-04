@@ -5,9 +5,7 @@ set -euo pipefail
 # Run inside hyg_fyd_e2e from /app/aiter:
 #   ROUNDS=3 bash my_code/moe_perf_compare.sh
 # ROUNDS is applied independently to each entry in SHAPE_SPECS below.
-# Baseline defaults to the fused GEMM1 quant pipeline.  Set
-# AITER_FLYDSL_GEMM1_FUSED_QUANT=0 to compare ROCm/main against the original
-# GEMM1 + standalone quant pipeline.
+# The current branch always uses its fused GEMM1 quant pipeline.
 #
 # /app/aiter is the baseline tree. ROCm/main is kept in a separate host worktree
 # visible through /data, so switching revisions is only a directory change and
@@ -33,7 +31,6 @@ TARGET_BRANCH="${TARGET_BRANCH:-main}"
 TARGET_URL="${TARGET_URL:-git@github.com:ROCm/aiter.git}"
 TARGET_REF="refs/remotes/rocm/$TARGET_BRANCH"
 IGNORE_GPU_BUSY="${IGNORE_GPU_BUSY:-0}"
-AITER_FLYDSL_GEMM1_FUSED_QUANT="${AITER_FLYDSL_GEMM1_FUSED_QUANT:-1}"
 RUN_MODE=both
 
 SHAPE_SPECS=(
@@ -136,13 +133,6 @@ esac
 
 if [[ ! "$ROUNDS" =~ ^[1-9][0-9]*$ ]]; then
   printf 'ROUNDS must be a positive integer, got %q\n' "$ROUNDS" >&2
-  exit 2
-fi
-
-if [[ "$AITER_FLYDSL_GEMM1_FUSED_QUANT" != 0 \
-      && "$AITER_FLYDSL_GEMM1_FUSED_QUANT" != 1 ]]; then
-  printf 'AITER_FLYDSL_GEMM1_FUSED_QUANT must be 0 or 1, got %q\n' \
-    "$AITER_FLYDSL_GEMM1_FUSED_QUANT" >&2
   exit 2
 fi
 
@@ -319,8 +309,7 @@ write_baseline_summary() {
     "$BASELINE_BRANCH_LABEL" \
     "$BASELINE_COMMIT_LABEL" \
     "$BASELINE_REPO" \
-    "$ROUNDS" \
-    "$AITER_FLYDSL_GEMM1_FUSED_QUANT" <<'PY'
+    "$ROUNDS" <<'PY'
 import csv
 import pathlib
 import statistics
@@ -334,7 +323,6 @@ import sys
     commit,
     repo,
     rounds,
-    fused_quant,
 ) = sys.argv[1:]
 
 with open(manifest_name, encoding="utf-8", newline="") as src:
@@ -347,7 +335,7 @@ lines = [
     f"- branch: `{branch}`",
     f"- commit: `{commit}`",
     f"- rounds per shape: `{rounds}`",
-    f"- AITER_FLYDSL_GEMM1_FUSED_QUANT: `{fused_quant}`",
+    "- GEMM1 quant pipeline: `fused-quant`",
     "- MoE e2e timing: `testGraph=False`, `use_cuda_event=False`, "
     "`num_warmup=5`, `num_iters=20`, torch profiler "
     "`get_trace_perf(...).device_time_sum`",
@@ -485,8 +473,6 @@ if ((RUN_BASE)); then
   printf 'Comparison target branch: ROCm/%s\n' "$TARGET_BRANCH"
 fi
 printf 'Rounds: %s\n' "$ROUNDS"
-printf 'Baseline AITER_FLYDSL_GEMM1_FUSED_QUANT: %s\n' \
-  "$AITER_FLYDSL_GEMM1_FUSED_QUANT"
 printf 'Logs: %s\n' "$LOG_ROOT"
 
 if ((RUN_CURRENT)); then
@@ -508,7 +494,6 @@ if ((RUN_CURRENT)); then
         PATH="$FAKE_GIT_DIR:$PATH" \
         CODEX_TEST_COMMIT="$BASELINE_COMMIT_LABEL" \
         CODEX_TEST_BRANCH="$BASELINE_BRANCH_LABEL" \
-        AITER_FLYDSL_GEMM1_FUSED_QUANT="$AITER_FLYDSL_GEMM1_FUSED_QUANT" \
         LOG_DIR="$shape_log_dir" \
         ROUNDS=1 \
           bash ./my_code/run_moe_prefill_switch_ab.sh e2e-const0 \

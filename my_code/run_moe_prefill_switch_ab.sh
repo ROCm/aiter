@@ -154,10 +154,6 @@ if [[ ! "$ROUNDS" =~ ^[1-9][0-9]*$ ]]; then
 fi
 
 CUSTOM_CURRENT_MODE="current-fused"
-case "${AITER_FLYDSL_GEMM1_FUSED_QUANT-1}" in
-  1|true|True|TRUE|yes|Yes|YES|on|On|ON) ;;
-  *) CUSTOM_CURRENT_MODE="current-baseline" ;;
-esac
 
 if [[ ! -f /.dockerenv ]]; then
   printf 'This script must be run inside the ROCm container.\n' >&2
@@ -200,11 +196,6 @@ clear_legacy_optimization_env() {
   local var
   while IFS='=' read -r var _; do
     case "$var" in
-      AITER_FLYDSL_GEMM1_FUSED_QUANT)
-        # This is a public pipeline selector for the current-worktree custom
-        # shape mode, not a legacy tuning override.  Preserve an explicit 0 so
-        # the same sources can reproduce the standalone-quant baseline.
-        ;;
       AITER_FLYDSL_GEMM1_*|AITER_FLYDSL_GEMM2_*|AITER_FLYDSL_MXFP4_CLUSTER_*|AITER_TDM_*)
         unset "$var"
         ;;
@@ -241,12 +232,6 @@ cleanup() {
 print_case_environment() {
   local mode="$1"
   local tested_commit="$2"
-  local fused_quant="${AITER_FLYDSL_GEMM1_FUSED_QUANT-1}"
-  local gemm1_pipeline="fused-quant"
-  case "$fused_quant" in
-    1|true|True|TRUE|yes|Yes|YES|on|On|ON) ;;
-    *) gemm1_pipeline="standalone-quant-baseline" ;;
-  esac
 
   printf 'mode=%s\n' "$mode"
   printf 'git_commit=%s\n' "$tested_commit"
@@ -257,8 +242,7 @@ print_case_environment() {
   printf 'AITER_GROUPED_DEBUG=%s\n' "$AITER_GROUPED_DEBUG"
   printf 'AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE=%s\n' \
     "$AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE"
-  printf 'AITER_FLYDSL_GEMM1_FUSED_QUANT=%s\n' "$fused_quant"
-  printf 'gemm1_quant_pipeline=%s\n' "$gemm1_pipeline"
+  printf 'gemm1_quant_pipeline=fused-quant\n'
   printf 'legacy_gemm_optimization_env=cleared\n'
 }
 
@@ -352,7 +336,7 @@ run_case() {
     baseline)
       tested_commit="$BASELINE_COMMIT"
       ;;
-    optimized|current|current-baseline|current-fused)
+    optimized|current|current-fused)
       tested_commit="$OPTIMIZED_COMMIT"
       ;;
     *)
@@ -360,8 +344,7 @@ run_case() {
       return 2
       ;;
   esac
-  if [[ "$mode" != current && "$mode" != current-baseline \
-        && "$mode" != current-fused ]]; then
+  if [[ "$mode" != current && "$mode" != current-fused ]]; then
     checkout_revision "$tested_commit"
   fi
   tested_commit="$(git_repo rev-parse HEAD)"
@@ -541,7 +524,6 @@ run_named_case() {
 write_summary() {
   "$PYTHON_BIN" - "$RESULTS_TSV" <<'PY' >"$SUMMARY_MD"
 import csv
-import os
 import statistics
 import sys
 from collections import defaultdict
@@ -555,16 +537,7 @@ with path.open(newline="", encoding="utf-8") as handle:
 if not rows:
     raise SystemExit(0)
 
-fused_quant = os.environ.get("AITER_FLYDSL_GEMM1_FUSED_QUANT", "1")
-pipeline = (
-    "fused-quant"
-    if fused_quant.lower() in {"1", "true", "yes", "on"}
-    else "standalone-quant-baseline"
-)
-print(
-    f"AITER_FLYDSL_GEMM1_FUSED_QUANT={fused_quant} "
-    f"(pipeline={pipeline})\n"
-)
+print("GEMM1 quant pipeline: fused-quant\n")
 
 grouped = defaultdict(list)
 data_order = []
@@ -634,7 +607,7 @@ for data in data_order:
             baseline_g1_pipeline = baseline_g2 = baseline_e2e = None
             modes = tuple(
                 mode
-                for mode in ("current", "current-baseline", "current-fused")
+                for mode in ("current", "current-fused")
                 if grouped.get((data, shape, mode))
             )
 

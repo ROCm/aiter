@@ -1092,12 +1092,8 @@ def _grouped_a8w4_tdm_moe(
     disable_gemm1_requant = _as_bool(
         os.environ.get("AITER_FLYDSL_DISABLE_GEMM1_REQUANT"), False
     )
-    _fuse_quant_enabled = (
-        os.environ.get("AITER_FLYDSL_GEMM1_FUSED_QUANT", "1") in _TRUTHY_ENV
-        and not disable_gemm1_requant
-    )
     _fuse_quant = (
-        _fuse_quant_enabled
+        not disable_gemm1_requant
         and (_b1 is None)
         and (_gemm1_a_preshuffle == _gemm2_a_preshuffle)
         and _stage_output_capture is None
