@@ -228,6 +228,16 @@ _PLAIN_K2048_MULTIBLOCK_ROWS = 2
 _PLAIN_K2048_MULTIBLOCK_MIN_WIDTH = 65536
 # Mirrors `kTopkPlainGfx950AnyRowsMaxLen` in csrc/kernels/topk_per_row_kernels.cu.
 _PLAIN_K2048_ONEBLOCK_MAX_WIDTH = 80 * 1024
+# Just past sampled's width door, plain's LDS-tail kernel still serves uniform
+# rows on gfx950 (one row per CU or more), and from 3000 rows on it beat
+# `sampled` at every measured cell of 3000..32768 rows and 131072..131840
+# columns: 0.80x-0.968x across four processes (seed-0 randn, MI355X; 4096 rows
+# of 131072 columns 405 against 420us). The edges are where that stopped:
+# 2816 rows reached 0.998x at 131104 columns, 2048 rows 0.979x at 131072, and
+# 4096 rows 0.978x at 131999 and 0.983x at 132000 columns. Mirrors
+# `kTopkPlainGfx950LdsTailMaxLen` in csrc/kernels/topk_per_row_kernels.cu.
+_PLAIN_K2048_LDS_TAIL_MIN_ROWS = 3000
+_PLAIN_K2048_LDS_TAIL_MAX_WIDTH = 128 * 1024 + 768
 
 # small_k narrows by dropping chunks below the cut, and a chunk is a lane: at k
 # equal to the wave width it drops none. Survivors at 8192 columns run 18 at
@@ -540,6 +550,20 @@ def _plain_k2048_multiblock(rows: int, width: int, ragged: bool) -> bool:
     )
 
 
+def _plain_k2048_lds_tail_takes(rows: int, width: int, k: int) -> bool:
+    """Whether uniform rows past sampled's width door go to plain's LDS tail.
+
+    Only asked where `sampled` could serve, which is what it was measured
+    against; see `_PLAIN_K2048_LDS_TAIL_MIN_ROWS`.
+    """
+    return (
+        k == 2048
+        and get_gfx_runtime() == "gfx950"
+        and rows >= _PLAIN_K2048_LDS_TAIL_MIN_ROWS
+        and _SAMPLED_MIN_WIDTH <= width <= _PLAIN_K2048_LDS_TAIL_MAX_WIDTH
+    )
+
+
 def _sampled_takes(
     rows: int, width: int, k: int, yield_to_plain: bool = False, ragged: bool = False
 ) -> bool:
@@ -698,6 +722,13 @@ def topk_select_backend(
     # the answer does not need, and lose 1.3x to 12x doing so.
     if "argmax" in available:
         return "argmax"
+    if (
+        "sampled" in available
+        and "plain" in available
+        and not ragged
+        and _plain_k2048_lds_tail_takes(rows, width, k)
+    ):
+        return "plain"
     if "sampled" in available and _sampled_takes(
         rows, width, k, yield_to_plain="plain" in available and not ragged, ragged=ragged
     ):

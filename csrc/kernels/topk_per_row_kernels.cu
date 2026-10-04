@@ -7673,7 +7673,11 @@ inline bool topk_oneblock_reg_launch(int ept, int batch_size, hipStream_t stream
 //  - Past 80 * 1024 columns the sampled threshold expects fewer than 64 ranks
 //    (2560 * 2048 / len), and with fewer rows than CUs the generic kernel is
 //    as fast.  With at least one row per CU the LDS tail stays at least as
-//    fast (up to 40% faster) through the widest row measured, 128 * 1024 - 1.
+//    fast (up to 40% faster) up to 128 * 1024 - 1 columns, and 0.54x-0.94x
+//    of the generic kernel from there to 147456 columns at 256..16384 rows.
+//    Wider rows lose at 256 rows (1.25x at 327680), so it stops at
+//    kTopkPlainGfx950LdsTailMaxLen: the widest row where, from 3000 rows on,
+//    it also beat `sampled` by at least 3% (131999 columns: 2.2%).
 //  - Up to 80 * 1024 columns (five batches of its scan) the LDS tail first
 //    runs its sampled stage (lds_tail_sampled_stage); any miss falls back to
 //    the full-row form.
@@ -7681,6 +7685,7 @@ inline bool topk_oneblock_reg_launch(int ept, int batch_size, hipStream_t stream
 // a launch is made at every row count.
 constexpr int64_t kTopkPlainGfx950AnyRowsMinLen = 2 * 1024 + 1;
 constexpr int64_t kTopkPlainGfx950AnyRowsMaxLen = 80 * 1024;
+constexpr int64_t kTopkPlainGfx950LdsTailMaxLen = 128 * 1024 + 768;
 
 template <typename T, typename IdxT, bool WRITE_TOPK_VALUES>
 inline bool dispatch_topk_plain_gfx950(T const* in, int batch_size, int64_t len, IdxT k, T* out,
@@ -7717,7 +7722,7 @@ inline bool dispatch_topk_plain_gfx950(T const* in, int batch_size, int64_t len,
             <<<batch_size, 1024, 0, stream>>>(in, len, k, out, out_idx, select_min);
         return true;
     }
-    if(batch_size >= topk_oneblock_num_cu() && len < 128 * 1024)
+    if(batch_size >= topk_oneblock_num_cu() && len <= kTopkPlainGfx950LdsTailMaxLen)
     {
         radix_topk_one_block_lds_tail_kernel<T, IdxT, 1024, WRITE_TOPK_VALUES>
             <<<batch_size, 1024, 0, stream>>>(in, len, k, out, out_idx, select_min);
