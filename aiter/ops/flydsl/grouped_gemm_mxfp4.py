@@ -161,17 +161,8 @@ def _supports_gfx1250_a_preshuffle_resolved(
     if not common:
         return False
     if stage1_act == 1:
-        return (
-            stage1_quant_out in (0, 1)
-            and K == 7168
-            and N in (4096, 6144)
-        )
-    return (
-        stage1_quant_out == 0
-        and stage1_act == 0
-        and N == 7168
-        and K in (2048, 3072)
-    )
+        return stage1_quant_out in (0, 1) and K == 7168 and N in (4096, 6144)
+    return stage1_quant_out == 0 and stage1_act == 0 and N == 7168 and K in (2048, 3072)
 
 
 def supports_gfx1250_a_preshuffle(
@@ -358,19 +349,24 @@ def flydsl_grouped_gemm_a8w4_masked(
                 cluster_m == 1,
             )
         )
-        use_gemm2_persistent = stage1_act == 0 and K == 2048 and N == 7168 and (
-            (
-                tile_m,
-                tile_n,
-                tile_k,
-                m_warp,
-                n_warp,
-                num_buffers,
-                n_experts,
-            )
-            in (
-                (192, 256, 256, 2, 2, 4, 64),
-                (192, 256, 256, 2, 4, 4, 64),
+        use_gemm2_persistent = (
+            stage1_act == 0
+            and K == 2048
+            and N == 7168
+            and (
+                (
+                    tile_m,
+                    tile_n,
+                    tile_k,
+                    m_warp,
+                    n_warp,
+                    num_buffers,
+                    n_experts,
+                )
+                in (
+                    (192, 256, 256, 2, 2, 4, 64),
+                    (192, 256, 256, 2, 4, 4, 64),
+                )
             )
         )
         if use_fused_persistent:

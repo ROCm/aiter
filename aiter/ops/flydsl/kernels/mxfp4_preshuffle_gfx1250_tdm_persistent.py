@@ -38,6 +38,7 @@ TDM_DESCRIPTOR_VERSION = 1
 
 # Optimized A-preshuffle path for the production gfx1250 MoE tiles.
 
+
 @flyc.jit
 def launch_gemm_a8w4_tdm_fused_persistent(
     arg_c: fx.Tensor,
@@ -128,9 +129,7 @@ def launch_gemm_a8w4_tdm_fused_persistent(
     )
     assert fp4_prefill_schedule or gemm2_schedule
     epilogue_batch_wn = (
-        (4 if gemm2_eight_wave_geometry else 8)
-        if fp4_prefill_schedule
-        else 1
+        (4 if gemm2_eight_wave_geometry else 8) if fp4_prefill_schedule else 1
     )
     relax_cluster_wrap_dscnt = fp4_prefill_schedule
     disable_xdl_arb_stall = (
@@ -146,11 +145,7 @@ def launch_gemm_a8w4_tdm_fused_persistent(
     # Split the output rows evenly.  t256 naturally remains 4+4, while t192
     # becomes 3+3 instead of 4+2 so the first TDM store has more epilogue work
     # available to cover it.
-    output_store_split_wm = (
-        schedule_wmma_m_rep // 2
-        if fp4_prefill_schedule
-        else 3
-    )
+    output_store_split_wm = schedule_wmma_m_rep // 2 if fp4_prefill_schedule else 3
     output_store_wave_split = gemm2_schedule
     assert (tile_n // n_warp // WMMA_N) % epilogue_batch_wn == 0
     cluster_m = (4 if cluster_m < 0 else cluster_m) if fp4_prefill_schedule else 1
@@ -204,9 +199,7 @@ def launch_gemm_a8w4_tdm_fused_persistent(
 
     A_LDS_OUTER = tile_m // 16
     SEGMENT_SPLIT_A = bool(
-        fp4_prefill_schedule
-        and gemm2_eight_wave_geometry
-        and stage1_quant_out == 1
+        fp4_prefill_schedule and gemm2_eight_wave_geometry and stage1_quant_out == 1
     )
     LDS_SEGMENT_BYTES = 64 * 1024
     INPUT_LDS_PAD_INTERVAL = (
@@ -253,9 +246,7 @@ def launch_gemm_a8w4_tdm_fused_persistent(
     # The cyclic layout uses exactly four physical segments.  Other schedules
     # retain their compact 512-byte-aligned linear stage pitch.
     PITCH = (
-        LDS_SEGMENT_BYTES
-        if SEGMENT_SPLIT_A
-        else ((SEGMENT_USED + 511) // 512) * 512
+        LDS_SEGMENT_BYTES if SEGMENT_SPLIT_A else ((SEGMENT_USED + 511) // 512) * 512
     )
 
     out_elem = T.f16 if out_is_f16 else T.bf16
@@ -276,9 +267,7 @@ def launch_gemm_a8w4_tdm_fused_persistent(
         )
     )
     OUTPUT_LDS_OFF = (
-        (3 if SEGMENT_SPLIT_A else 2) * PITCH
-        if PERSISTENT_TASKS > 1
-        else 0
+        (3 if SEGMENT_SPLIT_A else 2) * PITCH if PERSISTENT_TASKS > 1 else 0
     )
     A_CACHE_STAGES = 2 if gemm2_eight_wave_geometry and gemm2_schedule else 0
     A_CACHE_PITCH = ((STAGE_A + 511) // 512) * 512
@@ -446,8 +435,12 @@ def launch_gemm_a8w4_tdm_fused_persistent(
                 group_first_tile = group * group_m_units
                 in_group = swz_id - group * blocks_per_group
                 rem_tiles = m_units - group_first_tile
-                group_tiles = (rem_tiles < group_m_units).select(rem_tiles, group_m_units)
-                m_unit = group_first_tile + (in_group - (in_group // group_tiles) * group_tiles)
+                group_tiles = (rem_tiles < group_m_units).select(
+                    rem_tiles, group_m_units
+                )
+                m_unit = group_first_tile + (
+                    in_group - (in_group // group_tiles) * group_tiles
+                )
                 n_unit = in_group // group_tiles
                 m_tile = m_unit * cluster_m + local_m
                 blk_m = m_tile * tile_m
@@ -481,7 +474,9 @@ def launch_gemm_a8w4_tdm_fused_persistent(
             # Each A multicast row keeps one m_tile and varies n_tile. A 2-D
             # cluster has a separate contiguous N mask for each local M row.
             a_mcast_mask = (
-                ((1 << cluster_n) - 1) << (local_m * cluster_n) if cluster_n > 1 else None
+                ((1 << cluster_n) - 1) << (local_m * cluster_n)
+                if cluster_n > 1
+                else None
             )
             blk_n64 = fx.Int64(blk_n)
             n64 = fx.Int64(i32_n)
@@ -505,7 +500,9 @@ def launch_gemm_a8w4_tdm_fused_persistent(
                 prev_expert = (expert > 0).select(expert - 1, 0)
                 # The fixed-step bisect can return E+1 for capacity-tail tiles.
                 # Those WGs skip compute, but this descriptor setup runs first.
-                prev_expert = (prev_expert < n_experts).select(prev_expert, n_experts - 1)
+                prev_expert = (prev_expert < n_experts).select(
+                    prev_expert, n_experts - 1
+                )
                 first_m = (expert > 0).select(
                     (tile_map[prev_expert] + tile_m - 1) // tile_m, 0
                 )
@@ -515,7 +512,9 @@ def launch_gemm_a8w4_tdm_fused_persistent(
                 for mi in range_constexpr(cluster_m):
                     peer_m = cluster_first_m + mi
                     same_expert = (peer_m >= first_m) & (peer_m < end_m)
-                    column_mask = column_mask | same_expert.select(1 << (mi * cluster_n), 0)
+                    column_mask = column_mask | same_expert.select(
+                        1 << (mi * cluster_n), 0
+                    )
                 # A cluster containing sentinel tiles cannot use a cluster barrier.
                 # Its live rows use the existing independent 1-D A-only protocol.
                 b_mcast_mask = full_cluster.select(column_mask << local_n, 0)
@@ -574,7 +573,9 @@ def launch_gemm_a8w4_tdm_fused_persistent(
                 )
 
             def global_view(base, off, shape, stride):
-                return fx.Tensor(fx.make_view(base + off, fx.make_layout(shape, stride)))
+                return fx.Tensor(
+                    fx.make_view(base + off, fx.make_layout(shape, stride))
+                )
 
             def lds_view(ptr, shape, stride):
                 return fx.Tensor(fx.make_view(ptr, fx.make_layout(shape, stride)))
@@ -709,9 +710,11 @@ def launch_gemm_a8w4_tdm_fused_persistent(
                 lds_row=A_LDS_ROW,
                 k_adv=PACK_TK * 16,
                 wv=data_waves[0],
-                pad=(INPUT_LDS_PAD_INTERVAL, INPUT_LDS_PAD_AMOUNT)
-                if INPUT_LDS_PAD_INTERVAL
-                else None,
+                pad=(
+                    (INPUT_LDS_PAD_INTERVAL, INPUT_LDS_PAD_AMOUNT)
+                    if INPUT_LDS_PAD_INTERVAL
+                    else None
+                ),
                 wg_mask=a_mcast_mask,
                 a_cache_off=0,
                 owner_lds_offsets=(0, A_TAIL_OFF) if SEGMENT_SPLIT_A else None,
@@ -728,9 +731,11 @@ def launch_gemm_a8w4_tdm_fused_persistent(
                 lds_row=B_LDS_ROW,
                 k_adv=PACK_TK * 16,
                 wv=data_waves[1],
-                pad=(INPUT_LDS_PAD_INTERVAL, INPUT_LDS_PAD_AMOUNT)
-                if INPUT_LDS_PAD_INTERVAL
-                else None,
+                pad=(
+                    (INPUT_LDS_PAD_INTERVAL, INPUT_LDS_PAD_AMOUNT)
+                    if INPUT_LDS_PAD_INTERVAL
+                    else None
+                ),
                 wg_mask=b_mcast_mask,
                 cache_modifier=tdm_b_th,
             )
@@ -748,9 +753,9 @@ def launch_gemm_a8w4_tdm_fused_persistent(
                 wv=waves[2],
                 split_inner=AS_SUPERS < len(waves[2]),
                 wg_mask=a_mcast_mask if cluster_m > 1 else None,
-                owner_lds_offsets=(SA_OFF // 4, SA_TAIL_OFF // 4)
-                if SEGMENT_SPLIT_A
-                else None,
+                owner_lds_offsets=(
+                    (SA_OFF // 4, SA_TAIL_OFF // 4) if SEGMENT_SPLIT_A else None
+                ),
             )
             add_tdm_loads(
                 gSB_base,
@@ -773,17 +778,13 @@ def launch_gemm_a8w4_tdm_fused_persistent(
                 next_blk_n64 = fx.Int64(next_blk_n)
                 next_b_outer_row = eb64 * B_BATCH_ROWS + next_blk_n64 // 16
                 next_b_off0 = next_b_outer_row * Kp16
-                next_sb_off0 = (
-                    (next_blk_n64 // 32) * SB_OUTER_STRIDE + sb_batch_off
-                )
+                next_sb_off0 = (next_blk_n64 // 32) * SB_OUTER_STRIDE + sb_batch_off
                 if const_expr(A_CACHE_STAGES > 0):
                     # Cached A0/A1 remove owner-wave TDMs. Split B across the first
                     # resident waves and leave ScaleA/ScaleB on the second slots so
                     # every physical SIMD receives similar next-task prefetch bytes.
                     next_jobs = [
-                        jobs[1]._replace(
-                            g_off=next_b_off0, waves=tuple(range(4))
-                        ),
+                        jobs[1]._replace(g_off=next_b_off0, waves=tuple(range(4))),
                         jobs[2],
                         jobs[3]._replace(g_off=next_sb_off0),
                     ]
@@ -849,7 +850,9 @@ def launch_gemm_a8w4_tdm_fused_persistent(
                     )
                     ext = None if j.oob is None else j.oob - wave_outer_off
                     pad_kw = (
-                        {"pad_interval": j.pad[0], "pad_amount": j.pad[1]} if j.pad else {}
+                        {"pad_interval": j.pad[0], "pad_amount": j.pad[1]}
+                        if j.pad
+                        else {}
                     )
                     atom = fx.rocdl.make_tdm_atom(
                         gt,
@@ -887,11 +890,15 @@ def launch_gemm_a8w4_tdm_fused_persistent(
                         stage_offset = 0
                     else:
                         base = (
-                            cache_i32 if j.on_i32 else cache_pa
-                        ) if use_a_cache else (base_i32 if j.on_i32 else pa)
+                            (cache_i32 if j.on_i32 else cache_pa)
+                            if use_a_cache
+                            else (base_i32 if j.on_i32 else pa)
+                        )
                         lds_off = (
-                            j.a_cache_off // 4 if j.on_i32 else j.a_cache_off
-                        ) if use_a_cache else j.lds_off
+                            (j.a_cache_off // 4 if j.on_i32 else j.a_cache_off)
+                            if use_a_cache
+                            else j.lds_off
+                        )
                         dst_wave_outer_off = wave_outer_off * j.lds_row
                         stage_offset = so4 if j.on_i32 and not use_a_cache else 0
                     dst = lds_view(
@@ -907,7 +914,9 @@ def launch_gemm_a8w4_tdm_fused_persistent(
 
                 if const_expr(my_jobs is not None):
                     for j in my_jobs:
-                        if const_expr(not (reuse_cached_a and j.a_cache_off is not None)):
+                        if const_expr(
+                            not (reuse_cached_a and j.a_cache_off is not None)
+                        ):
                             emit(j)
                 else:
                     for g in range_constexpr(len(job_waves)):
@@ -927,13 +936,7 @@ def launch_gemm_a8w4_tdm_fused_persistent(
                 source_job_waves = sorted({j.waves for j in source_jobs})
                 for g in range_constexpr(len(source_job_waves)):
                     if owns(source_job_waves[g]):
-                        fn(
-                            [
-                                j
-                                for j in source_jobs
-                                if j.waves == source_job_waves[g]
-                            ]
-                        )
+                        fn([j for j in source_jobs if j.waves == source_job_waves[g]])
                 if const_expr(  # noqa: SIM102 - preserve DSL staging
                     4 * num_waves_per_tensor_tdm < num_waves
                 ):
@@ -981,9 +984,7 @@ def launch_gemm_a8w4_tdm_fused_persistent(
                         T.index, owner_stage * fx.Int32(PITCH)
                     )
                     a_owner_off = (
-                        wave_m * fx.Int32(A_TAIL_OFF)
-                        + kgrp * 256
-                        + lane16 * 16
+                        wave_m * fx.Int32(A_TAIL_OFF) + kgrp * 256 + lane16 * 16
                     )
                     sa_owner_off = (
                         fx.Int32(SA_OFF)
@@ -1006,9 +1007,7 @@ def launch_gemm_a8w4_tdm_fused_persistent(
                     use_cache = kt_i32 < fx.Int32(A_CACHE_STAGES)
                     regular_a = fx.index_cast(
                         T.index,
-                        use_cache.select(
-                            cache_a, fx.index_cast(T.i32, regular_a)
-                        ),
+                        use_cache.select(cache_a, fx.index_cast(T.i32, regular_a)),
                     )
                 return LdsAddr(
                     a=regular_a,
@@ -1042,7 +1041,9 @@ def launch_gemm_a8w4_tdm_fused_persistent(
                     )
 
                 if const_expr(a_is_fp4):
-                    return load_half(wn * 2).shuffle(load_half(wn * 2 + 1), list(range(16)))
+                    return load_half(wn * 2).shuffle(
+                        load_half(wn * 2 + 1), list(range(16))
+                    )
                 return load_half(wn)
 
             def load_sa(base, sm, ksl):
@@ -1073,7 +1074,8 @@ def launch_gemm_a8w4_tdm_fused_persistent(
             ]
             c_width = 16 if a_is_fp4 else 8
             c_frags = [
-                fx.make_rmem_tensor(c_width, fx.Float32) for _ in range_constexpr(mma_n_acc)
+                fx.make_rmem_tensor(c_width, fx.Float32)
+                for _ in range_constexpr(mma_n_acc)
             ]
 
             def zero_accumulators():
@@ -1169,8 +1171,12 @@ def launch_gemm_a8w4_tdm_fused_persistent(
 
             def load_lds_data(slot, lds_addr, ksl):
                 """Load one k128 of A, B, ScaleA, and ScaleB from LDS."""
-                sb_v = [load_sb(lds_addr.sb, sn, ksl) for sn in range_constexpr(sb_pairs)]
-                sa_v = [load_sa(lds_addr.sa, sm, ksl) for sm in range_constexpr(sa_pairs)]
+                sb_v = [
+                    load_sb(lds_addr.sb, sn, ksl) for sn in range_constexpr(sb_pairs)
+                ]
+                sa_v = [
+                    load_sa(lds_addr.sa, sm, ksl) for sm in range_constexpr(sa_pairs)
+                ]
                 slot.sb.store(Vec.from_elements(sb_v + sb_v[: SB_WIDTH - sb_pairs]))
                 slot.sa.store(Vec.from_elements(sa_v + sa_v[: SA_WIDTH - sa_pairs]))
                 for wn in range_constexpr(mma_n_rep):
@@ -1268,7 +1274,9 @@ def launch_gemm_a8w4_tdm_fused_persistent(
                     # turning the complete A/B/scale prefetch into long LDS bursts.
                     mma_group = min(MMA_GROUP, mma_total) if KWS > 1 else 1
                     schedule_slots = mma_total // mma_group
-                    future_schedule = spread(STATE_DS if has_next else 0, schedule_slots)
+                    future_schedule = spread(
+                        STATE_DS if has_next else 0, schedule_slots
+                    )
                     # Spread the tail issue's TDMs over the WMMA groups: one burst
                     # would block the MFMA pipe for its whole descriptor setup.
                     tdm_schedule = spread(
@@ -1312,7 +1320,9 @@ def launch_gemm_a8w4_tdm_fused_persistent(
                         num_outstanding_tdm=(
                             next_stage_wait if const_expr(carries) else None
                         ),
-                        issue_fn=do_issue if const_expr(tail_issue and is_last) else None,
+                        issue_fn=(
+                            do_issue if const_expr(tail_issue and is_last) else None
+                        ),
                     )
                     # One region per k128: sched_group_barrier only partitions
                     # within a region, and only sched_barrier delimits one.
@@ -1353,7 +1363,9 @@ def launch_gemm_a8w4_tdm_fused_persistent(
                         for kt in range(n_steady):
                             s = kt % num_buffers
                             buf = ptr_to_idx(buf_ptr(s))
-                            tdm_ops.tensor_wait(TDM_PER * (num_buffers - 1 - next_stage_on))
+                            tdm_ops.tensor_wait(
+                                TDM_PER * (num_buffers - 1 - next_stage_on)
+                            )
                             workgroup_barrier()
                             next_stage_buf = (
                                 ptr_to_idx(buf_ptr((kt + 1) % num_buffers))
@@ -1412,9 +1424,7 @@ def launch_gemm_a8w4_tdm_fused_persistent(
                         if tile_idx > 0:
                             # Previous task issued I0,I1 before O0,O1.  Waiting
                             # to two leaves only the old output stores outstanding.
-                            tdm_ops.tensor_wait(
-                                1 if gemm2_eight_wave_geometry else 2
-                            )
+                            tdm_ops.tensor_wait(1 if gemm2_eight_wave_geometry else 2)
                             workgroup_barrier()
                             prime_stage(0)
                             # Consume tile 0 while the previous output drains.
@@ -1446,8 +1456,7 @@ def launch_gemm_a8w4_tdm_fused_persistent(
                                     i,
                                     i,
                                     cache_a=(
-                                        gemm2_eight_wave_geometry
-                                        and i < A_CACHE_STAGES
+                                        gemm2_eight_wave_geometry and i < A_CACHE_STAGES
                                     ),
                                 )
                             pipeline_fence(outstanding=TDM_PER * (PRE - 1))
@@ -1632,10 +1641,9 @@ def launch_gemm_a8w4_tdm_fused_persistent(
                     """Store this wave's FP4 payload in GEMM2 A-preshuffle layout."""
                     payload_bytes_per_row = fx.Int64(i32_n) // 4
                     global_row_tile_stride = payload_bytes_per_row * 16
-                    global_off = (
-                        (fx.Int64(blk_m) // 16) * global_row_tile_stride
-                        + (fx.Int64(blk_n) // 64) * Q_MX_BLOCK_BYTES
-                    )
+                    global_off = (fx.Int64(blk_m) // 16) * global_row_tile_stride + (
+                        fx.Int64(blk_n) // 64
+                    ) * Q_MX_BLOCK_BYTES
                     local_m16_base = wave_m * quant_wmma_rep
                     local_mx = wave_n
                     global_off = (
@@ -1673,9 +1681,7 @@ def launch_gemm_a8w4_tdm_fused_persistent(
                         address_space=fx.AddressSpace.Global,
                         alignment=1,
                     )
-                    scale_ptr = fx.recast_iter(
-                        i32_ptr_g, fx.get_iter(arg_quant_scale)
-                    )
+                    scale_ptr = fx.recast_iter(i32_ptr_g, fx.get_iter(arg_quant_scale))
                     is_kgrp0 = fx.Int32(kgrp) == fx.Int32(0)
                     q_dst_scale_dwpr = i32_n // 256
 
@@ -1706,9 +1712,7 @@ def launch_gemm_a8w4_tdm_fused_persistent(
                             src_scale = lds_view(
                                 fx.recast_iter(fx.Int8, output_base_ptr)
                                 + Q_SCALE_LDS_OFF
-                                + fx.index_cast(
-                                    T.index, wave_m * Q_SCALE_TILE_BYTES
-                                ),
+                                + fx.index_cast(T.index, wave_m * Q_SCALE_TILE_BYTES),
                                 (quant_wmma_rep, Q_SCALE_ROW_BYTES),
                                 (Q_SCALE_ROW_BYTES, 1),
                             )
@@ -1723,9 +1727,7 @@ def launch_gemm_a8w4_tdm_fused_persistent(
                             for wn in range_constexpr(wmma_n_rep):
                                 acc = Vec(accs[wm * wmma_n_rep + wn])
                                 for pair in range_constexpr(4):
-                                    row_pairs.append(
-                                        (acc[2 * pair], acc[2 * pair + 1])
-                                    )
+                                    row_pairs.append((acc[2 * pair], acc[2 * pair + 1]))
                             row_vals = batched_silu_swiglu(
                                 row_pairs,
                                 swiglu=False,
@@ -1733,9 +1735,9 @@ def launch_gemm_a8w4_tdm_fused_persistent(
                                 neg_limit_f32=neg_limit,
                                 range_constexpr=range_constexpr,
                             )
-                            all_vals_bf16 = Vec.from_elements(
-                                row_vals, fx.Float32
-                            ).to(fx.BFloat16)
+                            all_vals_bf16 = Vec.from_elements(row_vals, fx.Float32).to(
+                                fx.BFloat16
+                            )
                             scale_vals = all_vals_bf16.to(fx.Float32)
                             scale_f32, e8m0_byte = emit_amax_e8m0_native_scale(
                                 [
@@ -1746,9 +1748,8 @@ def launch_gemm_a8w4_tdm_fused_persistent(
                                 dtype=MxDtype.FP4_E2M1,
                             )
                             payload_byte = (
-                                (wave * quant_wmma_rep + wm) * Q_MX_BLOCK_BYTES
-                                + lane16 * 16
-                            )
+                                wave * quant_wmma_rep + wm
+                            ) * Q_MX_BLOCK_BYTES + lane16 * 16
                             for half in range_constexpr(WN_PER_MX_BLOCK // 2):
                                 sub_wn0 = half * 2
                                 sub_wn1 = sub_wn0 + 1
@@ -1777,9 +1778,10 @@ def launch_gemm_a8w4_tdm_fused_persistent(
                                     packed_i32 >> fx.Int32(16),
                                 )
                             if row_rel < mn_oob and is_kgrp0:
-                                scale_row_byte = Q_SCALE_LDS_OFF + (
-                                    (wave_m * quant_wmma_rep + wm) * 16 + lane16
-                                ) * 4
+                                scale_row_byte = (
+                                    Q_SCALE_LDS_OFF
+                                    + ((wave_m * quant_wmma_rep + wm) * 16 + lane16) * 4
+                                )
                                 lds_store_b8(
                                     stC_idx,
                                     scale_row_byte + wave_n,
@@ -1815,7 +1817,10 @@ def launch_gemm_a8w4_tdm_fused_persistent(
                                 for i in range_constexpr(epilogue_batch_wn):
                                     for p in range_constexpr(4):
                                         pairs.append(
-                                            (batch_accs[i][2 * p], batch_accs[i][2 * p + 1])
+                                            (
+                                                batch_accs[i][2 * p],
+                                                batch_accs[i][2 * p + 1],
+                                            )
                                         )
                                 act_vals = batched_silu_swiglu(
                                     pairs,
@@ -1878,16 +1883,12 @@ def launch_gemm_a8w4_tdm_fused_persistent(
                             if const_expr(gemm2_eight_wave_geometry):
                                 tdm_ops.tensor_wait(2)
                 if const_expr(not (stage1_quant_out and stage1_act)):
-                    issue_output_slice(
-                        OUTPUT_SPLIT_WM, wmma_m_rep - OUTPUT_SPLIT_WM
-                    )
+                    issue_output_slice(OUTPUT_SPLIT_WM, wmma_m_rep - OUTPUT_SPLIT_WM)
 
         if const_expr(PERSISTENT_TASKS == 1):
             run_task(fx.Int32(0))
         else:
-            for tile_idx in range(
-                fx.Int32(0), fx.Int32(PERSISTENT_TASKS), fx.Int32(1)
-            ):
+            for tile_idx in range(fx.Int32(0), fx.Int32(PERSISTENT_TASKS), fx.Int32(1)):
                 run_task(tile_idx)
         tdm_ops.tensor_wait(0)
 
@@ -1937,6 +1938,7 @@ launch_gemm_a8w4_tdm_fused_persistent.compile_hints["llvm_options"] = {
 
 
 # Persistent GEMM2 specialization.
+
 
 @flyc.jit
 def launch_gemm_a8w4_tdm_gemm2_persistent(
@@ -2040,11 +2042,7 @@ def launch_gemm_a8w4_tdm_gemm2_persistent(
     # Split the output rows evenly.  t256 naturally remains 4+4, while t192
     # becomes 3+3 instead of 4+2 so the first TDM store has more epilogue work
     # available to cover it.
-    output_store_split_wm = (
-        schedule_wmma_m_rep // 2
-        if fp4_prefill_schedule
-        else 3
-    )
+    output_store_split_wm = schedule_wmma_m_rep // 2 if fp4_prefill_schedule else 3
     output_store_wave_split = gemm2_schedule
     assert (tile_n // n_warp // WMMA_N) % epilogue_batch_wn == 0
     cluster_m = (4 if cluster_m < 0 else cluster_m) if fp4_prefill_schedule else 1
@@ -2120,9 +2118,7 @@ def launch_gemm_a8w4_tdm_gemm2_persistent(
     # to break the ds_store bank conflict; reserve it so the padded tile fits.
     C_STORE_B = ((tile_m * (tile_n + 16) * 2 + 127) // 128) * 128
     PERSISTENT_TASKS = (
-        7
-        if gemm2_schedule and K == 2048 and tile_m == 192 and n_experts == 64
-        else 1
+        7 if gemm2_schedule and K == 2048 and tile_m == 192 and n_experts == 64 else 1
     )
     OUTPUT_LDS_OFF = 2 * PITCH if PERSISTENT_TASKS > 1 else 0
     A_CACHE_STAGES = 2 if gemm2_eight_wave_geometry else 0
@@ -2281,8 +2277,12 @@ def launch_gemm_a8w4_tdm_gemm2_persistent(
                 group_first_tile = group * group_m_units
                 in_group = swz_id - group * blocks_per_group
                 rem_tiles = m_units - group_first_tile
-                group_tiles = (rem_tiles < group_m_units).select(rem_tiles, group_m_units)
-                m_unit = group_first_tile + (in_group - (in_group // group_tiles) * group_tiles)
+                group_tiles = (rem_tiles < group_m_units).select(
+                    rem_tiles, group_m_units
+                )
+                m_unit = group_first_tile + (
+                    in_group - (in_group // group_tiles) * group_tiles
+                )
                 n_unit = in_group // group_tiles
                 m_tile = m_unit * cluster_m + local_m
                 blk_m = m_tile * tile_m
@@ -2316,7 +2316,9 @@ def launch_gemm_a8w4_tdm_gemm2_persistent(
             # Each A multicast row keeps one m_tile and varies n_tile. A 2-D
             # cluster has a separate contiguous N mask for each local M row.
             a_mcast_mask = (
-                ((1 << cluster_n) - 1) << (local_m * cluster_n) if cluster_n > 1 else None
+                ((1 << cluster_n) - 1) << (local_m * cluster_n)
+                if cluster_n > 1
+                else None
             )
             blk_n64 = fx.Int64(blk_n)
             n64 = fx.Int64(i32_n)
@@ -2340,7 +2342,9 @@ def launch_gemm_a8w4_tdm_gemm2_persistent(
                 prev_expert = (expert > 0).select(expert - 1, 0)
                 # The fixed-step bisect can return E+1 for capacity-tail tiles.
                 # Those WGs skip compute, but this descriptor setup runs first.
-                prev_expert = (prev_expert < n_experts).select(prev_expert, n_experts - 1)
+                prev_expert = (prev_expert < n_experts).select(
+                    prev_expert, n_experts - 1
+                )
                 first_m = (expert > 0).select(
                     (tile_map[prev_expert] + tile_m - 1) // tile_m, 0
                 )
@@ -2350,7 +2354,9 @@ def launch_gemm_a8w4_tdm_gemm2_persistent(
                 for mi in range_constexpr(cluster_m):
                     peer_m = cluster_first_m + mi
                     same_expert = (peer_m >= first_m) & (peer_m < end_m)
-                    column_mask = column_mask | same_expert.select(1 << (mi * cluster_n), 0)
+                    column_mask = column_mask | same_expert.select(
+                        1 << (mi * cluster_n), 0
+                    )
                 # A cluster containing sentinel tiles cannot use a cluster barrier.
                 # Its live rows use the existing independent 1-D A-only protocol.
                 b_mcast_mask = full_cluster.select(column_mask << local_n, 0)
@@ -2409,7 +2415,9 @@ def launch_gemm_a8w4_tdm_gemm2_persistent(
                 )
 
             def global_view(base, off, shape, stride):
-                return fx.Tensor(fx.make_view(base + off, fx.make_layout(shape, stride)))
+                return fx.Tensor(
+                    fx.make_view(base + off, fx.make_layout(shape, stride))
+                )
 
             def lds_view(ptr, shape, stride):
                 return fx.Tensor(fx.make_view(ptr, fx.make_layout(shape, stride)))
@@ -2575,17 +2583,13 @@ def launch_gemm_a8w4_tdm_gemm2_persistent(
                 next_blk_n64 = fx.Int64(next_blk_n)
                 next_b_outer_row = eb64 * B_BATCH_ROWS + next_blk_n64 // 16
                 next_b_off0 = next_b_outer_row * Kp16
-                next_sb_off0 = (
-                    (next_blk_n64 // 32) * SB_OUTER_STRIDE + sb_batch_off
-                )
+                next_sb_off0 = (next_blk_n64 // 32) * SB_OUTER_STRIDE + sb_batch_off
                 if const_expr(A_CACHE_STAGES > 0):
                     # Cached A0/A1 remove owner-wave TDMs. Split B across the first
                     # resident waves and leave ScaleA/ScaleB on the second slots so
                     # every physical SIMD receives similar next-task prefetch bytes.
                     next_jobs = [
-                        jobs[1]._replace(
-                            g_off=next_b_off0, waves=tuple(range(4))
-                        ),
+                        jobs[1]._replace(g_off=next_b_off0, waves=tuple(range(4))),
                         jobs[2],
                         jobs[3]._replace(g_off=next_sb_off0),
                     ]
@@ -2651,7 +2655,9 @@ def launch_gemm_a8w4_tdm_gemm2_persistent(
                     )
                     ext = None if j.oob is None else j.oob - wave_outer_off
                     pad_kw = (
-                        {"pad_interval": j.pad[0], "pad_amount": j.pad[1]} if j.pad else {}
+                        {"pad_interval": j.pad[0], "pad_amount": j.pad[1]}
+                        if j.pad
+                        else {}
                     )
                     atom = fx.rocdl.make_tdm_atom(
                         gt,
@@ -2672,11 +2678,15 @@ def launch_gemm_a8w4_tdm_gemm2_persistent(
                         )
                     use_a_cache = cache_a and j.a_cache_off is not None
                     base = (
-                        cache_i32 if j.on_i32 else cache_pa
-                    ) if use_a_cache else (base_i32 if j.on_i32 else pa)
+                        (cache_i32 if j.on_i32 else cache_pa)
+                        if use_a_cache
+                        else (base_i32 if j.on_i32 else pa)
+                    )
                     lds_off = (
-                        j.a_cache_off // 4 if j.on_i32 else j.a_cache_off
-                    ) if use_a_cache else j.lds_off
+                        (j.a_cache_off // 4 if j.on_i32 else j.a_cache_off)
+                        if use_a_cache
+                        else j.lds_off
+                    )
                     dst = lds_view(
                         base
                         + lds_off
@@ -2690,7 +2700,9 @@ def launch_gemm_a8w4_tdm_gemm2_persistent(
 
                 if const_expr(my_jobs is not None):
                     for j in my_jobs:
-                        if const_expr(not (reuse_cached_a and j.a_cache_off is not None)):
+                        if const_expr(
+                            not (reuse_cached_a and j.a_cache_off is not None)
+                        ):
                             emit(j)
                 else:
                     for g in range_constexpr(len(job_waves)):
@@ -2710,13 +2722,7 @@ def launch_gemm_a8w4_tdm_gemm2_persistent(
                 source_job_waves = sorted({j.waves for j in source_jobs})
                 for g in range_constexpr(len(source_job_waves)):
                     if owns(source_job_waves[g]):
-                        fn(
-                            [
-                                j
-                                for j in source_jobs
-                                if j.waves == source_job_waves[g]
-                            ]
-                        )
+                        fn([j for j in source_jobs if j.waves == source_job_waves[g]])
                 if const_expr(  # noqa: SIM102 - preserve DSL staging
                     4 * num_waves_per_tensor_tdm < num_waves
                 ):
@@ -2733,7 +2739,9 @@ def launch_gemm_a8w4_tdm_gemm2_persistent(
             # Split each region's offset into a lane-varying base, which keepalive
             # can pin, and a compile-time part that folds into ds_load's offset:.
             lds_a_lane_off = (wmb // 16) * A_LDS_ROW + kgrp * 256 + lane16 * 16
-            lds_b_lane_off = STAGE_A + (wnb // 16) * B_LDS_ROW + kgrp * 256 + lane16 * 16
+            lds_b_lane_off = (
+                STAGE_A + (wnb // 16) * B_LDS_ROW + kgrp * 256 + lane16 * 16
+            )
             assert wmma_m_rep == 1 or wmma_m_rep % 2 == 0
             lds_sa_lane_rel = ((wmb // 32) * AS_INNER + lane) * 4
             lds_sa_lane_off = SA_OFF + lds_sa_lane_rel
@@ -2771,9 +2779,7 @@ def launch_gemm_a8w4_tdm_gemm2_persistent(
                     use_cache = kt_i32 < fx.Int32(A_CACHE_STAGES)
                     regular_a = fx.index_cast(
                         T.index,
-                        use_cache.select(
-                            cache_a, fx.index_cast(T.i32, regular_a)
-                        ),
+                        use_cache.select(cache_a, fx.index_cast(T.i32, regular_a)),
                     )
                 return LdsAddr(
                     a=regular_a,
@@ -2807,7 +2813,9 @@ def launch_gemm_a8w4_tdm_gemm2_persistent(
                     )
 
                 if const_expr(a_is_fp4):
-                    return load_half(wn * 2).shuffle(load_half(wn * 2 + 1), list(range(16)))
+                    return load_half(wn * 2).shuffle(
+                        load_half(wn * 2 + 1), list(range(16))
+                    )
                 return load_half(wn)
 
             def load_sa(base, sm, ksl):
@@ -2838,7 +2846,8 @@ def launch_gemm_a8w4_tdm_gemm2_persistent(
             ]
             c_width = 16 if a_is_fp4 else 8
             c_frags = [
-                fx.make_rmem_tensor(c_width, fx.Float32) for _ in range_constexpr(mma_n_acc)
+                fx.make_rmem_tensor(c_width, fx.Float32)
+                for _ in range_constexpr(mma_n_acc)
             ]
 
             def zero_accumulators():
@@ -2934,8 +2943,12 @@ def launch_gemm_a8w4_tdm_gemm2_persistent(
 
             def load_lds_data(slot, lds_addr, ksl):
                 """Load one k128 of A, B, ScaleA, and ScaleB from LDS."""
-                sb_v = [load_sb(lds_addr.sb, sn, ksl) for sn in range_constexpr(sb_pairs)]
-                sa_v = [load_sa(lds_addr.sa, sm, ksl) for sm in range_constexpr(sa_pairs)]
+                sb_v = [
+                    load_sb(lds_addr.sb, sn, ksl) for sn in range_constexpr(sb_pairs)
+                ]
+                sa_v = [
+                    load_sa(lds_addr.sa, sm, ksl) for sm in range_constexpr(sa_pairs)
+                ]
                 slot.sb.store(Vec.from_elements(sb_v + sb_v[: SB_WIDTH - sb_pairs]))
                 slot.sa.store(Vec.from_elements(sa_v + sa_v[: SA_WIDTH - sa_pairs]))
                 for wn in range_constexpr(mma_n_rep):
@@ -3033,7 +3046,9 @@ def launch_gemm_a8w4_tdm_gemm2_persistent(
                     # turning the complete A/B/scale prefetch into long LDS bursts.
                     mma_group = min(MMA_GROUP, mma_total) if KWS > 1 else 1
                     schedule_slots = mma_total // mma_group
-                    future_schedule = spread(STATE_DS if has_next else 0, schedule_slots)
+                    future_schedule = spread(
+                        STATE_DS if has_next else 0, schedule_slots
+                    )
                     # Spread the tail issue's TDMs over the WMMA groups: one burst
                     # would block the MFMA pipe for its whole descriptor setup.
                     tdm_schedule = spread(
@@ -3077,7 +3092,9 @@ def launch_gemm_a8w4_tdm_gemm2_persistent(
                         num_outstanding_tdm=(
                             next_stage_wait if const_expr(carries) else None
                         ),
-                        issue_fn=do_issue if const_expr(tail_issue and is_last) else None,
+                        issue_fn=(
+                            do_issue if const_expr(tail_issue and is_last) else None
+                        ),
                     )
                     # One region per k128: sched_group_barrier only partitions
                     # within a region, and only sched_barrier delimits one.
@@ -3118,7 +3135,9 @@ def launch_gemm_a8w4_tdm_gemm2_persistent(
                         for kt in range(n_steady):
                             s = kt % num_buffers
                             buf = ptr_to_idx(buf_ptr(s))
-                            tdm_ops.tensor_wait(TDM_PER * (num_buffers - 1 - next_stage_on))
+                            tdm_ops.tensor_wait(
+                                TDM_PER * (num_buffers - 1 - next_stage_on)
+                            )
                             workgroup_barrier()
                             next_stage_buf = (
                                 ptr_to_idx(buf_ptr((kt + 1) % num_buffers))
@@ -3177,9 +3196,7 @@ def launch_gemm_a8w4_tdm_gemm2_persistent(
                         if tile_idx > 0:
                             # Previous task issued I0,I1 before O0,O1.  Waiting
                             # to two leaves only the old output stores outstanding.
-                            tdm_ops.tensor_wait(
-                                1 if gemm2_eight_wave_geometry else 2
-                            )
+                            tdm_ops.tensor_wait(1 if gemm2_eight_wave_geometry else 2)
                             workgroup_barrier()
                             prime_stage(0)
                             # Consume tile 0 while the previous output drains.
@@ -3211,8 +3228,7 @@ def launch_gemm_a8w4_tdm_gemm2_persistent(
                                     i,
                                     i,
                                     cache_a=(
-                                        gemm2_eight_wave_geometry
-                                        and i < A_CACHE_STAGES
+                                        gemm2_eight_wave_geometry and i < A_CACHE_STAGES
                                     ),
                                 )
                             pipeline_fence(outstanding=TDM_PER * (PRE - 1))
@@ -3455,7 +3471,10 @@ def launch_gemm_a8w4_tdm_gemm2_persistent(
                                         fx.Float32,
                                     ).ir_value()
                                     packed_v2i32 = emit_cvt_scalef32_pk8_fp8_f32(
-                                        src_f32, scale_f32, v2i32_ty=v2i32_ty, rocdl=rocdl
+                                        src_f32,
+                                        scale_f32,
+                                        v2i32_ty=v2i32_ty,
+                                        rocdl=rocdl,
                                     )
                                     for sub in range_constexpr(2):
                                         sub_wn = half * 2 + sub
@@ -3482,7 +3501,9 @@ def launch_gemm_a8w4_tdm_gemm2_persistent(
                                         * 16
                                         + scale_lane
                                     ) * 4 + byte_in_dw
-                                    fx.ptr_store(e8m0_bytes[mx_blk], scale_ptr + dst_byte)
+                                    fx.ptr_store(
+                                        e8m0_bytes[mx_blk], scale_ptr + dst_byte
+                                    )
                 else:
                     # bf16/f16 activation (or passthrough) -> stage to LDS.
                     if const_expr(has_bias):
@@ -3509,7 +3530,10 @@ def launch_gemm_a8w4_tdm_gemm2_persistent(
                                 for i in range_constexpr(epilogue_batch_wn):
                                     for p in range_constexpr(4):
                                         pairs.append(
-                                            (batch_accs[i][2 * p], batch_accs[i][2 * p + 1])
+                                            (
+                                                batch_accs[i][2 * p],
+                                                batch_accs[i][2 * p + 1],
+                                            )
                                         )
                                 act_vals = batched_silu_swiglu(
                                     pairs,
@@ -3576,9 +3600,7 @@ def launch_gemm_a8w4_tdm_gemm2_persistent(
         if const_expr(PERSISTENT_TASKS == 1):
             run_task(fx.Int32(0))
         else:
-            for tile_idx in range(
-                fx.Int32(0), fx.Int32(PERSISTENT_TASKS), fx.Int32(1)
-            ):
+            for tile_idx in range(fx.Int32(0), fx.Int32(PERSISTENT_TASKS), fx.Int32(1)):
                 run_task(tile_idx)
         tdm_ops.tensor_wait(0)
 

@@ -111,10 +111,7 @@ def launch_gemm_a8w4_tdm_optimized(
         )
     )
     fp4_prefill_schedule = (
-        common_schedule
-        and stage1_quant_out in (0, 1)
-        and K == 7168
-        and stage1_act == 1
+        common_schedule and stage1_quant_out in (0, 1) and K == 7168 and stage1_act == 1
     )
     gemm2_schedule = all(
         (
@@ -125,7 +122,9 @@ def launch_gemm_a8w4_tdm_optimized(
         )
     )
     assert fp4_prefill_schedule or gemm2_schedule
-    epilogue_batch_wn = min(8, tile_n // n_warp // WMMA_N) if fp4_prefill_schedule else 1
+    epilogue_batch_wn = (
+        min(8, tile_n // n_warp // WMMA_N) if fp4_prefill_schedule else 1
+    )
     relax_cluster_wrap_dscnt = fp4_prefill_schedule
     disable_xdl_arb_stall = 0 if fp4_prefill_schedule and n_warp == 2 else -1
     wmma_reuse = fp4_prefill_schedule
@@ -271,8 +270,7 @@ def launch_gemm_a8w4_tdm_optimized(
         and stage1_quant_out == 0
     ):
         _kname = (
-            f"a8w4_tdm_fp4_t256x256x256_w2x2_b4_K{K}_e{n_experts}"
-            "_cn4_prefetch_apre"
+            f"a8w4_tdm_fp4_t256x256x256_w2x2_b4_K{K}_e{n_experts}" "_cn4_prefetch_apre"
         )
 
     @flyc.kernel(name=_kname, known_block_size=[block, 1, 1])
@@ -1317,10 +1315,9 @@ def launch_gemm_a8w4_tdm_optimized(
                 """Store FP4 payload in GEMM2's A-preshuffle layout."""
                 payload_bytes_per_row = fx.Int64(i32_n) // 4
                 global_row_tile_stride = payload_bytes_per_row * 16
-                global_off = (
-                    (fx.Int64(blk_m) // 16) * global_row_tile_stride
-                    + (fx.Int64(blk_n) // 64) * Q_MX_BLOCK_BYTES
-                )
+                global_off = (fx.Int64(blk_m) // 16) * global_row_tile_stride + (
+                    fx.Int64(blk_n) // 64
+                ) * Q_MX_BLOCK_BYTES
                 c_iter = fx.recast_iter(fx.Int8, fx.get_iter(arg_c))
                 if const_expr(fused_quant_w2x4):
                     local_m16_base = wave_m * quant_wmma_rep
@@ -1400,10 +1397,10 @@ def launch_gemm_a8w4_tdm_optimized(
                         fx.Int64(q_dst_scale_dwpr) * Q_SCALE_TILE_BYTES
                     )
                     global_scale_off = (
-                        (fx.Int64(blk_m) // QUANT_ROWS_PER_TILE)
-                        * global_scale_tile_stride
-                        + (fx.Int64(blk_n) // 256) * Q_SCALE_TILE_BYTES
-                    )
+                        fx.Int64(blk_m) // QUANT_ROWS_PER_TILE
+                    ) * global_scale_tile_stride + (
+                        fx.Int64(blk_n) // 256
+                    ) * Q_SCALE_TILE_BYTES
                     if const_expr(fused_quant_w2x4):
                         if wave_n == 0:
                             global_scale_off = (
@@ -1426,9 +1423,7 @@ def launch_gemm_a8w4_tdm_optimized(
                             src_scale = lds_view(
                                 fx.recast_iter(fx.Int8, base_ptr)
                                 + Q_SCALE_LDS_OFF
-                                + fx.index_cast(
-                                    T.index, wave_m * Q_SCALE_TILE_BYTES
-                                ),
+                                + fx.index_cast(T.index, wave_m * Q_SCALE_TILE_BYTES),
                                 (quant_wmma_rep, Q_SCALE_ROW_BYTES),
                                 (Q_SCALE_ROW_BYTES, 1),
                             )
@@ -1496,16 +1491,14 @@ def launch_gemm_a8w4_tdm_optimized(
 
                             # The old two-kernel path materializes BF16 before
                             # quantization. Preserve that rounding point exactly.
-                            all_vals_bf16 = Vec.from_elements(
-                                all_vals, fx.Float32
-                            ).to(fx.BFloat16)
+                            all_vals_bf16 = Vec.from_elements(all_vals, fx.Float32).to(
+                                fx.BFloat16
+                            )
                             scale_vals = all_vals_bf16.to(fx.Float32)
                             scale_f32, e8m0_byte = emit_amax_e8m0_native_scale(
                                 [
                                     scale_vals[i]
-                                    for i in range_constexpr(
-                                        WN_PER_MX_BLOCK * 4
-                                    )
+                                    for i in range_constexpr(WN_PER_MX_BLOCK * 4)
                                 ],
                                 wave_size=WAVE,
                                 dtype=MxDtype.FP4_E2M1,
@@ -1557,9 +1550,10 @@ def launch_gemm_a8w4_tdm_optimized(
 
                         # Preshuffled e8m0 scale: one branch per wm (not per mx_blk).
                         if row_rel < mn_oob and is_kgrp0:
-                            scale_row_byte = Q_SCALE_LDS_OFF + (
-                                (wave_m * quant_wmma_rep + wm) * 16 + lane16
-                            ) * 4
+                            scale_row_byte = (
+                                Q_SCALE_LDS_OFF
+                                + ((wave_m * quant_wmma_rep + wm) * 16 + lane16) * 4
+                            )
                             if const_expr(N_MX_BLKS == 2):
                                 packed_scale = fx.Int32(
                                     arith.extui(T.i32, _raw(e8m0_bytes[0]))

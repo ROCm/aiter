@@ -3422,9 +3422,7 @@ def _emit_quant_block_loop_apre(c: SimpleNamespace) -> None:
                 # multiplies by the reciprocal 2^(127-e8m0) then converts.
                 if const_expr(c.is_fp8):
                     if const_expr(c.use_native):
-                        block_scale_f32 = (
-                            fx.Int32(e8m0_scale) << c.c23_i32
-                        ).bitcast(
+                        block_scale_f32 = (fx.Int32(e8m0_scale) << c.c23_i32).bitcast(
                             fx.Float32
                         )
                         packed = rocdl.cvt_scalef32_pk_fp8_f32(
@@ -3448,9 +3446,7 @@ def _emit_quant_block_loop_apre(c: SimpleNamespace) -> None:
                     payload_val = arith.trunci(T.i16, fx.Int32(packed))  # 2 fp8 B
                 else:
                     if const_expr(c.use_native):
-                        block_scale_f32 = (
-                            fx.Int32(e8m0_scale) << c.c23_i32
-                        ).bitcast(
+                        block_scale_f32 = (fx.Int32(e8m0_scale) << c.c23_i32).bitcast(
                             fx.Float32
                         )
                         packed = rocdl.cvt_scalef32_pk_fp4_f32(
@@ -3468,9 +3464,7 @@ def _emit_quant_block_loop_apre(c: SimpleNamespace) -> None:
                         )
                         nib0 = emit_f32_to_e2m1(x0 * recip_scale)
                         nib1 = emit_f32_to_e2m1(x1 * recip_scale)
-                        packed_byte = fx.Int32(nib0) | (
-                            fx.Int32(nib1) << c.c4_i32
-                        )
+                        packed_byte = fx.Int32(nib0) | (fx.Int32(nib1) << c.c4_i32)
                         payload_val = arith.trunci(T.i8, packed_byte)  # 1 fp4x2 B
 
             # Write one payload/scale result to every row in ``c.dests``. Current
