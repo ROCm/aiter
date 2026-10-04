@@ -7,7 +7,7 @@ Flow:  load_winners    fastest ok record per M; the installed baseline competes 
                        an M above the largest bound is not written
        build_table     seeded with this shape's file if it exists, else a new file marked
                        DEFAULT_FALLBACK (the loader serves its missing buckets from DEFAULT.json);
-                       "any" copies the highest M_LEQ bucket; DEFAULT.json is never written
+                       "any" is a copy of DEFAULT.json's; DEFAULT.json is never written
        write, confirm  write the file, re-resolve every assigned M through the real loader, and
                        put the previous file back if the loader disagrees
 
@@ -93,7 +93,7 @@ def assign_buckets(winners, bounds):
         bucket = bucket_for(M, bounds)
         if bucket is None:
             print(
-                f"  M={M}: above the largest bound {bounds[-1]}, not written ('any' copies the highest bucket)"
+                f"  M={M}: above the largest bound {bounds[-1]}, not written ('any' is DEFAULT.json's)"
             )
             continue
         if bucket in assignments:
@@ -159,18 +159,15 @@ def install(spec, backend, shape_nk, runs_dir):
     print(f"seeding from {seed_path}")
     # the loader walks the kernel's explicit bounds, else the M_BOUNDS of the file it picks
     bounds = spec.bounds or seed.get("M_BOUNDS") or gemm_config_utils.STANDARD_M_BOUNDS
-    keys, _, _ = load_defaults(spec, backend)
+    keys, default_buckets, _ = load_defaults(spec, backend)
     assignments = assign_buckets(winners, bounds)
     if not assignments:
         sys.exit(
             f"no swept M is within the bounds (largest {bounds[-1]}); nothing installed"
         )
     table = build_table(seed, assignments, arch, keys)
-    # every file ships an "any": a copy of its highest tuned M_LEQ bucket
-    highest = max(
-        (k for k in table if k.startswith("M_LEQ_")), key=lambda k: int(k[6:])
-    )
-    table["any"] = dict(table[highest])
+    # every file ships DEFAULT.json's "any": a tuned small-M tile must never become the fallback
+    table["any"] = copy.deepcopy(default_buckets["any"])
     for bucket, winner in sorted(assignments.items(), key=lambda kv: kv[1].M):
         gain = ""
         if winner.baseline is not None:

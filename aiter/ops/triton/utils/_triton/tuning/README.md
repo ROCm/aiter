@@ -39,7 +39,8 @@ it (for fp4 families that is twice the byte width).
 the GPUs, one serial worker per GPU; when all are done a final round re-times the installed
 baseline and the ten fastest candidates on the first GPU into `<results>.final.jsonl`, and the
 installer uses only that file for the M, so the winner is picked from numbers measured on one
-device. Never point two drivers at the same GPU.
+device. A resumed run refreshes an existing final-round file, even on one GPU. Never point two
+drivers at the same GPU, and never list a GPU twice.
 
 Suggested M lists: `GEMM-AFP4WFP4_PRESHUFFLED` 4 8 16 31 32 64 ... 8192 (31 is a bucket of its
 own because `BLOCK_SIZE_M` must be 16 or less below M=32); standard families 1 4 8 16 ... 8192;
@@ -112,7 +113,8 @@ bucket it lacks from `DEFAULT.json`. The M bounds are the kernel's explicit boun
 `M_BOUNDS`, else the standard list. Each swept M replaces its `M_LEQ_<smallest family bound >= M>`
 bucket with the fastest `ok` record, the installed baseline included; when several swept Ms share a
 bucket the largest M wins. Ms above the largest bound (8192) are not tuned. Every installed file
-ships an `any`: a copy of its highest `M_LEQ` bucket. `DEFAULT.json` is never written. Every swept M is then re-read
+ships an `any`: a copy of `DEFAULT.json`'s `any`, so an M above every tuned bucket gets the
+family fallback, never a small-M tile. `DEFAULT.json` is never written. Every swept M is then re-read
 through `get_gemm_config` and must come back `is_tuned`; if not, the previous file is put back and
 the command fails.
 Config reads are cached per process, so restart Python to pick up a new file.

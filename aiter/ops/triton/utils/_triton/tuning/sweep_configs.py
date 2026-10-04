@@ -98,6 +98,10 @@ def parse_args(argv=None):
         "--fresh", action="store_true", help="discard existing records for these shapes"
     )
     args = parser.parse_args(argv)
+    if args.batch <= 0:
+        parser.error("--batch must be positive")
+    if len(set(args.gpu)) != len(args.gpu):
+        parser.error("--gpu values must be distinct: one worker per GPU")
     if bool(args.M) == args.all_buckets:
         parser.error("give --M values or --all-buckets, not both")
     return args
@@ -194,10 +198,12 @@ def check_settings(out, args):
 
 
 def discard(out):
-    for path in glob.glob(
-        out[: -len(".jsonl")] + "*"
-    ):  # results, final round, logs, todo files
-        os.remove(path)
+    """Remove this shape's results, final round, logs and todo files (and no other shape's)."""
+    final_out = final_results_path(out)
+    paths = [out, final_out] + glob.glob(out + ".*") + glob.glob(final_out + ".*")
+    for path in paths:
+        if os.path.isfile(path):
+            os.remove(path)
 
 
 def terminate(proc):
@@ -335,11 +341,16 @@ def sweep(spec, shape, backend, candidates, out, gpus, args):
             raise
 
 
-def final_round(spec, shape, backend, out, gpu, args):
-    """Re-time the baseline and the fastest candidates on one GPU into the final-round file."""
+def final_round(spec, shape, backend, candidates, out, gpu, args):
+    """Re-time the baseline and the fastest current candidates on one GPU into the final-round file."""
     records = read_records(out)
+    current = {config_key(c) for c in candidates}  # records of an older plan stay out
     ok = sorted(
-        (r for r in records.values() if r["status"] == "ok" and not r.get("baseline")),
+        (
+            r
+            for key, r in records.items()
+            if key in current and r["status"] == "ok" and not r.get("baseline")
+        ),
         key=lambda r: r["us"],
     )
     fastest = [r["config"] for r in ok[:FINAL_ROUND_SIZE]]
@@ -350,7 +361,7 @@ def final_round(spec, shape, backend, out, gpu, args):
         f"  final round on gpu {gpu}: re-timing the baseline and the {len(fastest)} fastest",
         flush=True,
     )
-    run_batch(spec, shape, backend, [None] + fastest, final_out, gpu, args)
+    sweep_shard(spec, shape, backend, [None] + fastest, final_out, gpu, args)
 
 
 def summarize(out, candidates):
@@ -417,8 +428,9 @@ def main(argv=None):
         print(f"  results: {out}", flush=True)
         candidates = [None] + plan_["configs"]  # None is the installed baseline
         sweep(spec, shape, backend, candidates, out, gpus, args)
-        if len(gpus) > 1:
-            final_round(spec, shape, backend, out, gpus[0], args)
+        # the installer prefers a final-round file, so an existing one is always refreshed
+        if len(gpus) > 1 or os.path.exists(final_results_path(out)):
+            final_round(spec, shape, backend, candidates, out, gpus[0], args)
         summarize(out, candidates)
 
     return install(spec, args, backend, gpus[0])
