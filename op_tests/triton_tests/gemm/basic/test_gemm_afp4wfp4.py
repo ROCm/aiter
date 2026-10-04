@@ -17,6 +17,7 @@ from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
     gemm_afp4wfp4_preshuffle,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.shuffle import shuffle_scale_gemm
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 
 DEVICE_ARCH = arch_info.get_arch()
@@ -376,3 +377,67 @@ def test_gemm_mxfp4_preshuffled_gfx1250(
     )
 
     triton.testing.assert_close(torch_out, triton_out)
+
+
+def tile_scales_gfx1250(scales):
+    """scale_layout="gfx1250_tile": the gfx1250 tile of shuffle_scale_gemm, rows padded to 32."""
+    pad = (-scales.shape[0]) % 32
+    if pad:
+        scales = torch.cat([scales, scales.new_zeros(pad, scales.shape[1])])
+    return shuffle_scale_gemm(
+        scales.contiguous(), arch="gfx1250", preshuffle_factor=32, scale_kwidth=8
+    )
+
+
+@pytest.mark.parametrize(
+    "M, N, K",
+    [
+        (1, 256, 512),
+        (16, 256, 256),
+        (31, 7168, 4608),
+        (128, 9216, 7168),
+        (192, 7168, 4608),
+        (1024, 1024, 1024),
+        (2048, 7168, 16384),
+        (4096, 2112, 7168),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_gemm_mxfp4_preshuffled_gfx1250_tiled_scales(M: int, N: int, K: int, dtype):
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("gfx1250_tile scales are only supported on gfx1250")
+
+    (
+        x,
+        w,
+        w_preshuf,
+        x_scales,
+        w_scales,
+        x_scales_shuffled,
+        w_scales_shuffled,
+        _out_dtype,
+        _y,
+    ) = generate_gemm_afp4wfp4_inputs(
+        M,
+        N,
+        K,
+        dtype,
+        output=False,
+        shuffle_scales_fg=True,
+        shuffle_weight_fg=True,
+    )
+    # A scales of M < 32 stay un-shuffled row-major in both layouts.
+    x_scales_tiled = x_scales.contiguous() if M < 32 else tile_scales_gfx1250(x_scales)
+    w_scales_tiled = tile_scales_gfx1250(w_scales)
+
+    default_out = gemm_afp4wfp4_preshuffle(
+        x, w_preshuf, x_scales_shuffled, w_scales_shuffled, dtype
+    )
+    tiled_out = gemm_afp4wfp4_preshuffle(
+        x, w_preshuf, x_scales_tiled, w_scales_tiled, dtype, scale_layout="gfx1250_tile"
+    )
+
+    # Same tiles and per-tile k-order as the default path: identical bits.
+    torch.testing.assert_close(tiled_out, default_out, rtol=0, atol=0)
+    torch_out = run_torch(x, w, x_scales, w_scales, dtype).to(dtype)
+    triton.testing.assert_close(torch_out, tiled_out)

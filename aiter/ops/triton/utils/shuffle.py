@@ -139,7 +139,9 @@ def shuffle_scale_gemm(
 
     Inverse: ``unshuffle_scale_gemm`` (gfx950 only).
     gfx950: preshuffle_factor = 32, scale_kwidth = 8
-    gfx1250: preshuffle_factor = 16, scale_kwidth = 4
+    gfx1250: preshuffle_factor = 16, scale_kwidth = 4; ``gemm_afp4wfp4_preshuffle``
+    with ``scale_layout="gfx1250_tile"`` takes preshuffle_factor = 32, scale_kwidth = 8
+    (rows padded to a multiple of 32 first).
     """
     if (arch or get_arch()) == "gfx1250":
         return _shuffle_scale_tile_gfx1250(scales, preshuffle_factor, scale_kwidth)
@@ -150,7 +152,7 @@ def shuffle_scale_gemm(
 
 
 def unshuffle_scale_gemm(scales_shuffled: torch.Tensor, arch=None) -> torch.Tensor:
-    """Inverse of ``shuffle_scale_gemm`` (gfx950 layout). gfx1250 has no consumer."""
+    """Inverse of ``shuffle_scale_gemm`` (gfx950 layout only)."""
     if (arch or get_arch()) == "gfx1250":
         raise NotImplementedError("unshuffle_scale_gemm is not implemented for gfx1250")
     scales = scales_shuffled.clone()

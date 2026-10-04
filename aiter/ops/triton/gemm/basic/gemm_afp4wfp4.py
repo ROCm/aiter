@@ -34,6 +34,27 @@ _GLUON_PRESHUFFLE_ARCHS = ("gfx1250",)
 _GLUON_DEFAULT_ARCHS = ("gfx1250",)
 
 
+def _tiled_scales_num_slots(config, ctas_m, ctas_n):
+    """LDS slots for the gfx1250 tiled-scale kernel.
+
+    That kernel keeps NUM_SLOTS - 1 stages in flight, so NUM_BUFFERS stages need one
+    more slot. Capped by the LDS size; the output staging buffer reuses the slots
+    after the K loop.
+    """
+    block_m = config["BLOCK_SIZE_M"] // ctas_m
+    block_n = config["BLOCK_SIZE_N"] // ctas_n
+    k_bytes = config["BLOCK_SIZE_K"] // 2
+    k_groups = config["BLOCK_SIZE_K"] // 32
+    pad_interval = max(256, k_bytes)  # A rows are padded by 16 bytes per interval
+    slot_bytes = (
+        block_m * k_bytes * (pad_interval + 16) // pad_interval
+        + block_n * k_bytes
+        + (block_m + block_n) * k_groups
+    )
+    max_slots = arch_info._LDS_CAP_BYTES[arch_info.get_arch()] // slot_bytes
+    return max(2, min(config["NUM_BUFFERS"] + 1, max_slots))
+
+
 def set_use_gemm_splitk_bf16(value: bool):
     global _USE_GEMM_SPLITK_BF16
     _USE_GEMM_SPLITK_BF16 = value
@@ -494,6 +515,7 @@ def gemm_afp4wfp4_preshuffle(
     y: torch.Tensor | None = None,
     config: dict | None = None,
     skip_reduce: bool | None = False,
+    scale_layout: str = "shuffle_scale",
 ) -> torch.Tensor:
     """
     Computes matrix multiplication Y = X @ W^T with FP4 activations and FP4 weights.
@@ -523,13 +545,29 @@ def gemm_afp4wfp4_preshuffle(
         config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
             BLOCK_SIZE_K, GROUP_SIZE_M, NUM_KSPLIT, SPLITK_BLOCK_SIZE).
         skip_reduce (Optional[bool]): skip reduction, y becomes (SPK, M, N) where SPK is determined by config
+        scale_layout (str): layout of x_scales / w_scales.
+            "shuffle_scale" (default): the aiter.ops.shuffle.shuffle_scale layout described above.
+            "gfx1250_tile" (gfx1250 only, faster): the gfx1250 tile of
+            aiter.ops.triton.utils.shuffle.shuffle_scale_gemm(s, arch="gfx1250",
+            preshuffle_factor=32, scale_kwidth=8), applied to the (rows, K//32) scales with
+            rows padded to a multiple of 32, i.e. (rows_pad//32, (K//32)*32). For M < 32,
+            x_scales stay un-shuffled (M, K//32) row-major. The kernel reads these with
+            wide LDS loads instead of byte gathers.
 
     Returns:
         y (torch.Tensor): Output with shape (M, N) or (SPK, M, N).
     """
 
     assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
+    assert scale_layout in (
+        "shuffle_scale",
+        "gfx1250_tile",
+    ), f"Unknown scale_layout '{scale_layout}', must be 'shuffle_scale' or 'gfx1250_tile'"
     use_gluon = arch_info.get_arch() in _GLUON_PRESHUFFLE_ARCHS
+    if scale_layout == "gfx1250_tile" and not use_gluon:
+        raise ValueError(
+            f"scale_layout='gfx1250_tile' needs the gfx1250 gluon kernel, got {arch_info.get_arch()}"
+        )
 
     M, K_bytes = x_fp4.shape
     n16, _ = w_preshuf.shape
@@ -573,6 +611,9 @@ def gemm_afp4wfp4_preshuffle(
             gemm_mxfp4_preshuffle_gfx1250 as _gluon_gemm_mxfp4_preshuffle_gfx1250,
         )
         from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_mxfp4 import (
+            gemm_mxfp4_preshuffle_gfx1250_tiled_scales as _gluon_gemm_mxfp4_preshuffle_tiled_scales_gfx1250,
+        )
+        from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_mxfp4 import (
             get_gemm_afp4wfp4_preshuffle_layouts,
         )
 
@@ -597,6 +638,59 @@ def gemm_afp4wfp4_preshuffle(
             config["BLOCK_SIZE_N"],
             config["BLOCK_SIZE_K"],
         )
+
+        if scale_layout == "gfx1250_tile":
+            from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_mxfp4 import (
+                cluster_shape as _tiled_cluster_shape,
+            )
+
+            num_ctas = config.setdefault("num_ctas", 1)
+            ctas_m, ctas_n = _tiled_cluster_shape(
+                num_ctas, config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"]
+            )
+            assert (config["BLOCK_SIZE_N"] // ctas_n) % 32 == 0, (
+                f"each CTA needs a multiple of 32 columns of BLOCK_SIZE_N="
+                f"{config['BLOCK_SIZE_N']}, which num_ctas={num_ctas} splits {ctas_n} ways"
+            )
+            _gluon_gemm_mxfp4_preshuffle_tiled_scales_gfx1250[grid](
+                x_fp4,
+                w_preshuf,
+                y,
+                x_scales,
+                w_scales,
+                M,
+                N,
+                K_elems,
+                x_fp4.stride(0),
+                x_fp4.stride(1),
+                w_preshuf.stride(0),
+                w_preshuf.stride(1),
+                y.stride(-2),
+                y.stride(-1),
+                x_scales.stride(0),
+                x_scales.stride(1),
+                w_scales.stride(0),
+                w_scales.stride(1),
+                BLOCK_SIZE_M=config["BLOCK_SIZE_M"],
+                BLOCK_SIZE_N=config["BLOCK_SIZE_N"],
+                BLOCK_SIZE_K=config["BLOCK_SIZE_K"],
+                num_warps=config["num_warps"],
+                NUM_SLOTS=_tiled_scales_num_slots(config, ctas_m, ctas_n),
+                num_ctas=num_ctas,
+                # 32-row A-scale stripes per CTA, or un-shuffled rows below 32
+                A_STRIPE=32 if config["BLOCK_SIZE_M"] // ctas_m >= 32 else 1,
+                wmma_acc_layout=layouts["wmma_acc_layout"],
+                shared_A=layouts["shared_A"],
+                shared_B=layouts["shared_B"],
+                shared_AS=layouts["shared_AS"],
+                shared_BS=layouts["shared_BS"],
+                shared_C=layouts["shared_C"],
+                dot_a_layout=layouts["dot_a_layout"],
+                dot_b_layout=layouts["dot_b_layout"],
+                a_scale_layout=layouts["a_scale_layout"],
+                b_scale_layout=layouts["b_scale_layout"],
+            )
+            return y
 
         _gluon_gemm_mxfp4_preshuffle_gfx1250[grid](
             x_fp4,
