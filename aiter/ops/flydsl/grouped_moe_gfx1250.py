@@ -30,17 +30,14 @@ _GROUPED_WEIGHT_CACHE = {}
 # (name, callable) per-kernel launches; None in production.
 kernel_bench_callable = None
 
-# Opt-in correctness hook used by the grouped-MoE test.  When a dict is
-# installed here, the helper exposes GEMM1's logical BF16 output, its
-# route-to-grouped-row map, and GEMM2's raw grouped output.  The hook is
-# deliberately inactive in production and is populated only by an extra,
-# untimed diagnostic launch.
+# Opt-in grouped-MoE correctness hook. A diagnostic launch exposes GEMM1's
+# logical BF16 output, route-to-grouped-row map, and GEMM2's grouped output.
+# It is None in production, so the extra untimed launch is disabled.
 stage_output_capture = None
 
-# Opt-in diagnostic hook for validating GEMM1's fused activation/quant output
-# against the original standalone quant path.  A caller installs a dict; the
-# normal fused launch and the existing untimed stage-capture launch populate
-# separate payload/scale snapshots.  None in production, so no copies occur.
+# Opt-in hook comparing fused GEMM1 activation/quant with the standalone path.
+# A diagnostic launch records separate payload/scale snapshots in a caller dict.
+# It is None in production, so no copies occur.
 quant_output_capture = None
 
 # fused_moe_ rebuilds Stage2ScatterContext without MegaMoE's dispatch fields
@@ -1079,16 +1076,9 @@ def _grouped_a8w4_tdm_moe(
                 scale_k_per_tile=tile_k // 32,
             )
 
-    # Fuse gemm1 activation + MX quantization + scale preshuffle into the
-    # kernel epilogue, eliminating the standalone
-    # flydsl_moe_fused_quant_preshuffle call between gemm1 and gemm2.
-    # A diagnostic capture needs the canonical BF16 activation result.  Normal
-    # execution keeps the fused-quant epilogue unchanged; only the extra
-    # untimed test launch takes the BF16-output path when the hook is active.
-    # The generic GEMM1 epilogue emits row-major quant output, while the tuned
-    # A-preshuffle GEMM1 epilogue emits GEMM2's A-preshuffle layout directly.
-    # Fuse only when GEMM1's selected producer matches GEMM2's selected input
-    # layout; mixed schedules retain the standalone layout-conversion kernel.
+    # Fuse activation and MX quantization when GEMM1/GEMM2 use the same A layout.
+    # Generic output is row-major and tuned output is A-preshuffled; mixed layouts
+    # or diagnostic BF16 capture retain the standalone conversion kernel.
     disable_gemm1_requant = _as_bool(
         os.environ.get("AITER_FLYDSL_DISABLE_GEMM1_REQUANT"), False
     )

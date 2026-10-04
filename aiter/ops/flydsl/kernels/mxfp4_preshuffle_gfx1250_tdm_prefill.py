@@ -297,10 +297,9 @@ def launch_gemm_a8w4_tdm_optimized(
         if const_expr(fp4_prefill_schedule and xdl_arb_off):
             from flydsl._mlir.dialects import llvm as llvm_dialect
 
-            # gfx1250 SCHED_MODE bit 2; the installed convenience helper
-            # writes bit 4 instead. See CDNA5 ISA section 5.7.2.1. Keep this
-            # single-wave/SIMD-only: the hardware guide warns that disabling
-            # the XDL arbitration stall can block co-execution opportunities.
+            # gfx1250 SCHED_MODE bit 2; the helper writes bit 4. See CDNA5 ISA 5.7.2.1.
+            # Restrict this to one wave per SIMD because disabling the XDL
+            # arbitration stall can block co-execution opportunities.
             llvm_dialect.call_intrinsic(
                 None,
                 "llvm.amdgcn.s.setreg",
@@ -415,10 +414,9 @@ def launch_gemm_a8w4_tdm_optimized(
                     if const_expr(drain_lds):
                         workgroup_barrier()
                     else:
-                        # Ring-wrap synchronization only needs all requester
-                        # waves to have issued their matching TDM operations.
-                        # Keep outstanding carry DS reads alive across the
-                        # cluster wait so that wait latency can overlap it.
+                        # Ring wrap only needs every requester wave to issue its TDM.
+                        # Keep carry DS reads outstanding across the cluster wait so
+                        # their latency overlaps synchronization.
                         rocdl.s_barrier_signal(-1)
                         rocdl.s_barrier_wait(-1)
                     if wave == 0:
@@ -914,11 +912,9 @@ def launch_gemm_a8w4_tdm_optimized(
                 sb=fx.make_rmem_tensor(SB_WIDTH, fx.Int32),
             )
 
-        # KWS==1 carries the next tile back into slot 0 only after this tile's
-        # WMMA has consumed it, so a second slot is dead weight.  Avoiding that
-        # slot is important for the 16-wave geometry: it removes enough live
-        # VGPR state to avoid hot-loop scratch spills.  Multi-subtile K tiles
-        # still ping-pong two slots while preloading the following k128.
+        # KWS==1 reuses slot 0 after this tile's WMMA, avoiding enough live VGPRs
+        # to prevent hot-loop spills in the 16-wave geometry. Multi-subtile K
+        # tiles still ping-pong two slots while preloading the next k128.
         RMEM_SLOTS = 1 if KWS == 1 else 2
         rmem_slots = [make_rmem_slot() for _ in range_constexpr(RMEM_SLOTS)]
 
@@ -1209,11 +1205,9 @@ def launch_gemm_a8w4_tdm_optimized(
                         pipeline_fence(
                             outstanding=TDM_PER * max(0, num_buffers - 2 - j)
                         )
-                    # Carry target only -- see buf_ptr_opaque; ``buf`` itself
-                    # must stay foldable or the tile reads wrong LDS.  t192 has
-                    # fewer live accumulators and can afford the ordinary target
-                    # address; its opaque form misaddresses the drain on random
-                    # inputs even though all-zero tests hide the error.
+                    # Only the carry target is opaque; ``buf`` must stay foldable
+                    # for correct LDS addressing. t192 uses the ordinary target
+                    # because its opaque form misaddresses random-input drains.
                     next_stage_buf = (
                         (
                             ptr_to_idx(buf_ptr((kt + 1) % num_buffers))
@@ -1261,11 +1255,9 @@ def launch_gemm_a8w4_tdm_optimized(
                 if stage1_quant_out and stage1_act
                 else ((tile_n // 2) if stage1_act else tile_n)
             )
-            # Spread the lane16 rows over LDS banks. The activated BF16/F16
-            # prefill path stores b64 per lane: +8 elements gives a four-dword row
-            # skew, with kgrp selecting the other two dwords. Passthrough
-            # uses b128 and needs the existing eight-dword skew. Quantized
-            # output keeps its byte-packed layout. Pad cols never reach GM.
+            # Skew lane16 rows across LDS banks: activated b64 stores use four
+            # dwords and passthrough b128 stores use eight. Byte-packed quant
+            # output is unchanged, and padding columns never reach global memory.
             STORE_PAD = (
                 0
                 if stage1_quant_out and stage1_act
@@ -1532,11 +1524,9 @@ def launch_gemm_a8w4_tdm_optimized(
                                     + lane16 * 16
                                 )
                             )
-                            # Each kgrp owns two bytes per WN. Pair two WNs for
-                            # one pk8 conversion, then split the packed dword into
-                            # the two non-adjacent 16-bit segments owned by this
-                            # kgrp. This removes the peer shuffles and halves the
-                            # number of native FP4 conversion instructions.
+                            # Each kgrp owns two bytes per WN. Pair two WNs into one
+                            # pk8 conversion, then split their non-adjacent 16-bit
+                            # segments to remove peer shuffles and halve conversions.
                             for half in range_constexpr(WN_PER_MX_BLOCK // 2):
                                 sub_wn0 = half * 2
                                 sub_wn1 = sub_wn0 + 1
@@ -1603,10 +1593,9 @@ def launch_gemm_a8w4_tdm_optimized(
                 for wm in range_constexpr(wmma_m_rep):
                     row_rel = wmb + wm * 16 + lane16
                     if const_expr(stage1_act and epilogue_batch_wn > 1):
-                        # Keep several independent sigmoid chains in flight.  The
-                        # scalar path below serializes exp2 -> rcp for every four
-                        # outputs; batching lets the TRANS pipe overlap those
-                        # chains while bounding temporary VGPR pressure.
+                        # Keep independent sigmoid chains in flight: batching
+                        # overlaps serialized exp2 -> rcp TRANS work while bounding
+                        # temporary VGPR pressure.
                         for wn_base in range_constexpr(
                             0, wmma_n_rep, epilogue_batch_wn
                         ):

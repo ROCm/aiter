@@ -236,12 +236,9 @@ def launch_gemm_a8w4_tdm_fused_persistent(
     STAGE_SB = ((SB_SUPERS * SC_INNER * 4 + 15) // 16) * 16
     SA_OWNER_SUPERS = AS_SUPERS // m_warp
     SA_OWNER_BYTES = SA_OWNER_SUPERS * AS_INNER * 4
-    # The four persistent ring stages own one 64 KiB segment each.  A stage's
-    # wave_m=0 A/ScaleA half sits at the front of its segment, while wave_m=1
-    # sits at the tail of the next segment (wrapping stage 3 back to segment 0).
-    # B/ScaleB fill the middle.  Each segment therefore contains one complete
-    # stage's main region plus the previous stage's second A/ScaleA half, keeping
-    # resident waves on different segments without allocating a fifth segment.
+    # Each 64 KiB segment holds a stage's wave_m=0 A/ScaleA at its front and
+    # the previous stage's wave_m=1 half at its tail, with B/ScaleB in between.
+    # This separates resident waves without allocating a fifth segment.
     B_OFF = A_OWNER_BYTES + SA_OWNER_BYTES if SEGMENT_SPLIT_A else STAGE_A
     SA_OFF = A_OWNER_BYTES if SEGMENT_SPLIT_A else B_OFF + STAGE_B
     SB_OFF = B_OFF + STAGE_B if SEGMENT_SPLIT_A else SA_OFF + STAGE_SA
@@ -338,10 +335,9 @@ def launch_gemm_a8w4_tdm_fused_persistent(
         if const_expr(fp4_prefill_schedule and xdl_arb_off):
             from flydsl._mlir.dialects import llvm as llvm_dialect
 
-            # gfx1250 SCHED_MODE bit 2; the installed convenience helper
-            # writes bit 4 instead. See CDNA5 ISA section 5.7.2.1. Keep this
-            # single-wave/SIMD-only: the hardware guide warns that disabling
-            # the XDL arbitration stall can block co-execution opportunities.
+            # gfx1250 SCHED_MODE bit 2; the helper writes bit 4. See CDNA5 ISA 5.7.2.1.
+            # Restrict this to one wave per SIMD because disabling the XDL
+            # arbitration stall can block co-execution opportunities.
             llvm_dialect.call_intrinsic(
                 None,
                 "llvm.amdgcn.s.setreg",
@@ -530,10 +526,9 @@ def launch_gemm_a8w4_tdm_fused_persistent(
                         if const_expr(drain_lds):
                             workgroup_barrier()
                         else:
-                            # Ring-wrap synchronization only needs all requester
-                            # waves to have issued their matching TDM operations.
-                            # Keep outstanding carry DS reads alive across the
-                            # cluster wait so that wait latency can overlap it.
+                            # Ring wrap only needs every requester wave to issue its TDM.
+                            # Keep carry DS reads outstanding across the cluster wait so
+                            # their latency overlaps synchronization.
                             rocdl.s_barrier_signal(-1)
                             rocdl.s_barrier_wait(-1)
                         if wave == 0:
@@ -782,10 +777,9 @@ def launch_gemm_a8w4_tdm_fused_persistent(
                     (next_blk_n64 // 32) * SB_OUTER_STRIDE + sb_batch_off
                 )
                 if const_expr(A_CACHE_STAGES > 0):
-                    # Cached A0/A1 remove their owner-wave TDMs.  Split B across
-                    # one wave on every physical SIMD, then leave ScaleA/ScaleB
-                    # on the second resident-wave slots.  Every SIMD therefore
-                    # receives nearly the same bytes for the next-task prefetch.
+                    # Cached A0/A1 remove owner-wave TDMs. Split B across the first
+                    # resident waves and leave ScaleA/ScaleB on the second slots so
+                    # every physical SIMD receives similar next-task prefetch bytes.
                     next_jobs = [
                         jobs[1]._replace(
                             g_off=next_b_off0, waves=tuple(range(4))
@@ -793,10 +787,9 @@ def launch_gemm_a8w4_tdm_fused_persistent(
                         jobs[2],
                         jobs[3]._replace(g_off=next_sb_off0),
                     ]
-                    # When a persistent task reuses A4 from buffer 0, redistribute
-                    # B4 over the four first resident waves.  This keeps exactly
-                    # one input TDM per wave for the stage, preserving the
-                    # tensorcnt distance assumed by the four-buffer pipeline.
+                    # When a persistent task reuses A4 from buffer 0, split B4
+                    # across the first resident waves. One input TDM per wave keeps
+                    # the four-buffer pipeline's tensorcnt distance unchanged.
                     cached_a_jobs = [
                         jobs[1]._replace(waves=tuple(range(4))),
                         jobs[2],
@@ -1168,11 +1161,9 @@ def launch_gemm_a8w4_tdm_fused_persistent(
                     sb=fx.make_rmem_tensor(SB_WIDTH, fx.Int32),
                 )
 
-            # KWS==1 carries the next tile back into slot 0 only after this tile's
-            # WMMA has consumed it, so a second slot is dead weight.  Avoiding that
-            # slot is important for the 16-wave geometry: it removes enough live
-            # VGPR state to avoid hot-loop scratch spills.  Multi-subtile K tiles
-            # still ping-pong two slots while preloading the following k128.
+            # KWS==1 reuses slot 0 after this tile's WMMA, avoiding enough live
+            # VGPRs to prevent hot-loop spills in the 16-wave geometry. Multi-subtile
+            # K tiles still ping-pong two slots while preloading the next k128.
             RMEM_SLOTS = 1 if KWS == 1 else 2
             rmem_slots = [make_rmem_slot() for _ in range_constexpr(RMEM_SLOTS)]
 
@@ -1440,12 +1431,9 @@ def launch_gemm_a8w4_tdm_fused_persistent(
                             pipeline_fence(outstanding=0)
                             issue(2, 2)
                             issue(3, 3)
-                            # Stage 4 reuses buffer 0, but its A payload is the
-                            # same for every persistent N task.  Task 0 has
-                            # already populated buffer 0's A region with stage
-                            # 4, while next-task stage 0/1 live in the separate
-                            # read-only cache.  Refill only B/ScaleA/ScaleB and
-                            # preserve A4 across the remaining six tasks.
+                            # Stage 4 reuses buffer 0's A across persistent N tasks;
+                            # next-task stage 0/1 live in the read-only cache. Refill
+                            # B/ScaleA/ScaleB only and preserve A4 for later tasks.
                             dispatch_wave_job(
                                 lambda stage_jobs: issue(0, 4, stage_jobs),
                                 cached_a_jobs,
@@ -1516,11 +1504,9 @@ def launch_gemm_a8w4_tdm_fused_persistent(
                             pipeline_fence(
                                 outstanding=TDM_PER * max(0, num_buffers - 2 - j)
                             )
-                        # Carry target only -- see buf_ptr_opaque; ``buf`` itself
-                        # must stay foldable or the tile reads wrong LDS.  t192 has
-                        # fewer live accumulators and can afford the ordinary target
-                        # address; its opaque form misaddresses the drain on random
-                        # inputs even though all-zero tests hide the error.
+                        # Only the carry target is opaque; ``buf`` must stay foldable
+                        # for correct LDS addressing. t192 uses the ordinary target
+                        # because its opaque form misaddresses random-input drains.
                         next_stage_buf = (
                             (
                                 ptr_to_idx(buf_ptr((kt + 1) % num_buffers))
@@ -1530,10 +1516,9 @@ def launch_gemm_a8w4_tdm_fused_persistent(
                             if const_expr(has_next)
                             else None
                         )
-                        # The previous iteration has already fenced and loaded the
-                        # final K tile into rmem.  Start the next persistent task's
-                        # stage-0/stage-1 TDMs before the final tile's WMMA work so
-                        # their arrival overlaps useful compute as well as epilogue.
+                        # The prior iteration loaded the final K tile into rmem. Issue
+                        # next-task stage-0/stage-1 TDMs before its WMMA so arrival
+                        # overlaps compute and epilogue work.
                         if const_expr(  # noqa: SIM102 - preserve DSL staging
                             PERSISTENT_TASKS > 1 and j + 1 == PRE
                         ):
@@ -1569,19 +1554,15 @@ def launch_gemm_a8w4_tdm_fused_persistent(
                     accs = [
                         c_frags[idx].load().ir_value() for idx in range_constexpr(n_acc)
                     ]
-                # For the persistent path, all current-task input TDMs were drained
-                # before the final K tile was loaded into rmem.  Next-task I0/I1 use
-                # buffers 0/1 while the output arena overlaps only buffers 2/3, so
-                # they can remain in flight through the epilogue.  The one-task path
-                # retains the original full fence.
+                # Persistent current-task inputs drain before the final K tile.
+                # Next-task I0/I1 use buffers 0/1 while output uses buffers 2/3, so
+                # they stay in flight through epilogue; one-task keeps a full fence.
                 if const_expr(PERSISTENT_TASKS == 1):
                     pipeline_fence(outstanding=0)
                 STORE_N = (tile_n // 2) if stage1_act else tile_n
-                # Spread the lane16 rows over LDS banks. The activated BF16/F16
-                # prefill path stores b64 per lane: +8 elements gives a four-dword row
-                # skew, with kgrp selecting the other two dwords. Passthrough
-                # uses b128 and needs the existing eight-dword skew. Quantized
-                # output keeps its byte-packed layout. Pad cols never reach GM.
+                # Skew lane16 rows across LDS banks: activated b64 stores use four
+                # dwords and passthrough b128 stores use eight. Byte-packed quant
+                # output is unchanged, and padding columns never reach global memory.
                 STORE_PAD = 8 if fp4_prefill_schedule else (16 if not stage1_act else 0)
                 STORE_PITCH = STORE_N + STORE_PAD
                 neg_limit = fx.Float32(0.0) - f32_swiglu_limit
@@ -1594,10 +1575,9 @@ def launch_gemm_a8w4_tdm_fused_persistent(
                     slice_rows = wm_count * 16
                     workgroup_barrier()
                     if const_expr(gemm2_eight_wave_geometry):
-                        # Use one output descriptor per wave.  The first half of
-                        # N waves stores the first row slice while the second half
-                        # stores the second slice.  Together with next-task I0/I1,
-                        # this caps each wave at three in-flight tensor operations.
+                        # Use one output descriptor per wave; the two N-wave halves
+                        # store separate row slices. With next-task I0/I1, this caps
+                        # each wave at three in-flight tensor operations.
                         store_waves = n_warp // 2
                         assert slice_rows % store_waves == 0
                         owned_rows = slice_rows // store_waves
@@ -1821,10 +1801,9 @@ def launch_gemm_a8w4_tdm_fused_persistent(
                     for wm in range_constexpr(wmma_m_rep):
                         row_rel = wmb + wm * 16 + lane16
                         if const_expr(stage1_act and epilogue_batch_wn > 1):
-                            # Keep several independent sigmoid chains in flight.  The
-                            # scalar path below serializes exp2 -> rcp for every four
-                            # outputs; batching lets the TRANS pipe overlap those
-                            # chains while bounding temporary VGPR pressure.
+                            # Keep independent sigmoid chains in flight: batching
+                            # overlaps serialized exp2 -> rcp TRANS work while bounding
+                            # temporary VGPR pressure.
                             for wn_base in range_constexpr(
                                 0, wmma_n_rep, epilogue_batch_wn
                             ):
@@ -2191,10 +2170,9 @@ def launch_gemm_a8w4_tdm_gemm2_persistent(
         if const_expr(fp4_prefill_schedule and xdl_arb_off):
             from flydsl._mlir.dialects import llvm as llvm_dialect
 
-            # gfx1250 SCHED_MODE bit 2; the installed convenience helper
-            # writes bit 4 instead. See CDNA5 ISA section 5.7.2.1. Keep this
-            # single-wave/SIMD-only: the hardware guide warns that disabling
-            # the XDL arbitration stall can block co-execution opportunities.
+            # gfx1250 SCHED_MODE bit 2; the helper writes bit 4. See CDNA5 ISA 5.7.2.1.
+            # Restrict this to one wave per SIMD because disabling the XDL
+            # arbitration stall can block co-execution opportunities.
             llvm_dialect.call_intrinsic(
                 None,
                 "llvm.amdgcn.s.setreg",
@@ -2383,10 +2361,9 @@ def launch_gemm_a8w4_tdm_gemm2_persistent(
                         if const_expr(drain_lds):
                             workgroup_barrier()
                         else:
-                            # Ring-wrap synchronization only needs all requester
-                            # waves to have issued their matching TDM operations.
-                            # Keep outstanding carry DS reads alive across the
-                            # cluster wait so that wait latency can overlap it.
+                            # Ring wrap only needs every requester wave to issue its TDM.
+                            # Keep carry DS reads outstanding across the cluster wait so
+                            # their latency overlaps synchronization.
                             rocdl.s_barrier_signal(-1)
                             rocdl.s_barrier_wait(-1)
                         if wave == 0:
@@ -2602,10 +2579,9 @@ def launch_gemm_a8w4_tdm_gemm2_persistent(
                     (next_blk_n64 // 32) * SB_OUTER_STRIDE + sb_batch_off
                 )
                 if const_expr(A_CACHE_STAGES > 0):
-                    # Cached A0/A1 remove their owner-wave TDMs.  Split B across
-                    # one wave on every physical SIMD, then leave ScaleA/ScaleB
-                    # on the second resident-wave slots.  Every SIMD therefore
-                    # receives nearly the same bytes for the next-task prefetch.
+                    # Cached A0/A1 remove owner-wave TDMs. Split B across the first
+                    # resident waves and leave ScaleA/ScaleB on the second slots so
+                    # every physical SIMD receives similar next-task prefetch bytes.
                     next_jobs = [
                         jobs[1]._replace(
                             g_off=next_b_off0, waves=tuple(range(4))
@@ -2613,10 +2589,9 @@ def launch_gemm_a8w4_tdm_gemm2_persistent(
                         jobs[2],
                         jobs[3]._replace(g_off=next_sb_off0),
                     ]
-                    # When a persistent task reuses A4 from buffer 0, redistribute
-                    # B4 over the four first resident waves.  This keeps exactly
-                    # one input TDM per wave for the stage, preserving the
-                    # tensorcnt distance assumed by the four-buffer pipeline.
+                    # When a persistent task reuses A4 from buffer 0, split B4
+                    # across the first resident waves. One input TDM per wave keeps
+                    # the four-buffer pipeline's tensorcnt distance unchanged.
                     cached_a_jobs = [
                         jobs[1]._replace(waves=tuple(range(4))),
                         jobs[2],
@@ -2951,11 +2926,9 @@ def launch_gemm_a8w4_tdm_gemm2_persistent(
                     sb=fx.make_rmem_tensor(SB_WIDTH, fx.Int32),
                 )
 
-            # KWS==1 carries the next tile back into slot 0 only after this tile's
-            # WMMA has consumed it, so a second slot is dead weight.  Avoiding that
-            # slot is important for the 16-wave geometry: it removes enough live
-            # VGPR state to avoid hot-loop scratch spills.  Multi-subtile K tiles
-            # still ping-pong two slots while preloading the following k128.
+            # KWS==1 reuses slot 0 after this tile's WMMA, avoiding enough live
+            # VGPRs to prevent hot-loop spills in the 16-wave geometry. Multi-subtile
+            # K tiles still ping-pong two slots while preloading the next k128.
             RMEM_SLOTS = 1 if KWS == 1 else 2
             rmem_slots = [make_rmem_slot() for _ in range_constexpr(RMEM_SLOTS)]
 
@@ -3223,12 +3196,9 @@ def launch_gemm_a8w4_tdm_gemm2_persistent(
                             pipeline_fence(outstanding=0)
                             issue(2, 2)
                             issue(3, 3)
-                            # Stage 4 reuses buffer 0, but its A payload is the
-                            # same for every persistent N task.  Task 0 has
-                            # already populated buffer 0's A region with stage
-                            # 4, while next-task stage 0/1 live in the separate
-                            # read-only cache.  Refill only B/ScaleA/ScaleB and
-                            # preserve A4 across the remaining six tasks.
+                            # Stage 4 reuses buffer 0's A across persistent N tasks;
+                            # next-task stage 0/1 live in the read-only cache. Refill
+                            # B/ScaleA/ScaleB only and preserve A4 for later tasks.
                             dispatch_wave_job(
                                 lambda stage_jobs: issue(0, 4, stage_jobs),
                                 cached_a_jobs,
@@ -3299,11 +3269,9 @@ def launch_gemm_a8w4_tdm_gemm2_persistent(
                             pipeline_fence(
                                 outstanding=TDM_PER * max(0, num_buffers - 2 - j)
                             )
-                        # Carry target only -- see buf_ptr_opaque; ``buf`` itself
-                        # must stay foldable or the tile reads wrong LDS.  t192 has
-                        # fewer live accumulators and can afford the ordinary target
-                        # address; its opaque form misaddresses the drain on random
-                        # inputs even though all-zero tests hide the error.
+                        # Only the carry target is opaque; ``buf`` must stay foldable
+                        # for correct LDS addressing. t192 uses the ordinary target
+                        # because its opaque form misaddresses random-input drains.
                         next_stage_buf = (
                             (
                                 ptr_to_idx(buf_ptr((kt + 1) % num_buffers))
@@ -3313,10 +3281,9 @@ def launch_gemm_a8w4_tdm_gemm2_persistent(
                             if const_expr(has_next)
                             else None
                         )
-                        # The previous iteration has already fenced and loaded the
-                        # final K tile into rmem.  Start the next persistent task's
-                        # stage-0/stage-1 TDMs before the final tile's WMMA work so
-                        # their arrival overlaps useful compute as well as epilogue.
+                        # The prior iteration loaded the final K tile into rmem. Issue
+                        # next-task stage-0/stage-1 TDMs before its WMMA so arrival
+                        # overlaps compute and epilogue work.
                         if const_expr(  # noqa: SIM102 - preserve DSL staging
                             PERSISTENT_TASKS > 1 and j + 1 == PRE
                         ):
@@ -3352,19 +3319,15 @@ def launch_gemm_a8w4_tdm_gemm2_persistent(
                     accs = [
                         c_frags[idx].load().ir_value() for idx in range_constexpr(n_acc)
                     ]
-                # For the persistent path, all current-task input TDMs were drained
-                # before the final K tile was loaded into rmem.  Next-task I0/I1 use
-                # buffers 0/1 while the output arena overlaps only buffers 2/3, so
-                # they can remain in flight through the epilogue.  The one-task path
-                # retains the original full fence.
+                # Persistent current-task inputs drain before the final K tile.
+                # Next-task I0/I1 use buffers 0/1 while output uses buffers 2/3, so
+                # they stay in flight through epilogue; one-task keeps a full fence.
                 if const_expr(PERSISTENT_TASKS == 1):
                     pipeline_fence(outstanding=0)
                 STORE_N = (tile_n // 2) if stage1_act else tile_n
-                # Spread the lane16 rows over LDS banks. The activated BF16/F16
-                # prefill path stores b64 per lane: +8 elements gives a four-dword row
-                # skew, with kgrp selecting the other two dwords. Passthrough
-                # uses b128 and needs the existing eight-dword skew. Quantized
-                # output keeps its byte-packed layout. Pad cols never reach GM.
+                # Skew lane16 rows across LDS banks: activated b64 stores use four
+                # dwords and passthrough b128 stores use eight. Byte-packed quant
+                # output is unchanged, and padding columns never reach global memory.
                 STORE_PAD = 8 if fp4_prefill_schedule else (16 if not stage1_act else 0)
                 STORE_PITCH = STORE_N + STORE_PAD
                 neg_limit = fx.Float32(0.0) - f32_swiglu_limit
@@ -3377,10 +3340,9 @@ def launch_gemm_a8w4_tdm_gemm2_persistent(
                     slice_rows = wm_count * 16
                     workgroup_barrier()
                     if const_expr(gemm2_eight_wave_geometry):
-                        # Use one output descriptor per wave.  The first half of
-                        # N waves stores the first row slice while the second half
-                        # stores the second slice.  Together with next-task I0/I1,
-                        # this caps each wave at three in-flight tensor operations.
+                        # Use one output descriptor per wave; the two N-wave halves
+                        # store separate row slices. With next-task I0/I1, this caps
+                        # each wave at three in-flight tensor operations.
                         store_waves = n_warp // 2
                         assert slice_rows % store_waves == 0
                         owned_rows = slice_rows // store_waves
@@ -3533,10 +3495,9 @@ def launch_gemm_a8w4_tdm_gemm2_persistent(
                     for wm in range_constexpr(wmma_m_rep):
                         row_rel = wmb + wm * 16 + lane16
                         if const_expr(stage1_act and epilogue_batch_wn > 1):
-                            # Keep several independent sigmoid chains in flight.  The
-                            # scalar path below serializes exp2 -> rcp for every four
-                            # outputs; batching lets the TRANS pipe overlap those
-                            # chains while bounding temporary VGPR pressure.
+                            # Keep independent sigmoid chains in flight: batching
+                            # overlaps serialized exp2 -> rcp TRANS work while bounding
+                            # temporary VGPR pressure.
                             for wn_base in range_constexpr(
                                 0, wmma_n_rep, epilogue_batch_wn
                             ):

@@ -3338,10 +3338,9 @@ def _emit_quant_block_loop_apre(c: SimpleNamespace) -> None:
         block_in_range = (
             fx.Uint32(mx_block) < fx.Uint32(c.mx_blocks_per_row)
         ).ir_value()
-        # Raw scf.if, not a Python `if`: the AST rewriter only transforms
-        # @flyc.kernel / @flyc.jit bodies, and this is a plain module-level
-        # emitter called from them, so `if block_in_range:` here would be a
-        # host-side truthiness test rather than an scf.if.
+        # Use raw scf.if because this module-level emitter is outside the AST
+        # rewriter. A Python `if block_in_range` would test host-side truthiness
+        # instead of generating an scf.if in the @flyc.kernel/@flyc.jit caller.
         _if_block = scf.IfOp(block_in_range)
         with ir.InsertionPoint(_if_block.then_block):
             if const_expr(c.use_pk8):
@@ -3474,10 +3473,9 @@ def _emit_quant_block_loop_apre(c: SimpleNamespace) -> None:
                         )
                         payload_val = arith.trunci(T.i8, packed_byte)  # 1 fp4x2 B
 
-            # One quant result (payload_val + e8m0_scale) is written to every
-            # destination row in ``c.dests``. Current kernels pass one destination;
-            # the list keeps the store side generic without changing quant math.
-            # The block-scale's dword/byte position depends only on ``mx_block``.
+            # Write one payload/scale result to every row in ``c.dests``. Current
+            # kernels pass one destination; retaining the list keeps stores generic
+            # without changing quant math. Scale position depends only on mx_block.
             scale_dword = fx.Uint32(mx_block) // fx.Uint32(c.c4_i32)
             byte_in_dword = mx_block - scale_dword * c.c4_i32
             e8m0_byte = arith.trunci(T.i8, e8m0_scale)
@@ -3567,11 +3565,9 @@ def build_moe_fused_quant_preshuffle_module_apre(
     if a_preshuffle and quant_mode != "fp4":
         raise NotImplementedError("A preshuffle is supported only for fp4 payloads")
     L = _quant_layout(feat_dim, quant_mode, wmma_rep)
-    # Unpack into locals so the @kernel closure captures the quant_mode-derived
-    # scalars (is_fp8, payload geometry, ...). The JIT disk cache keys on the
-    # launch function's source + scalar closure values; if these stayed hidden
-    # inside the ``L`` namespace the fp4 and fp8 variants (same feat_dim/wmma_rep)
-    # would hash to the same key and silently share one binary.
+    # Capture quant-mode scalars directly: the JIT cache hashes source and scalar
+    # closure values, but not values hidden inside ``L``. Otherwise same-shape
+    # fp4 and fp8 variants could silently share one binary.
     is_fp8 = L.is_fp8
     use_native = L.use_native
     use_pk8 = L.use_pk8
@@ -3875,11 +3871,9 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module_apre(
         lane = tid - warp_in_block * c_wave
         route = bid * arith.constant(warps_per_block, type=i32) + warp_in_block
 
-        # Dynamic EP token count (capture-safe, no host sync): grid is launched over
-        # the static numel routes, but routes >= num_valid_routes (= total_recv*topk)
-        # are dead-tail padding rows of the dispatch buffer -> skip the gather+quant.
-        # When truncation is disabled the caller passes a null pointer, which must
-        # not be dereferenced, so the load is predicated rather than unconditional.
+        # Launch over static routes and skip rows beyond dynamic num_valid_routes
+        # without host synchronization. Predicate the load because a null pointer
+        # denotes disabled truncation and must not be dereferenced.
         num_valid_routes_is_set = fx.Int64(ptrtoint(num_valid_routes)) != 0
         valid_route_count = fx.Uint32(numel)
         if num_valid_routes_is_set:
