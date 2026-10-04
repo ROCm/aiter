@@ -173,6 +173,11 @@ AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv",
 )
 
+AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE = os.getenv(
+    "AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_mxfp8_bpreshuffle_tuned_gemm.csv",
+)
+
 AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_ABPRESHUFFLE = os.getenv(
     "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_ABPRESHUFFLE",
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_abpreshuffle_tuned_gemm.csv",
@@ -228,15 +233,6 @@ AITER_CONFIG_CONV3D_BF16 = os.getenv(
 AITER_CONFIG_GDN_K5_OPT = os.getenv(
     "AITER_CONFIG_GDN_K5_OPT",
     f"{AITER_ROOT_DIR}/aiter/configs/chunk_gdn_h_opt_tuned.csv",
-)
-
-# Head shapes to AOT-compile the gfx950 FlyDSL FP8 flash-attention forward for
-# (aiter/aot/flydsl/fmha_fp8.py). Per-model rows live under model_configs/
-# (*_fmha_fp8_aot.csv) and get merged into this canonical file, which ships
-# header-only like chunk_gdn_h_opt_tuned.csv.
-AITER_CONFIG_FMHA_FP8_AOT = os.getenv(
-    "AITER_CONFIG_FMHA_FP8_AOT",
-    f"{AITER_ROOT_DIR}/aiter/configs/fmha_fp8_aot.csv",
 )
 
 AITER_CONFIG_DISPATCH_COMBINE_INTRANODE = os.getenv(
@@ -353,6 +349,14 @@ class AITER_CONFIG:
         )
 
     @property
+    def AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE",
+            AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE,
+            "a8w8_mxfp8_bpreshuffle_tuned_gemm",
+        )
+
+    @property
     def AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_ABPRESHUFFLE_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_ABPRESHUFFLE",
@@ -394,14 +398,6 @@ class AITER_CONFIG:
             "AITER_CONFIG_GDN_K5_OPT",
             AITER_CONFIG_GDN_K5_OPT,
             "chunk_gdn_h_opt_tuned",
-        )
-
-    @property
-    def AITER_CONFIG_FMHA_FP8_AOT_FILE(self):
-        return self.get_config_file(
-            "AITER_CONFIG_FMHA_FP8_AOT",
-            AITER_CONFIG_FMHA_FP8_AOT,
-            "fmha_fp8_aot",
         )
 
     @property
@@ -567,7 +563,7 @@ class AITER_CONFIG:
 
     # Cache is keyed on (self, env_name, ...); this object is a
     # process-lifetime singleton, so the retained reference is not a leak.
-    @functools.lru_cache(maxsize=20)  # noqa: B019
+    @functools.lru_cache(maxsize=64)  # noqa: B019
     def get_config_file(self, env_name, default_file, tuned_file_name):
         config_env_file = (os.getenv(env_name) or "").strip()
         # default_file = f"{AITER_ROOT_DIR}/aiter/configs/{tuned_file_name}.csv"

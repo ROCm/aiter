@@ -78,7 +78,7 @@ def run_benchmark(args):
         x_vals=x_vals_list,
         line_arg="unit",
         line_vals=[ylabel],
-        line_names=[ylabel],
+        line_names=[""],  # prevents double bandwidth text
         styles=[("green", "-")],
         ylabel=ylabel,
         plot_name=f"{get_caller_name_no_ext()}_{backend}_{args.quant}",
@@ -125,7 +125,7 @@ def run_benchmark(args):
             backend=backend,
         )
 
-        ms = triton.testing.do_bench_cudagraph(fn, rep=100, return_mode="mean")
+        ms = triton.testing.do_bench_cudagraph(fn, rep=args.rep, return_mode="mean")
 
         # Memory-bound: read gate+up (M x 2N), write out (M x N) + small scale
         # buffer. Weights add M x 1 when broadcast (negligible) or a full
@@ -221,6 +221,14 @@ def parse_args(args: list[str] | None = None):
         choices=("broadcast", "full"),
         help="weight layout when --weighted 1: 'broadcast' is [M, 1] applied "
         "across the row, 'full' is [M, n_half], one weight per output element.",
+    )
+    parser.add_argument(
+        "--rep",
+        type=int,
+        default=20,
+        help="do_bench_cudagraph measurement target, in ms (default is 20). "
+        "captured graph unrolls rep/kernel_ms iterations, so its made configurable "
+        "Large rep can bloat the graph for small kernels and break profilers.",
     )
     parser.add_argument(
         "-print_vgpr",

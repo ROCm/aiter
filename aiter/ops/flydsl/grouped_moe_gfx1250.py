@@ -78,6 +78,12 @@ def _as_int(value, default: int | None) -> int | None:
     return int(text)
 
 
+def _as_bool(value, default: bool) -> bool:
+    if value is None or str(value).strip() == "":
+        return default
+    return str(value).strip() in _TRUTHY_ENV
+
+
 def _dtype_name(dtype) -> str:
     if dtype is torch.bfloat16 or dtype == dtypes.bf16:
         return "torch.bfloat16"
@@ -581,13 +587,16 @@ def _grouped_a8w4_tdm_moe(
     m_warp2=None,
     n_warp2=None,
     num_buffers2=None,
-    cluster_n=-1,
     cluster_m=-1,
+    cluster_n=-1,
+    cluster_m2=-1,
     cluster_n2=None,
     waves_per_tensor_tdm=-1,
+    waves_per_tensor_tdm2=None,
     next_stage_prefetch=0,
     tdm_as_in_prologue=0,
     tdm_b_th=0,
+    lds_soa_load_interleave=0,
     data_format="a8w4",
     expert_mask=None,
     num_local_tokens=None,
@@ -629,6 +638,8 @@ def _grouped_a8w4_tdm_moe(
         tile_k2 = tile_k
     if num_buffers2 is None:
         num_buffers2 = num_buffers
+    if waves_per_tensor_tdm2 is None:
+        waves_per_tensor_tdm2 = waves_per_tensor_tdm
     if m_warp2 is None:
         m_warp2 = m_warp
     if n_warp2 is None:
@@ -1078,9 +1089,13 @@ def _grouped_a8w4_tdm_moe(
     # A-preshuffle GEMM1 epilogue emits GEMM2's A-preshuffle layout directly.
     # Fuse only when GEMM1's selected producer matches GEMM2's selected input
     # layout; mixed schedules retain the standalone layout-conversion kernel.
-    _fuse_quant_enabled = os.environ.get(
-        "AITER_FLYDSL_GEMM1_FUSED_QUANT", "1"
-    ) in _TRUTHY_ENV
+    disable_gemm1_requant = _as_bool(
+        os.environ.get("AITER_FLYDSL_DISABLE_GEMM1_REQUANT"), False
+    )
+    _fuse_quant_enabled = (
+        os.environ.get("AITER_FLYDSL_GEMM1_FUSED_QUANT", "1") in _TRUTHY_ENV
+        and not disable_gemm1_requant
+    )
     _fuse_quant = (
         _fuse_quant_enabled
         and (_b1 is None)
@@ -1150,12 +1165,13 @@ def _grouped_a8w4_tdm_moe(
             stage1_quant_out=1,
             quant_scale=a2_scale,
             quant_wmma_rep=wmma_rep2,
-            cluster_n=cluster_n,
             cluster_m=cluster_m,
+            cluster_n=cluster_n,
             waves_per_tensor_tdm=waves_per_tensor_tdm,
             next_stage_prefetch=next_stage_prefetch,
             tdm_as_in_prologue=tdm_as_in_prologue,
             tdm_b_th=tdm_b_th,
+            lds_soa_load_interleave=lds_soa_load_interleave,
             row_major_ascale=int(_row_major_ascale),
             a_row_stride_bytes=_a1_wire_stride,
             a_scale_row_stride_bytes=_a1_wire_stride,
@@ -1187,12 +1203,13 @@ def _grouped_a8w4_tdm_moe(
             bias=_b1,
             swiglu_limit=sl,
             num_buffers=num_buffers,
-            cluster_n=cluster_n,
             cluster_m=cluster_m,
+            cluster_n=cluster_n,
             waves_per_tensor_tdm=waves_per_tensor_tdm,
             next_stage_prefetch=next_stage_prefetch,
             tdm_as_in_prologue=tdm_as_in_prologue,
             tdm_b_th=tdm_b_th,
+            lds_soa_load_interleave=lds_soa_load_interleave,
             row_major_ascale=int(_row_major_ascale),
             a_row_stride_bytes=_a1_wire_stride,
             a_scale_row_stride_bytes=_a1_wire_stride,
@@ -1278,12 +1295,14 @@ def _grouped_a8w4_tdm_moe(
         stage1_act=0,
         bias=_b2,
         num_buffers=num_buffers2,
+        cluster_m=cluster_m2,
         cluster_n=cluster_n2,
-        waves_per_tensor_tdm=waves_per_tensor_tdm,
+        waves_per_tensor_tdm=waves_per_tensor_tdm2,
         next_stage_prefetch=next_stage_prefetch,
         tdm_as_in_prologue=tdm_as_in_prologue,
         tdm_b_th=0,
         a_preshuffle=_gemm2_a_preshuffle,
+        lds_soa_load_interleave=lds_soa_load_interleave,
         **_ep_gemm2_kwargs,
     )
 
@@ -1373,13 +1392,14 @@ def _grouped_a8w4_tdm_moe(
                         stage1_quant_out=1,
                         quant_scale=a2_scale,
                         quant_wmma_rep=wmma_rep2,
-                        cluster_n=cluster_n,
                         cluster_m=cluster_m,
+                        cluster_n=cluster_n,
                         waves_per_tensor_tdm=waves_per_tensor_tdm,
                         next_stage_prefetch=next_stage_prefetch,
                         tdm_as_in_prologue=tdm_as_in_prologue,
                         tdm_b_th=tdm_b_th,
                         a_preshuffle=_gemm1_a_preshuffle,
+                        lds_soa_load_interleave=lds_soa_load_interleave,
                         **_situ_kw,
                     ),
                 )
@@ -1411,13 +1431,14 @@ def _grouped_a8w4_tdm_moe(
                         bias=_b1,
                         swiglu_limit=sl,
                         num_buffers=num_buffers,
-                        cluster_n=cluster_n,
                         cluster_m=cluster_m,
+                        cluster_n=cluster_n,
                         waves_per_tensor_tdm=waves_per_tensor_tdm,
                         next_stage_prefetch=next_stage_prefetch,
                         tdm_as_in_prologue=tdm_as_in_prologue,
                         tdm_b_th=tdm_b_th,
                         a_preshuffle=_gemm1_a_preshuffle,
+                        lds_soa_load_interleave=lds_soa_load_interleave,
                         **_situ_kw,
                     ),
                 )
@@ -1447,12 +1468,14 @@ def _grouped_a8w4_tdm_moe(
                     stage1_act=0,
                     bias=_b2,
                     num_buffers=num_buffers2,
+                    cluster_m=cluster_m2,
                     cluster_n=cluster_n2,
-                    waves_per_tensor_tdm=waves_per_tensor_tdm,
+                    waves_per_tensor_tdm=waves_per_tensor_tdm2,
                     next_stage_prefetch=next_stage_prefetch,
                     tdm_as_in_prologue=tdm_as_in_prologue,
                     tdm_b_th=0,
                     a_preshuffle=_gemm2_a_preshuffle,
+                    lds_soa_load_interleave=lds_soa_load_interleave,
                 ),
             )
         )
@@ -1713,13 +1736,18 @@ def grouped_gemm_gfx1250_a8w4(
             _tdm_kw["num_buffers2"] = _as_int(
                 cfg_row.get("num_buffer_stage2"), _tdm_kw["num_buffers"]
             )
-            _tdm_kw["cluster_n"] = _as_int(cfg_row.get("cluster_n"), -1)
             _tdm_kw["cluster_m"] = _as_int(cfg_row.get("cluster_m"), -1)
+            _tdm_kw["cluster_n"] = _as_int(cfg_row.get("cluster_n"), -1)
+            _tdm_kw["cluster_m2"] = _as_int(cfg_row.get("cluster_m2"), -1)
             _tdm_kw["cluster_n2"] = _as_int(
                 cfg_row.get("cluster_n2"), _tdm_kw["cluster_n"]
             )
             _tdm_kw["waves_per_tensor_tdm"] = _as_int(
                 cfg_row.get("waves_per_tensor_tdm"), -1
+            )
+            _tdm_kw["waves_per_tensor_tdm2"] = _as_int(
+                cfg_row.get("waves_per_tensor_tdm2"),
+                _tdm_kw["waves_per_tensor_tdm"],
             )
             _tdm_kw["next_stage_prefetch"] = _as_int(
                 cfg_row.get("next_stage_prefetch"), 0
@@ -1728,6 +1756,9 @@ def grouped_gemm_gfx1250_a8w4(
                 cfg_row.get("tdm_as_in_prologue"), 0
             )
             _tdm_kw["tdm_b_th"] = _as_int(cfg_row.get("tdm_b_th"), 0)
+            _tdm_kw["lds_soa_load_interleave"] = _as_int(
+                cfg_row.get("lds_soa_load_interleave"), 0
+            )
 
         # Env overrides for tuning (present-check so any set value wins over CSV /
         # defaults). Stage2 (*2) falls back to the stage1 value when unset. Set
