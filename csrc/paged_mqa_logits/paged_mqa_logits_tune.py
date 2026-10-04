@@ -7,8 +7,8 @@ launcher ``aiter.paged_mqa_logits`` uses, grades each against a torch
 reference, and writes the fastest correct one per shape::
 
     python3 csrc/paged_mqa_logits/paged_mqa_logits_tune.py \
-        -i aiter/configs/paged_mqa_logits_untuned.csv \
-        -o aiter/configs/paged_mqa_logits_tuned.csv
+        -i aiter/configs/model_configs/paged_mqa_logits_untuned_glm5.csv \
+        -o aiter/configs/model_configs/paged_mqa_logits_tuned_glm5.csv
 
 ``--run_config <tuned.csv>`` times the production op on every tuned row.
 
@@ -30,9 +30,9 @@ from typing import Any, ClassVar
 import pandas as pd
 import torch
 
+import aiter.paged_mqa_logits as pmql
 from aiter import logger
 from aiter.jit.core import AITER_CONFIG_PAGED_MQA_LOGITS, AITER_ROOT_DIR
-from aiter.ops import paged_mqa_logits as pmql
 from aiter.test_common import run_perftest
 from aiter.utility.base_tuner import TunerCommon
 
