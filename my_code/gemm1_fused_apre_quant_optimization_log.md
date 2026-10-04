@@ -1432,3 +1432,146 @@ The generated report is:
 ```text
 /app/aiter/my_code/gemm1_fused_variant_compare_runs/20261004T024422Z/summary.md
 ```
+
+## 2026-10-04 post-GEMM2-port repeated stability run
+
+The committed persistent GEMM2 port at `0df63659cb75` was measured in three
+independent groups, with three fresh processes in each group. The host GPU/KFD
+check was idle before and after every group. All nine const0 runs reported
+`logits_diff=0`, `rel_l2=0`, and matching GEMM1, GEMM2, and final MoE hashes.
+
+The reproduction command for each group was:
+
+```bash
+ROUNDS=3 bash ./my_code/run_moe_prefill_switch_ab.sh \
+  e2e-const0 \
+  --experts 64 --tokens 1536 --topk 8 \
+  --model-dim 7168 --inter-dim 2048
+```
+
+| Group | GEMM1 samples / median (us) | GEMM2 samples / median (us) | MoE e2e samples / median (us) |
+|---|---|---|---|
+| 1 | 73.385, 73.402, 72.246 / **73.385** | 49.522, 53.909, 52.574 / **52.574** | 179.56, 185.41, 180.16 / **180.16** |
+| 2 | 74.063, 73.376, 74.945 / **74.063** | 51.889, 51.050, 51.166 / **51.166** | 184.90, 176.32, 181.72 / **181.72** |
+| 3 | 80.089, 74.325, 73.231 / **74.325** | 53.981, 50.761, 51.375 / **51.375** | 192.63, 183.92, 187.27 / **187.27** |
+
+The aggregate statistics across all nine samples were:
+
+| Metric | Median (us) | Mean (us) | Standard deviation (us) | CV | Min--max (us) | Group-median span |
+|---|---:|---:|---:|---:|---:|---:|
+| GEMM1 | **73.402** | 74.340 | 2.287 | 3.08% | 72.246--80.089 | 0.940 us / 1.27% |
+| GEMM2 | **51.375** | 51.803 | 1.467 | 2.83% | 49.522--53.981 | 1.408 us / 2.74% |
+| MoE e2e | **183.92** | 183.54 | 4.81 | 2.62% | 176.32--192.63 | 7.11 us / 3.91% |
+
+The central GEMM1 and GEMM2 results were repeatable across groups, although
+individual samples still showed roughly 3% coefficient of variation. The third
+group contained the slowest GEMM1 and MoE samples (`80.089 us` and `192.63 us`),
+which raised its MoE median. There was no fault, hang, correctness failure, or
+pre-existing GPU workload during these measurements.
+
+The matching const0 hashes in every run were:
+
+```text
+gemm1_ref_output_hash128 = c281c06c980fd4ca89d84615b26083b9
+gemm1_output_hash128     = c281c06c980fd4ca89d84615b26083b9
+gemm2_ref_output_hash128 = 8435f663d2aae0fe93d109c485cd9265
+gemm2_output_hash128     = 8435f663d2aae0fe93d109c485cd9265
+ref_output_hash128       = 6bebf6409ef198fe1a0255681f4f784f
+moe_output_hash128       = 6bebf6409ef198fe1a0255681f4f784f
+```
+
+Run directories:
+
+```text
+/app/aiter/my_code/moe_prefill_switch_ab_runs/20261004T055532Z
+/app/aiter/my_code/moe_prefill_switch_ab_runs/20261004T055616Z
+/app/aiter/my_code/moe_prefill_switch_ab_runs/20261004T055659Z
+```
+
+## 2026-10-04 FlyDSL-guided persistent-kernel cleanup
+
+The two dedicated persistent modules were reviewed against FlyDSL
+`rocm/main@1941889400621f1fc3d8f03bada1a4e7380cdf7e`, using the
+`flydsl-kernel-authoring`, `flydsl-tile-programming`, `kernel-code-cleanup`,
+`llvm`, `gemm-optimization`, `lds-optimization`, `prefetch-data-load`, and
+`api-stability` guidance.
+
+The cleanup deliberately preserved the tuned launch ABI, kernel names, LDS
+layout, TDM issue order, wait/barrier protocol, LLVM options, and persistent task
+schedule. It made these source-only changes:
+
+- Removed the unreferenced generic `launch_gemm_a8w4_tdm` copy and its compile
+  hints from each dedicated persistent module. Repository-wide caller analysis
+  found that only `launch_gemm_a8w4_tdm_fused_persistent` and
+  `launch_gemm_a8w4_tdm_gemm2_persistent` are imported from these modules.
+- Removed imports, constants, and helpers that became dead with those generic
+  launchers. The two files lost approximately 3.7k lines of duplicate code.
+- Replaced the GEMM2 module's remaining internal `vector.extract` use with
+  `Vec(...)[sub]`.
+- Localized the raw `flydsl._mlir.dialects.llvm` import to the exact
+  `llvm.amdgcn.s.setreg` boundary. This raw intrinsic remains intentional because
+  the available convenience helper writes a different SCHED_MODE bit.
+- Retained `SharedAllocator().allocate(...)._ptr` with an explicit explanation:
+  replacing it with `peek().ptr` changes address lowering for the t192
+  specialization and previously caused a segmentation fault.
+
+AST comparison of both retained launchers showed no executable differences
+outside the unused-value removal, local import, and the GEMM2 vector-extract API
+migration. `py_compile`, `ruff check`, and `git diff --check` all passed. The
+unfused `AITER_FLYDSL_GEMM1_FUSED_QUANT=0` fallback also compiled and passed its
+const0 hash checks.
+
+Random validation after the cleanup used:
+
+```bash
+ROUNDS=1 bash ./my_code/run_moe_prefill_switch_ab.sh \
+  e2e-random \
+  --experts 64 --tokens 1536 --topk 8 \
+  --model-dim 7168 --inter-dim 2048
+```
+
+It passed with `logits_diff=3.3849e-06` and `rel_l2=2.6019e-03`. The captured
+GEMM2 reference and output hashes were both
+`8cbca379ad3bb16f00c22b4cb1dd528f` in this run.
+
+Three independent post-cleanup groups, each using the standard `ROUNDS=3`
+command, produced:
+
+| Group | GEMM1 samples / median (us) | GEMM2 samples / median (us) | MoE e2e samples / median (us) |
+|---|---|---|---|
+| 1 | 72.839, 75.696, 71.443 / **72.839** | 52.005, 52.125, 49.252 / **52.005** | 182.82, 186.30, 180.06 / **182.82** |
+| 2 | 74.797, 75.154, 73.773 / **74.797** | 53.597, 52.159, 56.446 / **53.597** | 186.48, 184.54, 187.85 / **186.48** |
+| 3 | 78.959, 73.003, 76.332 / **76.332** | 53.620, 52.098, 51.685 / **52.098** | 193.33, 184.97, 187.03 / **187.03** |
+
+The median of the three group medians was `74.797 us` for GEMM1, `52.098 us`
+for GEMM2, and `186.48 us` for MoE e2e. Across all nine samples, the medians
+were `74.797 us`, `52.125 us`, and `186.30 us`, respectively. Every run was
+bitwise exact for const0.
+
+Because these measurements occurred later than the pre-cleanup stability batch,
+an adjacent ABBA control was also run with one fresh process per sample:
+
+| Version | GEMM1 samples / median (us) | GEMM2 samples / median (us) | MoE e2e samples / median (us) |
+|---|---|---|---|
+| Pre-cleanup control | 71.449, 75.000, 74.133 / **74.133** | 50.380, 53.024, 52.298 / **52.298** | 179.83, 182.29, 183.92 / **182.29** |
+| Cleanup | 71.283, 75.805, 70.895 / **71.283** | 51.409, 53.987, 50.688 / **51.409** | 181.15, 191.10, 179.26 / **181.15** |
+
+The adjacent comparison shows no performance regression: the cleanup medians
+were 3.84% lower for GEMM1, 1.70% lower for GEMM2, and 0.63% lower for MoE e2e.
+These differences are treated as normal machine variance rather than an
+optimization because the retained specialization bodies and generated kernel
+symbols are unchanged.
+
+Post-cleanup three-group run directories:
+
+```text
+/app/aiter/my_code/moe_prefill_switch_ab_runs/20261004T063851Z
+/app/aiter/my_code/moe_prefill_switch_ab_runs/20261004T063942Z
+/app/aiter/my_code/moe_prefill_switch_ab_runs/20261004T064030Z
+```
+
+The adjacent comparison logs are stored under:
+
+```text
+/tmp/flydsl_refactor_ab_20261004/
+```
