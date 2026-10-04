@@ -592,7 +592,7 @@ def gemm_afp4wfp4_preshuffle(
         k_tiles = triton.cdiv(K_bytes, BLOCK_K_BYTES)
         config["NUM_BUFFERS"] = min(config["NUM_BUFFERS"], k_tiles)
 
-        num_ctas = config["num_ctas"]
+        num_ctas = config.setdefault("num_ctas", 1)
         ctas_m, _ = cluster_shape(
             num_ctas, config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"]
         )
