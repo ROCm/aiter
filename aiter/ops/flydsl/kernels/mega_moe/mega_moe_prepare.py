@@ -14,7 +14,7 @@ from flydsl.runtime.device import get_rocm_arch
 from .. import communication_ops_utils as comm_ops
 from ..tensor_shim import _preload_compiled, _run_compiled, ptr_buf_tensor
 from .dispatch import DispatchSlot, emit_dispatch_group, emit_dispatch_plan
-from .quant import emit_per_1x32_mx_fp8_group
+from .quant import emit_per_1x32_mx_fp4_group, emit_per_1x32_mx_fp8_group
 
 
 @functools.cache
@@ -30,6 +30,7 @@ def compile_mega_moe_prepare(
     num_prepare_cu: int,
     num_quant_cu: int,
     quant_cu_capacity: int,
+    quant_mode: str = "fp8",
     model_dim: int,
     payload_chunk_rows: int,
     tile_state_stride: int,
@@ -50,6 +51,8 @@ def compile_mega_moe_prepare(
     prepare_blocks = int(num_prepare_cu)
     quant_blocks = int(num_quant_cu)
     quant_cu_capacity = int(quant_cu_capacity)
+    if quant_mode not in ("fp4", "fp8"):
+        raise ValueError(f"quant_mode must be fp4|fp8, got {quant_mode!r}")
     model_dim = int(model_dim)
     num_waves = 8
     chunk_rows = int(payload_chunk_rows)
@@ -70,9 +73,10 @@ def compile_mega_moe_prepare(
         ticket: fx.Array[fx.Int64, 1, 8]
         count_scratch: fx.Array[fx.Int32, total_segments, 16]
 
+    quant_suffix = "_qfp4" if quant_mode == "fp4" else ""
     kernel_name = (
         f"megamoe_prepare_compact_m{tile_m}_dcu{dispatch_blocks}_pcu{prepare_blocks}_pc{chunk_rows}"
-        f"_qcu{quant_blocks}qcap{quant_cu_capacity}"
+        f"_qcu{quant_blocks}qcap{quant_cu_capacity}{quant_suffix}"
         "_fov_runtime_dyn"
         f"_tss{tile_state_stride}_v13"
     )
@@ -131,9 +135,14 @@ def compile_mega_moe_prepare(
                 group_stride = fx.Int32(quant_blocks * block_threads)
                 group0 = quant_slot * fx.Int32(block_threads) + tid
                 for group_id in range(group0, total_groups, group_stride):
-                    emit_per_1x32_mx_fp8_group(
-                        quant_in, quant_out, quant_scale, group_id
-                    )
+                    if const_expr(quant_mode == "fp4"):
+                        emit_per_1x32_mx_fp4_group(
+                            quant_in, quant_out, quant_scale, group_id
+                        )
+                    else:
+                        emit_per_1x32_mx_fp8_group(
+                            quant_in, quant_out, quant_scale, group_id
+                        )
 
         # Quant CTAs are independent specialists.  They must retire as soon as
         # their quant groups drain instead of entering prepare's epoch/barrier
