@@ -2,7 +2,6 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 """MegaMoE v2 fused dispatch, GEMM1, GEMM2, and combine implementation."""
 
-import os
 from dataclasses import replace
 
 import flydsl.expr as fx
@@ -13,6 +12,7 @@ from ..flydsl_dispatch_combine_intranode_op import (
     FlyDSLDispatchCombineConfig,
     FlyDSLDispatchCombineIntraNodeOp,
 )
+from . import envs
 from .dispatch import DISPATCH_TABLE_SIZE, DispatchSlot
 from .mega_moe_config import (
     INDEXED_PAYLOAD_MIN_MTPR,
@@ -93,7 +93,7 @@ class MegaMoEV2:
         self.w2_scale = w2_scale if w2_scale.is_contiguous() else w2_scale.contiguous()
         self._build_fused_stage1(w1, w1_scale)
         self._build_fused_stage2()
-        if os.environ.get("AITER_MEGA_MOE_PRELOAD", "0") == "1":
+        if envs.AITER_MEGA_MOE_PRELOAD:
             self.preload_aot_bundles()
 
     def preload_aot_bundles(self):
@@ -765,7 +765,7 @@ class MegaMoEV2:
         # forward(mask_invalid_slots=...) masks -1 top-k slots in combine; this is
         # the default when the caller does not say.
         self.supports_combine_mask = True
-        self._combine_mask = os.environ.get("AITER_MEGA_COMBINE_MASK", "0") == "1"
+        self._combine_mask = envs.AITER_MEGA_COMBINE_MASK
         self._g2_topk_ids = None
         comb_cfg = self.comb_cfg
         dev = torch.device("cuda", comb_cfg.rank)

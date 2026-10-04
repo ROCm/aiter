@@ -3,7 +3,6 @@
 """Fused stage1 with low-ID dispatch producers and oversubscribed FP8xFP4 grouped-GEMM1 consumers."""
 
 import functools
-import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -20,6 +19,7 @@ from ..tensor_shim import (
     buf_copy_load,
     ptr_buf_tensor,
 )
+from . import envs
 from .dispatch import (
     DispatchSlot,
     emit_direct_fixed_slot_finalize,
@@ -220,14 +220,16 @@ def compile_mega_moe_stage1(
 
     # Compact producers read two route ids back to back and keep both rows' loads
     # in flight before storing (instead of ~4 dependent load round trips per row).
-    DISPATCH_FAST_COPY = os.environ.get("AITER_MEGA_DISPATCH_FAST_COPY", "1") == "1"
+    DISPATCH_FAST_COPY = envs.AITER_MEGA_DISPATCH_FAST_COPY
     # Fixed-slot GEMM1 with LDS-DMA A copies runs its K loop two steps per
     # iteration so the B prefetch stays in flight (compact prefill is slower
     # with it: its 8-wave tiles already hide the latency).
     K_UNROLL = 2 if (
         fixed_slot_dispatch and async_a_copy
-        and os.environ.get("AITER_MEGA_S1_FIXED_KPAIR", "1") == "1"
+        and envs.AITER_MEGA_S1_FIXED_KPAIR
     ) else 0
+    # GEMM1 quant epilogue columns per lane; keyed below and passed to GEMM1.
+    EPI_EVEC = envs.AITER_MEGA_S1_EPI_EVEC
     dispatch_path = "fixedslot" if fixed_slot_dispatch else "compact"
     swiglu_suffix = "" if swiglu_limit <= 0 else f"_sl{str(float(swiglu_limit)).replace('.', 'p')}"
     WORK_BATCH = 1
@@ -243,7 +245,7 @@ def compile_mega_moe_stage1(
         f"_rc31_wb{WORK_BATCH}_adaptive_bc"
         f"_ix{int(indexed_payload)}"
         f"{swiglu_suffix}"
-        f"_ev{os.environ.get('AITER_MEGA_S1_EPI_EVEC', '8')}b"
+        f"_ev{EPI_EVEC}b"
         f"{'_fc' if DISPATCH_FAST_COPY and not fixed_slot_dispatch else ''}"
         f"{'_kp2' if K_UNROLL == 2 else ''}"
     )
@@ -491,7 +493,7 @@ def compile_mega_moe_stage1(
             n_tiles=N_TILES, expert_offset=fz_rank * fz_epr, b_cache_modifier=b_cache_modifier,
             swizzle_a=swizzle_a, pipe_weights=pipe_weights, mfma_amajor=mfma_amajor,
             async_a_copy=async_a_copy, use_tile_resource=use_tile_resource,
-            k_unroll=K_UNROLL, out_vec_rsrc=out_vec_rsrc,
+            k_unroll=K_UNROLL, out_vec_rsrc=out_vec_rsrc, evec=EPI_EVEC,
             indirect_input=compact_dispatch and not indexed_payload,
             indexed_input=indexed_payload,
             row_map_rsrc=srcmap_rsrc,
