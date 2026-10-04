@@ -161,6 +161,7 @@ else:
             if exc.name != "flydsl":
                 raise
 
+    from .ops.paged_mqa_logits import *
     from .ops.mha import *
     from .ops.vsa_sparse_attention import vsa_sparse_attention  # noqa: F401
     from .ops.gradlib import *
