@@ -1250,16 +1250,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
         return cur_tok
 
     def _run_combine_kernel(
-        self,
-        cache,
-        key,
-        fn,
-        inp_ptr,
-        wts_ptr,
-        prx_ptr,
-        cur_tok,
-        stream,
-        tok_map_ptr=None,
+        self, cache, key, fn, inp_ptr, wts_ptr, prx_ptr, cur_tok, stream, tok_map=None
     ):
         """Compile once and reuse the cached combine launcher."""
         fixed = (
@@ -1267,7 +1258,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
             self._fx_comb_out,
             self._fx_xdb_mem,
             self._fx_xdev_flag,
-            self._fx_tok_map if tok_map_ptr is None else fx.Int64(tok_map_ptr),
+            self._fx_tok_map if tok_map is None else tok_map,
             self._fx_comb_bar,
             self._fx_trecv,
             self._fx_out_shmem_tok_id_to_src,
@@ -1433,7 +1424,8 @@ class FlyDSLDispatchCombineIntraNodeOp:
             prx_ptr,
             _cur_tok,
             stream,
-            tok_map_ptr=indices.data_ptr() if mask_topk_ids else None,
+            # Masking reads the caller's top-k ids in place of the dispatch tok_map.
+            tok_map=fx.Int64(indices.data_ptr()) if mask_topk_ids else None,
         )
 
         mt = cfg.max_num_inp_token_per_rank
