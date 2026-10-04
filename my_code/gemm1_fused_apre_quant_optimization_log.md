@@ -1575,3 +1575,38 @@ The adjacent comparison logs are stored under:
 ```text
 /tmp/flydsl_refactor_ab_20261004/
 ```
+
+### Final validation after commit and pull
+
+The cleanup was committed as `684a0b1e8b84` and pushed to
+`origin/hyg/moe_a4w4_pr_refactor`. The a07-3 `hyg_fyd_e2e:/app/aiter`
+checkout was then fast-forwarded to that commit before the final validation.
+
+The post-pull random run passed with:
+
+```text
+logits_diff=3.3849e-06
+rel_l2=2.6019e-03
+gemm2_ref_output_hash128=bfe87bce57097fb38328e7ec96775893
+gemm2_output_hash128=bfe87bce57097fb38328e7ec96775893
+```
+
+The final idle-GPU `ROUNDS=3` result was:
+
+| Metric | Samples (us) | Median (us) | Change vs pre-cleanup nine-sample median |
+|---|---|---:|---:|
+| GEMM1 | 73.847, 72.638, 75.641 | **73.847** | +0.61% |
+| GEMM2 | 51.759, 51.229, 51.464 | **51.464** | +0.17% |
+| MoE e2e | 185.79, 182.84, 184.07 | **184.07** | +0.08% |
+
+All three const0 runs had `logits_diff=0`, `rel_l2=0`, and matching GEMM1,
+GEMM2, and final MoE hashes. The host GPU/KFD check was idle before and after
+the run. The differences from the pre-cleanup medians are below 1%, and the
+adjacent ABBA comparison also favored the cleanup, so the refactor is retained
+as performance-neutral.
+
+Final run directory:
+
+```text
+/app/aiter/my_code/moe_prefill_switch_ab_runs/20261004T065004Z
+```
