@@ -50,6 +50,12 @@ ALIASES = {
 # The gluon compiler ignores these launch options, so under gluon they stay at the default.
 TRITON_ONLY_KEYS = {"matrix_instr_nonkdim", "kpack"}
 
+# Per-lane register file, read off compiled gfx1250 kernels: a wave32 lane addresses up to 1024
+# VGPRs, and a workgroup of more than 4 waves puts several on one of the 4 SIMDs, which share
+# them (8 warps: 512 each). WMMA tiles are 16x16, so a warp never holds less than 16 rows or
+# columns. Archs without an entry are not checked.
+REGISTER_FILES = {"gfx1250": {"vgprs": 1024, "simds": 4, "wave": 32, "min_tile": 16}}
+
 
 class UnknownConfigKey(Exception):
     pass
@@ -187,6 +193,31 @@ def exceeds_lds(config, spec, arch, backend):
     return buffers * tile_bytes > _LDS_CAP_BYTES.get(arch, 64 * 1024)
 
 
+def exceeds_registers(config, spec, arch, backend):
+    """True when one warp's fp32 accumulator plus one K step of its A and B fragments cannot fit
+    the VGPRs of a lane; such a config spills heavily or does not compile.
+
+    The estimate is a lower bound: every compiled gfx1250 MXFP4 preshuffle kernel that did not
+    spill used at least 1.19x of it, so only configs that must spill are rejected.
+    """
+    registers = REGISTER_FILES.get(arch)
+    if backend != "gluon" or registers is None or spec.warp_split is None:
+        return False
+    warps = spec.warp_split(config["num_warps"])
+    if warps is None:  # no layout for this warp count: the kernel's own rules reject it
+        return False
+    block_m = config.get("BLOCK_SIZE_M", config.get("BLOCK_M"))
+    block_n = config.get("BLOCK_SIZE_N", config.get("BLOCK_N"))
+    block_k = config.get("BLOCK_SIZE_K", config.get("BLOCK_K"))
+    ctas_m, ctas_n = spec.cta_split(config) if spec.cta_split is not None else (1, 1)
+    rows = max(block_m // ctas_m // warps[0], registers["min_tile"])
+    cols = max(block_n // ctas_n // warps[1], registers["min_tile"])
+    warp_bits = rows * cols * 32 + (rows * spec.bits[0] + cols * spec.bits[1]) * block_k
+    lane_vgprs = warp_bits / 32 / registers["wave"]
+    budget = registers["vgprs"] // cdiv(config["num_warps"], registers["simds"])
+    return lane_vgprs > budget
+
+
 def build_space(spec, shape, backend, arch, kernel_should_skip):
     """All configs to benchmark for one shape, plus a report of how the space was built."""
     keys, buckets, default_path = load_defaults(spec, backend)
@@ -205,7 +236,7 @@ def build_space(spec, shape, backend, arch, kernel_should_skip):
 
     def prune(candidate_lists):
         configs = []
-        skipped = {"generic rules": 0, "LDS": 0, "kernel rules": 0}
+        skipped = {"generic rules": 0, "LDS": 0, "registers": 0, "kernel rules": 0}
         for combination in itertools.product(*candidate_lists.values()):
             config = dict(zip(keys, combination))
             if should_skip_generic(shape, config, backend):
@@ -213,6 +244,9 @@ def build_space(spec, shape, backend, arch, kernel_should_skip):
                 continue
             if exceeds_lds(config, spec, arch, backend):
                 skipped["LDS"] += 1
+                continue
+            if exceeds_registers(config, spec, arch, backend):
+                skipped["registers"] += 1
                 continue
             if kernel_should_skip is not None and kernel_should_skip(config):
                 skipped["kernel rules"] += 1

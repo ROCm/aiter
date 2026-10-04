@@ -79,6 +79,9 @@ class KernelSpec:
     gluon_candidates: dict = field(default_factory=dict)
     # (config) -> (ctas_m, ctas_n): how the kernel splits BLOCK_SIZE_M/N over a CTA cluster
     cta_split: Callable | None = None
+    # (num_warps) -> (warps_m, warps_n): how the gluon kernel spreads one CTA's tile over its
+    # warps, for the register check; None (or a None result) leaves that check off
+    warp_split: Callable | None = None
 
     def default_backend(self, arch):
         return "gluon" if arch in self.gluon_default_archs else "triton"
@@ -699,10 +702,16 @@ def mxfp4_cta_split(config):
     )
 
 
+def mxfp4_warp_split(num_warps):
+    """Warps along M and N: the warp_bases of get_gemm_afp4wfp4_preshuffle_layouts."""
+    return {2: (2, 1), 4: (2, 2), 8: (4, 2)}.get(num_warps)
+
+
 @kernel(
     "GEMM-AFP4WFP4_PRESHUFFLED",
     bits=(4, 4),
     cta_split=mxfp4_cta_split,
+    warp_split=mxfp4_warp_split,
     gluon_archs=("gfx1250",),
     gluon_default_archs=("gfx1250",),
     backend_kwarg=False,

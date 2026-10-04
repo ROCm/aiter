@@ -11,7 +11,7 @@ per M -> validate and install the config file.
 | --- | --- |
 | Where do I add a kernel? | One function in `kernels.py` decorated with `@kernel(...)`; the module docstring shows a complete example |
 | Where do I change candidate values? | `SEARCH_SPACE` in `space.py` |
-| Why was this config skipped? | `space.py`: the shape filters, `should_skip_generic` and `exceeds_lds`, plus the kernel's own `should_skip` in `kernels.py`. The driver prints how many combinations each rule removed |
+| Why was this config skipped? | `space.py`: the shape filters, `should_skip_generic`, `exceeds_lds` and `exceeds_registers`, plus the kernel's own `should_skip` in `kernels.py`. The driver prints how many combinations each rule removed |
 | How did this winner get installed? | `write_best_configs.py`: `load_winners` -> `assign_buckets` -> `build_table` -> write -> confirmation through `get_gemm_config` |
 
 | File | What it does |
@@ -63,7 +63,11 @@ that do not divide K), the generic rules in `space.py` (the old split-K pruning 
 when the keys exist, and an LDS check: a block-size combination whose buffers x (A tile + B tile)
 exceed the arch's LDS is never compiled; each kernel declares its element widths as `bits=(a, b)`,
 and a kernel whose `num_ctas` splits the tile over a CTA cluster declares `cta_split`, so the
-check counts one CTA's share)
+check counts one CTA's share; and a register check: a config whose fp32 accumulator plus one K
+step of A and B fragments needs more VGPRs per lane than the arch gives (`REGISTER_FILES`: 1024
+on gfx1250, 512 with 8 warps, which put two waves on a SIMD) must spill and is never compiled;
+it runs for gluon kernels that declare their warp layout as `warp_split`, and the estimate is a
+lower bound: every gfx1250 MXFP4 kernel that compiled without spilling used at least 1.19x of it)
 and the kernel's own `should_skip(config)` in `kernels.py` (what the kernel asserts, and buffer
 counts its wrapper clamps so they would only repeat another candidate). Every rule returns True
 to reject. If the kernel rejects every tile that fits the shape (a kernel that needs 64-row tiles
@@ -123,7 +127,8 @@ Config reads are cached per process, so restart Python to pick up a new file.
 
 Kernel: add one function to `kernels.py`, decorated with `@kernel(<config family>, ...)` giving the
 dims, the element widths, where the gluon path exists and the M bounds the kernel's `_get_config`
-passes. The function generates the inputs once and returns `(call, inputs, should_skip)`:
+passes (and, for a gluon kernel, its warp layout as `warp_split`, which turns on the register
+check). The function generates the inputs once and returns `(call, inputs, should_skip)`:
 `call(config, *inputs)` launches the public wrapper with `config=config` (and resets outputs or adds
 derived keys there), `should_skip(config)` returns True for configs the kernel would reject (or is
 `None`). The `kernels.py` docstring has a complete example. Key: add it to `SEARCH_SPACE` in

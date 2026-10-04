@@ -26,8 +26,12 @@ here. Update this file in the same change as any behaviour change.
    `Unknown config key 'X' in <DEFAULT.json>: add it to SEARCH_SPACE in space.py first`. Never pin
    or skip it silently.
 3. The whole `SEARCH_SPACE` is swept. No CLI overrides, no caps, no sampling. Pruning is: the
-   shape filters, `should_skip_generic` and `exceeds_lds` in `space.py`, then the kernel's own
-   `should_skip(config)`. Every rule returns True to reject; `build_space` reads as separate
+   shape filters, `should_skip_generic`, `exceeds_lds` and `exceeds_registers` in `space.py`, then
+   the kernel's own `should_skip(config)`. The register check rejects only configs that must spill:
+   its estimate (one warp's fp32 accumulator plus one K step of A and B fragments per lane) is a
+   lower bound checked against compiled kernels, and must stay one, never a tighter guess that
+   could drop a config that fits. It runs for gluon kernels that declare `warp_split` on archs in
+   `REGISTER_FILES`. Every rule returns True to reject; `build_space` reads as separate
    `if ...: continue` checks. When the kernel rejects every tile that fits the shape, `build_space`
    allows block sizes above the shape for that M (`oversized_tiles_allowed` in the plan). `gluon_candidates` is only for a key whose meaning differs under
    gluon (gfx1250 a8w8 blockscale `num_stages` is `NUM_BUFFERS`).
@@ -75,7 +79,9 @@ One function in `kernels.py`, decorated with `@kernel(config_name, ...)`: `confi
 the kernel's `_get_config` passes it, `dims` (`("B", "M", "N", "K")` for batched), `bits` (A and B
 element widths as they sit in LDS, scales not counted), `cta_split` when a key such as
 `num_ctas` makes `BLOCK_SIZE_M/N` a cluster tile (returns how the kernel splits it, so the LDS
-check and `should_skip` judge one CTA's share), `gluon_archs` / `gluon_default_archs` /
+and register checks and `should_skip` judge one CTA's share), `warp_split` from the gluon
+kernel's warp layout (warps along M and N per `num_warps`; without it the register check is off),
+`gluon_archs` / `gluon_default_archs` /
 `backend_kwarg` from the wrapper, `bounds` copied from the kernel's `_get_config` (the CLI K is the
 logical K, so no K transform is needed). The function builds the inputs once with the `op_tests`
 generator, preallocates the output, and returns `(call, inputs, should_skip)`;
