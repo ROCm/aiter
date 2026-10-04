@@ -493,7 +493,7 @@ def get_mla_v4_nm_ps_workspace(device="cuda", num_partitions=128) -> MlaV4NmPsWo
             "CUDA-graph capture"
         )
     P = num_partitions
-    i32 = dict(dtype=dtypes.i32, device=device)
+    i32 = {"dtype": dtypes.i32, "device": device}
     return MlaV4NmPsWorkspace(
         o_acc=torch.empty(2 * P, 128, 512, dtype=dtypes.fp32, device=device),
         lse_acc=torch.empty(2 * P, 128, dtype=dtypes.fp32, device=device),

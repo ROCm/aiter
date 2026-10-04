@@ -2641,15 +2641,15 @@ def _ps_inputs(kv_lens, seed=0, pool=None, device="cuda"):
         0, pool, (max(total, 1),), generator=g, device=device, dtype=torch.int32
     )
     sink = torch.randn(_PS_HEADS, generator=g, device=device) * 2.0
-    return dict(
-        q_packed=qp,
-        q_rope=qr.contiguous(),
-        kv_packed=kp,
-        kv_rope=kr.contiguous(),
-        kv_indptr=kv_indptr,
-        kv_page_indices=kv_page_indices,
-        sink=sink,
-    )
+    return {
+        "q_packed": qp,
+        "q_rope": qr.contiguous(),
+        "kv_packed": kp,
+        "kv_rope": kr.contiguous(),
+        "kv_indptr": kv_indptr,
+        "kv_page_indices": kv_page_indices,
+        "sink": sink,
+    }
 
 
 def _ps_call(inp, ws, out=None, lse=None, return_lse=True, kv_indptr=None):
@@ -2837,9 +2837,8 @@ def test_v4_nm_ps_cudagraph_replay(ps_workspace):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run()
-    with pytest.raises(RuntimeError):
-        with torch.cuda.graph(torch.cuda.CUDAGraph()):
-            aiter.mla.get_mla_v4_nm_ps_workspace()
+    with pytest.raises(RuntimeError), torch.cuda.graph(torch.cuda.CUDAGraph()):
+        aiter.mla.get_mla_v4_nm_ps_workspace()
 
     g = np.random.default_rng(7)
     for lens in (
