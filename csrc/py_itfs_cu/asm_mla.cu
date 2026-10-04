@@ -10,7 +10,9 @@ namespace mla_dsl {
 #include "aiter_ctypes_error.h"
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
+#include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <memory>
 #include <unordered_map>
@@ -171,7 +173,11 @@ std::string get_heuristic_kernel_mla(std::string q_type,
         if (el.first.find(arch_id) != 0)
             continue;
         const auto& cfg = el.second;
-        
+
+        // Gluon-shuffled page64 rows use the dedicated 88-byte launcher.
+        if (cfg.kv_shuffled != 0)
+            continue;
+
         if (cfg.qType != q_type || cfg.kvType != kv_type)
             continue;
         if (cfg.Gqa != gqa || cfg.ps != ps || cfg.prefill != prefill)
@@ -1504,4 +1510,145 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                              1,           // cluster_y
                              1,           // cluster_z
                              static_cast<unsigned int>(cfg->dyn_lds)});
+}
+
+// QH128 decode over the Gluon-shuffled FP8 page64 cache.
+namespace {
+struct MlaPs64Qh128Args
+{
+    const void* q;
+    const void* kv;
+    const void* seq_lens;
+    const void* page_table;
+    void* out;
+    void* lse;
+    const void* q_scale;
+    const void* kv_scale;
+    float softmax_scale;
+    uint32_t q_stride;
+    uint32_t physical_pages;
+    uint32_t page_table_stride;
+    uint32_t page_table_width;
+    uint32_t reserved;
+};
+static_assert(sizeof(MlaPs64Qh128Args) == 88);
+static_assert(offsetof(MlaPs64Qh128Args, q) == 0 && offsetof(MlaPs64Qh128Args, kv) == 8);
+static_assert(offsetof(MlaPs64Qh128Args, seq_lens) == 16 &&
+              offsetof(MlaPs64Qh128Args, page_table) == 24);
+static_assert(offsetof(MlaPs64Qh128Args, out) == 32 && offsetof(MlaPs64Qh128Args, lse) == 40);
+static_assert(offsetof(MlaPs64Qh128Args, q_scale) == 48 &&
+              offsetof(MlaPs64Qh128Args, kv_scale) == 56);
+static_assert(offsetof(MlaPs64Qh128Args, softmax_scale) == 64);
+static_assert(offsetof(MlaPs64Qh128Args, q_stride) == 68);
+static_assert(offsetof(MlaPs64Qh128Args, physical_pages) == 72);
+static_assert(offsetof(MlaPs64Qh128Args, page_table_stride) == 76);
+static_assert(offsetof(MlaPs64Qh128Args, page_table_width) == 80);
+static_assert(offsetof(MlaPs64Qh128Args, reserved) == 84);
+
+void check_mla_ps64_qh128_tensor(
+    const aiter_tensor_t* t, const char* name, AiterDtype dtype, int device, bool contiguous = true)
+{
+    AITER_CHECK(
+        t != nullptr && t->is_gpu() && t->device_id == device, name, " must be on the Q device");
+    AITER_CHECK(t->dtype() == dtype, name, " has an unsupported dtype");
+    AITER_CHECK(t->data_ptr() != nullptr || t->numel() == 0, name, " has a NULL pointer");
+    AITER_CHECK(!contiguous || t->is_contiguous(), name, " must be contiguous");
+}
+} // namespace
+
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
+    mla_ps64_qh128_fp8_asm_fwd,
+    (aiter_tensor_t * q,
+     aiter_tensor_t* kv,
+     aiter_tensor_t* seq_lens,
+     aiter_tensor_t* page_table,
+     aiter_tensor_t* out,
+     aiter_tensor_t* lse,
+     aiter_tensor_t* q_scale,
+     aiter_tensor_t* kv_scale,
+     float softmax_scale,
+     hipStream_t stream),
+    (q, kv, seq_lens, page_table, out, lse, q_scale, kv_scale, softmax_scale, stream))
+{
+    AITER_CHECK(q != nullptr && q->is_gpu(), "Q must be a GPU tensor");
+    const HipDeviceGuard guard(q->device_id);
+    const std::string arch_id = get_gpu_arch();
+    AITER_CHECK(arch_id == "gfx1250", "mla_ps64_qh128_fp8_asm_fwd requires gfx1250");
+    check_mla_ps64_qh128_tensor(q, "Q", AITER_DTYPE_fp8, q->device_id, false);
+    check_mla_ps64_qh128_tensor(kv, "KV", AITER_DTYPE_fp8, q->device_id);
+    check_mla_ps64_qh128_tensor(seq_lens, "seq_lens", AITER_DTYPE_i32, q->device_id);
+    check_mla_ps64_qh128_tensor(page_table, "page_table", AITER_DTYPE_i32, q->device_id, false);
+    check_mla_ps64_qh128_tensor(out, "out", AITER_DTYPE_bf16, q->device_id);
+    check_mla_ps64_qh128_tensor(q_scale, "q_scale", AITER_DTYPE_fp32, q->device_id);
+    check_mla_ps64_qh128_tensor(kv_scale, "kv_scale", AITER_DTYPE_fp32, q->device_id);
+    AITER_CHECK(q->dim() == 3 && q->size(1) == 128 && q->size(2) == 576, "Q must be [B,128,576]");
+    const int64_t batch = q->size(0);
+    AITER_CHECK(batch < (int64_t{1} << 32) / (128 * 4), "batch exceeds kernel address range");
+    AITER_CHECK(q->stride(2) == 1 && (q->stride(1) == 576 || q->stride(1) == 768) &&
+                    q->stride(0) == 128 * q->stride(1),
+                "Q requires dense batches with head stride 576 or 768");
+    AITER_CHECK(kv->dim() == 4 && kv->size(1) == 1 && kv->size(2) == 64 && kv->size(3) == 576 &&
+                    kv->size(0) > 0 && kv->size(0) <= INT32_MAX,
+                "KV must be contiguous Gluon-shuffled [physical_pages,1,64,576]");
+    AITER_CHECK(seq_lens->dim() == 1 && seq_lens->size(0) == batch, "seq_lens must be [B]");
+    AITER_CHECK(page_table->dim() == 2 && page_table->size(0) == batch &&
+                    page_table->stride(1) == 1 && page_table->stride(0) > 0 &&
+                    page_table->size(1) < (int64_t{1} << 25) &&
+                    page_table->stride(0) <= UINT32_MAX &&
+                    batch * page_table->stride(0) < (int64_t{1} << 32),
+                "page_table requires [B,max_pages], unit inner stride, and uint32 offsets");
+    AITER_CHECK(out->dim() == 3 && out->size(0) == batch && out->size(1) == 128 &&
+                    out->size(2) == 512,
+                "out must be [B,128,512]");
+    if(lse != nullptr)
+    {
+        check_mla_ps64_qh128_tensor(lse, "lse", AITER_DTYPE_fp32, q->device_id);
+        AITER_CHECK(lse->dim() == 2 && lse->size(0) == batch && lse->size(1) == 128,
+                    "lse must be [B,128]");
+    }
+    AITER_CHECK(q_scale->numel() == 1 && kv_scale->numel() == 1,
+                "q_scale and kv_scale must each contain one FP32 scalar");
+    AITER_CHECK(std::isfinite(softmax_scale), "softmax_scale must be finite");
+    if(batch == 0)
+        return;
+
+    // Select the Gluon-shuffled page64 ABI from the shared MLA manifest.
+    // Its single lse=0 row also supports optional LSE through a nullable pointer.
+    const mlaConfig* config = nullptr;
+    for(const auto& entry : cfg_mla_asm)
+    {
+        const auto& cfg = entry.second;
+        if(cfg.arch == arch_id && cfg.qType == "fp8" && cfg.kvType == "fp8" &&
+           cfg.Gqa == q->size(1) && cfg.ps == 0 && cfg.qSeqLen == 1 &&
+           cfg.prefill == 0 && cfg.causal == 0 && cfg.lse == 0 && cfg.cprr == 0 &&
+           cfg.page_size == kv->size(2) && cfg.kv_shuffled == 1)
+        {
+            config = &cfg;
+            break;
+        }
+    }
+    AITER_CHECK(config != nullptr, "mla_ps64_qh128_fp8_asm_fwd: no matching MLA kernel configuration");
+
+    // Cache by device and symbol; warm up before graph capture.
+    static SynchronizedCache<std::string, AiterAsmKernel> kernels;
+    const std::string key = std::to_string(q->device_id) + ":" + config->knl_name;
+    auto& kernel = kernels.get_or_create(key, [&]() {
+        return AiterAsmKernel(config->knl_name.c_str(), config->co_name.c_str());
+    });
+    MlaPs64Qh128Args args{q->data_ptr(),
+                         kv->data_ptr(),
+                         seq_lens->data_ptr(),
+                         page_table->data_ptr(),
+                         out->data_ptr(),
+                         lse == nullptr ? nullptr : lse->data_ptr(),
+                         q_scale->data_ptr(),
+                         kv_scale->data_ptr(),
+                         softmax_scale,
+                         static_cast<uint32_t>(q->stride(1)),
+                         static_cast<uint32_t>(kv->size(0)),
+                         static_cast<uint32_t>(page_table->stride(0)),
+                         static_cast<uint32_t>(page_table->size(1)),
+                         0};
+    size_t size = sizeof(args);
+    kernel.launch_kernel({&args, &size, static_cast<int>(batch), 1, 1, 128, 1, 1, stream});
 }
