@@ -1,0 +1,11 @@
+{
+    "flash_kda_segment_kernel": {
+        "candidates": [
+            {
+                "BW": 16,
+                "num_warps": 1,
+                "num_stages": 3
+            }
+        ]
+    }
+}
