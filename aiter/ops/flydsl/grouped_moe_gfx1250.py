@@ -1087,6 +1087,25 @@ def _grouped_a8w4_tdm_moe(
         and (_gemm1_a_preshuffle == _gemm2_a_preshuffle)
         and _stage_output_capture is None
     )
+    _fused_gemm1_n_warp = (
+        4
+        if (
+            _fuse_quant
+            and E == 64
+            and token_num == 1536
+            and topk == 8
+            and model_dim == 7168
+            and inter_dim == 2048
+            and tile_m == 192
+            and tile_n == 256
+            and tile_k == 256
+            and m_warp == 2
+            and n_warp == 2
+            and num_buffers == 4
+            and cluster_n == 4
+        )
+        else n_warp
+    )
     w1_u8 = _grouped_weight_uint8(w1)
     w1s_i32 = w1_scale.reshape(-1).view(torch.int32)
 
@@ -1121,7 +1140,7 @@ def _grouped_a8w4_tdm_moe(
             tile_n=tile_n,
             tile_k=tile_k,
             m_warp=m_warp,
-            n_warp=n_warp,
+            n_warp=_fused_gemm1_n_warp,
             out_is_f16=out_is_f16,
             a_is_fp4=_a_is_fp4,
             stage1_act=stage1_act,
@@ -1344,7 +1363,7 @@ def _grouped_a8w4_tdm_moe(
                         tile_n=tile_n,
                         tile_k=tile_k,
                         m_warp=m_warp,
-                        n_warp=n_warp,
+                        n_warp=_fused_gemm1_n_warp,
                         out_is_f16=out_is_f16,
                         a_is_fp4=_a_is_fp4,
                         stage1_act=stage1_act,

@@ -41,6 +41,35 @@ The final source SHA256 is:
 964651c9d75565f8ea416f252714d0dacdfd2bdd06fab1962735bbc2dddbbf96
 ```
 
+## New 20% optimization campaign baseline
+
+The optimization campaign uses the frozen v21 implementation with production
+kernel suffix `apreqb16batchs16direct_scaletdm`. The target remains exactly
+`E64/T1536/topk8/M7168/I2048`, A4W4, SiLU, no bias. Kernel eligibility,
+quantized output layout, arithmetic semantics, and accuracy requirements must
+remain unchanged.
+
+The baseline was measured on a07-3 after confirming that every GPU and KFD were
+idle before and after the command:
+
+```bash
+ROUNDS=3 bash ./my_code/run_moe_prefill_switch_ab.sh \
+  e2e-const0 \
+  --experts 64 --tokens 1536 --topk 8 \
+  --model-dim 7168 --inter-dim 2048
+```
+
+Results:
+
+| Metric | Samples (us) | Median (us) |
+|---|---|---:|
+| fused GEMM1 | 96.858, 103.192, 93.843 | **96.858** |
+| MoE e2e | 225.85, 238.55, 223.74 | **225.85** |
+
+All three rounds reported `logits_diff=0`, `rel_l2=0`, matching GEMM1 and GEMM2
+hashes, and matching MoE/reference output hashes. A 20% GEMM1 latency reduction
+from this baseline requires a median no greater than **77.486 us**.
+
 This document records only:
 
 1. the first implementation that passes correctness;
@@ -724,6 +753,63 @@ and GEMM2 hashes, and matching MoE/reference output hashes. An earlier baseline
 attempt at `20261002T141054Z` hit a GPU page fault during round 2 and is excluded
 from every table and aggregate above.
 
+## Retained v49: eight-wave latency hiding with wave-private payload stores
+
+The new campaign baseline used the frozen four-wave v21 kernel. The first
+retained change adapts the GEMM2 eight-wave latency-hiding method to fused
+GEMM1 while preserving the exact target shape and output formats:
+
+- change only the target fused E64/T1536 GEMM1 workgroup from `w2x2` to `w2x4`;
+- halve each wave's N range, accumulator footprint, and SiLU/quant work;
+- allow two resident waves per physical SIMD to hide XDL, TRANS, and LDS stalls;
+- keep `waves_per_tensor_tdm=2`, giving every wave one input TDM job;
+- keep the original two-kernel path at `w2x2`;
+- stage each wave's FP4 payload contiguously in LDS and issue one independent
+  output TDM per wave;
+- write one ScaleA byte per `wave_n`, preserving the original four-byte
+  preshuffled scale row exactly;
+- leave the target dimensions, arithmetic, BF16 rounding point, MXFP4 packing,
+  ScaleA layout, and GEMM2 interface unchanged.
+
+The initial eight-wave collective-output prototype was rejected because a
+single eight-wave payload descriptor read the interleaved LDS layout
+incorrectly. Its ScaleA result was exact, but the payload and downstream output
+were wrong. Repacking temporary LDS as `[wave][wm][256 bytes]` and using one
+payload descriptor per wave fixed the issue.
+
+Correctness was verified with random seeds 0, 1, and 2 and with const0. Every
+case produced byte-identical payload and ScaleA data, bitwise-identical GEMM2
+valid rows, and bitwise-identical MoE output.
+
+Performance command:
+
+```bash
+ROUNDS=3 bash ./my_code/run_moe_prefill_switch_ab.sh \
+  e2e-const0 \
+  --experts 64 --tokens 1536 --topk 8 \
+  --model-dim 7168 --inter-dim 2048
+```
+
+| Version | Group | Fused GEMM1 samples (us) | GEMM1 median (us) | MoE samples (us) | MoE median (us) |
+|---|---:|---|---:|---|---:|
+| four-wave v21 baseline | 1 | 96.858, 103.192, 93.843 | **96.858** | 225.85, 238.55, 223.74 | **225.85** |
+| eight-wave v49 | 1 | 234.540, 83.638, 82.238 | **83.638** | 780.09, 210.99, 207.67 | **210.99** |
+| eight-wave v49 | 2 | 83.022, 85.025, 86.761 | **85.025** | 209.91, 210.20, 209.14 | **209.91** |
+| eight-wave v49 | 3 | 79.012, 81.059, 84.559 | **81.059** | 197.92, 209.48, 209.95 | **209.48** |
+
+The median of the three v49 group medians is **83.638 us** for fused GEMM1 and
+**209.91 us** for MoE. Relative to the campaign baseline, this reduces fused
+GEMM1 latency by **13.65%** and MoE latency by **7.06%**. The first sample of
+the first retained group was a large machine transient; keeping it does not
+change that group's median. An earlier v49 run at `20261002T160815Z` was
+discarded because another user's GPU job began at the measurement boundary.
+
+The retained v49 kernel source SHA256 is:
+
+```text
+44323518045e800d657758203860140b18189ea455839f99fc35a4f2764bb6f7
+```
+
 ## Rejected v46 experiment: v21 with tanh chunk 8
 
 This experiment copied the validated v21 source and changed only the fused
@@ -776,3 +862,573 @@ Tanh chunk 8 regressed the fused GEMM1 by 1.300 us (1.36%) and MoE by
 of the three paired GEMM1 groups improved, and only one paired MoE group
 improved. The change therefore has no stable performance benefit and was
 rejected; the active source was restored to v21 after measurement.
+
+## Post-reboot v56 / v111 / v115 comparison and invalid-block trace
+
+The a07-3 machine was rebooted again before this comparison. Every accepted
+performance run was preceded by `/data/yanguahe/code/gpu_users.sh` reporting no
+GPU/KFD users. The common reproduction command was:
+
+```bash
+ROUNDS=3 bash ./my_code/run_moe_prefill_switch_ab.sh \
+  e2e-const0 \
+  --experts 64 --tokens 1536 --topk 8 \
+  --model-dim 7168 --inter-dim 2048
+```
+
+The compared kernels were:
+
+- v56: persistent four-task pipeline with WMMA `reuseB`;
+- v111: v56 with `amdgpu-expert-scheduling-mode` disabled for this launcher;
+- v115: v111 with `MMA_GROUP=2` instead of 4.
+
+| Version | Fused GEMM1 samples (us) | GEMM1 median (us) | GEMM2 samples (us) | GEMM2 median (us) | MoE samples (us) | MoE median (us) |
+|---|---|---:|---|---:|---|---:|
+| v56 baseline | 82.844, 81.783, 78.905 | **81.783** | 76.434, 66.843, 64.818 | **66.843** | 216.16, 211.15, 203.88 | **211.15** |
+| v111 no expert scheduler | 84.557, 82.596, 80.510 | **82.596** | 71.760, 65.979, 63.468 | **65.979** | 215.30, 210.31, 207.33 | **210.31** |
+| v115 no expert scheduler + `MMA_GROUP=2` | 80.950, 80.733, 79.025 | **80.733** | 62.186, 66.011, 68.761 | **66.011** | 203.23, 203.89, 208.40 | **203.89** |
+
+On this post-reboot machine state, v115 is the measured winner. Its GEMM1
+median is 1.050 us (1.28%) below v56. The machine remains variable, so the
+GEMM2 and MoE differences are retained as observed pipeline measurements rather
+than attributed entirely to the GEMM1 change.
+
+Random seed 0 validation for v115 was byte exact against the unfused producer:
+
+```text
+payload mismatch=0
+ScaleA mismatch=0
+GEMM2 valid-row bitwise mismatch=0
+MoE output bitwise mismatch=0
+logits_diff=3.3849e-06
+rel_l2=2.6019e-03
+```
+
+The retained v115 kernel source SHA256 is:
+
+```text
+e42894e0fb12d842b55a087e8a1bcce9a1758a1be17d9d4a611f6f1a09a501fb
+```
+
+The post-reboot all-SIMD v115 ATT capture is stored at:
+
+```text
+/app/aiter/my_code/thread_trace_runs/gemm1_fused_v115_att_all_simd_a07_reboot_20261003
+```
+
+Four independent captures selected SIMD0, SIMD1, SIMD2, and SIMD3. Across all
+32 observed physical slots, the longest slot window was
+`SIMD0/SE0/CU1/slot0`:
+
+| Block class | Begin | End | Lifetime cycles | Instructions | WMMA | TDM |
+|---|---:|---:|---:|---:|---:|---:|
+| valid | 111823 | 246431 | 134608 | 16731 | 2688 | 120 |
+
+This strict maximum slot contains no invalid expert block. Its invalid-block
+fraction is therefore exactly `0 / 134608 = 0.000000%` for both active cycles
+and the complete slot window.
+
+Because the captured maximum happened to contain only one block, the analysis
+also selected the longest slot that actually ran multiple blocks. That slot was
+`SIMD0/SE3/CU1/slot1`:
+
+| Block class | Begin | End | Lifetime cycles | Instructions | WMMA | TDM |
+|---|---:|---:|---:|---:|---:|---:|
+| valid | 101696 | 234523 | 132827 | 16882 | 2688 | 120 |
+| invalid expert | 234616 | 236030 | 1414 | 281 | 0 | 0 |
+
+The two active lifetimes sum to 134241 cycles. The invalid block accounts for
+`1414 / 134241 = 1.053329%` of active block cycles. The complete slot window is
+134334 cycles, including a 93-cycle inter-block gap, so the invalid block
+accounts for `1414 / 134334 = 1.052600%` of that slot's wall-clock cycle window.
+
+The invalid-wave classification is structural rather than duration-only: each
+invalid wave contains zero `v_wmma_*` and zero `tensor_*` instructions and
+terminates after the scalar lookup/control path with `s_wait_tensorcnt 0x0`
+followed by `s_endpgm`. A valid wave executes 2688 WMMA instructions and 120 TDM
+instructions in the all-SIMD capture.
+
+### v115 critical-slot wait and stall breakdown
+
+The strict critical slot above contains one complete valid wave with a
+134608-cycle lifetime. Summing every executed instruction of each requested
+class gives:
+
+| Instruction class | Executions | Total latency cycles | Latency / kernel | Stall cycles | Stall / kernel |
+|---|---:|---:|---:|---:|---:|
+| `s_wait_tensorcnt` | 117 | 1814 | **1.347617%** | 1697 | **1.260698%** |
+| `s_wait_dscnt` | 832 | 15010 | **11.150897%** | 14178 | **10.532806%** |
+| `s_barrier_wait` | 116 | 30030 | 22.309224% | 29914 | **22.223048%** |
+| `v_wmma_*` | 2688 | 32939 | 24.470314% | 8747 | **6.498128%** |
+| `s_wait_kmcnt` | 9 | 1844 | 1.369904% | 1835 | 1.363218% |
+| `ds_load_*` | 5184 | 6432 | 4.778319% | 1248 | 0.927137% |
+
+Together, all `s_wait_tensorcnt` and `s_wait_dscnt` instructions account for
+16824 latency cycles, or **12.498514%** of the critical wave lifetime. Their
+pure stall contribution is 15875 cycles, or **11.793504%**.
+
+The dominant individual DS wait is the repeated hot-loop ring-reuse fence:
+
+```text
+s_wait_tensorcnt 0x2
+s_wait_dscnt 0x0
+s_barrier_signal -1
+s_barrier_wait 0xffff
+tensor_load_to_lds ...
+```
+
+The `s_wait_dscnt 0x0` at code index 1344 executes 93 times and contributes
+11280 stall cycles by itself, or **8.379888%** of the complete critical wave.
+
+The largest tensor waits are:
+
+- next-persistent-task `s_wait_tensorcnt 0x1`: 939 stall cycles;
+- final output drain `s_wait_tensorcnt 0x0`: 445 stall cycles;
+- repeated steady `s_wait_tensorcnt 0x2`: 257 stall cycles.
+
+Across all 32 complete valid waves from the four SIMD captures, the weighted
+stall shares are 10.459015% for `s_wait_dscnt`, 3.837586% for
+`s_wait_tensorcnt`, 12.324430% for `s_barrier_wait`, and 8.381495% for
+`v_wmma_*`. The critical slot shifts most peer-side tensor latency into its
+barrier wait: its tensor wait share is only 1.26%, while its barrier wait share
+is 22.22%.
+
+The primary bottleneck is therefore workgroup synchronization plus LDS ring
+reuse, not raw TDM completion. The repeated DS drain and workgroup rendezvous
+consume 32.76% of the critical wave as stall, and all explicit wait/barrier
+classes (`tensorcnt`, `dscnt`, `kmcnt`, `xcnt`, and barrier wait) consume
+35.442916%. WMMA arbitration is the next material bottleneck at 6.50% stall.
+
+## MI400 LDS segment-layout experiments: v116 through v135
+
+The next optimization series targeted the dominant hot-loop `s_wait_dscnt 0x0`.
+The design was based on the local MI400 hardware documentation rather than on a
+generic LDS bank-conflict model:
+
+- `MI400_Shader_Programming#65.txt`, section 4.7.1 (page 169), states that LDS
+  has 64 banks of 4 bytes, is physically divided into 64 KiB segments, and uses
+  address mapping `{Segment[2:0], SRAM_address[7:0], Bank[5:0],
+  ByteInBank[1:0]}`.
+- `architecture/system.txt`, section 4.1.3.2, states that the two ports may
+  access different segments simultaneously for up to 512 B/cycle load
+  bandwidth, while two ports contending for one segment are serialized.
+- `HGEMM_Optimizations_And_Recommendations#1.txt`, pages 18-21, recommends
+  placing A and B in different segments, interleaving their loads, placing the
+  two resident A copies in different segments, and using the physical-to-logical
+  wave permutation `(w0,w1,w2,w3,w4,w5,w6,w7) ->
+  (w0,w2,w1,w3,w4,w6,w5,w7)`. It also confirms the 16-byte-per-1024-byte input
+  padding used by this kernel.
+
+The unmodified v115 all-SIMD trace had 3,981,044 total valid-wave cycles.
+`s_wait_dscnt` contributed 416,378 stall cycles (10.459%), and the repeated hot
+`s_wait_dscnt 0x0` averaged 122.3 cycles over 93 executions on the critical
+wave.
+
+### v116 and v117: separate the resident A halves
+
+v116 moved the two wave-M halves of A into different 64 KiB segments. v117 also
+moved each half's ScaleA beside its A data. Both preserved the arithmetic and
+the persistent pipeline. v117 measured 77.068 us in its retained three-sample
+run and was the better of the two layouts.
+
+| Version | Valid-wave cycles | `s_wait_dscnt` stall | `s_barrier_wait` stall | `s_wait_tensorcnt` stall | `ds_load` stall |
+|---|---:|---:|---:|---:|---:|
+| v116 A split | 4,176,029 | 8.405% | 15.404% | 4.558% | 1.270% |
+| v117 A + ScaleA split | 4,037,165 | 8.344% | 14.991% | 4.971% | 0.929% |
+
+The DS waits improved, but the saved cycles moved into workgroup-barrier wait.
+This established that segment placement must also preserve arrival balance
+between the two resident wave slots.
+
+### v123: cyclic four-segment packing, retained winner
+
+v123 packs every persistent ring stage into the four existing 64 KiB segments:
+
+- stage `s`, `wave_m=0` A/ScaleA: front of segment `s`;
+- stage `s`, `wave_m=1` A/ScaleA: tail of segment `(s+1) mod 4`;
+- stage `s` B/ScaleB: middle of segment `s`.
+
+Each physical segment contains one stage's main region and the preceding stage's
+second A/ScaleA half. The input footprint remains four segments, and the output
+LDS arena and persistent overlap protocol are unchanged. The kernel metadata is
+301,056 bytes group LDS, 128 SGPRs, 208 architectural VGPRs, zero accumulator
+VGPRs reported separately, and zero scratch/private bytes.
+
+Random seed 0 verification was byte exact:
+
+```text
+payload mismatch=0
+ScaleA mismatch=0
+GEMM2 valid-row bitwise mismatch=0
+MoE output bitwise mismatch=0
+```
+
+The first retained v123 run was `75.940 / 81.057 / 76.094 us`, median
+**76.094 us**. Its all-SIMD trace was:
+
+| Metric | v115 | v123 | Change |
+|---|---:|---:|---:|
+| Critical-wave cycles | 134,608 | 123,995 | -7.88% |
+| Total valid-wave cycles | 3,981,044 | 3,803,374 | -4.46% |
+| Valid-wave duration median | not recorded in this comparison | 118,800 | - |
+| `s_wait_dscnt` stall | 10.459% | 8.600% | -1.859 pp |
+| `s_barrier_wait` stall | 12.324% | 12.401% | +0.077 pp |
+| `s_wait_tensorcnt` stall | 3.838% | 5.528% | +1.690 pp |
+| Hot `s_wait_dscnt 0x0` mean | 122.3 cycles | 94.3 cycles | -22.90% |
+
+The retained source SHA256 is:
+
+```text
+c54a38e5d4bab82453deb9e3a59c3558fece84a04f7602237b2cedd3110eb6b4
+```
+
+The trace is stored at:
+
+```text
+/app/aiter/my_code/thread_trace_runs/gemm1_fused_v123_acyc4seg_att_all_simd_a07_20261003
+```
+
+### Rejected layout and scheduler probes after v123
+
+Each version was copied from its immediate predecessor before modification. A
+version was rejected if it changed the result, caused a fault, or failed to show
+a stable performance improvement.
+
+| Version | Experiment | Result |
+|---|---|---|
+| v118 | Increase split-A stage pitch to 80 KiB | 80.646 us; rejected |
+| v119 | Change fence-cover WMMA from 8 to 10 | 78.481 us; rejected |
+| v120 | Change `MMA_GROUP` from 2 to 1 | 84.391 us; rejected |
+| v121 | Raise fixed `wave_m=1` `USER_PRIO` | 79.461 us; rejected |
+| v122 | Issue B/ScaleB before A/ScaleA | 79.200 us; rejected |
+| v124 | Swap cyclic main/tail ownership | 77.182 us; rejected |
+| v125 | Force a large LDS memory clause | random payload mismatch; rejected |
+| v126 | Change input pad amount to 8 bytes | random payload mismatch; rejected |
+| v127 | Change input pad amount to 32 bytes | correct, 78.348 us; rejected |
+| v128 | Shrink the continuous output arena | GPU memory fault; immediately restored without reset |
+| v129 | Scatter output into segment tails and reduce to four segments | correct, 76.933 us; rejected |
+| v130 | Scatter output while retaining the original allocation | correct, 79.181 us; rejected |
+| v131 | Pairwise-XOR cyclic A ownership | correct, approximately 77.663 us; rejected |
+| v132 | Add `HT` cache modifier to A TDM | correct, 78.354 us; rejected |
+
+### v133: delta-2 A mapping
+
+v133 placed stage `s`'s second A/ScaleA half in segment `(s+2) mod 4`. This
+makes the future-stage TDM-write segment set disjoint from the carry DS-read set
+in steady state. Random validation remained byte exact.
+
+The original three-sample run was `82.072 / 76.640 / 74.723 us`, median
+76.640 us. A later adjacent machine-state comparison measured v123 at 80.560 us
+and v133 at 79.760 us, but the all-SIMD trace showed a structural regression:
+
+| Metric | v123 | v133 |
+|---|---:|---:|
+| Critical-wave cycles | 123,995 | 131,006 |
+| Total valid-wave cycles | 3,803,374 | 3,906,894 |
+| Valid-wave duration median | 118,800 | 121,014 |
+| `s_wait_dscnt` stall | 8.600% | 7.995% |
+| `s_barrier_wait` stall | 12.401% | 14.867% |
+| `s_wait_tensorcnt` stall | 5.528% | 5.788% |
+
+The critical-wave hot wait executes 93 times and totals 7,632 latency cycles:
+82.1 cycles mean, 87 cycles median, 100 cycles P90, and 127 cycles maximum. The
+layout therefore reduced the local DS drain but delayed peer waves enough to add
+more barrier and tensor wait than it removed. v133 was rejected.
+
+### v134: put complete B/ScaleB in a third segment
+
+v134 follows the aggressive HGEMM recommendation directly. For logical stage
+`s`, the two A/ScaleA halves occupy segments `s` and `s+1`, while the complete
+B/ScaleB tile occupies segment `s+2`. Across the four-stage ring, every physical
+segment still holds exactly one copy of each region, so group LDS remains
+301,056 bytes. Metadata reports 128 SGPRs, 200 architectural VGPRs, and no
+scratch. Random payload, ScaleA, GEMM2 valid rows, and MoE output were all
+bitwise identical.
+
+The adjacent idle-GPU comparison was:
+
+| Version | GEMM1 samples (us) | Median (us) | GEMM2 median (us) | MoE median (us) |
+|---|---|---:|---:|---:|
+| v134 third-segment B | 80.315, 78.057, 82.276 | **80.315** | 67.734 | 204.41 |
+| v123 control | 75.272, 79.657, 82.632 | **79.657** | 69.459 | 212.94 |
+
+The trace explains why v134 did not win despite improving LDS execution:
+
+| Metric | v123 | v134 | Change |
+|---|---:|---:|---:|
+| Critical-wave cycles | 123,995 | 128,811 | +3.88% |
+| Total valid-wave cycles | 3,803,374 | 3,846,515 | +1.13% |
+| Valid-wave duration median | 118,800 | 118,085.5 | -0.60% |
+| `ds_load` stall | 1.441% | 0.355% | -1.086 pp |
+| `s_wait_dscnt` stall | 8.600% | 8.420% | -0.180 pp |
+| `s_barrier_wait` stall | 12.401% | 13.671% | +1.270 pp |
+| `s_wait_tensorcnt` stall | 5.528% | 5.808% | +0.280 pp |
+| `v_wmma` stall | 8.495% | 8.816% | +0.321 pp |
+
+The LDS change removed roughly 75% of direct `ds_load` stall, but the two-port
+wave arrival pattern became less balanced. The added barrier, tensor, and WMMA
+stall exceeded the saved DS cycles, so v134 was rejected as the active winner.
+Its trace is retained for comparison at:
+
+```text
+/app/aiter/my_code/thread_trace_runs/gemm1_fused_v134_a3seg_att_all_simd_a07_20261003
+```
+
+### v135 through v152: load ordering, wave mapping, and scheduler follow-ups
+
+v135 added the documented eight-wave permutation to v134. Its first performance
+run looked favorable (`77.559 / 77.357 / 77.401 us`, median 77.401 us), but the
+all-SIMD trace did not confirm a structural improvement: total valid-wave cycles
+rose to 3,965,188, critical-wave cycles rose to 131,594, and barrier stall was
+13.986%. The permutation reduced tensor wait to 4.499%, but added instruction and
+barrier cost. It was rejected.
+
+v136 and v138 tested B-to-A interleaving and opposite A/B order by resident
+wave. Both changed random output and were rejected before performance testing.
+The failures show that the generated partial `s_wait_dscnt` sequence is tied to
+the operand issue order; source-level reordering is not automatically safe.
+
+v137 applied the documented 0,2,1,3 wave permutation directly to v123. It was
+byte exact and measured `77.745 / 80.838 / 75.259 us`, median 77.745 us. Its
+trace had 3,924,340 total valid-wave cycles, 8.462% DScnt stall, 11.737% barrier
+stall, and 4.593% tensor wait. Although barrier wait decreased, remapping the
+full wave id expanded dynamic scalar/vector address work and increased total
+cycles by 3.18% versus v123. It was rejected.
+
+v139 copied the exact correct interleave order used by the Yadai kernel:
+ScaleA then ScaleB, followed by alternating A then B payload fragments. It was
+byte exact. The first run was `74.502 / 75.330 / 78.550 us`, median 75.330 us.
+However, an adjacent idle-GPU control measured v123 at 78.843 us and v139 at
+78.803 us, only a 0.05% difference. The trace had 3,914,341 valid-wave cycles:
+DScnt improved from 8.600% to 7.632%, but barrier rose to 13.045% and tensor
+wait rose to 5.831%. The apparent timing gain was not stable, so v139 was not
+promoted.
+
+The scheduler follow-ups to v139 were also rejected:
+
+| Version | Change | Correctness | GEMM1 median | Trace conclusion |
+|---|---|---|---:|---|
+| v140 | Schedule two future DS reads before the first WMMA group | byte exact | 76.737 us | 3,992,970 cycles; barrier 14.607% |
+| v141 | First WMMA group 4, later groups 2 | byte exact | 77.996 us | 3,984,488 cycles; barrier 15.797% |
+| v142 | Split ready barrier around front WMMA | payload mismatch | not run | unsafe LDS reuse ordering |
+| v144 | Split barrier with explicit `s_wait_dscnt 0` before signal | payload mismatch | not run | still unsafe with the current issue point |
+
+Two further third-segment and wave-mapping variants remained correct but did not
+improve the full trace:
+
+| Version | Change | GEMM1 samples / median | Total valid-wave cycles | DScnt / barrier / tensor stall |
+|---|---|---:|---:|---|
+| v145 | Move complete B/ScaleB from `s+2` to `s+3` | 79.246, 81.612, 77.859 / **79.246 us** | 3,935,055 | 8.786% / 13.093% / 5.655% |
+| v146 | Remap only logical N with 0,2,1,3 permutation | 74.123, 79.619, 76.018 / **76.018 us** | 4,026,979 | 8.165% / 16.168% / 5.680% |
+| v147 | XOR the second resident wave's N half | 80.815, 74.850, 79.153 / **79.153 us** | 3,866,449 | 8.353% / 12.906% / 5.965% |
+
+v146's low timing median was contradicted by a 5.88% increase in traced total
+cycles and therefore was treated as machine variance rather than a retained
+gain.
+
+The remaining probes failed the byte-exact gate and were not performance-tested:
+
+| Version | Change | Failure |
+|---|---|---|
+| v148 | Align all segment regions to 128-byte starts | payload mismatch |
+| v149 | Interleave only A/B payload, preserving legacy scale order | payload mismatch |
+| v150 | Combine third-segment B with exact A/B interleaving | payload mismatch |
+| v151 | Reduce fence-cover WMMA from 8 to 6 | payload mismatch |
+| v152 | Enable the gfx1250 `coexec` scheduler strategy | payload mismatch |
+
+These failures are important: LLVM scheduling hints and apparently benign LDS
+offset changes can alter the generated partial DScnt waits. Const0 is not a
+sufficient gate for these variants; random byte-level payload validation must
+run before any timing result is accepted.
+
+v153 corrected the earlier split-barrier race. It performs
+`s_wait_tensorcnt`, drains DScnt, signals the workgroup barrier, executes only
+FRONT WMMA operations whose operands are already in registers, waits for every
+wave, and only then issues the TDM overwrite and reads the next LDS stage. This
+ordering passed all random byte-exact checks. Its three samples were
+`75.443 / 82.476 / 76.518 us`, median 76.518 us. The trace, however, had
+3,964,952 total valid-wave cycles: DScnt stall 8.528%, barrier stall 14.169%,
+and tensor wait 6.661%. Delaying the next TDM issue until after the barrier made
+the reuse safe but exposed more downstream TDM latency than the FRONT WMMA could
+hide, so v153 was rejected.
+
+After this sweep, v123 remains the retained source locally and in
+`hyg_fyd_e2e:/app/aiter`. The remaining exposed time is coupled: reducing DS
+stall alone repeatedly shifts more time into the all-wave reuse barrier or
+per-wave TDM completion. A larger gain now requires changing the synchronization
+topology, such as proven named sub-group barriers with matching producer/consumer
+sets, rather than another local address permutation or scheduler hint.
+
+Reaching 60 us from the retained 75-79 us range requires roughly another
+20-24% reduction. The v123 trace assigns about 26.5% of aggregate valid-wave
+time to DScnt, tensorcnt, and workgroup-barrier stall together, so that target
+cannot be reached by removing one local wait or changing one address phase. The
+barrier currently couples all eight waves because each stage is jointly produced
+by four TDM owner groups: A, B, ScaleA, and ScaleB. Any producer may overwrite a
+ring segment only after every consumer of the data sharing that segment has
+finished.
+
+The next credible architecture is a producer/consumer protocol with named DATA
+and FREE barriers per reusable LDS region. It must initialize named barriers,
+join every producer and consumer before a generation can complete, use separate
+FREE barriers where producer membership differs, and keep the four-buffer ring
+from reusing a barrier generation too early. The existing C++ Opus pipeline has
+a proven `DECLARE_NAMED_BARRIERS` implementation, but the current FlyDSL kernel
+has no working named-barrier allocation helper; the nearby gfx1250 FMHA code
+also leaves its `_named_barrier_pair` implementation as a TODO/no-op. Attempting
+this as another local reorder would risk a completion-before-join deadlock or an
+LDS overwrite race. Optimization is paused at v123 until that synchronization
+support is implemented and validated independently.
+
+### Latest v123 control remeasurement
+
+The retained v123 source was restored locally and in the a07-3
+`hyg_fyd_e2e:/app/aiter` tree, with SHA256
+`c54a38e5d4bab82453deb9e3a59c3558fece84a04f7602237b2cedd3110eb6b4`.
+The host GPU/KFD check was idle both before and after the run.
+
+| Metric | Samples (us) | Median (us) |
+|---|---|---:|
+| Fused GEMM1 | 77.737, 78.422, 75.234 | **77.737** |
+| GEMM2 | 68.991, 65.263, 66.022 | **66.022** |
+| MoE e2e | 209.12, 203.86, 202.98 | **203.86** |
+
+Const0 GEMM1, GEMM2, and MoE hashes matched their references. The run artifacts
+are stored at:
+
+```text
+/app/aiter/my_code/moe_prefill_switch_ab_runs/20261003T151433Z
+```
+
+### Same-session comparison: v123, v140, v146, and v153
+
+All four versions were measured sequentially on a07-3 with the same command and
+an idle host GPU/KFD check before and after every completed case. The forward
+pass completed for all four versions:
+
+| Version | GEMM1 samples (us) | GEMM1 median (us) | GEMM2 samples (us) | GEMM2 median (us) | MoE e2e samples (us) | MoE median (us) | Correctness |
+|---|---|---:|---|---:|---|---:|---|
+| v123 control | 82.309, 78.985, 77.112 | **78.985** | 73.410, 67.810, 64.437 | **67.810** | 213.10, 207.73, 201.18 | **207.73** | const0 hashes match |
+| v140 interleave + DS-first-2 | 76.899, 76.590, 76.767 | **76.767** | 63.734, 66.024, 71.841 | **66.024** | 202.12, 203.40, 211.37 | **203.40** | const0 hashes match |
+| v146 logical-N remap | 76.758, 82.369, 78.487 | **78.487** | 63.045, 64.089, 71.932 | **64.089** | 198.01, 208.02, 211.69 | **208.02** | const0 hashes match |
+| v153 safe split barrier | 75.556, 81.253, 78.405 | **78.405** | 59.716, 68.892, 64.439 | **64.439** | 192.21, 208.90, 203.26 | **203.26** | const0 hashes match |
+
+Relative to the v123 median in this forward pass, v140 was 2.81% faster in
+GEMM1 and 2.08% faster in MoE. v146 and v153 did not provide a consistent
+GEMM1/MoE improvement despite their lower GEMM2 medians.
+
+The reverse-order stability pass produced complete second groups for v153 and
+v146:
+
+| Version | GEMM1 samples / median (us) | GEMM2 samples / median (us) | MoE samples / median (us) |
+|---|---|---|---|
+| v153 | 79.716, 79.385, 75.510 / **79.385** | 64.449, 68.004, 61.913 / **64.449** | 203.67, 210.75, 194.81 / **203.67** |
+| v146 | 76.153, 78.763, 77.833 / **77.833** | 63.933, 61.542, 73.024 / **63.933** | 200.24, 203.24, 214.18 / **203.24** |
+
+The reverse v140 run completed two valid rounds before the third round caused a
+GPU memory fault:
+
+| Round | GEMM1 (us) | GEMM2 (us) | MoE e2e (us) |
+|---:|---:|---:|---:|
+| 1 | 79.412 | 63.720 | 206.23 |
+| 2 | 78.177 | 64.066 | 202.15 |
+
+The third round exited with code 134 and:
+
+```text
+Memory access fault by GPU node-2. Reason: Page not present or supervisor privilege.
+```
+
+No further GPU work was submitted after the fault. The reverse v123 run was not
+started. The active source was restored to v123 without resetting or restarting
+the GPU, host, or container. Because v140 failed the repeated-run stability gate,
+its lower forward-pass median is not considered an acceptable performance win.
+
+Run directories:
+
+```text
+/app/aiter/my_code/moe_prefill_switch_ab_runs/20261003T153414Z  # v123
+/app/aiter/my_code/moe_prefill_switch_ab_runs/20261003T153538Z  # v140
+/app/aiter/my_code/moe_prefill_switch_ab_runs/20261003T153645Z  # v146
+/app/aiter/my_code/moe_prefill_switch_ab_runs/20261003T153803Z  # v153
+/app/aiter/my_code/moe_prefill_switch_ab_runs/20261003T154031Z  # v153 reverse
+/app/aiter/my_code/moe_prefill_switch_ab_runs/20261003T154139Z  # v146 reverse
+/app/aiter/my_code/moe_prefill_switch_ab_runs/20261003T154310Z  # v140 reverse, round 3 fault
+```
+
+The common performance reproduction command for this series is:
+
+```bash
+ROUNDS=3 bash ./my_code/run_moe_prefill_switch_ab.sh \
+  e2e-const0 \
+  --experts 64 --tokens 1536 --topk 8 \
+  --model-dim 7168 --inter-dim 2048
+```
+
+## 2026-10-04 four-version remeasurement
+
+The four requested versions were rerun sequentially on a07-3. The complete host
+GPU/KFD check was idle before and after every case. Every run used three fresh
+processes and the common command above. The active source was restored to v123
+after the comparison.
+
+| Version | GEMM1 samples (us) | GEMM1 median (us) | GEMM2 samples (us) | GEMM2 median (us) | MoE e2e samples (us) | MoE median (us) | Correctness |
+|---|---|---:|---|---:|---|---:|---|
+| v123 control | 78.203, 78.306, 84.100 | **78.306** | 64.607, 63.283, 71.814 | **64.607** | 202.59, 201.74, 216.41 | **202.59** | const0 hashes match |
+| v140 interleave + DS-first-2 | 79.588, 79.929, 82.301 | **79.929** | 65.425, 65.868, 73.089 | **65.868** | 212.09, 208.27, 224.64 | **212.09** | const0 hashes match |
+| v146 logical-N remap | 81.420, 78.204, 80.541 | **80.541** | 66.313, 66.794, 67.698 | **66.794** | 209.94, 206.55, 209.27 | **209.27** | const0 hashes match |
+| v153 safe split barrier | 76.216, 75.674, 80.572 | **76.216** | 65.428, 60.964, 66.775 | **65.428** | 202.97, 195.75, 209.17 | **202.97** | const0 hashes match |
+
+Relative to v123 in this measurement, v153 reduced GEMM1 by 2.090 us (2.67%),
+but GEMM2 increased by 0.821 us and MoE increased by 0.38 us. Thus the isolated
+GEMM1 gain did not translate into an end-to-end improvement. v140 and v146 were
+slower in both GEMM1 and MoE. v123 remains the retained end-to-end control.
+
+Run directories:
+
+```text
+/app/aiter/my_code/moe_prefill_switch_ab_runs/20261004T022540Z  # v123
+/app/aiter/my_code/moe_prefill_switch_ab_runs/20261004T022703Z  # v140
+/app/aiter/my_code/moe_prefill_switch_ab_runs/20261004T022828Z  # v146
+/app/aiter/my_code/moe_prefill_switch_ab_runs/20261004T022942Z  # v153
+```
+
+### 2026-10-04 one-command comparison rerun
+
+The four-version runner was added as:
+
+```text
+my_code/run_gemm1_fused_variant_compare.sh
+my_code/gemm1_fused_apre_quant_variants/v123.py
+my_code/gemm1_fused_apre_quant_variants/v140.py
+my_code/gemm1_fused_apre_quant_variants/v146.py
+my_code/gemm1_fused_apre_quant_variants/v153.py
+```
+
+It verifies each source SHA256, waits for an idle GPU in six-second intervals,
+runs every requested case, extracts GEMM1/GEMM2/MoE timing, writes one combined
+Markdown report, and restores the kernel source that was active when the script
+started. The validated invocation was:
+
+```bash
+ROUNDS=3 bash my_code/run_gemm1_fused_variant_compare.sh
+```
+
+The resulting same-run comparison was:
+
+| Version | GEMM1 samples (us) | GEMM1 median (us) | GEMM2 samples (us) | GEMM2 median (us) | MoE e2e samples (us) | MoE median (us) | Correctness |
+|---|---|---:|---|---:|---|---:|---|
+| v123 control | 75.217, 77.191, 79.272 | **77.191** | 61.173, 65.177, 62.923 | **62.923** | 197.61, 202.11, 202.78 | **202.11** | const0 hashes match |
+| v140 interleave + DS-first-2 | 81.422, 80.437, 78.812 | **80.437** | 69.779, 67.504, 60.612 | **67.504** | 209.26, 208.93, 199.24 | **208.93** | const0 hashes match |
+| v146 logical-N remap | 76.098, 79.906, 74.102 | **76.098** | 68.173, 70.730, 63.496 | **68.173** | 205.44, 207.97, 198.33 | **205.44** | const0 hashes match |
+| v153 safe split barrier | 79.632, 77.009, 79.609 | **79.609** | 65.497, 61.980, 71.013 | **65.497** | 206.19, 201.55, 214.32 | **206.19** | const0 hashes match |
+
+In this run v146 had the lowest isolated GEMM1 median, 1.42% below v123, but
+its GEMM2 median was 8.34% slower and its MoE median was 1.65% slower. v123 had
+the lowest GEMM2 and MoE medians and therefore remains the end-to-end winner.
+
+The generated report is:
+
+```text
+/app/aiter/my_code/gemm1_fused_variant_compare_runs/20261004T024422Z/summary.md
+```
