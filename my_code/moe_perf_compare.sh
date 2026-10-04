@@ -3,14 +3,14 @@
 set -euo pipefail
 
 # Run inside hyg_fyd_e2e from /app/aiter:
-#   ROUNDS=3 bash my_code/run_moe_prefill_yadai_compare.sh
+#   ROUNDS=3 bash my_code/moe_perf_compare.sh
 # Baseline defaults to the fused GEMM1 quant pipeline.  Set
-# AITER_FLYDSL_GEMM1_FUSED_QUANT=0 to compare Yadai against the original
+# AITER_FLYDSL_GEMM1_FUSED_QUANT=0 to compare ROCm/main against the original
 # GEMM1 + standalone quant pipeline.
 #
-# /app/aiter is the baseline tree. The yadai branch is kept in a separate host
-# worktree visible through /data, so switching revisions is only a directory
-# change and /app/aiter remains untouched.
+# /app/aiter is the baseline tree. ROCm/main is kept in a separate host worktree
+# visible through /data, so switching revisions is only a directory change and
+# /app/aiter remains untouched.
 if [[ ! -f /.dockerenv ]]; then
   printf 'Run this script inside the hyg_fyd_e2e container.\n' >&2
   exit 2
@@ -22,12 +22,13 @@ YADAI_REPO="${YADAI_REPO:-/data/yanguahe/code/wk_sp1/aiter_a4w4_prefill_v2_yadai
 YADAI_REPO="$(readlink -f "$YADAI_REPO")"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 ROUNDS="${ROUNDS:-3}"
-BASELINE_COMMIT_LABEL="${BASELINE_COMMIT_LABEL:-792c83f280125256bab7533f2413c68e1f7b44ed}"
-BASELINE_BRANCH_LABEL="${BASELINE_BRANCH_LABEL:-hyg/moe_a4w4_pr_refactor}"
+BASELINE_COMMIT_LABEL="${BASELINE_COMMIT_LABEL:-}"
+BASELINE_BRANCH_LABEL="${BASELINE_BRANCH_LABEL:-}"
 YADAI_COMMIT_LABEL="${YADAI_COMMIT_LABEL:-pending}"
 GPU_USERS_SCRIPT="${GPU_USERS_SCRIPT:-/data/yanguahe/code/gpu_users.sh}"
+GPU_IDLE_POLL_SEC="${GPU_IDLE_POLL_SEC:-6}"
 GIT_ENV_FILE="${GIT_ENV_FILE:-/data/yanguahe/code/git_env}"
-TARGET_BRANCH="${TARGET_BRANCH:-dev/a4w4_prefill_v2_yadai}"
+TARGET_BRANCH="${TARGET_BRANCH:-main}"
 TARGET_URL="${TARGET_URL:-git@github.com:ROCm/aiter.git}"
 TARGET_REF="refs/remotes/rocm/$TARGET_BRANCH"
 IGNORE_GPU_BUSY="${IGNORE_GPU_BUSY:-0}"
@@ -57,9 +58,21 @@ if [[ ! -f "$BASELINE_REPO/my_code/run_moe_prefill_switch_ab.sh" ]]; then
   exit 2
 fi
 
+if [[ -z "$BASELINE_COMMIT_LABEL" ]]; then
+  BASELINE_COMMIT_LABEL="$(
+    git -c safe.directory="$BASELINE_REPO" -C "$BASELINE_REPO" rev-parse HEAD
+  )"
+fi
+if [[ -z "$BASELINE_BRANCH_LABEL" ]]; then
+  BASELINE_BRANCH_LABEL="$(
+    git -c safe.directory="$BASELINE_REPO" -C "$BASELINE_REPO" \
+      symbolic-ref --quiet --short HEAD || printf 'detached'
+  )"
+fi
+
 YADAI_TEST="$YADAI_REPO/op_tests/flydsl_tests/test_flydsl_grouped_gemm.py"
 if [[ ! -d "$YADAI_REPO" ]]; then
-  printf 'Missing yadai repository: %s\n' "$YADAI_REPO" >&2
+  printf 'Missing comparison repository: %s\n' "$YADAI_REPO" >&2
   exit 2
 fi
 
@@ -87,7 +100,7 @@ update_yadai_checkout() {
   git_cmd=(git -c safe.directory="$YADAI_REPO" -C "$YADAI_REPO")
   tracked_changes="$("${git_cmd[@]}" status --porcelain --untracked-files=no)"
   if [[ -n "$tracked_changes" ]]; then
-    printf 'Yadai worktree has tracked changes; refusing to overwrite them:\n%s\n' \
+    printf 'Comparison worktree has tracked changes; refusing to overwrite them:\n%s\n' \
       "$tracked_changes" >&2
     exit 2
   fi
@@ -102,20 +115,20 @@ update_yadai_checkout() {
 
   tracked_changes="$("${git_cmd[@]}" status --porcelain --untracked-files=no)"
   if [[ -n "$tracked_changes" ]]; then
-    printf 'Yadai worktree is not clean after update:\n%s\n' \
+    printf 'Comparison worktree is not clean after update:\n%s\n' \
       "$tracked_changes" >&2
     exit 2
   fi
 
   YADAI_COMMIT_LABEL="$("${git_cmd[@]}" rev-parse HEAD)"
-  printf 'Yadai updated commit: %s\n' "$YADAI_COMMIT_LABEL"
+  printf 'ROCm/%s updated commit: %s\n' "$TARGET_BRANCH" "$YADAI_COMMIT_LABEL"
 }
 
 ensure_yadai_core_enum_abi() {
   local probe_code
 
-  # Older Yadai revisions do not reference Relu2 and remain compatible with
-  # their older core extension.  Newer revisions require the enum in both the
+  # Older comparison revisions do not reference Relu2 and remain compatible
+  # with their older core extension. Newer revisions require the enum in both the
   # Python source and module_aiter_core.so.
   if ! grep -Fq 'ActivationType.Relu2' "$YADAI_REPO/aiter/fused_moe.py"; then
     return
@@ -127,11 +140,11 @@ ensure_yadai_core_enum_abi() {
     PYTHONPATH="$YADAI_REPO${PYTHONPATH:+:$PYTHONPATH}" \
       "$PYTHON_BIN" -c "$probe_code"
   ) >/dev/null 2>&1; then
-    printf 'Yadai module_aiter_core enum ABI is current.\n'
+    printf 'Comparison module_aiter_core enum ABI is current.\n'
     return
   fi
 
-  printf '\nYadai module_aiter_core is stale; rebuilding the core extension...\n'
+  printf '\nComparison module_aiter_core is stale; rebuilding the core extension...\n'
   (
     cd "$YADAI_REPO"
     AITER_REBUILD=1 \
@@ -149,7 +162,7 @@ ensure_yadai_core_enum_abi() {
     PYTHONPATH="$YADAI_REPO${PYTHONPATH:+:$PYTHONPATH}" \
       "$PYTHON_BIN" -c "$probe_code"
   )
-  printf 'Yadai module_aiter_core enum ABI rebuilt and verified.\n'
+  printf 'Comparison module_aiter_core enum ABI rebuilt and verified.\n'
 }
 
 require_gpu_idle() {
@@ -193,7 +206,7 @@ require_gpu_idle() {
       return
     fi
     if ((attempt < 5)); then
-      sleep 2
+      sleep "$GPU_IDLE_POLL_SEC"
     fi
   done
 
@@ -324,8 +337,8 @@ export AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE=1
 
 printf 'Baseline repository: %s\n' "$BASELINE_REPO"
 printf 'Baseline commit label: %s\n' "$BASELINE_COMMIT_LABEL"
-printf 'Yadai repository: %s\n' "$YADAI_REPO"
-printf 'Yadai target branch: ROCm/%s\n' "$TARGET_BRANCH"
+printf 'Comparison repository: %s\n' "$YADAI_REPO"
+printf 'Comparison target branch: ROCm/%s\n' "$TARGET_BRANCH"
 printf 'Rounds: %s\n' "$ROUNDS"
 printf 'Baseline AITER_FLYDSL_GEMM1_FUSED_QUANT: %s\n' \
   "$AITER_FLYDSL_GEMM1_FUSED_QUANT"
@@ -361,7 +374,7 @@ update_yadai_checkout
 ensure_yadai_core_enum_abi
 YADAI_TEST="$YADAI_REPO/op_tests/flydsl_tests/test_flydsl_grouped_gemm.py"
 if [[ ! -f "$YADAI_TEST" ]]; then
-  printf 'Missing yadai Python test after update: %s\n' "$YADAI_TEST" >&2
+  printf 'Missing comparison Python test after update: %s\n' "$YADAI_TEST" >&2
   exit 2
 fi
 YADAI_AITER_IMPORT="$(
@@ -373,12 +386,12 @@ YADAI_AITER_IMPORT="$(
 case "$YADAI_AITER_IMPORT" in
   "$YADAI_REPO"/*) ;;
   *)
-    printf 'Yadai test would import AITER from the wrong tree: %s\n' \
+    printf 'Comparison test would import AITER from the wrong tree: %s\n' \
       "$YADAI_AITER_IMPORT" >&2
     exit 2
     ;;
 esac
-printf 'Yadai Python import: %s\n' "$YADAI_AITER_IMPORT"
+printf 'Comparison Python import: %s\n' "$YADAI_AITER_IMPORT"
 
 COMMON_YADAI_ARGS=(
   --data-format a4w4
@@ -398,7 +411,7 @@ COMMON_YADAI_ARGS=(
 
 # Baseline e2e timing is run_perftest(testGraph=False, use_cuda_event=False,
 # num_warmup=5, num_iters=20), returning torch.profiler get_trace_perf device
-# time. Force and assert exactly the same contract for yadai.
+# time. Force and assert exactly the same contract for the comparison checkout.
 YADAI_E2E_CODE="$(cat <<'PY'
 import aiter.test_common as test_common
 from aiter import ActivationType
@@ -463,10 +476,11 @@ PY
 YADAI_E2E_SCRIPT="$YADAI_LOG_DIR/run_e2e_graph_false.py"
 printf '%s\n' "$YADAI_E2E_CODE" >"$YADAI_E2E_SCRIPT"
 
-printf '\n===== a4w4_prefill_v2_yadai: direct Python tests =====\n'
+printf '\n===== ROCm/%s: direct Python tests =====\n' "$TARGET_BRANCH"
 for ((round = 1; round <= ROUNDS; ++round)); do
-  require_gpu_idle "before yadai kernel round $round"
-  printf '\n===== yadai round %s/%s: GEMM1 and GEMM2 =====\n' "$round" "$ROUNDS"
+  require_gpu_idle "before ROCm/$TARGET_BRANCH kernel round $round"
+  printf '\n===== ROCm/%s round %s/%s: GEMM1 and GEMM2 =====\n' \
+    "$TARGET_BRANCH" "$round" "$ROUNDS"
   (
     cd "$YADAI_REPO"
     AITER_META_DIR="$YADAI_REPO" \
@@ -475,17 +489,18 @@ for ((round = 1; round <= ROUNDS; ++round)); do
       --scenario kernel \
       "${COMMON_YADAI_ARGS[@]}"
   ) 2>&1 | tee "$YADAI_LOG_DIR/kernel_r${round}.log"
-  require_gpu_idle "after yadai kernel round $round"
+  require_gpu_idle "after ROCm/$TARGET_BRANCH kernel round $round"
 
-  require_gpu_idle "before yadai e2e round $round"
-  printf '\n===== yadai round %s/%s: MoE e2e =====\n' "$round" "$ROUNDS"
+  require_gpu_idle "before ROCm/$TARGET_BRANCH e2e round $round"
+  printf '\n===== ROCm/%s round %s/%s: MoE e2e =====\n' \
+    "$TARGET_BRANCH" "$round" "$ROUNDS"
   (
     cd "$YADAI_REPO"
     AITER_META_DIR="$YADAI_REPO" \
     PYTHONPATH="$YADAI_REPO${PYTHONPATH:+:$PYTHONPATH}" \
       "$PYTHON_BIN" -u "$YADAI_E2E_SCRIPT"
   ) 2>&1 | tee "$YADAI_LOG_DIR/e2e_r${round}.log"
-  require_gpu_idle "after yadai e2e round $round"
+  require_gpu_idle "after ROCm/$TARGET_BRANCH e2e round $round"
 done
 
 YADAI_SUMMARY="$YADAI_LOG_DIR/summary.md"
@@ -603,7 +618,7 @@ kernel_command = shlex.join(
 )
 e2e_command = shlex.join([python_bin, "-u", e2e_script])
 
-print("# a4w4_prefill_v2_yadai E64/T1536/topk8 benchmark")
+print(f"# ROCm/{branch} E64/T1536/topk8 benchmark")
 print()
 print(f"- branch: `ROCm/{branch}`")
 print(f"- commit: `{commit}`")
@@ -646,9 +661,9 @@ PY
 printf '\n============== baseline summary ==============\n'
 cat "$BASELINE_LOG_DIR/summary.md"
 printf '================================================\n'
-printf '\n================ yadai summary ================\n'
+printf '\n============= ROCm/%s summary =============\n' "$TARGET_BRANCH"
 cat "$YADAI_SUMMARY"
 printf '================================================\n'
 printf 'Baseline summary: %s\n' "$BASELINE_LOG_DIR/summary.md"
-printf 'Yadai summary: %s\n' "$YADAI_SUMMARY"
+printf 'ROCm/%s summary: %s\n' "$TARGET_BRANCH" "$YADAI_SUMMARY"
 printf 'All logs: %s\n' "$LOG_ROOT"
