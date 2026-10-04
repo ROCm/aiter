@@ -1170,6 +1170,18 @@ def test_v4_nm_split_planner_picks(num_seqs, kv_len, expected):
 
 
 @needs_gfx950
+@pytest.mark.parametrize(
+    "num_seqs,kv_len", [(7, 128), (7, 1152), (56, 1152), (14, 8320)]
+)
+def test_v4_nm_num_kv_splits_matches_plan(num_seqs, kv_len):
+    """The host-only count is the plan's split count, with no device work."""
+    plan = aiter.mla.get_mla_v4_nm_split_plan(num_seqs, 128, kv_len)
+    assert aiter.mla.get_mla_v4_nm_num_kv_splits(num_seqs, 128, kv_len) == (
+        plan.num_kv_splits
+    )
+
+
+@needs_gfx950
 def test_v4_nm_split_plan_fills_buffer_in_place():
     buf = torch.full((10,), -1, dtype=torch.int32, device="cuda")
     plan = aiter.mla.get_mla_v4_nm_split_plan(7, 128, 1152, split_indptr=buf)

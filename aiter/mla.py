@@ -403,24 +403,17 @@ def _v4_nm_pick_num_kv_splits(cost, num_seqs, tg_factor, kv_len, cu_num):
     return best_splits
 
 
-def get_mla_v4_nm_split_plan(
-    num_seqs, num_heads, kv_len, *, split_indptr=None, device="cuda"
-) -> MlaV4NmSplitPlan:
-    """KV split plan for `mla_decode_fwd_v4_nm`.
+def get_mla_v4_nm_num_kv_splits(num_seqs, num_heads, kv_len) -> int:
+    """`num_kv_splits` for `mla_decode_fwd_v4_nm` (host only, no device work).
 
     `num_seqs` / `num_heads` are the decode call's `qo_indptr.shape[0] - 1`
     and `q.size(1)`; `kv_len` is the per-seq KV length to plan for (the
-    longest one the call can see). The split count minimizes the latency
-    model above where the arch has coefficients, and is the wrapper's own
-    occupancy-only pick elsewhere.
-
-    The split count is a host int that depends only on these arguments, and
-    `split_indptr` is the uniform `[0, s, 2s, ..., num_seqs * s]`. Pass a
-    persistent int32 `split_indptr` of at least `num_seqs + 1` entries to have
-    it filled in place (one device launch, no host sync): CUDA-graph callers
-    keep the buffer alive across replays and rebuild the plan with the same
-    arguments before each replay. Pass the plan on as
-    `mla_decode_fwd_v4_nm(..., **plan._asdict())`.
+    longest one the call can see). Minimizes the latency model above where
+    the arch has coefficients, and is the wrapper's own occupancy-only pick
+    elsewhere. The matching `split_indptr` is the uniform
+    `[0, s, 2s, ..., num_seqs * s]`; any prefix of a longer uniform buffer is
+    one, so callers can keep a constant buffer per split count and slice it
+    instead of writing one per call.
     """
     tg_factor = max(1, -(-num_heads // 64))  # ceil(num_heads / 64)
     cost = _V4_NM_SPLIT_COST.get(get_gfx())
@@ -439,6 +432,21 @@ def get_mla_v4_nm_split_plan(
             tg_factor,
             1,  # ignore_total_kv, as in mla_decode_fwd_v4_nm
         )
+    return num_kv_splits
+
+
+def get_mla_v4_nm_split_plan(
+    num_seqs, num_heads, kv_len, *, split_indptr=None, device="cuda"
+) -> MlaV4NmSplitPlan:
+    """KV split plan for `mla_decode_fwd_v4_nm`: the split count of
+    `get_mla_v4_nm_num_kv_splits` and its uniform `split_indptr`.
+
+    Pass a persistent int32 `split_indptr` of at least `num_seqs + 1` entries
+    to have it filled in place (one device launch, no host sync); otherwise a
+    new one is allocated on `device`. Pass the plan on as
+    `mla_decode_fwd_v4_nm(..., **plan._asdict())`.
+    """
+    num_kv_splits = get_mla_v4_nm_num_kv_splits(num_seqs, num_heads, kv_len)
     if split_indptr is None:
         split_indptr = torch.empty(num_seqs + 1, dtype=torch.int32, device=device)
     else:
