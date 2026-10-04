@@ -2,7 +2,6 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 """Static MegaMoEV2 configuration rules for MI355X."""
 
-import json
 import os
 from bisect import bisect_left
 from dataclasses import dataclass, replace
@@ -363,50 +362,8 @@ def _select_large_stage2(
     )
 
 
-def _config_overrides():
-    """Parse AITER_MEGA_CFG_OVERRIDE (tuning aid).
-
-    JSON ``{"<path>:<bucket>": {"stage1": {...}, "stage2": {...}, "p2p_quant": ...}}``
-    where ``<path>`` is ``fixed``, ``bounded`` or ``large`` and ``<bucket>`` a
-    token bucket or ``*``.  Fields replace the selected defaults.
-    """
-    raw = os.environ.get("AITER_MEGA_CFG_OVERRIDE", "")
-    return json.loads(raw) if raw else {}
-
-
-def _apply_override(config: MegaMoEConfig, path: str, bucket: int) -> MegaMoEConfig:
-    overrides = _config_overrides()
-    for key in (f"{path}:*", f"{path}:{bucket}"):
-        patch = overrides.get(key)
-        if not patch:
-            continue
-        config = MegaMoEConfig(
-            stage1=replace(config.stage1, **patch.get("stage1", {})),
-            stage2=replace(config.stage2, **patch.get("stage2", {})),
-            p2p_quant=patch.get("p2p_quant", config.p2p_quant),
-        )
-    return config
-
-
 @cache
 def _select_bucket_config(
-    bucket: int,
-    mtpr_class: int,
-    model_dim: int,
-    inter_dim: int,
-    fixed_slot_dispatch: bool,
-) -> MegaMoEConfig:
-    config = _select_default_bucket_config(
-        bucket, mtpr_class, model_dim, inter_dim, fixed_slot_dispatch
-    )
-    if mtpr_class == MAX_MTPR_CLASS:
-        path = "large"
-    else:
-        path = "fixed" if fixed_slot_dispatch else "bounded"
-    return _apply_override(config, path, bucket)
-
-
-def _select_default_bucket_config(
     bucket: int,
     mtpr_class: int,
     model_dim: int,

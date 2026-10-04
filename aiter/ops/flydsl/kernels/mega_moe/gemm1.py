@@ -31,20 +31,12 @@ class _LdsF32View:
         self.ptr = ptr
 
 
-# K loop shape: 0 rolled; 1 fully unrolled; 2 rolled by two steps (ping-pong B
-# registers: the prefetched tile is not copied into loop-carried registers,
-# which forced a vmcnt drain of the prefetch every step). Callers pass
-# ``k_unroll``; AITER_MEGA_S1_UNROLL_K overrides it for experiments.
-UNROLL_K_MODE = int(os.environ.get("AITER_MEGA_S1_UNROLL_K", "0"))
-
-
 # fmt: off
 @flyc.jit
 def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_scale, a_scale, mfma, epi, a_buf,
     a_scale_lds, a_lds_i32, K_ITERS, M_REPEAT, NUM_ACC_N, A_K_STEP_BYTES, pipe_weights,
     mfma_amajor, async_a_copy, trb_rsrc, tib_rsrc, indirect_input, k_unroll=0):
 # fmt: on
-    k_mode = k_unroll if k_unroll else UNROLL_K_MODE
     N_ACC = M_REPEAT * NUM_ACC_N
     NUM_B_SCALE = NUM_ACC_N // _PACK
     NUM_A_SCALE = M_REPEAT // _PACK
@@ -173,14 +165,10 @@ def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_sca
                 yv += sa_next
             return yv
 
-        if const_expr(k_mode == 1):
-            # Fully unrolled K: the prefetched B tile is consumed in place instead of
-            # being copied into loop-carried registers (which forced a vmcnt drain
-            # of the prefetch at the end of every K step).
-            state = init
-            for sp_i in range_constexpr(K_ITERS - 1):
-                state = _kstep(sp_i, state)
-        elif const_expr(k_mode == 2):
+        if const_expr(k_unroll == 2):
+            # Two K steps per iteration (ping-pong B registers): the rolled loop
+            # copies the prefetched B tile into loop-carried registers, which
+            # forces a vmcnt drain of the prefetch every step.
             pairs = (K_ITERS - 1) // 2
             for pr_i, state in range(0, pairs, 1, init=init):
                 pr = fx.Int32(pr_i)

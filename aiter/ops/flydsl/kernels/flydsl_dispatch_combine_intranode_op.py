@@ -1311,13 +1311,8 @@ class FlyDSLDispatchCombineIntraNodeOp:
         enable_weights,
         skip_stage1,
         stage2_p2p_quant=None,
-        geometry=None,
     ):
-        """Launch regular or skip-stage1 combine.
-
-        ``geometry``: optional (block_num, warp_num_per_block) for this call,
-        overriding cfg and the tuning table.
-        """
+        """Launch regular or skip-stage1 combine."""
         cfg = self.cfg
         stream = torch.cuda.current_stream()
         # skip_stage1 treats input as a placeholder -> relax the dtype check.
@@ -1371,8 +1366,8 @@ class FlyDSLDispatchCombineIntraNodeOp:
         # Resolve geometry on cur_tok, not input.shape[0] (ws*M under zero_copy).
         bn, wpb = _resolve_launch_geometry(
             "combine",
-            cfg.combine_block_num if geometry is None else geometry[0],
-            cfg.combine_warp_num_per_block if geometry is None else geometry[1],
+            cfg.combine_block_num,
+            cfg.combine_warp_num_per_block,
             cfg.tuning_table,
             _cur_tok,
             _DEFAULT_COMBINE_BLOCK_NUM,
@@ -1484,7 +1479,6 @@ class FlyDSLDispatchCombineIntraNodeOp:
         cur_tok=None,
         enable_weights: bool = True,
         stage2_p2p_quant=None,
-        geometry=None,
     ):
         """Run combine after fused GEMM2 has populated the P2P input.
 
@@ -1507,7 +1501,6 @@ class FlyDSLDispatchCombineIntraNodeOp:
             enable_weights=enable_weights,
             skip_stage1=True,
             stage2_p2p_quant=stage2_p2p_quant,
-            geometry=geometry,
         )
 
     def preload_combine_no_stage1(
@@ -1518,7 +1511,6 @@ class FlyDSLDispatchCombineIntraNodeOp:
         enable_weights: bool = False,
         stage2_p2p_quant=None,
         mask_topk_ids: bool = False,
-        geometry=None,
     ):
         """Compile and load one fused-Stage2 combine geometry without launching it."""
         if not type(self)._ENABLE_COMBINE_NO_STAGE1:
@@ -1539,8 +1531,8 @@ class FlyDSLDispatchCombineIntraNodeOp:
         _cur_tok = self._resolve_cur_tok(cur_tok, "preload_combine_no_stage1()")
         block_num, warp_num = _resolve_launch_geometry(
             "combine",
-            cfg.combine_block_num if geometry is None else geometry[0],
-            cfg.combine_warp_num_per_block if geometry is None else geometry[1],
+            cfg.combine_block_num,
+            cfg.combine_warp_num_per_block,
             cfg.tuning_table,
             _cur_tok,
             _DEFAULT_COMBINE_BLOCK_NUM,

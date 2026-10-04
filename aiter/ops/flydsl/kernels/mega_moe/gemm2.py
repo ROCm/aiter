@@ -186,14 +186,8 @@ def gemm2_compute_v2(
     explicit_m_row=None,
     explicit_n_block=None,
     explicit_expert=None,
-    static_k=False,
 ):
-    """Run GEMM2, optionally using an explicitly selected expert row/tile.
-
-    ``static_k``: the contraction length is INTER_MAX (i32_inter must equal it),
-    so the K loop is fully unrolled at trace time: no loop-carried accumulator /
-    B-fragment copies and no per-iteration address or bound arithmetic.
-    """
+    """Run GEMM2, optionally using an explicitly selected expert row/tile."""
     # SBM is the sort padding unit; BM is the compute tile and must divide SBM.
     if SBM is None:
         SBM = BM
@@ -522,20 +516,7 @@ def gemm2_compute_v2(
                 n += 1
         return n
 
-    K_TILES_STATIC = INTER_MAX // BK
-    if const_expr(static_k and BM == 64 and BN == 256):
-        for kt in range_constexpr(K_TILES_STATIC):
-            kt_rt = fx.Int32(kt)
-            gpu.barrier()
-            issue_a_ds_read(fx.Int32(kt % aStages))
-            if const_expr(kt + kStages < K_TILES_STATIC):
-                issue_a_load_lds(
-                    fx.Int32((kt + kStages) % aStages), fx.Int32(kt + kStages)
-                )
-            bqf, bsf = stream_b_tile(kt_rt)
-            sa = load_a_scale_tile(kt_rt)
-            mfma_cluster(bqf, bsf, sa, kt_rt)
-    elif const_expr(BM == 64 and BN == 256):
+    if const_expr(BM == 64 and BN == 256):
         # BM64/BN256 uses the 1-stage B path unconditionally.
         for kt_iv, state in range(
             fx.Int32(0),
@@ -659,45 +640,9 @@ def gemm2_compute_v2(
                     for sub in range_constexpr(kScaleSubBlocks):
                         nxt_saf[sub].store(cur_saf[sub].load())
 
-        if const_expr(static_k):
-            # Ping-pong the fragment sets by Python reference instead of copying
-            # the prefetched tile into the carried one every iteration.
-            b_cur, b_nxt = (cur_bqf, cur_bsf, cur_saf), (nxt_bqf, nxt_bsf, nxt_saf)
-            for kt in range_constexpr(K_TILES_STATIC):
-                kt_rt = fx.Int32(kt)
-
-                def _prefetch(kt=kt, b_nxt=b_nxt):
-                    if const_expr(kt + 1 < K_TILES_STATIC):
-                        issue_b_load_into(b_nxt[0], b_nxt[1], fx.Int32(kt + 1))
-                        if const_expr(g2_ascale_pf):
-                            issue_a_scale_load_into(b_nxt[2], fx.Int32(kt + 1))
-
-                if const_expr(g2_bhoist):
-                    _prefetch()
-                gpu.barrier()
-                issue_a_ds_read(fx.Int32(kt % aStages))
-                if const_expr(kt + kStages < K_TILES_STATIC):
-                    issue_a_load_lds(
-                        fx.Int32((kt + kStages) % aStages), fx.Int32(kt + kStages)
-                    )
-                if const_expr(g2_ascale_pf):
-                    sa = [
-                        Vec(b_cur[2][sub].load())[0]
-                        for sub in range_constexpr(kScaleSubBlocks)
-                    ]
-                else:
-                    sa = load_a_scale_tile(kt_rt)
-                if const_expr(not g2_bhoist):
-                    _prefetch()
-                rocdl.sched_barrier(0)
-                rocdl.s_setprio(1)
-                mfma_cluster(b_cur[0], b_cur[1], sa, kt_rt)
-                rocdl.s_setprio(0)
-                rocdl.sched_barrier(0)
-                b_cur, b_nxt = b_nxt, b_cur
         for kt_iv, state in range(
             fx.Int32(0),
-            K_TILES_RT if not static_k else fx.Int32(0),
+            K_TILES_RT,
             fx.Int32(1),
             init=load_carry(),
         ):

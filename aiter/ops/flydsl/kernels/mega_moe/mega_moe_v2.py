@@ -86,23 +86,6 @@ class MegaMoEV2:
             gm_indexed_payload=compact and self.mtpr >= INDEXED_PAYLOAD_MIN_MTPR,
             max_total_recv_tokens=self.world_size)
         # fmt: on
-        # Tuning aid: combine launch geometry by token count,
-        # "<min_tokens>:<blocks>,<warps>;..." (largest matching min_tokens wins;
-        # unmatched sizes use the tuning table). Without -1 masking the table is
-        # within 0.5% of the best geometry measured at 2K-8K tokens per rank.
-        self._combine_geom_rules = sorted(
-            (
-                (int(tok), tuple(int(v) for v in geom.split(",")))
-                for tok, geom in (
-                    rule.split(":")
-                    for rule in os.environ.get(
-                        "AITER_MEGA_COMBINE_GEOM", ""
-                    ).split(";")
-                    if rule
-                )
-            ),
-            reverse=True,
-        )
         self.comb_op = FlyDSLDispatchCombineIntraNodeOp(self.comb_cfg)
         torch.cuda.synchronize()
         ms.shmem_barrier_all()
@@ -783,8 +766,6 @@ class MegaMoEV2:
         # the default when the caller does not say.
         self.supports_combine_mask = True
         self._combine_mask = os.environ.get("AITER_MEGA_COMBINE_MASK", "0") == "1"
-        # Values per lane in the Stage2 peer scatter (8: 8/16-byte stores, 16: 16/32).
-        self._s2_scatter_vec = int(os.environ.get("AITER_MEGA_S2_SCATTER_VEC", "8"))
         self._g2_topk_ids = None
         comb_cfg = self.comb_cfg
         dev = torch.device("cuda", comb_cfg.rank)
@@ -818,12 +799,6 @@ class MegaMoEV2:
         self._g2_combine_placeholder = torch.empty(
             1, comb_cfg.hidden_dim, dtype=comb_cfg.combine_dtype, device=dev
         )
-
-    def _combine_geometry(self, tokens: int):
-        for min_tokens, geometry in self._combine_geom_rules:
-            if tokens >= min_tokens:
-                return geometry
-        return None
 
     def _fused_stage2_call(self, launcher, config, stream, *, runtime_pair_skip, scatter_vec):
         """Invoke one normal Stage2 variant through its shared ABI."""
@@ -874,14 +849,14 @@ class MegaMoEV2:
         stream,
         *,
         runtime_pair_skip: bool = False,
-        scatter_vec: int | None = None,
+        scatter_vec: int = 8,
     ):
         self._fused_stage2_call(
             self._g2_preload,
             config,
             stream,
             runtime_pair_skip=runtime_pair_skip,
-            scatter_vec=self._s2_scatter_vec if scatter_vec is None else scatter_vec,
+            scatter_vec=scatter_vec,
         )
 
     def _aligned_pair_stage2_call(self, launcher, config: MegaMoEConfig, stream):
@@ -960,7 +935,6 @@ class MegaMoEV2:
                 enable_weights=False,
                 stage2_p2p_quant=entry.config.p2p_quant,
                 mask_topk_ids=False,
-                geometry=self._combine_geometry(entry.token_bucket),
             )
             self.comb_op.preload_combine_no_stage1(
                 self._g2_combine_placeholder,
@@ -968,7 +942,6 @@ class MegaMoEV2:
                 enable_weights=False,
                 stage2_p2p_quant=entry.config.p2p_quant,
                 mask_topk_ids=True,
-                geometry=self._combine_geometry(entry.token_bucket),
             )
 
     def _run_fused_stage2(
@@ -979,10 +952,8 @@ class MegaMoEV2:
         *,
         runtime_pair_skip: bool = False,
         combine: bool = True,
-        scatter_vec: int | None = None,
+        scatter_vec: int = 8,
     ):
-        if scatter_vec is None:
-            scatter_vec = self._s2_scatter_vec
         comb_op = self.comb_op
         if stream is None:
             stream = torch.cuda.current_stream()
@@ -1002,7 +973,6 @@ class MegaMoEV2:
         return comb_op.combine_no_stage1(
             self._g2_combine_placeholder, None, self._g2_topk_ids, cur_tok=run_tokens,
             enable_weights=False, stage2_p2p_quant=p2p_quant,
-            geometry=self._combine_geometry(run_tokens),
         )
 
     def _launch_aligned_pair_stage2(self, config: MegaMoEConfig, stream):
@@ -1051,6 +1021,5 @@ class MegaMoEV2:
             cur_tok=run_tokens,
             enable_weights=False,
             stage2_p2p_quant=config.p2p_quant,
-            geometry=self._combine_geometry(run_tokens),
         )
         return self._stage2_output(result, run_tokens, slice_output)
