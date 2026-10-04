@@ -240,6 +240,11 @@ AITER_CONFIG_DISPATCH_COMBINE_INTRANODE = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_dispatch_combine_intranode.csv",
 )
 
+AITER_CONFIG_PAGED_MQA_LOGITS = os.getenv(
+    "AITER_CONFIG_PAGED_MQA_LOGITS",
+    f"{AITER_ROOT_DIR}/aiter/configs/paged_mqa_logits_tuned.csv",
+)
+
 
 class AITER_CONFIG:
     @property
@@ -406,6 +411,14 @@ class AITER_CONFIG:
             "AITER_CONFIG_DISPATCH_COMBINE_INTRANODE",
             AITER_CONFIG_DISPATCH_COMBINE_INTRANODE,
             "tuned_dispatch_combine_intranode",
+        )
+
+    @property
+    def AITER_CONFIG_PAGED_MQA_LOGITS_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_PAGED_MQA_LOGITS",
+            AITER_CONFIG_PAGED_MQA_LOGITS,
+            "paged_mqa_logits_tuned",
         )
 
     @property
