@@ -339,51 +339,12 @@ def launch_gemm_a8w4_tdm_fused_persistent(
     Q_SCALE_LDS_OFF = Q_M16_TILES * Q_ROW_TILE_BYTES
     assert Q_SCALE_LDS_OFF + m_warp * Q_SCALE_TILE_BYTES <= C_STORE_B
 
-    _act = f"_act{stage1_act}" if stage1_act else ""
-    _qout = (
-        f"_q{stage1_quant_out}r{quant_wmma_rep}_apreqb16batchs16direct_scaletdm_persistv53"
-        if stage1_quant_out
-        else ""
-    )
-    _grouped = f"_e{n_experts}" if n_experts > 0 else ""
-    _epilogue_batch = f"_eb{epilogue_batch_wn}" if epilogue_batch_wn > 1 else ""
-    _relax_cluster_wrap = "_rcw" if relax_cluster_wrap_dscnt else ""
-    _xdl_arb = f"_xdl{disable_xdl_arb_stall}" if disable_xdl_arb_stall >= 0 else ""
-    _wmma_reuse = (
-        f"_reuse{wmma_reuse}"
-        if gemm2_eight_wave_geometry
-        else ("_reuse" if wmma_reuse else "")
-    )
-    _overlap_store = f"_ostore2p_s{output_store_split_wm}"
-    _output_wave_split = "_ow2" if output_store_wave_split else ""
-    _cluster_m = f"_cm{cluster_m}" if fp4_prefill_schedule and cluster_m != 4 else ""
-    _b_tdm_th = f"_bth{tdm_b_th}" if tdm_b_th else ""
-    _input_lds_pad = (
-        f"_ipad{INPUT_LDS_PAD_INTERVAL}p{INPUT_LDS_PAD_AMOUNT}"
-        if INPUT_LDS_PAD_INTERVAL
-        else ""
-    )
-    _input_lds_segment = "_acyc4segv123" if SEGMENT_SPLIT_A else ""
-    _persistent = ""
-    if PERSISTENT_TASKS > 1:
-        if gemm2_eight_wave_geometry and gemm2_schedule:
-            _persistent = "_ac3payload_reuse_balnext_ps7pf2hm_earlynext_o1w_xor_wait2"
-        elif fp4_prefill_schedule:
-            _persistent = (
-                "_ps4pf2hm_earlynext_o1w_xor_wait1_reuseb_nosched_mg2v115"
-                if gemm2_eight_wave_geometry
-                else "_ps4pf2hm_earlynext"
-            )
-        else:
-            _persistent = "_ps7pf2hm_earlynext"
     _kname = (
         "a8w4_tdm_fp4"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
-        f"_b{num_buffers}_K{K}"
-        f"{_grouped}{_act}{_qout}_cn4{_cluster_m}_prefetch{_epilogue_batch}_apre_sh{_b_tdm_th}"
-        f"{_relax_cluster_wrap}_mg4_fc{fence_cover_mma}{_xdl_arb}"
-        f"{_wmma_reuse}{_overlap_store}{_output_wave_split}{_input_lds_pad}"
-        f"{_input_lds_segment}{_persistent}"
+        f"_b{num_buffers}_K{K}_e{n_experts}"
+        f"_act{stage1_act}_q{stage1_quant_out}r{quant_wmma_rep}"
+        f"_cn{cluster_n}_cm{cluster_m}_prefetch_apre_persist"
     )
 
     @flyc.kernel(name=_kname, known_block_size=[block, 1, 1])

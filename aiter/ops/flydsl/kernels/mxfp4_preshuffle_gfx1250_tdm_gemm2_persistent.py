@@ -273,36 +273,11 @@ def launch_gemm_a8w4_tdm_gemm2_persistent(
     # 4 wn subtiles = 32 output cols = 1 MX block for per-32 scaling.
     WN_PER_MX_BLOCK = 4
 
-    _act = f"_act{stage1_act}" if stage1_act else ""
-    _grouped = f"_e{n_experts}" if n_experts > 0 else ""
-    _epilogue_batch = f"_eb{epilogue_batch_wn}" if epilogue_batch_wn > 1 else ""
-    _relax_cluster_wrap = "_rcw" if relax_cluster_wrap_dscnt else ""
-    _xdl_arb = f"_xdl{disable_xdl_arb_stall}" if disable_xdl_arb_stall >= 0 else ""
-    _wmma_reuse = (
-        f"_reuse{wmma_reuse}"
-        if gemm2_eight_wave_geometry
-        else ("_reuse" if wmma_reuse else "")
-    )
-    _overlap_store = f"_ostore2p_s{output_store_split_wm}"
-    _output_wave_split = "_ow2" if output_store_wave_split else ""
-    _cluster_m = f"_cm{cluster_m}" if fp4_prefill_schedule and cluster_m != 4 else ""
-    _b_tdm_th = f"_bth{tdm_b_th}" if tdm_b_th else ""
-    _persistent = (
-        (
-            "_ac3payload_reuse_balnext_ps7pf2hm_earlynext_o1w_xor_wait2"
-            if gemm2_eight_wave_geometry
-            else "_ps7pf2hm_earlynext"
-        )
-        if PERSISTENT_TASKS > 1
-        else ""
-    )
     _kname = (
         "a8w4_tdm_fp4"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
-        f"_b{num_buffers}_K{K}"
-        f"{_grouped}{_act}_cn4{_cluster_m}_prefetch{_epilogue_batch}_apre_sh{_b_tdm_th}"
-        f"{_relax_cluster_wrap}_mg4_fc{fence_cover_mma}{_xdl_arb}"
-        f"{_wmma_reuse}{_overlap_store}{_output_wave_split}{_persistent}"
+        f"_b{num_buffers}_K{K}_e{n_experts}"
+        f"_cn{cluster_n}_cm{cluster_m}_prefetch_apre_persist"
     )
 
     @flyc.kernel(name=_kname, known_block_size=[block, 1, 1])

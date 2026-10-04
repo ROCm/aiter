@@ -4,6 +4,7 @@ set -euo pipefail
 
 # Run inside hyg_fyd_e2e from /app/aiter:
 #   ROUNDS=3 bash my_code/moe_perf_compare.sh
+# ROUNDS is applied independently to each entry in SHAPE_SPECS below.
 # Baseline defaults to the fused GEMM1 quant pipeline.  Set
 # AITER_FLYDSL_GEMM1_FUSED_QUANT=0 to compare ROCm/main against the original
 # GEMM1 + standalone quant pipeline.
@@ -33,12 +34,105 @@ TARGET_URL="${TARGET_URL:-git@github.com:ROCm/aiter.git}"
 TARGET_REF="refs/remotes/rocm/$TARGET_BRANCH"
 IGNORE_GPU_BUSY="${IGNORE_GPU_BUSY:-0}"
 AITER_FLYDSL_GEMM1_FUSED_QUANT="${AITER_FLYDSL_GEMM1_FUSED_QUANT:-1}"
+RUN_MODE=both
 
-EXPERTS=64
-TOKENS=1536
-TOPK=8
-MODEL_DIM=7168
-INTER_DIM=2048
+SHAPE_SPECS=(
+  "e64_t1536_k8_m7168_i2048|64|1536|8|7168|2048"
+  "e64_t16384_k8_m7168_i2048|64|16384|8|7168|2048"
+  "e256_t512_k8_m7168_i2048|256|512|8|7168|2048"
+  "e256_t16384_k8_m7168_i2048|256|16384|8|7168|2048"
+  "e96_t512_k6_m7168_i3072|96|512|6|7168|3072"
+  "e96_t16384_k6_m7168_i3072|96|16384|6|7168|3072"
+)
+ROUND_SHAPES=()
+COMMON_ARGS=()
+
+set_round_shapes() {
+  local round_id="$1"
+  local shape_index
+
+  ROUND_SHAPES=()
+  if ((round_id % 2 == 0)); then
+    ROUND_SHAPES=("${SHAPE_SPECS[@]}")
+  else
+    for ((shape_index = ${#SHAPE_SPECS[@]} - 1; shape_index >= 0; --shape_index)); do
+      ROUND_SHAPES+=("${SHAPE_SPECS[shape_index]}")
+    done
+  fi
+}
+
+set_common_args() {
+  local experts="$1" tokens="$2" topk="$3" model_dim="$4" inter_dim="$5"
+
+  COMMON_ARGS=(
+    --data-format a4w4
+    --experts "$experts"
+    --tokens "$tokens"
+    --topk "$topk"
+    --model-dim "$model_dim"
+    --inter-dim "$inter_dim"
+    --act silu
+    --no-bias
+    --no-check-aot-cache
+    --warmup 5
+    --iters 20
+    --data-init zero
+    --scale-init zero
+  )
+}
+
+usage() {
+  cat <<'EOF'
+usage: bash my_code/moe_perf_compare.sh [--both|--curr|--base]
+
+  --both  Run the current hyg/moe_a4w4_pr_refactor pipeline and ROCm/main
+          isolated GEMM plus graph-off MoE e2e tests. This is the default.
+  --curr  Run only the current hyg/moe_a4w4_pr_refactor MoE pipeline.
+  --base  Run only the latest ROCm/main isolated GEMM and graph-off MoE e2e.
+
+ROUNDS applies independently to every shape in every selected mode. Even
+round IDs use forward shape order; odd round IDs use reversed shape order.
+EOF
+}
+
+while (($#)); do
+  case "$1" in
+    --both)
+      RUN_MODE=both
+      ;;
+    --curr)
+      RUN_MODE=curr
+      ;;
+    --base)
+      RUN_MODE=base
+      ;;
+    -h|--help|help)
+      usage
+      exit 0
+      ;;
+    *)
+      printf 'Unknown argument: %s\n' "$1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+RUN_CURRENT=0
+RUN_BASE=0
+case "$RUN_MODE" in
+  both)
+    RUN_CURRENT=1
+    RUN_BASE=1
+    ;;
+  curr)
+    RUN_CURRENT=1
+    ;;
+  base)
+    RUN_BASE=1
+    ;;
+esac
 
 if [[ ! "$ROUNDS" =~ ^[1-9][0-9]*$ ]]; then
   printf 'ROUNDS must be a positive integer, got %q\n' "$ROUNDS" >&2
@@ -52,26 +146,27 @@ if [[ "$AITER_FLYDSL_GEMM1_FUSED_QUANT" != 0 \
   exit 2
 fi
 
-if [[ ! -f "$BASELINE_REPO/my_code/run_moe_prefill_switch_ab.sh" ]]; then
-  printf 'Missing baseline script: %s\n' \
-    "$BASELINE_REPO/my_code/run_moe_prefill_switch_ab.sh" >&2
-  exit 2
+if ((RUN_CURRENT)); then
+  if [[ ! -f "$BASELINE_REPO/my_code/run_moe_prefill_switch_ab.sh" ]]; then
+    printf 'Missing baseline script: %s\n' \
+      "$BASELINE_REPO/my_code/run_moe_prefill_switch_ab.sh" >&2
+    exit 2
+  fi
+
+  if [[ -z "$BASELINE_COMMIT_LABEL" ]]; then
+    BASELINE_COMMIT_LABEL="$(
+      git -c safe.directory="$BASELINE_REPO" -C "$BASELINE_REPO" rev-parse HEAD
+    )"
+  fi
+  if [[ -z "$BASELINE_BRANCH_LABEL" ]]; then
+    BASELINE_BRANCH_LABEL="$(
+      git -c safe.directory="$BASELINE_REPO" -C "$BASELINE_REPO" \
+        symbolic-ref --quiet --short HEAD || printf 'detached'
+    )"
+  fi
 fi
 
-if [[ -z "$BASELINE_COMMIT_LABEL" ]]; then
-  BASELINE_COMMIT_LABEL="$(
-    git -c safe.directory="$BASELINE_REPO" -C "$BASELINE_REPO" rev-parse HEAD
-  )"
-fi
-if [[ -z "$BASELINE_BRANCH_LABEL" ]]; then
-  BASELINE_BRANCH_LABEL="$(
-    git -c safe.directory="$BASELINE_REPO" -C "$BASELINE_REPO" \
-      symbolic-ref --quiet --short HEAD || printf 'detached'
-  )"
-fi
-
-YADAI_TEST="$YADAI_REPO/op_tests/flydsl_tests/test_flydsl_grouped_gemm.py"
-if [[ ! -d "$YADAI_REPO" ]]; then
+if ((RUN_BASE)) && [[ ! -d "$YADAI_REPO" ]]; then
   printf 'Missing comparison repository: %s\n' "$YADAI_REPO" >&2
   exit 2
 fi
@@ -214,89 +309,134 @@ require_gpu_idle() {
   exit 3
 }
 
-prepend_baseline_summary_metadata() {
-  local summary_file="$1"
+write_baseline_summary() {
+  local output_file="$1"
 
   "$PYTHON_BIN" - \
-    "$summary_file" \
+    "$SHAPE_MANIFEST" \
+    "$BASELINE_CASE_ROOT" \
+    "$output_file" \
     "$BASELINE_BRANCH_LABEL" \
     "$BASELINE_COMMIT_LABEL" \
     "$BASELINE_REPO" \
-    "$PYTHON_BIN" \
+    "$ROUNDS" \
     "$AITER_FLYDSL_GEMM1_FUSED_QUANT" <<'PY'
-import shlex
+import csv
+import pathlib
+import statistics
 import sys
-from pathlib import Path
 
+(
+    manifest_name,
+    case_root_name,
+    output_name,
+    branch,
+    commit,
+    repo,
+    rounds,
+    fused_quant,
+) = sys.argv[1:]
 
-summary_path = Path(sys.argv[1])
-branch, commit, repo, python_bin, fused_quant = sys.argv[2:]
-body = summary_path.read_text(encoding="utf-8")
-env = {
-    "ENABLE_CK": "0",
-    "AITER_MOE_EXPERT_BALANCE": "true",
-    "AITER_LOG_MORE": "1",
-    "AITER_USE_GROUPED_GEMM": "1",
-    "AITER_GROUPED_DEBUG": "0",
-    "AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE": "1",
-    "AITER_FLYDSL_GEMM1_FUSED_QUANT": fused_quant,
-}
-command = [
-    python_bin,
-    "-u",
-    "my_code/test_flydsl_grouped_gemm_gfx1250.py",
-    "--scenario",
-    "bench",
-    "--data-format",
-    "a4w4",
-    "--act",
-    "silu",
-    "--no-bias",
-    "--no-check-aot-cache",
-    "--experts",
-    "64",
-    "--tokens",
-    "1536",
-    "--topk",
-    "8",
-    "--model-dim",
-    "7168",
-    "--inter-dim",
-    "2048",
-    "--iters",
-    "20",
-    "--const-init",
-    "0",
+with open(manifest_name, encoding="utf-8", newline="") as src:
+    shapes = list(csv.DictReader(src, delimiter="\t"))
+
+case_root = pathlib.Path(case_root_name)
+lines = [
+    "# Baseline multi-shape benchmark",
+    "",
+    f"- branch: `{branch}`",
+    f"- commit: `{commit}`",
+    f"- rounds per shape: `{rounds}`",
+    f"- AITER_FLYDSL_GEMM1_FUSED_QUANT: `{fused_quant}`",
+    "- MoE e2e timing: `testGraph=False`, `use_cuda_event=False`, "
+    "`num_warmup=5`, `num_iters=20`, torch profiler "
+    "`get_trace_perf(...).device_time_sum`",
+    f"- repository: `{repo}`",
+    "",
+    "| shape | GEMM1 samples (us) | GEMM1 median (us) | standalone quant samples (us) | GEMM1 pipeline median (us) | GEMM2 samples (us) | GEMM2 median (us) | MoE e2e samples (us) | MoE median (us) | pass | max logits_diff | max rel_l2 | hashes |",
+    "|---|---|---:|---|---:|---|---:|---|---:|:---:|---:|---:|:---:|",
 ]
-env_text = " \\\n  ".join(f"{key}={shlex.quote(value)}" for key, value in env.items())
-command_text = shlex.join(command)
-metadata = f"""# Baseline E64/T1536/topk8 benchmark
 
-- branch: `{branch}`
-- commit: `{commit}`
-- MoE e2e timing: `testGraph=False`, `use_cuda_event=False`,
-  `num_warmup=5`, `num_iters=20`, torch profiler
-  `get_trace_perf(...).device_time_sum`
-- repository: `{repo}`
 
-## Python command
+def values(rows, key):
+    return [float(row[key] or 0.0) for row in rows]
 
-```bash
-cd {shlex.quote(repo)}
-{env_text} \\\n  {command_text}
-```
 
-"""
-summary_path.write_text(metadata + body, encoding="utf-8")
+def samples(vals, digits=3):
+    return ", ".join(f"{value:.{digits}f}" for value in vals)
+
+
+for shape in shapes:
+    rows = []
+    for round_id in range(int(rounds)):
+        result_file = (
+            case_root / f"round{round_id}_{shape['shape_id']}" / "results.tsv"
+        )
+        if not result_file.is_file():
+            raise SystemExit(f"missing baseline result: {result_file}")
+        with result_file.open(encoding="utf-8", newline="") as src:
+            round_rows = [
+                row
+                for row in csv.DictReader(src, delimiter="\t")
+                if row["data"] == "const0"
+            ]
+        if len(round_rows) != 1:
+            raise SystemExit(
+                f"expected one baseline row in {result_file}, got {len(round_rows)}"
+            )
+        rows.extend(round_rows)
+    if len(rows) != int(rounds):
+        raise SystemExit(
+            f"expected {rounds} baseline rows for {shape['shape_id']}, got {len(rows)}"
+        )
+
+    gemm1 = values(rows, "gemm1_us")
+    quant = values(rows, "quant_us")
+    gemm1_pipeline = [g + q for g, q in zip(gemm1, quant)]
+    gemm2 = values(rows, "gemm2_us")
+    moe = values(rows, "moe_e2e_us")
+    passed = all(row["pass"] == "True" for row in rows)
+    logits_diff = max(values(rows, "logits_diff"))
+    rel_l2 = max(values(rows, "rel_l2"))
+    hashes_match = all(
+        row["gemm1_ref_output_hash128"] == row["gemm1_output_hash128"]
+        and row["gemm2_ref_output_hash128"] == row["gemm2_output_hash128"]
+        for row in rows
+    )
+    label = (
+        f"E{shape['experts']}/T{shape['tokens']}/topk{shape['topk']}/"
+        f"M{shape['model_dim']}/I{shape['inter_dim']}"
+    )
+    lines.append(
+        f"| {label} | {samples(gemm1)} | {statistics.median(gemm1):.3f} | "
+        f"{samples(quant)} | {statistics.median(gemm1_pipeline):.3f} | "
+        f"{samples(gemm2)} | {statistics.median(gemm2):.3f} | "
+        f"{samples(moe, 2)} | {statistics.median(moe):.2f} | {passed} | "
+        f"{logits_diff:.4e} | {rel_l2:.4e} | {hashes_match} |"
+    )
+
+path = pathlib.Path(output_name)
+path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 PY
 }
 
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
 LOG_ROOT="${LOG_ROOT:-$SCRIPT_DIR/moe_prefill_yadai_compare_runs/$RUN_ID}"
 BASELINE_LOG_DIR="$LOG_ROOT/baseline"
-YADAI_LOG_DIR="$LOG_ROOT/a4w4_prefill_v2_yadai"
+BASELINE_CASE_ROOT="$BASELINE_LOG_DIR/cases"
+YADAI_LOG_DIR="$LOG_ROOT/rocm_main"
 FAKE_GIT_DIR="$LOG_ROOT/fake_git"
-mkdir -p "$BASELINE_LOG_DIR" "$YADAI_LOG_DIR" "$FAKE_GIT_DIR"
+SHAPE_MANIFEST="$LOG_ROOT/shapes.tsv"
+mkdir -p "$BASELINE_CASE_ROOT" "$YADAI_LOG_DIR" "$FAKE_GIT_DIR"
+
+printf 'shape_id\texperts\ttokens\ttopk\tmodel_dim\tinter_dim\n' >"$SHAPE_MANIFEST"
+for shape_spec in "${SHAPE_SPECS[@]}"; do
+  IFS='|' read -r shape_id experts tokens topk model_dim inter_dim \
+    <<<"$shape_spec"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$shape_id" "$experts" "$tokens" "$topk" "$model_dim" "$inter_dim" \
+    >>"$SHAPE_MANIFEST"
+done
 
 # The baseline custom-shape path only asks Git for HEAD and the branch name. A
 # tiny shim supplies those labels without running Git inside the container.
@@ -335,41 +475,57 @@ export AITER_USE_GROUPED_GEMM=1
 export AITER_GROUPED_DEBUG=0
 export AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE=1
 
-printf 'Baseline repository: %s\n' "$BASELINE_REPO"
-printf 'Baseline commit label: %s\n' "$BASELINE_COMMIT_LABEL"
-printf 'Comparison repository: %s\n' "$YADAI_REPO"
-printf 'Comparison target branch: ROCm/%s\n' "$TARGET_BRANCH"
+printf 'Run mode: %s\n' "$RUN_MODE"
+if ((RUN_CURRENT)); then
+  printf 'Current repository: %s\n' "$BASELINE_REPO"
+  printf 'Current commit label: %s\n' "$BASELINE_COMMIT_LABEL"
+fi
+if ((RUN_BASE)); then
+  printf 'Comparison repository: %s\n' "$YADAI_REPO"
+  printf 'Comparison target branch: ROCm/%s\n' "$TARGET_BRANCH"
+fi
 printf 'Rounds: %s\n' "$ROUNDS"
 printf 'Baseline AITER_FLYDSL_GEMM1_FUSED_QUANT: %s\n' \
   "$AITER_FLYDSL_GEMM1_FUSED_QUANT"
 printf 'Logs: %s\n' "$LOG_ROOT"
 
-require_gpu_idle 'before baseline'
-printf '\n===== baseline: run_moe_prefill_switch_ab.sh =====\n'
-(
-  cd "$BASELINE_REPO"
-  PATH="$FAKE_GIT_DIR:$PATH" \
-  CODEX_TEST_COMMIT="$BASELINE_COMMIT_LABEL" \
-  CODEX_TEST_BRANCH="$BASELINE_BRANCH_LABEL" \
-  AITER_FLYDSL_GEMM1_FUSED_QUANT="$AITER_FLYDSL_GEMM1_FUSED_QUANT" \
-  LOG_DIR="$BASELINE_LOG_DIR" \
-  ROUNDS="$ROUNDS" \
-    bash ./my_code/run_moe_prefill_switch_ab.sh \
-      --experts "$EXPERTS" \
-      --tokens "$TOKENS" \
-      --topk "$TOPK" \
-      --model-dim "$MODEL_DIM" \
-      --inter-dim "$INTER_DIM"
-) 2>&1 | tee "$LOG_ROOT/baseline_console.log"
-require_gpu_idle 'after baseline'
-
-BASELINE_SUMMARY="$BASELINE_LOG_DIR/summary.md"
-if [[ ! -f "$BASELINE_SUMMARY" ]]; then
-  printf 'Missing baseline summary: %s\n' "$BASELINE_SUMMARY" >&2
-  exit 2
+if ((RUN_CURRENT)); then
+  BASELINE_SUMMARY="$BASELINE_LOG_DIR/summary.md"
+  printf '\n===== mode current: hyg/moe_a4w4_pr_refactor MoE pipeline =====\n'
+  for ((round_id = 0; round_id < ROUNDS; ++round_id)); do
+    set_round_shapes "$round_id"
+    printf '\n===== current round %s: %s =====\n' \
+      "$round_id" "${ROUND_SHAPES[*]}"
+    for shape_spec in "${ROUND_SHAPES[@]}"; do
+      IFS='|' read -r shape_id experts tokens topk model_dim inter_dim \
+        <<<"$shape_spec"
+      shape_log_dir="$BASELINE_CASE_ROOT/round${round_id}_${shape_id}"
+      mkdir -p "$shape_log_dir"
+      require_gpu_idle "before current round $round_id $shape_id"
+      printf '\n===== current round %s shape %s =====\n' "$round_id" "$shape_id"
+      (
+        cd "$BASELINE_REPO"
+        PATH="$FAKE_GIT_DIR:$PATH" \
+        CODEX_TEST_COMMIT="$BASELINE_COMMIT_LABEL" \
+        CODEX_TEST_BRANCH="$BASELINE_BRANCH_LABEL" \
+        AITER_FLYDSL_GEMM1_FUSED_QUANT="$AITER_FLYDSL_GEMM1_FUSED_QUANT" \
+        LOG_DIR="$shape_log_dir" \
+        ROUNDS=1 \
+          bash ./my_code/run_moe_prefill_switch_ab.sh e2e-const0 \
+            --experts "$experts" \
+            --tokens "$tokens" \
+            --topk "$topk" \
+            --model-dim "$model_dim" \
+            --inter-dim "$inter_dim"
+      ) 2>&1 | tee \
+        "$BASELINE_LOG_DIR/round${round_id}_${shape_id}_console.log"
+      require_gpu_idle "after current round $round_id $shape_id"
+    done
+  done
+  write_baseline_summary "$BASELINE_SUMMARY"
 fi
-prepend_baseline_summary_metadata "$BASELINE_SUMMARY"
 
+if ((RUN_BASE)); then
 update_yadai_checkout
 ensure_yadai_core_enum_abi
 YADAI_TEST="$YADAI_REPO/op_tests/flydsl_tests/test_flydsl_grouped_gemm.py"
@@ -393,26 +549,12 @@ case "$YADAI_AITER_IMPORT" in
 esac
 printf 'Comparison Python import: %s\n' "$YADAI_AITER_IMPORT"
 
-COMMON_YADAI_ARGS=(
-  --data-format a4w4
-  --experts "$EXPERTS"
-  --tokens "$TOKENS"
-  --topk "$TOPK"
-  --model-dim "$MODEL_DIM"
-  --inter-dim "$INTER_DIM"
-  --act silu
-  --no-bias
-  --no-check-aot-cache
-  --warmup 5
-  --iters 20
-  --data-init zero
-  --scale-init zero
-)
-
 # Baseline e2e timing is run_perftest(testGraph=False, use_cuda_event=False,
 # num_warmup=5, num_iters=20), returning torch.profiler get_trace_perf device
 # time. Force and assert exactly the same contract for the comparison checkout.
 YADAI_E2E_CODE="$(cat <<'PY'
+import sys
+
 import aiter.test_common as test_common
 from aiter import ActivationType
 from op_tests.flydsl_tests import test_flydsl_grouped_gemm as grouped_test
@@ -424,7 +566,7 @@ original_run_perftest = test_common.run_perftest
 def run_perftest_baseline_compatible(*args, **kwargs):
     if kwargs.get("num_warmup") != 5 or kwargs.get("num_iters") != 20:
         raise RuntimeError(
-            "yadai e2e timing must match baseline: num_warmup=5, num_iters=20"
+            "comparison e2e timing must match baseline: num_warmup=5, num_iters=20"
         )
     kwargs["testGraph"] = False
     kwargs["use_cuda_event"] = False
@@ -433,13 +575,14 @@ def run_perftest_baseline_compatible(*args, **kwargs):
 
 test_common.run_perftest = run_perftest_baseline_compatible
 grouped_test.set_data_format("a4w4")
+experts, tokens, topk, model_dim, inter_dim = map(int, sys.argv[1:6])
 metrics = grouped_test.run_moe(
     "a4w4",
-    experts=64,
-    tokens=1536,
-    topk=8,
-    model_dim=7168,
-    inter_dim=2048,
+    experts=experts,
+    tokens=tokens,
+    topk=topk,
+    model_dim=model_dim,
+    inter_dim=inter_dim,
     activation=ActivationType.Silu,
     use_bias=False,
     bench=True,
@@ -476,58 +619,94 @@ PY
 YADAI_E2E_SCRIPT="$YADAI_LOG_DIR/run_e2e_graph_false.py"
 printf '%s\n' "$YADAI_E2E_CODE" >"$YADAI_E2E_SCRIPT"
 
-printf '\n===== ROCm/%s: direct Python tests =====\n' "$TARGET_BRANCH"
-for ((round = 1; round <= ROUNDS; ++round)); do
-  require_gpu_idle "before ROCm/$TARGET_BRANCH kernel round $round"
-  printf '\n===== ROCm/%s round %s/%s: GEMM1 and GEMM2 =====\n' \
-    "$TARGET_BRANCH" "$round" "$ROUNDS"
-  (
-    cd "$YADAI_REPO"
-    AITER_META_DIR="$YADAI_REPO" \
-    PYTHONPATH="$YADAI_REPO${PYTHONPATH:+:$PYTHONPATH}" \
-      "$PYTHON_BIN" -u op_tests/flydsl_tests/test_flydsl_grouped_gemm.py \
-      --scenario kernel \
-      "${COMMON_YADAI_ARGS[@]}"
-  ) 2>&1 | tee "$YADAI_LOG_DIR/kernel_r${round}.log"
-  require_gpu_idle "after ROCm/$TARGET_BRANCH kernel round $round"
+printf '\n===== mode base-isolated: ROCm/%s GEMM1/GEMM2 =====\n' \
+  "$TARGET_BRANCH"
+for ((round_id = 0; round_id < ROUNDS; ++round_id)); do
+  set_round_shapes "$round_id"
+  printf '\n===== ROCm/%s kernel round %s: %s =====\n' \
+    "$TARGET_BRANCH" "$round_id" "${ROUND_SHAPES[*]}"
+  for shape_spec in "${ROUND_SHAPES[@]}"; do
+    IFS='|' read -r shape_id experts tokens topk model_dim inter_dim \
+      <<<"$shape_spec"
+    set_common_args "$experts" "$tokens" "$topk" "$model_dim" "$inter_dim"
+    require_gpu_idle \
+      "before ROCm/$TARGET_BRANCH kernel round $round_id $shape_id"
+    printf '\n===== ROCm/%s kernel round %s shape %s =====\n' \
+      "$TARGET_BRANCH" "$round_id" "$shape_id"
+    (
+      cd "$YADAI_REPO"
+      AITER_META_DIR="$YADAI_REPO" \
+      PYTHONPATH="$YADAI_REPO${PYTHONPATH:+:$PYTHONPATH}" \
+        "$PYTHON_BIN" -u op_tests/flydsl_tests/test_flydsl_grouped_gemm.py \
+        --scenario kernel \
+        "${COMMON_ARGS[@]}"
+    ) 2>&1 | tee "$YADAI_LOG_DIR/${shape_id}_kernel_r${round_id}.log"
+    require_gpu_idle \
+      "after ROCm/$TARGET_BRANCH kernel round $round_id $shape_id"
+  done
+done
 
-  require_gpu_idle "before ROCm/$TARGET_BRANCH e2e round $round"
-  printf '\n===== ROCm/%s round %s/%s: MoE e2e =====\n' \
-    "$TARGET_BRANCH" "$round" "$ROUNDS"
-  (
-    cd "$YADAI_REPO"
-    AITER_META_DIR="$YADAI_REPO" \
-    PYTHONPATH="$YADAI_REPO${PYTHONPATH:+:$PYTHONPATH}" \
-      "$PYTHON_BIN" -u "$YADAI_E2E_SCRIPT"
-  ) 2>&1 | tee "$YADAI_LOG_DIR/e2e_r${round}.log"
-  require_gpu_idle "after ROCm/$TARGET_BRANCH e2e round $round"
+printf '\n===== mode base-e2e: ROCm/%s graph-off MoE e2e =====\n' \
+  "$TARGET_BRANCH"
+for ((round_id = 0; round_id < ROUNDS; ++round_id)); do
+  set_round_shapes "$round_id"
+  printf '\n===== ROCm/%s e2e round %s: %s =====\n' \
+    "$TARGET_BRANCH" "$round_id" "${ROUND_SHAPES[*]}"
+  for shape_spec in "${ROUND_SHAPES[@]}"; do
+    IFS='|' read -r shape_id experts tokens topk model_dim inter_dim \
+      <<<"$shape_spec"
+    require_gpu_idle \
+      "before ROCm/$TARGET_BRANCH e2e round $round_id $shape_id"
+    printf '\n===== ROCm/%s e2e round %s shape %s =====\n' \
+      "$TARGET_BRANCH" "$round_id" "$shape_id"
+    (
+      cd "$YADAI_REPO"
+      AITER_META_DIR="$YADAI_REPO" \
+      PYTHONPATH="$YADAI_REPO${PYTHONPATH:+:$PYTHONPATH}" \
+        "$PYTHON_BIN" -u "$YADAI_E2E_SCRIPT" \
+          "$experts" "$tokens" "$topk" "$model_dim" "$inter_dim"
+    ) 2>&1 | tee "$YADAI_LOG_DIR/${shape_id}_e2e_r${round_id}.log"
+    require_gpu_idle \
+      "after ROCm/$TARGET_BRANCH e2e round $round_id $shape_id"
+  done
 done
 
 YADAI_SUMMARY="$YADAI_LOG_DIR/summary.md"
 "$PYTHON_BIN" - \
+  "$SHAPE_MANIFEST" \
   "$YADAI_LOG_DIR" \
+  "$YADAI_SUMMARY" \
   "$YADAI_COMMIT_LABEL" \
   "$TARGET_BRANCH" \
   "$YADAI_REPO" \
   "$PYTHON_BIN" \
-  "$YADAI_E2E_SCRIPT" <<'PY' >"$YADAI_SUMMARY"
-import re
+  "$YADAI_E2E_SCRIPT" \
+  "$ROUNDS" <<'PY'
+import csv
 import os
+import pathlib
+import re
 import shlex
 import statistics
 import sys
-from pathlib import Path
+
+(
+    manifest_name,
+    log_dir_name,
+    output_name,
+    commit,
+    branch,
+    repo,
+    python_bin,
+    e2e_script,
+    rounds,
+) = sys.argv[1:]
+log_dir = pathlib.Path(log_dir_name)
+with open(manifest_name, encoding="utf-8", newline="") as src:
+    shapes = list(csv.DictReader(src, delimiter="\t"))
 
 
-log_dir = Path(sys.argv[1])
-commit = sys.argv[2]
-branch = sys.argv[3]
-repo = sys.argv[4]
-python_bin = sys.argv[5]
-e2e_script = sys.argv[6]
-
-
-def extract(path: Path, pattern: str) -> float:
+def extract(path: pathlib.Path, pattern: str) -> float:
     text = path.read_text(encoding="utf-8", errors="replace")
     match = re.search(pattern, text)
     if match is None:
@@ -535,7 +714,7 @@ def extract(path: Path, pattern: str) -> float:
     return float(match.group(1))
 
 
-def extract_accuracy(path: Path) -> tuple[float, float]:
+def extract_accuracy(path: pathlib.Path) -> tuple[float, float]:
     text = path.read_text(encoding="utf-8", errors="replace")
     match = re.search(
         r"\[yadai-e2e graph=False\] logits_diff=([0-9.eE+-]+) "
@@ -547,29 +726,65 @@ def extract_accuracy(path: Path) -> tuple[float, float]:
     return float(match.group(1)), float(match.group(2))
 
 
-kernel_logs = sorted(log_dir.glob("kernel_r*.log"))
-e2e_logs = sorted(log_dir.glob("e2e_r*.log"))
-gemm1 = [
-    extract(path, r"\[kernel-bench a4w4 silu\] gemm1: us = ([0-9.]+)")
-    for path in kernel_logs
+def samples(values: list[float], digits=3) -> str:
+    return ", ".join(f"{value:.{digits}f}" for value in values)
+
+
+lines = [
+    f"# ROCm/{branch} multi-shape benchmark",
+    "",
+    f"- branch: `ROCm/{branch}`",
+    f"- commit: `{commit}`",
+    f"- rounds per shape: `{rounds}`",
+    "- MoE e2e timing: `testGraph=False`, `use_cuda_event=False`, "
+    "`num_warmup=5`, `num_iters=20`, torch profiler "
+    "`get_trace_perf(...).device_time_sum`",
+    "",
+    "| shape | GEMM1 samples (us) | GEMM1 median (us) | GEMM2 samples (us) | GEMM2 median (us) | MoE e2e samples (us) | MoE median (us) | max logits_diff | max rel_l2 | pass |",
+    "|---|---|---:|---|---:|---|---:|---:|---:|:---:|",
 ]
-gemm2 = [
-    extract(path, r"\[kernel-bench a4w4 silu\] gemm2: us = ([0-9.]+)")
-    for path in kernel_logs
-]
-e2e = [
-    extract(
-        path,
-        r"\[yadai-e2e graph=False\] fused_moe end-to-end us = ([0-9.]+)",
+
+for shape in shapes:
+    shape_id = shape["shape_id"]
+    kernel_logs = [
+        log_dir / f"{shape_id}_kernel_r{round_id}.log"
+        for round_id in range(int(rounds))
+    ]
+    e2e_logs = [
+        log_dir / f"{shape_id}_e2e_r{round_id}.log"
+        for round_id in range(int(rounds))
+    ]
+    for path in kernel_logs + e2e_logs:
+        if not path.is_file():
+            raise SystemExit(f"missing comparison log: {path}")
+
+    gemm1 = [
+        extract(path, r"\[kernel-bench a4w4 silu\] gemm1: us = ([0-9.]+)")
+        for path in kernel_logs
+    ]
+    gemm2 = [
+        extract(path, r"\[kernel-bench a4w4 silu\] gemm2: us = ([0-9.]+)")
+        for path in kernel_logs
+    ]
+    e2e = [
+        extract(
+            path,
+            r"\[yadai-e2e graph=False\] fused_moe end-to-end us = ([0-9.]+)",
+        )
+        for path in e2e_logs
+    ]
+    accuracy = [extract_accuracy(path) for path in e2e_logs]
+    label = (
+        f"E{shape['experts']}/T{shape['tokens']}/topk{shape['topk']}/"
+        f"M{shape['model_dim']}/I{shape['inter_dim']}"
     )
-    for path in e2e_logs
-]
-accuracy = [extract_accuracy(path) for path in e2e_logs]
-
-
-def samples(values: list[float]) -> str:
-    return ", ".join(f"{value:.3f}" for value in values)
-
+    lines.append(
+        f"| {label} | {samples(gemm1)} | {statistics.median(gemm1):.3f} | "
+        f"{samples(gemm2)} | {statistics.median(gemm2):.3f} | "
+        f"{samples(e2e)} | {statistics.median(e2e):.3f} | "
+        f"{max(value[0] for value in accuracy):.4e} | "
+        f"{max(value[1] for value in accuracy):.4e} | True |"
+    )
 
 pythonpath = repo + (":" + os.environ["PYTHONPATH"] if os.environ.get("PYTHONPATH") else "")
 env = {
@@ -583,87 +798,123 @@ env = {
     "PYTHONPATH": pythonpath,
 }
 env_text = " \\\n  ".join(f"{key}={shlex.quote(value)}" for key, value in env.items())
-kernel_command = shlex.join(
+lines.extend(
     [
-        python_bin,
-        "-u",
-        "op_tests/flydsl_tests/test_flydsl_grouped_gemm.py",
-        "--scenario",
-        "kernel",
-        "--data-format",
-        "a4w4",
-        "--experts",
-        "64",
-        "--tokens",
-        "1536",
-        "--topk",
-        "8",
-        "--model-dim",
-        "7168",
-        "--inter-dim",
-        "2048",
-        "--act",
-        "silu",
-        "--no-bias",
-        "--no-check-aot-cache",
-        "--warmup",
-        "5",
-        "--iters",
-        "20",
-        "--data-init",
-        "zero",
-        "--scale-init",
-        "zero",
+        "",
+        "## Reproduction command templates",
+        "",
+        "```bash",
+        f"cd {shlex.quote(repo)}",
+        f"{env_text} \\",
+        f"  {shlex.join([python_bin, '-u', 'op_tests/flydsl_tests/test_flydsl_grouped_gemm.py', '--scenario', 'kernel', '--data-format', 'a4w4', '--experts', '<E>', '--tokens', '<T>', '--topk', '<TOPK>', '--model-dim', '<M>', '--inter-dim', '<I>', '--act', 'silu', '--no-bias', '--no-check-aot-cache', '--warmup', '5', '--iters', '20', '--data-init', 'zero', '--scale-init', 'zero'])}",
+        "",
+        f"{env_text} \\",
+        f"  {shlex.join([python_bin, '-u', e2e_script, '<E>', '<T>', '<TOPK>', '<M>', '<I>'])}",
+        "```",
     ]
 )
-e2e_command = shlex.join([python_bin, "-u", e2e_script])
-
-print(f"# ROCm/{branch} E64/T1536/topk8 benchmark")
-print()
-print(f"- branch: `ROCm/{branch}`")
-print(f"- commit: `{commit}`")
-print(
-    "- MoE e2e timing: `testGraph=False`, `use_cuda_event=False`, "
-    "`num_warmup=5`, `num_iters=20`, torch profiler "
-    "`get_trace_perf(...).device_time_sum`"
-)
-print()
-print("## GEMM kernel Python command")
-print()
-print("```bash")
-print(f"cd {shlex.quote(repo)}")
-print(f"{env_text} \\")
-print(f"  {kernel_command}")
-print("```")
-print()
-print("## MoE e2e Python command")
-print()
-print("```bash")
-print(f"cd {shlex.quote(repo)}")
-print(f"{env_text} \\")
-print(f"  {e2e_command}")
-print("```")
-print()
-print("| Metric | Samples (us) | Median (us) |")
-print("|---|---|---:|")
-print(f"| GEMM1 | {samples(gemm1)} | {statistics.median(gemm1):.3f} |")
-print(f"| GEMM2 | {samples(gemm2)} | {statistics.median(gemm2):.3f} |")
-print(f"| MoE e2e | {samples(e2e)} | {statistics.median(e2e):.3f} |")
-print()
-print("| Round | logits_diff | rel_l2 | pass |")
-print("|---:|---:|---:|:---:|")
-for round_index, (logits_diff, rel_l2) in enumerate(accuracy, 1):
-    print(
-        f"| {round_index} | {logits_diff:.4e} | {rel_l2:.4e} | True |"
-    )
+path = pathlib.Path(output_name)
+path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 PY
+fi
 
-printf '\n============== baseline summary ==============\n'
-cat "$BASELINE_LOG_DIR/summary.md"
-printf '================================================\n'
-printf '\n============= ROCm/%s summary =============\n' "$TARGET_BRANCH"
-cat "$YADAI_SUMMARY"
-printf '================================================\n'
-printf 'Baseline summary: %s\n' "$BASELINE_LOG_DIR/summary.md"
-printf 'ROCm/%s summary: %s\n' "$TARGET_BRANCH" "$YADAI_SUMMARY"
+if ((RUN_CURRENT)); then
+  printf '\n============== current summary ==============\n'
+  cat "$BASELINE_SUMMARY"
+  printf '=============================================\n'
+  printf 'Current summary: %s\n' "$BASELINE_SUMMARY"
+fi
+if ((RUN_BASE)); then
+  printf '\n============= ROCm/%s summary =============\n' "$TARGET_BRANCH"
+  cat "$YADAI_SUMMARY"
+  printf '================================================\n'
+  printf 'ROCm/%s summary: %s\n' "$TARGET_BRANCH" "$YADAI_SUMMARY"
+fi
+if ((RUN_CURRENT && RUN_BASE)); then
+  COMPARISON_SUMMARY="$LOG_ROOT/comparison.md"
+  "$PYTHON_BIN" - \
+    "$BASELINE_SUMMARY" \
+    "$YADAI_SUMMARY" \
+    "$COMPARISON_SUMMARY" \
+    "$BASELINE_BRANCH_LABEL" \
+    "$BASELINE_COMMIT_LABEL" \
+    "$TARGET_BRANCH" \
+    "$YADAI_COMMIT_LABEL" <<'PY'
+import pathlib
+import sys
+
+(
+    current_summary_name,
+    base_summary_name,
+    output_name,
+    current_branch,
+    current_commit,
+    base_branch,
+    base_commit,
+) = sys.argv[1:]
+
+
+def table_rows(path: pathlib.Path) -> dict[str, list[str]]:
+    rows = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.startswith("| E"):
+            continue
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        rows[cells[0]] = cells
+    return rows
+
+
+current_rows = table_rows(pathlib.Path(current_summary_name))
+base_rows = table_rows(pathlib.Path(base_summary_name))
+if current_rows.keys() != base_rows.keys():
+    missing_current = sorted(base_rows.keys() - current_rows.keys())
+    missing_base = sorted(current_rows.keys() - base_rows.keys())
+    raise SystemExit(
+        "summary shape mismatch: "
+        f"missing_current={missing_current}, missing_base={missing_base}"
+    )
+
+
+def speedup(current: float, base: float) -> float:
+    return (base - current) / base * 100.0
+
+
+lines = [
+    "# Current vs ROCm/main performance comparison",
+    "",
+    f"- current: `{current_branch}@{current_commit[:12]}`",
+    f"- comparison: `ROCm/{base_branch}@{base_commit[:12]}`",
+    "- positive percentages mean current is faster than ROCm/main",
+    "- current GEMM1 uses the pipeline median, including standalone quant when enabled",
+    "",
+    "| shape | current GEMM1 pipeline (us) | ROCm/main GEMM1 (us) | GEMM1 speedup | current GEMM2 (us) | ROCm/main GEMM2 (us) | GEMM2 speedup | current MoE e2e (us) | ROCm/main MoE e2e (us) | MoE speedup | current pass | ROCm/main pass |",
+    "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|:---:|",
+]
+
+for shape, current in current_rows.items():
+    base = base_rows[shape]
+    current_gemm1 = float(current[4])
+    current_gemm2 = float(current[6])
+    current_moe = float(current[8])
+    base_gemm1 = float(base[2])
+    base_gemm2 = float(base[4])
+    base_moe = float(base[6])
+    lines.append(
+        f"| {shape} | {current_gemm1:.3f} | {base_gemm1:.3f} | "
+        f"{speedup(current_gemm1, base_gemm1):+.2f}% | "
+        f"{current_gemm2:.3f} | {base_gemm2:.3f} | "
+        f"{speedup(current_gemm2, base_gemm2):+.2f}% | "
+        f"{current_moe:.3f} | {base_moe:.3f} | "
+        f"{speedup(current_moe, base_moe):+.2f}% | "
+        f"{current[9]} | {base[9]} |"
+    )
+
+path = pathlib.Path(output_name)
+path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+print("\n================ comparison ================")
+print(path.read_text(encoding="utf-8"), end="")
+print("============================================")
+print(f"Comparison summary: {path}")
+PY
+fi
 printf 'All logs: %s\n' "$LOG_ROOT"

@@ -2492,6 +2492,27 @@ def launch_gemm_a8w4_tdm_optimized(
         f"{_relax_cluster_wrap}_mg4_fc{fence_cover_mma}{_xdl_arb}"
         f"{_wmma_reuse}{_overlap_store}{_output_wave_split}"
     )
+    short_t256_name = (
+        n_experts > 0
+        and (tile_m, tile_n, tile_k) == (256, 256, 256)
+        and (m_warp, n_warp, num_buffers) == (2, 2, 4)
+        and cluster_n == 4
+    )
+    if short_t256_name and K == 7168 and stage1_act == 1 and stage1_quant_out == 1:
+        _kname = (
+            f"a8w4_tdm_fp4_t256x256x256_w2x2_b4_K7168_e{n_experts}"
+            f"_act1_q1r{quant_wmma_rep}_cn4_prefetch_apre"
+        )
+    elif (
+        short_t256_name
+        and K in (2048, 3072)
+        and stage1_act == 0
+        and stage1_quant_out == 0
+    ):
+        _kname = (
+            f"a8w4_tdm_fp4_t256x256x256_w2x2_b4_K{K}_e{n_experts}"
+            "_cn4_prefetch_apre"
+        )
 
     @flyc.kernel(name=_kname, known_block_size=[block, 1, 1])
     def kernel(
