@@ -769,7 +769,7 @@ def sparse_mla_fwd(
         # Only walks without a tile pad of their own read it.
         KV_LDS_PAD=(
             16
-            if num_queries >= _PREFILL_MIN_ROWS and not fp8_dots and not staged
+            if num_queries >= _PREFILL_MIN_ROWS and not fp8_dots and qk_rope_head_dim
             else 0
         ),
         q_scl_ptr=q_scale,

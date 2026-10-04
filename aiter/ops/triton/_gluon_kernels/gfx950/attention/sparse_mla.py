@@ -2221,8 +2221,11 @@ def _sparse_mla(
     EXTRA_PIPE: gl.constexpr = HAS_EXTRA and EXTRA_FMT == "fp8_dsv4_mla"
     PIPE: gl.constexpr = MAIN_PIPE or EXTRA_PIPE
     # Staged walks on 16x16x32: per-tensor fp8, and bf16 with the rope inside.
+    # Rope-appended rows with sentinels keep 16x16x16 up to 16 heads (register-bound).
     STAGED_K32: gl.constexpr = (
-        MAIN_FMT == "fp8_scalar" and ((not HAS_EXTRA) or EXTRA_FMT == "fp8_scalar")
+        MAIN_FMT == "fp8_scalar"
+        and ((not HAS_EXTRA) or EXTRA_FMT == "fp8_scalar")
+        and not (ROPE_SEPARATE and HAS_INVALID and BLOCK_M <= 16)
     ) or (
         MAIN_FMT == "bf16"
         and not ROPE_SEPARATE
