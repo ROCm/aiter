@@ -39,12 +39,13 @@ here. Update this file in the same change as any behaviour change.
    The loader serves the buckets a `DEFAULT_FALLBACK` file lacks from `DEFAULT.json`. Bounds: the
    kernel's explicit `bounds`, else the seed's `M_BOUNDS`, else `STANDARD_M_BOUNDS`.
    `--all-buckets` only chooses the M list (the family's buckets up to `TOP_BUCKET_M`, 8192). Ms
-   above the largest bound are not tuned. Every installed file ships an `any`: a copy of its
-   highest `M_LEQ` bucket, rewritten on every install. `DEFAULT.json` is never written, so its
-   `any` never changes; `M_GEQ_*` is never generated;
+   above the largest bound are not tuned. `any` is never written: an existing file keeps its own
+   and a new file is served `DEFAULT.json`'s (a small-M tile must not serve large Ms).
+   `DEFAULT.json` is never written; `M_GEQ_*` is never generated;
    `kpack` is dropped outside gfx942 and `persistent` always. After writing, clear both loader
-   caches and re-resolve every swept M; `is_tuned` must be True, otherwise the previous file is
-   restored. Bucket collisions are resolved before writing (largest M wins).
+   caches and re-resolve every swept M; `is_tuned` must be True. Every unswept bound and one M
+   above the largest must resolve as before (or to a tuned bucket that covers it); otherwise the
+   previous file is restored. Bucket collisions are resolved before writing (largest M wins).
 6. Data contracts: a kernel function returns `(call, inputs, should_skip)`; a result
    record's fields are listed in the `harness.py` docstring; the plan JSON carries the family's
    `bounds`; the worker prints `ready` and one line per candidate for the driver's watchdog;
@@ -58,9 +59,10 @@ here. Update this file in the same change as any behaviour change.
    discovery runs in the worker (`harness.py --plan`) under `HIP_VISIBLE_DEVICES`.
 8. One GPU op in flight per GPU: each worker is serial and owns one GPU. A driver may use several
    GPUs (`--gpu 0 1 2 3`): candidates are dealt round-robin, then a final round re-times the
-   baseline and the ten fastest on the first GPU into `<results>.final.jsonl`; when that file
+   baseline and the ten fastest current-plan candidates on the first GPU into
+   `<results>.final.jsonl` (also refreshed on a single-GPU resume when it exists); when that file
    exists the installer uses only it, and an M timed on several GPUs without it is skipped. Never two
-   drivers on one GPU.
+   drivers on one GPU; `--gpu` IDs must be unique.
 9. Call the public wrappers (`aiter.ops.triton.gemm...`) only, never `_triton_kernels` or
    `_gluon_kernels`; pass `backend=` where the wrapper takes it and refuse a backend the wrapper
    cannot select (`KernelSpec.supports`).

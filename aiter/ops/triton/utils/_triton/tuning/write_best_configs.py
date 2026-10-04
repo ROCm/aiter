@@ -7,9 +7,11 @@ Flow:  load_winners    fastest ok record per M; the installed baseline competes 
                        an M above the largest bound is not written
        build_table     seeded with this shape's file if it exists, else a new file marked
                        DEFAULT_FALLBACK (the loader serves its missing buckets from DEFAULT.json);
-                       "any" copies the highest M_LEQ bucket; DEFAULT.json is never written
-       write, confirm  write the file, re-resolve every assigned M through the real loader, and
-                       put the previous file back if the loader disagrees
+                       "any" is never written (an existing file keeps its own, a new file is
+                       served DEFAULT.json's); DEFAULT.json is never written
+       write, confirm  write the file, re-resolve every assigned M through the real loader and
+                       every unswept bound (and one M above the largest) against what it resolved
+                       to before, and put the previous file back if the loader disagrees
 
 sweep_configs.py runs this when a sweep finishes; run it by hand to re-install from results.
 """
@@ -93,7 +95,7 @@ def assign_buckets(winners, bounds):
         bucket = bucket_for(M, bounds)
         if bucket is None:
             print(
-                f"  M={M}: above the largest bound {bounds[-1]}, not written ('any' copies the highest bucket)"
+                f"  M={M}: above the largest bound {bounds[-1]}, not written ('any' is never changed)"
             )
             continue
         if bucket in assignments:
@@ -166,11 +168,6 @@ def install(spec, backend, shape_nk, runs_dir):
             f"no swept M is within the bounds (largest {bounds[-1]}); nothing installed"
         )
     table = build_table(seed, assignments, arch, keys)
-    # every file ships an "any": a copy of its highest tuned M_LEQ bucket
-    highest = max(
-        (k for k in table if k.startswith("M_LEQ_")), key=lambda k: int(k[6:])
-    )
-    table["any"] = dict(table[highest])
     for bucket, winner in sorted(assignments.items(), key=lambda kv: kv[1].M):
         gain = ""
         if winner.baseline is not None:
@@ -178,6 +175,16 @@ def install(spec, backend, shape_nk, runs_dir):
         print(
             f"  M={winner.M:<6} {bucket:<12} {winner.record['us']:10.3f} us  {gain:<36} {json.dumps(table[bucket])}"
         )
+
+    # unswept Ms (the other bounds and "any") must resolve as before, unless a tuned bucket covers them
+    def resolve(M):
+        try:
+            return resolve_installed(spec, dict(shape_nk, M=M), backend)
+        except KeyError:  # a file without "any"
+            return None
+
+    unswept = [b for b in bounds if f"M_LEQ_{b}" not in assignments] + [bounds[-1] + 1]
+    before = {M: resolve(M) for M in unswept}
 
     config_dir = resolve_config_dir("gemm", spec.config_name, backend=backend)
     target = f"{config_dir}/{specialized_filename(spec.config_name, shape_nk)}"
@@ -187,21 +194,34 @@ def install(spec, backend, shape_nk, runs_dir):
         f.write("\n")
     print(f"installed {target}")
 
+    def fail(message):
+        if previous is None:  # never leave a bad file in the tree
+            os.remove(target)
+        else:
+            Path(target).write_text(previous)
+        sys.exit(f"validation failed for {message}; previous file restored")
+
     # confirm through the real loader (both caches hold the old file)
     load_config_json.cache_clear()
     gemm_config_utils._get_gemm_config_cached.cache_clear()
     for bucket, winner in assignments.items():
         got, is_tuned = resolve_installed(spec, dict(shape_nk, M=winner.M), backend)
         if got != table[bucket] or not is_tuned:
-            if previous is None:  # never leave a bad file in the tree
-                os.remove(target)
-            else:
-                Path(target).write_text(previous)
-            sys.exit(
-                f"validation failed for M={winner.M} ({bucket}): the loader returned "
-                f"is_tuned={is_tuned} {json.dumps(got)}; previous file restored"
+            fail(
+                f"M={winner.M} ({bucket}): the loader returned "
+                f"is_tuned={is_tuned} {json.dumps(got)}"
             )
-    print(f"validated {len(assignments)} bucket(s) through the loader")
+    for M, expected in before.items():
+        got = resolve(M)
+        covering = [table[b] for b in assignments if M <= int(b[6:])]
+        if got != expected and (got is None or got[0] not in covering):
+            fail(
+                f"unswept M={M}: the loader returned {json.dumps(got)}, "
+                f"before {json.dumps(expected)}"
+            )
+    print(
+        f"validated {len(assignments)} bucket(s) and {len(unswept)} unswept M(s) through the loader"
+    )
     return target
 
 

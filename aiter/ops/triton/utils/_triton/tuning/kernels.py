@@ -300,7 +300,7 @@ def gemm_a16w16_persistent(shape, backend):
 
     def should_skip(config):
         if backend != "gluon":
-            return False
+            return config.get("NUM_KSPLIT", 1) != 1  # the wrapper resets it to 1
         block_k = config["BLOCK_K"]
         num_buffers = config.get("NUM_BUFFERS", 2)
         k_tiles = cdiv(cdiv(K, config.get("NUM_KSPLIT", 1)), block_k)

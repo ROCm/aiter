@@ -37,9 +37,10 @@ it (for fp4 families that is twice the byte width).
 
 `--gpu` takes one or more GPUs. With several, the candidates of each M are dealt round-robin to
 the GPUs, one serial worker per GPU; when all are done a final round re-times the installed
-baseline and the ten fastest candidates on the first GPU into `<results>.final.jsonl`, and the
-installer uses only that file for the M, so the winner is picked from numbers measured on one
-device. Never point two drivers at the same GPU.
+baseline and the ten fastest candidates of the current plan on the first GPU into
+`<results>.final.jsonl`, and the installer uses only that file for the M, so the winner is picked
+from numbers measured on one device. A single-GPU resume refreshes an existing final-round file.
+`--gpu` IDs must be unique; never point two drivers at the same GPU.
 
 Suggested M lists: `GEMM-AFP4WFP4_PRESHUFFLED` 4 8 16 31 32 64 ... 8192 (31 is a bucket of its
 own because `BLOCK_SIZE_M` must be 16 or less below M=32); standard families 1 4 8 16 ... 8192;
@@ -96,9 +97,10 @@ Results go to `runs/sweep-<arch>-<backend>-<kernel>-[B=..-]M=..-N=..-K=..jsonl` 
 (the exception; the sweep continues), `crashed` or `hung` (the worker died or stalled on it; the
 driver restarts the worker on the remaining configs). The baseline record carries `is_tuned`.
 The full field list is in the `harness.py` docstring. Re-running the same command skips configs that already have a record, provided `--calls` and
-`--replays` are unchanged (otherwise it refuses); `--fresh` discards them. The plan of each M is
+`--replays` are unchanged (otherwise it refuses); `--fresh` discards them (only this shape's results,
+final round, logs and todo files). The plan of each M is
 kept as `runs/plan-<arch>-<backend>-<kernel>-<shape>.json`, and only its candidates (plus the
-baseline) can win at install time. Ctrl-C kills the workers before the driver exits. `--batch` is the number of configs per worker process, `--stall` the
+baseline) can win at install time. Ctrl-C kills the workers before the driver exits. `--batch` is the number of configs per worker process (at least 1), `--stall` the
 seconds a worker may spend on one candidate (a huge tile can compile for minutes) before it is
 killed, `--setup-timeout` the time allowed before a worker is ready.
 
@@ -111,10 +113,11 @@ that shape is updated in place; a new file holds only the tuned buckets plus
 bucket it lacks from `DEFAULT.json`. The M bounds are the kernel's explicit bounds, else the file's
 `M_BOUNDS`, else the standard list. Each swept M replaces its `M_LEQ_<smallest family bound >= M>`
 bucket with the fastest `ok` record, the installed baseline included; when several swept Ms share a
-bucket the largest M wins. Ms above the largest bound (8192) are not tuned. Every installed file
-ships an `any`: a copy of its highest `M_LEQ` bucket. `DEFAULT.json` is never written. Every swept M is then re-read
-through `get_gemm_config` and must come back `is_tuned`; if not, the previous file is put back and
-the command fails.
+bucket the largest M wins. Ms above the largest bound (8192) are not tuned. `any` is never written:
+an existing file keeps its own and a new file is served `DEFAULT.json`'s. `DEFAULT.json` is never
+written. Every swept M is then re-read through `get_gemm_config` and must come back `is_tuned`, and
+every unswept bound (plus one M above the largest) must resolve as it did before the install, unless
+a newly tuned bucket covers it; if not, the previous file is put back and the command fails.
 Config reads are cached per process, so restart Python to pick up a new file.
 
 ## Adding a kernel or a key

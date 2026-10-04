@@ -6,14 +6,15 @@ Per M:   plan            harness.py --plan: load defaults, generate combinations
          check_settings  records can only be resumed when they were timed the same way
          sweep           harness.py --configs ...: the candidates are dealt round-robin to the
                          GPUs, one serial worker per GPU, with crash and hang recovery
-         final_round     with several GPUs: re-time the baseline and the ten fastest on the first
-                         GPU into <results>.final.jsonl, the only file the installer uses for
-                         that M, so the winner comes from same-device numbers
+         final_round     with several GPUs (or when a final-round file already exists): re-time
+                         the baseline and the ten fastest current candidates on the first GPU
+                         into <results>.final.jsonl, the only file the installer uses for that M,
+                         so the winner comes from same-device numbers
          summarize
 Then:    install         write_best_configs.py: select winners, merge buckets, validate, write
 
 --all-buckets sweeps every M bucket of the family up to TOP_BUCKET_M (8192); the installer
-sets "any" to a copy of the highest tuned bucket. The driver never imports torch or aiter: every step is a subprocess that sees
+never changes "any". The driver never imports torch or aiter: every step is a subprocess that sees
 HIP_VISIBLE_DEVICES=<gpu>. It resumes from the records in --runs-dir.
 """
 
@@ -100,6 +101,10 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if bool(args.M) == args.all_buckets:
         parser.error("give --M values or --all-buckets, not both")
+    if args.batch < 1:
+        parser.error("--batch must be positive")
+    if len(set(args.gpu)) != len(args.gpu):
+        parser.error("--gpu IDs must be unique: one worker per GPU")
     return args
 
 
@@ -148,7 +153,7 @@ def plan(spec, shape, backend, gpu, runs_dir, timeout):
 
 
 def all_bucket_ms(spec, args, gpu):
-    """Every bucket of the family up to TOP_BUCKET_M; the installer copies the highest into "any"."""
+    """Every bucket of the family up to TOP_BUCKET_M; "any" is never swept."""
     first = plan(
         spec,
         shape_from_args(args, spec.dims, 1),
@@ -194,10 +199,11 @@ def check_settings(out, args):
 
 
 def discard(out):
-    for path in glob.glob(
-        out[: -len(".jsonl")] + "*"
-    ):  # results, final round, logs, todo files
-        os.remove(path)
+    """This shape's results and final round, and their worker logs and todo files."""
+    for results in (out, final_results_path(out)):
+        for path in [results] + glob.glob(glob.escape(results) + ".*"):
+            if os.path.exists(path):
+                os.remove(path)
 
 
 def terminate(proc):
@@ -335,11 +341,18 @@ def sweep(spec, shape, backend, candidates, out, gpus, args):
             raise
 
 
-def final_round(spec, shape, backend, out, gpu, args):
-    """Re-time the baseline and the fastest candidates on one GPU into the final-round file."""
+def final_round(spec, shape, backend, candidates, out, gpu, args):
+    """Re-time the baseline and the fastest current candidates on one GPU into the final-round file."""
+    current = {config_key(c) for c in candidates}
     records = read_records(out)
     ok = sorted(
-        (r for r in records.values() if r["status"] == "ok" and not r.get("baseline")),
+        (
+            r
+            for r in records.values()
+            if r["status"] == "ok"
+            and not r.get("baseline")
+            and config_key(r["config"]) in current
+        ),
         key=lambda r: r["us"],
     )
     fastest = [r["config"] for r in ok[:FINAL_ROUND_SIZE]]
@@ -350,7 +363,7 @@ def final_round(spec, shape, backend, out, gpu, args):
         f"  final round on gpu {gpu}: re-timing the baseline and the {len(fastest)} fastest",
         flush=True,
     )
-    run_batch(spec, shape, backend, [None] + fastest, final_out, gpu, args)
+    sweep_shard(spec, shape, backend, [None] + fastest, final_out, gpu, args)
 
 
 def summarize(out, candidates):
@@ -417,8 +430,8 @@ def main(argv=None):
         print(f"  results: {out}", flush=True)
         candidates = [None] + plan_["configs"]  # None is the installed baseline
         sweep(spec, shape, backend, candidates, out, gpus, args)
-        if len(gpus) > 1:
-            final_round(spec, shape, backend, out, gpus[0], args)
+        if len(gpus) > 1 or os.path.exists(final_results_path(out)):
+            final_round(spec, shape, backend, candidates, out, gpus[0], args)
         summarize(out, candidates)
 
     return install(spec, args, backend, gpus[0])
