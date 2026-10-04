@@ -8,6 +8,7 @@ import torch
 
 from aiter import logger
 from aiter.ops.triton.attention.fav3_sage import (
+    fav3_sage_func,
     fav3_sage_wrapper_func,
     get_sage_fwd_configs,
 )
@@ -25,6 +26,92 @@ from aiter.test_mha_common import (
 
 ATOL_fp8 = 3.0e-1
 RTOL_fp8 = 2.5e-1
+
+
+@pytest.mark.parametrize(
+    "seqlen, tail_logit, causal, later_max, sparse, v_dtype",
+    [
+        pytest.param(4096, 0, False, False, False, torch.float8_e4m3fnuz, id="uniform"),
+        pytest.param(
+            4096, -8, False, False, False, torch.float8_e4m3fnuz, id="dense-full"
+        ),
+        pytest.param(
+            4117, -8, False, False, False, torch.float8_e4m3fnuz, id="dense-tail"
+        ),
+        pytest.param(
+            4117, -7, False, False, False, torch.float8_e4m3fnuz, id="tail-minus7"
+        ),
+        pytest.param(4117, -8, True, False, False, torch.float8_e4m3fnuz, id="causal"),
+        pytest.param(
+            4117, -8, False, True, False, torch.float8_e4m3fnuz, id="later-max"
+        ),
+        pytest.param(
+            4096, -8, False, False, True, torch.float8_e4m3fnuz, id="sparse-full"
+        ),
+        pytest.param(
+            4117, -8, False, True, True, torch.float8_e4m3fnuz, id="sparse-tail"
+        ),
+        pytest.param(4117, -8, False, False, False, torch.bfloat16, id="bf16-v"),
+    ],
+)
+def test_sage_small_probabilities(
+    seqlen, tail_logit, causal, later_max, sparse, v_dtype
+):
+    """Constant V must remain constant when many small probabilities contribute."""
+    if v_dtype == torch.float8_e4m3fnuz and arch_info.get_arch() != "gfx942":
+        pytest.skip("E4M3 FNUZ regression requires gfx942")
+
+    config = get_sage_fwd_configs()
+    block_m, block_n = config["BLOCK_M"], config["BLOCK_N"]
+    seqlen_q = seqlen if causal else block_m + 1
+    num_q_blocks = (seqlen_q + block_m - 1) // block_m
+    num_k_blocks = (seqlen + block_n - 1) // block_n
+    q = torch.zeros((1, seqlen_q, 1, 128), dtype=torch.int8, device="cuda")
+    k = torch.zeros((1, seqlen, 1, 128), dtype=torch.int8, device=q.device)
+    q[..., 0] = 1
+    k[..., 0] = tail_logit
+    max_position = seqlen - 1 if later_max else 0
+    k[:, max_position, :, 0] = 0
+    head_dim_v = 64 if v_dtype == torch.bfloat16 else 128
+    v = torch.ones((1, seqlen, 1, head_dim_v), dtype=torch.float32, device=q.device).to(
+        v_dtype
+    )
+    # QK descaling includes the conversion from natural logits to exp2 units.
+    q_descale = torch.full((1, 1, num_q_blocks), math.log2(math.e), device=q.device)
+    k_descale = torch.ones((1, 1, num_k_blocks), device=q.device)
+    v_descale = torch.ones((1, 1, head_dim_v), device=q.device)
+    sparse_args = {}
+    if sparse:
+        block_mask = torch.ones(
+            (1, num_q_blocks, num_k_blocks), dtype=torch.bool, device=q.device
+        )
+        indices, starts, counts = block_attn_mask_to_ragged_lut(block_mask, num_heads=1)
+        sparse_args = {
+            "kv_block_indices": indices,
+            "lut_start": starts,
+            "lut_count": counts,
+            "use_block_sparse": True,
+        }
+
+    out, lse = fav3_sage_func(
+        q,
+        k,
+        v,
+        q_descale,
+        k_descale,
+        v_descale,
+        causal=causal,
+        return_lse=True,
+        **sparse_args,
+    )
+    torch.testing.assert_close(out, torch.ones_like(out), atol=0.01, rtol=0)
+    if causal:
+        key_count = torch.arange(1, seqlen_q + 1, device=q.device)
+    else:
+        key_count = torch.full((seqlen_q,), seqlen, device=q.device)
+    # Every visible row has one zero logit and key_count - 1 tail logits.
+    expected_lse = torch.log1p((key_count.float() - 1) * math.exp(tail_logit))
+    torch.testing.assert_close(lse[0, 0], expected_lse, atol=2e-5, rtol=2e-5)
 
 
 def test_block_attn_mask_to_ragged_lut_metadata_dtype():
