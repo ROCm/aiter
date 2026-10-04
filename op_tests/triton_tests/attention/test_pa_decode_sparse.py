@@ -720,8 +720,8 @@ def _vllm_pool_skip():
         pytest.skip("the packed fp8_dsv4_mla cache is a gfx950 gluon path")
 
 
-# One shape per program kind: decode with split-K (16 heads, and 8 heads in a 16-head
-# program), 32-head programs, and prefill on 64-head programs.
+# Decode with split-K (16 heads; 8 heads in a 16-head program), 32-head programs,
+# 64-head prefill.
 @pytest.mark.parametrize("T, H", [(6, 16), (37, 8), (192, 32), (2100, 64)])
 @pytest.mark.parametrize("sentinels", ["some", "lead"])
 def test_pa_decode_sparse_two_loop_vllm_pool(T, H, sentinels):
@@ -744,8 +744,7 @@ def _inv_rope_ref(x, pos, cos_sin):
     return x
 
 
-# 6 rows split, so the reduce writes the output; 2,100 rows do not, so the attention
-# kernel does.
+# The reduce's store (6 rows, split) and the attention kernel's (2,100 rows).
 @pytest.mark.parametrize("T, H", [(6, 16), (2100, 64)])
 @pytest.mark.parametrize("mxfp8", [True, False])
 def test_pa_decode_sparse_inv_rope_mxfp8_epilogue(T, H, mxfp8):

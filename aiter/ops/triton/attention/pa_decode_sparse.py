@@ -484,15 +484,12 @@ def _last_round_fills(programs, num_sms):
 
 
 def _packed_head_block(num_heads, num_queries, num_splits, row_tiles, has_extra):
-    """Heads per program (16, 32 or 64) for fp8_dsv4_mla caches at 32 or 64 heads.
+    """Heads per program (16, 32 or 64) for fp8_dsv4_mla at 32 or 64 heads.
 
-    A 32-head program (8 warps) gathers each key row once for 32 heads instead of
-    twice. It pays when each program has more than one tile and, for grids of up
-    to four rounds, the last round is more than half full; bigger grids only need
-    long programs (four tiles or more). At 64 heads, a top-k launch without
-    split-K and with at least one full round of programs runs one 64-head program
-    per row (Q in LDS), so each key tile is staged once for all 64 heads; up to
-    four rounds, the last one must be more than half full.
+    32 when each program has more than one tile and, up to four rounds, the
+    last round is more than half full (past four rounds: four or more tiles).
+    64 for top-k launches without split-K from one full round of rows (up to
+    four rounds, a last round more than half full).
     """
     num_sms = get_num_sms()
     if num_heads == 64 and has_extra and num_splits == 1:
@@ -508,17 +505,13 @@ def _packed_head_block(num_heads, num_queries, num_splits, row_tiles, has_extra)
 
 
 def _staged_head_block(num_heads, num_queries, num_splits, row_tiles):
-    """Heads per program (16, 32 or 64) at 32 or 64 heads for the walks that
-    gather each key tile into registers and stage it: per-tensor fp8 caches, and
-    bf16 caches with the rope inside the row.
+    """Heads per program (16, 32 or 64) at 32 or 64 heads for the staged walks
+    (per-tensor fp8; bf16 with the rope inside).
 
-    A 16-head program stages its tiles for 16 heads, so at 32 or 64 heads each
-    tile is staged two or four times per row. Bigger programs stage it once, but
-    there are fewer of them: 64 heads without split-K once the 16-head grid
-    overflows one round of two programs per CU (more rows than half the CUs);
-    32 heads when each program has two or more tiles and the grid's last round
-    is more than half full (past four rounds, with four or more tiles). The
-    split count stays the 16-head grid's.
+    64 without split-K once 2 x rows > CUs; else 32 when each program has two
+    or more tiles and, up to four rounds, the last round is more than half
+    full (past four rounds: four or more tiles). The split count stays the
+    16-head grid's.
     """
     num_sms = get_num_sms()
     if num_heads == 64 and num_splits == 1 and 2 * num_queries > num_sms:
@@ -677,8 +670,7 @@ def _pa_decode_sparse_gfx950_gluon(
     )
     prefill = num_queries >= _PREFILL_MIN_ROWS
     row_tiles = max(avg_main, avg_extra) / BLOCK_K
-    # Split count from the 16-head grid. A 32-head grid gets the same count: half
-    # the programs, but one per CU instead of two.
+    # Split count from the 16-head grid, for every program size.
     if kv_splits is not None:
         num_splits = max(1, int(kv_splits))
     else:
@@ -692,8 +684,7 @@ def _pa_decode_sparse_gfx950_gluon(
     staged_bf16 = (
         not FLAT_POOL and main_fmt == "bf16" and (not has_extra or extra_fmt == "bf16")
     )
-    # 32- and 64-head programs (8 warps) gather and stage each key tile once for
-    # all their heads; when that pays depends on the walk.
+    # 32- and 64-head programs (8 warps) stage each key tile once for all heads.
     if num_heads in (32, 64):
         if packed_fp8:
             BLOCK_M = _packed_head_block(
@@ -812,13 +803,10 @@ def _pa_decode_sparse_gfx950_gluon(
         # Rows that share KV rows reuse them through the cache, so skip .cg.
         prefill_kw["GATHER_CACHE"] = ""
 
-    # Put a row's head blocks, which read the same KV rows, on one XCD so they
-    # share an L2. With one head block per row it slows plain decode more than
-    # it speeds up spec decode. Not for SWA-only prefill, or for launches padded
-    # past the split count.
-    # A bf16 row's one 32- or 64-head program is remapped too when there is no
-    # split-K: its neighbours (a request's draft rows, a prefill's rows) read the
-    # same KV rows.
+    # Rows of several head blocks on one XCD (shared L2); not for SWA-only prefill
+    # or launches padded past the split count.
+    # Also a bf16 row's single 32/64-head program without split-K: neighbouring
+    # rows read the same KV rows.
     rows_share = heads_blocks > 1 or (staged_bf16 and BLOCK_M > 16 and num_splits == 1)
     xcd_remap = (
         get_num_xcds()

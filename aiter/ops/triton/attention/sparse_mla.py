@@ -690,8 +690,7 @@ def sparse_mla_fwd(
 
     staged = fmt == "fp8_scalar" or (fmt == "bf16" and qk_rope_head_dim == 0)
     if staged and num_heads in (32, 64) and not async_lds_on:
-        # 32- or 64-head programs stage each key tile once for all their heads
-        # (see _staged_head_block).
+        # 32- or 64-head programs (_staged_head_block).
         block_m = _staged_head_block(
             num_heads, num_queries, num_splits, max(avg_main, avg_extra) / block_k
         )
@@ -767,8 +766,7 @@ def sparse_mla_fwd(
         FP8_MFMA=fp8_dots,
         ASYNC_LDS=async_lds_on,
         GATHER_CACHE="",
-        # The walks without a tile pad of their own (DeepSeek-V3.2 caches, bf16 rows
-        # with the rope appended); fp8 dots stage raw fp8 in their own layout.
+        # Only walks without a tile pad of their own read it.
         KV_LDS_PAD=(
             16
             if num_queries >= _PREFILL_MIN_ROWS and not fp8_dots and not staged

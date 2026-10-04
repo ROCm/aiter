@@ -78,10 +78,8 @@ def _xwarp_ld_layout(lin, n_warps):
 
 @gluon.jit
 def _xwarp_rowred(cfg, x, red_smem, IS_MAX: gl.constexpr):
-    """Row max or sum across the key warps, exchanged through red_smem.
-
-    One barrier instead of gl.reduce's two; same summation order, so the
-    result is bit-identical."""
+    """Row max or sum across the key warps through red_smem: one barrier,
+    and gl.reduce's summation order."""
     NW: gl.constexpr = cfg.N_WARPS
     BM: gl.constexpr = cfg.BLOCK_M
     BK: gl.constexpr = cfg.BLOCK_K
@@ -384,8 +382,7 @@ class Cfg:
         self.ROPE_SEPARATE = gl.constexpr(ROPE_SEPARATE)
         self.QK_DIM = gl.constexpr(KV_DIM + (ROPE_DIM if ROPE_SEPARATE else 0))
         self.NUM_WARPS = gl.constexpr(NUM_WARPS)
-        # Lanes per gathered 512 B row: 32 x 16 B, or 16 x 32 B on the pipelined
-        # walk, which halves the row addresses each lane computes.
+        # Lanes per gathered 512 B row: 32 x 16 B, or 16 x 32 B on the PIPE walk.
         GATHER_TW1 = 16 if PIPE else 32
         self.GATHER_TW1 = gl.constexpr(GATHER_TW1)
         GSPT = 16 * (32 // GATHER_TW1)
@@ -406,14 +403,11 @@ class Cfg:
         self.UNPEEL = gl.constexpr(UNPEEL)
         ROPE_VEC = 16
         self.ROPE_VEC = gl.constexpr(ROPE_VEC)
-        # The fp8_dsv4_mla walk, and the STAGED_K32 ones (bf16 and per-tensor fp8
-        # caches), run their bf16 dots on 16x16x32 too, gfx950's full bf16 rate
-        # (16x16x16 is half of it).
+        # bf16 dots on 16x16x32 (gfx950's full rate) for the PIPE and STAGED_K32 walks.
         MFMA_K = 32 if FP8_MFMA or PIPE or STAGED_K32 else 16
         self.MFMA_K = gl.constexpr(MFMA_K)
 
-        # Warps tile the dots' N. With more than 16 heads per program they also
-        # tile M, 16 heads per warp, so each wave keeps one 16-head slice.
+        # Warps tile N; past 16 heads they also tile M, 16 heads per warp.
         M_WARPS = max(1, min(BLOCK_M // 16, NUM_WARPS))
         self.N_WARPS = gl.constexpr(NUM_WARPS // M_WARPS)
         self.qk_layout = gl.constexpr(
@@ -457,8 +451,7 @@ class Cfg:
                 order=[1, 0],
             )
         )
-        # gather_l with 2-byte elements: same per-lane byte run, half the
-        # columns (the int16 view the asm dequant reads).
+        # gather_l over 2-byte elements (the int16 view _deq_asm reads).
         self.gather16_l = gl.constexpr(
             gl.BlockedLayout(
                 size_per_thread=[1, GSPT // 2],
@@ -477,19 +470,16 @@ class Cfg:
             )
         )
         if PIPE:
-            # 8 elements (16 B, so 128-bit accesses stay aligned) after every 128:
-            # each lane stores a 64 B run of its row, and without it lanes 4 apart
-            # landed on the same banks. Also the fewest conflicts for the K and V
-            # reads of the 16x16x32 operands.
+            # Pad 8 (16 B, keeps 128-bit accesses aligned) every 128 elements: spreads
+            # the 64 B-per-lane row stores and the 16x16x32 K / V reads over the banks.
             self.kv_shared = gl.constexpr(
                 gl.PaddedSharedLayout.with_identity_for(
                     [[128, 8]], [BLOCK_K, KV_DIM], [1, 0]
                 )
             )
         elif STAGED_K32 and not FP8_MFMA:
-            # These walks store 32 B per lane, 32 lanes per row. 8 elements after
-            # every 256 and 64 after every 8,192 (16 rows) leave the 16x16x32 V
-            # reads conflict-free, where a pad per row made them the worst access.
+            # Stores of 32 B per lane, 32 lanes per row: pad 8 every 256 and 64 every
+            # 8,192 (16 rows) for conflict-free 16x16x32 V reads.
             self.kv_shared = gl.constexpr(
                 gl.PaddedSharedLayout.with_identity_for(
                     [[256, 8], [8192, 64]], [BLOCK_K, KV_DIM], [1, 0]
@@ -504,9 +494,8 @@ class Cfg:
                     [[KV_DIM, KV_LDS_PAD or LDS_PAD]], [BLOCK_K, KV_DIM], [1, 0]
                 )
             )
-        # Q staged in LDS (one copy per program) instead of each wave's registers,
-        # which a 64-head program with bf16 dots needs; Q and the KV tile fit with
-        # one program per CU. A separate rope part of Q (64 dims) stays in registers.
+        # 64-head programs with bf16 dots keep Q in LDS (one copy per program); a
+        # separate rope part stays in registers.
         Q_LDS = BLOCK_M >= 64 and not FP8_MFMA
         self.Q_LDS = gl.constexpr(Q_LDS)
         self.q_shared = gl.constexpr(
@@ -870,8 +859,7 @@ def _qk_scores(cfg, q_dot, q_rope_dot, kv_smem, rope_smem):
     buffer (MFMA accumulates natively, so KV_DIM + ROPE_DIM is two dots)."""
     S = gl.zeros([cfg.BLOCK_M, cfg.BLOCK_K], gl.float32, layout=cfg.qk_layout)
     if cfg.Q_LDS:
-        # Q from LDS, 128 dims at a time with the matching K slice: only one
-        # chunk of each operand is live.
+        # 128-dim chunks of Q and the matching K slice.
         QC: gl.constexpr = 128
         for c in gl.static_range(cfg.KV_DIM // QC):
             q_c = q_dot.slice(c * QC, QC, dim=1).load(cfg.q_layout)
@@ -1668,9 +1656,8 @@ def _process_segment(
     return m_i, l_i, acc
 
 
-# The fp8_dsv4_mla tile walk: a tile's slot ids for all its layouts come in one
-# round trip, a tile ahead, and a row is gathered with 16 lanes. With PREFETCH
-# the gathers also run a tile ahead, so nothing waits at the back edge.
+# The fp8_dsv4_mla tile walk: a tile's slot ids for all its layouts in one round
+# trip, a tile ahead; 16 lanes per row. PREFETCH issues the gathers a tile ahead too.
 
 
 @gluon.jit
@@ -1742,8 +1729,8 @@ def _pipe_gather(
     bgr, pgr = _split_slot_sh(cfg, s_r, SHIFT)
     nope_row = bg * cs0 + pg * fmt.TOK_U8
     scl_row = bg * cs0 + (fmt.TOK_U8 << SHIFT) + pg * fmt.SCL_TRAILER_U8
-    # Scales first (vmcnt counts in order). Load the dword holding each exponent
-    # byte; _pipe_scales extracts it, since carried i8 values get repacked.
+    # Scales first (vmcnt counts in order), as the dwords holding each exponent
+    # byte (_pipe_scales extracts it; carried i8 would be repacked).
     if fmt.NARROW_SCALE and not fmt.USE_BUFFER_LOAD and cfg.SCL_DWORD:
         cols = gl.arange(0, fmt.NG, layout=gl.SliceLayout(0, fmt.scl_l))
         rows = gl.convert_layout(scl_row, gl.SliceLayout(1, fmt.scl_l))
@@ -1777,8 +1764,7 @@ def _pipe_gather(
             CACHE=cfg.GATHER_CACHE,
         )
     if fmt.DEQ == "asm":
-        # int16 view for _deq_asm (4 packed fp8 per VGPR): same bytes as nope_row,
-        # read through the bf16 view.
+        # _deq_asm reads the same bytes as int16 (4 packed fp8 per VGPR).
         offs_full16 = gl.arange(
             0, cfg.KV_DIM // 2, layout=gl.SliceLayout(0, cfg.gather16_l)
         )
@@ -1837,9 +1823,7 @@ def _pipe_segment(
     PREFETCH: gl.constexpr = False,
 ):
     """_process_segment for fp8_dsv4_mla under UNI_TILE, with slot ids read a
-    tile ahead. Same tiles and math, so the result is bit-identical. With
-    PREFETCH the tile itself is gathered a tile ahead too, so the loop-carried
-    tile needs no copy at the back edge."""
+    tile ahead; PREFETCH gathers the tile itself a tile ahead too."""
     BK: gl.constexpr = cfg.BLOCK_K
     offs_full = gl.arange(0, cfg.KV_DIM, layout=gl.SliceLayout(0, cfg.gather_l))
     offs_rope = gl.arange(0, cfg.ROPE_L, layout=gl.SliceLayout(0, cfg.gather_rope_l))
@@ -1998,8 +1982,7 @@ def _inv_rope(x, cs_row, ROPE_DIM: gl.constexpr):
     even, odd = gl.split(gl.reshape(x, [M, D // 2, 2]))
     k = gl.arange(0, D // 2, layout=gl.SliceLayout(0, even.type.layout))
     k = k - (D - ROPE_DIM) // 2
-    # A masked buffer_load folds the mask into the offset, where a masked gl.load
-    # would branch on exec around each load.
+    # buffer_load folds the mask into the offset; a masked gl.load branches on exec.
     cos = gl.amd.cdna4.buffer_load(ptr=cs_row, offsets=k, mask=k >= 0, other=1.0)
     sin = gl.amd.cdna4.buffer_load(
         ptr=cs_row + ROPE_DIM // 2, offsets=k, mask=k >= 0, other=0.0
@@ -2050,16 +2033,13 @@ def _epilogue_store(
     INV_ROPE: gl.constexpr,
     OUT_MXFP8: gl.constexpr,
 ):
-    """Store rows x [M, D] of one query row, heads h0 onwards, as vLLM's passes
-    before wo_a leave them (rocm_inverse_rope_rows_, rocm_inverse_rope_mxfp8_rows):
-    rotated back by the inverse RoPE (INV_ROPE), and quantized to e4m3 with one
-    E8M0 byte per 32 lanes (OUT_MXFP8). The rows are rounded to bf16 first, as the
-    unfused path stores them, which also halves the move into work_l."""
+    """Store x [M, D] (one query row, heads h0 onwards) as vLLM's pre-wo_a passes
+    would: inverse RoPE (INV_ROPE), then e4m3 with an E8M0 byte per 32 lanes
+    (OUT_MXFP8). Rows are rounded to bf16 first, as the unfused path stores them."""
     M: gl.constexpr = x.shape[0]
     D: gl.constexpr = x.shape[1]
     if INV_ROPE:
-        # The position is read before the move into work_l, which hides its
-        # latency.
+        # Read the position before the move into work_l to hide its latency.
         cs_row = cs_ptr + gl.load(pos_ptr + row).to(gl.int64) * cs_stride
     x = gl.convert_layout(x.to(gl.bfloat16), work_l).to(gl.float32)
     if INV_ROPE:
@@ -2090,9 +2070,8 @@ def _xcd_work(GRID_ORDER: gl.constexpr, NUM_XCDS: gl.constexpr, SPLIT_K: gl.cons
     nh = gl.num_programs(GRID_ORDER.index("h"))
     ns = gl.num_programs(GRID_ORDER.index("s"))
     if SPLIT_K:
-        # Rows go in blocks of ceil(nq / NUM_XCDS), about one block per XCD.
-        # Inside a block the order is split-major, head block fastest: running
-        # one row's splits back to back was up to 14 % slower.
+        # Rows in blocks of ceil(nq / NUM_XCDS), about one per XCD; split-major
+        # inside a block, head block fastest.
         nq = gl.num_programs(GRID_ORDER.index("q"))
         t = (nq + NUM_XCDS - 1) // NUM_XCDS
         per = t * ns * nh
@@ -2222,10 +2201,9 @@ def _sparse_mla(
     XCD_REMAP: gl.constexpr = 0,
     # fp8_dsv4_mla walk: gather a tile ahead (see _pipe_segment)
     PIPE_PREFETCH: gl.constexpr = False,
-    # Output epilogue without SPLIT_K (with it, the reduce's): INV_ROPE rotates
-    # the trailing ROPE_DIM lanes of each row back (pos_ptr [C] positions,
-    # cos_sin_ptr [P, ROPE_DIM] f32 cos | sin), and OUT_MXFP8 stores e4m3 to
-    # out_ptr plus one E8M0 byte per 32 lanes to out_scale_ptr [C, H * S // 32].
+    # Output epilogue (no SPLIT_K; else the reduce's): INV_ROPE un-rotates the
+    # trailing ROPE_DIM lanes (pos_ptr [C], cos_sin_ptr [P, ROPE_DIM] f32 cos | sin);
+    # OUT_MXFP8 stores e4m3 plus an E8M0 byte per 32 lanes (out_scale_ptr [C, H*S/32]).
     pos_ptr=None,
     cos_sin_ptr=None,
     cs_stride: gl.constexpr = 0,
@@ -2242,8 +2220,7 @@ def _sparse_mla(
     MAIN_PIPE: gl.constexpr = MAIN_FMT == "fp8_dsv4_mla"
     EXTRA_PIPE: gl.constexpr = HAS_EXTRA and EXTRA_FMT == "fp8_dsv4_mla"
     PIPE: gl.constexpr = MAIN_PIPE or EXTRA_PIPE
-    # Per-tensor fp8 caches (DeepSeek-V4 and GLM-5.3 rows with the rope inside or
-    # none, GLM-5.2 rows with it appended) and bf16 caches with the rope inside.
+    # Staged walks on 16x16x32: per-tensor fp8, and bf16 with the rope inside.
     STAGED_K32: gl.constexpr = (
         MAIN_FMT == "fp8_scalar" and ((not HAS_EXTRA) or EXTRA_FMT == "fp8_scalar")
     ) or (
@@ -2451,8 +2428,7 @@ def _sparse_mla(
         # Nothing to quantize
         q_scale = gl.load(q_scl_ptr)
         if not FP8_MFMA:
-            # fp8 -> bf16 is exact (3 mantissa bits into 8). Q in LDS was stored
-            # as bf16 already.
+            # fp8 -> bf16 is exact; Q_LDS stored it as bf16 already.
             if not cfg.Q_LDS:
                 q_dot = gl.convert_layout(q.to(gl.bfloat16), cfg.q_layout)
             if ROPE_SEPARATE:
@@ -2505,8 +2481,7 @@ def _sparse_mla(
         )
     else:
         rope_smem = kv_smem  # never read as the rope buffer in this geometry
-    # Softmax row max / sum exchange buffers for _pipe_segment, separate from
-    # the reduction scratch.
+    # _pipe_segment's row max / sum exchange.
     if PIPE:
         red_smem = gl.allocate_shared_memory(
             gl.float32,
@@ -2629,10 +2604,8 @@ def _sparse_mla(
 
     if HAS_EXTRA:
         if FP8_MFMA:
-            # The fp8 PV dot accumulates raw code points and the V-side scale
-            # comes off in the epilogue, which applies the extra segment's.
-            # Rebase the main segment's sum onto it; the online-softmax
-            # rescales after this are linear, so it stays exact.
+            # fp8 PV accumulates raw code points and the epilogue applies the extra
+            # segment's V scale: rebase the main segment's sum onto it (exact).
             acc = acc * (main_v_scale / extra_v_scale)
         extra_seg = Seg(
             extra_fmt,
