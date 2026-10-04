@@ -5,6 +5,7 @@
 import gc
 import math
 import os
+import re
 import resource
 import statistics
 from collections.abc import Callable
@@ -45,6 +46,11 @@ class F6GemmCandidate(TypedDict):
     swizzle_max_m: int
     swizzle_max_n: int
     swizzle_max_k: int
+    # (M, N, K) for a shape-locked kernel (f6gemm_fly_<M>x<N>x<K>), which traps on any other shape
+    exact_shape: tuple[int, int, int] | None
+
+
+_EXACT_SHAPE_RE = re.compile(r"^f6gemm_fly_(\d+)x(\d+)x(\d+)(?:_nobias)?_kernel_func$")
 
 
 def _disable_core_dumps() -> None:
@@ -100,6 +106,7 @@ def load_f6gemm_candidates() -> list[F6GemmCandidate]:
             swizzle_max_k > 0 and (swizzle_max_m <= 0 or swizzle_max_n <= 0)
         ):
             raise ValueError(f"{kernel_name} has invalid swizzle bounds")
+        exact = _EXACT_SHAPE_RE.match(kernel_name)
         candidates.append(
             {
                 "kernel_id": int(kernel_id),
@@ -109,6 +116,9 @@ def load_f6gemm_candidates() -> list[F6GemmCandidate]:
                 "swizzle_max_m": swizzle_max_m,
                 "swizzle_max_n": swizzle_max_n,
                 "swizzle_max_k": swizzle_max_k,
+                "exact_shape": (
+                    tuple(int(v) for v in exact.groups()) if exact else None
+                ),
             }
         )
     if not candidates:
@@ -120,6 +130,8 @@ def candidate_supports_shape(
     candidate: F6GemmCandidate, M: int, N: int, K: int
 ) -> bool:
     """Return whether a kernel's compile-time swizzle bounds cover the launch."""
+    if candidate["exact_shape"] is not None:
+        return candidate["exact_shape"] == (M, N, K)
     padM, padN, padK = _ceil(M, 256), _ceil(N, 256), _ceil(K, 128)
     max_k = candidate["swizzle_max_k"]
     if max_k <= 0 or padK > max_k:
