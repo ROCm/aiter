@@ -18,6 +18,12 @@
 //     every line is flushed immediately, so partial data survives an
 //     external SIGKILL.
 //
+// Graph capture:
+//   - Calls issued while the launch stream is being captured into a
+//     HIP/CUDA graph are not dumped; a one-time warning is printed to
+//     stderr instead. Graph replays do not run host code and are therefore
+//     never recorded either.
+//
 // Thread-safety:
 //   - Sampling counter is thread_local (lock-free).
 //   - The final emission to the sink FILE* is guarded by a shared
@@ -39,6 +45,8 @@
 #include <sstream>
 #include <string>
 #include <unistd.h>
+
+#include <hip/hip_runtime.h>
 
 #include "mha_fwd.h"
 
@@ -75,6 +83,46 @@ inline bool mha_dump_should_emit()
         return false;
     thread_local uint64_t counter = 0;
     return (counter++ % static_cast<uint64_t>(stride)) == 0;
+}
+
+// True when `stream` is being captured into a HIP/CUDA graph. If the query
+// itself fails (e.g. legacy-stream query during a global-mode capture), treat
+// the stream as capturing so the dumper stays out of the way. The last-error
+// state is intentionally not cleared, so no unrelated earlier error is hidden.
+inline bool mha_dump_stream_is_capturing(hipStream_t stream)
+{
+    hipStreamCaptureStatus status = hipStreamCaptureStatusNone;
+    if(hipStreamIsCapturing(stream, &status) != hipSuccess)
+        return true;
+    return status != hipStreamCaptureStatusNone;
+}
+
+// Single entry gate for every dumper. Order matters:
+//   1. stride == 0  -> return immediately (zero overhead when disabled; no
+//      HIP API call on the hot path);
+//   2. capturing    -> skip, warn once per process. Host-side work (D2H
+//      copies of cu_seqlens in group mode) is illegal during capture, and
+//      graph replays never re-enter the host code anyway, so captured calls
+//      cannot be recorded faithfully;
+//   3. sampling     -> only now consume the sampling counter, so captured
+//      calls do not shift which eager calls get sampled.
+inline bool mha_dump_should_emit_on(hipStream_t stream)
+{
+    if(get_mha_dump_stride() == 0)
+        return false;
+    if(mha_dump_stream_is_capturing(stream))
+    {
+        static std::once_flag warn_once;
+        std::call_once(warn_once, [] {
+            std::fprintf(stderr,
+                         "[MHA_FWD] AITER_DUMP_MHA_FWD_INFO: skipping dump during "
+                         "stream capture (calls captured into or replayed from a "
+                         "HIP/CUDA graph are not recorded). This warning is "
+                         "printed once.\n");
+        });
+        return false;
+    }
+    return mha_dump_should_emit();
 }
 
 inline std::mutex& mha_dump_mutex()
@@ -169,6 +217,16 @@ inline void mha_dump_write(const std::string& line)
 }
 
 // Append fields shared by batch/group modes.
+//
+// Dump coverage: only the plain forward entry points emit records, i.e.
+// group/varlen fwd (mha_varlen_fwd, non-paged branch) and batch fwd when it
+// is dispatched to CK. splitkv / pagedkv (block_table) / appendkv /
+// mha_batch_prefill / fmha_v3_varlen_fwd are intentionally NOT dumped.
+//
+// Fields after `has_dropout` capture the remaining kernel-trait dimensions
+// (mask window, sink, logits soft-cap, quant scale) so the tooling can
+// filter/group on them. `has_logits_soft_cap` is emitted as 0/1 because
+// the kernel trait is a bool.
 inline void append_mha_common_fields(std::ostringstream& os,
                                      const mha_fwd_args& a,
                                      const char* mode)
@@ -185,13 +243,20 @@ inline void append_mha_common_fields(std::ostringstream& os,
        << " mask_type=" << a.mask_type
        << " bias_type=" << a.bias_type
        << " has_lse=" << (a.has_lse ? 1 : 0)
-       << " has_dropout=" << ((a.p_drop > 0.f) ? 1 : 0);
+       << " has_dropout=" << ((a.p_drop > 0.f) ? 1 : 0)
+       << " window_left=" << a.window_size_left
+       << " window_right=" << a.window_size_right
+       << " sink_size=" << a.sink_size
+       << " has_sink=" << (a.has_sink ? 1 : 0)
+       << " has_logits_soft_cap=" << ((a.logits_soft_cap > 0.f) ? 1 : 0)
+       << " qscale_type=" << a.qscale_type;
 }
 
-// Batch-mode dumper: only two extra scalar seqlens.
-inline void dump_mha_fwd_info_batch(const mha_fwd_args& a)
+// Batch-mode dumper: only two extra scalar seqlens. `stream` is the launch
+// stream; dumping is skipped while it is being graph-captured.
+inline void dump_mha_fwd_info_batch(const mha_fwd_args& a, hipStream_t stream)
 {
-    if(!mha_dump_should_emit())
+    if(!mha_dump_should_emit_on(stream))
         return;
     std::ostringstream os;
     append_mha_common_fields(os, a, "batch");

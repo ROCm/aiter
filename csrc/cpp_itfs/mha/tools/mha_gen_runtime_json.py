@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """
@@ -21,8 +20,11 @@ Design (approved 2026-08-25, see history):
    because CK codegen keys tiles on compiled hdim.
 
 3. Buckets: for each source CSV, sort rows by max_seqlen ascending; the
-   boundary between two neighboring rows i / i+1 is `(M_i + M_{i+1}) // 2`
-   (integer midpoint). The i-th row therefore owns the half-open interval
+   boundary between two neighboring rows i / i+1 is
+   `(M_i + M_{i+1} + 1) // 2` (integer midpoint rounded up, so that
+   M_i < mid_i <= M_{i+1} and every sample M_i lies inside its own
+   interval, even for adjacent samples such as 512 / 513). The i-th row
+   therefore owns the half-open interval
    `[low_i, high_i)`:
      * low_0    = -inf (represented as absence of the lower bound)
      * low_i    = mid_{i-1}         for i >= 1
@@ -33,10 +35,20 @@ Design (approved 2026-08-25, see history):
    produce two intervals on tile-A that are OR-ed together in its
    cpp_constraint.
 
-4. mask_type / bias / lse / dropout are ignored: CK will emit binaries for
-   every combination anyway; the constraint only talks about `max_seqlen`.
+4. Kernel signatures must agree inside a bucket. Tiles of one bucket are
+   picked at runtime by `cpp_constraint`, which can only talk about
+   `max_seqlen_q`; two different signatures (mask_type, nhead, bias, lse,
+   dropout, raw hdim, ...) landing in the same bucket are therefore
+   undecidable at runtime, and the merge is rejected instead of silently
+   mixing them. The same holds for a `max_seqlen` tuned twice: such shapes
+   belong to one group and must be tuned together (see
+   `mha_count_shape.py group`).
 
-5. Output path is mandatory: `--out <path>` must be provided, typically named
+5. The output does not depend on the `--in` order: buckets, dtypes and
+   `meta.sources` are sorted, so two runs over the same set of CSVs differ
+   only in `meta.generated_at`.
+
+6. Output path is mandatory: `--out <path>` must be provided, typically named
    after the model (e.g. `caption5p1_gfx942.json`).
 
 Usage:
@@ -56,12 +68,12 @@ import json
 import re
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 # CK's FmhaFwdTileSize field order (19 fields), must stay in sync with
 # 3rdparty/composable_kernel/example/ck_tile/01_fmha/codegen/ops/fmha_fwd.py
 # (see FmhaFwdTileSize dataclass) and mha_tune.py's TileSize._ORDERED_FIELDS.
-_ORDERED_FIELDS: Tuple[str, ...] = (
+_ORDERED_FIELDS: tuple[str, ...] = (
     "F_bm0",
     "F_bn0",
     "F_bk0",
@@ -90,13 +102,46 @@ _TILE_EXPR_RE = re.compile(
 )
 
 # Untune / tuned filename pattern (validation only). Matches:
-#   mha_tuned_<gid>_<mode>_<dtype>_hq<HQ>_hv<HV>_mask<M>.csv
+#   mha_tuned_<gid>_<mode>_<dtype>_hq<HQ>_hv<HV>_mask<M>[_<trait>...].csv
+# The optional trait tail (nh/nhk + CK pipeline tokens such as
+# _nlogits_nbias_nlse_ndropout_skip_nqscale_nsink) is written by
+# mha_count_shape.py; legacy names ending at `mask<M>` still match.
 _TUNED_NAME_RE = re.compile(
     r"^mha_tuned_(?P<gid>\d+)_"
     r"(?P<mode>[a-zA-Z0-9]+)_"
     r"(?P<dtype>[a-zA-Z0-9]+)_"
     r"hq(?P<hq>\d+)_hv(?P<hv>\d+)_"
-    r"mask(?P<mask>\d+)\.csv$"
+    r"mask(?P<mask>\d+)(?P<traits>(?:_[a-zA-Z0-9]+)*)\.csv$"
+)
+
+# Full group signature columns written by mha_tune.py into every tuned csv
+# row. Must stay identical to mha_count_shape.GROUP_COLS and
+# mha_tune.SIGNATURE_COLS (asserted by the unit tests).
+SIGNATURE_COLS: tuple[str, ...] = (
+    "mode",
+    "dtype",
+    "hdim_q",
+    "hdim_v",
+    "mask_type",
+    "nhead_q",
+    "nhead_k",
+    "has_logits_soft_cap",
+    "bias_type",
+    "has_lse",
+    "has_dropout",
+    "skip_min_seqlen_q",
+    "qscale_type",
+    "has_sink",
+)
+_STR_SIGNATURE_COLS = frozenset({"mode", "dtype"})
+
+# Columns that must agree between tuned csvs merged into the same output
+# bucket. `dtype` is excluded because it is part of the bucket key itself;
+# `bench_variant` is included because a downgraded run (skip -> nskip) is
+# not comparable with a native one. `best_hdim_q/v` are the bucket key, so
+# they are not conflict dimensions either.
+CONFLICT_COLS: tuple[str, ...] = tuple(c for c in SIGNATURE_COLS if c != "dtype") + (
+    "bench_variant",
 )
 
 
@@ -105,7 +150,7 @@ _TUNED_NAME_RE = re.compile(
 # ===========================================================================
 
 
-def _parse_tile_expr(expr: str) -> Dict[str, int]:
+def _parse_tile_expr(expr: str) -> dict[str, int]:
     """Extract 19 ints from `best_tile_expr` and return a dict keyed by
     _ORDERED_FIELDS."""
     m = _TILE_EXPR_RE.search(expr)
@@ -115,7 +160,7 @@ def _parse_tile_expr(expr: str) -> Dict[str, int]:
     return dict(zip(_ORDERED_FIELDS, values))
 
 
-def _tile_signature(tile: Dict[str, int]) -> Tuple[int, ...]:
+def _tile_signature(tile: dict[str, int]) -> tuple[int, ...]:
     """Immutable key used to compare tiles (all 19 fields in order)."""
     return tuple(tile[k] for k in _ORDERED_FIELDS)
 
@@ -132,11 +177,16 @@ class TunedCsv:
         self.compiled_hdim_q: int = 0
         self.compiled_hdim_v: int = 0
         self.mask_type: int = 0
+        # Full SIGNATURE_COLS values of this file (every tuned csv carries
+        # them; see mha_tune.TUNED_CSV_COLS).
+        self.signature: dict[str, Any] = {}
+        # Kernel variant actually benched ("skip" / "nskip").
+        self.bench_variant: str = ""
         # Each entry: {"max_seqlen": int, "tile": {F_*: int, ...}}
-        self.rows: List[Dict[str, Any]] = []
+        self.rows: list[dict[str, Any]] = []
 
     @staticmethod
-    def load(path: Path) -> "TunedCsv":
+    def load(path: Path) -> TunedCsv:
         obj = TunedCsv(path)
 
         # sanity-check the filename shape (non-fatal if it differs, just warn).
@@ -153,11 +203,8 @@ class TunedCsv:
             reader = csv.DictReader(fp)
             required = {
                 "max_seqlen",
-                "mode",
-                "dtype",
-                "hdim_q",
-                "hdim_v",
-                "mask_type",
+                *SIGNATURE_COLS,
+                "bench_variant",
                 "best_hdim_q",
                 "best_hdim_v",
                 "best_tile_expr",
@@ -166,10 +213,13 @@ class TunedCsv:
             missing = required.difference(reader.fieldnames or [])
             if missing:
                 raise ValueError(
-                    f"{obj.path}: missing required columns: {sorted(missing)}"
+                    f"{obj.path}: missing required columns: {sorted(missing)}. "
+                    f"The full kernel signature is needed to detect merge "
+                    f"conflicts; re-generate the tuned csv with the current "
+                    f"`mha_tune.py bench`."
                 )
 
-            group_key_seen: Optional[Tuple[str, str, int, int, int, int, int]] = None
+            group_key_seen: tuple[Any, ...] | None = None
             for row in reader:
                 if row.get("status", "").strip() != "ok":
                     continue
@@ -184,12 +234,22 @@ class TunedCsv:
                     row_bhq = int(row["best_hdim_q"])
                     row_bhv = int(row["best_hdim_v"])
                     tile = _parse_tile_expr(row["best_tile_expr"])
-                except (KeyError, ValueError) as e:
+                    row_sig = {
+                        c: (row[c].strip() if c in _STR_SIGNATURE_COLS else int(row[c]))
+                        for c in SIGNATURE_COLS
+                    }
+                    row_variant = row["bench_variant"].strip()
+                except (KeyError, ValueError, AttributeError) as e:
                     raise ValueError(
                         f"{obj.path}: cannot parse row {row!r}: {e}"
                     ) from e
 
-                gk = (row_mode, row_dtype, row_hq, row_hv, row_mask, row_bhq, row_bhv)
+                gk = (
+                    row_bhq,
+                    row_bhv,
+                    tuple(row_sig[c] for c in SIGNATURE_COLS),
+                    row_variant,
+                )
                 if group_key_seen is None:
                     group_key_seen = gk
                     obj.mode = row_mode
@@ -199,6 +259,8 @@ class TunedCsv:
                     obj.compiled_hdim_q = row_bhq
                     obj.compiled_hdim_v = row_bhv
                     obj.mask_type = row_mask
+                    obj.signature = row_sig
+                    obj.bench_variant = row_variant
                 elif gk != group_key_seen:
                     raise ValueError(
                         f"{obj.path}: multiple group signatures found "
@@ -213,24 +275,22 @@ class TunedCsv:
                 f"{obj.path}: no rows with status=='ok'; nothing to merge."
             )
 
-        # Sort ascending by max_seqlen; also deduplicate exact-duplicate
-        # max_seqlen entries (keeping the first, warn on rest).
+        # Sort ascending by max_seqlen. A max_seqlen may appear only once:
+        # picking a winner between two rows of the same shape would be
+        # arbitrary, so this is reported instead of silently deduplicated.
         obj.rows.sort(key=lambda r: r["max_seqlen"])
-        deduped: List[Dict[str, Any]] = []
-        seen: Dict[int, Dict[str, Any]] = {}
-        for r in obj.rows:
-            M = r["max_seqlen"]
-            if M in seen:
-                if _tile_signature(r["tile"]) != _tile_signature(seen[M]["tile"]):
-                    print(
-                        f"[warn] {obj.path.name}: duplicate max_seqlen={M} "
-                        f"with different tiles; keeping the first.",
-                        file=sys.stderr,
-                    )
-                continue
-            seen[M] = r
-            deduped.append(r)
-        obj.rows = deduped
+        dups = sorted(
+            {
+                r["max_seqlen"]
+                for prev, r in zip(obj.rows, obj.rows[1:])
+                if prev["max_seqlen"] == r["max_seqlen"]
+            }
+        )
+        if dups:
+            raise ValueError(
+                f"{obj.path}: duplicate max_seqlen {dups}; every tuned row "
+                f"must describe a distinct max_seqlen."
+            )
         return obj
 
 
@@ -240,8 +300,8 @@ class TunedCsv:
 
 
 def _row_intervals(
-    rows: List[Dict[str, Any]],
-) -> List[Tuple[Optional[int], Optional[int]]]:
+    rows: list[dict[str, Any]],
+) -> list[tuple[int | None, int | None]]:
     """Given rows sorted by max_seqlen, return per-row half-open interval
     [low, high) where boundaries are integer midpoints between neighbors.
 
@@ -255,17 +315,18 @@ def _row_intervals(
         # single row covers the entire real line
         return [(None, None)]
 
-    mids: List[int] = []
+    mids: list[int] = []
     for i in range(n - 1):
         a = rows[i]["max_seqlen"]
         b = rows[i + 1]["max_seqlen"]
-        # (a + b) // 2 is well-defined and strictly greater than a whenever
-        # b > a + 1; for adjacent (b == a + 1) it equals a, giving an empty
-        # interval on the smaller side, which is harmless because ranges
-        # are half-open and the boundary flips to the next row anyway.
-        mids.append((a + b) // 2)
+        # Round the midpoint UP so that a < mid <= b for every a < b.
+        # With half-open intervals [low, high) this guarantees that each
+        # sample `a` falls inside its own row's interval (never empty),
+        # including adjacent samples (b == a + 1 -> mid == b). A tie (an
+        # exact-middle length for odd gaps) goes to the larger sample.
+        mids.append((a + b + 1) // 2)
 
-    intervals: List[Tuple[Optional[int], Optional[int]]] = []
+    intervals: list[tuple[int | None, int | None]] = []
     for i in range(n):
         low = None if i == 0 else mids[i - 1]
         high = None if i == n - 1 else mids[i]
@@ -274,9 +335,9 @@ def _row_intervals(
 
 
 def _fold_same_tile(
-    rows: List[Dict[str, Any]],
-    intervals: List[Tuple[Optional[int], Optional[int]]],
-) -> List[Dict[str, Any]]:
+    rows: list[dict[str, Any]],
+    intervals: list[tuple[int | None, int | None]],
+) -> list[dict[str, Any]]:
     """Group entries by tile signature, folding contiguous same-tile runs
     into one interval, but preserving non-contiguous runs as separate
     intervals under the same tile.
@@ -290,7 +351,7 @@ def _fold_same_tile(
     Preserves the encounter order of tiles.
     """
     # Step 1: fold contiguous same-tile runs.
-    folded_runs: List[Dict[str, Any]] = []
+    folded_runs: list[dict[str, Any]] = []
     for row, (low, high) in zip(rows, intervals):
         sig = _tile_signature(row["tile"])
         if folded_runs and folded_runs[-1]["_sig"] == sig:
@@ -309,8 +370,8 @@ def _fold_same_tile(
             )
 
     # Step 2: group by tile signature, keeping first-seen order.
-    order: List[Tuple[int, ...]] = []
-    grouped: Dict[Tuple[int, ...], Dict[str, Any]] = {}
+    order: list[tuple[int, ...]] = []
+    grouped: dict[tuple[int, ...], dict[str, Any]] = {}
     for run in folded_runs:
         sig = run["_sig"]
         if sig not in grouped:
@@ -328,7 +389,7 @@ def _fold_same_tile(
 
 
 def _interval_to_cpp(
-    low: Optional[int], high: Optional[int], var: str = "a.max_seqlen_q"
+    low: int | None, high: int | None, var: str = "a.max_seqlen_q"
 ) -> str:
     """Render one half-open interval [low, high) as a C++ boolean expr."""
     if low is None and high is None:
@@ -341,7 +402,7 @@ def _interval_to_cpp(
 
 
 def _intervals_to_cpp(
-    intervals: List[Tuple[Optional[int], Optional[int]]], var: str = "a.max_seqlen_q"
+    intervals: list[tuple[int | None, int | None]], var: str = "a.max_seqlen_q"
 ) -> str:
     """OR multiple intervals into one C++ boolean expression."""
     parts = [_interval_to_cpp(lo, hi, var) for (lo, hi) in intervals]
@@ -357,59 +418,117 @@ def _intervals_to_cpp(
 # ===========================================================================
 
 
+def _bucket_name(key: tuple[str, int, int]) -> str:
+    dtype, hq, hv = key
+    return f"dtype={dtype} hdim=({hq},{hv})"
+
+
+def _conflict_key(lc: TunedCsv) -> tuple[Any, ...]:
+    """Signature values that must agree between csvs of one bucket."""
+    sig = {**lc.signature, "bench_variant": lc.bench_variant}
+    return tuple(sig[c] for c in CONFLICT_COLS)
+
+
+def _check_bucket_signature(key: tuple[str, int, int], sources: list[TunedCsv]) -> None:
+    """Reject a bucket fed by tuned csvs with different kernel signatures.
+
+    Tiles of one bucket are selected at runtime by `cpp_constraint`, which
+    only knows `max_seqlen_q`, so two signatures sharing a bucket cannot be
+    told apart. The report is sorted, hence independent of the `--in` order.
+    """
+    by_sig: dict[tuple[Any, ...], list[TunedCsv]] = {}
+    for lc in sources:
+        by_sig.setdefault(_conflict_key(lc), []).append(lc)
+    if len(by_sig) <= 1:
+        return
+
+    diff_idx = [
+        i for i in range(len(CONFLICT_COLS)) if len({sig[i] for sig in by_sig}) > 1
+    ]
+    lines = []
+    for sig in sorted(by_sig, key=lambda s: tuple(str(v) for v in s)):
+        shown = " ".join(f"{CONFLICT_COLS[i]}={sig[i]}" for i in diff_idx)
+        files = ", ".join(sorted(lc.path.name for lc in by_sig[sig]))
+        lines.append(f"  {shown} : {files}")
+    raise ValueError(
+        f"bucket {_bucket_name(key)} is fed by {len(by_sig)} incompatible "
+        f"tuned csvs (differing in: "
+        f"{', '.join(CONFLICT_COLS[i] for i in diff_idx)})\n"
+        + "\n".join(lines)
+        + "\nTiles of one bucket are selected at runtime by max_seqlen_q "
+        "only, so these cannot be merged. Emit one JSON per signature."
+    )
+
+
+def _check_bucket_max_seqlens(
+    key: tuple[str, int, int], tagged: list[tuple[dict[str, Any], TunedCsv]]
+) -> None:
+    """Reject the same max_seqlen coming from two csvs of one bucket."""
+    by_len: dict[int, list[TunedCsv]] = {}
+    for row, lc in tagged:
+        by_len.setdefault(row["max_seqlen"], []).append(lc)
+    dups = {M: srcs for M, srcs in by_len.items() if len(srcs) > 1}
+    if not dups:
+        return
+    lines = [
+        f"  max_seqlen={M} : " + ", ".join(sorted(lc.path.name for lc in dups[M]))
+        for M in sorted(dups)
+    ]
+    raise ValueError(
+        f"bucket {_bucket_name(key)} gets the same max_seqlen from several "
+        f"tuned csvs\n"
+        + "\n".join(lines)
+        + "\nThese shapes share one kernel signature, so they belong to a "
+        "single group and must be tuned together (see "
+        "`mha_count_shape.py group`)."
+    )
+
+
 def build_merged_payload(
-    csv_paths: List[Path],
+    csv_paths: list[Path],
     target: str,
     schema_version: int,
     constraint_var: str,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Read every csv, group by (dtype, best_hq, best_hv), and produce the
     final JSON payload (as a Python dict).
-    """
-    loaded: List[TunedCsv] = [TunedCsv.load(p) for p in csv_paths]
 
-    # Group by (dtype, compiled_hq, compiled_hv). Each group can contain
-    # multiple csv sources (e.g. same shape tuned twice with different mask
-    # types); item 4 of the spec says we ignore mask/bias/lse/dropout so
-    # we merge them into one tile pool.
-    grouped_rows: Dict[Tuple[str, int, int], List[Dict[str, Any]]] = {}
-    grouped_sources: Dict[Tuple[str, int, int], List[TunedCsv]] = {}
+    Raises ValueError when one bucket is fed by csvs with different kernel
+    signatures, or when a max_seqlen is tuned more than once.
+    """
+    loaded: list[TunedCsv] = [TunedCsv.load(p) for p in csv_paths]
+    # Sort the sources so that every output (payload key order, warnings and
+    # error reports) is independent of the `--in` order.
+    loaded.sort(
+        key=lambda lc: (lc.dtype, lc.compiled_hdim_q, lc.compiled_hdim_v, str(lc.path))
+    )
+
+    # Group by (dtype, compiled_hq, compiled_hv), i.e. by the key CK uses to
+    # look tiles up. Several csvs may feed one bucket only when they share
+    # the full kernel signature (item 4 of the spec), which is what
+    # _check_bucket_signature enforces below.
+    grouped: dict[tuple[str, int, int], list[tuple[dict[str, Any], TunedCsv]]] = {}
+    grouped_sources: dict[tuple[str, int, int], list[TunedCsv]] = {}
     for lc in loaded:
         key = (lc.dtype, lc.compiled_hdim_q, lc.compiled_hdim_v)
-        grouped_rows.setdefault(key, []).extend(lc.rows)
+        grouped.setdefault(key, []).extend((r, lc) for r in lc.rows)
         grouped_sources.setdefault(key, []).append(lc)
 
-    tiles_by_dtype: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
-    dtypes_seen: List[str] = []
+    tiles_by_dtype: dict[str, dict[str, list[dict[str, Any]]]] = {}
 
-    for (dtype, hq, hv), rows in grouped_rows.items():
-        # Re-sort merged rows by max_seqlen and dedupe on max_seqlen (same
-        # rules as inside TunedCsv.load, only that here duplicates may come
-        # from different csv sources).
-        rows.sort(key=lambda r: r["max_seqlen"])
-        dedup: List[Dict[str, Any]] = []
-        seen: Dict[int, Dict[str, Any]] = {}
-        for r in rows:
-            M = r["max_seqlen"]
-            if M in seen:
-                if _tile_signature(r["tile"]) != _tile_signature(seen[M]["tile"]):
-                    print(
-                        f"[warn] group=(dtype={dtype}, hq={hq}, hv={hv}): "
-                        f"duplicate max_seqlen={M} across csv sources with "
-                        f"different tiles; keeping the first-encountered.",
-                        file=sys.stderr,
-                    )
-                continue
-            seen[M] = r
-            dedup.append(r)
+    for key in sorted(grouped):
+        dtype, hq, hv = key
+        _check_bucket_signature(key, grouped_sources[key])
+        _check_bucket_max_seqlens(key, grouped[key])
 
-        intervals = _row_intervals(dedup)
-        folded = _fold_same_tile(dedup, intervals)
+        merged = sorted((r for r, _ in grouped[key]), key=lambda r: r["max_seqlen"])
+        intervals = _row_intervals(merged)
+        folded = _fold_same_tile(merged, intervals)
 
         # Assemble tile objects for this (dtype, hq, hv) bucket.
-        tile_objs: List[Dict[str, Any]] = []
+        tile_objs: list[dict[str, Any]] = []
         for entry in folded:
-            tile: Dict[str, Any] = dict(entry["tile"])  # copy F_* ints
+            tile: dict[str, Any] = dict(entry["tile"])  # copy F_* ints
             tile["cpp_constraint"] = _intervals_to_cpp(
                 entry["intervals"], var=constraint_var
             )
@@ -420,13 +539,13 @@ def build_merged_payload(
             tile_objs.append(tile)
 
         tiles_by_dtype.setdefault(dtype, {})[f"{hq},{hv}"] = tile_objs
-        if dtype not in dtypes_seen:
-            dtypes_seen.append(dtype)
 
-    payload: Dict[str, Any] = {
+    payload: dict[str, Any] = {
         "schema_version": schema_version,
         "target": target,
-        "dtypes": dtypes_seen,
+        # `grouped` is walked in sorted order, so both dtypes and the
+        # per-dtype "HQ,HV" keys come out sorted as well.
+        "dtypes": list(tiles_by_dtype),
         "tiles": tiles_by_dtype,
         "meta": {
             "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -442,6 +561,8 @@ def build_merged_payload(
                     "compiled_hdim_q": lc.compiled_hdim_q,
                     "compiled_hdim_v": lc.compiled_hdim_v,
                     "mask_type": lc.mask_type,
+                    "signature": lc.signature,
+                    "bench_variant": lc.bench_variant,
                     "row_count": len(lc.rows),
                 }
                 for lc in loaded
@@ -470,8 +591,11 @@ def _build_parser() -> argparse.ArgumentParser:
         required=True,
         metavar="CSV",
         help="Path to a `mha_tuned_<gid>_<mode>_<dtype>_hq<HQ>_hv<HV>_"
-        "mask<M>.csv` produced by mha_tune.py. May be repeated to "
-        "merge multiple tuned shapes into one JSON.",
+        "mask<M>[_<trait>...].csv` produced by mha_tune.py. May be "
+        "repeated to merge multiple tuned shapes into one JSON. Two csvs "
+        "that compile to the same (dtype, best_hdim_q, best_hdim_v) bucket "
+        "must share the full kernel signature, otherwise the merge is "
+        "rejected. The result does not depend on the order of --in.",
     )
     p.add_argument(
         "--out",
@@ -532,7 +656,7 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _strip_for_runtime(payload: Dict[str, Any]) -> Dict[str, Any]:
+def _strip_for_runtime(payload: dict[str, Any]) -> dict[str, Any]:
     """Return a deep-ish copy of `payload` containing ONLY the fields that
     CK actually consumes when loading a custom tune-config JSON.
 
@@ -554,16 +678,16 @@ def _strip_for_runtime(payload: Dict[str, Any]) -> Dict[str, Any]:
           proactively strip to shrink the deployment JSON)
     """
     kept_tile_keys = set(_ORDERED_FIELDS) | {"cpp_constraint"}
-    stripped_tiles: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+    stripped_tiles: dict[str, dict[str, list[dict[str, Any]]]] = {}
     for dtype, hmap in payload.get("tiles", {}).items():
-        stripped_hmap: Dict[str, List[Dict[str, Any]]] = {}
+        stripped_hmap: dict[str, list[dict[str, Any]]] = {}
         for hkey, tile_list in hmap.items():
             stripped_hmap[hkey] = [
                 {k: v for k, v in t.items() if k in kept_tile_keys} for t in tile_list
             ]
         stripped_tiles[dtype] = stripped_hmap
 
-    out: Dict[str, Any] = {}
+    out: dict[str, Any] = {}
     # Preserve schema_version if present, for forward-compat.
     if "schema_version" in payload:
         out["schema_version"] = payload["schema_version"]
@@ -574,7 +698,7 @@ def _strip_for_runtime(payload: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def _print_summary(payload: Dict[str, Any]) -> None:
+def _print_summary(payload: dict[str, Any]) -> None:
     print()
     print("# ==== merge summary ====")
     for dtype, hkey_map in payload["tiles"].items():

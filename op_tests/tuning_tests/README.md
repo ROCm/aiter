@@ -13,6 +13,7 @@ Minimal test suite for validating the aiter tuning infrastructure.
 | `test_online_tune.py` | 1 | No | `AITER_ONLINE_TUNE` decision logic, `mp_lock` synchronization, MainFunc CSV write, cfg_2stages reload |
 | `test_tune_pipeline.py` | 2 | Yes | End-to-end: run each tuner on small shapes (mp=1 + mp=default), verify output CSV; `--compare --update_improved`; `AITER_ONLINE_TUNE` e2e |
 | `test_asm_splitk_guard.py` | 1 | No | `GemmTuner.asm_gemm_all_solutions` SplitK semaphore grid guard |
+| `test_mha_fwd_tune_tools.py` | 1 | No | MHA fwd tuning tools in `csrc/cpp_itfs/mha/tools/` (count_shape / tune / gen_runtime_json) on synthetic data from `mha_fwd_tune_synth.py` |
 | `test_run_config.py` | 2 | Yes | Run --run_config on ALL existing tuned CSVs (configs + model_configs) |
 
 ## CI coverage
@@ -65,6 +66,9 @@ python3 -m unittest op_tests.tuning_tests.test_csv_validation \
   op_tests.tuning_tests.test_mp_tuner_logic \
   op_tests.tuning_tests.test_mixed_mxfp_tuning \
   op_tests.tuning_tests.test_online_tune -v
+
+# MHA fwd tuning tools (no GPU, <1s)
+python3 -m unittest op_tests.tuning_tests.test_mha_fwd_tune_tools -v
 
 # Level 2: pipeline smoke (~10min)
 python3 -m unittest op_tests.tuning_tests.test_tune_pipeline -v

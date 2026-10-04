@@ -379,7 +379,7 @@ float fmha_fwd_ck(mha_fwd_args a, const ck_tile::stream_config& s)
     // host-side cu_seqlens tensors). Guarded by env AITER_DUMP_MHA_FWD_INFO.
     if(!a.is_group_mode)
     {
-        dump_mha_fwd_info_batch(a);
+        dump_mha_fwd_info_batch(a, s.stream_id_);
     }
 
     return fmha_fwd(traits, args, s);

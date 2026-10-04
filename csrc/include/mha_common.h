@@ -190,12 +190,16 @@ inline void mha_dump_append_int_list(std::ostringstream& os, const std::vector<i
 //   - cu_seqlens_k_opt : int32 [batch+1], cumulative K seqlens (optional)
 //   - seqlens_k_opt    : int32 [batch],   per-sequence K seqlens (optional; used
 //                                        when cu_seqlens_k is absent)
+//   - stream           : launch stream. The capture check runs BEFORE the
+//                        blocking D2H copies below, which would otherwise fail
+//                        inside torch.cuda.graph().
 inline void dump_mha_fwd_info_group(const mha_fwd_args& a,
                                     const at::Tensor& cu_seqlens_q,
                                     const std::optional<const at::Tensor>& cu_seqlens_k_opt,
-                                    const std::optional<const at::Tensor>& seqlens_k_opt)
+                                    const std::optional<const at::Tensor>& seqlens_k_opt,
+                                    hipStream_t stream)
 {
-    if(!mha_dump_should_emit())
+    if(!mha_dump_should_emit_on(stream))
         return;
 
     std::ostringstream os;
@@ -237,6 +241,8 @@ inline void dump_mha_fwd_info_group(const mha_fwd_args& a,
         has_k_varlen_info = true;
     }
 
+    // min_seqlen_q != 0 selects the skip_min_seqlen_q kernel variant.
+    os << " min_seqlen_q=" << a.min_seqlen_q;
     os << " total_q=" << total_q;
     if(has_k_varlen_info)
         os << " total_k=" << total_k;

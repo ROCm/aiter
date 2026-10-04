@@ -667,7 +667,7 @@ mha_varlen_fwd(
                     bias_type,
                     qscale_type,
                     sink_ptr);
-            aiter::dump_mha_fwd_info_group(args, cu_seqlens_q, cu_seqlens_k, seqlens_k);
+            aiter::dump_mha_fwd_info_group(args, cu_seqlens_q, cu_seqlens_k, seqlens_k, stream);
             float t = aiter::mha_fwd(args, stream_config);     // how_v3_bf16_cvt
             TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
         }
