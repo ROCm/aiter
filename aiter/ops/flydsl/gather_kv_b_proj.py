@@ -477,6 +477,10 @@ def gather_kv_b_proj_flydsl(
     if reason is not None:
         _raise(reason)
 
+    reason = _output_scale_reason(k_buffer, k_prefix, k_out_scale, v_out_scale)
+    if reason is not None:
+        _raise(reason)
+
     if _arch_of(k_buffer.device.index) == "gfx1250":
         from .gather_kv_b_proj_gfx1250 import gather_kv_b_proj_flydsl_gfx1250
 
@@ -490,15 +494,12 @@ def gather_kv_b_proj_flydsl(
             kv_proj_scale,
             k_prefix,
             v_prefix,
+            num_tokens=num_tokens,
             weight_preshuffle=weight_preshuffle,
             shuffled_kv_cache=shuffled_kv_cache,
         )
 
     output_fp8 = k_prefix.dtype == torch.float8_e4m3fn
-    reason = _output_scale_reason(k_buffer, k_prefix, k_out_scale, v_out_scale)
-    if reason is not None:
-        _raise(reason)
-
     num_blocks = k_buffer.shape[0]
     total_kv, n_heads, kp_dim = k_prefix.shape
     nope = kp_dim - KV_PE_DIM

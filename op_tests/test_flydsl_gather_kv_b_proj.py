@@ -31,9 +31,6 @@ from aiter.ops.flydsl.gather_kv_b_proj import (
     gather_kv_b_proj_flydsl_fp8_supported,
     gather_kv_b_proj_flydsl_supported,
 )
-from aiter.ops.flydsl.gather_kv_b_proj_gfx1250 import (
-    gather_kv_b_proj_flydsl_gfx1250,
-)
 from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.gather_kv_b_proj import (
     gather_kv_b_proj as triton_gather_kv_b_proj,
@@ -300,9 +297,9 @@ def _check_output(case):
 
 
 @_SKIP_GFX1250
-@pytest.mark.parametrize("num_tokens", [512, 2048, 4096])
-def test_gather_kv_b_proj_flydsl_gfx1250_kimi_ptpc(num_tokens):
-    case = _make_case(num_tokens, 96)
+@pytest.mark.parametrize("num_tokens,alloc", [(512, None), (2048, 2176), (4096, None)])
+def test_gather_kv_b_proj_flydsl_gfx1250_kimi_ptpc(num_tokens, alloc):
+    case = _make_case(num_tokens, 96, alloc=alloc)
     case["k_scale"] = torch.tensor(1.0)
     weight = shuffle_weight(case["weight"], layout=(16, 16))
     assert gather_kv_b_proj_flydsl_supported(
@@ -312,18 +309,14 @@ def test_gather_kv_b_proj_flydsl_gfx1250_kimi_ptpc(num_tokens):
         case["k_prefix"],
         case["v_prefix"],
     )
-    gather_kv_b_proj_flydsl_gfx1250(
-        case["k_buffer"],
-        case["k_scale"],
-        case["kv_indptr"],
-        case["kv_indices"],
-        case["cu_seqlens_k"],
-        weight,
-        case["weight_scale"],
-        case["k_prefix"],
-        case["v_prefix"],
-    )
+    if alloc is not None:
+        case["k_prefix"][num_tokens:].fill_(float("nan"))
+        case["v_prefix"][num_tokens:].fill_(float("nan"))
+    _run_flydsl(case)
     _check_output(case)
+    if alloc is not None:
+        assert torch.isnan(case["k_prefix"][num_tokens:]).all()
+        assert torch.isnan(case["v_prefix"][num_tokens:]).all()
 
 
 @_SKIP

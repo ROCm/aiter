@@ -183,6 +183,7 @@ def gather_kv_b_proj_flydsl_gfx1250(
     k_prefix: Tensor,
     v_prefix: Tensor,
     *,
+    num_tokens: int | None = None,
     weight_preshuffle: bool = True,
     shuffled_kv_cache: bool = False,
 ) -> None:
@@ -200,7 +201,14 @@ def gather_kv_b_proj_flydsl_gfx1250(
             f"[gfx1250 FlyDSL gather_kv_b_proj] {reason or 'weight layout'}"
         )
 
-    m = k_prefix.shape[0]
+    total_kv = k_prefix.shape[0]
+    m = int(total_kv if num_tokens is None else num_tokens)
+    if m < 0:
+        raise ValueError(f"num_tokens must be >=0, got {m}")
+    if m > total_kv:
+        raise ValueError(f"num_tokens={m} exceeds the allocated {total_kv} output rows")
+    if m == 0:
+        return
     if kv_indices.numel() < m:
         raise ValueError(f"kv_indices has {kv_indices.numel()} entries, need {m}")
     if k_scale.numel() != 1 or k_scale.device not in (
