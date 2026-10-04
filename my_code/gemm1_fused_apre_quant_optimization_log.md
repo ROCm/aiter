@@ -1610,3 +1610,56 @@ Final run directory:
 ```text
 /app/aiter/my_code/moe_prefill_switch_ab_runs/20261004T065004Z
 ```
+
+## 2026-10-04 merge with ROCm main
+
+PR #2 was brought up to date with `rocm-main@45c5ad065035`. Conflicts in the
+tuned grouped-MoE CSV, grouped GEMM dispatch, grouped MoE pipeline, and base TDM
+kernel were resolved while preserving the fused persistent GEMM1 and persistent
+GEMM2 specializations. The resolution also retained the upstream additions for
+separate GEMM1/GEMM2 cluster geometry, stage-specific TDM ownership,
+`lds_soa_load_interleave`, `AITER_FLYDSL_DISABLE_GEMM1_REQUANT`, and explicit
+VGPR partitioning.
+
+The resulting merge commit is `6166f47ba1b1`. GitHub reported PR #2 as
+`MERGEABLE` with merge state `CLEAN`.
+
+After the container pulled the merge commit, `module_aiter_core.so` was rebuilt
+with `AITER_REBUILD=1` because the updated `fused_moe.py` references the new
+`ActivationType.Relu2` enum. A fresh process confirmed the rebuilt enum ABI.
+
+Random validation passed:
+
+```text
+logits_diff=3.3849e-06
+rel_l2=2.6019e-03
+gemm2_ref_output_hash128=a1fdf3509679ad49a6c75d4bb5e68229
+gemm2_output_hash128=a1fdf3509679ad49a6c75d4bb5e68229
+```
+
+The final performance command was:
+
+```bash
+ROUNDS=3 bash ./my_code/run_moe_prefill_switch_ab.sh \
+  e2e-const0 \
+  --experts 64 --tokens 1536 --topk 8 \
+  --model-dim 7168 --inter-dim 2048
+```
+
+| Metric | Samples (us) | Median (us) | Change vs pre-merge final run |
+|---|---|---:|---:|
+| GEMM1 | 72.379, 74.367, 73.203 | **73.203** | -0.87% |
+| GEMM2 | 51.134, 48.383, 50.793 | **50.793** | -1.30% |
+| MoE e2e | 178.29, 175.84, 181.31 | **178.29** | -3.14% |
+
+All three const0 rounds reported `logits_diff=0`, `rel_l2=0`, and matching
+GEMM1, GEMM2, and final MoE hashes. The GPU was idle before the run. The other
+GPU process observed later started after this benchmark had completed and did
+not overlap the measured interval.
+
+Validation directories:
+
+```text
+/app/aiter/my_code/moe_prefill_switch_ab_runs/20261004T100535Z  # random
+/app/aiter/my_code/moe_prefill_switch_ab_runs/20261004T100720Z  # const0 perf
+```
