@@ -126,7 +126,6 @@ else:
     from .ops.topk import *
     from .ops.topk_plain import topk_plain  # noqa: F401
     from .ops.topk_select import topk_select, topk_select_backend  # noqa: F401
-    from .ops.paged_mqa_logits import *
     from .ops.mha import *
     from .ops.vsa_sparse_attention import vsa_sparse_attention  # noqa: F401
     from .ops.gradlib import *

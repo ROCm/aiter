@@ -20,9 +20,9 @@ import pandas as pd
 import torch
 
 import aiter
+import aiter.paged_mqa_logits as pmql
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops import paged_mqa_logits as pmql
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
