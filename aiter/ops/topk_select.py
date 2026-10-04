@@ -238,6 +238,14 @@ _PLAIN_K2048_ONEBLOCK_MAX_WIDTH = 80 * 1024
 # `kTopkPlainGfx950LdsTailMaxLen` in csrc/kernels/topk_per_row_kernels.cu.
 _PLAIN_K2048_LDS_TAIL_MIN_ROWS = 3000
 _PLAIN_K2048_LDS_TAIL_MAX_WIDTH = 128 * 1024 + 768
+# Rows that select all of their columns skip the backends (`_whole_row_takes`).
+# With the values wanted, one launch writing both replaces a selection and a
+# gather: 0.47x-0.78x of the fastest backend at every measured row count from
+# 1 to 16384 (seed-0 randn, MI355X, 4 processes, worst process). Indices alone
+# are one launch either way. From 5 rows on the write still beat every backend,
+# 0.87x-0.96x; at 1-4 rows stream runs at the same ~2.08us launch floor and the
+# write measured 1.00x-1.01x of it, so those calls stay with the backends.
+_WHOLE_ROW_MIN_ROWS = 5
 
 # small_k narrows by dropping chunks below the cut, and a chunk is a lane: at k
 # equal to the wave width it drops none. Survivors at 8192 columns run 18 at
@@ -355,6 +363,71 @@ def _gather_selected(scores, idx, fill):
         out.stride(0),
         topk,
         fill,
+        BLOCK_K=triton.next_power_of_2(topk),
+    )
+    return out
+
+
+@triton.jit
+def _whole_row_kernel(
+    scores_ptr,
+    idx_ptr,
+    out_ptr,
+    scores_stride0,
+    idx_stride0,
+    out_stride0,
+    topk,
+    VALUES: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """`idx[r, j] = j` and, with VALUES, `out[r, j] = scores[r, j]`."""
+    row = tl.program_id(0).to(tl.int64)
+    offs = tl.arange(0, BLOCK_K)
+    live = offs < topk
+    tl.store(idx_ptr + row * idx_stride0 + offs, offs, mask=live)
+    if VALUES:
+        val = tl.load(scores_ptr + row * scores_stride0 + offs, mask=live)
+        tl.store(out_ptr + row * out_stride0 + offs, val, mask=live)
+
+
+def _whole_row_takes(
+    backend: str, rows: int, width: int, k: int, ragged: bool, with_values: bool
+) -> bool:
+    """Whether the call selects every column of uniform rows that stream would serve.
+
+    There `stream` writes 0..k-1 in column order on every row whatever the
+    scores -- NaN, -inf, ties and constant rows included -- so the answer is
+    known before reading them. Bounded to the gfx950 k=2048 rows where that was
+    checked byte for byte against the dispatched path and timed against every
+    backend; see `_WHOLE_ROW_MIN_ROWS`.
+    """
+    return (
+        backend == "stream"
+        and not ragged
+        and width == k
+        and k == 2048
+        and (with_values or rows >= _WHOLE_ROW_MIN_ROWS)
+        and get_gfx_runtime() == "gfx950"
+    )
+
+
+def _select_whole_rows(input, idx, with_values):
+    """One launch standing in for `_dispatch` and `_gather_selected`."""
+    rows, topk = idx.shape
+    out = (
+        torch.empty((rows, topk), dtype=input.dtype, device=input.device)
+        if with_values
+        else None
+    )
+    _whole_row_kernel[(rows,)](
+        input,
+        idx,
+        idx if out is None else out,
+        input.stride(0),
+        idx.stride(0),
+        0 if out is None else out.stride(0),
+        topk,
+        VALUES=with_values,
         BLOCK_K=triton.next_power_of_2(topk),
     )
     return out
@@ -961,9 +1034,23 @@ def topk_select(
         deterministic,
         input.dtype is torch.float32,
     )
-    _dispatch(
-        backend, input, row_lens, idx, topk, rows, end is not None, tie, deterministic
-    )
+    gathered = None
+    if _whole_row_takes(
+        backend, rows, width, topk, end is not None, return_value or sorted
+    ):
+        gathered = _select_whole_rows(input, idx, return_value or sorted)
+    else:
+        _dispatch(
+            backend,
+            input,
+            row_lens,
+            idx,
+            topk,
+            rows,
+            end is not None,
+            tie,
+            deterministic,
+        )
 
     values = None
     if return_value or sorted:
@@ -975,7 +1062,8 @@ def topk_select(
         # that order even when the caller does not want them back. Gathering
         # them and dropping them is the cost of asking for the order; returning
         # indices in an arbitrary order from `sorted=True` is not an option.
-        gathered = _gather_selected(input, idx, value_oob_fill_value)
+        if gathered is None:
+            gathered = _gather_selected(input, idx, value_oob_fill_value)
         if sorted:
             gathered, order = torch.sort(gathered, dim=1, descending=True)
             idx = idx.gather(1, order)
