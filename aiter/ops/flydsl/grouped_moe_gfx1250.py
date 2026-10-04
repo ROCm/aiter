@@ -30,16 +30,6 @@ _GROUPED_WEIGHT_CACHE = {}
 # (name, callable) per-kernel launches; None in production.
 kernel_bench_callable = None
 
-# Opt-in grouped-MoE correctness hook. A diagnostic launch exposes GEMM1's
-# logical BF16 output, route-to-grouped-row map, and GEMM2's grouped output.
-# It is None in production, so the extra untimed launch is disabled.
-stage_output_capture = None
-
-# Opt-in hook comparing fused GEMM1 activation/quant with the standalone path.
-# A diagnostic launch records separate payload/scale snapshots in a caller dict.
-# It is None in production, so no copies occur.
-quant_output_capture = None
-
 # fused_moe_ rebuilds Stage2ScatterContext without MegaMoE's dispatch fields
 # (custom-op schema). MegaMoE stashes the live context here for the grouped helper.
 _MEGA_DISPATCH_TLS = threading.local()
@@ -617,8 +607,6 @@ def _grouped_a8w4_tdm_moe(
     )
 
     device = hidden_states.device
-    _stage_output_capture = stage_output_capture
-    _quant_output_capture = quant_output_capture
     token_num, topk = topk_ids.shape
     enable_ep_scatter = stage2_scatter is not None
     _compact_ctx = _flydsl_dispatch_context()
@@ -1078,7 +1066,7 @@ def _grouped_a8w4_tdm_moe(
 
     # Fuse activation and MX quantization when GEMM1/GEMM2 use the same A layout.
     # Generic output is row-major and tuned output is A-preshuffled; mixed layouts
-    # or diagnostic BF16 capture retain the standalone conversion kernel.
+    # retain the standalone conversion kernel.
     disable_gemm1_requant = _as_bool(
         os.environ.get("AITER_FLYDSL_DISABLE_GEMM1_REQUANT"), False
     )
@@ -1086,7 +1074,6 @@ def _grouped_a8w4_tdm_moe(
         not disable_gemm1_requant
         and (_b1 is None)
         and (_gemm1_a_preshuffle == _gemm2_a_preshuffle)
-        and _stage_output_capture is None
     )
     _fused_gemm1_n_warp = (
         4
@@ -1220,44 +1207,7 @@ def _grouped_a8w4_tdm_moe(
             expert_tile_m=_align_m,
         )
 
-    if _quant_output_capture is not None:
-        torch.cuda.synchronize()
-        capture_prefix = "fused" if _fuse_quant else "reference"
-        _quant_output_capture.update(
-            {
-                f"{capture_prefix}_payload": a2_payload.detach().clone(),
-                f"{capture_prefix}_scale": a2_scale.detach().clone(),
-                f"{capture_prefix}_topids_to_rows": (
-                    None
-                    if topids_to_rows is None
-                    else topids_to_rows.detach().clone()
-                ),
-                "contiguous_m": contiguous_m,
-                "inter_dim": inter_dim,
-                "wmma_rep": wmma_rep2,
-                "gemm1_a_preshuffle": _gemm1_a_preshuffle,
-                "gemm2_a_preshuffle": _gemm2_a_preshuffle,
-            }
-        )
-
-    if _stage_output_capture is not None:
-        if topids_to_rows is None:
-            raise RuntimeError(
-                "GEMM stage-output capture requires the non-EP routed-row layout"
-            )
-        _stage_output_capture.update(
-            {
-                "gemm1_grouped_out": y,
-                "topids_to_rows": topids_to_rows,
-            }
-        )
-
     grouped_out = torch.empty((1, contiguous_m, model_dim), dtype=dtype, device=device)
-    if _stage_output_capture is not None:
-        # This diagnostic launch happens after torch.profiler has finished.
-        # Stabilize undefined padding bytes for a direct whole-buffer hash;
-        # every profiled/production launch retains the torch.empty fast path.
-        grouped_out.zero_()
     w2_u8 = _grouped_weight_uint8(w2)
     w2s_i32 = w2_scale.reshape(-1).view(torch.int32)
     flydsl_grouped_gemm_a8w4_masked(
@@ -1291,16 +1241,6 @@ def _grouped_a8w4_tdm_moe(
         lds_soa_load_interleave=lds_soa_load_interleave,
         **_ep_gemm2_kwargs,
     )
-
-    if _quant_output_capture is not None:
-        torch.cuda.synchronize()
-        capture_prefix = "fused" if _fuse_quant else "reference"
-        _quant_output_capture[
-            f"{capture_prefix}_gemm2_grouped_out"
-        ] = grouped_out.detach().clone()
-
-    if _stage_output_capture is not None:
-        _stage_output_capture["gemm2_grouped_out"] = grouped_out
 
     if kernel_bench_callable is not None:
         kernel_bench_callable.append(
@@ -1492,10 +1432,6 @@ def _grouped_a8w4_tdm_moe(
         out=moe_out,
         num_valid_tokens=(_ep_nvt if _is_ep else None),
     )
-    if _quant_output_capture is not None:
-        torch.cuda.synchronize()
-        capture_prefix = "fused" if _fuse_quant else "reference"
-        _quant_output_capture[f"{capture_prefix}_moe_out"] = moe_out.detach().clone()
     return moe_out
 
 
