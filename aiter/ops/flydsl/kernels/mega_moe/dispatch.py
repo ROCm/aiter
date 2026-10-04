@@ -1561,7 +1561,7 @@ def emit_dispatch_payload(
     payload_chunk_rows,
     tile_state_stride,
     indexed_payload=False,
-    fast_copy=False,
+    fast_copy,
 ):
 # fmt: on
     """Produce independently publishable expert payloads from a compact plan."""
@@ -1715,6 +1715,7 @@ def emit_dispatch_payload(
                 remote_scale_vec_buffer = ptr_buf_tensor(
                     scale_table[destination], fx.Int32, unit_elems=4
                 )
+
         def _row_body(row, wk, token_vals):
             source_token = wk // fx.Int32(fz_k)
             topk_slot = wk % fx.Int32(fz_k)
@@ -1853,13 +1854,7 @@ def emit_dispatch_payload(
                     unit_elems=4,
                 )
             if const_expr(fast_copy):
-                for j in range_constexpr(len(token_vals)):
-                    unit = lane + fx.Int32(j * 64)
-                    if const_expr(j < full_units):
-                        buf_copy_store(destination_buffer, unit, token_vals[j], fx.Int32, unit_elems=4)
-                    else:
-                        if unit < fx.Int32(fz_n_i32 // 4):
-                            buf_copy_store(destination_buffer, unit, token_vals[j], fx.Int32, unit_elems=4)
+                _store_token(destination_buffer, token_vals)
             else:
                 _copy_token_row(
                     source_buffer,
@@ -1868,7 +1863,6 @@ def emit_dispatch_payload(
                     fz_safe_end_i32=fz_safe_end_i32,
                     fz_n_i32=fz_n_i32,
                 )
-
 
         def _load_token(wk):
             token = group_task.select(wk & fx.Int32(0xFFFFFF), wk // fx.Int32(fz_k))
@@ -1884,6 +1878,15 @@ def emit_dispatch_payload(
                     unit = (unit < fx.Int32(fz_n_i32 // 4)).select(unit, fx.Int32(0))
                 vals.append(buf_copy_load(source_row, unit, fx.Int32, unit_elems=4))
             return vals
+
+        def _store_token(destination_buffer, vals):
+            for j in range_constexpr(len(vals)):
+                unit = lane + fx.Int32(j * 64)
+                if const_expr(j < full_units):
+                    buf_copy_store(destination_buffer, unit, vals[j], fx.Int32, unit_elems=4)
+                else:
+                    if unit < fx.Int32(fz_n_i32 // 4):
+                        buf_copy_store(destination_buffer, unit, vals[j], fx.Int32, unit_elems=4)
 
         if const_expr(fast_copy):
             # Two rows per step: both route ids are read back to back and both

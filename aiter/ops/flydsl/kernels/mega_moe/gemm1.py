@@ -34,7 +34,7 @@ class _LdsF32View:
 @flyc.jit
 def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_scale, a_scale, mfma, epi, a_buf,
     a_scale_lds, a_lds_i32, K_ITERS, M_REPEAT, NUM_ACC_N, A_K_STEP_BYTES, pipe_weights,
-    mfma_amajor, async_a_copy, trb_rsrc, tib_rsrc, indirect_input, k_unroll=0):
+    mfma_amajor, async_a_copy, trb_rsrc, tib_rsrc, indirect_input, pair_k):
 # fmt: on
     N_ACC = M_REPEAT * NUM_ACC_N
     NUM_B_SCALE = NUM_ACC_N // _PACK
@@ -164,7 +164,7 @@ def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_sca
                 yv += sa_next
             return yv
 
-        if const_expr(k_unroll == 2):
+        if const_expr(pair_k):
             # Two K steps per iteration (ping-pong B registers): the rolled loop
             # copies the prefetched B tile into loop-carried registers, which
             # forces a vmcnt drain of the prefetch every step.
@@ -290,7 +290,7 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
     m_repeat, num_acc_n, a_k_step_bytes, total_threads, k_iters, a_lds_i32, n_tiles,
     expert_offset, b_cache_modifier, swizzle_a, pipe_weights, mfma_amajor, async_a_copy,
     use_tile_resource, indirect_input, indexed_input=False, row_map_rsrc=None,
-    source_rows=0, swiglu_limit=0.0, k_unroll=0, out_vec_rsrc=None, evec=8):
+    source_rows=0, swiglu_limit=0.0, pair_k=False, evec):
     # fmt: on
     """Build the GEMM1 atoms and return its expert resolver and tile runner."""
     sched = TileScheduler(
@@ -329,8 +329,7 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
     epi = SiluQuantEpilogue(out_rsrc=out_rsrc, out_scale_rsrc=os_rsrc, sorted_rsrc=trb_rsrc, tokens=0,
         inter_dim=inter_dim, m_repeat=m_repeat, num_acc_n=num_acc_n, sort_block_m=sort_block_m, tile_n=tile_n,
         num_waves=num_waves, lds_out=c_tile, swiglu_limit=swiglu_limit, always_valid=True,
-        out_tensor=out_tensor if use_tile_resource else None, out_vec_rsrc=out_vec_rsrc,
-        evec=evec)
+        out_tensor=out_tensor if use_tile_resource else None, evec=evec)
     # fmt: on
 
     def _decode(flat):
@@ -351,7 +350,7 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
             a_s2r, b_loader, b_scale, a_scale, mfma, epi, a_buf,
             a_scale_lds, a_lds_i32, k_iters, m_repeat, num_acc_n,
             a_k_step_bytes, pipe_weights, mfma_amajor, async_a_copy,
-            trb_rsrc, tib_rsrc, indirect_input, k_unroll)
+            trb_rsrc, tib_rsrc, indirect_input, pair_k)
         # fmt: on
 
     return expert_of_flat, do_scheduled_tile
@@ -439,7 +438,7 @@ def compile_gemm1(
             expert_offset=expert_offset, b_cache_modifier=b_cache_modifier, swizzle_a=swizzle_a,
             pipe_weights=pipe_weights, mfma_amajor=mfma_amajor, async_a_copy=async_a_copy,
             use_tile_resource=use_tile_resource, indirect_input=False,
-            swiglu_limit=swiglu_limit,
+            swiglu_limit=swiglu_limit, evec=8 if use_tile_resource else 2,
         )
         total_work = (num_valid // fx.Int32(sort_block_m)) * fx.Int32(n_tiles)
         for flat in range(fx.block_idx.x, total_work, grid_x):
