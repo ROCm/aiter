@@ -105,6 +105,43 @@ def run_edge_shapes():
         LINEAR_BETA,
     )
 
+    # Empty tensors exercise shape validation without allocating multi-GB
+    # rows. The largest safe d leaves room for a final 1024 * 8 loop step.
+    max_indexed_d = torch.iinfo(torch.int32).max - 1024 * 8 + 1
+    situv2_and_mul_quant(
+        torch.empty((0, max_indexed_d), dtype=dtypes.fp8),
+        torch.empty((0, 2 * max_indexed_d), dtype=dtypes.bf16),
+        torch.empty((0, 1), dtype=dtypes.fp32),
+        max_indexed_d,
+        BETA,
+        LINEAR_BETA,
+    )
+
+    too_large_d = max_indexed_d + 8
+    # AITER_CHECK aborts rather than raising, so isolate the negative case.
+    import subprocess
+    import sys
+
+    cmd = [
+        sys.executable,
+        "-c",
+        (
+            "import torch\n"
+            "from aiter import dtypes\n"
+            "from aiter.ops.activation import situv2_and_mul_quant\n"
+            f"d = {too_large_d}\n"
+            "situv2_and_mul_quant(\n"
+            "    torch.empty((0, d), dtype=dtypes.fp8, device='cuda'),\n"
+            "    torch.empty((0, 2 * d), dtype=dtypes.bf16, device='cuda'),\n"
+            "    torch.empty((0, 1), dtype=dtypes.fp32, device='cuda'),\n"
+            f"    d, {BETA}, {LINEAR_BETA})\n"
+        ),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=False)
+    if proc.returncode == 0:
+        raise AssertionError("oversized d must be rejected before int narrowing")
+    assert "32-bit kernel indexing limit" in proc.stdout + proc.stderr
+
     for d in (33792, 81912, 81920, 100000):
         x = torch.randn((2, 2 * d), dtype=dtypes.bf16)
         ref = run_torch(x)

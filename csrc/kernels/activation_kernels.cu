@@ -7,6 +7,7 @@
 // the t2opus<c10::*> specializations, so nothing here needs torch/ATen/c10.
 #define AITER_NO_TORCH_TYPES
 #include <cmath>
+#include <limits>
 
 #include "aiter_hip_common.h"
 #include "aiter_opus_plus.h"
@@ -870,11 +871,17 @@ __global__ __launch_bounds__(BlockSize) void situv2_and_mul_quant_kernel(
     static constexpr int32_t load_chunk_bytes =
         load_bytes % 16 == 0 ? 16 : (load_bytes % 8 == 0 ? 8 : 4);
     auto gate_buffer = opus::make_gmem<opus::bf16_t>(
-        gate_ptr, dim * sizeof(opus::bf16_t));
+        gate_ptr,
+        static_cast<unsigned int>(dim) *
+            static_cast<unsigned int>(sizeof(opus::bf16_t)));
     auto up_buffer = opus::make_gmem<opus::bf16_t>(
-        up_ptr, dim * sizeof(opus::bf16_t));
+        up_ptr,
+        static_cast<unsigned int>(dim) *
+            static_cast<unsigned int>(sizeof(opus::bf16_t)));
     auto out_buffer = opus::make_gmem<opus::fp8_t>(
-        out_ptr, dim * sizeof(opus::fp8_t));
+        out_ptr,
+        static_cast<unsigned int>(dim) *
+            static_cast<unsigned int>(sizeof(opus::fp8_t)));
 
     extern __shared__ float activated[];
     auto* reduce_scratch =
@@ -1832,7 +1839,19 @@ void situv2_and_mul_quant(const aiter_tensor_t& out,
                     linear_beta > 0.0f,
                 "situv2_and_mul_quant: beta and linear_beta must be finite and positive");
 
-    const int d              = input.size(-1) / 2;
+    // Dynamic kernels advance a signed 32-bit index by at most 1024 * 8
+    // elements. Leave room for the final loop increment, and reject before
+    // narrowing the tensor dimension to int.
+    constexpr int64_t max_kernel_stride = 1024 * 8;
+    constexpr int64_t max_supported_d =
+        static_cast<int64_t>(std::numeric_limits<int>::max()) - max_kernel_stride + 1;
+    const int64_t d64 = input.size(-1) / 2;
+    AITER_CHECK(d64 <= max_supported_d,
+                "situv2_and_mul_quant: d exceeds the 32-bit kernel indexing limit (",
+                max_supported_d,
+                ")");
+
+    const int d              = static_cast<int>(d64);
     const int64_t num_tokens = input.numel() / input.size(-1);
     AITER_CHECK(d > 0 && d % 8 == 0,
                 "situv2_and_mul_quant: d must be positive and divisible by 8");
