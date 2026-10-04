@@ -84,6 +84,17 @@ def _reduce_float(value, device, op):
     return float(result.item())
 
 
+def _rel_l2(output, reference):
+    """Relative L2 error over all ranks; -1.0 when the reference is all zero."""
+    error_sq = torch.sum((output.float() - reference) ** 2)
+    reference_sq = torch.sum(reference**2)
+    dist.all_reduce(error_sq)
+    dist.all_reduce(reference_sq)
+    if not reference_sq.item():
+        return -1.0
+    return float(torch.sqrt(error_sq / reference_sq))
+
+
 def _next_power_of_two(value):
     return 1 << (int(value) - 1).bit_length()
 
@@ -335,11 +346,7 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
             moe.experts,
             moe.swiglu_limit,
         )
-        error_sq = torch.sum((output.float() - reference) ** 2)
-        reference_sq = torch.sum(reference**2)
-        dist.all_reduce(error_sq)
-        dist.all_reduce(reference_sq)
-        rel_l2 = float(torch.sqrt(error_sq / reference_sq))
+        rel_l2 = _rel_l2(output, reference)
         if rel_l2 >= args.rtol:
             raise AssertionError(f"bs={tokens} relL2={rel_l2:.6f} exceeds {args.rtol}")
 
@@ -401,11 +408,8 @@ def _check_pad_tail(moe, x, weights, ids, ref_weights, args, rank, world, device
 
     eager_output = masked().clone()
     _barrier()
-    pad_zero = torch.tensor(
-        int(bool((eager_output[real:] == 0).all())), dtype=torch.int32, device=device
-    )
-    dist.all_reduce(pad_zero, op=dist.ReduceOp.MIN)
-    if not int(pad_zero.item()):
+    pad_zero = bool((eager_output[real:] == 0).all())
+    if not _reduce_float(pad_zero, device, dist.ReduceOp.MIN):
         raise AssertionError(f"bs={tokens} masked pad rows are not zero")
     reference = _reference(
         x[:real],
@@ -419,12 +423,8 @@ def _check_pad_tail(moe, x, weights, ids, ref_weights, args, rank, world, device
         moe.experts,
         moe.swiglu_limit,
     )
-    error_sq = torch.sum((eager_output[:real].float() - reference) ** 2)
-    reference_sq = torch.sum(reference**2)
-    dist.all_reduce(error_sq)
-    dist.all_reduce(reference_sq)
     # -1: every row of every rank is padding, so there is nothing to compare.
-    rel_l2 = float(torch.sqrt(error_sq / reference_sq)) if reference_sq.item() else -1.0
+    rel_l2 = _rel_l2(eager_output[:real], reference)
     if rel_l2 >= args.rtol:
         raise AssertionError(
             f"bs={tokens} pad_tail={args.pad_tail_rows} relL2={rel_l2:.6f} "
@@ -436,13 +436,8 @@ def _check_pad_tail(moe, x, weights, ids, ref_weights, args, rank, world, device
         state["output"] = masked()
 
     _time_graph(capture, device, 1)
-    graph_exact = torch.tensor(
-        int(torch.equal(state["output"], eager_output)),
-        dtype=torch.int32,
-        device=device,
-    )
-    dist.all_reduce(graph_exact, op=dist.ReduceOp.MIN)
-    if not int(graph_exact.item()):
+    graph_exact = torch.equal(state["output"], eager_output)
+    if not _reduce_float(graph_exact, device, dist.ReduceOp.MIN):
         raise AssertionError(f"bs={tokens} CUDA Graph replay changed masked output")
     if rank == 0:
         print(

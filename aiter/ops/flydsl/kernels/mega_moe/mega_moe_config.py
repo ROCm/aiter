@@ -207,9 +207,8 @@ def _select_fixed_stage1(bucket: int) -> Stage1Config:
         grid_mult=grid_mult,
         num_dispatch_cu=_fixed_dispatch_cu(bucket),
         mfma_amajor=False,
-        # LDS-DMA A copies + the paired K loop keep the B prefetch in flight;
-        # it matters when few tiles are resident (T=3 -12, T=7 -1.6 us/layer;
-        # neutral from 14 up).
+        # LDS-DMA A copies + the paired K loop keep the B prefetch in flight,
+        # which matters when few tiles are resident.
         async_a_copy=bucket <= 8,
         use_tile_resource=bucket <= 16,
         b_nt=0 if bucket == 1 else 3,
@@ -314,8 +313,7 @@ def _select_bounded_stage2(
     if model_dim < 4096:
         block_n = 128
     # Fixed-slot buckets below 128 also run persistent: the non-persistent grid
-    # is sized for the MTPR capacity, and its idle CTAs delay the real tiles
-    # (T=7/14/28: -10..-11 us/layer with 128 persistent CTAs).
+    # is sized for the MTPR capacity, and its idle CTAs delay the real tiles.
     persist = bucket >= 128 or fixed_slot
     if not persist:
         persist_cu = 0
@@ -330,8 +328,7 @@ def _select_bounded_stage2(
         block_n=block_n,
         persist=persist,
         persist_cu=persist_cu,
-        # Non-temporal W2 loads also for fixed-slot 256: DP-padded decode graphs
-        # (224 rows, ~84 real) -14 us/layer; fully real 224 rows -2 us.
+        # Non-temporal W2 loads also for fixed-slot 256 (DP-padded decode graphs).
         use_nt=bucket <= 128 or (fixed_slot and bucket <= 256),
         persist_strided=512 <= bucket <= 2048,
     )

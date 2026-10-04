@@ -651,8 +651,8 @@ class MegaMoEV2:
         if config is None:
             config = self._select_config(run_tokens)
         # Combine skips top-k slots with id -1 (never dispatched, so their partial
-        # is stale). The check costs 9-12% of a prefill layer, so it runs only
-        # when the caller says ids may be -1.
+        # is stale). The check costs prefill time, so it runs only when the
+        # caller says ids may be -1.
         if mask_invalid_slots is None:
             mask_invalid_slots = self._combine_mask
         self._g2_topk_ids = topk_ids if mask_invalid_slots else None
