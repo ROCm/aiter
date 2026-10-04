@@ -11,7 +11,7 @@ per M -> validate and install the config file.
 | --- | --- |
 | Where do I add a kernel? | One function in `kernels.py` decorated with `@kernel(...)`; the module docstring shows a complete example |
 | Where do I change candidate values? | `SEARCH_SPACE` in `space.py` |
-| Why was this config skipped? | `space.py`: the shape filters, `should_skip_generic` and `exceeds_lds`, plus the kernel's own `should_skip` in `kernels.py`. The driver prints how many combinations each rule removed |
+| Why was this config skipped? | `space.py`: the shape filters, `should_skip_generic`, `exceeds_lds` and `exceeds_registers`, plus the kernel's own `should_skip` in `kernels.py`. The driver prints how many combinations each rule removed |
 | How did this winner get installed? | `write_best_configs.py`: `load_winners` -> `assign_buckets` -> `build_table` -> write -> confirmation through `get_gemm_config` |
 
 | File | What it does |
@@ -63,7 +63,11 @@ that do not divide K), the generic rules in `space.py` (the old split-K pruning 
 when the keys exist, and an LDS check: a block-size combination whose buffers x (A tile + B tile)
 exceed the arch's LDS is never compiled; each kernel declares its element widths as `bits=(a, b)`,
 and a kernel whose `num_ctas` splits the tile over a CTA cluster declares `cta_split`, so the
-check counts one CTA's share)
+check counts one CTA's share; and a register check: a gluon kernel that declares `gluon_vgprs`
+(its accumulator plus the operand registers it keeps live, per lane) is rejected when that exceeds
+one wave's VGPRs, `VGPRS_PER_LANE` divided by the waves a workgroup puts on each SIMD, since such a
+config spills to scratch; the gfx1250 gluon a16w16 model was calibrated on the `.vgpr_count` and
+`.vgpr_spill_count` of compiled kernels, and every config it rejected there timed at least 3x the best)
 and the kernel's own `should_skip(config)` in `kernels.py` (what the kernel asserts, and buffer
 counts its wrapper clamps so they would only repeat another candidate). Every rule returns True
 to reject. If the kernel rejects every tile that fits the shape (a kernel that needs 64-row tiles

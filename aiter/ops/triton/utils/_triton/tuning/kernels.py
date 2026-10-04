@@ -79,6 +79,8 @@ class KernelSpec:
     gluon_candidates: dict = field(default_factory=dict)
     # (config) -> (ctas_m, ctas_n): how the kernel splits BLOCK_SIZE_M/N over a CTA cluster
     cta_split: Callable | None = None
+    # (config) -> VGPRs one lane of the gluon kernel keeps live (None: no register check)
+    gluon_vgprs: Callable | None = None
 
     def default_backend(self, arch):
         return "gluon" if arch in self.gluon_default_archs else "triton"
@@ -225,11 +227,29 @@ def batched_gemm_bf16(shape, backend):
     return call, (x, w, bias, y), should_skip
 
 
+def a16w16_gluon_vgprs(config):
+    """fp32 accumulator plus A/B operand registers of one lane, wave32.
+
+    The WMMA layout puts the first warp split on N and the rest on M; a warp tile is at least one
+    16x16 instruction. compute_bound loads the whole next K tile before each wmma. bandwidth_bound
+    streams its operands (LLVM sinks the LDS reads next to the wmmas), so half a tile is counted.
+    """
+    warps_n = min(config["num_warps"], 2)
+    warps_m = config["num_warps"] // warps_n
+    tile_m = max(config["BLOCK_M"] // warps_m, 16)
+    tile_n = max(config["BLOCK_N"] // warps_n, 16)
+    accumulator = tile_m * tile_n / 32
+    operands = (tile_m + tile_n) * config["BLOCK_K"] / 64
+    live = 1.0 if config["kernel_type"] == "compute_bound" else 0.5
+    return accumulator + live * operands
+
+
 @kernel(
     "GEMM-A16W16",
     gluon_archs=("gfx1250",),
     gluon_default_archs=("gfx1250",),
     gluon_ignored_keys=("persistent",),
+    gluon_vgprs=a16w16_gluon_vgprs,
 )
 def gemm_a16w16(shape, backend):
     import torch

@@ -50,6 +50,11 @@ ALIASES = {
 # The gluon compiler ignores these launch options, so under gluon they stay at the default.
 TRITON_ONLY_KEYS = {"matrix_instr_nonkdim", "kpack"}
 
+# VGPRs per lane of one SIMD; a workgroup with more warps than a CU has SIMDs shares each SIMD's
+# file between its waves. Only archs checked against compiled kernels' .vgpr_count are listed.
+VGPRS_PER_LANE = {"gfx1250": 1024}
+SIMDS_PER_CU = 4
+
 
 class UnknownConfigKey(Exception):
     pass
@@ -187,6 +192,15 @@ def exceeds_lds(config, spec, arch, backend):
     return buffers * tile_bytes > _LDS_CAP_BYTES.get(arch, 64 * 1024)
 
 
+def exceeds_registers(config, spec, arch, backend):
+    """True when the kernel's register model needs more VGPRs than one wave gets: such a config
+    spills to scratch, and spilling configs time several times slower than the best."""
+    if backend != "gluon" or spec.gluon_vgprs is None or arch not in VGPRS_PER_LANE:
+        return False
+    waves_per_simd = cdiv(config["num_warps"], SIMDS_PER_CU)
+    return spec.gluon_vgprs(config) > VGPRS_PER_LANE[arch] // waves_per_simd
+
+
 def build_space(spec, shape, backend, arch, kernel_should_skip):
     """All configs to benchmark for one shape, plus a report of how the space was built."""
     keys, buckets, default_path = load_defaults(spec, backend)
@@ -205,7 +219,7 @@ def build_space(spec, shape, backend, arch, kernel_should_skip):
 
     def prune(candidate_lists):
         configs = []
-        skipped = {"generic rules": 0, "LDS": 0, "kernel rules": 0}
+        skipped = {"generic rules": 0, "LDS": 0, "registers": 0, "kernel rules": 0}
         for combination in itertools.product(*candidate_lists.values()):
             config = dict(zip(keys, combination))
             if should_skip_generic(shape, config, backend):
@@ -213,6 +227,9 @@ def build_space(spec, shape, backend, arch, kernel_should_skip):
                 continue
             if exceeds_lds(config, spec, arch, backend):
                 skipped["LDS"] += 1
+                continue
+            if exceeds_registers(config, spec, arch, backend):
+                skipped["registers"] += 1
                 continue
             if kernel_should_skip is not None and kernel_should_skip(config):
                 skipped["kernel rules"] += 1
