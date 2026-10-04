@@ -396,6 +396,107 @@ def test_paged_mqa_logits_preshuffle(
     get_gfx() not in ("gfx942", "gfx950") or not enable_jit_gluon_pa_mqa_logits_kernel,
     reason="Requires the CDNA Gluon JIT paged MQA kernel",
 )
+# stage1 and the varctx schedule are left out: two identical calls of either do
+# not always give the same logits today.
+@pytest.mark.parametrize("entry", ["plain", "preshuffle", "flydsl"])
+@torch.inference_mode()
+def test_paged_mqa_logits_2d_context_lens(entry: str) -> None:
+    """A (B, next_n) per-row table, the layout DeepGEMM takes and vLLM passes,
+    gives the same logits as the per-sequence lengths it ends with."""
+    if entry == "flydsl" and get_gfx() != "gfx950":
+        pytest.skip("FlyDSL paged MQA logits is gfx950-only")
+    device = "cuda"
+    generator = torch.Generator(device=device).manual_seed(6021)
+    next_n, heads, hidden_dim, block_size = 3, 32, 128, 64
+    context_lengths = (3000, 257, 64, 3)
+    batch = len(context_lengths)
+    max_context = max(context_lengths)
+    max_pages = (max_context + block_size - 1) // block_size
+    num_blocks = batch * max_pages
+    preshuffle = entry in ("preshuffle", "flydsl")
+
+    q = torch.randn(
+        batch,
+        next_n,
+        heads,
+        hidden_dim,
+        generator=generator,
+        device=device,
+        dtype=torch.bfloat16,
+    ).to(dtypes.fp8)
+    kv = torch.randn(
+        num_blocks,
+        block_size,
+        hidden_dim,
+        generator=generator,
+        device=device,
+        dtype=torch.bfloat16,
+    ).to(dtypes.fp8)
+    if preshuffle:
+        kv = shuffle_weight(kv, layout=(16, 16))
+    scales = 0.25 + torch.rand(
+        num_blocks, block_size, generator=generator, device=device
+    )
+    weights = torch.randn(batch * next_n, heads, generator=generator, device=device)
+    packed = torch.empty(
+        num_blocks, block_size * (hidden_dim + 4), dtype=torch.uint8, device=device
+    )
+    value_bytes = block_size * hidden_dim
+    packed[:, :value_bytes] = kv.reshape(num_blocks, -1).view(torch.uint8)
+    packed[:, value_bytes:] = scales.view(torch.uint8)
+    cache = packed.view(num_blocks, block_size, 1, hidden_dim + 4)
+    block_tables = (
+        torch.randperm(num_blocks, generator=generator, device=device)
+        .view(batch, max_pages)
+        .to(torch.int32)
+    )
+    seq_lens = torch.tensor(context_lengths, dtype=torch.int32, device=device)
+    row_lens = (
+        seq_lens[:, None]
+        - next_n
+        + 1
+        + torch.arange(next_n, dtype=torch.int32, device=device)
+    )
+
+    def run(context_lens):
+        out = torch.full((batch * next_n, max_context), float("-inf"), device=device)
+        if entry == "flydsl":
+            from aiter.ops.flydsl import flydsl_fp8_paged_mqa_logits
+
+            flydsl_fp8_paged_mqa_logits(
+                q,
+                cache,
+                weights,
+                out,
+                context_lens,
+                block_tables,
+                max_context,
+                Preshuffle=True,
+                KVBlockSize=block_size,
+            )
+            return out
+        deepgemm_fp8_paged_mqa_logits(
+            q,
+            cache,
+            weights,
+            out,
+            context_lens,
+            block_tables,
+            max_context,
+            Preshuffle=preshuffle,
+            KVBlockSize=block_size,
+            ChunkK=256,
+            WavePerEU=2,
+        )
+        return out
+
+    assert torch.equal(run(row_lens), run(seq_lens))
+
+
+@pytest.mark.skipif(
+    get_gfx() not in ("gfx942", "gfx950") or not enable_jit_gluon_pa_mqa_logits_kernel,
+    reason="Requires the CDNA Gluon JIT paged MQA kernel",
+)
 @pytest.mark.parametrize(
     "layout,block_size",
     [

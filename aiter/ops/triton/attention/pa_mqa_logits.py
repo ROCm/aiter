@@ -80,6 +80,14 @@ else:
     enable_jit_gluon_pa_mqa_logits_kernel = False
 
 
+def per_sequence_context_lens(context_lens: torch.Tensor) -> torch.Tensor:
+    # The kernels read one length per sequence; a (B, next_n) per-row table
+    # ends with it.
+    if context_lens.dim() == 2 and context_lens.shape[1] > 1:
+        return context_lens[:, -1].contiguous()
+    return context_lens
+
+
 def deepgemm_fp8_paged_mqa_logits_ragged_k(
     q_fp8: torch.Tensor,  # dtype = float8
     kv_cache_fp8: torch.Tensor,  # dtype = float8
@@ -200,6 +208,7 @@ def deepgemm_fp8_paged_mqa_logits_stage1(
     batch_size, next_n, heads, hidden_dim = q_fp8.size()
     num_blocks, block_size, num_kv_heads, packed_dim = kv_cache_fp8.size()
     _, max_blk_len = kv_indices.size()
+    context_lens = per_sequence_context_lens(context_lens)
 
     assert num_kv_heads == 1
     assert packed_dim == hidden_dim + 4, (
@@ -437,6 +446,7 @@ def deepgemm_fp8_paged_mqa_logits_schedule(
     if TotalCuCount is None:
         TotalCuCount = get_num_sms()
     assert batch_size < TotalCuCount * WavePerEU // next_n
+    context_lens = per_sequence_context_lens(context_lens)
 
     max_chunks = math.ceil(max_model_len / ChunkK)
     schedule_waves_per_eu = 4
@@ -482,6 +492,7 @@ def deepgemm_fp8_paged_mqa_logits(
     batch_size, next_n, heads, hidden_dim = q_fp8.size()
     _, block_Size, _, index_dim = kv_cache.size()
     _, max_block_len = kv_indices.size()
+    context_lens = per_sequence_context_lens(context_lens)
 
     if get_gfx() == "gfx1250":
         if Preshuffle and hidden_dim <= 128:

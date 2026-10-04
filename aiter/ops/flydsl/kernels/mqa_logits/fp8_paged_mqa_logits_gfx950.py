@@ -524,6 +524,8 @@ def flydsl_fp8_paged_mqa_logits(
     if out_logits.shape[0] != batch_size * next_n:
         raise ValueError(f"out_logits first dimension must be {batch_size * next_n}")
 
+    if context_lens.dim() == 2 and context_lens.shape[1] > 1:
+        context_lens = context_lens[:, -1].contiguous()
     context_lens = context_lens.reshape(batch_size)
     max_block_len = kv_indices.shape[-1]
     kv_indices = kv_indices.reshape(batch_size, max_block_len)
