@@ -24,6 +24,7 @@ import os
 from multiprocessing import Pool, freeze_support, set_start_method
 
 import torch
+import torch.distributed as dist
 
 from aiter.test_common import checkAllclose
 
@@ -63,6 +64,18 @@ def _worker(tp_size, rankID, mode, shape):
 
     x = torch.full(shape, float(rankID + 1), dtype=torch.bfloat16, device=device)
     out = tensor_model_parallel_all_reduce(x).cpu()
+
+    # Align all ranks before teardown. destroy_dist_env() eagerly disposes the
+    # custom-all-reduce IPC buffers and message-queue/shm segments; without a
+    # barrier a rank can free a buffer a peer is still reading in a collective,
+    # which intermittently hangs these comm UTs in CI.
+    if dist.is_initialized():
+        torch.cuda.synchronize()
+        try:
+            dist.barrier()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("barrier before teardown failed: %s", e)
+        torch.cuda.synchronize()
 
     destroy_dist_env()
     return pool_mode, out

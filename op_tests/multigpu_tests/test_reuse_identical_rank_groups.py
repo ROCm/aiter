@@ -41,6 +41,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from aiter import logger
 from aiter.dist import parallel_state as ps
 from aiter.dist.parallel_state import (
     destroy_distributed_environment,
@@ -419,6 +420,16 @@ def _gpu_init(rank, world_size, port, topo, reuse):
 
 
 def _gpu_teardown():
+    # Align ranks before destroy_model_parallel() eagerly disposes the (possibly
+    # borrowed) custom-all-reduce IPC buffers and message-queue/shm segments; an
+    # unsynchronized free intermittently hangs the comm UTs back-to-back in CI.
+    if dist.is_initialized():
+        torch.cuda.synchronize()
+        try:
+            dist.barrier()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("barrier before teardown failed: %s", e)
+        torch.cuda.synchronize()
     destroy_model_parallel()
     destroy_distributed_environment()
     torch.cuda.empty_cache()
