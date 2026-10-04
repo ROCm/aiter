@@ -1169,28 +1169,27 @@ def test_v4_nm_split_planner_picks(num_seqs, kv_len, expected):
     )
 
 
+def _uniform_split(num_seqs, num_heads, kv_len, device="cuda"):
+    """mla_decode_fwd_v4_nm split kwargs: aiter's split count and its uniform
+    split_indptr [0, s, 2s, ...]."""
+    s = aiter.mla.get_mla_v4_nm_num_kv_splits(num_seqs, num_heads, kv_len)
+    return {
+        "num_kv_splits": s,
+        "split_indptr": torch.arange(
+            0, (num_seqs + 1) * s, s, dtype=torch.int32, device=device
+        ),
+    }
+
+
 @needs_gfx950
 @pytest.mark.parametrize(
     "num_seqs,kv_len", [(7, 128), (7, 1152), (56, 1152), (14, 8320)]
 )
-def test_v4_nm_num_kv_splits_matches_plan(num_seqs, kv_len):
-    """The host-only count is the plan's split count, with no device work."""
-    plan = aiter.mla.get_mla_v4_nm_split_plan(num_seqs, 128, kv_len)
-    assert aiter.mla.get_mla_v4_nm_num_kv_splits(num_seqs, 128, kv_len) == (
-        plan.num_kv_splits
-    )
-
-
-@needs_gfx950
-def test_v4_nm_split_plan_fills_buffer_in_place():
-    buf = torch.full((10,), -1, dtype=torch.int32, device="cuda")
-    plan = aiter.mla.get_mla_v4_nm_split_plan(7, 128, 1152, split_indptr=buf)
+def test_v4_nm_num_kv_splits_uses_cost_model(num_seqs, kv_len):
     cost = aiter.mla._V4_NM_SPLIT_COST["gfx950"]
-    assert plan.num_kv_splits == aiter.mla._v4_nm_pick_num_kv_splits(
-        cost, 7, 2, 1152, get_cu_num()
-    )
-    assert plan.split_indptr.data_ptr() == buf.data_ptr()
-    assert buf.tolist() == [i * plan.num_kv_splits for i in range(8)] + [-1, -1]
+    assert aiter.mla.get_mla_v4_nm_num_kv_splits(
+        num_seqs, 128, kv_len
+    ) == aiter.mla._v4_nm_pick_num_kv_splits(cost, num_seqs, 2, kv_len, get_cu_num())
 
 
 @needs_gfx950
@@ -1203,8 +1202,9 @@ def test_v4_nm_split_plan_fills_buffer_in_place():
     ],
 )
 def test_v4_nm_split_plan_accuracy(kv_lens, kv_len):
-    plan = aiter.mla.get_mla_v4_nm_split_plan(len(kv_lens), 128, kv_len)
-    err, out = _run_varlen_point(kv_lens, split_kwargs=plan._asdict())
+    err, out = _run_varlen_point(
+        kv_lens, split_kwargs=_uniform_split(len(kv_lens), 128, kv_len)
+    )
     assert torch.isfinite(out).all()
     assert err < 0.02
 
@@ -1236,13 +1236,12 @@ def test_v4_nm_split_plan_cudagraph_replay():
     kv_page_indices = torch.randperm(n * kv_cap, device=device).to(torch.int32)
     kv_last_page_lens = torch.ones(n, dtype=torch.int32, device=device)
     output = torch.empty((n, gqa, V_HEAD_DIM), dtype=dtypes.bf16, device=device)
-    split_buf = torch.empty(n + 1, dtype=torch.int32, device=device)
 
     def set_lens(lens):
         kv_indptr.copy_(torch.tensor([0] + np.cumsum(lens).tolist(), dtype=torch.int32))
 
-    plan = aiter.mla.get_mla_v4_nm_split_plan(n, gqa, kv_cap, split_indptr=split_buf)
-    assert plan.num_kv_splits > 1  # exercise the stage-2 path under the graph
+    split = _uniform_split(n, gqa, kv_cap)
+    assert split["num_kv_splits"] > 1  # exercise the stage-2 path under the graph
 
     def run():
         aiter.mla.mla_decode_fwd_v4_nm(
@@ -1257,7 +1256,7 @@ def test_v4_nm_split_plan_cudagraph_replay():
             1,
             sink=sink,
             sm_scale=sm_scale,
-            **plan._asdict(),
+            **split,
         )
 
     set_lens([kv_cap] * n)
@@ -2883,7 +2882,7 @@ def test_v4_nm_ps_matches_split_kernel(ps_workspace, kv_lens):
     n = len(kv_lens)
     out = _ps_call(inp, ps_workspace, return_lse=False)
     ref = torch.empty(n, _PS_HEADS, V_HEAD_DIM, dtype=dtypes.bf16, device="cuda")
-    plan = aiter.mla.get_mla_v4_nm_split_plan(n, _PS_HEADS, max(kv_lens))
+    split = _uniform_split(n, _PS_HEADS, max(kv_lens))
     logits, _ = aiter.mla.mla_decode_fwd_v4_nm(
         inp["q_packed"],
         inp["q_rope"],
@@ -2895,9 +2894,9 @@ def test_v4_nm_ps_matches_split_kernel(ps_workspace, kv_lens):
         inp["kv_page_indices"],
         1,
         sink=inp["sink"],
-        **plan._asdict(),
+        **split,
     )
-    if plan.num_kv_splits == 1:
+    if split["num_kv_splits"] == 1:
         ref = logits[:, 0]
     torch.cuda.synchronize()
     assert _cos_diff(out, ref) < 1e-5

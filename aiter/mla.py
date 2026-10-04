@@ -380,13 +380,6 @@ _V4_NM_SPLIT_COST = {
 _V4_NM_MAX_SPLITS = 16
 
 
-class MlaV4NmSplitPlan(NamedTuple):
-    """KV split plan for `mla_decode_fwd_v4_nm`; the fields are its kwargs."""
-
-    num_kv_splits: int
-    split_indptr: torch.Tensor
-
-
 @functools.lru_cache(maxsize=1024)
 def _v4_nm_pick_num_kv_splits(cost, num_seqs, tg_factor, kv_len, cu_num):
     """Split count minimizing the latency model above with coefficients `cost`."""
@@ -433,33 +426,6 @@ def get_mla_v4_nm_num_kv_splits(num_seqs, num_heads, kv_len) -> int:
             1,  # ignore_total_kv, as in mla_decode_fwd_v4_nm
         )
     return num_kv_splits
-
-
-def get_mla_v4_nm_split_plan(
-    num_seqs, num_heads, kv_len, *, split_indptr=None, device="cuda"
-) -> MlaV4NmSplitPlan:
-    """KV split plan for `mla_decode_fwd_v4_nm`: the split count of
-    `get_mla_v4_nm_num_kv_splits` and its uniform `split_indptr`.
-
-    Pass a persistent int32 `split_indptr` of at least `num_seqs + 1` entries
-    to have it filled in place (one device launch, no host sync); otherwise a
-    new one is allocated on `device`. Pass the plan on as
-    `mla_decode_fwd_v4_nm(..., **plan._asdict())`.
-    """
-    num_kv_splits = get_mla_v4_nm_num_kv_splits(num_seqs, num_heads, kv_len)
-    if split_indptr is None:
-        split_indptr = torch.empty(num_seqs + 1, dtype=torch.int32, device=device)
-    else:
-        split_indptr = split_indptr[: num_seqs + 1]
-    torch.arange(
-        0,
-        (num_seqs + 1) * num_kv_splits,
-        num_kv_splits,
-        dtype=torch.int32,
-        device=split_indptr.device,
-        out=split_indptr,
-    )
-    return MlaV4NmSplitPlan(num_kv_splits, split_indptr)
 
 
 # Workspace of the persistent v4 nm decode kernel (mla_decode_v4_ps_asm).
@@ -1891,9 +1857,9 @@ def mla_decode_fwd_v4_nm(
       path. Pass an explicit int to override. Note V4 nm is always
       non-persistent, so only that branch of `get_meta_param` applies.
       Callers that know their per-seq KV length (and CUDA-graph callers,
-      whose `kv_page_indices` is typically capacity-sized) should build a
-      plan with `get_mla_v4_nm_split_plan` and pass it as
-      `**plan._asdict()`.
+      whose `kv_page_indices` is typically capacity-sized) should pick it
+      with `get_mla_v4_nm_num_kv_splits` and pass it with the uniform
+      `split_indptr` `[0, s, 2s, ...]`.
 
     Multi-pass mode (`num_kv_splits > 1`):
       1. If `split_indptr` is None, build a uniform one:
