@@ -15,12 +15,16 @@ import triton
 from aiter.ops.triton.moe.moe_gemm_mxfp8 import moe_gemm_mxfp8
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
 
-# DSv4-style MoE shapes: (E, N, K, tokens_per_expert)
+# MoE shapes: (E, N, K, tokens_per_expert)
 _SHAPES = [
     (8, 7168, 2048, 64, "DSv4-decode"),
     (8, 7168, 2048, 256, "DSv4-prefill-small"),
     (8, 7168, 2048, 1024, "DSv4-prefill-large"),
     (64, 2048, 7168, 64, "DSv4-E64-decode"),
+    # Hy4-preview-FP8 gemm1 as sharded at TP=8: 256 experts / 8 ranks,
+    # hidden 6144, moe_intermediate 2048.
+    (32, 2048, 6144, 1, "Hy4-TP8-decode"),
+    (32, 2048, 6144, 16, "Hy4-TP8-prefill"),
 ]
 _QBS = 32
 
