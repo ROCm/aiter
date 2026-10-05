@@ -18,7 +18,7 @@ _SUPPORTED_ARCHS = ("gfx942", "gfx950")
 
 # How the IPC inbox is allocated. The wire protocol is identical in every
 # mode; only the memory type changes.
-INBOX_MEMORY_MODES = ("auto", "uncached", "finegrained", "default")
+INBOX_MEMORY_MODES = ("auto", "uncached", "finegrained")
 
 
 def _cuda_index(device) -> int:
@@ -53,7 +53,6 @@ def _resolve_inbox_flags(mode: str, world_size: int) -> tuple[int, str]:
     flags = {
         "uncached": UncachedIpcHeap._HIP_DEVICE_MALLOC_UNCACHED,
         "finegrained": UncachedIpcHeap._HIP_DEVICE_MALLOC_FINEGRAINED,
-        "default": UncachedIpcHeap._HIP_DEVICE_MALLOC_DEFAULT,
     }[mode]
     return flags, mode
 

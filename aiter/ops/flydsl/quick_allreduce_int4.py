@@ -253,7 +253,7 @@ def _resolve_codecs(algo, world_size, rs_codec, ag_codec):
 
 
 def batches_publishes(inbox_memory: str, algorithm: str, link: str) -> bool:
-    """Whether ``QuickAllReduceInt4`` batches publishes by default.
+    """Whether ``QuickAllReduceInt4`` batches publishes into super-tiles.
 
     Always with a release fence, where every publish is an L2 writeback. The
     PCIe ring batches without one too: each of its ``2(N-1)`` hops ends in a
@@ -316,7 +316,6 @@ class QuickAllReduceInt4:
         super_tile: int | None = None,
         grid_cap: int | None = None,
         inbox_memory: str = "auto",
-        batch_publishes: bool | None = None,
         min_bytes: int | None = None,
         algorithm: str = DEFAULT_ALGORITHM,
         rs_codec: str | None = None,
@@ -410,11 +409,7 @@ class QuickAllReduceInt4:
         )
         lds_capacity = get_lds_capacity_bytes(arch)
 
-        self._batch_publishes = (
-            batches_publishes(resolved_inbox, algorithm, link)
-            if batch_publishes is None
-            else bool(batch_publishes)
-        )
+        self._batch_publishes = batches_publishes(resolved_inbox, algorithm, link)
 
         self.min_bytes = (
             algo.floor_bytes(self.world_size) if min_bytes is None else int(min_bytes)
