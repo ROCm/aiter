@@ -18,6 +18,7 @@ from aiter.ops.triton.attention.pa_decode_sparse import (
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.common_utils import max_addressable_bytes
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -74,18 +75,16 @@ FP8_ARCHS = ("gfx950",)
 # plain grouped fp8 pool rather than these records, so it rejects them on dtype.
 PACKED_ARCHS = ("gfx950",)
 
-# gfx942 has 64 KB of LDS, not gfx950's 160, so BLOCK_K=64 (~67 KB) will not
-# launch. num_warps stays 4 instead of block_k // 16, which the cap would halve.
-_ARCH_BLOCK_K = {"gfx942": 32, "gfx950": 64}
-_ARCH_NUM_WARPS = {"gfx942": 4, "gfx950": 4}
 
+def _get_config(arch: str | None = None) -> dict:
+    """The _sparse_mla launch config published for arch, the running one by default.
 
-def _arch_block_k(arch: str) -> int:
-    return _ARCH_BLOCK_K.get(arch, 64)
-
-
-def _arch_num_warps(arch: str) -> int:
-    return _ARCH_NUM_WARPS.get(arch, _arch_block_k(arch) // 16)
+    BLOCK_K is per arch because gfx950's tile does not fit gfx942's 64 KB of
+    LDS. num_warps is its own entry rather than BLOCK_K // 16, so the smaller
+    tile does not halve the warps too.
+    """
+    cfg_dir = resolve_config_dir("attention", "SPARSE_MLA", backend="gluon", arch=arch)
+    return dict(load_config_json(f"{cfg_dir}/DEFAULT.json")["_sparse_mla"])
 
 
 def _check_packed_arch(arch: str) -> None:
@@ -141,9 +140,9 @@ def _check_lds_budget(arch, block_k, kv_lora_rank, qk_rope_head_dim, kv_lds_pad)
 
     kv_lds_pad is the launch's KV_LDS_PAD, so prefill is checked at the wider
     pitch it stages at. Left to the launcher this surfaces as an opaque
-    OutOfResources. gfx942 is the only arch checked: it already takes the
-    smaller of the two tiles this wrapper selects, so a latent too wide to fit
-    has nowhere left to go. gfx950 is left to the launcher, as before.
+    OutOfResources. gfx942 is the only arch checked: its config already takes
+    the smaller of the two published tiles, so a latent too wide to fit has
+    nowhere left to go. gfx950 is left to the launcher, as before.
     """
     if arch != "gfx942":
         return
@@ -644,8 +643,9 @@ def sparse_mla_fwd(
     # Tuned launch config (gfx950 / MI355). H < 16 runs natively at
     # BLOCK_M = next_pow2(H) instead of padding heads
     block_m = 16 if num_heads >= 16 else max(8, 1 << (num_heads - 1).bit_length())
-    block_k = _arch_block_k(arch)
-    num_warps = _arch_num_warps(arch)
+    cfg = _get_config()
+    block_k = cfg["BLOCK_K"]
+    num_warps = cfg["num_warps"]
 
     num_rows = cache.shape[0] * block_size if cache.ndim >= 2 else cache.shape[0]
     avg_topk = kv_indices.numel() / max(1, num_queries)

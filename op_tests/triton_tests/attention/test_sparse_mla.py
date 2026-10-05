@@ -214,6 +214,12 @@ def test_native_fp8_cache_rejected(fmt):
         sparse_mla_fwd(q, cache, ptr, idx, D_QK**-0.5, kv_scale=ks)
 
 
+@pytest.mark.parametrize("arch", SUPPORTED_ARCHS)
+def test_launch_config_published(arch):
+    """Every supported arch ships its launch config, checked from any machine."""
+    assert {"BLOCK_K", "num_warps"} <= smd._get_config(arch).keys()
+
+
 def test_lds_budget_gfx950_is_unchecked():
     """gfx950 is left to the launcher, though arch_info lists its LDS too.
 
@@ -255,7 +261,7 @@ def test_lds_budget_gfx942_boundary(kv_lds_pad, kv_lora_rank, rope, need):
     1008 only pin the comparison at exactly 64 KB: the KV tile's shared layout
     takes a power-of-two width, so no launch reaches that point.
     """
-    block_k = smd._arch_block_k("gfx942")
+    block_k = smd._get_config("gfx942")["BLOCK_K"]
     if need is None:
         smd._check_lds_budget("gfx942", block_k, kv_lora_rank, rope, kv_lds_pad)
         return
