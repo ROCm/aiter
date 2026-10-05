@@ -478,6 +478,7 @@ def _run_fp8_shape(
     seqlen_kv=None,
     varlen_seqlens_q=None,
     varlen_seqlens_kv=None,
+    out_dtype=None,
 ):
     """Run one fp8 shape and assert it against the fixed fp8 gate.
 
@@ -538,6 +539,8 @@ def _run_fp8_shape(
     k, k_s = _fp8_quant(k_bf)
     v, v_s = _fp8_quant(v_bf)
 
+    if out_dtype is not None:
+        kw["out"] = torch.empty(q.shape[:-1] + (Dv,), dtype=out_dtype, device="cuda")
     out = flydsl_flash_attn_fp8_func(
         q,
         k,
@@ -620,6 +623,40 @@ def test_fp8_gqa_dense(causal, num_heads, num_kv_heads, seq_len):
         head_dim=128,
         head_dim_v=128,
     )
+
+
+@_gfx950_only
+@pytest.mark.parametrize("causal", [False, True])
+def test_fp8_out_f16_dense(causal):
+    out = _run_fp8_shape(
+        causal,
+        batch=1,
+        seq_len=4096,
+        num_heads=16,
+        num_kv_heads=1,
+        head_dim=128,
+        head_dim_v=128,
+        num_kv_splits=1,
+        out_dtype=torch.float16,
+    )
+    assert out.dtype == torch.float16
+
+
+@_gfx950_only
+@pytest.mark.parametrize("causal", [False, True])
+def test_fp8_out_f16_varlen(causal):
+    out = _run_fp8_shape(
+        causal,
+        num_heads=16,
+        num_kv_heads=1,
+        head_dim=128,
+        head_dim_v=128,
+        num_kv_splits=1,
+        varlen_seqlens_q=FP8_VARLEN_Q_SEQLENS[2],
+        varlen_seqlens_kv=FP8_VARLEN_KV_SEQLENS[2],
+        out_dtype=torch.float16,
+    )
+    assert out.dtype == torch.float16
 
 
 @_gfx950_only

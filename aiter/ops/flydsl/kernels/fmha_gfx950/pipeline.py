@@ -10,6 +10,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly, llvm
+from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace as _TargetAddressSpace
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
@@ -266,6 +267,42 @@ def _cu_load(div, idx, cu_atom, cu_v1i32):
     )
 
 
+def _make_page_view(
+    base_iter,
+    base_iter_ty,
+    align,
+    page_id,
+    page_byte_stride,
+    page_nrec_bytes,
+    page_layout,
+    elem_ir,
+    buf_flags_i32,
+):
+    """Buffer descriptor covering exactly one KV page.
+
+    Vendored from upstream ``flash_attn_utils._make_page_view`` (v0.3.0), which is
+    already dtype-parametric via ``elem_ir`` -- the fp8 caller passes i8 to match its
+    byte-indexed dense descriptors. ``num_records`` is one page, so a read past the
+    page end returns 0 instead of the neighbouring page: the bound is the OOB guard.
+    """
+    base_i64 = fx.Int64(fx.ptrtoint(base_iter))
+    off_i64 = fx.Int64(page_id * page_byte_stride)
+    shifted = fx.inttoptr(base_iter_ty, base_i64 + off_i64)
+    buf_ptr_ty = fx.PointerType.get(
+        elem_ty=elem_ir, address_space=_TargetAddressSpace.BufferDesc, alignment=align
+    )
+    buf_ptr = fx.make_ptr(
+        buf_ptr_ty,
+        [
+            shifted,
+            fx.Int16(0).ir_value(),
+            page_nrec_bytes.ir_value(),
+            buf_flags_i32.ir_value(),
+        ],
+    )
+    return fx.logical_divide(fx.make_view(buf_ptr, page_layout), fx.make_layout(1, 1))
+
+
 def _make_ws_rsrc(ws_base_i64, byte_offset, nrec_bytes):
     addr_i64 = as_mlir_value(ws_base_i64 + fx.Int64(byte_offset))
     return buffer_ops.create_buffer_resource_from_addr(
@@ -403,6 +440,11 @@ class DualwaveSwpFp8Traits:
     NEG_INF_F32_BITS: int
     BATCH_INTERLEAVE_GROUP: int = 1
     RETURN_LSE: bool = False
+    PAGED: bool = False
+    K_SHUFFLED: bool = False
+    V_SHUFFLED: bool = False
+    OUT_F16: bool = False
+    PAGED_BT_LDS_SIZE: int = 2048
 
     @property
     def cache_tag(self):
@@ -412,7 +454,7 @@ class DualwaveSwpFp8Traits:
         whole argument grid and checking this tuple stays injective), so adding one
         cannot separate two builds that would otherwise share a binary.
         """
-        return (
+        base = (
             "fp8_e4m3_dualwave_swp",
             self.NUM_HEADS_Q,
             self.NUM_HEADS_KV,
@@ -431,6 +473,13 @@ class DualwaveSwpFp8Traits:
             self.BATCH_INTERLEAVE_GROUP,
             self.RETURN_LSE,
         )
+        # Suffix only for non-default flags so dense tags (and AOT artifacts keyed
+        # on them) stay unchanged.
+        if self.PAGED:
+            base += (("paged", self.K_SHUFFLED, self.V_SHUFFLED),)
+        if self.OUT_F16:
+            base += (("out_f16",),)
+        return base
 
 
 def _make_dualwave_swp_fp8_traits(
@@ -450,6 +499,10 @@ def _make_dualwave_swp_fp8_traits(
     cross_seqlen=False,
     batch_interleave_group=1,
     return_lse=False,
+    paged=False,
+    kv_cache_layout="linear",
+    out_dtype="bf16",
+    _k_shuffled_only=False,
 ):
     """Build gfx950 DUALWAVE_SWP fp8 compile-time layout traits.
 
@@ -469,6 +522,27 @@ def _make_dualwave_swp_fp8_traits(
             "fp8 flash attention needs 64 <= head_dim_v <= 192 and head_dim_v % 32 == 0, "
             f"got head_dim_v={head_dim_v} (head_dim={head_dim})"
         )
+    if kv_cache_layout not in ("linear", "shuffled"):
+        raise RuntimeError(
+            f"kv_cache_layout must be 'linear' or 'shuffled', got {kv_cache_layout!r}"
+        )
+    if _k_shuffled_only and (not paged or kv_cache_layout != "shuffled"):
+        raise RuntimeError("_k_shuffled_only requires shuffled paging")
+    if out_dtype not in ("bf16", "f16"):
+        raise RuntimeError(f"out_dtype must be 'bf16' or 'f16', got {out_dtype!r}")
+    if kv_cache_layout == "shuffled" and not paged:
+        raise RuntimeError("kv_cache_layout='shuffled' requires paged=True")
+    if paged:
+        if not varlen:
+            raise RuntimeError("paged fp8 flash attention requires varlen=True")
+        if head_dim != 128 or head_dim_v != 128:
+            raise RuntimeError(
+                "paged fp8 flash attention requires head_dim == head_dim_v == 128, "
+                f"got head_dim={head_dim}, head_dim_v={head_dim_v}"
+            )
+        if return_lse:
+            raise RuntimeError("paged fp8 flash attention does not support return_lse")
+    paged_bt_lds_size = 2048
     block_n = 64
     k_sub_n = 32
     warp_size = 64
@@ -535,6 +609,8 @@ def _make_dualwave_swp_fp8_traits(
     lds_bytes = lds_kv_total_size * elem_bytes + vt_bf16_total * eb_bf
     if qlds:
         lds_bytes += block_m * head_dim * elem_bytes
+    if paged:
+        lds_bytes += paged_bt_lds_size * 4
     if lds_bytes > LDS_BYTES_GFX950:
         raise RuntimeError(
             f"fp8 flash attention head_dim={head_dim}/head_dim_v={head_dim_v} at block_m={block_m} "
@@ -595,6 +671,11 @@ def _make_dualwave_swp_fp8_traits(
         NEG_INF_F32_BITS=0xFF800000,
         BATCH_INTERLEAVE_GROUP=int(batch_interleave_group),
         RETURN_LSE=bool(return_lse),
+        PAGED=bool(paged),
+        K_SHUFFLED=kv_cache_layout == "shuffled",
+        V_SHUFFLED=kv_cache_layout == "shuffled" and not _k_shuffled_only,
+        OUT_F16=out_dtype == "f16",
+        PAGED_BT_LDS_SIZE=paged_bt_lds_size,
     )
 
 
@@ -700,6 +781,8 @@ class DualwaveFp8KernelContext:
         stride_kv_n=None,
         softmax_scale=None,
         lse_stride_h=None,
+        BlockTable=None,
+        block_table_stride=None,
     ):
         if isinstance(traits_or_ctx, DualwaveFp8KernelContext):
             self.__dict__.update(traits_or_ctx.__dict__)
@@ -724,6 +807,8 @@ class DualwaveFp8KernelContext:
         self.stride_kv_n = stride_kv_n
         self.softmax_scale = softmax_scale
         self.lse_stride_h = lse_stride_h
+        self.BlockTable = BlockTable
+        self.block_table_stride = block_table_stride
 
     def init_types_and_constants(self):
         traits = self.traits
@@ -776,6 +861,8 @@ class DualwaveFp8KernelContext:
         self.lds_vt_base_ptr = lds.vt.ptr.llvm_ptr
         self.lds_q_base_idx = fx.Index(fx.ptrtoint(lds.q.ptr))
         self.lds_q_base_ptr = lds.q.ptr.llvm_ptr
+        if const_expr(self.traits.PAGED):
+            self.lds_bt_base_ptr = lds.bt.ptr.llvm_ptr
 
     def init_thread_mapping(self):
         _init_dualwave_thread_mapping(self)
@@ -802,12 +889,22 @@ class DualwaveFp8KernelContext:
 
             self.q_tok_base = _cu_load(_cuq_div, self.batch_idx, _cu_atom, _cu_v1i32)
             self.q_tok_end = _cu_load(_cuq_div, self.batch_idx + 1, _cu_atom, _cu_v1i32)
-            self.kv_tok_base = _cu_load(_cuk_div, self.batch_idx, _cu_atom, _cu_v1i32)
-            self.kv_tok_end = _cu_load(
-                _cuk_div, self.batch_idx + 1, _cu_atom, _cu_v1i32
-            )
-            self.seqlen_q_v = self.q_tok_end - self.q_tok_base
-            self.seqlen_kv_v = self.kv_tok_end - self.kv_tok_base
+            if const_expr(traits.PAGED):
+                self.kv_tok_base = fx.Index(0)
+                self.kv_tok_end = _cu_load(
+                    _cuk_div, self.batch_idx, _cu_atom, _cu_v1i32
+                )
+                self.seqlen_q_v = self.q_tok_end - self.q_tok_base
+                self.seqlen_kv_v = self.kv_tok_end
+            else:
+                self.kv_tok_base = _cu_load(
+                    _cuk_div, self.batch_idx, _cu_atom, _cu_v1i32
+                )
+                self.kv_tok_end = _cu_load(
+                    _cuk_div, self.batch_idx + 1, _cu_atom, _cu_v1i32
+                )
+                self.seqlen_q_v = self.q_tok_end - self.q_tok_base
+                self.seqlen_kv_v = self.kv_tok_end - self.kv_tok_base
             self.seqlen_kv_i32 = fx.Int32(self.seqlen_kv_v)
         else:
             self.q_tok_base = self.batch_idx * self.seq_len_v
@@ -821,12 +918,22 @@ class DualwaveFp8KernelContext:
         self.q_gmem_elem_offset = (
             self.q_tok_base + self.q_start
         ) * self.stride_q_n_v + self.q_head_idx * traits.HEAD_DIM
-        self.kv_gmem_elem_offset = (
-            self.kv_tok_base * self.stride_kv_n_v + self.kv_head_idx * traits.HEAD_DIM
-        )
-        self.v_gmem_elem_offset = (
-            self.kv_tok_base * self.stride_v_n_v + self.kv_head_idx * traits.HEAD_DIM_V
-        )
+        if const_expr(traits.PAGED):
+            self.kv_gmem_elem_offset = self.kv_head_idx * traits.HEAD_DIM
+            if const_expr(traits.K_SHUFFLED):
+                self.kv_gmem_elem_offset *= traits.BLOCK_N
+            self.v_gmem_elem_offset = self.kv_head_idx * traits.HEAD_DIM_V
+            if const_expr(traits.V_SHUFFLED):
+                self.v_gmem_elem_offset *= traits.BLOCK_N
+        else:
+            self.kv_gmem_elem_offset = (
+                self.kv_tok_base * self.stride_kv_n_v
+                + self.kv_head_idx * traits.HEAD_DIM
+            )
+            self.v_gmem_elem_offset = (
+                self.kv_tok_base * self.stride_v_n_v
+                + self.kv_head_idx * traits.HEAD_DIM_V
+            )
 
     def init_descriptors(self):
         traits = self.traits
@@ -854,11 +961,57 @@ class DualwaveFp8KernelContext:
             return fx.logical_divide(bt, fx.make_layout(1, 1))
 
         self.q_div = _make_buf_div(self.Q, q_nrec_bytes)
-        self.k_div = _make_buf_div(self.K, kv_nrec_bytes)
-        self.v_div = _make_buf_div(self.V, v_nrec_bytes)
+        if const_expr(traits.PAGED):
+            self.k_div = None
+            self.v_div = None
+            self.page_byte_stride = fx.Int64(traits.BLOCK_N) * fx.Int64(
+                self.stride_kv_n_v
+            )
+            self.page_layout = fx.make_layout(
+                fx.Int32(self.page_byte_stride), fx.Int32(1)
+            )
+            self.buf_flags_i32 = fx.Int32(buffer_ops._get_buffer_flags())
+            self.k_iter = fx.get_iter(self.K)
+            self.v_iter = fx.get_iter(self.V)
+            self.block_table_stride_v = fx.Index(self.block_table_stride)
+            self.bt_div = fx.logical_divide(
+                fx.rocdl.make_buffer_tensor(self.BlockTable), fx.make_layout(1, 1)
+            )
+            self.bt_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
+            self.bt_v1i32 = Vec.make_type(1, fx.Int32)
+        else:
+            self.k_div = _make_buf_div(self.K, kv_nrec_bytes)
+            self.v_div = _make_buf_div(self.V, v_nrec_bytes)
         self.o_div = fx.logical_divide(
             fx.rocdl.make_buffer_tensor(self.O, num_records_bytes=o_nrec_bytes),
             fx.make_layout(1, 1),
+        )
+
+    def kv_page_div(self, which, page_id, tile_start):
+        base_iter = self.k_iter if which == "k" else self.v_iter
+        # Bounds follow the logical tile, not the clamped page id: invalid-token
+        # V must be zero even when the last page contains stale fp8 NaNs.
+        remaining = self.seqlen_kv_v - tile_start
+        valid = (remaining > 0).select(remaining, fx.Index(0))
+        valid = (valid < self.traits.BLOCK_N).select(
+            valid, fx.Index(self.traits.BLOCK_N)
+        )
+        nrec = fx.Int64(valid * self.stride_kv_n_v)
+        if const_expr(
+            (which == "k" and self.traits.K_SHUFFLED)
+            or (which == "v" and self.traits.V_SHUFFLED)
+        ):
+            nrec = (valid > 0).select(self.page_byte_stride, fx.Int64(0))
+        return _make_page_view(
+            base_iter,
+            base_iter.type,
+            fx.PointerType(base_iter.type).alignment,
+            page_id,
+            self.page_byte_stride,
+            nrec,
+            self.page_layout,
+            fx.Int8.ir_type,
+            self.buf_flags_i32,
         )
 
     def init_atoms_and_lds_ptrs(self):
