@@ -33,6 +33,16 @@ MEGA_MHC_DEFAULTS = {
     "NT_STREAMS": False,  # opt-in only: no policy range wins in eager and graph
     "FN_PREPACKED": True,
     "SINKHORN_RCP": True,
+    "X1_LDS_SLOTS": 0,
+}
+
+_TOKENS_CFG = {
+    "BLOCK_M": 64,
+    "WARP_SPLIT": "tokens",
+    "WARPS_PER_WG": 4,
+    "NUM_KSPLIT": 1,
+    "TILE_K": 64,
+    "COHERENCE": "none",
 }
 
 _MAX_SPLIT = 20  # 40/80 splits measured no faster at decode (more partial rows)
@@ -49,8 +59,18 @@ def get_mega_mhc_config(
       Splits finish on one XCD (``COHERENCE="xcd"``), measured faster than the
       agent-scope path at every size. ``TILE_K=64`` (whole 128 B lines per k-step)
       wherever H divides, else 32.
-    * Beyond that, fn's L2 traffic (2 MB per token block) dominates: 64-token blocks
-      with 4 token-split warps sharing each fn tile through LDS (bf16). The FP8 output
+    * bf16 with ``NUM_KSPLIT == 1`` and more than ~0.6 * cu_num token blocks keeps
+      each warp's first ``X1_LDS_SLOTS`` 32-column chunks of x1 in LDS for the
+      finish instead of staging them in HBM and re-reading them (P3,
+      ``sweep/p3_x1_in_registers.md``): 6-8% faster at T = 2560..12288. Below that
+      size the kernel is latency-bound and the knob is neutral. FP8 never re-reads.
+    * Beyond ``64 * cu_num`` tokens, fn's L2 traffic (2 MB per token block) dominates:
+      for bf16, 64-token blocks with 4 token-split warps sharing each fn tile through
+      LDS, but only while the last round of ``64 * cu_num``-token workgroup waves is
+      at least 95% full: that kernel steps +46% at T = 16400 (a second round for one
+      workgroup), while the 16-token column-split kernel with the x1 LDS stage scales
+      smoothly and is 22-30% faster for T = 16400..28672 and 9-15% for 36864..40960
+      (1-2% slower at exact multiples). The FP8 output
       instead keeps column-split warps with 10 column splits (32-token blocks, 8
       warps; 16-token/4-warp when H does not allow it): its finisher only rescales
       the group scales, so the split-K tail is cheap there, while the bf16 finisher
@@ -64,12 +84,14 @@ def get_mega_mhc_config(
     neutral to slower in eager; only the ks=10 window (T = 208..384) is faster in
     graph replay (-4..-8%) but not in eager; it is 8-40% slower from T = 416 on.
     """
-    from aiter.ops.flydsl.kernels.mega_mhc import check_config
+    from aiter.ops.flydsl.kernels.mega_mhc import check_config, max_x1_lds_slots
 
     if arch not in _GFX:
         raise RuntimeError(f"[flydsl_mega_mhc] unsupported arch {arch}")
     cfg = dict(MEGA_MHC_DEFAULTS)
-    if T >= 64 * cu_num:
+    tok_round = 64 * cu_num
+    tok_fill = T / (-(-T // tok_round) * tok_round)  # fill of the last WG wave
+    if T >= tok_round and (out_fp8 or tok_fill >= 0.95):
         if out_fp8:
             cfg.update(
                 BLOCK_M=32, WARPS_PER_WG=8, NUM_KSPLIT=10, TILE_K=64, COHERENCE="xcd"
@@ -79,14 +101,7 @@ def get_mega_mhc_config(
             except ValueError:  # H not divisible by 10 * 8 * 64: narrower warps
                 cfg.update(BLOCK_M=16, WARPS_PER_WG=4)
         else:
-            cfg.update(
-                BLOCK_M=64,
-                WARP_SPLIT="tokens",
-                WARPS_PER_WG=4,
-                NUM_KSPLIT=1,
-                TILE_K=64,
-                COHERENCE="none",
-            )
+            cfg.update(_TOKENS_CFG)
         check_config(H, cfg)
         return cfg
     nblk = -(-T // 16)
@@ -99,7 +114,15 @@ def get_mega_mhc_config(
     cfg.update(
         BLOCK_M=16, NUM_KSPLIT=ks, TILE_K=tk, COHERENCE="xcd" if ks > 1 else "none"
     )
-    check_config(H, cfg)
+    if ks == 1 and not out_fp8 and 5 * nblk > 3 * cu_num:
+        cfg["X1_LDS_SLOTS"] = max_x1_lds_slots(H, cfg)
+    try:
+        check_config(H, cfg)
+    except ValueError:
+        if T < tok_round or out_fp8:
+            raise
+        cfg = dict(MEGA_MHC_DEFAULTS, **_TOKENS_CFG)  # H too narrow for 8 col warps
+        check_config(H, cfg)
     return cfg
 
 

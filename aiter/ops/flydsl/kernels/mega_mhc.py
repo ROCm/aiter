@@ -38,6 +38,17 @@ rescales the staged bf16 ``x1`` in place (or only the FP8 scales) and re-arms th
 counter. ``COHERENCE`` makes the other splits' writes visible to it:
   "xcd"   all splits of a token block run on one XCD (shared L2); L1-bypass reads.
   "agent" splits anywhere; agent-scope release/acquire, L1+L2-bypass reads.
+
+x1 stage (``X1_LDS_SLOTS`` = n > 0, bf16, ``NUM_KSPLIT == 1``, ``BLOCK_M == 16``,
+column-split warps). The finish needs the whole row's sum of squares before it can
+rescale x1, so the main loop stages x1 and the finish used to re-read it from HBM.
+With the knob, the first n 32-column chunks of each warp's columns are written to LDS
+instead (one 1 KiB slot per chunk, lane-local in the elementwise layout, a shared
+dummy slot for the chunks past n so the loop stays branch-free) and the finish
+rescales them straight out of LDS; only the remaining chunks take the HBM round
+trip. 160 KB of x1 does not fit in the 160 KB of LDS next to the 51 KB the kernel
+already uses, so n is at most 13 at H = 5120 with 8 warps (the policy uses 12: whole
+k-steps keep the staged remainder on 128 B lines).
 """
 
 import functools
@@ -109,6 +120,38 @@ def _st(val, rsrc, voff, soff, cm):
 
 
 COHERENCE_MODES = ("none", "xcd", "agent")
+N_FN_OPS = 3  # 1 KiB B operands per (chunk, stream), see compile_mega_mhc
+LDS_MAX = 163840  # gfx950: LDS bytes per workgroup
+
+
+def smem_bytes(H: int, cfg: dict) -> int:
+    """Static LDS bytes of the kernel for a knob set (the ``Smem`` struct plus the
+    ``X1_LDS_SLOTS`` x1 stage: W * slots + 1 dummy slot, 1 KiB each)."""
+    bm, ws, w = cfg["BLOCK_M"], cfg["WARP_SPLIT"], cfg["WARPS_PER_WG"]
+    k_warps = w if ws == "cols" else 1
+    units = bm * PSLOT // 4
+    kgroups = max(1, min(WAVE * w // units, cfg["NUM_KSPLIT"]))
+    red = max(k_warps * bm * PSLOT, kgroups * units * 4)
+    fn_lds = ws == "tokens" and w > 1 and cfg["FN_PREPACKED"]
+    nops = (cfg["TILE_K"] // 32) * N_STREAMS * N_FN_OPS
+    fnbuf = 2 * nops * WAVE * 4 if fn_lds else 4
+    total = 4 * (red + bm * PSLOT + bm + 4 + w * N_STREAMS * WAVE * 4 + fnbuf)
+    nsl = cfg.get("X1_LDS_SLOTS", 0)
+    return total + (1024 * (w * nsl + 1) if nsl else 0)
+
+
+def max_x1_lds_slots(H: int, cfg: dict) -> int:
+    """Largest legal ``X1_LDS_SLOTS`` for a knob set: whole k-steps (so the staged
+    remainder keeps 128 B lines), within the LDS budget; 0 if the knob does not apply.
+    """
+    w, step = cfg["WARPS_PER_WG"], cfg["TILE_K"] // 32
+    if cfg["WARP_SPLIT"] != "cols" or cfg["NUM_KSPLIT"] != 1 or cfg["BLOCK_M"] != 16:
+        return 0
+    best = 0
+    for n in range(step, H // (w * 32) + 1, step):
+        if smem_bytes(H, dict(cfg, X1_LDS_SLOTS=n)) <= LDS_MAX:
+            best = n
+    return best
 
 
 def check_config(H: int, cfg: dict) -> None:
@@ -156,6 +199,22 @@ def check_config(H: int, cfg: dict) -> None:
         raise ValueError("NUM_KSPLIT=1 needs no coherence mode (use 'none')")
     if ks > 1 and coh == "none":
         raise ValueError("NUM_KSPLIT>1 needs COHERENCE 'xcd' or 'agent'")
+    nsl = cfg.get("X1_LDS_SLOTS", 0)
+    if nsl:
+        if ws != "cols" or ks != 1 or bm != 16:
+            raise ValueError(
+                "X1_LDS_SLOTS needs WARP_SPLIT=cols, NUM_KSPLIT=1 and BLOCK_M=16"
+            )
+        if not 0 < nsl <= H // (w * 32):
+            raise ValueError(
+                f"X1_LDS_SLOTS={nsl} must be in 1..{H // (w * 32)} (32-column "
+                f"chunks of one warp's columns)"
+            )
+        if smem_bytes(H, cfg) > LDS_MAX:
+            raise ValueError(
+                f"X1_LDS_SLOTS={nsl} needs {smem_bytes(H, cfg)} B of LDS "
+                f"(> {LDS_MAX})"
+            )
 
 
 def kernel_name(cfg: dict, has_post: bool, identity_pre: bool, out_fp8: bool) -> str:
@@ -168,6 +227,7 @@ def kernel_name(cfg: dict, has_post: bool, identity_pre: bool, out_fp8: bool) ->
         f"_{cfg['COHERENCE']}_nt{int(cfg['NT_STREAMS'])}"
         f"_pk{int(cfg['FN_PREPACKED'])}_rcp{int(cfg['SINKHORN_RCP'])}"
         f"_{mode}_{'fp8' if out_fp8 else 'bf16'}"
+        + (f"_x1l{cfg['X1_LDS_SLOTS']}" if cfg.get("X1_LDS_SLOTS") else "")
     )
 
 
@@ -199,6 +259,7 @@ def compile_mega_mhc(
     SINKHORN_RCP: bool,
     SINKHORN_ITERS: int,
     FP8_MAX: float = 448.0,
+    X1_LDS_SLOTS: int = 0,
 ):
     """Compile the Mega-mHC kernel for one knob set; returns the ``@flyc.jit`` launcher."""
     cfg = {
@@ -212,6 +273,7 @@ def compile_mega_mhc(
         "NT_STREAMS": NT_STREAMS,
         "FN_PREPACKED": FN_PREPACKED,
         "SINKHORN_RCP": SINKHORN_RCP,
+        "X1_LDS_SLOTS": X1_LDS_SLOTS,
     }
     check_config(H, cfg)
     assert H % FP8_GROUP == 0 and SINKHORN_ITERS >= 1
@@ -229,6 +291,11 @@ def compile_mega_mhc(
     COLS_WG = H // KS
     COLS_W = COLS_WG // K_WARPS
     NK = COLS_W // TILE_K  # k-steps per warp
+    NQ = COLS_W // 32  # 32-column chunks per warp
+    # bf16 only: the first X1L chunks of every warp's x1 stay in LDS for the finish
+    # instead of being staged in HBM and re-read (the FP8 finish never re-reads).
+    X1L = 0 if OUT_FP8 else X1_LDS_SLOTS
+    X1_INTS = (WARPS_PER_WG * X1L + 1) * 256 if X1L else 4
     K4 = N_STREAMS * H
     H8 = H // 8
     NG = H // FP8_GROUP
@@ -246,7 +313,6 @@ def compile_mega_mhc(
     # (chunk, stream, op): op 0/1 = rows 0..15 hi/lo, op 2 = rows 16..23 hi in
     # columns 0..7 and lo in columns 8..15 of the second N tile, folded by one
     # shuffle after the k-loop. 3 B operands and MFMAs per (chunk, stream), not 4.
-    N_FN_OPS = 3
     NOPS = NC * N_STREAMS * N_FN_OPS  # 1 KiB B operands per k-step
     # Token-split warps share their columns, so a k-step's fn tile is loaded once
     # per WG into a double-buffered LDS slot instead of once per warp.
@@ -265,6 +331,12 @@ def compile_mega_mhc(
         # per-wave R' bf16 tile in elementwise lane order, read back as MFMA A
         xpose: fx.Array[fx.Int32, W * N_STREAMS * WAVE * 4, 16]
         fnbuf: fx.Array[fx.Int32, (2 * NOPS * WAVE * 4) if FN_LDS else 4, 16]
+
+    if X1L:
+
+        @fx.struct
+        class X1Smem:
+            x1s: fx.Array[fx.Int32, X1_INTS, 16]
 
     F32, BF16, I32 = fx.Float32, fx.BFloat16, fx.Int32
 
@@ -370,7 +442,10 @@ def compile_mega_mhc(
 
         def body():
             # LDS views are built here so they dominate every use in the body
-            lds = fx.SharedAllocator().allocate(Smem).peek()
+            alloc = fx.SharedAllocator()
+            lds = alloc.allocate(Smem).peek()
+            if fx.const_expr(X1L > 0):
+                x1s = alloc.allocate(X1Smem).peek().x1s
             red = lds.red
             fin = lds.fin
             rstdn = lds.rstdn
@@ -536,6 +611,25 @@ def compile_mega_mhc(
                         flat += load_fn(iv, c, s, dead)
                 return flat
 
+            def stage_x1(iv, c, mt, unit, cb):
+                """Chunk q = iv * NC + c of x1: LDS slot q of this warp if q < X1L
+                (else a shared dummy slot), HBM staging otherwise."""
+                q = iv * NC + c
+                in_l = q < I32(X1L)
+                if fx.const_expr(X1L < NQ):
+                    _st(
+                        unit,
+                        rs_x1,
+                        in_l.select(OOB, v_y),
+                        (cb + mt * 16 * H) * 2,
+                        0,
+                    )
+                lds_off = in_l.select(
+                    wi_u * (X1L * 256) + q * 256 + lane * 4,
+                    I32(WARPS_PER_WG * X1L * 256) + lane * 4,
+                )
+                fx.ptr_store(unit.ir_value(), fx.add_offset(x1s.ptr, lds_off))
+
             def step(iv, tiles, fns, acc, sqr, sqx):
                 """One k-step in three phases: the VALU work of every chunk, then
                 the stores with the 32-column halves of a 128 B line back to back
@@ -669,7 +763,16 @@ def compile_mega_mhc(
                                 0,
                             )
                         else:
-                            _st(st_x[mt][c], rs_x1, v_y, (cb + mt * 16 * H) * 2, 0)
+                            if fx.const_expr(X1L > 0):
+                                stage_x1(iv, c, mt, st_x[mt][c], cb)
+                            else:
+                                _st(
+                                    st_x[mt][c],
+                                    rs_x1,
+                                    v_y,
+                                    (cb + mt * 16 * H) * 2,
+                                    0,
+                                )
                 for c in range_constexpr(NC):
                     if fx.const_expr(FN_LDS or c == 0):
                         ops_c = fns[
@@ -869,6 +972,85 @@ def compile_mega_mhc(
             # the finish only walks the token rows that exist (decode: T < BLOCK_M)
             rows_valid = (n_tok - tok0 < I32(BM)).select(n_tok - tok0, I32(BM))
 
+            # bf16 rescale of the x1 chunks this warp kept in LDS: lane-local, in the
+            # layout they were produced in (token erow, 8 columns ekg * 8 of a chunk)
+            def rescale_x1_lds():
+                rs_e = rstdn[erow]
+                c8_0 = col_w // 8 + ekg
+                base = wi_u * (X1L * 256) + lane * 4
+                xs, wv = [], []
+                for q in range_constexpr(X1L):
+                    xs.append(
+                        Vec(
+                            fx.ptr_load(
+                                fx.add_offset(x1s.ptr, base + q * 256), T.vec(4, T.i32)
+                            )
+                        )
+                    )
+                    wv.append(buf_copy_load(w_t, c8_0 + q * 4, I32, 4))
+                for q in range_constexpr(X1L):
+                    r_o = (bf16x8(xs[q]).to(F32) * rs_e) * bf16x8(wv[q]).to(F32)
+                    buf_copy_store(
+                        out_t,
+                        (tok0 + erow) * H8 + c8_0 + q * 4,
+                        as_i32x4(r_o.to(BF16)),
+                        I32,
+                        4,
+                    )
+
+            # bf16 rescale of the HBM-staged x1: every thread takes 16 B units; with
+            # X1L > 0 only the columns past each warp's first X1L chunks are staged
+            RU = COLS_W // 8 - X1L * 4  # staged 16 B units per warp and token
+            RT = K_WARPS * RU if X1L else H8  # staged units per token
+
+            def hbm_unit(r_u, n_u):
+                """(token, column unit, element index) of staged unit r_u"""
+                r_live = r_u < n_u
+                tl_g = r_live.select(r_u // RT, I32(0))
+                if fx.const_expr(X1L > 0):
+                    r_j = r_u % RT
+                    c8 = (r_j // RU) * (COLS_W // 8) + X1L * 4 + r_j % RU
+                else:
+                    c8 = r_u % H8
+                return tl_g, c8, r_live.select((tok0 + tl_g) * H8 + c8, n_tok * H8)
+
+            def hbm_ld(idx):
+                return buf_copy_load(out_t, idx, I32, 4, cache_modifier=cm_fin)
+
+            def hbm_st(tl_g, c8, idx, xv):
+                r_wv = bf16x8(buf_copy_load(w_t, c8, I32, 4)).to(F32)
+                r_o = (bf16x8(xv).to(F32) * rstdn[tl_g]) * r_wv
+                buf_copy_store(out_t, idx, as_i32x4(r_o.to(BF16)), I32, 4)
+
+            def rescale_x1_hbm(rtid, NTHR):
+                n_u = rows_valid * RT
+                for r_it in range(
+                    I32(0), (n_u + NTHR * RS_G - 1) // (NTHR * RS_G), I32(1)
+                ):
+                    units, r_xv = [], []
+                    for g in range_constexpr(RS_G):
+                        u = hbm_unit((I32(r_it) * RS_G + g) * NTHR + rtid, n_u)
+                        units.append(u)
+                        r_xv.append(hbm_ld(u[2]))
+                    for g in range_constexpr(RS_G):
+                        hbm_st(units[g][0], units[g][1], units[g][2], r_xv[g])
+
+            # X1L > 0: the staged remainder is small (BM * RT units), so all of a
+            # thread's units are loaded up front and overlap the LDS part
+            NB = -(-BM * RT // THREADS)
+
+            def rescale_x1_split(rtid, NTHR):
+                n_u = rows_valid * RT
+                units, r_xv = [], []
+                if fx.const_expr(X1L < NQ):
+                    for g in range_constexpr(NB):
+                        u = hbm_unit(g * NTHR + rtid, n_u)
+                        units.append(u)
+                        r_xv.append(hbm_ld(u[2]))
+                rescale_x1_lds()
+                for g in range_constexpr(len(units)):
+                    hbm_st(units[g][0], units[g][1], units[g][2], r_xv[g])
+
             def finish_rescale(rtid, NTHR):
                 if fx.const_expr(OUT_FP8):
                     n_el = rows_valid * NG
@@ -892,31 +1074,10 @@ def compile_mega_mhc(
                         for g in range_constexpr(RS_G):
                             _put(osc_t, r_idx[g], r_sv[g] * rstdn[r_tl[g]])
                 else:
-                    n_u = rows_valid * H8
-                    for r_it in range(
-                        I32(0), (n_u + NTHR * RS_G - 1) // (NTHR * RS_G), I32(1)
-                    ):
-                        r_idx, r_tl, r_c8, r_xv = [], [], [], []
-                        for g in range_constexpr(RS_G):
-                            r_u = (I32(r_it) * RS_G + g) * NTHR + rtid
-                            r_live = r_u < n_u
-                            tl_g = r_live.select(r_u // H8, I32(0))
-                            r_tl.append(tl_g)
-                            r_c8.append(r_u % H8)
-                            r_idx.append(
-                                r_live.select((tok0 + tl_g) * H8 + r_c8[g], n_tok * H8)
-                            )
-                            r_xv.append(
-                                buf_copy_load(
-                                    out_t, r_idx[g], I32, 4, cache_modifier=cm_fin
-                                )
-                            )
-                        for g in range_constexpr(RS_G):
-                            r_wv = bf16x8(buf_copy_load(w_t, r_c8[g], I32, 4)).to(F32)
-                            r_o = (bf16x8(r_xv[g]).to(F32) * rstdn[r_tl[g]]) * r_wv
-                            buf_copy_store(
-                                out_t, r_idx[g], as_i32x4(r_o.to(BF16)), I32, 4
-                            )
+                    if fx.const_expr(X1L > 0):
+                        rescale_x1_split(rtid, NTHR)
+                    else:
+                        rescale_x1_hbm(rtid, NTHR)
 
             def finish():
                 if fx.const_expr(FIN_WARPS < W):
