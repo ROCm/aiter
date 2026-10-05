@@ -88,7 +88,9 @@ def batched_gemm_a16w8(
     assert Y.shape == (B, M, N) and Y.stride(2) == 1, "Output dimension error"
 
     if config is None:
-        config, _ = get_gemm_config("BATCHED_GEMM-A16W8", M, N, K, backend="gluon")
+        config, _ = get_gemm_config(
+            "BATCHED_GEMM-A16W8", M, N, K, backend="gluon", B=B
+        )
     BM = config["BLOCK_SIZE_M"]
     BN = config["BLOCK_SIZE_N"]
     BK = config["BLOCK_SIZE_K"]
