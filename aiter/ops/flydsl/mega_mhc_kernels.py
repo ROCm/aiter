@@ -34,6 +34,8 @@ MEGA_MHC_DEFAULTS = {
     "FN_PREPACKED": True,
     "SINKHORN_RCP": True,
     "X1_LDS_SLOTS": 0,
+    "PERSIST_WGS": 0,  # P4: >0 caps the grid; each WG walks token blocks w, w + G, ...
+    "PERSIST_PREFETCH": True,  # next block's first R/y tile loads during this block's last k-step
 }
 
 _TOKENS_CFG = {
@@ -47,6 +49,14 @@ _TOKENS_CFG = {
 
 _MAX_SPLIT = 20  # 40/80 splits measured no faster at decode (more partial rows)
 
+# P4 wave quantization (sweep/p4_persistent_overlap.md): a one-WG-per-CU kernel runs
+# ceil(blocks / CUs) rounds, and a nearly empty last round costs ~65% of a full one
+# (T = 4160: 180 us vs 111 us at T = 4096). A split-K kernel (items = blocks * KS) has
+# a 25% fixed overhead at exact fill but smooth cost, so it wins while the last
+# round of the KS = 1 kernel is less than FILL_MAX full. (NUM_KSPLIT, FILL_MAX)
+_QUANT_SPLIT_BF16 = (5, 0.73)
+_QUANT_SPLIT_FP8 = (10, 0.95)
+
 
 def get_mega_mhc_config(
     T: int, H: int, arch: str, cu_num: int, out_fp8: bool = False
@@ -59,6 +69,17 @@ def get_mega_mhc_config(
       Splits finish on one XCD (``COHERENCE="xcd"``), measured faster than the
       agent-scope path at every size. ``TILE_K=64`` (whole 128 B lines per k-step)
       wherever H divides, else 32.
+    * Wave quantization (P4, ``sweep/p4_persistent_overlap.md``): with ``NUM_KSPLIT == 1``
+      the grid is ``ceil(blocks / cu_num)`` rounds of one workgroup per CU and a nearly
+      empty last round still costs ~65% of a full one (T = 4160: 179 us vs 111 us at
+      4096). While the last round is less than 73% full (bf16) or 95% full (FP8) the
+      split-K kernel is smoother and wins: bf16 ``NUM_KSPLIT = 5`` (T = 2496..2944,
+      4160..5888, 8256..8704: -1.5% to -23%), FP8 ``NUM_KSPLIT = 10`` (T = 2560..3840,
+      4160..15360 off the exact multiples: -2% to -32%). FP8 grids that are (nearly)
+      exactly full and have two or more rounds (T = 8192, 12288) instead use the
+      persistent walk ``PERSIST_WGS = cu_num``: ``cu_num`` workgroups walk the blocks
+      and load the next block's first tile during the last k-step (-2.3% to -3.1%).
+      bf16 never walks: its 253-256 VGPR persistent kernel is 0.4-3.6% slower.
     * bf16 with ``NUM_KSPLIT == 1`` and more than ~0.6 * cu_num token blocks keeps
       each warp's first ``X1_LDS_SLOTS`` 32-column chunks of x1 in LDS for the
       finish instead of staging them in HBM and re-reading them (P3,
@@ -110,12 +131,29 @@ def get_mega_mhc_config(
     for k in range(1, _MAX_SPLIT + 1):
         if H % (k * w * 32) == 0 and nblk * k <= cu_num:
             ks = k
+    rounds = -(-nblk // cu_num)
+    fill = nblk / (rounds * cu_num)  # how full the last round of WGs is at KS = 1
+    persist = False
+    if ks == 1:
+        want, fill_max = _QUANT_SPLIT_FP8 if out_fp8 else _QUANT_SPLIT_BF16
+        # below ~0.6 * CUs blocks one round is latency-bound: a split does not pay
+        busy = (8 * nblk >= 5 * cu_num) if out_fp8 else (5 * nblk > 3 * cu_num)
+        if (rounds > 1 or busy) and fill < fill_max:
+            for k in (want, 5, 2):
+                if H % (k * w * 64) == 0:
+                    ks = k
+                    break
+        # an exactly filled FP8 grid walks its blocks in persistent workgroups: the
+        # next block's first tile loads before this one finishes (2.3-3.1% at 8192)
+        persist = out_fp8 and rounds > 1 and fill >= fill_max
     tk = 64 if H % (ks * w * 64) == 0 else 32
     cfg.update(
         BLOCK_M=16, NUM_KSPLIT=ks, TILE_K=tk, COHERENCE="xcd" if ks > 1 else "none"
     )
     if ks == 1 and not out_fp8 and 5 * nblk > 3 * cu_num:
         cfg["X1_LDS_SLOTS"] = max_x1_lds_slots(H, cfg)
+    if persist:
+        cfg.update(PERSIST_WGS=cu_num, PERSIST_PREFETCH=True)
     try:
         check_config(H, cfg)
     except ValueError:

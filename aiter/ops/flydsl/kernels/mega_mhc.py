@@ -49,6 +49,15 @@ rescales them straight out of LDS; only the remaining chunks take the HBM round
 trip. 160 KB of x1 does not fit in the 160 KB of LDS next to the 51 KB the kernel
 already uses, so n is at most 13 at H = 5120 with 8 warps (the policy uses 12: whole
 k-steps keep the staged remainder on 128 B lines).
+
+Persistent walk (``PERSIST_WGS`` = G > 0, ``NUM_KSPLIT == 1``, column-split warps). The
+grid is capped at G workgroups and workgroup w walks the token blocks w, w + G, ...
+(static stride, no counters or scratch). With ``PERSIST_PREFETCH`` the last k-step
+of a block issues the loads of the next block's k-step 0 instead of the dead
+out-of-range loads, and the tile rides through the block's reduce and finish as a
+loop-carried value. Net effect measured in ``sweep/p4_persistent_overlap.md``: FP8
+-2.3..-3.1% at two or three full rounds, bf16 (with the x1 LDS stage) 0.4-3.6% slower
+because the carried tile pushes the kernel to 253-256 VGPRs.
 """
 
 import functools
@@ -199,6 +208,11 @@ def check_config(H: int, cfg: dict) -> None:
         raise ValueError("NUM_KSPLIT=1 needs no coherence mode (use 'none')")
     if ks > 1 and coh == "none":
         raise ValueError("NUM_KSPLIT>1 needs COHERENCE 'xcd' or 'agent'")
+    if cfg.get("PERSIST_WGS", 0):
+        if cfg["PERSIST_WGS"] < 0:
+            raise ValueError("PERSIST_WGS must be >= 0")
+        if ws != "cols" or ks != 1:
+            raise ValueError("PERSIST_WGS needs WARP_SPLIT=cols and NUM_KSPLIT=1")
     nsl = cfg.get("X1_LDS_SLOTS", 0)
     if nsl:
         if ws != "cols" or ks != 1 or bm != 16:
@@ -228,6 +242,11 @@ def kernel_name(cfg: dict, has_post: bool, identity_pre: bool, out_fp8: bool) ->
         f"_pk{int(cfg['FN_PREPACKED'])}_rcp{int(cfg['SINKHORN_RCP'])}"
         f"_{mode}_{'fp8' if out_fp8 else 'bf16'}"
         + (f"_x1l{cfg['X1_LDS_SLOTS']}" if cfg.get("X1_LDS_SLOTS") else "")
+        + (
+            f"_pw{cfg['PERSIST_WGS']}{'p' if cfg.get('PERSIST_PREFETCH', True) else ''}"
+            if cfg.get("PERSIST_WGS")
+            else ""
+        )
     )
 
 
@@ -235,6 +254,8 @@ def grid_size(T: int, cfg: dict) -> tuple[int, int]:
     """(number of token blocks, number of workgroups) for T tokens."""
     nblk = -(-T // cfg["BLOCK_M"])
     ks = cfg["NUM_KSPLIT"]
+    if cfg.get("PERSIST_WGS"):
+        return nblk, min(nblk, cfg["PERSIST_WGS"])
     if cfg["COHERENCE"] == "xcd":
         return nblk, -(-nblk // 8) * 8 * ks
     return nblk, nblk * ks
@@ -260,6 +281,8 @@ def compile_mega_mhc(
     SINKHORN_ITERS: int,
     FP8_MAX: float = 448.0,
     X1_LDS_SLOTS: int = 0,
+    PERSIST_WGS: int = 0,
+    PERSIST_PREFETCH: bool = True,
 ):
     """Compile the Mega-mHC kernel for one knob set; returns the ``@flyc.jit`` launcher."""
     cfg = {
@@ -274,6 +297,8 @@ def compile_mega_mhc(
         "FN_PREPACKED": FN_PREPACKED,
         "SINKHORN_RCP": SINKHORN_RCP,
         "X1_LDS_SLOTS": X1_LDS_SLOTS,
+        "PERSIST_WGS": PERSIST_WGS,
+        "PERSIST_PREFETCH": PERSIST_PREFETCH,
     }
     check_config(H, cfg)
     assert H % FP8_GROUP == 0 and SINKHORN_ITERS >= 1
@@ -295,6 +320,11 @@ def compile_mega_mhc(
     # bf16 only: the first X1L chunks of every warp's x1 stay in LDS for the finish
     # instead of being staged in HBM and re-read (the FP8 finish never re-reads).
     X1L = 0 if OUT_FP8 else X1_LDS_SLOTS
+    # P4 persistent walk: the grid is capped at PERSIST_WGS workgroups, each walking
+    # the token blocks w, w + G, ...; PF: the next block's first R/y tile is loaded
+    # during this block's last k-step and carried through its reduce and finish.
+    PERSIST = PERSIST_WGS > 0
+    PF = PERSIST and PERSIST_PREFETCH
     X1_INTS = (WARPS_PER_WG * X1L + 1) * 256 if X1L else 4
     K4 = N_STREAMS * H
     H8 = H // 8
@@ -440,12 +470,21 @@ def compile_mega_mhc(
         )
         cnt_t = ptr_buf_tensor(counters, I32, num_records_bytes=fx.Int64(n_blk) * 128)
 
-        def body():
-            # LDS views are built here so they dominate every use in the body
+        def make_views():
             alloc = fx.SharedAllocator()
             lds = alloc.allocate(Smem).peek()
+            x1s = None
             if fx.const_expr(X1L > 0):
                 x1s = alloc.allocate(X1Smem).peek().x1s
+            return lds, x1s
+
+        def body(tok0, pre_tiles, pro=False, views=None):
+            # LDS views are built here (or by the persistent walk, once, before its
+            # loop) so they dominate every use in the body
+            if fx.const_expr(PERSIST):
+                lds, x1s = views
+            else:
+                lds, x1s = make_views()
             red = lds.red
             fin = lds.fin
             rstdn = lds.rstdn
@@ -496,16 +535,17 @@ def compile_mega_mhc(
             # dwordx4 is 16 coalesced 64 B segments. Only the bf16 R' MFMA A operand
             # is moved to the MFMA layout (row = lane % 16), through LDS.
             OOB = I32(0x7FFFFFFF)
-            v_r = erow * (K4 * 2) + ekg * 16  # residual / residual_out
-            v_y = erow * (H * 2) + ekg * 16  # sublayer / staged x1
+            tokv = erow  # (the descriptors are based at this block's first token)
+            v_r = tokv * (K4 * 2) + ekg * 16  # residual / residual_out
+            v_y = tokv * (H * 2) + ekg * 16  # sublayer / staged x1
             if fx.const_expr(FN_PREPACKED):
                 v_fn0 = lane * 16
                 v_fn1 = lane * 16
             else:
                 v_fn0 = row * (K4 * 4) + kg * 32
                 v_fn1 = (16 + row % 8) * (K4 * 4) + kg * 32
-            v_q = erow * H + ekg * 8
-            v_sc = (ekg == 0).select(erow * (NG * 4), OOB)
+            v_q = tokv * H + ekg * 8
+            v_sc = (ekg == 0).select(tokv * (NG * 4), OOB)
             v_w = ekg * 16
             # LDS transpose: lane e writes slot e, MFMA lane m reads slot (m%16)*4 + m//16
             xp_base = wi * (N_STREAMS * WAVE * 4)
@@ -547,10 +587,23 @@ def compile_mega_mhc(
                 """wave-uniform first column of chunk c of k-step iv"""
                 return col_w + iv * TILE_K + c * 32
 
+            if fx.const_expr(PF):
+                # the block this WG walks next: its tokens start G * BM rows later
+                step_rows = I32(fx.grid_dim.x) * BM
+                has_next = (tok0 + step_rows) < n_tok
+                v_r_nx = has_next.select(v_r + step_rows * (K4 * 2), OOB)
+                v_y_nx = has_next.select(v_y + step_rows * (H * 2), OOB)
+            else:
+                v_r_nx, v_y_nx = OOB, OOB
+
             def load_tile(iv, dead):
-                """R (and y) 16 B units of k-step iv; ``dead`` turns them into OOB no-ops."""
-                vr = dead.select(OOB, v_r)
-                vy = dead.select(OOB, v_y)
+                """R (and y) 16 B units of k-step iv; ``dead`` turns them into OOB no-ops
+                (PERSIST: into the next block's k-step 0, or into no-ops past the last).
+                """
+                vr = dead.select(v_r_nx, v_r)
+                vy = dead.select(v_y_nx, v_y)
+                if fx.const_expr(PF):
+                    iv = dead.select(I32(0), iv)
                 vals = []
                 for mt in range_constexpr(MT):
                     for c in range_constexpr(NC):
@@ -797,388 +850,422 @@ def compile_mega_mhc(
             acc0 = [Vec.filled(4, 0.0, F32) for _ in range_constexpr(2 * MT)]
             sq0 = [F32(0.0) for _ in range_constexpr(MT)]
             never_oob = I32(0) != I32(0)  # a "dead" flag that is always false
-            tiles0 = load_tile(I32(0), never_oob)
-            n_acc, n_sq, n_tiles = 2 * MT, MT, len(tiles0)
+            if fx.const_expr(PF and not pro):
+                tiles0 = [Vec(t) for t in pre_tiles]
+            else:
+                tiles0 = load_tile(I32(0), never_oob)
+            if fx.const_expr(pro):
+                ret = [Vec(t) for t in tiles0]
+            else:
+                n_acc, n_sq, n_tiles = 2 * MT, MT, len(tiles0)
 
-            def pack(acc, sqr, sqx, tiles):
-                return (
-                    [a.ir_value() for a in acc]
-                    + [F32(x).ir_value() for x in sqr]
-                    + [F32(x).ir_value() for x in sqx]
-                    + [Vec(t).ir_value() for t in tiles]
-                )
-
-            def unpack(state):
-                acc = [Vec(state[i]) for i in range_constexpr(n_acc)]
-                o = n_acc
-                sqr = [F32(state[o + i]) for i in range_constexpr(n_sq)]
-                o += n_sq
-                sqx = [F32(state[o + i]) for i in range_constexpr(n_sq)]
-                o += n_sq
-                tiles = [Vec(state[o + i]) for i in range_constexpr(n_tiles)]
-                return acc, sqr, sqx, tiles
-
-            def fn_glb(k, dead):
-                """this warp's share of k-step k's fn tile: ops wi, wi + W, ..."""
-                chunk0 = chunk_col(k, 0) // 32
-                regs = []
-                for j in range_constexpr(FN_PER_WARP):
-                    o = wi_u + j * W
-                    v = (dead | (o >= I32(NOPS))).select(OOB, v_fn0)
-                    regs.append(
-                        _ld(rs_fn, v, (chunk0 * NOPS // NC + o) * (WAVE * 16), 4, 0)
+                def pack(acc, sqr, sqx, tiles):
+                    return (
+                        [a.ir_value() for a in acc]
+                        + [F32(x).ir_value() for x in sqr]
+                        + [F32(x).ir_value() for x in sqx]
+                        + [Vec(t).ir_value() for t in tiles]
                     )
-                return regs
 
-            def fn_to_lds(regs, buf):
-                for j in range_constexpr(FN_PER_WARP):
-                    o = wi_u + j * W
-                    ptr = fx.add_offset(
-                        fnbuf.ptr, (buf * NOPS + o) * (WAVE * 4) + lane * 4
-                    )
-                    if fx.const_expr(NOPS % W == 0):
-                        fx.ptr_store(Vec(regs[j]).ir_value(), ptr)
-                    else:
-                        if o < I32(NOPS):
-                            fx.ptr_store(Vec(regs[j]).ir_value(), ptr)
+                def unpack(state):
+                    acc = [Vec(state[i]) for i in range_constexpr(n_acc)]
+                    o = n_acc
+                    sqr = [F32(state[o + i]) for i in range_constexpr(n_sq)]
+                    o += n_sq
+                    sqx = [F32(state[o + i]) for i in range_constexpr(n_sq)]
+                    o += n_sq
+                    tiles = [Vec(state[o + i]) for i in range_constexpr(n_tiles)]
+                    return acc, sqr, sqx, tiles
 
-            def fn_from_lds(buf):
-                return [
-                    Vec(
-                        fx.ptr_load(
-                            fx.add_offset(
-                                fnbuf.ptr, (buf * NOPS + o) * (WAVE * 4) + lane * 4
-                            ),
-                            T.vec(4, T.i32),
+                def fn_glb(k, dead):
+                    """this warp's share of k-step k's fn tile: ops wi, wi + W, ..."""
+                    chunk0 = chunk_col(k, 0) // 32
+                    regs = []
+                    for j in range_constexpr(FN_PER_WARP):
+                        o = wi_u + j * W
+                        v = (dead | (o >= I32(NOPS))).select(OOB, v_fn0)
+                        regs.append(
+                            _ld(rs_fn, v, (chunk0 * NOPS // NC + o) * (WAVE * 16), 4, 0)
                         )
-                    )
-                    for o in range_constexpr(NOPS)
-                ]
+                    return regs
 
-            # The current k-step's fn operands are issued before the next k-step's
-            # R/y prefetch: vmcnt is in order, so waiting for fn then also covers the
-            # current tiles while the prefetch stays in flight. The loop is unrolled
-            # by two with A/B tile buffers: a single carried buffer interferes with
-            # its own prefetch, and the back-edge copy then waits for that prefetch.
-            # With FN_LDS the next k-step's fn tile goes global -> regs -> LDS buffer
-            # 1 - buf behind one barrier per k-step.
-            def half(k, cur, acc, sqr, sqx, buf=0):
-                if fx.const_expr(FN_LDS):
-                    g = fn_glb(k + 1, k + 1 == I32(NK))
-                    nxt = load_tile(k + 1, k + 1 == I32(NK))
-                    fns = fn_from_lds(buf)
-                    acc, sqr, sqx = step(k, cur, fns, acc, sqr, sqx)
-                    fn_to_lds(g, 1 - buf)
-                    gpu.barrier()
-                else:
-                    fns = load_fn_all(k, never_oob, 1)
-                    nxt = load_tile(k + 1, k + 1 == I32(NK))
-                    acc, sqr, sqx = step(k, cur, fns, acc, sqr, sqx)
-                return nxt, acc, sqr, sqx
+                def fn_to_lds(regs, buf):
+                    for j in range_constexpr(FN_PER_WARP):
+                        o = wi_u + j * W
+                        ptr = fx.add_offset(
+                            fnbuf.ptr, (buf * NOPS + o) * (WAVE * 4) + lane * 4
+                        )
+                        if fx.const_expr(NOPS % W == 0):
+                            fx.ptr_store(Vec(regs[j]).ir_value(), ptr)
+                        else:
+                            if o < I32(NOPS):
+                                fx.ptr_store(Vec(regs[j]).ir_value(), ptr)
 
-            if fx.const_expr(FN_LDS):
-                fn_to_lds(fn_glb(I32(0), never_oob), 0)
-                gpu.barrier()
-            init = pack(acc0, sq0, sq0, tiles0)
-            results = init
-            for ip, state in range(I32(0), I32(NK // 2), I32(1), init=init):
-                acc, sqr, sqx, tiles_a = unpack(state)
-                k0 = I32(ip) * 2
-                tiles_b, acc, sqr, sqx = half(k0, tiles_a, acc, sqr, sqx, 0)
-                tiles_a, acc, sqr, sqx = half(k0 + 1, tiles_b, acc, sqr, sqx, 1)
-                results = yield pack(acc, sqr, sqx, tiles_a)
-            if fx.const_expr(NK % 2):
-                acc, sqr, sqx, tiles_a = unpack(results)
-                _, acc, sqr, sqx = half(I32(NK - 1), tiles_a, acc, sqr, sqx, 0)
-                results = pack(acc, sqr, sqx, tiles_a)
-            acc, sqr, sqx, _ = unpack(results)
-
-            # per-warp partials -> LDS red[slot][token][32]
-            for mt in range_constexpr(MT):
-                s_r = sqr[mt]
-                s_x = sqx[mt]
-                for off in (1, 2):
-                    s_r = s_r + s_r.shuffle_xor(off, WAVE)
-                    s_x = s_x + s_x.shuffle_xor(off, WAVE)
-                tl_base = tok_w - tok0 + mt * 16
-                for nt in range_constexpr(2):
-                    n = nt * 16 + row
-                    for i in range_constexpr(4):
-                        tl = tl_base + kg * 4 + i
-                        v = acc[mt * 2 + nt][i]
-                        if fx.const_expr(nt == 1):
-                            # rows 16..23: hi part in columns 0..7 + lo part in 8..15
-                            v = (row < 8).select(v + v.shuffle_xor(8, WAVE), F32(0.0))
-                            src = (
-                                kg * 4 + i
-                            ) * 4  # token t's sums sit on lanes 4t..4t+3
-                            r_t = F32(gpu.shuffle(s_r, src, WAVE, mode="idx"))
-                            x_t = F32(gpu.shuffle(s_x, src, WAVE, mode="idx"))
-                            v = (n == N_MIX).select(
-                                r_t, (n == N_MIX + 1).select(x_t, v)
+                def fn_from_lds(buf):
+                    return [
+                        Vec(
+                            fx.ptr_load(
+                                fx.add_offset(
+                                    fnbuf.ptr, (buf * NOPS + o) * (WAVE * 4) + lane * 4
+                                ),
+                                T.vec(4, T.i32),
                             )
-                        _put(red, (red_slot * BM + tl) * PSLOT + n, v)
-            gpu.barrier()
+                        )
+                        for o in range_constexpr(NOPS)
+                    ]
 
-            # --------------------------------------------------------- finish
-            def finish_gates_body():
-                for p in range_constexpr(FIN_PASSES):
-                    tl = p * (4 * W) + wi * 4 + kg
-                    tok = tok0 + tl
-                    e = row
-                    fb = tl * PSLOT
-                    m_e = fin[fb + e]
-                    m_c = fin[fb + 8 + e]
-                    s_r = fin[fb + N_MIX]
-                    s_x = fin[fb + N_MIX + 1]
-                    rstd = fx.rsqrt(s_r * F32(1.0 / K4) + rms_eps)
-                    sc = scale_t[(e < 8).select(e // 4, I32(0))]
-                    gate = sigmoid(m_e * rstd * sc + base_t[(e < 8).select(e, I32(0))])
-                    is_pre = e < 4
-                    is_post = (e >= 4) & (e < 8)
-                    n4 = n_tok * 4
-                    _put(preo_t, is_pre.select(tok * 4 + e, n4), gate + hc_pre_eps)
-                    _put(
-                        posto_t,
-                        is_post.select(tok * 4 + e - 4, n4),
-                        gate * hc_post_mult,
+                # The current k-step's fn operands are issued before the next k-step's
+                # R/y prefetch: vmcnt is in order, so waiting for fn then also covers the
+                # current tiles while the prefetch stays in flight. The loop is unrolled
+                # by two with A/B tile buffers: a single carried buffer interferes with
+                # its own prefetch, and the back-edge copy then waits for that prefetch.
+                # With FN_LDS the next k-step's fn tile goes global -> regs -> LDS buffer
+                # 1 - buf behind one barrier per k-step.
+                def half(k, cur, acc, sqr, sqx, buf=0):
+                    if fx.const_expr(FN_LDS):
+                        g = fn_glb(k + 1, k + 1 == I32(NK))
+                        nxt = load_tile(k + 1, k + 1 == I32(NK))
+                        fns = fn_from_lds(buf)
+                        acc, sqr, sqx = step(k, cur, fns, acc, sqr, sqx)
+                        fn_to_lds(g, 1 - buf)
+                        gpu.barrier()
+                    else:
+                        fns = load_fn_all(k, never_oob, 1)
+                        nxt = load_tile(k + 1, k + 1 == I32(NK))
+                        acc, sqr, sqx = step(k, cur, fns, acc, sqr, sqx)
+                    return nxt, acc, sqr, sqx
+
+                if fx.const_expr(FN_LDS):
+                    fn_to_lds(fn_glb(I32(0), never_oob), 0)
+                    gpu.barrier()
+                init = pack(acc0, sq0, sq0, tiles0)
+                results = init
+                for ip, state in range(I32(0), I32(NK // 2), I32(1), init=init):
+                    acc, sqr, sqx, tiles_a = unpack(state)
+                    k0 = I32(ip) * 2
+                    tiles_b, acc, sqr, sqx = half(k0, tiles_a, acc, sqr, sqx, 0)
+                    tiles_a, acc, sqr, sqx = half(k0 + 1, tiles_b, acc, sqr, sqx, 1)
+                    results = yield pack(acc, sqr, sqx, tiles_a)
+                if fx.const_expr(NK % 2):
+                    acc, sqr, sqx, tiles_a = unpack(results)
+                    tiles_n, acc, sqr, sqx = half(
+                        I32(NK - 1), tiles_a, acc, sqr, sqx, 0
                     )
-                    a = m_c * rstd * scale_t[2] + base_t[8 + e]
-                    mx = a
+                    if fx.const_expr(PERSIST):
+                        results = pack(acc, sqr, sqx, tiles_n)
+                    else:
+                        results = pack(acc, sqr, sqx, tiles_a)
+                acc, sqr, sqx, tiles_next = unpack(results)
+
+                # per-warp partials -> LDS red[slot][token][32]
+                for mt in range_constexpr(MT):
+                    s_r = sqr[mt]
+                    s_x = sqx[mt]
                     for off in (1, 2):
-                        mx = fx.maximumf(mx, mx.shuffle_xor(off, WAVE))
-                    P = exp(a - mx)
-                    rs = P
-                    for off in (1, 2):
-                        rs = rs + rs.shuffle_xor(off, WAVE)
-                    P = div(P, rs) + hc_sinkhorn_eps
-                    cs = P
-                    for off in (4, 8):
-                        cs = cs + cs.shuffle_xor(off, WAVE)
-                    P = div(P, cs + hc_sinkhorn_eps)
-                    for _ in range_constexpr(SINKHORN_ITERS - 1):
+                        s_r = s_r + s_r.shuffle_xor(off, WAVE)
+                        s_x = s_x + s_x.shuffle_xor(off, WAVE)
+                    tl_base = tok_w - tok0 + mt * 16
+                    for nt in range_constexpr(2):
+                        n = nt * 16 + row
+                        for i in range_constexpr(4):
+                            tl = tl_base + kg * 4 + i
+                            v = acc[mt * 2 + nt][i]
+                            if fx.const_expr(nt == 1):
+                                # rows 16..23: hi part in columns 0..7 + lo part in 8..15
+                                v = (row < 8).select(
+                                    v + v.shuffle_xor(8, WAVE), F32(0.0)
+                                )
+                                src = (
+                                    kg * 4 + i
+                                ) * 4  # token t's sums sit on lanes 4t..4t+3
+                                r_t = F32(gpu.shuffle(s_r, src, WAVE, mode="idx"))
+                                x_t = F32(gpu.shuffle(s_x, src, WAVE, mode="idx"))
+                                v = (n == N_MIX).select(
+                                    r_t, (n == N_MIX + 1).select(x_t, v)
+                                )
+                            _put(red, (red_slot * BM + tl) * PSLOT + n, v)
+                gpu.barrier()
+
+                # --------------------------------------------------------- finish
+                def finish_gates_body():
+                    for p in range_constexpr(FIN_PASSES):
+                        tl = p * (4 * W) + wi * 4 + kg
+                        tok = tok0 + tl
+                        e = row
+                        fb = tl * PSLOT
+                        m_e = fin[fb + e]
+                        m_c = fin[fb + 8 + e]
+                        s_r = fin[fb + N_MIX]
+                        s_x = fin[fb + N_MIX + 1]
+                        rstd = fx.rsqrt(s_r * F32(1.0 / K4) + rms_eps)
+                        sc = scale_t[(e < 8).select(e // 4, I32(0))]
+                        gate = sigmoid(
+                            m_e * rstd * sc + base_t[(e < 8).select(e, I32(0))]
+                        )
+                        is_pre = e < 4
+                        is_post = (e >= 4) & (e < 8)
+                        n4 = n_tok * 4
+                        _put(preo_t, is_pre.select(tok * 4 + e, n4), gate + hc_pre_eps)
+                        _put(
+                            posto_t,
+                            is_post.select(tok * 4 + e - 4, n4),
+                            gate * hc_post_mult,
+                        )
+                        a = m_c * rstd * scale_t[2] + base_t[8 + e]
+                        mx = a
+                        for off in (1, 2):
+                            mx = fx.maximumf(mx, mx.shuffle_xor(off, WAVE))
+                        P = exp(a - mx)
                         rs = P
                         for off in (1, 2):
                             rs = rs + rs.shuffle_xor(off, WAVE)
-                        P = div(P, rs + hc_sinkhorn_eps)
+                        P = div(P, rs) + hc_sinkhorn_eps
                         cs = P
                         for off in (4, 8):
                             cs = cs + cs.shuffle_xor(off, WAVE)
                         P = div(P, cs + hc_sinkhorn_eps)
-                    _put(combo_t, tok * 16 + e, P)
-                    _put(rstdn, tl, fx.rsqrt(s_x * F32(1.0 / H) + norm_eps))
+                        for _ in range_constexpr(SINKHORN_ITERS - 1):
+                            rs = P
+                            for off in (1, 2):
+                                rs = rs + rs.shuffle_xor(off, WAVE)
+                            P = div(P, rs + hc_sinkhorn_eps)
+                            cs = P
+                            for off in (4, 8):
+                                cs = cs + cs.shuffle_xor(off, WAVE)
+                            P = div(P, cs + hc_sinkhorn_eps)
+                        _put(combo_t, tok * 16 + e, P)
+                        _put(rstdn, tl, fx.rsqrt(s_x * F32(1.0 / H) + norm_eps))
 
-            RS_G = 4  # rescale units in flight per thread (16 measured slower)
-            # the finish only walks the token rows that exist (decode: T < BLOCK_M)
-            rows_valid = (n_tok - tok0 < I32(BM)).select(n_tok - tok0, I32(BM))
+                RS_G = 4  # rescale units in flight per thread (16 measured slower)
+                # the finish only walks the token rows that exist (decode: T < BLOCK_M)
+                rows_valid = (n_tok - tok0 < I32(BM)).select(n_tok - tok0, I32(BM))
 
-            # bf16 rescale of the x1 chunks this warp kept in LDS: lane-local, in the
-            # layout they were produced in (token erow, 8 columns ekg * 8 of a chunk)
-            def rescale_x1_lds():
-                rs_e = rstdn[erow]
-                c8_0 = col_w // 8 + ekg
-                base = wi_u * (X1L * 256) + lane * 4
-                xs, wv = [], []
-                for q in range_constexpr(X1L):
-                    xs.append(
-                        Vec(
-                            fx.ptr_load(
-                                fx.add_offset(x1s.ptr, base + q * 256), T.vec(4, T.i32)
+                # bf16 rescale of the x1 chunks this warp kept in LDS: lane-local, in the
+                # layout they were produced in (token erow, 8 columns ekg * 8 of a chunk)
+                def rescale_x1_lds():
+                    rs_e = rstdn[erow]
+                    c8_0 = col_w // 8 + ekg
+                    base = wi_u * (X1L * 256) + lane * 4
+                    xs, wv = [], []
+                    for q in range_constexpr(X1L):
+                        xs.append(
+                            Vec(
+                                fx.ptr_load(
+                                    fx.add_offset(x1s.ptr, base + q * 256),
+                                    T.vec(4, T.i32),
+                                )
                             )
                         )
-                    )
-                    wv.append(buf_copy_load(w_t, c8_0 + q * 4, I32, 4))
-                for q in range_constexpr(X1L):
-                    r_o = (bf16x8(xs[q]).to(F32) * rs_e) * bf16x8(wv[q]).to(F32)
-                    buf_copy_store(
-                        out_t,
-                        (tok0 + erow) * H8 + c8_0 + q * 4,
-                        as_i32x4(r_o.to(BF16)),
-                        I32,
-                        4,
-                    )
+                        wv.append(buf_copy_load(w_t, c8_0 + q * 4, I32, 4))
+                    for q in range_constexpr(X1L):
+                        r_o = (bf16x8(xs[q]).to(F32) * rs_e) * bf16x8(wv[q]).to(F32)
+                        buf_copy_store(
+                            out_t,
+                            (tok0 + erow) * H8 + c8_0 + q * 4,
+                            as_i32x4(r_o.to(BF16)),
+                            I32,
+                            4,
+                        )
 
-            # bf16 rescale of the HBM-staged x1: every thread takes 16 B units; with
-            # X1L > 0 only the columns past each warp's first X1L chunks are staged
-            RU = COLS_W // 8 - X1L * 4  # staged 16 B units per warp and token
-            RT = K_WARPS * RU if X1L else H8  # staged units per token
+                # bf16 rescale of the HBM-staged x1: every thread takes 16 B units; with
+                # X1L > 0 only the columns past each warp's first X1L chunks are staged
+                RU = COLS_W // 8 - X1L * 4  # staged 16 B units per warp and token
+                RT = K_WARPS * RU if X1L else H8  # staged units per token
 
-            def hbm_unit(r_u, n_u):
-                """(token, column unit, element index) of staged unit r_u"""
-                r_live = r_u < n_u
-                tl_g = r_live.select(r_u // RT, I32(0))
-                if fx.const_expr(X1L > 0):
-                    r_j = r_u % RT
-                    c8 = (r_j // RU) * (COLS_W // 8) + X1L * 4 + r_j % RU
-                else:
-                    c8 = r_u % H8
-                return tl_g, c8, r_live.select((tok0 + tl_g) * H8 + c8, n_tok * H8)
+                def hbm_unit(r_u, n_u):
+                    """(token, column unit, element index) of staged unit r_u"""
+                    r_live = r_u < n_u
+                    tl_g = r_live.select(r_u // RT, I32(0))
+                    if fx.const_expr(X1L > 0):
+                        r_j = r_u % RT
+                        c8 = (r_j // RU) * (COLS_W // 8) + X1L * 4 + r_j % RU
+                    else:
+                        c8 = r_u % H8
+                    return tl_g, c8, r_live.select((tok0 + tl_g) * H8 + c8, n_tok * H8)
 
-            def hbm_ld(idx):
-                return buf_copy_load(out_t, idx, I32, 4, cache_modifier=cm_fin)
+                def hbm_ld(idx):
+                    return buf_copy_load(out_t, idx, I32, 4, cache_modifier=cm_fin)
 
-            def hbm_st(tl_g, c8, idx, xv):
-                r_wv = bf16x8(buf_copy_load(w_t, c8, I32, 4)).to(F32)
-                r_o = (bf16x8(xv).to(F32) * rstdn[tl_g]) * r_wv
-                buf_copy_store(out_t, idx, as_i32x4(r_o.to(BF16)), I32, 4)
+                def hbm_st(tl_g, c8, idx, xv):
+                    r_wv = bf16x8(buf_copy_load(w_t, c8, I32, 4)).to(F32)
+                    r_o = (bf16x8(xv).to(F32) * rstdn[tl_g]) * r_wv
+                    buf_copy_store(out_t, idx, as_i32x4(r_o.to(BF16)), I32, 4)
 
-            def rescale_x1_hbm(rtid, NTHR):
-                n_u = rows_valid * RT
-                for r_it in range(
-                    I32(0), (n_u + NTHR * RS_G - 1) // (NTHR * RS_G), I32(1)
-                ):
+                def rescale_x1_hbm(rtid, NTHR):
+                    n_u = rows_valid * RT
+                    for r_it in range(
+                        I32(0), (n_u + NTHR * RS_G - 1) // (NTHR * RS_G), I32(1)
+                    ):
+                        units, r_xv = [], []
+                        for g in range_constexpr(RS_G):
+                            u = hbm_unit((I32(r_it) * RS_G + g) * NTHR + rtid, n_u)
+                            units.append(u)
+                            r_xv.append(hbm_ld(u[2]))
+                        for g in range_constexpr(RS_G):
+                            hbm_st(units[g][0], units[g][1], units[g][2], r_xv[g])
+
+                # X1L > 0: the staged remainder is small (BM * RT units), so all of a
+                # thread's units are loaded up front and overlap the LDS part
+                NB = -(-BM * RT // THREADS)
+
+                def rescale_x1_split(rtid, NTHR):
+                    n_u = rows_valid * RT
                     units, r_xv = [], []
-                    for g in range_constexpr(RS_G):
-                        u = hbm_unit((I32(r_it) * RS_G + g) * NTHR + rtid, n_u)
-                        units.append(u)
-                        r_xv.append(hbm_ld(u[2]))
-                    for g in range_constexpr(RS_G):
+                    if fx.const_expr(X1L < NQ):
+                        for g in range_constexpr(NB):
+                            u = hbm_unit(g * NTHR + rtid, n_u)
+                            units.append(u)
+                            r_xv.append(hbm_ld(u[2]))
+                    rescale_x1_lds()
+                    for g in range_constexpr(len(units)):
                         hbm_st(units[g][0], units[g][1], units[g][2], r_xv[g])
 
-            # X1L > 0: the staged remainder is small (BM * RT units), so all of a
-            # thread's units are loaded up front and overlap the LDS part
-            NB = -(-BM * RT // THREADS)
-
-            def rescale_x1_split(rtid, NTHR):
-                n_u = rows_valid * RT
-                units, r_xv = [], []
-                if fx.const_expr(X1L < NQ):
-                    for g in range_constexpr(NB):
-                        u = hbm_unit(g * NTHR + rtid, n_u)
-                        units.append(u)
-                        r_xv.append(hbm_ld(u[2]))
-                rescale_x1_lds()
-                for g in range_constexpr(len(units)):
-                    hbm_st(units[g][0], units[g][1], units[g][2], r_xv[g])
-
-            def finish_rescale(rtid, NTHR):
-                if fx.const_expr(OUT_FP8):
-                    n_el = rows_valid * NG
-                    for r_it in range(
-                        I32(0), (n_el + NTHR * RS_G - 1) // (NTHR * RS_G), I32(1)
-                    ):
-                        r_idx, r_tl, r_sv = [], [], []
-                        for g in range_constexpr(RS_G):
-                            r_u = (I32(r_it) * RS_G + g) * NTHR + rtid
-                            r_live = r_u < n_el
-                            tl_g = r_live.select(r_u // NG, I32(0))
-                            r_tl.append(tl_g)
-                            r_idx.append(
-                                r_live.select((tok0 + tl_g) * NG + r_u % NG, n_tok * NG)
-                            )
-                            r_sv.append(
-                                buf_copy_load(
-                                    osc_t, r_idx[g], F32, 1, cache_modifier=cm_fin
+                def finish_rescale(rtid, NTHR):
+                    if fx.const_expr(OUT_FP8):
+                        n_el = rows_valid * NG
+                        for r_it in range(
+                            I32(0), (n_el + NTHR * RS_G - 1) // (NTHR * RS_G), I32(1)
+                        ):
+                            r_idx, r_tl, r_sv = [], [], []
+                            for g in range_constexpr(RS_G):
+                                r_u = (I32(r_it) * RS_G + g) * NTHR + rtid
+                                r_live = r_u < n_el
+                                tl_g = r_live.select(r_u // NG, I32(0))
+                                r_tl.append(tl_g)
+                                r_idx.append(
+                                    r_live.select(
+                                        (tok0 + tl_g) * NG + r_u % NG, n_tok * NG
+                                    )
                                 )
-                            )
-                        for g in range_constexpr(RS_G):
-                            _put(osc_t, r_idx[g], r_sv[g] * rstdn[r_tl[g]])
-                else:
-                    if fx.const_expr(X1L > 0):
-                        rescale_x1_split(rtid, NTHR)
+                                r_sv.append(
+                                    buf_copy_load(
+                                        osc_t, r_idx[g], F32, 1, cache_modifier=cm_fin
+                                    )
+                                )
+                            for g in range_constexpr(RS_G):
+                                _put(osc_t, r_idx[g], r_sv[g] * rstdn[r_tl[g]])
                     else:
-                        rescale_x1_hbm(rtid, NTHR)
+                        if fx.const_expr(X1L > 0):
+                            rescale_x1_split(rtid, NTHR)
+                        else:
+                            rescale_x1_hbm(rtid, NTHR)
 
-            def finish():
-                if fx.const_expr(FIN_WARPS < W):
-                    if wi < I32(FIN_WARPS):
+                def finish():
+                    if fx.const_expr(FIN_WARPS < W):
+                        if wi < I32(FIN_WARPS):
+                            finish_gates_body()
+                    else:
                         finish_gates_body()
-                else:
-                    finish_gates_body()
-                gpu.barrier()
-                finish_rescale(tid, THREADS)
-
-            if fx.const_expr(KS == 1):
-                for it in range_constexpr(BM * PSLOT // THREADS):
-                    e = it * THREADS + tid
-                    v = red[e]
-                    for s in range_constexpr(1, K_WARPS):
-                        v = v + red[s * BM * PSLOT + e]
-                    _put(fin, e, v)
-                gpu.barrier()
-                finish()
-            else:
-                for it in range_constexpr(BM * PSLOT // THREADS):
-                    e = it * THREADS + tid
-                    v = red[e]
-                    for s in range_constexpr(1, K_WARPS):
-                        v = v + red[s * BM * PSLOT + e]
-                    tl = e // PSLOT
-                    _put(part_t, ((tok0 + tl) * KS + ks) * PSLOT + e % PSLOT, v)
-                rocdl.s_waitcnt(vmcnt=0)
-                gpu.barrier()
-                if tid == I32(0):
-                    if fx.const_expr(COHERENCE == "agent"):
-                        fx.llvm.memory_fence(
-                            syncscope=rocdl.SyncScope.Agent,
-                            ordering=fx.AtomicOrdering.Release,
-                        )
-                    else:
-                        # the splits share this XCD's L2 (L1 is write-through)
-                        fx.llvm.memory_fence(
-                            syncscope=rocdl.SyncScope.Workgroup,
-                            ordering=fx.AtomicOrdering.Release,
-                        )
-                    cnt_ptr = fx.inttoptr(
-                        fx.PointerType.get(T.i32, fx.AddressSpace.Global, 4),
-                        buf_base_i64(counters) + fx.Int64(blk) * 128,
-                    )
-                    old = fx.llvm.atomic_add(
-                        cnt_ptr,
-                        I32(1),
-                        syncscope=rocdl.SyncScope.Agent,
-                        ordering=fx.AtomicOrdering.Monotonic,
-                    )
-                    _put(flag, 0, old)
-                gpu.barrier()
-                if flag[0] == I32(KS - 1):
-                    if fx.const_expr(COHERENCE == "agent"):
-                        fx.llvm.memory_fence(
-                            syncscope=rocdl.SyncScope.Agent,
-                            ordering=fx.AtomicOrdering.Acquire,
-                        )
-                    else:
-                        fx.llvm.memory_fence(
-                            syncscope=rocdl.SyncScope.Workgroup,
-                            ordering=fx.AtomicOrdering.Acquire,
-                        )
-                    # thread (g, u): sums splits k = g, g + KGROUPS, ... of unit u
-                    g_id = tid // UNITS
-                    u_lo = tid % UNITS
-                    for up in range_constexpr(UPASS):
-                        u = u_lo + up * THREADS
-                        tl = u // (PSLOT // 4)
-                        q4 = u % (PSLOT // 4)
-                        if g_id < I32(KGROUPS):
-                            acc4 = Vec.filled(4, 0.0, F32)
-                            for k in range_constexpr(-(-KS // KGROUPS)):
-                                kk = g_id + k * KGROUPS
-                                live = kk < I32(KS)
-                                uidx = ((tok0 + tl) * KS + kk) * (PSLOT // 4) + q4
-                                uidx = live.select(uidx, n_tok * (KS * PSLOT // 4))
-                                acc4 = acc4 + buf_copy_load(
-                                    part4_t, uidx, F32, 4, cache_modifier=cm_fin
-                                )
-                            for i in range_constexpr(4):
-                                _put(red, (g_id * UNITS + u) * 4 + i, acc4[i])
                     gpu.barrier()
+                    finish_rescale(tid, THREADS)
+
+                if fx.const_expr(KS == 1):
                     for it in range_constexpr(BM * PSLOT // THREADS):
                         e = it * THREADS + tid
                         v = red[e]
-                        for gg in range_constexpr(1, KGROUPS):
-                            v = v + red[gg * UNITS * 4 + e]
+                        for s in range_constexpr(1, K_WARPS):
+                            v = v + red[s * BM * PSLOT + e]
                         _put(fin, e, v)
                     gpu.barrier()
                     finish()
+                else:
+                    for it in range_constexpr(BM * PSLOT // THREADS):
+                        e = it * THREADS + tid
+                        v = red[e]
+                        for s in range_constexpr(1, K_WARPS):
+                            v = v + red[s * BM * PSLOT + e]
+                        tl = e // PSLOT
+                        _put(part_t, ((tok0 + tl) * KS + ks) * PSLOT + e % PSLOT, v)
+                    rocdl.s_waitcnt(vmcnt=0)
+                    gpu.barrier()
                     if tid == I32(0):
-                        _put(cnt_t, blk * 32, I32(0))
+                        if fx.const_expr(COHERENCE == "agent"):
+                            fx.llvm.memory_fence(
+                                syncscope=rocdl.SyncScope.Agent,
+                                ordering=fx.AtomicOrdering.Release,
+                            )
+                        else:
+                            # the splits share this XCD's L2 (L1 is write-through)
+                            fx.llvm.memory_fence(
+                                syncscope=rocdl.SyncScope.Workgroup,
+                                ordering=fx.AtomicOrdering.Release,
+                            )
+                        cnt_ptr = fx.inttoptr(
+                            fx.PointerType.get(T.i32, fx.AddressSpace.Global, 4),
+                            buf_base_i64(counters) + fx.Int64(blk) * 128,
+                        )
+                        old = fx.llvm.atomic_add(
+                            cnt_ptr,
+                            I32(1),
+                            syncscope=rocdl.SyncScope.Agent,
+                            ordering=fx.AtomicOrdering.Monotonic,
+                        )
+                        _put(flag, 0, old)
+                    gpu.barrier()
+                    if flag[0] == I32(KS - 1):
+                        if fx.const_expr(COHERENCE == "agent"):
+                            fx.llvm.memory_fence(
+                                syncscope=rocdl.SyncScope.Agent,
+                                ordering=fx.AtomicOrdering.Acquire,
+                            )
+                        else:
+                            fx.llvm.memory_fence(
+                                syncscope=rocdl.SyncScope.Workgroup,
+                                ordering=fx.AtomicOrdering.Acquire,
+                            )
+                        # thread (g, u): sums splits k = g, g + KGROUPS, ... of unit u
+                        g_id = tid // UNITS
+                        u_lo = tid % UNITS
+                        for up in range_constexpr(UPASS):
+                            u = u_lo + up * THREADS
+                            tl = u // (PSLOT // 4)
+                            q4 = u % (PSLOT // 4)
+                            if g_id < I32(KGROUPS):
+                                acc4 = Vec.filled(4, 0.0, F32)
+                                for k in range_constexpr(-(-KS // KGROUPS)):
+                                    kk = g_id + k * KGROUPS
+                                    live = kk < I32(KS)
+                                    uidx = ((tok0 + tl) * KS + kk) * (PSLOT // 4) + q4
+                                    uidx = live.select(uidx, n_tok * (KS * PSLOT // 4))
+                                    acc4 = acc4 + buf_copy_load(
+                                        part4_t, uidx, F32, 4, cache_modifier=cm_fin
+                                    )
+                                for i in range_constexpr(4):
+                                    _put(red, (g_id * UNITS + u) * 4 + i, acc4[i])
+                        gpu.barrier()
+                        for it in range_constexpr(BM * PSLOT // THREADS):
+                            e = it * THREADS + tid
+                            v = red[e]
+                            for gg in range_constexpr(1, KGROUPS):
+                                v = v + red[gg * UNITS * 4 + e]
+                            _put(fin, e, v)
+                        gpu.barrier()
+                        finish()
+                        if tid == I32(0):
+                            _put(cnt_t, blk * 32, I32(0))
+                if fx.const_expr(PERSIST):
+                    ret = [Vec(t) for t in tiles_next]
+                else:
+                    ret = None
+            return ret
 
-        if fx.const_expr(COHERENCE == "xcd"):
+        if fx.const_expr(PERSIST):
+            views = make_views()
+            n_g = I32(fx.grid_dim.x)
+            t_pro = body(tok0, None, True, views)  # block w's k-step 0 tile
+            n_t = len(t_pro)
+            for b, st_p in range(
+                w_id, n_blk, n_g, init=[Vec(t).ir_value() for t in t_pro]
+            ):
+                tiles_c = [Vec(st_p[i]) for i in range_constexpr(n_t)]
+                t_nx = body(I32(b) * BM, tiles_c, False, views)
+                _ = yield [Vec(t).ir_value() for t in t_nx]
+        elif fx.const_expr(COHERENCE == "xcd"):
             # the XCD mapping pads the grid to whole groups of 8 token blocks
             if tok0 < n_tok:
-                body()
+                body(tok0, None)
         else:
-            body()
+            body(tok0, None)
 
     @flyc.jit
     def launch_mega_mhc(
