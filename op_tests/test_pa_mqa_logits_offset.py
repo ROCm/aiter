@@ -490,7 +490,13 @@ def test_paged_mqa_logits_2d_context_lens(entry: str) -> None:
         )
         return out
 
-    assert torch.equal(run(row_lens), run(seq_lens))
+    expected = run(seq_lens)
+    assert torch.equal(run(row_lens), expected)
+    assert torch.equal(run(seq_lens[:, None]), expected)
+    assert torch.equal(run(row_lens[:, -1]), expected)
+    for bad in (row_lens[:-1], row_lens.t().contiguous().t()):
+        with pytest.raises(ValueError):
+            run(bad)
 
 
 @pytest.mark.skipif(

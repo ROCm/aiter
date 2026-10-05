@@ -80,13 +80,20 @@ else:
     enable_jit_gluon_pa_mqa_logits_kernel = False
 
 
-def _context_len_stride(context_lens: torch.Tensor) -> int:
+def _context_lens_and_stride(context_lens: torch.Tensor, batch_size: int):
     # The kernels read sequence b's length at b * stride + stride - 1: element b
     # of [B], or the last entry of row b of a contiguous (B, n) per-row table.
     if context_lens.dim() == 1:
-        return 1
-    assert context_lens.dim() == 2 and context_lens.is_contiguous()
-    return context_lens.shape[1]
+        return context_lens.contiguous(), 1
+    if (
+        context_lens.dim() != 2
+        or not context_lens.is_contiguous()
+        or context_lens.shape[0] < batch_size
+    ):
+        raise ValueError(
+            "context_lens must be [B] or a contiguous [B, n] with at least B rows"
+        )
+    return context_lens, context_lens.shape[1]
 
 
 def deepgemm_fp8_paged_mqa_logits_ragged_k(
@@ -216,6 +223,8 @@ def deepgemm_fp8_paged_mqa_logits_stage1(
         f"got q hidden_dim={hidden_dim} and packed KV dim={packed_dim}."
     )
 
+    context_lens, ctx_stride = _context_lens_and_stride(context_lens, batch_size)
+
     TileQCount = batch_size * next_n * (heads // ChunkQ)
     SplitKV = (max(1, TotalCuCount // TileQCount) + 4) // 5 * 5 * WavePerEU
 
@@ -262,7 +271,7 @@ def deepgemm_fp8_paged_mqa_logits_stage1(
         waves_per_eu=WavePerEU,
         **config,
         KVBlockSize=block_size,
-        ContextLenStride=_context_len_stride(context_lens),
+        ContextLenStride=ctx_stride,
     )
 
 
@@ -457,6 +466,7 @@ def deepgemm_fp8_paged_mqa_logits_schedule(
     grid = (TotalCuCount * schedule_waves_per_eu, 1, 1)
     TryCount = math.ceil(max_chunks / grid[0])
     align_power_of_2_batch = 1 << (batch_size - 1).bit_length()
+    context_lens, ctx_stride = _context_lens_and_stride(context_lens, batch_size)
 
     safe_chunks_per_cta = torch.empty(
         (1,),
@@ -472,7 +482,7 @@ def deepgemm_fp8_paged_mqa_logits_schedule(
         align_power_of_2_batch,
         TryCount,
         waves_per_eu=schedule_waves_per_eu,
-        ContextLenStride=_context_len_stride(context_lens),
+        ContextLenStride=ctx_stride,
     )
     return safe_chunks_per_cta
 
@@ -497,7 +507,7 @@ def deepgemm_fp8_paged_mqa_logits(
     batch_size, next_n, heads, hidden_dim = q_fp8.size()
     _, block_Size, _, index_dim = kv_cache.size()
     _, max_block_len = kv_indices.size()
-    ctx_stride = _context_len_stride(context_lens)
+    context_lens, ctx_stride = _context_lens_and_stride(context_lens, batch_size)
 
     if get_gfx() == "gfx1250":
         if Preshuffle and hidden_dim <= 128:
