@@ -200,17 +200,54 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
         + gl.arange(0, ChunkQ, layout=layout_scale),
     )
 
+    # Bound the prologue prefetch in BOTH directions. The lower bound keeps
+    # the residual_context look-back in range; the upper bounds -- the
+    # request's context_length and the block-table row capacity
+    # (max_block_len * KVBlockSize pools) -- keep the first chunk's prefetch
+    # from reading past the row's valid kv_indices columns, so a garbage
+    # physical block id can never reach the KV_buffer dereference below.
+    # In-contract the window tops out at split_context_length and these never
+    # mask a valid lane; they only fire for an out-of-contract context_length,
+    # which the wrapper does not validate.
     mask_kv_next = (
-        split_context_start
-        - residual_context
-        + gl.arange(0, ChunkK, layout=gl.SliceLayout(1, layout_kv))
-        >= 0
+        (
+            split_context_start
+            - residual_context
+            + gl.arange(0, ChunkK, layout=gl.SliceLayout(1, layout_kv))
+            >= 0
+        )
+        & (
+            split_context_start
+            - residual_context
+            + gl.arange(0, ChunkK, layout=gl.SliceLayout(1, layout_kv))
+            < context_length
+        )
+        & (
+            split_context_start
+            - residual_context
+            + gl.arange(0, ChunkK, layout=gl.SliceLayout(1, layout_kv))
+            < max_block_len * KVBlockSize
+        )
     )
     mask_kv_scale_next = (
-        split_context_start
-        - residual_context
-        + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))
-        >= 0
+        (
+            split_context_start
+            - residual_context
+            + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))
+            >= 0
+        )
+        & (
+            split_context_start
+            - residual_context
+            + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))
+            < context_length
+        )
+        & (
+            split_context_start
+            - residual_context
+            + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))
+            < max_block_len * KVBlockSize
+        )
     )
     # Preserve scalar-first address arithmetic for per-token paging. Grouping
     # the token offsets first increases register pressure on that path.
@@ -288,6 +325,35 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
         k = k_next
         k_scale_f = k_scale_f_next
 
+        # Prefetch masks: bound the next chunk's pool positions by both the
+        # request's context_length and the block-table row capacity, and force
+        # out-of-window lanes to block 0. In-contract the window tops out at
+        # split_context_length and the masks never fire; with them, an
+        # out-of-contract context_length (which the wrapper does not
+        # validate) can only ever read block 0, never a garbage block id
+        # dereferenced into KV_buffer.
+        mask_kv_next_loop = (
+            context_idx
+            + ChunkK
+            + gl.arange(0, ChunkK, layout=gl.SliceLayout(1, layout_kv))
+            < context_length
+        ) & (
+            context_idx
+            + ChunkK
+            + gl.arange(0, ChunkK, layout=gl.SliceLayout(1, layout_kv))
+            < max_block_len * KVBlockSize
+        )
+        mask_kv_scale_next_loop = (
+            context_idx
+            + ChunkK
+            + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))
+            < context_length
+        ) & (
+            context_idx
+            + ChunkK
+            + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))
+            < max_block_len * KVBlockSize
+        )
         kv_table_offsets = (
             pid_batch * max_block_len
             + context_idx
@@ -306,6 +372,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
         context_kv_idx_next = gl.amd.cdna3.buffer_load(
             ptr=kv_indices,
             offsets=kv_table_offsets,
+            mask=mask_kv_next_loop,
         )
         scale_table_offsets = (
             pid_batch * max_block_len
@@ -323,7 +390,11 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
                 pid_batch * max_block_len + logical_kv_scale_idx_next // KVBlockSize
             )
         context_kv_scale_idx_next = gl.amd.cdna3.buffer_load(
-            ptr=kv_indices, offsets=scale_table_offsets
+            ptr=kv_indices, offsets=scale_table_offsets, mask=mask_kv_scale_next_loop
+        )
+        context_kv_idx_next = tl.where(mask_kv_next_loop, context_kv_idx_next, 0)
+        context_kv_scale_idx_next = tl.where(
+            mask_kv_scale_next_loop, context_kv_scale_idx_next, 0
         )
 
         #!=----------------------------
