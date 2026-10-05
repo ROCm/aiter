@@ -152,12 +152,6 @@ def clamp_grid_cap(
 #   TP2  ST=1 everywhere.
 #   TP4  ST=8 everywhere.
 #   TP8  ST=1 up to 768 KiB then ST=8.
-#
-_MESH_DEFAULT = {
-    2: ((0, 1, 128, BLOCK, False),),
-    4: ((0, 8, 128, BLOCK, False),),
-    8: ((0, 1, 128, BLOCK, False), (768 << 10, 8, 128, BLOCK, False)),
-}
 #  ``(min_bytes, super_tile, grid_cap, block, skip_self)``
 MESH_ST_LADDER = {
     ("xgmi", 2): ((0, 1, 128, 256, True), (4 << 20, 1, 128, 512, True)),
@@ -169,7 +163,7 @@ MESH_ST_LADDER = {
     ),
     ("pcie", 2): ((0, 1, 128, 256, True), (4 << 20, 8, 128, 512, True)),
     ("pcie", 4): ((0, 1, 128, 256, True), (768 << 10, 8, 128, 512, True)),
-    ("pcie", 8): ((0, 1, 128, 256, True), (96 << 10, 8, 128, 512, True)),
+    ("pcie", 8): ((0, 8, 128, 512, True),),
 }
 
 
