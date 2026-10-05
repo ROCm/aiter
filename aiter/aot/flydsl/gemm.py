@@ -213,7 +213,7 @@ def _bmm_mfma_job(
         "m": 1,
         "n": n,
         "k": k,
-        "cu_num": 0,  # the gfx column names the arch
+        "cu_num": int(row.get("cu_num") or 0),
         "gfx": row.get("gfx", "").strip(),
         "b": b,
         # A table from before the column holds only 128x128 rows (as at runtime).
