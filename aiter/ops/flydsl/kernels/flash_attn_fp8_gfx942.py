@@ -113,11 +113,16 @@ def plan_num_kv_splits(num_seqs, max_seqlen_k, num_kv_heads, window, head_dim):
     """Decode split count, fitted to MI325X sweeps (batch 1-256, context
     0.5K-32K): about 128K / head_dim split waves in all, and at least
     head_dim / 128 tiles per split, since each split's partial costs a
-    query group's worth of head_dim floats."""
+    query group's worth of head_dim floats. Below 128 waves the GPU is nearly
+    idle, and half that many tiles per split is faster."""
     keys = max_seqlen_k if window is None else min(max_seqlen_k, window)
     tiles = max(1, (keys + NK - 1) // NK)
     units = num_seqs * num_kv_heads
-    return max(1, min((1 << 17) // head_dim // units, tiles * 128 // head_dim))
+    want = (1 << 17) // head_dim // units
+    splits = min(want, tiles * 128 // head_dim)
+    if splits * units < 128:
+        splits = min(want, tiles * 256 // head_dim)
+    return max(1, splits)
 
 
 def prefill_block_q(num_q_heads, num_kv_heads):
@@ -841,9 +846,12 @@ def build_flash_attn_fp8_gfx942_combine_module(dim, num_q_heads):
 
     Part holds dim floats (scaled by V's descale), then m and l, per (seq,
     head, split), padded to dim + 4 floats. Multi-token sequences are skipped.
+    Splits merge eight at a time, all eight loaded before any is merged: the
+    merge is cheap and the load latency is not.
     """
     stride = dim + 4
     vecs = dim // 256
+    unroll = 8
 
     @flyc.kernel(known_block_size=(64, 1, 1))
     def combine(Part: fx.Tensor, O: fx.Tensor, CuQ: fx.Tensor, num_splits: fx.Int32):
@@ -861,28 +869,59 @@ def build_flash_attn_fp8_gfx942_combine_module(dim, num_q_heads):
         init = [fx.Float32(-1.0e30), fx.Float32(0.0)] + [
             fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(vecs)
         ]
-        for s, state in range(fx.Int32(0), trips, fx.Int32(1), init=init):
-            base = (row + fx.Int64(fx.Int32(s))) * stride
-            m_s = fx.Float32(_load(pp, (base + dim) * 4, T.f32, 4))
-            l_s = fx.Float32(_load(pp, (base + dim + 1) * 4, T.f32, 4))
-            m_old = fx.Float32(state[0])
-            m_new = fx.maxnumf(m_old, m_s)
-            a = _exp2(m_old - m_new)
-            b = _exp2(m_s - m_new)
-            va = fx.Vector.filled(4, a, fx.Float32)
-            vb = fx.Vector.filled(4, b, fx.Float32)
-            accs = []
-            for i in range_constexpr(vecs):
-                o_s = fx.Vector(
-                    _load(
-                        pp,
-                        (base + fx.Int64(lane * (4 * vecs) + 4 * i)) * 4,
-                        fx.Vector.make_type(4, fx.Float32),
-                        16,
+        for sg, state in range(
+            fx.Int32(0), (trips + unroll - 1) // unroll, fx.Int32(1), init=init
+        ):
+            s0 = fx.Int32(sg) * unroll
+            ml, os_ = [], []
+            rocdl.sched_barrier(0)
+            for u in range_constexpr(unroll):
+                # Past the last split, reload it; its max is masked to -inf below.
+                s = s0 + u
+                base = (row + fx.Int64((s < trips).select(s, trips - 1))) * stride
+                ml.append(
+                    fx.Vector(
+                        _load(
+                            pp, (base + dim) * 4, fx.Vector.make_type(2, fx.Float32), 8
+                        )
                     )
                 )
-                accs.append(fx.Vector(state[2 + i]) * va + o_s * vb)
-            result = yield [m_new, fx.Float32(state[1]) * a + l_s * b] + accs
+                os_.append(
+                    [
+                        fx.Vector(
+                            _load(
+                                pp,
+                                (base + fx.Int64(lane * (4 * vecs) + 4 * i)) * 4,
+                                fx.Vector.make_type(4, fx.Float32),
+                                16,
+                            )
+                        )
+                        for i in range(vecs)
+                    ]
+                )
+            # Without the barrier the scheduler interleaves the merge into the
+            # loads and reuses their registers, waiting out each load in turn.
+            rocdl.sched_barrier(0)
+            m_old = fx.Float32(state[0])
+            m_s = [
+                (s0 + u < trips).select(ml[u][0], fx.Float32(float("-inf")))
+                for u in range(unroll)
+            ]
+            m_new = m_old
+            for u in range_constexpr(unroll):
+                m_new = fx.maxnumf(m_new, m_s[u])
+            a = _exp2(m_old - m_new)
+            w = [_exp2(m_s[u] - m_new) for u in range(unroll)]
+            l_new = fx.Float32(state[1]) * a
+            accs = [
+                fx.Vector(state[2 + i]) * fx.Vector.filled(4, a, fx.Float32)
+                for i in range(vecs)
+            ]
+            for u in range_constexpr(unroll):
+                l_new = l_new + ml[u][1] * w[u]
+                vw = fx.Vector.filled(4, w[u], fx.Float32)
+                accs = [accs[i] + os_[u][i] * vw for i in range(vecs)]
+            result = yield [m_new, l_new] + accs
         if is_decode:
             inv = 1.0 / fx.Float32(result[1])
             words = []

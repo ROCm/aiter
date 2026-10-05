@@ -12,6 +12,7 @@ covers warm JIT-cache reuse, not wheel AOT packaging.
 import argparse
 import importlib.util
 import itertools
+import math
 import os
 import sys
 from functools import partial
@@ -34,6 +35,8 @@ PAGE = 64
 SHAPES = {"full": (512, 32, 4, None), "sliding": (256, 32, 16, 1024)}
 # Max |err| against the oracle, as a fraction of max |ref|.
 TOLERANCE = 0.04
+# Speed-vs-Triton column: FlyDSL time over Triton time, below 1.0 is faster.
+RATIO = "flydsl / triton"
 # One-token sequences at the decode boundaries, plus a (0, 0) padding entry.
 DECODE_QUERY_LENS = [1] * 8 + [0]
 DECODE_KV_LENS = [1, 65, 1023, 1024, 1025, 2047, 4097, 8192, 0]
@@ -486,8 +489,24 @@ def test_speed_vs_triton(shape, workload):
         kv_lens,
         atol=2 * TOLERANCE * want.abs().max().item(),
     )
-    ret["flydsl / triton"] = ret["flydsl us"] / ret["triton us"]
+    ret[RATIO] = ret["flydsl us"] / ret["triton us"]
     return ret
+
+
+def with_geomean(df):
+    """Append the geometric-mean time ratio per shape and over every row."""
+
+    def geomean(ratios):
+        return math.exp(ratios.map(math.log).mean())
+
+    means = [
+        {"shape": shape, "workload": "geomean", RATIO: geomean(rows[RATIO])}
+        for shape, rows in df.groupby("shape", sort=False)
+    ]
+    means.append({"shape": "all", "workload": "geomean", RATIO: geomean(df[RATIO])})
+    df = pd.concat([df, pd.DataFrame(means)], ignore_index=True)
+    # None, unlike NaN, prints as an empty cell.
+    return df.astype(object).where(df.notna(), None)
 
 
 def main():
@@ -572,8 +591,12 @@ def main():
     for name, fn, parameters in sweeps:
         rows = [fn(*values) for values in parameters]
         df = pd.DataFrame(rows)
+        if RATIO in df:
+            df = with_geomean(df)
         aiter.logger.info(
-            "%s summary (markdown):\n%s", name, df.to_markdown(index=False)
+            "%s summary (markdown):\n%s",
+            name,
+            df.to_markdown(index=False, missingval=""),
         )
     aiter.logger.info(
         "PASS: all unified-attention test groups; all candidate timings non-zero"

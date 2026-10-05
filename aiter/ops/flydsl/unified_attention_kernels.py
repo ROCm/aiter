@@ -208,16 +208,11 @@ def _supported(
 
 
 def _cede_to_triton(head_size, max_seqlen_q, num_seqs, max_seqlen_k) -> bool:
-    """Tiny head-512 decode-only batches stay on Triton: up to 4K keys in all
-    and 2K per sequence (batch 1-2 to 2K, batch 4 at 1K), where launch latency
-    dominates and Triton is 1.0-1.3x faster on MI325X. Every other batch is
-    faster here and is served."""
-    return (
-        head_size == 512
-        and max_seqlen_q == 1
-        and max_seqlen_k <= 2048
-        and num_seqs * max_seqlen_k <= 4096
-    )
+    """Tiny head-512 decode-only batches, up to 2K keys in all (batch 1 to 2K,
+    batch 2 at 1K), stay on Triton: launch latency dominates there, and Triton
+    is 1.04-1.17x faster on MI325X. Every other batch is faster here and is
+    served."""
+    return head_size == 512 and max_seqlen_q == 1 and num_seqs * max_seqlen_k <= 2048
 
 
 def _as_i8(t: torch.Tensor) -> torch.Tensor:
