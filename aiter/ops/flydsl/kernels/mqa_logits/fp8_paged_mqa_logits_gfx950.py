@@ -528,12 +528,12 @@ def flydsl_fp8_paged_mqa_logits(
         raise ValueError(f"out_logits first dimension must be {batch_size * next_n}")
 
     ctx_stride = context_lens.shape[1] if context_lens.dim() == 2 else 1
-    if (
-        not context_lens.is_contiguous()
-        or context_lens.numel() != batch_size * ctx_stride
-    ):
-        raise ValueError("context_lens must be contiguous [B] or [B, n]")
-    context_lens = context_lens.reshape(-1)
+    if ctx_stride == 1:
+        context_lens = context_lens.reshape(batch_size).contiguous()
+    elif context_lens.is_contiguous() and context_lens.shape[0] == batch_size:
+        context_lens = context_lens.reshape(-1)
+    else:
+        raise ValueError("a [B, n] context_lens must be contiguous with B rows")
     max_block_len = kv_indices.shape[-1]
     kv_indices = kv_indices.reshape(batch_size, max_block_len)
     has_next_n_lens = next_n_lens is not None
