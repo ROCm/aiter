@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 
-"""FP8 paged-attention decode with BF16/FP16 queries on gfx942/gfx950.
+"""FP8 paged-attention decode with BF16/FP16 or FP8 queries on gfx942/gfx950.
 
 Cache layouts are logical, not preshuffled. K/V use E4M3 FNUZ on gfx942 and
 OCP on gfx950. See ``kernels.pa_decode_kernel`` for Q/P quantization and
@@ -208,11 +208,14 @@ def pa_decode(
     sliding_window: int = 0,
     work_plan: PADecodePlan | None = None,
 ) -> None:
-    """Decode FP8 K/V with BF16/FP16 queries using 256-token compute tiles.
+    """Decode FP8 K/V with BF16/FP16 or FP8 queries using 256-token compute tiles.
 
     Supports page sizes 16/64/128 and head_dim 64 or multiples of 128 up to 1024.
     K/V scales are [1] or [num_blocks, num_kv_heads, block_size, 1].
-    ALiBi and externally quantized queries are unsupported.
+    FP8 queries use the cache dtype and require a single-element FP32 device
+    ``query_scale`` descale. The existing ``output`` tensor selects BF16/FP16
+    output for FP8 Q; 16-bit Q retains output.dtype == query.dtype and does not
+    accept query_scale. ALiBi is unsupported.
 
     MTP lengths include the query tokens and use dense causal masking.
     Independently selected sparse queries need separate table rows and
@@ -238,10 +241,6 @@ def pa_decode(
         raise NotImplementedError(
             "pa_decode only supports context_partition_size=256, "
             f"got {context_partition_size}"
-        )
-    if query_scale is not None:
-        raise NotImplementedError(
-            "pa_decode does not support externally quantized FP8 queries"
         )
     if alibi_slopes is not None:
         raise NotImplementedError("pa_decode does not support ALiBi")
@@ -403,13 +402,31 @@ def pa_decode(
         raise TypeError(f"context_lengths must be int32, got {context_lengths.dtype}")
     query_group_size = num_q_heads // num_kv_heads
     max_blocks_per_seq = block_tables.shape[1]
-    if query.dtype == torch.bfloat16:
+    fp8_query = query.dtype == expected_fp8_dtype
+    if fp8_query:
+        query_dtype = "fp8"
+        if not isinstance(query_scale, torch.Tensor):
+            raise TypeError("FP8 query_scale must be a torch.Tensor")
+        if query_scale.dtype != torch.float32:
+            raise TypeError("FP8 query_scale must be float32")
+        if query_scale.numel() != 1:
+            raise ValueError("FP8 query_scale must contain one element")
+        if query_scale.device != query.device:
+            raise ValueError("query_scale must be on the same device as query")
+        if output.dtype not in (torch.bfloat16, torch.float16):
+            raise TypeError("FP8 query requires bfloat16 or float16 output")
+    elif query.dtype == torch.bfloat16:
         query_dtype = "bf16"
     elif query.dtype == torch.float16:
         query_dtype = "f16"
     else:
-        raise TypeError(f"pa_decode only supports f16/bf16 query, got {query.dtype}")
-    if output.dtype != query.dtype:
+        raise TypeError(
+            f"pa_decode only supports f16/bf16 or {expected_fp8_dtype} query, "
+            f"got {query.dtype}"
+        )
+    if not fp8_query and query_scale is not None:
+        raise NotImplementedError("query_scale is only supported for FP8 queries")
+    if not fp8_query and output.dtype != query.dtype:
         raise TypeError(
             "pa_decode requires output.dtype == query.dtype, "
             f"got {output.dtype} vs {query.dtype}"
@@ -574,6 +591,7 @@ def pa_decode(
             num_partitions=num_partitions,
             softmax_scale=softmax_scale,
             query_dtype=query_dtype,
+            output_dtype=get_dtype_str(output.dtype),
             per_token_kv=per_token_kv,
             query_length=query_length,
             trans_v=trans_v,
@@ -685,6 +703,7 @@ def pa_decode(
                 else flyc.from_c_void_p(fx.Int32, 0)
             ),
             work_plan.capacity if work_plan is not None else 0,
+            *([ptr_arg(query_scale, fx.Float32)] if fp8_query else []),
             s,
         )
         if num_partitions > 1 or work_plan is not None:

@@ -11,13 +11,11 @@ import argparse
 import csv
 import os
 import sys
-from contextlib import nullcontext
 
 import torch
 
 sys.path.insert(0, os.getcwd())
 import aiter.ops.unified_attention as ua
-from scripts.bench_decode_ab_splitk import force_decode_ctx
 from scripts.bench_decode_mixed_shuffled import (
     build_shuffled_full,
     ref_paged_attn,
@@ -32,10 +30,7 @@ REPLAYS = 50
 
 
 def invoke(kw, backend):
-    with force_decode_ctx() if backend == "flydsl" else nullcontext():
-        return ua.unified_attention(
-            **kw, backend=None if backend == "default" else backend
-        )
+    return ua.unified_attention(**kw, backend=None if backend == "default" else backend)
 
 
 def check_output(kw, output, want, backend):

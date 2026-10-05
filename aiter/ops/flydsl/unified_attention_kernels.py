@@ -14,10 +14,8 @@ config, falling through to Triton unchanged (matches
 ``ops/gemm_op_a8w8.py``) -- deliberately no dispatch env var (the routing is a
 code gate on arch/shape). Automatic routing is enabled only when the call's
 ``q.device`` is
-a full-chip gfx950. Two env knobs govern dispatch: the split-count cap,
-``AITER_UNIFIED_ATTN_MAX_KV_SPLITS`` (see ``_MAX_SEGMENTS``), and
-``AITER_DECODE_KERNEL``, the decode-kernel on/off master switch (see
-``_USE_DECODE_KERNEL``).
+a full-chip gfx950. One env knob governs dispatch: the split-count cap,
+``AITER_UNIFIED_ATTN_MAX_KV_SPLITS`` (see ``_MAX_SEGMENTS``).
 
 Two tiers chosen at call time from the machine-fill deficit (``_split_count``
 and the gate in ``flydsl_unified_attention``), not from all-decode-ness: an
@@ -41,10 +39,6 @@ from functools import cache, lru_cache
 import torch
 
 from .kernels.flash_attn_dualwave_common import dualwave_splitk_workspace_elems
-from .kernels.flash_attn_fp8_decode_gfx950 import (
-    build_flash_attn_fp8_decode_module,
-    plan_num_kv_splits,
-)
 from .kernels.flash_attn_fp8_gfx950 import build_flash_attn_dualwave_swp_fp8_module
 
 __all__ = ["flydsl_unified_attention"]
@@ -148,8 +142,7 @@ _SPLIT_MIN_DECODE_KV = 6144
 # (query_len=1, 16:1) a BLOCK_M=256 tile has only 16 live M-rows, and that
 # wasted per-tile compute is exposed at 1 WG/CU. Above this KV-read-volume
 # quantum the exposure dominates and Triton wins; split-K does not recover
-# it. NOTE: gates only the LEGACY prefill-body decode path; the decode
-# kernel cedes in _decode_dispatch_action.
+# it. NOTE: gates only the prefill-body decode path.
 _DECODE_CEDE_WORK = 65536
 
 
@@ -239,126 +232,63 @@ def _get_kernel(
     )
 
 
-# ===========================================================================
-# Decode dispatch gates. All decode routing/cede thresholds live here so
-# retuning is a one-line edit. See _decode_dispatch_action for how they
-# combine.
-# ===========================================================================
-def _env_use_decode_kernel(default: bool = True) -> bool:
-    """Defensive parse of AITER_DECODE_KERNEL, the enabled-by-default master
-    switch for the BLOCK_M=16 multi-wave + register-V + split-K decode path.
-
-    Mirrors ``_env_max_kv_splits``: a bad value (non-integer, e.g. ``true``/
-    ``on``/empty) must not abort import. The importer in unified_attention.py
-    catches only ImportError, so a bare ``int(...)`` raising ValueError here
-    would take down the whole public op rather than falling back to Triton.
-    """
-    raw = os.environ.get("AITER_DECODE_KERNEL")
-    if raw is None:
-        return default
-    try:
-        return bool(int(raw))
-    except ValueError:
-        return default
-
-
-# GQA group size the decode-specialized kernel is built for (BLOCK_M=16).
+# GQA group size pa_decode is built for.
 _DECODE_GQA = 16
-# Master on/off; AITER_DECODE_KERNEL=0 forces the legacy prefill-body/cede path.
-_USE_DECODE_KERNEL = _env_use_decode_kernel()
-# Conservative cede band: mid-batch x deep-context is the near-parity/loss
-# region vs Triton on gfx950, so cede the whole band to guarantee no
-# regression. Retune against production traces.
-_DECODE_CEDE_MIN_SEQS = 9  # below: machine underfills, split-K decode wins
-_DECODE_CEDE_MAX_SEQS = 48  # above (incl. b=64): batch fills the machine, wins
-_DECODE_CEDE_MIN_KV = 8192  # shallower context always wins on the decode kernel
+
+# FlyDSL pa_decode route for all-decode calls on the shuffled fp8 KV cache. The
+# partition count is a host-only static rule (no planner, no device sync).
+_PA_DECODE_TILE = 256  # pa_decode's fixed context_partition_size
+_PA_DECODE_MAX_NP = 32
+# Target workgroups per CU for one launch. Measured best on gfx950 for both
+# pa_decode tile variants: 144 VGPRs with wide KV addressing (3 WGs/CU resident)
+# and 114 VGPRs without (4 resident). More WGs per CU adds partitions and reduce
+# work without raising in-flight loads.
+_PA_DECODE_WGS_PER_CU = 3
 
 
-def _decode_dispatch_action(
-    max_seqlen_q,
-    num_queries_per_kv,
-    sinks,
-    window_size,
-    softcap,
-    num_seqs,
-    max_seqlen_k,
-    from_split,
-    causal,
-):
-    """Single decode-dispatch decision: ``"route"`` the decode-specialized
-    kernel, ``"cede"`` to Triton, or ``"legacy"`` (fall through to the
-    prefill-body path). The one place all decode gates and thresholds live."""
-    if not _USE_DECODE_KERNEL:
-        return "legacy"
-    # only all-decode (single query token) is a candidate for this kernel
-    if max_seqlen_q != 1:
-        return "legacy"
-    # decode kernel supports only GQA-16:1 fp8, no sinks/window/softcap
-    if (
-        num_queries_per_kv != _DECODE_GQA
-        or sinks is not None
-        or (window_size is not None and window_size != (-1, -1))
-        or (softcap is not None and softcap != 0.0)
-    ):
-        return "legacy"
-    # cede the mid-batch x deep-context loss band (see constants). Never cede a
-    # decode half reached via the mixed split -- the split drops its return value
-    # on the invariant that a decode sub-call always serves. Only a PERFORMANCE
-    # cede, so never take it for non-causal: Triton's fallback is causal-only,
-    # and FlyDSL already builds and supports the non-causal binary.
-    if (
-        causal
-        and not from_split
-        and _DECODE_CEDE_MIN_SEQS <= num_seqs <= _DECODE_CEDE_MAX_SEQS
-        and max_seqlen_k >= _DECODE_CEDE_MIN_KV
-    ):
-        return "cede"
-    return "route"
+def _env_use_pa_decode(default: bool = True) -> bool:
+    raw = os.environ.get("AITER_UNIFIED_ATTN_PA_DECODE")
+    return default if raw is None else raw == "1"
 
 
-@lru_cache(maxsize=64)
-def _get_decode_kernel(
-    num_heads: int,
-    num_kv_heads: int,
-    causal: bool,
-    out_dtype_str: str,
-    shuffled_kv_cache: bool,
-    num_kv_splits: int,
-):
-    """Build (and cache) the decode-specialized fp8 launcher.
+_USE_PA_DECODE = _env_use_pa_decode()
 
-    Separate memo from ``_get_kernel``: this is a different kernel body (BLOCK_M
-    =16 multi-wave + register-V + split-K combine), so its binary must never
-    alias the prefill body's. The builder's own ``_cache_tag`` keys the JIT disk
-    cache on ``(out_dtype, layout, varlen, causal, H, HKV, nw, splk)``; this
-    ``lru_cache`` is the process-level memo one layer up, keyed on the same
-    distinguishing fields plus the split count so linear/vectorized and each S
-    get distinct closures.
-    """
-    return build_flash_attn_fp8_decode_module(
-        num_heads=num_heads,
-        head_dim=_HEAD_DIM,
-        num_kv_heads=num_kv_heads,
-        causal=causal,
-        dtype_str="fp8",
-        out_dtype_str=out_dtype_str,
-        varlen=True,
-        paged=True,
-        kv_cache_layout="vectorized" if shuffled_kv_cache else "linear",
-        num_kv_splits=num_kv_splits,
+
+def _pa_decode_num_partitions(
+    num_seqs: int, num_kv_heads: int, max_seqlen_k: int, num_cus: int
+) -> int:
+    """Static partition count NP: split each sequence into about
+    three workgroups per CU across the GPU, but never less than one 256-token
+    tile per partition. Python ints only."""
+    fit = _PA_DECODE_WGS_PER_CU * num_cus // (num_seqs * num_kv_heads)
+    hi = min(-(-max_seqlen_k // _PA_DECODE_TILE), _PA_DECODE_MAX_NP)
+    return max(1, min(fit, hi))
+
+
+def _pa_decode_ok(
+    max_seqlen_q, num_queries_per_kv, sinks, shuffled_kv_cache, out, num_seqs
+) -> bool:
+    """Layout/dtype gate on top of _supported (which already pins fp8 QKV,
+    5D shuffled strides, page 64, D128, int32 index tensors, no softcap/alibi)."""
+    return (
+        _USE_PA_DECODE
+        and max_seqlen_q == 1
+        and shuffled_kv_cache
+        and num_queries_per_kv == _DECODE_GQA
+        and sinks is None
+        and out.dtype in (torch.bfloat16, torch.float16)
+        and num_seqs > 0
     )
 
 
-def _route_decode_kernel(
+def _route_pa_decode(
     q,
     k,
     v,
     out,
-    cu_seqlens_q,
     seqused_k,
     max_seqlen_k,
     softmax_scale,
-    causal,
     block_table,
     q_descale,
     k_descale,
@@ -366,60 +296,39 @@ def _route_decode_kernel(
     *,
     num_kv_heads,
     num_seqs,
-    shuffled_kv_cache,
 ):
-    """Marshal an all-decode call to the decode-specialized kernel and run it.
+    """All-decode call -> FlyDSL pa_decode with fp8 Q. seqused_k is already the
+    per-sequence context length, so no cumulative-offset conversion is needed."""
+    from .pa_decode import pa_decode
 
-    Host-computes the fill-aware split S (``plan_num_kv_splits``), builds/caches
-    the matching binary, and forwards through the kernel's own ``mod`` wrapper
-    (which allocates the split-K workspace internally). K/V are passed as raw
-    base pointers into the contiguous paged pool; the kernel rebases a
-    per-page BufferDesc from the block table and indexes only within that page
-    (see the "Per-page buffer rebasing" comment in the kernel launch below),
-    since a >= 2**31-element production pool cannot be addressed as one
-    whole-pool memref with a flat ``page_id * PAGE_REGION`` offset. q_descale
-    folds the softmax scale exactly as the prefill path does. Returns ``out``
-    written in place.
-    """
-    assert (
-        k.is_contiguous() and v.is_contiguous()
-    ), "decode route requires contiguous K/V"
-    num_query_heads = q.shape[1]
-    out_dtype_str = "f16" if out.dtype == torch.float16 else "bf16"
-    npages = (int(max_seqlen_k) + _PAGE_SIZE - 1) // _PAGE_SIZE
-    num_kv_splits = plan_num_kv_splits(
-        num_seqs,
-        num_kv_heads,
-        npages,
-        target_wg=_target_num_prgms(q.device.index),
-        s_max=_MAX_SEGMENTS,
+    hq, d = q.shape[1], q.shape[2]
+    np_ = _pa_decode_num_partitions(
+        num_seqs, num_kv_heads, int(max_seqlen_k), _target_num_prgms(q.device.index)
     )
-    with torch.cuda.device(q.device.index):
-        mod = _get_decode_kernel(
-            num_query_heads,
-            num_kv_heads,
-            causal,
-            out_dtype_str,
-            shuffled_kv_cache,
-            num_kv_splits,
-        )
-        mod(
-            q.reshape(-1),
-            # K/V pass as base pointers only: the kernel rebases a BufferDesc per
-            # page from the block table (int32-safe within-page voffset), so the
-            # 2 GB (2**31-element) production pool needs no whole-pool memref.
+    shape = (num_seqs, num_kv_heads, np_, hq // num_kv_heads)
+    dev = q.device
+    exp_sums = torch.empty(shape, dtype=torch.float32, device=dev)
+    max_logits = torch.empty(shape, dtype=torch.float32, device=dev)
+    tmp_out = torch.empty((*shape, d), dtype=out.dtype, device=dev)
+    with torch.cuda.device(dev.index):
+        pa_decode(
+            out,
+            q,
             k,
             v,
-            out.reshape(-1),
-            num_seqs,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_kv=_cu_seqlens_kv(seqused_k, num_seqs),
-            block_table=block_table.reshape(-1),
-            block_table_stride=int(block_table.stride(0)),
-            q_descale=_scaled_q_descale(q_descale, softmax_scale, q.shape[-1]),
-            k_descale=k_descale,
-            v_descale=v_descale,
-            stream=torch.cuda.current_stream(q.device),
+            seqused_k,
+            block_table.contiguous(),
+            float(softmax_scale),
+            1,
+            np_,
+            _PA_DECODE_TILE,
+            _FP8_DTYPE,
+            q_descale.reshape(-1),
+            k_descale.reshape(-1),
+            v_descale.reshape(-1),
+            exp_sums,
+            max_logits,
+            tmp_out,
         )
     return out
 
@@ -863,40 +772,23 @@ def flydsl_unified_attention(
     ):
         return None
 
-    # Decode-specialized kernel: the all-decode region routes to the
-    # BLOCK_M=16 multi-wave + register-V + split-K decode body. All gates and
-    # thresholds live in _decode_dispatch_action (see that block).
-    _decode_action = _decode_dispatch_action(
-        max_seqlen_q,
-        num_queries_per_kv,
-        sinks,
-        window_size,
-        softcap,
-        num_seqs,
-        max_seqlen_k,
-        _from_split,
-        bool(causal),
-    )
-    if _decode_action == "cede":
-        return None
-    if _decode_action == "route":
-        return _route_decode_kernel(
+    if _pa_decode_ok(
+        max_seqlen_q, num_queries_per_kv, sinks, shuffled_kv_cache, out, num_seqs
+    ):
+        return _route_pa_decode(
             q,
             k,
             v,
             out,
-            cu_seqlens_q,
             seqused_k,
             max_seqlen_k,
             softmax_scale,
-            bool(causal),
             block_table,
             q_descale,
             k_descale,
             v_descale,
             num_kv_heads=num_kv_heads,
             num_seqs=num_seqs,
-            shuffled_kv_cache=shuffled_kv_cache,
         )
 
     # Cede the pure-decode region FlyDSL loses to Triton (return None -> caller

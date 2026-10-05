@@ -95,6 +95,7 @@ class DecodeCase:
     masked_scale: bool = False
     query_splits: int | None = None
     wide_kv_addressing: bool | None = None
+    fp8_query: bool = False
 
 
 def _require_gpu():
@@ -129,6 +130,7 @@ def run_torch(
     query_length=1,
     sliding_window=0,
     sinks=None,
+    query_scale=None,
 ):
     """Dequantized FP32 GQA reference, including empty rows and infinite sinks."""
     batch = context_lengths.numel()
@@ -136,6 +138,8 @@ def run_torch(
     kv_heads, page_size = key_cache.shape[1:3]
     group = heads // kv_heads
     queries = query.float().reshape(batch, query_length, kv_heads, group, dim)
+    if query_scale is not None:
+        queries = queries * query_scale
     output = torch.zeros_like(queries)
     positions = torch.arange(query_length, device=query.device)
 
@@ -184,6 +188,13 @@ def _make_inputs(case, planned=False):
     query = torch.empty((batch * ql, heads, dim), dtype=case.dtype).uniform_(-0.5, 0.5)
     if case.masked_scale:
         query.zero_()  # Exercise zero-scale Q quantization.
+    query_scale = None
+    if case.fp8_query:
+        query, query_scale = per_tensor_quant(query, quant_dtype=quant_dtype)
+        # Non-unit descales must remain device values, including graph replay.
+        query_scale *= 3.0
+        if ql == 1:
+            query_scale = query_scale.reshape(())
     key = torch.empty((num_pages, kv_heads, page, dim), dtype=case.dtype).uniform_(
         -0.5, 0.5
     )
@@ -308,7 +319,7 @@ def _make_inputs(case, planned=False):
     pmax = torch.full_like(psum, float("nan"))
     pout = torch.full((*shape, dim), float("nan"), dtype=case.dtype)
     args = (
-        torch.full_like(query, float("nan")),
+        torch.full(query.shape, float("nan"), dtype=case.dtype),
         query,
         key_cache,
         value_cache,
@@ -319,7 +330,7 @@ def _make_inputs(case, planned=False):
         parts,
         KV_COMPUTE_BLOCK,
         quant_dtype,
-        None,
+        query_scale,
         key_scale,
         value_scale,
         psum,
@@ -341,6 +352,7 @@ def _make_inputs(case, planned=False):
         query_length=ql,
         sliding_window=case.sliding_window,
         sinks=sinks,
+        query_scale=query_scale,
     )
     return args, options, reference
 
@@ -408,6 +420,22 @@ def _assert_plan(plan, lengths):
 def _assert_contracts(args, options):
     """Reuse numerical inputs for API validation."""
     heads = args[1].shape[1]
+    if args[11] is not None:
+        for invalid, error in [
+            (None, TypeError),
+            (1.0, TypeError),
+            (torch.ones(1, dtype=torch.float16), TypeError),
+            (torch.ones(2, dtype=torch.float32), ValueError),
+            (torch.ones(1, dtype=torch.float32, device="cpu"), ValueError),
+        ]:
+            with pytest.raises(error, match="query_scale"):
+                pa_decode(*args[:11], invalid, *args[12:], **options)
+        for dtype in (args[1].dtype, torch.float32):
+            with pytest.raises(TypeError, match="output"):
+                pa_decode(torch.empty(args[0].shape, dtype=dtype), *args[1:], **options)
+    else:
+        with pytest.raises(NotImplementedError, match="query_scale"):
+            pa_decode(*args[:11], torch.ones(1), *args[12:], **options)
     for invalid, error in [
         ([0.0] * heads, TypeError),
         (torch.zeros(1, heads), ValueError),
@@ -870,6 +898,67 @@ CASES = [
 ]
 
 
+CASES += [
+    _case(
+        f"fp8-q-p{page}-q{ql}-token{int(per_token)}",
+        (ql, 1, 16, 128),
+        (page, int(ql == 1), int(per_token)),
+        parts=1 if ql == 1 else 3,
+        lengths=(0, 1, 3, 259, 1027),
+        dtype=BF16 if ql == 1 else FP16,
+        fp8_query=True,
+    )
+    for page, ql, per_token in itertools.product((16, 64, 128), (1, 4), (False, True))
+]
+CASES += [
+    _case(
+        "fp8-q-sink",
+        (2, 2, 12, 128),
+        (16, 1, 1),
+        parts=1,
+        sink=FP32,
+        fp8_query=True,
+        lengths=(0, 1, 259, 1027),
+    ),
+    _case(
+        "fp8-q-window",
+        (4, 1, 16, 128),
+        (128, 1, 1),
+        parts=7,
+        window=257,
+        sink=BF16,
+        fp8_query=True,
+        lengths=(0, 3, 259, 1027),
+    ),
+    _case(
+        "fp8-q-window-scalar",
+        (2, 1, 8, 128),
+        (64, 0, 0),
+        parts=3,
+        window=1,
+        sink=FP16,
+        fp8_query=True,
+        lengths=(0, 1, 259, 1027),
+    ),
+    _case(
+        "fp8-q-d64",
+        (2, 1, 8, 64),
+        (64, 1, 1),
+        parts=3,
+        fp8_query=True,
+        lengths=(0, 259, 1027),
+    ),
+    _case(
+        "fp8-q-d256",
+        (4, 1, 16, 256),
+        (128, 0, 0),
+        parts=3,
+        fp8_query=True,
+        lengths=(0, 259, 1027),
+    ),
+]
+
+
 @pytest.mark.parametrize("planned", [False, True], ids=["static", "planned"])
 @pytest.mark.parametrize("case", CASES)
 def test_pa_decode(case, planned, monkeypatch):
@@ -964,6 +1053,8 @@ def test_pa_decode(case, planned, monkeypatch):
         )
     ):
         context.copy_(torch.tensor(lengths, dtype=torch.int32))
+        if case.fp8_query:
+            args[11].mul_(0.5)
         if sinks is not None:
             if step == 2:
                 sinks.fill_(float("-inf"))

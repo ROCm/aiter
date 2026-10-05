@@ -283,6 +283,143 @@ def measure(candidates, case, want, query_lens, kv_lens, atol=None, bad_rows=Fal
     return ret
 
 
+PA_DECODE_CASES = {
+    "pure": ([1] * 8, [64, 700, 4096, 65, 8192, 1, 3000, 256]),
+    "mixed": ([128] + [1] * 8, [16384, 4096, 8192, 1024, 6000, 300, 12000, 2048, 512]),
+    "ragged": ([1] * 16, [30000] + [37 + 11 * i for i in range(15)]),
+    # NP hits the 32 cap: one 16384-token seq, 3*256/4 = 192 fit -> cap 32
+    "cap": ([1], [16384]),
+}
+
+
+@benchmark()
+def test_pa_decode_route(kind):
+    """Decode rows on the shuffled cache must reach FlyDSL pa_decode (static NP)
+    and match the reference. Block 16 is not exercised: the dispatcher's page
+    gate is 64 only."""
+    import aiter.ops.flydsl.unified_attention_kernels as uk
+
+    query_lens, kv_lens = PA_DECODE_CASES[kind]
+    case = make_case(query_lens, kv_lens, dtypes.bf16, seed=11)
+    want = reference(case, query_lens, kv_lens)
+    case["k"], case["v"] = shuffle_kv(case["k"], case["v"])
+    call = partial(
+        ua.unified_attention, **case, backend="flydsl", shuffled_kv_cache=True
+    )
+    with mock.patch.object(uk, "_route_pa_decode", wraps=uk._route_pa_decode) as spy:
+        call()
+        assert spy.called, "decode rows did not route to pa_decode"
+    return measure({"pa_decode_route": call}, case, want, query_lens, kv_lens)
+
+
+def test_pa_decode_num_partitions():
+    from aiter.ops.flydsl.unified_attention_kernels import (
+        _pa_decode_num_partitions as f,
+    )
+
+    assert f(64, 4, 16384, 256) == 3
+    assert f(32, 4, 16384, 256) == 6
+    assert f(56, 4, 16384, 256) == 3  # floor(768/224)
+    assert f(8, 4, 1024, 256) == 4  # tile bound (24 fit)
+    assert f(1, 4, 16384, 256) == 32  # max-NP bound (192 fit, 64 tiles)
+    assert f(512, 4, 16384, 256) == 1  # floor gives 0
+
+
+_PA_DECODE_VGPR_PROBE = r"""
+import sys, torch
+import aiter.ops.flydsl.pa_decode as pd
+wide = sys.argv[1] == "1"
+orig = pd.compile_pa_decode_tile
+pd.compile_pa_decode_tile = lambda **kw: orig(**{**kw, "wide_kv_addressing": wide})
+S, HKV, G, D, PAGE, NP, NB = 2, 4, 16, 128, 64, 3, 12
+f8 = torch.float8_e4m3fn
+one = torch.ones(1, dtype=torch.float32, device="cuda")
+q = torch.zeros(S, HKV * G, D, dtype=f8, device="cuda")
+k = torch.zeros(NB, HKV, D // 16, PAGE, 16, dtype=f8, device="cuda")
+v = torch.zeros(NB, HKV, PAGE // 16, D, 16, dtype=f8, device="cuda")
+bt = torch.arange(NB, dtype=torch.int32, device="cuda").reshape(S, NB // S)
+ctx = torch.full((S,), NP * 256 // 2, dtype=torch.int32, device="cuda")
+out = torch.zeros(S, HKV * G, D, dtype=torch.bfloat16, device="cuda")
+sh = (S, HKV, NP, G)
+pd.pa_decode(
+    out, q, k, v, ctx, bt, 0.1, 1, NP, 256, f8, one, one, one,
+    torch.empty(sh, dtype=torch.float32, device="cuda"),
+    torch.empty(sh, dtype=torch.float32, device="cuda"),
+    torch.empty(*sh, D, dtype=torch.bfloat16, device="cuda"),
+)
+torch.cuda.synchronize()
+"""
+
+
+def _pa_decode_tile_vgprs(wide):
+    """VGPR count of the route's pa_decode tile kernel, read from the code object
+    FlyDSL caches (the .vgpr_count msgpack note). Runs in a subprocess with a
+    private cache so a warm or disabled default cache cannot hide the kernel."""
+    import glob
+    import pickle
+    import re
+    import subprocess
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as cache:
+        env = {
+            **os.environ,
+            "FLYDSL_RUNTIME_CACHE_DIR": cache,
+            "FLYDSL_RUNTIME_ENABLE_CACHE": "1",
+            "PYTHONPATH": os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        }
+        subprocess.run(
+            [sys.executable, "-c", _PA_DECODE_VGPR_PROBE, "1" if wide else "0"],
+            env=env,
+            check=True,
+            timeout=300,
+        )
+        counts = set()
+        for p in glob.glob(f"{cache}/pa_decode_tile_fp8_launch_*/*.pkl"):
+            with open(p, "rb") as f:
+                art = pickle.load(f)
+            m = re.search(
+                r'bin = "(.*?)"', getattr(art, "ir", None) or str(art), re.DOTALL
+            )
+            assert m, f"no code object in {p}"
+            s, data, i = m.group(1), bytearray(), 0
+            while i < len(s):
+                if s[i] == "\\" and s[i + 1] in '\\"':
+                    data.append(ord(s[i + 1]))
+                    i += 2
+                elif s[i] == "\\":
+                    data.append(int(s[i + 1 : i + 3], 16))
+                    i += 3
+                else:
+                    data.append(ord(s[i]))
+                    i += 1
+            # msgpack note: key ".vgpr_count" followed by fixint/uint8/uint16.
+            j = bytes(data).index(b".vgpr_count") + len(b".vgpr_count")
+            tag = data[j]
+            counts.add(
+                tag
+                if tag < 0x80
+                else (
+                    data[j + 1]
+                    if tag == 0xCC
+                    else int.from_bytes(data[j + 1 : j + 3], "big")
+                )
+            )
+    assert len(counts) == 1, f"expected one pa_decode tile kernel, got {counts}"
+    return counts.pop()
+
+
+def test_pa_decode_vgpr_occupancy():
+    """_PA_DECODE_WGS_PER_CU assumes the route tile keeps >= 3 waves/SIMD."""
+    wide, narrow = _pa_decode_tile_vgprs(True), _pa_decode_tile_vgprs(False)
+    msg = (
+        f"pa_decode tile VGPRs: wide={wide}, narrow={narrow} (expected ~144 and ~114); "
+        "re-sweep _PA_DECODE_WGS_PER_CU if a count crosses 128 or 170"
+    )
+    assert 512 // wide >= 3 and 512 // narrow >= 3, msg
+    print(msg)
+
+
 @benchmark()
 def test_prefill(dtype, causal):
     query_lens, kv_lens = [512, 256], [512, 256]
@@ -501,6 +638,8 @@ def main():
     )
     parser.add_argument("--seq-len", type=int, nargs="+", default=[1024])
     args = parser.parse_args()
+    test_pa_decode_num_partitions()
+    test_pa_decode_vgpr_occupancy()
     sweeps = [
         ("prefill", test_prefill, itertools.product(args.dtype, args.causal)),
         (
@@ -524,6 +663,11 @@ def main():
             "paged addressing",
             test_paged_addressing,
             itertools.product([65535], args.layout),
+        ),
+        (
+            "pa_decode route",
+            test_pa_decode_route,
+            itertools.product(list(PA_DECODE_CASES)),
         ),
         (
             "routing/backend gate",

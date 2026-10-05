@@ -57,13 +57,10 @@ def _clear_flydsl_cache():
 
 def _served_and_kv_splits(kw):
     """Run through the public API, reporting whether FlyDSL served the call and
-    which num_kv_splits it built with (tier confirmation). Stage 4: all-decode
-    routes to the decode-specialized kernel (`_get_decode_kernel`), so spy both
-    it and the prefill-body `_get_kernel`; whichever fires reports the split
-    count. (`_get_decode_kernel`'s num_kv_splits is its 6th positional arg.)"""
+    which num_kv_splits it built with (tier confirmation). Calls served by
+    pa_decode never reach `_get_kernel`, so they report the default 1."""
     real_served, seen = uak.flydsl_unified_attention, {}
     real_get_kernel = uak._get_kernel.__wrapped__
-    real_get_decode = uak._get_decode_kernel.__wrapped__
 
     def served_spy(*a, **k):
         r = real_served(*a, **k)
@@ -74,17 +71,10 @@ def _served_and_kv_splits(kw):
         seen["num_kv_splits"] = a[5] if len(a) > 5 else k.get("num_kv_splits", 1)
         return real_get_kernel(*a, **k)
 
-    def decode_kernel_spy(*a, **k):
-        seen["num_kv_splits"] = a[5] if len(a) > 5 else k.get("num_kv_splits", 1)
-        return real_get_decode(*a, **k)
-
     uak._get_kernel.cache_clear()
-    uak._get_decode_kernel.cache_clear()
     with mock.patch.object(
         uak, "flydsl_unified_attention", served_spy
-    ), mock.patch.object(uak, "_get_kernel", kernel_spy), mock.patch.object(
-        uak, "_get_decode_kernel", decode_kernel_spy
-    ):
+    ), mock.patch.object(uak, "_get_kernel", kernel_spy):
         ua.unified_attention(**kw)
     return seen.get("served", False), seen.get("num_kv_splits", 1)
 
@@ -271,16 +261,14 @@ def _run_matrix(shuffled_kv_cache, tag):
         causal=True,
     )
 
-    # batch: all-decode (max_seqlen_q == 1), small batch. Stage 4 routes this to
-    # the decode-specialized kernel, whose fill-aware host plan splits an
-    # underfilled batch (b=4 -> S = min(ceil(256/16), 8, npages) > 1), so it is
-    # now split-K on the decode kernel (was single-pass on the prefill body).
+    # batch: all-decode (max_seqlen_q == 1), small batch. Served by pa_decode
+    # or the prefill body depending on layout, so the split tier is not pinned.
     all_ok &= _run_case(
         f"{tag} all-decode small-batch",
         [(1, kv) for kv in (300, 250, 400, 180)],
         shuffled_kv_cache,
         causal=True,
-        expect_split_k=True,
+        expect_split_k=None,
     )
 
     # large production-like case: total_q ~8k across many seqs, deep KV

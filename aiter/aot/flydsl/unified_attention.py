@@ -12,12 +12,11 @@ fp8 QKV, paged + varlen). ``DEFAULT_CSVS = [None]`` is a sentinel so the shared
 ``collect_aot_jobs`` machinery iterates once and ``parse_csv`` emits the whole
 hardcoded job list regardless of its argument.
 
-Two builders back the family (both gfx950-only, forced via FLYDSL_GPU_ARCH):
+One builder backs the family (gfx950-only, forced via FLYDSL_GPU_ARCH):
   - prefill: ``_get_kernel`` -> ``build_flash_attn_dualwave_swp_fp8_module``
-  - decode:  ``_get_decode_kernel`` -> ``build_flash_attn_fp8_decode_module``
 
 Each job is compiled by fetching its launcher from the runtime adapter's own
-``_get_kernel`` / ``_get_decode_kernel`` (so the AOT binary is keyed identically
+``_get_kernel`` (so the AOT binary is keyed identically
 to what dispatch will look up), then invoking it under ``FakeTensorMode`` +
 ``COMPILE_ONLY=1`` with geometry-only fake tensors -- no GPU, no real memory.
 
@@ -32,8 +31,6 @@ import os
 import sys
 import time
 import traceback
-
-import flydsl.expr as fx
 
 from aiter.aot.flydsl.common import (
     collect_aot_jobs,
@@ -59,8 +56,6 @@ _NUM_KV_HEADS = 4  # GQA-16, the only decode-valid production config
 # refuses it: exp(sink) would be double-counted across split combines), so sinks
 # only ever pairs with split=1.
 _PREFILL_SPLITS = (1, 2, 4, 8, 16)
-# Decode split-K counts (decode has no use_sinks axis -- always sinks-off).
-_DECODE_SPLITS = (1, 2, 4, 8, 16)
 
 _OUT_DTYPES = ("bf16", "f16")
 
@@ -108,29 +103,11 @@ def _prefill_jobs() -> list[dict]:
     return jobs
 
 
-def _decode_jobs() -> list[dict]:
-    jobs = []
-    for causal in (True, False):
-        for out_dtype_str in _OUT_DTYPES:
-            for shuffled_kv_cache in (False, True):
-                for num_kv_splits in _DECODE_SPLITS:
-                    jobs.append(
-                        {
-                            "path": "decode",
-                            "causal": causal,
-                            "out_dtype_str": out_dtype_str,
-                            "shuffled_kv_cache": shuffled_kv_cache,
-                            "num_kv_splits": num_kv_splits,
-                        }
-                    )
-    return jobs
-
-
 def parse_csv(_csv=None) -> list[dict]:
     """Return the full unified-attention job list. The CSV argument is ignored
     (this family has no tuning CSV); ``_csv`` is present only to satisfy the
     ``collect_aot_jobs`` / ``_collect_aot_jobs_for`` contract."""
-    jobs = _prefill_jobs() + _decode_jobs()
+    jobs = _prefill_jobs()
     common = {
         "num_heads": _NUM_HEADS,
         "num_kv_heads": _NUM_KV_HEADS,
@@ -146,8 +123,7 @@ def parse_csv(_csv=None) -> list[dict]:
         job["kernel_name"] = _kernel_name(job)
     print(
         f"[aiter] FlyDSL unified-attention AOT: {len(jobs)} jobs "
-        f"({sum(j['path'] == 'prefill' for j in jobs)} prefill, "
-        f"{sum(j['path'] == 'decode' for j in jobs)} decode)"
+        f"({sum(j['path'] == 'prefill' for j in jobs)} prefill)"
     )
     return jobs
 
@@ -279,59 +255,6 @@ def _compile_prefill(job: dict) -> None:
         )
 
 
-def _compile_decode(job: dict) -> None:
-    import torch
-
-    from aiter.ops.flydsl.unified_attention_kernels import _get_decode_kernel
-
-    num_heads = job["num_heads"]
-    num_kv_heads = job["num_kv_heads"]
-    out_dtype_str = job["out_dtype_str"]
-    num_kv_splits = job["num_kv_splits"]
-    shuffled_kv_cache = job["shuffled_kv_cache"]
-
-    mod = _get_decode_kernel(
-        num_heads,
-        num_kv_heads,
-        bool(job["causal"]),
-        out_dtype_str,
-        shuffled_kv_cache,
-        num_kv_splits,
-    )
-
-    fp8 = torch.float8_e4m3fn
-    d = _HEAD_DIM
-    num_seqs = _FAKE_NUM_SEQS
-
-    # Decode: query_len == 1, so total_q == num_seqs.
-    q = torch.empty((num_seqs, num_heads, d), dtype=fp8)
-    out = torch.empty((num_seqs, num_heads, d), dtype=_out_torch_dtype(out_dtype_str))
-    k, v = _fake_kv(num_kv_heads, shuffled_kv_cache)  # decode requires contiguous K/V
-    cu_seqlens_q = torch.empty((num_seqs + 1,), dtype=torch.int32)
-    cu_seqlens_kv = torch.empty((num_seqs + 1,), dtype=torch.int32)
-    block_table = torch.empty((num_seqs, _FAKE_MAX_BLOCKS), dtype=torch.int32)
-    q_descale = torch.empty((1,), dtype=torch.float32)
-    k_descale = torch.empty((1,), dtype=torch.float32)
-    v_descale = torch.empty((1,), dtype=torch.float32)
-
-    with compile_only_env():
-        mod(
-            q.reshape(-1),
-            k,
-            v,
-            out.reshape(-1),
-            num_seqs,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_kv=cu_seqlens_kv,
-            block_table=block_table.reshape(-1),
-            block_table_stride=int(block_table.stride(0)),
-            q_descale=q_descale,
-            k_descale=k_descale,
-            v_descale=v_descale,
-            stream=fx.Stream(0),
-        )
-
-
 def compile_one_config(**job) -> dict:
     """Compile one unified-attention variant and save it to the FlyDSL cache."""
     from torch._subclasses.fake_tensor import FakeTensorMode
@@ -352,8 +275,6 @@ def compile_one_config(**job) -> dict:
         ):
             if job["path"] == "prefill":
                 _compile_prefill(job)
-            elif job["path"] == "decode":
-                _compile_decode(job)
             else:
                 raise ValueError(f"Unknown unified-attention path: {job['path']!r}")
         elapsed = time.time() - t0
