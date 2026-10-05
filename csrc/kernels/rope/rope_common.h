@@ -7862,7 +7862,8 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
                                           int64_t v_head_stride    = 0,
                                           bool v_norm              = false,
                                           KVT* q_out_fp8           = nullptr,
-                                          const float* per_tensor_q_scale = nullptr)
+                                          const float* per_tensor_q_scale = nullptr,
+                                          int q_head_stride        = 0)
 {
     constexpr int VEC_SIZE        = HEAD_SIZE / WARP_SIZE;
     constexpr int HALF_HEAD_SIZE  = HEAD_SIZE / 2;
@@ -7911,8 +7912,15 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
     const int access_id_in_head = (threadIdx.x % WARP_SIZE) * VEC_SIZE;
     const int neighbor_offset =
         access_id_in_head < HALF_HEAD_SIZE ? HALF_HEAD_SIZE / VEC_SIZE : -HALF_HEAD_SIZE / VEC_SIZE;
-    const T* qkv_ =
-        &qkv[(static_cast<int64_t>(token_id) * num_heads + head_id_in_token) * HEAD_SIZE];
+    // q_head_stride: Q heads at this stride (e.g. Qwen3.5 [q | gate]); K/V follow.
+    const int q_head_stride_ = q_head_stride > 0 ? q_head_stride : HEAD_SIZE;
+    const int64_t q_region   = static_cast<int64_t>(num_heads_q) * q_head_stride_;
+    const int64_t qkv_token_stride =
+        q_region + static_cast<int64_t>(num_heads - num_heads_q) * HEAD_SIZE;
+    const int64_t head_offset =
+        is_q ? static_cast<int64_t>(head_id_in_token) * q_head_stride_
+             : q_region + static_cast<int64_t>(head_id_in_token - num_heads_q) * HEAD_SIZE;
+    const T* qkv_ = &qkv[static_cast<int64_t>(token_id) * qkv_token_stride + head_offset];
 
     if(!is_v)
     {
@@ -8226,9 +8234,12 @@ void fused_mrope_rms_set_kv(const T* qkv,
                             int64_t k_token_stride   = 0,
                             int64_t k_head_stride    = 0,
                             int64_t v_token_stride   = 0,
-                            int64_t v_head_stride    = 0)
+                            int64_t v_head_stride    = 0,
+                            int64_t q_head_stride    = 0)
 {
     AITER_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
+    AITER_CHECK(q_head_stride == 0 || q_head_stride >= head_size,
+                "q_head_stride must be 0 (dense) or >= head_size, got ", q_head_stride);
     // po2_div/po2_mod in the paged and shuffle-layout address math assume these are
     // powers of two. Every vLLM block_size and every x = 16 / sizeof(elem) satisfies
     // it, but check rather than corrupt the cache silently if that ever changes.
@@ -8286,7 +8297,11 @@ void fused_mrope_rms_set_kv(const T* qkv,
                                                         k_token_stride,              \
                                                         k_head_stride,               \
                                                         v_token_stride,              \
-                                                        v_head_stride);              \
+                                                        v_head_stride,               \
+                                                        /*v_norm=*/false,            \
+                                                        /*q_out_fp8=*/nullptr,       \
+                                                        /*per_tensor_q_scale=*/nullptr, \
+                                                        (int)q_head_stride);         \
     }                                                                                \
     else                                                                             \
     {                                                                                \
@@ -8323,7 +8338,11 @@ void fused_mrope_rms_set_kv(const T* qkv,
                                                         k_token_stride,              \
                                                         k_head_stride,               \
                                                         v_token_stride,              \
-                                                        v_head_stride);              \
+                                                        v_head_stride,               \
+                                                        /*v_norm=*/false,            \
+                                                        /*q_out_fp8=*/nullptr,       \
+                                                        /*per_tensor_q_scale=*/nullptr, \
+                                                        (int)q_head_stride);         \
     }
 
     if(is_interleaved)
