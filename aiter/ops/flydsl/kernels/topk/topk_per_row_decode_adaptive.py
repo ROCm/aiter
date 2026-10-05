@@ -472,9 +472,9 @@ def create_topk_per_row_decode_adaptive_kernel(
 
     - `bits_per_pass` is 10 or 11, and the short tier needs 11 (2048-bin histogram).
     - `scan_stages` is one of 1/2/4/8; `spin_sleep` is 0..15.
-    - `mask_non_finite` off is the default *because* it matches torch.topk and the
-      C++ one-block kernel, which rank inf/NaN by raw twiddled bits. Asking for it
-      is asking to diverge from both.
+    - `mask_non_finite` off is the default *because* it matches torch.topk, which
+      ranks every NaN, of either sign, above +inf. Asking for it is asking to
+      diverge from it.
     - `compact_cap_mult` trades workspace for how often the buffer path is taken,
       never correctness: a row that overflows rescans instead.
     - `early_stop` is silently dropped from the multi-block tiers under `compact`,
@@ -664,7 +664,8 @@ def create_topk_per_row_decode_adaptive_kernel(
         c_parts = fx.Int32(blocks_per_row)
         c_sign_bit = fx.Int32(-2147483648)
         c_exp_mask = fx.Int32(0x7F800000)  # fp32 exponent bits (all-ones => inf/NaN)
-        c_neg_inf = fx.Float32(float("-inf"))
+        c_neg_inf_bits = fx.Int32(-0x800000)  # fp32 -inf
+        c_nan_turn = fx.Int32(0x7FFFFF)  # keys from -inf past the -NaNs
         c_row_ws = fx.Int32(row_workspace_slots)
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
@@ -826,14 +827,13 @@ def create_topk_per_row_decode_adaptive_kernel(
                     spin_until_slot_ge(counter_slot(COUNTER_PASS_DONE), token_value)
             gpu.barrier()
 
-        def mask_nonfinite(val):
-            # inf/NaN (exponent all-ones) -> -inf so they sort below every finite
-            # value and are never selected.
-            if const_expr(not mask_non_finite):
-                return val
+        def key_bits(val):
+            # Under mask_non_finite every inf/NaN becomes -inf and is never selected.
             bits = val.bitcast(fx.Int32)
+            if const_expr(not mask_non_finite):
+                return bits
             is_nonfinite = (bits & c_exp_mask) == c_exp_mask
-            return is_nonfinite.select(c_neg_inf, val)
+            return is_nonfinite.select(c_neg_inf_bits, bits)
 
         def radix_twiddle_key(val):
             # Map larger fp32 values to smaller unsigned keys so ascending bucket
@@ -842,8 +842,10 @@ def create_topk_per_row_decode_adaptive_kernel(
             # Signed zero is left alone: torch.topk and the C++ one-block kernel
             # both rank -0.0 strictly below +0.0, so collapsing the two here would
             # change which tied index is emitted.
-            bits = mask_nonfinite(val).bitcast(fx.Int32)
-            return bits ^ ~((bits >> 31) | c_sign_bit)
+            # The wrapping add rotates the -NaNs, which twiddle past -inf, round to
+            # the top, so every NaN ranks above +inf as torch.topk ranks it.
+            bits = key_bits(val)
+            return (bits ^ ~((bits >> 31) | c_sign_bit)) + c_nan_turn
 
         def bucket_for_key(key, start_bit: int):
             return (key.shrui(fx.Int32(start_bit))) & fx.Int32(num_buckets - 1)
@@ -1907,16 +1909,16 @@ def create_topk_per_row_decode_adaptive_kernel(
                 # the sign bit of a positive value and every bit of a negative one.
                 # An unsigned compare of two keys then orders the floats, which is
                 # what makes the histogram's bins ascend.
-                bits = mask_nonfinite(val).bitcast(fx.Int32)
-                return bits ^ ((bits >> 31) | c_sign_bit)
+                # The same NaN rotation as `radix_twiddle_key`, mirrored.
+                bits = key_bits(val)
+                return (bits ^ ((bits >> 31) | c_sign_bit)) - c_nan_turn
 
             def signed_key(val):
                 # `ordered_key` biased by the sign bit, so a *signed* compare
                 # answers the same ordering. Keep the two in step: the scatter
                 # compares this against a threshold assembled from digits the
                 # histogram produced under `ordered_key`.
-                bits = mask_nonfinite(val).bitcast(fx.Int32)
-                return bits ^ ((bits >> 31) & ~c_sign_bit)
+                return ordered_key(val) ^ c_sign_bit
 
             def ordered_bucket(val):
                 return ordered_key(val).shrui(c_shift)

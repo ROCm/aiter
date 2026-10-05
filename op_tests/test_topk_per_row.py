@@ -867,6 +867,46 @@ def test_adaptive_row_past_width(card):
     print("[adaptive_row_past_width] PASS")
 
 
+def test_adaptive_nan_ranks_first(card):
+    """A NaN of either sign and any payload ranks above +inf, as `torch.topk` ranks
+    it on the CPU, on every band `card` ships and on rows of every tier."""
+    nans = torch.tensor(
+        [0x7FC00000, 0x7F800001, -0x400000, -1], dtype=torch.int32
+    ).view(torch.float32)
+    special = torch.cat([nans, torch.tensor([float("inf"), float("-inf")])]).cuda()
+    cols = torch.arange(special.numel(), device="cuda") * 2 + 1
+    for rows, width, top_k, stable in adaptive_band_cells(card):
+        seq_lens = torch.randint(
+            top_k + 16, width + 1, (rows,), dtype=torch.int32, device="cuda"
+        )
+        seq_lens[0] = width
+        logits = create_planted_logits(seq_lens, width, top_k)
+        logits[:, cols] = special
+        indices = torch.empty((rows, top_k), dtype=torch.int32, device="cuda")
+        flydsl_decode_host._decode_with_backend(
+            logits,
+            1,
+            seq_lens,
+            indices,
+            rows,
+            *logits.stride(),
+            top_k,
+            stable,
+            None,
+            topk.BACKEND_ADAPTIVE,
+            width,
+        )
+        torch.cuda.synchronize()
+        live = torch.arange(width, device="cuda")[None, :] < seq_lens[:, None]
+        ranked = torch.where(logits.isnan(), float("inf"), logits)
+        ranked = torch.where(live, ranked, float("-inf"))
+        want = stable_reference(ranked, top_k)
+        got = indices.long() if stable else indices.long().sort(dim=-1).values
+        cell = f"rows={rows} width={width} k={top_k} stable={stable}"
+        assert torch.equal(got, want), f"NaN ranking mismatch at {cell}"
+    print("[adaptive_nan_ranks_first] PASS")
+
+
 def stable_reference(masked: torch.Tensor, top_k: int) -> torch.Tensor:
     """The k largest per row in ascending column order, ties to the smallest column.
 
@@ -1219,6 +1259,7 @@ if card in topk._ADAPTIVE_BANDS_BY_K_GROUP:
     test_decode_bound_entry_points(card)
     test_adaptive_compact_garbage(card)
     test_adaptive_row_past_width(card)
+    test_adaptive_nan_ranks_first(card)
     test_adaptive_ordered_early_stop(card)
 else:
     aiter.logger.warning(
