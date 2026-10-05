@@ -159,6 +159,35 @@ def _gdn_k5_target_segments() -> int:
     return target_segments
 
 
+@functools.cache
+def _is_gfx950_device(device: torch.device) -> bool:
+    # get_device_properties costs several us per call; the arch is fixed per device.
+    return (
+        torch.cuda.get_device_properties(device).gcnArchName.split(":")[0] == "gfx950"
+    )
+
+
+# Blocked-path scratch (maps, carry entries) is never returned to the caller, so it
+# is reused across calls. Reuse is only stream-ordered on the stream that allocated it.
+_BLOCKED_SCRATCH: dict = {}
+_BLOCKED_SCRATCH_MAX = 8
+
+
+def _blocked_scratch(device, blocks, H, packed_v, K, stream):
+    key = (device, blocks, H, packed_v, K)
+    cached = _BLOCKED_SCRATCH.get(key)
+    if cached is not None and cached[0] == stream:
+        return cached[1], cached[2]
+    maps = torch.empty((blocks, H, packed_v, K), device=device, dtype=torch.float32)
+    entry = torch.empty(
+        (blocks, H, K, packed_v - K), device=device, dtype=torch.float32
+    )
+    if len(_BLOCKED_SCRATCH) >= _BLOCKED_SCRATCH_MAX and key not in _BLOCKED_SCRATCH:
+        _BLOCKED_SCRATCH.pop(next(iter(_BLOCKED_SCRATCH)))
+    _BLOCKED_SCRATCH[key] = (stream, maps, entry)
+    return maps, entry
+
+
 def _flydsl_run_only() -> bool:
     return flydsl_runtime_env.run_only
 
@@ -195,6 +224,12 @@ def _require_contiguous(t: torch.Tensor, name: str) -> torch.Tensor:
     if not t.is_contiguous():
         raise ValueError(f"FlyDSL K5 opt: `{name}` must be contiguous")
     return t
+
+
+def _as_fp32_contig(t: torch.Tensor) -> torch.Tensor:
+    if t.dtype is not torch.float32:
+        t = t.float()
+    return t if t.is_contiguous() else t.contiguous()
 
 
 def _as_contiguous(t: torch.Tensor) -> torch.Tensor:
@@ -975,8 +1010,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
         and use_exp2
         and bf16_convert_trunc
         and k.is_cuda
-        and torch.cuda.get_device_properties(k.device).gcnArchName.split(":")[0]
-        == "gfx950"
+        and _is_gfx950_device(k.device)
         and not torch.cuda.is_current_stream_capturing()
     ):
         lengths = _gdn_k5_sequence_lengths(cu_seqlens, T, prefill_metadata)
@@ -1062,6 +1096,8 @@ def _build_chunk_gdn_block_maps(
     *,
     prefill_metadata: GatedDeltaRulePrefillMetadata,
     bv: int = 64,
+    out: torch.Tensor | None = None,
+    stream=None,
 ) -> torch.Tensor:
     """Build packed fp32 [Aᵀ,Cᵀ] maps with request-aligned blocks.
 
@@ -1083,9 +1119,13 @@ def _build_chunk_gdn_block_maps(
     k, w = _require_contiguous(k, "k"), _require_contiguous(w, "w")
     blocks = schedule.total_blocks
     # The homogeneous basis state needs no stored u.
-    packed_u = u.contiguous()
+    packed_u = u if u.is_contiguous() else u.contiguous()
     packed_v = K + V
-    maps = torch.empty((blocks, H, packed_v, K), device=k.device, dtype=torch.float32)
+    maps = (
+        out
+        if out is not None
+        else torch.empty((blocks, H, packed_v, K), device=k.device, dtype=torch.float32)
+    )
     dummy, int_dummy = _placeholder_pair(k.device)
     launch = _get_or_compile_opt(
         K,
@@ -1111,7 +1151,7 @@ def _build_chunk_gdn_block_maps(
         packed_u,
         w,
         dummy,
-        g.float().contiguous() if g is not None else dummy,
+        _as_fp32_contig(g) if g is not None else dummy,
         dummy,
         dummy,
         dummy,
@@ -1128,7 +1168,7 @@ def _build_chunk_gdn_block_maps(
         schedule.n_prefill,
         packed_v // bv,
         blocks * H,
-        torch.cuda.current_stream(),
+        stream if stream is not None else torch.cuda.current_stream(),
     )
     return maps
 
@@ -1151,6 +1191,8 @@ def _carry_chunk_gdn_block_maps(
     initial_state: torch.Tensor | None = None,
     *,
     prefill_metadata: GatedDeltaRulePrefillMetadata,
+    out: torch.Tensor | None = None,
+    stream=None,
 ) -> torch.Tensor:
     """Scan request-local maps into fp32 [blocks,H,K,V] entries.
 
@@ -1166,11 +1208,7 @@ def _carry_chunk_gdn_block_maps(
         raise ValueError("Carry requires packed maps with K=V=128.")
     if maps.dtype != torch.float32:
         raise ValueError("Carry maps must be fp32 tensors.")
-    if (
-        not maps.is_cuda
-        or torch.cuda.get_device_properties(maps.device).gcnArchName.split(":")[0]
-        != "gfx950"
-    ):
+    if not maps.is_cuda or not _is_gfx950_device(maps.device):
         raise ValueError("Block-map carry currently supports gfx950 only.")
     maps = _require_contiguous(maps, "maps")
     if initial_state is not None:
@@ -1183,7 +1221,11 @@ def _carry_chunk_gdn_block_maps(
                 "Carry initial_state must be colocated fp32/bf16 [N,H,V,K]."
             )
         initial_state = _require_contiguous(initial_state, "initial_state")
-    entry = torch.empty((blocks, heads, K, V), device=maps.device, dtype=maps.dtype)
+    entry = (
+        out
+        if out is not None
+        else torch.empty((blocks, heads, K, V), device=maps.device, dtype=maps.dtype)
+    )
     if blocks != schedule.total_blocks or schedule.block_prefix.device != maps.device:
         raise ValueError("Carry maps must match the block schedule.")
     launch = _get_or_compile_chunk_gdn_carry(
@@ -1199,7 +1241,7 @@ def _carry_chunk_gdn_block_maps(
         schedule.block_prefix,
         blocks,
         requests,
-        torch.cuda.current_stream(maps.device),
+        stream if stream is not None else torch.cuda.current_stream(maps.device),
     )
     return entry
 
@@ -1251,13 +1293,26 @@ def _chunk_gated_delta_rule_fwd_h_blocked(
     blocks = schedule.total_blocks
     map_bv = 64
     bv = 64
+    H, V = u.shape[1], u.shape[-1]
+    stream = torch.cuda.current_stream(k.device)
+    maps_buf, entry_buf = _blocked_scratch(k.device, blocks, H, K + V, K, stream)
     maps = _build_chunk_gdn_block_maps(
-        k, w, u, g, prefill_metadata=prefill_metadata, bv=map_bv
+        k,
+        w,
+        u,
+        g,
+        prefill_metadata=prefill_metadata,
+        bv=map_bv,
+        out=maps_buf,
+        stream=stream,
     )
     entry = _carry_chunk_gdn_block_maps(
-        maps, initial_state, prefill_metadata=prefill_metadata
+        maps,
+        initial_state,
+        prefill_metadata=prefill_metadata,
+        out=entry_buf,
+        stream=stream,
     )
-    H, V = u.shape[1], u.shape[-1]
     h = torch.empty(
         (1, schedule.total_chunks, H, V, K), device=k.device, dtype=torch.bfloat16
     )
@@ -1291,7 +1346,7 @@ def _chunk_gated_delta_rule_fwd_h_blocked(
         u,
         w,
         v_new,
-        g.float().contiguous() if g is not None else dummy,
+        _as_fp32_contig(g) if g is not None else dummy,
         dummy,
         h,
         entry,
@@ -1308,7 +1363,7 @@ def _chunk_gated_delta_rule_fwd_h_blocked(
         schedule.n_prefill,
         V // bv,
         blocks * H,
-        torch.cuda.current_stream(k.device),
+        stream,
     )
     return h, v_new, final_state
 
