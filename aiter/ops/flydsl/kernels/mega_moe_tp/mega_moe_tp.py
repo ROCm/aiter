@@ -11,6 +11,7 @@ elsewhere, as for the other AITER_CONFIG_* tables), else from a heuristic.
 from __future__ import annotations
 
 import csv
+import dataclasses
 import functools
 import heapq
 import math
@@ -25,6 +26,7 @@ from ..tensor_shim import _preload_compiled, _run_compiled
 from .mega_moe_tp_kernel import (
     CTRL_ERR,
     CTRL_INTS,
+    DYN_MAX,
     ERR_CHUNK,
     ERR_COMM,
     ERR_FLAG,
@@ -33,6 +35,8 @@ from .mega_moe_tp_kernel import (
     FLAG_INTS,
     MAX_TP,
     NCTA_MAX,
+    TLU_INTS,
+    TN_MAX,
     UNIT_G1X,
     UNIT_G2COL,
     UNIT_REC,
@@ -55,6 +59,9 @@ __all__ = [
 ]
 
 LDS_LIMIT = 160 * 1024
+# LB: up to this many tokens the A loader wave prefetches the GEMM2 units and
+# the GEMM1 split is picked per batch at run time
+LB_PF_MAX = 1024
 COMM_MODES = ("ag_rs", "rs", "ar", "ar_ar")
 _TUNED_LIKE = {"ar": "ar_ar", "rs": "ag_rs"}
 _ERR_NAMES = (
@@ -64,7 +71,6 @@ _ERR_NAMES = (
     (ERR_COMM, "reduce"),
     (ERR_YAG, "output gather"),
 )
-DYN_MAX = 256
 CSV_KEY = (
     "gfx",
     "cu_num",
@@ -94,6 +100,10 @@ class LaunchCfg:
     npp: int = 1
     xb: int = 0
     ag8: bool = False  # ar / ar_ar: MXFP8 all-gather rows (ar_gather="auto")
+    lb: bool = False  # dynamic: two-phase large-batch schedule (no partial sums)
+    tn: int = 0  # ag_rs: the next layer's residual add + norm + FP8 gather fused (1)
+    pf: bool = False  # lb: the A loader wave prefetches the GEMM2 units
+    lp: int = 0  # lb: GEMM1 inter pieces per row chunk (0: picked per batch)
 
     @property
     def block_m(self) -> int:
@@ -186,6 +196,8 @@ class MegaMoeTPEngine:
         comm_mode: str = "ag_rs",
         comm_dtype: str = "fp8",
         ar_gather: str = "auto",
+        schedule: str = "tuned",
+        act_dtype: str = "fp4",
         group=None,
         device: torch.device | None = None,
     ):
@@ -215,6 +227,43 @@ class MegaMoeTPEngine:
         self.mode = comm_mode
         self.check = os.environ.get("AITER_MEGAMOE_TP_CHECK", "0") == "1"
         self.dx = os.environ.get("AITER_MEGAMOE_TP_DX", "1") == "1"
+        # "tuned": the tuned table (balanced routing). "dynamic": the dynamic
+        # schedule with row chunks for every batch it can run, which is what
+        # model routing (idle and hot experts) wants.
+        schedule = os.environ.get("AITER_MEGAMOE_TP_SCHEDULE", schedule)
+        if schedule not in ("tuned", "dynamic"):
+            raise ValueError(f"unknown schedule {schedule!r}")
+        self.schedule = schedule
+        # dynamic schedule: split experts routed by more than one row tile into
+        # row chunks run by different CTAs (real routing has hot experts)
+        self.chunk = (
+            os.environ.get("AITER_MEGAMOE_TP_CHUNK", "1" if schedule == "dynamic" else "0")
+            == "1"
+        )
+        # activations (input and GEMM2 intermediate) as MXFP4 or MXFP8 (a8);
+        # the MXFP8 layout exists on the dynamic schedule only
+        act_dtype = os.environ.get("AITER_MEGAMOE_TP_ACT", act_dtype)
+        if act_dtype not in ("fp4", "fp8"):
+            raise ValueError(f"unknown act_dtype {act_dtype!r}")
+        self.a8 = act_dtype == "fp8"
+        if self.a8 and schedule != "dynamic":
+            raise ValueError('act_dtype="fp8" needs schedule="dynamic"')
+        # dynamic schedule: global token counts from which the large-batch
+        # (two-phase) schedule runs (0: never)
+        self.lb_min = (
+            int(os.environ.get("AITER_MEGAMOE_TP_LB_MIN", "0"))
+            if schedule == "dynamic" and not self.a8
+            else 0
+        )
+        self.lb_mt = int(os.environ.get("AITER_MEGAMOE_TP_LB_MT", "3"))
+        # smaller row tiles up to lb_small_max global tokens (rows per expert
+        # are few there: less padded work per unit)
+        self.lb_mt_small = int(os.environ.get("AITER_MEGAMOE_TP_LB_MT_SMALL", "3"))
+        self.lb_small_max = int(os.environ.get("AITER_MEGAMOE_TP_LB_SMALL_MAX", "512"))
+        # GEMM1 column blocks per pass over A (up to lb_small_max: 2)
+        self.lb_npp = int(os.environ.get("AITER_MEGAMOE_TP_LB_NPP", "1"))
+        # output column chunks per GEMM2 column group
+        self.lb_q = int(os.environ.get("AITER_MEGAMOE_TP_LB_Q", "1"))
         self.ar = comm_mode in ("ar", "ar_ar")
         self.xrep = comm_mode in ("ar", "rs")
         # inputs and routing of every token on every rank
@@ -231,20 +280,7 @@ class MegaMoeTPEngine:
         if swiglu_limit is None:
             swiglu_limit = 7.0 if activation == "swiglu" else float("inf")
         self.swiglu_limit = float(swiglu_limit)
-        self.w1, self.w1s, self.w2, self.w2s = (
-            t.view(torch.uint8) for t in (w1, w1_scale, w2, w2_scale)
-        )
-        I2, E = inter_dim, experts
-        for name, t, n in (
-            ("w1", self.w1, E * 2 * I2 * model_dim // 2),
-            ("w1_scale", self.w1s, E * 2 * I2 * model_dim // 32),
-            ("w2", self.w2, E * model_dim * I2 // 2),
-            ("w2_scale", self.w2s, E * model_dim * I2 // 32),
-        ):
-            if t.device != self.device or not t.is_contiguous() or t.numel() < n:
-                raise ValueError(
-                    f"{name}: need a contiguous tensor of >= {n} bytes on {self.device}"
-                )
+        self._bind_weights(w1, w1_scale, w2, w2_scale)
 
         props = torch.cuda.get_device_properties(self.device)
         self.n_cta = int(props.multi_processor_count)
@@ -266,7 +302,7 @@ class MegaMoeTPEngine:
         tot = self.mmax * self.tp
         H, K = model_dim, topk
         arena = SymmetricArena(group=group, device=self.device)
-        self._x = arena.reserve("x", (tot, H // 2), torch.uint8)
+        self._x = arena.reserve("x", (tot, H if self.a8 else H // 2), torch.uint8)
         self._xs = arena.reserve("xs", (tot, H // 32), torch.uint8)
         self._ids = arena.reserve("ids", (2, tot, 4 * K), torch.int32)
         self._w = arena.reserve("w", (2, tot, K), torch.float32)
@@ -282,9 +318,17 @@ class MegaMoeTPEngine:
         self._yall = arena.reserve(
             "yall", (tot, H) if self.ar else (1,), torch.bfloat16
         )
+        # tail (tn, ag_rs): every rank's FP8 rows of the next layer's input and
+        # their per-token scales, gathered by the kernel
+        # (FP8 rows [tot, H] + scales)
+        tn_ok = comm_mode == "ag_rs"
+        self._qall = arena.reserve("qall", (tot * H,) if tn_ok else (1,), torch.uint8)
+        self._sall = arena.reserve("sall", (tot,) if tn_ok else (1,), torch.float32)
+        self.tn_eps = 1e-6
+        self.tn_mode = 1
         arena.commit()
         self.arena = arena
-        self.ctrl = torch.zeros(CTRL_INTS + 256 * 16 + 128, dtype=torch.int32, device=self.device)  # [tl]
+        self.ctrl = torch.zeros(CTRL_INTS + 256 * 16 + 128 + TLU_INTS, dtype=torch.int32, device=self.device)  # [tl]
         self.routes = torch.zeros(
             (tot * topk + 1, H), dtype=torch.bfloat16, device=self.device
         )
@@ -307,13 +351,14 @@ class MegaMoeTPEngine:
         self.proutes = torch.zeros(
             (extra + 1, H), dtype=torch.bfloat16, device=self.device
         )
+        # exported intermediate rows and scales (+ the LB route list)
         self.xg = (
             torch.empty(
-                tot * topk * (inter_dim // 2 + inter_dim // 32),
+                tot * topk * (inter_dim // 2 + inter_dim // 32 + 8),
                 dtype=torch.uint8,
                 device=self.device,
             )
-            if self.sched.xsplit or self.dx
+            if self.sched.xsplit or self.dx or self.lb_min
             else None
         )
         key = (
@@ -336,6 +381,27 @@ class MegaMoeTPEngine:
         self._cfgs: dict = {}
         self._launchers: dict = {}
         self._armed: set = set()
+        self._args = (None, None)
+
+    def _bind_weights(self, w1, w1_scale, w2, w2_scale) -> None:
+        w = tuple(t.view(torch.uint8) for t in (w1, w1_scale, w2, w2_scale))
+        H, I, E = self.H, self.I, self.E
+        for name, t, n in (
+            ("w1", w[0], E * 2 * I * H // 2),
+            ("w1_scale", w[1], E * 2 * I * H // 32),
+            ("w2", w[2], E * H * I // 2),
+            ("w2_scale", w[3], E * H * I // 32),
+        ):
+            if t.device != self.device or not t.is_contiguous() or t.numel() < n:
+                raise ValueError(
+                    f"{name}: need a contiguous tensor of >= {n} bytes on {self.device}"
+                )
+        self.w1, self.w1s, self.w2, self.w2s = w
+
+    def set_weights(self, w1, w1_scale, w2, w2_scale) -> None:
+        """Run the next forwards on other weights of this shape; launch configs
+        stay armed."""
+        self._bind_weights(w1, w1_scale, w2, w2_scale)
         self._args = (None, None)
 
     def _pieces(self, rem: int) -> int:
@@ -504,8 +570,26 @@ class MegaMoeTPEngine:
             for j in range(rem)
         ]
 
+    def _chunks(
+        self, mt: int, dyn: bool, mmax: int = 0, lb: bool = False
+    ) -> tuple[int, int]:
+        """(rows per chunk, chunk table entries) of a dynamic schedule."""
+        if not (dyn and (self.chunk or lb)):
+            return 0, 0
+        rch = 16 * mt
+        tot = (mmax or self.mmax) * self.tp
+        if not lb:
+            tot = min(tot, DYN_MAX)
+        return rch, self.E + -(-tot * self.K // rch) + 1
+
     def _consts(
-        self, mt: int, dyn: bool, nab: int = 4, nsk: int = 4, mmax: int = 0
+        self,
+        mt: int,
+        dyn: bool,
+        nab: int = 4,
+        nsk: int = 4,
+        mmax: int = 0,
+        lb: bool = False,
     ) -> dict:
         mmax = mmax or self.mmax
         return mega_moe_tp_consts(
@@ -517,19 +601,28 @@ class MegaMoeTPEngine:
             self.E if dyn else 0,
             nab,
             nsk,
+            self._chunks(mt, dyn, mmax, lb)[1],
+            self.a8,
+            lb,
         )
 
-    def _nab(self, mt: int, dyn: bool, nsk: int = 4, mmax: int = 0) -> int:
-        lds = self._consts(mt, dyn, 4, nsk, mmax)["LDS_BYTES"]
+    def _nab(
+        self, mt: int, dyn: bool, nsk: int = 4, mmax: int = 0, lb: bool = False
+    ) -> int:
+        lds = self._consts(mt, dyn, 4, nsk, mmax, lb)["LDS_BYTES"]
+        if lb:
+            return 3
         return 4 if lds <= LDS_LIMIT else 3
 
-    def _lds(self, mt: int, dyn: bool, nsk: int = 4, mmax: int = 0) -> int:
-        nab = self._nab(mt, dyn, nsk, mmax)
-        return self._consts(mt, dyn, nab, nsk, mmax)["LDS_BYTES"]
+    def _lds(
+        self, mt: int, dyn: bool, nsk: int = 4, mmax: int = 0, lb: bool = False
+    ) -> int:
+        nab = self._nab(mt, dyn, nsk, mmax, lb)
+        return self._consts(mt, dyn, nab, nsk, mmax, lb)["LDS_BYTES"]
 
-    def _fit_mt(self, mt: int, dyn: bool, nsk: int = 4) -> int:
+    def _fit_mt(self, mt: int, dyn: bool, nsk: int = 4, lb: bool = False) -> int:
         mt = max(1, min(6, int(mt)))
-        while mt > 1 and self._lds(mt, dyn, nsk) > LDS_LIMIT:
+        while mt > 1 and self._lds(mt, dyn, nsk, lb=lb) > LDS_LIMIT:
             mt -= 1
         return mt
 
@@ -561,14 +654,41 @@ class MegaMoeTPEngine:
         cfg = self._cfgs.get(m)
         if cfg is None:
             tot = m * self.tp
-            if self._tuned:
+            lb = bool(self.lb_min) and tot >= self.lb_min and self.I // 128 >= 2
+            if lb:
+                cfg = LaunchCfg(
+                    mt=self.lb_mt_small if tot <= self.lb_small_max else self.lb_mt,
+                    dyn=True,
+                    route_fp8=False,
+                    npp=2 if tot <= self.lb_small_max else self.lb_npp,
+                    lb=True,
+                    # the GEMM2 units prefetched by the A loader wave
+                    pf=tot <= LB_PF_MAX,
+                    # GEMM1 split: the fewest unit rounds at small batches;
+                    # above, a fixed split pipelines GEMM2 better
+                    lp=0 if tot <= LB_PF_MAX else 3,
+                )
+            elif self.schedule == "dynamic" and tot <= self.dyn_max:
+                cfg = LaunchCfg(
+                    mt=1 if tot <= 32 else 2 if tot <= 64 else 3,
+                    dyn=True,
+                    route_fp8=False,
+                    ll=tot <= 256,
+                    llr=tot <= 128,
+                )
+            elif self._tuned:
                 cfg = next((c for t, c in self._tuned if t >= tot), self._tuned[-1][1])
             else:
                 cfg = self.default_config(m)
-            dyn = cfg.dyn and tot <= self.dyn_max and self.I // 128 >= 2
-            dyn = dyn and self._lds(1, True) <= LDS_LIMIT
-            mt = self._fit_mt(cfg.mt, dyn)
-            nsk = self._fit_nsk(mt, dyn, cfg.nsk)
+            dyn = cfg.dyn and (lb or tot <= self.dyn_max) and self.I // 128 >= 2
+            dyn = dyn and self._lds(1, True, lb=lb) <= LDS_LIMIT
+            lb = lb and dyn
+            if self.a8 and not dyn:
+                raise ValueError(
+                    f'act_dtype="fp8": {tot} tokens are beyond the dynamic schedule'
+                )
+            mt = self._fit_mt(cfg.mt, dyn, lb=lb)
+            nsk = 4 if lb else self._fit_nsk(mt, dyn, cfg.nsk)
             fp8 = not self.comm_bf16
             cfg = LaunchCfg(
                 mt,
@@ -580,6 +700,10 @@ class MegaMoeTPEngine:
                 self._fit_npp(cfg.npp, nsk),
                 cfg.xb if cfg.xb % 2 == 0 and 0 <= cfg.xb < self.H // 512 else 0,
                 bool(self.ag_auto) and tot >= self.ag_auto,
+                lb,
+                0,
+                lb and cfg.pf,
+                cfg.lp if lb and self.I // 128 % max(cfg.lp, 1) == 0 else 0,
             )
             self._cfgs[m] = cfg
         return cfg
@@ -628,7 +752,7 @@ class MegaMoeTPEngine:
                 tp=self.tp,
                 ar=self.ar,
                 dyn_e=self.E if cfg.dyn else 0,
-                nab=self._nab(cfg.mt, cfg.dyn, cfg.nsk),
+                nab=self._nab(cfg.mt, cfg.dyn, cfg.nsk, lb=cfg.lb),
                 nsk=cfg.nsk,
                 npp=cfg.npp,
                 ll_rs=cfg.ll,
@@ -638,7 +762,17 @@ class MegaMoeTPEngine:
                 comm_bf16=self.comm_bf16,
                 xrep=self.xrep,
                 ag8=self._ag8(cfg),
-                dx=self.dx and cfg.dyn and cfg.ll and cfg.llr,
+                dx=self.dx and cfg.dyn and cfg.ll and cfg.llr and not self.a8,
+                rch=self._chunks(cfg.mt, cfg.dyn, lb=cfg.lb)[0],
+                nch=self._chunks(cfg.mt, cfg.dyn, lb=cfg.lb)[1],
+                vb=self.schedule != "dynamic",
+                a8=self.a8,
+                lb=cfg.lb,
+                lbq=self.lb_q if cfg.lb else 1,
+                tn=cfg.tn,
+                tn_eps=self.tn_eps,
+                lbpf=cfg.pf,
+                lbp=cfg.lp,
                 **static,
             )
             self._launchers[cfg] = fn
@@ -708,15 +842,21 @@ class MegaMoeTPEngine:
                 "rank (replicated input)"
             )
 
-    def prepare(self, local_tokens) -> None:
+    def prepare(self, local_tokens, tail: bool = False) -> None:
         """Compile and arm the kernel for these local token counts (collective:
         every rank, same list). forward() does this on first use of a launch
         config, which must not happen inside CUDA graph capture."""
         for m in local_tokens:
             if 0 < m <= self.mmax:
-                self._arm(self.config(int(m)))
+                self._arm(self.config(int(m)), int(m))
+                if tail and self.tail_ok(int(m)):
+                    self._arm(dataclasses.replace(self.config(int(m)), tn=self.tn_mode), int(m))
 
-    def _arm(self, cfg: LaunchCfg) -> None:
+    def tail_ok(self, m: int) -> bool:
+        """forward(tail=...) runs for m local tokens (ag_rs, the LB schedule)."""
+        return self.mode == "ag_rs" and 0 < m <= min(TN_MAX, self.mmax) and self.config(m).lb
+
+    def _arm(self, cfg: LaunchCfg, m: int = 0) -> None:
         if cfg in self._armed:
             return
         if torch.cuda.is_current_stream_capturing():
@@ -725,14 +865,14 @@ class MegaMoeTPEngine:
                 "capture; call prepare(local_tokens) (or run it eagerly) first"
             )
         fn = self._launcher(cfg)
-        m = next(m for m, c in self._cfgs.items() if c == cfg)
+        m = m or next(m for m, c in self._cfgs.items() if c == cfg)
         args = self._launch_args(m, cfg, self.y, None, None, None)
         _preload_compiled(fn, *args, torch.cuda.current_stream())
         torch.cuda.synchronize(self.device)
         self.arena.barrier()
         self._armed.add(cfg)
 
-    def _launch_args(self, m, cfg, y, x, ids, tw):
+    def _launch_args(self, m, cfg, y, x, ids, tw, tail=None):
         sc = self._cfg_sched(cfg)
         peers = [int(b) for b in self.arena.base_ptrs] + [0] * (MAX_TP - self.tp)
 
@@ -770,6 +910,9 @@ class MegaMoeTPEngine:
             0 if self.xg is None else self.xg.data_ptr(),
             0 if cfg.dyn else sc.col0,
             0 if cfg.dyn else sc.ncol,
+            *(ptr(t) for t in (tail or (None, None, None))),
+            self._qall.offset,
+            self._sall.offset,
             self.n_cta,
         )
 
@@ -779,7 +922,13 @@ class MegaMoeTPEngine:
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         out: torch.Tensor | None = None,
+        tail=None,
     ):
+        """tail (ag_rs): (res_in, res_out, norm_w), bf16 [m, H], [m, H], [H]:
+        also res_out = y + res_in and every rank's per-token FP8 rows of
+        GemmaRMSNorm(res_out) (eps tn_eps) gathered: returns (y, q [M, H] fp8
+        bytes, scale [M] fp32), views of arena buffers valid until the next
+        forward with a tail."""
         m = self._local_tokens(x_local, topk_weights, topk_ids)
         rows = m * self.tp if self.ar else m  # output rows
         if out is not None and (
@@ -795,16 +944,25 @@ class MegaMoeTPEngine:
         ids = topk_ids.to(torch.int32).contiguous()
         tw = topk_weights.to(torch.float32).contiguous()
         cfg = self.config(m)
+        if tail is not None:
+            if not self.tail_ok(m):
+                raise ValueError("tail: ag_rs, the LB schedule, at most TN_MAX local tokens")
+            res_in, res_out, nw = tail
+            for t, shp in ((res_in, (m, self.H)), (res_out, (m, self.H)), (nw, (self.H,))):
+                if tuple(t.shape) != shp or t.dtype != torch.bfloat16 or not t.is_contiguous():
+                    raise ValueError(f"tail: need contiguous bf16 {shp}")
+            cfg = dataclasses.replace(cfg, tn=self.tn_mode)
         # output written in place: ag_rs / rs, and ar when the all-reduce ends
         # locally (one-shot LL); else it lands in the peers' symmetric buffer
         local_y = not self.ar or self._arll(cfg) or self._ag8(cfg)
         y = out if out is not None and local_y else self.y
-        key = (m, x.data_ptr(), ids.data_ptr(), tw.data_ptr(), y.data_ptr(), cfg)
+        tptr = tuple(t.data_ptr() for t in tail) if tail is not None else ()
+        key = (m, x.data_ptr(), ids.data_ptr(), tw.data_ptr(), y.data_ptr(), cfg, tptr)
         if self._args[0] != key:
-            args = self._launch_args(m, cfg, y, x, ids, tw)
+            args = self._launch_args(m, cfg, y, x, ids, tw, tail)
             # the inputs stay referenced while their pointers are cached
             self._args = (key, (args, x, ids, tw))
-        self._arm(cfg)
+        self._arm(cfg, m)
         _run_compiled(
             self._launcher(cfg), *self._args[1][0], torch.cuda.current_stream()
         )
@@ -813,7 +971,11 @@ class MegaMoeTPEngine:
         if not local_y:
             y = self._yall.local[:rows]
             return y if out is None else out.copy_(y)
-        return y[:rows] if out is None else out
+        y = y[:rows] if out is None else out
+        if tail is not None:
+            T_ = m * self.tp
+            return y, self._qall.local[: T_ * self.H].view(T_, self.H), self._sall.local[:T_]
+        return y
 
     __call__ = forward
 

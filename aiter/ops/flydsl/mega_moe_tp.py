@@ -46,6 +46,10 @@ Contract (the kernel synchronizes the ranks through flags in each other's memory
 * The result is a view of an internal buffer, valid until the next forward of
   this layer (ar / ar_ar: peers write into it during that forward); pass
   ``out=`` to get it in a buffer of your own (ag_rs / rs: written in place).
+* One instance can serve several layers of the same shape (``set_weights``
+  before each forward): they share its scratch and cross-rank state, so their
+  forwards form one collective sequence and a result is valid only until the
+  next forward of any of them.
 * The kernel keeps every CU busy and spins on peers: do not overlap it with
   another persistent / communication kernel (e.g. another layer's, a custom
   all-reduce on a side stream).
@@ -60,6 +64,14 @@ Contract (the kernel synchronizes the ranks through flags in each other's memory
   fp8 from ``AITER_MEGAMOE_TP_AG8_MIN`` = 512 global tokens up): the gathered
   rows travel as MXFP8, half the bytes (e.g. glm5 tp4 2048 tokens 472 -> 430 us)
   at rel L2 ~0.046 instead of ~0.038 against the torch reference.
+* ``schedule``: ``"tuned"`` (default) takes the tuned launch configs, tuned on
+  balanced routing; ``"dynamic"`` runs every batch of up to 256 tokens on the
+  dynamic schedule, which plans over the experts actually routed and splits hot
+  ones into row chunks (model routing leaves many experts idle and a few hot).
+* ``act_dtype``: ``"fp4"`` (default) quantizes the input and the GEMM2
+  intermediate to MXFP4; ``"fp8"`` (``schedule="dynamic"``, up to 256 tokens)
+  to MXFP8 (E4M3), the GEMMs then run E2M1 weights x E4M3 activations: closer
+  to bf16-activation MoE paths at twice the activation traffic.
 * Launch epochs are int32: ``reset()`` at least every 2**31 forwards per layer.
 """
 
@@ -103,6 +115,8 @@ class MegaMoeTPConfig:
     comm_mode: str = "ag_rs"
     comm_dtype: str = "fp8"
     ar_gather: str = "auto"
+    schedule: str = "tuned"
+    act_dtype: str = "fp4"
 
 
 class MegaMoeTP:
@@ -150,6 +164,8 @@ class MegaMoeTP:
             comm_mode=cfg.comm_mode,
             comm_dtype=cfg.comm_dtype,
             ar_gather=cfg.ar_gather,
+            schedule=cfg.schedule,
+            act_dtype=cfg.act_dtype,
             group=group,
             device=device,
         )
@@ -160,19 +176,32 @@ class MegaMoeTP:
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         out: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        tail=None,
+    ):
         """ag_rs: x_local [m, H] bf16 (this rank's tokens), topk_* [m, topk].
         rs / ar: x [M, H] bf16 (all tokens, same on every rank), topk_* [M, topk].
         ar_ar: x [M, H] bf16 (this rank's partial of every token), topk_* [M, topk]
         (the same routing on every rank). topk_ids int32, topk_weights float32
         (others are converted per call)."""
-        return self.engine(x_local, topk_weights, topk_ids, out)
+        return self.engine(x_local, topk_weights, topk_ids, out, tail=tail)
 
     __call__ = forward
 
-    def prepare(self, local_tokens) -> None:
-        """Collective: compile + arm the launch configs of these local token counts."""
-        self.engine.prepare(local_tokens)
+    def set_weights(
+        self,
+        *,
+        w1: torch.Tensor,
+        w1_scale: torch.Tensor,
+        w2: torch.Tensor,
+        w2_scale: torch.Tensor,
+    ) -> None:
+        """Run the next forwards on another layer's weights of the same shape."""
+        self.engine.set_weights(w1, w1_scale, w2, w2_scale)
+
+    def prepare(self, local_tokens, tail: bool = False) -> None:
+        """Collective: compile + arm the launch configs of these local token
+        counts (tail: also their fused-tail variants, ag_rs)."""
+        self.engine.prepare(local_tokens, tail)
 
     def poll_errors(self) -> int:
         """Nonzero if a wait inside the kernel gave up (a peer never arrived)."""
