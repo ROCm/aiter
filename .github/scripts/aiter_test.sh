@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 MULTIGPU=${MULTIGPU:-FALSE}
 SHARD_TOTAL=${SHARD_TOTAL:-5}
 SHARD_IDX=${SHARD_IDX:-0}
@@ -26,8 +28,13 @@ if [[ "$MULTIGPU" == "TRUE" ]]; then
 else
     if [[ -z "${AITER_TEST:-}" ]]; then
         echo "AITER_TEST is not set"
-        # Recursively find all files under op_tests, excluding op_tests/multigpu_tests
-        mapfile -t files < <(find op_tests -maxdepth 1 -type f -name "*.py" | sort)
+        # Find all files under op_tests root and op_tests/flydsl_tests
+        mapfile -t files < <(
+            {
+                find op_tests -maxdepth 1 -type f -name "*.py"
+                find op_tests/flydsl_tests -maxdepth 1 -type f -name "test_*.py"
+            } | sort
+        )
     else
         # If AITER_TEST contains multiple files separated by whitespace, convert to an array
         read -r -a files <<< "$AITER_TEST"
@@ -83,7 +90,12 @@ for file in "${sharded_files[@]}"; do
     fi
     # Persistent MLA op-tests always pass work_meta_data; disable the decode
     # batch gate so they exercise the persistent kernel at every batch size.
-    test_cmd=(timeout 60m python3 "$file")
+    runner_mode=$(python3 "${SCRIPT_DIR}/classify_test.py" "$file" 2>/dev/null || echo "PYTHON")
+    if [[ "$runner_mode" == "PYTEST" ]]; then
+        test_cmd=(timeout 60m python3 -m pytest -v "$file")
+    else
+        test_cmd=(timeout 60m python3 "$file")
+    fi
     case "$file" in
         op_tests/multigpu_tests/bench_mega_moe.py)
             {
