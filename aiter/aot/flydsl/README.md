@@ -14,7 +14,7 @@ the JIT path hits the cache instead of compiling again.
 | `chunk_gdn_h.py` | `CHUNK_GDN_H` | chunk-gdn-h opt (K5) kernels |
 | `unified_attention.py` | `UNIFIED_ATTENTION` | gfx950 fp8 unified-attention kernels (no CSV; fixed prefill/decode cross-product) |
 | `mega_moe.py` | `MEGA_MOE` | MegaMoE A8W4 profile bundles for MTPR 8192/16384/32768 |
-| `fmha_fp8.py` | `FMHA_FP8` | gfx950 FP8 flash-attention forward, per head shape listed in `configs/fmha_fp8_aot.csv` + `configs/model_configs/*_fmha_fp8_aot.csv` |
+| `fmha_fp8.py` | `FMHA_FP8` | gfx950 FP8 flash-attention forward, per head shape in `DEFAULT_SHAPES` |
 | `common.py` | — | Shared job collection, the deadlock-free fork pool, and cache-hit checking logic |
 
 ---
@@ -68,16 +68,14 @@ python -m aiter.aot.flydsl.mega_moe --experts-per-rank 48
 The FP8 flash-attention kernel picks its tile, rescale threshold and split-K
 factor per call, so a serving process JIT-compiles each new combination on the
 request path. `fmha_fp8` enumerates every combination the wrapper's heuristics
-can reach for each head shape listed in `AITER_CONFIG_FMHA_FP8_AOT_FILE`: the
-header-only `configs/fmha_fp8_aot.csv` merged with
-`configs/model_configs/*_fmha_fp8_aot.csv`. Add a model by adding a row
-(`cu_num,num_heads,num_kv_heads,head_dim,head_dim_v,layout,model`, heads per rank,
-layout `varlen_cross` for the chunked-prefill serving path).
+can reach for each head shape in its `DEFAULT_SHAPES` table. Add a model by
+adding an entry (`num_heads, num_kv_heads, head_dim, head_dim_v, layout`, heads
+per rank, layout `varlen_cross` for the chunked-prefill serving path).
 
 ```bash
 # every configured shape (Kimi-K3 at TP8: 12:12:192:128 -> 92 kernels)
 python -m aiter.aot.flydsl.fmha_fp8
-# ad hoc shape, without touching the CSVs
+# ad hoc shape, without editing DEFAULT_SHAPES
 python -m aiter.aot.flydsl.fmha_fp8 --shape 12:12:192:128
 ```
 
