@@ -131,24 +131,26 @@ def _check_fp8_arch(arch: str, fmt: str, q_dtype: torch.dtype) -> None:
 # Row pitch padding, and the scratch the kernel takes beyond the tiles. Both
 # hold only for bf16 tiles with the async path off, which is every gfx942
 # launch: fp8 dots are rejected there and its launch config keeps ASYNC_LDS off.
+# A nonzero KV_LDS_PAD replaces the pad on the KV tile alone.
 _LDS_PAD = 8
 _LDS_SCRATCH_PER_BLOCK_K = 32
 
 
-def _check_lds_budget(arch, block_k, kv_lora_rank, qk_rope_head_dim):
+def _check_lds_budget(arch, block_k, kv_lora_rank, qk_rope_head_dim, kv_lds_pad):
     """Reject a geometry whose tiles cannot fit, naming what would.
 
-    Left to the launcher this surfaces as an opaque OutOfResources. gfx942 is
-    the only arch checked: it already takes the smaller of the two tiles this
-    wrapper selects, so a latent too wide to fit has nowhere left to go. gfx950
-    is left to the launcher, as before.
+    kv_lds_pad is the launch's KV_LDS_PAD, so prefill is checked at the wider
+    pitch it stages at. Left to the launcher this surfaces as an opaque
+    OutOfResources. gfx942 is the only arch checked: it already takes the
+    smaller of the two tiles this wrapper selects, so a latent too wide to fit
+    has nowhere left to go. gfx950 is left to the launcher, as before.
     """
     if arch != "gfx942":
         return
     budget = arch_info._LDS_CAP_BYTES[arch]
     rope = block_k * (qk_rope_head_dim + _LDS_PAD) * 2 if qk_rope_head_dim else 0
     need = (
-        block_k * (kv_lora_rank + _LDS_PAD) * 2
+        block_k * (kv_lora_rank + (kv_lds_pad or _LDS_PAD)) * 2
         + rope
         + _LDS_SCRATCH_PER_BLOCK_K * block_k
     )
@@ -719,7 +721,9 @@ def sparse_mla_fwd(
         has_extra=False,
         block_k=block_k,
     )
-    _check_lds_budget(arch, block_k, kv_lora_rank, qk_rope_head_dim)
+    # bf16-staged tiles only; fp8 dots stage raw fp8 in their own layout
+    kv_lds_pad = 16 if num_queries >= _PREFILL_MIN_ROWS and not fp8_dots else 0
+    _check_lds_budget(arch, block_k, kv_lora_rank, qk_rope_head_dim, kv_lds_pad)
 
     # Q is read once per query without split-K, and re-read by every split
     q_cache = ".cg" if num_splits == 1 else ""
@@ -788,8 +792,7 @@ def sparse_mla_fwd(
         FP8_MFMA=fp8_dots,
         ASYNC_LDS=async_lds_on,
         GATHER_CACHE="",
-        # bf16-staged tiles only; fp8 dots stage raw fp8 in their own layout
-        KV_LDS_PAD=16 if num_queries >= _PREFILL_MIN_ROWS and not fp8_dots else 0,
+        KV_LDS_PAD=kv_lds_pad,
         q_scl_ptr=q_scale,
         Q_FP8=q_is_fp8,
         lse_ptr=lse,

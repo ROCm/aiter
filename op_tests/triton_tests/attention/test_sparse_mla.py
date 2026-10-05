@@ -219,33 +219,48 @@ def test_lds_budget_gfx950_is_unchecked():
 
     The footprint model holds only for gfx942's bf16, non-async tiles.
     """
-    smd._check_lds_budget("gfx950", 64, 2048, 64)
+    smd._check_lds_budget("gfx950", 64, 2048, 64, kv_lds_pad=16)
 
 
 @pytest.mark.parametrize(
-    "kv_lora_rank, rope, need",
+    "kv_lds_pad, kv_lora_rank, rope, need",
     [
-        (512, 0, None),
-        (512, 64, None),
-        (1000, 0, None),  # exactly 64 KB
-        (1008, 0, 66048),
-        (1024, 0, 67072),
-        (1024, 64, 71680),
-        (2048, 0, 132608),
+        # decode: the KV tile keeps the kernel's default pad
+        (0, 512, 0, None),
+        (0, 512, 64, None),
+        (0, 512, 256, None),
+        (0, 1000, 0, None),  # exactly 64 KB
+        (0, 1008, 0, 66048),
+        (0, 512, 512, 67584),
+        (0, 1024, 0, 67072),
+        (0, 1024, 64, 71680),
+        (0, 2048, 0, 132608),
+        # prefill: the launch pads the KV tile's rows by 16
+        (16, 512, 0, None),
+        (16, 512, 64, None),
+        (16, 512, 256, None),
+        (16, 992, 0, None),  # exactly 64 KB
+        (16, 1000, 0, 66048),
+        (16, 512, 512, 68096),
+        (16, 1024, 0, 67584),
+        (16, 1024, 64, 72192),
+        (16, 2048, 0, 133120),
     ],
 )
-def test_lds_budget_gfx942_boundary(kv_lora_rank, rope, need):
-    """CPU-only: the gfx942 64 KB guard, including the measured rejects.
+def test_lds_budget_gfx942_boundary(kv_lds_pad, kv_lora_rank, rope, need):
+    """CPU-only: the gfx942 64 KB guard at the decode and prefill KV pads.
 
-    The GPU suite only launches the default 512/64 geometry. These are the
-    rope-free and separated-rope points from the OutOfResources sweep.
+    The GPU suite only launches the default 512/64 geometry. The power-of-two
+    rejects are the byte counts OutOfResources reported for them. 992, 1000 and
+    1008 only pin the comparison at exactly 64 KB: the KV tile's shared layout
+    takes a power-of-two width, so no launch reaches that point.
     """
     block_k = smd._arch_block_k("gfx942")
     if need is None:
-        smd._check_lds_budget("gfx942", block_k, kv_lora_rank, rope)
+        smd._check_lds_budget("gfx942", block_k, kv_lora_rank, rope, kv_lds_pad)
         return
     with pytest.raises(ValueError, match=rf"needs {need} B of LDS"):
-        smd._check_lds_budget("gfx942", block_k, kv_lora_rank, rope)
+        smd._check_lds_budget("gfx942", block_k, kv_lora_rank, rope, kv_lds_pad)
 
 
 def test_ds_mla_format():
