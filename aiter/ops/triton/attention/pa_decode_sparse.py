@@ -801,10 +801,9 @@ def _pa_decode_sparse_gfx950_gluon(
         # Rows that share KV rows reuse them through the cache, so skip .cg.
         prefill_kw["GATHER_CACHE"] = ""
 
-    # Rows of several head blocks on one XCD (shared L2); not for SWA-only prefill
-    # or launches padded past the split count.
-    # Also a bf16 row's single 32/64-head program without split-K: neighbouring
-    # rows read the same KV rows.
+    # One XCD (and L2) for programs that read the same KV rows: a row's head blocks,
+    # or neighbouring rows of bf16's 32/64-head programs without split-K. Not for
+    # SWA-only prefill or launches padded past the split count.
     rows_share = heads_blocks > 1 or (staged_bf16 and BLOCK_M > 16 and num_splits == 1)
     xcd_remap = (
         get_num_xcds()

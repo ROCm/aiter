@@ -30,6 +30,17 @@ generation, so the tags here carry the generation instead:
     "fp8_dsv32_mla"   DeepSeek-V3.2 (also Kimi-K3), 656 B per token, token-major
                       records: 512 fp8 | 4 f32 per-128 scales | 64 bf16 rope.
                       Rope is appended, so this requires ROPE_SEPARATE.
+
+Tile walks, per segment (_segment):
+
+    _dsv4_segment     fp8_dsv4_mla: slot ids a tile ahead, 16 lanes x 32 B per row,
+                      softmax row reductions through LDS (_row_reduce_lds)
+    _async_segment    ASYNC_LDS: the tile copied straight into LDS (fp8 dots)
+    _staged_segment   the other formats: gathered into registers, dequantized,
+                      stored to LDS; fp8 tiles are gathered a tile ahead
+
+Output: the attention kernel without SPLIT_K, else _sparse_mla_reduce. Either store
+can apply the inverse RoPE + MXFP8 epilogue (_epilogue_store).
 """
 
 from triton.experimental import gluon
@@ -1336,7 +1347,7 @@ def _qkpv_lds(
 
 # ---------------------------------------------------------------------------
 # Non-prefetched path: bf16 segments, and the peeled masked tail when UNI_TILE
-# is off (dsv4/uniform only; tensor/dsmla require UNI_TILE).
+# is off (uniform only; tensor/dsmla require UNI_TILE, dsv4 takes _dsv4_segment).
 # ---------------------------------------------------------------------------
 
 
@@ -1673,8 +1684,7 @@ def _staged_segment(
     return m_i, l_i, acc
 
 
-# The fp8_dsv4_mla tile walk: a tile's slot ids for all its layouts in one round
-# trip, a tile ahead; 16 lanes per row. PREFETCH issues the gathers a tile ahead too.
+# The fp8_dsv4_mla walk and its helpers.
 
 
 @gluon.jit
@@ -1836,7 +1846,7 @@ def _dsv4_segment(
 ):
     """The fp8_dsv4_mla walk (UNI_TILE). A tile's slot ids are read a tile ahead
     of its gathers; PREFETCH also issues the gathers a tile ahead, after staging
-    the current tile, so no tile is carried across the back edge."""
+    the current tile, so the in-flight tile needs no back-edge copy."""
     BK: gl.constexpr = cfg.BLOCK_K
     offs_full = gl.arange(0, cfg.KV_DIM, layout=gl.SliceLayout(0, cfg.gather_l))
     offs_rope = gl.arange(0, cfg.ROPE_L, layout=gl.SliceLayout(0, cfg.gather_rope_l))
