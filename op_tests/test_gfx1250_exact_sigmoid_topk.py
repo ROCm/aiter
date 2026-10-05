@@ -102,21 +102,23 @@ def _assert_matches_legacy(
     )
 
 
-@pytest.mark.parametrize("api", ["biased_grouped_topk", "topk_gating"])
+# Both public APIs launch the same exact kernel. Run its semantic matrix once;
+# the strided CUDAGraph test below still exercises both dispatch sites.
 @pytest.mark.parametrize("rows", [1, 2, 4, 8, 32, 128])
 @pytest.mark.parametrize("renorm,scale", [(True, 1.0), (False, 2.5)])
-def test_exact_sigmoid_topk_matches_legacy(api, rows, renorm, scale):
+def test_exact_sigmoid_topk_matches_legacy(rows, renorm, scale):
     torch.manual_seed(17 + rows)
     logits = torch.randn((rows, EXPERTS), dtype=torch.bfloat16, device="cuda")
     bias = (torch.randn(EXPERTS, device="cuda") * 0.1).to(torch.bfloat16)
     expected = _run_legacy(logits, bias, renorm=renorm, scale=scale)
-    actual = _run_public(api, logits, bias, renorm=renorm, scale=scale)
+    actual = _run_public(
+        "biased_grouped_topk", logits, bias, renorm=renorm, scale=scale
+    )
     _assert_matches_legacy(expected, actual)
 
 
-@pytest.mark.parametrize("api", ["biased_grouped_topk", "topk_gating"])
 @pytest.mark.parametrize("case", ["all_tie", "plateau", "extreme", "nan"])
-def test_exact_sigmoid_topk_preserves_legacy_edge_semantics(api, case):
+def test_exact_sigmoid_topk_preserves_legacy_edge_semantics(case):
     torch.manual_seed(2026)
     bias = torch.zeros(EXPERTS, dtype=torch.bfloat16, device="cuda")
     if case == "all_tie":
@@ -142,7 +144,7 @@ def test_exact_sigmoid_topk_preserves_legacy_edge_semantics(api, case):
 
     _assert_matches_legacy(
         _run_legacy(logits, bias),
-        _run_public(api, logits, bias),
+        _run_public("biased_grouped_topk", logits, bias),
     )
 
 
