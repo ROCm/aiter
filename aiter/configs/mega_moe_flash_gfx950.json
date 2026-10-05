@@ -1,0 +1,3130 @@
+{
+  "schema_version": 1,
+  "architecture": "gfx950",
+  "shape": [
+    5120,
+    2304,
+    384,
+    6
+  ],
+  "fixed": {
+    "2": {
+      "configs": [
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 128,
+            "num_waves": 2,
+            "grid_mult": 1,
+            "num_dispatch_cu": 8,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 3,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "b_hoist": false
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 32,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 512,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 32,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 3,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "b_hoist": false,
+            "bf16_lds": true
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 32,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 512,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 16,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 3,
+            "waves_per_eu_hint": 1,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "persist_strided": true,
+            "ascale_prefetch": false
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 32,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 32,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 3,
+            "work_shards": 1
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "ascale_prefetch": false
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 32,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 32,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 3,
+            "work_shards": 1
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "persist_strided": true,
+            "spatial_partition": 802
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 64,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 32,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 3,
+            "work_shards": 1
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 512,
+            "persist": true,
+            "persist_cu": 128,
+            "use_nt": true,
+            "spatial_partition": 202
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 64,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 512,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 32,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 3,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 512,
+            "persist": true,
+            "persist_cu": 128,
+            "use_nt": true
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 32,
+            "tile_n": 512,
+            "num_waves": 8,
+            "grid_mult": 1,
+            "num_dispatch_cu": 16,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 3,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 32,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "persist_strided": true
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 64,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 64,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 3,
+            "work_shards": 1
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "b_hoist": false
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 32,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 3,
+            "work_shards": 1
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "ascale_prefetch": false
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 64,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 3,
+            "work_shards": 2
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "persist_strided": true,
+            "b_hoist": false
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 64,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "b_hoist": false,
+            "spatial_partition": 802
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 512,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 64,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "ascale_prefetch": false,
+            "spatial_partition": 202
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 64,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 512,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 64,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "persist_strided": true,
+            "spatial_partition": 802
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 64,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "persist_strided": true,
+            "spatial_partition": 0
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 64,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 128,
+            "use_nt": true,
+            "spatial_partition": 102
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 64,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "ascale_prefetch": false
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 64,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "b_hoist": false
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 64,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 512,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "spatial_partition": 0
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 64,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "persist_strided": true,
+            "spatial_partition": 102
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "ascale_prefetch": false,
+            "bf16_lds": true
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 192,
+            "use_nt": true,
+            "bf16_lds": true
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "b_hoist": false,
+            "spatial_partition": 802
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "b_hoist": false,
+            "bf16_lds": true
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "b_hoist": false,
+            "spatial_partition": 102
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "b_hoist": false,
+            "spatial_partition": 0
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "ascale_prefetch": false,
+            "spatial_partition": 0
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "b_hoist": false,
+            "spatial_partition": 202
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "ascale_prefetch": false,
+            "spatial_partition": 802
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "b_hoist": false,
+            "spatial_partition": 0
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "b_hoist": false,
+            "bf16_lds": true
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "ascale_prefetch": false
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "persist_strided": true
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "persist_strided": true,
+            "spatial_partition": 102
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 64,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "persist_strided": true
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "b_hoist": false,
+            "spatial_partition": 802
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "b_hoist": false
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "b_hoist": false
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 64,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "ascale_prefetch": false,
+            "bf16_lds": true
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 64,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "persist_strided": true,
+            "b_hoist": false,
+            "spatial_partition": 202
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 64,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "b_hoist": false,
+            "spatial_partition": 802
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 64,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "ascale_prefetch": false,
+            "spatial_partition": 202
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 192,
+            "use_nt": true,
+            "spatial_partition": 802
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "ascale_prefetch": false,
+            "spatial_partition": 202
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 64,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "b_hoist": false,
+            "spatial_partition": 202
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 64,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "b_hoist": false
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "ascale_prefetch": false,
+            "spatial_partition": 802
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 256,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "ascale_prefetch": false,
+            "spatial_partition": 102
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "b_hoist": false,
+            "spatial_partition": 202
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 256,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "ascale_prefetch": false
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 192,
+            "use_nt": true,
+            "b_hoist": false
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "ascale_prefetch": false,
+            "bf16_lds": true
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 32,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 192,
+            "use_nt": true,
+            "b_hoist": false,
+            "spatial_partition": 102
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 64,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "persist_strided": true,
+            "ascale_prefetch": false
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 64,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "b_hoist": false,
+            "spatial_partition": 202
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 32,
+            "tile_n": 512,
+            "num_waves": 8,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 32,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "spatial_partition": 0
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        }
+      ],
+      "tokens": {
+        "1": 0,
+        "2": 1,
+        "3": 2,
+        "4": 3,
+        "5": 4,
+        "6": 5,
+        "7": 6,
+        "8": 7,
+        "9": 8,
+        "10": 9,
+        "11": 10,
+        "12": 11,
+        "13": 12,
+        "14": 13,
+        "15": 14,
+        "16": 15,
+        "17": 16,
+        "18": 17,
+        "19": 17,
+        "20": 18,
+        "21": 19,
+        "22": 20,
+        "23": 21,
+        "24": 22,
+        "25": 23,
+        "26": 24,
+        "27": 25,
+        "28": 26,
+        "29": 27,
+        "30": 28,
+        "31": 29,
+        "32": 30,
+        "33": 24,
+        "34": 31,
+        "35": 32,
+        "36": 33,
+        "37": 34,
+        "38": 35,
+        "39": 36,
+        "40": 27,
+        "41": 37,
+        "42": 38,
+        "43": 28,
+        "44": 39,
+        "45": 40,
+        "46": 41,
+        "47": 42,
+        "48": 43,
+        "49": 25,
+        "50": 44,
+        "51": 45,
+        "52": 20,
+        "53": 38,
+        "54": 46,
+        "55": 47,
+        "56": 48,
+        "57": 31,
+        "58": 49,
+        "59": 24,
+        "60": 50,
+        "61": 48,
+        "62": 51,
+        "63": 44,
+        "64": 52,
+        "96": 48,
+        "128": 53,
+        "192": 54,
+        "256": 55,
+        "512": 56
+      }
+    },
+    "4": {
+      "configs": [
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 4,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 3,
+            "waves_per_eu_hint": 1,
+            "swizzle_a": false,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "b_hoist": false,
+            "bf16_lds": true
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 16,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 512,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 8,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 3,
+            "waves_per_eu_hint": 1,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "b_hoist": false
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 16,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 512,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 16,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 3
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 128,
+            "use_nt": true,
+            "b_hoist": false
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 64,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 512,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 16,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 3
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "persist_strided": true,
+            "spatial_partition": 102
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 32,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 16,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 3,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 192,
+            "use_nt": true,
+            "spatial_partition": 0
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 64,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 32,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 3,
+            "swizzle_a": false,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 192,
+            "use_nt": true,
+            "ascale_prefetch": false
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 32,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 32,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 3,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 512,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "ascale_prefetch": false
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 64,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 512,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 32,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 3,
+            "waves_per_eu_hint": 1,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 512,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "spatial_partition": 802
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 64,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 512,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 32,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 3,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 512,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "spatial_partition": 0
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 512,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 64,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 3,
+            "waves_per_eu_hint": 1,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "persist_strided": true
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 32,
+            "tile_n": 512,
+            "num_waves": 8,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 3,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 32,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 128,
+            "use_nt": true
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 64,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 64,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 3,
+            "work_shards": 1
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "ascale_prefetch": false,
+            "spatial_partition": 102
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 64,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 64,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 3,
+            "work_shards": 1
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "spatial_partition": 202
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 64,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 64,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 3,
+            "work_shards": 1
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "ascale_prefetch": false,
+            "bf16_lds": true
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 32,
+            "tile_n": 256,
+            "num_waves": 8,
+            "grid_mult": 1,
+            "num_dispatch_cu": 32,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 3,
+            "work_shards": 2
+          },
+          "stage2": {
+            "block_m": 32,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 192,
+            "use_nt": true
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 64,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 192,
+            "use_nt": true,
+            "spatial_partition": 202,
+            "bf16_lds": true
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 64,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 32,
+            "tile_n": 512,
+            "num_waves": 8,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 3,
+            "waves_per_eu_hint": 1,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 32,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 192,
+            "use_nt": true,
+            "spatial_partition": 0,
+            "bf16_lds": true
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 64,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "b_hoist": false
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 512,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 64,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 128,
+            "use_nt": true,
+            "b_hoist": false,
+            "bf16_lds": true
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 512,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 64,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "ascale_prefetch": false
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 512,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 64,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "swizzle_a": false,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 192,
+            "use_nt": true,
+            "spatial_partition": 0
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "b_hoist": false,
+            "spatial_partition": 102
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 512,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "b_hoist": false,
+            "spatial_partition": 0
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "b_hoist": false,
+            "spatial_partition": 202
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "spatial_partition": 802
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "ascale_prefetch": false,
+            "spatial_partition": 802
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "ascale_prefetch": false,
+            "bf16_lds": true
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 32,
+            "tile_n": 256,
+            "num_waves": 8,
+            "grid_mult": 1,
+            "num_dispatch_cu": 64,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 32,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "spatial_partition": 202,
+            "bf16_lds": true
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "ascale_prefetch": false
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 128,
+            "use_nt": true
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 192,
+            "use_nt": true,
+            "spatial_partition": 0
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "persist_strided": true,
+            "ascale_prefetch": false,
+            "spatial_partition": 0
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 192,
+            "use_nt": true,
+            "ascale_prefetch": false
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 128,
+            "use_nt": true,
+            "spatial_partition": 802
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 192,
+            "use_nt": true,
+            "spatial_partition": 102
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "persist_strided": true,
+            "ascale_prefetch": false,
+            "spatial_partition": 802
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "persist_strided": true,
+            "spatial_partition": 202
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 128,
+            "use_nt": true,
+            "spatial_partition": 102
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "persist_strided": true,
+            "ascale_prefetch": false,
+            "spatial_partition": 102
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "swizzle_a": false,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "ascale_prefetch": false
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 32,
+            "tile_n": 256,
+            "num_waves": 8,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 32,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 192,
+            "use_nt": true,
+            "spatial_partition": 0
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "ascale_prefetch": false,
+            "bf16_lds": true
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "ascale_prefetch": false
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 512,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "spatial_partition": 102
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "spatial_partition": 802
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "b_hoist": false,
+            "spatial_partition": 802
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "ascale_prefetch": false
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 256,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 512,
+            "persist": true,
+            "persist_cu": 128,
+            "use_nt": true,
+            "spatial_partition": 0
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "ascale_prefetch": false,
+            "spatial_partition": 802
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 32,
+            "tile_n": 256,
+            "num_waves": 8,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 32,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 192,
+            "use_nt": true
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "ascale_prefetch": false,
+            "spatial_partition": 102
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 32,
+            "tile_n": 256,
+            "num_waves": 8,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 32,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 128,
+            "use_nt": true,
+            "ascale_prefetch": false,
+            "spatial_partition": 102
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 32,
+            "tile_n": 256,
+            "num_waves": 8,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 32,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "persist_strided": true,
+            "spatial_partition": 802
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 192,
+            "use_nt": true,
+            "spatial_partition": 802
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "persist_strided": true,
+            "spatial_partition": 802
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 64,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 32,
+            "tile_n": 256,
+            "num_waves": 8,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 32,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "persist_strided": true,
+            "spatial_partition": 802
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 64,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 32,
+            "tile_n": 256,
+            "num_waves": 8,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "swizzle_a": false,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 32,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 128,
+            "use_nt": true,
+            "spatial_partition": 802
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 32,
+            "tile_n": 512,
+            "num_waves": 8,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 32,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": false,
+            "spatial_partition": 0
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 64,
+            "tile_n": 512,
+            "num_waves": 8,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": true,
+            "async_a_copy": false,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 64,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "spatial_partition": 802,
+            "bf16_lds": true
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 256,
+          "combine_waves": 8
+        }
+      ],
+      "tokens": {
+        "1": 0,
+        "2": 1,
+        "3": 2,
+        "4": 3,
+        "5": 4,
+        "6": 5,
+        "7": 6,
+        "8": 7,
+        "9": 8,
+        "10": 9,
+        "11": 10,
+        "12": 11,
+        "13": 12,
+        "14": 13,
+        "15": 14,
+        "16": 15,
+        "17": 16,
+        "18": 17,
+        "19": 18,
+        "20": 19,
+        "21": 20,
+        "22": 21,
+        "23": 22,
+        "24": 23,
+        "25": 24,
+        "26": 25,
+        "27": 26,
+        "28": 27,
+        "29": 28,
+        "30": 29,
+        "31": 30,
+        "32": 31,
+        "33": 32,
+        "34": 26,
+        "35": 33,
+        "36": 34,
+        "37": 35,
+        "38": 36,
+        "39": 37,
+        "40": 38,
+        "41": 39,
+        "42": 28,
+        "43": 39,
+        "44": 40,
+        "45": 28,
+        "46": 41,
+        "47": 42,
+        "48": 43,
+        "49": 44,
+        "50": 45,
+        "51": 24,
+        "52": 39,
+        "53": 28,
+        "54": 25,
+        "55": 46,
+        "56": 47,
+        "57": 48,
+        "58": 49,
+        "59": 42,
+        "60": 50,
+        "61": 51,
+        "62": 48,
+        "63": 42,
+        "64": 52,
+        "96": 53,
+        "128": 54,
+        "192": 55,
+        "256": 56,
+        "512": 57,
+        "1024": 58
+      }
+    }
+  }
+}

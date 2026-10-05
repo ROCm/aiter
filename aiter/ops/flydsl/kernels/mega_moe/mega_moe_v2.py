@@ -33,6 +33,7 @@ class MegaMoEV2:
 
     # forward(mask_invalid_slots=...) is accepted: combine can skip -1 top-k slots.
     supports_combine_mask = True
+    supports_layer_weights = True
 
     # fmt: off
     def __init__(self, *, rank: int, world_size: int, model_dim: int, inter_dim: int, experts: int, topk: int,
@@ -115,7 +116,7 @@ class MegaMoEV2:
             run_mega_moe_stage1_bundle,
         )
 
-        self.sort_block_m = 32
+        self.sort_block_m = min(entry.config.stage1.sort_block_m for entry in self._bundle_plan.entries)
         self._s1_w1 = w1.contiguous().view(torch.uint8)
         self._s1_w1_scale = w1_scale.contiguous().view(torch.uint8)
         op = self.comb_op._gm
@@ -619,6 +620,7 @@ class MegaMoEV2:
                 mfma_amajor=config.mfma_amajor,
                 swizzle_a=config.swizzle_a,
                 async_a_copy=config.async_a_copy,
+                pair_k=config.pair_k,
                 num_dispatch_cu=config.num_dispatch_cu,
                 use_tile_resource=config.use_tile_resource,
                 waves_per_eu_hint=config.waves_per_eu_hint,
@@ -674,6 +676,11 @@ class MegaMoEV2:
         self, run_tokens, stream, slice_output, config: MegaMoEConfig, combine_ids=None
     ):
         """``combine_ids``: the top-k ids, when combine must skip their -1 slots."""
+        self.comb_op.cfg = replace(
+            self.comb_cfg,
+            combine_block_num=config.combine_blocks,
+            combine_warp_num_per_block=config.combine_waves,
+        )
         if config.stage2.aligned_pair:
             return self._run_aligned_pair_stage2(
                 run_tokens, config, stream, slice_output, combine_ids
@@ -697,11 +704,36 @@ class MegaMoEV2:
         return out_tok[:run_tokens] if slice_output else out_tok
 
     def forward(
-        self, x_bf16, wts, topk_ids, *, stream=None, slice_output=True, mask_invalid_slots=None
+        self, x_bf16, wts, topk_ids, *, stream=None, slice_output=True,
+        mask_invalid_slots=None, w1=None, w1_scale=None, w2=None, w2_scale=None,
+        config_tokens=None,
     ):
-        """``mask_invalid_slots``: ids may contain -1 (skipped, contributing zero).
-        None defers to AITER_MEGA_COMBINE_MASK (default off)."""
+        """Run one collective MoE invocation with optional prepared layer weights.
+
+        ``config_tokens`` must agree across ranks and cover their source counts.
+        Replacement weights use the constructor's shuffled MXFP4 layout.
+        ``mask_invalid_slots`` skips ids of -1; None uses AITER_MEGA_COMBINE_MASK.
+        """
         run_tokens = int(x_bf16.shape[0])
+        weights = (w1, w1_scale, w2, w2_scale)
+        if any(weight is not None for weight in weights):
+            if any(weight is None for weight in weights):
+                raise ValueError("per-layer weights require W13, W2 and both scales")
+            expected = (
+                self.epr * 2 * self.inter_dim * self.model_dim // 2,
+                self.epr * 2 * self.inter_dim * self.model_dim // 32,
+                self.epr * self.model_dim * self.inter_dim // 2,
+                self.epr * self.model_dim * self.inter_dim // 32,
+            )
+            for weight, size in zip(weights, expected):
+                if (
+                    weight.element_size() != 1 or weight.numel() != size
+                    or weight.device != self.dev or not weight.is_contiguous()
+                ):
+                    raise ValueError("per-layer weights must match the prepared geometry")
+            self._s1_w1, self._s1_w1_scale, self.w2, self.w2_scale = (
+                weight.view(torch.uint8) for weight in weights
+            )
         if run_tokens > self.mtpr:
             raise ValueError(f"run_tokens={run_tokens} > max_tok_per_rank={self.mtpr}")
         if x_bf16.dtype != torch.bfloat16 or not x_bf16.is_contiguous():
@@ -710,14 +742,16 @@ class MegaMoEV2:
             raise ValueError("wts must be contiguous float32")
         if topk_ids.dtype != torch.int32 or not topk_ids.is_contiguous():
             raise ValueError("topk_ids must be contiguous int32")
+        policy_tokens = run_tokens if config_tokens is None else int(config_tokens)
+        if policy_tokens < run_tokens or policy_tokens > self.mtpr:
+            raise ValueError("config_tokens must cover every source rank within MTPR")
+        config = self._select_config(policy_tokens)
         if self._s1_fixed_slot:
             x_q, scales = self.quantize(x_bf16)
             return self._run_joint(
                 x_q, scales, wts, topk_ids, run_tokens, stream, slice_output,
-                mask_invalid_slots=mask_invalid_slots,
+                config=config, mask_invalid_slots=mask_invalid_slots,
             )
-
-        config = self._select_config(run_tokens)
         prepare_stream = stream
         if prepare_stream is None:
             prepare_stream = fx.Stream(torch.cuda.current_stream().cuda_stream)
@@ -934,6 +968,11 @@ class MegaMoEV2:
             )
             self._preload_aligned_pair_stage2(config, stream)
         for entry in self._bundle_plan.entries:
+            self.comb_op.cfg = replace(
+                self.comb_cfg,
+                combine_block_num=entry.config.combine_blocks,
+                combine_warp_num_per_block=entry.config.combine_waves,
+            )
             for mask_topk_ids in (False, True):
                 self.comb_op.preload_combine_no_stage1(
                     self._g2_combine_placeholder,

@@ -2,9 +2,11 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 """Static MegaMoEV2 configuration rules for MI355X."""
 
+import json
 from bisect import bisect_left
 from dataclasses import dataclass, replace
 from functools import cache
+from pathlib import Path
 
 from . import envs
 
@@ -25,6 +27,7 @@ TOKEN_BUCKETS = (
     16384,
     32768,
 )
+FLASH_TOKEN_BUCKETS = tuple(range(1, 65)) + (96, 128, 192) + TOKEN_BUCKETS[7:]
 FIXED_GRID_MULT_VALUES = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32)
 P2P_FP8_MIN_MTPR = 1024
 # Fixed-slot (direct expert slots, no count exchange) is the default up to MTPR
@@ -76,6 +79,7 @@ class Stage1Config:
     work_shards: int = 8
     payload_chunk_rows: int = 0
     prepare_quant_cu: int = 64
+    pair_k: bool = False
 
 
 def stage1_bundle_identity(config: Stage1Config) -> Stage1Config:
@@ -108,6 +112,8 @@ class MegaMoEConfig:
     stage1: Stage1Config
     stage2: Stage2Config
     p2p_quant: str
+    combine_blocks: int = 128
+    combine_waves: int = 8
 
     def __post_init__(self):
         sbm = self.stage1.sort_block_m
@@ -161,7 +167,8 @@ class MegaMoEBundlePlan:
         # Empty DP ranks must still launch the same collective MegaMoE protocol
         # as non-empty ranks.  Use the smallest bundle geometry for that rank;
         # returning early would strand peers that have already entered dispatch.
-        bucket = TOKEN_BUCKETS[0] if tokens == 0 else nearest_token_bucket(tokens)
+        buckets = tuple(entry.token_bucket for entry in self.entries)
+        bucket = buckets[0] if tokens == 0 else nearest_token_bucket(tokens, buckets)
         for entry in self.entries:
             if entry.token_bucket == bucket:
                 return entry
@@ -170,20 +177,29 @@ class MegaMoEBundlePlan:
         )
 
 
-def nearest_token_bucket(tokens: int) -> int:
+def nearest_token_bucket(tokens: int, buckets=TOKEN_BUCKETS) -> int:
     if tokens <= 0:
         raise ValueError(f"tokens must be positive, got {tokens}")
-    index = bisect_left(TOKEN_BUCKETS, tokens)
+    index = bisect_left(buckets, tokens)
     if index == 0:
-        return TOKEN_BUCKETS[0]
-    if index == len(TOKEN_BUCKETS):
-        return TOKEN_BUCKETS[-1]
-    lower, upper = TOKEN_BUCKETS[index - 1], TOKEN_BUCKETS[index]
+        return buckets[0]
+    if index == len(buckets):
+        return buckets[-1]
+    lower, upper = buckets[index - 1], buckets[index]
     return upper if upper - tokens <= tokens - lower else lower
 
 
 def mtpr_config_class(mtpr: int) -> int:
     return mtpr if mtpr <= P2P_FP8_MIN_MTPR else MAX_MTPR_CLASS
+
+
+def _use_fixed_slots(mtpr: int, world_size: int, experts_per_rank: int) -> bool:
+    geometry = (world_size, experts_per_rank)
+    if geometry in ((2, 192), (4, 96)):
+        limit = envs.fixed_slot_max_mtpr(512 if world_size == 2 else 1024)
+    else:
+        limit = FIXED_SLOT_MAX_MTPR
+    return mtpr <= limit and geometry in ((8, 48), (2, 192), (4, 96))
 
 
 def _fixed_dispatch_cu(bucket: int) -> int:
@@ -359,13 +375,155 @@ def _select_large_stage2(
 
 
 @cache
+def _flash_tuning_data():
+    path = Path(__file__).resolve().parents[4] / "configs/mega_moe_flash_gfx950.json"
+    return json.loads(path.read_text())
+
+
+def _select_flash_config(bucket, mtpr_class, world_size, fixed):
+    if fixed:
+        policy = _flash_tuning_data()["fixed"][str(world_size)]
+        config_id = policy["tokens"].get(str(bucket))
+        if config_id is not None:
+            config = policy["configs"][config_id]
+            return MegaMoEConfig(
+                stage1=Stage1Config(**config["stage1"]),
+                stage2=Stage2Config(**config["stage2"]),
+                p2p_quant=config["p2p_quant"],
+                combine_blocks=config["combine_blocks"],
+                combine_waves=config["combine_waves"],
+            )
+    bucket = nearest_token_bucket(bucket)
+    # W13: rows, columns, waves, producer CUs, work shards, weight cache hint.
+    # W2: columns, persistent CUs, non-temporal weights, strided scheduling.
+    if fixed and world_size == 2:
+        rows = {
+            1: ((16, 128, 2, 8, 4, 3), (128, 256, True, False), (16, 4)),
+            4: ((16, 256, 4, 16, 1, 3), (256, 256, True, False), (64, 4)),
+            8: ((16, 512, 4, 16, 4, 3), (256, 256, True, False), (128, 4)),
+            16: ((16, 256, 4, 64, 4, 0), (256, 128, True, False), (128, 8)),
+            32: ((32, 256, 8, 64, 4, 0), (256, 192, True, False), (128, 8)),
+            64: ((32, 512, 8, 128, 4, 0), (256, 256, False, False), (128, 8)),
+            128: ((32, 512, 8, 128, 4, 0), (256, 256, False, False), (32, 4)),
+            256: ((32, 512, 8, 128, 4, 0), (256, 256, False, False), (128, 8)),
+            512: ((32, 512, 8, 128, 4, 0), (128, 256, True, False), (128, 8)),
+            1024: ((64, 512, 8, 128, 4, 0), (128, 256, True, False), (256, 8)),
+        }
+    elif fixed:
+        rows = {
+            1: ((16, 256, 2, 32, 4, 3), (256, 256, True, False), (16, 4)),
+            4: ((16, 256, 2, 32, 4, 3), (256, 128, True, False), (16, 4)),
+            8: ((16, 512, 4, 32, 4, 3), (256, 256, True, False), (128, 8)),
+            16: ((32, 256, 8, 32, 2, 3), (128, 256, True, False), (32, 4)),
+            32: ((32, 256, 8, 64, 4, 0), (256, 256, True, True), (128, 8)),
+            64: ((32, 256, 8, 32, 4, 3), (256, 128, True, False), (128, 8)),
+            128: ((16, 512, 4, 64, 4, 0), (256, 256, True, False), (64, 4)),
+            256: ((32, 512, 8, 32, 4, 3), (256, 128, True, False), (128, 8)),
+            512: ((32, 512, 8, 128, 4, 0), (256, 256, False, False), (128, 8)),
+            1024: ((64, 512, 8, 128, 4, 0), (128, 256, False, False), (128, 8)),
+        }
+    elif world_size == 2:
+        rows = {
+            1: ((16, 128, 2, 128, 4, 3), (128, 256, True, False), (64, 4)),
+            4: ((16, 256, 4, 128, 4, 3), (128, 256, True, False), (64, 4)),
+            8: ((16, 512, 4, 128, 1, 3), (128, 256, True, False), (64, 4)),
+            16: ((16, 512, 4, 16, 4, 0), (256, 192, True, False), (64, 4)),
+            32: ((16, 512, 4, 16, 4, 0), (256, 192, True, False), (64, 4)),
+            64: ((16, 512, 4, 128, 4, 0), (128, 256, True, False), (32, 4)),
+            128: ((16, 512, 4, 128, 4, 0), (256, 192, True, False), (128, 8)),
+            256: ((16, 512, 4, 128, 4, 0), (256, 256, True, True), (128, 8)),
+            512: ((32, 512, 8, 32, 4, 0), (128, 256, True, False), (128, 8)),
+            1024: ((64, 512, 8, 32, 1, 3), (128, 256, True, False), (128, 8)),
+        }
+    else:
+        rows = {
+            1: ((16, 256, 4, 32, 1, 3), (256, 256, True, False), (32, 4)),
+            4: ((16, 512, 4, 64, 2, 3), (512, 128, True, False), (128, 4)),
+            8: ((16, 512, 4, 64, 2, 3), (512, 128, True, False), (128, 4)),
+            16: ((16, 512, 4, 32, 4, 0), (256, 256, True, True), (128, 4)),
+            32: ((16, 512, 4, 32, 4, 0), (256, 256, True, True), (128, 4)),
+            64: ((16, 512, 4, 128, 4, 0), (512, 256, True, False), (128, 4)),
+            128: ((16, 512, 4, 64, 4, 0), (256, 256, True, True), (128, 8)),
+            256: ((32, 512, 8, 128, 1, 3), (256, 128, True, False), (64, 4)),
+            512: ((64, 512, 8, 64, 1, 3), (128, 256, True, False), (128, 8)),
+            1024: ((64, 512, 8, 32, 4, 0), (128, 256, True, False), (128, 8)),
+        }
+    if bucket <= 1024:
+        (bm, bn, waves, producers, shards, hint), (n2, cu2, nt2, strided), combine = (
+            rows[bucket]
+        )
+        stage1 = Stage1Config(
+            sort_block_m=bm,
+            tile_n=bn,
+            num_waves=waves,
+            grid_mult=1,
+            num_dispatch_cu=producers,
+            mfma_amajor=bm >= 32,
+            async_a_copy=True,
+            use_tile_resource=True,
+            b_nt=hint,
+            work_shards=shards,
+            payload_chunk_rows=0 if fixed else 256,
+        )
+        stage2 = Stage2Config(
+            block_m=min(bm, 64),
+            block_n=n2,
+            persist=True,
+            persist_cu=cu2,
+            use_nt=nt2,
+            persist_strided=strided,
+        )
+        if not fixed:
+            if world_size == 2 and bucket == 64:
+                stage2 = replace(stage2, b_hoist=False)
+            elif world_size == 2 and bucket == 128:
+                stage2 = replace(stage2, spatial_partition=0)
+            elif world_size == 2 and bucket == 512 and mtpr_class <= 1024:
+                stage2 = replace(stage2, bf16_lds=True)
+            elif world_size == 2 and bucket == 1024 and mtpr_class <= 1024:
+                stage1 = replace(stage1, payload_chunk_rows=1024, prepare_quant_cu=32)
+                stage2 = replace(stage2, bf16_lds=True)
+            elif world_size == 4 and bucket == 64:
+                stage2 = replace(stage2, spatial_partition=102)
+            elif world_size == 4 and bucket == 128:
+                stage1 = replace(stage1, mfma_amajor=True)
+                stage2 = replace(stage2, b_hoist=False)
+            elif world_size == 4 and bucket == 256:
+                stage2 = replace(stage2, spatial_partition=0)
+            elif world_size == 4 and bucket >= 512:
+                stage2 = replace(stage2, spatial_partition=202)
+    else:
+        stage1 = _select_large_stage1(bucket, 2304)
+        # N512 at M128 spills registers and consumes 151.6 KiB LDS.
+        if stage1.sort_block_m == 128:
+            stage1 = replace(stage1, tile_n=256)
+        stage2 = _select_large_stage2(bucket, stage1.sort_block_m, 5120)
+        combine = (128, 8)
+    return MegaMoEConfig(
+        stage1=stage1,
+        stage2=stage2,
+        p2p_quant="none" if mtpr_class <= 1024 else "fp8_blockwise_1x32",
+        combine_blocks=combine[0],
+        combine_waves=combine[1],
+    )
+
+
+@cache
 def _select_bucket_config(
     bucket: int,
     mtpr_class: int,
     model_dim: int,
     inter_dim: int,
     fixed_slot_dispatch: bool,
+    world_size: int,
+    experts_per_rank: int,
 ) -> MegaMoEConfig:
+    if (model_dim, inter_dim, experts_per_rank * world_size) == (
+        5120,
+        2304,
+        384,
+    ) and world_size in (2, 4):
+        return _select_flash_config(bucket, mtpr_class, world_size, fixed_slot_dispatch)
     if mtpr_class == MAX_MTPR_CLASS:
         stage1 = _select_large_stage1(bucket, inter_dim)
         stage2 = _select_large_stage2(bucket, stage1.sort_block_m, model_dim)
@@ -398,6 +556,12 @@ def select_mega_moe_config(
         raise ValueError(f"tokens={tokens} exceeds mtpr={mtpr}")
     if experts_per_rank <= 0:
         raise ValueError(f"experts_per_rank must be positive, got {experts_per_rank}")
+    if (model_dim, inter_dim, experts_per_rank * world_size) == (
+        5120,
+        2304,
+        384,
+    ) and world_size not in (2, 4):
+        raise ValueError("DeepSeek-V4.1-Flash MegaMoE requires EP2 or EP4")
     if not 0 < world_size <= 8:
         raise ValueError(f"world_size must be in [1, 8], got {world_size}")
     if model_dim <= 0 or inter_dim <= 0:
@@ -407,15 +571,14 @@ def select_mega_moe_config(
             "MegaMoE v2 fanout pair ids support at most "
             f"{MAX_FANOUT_EXPERTS_PER_RANK} experts per rank"
         )
-    bucket = nearest_token_bucket(tokens)
-    mtpr_class = mtpr_config_class(mtpr)
-    fixed_slot_dispatch = (
-        mtpr_class <= FIXED_SLOT_MAX_MTPR
-        and world_size == 8
-        and experts_per_rank == REFERENCE_EXPERTS_PER_RANK
+    buckets = (
+        FLASH_TOKEN_BUCKETS
+        if (model_dim, inter_dim, experts_per_rank * world_size) == (5120, 2304, 384)
+        else TOKEN_BUCKETS
     )
-    if fixed_slot_dispatch and bucket > FIXED_SLOT_MAX_MTPR:
-        raise ValueError(f"fixed-slot does not support token bucket {bucket}")
+    bucket = nearest_token_bucket(tokens, buckets)
+    mtpr_class = mtpr_config_class(mtpr)
+    fixed_slot_dispatch = _use_fixed_slots(mtpr_class, world_size, experts_per_rank)
     total_segments = world_size * experts_per_rank + world_size
     if total_segments > MAX_FANOUT_SEGMENTS:
         raise ValueError(
@@ -428,6 +591,8 @@ def select_mega_moe_config(
         model_dim,
         inter_dim,
         fixed_slot_dispatch,
+        world_size,
+        experts_per_rank,
     )
 
 
@@ -443,15 +608,16 @@ def build_mega_moe_bundle_plan(
     """Deduplicate variants while keeping Stage1/Stage2 selection atomic."""
     if mtpr <= 0 or mtpr & (mtpr - 1):
         raise ValueError(f"mtpr={mtpr} must be a positive power of two")
-    buckets = tuple(bucket for bucket in TOKEN_BUCKETS if bucket <= mtpr)
+    token_buckets = (
+        FLASH_TOKEN_BUCKETS
+        if (model_dim, inter_dim, experts_per_rank * world_size) == (5120, 2304, 384)
+        else TOKEN_BUCKETS
+    )
+    buckets = tuple(bucket for bucket in token_buckets if bucket <= mtpr)
     if not buckets or buckets[-1] != mtpr:
         raise ValueError(f"mtpr={mtpr} has no exact token bucket")
 
-    fixed_slot_dispatch = (
-        mtpr <= FIXED_SLOT_MAX_MTPR
-        and world_size == 8
-        and experts_per_rank == REFERENCE_EXPERTS_PER_RANK
-    )
+    fixed_slot_dispatch = _use_fixed_slots(mtpr, world_size, experts_per_rank)
     stage1_variants: list[Stage1Config] = []
     stage2_variants: list[Stage2BundleKey] = []
     stage1_ids: dict[Stage1Config, int] = {}

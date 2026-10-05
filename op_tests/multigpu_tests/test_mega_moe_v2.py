@@ -22,6 +22,13 @@ from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
 from aiter.utility import fp4_utils
 
 NETWORKS = {
+    "v4_1_flash": {
+        "model_dim": 5120,
+        "inter_dim": 2304,
+        "experts": 384,
+        "topk": 6,
+        "swiglu_limit": 10.0,
+    },
     # swiglu_limit 0.0 exercises the operator's default, unclamped SwiGLU.
     "glm52": {
         "model_dim": 6144,
@@ -111,6 +118,7 @@ def _make_inputs(
     force_fanout_boundary,
     inject_invalid_route,
     force_padding_boundary,
+    route="uniform",
 ):
     generator = torch.Generator(device=device).manual_seed(seed + rank)
     x = torch.randn(
@@ -120,6 +128,19 @@ def _make_inputs(
         (tokens, experts), dtype=torch.float32, device=device, generator=generator
     )
     values, ids = torch.topk(scores, topk, dim=-1)
+    if route != "uniform":
+        world = dist.get_world_size()
+        epr = experts // world
+        slot = torch.arange(topk, device=device)[None, :]
+        token = torch.arange(tokens, device=device)[:, None]
+        if route == "expert-boundary":
+            destination = (token + rank + slot) % world
+            local = torch.where(slot % 2 == 0, slot // world, epr - 1 - slot // world)
+            ids = destination * epr + local
+        elif route == "hot-rank0":
+            ids = (slot + epr - topk).expand(tokens, -1).clone()
+        else:
+            raise ValueError(f"unsupported route {route}")
     if force_fanout_boundary or inject_invalid_route or force_padding_boundary:
         if topk != 16 or experts % dist.get_world_size():
             raise ValueError("fanout adversarial cases require topk=16 and EP")
@@ -285,7 +306,7 @@ def _reference(
     return partial[start : start + x.shape[0]]
 
 
-def _time_graph(fn, device, iters):
+def _time_graph(fn, device, iters, prepare=None):
     _barrier()
     fn()
     _barrier()
@@ -294,18 +315,32 @@ def _time_graph(fn, device, iters):
     with torch.cuda.graph(graph, stream=capture_stream):
         fn()
     for _ in range(10):
+        if prepare is not None:
+            prepare()
         graph.replay()
     torch.cuda.synchronize()
     start, end = (
         torch.cuda.Event(enable_timing=True),
         torch.cuda.Event(enable_timing=True),
     )
-    start.record()
-    for _ in range(iters):
-        graph.replay()
-    end.record()
+    if prepare is None:
+        start.record()
+        for _ in range(iters):
+            graph.replay()
+        end.record()
+        events = [(start, end)]
+    else:
+        events = [
+            (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+            for _ in range(iters)
+        ]
+        for start, end in events:
+            prepare()
+            start.record()
+            graph.replay()
+            end.record()
     torch.cuda.synchronize()
-    local_ms = start.elapsed_time(end) / iters
+    local_ms = sum(start.elapsed_time(end) for start, end in events) / iters
     mean_ms = _reduce_float(local_ms, device, dist.ReduceOp.SUM) / dist.get_world_size()
     max_ms = _reduce_float(local_ms, device, dist.ReduceOp.MAX)
     return mean_ms, max_ms
@@ -365,7 +400,9 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
     stage1_ms = _time_graph(stage1, device, args.iters)
     stage1()
     _barrier()
-    stage2_ms = _time_graph(stage2, device, args.iters)
+    # Stage1's peer handshake protects the previous combine's consumers before
+    # the next W2 overwrites their P2P inputs. Keep it outside the timed region.
+    stage2_ms = _time_graph(stage2, device, args.iters, prepare=stage1)
     e2e_ms = _time_graph(end_to_end, device, args.iters)
     graph_output = state["output"][:tokens]
     graph_replay_exact = torch.tensor(
@@ -447,14 +484,26 @@ def _check_pad_tail(moe, x, weights, ids, ref_weights, args, rank, world, device
         )
 
 
-def _run_burst(moe, x, weights, ids, depth, rank):
-    moe(x, weights, ids)
+def _run_burst(moe, x, weights, ids, depth, rank, graph_mode=False):
+    expected = moe(x, weights, ids).clone()
     _barrier()
+    graph = None
+    if graph_mode:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=torch.cuda.Stream()):
+            output = moe(x, weights, ids)
+        _barrier()
     for _ in range(depth):
-        moe(x, weights, ids)
+        if graph is None:
+            output = moe(x, weights, ids)
+        else:
+            graph.replay()
     torch.cuda.synchronize()
+    if not _reduce_float(torch.equal(output, expected), x.device, dist.ReduceOp.MIN):
+        raise AssertionError("burst execution changed the output")
     if rank == 0:
-        print(f"[BURST] completed={depth}/{depth}", flush=True)
+        mode = "graph" if graph_mode else "eager"
+        print(f"[BURST] mode={mode} completed={depth}/{depth} output=PASS", flush=True)
 
 
 def _install_config_policy(moe, config_tokens, unify_fields):
@@ -503,7 +552,12 @@ def _install_config_policy(moe, config_tokens, unify_fields):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--network", choices=NETWORKS, default="v4_pro")
-    parser.add_argument("--bs-list", default="128")
+    parser.add_argument("--bs-list")
+    parser.add_argument(
+        "--route",
+        choices=("uniform", "expert-boundary", "hot-rank0"),
+        default="uniform",
+    )
     parser.add_argument("--iters", type=int, default=30)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--accuracy-max-bs", type=int, default=128)
@@ -513,6 +567,7 @@ def main():
     parser.add_argument("--config-tokens", type=int, default=0)
     parser.add_argument("--unify-fields", default="")
     parser.add_argument("--burst-depth", type=int, default=0)
+    parser.add_argument("--burst-graph", action="store_true")
     parser.add_argument("--force-fanout-boundary", action="store_true")
     parser.add_argument("--inject-invalid-route", action="store_true")
     parser.add_argument("--force-padding-boundary", action="store_true")
@@ -524,6 +579,14 @@ def main():
         "forward(mask_invalid_slots=True) returns them as zeros",
     )
     args = parser.parse_args()
+    if args.bs_list is None:
+        sizes = list(range(1, 65)) + [96, 128, 192, 256, 512, 1024]
+        args.bs_list = (
+            ",".join(map(str, sizes)) if args.network == "v4_1_flash" else "128"
+        )
+        if args.network == "v4_1_flash":
+            args.accuracy_max_bs = max(args.accuracy_max_bs, 1024)
+            args.max_tok_per_rank = args.max_tok_per_rank or 1024
     if (
         sum(
             (
@@ -543,6 +606,8 @@ def main():
     rank, world, device = _setup_dist()
     try:
         network = NETWORKS[args.network]
+        if args.network == "v4_1_flash" and world not in (2, 4):
+            raise ValueError("DeepSeek-V4.1-Flash MegaMoE requires EP2 or EP4")
         if network["experts"] % world:
             raise ValueError(
                 f"experts={network['experts']} must be divisible by world={world}"
@@ -584,6 +649,7 @@ def main():
             force_fanout_boundary=args.force_fanout_boundary,
             inject_invalid_route=args.inject_invalid_route,
             force_padding_boundary=args.force_padding_boundary,
+            route=args.route,
         )
         ref_weights = w1_q, w1_ref_scale, w2_q, w2_ref_scale
         # MegaMoE's producer/consumer wire geometry is rank-invariant. A
@@ -624,6 +690,44 @@ def main():
                     **network,
                 )
             moe = shared_moe
+            if args.network == "v4_1_flash" and batch_size == batch_sizes[0]:
+                local_x = x[:local_batch_size].contiguous()
+                local_weights = weights[:local_batch_size].contiguous()
+                local_ids = ids[:local_batch_size].contiguous()
+                expected = moe(
+                    local_x,
+                    local_weights,
+                    local_ids,
+                    config_tokens=config_tokens or None,
+                ).clone()
+                zero_w2 = torch.zeros_like(w2.view(torch.uint8)).view(w2.dtype)
+                zero_output = moe(
+                    local_x,
+                    local_weights,
+                    local_ids,
+                    w1=w1,
+                    w1_scale=w1_scale,
+                    w2=zero_w2,
+                    w2_scale=w2_scale,
+                    config_tokens=config_tokens or None,
+                )
+                if not torch.equal(zero_output, torch.zeros_like(zero_output)):
+                    raise AssertionError(
+                        "per-layer W2 replacement did not produce zeros"
+                    )
+                restored = moe(
+                    local_x,
+                    local_weights,
+                    local_ids,
+                    w1=w1,
+                    w1_scale=w1_scale,
+                    w2=w2,
+                    w2_scale=w2_scale,
+                    config_tokens=config_tokens or None,
+                )
+                if not torch.equal(restored, expected):
+                    raise AssertionError("per-layer weight restore changed the output")
+                del zero_w2
             _install_config_policy(moe, config_tokens, args.unify_fields)
             if rank_tokens:
                 selected = moe._select_config(local_batch_size)
@@ -646,7 +750,13 @@ def main():
             local_ids = ids[:local_batch_size].contiguous()
             if args.burst_depth:
                 _run_burst(
-                    moe, local_x, local_weights, local_ids, args.burst_depth, rank
+                    moe,
+                    local_x,
+                    local_weights,
+                    local_ids,
+                    args.burst_depth,
+                    rank,
+                    args.burst_graph,
                 )
             else:
                 _run_size(

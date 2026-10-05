@@ -16,6 +16,10 @@ def _flag(value: str) -> bool:
     return value == "1"
 
 
+def fixed_slot_max_mtpr(default: int) -> int:
+    return int(os.environ.get("AITER_MEGA_FIXED_SLOT_MAX_MTPR", str(default)))
+
+
 # name -> (parser, default)
 environment_variables: dict[str, tuple[Callable[[str], Any], str]] = {
     # Largest MTPR still dispatched fixed-slot (direct expert slots, no count

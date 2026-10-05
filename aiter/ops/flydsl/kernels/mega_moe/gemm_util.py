@@ -355,7 +355,7 @@ class AScaleLoader:
         self._rsrc = scale_rsrc
         self._n_scale = model_dim // 32
         self._lane = fx.thread_idx.x % 64
-        self._n_groups = m_repeat // _PACK
+        self._n_groups = (m_repeat + _PACK - 1) // _PACK
         self._sort_block_m = sort_block_m
         self._total_threads = total_threads
         self._tx = fx.thread_idx.x
@@ -440,7 +440,7 @@ class AScaleLoader:
         out = []
         for g in range_constexpr(self._n_groups):
             r0 = fx.Int32(g * 32) + lane_row
-            r1 = r0 + fx.Int32(16)
+            r1 = r0 + fx.Int32(16 if self._sort_block_m >= 32 else 0)
             b = []
             for ksub in range_constexpr(_PACK):
                 for rr in (r0, r1):
