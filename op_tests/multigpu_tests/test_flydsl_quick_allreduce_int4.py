@@ -18,8 +18,8 @@ sweep ends in a markdown table:
 * ``test_quick_allreduce_int4_coverage`` -- the kernels those rows ran include
   every kernel the engine's own ``cfgs_for`` says the window selects.
 * ``test_quick_allreduce_int4`` again, as a second table -- the shipping INT4
-  ladder with ``block`` and ``skip_self`` overridden on every rung, at the
-  geometry that caught a VMEM store-data hazard.
+  ladder with ``block`` overridden on every rung, at the narrow blocks where a
+  VMEM store-data hazard once showed up.
 * ``test_quick_allreduce_int4_edge_inputs`` -- payloads that land on the E4M3
   scale's edge cases, and degenerate groups that must stay finite.
 * ``test_quick_allreduce_transport`` -- the ``fp16`` wire format, a lossless
@@ -29,15 +29,15 @@ sweep ends in a markdown table:
   ladder on the shipping payloads, so it covers the geometry that ships.
 
 ``--extended`` adds what production never selects: the legacy fixed shipping
-shapes, the full ``block``/``skip_self`` sweep, the fp16 transport over a
-matrix of pinned ``super_tile``/``block``/``skip_self``, and
+shapes, the full ``block`` sweep, the fp16 transport over a matrix of pinned
+``super_tile``/``block``, and
 ``test_quick_allreduce_int4_pinned_codec`` -- the ring with its wire formats
 pinned per lap: all-INT4 at TP8, and one lap lossless to isolate the other.
 
 Every mesh row also checks that all ranks wrote bit-identical output: each
-rank decodes every chunk from the same packets, its own included, and under
-``skip_self`` it decodes its own from the packet it sent rather than from its
-inbox. The ring's owner stores its chunk before the all-gather quantization, so
+rank decodes every chunk from the same packets, its own included -- its own
+from the packet it sent, since it never round-trips through its own inbox. 
+The ring's owner stores its chunk before the all-gather quantization, so
 its ranks legitimately differ and only report the count.
 
 Every rank is a ``multiprocessing`` spawn worker that builds its own engine.
@@ -172,71 +172,70 @@ PINNED_CODEC_CASES = (
     (8, 512, 5120, "int4", "fp16"),
 )
 
-# (tp, algorithm, tokens, hidden, super_tile, block, skip_self) on the lossless
+# (tp, algorithm, tokens, hidden, super_tile, block) on the lossless
 # fp16 wire, with the geometry pinned. ``--extended`` only: a default run
 # drives the fp16 wire through each schedule's own ladder instead, on the
 # payloads that reach every kernel production selects.
 TRANSPORT_CASES = (
-    (8, "ring", 8, 1024, 1, 256, False),
-    (8, "ring", 512, 5120, 1, 256, False),
-    (8, "ring", 4096, 4096, 8, 256, False),
-    (4, "ring", 512, 5120, 1, 256, False),
-    (4, "ring", 4096, 4096, 8, 256, False),
-    (2, "ring", 512, 5120, 1, 256, False),
-    (8, "mesh", 512, 5120, 1, 256, False),
-    (8, "mesh", 4096, 4096, 8, 256, False),
-    # block and skip_self.
-    (8, "mesh", 512, 5120, 1, 128, True),
-    (8, "mesh", 4096, 4096, 8, 64, True),
-    (8, "ring", 512, 5120, 8, 128, False),
-    (4, "mesh", 512, 5120, 1, 64, False),
-    (4, "mesh", 4096, 4096, 8, 64, True),
-    (4, "mesh", 512, 5120, 1, 128, True),
-    (4, "mesh", 4096, 4096, 8, 128, False),
-    (4, "mesh", 512, 5120, 1, 256, True),
-    (4, "mesh", 4096, 4096, 8, 256, True),
-    (4, "mesh", 512, 5120, 1, 512, True),
-    (4, "mesh", 4096, 4096, 8, 512, False),
-    (4, "ring", 512, 5120, 1, 64, False),
-    (4, "ring", 4096, 4096, 8, 128, False),
-    (4, "ring", 4096, 4096, 8, 512, False),
-    (2, "mesh", 512, 5120, 1, 64, True),
-    (2, "mesh", 4096, 4096, 8, 128, True),
-    (2, "mesh", 512, 5120, 1, 512, False),
-    (2, "mesh", 4096, 4096, 8, 256, True),
-    (2, "ring", 4096, 4096, 8, 64, False),
-    (2, "ring", 512, 5120, 1, 512, False),
+    (8, "ring", 8, 1024, 1, 256),
+    (8, "ring", 512, 5120, 1, 256),
+    (8, "ring", 4096, 4096, 8, 256),
+    (4, "ring", 512, 5120, 1, 256),
+    (4, "ring", 4096, 4096, 8, 256),
+    (2, "ring", 512, 5120, 1, 256),
+    (8, "mesh", 512, 5120, 1, 256),
+    (8, "mesh", 4096, 4096, 8, 256),
+    (8, "mesh", 512, 5120, 1, 128),
+    (8, "mesh", 4096, 4096, 8, 64),
+    (8, "ring", 512, 5120, 8, 128),
+    (4, "mesh", 512, 5120, 1, 64),
+    (4, "mesh", 4096, 4096, 8, 64),
+    (4, "mesh", 512, 5120, 1, 128),
+    (4, "mesh", 4096, 4096, 8, 128),
+    (4, "mesh", 512, 5120, 1, 256),
+    (4, "mesh", 4096, 4096, 8, 256),
+    (4, "mesh", 512, 5120, 1, 512),
+    (4, "mesh", 4096, 4096, 8, 512),
+    (4, "ring", 512, 5120, 1, 64),
+    (4, "ring", 4096, 4096, 8, 128),
+    (4, "ring", 4096, 4096, 8, 512),
+    (2, "mesh", 512, 5120, 1, 64),
+    (2, "mesh", 4096, 4096, 8, 128),
+    (2, "mesh", 512, 5120, 1, 512),
+    (2, "mesh", 4096, 4096, 8, 256),
+    (2, "ring", 4096, 4096, 8, 64),
+    (2, "ring", 512, 5120, 1, 512),
     # Sub-tile and single-tile payloads, where one block owns the lot.
-    (4, "mesh", 8, 1024, 1, 64, True),
-    (2, "mesh", 8, 1024, 8, 512, True),
+    (4, "mesh", 8, 1024, 1, 64),
+    (2, "mesh", 8, 1024, 8, 512),
 )
 TRANSPORT_GRID_CAP = 64
 
-# (tp, algorithm, tokens, hidden, block, skip_self): the shipping INT4 ladder
-# with both knobs overridden on every rung.
+# (tp, algorithm, tokens, hidden, block): the shipping INT4 ladder with
+# ``block`` overridden on every rung.
 #
-# The TP4 mesh rows at blocks 64 and 128 without skip_self are the ones that
-# caught the VMEM store-data hazard in ``_store_v4i32_peer``:
-# INT4's peer-major fanout at those widths is where the register
-# allocator recycles the store's data VGPRs. The fp16 transport rows at the
-# same geometry never did. Those two run by default; no production rung uses
-# either width, but the hazard lives in code every mesh rung shares.
+# The TP4 mesh rows at blocks 64 and 128 are where the VMEM store-data hazard in
+# ``_store_v4i32_peer`` was caught, back when the mesh still had a variant that
+# round-tripped through its own inbox: INT4's peer-major fanout at those widths
+# is where the register allocator recycles the store's data VGPRs. The fp16
+# transport rows at the same geometry never did. Those two run by default; no
+# production rung uses either width, but the hazard lives in code every mesh
+# rung shares.
 KNOB_CASES = (
-    (4, "mesh", 512, 5120, 64, False),
-    (4, "mesh", 512, 5120, 128, False),
+    (4, "mesh", 512, 5120, 64),
+    (4, "mesh", 512, 5120, 128),
 )
 
 # The rest of the knob sweep. ``--extended`` only.
 EXTENDED_KNOB_CASES = (
-    (8, "mesh", 512, 5120, 128, True),
-    (8, "ring", 512, 5120, 128, False),
-    (4, "mesh", 512, 5120, 64, True),
-    (4, "mesh", 9216, 4096, 128, True),
-    (4, "mesh", 9216, 4096, 512, False),
-    (4, "ring", 9216, 4096, 64, False),
-    (2, "mesh", 512, 5120, 128, True),
-    (2, "mesh", 9216, 4096, 512, True),
-    (2, "ring", 9216, 4096, 128, False),
+    (8, "mesh", 512, 5120, 128),
+    (8, "ring", 512, 5120, 128),
+    (4, "mesh", 9216, 4096, 128),
+    (4, "mesh", 9216, 4096, 512),
+    (4, "ring", 9216, 4096, 64),
+    (2, "mesh", 512, 5120, 128),
+    (2, "mesh", 9216, 4096, 512),
+    (2, "ring", 9216, 4096, 128),
 )
 
 # Seconds to wait for each rank of a spawn. The kernels spin on flags written
@@ -316,12 +315,10 @@ def _expected_cfg(
     batched: bool,
     grid_by_cfg: dict[tuple, int],
     block: int | None = None,
-    skip_self: bool | None = None,
-) -> tuple[int, int, bool]:
-    """Mirror of ``QuickAllReduceInt4._pick_cfg``: the ``(super_tile, block,
-    skip_self)`` kernel an engine with no super-tile pinned runs *nbytes* on.
-    *block* and *skip_self* are the overrides the engine was built with,
-    ``None`` for the rung's own.
+) -> tuple[int, int]:
+    """Mirror of ``QuickAllReduceInt4._pick_cfg``: the ``(super_tile, block)``
+    kernel an engine with no super-tile pinned runs *nbytes* on. *block* is the
+    override the engine was built with, ``None`` for the rung's own.
 
     Two rules compose. The payload one: the schedule's ladder assigns a
     super-tile by size -- publishes per rank are ``num_tiles / ST * 2(N-1)``,
@@ -334,18 +331,17 @@ def _expected_cfg(
     caps: the host reduces them to the measured resident workgroups per CU,
     and the clamped value is what the selection compares against.
     """
-    want, b, ss = 1, None, None
-    for floor, rung_st, _cap, rung_b, rung_ss in ladder:
+    want, b = 1, None
+    for floor, rung_st, _cap, rung_b in ladder:
         if nbytes >= floor:
-            want, b, ss = rung_st, rung_b, rung_ss
+            want, b = rung_st, rung_b
     b = b if block is None else block
-    ss = ss if skip_self is None else skip_self
     if want == 1:
-        return 1, b, ss
+        return 1, b
     tiles = _num_tiles(nbytes, b)
     if batched:
-        return (want if tiles >= want else 1), b, ss
-    return (want if tiles > grid_by_cfg[(want, b, ss)] else 1), b, ss
+        return (want if tiles >= want else 1), b
+    return (want if tiles > grid_by_cfg[(want, b)] else 1), b
 
 
 def _expected_st(
@@ -357,7 +353,6 @@ def _expected_st(
     inbox_memory: str,
     grid_by_cfg: dict[tuple, int],
     block: int | None = None,
-    skip_self: bool | None = None,
 ) -> int:
     """The super-tile ``_expected_cfg`` picks, on the host a rank reported.
 
@@ -370,7 +365,6 @@ def _expected_st(
         batched=batches_publishes(inbox_memory, algorithm, link),
         grid_by_cfg=grid_by_cfg,
         block=block,
-        skip_self=skip_self,
     )[0]
 
 
@@ -381,9 +375,9 @@ def _rung_grids(world_size: int, ladder: tuple) -> dict[tuple, int]:
     """
     cu_count = int(torch.cuda.get_device_properties(0).multi_processor_count)
     grids = {}
-    for _floor, st, cap, b, ss in ladder:
+    for _floor, st, cap, b in ladder:
         grids.setdefault(
-            (st, b, ss),
+            (st, b),
             clamp_grid_cap(
                 min(cap, DEFAULT_GRID_CAP),
                 arch=ARCH,
@@ -400,8 +394,7 @@ def _kernel_payloads(
     world_size: int, algorithm: str, link: str, lo: int, hi: int
 ) -> dict[tuple, int]:
     """Smallest whole-row payload in ``lo..hi`` bytes (inclusive) that selects
-    each ``(super_tile, block, skip_self)`` kernel the shipping engine can run
-    there.
+    each ``(super_tile, block)`` kernel the shipping engine can run there.
 
     Within one rung the choice is a fixed kernel, or the rung's super-tile
     once the tile count crosses a threshold and its ST=1 fallback below it, so
@@ -414,13 +407,13 @@ def _kernel_payloads(
     grids = _rung_grids(world_size, ladder)
     ends = [floor - 1 for floor, *_ in ladder[1:]] + [hi]
     out: dict[tuple, int] = {}
-    for (floor, st, _cap, b, ss), end in zip(ladder, ends):
+    for (floor, st, _cap, b), end in zip(ladder, ends):
         start, end = max(lo, floor), min(hi, end)
         probes = [start]
         if st > 1:
             # The first payload with a whole super-tile when batched, and with
             # more tiles than blocks when not.
-            tiles = st - 1 if batched else grids[(st, b, ss)]
+            tiles = st - 1 if batched else grids[(st, b)]
             probes.append(tiles * _tile_bytes(b) + 1)
         for probe in probes:
             nbytes = -(-max(probe, start) // _ROW_BYTES) * _ROW_BYTES
@@ -454,8 +447,8 @@ def _ship_payloads(
     by_cfg = _kernel_payloads(
         world_size, algorithm, link, policy.floor + 1, policy.max_bytes
     )
-    _floor, st, _cap, b, ss = _ladder(algorithm, world_size, link)[0]
-    return [by_cfg.get((st, b, ss), min(by_cfg.values()))], None
+    _floor, st, _cap, b = _ladder(algorithm, world_size, link)[0]
+    return [by_cfg.get((st, b), min(by_cfg.values()))], None
 
 
 def _fmt_bytes(nbytes: int) -> str:
@@ -612,9 +605,7 @@ def _run_rank(
     fly.preload()
     production_cfgs = None
     if window is not None:
-        production_cfgs = [
-            (int(st), int(b), bool(ss)) for st, b, ss in fly.cfgs_for(*window)
-        ]
+        production_cfgs = [(int(st), int(b)) for st, b in fly.cfgs_for(*window)]
 
     rows = []
     try:
@@ -649,7 +640,7 @@ def _run_rank(
                     dist.barrier()
                     m = _worst(m, _metrics(out, ref, rank, tile_bytes, group))
 
-            st_used, block_used, skip_used = cfg_used
+            st_used, block_used = cfg_used
             row = {
                 **m,
                 "link": fly.link,
@@ -661,7 +652,6 @@ def _run_rank(
                 "ag_codec": fly.ag_codec,
                 "st_used": int(st_used),
                 "block_used": int(block_used),
-                "skip_self_used": bool(skip_used),
                 "grid_by_cfg": {cfg: int(e.grid) for cfg, e in fly._by_cfg.items()},
                 "production_cfgs": production_cfgs,
                 "us": None,
@@ -816,7 +806,6 @@ def _shipping_st(
     algorithm: str,
     tp: int,
     block: int | None = None,
-    skip_self: bool | None = None,
 ) -> int:
     return _expected_st(
         nbytes,
@@ -826,7 +815,6 @@ def _shipping_st(
         inbox_memory=rows[0]["inbox_memory"],
         grid_by_cfg=rows[0]["grid_by_cfg"],
         block=block,
-        skip_self=skip_self,
     )
 
 
@@ -838,7 +826,6 @@ def _summary(rows: list[dict]) -> dict:
         "ag_codec": rows[0]["ag_codec"],
         "st_used": rows[0]["st_used"],
         "block_used": rows[0]["block_used"],
-        "skip_self_used": rows[0]["skip_self_used"],
         "lanes_differing": max(r["lanes_differing"] for r in rows),
         "err": max(r["err"] for r in rows),
         "sqnr_db": min(r["sqnr_db"] for r in rows),
@@ -851,14 +838,9 @@ def _ship_key(
     algorithm: str,
     grid_cap: int | None,
     block: int | None = None,
-    skip_self: bool | None = None,
 ) -> tuple:
     kw = {"algorithm": algorithm}
-    for name, val in (
-        ("grid_cap", grid_cap),
-        ("block", block),
-        ("skip_self", skip_self),
-    ):
+    for name, val in (("grid_cap", grid_cap), ("block", block)):
         if val is not None:
             kw[name] = val
     return _key(tp, **kw)
@@ -869,7 +851,6 @@ def _transport_key(
     algorithm: str,
     super_tile: int | None = None,
     block: int | None = None,
-    skip_self: bool | None = None,
 ) -> tuple:
     """The fp16-wire engine: the schedule's own ladder when *super_tile* is
     None, otherwise that geometry pinned at ``TRANSPORT_GRID_CAP``."""
@@ -879,7 +860,6 @@ def _transport_key(
             super_tile=super_tile,
             grid_cap=TRANSPORT_GRID_CAP,
             block=block,
-            skip_self=skip_self,
         )
     return _key(tp, **kw)
 
@@ -894,20 +874,18 @@ def test_quick_allreduce_int4(
     grid_cap=None,
     graph=False,
     block=None,
-    skip_self=None,
 ):
     """Shipping configuration: no codec or super-tile pinned."""
     rows = _result(
-        _ship_key(tp, algorithm, grid_cap, block, skip_self),
+        _ship_key(tp, algorithm, grid_cap, block),
         (tokens, hidden, "normal", graph, True),
     )
     nbytes = tokens * hidden * 2
     _check_sqnr(
-        f"tp={tp} {algorithm} {tokens}x{hidden} graph={graph} block={block} "
-        f"skip_self={skip_self}",
+        f"tp={tp} {algorithm} {tokens}x{hidden} graph={graph} block={block}",
         rows,
         floor=SQNR_MIN_DB,
-        expected_st=_shipping_st(rows, nbytes, algorithm, tp, block, skip_self),
+        expected_st=_shipping_st(rows, nbytes, algorithm, tp, block),
         algorithm=algorithm,
     )
     # (tp - 1) adds per element; codec ALU work is not counted.
@@ -980,9 +958,7 @@ def test_quick_allreduce_int4_pinned_codec(tokens, hidden, tp, rs_codec, ag_code
 
 
 @benchmark()
-def test_quick_allreduce_transport(
-    tokens, hidden, tp, algorithm, super_tile, block, skip_self
-):
+def test_quick_allreduce_transport(tokens, hidden, tp, algorithm, super_tile, block):
     """fp16 wire, exact-grid input: bit-identical to the fp32 reference.
 
     Exercises chunk/slot addressing, the flag protocol, the super-tile loop and
@@ -991,12 +967,12 @@ def test_quick_allreduce_transport(
     name the geometry that ran; pinned, there is no selection to check.
     """
     rows = _result(
-        _transport_key(tp, algorithm, super_tile, block, skip_self),
+        _transport_key(tp, algorithm, super_tile, block),
         (tokens, hidden, "exact", False, False),
     )
     _check(
         f"tp={tp} {algorithm} {tokens}x{hidden} st={super_tile} block={block} "
-        f"skip_self={skip_self} fp16-exact",
+        "fp16-exact",
         [
             f"rank {rank}: {row['n_mismatch']} mismatched elements, "
             f"max |err| {row['max_abs_err']:.3e}, "
@@ -1009,7 +985,6 @@ def test_quick_allreduce_transport(
         "gfx": ARCH,
         "st_used": rows[0]["st_used"],
         "block_used": rows[0]["block_used"],
-        "skip_self_used": rows[0]["skip_self_used"],
         "n_mismatch": max(r["n_mismatch"] for r in rows),
         "max_abs_err": max(r["max_abs_err"] for r in rows),
     }
@@ -1028,7 +1003,7 @@ def test_quick_allreduce_int4_coverage(tp, algorithm, window):
     by_case = {c: _result(key, c) for c in _CASES[key]}
     production = set(next(iter(by_case.values()))[0]["production_cfgs"])
     ran = {
-        (rows[0]["st_used"], rows[0]["block_used"], rows[0]["skip_self_used"])
+        (rows[0]["st_used"], rows[0]["block_used"])
         for case, rows in by_case.items()
         if case[2] == "normal"
     }
@@ -1117,15 +1092,6 @@ def main():
         "each rung's own.",
     )
     parser.add_argument(
-        "--skip-self",
-        type=int,
-        nargs="*",
-        default=[None],
-        choices=(0, 1, None),
-        help="Pin skip_self off (0) or on (1) for the shipping sweep, on every\n"
-        "rung. Mesh only; ignored for the ring. Default: each rung's own.",
-    )
-    parser.add_argument(
         "-o",
         "--out",
         default=None,
@@ -1135,8 +1101,8 @@ def main():
         "--extended",
         action="store_true",
         help="Also run what production never selects: the legacy fixed\n"
-        "shipping shapes, the full block/skip_self sweep, the pinned-codec\n"
-        "ring and the pinned-geometry fp16 transport matrix.",
+        "shipping shapes, the full block sweep, the pinned-codec ring and the\n"
+        "pinned-geometry fp16 transport matrix.",
     )
     args = parser.parse_args()
 
@@ -1168,10 +1134,7 @@ def main():
     # Engines exactly as production builds them: only these are checked for
     # kernel coverage.
     shipping_engine = (
-        args.mnk is None
-        and args.grid_cap == [None]
-        and args.block == [None]
-        and args.skip_self == [None]
+        args.mnk is None and args.grid_cap == [None] and args.block == [None]
     )
 
     # Register every row before running any, so rows sharing an engine share
@@ -1187,43 +1150,36 @@ def main():
                 shapes += [
                     s for s in LEGACY_SHAPES_PER_WORLD_SIZE[tp] if s not in shapes
                 ]
-        for grid_cap, block, skip_self in itertools.product(
-            args.grid_cap, args.block, args.skip_self
-        ):
-            skip_self = None if skip_self is None else bool(skip_self)
-            if algorithm != "mesh":
-                skip_self = None
+        for grid_cap, block in itertools.product(args.grid_cap, args.block):
             for tokens, hidden in shapes:
-                row = (tokens, hidden, tp, algorithm, grid_cap, False, block, skip_self)
+                row = (tokens, hidden, tp, algorithm, grid_cap, False, block)
                 if row not in ship:
                     ship.append(row)
         if window is not None:
             # Captured into a CUDA graph at every world size, on the smallest
             # shape, as a serving framework replays it.
             tokens, hidden = shapes[0]
-            ship.append(
-                (tokens, hidden, tp, algorithm, args.grid_cap[0], True, None, None)
-            )
+            ship.append((tokens, hidden, tp, algorithm, args.grid_cap[0], True, None))
             if shipping_engine:
                 _WINDOWS[_ship_key(tp, algorithm, None)] = window
                 lo, hi = window
                 label = f"({_fmt_bytes(lo - 1)}, {_fmt_bytes(hi)}]"
                 coverage.append((tp, algorithm, label))
-    # Knob rows only in a default run: pinning --block or --skip-self already
-    # sweeps them over the shipping shapes.
+    # Knob rows only in a default run: pinning --block already sweeps it over
+    # the shipping shapes.
     knobs = []
-    if args.block == [None] and args.skip_self == [None]:
+    if args.block == [None]:
         knobs = [
-            (tokens, hidden, tp, algorithm, None, False, block, skip_self)
-            for tp, algorithm, tokens, hidden, block, skip_self in (
+            (tokens, hidden, tp, algorithm, None, False, block)
+            for tp, algorithm, tokens, hidden, block in (
                 KNOB_CASES + (EXTENDED_KNOB_CASES if args.extended else ())
             )
             if tp in tps and algorithm in algos
         ]
     if dts:
-        for tokens, hidden, tp, algorithm, grid_cap, graph, block, ss in ship + knobs:
+        for tokens, hidden, tp, algorithm, grid_cap, graph, block in ship + knobs:
             _register(
-                _ship_key(tp, algorithm, grid_cap, block, ss),
+                _ship_key(tp, algorithm, grid_cap, block),
                 (tokens, hidden, "normal", graph, True),
             )
     edge = [c for c in EDGE_CASES if c[0] in tps and c[1] in algos]
@@ -1240,16 +1196,16 @@ def main():
     # The fp16 wire through each production schedule's own ladder, on the
     # payloads that reach its kernels, plus one a single block owns.
     transport = [
-        (tp, algorithm, *shape, None, None, None)
+        (tp, algorithm, *shape, None, None)
         for (tp, algorithm), (payloads, window) in plans.items()
         if window is not None
         for shape in [SUB_TILE_SHAPE] + [(n // _ROW_BYTES, HIDDEN) for n in payloads]
     ]
     if args.extended:
         transport += [c for c in TRANSPORT_CASES if c[0] in tps and c[1] in algos]
-    for tp, algorithm, tokens, hidden, st, block, ss in transport:
+    for tp, algorithm, tokens, hidden, st, block in transport:
         _register(
-            _transport_key(tp, algorithm, st, block, ss),
+            _transport_key(tp, algorithm, st, block),
             (tokens, hidden, "exact", False, False),
         )
 
@@ -1264,9 +1220,8 @@ def main():
                 grid_cap=grid_cap,
                 graph=graph,
                 block=block,
-                skip_self=ss,
             )
-            for tokens, hidden, tp, algorithm, grid_cap, graph, block, ss in cases
+            for tokens, hidden, tp, algorithm, grid_cap, graph, block in cases
         ]
 
     for dtype in dts:
@@ -1279,7 +1234,7 @@ def main():
                 for tp, algorithm, window in coverage
             ],
         )
-        _summarize("flydsl quick allreduce INT4 block/skip_self", _int4_rows(knobs))
+        _summarize("flydsl quick allreduce INT4 block", _int4_rows(knobs))
         if args.out and rows:
             os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
             with open(args.out, "w") as fh:
@@ -1310,8 +1265,8 @@ def main():
     _summarize(
         "flydsl quick allreduce transport (fp16 wire, bit-exact)",
         [
-            test_quick_allreduce_transport(tokens, hidden, tp, algorithm, st, block, ss)
-            for tp, algorithm, tokens, hidden, st, block, ss in transport
+            test_quick_allreduce_transport(tokens, hidden, tp, algorithm, st, block)
+            for tp, algorithm, tokens, hidden, st, block in transport
         ],
     )
 

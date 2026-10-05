@@ -81,7 +81,6 @@ class _StEngine:
         self.rank_tile_bytes = spec["rank_tile_bytes"]
         self.wire_tile_bytes = spec["wire_tile_bytes"]
         self.block = spec["block"]
-        self.skip_self = spec.get("skip_self", False)
         self._peer_bases = [None] * world_size
         self._buf_ptr = None
         self._meta_ptr = None

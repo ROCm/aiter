@@ -63,7 +63,7 @@ SUPPORTED_ATOMS = (1, 2, 4)
 DEFAULT_GRID_CAP = 64
 
 # Per-``(link, world_size)`` tuning ladder: ``(min_bytes, atoms, grid_cap,
-# fanout, block, skip_self)`` rungs. The host builds one engine per rung and
+# fanout, block)`` rungs. The host builds one engine per rung and
 # selects by payload size at launch. Created from a tuning sweep.
 #
 # ``atoms`` and ``block`` both scale the tile, and their product is what
@@ -89,24 +89,24 @@ DEFAULT_GRID_CAP = 64
 #     TP8  atoms=1 cap128 b128 -- one rung over the whole window
 ONESHOT_LADDER = {
     ("pcie", 2): (
-        (0, 1, 128, "peer", 256, True),
-        (384 << 10, 4, 128, "peer", 512, True),
+        (0, 1, 128, "peer", 256),
+        (384 << 10, 4, 128, "peer", 512),
     ),
     ("pcie", 4): (
-        (0, 1, 128, "peer", 128, True),
-        (96 << 10, 2, 64, "peer", 512, True),
+        (0, 1, 128, "peer", 128),
+        (96 << 10, 2, 64, "peer", 512),
     ),
     ("pcie", 8): (
-        (0, 1, 64, "peer", 64, True),
-        (48 << 10, 1, 64, "peer", 256, True),
-        (192 << 10, 1, 64, "peer", 64, True),
+        (0, 1, 64, "peer", 64),
+        (48 << 10, 1, 64, "peer", 256),
+        (192 << 10, 1, 64, "peer", 64),
     ),
     ("xgmi", 2): (
-        (0, 1, 128, "peer", 128, True),
-        (256 << 10, 1, 128, "peer", 256, True),
+        (0, 1, 128, "peer", 128),
+        (256 << 10, 1, 128, "peer", 256),
     ),
-    ("xgmi", 4): ((0, 1, 128, "peer", 256, True),),
-    ("xgmi", 8): ((0, 1, 128, "peer", 128, True),),
+    ("xgmi", 4): ((0, 1, 128, "peer", 256),),
+    ("xgmi", 8): ((0, 1, 128, "peer", 128),),
 }
 
 
@@ -126,7 +126,6 @@ def oneshot_ladder(world_size: int, link: str = "pcie"):
                 DEFAULT_GRID_CAP,
                 DEFAULT_FANOUT,
                 DEFAULT_BLOCK,
-                DEFAULT_SKIP_SELF,
             ),
         ),
     )
@@ -147,12 +146,6 @@ _RECV_POLICY = _CM_SC0 | _CM_SC1
 # so spreading across links sooner can start more of them in parallel.
 FANOUT_ORDERS = ("peer", "atom")
 DEFAULT_FANOUT = "peer"
-
-# Whether a rank pushes its own contribution through its own inbox. Keeping it
-# costs a store, a poll and a re-arm per tile in memory the rank already holds
-# in registers, which is 1/N of each; dropping it specialises the binary per
-# rank.
-DEFAULT_SKIP_SELF = False
 
 # Three inbox buffers rotate by colour. Round ``c`` reads buffer ``c``, and
 # re-arms buffer ``c + 2`` (mod 3) with the sentinel. No peer can be writing that
@@ -215,8 +208,7 @@ def make_one_shot_allreduce_kernel(
     grid: int,
     inbox_memory: str = "uncached",
     fanout: str = DEFAULT_FANOUT,
-    skip_self: bool = False,
-    rank: int | None = None,
+    rank: int,
     block: int = DEFAULT_BLOCK,
 ):
     if block not in SUPPORTED_BLOCKS:
@@ -225,11 +217,8 @@ def make_one_shot_allreduce_kernel(
         raise ValueError(
             f"world_size must be one of {SUPPORTED_WORLDS}, got {world_size}"
         )
-    if skip_self and not 0 <= (rank if rank is not None else -1) < world_size:
-        raise ValueError(
-            f"skip_self needs the rank at trace time, got rank={rank!r} for "
-            f"world_size={world_size}"
-        )
+    if not 0 <= int(rank) < world_size:
+        raise ValueError(f"rank must be in [0, {world_size}), got {rank}")
     if atoms not in SUPPORTED_ATOMS:
         raise ValueError(f"atoms must be one of {SUPPORTED_ATOMS}, got {atoms!r}")
     if inbox_memory not in SUPPORTED_INBOX_MEMORY:
@@ -250,15 +239,16 @@ def make_one_shot_allreduce_kernel(
     tile_i32 = tile_bytes // 4
     data_bytes = INBOX_BUFFERS * grid * world_size * tile_bytes
 
-    # This rank's own index as a trace-time constant, or None when the self
-    # slot is being used. It has to be compile-time: the peer fanout, the poll
-    # and the reduce are all unrolled over trace-time peer indices, and
-    # "all peers but me" is only expressible there. The cost is one kernel
-    # binary per rank -- but a process is one rank, so it compiles exactly one.
-    self_rank = int(rank) if skip_self else None
-    # Peers this rank pushes payload to. With ``skip_self`` our own
-    # inbox slot is simply never touched: the wire format is unchanged, the slot
-    # is still allocated, and no peer can observe the difference.
+    # This rank's own index as a trace-time constant. It has to be
+    # compile-time: the peer fanout, the poll and the reduce are all unrolled
+    # over trace-time peer indices, and "all peers but me" is only expressible
+    # there. The cost is one kernel binary per rank -- but a process is one
+    # rank, so it compiles exactly one.
+    self_rank = int(rank)
+    # Peers this rank pushes payload to. Our own contribution never round-trips
+    # through our own inbox: it stays in registers. Our own inbox slot is simply
+    # never touched -- the wire format is unchanged, the slot is still
+    # allocated, and no peer can observe the difference.
     push_peers = [p for p in range(world_size) if p != self_rank]
 
     # (peer, atom) iteration order for the fanout, unrolled at trace time.
@@ -318,10 +308,9 @@ def make_one_shot_allreduce_kernel(
             Thread ``t``'s data lands at the same offset in every destination,
             so it goes straight from registers -- no LDS staging.
 
-            ``skip_self`` decides whether the fanout includes our own inbox.
-            Keeping it makes the receive loop uniform over ``world_size``;
-            dropping it removes 1/N of the stores, the polls and the re-arms, at
-            the cost of one kernel binary per rank.
+            Our own inbox is not among the destinations: our contribution stays
+            in registers, which saves 1/N of the stores, the polls and the
+            re-arms.
 
             On a cacheable inbox an ``nt`` push can sit in this XCD's L2 until
             something evicts it, so each wave writes it back with a release
@@ -411,8 +400,7 @@ def make_one_shot_allreduce_kernel(
                         )
                     else:
                         _store_v4i32_peer(
-                            peer_vec[rank]
-                            + _i32_to_bytes(_recv_i32(buf, src, atom)),
+                            peer_vec[rank] + _i32_to_bytes(_recv_i32(buf, src, atom)),
                             sentinel,
                             payload_policy,
                         )
@@ -423,8 +411,8 @@ def make_one_shot_allreduce_kernel(
             Rank order, not a rotated order: every rank must accumulate in the
             same sequence or the results differ in the last bit across ranks.
             ``cross_device_reduce`` makes the same promise for the same reason.
-            Under ``skip_self`` our own contribution comes out of the registers.
-            The peers' come from *polled*, ``_poll``'s result.
+            Our own contribution comes out of the registers; the peers' come
+            from *polled*, ``_poll``'s result.
             """
             outs = []
             for atom in range_constexpr(atoms):
@@ -502,14 +490,9 @@ def make_one_shot_allreduce_kernel(
             value_attrs={"rocdl.flat_work_group_size": flat_wg},
         ).launch(grid=(grid_x, 1, 1), block=(block, 1, 1), stream=stream)
 
-    tag = f"ws{world_size}_a{atoms}_g{grid}_{inbox_memory}_b{block}"
+    tag = f"ws{world_size}_r{self_rank}_a{atoms}_g{grid}_{inbox_memory}_b{block}"
     if atoms > 1:
         tag += f"_{fanout}"
-    if skip_self:
-        # ``_r<n>_`` is the rank field the bench's variant comparison already
-        # knows to collapse before checking that the ranks agree; a build
-        # specialised per rank legitimately reports a different string on each.
-        tag += f"_r{self_rank}_ss"
     launch_one_shot_allreduce.func.__name__ = f"launch_one_shot_allreduce_{tag}"
     try:
         one_shot_allreduce.func.__name__ = f"one_shot_allreduce_{tag}"
@@ -534,7 +517,7 @@ def make_one_shot_allreduce_kernel(
         "world_size": world_size,
         "inbox_memory": inbox_memory,
         "fanout": fanout,
-        "skip_self": skip_self,
+        "rank": self_rank,
         # Byte every inbox byte starts as.
         "inbox_fill": SENTINEL_FILL_BYTE,
         "grid": grid,

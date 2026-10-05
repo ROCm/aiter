@@ -527,11 +527,6 @@ class Candidate:
     # value means a distinct engine with its own inbox.
     atoms: int | None = None
     fanout: str | None = None
-    # Drop this rank's own trip through its own inbox, family == "fly1s", and
-    # family == "fly" with algorithm == "mesh" (the ring has no such trip).
-    # None leaves it to the rung; False and True both pin it, and pinning it
-    # True specialises the binary per rank.
-    skip_self: bool | None = None
     # Threads per block, families "fly1s" and "fly". Also the tile width, so it
     # is the knob that sets how many blocks a payload gets. None leaves it to
     # the rung.
@@ -547,7 +542,6 @@ class Candidate:
             self.rs_codec,
             self.ag_codec,
             self.block,
-            self.skip_self,
         )
 
     def fly_rung(self, min_bytes: int) -> tuple:
@@ -556,9 +550,7 @@ class Candidate:
         if self.family != "fly":
             raise ValueError(f"{self.key} is not a two-stage candidate")
         unpinned = [
-            n
-            for n in ("super_tile", "grid_cap", "block", "skip_self")
-            if getattr(self, n) is None
+            n for n in ("super_tile", "grid_cap", "block") if getattr(self, n) is None
         ]
         if unpinned:
             raise ValueError(
@@ -571,13 +563,12 @@ class Candidate:
             self.super_tile,
             self.grid_cap,
             self.block,
-            self.skip_self,
         )
 
     @property
     def fly1s_cfg(self) -> tuple:
         """Identity of the OneShotAllReduce engine this candidate needs."""
-        return (self.atoms, self.grid_cap, self.fanout, self.skip_self, self.block)
+        return (self.atoms, self.grid_cap, self.fanout, self.block)
 
     def fly1s_rung(self, min_bytes: int) -> tuple:
         """This candidate as an ``ONESHOT_LADDER`` rung, for the fit's paste."""
@@ -585,7 +576,7 @@ class Candidate:
             raise ValueError(f"{self.key} is not a one-shot candidate")
         unpinned = [
             n
-            for n in ("atoms", "grid_cap", "fanout", "block", "skip_self")
+            for n in ("atoms", "grid_cap", "fanout", "block")
             if getattr(self, n) is None
         ]
         if unpinned:
@@ -600,7 +591,6 @@ class Candidate:
             self.grid_cap,
             self.fanout,
             self.block,
-            self.skip_self,
         )
 
 
@@ -627,8 +617,7 @@ _FLY1S_GRID = (
 
 # Two-stage knob grids, as (block, super_tile, grid_cap). Every block the codec
 # supports, at the super-tiles each schedule's ladder uses and the cap every
-# shipped rung has. The mesh rows are crossed with skip_self below; the ring has
-# no self round trip to skip.
+# shipped rung has.
 _FLY_MESH_GRID = tuple(
     (block, st, 128) for block in (64, 128, 256, 512) for st in (1, 8)
 )
@@ -638,26 +627,23 @@ _FLY_RING_GRID = tuple(
 
 
 def _fly_grid_rows():
-    """``_FLY_MESH_GRID`` x self-skip and ``_FLY_RING_GRID`` as Candidates.
+    """``_FLY_MESH_GRID`` and ``_FLY_RING_GRID`` as Candidates.
 
     SQNR floors follow the shipping rows': 15 dB for the mesh, 14 for the ring.
     """
     rows = []
-    for skip_self in (False, True):
-        for block, st, cap in _FLY_MESH_GRID:
-            key = f"fly_int4_b{block}_st{st}_g{cap}" + ("_ss" if skip_self else "")
-            rows.append(
-                Candidate(
-                    key,
-                    "fly",
-                    15.0,
-                    False,
-                    super_tile=st,
-                    grid_cap=cap,
-                    block=block,
-                    skip_self=skip_self,
-                )
+    for block, st, cap in _FLY_MESH_GRID:
+        rows.append(
+            Candidate(
+                f"fly_int4_b{block}_st{st}_g{cap}",
+                "fly",
+                15.0,
+                False,
+                super_tile=st,
+                grid_cap=cap,
+                block=block,
             )
+        )
     for block, st, cap in _FLY_RING_GRID:
         rows.append(
             Candidate(
@@ -669,35 +655,30 @@ def _fly_grid_rows():
                 super_tile=st,
                 grid_cap=cap,
                 block=block,
-                skip_self=False,
             )
         )
     return tuple(rows)
 
 
 def _fly1s_grid_rows():
-    """``_FLY1S_GRID`` x self-skip as Candidates."""
+    """``_FLY1S_GRID`` as Candidates."""
     rows = []
-    for skip_self in (False, True):
-        for block, atoms, cap, fanout in _FLY1S_GRID:
-            key = f"fly_1stage_b{block}_a{atoms}_g{cap}"
-            if atoms > 1 and fanout == "atom":
-                key += "_fa"
-            if skip_self:
-                key += "_ss"
-            rows.append(
-                Candidate(
-                    key,
-                    "fly1s",
-                    40.0,  # min acceptable SQNR value
-                    True,
-                    atoms=atoms,
-                    grid_cap=cap,
-                    fanout=fanout,
-                    block=block,
-                    skip_self=skip_self,
-                )
+    for block, atoms, cap, fanout in _FLY1S_GRID:
+        key = f"fly_1stage_b{block}_a{atoms}_g{cap}"
+        if atoms > 1 and fanout == "atom":
+            key += "_fa"
+        rows.append(
+            Candidate(
+                key,
+                "fly1s",
+                40.0,  # min acceptable SQNR value
+                True,
+                atoms=atoms,
+                grid_cap=cap,
+                fanout=fanout,
+                block=block,
             )
+        )
     return tuple(rows)
 
 
@@ -1191,8 +1172,8 @@ def _ran_exact(cand: Candidate, flyauto, nbytes: int) -> bool:
     return flyauto is not None and flyauto.family_for(int(nbytes)) == "oneshot"
 
 
-# The ring bakes its rank into the kernel at compile time, so its symbol carries
-# an ``_r<n>_`` field and every rank legitimately reports a different string for
+# Every FlyDSL schedule bakes its rank into the kernel at compile time, so its
+# symbol carries an ``_r<n>_`` field and every rank legitimately reports a different string for
 # the same variant. Collapse that one field before comparing.
 _RANK_FIELD = re.compile(r"_r\d+_")
 
@@ -1202,8 +1183,8 @@ def _agree_variant(per_rank) -> str | None:
 
     Every rank must be running the same variant of the same kernel; if they are
     not, a latency taken as ``max`` over ranks is comparing two different
-    binaries and the row is meaningless. That is not hypothetical -- the ring
-    compiles per rank -- so it is checked rather than assumed, and a
+    binaries and the row is meaningless. That is not hypothetical -- every
+    FlyDSL schedule compiles per rank -- so it is checked rather than assumed, and a
     disagreement is reported in the cell instead of being averaged away.
     """
     seen = {_RANK_FIELD.sub("_r*_", v) for v in per_rank if v is not None}
@@ -1678,8 +1659,8 @@ def _worker(
 
     fly = {}  # QuickAllReduceInt4 config tuple -> engine
     # One engine per distinct (schedule, super_tile, grid_cap, rs_codec,
-    # ag_codec, block, skip_self): each owns its own IPC inbox, whose layout
-    # depends on all of them.
+    # ag_codec, block): each owns its own IPC inbox, whose layout depends on
+    # all of them.
     # Sorted so every rank performs its handle exchanges in the same sequence --
     # the exchange is a collective, so a differing order across ranks deadlocks.
     # ``None`` means "constructor default" and does not order against an int,
@@ -1715,7 +1696,6 @@ def _worker(
                         "rs_codec",
                         "ag_codec",
                         "block",
-                        "skip_self",
                     ),
                 ),
             )
@@ -1741,7 +1721,7 @@ def _worker(
         and dtype == dtypes.bf16
     ):
         for cfg in wanted_1s:
-            kw = _fly_kwargs(cfg, ("atoms", "grid_cap", "fanout", "skip_self", "block"))
+            kw = _fly_kwargs(cfg, ("atoms", "grid_cap", "fanout", "block"))
             fly1s[cfg] = OneShotAllReduce(
                 group=tp_group.cpu_group,
                 device=device,
