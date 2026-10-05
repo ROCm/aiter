@@ -16,16 +16,8 @@ def _flag(value: str) -> bool:
     return value == "1"
 
 
-def fixed_slot_max_mtpr(default: int) -> int:
-    return int(os.environ.get("AITER_MEGA_FIXED_SLOT_MAX_MTPR", str(default)))
-
-
 # name -> (parser, default)
 environment_variables: dict[str, tuple[Callable[[str], Any], str]] = {
-    # Largest MTPR still dispatched fixed-slot (direct expert slots, no count
-    # exchange). 511 / 1023 / 2047 admit the 256 / 512 / 1024-token capacities,
-    # validated on the EP8 v4_pro layout. Read once, at import.
-    "AITER_MEGA_FIXED_SLOT_MAX_MTPR": (int, "255"),
     # Default of forward(mask_invalid_slots=...): combine skips top-k slots with
     # id -1. Off because the id check costs prefill time; callers that pad with
     # -1 ask for it per call.

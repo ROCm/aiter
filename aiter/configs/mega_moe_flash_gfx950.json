@@ -1381,10 +1381,222 @@
           },
           "stage2": {
             "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "ascale_prefetch": false,
+            "spatial_partition": 0,
+            "bf16_lds": true
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "ascale_prefetch": false,
+            "spatial_partition": 802,
+            "bf16_lds": true
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "ascale_prefetch": false,
+            "spatial_partition": 202
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 256,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "persist_strided": true,
+            "b_hoist": false,
+            "spatial_partition": 102
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
             "block_n": 256,
             "persist": true,
             "persist_cu": 192,
             "use_nt": true,
+            "b_hoist": false,
+            "spatial_partition": 102
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 32,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 192,
+            "use_nt": true,
+            "b_hoist": false,
+            "spatial_partition": 102
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 256,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 192,
+            "use_nt": true,
+            "b_hoist": false,
+            "spatial_partition": 102
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 64,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 192,
+            "use_nt": true,
+            "b_hoist": false,
+            "spatial_partition": 102
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 64,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "persist_strided": true,
             "b_hoist": false,
             "spatial_partition": 102
           },
@@ -1425,6 +1637,193 @@
             "num_waves": 4,
             "grid_mult": 1,
             "num_dispatch_cu": 128,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "swizzle_a": false,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "persist_strided": true,
+            "ascale_prefetch": false,
+            "spatial_partition": 802
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 64,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "persist_strided": true,
+            "ascale_prefetch": false,
+            "spatial_partition": 202
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 64,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "persist_strided": true,
+            "ascale_prefetch": false,
+            "spatial_partition": 102
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 64,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 192,
+            "use_nt": true,
+            "b_hoist": false,
+            "spatial_partition": 202
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "persist_strided": true,
+            "b_hoist": false,
+            "spatial_partition": 202
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 64,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 192,
+            "use_nt": true,
+            "b_hoist": false,
+            "spatial_partition": 0
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 256,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 192,
+            "use_nt": true,
+            "b_hoist": false,
+            "spatial_partition": 102
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
             "mfma_amajor": false,
             "async_a_copy": true,
             "use_tile_resource": true,
@@ -1439,6 +1838,378 @@
             "use_nt": true,
             "b_hoist": false,
             "spatial_partition": 202
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "persist_strided": true,
+            "b_hoist": false,
+            "spatial_partition": 202
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 256,
+          "combine_waves": 8
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "persist_strided": true,
+            "b_hoist": false,
+            "spatial_partition": 102
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 192,
+            "use_nt": true,
+            "b_hoist": false,
+            "spatial_partition": 0
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "persist_strided": true,
+            "b_hoist": false,
+            "spatial_partition": 202
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "persist_strided": true,
+            "b_hoist": false,
+            "spatial_partition": 202
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 512,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "swizzle_a": false,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "persist_strided": true,
+            "b_hoist": false,
+            "spatial_partition": 202
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "persist_strided": true,
+            "b_hoist": false,
+            "spatial_partition": 802
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 32,
+            "tile_n": 512,
+            "num_waves": 8,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 32,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 192,
+            "use_nt": true,
+            "b_hoist": false,
+            "spatial_partition": 0
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "persist_strided": true,
+            "b_hoist": false,
+            "spatial_partition": 0
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 32,
+            "tile_n": 512,
+            "num_waves": 8,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 32,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 192,
+            "use_nt": true,
+            "b_hoist": false,
+            "spatial_partition": 102
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 32,
+            "tile_n": 512,
+            "num_waves": 8,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 32,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "persist_strided": true,
+            "b_hoist": false,
+            "spatial_partition": 202
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 32,
+            "tile_n": 512,
+            "num_waves": 8,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 32,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 192,
+            "use_nt": true,
+            "b_hoist": false,
+            "spatial_partition": 202
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 16,
+            "tile_n": 256,
+            "num_waves": 4,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": false,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 16,
+            "block_n": 256,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": false,
+            "b_hoist": false,
+            "spatial_partition": 102
+          },
+          "p2p_quant": "none",
+          "combine_blocks": 128,
+          "combine_waves": 4
+        },
+        {
+          "stage1": {
+            "sort_block_m": 32,
+            "tile_n": 512,
+            "num_waves": 8,
+            "grid_mult": 1,
+            "num_dispatch_cu": 128,
+            "mfma_amajor": true,
+            "async_a_copy": true,
+            "use_tile_resource": true,
+            "b_nt": 0,
+            "work_shards": 4
+          },
+          "stage2": {
+            "block_m": 32,
+            "block_n": 128,
+            "persist": true,
+            "persist_cu": 256,
+            "use_nt": true,
+            "spatial_partition": 0
           },
           "p2p_quant": "none",
           "combine_blocks": 128,
@@ -1535,11 +2306,63 @@
         "62": 51,
         "63": 44,
         "64": 52,
+        "66": 53,
+        "72": 54,
+        "78": 20,
+        "84": 44,
+        "90": 55,
         "96": 48,
-        "128": 53,
-        "192": 54,
-        "256": 55,
-        "512": 56
+        "102": 48,
+        "108": 48,
+        "114": 56,
+        "120": 57,
+        "126": 58,
+        "128": 59,
+        "132": 59,
+        "138": 59,
+        "144": 60,
+        "150": 61,
+        "156": 59,
+        "162": 62,
+        "168": 63,
+        "174": 62,
+        "180": 64,
+        "186": 62,
+        "192": 62,
+        "198": 62,
+        "204": 62,
+        "210": 65,
+        "216": 62,
+        "222": 62,
+        "228": 66,
+        "234": 67,
+        "240": 68,
+        "246": 67,
+        "252": 69,
+        "256": 70,
+        "258": 70,
+        "264": 71,
+        "270": 72,
+        "276": 71,
+        "282": 70,
+        "288": 73,
+        "294": 74,
+        "300": 75,
+        "306": 70,
+        "312": 76,
+        "318": 77,
+        "324": 72,
+        "330": 72,
+        "336": 78,
+        "342": 79,
+        "348": 74,
+        "354": 70,
+        "360": 80,
+        "366": 81,
+        "372": 82,
+        "378": 83,
+        "384": 84,
+        "512": 85
       }
     },
     "4": {

@@ -8,8 +8,6 @@ from dataclasses import dataclass, replace
 from functools import cache
 from pathlib import Path
 
-from . import envs
-
 TOKEN_BUCKETS = (
     1,
     4,
@@ -28,11 +26,12 @@ TOKEN_BUCKETS = (
     32768,
 )
 FLASH_TOKEN_BUCKETS = tuple(range(1, 65)) + (96, 128, 192) + TOKEN_BUCKETS[7:]
+FLASH_EP2_TOKEN_BUCKETS = tuple(
+    sorted(set(FLASH_TOKEN_BUCKETS) | set(range(6, 385, 6)))
+)
 FIXED_GRID_MULT_VALUES = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32)
 P2P_FP8_MIN_MTPR = 1024
-# Fixed-slot (direct expert slots, no count exchange) is the default up to MTPR
-# 128; AITER_MEGA_FIXED_SLOT_MAX_MTPR extends it (see envs.py).
-FIXED_SLOT_MAX_MTPR = envs.AITER_MEGA_FIXED_SLOT_MAX_MTPR
+FIXED_SLOT_MAX_MTPR = 128
 MAX_MTPR_CLASS = 32768
 # Source-indexed payload storage cuts the maximum-capacity activation buffer
 # by roughly ``topk``.  Keep every smaller capacity on the historical layout.
@@ -194,12 +193,12 @@ def mtpr_config_class(mtpr: int) -> int:
 
 
 def _use_fixed_slots(mtpr: int, world_size: int, experts_per_rank: int) -> bool:
-    geometry = (world_size, experts_per_rank)
-    if geometry in ((2, 192), (4, 96)):
-        limit = envs.fixed_slot_max_mtpr(512 if world_size == 2 else 1024)
-    else:
-        limit = FIXED_SLOT_MAX_MTPR
-    return mtpr <= limit and geometry in ((8, 48), (2, 192), (4, 96))
+    limit = {
+        (8, 48): FIXED_SLOT_MAX_MTPR,
+        (2, 192): 512,
+        (4, 96): 1024,
+    }.get((world_size, experts_per_rank), 0)
+    return mtpr <= limit
 
 
 def _fixed_dispatch_cu(bucket: int) -> int:
@@ -571,11 +570,9 @@ def select_mega_moe_config(
             "MegaMoE v2 fanout pair ids support at most "
             f"{MAX_FANOUT_EXPERTS_PER_RANK} experts per rank"
         )
-    buckets = (
-        FLASH_TOKEN_BUCKETS
-        if (model_dim, inter_dim, experts_per_rank * world_size) == (5120, 2304, 384)
-        else TOKEN_BUCKETS
-    )
+    buckets = TOKEN_BUCKETS
+    if (model_dim, inter_dim, experts_per_rank * world_size) == (5120, 2304, 384):
+        buckets = FLASH_EP2_TOKEN_BUCKETS if world_size == 2 else FLASH_TOKEN_BUCKETS
     bucket = nearest_token_bucket(tokens, buckets)
     mtpr_class = mtpr_config_class(mtpr)
     fixed_slot_dispatch = _use_fixed_slots(mtpr_class, world_size, experts_per_rank)
@@ -608,11 +605,11 @@ def build_mega_moe_bundle_plan(
     """Deduplicate variants while keeping Stage1/Stage2 selection atomic."""
     if mtpr <= 0 or mtpr & (mtpr - 1):
         raise ValueError(f"mtpr={mtpr} must be a positive power of two")
-    token_buckets = (
-        FLASH_TOKEN_BUCKETS
-        if (model_dim, inter_dim, experts_per_rank * world_size) == (5120, 2304, 384)
-        else TOKEN_BUCKETS
-    )
+    token_buckets = TOKEN_BUCKETS
+    if (model_dim, inter_dim, experts_per_rank * world_size) == (5120, 2304, 384):
+        token_buckets = (
+            FLASH_EP2_TOKEN_BUCKETS if world_size == 2 else FLASH_TOKEN_BUCKETS
+        )
     buckets = tuple(bucket for bucket in token_buckets if bucket <= mtpr)
     if not buckets or buckets[-1] != mtpr:
         raise ValueError(f"mtpr={mtpr} has no exact token bucket")
