@@ -29,8 +29,8 @@ def topk_gating_fwd(
 
 
 _VALID_SCORE_FUNCS = {"sqrtsoftplus", "sigmoid", "softmax"}
-_EXACT_SIGMOID_EXPERTS = 896
-_EXACT_SIGMOID_TOPK = 16
+_GFX1250_SIGMOID_EXPERTS = {512, 768, 896, 900, 1024}
+_GFX1250_SIGMOID_TOPKS = {4, 8, 16}
 
 
 @functools.lru_cache(maxsize=16)
@@ -45,26 +45,28 @@ def _can_use_gfx1250_exact_sigmoid_topk(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
 ) -> bool:
-    """Whether tensors satisfy the measured gfx1250 exact-contract fast path."""
+    """Whether tensors satisfy a measured gfx1250 sigmoid top-k contract."""
     if (
         not gating_output.is_cuda
         or gating_output.ndim != 2
         or gating_output.shape[0] == 0
-        or gating_output.shape[1] != _EXACT_SIGMOID_EXPERTS
+        or gating_output.shape[1] not in _GFX1250_SIGMOID_EXPERTS
         or gating_output.dtype != torch.bfloat16
         or gating_output.stride(1) != 1
-        or gating_output.stride(0) < _EXACT_SIGMOID_EXPERTS
-        or correction_bias.shape != (_EXACT_SIGMOID_EXPERTS,)
+        or gating_output.stride(0) < gating_output.shape[1]
+        or correction_bias.shape != (gating_output.shape[1],)
         or correction_bias.dtype != torch.bfloat16
         or correction_bias.stride(0) != 1
-        or topk_weights.shape != (gating_output.shape[0], _EXACT_SIGMOID_TOPK)
+        or topk_ids.ndim != 2
+        or topk_ids.shape[0] != gating_output.shape[0]
+        or topk_ids.shape[1] not in _GFX1250_SIGMOID_TOPKS
+        or topk_weights.shape != topk_ids.shape
         or topk_weights.dtype != torch.float32
         or topk_weights.stride(1) != 1
-        or topk_weights.stride(0) < _EXACT_SIGMOID_TOPK
-        or topk_ids.shape != (gating_output.shape[0], _EXACT_SIGMOID_TOPK)
+        or topk_weights.stride(0) < topk_ids.shape[1]
         or topk_ids.dtype != torch.int32
         or topk_ids.stride(1) != 1
-        or topk_ids.stride(0) < _EXACT_SIGMOID_TOPK
+        or topk_ids.stride(0) < topk_ids.shape[1]
     ):
         return False
     if not (

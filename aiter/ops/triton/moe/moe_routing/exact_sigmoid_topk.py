@@ -16,7 +16,9 @@ def exact_sigmoid_biased_topk(
     need_renorm: bool,
     routed_scaling_factor: float,
 ) -> None:
-    """Run the gfx1250 exact-contract sigmoid + bias top-k specialization."""
+    """Run a measured gfx1250 sigmoid + bias top-k specialization."""
+    num_experts = gating_output.shape[1]
+    topk = topk_ids.shape[1]
     _exact_sigmoid_biased_topk[(gating_output.shape[0],)](
         gating_output,
         correction_bias,
@@ -27,9 +29,9 @@ def exact_sigmoid_biased_topk(
         topk_ids.stride(0),
         gating_output.shape[0],
         routed_scaling_factor,
-        N_EXPERTS=896,
-        TOPK=16,
-        BLOCK_N=1024,
+        N_EXPERTS=num_experts,
+        TOPK=topk,
+        BLOCK_N=1 << (num_experts - 1).bit_length(),
         NEED_RENORM=need_renorm,
         num_warps=4,
     )

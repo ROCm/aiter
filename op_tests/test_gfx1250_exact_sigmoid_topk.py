@@ -16,24 +16,26 @@ def _is_gfx1250() -> bool:
 
 pytestmark = pytest.mark.skipif(not _is_gfx1250(), reason="requires gfx1250")
 
+SUPPORTED_EXPERTS = [512, 768, 896, 900, 1024]
+SUPPORTED_TOPKS = [4, 8, 16]
 EXPERTS = 896
 TOPK = 16
 
 
 def _outputs(
-    rows: int, *, stride: int | None = None
+    rows: int, topk: int = TOPK, *, stride: int | None = None
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if stride is None:
         return (
-            torch.empty((rows, TOPK), dtype=torch.float32, device="cuda"),
-            torch.empty((rows, TOPK), dtype=torch.int32, device="cuda"),
+            torch.empty((rows, topk), dtype=torch.float32, device="cuda"),
+            torch.empty((rows, topk), dtype=torch.int32, device="cuda"),
         )
     return (
         torch.empty_strided(
-            (rows, TOPK), (stride, 1), dtype=torch.float32, device="cuda"
+            (rows, topk), (stride, 1), dtype=torch.float32, device="cuda"
         ),
         torch.empty_strided(
-            (rows, TOPK), (stride, 1), dtype=torch.int32, device="cuda"
+            (rows, topk), (stride, 1), dtype=torch.int32, device="cuda"
         ),
     )
 
@@ -42,12 +44,13 @@ def _run_legacy(
     logits: torch.Tensor,
     bias: torch.Tensor,
     *,
+    topk: int = TOPK,
     groups: int = 1,
     topk_groups: int = 1,
     renorm: bool = True,
     scale: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    weights, ids = _outputs(logits.shape[0])
+    weights, ids = _outputs(logits.shape[0], topk)
     topk_ops.biased_grouped_topk_hip(
         logits,
         bias,
@@ -66,11 +69,12 @@ def _run_public(
     logits: torch.Tensor,
     bias: torch.Tensor,
     *,
+    topk: int = TOPK,
     renorm: bool = True,
     scale: float = 1.0,
     output_stride: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    weights, ids = _outputs(logits.shape[0], stride=output_stride)
+    weights, ids = _outputs(logits.shape[0], topk, stride=output_stride)
     if api == "biased_grouped_topk":
         topk_ops.biased_grouped_topk(logits, bias, weights, ids, 1, 1, renorm, scale)
     else:
@@ -104,41 +108,49 @@ def _assert_matches_legacy(
 
 # Both public APIs launch the same exact kernel. Run its semantic matrix once;
 # the strided CUDAGraph test below still exercises both dispatch sites.
-@pytest.mark.parametrize("rows", [1, 2, 4, 8, 32, 128])
+@pytest.mark.parametrize("experts", SUPPORTED_EXPERTS)
+@pytest.mark.parametrize("topk", SUPPORTED_TOPKS)
+@pytest.mark.parametrize("rows", [1, 8, 128])
 @pytest.mark.parametrize("renorm,scale", [(True, 1.0), (False, 2.5)])
-def test_exact_sigmoid_topk_matches_legacy(rows, renorm, scale):
-    torch.manual_seed(17 + rows)
-    logits = torch.randn((rows, EXPERTS), dtype=torch.bfloat16, device="cuda")
-    bias = (torch.randn(EXPERTS, device="cuda") * 0.1).to(torch.bfloat16)
-    expected = _run_legacy(logits, bias, renorm=renorm, scale=scale)
+def test_exact_sigmoid_topk_matches_legacy(experts, topk, rows, renorm, scale):
+    torch.manual_seed(experts + topk + rows)
+    logits = torch.randn((rows, experts), dtype=torch.bfloat16, device="cuda")
+    bias = (torch.randn(experts, device="cuda") * 0.1).to(torch.bfloat16)
+    expected = _run_legacy(logits, bias, topk=topk, renorm=renorm, scale=scale)
     actual = _run_public(
-        "biased_grouped_topk", logits, bias, renorm=renorm, scale=scale
+        "biased_grouped_topk",
+        logits,
+        bias,
+        topk=topk,
+        renorm=renorm,
+        scale=scale,
     )
     _assert_matches_legacy(expected, actual)
 
 
+@pytest.mark.parametrize("experts", SUPPORTED_EXPERTS)
 @pytest.mark.parametrize("case", ["all_tie", "plateau", "extreme", "nan"])
-def test_exact_sigmoid_topk_preserves_legacy_edge_semantics(case):
+def test_exact_sigmoid_topk_preserves_legacy_edge_semantics(experts, case):
     torch.manual_seed(2026)
-    bias = torch.zeros(EXPERTS, dtype=torch.bfloat16, device="cuda")
+    bias = torch.zeros(experts, dtype=torch.bfloat16, device="cuda")
     if case == "all_tie":
-        logits = torch.zeros((8, EXPERTS), dtype=torch.bfloat16, device="cuda")
+        logits = torch.zeros((8, experts), dtype=torch.bfloat16, device="cuda")
     elif case == "plateau":
         logits = (
-            (torch.arange(EXPERTS, device="cuda") % 7)
+            (torch.arange(experts, device="cuda") % 7)
             .sub_(3)
             .repeat(8, 1)
             .to(torch.bfloat16)
         )
     elif case == "extreme":
-        logits = torch.empty((8, EXPERTS), dtype=torch.bfloat16, device="cuda")
+        logits = torch.empty((8, experts), dtype=torch.bfloat16, device="cuda")
         logits[:, 0::4] = 100
         logits[:, 1::4] = -100
         logits[:, 2::4] = 0
-        logits[:, 3::4] = torch.linspace(-20, 20, EXPERTS // 4, device="cuda")
-        bias = torch.linspace(-1, 1, EXPERTS, device="cuda").to(torch.bfloat16)
+        logits[:, 3::4] = torch.linspace(-20, 20, experts // 4, device="cuda")
+        bias = torch.linspace(-1, 1, experts, device="cuda").to(torch.bfloat16)
     else:
-        logits = torch.randn((8, EXPERTS), dtype=torch.bfloat16, device="cuda")
+        logits = torch.randn((8, experts), dtype=torch.bfloat16, device="cuda")
         logits[:, ::113] = float("nan")
         bias[::127] = float("nan")
 
@@ -149,13 +161,17 @@ def test_exact_sigmoid_topk_preserves_legacy_edge_semantics(case):
 
 
 @pytest.mark.parametrize("api", ["biased_grouped_topk", "topk_gating"])
-def test_exact_sigmoid_topk_supports_row_strides_and_cudagraph(api):
+@pytest.mark.parametrize(
+    "experts,topk",
+    [(512, 4), (900, 8), (1024, 16)],
+)
+def test_exact_sigmoid_topk_supports_row_strides_and_cudagraph(api, experts, topk):
     torch.manual_seed(7)
-    backing = torch.randn((8, 1536), dtype=torch.bfloat16, device="cuda")
-    logits = backing[:, 113 : 113 + EXPERTS]
-    bias = (torch.randn(EXPERTS, device="cuda") * 0.1).to(torch.bfloat16)
-    expected = _run_legacy(logits, bias)
-    actual = _run_public(api, logits, bias, output_stride=TOPK + 7)
+    backing = torch.randn((8, experts + 256), dtype=torch.bfloat16, device="cuda")
+    logits = backing[:, 113 : 113 + experts]
+    bias = (torch.randn(experts, device="cuda") * 0.1).to(torch.bfloat16)
+    expected = _run_legacy(logits, bias, topk=topk)
+    actual = _run_public(api, logits, bias, topk=topk, output_stride=topk + 7)
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -208,11 +224,34 @@ def test_topk_gating_noncontract_bias_keeps_hip_path():
     assert torch.equal(actual[1], expected[1])
 
 
-def test_exact_sigmoid_topk_capability_guard():
+@pytest.mark.parametrize("experts", SUPPORTED_EXPERTS)
+@pytest.mark.parametrize("topk", SUPPORTED_TOPKS)
+def test_exact_sigmoid_topk_capability_guard(experts, topk):
+    logits = torch.empty((8, experts), dtype=torch.bfloat16, device="cuda")
+    bias = torch.empty(experts, dtype=torch.bfloat16, device="cuda")
+    weights, ids = _outputs(8, topk)
+    assert topk_ops._can_use_gfx1250_exact_sigmoid_topk(logits, bias, weights, ids)
+
+
+@pytest.mark.parametrize(
+    "experts,topk",
+    [(experts, topk) for experts in (256, 300) for topk in SUPPORTED_TOPKS]
+    + [(experts, 12) for experts in SUPPORTED_EXPERTS],
+)
+@pytest.mark.parametrize("api", ["biased_grouped_topk", "topk_gating"])
+def test_noncontract_shapes_keep_legacy_path(api, experts, topk):
+    torch.manual_seed(experts + topk)
+    logits = torch.randn((8, experts), dtype=torch.bfloat16, device="cuda")
+    bias = (torch.randn(experts, device="cuda") * 0.1).to(torch.bfloat16)
+    expected = _run_legacy(logits, bias, topk=topk)
+    actual = _run_public(api, logits, bias, topk=topk)
+    _assert_matches_legacy(expected, actual)
+
+
+def test_exact_sigmoid_topk_capability_guard_rejects_layout_and_dtype():
     logits = torch.empty((8, EXPERTS), dtype=torch.bfloat16, device="cuda")
     bias = torch.empty(EXPERTS, dtype=torch.bfloat16, device="cuda")
     weights, ids = _outputs(8)
-    assert topk_ops._can_use_gfx1250_exact_sigmoid_topk(logits, bias, weights, ids)
     assert not topk_ops._can_use_gfx1250_exact_sigmoid_topk(
         logits, bias.float(), weights, ids
     )

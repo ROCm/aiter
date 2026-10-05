@@ -44,6 +44,7 @@ def _exact_sigmoid_biased_topk(
     low2 = (lane & 3) ^ tl.where((lane & 4) != 0, 3, 0)
     bit2 = (((lane >> 2) ^ (lane >> 3)) & 1) << 2
     lane_rank = ((lane ^ 0x38) & 0x38) | bit2 | low2
+    # Admitted expert counts use BLOCK_N <= 1024, so local_pos fits in 5 bits.
     tie_rank = lane_rank * 32 + local_pos
 
     for k in tl.static_range(TOPK):
