@@ -4846,7 +4846,7 @@ def pa_decode_gluon(
         Buffer for partial attention outputs from each context partition.
         - Shape: [num_seqs, num_kv_heads, max_context_partition_num,
           query_length * query_group_size, head_size]
-        - Dtype: same as query/output
+        - Dtype: torch.bfloat16 if compute_type is FP8, otherwise compute_type
 
     alibi_slopes : torch.Tensor, optional
         ALiBi (Attention with Linear Biases) slopes for positional encoding.
@@ -4860,7 +4860,7 @@ def pa_decode_gluon(
         per-token query_scale). query_length must be >= every per-sequence
         query length; otherwise the result is undefined. Rows not owned by
         any sequence are left untouched. Only supported on the PS path.
-        - Shape: [num_seqs + 1]
+        - Shape: [num_seqs + 1], on the same device as query
         - Dtype: torch.int32
         - Default: None (every sequence has exactly query_length rows)
 
@@ -4898,8 +4898,12 @@ def pa_decode_gluon(
             query_start_loc.dtype == aiter.dtypes.i32
             and query_start_loc.dim() == 1
             and query_start_loc.is_contiguous()
-        ), "query_start_loc must be a contiguous 1D int32 tensor"
+            and query_start_loc.device == query.device
+        ), "query_start_loc must be a contiguous 1D int32 tensor on query's device"
         batch_size = query_start_loc.shape[0] - 1
+        assert (
+            context_lengths.shape[0] == batch_size == block_tables.shape[0]
+        ), "context_lengths and block_tables must have len(query_start_loc) - 1 rows"
     else:
         batch_size = query.shape[0] // query_length
     num_kv_heads = key_cache.shape[1]

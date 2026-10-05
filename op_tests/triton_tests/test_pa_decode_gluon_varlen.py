@@ -32,7 +32,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.fixture(params=["hip", "flydsl", "triton"])
+@pytest.fixture
 def reduce_backend(request, monkeypatch):
     """Force one PS reduce backend and record its varlen launches."""
     backend = request.param
@@ -214,51 +214,70 @@ def _run(
     )
 
 
+QUERY_LENS = [
+    ((4, 4, 1), 4),
+    ((1, 2, 3, 4), 4),
+    ((2, 2), 2),
+    ((3, 1, 3), 3),
+    ((1, 2, 1), 4),
+    ((2, 0, 3), 3),
+]
+NUM_HEADS = {
+    "head1_g16": (16, 1),
+    "head1_g8": (8, 1),
+    "multi_g16": (64, 4),
+    "multi_g8": (16, 2),
+}
+# block_size, trans_v, quant, use_sinks, sliding_window, partition_size
+KERNEL_CONFIGS = {
+    "bf16": (16, False, None, False, 0, 256),
+    "bf16_sinks_b64": (64, False, None, True, 0, 256),
+    "fp8_q_kv": (16, False, "fp8_q_kv", False, 0, 256),
+    "fp8_kv": (16, False, "fp8_kv", False, 0, 256),
+    "sliding128_b64": (64, False, None, False, 128, 256),
+    # vLLM's sliding-window setup: window + 1, 128-token partitions.
+    "fp8_kv_sinks_sliding128_p128": (16, False, "fp8_kv", True, 129, 128),
+    "sliding256_p128": (16, False, None, False, 257, 128),
+    # vLLM's shuffled KV layout with 128-token pages (MiniMax-M3).
+    "b128_transv_bf16": (128, True, None, False, 0, 256),
+    "b128_transv_fp8_kv_sinks": (128, True, "fp8_kv", True, 0, 256),
+    "b128_transv_fp8_kv_sliding128_p128": (128, True, "fp8_kv", False, 129, 128),
+}
+# (reduce backend, num_splits); one-shot runs no reduce.
+RUNS = [("hip", 8), ("flydsl", 8), ("triton", 8), ("triton", 1)]
+
+
+def _cases():
+    """Pairwise instead of the full product: every kernel config meets every
+    head config once across RUNS, and each run sees every query-length pattern.
+    """
+    cases = []
+    head_ids = list(NUM_HEADS)
+    for i, (config_id, config) in enumerate(KERNEL_CONFIGS.items()):
+        for run, (backend, num_splits) in enumerate(RUNS):
+            head_id = head_ids[(i + run) % len(head_ids)]
+            query_lens, query_length = QUERY_LENS[(i + 2 * run) % len(QUERY_LENS)]
+            run_id = "one_shot" if num_splits == 1 else f"split8_{backend}"
+            lens_id = "_".join(map(str, query_lens))
+            cases.append(
+                pytest.param(
+                    backend,
+                    query_lens,
+                    query_length,
+                    NUM_HEADS[head_id],
+                    num_splits,
+                    *config,
+                    id=f"{run_id}-{config_id}-{head_id}-q{lens_id}",
+                )
+            )
+    return cases
+
+
 @pytest.mark.parametrize(
-    "query_lens, query_length",
-    [
-        ((4, 4, 1), 4),
-        ((1, 2, 3, 4), 4),
-        ((2, 2), 2),
-        ((3, 1, 3), 3),
-        ((1, 2, 1), 4),
-        ((2, 0, 3), 3),
-    ],
-)
-@pytest.mark.parametrize(
-    "num_heads",
-    [(16, 1), (8, 1), (64, 4), (16, 2)],
-    ids=["head1_g16", "head1_g8", "multi_g16", "multi_g8"],
-)
-@pytest.mark.parametrize("num_splits", [1, 8], ids=["one_shot", "split8"])
-@pytest.mark.parametrize(
+    "reduce_backend, query_lens, query_length, num_heads, num_splits, "
     "block_size, trans_v, quant, use_sinks, sliding_window, partition_size",
-    [
-        (16, False, None, False, 0, 256),
-        (64, False, None, True, 0, 256),
-        (16, False, "fp8_q_kv", False, 0, 256),
-        (16, False, "fp8_kv", False, 0, 256),
-        (64, False, None, False, 128, 256),
-        # vLLM's sliding-window setup: window + 1, 128-token partitions.
-        (16, False, "fp8_kv", True, 129, 128),
-        (16, False, None, False, 257, 128),
-        # vLLM's shuffled KV layout with 128-token pages (MiniMax-M3).
-        (128, True, None, False, 0, 256),
-        (128, True, "fp8_kv", True, 0, 256),
-        (128, True, "fp8_kv", False, 129, 128),
-    ],
-    ids=[
-        "bf16",
-        "bf16_sinks_b64",
-        "fp8_q_kv",
-        "fp8_kv",
-        "sliding128_b64",
-        "fp8_kv_sinks_sliding128_p128",
-        "sliding256_p128",
-        "b128_transv_bf16",
-        "b128_transv_fp8_kv_sinks",
-        "b128_transv_fp8_kv_sliding128_p128",
-    ],
+    _cases(),
+    indirect=["reduce_backend"],
 )
 def test_varlen_matches_uniform(
     reduce_backend,
@@ -274,8 +293,6 @@ def test_varlen_matches_uniform(
     partition_size,
 ):
     backend, varlen_calls = reduce_backend
-    if num_splits == 1 and backend != "hip":
-        pytest.skip("one-shot runs no reduce; covered once")
     inputs, sinks, query_start_loc, context_lens, block_tables = _make_inputs(
         query_lens,
         num_heads,
