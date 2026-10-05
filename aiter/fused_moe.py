@@ -789,6 +789,8 @@ def resolve_activation_dtype(
             q_dtype_a = _bound_split(
                 M, _SWIGLU_MXFP4_BF16_BOUND, dtypes.bf16, dtypes.fp4x2
             )
+        elif activation == ActivationType.Relu2:
+            q_dtype_a = dtypes.bf16
         elif activation == ActivationType.Swiglu or gate_mode == GateMode.INTERLEAVE:
             if gfx != "gfx950":
                 q_dtype_a = dtypes.bf16
@@ -1814,6 +1816,7 @@ fused_moe_1stage_dict = {
     "gfx950":
     {
         (ActivationType.Silu,    QuantType.per_1x32,   dtypes.bf16,   dtypes.fp4x2,  dtypes.fp4x2,    True,   False) : aiter.fmoe_g1u1,
+        (ActivationType.Situv2,  QuantType.per_1x32,   dtypes.bf16,   dtypes.bf16,   dtypes.fp4x2,    True,   False) : aiter.fmoe_g1u1,
         (ActivationType.Silu,   QuantType.per_1x128,   dtypes.bf16,     dtypes.fp8,    dtypes.fp8,    True,   False) : aiter.fmoe_fp8_blockscale_g1u1,
         (ActivationType.Gelu,   QuantType.per_1x128,   dtypes.bf16,     dtypes.fp8,    dtypes.fp8,    True,   False) : aiter.fmoe_fp8_blockscale_g1u1,
         (ActivationType.Silu,   QuantType.per_Token,   dtypes.bf16,    dtypes.bf16,   dtypes.bf16,   False,   False) : aiter.fmoe,
@@ -1901,7 +1904,9 @@ def _normalize_mxfp4_activation_params(
         situ_beta = 1.0 if beta is None else float(beta)
         situ_linear_beta = 1.0 if linear_beta is None else float(linear_beta)
     normalized_swiglu_limit = (
-        swiglu_limit if activation == ActivationType.Swiglu else None
+        swiglu_limit
+        if activation in (ActivationType.Silu, ActivationType.Swiglu)
+        else None
     )
     return situ_beta, situ_linear_beta, normalized_swiglu_limit
 
@@ -2422,14 +2427,11 @@ def _mxfp4_a4w4_stage1_fw(
     p1 = _parse_mxfp4_g1_kname(kernelName1)
     runtime_situ_beta = float(situ_beta)
     runtime_situ_linear_beta = float(situ_linear_beta)
-    # swiglu_limit reaches the kernel as a scalar closure value, so it lands in
-    # FlyDSL's disk-cache key (see the note in mxfp4_gemm1.py), yet
-    # _activation_mul_batch only consumes it for swiglu -- silu and situv2 ignore
-    # it entirely. Pin the other activations to the default so a caller's limit
-    # cannot fork the cache into entries whose generated code is identical.
-    runtime_swiglu_limit = 7.0
-    if p1["act"] == "swiglu" and swiglu_limit is not None:
-        runtime_swiglu_limit = float(swiglu_limit)
+    # Match generic FlyDSL v1/v2 semantics. MXMOE captures this value in the
+    # compiled kernel closure; +inf represents an unclamped SiLU.
+    runtime_swiglu_limit = _get_flydsl_moe_kernels().runtime_swiglu_limit(
+        swiglu_limit, p1["act"]
+    )
     if not p1.get("enable_bias", False) and bias1 is not None:
         raise ValueError(
             "MXMOE bias presence does not match the cache-safe kernel name"
@@ -2671,6 +2673,11 @@ def _flydsl_v2_stage2_wrapper(
     bn = cfg["tile_n"]
     bk = cfg["tile_k"]
     sbm = cfg["sort_block_m"] or (int(block_m) if block_m else bm)
+    if cfg["sort_block_m"] and block_m is not None and int(block_m) != sbm:
+        raise ValueError(
+            "FlyDSL v2 stage2 sorting layout mismatch: moe_sorting uses "
+            f"block_m={int(block_m)}, but the kernel expects sort_block_m={sbm}."
+        )
     epilog = cfg["epilog"]
     max_sorted = inter_states.shape[0]
 
@@ -2753,6 +2760,7 @@ def _flydsl_v2_stage2_wrapper(
         g2_spart=cfg["spart"],
         out_dtype="fp8" if _s2_fp8_inter else "bf16",
         bias=bias2,
+        is_ep=expert_mask is not None,
     )
     if epilog == "reduce":
         from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
@@ -2886,6 +2894,31 @@ def get_2stage_cfgs(
     has_num_local_tokens=False,
 ):
     gate_mode = GateMode(gate_mode)
+    if activation == ActivationType.Relu2:
+        if use_g1u1:
+            raise NotImplementedError(
+                "ActivationType.Relu2 is gate-only (non-gated) and does not "
+                "support use_g1u1=True; pass use_g1u1=False."
+            )
+        if doweight_stage1:
+            raise NotImplementedError(
+                "ActivationType.Relu2 CK-Tile stage1 instances are generated "
+                "with MulRoutedWeight=False; doweight_stage1=True is not "
+                "supported and would silently drop routed weights."
+            )
+        if has_stage1_bias or has_stage2_bias:
+            raise NotImplementedError(
+                "ActivationType.Relu2 CK-Tile path does not support "
+                "per-expert bias (has_stage1_bias/has_stage2_bias); the "
+                "returned metadata hardcodes has_bias=False."
+            )
+        if gate_mode != GateMode.SEPARATED:
+            raise NotImplementedError(
+                "ActivationType.Relu2 CK-Tile stage1 instance "
+                "(kFFN_gemm1_gate_only) only supports the gate-only/"
+                f"separated weight layout; gate_mode={gate_mode.value!r} "
+                "is not supported."
+            )
     cktile_mxfp4_unsafe = q_dtype_w == dtypes.fp4x2 and inter_dim % 256 != 0
     flydsl_can_take_over = _can_reroute_mxfp4_to_flydsl(
         model_dim=model_dim,
@@ -3125,6 +3158,18 @@ def get_2stage_cfgs(
                 f"[fused_moe] discarding Opus tuned config for unsupported "
                 f"activation {activation}; using default heuristics"
             )
+        elif (
+            kn1.startswith("flydsl_") or kn2.startswith("flydsl_")
+        ) and activation not in (
+            ActivationType.Silu,
+            ActivationType.Swiglu,
+            ActivationType.Situv2,
+        ):
+            cfg = None
+            logger.warning(
+                f"[fused_moe] discarding FlyDSL tuned config for unsupported "
+                f"activation {activation}; using default heuristics"
+            )
         elif _disable_inline_sort and _is_inline_sort_cfg(kn1, kn2):
             cfg = None
             logger.warning("[fused_moe] discarding tuned inline-sort config")
@@ -3170,9 +3215,7 @@ def get_2stage_cfgs(
                 f"activation {configured_act!r} does not match runtime "
                 f"{expected_act!r}"
             )
-        elif swiglu_limit and expected_act != "swiglu":
-            # MXMOE's _activation_mul_batch consumes the limit for swiglu only;
-            # zero is the existing no-clamp sentinel on non-SwiGLU paths.
+        elif swiglu_limit and expected_act not in ("silu", "swiglu"):
             reject_reason = (
                 f"MXMOE cannot apply swiglu_limit={swiglu_limit!r} to "
                 f"activation {expected_act!r}"
@@ -3189,6 +3232,8 @@ def get_2stage_cfgs(
             reject_reason = (
                 f"stage2 bias requires a flydsl_moe2_layout_ kernel, got {kn2!r}"
             )
+        elif is_ep:
+            reject_reason = "the MXMOE output_aux sort drops expert_mask"
         if reject_reason is not None:
             cfg = None
             logger.warning(
@@ -3282,11 +3327,12 @@ def get_2stage_cfgs(
             f"{keys} in {tune_file}"
         )
 
-    # The asm 1-stage kernels are compiled only for Silu/Gelu
+    # Asm 1-stage kernels exist for Silu/Gelu and for gfx950 MXFP4 SiTUv2 FLAT.
     if (
         cfg is not None
         and cfg.get("run_1stage", False)
-        and activation not in (ActivationType.Silu, ActivationType.Gelu)
+        and activation
+        not in (ActivationType.Silu, ActivationType.Gelu, ActivationType.Situv2)
     ):
         cfg = None
         logger.warning(
@@ -3349,6 +3395,15 @@ def get_2stage_cfgs(
         )
     else:
         block_m = cfg["block_m"]
+        nt_override = int(os.environ.get("AITER_USE_NT", "-1"))
+        if nt_override != -1:
+            use_non_temporal_load = bool(nt_override)
+        elif "nt" in cfg:
+            try:
+                use_non_temporal_load = bool(int(float(cfg["nt"])))
+            except (TypeError, ValueError):
+                # blank or malformed column: keep the pre-column behaviour
+                use_non_temporal_load = False
         if int(os.environ.get("AITER_KSPLIT", "0")) != -1:
             ksplit = cfg["ksplit"]
         else:
@@ -3450,7 +3505,9 @@ def get_2stage_cfgs(
     is_opus2 = _opus_a8w4.is_opus_a8w4_stage2_kernel(kernelName2)
     if is_opus1 or is_flydsl1 or is_flydsl2:
         enable_bias = (
-            _needs_swiglu_bias_support(dtype, q_type) and q_dtype_w == dtypes.fp4x2
+            activation == ActivationType.Swiglu
+            and _needs_swiglu_bias_support(dtype, q_type)
+            and q_dtype_w == dtypes.fp4x2
         )
         _s1_fp4q = is_flydsl1 and "_fp4" in kernelName1.split("_t")[-1]
         if is_opus1:
@@ -3586,6 +3643,40 @@ def get_2stage_cfgs(
         and is_shuffled
         and cktile_mxfp4_ok
     )
+    if (
+        activation == ActivationType.Relu2
+        and not use_g1u1
+        and q_type == QuantType.per_1x32
+        and q_dtype_w == dtypes.fp4x2
+        and q_dtype_a == dtypes.bf16
+        and dtype == dtypes.bf16
+        and not has_stage2_scatter
+        and not has_activation_scales
+        and bool(opus_weights_shuffled)
+        and get_gfx() == "gfx950"
+    ):
+        _cktile_block_m = 16 if token < 2048 else 32 if token < 16384 else 64
+        return MOEMetadata(
+            functools.partial(
+                cktile_moe_stage1,
+                n_pad_zeros=intermediate_pad // 64 * 64,
+                k_pad_zeros=hidden_pad // 128 * 128,
+                activation=activation,
+                split_k=1,
+                dtype=dtype,
+            ),
+            functools.partial(
+                cktile_moe_stage2,
+                n_pad_zeros=hidden_pad // 64 * 64,
+                k_pad_zeros=intermediate_pad // 128 * 128,
+                activation=activation,
+            ),
+            _cktile_block_m,
+            1,
+            run_1stage,
+            has_bias=False,
+            stage2_has_bias=False,
+        )
     if q_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
         # Untuned a16wi4 fallback: one shape-safe config on the shared a16w-mix port.
         # Tiles belong in the tuned CSV, not in a heuristic here. ksplit is 0 because
@@ -3669,6 +3760,39 @@ def get_2stage_cfgs(
         and use_g1u1
         and not doweight_stage1
     )
+    # The fallback's layout GEMM2 writes bf16 only, and its output_aux sort drops expert_mask.
+    _mxmoe_fallback_ok = (
+        dtype == dtypes.bf16
+        and not is_ep
+        and q_type == QuantType.per_1x32
+        and activation == ActivationType.Situv2
+        and q_dtype_a == dtypes.fp4x2
+        and q_dtype_w == dtypes.fp4x2
+        and is_shuffled
+        and use_g1u1
+        and not doweight_stage1
+        and gate_mode != GateMode.INTERLEAVE
+        and not (has_stage1_bias or has_stage2_bias)
+        and hidden_pad == 0
+        and intermediate_pad == 0
+        and model_dim % 256 == 0
+        and inter_dim % 128 == 0
+        and aiter.is_mxfp4_moe_shape_supported(expert, model_dim, inter_dim, topk)
+        and os.environ.get("AITER_MXMOE_FALLBACK", "1") == "1"
+    )
+    if _mxmoe_fallback_ok and cfg is None:
+        _bm = 64 if token < 512 else 128
+        _rows_per_expert = -(-token * topk // expert)
+        _g1_swz = min(6, max(1, -(-_rows_per_expert // _bm)))
+        _g1_sfx = f"_xcd{_g1_swz}" if _g1_swz > 1 else ""
+        _kn1 = f"flydsl_mxmoe_g1_a4w4_{_bm}x256x256_situv2{_g1_sfx}"
+        _kn2 = f"flydsl_moe2_layout_afp4_wfp4_bf16_t{_bm}x256x128_reduce_sbm{_bm}"
+        logger.warning(
+            f"[fused_moe] no tuned FlyDSL config for {keys}, "
+            f"using heuristic MXMOE fallback (kn1={_kn1!r}, kn2={_kn2!r})"
+        )
+        return _make_mxfp4_metadata(_kn1, _kn2, gate_mode, 0, block_m=_bm)
+
     if use_mxfp4_flydsl:
         from aiter.ops.flydsl.moe_kernels import (
             flydsl_kernel_name,
@@ -3724,7 +3848,10 @@ def get_2stage_cfgs(
             f"[fused_moe] no tuned FlyDSL config for {keys}, "
             f"using heuristic FlyDSL fallback ({kn1=}, {kn2=})"
         )
-        enable_bias = _needs_swiglu_bias_support(dtype, q_type)
+        enable_bias = (
+            activation == ActivationType.Swiglu
+            and _needs_swiglu_bias_support(dtype, q_type)
+        )
         return MOEMetadata(
             functools.partial(
                 _flydsl_stage1_wrapper,
@@ -4044,7 +4171,8 @@ def fused_moe_2stages(
         and (
             q_dtype_a in [dtypes.bf16, dtypes.fp16]
             and (
-                activation in (ActivationType.Swiglu, ActivationType.Situv2)
+                activation
+                in (ActivationType.Swiglu, ActivationType.Situv2, ActivationType.Relu2)
                 or gate_mode == GateMode.INTERLEAVE
             )
             or (q_dtype_a in [dtypes.fp4x2] and metadata.ksplit > 1 and is_shuffled)
@@ -4284,7 +4412,8 @@ def fused_moe_2stages(
         and w1.dtype == dtypes.fp4x2
         and (
             q_dtype_a in [dtypes.bf16, dtypes.fp16]
-            and activation in (ActivationType.Swiglu, ActivationType.Situv2)
+            and activation
+            in (ActivationType.Swiglu, ActivationType.Situv2, ActivationType.Relu2)
             or (metadata.ksplit > 1 and is_shuffled)
         )
     ):
