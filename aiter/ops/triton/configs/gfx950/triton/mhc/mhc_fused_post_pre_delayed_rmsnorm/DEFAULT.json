@@ -1,0 +1,74 @@
+{
+    "M_LEQ_144": {
+        "NUM_KSPLIT": 160,
+        "BLOCK_M": 16,
+        "TILE_K": 32,
+        "num_warps": 2,
+        "num_stages": 3,
+        "BLOCK_C": 1024,
+        "reduce_num_warps": 1
+    },
+    "M_LEQ_192": {
+        "NUM_KSPLIT": 40,
+        "BLOCK_M": 16,
+        "TILE_K": 32,
+        "num_warps": 2,
+        "num_stages": 3,
+        "BLOCK_C": 1024,
+        "reduce_num_warps": 1
+    },
+    "M_LEQ_1024": {
+        "NUM_KSPLIT": 160,
+        "BLOCK_M": 16,
+        "TILE_K": 32,
+        "num_warps": 2,
+        "num_stages": 3,
+        "BLOCK_C": 1024,
+        "reduce_num_warps": 1
+    },
+    "M_LEQ_2048": {
+        "NUM_KSPLIT": 80,
+        "BLOCK_M": 16,
+        "TILE_K": 32,
+        "num_warps": 2,
+        "num_stages": 3,
+        "BLOCK_C": 1024,
+        "reduce_num_warps": 1
+    },
+    "M_LEQ_4096": {
+        "NUM_KSPLIT": 10,
+        "BLOCK_M": 16,
+        "TILE_K": 32,
+        "num_warps": 2,
+        "num_stages": 3,
+        "BLOCK_C": 1024,
+        "reduce_num_warps": 1
+    },
+    "M_LEQ_8192": {
+        "NUM_KSPLIT": 8,
+        "BLOCK_M": 16,
+        "TILE_K": 32,
+        "num_warps": 2,
+        "num_stages": 3,
+        "BLOCK_C": 1024,
+        "reduce_num_warps": 1
+    },
+    "M_LEQ_16384": {
+        "NUM_KSPLIT": 4,
+        "BLOCK_M": 16,
+        "TILE_K": 32,
+        "num_warps": 2,
+        "num_stages": 3,
+        "BLOCK_C": 1024,
+        "reduce_num_warps": 1
+    },
+    "any": {
+        "NUM_KSPLIT": 4,
+        "BLOCK_M": 16,
+        "TILE_K": 32,
+        "num_warps": 2,
+        "num_stages": 3,
+        "BLOCK_C": 1024,
+        "reduce_num_warps": 1
+    }
+}

@@ -3,6 +3,7 @@
 
 import argparse
 import hashlib
+import os
 import random
 import sys
 
@@ -13,7 +14,7 @@ import torch
 import triton
 
 import aiter
-from aiter import dtypes, per_tensor_quant, pertoken_quant
+from aiter import dtypes, logger, per_tensor_quant, pertoken_quant
 from aiter.ops.triton.gluon.pa_decode_gluon import (
     get_recommended_splits,
     pa_decode_gluon,
@@ -24,8 +25,8 @@ try:
     from triton.experimental import gluon  # noqa: F401
     from triton.experimental.gluon import language as gl  # noqa: F401
 except ImportError:
-    print(
-        "Warning: pa_decode_gluon tests require triton.experimental.gluon and "
+    logger.warning(
+        "pa_decode_gluon tests require triton.experimental.gluon and "
         "triton.experimental.gluon.language!"
     )
     pa_decode_gluon = None
@@ -37,7 +38,6 @@ TEST_NAME = "main.normal_accuracy_performance.jit"
 # Global variables that will be set by command line arguments
 USE_TORCH_FLASH_REF = True
 
-torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
 
 # Global configuration
@@ -122,15 +122,15 @@ def compare_arrays(
     if np.any(nan_mask1):
         result["nan_info"]["arr1_nan_count"] = np.sum(nan_mask1)
         result["nan_info"]["arr1_nan_positions"] = np.argwhere(nan_mask1)
-        print(
-            f"Warning: arr1 contains {result['nan_info']['arr1_nan_count']} NaN values"
+        logger.warning(
+            "arr1 contains %d NaN values", result["nan_info"]["arr1_nan_count"]
         )
 
     if np.any(nan_mask2):
         result["nan_info"]["arr2_nan_count"] = np.sum(nan_mask2)
         result["nan_info"]["arr2_nan_positions"] = np.argwhere(nan_mask2)
-        print(
-            f"Warning: arr2 contains {result['nan_info']['arr2_nan_count']} NaN values"
+        logger.warning(
+            "arr2 contains %d NaN values", result["nan_info"]["arr2_nan_count"]
         )
 
     # Compute absolute differences
@@ -139,8 +139,8 @@ def compare_arrays(
 
     max_diff_thr = diff / (1.0 + np.abs(arr2))
     max_diff_thr = max_diff_thr.max()
-    print(f"diff.abs.max={diff.max()}")
-    print(f"max_diff_thr={max_diff_thr}")
+    logger.info("diff.abs.max=%f", diff.max())
+    logger.info("max_diff_thr=%f", max_diff_thr)
     result["max_diff"] = diff.max()
     result["max_diff_thr"] = max_diff_thr
 
@@ -1184,7 +1184,6 @@ def run_pa_gluon_test(
     seed = 123
     setup_seed(seed)
     device = "cuda:0"
-    torch.set_default_device(device)
     num_query_heads, num_kv_heads = num_heads
     assert (
         num_query_heads % num_kv_heads == 0
@@ -1203,7 +1202,11 @@ def run_pa_gluon_test(
     total_queries = query_output_indptr[-1].item()
 
     qkv_tensor = torch.randn(
-        total_queries, num_query_heads + 2 * num_kv_heads, head_size, dtype=data_type
+        total_queries,
+        num_query_heads + 2 * num_kv_heads,
+        head_size,
+        dtype=data_type,
+        device=device,
     )
     query, _key, _value = torch.split(
         qkv_tensor, [num_query_heads, num_kv_heads, num_kv_heads], dim=1
@@ -1406,11 +1409,11 @@ def run_pa_gluon_test(
             ).reshape(
                 batch_size * query_length, num_kv_heads * query_group_size, head_size
             )
-        print("\n=== Comparing Two Reference Implementations ===")
+        logger.info("\n=== Comparing Two Reference Implementations ===")
         ref_diff = (
             (reference_output_quant - reference_output_flashattn).abs().max().item()
         )
-        print(f"FlashAttn-style Ref vs Original Ref: max diff = {ref_diff:.6e}")
+        logger.info("FlashAttn-style Ref vs Original Ref: max diff = %.6e", ref_diff)
         compare_arrays(
             reference_output_flashattn.to(torch.float32).detach().cpu().numpy(),
             reference_output_quant.to(torch.float32).detach().cpu().numpy(),
@@ -1423,7 +1426,7 @@ def run_pa_gluon_test(
             .numpy()
             .tobytes()
         ).hexdigest()
-        print(f"out_flashattn_ref_md5={out_flashattn_ref_md5}")
+        logger.info("out_flashattn_ref_md5=%s", out_flashattn_ref_md5)
 
     # Create intermediate tensors for attention computation
     num_seqs = batch_size
@@ -1504,30 +1507,30 @@ def run_pa_gluon_test(
     )
     if err_gluon > 0:
         err_gluon = 1
-    print("\n=== Detailed Error Analysis ===")
-    print("Gluon vs Original Ref:")
+    logger.info("\n=== Detailed Error Analysis ===")
+    logger.info("Gluon vs Original Ref:")
     diff_result = compare_arrays(
         final_output_gluon.to(torch.float32).detach().cpu().numpy(),
         reference_output_quant.to(torch.float32).detach().cpu().numpy(),
     )
     if diff_result["max_diff_thr"] < diff_tolerance:
-        print("gluon_vs_torch_ref PASSED")
+        logger.info("gluon_vs_torch_ref PASSED")
     else:
-        print("gluon_vs_torch_ref FAILED")
+        logger.warning("gluon_vs_torch_ref FAILED")
     # Track results based on implementation type
     results["us_gluon"] = gluon_time
     results["err_gluon"] = err_gluon
 
     if USE_TORCH_FLASH_REF:
-        print("\nGluon vs FlashAttn-style Ref:")
+        logger.info("\nGluon vs FlashAttn-style Ref:")
         diff_result = compare_arrays(
             final_output_gluon.to(torch.float32).detach().cpu().numpy(),
             reference_output_flashattn.to(torch.float32).detach().cpu().numpy(),
         )
         if diff_result["max_diff_thr"] < flash_style_diff_tolerance:
-            print("gluon_vs_torch_flash_ref PASSED")
+            logger.info("gluon_vs_torch_flash_ref PASSED")
         else:
-            print("gluon_vs_torch_flash_ref FAILED")
+            logger.warning("gluon_vs_torch_flash_ref FAILED")
 
     # MD5 hash
     out_ref_md5 = hashlib.md5(
@@ -1546,8 +1549,8 @@ def run_pa_gluon_test(
         .numpy()
         .tobytes()
     ).hexdigest()
-    print(f"out_ref_md5={out_ref_md5}")
-    print(f"gluon_output_md5={gluon_hash}")
+    logger.info("out_ref_md5=%s", out_ref_md5)
+    logger.info("gluon_output_md5=%s", gluon_hash)
 
     # Bandwidth
     kernel_time_us = gluon_time
@@ -1740,24 +1743,27 @@ def _run_single_test(args):
     """
     test_config, current, total = args
 
-    print(
-        f"\n[{current}/{total}] Testing: "
-        f"use_torch_flash_ref={test_config['use_torch_flash_ref']}, "
-        f"compute_type={test_config['compute_type']}, "
-        f"quant_q_and_kv=({test_config['quant_q']}, {test_config['quant_kv']}), "
-        f"trans_v={test_config['trans_v']}, "
-        f"kv_varlen={test_config['kv_varlen']}, "
-        f"context_partition_size={test_config['context_partition_size']}, "
-        f"quant_mode={test_config['quant_mode']}, "
-        f"block_size={test_config['block_size']}, "
-        f"num_heads={test_config['num_heads']}, "
-        f"context_lengths={test_config['context_length']}, "
-        f"batch_size={test_config['batch_size']}, "
-        f"query_length={test_config['query_length']}, "
-        f"head_size={test_config['head_size']}, "
-        f"sinks={test_config['sinks']}, "
-        f"sliding_window={test_config['sliding_window']},"
-        f"ps={test_config['ps']}"
+    logger.info(
+        "\n[%d/%d] Testing: use_torch_flash_ref=%s, compute_type=%s, quant_q_and_kv=(%s, %s), trans_v=%s, kv_varlen=%s, context_partition_size=%d, quant_mode=%s, block_size=%d, num_heads=%s, context_lengths=%d, batch_size=%d, query_length=%d, head_size=%d, sinks=%s, sliding_window=%d,ps=%s",
+        current,
+        total,
+        test_config["use_torch_flash_ref"],
+        test_config["compute_type"],
+        test_config["quant_q"],
+        test_config["quant_kv"],
+        test_config["trans_v"],
+        test_config["kv_varlen"],
+        test_config["context_partition_size"],
+        test_config["quant_mode"],
+        test_config["block_size"],
+        test_config["num_heads"],
+        test_config["context_length"],
+        test_config["batch_size"],
+        test_config["query_length"],
+        test_config["head_size"],
+        test_config["sinks"],
+        test_config["sliding_window"],
+        test_config["ps"],
     )
 
     # Import global variables to modify them
@@ -1860,7 +1866,7 @@ def run_multi_pa_gluon_test(
                                                                     test_config
                                                                 )
     total = len(test_configs)
-    print(f"\nTotal test cases: {total}")
+    logger.info("\nTotal test cases: %d", total)
 
     # Run tests with random sampling
     if sample_rate < 1.0:
@@ -1868,12 +1874,15 @@ def run_multi_pa_gluon_test(
         test_configs_to_run = [
             config for config in test_configs if random.random() < sample_rate
         ]
-        print(
-            f"Using random sampling: running {len(test_configs_to_run)} out of {total} test cases (sample_rate={sample_rate:.2%})"
+        logger.info(
+            "Using random sampling: running %d out of %d test cases (sample_rate=%.2f%%)",
+            len(test_configs_to_run),
+            total,
+            (sample_rate) * 100,
         )
     else:
         test_configs_to_run = test_configs
-        print(f"Running all {total} test cases (sample_rate=100%)")
+        logger.info("Running all %d test cases (sample_rate=100%%)", total)
 
     results = []
     for idx, test_config in enumerate(test_configs_to_run):
@@ -1885,8 +1894,8 @@ def run_multi_pa_gluon_test(
 
 def parse_arg_and_run_test(sample_rate0: float | None = None):
     """Parse arguments and run tests."""
-    print(f"Triton location: {triton}")
-    print(f"Triton version: {triton.__version__}")
+    logger.info("Triton location: %s", triton)
+    logger.info("Triton version: %s", triton.__version__)
 
     parser = create_argument_parser()
     # When running via pytest, use empty args to avoid conflict with pytest's argv
@@ -1937,11 +1946,13 @@ def parse_arg_and_run_test(sample_rate0: float | None = None):
         ps_options,
     )
 
+    # Unit tests only check pass/fail; only a CLI run keeps the CSV report.
+    write_output_file = "PYTEST_CURRENT_TEST" not in os.environ
     output_file = f"run_pa_gluon_test.{TEST_NAME}.block_size_{block_sizes[0]}.triton.{TRITON_VERSION}.csv"
-    results_df.to_csv(output_file, index=False)
-
-    print(f"\nResults saved to {output_file}")
-    print(f"\nSummary:\n{results_df}")
+    if write_output_file:
+        results_df.to_csv(output_file, index=False)
+        logger.info("\nResults saved to %s", output_file)
+    logger.info("\nSummary:\n%s", results_df)
 
     # Print mean of selected columns grouped by compute_type
     columns_to_print_mean = [
@@ -1972,7 +1983,7 @@ def parse_arg_and_run_test(sample_rate0: float | None = None):
 
     # Check if DataFrame is empty or missing required column
     if results_df.empty or "compute_type" not in results_df.columns:
-        print("\nNo test results to analyze (empty DataFrame).")
+        logger.info("\nNo test results to analyze (empty DataFrame).")
         return
 
     # Get unique compute_types
@@ -1982,7 +1993,7 @@ def parse_arg_and_run_test(sample_rate0: float | None = None):
     valid_columns = [col for col in columns_to_print_mean if col in results_df.columns]
 
     if valid_columns:
-        print("\n=== Selected Columns Mean by Compute Type ===")
+        logger.info("\n=== Selected Columns Mean by Compute Type ===")
 
         # Build the mean table
         mean_table = {}
@@ -2005,8 +2016,8 @@ def parse_arg_and_run_test(sample_rate0: float | None = None):
         header = f"{'compute_type':<{ct_width}}"
         for col in valid_columns:
             header += f"  {col:>{col_widths[col]}}"
-        print(header)
-        print("-" * len(header))
+        logger.info(header)
+        logger.info("-" * len(header))
 
         # Print rows for each compute_type
         for ct in compute_types:
@@ -2019,18 +2030,22 @@ def parse_arg_and_run_test(sample_rate0: float | None = None):
                     row += f"  {val:>{col_widths[col]}.2f}%"
                 else:
                     row += f"  {val:>{col_widths[col]}.4f}"
-            print(row)
+            logger.info(row)
 
     # Check if all tests passed
     total_errors = results_df["err_gluon"].sum()
     if total_errors > 0:
-        print(
-            f"\nTests failed! {total_errors} test case(s) exceeded the error threshold. "
+        logger.warning(
+            "\nTests failed! %d test case(s) exceeded the error threshold. ",
+            total_errors,
         )
-        print(f"Please check rows with non-zero err_gluon in {output_file}.")
+        if write_output_file:
+            logger.warning(
+                "Please check rows with non-zero err_gluon in %s.", output_file
+            )
         assert False, f"{total_errors} test case(s) exceeded the error threshold"
     else:
-        print("\nAll tests passed!")
+        logger.info("\nAll tests passed!")
 
 
 def normal_accuracy_test():

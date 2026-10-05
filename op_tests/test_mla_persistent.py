@@ -674,6 +674,13 @@ def torch_mla_extend_split_kv(
             and is_fp8_kvc
             and max_seqlen_q <= 6
         )
+        or (
+            get_gfx() == "gfx950"
+            and is_fp8_q
+            and is_fp8_kvc
+            and nheads == 12
+            and nheads * max_seqlen_q <= 128
+        )
     ):
         # Natively support cases
         pass
@@ -1170,16 +1177,8 @@ def test_mla(
             kv_last_page_lens.fill_(ctx_lens % page_size)
 
     kv_indptr[1 : batch_size + 1] = torch.cumsum(kv_block_nums, dim=0)
-    if os.environ.get("DS32_DENSE_KV"):
-        assert not varlen, "DS32_DENSE_KV requires uniform seqlen (drop --varlen)"
-        pages_per_batch = int(kv_block_nums[0].item())
-        num_page = pages_per_batch
-        kv_indices = (
-            torch.arange(num_page, dtype=torch.int).repeat(batch_size).contiguous()
-        )
-    else:
-        num_page = kv_indptr[-1].item()
-        kv_indices = torch.randperm(num_page, dtype=torch.int)
+    num_page = kv_indptr[-1].item()
+    kv_indices = torch.randperm(num_page, dtype=torch.int)
     qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
     max_seqlen_qo = seq_lens_qo.max().item()
     # max_seqlen_kv = seq_lens_kv.max().item()

@@ -748,7 +748,22 @@ jobs:
           name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}-py3.12
           path: aiter_wheels
 
+      - name: Ensure zstd for Triton wheel cache
+        if: ${{ runner.os == 'Linux' }}
+        run: ./.github/scripts/ensure_zstd.sh
+
+      - name: Restore Triton wheel cache
+        id: restore_triton_wheel
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: 30
+        with:
+          path: triton_wheels
+          key: ${{ needs.prepare_triton_wheel.outputs.cache_key }}
+
       - name: Download Triton wheel artifact
+        if: steps.restore_triton_wheel.outputs.cache-hit != 'true'
         id: download_triton_wheel
         uses: actions/download-artifact@v4
         timeout-minutes: 30
@@ -757,8 +772,8 @@ jobs:
           name: ${{ env.TRITON_WHEEL_ARTIFACT_NAME }}
           path: triton_wheels
 
-      - name: Speedtest after Aiter test artifact download failure
-        if: ${{ always() && startsWith(runner.name, 'linux-aiter-mi35x-1-') && (steps.download_aiter_shards.outcome == 'failure' || steps.restore_aiter_wheel.outcome == 'failure' || steps.retry_aiter_wheel.outcome == 'failure' || steps.download_triton_wheel.outcome == 'failure') }}
+      - name: Speedtest after Aiter test cache or artifact download failure
+        if: ${{ always() && startsWith(runner.name, 'linux-aiter-mi35x-1-') && (steps.download_aiter_shards.outcome == 'failure' || steps.restore_aiter_wheel.outcome == 'failure' || steps.retry_aiter_wheel.outcome == 'failure' || steps.restore_triton_wheel.outcome == 'failure' || steps.download_triton_wheel.outcome == 'failure') }}
         continue-on-error: true
         timeout-minutes: 5
         run: |
@@ -1053,7 +1068,22 @@ jobs:
           name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}-py3.12
           path: aiter_wheels
 
+      - name: Ensure zstd for Triton wheel cache
+        if: ${{ runner.os == 'Linux' }}
+        run: ./.github/scripts/ensure_zstd.sh
+
+      - name: Restore Triton wheel cache
+        id: restore_triton_wheel
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: 30
+        with:
+          path: triton_wheels
+          key: ${{ needs.prepare_triton_wheel.outputs.cache_key }}
+
       - name: Download Triton wheel artifact
+        if: steps.restore_triton_wheel.outputs.cache-hit != 'true'
         uses: actions/download-artifact@v4
         timeout-minutes: 30
         continue-on-error: true
