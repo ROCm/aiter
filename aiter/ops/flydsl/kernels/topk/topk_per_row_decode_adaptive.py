@@ -377,8 +377,9 @@ def decode_adaptive_config(
     if early_stop is None:
         early_stop = early_stop_default()
     # Left out where the build cannot reach it, which would only split the JIT cache.
-    # The short tier reaches it under `compact` too, since it never uses the buffer.
-    if early_stop and not ordered:
+    # The short tier reaches it under `compact` too, since it never uses the buffer;
+    # `ordered` has no short tier, so there `compact` leaves nothing to reach.
+    if early_stop and not (ordered and compact):
         kw["early_stop"] = True
     if decode_adaptive_certificate(seq, parts):
         kw["histogram_certificate"] = True
@@ -477,9 +478,9 @@ def create_topk_per_row_decode_adaptive_kernel(
       is asking to diverge from both.
     - `compact_cap_mult` trades workspace for how often the buffer path is taken,
       never correctness: a row that overflows rescans instead.
-    - `early_stop` is silently dropped from the multi-block tiers under `ordered`
-      or `compact`, which are the two ways the last pass stops being a row walk it
-      can replace. The short tier takes it whenever it is compiled in.
+    - `early_stop` is silently dropped from the multi-block tiers under `compact`,
+      where the last pass reads the candidate buffer rather than the row. The
+      short tier takes it whenever it is compiled in.
     - `mid_cap` / `long_cap` are clamped to `blocks_per_row`.
 
     The module docstring describes what each tier, the candidate buffer and the
@@ -536,9 +537,9 @@ def create_topk_per_row_decode_adaptive_kernel(
     short_early_stop = bool(early_stop) and short_tier
     meta_slots = SMEM_META_SLOTS if short_early_stop else 8
     # Early stop replaces the last pass with one row walk, so it needs that pass to
-    # be reading the row: under `ordered` the last pass is what produces the order,
-    # and under `compact` it reads the candidate buffer instead.
-    early_stop = early_stop and not ordered and not compact
+    # be reading the row: under `compact` it reads the candidate buffer instead.
+    early_stop = early_stop and not compact
+    ordered_early_stop = early_stop and ordered
     # At one block per row "auto" cannot tell a short row from a row the grid could
     # only give one workgroup: `active_parts` folds to a compile-time one either
     # way, so a long row has nowhere to go but the single-workgroup tier. Only
@@ -1224,14 +1225,23 @@ def create_topk_per_row_decode_adaptive_kernel(
                     fx.memref_store(
                         carried + run_total, s_run, fx.Int32(SMEM_RUN_SELECTED)
                     )
-                    if const_expr(pass_id == num_passes - 1):
+                    # The early stop emits after the pass before the last, taking
+                    # that pass's whole bucket as the ties.
+                    if const_expr(
+                        pass_id == num_passes - 1
+                        or (ordered_early_stop and pass_id == num_passes - 2)
+                    ):
                         fx.memref_store(
                             s_own_hist[chosen_bucket], s_run, fx.Int32(SMEM_RUN_TIED)
                         )
                 gpu.barrier()
 
-        def ordered_classify(col_base, vec, col_hi, kth_bits):
-            """Classify one loaded vec-block vs the settled kth key."""
+        def ordered_classify(col_base, vec, col_hi, kth_bits, key_mask=None):
+            """Classify one loaded vec-block vs the settled kth key.
+
+            A `key_mask` that clears the unsettled low bits compares key prefixes
+            instead, so every key in the boundary bucket counts as tied.
+            """
             biased_kth = kth_bits ^ c_sign_bit
             cols = []
             n_selected = c_zero
@@ -1240,6 +1250,8 @@ def create_topk_per_row_decode_adaptive_kernel(
                 col_i32 = col_base + fx.Int32(j)
                 val = vec[j]
                 key = radix_twiddle_key(val)
+                if const_expr(key_mask is not None):
+                    key = key & key_mask
                 in_run = col_i32 < col_hi
                 selected = in_run.select(
                     ((key ^ c_sign_bit) < biased_kth).select(c_one, c_zero), c_zero
@@ -1250,14 +1262,20 @@ def create_topk_per_row_decode_adaptive_kernel(
                 n_tied = n_tied + tied
             return cols, n_selected, n_tied
 
-        def ordered_emit(need, kth_bits):
+        def ordered_emit(
+            need, kth_bits, key_mask=None, barrier_token=emit_barrier_token
+        ):
             """Write k ascending indices; ties on the kth value keep smallest column.
 
             Under compact this emits both a buffer-sourced and a row-sourced placement
             loop and gives the unused one zero trips, rather than branching around
             them. Both would otherwise have to run the cross-part base exchange, and
             that exchange contains a row barrier every part must reach exactly once.
+
+            The early stop passes, as runtime values, a mask of the bits its row has
+            settled and the token of the barriers that row actually reached.
             """
+            assert not (compact and key_mask is not None), "early stop reads the row"
             c_block_log2 = fx.Int32(int.bit_length(block_threads) - 1)
             # Trip count is uniform across workgroups; tail runs predicate columns away.
             row_steps_all = fx.Index(
@@ -1288,12 +1306,14 @@ def create_topk_per_row_decode_adaptive_kernel(
                 bases = [stage_col_base(step_i32, s) for s in range_constexpr(stages)]
                 return bases, [load_row_vec(b) for b in bases]
 
-            base_selected, base_tied = ordered_emit_bases(run_selected, run_tied)
+            base_selected, base_tied = ordered_emit_bases(
+                run_selected, run_tied, barrier_token
+            )
 
             # Phase 2: place.
             def place_tile(col_base, vec):
                 cols, n_selected, n_tied = ordered_classify(
-                    col_base, vec, col_hi, kth_bits
+                    col_base, vec, col_hi, kth_bits, key_mask
                 )
                 ordered_place(cols, n_selected, n_tied, base_selected, base_tied, need)
 
@@ -1339,7 +1359,7 @@ def create_topk_per_row_decode_adaptive_kernel(
                     )
                     yield [buf_state[0]]
 
-        def ordered_emit_bases(run_selected, run_tied):
+        def ordered_emit_bases(run_selected, run_tied, barrier_token):
             """Exclusive scan of selected/tied counts over the parts before this one."""
             # Single-workgroup rows skip the cross-part exchange; bases stay zero.
             if tid == c_zero:
@@ -1363,7 +1383,7 @@ def create_topk_per_row_decode_adaptive_kernel(
                         workspace_rsrc,
                         counter_slot(COUNTER_ORDERED_EQUAL) + part,
                     )
-                row_barrier(fx.Int32(emit_barrier_token))
+                row_barrier(barrier_token)
                 if wave == c_zero:
                     in_runs = lane < active_parts
                     lane_safe = in_runs.select(lane, c_zero)
@@ -1856,7 +1876,9 @@ def create_topk_per_row_decode_adaptive_kernel(
             next_len = s_meta[fx.Int32(SMEM_META_LEN)]
             next_bits = current_bits | fx.Int32(chosen_bucket << start_bit)
             if const_expr(pass_id == num_passes - 1):
-                if const_expr(ordered):
+                if const_expr(ordered_early_stop):
+                    pass  # the driver emits once for both of its exits
+                elif const_expr(ordered):
                     ordered_emit(next_k, next_bits)
                 elif const_expr(compact and pass_id > compact_fill_pass):
                     compact_write_entries(next_k, next_bits)
@@ -2167,11 +2189,11 @@ def create_topk_per_row_decode_adaptive_kernel(
                         local_len,
                     )
                 last_pass = num_passes - 1
+                settled_bit = max(32 - last_pass * bits_per_pass, 0)
                 early = local_len == local_k
-                if early:
-                    early_write_all(
-                        max(32 - last_pass * bits_per_pass, 0), kth_bits, local_k
-                    )
+                if const_expr(not ordered):  # noqa: SIM102 - constexpr guard
+                    if early:
+                        early_write_all(settled_bit, kth_bits, local_k)
                 if ~early:
                     local_k, local_len, kth_bits = scan_pass(
                         last_pass,
@@ -2179,6 +2201,18 @@ def create_topk_per_row_decode_adaptive_kernel(
                         kth_bits,
                         barrier_token_for(last_pass),
                         local_len,
+                    )
+                if const_expr(ordered):
+                    # Both exits share this emit; the key mask and the barrier
+                    # token tell it which pass settled the row.
+                    ordered_emit(
+                        local_k,
+                        kth_bits,
+                        early.select(fx.Int32(-(1 << settled_bit)), fx.Int32(-1)),
+                        early.select(
+                            fx.Int32(barrier_token_for(last_pass)),
+                            fx.Int32(emit_barrier_token),
+                        ),
                     )
             else:
                 for pass_id in range_constexpr(num_passes):
