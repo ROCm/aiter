@@ -174,8 +174,8 @@ std::string get_heuristic_kernel_mla(std::string q_type,
             continue;
         const auto& cfg = el.second;
 
-        // Gluon-shuffled page64 rows use the dedicated 88-byte launcher.
-        if (cfg.kv_shuffled != 0)
+        // Explicit page1/page64 rows use dedicated 80/88-byte QH128 launchers.
+        if (cfg.page_size != 0 || cfg.kv_shuffled != 0)
             continue;
 
         if (cfg.qType != q_type || cfg.kvType != kv_type)
@@ -1512,8 +1512,35 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                              static_cast<unsigned int>(cfg->dyn_lds)});
 }
 
-// QH128 decode over the Gluon-shuffled FP8 page64 cache.
+// QH128 decode over token-major page1 or Gluon-shuffled page64 FP8 caches.
 namespace {
+struct MlaPs1Qh128Args
+{
+    const void* q;
+    const void* kv;
+    const void* kv_indptr;
+    const void* kv_indices;
+    void* out;
+    void* lse;
+    const void* q_scale;
+    const void* kv_scale;
+    float softmax_scale;
+    uint32_t q_stride;
+    uint32_t physical_tokens;
+    uint32_t reserved;
+};
+static_assert(sizeof(MlaPs1Qh128Args) == 80);
+static_assert(offsetof(MlaPs1Qh128Args, q) == 0 && offsetof(MlaPs1Qh128Args, kv) == 8);
+static_assert(offsetof(MlaPs1Qh128Args, kv_indptr) == 16 &&
+              offsetof(MlaPs1Qh128Args, kv_indices) == 24);
+static_assert(offsetof(MlaPs1Qh128Args, out) == 32 && offsetof(MlaPs1Qh128Args, lse) == 40);
+static_assert(offsetof(MlaPs1Qh128Args, q_scale) == 48 &&
+              offsetof(MlaPs1Qh128Args, kv_scale) == 56);
+static_assert(offsetof(MlaPs1Qh128Args, softmax_scale) == 64);
+static_assert(offsetof(MlaPs1Qh128Args, q_stride) == 68);
+static_assert(offsetof(MlaPs1Qh128Args, physical_tokens) == 72);
+static_assert(offsetof(MlaPs1Qh128Args, reserved) == 76);
+
 struct MlaPs64Qh128Args
 {
     const void* q;
@@ -1545,7 +1572,7 @@ static_assert(offsetof(MlaPs64Qh128Args, page_table_stride) == 76);
 static_assert(offsetof(MlaPs64Qh128Args, page_table_width) == 80);
 static_assert(offsetof(MlaPs64Qh128Args, reserved) == 84);
 
-void check_mla_ps64_qh128_tensor(
+void check_mla_qh128_tensor(
     const aiter_tensor_t* t, const char* name, AiterDtype dtype, int device, bool contiguous = true)
 {
     AITER_CHECK(
@@ -1555,6 +1582,85 @@ void check_mla_ps64_qh128_tensor(
     AITER_CHECK(!contiguous || t->is_contiguous(), name, " must be contiguous");
 }
 } // namespace
+
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
+    mla_ps1_qh128_fp8_asm_fwd,
+    (aiter_tensor_t* q,
+     aiter_tensor_t* kv,
+     aiter_tensor_t* kv_indptr,
+     aiter_tensor_t* kv_indices,
+     aiter_tensor_t* out,
+     aiter_tensor_t* lse,
+     aiter_tensor_t* q_scale,
+     aiter_tensor_t* kv_scale,
+     float softmax_scale,
+     hipStream_t stream),
+    (q, kv, kv_indptr, kv_indices, out, lse, q_scale, kv_scale, softmax_scale, stream))
+{
+    AITER_CHECK(q != nullptr && q->is_gpu(), "Q must be a GPU tensor");
+    const HipDeviceGuard guard(q->device_id);
+    const std::string arch_id = get_gpu_arch();
+    AITER_CHECK(arch_id == "gfx1250", "mla_ps1_qh128_fp8_asm_fwd requires gfx1250");
+    check_mla_qh128_tensor(q, "Q", AITER_DTYPE_fp8, q->device_id, false);
+    check_mla_qh128_tensor(kv, "KV", AITER_DTYPE_fp8, q->device_id);
+    check_mla_qh128_tensor(kv_indptr, "kv_indptr", AITER_DTYPE_i32, q->device_id);
+    check_mla_qh128_tensor(kv_indices, "kv_indices", AITER_DTYPE_i32, q->device_id);
+    check_mla_qh128_tensor(out, "out", AITER_DTYPE_bf16, q->device_id);
+    check_mla_qh128_tensor(lse, "lse", AITER_DTYPE_fp32, q->device_id);
+    check_mla_qh128_tensor(q_scale, "q_scale", AITER_DTYPE_fp32, q->device_id);
+    check_mla_qh128_tensor(kv_scale, "kv_scale", AITER_DTYPE_fp32, q->device_id);
+    AITER_CHECK(q->dim() == 3 && q->size(1) == 128 && q->size(2) == 576, "Q must be [B,128,576]");
+    const int64_t batch = q->size(0);
+    AITER_CHECK(batch < (int64_t{1} << 32) / (128 * 4), "batch exceeds kernel address range");
+    AITER_CHECK(q->stride(2) == 1 && (q->stride(1) == 576 || q->stride(1) == 768) &&
+                    q->stride(0) == 128 * q->stride(1),
+                "Q requires dense batches with head stride 576 or 768");
+    AITER_CHECK(kv->dim() == 4 && kv->size(1) == 1 && kv->size(2) == 1 && kv->size(3) == 576 &&
+                    kv->size(0) <= INT32_MAX,
+                "KV must be contiguous token-major [physical_tokens,1,1,576]");
+    AITER_CHECK(kv_indptr->dim() == 1 && kv_indptr->size(0) == batch + 1,
+                "kv_indptr must be [B+1]");
+    AITER_CHECK(kv_indices->dim() == 1 && kv_indices->numel() <= INT32_MAX / 4,
+                "kv_indices must be 1-D with at most INT32_MAX/4 entries");
+    AITER_CHECK(out->dim() == 3 && out->size(0) == batch && out->size(1) == 128 &&
+                    out->size(2) == 512,
+                "out must be [B,128,512]");
+    AITER_CHECK(lse->dim() == 2 && lse->size(0) == batch && lse->size(1) == 128,
+                "lse must be [B,128]");
+    AITER_CHECK(q_scale->numel() == 1 && kv_scale->numel() == 1,
+                "q_scale and kv_scale must each contain one FP32 scalar");
+    AITER_CHECK(std::isfinite(softmax_scale), "softmax_scale must be finite");
+    if(batch == 0)
+        return;
+
+    // CSR contents are a caller contract; no GPU-to-host validation or repacking.
+    const mlaConfig* config = nullptr;
+    for(const auto& entry : cfg_mla_asm)
+    {
+        const auto& cfg = entry.second;
+        if(cfg.arch == arch_id && cfg.qType == "fp8" && cfg.kvType == "fp8" &&
+           cfg.Gqa == q->size(1) && cfg.ps == 0 && cfg.qSeqLen == 1 &&
+           cfg.prefill == 0 && cfg.causal == 0 && cfg.lse == 1 && cfg.cprr == 0 &&
+           cfg.page_size == 1 && cfg.kv_shuffled == 0)
+        {
+            config = &cfg;
+            break;
+        }
+    }
+    AITER_CHECK(config != nullptr, "mla_ps1_qh128_fp8_asm_fwd: no matching MLA kernel configuration");
+    static SynchronizedCache<std::string, AiterAsmKernel> kernels;
+    const std::string key = std::to_string(q->device_id) + ":" + config->knl_name;
+    auto& kernel = kernels.get_or_create(key, [&]() {
+        return AiterAsmKernel(config->knl_name.c_str(), config->co_name.c_str());
+    });
+    MlaPs1Qh128Args args{q->data_ptr(), kv->data_ptr(), kv_indptr->data_ptr(),
+                        kv_indices->data_ptr(), out->data_ptr(), lse->data_ptr(),
+                        q_scale->data_ptr(), kv_scale->data_ptr(), softmax_scale,
+                        static_cast<uint32_t>(q->stride(1)),
+                        static_cast<uint32_t>(kv->size(0)), 0};
+    size_t size = sizeof(args);
+    kernel.launch_kernel({&args, &size, static_cast<int>(batch), 1, 1, 128, 1, 1, stream});
+}
 
 AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     mla_ps64_qh128_fp8_asm_fwd,
@@ -1574,13 +1680,13 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     const HipDeviceGuard guard(q->device_id);
     const std::string arch_id = get_gpu_arch();
     AITER_CHECK(arch_id == "gfx1250", "mla_ps64_qh128_fp8_asm_fwd requires gfx1250");
-    check_mla_ps64_qh128_tensor(q, "Q", AITER_DTYPE_fp8, q->device_id, false);
-    check_mla_ps64_qh128_tensor(kv, "KV", AITER_DTYPE_fp8, q->device_id);
-    check_mla_ps64_qh128_tensor(seq_lens, "seq_lens", AITER_DTYPE_i32, q->device_id);
-    check_mla_ps64_qh128_tensor(page_table, "page_table", AITER_DTYPE_i32, q->device_id, false);
-    check_mla_ps64_qh128_tensor(out, "out", AITER_DTYPE_bf16, q->device_id);
-    check_mla_ps64_qh128_tensor(q_scale, "q_scale", AITER_DTYPE_fp32, q->device_id);
-    check_mla_ps64_qh128_tensor(kv_scale, "kv_scale", AITER_DTYPE_fp32, q->device_id);
+    check_mla_qh128_tensor(q, "Q", AITER_DTYPE_fp8, q->device_id, false);
+    check_mla_qh128_tensor(kv, "KV", AITER_DTYPE_fp8, q->device_id);
+    check_mla_qh128_tensor(seq_lens, "seq_lens", AITER_DTYPE_i32, q->device_id);
+    check_mla_qh128_tensor(page_table, "page_table", AITER_DTYPE_i32, q->device_id, false);
+    check_mla_qh128_tensor(out, "out", AITER_DTYPE_bf16, q->device_id);
+    check_mla_qh128_tensor(q_scale, "q_scale", AITER_DTYPE_fp32, q->device_id);
+    check_mla_qh128_tensor(kv_scale, "kv_scale", AITER_DTYPE_fp32, q->device_id);
     AITER_CHECK(q->dim() == 3 && q->size(1) == 128 && q->size(2) == 576, "Q must be [B,128,576]");
     const int64_t batch = q->size(0);
     AITER_CHECK(batch < (int64_t{1} << 32) / (128 * 4), "batch exceeds kernel address range");
@@ -1602,7 +1708,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                 "out must be [B,128,512]");
     if(lse != nullptr)
     {
-        check_mla_ps64_qh128_tensor(lse, "lse", AITER_DTYPE_fp32, q->device_id);
+        check_mla_qh128_tensor(lse, "lse", AITER_DTYPE_fp32, q->device_id);
         AITER_CHECK(lse->dim() == 2 && lse->size(0) == batch && lse->size(1) == 128,
                     "lse must be [B,128]");
     }

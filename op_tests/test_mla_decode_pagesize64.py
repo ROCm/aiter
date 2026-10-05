@@ -12,6 +12,9 @@
 #   # QH128 PS64 kernel with shuffled KV (one query, no KV splitting):
 #   python3 op_tests/test_mla_decode_pagesize64.py --kv-shuffled -n 128,1 --split-kv 1
 #
+#   # QH128 PS1 kernel with token-major KV, in the same test harness:
+#   python3 op_tests/test_mla_decode_pagesize64.py --page-size 1 -n 128,1 --split-kv 1
+#
 #   # GPU contract tests, including graph replay and all page tails:
 #   python3 -m pytest op_tests/test_mla_decode_pagesize64.py -q
 #
@@ -32,7 +35,7 @@ import aiter
 import aiter.mla
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.mla import mla_decode_fwd_ps64_qh128_asm
+from aiter.mla import mla_decode_fwd_ps1_qh128_asm, mla_decode_fwd_ps64_qh128_asm
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_printoptions(sci_mode=False)
@@ -157,12 +160,12 @@ def _make_mla_mi400_case(
     num_kv_splits,
     page_indices_oob=0,
     use_non_unit_scales=True,
+    page_size=64,
 ):
     repo_hsa_dir = Path(__file__).resolve().parents[1] / "hsa"
     os.environ["AITER_ASM_DIR"] = str(repo_hsa_dir)
 
     device = torch.device("cuda")
-    page_size = 64
     num_pages_per_batch = (ctx_lens + page_size - 1) // page_size
 
     if num_kv_splits is None:
@@ -230,8 +233,9 @@ def _make_mla_mi400_kv_case(
     fallback_fill_value=None,
     shuffle_pages=True,
     kv_shuffled=False,
+    page_size=64,
 ):
-    """Build page64 KV for segmented or shuffled gfx1250 ASM decode.
+    """Build token-major page1 or segmented/shuffled page64 KV for gfx1250.
 
     Returns (kv_buffer, kv_buffer_ref, kv_indices):
       kv_buffer     : fp8 (float8_e4m3fn), aiter PAGE-level seg-pack, shape
@@ -248,7 +252,6 @@ def _make_mla_mi400_kv_case(
                       page ids (compact, OOB padding appended after valid pages).
     """
     device = torch.device("cuda")
-    page_size = 64
     nhead_kv = 1
     num_pages_per_batch = (ctx_lens + page_size - 1) // page_size
     total_page_indices = batch * (num_pages_per_batch + page_indices_oob)
@@ -300,11 +303,13 @@ def _make_mla_mi400_kv_case(
     shuffled_page_indices = _make_page_permutation(total_pages, shuffle=shuffle_pages)
     kv_buffer_scattered_bf16 = torch.empty_like(kv_buffer_logical_bf16)
     kv_indices = torch.zeros(total_page_indices, dtype=torch.int32, device=device)
-    for logical_page, physical_page in enumerate(shuffled_page_indices):
-        kv_buffer_scattered_bf16[physical_page] = kv_buffer_logical_bf16[logical_page]
-        kv_indices[logical_page] = physical_page
+    physical_ids = torch.tensor(shuffled_page_indices, dtype=torch.int64, device=device)
+    kv_buffer_scattered_bf16[physical_ids] = kv_buffer_logical_bf16
+    kv_indices[:total_pages] = physical_ids.to(torch.int32)
 
     kv_buffer_ref = kv_buffer_scattered_bf16.to(dtypes.fp8)
+    if page_size == 1:
+        return kv_buffer_ref, kv_buffer_ref, kv_indices
     pack_kv = _pack_kv_shuffled_pages if kv_shuffled else _pack_rope_split2_kv_pages
     kv_buffer = pack_kv(
         kv_buffer_ref.view(total_pages, page_size, nhead_kv, qk_head_dim),
@@ -423,12 +428,15 @@ def test_mla(
     kv_dtype,
     init,
     kv_shuffled=False,
+    page_size=64,
 ):
-    if kv_shuffled and (nhead != 128 or decode_qlen != 1 or split_kv != 1):
+    dedicated_qh128 = kv_shuffled or page_size == 1
+    if page_size not in (1, 64) or (page_size == 1 and kv_shuffled):
+        raise ValueError("page_size must be 1 or 64; shuffled KV requires page_size=64")
+    if dedicated_qh128 and (nhead != 128 or decode_qlen != 1 or split_kv != 1):
         raise ValueError(
-            "KV-shuffled PS64 requires nhead=128, decode_qlen=1, split_kv=1"
+            "Dedicated PS1/PS64 kernels require nhead=128, decode_qlen=1, split_kv=1"
         )
-    page_size = 64
     kv_lora_rank = 512
     qk_rope_head_dim = 64
     qk_head_dim = kv_lora_rank + qk_rope_head_dim
@@ -439,7 +447,7 @@ def test_mla(
     kv_max_sz = 65536 * 32  # Remaining framework KV capacity after weights.
     num_page = (
         batch * ((ctx_len + page_size - 1) // page_size)
-        if kv_shuffled
+        if dedicated_qh128
         else (kv_max_sz + page_size - 1) // page_size
     )
     input_fill_value = 0.25 if init == "const0.25" else None
@@ -477,6 +485,7 @@ def test_mla(
         page_indices_oob=page_indices_oob,
         fallback_fill_value=input_fill_value,
         kv_shuffled=kv_shuffled,
+        page_size=page_size,
     )
     q_fp8_mi400 = q.to(dtypes.fp8)
     q_mi400 = _make_mla_mi400_q_case(
@@ -494,17 +503,32 @@ def test_mla(
         decode_qlen=decode_qlen,
         num_kv_splits=split_kv,
         page_indices_oob=page_indices_oob,
+        page_size=page_size,
     )
 
     # Prepare the dense table and lengths outside the measured/captured launch.
-    if kv_shuffled:
-        page_table = kv_indices_mi400[: batch * case["num_pages_per_batch"]].view(
-            batch, case["num_pages_per_batch"]
-        )
-        seq_lens = torch.full((batch,), ctx_len, dtype=torch.int32)
+    if dedicated_qh128:
         final_lse = torch.empty((batch, nhead), dtype=torch.float32)
+        if kv_shuffled:
+            page_table = kv_indices_mi400[: batch * case["num_pages_per_batch"]].view(
+                batch, case["num_pages_per_batch"]
+            )
+            seq_lens = torch.full((batch,), ctx_len, dtype=torch.int32)
 
     def run_mla_decode(out_tensor):
+        if page_size == 1:
+            aiter.mla.mla_decode_fwd_ps1_qh128_asm(
+                q_mi400,
+                kv_buffer_mi400,
+                case["kv_indptr"],
+                kv_indices_mi400,
+                out_tensor,
+                case["q_scale"],
+                case["kv_scale"],
+                1.0 / (qk_head_dim**0.5),
+                lse=final_lse,
+            )
+            return out_tensor, final_lse
         if kv_shuffled:
             aiter.mla.mla_decode_fwd_ps64_qh128_asm(
                 q_mi400,
@@ -637,6 +661,7 @@ def _format_summary(rows):
         "dtype",
         "kv_dtype",
         "gfx",
+        "page_size",
         "kv_shuffled",
         "init",
         "mi400 us",
@@ -734,20 +759,30 @@ def main():
         e.g.: --init randn const0.25""",
     )
     parser.add_argument(
+        "--page-size",
+        type=int,
+        choices=[1, 64],
+        default=64,
+        help="Attention page size; 1 selects the token-major QH128 ASM kernel.",
+    )
+    parser.add_argument(
         "--kv-shuffled",
         action="store_true",
         help="Use the QH128 PS64 ASM kernel with shuffled KV (one query, one KV split).",
     )
     args = parser.parse_args()
+    dedicated_qh128 = args.kv_shuffled or args.page_size == 1
+    if args.kv_shuffled and args.page_size != 64:
+        parser.error("--kv-shuffled requires --page-size 64")
     if args.nhead is None:
-        args.nhead = [(128, 1)] if args.kv_shuffled else _MI400_DISPATCH_CASES
+        args.nhead = [(128, 1)] if dedicated_qh128 else _MI400_DISPATCH_CASES
     if args.split_kv is None:
-        args.split_kv = [1] if args.kv_shuffled else [1, 2, 3]
-    if args.kv_shuffled and (
+        args.split_kv = [1] if dedicated_qh128 else [1, 2, 3]
+    if dedicated_qh128 and (
         any(case != (128, 1) for case in args.nhead)
         or any(splits != 1 for splits in args.split_kv)
     ):
-        parser.error("--kv-shuffled requires -n 128,1 and --split-kv 1")
+        parser.error("PS1/shuffled PS64 require -n 128,1 and --split-kv 1")
     torch.set_default_device("cuda")
 
     rows = []
@@ -790,6 +825,7 @@ def main():
                 kv_dtype,
                 init,
                 kv_shuffled=args.kv_shuffled,
+                page_size=args.page_size,
             )
         )
 
@@ -804,36 +840,57 @@ def main():
     )
 
 
-def _make_ps64_qh128_case(lengths, stride=576):
+_QH128_ASM = {1: mla_decode_fwd_ps1_qh128_asm, 64: mla_decode_fwd_ps64_qh128_asm}
+
+
+def _make_qh128_case(lengths, stride=576, page_size=64):
     generator = torch.Generator().manual_seed(19)
     batch = len(lengths)
-    counts = [(n + 63) // 64 for n in lengths]
+    counts = [(n + page_size - 1) // page_size for n in lengths]
     pages = max(1, sum(counts))
     width = max(1, max(counts, default=0))
     ids = torch.randperm(pages, generator=generator)
     table = torch.full((batch, width + 3), -1, dtype=torch.int32)
     q = torch.randn(batch, 128, stride, generator=generator).to(torch.float8_e4m3fn)
-    kv = torch.randn(pages, 64, 576, generator=generator).to(torch.float8_e4m3fn)
+    # Poison Q padding: neither kernel may read beyond the 576 logical values.
+    q[..., 576:] = float("nan")
+    kv = torch.randn(pages, page_size, 576, generator=generator).to(torch.float8_e4m3fn)
     offset = 0
     for row, (length, count) in enumerate(zip(lengths, counts)):
         table[row, :count] = ids[offset : offset + count]
         offset += count
-        if length % 64:
-            kv[table[row, count - 1], length % 64 :] = float("nan")
-    shuffled = _pack_kv_shuffled_pages(kv)
+        if length % page_size:
+            kv[table[row, count - 1], length % page_size :] = float("nan")
     raw = torch.full(
         (batch * 128 * 512 + 32,), 123, dtype=torch.bfloat16, device="cuda"
     )
     out = raw[16:-16].view(batch, 128, 512)
-    lse = torch.empty(batch, 128, dtype=torch.float32, device="cuda")
+    raw_lse = torch.full(
+        (batch * 128 + 32,), float("nan"), dtype=torch.float32, device="cuda"
+    )
+    lse = raw_lse[16:-16].view(batch, 128)
     scales = [
         torch.tensor([v], dtype=torch.float32, device="cuda") for v in [0.75, 1.25]
     ]
+    if page_size == 1:
+        cache = kv.view(pages, 1, 1, 576)
+        indptr = torch.tensor([0, *itertools.accumulate(lengths)], dtype=torch.int32)
+        indices = (
+            torch.cat([table[row, :n] for row, n in enumerate(lengths)])
+            if batch
+            else torch.empty(0, dtype=torch.int32)
+        )
+        metadata = [indptr.to("cuda"), indices.to("cuda")]
+    else:
+        cache = _pack_kv_shuffled_pages(kv)
+        metadata = [
+            torch.tensor(lengths, dtype=torch.int32, device="cuda"),
+            table.to("cuda")[:, :width],
+        ]
     tensors = [
         q.to("cuda")[..., :576],
-        shuffled.to("cuda"),
-        torch.tensor(lengths, dtype=torch.int32, device="cuda"),
-        table.to("cuda")[:, :width],
+        cache.to("cuda"),
+        *metadata,
         out,
         *scales,
         1 / 24,
@@ -841,30 +898,35 @@ def _make_ps64_qh128_case(lengths, stride=576):
     return tensors, lse, raw, q[..., :576].float(), kv.float(), table, lengths
 
 
-def _ref_ps64_qh128_case(case):
-    _, _, _, q, kv, table, lengths = case
+def _ref_qh128_case(case):
+    args, _, _, q, kv, table, lengths = case
+    page_size = kv.shape[1]
+    q_scale = 1.0 if args[5] is None else args[5].cpu().item()
+    kv_scale = 1.0 if args[6] is None else args[6].cpu().item()
     outputs = torch.zeros(len(lengths), 128, 512)
     lse = torch.full((len(lengths), 128), -float("inf"))
     for row, length in enumerate(lengths):
         if not length:
             continue
-        keys = kv[table[row, : (length + 63) // 64].long()].reshape(-1, 576)[:length]
-        scores = (q[row] @ keys.T) * (0.75 * 1.25 / 24)
-        outputs[row] = torch.softmax(scores, -1) @ (keys[:, :512] * 1.25)
+        count = (length + page_size - 1) // page_size
+        keys = kv[table[row, :count].long()].reshape(-1, 576)[:length]
+        scores = (q[row] @ keys.T) * (q_scale * kv_scale * args[7])
+        outputs[row] = torch.softmax(scores, -1) @ (keys[:, :512] * kv_scale)
         lse[row] = torch.logsumexp(scores, -1)
     return outputs, lse
 
 
-def _check_ps64_qh128_case(case):
-    args, lse, raw, *_ = case
-    expected, expected_lse = _ref_ps64_qh128_case(case)
+def _check_qh128_case(case):
+    args, lse, raw, *_, lengths = case
+    expected, expected_lse = _ref_qh128_case(case)
     got = args[4].float().cpu()
     assert torch.isfinite(got).all()
     assert (raw[:16] == 123).all() and (raw[-16:] == 123).all()
+    assert torch.isnan(lse._base[:16]).all() and torch.isnan(lse._base[-16:]).all()
     denom = expected.square().mean().sqrt().clamp_min(1e-8)
     assert (got - expected).square().mean().sqrt() / denom < 0.06
     torch.testing.assert_close(lse.cpu(), expected_lse, atol=0.02, rtol=0.002)
-    empty = args[2].cpu() == 0
+    empty = torch.tensor(lengths) == 0
     assert (got[empty] == 0).all() and torch.isneginf(lse.cpu()[empty]).all()
 
 
@@ -873,7 +935,8 @@ def _check_ps64_qh128_case(case):
     or torch.cuda.get_device_properties(0).gcnArchName.split(":")[0] != "gfx1250",
     reason="requires gfx1250",
 )
-class TestMlaPs64Qh128Shuffled:
+class TestMlaQh128:
+    @pytest.mark.parametrize("page_size", [1, 64])
     @pytest.mark.parametrize(
         "lengths,stride",
         [
@@ -883,44 +946,48 @@ class TestMlaPs64Qh128Shuffled:
             ([1024, 4096, 4097, 5120], 576),
         ],
     )
-    def test_reference_and_optional_lse(self, lengths, stride):
-        case = _make_ps64_qh128_case(lengths, stride)
+    def test_reference_and_lse(self, lengths, stride, page_size):
+        case = _make_qh128_case(lengths, stride, page_size)
         args, lse, *_ = case
-        assert mla_decode_fwd_ps64_qh128_asm(*args, lse=lse) is args[4]
-        _check_ps64_qh128_case(case)
-        previous = args[4].clone()
-        args[4].zero_()
-        assert mla_decode_fwd_ps64_qh128_asm(*args) is args[4]
-        torch.testing.assert_close(args[4], previous, atol=0, rtol=0)
+        launch = _QH128_ASM[page_size]
+        assert launch(*args, lse=lse) is args[4]
+        _check_qh128_case(case)
+        if page_size == 64:
+            previous = args[4].clone()
+            args[4].zero_()
+            assert launch(*args) is args[4]
+            torch.testing.assert_close(args[4], previous, atol=0, rtol=0)
 
-    def test_stream_graph_and_dynamic_metadata(self):
-        case = _make_ps64_qh128_case([65, 321])
+    @pytest.mark.parametrize("page_size", [1, 64])
+    def test_stream_graph_and_dynamic_metadata(self, page_size):
+        case = _make_qh128_case([65, 321], page_size=page_size)
         args, lse, *_ = case
-        mla_decode_fwd_ps64_qh128_asm(*args, lse=lse)
+        launch = _QH128_ASM[page_size]
+        launch(*args, lse=lse)
         reference_output = args[4].clone()
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
-            mla_decode_fwd_ps64_qh128_asm(*args, lse=lse)
+            launch(*args, lse=lse)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, stream=stream):
-                mla_decode_fwd_ps64_qh128_asm(*args, lse=lse)
+                launch(*args, lse=lse)
             graph.replay()
         torch.cuda.current_stream().wait_stream(stream)
         torch.testing.assert_close(args[4], reference_output, atol=0, rtol=0)
-        args[2].zero_()
+        args[2].zero_()  # PS1: empty CSR ranges; PS64: zero sequence lengths.
         graph.replay()
         torch.cuda.synchronize()
         assert (args[4] == 0).all() and torch.isneginf(lse).all()
 
-    def test_invalid_metadata_is_not_addressed(self):
+    def test_ps64_invalid_metadata_is_not_addressed(self):
         for bad_length, bad_page in [
             (None, -1),
             (None, 1000000),
             (-1, None),
             (1000000, None),
         ]:
-            args, lse, *_ = _make_ps64_qh128_case([129])
+            args, lse, *_ = _make_qh128_case([129])
             if bad_length is not None:
                 args[2].fill_(bad_length)
             if bad_page is not None:
@@ -928,22 +995,77 @@ class TestMlaPs64Qh128Shuffled:
             mla_decode_fwd_ps64_qh128_asm(*args, lse=lse)
             assert (args[4] == 0).all() and torch.isneginf(lse).all()
 
-    def test_host_contract_rejection_and_empty_batch(self):
-        args, lse, *_ = _make_ps64_qh128_case([64])
+    @pytest.mark.parametrize("page_size", [1, 64])
+    def test_host_contract_rejection_and_empty_batch(self, page_size):
+        args, lse, *_ = _make_qh128_case([64], page_size=page_size)
+        launch = _QH128_ASM[page_size]
         broken = list(args)
         broken[0] = args[0][:, :64]
         with pytest.raises(RuntimeError, match="Q must be"):
-            mla_decode_fwd_ps64_qh128_asm(*broken, lse=lse)
+            launch(*broken, lse=lse)
         broken = list(args)
         broken[2] = args[2].to(torch.int64)
         with pytest.raises(RuntimeError, match="dtype"):
-            mla_decode_fwd_ps64_qh128_asm(*broken, lse=lse)
+            launch(*broken, lse=lse)
         broken = list(args)
-        broken[3] = torch.zeros((1, 4), dtype=torch.int32, device="cuda")[:, ::2]
-        with pytest.raises(RuntimeError, match="page_table"):
-            mla_decode_fwd_ps64_qh128_asm(*broken, lse=lse)
-        args, lse, *_ = _make_ps64_qh128_case([])
-        assert mla_decode_fwd_ps64_qh128_asm(*args, lse=lse).numel() == 0
+        if page_size == 1:
+            broken[3] = torch.zeros(128, dtype=torch.int32, device="cuda")[::2]
+            error = "contiguous"
+        else:
+            broken[3] = torch.zeros((1, 4), dtype=torch.int32, device="cuda")[:, ::2]
+            error = "page_table"
+        with pytest.raises(RuntimeError, match=error):
+            launch(*broken, lse=lse)
+        broken = list(args)
+        broken[1] = torch.empty(
+            (1, 1, 64 if page_size == 1 else 1, 576),
+            dtype=torch.float8_e4m3fn,
+            device="cuda",
+        )
+        with pytest.raises(RuntimeError, match="KV must be"):
+            launch(*broken, lse=lse)
+        if page_size == 1:
+            with pytest.raises(ValueError, match="lse"):
+                launch(*args, lse=None)
+            broken = list(args)
+            broken[2] = args[2][:-1]
+            with pytest.raises(RuntimeError, match="kv_indptr"):
+                launch(*broken, lse=lse)
+        args, lse, *_ = _make_qh128_case([], page_size=page_size)
+        assert launch(*args, lse=lse).numel() == 0
+
+    @pytest.mark.parametrize("page_size", [1, 64])
+    def test_shared_pages_and_unit_scales(self, page_size):
+        case = _make_qh128_case([65, 65], page_size=page_size)
+        args, lse, _, _, _, table, _ = case
+        table[1].copy_(table[0])
+        if page_size == 1:
+            args[3][65:130].copy_(args[3][:65])
+        else:
+            args[3][1].copy_(args[3][0])
+        args[5] = args[6] = None
+        _QH128_ASM[page_size](*args, lse=lse)
+        _check_qh128_case(case)
+
+    def test_ps1_empty_physical_cache_and_offset_csr(self):
+        case = _make_qh128_case([0, 0], page_size=1)
+        args, lse, *_ = case
+        args[1] = torch.empty((0, 1, 1, 576), dtype=torch.float8_e4m3fn, device="cuda")
+        mla_decode_fwd_ps1_qh128_asm(*args, lse=lse)
+        _check_qh128_case(case)
+        case = _make_qh128_case([17, 65], page_size=1)
+        args, lse, *_ = case
+        # Used CSR ranges may start after unrelated entries. Padding is not read.
+        args[3] = torch.cat(
+            [
+                torch.full((3,), -1, dtype=torch.int32, device="cuda"),
+                args[3],
+                torch.full((7,), -1, dtype=torch.int32, device="cuda"),
+            ]
+        )
+        args[2].add_(3)
+        mla_decode_fwd_ps1_qh128_asm(*args, lse=lse)
+        _check_qh128_case(case)
 
 
 if __name__ == "__main__":
