@@ -3,12 +3,14 @@
 
 """FlyDSL single-launch Mega-mHC seam (DeepSeek-V4.1 delayed mHC) vs fp32 torch.
 
-Three tables:
+Four tables:
   test_mega_mhc          candidates flydsl (policy config) and the Triton seam,
                          plus a CUDA-graph replay check of the flydsl launch.
   test_mega_mhc_config   one row per legal knob set (the tuning sweep), with ISA
                          resources when run under FLYDSL_DUMP_IR=1.
   test_mega_mhc_streams  two seams on two streams at once (per-stream scratch).
+  test_mega_mhc_dist     DIST_FINISH (D2) bit-exact against the classic finisher, also with
+                         forced hand-off (DIST_SPIN=0) and on two streams at once.
 """
 
 import argparse
@@ -405,6 +407,65 @@ def test_mega_mhc_streams(T, H, ksplit, coherence):
     return {"gfx": get_gfx(), "err": max(errs)}
 
 
+@benchmark()
+def test_mega_mhc_dist(T, H, ksplit, coherence, mode):
+    """DIST_FINISH must give bit-identical outputs to the classic finisher, in a
+    normal run, with every split forced to hand off (DIST_SPIN=0), and with two
+    streams of DIST launches at once (per-stream scratch and publish words)."""
+    from aiter.ops.flydsl import flydsl_mega_mhc
+    from aiter.ops.flydsl.kernels.mega_mhc import dist_residency_error
+
+    base = {
+        "BLOCK_M": 16,
+        "WARPS_PER_WG": 8,
+        "NUM_KSPLIT": ksplit,
+        "TILE_K": 64 if H % (ksplit * 8 * 64) == 0 else 32,
+        "COHERENCE": coherence,
+    }
+    cu = torch.cuda.get_device_properties(0).multi_processor_count
+    if dist_residency_error(T, dict(base, DIST_FINISH=True), cu):
+        return {"gfx": get_gfx(), "skipped": "not resident"}
+    args, kw, ref = _call_kwargs(mode, T, H)
+    classic = [
+        x.clone() for x in flydsl_mega_mhc(*args, config=base, **kw)
+    ]  # residual_out is the shared kw buffer: cloned
+    ret = {"gfx": get_gfx()}
+    for name, extra in (("dist", {}), ("dist spin0", {"DIST_SPIN": 0})):
+        cfg = dict(base, DIST_FINISH=True, **extra)
+        outs = [flydsl_mega_mhc(*args, config=cfg, **kw) for _ in range(20)]
+        torch.cuda.synchronize()
+        bad = sum(
+            any(not torch.equal(a, b) for a, b in zip(o[1:], classic[1:])) for o in outs
+        )
+        ret[f"{name} != classic"] = bad
+        ret[f"{name} err"] = check_outputs(
+            f"dist {name} T={T}", outs[-1], ref, "bf16", mode
+        )
+        if bad:
+            _FAILURES.append(f"dist {name} T={T} ks={ksplit} {coherence}: {bad} bad")
+    cases = [_call_kwargs(mode, T, H, seed=sd) for sd in (1, 2)]
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    cfg = dict(base, DIST_FINISH=True)
+    torch.cuda.synchronize()
+    gold = [flydsl_mega_mhc(*a, config=base, **k) for (a, k, _r) in cases]
+    gold = [[x.clone() for x in g] for g in gold]
+    outs = [[], []]
+    for _ in range(30):
+        for i, (a, k, _r) in enumerate(cases):
+            with torch.cuda.stream(streams[i]):
+                outs[i].append(flydsl_mega_mhc(*a, config=cfg, **k))
+    torch.cuda.synchronize()
+    sbad = sum(
+        any(not torch.equal(x, y) for x, y in zip(o[1:], gold[i][1:]))
+        for i in range(2)
+        for o in outs[i]
+    )
+    ret["two-stream != classic"] = sbad
+    if sbad:
+        _FAILURES.append(f"dist two-stream T={T} ks={ksplit} {coherence}: {sbad} bad")
+    return ret
+
+
 def _scratch_sizes(T, H, out_dtype):
     """(partial floats, counter ints) the policy's split-K scratch needs at T."""
     from aiter.ops.flydsl.kernels.mega_mhc import grid_size
@@ -536,6 +597,15 @@ def main():
     parser.add_argument("--stream_ksplit", type=int, nargs="*", default=[1, 10])
     parser.add_argument("--stream_coherence", nargs="*", default=["xcd", "agent"])
     parser.add_argument(
+        "--dist",
+        type=int,
+        nargs=3,
+        action="append",
+        metavar=("T", "KSPLIT", "AGENT"),
+        default=None,
+        help="DIST_FINISH bit-exact checks: T NUM_KSPLIT 0=xcd|1=agent (repeatable)",
+    )
+    parser.add_argument(
         "--capture_tokens",
         type=int,
         nargs=2,
@@ -604,6 +674,28 @@ def main():
     ]
     aiter.logger.info(
         "mega-mhc two-stream check (markdown):\n%s",
+        pd.DataFrame(rows).to_markdown(index=False),
+    )
+
+    dist_cases = args.dist or [
+        [4, 20, 0],
+        [32, 20, 0],
+        [128, 20, 0],
+        [256, 10, 0],
+        [400, 5, 0],
+        [1024, 4, 0],
+        [1536, 2, 0],
+        [64, 10, 1],
+    ]
+    rows = [
+        test_mega_mhc_dist(T, H, ks, "agent" if agent else "xcd", mode)
+        for (T, ks, agent), H, mode in itertools.product(
+            dist_cases, args.hidden, args.mode
+        )
+        if "bf16" in args.out_dtype
+    ]
+    aiter.logger.info(
+        "mega-mhc DIST_FINISH check (markdown):\n%s",
         pd.DataFrame(rows).to_markdown(index=False),
     )
 

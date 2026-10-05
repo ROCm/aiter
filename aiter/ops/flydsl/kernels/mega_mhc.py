@@ -58,6 +58,26 @@ workgroup per CU fills the GPU (-5% at T = 3904..4096, -4% at 2544; e = 2 gives 
 the bm32 / 10-way split kernel at T >= 16384). bf16 is 1-5% slower with any e < 4
 (``sweep/p5_register_pressure.md``).
 
+Distributed finish (``DIST_FINISH``, bf16, ``NUM_KSPLIT > 1``, ``BLOCK_M == 16``, column
+warps; D2, ``sweep/d2_distributed_finish.md``). The split-K finisher normally rescales the
+whole staged bf16 x1 of its token block alone (``BLOCK_M * H`` elements read and written
+by one workgroup, after the last arrival). With the knob every split keeps its own x1
+columns in LDS instead of staging them in HBM; the last arrival only sums the partials,
+computes the gates and the per-token x1 ``rstd``, writes the ``rstd`` row to the block's
+scratch line and publishes it; every other split waits for the publish and rescales its
+own columns. The publish word is slot 1 of the block's 128 B counter line: the low 8 bits
+count arrivals, the high 24 bits are a generation. An arrival is an atomic add of 1 whose
+old value tells a split its generation and whether it is last; the finisher publishes
+with an add of ``256 - NUM_KSPLIT`` (count back to 0, generation + 1), so the word
+re-arms itself, needs no memset and no pre-read, and the generation only has to change to
+release a waiter. Waiting splits spin, so all splits of a block should be resident at
+once (``dist_residency_error``). A split that has waited ``DIST_SPIN`` polls without a
+publish hands off instead of hanging: it stages its unscaled x1 in the output, registers
+its bit in the block's mask word (slot 3: generation tag in the high byte, hand-off bits
+in the low 24; a compare-exchange that fails once the tag has moved on means "published")
+and exits, freeing its CU; the finisher's publish exchanges the mask word for the next
+generation's tag and rescales the staged columns of every bit it got back.
+
 Persistent walk (``PERSIST_WGS`` = G > 0, ``NUM_KSPLIT == 1``, column-split warps). The
 grid is capped at G workgroups and workgroup w walks the token blocks w, w + G, ...
 (static stride, no counters or scratch). With ``PERSIST_PREFETCH`` the last k-step
@@ -101,6 +121,16 @@ CM_L1_BYPASS = 1  # sc0: miss the CU's L1, hit the XCD's L2
 CM_L2_BYPASS = 17  # sc0 sc1: system scope, past this XCD's L2
 
 WARP_SPLITS = ("cols", "tokens")
+
+# DIST_FINISH scratch line (128 B per token block, 32 ints): slot 0 = classic counter,
+# slot 1 = publish word (arrivals | generation << 8), slot 2 = spin time-out count,
+# slots 16..31 = x1 rstd of the block's 16 tokens (second 64 B, no atomics on it)
+DIST_WORD = 1
+DIST_TMO = 2
+DIST_MASK = 3
+DIST_RSTD = 16
+DIST_SPIN = 1024  # default polls (~1 us each) a split waits before it hands off
+DIST_MAX_KS = 24  # hand-off bits in the low 24 bits of the mask word
 
 
 def _put(t, idx, val):
@@ -154,6 +184,8 @@ def smem_bytes(H: int, cfg: dict) -> int:
     fnbuf = 2 * nops * WAVE * 4 if fn_lds else 4
     total = 4 * (red + bm * PSLOT + bm + 4 + w * N_STREAMS * WAVE * 4 + fnbuf)
     nsl = cfg.get("X1_LDS_SLOTS", 0)
+    if cfg.get("DIST_FINISH"):  # every chunk of the split's columns stays in LDS
+        nsl = H // cfg["NUM_KSPLIT"] // w // 32
     return total + (1024 * (w * nsl + 1) if nsl else 0)
 
 
@@ -171,7 +203,7 @@ def max_x1_lds_slots(H: int, cfg: dict) -> int:
     return best
 
 
-def check_config(H: int, cfg: dict) -> None:
+def check_config(H: int, cfg: dict, out_fp8: bool = False) -> None:
     """Raise a ValueError naming the first violated legality rule of a knob set."""
     bm, ws, w = cfg["BLOCK_M"], cfg["WARP_SPLIT"], cfg["WARPS_PER_WG"]
     ks, tk = cfg["NUM_KSPLIT"], cfg["TILE_K"]
@@ -225,6 +257,27 @@ def check_config(H: int, cfg: dict) -> None:
         raise ValueError(f"FN_EARLY must be in 0..{N_STREAMS}")
     if cfg.get("FN_EARLY", N_STREAMS) != N_STREAMS and ws == "tokens" and w > 1:
         raise ValueError("FN_EARLY does not apply to the LDS-shared fn path")
+    if cfg.get("DIST_FINISH"):
+        if out_fp8:
+            raise ValueError("DIST_FINISH is a bf16 finish (FP8 only rescales scales)")
+        if ks < 2 or ks > DIST_MAX_KS:
+            raise ValueError(
+                f"DIST_FINISH needs 2 <= NUM_KSPLIT <= {DIST_MAX_KS}, got {ks}"
+            )
+        if cfg.get("DIST_SPIN", DIST_SPIN) < 0:
+            raise ValueError("DIST_SPIN must be >= 0")
+        if ws != "cols" or bm != 16:
+            raise ValueError("DIST_FINISH needs WARP_SPLIT=cols and BLOCK_M=16")
+        if cfg.get("X1_LDS_SLOTS", 0):
+            raise ValueError(
+                "DIST_FINISH keeps all of x1 in LDS: X1_LDS_SLOTS must be 0"
+            )
+        if cfg.get("PERSIST_WGS", 0):
+            raise ValueError("DIST_FINISH does not combine with PERSIST_WGS")
+        if smem_bytes(H, cfg) > LDS_MAX:
+            raise ValueError(
+                f"DIST_FINISH needs {smem_bytes(H, cfg)} B of LDS (> {LDS_MAX})"
+            )
     nsl = cfg.get("X1_LDS_SLOTS", 0)
     if nsl:
         if ws != "cols" or ks != 1 or bm != 16:
@@ -243,6 +296,33 @@ def check_config(H: int, cfg: dict) -> None:
             )
 
 
+def dist_residency_error(T: int, cfg: dict, cu_num: int) -> str | None:
+    """Why ``DIST_FINISH`` is unsafe for T tokens on a GPU with ``cu_num`` CUs, or None.
+
+    Waiting splits spin until the last arrival of their token block, so a split that is
+    not yet scheduled must never be held back by waiting ones: every split of the grid
+    has to be resident at once. Conservatively assume one workgroup per CU (the kernel
+    is 8 warps, 2 per SIMD; LDS or VGPRs may allow more, which is not relied on) and
+    8 XCDs of ``cu_num / 8`` CUs, workgroups dealt round-robin to XCDs. ``xcd``
+    coherence pins the splits of a token block to one XCD, so the busiest XCD holds
+    ``ceil(blocks / 8)`` whole blocks; ``agent`` deals the ``blocks * NUM_KSPLIT``
+    workgroups evenly. Does not see CU masks or other kernels (see the doc).
+    """
+    if not cfg.get("DIST_FINISH"):
+        return None
+    if cu_num < 8 or cu_num % 8:
+        return f"cu_num={cu_num} is not a multiple of the 8 XCDs"
+    nblk = -(-T // cfg["BLOCK_M"])
+    ks = cfg["NUM_KSPLIT"]
+    per_xcd = (-(-nblk // 8) * ks) if cfg["COHERENCE"] == "xcd" else -(-nblk * ks // 8)
+    if per_xcd > cu_num // 8:
+        return (
+            f"{per_xcd} workgroups on the busiest XCD exceed its {cu_num // 8} CUs "
+            f"(T={T}, NUM_KSPLIT={ks}, COHERENCE={cfg['COHERENCE']})"
+        )
+    return None
+
+
 def kernel_name(cfg: dict, has_post: bool, identity_pre: bool, out_fp8: bool) -> str:
     mode = "post" if has_post else "nopost"
     if identity_pre:
@@ -254,6 +334,16 @@ def kernel_name(cfg: dict, has_post: bool, identity_pre: bool, out_fp8: bool) ->
         f"_pk{int(cfg['FN_PREPACKED'])}_rcp{int(cfg['SINKHORN_RCP'])}"
         f"_{mode}_{'fp8' if out_fp8 else 'bf16'}"
         + (f"_x1l{cfg['X1_LDS_SLOTS']}" if cfg.get("X1_LDS_SLOTS") else "")
+        + (
+            "_dist"
+            + (
+                f"s{cfg['DIST_SPIN']}"
+                if cfg.get("DIST_SPIN", DIST_SPIN) != DIST_SPIN
+                else ""
+            )
+            if cfg.get("DIST_FINISH")
+            else ""
+        )
         + (
             f"_fe{cfg['FN_EARLY']}"
             if cfg.get("FN_EARLY", N_STREAMS) != N_STREAMS
@@ -301,6 +391,8 @@ def compile_mega_mhc(
     PERSIST_WGS: int = 0,
     PERSIST_PREFETCH: bool = True,
     FN_EARLY: int = N_STREAMS,
+    DIST_FINISH: bool = False,
+    DIST_SPIN: int = DIST_SPIN,
 ):
     """Compile the Mega-mHC kernel for one knob set; returns the ``@flyc.jit`` launcher."""
     cfg = {
@@ -318,8 +410,10 @@ def compile_mega_mhc(
         "PERSIST_WGS": PERSIST_WGS,
         "PERSIST_PREFETCH": PERSIST_PREFETCH,
         "FN_EARLY": FN_EARLY,
+        "DIST_FINISH": DIST_FINISH,
+        "DIST_SPIN": DIST_SPIN,
     }
-    check_config(H, cfg)
+    check_config(H, cfg, OUT_FP8)
     assert H % FP8_GROUP == 0 and SINKHORN_ITERS >= 1
 
     W = WARPS_PER_WG
@@ -336,9 +430,11 @@ def compile_mega_mhc(
     COLS_W = COLS_WG // K_WARPS
     NK = COLS_W // TILE_K  # k-steps per warp
     NQ = COLS_W // 32  # 32-column chunks per warp
+    HO_UNITS = BM * COLS_WG // 8  # 16 B units of one split's x1 (hand-off rescale)
     # bf16 only: the first X1L chunks of every warp's x1 stay in LDS for the finish
     # instead of being staged in HBM and re-read (the FP8 finish never re-reads).
-    X1L = 0 if OUT_FP8 else X1_LDS_SLOTS
+    DIST = bool(DIST_FINISH)
+    X1L = NQ if DIST else (0 if OUT_FP8 else X1_LDS_SLOTS)
     # P4 persistent walk: the grid is capped at PERSIST_WGS workgroups, each walking
     # the token blocks w, w + G, ...; PF: the next block's first R/y tile is loaded
     # during this block's last k-step and carried through its reduce and finish.
@@ -488,6 +584,7 @@ def compile_mega_mhc(
             partials, F32, unit_elems=4, num_records_bytes=nt64 * (KS * PSLOT * 4)
         )
         cnt_t = ptr_buf_tensor(counters, I32, num_records_bytes=fx.Int64(n_blk) * 128)
+        rstdg_t = ptr_buf_tensor(counters, F32, num_records_bytes=fx.Int64(n_blk) * 128)
 
         def make_views():
             alloc = fx.SharedAllocator()
@@ -696,10 +793,13 @@ def compile_mega_mhc(
                         (cb + mt * 16 * H) * 2,
                         0,
                     )
-                lds_off = in_l.select(
-                    wi_u * (X1L * 256) + q * 256 + lane * 4,
-                    I32(WARPS_PER_WG * X1L * 256) + lane * 4,
-                )
+                if fx.const_expr(X1L >= NQ):  # every chunk of this warp is in LDS
+                    lds_off = wi_u * (X1L * 256) + q * 256 + lane * 4
+                else:
+                    lds_off = in_l.select(
+                        wi_u * (X1L * 256) + q * 256 + lane * 4,
+                        I32(WARPS_PER_WG * X1L * 256) + lane * 4,
+                    )
                 fx.ptr_store(unit.ir_value(), fx.add_offset(x1s.ptr, lds_off))
 
             def step(iv, tiles, fns, acc, sqr, sqx):
@@ -1013,7 +1113,7 @@ def compile_mega_mhc(
                 gpu.barrier()
 
                 # --------------------------------------------------------- finish
-                def finish_gates_body():
+                def finish_gates_body(with_rstd=True):
                     for p in range_constexpr(FIN_PASSES):
                         tl = p * (4 * W) + wi * 4 + kg
                         tok = tok0 + tl
@@ -1060,7 +1160,8 @@ def compile_mega_mhc(
                                 cs = cs + cs.shuffle_xor(off, WAVE)
                             P = div(P, cs + hc_sinkhorn_eps)
                         _put(combo_t, tok * 16 + e, P)
-                        _put(rstdn, tl, fx.rsqrt(s_x * F32(1.0 / H) + norm_eps))
+                        if fx.const_expr(with_rstd):
+                            _put(rstdn, tl, fx.rsqrt(s_x * F32(1.0 / H) + norm_eps))
 
                 RS_G = 4  # rescale units in flight per thread (16 measured slower)
                 # the finish only walks the token rows that exist (decode: T < BLOCK_M)
@@ -1068,8 +1169,8 @@ def compile_mega_mhc(
 
                 # bf16 rescale of the x1 chunks this warp kept in LDS: lane-local, in the
                 # layout they were produced in (token erow, 8 columns ekg * 8 of a chunk)
-                def rescale_x1_lds():
-                    rs_e = rstdn[erow]
+                def load_x1_lds():
+                    """this lane's staged x1 units (LDS) and norm weights, raw i32x4"""
                     c8_0 = col_w // 8 + ekg
                     base = wi_u * (X1L * 256) + lane * 4
                     xs, wv = [], []
@@ -1083,6 +1184,22 @@ def compile_mega_mhc(
                             )
                         )
                         wv.append(buf_copy_load(w_t, c8_0 + q * 4, I32, 4))
+                    return xs, wv
+
+                def stage_x1_out(xs):
+                    """time-out: this lane's unscaled x1 units into ``out`` (hand-off)"""
+                    c8_0 = col_w // 8 + ekg
+                    for q in range_constexpr(X1L):
+                        buf_copy_store(
+                            out_t,
+                            (tok0 + erow) * H8 + c8_0 + q * 4,
+                            xs[q],
+                            I32,
+                            4,
+                        )
+
+                def store_x1_lds(xs, wv, rs_e):
+                    c8_0 = col_w // 8 + ekg
                     for q in range_constexpr(X1L):
                         r_o = (bf16x8(xs[q]).to(F32) * rs_e) * bf16x8(wv[q]).to(F32)
                         buf_copy_store(
@@ -1092,6 +1209,11 @@ def compile_mega_mhc(
                             I32,
                             4,
                         )
+
+                def rescale_x1_lds():
+                    rs_e = rstdn[erow]
+                    xs, wv = load_x1_lds()
+                    store_x1_lds(xs, wv, rs_e)
 
                 # bf16 rescale of the HBM-staged x1: every thread takes 16 B units; with
                 # X1L > 0 only the columns past each warp's first X1L chunks are staged
@@ -1185,16 +1307,31 @@ def compile_mega_mhc(
                     gpu.barrier()
                     finish_rescale(tid, THREADS)
 
-                if fx.const_expr(KS == 1):
-                    for it in range_constexpr(BM * PSLOT // THREADS):
-                        e = it * THREADS + tid
-                        v = red[e]
-                        for s in range_constexpr(1, K_WARPS):
-                            v = v + red[s * BM * PSLOT + e]
-                        _put(fin, e, v)
-                    gpu.barrier()
-                    finish()
-                else:
+                def x1_rstd(tl_r):
+                    # token tl_r's x1 rstd from its summed sum(x1^2) (fin column 25)
+                    return fx.rsqrt(
+                        fin[tl_r * PSLOT + N_MIX + 1] * F32(1.0 / H) + norm_eps
+                    )
+
+                def fence(ordering):
+                    # the splits share this XCD's L2 (L1 is write-through) unless agent
+                    fx.llvm.memory_fence(
+                        syncscope=(
+                            rocdl.SyncScope.Agent
+                            if COHERENCE == "agent"
+                            else rocdl.SyncScope.Workgroup
+                        ),
+                        ordering=ordering,
+                    )
+
+                def word_ptr(slot):
+                    """this token block's slot-th int of its 128 B scratch line"""
+                    return fx.inttoptr(
+                        fx.PointerType.get(T.i32, fx.AddressSpace.Global, 4),
+                        buf_base_i64(counters) + fx.Int64(blk) * 128 + slot * 4,
+                    )
+
+                def write_partials():
                     for it in range_constexpr(BM * PSLOT // THREADS):
                         e = it * THREADS + tid
                         v = red[e]
@@ -1204,68 +1341,207 @@ def compile_mega_mhc(
                         _put(part_t, ((tok0 + tl) * KS + ks) * PSLOT + e % PSLOT, v)
                     rocdl.s_waitcnt(vmcnt=0)
                     gpu.barrier()
+
+                def arrive(slot):
+                    """bump the slot-th word of the block's line; flag[0] = old value"""
                     if tid == I32(0):
-                        if fx.const_expr(COHERENCE == "agent"):
-                            fx.llvm.memory_fence(
-                                syncscope=rocdl.SyncScope.Agent,
-                                ordering=fx.AtomicOrdering.Release,
-                            )
-                        else:
-                            # the splits share this XCD's L2 (L1 is write-through)
-                            fx.llvm.memory_fence(
-                                syncscope=rocdl.SyncScope.Workgroup,
-                                ordering=fx.AtomicOrdering.Release,
-                            )
-                        cnt_ptr = fx.inttoptr(
-                            fx.PointerType.get(T.i32, fx.AddressSpace.Global, 4),
-                            buf_base_i64(counters) + fx.Int64(blk) * 128,
-                        )
+                        fence(fx.AtomicOrdering.Release)
                         old = fx.llvm.atomic_add(
-                            cnt_ptr,
+                            word_ptr(slot),
                             I32(1),
                             syncscope=rocdl.SyncScope.Agent,
                             ordering=fx.AtomicOrdering.Monotonic,
                         )
                         _put(flag, 0, old)
                     gpu.barrier()
-                    if flag[0] == I32(KS - 1):
-                        if fx.const_expr(COHERENCE == "agent"):
-                            fx.llvm.memory_fence(
-                                syncscope=rocdl.SyncScope.Agent,
-                                ordering=fx.AtomicOrdering.Acquire,
-                            )
+
+                def sum_partials():
+                    """last arrival: acquire, sum the splits' partial rows into fin"""
+                    fence(fx.AtomicOrdering.Acquire)
+                    # thread (g, u): sums splits k = g, g + KGROUPS, ... of unit u
+                    g_id = tid // UNITS
+                    u_lo = tid % UNITS
+                    for up in range_constexpr(UPASS):
+                        u = u_lo + up * THREADS
+                        tl = u // (PSLOT // 4)
+                        q4 = u % (PSLOT // 4)
+                        if g_id < I32(KGROUPS):
+                            acc4 = Vec.filled(4, 0.0, F32)
+                            for k in range_constexpr(-(-KS // KGROUPS)):
+                                kk = g_id + k * KGROUPS
+                                live = kk < I32(KS)
+                                uidx = ((tok0 + tl) * KS + kk) * (PSLOT // 4) + q4
+                                uidx = live.select(uidx, n_tok * (KS * PSLOT // 4))
+                                acc4 = acc4 + buf_copy_load(
+                                    part4_t, uidx, F32, 4, cache_modifier=cm_fin
+                                )
+                            for i in range_constexpr(4):
+                                _put(red, (g_id * UNITS + u) * 4 + i, acc4[i])
+                    gpu.barrier()
+                    for it in range_constexpr(BM * PSLOT // THREADS):
+                        e = it * THREADS + tid
+                        v = red[e]
+                        for gg in range_constexpr(1, KGROUPS):
+                            v = v + red[gg * UNITS * 4 + e]
+                        _put(fin, e, v)
+                    gpu.barrier()
+
+                if fx.const_expr(KS == 1):
+                    for it in range_constexpr(BM * PSLOT // THREADS):
+                        e = it * THREADS + tid
+                        v = red[e]
+                        for s in range_constexpr(1, K_WARPS):
+                            v = v + red[s * BM * PSLOT + e]
+                        _put(fin, e, v)
+                    gpu.barrier()
+                    finish()
+                elif fx.const_expr(DIST):
+                    # D2: the last arrival computes the gates and the x1 rstd, publishes
+                    # the rstd row, and rescales its own columns; every other split waits
+                    # for the publish and rescales its own columns from LDS.
+                    write_partials()
+                    arrive(DIST_WORD)
+                    old_w = flag[0]
+                    if (old_w & I32(255)) == I32(KS - 1):
+                        sum_partials()
+
+                        # publish the rstd row first: the waiting splits then rescale their
+                        # columns while this workgroup is still busy with the gates
+                        if wi == I32(0):
+                            if lane < I32(BM):
+                                _put(
+                                    rstdg_t, blk * 32 + DIST_RSTD + lane, x1_rstd(lane)
+                                )
+                            rocdl.s_waitcnt(vmcnt=0)
+                            if lane == I32(0):
+                                fence(fx.AtomicOrdering.Release)
+                                # close the hand-off window (next generation's tag),
+                                # then release the waiting splits
+                                snap = fx.llvm.atomic_xchg(
+                                    word_ptr(DIST_MASK),
+                                    (((old_w >> I32(8)) + I32(1)) & I32(255))
+                                    << I32(24),
+                                    syncscope=rocdl.SyncScope.Agent,
+                                    ordering=fx.AtomicOrdering.Monotonic,
+                                )
+                                fx.llvm.atomic_add(
+                                    word_ptr(DIST_WORD),
+                                    I32(256 - KS),
+                                    syncscope=rocdl.SyncScope.Agent,
+                                    ordering=fx.AtomicOrdering.Monotonic,
+                                )
+                                _put(flag, 2, snap & I32(0xFFFFFF))
+                        store_x1_lds(*load_x1_lds(), x1_rstd(erow))
+                        if fx.const_expr(FIN_WARPS < W):
+                            if wi < I32(FIN_WARPS):
+                                finish_gates_body(False)
                         else:
-                            fx.llvm.memory_fence(
-                                syncscope=rocdl.SyncScope.Workgroup,
-                                ordering=fx.AtomicOrdering.Acquire,
+                            finish_gates_body(False)
+                        gpu.barrier()
+                        handed = flag[2]
+                        if handed != I32(0):  # rare: splits that gave up waiting
+                            fence(fx.AtomicOrdering.Acquire)
+                            for k_h in range(I32(0), I32(KS), I32(1)):
+                                kk = I32(k_h)
+                                if ((handed >> kk) & I32(1)) != I32(0):
+                                    for i in range_constexpr(-(-HO_UNITS // THREADS)):
+                                        u = i * THREADS + tid
+                                        live = u < I32(HO_UNITS)
+                                        tl_h = live.select(
+                                            u // I32(COLS_WG // 8), I32(0)
+                                        )
+                                        c8_h = kk * (COLS_WG // 8) + u % (COLS_WG // 8)
+                                        idx_h = live.select(
+                                            (tok0 + tl_h) * H8 + c8_h, n_tok * H8
+                                        )
+                                        x_h = bf16x8(hbm_ld(idx_h)).to(F32)
+                                        w_h = bf16x8(
+                                            buf_copy_load(w_t, c8_h, I32, 4)
+                                        ).to(F32)
+                                        r_h = (x_h * x1_rstd(tl_h)) * w_h
+                                        buf_copy_store(
+                                            out_t, idx_h, as_i32x4(r_h.to(BF16)), I32, 4
+                                        )
+                    else:
+                        xs, wv = load_x1_lds()
+                        gen = old_w >> I32(8)
+                        if tid == I32(0):
+                            sp = word_ptr(DIST_WORD)
+                            cur = fx.generic_load(
+                                sp,
+                                dtype=I32,
+                                memory_order=fx.AtomicOrdering.Monotonic,
+                                syncscope=rocdl.SyncScope.Agent,
                             )
-                        # thread (g, u): sums splits k = g, g + KGROUPS, ... of unit u
-                        g_id = tid // UNITS
-                        u_lo = tid % UNITS
-                        for up in range_constexpr(UPASS):
-                            u = u_lo + up * THREADS
-                            tl = u // (PSLOT // 4)
-                            q4 = u % (PSLOT // 4)
-                            if g_id < I32(KGROUPS):
-                                acc4 = Vec.filled(4, 0.0, F32)
-                                for k in range_constexpr(-(-KS // KGROUPS)):
-                                    kk = g_id + k * KGROUPS
-                                    live = kk < I32(KS)
-                                    uidx = ((tok0 + tl) * KS + kk) * (PSLOT // 4) + q4
-                                    uidx = live.select(uidx, n_tok * (KS * PSLOT // 4))
-                                    acc4 = acc4 + buf_copy_load(
-                                        part4_t, uidx, F32, 4, cache_modifier=cm_fin
+                            n_spin = I32(0)
+                            while ((cur >> I32(8)) == gen) & (n_spin < I32(DIST_SPIN)):
+                                rocdl.s_sleep(1)
+                                cur = fx.generic_load(
+                                    sp,
+                                    dtype=I32,
+                                    memory_order=fx.AtomicOrdering.Monotonic,
+                                    syncscope=rocdl.SyncScope.Agent,
+                                )
+                                n_spin = n_spin + I32(1)
+                            _put(
+                                flag, 1, ((cur >> I32(8)) == gen).select(I32(1), I32(0))
+                            )
+                        gpu.barrier()
+                        if flag[1] != I32(0):
+                            # gave up waiting: stage the unscaled x1 in out, then try to
+                            # register the hand-off. A compare-exchange that sees a moved-on
+                            # tag lost the race with the publish: finish the columns here.
+                            stage_x1_out(xs)
+                            rocdl.s_waitcnt(vmcnt=0)
+                            gpu.barrier()
+                            if tid == I32(0):
+                                fence(fx.AtomicOrdering.Release)
+                                mp = word_ptr(DIST_MASK)
+                                tag = gen & I32(255)
+                                m_cur = fx.generic_load(
+                                    mp,
+                                    dtype=I32,
+                                    memory_order=fx.AtomicOrdering.Monotonic,
+                                    syncscope=rocdl.SyncScope.Agent,
+                                )
+                                state = I32(0)
+                                while state == I32(0):
+                                    if ((m_cur >> I32(24)) & I32(255)) != tag:
+                                        state = I32(2)  # published: not handed off
+                                    else:
+                                        m_old, m_ok = fx.llvm.atomic_cas(
+                                            mp,
+                                            m_cur,
+                                            m_cur | (I32(1) << ks),
+                                            syncscope=rocdl.SyncScope.Agent,
+                                        )
+                                        if m_ok:
+                                            state = I32(3)  # handed off
+                                        m_cur = m_old
+                                if state == I32(3):
+                                    fx.llvm.atomic_add(
+                                        word_ptr(DIST_TMO),
+                                        I32(1),
+                                        syncscope=rocdl.SyncScope.Agent,
+                                        ordering=fx.AtomicOrdering.Monotonic,
                                     )
-                                for i in range_constexpr(4):
-                                    _put(red, (g_id * UNITS + u) * 4 + i, acc4[i])
-                        gpu.barrier()
-                        for it in range_constexpr(BM * PSLOT // THREADS):
-                            e = it * THREADS + tid
-                            v = red[e]
-                            for gg in range_constexpr(1, KGROUPS):
-                                v = v + red[gg * UNITS * 4 + e]
-                            _put(fin, e, v)
-                        gpu.barrier()
+                                _put(flag, 1, state)
+                            gpu.barrier()
+                        if flag[1] != I32(3):
+                            fence(fx.AtomicOrdering.Acquire)
+                            r_e = buf_copy_load(
+                                rstdg_t,
+                                blk * 32 + DIST_RSTD + erow,
+                                F32,
+                                1,
+                                cache_modifier=cm_fin,
+                            )
+                            store_x1_lds(xs, wv, r_e)
+                else:
+                    write_partials()
+                    arrive(0)
+                    if flag[0] == I32(KS - 1):
+                        sum_partials()
                         finish()
                         if tid == I32(0):
                             _put(cnt_t, blk * 32, I32(0))

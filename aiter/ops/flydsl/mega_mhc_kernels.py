@@ -9,6 +9,7 @@ Same arguments and returns as the Triton seam
 ``aiter/ops/flydsl/kernels/mega_mhc.py`` for the kernel.
 """
 
+import os
 import threading
 import weakref
 
@@ -37,6 +38,8 @@ MEGA_MHC_DEFAULTS = {
     "PERSIST_WGS": 0,  # P4: >0 caps the grid; each WG walks token blocks w, w + G, ...
     "PERSIST_PREFETCH": True,  # next block's first R/y tile loads during this block's last k-step
     "FN_EARLY": 4,  # P5: streams (of 4) of chunk 0's fn loaded ahead of the R/y prefetch
+    "DIST_FINISH": False,  # D2: every split rescales its own x1 columns (bf16, KS > 1)
+    "DIST_SPIN": 1024,  # D2: polls a waiting split spins before it hands its columns off
 }
 
 _TOKENS_CFG = {
@@ -57,6 +60,11 @@ _MAX_SPLIT = 20  # 40/80 splits measured no faster at decode (more partial rows)
 # round of the KS = 1 kernel is less than FILL_MAX full. (NUM_KSPLIT, FILL_MAX)
 _QUANT_SPLIT_BF16 = (5, 0.73)
 _QUANT_SPLIT_FP8 = (10, 0.95)
+
+# D2 distributed bf16 finish (sweep/d2_distributed_finish.md): at T = 1..3 the publish
+# round trip costs more than the one-to-three-token rescale it replaces (+0.2-0.3 us), from
+# T = 4 it wins (-6%, growing to -30% at T = 16..128).
+_DIST_MIN_T = 4
 
 
 def get_mega_mhc_config(
@@ -92,6 +100,21 @@ def get_mega_mhc_config(
       finish instead of staging them in HBM and re-reading them (P3,
       ``sweep/p3_x1_in_registers.md``): 6-8% faster at T = 2560..12288. Below that
       size the kernel is latency-bound and the knob is neutral. FP8 never re-reads.
+    * bf16 split-K (``NUM_KSPLIT > 1``, decode up to T ~ 2048) from T = 4 uses the distributed
+      finish ``DIST_FINISH`` (D2, ``sweep/d2_distributed_finish.md``): the last arrival only
+      sums the partials and publishes the x1 ``rstd``; every split rescales its own columns
+      (kept in LDS) instead of one workgroup re-reading and rescaling the whole block's x1.
+      T = 16..128: 15.2 -> 11.2 us eager, 13.9 -> 9.7 us in a graph; T = 256..2048: -13%..-27%.
+      The splits spin on each other, so it needs every split of the grid resident at once
+      (``dist_residency_error``: the busiest XCD must hold ``ceil(blocks / 8) * NUM_KSPLIT``
+      workgroups on its ``cu_num / 8`` CUs, one workgroup per CU assumed): when the
+      fill-the-GPU ``NUM_KSPLIT`` violates that (T = 129..192 with 20 splits, T = 385..400
+      with 10, T ~ 780..830 with 5), the largest smaller legal split count that fits is used
+      (it still beats the classic finisher at the original count: T = 144/192: 21.8 -> 13.9
+      us, T = 400: 26.3 -> 20.3 us). Not used with a CU mask in the environment
+      (``HSA_CU_MASK`` / ``ROC_GLOBAL_CU_MASK``), where residency is unknown; a split that
+      still waits ``DIST_SPIN`` polls without a publish hands its columns to the finisher
+      (``kernels/mega_mhc.py``), so a violated assumption costs time, not correctness.
     * Beyond ``64 * cu_num`` tokens, fn's L2 traffic (2 MB per token block) dominates:
       for bf16, 64-token blocks with 4 token-split warps sharing each fn tile through
       LDS, but only while the last round of ``64 * cu_num``-token workgroup waves is
@@ -170,6 +193,8 @@ def get_mega_mhc_config(
         cfg.update(PERSIST_WGS=cu_num, PERSIST_PREFETCH=True)
     elif ks == 1 and out_fp8:
         cfg["FN_EARLY"] = 1  # P5: -4..-5% at T = 2544, 3904..4096
+    if not out_fp8 and ks > 1 and T >= _DIST_MIN_T:
+        cfg = _with_dist_finish(T, H, cfg, cu_num)
     try:
         check_config(H, cfg)
     except ValueError:
@@ -177,6 +202,31 @@ def get_mega_mhc_config(
             raise
         cfg = dict(MEGA_MHC_DEFAULTS, **_TOKENS_CFG)  # H too narrow for 8 col warps
         check_config(H, cfg)
+    return cfg
+
+
+def _with_dist_finish(T: int, H: int, cfg: dict, cu_num: int) -> dict:
+    """``cfg`` with ``DIST_FINISH`` at the largest split count <= its own that is resident
+    (``_dist_guard_error``) and legal; ``cfg`` unchanged if there is none."""
+    from aiter.ops.flydsl.kernels.mega_mhc import DIST_MAX_KS, check_config
+
+    w = cfg["WARPS_PER_WG"]
+    for k in range(min(cfg["NUM_KSPLIT"], DIST_MAX_KS), 1, -1):
+        if H % (k * w * 32):
+            continue
+        cand = dict(
+            cfg,
+            NUM_KSPLIT=k,
+            TILE_K=64 if H % (k * w * 64) == 0 else 32,
+            DIST_FINISH=True,
+        )
+        if _dist_guard_error(T, cand, cu_num):
+            continue
+        try:
+            check_config(H, cand)
+        except ValueError:
+            continue
+        return cand
     return cfg
 
 
@@ -262,6 +312,29 @@ def _prepack_fn(fn: torch.Tensor, capturing: bool) -> torch.Tensor:
         weakref.finalize(fn, _FN_CACHE.pop, key, None)
     _FN_CACHE[key] = (stamp, packed)
     return packed
+
+
+_CU_MASK_ENV = ("HSA_CU_MASK", "ROC_GLOBAL_CU_MASK")
+
+
+def _dist_guard_error(T: int, cfg: dict, cu_num: int) -> str | None:
+    """Why DIST_FINISH must not run (residency, CU mask env), or None."""
+    from aiter.ops.flydsl.kernels.mega_mhc import dist_residency_error
+
+    if not cfg.get("DIST_FINISH"):
+        return None
+    masked = [e for e in _CU_MASK_ENV if os.environ.get(e)]
+    if masked:
+        return f"a CU mask is set ({', '.join(masked)}): residency is unknown"
+    return dist_residency_error(T, cfg, cu_num)
+
+
+def _check_dist_guard(T: int, cfg: dict, cu_num: int) -> None:
+    err = _dist_guard_error(T, cfg, cu_num)
+    if err:
+        raise ValueError(
+            f"[flydsl_mega_mhc] DIST_FINISH needs every split workgroup resident: {err}"
+        )
 
 
 def _cu_num(device) -> int:
@@ -393,7 +466,8 @@ def flydsl_mega_mhc(
     else:
         cfg = dict(MEGA_MHC_DEFAULTS)
         cfg.update(config)
-        check_config(H, cfg)
+        check_config(H, cfg, out_dtype == "fp8")
+        _check_dist_guard(T, cfg, _cu_num(device))
 
     capturing = torch.cuda.is_current_stream_capturing()
     fn_arg = _prepack_fn(fn, capturing) if cfg["FN_PREPACKED"] else fn
