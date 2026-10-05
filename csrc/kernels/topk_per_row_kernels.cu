@@ -5345,7 +5345,8 @@ template <typename T, typename IdxT, int BlockSize, bool WRITE_TOPK_VALUES,
           unsigned ExactFirstBucket = 0, bool CacheExactStageBits = false,
           bool UseSplitExactStage = false, bool DirectKnownWinners = false,
           bool UseHigh5DirectTail = false, bool UseWaveB128ExactStage = false,
-          bool UseWaveB128Prefetch = false, bool UseSampledStage = false>
+          bool UseWaveB128Prefetch = false, bool UseSampledStage = false,
+          int WideSampleVecs = 2, int WideStageCapacity = 4096>
 __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
                                                      const int64_t len,
                                                      const IdxT k,
@@ -5367,8 +5368,17 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
     constexpr int pass2             = 2;
     // How much of the row's leading slice may be used to predict the staging
     // threshold, and how many elements the staging may hold.
-    constexpr int MaxSampleVecs = 2;
-    constexpr int StageCapacity = 4096;
+    //
+    // Only the plain sampled-threshold form takes other sizes: past 80K
+    // columns a 2048-value slice predicts the threshold too coarsely, and
+    // about 1% of randn rows then miss the single-read path (a second full
+    // read of the row). At one row per CU the slowest row sets the grid's
+    // time, so one miss in 256 rows took the grid from ~34us to ~54us. A
+    // 4096-value slice and a 4608-entry stage make such a miss rare.
+    constexpr bool WideRowForm =
+        !UseSampledStage && ExactHighBucket == 0 && !UseGuardedFixedPredictor;
+    constexpr int MaxSampleVecs = WideRowForm ? WideSampleVecs : 2;
+    constexpr int StageCapacity = WideRowForm ? WideStageCapacity : 4096;
     constexpr int SplitBucketCapacity = (StageCapacity - WinnerCapacity) / 2;
     constexpr PreBits FixedPrePrefix = static_cast<PreBits>(0x407u) << pass0_start_bit;
     constexpr PreBits FixedPreLast =
@@ -6143,7 +6153,7 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
     // original full-row pass runs unchanged.
     //
     // The slice is up to an eighth of the row, one element per thread per
-    // step, capped at two steps. It is read with scalar loads rather than
+    // step, capped at MaxSampleVecs steps. It is read with scalar loads rather than
     // through the vector loop, so a longer one costs load instructions at high
     // row counts; a shorter one leaves the count the threshold has to resolve
     // noisy enough that the margin must widen, which costs more staging than
@@ -6155,13 +6165,25 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
     T sample_values[MaxSampleVecs];
     bool fixed_pair_hit = false;
 
+    // Each load behind its own `j < nsample` branch waits out a full memory
+    // latency before the next is issued; at four steps that cost about 1us a
+    // row, a 3% loss at N=98304 where the shorter slice rarely misses. Wider
+    // forms issue every load first, all in bounds by the `len` check above.
+    constexpr bool LoadSampleFirst = MaxSampleVecs > 2;
+    if constexpr(LoadSampleFirst)
+    {
+#pragma unroll
+        for(int j = 0; j < MaxSampleVecs; ++j)
+            sample_values[j] = in[static_cast<IdxT>(threadIdx.x) + j * BlockSize];
+    }
 #pragma unroll
     for(int j = 0; j < MaxSampleVecs; ++j)
     {
-        sample_values[j] = static_cast<T>(0);
+        if constexpr(!LoadSampleFirst) sample_values[j] = static_cast<T>(0);
         if(j < nsample)
         {
-            sample_values[j] = in[static_cast<IdxT>(threadIdx.x) + j * BlockSize];
+            if constexpr(!LoadSampleFirst)
+                sample_values[j] = in[static_cast<IdxT>(threadIdx.x) + j * BlockSize];
             PreBits const bits = histogram_one(sample_values[j]);
             if constexpr(UseGuardedFixedPredictor)
             {
@@ -6199,7 +6221,7 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
         // overshoot overflows it.
         IdxT const stage_target = k + k / 4;
         IdxT const sample_len_for_rank = static_cast<IdxT>(nsample) * BlockSize;
-        // k=2048, len<=32770 and sample_len<=2048 keep this quotient in i32.
+        // k=2048 and sample_len<=4096 keep this product in i32.
         IdxT sample_k =
             static_cast<IdxT>((stage_target * sample_len_for_rank) / row_len);
         if(sample_k < 1) sample_k = 1;
@@ -7724,7 +7746,9 @@ inline bool dispatch_topk_plain_gfx950(T const* in, int batch_size, int64_t len,
     }
     if(batch_size >= topk_oneblock_num_cu() && len <= kTopkPlainGfx950LdsTailMaxLen)
     {
-        radix_topk_one_block_lds_tail_kernel<T, IdxT, 1024, WRITE_TOPK_VALUES>
+        radix_topk_one_block_lds_tail_kernel<T, IdxT, 1024, WRITE_TOPK_VALUES, false, 270, 0, 0u,
+                                             0u, false, false, false, false, false, false, false,
+                                             4, 4608>
             <<<batch_size, 1024, 0, stream>>>(in, len, k, out, out_idx, select_min);
         return true;
     }
