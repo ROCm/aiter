@@ -26,8 +26,8 @@ TOKEN_BUCKETS = (
     32768,
 )
 FLASH_TOKEN_BUCKETS = tuple(range(1, 65)) + (96, 128, 192) + TOKEN_BUCKETS[7:]
-FLASH_EP2_TOKEN_BUCKETS = tuple(
-    sorted(set(FLASH_TOKEN_BUCKETS) | set(range(6, 385, 6)))
+FLASH_SPEC_DECODE_TOKEN_BUCKETS = tuple(
+    sorted(set(FLASH_TOKEN_BUCKETS) | set(range(6, 1153, 6)))
 )
 FIXED_GRID_MULT_VALUES = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32)
 P2P_FP8_MIN_MTPR = 1024
@@ -380,8 +380,13 @@ def _flash_tuning_data():
 
 
 def _select_flash_config(bucket, mtpr_class, world_size, fixed):
-    if fixed:
-        policy = _flash_tuning_data()["fixed"][str(world_size)]
+    tuning = _flash_tuning_data()
+    policy = (
+        tuning["fixed"][str(world_size)]
+        if fixed
+        else tuning.get("compact", {}).get(str(world_size), {}).get(str(mtpr_class))
+    )
+    if policy is not None:
         config_id = policy["tokens"].get(str(bucket))
         if config_id is not None:
             config = policy["configs"][config_id]
@@ -570,11 +575,16 @@ def select_mega_moe_config(
             "MegaMoE v2 fanout pair ids support at most "
             f"{MAX_FANOUT_EXPERTS_PER_RANK} experts per rank"
         )
+    is_flash = (model_dim, inter_dim, experts_per_rank * world_size) == (
+        5120,
+        2304,
+        384,
+    )
     buckets = TOKEN_BUCKETS
-    if (model_dim, inter_dim, experts_per_rank * world_size) == (5120, 2304, 384):
-        buckets = FLASH_EP2_TOKEN_BUCKETS if world_size == 2 else FLASH_TOKEN_BUCKETS
+    if is_flash:
+        buckets = FLASH_SPEC_DECODE_TOKEN_BUCKETS
     bucket = nearest_token_bucket(tokens, buckets)
-    mtpr_class = mtpr_config_class(mtpr)
+    mtpr_class = mtpr if is_flash else mtpr_config_class(mtpr)
     fixed_slot_dispatch = _use_fixed_slots(mtpr_class, world_size, experts_per_rank)
     total_segments = world_size * experts_per_rank + world_size
     if total_segments > MAX_FANOUT_SEGMENTS:
@@ -607,9 +617,7 @@ def build_mega_moe_bundle_plan(
         raise ValueError(f"mtpr={mtpr} must be a positive power of two")
     token_buckets = TOKEN_BUCKETS
     if (model_dim, inter_dim, experts_per_rank * world_size) == (5120, 2304, 384):
-        token_buckets = (
-            FLASH_EP2_TOKEN_BUCKETS if world_size == 2 else FLASH_TOKEN_BUCKETS
-        )
+        token_buckets = FLASH_SPEC_DECODE_TOKEN_BUCKETS
     buckets = tuple(bucket for bucket in token_buckets if bucket <= mtpr)
     if not buckets or buckets[-1] != mtpr:
         raise ValueError(f"mtpr={mtpr} has no exact token bucket")
