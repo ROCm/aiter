@@ -551,7 +551,7 @@ def flydsl_pa_mqa_logits_fp4(
     kv_scale: torch.Tensor,
     block_tables: torch.Tensor,
     weights: torch.Tensor,
-    context_lens: torch.Tensor,
+    context_lens: torch.Tensor | None,
     max_seq_len: int,
     *,
     weight_scale: float = 1.0,
@@ -563,6 +563,10 @@ def flydsl_pa_mqa_logits_fp4(
     out: torch.Tensor | None = None,
     cta_info: torch.Tensor | None = None,
     total_ctas: int | None = None,
+    row_ends: torch.Tensor | None = None,
+    query_start_loc: torch.Tensor | None = None,
+    max_query_len: int | None = None,
+    pages_per_block: int = 1,
     stream: torch.cuda.Stream | None = None,
 ) -> torch.Tensor:
     """Decode/varctx FP4 paged MQA logits (gfx950).
@@ -583,10 +587,14 @@ def flydsl_pa_mqa_logits_fp4(
     length itself: ``cta_info``, ``block_k``, ``num_warps`` and
     ``parallel_unit_num`` do not apply. A given ``out`` is left as it was past
     each row's context (no -inf fill: the caller owns those columns); without
-    ``out`` the result is allocated -inf as here.
+    ``out`` the result is allocated -inf as here. Only that kernel takes
+    ``row_ends`` (each row's bound) and the ragged rows (``query_start_loc``,
+    ``max_query_len``; ``q_fp4`` then [rows, 1, H, D / 2]) and a table entry
+    naming ``pages_per_block`` consecutive pages: see
+    ``flydsl_pa_mqa_logits_fp4_rowgroup``.
     """
     if kv_block_size in ROWGROUP_PAGE_SIZES:
-        if q_fp4.shape[1] != next_n:
+        if query_start_loc is None and q_fp4.shape[1] != next_n:
             raise ValueError(
                 f"q_fp4 next_n dim ({q_fp4.shape[1]}) != next_n ({next_n})"
             )
@@ -600,8 +608,18 @@ def flydsl_pa_mqa_logits_fp4(
             context_lens,
             max_seq_len,
             weight_scale=weight_scale,
+            row_ends=row_ends,
+            query_start_loc=query_start_loc,
+            max_query_len=max_query_len,
+            pages_per_block=pages_per_block,
             out=out,
             stream=stream,
+        )
+    if row_ends is not None or query_start_loc is not None or pages_per_block != 1:
+        raise ValueError(
+            "row_ends / ragged rows / pages_per_block need kv_block_size in "
+            f"{ROWGROUP_PAGE_SIZES}, "
+            f"got {kv_block_size}"
         )
     batch_size, q_next_n, heads, head_dim_packed = q_fp4.shape
     head_dim = head_dim_packed * 2
