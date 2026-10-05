@@ -1007,7 +1007,6 @@ class CustomAllreduce:
                     world_size=self.world_size,
                     max_bytes=policy.max_bytes,
                     link=link,
-                    lamport=policy.lamport,
                 )
         except Exception:  # noqa: BLE001
             logger.warning("FlyDSL one-shot disabled: init failed.", exc_info=True)

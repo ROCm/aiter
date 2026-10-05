@@ -253,9 +253,15 @@ def _buffer_load(ptr, elem_off, n, dtype, cache_modifier=0):
     return fx.Vector(fx.memref_load_vec(reg))
 
 
-def _buffer_store(ptr, elem_off, vec):
-    """Store the vector *vec* to a buffer pointer, at an element offset."""
-    atom = fx.make_copy_atom(rocdl.BufferCopy(vec.numel * vec.dtype.width), vec.dtype)
+def _buffer_store(ptr, elem_off, vec, cache_modifier=0):
+    """Store the vector *vec* to a buffer pointer, at an element offset.
+
+    *cache_modifier* is ``_CM_*`` bits; ``_CM_SC0 | _CM_SC1`` writes through
+    to memory.
+    """
+    atom = fx.make_copy_atom(
+        rocdl.BufferCopy(vec.numel * vec.dtype.width, cache_modifier), vec.dtype
+    )
     reg = fx.make_rmem_tensor(vec.numel, vec.dtype)
     fx.memref_store_vec(vec, reg)
     fx.copy(atom, reg, fx.make_view(ptr + elem_off, fx.make_layout(vec.numel, 1)))

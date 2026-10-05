@@ -9,8 +9,8 @@ it walks ``ONESHOT_LADDER`` and picks a rung by payload size -- on payloads
 derived from ``allreduce_policy``: at every world size, both ends of each
 rung's slice of the window the policy routes to the one-shot. Next to it, a
 few spot checks run pinned configurations no shipped rung uses, one world size
-each. ``--atoms``, ``--grid-cap``, ``--fanout``, ``--block``, ``--skip-self``
-or ``--lamport`` pin a configuration instead.
+each. ``--atoms``, ``--grid-cap``, ``--fanout``, ``--block`` or ``--skip-self``
+pin a configuration instead.
 
 ``test_one_shot_allreduce`` checks three things per shape, and the second
 matters more than the first:
@@ -29,16 +29,17 @@ ladder or policy the payload derivation does not follow fails rather than
 silently leaving a rung untested.
 
 ``test_one_shot_allreduce_run_ahead`` makes repeated back-to-back calls under
-deliberate rank skew. The inbox is double-buffered by ``colour & 1`` and the
-safety argument depends on a straggler's read of call k finishing before
-anyone's push for call k+2; a quiescent test never exercises that.
+deliberate rank skew. The inbox rotates through three buffers by colour, and
+the safety argument depends on a straggler's read of round k finishing before
+anyone's push for round k+2 lands in the buffer it re-armed; a quiescent test
+never exercises that.
 
 ``test_one_shot_allreduce_fresh_inputs`` makes back-to-back calls with a new
 input on every call, at varying sizes and under rank skew, and checks each
 result bit for bit against an fp32 rank-order reference. A static input cannot
-see a read of a stale inbox slot: the stale data is the right answer. That
-matters most to the Lamport variant, whose slots are re-armed rather than
-flagged, so its run also feeds it the NaN pattern it uses as a sentinel.
+see a read of a stale inbox slot: the stale data is the right answer. The
+slots are re-armed rather than flagged, so the run also feeds the kernel the
+NaN pattern it uses as a sentinel.
 
 ``--extended`` runs the spot-check configurations at every world size, and the
 spot-check shapes on the production engine too.
@@ -104,8 +105,8 @@ SPOT_SHAPES = [(m, HIDDEN) for m in (1, 3, 5, 8, 16)] + [
     (1, 3072),
 ]
 
-# Each replay advances the device-side colour and alternates the inbox parity
-# slot, so only repeated replays show the captured launch advancing that state
+# Each replay advances the device-side colour and rotates the inbox buffer, so
+# only repeated replays show the captured launch advancing that state
 # rather than freezing it.
 GRAPH_REPLAYS = 4
 
@@ -136,17 +137,6 @@ SPOT_CONFIGS = (
         },
     ),
     (
-        2,
-        {
-            "atoms": 1,
-            "grid_cap": 128,
-            "fanout": "peer",
-            "block": 256,
-            "skip_self": True,
-            "lamport": True,
-        },
-    ),
-    (
         8,
         {
             "atoms": 2,
@@ -154,7 +144,6 @@ SPOT_CONFIGS = (
             "fanout": "peer",
             "block": 256,
             "skip_self": False,
-            "lamport": True,
         },
     ),
 )
@@ -167,8 +156,8 @@ FRESH_ITERS = 300
 FRESH_TOKENS = (1, 2, 3, 8, 1, 160, 4, 1)
 SQNR_FLOOR_DB = 45.0
 
-# Seconds to wait for each rank of a spawn. The kernels spin on flags written
-# by peers, so a protocol bug or a dead rank hangs the rest; this fails the
+# Seconds to wait for each rank of a spawn. The kernels spin on inbox slots
+# written by peers, so a protocol bug or a dead rank hangs the rest; this fails the
 # spawn instead of leaving it to CI's per-file timeout. A full default run of
 # either FlyDSL all-reduce test takes a few minutes, JIT included.
 SPAWN_TIMEOUT_S = 600
@@ -253,7 +242,7 @@ def _fresh_inputs(eng, rank: int, tp: int, device) -> dict:
 
     Rank 0 is dragged now and then so the others run ahead. Every 7th call
     carries the bf16 NaN ``0xFFFF`` in some lanes of every rank, which is the
-    Lamport sentinel; the result there need only be NaN.
+    inbox sentinel; the result there need only be NaN.
     """
     drag = torch.randn(2048, 2048, device=device, dtype=torch.float32)
     calls = []
@@ -370,7 +359,7 @@ def _run_rank(
             rows.append(res)
 
         # Run-ahead: many back-to-back calls with rank 0 deliberately late, so
-        # the others get a chance to run ahead into the other parity slot.
+        # the others get a chance to run ahead into the next inbox buffer.
         parts = _parts(RUN_AHEAD_M, HIDDEN, tp, 99, device)
         inp = parts[rank].contiguous()
         out = torch.empty_like(inp)
@@ -453,10 +442,10 @@ _FAILURES: list[str] = []
 # Tuning knobs the command line can pin. They are test-function arguments, so
 # they select the engine, but not table columns: the ``variant`` column names
 # the binary that actually ran, which is what a pinned knob changes.
-KNOBS = ("atoms", "grid_cap", "fanout", "block", "skip_self", "lamport")
+KNOBS = ("atoms", "grid_cap", "fanout", "block", "skip_self")
 
 
-def _engine_kw(atoms, grid_cap, fanout, block, skip_self, lamport=None) -> dict:
+def _engine_kw(atoms, grid_cap, fanout, block, skip_self) -> dict:
     """OneShotAllReduce kwargs for the knobs that are pinned (not None)."""
     kw = {
         "atoms": atoms,
@@ -464,7 +453,6 @@ def _engine_kw(atoms, grid_cap, fanout, block, skip_self, lamport=None) -> dict:
         "fanout": fanout,
         "block": block,
         "skip_self": skip_self,
-        "lamport": lamport,
     }
     return {k: v for k, v in kw.items() if v is not None}
 
@@ -498,9 +486,8 @@ def test_one_shot_allreduce(
     fanout=None,
     block=None,
     skip_self=None,
-    lamport=None,
 ):
-    engine_kw = _engine_kw(atoms, grid_cap, fanout, block, skip_self, lamport)
+    engine_kw = _engine_kw(atoms, grid_cap, fanout, block, skip_self)
     key = _key(tp, engine_kw)
     i = _CASES[key].index((tokens, hidden, graph))
     rows = [r["rows"][i] for r in _ranks(key)]
@@ -544,9 +531,8 @@ def test_one_shot_allreduce_run_ahead(
     fanout=None,
     block=None,
     skip_self=None,
-    lamport=None,
 ):
-    engine_kw = _engine_kw(atoms, grid_cap, fanout, block, skip_self, lamport)
+    engine_kw = _engine_kw(atoms, grid_cap, fanout, block, skip_self)
     runs = [r["run_ahead"] for r in _ranks(_key(tp, engine_kw))]
     _check(
         f"tp={tp} run-ahead {engine_kw}",
@@ -572,9 +558,8 @@ def test_one_shot_allreduce_fresh_inputs(
     fanout=None,
     block=None,
     skip_self=None,
-    lamport=None,
 ):
-    engine_kw = _engine_kw(atoms, grid_cap, fanout, block, skip_self, lamport)
+    engine_kw = _engine_kw(atoms, grid_cap, fanout, block, skip_self)
     runs = [r["fresh"] for r in _ranks(_key(tp, engine_kw))]
     _check(
         f"tp={tp} fresh inputs {engine_kw}",
@@ -683,14 +668,6 @@ def main():
         help="Pin skip_self off (0) or on (1).",
     )
     parser.add_argument(
-        "--lamport",
-        type=int,
-        nargs="*",
-        default=[None],
-        choices=(0, 1, None),
-        help="Pin the Lamport (flagless) variant off (0) or on (1).",
-    )
-    parser.add_argument(
         "--extended",
         action="store_true",
         help="Run the spot-check configurations at every world size, and the\n"
@@ -721,15 +698,9 @@ def main():
             "fanout": fanout,
             "block": block,
             "skip_self": None if skip_self is None else bool(skip_self),
-            "lamport": None if lamport is None else bool(lamport),
         }
-        for atoms, grid_cap, fanout, block, skip_self, lamport in itertools.product(
-            args.atoms,
-            args.grid_cap,
-            args.fanout,
-            args.block,
-            args.skip_self,
-            args.lamport,
+        for atoms, grid_cap, fanout, block, skip_self in itertools.product(
+            args.atoms, args.grid_cap, args.fanout, args.block, args.skip_self
         )
     ]
     ladder = configs == [dict.fromkeys(KNOBS)]
