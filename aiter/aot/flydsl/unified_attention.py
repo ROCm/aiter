@@ -6,14 +6,15 @@
 """AOT pre-compilation for the gfx942 FlyDSL fp8 unified-attention kernels.
 
 Unified attention has no tuning CSV. Its builder is keyed by the layer shape,
-the page size, and the K/V strides, so the set a model can reach is finite:
-per shape in ``DEFAULT_SHAPES``, every page size the adapter serves times two
-K/V layouts (separate contiguous caches, and vLLM's views of one
-``[blocks, kv_heads, page, 2 * head_dim]`` cache), plus one combine kernel per
-(head dim, query heads). Each job takes its launcher from the builders the
-adapter calls, with the same arguments, and invokes it under
-``FakeTensorMode`` + ``COMPILE_ONLY=1`` on fake tensors whose dtypes, ranks,
-and strides match the runtime call.
+the page size, the K/V strides, and whether the batch is decode-only, so the
+set a model can reach is finite: per shape in ``DEFAULT_SHAPES``, every page
+size the adapter serves times two K/V layouts (separate contiguous caches, and
+vLLM's views of one ``[blocks, kv_heads, page, 2 * head_dim]`` cache) times
+the unified and decode-only builds, plus one combine kernel per (head dim,
+query heads). Each job takes its launcher from the builders the adapter calls,
+with the same arguments, and invokes it under ``FakeTensorMode`` +
+``COMPILE_ONLY=1`` on fake tensors whose dtypes, ranks, and strides match the
+runtime call.
 
 Usage:
     python -m aiter.aot.flydsl.unified_attention
@@ -39,6 +40,8 @@ DEFAULT_SHAPES = {
     "gemma4_31b_tp1": [(32, 4, 512, None), (32, 16, 256, 1024)],
 }
 LAYOUTS = ("plain", "vllm")
+# The adapter builds decode-only batches (max_seqlen_q == 1) separately.
+MODES = ("unified", "decode")
 # Fake geometry: sizes never reach the compile key, only dtypes, ranks, and
 # strides do.
 _FAKE_SEQS = 4
@@ -46,10 +49,10 @@ _FAKE_TOKENS = 16
 _FAKE_BLOCKS = 8
 
 
-def _attention_name(num_heads, num_kv_heads, head_dim, window, page_size, layout):
+def _attention_name(num_heads, num_kv_heads, head_dim, window, page_size, layout, mode):
     return (
         f"flydsl_unified_attn_gfx942_h{num_heads}_hkv{num_kv_heads}_d{head_dim}"
-        f"_w{window or 0}_p{page_size}_{layout}"
+        f"_w{window or 0}_p{page_size}_{layout}_{mode}"
     )
 
 
@@ -62,25 +65,28 @@ def default_jobs(shapes: dict[str, list] = DEFAULT_SHAPES) -> list[dict]:
         for num_heads, num_kv_heads, head_dim, window in entries:
             for page_size in _PAGE_SIZES:
                 for layout in LAYOUTS:
-                    jobs.append(
-                        {
-                            "kernel_name": _attention_name(
-                                num_heads,
-                                num_kv_heads,
-                                head_dim,
-                                window,
-                                page_size,
-                                layout,
-                            ),
-                            "path": "attention",
-                            "num_heads": num_heads,
-                            "num_kv_heads": num_kv_heads,
-                            "head_dim": head_dim,
-                            "window": window,
-                            "page_size": page_size,
-                            "layout": layout,
-                        }
-                    )
+                    for mode in MODES:
+                        jobs.append(
+                            {
+                                "kernel_name": _attention_name(
+                                    num_heads,
+                                    num_kv_heads,
+                                    head_dim,
+                                    window,
+                                    page_size,
+                                    layout,
+                                    mode,
+                                ),
+                                "path": "attention",
+                                "num_heads": num_heads,
+                                "num_kv_heads": num_kv_heads,
+                                "head_dim": head_dim,
+                                "window": window,
+                                "page_size": page_size,
+                                "layout": layout,
+                                "mode": mode,
+                            }
+                        )
             jobs.append(
                 {
                     "kernel_name": (
@@ -110,7 +116,9 @@ def _fake_kv(layout, page_size, num_kv_heads, head_dim):
     return kv[..., :head_dim], kv[..., head_dim:]
 
 
-def _compile_attention(num_heads, num_kv_heads, head_dim, window, page_size, layout):
+def _compile_attention(
+    num_heads, num_kv_heads, head_dim, window, page_size, layout, mode
+):
     import torch
 
     from aiter.ops.flydsl.kernels.flash_attn_fp8_gfx942 import (
@@ -125,6 +133,7 @@ def _compile_attention(num_heads, num_kv_heads, head_dim, window, page_size, lay
         window,
         page_size,
         k.stride()[:3] + v.stride()[:3],
+        decode_only=mode == "decode",
     )
 
     def t(shape, dtype):

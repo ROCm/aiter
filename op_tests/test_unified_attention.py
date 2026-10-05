@@ -250,7 +250,9 @@ def flydsl_candidate(case, kv_lens):
     """The public wrapper, or a direct launch where dispatch cedes to Triton."""
     from aiter.ops.flydsl import unified_attention_kernels as adapter
 
-    if adapter._cede_to_triton(case["q"].shape[-1], case["max_seqlen_q"]):
+    if adapter._cede_to_triton(
+        case["q"].shape[-1], case["max_seqlen_q"], len(kv_lens), case["max_seqlen_k"]
+    ):
         return direct_candidate(case, kv_lens)
     return partial(ua.unified_attention, **case, backend="flydsl")
 
@@ -365,7 +367,7 @@ def test_splitk_combine(shape, splits):
         workspace.fill_(float("nan"))
     case["out"].fill_(float("nan"))
     ret = measure({"splitk": launch}, case, want, DECODE_QUERY_LENS, DECODE_KV_LENS)
-    ret["splits run"] = (splits + 3) // 4 * 4
+    ret["splits run"] = splits
     return ret
 
 
@@ -415,7 +417,7 @@ def test_routing_backend_gate(config):
     import aiter.ops.flydsl.unified_attention_kernels as adapter
 
     if config == "ceded decode":
-        query_lens, kv_lens = [1] * 4, [1024] * 4
+        query_lens, kv_lens = [1] * 2, [1024] * 2
         case = make_case(query_lens, kv_lens, "full")
     else:
         query_lens, kv_lens = [256, 1], [256, 700]
@@ -508,7 +510,7 @@ def main():
         "--shape", choices=list(SHAPES), nargs="+", default=list(SHAPES)
     )
     parser.add_argument(
-        "--page", type=int, choices=[32, 64], nargs="+", default=[32, 64]
+        "--page", type=int, choices=[32, 64, 128], nargs="+", default=[32, 64, 128]
     )
     parser.add_argument(
         "--layout", choices=["plain", "vllm"], nargs="+", default=["plain", "vllm"]

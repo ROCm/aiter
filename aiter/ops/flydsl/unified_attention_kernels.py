@@ -10,11 +10,11 @@ the config, falling through to Triton unchanged.
 
 Served: causal paged attention with head dim 256 or 512, a GQA group dividing
 16, full attention or a left-only sliding window, plain (unshuffled) FP8
-E4M3FNUZ K/V with page 32 or 64, per-tensor fp32 descales, and bf16 output.
-That covers both Gemma-4 layer types. One launch serves a whole varlen batch:
-multi-token sequences run as prefill tiles, one-token sequences as KV splits
-that a second launch combines. Head-512 decode-only batches are ceded to
-Triton (``_cede_to_triton``).
+E4M3FNUZ K/V with page 32, 64 or 128, per-tensor fp32 descales, and bf16
+output. That covers both Gemma-4 layer types. One launch serves a whole varlen
+batch: multi-token sequences run as prefill tiles, one-token sequences as KV
+splits that a second launch combines. A batch of only one-token sequences runs
+a decode-only build of the same kernel.
 """
 
 from __future__ import annotations
@@ -35,7 +35,9 @@ __all__ = ["flydsl_unified_attention"]
 
 _FP8_DTYPE = torch.float8_e4m3fnuz
 _HEAD_DIMS = (256, 512)
-_PAGE_SIZES = (32, 64)
+# vLLM pages Gemma-4's head-512 layers at twice the block size of its head-256
+# layers (equal page bytes), so block size 64 gives them page 128.
+_PAGE_SIZES = (32, 64, 128)
 # fp32 split partials, one buffer per (device, stream), grown on demand.
 _workspaces = {}
 
@@ -205,11 +207,17 @@ def _supported(
     )
 
 
-def _cede_to_triton(head_size, max_seqlen_q) -> bool:
-    """Head-512 decode-only batches stay on Triton, which is 1.1-2.2x faster
-    there on MI325X (batch 1-64, context 1K-16K). Mixed batches with head-512
-    decodes are faster here and are served."""
-    return head_size == 512 and max_seqlen_q == 1
+def _cede_to_triton(head_size, max_seqlen_q, num_seqs, max_seqlen_k) -> bool:
+    """Tiny head-512 decode-only batches stay on Triton: up to 4K keys in all
+    and 2K per sequence (batch 1-2 to 2K, batch 4 at 1K), where launch latency
+    dominates and Triton is 1.0-1.3x faster on MI325X. Every other batch is
+    faster here and is served."""
+    return (
+        head_size == 512
+        and max_seqlen_q == 1
+        and max_seqlen_k <= 2048
+        and num_seqs * max_seqlen_k <= 4096
+    )
 
 
 def _as_i8(t: torch.Tensor) -> torch.Tensor:
@@ -249,22 +257,24 @@ def _launch(
     """Launch for a call that passed _supported. window is the inclusive key
     count or None; num_kv_splits forces the decode split count."""
     _, num_query_heads, head_size = q.shape
+    decode_only = max_seqlen_q == 1
     # Triton's q-block count: an upper bound on any batch's prefill tiles.
     tile_slots = (
-        q.shape[0] // prefill_block_q(num_query_heads, num_kv_heads) + num_seqs
-        if max_seqlen_q > 1
-        else 0
+        0
+        if decode_only
+        else q.shape[0] // prefill_block_q(num_query_heads, num_kv_heads) + num_seqs
     )
     splits = num_kv_splits or plan_num_kv_splits(
-        num_seqs, max_seqlen_k, num_kv_heads, window
+        num_seqs, max_seqlen_k, num_kv_heads, window, head_size
     )
-    # A decode workgroup runs four splits, one per wave.
-    groups = (splits + 3) // 4
+    # Each decode wave runs one split; the unified kernel has four per workgroup.
+    waves = 1 if decode_only else 4
+    groups = (splits + waves - 1) // waves
     stream = torch.cuda.current_stream(q.device)
     workspace = _workspace(
         q.device,
         stream,
-        max(4, num_seqs * num_query_heads * groups * 4 * (head_size + 4)),
+        max(4, num_seqs * num_query_heads * groups * waves * (head_size + 4)),
     )
     with torch.cuda.device(q.device):
         kernel = build_flash_attn_fp8_gfx942_module(
@@ -274,6 +284,7 @@ def _launch(
             window,
             block_size,
             k.stride()[:3] + v.stride()[:3],
+            decode_only=decode_only,
         )
         combine = build_flash_attn_fp8_gfx942_combine_module(head_size, num_query_heads)
         kernel(
@@ -298,7 +309,7 @@ def _launch(
             tile_slots + num_seqs * groups,
             stream=stream,
         )
-        combine(workspace, out, cu_seqlens_q, num_seqs, groups * 4, stream=stream)
+        combine(workspace, out, cu_seqlens_q, num_seqs, groups * waves, stream=stream)
     return out
 
 
@@ -369,7 +380,7 @@ def flydsl_unified_attention(
         skip_reduce,
     ):
         return None
-    if _cede_to_triton(q.shape[-1], max_seqlen_q):
+    if _cede_to_triton(q.shape[-1], max_seqlen_q, num_seqs, max_seqlen_k):
         return None
     return _launch(
         q,

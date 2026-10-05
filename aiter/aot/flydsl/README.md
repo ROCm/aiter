@@ -77,13 +77,15 @@ python -m aiter.aot.flydsl.fmha_fp8 --shape 12:12:192:128
 ```
 
 The gfx942 unified-attention kernel compiles in the layer shape, the page size,
-and the K/V strides. `unified_attention` builds every page size the adapter
-serves, for separate contiguous K/V caches and for vLLM's views of one cache,
-for each layer shape in its `DEFAULT_SHAPES` table (`num_heads, num_kv_heads,
-head_dim, window`, heads per rank). It has no CSV and does not accept `--csv`.
+the K/V strides, and whether the batch is decode-only. `unified_attention`
+builds every page size the adapter serves, for separate contiguous K/V caches
+and for vLLM's views of one cache, in both the unified and the decode-only
+build, for each layer shape in its `DEFAULT_SHAPES` table (`num_heads,
+num_kv_heads, head_dim, window`, heads per rank). It has no CSV and does not
+accept `--csv`.
 
 ```bash
-# Gemma-4-31B at TP1: 8 attention kernels and 2 combine kernels
+# Gemma-4-31B at TP1: 24 attention kernels and 2 combine kernels
 python -m aiter.aot.flydsl.unified_attention
 ```
 
