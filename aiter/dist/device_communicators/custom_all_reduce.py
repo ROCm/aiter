@@ -753,9 +753,9 @@ class _SymmMemBufferProxy:
     def __init__(self, meta_tensor, input_tensor, handles, ca):
         self._meta = meta_tensor
         self._input = input_tensor
-        # Nothing reads these after init. They are kept so the rendezvous
-        # handles cannot outlive the buffers they map, whichever way round
-        # torch ties those two lifetimes together.
+        # Nothing reads these after init. They are kept so the peer mappings
+        # stay valid while the kernel uses the buffers: whether dropping a
+        # handle unmaps its peers is up to the backend.
         self._hdls = handles
         self._ca = ca
 
@@ -793,8 +793,7 @@ class _SymmMemBufferProxy:
             "register_input_buffer/register_output_buffer are not supported on "
             "the torch.symm_mem transport: sharing an external tensor needs a "
             "registration-time copy, which would make peers reduce stale data. "
-            "Allocate from the symmetric heap, or unset "
-            "AITER_CUSTOM_AR_USE_SYMM_MEM to use the IPC transport."
+            "Unset AITER_CUSTOM_AR_USE_SYMM_MEM to use the default transport."
         )
 
 
@@ -906,8 +905,8 @@ class CustomAllreduce:
             return
         if not self._same_node and self._use_symm_mem:
             logger.info(
-                "Custom allreduce: multi-node detected, relying on "
-                "symm_mem probe to verify cross-node P2P accessibility."
+                "Custom allreduce: group spans nodes; symm_mem init raises "
+                "on every rank if a peer cannot be mapped."
             )
 
         rank = dist.get_rank(group=self.group)
@@ -1046,8 +1045,7 @@ class CustomAllreduce:
 
         # No fallback past here, same as the VMM path. The probe already showed
         # symm_mem is there, so failing now means a broken setup, not an
-        # unsupported one. Falling back would also strand the buffers: symm_mem
-        # never returns them to the driver.
+        # unsupported one, and it raises on every rank.
         if self._use_symm_mem:
             self._init_symm_mem(rank, world_size, max_size)
         elif self._use_vmm:
@@ -1106,14 +1104,16 @@ class CustomAllreduce:
         version check can answer it the way _should_use_vmm answers VMM.
         Everything after this raises instead.
 
-        Probes 64 bytes rather than the real sizes: symm_mem.empty draws from a
-        torch.cuda.MemPool that never returns a segment to the driver, so a
-        full-size probe would strand ~1 GiB per rank on every fallback.
+        It only checks that the backend loads and can allocate locally, which
+        also test-exports a fabric handle. Mapping peers (cco comm creation,
+        handle import, peers on other nodes) is left to _init_symm_mem: symm_mem
+        was asked for explicitly, so a failure there is a broken setup and
+        raises on every rank rather than quietly switching transport.
         """
         buf = None
         prev_backend = None
-        # Keep the allocation above the vote with the rest of the rank-local
-        # work: mori carves even 64 bytes out of a fixed VA reservation.
+        # Allocate before the vote: like the import, it can fail on one rank
+        # alone, and every rank must see that before the next collective.
         try:
             import mori.allocator  # noqa: F401
             import torch.distributed._symmetric_memory as symm_mem
@@ -1369,8 +1369,8 @@ class CustomAllreduce:
 
     def register_input_buffer(self, inp: torch.Tensor):
         """Register an external tensor as an IPC input buffer."""
-        # Branch on transport: VMM/symm_mem returns a raw peer-ptr list;
-        # IPC (old-arch and gfx1250 kernels) returns handles + offsets.
+        # Branch on transport: VMM returns a raw peer-ptr list (symm_mem
+        # raises); IPC (old-arch and gfx1250 kernels) returns handles + offsets.
         if self._use_symm_mem or self._use_vmm:
             all_ptrs = self._pool.get_external_ipc_meta(inp)
             self._ops_register_input_buffer(self._ptr, inp.data_ptr(), all_ptrs)
