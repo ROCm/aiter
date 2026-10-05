@@ -347,6 +347,10 @@ def main():
             _run_mix(m, fold_w)
             _run_final_mixer_no_inject(m, fold_w)
         _run_combine(m)
+    if arch == "gfx942" and 8192 not in args.tokens:
+        # gfx942's 64 KiB LDS makes high-M decoupled plans capacity-sensitive.
+        for fold_w in (False, True):
+            _run_combine_and_mix(8192, fold_w)
     _run_combine(64)
     for m in args.decode_tokens:
         # Unfolded decode uses the padded tail because skinny K1 requires folding.
