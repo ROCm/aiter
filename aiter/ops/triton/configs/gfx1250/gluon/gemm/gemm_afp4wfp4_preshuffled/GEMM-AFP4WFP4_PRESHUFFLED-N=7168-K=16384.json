@@ -80,12 +80,12 @@
         "num_ctas": 1
     },
     "M_LEQ_2048": {
-        "BLOCK_SIZE_M": 256,
-        "BLOCK_SIZE_N": 256,
+        "BLOCK_SIZE_M": 512,
+        "BLOCK_SIZE_N": 1024,
         "BLOCK_SIZE_K": 256,
         "num_warps": 4,
-        "NUM_BUFFERS": 3,
-        "num_ctas": 1
+        "NUM_BUFFERS": 4,
+        "num_ctas": 8
     },
     "any": {
         "BLOCK_SIZE_M": 256,
