@@ -1874,7 +1874,7 @@ def _mla_decode_fwd_kernel(
     num_segments = NUM_SEGMENTS_PER_SEQ
     tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
 
-    if not USE_LDS_PIPELINE and segm_idx * tiles_per_segment * TILE_SIZE >= seq_len:
+    if segm_idx * tiles_per_segment * TILE_SIZE >= seq_len:
         return
 
     qk_factor: gl.float32 = cfg.QK_SCALE
