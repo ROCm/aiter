@@ -34,18 +34,17 @@ Paths (per row, by valid length row_len):
 Constraints:
   - logits are fp32; the order-preserving radix key twiddle is fp32-specific.
   - bits_per_pass is 10 or 11; the short tier requires 11 bits (2048-bin LDS histogram).
-  - BLOCK_THREADS is fixed at 1024 (wave64); the histogram/scan layout and the
-    occupancy deadlock guard rely on it.
+  - BLOCK_THREADS is fixed at 1024 (wave64); the histogram/scan layout relies on it.
   - workspace must be zeroed before any launch that enters a multi-block tier; its
     counters and histograms accumulate from zero (needs_workspace_zero reports when).
     Only the leading workspace_zero_row_slots of each row need it.
-  - The row barrier spins (s_sleep), so a row's blocks_per_row workgroups must be
-    co-resident. This is a regular launch, not hipLaunchCooperativeKernel, and is safe
-    only because the grid is flattened x-fastest: a row's parts launch contiguously
-    and drain in order, which is scheduler launch order rather than a cooperative
-    guarantee. Do not reorder the grid. The deadlock guard keeps
-    num_rows * blocks_per_row co-resident, forcing larger batches onto the
-    barrier-free short tier.
+  - The row barrier spins (s_sleep), so a row's active parts must be co-resident.
+    This is a regular launch, not a cooperative one, which FlyDSL does not offer.
+    A multi-part launch stays within one workgroup per CU, and rows are independent
+    and flattened x-fastest, so the earliest rows finish and free CUs for the rest.
+    That relies on in-order dispatch rather than a guarantee: a row stalls only
+    while other work leaves fewer free slots than it has parts. Do not reorder the
+    grid.
 """
 
 import math
@@ -72,8 +71,7 @@ from aiter.ops.flydsl.kernels import buffer_ops
 _AGENT = rocdl.SyncScope.Agent
 _WORKGROUP = rocdl.SyncScope.Workgroup
 
-# HW max block size; also assumed by the bucket scan (2 bins/thread -> 2048 bins)
-# and the occupancy=2 deadlock guard. Changing it breaks both.
+# HW max block size; also assumed by the bucket scan (2 bins/thread -> 2048 bins).
 BLOCK_THREADS = 1024
 WARP_SIZE = 64
 LOAD_VEC = 4
