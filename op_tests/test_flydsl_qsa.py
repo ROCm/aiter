@@ -19,12 +19,16 @@ Usage::
     HIP_VISIBLE_DEVICES=6 python3 op_tests/test_flydsl_qsa.py
     HIP_VISIBLE_DEVICES=6 python3 op_tests/test_flydsl_qsa.py --rotate 0 1
     HIP_VISIBLE_DEVICES=6 python3 op_tests/test_flydsl_qsa.py --pad-pages 4096
+    HIP_VISIBLE_DEVICES=6 python3 op_tests/test_flydsl_qsa.py --cache-layout wide
 
 Perf rows default to cold weights (``--rotate 0``); pass ``--rotate 1`` to
 reproduce the older hot-cache 1047 tables. ``--pad-pages 0`` (the default)
 keeps each K1 block table packed to the context. A positive width zero-fills
 it out to that many pages, which is how vLLM sizes the table for
-``max_model_len``.
+``max_model_len``. ``--cache-layout packed`` (the default) keeps each cache
+contiguous. ``wide`` is vLLM's per-layer view: the same pages, with a page
+stride that puts the byte span just past 4 GiB, which is the compile K1
+and K2 use for a serving KV pool.
 """
 
 from __future__ import annotations
@@ -74,6 +78,151 @@ from op_tests.qsa_shapes import (
 )
 
 SUPPORTED_GFX = ["gfx942", "gfx950"]
+# Exactly 4 GiB still fits in a V# offset. The wide compile starts past that.
+_FOUR_GIB = 1 << 32
+
+
+def _span_bytes(t: torch.Tensor) -> int:
+    """Bytes from ``t``'s first element to one past its last, for any strides."""
+    if t.numel() == 0:
+        return 0
+    last = sum((size - 1) * stride for size, stride in zip(t.shape, t.stride()))
+    return (last + 1) * t.element_size()
+
+
+def _storage_tensor(view: torch.Tensor) -> torch.Tensor:
+    """Contiguous 1-D tensor over ``view``'s storage.
+
+    Cold rotation deep-copies this, which keeps the gaps. Copying the view
+    itself packs the pages and the span falls back under 4 GiB.
+    """
+    elem = view.element_size()
+    n_elems = view.untyped_storage().size() // elem - view.storage_offset()
+    flat = torch.empty(0, dtype=view.dtype, device=view.device)
+    flat.set_(view.untyped_storage(), view.storage_offset(), (n_elems,), (1,))
+    return flat
+
+
+def _widen_cache(cache: torch.Tensor) -> torch.Tensor:
+    """The same pages, with a page stride that puts the span just past 4 GiB.
+
+    vLLM allocates one KV pool and hands each layer a strided view, so the
+    page stride covers every layer and the span is the pool. Allocating that
+    pool is unnecessary: a few pages and a stride that lands the last page
+    just past 4 GiB selects the same compile. A one-page cache gains an
+    unreferenced trailing page, because a size of 1 ignores its stride.
+    The parent holds the span and no more. Page stride is a multiple of 8
+    elements, which is the gather alignment K1 and K2 already require.
+    """
+    if cache.ndim != 4:
+        raise ValueError(
+            f"paged cache must be [pages, page_size, H, D], got {tuple(cache.shape)}"
+        )
+    n_pages, page_size, n_heads, head_dim = (int(s) for s in cache.shape)
+    if n_pages < 1:
+        return cache
+    page_elems = page_size * n_heads * head_dim
+    token_stride = n_heads * head_dim
+    head_stride = head_dim
+    view_pages = max(n_pages, 2)
+    elem = cache.element_size()
+    gaps = view_pages - 1
+    # span = (gaps * page_stride + page_elems) * elem, and it must exceed 4 GiB.
+    min_elems = (_FOUR_GIB + elem) // elem
+    page_stride = (min_elems - page_elems + gaps - 1) // gaps
+    page_stride = max(page_stride, page_elems)
+    if page_stride % 8:
+        page_stride += 8 - (page_stride % 8)
+    span_elems = gaps * page_stride + page_elems
+    parent = cache.new_empty(span_elems)
+    parent.zero_()
+    flat = cache.contiguous().reshape(n_pages, page_elems)
+    for i in range(n_pages):
+        parent[i * page_stride : i * page_stride + page_elems] = flat[i]
+    view = parent.as_strided(
+        (view_pages, page_size, n_heads, head_dim),
+        (page_stride, token_stride, head_stride, 1),
+    )
+    if _span_bytes(view) <= _FOUR_GIB:
+        raise RuntimeError(f"wide cache span {_span_bytes(view)} did not pass 4 GiB")
+    return view
+
+
+def _apply_cache_layout(cache: torch.Tensor, layout: str) -> torch.Tensor:
+    """``packed`` leaves the cache. ``wide`` is the serving span."""
+    if layout == "packed":
+        return cache
+    if layout != "wide":
+        raise ValueError(f"cache_layout must be packed or wide, got {layout}")
+    return _widen_cache(cache)
+
+
+def _span_gib(cache: torch.Tensor) -> float:
+    return _span_bytes(cache) / (1 << 30)
+
+
+def test_wide_cache_layout_spans_past_4gib():
+    """The bench view crosses 4 GiB without packing, and a clone does not.
+
+    A one-page cache has to grow a trailing page or the stride is ignored.
+    Rotating copies the storage and rebuilds the view; cloning the view
+    packs it back under 4 GiB, which would time the narrow compile.
+    """
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    device = torch.device("cuda")
+    free, _total = torch.cuda.mem_get_info(device)
+    if free < _FOUR_GIB + (1 << 30):
+        aiter.logger.warning(
+            "skip wide cache layout test: need %s bytes, %s free",
+            _FOUR_GIB + (1 << 30),
+            free,
+        )
+        return
+    try:
+        _apply_cache_layout(torch.empty(1, 1, 1, 8), "dense")
+    except ValueError as exc:
+        if "cache_layout" not in str(exc):
+            raise
+    else:
+        raise AssertionError("an unknown cache layout was accepted")
+    idx = FAMILY_A_INDEXER
+    page_size = 16
+    for n_pages in (1, 3):
+        n_blocks = n_pages * page_size
+        cache, _table = pack_paged_cache(
+            torch.randn(n_blocks, 1, idx.head_dim, dtype=dtypes.bf16, device=device),
+            page_size,
+        )
+        packed = _apply_cache_layout(cache, "packed")
+        if _span_bytes(packed) > _FOUR_GIB:
+            raise AssertionError("packed layout crossed 4 GiB")
+        view = _apply_cache_layout(cache, "wide")
+        if _span_bytes(view) <= _FOUR_GIB:
+            raise AssertionError(f"wide span {_span_bytes(view)} did not pass 4 GiB")
+        if n_pages == 1 and view.shape[0] != 2:
+            raise AssertionError(f"one-page cache stayed at {view.shape[0]} pages")
+        if n_pages > 1 and view.shape[0] != n_pages:
+            raise AssertionError(f"wide page count {view.shape[0]} != {n_pages}")
+        if any(s % 8 for s in view.stride()[:3]) or view.stride(3) != 1:
+            raise AssertionError(
+                f"wide strides are not gather-aligned: {view.stride()}"
+            )
+        if not torch.equal(view[:n_pages], cache):
+            raise AssertionError("wide view changed the packed pages")
+        q = torch.empty(1, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device)
+        table = torch.zeros(1, 1, dtype=dtypes.i32, device=device)
+        reason = k1_kernel.qsa_k1_serves(q, view, table, (4,))
+        if reason is not None:
+            raise AssertionError(f"wide indexer cache was rejected: {reason}")
+        if _span_bytes(view.clone()) > _FOUR_GIB:
+            raise AssertionError("cloning the view kept the wide span")
+        restored = _storage_tensor(view).clone().as_strided(view.shape, view.stride())
+        if _span_bytes(restored) <= _FOUR_GIB:
+            raise AssertionError("storage copy dropped the wide span")
+        if not torch.equal(restored[:n_pages], cache):
+            raise AssertionError("storage copy changed the packed pages")
+        del view, restored, cache
 
 
 def _time(fn, *args, rotate, **kwargs):
@@ -88,8 +237,36 @@ def _time(fn, *args, rotate, **kwargs):
     pass paged caches as ``*args`` so deepcopy clones them -- a zero-arg
     closure cannot rotate closed-over tensors. HIP-graph replay is not
     combined with rotation.
+
+    A wide cache is a strided view over about 4 GiB. ``clone`` packs that
+    view and the next iteration would take the narrow compile, and one
+    copy is already larger than L2, so auto-rotate keeps a single copy.
+    An explicit ``rotate`` still makes that many copies. Each copy is the
+    storage, and the view is rebuilt per call.
     """
-    return run_perftest(fn, *args, num_rotate_args=rotate, **kwargs)
+    wide = [
+        i
+        for i, arg in enumerate(args)
+        if isinstance(arg, torch.Tensor) and _span_bytes(arg) > _FOUR_GIB
+    ]
+    if not wide:
+        return run_perftest(fn, *args, num_rotate_args=rotate, **kwargs)
+    rotate = max(rotate, 1)
+    call_args = list(args)
+    shapes = []
+    strides = []
+    for i in wide:
+        shapes.append(tuple(call_args[i].shape))
+        strides.append(tuple(int(s) for s in call_args[i].stride()))
+        call_args[i] = _storage_tensor(call_args[i])
+
+    def _restore(*restored, **restored_kwargs):
+        restored = list(restored)
+        for i, shape, stride in zip(wide, shapes, strides):
+            restored[i] = restored[i].as_strided(shape, stride)
+        return fn(*restored, **restored_kwargs)
+
+    return run_perftest(_restore, *call_args, num_rotate_args=rotate, **kwargs)
 
 
 def test_indexer_hand_checked_one_row():
@@ -2036,7 +2213,9 @@ def _pad_index_table(index_table, pad_pages):
 
 
 @benchmark()
-def bench_qsa_family_a_k1(m, seq_len, page_size, dtype, rotate=0, pad_pages=0):
+def bench_qsa_family_a_k1(
+    m, seq_len, page_size, dtype, rotate=0, pad_pages=0, cache_layout="packed"
+):
     """Family A FlyDSL K1 vs oracle set equality; us vs live AMD.
 
     2d: short rows use fused emit. Long rows use BLOCK_N=32 BF16 MFMA scoring
@@ -2046,8 +2225,8 @@ def bench_qsa_family_a_k1(m, seq_len, page_size, dtype, rotate=0, pad_pages=0):
     the vendored Triton expand, the same expand live AMD select includes.
     Set equality stays on block ids. Same ``rotate`` on every select column.
     ``pad_pages`` widens the block table every column sees; ``0`` keeps it
-    packed to the context. The layer bench is a separate matched chain and
-    is not changed here.
+    packed to the context. ``cache_layout="wide"`` gives every column the
+    serving cache span. The layer bench takes the same layout.
     """
     idx = FAMILY_A_INDEXER
     device = torch.device("cuda")
@@ -2064,7 +2243,7 @@ def bench_qsa_family_a_k1(m, seq_len, page_size, dtype, rotate=0, pad_pages=0):
     gen_i = torch.Generator(device=device)
     gen_i.manual_seed(1)
     index_cache, index_table = pack_paged_cache(index_k, page_size, generator=gen_i)
-    index_cache = index_cache.contiguous()
+    index_cache = _apply_cache_layout(index_cache.contiguous(), cache_layout)
     index_table = _pad_index_table(index_table.contiguous(), pad_pages)
 
     ref_scores = qsa_indexer_scores(
@@ -2113,6 +2292,7 @@ def bench_qsa_family_a_k1(m, seq_len, page_size, dtype, rotate=0, pad_pages=0):
         "gfx": get_gfx(),
         "n_blocks": n_blocks,
         "n_pages": int(index_table.shape[1]),
+        "cache_span_gib": _span_gib(index_cache),
         "flydsl_k1 us": k1_us,
         "flydsl_k1 TFLOPS": flops / k1_us / 1e6,
         "flydsl_k1 TB/s": nbytes / k1_us / 1e6,
@@ -2125,12 +2305,16 @@ def bench_qsa_family_a_k1(m, seq_len, page_size, dtype, rotate=0, pad_pages=0):
 
 
 @benchmark()
-def bench_qsa_family_a_k2(m, seq_len, page_size, dtype, rotate=0):
+def bench_qsa_family_a_k2(
+    m, seq_len, page_size, dtype, rotate=0, cache_layout="packed"
+):
     """Family A FlyDSL K2 vs oracle GQA; us vs live AMD.
 
     3d: live-AMD-shaped BLOCK_N/threads/split policy, tiled MFMA QK/PV,
     log2 online softmax, direct output at one split, and a two-wave merge.
     Expand and sigmoid stay unfused. Same ``rotate`` on every GQA column.
+    ``cache_layout="wide"`` gives K and V the serving cache span. K2 reads
+    V with K's strides, so the two views share one page stride.
     """
     idx = FAMILY_A_INDEXER
     gqa = FAMILY_A_GQA
@@ -2152,8 +2336,12 @@ def bench_qsa_family_a_k2(m, seq_len, page_size, dtype, rotate=0):
     _index_cache, _index_table, k_cache, v_cache, kv_table = _pack_family_a(
         k_bar, k, v, page_size, device
     )
-    k_cache = k_cache.contiguous()
-    v_cache = v_cache.contiguous()
+    k_cache = _apply_cache_layout(k_cache.contiguous(), cache_layout)
+    v_cache = _apply_cache_layout(v_cache.contiguous(), cache_layout)
+    if k_cache.stride() != v_cache.stride():
+        raise RuntimeError(
+            f"K and V strides diverged: {k_cache.stride()} vs {v_cache.stride()}"
+        )
     kv_table = kv_table.contiguous()
     ref = qsa_oracle(
         q_indexer,
@@ -2218,6 +2406,7 @@ def bench_qsa_family_a_k2(m, seq_len, page_size, dtype, rotate=0):
         "n_blocks": n_blocks,
         "width": w_alloc,
         "valid%": 100.0 * w / w_alloc,
+        "cache_span_gib": _span_gib(k_cache),
         "flydsl_k2 us": k2_us,
         "flydsl_k2 TFLOPS": flops / k2_us / 1e6,
         "flydsl_k2 TB/s": nbytes / k2_us / 1e6,
@@ -2455,7 +2644,14 @@ def test_k1_family_b_set_equality_published_indexer_point():
 
 @benchmark()
 def bench_qsa_family_b_k1(
-    m, seq_len, page_size, dtype, index_heads, rotate=0, pad_pages=0
+    m,
+    seq_len,
+    page_size,
+    dtype,
+    index_heads,
+    rotate=0,
+    pad_pages=0,
+    cache_layout="packed",
 ):
     """Family B FlyDSL K1 vs oracle set equality.
 
@@ -2463,7 +2659,8 @@ def bench_qsa_family_b_k1(
     scorer plus radix (``H=8`` is a second compile). ``H`` 4 and 8 emit
     share one kernel. Separate table from family A. Expand is not fused.
     ``pad_pages`` widens the block table every column sees; ``0`` keeps it
-    packed to the context.
+    packed to the context. ``cache_layout="wide"`` gives the indexer cache
+    the serving span.
     """
     idx = _family_b_indexer(index_heads)
     device = torch.device("cuda")
@@ -2480,7 +2677,7 @@ def bench_qsa_family_b_k1(
     gen_i = torch.Generator(device=device)
     gen_i.manual_seed(1)
     index_cache, index_table = pack_paged_cache(index_k, page_size, generator=gen_i)
-    index_cache = index_cache.contiguous()
+    index_cache = _apply_cache_layout(index_cache.contiguous(), cache_layout)
     index_table = _pad_index_table(index_table.contiguous(), pad_pages)
     score_scale = idx.head_dim**-0.5
 
@@ -2515,6 +2712,7 @@ def bench_qsa_family_b_k1(
         "index_heads": idx.n_heads,
         "n_blocks": n_blocks,
         "n_pages": int(index_table.shape[1]),
+        "cache_span_gib": _span_gib(index_cache),
         "flydsl_k1 us": k1_us,
         "flydsl_k1 TFLOPS": flops / k1_us / 1e6,
         "flydsl_k1 TB/s": nbytes / k1_us / 1e6,
@@ -3157,7 +3355,7 @@ def test_qsa_symbols_export_lazily():
     assert flydsl.normalize_qsa_backend is normalize_qsa_backend
 
 
-def _prepare_qsa_layer(idx, gqa, m, seq_len, page_size, dtype):
+def _prepare_qsa_layer(idx, gqa, m, seq_len, page_size, dtype, cache_layout="packed"):
     device = torch.device("cuda")
     n_blocks = seq_len // idx.compress_ratio
     torch.manual_seed(0)
@@ -3176,10 +3374,14 @@ def _prepare_qsa_layer(idx, gqa, m, seq_len, page_size, dtype):
     index_cache, index_table, k_cache, v_cache, kv_table = _pack_family_a(
         k_bar, k, v, page_size, device
     )
-    index_cache = index_cache.contiguous()
+    index_cache = _apply_cache_layout(index_cache.contiguous(), cache_layout)
     index_table = index_table.contiguous()
-    k_cache = k_cache.contiguous()
-    v_cache = v_cache.contiguous()
+    k_cache = _apply_cache_layout(k_cache.contiguous(), cache_layout)
+    v_cache = _apply_cache_layout(v_cache.contiguous(), cache_layout)
+    if k_cache.stride() != v_cache.stride():
+        raise RuntimeError(
+            f"K and V strides diverged: {k_cache.stride()} vs {v_cache.stride()}"
+        )
     kv_table = kv_table.contiguous()
     ref = qsa_oracle(
         q_indexer,
@@ -3377,14 +3579,18 @@ def _time_layer(case, idx, backend, rotate):
 
 
 @benchmark()
-def bench_qsa_family_a_e2e(m, seq_len, page_size, dtype, rotate=0):
+def bench_qsa_family_a_e2e(
+    m, seq_len, page_size, dtype, rotate=0, cache_layout="packed"
+):
     """One family A QSA layer: FlyDSL K1+expand+K2 vs live AMD.
 
     Expand stays the vendored Triton kernel. Oracle is not timed. Same
     ``rotate`` on every column. HIP graph replay is a separate table.
+    ``cache_layout="wide"`` is the serving span on the indexer cache and
+    on K and V.
     """
     idx, gqa = FAMILY_A_INDEXER, FAMILY_A_GQA
-    case = _prepare_qsa_layer(idx, gqa, m, seq_len, page_size, dtype)
+    case = _prepare_qsa_layer(idx, gqa, m, seq_len, page_size, dtype, cache_layout)
     ref = case["ref"].output
     w_alloc, w, flops, nbytes = _e2e_counts(case, idx, gqa, dtype)
 
@@ -3401,6 +3607,7 @@ def bench_qsa_family_a_e2e(m, seq_len, page_size, dtype, rotate=0):
         "n_blocks": case["n_blocks"],
         "width": w_alloc,
         "valid%": 100.0 * w / w_alloc,
+        "cache_span_gib": _span_gib(case["k_cache"]),
     }
     ret.update(_e2e_cells("flydsl_e2e", fly_us, fly_err, flops, nbytes))
     ret.update(_e2e_cells("vllm_amd_e2e", amd_us, amd_err, flops, nbytes))
@@ -3408,7 +3615,9 @@ def bench_qsa_family_a_e2e(m, seq_len, page_size, dtype, rotate=0):
 
 
 @benchmark()
-def bench_qsa_family_b_e2e(m, seq_len, page_size, dtype, index_heads, rotate=0):
+def bench_qsa_family_b_e2e(
+    m, seq_len, page_size, dtype, index_heads, rotate=0, cache_layout="packed"
+):
     """One family B QSA layer vs live AMD.
 
     Separate table from family A. Live AMD is the column ``auto`` decides
@@ -3416,7 +3625,7 @@ def bench_qsa_family_b_e2e(m, seq_len, page_size, dtype, index_heads, rotate=0):
     """
     idx = _family_b_indexer(index_heads)
     gqa = FAMILY_B_GQA
-    case = _prepare_qsa_layer(idx, gqa, m, seq_len, page_size, dtype)
+    case = _prepare_qsa_layer(idx, gqa, m, seq_len, page_size, dtype, cache_layout)
     ref = case["ref"].output
     w_alloc, w, flops, nbytes = _e2e_counts(case, idx, gqa, dtype)
     fly, fly_us = _time_layer(case, idx, "flydsl", rotate)
@@ -3433,6 +3642,7 @@ def bench_qsa_family_b_e2e(m, seq_len, page_size, dtype, index_heads, rotate=0):
         "n_blocks": case["n_blocks"],
         "width": w_alloc,
         "valid%": 100.0 * w / w_alloc,
+        "cache_span_gib": _span_gib(case["k_cache"]),
     }
     ret.update(_e2e_cells("flydsl_e2e", fly_us, fly_err, flops, nbytes))
     ret.update(_e2e_cells("vllm_amd_e2e", amd_us, amd_err, flops, nbytes))
@@ -3440,14 +3650,14 @@ def bench_qsa_family_b_e2e(m, seq_len, page_size, dtype, index_heads, rotate=0):
 
 
 @benchmark()
-def bench_qsa_family_a_e2e_graph(m, seq_len, page_size, dtype):
+def bench_qsa_family_a_e2e_graph(m, seq_len, page_size, dtype, cache_layout="packed"):
     """HIP graph replay of one family A decode layer. Not combined with rotate.
 
     Each candidate is captured once, then ``replay`` is timed hot. The
     output buffer after replay is the correctness check.
     """
     idx, gqa = FAMILY_A_INDEXER, FAMILY_A_GQA
-    case = _prepare_qsa_layer(idx, gqa, m, seq_len, page_size, dtype)
+    case = _prepare_qsa_layer(idx, gqa, m, seq_len, page_size, dtype, cache_layout)
     ref = case["ref"].output
     _w_alloc, w, flops, nbytes = _e2e_counts(case, idx, gqa, dtype)
     device = case["q_gqa"].device
@@ -3482,6 +3692,7 @@ def bench_qsa_family_a_e2e_graph(m, seq_len, page_size, dtype):
         "gfx": get_gfx(),
         "n_blocks": case["n_blocks"],
         "valid%": 100.0 * w / width,
+        "cache_span_gib": _span_gib(case["k_cache"]),
     }
     ret.update(_e2e_cells("flydsl_graph", fly_us, fly_err, flops, nbytes))
     ret.update(_e2e_cells("vllm_amd_graph", amd_us, amd_err, flops, nbytes))
@@ -3513,6 +3724,7 @@ def _run_unit_cases():
     test_k1_serves_padded_page_and_rejects_misaligned()
     test_k1_padded_page_stride_matches_packed()
     test_k1_wide_padded_page_does_not_alias()
+    test_wide_cache_layout_spans_past_4gib()
     test_k1_family_b_set_equality_short_decode()
     test_k1_family_b_set_equality_short_decode_h8()
     test_k1_family_b_set_equality_two_tiles()
@@ -3654,6 +3866,19 @@ def main():
         "(65856 columns). Pass 0 and a width to sweep both.",
     )
     parser.add_argument(
+        "--cache-layout",
+        nargs="*",
+        default=["packed"],
+        choices=["packed", "wide"],
+        help="K and V cache layout. packed is one contiguous page after\n"
+        "another and stays under 4 GiB. wide keeps those pages and inserts\n"
+        "a page stride so the byte span is just past 4 GiB, which is how\n"
+        "vLLM's per-layer view selects the wide K1/K2 compile. A one-page\n"
+        "cache gains an unreferenced trailing page so the stride counts.\n"
+        "Auto-rotate keeps one copy of a wide cache: it is already larger\n"
+        "than L2. Pass both names to sweep them.",
+    )
+    parser.add_argument(
         "--rotate",
         type=int,
         nargs="*",
@@ -3710,8 +3935,20 @@ def main():
         decode_m, prefill_m = _k1_k2_sweep_batches(args.batch)
 
         rows = []
-        for m, seq_len, page_size, rotate, pad_pages in itertools.product(
-            decode_m, args.seq, args.page_size, args.rotate, args.pad_pages
+        for (
+            m,
+            seq_len,
+            page_size,
+            rotate,
+            pad_pages,
+            cache_layout,
+        ) in itertools.product(
+            decode_m,
+            args.seq,
+            args.page_size,
+            args.rotate,
+            args.pad_pages,
+            args.cache_layout,
         ):
             if _skip_m_past_seq(m, seq_len, "family A K1 decode"):
                 continue
@@ -3723,7 +3960,15 @@ def main():
                 "family A K1 decode",
             ):
                 continue
-            row = bench_qsa_family_a_k1(m, seq_len, page_size, dtype, rotate, pad_pages)
+            row = bench_qsa_family_a_k1(
+                m,
+                seq_len,
+                page_size,
+                dtype,
+                rotate,
+                pad_pages,
+                cache_layout,
+            )
             _raise_if_k1_mismatch(row["flydsl_k1 err"], m, seq_len)
             rows.append(row)
         if rows:
@@ -3734,12 +3979,14 @@ def main():
             )
 
         rows = []
-        for m, seq_len, page_size, rotate in itertools.product(
-            decode_m, args.seq, args.page_size, args.rotate
+        for m, seq_len, page_size, rotate, cache_layout in itertools.product(
+            decode_m, args.seq, args.page_size, args.rotate, args.cache_layout
         ):
             if _skip_m_past_seq(m, seq_len, "family A K2 decode"):
                 continue
-            row = bench_qsa_family_a_k2(m, seq_len, page_size, dtype, rotate)
+            row = bench_qsa_family_a_k2(
+                m, seq_len, page_size, dtype, rotate, cache_layout
+            )
             _raise_if_k2_above_tolerance(row["flydsl_k2 err"], m, seq_len)
             rows.append(row)
         if rows:
@@ -3750,8 +3997,20 @@ def main():
             )
 
         rows = []
-        for m, seq_len, page_size, rotate, pad_pages in itertools.product(
-            prefill_m, args.seq, args.page_size, args.rotate, args.pad_pages
+        for (
+            m,
+            seq_len,
+            page_size,
+            rotate,
+            pad_pages,
+            cache_layout,
+        ) in itertools.product(
+            prefill_m,
+            args.seq,
+            args.page_size,
+            args.rotate,
+            args.pad_pages,
+            args.cache_layout,
         ):
             if _skip_m_past_seq(m, seq_len, "family A K1 prefill"):
                 continue
@@ -3763,7 +4022,15 @@ def main():
                 "family A K1 prefill",
             ):
                 continue
-            row = bench_qsa_family_a_k1(m, seq_len, page_size, dtype, rotate, pad_pages)
+            row = bench_qsa_family_a_k1(
+                m,
+                seq_len,
+                page_size,
+                dtype,
+                rotate,
+                pad_pages,
+                cache_layout,
+            )
             _raise_if_k1_mismatch(row["flydsl_k1 err"], m, seq_len)
             rows.append(row)
         if rows:
@@ -3774,12 +4041,14 @@ def main():
             )
 
         rows = []
-        for m, seq_len, page_size, rotate in itertools.product(
-            prefill_m, args.seq, args.page_size, args.rotate
+        for m, seq_len, page_size, rotate, cache_layout in itertools.product(
+            prefill_m, args.seq, args.page_size, args.rotate, args.cache_layout
         ):
             if _skip_m_past_seq(m, seq_len, "family A K2 prefill"):
                 continue
-            row = bench_qsa_family_a_k2(m, seq_len, page_size, dtype, rotate)
+            row = bench_qsa_family_a_k2(
+                m, seq_len, page_size, dtype, rotate, cache_layout
+            )
             _raise_if_k2_above_tolerance(row["flydsl_k2 err"], m, seq_len)
             rows.append(row)
         if rows:
@@ -3790,12 +4059,20 @@ def main():
             )
 
         rows = []
-        for m, seq_len, page_size, rotate, pad_pages in itertools.product(
+        for (
+            m,
+            seq_len,
+            page_size,
+            rotate,
+            pad_pages,
+            cache_layout,
+        ) in itertools.product(
             args.batch,
             [s for s in args.seq if s // FAMILY_B_INDEXER.compress_ratio <= 512],
             args.page_size,
             args.rotate,
             args.pad_pages,
+            args.cache_layout,
         ):
             if _skip_m_past_seq(m, seq_len, "family B K1 H=4"):
                 continue
@@ -3808,7 +4085,7 @@ def main():
             ):
                 continue
             row = bench_qsa_family_b_k1(
-                m, seq_len, page_size, dtype, 4, rotate, pad_pages
+                m, seq_len, page_size, dtype, 4, rotate, pad_pages, cache_layout
             )
             _raise_if_k1_mismatch(row["flydsl_k1 err"], m, seq_len)
             rows.append(row)
@@ -3820,12 +4097,20 @@ def main():
             )
 
         rows = []
-        for m, seq_len, page_size, rotate, pad_pages in itertools.product(
+        for (
+            m,
+            seq_len,
+            page_size,
+            rotate,
+            pad_pages,
+            cache_layout,
+        ) in itertools.product(
             args.batch,
             [s for s in args.seq if s // FAMILY_B_INDEXER_H8.compress_ratio <= 512],
             args.page_size,
             args.rotate,
             args.pad_pages,
+            args.cache_layout,
         ):
             if _skip_m_past_seq(m, seq_len, "family B K1 H=8"):
                 continue
@@ -3838,7 +4123,7 @@ def main():
             ):
                 continue
             row = bench_qsa_family_b_k1(
-                m, seq_len, page_size, dtype, 8, rotate, pad_pages
+                m, seq_len, page_size, dtype, 8, rotate, pad_pages, cache_layout
             )
             _raise_if_k1_mismatch(row["flydsl_k1 err"], m, seq_len)
             rows.append(row)
@@ -3851,7 +4136,9 @@ def main():
 
         # Published indexer point: M=32, H=4, page_size=8, n_blocks=512.
         rows = []
-        for rotate, pad_pages in itertools.product(args.rotate, args.pad_pages):
+        for rotate, pad_pages, cache_layout in itertools.product(
+            args.rotate, args.pad_pages, args.cache_layout
+        ):
             if _skip_pad_narrower_than_context(
                 2048,
                 8,
@@ -3860,7 +4147,9 @@ def main():
                 "family B K1 published",
             ):
                 continue
-            row = bench_qsa_family_b_k1(32, 2048, 8, dtype, 4, rotate, pad_pages)
+            row = bench_qsa_family_b_k1(
+                32, 2048, 8, dtype, 4, rotate, pad_pages, cache_layout
+            )
             _raise_if_k1_mismatch(row["flydsl_k1 err"], 32, 2048)
             rows.append(row)
         if rows:
@@ -3871,13 +4160,22 @@ def main():
             )
 
         rows = []
-        for m, seq_len, page_size, index_heads, rotate, pad_pages in itertools.product(
+        for (
+            m,
+            seq_len,
+            page_size,
+            index_heads,
+            rotate,
+            pad_pages,
+            cache_layout,
+        ) in itertools.product(
             args.batch,
             [s for s in args.seq if s // FAMILY_B_INDEXER.compress_ratio > 512],
             args.page_size,
             (4, 8),
             args.rotate,
             args.pad_pages,
+            args.cache_layout,
         ):
             if _skip_m_past_seq(m, seq_len, "family B K1 long-L"):
                 continue
@@ -3890,7 +4188,14 @@ def main():
             ):
                 continue
             row = bench_qsa_family_b_k1(
-                m, seq_len, page_size, dtype, index_heads, rotate, pad_pages
+                m,
+                seq_len,
+                page_size,
+                dtype,
+                index_heads,
+                rotate,
+                pad_pages,
+                cache_layout,
             )
             _raise_if_k1_mismatch(row["flydsl_k1 err"], m, seq_len)
             rows.append(row)
@@ -3902,12 +4207,16 @@ def main():
             )
 
         rows = []
-        for m, seq_len, page_size, rotate in itertools.product(
-            args.batch, args.seq, args.page_size, args.rotate
+        for m, seq_len, page_size, rotate, cache_layout in itertools.product(
+            args.batch, args.seq, args.page_size, args.rotate, args.cache_layout
         ):
             if m > seq_len:
                 continue
-            rows.append(bench_qsa_family_a_e2e(m, seq_len, page_size, dtype, rotate))
+            rows.append(
+                bench_qsa_family_a_e2e(
+                    m, seq_len, page_size, dtype, rotate, cache_layout
+                )
+            )
         if rows:
             df = pd.DataFrame(rows)
             aiter.logger.info(
@@ -3916,12 +4225,17 @@ def main():
             )
 
         rows = []
-        for m, seq_len, page_size in itertools.product(
-            [b for b in args.batch if b <= 8], args.seq, args.page_size
+        for m, seq_len, page_size, cache_layout in itertools.product(
+            [b for b in args.batch if b <= 8],
+            args.seq,
+            args.page_size,
+            args.cache_layout,
         ):
             if m > seq_len:
                 continue
-            rows.append(bench_qsa_family_a_e2e_graph(m, seq_len, page_size, dtype))
+            rows.append(
+                bench_qsa_family_a_e2e_graph(m, seq_len, page_size, dtype, cache_layout)
+            )
         if rows:
             df = pd.DataFrame(rows)
             aiter.logger.info(
@@ -3930,14 +4244,32 @@ def main():
             )
 
         rows = []
-        for m, seq_len, page_size, index_heads, rotate in itertools.product(
-            args.batch, args.seq, args.page_size, (4, 8), args.rotate
+        for (
+            m,
+            seq_len,
+            page_size,
+            index_heads,
+            rotate,
+            cache_layout,
+        ) in itertools.product(
+            args.batch,
+            args.seq,
+            args.page_size,
+            (4, 8),
+            args.rotate,
+            args.cache_layout,
         ):
             if m > seq_len:
                 continue
             rows.append(
                 bench_qsa_family_b_e2e(
-                    m, seq_len, page_size, dtype, index_heads, rotate
+                    m,
+                    seq_len,
+                    page_size,
+                    dtype,
+                    index_heads,
+                    rotate,
+                    cache_layout,
                 )
             )
         if rows:
