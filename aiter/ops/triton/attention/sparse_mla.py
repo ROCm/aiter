@@ -204,13 +204,11 @@ def _async_launch_config(
         and uni_tile
         and not has_invalid
         and not has_extra
+        # The async tiles below are sized for gfx950's LDS.
+        and arch_info.get_arch() != "gfx942"
     )
     workgroups = num_queries * heads_blocks * max(1, num_splits)
     num_sms = get_num_sms()
-    # The tiles below are sized for gfx950's LDS; block_k already fits gfx942's.
-    if arch_info.get_arch() == "gfx942":
-        waves_per_eu = 1 if (use_buffer_load and workgroups <= num_sms) else 2
-        return False, block_k, waves_per_eu
     if enabled and workgroups >= 4 * num_sms:
         return True, 64, 4
     waves_per_eu = 2
