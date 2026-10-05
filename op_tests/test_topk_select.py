@@ -515,6 +515,13 @@ def main():
         default=["none"],
         choices=["none", "low", "high"],
     )
+    parser.add_argument(
+        "--include-large",
+        action="store_true",
+        help="also run fp32 shapes of 4 GiB or more (m * n * 4 >= 2**32),\n"
+        "which the sweep skips by default; each such shape is timed on\n"
+        "every backend that serves it, like any other shape",
+    )
     args = parser.parse_args()
 
     bad = test_lds_sizing()
@@ -548,7 +555,7 @@ def main():
     for tie in args.tie:
         df = []
         for m, n, k in itertools.product(args.rows, args.width, args.topk):
-            if k > n or m * n * 4 >= 2**32:
+            if k > n or (m * n * 4 >= 2**32 and not args.include_large):
                 continue
             df.append(test_topk_select(m, n, k, None if tie == "none" else tie, False))
         df = pd.DataFrame(df)
