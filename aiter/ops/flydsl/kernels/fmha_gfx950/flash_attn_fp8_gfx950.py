@@ -70,7 +70,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
     if paged and int(num_kv_splits) > 1:
         raise NotImplementedError("paged split-K is not supported")
     if out_dtype == "f16" and int(num_kv_splits) > 1:
-        # The split-K combine still packs and decodes bf16 partials.
+        # The split-K combine packs and decodes bf16 partials.
         raise NotImplementedError("f16 output with split-K is not built yet")
 
     if num_kv_heads is None:
@@ -816,9 +816,8 @@ def build_flash_attn_dualwave_swp_fp8_module(
             raise ValueError(
                 "num_kv_splits > 1 requires a fp32 workspace (see dualwave_splitk_workspace_elems)"
             )
-        # O is bf16 and would be corrupted by the fp32 LSE stores. lse_stride_h
-        # sizes the LSE buffer descriptor, so leaving it at 0 gives num_records=0
-        # and the hardware silently drops every LSE store.
+        # O contains 16-bit output, not fp32 LSE. A nonzero lse_stride_h is required
+        # to bound the LSE descriptor.
         if RETURN_LSE and (lse is None or not lse_stride_h):
             raise ValueError(
                 "return_lse=True requires a fp32 lse tensor and a non-zero "

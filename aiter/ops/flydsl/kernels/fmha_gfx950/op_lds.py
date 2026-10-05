@@ -58,8 +58,8 @@ class DualwaveFp8PageIdLoader(DualwaveFp8KernelContext):
             for pas in range_constexpr(traits.PAGED_BT_LDS_SIZE // traits.BLOCK_SIZE):
                 local_tile = self.tid + pas * traits.BLOCK_SIZE
                 if local_tile < staged_tiles:
-                    # Typed LDS stores change the address materialization across
-                    # these guards; retain the byte pointer's original schedule.
+                    # Keep byte-addressed stores to preserve LDS address materialization
+                    # across the nested guards.
                     dst = buffer_ops.get_element_ptr(
                         self.lds_bt_base_ptr,
                         byte_offset=_raw(fx.Int32(local_tile * 4)),

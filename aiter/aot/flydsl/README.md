@@ -12,7 +12,7 @@ the JIT path hits the cache instead of compiling again.
 | `conv.py` | `CONV` | conv3d implicit-GEMM kernels, plus the NCDHW->NDHWC pre-transpose each NCDHW caller reaches first |
 | `grouped_moe.py` | `GROUPED_MOE` | gfx1250 grouped MoE GEMM kernels |
 | `chunk_gdn_h.py` | `CHUNK_GDN_H` | chunk-gdn-h opt (K5) kernels |
-| `unified_attention.py` | `UNIFIED_ATTENTION` | gfx950 fp8 unified-attention kernels (no CSV; fixed prefill/decode cross-product) |
+| `unified_attention.py` | `UNIFIED_ATTENTION` | gfx950 fp8 unified-attention prefill kernels (no CSV; fixed specialization list) |
 | `mega_moe.py` | `MEGA_MOE` | MegaMoE A8W4 profile bundles for MTPR 8192/16384/32768 |
 | `fmha_fp8.py` | `FMHA_FP8` | gfx950 FP8 flash-attention forward, per head shape in `DEFAULT_SHAPES` |
 | `common.py` | — | Shared job collection, the deadlock-free fork pool, and cache-hit checking logic |

@@ -10,16 +10,17 @@ back to the Triton wrapper (Gluon on gfx950).
 
 from __future__ import annotations
 
-import importlib.util
 import os
-from functools import cache, lru_cache
+from functools import lru_cache
 
 import torch
+from flydsl.utils.env import runtime as _flydsl_runtime
 
 from .kernels.flash_attn_func_fp8_gfx950 import (
     _FP8_MAX_FLAT_ELEMS,
     _fp8_auto_block_m,
     _fp8_rescale_threshold,
+    _gpu_arch_cached,
     _is_valid_softmax_scale,
     _num_cu,
 )
@@ -30,19 +31,9 @@ from .kernels.fmha_gfx950.flash_attn_fp8_gfx950 import (
 __all__ = ["flydsl_unified_attention"]
 
 
-@lru_cache(maxsize=1)
-def _is_flydsl_installed() -> bool:
-    return importlib.util.find_spec("flydsl") is not None
-
-
-@cache
 def is_flydsl_available(device_index: int) -> bool:
-    if not _is_flydsl_installed():
-        return False
-    with torch.cuda.device(device_index):
-        props = torch.cuda.get_device_properties(device_index)
-    arch = props.gcnArchName.split(":", 1)[0]
-    return arch == "gfx950"
+    # The adapter's import boundary already handles an absent FlyDSL package.
+    return _gpu_arch_cached(device_index) == "gfx950"
 
 
 # Page size is structural, not a builder parameter: the paged path addresses KV
@@ -232,6 +223,9 @@ def _shapes_ok(
     num_kv_heads,
     num_seqs,
     shuffled_kv_cache,
+    q_descale,
+    k_descale,
+    v_descale,
 ) -> bool:
     """Exact shapes and devices the launcher addresses from Q alone.
 
@@ -239,13 +233,17 @@ def _shapes_ok(
     head counts, so a smaller O or V (e.g. a column slice) must decline before
     any reshape can silently copy it.
     """
-    if q.dim() != 3 or out.shape != q.shape or num_kv_heads <= 0:
+    if out.shape != q.shape:
         return False
     # Q/O are flattened and the C-ABI packs the dynamic dim as signed i32.
     if q.numel() >= _FP8_MAX_FLAT_ELEMS:
         return False
     if block_table.dim() != 2 or block_table.shape[0] < num_seqs:
         return False
+    # Metadata is read as flat int32 vectors; the tensor adaptor needs a stride-1 axis.
+    for meta in (seqused_k, cu_seqlens_q):
+        if meta.dim() != 1 or meta.stride(0) != 1:
+            return False
     if seqused_k.numel() != num_seqs or cu_seqlens_q.numel() != num_seqs + 1:
         return False
     if k.shape != v.shape and not shuffled_kv_cache:
@@ -256,7 +254,18 @@ def _shapes_ok(
         return False
     # The shuffled K/V shapes are checked exactly in _kv_strides_ok_5d.
     return all(
-        t.device == q.device for t in (out, k, v, block_table, cu_seqlens_q, seqused_k)
+        t.device == q.device
+        for t in (
+            out,
+            k,
+            v,
+            block_table,
+            cu_seqlens_q,
+            seqused_k,
+            q_descale,
+            k_descale,
+            v_descale,
+        )
     )
 
 
@@ -372,15 +381,9 @@ def _as_1d_descale(d):
     return d
 
 
-def _geometry_ok(
-    head_size, num_query_heads, num_kv_heads, cu_seqlens_q, num_seqs
-) -> bool:
-    """Fixed head dim, integral GQA, and cu_seqlens covering every sequence."""
-    return (
-        head_size == _HEAD_DIM
-        and num_query_heads % num_kv_heads == 0
-        and cu_seqlens_q.numel() == num_seqs + 1
-    )
+def _geometry_ok(head_size, num_query_heads, num_kv_heads) -> bool:
+    """Fixed head dim and integral GQA (cu_seqlens length is owned by _shapes_ok)."""
+    return head_size == _HEAD_DIM and num_query_heads % num_kv_heads == 0
 
 
 def _no_unsupported_features(
@@ -428,15 +431,17 @@ def _supported(
     skip_reduce,
     softmax_scale,
 ) -> bool:
-    """Whether this exact configuration can be served. Kept separate from the
-    marshalling so it can be unit-tested against meta tensors, with no GPU.
-    Causal and non-causal are both built, so this gate does not branch on it."""
+    """Return whether the configuration satisfies the FlyDSL device, dtype, feature,
+    and layout requirements."""
     if not is_flydsl_available(q.device.index):
         return False
     # FMHA softmax masks in the unscaled domain; scale <= 0 or non-finite breaks it.
     if softmax_scale is None or not _is_valid_softmax_scale(softmax_scale):
         return False
 
+    # Rank and positivity first: later checks index q.shape and take modulo.
+    if q.dim() != 3 or num_kv_heads <= 0:
+        return False
     head_size = q.shape[-1]
     num_query_heads = q.shape[1]
 
@@ -445,13 +450,7 @@ def _supported(
         and _page_geometry_ok(block_size, max_seqlen_k)
         and _dtypes_ok(q, k, v, out, cu_seqlens_q, seqused_k, block_table)
         and _descales_ok(q_descale, k_descale, v_descale)
-        and _geometry_ok(
-            head_size,
-            num_query_heads,
-            num_kv_heads,
-            cu_seqlens_q,
-            num_seqs,
-        )
+        and _geometry_ok(head_size, num_query_heads, num_kv_heads)
         and _no_unsupported_features(
             softcap, alibi_slopes, qq_bias, q_scales, output_scale
         )
@@ -467,6 +466,9 @@ def _supported(
             num_kv_heads,
             num_seqs,
             shuffled_kv_cache,
+            q_descale,
+            k_descale,
+            v_descale,
         )
         and _strides_ok(
             q,
@@ -532,6 +534,8 @@ def flydsl_unified_attention(
     k_descale = _as_1d_descale(k_descale)
     v_descale = _as_1d_descale(v_descale)
 
+    # vLLM may pad the table with extra rows; launchers take exactly num_seqs rows.
+    # A short table is declined by _supported, so slice only after it passes.
     if not _supported(
         q,
         k,
@@ -559,16 +563,12 @@ def flydsl_unified_attention(
         softmax_scale,
     ):
         return None
+    block_table = block_table[:num_seqs]
 
     if max_seqlen_q == 1:
         # Decode kernels are not AOT-compiled; decline so run-only deployments
         # fall back.
-        if os.environ.get("FLYDSL_RUNTIME_RUN_ONLY", "").lower() in (
-            "1",
-            "true",
-            "yes",
-            "on",
-        ):
+        if _flydsl_runtime.run_only:
             return None
         if _pa_decode_ok(max_seqlen_q, shuffled_kv_cache, out, num_seqs):
             return _route_pa_decode(
@@ -627,7 +627,7 @@ def flydsl_unified_attention(
             packed_bn64=packed_bn64,
         )
         q_flat, out_flat = _as_i8(q).reshape(-1), out.reshape(-1)
-        # _supported guarantees views; a copy would write the caller's out blindly.
+        # A reshape copy would leave the caller's output buffer unchanged.
         assert q_flat.data_ptr() == q.data_ptr()
         assert out_flat.data_ptr() == out.data_ptr()
         kernel(

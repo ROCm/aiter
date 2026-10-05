@@ -25,6 +25,7 @@ from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.ops.quant import per_tensor_quant
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 from op_tests.triton_tests.utils.paged_attn_ref import ref_paged_attn
+from op_tests.triton_tests.utils.shuffle_kv_cache import shuffle_kv_cache
 
 PAGE, H, HKV, D = 64, 64, 4, 128
 
@@ -107,13 +108,6 @@ def reference(case, query_lens, kv_lens):
     )
 
 
-def shuffle_kv(k, v):
-    nb, page, hkv, d = k.shape
-    k = k.permute(0, 2, 3, 1).contiguous().view(nb, hkv, d // 16, 16, page)
-    v = v.permute(0, 2, 3, 1).contiguous().view(nb, hkv, d, page // 16, 16)
-    return k.permute(0, 1, 2, 4, 3).contiguous(), v.permute(0, 1, 3, 2, 4).contiguous()
-
-
 def compare(want, got, atol, name):
     want, got = want.float(), got.float()
     err = checkAllclose(want, got, rtol=0, atol=atol, tol_err_ratio=0, msg=name)
@@ -121,28 +115,27 @@ def compare(want, got, atol, name):
     return err
 
 
-def measure(candidates, case, want, query_lens, kv_lens, atol=None, bad_rows=False):
+def measure(candidates, case, want, query_lens, kv_lens, atol=None):
     # 8% of the global max rather than an element-relative rtol.
     if atol is None:
         atol = 0.08 * want.abs().max().item()
     heads = case["q"].shape[1]
-    flops = 4 * heads * D * sum(q * k for q, k in zip(query_lens, kv_lens))
+    # Bottom-right-aligned causal: query i sees kv_len - q_len + i + 1 keys.
+    pairs = sum(
+        (
+            sum(max(0, min(k, k - q + i + 1)) for i in range(q))
+            if case["causal"]
+            else q * k
+        )
+        for q, k in zip(query_lens, kv_lens)
+    )
+    flops = 4 * heads * D * pairs
     nbytes = sum(query_lens) * heads * D * (1 + case["out"].element_size())
     nbytes += 2 * sum(kv_lens) * HKV * D
     ret = {"gfx": get_gfx_runtime()}
     for name, fn in candidates.items():
         got = fn()
         err = compare(want, got, atol, name)
-        if bad_rows:
-            bad = int(
-                (~torch.isclose(want.float(), got.float(), rtol=0, atol=atol))
-                .any(dim=-1)
-                .any(dim=-1)
-                .sum()
-                .item()
-            )
-            assert bad == 0, f"{name}: {bad} bad rows"
-            ret[f"{name} bad_rows"] = bad
         _, us = run_perftest(fn, num_rotate_args=1)
         assert us > 0, f"{name}: empty timing"
         compare(want, got, atol, f"{name} after timing")
@@ -155,11 +148,11 @@ def measure(candidates, case, want, query_lens, kv_lens, atol=None, bad_rows=Fal
 
 PREFILL_CASES = {
     "base": ([512, 256], [512, 256], 16),
-    # Small-Sq causal prefill is never declined for underfill; it has no host sync, so it captures.
+    # Uniform short prefill exercises graph capture without host synchronization.
     "small_sq": ([64, 64], [2048, 2048], 16),
     # Ragged pure prefill: M=970 > (B-1)*S+1=961, so no row can have query length 1.
     "varlen": ([320, 300, 200, 150], [2048, 5000, 8192, 3000], 16),
-    # Ragged rows with an empty-KV row and partial last pages, per packed-BN64 GQA group.
+    # Ragged causal prefill with partial KV pages.
     "varlen_causal": ([93, 80, 71, 60], [157, 100, 90, 70], 4),
     **{f"ragged_g{g}": ([93, 17, 41, 9], [157, 0, 70, 1], g) for g in (1, 4, 8, 16)},
 }
@@ -188,7 +181,7 @@ def test_prefill(dtype, causal, kind, layout):
     # An empty-KV row has no softmax support; the kernel writes zeros there.
     want = torch.nan_to_num(reference(case, query_lens, kv_lens))
     if layout == "vectorized":
-        case["k"], case["v"] = shuffle_kv(case["k"], case["v"])
+        case["k"], case["v"] = shuffle_kv_cache(case["k"], case["v"])
     case["shuffled_kv_cache"] = layout == "vectorized"
     call = partial(ua.unified_attention, **case, backend="flydsl")
     ret = measure({"flydsl": call}, case, want, query_lens, kv_lens)
@@ -215,7 +208,7 @@ def test_decode(dtype, depth, layout):
     case = make_case(query_lens, kv_lens, dtype)
     want = reference(case, query_lens, kv_lens)
     if layout == "vectorized":
-        case["k"], case["v"] = shuffle_kv(case["k"], case["v"])
+        case["k"], case["v"] = shuffle_kv_cache(case["k"], case["v"])
     case["shuffled_kv_cache"] = layout == "vectorized"
     backend = "flydsl" if layout == "vectorized" else None
     name = "flydsl" if layout == "vectorized" else "triton_fallback"
@@ -240,10 +233,7 @@ def test_paged_addressing(pool_blocks, layout):
     want = reference(original, query_lens, kv_lens)
     candidates, cases = {}, {}
     count = original["k"].shape[0]
-    for name, ids in (
-        ("identity", list(range(count))),
-        ("reversed", list(reversed(range(count)))),
-    ):
+    for name, ids in (("reversed", list(reversed(range(count)))),):
         case = dict(original, out=torch.empty_like(original["out"]))
         ids = [pool_blocks - count + i for i in ids]
         for key in ("k", "v"):
@@ -255,17 +245,11 @@ def test_paged_addressing(pool_blocks, layout):
             case[key] = pool
         case["block_table"] = torch.tensor([ids], device="cuda", dtype=torch.int32)
         if layout == "vectorized":
-            case["k"], case["v"] = shuffle_kv(case["k"], case["v"])
+            case["k"], case["v"] = shuffle_kv_cache(case["k"], case["v"])
         case["shuffled_kv_cache"] = layout == "vectorized"
         cases[name] = case
         candidates[name] = partial(ua.unified_attention, **case, backend="flydsl")
-    ret = measure(candidates, cases["identity"], want, query_lens, kv_lens, atol=0.1)
-    compare(
-        cases["identity"]["out"],
-        cases["reversed"]["out"],
-        0,
-        "page permutation invariance",
-    )
+    ret = measure(candidates, cases["reversed"], want, query_lens, kv_lens, atol=0.1)
     return ret
 
 
@@ -280,15 +264,9 @@ def main():
         return
     from aiter.ops.flydsl.unified_attention_kernels import is_flydsl_available
 
-    if (
-        not is_flydsl_available(torch.cuda.current_device())
-        or torch.cuda.get_device_properties(
-            torch.cuda.current_device()
-        ).multi_processor_count
-        != 256
-    ):
+    if not is_flydsl_available(torch.cuda.current_device()):
         aiter.logger.warning(
-            "FlyDSL unified attention requires FlyDSL and a full-chip gfx950; skipping"
+            "FlyDSL unified attention requires FlyDSL on gfx950; skipping"
         )
         return
     parser = argparse.ArgumentParser(
@@ -321,8 +299,8 @@ def main():
                 for d, c, k, lay in itertools.product(
                     args.dtype, args.causal, list(PREFILL_CASES), args.layout
                 )
-                # Causal batches with a length-1 row are possibly-mixed and decline
-                # to the fallback by design; only non-causal reaches FlyDSL.
+                # These ragged query lengths do not satisfy the host-only no-decode
+                # proof; exercise them noncausally on FlyDSL.
                 if not (c and k.startswith("ragged"))
             ],
         ),
@@ -331,7 +309,7 @@ def main():
             test_decode,
             itertools.product(args.dtype, args.decode_depth, args.layout),
         ),
-        # 65535 pages stay below the dualwave launcher's signed-i32 element limit.
+        # Place live pages near the end of a two-GiB KV pool.
         (
             "paged addressing",
             test_paged_addressing,

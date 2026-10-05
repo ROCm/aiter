@@ -1,5 +1,6 @@
-# SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modifications Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """Import-safe paged-attention torch oracle shared by the unified-attention tests."""
 
@@ -7,27 +8,27 @@ import torch
 
 
 def ref_paged_attn(
-    query,
-    key_cache,
-    value_cache,
-    query_lens,
-    kv_lens,
-    block_tables,
-    scale,
-    out_dtype=torch.float32,
-    sliding_window=None,
-    soft_cap=None,
-    sinks=None,
-    q_descale=None,
-    k_descale=None,
-    v_descale=None,
-    output_scale=None,
-    causal=1,
-):
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    query_lens: list[int],
+    kv_lens: list[int],
+    block_tables: torch.Tensor,
+    scale: float,
+    out_dtype: torch.dtype = torch.float32,
+    sliding_window: int | None = None,
+    soft_cap: float | None = None,
+    sinks: torch.Tensor | None = None,
+    q_descale: torch.Tensor | None = None,
+    k_descale: torch.Tensor | None = None,
+    v_descale: torch.Tensor | None = None,
+    output_scale: torch.Tensor | None = None,
+    causal: int = 1,
+) -> torch.Tensor:
     num_seqs = len(query_lens)
     block_tables = block_tables.cpu().numpy()
     _, block_size, num_kv_heads, head_size = key_cache.shape
-    outputs = []
+    outputs: list[torch.Tensor] = []
     start_idx = 0
     query = query.to(torch.float32)
     key_cache = key_cache.to(torch.float32)
@@ -42,7 +43,7 @@ def ref_paged_attn(
         query_len = query_lens[i]
         kv_len = kv_lens[i]
         q = query[start_idx : start_idx + query_len]
-        q *= scale
+        q = q * scale
         num_kv_blocks = (kv_len + block_size - 1) // block_size
         block_indices = block_tables[i, :num_kv_blocks]
         k = key_cache[block_indices].view(-1, num_kv_heads, head_size)[:kv_len]

@@ -218,9 +218,8 @@ def compile_one_config(**job) -> dict:
         elapsed = time.time() - t0
         return {**job, "compile_time": elapsed, "compile_arch": aot_arch}
     except Exception as e:  # noqa: BLE001
-        # Return cleanly (compile_time=None) so the AOT pool marks it "produced no
-        # kernel" and does NOT retry -- an escaping exception crashes the worker
-        # (exitcode != 0), which the pool misreads as transient -> deadlock.
+        # Return compile_time=None so deterministic compile failures are reported
+        # without abnormal-worker retries.
         print(f"  [FAIL] compile  {shape_str}  arch={aot_arch}: {e}")
         traceback.print_exc()
         return {**job, "compile_time": None, "compile_arch": aot_arch}

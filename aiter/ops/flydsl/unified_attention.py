@@ -37,7 +37,7 @@ def unified_attention_flydsl(
     except ModuleNotFoundError as e:
         # Only an absent FlyDSL package means "no backend"; a broken internal
         # import must surface with its own traceback.
-        if e.name is not None and e.name.split(".")[0] == "flydsl":
+        if e.name == "flydsl":
             return None
         raise
 

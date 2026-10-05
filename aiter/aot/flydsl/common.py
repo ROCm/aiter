@@ -135,11 +135,8 @@ def override_env(var_name: str, value: str | None) -> Iterator[None]:
 
 
 def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
-    """Load DEFAULT_CSVS + parse_csv for the named kind and return its
-    job list. Note: importing .gemm / .moe / .chunk_gdn_h here also
-    runs their module-level imports, which pull in FlyDSL (e.g.
-    ``flydsl.expr``). Job collection is therefore not free in the
-    parent process, just shifted once out of every child."""
+    """Collect fixed jobs or parse the configured CSVs for the selected family.
+    Family imports may load FlyDSL in the parent process."""
     if kind is OpKind.MEGA_MOE:
         from .mega_moe import default_jobs
 

@@ -28,8 +28,7 @@ _P_HEADROOM_LOG2 = 8.807354922057604
 LDS_BYTES_GFX950 = 160 * 1024
 
 
-# The dual-wave 8-wave CTA fixes the q-block height; callers need it to count
-# q-blocks before any traits object exists.
+# Default q-block height for the eight-wave configuration.
 DUALWAVE_SWP_BLOCK_M = 256
 
 
@@ -178,8 +177,8 @@ def _scale_sub_score_pair(v_s, row_max_raw, scale, zero_f, fm_fast, bias=None):
     Returns ``scale * (v_s - row_max_raw) + bias`` per element via a single FMA
     (``fma(s, scale, bias - scale*row_max_raw)``), so the fp8 QK MMA can emit raw
     (un-scaled) logits and reduce_max can run in the raw domain (scale > 0 is
-    order-preserving). Replaces the separate post-QK scale multiply + subtract.
-    ``-inf`` masked lanes stay ``-inf`` (scale > 0), matching the un-fused path.
+    order-preserving). Positive scaling preserves score order and keeps masked
+    ``-inf`` lanes at ``-inf``.
 
     ``bias`` lands in the FMA's addend, so a caller needing ``exp2`` to produce
     ``2**bias * P`` pays nothing -- see ``DualwaveFp8SoftmaxHelper.sub_m``.
@@ -405,7 +404,6 @@ class DualwaveSwpFp8Traits:
     ELEM_BYTES: int
     OUT_ELEM_BYTES: int
     VEC_KV: int
-    LANE_SPLIT_KV: int
     SMEM_K_TILE_ELEMS: int
     NUM_PREFETCH_K: int
     DUALWAVE_SWP_KV_PER_BUFFER: int
@@ -430,9 +428,8 @@ class DualwaveSwpFp8Traits:
     def cache_tag(self):
         """The independent builder arguments, and nothing derived from them.
 
-        Every other trait is a pure function of these (verified by enumerating the
-        whole argument grid and checking this tuple stays injective), so adding one
-        cannot separate two builds that would otherwise share a binary.
+        Derived traits must remain functions of this key so distinct binaries cannot
+        share a cache entry.
         """
         base = (
             "fp8_e4m3_dualwave_swp",
@@ -572,11 +569,10 @@ def _make_dualwave_swp_fp8_traits(
     default_stride_v_n = num_kv_heads * head_dim_v
     default_stride_o_n = num_heads * head_dim_v
 
-    # fp8: Q/K/V are 1B; O is bf16 (2B). ELEM_BYTES=1 drives the fp8 address math.
+    # Q/K/V use one-byte fp8 elements; bf16/f16 output uses two-byte elements.
     elem_bytes = 1
     out_elem_bytes = 2
     vec_kv = 16 // elem_bytes
-    lane_split_kv = 8
     smem_k_pad = 16 // elem_bytes
 
     # Eight padded stripes avoid the BN64 wide K reader's two-way bank conflicts.
@@ -668,7 +664,6 @@ def _make_dualwave_swp_fp8_traits(
         ELEM_BYTES=elem_bytes,
         OUT_ELEM_BYTES=out_elem_bytes,
         VEC_KV=vec_kv,
-        LANE_SPLIT_KV=lane_split_kv,
         SMEM_K_TILE_ELEMS=smem_k_tile_elems,
         NUM_PREFETCH_K=num_prefetch_k,
         DUALWAVE_SWP_KV_PER_BUFFER=dualwave_swp_kv_per_buffer,
@@ -784,9 +779,8 @@ def _init_dualwave_q_row(ctx):
 class DualwaveFp8KernelContext:
     """Shared per-kernel state for the gfx950 dualwave fp8 attention helpers.
 
-    Raw fp8 Q/K/V
-    (i8 buffer views), per-tensor Q/K/V descale scalars applied to the fp32 logits,
-    and a bf16 ``vt`` LDS scratch for HIPREC PV."""
+    Byte-addressed Q/K/V, Q/K descales for logits, a V descale for output, and LDS
+    staging."""
 
     def __init__(
         self,
@@ -900,12 +894,8 @@ class DualwaveFp8KernelContext:
         _init_dualwave_thread_mapping(self)
 
     def init_dma_thread_offsets(self):
-        # Emitted after descriptors/atoms (matching the original schedule) so the
-        # d_bucket ``v_and`` lands at the same ISA position.
         traits = self.traits
         self.lane_in_warp = self.tid % traits.WARP_SIZE
-        self.n_in_warp = self.lane_in_warp // traits.LANE_SPLIT_KV
-        self.d_bucket = self.lane_in_warp % traits.LANE_SPLIT_KV
 
     def init_sequence_lengths(self):
         traits = self.traits
@@ -1009,7 +999,6 @@ class DualwaveFp8KernelContext:
                 fx.rocdl.make_buffer_tensor(self.BlockTable), fx.make_layout(1, 1)
             )
             self.bt_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
-            self.bt_v1i32 = Vec.make_type(1, fx.Int32)
         else:
             self.k_div = _make_buf_div(self.K, kv_nrec_bytes)
             self.v_div = _make_buf_div(self.V, v_nrec_bytes)
