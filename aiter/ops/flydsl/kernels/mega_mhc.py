@@ -50,6 +50,14 @@ trip. 160 KB of x1 does not fit in the 160 KB of LDS next to the 51 KB the kerne
 already uses, so n is at most 13 at H = 5120 with 8 warps (the policy uses 12: whole
 k-steps keep the staged remainder on 128 B lines).
 
+fn load order (``FN_EARLY`` = e, default 4 = all). In the k-loop the first e streams of
+chunk 0's fn B operands are issued before the next k-step's R/y prefetch; the other
+streams (and chunk 1) are loaded just before their MFMAs. Fewer early streams cut the
+live VGPRs (fp8 bm16: 233 -> 197 at e = 1) and, for FP8 only, shorten the loop when one
+workgroup per CU fills the GPU (-5% at T = 3904..4096, -4% at 2544; e = 2 gives -2.3% for
+the bm32 / 10-way split kernel at T >= 16384). bf16 is 1-5% slower with any e < 4
+(``sweep/p5_register_pressure.md``).
+
 Persistent walk (``PERSIST_WGS`` = G > 0, ``NUM_KSPLIT == 1``, column-split warps). The
 grid is capped at G workgroups and workgroup w walks the token blocks w, w + G, ...
 (static stride, no counters or scratch). With ``PERSIST_PREFETCH`` the last k-step
@@ -213,6 +221,10 @@ def check_config(H: int, cfg: dict) -> None:
             raise ValueError("PERSIST_WGS must be >= 0")
         if ws != "cols" or ks != 1:
             raise ValueError("PERSIST_WGS needs WARP_SPLIT=cols and NUM_KSPLIT=1")
+    if not 0 <= cfg.get("FN_EARLY", N_STREAMS) <= N_STREAMS:
+        raise ValueError(f"FN_EARLY must be in 0..{N_STREAMS}")
+    if cfg.get("FN_EARLY", N_STREAMS) != N_STREAMS and ws == "tokens" and w > 1:
+        raise ValueError("FN_EARLY does not apply to the LDS-shared fn path")
     nsl = cfg.get("X1_LDS_SLOTS", 0)
     if nsl:
         if ws != "cols" or ks != 1 or bm != 16:
@@ -242,6 +254,11 @@ def kernel_name(cfg: dict, has_post: bool, identity_pre: bool, out_fp8: bool) ->
         f"_pk{int(cfg['FN_PREPACKED'])}_rcp{int(cfg['SINKHORN_RCP'])}"
         f"_{mode}_{'fp8' if out_fp8 else 'bf16'}"
         + (f"_x1l{cfg['X1_LDS_SLOTS']}" if cfg.get("X1_LDS_SLOTS") else "")
+        + (
+            f"_fe{cfg['FN_EARLY']}"
+            if cfg.get("FN_EARLY", N_STREAMS) != N_STREAMS
+            else ""
+        )
         + (
             f"_pw{cfg['PERSIST_WGS']}{'p' if cfg.get('PERSIST_PREFETCH', True) else ''}"
             if cfg.get("PERSIST_WGS")
@@ -283,6 +300,7 @@ def compile_mega_mhc(
     X1_LDS_SLOTS: int = 0,
     PERSIST_WGS: int = 0,
     PERSIST_PREFETCH: bool = True,
+    FN_EARLY: int = N_STREAMS,
 ):
     """Compile the Mega-mHC kernel for one knob set; returns the ``@flyc.jit`` launcher."""
     cfg = {
@@ -299,6 +317,7 @@ def compile_mega_mhc(
         "X1_LDS_SLOTS": X1_LDS_SLOTS,
         "PERSIST_WGS": PERSIST_WGS,
         "PERSIST_PREFETCH": PERSIST_PREFETCH,
+        "FN_EARLY": FN_EARLY,
     }
     check_config(H, cfg)
     assert H % FP8_GROUP == 0 and SINKHORN_ITERS >= 1
@@ -827,10 +846,15 @@ def compile_mega_mhc(
                                     0,
                                 )
                 for c in range_constexpr(NC):
-                    if fx.const_expr(FN_LDS or c == 0):
+                    if fx.const_expr(FN_LDS):
                         ops_c = fns[
                             c * N_STREAMS * N_FN_OPS : (c + 1) * N_STREAMS * N_FN_OPS
                         ]
+                    elif fx.const_expr(c == 0):
+                        # the FN_EARLY streams loaded ahead, then the rest just in time
+                        ops_c = list(fns)
+                        for s in range_constexpr(FN_EARLY, N_STREAMS):
+                            ops_c += load_fn(iv, 0, s, never_oob)
                     else:
                         ops_c = []
                         for s in range_constexpr(N_STREAMS):
@@ -930,7 +954,9 @@ def compile_mega_mhc(
                         fn_to_lds(g, 1 - buf)
                         gpu.barrier()
                     else:
-                        fns = load_fn_all(k, never_oob, 1)
+                        fns = []
+                        for s in range_constexpr(FN_EARLY):
+                            fns += load_fn(k, 0, s, never_oob)
                         nxt = load_tile(k + 1, k + 1 == I32(NK))
                         acc, sqr, sqx = step(k, cur, fns, acc, sqr, sqx)
                     return nxt, acc, sqr, sqx

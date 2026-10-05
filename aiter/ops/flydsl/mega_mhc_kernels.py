@@ -36,6 +36,7 @@ MEGA_MHC_DEFAULTS = {
     "X1_LDS_SLOTS": 0,
     "PERSIST_WGS": 0,  # P4: >0 caps the grid; each WG walks token blocks w, w + G, ...
     "PERSIST_PREFETCH": True,  # next block's first R/y tile loads during this block's last k-step
+    "FN_EARLY": 4,  # P5: streams (of 4) of chunk 0's fn loaded ahead of the R/y prefetch
 }
 
 _TOKENS_CFG = {
@@ -80,6 +81,12 @@ def get_mega_mhc_config(
       persistent walk ``PERSIST_WGS = cu_num``: ``cu_num`` workgroups walk the blocks
       and load the next block's first tile during the last k-step (-2.3% to -3.1%).
       bf16 never walks: its 253-256 VGPR persistent kernel is 0.4-3.6% slower.
+    * fn load order (P5, ``sweep/p5_register_pressure.md``): FP8 with ``NUM_KSPLIT == 1``
+      loads only stream 0 of each k-step's first fn chunk ahead of the R/y prefetch
+      (``FN_EARLY = 1``; 233 -> 197 VGPR): -4% at T = 2544, -5% at T = 3904..4096 (one
+      full round of workgroups), neutral below T = 2304. The FP8 token-block kernel
+      (32 tokens, 10-way split, T >= 64 * cu_num) uses ``FN_EARLY = 2`` (-2.3%). bf16
+      keeps all four streams early (any other value is 1-5% slower).
     * bf16 with ``NUM_KSPLIT == 1`` and more than ~0.6 * cu_num token blocks keeps
       each warp's first ``X1_LDS_SLOTS`` 32-column chunks of x1 in LDS for the
       finish instead of staging them in HBM and re-reading them (P3,
@@ -115,12 +122,19 @@ def get_mega_mhc_config(
     if T >= tok_round and (out_fp8 or tok_fill >= 0.95):
         if out_fp8:
             cfg.update(
-                BLOCK_M=32, WARPS_PER_WG=8, NUM_KSPLIT=10, TILE_K=64, COHERENCE="xcd"
+                BLOCK_M=32,
+                WARPS_PER_WG=8,
+                NUM_KSPLIT=10,
+                TILE_K=64,
+                COHERENCE="xcd",
+                FN_EARLY=2,
             )
             try:
                 check_config(H, cfg)
             except ValueError:  # H not divisible by 10 * 8 * 64: narrower warps
-                cfg.update(BLOCK_M=16, WARPS_PER_WG=4)
+                cfg.update(
+                    BLOCK_M=16, WARPS_PER_WG=4, FN_EARLY=MEGA_MHC_DEFAULTS["FN_EARLY"]
+                )
         else:
             cfg.update(_TOKENS_CFG)
         check_config(H, cfg)
@@ -154,6 +168,8 @@ def get_mega_mhc_config(
         cfg["X1_LDS_SLOTS"] = max_x1_lds_slots(H, cfg)
     if persist:
         cfg.update(PERSIST_WGS=cu_num, PERSIST_PREFETCH=True)
+    elif ks == 1 and out_fp8:
+        cfg["FN_EARLY"] = 1  # P5: -4..-5% at T = 2544, 3904..4096
     try:
         check_config(H, cfg)
     except ValueError:
