@@ -80,7 +80,7 @@ _QUANT_JSONS = sorted(
 )
 _KEY_RE = re.compile(r"^(any|[A-Z]+_(LEQ|GEQ)_\d+(\.[A-Z]+_(LEQ|GEQ)_\d+)*)$")
 _REQUIRED = {"NUM_ITER", "BLOCK_SIZE_M", "BLOCK_SIZE_N", "NUM_WARPS"}
-_OPTIONAL = {"NUM_STAGES", "NUM_BUFFERS"}
+_OPTIONAL = {"NUM_STAGES", "NUM_BUFFERS", "waves_per_eu"}
 
 
 def _ids(paths):
@@ -97,7 +97,7 @@ def test_quant_config_table(path):
         table = json.load(f)
     assert "any" in table
     required = set(_REQUIRED)
-    if path.endswith("/mxfp4/DEFAULT.json"):
+    if "/gfx950/" in path and path.endswith("/mxfp4/DEFAULT.json"):
         required.add("NUM_STAGES")
     for key, cfg in table.items():
         assert _KEY_RE.match(key), f"bad bucket key {key!r}"

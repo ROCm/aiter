@@ -310,7 +310,6 @@ def dynamic_mxfp4_quant(
         BLOCK_SIZE_M = cfg["BLOCK_SIZE_M"]
         BLOCK_SIZE_N = cfg["BLOCK_SIZE_N"]
         NUM_WARPS = cfg["NUM_WARPS"]
-        NUM_STAGES = cfg["NUM_STAGES"]
 
         grid = (
             triton.cdiv(M, BLOCK_SIZE_M),
@@ -329,11 +328,9 @@ def dynamic_mxfp4_quant(
             N=N,
             MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
             EVEN_M_N=even_m_n,
-            SCALING_MODE=0,
             NUM_ITER=NUM_ITER,
             BLOCK_SIZE_M=BLOCK_SIZE_M,
             BLOCK_SIZE_N=BLOCK_SIZE_N,
-            NUM_STAGES=NUM_STAGES,
             num_warps=NUM_WARPS,
         )
     # The gfx950 Gluon kernel only supports bf16 (hw-cvt) and no use_sr;
@@ -563,14 +560,12 @@ def dynamic_mxfp8_quant(
         BLOCK_SIZE_M = cfg["BLOCK_SIZE_M"]
         BLOCK_SIZE_N = cfg["BLOCK_SIZE_N"]
         NUM_WARPS = cfg["NUM_WARPS"]
-        NUM_STAGES = cfg["NUM_STAGES"]
         NUM_BUFFERS = cfg["NUM_BUFFERS"]
 
         grid = (
             triton.cdiv(M, BLOCK_SIZE_M),
             triton.cdiv(K, BLOCK_SIZE_N * NUM_ITER),
         )
-        even_m_n = (M % BLOCK_SIZE_M == 0) and (K % (BLOCK_SIZE_N * NUM_ITER) == 0)
 
         gluon_dynamic_mxfp8_quant_kernel_gfx1250[grid](
             x2d,
@@ -585,11 +580,9 @@ def dynamic_mxfp8_quant(
             BLOCK_SIZE_N=BLOCK_SIZE_N,
             NUM_ITER=NUM_ITER,
             MXFP8_QUANT_BLOCK_SIZE=_MXFP8_QUANT_BLOCK_SIZE,
-            EVEN_M_N=even_m_n,
-            NUM_STAGES=NUM_STAGES,
             NUM_BUFFERS=NUM_BUFFERS,
             num_warps=NUM_WARPS,
-            waves_per_eu=4,
+            waves_per_eu=cfg["waves_per_eu"],
         )
     elif _use_gluon(
         backend,
