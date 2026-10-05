@@ -89,6 +89,8 @@ def pa_decode_sparse(
     extra_indices: torch.Tensor | None = None,
     extra_indptr: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
+    qblock_reuse: bool | None = None,
+    uniform_topk: int | None = None,
 ) -> torch.Tensor:
     """Sparse paged-decode attention with split-K + widened BLOCK_H.
 
@@ -109,6 +111,12 @@ def pa_decode_sparse(
         num_stages: software-pipeline depth of the K loop (default 2).
         out: optional ``[N, H, D]`` destination. Supplied -> written in place and
             returned, which saves the caller a full-size device copy.
+        qblock_reuse: gfx942 only. ``True`` selects FlyDSL Q-block reuse,
+            ``False`` skips the probe, ``None`` probes the first block for an
+            exact shared slot list. Ignored on other architectures.
+        uniform_topk: gfx942 only. Honored when ``kv_indptr[t] == t * topk``
+            and ``kv_indices`` has exactly ``T * topk`` entries. Any other CSR
+            stays on the generic path. Ignored on other architectures.
         skip_reduce: when the split-K path is active (``kv_splits > 1``), return
             the pre-reduce ``(acc_partial, m_partial, l_partial)`` partials
             instead of launching the reduce kernel. Has no effect when
@@ -150,43 +158,69 @@ def pa_decode_sparse(
         tuple(kv_indices.shape),
     )
 
-    # gfx950: route to the merged DSv4 sparse-MLA gluon driver. Format is inferred
-    # from the cache: 3D -> packed fp8_dsv4_mla / bf16 block cache (optional SWA+top-k
-    # two-loop via extra_*); 2D -> uniform pool (OCP fp8 + fp32 kv_scales, or bf16).
-    # kv_splits and skip_reduce are honored here; block_h and fp16 q fall through to
-    # the triton path below (the gluon kernel is bf16-only: bf16 LDS + bf16 MFMA).
-    if DEVICE_ARCH == "gfx950" and block_h is None and q.dtype == torch.bfloat16:
-        # gfx950 (CDNA4) reads OCP e4m3 natively. fnuz is the gfx942 encoding,
-        # so it never appears here and falls through to the triton path below.
-        if unified_kv.ndim == 3:
-            # packed / bf16 block cache: it carries its own scales, if any
+    # gfx942 FlyDSL returns None outside packed uniform H=16 D=512 bf16.
+    if (
+        DEVICE_ARCH in ("gfx950", "gfx942")
+        and block_h is None
+        and q.dtype == torch.bfloat16
+    ):
+        if DEVICE_ARCH == "gfx942":
+            # No OCP e4m3 on CDNA3; 3D packed rows do not fit the 64 KiB budget
+            # at the gfx950 BLOCK_K=64 specialization.
+            _ok = (
+                unified_kv.ndim == 2
+                and kv_scales is None
+                and extra_cache is None
+                and extra_indices is None
+                and extra_indptr is None
+                and unified_kv.dtype == q.dtype
+            )
+        elif unified_kv.ndim == 3:
             _ok = kv_scales is None and unified_kv.dtype in (torch.uint8, q.dtype)
         elif kv_scales is not None:
             _ok = unified_kv.dtype in (torch.float8_e4m3fn, torch.uint8)
         else:
             _ok = unified_kv.dtype == q.dtype
         if _ok:
-            cache = (
-                unified_kv.view(torch.uint8)
-                if (unified_kv.ndim == 2 and kv_scales is not None)
-                else unified_kv
-            )
-            return _pa_decode_sparse_gfx950_gluon(
-                q,
-                cache,
-                kv_scales,
-                kv_indices,
-                kv_indptr,
-                softmax_scale,
-                attn_sink,
-                extra_cache=extra_cache,
-                extra_indices=extra_indices,
-                extra_indptr=extra_indptr,
-                kv_splits=kv_splits,
-                skip_reduce=skip_reduce,
-                has_invalid=bool(has_invalid),
-                out=out,
-            )
+            if DEVICE_ARCH == "gfx942":
+                result = _pa_decode_sparse_gfx942_flydsl(
+                    q,
+                    unified_kv,
+                    kv_indices,
+                    kv_indptr,
+                    softmax_scale,
+                    attn_sink,
+                    kv_splits=kv_splits,
+                    skip_reduce=skip_reduce,
+                    has_invalid=bool(has_invalid),
+                    out=out,
+                    uniform_topk=uniform_topk,
+                    qblock_reuse=qblock_reuse,
+                )
+                if result is not None:
+                    return result
+            else:
+                cache = (
+                    unified_kv.view(torch.uint8)
+                    if (unified_kv.ndim == 2 and kv_scales is not None)
+                    else unified_kv
+                )
+                return _pa_decode_sparse_gfx950_gluon(
+                    q,
+                    cache,
+                    kv_scales,
+                    kv_indices,
+                    kv_indptr,
+                    softmax_scale,
+                    attn_sink,
+                    extra_cache=extra_cache,
+                    extra_indices=extra_indices,
+                    extra_indptr=extra_indptr,
+                    kv_splits=kv_splits,
+                    skip_reduce=skip_reduce,
+                    has_invalid=bool(has_invalid),
+                    out=out,
+                )
 
     assert (
         extra_cache is None and extra_indices is None and extra_indptr is None
@@ -471,6 +505,121 @@ def _launch_splits(num_splits):
     reduce (unrolled over the launched count) compiles for few counts. The extra
     programs exit early with empty partials."""
     return num_splits if num_splits <= 2 else -(-num_splits // 4) * 4
+
+
+def _packed_uniform_topk(kv_indices, kv_indptr, n_tok, topk_hint):
+    """Return topk when every row is the packed span ``[t * topk, (t + 1) * topk)``."""
+    if n_tok <= 0 or kv_indptr is None or int(kv_indptr.numel()) != n_tok + 1:
+        return None
+    if topk_hint is None:
+        topk = int((kv_indptr[1] - kv_indptr[0]).item())
+    else:
+        topk = int(topk_hint)
+    if topk <= 0 or topk % 16 != 0 or kv_indices.numel() != n_tok * topk:
+        return None
+    expected = torch.arange(n_tok + 1, device=kv_indptr.device, dtype=kv_indptr.dtype)
+    if not torch.equal(kv_indptr, expected * topk):
+        return None
+    return topk
+
+
+def _pa_decode_sparse_gfx942_flydsl(
+    q,
+    unified_kv,
+    kv_indices,
+    kv_indptr,
+    softmax_scale,
+    attn_sink,
+    kv_splits=None,
+    skip_reduce=False,
+    has_invalid=False,
+    out=None,
+    uniform_topk=None,
+    qblock_reuse=None,
+):
+    """Return the gfx942 FlyDSL path, or None so the caller uses Triton."""
+    if not (
+        q.shape[1:] == (16, 512)
+        and kv_splits in (None, 1)
+        and not skip_reduce
+        and not has_invalid
+        and q.is_contiguous()
+        and unified_kv.is_contiguous()
+        and unified_kv.ndim == 2
+        and (out is None or out.is_contiguous())
+    ):
+        return None
+    # int32 element offsets wrap at these bounds; Triton already handles them.
+    if q.shape[0] >= (1 << 31) // (16 * 512) or unified_kv.shape[0] >= (1 << 31) // 512:
+        return None
+    topk = _packed_uniform_topk(kv_indices, kv_indptr, q.shape[0], uniform_topk)
+    if topk is None:
+        return None
+    out = _check_out(out, q, q.dtype)
+    use_qblock = qblock_reuse is True or (
+        qblock_reuse is None and _qblock_reuse_wins(kv_indices, q.shape[0], topk)
+    )
+    if use_qblock:
+        return _pa_decode_sparse_gfx942_qblock(
+            q,
+            unified_kv,
+            kv_indices,
+            kv_indptr,
+            softmax_scale,
+            attn_sink,
+            out=out,
+            uniform_topk=topk,
+        )
+    from aiter.ops.flydsl.sparse_mla_qblock_kernels import (
+        sparse_mla_one_query_fwd_flydsl,
+    )
+
+    return sparse_mla_one_query_fwd_flydsl(
+        q,
+        unified_kv,
+        kv_indices,
+        out,
+        kv_indptr=kv_indptr,
+        attn_sink=attn_sink,
+        softmax_scale=softmax_scale,
+        uniform_topk=topk,
+    )
+
+
+def _qblock_reuse_wins(kv_indices, n_tok, topk, block_q=4):
+    """True when the first ``block_q`` queries attend one identical slot list."""
+    if n_tok < block_q or kv_indices.numel() < block_q * topk:
+        return False
+    sample = kv_indices[: block_q * topk].view(block_q, topk)
+    return torch.equal(sample, sample[:1].expand_as(sample))
+
+
+def _pa_decode_sparse_gfx942_qblock(
+    q,
+    unified_kv,
+    kv_indices,
+    kv_indptr,
+    softmax_scale,
+    attn_sink,
+    out=None,
+    uniform_topk=None,
+):
+    """FlyDSL Q-block kernel: one CTA owns neighboring queries and streams unique KV."""
+    from aiter.ops.flydsl.sparse_mla_qblock_kernels import (
+        sparse_mla_qblock_fwd_flydsl,
+    )
+
+    out = _check_out(out, q, q.dtype)
+    return sparse_mla_qblock_fwd_flydsl(
+        q,
+        unified_kv,
+        kv_indices,
+        out,
+        kv_indptr=kv_indptr,
+        attn_sink=attn_sink,
+        softmax_scale=softmax_scale,
+        uniform_topk=uniform_topk,
+    )
 
 
 def _pa_decode_sparse_gfx950_gluon(
