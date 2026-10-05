@@ -1629,6 +1629,18 @@ def flydsl_k1_combine_norm_down(
         if _dn_bm is None or gemm_tokens % _dn_bm:
             _dn_bm = 64 if gemm_tokens % 64 == 0 else block_m
         assert gemm_tokens % _dn_bm == 0
+        if arch == "gfx942":
+            # A/B panels share gfx942's 64 KiB LDS with norm scratch.
+            stage_weight = (not fold_w) and w_len != hidden
+            w1_len = w_len if stage_weight else 1
+            aux_lds = ((w1_len * 4 + 15) // 16) * 16
+            aux_lds += ((_dn_bm * hc_count * 4 + 15) // 16) * 16
+            fixed_lds = stages * _dn_bm * block_k * 2 + aux_lds
+            bytes_per_n = stages * block_k * 2
+            max_block_n = (64 * 1024 - fixed_lds) // bytes_per_n
+            if _dn_bn > max_block_n:
+                _dn_bn = _decouple_block_n(n_pad, min(_dn_bn, max_block_n))
+            assert _dn_bn <= max_block_n, "decoupled K1 exceeds gfx942 LDS capacity"
         _dn_mw = dn_m_waves if dn_m_waves is not None else 2
         _dn_nw = dn_n_waves if dn_n_waves is not None else 2
         # Reduce N waves until each wave owns whole MMA columns.
