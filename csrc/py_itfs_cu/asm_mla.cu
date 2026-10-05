@@ -2,6 +2,11 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "aiter_tensor.h"
 #include "asm_mla_configs.hpp"
+
+#undef ADD_CFG
+namespace mla_dsl {
+#include "asm_mla_dsl_configs.hpp"
+} // namespace mla_dsl
 #include "aiter_ctypes_error.h"
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -1331,4 +1336,172 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                              1,                                              // bdy
                              1,                                              // bdz
                              stream});
+}
+
+// Kernel arguments of the persistent page-size-1 FP8 decode stage 1 exported
+// from FlyDSL (hsa/gfx1250/mla_dsl/mla_dsl.csv). The layout is the code object's
+// amdhsa.kernels .args list; the offsets below pin it.
+struct __attribute__((packed)) MlaPs1Fp8KernelArgs
+{
+    void* ptr_r;
+    void* ptr_lse;
+    void* ptr_final;
+    void* ptr_final_lse;
+    void* ptr_q;
+    void* ptr_kv;
+    void* kv_page_indices;
+    void* work_indptr;
+    void* work_info_set;
+    void* q_scale;
+    void* kv_scale;
+    float softmax_scale;
+    int num_pages;
+    int num_page_indices;
+    unsigned int _pad0;
+    void* qo_indptr;
+    void* kv_indptr;
+    void* g_kv_indptr;
+    int cp_world_size;
+    int cp_rank;
+};
+static_assert(offsetof(MlaPs1Fp8KernelArgs, softmax_scale) == 88, "mla_ps1 kernarg layout");
+static_assert(offsetof(MlaPs1Fp8KernelArgs, qo_indptr) == 104, "mla_ps1 kernarg layout");
+static_assert(offsetof(MlaPs1Fp8KernelArgs, cp_rank) == 132, "mla_ps1 kernarg layout");
+static_assert(sizeof(MlaPs1Fp8KernelArgs) == 136, "mla_ps1 kernarg layout");
+
+// Bridged: an exception crossing extern "C" would terminate the process.
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
+    mla_ps1_fp8_asm_fwd,
+    (aiter_tensor_t* split_data,      //   [num_partials, num_heads, 512] fp32
+    aiter_tensor_t* split_lse,        //   [num_partials, num_heads] fp32
+    aiter_tensor_t* final_output,     //   [total_q, num_heads, 512] bf16
+    aiter_tensor_t* final_lse,        //   [total_q, num_heads] fp32 (nullable)
+    aiter_tensor_t* q,                //   [total_q, num_heads, 576] fp8
+    aiter_tensor_t* kv_buffer,        //   [num_pages, 1, 1, 576] fp8
+    aiter_tensor_t* kv_page_indices,  //   [num_page_indices] int32
+    aiter_tensor_t* work_indptr,      //   [num_workers + 1] int32
+    aiter_tensor_t* work_info_set,    //   [num_works, 8] int32
+    float softmax_scale,
+    aiter_tensor_t* q_scale,          //   [1] fp32
+    aiter_tensor_t* kv_scale,         //   [1] fp32
+    int max_seqlen_q,
+    int causal,
+    aiter_tensor_t* qo_indptr,        //   [batch + 1] int32, round-robin CP only (nullable)
+    aiter_tensor_t* kv_indptr,        //   [batch + 1] int32, round-robin CP only (nullable)
+    aiter_tensor_t* g_kv_indptr,      //   [batch + 1] int32, round-robin CP only (nullable)
+    int cp_world_size,
+    int cp_rank,
+    hipStream_t stream),
+    (split_data, split_lse, final_output, final_lse, q, kv_buffer, kv_page_indices, work_indptr, work_info_set, softmax_scale, q_scale, kv_scale, max_seqlen_q, causal, qo_indptr, kv_indptr, g_kv_indptr, cp_world_size, cp_rank, stream))
+{
+    const std::string arch_id = get_gpu_arch();
+    AITER_CHECK(arch_id == "gfx1250", __func__, ": only supports gfx1250, got ", arch_id);
+    const HipDeviceGuard device_guard(q->device_id);
+
+    const int total_q   = q->size(0);
+    const int num_heads = q->size(1);
+    auto require_i32 = [](const aiter_tensor_t* t, const char* name) {
+        AITER_CHECK(t != nullptr && t->dtype() == AITER_DTYPE_i32 && t->is_contiguous(),
+                    "mla_ps1_fp8_asm_fwd: ", name, " must be a contiguous int32 tensor");
+    };
+    AITER_CHECK(q->dim() == 3 && q->size(2) == 576 && q->dtype() == AITER_DTYPE_fp8 &&
+                    q->is_contiguous(),
+                __func__, ": q must be a contiguous fp8 [total_q, num_heads, 576] tensor");
+    AITER_CHECK(kv_buffer->size(-1) == 576 && kv_buffer->numel() == kv_buffer->size(0) * 576 &&
+                    kv_buffer->dtype() == AITER_DTYPE_fp8 && kv_buffer->is_contiguous(),
+                __func__, ": kv_buffer must be a contiguous fp8 [num_pages, 1, 1, 576] tensor");
+    AITER_CHECK(split_data->dtype() == AITER_DTYPE_fp32 && split_data->size(-2) == num_heads &&
+                    split_data->size(-1) == 512 && split_data->is_contiguous(),
+                __func__, ": split_data must be a contiguous fp32 [*, num_heads, 512] tensor");
+    AITER_CHECK(split_lse->dtype() == AITER_DTYPE_fp32 && split_lse->is_contiguous(),
+                __func__, ": split_lse must be a contiguous fp32 tensor");
+    AITER_CHECK(final_output->dtype() == AITER_DTYPE_bf16 && final_output->size(0) == total_q &&
+                    final_output->is_contiguous(),
+                __func__, ": final_output must be a contiguous bf16 [total_q, num_heads, 512] tensor");
+    AITER_CHECK(final_lse == nullptr ||
+                    (final_lse->dtype() == AITER_DTYPE_fp32 && final_lse->is_contiguous()),
+                __func__, ": final_lse must be a contiguous fp32 tensor");
+    AITER_CHECK(q_scale != nullptr && kv_scale != nullptr &&
+                    q_scale->dtype() == AITER_DTYPE_fp32 && kv_scale->dtype() == AITER_DTYPE_fp32,
+                __func__, ": q_scale and kv_scale must be fp32 scalar tensors");
+    require_i32(kv_page_indices, "kv_page_indices");
+    require_i32(work_indptr, "work_indptr");
+    require_i32(work_info_set, "work_info_set");
+
+    const int lse_flag  = final_lse != nullptr ? 1 : 0;
+    const int causal_flag = causal ? 1 : 0;
+    // Round-robin CP only exists with causal masking, matching the FlyDSL wrapper.
+    const int cprr = (cp_world_size > 1 && causal_flag) ? 1 : 0;
+    if(cprr)
+    {
+        AITER_CHECK(0 <= cp_rank && cp_rank < cp_world_size,
+                    __func__, ": cp_rank must be in [0, cp_world_size)");
+        require_i32(qo_indptr, "qo_indptr");
+        require_i32(kv_indptr, "kv_indptr");
+        require_i32(g_kv_indptr, "g_kv_indptr");
+    }
+
+    const mla_dsl::mla_dslConfig* cfg = nullptr;
+    for(const auto& el : mla_dsl::cfg_mla_dsl)
+    {
+        const auto& c = el.second;
+        if(el.first.find(arch_id) == 0 && c.qType == "fp8" && c.kvType == "fp8" &&
+           c.Gqa == num_heads && (c.qSeqLen == 0 || c.qSeqLen == max_seqlen_q) &&
+           c.causal == causal_flag && c.lse == lse_flag && c.cprr == cprr)
+        {
+            cfg = &c;
+            break;
+        }
+    }
+    AITER_CHECK(cfg != nullptr, __func__, ": no mla_ps1 code object for num_heads=", num_heads,
+                " max_seqlen_q=", max_seqlen_q, " causal=", causal_flag, " lse=", lse_flag,
+                " cprr=", cprr);
+
+    // Compiler output, not shipped hand-written asm: the gfx1250 B0-only gate
+    // does not apply.
+    static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
+    const char* name    = cfg->knl_name.c_str();
+    const char* co_name = cfg->co_name.c_str();
+    AiterAsmKernel* impl_ptr = &impl_ptr_map.get_or_create(name, [&]() {
+        return AiterAsmKernel(name, co_name, AiterAsmKernel::SkipGfx1250Gate{});
+    });
+
+    MlaPs1Fp8KernelArgs args{};
+    args.ptr_r            = split_data->data_ptr();
+    args.ptr_lse          = split_lse->data_ptr();
+    args.ptr_final        = final_output->data_ptr();
+    args.ptr_final_lse    = lse_flag ? final_lse->data_ptr() : nullptr;
+    args.ptr_q            = q->data_ptr();
+    args.ptr_kv           = kv_buffer->data_ptr();
+    args.kv_page_indices  = kv_page_indices->data_ptr();
+    args.work_indptr      = work_indptr->data_ptr();
+    args.work_info_set    = work_info_set->data_ptr();
+    args.q_scale          = q_scale->data_ptr();
+    args.kv_scale         = kv_scale->data_ptr();
+    args.softmax_scale    = softmax_scale;
+    args.num_pages        = static_cast<int>(kv_buffer->size(0));
+    args.num_page_indices = static_cast<int>(kv_page_indices->numel());
+    args.qo_indptr        = cprr ? qo_indptr->data_ptr() : nullptr;
+    args.kv_indptr        = cprr ? kv_indptr->data_ptr() : nullptr;
+    args.g_kv_indptr      = cprr ? g_kv_indptr->data_ptr() : nullptr;
+    args.cp_world_size    = cprr ? cp_world_size : 1;
+    args.cp_rank          = cprr ? cp_rank : 0;
+    size_t arg_size       = sizeof(args);
+
+    // Persistent: one workgroup per worker slot of the metadata planner.
+    const int num_workers = static_cast<int>(work_indptr->numel()) - 1;
+    AITER_CHECK(num_workers > 0, __func__, ": work_indptr must hold at least one worker");
+    impl_ptr->launch_kernel({&args,
+                             &arg_size,
+                             num_workers, // gdx
+                             1,           // gdy
+                             1,           // gdz
+                             256,         // bdx: 8 wave32
+                             1,           // bdy
+                             1,           // bdz
+                             stream,
+                             1,           // cluster_x
+                             1,           // cluster_y
+                             1,           // cluster_z
+                             static_cast<unsigned int>(cfg->dyn_lds)});
 }
