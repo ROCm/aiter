@@ -1,6 +1,11 @@
+import triton
+
 from aiter.ops.triton._triton_kernels.attention.unified_attention_sparse_mla import (
     _kernel_unified_attention_sparse_mla_2d,
 )
+from aiter.ops.triton.utils.tuned_config_utils import get_tuned_kernel_config
+
+_FALLBACK = triton.Config({"BLOCK_M": 16}, num_warps=4, num_stages=1)
 
 
 def unified_attention_sparse_mla(
@@ -47,7 +52,17 @@ def unified_attention_sparse_mla(
     k = kv
     v = kv[..., :kv_lora_rank]
 
-    BLOCK_M = 16
+    cfg = get_tuned_kernel_config(
+        "attention",
+        "UNIFIED_ATTENTION_SPARSE_MLA",
+        "_kernel_unified_attention_sparse_mla_2d",
+        _FALLBACK,
+    )
+    BLOCK_M = cfg.kwargs["BLOCK_M"]
+    # The grid has num_query_heads // BLOCK_M programs per token, so BLOCK_M must
+    # divide the head count; halve a larger tuned value until it does.
+    while BLOCK_M > _FALLBACK.kwargs["BLOCK_M"] and num_query_heads % BLOCK_M:
+        BLOCK_M //= 2
 
     total_num_q_blocks = q.shape[0] * (num_query_heads // BLOCK_M)
     ALL_DECODE = max_seqlen_q == 1
@@ -55,8 +70,8 @@ def unified_attention_sparse_mla(
     ROPE_RANK = head_size - kv_lora_rank
     KV_LORA_RANK = kv_lora_rank
     TILE_SIZE = block_size
-    num_stages_2d = 1
-    num_warps = 4
+    num_stages_2d = cfg.num_stages
+    num_warps = cfg.num_warps
     _kernel_unified_attention_sparse_mla_2d[(total_num_q_blocks,)](
         output_ptr=out,
         query_ptr=q,
