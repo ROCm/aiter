@@ -786,6 +786,20 @@ MD_NAME = "module_mla_asm"
 
 
 @compile_ops(MD_NAME, ffi_type="ctypes")
+def mla_ps1_qh128_fp8_asm_fwd(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_indices: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    q_scale: torch.Tensor,
+    kv_scale: torch.Tensor,
+    softmax_scale: float,
+) -> None: ...
+
+
+@compile_ops(MD_NAME, ffi_type="ctypes")
 def mla_ps64_qh128_fp8_asm_fwd(
     q: torch.Tensor,
     kv: torch.Tensor,

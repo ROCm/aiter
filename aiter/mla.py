@@ -18,6 +18,7 @@ from aiter.jit.utils.asm_guard import require_gfx1250_asm
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.ops.attention import (
     get_mla_decode_fwd_max_splits,
+    mla_ps1_qh128_fp8_asm_fwd,
     mla_ps64_qh128_fp8_asm_fwd,
 )
 
@@ -632,9 +633,62 @@ def mla_decode_fwd_ds32(
 
 
 @functools.lru_cache(maxsize=16)
-def _mla_ps64_qh128_unit_scale(device):
+def _mla_qh128_unit_scale(device):
     """Reuse a device-side FP32 one when a caller omits Q/KV descales."""
     return torch.ones(1, dtype=torch.float32, device=device)
+
+
+def mla_decode_fwd_ps1_qh128_asm(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_indices: torch.Tensor,
+    out: torch.Tensor,
+    q_scale: torch.Tensor | None,
+    kv_scale: torch.Tensor | None,
+    softmax_scale: float,
+    lse: torch.Tensor,
+) -> torch.Tensor:
+    """Write BF16 O and natural-log FP32 LSE from token-major FP8 page1 KV.
+
+    Q is [B,128,576] FP8 E4M3FN, with head stride 576 or 768 bytes. KV is
+    contiguous [physical_tokens,1,1,576]: each token's first 512 values are
+    NoPE/V, followed by 64 RoPE values. No KV shuffle is needed. Contiguous
+    int32 kv_indptr[B+1] and kv_indices[nnz] describe one query per sequence.
+    The caller must provide nonnegative, monotonic indptr within [0,nnz] and
+    valid physical token IDs in each used range. CSR contents are not checked
+    on the host, so the launch does not synchronize GPU metadata to the CPU.
+
+    Scales are one FP32 scalar each, or None for 1. Used inputs/scales must be
+    finite. Empty sequences produce O=0, LSE=-inf. This CO always writes LSE:
+    supply a reusable contiguous FP32 [B,128] buffer even if LSE is discarded.
+    No split-K or partial logits. Warm up on the target device before graph
+    capture. The native launcher uses the current stream.
+    """
+    require_gfx1250_asm("mla_decode_fwd_ps1_qh128_asm")
+    if lse is None:
+        raise ValueError(
+            "lse is required by the page1 kernel; supply an FP32 [B,128] buffer"
+        )
+    with torch.cuda.device(q.device):
+        q_scale = _mla_qh128_unit_scale(q.device) if q_scale is None else q_scale
+        kv_scale = _mla_qh128_unit_scale(q.device) if kv_scale is None else kv_scale
+        mla_ps1_qh128_fp8_asm_fwd(
+            q,
+            kv,
+            kv_indptr,
+            kv_indices,
+            out,
+            lse,
+            q_scale,
+            kv_scale,
+            float(softmax_scale),
+        )
+        stream = torch.cuda.current_stream(q.device)
+        for tensor in (q, kv, kv_indptr, kv_indices, out, lse, q_scale, kv_scale):
+            if tensor is not None:
+                tensor.record_stream(stream)
+    return out
 
 
 def mla_decode_fwd_ps64_qh128_asm(
@@ -662,10 +716,8 @@ def mla_decode_fwd_ps64_qh128_asm(
     """
     require_gfx1250_asm("mla_decode_fwd_ps64_qh128_asm")
     with torch.cuda.device(q.device):
-        q_scale = _mla_ps64_qh128_unit_scale(q.device) if q_scale is None else q_scale
-        kv_scale = (
-            _mla_ps64_qh128_unit_scale(q.device) if kv_scale is None else kv_scale
-        )
+        q_scale = _mla_qh128_unit_scale(q.device) if q_scale is None else q_scale
+        kv_scale = _mla_qh128_unit_scale(q.device) if kv_scale is None else kv_scale
         mla_ps64_qh128_fp8_asm_fwd(
             q,
             kv,
