@@ -154,6 +154,8 @@ struct AiterAsmKernelArgs
     int cluster_x = 1;
     int cluster_y = 1;
     int cluster_z = 1;
+
+    unsigned int smem = 0;
 };
 
 static const std::string get_gpu_arch();
@@ -350,7 +352,7 @@ class AiterAsmKernelFast
             launch_config.blockDimX     = static_cast<unsigned int>(kargs.bdx);
             launch_config.blockDimY     = static_cast<unsigned int>(kargs.bdy);
             launch_config.blockDimZ     = static_cast<unsigned int>(kargs.bdz);
-            launch_config.sharedMemBytes = 0;
+            launch_config.sharedMemBytes = kargs.smem;
             launch_config.hStream       = kargs.stream;
             launch_config.attrs         = attrs;
             launch_config.numAttrs      = 1;
@@ -378,7 +380,7 @@ class AiterAsmKernelFast
                                               kargs.bdx,
                                               kargs.bdy,
                                               kargs.bdz,
-                                              0,
+                                              kargs.smem,
                                               kargs.stream,
                                               nullptr,
                                               (void**)&config));
