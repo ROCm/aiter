@@ -158,7 +158,9 @@ def test_quant_1x32_e8m0(m, n, q_dtype, h_dtype, shuffle, strided):
 
 
 def test_mxfp8_nonfinite(group_size, shuffle, h_dtype, pattern):
-    """A NaN/Inf makes its MXFP8 group invalid (scale 0xff, data 0xff); others unchanged."""
+    """A NaN/Inf makes its MXFP8 group invalid (scale 0xff, data NaN); others unchanged."""
+    # gfx942 FNUZ: NaN is 0x80 (negative zero); OCP archs: NaN is 0xff.
+    _nan_byte = 0x80 if get_gfx() == "gfx942" else 0xFF
     x = torch.ones((32, group_size * 8), dtype=h_dtype)
     bad = torch.zeros((32, 8), dtype=torch.bool)
     for row in range(32):
@@ -179,9 +181,24 @@ def test_mxfp8_nonfinite(group_size, shuffle, h_dtype, pattern):
     scale = torch.empty((32, 8), dtype=torch.uint8)
     dynamic_per_group_scaled_quant(out, x, scale, group_size, shuffle)
 
-    expected = torch.full(x.shape, 0x78, dtype=torch.uint8)  # 1 / 2^-8 = FP8 256
-    expected.view(32, 8, group_size)[bad] = 0xFF
-    expected_scale = torch.where(bad, 255, 119).to(torch.uint8)
+    # Build expected from a good-group reference quant of all-ones input.
+    _fnuz = get_gfx() == "gfx942"
+    _mx = MxDtypeInt.FP8_E4M3_FNUZ if _fnuz else MxDtypeInt.FP8_E4M3
+    _ref_amax = torch.tensor([[1.0]])
+    _ref_scale_byte = (
+        f32_to_mx_e8m0_scale(_ref_amax, dtype=_mx).view(torch.uint8).item()
+    )
+    _ref_divisor = 2.0 ** (_ref_scale_byte - 127)
+    _good_fp8 = (
+        (torch.tensor([1.0]) / _ref_divisor)
+        .clamp(-torch.finfo(dtypes.fp8).max, torch.finfo(dtypes.fp8).max)
+        .to(dtypes.fp8)
+        .view(torch.uint8)
+        .item()
+    )
+    expected = torch.full(x.shape, _good_fp8, dtype=torch.uint8)
+    expected.view(32, 8, group_size)[bad] = _nan_byte
+    expected_scale = torch.where(bad, 255, _ref_scale_byte).to(torch.uint8)
     if shuffle and group_size == 32:
         shuffled = torch.empty_like(expected_scale).flatten()
         for row, col in itertools.product(range(32), range(8)):
@@ -320,6 +337,7 @@ if "fp8_mx_nonfinite" in args.quant and get_gfx() in ("gfx950", "gfx1250"):
         ):
             test_quant_1x32_e8m0(m, n, q_dtype, h_dtype, shuffle, strided)
     aiter.logger.info("fp8_1x32_e8m0 passed")
+if "fp8_mx_nonfinite" in args.quant and get_gfx() in ("gfx942", "gfx950", "gfx1250"):
     for gs, shuffle in itertools.product([32, 64, 128], [True, False]):
         for h_dtype, pattern in itertools.product(
             [dtypes.bf16, dtypes.fp16],
