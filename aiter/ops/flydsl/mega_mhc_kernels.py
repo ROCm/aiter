@@ -51,9 +51,12 @@ def get_mega_mhc_config(
       wherever H divides, else 32.
     * Beyond that, fn's L2 traffic (2 MB per token block) dominates: 64-token blocks
       with 4 token-split warps sharing each fn tile through LDS (bf16). The FP8 output
-      instead keeps 16-token blocks with 10 column splits: its finisher only rescales
+      instead keeps column-split warps with 10 column splits (32-token blocks, 8
+      warps; 16-token/4-warp when H does not allow it): its finisher only rescales
       the group scales, so the split-K tail is cheap there, while the bf16 finisher
-      re-reads and rewrites the whole staged collapse.
+      re-reads and rewrites the whole staged collapse. The 32-token/8-warp point
+      measured 2-4% faster than 16-token/4-warp at T = 16384..32768 (P1 sweep,
+      ``sweep/p1_triton_geometry.md``).
     """
     from aiter.ops.flydsl.kernels.mega_mhc import check_config
 
@@ -63,8 +66,12 @@ def get_mega_mhc_config(
     if T >= 64 * cu_num:
         if out_fp8:
             cfg.update(
-                BLOCK_M=16, WARPS_PER_WG=4, NUM_KSPLIT=10, TILE_K=64, COHERENCE="xcd"
+                BLOCK_M=32, WARPS_PER_WG=8, NUM_KSPLIT=10, TILE_K=64, COHERENCE="xcd"
             )
+            try:
+                check_config(H, cfg)
+            except ValueError:  # H not divisible by 10 * 8 * 64: narrower warps
+                cfg.update(BLOCK_M=16, WARPS_PER_WG=4)
         else:
             cfg.update(
                 BLOCK_M=64,
