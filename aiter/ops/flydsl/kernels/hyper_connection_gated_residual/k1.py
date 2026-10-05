@@ -1377,6 +1377,14 @@ def _k1_auto_split_k(tokens: int, block_m: int, k_tiles: int) -> int:
     return best
 
 
+def _decouple_block_n(n_pad: int, preferred: int = 128) -> int:
+    """Choose a common MMA-aligned N tile that divides the packed width."""
+    for block_n in (128, 112, 96, 64, 48, 32, 16):
+        if block_n <= preferred and n_pad % block_n == 0:
+            return block_n
+    return n_pad
+
+
 def flydsl_k1_combine_norm_down(
     residual: torch.Tensor,
     block_output: torch.Tensor,
@@ -1613,10 +1621,10 @@ def flydsl_k1_combine_norm_down(
         _dn_bn = dn_block_n
         _dn_bm = dn_block_m
         if _dn_bn is None:
-            _dn_bn = 128 if n_pad % 128 == 0 else (64 if n_pad % 64 == 0 else n_pad)
+            _dn_bn = _decouple_block_n(n_pad)
         elif n_pad % _dn_bn:
-            # The final mixer may be narrower than the tuned output shape.
-            _dn_bn = 64 if n_pad % 64 == 0 else n_pad
+            # A tuned tile may not divide a differently padded merged weight.
+            _dn_bn = _decouple_block_n(n_pad, _dn_bn)
         # Stores are not row-masked, so the tile height must divide gemm_tokens.
         if _dn_bm is None or gemm_tokens % _dn_bm:
             _dn_bm = 64 if gemm_tokens % 64 == 0 else block_m
