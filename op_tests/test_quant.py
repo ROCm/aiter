@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
 import itertools
@@ -84,7 +84,12 @@ def test_quant_1x128_e8m0(m, n, q_dtype, h_dtype, shuffle, strided):
     )
 
     xf = x.float().view(m, n // G, G)
-    mx = MxDtypeInt.FP4_E2M1 if fp4 else MxDtypeInt.FP8_E4M3
+    _fnuz = get_gfx() == "gfx942"
+    mx = (
+        MxDtypeInt.FP4_E2M1
+        if fp4
+        else (MxDtypeInt.FP8_E4M3_FNUZ if _fnuz else MxDtypeInt.FP8_E4M3)
+    )
     ref_scale = f32_to_mx_e8m0_scale(xf.abs().amax(-1), dtype=mx).view(torch.uint8)
     xs = xf / (ref_scale.to(torch.int32) - 127).float().exp2()[..., None]
     if fp4:
