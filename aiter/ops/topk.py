@@ -784,11 +784,14 @@ def _decode_backend(
 
 @functools.lru_cache(maxsize=8)
 def _decode_cu_count(device_index: int) -> int:
-    """`get_cu_num()`, capped to this device: a row's parts must be co-resident."""
+    """This device's CU count, lowered by `CU_NUM` through `get_cu_num()`."""
     # Callers pass a CUDA tensor's `device.index`, which torch always sets. Do not
     # map `None` to the current device here: the cache would pin that device's
     # count under the `None` key for every later device.
     physical = torch.cuda.get_device_properties(device_index).multi_processor_count
+    # Without `CU_NUM`, `get_cu_num()` asserts every GPU on the node has one count.
+    if int(os.getenv("CU_NUM", "0")) <= 0:
+        return physical
     return min(get_cu_num(), physical)
 
 

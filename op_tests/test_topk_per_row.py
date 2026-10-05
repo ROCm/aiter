@@ -1,6 +1,9 @@
 import argparse
 import itertools
 import os
+import subprocess
+import sys
+import tempfile
 
 import numpy as np
 import pandas as pd
@@ -8,6 +11,7 @@ import torch
 
 import aiter
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.cpp_extension import executable_path
 from aiter.ops import topk
 from aiter.ops.flydsl.kernels.tensor_shim import wave_size_of
 from aiter.ops.flydsl.kernels.topk import (
@@ -666,6 +670,38 @@ def test_decode_bound_gate():
     print(f"[decode_bound_gate] PASS: {len(table)} cards")
 
 
+def test_decode_cu_count_mixed_node():
+    """Without `CU_NUM`, the gate reads this device's CU count even when `rocminfo`
+    lists a GPU with another count, which `get_cu_num()` rejects."""
+    with tempfile.TemporaryDirectory() as bin_dir:
+        fake = os.path.join(bin_dir, "rocminfo")
+        with open(fake, "w") as f:
+            f.write(
+                f"#!/bin/sh\n{executable_path('rocminfo')} \"$@\"\n"
+                "printf 'Agent 99\\n  Name: gfx000\\n  Device Type: GPU\\n"
+                "  Compute Unit: 1\\n'\n"
+            )
+        os.chmod(fake, 0o755)
+        env = {k: v for k, v in os.environ.items() if k != "CU_NUM"}
+        env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
+        probe = (
+            "import torch\n"
+            "from aiter.ops import topk\n"
+            "d = torch.cuda.current_device()\n"
+            "cu = torch.cuda.get_device_properties(d).multi_processor_count\n"
+            "assert topk._decode_cu_count(d) == cu\n"
+        )
+        run = subprocess.run(
+            [sys.executable, "-c", probe],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    assert run.returncode == 0, run.stderr[-2000:]
+    print("[decode_cu_count_mixed_node] PASS")
+
+
 def test_decode_bound_entry_points(card):
     """`topk_select` and the public FlyDSL wrapper each carry `max_row_len` to the
     adaptive kernel. A dropped bound still returns correct indices, so the launch
@@ -1011,6 +1047,7 @@ args = parser.parse_args()
 # Self-reset / persistent-workspace regression (runs in CI via `python3 <file>`).
 test_mb_workspace_reuse()
 test_decode_bound_gate()
+test_decode_cu_count_mixed_node()
 
 
 # Ask each path which arches it serves rather than keeping a second copy
