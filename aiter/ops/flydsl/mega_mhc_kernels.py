@@ -30,7 +30,7 @@ MEGA_MHC_DEFAULTS = {
     "NUM_KSPLIT": 1,
     "TILE_K": 64,
     "COHERENCE": "none",
-    "NT_STREAMS": False,
+    "NT_STREAMS": False,  # opt-in only: no policy range wins in eager and graph
     "FN_PREPACKED": True,
     "SINKHORN_RCP": True,
 }
@@ -57,6 +57,12 @@ def get_mega_mhc_config(
       re-reads and rewrites the whole staged collapse. The 32-token/8-warp point
       measured 2-4% faster than 16-token/4-warp at T = 16384..32768 (P1 sweep,
       ``sweep/p1_triton_geometry.md``).
+
+    ``NT_STREAMS`` stays off at every size (D1, ``sweep/d1_nt_streams_decode.md``):
+    paired off/on timing finds no (dtype, T) range where it wins by >= 2% in both
+    the eager kernel time and the CUDA-graph per-launch time. Decode (T <= 192) is
+    neutral to slower in eager; only the ks=10 window (T = 208..384) is faster in
+    graph replay (-4..-8%) but not in eager; it is 8-40% slower from T = 416 on.
     """
     from aiter.ops.flydsl.kernels.mega_mhc import check_config
 
