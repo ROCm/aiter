@@ -37,7 +37,7 @@ from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
 
-SUPPORTED_GFX = ["gfx942", "gfx950"]
+SUPPORTED_GFX = ["gfx942", "gfx950", "gfx1250"]
 
 
 def run_torch(x, row_lens, k):

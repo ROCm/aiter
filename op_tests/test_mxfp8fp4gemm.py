@@ -461,8 +461,11 @@ def test_gemm(
         from aiter.ops.gemm_op_a8w8 import _mxfp8_mxfp8_gemm_asm
 
         raw_kern = _mxfp8_mxfp4_gemm_asm if intype == "a8w4" else _mxfp8_mxfp8_gemm_asm
-        partials = torch.empty(
+        # NaN-prefilled: an unwritten plane region survives every iteration and
+        # fails the isfinite check (the public op relies on full coverage).
+        partials = torch.full(
             (splitk, M, N) if splitk > 1 else (M, N),
+            float("nan"),
             dtype=out_dtype,
             device=inp["A"].device,
         )

@@ -15,7 +15,8 @@ __all__ = [
     "flydsl_mla_pagesize64_fp8_fp8",
 ]
 
-_PAGESIZE1_NUM_Q_HEADS = (16, 32, 64, 128)
+_PAGESIZE1_NUM_Q_HEADS = (16, 32, 64, 96, 128)
+_PAGESIZE1_PACKED_Q_HEADS = 64
 
 
 def _require(condition, message):
@@ -66,10 +67,6 @@ def _validate_pagesize1_inputs(
     )
     softmax_scale = float(softmax_scale)
     max_seqlen_q = int(max_seqlen_q)
-    _require(
-        max_seqlen_q in (1, 2, 3, 4),
-        f"max_seqlen_q: expected one of [1, 2, 3, 4], got {max_seqlen_q}",
-    )
     total_q = q.size(0)
     num_q_heads = q.size(1)
     _require(
@@ -78,7 +75,13 @@ def _validate_pagesize1_inputs(
         f"got {num_q_heads}",
     )
     _require(
-        num_q_heads == 16 or max_seqlen_q == 1,
+        max_seqlen_q in (1, 2, 3, 4) or num_q_heads > _PAGESIZE1_PACKED_Q_HEADS,
+        f"max_seqlen_q: expected one of [1, 2, 3, 4], got {max_seqlen_q}",
+    )
+    _require(
+        num_q_heads in (16,)
+        or num_q_heads > _PAGESIZE1_PACKED_Q_HEADS
+        or max_seqlen_q == 1,
         f"q: {num_q_heads} heads only support max_seqlen_q=1",
     )
     _require_layout("q", q, torch.float8_e4m3fn, (total_q, num_q_heads, 576))
@@ -130,6 +133,11 @@ def flydsl_mla_pagesize1_fp8_fp8(
     final_lse=None,
     max_seqlen_q=1,
     causal=False,
+    qo_indptr=None,
+    kv_indptr=None,
+    g_kv_indptr=None,
+    cp_world_size=1,
+    cp_rank=0,
     stream=None,
 ):
     (
@@ -156,13 +164,25 @@ def flydsl_mla_pagesize1_fp8_fp8(
         max_seqlen_q,
         causal,
     )
-    from .kernels.mla_gfx1250.mla_pagesize1_fp8_fp8 import (
-        launch_mla_pagesize1_fp8_fp8,
-    )
-
+    cp_world_size = int(cp_world_size)
+    cp_rank = int(cp_rank)
+    _require(cp_world_size >= 1, f"cp_world_size: expected >= 1, got {cp_world_size}")
+    cp_round_robin = int(cp_world_size > 1 and bool(causal))
+    if cp_round_robin:
+        _require(
+            0 <= cp_rank < cp_world_size,
+            f"cp_rank: expected in [0, {cp_world_size}), got {cp_rank}",
+        )
+        _require(
+            qo_indptr is not None and kv_indptr is not None and g_kv_indptr is not None,
+            "round-robin CP needs qo_indptr, kv_indptr and g_kv_indptr",
+        )
+        _require_layout("qo_indptr", qo_indptr, torch.int32, (None,))
+        _require_layout("kv_indptr", kv_indptr, torch.int32, (qo_indptr.numel(),))
+        _require_layout("g_kv_indptr", g_kv_indptr, torch.int32, (qo_indptr.numel(),))
     if stream is None:
         stream = torch.cuda.current_stream(q.device)
-    launch_mla_pagesize1_fp8_fp8(
+    buffers = (
         ptr_arg(split_data, fx.Float32),
         ptr_arg(split_lse, fx.Float32),
         ptr_arg(final_output, fx.BFloat16),
@@ -181,9 +201,35 @@ def flydsl_mla_pagesize1_fp8_fp8(
         softmax_scale,
         kv_buffer.size(0),
         kv_page_indices.numel(),
+        (
+            ptr_arg(qo_indptr, fx.Int32)
+            if cp_round_robin
+            else flyc.from_c_void_p(fx.Int32, 0)
+        ),
+        (
+            ptr_arg(kv_indptr, fx.Int32)
+            if cp_round_robin
+            else flyc.from_c_void_p(fx.Int32, 0)
+        ),
+        (
+            ptr_arg(g_kv_indptr, fx.Int32)
+            if cp_round_robin
+            else flyc.from_c_void_p(fx.Int32, 0)
+        ),
+        cp_world_size if cp_round_robin else 1,
+        cp_rank if cp_round_robin else 0,
+    )
+
+    from .kernels.mla_gfx1250.mla_pagesize1_fp8_fp8 import (
+        launch_mla_pagesize1_fp8_fp8,
+    )
+
+    launch_mla_pagesize1_fp8_fp8(
+        *buffers,
         num_q_heads,
         max_seqlen_q,
         causal,
+        cp_round_robin,
         write_final_lse,
         num_cus,
         lds_size,

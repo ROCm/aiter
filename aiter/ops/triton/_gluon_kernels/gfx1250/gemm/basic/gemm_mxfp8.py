@@ -648,28 +648,23 @@ def _gemm_mxfp8_preshuffle_bandwidth_bound_kernel(
     dot_b_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=1, parent=wmma_layout, k_width=16
     )
-    # get_wmma_scale_layout reads its argument's PARENT cga_layout, not the one
-    # DotOperandLayout derives, so passing dot_a_layout / dot_b_layout would give
-    # the scale tiles the accumulator's CGA -- which splits a scale tile along K
-    # instead of broadcasting it, and silently feeds wmma_scaled the wrong bytes.
-    # Each scale operand therefore gets its own parent already carrying the CGA
-    # of the tensor it indexes: CGA_A for the (M, K_GROUPS) A-scale tile,
-    # CGA_B_NM for the (N, K_GROUPS) B-scale tile.
+    # get_wmma_scale_layout derives each scale's CGA from the operand layout it
+    # is handed: it reads dot_operand.cga_layout -- the accumulator CGA already
+    # projected onto the operand (K broadcast) -- and, for the B operand,
+    # transposes the trailing two dims internally so the (N, K_GROUPS) scale tile
+    # matches B's [K, N] operand order. So the correct argument is the operand's
+    # own dot layout (dot_a_layout / dot_b_layout, both parented on cga_c); the
+    # verifier expects exactly inferDotScaleCGALayoutFromOperand(operand CGA).
+    # (Older triton read the PARENT CGA verbatim and did not transpose, so this
+    # used to hand-build parents carrying CGA_A / CGA_B_NM; that now double-
+    # applies the projection and miscompiles the B scale.)
     a_scale_layout: gl.constexpr = gl.amd.gfx1250.get_wmma_scale_layout(
-        gl.DotOperandLayout(
-            operand_index=0,
-            parent=make_wmma_layout(warp_bases, CGA_A),
-            k_width=16,
-        ),
+        dot_a_layout,
         [BLOCK_SIZE_M, K_GROUPS],
         scale_factor=SCALE_GROUP_SIZE,
     )
     b_scale_layout: gl.constexpr = gl.amd.gfx1250.get_wmma_scale_layout(
-        gl.DotOperandLayout(
-            operand_index=1,
-            parent=make_wmma_layout(warp_bases, CGA_B_NM),
-            k_width=16,
-        ),
+        dot_b_layout,
         [BLOCK_SIZE_N, K_GROUPS],
         scale_factor=SCALE_GROUP_SIZE,
     )

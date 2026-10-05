@@ -6,13 +6,13 @@
 Decode-stage counterpart of the prefill ``causal_conv1d_prefill`` module: a
 single-/few-token autoregressive conv update that directly outputs split
 q/k/v. The ``@triton.jit`` / Gluon kernels live in
-``aiter.ops.triton._triton_kernels.gated_delta_rule.decode.causal_conv1d_update_split_qkv``.
+``aiter.ops.triton._triton_kernels.gated_delta_net.decode.causal_conv1d_update_split_qkv``.
 """
 
 import torch
 import triton
 
-from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.causal_conv1d_update_split_qkv import (
+from aiter.ops.triton._triton_kernels.gated_delta_net.decode.causal_conv1d_update_split_qkv import (
     PAD_SLOT_ID,
     _causal_conv1d_update_split_qkv_kernel,
     gluon_causal_conv1d_update_split_qkv_kernel,

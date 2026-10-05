@@ -31,7 +31,8 @@ jobs:
             | Label | Tests |
             |-------|-------|
             | \`ci:gfx1250-ffm-triton\` | Run the five-shard gfx1250 FFM Triton test suite |
-            | \`ci:triton-300x\` | Run an additional Triton test job on MI300X in PRs; main branch always runs both MI35X and MI300X |
+            | \`ci:triton-300x\` | Run an additional Triton test job on MI300X in PRs (added automatically when gfx942 configs change); main branch always runs both MI35X and MI300X |
+            | \`ci:triton-355\` | Run the full Triton test suite on MI35X, not only the tests the change affects |
             | \`multigpu\` | Aiter multi-GPU tests on the 8-GPU runner |
             | \`ci:sglang\` | SGLang integration tests: DeepSeek-R1-MXFP4 accuracy, Qwen 3.5 accuracy |
             | \`ci:atom\` | ATOM benchmark: DeepSeek-R1-0528, GPT-OSS-120B |

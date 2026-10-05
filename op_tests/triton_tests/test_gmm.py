@@ -625,3 +625,75 @@ def test_tgmm_alt_trans_lhs_int64_group_sizes_grid_dim_override(
             out_torch[non_empty_groups],
             f"Triton {'persistent' if persistent else 'non-persistent'} TGMM doesn't match PyTorch reference TGMM.",
         )
+
+
+def _get_gmm_config_for_arch(monkeypatch, arch, *args, **kwargs):
+    import aiter.ops.triton._triton_kernels.gmm as gmm_kernels
+    from aiter.ops.triton.utils.config_utils import resolve_config_dir
+
+    monkeypatch.setattr(
+        gmm_kernels,
+        "resolve_config_dir",
+        lambda *a, **k: resolve_config_dir(*a, **{**k, "arch": arch}),
+    )
+    # Bypass the lru_cache so the patched resolver is used.
+    return gmm_kernels.get_config.__wrapped__(*args, **kwargs)
+
+
+@pytest.mark.parametrize(
+    "M, K, N, G, accumulate, expected",
+    [
+        (8192, 4096, 4096, 32, False, "large_kn"),  # all thresholds at boundary
+        (8191, 4096, 4096, 32, False, "default"),  # avg rows just below 256
+        (8192, 4095, 4096, 32, False, "default"),  # K just below 4096
+        (8192, 4096, 4095, 32, False, "default"),  # N just below 4096
+        (65536, 7168, 16384, 8, False, "large_kn"),
+        (1024, 2048, 2048, 4, False, "default"),  # no threshold met
+    ],
+)
+def test_gmm_get_config_dispatch_gfx950(monkeypatch, M, K, N, G, accumulate, expected):
+    from aiter.ops.triton.utils.config_utils import (
+        load_config_json,
+        resolve_config_dir,
+    )
+
+    cfg = load_config_json(
+        f"{resolve_config_dir('gmm', 'GMM', backend='triton', arch='gfx950')}/DEFAULT.json"
+    )["gmm"]
+    assert (
+        _get_gmm_config_for_arch(monkeypatch, "gfx950", "gmm", M, K, N, G, accumulate)
+        == cfg[expected]
+    )
+
+
+@pytest.mark.parametrize("gmm_type", ["ptgmm", "nptgmm"])
+def test_gmm_get_config_dispatch_other_variants_unaffected(monkeypatch, gmm_type):
+    from aiter.ops.triton.utils.config_utils import (
+        load_config_json,
+        resolve_config_dir,
+    )
+
+    cfg = load_config_json(
+        f"{resolve_config_dir('gmm', 'GMM', backend='triton', arch='gfx950')}/DEFAULT.json"
+    )[gmm_type]
+    assert "dispatch" not in cfg
+    assert (
+        _get_gmm_config_for_arch(monkeypatch, "gfx950", gmm_type, 8192, 4096, 4096, 32)
+        == cfg["default"]
+    )
+
+
+def test_gmm_get_config_arch_without_dispatch(monkeypatch):
+    from aiter.ops.triton.utils.config_utils import (
+        load_config_json,
+        resolve_config_dir,
+    )
+
+    cfg = load_config_json(
+        f"{resolve_config_dir('gmm', 'GMM', backend='triton', arch='gfx942')}/DEFAULT.json"
+    )["gmm"]
+    assert "dispatch" not in cfg
+    assert (
+        _get_gmm_config_for_arch(monkeypatch, "gfx942", "gmm", 65536, 7168, 16384, 8)
+        == cfg["default"]
+    )

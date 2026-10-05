@@ -565,7 +565,9 @@ def _mla_gluon_decode(
     mla_gluon, kv_c, kv_indices, kv_indptr, q_nope, q_pe, batch, nhead, min_kv
 ):
     kv_lora_rank = q_nope.shape[-1]
-    o = torch.empty((batch, nhead, kv_lora_rank), dtype=q_nope.dtype)
+    o = torch.empty(
+        (batch, nhead, kv_lora_rank), dtype=q_nope.dtype, device=q_nope.device
+    )
     mla_gluon(
         q_nope=q_nope,
         q_pe=q_pe,
@@ -596,14 +598,15 @@ def test_mla_gluon_decode_over_2gb(batch, ctx, nhead, kv_lora_rank, qk_rope_head
 
     A KV cache larger than 2 GB sets ``within_2gb=False`` so the kernel loads KV
     through ``global_load_to_shared`` (64-bit offsets) instead of
-    ``buffer_load_to_shared``.  That path must carry the same bounds mask (+
-    ``other=0.0`` zero-fill) as the buffer path, or the last partial split block
-    reads out of bounds -> illegal memory access (garbage -> NaN).  Compares the
-    >2 GB (global_load) path against the <2 GB (buffer_load) reference on
-    identical KV content placed at high row indices.
+    ``buffer_load_to_shared``.  That path must carry the same bounds mask and
+    ``other=0.0`` zero-fill as the buffer path, or the last partial split block
+    reads out of bounds -> illegal memory access (garbage -> NaN).  The two paths
+    load identical KV, so their outputs must be bit-identical; compared here with
+    the reference KV placed at high row indices in the >2 GB cache.
     """
     if DEVICE_ARCH != "gfx950":
         pytest.skip("Gluon MLA decode is gfx950-only")
+    torch.cuda.empty_cache()
     free, _ = torch.cuda.mem_get_info()
     if free < int(3.5 * 2**30):
         pytest.skip("needs >3.5 GiB free for the >2 GB cache")
@@ -641,4 +644,5 @@ def test_mla_gluon_decode_over_2gb(batch, ctx, nhead, kv_lora_rank, qk_rope_head
     )
 
     assert torch.isfinite(o_big.float()).all(), "NaN/Inf in the >2 GB global_load path"
-    torch.testing.assert_close(o_big, o_ref, atol=1e-2, rtol=1e-2)
+    # the two load paths read identical KV and reduce identically -> exact parity
+    torch.testing.assert_close(o_big, o_ref, atol=0, rtol=0)

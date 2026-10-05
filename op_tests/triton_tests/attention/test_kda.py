@@ -2,13 +2,13 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import json
+import os
 import sys
 
 import pytest
 import torch
 import torch.nn.functional as F
 
-from aiter.ops.triton.attention import kda as kda_module
 from aiter.ops.triton.attention.kda import (
     fused_recurrent_kda,
     fused_recurrent_kda_packed_decode,
@@ -22,14 +22,13 @@ pytestmark = pytest.mark.skipif(
     arch not in ("gfx950", "gfx1250"),
     reason=f"KDA gluon decode needs gfx950/gfx1250, got {arch}",
 )
-# gfx950 runs the vLLM decode path only: V-first state, head_dim 128, no spec
-# decoding, cache_state_updates or tiling knobs
+
 gfx1250_only = pytest.mark.skipif(arch != "gfx1250", reason="gfx1250-only feature")
 
 
-def skip_on_gfx950(D=128, spec=False):
-    if arch == "gfx950" and (D != 128 or spec):
-        pytest.skip("gfx950 KDA decode needs head_dim 128 and no spec decoding")
+def skip_on_gfx950(D=128):
+    if arch == "gfx950" and D != 128:
+        pytest.skip("gfx950 KDA decode needs head_dim 128")
 
 
 DEVICE = "cuda"
@@ -167,15 +166,20 @@ _TUNED: dict = {}
 
 @pytest.fixture
 def get_config(monkeypatch, tmp_path):
-    name = f"{arch}-KDA_DECODE-DEFAULT.json"
-    with open(f"{triton_core.AITER_TRITON_CONFIGS_PATH}/{name}") as f:
+    # The shipped family lives at <configs>/<arch>/gluon/attention/kda_decode/;
+    # a variant is written to the same relative path under tmp_path and the
+    # config root is pointed there, so the wrapper resolves the variant.
+    cfg_dir = triton_core.resolve_config_dir("attention", "KDA_DECODE", backend="gluon")
+    with open(f"{cfg_dir}/DEFAULT.json") as f:
         shipped = json.load(f)
+    relative = os.path.relpath(cfg_dir, triton_core.AITER_TRITON_CONFIGS_PATH)
 
     def _get(**variant):
         merged = {b: {**values, **variant} for b, values in shipped.items()}
-        (tmp_path / name).write_text(json.dumps(merged))
+        variant_dir = tmp_path / relative
+        variant_dir.mkdir(parents=True, exist_ok=True)
+        (variant_dir / "DEFAULT.json").write_text(json.dumps(merged))
         monkeypatch.setattr(triton_core, "AITER_TRITON_CONFIGS_PATH", str(tmp_path))
-        monkeypatch.setattr(kda_module, "AITER_TRITON_CONFIGS_PATH", str(tmp_path))
         monkeypatch.setattr(sys.modules[__name__], "_TUNED", dict(variant))
 
     return _get
@@ -439,7 +443,6 @@ def test_fused_recurrent_varlen(lens):
 @pytest.mark.parametrize("spec", [False, True])
 def test_fused_recurrent_vllm_decode(B, T, spec):
     """Continuous batching with paged state, poisoning untouched slots."""
-    skip_on_gfx950(spec=spec)
     H, D = 8, 128
     pool_kv, indices, untouched = make_pool(B, T, H, D)
 
@@ -1320,8 +1323,7 @@ def test_pad_slot_guard():
         assert_close(f"o[{n}]", ref, o[:, b:e])
         assert_close(f"ht[{n}]", ref_ht[0], pool_out[int(indices[n, T - 1])])
 
-    assert torch.all(o[:, T] == 0), "pad seq token 0 must be zeroed"
-    assert torch.all(o[:, T + 1 : 2 * T] == 123.0), "pad seq must not be computed"
+    assert torch.all(o[:, T : 2 * T] == 0), "every pad seq token must be zeroed"
     assert torch.all(pool_out[0] == POISON), "the pad slot was written"
 
 
@@ -1492,6 +1494,88 @@ def test_fused_conv_rms_gate(N, T, H):
     ref = ob * torch.rsqrt(ob.square().mean(-1, keepdim=True) + eps) * nw
     ref = ref * torch.sigmoid(shp(og).float())
     assert torch.equal(cs1, cs2), "conv state roll"
+    assert_close("o", ref, o1)
+    assert_close("ht", S2, S1)
+
+
+@pytest.mark.parametrize("N, k", [(3, 3), (2, 7), (5, 1)])
+@pytest.mark.parametrize("padded", [False, True])
+def test_fused_conv_rms_gate_spec(N, k, padded):
+    """vLLM's spec conv window: W-1+k taps in slot column 0, read from
+    num_accepted-1; the step leaves taps 1..W-2 followed by its inputs. A padded
+    sequence (slot 0) zeroes all of its tokens and writes no state."""
+    D, W, eps, lb, H = 128, 4, 1e-6, -5.0, 8
+    T = k + 1
+    lp, TT, NS = H * D, N * T, N * T + 4
+    torch.manual_seed(N * 11 + k)
+    mixed = torch.randn(TT, 3 * lp, dtype=torch.bfloat16, device=DEVICE)
+    cw = torch.randn(3 * lp, W, dtype=torch.bfloat16, device=DEVICE) * 0.1
+    cs = torch.randn(NS, W - 1 + k, 3 * lp, dtype=torch.bfloat16, device=DEVICE)
+    cs = cs.transpose(-1, -2) * 0.1  # vLLM's SD storage, seen as (dim, taps)
+    g = torch.randn(1, TT, H, D, dtype=torch.bfloat16, device=DEVICE) * 0.5
+    beta = torch.randn(1, TT, H, dtype=torch.bfloat16, device=DEVICE)
+    og = torch.randn(1, TT, H, D, dtype=torch.bfloat16, device=DEVICE)
+    A_log = torch.randn(H, dtype=torch.float32, device=DEVICE) * 0.1
+    dt_bias = torch.randn(lp, dtype=torch.float32, device=DEVICE) * 0.1
+    S = torch.randn(NS, H, D, D, dtype=torch.float32, device=DEVICE) * 0.01
+    nw = torch.rand(D, dtype=torch.float32, device=DEVICE) + 0.5
+    idx = (torch.randperm(NS - 1, device=DEVICE)[:TT] + 1).int().view(N, T)
+    if padded:
+        idx[0] = 0
+    acc = torch.randint(1, T + 1, (N,), dtype=torch.int32, device=DEVICE)
+    kw = {
+        "g": g,
+        "beta": beta,
+        "A_log": A_log,
+        "dt_bias": dt_bias,
+        "lower_bound": lb,
+        "use_qk_l2norm_in_kernel": True,
+        "use_gate_in_kernel": True,
+        "use_beta_sigmoid_in_kernel": True,
+        "pad_slot_guard": True,
+        "cu_seqlens": torch.arange(0, TT + 1, T, dtype=torch.int64, device=DEVICE),
+        "ssm_state_indices": idx,
+        "num_accepted_tokens": acc,
+    }
+    view = lambda off: mixed.as_strided((1, TT, H, D), (TT * 3 * lp, 3 * lp, D, 1), off)
+    S1, cs1 = S.clone(), cs.clone()
+    o1, _ = fused_recurrent_kda(
+        q=view(0),
+        k=view(lp),
+        v=view(2 * lp),
+        initial_state=S1,
+        conv_state=cs1,
+        conv_weight=cw.view(3, lp, W).permute(0, 2, 1).contiguous().float(),
+        out_gate=og,
+        norm_weight=nw,
+        norm_eps=eps,
+        out=torch.full_like(og, float("nan")),
+        **kw,
+    )
+    # reference: torch conv under vLLM's window rules, then the recurrence alone
+    x, w, S2, cs2 = mixed.float(), cw.float(), S.clone(), cs.clone()
+    y = torch.zeros(TT, 3 * lp, device=DEVICE)
+    for n in range(N):
+        c, off, rows = int(idx[n, 0]), int(acc[n]) - 1, slice(n * T, (n + 1) * T)
+        if c == 0:
+            continue
+        h = cs2[c].float()
+        taps = h[:, off : off + W - 1]
+        for t in range(T):
+            y[n * T + t] = (taps * w[:, : W - 1]).sum(-1) + x[n * T + t] * w[:, W - 1]
+            taps = torch.cat([taps[:, 1:], x[n * T + t, :, None]], -1)
+        window = torch.cat([h[:, off + 1 : off + W - 1], x[rows].T], -1)
+        cs2[c][:, : W - 2 + T] = window.to(cs.dtype)
+    y = y * torch.sigmoid(y)
+    q2, k2, v2 = (
+        y[None, :, i * lp : (i + 1) * lp].reshape(1, TT, H, D) for i in range(3)
+    )
+    o2, _ = fused_recurrent_kda(q=q2, k=k2, v=v2, initial_state=S2, **kw)
+    ob = o2.to(torch.bfloat16).float()
+    ref = ob * torch.rsqrt(ob.square().mean(-1, keepdim=True) + eps) * nw
+    ref = ref * torch.sigmoid(og.float())
+    assert torch.equal(cs1, cs2), "conv window"
+    assert not padded or o1[0, :T].eq(0).all(), "padded sequence output"
     assert_close("o", ref, o1)
     assert_close("ht", S2, S1)
 

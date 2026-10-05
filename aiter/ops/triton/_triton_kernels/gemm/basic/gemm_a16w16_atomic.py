@@ -20,6 +20,7 @@ _gemm_a16w16_atomic_repr = make_kernel_repr(
         "cache_modifier",
         "EVEN_K",
         "GRID_MN",
+        "ACCUMULATE",
     ],
 )
 
@@ -57,8 +58,9 @@ def _gemm_a16_w16_atomic_kernel(
     cache_modifier: tl.constexpr,
     EVEN_K: tl.constexpr,
     GRID_MN: tl.constexpr,
+    ACCUMULATE: tl.constexpr = False,
 ):
-    """Kernel for computing the matmul C = A x B.
+    """Kernel for computing the matmul C = A x B, or C += A x B with ACCUMULATE.
     A has shape (M, K), B has shape (K, N) and C has shape (M, N)
     """
 
@@ -134,6 +136,9 @@ def _gemm_a16_w16_atomic_kernel(
         c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
         if NUM_KSPLIT == 1:
+            if ACCUMULATE:
+                c_prev = tl.load(c_ptrs, mask=c_mask, other=0.0).to(acc_dtype)
+                c = (accumulator + c_prev).to(c_ptr.type.element_ty)
             tl.store(c_ptrs, c, mask=c_mask)
         else:
             tl.atomic_add(c_ptrs, c, mask=c_mask, sem="relaxed")

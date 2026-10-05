@@ -1,11 +1,14 @@
 {
     "N_LEQ_512": {
-        "num_warps": 1
+        "num_warps": 1,
+        "waves_per_eu": 0
     },
     "N_LEQ_2048": {
-        "num_warps": 4
+        "num_warps": 4,
+        "waves_per_eu": 0
     },
     "any": {
-        "num_warps": 8
+        "num_warps": 8,
+        "waves_per_eu": 0
     }
 }

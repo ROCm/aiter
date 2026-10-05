@@ -9,6 +9,7 @@ from aiter.ops.triton.attention.pa_mqa_logits_mxfp4 import (
 )
 from aiter.ops.triton.fusions.k_norm_rope_mxfp4_cache import k_norm_rope_mxfp4_cache
 from aiter.ops.triton.rope.q_rope_mxfp4_quant import q_rope_mxfp4_quant
+from aiter.ops.triton.utils._triton import arch_info
 from op_tests.triton_tests.utils.pa_mqa_logits_mxfp4_ref import (
     unshuffle_scales,
     unshuffle_values,
@@ -244,6 +245,10 @@ def test_q_quant_matches_reference(num_tokens, num_heads, with_weights):
 
 
 @pytest.mark.parametrize("page_size", [64, 128])
+@pytest.mark.skipif(
+    arch_info.get_arch() != "gfx950",
+    reason="paged MXFP4 MQA logits is gfx950 only",
+)
 def test_round_trip_through_logits(page_size):
     """Keys written by the cache op and a query from the quant op score as the
     dequantized values do: the writer and paged_mxfp4_mqa_logits agree."""

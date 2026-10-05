@@ -143,6 +143,10 @@ def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
         from .mega_moe import default_jobs
 
         return default_jobs()
+    if kind is OpKind.FMHA_FP8:
+        from .fmha_fp8 import default_jobs
+
+        return default_jobs()
     if kind is OpKind.MOE:
         from .moe import DEFAULT_CSVS, parse_csv
     elif kind is OpKind.MXFP4_MOE:
@@ -155,8 +159,6 @@ def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
         from .grouped_moe import DEFAULT_CSVS, parse_csv
     elif kind is OpKind.CHUNK_GDN_H:
         from .chunk_gdn_h import DEFAULT_CSVS, parse_csv
-    elif kind is OpKind.FMHA_FP8:
-        from .fmha_fp8 import DEFAULT_CSVS, parse_csv
     else:
         raise ValueError(f"unknown FlyDSL AOT kind: {kind!r}")
     return collect_aot_jobs(DEFAULT_CSVS, parse_csv)

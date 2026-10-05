@@ -8,7 +8,7 @@ Gated Delta Net Operations (Forward Only).
 This module provides high-level Triton implementations for gated delta rule.
 """
 
-from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import (
+from aiter.ops.triton._triton_kernels.gated_delta_net.utils import (
     GatedDeltaRulePrefillMetadata,
     build_gated_delta_rule_prefill_metadata,
 )

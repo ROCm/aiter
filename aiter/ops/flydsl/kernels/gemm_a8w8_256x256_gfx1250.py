@@ -88,7 +88,6 @@ def launch_gemm_a8w8_256x256(
     assert not fused_splitk or (
         split_k > 1 and tile_m % split_k == 0
     ), "a fused split-K epilogue needs split_k > 1 dividing tile_m"
-    assert not cluster_splitk or block_size == 128, "fsk requires split-K block128"
     cluster_k = split_k if cluster_splitk else 1
     assert (
         cluster_m * cluster_n * cluster_k <= 16
@@ -649,9 +648,23 @@ def launch_gemm_a8w8_256x256(
                     seed_b[wn].store(_stage_load_frag("b", stage, wn))
 
                 b_thunks.append(_go_b)
-            if const_expr(parity == 0):
-                return head + a_thunks, b_thunks
-            return head + b_thunks, a_thunks
+            early, tail = (
+                (a_thunks, b_thunks)
+                if const_expr(parity == 0)
+                else (b_thunks, a_thunks)
+            )
+            n_slots = half_m * half_n
+            if const_expr(
+                mx32
+                and N_SA == N_SB
+                and len(head) + len(early) - (n_slots - n_slots // 4)
+                > n_slots - len(tail)
+            ):
+                head = [
+                    (lambda a=head[i], b=head[N_SA + i]: (a(), b()))
+                    for i in range_constexpr(N_SA)
+                ]
+            return head + early, tail
 
         def _compute_stage_lean(
             stage,

@@ -15,7 +15,11 @@
 
 namespace aiter {
 
-template <typename DTYPE_I, typename DTYPE_O, int BlockSize, int thread_data_size, bool ADD_RESIDUAL=true, bool FUSE_QUANT=true, bool interleave = false, int num_row = 1>
+// scale_m32k4: fp8 + e8m0 + group_size 32 only. The scale goes straight into the gfx1250
+// MXFP8 ASM GEMM A-scale layout (shuffle_mxfp8fp4_scale bytes),
+//     scale[(row / 32) * n + (g / 4) * 128 + (row % 32) * 4 + g % 4],
+// and the grid is padded to a multiple of 32 rows whose blocks only write the pad scales (0x7F).
+template <typename DTYPE_I, typename DTYPE_O, int BlockSize, int thread_data_size, bool ADD_RESIDUAL=true, bool FUSE_QUANT=true, bool interleave = false, int num_row = 1, bool scale_m32k4 = false>
 __global__ void add_rmsnorm_quant_kernel(
     DTYPE_O* out,
     DTYPE_I* residual_out,
@@ -43,6 +47,12 @@ __global__ void add_rmsnorm_quant_kernel(
         int64_t idx = blockIdx.x * num_row;
         if (idx >= m)
         {
+            if constexpr(scale_m32k4)
+            {
+                auto* tmp = reinterpret_cast<uint8_t*>(scale);
+                for(int y = threadIdx.x; y < n / 32; y += BlockSize)
+                    tmp[(idx / 32) * n + (y / 4) * 128 + (idx % 32) * 4 + y % 4] = 0x7F;
+            }
             return;
         }
         int tid = threadIdx.x;
@@ -267,7 +277,11 @@ __global__ void add_rmsnorm_quant_kernel(
                             auto* tmp        = reinterpret_cast<uint8_t*>(scale);
                             uint8_t exponent = (__builtin_bit_cast(uint32_t, quant_scale) >> 23) & 0b11111111;
                             int scaleN = n / group_size;
-                            if(shuffle_scale)
+                            if constexpr(scale_m32k4)
+                            {
+                                x = (x / 32) * n + (y / 4) * 128 + (x % 32) * 4 + y % 4;
+                            }
+                            else if(shuffle_scale)
                             {
                                 if(group_size == 32)
                                 {
@@ -328,6 +342,9 @@ __global__ void add_rmsnorm_quant_kernel(
     }
 
 #define ADD_RMSNORM_QUANT_KERNEL_IMPL_(DTYPE_O, BlockSize, thread_data_size, ADD_RESIDUAL, FUSE_QUANT, interleave) \
+    ADD_RMSNORM_QUANT_KERNEL_IMPL_M(DTYPE_O, BlockSize, thread_data_size, ADD_RESIDUAL, FUSE_QUANT, interleave, false)
+
+#define ADD_RMSNORM_QUANT_KERNEL_IMPL_M(DTYPE_O, BlockSize, thread_data_size, ADD_RESIDUAL, FUSE_QUANT, interleave, SCALE_M32K4) \
     AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "quant_kernel", [&] {                    \
     using DTYPE_I = typename hip2opus<scalar_t>::type;                                        \
     using DTYPE_OO = std::conditional_t<FUSE_QUANT, DTYPE_O, DTYPE_I>; \
@@ -335,9 +352,10 @@ __global__ void add_rmsnorm_quant_kernel(
     int reduce_thread_size = group_size / thread_data_size; \
     AITER_CHECK(group_size == 0 || (reduce_thread_size & (reduce_thread_size - 1)) == 0, __func__, " reduce_thread_size is not power of 2"); \
     const int num_row_per_block = 1; \
-    dim3 grid((m + num_row_per_block - 1) / num_row_per_block); \
+    const int grid_rows = SCALE_M32K4 ? (m + 31) / 32 * 32 : m; \
+    dim3 grid((grid_rows + num_row_per_block - 1) / num_row_per_block); \
     dim3 block(BlockSize); \
-    add_rmsnorm_quant_kernel<DTYPE_I, DTYPE_OO, BlockSize, thread_data_size, ADD_RESIDUAL, FUSE_QUANT, interleave, num_row_per_block><<<grid, block, 0, stream>>>(reinterpret_cast<DTYPE_OO*>(out.data_ptr()), \
+    add_rmsnorm_quant_kernel<DTYPE_I, DTYPE_OO, BlockSize, thread_data_size, ADD_RESIDUAL, FUSE_QUANT, interleave, num_row_per_block, SCALE_M32K4><<<grid, block, 0, stream>>>(reinterpret_cast<DTYPE_OO*>(out.data_ptr()), \
                                                                                                      reinterpret_cast<DTYPE_I*>(residual_out.data_ptr()), \
                                                                                                      reinterpret_cast<float*>(scale.data_ptr()), \
                                                                                                      reinterpret_cast<DTYPE_I*>(input.data_ptr()), \
@@ -399,6 +417,47 @@ __global__ void add_rmsnorm_quant_kernel(
         AITER_CHECK(false, __func__, " not support n: ", n); \
     }
 
+// m32k4 scale layout: fp8 + e8m0 + group_size 32. Same width buckets as the grouped
+// dispatch above; 32 % thread_data_size == 0 holds for every bucket used here.
+#define RMSNORM_QUANT_M32K4_IMPL(BlockSize, thread_data_size, ADD_RESIDUAL) \
+    ADD_RMSNORM_QUANT_KERNEL_IMPL_M(opus::fp8_t, BlockSize, thread_data_size, ADD_RESIDUAL, true, (thread_data_size <= 8), true)
+
+#define RMSNORM_QUANT_M32K4_DISPATCH(ADD_RESIDUAL) \
+    if (n <= 512) { \
+        RMSNORM_QUANT_M32K4_IMPL(64, 8, ADD_RESIDUAL); \
+    } else if (n <= 1024) { \
+        RMSNORM_QUANT_M32K4_IMPL(128, 8, ADD_RESIDUAL); \
+    } else if (n <= 2048) { \
+        RMSNORM_QUANT_M32K4_IMPL(128, 16, ADD_RESIDUAL); \
+    } else if (n <= 4096) { \
+        RMSNORM_QUANT_M32K4_IMPL(256, 16, ADD_RESIDUAL); \
+    } else if (n <= 6144) { \
+        if (cu_num < 160) { \
+            RMSNORM_QUANT_M32K4_IMPL(512, 16, ADD_RESIDUAL); \
+        } else { \
+            RMSNORM_QUANT_M32K4_IMPL(1024, 8, ADD_RESIDUAL); \
+        } \
+    } else if (n <= 8192) { \
+        RMSNORM_QUANT_M32K4_IMPL(256, 32, ADD_RESIDUAL); \
+    } else { \
+        AITER_CHECK(false, __func__, " not support n: ", n); \
+    }
+
+    static inline void check_scale_m32k4(const aiter_tensor_t& out, const aiter_tensor_t& scale,
+                                         int group_size, int m, int n, bool emit_e8m0_scale)
+    {
+        AITER_CHECK(out.dtype() == AITER_DTYPE_fp8, "scale_layout_m32k4 needs fp8 output, got ",
+                    AiterDtype_to_str(out.dtype()));
+        AITER_CHECK(emit_e8m0_scale && group_size == 32,
+                    "scale_layout_m32k4 needs an e8m0 scale and group_size 32, got group_size ",
+                    group_size);
+        AITER_CHECK(n % 128 == 0, "scale_layout_m32k4 needs n % 128 == 0, got ", n);
+        const int64_t m_pad = (static_cast<int64_t>(m) + 31) / 32 * 32;
+        AITER_CHECK(scale.is_contiguous() && scale.numel() >= m_pad * (n / 32),
+                    "scale_layout_m32k4 needs a contiguous (pad32(m), n/32) = (", m_pad, ", ",
+                    n / 32, ") scale, got numel ", scale.numel());
+    }
+
     // A zero-element placeholder for optional operands (residual / scale) that a
     // given entry point does not use. The kernel never dereferences these when
     // the corresponding ADD_RESIDUAL / FUSE_QUANT path is disabled; only
@@ -426,7 +485,8 @@ __global__ void add_rmsnorm_quant_kernel(
         double epsilon,
         int group_size = 0,
         bool shuffle_scale = false,
-        bool gemma_norm = false
+        bool gemma_norm = false,
+        bool scale_layout_m32k4 = false
     )
     {
         int n = input.size(1);
@@ -443,6 +503,12 @@ __global__ void add_rmsnorm_quant_kernel(
         const bool emit_e8m0_scale = scale.element_size() == 1;
         AITER_CHECK(!emit_e8m0_scale || group_size != 0, __func__,
                     " e8m0 byte scale requires group_size != 0");
+        if(scale_layout_m32k4)
+        {
+            check_scale_m32k4(out, scale, group_size, m, n, emit_e8m0_scale);
+            RMSNORM_QUANT_M32K4_DISPATCH(true);
+            return;
+        }
 
         if(out.dtype() == AITER_DTYPE_fp8)
         {
@@ -499,7 +565,8 @@ __global__ void add_rmsnorm_quant_kernel(
         double epsilon,
         int group_size = 0,
         bool shuffle_scale = false,
-        bool gemma_norm = false
+        bool gemma_norm = false,
+        bool scale_layout_m32k4 = false
     )
     {
         aiter_tensor_t residual_in = empty_placeholder(input.dtype(), input.device_id);
@@ -519,6 +586,12 @@ __global__ void add_rmsnorm_quant_kernel(
         const bool emit_e8m0_scale = scale.element_size() == 1;
         AITER_CHECK(!emit_e8m0_scale || group_size != 0, __func__,
                     " e8m0 byte scale requires group_size != 0");
+        if(scale_layout_m32k4)
+        {
+            check_scale_m32k4(out, scale, group_size, m, n, emit_e8m0_scale);
+            RMSNORM_QUANT_M32K4_DISPATCH(false);
+            return;
+        }
 
         if(out.dtype() == AITER_DTYPE_fp8)
         {

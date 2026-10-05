@@ -29,6 +29,7 @@
 #include <hip/hip_runtime.h>
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <hip/hip_fp16.h>
@@ -541,4 +542,259 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     }
 
     impl_ptr->launch_kernel({arg_buf, &arg_size, gdx, gdy, gdz, block_dim, 1, 1, stream});
+}
+
+// ----------------------------------------------------------------------------
+// Persistent-scheduling v4 nm decode (CSV row ps=1)
+//
+// One launch per call: grid (2 * P, 1, 1), block 256. The kernel plans the
+// KV split over P partitions in-kernel from kv_indptr, runs the attention
+// and merges the split partials itself (the last arriving partition of a row
+// combines it), so there is no host split plan and no stage-2 merge.
+// Same math and packed Q / KV / rope layouts as mla_decode_v4_asm with
+// gqa=128, max_seqlen_q=1 and page_size=1; rows with K=0 are left unwritten.
+//
+// The kernarg block keeps the 21 x 16 B layout of MlaV4KernelArgsLegacy;
+// slots marked "repurposed" carry a different value than the non-persistent
+// kernel, and several upper halves of the pointer slots carry an extra field.
+// ----------------------------------------------------------------------------
+struct __attribute__((packed)) MlaV4PsKernelArgs
+{
+    void* ptr_O_acc; // 0x00: workspace o_acc  [2P, 128, 512] FP32 split partials
+                     // (rw)
+    void* ptr_out;   // 0x08: out [N, 128, 512] BF16 (upper half of slot 0)
+    void* ptr_L_acc; // 0x10: workspace lse_acc [2P, 128] FP32 split partials (rw)
+    void* ptr_lse;   // 0x18: final LSE [N, 128] FP32, nullptr = not written
+    void* ptr_Q;
+    p2 _p_q; // 0x20: Q packed FP8 + e8m0 scale
+    void* ptr_KV;
+    p2 _p_kv; // 0x30: KV packed FP8
+    void* ptr_LTP;
+    p2 _p_ltp; // 0x40: kv_indptr
+    void* ptr_LTD;
+    p2 _p_ltd;      // 0x50: kv_page_indices
+    void* ptr_desc; // 0x60: repurposed: workspace desc [P, 8] int32 (rw)
+    void* ptr_dbg;  // 0x68: unused, nullptr
+    float scalar_f;
+    p3 _p_sc; // 0x70: 1.0f/sqrtf(kV4DimNope+kV4DimRope)
+    unsigned int s_gqa_ratio;
+    p3 _p_gr;                // 0x80: 128 (heads)
+    unsigned int s_kv_split; // 0x90: 1
+    unsigned int _p_ks;      // 0x94: pad
+    void* ptr_cnt;           // 0x98: workspace cnt int32 counters (rw, zero at rest)
+    unsigned int s_num_p;    // 0xa0: repurposed: number of partitions P
+    unsigned int s_num_q;    // 0xa4: number of query rows N
+    p2 _p_nq;                // 0xa8: pad
+    unsigned int s_plan;     // 0xb0: repurposed: planner config F | (MT << 8)
+    unsigned int _p_pl;      // 0xb4: pad
+    void* ptr_unused;        // 0xb8: not read by this kernel, nullptr
+    unsigned int s_zero;
+    p3 _p_z; // 0xc0: 0
+    void* ptr_QTP;
+    p2 _p_qtp; // 0xd0: repurposed: workspace arange int32 (read-only)
+    void* ptr_STP;
+    p2 _p_stp; // 0xe0: repurposed: the same arange
+    unsigned int out_16_nosplit;
+    p3 _p_o16; // 0xf0: 1
+    void* ptr_QROPE;
+    p2 _p_qrope; // 0x100: Q rope BF16
+    void* ptr_KVROPE;
+    p2 _p_kvrope; // 0x110: KV rope BF16
+    void* ptr_sink;
+    p2 _p_sink; // 0x120: [128] FP32 attention sink logit
+    void* ptr_zero;
+    p2 _p_pz; // 0x130: nullptr
+    unsigned int s_zero2;
+    p3 _p_z2; // 0x140: 0
+};
+static_assert(sizeof(MlaV4PsKernelArgs) == 21 * 16, "persistent v4 nm kernarg is 0x150 bytes");
+static_assert(offsetof(MlaV4PsKernelArgs, ptr_cnt) == 0x98 &&
+                  offsetof(MlaV4PsKernelArgs, s_num_q) == 0xa4 &&
+                  offsetof(MlaV4PsKernelArgs, ptr_unused) == 0xb8 &&
+                  offsetof(MlaV4PsKernelArgs, ptr_sink) == 0x120,
+              "persistent v4 nm kernarg offsets");
+
+// Workspace sizes the kernel indexes into (aiter/mla.py
+// get_mla_v4_nm_ps_workspace).
+// cnt holds [0, 2*65536) row counters, [2*65536, +16*512) reserved (unused)
+// and [.., +4*1024) group counters.
+static constexpr int kV4PsHeads            = 128;
+static constexpr int kV4PsDim              = kV4DimNope + kV4DimRope;
+static constexpr int kV4PsMaxParts         = 1024;
+static constexpr int kV4PsMaxRows          = 32768; // byte offsets of out / q wrap above this
+static constexpr int64_t kV4PsArange       = 65537;
+static constexpr int64_t kV4PsCntInts      = 2 * 65536 + 16 * 512 + 4 * 1024;
+static constexpr unsigned int kV4PsPlanCfg = 6u | (1u << 8);
+
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
+    mla_decode_v4_ps_asm,
+    (aiter_tensor_t * Q,              // [N, 128, 512] FP8 packed Q + e8m0
+     aiter_tensor_t* qrope,           // [N, 128, 64] BF16
+     aiter_tensor_t* KV,              // [rows, ..., 512] FP8 packed KV, row-dense
+     aiter_tensor_t* kvrope,          // [rows, ..., 64] BF16, row-dense
+     aiter_tensor_t* kv_indptr,       // [>= N+1] int32
+     aiter_tensor_t* kv_page_indices, // [*] int32
+     aiter_tensor_t* sink,            // [128] FP32
+     aiter_tensor_t* o_acc,           // workspace [2P, 128, 512] FP32
+     aiter_tensor_t* lse_acc,         // workspace [2P, 128] FP32
+     aiter_tensor_t* desc,            // workspace [P, 8] int32
+     aiter_tensor_t* cnt,             // workspace [kV4PsCntInts] int32, zero at rest
+     aiter_tensor_t* arange,          // workspace arange(kV4PsArange) int32
+     aiter_tensor_t* output,          // [N, 128, 512] BF16
+     aiter_tensor_t* lse,             // [N, 128] FP32, nullable
+     hipStream_t stream),
+    (Q,
+     qrope,
+     KV,
+     kvrope,
+     kv_indptr,
+     kv_page_indices,
+     sink,
+     o_acc,
+     lse_acc,
+     desc,
+     cnt,
+     arange,
+     output,
+     lse,
+     stream))
+{
+    auto check_buf = [&](aiter_tensor_t* t, AiterDtype dt, const char* name) {
+        AITER_CHECK(t != nullptr && t->data_ptr() != nullptr,
+                    "mla_decode_v4_ps_asm",
+                    ": `",
+                    name,
+                    "` is NULL");
+        AITER_CHECK(t->dtype() == dt,
+                    "mla_decode_v4_ps_asm",
+                    ": `",
+                    name,
+                    "` has dtype ",
+                    AiterDtype_to_str(t->dtype()),
+                    ", expected ",
+                    AiterDtype_to_str(dt));
+        AITER_CHECK(
+            t->is_contiguous(), "mla_decode_v4_ps_asm", ": `", name, "` must be contiguous");
+        AITER_CHECK(t->device_id == Q->device_id,
+                    "mla_decode_v4_ps_asm",
+                    ": `",
+                    name,
+                    "` is on another device");
+    };
+    AITER_CHECK(Q != nullptr, __func__, ": `Q` is NULL");
+    check_buf(Q, AITER_DTYPE_fp8, "Q");
+    check_buf(qrope, AITER_DTYPE_bf16, "qrope");
+    check_buf(KV, AITER_DTYPE_fp8, "KV");
+    check_buf(kvrope, AITER_DTYPE_bf16, "kvrope");
+    check_buf(kv_indptr, AITER_DTYPE_i32, "kv_indptr");
+    check_buf(kv_page_indices, AITER_DTYPE_i32, "kv_page_indices");
+    check_buf(sink, AITER_DTYPE_fp32, "sink");
+    check_buf(o_acc, AITER_DTYPE_fp32, "o_acc");
+    check_buf(lse_acc, AITER_DTYPE_fp32, "lse_acc");
+    check_buf(desc, AITER_DTYPE_i32, "desc");
+    check_buf(cnt, AITER_DTYPE_i32, "cnt");
+    check_buf(arange, AITER_DTYPE_i32, "arange");
+    check_buf(output, AITER_DTYPE_bf16, "output");
+    if(lse != nullptr && lse->data_ptr() != nullptr)
+        check_buf(lse, AITER_DTYPE_fp32, "lse");
+
+    AITER_CHECK(Q->dim() == 3 && Q->size(1) == kV4PsHeads && Q->size(2) == kV4PsDim,
+                __func__,
+                ": Q must be [N, 128, 512]");
+    const int64_t num_q = Q->size(0);
+    AITER_CHECK(num_q <= kV4PsMaxRows, __func__, ": N=", num_q, " exceeds ", kV4PsMaxRows);
+    AITER_CHECK(qrope->numel() == static_cast<size_t>(num_q * kV4PsHeads * kV4DimRope),
+                __func__,
+                ": qrope must be [N, 128, 64]");
+    AITER_CHECK(output->dim() == 3 && output->size(0) == num_q && output->size(1) == kV4PsHeads &&
+                    output->size(2) == kV4PsDim,
+                __func__,
+                ": output must be [N, 128, 512]");
+    if(lse != nullptr && lse->data_ptr() != nullptr)
+        AITER_CHECK(lse->numel() == static_cast<size_t>(num_q * kV4PsHeads),
+                    __func__,
+                    ": lse must be [N, 128]");
+    AITER_CHECK(KV->size(-1) == kV4PsDim && kvrope->size(-1) == kV4DimRope &&
+                    KV->numel() / kV4PsDim == kvrope->numel() / kV4DimRope,
+                __func__,
+                ": KV / kvrope must be row-dense [rows, 512] / [rows, 64] with "
+                "equal rows");
+    AITER_CHECK(static_cast<int64_t>(kv_indptr->numel()) >= num_q + 1,
+                __func__,
+                ": kv_indptr needs at least N+1 entries");
+    AITER_CHECK(sink->numel() == kV4PsHeads, __func__, ": sink must have 128 entries");
+
+    AITER_CHECK(desc->dim() == 2 && desc->size(1) == 8, __func__, ": desc must be [P, 8]");
+    const int64_t num_p = desc->size(0);
+    AITER_CHECK(num_p >= 1 && num_p <= kV4PsMaxParts,
+                __func__,
+                ": num_partitions=",
+                num_p,
+                " must be in [1, ",
+                kV4PsMaxParts,
+                "]");
+    AITER_CHECK(o_acc->numel() == static_cast<size_t>(2 * num_p * kV4PsHeads * kV4PsDim),
+                __func__,
+                ": o_acc must be [2P, 128, 512]");
+    AITER_CHECK(lse_acc->numel() == static_cast<size_t>(2 * num_p * kV4PsHeads),
+                __func__,
+                ": lse_acc must be [2P, 128]");
+    AITER_CHECK(cnt->numel() >= static_cast<size_t>(kV4PsCntInts),
+                __func__,
+                ": cnt needs ",
+                kV4PsCntInts,
+                " entries");
+    AITER_CHECK(arange->numel() >= static_cast<size_t>(kV4PsArange),
+                __func__,
+                ": arange needs ",
+                kV4PsArange,
+                " entries");
+    if(num_q == 0)
+        return;
+
+    const HipDeviceGuard device_guard(Q->device_id);
+
+    MlaV4PsKernelArgs args = {};
+    args.ptr_O_acc         = o_acc->data_ptr();
+    args.ptr_out           = output->data_ptr();
+    args.ptr_L_acc         = lse_acc->data_ptr();
+    args.ptr_lse           = (lse != nullptr) ? lse->data_ptr() : nullptr;
+    args.ptr_Q             = Q->data_ptr();
+    args.ptr_KV            = KV->data_ptr();
+    args.ptr_LTP           = kv_indptr->data_ptr();
+    args.ptr_LTD           = kv_page_indices->data_ptr();
+    args.ptr_desc          = desc->data_ptr();
+    args.ptr_dbg           = nullptr;
+    args.scalar_f          = 1.0f / std::sqrt(static_cast<float>(kV4PsDim));
+    args.s_gqa_ratio       = kV4PsHeads;
+    args.s_kv_split        = 1;
+    args.ptr_cnt           = cnt->data_ptr();
+    args.s_num_p           = static_cast<unsigned int>(num_p);
+    args.s_num_q           = static_cast<unsigned int>(num_q);
+    args.s_plan            = kV4PsPlanCfg;
+    args.ptr_unused        = nullptr;
+    args.ptr_QTP           = arange->data_ptr();
+    args.ptr_STP           = arange->data_ptr();
+    args.out_16_nosplit    = 1;
+    args.ptr_QROPE         = qrope->data_ptr();
+    args.ptr_KVROPE        = kvrope->data_ptr();
+    args.ptr_sink          = sink->data_ptr();
+
+    CFG* config_map = &cfg_mla_v4_asm;
+    // Separate cache from mla_decode_v4_asm's; keys are the distinct symbol
+    // names.
+    static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
+    const std::string arch_id    = get_gpu_arch();
+    const std::string kernelName = get_heuristic_kernel_mla_v4(
+        "fp8", "fp8", /*gqa=*/64, /*ps=*/1, 0, 0, /*qseqlen=*/1, /*lse=*/1, arch_id, config_map);
+    auto it = config_map->find(kernelName);
+    AITER_CHECK(it != config_map->end(), __func__, " not find kernel ", kernelName);
+    const char* name    = it->second.knl_name.c_str();
+    const char* co_name = it->second.co_name.c_str();
+    AiterAsmKernel* impl_ptr =
+        &impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name, co_name); });
+
+    size_t arg_size = sizeof(args);
+    impl_ptr->launch_kernel(
+        {&args, &arg_size, static_cast<int>(2 * num_p), 1, 1, 256, 1, 1, stream});
 }

@@ -2878,13 +2878,19 @@ def _mla_decode_fwd_kernel_non_pipelined(
         acc,
         mask=query_mask_0_pv[:, None] & query_mask_1_pv[:, None],
     )
-    segm_offset = (
-        query_offset_0_qk.to(gl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
-        + query_offset_1_qk * NUM_SEGMENTS_PER_SEQ
-        + segm_idx
-    )
-    gl.store(segm_max_ptr + segm_offset, M, mask=query_mask_0_qk & query_mask_1_qk)
-    gl.store(segm_expsum_ptr + segm_offset, L, mask=query_mask_0_qk & query_mask_1_qk)
+    # NUM_SEGMENTS_PER_SEQ == 1 skips the reduce kernel, and the host then aliases
+    # segm_max_ptr / segm_expsum_ptr onto the output buffer as dummy pointers, so
+    # writing M / L here would clobber the attention result.
+    if NUM_SEGMENTS_PER_SEQ > 1:
+        segm_offset = (
+            query_offset_0_qk.to(gl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
+            + query_offset_1_qk * NUM_SEGMENTS_PER_SEQ
+            + segm_idx
+        )
+        gl.store(segm_max_ptr + segm_offset, M, mask=query_mask_0_qk & query_mask_1_qk)
+        gl.store(
+            segm_expsum_ptr + segm_offset, L, mask=query_mask_0_qk & query_mask_1_qk
+        )
 
 
 _mla_decode_fwd_reduce_kernel_repr = make_kernel_repr(

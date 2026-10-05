@@ -1,0 +1,33 @@
+{
+  "prepare": {
+    "num_warps": 4,
+    "nc": 32,
+    "waves_per_eu": 3
+  },
+  "walk": {
+    "BV": 64,
+    "num_warps": 8,
+    "KS": 2,
+    "num_stages": 2,
+    "waves_per_eu": 2,
+    "pass0_tiers": [
+      {"BV": 16, "num_warps": 2, "KS": 2, "num_stages": 2, "waves_per_eu": 0},
+      {"BV": 32, "num_warps": 4, "KS": 2, "num_stages": 2, "waves_per_eu": 0}
+    ],
+    "G": 0,
+    "split_min_chunks": 24,
+    "split_programs_per_cu": 1,
+    "split_min_group_chunks": 4,
+    "split_min_groups": 4,
+    "split_max_groups": 32,
+    "BV_pass1": 128,
+    "num_warps_pass1": 4,
+    "KS_pass1": 1,
+    "num_stages_pass1": 2,
+    "waves_per_eu_pass1": 1,
+    "BV_scan": 16,
+    "num_warps_scan": 8,
+    "num_stages_scan": 2,
+    "waves_per_eu_scan": 0
+  }
+}

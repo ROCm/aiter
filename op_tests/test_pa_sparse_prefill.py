@@ -9,6 +9,9 @@ one online softmax with a per-head sink. Every backend in a case runs on the
 same inputs and is checked against the same PyTorch reference, so the reported
 latencies are directly comparable.
 
+Inputs model a DSA page table: each token draws ``topk`` rows from each range,
+and the extend range is causal.
+
 The ``prec`` axis picks both the input format and the backends that run:
 
 * ``bf16`` -- single ``D=512`` Q/K/V/O tensor: ``opus``, ``triton``.
@@ -21,7 +24,7 @@ Both are gfx1250-only here and drop out of the sweep elsewhere.
 Example CLI usage::
 
     PYTHONPATH=. python3 op_tests/test_pa_sparse_prefill.py
-    PYTHONPATH=. python3 op_tests/test_pa_sparse_prefill.py --mode dense
+    PYTHONPATH=. python3 op_tests/test_pa_sparse_prefill.py --topk 256 2048
     PYTHONPATH=. python3 op_tests/test_pa_sparse_prefill.py --backend opus \\
         -n 1024 --h_q 128 --prec fp8 --no-verify
 """
@@ -140,11 +143,11 @@ def _ref_pa_sparse_prefill_opus(
         if ee > es:
             rows.append(kv_f32.index_select(0, e_idx[es:ee]))
         if not rows:
-            continue  # sink-only row: numerator 0, output stays 0
-        kv_rows = torch.cat(rows, dim=0)  # [nnz_i, D]
-        scores = q_f32[i] @ kv_rows.t() * softmax_scale  # [H, nnz_i]
-        sink_col = sink_f32.unsqueeze(1)  # [H, 1]
-        scores_with_sink = torch.cat([scores, sink_col], dim=1)  # [H, nnz_i+1]
+            continue
+        kv_rows = torch.cat(rows, dim=0)
+        scores = q_f32[i] @ kv_rows.t() * softmax_scale
+        sink_col = sink_f32.unsqueeze(1)
+        scores_with_sink = torch.cat([scores, sink_col], dim=1)
         max_score = scores_with_sink.amax(dim=1, keepdim=True)
         exp_scores = torch.exp(scores - max_score)
         exp_sink = torch.exp(sink_col - max_score)
@@ -157,7 +160,7 @@ def _ref_pa_sparse_prefill_opus(
 
 # ---------------------------------------------------------------------------
 # FP8 DSA packing + reference. Each NoPE row of 512 fp8 slots holds
-#   [ NoPE fp8 (448) | E8M0 block scales (14) | zero-pad (50) ]
+#   [ NoPE fp8 (448) | E8M0 block scales (14) | 0xFF pad (50) ]
 # ---------------------------------------------------------------------------
 
 _FP8_D_NOPE = 448
@@ -166,7 +169,7 @@ _FP8_D_ROPE = 64
 _FP8_D_HEAD = _FP8_D_NOPE + _FP8_D_ROPE
 _FP8_NBLK = _FP8_D_NOPE // 32
 _FP8_BLK = 32
-_FP8_MAX = 448.0  # e4m3fn max normal
+_FP8_MAX = 448.0
 
 
 def _quantize_nope(real: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -175,20 +178,21 @@ def _quantize_nope(real: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """
     r = real.shape[0]
     blk = real.reshape(r, _FP8_NBLK, _FP8_BLK).to(torch.float32)
-    amax = blk.abs().amax(dim=-1)  # [R, NBLK]
+    amax = blk.abs().amax(dim=-1)
 
-    # Lands the block max in (224, 448]; overflowing e4m3fn would cast to NaN.
     e_unbiased = torch.ceil(torch.log2(amax.clamp(min=1e-30) / _FP8_MAX)).to(
         torch.int32
     )
     e_unbiased = torch.where(amax == 0, torch.zeros_like(e_unbiased), e_unbiased)
-    e_byte = (e_unbiased + 127).clamp(0, 255).to(torch.uint8)  # [R, NBLK]
-    s = torch.exp2(e_unbiased.to(torch.float32)).unsqueeze(-1)  # [R, NBLK, 1]
+    e_byte = (e_unbiased + 127).clamp(0, 255).to(torch.uint8)
+    s = torch.exp2(e_unbiased.to(torch.float32)).unsqueeze(-1)
 
-    q = (blk / s).to(torch.float8_e4m3fn)  # [R, NBLK, BLOCK]
+    q = (blk / s).to(torch.float8_e4m3fn)
     deq = (q.to(torch.float32) * s).reshape(r, _FP8_D_NOPE)
 
-    packed = torch.zeros(r, _FP8_D_NOPE_PADDED, dtype=torch.uint8, device=real.device)
+    packed = torch.full(
+        (r, _FP8_D_NOPE_PADDED), 0xFF, dtype=torch.uint8, device=real.device
+    )
     packed[:, :_FP8_D_NOPE] = q.reshape(r, _FP8_D_NOPE).view(torch.uint8)
     packed[:, _FP8_D_NOPE : _FP8_D_NOPE + _FP8_NBLK] = e_byte
     return packed.view(torch.float8_e4m3fn), deq
@@ -224,8 +228,8 @@ def _ref_pa_sparse_prefill_fp8(
             rows.append(kv_fp32.index_select(0, eidx[pe[i] : pe[i + 1]]))
         if not rows:
             continue
-        kv_rows = torch.cat(rows, dim=0)  # [nnz, 512]
-        scores = q_fp32[i] @ kv_rows.t() * softmax_scale  # [H, nnz]
+        kv_rows = torch.cat(rows, dim=0)
+        scores = q_fp32[i] @ kv_rows.t() * softmax_scale
         sink_col = sink_f.unsqueeze(1)
         m = torch.cat([scores, sink_col], dim=1).amax(dim=1, keepdim=True)
         e_s = torch.exp(scores - m)
@@ -236,70 +240,94 @@ def _ref_pa_sparse_prefill_fp8(
 
 
 # ---------------------------------------------------------------------------
-# CSR index generators
+# Page table
 # ---------------------------------------------------------------------------
 
+# f32 keys per sampling chunk; 1 << 25 keeps a chunk near 128 MiB.
+_PAGE_TABLE_STAGE_ELEMS = 1 << 25
 
-def _random_csr(
+
+def _page_table_csr(
     n: int,
-    total_rows: int,
+    pool_rows: int,
+    topk: int,
     *,
-    allow_empty: bool = True,
+    causal: bool,
     device: torch.device,
     seed: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Random nnz/row in ``[0, total_rows]``."""
-    g = torch.Generator(device="cpu")
-    g.manual_seed(seed)
+    """One CSR range: a per-token budget intersected with the token's window.
 
-    lo = 0 if allow_empty else 1
-
-    lens = torch.randint(lo, total_rows + 1, (n,), generator=g, dtype=torch.int32)
-
-    indptr = torch.zeros(n + 1, dtype=torch.int32)
-    indptr[1:] = torch.cumsum(lens, dim=0)
-    nnz = int(indptr[-1].item())
-
-    indices = torch.empty(nnz, dtype=torch.int32)
-    for i in range(n):
-        s, e = int(indptr[i].item()), int(indptr[i + 1].item())
-        row_len = e - s
-        if row_len == 0:
-            continue
-        perm = torch.randperm(total_rows, generator=g)[:row_len]
-        indices[s:e] = perm.to(torch.int32)
-
-    assert int(indptr[0].item()) == 0
-    assert int(indptr[-1].item()) == nnz
-    assert bool(torch.all(indptr[1:] >= indptr[:-1]).item())
-    if nnz > 0:
-        assert int(indices.min().item()) >= 0
-        assert int(indices.max().item()) < total_rows
-
-    return indptr.to(device), indices.to(device)
-
-
-def _dense_csr(
-    n: int, total_rows: int, *, device: torch.device
-) -> tuple[torch.Tensor, torch.Tensor]:
-    indptr = torch.arange(0, (n + 1) * total_rows, total_rows, dtype=torch.int32)
-    indices = torch.arange(total_rows, dtype=torch.int32).repeat(n)
-    return indptr.to(device), indices.to(device)
-
-
-def _empty_csr(n: int, *, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-    return (
-        torch.zeros(n + 1, dtype=torch.int32, device=device),
-        torch.zeros(0, dtype=torch.int32, device=device),
+    ``topk <= 0`` and ``topk > pool_rows`` both mean the whole pool. ``causal``
+    bounds token ``i`` to ``[0, i]``, which is the extend range's rule.
+    """
+    budget = pool_rows if topk <= 0 or topk > pool_rows else topk
+    window = (
+        torch.arange(1, n + 1, dtype=torch.int64, device=device).clamp_(max=pool_rows)
+        if causal
+        else torch.full((n,), pool_rows, dtype=torch.int64, device=device)
     )
+    lens = window.clamp(max=budget)
+
+    indptr = torch.zeros(n + 1, dtype=torch.int32, device=device)
+    indptr[1:] = lens.cumsum(0).to(torch.int32)
+    nnz = int(indptr[-1].item())
+    indices = torch.empty(nnz, dtype=torch.int32, device=device)
+    if nnz == 0:
+        return indptr, indices
+
+    gen = make_generator(seed, device=device)
+    col = torch.arange(pool_rows, dtype=torch.int64, device=device)
+    rows_per_chunk = max(1, _PAGE_TABLE_STAGE_ELEMS // pool_rows)
+
+    for r0 in range(0, n, rows_per_chunk):
+        r1 = min(r0 + rows_per_chunk, n)
+        take = lens[r0:r1]
+        # k smallest of a uniform draw == uniform subset; +inf drops the
+        # out-of-window columns. Unsorted on purpose: sorting would hand the
+        # gather a near-sequential read no page table provides.
+        keys = torch.rand((r1 - r0, pool_rows), generator=gen, device=device)
+        if causal:
+            keys.masked_fill_(col.unsqueeze(0) >= window[r0:r1].unsqueeze(1), math.inf)
+        k = int(take.max().item())
+        picked = keys.topk(k, dim=1, largest=False).indices
+        keep = col[:k].unsqueeze(0) < take.unsqueeze(1)
+        # Masked selection flattens row-major, which is the CSR order.
+        indices[int(indptr[r0]) : int(indptr[r1])] = picked[keep].to(torch.int32)
+
+    return indptr, indices
+
+
+def _poison_unreferenced(
+    pool_rows: int,
+    indices: torch.Tensor,
+    *,
+    bf16: torch.Tensor | None = None,
+    nope: torch.Tensor | None = None,
+    rope: torch.Tensor | None = None,
+) -> None:
+    """NaN the pool rows the page table never names, so a gather that walks off
+    its index list cannot come back with plausible numbers. fp8 NoPE goes to
+    0xFF, NaN as both e4m3 and E8M0.
+    """
+    if pool_rows == 0:
+        return
+    seen = torch.zeros(pool_rows, dtype=torch.bool, device=indices.device)
+    seen[indices.to(torch.int64)] = True
+    dead = ~seen
+    if not bool(dead.any()):
+        return
+    if bf16 is not None:
+        bf16[dead] = math.nan
+    if nope is not None:
+        nope.view(torch.uint8)[dead] = 0xFF
+    if rope is not None:
+        rope[dead] = math.nan
 
 
 # ---------------------------------------------------------------------------
 # Input factory
 # ---------------------------------------------------------------------------
-
-# Applied symmetrically to both the prefix and the extend CSR.
-_MODES = ("sparse", "dense", "empty")
 
 
 def _make_inputs(
@@ -310,12 +338,11 @@ def _make_inputs(
     total_tokens: int,
     dtype: torch.dtype,
     *,
-    mode: str = "sparse",
+    topk: int = 1024,
     device: torch.device | str = "cuda",
     seed: int = 0,
     data_init: str = "norm",
 ) -> dict:
-    assert mode in _MODES
     device = torch.device(device)
     gen = make_generator(seed, device=device)
 
@@ -333,20 +360,15 @@ def _make_inputs(
     ).to(dtype)
     attn_sink = fill((h,), data_init, gen, dtype=torch.float32, device=device) * 0.25
 
-    def _csr(total_rows: int, seed_offset: int):
-        if mode == "sparse":
-            return _random_csr(
-                n,
-                total_rows,
-                device=device,
-                seed=seed * 2 + seed_offset,
-            )
-        if mode == "dense":
-            return _dense_csr(n, total_rows, device=device)
-        return _empty_csr(n, device=device)
+    ip_p, ix_p = _page_table_csr(
+        n, total_pages, topk, causal=False, device=device, seed=seed * 2 + 1
+    )
+    ip_e, ix_e = _page_table_csr(
+        n, total_tokens, topk, causal=True, device=device, seed=seed * 2 + 2
+    )
 
-    ip_p, ix_p = _csr(total_pages, 1)
-    ip_e, ix_e = _csr(total_tokens, 2)
+    _poison_unreferenced(total_pages, ix_p, bf16=unified_kv)
+    _poison_unreferenced(total_tokens, ix_e, bf16=kv)
 
     return {
         "q": q,
@@ -366,7 +388,7 @@ def _make_inputs_fp8(
     total_pages: int,
     total_tokens: int,
     *,
-    mode: str = "sparse",
+    topk: int = 1024,
     device: torch.device | str = "cuda",
     seed: int = 0,
     data_init: str = "norm",
@@ -374,7 +396,6 @@ def _make_inputs_fp8(
     """Returns ``{"kernel": ..., "ref": ...}``: the split fp8/bf16 tensors the
     kernels take, and the dequantized fp32 rows the reference takes.
     """
-    assert mode in _MODES
     device = torch.device(device)
     gen = make_generator(seed, device=device)
 
@@ -400,7 +421,7 @@ def _make_inputs_fp8(
             * 0.5
         )
         rope = rope.to(torch.bfloat16)
-        row_fp32 = torch.cat([deq, rope.to(torch.float32)], dim=1)  # [rows, 512]
+        row_fp32 = torch.cat([deq, rope.to(torch.float32)], dim=1)
         return nope_fp8, rope, row_fp32
 
     qn, qr, q_fp32 = _streams(n * h)
@@ -412,20 +433,16 @@ def _make_inputs_fp8(
 
     attn_sink = fill((h,), data_init, gen, dtype=torch.float32, device=device) * 0.25
 
-    def _csr(total_rows: int, seed_offset: int):
-        if mode == "sparse":
-            return _random_csr(
-                n,
-                total_rows,
-                device=device,
-                seed=seed * 2 + seed_offset,
-            )
-        if mode == "dense":
-            return _dense_csr(n, total_rows, device=device)
-        return _empty_csr(n, device=device)
+    ip_p, ix_p = _page_table_csr(
+        n, total_pages, topk, causal=False, device=device, seed=seed * 2 + 1
+    )
+    ip_e, ix_e = _page_table_csr(
+        n, total_tokens, topk, causal=True, device=device, seed=seed * 2 + 2
+    )
 
-    ip_p, ix_p = _csr(total_pages, 1)
-    ip_e, ix_e = _csr(total_tokens, 2)
+    # The fp32 copies stay clean; the reference only reads rows that were named.
+    _poison_unreferenced(total_pages, ix_p, nope=ukn, rope=ukr)
+    _poison_unreferenced(total_tokens, ix_e, nope=kn, rope=kr)
 
     kernel = {
         "q_nope": qn,
@@ -492,17 +509,12 @@ def _profile_func(target_func, *, backend: str):
 _PRECS = ("bf16", "fp8")
 _PREC_TO_DTYPE = {"bf16": torch.bfloat16}
 
-# |got - ref| <= _ATOL + _RTOL * |ref|. Must stay tight in absolute terms: the
-# output magnitude shrinks as nnz/row grows (|out| ~ 0.05 at 4k nnz/row), so a
-# loose atol would accept even all-zeros. Measured worst case is 3.9e-3, itself
-# half an ulp of the bf16 output.
 _RTOL = 1e-2
 _ATOL = 1e-2
 
 
 # ---------------------------------------------------------------------------
-# Single-case driver. `@benchmark()` turns the kwargs into a row dict and
-# merges in whatever this returns.
+# Single-case driver
 # ---------------------------------------------------------------------------
 
 
@@ -515,7 +527,7 @@ def run_pa_sparse_prefill(
     total_tokens: int,
     prec: str,
     *,
-    mode: str = "sparse",
+    topk: int = 1024,
     backends: tuple = _BACKENDS,
     seed: int = 0,
     data_init: str = "norm",
@@ -529,7 +541,7 @@ def run_pa_sparse_prefill(
     softmax_scale = 1.0 / math.sqrt(d)
     msg = (
         f"[N={n} H={h} D={d} total_pages={total_pages} total_tokens={total_tokens} "
-        f"prec={prec} mode={mode} data_init={data_init} seed={seed}]"
+        f"prec={prec} topk={topk} data_init={data_init} seed={seed}]"
     )
     wanted = [b for b in _PREC_BACKENDS[prec] if b in backends]
 
@@ -542,7 +554,7 @@ def run_pa_sparse_prefill(
             h,
             total_pages,
             total_tokens,
-            mode=mode,
+            topk=topk,
             seed=seed,
             data_init=data_init,
         )
@@ -574,7 +586,7 @@ def run_pa_sparse_prefill(
             total_pages,
             total_tokens,
             _PREC_TO_DTYPE[prec],
-            mode=mode,
+            topk=topk,
             seed=seed,
             data_init=data_init,
         )
@@ -644,25 +656,29 @@ def run_pa_sparse_prefill(
 # ---------------------------------------------------------------------------
 
 
-_PYTEST_SHAPES = [
-    # (N, H, total_pages, total_tokens)
-    (64, 16, 256, 256),
-    (128, 32, 256, 256),
-    (64, 64, 1024, 1024),
-    (256, 128, 2048, 2048),
-]
 _PYTEST_PRECS = ["bf16", "fp8"]
-_PYTEST_MODES = ["sparse", "dense", "empty"]
+
+# topk rides in the case instead of being its own axis: crossed with the shapes,
+# most combinations would collapse onto the same whole-pool budget.
+_PYTEST_CASES = [
+    # (N, H, total_pages, total_tokens, topk)
+    (64, 16, 256, 256, 100),
+    (128, 24, 512, 128, 64),
+    (256, 32, 1024, 256, 192),
+    (64, 64, 1024, 1024, 1024),
+    (192, 96, 1024, 192, 256),
+    (256, 128, 2048, 2048, 512),
+    (64, 32, 0, 0, 128),  # empty pools -> sink-only
+]
 
 
 @pytest.mark.parametrize("prec", _PYTEST_PRECS)
 @pytest.mark.parametrize(
-    "n,h,total_pages,total_tokens",
-    _PYTEST_SHAPES,
+    "n,h,total_pages,total_tokens,topk",
+    _PYTEST_CASES,
     ids=lambda v: "x".join(map(str, v)) if isinstance(v, tuple) else str(v),
 )
-@pytest.mark.parametrize("mode", _PYTEST_MODES)
-def test_pa_sparse_prefill(prec, n, h, total_pages, total_tokens, mode):
+def test_pa_sparse_prefill(prec, n, h, total_pages, total_tokens, topk):
     run_pa_sparse_prefill(
         n=n,
         h=h,
@@ -670,8 +686,8 @@ def test_pa_sparse_prefill(prec, n, h, total_pages, total_tokens, mode):
         total_pages=total_pages,
         total_tokens=total_tokens,
         prec=prec,
-        mode=mode,
-        seed=(hash((n, h, total_pages, total_tokens, prec, mode)) & 0xFFFF),
+        topk=topk,
+        seed=(hash((n, h, total_pages, total_tokens, prec, topk)) & 0xFFFF),
         verify=True,
         bench=False,
     )
@@ -704,8 +720,7 @@ parser.add_argument(
     default=[16, 32, 64, 128],
     help=(
         "number of query heads H_Q (default: [16, 32, 64, 128]).\n"
-        f"The asm candidate is built for H_Q={_ASM_HEADS} only and drops out\n"
-        "of the other sweep points; opus and triton run at every value."
+        f"asm is built for H_Q={_ASM_HEADS} only and drops out elsewhere."
     ),
 )
 parser.add_argument(
@@ -716,14 +731,18 @@ parser.add_argument(
     help="head dim D, kernel currently only compiled for 512 (default: 512)",
 )
 parser.add_argument(
+    "--topk",
+    type=int,
+    nargs="*",
+    default=[1024, 2048],
+    help="rows each token draws from each range (default: [1024, 2048])",
+)
+parser.add_argument(
     "--total_pages",
     type=int,
     nargs="*",
-    default=[4096, 16384],
-    help=(
-        "rows in unified_kv (default: [4096, 16384]). "
-        "Pass 0 to mirror -n for that sweep point."
-    ),
+    default=[65536, 1048576],
+    help="rows in unified_kv (default: [65536, 1048576]); 0 leaves it empty",
 )
 parser.add_argument(
     "--total_tokens",
@@ -749,24 +768,7 @@ parser.add_argument(
     nargs="*",
     default=list(_BACKENDS),
     choices=list(_BACKENDS),
-    help=(
-        "backend(s) to run, intersected with what each precision supports\n"
-        "and with what the running arch provides (default: all)."
-    ),
-)
-parser.add_argument(
-    "--mode",
-    type=str,
-    nargs="*",
-    default=["sparse", "dense"],
-    choices=list(_MODES),
-    help=(
-        "CSR mode(s) to sweep for both prefix and extend.\n"
-        "  sparse: random nnz/row in [0, total_rows]\n"
-        "  dense : every token sees every page / every kv row\n"
-        "  empty : all-empty CSR rows (sink-only output)\n"
-        "Default: [sparse, dense]."
-    ),
+    help="backend(s) to run, intersected with the precision and arch (all)",
 )
 parser.add_argument(
     "--no-verify",
@@ -798,15 +800,14 @@ if __name__ == "__main__":
 
     rows = []
     # product varies its last argument fastest -> this is also the row order.
-    for prec, mode, h, n, pages_arg, data_init in itertools.product(
+    for prec, topk, h, n, total_pages, data_init in itertools.product(
         args.prec,
-        args.mode,
+        args.topk,
         args.h_q,
         args.n_tokens,
         args.total_pages,
         args.data_init,
     ):
-        total_pages = pages_arg if pages_arg > 0 else n  # 0 is "mirror -n"
         total_tokens = args.total_tokens if args.total_tokens is not None else n
         row = run_pa_sparse_prefill(
             n=n,
@@ -815,7 +816,7 @@ if __name__ == "__main__":
             total_pages=total_pages,
             total_tokens=total_tokens,
             prec=prec,
-            mode=mode,
+            topk=topk,
             backends=tuple(args.backend),
             seed=args.seed,
             data_init=data_init,
@@ -833,7 +834,7 @@ if __name__ == "__main__":
         if drop_cols:
             df = df.drop(columns=drop_cols)
         # Column order otherwise follows whichever row first ran a backend.
-        lead = [c for c in ("prec", "mode", "data_init", "h", "n") if c in df.columns]
+        lead = [c for c in ("prec", "topk", "data_init", "h", "n") if c in df.columns]
         rest = [c for c in df.columns if c not in lead]
         metrics = [c for b in _BACKENDS for c in rest if c.startswith(f"{b} ")]
         df = df[lead + [c for c in rest if c not in metrics] + metrics]

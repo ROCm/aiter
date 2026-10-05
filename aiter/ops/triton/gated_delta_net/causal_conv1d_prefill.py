@@ -17,7 +17,7 @@ The other backends live in their own namespaces:
 * FlyDSL : ``aiter.ops.flydsl.causal_conv1d_flydsl.causal_conv1d_split_qkv_flydsl_fn``
 
 The ``@triton.jit`` kernels themselves live in
-``aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.causal_conv1d_fwd_split_qkv``.
+``aiter.ops.triton._triton_kernels.gated_delta_net.prefill.causal_conv1d_fwd_split_qkv``.
 
 ``x`` has shape ``[dim, cu_seqlen]`` with the channel axis packed as the
 concatenation ``[Q | K | V]`` (``dim == 2*k_dim + v_dim``).
@@ -27,7 +27,7 @@ import torch
 import triton
 
 from aiter.ops.prefill_batch_metadata import CausalConvPrefillMetadata
-from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.causal_conv1d_fwd_split_qkv import (
+from aiter.ops.triton._triton_kernels.gated_delta_net.prefill.causal_conv1d_fwd_split_qkv import (
     PAD_SLOT_ID,
     _causal_conv1d_fwd_split_qkv_kernel,
     _causal_conv1d_fwd_split_qkv_tile_kernel,

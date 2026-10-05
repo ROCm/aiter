@@ -47,8 +47,10 @@ def get_gemm_afp4wfp4_preshuffle_layouts(num_warps, BLOCK_M, BLOCK_N, BLOCK_K):
     shared_B = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
     shared_S = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
 
-    # Output staging layout for the TDM store (acc -> LDS -> HBM)
-    shared_C = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
+    # Output staging layout for the TDM store (acc -> LDS -> HBM).
+    shared_C = gl.PaddedSharedLayout.with_identity_for(
+        [[BLOCK_N, 8]], [BLOCK_M, BLOCK_N], [1, 0]
+    )
 
     # Register layouts for WMMA operands
     dot_a = gl.DotOperandLayout(operand_index=0, parent=wmma_layout, k_width=16)
@@ -130,6 +132,37 @@ def depreshuffle_b_raw_to_kn(
     )
 
 
+@gluon.jit
+def _issue_tdm_stage(
+    a_desc,
+    b_desc,
+    as_desc,
+    bs_desc,
+    a_slot,
+    b_slot,
+    as_slot,
+    bs_slot,
+    off_a,
+    off_b,
+    off_as,
+    off_bs,
+):
+    # Movbe all descriptors before the four copies then the compiler fuses all TDM copies
+    a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(a_desc, add_offsets=[0, off_a])
+    b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(b_desc, add_offsets=[0, off_b])
+    as_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+        as_desc, add_offsets=[0, off_as]
+    )
+    bs_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+        bs_desc, add_offsets=[0, off_bs]
+    )
+
+    gl.amd.gfx1250.tdm.async_load(a_desc, dest=a_slot)
+    gl.amd.gfx1250.tdm.async_load(b_desc, dest=b_slot)
+    gl.amd.gfx1250.tdm.async_load(as_desc, dest=as_slot)
+    gl.amd.gfx1250.tdm.async_load(bs_desc, dest=bs_slot)
+
+
 _gemm_mxfp4_preshuffle_gfx1250_repr = make_kernel_repr(
     "_gemm_mxfp4_preshuffle_gfx1250_kernel",
     [
@@ -179,6 +212,13 @@ def gemm_mxfp4_preshuffle_gfx1250(
     a_scale_layout: gl.constexpr,
     b_scale_layout: gl.constexpr,
 ):
+    # async_wait counts TDM ops in flight. The compiler fuses each stage's four
+    # copies into one op (two with 2 warps, which fuse in pairs).
+    if num_warps == 2:
+        TDM_OPS_PER_STAGE: gl.constexpr = 2
+    else:
+        TDM_OPS_PER_STAGE: gl.constexpr = 1
+
     # Compile-time constants
     FP4_ELEMS_PER_BYTE: gl.constexpr = 2
     SCALE_GROUP_ELEMS: gl.constexpr = 32
@@ -315,14 +355,11 @@ def gemm_mxfp4_preshuffle_gfx1250(
         off_b = load_idx * BLOCK_K_BYTES * 16
         off_as = load_idx * K_GROUPS * A_PRESHUFFLE_FACTOR
         off_bs = load_idx * K_GROUPS * PRESHUFFLE_FACTOR
-        gl.amd.gfx1250.tdm.async_load(a_desc, [0, off_a], a_slot)
-        gl.amd.gfx1250.tdm.async_load(b_desc, [0, off_b], b_slot)
-        gl.amd.gfx1250.tdm.async_load(as_desc, [0, off_as], as_slot)
-        gl.amd.gfx1250.tdm.async_load(bs_desc, [0, off_bs], bs_slot)
+        _issue_tdm_stage(a_desc, b_desc, as_desc, bs_desc, a_slot, b_slot, as_slot, bs_slot, off_a, off_b, off_as, off_bs)  # fmt: skip
         load_idx += 1
 
     # --- 2. Pre-load tile 0 from LDS into registers ---
-    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 4)
+    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * TDM_OPS_PER_STAGE)
 
     slot_c = compute_idx % NUM_BUFFERS
     cur_A = smem_A.index(slot_c).load(layout=dot_a_layout)
@@ -355,12 +392,9 @@ def gemm_mxfp4_preshuffle_gfx1250(
         off_b = load_idx * BLOCK_K_BYTES * 16
         off_as = load_idx * K_GROUPS * A_PRESHUFFLE_FACTOR
         off_bs = load_idx * K_GROUPS * PRESHUFFLE_FACTOR
-        gl.amd.gfx1250.tdm.async_load(a_desc, [0, off_a], a_slot)
-        gl.amd.gfx1250.tdm.async_load(b_desc, [0, off_b], b_slot)
-        gl.amd.gfx1250.tdm.async_load(as_desc, [0, off_as], as_slot)
-        gl.amd.gfx1250.tdm.async_load(bs_desc, [0, off_bs], bs_slot)
+        _issue_tdm_stage(a_desc, b_desc, as_desc, bs_desc, a_slot, b_slot, as_slot, bs_slot, off_a, off_b, off_as, off_bs)  # fmt: skip
 
-        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 4)
+        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * TDM_OPS_PER_STAGE)
         load_idx += 1
 
         # Pre-load next tile from LDS into registers
@@ -393,7 +427,7 @@ def gemm_mxfp4_preshuffle_gfx1250(
             cur_A, cur_AS, "e2m1", cur_B, cur_BS, "e2m1", acc
         )
 
-        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2 - i) * 4)
+        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2 - i) * TDM_OPS_PER_STAGE)
 
         next_slot = (compute_idx + 1) % NUM_BUFFERS
         cur_A = smem_A.index(next_slot).load(layout=dot_a_layout)

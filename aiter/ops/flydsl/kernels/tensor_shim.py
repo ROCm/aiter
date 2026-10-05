@@ -295,15 +295,28 @@ def _compile_and_run(exe, *args):
         raise
 
 
-def _run_compiled(exe, *args):
+def _run_compiled(exe, *args, specialization_key=None):
     """First call: ``flyc.compile(exe, *args)`` compiles **and** executes the kernel.
     Subsequent calls: fast dispatch via the cached ``CompiledFunction``.
+
+    A specialization key gives a multi-constexpr JitFunction one compiled
+    callable per configuration. Factory-style launchers should leave it unset.
     """
-    cf = getattr(exe, "_cf", None)
+    if specialization_key is None:
+        cf = getattr(exe, "_cf", None)
+    else:
+        cache = getattr(exe, "_cf_by_specialization", None)
+        cf = cache.get(specialization_key) if cache is not None else None
     if cf is not None:
         cf(*args)
         return
-    exe._cf = _compile_and_run(exe, *args)
+    cf = _compile_and_run(exe, *args)
+    if specialization_key is None:
+        exe._cf = cf
+    else:
+        if not hasattr(exe, "_cf_by_specialization"):
+            exe._cf_by_specialization = {}
+        exe._cf_by_specialization[specialization_key] = cf
 
 
 def _preload_compiled(exe, *args):
