@@ -29,6 +29,8 @@ def unified_attention(
     # backend
     backend: str | None = None,  # "triton" | "gluon" | "flydsl"
 ):
+    if backend is not None:
+        backend = backend.lower()
     if backend not in (None, "flydsl", "triton", "gluon"):
         raise ValueError(
             f"Unknown backend '{backend}', must be None, 'triton', 'gluon' or 'flydsl'"
@@ -70,7 +72,6 @@ def unified_attention(
             sinks=sinks,
             shuffled_kv_cache=shuffled_kv_cache,
             skip_reduce=skip_reduce,
-            backend=backend,
         )
         if flydsl_out is not None:
             return flydsl_out

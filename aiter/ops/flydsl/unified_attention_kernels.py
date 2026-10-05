@@ -3,8 +3,9 @@
 
 """FlyDSL fp8 paged unified attention on gfx950.
 
-Main's fmha_gfx950 builder serves single-pass prefill. Shuffled decode uses
-pa_decode; causal calls outside the served routing region fall back to the Triton-wrapper path (Gluon on gfx950).
+The fmha_gfx950 builder serves single-pass prefill and pa_decode serves shuffled
+decode. Causal calls outside that routing region return None so the caller falls
+back to the Triton wrapper (Gluon on gfx950).
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from .kernels.flash_attn_func_fp8_gfx950 import (
     _fp8_auto_block_m,
     _fp8_rescale_threshold,
     _is_valid_softmax_scale,
+    _num_cu,
 )
 from .kernels.fmha_gfx950.flash_attn_fp8_gfx950 import (
     build_flash_attn_dualwave_swp_fp8_module,
@@ -51,30 +53,8 @@ _PAGE_SIZE = 64
 _HEAD_DIM = 128
 
 # Vectorization width of the shuffled 5D KV cache: 16 fp8 elements = one
-# 128-bit dwordx4. Backs the _strides_ok 5D validation branch and
-# _get_kernel's layout selection; _dispatch_mode_ok accepts shuffled_kv_cache.
+# 128-bit dwordx4.
 _KV_VEC_SIZE = 16
-
-
-@cache
-def _target_num_prgms(device_index: int) -> int:
-    """Split-K fill target: a launch with num_2d_prgms base workgroups is "full"
-    at num_2d_prgms >= this value.
-
-    A device CU-count query (not a hardcoded constant), so it also handles
-    CU-partitioned modes (CPX/NPS) where fewer CUs are exposed; falls back to
-    256 (full-chip gfx950) if the query fails. Keyed on device.index and
-    resolved at call time: in a multi-GPU process the import-time device can
-    differ from the run device, and a heterogeneous host exposes different CU
-    counts per device -- either would lock in a wrong fill target.
-    """
-    try:
-        from aiter.ops.triton.utils.device_info import get_num_sms
-
-        with torch.cuda.device(device_index):
-            return get_num_sms()
-    except Exception:  # noqa: BLE001
-        return 256
 
 
 # The block table is staged through a fixed LDS window of PAGED_BT_LDS_SIZE=2048
@@ -156,9 +136,7 @@ def _pa_decode_num_partitions(
     return max(1, min(fit, hi))
 
 
-def _pa_decode_ok(
-    max_seqlen_q, num_queries_per_kv, sinks, shuffled_kv_cache, out, num_seqs
-) -> bool:
+def _pa_decode_ok(max_seqlen_q, shuffled_kv_cache, out, num_seqs) -> bool:
     """Layout/dtype gate on top of _supported (which already pins fp8 QKV,
     5D shuffled strides, page 64, D128, int32 index tensors, no softcap/alibi)."""
     return (
@@ -191,23 +169,17 @@ def _route_pa_decode(
     per-sequence context length, so no cumulative-offset conversion is needed."""
     from .pa_decode import pa_decode
 
-    hq, d = q.shape[1], q.shape[2]
     np_ = _pa_decode_num_partitions(
-        num_seqs, num_kv_heads, int(max_seqlen_k), _target_num_prgms(q.device.index)
+        num_seqs, num_kv_heads, int(max_seqlen_k), _num_cu(q.device)
     )
-    shape = (num_seqs, num_kv_heads, np_, hq // num_kv_heads)
-    dev = q.device
-    exp_sums = torch.empty(shape, dtype=torch.float32, device=dev)
-    max_logits = torch.empty(shape, dtype=torch.float32, device=dev)
-    tmp_out = torch.empty((*shape, d), dtype=out.dtype, device=dev)
-    with torch.cuda.device(dev.index):
+    with torch.cuda.device(q.device.index):
         pa_decode(
             out,
             q,
             k,
             v,
             seqused_k,
-            block_table.contiguous(),
+            block_table,
             float(softmax_scale),
             1,
             np_,
@@ -216,9 +188,6 @@ def _route_pa_decode(
             q_descale.reshape(-1),
             k_descale.reshape(-1),
             v_descale.reshape(-1),
-            exp_sums,
-            max_logits,
-            tmp_out,
             sinks=sinks,
         )
     return out
@@ -325,17 +294,13 @@ def _strides_ok(
     # the kernel writes the copy, the caller's real `out` stays untouched.
     # Requiring stride(0) == flattened row size restricts acceptance to
     # layouts where reshape(-1) is a view; padded layouts decline and fall
-    # through to the Triton-wrapper path (Gluon on gfx950).
+    # through to the Triton wrapper.
     if q.stride(0) != num_query_heads * head_size:
         return False
     if out.stride(0) != num_query_heads * head_size:
         return False
-    # Shuffled 5D KV cache: the production gate (_dispatch_mode_ok) accepts
-    # shuffled_kv_cache, so this branch is live on the real dispatch path. The
-    # flag and the tensor layout MUST agree: a shuffled flag on a 4D linear
-    # tensor (or vice versa) would run the vectorized loader's byte-offset
-    # formula against the wrong memory, so decline the mismatch rather than
-    # mis-address it. shuffled -> require 5D.
+    # The flag and the tensor rank must agree: the vectorized loader's
+    # byte-offset formula would read the wrong memory on a mismatch.
     if shuffled_kv_cache:
         if k.dim() != 5 or v.dim() != 5:
             return False
@@ -353,13 +318,10 @@ def _strides_ok(
 
 def _dispatch_mode_ok(window_size, block_table, skip_reduce) -> bool:
     """Paged, full-window, non-reduce. The reduce flag belongs to a Triton
-    layout this kernel does not read; the paged path is the only one wired
-    here. (Causal and non-causal are both built.)
+    layout this kernel does not read. Causal and non-causal are both built.
 
-    ``shuffled_kv_cache`` is accepted unconditionally by design, not gated
-    here: the vectorized K and V loaders are both correctness-validated
-    against a torch reference, and ``_get_kernel``/``_strides_ok`` route a
-    shuffled call to the vectorized builder and validate its 5D K/V shape.
+    ``shuffled_kv_cache`` is not gated here: ``_get_kernel`` selects the layout
+    and ``_strides_ok`` validates the 5D K/V shape.
     """
     return window_size == (-1, -1) and block_table is not None and not skip_reduce
 
@@ -411,7 +373,7 @@ def _as_1d_descale(d):
 
 
 def _geometry_ok(
-    head_size, num_query_heads, num_kv_heads, num_queries_per_kv, cu_seqlens_q, num_seqs
+    head_size, num_query_heads, num_kv_heads, cu_seqlens_q, num_seqs
 ) -> bool:
     """Fixed head dim, integral GQA, and cu_seqlens covering every sequence."""
     return (
@@ -434,11 +396,9 @@ def _no_unsupported_features(
     )
 
 
-def _sinks_ok(sinks, num_query_heads) -> bool:
-    """Sinks are not served by FlyDSL; causal auto calls fall back to the Triton-wrapper path (Gluon on gfx950).
-
-    Non-causal and explicit-FlyDSL sinks calls cannot fall back.
-    """
+def _sinks_ok(sinks) -> bool:
+    """Sinks are not served by FlyDSL; auto-backend calls fall back to the
+    Triton wrapper. Explicit-FlyDSL sinks calls raise instead."""
     return sinks is None
 
 
@@ -458,7 +418,6 @@ def _supported(
     v_descale,
     num_kv_heads,
     block_size,
-    num_queries_per_kv,
     num_seqs,
     q_scales,
     alibi_slopes,
@@ -490,14 +449,13 @@ def _supported(
             head_size,
             num_query_heads,
             num_kv_heads,
-            num_queries_per_kv,
             cu_seqlens_q,
             num_seqs,
         )
         and _no_unsupported_features(
             softcap, alibi_slopes, qq_bias, q_scales, output_scale
         )
-        and _sinks_ok(sinks, num_query_heads)
+        and _sinks_ok(sinks)
         and _shapes_ok(
             q,
             out,
@@ -550,7 +508,6 @@ def flydsl_unified_attention(
     *,
     num_kv_heads,
     block_size,
-    num_queries_per_kv,
     num_seqs,
     q_scales=None,
     alibi_slopes=None,
@@ -567,11 +524,10 @@ def flydsl_unified_attention(
     already derived; recomputing them here would duplicate its layout unpacking.
 
     Returns ``out`` (written in place) if this configuration is supported, or
-    ``None`` so the caller falls back to the Triton-wrapper path (Gluon on gfx950; real Triton only if Gluon is unsupported, e.g. softcap, alibi, qq_bias).
+    ``None`` so the caller falls back to the Triton wrapper.
     """
-    # Widen 0-dim scalar descales to [1] before the gate and the
-    # kernel see them (vLLM passes per-tensor descales as scalars; FlyDSL's
-    # from_dlpack rejects a shape-() tensor). A view, not a copy.
+    # vLLM passes per-tensor descales as 0-dim scalars, which FlyDSL's
+    # from_dlpack rejects; widen to [1] (a view) before the gate sees them.
     q_descale = _as_1d_descale(q_descale)
     k_descale = _as_1d_descale(k_descale)
     v_descale = _as_1d_descale(v_descale)
@@ -592,7 +548,6 @@ def flydsl_unified_attention(
         v_descale,
         num_kv_heads,
         block_size,
-        num_queries_per_kv,
         num_seqs,
         q_scales,
         alibi_slopes,
@@ -606,7 +561,8 @@ def flydsl_unified_attention(
         return None
 
     if max_seqlen_q == 1:
-        # Decode kernels are not AOT-compiled; decline so run-only deployments fall back.
+        # Decode kernels are not AOT-compiled; decline so run-only deployments
+        # fall back.
         if os.environ.get("FLYDSL_RUNTIME_RUN_ONLY", "").lower() in (
             "1",
             "true",
@@ -614,9 +570,7 @@ def flydsl_unified_attention(
             "on",
         ):
             return None
-        if _pa_decode_ok(
-            max_seqlen_q, num_queries_per_kv, sinks, shuffled_kv_cache, out, num_seqs
-        ):
+        if _pa_decode_ok(max_seqlen_q, shuffled_kv_cache, out, num_seqs):
             return _route_pa_decode(
                 q,
                 k,
@@ -644,7 +598,7 @@ def flydsl_unified_attention(
 
     num_query_heads = q.shape[1]
     out_dtype_str = "f16" if out.dtype == torch.float16 else "bf16"
-    target_num_prgms = _target_num_prgms(q.device.index)
+    target_num_prgms = _num_cu(q.device)
     block_m = _fp8_auto_block_m(
         num_seqs,
         num_query_heads,

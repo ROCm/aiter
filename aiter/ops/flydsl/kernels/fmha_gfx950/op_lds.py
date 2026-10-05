@@ -6,8 +6,7 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm, scf
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
@@ -59,6 +58,8 @@ class DualwaveFp8PageIdLoader(DualwaveFp8KernelContext):
             for pas in range_constexpr(traits.PAGED_BT_LDS_SIZE // traits.BLOCK_SIZE):
                 local_tile = self.tid + pas * traits.BLOCK_SIZE
                 if local_tile < staged_tiles:
+                    # Typed LDS stores change the address materialization across
+                    # these guards; retain the byte pointer's original schedule.
                     dst = buffer_ops.get_element_ptr(
                         self.lds_bt_base_ptr,
                         byte_offset=_raw(fx.Int32(local_tile * 4)),
@@ -71,7 +72,7 @@ class DualwaveFp8PageIdLoader(DualwaveFp8KernelContext):
                     if (local_tile < segment_tiles) & (tile < num_kv_tiles):
                         row = self.batch_idx * self.block_table_stride_v + tile
                         reg = fx.make_rmem_tensor(1, fx.Int32)
-                        fx.copy_atom_call(
+                        fx.copy(
                             self.bt_atom,
                             fx.slice(self.bt_div, (None, fx.Int32(row))),
                             reg,
@@ -88,16 +89,12 @@ class DualwaveFp8PageIdLoader(DualwaveFp8KernelContext):
             clamped = (tile < last).select(tile, last)
             first = fx.Index(self.split_t0)
             clamped = (clamped > first).select(clamped, first)
-            src = buffer_ops.get_element_ptr(
-                self.lds_bt_base_ptr,
-                byte_offset=_raw(fx.Int32((clamped - first) * 4)),
-                elem_type=T.i8,
-            )
-            handles.append(llvm.LoadOp(T.i32, src).result)
+            bt = self.lds.bt.view(fx.make_layout(self.traits.PAGED_BT_LDS_SIZE, 1))
+            handles.append(fx.memref_load(bt, fx.Int32(clamped - first)))
         return handles
 
     def end_page_ids(self, handles):
-        rocdl.s_waitcnt(0xC07F)
+        rocdl.s_waitcnt(lgkmcnt=0)
         return [fx.Int64(fx.Int32(rocdl.readfirstlane(T.i32, h))) for h in handles]
 
 
@@ -343,71 +340,36 @@ class DualwaveFp8KvLdsToVgprLoader(DualwaveFp8KernelContext):
     def _load_v_fp8_bn64(self, buf_id, tile_start):
         traits = self.traits
         full_tile = fx.Int64(tile_start) + traits.BLOCK_N <= fx.Int64(self.seqlen_kv_v)
-        # Explicit results keep the packed operands inside the uniform branch;
-        # the tail reader must not execute for full logical pages.
-        branch = scf.IfOp(
-            _raw(full_tile), [T.i64] * (4 * traits.D_CHUNKS), has_else=True
-        )
-        with ir.InsertionPoint(branch.then_block):
-            packs = self._load_v_fp8_coalesced_full(buf_id)
-            scf.YieldOp([pack for strip in packs for pack in strip])
-        with ir.InsertionPoint(branch.else_block):
-            packs = self._load_v_fp8_coalesced(buf_id, tile_start)
-            scf.YieldOp([pack for strip in packs for pack in strip])
-        return [
-            list(branch.results[ks * traits.D_CHUNKS : (ks + 1) * traits.D_CHUNKS])
-            for ks in range(4)
-        ]
 
-    def _load_v_fp8_coalesced_full(self, buf_id):
-        traits = self.traits
-        aligned_base = ((self.lds_vt_base_idx + 127) // 128) * 128
-        tile_base = aligned_base + buf_id * traits.BLOCK_N * traits.HEAD_DIM_V
-        d_lane = fx.Int32(self.lane % 32)
-        lane_half = fx.Int32(self.lane // 32)
-        packs = [[None] * traits.D_CHUNKS for _ in range(4)]
-        for dc in range_constexpr(traits.D_CHUNKS):
-            d = fx.Int32(32 * dc) + d_lane
-            for half in range_constexpr(2):
-                byte_off = fx.Int32(
-                    tile_base + (lane_half + 2 * half) * traits.HEAD_DIM_V * 16 + d * 16
-                )
-                ptr = buffer_ops.get_element_ptr(
-                    self.lds_vt_base_ptr,
-                    byte_offset=_raw(byte_off - fx.Int32(self.lds_vt_base_idx)),
-                    elem_type=T.i8,
-                )
-                words = Vec(
-                    llvm.LoadOp(Vec.make_type(4, fx.Int32), ptr, alignment=16).result
-                )
-                for pair in range_constexpr(2):
-                    packs[2 * half + pair][dc] = (
-                        Vec.from_elements(
-                            [fx.Int32(words[2 * pair]), fx.Int32(words[2 * pair + 1])],
-                            fx.Int32,
-                        )
-                        .bitcast(fx.Int64)[0]
-                        .ir_value()
-                    )
-        return packs
+        @flyc.jit
+        def _run():
+            packs = [[fx.Int64(0).ir_value()] * traits.D_CHUNKS for _ in range(4)]
+            if full_tile:
+                packs = self._load_v_fp8_coalesced(buf_id, tile_start, mask_tail=False)
+            else:
+                packs = self._load_v_fp8_coalesced(buf_id, tile_start)
+            return packs
 
-    def _load_v_fp8_coalesced(self, buf_id, tile_start):
+        return _run()
+
+    def _load_v_fp8_coalesced(self, buf_id, tile_start, mask_tail=True):
         traits = self.traits
         aligned_base = ((self.lds_vt_base_idx + 127) // 128) * 128
         tile_base = aligned_base + buf_id * traits.BLOCK_N * traits.HEAD_DIM_V
         d_lane = fx.Int32(self.lane % 32)
         lane_half = fx.Int32(self.lane // 32)
         masks = []
-        for half in range_constexpr(2):
-            for word in range_constexpr(4):
-                token = fx.Int32(tile_start) + lane_half * 16 + half * 32 + word * 4
-                count = self.seqlen_kv_i32 - token
-                count = (count > 0).select(count, fx.Int32(0))
-                count = (count < 4).select(count, fx.Int32(4))
-                # Shift a 32-bit all-ones word; avoid shifting by the word width.
-                shift = (count > 0).select((4 - count) * 8, fx.Int32(24))
-                mask = fx.Int32(-1).shrui(shift)
-                masks.append((count > 0).select(mask, fx.Int32(0)))
+        if const_expr(mask_tail):
+            for half in range_constexpr(2):
+                for word in range_constexpr(4):
+                    token = fx.Int32(tile_start) + lane_half * 16 + half * 32 + word * 4
+                    count = self.seqlen_kv_i32 - token
+                    count = (count > 0).select(count, fx.Int32(0))
+                    count = (count < 4).select(count, fx.Int32(4))
+                    # Shift a 32-bit all-ones word; avoid shifting by the word width.
+                    shift = (count > 0).select((4 - count) * 8, fx.Int32(24))
+                    mask = fx.Int32(-1).shrui(shift)
+                    masks.append((count > 0).select(mask, fx.Int32(0)))
         packs = [[None] * traits.D_CHUNKS for _ in range(4)]
         for dc in range_constexpr(traits.D_CHUNKS):
             d = fx.Int32(32 * dc) + d_lane
@@ -415,6 +377,8 @@ class DualwaveFp8KvLdsToVgprLoader(DualwaveFp8KernelContext):
                 byte_off = fx.Int32(
                     tile_base + (lane_half + 2 * half) * traits.HEAD_DIM_V * 16 + d * 16
                 )
+                # The typed LDS view splits this aligned b128 load into read2_b32
+                # pairs and adds address arithmetic; keep the explicit alignment.
                 ptr = buffer_ops.get_element_ptr(
                     self.lds_vt_base_ptr,
                     byte_offset=_raw(byte_off - fx.Int32(self.lds_vt_base_idx)),
@@ -423,10 +387,11 @@ class DualwaveFp8KvLdsToVgprLoader(DualwaveFp8KernelContext):
                 words = Vec(
                     llvm.LoadOp(Vec.make_type(4, fx.Int32), ptr, alignment=16).result
                 )
-                # Integer masks remove invalid bytes without sanitizing valid NaNs.
-                words = words & Vec.from_elements(
-                    masks[4 * half : 4 * half + 4], fx.Int32
-                )
+                if const_expr(mask_tail):
+                    # Integer masks remove invalid bytes without sanitizing valid NaNs.
+                    words = words & Vec.from_elements(
+                        masks[4 * half : 4 * half + 4], fx.Int32
+                    )
                 for pair in range_constexpr(2):
                     packs[2 * half + pair][dc] = (
                         Vec.from_elements(

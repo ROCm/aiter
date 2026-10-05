@@ -5,7 +5,8 @@
 """FlyDSL Flash Attention fp8 (e4m3fn) forward for gfx950.
 
 Q/K/V are pre-quantized e4m3fn with per-tensor fp32 shape-[1] descales; the
-output is bf16 (or f16 when ``out`` is f16, non-split-K). Dense, packed-varlen and split-K.
+output is bf16 (or f16 when ``out`` is f16, non-split-K). Dense, packed-varlen and
+split-K.
 """
 
 from __future__ import annotations
@@ -242,10 +243,6 @@ def _build_fp8(
     batch_interleave_group: int = 1,
     return_lse: bool = False,
     out_dtype: str = "bf16",
-    paged: bool = False,
-    kv_cache_layout: str = "linear",
-    body_variant: str = "default",
-    gqa_pack_m: bool = False,
 ):
     """Build (and cache) the gfx950 fp8 launcher (dense, packed varlen, or split-K)."""
     from aiter.ops.flydsl.kernels.fmha_gfx950.flash_attn_fp8_gfx950 import (
@@ -270,10 +267,6 @@ def _build_fp8(
         batch_interleave_group=batch_interleave_group,
         return_lse=return_lse,
         out_dtype=out_dtype,
-        paged=paged,
-        kv_cache_layout=kv_cache_layout,
-        body_variant=body_variant,
-        gqa_pack_m=gqa_pack_m,
     )
 
 
@@ -325,7 +318,8 @@ def flydsl_flash_attn_fp8_func(
             ``None`` autotunes it.
         fp8_block_m: Pin the tile height to 128 or 256. ``None`` autotunes it.
         q_descale / k_descale / v_descale: fp32 shape-[1] descales, required.
-        out: Optional pre-allocated bf16 or f16 (non-split-K) output of shape ``q.shape[:-1] + (Dv,)``.
+        out: Optional pre-allocated bf16 or f16 (non-split-K) output of shape
+            ``q.shape[:-1] + (Dv,)``.
         return_lse: Also return the fp32 log-sum-exp of the softmax logits.
         lse: Optional pre-allocated fp32 LSE buffer; allocated here when None.
             Dense: ``[B, H, Sq]``. Varlen: ``[H, total_q]``.
@@ -336,7 +330,8 @@ def flydsl_flash_attn_fp8_func(
         stream: CUDA/HIP stream to launch on.
 
     Returns:
-        bf16 (or ``out.dtype``) output tensor of shape ``q.shape[:-1] + (v.shape[-1],)``, or
+        bf16 (or ``out.dtype``) output tensor of shape
+        ``q.shape[:-1] + (v.shape[-1],)``, or
         ``(out, lse)`` when ``return_lse``.
     """
     if not (q.is_cuda and k.is_cuda and v.is_cuda):

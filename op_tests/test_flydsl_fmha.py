@@ -1490,10 +1490,10 @@ def test_fp8_lse_fully_masked_rows_are_neg_inf(block_m, splits, S, Skv):
     """Every dead row's LSE is exactly -inf, on every tile/split configuration.
 
     Bottom-right causal with Skv < Sq leaves the leading Sq-Skv rows with no
-    visible key. The kernel used to seed the running max with a compile-time -inf
-    and compile with nnan+ninf fast math, so a q-block whose causal window is
-    empty carried poison into the epilogue and wrote NaN for a varying handful of
-    those rows on each launch -- hence the repeat loop rather than a single call.
+    visible key. A running max seeded with a compile-time -inf under nnan+ninf
+    fast math lets a q-block whose causal window is empty carry poison into the
+    epilogue, writing NaN in a varying handful of those rows per launch -- hence
+    the repeat loop rather than a single call.
     """
     from aiter.ops.flydsl.kernels.flash_attn_func_fp8_gfx950 import (
         flydsl_flash_attn_fp8_func,
@@ -1610,7 +1610,7 @@ def test_fp8_varlen_zero_length_kv_entry(causal, vl_q, vl_kv):
 @_gfx950_only
 @pytest.mark.parametrize("causal", [False, True])
 def test_fp8_dispatch_return_lse(causal):
-    """``return_lse`` now routes to gfx950 fp8 instead of falling through."""
+    """``return_lse`` routes to gfx950 fp8."""
     from aiter.ops.flydsl.fmha_kernels import (
         flydsl_flash_attn_batch_func,
         flydsl_flash_attn_varlen_func,

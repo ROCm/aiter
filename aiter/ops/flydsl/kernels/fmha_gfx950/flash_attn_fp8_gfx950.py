@@ -55,7 +55,6 @@ def build_flash_attn_dualwave_swp_fp8_module(
     paged=False,
     kv_cache_layout="linear",
     out_dtype="bf16",
-    _k_shuffled_only=False,
     body_variant="default",
     gqa_pack_m=False,
 ):
@@ -101,7 +100,6 @@ def build_flash_attn_dualwave_swp_fp8_module(
         paged=paged,
         kv_cache_layout=kv_cache_layout,
         out_dtype=out_dtype,
-        _k_shuffled_only=_k_shuffled_only,
         body_variant=body_variant,
         gqa_pack_m=gqa_pack_m,
     )
@@ -139,8 +137,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
             vt: fx.Array[fx.BFloat16, traits.VT_BF16_TOTAL, 16]
             q: fx.Array[_lds_elem_dtype, _q_lds_elems, 16]
 
-    @flyc.jit
-    def _fwd_body(ctx):
+    def _init_fwd_helpers(ctx):
         ctx.init_types_and_constants()
         ctx.init_runtime_indices()
         ctx.init_lds(SharedStorage)
@@ -153,14 +150,28 @@ def build_flash_attn_dualwave_swp_fp8_module(
         ctx.init_dma_thread_offsets()
         ctx.init_descale()
         ctx.init_tile_bounds()
-        ctx.init_workspace_io()
+        if const_expr(traits.BODY_VARIANT == "default"):
+            ctx.init_workspace_io()
 
-        q_loader = DualwaveFp8QLoader(ctx)
-        gemm_helper = DualwaveFp8GemmHelper(ctx)
-        softmax_helper = DualwaveFp8SoftmaxHelper(ctx)
-        kv_gmem_to_lds = DualwaveFp8KvGmemToLdsLoader(ctx)
-        kv_lds_to_regs = DualwaveFp8KvLdsToVgprLoader(ctx)
-        output_store = DualwaveFp8StoreHelper(ctx)
+        return (
+            DualwaveFp8QLoader(ctx),
+            DualwaveFp8GemmHelper(ctx),
+            DualwaveFp8SoftmaxHelper(ctx),
+            DualwaveFp8KvGmemToLdsLoader(ctx),
+            DualwaveFp8KvLdsToVgprLoader(ctx),
+            DualwaveFp8StoreHelper(ctx),
+        )
+
+    @flyc.jit
+    def _fwd_body(ctx):
+        (
+            q_loader,
+            gemm_helper,
+            softmax_helper,
+            kv_gmem_to_lds,
+            kv_lds_to_regs,
+            output_store,
+        ) = _init_fwd_helpers(ctx)
 
         BN = traits.BLOCK_N
         D_CHUNKS = traits.D_CHUNKS
@@ -354,25 +365,14 @@ def build_flash_attn_dualwave_swp_fp8_module(
 
     @flyc.jit
     def _conventional_bn64_body(ctx):
-        ctx.init_types_and_constants()
-        ctx.init_runtime_indices()
-        ctx.init_lds(SharedStorage)
-        ctx.init_thread_mapping()
-        if const_expr(traits.CAUSAL):
-            ctx.init_causal_lpt_order()
-        ctx.init_sequence_lengths()
-        ctx.init_descriptors()
-        ctx.init_atoms_and_lds_ptrs()
-        ctx.init_dma_thread_offsets()
-        ctx.init_descale()
-        ctx.init_tile_bounds()
-
-        q_loader = DualwaveFp8QLoader(ctx)
-        gemm_helper = DualwaveFp8GemmHelper(ctx)
-        softmax_helper = DualwaveFp8SoftmaxHelper(ctx)
-        kv_gmem_to_lds = DualwaveFp8KvGmemToLdsLoader(ctx)
-        kv_lds_to_regs = DualwaveFp8KvLdsToVgprLoader(ctx)
-        output_store = DualwaveFp8StoreHelper(ctx)
+        (
+            q_loader,
+            gemm_helper,
+            softmax_helper,
+            kv_gmem_to_lds,
+            kv_lds_to_regs,
+            output_store,
+        ) = _init_fwd_helpers(ctx)
         BN = traits.BLOCK_N
         D_CHUNKS = traits.D_CHUNKS
         t0 = fx.Int64(ctx.split_t0)

@@ -10,7 +10,6 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly, llvm
-from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace as _TargetAddressSpace
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
@@ -174,7 +173,7 @@ def _score_pair_sum(v_s, zero_f, fm_fast):
 
 
 def _scale_sub_score_pair(v_s, row_max_raw, scale, zero_f, fm_fast, bias=None):
-    """Fused softmax-scale + row-max subtraction (optimization 1-A).
+    """Fused softmax-scale + row-max subtraction.
 
     Returns ``scale * (v_s - row_max_raw) + bias`` per element via a single FMA
     (``fma(s, scale, bias - scale*row_max_raw)``), so the fp8 QK MMA can emit raw
@@ -267,39 +266,18 @@ def _cu_load(div, idx, cu_atom, cu_v1i32):
     )
 
 
-def _make_page_view(
-    base_iter,
-    base_iter_ty,
-    align,
-    page_id,
-    page_byte_stride,
-    page_nrec_bytes,
-    page_layout,
-    elem_ir,
-    buf_flags_i32,
-):
-    """Buffer descriptor covering exactly one KV page.
-
-    Vendored from upstream ``flash_attn_utils._make_page_view`` (v0.3.0), which is
-    already dtype-parametric via ``elem_ir`` -- the fp8 caller passes i8 to match its
-    byte-indexed dense descriptors. ``num_records`` is one page, so a read past the
-    page end returns 0 instead of the neighbouring page: the bound is the OOB guard.
-    """
+def _make_page_view(base_iter, page_id, page_byte_stride, page_nrec_bytes, page_layout):
+    """Byte-indexed descriptor bounded to one KV page, not its neighbour."""
     base_i64 = fx.Int64(fx.ptrtoint(base_iter))
     off_i64 = fx.Int64(page_id * page_byte_stride)
-    shifted = fx.inttoptr(base_iter_ty, base_i64 + off_i64)
-    buf_ptr_ty = fx.PointerType.get(
-        elem_ty=elem_ir, address_space=_TargetAddressSpace.BufferDesc, alignment=align
+    base_ty = fx.PointerType(base_iter.type)
+    byte_ptr_ty = fx.PointerType.get(
+        elem_ty=fx.Int8.ir_type,
+        address_space=base_ty.address_space,
+        alignment=base_ty.alignment,
     )
-    buf_ptr = fx.make_ptr(
-        buf_ptr_ty,
-        [
-            shifted,
-            fx.Int16(0).ir_value(),
-            page_nrec_bytes.ir_value(),
-            buf_flags_i32.ir_value(),
-        ],
-    )
+    shifted = fx.inttoptr(byte_ptr_ty, base_i64 + off_i64)
+    buf_ptr = fx.rocdl.make_buffer_ptr(shifted, num_records_bytes=page_nrec_bytes)
     return fx.logical_divide(fx.make_view(buf_ptr, page_layout), fx.make_layout(1, 1))
 
 
@@ -508,7 +486,6 @@ def _make_dualwave_swp_fp8_traits(
     paged=False,
     kv_cache_layout="linear",
     out_dtype="bf16",
-    _k_shuffled_only=False,
     body_variant="default",
     gqa_pack_m=False,
 ):
@@ -558,8 +535,6 @@ def _make_dualwave_swp_fp8_traits(
         raise RuntimeError(
             f"kv_cache_layout must be 'linear' or 'shuffled', got {kv_cache_layout!r}"
         )
-    if _k_shuffled_only and (not paged or kv_cache_layout != "shuffled"):
-        raise RuntimeError("_k_shuffled_only requires shuffled paging")
     if out_dtype not in ("bf16", "f16"):
         raise RuntimeError(f"out_dtype must be 'bf16' or 'f16', got {out_dtype!r}")
     if kv_cache_layout == "shuffled" and not paged:
@@ -708,7 +683,7 @@ def _make_dualwave_swp_fp8_traits(
         RETURN_LSE=bool(return_lse),
         PAGED=bool(paged),
         K_SHUFFLED=kv_cache_layout == "shuffled",
-        V_SHUFFLED=kv_cache_layout == "shuffled" and not _k_shuffled_only,
+        V_SHUFFLED=kv_cache_layout == "shuffled",
         OUT_F16=out_dtype == "f16",
         PAGED_BT_LDS_SIZE=paged_bt_lds_size,
         BODY_VARIANT=body_variant,
@@ -1027,7 +1002,6 @@ class DualwaveFp8KernelContext:
             self.page_layout = fx.make_layout(
                 fx.Int32(self.page_byte_stride), fx.Int32(1)
             )
-            self.buf_flags_i32 = fx.Int32(buffer_ops._get_buffer_flags())
             self.k_iter = fx.get_iter(self.K)
             self.v_iter = fx.get_iter(self.V)
             self.block_table_stride_v = fx.Index(self.block_table_stride)
@@ -1048,27 +1022,24 @@ class DualwaveFp8KernelContext:
         base_iter = self.k_iter if which == "k" else self.v_iter
         # Bounds follow the logical tile, not the clamped page id: invalid-token
         # V must be zero even when the last page contains stale fp8 NaNs.
-        remaining = self.seqlen_kv_v - tile_start
-        valid = (remaining > 0).select(remaining, fx.Index(0))
-        valid = (valid < self.traits.BLOCK_N).select(
-            valid, fx.Index(self.traits.BLOCK_N)
+        # Signed: tiles wholly past the sequence end would underflow in index math.
+        remaining = fx.Int64(self.seqlen_kv_v) - fx.Int64(tile_start)
+        valid = (remaining > fx.Int64(0)).select(remaining, fx.Int64(0))
+        valid = (valid < fx.Int64(self.traits.BLOCK_N)).select(
+            valid, fx.Int64(self.traits.BLOCK_N)
         )
-        nrec = fx.Int64(valid * self.stride_kv_n_v)
+        nrec = valid * fx.Int64(self.stride_kv_n_v)
         if const_expr(
             (which == "k" and self.traits.K_SHUFFLED)
             or (which == "v" and self.traits.V_SHUFFLED)
         ):
-            nrec = (valid > 0).select(self.page_byte_stride, fx.Int64(0))
+            nrec = (valid > fx.Int64(0)).select(self.page_byte_stride, fx.Int64(0))
         return _make_page_view(
             base_iter,
-            base_iter.type,
-            fx.PointerType(base_iter.type).alignment,
             page_id,
             self.page_byte_stride,
             nrec,
             self.page_layout,
-            fx.Int8.ir_type,
-            self.buf_flags_i32,
         )
 
     def init_atoms_and_lds_ptrs(self):

@@ -28,13 +28,18 @@ def unified_attention_flydsl(
     sinks=None,
     shuffled_kv_cache: bool = False,
     skip_reduce: bool = False,
-    # backend
-    backend: str | None = None,  # "triton" | "gluon" | "flydsl"
 ) -> torch.Tensor | None:
     try:
-        from aiter.ops.flydsl.unified_attention_kernels import is_flydsl_available
-    except ImportError:
-        return None
+        from aiter.ops.flydsl.unified_attention_kernels import (
+            flydsl_unified_attention,
+            is_flydsl_available,
+        )
+    except ModuleNotFoundError as e:
+        # Only an absent FlyDSL package means "no backend"; a broken internal
+        # import must surface with its own traceback.
+        if e.name is not None and e.name.split(".")[0] == "flydsl":
+            return None
+        raise
 
     q_device_index = q.device.index
     if q_device_index is None:
@@ -43,27 +48,16 @@ def unified_attention_flydsl(
         if not is_flydsl_available(q_device_index):
             return None
 
-    try:
-        from aiter.ops.flydsl.unified_attention_kernels import flydsl_unified_attention
-    except ImportError:
-        return None
-
-    _num_tokens, num_query_heads, _head_size = q.shape
-    kv_cache_dtype = k.dtype
+    # shuffled_kv_cache is already normalized by the router: rank 5 <=> shuffled.
     if k.dim() == 5:
-        _num_blocks, num_kv_heads, _, block_size, _K_WIDTH = k.shape
-        shuffled_kv_cache = True
+        num_kv_heads, block_size = k.shape[1], k.shape[3]
     elif k.dim() == 4:
-        if shuffled_kv_cache and kv_cache_dtype == torch.uint8:
-            _num_blocks, num_kv_heads, block_size, _ = k.shape
-        else:
-            _num_blocks, block_size, num_kv_heads, _ = k.shape
-            shuffled_kv_cache = False
+        # A shuffled flag on a rank-4 cache is declined by the stride gate.
+        block_size, num_kv_heads = k.shape[1], k.shape[2]
     else:
         return None
 
     num_seqs = len(seqused_k)
-    num_queries_per_kv = num_query_heads // num_kv_heads
 
     return flydsl_unified_attention(
         q,
@@ -84,7 +78,6 @@ def unified_attention_flydsl(
         v_descale,
         num_kv_heads=num_kv_heads,
         block_size=block_size,
-        num_queries_per_kv=num_queries_per_kv,
         num_seqs=num_seqs,
         q_scales=q_scales,
         alibi_slopes=alibi_slopes,

@@ -8,9 +8,7 @@
 Unlike the GEMM/MoE families, unified attention has no tuning CSV: the served
 config space is a fixed cross-product of build-time specializations for the
 Qwen3-VL production shape (num_heads=64, num_kv_heads=4 => GQA-16, head_dim=128,
-fp8 QKV, paged + varlen). ``DEFAULT_CSVS = [None]`` is a sentinel so the shared
-``collect_aot_jobs`` machinery iterates once and ``parse_csv`` emits the whole
-hardcoded job list regardless of its argument.
+fp8 QKV, paged + varlen). ``default_jobs()`` emits the fixed job list.
 
 One builder backs the family (gfx950-only, forced via FLYDSL_GPU_ARCH):
   - prefill: ``_get_kernel`` -> ``build_flash_attn_dualwave_swp_fp8_module``
@@ -33,7 +31,6 @@ import time
 import traceback
 
 from aiter.aot.flydsl.common import (
-    collect_aot_jobs,
     compile_only_env,
     override_env,
     run_jobs_parallel,
@@ -42,10 +39,6 @@ from aiter.aot.flydsl.common import (
 # The whole family is pinned to the gfx950 production config; attention has no
 # CSV cu_num column, so the target arch is hardcoded per job.
 UNIFIED_ATTENTION_AOT_ARCH = "gfx950"
-
-# Sentinel: no CSV. collect_aot_jobs iterates DEFAULT_CSVS and calls
-# parse_csv(None) once, which returns the full hardcoded job list.
-DEFAULT_CSVS = [None]
 
 # Pinned production geometry (Qwen3-VL fp8 unified attention on gfx950).
 _HEAD_DIM = 128
@@ -58,7 +51,6 @@ _OUT_DTYPES = ("bf16", "f16")
 def _prefill_jobs() -> list[dict]:
     return [
         {
-            "path": "prefill",
             "causal": causal,
             "out_dtype_str": out_dtype,
             "shuffled_kv_cache": shuffled,
@@ -75,10 +67,8 @@ def _prefill_jobs() -> list[dict]:
     ]
 
 
-def parse_csv(_csv=None) -> list[dict]:
-    """Return the full unified-attention job list. The CSV argument is ignored
-    (this family has no tuning CSV); ``_csv`` is present only to satisfy the
-    ``collect_aot_jobs`` / ``_collect_aot_jobs_for`` contract."""
+def default_jobs() -> list[dict]:
+    """Return the fixed prefill specialization list."""
     jobs = _prefill_jobs()
     common = {
         "num_heads": _NUM_HEADS,
@@ -94,15 +84,14 @@ def parse_csv(_csv=None) -> list[dict]:
             job.setdefault(key, val)
         job["kernel_name"] = _kernel_name(job)
     print(
-        f"[aiter] FlyDSL unified-attention AOT: {len(jobs)} jobs "
-        f"({sum(j['path'] == 'prefill' for j in jobs)} prefill)"
+        f"[aiter] FlyDSL unified-attention AOT: {len(jobs)} jobs ({len(jobs)} prefill)"
     )
     return jobs
 
 
 def _kernel_name(job: dict) -> str:
     return (
-        f"flydsl_unified_attn_{job['path']}"
+        "flydsl_unified_attn_prefill"
         f"_c{int(job['causal'])}_{job['out_dtype_str']}"
         f"_shuf{int(job['shuffled_kv_cache'])}"
         f"_thr{job['rescale_threshold']:g}_bm{job['block_m']}"
@@ -214,7 +203,7 @@ def compile_one_config(**job) -> dict:
     aot_arch = job.get("arch", UNIFIED_ATTENTION_AOT_ARCH)
     kernel_name = job.get("kernel_name", "flydsl_unified_attn")
     shape_str = (
-        f"{kernel_name}  path={job.get('path')} causal={job.get('causal')} "
+        f"{kernel_name}  causal={job.get('causal')} "
         f"out={job.get('out_dtype_str')} shuffled={job.get('shuffled_kv_cache')} "
         f"threshold={job.get('rescale_threshold')} block_m={job.get('block_m')}"
     )
@@ -225,10 +214,7 @@ def compile_one_config(**job) -> dict:
             override_env("FLYDSL_GPU_ARCH", aot_arch),
             FakeTensorMode(),
         ):
-            if job["path"] == "prefill":
-                _compile_prefill(job)
-            else:
-                raise ValueError(f"Unknown unified-attention path: {job['path']!r}")
+            _compile_prefill(job)
         elapsed = time.time() - t0
         return {**job, "compile_time": elapsed, "compile_arch": aot_arch}
     except Exception as e:  # noqa: BLE001
@@ -250,9 +236,7 @@ def main(argv=None):
     os.makedirs(cache_dir, exist_ok=True)
     os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = cache_dir
 
-    # No CSV: the None sentinel in DEFAULT_CSVS routes collect_aot_jobs straight
-    # to parse_csv, which ignores its arg and emits the hardcoded job list.
-    jobs = collect_aot_jobs(DEFAULT_CSVS, parse_csv)
+    jobs = default_jobs()
 
     total_t0 = time.time()
     print(f"--- Compiling {len(jobs)} unified-attention kernels ---")

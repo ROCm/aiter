@@ -122,7 +122,7 @@ def compare(want, got, atol, name):
 
 
 def measure(candidates, case, want, query_lens, kv_lens, atol=None, bad_rows=False):
-    # Preserve the old adapter's 8% global-scale gate, not element-relative rtol.
+    # 8% of the global max rather than an element-relative rtol.
     if atol is None:
         atol = 0.08 * want.abs().max().item()
     heads = case["q"].shape[1]
@@ -161,7 +161,7 @@ PREFILL_CASES = {
     "varlen": ([320, 300, 200, 150], [2048, 5000, 8192, 3000], 16),
     # Ragged rows with an empty-KV row and partial last pages, per packed-BN64 GQA group.
     "varlen_causal": ([93, 80, 71, 60], [157, 100, 90, 70], 4),
-    **{f"ragged_g{g}": ([93, 1, 17, 9], [157, 0, 5, 1], g) for g in (1, 4, 8, 16)},
+    **{f"ragged_g{g}": ([93, 17, 41, 9], [157, 0, 70, 1], g) for g in (1, 4, 8, 16)},
 }
 
 
