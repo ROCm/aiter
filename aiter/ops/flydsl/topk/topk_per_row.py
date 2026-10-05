@@ -454,6 +454,7 @@ def _run_adaptive(
         indices,
         workspace,
         rows,
+        width,
         stride0,
         stride1,
         stream,

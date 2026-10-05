@@ -826,6 +826,47 @@ def test_adaptive_compact_garbage(card):
     print(f"[adaptive_compact_garbage] PASS: rows={rows} width={width} k={top_k}")
 
 
+def test_adaptive_row_past_width(card):
+    """A `seq_lens` entry past the buffer width reads the row to its width, as the
+    other decode kernels do, and not into the outranking padding behind it."""
+    pad = 4096
+    for rows, width, top_k, stable in adaptive_band_cells(card):
+        storage = torch.full((rows, width + pad), 1e4, device="cuda")
+        logits = storage[:, :width]
+        full = torch.full((rows,), width, dtype=torch.int32, device="cuda")
+        logits.copy_(create_planted_logits(full, width, top_k))
+        seq_lens = torch.randint(
+            top_k, width + 1, (rows,), dtype=torch.int32, device="cuda"
+        )
+        seq_lens[::2] = width + pad
+        row_ends = seq_lens.clamp(max=width)
+        indices = torch.empty((rows, top_k), dtype=torch.int32, device="cuda")
+        flydsl_decode_host._decode_with_backend(
+            logits,
+            1,
+            seq_lens,
+            indices,
+            rows,
+            *logits.stride(),
+            top_k,
+            stable,
+            None,
+            topk.BACKEND_ADAPTIVE,
+            width + pad,
+        )
+        torch.cuda.synchronize()
+        cell = f"rows={rows} width={width} k={top_k} stable={stable}"
+        assert (indices < width).all(), f"read past the width at {cell}"
+        live = torch.arange(width, device="cuda")[None, :] < row_ends[:, None]
+        masked = torch.where(live, logits, float("-inf"))
+        torch_indices = masked.topk(top_k, dim=-1)[1]
+        row_starts = torch.zeros(rows, dtype=torch.int32, device="cuda")
+        assert compare_topk_results(
+            masked, indices, torch_indices, row_starts, row_ends, top_k, stable=stable
+        ), f"row past width mismatch at {cell}"
+    print("[adaptive_row_past_width] PASS")
+
+
 def stable_reference(masked: torch.Tensor, top_k: int) -> torch.Tensor:
     """The k largest per row in ascending column order, ties to the smallest column.
 
@@ -1177,6 +1218,7 @@ if card in topk._ADAPTIVE_BANDS_BY_K_GROUP:
     ), f"short-row decode does not reach every radix pass exit:\n{df_md}"
     test_decode_bound_entry_points(card)
     test_adaptive_compact_garbage(card)
+    test_adaptive_row_past_width(card)
     test_adaptive_ordered_early_stop(card)
 else:
     aiter.logger.warning(

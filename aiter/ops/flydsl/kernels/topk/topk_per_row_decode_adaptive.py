@@ -14,7 +14,8 @@ Inputs/outputs:
   - logits: fp32, logical shape (num_rows, L), strides (stride0, stride1) with
     stride1 == 1 (contiguous within a row).
   - seq_lens: int32 causal lengths per sequence; row r scores sequence r // next_n at
-    decode slot r % next_n, valid length seq_len - next_n + slot + 1.
+    decode slot r % next_n, valid length seq_len - next_n + slot + 1 clamped to
+    [0, L].
   - indices: flattened int32 output with shape (num_rows, top_k); each row writes its
     unordered Top-K index set. A row with fewer than top_k valid entries is
     identity-filled and padded with -1.
@@ -639,6 +640,7 @@ def create_topk_per_row_decode_adaptive_kernel(
         indices: fx.Tensor,
         workspace: fx.Tensor,
         stride0: fx.Int32,
+        width: fx.Int32,
     ) -> None:
         block_x = gpu.block_id("x")
         block_y = gpu.block_id("y")
@@ -694,6 +696,7 @@ def create_topk_per_row_decode_adaptive_kernel(
         )
         row_len = seq_len - next_n + slot + c_one
         row_len = (row_len > c_zero).select(row_len, c_zero)
+        row_len = (row_len < width).select(row_len, width)
         # One descriptor per row, based at the row and sized to its live length, so
         # no stride0 can move the bound and the vec4 tail reads zeros past the row.
         # The base is 64-bit, which keeps a tensor past 4 GiB addressable.
@@ -2232,13 +2235,14 @@ def create_topk_per_row_decode_adaptive_kernel(
         indices: fx.Tensor,
         workspace: fx.Tensor,
         num_rows: fx.Int32,
+        width: fx.Int32,
         stride0: fx.Int32,
         stride1: fx.Int32,
         stream: fx.Stream,
     ) -> None:
         grid_y = fx.Index(num_rows)
         topk_per_row_decode_adaptive_kernel(
-            logits, next_n, seq_lens, indices, workspace, stride0
+            logits, next_n, seq_lens, indices, workspace, stride0, width
         ).launch(
             grid=(blocks_per_row, grid_y, 1),
             block=(block_threads, 1, 1),
