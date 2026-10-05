@@ -887,7 +887,7 @@ def _pa_decode_sparse_gfx950_gluon(
         XCD_REMAP=xcd_remap,
         # Gather a tile ahead only for fp8_dsv4_mla's 32-head programs below prefill
         # size.
-        PIPE_PREFETCH=packed_fp8 and BLOCK_M == 32 and not prefill,
+        DSV4_PREFETCH=packed_fp8 and BLOCK_M == 32 and not prefill,
         num_warps=num_warps,
         waves_per_eu=waves_per_eu,
         **prefill_kw,
