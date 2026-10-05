@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import contextlib
-
 import torch
 import triton
 
@@ -40,21 +38,6 @@ def _is_gluon_available():
         return any(supported in get_arch() for supported in _GLUON_SUPPORTED_ARCHS)
     except Exception:  # noqa: BLE001
         return False
-
-
-@contextlib.contextmanager
-def _no_async_copy_on_gfx1250():
-    # Triton 3.8 on gfx1250 lowers the kernel's pipelined masked loads to
-    # global_load_async_to_lds, which has no bounds check and faults the GPU.
-    # The knob also sets TRITON_HIP_USE_ASYNC_COPY, which is part of Triton's
-    # compile cache key, so other kernels keep async copy.
-    amd_knobs = getattr(triton.knobs, "amd", None)
-    if "gfx1250" not in get_arch() or not hasattr(amd_knobs, "use_async_copy"):
-        yield
-        return
-    with amd_knobs.scope():
-        amd_knobs.use_async_copy = False
-        yield
 
 
 def gemm_a16w16_fake_tensor(
@@ -532,28 +515,27 @@ def gemm_a16w16_(
             * triton.cdiv(N, META["BLOCK_SIZE_N"])
         ),
     )
-    with _no_async_copy_on_gfx1250():
-        _gemm_a16_w16_kernel[grid](
-            x,
-            w,
-            bias,
-            y if config["NUM_KSPLIT"] == 1 else y_pp,
-            M,
-            N,
-            K,
-            x.stride(0),
-            x.stride(1),
-            w.stride(0),
-            w.stride(1),
-            0 if config["NUM_KSPLIT"] == 1 else y_pp.stride(0),
-            y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
-            y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
-            activation=_get_activation_from_str(activation) if activation else "",
-            use_activation=activation is not None,
-            ADD_BIAS=(bias is not None),
-            SKIP_REDUCE=skip_reduce,
-            **config,
-        )
+    _gemm_a16_w16_kernel[grid](
+        x,
+        w,
+        bias,
+        y if config["NUM_KSPLIT"] == 1 else y_pp,
+        M,
+        N,
+        K,
+        x.stride(0),
+        x.stride(1),
+        w.stride(0),
+        w.stride(1),
+        0 if config["NUM_KSPLIT"] == 1 else y_pp.stride(0),
+        y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
+        y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
+        activation=_get_activation_from_str(activation) if activation else "",
+        use_activation=activation is not None,
+        ADD_BIAS=(bias is not None),
+        SKIP_REDUCE=skip_reduce,
+        **config,
+    )
 
     if config["NUM_KSPLIT"] > 1:
         if skip_reduce:
