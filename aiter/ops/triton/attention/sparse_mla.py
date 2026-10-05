@@ -19,7 +19,7 @@ from aiter.ops.triton.attention.pa_decode_sparse import (
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.common_utils import max_addressable_bytes
-from aiter.ops.triton.utils.device_info import get_num_sms
+from aiter.ops.triton.utils.device_info import get_num_sms, get_num_xcds
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -701,6 +701,9 @@ def sparse_mla_fwd(
 
     # Q is read once per query without split-K, and re-read by every split
     q_cache = ".cg" if num_splits == 1 else ""
+    # Decode keeps neighbouring rows on one XCD: a spec-decode request's rows read
+    # nearly the same KV rows and share its L2. Prefill rows gain nothing from it.
+    xcd_remap = get_num_xcds() if num_queries < _PREFILL_MIN_ROWS else 0
     grid = (num_queries, grid_splits, heads_blocks)
     _sparse_mla_gfx950[grid](
         q,
@@ -756,6 +759,7 @@ def sparse_mla_fwd(
         UNI_TILE=True,
         GRID_ORDER="qsh",
         Q_CACHE=q_cache,
+        XCD_REMAP=xcd_remap,
         main_num_splits=main_splits,
         ADAPTIVE_SPLITS=num_splits > 1,
         DEQ="none",
