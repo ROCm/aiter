@@ -893,8 +893,7 @@ def test_route_g2l_fused(numel, E_global, n_buckets, w_dtype):
     max_m = max(512, 4 * numel // max(1, n_buckets))
 
     # Exactly n_buckets enabled global experts; the LUT is their rank order.
-    mask = torch.zeros(E_global, dtype=I32)
-    mask[torch.randperm(E_global, device="cpu")[:n_buckets].to(mask.device)] = 1
+    mask = random_expert_mask(E_global, n_buckets)
     g2l, _, _ = run_torch_g2l_lut(mask, n_buckets, 1, 1)
     topk_ids = torch.randint(0, E_global, (numel,), dtype=I32)
     weight_in = torch.rand(numel, dtype=torch.float32)
@@ -1058,7 +1057,9 @@ def main():
     args = parser.parse_args()
     dmap = {"bf16": torch.bfloat16, "f16": torch.float16}
 
-    # n <= 1024: the LUT scan is single-workgroup (MAX_G2L_EXPERTS).
+    # Keep one direct-kernel case for each meaningful extension point: the first
+    # 1024-thread variant, K3's sparse production shape, and full capacity.
+    # Production dispatch owns the exact 512/513 and 1024/1025 boundaries below.
     summarize(
         "moe_g2l_lut",
         [
@@ -1067,13 +1068,8 @@ def main():
                 *itertools.product(
                     [64, 512], [e for e in args.experts if e <= 512], [2, 8]
                 ),
-                (511, 128, 8),
                 (513, 128, 8),
-                (640, 160, 8),
-                (768, 192, 8),
                 (896, 56, 16),
-                (1023, 256, 8),
-                (1024, 256, 8),
                 (1024, 512, 8),
             ]
             if E <= n

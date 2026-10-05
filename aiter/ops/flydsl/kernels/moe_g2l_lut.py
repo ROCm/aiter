@@ -41,15 +41,14 @@ def build_moe_g2l_lut_module(
 ):
     """JIT launcher: single-block build of the EP global->local expert LUT."""
     wave_size = get_warp_size()
-    if (
-        max_experts < wave_size
-        or max_experts > MAX_G2L_EXPERTS
-        or max_experts & (max_experts - 1)
-        or max_experts > wave_size * wave_size
+    max_scan_experts = min(MAX_G2L_EXPERTS, wave_size * wave_size)
+    if not (
+        wave_size <= max_experts <= max_scan_experts
+        and max_experts & (max_experts - 1) == 0
     ):
         raise ValueError(
             f"max_experts must be a power of two in "
-            f"[{wave_size}, min({MAX_G2L_EXPERTS}, wave_size**2)], "
+            f"[{wave_size}, {max_scan_experts}], "
             f"got {max_experts}"
         )
     num_waves = max_experts // wave_size
@@ -104,6 +103,8 @@ def build_moe_g2l_lut_module(
             wave_prefix[wave] = inclusive
         gpu.barrier()
 
+        # The capacity check keeps num_waves within one wave, so wave 0 can
+        # turn all wave totals into exclusive offsets in one more wave scan.
         if wave == c0:
             active = lane < fx.Int32(num_waves)
             safe_lane = active.select(lane, c0)
