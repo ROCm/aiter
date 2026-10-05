@@ -468,6 +468,7 @@ def is_2d_gluon_available(params: _UAParams, backend: str):
             and params.q_dtype != torch.uint8
             and params.kv_cache_dtype != torch.uint8
             and params.q_dtype == params.kv_cache_dtype
+            and params.head_size_v == params.head_size
         )
     elif DEVICE_ARCH == "gfx950":
         use_gluon_arch = _gfx950_gluon_supported(params)
@@ -506,6 +507,7 @@ def is_reduce_gluon_available(params: _UAParams, NUM_SEGMENTS, backend: str):
             and NUM_SEGMENTS <= _GLUON_REDUCE_MAX_SEGMENTS
             and head_size_padded % 32 == 0
             and params.num_query_heads % gluon_num_warps == 0
+            and params.head_size_v == params.head_size
         )
 
     return use_gluon and use_gluon_arch
