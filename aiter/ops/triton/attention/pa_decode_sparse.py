@@ -483,43 +483,41 @@ def _last_round_fills(programs, num_sms):
     return left == 0 or 2 * left > num_sms
 
 
-def _packed_head_block(num_heads, num_queries, num_splits, row_tiles, has_extra):
-    """Heads per program (16, 32 or 64) for fp8_dsv4_mla at 32 or 64 heads.
-
-    32 when each program has more than one tile and, up to four rounds, the
-    last round is more than half full (past four rounds: four or more tiles).
-    64 for top-k launches without split-K from one full round of rows (up to
-    four rounds, a last round more than half full).
-    """
+def _rounds_suit_32(num_heads, num_queries, num_splits, tiles):
+    """The 32-head grid ends on a full or more-than-half-full round (up to four
+    rounds), or its programs have four or more tiles (past four rounds)."""
     num_sms = get_num_sms()
-    if num_heads == 64 and has_extra and num_splits == 1:
-        fills = _last_round_fills(num_queries, num_sms)
-        if num_queries >= num_sms and (fills or num_queries > 4 * num_sms):
-            return 64
-    tiles = row_tiles / num_splits
     programs = num_queries * (num_heads // 32) * num_splits
-    fills = _last_round_fills(programs, num_sms)
-    if tiles > 1 and (fills if programs <= 4 * num_sms else tiles >= 4):
+    if programs <= 4 * num_sms:
+        return _last_round_fills(programs, num_sms)
+    return tiles >= 4
+
+
+def _dsv4_block_m(num_heads, num_queries, num_splits, row_tiles, has_extra):
+    """Heads per program (16, 32 or 64) for fp8_dsv4_mla at 32 or 64 heads: 64
+    for top-k launches without split-K from one full round of rows (up to four
+    rounds, the last more than half full); else 32 past one tile per program."""
+    num_sms = get_num_sms()
+    rows_fill = num_queries >= num_sms and (
+        _last_round_fills(num_queries, num_sms) or num_queries > 4 * num_sms
+    )
+    if num_heads == 64 and has_extra and num_splits == 1 and rows_fill:
+        return 64
+    tiles = row_tiles / num_splits
+    if tiles > 1 and _rounds_suit_32(num_heads, num_queries, num_splits, tiles):
         return 32
     return 16
 
 
-def _staged_head_block(num_heads, num_queries, num_splits, row_tiles):
+def _staged_block_m(num_heads, num_queries, num_splits, row_tiles):
     """Heads per program (16, 32 or 64) at 32 or 64 heads for the staged walks
-    (per-tensor fp8; bf16 with the rope inside).
-
-    64 without split-K once 2 x rows > CUs; else 32 when each program has two
-    or more tiles and, up to four rounds, the last round is more than half
-    full (past four rounds: four or more tiles). The split count stays the
-    16-head grid's.
-    """
+    (per-tensor fp8; bf16 with the rope inside): 64 without split-K once
+    2 x rows > CUs; else 32 from two tiles per program."""
     num_sms = get_num_sms()
     if num_heads == 64 and num_splits == 1 and 2 * num_queries > num_sms:
         return 64
     tiles = row_tiles / num_splits
-    programs = num_queries * (num_heads // 32) * num_splits
-    fills = _last_round_fills(programs, num_sms)
-    if tiles >= 2 and (fills if programs <= 4 * num_sms else tiles >= 4):
+    if tiles >= 2 and _rounds_suit_32(num_heads, num_queries, num_splits, tiles):
         return 32
     return 16
 
@@ -687,11 +685,11 @@ def _pa_decode_sparse_gfx950_gluon(
     # 32- and 64-head programs (8 warps) stage each key tile once for all heads.
     if num_heads in (32, 64):
         if packed_fp8:
-            BLOCK_M = _packed_head_block(
+            BLOCK_M = _dsv4_block_m(
                 num_heads, num_queries, num_splits, row_tiles, has_extra
             )
         elif staged_bf16:
-            BLOCK_M = _staged_head_block(num_heads, num_queries, num_splits, row_tiles)
+            BLOCK_M = _staged_block_m(num_heads, num_queries, num_splits, row_tiles)
     if BLOCK_M > 16:
         num_warps = 8
     HEAD_ALIGNED = num_heads % BLOCK_M == 0

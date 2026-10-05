@@ -15,7 +15,7 @@ from aiter.ops.triton.attention.pa_decode_sparse import (
     _PREFILL_MIN_ROWS,
     _as_int32_contiguous_1d,
     _launch_splits,
-    _staged_head_block,
+    _staged_block_m,
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.common_utils import max_addressable_bytes
@@ -690,8 +690,8 @@ def sparse_mla_fwd(
 
     staged = fmt == "fp8_scalar" or (fmt == "bf16" and qk_rope_head_dim == 0)
     if staged and num_heads in (32, 64) and not async_lds_on:
-        # 32- or 64-head programs (_staged_head_block).
-        block_m = _staged_head_block(
+        # 32- or 64-head programs (_staged_block_m).
+        block_m = _staged_block_m(
             num_heads, num_queries, num_splits, max(avg_main, avg_extra) / block_k
         )
         if block_m > 16:
