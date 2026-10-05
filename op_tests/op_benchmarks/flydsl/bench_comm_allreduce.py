@@ -2043,20 +2043,8 @@ def _mark_na(out, cols):
             out[col] = out[col].astype(object).where(out[col].notna(), None)
 
 
-def case_tables(df, keys, baseline: str):
+def case_tables(df, keys, baseline: str, measured=None):
     """One latency/accuracy table per case (shape x TP x dtype), candidates as rows.
-
-    The predecessor of this function, ``latency_table``, stacked every case
-    into one wide table with a column per candidate, and accuracy sat in a
-    second wide table of its own keyed the same way. With the full candidate
-    set that grid is wider than a screen, so comparing implementations at one
-    shape meant scanning across a giant row in one table, then finding the
-    matching row in another. This stacks the other way: one small table per
-    case -- its title carries the identity (TP, dtype, M, payload size,
-    predicted kernel, prod path) that used to be repeated as leading columns
-    on every row -- with one row per candidate that actually ran here, latency
-    and SQNR side by side, so comparing implementations is reading down a
-    short column instead.
 
     Ratio is ``baseline_us / candidate_us``, so **> 1.0 means the candidate is
     faster than the baseline**; the baseline's own row reads 1.0.
@@ -2099,6 +2087,8 @@ def case_tables(df, keys, baseline: str):
             row = {"candidate": k, "us": us}
             if base_us is not None:
                 row[f"vs {baseline}"] = base_us / us
+            if measured is not None:
+                row["eff"] = _eff(r, k, us, measured)
             row["SQNR dB"] = r.get(f"{k} SQNR dB", float("nan"))
             row["busbw GB/s"] = r.get(f"{k} busbw GB/s", float("nan"))
             spread = r.get(f"{k} spread us")
@@ -2141,20 +2131,18 @@ def metric_table(df, suffix: str, keys):
 def _roof(row, key, measured):
     """TransferBench ceiling for *key*'s wire bytes in this row, or None.
 
-    Shared by ``roofline_table`` and ``summary_table`` so both grade a
-    candidate against the bytes it actually sends rather than the payload it
-    was handed. *key* of ``None`` means the payload itself.
-
-    Keyed on ``(TP, bytes)`` only. It used to also key on the candidate's own
-    algorithm, which meant a candidate was graded against a ceiling built from
-    the same algorithm it had chosen -- so picking a better one than the model
-    put ``eff`` above 1.0. The roof is now the best algorithm for that many
+    The roof is now the best algorithm for that many
     bytes, which is a bound a candidate cannot legitimately beat.
     """
+    return measured.get((int(row["TP"]), _wire_bytes(row, key)))
+
+
+def _wire_bytes(row, key):
+    """Bytes *key* puts on the wire in this row; the payload when *key* is None."""
     nbytes = int(row["_nbytes"])
-    return measured.get(
-        (int(row["TP"]), tbr.wire_bytes(nbytes, key) if key else nbytes)
-    )
+    if not key:
+        return nbytes
+    return tbr.wire_bytes(nbytes, key, row.get(f"{key} variant"))
 
 
 def _roof_us(row, key, measured):
@@ -2197,46 +2185,6 @@ def summary_table(df, keys, min_sqnr: float = DEFAULT_MIN_SQNR, roofline=None):
     to an all-reduce, and how much faster is it than what production actually
     dispatches here?
 
-    **"Production" is derived per row from ``prod path``, not from a fixed
-    candidate.** An earlier version used *every* row's ``prod time (us)`` from
-    a single CLI-selected baseline (``cdr`` by default) while labelling the
-    column with the per-row ``prod path`` string -- so a row where production
-    falls back to RCCL (large messages past the custom-AR cutoff, or QR
-    disabled) printed ``prod collective = rccl`` next to ``cdr``'s time and
-    efficiency under that name. The two must always describe the same
-    collective: ``_prod_candidate_key`` parses ``prod path`` (``"rccl"``,
-    ``"cdr:<kernel>"``, ``"qr:<regime>"``) back into the ``CANDIDATES`` key
-    that was actually timed, and every ``prod *`` column below comes from that
-    key's own row -- never from an unrelated fixed baseline.
-
-    A row can still show ``prod collective`` with no timing: if ``prod path``
-    names a candidate the sweep did not measure (``-c`` excluded it, or the
-    env implied a candidate the sweep never enabled), ``prod time (us)`` is
-    NaN and a rendered ``-``. That is reported once per candidate rather than
-    silently substituting a different collective's number -- see the log line
-    this emits.
-
-    **Ranked on speed alone this table would be a trap**, which is why the
-    winner is accuracy-gated and why there are two of them:
-
-    * ``fastest collective`` is the fastest candidate clearing *min_sqnr*
-      (default ``DEFAULT_MIN_SQNR``), with ``fastest collective SQNR dB``
-      printed beside it so the cost of the choice is never off-screen. Without
-      a floor the winner would be the widest-error codec in the sweep at
-      nearly every shape -- ``qr_int3`` at ~12 dB is ~25% relative error and
-      beats everything on speed.
-    * ``fastest exact collective`` is the fastest of the bit-accurate
-      candidates, i.e. the fastest option that does not change the model's
-      numerics at all. Membership is decided **per shape**, not per candidate:
-      ``fly_auto`` dispatches to the exact one-shot below its policy ceiling
-      and to a quantized schedule above it, so it belongs in this column on
-      some rows and not others. Omitted when every candidate in the sweep is
-      exact at every shape, since it would just repeat ``fastest collective``.
-
-    A candidate excluded by the floor is not hidden: it keeps its row in that
-    shape's ``latency & accuracy by case`` table, and the count of rows where
-    the floor changed the winner is logged, so the default can never silently
-    bury a result.
 
     Both ratios are ``prod time (us) / fastest time (us)``, so **> 1.0 means
     faster than production**, matching ``case_tables``'s ``vs <baseline>``
@@ -2249,8 +2197,8 @@ def summary_table(df, keys, min_sqnr: float = DEFAULT_MIN_SQNR, roofline=None):
     ``roofline_table``, graded on that candidate's own wire bytes, so a
     quantizing winner is not held to the exact candidates' ceiling. This is
     also why a faster winner can show a *lower* eff than a slower one: e.g.
-    ``fly_int4`` sends 1/4 the bytes of ``rccl``, so its roof is a quarter the
-    size, and the same fixed quantize/dequantize and launch overhead is a
+    ``fly_int4`` sends 9/32 the bytes of ``rccl`` (int4 plus scales), so its
+    roof is under a third the size, and the same fixed quantize/dequantize and launch overhead is a
     larger fraction of a smaller roof. Faster-but-less-efficient is the
     signature of a candidate that is winning on payload reduction rather than
     on using the fabric well.
@@ -2391,7 +2339,7 @@ def measure_roofline(df, keys, *, binary, cus, iters, warmup):
             requests.add(nbytes)
             for k in live:
                 if pd.notna(r[f"{k} us"]):
-                    requests.add(tbr.wire_bytes(nbytes, k))
+                    requests.add(_wire_bytes(r, k))
         logger.info(
             "TransferBench: TP%d, %d distinct byte count(s) x %d algorithm(s)",
             tp_size,
@@ -2420,29 +2368,10 @@ def roofline_table(df, keys, measured):
     """Fabric ceiling per row, and what fraction of it each candidate reached.
 
     ``roof us`` is the fastest way TransferBench could move this row's *payload*
-    bytes, over one-shot, two-shot and ring; ``roof algo`` names the winner.
-    Each ``<cand> eff`` uses the same best-over-algorithms roof but at that
-    candidate's own wire size (``transferbench_roofline.wire_bytes``), so a
-    quantizing candidate is graded on the bytes it really sends rather than the
-    ones it was handed.
+    bytes.
 
     ``eff`` is ``roof us / cand us``, so **1.0 means the candidate is at the
-    ceiling and values above 1.0 should not occur**. Two ways to read it:
-
-    * **Well below 1.0 at small sizes is expected, not a finding.** The
-      roofline has no peer handshake, and the 1-stage kernel is dominated by
-      the ``start_sync`` spin there. The gap is the sync cost, not waste.
-    * **Above 1.0 is a bug in the roofline**, not a fast kernel. It means some
-      algorithm the candidate can reach is not in ``_ALGOS``, so the "ceiling"
-      is really the cost of an algorithm the candidate beat. This is exactly
-      what a two-shot-only model did to ``rccl`` on a NUMA-split PCIe host
-      (``eff`` 1.18, because RCCL rings and the model did not). Add the missing
-      pattern rather than explaining the number away.
-
-    ``roof algo`` is worth reading next to the ``kernel`` column: where they
-    disagree, the dispatch picked an algorithm this fabric does not favour.
-
-    *measured* is the lookup from ``measure_roofline``.
+    ceiling and values above 1.0 should not occur**.
     """
     out = df[[c for c in ID_COLUMNS if c in df]].copy()
     live = [k for k in keys if f"{k} us" in df.columns]
@@ -2588,10 +2517,7 @@ def _write_report(
         lines += [
             "`eff` in the roofline table is `roof us / cand us`, where the roof is",
             "the fastest of one-shot / two-shot / ring moving that candidate's wire",
-            "bytes **with no peer handshake**; `roof algo` names the winner. Below",
-            "1.0 at small sizes is the sync cost, not waste. Above 1.0 should not",
-            "happen and means the roof is missing an algorithm the candidate used,",
-            "not that the kernel was fast.",
+            "bytes, bandwidth only.",
             "",
         ]
     for title, table in sections:
@@ -2960,7 +2886,7 @@ def main():
         case_md = "\n\n".join(
             f"### {title}\n\n"
             + cdf.to_markdown(index=False, floatfmt=".4g", missingval="n/a")
-            for title, cdf in case_tables(df, keys, args.baseline)
+            for title, cdf in case_tables(df, keys, args.baseline, measured)
         )
         logger.info("all-reduce %s (markdown):\n%s", case_title, case_md)
         sections.append((case_title, case_md))

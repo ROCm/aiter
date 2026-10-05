@@ -36,7 +36,7 @@ pinned per lap: all-INT4 at TP8, and one lap lossless to isolate the other.
 
 Every mesh row also checks that all ranks wrote bit-identical output: each
 rank decodes every chunk from the same packets, its own included -- its own
-from the packet it sent, since it never round-trips through its own inbox. 
+from the packet it sent, since it never round-trips through its own inbox.
 The ring's owner stores its chunk before the all-gather quantization, so
 its ranks legitimately differ and only report the count.
 

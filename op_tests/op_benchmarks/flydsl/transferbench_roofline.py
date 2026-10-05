@@ -3,29 +3,19 @@
 """TransferBench-backed bandwidth roofline for ``bench_comm_allreduce.py``.
 
 ``bench_comm_allreduce.py`` compares aiter's all-reduce candidates against each
-other and against RCCL. Both of those are *floors*: they tell you whether a
-kernel beats another kernel, not how much of the fabric any of them is
-actually using. This module supplies the ceiling, by asking TransferBench
+other and against RCCL. This module supplies the roofline, by asking TransferBench
 (https://github.com/ROCm/TransferBench) to move the same bytes in the same
 pattern with none of the collective's semantics attached.
 
 The one TransferBench feature that makes this possible: a Transfer is defined
 as "an Executor reads and **adds** values from source memory, then writes the
-sum to destination memory", and source/destination locations concatenate. So
-``G0G1G2G3->G0->G0`` is a GPU-0 kernel that reads all four peer buffers, sums
-them, and writes GPU 0's copy -- exactly the data movement of a one-shot
-all-reduce, minus the peer handshake.
+sum to destination memory", and source/destination locations concatenate.
 
-What the roofline is and is not
+What the roofline is
 ===============================
 
 The roof for a byte count is the **best over algorithms**, not the throughput of
-one. That distinction is load-bearing: an earlier version modelled only the
-direct two-shot below, and on a NUMA-split PCIe host that pattern is ~19% slower
-than a ring -- so RCCL, which rings, measured *above* the "ceiling" at
-``eff = 1.18``. A ceiling a real candidate can beat is not a ceiling. Every
-algorithm here is a legitimate way to all-reduce the same bytes, so the fastest
-of them is the honest bound::
+one. 
 
     one-shot  N parallel transfers, GPU i reduces all N buffers into its own:
               -N (G0..G(N-1) Gi Gi <cus> <bytes>)  for each i
@@ -61,9 +51,9 @@ Deliberately not modelled, all of which make the roofline optimistic:
 * **No quantize/dequantize ALU cost.** The quantizing candidates are rooflined
   by shrinking the byte count (see ``WIRE_RATIO``), which prices their wire
   saving but not the codec.
-* **Scale bytes are ignored.** The quick-reduce codecs also ship per-group
-  scales, so their true wire is a little larger than ``WIRE_RATIO`` says and
-  their roofline is correspondingly a little too fast.
+* **Wire-only roof for the codecs.** Their per-tile scale bytes *are* in
+  ``WIRE_RATIO`` (``SCALE_RATIO``), but flags and the 64 B padding of a
+  block-64 scale region are not.
 * **fp32 elements.** TransferBench is hardcoded to ``float`` throughout
   (``numBytes / sizeof(float)``). Only the byte count is comparable, which for
   a bandwidth ceiling is the part that matters.
@@ -72,12 +62,7 @@ Because of the first point especially, treat a low efficiency at small sizes as
 "sync-bound, as expected" and a low efficiency at large sizes as a real
 question about the kernel.
 
-One parsing constraint worth knowing, since it decides how the numbers are
-read back: TransferBench prints durations as ``%8.3f ms``, a 1 us quantum, and
-a small-shape all-reduce roofline is *sub*-microsecond -- it reads back as a
-flat ``0.000``. Durations are therefore re-derived from the bandwidth column
-where that is the more precise of the two; see ``_duration_ms``. Rows where
-both columns bottom out are dropped rather than reported as zero.
+The roof is **bandwidth-only**.
 
 Usage
 =====
@@ -111,22 +96,21 @@ logger = logging.getLogger("aiter")
 # is what the candidate actually puts on the fabric relative to its (bf16/fp16)
 # input, and it is the only thing that distinguishes one candidate's roofline
 # from another's -- the pattern and the CU count are shared.
-#
-# The int/fp8 ratios are codec width / 16, and ignore the per-group scales the
-# quick-reduce codecs also send, so they are slightly optimistic. qr_fp stays at
-# 1.0 on bf16 input because AITER_QUICK_REDUCE_CAST_BF16_TO_FP16 casts to fp16,
-# which is the same 2 bytes per element.
+SCALE_RATIO = 128.0 / 4096.0
 WIRE_RATIO = {
     "cdr": 1.0,
     "cdr_naive": 1.0,
     "cdr_fp8": 0.5,
     "qr_fp": 1.0,
-    "qr_fp8": 0.5,
-    "qr_int6": 6.0 / 16.0,
-    "qr_int4": 4.0 / 16.0,
-    "qr_int3": 3.0 / 16.0,
-    "fly_int4": 4.0 / 16.0,
-    "fly_int4_ring": 4.0 / 16.0,
+    "qr_fp8": 8.0 / 16.0 + SCALE_RATIO,
+    "qr_int6": 6.0 / 16.0 + SCALE_RATIO,
+    "qr_int4": 4.0 / 16.0 + SCALE_RATIO,
+    "qr_int3": 3.0 / 16.0 + SCALE_RATIO,
+    "fly_int4": 4.0 / 16.0 + SCALE_RATIO,
+    "fly_int4_ring": 4.0 / 16.0 + SCALE_RATIO,
+    # Follows its reported variant (``wire_ratio``); this is only the fallback
+    # for a row with none, and is the exact one-shot's ratio.
+    "fly_auto": 1.0,
     # Exact, bf16 on the wire -- no codec, so the payload dtype is the wire
     # dtype. The (N-1)x fan-out of a one-shot is in the *pattern*, not here.
     "fly_1stage": 1.0,
@@ -175,7 +159,8 @@ def pattern(cand_key: str, predicted: str) -> str:
     *predicted* is the ``cross_device_reduce_*`` the host dispatch would pick
     for this shape, and is used only for the candidates that actually follow it.
     """
-    fixed = _FIXED_PATTERN.get(base_key(cand_key))
+    m = _RS_CODEC_KEY.match(cand_key)
+    fixed = _FIXED_PATTERN.get(base_key(m.group(1) if m else cand_key))
     if fixed is not None:
         return fixed
     return "1stage" if predicted.startswith("1stage") else "2stage"
@@ -227,33 +212,109 @@ def round16(nbytes) -> int:
     return max(16, (int(nbytes) // 16) * 16)
 
 
-# Tuning suffixes that never change the wire shape: ``_st<N>`` (two-shot/ring
-# super-tile), ``_g<N>`` (grid cap), ``_a<N>`` (atoms per thread), ``_fa``
-# (fanout order). All of them change how the bytes are scheduled, none of them
-# change how many there are or which pattern is driven.
-_ST_SUFFIX = re.compile(r"(?:_st\d+|_g\d+|_a\d+|_fa)$")
+# Tuning suffixes that never change the wire shape: ``_b<N>`` (block size),
+# ``_st<N>`` (two-shot/ring super-tile), ``_g<N>`` (grid cap), ``_a<N>`` (atoms
+# per thread), ``_fa`` (fanout order). All of them change how the bytes are
+# scheduled, none of them change how many there are or which pattern is driven.
+_TUNING_SUFFIX = re.compile(r"_(?:b\d+|st\d+|g\d+|a\d+|fa)$")
+
+# A pinned reduce-scatter codec, ``fly_int4_ring_st8_int6``: the RS lap runs at
+# that width and the AG lap stays int4. Anchored on the ring family because
+# ``qr_int6`` and ``fly_int4`` also end in ``_int<N>`` and mean something else.
+_RS_CODEC_KEY = re.compile(r"^(fly_int4_ring.*)_int(\d+)$")
+_AG_CODEC_BITS = 4
+
+# The codec(s) a FlyDSL engine reports in ``variant()``: mesh names one
+# (``..._uncached_int4_b256/grid_x16``), ring names the RS and AG laps
+# (``..._finegrained_int6_int4_b256/...``). One-shot variants name none.
+_VARIANT_CODEC = re.compile(r"_(?:uncached|finegrained)_(int\d+(?:_int\d+)?)_b\d+")
+_VARIANT_EXACT = ("one_shot_allreduce", "oneshot:")
 
 
 def base_key(cand_key: str) -> str:
-    """Strip a ``_st<N>`` tuning suffix; variants share their base's wire shape.
+    """Strip every tuning suffix; variants share their base's wire shape.
 
-    ``fly_int4_ring_st16`` puts exactly the bytes on the wire that
-    ``fly_int4_ring`` does and drives the same pattern -- the super-tile changes
-    how many tiles a block batches behind one publish, never the wire format.
-    The one-shot variants (``_g<N>``, ``_a<N>``, ``_fa``) are the same story:
-    block count and store order, not wire format.
+    ``fly_int4_b256_st1_g128`` puts exactly the bytes on the wire that
+    ``fly_int4`` does -- block size, super-tile and grid cap change how a block
+    batches its tiles, never the wire format. The one-shot variants (``_a<N>``,
+    ``_fa``) are the same story: atom count and store order, not wire format.
 
-    Resolving by prefix matters because both lookups below fall back to a
-    *silent* default (ratio 1.0, pattern two-shot). A variant added in
-    ``bench_comm_allreduce.py`` and forgotten here would then be graded against
-    a 4x-too-large roof and quietly report a quarter of its real efficiency.
+    Suffixes come off one at a time until none is left. A single ``sub`` removed
+    only the last one, so every variant with two or more of them resolved to a
+    name that is not in ``WIRE_RATIO``, and the silent fallback to ratio 1.0
+    graded it against a 4x-too-large roof.
     """
-    return _ST_SUFFIX.sub("", cand_key)
+    while True:
+        stripped = _TUNING_SUFFIX.sub("", cand_key)
+        if stripped == cand_key:
+            return cand_key
+        cand_key = stripped
 
 
-def wire_bytes(payload_bytes: int, cand_key: str) -> int:
+def variant_wire_ratio(variant) -> float | None:
+    """Wire bytes per payload byte for a reported kernel *variant*, or None.
+
+    The variant string is what actually ran, so it is the authority for rows
+    whose codec is a function of the shape: ``fly_auto`` is exact one-shot below
+    its quantized window and an int4 mesh/ring above it, and an unpinned ring
+    switches its RS lap to int6 at TP8. A ring ships ``N-1`` RS laps and ``N-1``
+    AG laps, so its ratio is the mean of the two codec widths.
+
+    Returns None for anything it does not recognise (including NaN, ``n/a`` and
+    a cross-rank disagreement flag), leaving the caller to use the key.
+    """
+    if not isinstance(variant, str):
+        return None
+    m = _VARIANT_CODEC.search(variant)
+    if m:
+        bits = [int(b) for b in re.findall(r"int(\d+)", m.group(1))]
+        return sum(bits) / len(bits) / 16.0 + SCALE_RATIO
+    if any(tag in variant for tag in _VARIANT_EXACT):
+        return 1.0
+    return None
+
+
+_warned_keys: set = set()
+
+
+def wire_ratio(cand_key: str, variant=None) -> float:
+    """Wire bytes per payload byte for *cand_key*.
+
+    FlyDSL rows (``fly_*``) follow their reported *variant* when there is one;
+    everything else, and a FlyDSL row with no usable variant, resolves through
+    the key. A key that resolves to nothing is warned about once and graded at
+    1.0, because a missing row is worse than an obviously-wrong one -- but it is
+    never silent, which is how the 4x error above survived.
+    """
+    if cand_key.startswith("fly_"):
+        ratio = variant_wire_ratio(variant)
+        if ratio is not None:
+            return ratio
+    m = _RS_CODEC_KEY.match(cand_key)
+    if m:
+        return (int(m.group(2)) + _AG_CODEC_BITS) / 32.0 + SCALE_RATIO
+    base = base_key(cand_key)
+    if base in WIRE_RATIO:
+        return WIRE_RATIO[base]
+    if cand_key not in _warned_keys:
+        _warned_keys.add(cand_key)
+        logger.warning(
+            "TransferBench: no wire ratio for candidate %r (resolved to %r); "
+            "grading it at 1.0 -- add it to WIRE_RATIO",
+            cand_key,
+            base,
+        )
+    return 1.0
+
+
+def has_wire_ratio(cand_key: str) -> bool:
+    """Whether *cand_key* resolves through the key alone, without the fallback."""
+    return bool(_RS_CODEC_KEY.match(cand_key)) or base_key(cand_key) in WIRE_RATIO
+
+
+def wire_bytes(payload_bytes: int, cand_key: str, variant=None) -> int:
     """Bytes *cand_key* puts on the wire for a *payload_bytes* all-reduce."""
-    return round16(payload_bytes * WIRE_RATIO.get(base_key(cand_key), 1.0))
+    return round16(payload_bytes * wire_ratio(cand_key, variant))
 
 
 # ---------------------------------------------------------------------------
@@ -323,13 +384,39 @@ def _ring_steps(tp: int) -> int:
     return 2 * (tp - 1)
 
 
-# name -> (emit, steps(tp), fan-in(tp)). ``fan-in`` is the largest source or
-# destination list the pattern builds, checked against MAX_FANIN.
+# name -> (emit, steps(tp), fan-in(tp), split(tp)). ``fan-in`` is the largest
+# source or destination list the pattern builds, checked against MAX_FANIN.
+# ``split`` is how many ways the pattern divides its byte count: the bytes each
+# Transfer carries are ``nbytes / split``, which is what the launch-floor probe
+# below needs to pin at one minimal Transfer.
 _ALGOS = (
-    ("one-shot", _one_shot, lambda tp: 1, lambda tp: tp),
-    ("two-shot", _two_shot, lambda tp: 1, lambda tp: tp),
-    ("ring", _ring, _ring_steps, lambda tp: 1),
+    ("one-shot", _one_shot, lambda tp: 1, lambda tp: tp, lambda tp: 1),
+    ("two-shot", _two_shot, lambda tp: 1, lambda tp: tp, lambda tp: tp),
+    ("ring", _ring, _ring_steps, lambda tp: 1, lambda tp: tp),
 )
+
+# Bytes per Transfer in the launch-floor probe. Small enough that the wire time
+# is tens of nanoseconds, so what it reports is the fixed cost of running a test
+# at all; not smaller, because the duration is re-derived from the printed GB/s
+# (see ``_duration_ms``) and at 16 B that column reads 0.004 GB/s -- a 25% step
+# per digit, i.e. a floor quantized to whole microseconds.
+FLOOR_BYTES = 1024
+FLOOR_ITERS = 200
+FLOOR_WARMUP = 10
+
+# Byte counts up to this are measured at ``FLOOR_ITERS`` rather than the caller's
+# count, in their own process. At 20 iterations a 16 KiB test is noisy by
+# 0.1-0.3 us and reads 0.1-0.7 us *above* its 200-iteration mean (the first
+# iterations are slow); against a floor measured at 200 that is a bias, not
+# just a spread. Tests this small cost milliseconds, so the extra iterations
+# are free. Above it the time dwarfs both effects and 20 is plenty.
+SMALL_BYTES = 4 << 20
+
+# A test whose time exceeds its floor by less than this has no resolvable
+# bandwidth term: with the floor and the measurement each good to ~0.05 us at
+# 200 iterations, the difference is noise, and a *minimum* over nine such
+# differences would report whichever happened to land nearest zero as the roof.
+MIN_RESOLVED_US = 0.15
 
 
 @dataclass(frozen=True)
@@ -364,7 +451,7 @@ def build_plans(tp: int, byte_counts, cus=DEFAULT_CUS, algos=None) -> list[_Plan
     """
     plans = []
     for nbytes in sorted(set(byte_counts)):
-        for name, emit, steps, fanin in _ALGOS:
+        for name, emit, steps, fanin, _split in _ALGOS:
             if algos is not None and name not in algos:
                 continue
             if fanin(tp) > MAX_FANIN:
@@ -531,6 +618,62 @@ def _run(binary: str, config: str, *, iters: int, warmup: int, timeout: float) -
     return proc.stdout
 
 
+def measure_floors(
+    tp_size: int,
+    *,
+    binary: str,
+    cus=DEFAULT_CUS,
+    algos=None,
+    iters: int = FLOOR_ITERS,
+    warmup: int = FLOOR_WARMUP,
+    timeout: float = 900.0,
+) -> dict:
+    """``{(algo, cus): [ms per test]}`` -- what a minimal test costs to run.
+
+    TransferBench times each iteration with events around a kernel launch, so a
+    test has a fixed cost that no byte count removes: a one-shot reads ~4 us at
+    TP2 and ~8-9 us at TP4 whether it moves 16 B or 4 KiB. That is launch and
+    event overhead, not fabric time, and it grows with fan-in. One probe per
+    (algorithm, CU count) at ``FLOOR_BYTES`` per Transfer, in the same pattern
+    as the real test and with one entry per test line (two-shot has two).
+
+    Tiny tests are cheap, so this runs in its own process at many more
+    iterations than the main measurement: the floor is subtracted from every
+    point and any noise in it lands on all of them.
+    """
+    keys, config = [], []
+    for name, emit, _steps, fanin, split in _ALGOS:
+        if algos is not None and name not in algos:
+            continue
+        if fanin(tp_size) > MAX_FANIN:
+            continue
+        for cu in cus:
+            lines = emit(tp_size, FLOOR_BYTES * split(tp_size), cu)
+            keys.append(((name, cu), len(lines)))
+            config.extend(lines)
+    if not keys:
+        return {}
+    tests = parse_tests(
+        _run(
+            binary,
+            "\n".join(config) + "\n",
+            iters=iters,
+            warmup=warmup,
+            timeout=timeout,
+        )
+    )
+    if len(tests) != len(config):
+        raise RuntimeError(
+            f"TransferBench returned {len(tests)} floor test(s), "
+            f"expected {len(config)}; the output format may have changed"
+        )
+    floors, pos = {}, 0
+    for key, n in keys:
+        floors[key] = [t.slowest_exec_ms for t in tests[pos : pos + n]]
+        pos += n
+    return floors
+
+
 def measure(
     tp_size: int,
     byte_counts,
@@ -541,6 +684,7 @@ def measure(
     iters: int = 20,
     warmup: int = 3,
     timeout: float = 900.0,
+    subtract_floor: bool = True,
 ) -> dict:
     """``{bytes: Roof}`` -- the fastest modelled all-reduce of that many bytes.
 
@@ -549,46 +693,99 @@ def measure(
     more than most of the tests do. The winner is the minimum over *both* the
     algorithm and the CU count, because a ceiling is what the fabric can do,
     not what one arbitrary choice of either achieves.
+
+    **The roof is bandwidth-only** (``subtract_floor``, the default): each
+    test's fixed launch/event cost, measured by ``measure_floors``, is taken off
+    before the phases are summed and the ring step is scaled. Without that the
+    cost is paid once per test -- twice for two-shot, 2(N-1) times for the ring
+    -- and a small-message "ceiling" of 5-25 us is mostly TransferBench's
+    overhead, which a real kernel that pipelines its launches beats outright.
+    The consequence is that the roof is what the wire alone would take, so
+    small sizes read as far below 1.0: that is the handshake and launch the
+    roofline deliberately leaves out, not a measurement error. A point whose
+    time does not clear the floor is treated as unresolved, like one below the
+    text interface's resolution, as is one whose excess over the floor is below
+    ``MIN_RESOLVED_US``. Byte counts up to ``SMALL_BYTES`` run at
+    ``max(iters, FLOOR_ITERS)``.
     """
     plans = build_plans(tp_size, byte_counts, cus, algos)
     if not plans:
         return {}
-    config = "\n".join(line for p in plans for line in p.lines) + "\n"
-    text = _run(binary, config, iters=iters, warmup=warmup, timeout=timeout)
-    tests = parse_tests(text)
-
-    expected = sum(len(p.lines) for p in plans)
-    if len(tests) != expected:
-        raise RuntimeError(
-            f"TransferBench returned {len(tests)} test(s), expected {expected}; "
-            "the output format may have changed"
+    floors = (
+        measure_floors(
+            tp_size, binary=binary, cus=cus, algos=algos, timeout=timeout
         )
-
+        if subtract_floor
+        else {}
+    )
+    if floors:
+        logger.info(
+            "TransferBench: TP%d launch floor (us): %s",
+            tp_size,
+            ", ".join(
+                f"{a}@{c}CU {'+'.join(f'{x * 1e3:.2f}' for x in v)}"
+                for (a, c), v in sorted(floors.items())
+            ),
+        )
+    # Small and large byte counts run in separate processes at different
+    # iteration counts (see SMALL_BYTES); plans keep their relative order inside
+    # each, and the results are matched back by plan.
+    small = [p for p in plans if p.nbytes <= SMALL_BYTES]
+    large = [p for p in plans if p.nbytes > SMALL_BYTES]
     best: dict = {}
     unresolved: set = set()
-    pos = 0
-    for plan in plans:
-        chunk = tests[pos : pos + len(plan.lines)]
-        pos += len(plan.lines)
-        # Sum across the phases of a multi-test plan (two-shot), scale by the
-        # step count (the ring runs one representative step), then keep the
-        # fastest algorithm/CU pair for this byte count.
-        us = sum(t.slowest_exec_ms for t in chunk) * 1e3 * plan.steps
-        # A row below the text interface's resolution comes back nan (see
-        # _duration_ms). Dropping it leaves the caller with no entry, which
-        # renders as a blank cell -- reporting the 0 would instead read as an
-        # infinitely fast fabric and take every efficiency to 0.
-        if not math.isfinite(us) or us <= 0.0:
-            unresolved.add(plan.nbytes)
+    for group, group_iters, group_warmup in (
+        (small, max(iters, FLOOR_ITERS), max(warmup, FLOOR_WARMUP)),
+        (large, iters, warmup),
+    ):
+        if not group:
             continue
-        prev = best.get(plan.nbytes)
-        if prev is None or us < prev.us:
-            best[plan.nbytes] = Roof(us, plan.algo)
+        config = "\n".join(line for p in group for line in p.lines) + "\n"
+        text = _run(
+            binary, config, iters=group_iters, warmup=group_warmup, timeout=timeout
+        )
+        tests = parse_tests(text)
+
+        expected = sum(len(p.lines) for p in group)
+        if len(tests) != expected:
+            raise RuntimeError(
+                f"TransferBench returned {len(tests)} test(s), expected "
+                f"{expected}; the output format may have changed"
+            )
+
+        pos = 0
+        for plan in group:
+            chunk = tests[pos : pos + len(plan.lines)]
+            pos += len(plan.lines)
+            floor = floors[(plan.algo, plan.cus)] if floors else [0.0] * len(chunk)
+            # Per test: take off its own launch floor, and sum across the phases
+            # of a multi-test plan (two-shot).
+            bw_us = sum(t.slowest_exec_ms - f for t, f in zip(chunk, floor)) * 1e3
+            # A row below the text interface's resolution (nan, see
+            # _duration_ms) or that does not clear the floor by a resolvable
+            # margin has no bandwidth term to report. Dropping it leaves the
+            # caller with no entry, which renders as a blank cell -- reporting 0
+            # would instead read as an infinitely fast fabric and take every
+            # efficiency to 0.
+            if not math.isfinite(bw_us) or bw_us < (
+                MIN_RESOLVED_US if floors else 0.0
+            ):
+                unresolved.add(plan.nbytes)
+                continue
+            # Scale by the step count (the ring runs one representative step),
+            # then keep the fastest algorithm/CU pair for this byte count.
+            us = bw_us * plan.steps
+            if us <= 0.0:
+                unresolved.add(plan.nbytes)
+                continue
+            prev = best.get(plan.nbytes)
+            if prev is None or us < prev.us:
+                best[plan.nbytes] = Roof(us, plan.algo)
 
     for nbytes in sorted(unresolved - set(best)):
         logger.warning(
-            "TransferBench: TP%d %d B is below the resolution of the "
-            "reported table; leaving it blank",
+            "TransferBench: TP%d %d B does not clear the launch floor or the "
+            "resolution of the reported table; leaving it blank",
             tp_size,
             nbytes,
         )
@@ -618,6 +815,22 @@ _SAMPLE = """Test 1:
 Aggregate (CPU)    │  0.891 GB/s  │  77.688 ms │   69206016 bytes  │  Overhead 0.197 ms
 -------------------┴--------------┴------------┴-------------------┴--------------------
 """
+
+
+def _check_candidate_keys() -> None:
+    """``wire_ratio`` must know every key ``bench_comm_allreduce`` can emit.
+
+    Needs the bench's own imports (torch, aiter), so it is skipped -- loudly --
+    where those are unavailable rather than failing the parser self-test.
+    """
+    try:
+        import bench_comm_allreduce as bench
+    except ImportError as e:
+        print(f"candidate-key self-test: skipped ({e})")
+        return
+    unknown = [k for k in bench.CANDIDATE_KEYS if not has_wire_ratio(k)]
+    assert not unknown, f"candidates with no wire ratio: {unknown}"
+    print(f"candidate-key self-test: ok ({len(bench.CANDIDATE_KEYS)} keys)")
 
 
 def _self_test() -> None:
@@ -664,9 +877,53 @@ def _self_test() -> None:
     assert round16(114688) == 114688
     assert round16(114688 * 3 / 16) == 21504
     assert round16(8) == 16
-    assert wire_bytes(114688, "qr_int4") == 28672
+    assert wire_bytes(114688, "qr_int4") == 32256  # 9/32: 4-bit payload + scales
     assert wire_bytes(114688, "rccl") == 114688
+
+    # Every tuning suffix comes off, not just the last: the original single
+    # ``sub`` left ``fly_int4_b256_st1`` unresolved and graded it at ratio 1.0.
+    for key, base in (
+        ("fly_int4_b256_st1_g128", "fly_int4"),
+        ("fly_int4_ring_b128_st8_g128", "fly_int4_ring"),
+        ("fly_int4_ring_st32", "fly_int4_ring"),
+        ("fly_1stage_b256_a2_g64_fa", "fly_1stage"),
+        ("fly_1stage_b64_a1_g64", "fly_1stage"),
+        ("fly_int4", "fly_int4"),
+        ("qr_int4", "qr_int4"),
+    ):
+        assert base_key(key) == base, (key, base_key(key))
+    assert wire_ratio("fly_int4_b512_st8_g128") == 9.0 / 32.0
+    assert wire_ratio("fly_int4_ring_b256_st16_g128") == 9.0 / 32.0
+    assert wire_ratio("fly_1stage_b128_a2_g64") == 1.0
+    # Pinned INT6 reduce-scatter lap over an INT4 gather lap: mean of 6 and 4,
+    # plus the 128 B/4096 B scale region every codec carries (1152/1664 B tiles).
+    assert wire_ratio("fly_int4_ring_st8_int6") == 11.0 / 32.0
+    assert wire_ratio("qr_int6") == 13.0 / 32.0
+    assert wire_ratio("qr_fp8") == 17.0 / 32.0
+    assert SCALE_RATIO == 1.0 / 32.0
+    assert pattern("fly_int4_ring_st8_int6", "1stage") == "ring"
+
+    # The reported variant is the authority for FlyDSL rows.
+    mesh = "mesh:quick_allreduce_int4_ws2_r*_st8_g128_uncached_int4_b512/grid_x128"
+    ring = "ring:quick_allreduce_int4_ring_ws4_r*_st32_g128_finegrained_int4_int4_b512/grid_x32"
+    ring6 = "quick_allreduce_int4_ring_ws4_r*_st8_g128_finegrained_int6_int4_b256/grid_x128"
+    exact = "oneshot:one_shot_allreduce_ws2_r*_a1_g128_uncached_b256/grid_x2"
+    assert variant_wire_ratio(mesh) == 9.0 / 32.0
+    assert variant_wire_ratio(ring) == 9.0 / 32.0
+    assert variant_wire_ratio(ring6) == 11.0 / 32.0
+    assert variant_wire_ratio(exact) == 1.0
+    assert variant_wire_ratio(float("nan")) is None
+    assert variant_wire_ratio("n/a") is None
+    assert wire_ratio("fly_auto", mesh) == 9.0 / 32.0
+    assert wire_ratio("fly_auto", exact) == 1.0
+    assert wire_ratio("fly_auto", None) == 1.0  # no variant: documented fallback
+    # A non-FlyDSL key ignores any variant it is handed.
+    assert wire_ratio("qr_int4", exact) == 9.0 / 32.0
+    assert wire_bytes(8 << 20, "fly_auto", mesh) == (9 << 20) // 4
     print("sizing self-test: ok")
+
+    # Every real candidate key must resolve without hitting the fallback.
+    _check_candidate_keys()
 
     # cdr follows the host dispatch; everything else is pinned to its own
     # algorithm regardless of what cdr would have done at this shape.
@@ -742,6 +999,12 @@ def main() -> None:
         "patterns directly (e.g. ring vs two-shot on a NUMA-split host).",
     )
     p.add_argument("--cus", type=int, nargs="*", default=list(DEFAULT_CUS))
+    p.add_argument(
+        "--no-floor",
+        action="store_true",
+        help="report raw TransferBench times instead of subtracting each\n"
+        "test's fixed launch cost (the default, bandwidth-only roof)",
+    )
     p.add_argument("--iters", type=int, default=20)
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--bin", default=None, help="path to the TransferBench binary")
@@ -763,6 +1026,14 @@ def main() -> None:
             steps = f" x{plan.steps} steps" if plan.steps != 1 else ""
             print(f"# {plan.algo} {plan.nbytes}B x {plan.cus} CUs{steps}")
             print("\n".join(plan.lines))
+        if not args.no_floor:
+            print(f"# launch floor probe, {FLOOR_BYTES} B per Transfer")
+            for name, emit, _steps, fanin, split in _ALGOS:
+                if (args.algo and name not in args.algo) or fanin(args.tp) > MAX_FANIN:
+                    continue
+                for cu in args.cus:
+                    print(f"# {name} x {cu} CUs")
+                    print("\n".join(emit(args.tp, FLOOR_BYTES * split(args.tp), cu)))
         return
 
     binary = find_binary(args.bin)
@@ -783,6 +1054,7 @@ def main() -> None:
         algos=args.algo,
         iters=args.iters,
         warmup=args.warmup,
+        subtract_floor=not args.no_floor,
     )
     for nbytes, roof in sorted(got.items()):
         print(
