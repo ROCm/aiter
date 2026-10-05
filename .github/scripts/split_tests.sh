@@ -127,6 +127,7 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_gemm_a8w8.py]=589
     FILE_TIMES[op_tests/test_mla_sparse.py]=584
     FILE_TIMES[op_tests/test_rope.py]=401
+    FILE_TIMES[op_tests/test_flydsl_fmha.py]=273
     FILE_TIMES[op_tests/test_concat_cache_mla.py]=262
     FILE_TIMES[op_tests/test_moe_topk_gating.py]=260
     FILE_TIMES[op_tests/test_gated_delta_rule.py]=198
@@ -164,9 +165,9 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_moe_sorting_mxfp4.py]=36
     FILE_TIMES[op_tests/test_pa_ragged.py]=36
     FILE_TIMES[op_tests/test_flydsl_linear_attention_prefill.py]=35
+    FILE_TIMES[op_tests/test_unified_attention.py]=33
     FILE_TIMES[op_tests/test_aiter_addInp.py]=31
     FILE_TIMES[op_tests/test_sampling.py]=31
-    FILE_TIMES[op_tests/test_unified_attention.py]=30
     FILE_TIMES[op_tests/test_gemm_a4w4.py]=30
     FILE_TIMES[op_tests/test_gemm_a4w6.py]=12
     FILE_TIMES[op_tests/test_gemm_a6w4.py]=12
@@ -238,7 +239,6 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_f4gemm.py]=4
     FILE_TIMES[op_tests/test_fhmoe.py]=4
     FILE_TIMES[op_tests/test_flydsl_batched_gemm.py]=4
-    FILE_TIMES[op_tests/test_flydsl_fmha.py]=4
     FILE_TIMES[op_tests/test_fmha_fwd_mxfp8_asm.py]=4
     FILE_TIMES[op_tests/test_fmha_fwd_with_sink_asm.py]=4
     FILE_TIMES[op_tests/test_fmha_fwd_with_sink_varlen_asm.py]=4
