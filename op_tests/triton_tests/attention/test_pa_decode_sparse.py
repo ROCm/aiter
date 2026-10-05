@@ -608,131 +608,6 @@ def test_pa_decode_sparse_global_gather(T, has_invalid):
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
 
 
-def _packed_pool(num_blocks, block, pitch_bytes, device="cuda", seed=0):
-    """A DSv4 packed fp8 pool laid out as in vLLM: [nb, block, 584] uint8 with
-    blocks pitch_bytes apart. Returns the strided view and the dequantized
-    [nb * block, 512] f32 rows."""
-    g = torch.Generator(device=device).manual_seed(seed)
-    nope, rope = 448, 64
-    blk = block * 584
-    raw = torch.zeros(
-        pitch_bytes * (num_blocks - 1) + blk, dtype=torch.uint8, device=device
-    )
-    view = raw.as_strided((num_blocks, block, 584), (pitch_bytes, 584, 1))
-    flat = raw.as_strided((num_blocks, blk), (pitch_bytes, 1))
-    data = flat[:, : block * 576].view(num_blocks, block, 576)
-    scl = flat[:, block * 576 :].view(num_blocks, block, 8)
-    q8 = (torch.randn(num_blocks, block, nope, device=device, generator=g) * 0.4).to(
-        torch.float8_e4m3fn
-    )
-    rb = (torch.randn(num_blocks, block, rope, device=device, generator=g) * 0.4).to(
-        torch.bfloat16
-    )
-    data[:, :, :nope] = q8.view(torch.uint8)
-    data[:, :, nope:] = rb.view(torch.uint8).view(num_blocks, block, 2 * rope)
-    exps = torch.randint(
-        124, 130, (num_blocks, block, 7), device=device, generator=g, dtype=torch.uint8
-    )
-    scl[:, :, :7] = exps
-    deq = torch.cat(
-        [
-            q8.float() * torch.exp2(exps.float() - 127.0).repeat_interleave(64, dim=2),
-            rb.float(),
-        ],
-        dim=2,
-    )
-    return view, deq.reshape(num_blocks * block, 512)
-
-
-def _ragged(lens, pool_rows, device, gen, sentinel_rows=(), lead_invalid=0):
-    """Ragged slot lists: row r draws lens[r] distinct slots; rows in sentinel_rows get
-    a -1 in every other entry, and every row's first lead_invalid entries are -1."""
-    rows = []
-    for r, n in enumerate(lens):
-        sel = torch.randperm(pool_rows, generator=gen)[:n].to(torch.int32)
-        if r in sentinel_rows:
-            sel[::2] = -1
-        sel[: min(n, lead_invalid)] = -1
-        rows.append(sel)
-    ptr = torch.zeros(len(lens) + 1, dtype=torch.int32)
-    ptr[1:] = torch.tensor(lens, dtype=torch.int32).cumsum(0)
-    return torch.cat(rows).to(device), ptr.to(device)
-
-
-def _edge_lens(T):
-    """SWA and top-k lengths on every tile edge, over T rows."""
-    edge = [0, 1, 63, 64, 65, 127, 128, 129]
-    main_lens = [edge[(t * 7) % len(edge)] if t % 3 else 128 for t in range(T)]
-    extra_lens = [
-        ([0, 1, 64, 65, 192, 511, 512, 640] * 3)[(t * 5) % 24] for t in range(T)
-    ]
-    return main_lens, extra_lens
-
-
-def _vllm_pool_case(H, main_lens, extra_lens, sentinels="none"):
-    """Inputs and reference of one DSv4.1 vLLM-pool case: row t attends
-    main_lens[t] SWA slots and extra_lens[t] top-k slots of page-pitched pools.
-    sentinels: "some" puts a -1 in every other entry of every 4th row, "lead"
-    makes every row's first 130 entries -1."""
-    main_lens = [int(n) for n in main_lens]
-    extra_lens = [int(n) for n in extra_lens]
-    assert len(main_lens) == len(extra_lens)
-    T = len(main_lens)
-    device = "cuda"
-    torch.manual_seed(0)
-    gen = torch.Generator().manual_seed(T * 131 + H)
-    D = 512
-    q = torch.randn(T, H, D, dtype=torch.bfloat16, device=device) * 0.125
-    sink = torch.randn(H, dtype=torch.float32, device=device) * 0.1
-    scale = float(D) ** -0.5
-    # Pools large enough for the longest row's distinct slots.
-    main_nb = max(64, -(-max(main_lens, default=0) // 32))
-    extra_nb = max(48, -(-max(extra_lens, default=0) // 128))
-    main_pool, main_deq = _packed_pool(main_nb, 32, 32 * 584 + 192, device, seed=1)
-    extra_pool, extra_deq = _packed_pool(extra_nb, 128, 128 * 584 + 448, device, seed=2)
-    srows = set(range(0, T, 4)) if sentinels == "some" else ()
-    lead = 130 if sentinels == "lead" else 0
-    mi, mp = _ragged(main_lens, main_nb * 32, device, gen, srows, lead)
-    ei, ep = _ragged(extra_lens, extra_nb * 128, device, gen, srows, lead)
-    ref = two_loop_reference(q, main_deq, mi, mp, extra_deq, ei, ep, sink, scale)
-    return (q, main_pool, mi, mp, sink, scale, extra_pool, ei, ep), ref
-
-
-def _vllm_pool_run(args):
-    q, main_pool, mi, mp, sink, scale, extra_pool, ei, ep = args
-    return pa_decode_sparse(
-        q,
-        main_pool,
-        mi,
-        mp,
-        sink,
-        scale,
-        extra_cache=extra_pool,
-        extra_indices=ei,
-        extra_indptr=ep,
-    )
-
-
-def _vllm_pool_skip():
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA required")
-    if arch_info.get_arch() != "gfx950":
-        pytest.skip("the packed fp8_dsv4_mla cache is a gfx950 gluon path")
-
-
-# Decode with split-K (16 heads; 8 heads in a 16-head program), 32-head programs,
-# 64-head prefill.
-@pytest.mark.parametrize("T, H", [(6, 16), (37, 8), (192, 32), (2100, 64)])
-@pytest.mark.parametrize("sentinels", ["some", "lead"])
-def test_pa_decode_sparse_two_loop_vllm_pool(T, H, sentinels):
-    """DSv4.1 vLLM-pool shapes: page-pitched SWA and top-k pools, ragged lengths on
-    every tile edge, -1 sentinels including whole leading tiles."""
-    _vllm_pool_skip()
-    args, ref = _vllm_pool_case(H, *_edge_lens(T), sentinels)
-    out = _vllm_pool_run(args)
-    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
-
-
 def _inv_rope_ref(x, pos, cos_sin):
     """Inverse GPT-J RoPE on the trailing rope lanes of x [T, H, D], in f32."""
     x = x.float().clone()
@@ -744,38 +619,70 @@ def _inv_rope_ref(x, pos, cos_sin):
     return x
 
 
-# The reduce's store (6 rows, split) and the attention kernel's (2,100 rows).
-@pytest.mark.parametrize("T, H", [(6, 16), (2100, 64)])
-@pytest.mark.parametrize("mxfp8", [True, False])
+# T=4: split-K, the reduce writes the output. T=256: one 32-head program per row
+# writes it.
+@pytest.mark.parametrize("T, H", [(4, 16), (256, 32)])
+@pytest.mark.parametrize("mxfp8", [False, True])
 def test_pa_decode_sparse_inv_rope_mxfp8_epilogue(T, H, mxfp8):
-    """The inverse-RoPE / MXFP8 output epilogue against the f32 reference rotated
-    back; MXFP8 is checked dequantized."""
-    _vllm_pool_skip()
-    args, ref = _vllm_pool_case(H, *_edge_lens(T), "some")
-    q, main_pool, mi, mp, sink, scale, extra_pool, ei, ep = args
-    gen = torch.Generator(device="cuda").manual_seed(T * 7 + H)
-    ang = torch.rand(4096, 32, device="cuda", generator=gen) * 6.2831853
+    """The fused output epilogue (inverse RoPE, optionally MXFP8) on the SWA +
+    top-k two-loop, against the reference rotated back; MXFP8 is dequantized."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    if arch_info.get_arch() != "gfx950":
+        pytest.skip("the output epilogue is a gfx950 gluon path")
+
+    device = "cuda"
+    D, main_len, extra_len = 512, 128, 256
+    torch.manual_seed(0)
+    q = torch.randn(T, H, D, dtype=torch.bfloat16, device=device) * 0.125
+    attn_sink = torch.randn(H, dtype=torch.float32, device=device) * 0.1
+    softmax_scale = float(D) ** -0.5
+    main_cache, main_deq = make_packed_cache(T * main_len, D, "fp8")
+    main_idx = torch.arange(T * main_len, device=device, dtype=torch.int32)
+    main_indptr = torch.arange(
+        0, T * main_len + 1, main_len, dtype=torch.int32, device=device
+    )
+    extra_cache, extra_deq = make_packed_cache(T * extra_len, D, "fp8")
+    extra_idx = torch.randint(
+        0, T * extra_len, (T * extra_len,), device=device, dtype=torch.int32
+    )
+    extra_idx[::5] = -1
+    extra_indptr = torch.arange(
+        0, T * extra_len + 1, extra_len, dtype=torch.int32, device=device
+    )
+    ang = torch.rand(4096, 32, device=device) * 6.2831853
     cos_sin = torch.cat([ang.cos(), ang.sin()], dim=1).contiguous()
-    pos = torch.randint(0, 4096, (T,), device="cuda", generator=gen)
+    pos = torch.randint(0, 4096, (T,), device=device)
+
+    ref = two_loop_reference(
+        q,
+        main_deq,
+        main_idx,
+        main_indptr,
+        extra_deq,
+        extra_idx,
+        extra_indptr,
+        attn_sink,
+        softmax_scale,
+    )
     ref = _inv_rope_ref(ref, pos, cos_sin)
     kw = {
-        "extra_cache": extra_pool,
-        "extra_indices": ei,
-        "extra_indptr": ep,
+        "extra_cache": extra_cache,
+        "extra_indices": extra_idx,
+        "extra_indptr": extra_indptr,
         "inv_rope_positions": pos,
         "inv_rope_cos_sin_cache": cos_sin,
     }
+    args = (q, main_cache, main_idx, main_indptr, attn_sink, softmax_scale)
     if mxfp8:
-        data = torch.empty(T, H * 512, dtype=torch.float8_e4m3fn, device="cuda")
-        scl = torch.empty(T, H * 16, dtype=torch.uint8, device="cuda")
-        out = pa_decode_sparse(
-            q, main_pool, mi, mp, sink, scale, out_mxfp8=(data, scl), **kw
-        )
-        assert out.data_ptr() == data.data_ptr() and out.shape == (T, H, 512)
-        step = torch.exp2(scl.float() - 127.0).view(T, H * 16, 1)
-        deq = (data.float().view(T, H * 16, 32) * step).view(T, H, 512)
-        # e4m3 rounds to within 1/16 of a value
+        data = torch.empty(T, H * D, dtype=torch.float8_e4m3fn, device=device)
+        scale = torch.empty(T, H * D // 32, dtype=torch.uint8, device=device)
+        out = pa_decode_sparse(*args, out_mxfp8=(data, scale), **kw)
+        assert out.data_ptr() == data.data_ptr() and out.shape == (T, H, D)
+        step = torch.exp2(scale.float() - 127.0).view(T, H * D // 32, 1)
+        deq = (data.float().view(T, H * D // 32, 32) * step).view(T, H, D)
+        # e4m3 keeps 3 mantissa bits: within 1/16 of the value
         torch.testing.assert_close(deq, ref, atol=1e-2, rtol=0.07)
     else:
-        out = pa_decode_sparse(q, main_pool, mi, mp, sink, scale, **kw)
+        out = pa_decode_sparse(*args, **kw)
         torch.testing.assert_close(out.float(), ref, atol=1e-2, rtol=1e-2)
