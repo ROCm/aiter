@@ -6,7 +6,7 @@
 Supported: fp8 KV cache (OCP e4m3), fp8 weight in either row-major or
 ``shuffle_weight((16,16))`` layout, per-output-row *or* 128x128 block weight
 scale, per-tensor activation scale, page_size 1, bf16 or scaled fp8 outputs on
-gfx950. The gfx1250 Kimi-K3 ptpc specialization is dispatched separately.
+gfx950. The gfx1250 128+128 ptpc specialization is dispatched separately.
 
 The cache has no size limit: up to 4 GiB it is reached through one buffer
 descriptor, beyond that through 64-bit per-lane addresses. Output width is

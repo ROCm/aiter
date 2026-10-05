@@ -1,19 +1,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 
-"""gfx1250 Kimi-K3 gather + FlyDSL ptpc projection."""
+"""gfx1250 MLA gather + FlyDSL ptpc projection."""
 
 import torch
 import triton
 import triton.language as tl
 from torch import Tensor
 
-_HEADS = 96
 _KV_C = 512
 _KV_PE = 64
 _NOPE = 128
 _V_DIM = 128
-_WEIGHT_N = _HEADS * (_NOPE + _V_DIM)
 
 _launch_projection = None
 _ptr_arg = None
@@ -27,8 +25,9 @@ def _run_projection(
     weight_scale: Tensor,
     k_out: Tensor,
     v_out: Tensor,
+    n_heads: int,
 ) -> None:
-    """Launch the fixed Kimi TP1 WMMA kernel without using the GEMM ABI."""
+    """Launch the fixed-width MLA WMMA kernel without using the GEMM ABI."""
     global _launch_projection, _ptr_arg, _fx
     if _launch_projection is None:
         import flydsl.expr as fx
@@ -44,7 +43,7 @@ def _run_projection(
 
     sa = x_scale.reshape(-1).to(torch.float32).contiguous()
     sb = weight_scale.reshape(-1).to(torch.float32).contiguous()
-    _launch_projection(
+    args = (
         _ptr_arg(k_out),
         _ptr_arg(v_out),
         _ptr_arg(xq),
@@ -54,6 +53,10 @@ def _run_projection(
         xq.shape[0],
         _fx.Stream(torch.cuda.current_stream(device=xq.device)),
     )
+    if n_heads == 96:
+        _launch_projection(*args)
+    else:
+        _launch_projection(*args, n_heads)
 
 
 def unsupported_reason(
@@ -74,20 +77,25 @@ def unsupported_reason(
         return f"k_buffer must be torch.float8_e4m3fn, got {k_buffer.dtype}"
     if kv_proj_weight.dtype != torch.float8_e4m3fn:
         return f"kv_proj_weight must be torch.float8_e4m3fn, got {kv_proj_weight.dtype}"
-    if tuple(kv_proj_weight.shape) != (_WEIGHT_N, _KV_C):
-        return f"kv_proj_weight must be [{_WEIGHT_N}, {_KV_C}]"
-    if kv_proj_scale is None or kv_proj_scale.numel() != _WEIGHT_N:
-        return f"kv_proj_scale must have {_WEIGHT_N} per-output-row elements"
     if not getattr(kv_proj_weight, "is_shuffled", False):
         return "kv_proj_weight must use the 16x16 preshuffled layout"
     if (
         k_prefix.dim() != 3
-        or tuple(k_prefix.shape[1:]) != (_HEADS, _NOPE + _KV_PE)
         or v_prefix.dim() != 3
-        or tuple(v_prefix.shape[1:]) != (_HEADS, _V_DIM)
+        or k_prefix.shape[1] != v_prefix.shape[1]
         or k_prefix.shape[0] != v_prefix.shape[0]
     ):
-        return "outputs must be [M,96,192] and [M,96,128]"
+        return "outputs must be matching [M, heads, width] tensors"
+    n_heads = k_prefix.shape[1]
+    if n_heads <= 0:
+        return "outputs must have a positive head count"
+    if k_prefix.shape[2] != _NOPE + _KV_PE or v_prefix.shape[2] != _V_DIM:
+        return "output widths must be NoPE+PE=192 and V=128"
+    weight_n = n_heads * (_NOPE + _V_DIM)
+    if tuple(kv_proj_weight.shape) != (weight_n, _KV_C):
+        return f"kv_proj_weight must be [{weight_n}, {_KV_C}]"
+    if kv_proj_scale is None or kv_proj_scale.numel() != weight_n:
+        return f"kv_proj_scale must have {weight_n} per-output-row elements"
     if k_prefix.dtype != torch.bfloat16 or v_prefix.dtype != torch.bfloat16:
         return "outputs must both be bfloat16"
     if not k_prefix.is_contiguous() or not v_prefix.is_contiguous():
@@ -141,6 +149,7 @@ def _copy_rope(
     BLOCK_M: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    HEADS: tl.constexpr,
     SCALE_IS_PTR: tl.constexpr,
 ):
     rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -159,14 +168,14 @@ def _copy_rope(
     rope *= scale
     out = (
         k_out
-        + safe_rows[:, None, None] * 18432
+        + safe_rows[:, None, None] * (HEADS * 192)
         + heads[None, :, None] * 192
         + 128
         + cols[None, None, :]
     )
     out_mask = (
         row_mask[:, None, None]
-        & (heads[None, :, None] < 96)
+        & (heads[None, :, None] < HEADS)
         & (cols[None, None, :] < 64)
     )
     tl.store(out, rope[:, None, :], mask=out_mask)
@@ -187,7 +196,7 @@ def gather_kv_b_proj_flydsl_gfx1250(
     weight_preshuffle: bool = True,
     shuffled_kv_cache: bool = False,
 ) -> None:
-    """Use the dedicated gfx1250 FlyDSL WMMA path for Kimi-K3 ptpc prefixes."""
+    """Use the dedicated gfx1250 FlyDSL WMMA path for 128+128 MLA prefixes."""
     reason = unsupported_reason(
         k_buffer,
         kv_proj_weight,
@@ -219,6 +228,7 @@ def gather_kv_b_proj_flydsl_gfx1250(
     scale_is_ptr = k_scale.device.type != "cpu"
     scale_arg = k_scale if scale_is_ptr else float(k_scale)
 
+    n_heads = k_prefix.shape[1]
     xq = torch.empty((m, _KV_C), dtype=torch.float8_e4m3fn, device=k_buffer.device)
     x_scale = torch.empty((m, 1), dtype=torch.float32, device=k_buffer.device)
 
@@ -240,8 +250,9 @@ def gather_kv_b_proj_flydsl_gfx1250(
         kv_proj_scale,
         k_prefix,
         v_prefix,
+        n_heads,
     )
-    _copy_rope[(triton.cdiv(m, 16), triton.cdiv(_HEADS, 8))](
+    _copy_rope[(triton.cdiv(m, 16), triton.cdiv(n_heads, 8))](
         k_buffer,
         kv_indices,
         scale_arg,
@@ -250,5 +261,6 @@ def gather_kv_b_proj_flydsl_gfx1250(
         BLOCK_M=16,
         BLOCK_D=64,
         BLOCK_H=8,
+        HEADS=n_heads,
         SCALE_IS_PTR=scale_is_ptr,
     )

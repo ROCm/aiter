@@ -1,17 +1,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Kimi-K3 TP1 gather projection WMMA kernel for gfx1250.
+"""MLA gather projection WMMA kernel for gfx1250.
 
 This is deliberately not a generic GEMM entry point. Its only layout is
-M x 512 A-preshuffled FP8 activations times the 24576 x 512 ptpc-preshuffled
-FP8 weight, written directly as 96 heads of BF16 K-nope and V.
+M x 512 A-preshuffled FP8 activations times a ptpc-preshuffled FP8 weight,
+written directly as BF16 heads of 128-wide K-nope and V.
 """
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, range_constexpr, rocdl
-from flydsl.expr.typing import T
+from flydsl.expr.typing import Constexpr, T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
 
@@ -30,12 +30,8 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
 # Largest TDM pad interval the gfx1250 descriptor can encode for 1-byte
 # elements: log2(interval/4) - 1 must fit 3 bits, so interval <= 1024 B.
 _TDM_MAX_PAD_INTERVAL_BYTES = 1024
-_N = 24576
 _K = 512
 _LDA = 512
-_LDK = 96 * 192
-_LDV = 96 * 128
-_HEADS = 96
 
 _TILE_M = 256
 _TILE_N = 256
@@ -55,10 +51,14 @@ def launch_kimi_k3_gather_kv_b_proj_8wave_gfx1250(
     arg_scale_b: fx.Pointer,
     i32_m: fx.Int32,
     stream: fx.Stream,
+    n_heads: Constexpr[int] = 96,
 ):
     tile_m, tile_n, tile_k = _TILE_M, _TILE_N, _TILE_K
     m_warp, n_warp = _M_WARP, _N_WARP
     num_buffers = _NUM_BUFFERS
+    n = n_heads * 256
+    ldk = n_heads * 192
+    ldv = n_heads * 128
     WMMA_M = WMMA_N = 16
     WMMA_K = 128
     WAVE = 32
@@ -96,9 +96,9 @@ def launch_kimi_k3_gather_kv_b_proj_8wave_gfx1250(
             f"limit is {lds_cap} bytes"
         )
     kernel_name = format_kernel_name(
-        "gather_kv_b_proj_kimi_ptpc"
+        "gather_kv_b_proj_ptpc"
         f"_t{tile_m}x{tile_n}x{tile_k}"
-        f"_mw{m_warp}_nw{n_warp}_nb{num_buffers}_apre_vecstore"
+        f"_mw{m_warp}_nw{n_warp}_nb{num_buffers}_h{n_heads}_apre_vecstore"
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
@@ -316,12 +316,12 @@ def launch_kimi_k3_gather_kv_b_proj_8wave_gfx1250(
                 arg_scale_b,
             )
             sa_view = fx.Tensor(fx.make_view(gSA_base, fx.make_layout(i32_m, 1)))
-            sb_view = fx.Tensor(fx.make_view(gSB_base, fx.make_layout(_N, 1)))
+            sb_view = fx.Tensor(fx.make_view(gSB_base, fx.make_layout(n, 1)))
             sa_buf = fx.rocdl.make_buffer_tensor(
                 sa_view, max_size=False, num_records_bytes=i32_m * fx.Int32(4)
             )
             sb_buf = fx.rocdl.make_buffer_tensor(
-                sb_view, max_size=False, num_records_bytes=fx.Int32(_N * 4)
+                sb_view, max_size=False, num_records_bytes=fx.Int32(n * 4)
             )
             sa_lay, sb_lay = (fx.make_layout(1, 1), fx.make_layout(4, 1))
             sa_tiles = fx.logical_divide(sa_buf, sa_lay)
@@ -409,8 +409,8 @@ def launch_kimi_k3_gather_kv_b_proj_8wave_gfx1250(
                 k_vec = Vec(lds_load_b128(lds_base, (row * C_LDS_ROW + col) * 2))
                 v_vec = Vec(lds_load_b128(lds_base, (row * C_LDS_ROW + 128 + col) * 2))
                 out_row = fx.Int64(blk_m + row)
-                k_offset = (out_row * fx.Int64(_LDK) + fx.Int64(head * 192 + col)) * 2
-                v_offset = (out_row * fx.Int64(_LDV) + fx.Int64(head * 128 + col)) * 2
+                k_offset = (out_row * fx.Int64(ldk) + fx.Int64(head * 192 + col)) * 2
+                v_offset = (out_row * fx.Int64(ldv) + fx.Int64(head * 128 + col)) * 2
                 fx.ptr_store(k_vec.bitcast(fx.Int8), gK_base + k_offset)
                 fx.ptr_store(v_vec.bitcast(fx.Int8), gV_base + v_offset)
 
@@ -424,7 +424,7 @@ def launch_kimi_k3_gather_kv_b_proj_8wave_gfx1250(
         arg_scale_b,
         i32_m,
     ).launch(
-        grid=(gx, _HEADS, 1),
+        grid=(gx, n_heads, 1),
         block=(block, 1, 1),
         stream=stream,
     )

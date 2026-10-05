@@ -297,9 +297,12 @@ def _check_output(case):
 
 
 @_SKIP_GFX1250
-@pytest.mark.parametrize("num_tokens,alloc", [(512, None), (2048, 2176), (4096, None)])
-def test_gather_kv_b_proj_flydsl_gfx1250_kimi_ptpc(num_tokens, alloc):
-    case = _make_case(num_tokens, 96, alloc=alloc)
+@pytest.mark.parametrize(
+    "num_tokens,n_heads,alloc",
+    [(257, 12, 320), (512, 96, None), (2048, 96, 2176), (4096, 96, None)],
+)
+def test_gather_kv_b_proj_flydsl_gfx1250_ptpc(num_tokens, n_heads, alloc):
+    case = _make_case(num_tokens, n_heads, alloc=alloc)
     case["k_scale"] = torch.tensor(1.0)
     weight = shuffle_weight(case["weight"], layout=(16, 16))
     assert gather_kv_b_proj_flydsl_supported(
