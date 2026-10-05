@@ -166,6 +166,7 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_flydsl_linear_attention_prefill.py]=35
     FILE_TIMES[op_tests/test_aiter_addInp.py]=31
     FILE_TIMES[op_tests/test_sampling.py]=31
+    FILE_TIMES[op_tests/test_unified_attention.py]=30
     FILE_TIMES[op_tests/test_gemm_a4w4.py]=30
     FILE_TIMES[op_tests/test_gemm_a4w6.py]=12
     FILE_TIMES[op_tests/test_gemm_a6w4.py]=12

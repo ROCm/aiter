@@ -248,7 +248,9 @@ def _shapes_ok(
         return False
     if k.shape != v.shape and not shuffled_kv_cache:
         return False
-    if k.dim() not in (4, 5) or k.shape[0] != v.shape[0]:
+    if k.dim() not in (4, 5) or v.dim() != k.dim():
+        return False
+    if k.shape[0] != v.shape[0]:
         return False
     if not shuffled_kv_cache and k.shape[1:] != (_PAGE_SIZE, num_kv_heads, _HEAD_DIM):
         return False

@@ -41,6 +41,9 @@ def unified_attention_flydsl(
             return None
         raise
 
+    if not q.is_cuda:
+        return None
+
     q_device_index = q.device.index
     if q_device_index is None:
         q_device_index = torch.cuda.current_device()

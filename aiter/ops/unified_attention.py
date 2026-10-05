@@ -29,6 +29,26 @@ def unified_attention(
     # backend
     backend: str | None = None,  # "triton" | "gluon" | "flydsl"
 ):
+    """Compute paged variable-length scaled dot-product attention into ``out``.
+
+    ``q``/``out`` are [tokens, query_heads, head_dim]. Linear K/V are
+    [blocks, page_size, kv_heads, head_dim]; shuffled K/V use the vectorized
+    rank-5 layouts. ``cu_seqlens_q`` contains cumulative query offsets,
+    ``seqused_k`` contains KV lengths, and ``block_table`` maps logical pages.
+    ``max_seqlen_q``/``max_seqlen_k`` bound lengths; ``softmax_scale`` scales
+    QK logits, and ``q_descale``/``k_descale``/``v_descale`` dequantize FP8.
+
+    ``causal`` selects bottom-right masking; ``window_size`` selects the
+    attention window. Optional scales, biases, softcap, sinks, and
+    ``skip_reduce`` are backend-dependent. ``shuffled_kv_cache=None`` infers
+    the layout; False with rank-5 K raises ValueError.
+
+    ``backend=None`` tries FlyDSL then Triton/Gluon; explicit ``"flydsl"``
+    raises RuntimeError when declined. ``"triton"``/``"gluon"`` bypass FlyDSL.
+    The Triton/Gluon fallback supports causal attention only. Returns ``out``
+    written in place; with ``skip_reduce`` the fallback may instead return
+    unreduced segment buffers.
+    """
     if backend is not None:
         backend = backend.lower()
     if backend not in (None, "flydsl", "triton", "gluon"):
