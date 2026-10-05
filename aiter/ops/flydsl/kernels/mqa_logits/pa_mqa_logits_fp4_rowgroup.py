@@ -313,7 +313,10 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
     kv_nt: bool = False,
     out_nt: bool = False,
     wave_min_steps: int = 2,
+    ragged: bool = False,
 ):
+    """``ragged``: a sequence's rows are query_start_loc's (at most next_n,
+    any count, 0 included) in flattened row order, not next_n each."""
     assert page_size in SUPPORTED_PAGE_SIZES, page_size
     assert heads % MFMA_M == 0 and heads // MFMA_M <= 8, heads
     assert head_dim % 128 == 0, head_dim
@@ -354,15 +357,17 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
 
     @flyc.kernel
     def pa_mqa_logits_fp4_rowgroup_kernel(
-        out_ptr: fx.Int64,  # [B * NEXT_N, stride_out] f32
-        q_ptr: fx.Int64,  # [B, NEXT_N, H, D / 2] u8
-        qs_ptr: fx.Int64,  # [B, NEXT_N, K_TILES, 4, 16, qs_pad] u8
+        # rows: B * NEXT_N, or (ragged) query_start_loc[B]
+        out_ptr: fx.Int64,  # [rows, stride_out] f32
+        q_ptr: fx.Int64,  # [rows, H, D / 2] u8
+        qs_ptr: fx.Int64,  # [rows, K_TILES, 4, 16, qs_pad] u8
         kv_ptr: fx.Int64,  # [num_pages, kv_page] u8
         kvs_ptr: fx.Int64,  # [num_pages, kvs_page] u8
         bt_ptr: fx.Int64,  # [B, max_blocks_per_seq] i32, rows bt_stride apart
-        w_ptr: fx.Int64,  # [B * NEXT_N, H] f32 | bf16
+        w_ptr: fx.Int64,  # [rows, H] f32 | bf16
         ctx_ptr: fx.Int64,  # [B] i32
-        ends_ptr: fx.Int64,  # [B * NEXT_N] i32 (ctx_ptr when absent)
+        ends_ptr: fx.Int64,  # [rows] i32 (ctx_ptr when absent)
+        qsl_ptr: fx.Int64,  # [B + 1] i32 query_start_loc (ctx_ptr unless ragged)
         stride_out: Int32,
         weight_scale: fx.Float32,
         last_page: Int32,
@@ -376,8 +381,8 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
         # round trip, which an isolated launch pays in full.
         args_read = _read_all(
             out_ptr, q_ptr, qs_ptr, kv_ptr, kvs_ptr, bt_ptr, w_ptr, ctx_ptr,
-            ends_ptr, stride_out, weight_scale, last_page, batch, base_slots,
-            max_steps,
+            ends_ptr, qsl_ptr, stride_out, weight_scale, last_page, batch,
+            base_slots, max_steps,
         )  # fmt: skip
         tid = gpu.thread_idx.x
         # (one allocator a kernel: the workgroup's shared assignment and rows)
@@ -544,7 +549,23 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
         q_bt = _addr_i32_buffer(q_ptr, width=4)
         qs_bt = _addr_i32_buffer(qs_ptr)
         w_bt = _addr_i32_buffer(w_ptr, width=1 if weights_bf16 else 4)
+        qsl_bt = _addr_i32_buffer(qsl_ptr)
         n0 = (warp % row_groups) * rows
+
+        def seq_rows(seq):
+            """(first row, row count) of sequence seq among the flattened
+            rows: next_n each, or (ragged) query_start_loc's."""
+            if fx.const_expr(ragged):
+                first = fx.Int32(qsl_bt[seq])
+                return first, fx.Int32(qsl_bt[seq + fx.Int32(1)]) - first
+            return seq * fx.Int32(next_n), fx.Int32(next_n)
+
+        def row_of(first, count, n):
+            """Flattened row of a sequence's row n; a ragged row past its
+            count reads row 0 (it is there) and gets bound 0 (row_bound)."""
+            if fx.const_expr(ragged):
+                return (n < count).select(first + n, fx.Int32(0))
+            return first + n
 
         def read_rows(seq):
             """Sequence seq's rows n0 .. n0 + rows - 1 as loaded: per row,
@@ -552,8 +573,9 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
             the scale dwords and this lane's head weights (heads 16 mi + 4 g
             .. + 3; bf16 pairs as dwords). Flat, in that order."""
             raw = []
+            first, count = seq_rows(seq)
             for r in range_constexpr(rows):
-                row = seq * fx.Int32(next_n) + n0 + r
+                row = row_of(first, count, n0 + r)
                 for kt in range_constexpr(k_tiles):
                     for mi in range_constexpr(m_tiles):
                         head = row * fx.Int32(heads) + fx.Int32(mi * MFMA_M) + l
@@ -562,7 +584,7 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
                         )
                         raw.append(_load_vec4_i32(q_bt, off))
                 for kt in range_constexpr(k_tiles):
-                    # [B, NEXT_N, K_TILES, 4 (g), 16 (l), qs_pad] bytes
+                    # [rows, K_TILES, 4 (g), 16 (l), qs_pad] bytes
                     lane_row = ((row * fx.Int32(k_tiles) + kt) * 4 + g) * 16 + l
                     for i in range_constexpr(qs_dw):
                         raw.append(
@@ -581,9 +603,9 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
             """Sequence seq's rows' bounds as given (row_ends): read with
             the first pages; without row_ends, from the length (no read)."""
             if fx.const_expr(has_row_ends):
+                first, count = seq_rows(seq)
                 return [
-                    fx.Int32(ends_bt[seq * fx.Int32(next_n) + n0 + r])
-                    for r in range(rows)
+                    fx.Int32(ends_bt[row_of(first, count, n0 + r)]) for r in range(rows)
                 ]
             return [fx.Int32(0)] * rows
 
@@ -764,7 +786,8 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
         # launch's max_seq_len, the shares the real lengths) reads nothing
         # more: no query rows, no keys for steps that are not there
         if s_hi > s0:
-            row0 = b * next_n + n0
+            first_b, count_b = seq_rows(b)
+            row0 = first_b + n0
 
             # A workgroup's waves of a row group walk one sequence's steps side
             # by side with the same query rows: its first wave reads them (ahead
@@ -968,7 +991,12 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
                     if fx.const_expr(has_row_ends):
                         e = _uniform(row_ends_raw[r])
                     else:
-                        e = len_c - fx.Int32(next_n - 1) + n0 + r
+                        # row n of count sees length - count + n + 1 keys
+                        e = len_c - (count_b - fx.Int32(1)) + n0 + r
+                    if fx.const_expr(ragged):
+                        # a row past its sequence's count: bound 0, so no
+                        # key of the walk and no store of the window
+                        e = (n0 + r < count_b).select(e, fx.Int32(0))
                     ends.append(fx.max(e, fx.Int32(0)))
                 max_end = fx.max(*ends)
                 n_steps = (max_end + fx.Int32(STEP_KEYS - 1)) // STEP_KEYS
@@ -1210,6 +1238,7 @@ def compile_pa_mqa_logits_fp4_rowgroup(
     kv_nt: bool,
     out_nt: bool,
     wave_min_steps: int,
+    ragged: bool,
 ):
     kfn, row_groups = build_pa_mqa_logits_fp4_rowgroup_module(
         page_size=page_size,
@@ -1227,6 +1256,7 @@ def compile_pa_mqa_logits_fp4_rowgroup(
         kv_nt=kv_nt,
         out_nt=out_nt,
         wave_min_steps=wave_min_steps,
+        ragged=ragged,
     )
     block_threads = num_warps * WARP_SIZE
 
@@ -1241,6 +1271,7 @@ def compile_pa_mqa_logits_fp4_rowgroup(
         w: fx.Int64,
         ctx: fx.Int64,
         ends: fx.Int64,
+        qsl: fx.Int64,
         stride_out: fx.Int32,
         weight_scale: fx.Float32,
         last_page: fx.Int32,
@@ -1251,8 +1282,8 @@ def compile_pa_mqa_logits_fp4_rowgroup(
         stream: fx.Stream,
     ):
         kfn(
-            out, q, qs, kv, kvs, bt, w, ctx, ends, stride_out, weight_scale,
-            last_page, batch, base_slots, max_steps,
+            out, q, qs, kv, kvs, bt, w, ctx, ends, qsl, stride_out,
+            weight_scale, last_page, batch, base_slots, max_steps,
         ).launch(
             grid=(fx.Int64(grid_x), 1, 1),
             block=(block_threads, 1, 1),
@@ -1399,6 +1430,8 @@ def flydsl_pa_mqa_logits_fp4_rowgroup(
     *,
     weight_scale: float = 1.0,
     row_ends: torch.Tensor | None = None,
+    query_start_loc: torch.Tensor | None = None,
+    max_query_len: int | None = None,
     rows_per_wave: int | None = None,
     num_warps: int | None = None,
     workgroups: int | None = None,
@@ -1424,6 +1457,14 @@ def flydsl_pa_mqa_logits_fp4_rowgroup(
     out           [B * NEXT_N, >= max_seq_len] f32. Columns past a row's bound
                   are left as they were.
 
+    Ragged: with ``query_start_loc`` [B + 1] i32, sequence b's rows are the
+    flattened rows query_start_loc[b] .. query_start_loc[b + 1] - 1, any
+    count up to ``max_query_len`` (0 too, as cudagraph padding has):
+    q_fp4 [rows, 1, H, D / 2], q_scale, weights, row_ends and out by
+    flattened row, and row n of a count-row sequence sees context - count +
+    n + 1 keys unless row_ends says otherwise. A sequence's rows still share
+    each key load, as NEXT_N rows do.
+
     Work is shared out by length, a long sequence getting more workgroups
     than a short one, by each workgroup from context_lens: no launch of its
     own, and the grid, ``workgroups`` (at least B), follows the batch and
@@ -1437,7 +1478,16 @@ def flydsl_pa_mqa_logits_fp4_rowgroup(
     depth          steps of keys in flight per wave
     kv_nt / out_nt nontemporal key loads / logit stores
     """
-    batch, next_n, heads, half = q_fp4.shape
+    ragged = query_start_loc is not None
+    if ragged:
+        assert max_query_len is not None and max_query_len >= 1, max_query_len
+        assert q_fp4.shape[1] == 1, "ragged rows: q_fp4 [rows, 1, H, D / 2]"
+        assert query_start_loc.dtype == torch.int32 and query_start_loc.is_contiguous()
+        total_rows, _, heads, half = q_fp4.shape
+        batch, next_n = query_start_loc.shape[0] - 1, max_query_len
+    else:
+        batch, next_n, heads, half = q_fp4.shape
+        total_rows = batch * next_n
     head_dim = half * 2
     num_pages = kv_cache.shape[0]
     kv_page = kv_cache[0].numel()
@@ -1456,11 +1506,11 @@ def flydsl_pa_mqa_logits_fp4_rowgroup(
     assert block_tables.dtype == torch.int32 and block_tables.stride(1) == 1
     assert block_tables.shape[0] >= batch
     assert context_lens.dtype == torch.int32 and context_lens.shape[0] >= batch
-    assert weights.shape[0] >= batch * next_n and weights.shape[1] == heads
+    assert weights.shape[0] >= total_rows and weights.shape[1] == heads
     assert weights.stride(1) == 1 and weights.stride(0) == heads
     assert weights.dtype in (torch.float32, torch.bfloat16)
     if row_ends is not None:
-        assert row_ends.dtype == torch.int32 and row_ends.shape == (batch * next_n,)
+        assert row_ends.dtype == torch.int32 and row_ends.shape == (total_rows,)
     rows = rows_per_wave or default_rows_per_wave(next_n, heads, batch, max_seq_len)
     if kv_nt is None:
         kv_nt = default_kv_nt(page_size, rows, next_n)
@@ -1504,15 +1554,16 @@ def flydsl_pa_mqa_logits_fp4_rowgroup(
         kv_nt=kv_nt,
         out_nt=out_nt,
         wave_min_steps=wave_min_steps,
+        ragged=ragged,
     )
     if out is None:
         out = torch.full(
-            (batch * next_n, max_seq_len),
+            (total_rows, max_seq_len),
             float("-inf"),
             dtype=torch.float32,
             device=q_fp4.device,
         )
-    assert out.shape[0] >= batch * next_n and out.shape[1] >= max_seq_len
+    assert out.shape[0] >= total_rows and out.shape[1] >= max_seq_len
     assert out.stride(1) == 1
     for t in (q_fp4, q_scale, context_lens):
         assert t.is_contiguous(), "the kernel addresses its operands as dense"
@@ -1526,6 +1577,7 @@ def flydsl_pa_mqa_logits_fp4_rowgroup(
         weights.data_ptr(),
         context_lens.data_ptr(),
         (row_ends if row_ends is not None else context_lens).data_ptr(),
+        (query_start_loc if ragged else context_lens).data_ptr(),
         out.stride(0),
         float(weight_scale),
         num_pages - 1,
