@@ -111,47 +111,8 @@ def build_flash_attn_dualwave_swp_fp8_module(
         vt: fx.Array[fx.BFloat16, traits.VT_BF16_TOTAL, 16]
         q: fx.Array[_lds_elem_dtype, _q_lds_elems, 16]
 
-    # BN128: two BLOCK_N=64 KV tiles per iteration, one merged softmax correction.
-    @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
-    def flash_attn_dualwave_swp_fp8_bn128_kernel(
-        Q: fx.Tensor,
-        K: fx.Tensor,
-        V: fx.Tensor,
-        O: fx.Tensor,
-        Workspace: fx.Tensor,
-        CuSeqQ: fx.Tensor,
-        CuSeqKv: fx.Tensor,
-        QDescale: fx.Tensor,
-        KDescale: fx.Tensor,
-        VDescale: fx.Tensor,
-        LSE: fx.Tensor,
-        seq_len: fx.Int32,
-        seq_len_kv: fx.Int32,
-        stride_q_n: fx.Int32,
-        stride_kv_n: fx.Int32,
-        softmax_scale: fx.Float32,
-        lse_stride_h: fx.Int32,
-    ):
-        ctx = DualwaveFp8KernelContext(
-            traits,
-            Q,
-            K,
-            V,
-            O,
-            Workspace,
-            CuSeqQ,
-            CuSeqKv,
-            QDescale,
-            KDescale,
-            VDescale,
-            LSE,
-            seq_len,
-            seq_len_kv,
-            stride_q_n,
-            stride_kv_n,
-            softmax_scale,
-            lse_stride_h,
-        )
+    @flyc.jit
+    def _fwd_body(ctx):
         ctx.init_types_and_constants()
         ctx.init_runtime_indices()
         ctx.init_lds(SharedStorage)
@@ -343,6 +304,49 @@ def build_flash_attn_dualwave_swp_fp8_module(
         else:
             output_store.store_splitk_partial_o(v_o, m_row, l_row, q_row)
             output_store.store_empty_split()
+
+    # BN128: two BLOCK_N=64 KV tiles per iteration, one merged softmax correction.
+    @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
+    def flash_attn_dualwave_swp_fp8_bn128_kernel(
+        Q: fx.Tensor,
+        K: fx.Tensor,
+        V: fx.Tensor,
+        O: fx.Tensor,
+        Workspace: fx.Tensor,
+        CuSeqQ: fx.Tensor,
+        CuSeqKv: fx.Tensor,
+        QDescale: fx.Tensor,
+        KDescale: fx.Tensor,
+        VDescale: fx.Tensor,
+        LSE: fx.Tensor,
+        seq_len: fx.Int32,
+        seq_len_kv: fx.Int32,
+        stride_q_n: fx.Int32,
+        stride_kv_n: fx.Int32,
+        softmax_scale: fx.Float32,
+        lse_stride_h: fx.Int32,
+    ):
+        ctx = DualwaveFp8KernelContext(
+            traits,
+            Q,
+            K,
+            V,
+            O,
+            Workspace,
+            CuSeqQ,
+            CuSeqKv,
+            QDescale,
+            KDescale,
+            VDescale,
+            LSE,
+            seq_len,
+            seq_len_kv,
+            stride_q_n,
+            stride_kv_n,
+            softmax_scale,
+            lse_stride_h,
+        )
+        _fwd_body(ctx)
 
     # Combine kernel: out = sum_s w_s * O_s / sum_s w_s * l_s, w_s = exp2(m_s - m_max).
     # One wave row of 32 lanes covers a (b, h, s) row, 4 contiguous cols/lane.
