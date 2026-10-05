@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""FP8 unified attention: public dispatch and focused direct-launch regressions.
+"""FP8 unified attention: public dispatch.
 
 Timings use warm, fixed buffers; TB/s is logical traffic, not measured HBM bandwidth.
-The run-only check covers warm JIT-cache reuse, not wheel AOT packaging.
 """
 
 import argparse
@@ -12,7 +11,6 @@ import itertools
 import os
 import sys
 from functools import partial
-from unittest import mock
 
 import pandas as pd
 import torch
@@ -24,99 +22,25 @@ import aiter
 import aiter.ops.unified_attention as ua
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
-from aiter.ops.triton.attention.unified_attention import _is_gluon_available
+from aiter.ops.quant import per_tensor_quant
 from aiter.test_common import benchmark, checkAllclose, run_perftest
+from op_tests.triton_tests.utils.paged_attn_ref import ref_paged_attn
 
 PAGE, H, HKV, D = 64, 64, 4, 128
 
 
 def q8(x):
-    s = x.abs().amax().clamp(min=1e-4) / 448.0
-    return (x / s).to(torch.float8_e4m3fn), s.reshape(1).float().to(x.device)
+    return per_tensor_quant(x, quant_dtype=torch.float8_e4m3fn)
 
 
-def ref_paged_attn(
-    query,
-    key_cache,
-    value_cache,
-    query_lens,
-    kv_lens,
-    block_tables,
-    scale,
-    out_dtype=torch.float32,
-    sliding_window=None,
-    soft_cap=None,
-    sinks=None,
-    q_descale=None,
-    k_descale=None,
-    v_descale=None,
-    output_scale=None,
-    causal=1,
-):
-    # Local copy of the established paged oracle; never import a test suite.
-    num_seqs = len(query_lens)
-    block_tables = block_tables.cpu().numpy()
-    _, block_size, num_kv_heads, head_size = key_cache.shape
-    outputs = []
-    start_idx = 0
-    query = query.to(torch.float32)
-    key_cache = key_cache.to(torch.float32)
-    value_cache = value_cache.to(torch.float32)
-    if q_descale is not None:
-        query = query * q_descale
-    if k_descale is not None:
-        key_cache = key_cache * k_descale
-    if v_descale is not None:
-        value_cache = value_cache * v_descale
-    for i in range(num_seqs):
-        query_len = query_lens[i]
-        kv_len = kv_lens[i]
-        q = query[start_idx : start_idx + query_len]
-        q *= scale
-        num_kv_blocks = (kv_len + block_size - 1) // block_size
-        block_indices = block_tables[i, :num_kv_blocks]
-        k = key_cache[block_indices].view(-1, num_kv_heads, head_size)[:kv_len]
-        v = value_cache[block_indices].view(-1, num_kv_heads, head_size)[:kv_len]
-        if q.shape[1] != k.shape[1]:
-            k = torch.repeat_interleave(k, q.shape[1] // k.shape[1], dim=1)
-            v = torch.repeat_interleave(v, q.shape[1] // v.shape[1], dim=1)
-        attn = torch.einsum("qhd,khd->hqk", q, k).float()
-        empty_mask = torch.ones(query_len, kv_len, device=q.device)
-        mask = torch.triu(empty_mask, diagonal=kv_len - query_len + 1).bool()
-        if sliding_window is not None:
-            sliding_window_mask = (
-                torch.triu(
-                    empty_mask, diagonal=kv_len - (query_len + sliding_window) + 1
-                )
-                .bool()
-                .logical_not()
-            )
-            mask |= sliding_window_mask
-        if soft_cap is not None and soft_cap > 0:
-            attn = soft_cap * torch.tanh(attn / soft_cap)
-        if causal:
-            attn.masked_fill_(mask, float("-inf"))
-        if sinks is not None:
-            s_aux = sinks[:, None, None].repeat_interleave(attn.shape[-2], dim=-2)
-            attn = torch.cat((attn, s_aux), dim=-1)
-        attn = torch.softmax(attn, dim=-1).to(v.dtype)
-        if sinks is not None:
-            attn = attn[..., :-1]
-        outputs.append(torch.einsum("hqk,khd->qhd", attn, v))
-        start_idx += query_len
-    out = torch.cat(outputs, dim=0)
-    if output_scale is not None:
-        out = out / output_scale
-    return out.to(out_dtype)
-
-
-def make_case(query_lens, kv_lens, dtype, causal=True, seed=3):
+def make_case(query_lens, kv_lens, dtype, causal=True, seed=3, group=H // HKV):
+    heads = HKV * group
     g = torch.Generator(device="cuda").manual_seed(seed)
     pages = [max(0, (n + PAGE - 1) // PAGE) for n in kv_lens]
     n_pages = max(1, sum(pages))
     q, qs = q8(
         torch.randn(
-            sum(query_lens), H, D, device="cuda", dtype=dtypes.bf16, generator=g
+            sum(query_lens), heads, D, device="cuda", dtype=dtypes.bf16, generator=g
         )
     )
     k, ks = q8(
@@ -190,60 +114,6 @@ def shuffle_kv(k, v):
     return k.permute(0, 1, 2, 4, 3).contiguous(), v.permute(0, 1, 3, 2, 4).contiguous()
 
 
-def direct_candidate(case, kv_lens):
-    from aiter.ops.flydsl.kernels.flash_attn_func_fp8_gfx950 import (
-        _fp8_auto_block_m,
-        _fp8_rescale_threshold,
-    )
-    from aiter.ops.flydsl.unified_attention_kernels import (
-        _PACKED_BN64_GROUPS,
-        _as_i8,
-        _get_kernel,
-    )
-
-    b, max_q = len(kv_lens), case["max_seqlen_q"]
-    block_m = _fp8_auto_block_m(b, H, max_q, max(kv_lens), 256)
-    # Mirror the router: GQA groups 4/8/16 take the packed BN64 body (block_m=128).
-    packed_bn64 = H // HKV in _PACKED_BN64_GROUPS
-    if packed_bn64:
-        block_m = 128
-    mod = _get_kernel(
-        H,
-        HKV,
-        bool(case["causal"]),
-        "bf16" if case["out"].dtype == dtypes.bf16 else "f16",
-        case["k"].ndim == 5,
-        _fp8_rescale_threshold(max(kv_lens)),
-        block_m,
-        packed_bn64=packed_bn64,
-    )
-
-    def launch():
-        mod(
-            _as_i8(case["q"]).reshape(-1),
-            _as_i8(case["k"]).reshape(case["k"].shape[0], -1),
-            _as_i8(case["v"]).reshape(case["v"].shape[0], -1),
-            case["out"].reshape(-1),
-            b,
-            max_q,
-            HKV * D,
-            case["q"].stride(0),
-            softmax_scale=case["softmax_scale"],
-            seq_len_kv=max(kv_lens),
-            cu_seqlens_q=case["cu_seqlens_q"],
-            cu_seqlens_kv=case["seqused_k"],
-            block_table=case["block_table"].reshape(-1),
-            block_table_stride=case["block_table"].stride(0),
-            q_descale=case["q_descale"],
-            k_descale=case["k_descale"],
-            v_descale=case["v_descale"],
-            stream=torch.cuda.current_stream().cuda_stream,
-        )
-        return case["out"]
-
-    return launch
-
-
 def compare(want, got, atol, name):
     want, got = want.float(), got.float()
     err = checkAllclose(want, got, rtol=0, atol=atol, tol_err_ratio=0, msg=name)
@@ -255,8 +125,9 @@ def measure(candidates, case, want, query_lens, kv_lens, atol=None, bad_rows=Fal
     # Preserve the old adapter's 8% global-scale gate, not element-relative rtol.
     if atol is None:
         atol = 0.08 * want.abs().max().item()
-    flops = 4 * H * D * sum(q * k for q, k in zip(query_lens, kv_lens))
-    nbytes = sum(query_lens) * H * D * (1 + case["out"].element_size())
+    heads = case["q"].shape[1]
+    flops = 4 * heads * D * sum(q * k for q, k in zip(query_lens, kv_lens))
+    nbytes = sum(query_lens) * heads * D * (1 + case["out"].element_size())
     nbytes += 2 * sum(kv_lens) * HKV * D
     ret = {"gfx": get_gfx_runtime()}
     for name, fn in candidates.items():
@@ -282,151 +153,57 @@ def measure(candidates, case, want, query_lens, kv_lens, atol=None, bad_rows=Fal
     return ret
 
 
-PA_DECODE_CASES = {
-    "pure": ([1] * 8, [64, 700, 4096, 65, 8192, 1, 3000, 256]),
-    "ragged": ([1] * 16, [30000] + [37 + 11 * i for i in range(15)]),
-    # NP hits the 32 cap: one 16384-token seq, 3*256/4 = 192 fit -> cap 32
-    "cap": ([1], [16384]),
+PREFILL_CASES = {
+    "base": ([512, 256], [512, 256], 16),
+    # Small-Sq causal prefill is never declined for underfill; it has no host sync, so it captures.
+    "small_sq": ([64, 64], [2048, 2048], 16),
+    # Ragged pure prefill: M=970 > (B-1)*S+1=961, so no row can have query length 1.
+    "varlen": ([320, 300, 200, 150], [2048, 5000, 8192, 3000], 16),
+    # Ragged rows with an empty-KV row and partial last pages, per packed-BN64 GQA group.
+    "varlen_causal": ([93, 80, 71, 60], [157, 100, 90, 70], 4),
+    **{f"ragged_g{g}": ([93, 1, 17, 9], [157, 0, 5, 1], g) for g in (1, 4, 8, 16)},
 }
 
 
 @benchmark()
-def test_pa_decode_route(kind, gqa=16):
-    """Decode rows on the shuffled cache must reach FlyDSL pa_decode (static NP)
-    and match the reference. Block 16 is not exercised: the dispatcher's page
-    gate is 64 only."""
-    import aiter.ops.flydsl.unified_attention_kernels as uk
-
-    query_lens, kv_lens = PA_DECODE_CASES[kind]
-    case = make_case(query_lens, kv_lens, dtypes.bf16, seed=11)
-    case["q"] = case["q"][:, : HKV * gqa].clone(memory_format=torch.contiguous_format)
-    case["out"] = torch.empty_like(case["q"], dtype=dtypes.bf16)
-    want = reference(case, query_lens, kv_lens)
-    case["k"], case["v"] = shuffle_kv(case["k"], case["v"])
-    call = partial(
-        ua.unified_attention, **case, backend="flydsl", shuffled_kv_cache=True
-    )
-    with mock.patch.object(uk, "_route_pa_decode", wraps=uk._route_pa_decode) as spy:
-        call()
-        assert spy.called, "decode rows did not route to pa_decode"
-    return measure({"pa_decode_route": call}, case, want, query_lens, kv_lens)
-
-
-def test_pa_decode_num_partitions():
-    from aiter.ops.flydsl.unified_attention_kernels import (
-        _pa_decode_num_partitions as f,
-    )
-
-    assert f(64, 4, 16384, 256) == 3
-    assert f(32, 4, 16384, 256) == 6
-    assert f(56, 4, 16384, 256) == 3  # floor(768/224)
-    assert f(8, 4, 1024, 256) == 4  # tile bound (24 fit)
-    assert f(1, 4, 16384, 256) == 32  # max-NP bound (192 fit, 64 tiles)
-    assert f(512, 4, 16384, 256) == 1  # floor gives 0
-
-
-_PA_DECODE_VGPR_PROBE = r"""
-import sys, torch
-import aiter.ops.flydsl.pa_decode as pd
-wide = sys.argv[1] == "1"
-orig = pd.compile_pa_decode_tile
-pd.compile_pa_decode_tile = lambda **kw: orig(**{**kw, "wide_kv_addressing": wide})
-S, HKV, G, D, PAGE, NP, NB = 2, 4, 16, 128, 64, 3, 12
-f8 = torch.float8_e4m3fn
-one = torch.ones(1, dtype=torch.float32, device="cuda")
-q = torch.zeros(S, HKV * G, D, dtype=f8, device="cuda")
-k = torch.zeros(NB, HKV, D // 16, PAGE, 16, dtype=f8, device="cuda")
-v = torch.zeros(NB, HKV, PAGE // 16, D, 16, dtype=f8, device="cuda")
-bt = torch.arange(NB, dtype=torch.int32, device="cuda").reshape(S, NB // S)
-ctx = torch.full((S,), NP * 256 // 2, dtype=torch.int32, device="cuda")
-out = torch.zeros(S, HKV * G, D, dtype=torch.bfloat16, device="cuda")
-sh = (S, HKV, NP, G)
-pd.pa_decode(
-    out, q, k, v, ctx, bt, 0.1, 1, NP, 256, f8, one, one, one,
-    torch.empty(sh, dtype=torch.float32, device="cuda"),
-    torch.empty(sh, dtype=torch.float32, device="cuda"),
-    torch.empty(*sh, D, dtype=torch.bfloat16, device="cuda"),
-)
-torch.cuda.synchronize()
-"""
-
-
-def _pa_decode_tile_vgprs(wide):
-    """VGPR count of the route's pa_decode tile kernel, read from the code object
-    FlyDSL caches (the .vgpr_count msgpack note). Runs in a subprocess with a
-    private cache so a warm or disabled default cache cannot hide the kernel."""
-    import glob
-    import pickle
-    import re
-    import subprocess
-    import tempfile
-
-    with tempfile.TemporaryDirectory() as cache:
-        env = {
-            **os.environ,
-            "FLYDSL_RUNTIME_CACHE_DIR": cache,
-            "FLYDSL_RUNTIME_ENABLE_CACHE": "1",
-            "PYTHONPATH": os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        }
-        subprocess.run(
-            [sys.executable, "-c", _PA_DECODE_VGPR_PROBE, "1" if wide else "0"],
-            env=env,
-            check=True,
-            timeout=300,
+def test_prefill(dtype, causal, kind, layout):
+    query_lens, kv_lens, group = PREFILL_CASES[kind]
+    case = make_case(query_lens, kv_lens, dtype, causal, group=group)
+    if kind.startswith("ragged"):
+        # Poison V past each row's valid tokens: stale tails and page-zero prefetches
+        # must not reach PV. Out is a slice of a NaN canary buffer, so any write past
+        # the last query row is detected.
+        for row, n in enumerate(kv_lens):
+            if n % PAGE:
+                page = int(case["block_table"][row, n // PAGE])
+                case["v"].view(torch.uint8)[page, n % PAGE :] = 0x7F
+        total = sum(query_lens)
+        storage = torch.full(
+            (total + 128, *case["q"].shape[1:]),
+            float("nan"),
+            device="cuda",
+            dtype=dtype,
         )
-        counts = set()
-        for p in glob.glob(f"{cache}/pa_decode_tile_fp8_launch_*/*.pkl"):
-            with open(p, "rb") as f:
-                art = pickle.load(f)
-            m = re.search(
-                r'bin = "(.*?)"', getattr(art, "ir", None) or str(art), re.DOTALL
-            )
-            assert m, f"no code object in {p}"
-            s, data, i = m.group(1), bytearray(), 0
-            while i < len(s):
-                if s[i] == "\\" and s[i + 1] in '\\"':
-                    data.append(ord(s[i + 1]))
-                    i += 2
-                elif s[i] == "\\":
-                    data.append(int(s[i + 1 : i + 3], 16))
-                    i += 3
-                else:
-                    data.append(ord(s[i]))
-                    i += 1
-            # msgpack note: key ".vgpr_count" followed by fixint/uint8/uint16.
-            j = bytes(data).index(b".vgpr_count") + len(b".vgpr_count")
-            tag = data[j]
-            counts.add(
-                tag
-                if tag < 0x80
-                else (
-                    data[j + 1]
-                    if tag == 0xCC
-                    else int.from_bytes(data[j + 1 : j + 3], "big")
-                )
-            )
-    assert len(counts) == 1, f"expected one pa_decode tile kernel, got {counts}"
-    return counts.pop()
-
-
-def test_pa_decode_vgpr_occupancy():
-    """_PA_DECODE_WGS_PER_CU assumes the route tile keeps >= 3 waves/SIMD."""
-    wide, narrow = _pa_decode_tile_vgprs(True), _pa_decode_tile_vgprs(False)
-    msg = (
-        f"pa_decode tile VGPRs: wide={wide}, narrow={narrow} (expected ~144 and ~114); "
-        "re-sweep _PA_DECODE_WGS_PER_CU if a count crosses 128 or 170"
-    )
-    assert 512 // wide >= 3 and 512 // narrow >= 3, msg
-    print(msg)
-
-
-@benchmark()
-def test_prefill(dtype, causal):
-    query_lens, kv_lens = [512, 256], [512, 256]
-    case = make_case(query_lens, kv_lens, dtype, causal)
-    want = reference(case, query_lens, kv_lens)
-    candidates = {"flydsl": partial(ua.unified_attention, **case, backend="flydsl")}
-    return measure(candidates, case, want, query_lens, kv_lens)
+        case["out"] = storage[:total]
+    # An empty-KV row has no softmax support; the kernel writes zeros there.
+    want = torch.nan_to_num(reference(case, query_lens, kv_lens))
+    if layout == "vectorized":
+        case["k"], case["v"] = shuffle_kv(case["k"], case["v"])
+    case["shuffled_kv_cache"] = layout == "vectorized"
+    call = partial(ua.unified_attention, **case, backend="flydsl")
+    ret = measure({"flydsl": call}, case, want, query_lens, kv_lens)
+    if kind.startswith("ragged"):
+        empty = query_lens[0], query_lens[0] + query_lens[1]
+        assert torch.count_nonzero(case["out"][empty[0] : empty[1]]) == 0
+        assert torch.isnan(storage[total:]).all(), "write past the last query row"
+    if kind == "small_sq" and causal:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            call()
+        case["out"].fill_(float("nan"))
+        graph.replay()
+        compare(want, case["out"], 0.08 * want.abs().max().item(), "small-Sq graph")
+    return ret
 
 
 @benchmark()
@@ -456,80 +233,6 @@ def test_decode(dtype, depth, layout):
     return ret
 
 
-SMALL_SQ_CASES = {
-    f"b{b}_sq{sq}_kv{kv}": ([sq] * b, [kv] * b)
-    for b in (1, 2, 4)
-    for sq in (1, 64, 128, 320)
-    for kv in (2048, 8192)
-}
-# Ragged pure prefill: M=970 > (B-1)*S+1=961, so no row can have query length 1.
-SMALL_SQ_CASES["varlen"] = ([320, 300, 200, 150], [2048, 5000, 8192, 3000])
-# Possibly mixed (M=591 <= 961): causal declines to the fallback, non-causal stays on FlyDSL.
-SMALL_SQ_CASES["varlen_mixed"] = ([7, 64, 200, 320], [2048, 5000, 8192, 3000])
-
-
-@benchmark()
-def test_small_sq_causal_prefill(kind, layout):
-    """Small-Sq causal prefill is never declined for underfill: FlyDSL must
-    handle the call itself (non-None) and match the reference. The possibly-mixed
-    case is causal-declined and checked non-causal. Sq=1 on the
-    linear layout is a linear decode, which FlyDSL declines by design, so it is
-    skipped there; on the shuffled layout it routes to pa_decode."""
-    import aiter.ops.flydsl.unified_attention_kernels as adapter
-
-    query_lens, kv_lens = SMALL_SQ_CASES[kind]
-    if layout == "linear" and max(query_lens) == 1:
-        return {"skipped": "linear decode is declined by design"}
-    mixed = kind == "varlen_mixed"
-    case = make_case(query_lens, kv_lens, dtypes.bf16, causal=not mixed)
-    want = reference(case, query_lens, kv_lens)
-    shuffled = layout == "shuffled"
-    if shuffled:
-        case["k"], case["v"] = shuffle_kv(case["k"], case["v"])
-    route = partial(
-        adapter.flydsl_unified_attention,
-        num_kv_heads=HKV,
-        block_size=PAGE,
-        num_queries_per_kv=H // HKV,
-        num_seqs=len(kv_lens),
-        shuffled_kv_cache=shuffled,
-    )
-    if mixed:
-        # A causal batch that is not provably prefill must decline.
-        declined = route(**{**case, "causal": True})
-        assert declined is None, f"{kind}/{layout}: causal mixed batch not declined"
-    got = route(**case)
-    assert got is not None, f"{kind}/{layout}: FlyDSL declined small-Sq causal prefill"
-    compare(want, got, 0.08 * want.abs().max().item(), f"{kind}/{layout}")
-    return {"kind": kind, "layout": layout}
-
-
-@benchmark()
-def test_small_sq_causal_graph():
-    """Small-Sq causal prefill has no host sync, so it captures and replays."""
-    query_lens, kv_lens = [64, 64], [2048, 2048]
-    case = make_case(query_lens, kv_lens, dtypes.bf16)
-    want = reference(case, query_lens, kv_lens)
-    call = partial(ua.unified_attention, **case, backend=None)
-    call()  # compile outside capture
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        call()
-    case["out"].fill_(float("nan"))
-    graph.replay()
-    compare(want, case["out"], 0.08 * want.abs().max().item(), "small-Sq graph")
-    return {"graph": "ok"}
-
-
-@benchmark()
-def test_cross_attention_mask(query_len, kv_len):
-    case = make_case([query_len], [kv_len], dtypes.bf16)
-    want = reference(case, [query_len], [kv_len])
-    candidates = {"direct_prefill": direct_candidate(case, [kv_len])}
-    return measure(candidates, case, want, [query_len], [kv_len], atol=0.1)
-
-
 @benchmark()
 def test_paged_addressing(pool_blocks, layout):
     query_lens, kv_lens = [128], [256]
@@ -553,8 +256,9 @@ def test_paged_addressing(pool_blocks, layout):
         case["block_table"] = torch.tensor([ids], device="cuda", dtype=torch.int32)
         if layout == "vectorized":
             case["k"], case["v"] = shuffle_kv(case["k"], case["v"])
+        case["shuffled_kv_cache"] = layout == "vectorized"
         cases[name] = case
-        candidates[name] = direct_candidate(case, kv_lens)
+        candidates[name] = partial(ua.unified_attention, **case, backend="flydsl")
     ret = measure(candidates, cases["identity"], want, query_lens, kv_lens, atol=0.1)
     compare(
         cases["identity"]["out"],
@@ -563,114 +267,6 @@ def test_paged_addressing(pool_blocks, layout):
         "page permutation invariance",
     )
     return ret
-
-
-@benchmark()
-def test_routing_backend_gate(config):
-    import aiter.ops.flydsl.unified_attention_kernels as adapter
-
-    query_lens, kv_lens = [256] * 4, [256] * 4
-    case = make_case(query_lens, kv_lens, dtypes.bf16)
-    if config == "linear_decode":
-        query_lens, kv_lens = [1] * 8, [64] * 8
-        case = make_case(query_lens, kv_lens, dtypes.bf16)
-    elif config == "short_prefill":
-        query_lens, kv_lens = [320], [1024]
-        case = make_case(query_lens, kv_lens, dtypes.bf16)
-    elif config == "softcap":
-        case["softcap"] = 30.0
-    elif config == "sliding_window":
-        case["window_size"] = (127, 0)
-    elif config == "sinks":
-        case["sinks"] = torch.linspace(-1, 1, H, device="cuda", dtype=torch.float32)
-    want = reference(case, query_lens, kv_lens)
-    # short_prefill (small-Sq causal) used to be declined for underfill; it now routes to FlyDSL.
-    declined = config not in ("supported", "short_prefill")
-    explicit = partial(ua.unified_attention, **case, backend="flydsl")
-    if declined:
-        try:
-            explicit()
-        except RuntimeError as exc:
-            assert "does not support this configuration" in str(exc)
-        else:
-            raise AssertionError("explicit FlyDSL silently accepted a declined config")
-    real = adapter.flydsl_unified_attention
-    with mock.patch.object(adapter, "flydsl_unified_attention", wraps=real) as spy:
-        auto = ua.unified_attention(**case).clone()
-        assert spy.call_count > 0, "automatic dispatch never offered the call to FlyDSL"
-    if config == "sinks":
-        assert adapter._sinks_ok(case["sinks"], H) is False
-        try:
-            ua.unified_attention(**{**case, "causal": False})
-        except AssertionError:
-            pass
-        else:
-            raise AssertionError("non-causal sinks unexpectedly accepted")
-    compare(want, auto, 0.08 * want.abs().max().item(), "automatic routing")
-    candidates = {"triton": partial(ua.unified_attention, **case, backend="triton")}
-    with mock.patch.object(
-        adapter,
-        "flydsl_unified_attention",
-        side_effect=AssertionError("explicit backend selected FlyDSL"),
-    ):
-        ret = measure(candidates, case, want, query_lens, kv_lens)
-        if declined:
-            from aiter.ops.triton.attention.unified_attention import (
-                unified_attention as main_unified_attention,
-            )
-
-            fallback = main_unified_attention(**case).clone()
-            compare(auto, fallback, 0, "declined config vs default backend bitwise")
-        if _is_gluon_available():
-            ret.update(
-                measure(
-                    {"gluon": partial(ua.unified_attention, **case, backend="gluon")},
-                    case,
-                    want,
-                    query_lens,
-                    kv_lens,
-                )
-            )
-        else:
-            try:
-                ua.unified_attention(**case, backend="gluon")
-            except AssertionError as exc:
-                assert "Gluon backend requires" in str(exc)
-            else:
-                raise AssertionError("unsupported Gluon backend did not raise")
-            ret["gluon gate"] = "rejected: unsupported arch (no FlyDSL call)"
-    if not declined:
-        ret.update(measure({"flydsl": explicit}, case, want, query_lens, kv_lens))
-    return ret
-
-
-@benchmark()
-def test_warm_cache_run_only(path):
-    from aiter.aot.flydsl.common import override_env, run_only_env
-
-    query_lens, kv_lens = ([512], [512]) if path == "prefill" else ([1] * 8, [4096] * 8)
-    case = make_case(query_lens, kv_lens, dtypes.bf16, seed=17)
-    want = reference(case, query_lens, kv_lens)
-    if path == "decode":
-        case["k"], case["v"] = shuffle_kv(case["k"], case["v"])
-        case["shuffled_kv_cache"] = True
-    call = partial(ua.unified_attention, **case, backend="flydsl")
-    with override_env("FLYDSL_RUNTIME_ENABLE_CACHE", "1"):
-        call()
-        torch.cuda.synchronize()
-        case["out"].fill_(float("nan"))
-        # Missing artifacts must raise rather than quietly compile a replacement.
-        with run_only_env():
-            if path == "decode":
-                # Decode kernels are not AOT-compiled, so run-only declines them.
-                try:
-                    call()
-                except RuntimeError as exc:
-                    assert "does not support this configuration" in str(exc)
-                else:
-                    raise AssertionError("run-only decode was not declined")
-                return {"path": path, "declined": True}
-            return measure({"warm_run_only": call}, case, want, query_lens, kv_lens)
 
 
 def main():
@@ -716,55 +312,30 @@ def main():
         default=["linear", "vectorized"],
     )
     args = parser.parse_args()
-    test_pa_decode_num_partitions()
-    test_pa_decode_vgpr_occupancy()
     sweeps = [
-        ("prefill", test_prefill, itertools.product(args.dtype, args.causal)),
+        (
+            "prefill",
+            test_prefill,
+            [
+                (d, c, k, lay)
+                for d, c, k, lay in itertools.product(
+                    args.dtype, args.causal, list(PREFILL_CASES), args.layout
+                )
+                # Causal batches with a length-1 row are possibly-mixed and decline
+                # to the fallback by design; only non-causal reaches FlyDSL.
+                if not (c and k.startswith("ragged"))
+            ],
+        ),
         (
             "decode",
             test_decode,
             itertools.product(args.dtype, args.decode_depth, args.layout),
-        ),
-        (
-            "small-Sq causal prefill",
-            test_small_sq_causal_prefill,
-            itertools.product(list(SMALL_SQ_CASES), ["shuffled", "linear"]),
-        ),
-        ("small-Sq causal graph", test_small_sq_causal_graph, [()]),
-        (
-            "cross-attention mask",
-            test_cross_attention_mask,
-            itertools.product([320], [1024]),
         ),
         # 65535 pages stay below the dualwave launcher's signed-i32 element limit.
         (
             "paged addressing",
             test_paged_addressing,
             itertools.product([65535], args.layout),
-        ),
-        (
-            "pa_decode route",
-            test_pa_decode_route,
-            itertools.product(list(PA_DECODE_CASES), [3, 8, 16]),
-        ),
-        (
-            "routing/backend gate",
-            test_routing_backend_gate,
-            itertools.product(
-                [
-                    "supported",
-                    "softcap",
-                    "sliding_window",
-                    "sinks",
-                    "linear_decode",
-                    "short_prefill",
-                ]
-            ),
-        ),
-        (
-            "warm-cache run-only (not full AOT)",
-            test_warm_cache_run_only,
-            itertools.product(["prefill", "decode"]),
         ),
     ]
     for name, fn, parameters in sweeps:
