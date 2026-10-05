@@ -12,9 +12,12 @@ from aiter.fused_moe import (
     fused_moe,
     fused_topk,
     torch_moe,
+    torch_moe_stage1,
+    torch_moe_stage2,
 )
 from aiter.fused_moe_bf16_asm import asm_moe
 from aiter.ops.flydsl.moe_common import GateMode
+from aiter.ops.quant import per_1x32_f4_quant
 from aiter.ops.shuffle import (
     moe_shuffle_scale,
     moe_shuffle_weight,
@@ -416,7 +419,7 @@ def test_fmoe_ep_mxfp4(
       * "real" (default): simulate MORI dispatch. `token` is the GLOBAL token count;
         a source token is received iff it owns >=1 local expert (deduplicated), so
         total_recv <= token and non-local routes are masked. Buffer is trimmed to
-        trim_M = token*topk (ATOM CUDAGraph bound) with a padded tail.
+        trim_M = token with a padded tail.
       * "fake": mirror ATOM fake-EP (ATOM_FAKE_EP + --fake-eplb,
         atom/model_ops/moe.py:121-136). `token` is the PER-RANK batch M; every
         token's topk picks are redirected onto this rank's local expert block via a
@@ -431,7 +434,7 @@ def test_fmoe_ep_mxfp4(
       graph_bs    = token // ep          (per-rank tokens before dispatch)
       n_src       = token                (global source tokens across all ranks)
       total_recv  = #tokens routed to THIS rank (MORI's total_recv_t, <= n_src)
-      trim_M      = graph_bs * topk * ep (= token * topk, ATOM's CUDAGraph trim bound)
+      trim_M      = token                (topk does not enlarge the token buffer)
 
     Unlike a balanced "every token arrives" assumption, `total_recv` is derived
     from the actual routing exactly like MORI dispatch (and run_ref() in
@@ -451,10 +454,6 @@ def test_fmoe_ep_mxfp4(
     if _gfx not in ["gfx950", "gfx1250"]:
         print(f"skip {quant_label}: mxfp4 requires gfx950/gfx1250, got {_gfx}")
         return
-    if _gfx == "gfx1250" and quant_label != "a8w4_mxfp4":
-        print(f"skip {quant_label} on gfx1250: only a8w4_mxfp4 supported")
-        return
-
     # ---------- ATOM shape model (MoriV2ModularKernel) ----------
     # Before MORI dispatch: each of `ep` ranks holds `graph_bs` tokens, each
     #   with `topk` *global* expert ids (spanning all E experts).
@@ -463,7 +462,8 @@ def test_fmoe_ep_mxfp4(
     #   dest_pe (deduplicated); all topk idx/weight travel with it.
     # After dispatch: recv buffer shape (mr, hidden_dim) with (mr, topk) ids.
     #   total_recv = number of unique tokens that landed on this rank.
-    # After trim: buffer is sliced to graph_bs * topk * dp_size (CUDAGraph bound).
+    # After trim: the buffer retains one row per source token. Top-k remains a
+    # separate routing dimension and does not enlarge the activation buffer.
     #
     # Realistic simulation:
     #   experts_per_rank = E // ep. total_recv is computed from the actual routing
@@ -557,7 +557,7 @@ def test_fmoe_ep_mxfp4(
     else:
         graph_bs = token // ep
         n_src = graph_bs * ep  # global source tokens (all EP ranks' pre-dispatch)
-        trim_M = graph_bs * topk * ep  # ATOM's CUDAGraph trim bound (buffer rows)
+        trim_M = n_src
 
         # ---------- Simulate MORI dispatch output ----------
         # Step 1: generate the `n_src` *source* tokens (what all EP ranks hold
@@ -662,18 +662,61 @@ def test_fmoe_ep_mxfp4(
 
     w1_deq = _dequant(w1_qt, w1_scale, w1.shape)
     w2_deq = _dequant(w2_qt, w2_scale, w2.shape)
-    ref, _ = torch_moe_test(
-        ref_input,
-        w1_deq,
-        w2_deq,
-        ref_topk_weights,
-        ref_topk_ids,
-        expert_mask=expert_mask,
-    )
+    if _gfx == "gfx1250" and quant_label == "a4w4_mxfp4":
+        # Match both activation quantization points in the grouped A4W4 path.
+        # The generic BF16 reference above otherwise compares against A16W4
+        # and overstates the numerical error from the two MXFP4 round trips.
+        local_topk_ids = torch.where(
+            (ref_topk_ids >= local_expert_start) & (ref_topk_ids < local_expert_end),
+            ref_topk_ids - local_expert_start,
+            -1,
+        )
+        a1_q, a1_scale = per_1x32_f4_quant(
+            ref_input, quant_dtype=dtypes.fp4x2, shuffle=False
+        )
+        a2 = torch_moe_stage1(
+            a1_q,
+            w1_qt,
+            w2_qt,
+            ref_topk_weights,
+            local_topk_ids,
+            dtype=dtype,
+            activation=ActivationType.Silu,
+            quant_type=QuantType.per_1x32,
+            a1_scale=a1_scale,
+            w1_scale=w1_scale,
+        )
+        ref_rows, ref_topk = local_topk_ids.shape
+        a2_q, a2_scale = per_1x32_f4_quant(
+            a2.contiguous().view(ref_rows * ref_topk, inter_dim),
+            quant_dtype=dtypes.fp4x2,
+            shuffle=False,
+        )
+        ref = torch_moe_stage2(
+            a2_q.view(ref_rows, ref_topk, inter_dim // 2),
+            w1_qt,
+            w2_qt,
+            ref_topk_weights,
+            local_topk_ids,
+            dtype=dtype,
+            quant_type=QuantType.per_1x32,
+            w2_scale=w2_scale,
+            a2_scale=a2_scale,
+            doweight=True,
+        )
+    else:
+        ref, _ = torch_moe_test(
+            ref_input,
+            w1_deq,
+            w2_deq,
+            ref_topk_weights,
+            ref_topk_ids,
+            expert_mask=expert_mask,
+        )
 
     if _gfx == "gfx1250":
-        # gfx1250 grouped GEMM path: FlyDSL grouped layout. Weights stay uint8
-        # (a8w4 -> q_dtype_a=fp8), per_1x32 mxfp4 weights.
+        # gfx1250 grouped GEMM path: FlyDSL grouped layout. Weights stay uint8;
+        # resolve_activation_dtype selects fp8 for a8w4 and fp4 for a4w4.
         w1_u8 = w1_qt.view(torch.uint8)
         w2_u8 = w2_qt.view(torch.uint8)
         # gugu (INTERLEAVE) stage1 layout so the EP path is routed through the
@@ -693,7 +736,10 @@ def test_fmoe_ep_mxfp4(
         w2_s = moe_shuffle_scale(w2_scale.contiguous(), experts_cnt=total_local)
         gate_mode = GateMode.INTERLEAVE.value
         act = ActivationType.Silu
-        os.environ["AITER_FORCE_A8W4"] = "1"
+        if quant_label == "a8w4_mxfp4":
+            os.environ["AITER_FORCE_A8W4"] = "1"
+        else:
+            os.environ.pop("AITER_FORCE_A8W4", None)
         os.environ.setdefault("AITER_USE_GROUPED_GEMM", "1")
     elif quant_label == "a8w4_mxfp4":
         # gfx950 a8w4 (fp8 activations, mxfp4 weights): use the CK a16w4 layout
@@ -891,8 +937,8 @@ parser.add_argument(
     type=int,
     nargs="*",
     default=[128],
-    help="""Global token count. For EP mxfp4 tests the dispatch buffer is
-    token*topk rows (ATOM trim bound) with token valid rows.
+    help="""Token count. For EP mxfp4 tests the activation buffer has exactly
+    token rows; topk is represented only in the routing tensors.
     e.g.: -m 128""",
 )
 parser.add_argument(
