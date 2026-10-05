@@ -340,7 +340,7 @@ def fused_kda_decode(
         V=V,
         W=W,
         STATE_LEN=conv_state.shape[2],
-        STATE_LEN_P2=triton.next_power_of_2(conv_state.shape[2]),
+        SHIFT_LEN_P2=triton.next_power_of_2(max(conv_state.shape[2] - 1, 1)),
         IS_SPEC_DECODING=is_spec_decoding,
         SPEC_LEN=spec_tokens if is_spec_decoding else 1,
         stride_x_tok=mixed_qkv.stride(0),

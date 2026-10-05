@@ -75,7 +75,7 @@ def fused_conv_recurrent_norm_kernel(
     V: tl.constexpr,
     W: tl.constexpr,
     STATE_LEN: tl.constexpr,
-    STATE_LEN_P2: tl.constexpr,
+    SHIFT_LEN_P2: tl.constexpr,
     IS_SPEC_DECODING: tl.constexpr,
     SPEC_LEN: tl.constexpr,
     # Strides
@@ -333,7 +333,7 @@ def fused_conv_recurrent_norm_kernel(
             # into registers, then barrier, then store: a slot-by-slot
             # load/store loop lets a fast owner overwrite slot j + 1 before a
             # slow owner has read it.
-            o_s = tl.arange(0, STATE_LEN_P2)
+            o_s = tl.arange(0, SHIFT_LEN_P2)
             m_src = (o_s + 1) < STATE_LEN
             sh_q = tl.load(
                 p_csq[None, :] + (o_s[:, None] + 1) * stride_cs_pos,
