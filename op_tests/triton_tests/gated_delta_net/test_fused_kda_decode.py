@@ -286,12 +286,24 @@ def test_fused_kda_decode_pad_slot():
     ), "Conv state modified for PAD_SLOT_ID"
 
 
-def test_fused_kda_decode_rejects_noncontiguous_out():
-    """The kernels address out as tok * (H * V) + channel."""
+@pytest.mark.parametrize(
+    "invalid_out,match",
+    [
+        ("noncontiguous", "contiguous"),
+        ("dtype", "torch.bfloat16"),
+        ("device", "device"),
+    ],
+)
+def test_fused_kda_decode_rejects_invalid_out(invalid_out, match):
     batch, Hloc, D = 2, 2, 128
     inp = _make_inputs(batch, Hloc, D)
-    out = torch.zeros(Hloc * D, batch, dtype=torch.bfloat16, device=device).t()
-    with pytest.raises(ValueError, match="contiguous"):
+    if invalid_out == "noncontiguous":
+        out = torch.zeros(Hloc * D, batch, dtype=torch.bfloat16, device=device).t()
+    elif invalid_out == "dtype":
+        out = torch.zeros(batch, Hloc * D, dtype=torch.float32, device=device)
+    else:
+        out = torch.zeros(batch, Hloc * D, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match=match):
         fused_kda_decode(
             inp["mixed_qkv"],
             inp["conv_state"],
@@ -712,16 +724,29 @@ def test_spec_decode_honours_non_contiguous_index_strides(
     )
 
 
-def test_spec_decode_rejects_narrow_conv_cache():
-    """Every spec path needs room for the largest accepted checkpoint."""
+@pytest.mark.parametrize(
+    "invalid_layout",
+    ["narrow_conv_cache", "zero_sequence_stride", "zero_token_stride"],
+)
+def test_spec_decode_rejects_invalid_layout(invalid_layout):
     num_spec = 7
-    inp = _make_spec_inputs(1, 2, num_spec=num_spec)
+    batch = 1 if invalid_layout == "narrow_conv_cache" else 2
+    inp = _make_spec_inputs(batch, 2, num_spec=num_spec)
     spec_tokens = inp["state_indices"].shape[1]
-    required = spec_tokens + SPEC_W - 2
-    narrow = required - 1
-    inp["conv_state"] = inp["conv_state"][:, :, :narrow].contiguous()
-    inp["num_accepted_tokens"][0] = spec_tokens
-    with pytest.raises(ValueError, match=rf"conv_state\.shape\[2\] >= {required}"):
+    if invalid_layout == "narrow_conv_cache":
+        required = spec_tokens + SPEC_W - 2
+        inp["conv_state"] = inp["conv_state"][:, :, : required - 1].contiguous()
+        inp["num_accepted_tokens"][0] = spec_tokens
+        match = rf"conv_state\.shape\[2\] >= {required}"
+    elif invalid_layout == "zero_sequence_stride":
+        packed = inp["state_indices"]
+        inp["state_indices"] = packed[:1].expand_as(packed)
+        match = "positive sequence stride"
+    else:
+        packed = inp["state_indices"]
+        inp["state_indices"] = packed[:, :1].expand_as(packed)
+        match = "positive token stride"
+    with pytest.raises(ValueError, match=match):
         _run_spec(inp)
 
 

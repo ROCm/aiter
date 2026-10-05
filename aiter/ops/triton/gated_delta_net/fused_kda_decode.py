@@ -67,7 +67,7 @@ def fused_kda_decode(
         conv_state: [N, 3*lp, STATE_LEN] bf16, transposed view of conv cache.
             STATE_LEN is W-1 for normal decode; speculative decode needs
             STATE_LEN >= S + W - 2.
-        conv_weight: [3*lp, W] or [3, W, lp], fp32 conv1d weights.
+        conv_weight: [3*lp, W] or [3, W, lp], bf16 or fp32 conv1d weights.
         gate: [1, T, H, K] bf16, KDA decay gate (raw logits).
         beta: [1, T, H] bf16, write strength (raw logits), may be strided.
         out_gate: [T, H*K] bf16, output gate for RMSNorm, may be strided.
@@ -80,7 +80,7 @@ def fused_kda_decode(
         cu_seqlens: [B+1] int64, cumulative sequence lengths. For speculative
             decode every sequence spans at most S tokens (the width of
             ssm_state_indices); tokens past S are not processed.
-        norm_weight: [K] fp32, RMSNorm weight.
+        norm_weight: [K] bf16 or fp32 RMSNorm weight.
         norm_eps: float, RMSNorm epsilon.
         head_dim: int, K = V = head_dim.
         num_local_heads: int, H = num_local_heads.
@@ -132,11 +132,21 @@ def fused_kda_decode(
             )
         stride_indices_seq = ssm_state_indices.stride(0)
         stride_indices_tok = ssm_state_indices.stride(1)
+        if ssm_state_indices.shape[1] > 1 and stride_indices_tok <= 0:
+            raise ValueError(
+                "ssm_state_indices must have a positive token stride, got "
+                f"{stride_indices_tok}"
+            )
     else:
         stride_indices_seq = ssm_state_indices.stride(0)
         stride_indices_tok = 1
         # Unused off the speculative path; the pointers alias ssm_state_indices.
         stride_cidx = 1
+    if batch > 1 and stride_indices_seq <= 0:
+        raise ValueError(
+            "ssm_state_indices must have a positive sequence stride, got "
+            f"{stride_indices_seq}"
+        )
     # A single sequence only forms i_n == 0, so normalize a zero stride before
     # passing it to kernels that assume positive strides.
     if batch <= 1:
@@ -154,6 +164,10 @@ def fused_kda_decode(
         out = allocator(T, lp, dtype=torch.bfloat16, device=mixed_qkv.device)
     elif out.shape != (T, lp):
         raise ValueError(f"Expected out shape {(T, lp)}, got {tuple(out.shape)}")
+    elif out.dtype != torch.bfloat16:
+        raise ValueError(f"out must have dtype torch.bfloat16, got {out.dtype}")
+    elif out.device != mixed_qkv.device:
+        raise ValueError(f"out must be on device {mixed_qkv.device}, got {out.device}")
     elif not out.is_contiguous():
         # The kernels address out as tok * (H * V) + channel.
         raise ValueError("out must be contiguous")
@@ -194,6 +208,8 @@ def fused_kda_decode(
     # BV is a compile-time tile, so resolve it before the V % BV test below.
     parallel_cfg = None
     block_v = 0
+    min_spec_tokens = 0
+    min_batch_for_width2 = 0
     if is_spec_decoding and get_arch() == "gfx950":
         cfg = _launch_config("fused_kda_spec_parallel_v_kernel")
         # An unpublished tile drops to the generic kernel rather than raising.
@@ -207,6 +223,8 @@ def fused_kda_decode(
                 )
             parallel_cfg = cfg
             block_v = bv
+            min_spec_tokens = cfg.kwargs["MIN_SPEC_TOKENS"]
+            min_batch_for_width2 = cfg.kwargs["MIN_BATCH_FOR_WIDTH2"]
     # W == 4 is structural: the recurrence keeps exactly W - 1 = 3 conv history
     # taps in registers.
     use_parallel_spec = (
@@ -214,8 +232,7 @@ def fused_kda_decode(
         and K == 128
         and V % block_v == 0
         and W == 4
-        # Width 2 only beats the generic kernel at larger graph batches.
-        and (spec_tokens >= 3 or batch >= 16)
+        and (spec_tokens >= min_spec_tokens or batch >= min_batch_for_width2)
     )
     if use_parallel_spec:
         # cu_seqlens stays on device. A host read would sync and break CUDA
