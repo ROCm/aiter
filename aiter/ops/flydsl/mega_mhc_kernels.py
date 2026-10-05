@@ -90,26 +90,46 @@ def get_mega_mhc_config(
     return cfg
 
 
+_CAPTURE_HINT = (
+    "run one eager flydsl_mega_mhc call on the capture stream with the largest "
+    "token count and the same weights before capturing"
+)
+
+
 class _Scratch:
-    """Per-(device, stream) split-K scratch, grown on demand.
+    """Per-(device, stream) split-K scratch, grown on demand by eager calls only.
 
     Counters are zeroed once at allocation; the kernel's finisher re-arms them,
-    so CUDA-graph replays and back-to-back launches need no memset.
+    so CUDA-graph replays and back-to-back launches need no memset. Buffers
+    replaced by a larger one are retained, never freed: an earlier captured
+    graph may still launch on them.
     """
 
     def __init__(self):
         self.lock = threading.Lock()
         self.bufs = {}
+        self.retired = []
 
-    def get(self, device, stream_id, n_part_floats, n_counters):
+    def get(self, device, stream_id, n_part_floats, n_counters, capturing):
         key = (device, stream_id)
         with self.lock:
             part, cnt = self.bufs.get(key, (None, None))
-            if part is None or part.numel() < n_part_floats:
+            grow_part = part is None or part.numel() < n_part_floats
+            grow_cnt = cnt is None or cnt.numel() < n_counters
+            if (grow_part or grow_cnt) and capturing:
+                raise RuntimeError(
+                    "[flydsl_mega_mhc] split-K scratch is not allocated for this "
+                    f"stream during CUDA-graph capture: {_CAPTURE_HINT}"
+                )
+            if grow_part:
+                if part is not None:
+                    self.retired.append(part)
                 part = torch.empty(
                     max(n_part_floats, 32), dtype=torch.float32, device=device
                 )
-            if cnt is None or cnt.numel() < n_counters:
+            if grow_cnt:
+                if cnt is not None:
+                    self.retired.append(cnt)
                 cnt = torch.zeros(max(n_counters, 32), dtype=torch.int32, device=device)
             self.bufs[key] = (part, cnt)
             return part, cnt
@@ -119,18 +139,24 @@ _SCRATCH = _Scratch()
 _FN_CACHE: dict = {}
 
 
-def _prepack_fn(fn: torch.Tensor) -> torch.Tensor:
+def _prepack_fn(fn: torch.Tensor, capturing: bool) -> torch.Tensor:
     """fn (24, 4H) fp32 -> bf16 [hi, lo] in MFMA B-operand order, cached per weight tensor.
 
     Keyed on the tensor object (dropped when it is freed, so a new weight at a
     recycled address never hits a stale pack) and checked against its version
-    counter and address, so an in-place update repacks.
+    counter and address, so an in-place update repacks. Packing only runs
+    eagerly: during capture the pack would be recorded, not computed.
     """
     key = id(fn)
     hit = _FN_CACHE.get(key)
     stamp = (fn.data_ptr(), fn._version)
     if hit is not None and hit[0] == stamp:
         return hit[1]
+    if capturing:
+        raise RuntimeError(
+            "[flydsl_mega_mhc] fn is not pre-packed during CUDA-graph capture: "
+            f"{_CAPTURE_HINT}"
+        )
     hi = fn.to(torch.bfloat16)
     lo = (fn - hi.float()).to(torch.bfloat16)
     # B operands of mfma_f32_16x16x32_bf16 in register order:
@@ -186,6 +212,12 @@ def flydsl_mega_mhc(
 
     ``residual_out`` must be preallocated when ``sublayer_out`` is given; with no
     post-mix (Engram seam) the residual is returned as is and must not be passed.
+
+    CUDA graphs: before capturing, run one eager call on the capture stream with
+    the largest token count and the same ``fn`` (as serving warm-up does). A call
+    during capture that would need to pack ``fn`` or allocate split-K scratch
+    raises ``RuntimeError``, so a replay is a single kernel. ``fn`` must not be
+    updated in place after capture: the captured graph keeps the pack it saw.
     """
     from aiter.ops.flydsl.kernels.mega_mhc import (
         check_config,
@@ -273,14 +305,15 @@ def flydsl_mega_mhc(
         cfg.update(config)
         check_config(H, cfg)
 
-    fn_arg = _prepack_fn(fn) if cfg["FN_PREPACKED"] else fn
+    capturing = torch.cuda.is_current_stream_capturing()
+    fn_arg = _prepack_fn(fn, capturing) if cfg["FN_PREPACKED"] else fn
     nblk, n_wg = grid_size(T, cfg)
     ks = cfg["NUM_KSPLIT"]
     stream = torch.cuda.current_stream(device)
     if ks > 1:
         n_cnt_blk = n_wg // ks  # includes the XCD-mapping padding blocks
         partials, counters = _SCRATCH.get(
-            device, stream.stream_id, T * ks * 32, n_cnt_blk * 32
+            device, stream.stream_id, T * ks * 32, n_cnt_blk * 32, capturing
         )
     else:
         n_cnt_blk = nblk

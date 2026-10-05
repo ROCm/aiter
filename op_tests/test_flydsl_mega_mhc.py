@@ -216,11 +216,14 @@ def _traffic(T, H, mode, out_dtype):
 
 
 def _graph_err(fn, ref, out_dtype, mode):
-    """Capture the launch in a CUDA graph and replay it twice."""
-    fn()
+    """Capture the launch in a CUDA graph and replay it twice (warmed on the
+    capture stream first, as the wrapper requires)."""
+    s = torch.cuda.Stream()
+    with torch.cuda.stream(s):
+        fn()
     torch.cuda.synchronize()
     g = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g):
+    with torch.cuda.graph(g, stream=s):
         out = fn()
     errs = []
     for i in range(2):
@@ -402,6 +405,95 @@ def test_mega_mhc_streams(T, H, ksplit, coherence):
     return {"gfx": get_gfx(), "err": max(errs)}
 
 
+def _scratch_sizes(T, H, out_dtype):
+    """(partial floats, counter ints) the policy's split-K scratch needs at T."""
+    from aiter.ops.flydsl.kernels.mega_mhc import grid_size
+    from aiter.ops.flydsl.mega_mhc_kernels import get_mega_mhc_config
+
+    dev = torch.cuda.current_device()
+    cfg = get_mega_mhc_config(
+        T,
+        H,
+        get_gfx(),
+        torch.cuda.get_device_properties(dev).multi_processor_count,
+        out_dtype == "fp8",
+    )
+    _nblk, n_wg = grid_size(T, cfg)
+    ks = cfg["NUM_KSPLIT"]
+    return max(T * ks * 32, 32), max(n_wg // ks * 32, 32)
+
+
+@benchmark()
+def test_mega_mhc_capture(T_small, T_large, H, out_dtype):
+    """CUDA-graph capture safety, as serving captures many batch sizes.
+
+    cold:   capture on a fresh stream with a never-packed fn must raise (no
+            garbage pack or un-zeroed counter may be cached); if it does not,
+            an eager call right after the capture must still be correct.
+    growth: warm + capture T_small, then warm + capture T_large on the same
+            stream (the split-K scratch grows), grab freed blocks with junk,
+            make an eager call, and replay both graphs in reverse order.
+    """
+    from aiter.ops.flydsl import flydsl_mega_mhc
+
+    ret = {"gfx": get_gfx()}
+    s = torch.cuda.Stream()
+    torch.cuda.synchronize()
+
+    # cold capture
+    args, kw, ref = _call_kwargs("post", T_small, H, seed=11)
+    g = torch.cuda.CUDAGraph()
+    raised = False
+    try:
+        with torch.cuda.graph(g, stream=s):
+            flydsl_mega_mhc(*args, out_dtype=out_dtype, **kw)
+    except RuntimeError as e:
+        raised = "capture" in str(e)
+    torch.cuda.synchronize()
+    ret["cold raises"] = raised
+    with torch.cuda.stream(s):
+        out = flydsl_mega_mhc(*args, out_dtype=out_dtype, **kw)
+    torch.cuda.synchronize()
+    ret["cold eager err"] = check_outputs(
+        "capture cold eager", out, ref, out_dtype, "post"
+    )
+    if not raised:
+        _FAILURES.append("capture cold: no RuntimeError")
+
+    # growth across two captured graphs on one stream
+    s = torch.cuda.Stream()
+    cases = {T: _call_kwargs("post", T, H, seed=T) for T in (T_small, T_large)}
+    graphs, outs = {}, {}
+    for T in (T_small, T_large):
+        a, k, _ = cases[T]
+        with torch.cuda.stream(s):
+            flydsl_mega_mhc(*a, out_dtype=out_dtype, **k)  # warm on the capture stream
+        torch.cuda.synchronize()
+        graphs[T] = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graphs[T], stream=s):
+            outs[T] = flydsl_mega_mhc(*a, out_dtype=out_dtype, **k)
+        torch.cuda.synchronize()
+    # reuse any freed scratch blocks with junk, on the stream that owned them
+    n_part, n_cnt = _scratch_sizes(T_small, H, out_dtype)
+    with torch.cuda.stream(s):
+        junk = [
+            torch.full((n_part,), -7.0, dtype=torch.float32),
+            torch.full((n_cnt,), 7, dtype=torch.int32),
+        ]
+        a, k, r = cases[T_large]
+        eager = flydsl_mega_mhc(*a, out_dtype=out_dtype, **k)
+    torch.cuda.synchronize()
+    ret["eager err"] = check_outputs("capture eager", eager, r, out_dtype, "post")
+    for T in (T_large, T_small):
+        graphs[T].replay()
+        torch.cuda.synchronize()
+        ret[f"replay T={T} err"] = check_outputs(
+            f"capture replay T={T}", outs[T], cases[T][2], out_dtype, "post"
+        )
+    del junk
+    return ret
+
+
 def _legal(H, cfg):
     from aiter.ops.flydsl.kernels.mega_mhc import check_config
 
@@ -443,6 +535,13 @@ def main():
     parser.add_argument("--coherence", nargs="*", default=["auto"])
     parser.add_argument("--stream_ksplit", type=int, nargs="*", default=[1, 10])
     parser.add_argument("--stream_coherence", nargs="*", default=["xcd", "agent"])
+    parser.add_argument(
+        "--capture_tokens",
+        type=int,
+        nargs=2,
+        default=[64, 1024],
+        help="T_small T_large for the CUDA-graph capture-safety check",
+    )
     args = parser.parse_args()
 
     rows = [
@@ -505,6 +604,16 @@ def main():
     ]
     aiter.logger.info(
         "mega-mhc two-stream check (markdown):\n%s",
+        pd.DataFrame(rows).to_markdown(index=False),
+    )
+
+    t_small, t_large = args.capture_tokens
+    rows = [
+        test_mega_mhc_capture(t_small, t_large, H, d)
+        for H, d in itertools.product(args.hidden, args.out_dtype)
+    ]
+    aiter.logger.info(
+        "mega-mhc CUDA-graph capture check (markdown):\n%s",
         pd.DataFrame(rows).to_markdown(index=False),
     )
 

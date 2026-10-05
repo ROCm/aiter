@@ -952,6 +952,12 @@ def compile_mega_mhc(
                             syncscope=rocdl.SyncScope.Agent,
                             ordering=fx.AtomicOrdering.Release,
                         )
+                    else:
+                        # the splits share this XCD's L2 (L1 is write-through)
+                        fx.llvm.memory_fence(
+                            syncscope=rocdl.SyncScope.Workgroup,
+                            ordering=fx.AtomicOrdering.Release,
+                        )
                     cnt_ptr = fx.inttoptr(
                         fx.PointerType.get(T.i32, fx.AddressSpace.Global, 4),
                         buf_base_i64(counters) + fx.Int64(blk) * 128,
@@ -968,6 +974,11 @@ def compile_mega_mhc(
                     if fx.const_expr(COHERENCE == "agent"):
                         fx.llvm.memory_fence(
                             syncscope=rocdl.SyncScope.Agent,
+                            ordering=fx.AtomicOrdering.Acquire,
+                        )
+                    else:
+                        fx.llvm.memory_fence(
+                            syncscope=rocdl.SyncScope.Workgroup,
                             ordering=fx.AtomicOrdering.Acquire,
                         )
                     # thread (g, u): sums splits k = g, g + KGROUPS, ... of unit u
