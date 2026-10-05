@@ -151,8 +151,6 @@ DEFAULT_FANOUT = "peer"
 # re-arms buffer ``c + 2`` (mod 3) with the sentinel. No peer can be writing that
 # one: a peer is at most one round ahead, and that round uses ``c + 1``.
 INBOX_BUFFERS = 3
-# Inbox memory types this kernel has been validated on.
-SUPPORTED_INBOX_MEMORY = ("uncached", "finegrained")
 # The sentinel is bf16 (and fp16) NaN ``0xFFFF`` in every half-word, so an unused
 # inbox is just a ``0xFF`` memset. A sender rewrites a sentinel half-word in its
 # own payload to ``0x7FFF``, which is still NaN, so the result is unchanged.
@@ -221,10 +219,9 @@ def make_one_shot_allreduce_kernel(
         raise ValueError(f"rank must be in [0, {world_size}), got {rank}")
     if atoms not in SUPPORTED_ATOMS:
         raise ValueError(f"atoms must be one of {SUPPORTED_ATOMS}, got {atoms!r}")
-    if inbox_memory not in SUPPORTED_INBOX_MEMORY:
+    if inbox_memory not in _INBOX_POLICY:
         raise ValueError(
-            f"inbox_memory must be one of {SUPPORTED_INBOX_MEMORY}, got "
-            f"{inbox_memory!r}"
+            f"inbox_memory must be one of {tuple(_INBOX_POLICY)}, got {inbox_memory!r}"
         )
     if fanout not in FANOUT_ORDERS:
         raise ValueError(f"fanout must be one of {FANOUT_ORDERS}, got {fanout!r}")

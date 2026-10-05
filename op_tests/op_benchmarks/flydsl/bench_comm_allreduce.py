@@ -24,8 +24,8 @@ all-reduce is fastest at this shape, and what does it cost in accuracy".
 The three ``fly_*`` families are the ones with a dispatch question open: which
 of them wins is a function of payload size, and so is which variant wins inside
 each. Every ``fly_*`` key above is joined by pinned tuning rows
-(``fly_int4_ring_st16``, ``fly_1stage_b256_a4_g64``, ...) whose only purpose is to be
-swept against the auto rows. A key names a *policy*, not a binary -- the auto
+(``fly_int4_ring_b512_st16_g128``, ``fly_1stage_b256_a4_g64``, ...) whose only
+purpose is to be swept against the auto rows. A key names a *policy*, not a binary -- the auto
 rows walk a size ladder -- so the ``variant`` column and the ``kernel variants``
 table report the JIT symbol that actually ran at each shape, super-tile and
 block count included.
@@ -597,7 +597,6 @@ class Candidate:
 _FLY1S_GRID = (
     # block, atoms, grid_cap, fanout   tile
     (64, 1, 64, "peer"),  # 1 KiB
-    (64, 1, 256, "peer"),  # 1 KiB
     (128, 1, 128, "peer"),  # 2 KiB
     (256, 1, 64, "peer"),  # 4 KiB
     (256, 1, 128, "peer"),  # 4 KiB
@@ -615,14 +614,11 @@ _FLY1S_GRID = (
 )
 
 
-# Two-stage knob grids, as (block, super_tile, grid_cap). Every block the codec
-# supports, at the super-tiles each schedule's ladder uses and the cap every
-# shipped rung has.
-_FLY_MESH_GRID = tuple(
-    (block, st, 128) for block in (64, 128, 256, 512) for st in (1, 8)
-)
+# Two-stage knob grids, as (block, super_tile, grid_cap), at the super-tiles
+# each schedule's ladder uses and the cap every shipped rung has.
+_FLY_MESH_GRID = tuple((block, st, 128) for block in (256, 512) for st in (1, 8))
 _FLY_RING_GRID = tuple(
-    (block, st, 128) for block in (64, 128, 256, 512) for st in (8, 16, 32)
+    (block, st, 128) for block in (128, 256, 512) for st in (8, 16, 32)
 )
 
 
@@ -697,15 +693,6 @@ CANDIDATES = (
     Candidate("qr_int4", "qr", 14.0, False, quant="INT4"),  # 18.3 / 18.3
     Candidate("qr_int3", "qr", 8.0, False, quant="INT3"),  # 12.2 / 12.2
     Candidate("fly_int4", "fly", 15.0, False),  # 19.2 / n/a
-    # Mesh tuning rows. The mesh is the one schedule with *no* size ladder --
-    # `_Algorithm.st_ladder` is empty for it, so ST=8 (falling back to 1 when a
-    # payload has fewer than 8 tiles) runs at every size, and the default grid
-    # cap of 1216 is never revisited. These two rows are what decides whether
-    # that is right or merely untested: `st1` pins the fallback at every size,
-    # `g128` holds ST at the default and moves only the block ceiling, to the
-    # same 128 the ring's rungs use.
-    Candidate("fly_int4_st1", "fly", 15.0, False, super_tile=1),
-    Candidate("fly_int4_g128", "fly", 15.0, False, grid_cap=128),
     # Pinned mesh and ring rows: the knob grid the two-stage ladders are fitted
     # over. See _FLY_MESH_GRID / _FLY_RING_GRID.
     *_fly_grid_rows(),
@@ -730,56 +717,16 @@ CANDIDATES = (
     # Auto: no pinned super_tile, so QuickAllReduceInt4 walks RING_ST_LADDER and picks by
     # payload size at launch. This is what production gets.
     Candidate("fly_int4_ring", "fly", 14.0, False, algorithm="ring"),  # 18.7 / n/a
-    # Super-tile variants of the ring with the ladder *disabled* -- pinning
-    # super_tile fixes one value for every size. Kept as separate rows so a
-    # sweep is one bench run rather than a rebuild, and so `fly_int4_ring`
-    # (auto) can be checked against the best pinned row at each shape. ST sets how many tiles a block batches behind
-    # one publish; publishes per rank are `num_tiles / ST * 2(N-1)` and are
-    # *independent of the block count*, so ST is the only knob that reduces
-    # them -- and it pays in parallelism, because `_grid_x` derives the block
-    # count from `num_tiles / ST`. Measured on MI350P TP4 bf16 hidden 7168:
-    # ST=8 wins at 14 MiB, ST=16 is 1.24x at 56 MiB and 1.27x at 114 MiB, ST=32
-    # is slightly behind 16. Accuracy is identical at every ST.
-    #
-    # Each carries its own grid_cap because the wire buffer is
-    # `2(N-1) * grid * (ST * rank_atoms * 1152 + 64)` bytes -- ST=16 at the
-    # default cap of 1216 is ~269 MB per rank, against 28 MB at cap 128, and
-    # they measure the same (671 vs 673 us).
-    Candidate(
-        "fly_int4_ring_st8",
-        "fly",
-        14.0,
-        False,
-        algorithm="ring",
-        super_tile=8,
-        grid_cap=128,
-    ),
-    Candidate(
-        "fly_int4_ring_st16",
-        "fly",
-        14.0,
-        False,
-        algorithm="ring",
-        super_tile=16,
-        grid_cap=128,
-    ),
-    Candidate(
-        "fly_int4_ring_st32",
-        "fly",
-        14.0,
-        False,
-        algorithm="ring",
-        super_tile=32,
-        grid_cap=128,
-    ),
-    # The same two rungs with the reduce-scatter lap pinned to INT6. The rows
-    # above leave `rs_codec=None`, i.e. QuickAllReduceInt4's per-world default, which is
+    # Ring rows with the reduce-scatter lap pinned to INT6, at block 256 (the
+    # default a pinned super-tile gets). The pinned grid rows leave
+    # `rs_codec=None`, i.e. QuickAllReduceInt4's per-world default, which is
     # INT4 below TP8 and INT6 at TP8 -- so the TP4 and TP8 reports are not
     # comparing the same wire, and the TP8 ring's 21.6 dB against TP4's 18.7 is
     # a codec difference reported as a schedule difference. These rows hold the
-    # wire constant across world sizes; read them against the INT4 rows at the
-    # same ST to price what the wider RS lap costs in latency. Same 14 dB floor
-    # -- INT6 only ever lands above INT4, so it cannot be the row that trips.
+    # wire constant across world sizes; read them against
+    # `fly_int4_ring_b256_st{8,32}_g128` to price what the wider RS lap costs in
+    # latency. Same 14 dB floor -- INT6 only ever lands above INT4, so it cannot
+    # be the row that trips.
     Candidate(
         "fly_int4_ring_st8_int6",
         "fly",

@@ -78,8 +78,7 @@ class OneShotAllReduce:
     hosts and ``finegrained`` on PCIe ones from the KFD topology, because
     MI350X and MI350P both report ``gfx950`` and want opposite answers.
     One exception: at TP2 it picks ``uncached`` on PCIe too, since a single
-    remote destination cannot collapse. Coarse-grained (``"default"``) is
-    rejected: the kernel has only been validated on the other two.
+    remote destination cannot collapse.
 
     A rank never round-trips through its own inbox: its own contribution stays
     in registers. That specialises the kernel to this rank, so the JIT symbol

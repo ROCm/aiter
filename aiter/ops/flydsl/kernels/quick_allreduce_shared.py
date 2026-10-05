@@ -61,7 +61,6 @@ _CM_SC1 = 16
 # and FlyDSL folds a captured tuple into its compile-cache key but silently
 # leaves a dict out. On gfx942/gfx950 they lower to:
 #
-#   _ST_PLAIN   global_store_*
 #   _ST_NT      global_store_* ... nt
 #   _ST_SYSTEM  global_store_* ... sc0 sc1   (a relaxed system-scope atomic)
 #
@@ -87,7 +86,6 @@ _CM_SC1 = 16
 # part of the same policy because it is the other half of the same decision: the
 # more the writer is allowed to cache, the harder the reader has to work to
 # avoid a stale line.
-_ST_PLAIN = ()
 _ST_NT = (("nontemporal", True),)
 _ST_SYSTEM = (("memory_order", fx.AtomicOrdering.Monotonic),)
 _SYSTEM_SYNC_SCOPE = rocdl.SyncScope.OneAs
@@ -113,26 +111,7 @@ _INBOX_POLICY = {
         "fanout": "peer",
         "recv": _CM_NT,
     },
-    # Coarse-grained: the only mode whose pages are marked cacheable, so the
-    # only one where a peer write can actually sit in the writer's L2 and be
-    # combined with its neighbours before going out on the wire.
-    #
-    # The payload stores are plain (no `nt`) so lines stay dirty in L2;
-    # the release fence at the publish point is what puts them on the wire;
-    # the flag goes out write-through so the peer's spin sees it after the
-    # payload; and the reader must bypass both its caches (`sc0 sc1`) rather
-    # than trust `nt`, which is only a hint and can be answered from a stale
-    # line.
-    "default": {
-        "payload": _ST_PLAIN,
-        "flag": _ST_SYSTEM,
-        "release": _SYSTEM_SYNC_SCOPE,
-        "acquire": _SYSTEM_SYNC_SCOPE,
-        "fanout": "peer",
-        "recv": _CM_SC0 | _CM_SC1,
-    },
 }
-FANOUT_ORDERS = ("sector", "peer")
 
 
 def has_release_fence(inbox_memory: str) -> bool:
@@ -160,8 +139,8 @@ def _global_ptr(addr_i64, elem_ty, alignment):
 def _store_v4i32_peer(addr_i64, data, policy):
     """Store 16 B to a peer through a per-lane global address.
 
-    *policy* is the inbox's ``payload`` entry in ``_INBOX_POLICY``: plain or
-    ``nt``. Every wire offset is a multiple of 16 B, hence the alignment.
+    *policy* is the inbox's ``payload`` entry in ``_INBOX_POLICY``. Every wire
+    offset is a multiple of 16 B, hence the alignment.
     """
     fx.generic_store(_global_ptr(addr_i64, T.i32, 16), data, **dict(policy))
 
@@ -245,7 +224,7 @@ def _buffer_load(ptr, elem_off, n, dtype, cache_modifier=0):
     ``recv`` entry. ``nt`` is a reuse *hint* and does not stop the load being
     answered from the reader's own L1/L2, so it is only used where the
     policy's ``acquire`` invalidates both first (fine-grained). The uncached
-    and coarse-grained inboxes read ``_CM_SC0 | _CM_SC1``, which does bypass.
+    inbox reads ``_CM_SC0 | _CM_SC1``, which does bypass.
     """
     atom = fx.make_copy_atom(rocdl.BufferCopy(n * dtype.width, cache_modifier), dtype)
     reg = fx.make_rmem_tensor(n, dtype)
