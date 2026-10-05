@@ -93,6 +93,8 @@ python -m aiter.aot.flydsl.chunk_gdn_h --csv /path/to/tuned.csv
 
 Unified attention uses a fixed job list and does not accept `--csv`.
 
+Unified-attention AOT covers the prefill path. Decode kernels compile on first use, so a run-only deployment (`FLYDSL_RUNTIME_RUN_ONLY=1`) declines decode to the fallback.
+
 ### Environment variables
 
 | Variable | Purpose | Default |

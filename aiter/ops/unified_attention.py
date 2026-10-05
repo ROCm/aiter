@@ -24,7 +24,7 @@ def unified_attention(
     qq_bias=None,
     # Optional tensor for sinks
     sinks=None,
-    shuffled_kv_cache: bool = False,
+    shuffled_kv_cache: bool | None = None,
     skip_reduce: bool = False,
     # backend
     backend: str | None = None,  # "triton" | "gluon" | "flydsl"
@@ -33,6 +33,15 @@ def unified_attention(
         raise ValueError(
             f"Unknown backend '{backend}', must be None, 'triton', 'gluon' or 'flydsl'"
         )
+
+    # Normalize the cache layout once so every backend sees the same flag. A
+    # rank-5 cache is the shuffled layout; an explicit False contradicts it.
+    if k.dim() == 5:
+        if shuffled_kv_cache is False:
+            raise ValueError("shuffled_kv_cache=False contradicts a rank-5 KV cache")
+        shuffled_kv_cache = True
+    else:
+        shuffled_kv_cache = bool(shuffled_kv_cache)
 
     if backend in (None, "flydsl"):
         from aiter.ops.flydsl.unified_attention import unified_attention_flydsl
@@ -100,12 +109,4 @@ def unified_attention(
         skip_reduce=skip_reduce,
         backend=backend,
     )
-    if backend is None and max_seqlen_q == 1 and k.dim() == 4 and not shuffled_kv_cache:
-        import torch
-
-        # Triton yields NaN for empty KV rows; the FlyDSL path returns zero.
-        tokens = torch.arange(q.shape[0], device=q.device, dtype=cu_seqlens_q.dtype)
-        seq_ids = torch.searchsorted(cu_seqlens_q[1:], tokens, right=True)
-        empty_rows = seqused_k[seq_ids] == 0
-        out.masked_fill_(empty_rows[:, None, None], 0)
     return result

@@ -11,14 +11,15 @@ from __future__ import annotations
 
 import importlib.util
 import os
-from collections import OrderedDict
 from functools import cache, lru_cache
 
 import torch
 
 from .kernels.flash_attn_func_fp8_gfx950 import (
+    _FP8_MAX_FLAT_ELEMS,
     _fp8_auto_block_m,
     _fp8_rescale_threshold,
+    _is_valid_softmax_scale,
 )
 from .kernels.fmha_gfx950.flash_attn_fp8_gfx950 import (
     build_flash_attn_dualwave_swp_fp8_module,
@@ -83,39 +84,6 @@ def _target_num_prgms(device_index: int) -> int:
 _MAX_KV_TILES = 2048
 
 _FP8_DTYPE = torch.float8_e4m3fn
-
-# Minimum decode-half context depth (KV length) at which the mixed-batch
-# dispatch split is taken. Below this the decode half's split-K does not
-# amortize the split's two-launch + partition-sync overhead, so the split
-# regresses vs the single call; 6144 (96 pages) is the crossover.
-_SPLIT_MIN_DECODE_KV = 6144
-
-# Memoizes only DECLINES of the mixed-batch split probe, to avoid re-paying
-# _partition_mixed's host sync for a batch shape that recurs each decoder
-# layer. The asymmetry is a correctness invariant: a declined split falls
-# through to the always-correct single call, so a stale decline costs at
-# most a missed split, never a wrong result -- whereas a TAKE re-slices on
-# the probed split_point and must always re-probe. Bounded LRU; eviction
-# only forces a re-probe.
-_SPLIT_DECLINE_MEMO: OrderedDict[tuple, bool] = OrderedDict()
-_SPLIT_DECLINE_MEMO_MAX = 128
-
-
-def _split_declined_before(key) -> bool:
-    """True if this batch signature already probed and declined the split."""
-    if key in _SPLIT_DECLINE_MEMO:
-        _SPLIT_DECLINE_MEMO.move_to_end(key)
-        return True
-    return False
-
-
-def _remember_split_decline(key) -> None:
-    """Record that this batch signature's split probe declined."""
-    _SPLIT_DECLINE_MEMO[key] = True
-    _SPLIT_DECLINE_MEMO.move_to_end(key)
-    if len(_SPLIT_DECLINE_MEMO) > _SPLIT_DECLINE_MEMO_MAX:
-        _SPLIT_DECLINE_MEMO.popitem(last=False)
-
 
 # GQA group sizes routed to the packed BN64 body (group 1 packing is the identity).
 _PACKED_BN64_GROUPS = (4, 8, 16)
@@ -282,6 +250,45 @@ def _kv_strides_ok_5d(k, v, num_kv_heads, head_size) -> bool:
                 return False
             stride *= shape[dim]
     return True
+
+
+def _shapes_ok(
+    q,
+    out,
+    k,
+    v,
+    block_table,
+    cu_seqlens_q,
+    seqused_k,
+    num_kv_heads,
+    num_seqs,
+    shuffled_kv_cache,
+) -> bool:
+    """Exact shapes and devices the launcher addresses from Q alone.
+
+    The kernel derives Q/O bounds and the Dv=D128 V addressing from Q and the
+    head counts, so a smaller O or V (e.g. a column slice) must decline before
+    any reshape can silently copy it.
+    """
+    if q.dim() != 3 or out.shape != q.shape or num_kv_heads <= 0:
+        return False
+    # Q/O are flattened and the C-ABI packs the dynamic dim as signed i32.
+    if q.numel() >= _FP8_MAX_FLAT_ELEMS:
+        return False
+    if block_table.dim() != 2 or block_table.shape[0] < num_seqs:
+        return False
+    if seqused_k.numel() != num_seqs or cu_seqlens_q.numel() != num_seqs + 1:
+        return False
+    if k.shape != v.shape and not shuffled_kv_cache:
+        return False
+    if k.dim() not in (4, 5) or k.shape[0] != v.shape[0]:
+        return False
+    if not shuffled_kv_cache and k.shape[1:] != (_PAGE_SIZE, num_kv_heads, _HEAD_DIM):
+        return False
+    # The shuffled K/V shapes are checked exactly in _kv_strides_ok_5d.
+    return all(
+        t.device == q.device for t in (out, k, v, block_table, cu_seqlens_q, seqused_k)
+    )
 
 
 def _strides_ok(
@@ -460,11 +467,15 @@ def _supported(
     sinks,
     shuffled_kv_cache,
     skip_reduce,
+    softmax_scale,
 ) -> bool:
     """Whether this exact configuration can be served. Kept separate from the
     marshalling so it can be unit-tested against meta tensors, with no GPU.
     Causal and non-causal are both built, so this gate does not branch on it."""
     if not is_flydsl_available(q.device.index):
+        return False
+    # FMHA softmax masks in the unscaled domain; scale <= 0 or non-finite breaks it.
+    if softmax_scale is None or not _is_valid_softmax_scale(softmax_scale):
         return False
 
     head_size = q.shape[-1]
@@ -487,6 +498,18 @@ def _supported(
             softcap, alibi_slopes, qq_bias, q_scales, output_scale
         )
         and _sinks_ok(sinks, num_query_heads)
+        and _shapes_ok(
+            q,
+            out,
+            k,
+            v,
+            block_table,
+            cu_seqlens_q,
+            seqused_k,
+            num_kv_heads,
+            num_seqs,
+            shuffled_kv_cache,
+        )
         and _strides_ok(
             q,
             out,
@@ -505,66 +528,6 @@ def _as_i8(t: torch.Tensor) -> torch.Tensor:
     """fp8 buffers are passed to flydsl as int8 views (the kernel builds i8-typed
     descriptors so DMA and register loads share one byte view)."""
     return t.view(torch.int8) if t.dtype == _FP8_DTYPE else t
-
-
-def _partition_mixed(cu_seqlens_q, seqused_k, num_seqs):
-    """Partition a mixed batch into a contiguous prefill block and a contiguous
-    decode block, or return None when the layout isn't a clean two-block split.
-
-    A mixed batch is independent sequences, but the single launch below picks one
-    ``num_kv_splits`` for all of them -- wrong for one half. This finds the split
-    so each half can run on its own optimal path. Returns None (caller runs the
-    single unified call, still correct) unless every prefill seq (query_len > 1)
-    forms one contiguous run and every decode seq (query_len == 1) forms another,
-    both non-empty. Only that shape lets each half be a zero-copy view slice of
-    q/out. Interleaved layouts decline here and fall through to the single call.
-
-    On success returns (split_point, prefill_first, n_pre, n_dec, pre_max_q,
-    dec_max_kv):
-      split_point   -- seq index where the second block begins
-      prefill_first -- True if prefills lead, False if decodes lead
-      n_pre, n_dec  -- sequence counts per block (both > 0)
-      pre_max_q     -- max query_len over the prefill block (grid.y for the 2d call)
-      dec_max_kv    -- max KV length over the decode block; the caller gates the
-                       split on this (shallow decodes don't amortize split-K)
-    Costs one device->host sync (all scalars pulled in a single transfer).
-    """
-    seqlens_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]  # [num_seqs], device
-    is_dec = seqlens_q == 1
-    n_dec_t = is_dec.sum()
-    di = is_dec.to(torch.int32)
-    # Clean two-block <=> is_dec is monotonic: all-False-then-True (prefill-first)
-    # or all-True-then-False (decode-first). Both non-empty => exactly one holds.
-    asc = torch.all(di[1:] >= di[:-1])
-    desc = torch.all(di[1:] <= di[:-1])
-    pre_max_q_t = torch.where(is_dec, torch.zeros_like(seqlens_q), seqlens_q).max()
-    # Max KV depth over the decode seqs only (prefill KV is larger but irrelevant
-    # to whether the decode half wants split-K).
-    dec_max_kv_t = torch.where(is_dec, seqused_k, torch.zeros_like(seqused_k)).max()
-    stats = torch.stack(
-        [
-            n_dec_t.to(torch.int64),
-            asc.to(torch.int64),
-            desc.to(torch.int64),
-            pre_max_q_t.to(torch.int64),
-            dec_max_kv_t.to(torch.int64),
-        ]
-    ).tolist()
-    n_dec, asc_b, desc_b, pre_max_q, dec_max_kv = (
-        stats[0],
-        bool(stats[1]),
-        bool(stats[2]),
-        stats[3],
-        stats[4],
-    )
-    n_pre = num_seqs - n_dec
-    if n_pre == 0 or n_dec == 0:
-        return None  # pure prefill or pure decode: nothing to split
-    if asc_b:
-        return (n_pre, True, n_pre, n_dec, pre_max_q, dec_max_kv)
-    if desc_b:
-        return (n_dec, False, n_pre, n_dec, pre_max_q, dec_max_kv)
-    return None  # interleaved: decline (single call stays correct)
 
 
 def flydsl_unified_attention(
@@ -596,7 +559,6 @@ def flydsl_unified_attention(
     sinks=None,
     shuffled_kv_cache=False,
     skip_reduce=False,
-    _from_split=False,
 ):
     """Run unified attention on the FlyDSL fp8 gfx950 kernel.
 
@@ -607,7 +569,7 @@ def flydsl_unified_attention(
     Returns ``out`` (written in place) if this configuration is supported, or
     ``None`` so the caller falls back to the Triton-wrapper path (Gluon on gfx950; real Triton only if Gluon is unsupported, e.g. softcap, alibi, qq_bias).
     """
-    # Widen 0-dim scalar descales to [1] before the gate, the recursion, and the
+    # Widen 0-dim scalar descales to [1] before the gate and the
     # kernel see them (vLLM passes per-tensor descales as scalars; FlyDSL's
     # from_dlpack rejects a shape-() tensor). A view, not a copy.
     q_descale = _as_1d_descale(q_descale)
@@ -639,120 +601,46 @@ def flydsl_unified_attention(
         sinks,
         shuffled_kv_cache,
         skip_reduce,
+        softmax_scale,
     ):
         return None
 
-    if _pa_decode_ok(
-        max_seqlen_q, num_queries_per_kv, sinks, shuffled_kv_cache, out, num_seqs
-    ):
-        return _route_pa_decode(
-            q,
-            k,
-            v,
-            out,
-            seqused_k,
-            max_seqlen_k,
-            softmax_scale,
-            block_table,
-            q_descale,
-            k_descale,
-            v_descale,
-            num_kv_heads=num_kv_heads,
-            num_seqs=num_seqs,
-            sinks=sinks,
-        )
-
-    # Decode cannot use the single-pass prefill body without wasting its M tile.
-    # The caller owns fallback (or explicit-backend rejection), including recursion.
     if max_seqlen_q == 1:
+        # Decode kernels are not AOT-compiled; decline so run-only deployments fall back.
+        if os.environ.get("FLYDSL_RUNTIME_RUN_ONLY", "").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            return None
+        if _pa_decode_ok(
+            max_seqlen_q, num_queries_per_kv, sinks, shuffled_kv_cache, out, num_seqs
+        ):
+            return _route_pa_decode(
+                q,
+                k,
+                v,
+                out,
+                seqused_k,
+                max_seqlen_k,
+                softmax_scale,
+                block_table,
+                q_descale,
+                k_descale,
+                v_descale,
+                num_kv_heads=num_kv_heads,
+                num_seqs=num_seqs,
+                sinks=sinks,
+            )
+        # Linear-cache decode has no FlyDSL kernel.
         return None
 
-    # Clean two-block mixed batches can use separate prefill and pa_decode calls.
-    # Keep the measured depth threshold and decline memo until perf re-measure.
-    if max_seqlen_q > 1 and num_seqs > 1 and max_seqlen_k >= _SPLIT_MIN_DECODE_KV:
-        memo_key = (
-            cu_seqlens_q.data_ptr(),
-            seqused_k.data_ptr(),
-            num_seqs,
-            q.shape[0],
-            max_seqlen_q,
-            max_seqlen_k,
-        )
-        part = None
-        if not _split_declined_before(memo_key):
-            part = _partition_mixed(cu_seqlens_q, seqused_k, num_seqs)
-            if part is not None and part[5] < _SPLIT_MIN_DECODE_KV:
-                # Clean two-block batch whose decode half is too shallow to
-                # amortize the split -- the residual case. Record it so the
-                # recurrence on later layers skips the probe. part is None
-                # (interleaved, or a pure prefill/decode sub-batch of a taken
-                # split) is left unmemoized: its key can be an ephemeral sliced
-                # tensor, and re-probing it is both correct and the pre-existing
-                # behavior.
-                _remember_split_decline(memo_key)
-        if part is not None and part[5] >= _SPLIT_MIN_DECODE_KV:
-            split_point, prefill_first, n_pre, n_dec, pre_max_q, dec_max_kv = part
-            row_split = int(cu_seqlens_q[split_point])
-            total_q = q.shape[0]
-            if prefill_first:
-                pre_rows, dec_rows = (0, row_split), (row_split, total_q)
-                pre_seqs, dec_seqs = (0, split_point), (split_point, num_seqs)
-            else:
-                dec_rows, pre_rows = (0, row_split), (row_split, total_q)
-                dec_seqs, pre_seqs = (0, split_point), (split_point, num_seqs)
-
-            def _sub(rows, seqs, n_sub, max_q_sub, max_kv_sub):
-                r0, r1 = rows
-                s0, s1 = seqs
-                return flydsl_unified_attention(
-                    q[r0:r1],
-                    k,
-                    v,
-                    out[r0:r1],
-                    cu_seqlens_q[s0 : s1 + 1] - cu_seqlens_q[s0],
-                    max_q_sub,
-                    seqused_k[s0:s1],
-                    max_kv_sub,
-                    softmax_scale,
-                    causal,
-                    window_size,
-                    block_table[s0:s1],
-                    softcap,
-                    q_descale,
-                    k_descale,
-                    v_descale,
-                    num_kv_heads=num_kv_heads,
-                    block_size=block_size,
-                    num_queries_per_kv=num_queries_per_kv,
-                    num_seqs=n_sub,
-                    q_scales=q_scales,
-                    alibi_slopes=alibi_slopes,
-                    output_scale=output_scale,
-                    qq_bias=qq_bias,
-                    sinks=sinks,
-                    shuffled_kv_cache=shuffled_kv_cache,
-                    skip_reduce=skip_reduce,
-                    _from_split=True,
-                )
-
-            # Prefill first. A small multi-chunk prefill half can underfill and
-            # decline (return None from the tier-selection guard below); the split
-            # has no wrapper fall-through, only the external caller does, so cede the
-            # whole batch to the Triton-wrapper path rather than leaving its rows unwritten. The decode
-            # half has max_q == 1 and never declines today, but a future cede or a
-            # _supported failure on the sliced views could return None too -- if so,
-            # its rows would be left unwritten while this function still returns
-            # `out`, so check it the same way as the prefill half rather than
-            # dropping the return value.
-            if (
-                _sub(pre_rows, pre_seqs, n_pre, pre_max_q, max_seqlen_k) is None
-            ):  # prefill -> single-pass 2d
-                return None
-            if (
-                _sub(dec_rows, dec_seqs, n_dec, 1, dec_max_kv) is None
-            ):  # decode -> pa_decode
-                return None
-            return out
+    # One query-length-1 row caps M at (B-1)*S+1, so a larger M has no decode rows.
+    # Possibly mixed: BN64 pads decode rows to full tiles, slower than the fallback.
+    # Non-causal has no fallback, so it stays on FlyDSL.
+    if causal and not (num_seqs == 1 or q.shape[0] > (num_seqs - 1) * max_seqlen_q + 1):
+        return None
 
     num_query_heads = q.shape[1]
     out_dtype_str = "f16" if out.dtype == torch.float16 else "bf16"
@@ -784,12 +672,16 @@ def flydsl_unified_attention(
             block_m,
             packed_bn64=packed_bn64,
         )
+        q_flat, out_flat = _as_i8(q).reshape(-1), out.reshape(-1)
+        # _supported guarantees views; a copy would write the caller's out blindly.
+        assert q_flat.data_ptr() == q.data_ptr()
+        assert out_flat.data_ptr() == out.data_ptr()
         kernel(
-            _as_i8(q).reshape(-1),
+            q_flat,
             # Rank two avoids the C-ABI signed-i32 flat-pool shape overflow.
             _as_i8(k).reshape(k.shape[0], -1),
             _as_i8(v).reshape(v.shape[0], -1),
-            out.reshape(-1),
+            out_flat,
             num_seqs,
             int(max_seqlen_q),
             num_kv_heads * _HEAD_DIM,

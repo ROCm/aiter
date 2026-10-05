@@ -284,7 +284,6 @@ def measure(candidates, case, want, query_lens, kv_lens, atol=None, bad_rows=Fal
 
 PA_DECODE_CASES = {
     "pure": ([1] * 8, [64, 700, 4096, 65, 8192, 1, 3000, 256]),
-    "mixed": ([512] + [1] * 8, [16384, 4096, 8192, 1024, 6000, 300, 12000, 2048, 512]),
     "ragged": ([1] * 16, [30000] + [37 + 11 * i for i in range(15)]),
     # NP hits the 32 cap: one 16384-token seq, 3*256/4 = 192 fit -> cap 32
     "cap": ([1], [16384]),
@@ -433,7 +432,9 @@ def test_prefill(dtype, causal):
 @benchmark()
 def test_decode(dtype, depth, layout):
     query_lens = [1] * 8
-    kv_lens = [depth, max(1, depth // 2 + 3), depth, 65, depth, 1, depth, 0]
+    # Only the FlyDSL layout defines empty-KV output (zero); the Triton fallback gives NaN.
+    empty_kv = 0 if layout == "vectorized" else 1
+    kv_lens = [depth, max(1, depth // 2 + 3), depth, 65, depth, 1, depth, empty_kv]
     case = make_case(query_lens, kv_lens, dtype)
     want = reference(case, query_lens, kv_lens)
     if layout == "vectorized":
@@ -443,7 +444,8 @@ def test_decode(dtype, depth, layout):
     name = "flydsl" if layout == "vectorized" else "triton_fallback"
     candidates = {name: partial(ua.unified_attention, **case, backend=backend)}
     ret = measure(candidates, case, want, query_lens, kv_lens)
-    compare(torch.zeros_like(want[-1]), case["out"][-1], 0, "empty KV")
+    if layout == "vectorized":
+        compare(torch.zeros_like(want[-1]), case["out"][-1], 0, "empty KV")
     if layout == "linear":
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
@@ -451,7 +453,6 @@ def test_decode(dtype, depth, layout):
         case["out"].fill_(float("nan"))
         graph.replay()
         compare(want, case["out"], 0.08 * want.abs().max().item(), "decode graph")
-        compare(torch.zeros_like(want[-1]), case["out"][-1], 0, "empty KV graph")
     return ret
 
 
@@ -461,14 +462,17 @@ SMALL_SQ_CASES = {
     for sq in (1, 64, 128, 320)
     for kv in (2048, 8192)
 }
-# Mixed lengths: one varlen batch with decode-like, tiny and mid-size rows.
-SMALL_SQ_CASES["varlen"] = ([7, 64, 200, 320], [2048, 5000, 8192, 3000])
+# Ragged pure prefill: M=970 > (B-1)*S+1=961, so no row can have query length 1.
+SMALL_SQ_CASES["varlen"] = ([320, 300, 200, 150], [2048, 5000, 8192, 3000])
+# Possibly mixed (M=591 <= 961): causal declines to the fallback, non-causal stays on FlyDSL.
+SMALL_SQ_CASES["varlen_mixed"] = ([7, 64, 200, 320], [2048, 5000, 8192, 3000])
 
 
 @benchmark()
 def test_small_sq_causal_prefill(kind, layout):
     """Small-Sq causal prefill is never declined for underfill: FlyDSL must
-    handle the call itself (non-None) and match the reference. Sq=1 on the
+    handle the call itself (non-None) and match the reference. The possibly-mixed
+    case is causal-declined and checked non-causal. Sq=1 on the
     linear layout is a linear decode, which FlyDSL declines by design, so it is
     skipped there; on the shuffled layout it routes to pa_decode."""
     import aiter.ops.flydsl.unified_attention_kernels as adapter
@@ -476,19 +480,25 @@ def test_small_sq_causal_prefill(kind, layout):
     query_lens, kv_lens = SMALL_SQ_CASES[kind]
     if layout == "linear" and max(query_lens) == 1:
         return {"skipped": "linear decode is declined by design"}
-    case = make_case(query_lens, kv_lens, dtypes.bf16)
+    mixed = kind == "varlen_mixed"
+    case = make_case(query_lens, kv_lens, dtypes.bf16, causal=not mixed)
     want = reference(case, query_lens, kv_lens)
     shuffled = layout == "shuffled"
     if shuffled:
         case["k"], case["v"] = shuffle_kv(case["k"], case["v"])
-    got = adapter.flydsl_unified_attention(
-        **case,
+    route = partial(
+        adapter.flydsl_unified_attention,
         num_kv_heads=HKV,
         block_size=PAGE,
         num_queries_per_kv=H // HKV,
         num_seqs=len(kv_lens),
         shuffled_kv_cache=shuffled,
     )
+    if mixed:
+        # A causal batch that is not provably prefill must decline.
+        declined = route(**{**case, "causal": True})
+        assert declined is None, f"{kind}/{layout}: causal mixed batch not declined"
+    got = route(**case)
     assert got is not None, f"{kind}/{layout}: FlyDSL declined small-Sq causal prefill"
     compare(want, got, 0.08 * want.abs().max().item(), f"{kind}/{layout}")
     return {"kind": kind, "layout": layout}
@@ -651,6 +661,15 @@ def test_warm_cache_run_only(path):
         case["out"].fill_(float("nan"))
         # Missing artifacts must raise rather than quietly compile a replacement.
         with run_only_env():
+            if path == "decode":
+                # Decode kernels are not AOT-compiled, so run-only declines them.
+                try:
+                    call()
+                except RuntimeError as exc:
+                    assert "does not support this configuration" in str(exc)
+                else:
+                    raise AssertionError("run-only decode was not declined")
+                return {"path": path, "declined": True}
             return measure({"warm_run_only": call}, case, want, query_lens, kv_lens)
 
 
