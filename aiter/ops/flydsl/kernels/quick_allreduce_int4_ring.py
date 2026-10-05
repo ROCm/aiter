@@ -90,25 +90,24 @@ from .quick_allreduce_shared import (
 # Pin ``grid_cap`` alongside ``super_tile``.
 RING_SUPER_TILES = (1, 8, 16, 32)
 
-# Payload-size ladder: ``(min_bytes, super_tile, grid_cap, block, skip_self)``,
-# ascending, per ``(link, world_size)``. ``skip_self`` is always False: the ring never
-# round-trips through its own inbox.
+# Payload-size ladder: ``(min_bytes, super_tile, grid_cap, block)``, ascending,
+# per ``(link, world_size)``.
 _RING_DEFAULT = {
-    2: ((0, 8, 128, BLOCK, False), (24 << 20, 16, 128, BLOCK, False)),
+    2: ((0, 8, 128, BLOCK), (24 << 20, 16, 128, BLOCK)),
     4: (
-        (0, 8, 128, BLOCK, False),
-        (24 << 20, 16, 128, BLOCK, False),
-        (48 << 20, 32, 128, BLOCK, False),
+        (0, 8, 128, BLOCK),
+        (24 << 20, 16, 128, BLOCK),
+        (48 << 20, 32, 128, BLOCK),
     ),
-    8: ((0, 16, 128, BLOCK, False), (48 << 20, 32, 128, BLOCK, False)),
+    8: ((0, 16, 128, BLOCK), (48 << 20, 32, 128, BLOCK)),
 }
 
-# ``(min_bytes, super_tile, grid_cap, block, skip_self)``
+# ``(min_bytes, super_tile, grid_cap, block)``
 RING_ST_LADDER = {
     **{("xgmi", ws): rungs for ws, rungs in _RING_DEFAULT.items()},
-    ("pcie", 2): ((0, 16, 128, 512, False),),
-    ("pcie", 4): ((0, 32, 128, 512, False),),
-    ("pcie", 8): ((0, 32, 128, 512, False),),
+    ("pcie", 2): ((0, 16, 128, 512),),
+    ("pcie", 4): ((0, 32, 128, 512),),
+    ("pcie", 8): ((0, 32, 128, 512),),
 }
 
 
@@ -724,5 +723,4 @@ def make_quick_allreduce_int4_ring_kernel(
         "steps": steps,
         "grid": grid,
         "block": block,
-        "skip_self": False,
     }

@@ -9,8 +9,8 @@ it walks ``ONESHOT_LADDER`` and picks a rung by payload size -- on payloads
 derived from ``allreduce_policy``: at every world size, both ends of each
 rung's slice of the window the policy routes to the one-shot. Next to it, a
 few spot checks run pinned configurations no shipped rung uses, one world size
-each. ``--atoms``, ``--grid-cap``, ``--fanout``, ``--block`` or ``--skip-self``
-pin a configuration instead.
+each. ``--atoms``, ``--grid-cap``, ``--fanout`` or ``--block`` pin a
+configuration instead.
 
 ``test_one_shot_allreduce`` checks three things per shape, and the second
 matters more than the first:
@@ -123,7 +123,6 @@ SPOT_CONFIGS = (
             "grid_cap": 64,
             "fanout": "peer",
             "block": 512,
-            "skip_self": False,
         },
     ),
     (
@@ -133,7 +132,6 @@ SPOT_CONFIGS = (
             "grid_cap": 64,
             "fanout": "peer",
             "block": 512,
-            "skip_self": True,
         },
     ),
     (
@@ -143,7 +141,6 @@ SPOT_CONFIGS = (
             "grid_cap": 64,
             "fanout": "peer",
             "block": 256,
-            "skip_self": False,
         },
     ),
 )
@@ -442,17 +439,16 @@ _FAILURES: list[str] = []
 # Tuning knobs the command line can pin. They are test-function arguments, so
 # they select the engine, but not table columns: the ``variant`` column names
 # the binary that actually ran, which is what a pinned knob changes.
-KNOBS = ("atoms", "grid_cap", "fanout", "block", "skip_self")
+KNOBS = ("atoms", "grid_cap", "fanout", "block")
 
 
-def _engine_kw(atoms, grid_cap, fanout, block, skip_self) -> dict:
+def _engine_kw(atoms, grid_cap, fanout, block) -> dict:
     """OneShotAllReduce kwargs for the knobs that are pinned (not None)."""
     kw = {
         "atoms": atoms,
         "grid_cap": grid_cap,
         "fanout": fanout,
         "block": block,
-        "skip_self": skip_self,
     }
     return {k: v for k, v in kw.items() if v is not None}
 
@@ -485,9 +481,8 @@ def test_one_shot_allreduce(
     grid_cap=None,
     fanout=None,
     block=None,
-    skip_self=None,
 ):
-    engine_kw = _engine_kw(atoms, grid_cap, fanout, block, skip_self)
+    engine_kw = _engine_kw(atoms, grid_cap, fanout, block)
     key = _key(tp, engine_kw)
     i = _CASES[key].index((tokens, hidden, graph))
     rows = [r["rows"][i] for r in _ranks(key)]
@@ -530,9 +525,8 @@ def test_one_shot_allreduce_run_ahead(
     grid_cap=None,
     fanout=None,
     block=None,
-    skip_self=None,
 ):
-    engine_kw = _engine_kw(atoms, grid_cap, fanout, block, skip_self)
+    engine_kw = _engine_kw(atoms, grid_cap, fanout, block)
     runs = [r["run_ahead"] for r in _ranks(_key(tp, engine_kw))]
     _check(
         f"tp={tp} run-ahead {engine_kw}",
@@ -557,9 +551,8 @@ def test_one_shot_allreduce_fresh_inputs(
     grid_cap=None,
     fanout=None,
     block=None,
-    skip_self=None,
 ):
-    engine_kw = _engine_kw(atoms, grid_cap, fanout, block, skip_self)
+    engine_kw = _engine_kw(atoms, grid_cap, fanout, block)
     runs = [r["fresh"] for r in _ranks(_key(tp, engine_kw))]
     _check(
         f"tp={tp} fresh inputs {engine_kw}",
@@ -660,14 +653,6 @@ def main():
         choices=(*SUPPORTED_BLOCKS, None),
     )
     parser.add_argument(
-        "--skip-self",
-        type=int,
-        nargs="*",
-        default=[None],
-        choices=(0, 1, None),
-        help="Pin skip_self off (0) or on (1).",
-    )
-    parser.add_argument(
         "--extended",
         action="store_true",
         help="Run the spot-check configurations at every world size, and the\n"
@@ -697,10 +682,9 @@ def main():
             "grid_cap": grid_cap,
             "fanout": fanout,
             "block": block,
-            "skip_self": None if skip_self is None else bool(skip_self),
         }
-        for atoms, grid_cap, fanout, block, skip_self in itertools.product(
-            args.atoms, args.grid_cap, args.fanout, args.block, args.skip_self
+        for atoms, grid_cap, fanout, block in itertools.product(
+            args.atoms, args.grid_cap, args.fanout, args.block
         )
     ]
     ladder = configs == [dict.fromkeys(KNOBS)]
