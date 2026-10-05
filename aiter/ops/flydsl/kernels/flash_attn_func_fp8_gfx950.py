@@ -242,6 +242,10 @@ def _build_fp8(
     batch_interleave_group: int = 1,
     return_lse: bool = False,
     out_dtype: str = "bf16",
+    paged: bool = False,
+    kv_cache_layout: str = "linear",
+    body_variant: str = "default",
+    gqa_pack_m: bool = False,
 ):
     """Build (and cache) the gfx950 fp8 launcher (dense, packed varlen, or split-K)."""
     from aiter.ops.flydsl.kernels.fmha_gfx950.flash_attn_fp8_gfx950 import (
@@ -266,6 +270,10 @@ def _build_fp8(
         batch_interleave_group=batch_interleave_group,
         return_lse=return_lse,
         out_dtype=out_dtype,
+        paged=paged,
+        kv_cache_layout=kv_cache_layout,
+        body_variant=body_variant,
+        gqa_pack_m=gqa_pack_m,
     )
 
 

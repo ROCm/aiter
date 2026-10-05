@@ -175,6 +175,7 @@ def reference(case, query_lens, kv_lens):
         k_descale=case["k_descale"],
         v_descale=case["v_descale"],
         causal=case["causal"],
+        sinks=case.get("sinks"),
         soft_cap=case["softcap"],
         sliding_window=(
             None if case["window_size"][0] < 0 else case["window_size"][0] + 1
@@ -189,50 +190,48 @@ def shuffle_kv(k, v):
     return k.permute(0, 1, 2, 4, 3).contiguous(), v.permute(0, 1, 3, 2, 4).contiguous()
 
 
-def direct_candidate(case, kv_lens, splits=1, packed=False):
-    from aiter.ops.flydsl.kernels.flash_attn_dualwave_common import (
-        dualwave_splitk_workspace_elems,
+def direct_candidate(case, kv_lens):
+    from aiter.ops.flydsl.kernels.flash_attn_func_fp8_gfx950 import (
+        _fp8_auto_block_m,
+        _fp8_rescale_threshold,
     )
-    from aiter.ops.flydsl.kernels.flash_attn_fp8_gfx950 import (
-        build_flash_attn_dualwave_swp_fp8_module,
+    from aiter.ops.flydsl.unified_attention_kernels import (
+        _PACKED_BN64_GROUPS,
+        _as_i8,
+        _get_kernel,
     )
 
-    mod = build_flash_attn_dualwave_swp_fp8_module(
-        num_heads=H,
-        head_dim=D,
-        causal=case["causal"],
-        dtype_str="fp8",
-        out_dtype_str="bf16" if case["out"].dtype == dtypes.bf16 else "f16",
-        num_kv_heads=HKV,
-        paged=True,
-        varlen=True,
-        num_kv_splits=splits,
-        gqa_pack_m=packed,
-        kv_cache_layout="vectorized" if case["k"].ndim == 5 else "linear",
-    )
     b, max_q = len(kv_lens), case["max_seqlen_q"]
-    cu_kv = torch.tensor(
-        [0] + list(itertools.accumulate(kv_lens)), device="cuda", dtype=torch.int32
+    block_m = _fp8_auto_block_m(b, H, max_q, max(kv_lens), 256)
+    # Mirror the router: GQA groups 4/8/16 take the packed BN64 body (block_m=128).
+    packed_bn64 = H // HKV in _PACKED_BN64_GROUPS
+    if packed_bn64:
+        block_m = 128
+    mod = _get_kernel(
+        H,
+        HKV,
+        bool(case["causal"]),
+        "bf16" if case["out"].dtype == dtypes.bf16 else "f16",
+        case["k"].ndim == 5,
+        _fp8_rescale_threshold(max(kv_lens)),
+        block_m,
+        packed_bn64=packed_bn64,
     )
-    ws = None
-    if splits > 1:
-        ws = torch.zeros(
-            dualwave_splitk_workspace_elems(b, H, max_q, splits, D),
-            device="cuda",
-            dtype=dtypes.fp32,
-        )
 
     def launch():
         mod(
-            case["q"].reshape(-1),
-            case["k"].reshape(-1),
-            case["v"].reshape(-1),
+            _as_i8(case["q"]).reshape(-1),
+            _as_i8(case["k"]).reshape(case["k"].shape[0], -1),
+            _as_i8(case["v"]).reshape(case["v"].shape[0], -1),
             case["out"].reshape(-1),
             b,
             max_q,
-            workspace=ws,
+            HKV * D,
+            case["q"].stride(0),
+            softmax_scale=case["softmax_scale"],
+            seq_len_kv=max(kv_lens),
             cu_seqlens_q=case["cu_seqlens_q"],
-            cu_seqlens_kv=cu_kv,
+            cu_seqlens_kv=case["seqused_k"],
             block_table=case["block_table"].reshape(-1),
             block_table_stride=case["block_table"].stride(0),
             q_descale=case["q_descale"],
@@ -285,7 +284,7 @@ def measure(candidates, case, want, query_lens, kv_lens, atol=None, bad_rows=Fal
 
 PA_DECODE_CASES = {
     "pure": ([1] * 8, [64, 700, 4096, 65, 8192, 1, 3000, 256]),
-    "mixed": ([128] + [1] * 8, [16384, 4096, 8192, 1024, 6000, 300, 12000, 2048, 512]),
+    "mixed": ([512] + [1] * 8, [16384, 4096, 8192, 1024, 6000, 300, 12000, 2048, 512]),
     "ragged": ([1] * 16, [30000] + [37 + 11 * i for i in range(15)]),
     # NP hits the 32 cap: one 16384-token seq, 3*256/4 = 192 fit -> cap 32
     "cap": ([1], [16384]),
@@ -293,7 +292,7 @@ PA_DECODE_CASES = {
 
 
 @benchmark()
-def test_pa_decode_route(kind):
+def test_pa_decode_route(kind, gqa=16):
     """Decode rows on the shuffled cache must reach FlyDSL pa_decode (static NP)
     and match the reference. Block 16 is not exercised: the dispatcher's page
     gate is 64 only."""
@@ -301,6 +300,8 @@ def test_pa_decode_route(kind):
 
     query_lens, kv_lens = PA_DECODE_CASES[kind]
     case = make_case(query_lens, kv_lens, dtypes.bf16, seed=11)
+    case["q"] = case["q"][:, : HKV * gqa].clone(memory_format=torch.contiguous_format)
+    case["out"] = torch.empty_like(case["q"], dtype=dtypes.bf16)
     want = reference(case, query_lens, kv_lens)
     case["k"], case["v"] = shuffle_kv(case["k"], case["v"])
     call = partial(
@@ -437,46 +438,86 @@ def test_decode(dtype, depth, layout):
     want = reference(case, query_lens, kv_lens)
     if layout == "vectorized":
         case["k"], case["v"] = shuffle_kv(case["k"], case["v"])
-    candidates = {"flydsl": partial(ua.unified_attention, **case, backend="flydsl")}
+    case["shuffled_kv_cache"] = layout == "vectorized"
+    backend = "flydsl" if layout == "vectorized" else None
+    name = "flydsl" if layout == "vectorized" else "triton_fallback"
+    candidates = {name: partial(ua.unified_attention, **case, backend=backend)}
     ret = measure(candidates, case, want, query_lens, kv_lens)
     compare(torch.zeros_like(want[-1]), case["out"][-1], 0, "empty KV")
+    if layout == "linear":
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            candidates[name]()
+        case["out"].fill_(float("nan"))
+        graph.replay()
+        compare(want, case["out"], 0.08 * want.abs().max().item(), "decode graph")
+        compare(torch.zeros_like(want[-1]), case["out"][-1], 0, "empty KV graph")
     return ret
+
+
+SMALL_SQ_CASES = {
+    f"b{b}_sq{sq}_kv{kv}": ([sq] * b, [kv] * b)
+    for b in (1, 2, 4)
+    for sq in (1, 64, 128, 320)
+    for kv in (2048, 8192)
+}
+# Mixed lengths: one varlen batch with decode-like, tiny and mid-size rows.
+SMALL_SQ_CASES["varlen"] = ([7, 64, 200, 320], [2048, 5000, 8192, 3000])
 
 
 @benchmark()
-def test_mixed_batch(causal, splits):
-    query_lens = [128] + [1] * 8
-    kv_lens = [16384, 4096, 8192, 1024, 6000, 300, 12000, 2048, 512]
-    case = make_case(query_lens, kv_lens, dtypes.bf16, causal)
+def test_small_sq_causal_prefill(kind, layout):
+    """Small-Sq causal prefill is never declined for underfill: FlyDSL must
+    handle the call itself (non-None) and match the reference. Sq=1 on the
+    linear layout is a linear decode, which FlyDSL declines by design, so it is
+    skipped there; on the shuffled layout it routes to pa_decode."""
+    import aiter.ops.flydsl.unified_attention_kernels as adapter
+
+    query_lens, kv_lens = SMALL_SQ_CASES[kind]
+    if layout == "linear" and max(query_lens) == 1:
+        return {"skipped": "linear decode is declined by design"}
+    case = make_case(query_lens, kv_lens, dtypes.bf16)
     want = reference(case, query_lens, kv_lens)
-    storage = torch.full(
-        (sum(query_lens) + 64, H, D), float("nan"), device="cuda", dtype=dtypes.bf16
+    shuffled = layout == "shuffled"
+    if shuffled:
+        case["k"], case["v"] = shuffle_kv(case["k"], case["v"])
+    got = adapter.flydsl_unified_attention(
+        **case,
+        num_kv_heads=HKV,
+        block_size=PAGE,
+        num_queries_per_kv=H // HKV,
+        num_seqs=len(kv_lens),
+        shuffled_kv_cache=shuffled,
     )
-    case["out"] = storage[: sum(query_lens)]
-    candidates = {"packed_splitk": direct_candidate(case, kv_lens, splits, packed=True)}
-    ret = measure(candidates, case, want, query_lens, kv_lens, atol=0.1, bad_rows=True)
-    assert torch.isnan(
-        storage[sum(query_lens) :]
-    ).all(), "combine wrote beyond packed output"
-    return ret
+    assert got is not None, f"{kind}/{layout}: FlyDSL declined small-Sq causal prefill"
+    compare(want, got, 0.08 * want.abs().max().item(), f"{kind}/{layout}")
+    return {"kind": kind, "layout": layout}
+
+
+@benchmark()
+def test_small_sq_causal_graph():
+    """Small-Sq causal prefill has no host sync, so it captures and replays."""
+    query_lens, kv_lens = [64, 64], [2048, 2048]
+    case = make_case(query_lens, kv_lens, dtypes.bf16)
+    want = reference(case, query_lens, kv_lens)
+    call = partial(ua.unified_attention, **case, backend=None)
+    call()  # compile outside capture
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        call()
+    case["out"].fill_(float("nan"))
+    graph.replay()
+    compare(want, case["out"], 0.08 * want.abs().max().item(), "small-Sq graph")
+    return {"graph": "ok"}
 
 
 @benchmark()
 def test_cross_attention_mask(query_len, kv_len):
     case = make_case([query_len], [kv_len], dtypes.bf16)
     want = reference(case, [query_len], [kv_len])
-    candidates = {"flydsl": partial(ua.unified_attention, **case, backend="flydsl")}
+    candidates = {"direct_prefill": direct_candidate(case, [kv_len])}
     return measure(candidates, case, want, [query_len], [kv_len], atol=0.1)
-
-
-@benchmark()
-def test_splitk_combine(seq_len, splits):
-    case = make_case([seq_len], [seq_len], dtypes.bf16, causal=False)
-    want = reference(case, [seq_len], [seq_len])
-    candidates = {"splitk": direct_candidate(case, [seq_len], splits)}
-    return measure(
-        candidates, case, want, [seq_len], [seq_len], atol=0.1, bad_rows=True
-    )
 
 
 @benchmark()
@@ -518,15 +559,25 @@ def test_paged_addressing(pool_blocks, layout):
 def test_routing_backend_gate(config):
     import aiter.ops.flydsl.unified_attention_kernels as adapter
 
-    query_lens, kv_lens = [256], [256]
+    query_lens, kv_lens = [256] * 4, [256] * 4
     case = make_case(query_lens, kv_lens, dtypes.bf16)
-    if config == "softcap":
+    if config == "linear_decode":
+        query_lens, kv_lens = [1] * 8, [64] * 8
+        case = make_case(query_lens, kv_lens, dtypes.bf16)
+    elif config == "short_prefill":
+        query_lens, kv_lens = [320], [1024]
+        case = make_case(query_lens, kv_lens, dtypes.bf16)
+    elif config == "softcap":
         case["softcap"] = 30.0
     elif config == "sliding_window":
         case["window_size"] = (127, 0)
+    elif config == "sinks":
+        case["sinks"] = torch.linspace(-1, 1, H, device="cuda", dtype=torch.float32)
     want = reference(case, query_lens, kv_lens)
+    # short_prefill (small-Sq causal) used to be declined for underfill; it now routes to FlyDSL.
+    declined = config not in ("supported", "short_prefill")
     explicit = partial(ua.unified_attention, **case, backend="flydsl")
-    if config != "supported":
+    if declined:
         try:
             explicit()
         except RuntimeError as exc:
@@ -537,6 +588,14 @@ def test_routing_backend_gate(config):
     with mock.patch.object(adapter, "flydsl_unified_attention", wraps=real) as spy:
         auto = ua.unified_attention(**case).clone()
         assert spy.call_count > 0, "automatic dispatch never offered the call to FlyDSL"
+    if config == "sinks":
+        assert adapter._sinks_ok(case["sinks"], H) is False
+        try:
+            ua.unified_attention(**{**case, "causal": False})
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("non-causal sinks unexpectedly accepted")
     compare(want, auto, 0.08 * want.abs().max().item(), "automatic routing")
     candidates = {"triton": partial(ua.unified_attention, **case, backend="triton")}
     with mock.patch.object(
@@ -545,7 +604,7 @@ def test_routing_backend_gate(config):
         side_effect=AssertionError("explicit backend selected FlyDSL"),
     ):
         ret = measure(candidates, case, want, query_lens, kv_lens)
-        if config != "supported":
+        if declined:
             from aiter.ops.triton.attention.unified_attention import (
                 unified_attention as main_unified_attention,
             )
@@ -570,25 +629,29 @@ def test_routing_backend_gate(config):
             else:
                 raise AssertionError("unsupported Gluon backend did not raise")
             ret["gluon gate"] = "rejected: unsupported arch (no FlyDSL call)"
-    if config == "supported":
+    if not declined:
         ret.update(measure({"flydsl": explicit}, case, want, query_lens, kv_lens))
     return ret
 
 
 @benchmark()
 def test_warm_cache_run_only(path):
-    from aiter.aot.flydsl.common import run_only_env
+    from aiter.aot.flydsl.common import override_env, run_only_env
 
-    query_lens, kv_lens = ([256], [256]) if path == "prefill" else ([1] * 8, [4096] * 8)
+    query_lens, kv_lens = ([512], [512]) if path == "prefill" else ([1] * 8, [4096] * 8)
     case = make_case(query_lens, kv_lens, dtypes.bf16, seed=17)
     want = reference(case, query_lens, kv_lens)
+    if path == "decode":
+        case["k"], case["v"] = shuffle_kv(case["k"], case["v"])
+        case["shuffled_kv_cache"] = True
     call = partial(ua.unified_attention, **case, backend="flydsl")
-    call()
-    torch.cuda.synchronize()
-    case["out"].fill_(float("nan"))
-    # Missing artifacts must raise rather than quietly compile a replacement.
-    with run_only_env():
-        return measure({"warm_run_only": call}, case, want, query_lens, kv_lens)
+    with override_env("FLYDSL_RUNTIME_ENABLE_CACHE", "1"):
+        call()
+        torch.cuda.synchronize()
+        case["out"].fill_(float("nan"))
+        # Missing artifacts must raise rather than quietly compile a replacement.
+        with run_only_env():
+            return measure({"warm_run_only": call}, case, want, query_lens, kv_lens)
 
 
 def main():
@@ -633,10 +696,6 @@ def main():
         nargs="+",
         default=["linear", "vectorized"],
     )
-    parser.add_argument(
-        "--splits", type=int, choices=[2, 4, 8], nargs="+", default=[2, 4]
-    )
-    parser.add_argument("--seq-len", type=int, nargs="+", default=[1024])
     args = parser.parse_args()
     test_pa_decode_num_partitions()
     test_pa_decode_vgpr_occupancy()
@@ -647,16 +706,16 @@ def main():
             test_decode,
             itertools.product(args.dtype, args.decode_depth, args.layout),
         ),
-        ("mixed batch", test_mixed_batch, itertools.product(args.causal, args.splits)),
+        (
+            "small-Sq causal prefill",
+            test_small_sq_causal_prefill,
+            itertools.product(list(SMALL_SQ_CASES), ["shuffled", "linear"]),
+        ),
+        ("small-Sq causal graph", test_small_sq_causal_graph, [()]),
         (
             "cross-attention mask",
             test_cross_attention_mask,
             itertools.product([320], [1024]),
-        ),
-        (
-            "split-K combine",
-            test_splitk_combine,
-            itertools.product(args.seq_len, args.splits),
         ),
         # 65535 pages stay below the dualwave launcher's signed-i32 element limit.
         (
@@ -667,12 +726,21 @@ def main():
         (
             "pa_decode route",
             test_pa_decode_route,
-            itertools.product(list(PA_DECODE_CASES)),
+            itertools.product(list(PA_DECODE_CASES), [3, 8, 16]),
         ),
         (
             "routing/backend gate",
             test_routing_backend_gate,
-            itertools.product(["supported", "softcap", "sliding_window"]),
+            itertools.product(
+                [
+                    "supported",
+                    "softcap",
+                    "sliding_window",
+                    "sinks",
+                    "linear_decode",
+                    "short_prefill",
+                ]
+            ),
         ),
         (
             "warm-cache run-only (not full AOT)",
@@ -687,7 +755,7 @@ def main():
             "%s summary (markdown):\n%s", name, df.to_markdown(index=False)
         )
     aiter.logger.info(
-        "PASS: all eight unified-attention test groups; all candidate timings non-zero"
+        "PASS: all unified-attention test groups; all candidate timings non-zero"
     )
 
 

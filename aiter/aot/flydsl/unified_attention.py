@@ -50,57 +50,29 @@ DEFAULT_CSVS = [None]
 # Pinned production geometry (Qwen3-VL fp8 unified attention on gfx950).
 _HEAD_DIM = 128
 _NUM_HEADS = 64
-_NUM_KV_HEADS = 4  # GQA-16, the only decode-valid production config
-
-# Prefill split-K counts. use_sinks=True is invalid with split>1 (the builder
-# refuses it: exp(sink) would be double-counted across split combines), so sinks
-# only ever pairs with split=1.
-_PREFILL_SPLITS = (1, 2, 4, 8, 16)
+_NUM_KV_HEADS = 4  # Qwen3-VL production GQA-16
 
 _OUT_DTYPES = ("bf16", "f16")
 
 
 def _prefill_jobs() -> list[dict]:
-    jobs = []
-    for causal in (True, False):
-        for out_dtype_str in _OUT_DTYPES:
-            for shuffled_kv_cache in (False, True):
-                for num_kv_splits in _PREFILL_SPLITS:
-                    jobs.append(
-                        {
-                            "path": "prefill",
-                            "causal": causal,
-                            "out_dtype_str": out_dtype_str,
-                            "shuffled_kv_cache": shuffled_kv_cache,
-                            "num_kv_splits": num_kv_splits,
-                            "use_sinks": False,
-                        }
-                    )
-                # sinks: single-split only (split>1 is rejected by the builder).
-                jobs.append(
-                    {
-                        "path": "prefill",
-                        "causal": causal,
-                        "out_dtype_str": out_dtype_str,
-                        "shuffled_kv_cache": shuffled_kv_cache,
-                        "num_kv_splits": 1,
-                        "use_sinks": True,
-                    }
-                )
-                if shuffled_kv_cache:
-                    for use_sinks in (False, True):
-                        jobs.append(
-                            {
-                                "path": "prefill",
-                                "causal": causal,
-                                "out_dtype_str": out_dtype_str,
-                                "shuffled_kv_cache": True,
-                                "num_kv_splits": 1,
-                                "use_sinks": use_sinks,
-                                "conventional": True,
-                            }
-                        )
-    return jobs
+    return [
+        {
+            "path": "prefill",
+            "causal": causal,
+            "out_dtype_str": out_dtype,
+            "shuffled_kv_cache": shuffled,
+            "rescale_threshold": threshold,
+            "block_m": block_m,
+            "packed_bn64": packed,
+        }
+        for causal in (True, False)
+        for out_dtype in _OUT_DTYPES
+        for shuffled in (False, True)
+        for threshold in (6.0, 4.0)
+        # The adapter routes this GQA-16 shape to packed BN64 (fixed block_m=128).
+        for block_m, packed in ((128, True),)
+    ]
 
 
 def parse_csv(_csv=None) -> list[dict]:
@@ -132,9 +104,9 @@ def _kernel_name(job: dict) -> str:
     return (
         f"flydsl_unified_attn_{job['path']}"
         f"_c{int(job['causal'])}_{job['out_dtype_str']}"
-        f"_shuf{int(job['shuffled_kv_cache'])}_s{job['num_kv_splits']}"
-        f"_sink{int(job.get('use_sinks', False))}"
-        f"_conv{int(job.get('conventional', False))}"
+        f"_shuf{int(job['shuffled_kv_cache'])}"
+        f"_thr{job['rescale_threshold']:g}_bm{job['block_m']}"
+        f"{'_bn64pack' if job['packed_bn64'] else ''}"
     )
 
 
@@ -178,27 +150,21 @@ def _fake_kv(num_kv_heads: int, shuffled_kv_cache: bool):
 def _compile_prefill(job: dict) -> None:
     import torch
 
-    from aiter.ops.flydsl.kernels.flash_attn_dualwave_common import (
-        dualwave_splitk_workspace_elems,
-    )
     from aiter.ops.flydsl.unified_attention_kernels import _as_i8, _get_kernel
 
     num_heads = job["num_heads"]
     num_kv_heads = job["num_kv_heads"]
     out_dtype_str = job["out_dtype_str"]
-    num_kv_splits = job["num_kv_splits"]
-    use_sinks = job["use_sinks"]
     shuffled_kv_cache = job["shuffled_kv_cache"]
-
     kernel = _get_kernel(
         num_heads,
         num_kv_heads,
         bool(job["causal"]),
         out_dtype_str,
-        use_sinks,
-        num_kv_splits,
         shuffled_kv_cache,
-        job.get("conventional", False),
+        job["rescale_threshold"],
+        job["block_m"],
+        packed_bn64=job["packed_bn64"],
     )
 
     fp8 = torch.float8_e4m3fn
@@ -211,26 +177,12 @@ def _compile_prefill(job: dict) -> None:
     out = torch.empty((total_q, num_heads, d), dtype=_out_torch_dtype(out_dtype_str))
     k, v = _fake_kv(num_kv_heads, shuffled_kv_cache)
     cu_seqlens_q = torch.empty((num_seqs + 1,), dtype=torch.int32)
-    cu_seqlens_kv = torch.empty(
-        (num_seqs if job.get("conventional", False) else num_seqs + 1,),
-        dtype=torch.int32,
-    )
+    cu_seqlens_kv = torch.empty((num_seqs,), dtype=torch.int32)
     block_table = torch.empty((num_seqs, _FAKE_MAX_BLOCKS), dtype=torch.int32)
     q_descale = torch.empty((1,), dtype=torch.float32)
     k_descale = torch.empty((1,), dtype=torch.float32)
     v_descale = torch.empty((1,), dtype=torch.float32)
-    sink = torch.empty((num_heads,), dtype=torch.float32) if use_sinks else None
-
-    # stride_kv_n: for the 5D shuffled cache k.stride(1) is the wrong (kv-head)
-    # axis, so the runtime derives per-page geometry from shape -- mirror that.
-    stride_kv_n = num_kv_heads * d if shuffled_kv_cache else k.stride(1)
-
-    workspace = None
-    if num_kv_splits > 1:
-        ws_elems = dualwave_splitk_workspace_elems(
-            num_seqs, num_heads, max_seqlen_q, num_kv_splits, d
-        )
-        workspace = torch.empty(ws_elems, dtype=torch.float32)
+    stride_kv_n = num_kv_heads * d
 
     with compile_only_env():
         kernel(
@@ -242,7 +194,8 @@ def _compile_prefill(job: dict) -> None:
             int(max_seqlen_q),
             stride_kv_n,
             q.stride(0),
-            workspace=workspace,
+            softmax_scale=d**-0.5,
+            seq_len_kv=_FAKE_MAX_BLOCKS * _PAGE,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_kv=cu_seqlens_kv,
             q_descale=q_descale,
@@ -250,7 +203,6 @@ def _compile_prefill(job: dict) -> None:
             v_descale=v_descale,
             block_table=block_table.reshape(-1),
             block_table_stride=int(block_table.stride(0)),
-            sink=None if sink is None else sink.reshape(-1),
             stream=0,
         )
 
@@ -264,7 +216,7 @@ def compile_one_config(**job) -> dict:
     shape_str = (
         f"{kernel_name}  path={job.get('path')} causal={job.get('causal')} "
         f"out={job.get('out_dtype_str')} shuffled={job.get('shuffled_kv_cache')} "
-        f"splits={job.get('num_kv_splits')} sinks={job.get('use_sinks', False)}"
+        f"threshold={job.get('rescale_threshold')} block_m={job.get('block_m')}"
     )
 
     t0 = time.time()

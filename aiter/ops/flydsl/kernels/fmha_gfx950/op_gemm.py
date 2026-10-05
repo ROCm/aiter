@@ -5,6 +5,7 @@
 """The two GEMMs: QK^T and PV."""
 
 import flydsl.expr as fx
+from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
@@ -122,7 +123,27 @@ class DualwaveFp8GemmHelper(DualwaveFp8KernelContext):
         for pks in range_constexpr(self.traits.PV_K_STEPS):
             p_base = pks * 8
             f32 += [hi_full[p_base + s] for s in range_constexpr(8)]
-        return self._pack_fp8_i32x8(f32)
+        packed = self._pack_fp8_i32x8(f32)
+        if const_expr(self.traits.V_SHUFFLED):
+            # Match V's intact 16-token vectors after rounding P to fp8.
+            words = Vec(packed)
+            pair_ty = ir.Type.parse("!llvm.struct<(i32, i32)>")
+            reordered = []
+            for base in range_constexpr(0, 8, 4):
+                for i in range_constexpr(2):
+                    pair = rocdl.permlane32_swap(
+                        pair_ty,
+                        as_mlir_value(words[base + i]),
+                        as_mlir_value(words[base + i + 2]),
+                        False,
+                        False,
+                    )
+                    reordered += [
+                        fx.Int32(llvm.extractvalue(T.i32, pair, [0])),
+                        fx.Int32(llvm.extractvalue(T.i32, pair, [1])),
+                    ]
+            packed = Vec.from_elements(reordered, fx.Int32).ir_value()
+        return packed
 
     def _pv_fp8_direct(self, p_fp8, v_v, v_o):
         v_o = _anchor_v_o(self.traits, v_o)

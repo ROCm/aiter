@@ -114,13 +114,14 @@ def ref_paged_attn(
     return out.to(out_dtype)
 
 
-def make_case(query_lens, kv_lens, dtype, causal=True, seed=3):
+def make_case(query_lens, kv_lens, dtype, causal=True, seed=3, group=None):
+    heads = H if group is None else HKV * group
     g = torch.Generator(device="cuda").manual_seed(seed)
     pages = [max(0, (n + PAGE - 1) // PAGE) for n in kv_lens]
     n_pages = max(1, sum(pages))
     q, qs = q8(
         torch.randn(
-            sum(query_lens), H, D, device="cuda", dtype=torch.bfloat16, generator=g
+            sum(query_lens), heads, D, device="cuda", dtype=torch.bfloat16, generator=g
         )
     )
     k, ks = q8(
@@ -186,14 +187,22 @@ def reference(case, query_lens, kv_lens):
     )
 
 
-def direct_candidate(case, kv_lens, block_m=None, layout="linear"):
+def direct_candidate(
+    case,
+    kv_lens,
+    block_m=None,
+    layout="linear",
+    body_variant="default",
+    gqa_pack_m=False,
+):
+    heads = case["q"].shape[1]
     b, max_q = len(kv_lens), case["max_seqlen_q"]
     if block_m is None:
         block_m = _fp8_auto_block_m(
             b, H, max_q, max(kv_lens), _num_cu(case["q"].device)
         )
     mod = build_flash_attn_dualwave_swp_fp8_module(
-        num_heads=H,
+        num_heads=heads,
         num_kv_heads=HKV,
         head_dim=D,
         causal=case["causal"],
@@ -205,6 +214,8 @@ def direct_candidate(case, kv_lens, block_m=None, layout="linear"):
         out_dtype="bf16" if case["out"].dtype == torch.bfloat16 else "f16",
         rescale_threshold=_fp8_rescale_threshold(max(kv_lens)),
         block_m=block_m,
+        body_variant=body_variant,
+        gqa_pack_m=gqa_pack_m,
     )
     mod(
         case["q"].view(torch.int8).reshape(-1),
@@ -213,7 +224,7 @@ def direct_candidate(case, kv_lens, block_m=None, layout="linear"):
         case["out"].reshape(-1),
         b,
         max_q,
-        stride_q_n=H * D,
+        stride_q_n=heads * D,
         stride_kv_n=HKV * D,
         seq_len_kv=max(kv_lens),
         softmax_scale=case["softmax_scale"],
@@ -242,19 +253,25 @@ def _check(want, got, atol=None):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("layout", ["linear", "shuffled"])
-def test_paged_prefill(dtype, causal, layout):
+@pytest.mark.parametrize("body_variant", ["default", "conventional_bn64"])
+def test_paged_prefill(dtype, causal, layout, body_variant):
     qlens, klens = [512, 256], [512, 256]
     case = make_case(qlens, klens, dtype, causal)
     want = reference(case, qlens, klens)
     shuffle_case(case, layout)
-    _check(want, direct_candidate(case, klens, layout=layout))
+    _check(
+        want, direct_candidate(case, klens, layout=layout, body_variant=body_variant)
+    )
 
 
 @pytest.mark.parametrize("block_m", [128, 256])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("layout", ["linear", "shuffled"])
-def test_paged_ragged_stale_nan(block_m, causal, layout):
+@pytest.mark.parametrize("body_variant", ["default", "conventional_bn64"])
+def test_paged_ragged_stale_nan(block_m, causal, layout, body_variant):
     qlens, klens = [513, 1, 129, 257], [577, 0, 65, 1]
+    if body_variant == "conventional_bn64" and block_m != 128:
+        pytest.skip("conventional_bn64 fixes block_m=128")
     case = make_case(qlens, klens, torch.bfloat16, causal)
     # Tail bytes and page-zero prefetches must not reach PV, while valid
     # payload is unchanged. The longest Q supplies excess blocks for every row.
@@ -271,7 +288,7 @@ def test_paged_ragged_stale_nan(block_m, causal, layout):
     case["out"] = storage[: sum(qlens)]
     want = torch.nan_to_num(reference(case, qlens, klens))
     shuffle_case(case, layout)
-    got = direct_candidate(case, klens, block_m, layout)
+    got = direct_candidate(case, klens, block_m, layout, body_variant)
     _check(want, got)
     assert torch.count_nonzero(got[qlens[0] : qlens[0] + qlens[1]]) == 0
     assert torch.isnan(storage[sum(qlens) :]).all()
@@ -279,13 +296,117 @@ def test_paged_ragged_stale_nan(block_m, causal, layout):
 
 @pytest.mark.parametrize("block_m", [128, 256])
 @pytest.mark.parametrize("layout", ["linear", "shuffled"])
-def test_paged_empty_segment(block_m, layout):
+@pytest.mark.parametrize("body_variant", ["default", "conventional_bn64"])
+def test_paged_empty_segment(block_m, layout, body_variant):
+    if body_variant == "conventional_bn64" and block_m != 128:
+        pytest.skip("conventional_bn64 fixes block_m=128")
     case = make_case([513], [0], torch.float16)
     case["k"].view(torch.uint8).fill_(0x7F)
     case["v"].view(torch.uint8).fill_(0xFF)
     shuffle_case(case, layout)
-    got = direct_candidate(case, [0], block_m, layout)
+    got = direct_candidate(case, [0], block_m, layout, body_variant)
     assert torch.count_nonzero(got) == 0
+
+
+@pytest.mark.parametrize("group", [1, 4, 8, 16])
+@pytest.mark.parametrize("layout", ["linear", "shuffled"])
+@pytest.mark.parametrize(
+    "causal,dtype",
+    [
+        (False, torch.bfloat16),
+        (True, torch.bfloat16),
+        (True, torch.float16),
+    ],
+)
+def test_paged_gqa_pack_m(group, layout, causal, dtype):
+    qlens, klens = [93, 1, 17, 9], [157, 0, 5, 1]
+    case = make_case(qlens, klens, dtype, causal, group=group)
+    for row, n in enumerate(klens):
+        if n % PAGE:
+            page = int(case["block_table"][row, n // PAGE])
+            case["v"].view(torch.uint8)[page, n % PAGE :] = 0x7F
+    storage = torch.full(
+        (sum(qlens) + 128, HKV * group, D),
+        float("nan"),
+        device="cuda",
+        dtype=dtype,
+    )
+    case["out"] = storage[: sum(qlens)]
+    want = torch.nan_to_num(reference(case, qlens, klens))
+    shuffle_case(case, layout)
+    got = direct_candidate(
+        case,
+        klens,
+        layout=layout,
+        body_variant="conventional_bn64",
+        gqa_pack_m=True,
+    )
+    _check(want, got)
+    assert torch.count_nonzero(got[qlens[0] : qlens[0] + qlens[1]]) == 0
+    assert torch.isnan(storage[sum(qlens) :]).all()
+
+
+@pytest.mark.parametrize("layout", ["linear", "shuffled"])
+def test_paged_gqa_pack_m_empty(layout):
+    case = make_case([17], [0], torch.float16, group=16)
+    case["k"].view(torch.uint8).fill_(0x7F)
+    case["v"].view(torch.uint8).fill_(0xFF)
+    shuffle_case(case, layout)
+    got = direct_candidate(
+        case,
+        [0],
+        layout=layout,
+        body_variant="conventional_bn64",
+        gqa_pack_m=True,
+    )
+    assert torch.count_nonzero(got) == 0
+
+
+@pytest.mark.parametrize("layout", ["linear", "shuffled"])
+@pytest.mark.parametrize("gqa_pack_m", [False, True])
+@pytest.mark.parametrize("causal", [False, True])
+def test_paged_bn64_concurrent_v_reads(layout, gqa_pack_m, causal):
+    qlens, klens = [65] * 40, [64] * 40
+    case = make_case(qlens, klens, torch.bfloat16, causal)
+    want = torch.nan_to_num(reference(case, qlens, klens))
+    shuffle_case(case, layout)
+    # A single KV tile excludes ring reuse; concurrent waves expose missing
+    # completion waits that low-concurrency cases can hide behind LDS latency.
+    for _ in range(5):
+        got = direct_candidate(
+            case,
+            klens,
+            block_m=128,
+            layout=layout,
+            body_variant="conventional_bn64",
+            gqa_pack_m=gqa_pack_m,
+        )
+        _check(want, got)
+
+
+@pytest.mark.parametrize("poison_tail", [False, True])
+def test_paged_bn64_shuffled_full_tiles_and_tail(poison_tail):
+    qlens, klens = [65] * 40, [197] * 40
+    case = make_case(qlens, klens, torch.bfloat16, causal=False)
+    # Distinct token values expose page/quad permutations across the branch.
+    tokens = torch.arange(PAGE, device="cuda", dtype=torch.float32)
+    values = ((tokens % 13) - 6).view(1, PAGE, 1, 1).expand_as(case["v"])
+    case["v"] = values.to(case["v"].dtype).contiguous()
+    case["v_descale"].fill_(1)
+    if poison_tail:
+        for row, n in enumerate(klens):
+            page = int(case["block_table"][row, n // PAGE])
+            case["v"].view(torch.uint8)[page, n % PAGE :] = 0x7F
+    want = reference(case, qlens, klens)
+    shuffle_case(case, "shuffled")
+    got = direct_candidate(
+        case,
+        klens,
+        layout="shuffled",
+        body_variant="conventional_bn64",
+        gqa_pack_m=True,
+    )
+    _check(want, got)
 
 
 @pytest.mark.parametrize("layout", ["linear", "shuffled"])
@@ -335,7 +456,8 @@ def test_paged_shuffled_matches_linear(block_m, causal, layout):
     shuffle_case(case, layout)
     got = direct_candidate(case, klens, block_m, layout)
     _check(want, got)
-    assert torch.equal(linear, got)
+    # The shuffled V reader permutes the PV reduction order, so results match linear only to rounding.
+    _check(linear, got)
 
 
 def shuffle_case(case, layout):

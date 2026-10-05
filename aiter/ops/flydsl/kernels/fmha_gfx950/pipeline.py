@@ -445,6 +445,8 @@ class DualwaveSwpFp8Traits:
     V_SHUFFLED: bool = False
     OUT_F16: bool = False
     PAGED_BT_LDS_SIZE: int = 2048
+    BODY_VARIANT: str = "default"
+    GQA_PACK_M: bool = False
 
     @property
     def cache_tag(self):
@@ -479,6 +481,10 @@ class DualwaveSwpFp8Traits:
             base += (("paged", self.K_SHUFFLED, self.V_SHUFFLED),)
         if self.OUT_F16:
             base += (("out_f16",),)
+        if self.BODY_VARIANT != "default":
+            base += ((self.BODY_VARIANT,),)
+        if self.GQA_PACK_M:
+            base += (("gqa_pack_m",),)
         return base
 
 
@@ -503,14 +509,40 @@ def _make_dualwave_swp_fp8_traits(
     kv_cache_layout="linear",
     out_dtype="bf16",
     _k_shuffled_only=False,
+    body_variant="default",
+    gqa_pack_m=False,
 ):
     """Build gfx950 DUALWAVE_SWP fp8 compile-time layout traits.
 
     ``head_dim`` is the QK reduction width (a multiple of 64: the QK MFMA is
     32x32x64) and ``head_dim_v`` the V/output width, tiled in 32-wide D_CHUNKs.
     """
+    if body_variant not in ("default", "conventional_bn64"):
+        raise RuntimeError(f"unsupported body_variant={body_variant!r}")
+    if body_variant == "conventional_bn64":
+        if not paged or num_kv_splits != 1:
+            raise RuntimeError(
+                "conventional_bn64 requires paged=True and num_kv_splits=1"
+            )
+        block_m = 128
+        dualwave_swp_setprio = False
+        dualwave_swp_enable_stagger = False
     if head_dim_v is None:
         head_dim_v = head_dim
+    if gqa_pack_m:
+        if (
+            body_variant != "conventional_bn64"
+            or not paged
+            or num_kv_splits != 1
+            or head_dim != 128
+            or head_dim_v != 128
+        ):
+            raise RuntimeError(
+                "gqa_pack_m requires paged single-pass D128 conventional_bn64"
+            )
+        group = num_heads // num_kv_heads
+        if group not in (1, 4, 8, 16):
+            raise RuntimeError("gqa_pack_m supports GQA groups 1, 4, 8, and 16")
     if head_dim % 64:
         raise RuntimeError(
             f"fp8 flash attention needs head_dim % 64 == 0, got head_dim={head_dim}"
@@ -572,7 +604,9 @@ def _make_dualwave_swp_fp8_traits(
     lane_split_kv = 8
     smem_k_pad = 16 // elem_bytes
 
-    rows_per_wave_dma = -(-block_n // num_waves)
+    # Eight padded stripes avoid the BN64 wide K reader's two-way bank conflicts.
+    k_stripes = 8 if body_variant == "conventional_bn64" else num_waves
+    rows_per_wave_dma = -(-block_n // k_stripes)
     k_band_chunk, k_band_base, k_band_line_stride, k_band_global_d = [], [], [], []
     _off, _cursor = 0, 0
     while _off < head_dim:
@@ -582,7 +616,7 @@ def _make_dualwave_swp_fp8_traits(
         k_band_base.append(_cursor)
         k_band_line_stride.append(line_stride)
         k_band_global_d.append(_off)
-        _cursor += num_waves * line_stride
+        _cursor += k_stripes * line_stride
         _off += chunk
     smem_k_tile_elems = _cursor
     k_ws_band, k_ws_off = [], []
@@ -590,7 +624,7 @@ def _make_dualwave_swp_fp8_traits(
         for _o in range(0, chunk, 64):
             k_ws_band.append(_bi)
             k_ws_off.append(_o)
-    num_prefetch_k = 6
+    num_prefetch_k = 2 if body_variant == "conventional_bn64" else 6
     dualwave_swp_kv_per_buffer = smem_k_tile_elems
     lds_kv_total_size = num_prefetch_k * dualwave_swp_kv_per_buffer
     dualwave_swp_k_buf_base = tuple(
@@ -620,6 +654,7 @@ def _make_dualwave_swp_fp8_traits(
         )
 
     return DualwaveSwpFp8Traits(
+        GQA_PACK_M=bool(gqa_pack_m),
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         WARP_SIZE=warp_size,
@@ -676,6 +711,7 @@ def _make_dualwave_swp_fp8_traits(
         V_SHUFFLED=kv_cache_layout == "shuffled" and not _k_shuffled_only,
         OUT_F16=out_dtype == "f16",
         PAGED_BT_LDS_SIZE=paged_bt_lds_size,
+        BODY_VARIANT=body_variant,
     )
 
 
@@ -705,6 +741,12 @@ def _init_dualwave_thread_mapping(ctx):
             fx.Index(gpu.block_idx.z) * batch_interleave_group
             + linear_head_batch // traits.NUM_HEADS_Q
         )
+        if const_expr(traits.GQA_PACK_M):
+            ctx.h_idx = linear_head_batch % traits.NUM_HEADS_KV
+            ctx.batch_idx = (
+                fx.Index(gpu.block_idx.z) * batch_interleave_group
+                + linear_head_batch // traits.NUM_HEADS_KV
+            )
         ctx.q_block_idx = fx.Index(gpu.block_idx.y)
     else:
         ctx.h_idx = fx.Index(gpu.block_idx.x)
@@ -743,6 +785,9 @@ def _init_dualwave_thread_mapping(ctx):
     ctx.group_id = ctx.h_idx // traits.NUM_HEADS_KV
     ctx.q_head_idx = ctx.h_kv_idx * traits.GQA_GROUP_SIZE + ctx.group_id
     ctx.kv_head_idx = ctx.h_kv_idx
+    if const_expr(traits.GQA_PACK_M):
+        ctx.q_start = ctx.q_block_idx * (traits.BLOCK_M // traits.GQA_GROUP_SIZE)
+        ctx.q_head_idx = ctx.h_kv_idx * traits.GQA_GROUP_SIZE
 
 
 def _init_dualwave_q_row(ctx):
@@ -751,6 +796,13 @@ def _init_dualwave_q_row(ctx):
     ctx.q_row_in_block = ctx.wave_q_offset + ctx.lane_mod_32
     ctx.q_start_pos_i32 = fx.Int32(ctx.q_start + ctx.wave_id_uni * traits.ROWS_PER_WAVE)
     ctx.q_row = ctx.q_start + ctx.q_row_in_block
+    if const_expr(traits.GQA_PACK_M):
+        ctx.q_row = ctx.q_start + ctx.q_row_in_block // traits.GQA_GROUP_SIZE
+        ctx.q_head_row = ctx.q_head_idx + ctx.q_row_in_block % traits.GQA_GROUP_SIZE
+        ctx.q_start_pos_i32 = fx.Int32(
+            ctx.q_start
+            + ctx.wave_id_uni * traits.ROWS_PER_WAVE // traits.GQA_GROUP_SIZE
+        )
     ctx.q_row_i32 = fx.Int32(ctx.q_row)
 
 
@@ -851,6 +903,11 @@ class DualwaveFp8KernelContext:
         num_q_blocks = (self.seq_len_v + traits.BLOCK_M - 1) // traits.BLOCK_M
         self.q_block_idx = num_q_blocks - 1 - self.q_block_idx
         self.q_start = self.q_block_idx * traits.BLOCK_M
+        if const_expr(traits.GQA_PACK_M):
+            block_q = traits.BLOCK_M // traits.GQA_GROUP_SIZE
+            num_q_blocks = (self.seq_len_v + block_q - 1) // block_q
+            self.q_block_idx = num_q_blocks - 1 - fx.Index(gpu.block_idx.y)
+            self.q_start = self.q_block_idx * block_q
 
     def init_lds(self, shared_storage):
         lds = fx.SharedAllocator().allocate(shared_storage).peek()
@@ -1056,6 +1113,11 @@ class DualwaveFp8KernelContext:
             causal_end_raw_i32 = (
                 fx.Int32(self.q_start + traits.BLOCK_M) + self.delta_i32
             )
+            if const_expr(traits.GQA_PACK_M):
+                causal_end_raw_i32 = (
+                    fx.Int32(self.q_start + traits.BLOCK_M // traits.GQA_GROUP_SIZE)
+                    + self.delta_i32
+                )
             causal_end_i32 = fx.Int32(
                 (causal_end_raw_i32 > fx.Int32(0)).select(
                     causal_end_raw_i32, fx.Int32(0)
@@ -1071,8 +1133,9 @@ class DualwaveFp8KernelContext:
             causal_end_raw_i32 = None
             max_num_tiles = num_kv_tiles
         # Pipeline needs an EVEN tile count >= 4; extra tiles read 0 (num_records) and are masked.
-        max_num_tiles = ((max_num_tiles + 1) // 2) * 2
-        max_num_tiles = fx.Index((max_num_tiles < 4).select(4, max_num_tiles))
+        if const_expr(traits.BODY_VARIANT == "default"):
+            max_num_tiles = ((max_num_tiles + 1) // 2) * 2
+            max_num_tiles = fx.Index((max_num_tiles < 4).select(4, max_num_tiles))
         self.max_num_tiles = max_num_tiles
         if const_expr(traits.SPLITK):
             chunk = (
@@ -1181,6 +1244,12 @@ class DualwaveFp8KernelContext:
 
     def global_idx_o(self, token_idx, col):
         """Element index into O, which is HEAD_DIM_V wide (not HEAD_DIM)."""
+        if self.traits.GQA_PACK_M:
+            return (
+                (self.q_tok_base + token_idx) * self.stride_o_n_v
+                + self.ctx_ref.q_head_row * self.traits.HEAD_DIM_V
+                + col
+            )
         return (
             (self.q_tok_base + token_idx) * self.stride_o_n_v
             + self.q_head_idx * self.traits.HEAD_DIM_V

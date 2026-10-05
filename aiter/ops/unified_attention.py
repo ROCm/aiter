@@ -74,7 +74,7 @@ def unified_attention(
         unified_attention as _triton_unified_attention,
     )
 
-    return _triton_unified_attention(
+    result = _triton_unified_attention(
         q,
         k,
         v,
@@ -100,3 +100,12 @@ def unified_attention(
         skip_reduce=skip_reduce,
         backend=backend,
     )
+    if backend is None and max_seqlen_q == 1 and k.dim() == 4 and not shuffled_kv_cache:
+        import torch
+
+        # Triton yields NaN for empty KV rows; the FlyDSL path returns zero.
+        tokens = torch.arange(q.shape[0], device=q.device, dtype=cu_seqlens_q.dtype)
+        seq_ids = torch.searchsorted(cu_seqlens_q[1:], tokens, right=True)
+        empty_rows = seqused_k[seq_ids] == 0
+        out.masked_fill_(empty_rows[:, None, None], 0)
+    return result
