@@ -92,6 +92,19 @@ def _prefill_jobs() -> list[dict]:
                         "use_sinks": True,
                     }
                 )
+                if shuffled_kv_cache:
+                    for use_sinks in (False, True):
+                        jobs.append(
+                            {
+                                "path": "prefill",
+                                "causal": causal,
+                                "out_dtype_str": out_dtype_str,
+                                "shuffled_kv_cache": True,
+                                "num_kv_splits": 1,
+                                "use_sinks": use_sinks,
+                                "conventional": True,
+                            }
+                        )
     return jobs
 
 
@@ -145,6 +158,7 @@ def _kernel_name(job: dict) -> str:
         f"_c{int(job['causal'])}_{job['out_dtype_str']}"
         f"_shuf{int(job['shuffled_kv_cache'])}_s{job['num_kv_splits']}"
         f"_sink{int(job.get('use_sinks', False))}"
+        f"_conv{int(job.get('conventional', False))}"
     )
 
 
@@ -208,6 +222,7 @@ def _compile_prefill(job: dict) -> None:
         use_sinks,
         num_kv_splits,
         shuffled_kv_cache,
+        job.get("conventional", False),
     )
 
     fp8 = torch.float8_e4m3fn
@@ -220,7 +235,10 @@ def _compile_prefill(job: dict) -> None:
     out = torch.empty((total_q, num_heads, d), dtype=_out_torch_dtype(out_dtype_str))
     k, v = _fake_kv(num_kv_heads, shuffled_kv_cache)
     cu_seqlens_q = torch.empty((num_seqs + 1,), dtype=torch.int32)
-    cu_seqlens_kv = torch.empty((num_seqs + 1,), dtype=torch.int32)
+    cu_seqlens_kv = torch.empty(
+        (num_seqs if job.get("conventional", False) else num_seqs + 1,),
+        dtype=torch.int32,
+    )
     block_table = torch.empty((num_seqs, _FAKE_MAX_BLOCKS), dtype=torch.int32)
     q_descale = torch.empty((1,), dtype=torch.float32)
     k_descale = torch.empty((1,), dtype=torch.float32)

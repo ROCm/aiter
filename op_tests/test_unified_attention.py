@@ -409,7 +409,12 @@ def test_routing_backend_gate(config):
     ):
         ret = measure(candidates, case, want, query_lens, kv_lens)
         if config != "supported":
-            compare(auto, case["out"], 0, "declined config vs Triton bitwise")
+            from aiter.ops.triton.attention.unified_attention import (
+                unified_attention as main_unified_attention,
+            )
+
+            fallback = main_unified_attention(**case).clone()
+            compare(auto, fallback, 0, "declined config vs default backend bitwise")
         if _is_gluon_available():
             ret.update(
                 measure(

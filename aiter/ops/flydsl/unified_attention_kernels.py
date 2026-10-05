@@ -125,6 +125,8 @@ _MAX_SEGMENTS = _env_max_kv_splits(16)
 
 # block_m, and with it the largest GQA group that can pack into the M dimension.
 # _make_dualwave_swp_fp8_traits asserts block_m % gqa_group_size == 0.
+# C is the default for compatible prefill; =0 keeps A available without an API change.
+_PREFILL_CONVENTIONAL = os.environ.get("AITER_PREFILL_CONVENTIONAL", "1") == "1"
 _BLOCK_M = 256
 
 # The block table is staged through a fixed LDS window of PAGED_BT_LDS_SIZE=2048
@@ -187,11 +189,12 @@ def _get_kernel(
     use_sinks: bool,
     num_kv_splits: int = 1,
     shuffled_kv_cache: bool = False,
+    conventional: bool = False,
 ):
     """Build (and cache) the paged+varlen fp8 launcher.
 
-    Keyed on head counts, mask mode, output dtype, split count, and the
-    shuffled-cache flag; every other builder argument is pinned by the
+    Keyed on head counts, mask mode, output dtype, split count, shuffled-cache
+    layout, and conventional scheduling; every other builder argument is pinned by the
     support gate or left at default.
 
     ``num_kv_splits`` selects the tier: at 1, the builder auto-enables
@@ -226,6 +229,13 @@ def _get_kernel(
         num_kv_splits=num_kv_splits,
         gqa_pack_m=True if num_kv_splits > 1 else None,
         kv_cache_layout="vectorized" if shuffled_kv_cache else "linear",
+        conventional=conventional,
+        direct_kv_lengths=(
+            conventional
+            and shuffled_kv_cache
+            and num_kv_splits == 1
+            and 128 % (num_heads // num_kv_heads) == 0
+        ),
     )
 
 
@@ -685,12 +695,10 @@ def _as_i8(t: torch.Tensor) -> torch.Tensor:
 def _cu_seqlens_kv(seqused_k: torch.Tensor, num_seqs: int) -> torch.Tensor:
     """Lengths -> cumulative offsets.
 
-    ``unified_attention`` passes per-sequence KV *lengths*; the kernel wants
-    cumulative offsets and recovers the length as ``cu[i+1] - cu[i]``. Under
-    paging the absolute bases are unobservable -- init_gmem_offsets drops
-    kv_tok_base from the KV offset and the paged path builds per-page
-    descriptors instead of a whole-tensor view -- so a synthesized cumsum is
-    exactly equivalent to the real one.
+    ``unified_attention`` passes per-sequence KV *lengths*; the legacy prefill
+    and decode kernels recover each length from cumulative offsets. The paged
+    absolute bases are unobservable, so this synthesized prefix preserves their
+    behavior. Conventional prefill reads the lengths directly instead.
     """
     cu = torch.zeros(num_seqs + 1, dtype=torch.int32, device=seqused_k.device)
     torch.cumsum(seqused_k, 0, out=cu[1:])
@@ -1061,7 +1069,14 @@ def flydsl_unified_attention(
     num_kv_splits = 1
     if max_seqlen_k > _PAGE_SIZE * 20 and sinks is None:
         target_num_prgms = _target_num_prgms(q.device.index)
-        block_q = _BLOCK_M // num_queries_per_kv
+        block_m = (
+            128
+            if _PREFILL_CONVENTIONAL
+            and shuffled_kv_cache
+            and 128 % num_queries_per_kv == 0
+            else _BLOCK_M
+        )
+        block_q = block_m // num_queries_per_kv
         if max_seqlen_q == 1:
             num_q_blocks = num_seqs
         else:
@@ -1110,6 +1125,12 @@ def flydsl_unified_attention(
         )
         workspace = torch.empty(ws_elems, device=q.device, dtype=torch.float32)
 
+    direct_kv_lengths = (
+        _PREFILL_CONVENTIONAL
+        and shuffled_kv_cache
+        and num_kv_splits == 1
+        and 128 % num_queries_per_kv == 0
+    )
     with torch.cuda.device(q.device.index):
         kernel = _get_kernel(
             num_query_heads,
@@ -1119,6 +1140,7 @@ def flydsl_unified_attention(
             sinks is not None,
             num_kv_splits,
             shuffled_kv_cache,
+            _PREFILL_CONVENTIONAL,
         )
         kernel(
             # .reshape(-1) relies on _strides_ok already restricting Q/O to
@@ -1163,7 +1185,9 @@ def flydsl_unified_attention(
             q.stride(0),
             workspace=workspace,
             cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_kv=_cu_seqlens_kv(seqused_k, num_seqs),
+            cu_seqlens_kv=(
+                seqused_k if direct_kv_lengths else _cu_seqlens_kv(seqused_k, num_seqs)
+            ),
             q_descale=_scaled_q_descale(q_descale, softmax_scale, q.shape[-1]),
             k_descale=k_descale,
             v_descale=v_descale,

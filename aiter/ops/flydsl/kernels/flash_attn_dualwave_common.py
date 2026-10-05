@@ -753,6 +753,8 @@ class DualwaveSwpFp8Traits:
     # module can never alias a linear one under the same JIT key.
     KV_VECTORIZED: bool = False
     KV_VEC_SIZE: int = 16
+    CONVENTIONAL: bool = False
+    DIRECT_KV_LENGTHS: bool = False
 
     @property
     def cache_tag(self):
@@ -802,6 +804,8 @@ class DualwaveSwpFp8Traits:
             # linear one under the same JIT key.
             self.KV_VECTORIZED,
             self.KV_VEC_SIZE,
+            self.CONVENTIONAL,
+            self.DIRECT_KV_LENGTHS,
         )
 
 
@@ -824,13 +828,14 @@ def _make_dualwave_swp_fp8_traits(
     gqa_pack_m=None,
     kv_vectorized=False,
     kv_vec_size=16,
+    conventional=False,
+    direct_kv_lengths=False,
 ):
     """Build gfx950 DUALWAVE_SWP fp8 compile-time layout traits (dtype fixed to fp8).
 
-    Always builds the BN128 deep-pipeline shape (6-deep K prefetch ring, Q in
-    registers, DMA V staging, direct packed-i32x8 PV) -- the only shape fp8
-    builds at all; the shallow path's PV dispatch expects an unpacked P pair
-    the body never produces.
+    The default BN128 pipeline uses six K/V slots. The conventional BN64
+    prototype uses two slots and four waves; both keep Q in registers and
+    use direct packed-i32x8 PV.
 
     ``paged`` addresses KV through a block table instead of contiguously. Page
     size is not a parameter: it is structurally ``BLOCK_N`` (64), which is why
@@ -839,21 +844,17 @@ def _make_dualwave_swp_fp8_traits(
     and V loaders both branch on ``KV_VECTORIZED`` and read the 5D-shuffled
     layout (``load_k`` address-only, ``_stage_v_fp8_coalesced`` for V staging).
 
-    CTA width is fixed at 8 waves (``block_m = 256``): the fp8 V staging path
-    distributes BLOCK_N rows over waves with a hardcoded literal 8
-    (``_stage_v_fp8_block_dma``), so anything else would stage a partial V
-    tile. Ring depth is fixed at 6 buffers: the BN128
-    body's prefetch distance is hardcoded to reach 4/5 buffers ahead
-    (``_ring_wrap(a_buf + 4/5)`` in ``flash_attn_fp8_gfx950.py``), so fewer
-    than 6 live buffers alias a buffer still being read (wrong output at 4,
-    a memory fault at 3).
+    The staggered BN128 body requires eight waves and six slots because its
+    prefetch reaches four/five slots ahead. Conventional mode preserves the
+    eight-stripe K layout with two copies per wave. Only shuffled single-pass
+    calls select it; linear V staging and split-K keep the original geometry.
     """
     # Tile shape and wave geometry follow the gfx950 dual-wave CTA.
     block_n = 64
     k_sub_n = 32
     warp_size = 64
     rows_per_wave = 32
-    num_waves = 8
+    num_waves = 4 if conventional else 8
     block_size = num_waves * warp_size
     block_m = num_waves * rows_per_wave
 
@@ -910,14 +911,11 @@ def _make_dualwave_swp_fp8_traits(
     smem_k_pad = 16 // elem_bytes
     smem_k_line_stride = smem_linear_wave + smem_k_pad
     smem_k_tile_elems = smem_n_rpt * smem_d_rpt * smem_k_line_stride
-    # BN128 (the deep-pipeline shape: 6-deep K prefetch ring, Q held in
-    # registers, DMA V staging, packed-i32x8 direct PV) is the only shape fp8
-    # builds -- the shallow path's PV dispatch expects an unpacked P pair the
-    # body never produces, so it does not build at all. Ring depth is welded
-    # to 6: see the docstring for why fewer buffers aliases a live one.
+    # Ring depth follows the body: staggered prefetch reaches four/five slots
+    # ahead; the conventional loop only stages the next tile.
     qreg = True
     vdma = True
-    num_prefetch_k = 6
+    num_prefetch_k = 2 if conventional else 6
     dualwave_swp_kv_per_buffer = smem_k_tile_elems
     lds_kv_total_size = num_prefetch_k * dualwave_swp_kv_per_buffer
     dualwave_swp_k_buf_base = tuple(
@@ -1027,6 +1025,8 @@ def _make_dualwave_swp_fp8_traits(
         LGKMCNT_0_ONLY=0xC07F,
         KV_VECTORIZED=bool(kv_vectorized),
         KV_VEC_SIZE=int(kv_vec_size),
+        CONVENTIONAL=bool(conventional),
+        DIRECT_KV_LENGTHS=bool(direct_kv_lengths),
     )
 
 
@@ -1179,12 +1179,21 @@ class DualwaveFp8KernelContext:
             self.q_tok_end = _cu_load(
                 _cuq_div, self.batch_idx + fx.Int32(1), _cu_atom, _cu_v1i32
             )
-            self.kv_tok_base = _cu_load(_cuk_div, self.batch_idx, _cu_atom, _cu_v1i32)
-            self.kv_tok_end = _cu_load(
-                _cuk_div, self.batch_idx + fx.Int32(1), _cu_atom, _cu_v1i32
-            )
+            if const_expr(traits.DIRECT_KV_LENGTHS):
+                self.kv_tok_base = fx.Int32(0)
+                self.seqlen_kv_v = _cu_load(
+                    _cuk_div, self.batch_idx, _cu_atom, _cu_v1i32
+                )
+                self.kv_tok_end = self.seqlen_kv_v
+            else:
+                self.kv_tok_base = _cu_load(
+                    _cuk_div, self.batch_idx, _cu_atom, _cu_v1i32
+                )
+                self.kv_tok_end = _cu_load(
+                    _cuk_div, self.batch_idx + fx.Int32(1), _cu_atom, _cu_v1i32
+                )
+                self.seqlen_kv_v = self.kv_tok_end - self.kv_tok_base
             self.seqlen_q_v = self.q_tok_end - self.q_tok_base
-            self.seqlen_kv_v = self.kv_tok_end - self.kv_tok_base
             self.seqlen_kv_i32 = fx.Int32(self.seqlen_kv_v)
         else:
             self.q_tok_base = self.batch_idx * self.seq_len_v
@@ -1390,12 +1399,13 @@ class DualwaveFp8KernelContext:
             )
         else:
             max_num_tiles = fx.Int32(num_kv_tiles)
-        # Pipeline needs an EVEN tile count >= 4; extra tiles read 0
-        # (num_records) and are masked.
-        max_num_tiles = ((max_num_tiles + fx.Int32(1)) // fx.Int32(2)) * fx.Int32(2)
-        max_num_tiles = fx.Int32(
-            (max_num_tiles < fx.Int32(4)).select(fx.Int32(4), max_num_tiles)
-        )
+        # The staggered pipeline needs an even tile count >= 4. Conventional
+        # mode can stop at the exact causal extent, including a one-tile range.
+        if const_expr(not traits.CONVENTIONAL):
+            max_num_tiles = ((max_num_tiles + fx.Int32(1)) // fx.Int32(2)) * fx.Int32(2)
+            max_num_tiles = fx.Int32(
+                (max_num_tiles < fx.Int32(4)).select(fx.Int32(4), max_num_tiles)
+            )
         self.max_num_tiles = max_num_tiles
         if const_expr(traits.SPLITK):
             chunk = (
@@ -1839,7 +1849,28 @@ class DualwaveFp8GemmHelper(DualwaveFp8KernelContext):
         for pks in range_constexpr(self.traits.PV_K_STEPS):
             p_base = pks * 8
             f32 += [hi_full[p_base + s] for s in range_constexpr(8)]
-        return self._pack_fp8_i32x8(f32)
+        packed = self._pack_fp8_i32x8(f32)
+        if const_expr(self.traits.CONVENTIONAL):
+            # Match V's intact 16-token vectors: exchange the lane-half K bit
+            # with the register K bit, after rounding P to the same fp8 bytes.
+            words = Vec(packed)
+            pair_ty = ir.Type.parse("!llvm.struct<(i32, i32)>")
+            reordered = []
+            for base in range_constexpr(0, 8, 4):
+                for i in range_constexpr(2):
+                    pair = rocdl.permlane32_swap(
+                        pair_ty,
+                        as_mlir_value(words[base + i]),
+                        as_mlir_value(words[base + i + 2]),
+                        False,
+                        False,
+                    )
+                    reordered += [
+                        fx.Int32(llvm.extractvalue(T.i32, pair, [0])),
+                        fx.Int32(llvm.extractvalue(T.i32, pair, [1])),
+                    ]
+            packed = Vec.from_elements(reordered, fx.Int32).ir_value()
+        return packed
 
     def _pv_fp8_direct(self, p_fp8, v_v, v_o):
         v_o = _anchor_v_o(self.traits, v_o)
@@ -2029,13 +2060,17 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8PageIdLoader):
         eb = traits.ELEM_BYTES
         k_div, k_soffset = self._kv_src("k", tile_start, page_id)
         k_lds_byte_base = self.lds_kv_base_idx + self.k_buf_base(buf_id) * eb
-        for d in range_constexpr(self.NUM_DMA_K):
+        for load in range_constexpr(self.NUM_DMA_K * (8 // traits.NUM_WAVES)):
+            d = load // (8 // traits.NUM_WAVES)
+            stripe = (
+                self.wave_id_uni + (load % (8 // traits.NUM_WAVES)) * traits.NUM_WAVES
+            )
             lds_addr = (
                 k_lds_byte_base
-                + self.wave_id_uni * (traits.SMEM_K_LINE_STRIDE * eb)
+                + stripe * (traits.SMEM_K_LINE_STRIDE * eb)
                 + (d * traits.SMEM_N_RPT * traits.SMEM_K_LINE_STRIDE * eb)
             )
-            n_in_tile = self.n_in_warp * traits.NUM_WAVES + self.wave_id
+            n_in_tile = self.n_in_warp * 8 + stripe
             global_d = self.d_bucket * traits.VEC_KV + (d * traits.D_128B_SIZE)
             if const_expr(traits.KV_VECTORIZED):
                 # Shuffled 5D K cache: the linear path above fetches the
@@ -2137,61 +2172,33 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8PageIdLoader):
     def _stage_v_fp8_coalesced(
         self, tile_start, buf_id, page_id, aligned_base, buf_off
     ):
-        """Swizzled token-contiguous V staging for the shuffled 5D fp8 cache.
-
-        V's innermost x=16 axis holds 16 TOKENS at one head-dim, so a single
-        coalesced 128-bit load fetches 16 tokens (4 quads) of one head-dim.
-        Those go straight into a token-contiguous LDS layout with four
-        dword (ds_write_b32) stores.
-
-        Layout ``L_tok``: row = ``d*BLOCK_N`` (one 64-byte row per head-dim),
-        and within a row the quad index is rotated by ``d % 16``:
-        ``col = ((quad + d%16) % (BLOCK_N//4)) * 4``. The rotation makes the
-        read (16 lanes reading 16 consecutive head-dims of one quad, see
-        ``_load_v_fp8_coalesced``) hit 16 distinct banks -- without it the
-        64-byte rows collapse those 16 lanes onto 2 banks (8-way conflict).
-        The token<->head_dim transpose the PV MFMA needs is done in the read.
-        """
+        """Keep each shuffled 16-token vector intact in LDS for wide PV reads."""
         traits = self.traits
-        HD = traits.HEAD_DIM
-        BN = traits.BLOCK_N
-        vec = traits.KV_VEC_SIZE
-        nquads = BN // 4  # quads per row (16)
         v_div, _ = self._kv_src("v", tile_start, page_id)
-        # Lane->(d, tc) assignment for a COALESCED gmem load: the 5D V region is
-        # contiguous in head-dim for a fixed token-group (src stride vec in d),
-        # so consecutive threads must take consecutive d. (d=tid//ngroups would
-        # stride HD*vec=2048 B between consecutive lanes -- the scatter path's
-        # poor coalescing.) The LDS write address is computed from (d, tc)
-        # explicitly, so this assignment is free to optimise the load.
-        # tid decomposes as (tc, d) over [., HD] (d contiguous); the coalesced
-        # gmem src is [tc, d] with strides (HD*vec, vec) within the head region.
-        # Int64 crd2idx keeps the address 64-bit as the prior fx.Int64 terms did.
-        tid_layout = fx.make_layout((1 << 20, HD), (HD, 1))
-        src_layout = fx.make_layout((1 << 20, HD), (HD * vec, vec))
-        crd = fx.idx2crd(fx.Int32(self.tid), tid_layout)
-        tc = fx.Int32(fx.get(crd, 0))
-        d = fx.Int32(fx.get(crd, 1))
-        head_region_base = self.kv_head_idx * fx.Int64(HD * traits.BLOCK_N)
-        src_elem = head_region_base + fx.Int64(
-            fx.get_scalar(fx.crd2idx((fx.Int64(tc), fx.Int64(d)), src_layout))
-        )
-        v16 = fly.copy_atom_call_ssa(
-            [Vec.make_type(4, fx.Int32)],
-            self.load_atom_128,
-            fx.slice(v_div, (None, fx.Int32(src_elem))),
-        )
-        v4 = Vec(v16)  # 4 dwords = 4 token-quads of this head-dim
-        dmask = d % fx.Int32(16)
-        row = aligned_base + fx.Int32(buf_off) + d * fx.Int32(BN)
-        quads_per_group = vec // 4  # 4
-        for qi in range_constexpr(quads_per_group):
-            qglobal = tc * fx.Int32(quads_per_group) + fx.Int32(qi)
-            # Hand-tuned bank-conflict mod-rotation, kept as raw arithmetic (a
-            # SwizzleType composition for it is unresolved), not a layout crd2idx.
-            col = ((qglobal + dmask) % fx.Int32(nquads)) * fx.Int32(4)
-            p = kernels_common.create_llvm_ptr(row + col, address_space=3)
-            llvm.StoreOp(as_mlir_value(fx.Int32(v4[qi])), p, alignment=4)
+        head_region_base = self.kv_head_idx * fx.Int64(traits.HEAD_DIM * traits.BLOCK_N)
+        for load in range_constexpr(8 // traits.NUM_WAVES):
+            src_elem = head_region_base + fx.Int64(
+                self.tid + load * traits.BLOCK_SIZE
+            ) * fx.Int64(16)
+            # DMA adds lane*16 to the wave-uniform destination address.
+            lds_addr = (
+                aligned_base
+                + fx.Int32(buf_off)
+                + (self.wave_id_uni + load * traits.NUM_WAVES) * fx.Int32(1024)
+            )
+            if const_expr(traits.CONVENTIONAL):
+                # C publishes this buffer at the loop-entry wait/barrier. Do
+                # not make its reads drain the other buffer's in-flight DMA.
+                rocdl.raw_ptr_buffer_load_async_lds(
+                    rocdl.get_buffer_rsrc(fx.get_iter(v_div)),
+                    kernels_common.create_llvm_ptr(lds_addr, address_space=3),
+                    as_mlir_value(fx.Int32(16)),
+                    as_mlir_value(fx.Int32(src_elem)),
+                    as_mlir_value(fx.Int32(0)),
+                    as_mlir_value(fx.Int32(0)),
+                )
+            else:
+                self.buffer_load_lds_128(v_div, lds_addr, src_elem, 0)
 
     def _stage_vt_dequant_fp8(self, tile_start, buf_id):
         # Dequantize fp8 V into the exact bf16 V staging positions. The two d-iters
@@ -2346,60 +2353,71 @@ class DualwaveFp8KvLdsToVgprLoader(DualwaveFp8KernelContext):
                 packs[ks][dc] = _tr8(imm0)
         return packs
 
-    def _load_v_fp8_coalesced(self, buf_id):
-        """Read the token-contiguous L_tok[d*BLOCK_N + token] laid down by
-        ``_stage_v_fp8_coalesced`` and deliver the byte-identical PV MFMA
-        operand the ds_read_b64_tr_b8 path produced from L_lin.
-
-        The tr8 path is characterised (from the CDNA4 transpose semantics,
-        FlyROCDL CopyAtom) by: for lane ``L`` (0..63), pack ``(ks, dc)``,
-        operand element ``j`` (0..7),
-            d       = 32*dc + 16*(gi & 1) + (L % 16)
-            dest_n  = 16*ks + 8*(gi // 2) + j          (gi = L // 16)
-            token   = swap16(dest_n)                   (quads 4-7 <-> 8-11)
-            operand[j] = V[token, d].
-        Under swap16 the 8 tokens of a pack are two 4-token quads (global quad
-        index ``Q = 4*ks + qoff``): for gi < 2 the quad offsets are {0, 2}
-        (tokens {16ks+0..3, 16ks+8..11}); for gi >= 2 they are {1, 3} (tokens
-        {16ks+4..7, 16ks+12..15}). ``_stage_v_fp8_coalesced`` stored quad ``Q``
-        of head-dim ``d`` at row ``d*BLOCK_N`` and rotated column
-        ``((Q + d%16) % (BLOCK_N//4)) * 4``; here ``d % 16 == L_local``, so the
-        rotation spreads the 16 lanes of a tr8-group across 16 distinct banks.
-        Each pack is two swizzled 32-bit reads concatenated into the i64 pack --
-        conflict-free plain reads, no transpose read, no scatter.
-        """
+    def _load_v_fp8_full_width(self, buf_id):
+        """Consume every dword; lane halves own adjacent 16-token groups."""
         traits = self.traits
-        BN = traits.BLOCK_N
-        nquads = BN // 4  # quads per row (16)
-        v_tile_bytes = (traits.BLOCK_N // 8) * (traits.HEAD_DIM // 16) * 128
-        buf_off = buf_id * v_tile_bytes
         aligned_base = (
             (self.lds_vt_base_idx + fx.Int32(127)) // fx.Int32(128)
         ) * fx.Int32(128)
-        tile_base = aligned_base + fx.Int32(buf_off)
-        gi = self.lane // fx.Int32(16)
-        l_local = self.lane % fx.Int32(16)
-        gi_lo = gi % fx.Int32(2)  # gi & 1 -> which 16-wide head-dim half
-        qoffA = gi // fx.Int32(2)  # 0 for gi<2, 1 for gi>=2
-        qoffB = qoffA + fx.Int32(2)
-        dmask = l_local  # == d % 16 for every dc below
-        i32x1 = Vec.make_type(1, fx.Int32)
-
-        def _read32(byte_off):
-            p = kernels_common.create_llvm_ptr(byte_off, address_space=3)
-            return Vec(llvm.LoadOp(i32x1, p, alignment=4).result)
-
+        tile_base = aligned_base + fx.Int32(buf_id * traits.BLOCK_N * traits.HEAD_DIM)
+        d_lane = self.lane % fx.Int32(32)
+        token_group = self.lane // fx.Int32(32)
+        i32x4 = Vec.make_type(4, fx.Int32)
         packs = [[None] * traits.D_CHUNKS for _ in range(4)]
         for dc in range_constexpr(traits.D_CHUNKS):
-            d = fx.Int32(32 * dc) + fx.Int32(16) * gi_lo + l_local
-            row = tile_base + d * fx.Int32(BN)
+            for half in range_constexpr(2):
+                # Each 16-lane read phase spans all 64 banks, as in the flat
+                # shuffled-cache layout; no LDS transpose or extra copy is needed.
+                byte_off = (
+                    tile_base
+                    + (token_group + fx.Int32(2 * half))
+                    * fx.Int32(traits.HEAD_DIM * 16)
+                    + (d_lane + fx.Int32(32 * dc)) * fx.Int32(16)
+                )
+                p = kernels_common.create_llvm_ptr(byte_off, address_space=3)
+                v = Vec(llvm.LoadOp(i32x4, p, alignment=16).result)
+                for pair in range_constexpr(2):
+                    v2 = Vec.from_elements(
+                        [fx.Int32(v[2 * pair]), fx.Int32(v[2 * pair + 1])],
+                        fx.Int32,
+                    )
+                    packs[2 * half + pair][dc] = llvm.bitcast(T.i64, as_mlir_value(v2))
+        return packs
+
+    def _load_v_fp8_coalesced(self, buf_id):
+        """Read aligned token vectors and select the PV operand's two quads.
+
+        Sixteen adjacent head dimensions span all 64 LDS banks. The two
+        lane halves read the same vector, selecting even/odd token quads to
+        preserve the existing PV packing without an LDS scatter.
+        """
+        traits = self.traits
+        if const_expr(traits.CONVENTIONAL):
+            return self._load_v_fp8_full_width(buf_id)
+        v_tile_bytes = traits.BLOCK_N * traits.HEAD_DIM
+        aligned_base = (
+            (self.lds_vt_base_idx + fx.Int32(127)) // fx.Int32(128)
+        ) * fx.Int32(128)
+        tile_base = aligned_base + fx.Int32(buf_id * v_tile_bytes)
+        d_lane = self.lane % fx.Int32(32)
+        odd = self.lane >= fx.Int32(32)
+        i32x4 = Vec.make_type(4, fx.Int32)
+        packs = [[None] * traits.D_CHUNKS for _ in range(4)]
+        for dc in range_constexpr(traits.D_CHUNKS):
+            d = fx.Int32(32 * dc) + d_lane
             for ks in range_constexpr(4):
-                qbase = fx.Int32(4 * ks)
-                colA = row + ((qbase + qoffA + dmask) % fx.Int32(nquads)) * fx.Int32(4)
-                colB = row + ((qbase + qoffB + dmask) % fx.Int32(nquads)) * fx.Int32(4)
-                a = _read32(colA)
-                b = _read32(colB)
-                v2 = a.shuffle(b, [0, 1])
+                byte_off = (
+                    tile_base + fx.Int32(ks * traits.HEAD_DIM * 16) + d * fx.Int32(16)
+                )
+                p = kernels_common.create_llvm_ptr(byte_off, address_space=3)
+                v = Vec(llvm.LoadOp(i32x4, p, alignment=16).result)
+                v2 = Vec.from_elements(
+                    [
+                        odd.select(fx.Int32(v[1]), fx.Int32(v[0])),
+                        odd.select(fx.Int32(v[3]), fx.Int32(v[2])),
+                    ],
+                    fx.Int32,
+                )
                 packs[ks][dc] = llvm.bitcast(T.i64, as_mlir_value(v2))
         return packs
 

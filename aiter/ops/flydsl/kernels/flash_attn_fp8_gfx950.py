@@ -64,6 +64,8 @@ def build_flash_attn_dualwave_swp_fp8_module(
     pv_spread=False,
     gqa_pack_m=None,
     kv_cache_layout="linear",
+    conventional=False,
+    direct_kv_lengths=False,
 ):
     """Build the gfx950 D=128 dual-wave flash-attention launcher.
 
@@ -83,7 +85,9 @@ def build_flash_attn_dualwave_swp_fp8_module(
     token-contiguous store (see ``_stage_v_fp8_coalesced``), both
     correctness-validated bit-identical against the linear path. A caller
     building with ``kv_cache_layout="vectorized"`` must pass 5D-shuffled K AND
-    V at runtime."""
+    V at runtime. The adapter defaults ``conventional=True`` for compatible
+    shuffled single-pass calls (four-wave BN64); linear KV, split-K, and GQA
+    groups that cannot tile 128 M-rows retain the BN128 body."""
     gpu_arch = get_hip_arch()
 
     if not gpu_arch.startswith("gfx950"):
@@ -108,11 +112,10 @@ def build_flash_attn_dualwave_swp_fp8_module(
         raise ValueError(
             f"flash_attn_dualwave_swp_fp8 output supports bf16/f16 only, got out_dtype={out_dtype_str}"
         )
-    # fp8 always builds the BN128 deep-pipeline path: the shallow path's PV
-    # dispatch expects an unpacked P pair the body never produces. Split-K and
-    # varlen are both supported -- split-K needs the combine pass to pack output
-    # at the kernel's fixed 2-byte width (see pack_output), varlen needs the
-    # active guard (see compute_active_guard), both in the common module.
+    # Split-K retains the BN128 body and its combine pass. Conventional mode
+    # below shares the varlen guard and the single-pass output packer.
+    if direct_kv_lengths and not (varlen and paged):
+        raise ValueError("direct KV lengths require varlen paged KV")
 
     if num_kv_heads is None:
         num_kv_heads = num_heads
@@ -122,8 +125,8 @@ def build_flash_attn_dualwave_swp_fp8_module(
     # varlen + split-K: each sequence has its OWN kv length, so the per-segment
     # KV range must come from that sequence's length rather than a batch-wide
     # scalar. init_tile_bounds already derives the segment [split_t0, split_t_end)
-    # from self.seqlen_kv_v, which is per-sequence under VARLEN (init_sequence_
-    # lengths reads cu_seqlens_kv[b+1]-cu_seqlens_kv[b]); the paged block-table
+    # from self.seqlen_kv_v, which is per-sequence under VARLEN (either the
+    # direct paged length or cu_seqlens_kv[b+1]-cu_seqlens_kv[b]); the paged block-table
     # stage and store_empty_split likewise key on the per-sequence max_num_tiles,
     # so empty/partial segments past a short sequence contribute nothing to the
     # combine. compute_active_guard ANDs the split-nonempty and per-sequence
@@ -168,6 +171,17 @@ def build_flash_attn_dualwave_swp_fp8_module(
                 f"got page_size={_PAGED_PAGE_SIZE}"
             )
 
+    # The prototype keeps the legacy path for linear KV and split-K.
+    conventional = bool(
+        conventional
+        and kv_vectorized
+        and NUM_KV_SPLITS == 1
+        and 128 % (num_heads // num_kv_heads) == 0
+    )
+    if conventional:
+        dualwave_swp_enable_stagger = False
+        dualwave_swp_setprio = False
+
     # All compile-time tile/layout constants live in the fp8 traits object.
     traits = _make_dualwave_swp_fp8_traits(
         num_heads,
@@ -188,6 +202,8 @@ def build_flash_attn_dualwave_swp_fp8_module(
         gqa_pack_m=gqa_pack_m,
         kv_vectorized=kv_vectorized,
         kv_vec_size=KV_VEC_SIZE,
+        conventional=conventional,
+        direct_kv_lengths=direct_kv_lengths,
     )
     # kv_vectorized builds K AND V: load_k's KV_VECTORIZED branch reads the 5D
     # shuffled K layout (address-only, no LDS/MFMA change; see
@@ -373,7 +389,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
                 m_tile = softmax_helper.floor_masked_max(m_tile)
             return m_tile
 
-        def _main_body():
+        def _staggered_body():
             kv_gmem_to_lds.load_k(t0 * BN, fx.Int32(t0) % fx.Int32(NPF))
             q_loader.stage_q_to_lds()
             rocdl.s_waitcnt(0)
@@ -576,6 +592,100 @@ def build_flash_attn_dualwave_swp_fp8_module(
                 # unconditionally, leaving the workspace all zeros -- the
                 # partial-store helpers existed but nothing called them.
                 output_store.store_splitk_partial_o(v_o, m_row, l_row, q_row)
+
+        def _conventional_body():
+            q_loader.stage_q_to_lds()
+            kv_gmem_to_lds.load_k(t0 * BN, fx.Int32(0))
+            kv_gmem_to_lds.load_v(t0 * BN, fx.Int32(0))
+            rocdl.s_waitcnt(0)
+            rocdl.s_barrier()
+            ctx.init_q_row()
+            q_row = ctx.q_row
+            q_wide = gemm_helper.load_q_wide()
+            if const_expr(traits.USE_SINKS):
+                m_row = fx.Float32(softmax_helper.load_sink_logit())
+            else:
+                m_row = ctx.c_neg_inf
+            l_row = ctx.c_zero_f
+            v_o = [ctx.c_zero_v16f32 for _ in range_constexpr(D_CHUNKS)]
+            init_args = [m_row, l_row] + v_o
+            loop_results = init_args
+            for j, loop_args in range(t0, t_end, fx.Int64(1), init=init_args):
+                m_row = loop_args[0]
+                l_row = loop_args[1]
+                v_o = [loop_args[2 + i] for i in range_constexpr(D_CHUNKS)]
+                buf = fx.Int32(j) % fx.Int32(2)
+                next_buf = fx.Int32(1) - buf
+                # This rendezvous publishes the next tile and retires every
+                # reader of the slot about to be reused, across all four waves.
+                rocdl.s_waitcnt(0)
+                rocdl.sched_barrier(0)
+                rocdl.s_barrier()
+                rocdl.sched_barrier(0)
+                pf = fx.Int64(j) + fx.Int64(1)
+                page = kv_gmem_to_lds.end_page_ids(kv_gmem_to_lds.begin_page_ids([pf]))[
+                    0
+                ]
+                kv_gmem_to_lds.load_k(pf * BN, next_buf, page)
+                kv_gmem_to_lds.load_v(pf * BN, next_buf, page)
+                v_k = kv_lds_to_regs.load_k(buf)
+                v_s = gemm_helper.qk(v_k, q_wide)
+                if const_expr(traits.CAUSAL):
+                    v_s = softmax_helper.causal_mask_prologue_if_needed(
+                        v_s, fx.Int32(j), (fx.Int32(j) + fx.Int32(1)) * BN
+                    )
+                else:
+                    v_s = softmax_helper.seq_pad_mask_if_needed(v_s, fx.Int32(j))
+                m_tile = softmax_helper.reduce_max(v_s)
+                if const_expr(traits.CAUSAL):
+                    m_tile = softmax_helper.floor_masked_max(m_tile)
+                v_o, m_new, l_row = softmax_helper.lazy_correct_o(
+                    v_o, m_row, l_row, m_tile
+                )
+                v_s = softmax_helper.sub_m(v_s, m_new)
+                v_p = softmax_helper.exp2(v_s, 0, 16)
+                v_p = softmax_helper.exp2(v_p, 16, 16)
+                l_row = softmax_helper.reduce_sum(l_row, v_p)
+                v_p = gemm_helper.cast_p_fp8_direct(v_p)
+                v_v = kv_lds_to_regs.load_v(buf)
+                v_o = gemm_helper.pv(v_p, v_v, v_o)
+                loop_results = yield [m_new, l_row] + v_o
+            m_row = loop_results[0]
+            l_row = loop_results[1]
+            v_o = [loop_results[2 + i] for i in range_constexpr(D_CHUNKS)]
+
+            # Sinks: add exp(sink) to the denominator (epilogue only). The sink
+            # has no value vector, so it contributes to l_row but not v_o.
+            if const_expr(traits.USE_SINKS):
+                l_row = fx.Float32(softmax_helper.add_sink_denom(l_row, m_row))
+            inv_l_rcp = rocdl.rcp(T.f32, _raw(l_row))
+            inv_l = (fx.Float32(l_row) > ctx.c_zero_f).select(inv_l_rcp, ctx.c_zero_f)
+            if const_expr(traits.FP8_PV):
+                inv_l = fx.Float32(inv_l) * ctx.vd_fp8
+            softmax_helper.scale_o(v_o, inv_l)
+            # Close the phase shift: group A takes the barrier group B took in
+            # the prologue, so both groups have executed the same number over
+            # the kernel's lifetime and neither is left waiting at a rendezvous
+            # no one else reaches. Placed after the last compute and before the
+            # store, the final point where the two groups still need to agree.
+            if const_expr(traits.DUALWAVE_SWP_ENABLE_STAGGER):
+                stagger_extra_barrier_if_zero(ctx.stagger_i32)
+            rocdl.s_barrier()
+            if const_expr(not SPLITK):
+                output_store.store_final_o(v_o, q_row)
+            else:
+                # Under split-K this workgroup owns one KV range, so it writes a
+                # partial plus its (m, l) for the combine pass instead of the
+                # final output. The fp8 body previously called store_final_o
+                # unconditionally, leaving the workspace all zeros -- the
+                # partial-store helpers existed but nothing called them.
+                output_store.store_splitk_partial_o(v_o, m_row, l_row, q_row)
+
+        def _main_body():
+            if const_expr(conventional):
+                _conventional_body()
+            else:
+                _staggered_body()
 
         # Under varlen the grid is sized for the longest sequence, so a shorter
         # sequence's surplus Q blocks would write into the next packed sequence's
