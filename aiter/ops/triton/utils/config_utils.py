@@ -56,15 +56,42 @@ def load_config_json(fpath: str, required: bool = True) -> dict | None:
 
 def select_leq_config(
     configs: dict,
-    value: int,
+    value: int | None = None,
     *,
     prefix: str = "N_LEQ_",
     fallback_key: str = "any",
+    axes: tuple | None = None,
+    **values,
 ) -> dict:
-    """Copy the smallest prefixed upper-bound config containing ``value``.
+    """Copy the config whose bucket contains the given value.
 
-    Use ``fallback_key`` when no threshold matches.
+    One axis: pass ``value``. The smallest ``<prefix><bound>`` key with
+    ``value <= bound`` wins. Use ``fallback_key`` when no threshold matches.
+
+    Many axes: pass ``axes`` and one keyword value per axis. A key joins one
+    ``<axis>_LEQ_<n>`` or ``<axis>_GEQ_<n>`` part per constrained axis with
+    ``.``, for example ``M_LEQ_32.N_LEQ_1024``. Per axis, in ``axes`` order
+    (leftmost wins ties): LEQ bounds ascending, then GEQ bounds descending,
+    then ``"any"``. The ``"any"`` key is required. ``prefix`` and
+    ``fallback_key`` apply to the one-axis form only.
     """
+    if axes is not None:
+        axes = tuple(axes)
+        if value is not None:
+            raise TypeError("pass either value or axes, not both")
+        missing = [a for a in axes if a not in values]
+        unexpected = [k for k in values if k not in axes]
+        if missing or unexpected:
+            raise TypeError(
+                f"axes {axes}: missing values for {missing}, unexpected {unexpected}"
+            )
+        return _select_by_axes(configs, axes, values)
+    if values:
+        raise TypeError(
+            f"unexpected keyword arguments {sorted(values)}; pass axes= to use them"
+        )
+    if value is None:
+        raise TypeError("select_leq_config needs either value or axes")
     threshold_keys = sorted(
         (key for key in configs if key.startswith(prefix)),
         key=lambda key: int(key[len(prefix) :]),
@@ -184,7 +211,8 @@ def _bound_of(component: str) -> int:
 
 
 def _candidates(axis: str, value, parts: set) -> list:
-    """Matching components of ``axis``: LEQ ascending, GEQ descending, ``any``."""
+    """Components of ``axis`` matching ``value``, most specific first: LEQ
+    bounds ascending, then GEQ bounds descending, then ``"any"``."""
     leq = sorted((c for c in parts if c.startswith(f"{axis}_LEQ_")), key=_bound_of)
     geq = sorted(
         (c for c in parts if c.startswith(f"{axis}_GEQ_")), key=_bound_of, reverse=True
@@ -207,7 +235,8 @@ def _canonical(key: str, axes: tuple) -> tuple:
 
 @functools.lru_cache(maxsize=None if USE_LRU_CACHE else 0)
 def _bucket_index(keys: tuple, axes: tuple) -> tuple:
-    """Cached ``(slots -> key, components per axis)``."""
+    """Build ``(slots -> key, LEQ/GEQ components declared per axis)``, cached
+    on the key names (all it depends on)."""
     parts = {a: set() for a in axes}
     for key in keys:
         if key != "any":
@@ -216,8 +245,7 @@ def _bucket_index(keys: tuple, axes: tuple) -> tuple:
     return {_canonical(k, axes): k for k in keys}, parts
 
 
-def lookup_config(table: dict, axes: tuple, **values) -> dict:
-    """Bucket-table lookup: per axis (leftmost first) LEQ ascending, GEQ descending, ``any``."""
+def _select_by_axes(table: dict, axes: tuple, values: dict) -> dict:
     index, parts = _bucket_index(tuple(table), axes)
     per_axis = [_candidates(axis, values[axis], parts[axis]) for axis in axes]
     for slots in itertools.product(*per_axis):

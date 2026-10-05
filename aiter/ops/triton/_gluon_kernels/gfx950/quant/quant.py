@@ -5,7 +5,83 @@ import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+from aiter.ops.triton._gluon_kernels.common.utils import mx_e8m0_scale
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
+
+@gluon.constexpr_function
+def _quant_layout(BLOCK_SIZE_M, num_warps):
+    # A warp tile is 8 rows x 64 cols. Put all warps on M if it fits, else on N.
+    warps_m = num_warps if (BLOCK_SIZE_M // 8) >= num_warps else 1
+    return gl.BlockedLayout(
+        size_per_thread=[1, 8],  # N is contiguous; 8 elems give dwordx4 loads
+        threads_per_warp=[8, 8],
+        warps_per_cta=[warps_m, num_warps // warps_m],
+        order=[1, 0],
+    )
+
+
+@gluon.jit
+def _store_quant_tile(
+    out_tensor,
+    bs_e8m0,
+    out_ptr,
+    bs_ptr,
+    stride_out_m_in,
+    stride_out_n_in,
+    stride_bs_m_in,
+    stride_bs_n_in,
+    pid_m,
+    pid_n,
+    M,
+    n_out,
+    n_scales,
+    BLOCK_SIZE_M: gl.constexpr,
+    OUT_BLOCK_N: gl.constexpr,
+    NUM_QUANT_BLOCKS: gl.constexpr,
+    EVEN_M_N: gl.constexpr,
+):
+    # Store one quantized tile and its e8m0 scales; n_out and n_scales are row extents.
+    stride_out_m = gl.cast(stride_out_m_in, gl.int64)
+    stride_out_n = gl.cast(stride_out_n_in, gl.int64)
+    stride_bs_m = gl.cast(stride_bs_m_in, gl.int64)
+    stride_bs_n = gl.cast(stride_bs_n_in, gl.int64)
+
+    out_m_local = gl.arange(0, BLOCK_SIZE_M)
+    out_n_local = gl.arange(0, OUT_BLOCK_N)
+    out_block_ptr = (
+        out_ptr
+        + (pid_m * BLOCK_SIZE_M).to(gl.int64) * stride_out_m
+        + (pid_n * OUT_BLOCK_N).to(gl.int64) * stride_out_n
+    )
+    out_offs = (
+        out_m_local[:, None] * stride_out_m_in + out_n_local[None, :] * stride_out_n_in
+    )
+    if EVEN_M_N:
+        gl.amd.cdna4.buffer_store(out_tensor, out_block_ptr, out_offs)
+    else:
+        out_mask = (pid_m * BLOCK_SIZE_M + out_m_local < M)[:, None] & (
+            pid_n * OUT_BLOCK_N + out_n_local < n_out
+        )[None, :]
+        gl.amd.cdna4.buffer_store(out_tensor, out_block_ptr, out_offs, mask=out_mask)
+
+    bs_m_local = gl.arange(0, BLOCK_SIZE_M)
+    bs_n_local = gl.arange(0, NUM_QUANT_BLOCKS)
+    bs_block_ptr = (
+        bs_ptr
+        + (pid_m * BLOCK_SIZE_M).to(gl.int64) * stride_bs_m
+        + (pid_n * NUM_QUANT_BLOCKS).to(gl.int64) * stride_bs_n
+    )
+    bs_offs = (
+        bs_m_local[:, None] * stride_bs_m_in + bs_n_local[None, :] * stride_bs_n_in
+    )
+    if EVEN_M_N:
+        gl.amd.cdna4.buffer_store(bs_e8m0, bs_block_ptr, bs_offs)
+    else:
+        bs_mask = (pid_m * BLOCK_SIZE_M + bs_m_local < M)[:, None] & (
+            pid_n * NUM_QUANT_BLOCKS + bs_n_local < n_scales
+        )[None, :]
+        gl.amd.cdna4.buffer_store(bs_e8m0, bs_block_ptr, bs_offs, mask=bs_mask)
 
 
 @gluon.jit
@@ -15,11 +91,8 @@ def _mxfp4_quant_op(
     BLOCK_SIZE_M: gl.constexpr,
     MXFP4_QUANT_BLOCK_SIZE: gl.constexpr,
 ):
-    """
-    Converts x (bf16) [BLOCK_SIZE_M, BLOCK_SIZE_N] to packed mxfp4 bytes via
-    gl.amd.cdna4.scaled_downcast, computing the per-32-element e8m0 scale
-    ourselves. Reduces over split evens/odds, not a plain reshape+max, so
-    amax's layout stays compatible with the split tensors it's compared to.
+    """Quantize a bf16 tile to packed mxfp4 and e8m0 scales.
+    Reduce over the even/odd split so amax keeps the split layout.
     """
     NUM_QUANT_BLOCKS: gl.constexpr = BLOCK_SIZE_N // MXFP4_QUANT_BLOCK_SIZE
     x_grouped = x.reshape(
@@ -28,12 +101,7 @@ def _mxfp4_quant_op(
     evens, odds = gl.split(x_grouped)
     amax = gl.maximum(gl.abs(evens), gl.abs(odds)).to(gl.float32)
     amax = gl.max(amax, axis=-1, keep_dims=True)
-    amax = amax.to(gl.int32, bitcast=True)
-    amax = (amax + 0x200000).to(gl.uint32, bitcast=True) & 0xFF800000
-    amax = amax.to(gl.float32, bitcast=True)
-    scale_e8m0_unbiased = gl.log2(amax).floor() - 2
-    scale_e8m0_unbiased = gl.maximum(-127, gl.minimum(scale_e8m0_unbiased, 127))
-    bs_e8m0 = (scale_e8m0_unbiased.to(gl.int32) + 127).to(gl.uint8)
+    bs_e8m0 = mx_e8m0_scale(amax, 2)
     bs_e8m0 = bs_e8m0.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS)
 
     x_fp4 = gl.amd.cdna4.scaled_downcast(x, bs_e8m0, "e2m1", axis=1)
@@ -43,7 +111,7 @@ def _mxfp4_quant_op(
 
 _gluon_dynamic_mxfp4_quant_kernel_gfx950_repr = make_kernel_repr(
     "gluon_dynamic_mxfp4_quant_kernel_gfx950",
-    ["BLOCK_SIZE_M", "BLOCK_SIZE_N", "NUM_ITER", "NUM_STAGES"],
+    ["BLOCK_SIZE_M", "BLOCK_SIZE_N", "NUM_ITER", "NUM_STAGES", "num_warps", "EVEN_M_N"],
 )
 
 
@@ -67,30 +135,15 @@ def gluon_dynamic_mxfp4_quant_kernel_gfx950(
     num_warps: gl.constexpr,
     MXFP4_QUANT_BLOCK_SIZE: gl.constexpr,
     EVEN_M_N: gl.constexpr,
-    SCALING_MODE: gl.constexpr,
 ):
     pid_m = gl.program_id(0)
     start_n = gl.program_id(1) * NUM_ITER
     # cast strides to int64, in case M*N > max int32
     stride_x_m = gl.cast(stride_x_m_in, gl.int64)
     stride_x_n = gl.cast(stride_x_n_in, gl.int64)
-    stride_x_fp4_m = gl.cast(stride_x_fp4_m_in, gl.int64)
-    stride_x_fp4_n = gl.cast(stride_x_fp4_n_in, gl.int64)
-    stride_bs_m = gl.cast(stride_bs_m_in, gl.int64)
-    stride_bs_n = gl.cast(stride_bs_n_in, gl.int64)
 
     NUM_QUANT_BLOCKS: gl.constexpr = BLOCK_SIZE_N // MXFP4_QUANT_BLOCK_SIZE
-    # Nominal warp tile is 8 rows (M) or 64 cols (N); put all warps on M only
-    # if BLOCK_SIZE_M fits them, else on N (avoids idle warps at small M).
-    WARPS_M: gl.constexpr = num_warps if (BLOCK_SIZE_M // 8) >= num_warps else 1
-    WARPS_N: gl.constexpr = num_warps // WARPS_M
-    # N is contiguous; 8 elems/thread gives dwordx4 loads.
-    layout: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 8],
-        threads_per_warp=[8, 8],
-        warps_per_cta=[WARPS_M, WARPS_N],
-        order=[1, 0],
-    )
+    layout: gl.constexpr = _quant_layout(BLOCK_SIZE_M, num_warps)
 
     end_n = min(start_n + NUM_ITER, N)
 
@@ -104,7 +157,6 @@ def gluon_dynamic_mxfp4_quant_kernel_gfx950(
         x_offs_m = pid_m * BLOCK_SIZE_M + local_m
 
     # NUM_STAGES==1: plain loop. ==2: double-buffered, warp-pipelined loop.
-    # Gluon has no closures, so the body is duplicated per branch.
     if NUM_STAGES == 1:
         for pid_n in range(start_n, end_n):
             x_block_ptr = (
@@ -125,52 +177,25 @@ def gluon_dynamic_mxfp4_quant_kernel_gfx950(
                 x, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
             )
 
-            out_m_local = gl.arange(0, BLOCK_SIZE_M)
-            out_n_local = gl.arange(0, BLOCK_SIZE_N // 2)
-            out_offs_m = pid_m * BLOCK_SIZE_M + out_m_local
-            out_offs_n = pid_n * (BLOCK_SIZE_N // 2) + out_n_local
-            out_block_offset = (pid_m * BLOCK_SIZE_M).to(gl.int64) * stride_x_fp4_m + (
-                pid_n * (BLOCK_SIZE_N // 2)
-            ).to(gl.int64) * stride_x_fp4_n
-            out_block_ptr = x_fp4_ptr + out_block_offset
-            out_offs = (
-                out_m_local[:, None] * stride_x_fp4_m_in
-                + out_n_local[None, :] * stride_x_fp4_n_in
+            _store_quant_tile(
+                out_tensor,
+                bs_e8m0,
+                x_fp4_ptr,
+                bs_ptr,
+                stride_x_fp4_m_in,
+                stride_x_fp4_n_in,
+                stride_bs_m_in,
+                stride_bs_n_in,
+                pid_m,
+                pid_n,
+                M,
+                N // 2,
+                (N + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE,
+                BLOCK_SIZE_M,
+                BLOCK_SIZE_N // 2,
+                NUM_QUANT_BLOCKS,
+                EVEN_M_N,
             )
-
-            if EVEN_M_N:
-                gl.amd.cdna4.buffer_store(out_tensor, out_block_ptr, out_offs)
-            else:
-                out_mask = (out_offs_m < M)[:, None] & (out_offs_n < (N // 2))[None, :]
-                gl.amd.cdna4.buffer_store(
-                    out_tensor, out_block_ptr, out_offs, mask=out_mask
-                )
-
-            bs_m_local = gl.arange(0, BLOCK_SIZE_M)
-            bs_n_local = gl.arange(0, NUM_QUANT_BLOCKS)
-            bs_offs_m = pid_m * BLOCK_SIZE_M + bs_m_local
-            bs_offs_n = pid_n * NUM_QUANT_BLOCKS + bs_n_local
-            bs_block_offset = (pid_m * BLOCK_SIZE_M).to(gl.int64) * stride_bs_m + (
-                pid_n * NUM_QUANT_BLOCKS
-            ).to(gl.int64) * stride_bs_n
-            bs_block_ptr = bs_ptr + bs_block_offset
-            bs_offs = (
-                bs_m_local[:, None] * stride_bs_m_in
-                + bs_n_local[None, :] * stride_bs_n_in
-            )
-            if EVEN_M_N:
-                gl.amd.cdna4.buffer_store(bs_e8m0, bs_block_ptr, bs_offs)
-            else:
-                bs_mask = (bs_offs_m < M)[:, None] & (
-                    bs_offs_n
-                    < (N + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE
-                )[None, :]
-                gl.amd.cdna4.buffer_store(
-                    bs_e8m0,
-                    bs_block_ptr,
-                    bs_offs,
-                    mask=bs_mask,
-                )
     else:
         # Prologue: first iteration is always valid (grid guarantees start_n < end_n).
         pid_n = start_n
@@ -214,57 +239,25 @@ def gluon_dynamic_mxfp4_quant_kernel_gfx950(
                 out_tensor, bs_e8m0 = _mxfp4_quant_op(
                     x, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
                 )
-
-                out_m_local = gl.arange(0, BLOCK_SIZE_M)
-                out_n_local = gl.arange(0, BLOCK_SIZE_N // 2)
-                out_offs_m = pid_m * BLOCK_SIZE_M + out_m_local
-                out_offs_n = pid_n * (BLOCK_SIZE_N // 2) + out_n_local
-                out_block_offset = (pid_m * BLOCK_SIZE_M).to(
-                    gl.int64
-                ) * stride_x_fp4_m + (pid_n * (BLOCK_SIZE_N // 2)).to(
-                    gl.int64
-                ) * stride_x_fp4_n
-                out_block_ptr = x_fp4_ptr + out_block_offset
-                out_offs = (
-                    out_m_local[:, None] * stride_x_fp4_m_in
-                    + out_n_local[None, :] * stride_x_fp4_n_in
+                _store_quant_tile(
+                    out_tensor,
+                    bs_e8m0,
+                    x_fp4_ptr,
+                    bs_ptr,
+                    stride_x_fp4_m_in,
+                    stride_x_fp4_n_in,
+                    stride_bs_m_in,
+                    stride_bs_n_in,
+                    pid_m,
+                    pid_n,
+                    M,
+                    N // 2,
+                    (N + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE,
+                    BLOCK_SIZE_M,
+                    BLOCK_SIZE_N // 2,
+                    NUM_QUANT_BLOCKS,
+                    EVEN_M_N,
                 )
-
-                if EVEN_M_N:
-                    gl.amd.cdna4.buffer_store(out_tensor, out_block_ptr, out_offs)
-                else:
-                    out_mask = (out_offs_m < M)[:, None] & (out_offs_n < (N // 2))[
-                        None, :
-                    ]
-                    gl.amd.cdna4.buffer_store(
-                        out_tensor, out_block_ptr, out_offs, mask=out_mask
-                    )
-
-                bs_m_local = gl.arange(0, BLOCK_SIZE_M)
-                bs_n_local = gl.arange(0, NUM_QUANT_BLOCKS)
-                bs_offs_m = pid_m * BLOCK_SIZE_M + bs_m_local
-                bs_offs_n = pid_n * NUM_QUANT_BLOCKS + bs_n_local
-                bs_block_offset = (pid_m * BLOCK_SIZE_M).to(gl.int64) * stride_bs_m + (
-                    pid_n * NUM_QUANT_BLOCKS
-                ).to(gl.int64) * stride_bs_n
-                bs_block_ptr = bs_ptr + bs_block_offset
-                bs_offs = (
-                    bs_m_local[:, None] * stride_bs_m_in
-                    + bs_n_local[None, :] * stride_bs_n_in
-                )
-                if EVEN_M_N:
-                    gl.amd.cdna4.buffer_store(bs_e8m0, bs_block_ptr, bs_offs)
-                else:
-                    bs_mask = (bs_offs_m < M)[:, None] & (
-                        bs_offs_n
-                        < (N + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE
-                    )[None, :]
-                    gl.amd.cdna4.buffer_store(
-                        bs_e8m0,
-                        bs_block_ptr,
-                        bs_offs,
-                        mask=bs_mask,
-                    )
 
             x = x_next
             x_block_ptr = x_block_ptr_next
@@ -277,23 +270,13 @@ def _mxfp8_quant_op(
     BLOCK_SIZE_M: gl.constexpr,
     MXFP8_QUANT_BLOCK_SIZE: gl.constexpr,
 ):
-    """
-    Converts x (bf16) [BLOCK_SIZE_M, BLOCK_SIZE_N] to fp8 e4m3 via
-    gl.amd.cdna4.scaled_downcast, computing the per-32-element e8m0 scale
-    ourselves. No packing (1 output byte/element), so amax is a plain
-    reshape+max reduction -- no evens/odds split needed like MXFP4.
+    """Quantize a bf16 tile to fp8 e4m3 and e8m0 scales.
+    The output is not packed, so a plain reshape and max works.
     """
     NUM_QUANT_BLOCKS: gl.constexpr = BLOCK_SIZE_N // MXFP8_QUANT_BLOCK_SIZE
     x_grouped = x.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS, MXFP8_QUANT_BLOCK_SIZE)
     amax = gl.max(gl.abs(x_grouped), axis=-1, keep_dims=True).to(gl.float32)
-    amax = amax.to(gl.int32, bitcast=True)
-    amax = (amax + 0x200000).to(gl.uint32, bitcast=True) & 0xFF800000
-    amax = amax.to(gl.float32, bitcast=True)
-    # e4m3's max representable value is 2**8 * 1.75, so the unbiased exponent
-    # offset is -8 (vs MXFP4/e2m1's -2).
-    scale_e8m0_unbiased = gl.log2(amax).floor() - 8
-    scale_e8m0_unbiased = gl.maximum(-127, gl.minimum(scale_e8m0_unbiased, 127))
-    bs_e8m0 = (scale_e8m0_unbiased.to(gl.int32) + 127).to(gl.uint8)
+    bs_e8m0 = mx_e8m0_scale(amax, 8)
     bs_e8m0 = bs_e8m0.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS)
 
     x_fp8 = gl.amd.cdna4.scaled_downcast(x, bs_e8m0, "e4m3", axis=1)
@@ -303,7 +286,7 @@ def _mxfp8_quant_op(
 
 _gluon_dynamic_mxfp8_quant_kernel_gfx950_repr = make_kernel_repr(
     "gluon_dynamic_mxfp8_quant_kernel_gfx950",
-    ["BLOCK_SIZE_M", "BLOCK_SIZE_N", "NUM_ITER"],
+    ["BLOCK_SIZE_M", "BLOCK_SIZE_N", "NUM_ITER", "num_warps", "EVEN_M_N"],
 )
 
 
@@ -338,21 +321,9 @@ def gluon_dynamic_mxfp8_quant_kernel_gfx950(
     # cast strides to int64, in case M*N > max int32
     stride_x_m = gl.cast(stride_x_m_in, gl.int64)
     stride_x_n = gl.cast(stride_x_n_in, gl.int64)
-    stride_x_fp8_m = gl.cast(stride_x_fp8_m_in, gl.int64)
-    stride_x_fp8_n = gl.cast(stride_x_fp8_n_in, gl.int64)
-    stride_bs_m = gl.cast(stride_bs_m_in, gl.int64)
-    stride_bs_n = gl.cast(stride_bs_n_in, gl.int64)
 
     NUM_QUANT_BLOCKS: gl.constexpr = BLOCK_SIZE_N // MXFP8_QUANT_BLOCK_SIZE
-    # Same warp-axis heuristic as the MXFP4 kernel.
-    WARPS_M: gl.constexpr = num_warps if (BLOCK_SIZE_M // 8) >= num_warps else 1
-    WARPS_N: gl.constexpr = num_warps // WARPS_M
-    layout: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 8],
-        threads_per_warp=[8, 8],
-        warps_per_cta=[WARPS_M, WARPS_N],
-        order=[1, 0],
-    )
+    layout: gl.constexpr = _quant_layout(BLOCK_SIZE_M, num_warps)
 
     end_n = min(start_n + NUM_ITER, N)
 
@@ -378,49 +349,22 @@ def gluon_dynamic_mxfp8_quant_kernel_gfx950(
         out_tensor, bs_e8m0 = _mxfp8_quant_op(
             x, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP8_QUANT_BLOCK_SIZE
         )
-
-        # fp8 output is unpacked: N-extent is BLOCK_SIZE_N (MXFP4: // 2).
-        out_m_local = gl.arange(0, BLOCK_SIZE_M)
-        out_n_local = gl.arange(0, BLOCK_SIZE_N)
-        out_offs_m = pid_m * BLOCK_SIZE_M + out_m_local
-        out_offs_n = pid_n * BLOCK_SIZE_N + out_n_local
-        out_block_offset = (pid_m * BLOCK_SIZE_M).to(gl.int64) * stride_x_fp8_m + (
-            pid_n * BLOCK_SIZE_N
-        ).to(gl.int64) * stride_x_fp8_n
-        out_block_ptr = x_fp8_ptr + out_block_offset
-        out_offs = (
-            out_m_local[:, None] * stride_x_fp8_m_in
-            + out_n_local[None, :] * stride_x_fp8_n_in
+        _store_quant_tile(
+            out_tensor,
+            bs_e8m0,
+            x_fp8_ptr,
+            bs_ptr,
+            stride_x_fp8_m_in,
+            stride_x_fp8_n_in,
+            stride_bs_m_in,
+            stride_bs_n_in,
+            pid_m,
+            pid_n,
+            M,
+            N,
+            (N + MXFP8_QUANT_BLOCK_SIZE - 1) // MXFP8_QUANT_BLOCK_SIZE,
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N,
+            NUM_QUANT_BLOCKS,
+            EVEN_M_N,
         )
-
-        if EVEN_M_N:
-            gl.amd.cdna4.buffer_store(out_tensor, out_block_ptr, out_offs)
-        else:
-            out_mask = (out_offs_m < M)[:, None] & (out_offs_n < N)[None, :]
-            gl.amd.cdna4.buffer_store(
-                out_tensor, out_block_ptr, out_offs, mask=out_mask
-            )
-
-        bs_m_local = gl.arange(0, BLOCK_SIZE_M)
-        bs_n_local = gl.arange(0, NUM_QUANT_BLOCKS)
-        bs_offs_m = pid_m * BLOCK_SIZE_M + bs_m_local
-        bs_offs_n = pid_n * NUM_QUANT_BLOCKS + bs_n_local
-        bs_block_offset = (pid_m * BLOCK_SIZE_M).to(gl.int64) * stride_bs_m + (
-            pid_n * NUM_QUANT_BLOCKS
-        ).to(gl.int64) * stride_bs_n
-        bs_block_ptr = bs_ptr + bs_block_offset
-        bs_offs = (
-            bs_m_local[:, None] * stride_bs_m_in + bs_n_local[None, :] * stride_bs_n_in
-        )
-        if EVEN_M_N:
-            gl.amd.cdna4.buffer_store(bs_e8m0, bs_block_ptr, bs_offs)
-        else:
-            bs_mask = (bs_offs_m < M)[:, None] & (
-                bs_offs_n < (N + MXFP8_QUANT_BLOCK_SIZE - 1) // MXFP8_QUANT_BLOCK_SIZE
-            )[None, :]
-            gl.amd.cdna4.buffer_store(
-                bs_e8m0,
-                bs_block_ptr,
-                bs_offs,
-                mask=bs_mask,
-            )
