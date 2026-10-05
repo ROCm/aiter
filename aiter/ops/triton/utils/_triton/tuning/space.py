@@ -161,20 +161,45 @@ def should_skip_generic(shape, config, backend):
     return False
 
 
-def exceeds_lds(config, spec, arch, backend):
-    """True when buffers x (A tile + B tile) cannot fit the LDS; such a config never compiles."""
-    from aiter.ops.triton.utils._triton.arch_info import _LDS_CAP_BYTES
+# fp32 accumulator values one thread may hold: above this the accumulator alone fills the egister file and the kernel spills. gfx1250 (wave32) measured: 1024 per thread runs 16-19x lane's 512 VGPR+AGPR, and the largest any shipped config uses.
+MAX_ACC_PER_THREAD = {"gfx1250": 512}
 
+
+def cta_tile(config, spec):
+    """(block_m, block_n, block_k) one CTA works on, or None when the config has no tile keys."""
     block_m = config.get("BLOCK_SIZE_M", config.get("BLOCK_M"))
     block_n = config.get("BLOCK_SIZE_N", config.get("BLOCK_N"))
     block_k = config.get("BLOCK_SIZE_K", config.get("BLOCK_K"))
     if None in (block_m, block_n, block_k):
-        return False
+        return None
     if (
         spec.cta_split is not None
     ):  # each CTA of a cluster keeps only its share of the tile
         ctas_m, ctas_n = spec.cta_split(config)
         block_m, block_n = block_m // ctas_m, block_n // ctas_n
+    return block_m, block_n, block_k
+
+
+def exceeds_registers(config, spec, arch):
+    """True when one thread's share of the fp32 accumulator alone fills its registers."""
+    tile = cta_tile(config, spec)
+    if tile is None or "num_warps" not in config:
+        return False
+    wave_size = (
+        32 if arch.startswith("gfx1250") else 64
+    )  # gfx1250 run wave32, gfx9xx wave64
+    acc_per_thread = tile[0] * tile[1] / (config["num_warps"] * wave_size)
+    return acc_per_thread > MAX_ACC_PER_THREAD.get(arch, 256)
+
+
+def exceeds_lds(config, spec, arch, backend):
+    """True when buffers x (A tile + B tile) cannot fit the LDS; such a config never compiles."""
+    from aiter.ops.triton.utils._triton.arch_info import _LDS_CAP_BYTES
+
+    tile = cta_tile(config, spec)
+    if tile is None:
+        return False
+    block_m, block_n, block_k = tile
     # gluon keeps NUM_BUFFERS (or num_stages, where that is what the key means) tile pairs
     # resident; the triton pipeliner keeps num_stages - 1 (lenient bound)
     num_stages = config.get("num_stages", 1)
@@ -205,7 +230,7 @@ def build_space(spec, shape, backend, arch, kernel_should_skip):
 
     def prune(candidate_lists):
         configs = []
-        skipped = {"generic rules": 0, "LDS": 0, "kernel rules": 0}
+        skipped = {"generic rules": 0, "LDS": 0, "registers": 0, "kernel rules": 0}
         for combination in itertools.product(*candidate_lists.values()):
             config = dict(zip(keys, combination))
             if should_skip_generic(shape, config, backend):
@@ -213,6 +238,9 @@ def build_space(spec, shape, backend, arch, kernel_should_skip):
                 continue
             if exceeds_lds(config, spec, arch, backend):
                 skipped["LDS"] += 1
+                continue
+            if exceeds_registers(config, spec, arch):
+                skipped["registers"] += 1
                 continue
             if kernel_should_skip is not None and kernel_should_skip(config):
                 skipped["kernel rules"] += 1

@@ -63,7 +63,9 @@ that do not divide K), the generic rules in `space.py` (the old split-K pruning 
 when the keys exist, and an LDS check: a block-size combination whose buffers x (A tile + B tile)
 exceed the arch's LDS is never compiled; each kernel declares its element widths as `bits=(a, b)`,
 and a kernel whose `num_ctas` splits the tile over a CTA cluster declares `cta_split`, so the
-check counts one CTA's share)
+check counts one CTA's share; and a register check: a config whose fp32 accumulator per thread,
+BLOCK_M x BLOCK_N / (num_warps x wave size), exceeds `MAX_ACC_PER_THREAD` (512 on gfx1250, 256
+elsewhere) only spills, so it is never run. On gfx1250 1024 per thread measured 16-19x slower)
 and the kernel's own `should_skip(config)` in `kernels.py` (what the kernel asserts, and buffer
 counts its wrapper clamps so they would only repeat another candidate). Every rule returns True
 to reject. If the kernel rejects every tile that fits the shape (a kernel that needs 64-row tiles
