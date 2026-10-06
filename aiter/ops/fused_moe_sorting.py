@@ -49,6 +49,7 @@ def fused_moe_sorting_topk_is_supported(
     topk: int,
     unit_size: int,
     router_experts: int,
+    num_fused_shared_experts: int = 0,
 ) -> bool: ...
 
 
@@ -69,4 +70,7 @@ def fused_moe_sorting_topk_fwd(
     local_expert_mask: torch.Tensor | None = None,
     num_local_tokens: torch.Tensor | None = None,
     sync: torch.Tensor | None = None,
+    correction_bias: torch.Tensor | None = None,
+    num_fused_shared_experts: int = 0,
+    shared_expert_weight: float = 1.0,
 ) -> None: ...

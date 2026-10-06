@@ -26,6 +26,7 @@
 //   * packed id      = (slot << 24) | token_id
 //   * sentinel       = (topk << 24) | num_tokens   [num_tokens = static capacity]
 //   * each expert padded up to a multiple of unit_size; empty expert = 0 blocks
+//   * padding slots: id = sentinel, weight = 0.0f (as Opus writes them)
 //   * sorted_expert_ids holds the *local* expert index when expert_mask is set
 //   * num_valid_ids[0] = padded slot total, [1] = number of real tokens
 //   * moe_buf is zeroed by this same launch; a 0-element moe_buf is a no-op
@@ -136,74 +137,6 @@ struct FusedMoeSortingSmem
     }
 };
 
-// ---------------------------------------------------------------------------
-// Block-wide exclusive scan over `n` ints already in LDS.
-//
-// n is E, which is 257 for GLM-5.2 -- deliberately *not* assumed to fit the
-// block, since 257 > 256 breaks any "one element per thread" shortcut (and E
-// can be 385 elsewhere). Each thread serially folds a contiguous chunk, the
-// per-thread totals are scanned, then each thread rewrites its chunk.
-//
-// The cross-thread step runs on wave shuffles, not a Hillis-Steele pass over
-// LDS: with BLOCK=1024 the latter costs 20 __syncthreads per scan, and at
-// these shapes the scan is pure overhead sitting on the critical path of the
-// one workgroup that owns the sort. Shuffles bring it down to three barriers.
-template <int BLOCK>
-__device__ inline int fused_block_exclusive_scan(int32_t* data, int n, int32_t* tmp)
-{
-    constexpr int NW = BLOCK / 64;
-    const int tid    = threadIdx.x;
-    const int lane   = tid & 63;
-    const int wave   = tid >> 6;
-
-    const int chunk = (n + BLOCK - 1) / BLOCK;
-    const int beg   = tid * chunk;
-    const int end   = min(beg + chunk, n);
-
-    int local = 0;
-    for(int i = beg; i < end; ++i)
-        local += data[i];
-
-    // Inclusive scan inside the wave.
-    int v = local;
-    for(int off = 1; off < 64; off <<= 1)
-    {
-        const int u = __shfl_up(v, off, 64);
-        if(lane >= off)
-            v += u;
-    }
-    if(lane == 63)
-        tmp[wave] = v;
-    __syncthreads();
-
-    // Scan the NW wave totals (NW <= 16) inside wave 0.
-    if(tid < NW)
-    {
-        int w = tmp[tid];
-        for(int off = 1; off < NW; off <<= 1)
-        {
-            const int u = __shfl_up(w, off, 64);
-            if(tid >= off)
-                w += u;
-        }
-        tmp[tid] = w;
-    }
-    __syncthreads();
-
-    const int wave_off = (wave == 0) ? 0 : tmp[wave - 1];
-    const int total    = tmp[NW - 1];
-
-    int run = wave_off + v - local; // exclusive prefix of this thread's chunk
-    for(int i = beg; i < end; ++i)
-    {
-        const int x = data[i];
-        data[i]     = run;
-        run += x;
-    }
-    __syncthreads();
-    return total;
-}
-
 // Inclusive prefix sum across a wave64 in DPP: four row_shr steps inside each
 // 16-lane row, then row_bcast:15 into rows 1 and 3 and row_bcast:31 into rows
 // 2 and 3. Six VALU ops with 1-2 wait states each, versus the __shfl_up loop
@@ -240,7 +173,7 @@ __device__ inline int fused_wave_inclusive_scan_i32(int v)
 // through a shuffle scan, then each lane rewrites its chunk. Returns the total
 // in every lane of the wave.
 //
-// This replaced the block-wide scan (fused_block_exclusive_scan) for the sort's
+// This replaced a block-wide scan for the sort's
 // phase 3. That one spent three block barriers to scan 257 numbers -- with 16
 // waves each barrier is ~135 ns -- and measured 0.96 us for the phase. n here
 // is E, at most a few hundred, so one wave with a short serial chunk per lane
@@ -312,6 +245,16 @@ struct FusedRouterArgs
     // zero. nullptr => route inside block 0 only.
     int32_t* sync;
     int router_blocks; // blocks 0..router_blocks-1 each route NW tokens
+    // Biased (DeepSeek/GLM) routing, mirroring aiter's biased_grouped_topk:
+    // experts are *chosen* on sigmoid(x) + bias[e], but each one's weight is the
+    // unbiased sigmoid(x). nullptr => plain grouped_topk (choice == weight).
+    const void* bias;  // [router_experts]
+    bool bias_is_fp32; // else bf16
+    // Fused shared experts, as vLLM hands them to aiter: the last n_shared of
+    // the `topk` slots per token take ids router_experts .. +n_shared-1 and a
+    // fixed weight that renorm and routed_scaling_factor never touch.
+    int n_shared;
+    float shared_weight;
 };
 
 // Wave reductions that mirror aiter's `wave_reduce` exactly.
@@ -424,7 +367,7 @@ __device__ inline float fused_wave_reduce_f32(float v)
 // Routes tokens t = t_begin + wave, t_begin + wave + stride, ... while < m_eff,
 // TB of them per batch. `sids`/`sweight` may be LDS or global (generic).
 // Multi-block routing passes stride = capacity so each wave does one token.
-template <int BLOCK, int NREG, int TB = 4>
+template <int BLOCK, int NREG, int TB = 4, bool BIAS = false>
 __device__ inline void fused_router_topk_reg(const FusedRouterArgs& r,
                                              int t_begin,
                                              int stride,
@@ -442,6 +385,41 @@ __device__ inline void fused_router_topk_reg(const FusedRouterArgs& r,
     const int wave = threadIdx.x >> 6;
     const int ER   = r.router_experts;
     const int NVEC = ER / VEC;
+    const int KR   = topk - r.n_shared; // routed picks; the rest are shared slots
+
+    // This lane's bias slice, loaded once. BIAS is a template parameter so the
+    // unbiased instantiation compiles to exactly the plain grouped_topk router
+    // (the runtime-flag version cost it ~0.4 us per launch).
+    float bv[NREG];
+#pragma unroll
+    for(int rr = 0; rr < R; ++rr)
+    {
+        const int v = lane + 64 * rr;
+#pragma unroll
+        for(int i = 0; i < VEC; ++i)
+            bv[rr * VEC + i] = 0.0f;
+        if(BIAS && v < NVEC)
+        {
+            if(r.bias_is_fp32)
+            {
+                const float4 x =
+                    *reinterpret_cast<const float4*>(static_cast<const float*>(r.bias) + v * VEC);
+                bv[rr * VEC + 0] = x.x;
+                bv[rr * VEC + 1] = x.y;
+                bv[rr * VEC + 2] = x.z;
+                bv[rr * VEC + 3] = x.w;
+            }
+            else
+            {
+                const uint2 x =
+                    *reinterpret_cast<const uint2*>(static_cast<const uint16_t*>(r.bias) + v * VEC);
+                bv[rr * VEC + 0] = __uint_as_float(x.x << 16);
+                bv[rr * VEC + 1] = __uint_as_float(x.x & 0xffff0000u);
+                bv[rr * VEC + 2] = __uint_as_float(x.y << 16);
+                bv[rr * VEC + 3] = __uint_as_float(x.y & 0xffff0000u);
+            }
+        }
+    }
 
     for(int t0 = t_begin + wave; t0 < m_eff; t0 += stride * TB)
     {
@@ -482,7 +460,7 @@ __device__ inline void fused_router_topk_reg(const FusedRouterArgs& r,
                 {
 #pragma unroll
                     for(int i = 0; i < VEC; ++i)
-                        g[b][rr * VEC + i] = -INFINITY; // never a candidate
+                        g[b][rr * VEC + i] = __builtin_nanf(""); // padding, see below
                 }
             }
         }
@@ -494,21 +472,28 @@ __device__ inline void fused_router_topk_reg(const FusedRouterArgs& r,
             if(t >= m_eff)
                 break;
 
+            // Score every expert exactly as grouped_topk does -- a -inf logit
+            // is sigmoid(-inf) = 0, a live candidate, not a hole. Padding past
+            // the router's experts was loaded as NaN, which sigmoid keeps NaN
+            // and the strict `x > mv` below never selects, so it cannot win
+            // even when every real score is 0, at no extra instruction.
+            //
+            // With a bias, s is the choice score sig + bias (fp32 add, as aiter)
+            // and sg keeps the unbiased sigmoid the winner's weight comes from.
             float s[NREG];
+            float sg[NREG];
 #pragma unroll
             for(int j = 0; j < NREG; ++j)
             {
-                const float x = g[b][j];
-                s[j] = (x == -INFINITY)
-                           ? -INFINITY
-                           : __builtin_amdgcn_rcpf(
-                                 1.0f + exp2f(static_cast<float>(-AITER_FUSED_SORT_LOG2E * x)));
+                sg[j] = __builtin_amdgcn_rcpf(
+                    1.0f + exp2f(static_cast<float>(-AITER_FUSED_SORT_LOG2E * g[b][j])));
+                s[j] = BIAS ? sg[j] + bv[j] : sg[j];
             }
 
             float sum  = 0.0f;
             int my_id  = 0;
             float my_w = 0.0f;
-            for(int k = 0; k < topk; ++k)
+            for(int k = 0; k < KR; ++k)
             {
                 float mv = -INFINITY;
                 int mi   = k;
@@ -541,12 +526,42 @@ __device__ inline void fused_router_topk_reg(const FusedRouterArgs& r,
                 sum += mv;
             }
 
+            if constexpr(BIAS)
+            {
+                // Biased: the score that won is sig + bias, the weight is sig.
+                // Fetched once after the k loop rather than inside it, so the
+                // arg-max chain stays as short as the unbiased one: lane k pulls
+                // the sigmoid of its winner from the lane that owns it (one
+                // bpermute per register slot), then the renorm sum is rebuilt in
+                // pass order k = 0..KR-1, which is the order aiter adds in.
+                const int src = (my_id / VEC) & 63;
+                const int jj  = ((my_id / VEC) >> 6) * VEC + (my_id % VEC);
+                float w       = 0.0f;
+#pragma unroll
+                for(int j = 0; j < NREG; ++j)
+                {
+                    const float v = __shfl(sg[j], src, 64);
+                    if(j == jj)
+                        w = v;
+                }
+                my_w = w;
+                sum  = 0.0f;
+                for(int k = 0; k < KR; ++k)
+                    sum += __builtin_bit_cast(
+                        float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, my_w), k));
+            }
+
             const float scale =
                 r.need_renorm ? r.routed_scaling_factor / sum : r.routed_scaling_factor;
-            if(lane < topk)
+            if(lane < KR)
             {
                 sids[static_cast<size_t>(t) * topk + lane]    = my_id;
                 sweight[static_cast<size_t>(t) * topk + lane] = my_w * scale;
+            }
+            else if(lane < topk)
+            {
+                sids[static_cast<size_t>(t) * topk + lane]    = ER + (lane - KR);
+                sweight[static_cast<size_t>(t) * topk + lane] = r.shared_weight;
             }
         }
     }
@@ -614,14 +629,22 @@ __device__ inline void fused_router_topk(
         }
         else
         {
+            // Choice score sigmoid(x) + bias[e] (bias 0 when absent); the winner's
+            // weight is recomputed from its logit below, so no second array.
             for(int e = lane; e < ER; e += 64)
             {
                 const float g =
                     r.gating_is_fp32
                         ? static_cast<const float*>(r.gating)[row + e]
                         : __bfloat162float(static_cast<const __hip_bfloat16*>(r.gating)[row + e]);
+                const float b =
+                    r.bias == nullptr ? 0.0f
+                    : r.bias_is_fp32
+                        ? static_cast<const float*>(r.bias)[e]
+                        : __bfloat162float(static_cast<const __hip_bfloat16*>(r.bias)[e]);
                 sc[e] = __builtin_amdgcn_rcpf(
-                    1.0f + exp2f(static_cast<float>(-AITER_FUSED_SORT_LOG2E * g)));
+                            1.0f + exp2f(static_cast<float>(-AITER_FUSED_SORT_LOG2E * g))) +
+                        b;
             }
         }
         __builtin_amdgcn_wave_barrier();
@@ -636,10 +659,11 @@ __device__ inline void fused_router_topk(
         const int VEC  = (ER % 4 == 0) ? 4 : ((ER % 4 == 2) ? 2 : 1);
         const int NVEC = ER / VEC;
 
-        float sum  = 0.0f;
-        int my_id  = 0;
-        float my_w = 0.0f;
-        for(int k = 0; k < topk; ++k)
+        const int KR = topk - r.n_shared; // routed picks; the rest are shared slots
+        float sum    = 0.0f;
+        int my_id    = 0;
+        float my_w   = 0.0f;
+        for(int k = 0; k < KR; ++k)
         {
             float mv = -INFINITY;
             int mi   = k;
@@ -659,6 +683,17 @@ __device__ inline void fused_router_topk(
             fused_wave_argmax(mv, mi);
             sc[mi] = -INFINITY; // every lane writes the same value to the same slot
             __builtin_amdgcn_wave_barrier();
+            if(r.bias != nullptr && !r.is_softmax)
+            {
+                // Biased: weight is the unbiased sigmoid of the winner's logit,
+                // the same expression as the scoring loop, so bit-identical.
+                const float g =
+                    r.gating_is_fp32
+                        ? static_cast<const float*>(r.gating)[row + mi]
+                        : __bfloat162float(static_cast<const __hip_bfloat16*>(r.gating)[row + mi]);
+                mv = __builtin_amdgcn_rcpf(1.0f +
+                                           exp2f(static_cast<float>(-AITER_FUSED_SORT_LOG2E * g)));
+            }
             if(lane == k)
             {
                 my_id = mi;
@@ -668,10 +703,15 @@ __device__ inline void fused_router_topk(
         }
 
         const float scale = r.need_renorm ? r.routed_scaling_factor / sum : r.routed_scaling_factor;
-        if(lane < topk)
+        if(lane < KR)
         {
             sids[static_cast<size_t>(t) * topk + lane]    = my_id;
             sweight[static_cast<size_t>(t) * topk + lane] = my_w * scale;
+        }
+        else if(lane < topk)
+        {
+            sids[static_cast<size_t>(t) * topk + lane]    = ER + (lane - KR);
+            sweight[static_cast<size_t>(t) * topk + lane] = r.shared_weight;
         }
         __builtin_amdgcn_wave_barrier();
     }
@@ -689,7 +729,7 @@ __device__ inline void fused_router_topk(
 //      (the latter converts a global expert id into the local one EP expects)
 //   4  one wave per expert: emit block ids, scatter packed ids + weights, then
 //      write the sentinel over the padding tail only
-template <int BLOCK, bool STAGE_W, bool FUSE_TOPK, int RNREG = 0, int RW = 4>
+template <int BLOCK, bool STAGE_W, bool FUSE_TOPK, int RNREG = 0, int RW = 4, bool BIAS = false>
 __device__ inline void
 fused_moe_sorting_body(const int32_t* __restrict__ topk_ids,
                        const float* __restrict__ topk_weights,
@@ -729,7 +769,7 @@ fused_moe_sorting_body(const int32_t* __restrict__ topk_ids,
         {
             if constexpr(RNREG > 0)
                 if((threadIdx.x >> 6) < RW)
-                    fused_router_topk_reg<BLOCK, RNREG, 1>(
+                    fused_router_topk_reg<BLOCK, RNREG, 1, BIAS>(
                         router,
                         rblk * RW,
                         num_tokens, // stride: one token per wave
@@ -812,9 +852,13 @@ fused_moe_sorting_body(const int32_t* __restrict__ topk_ids,
         if constexpr(RNREG > 0)
             if(router.sync != nullptr)
             {
+                // Every router wave routes one token and the remaining waves clear
+                // the mask, so at least one wave has to be left over. The host
+                // clamps RW to BLOCK; this pins the contract at compile time.
+                static_assert(RW * 64 < BLOCK, "RW router waves must leave a non-router wave");
                 // Block 0 routes its own RW tokens straight into LDS ...
                 if((threadIdx.x >> 6) < RW)
-                    fused_router_topk_reg<BLOCK, RNREG, 1>(
+                    fused_router_topk_reg<BLOCK, RNREG, 1, BIAS>(
                         router, 0, num_tokens, min(m_eff, RW), topk, sids, sweight);
                 else // ... while the other waves clear the mask (phase 0, overlapped).
                     for(size_t i = tid - RW * 64; i < pstride; i += BLOCK - RW * 64)
@@ -837,7 +881,7 @@ fused_moe_sorting_body(const int32_t* __restrict__ topk_ids,
                 }
             }
             else
-                fused_router_topk_reg<BLOCK, RNREG>(
+                fused_router_topk_reg<BLOCK, RNREG, 4, BIAS>(
                     router, 0, BLOCK / 64, m_eff, topk, sids, sweight);
         else
             fused_router_topk<BLOCK>(router, m_eff, topk, sscores, sids, sweight);
@@ -926,17 +970,30 @@ fused_moe_sorting_body(const int32_t* __restrict__ topk_ids,
     // total_padded is a multiple of unit_size; when that is a multiple of 4 the
     // whole live range is 16 B-aligned (torch buffers are), so four slots go
     // per store. 7100 slots at M=64 drop from 7 rounds to 2.
-    if((total_padded & 3) == 0 && (reinterpret_cast<uintptr_t>(sorted_ids) & 15) == 0)
+    // The padding slots of sorted_weights are written too (0.0f), as Opus does
+    // in all three of its paths: consumers are entitled to the same contract
+    // whichever sort produced the buffer, and a pad slot holding stale caller
+    // memory is the kind of state nobody tests for.
+    if((total_padded & 3) == 0 && (reinterpret_cast<uintptr_t>(sorted_ids) & 15) == 0 &&
+       (reinterpret_cast<uintptr_t>(sorted_weights) & 15) == 0)
     {
         uint4* v4      = reinterpret_cast<uint4*>(sorted_ids);
+        uint4* w4      = reinterpret_cast<uint4*>(sorted_weights);
         const uint4 sv = make_uint4(sentinel, sentinel, sentinel, sentinel);
+        const uint4 zv = make_uint4(0u, 0u, 0u, 0u);
         for(int k = tid; k < (total_padded >> 2); k += BLOCK)
+        {
             v4[k] = sv;
+            w4[k] = zv;
+        }
     }
     else
     {
         for(int k = tid; k < total_padded; k += BLOCK)
-            sorted_ids[k] = sentinel;
+        {
+            sorted_ids[k]     = sentinel;
+            sorted_weights[k] = 0.0f;
+        }
     }
 
     // 4b. Block ids: one thread per expert, so E=257 is a single pass.
@@ -1024,7 +1081,7 @@ __global__ void __launch_bounds__(BLOCK)
 // F1-b: router folded in. topk_ids / topk_weights never leave LDS, which is
 // the point -- it removes a launch *and* an HBM round trip, and §3 identifies
 // the round trip as the real cost at decode shapes.
-template <int BLOCK, bool STAGE_W, int RNREG, int RW>
+template <int BLOCK, bool STAGE_W, int RNREG, int RW, bool BIAS = false>
 __global__ void __launch_bounds__(BLOCK)
     fused_moe_sorting_topk_bitmask(const int32_t* __restrict__ expert_mask,
                                    const int32_t* __restrict__ num_local_tokens,
@@ -1041,22 +1098,22 @@ __global__ void __launch_bounds__(BLOCK)
                                    int zero_blocks,
                                    FusedRouterArgs router)
 {
-    fused_moe_sorting_body<BLOCK, STAGE_W, true, RNREG, RW>(nullptr,
-                                                            nullptr,
-                                                            expert_mask,
-                                                            num_local_tokens,
-                                                            sorted_ids,
-                                                            sorted_weights,
-                                                            sorted_expert_ids,
-                                                            num_valid_ids,
-                                                            moe_buf,
-                                                            num_tokens,
-                                                            topk,
-                                                            num_experts,
-                                                            unit_size,
-                                                            moe_buf_bytes,
-                                                            zero_blocks,
-                                                            router);
+    fused_moe_sorting_body<BLOCK, STAGE_W, true, RNREG, RW, BIAS>(nullptr,
+                                                                  nullptr,
+                                                                  expert_mask,
+                                                                  num_local_tokens,
+                                                                  sorted_ids,
+                                                                  sorted_weights,
+                                                                  sorted_expert_ids,
+                                                                  num_valid_ids,
+                                                                  moe_buf,
+                                                                  num_tokens,
+                                                                  topk,
+                                                                  num_experts,
+                                                                  unit_size,
+                                                                  moe_buf_bytes,
+                                                                  zero_blocks,
+                                                                  router);
 }
 
 } // namespace aiter
@@ -1071,8 +1128,12 @@ int fused_moe_sorting_get_workspace_size(int tokens, int num_experts, int topk, 
 
 bool fused_moe_sorting_is_supported(int tokens, int num_experts, int topk, int unit_size);
 
-bool fused_moe_sorting_topk_is_supported(
-    int tokens, int num_experts, int topk, int unit_size, int router_experts);
+bool fused_moe_sorting_topk_is_supported(int tokens,
+                                         int num_experts,
+                                         int topk,
+                                         int unit_size,
+                                         int router_experts,
+                                         int num_fused_shared_experts = 0);
 
 void fused_moe_sorting_topk_fwd(aiter_tensor_t& gating_output,
                                 aiter_tensor_t& sorted_token_ids,
@@ -1088,7 +1149,10 @@ void fused_moe_sorting_topk_fwd(aiter_tensor_t& gating_output,
                                 float routed_scaling_factor,
                                 std::optional<aiter_tensor_t> local_expert_mask = std::nullopt,
                                 std::optional<aiter_tensor_t> num_local_tokens  = std::nullopt,
-                                std::optional<aiter_tensor_t> sync              = std::nullopt);
+                                std::optional<aiter_tensor_t> sync              = std::nullopt,
+                                std::optional<aiter_tensor_t> correction_bias   = std::nullopt,
+                                int num_fused_shared_experts                    = 0,
+                                float shared_expert_weight                      = 1.0f);
 
 void fused_moe_sorting_fwd(aiter_tensor_t& topk_ids,
                            aiter_tensor_t& topk_weights,

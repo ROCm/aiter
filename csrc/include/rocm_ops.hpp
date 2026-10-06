@@ -1502,7 +1502,8 @@ namespace py = pybind11;
           py::arg("num_experts"),                      \
           py::arg("topk"),                             \
           py::arg("unit_size"),                        \
-          py::arg("router_experts"));                  \
+          py::arg("router_experts"),                   \
+          py::arg("num_fused_shared_experts") = 0);                  \
     m.def("fused_moe_sorting_topk_fwd",                \
           &fused_moe_sorting_topk_fwd,                 \
           py::arg("gating_output"),                    \
@@ -1519,7 +1520,10 @@ namespace py = pybind11;
           py::arg("routed_scaling_factor"),            \
           py::arg("local_expert_mask") = std::nullopt, \
           py::arg("num_local_tokens")  = std::nullopt, \
-          py::arg("sync")              = std::nullopt);
+          py::arg("sync")              = std::nullopt,                   \
+          py::arg("correction_bias")          = std::nullopt, \
+          py::arg("num_fused_shared_experts") = 0,            \
+          py::arg("shared_expert_weight")     = 1.0f);
 
 #define MOE_SORTING_OPUS_PYBIND                        \
     m.def("moe_sorting_opus_get_workspace_size",       \

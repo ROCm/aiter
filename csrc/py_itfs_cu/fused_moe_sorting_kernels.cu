@@ -6,6 +6,9 @@
 
 #include "fused_moe_sorting.h"
 
+#include <array>
+#include <mutex>
+
 #include "aiter_hip_common.h"
 #include "aiter_stream.h"
 #include "aiter_tensor.h"
@@ -38,16 +41,55 @@ static int block_override()
 // M<=24 even on MI355X, which actually offers 160 KB (FlyDSL reads the arch
 // correctly but then clamps to 16 anyway). Querying hipGetDeviceProperties
 // once and caching it keeps the threshold honest on every arch.
-static size_t lds_budget_bytes()
+//
+// Cached per device, not per process: a multi-GPU process reaches this from
+// whichever device the caller has current, and the callers below install
+// HipDeviceGuard before asking.
+//
+// The wave width is cached alongside it. Every kernel here is written for
+// wave64 (DPP row_bcast:15/31 and readlane 63 in the arg-max, one 64-bit
+// bitmask word per wave), so a wave32 device (RDNA) must be reported
+// unsupported and take the stock path rather than launch and compute garbage.
+struct DeviceLimits
 {
-    static const size_t budget = [] {
-        hipDevice_t dev;
+    size_t lds_bytes;
+    int warp_size;
+};
+
+static DeviceLimits device_limits()
+{
+    static std::array<DeviceLimits, 64> cache{};
+    static std::mutex mu;
+    hipDevice_t dev;
+    HIP_CALL(hipGetDevice(&dev));
+    AITER_CHECK(dev >= 0 && dev < static_cast<int>(cache.size()), "device index out of range");
+    std::lock_guard<std::mutex> lock(mu);
+    if(cache[dev].lds_bytes == 0)
+    {
         hipDeviceProp_t prop;
-        HIP_CALL(hipGetDevice(&dev));
         HIP_CALL(hipGetDeviceProperties(&prop, dev));
-        return static_cast<size_t>(prop.sharedMemPerBlock);
-    }();
-    return budget;
+        cache[dev] = DeviceLimits{static_cast<size_t>(prop.sharedMemPerBlock), prop.warpSize};
+    }
+    return cache[dev];
+}
+
+static size_t lds_budget_bytes() { return device_limits().lds_bytes; }
+
+// Raise the dynamic-LDS limit of one kernel instantiation on the current
+// device, once. Checked: a rejected request would otherwise surface as a launch
+// that silently leaves every output buffer untouched.
+template <typename Kernel>
+static void raise_lds_limit(Kernel* f, std::array<bool, 64>& done)
+{
+    hipDevice_t dev;
+    HIP_CALL(hipGetDevice(&dev));
+    if(!done[dev])
+    {
+        HIP_CALL(hipFuncSetAttribute(reinterpret_cast<const void*>(f),
+                                     hipFuncAttributeMaxDynamicSharedMemorySize,
+                                     static_cast<int>(lds_budget_bytes())));
+        done[dev] = true;
+    }
 }
 
 // AITER_CHECK aborts the process unless throwing is enabled for the thread.
@@ -125,6 +167,8 @@ static int max_fused_topk_tokens()
 // Eight wins through M=64 (fewer blocks, less dispatch skew, two chains per
 // SIMD still cheap enough); at 80 the extra chain contention overtakes it.
 // Selected from the static capacity, so a captured graph replays unchanged.
+// Measured at BLOCK=1024; the caller clamps the result below BLOCK/64 when the
+// block override is narrower (see fused_moe_sorting_topk_fwd).
 static int router_waves_for(int num_tokens)
 {
     if(const char* e = getenv("AITER_FUSED_MOE_SORTING_ROUTER_WAVES"))
@@ -150,6 +194,8 @@ struct LaunchPlan
 // better spent on reach.
 static LaunchPlan plan_launch(int num_tokens, int num_experts, int topk, int router_experts = 0)
 {
+    if(device_limits().warp_size != 64)
+        return LaunchPlan{false, false, 0}; // wave64-only kernels
     const int cap = router_experts > 0 ? max_fused_topk_tokens() : max_fused_tokens();
     if(num_tokens > cap)
         return LaunchPlan{false, false, 0};
@@ -187,13 +233,8 @@ static void launch(const LaunchPlan& plan,
     // reports a larger budget. Raised once per instantiation to the whole
     // budget rather than per launch: the call is not free, and this op is
     // dispatched 75 times per decode step.
-    static const bool once = [] {
-        auto* f = reinterpret_cast<const void*>(&aiter::fused_moe_sorting_bitmask<BLOCK, STAGE_W>);
-        (void)hipFuncSetAttribute(
-            f, hipFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(lds_budget_bytes()));
-        return true;
-    }();
-    (void)once;
+    static std::array<bool, 64> done{};
+    raise_lds_limit(&aiter::fused_moe_sorting_bitmask<BLOCK, STAGE_W>, done);
 
     hipLaunchKernelGGL(HIP_KERNEL_NAME(aiter::fused_moe_sorting_bitmask<BLOCK, STAGE_W>),
                        grid,
@@ -215,6 +256,47 @@ static void launch(const LaunchPlan& plan,
                        unit_size,
                        moe_buf_bytes,
                        zero_blocks);
+    HIP_CALL(hipGetLastError());
+}
+
+// Every output the kernels dereference, checked once here so a short buffer is
+// an error rather than an overwrite. Round the capacity to full unit_size
+// blocks, matching the allocation described by downstream GEMM consumers.
+static void check_outputs(const aiter_tensor_t& sorted_token_ids,
+                          const aiter_tensor_t& sorted_weights,
+                          const aiter_tensor_t& sorted_expert_ids,
+                          const aiter_tensor_t& num_valid_ids,
+                          const aiter_tensor_t& moe_buf,
+                          const std::optional<aiter_tensor_t>& local_expert_mask,
+                          const std::optional<aiter_tensor_t>& num_local_tokens,
+                          int num_tokens,
+                          int topk,
+                          int num_experts,
+                          int unit_size)
+{
+    const int64_t max_slots = static_cast<int64_t>(num_tokens) * topk +
+                              static_cast<int64_t>(num_experts) * unit_size - topk;
+    const int64_t max_blocks = (max_slots + unit_size - 1) / unit_size;
+    const int64_t max_padded = max_blocks * unit_size;
+    AITER_CHECK(sorted_token_ids.dtype() == AITER_DTYPE_i32 && sorted_token_ids.is_contiguous() &&
+                    sorted_token_ids.numel() >= max_padded,
+                "sorted_token_ids must be contiguous int32 covering every full unit_size block");
+    AITER_CHECK(sorted_weights.dtype() == AITER_DTYPE_fp32 && sorted_weights.is_contiguous() &&
+                    sorted_weights.numel() >= max_padded,
+                "sorted_weights must be contiguous fp32 covering every full unit_size block");
+    AITER_CHECK(sorted_expert_ids.dtype() == AITER_DTYPE_i32 && sorted_expert_ids.is_contiguous() &&
+                    sorted_expert_ids.numel() >= max_blocks,
+                "sorted_expert_ids must be contiguous int32[>= padded / unit_size]");
+    AITER_CHECK(num_valid_ids.dtype() == AITER_DTYPE_i32 && num_valid_ids.numel() >= 2,
+                "num_valid_ids must be int32[>= 2]");
+    AITER_CHECK(moe_buf.is_contiguous(), "moe_buf must be contiguous (it is zeroed by bytes)");
+    if(local_expert_mask.has_value())
+        AITER_CHECK(local_expert_mask->dtype() == AITER_DTYPE_i32 &&
+                        local_expert_mask->numel() >= num_experts,
+                    "local_expert_mask must be int32[>= num_experts]");
+    if(num_local_tokens.has_value())
+        AITER_CHECK(num_local_tokens->dtype() == AITER_DTYPE_i32 && num_local_tokens->numel() >= 1,
+                    "num_local_tokens must be int32[>= 1]");
 }
 
 } // namespace
@@ -235,9 +317,10 @@ bool fused_moe_sorting_is_supported(int tokens, int num_experts, int topk, int u
 {
     if(tokens <= 0 || num_experts <= 0 || topk <= 0 || unit_size <= 0)
         return false;
-    // The slot is packed into the top 8 bits of the id, and 3 bitplanes encode
-    // it in the 4-plane layout.
-    if(topk > 8)
+    // The slot lives in the top 8 bits of the packed id. vLLM appends fused
+    // shared experts to the router's top-k (GLM-5.2: 8 routed + 1 shared = 9),
+    // so the sort-only path has to take more than 8.
+    if(topk > 255)
         return false;
     return plan_launch(tokens, num_experts, topk).supported;
 }
@@ -270,9 +353,20 @@ void fused_moe_sorting_fwd(aiter_tensor_t& topk_ids,
 
     const auto plan = plan_launch(num_tokens, num_experts, topk);
     AITER_CHECK(plan.supported,
-                "fused_moe_sorting: shape outside the fused range (token cap or "
-                "LDS budget); caller should fall back to moe_sorting_opus");
-    AITER_CHECK(topk <= 8, "fused_moe_sorting: topk > 8 unsupported");
+                "fused_moe_sorting: shape outside the fused range (token cap, "
+                "LDS budget or non-wave64 device); caller should fall back to moe_sorting_opus");
+    AITER_CHECK(topk <= 255, "fused_moe_sorting: topk > 255 unsupported (8-bit slot)");
+    check_outputs(sorted_token_ids,
+                  sorted_weights,
+                  sorted_expert_ids,
+                  num_valid_ids,
+                  moe_buf,
+                  local_expert_mask,
+                  num_local_tokens,
+                  num_tokens,
+                  topk,
+                  num_experts,
+                  unit_size);
 
     HipDeviceGuard device_guard(topk_ids.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
@@ -348,7 +442,7 @@ void fused_moe_sorting_fwd(aiter_tensor_t& topk_ids,
 
 namespace {
 
-template <int BLOCK, int RNREG, int RW>
+template <int BLOCK, int RNREG, int RW, bool BIAS>
 static void launch_topk(const LaunchPlan& plan,
                         dim3 grid,
                         hipStream_t stream,
@@ -367,17 +461,11 @@ static void launch_topk(const LaunchPlan& plan,
                         int zero_blocks,
                         aiter::FusedRouterArgs router)
 {
-    static const bool once = [] {
-        auto* f = reinterpret_cast<const void*>(
-            &aiter::fused_moe_sorting_topk_bitmask<BLOCK, true, RNREG, RW>);
-        (void)hipFuncSetAttribute(
-            f, hipFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(lds_budget_bytes()));
-        return true;
-    }();
-    (void)once;
+    static std::array<bool, 64> done{};
+    raise_lds_limit(&aiter::fused_moe_sorting_topk_bitmask<BLOCK, true, RNREG, RW, BIAS>, done);
 
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(aiter::fused_moe_sorting_topk_bitmask<BLOCK, true, RNREG, RW>),
+        HIP_KERNEL_NAME(aiter::fused_moe_sorting_topk_bitmask<BLOCK, true, RNREG, RW, BIAS>),
         grid,
         dim3(BLOCK),
         plan.smem_bytes,
@@ -396,17 +484,27 @@ static void launch_topk(const LaunchPlan& plan,
         moe_buf_bytes,
         zero_blocks,
         router);
+    HIP_CALL(hipGetLastError());
 }
 
 } // namespace
 
-bool fused_moe_sorting_topk_is_supported(
-    int tokens, int num_experts, int topk, int unit_size, int router_experts)
+bool fused_moe_sorting_topk_is_supported(int tokens,
+                                         int num_experts,
+                                         int topk,
+                                         int unit_size,
+                                         int router_experts,
+                                         int num_fused_shared_experts)
 {
     if(tokens <= 0 || num_experts <= 0 || topk <= 0 || unit_size <= 0 || router_experts <= 0)
         return false;
-    if(topk > 8 || topk > 64)
-        return false; // slot field is 8 bits; lane `k` carries result k
+    // topk counts every slot, shared ones included (vLLM's convention); at most
+    // 8 of them are routed, and at most one shared expert is fused.
+    if(num_fused_shared_experts < 0 || num_fused_shared_experts > 1 ||
+       topk - num_fused_shared_experts < 1 || topk - num_fused_shared_experts > 8)
+        return false;
+    if(num_experts < router_experts + num_fused_shared_experts)
+        return false; // the shared ids router_experts.. must be valid sort experts
     return plan_launch(tokens, num_experts, topk, router_experts).supported;
 }
 
@@ -424,7 +522,10 @@ void fused_moe_sorting_topk_fwd(aiter_tensor_t& gating_output,
                                 float routed_scaling_factor,
                                 std::optional<aiter_tensor_t> local_expert_mask,
                                 std::optional<aiter_tensor_t> num_local_tokens,
-                                std::optional<aiter_tensor_t> sync)
+                                std::optional<aiter_tensor_t> sync,
+                                std::optional<aiter_tensor_t> correction_bias,
+                                int num_fused_shared_experts,
+                                float shared_expert_weight)
 {
     const AiterThrowGuard throw_guard;
 
@@ -439,10 +540,39 @@ void fused_moe_sorting_topk_fwd(aiter_tensor_t& gating_output,
 
     const auto plan = plan_launch(num_tokens, num_experts, topk, router_experts);
     AITER_CHECK(plan.supported,
-                "fused_moe_sorting_topk: shape outside the fused range (token cap "
-                "or LDS budget); caller should fall back to grouped_topk + "
+                "fused_moe_sorting_topk: shape outside the fused range (token cap, "
+                "LDS budget or non-wave64 device); caller should fall back to grouped_topk + "
                 "moe_sorting_opus");
-    AITER_CHECK(topk <= 8, "fused_moe_sorting_topk: topk > 8 unsupported");
+    AITER_CHECK(num_fused_shared_experts >= 0 && num_fused_shared_experts <= 1,
+                "fused_moe_sorting_topk: num_fused_shared_experts must be 0 or 1");
+    AITER_CHECK(topk - num_fused_shared_experts >= 1 && topk - num_fused_shared_experts <= 8,
+                "fused_moe_sorting_topk: 1..8 routed experts per token (topk counts shared slots)");
+    AITER_CHECK(num_experts >= router_experts + num_fused_shared_experts,
+                "fused_moe_sorting_topk: num_experts must cover router_experts + shared experts");
+    const void* bias_ptr = nullptr;
+    bool bias_is_fp32    = false;
+    if(correction_bias.has_value())
+    {
+        const auto& b = correction_bias.value();
+        AITER_CHECK(!is_softmax, "fused_moe_sorting_topk: correction_bias needs sigmoid routing");
+        AITER_CHECK(b.is_contiguous() && b.numel() >= router_experts,
+                    "correction_bias must be contiguous [>= router_experts]");
+        bias_is_fp32 = b.dtype() == AITER_DTYPE_fp32;
+        AITER_CHECK(bias_is_fp32 || b.dtype() == AITER_DTYPE_bf16,
+                    "correction_bias must be fp32 or bf16");
+        bias_ptr = b.data_ptr();
+    }
+    check_outputs(sorted_token_ids,
+                  sorted_weights,
+                  sorted_expert_ids,
+                  num_valid_ids,
+                  moe_buf,
+                  local_expert_mask,
+                  num_local_tokens,
+                  num_tokens,
+                  topk,
+                  num_experts,
+                  unit_size);
 
     HipDeviceGuard device_guard(gating_output.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
@@ -466,8 +596,10 @@ void fused_moe_sorting_topk_fwd(aiter_tensor_t& gating_output,
     // (NREG 8) vectors per lane, and a 16 B-aligned gating tile for the float4
     // loads. Everything else takes the LDS router (RNREG 0).
     int rnreg = 0;
+    // The bias is read with the same vector loads, so it must be aligned too.
     if(!is_softmax && router_experts % 4 == 0 &&
-       (reinterpret_cast<uintptr_t>(gating_output.data_ptr()) % 16) == 0)
+       (reinterpret_cast<uintptr_t>(gating_output.data_ptr()) % 16) == 0 &&
+       (reinterpret_cast<uintptr_t>(bias_ptr) % 16) == 0)
     {
         const int nvec = router_experts / 4;
         rnreg          = nvec <= 64 ? 4 : (nvec <= 128 ? 8 : 0);
@@ -480,7 +612,12 @@ void fused_moe_sorting_topk_fwd(aiter_tensor_t& gating_output,
     // graph-replayable; zero blocks are raised to cover them.
     int32_t* sync_ptr = nullptr;
     int router_blocks = 0;
-    const int rw      = router_waves_for(num_tokens);
+    int rw            = router_waves_for(num_tokens);
+    // One token per router wave, and the waves left over clear the mask, so RW
+    // must stay below BLOCK/64 whatever the block override says: 1024 -> 8 or
+    // 4, 512 -> 4, 256 -> 2. The kernel static_asserts the same relation.
+    while(rw * 64 >= block)
+        rw >>= 1;
     if(sync.has_value() && rnreg > 0)
     {
         AITER_CHECK(sync.value().dtype() == AITER_DTYPE_i32 && sync.value().numel() >= 1,
@@ -499,7 +636,11 @@ void fused_moe_sorting_topk_fwd(aiter_tensor_t& gating_output,
                                   is_softmax,
                                   routed_scaling_factor,
                                   sync_ptr,
-                                  router_blocks};
+                                  router_blocks,
+                                  bias_ptr,
+                                  bias_is_fp32,
+                                  num_fused_shared_experts,
+                                  shared_expert_weight};
 
     const auto* mask_ptr = local_expert_mask.has_value()
                                ? static_cast<const int32_t*>(local_expert_mask.value().data_ptr())
@@ -508,8 +649,31 @@ void fused_moe_sorting_topk_fwd(aiter_tensor_t& gating_output,
                                ? static_cast<const int32_t*>(num_local_tokens.value().data_ptr())
                                : nullptr;
 
+    // The register router specialises on the bias; the LDS router (RNREG 0)
+    // reads it through the runtime pointer, so it needs no second instantiation.
     auto go = [&](auto block_tag, auto rn_tag, auto rw_tag) {
-        launch_topk<decltype(block_tag)::value, decltype(rn_tag)::value, decltype(rw_tag)::value>(
+        constexpr int RN = decltype(rn_tag)::value;
+        if constexpr(RN > 0)
+            if(bias_ptr != nullptr)
+                return launch_topk<decltype(block_tag)::value, RN, decltype(rw_tag)::value, true>(
+                    plan,
+                    grid,
+                    stream,
+                    mask_ptr,
+                    nlt_ptr,
+                    static_cast<int32_t*>(sorted_token_ids.data_ptr()),
+                    static_cast<float*>(sorted_weights.data_ptr()),
+                    static_cast<int32_t*>(sorted_expert_ids.data_ptr()),
+                    static_cast<int32_t*>(num_valid_ids.data_ptr()),
+                    moe_buf.data_ptr(),
+                    num_tokens,
+                    topk,
+                    num_experts,
+                    unit_size,
+                    moe_buf_bytes,
+                    zero_blocks,
+                    router);
+        launch_topk<decltype(block_tag)::value, RN, decltype(rw_tag)::value, false>(
             plan,
             grid,
             stream,
@@ -530,10 +694,18 @@ void fused_moe_sorting_topk_fwd(aiter_tensor_t& gating_output,
     };
 
     auto by_rw = [&](auto block_tag, auto rn_tag) {
-        if(rw == 8)
-            go(block_tag, rn_tag, std::integral_constant<int, 8>{});
-        else
+        constexpr int B = decltype(block_tag)::value;
+        if constexpr(B >= 1024)
+        {
+            if(rw == 8)
+                go(block_tag, rn_tag, std::integral_constant<int, 8>{});
+            else
+                go(block_tag, rn_tag, std::integral_constant<int, 4>{});
+        }
+        else if constexpr(B >= 512)
             go(block_tag, rn_tag, std::integral_constant<int, 4>{});
+        else
+            go(block_tag, rn_tag, std::integral_constant<int, 2>{});
     };
     auto by_planes = [&](auto block_tag) {
         if(rnreg == 4)
