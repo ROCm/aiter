@@ -585,18 +585,29 @@ def _run_spec(inp, conv_weight=None, out=None):
     )
 
 
-@pytest.mark.parametrize("null_conv_slot", [False, True])
-def test_optimized_fused_spec_decode_skips_invalid_accepted_state(null_conv_slot):
-    """A NULL accepted slot must not commit state or convolution carry."""
+@pytest.mark.parametrize(
+    "invalid_accepted,num_spec",
+    [
+        ("null_state", 7),
+        ("null_state_and_conv", 7),
+        ("count_past_width", 7),
+        ("count_past_width", 1),
+    ],
+)
+def test_fused_spec_decode_skips_invalid_accepted_state(invalid_accepted, num_spec):
+    """Invalid accepted metadata must not commit state or convolution carry."""
     from aiter.ops.triton.utils._triton.arch_info import get_arch
 
     if get_arch() != "gfx950":
         pytest.skip("parallel spec-7 kernel is only dispatched on gfx950")
 
-    inp = _make_spec_inputs(1, 2, num_spec=7)
-    inp["state_indices"].zero_()  # accepted checkpoint slot is NULL
-    if null_conv_slot:
-        inp["conv_state_indices"].zero_()
+    inp = _make_spec_inputs(1, 2, num_spec=num_spec)
+    if invalid_accepted == "count_past_width":
+        inp["num_accepted_tokens"][0] = inp["state_indices"].shape[1] + 1
+    else:
+        inp["state_indices"].zero_()
+        if invalid_accepted == "null_state_and_conv":
+            inp["conv_state_indices"].zero_()
     before_cs, before_ss = inp["conv_state"].clone(), inp["state"].clone()
     out = _run_spec(inp)
     torch.testing.assert_close(inp["conv_state"], before_cs, atol=0, rtol=0)

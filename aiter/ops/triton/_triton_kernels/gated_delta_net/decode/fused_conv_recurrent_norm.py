@@ -124,7 +124,10 @@ def fused_conv_recurrent_norm_kernel(
         # Three history taps are kept in registers. The wrapper rejects any
         # other width before launch.
         tl.static_assert(W == 4)
-        checkpoint = tl.load(num_accepted_tokens_ptr + i_n).to(tl.int64) - 1
+        accepted = tl.load(num_accepted_tokens_ptr + i_n).to(tl.int64)
+        if accepted > SPEC_LEN:
+            return
+        checkpoint = accepted - 1
         checkpoint = tl.maximum(checkpoint, 0)
         tl.assume(checkpoint >= 0)
         state_idx = tl.load(
@@ -505,7 +508,10 @@ def fused_kda_spec_parallel_v_kernel(
     if seq_t == 0:
         return
 
-    checkpoint = tl.maximum(tl.load(num_accepted_tokens_ptr + i_n).to(tl.int64) - 1, 0)
+    accepted = tl.load(num_accepted_tokens_ptr + i_n).to(tl.int64)
+    if accepted > SPEC_LEN:
+        return
+    checkpoint = tl.maximum(accepted - 1, 0)
     tl.assume(checkpoint >= 0)
     read_state_idx = tl.load(
         ssm_state_indices_ptr
@@ -707,7 +713,10 @@ def fused_kda_spec_finalize_kernel(
 
     # Same validity test as the parallel kernel: when it returned early, the
     # carry was never written and the output was never produced.
-    checkpoint = tl.maximum(tl.load(num_accepted_tokens_ptr + i_n).to(tl.int64) - 1, 0)
+    accepted = tl.load(num_accepted_tokens_ptr + i_n).to(tl.int64)
+    if accepted > SPEC_LEN:
+        return
+    checkpoint = tl.maximum(accepted - 1, 0)
     read_state_idx = tl.load(
         ssm_state_indices_ptr
         + i_n * stride_indices_seq
