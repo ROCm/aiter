@@ -383,6 +383,16 @@ def _mxfp4_inline_sort_unsupported(
     if w1_scale.dtype not in scale_dtypes or w2_scale.dtype not in scale_dtypes:
         return "MXFP4 weight scales must be e8m0"
     experts, hidden, inter = w1.shape[0], hidden_states.shape[1], w2.shape[-1] * 2
+    # The intermediate scales are e8m0_shuffle'd in groups of 8 columns, so
+    # stage1 writes and stage2 reads them on a stride that rounds scale-N up to
+    # a multiple of 8 (kas_c_k1_for). The buffers aiter sizes for the exact
+    # inter_dim are short of that stride whenever inter_dim % 256 != 0, and the
+    # generated aux instance is the one code-generated for the 256-aligned
+    # width (is_mxfp4_moe_shape_supported pads before its lookup), so the call
+    # faults in moe_sorting instead of running slow. The heuristic fallback
+    # handles these shapes.
+    if inter % 256 != 0:
+        return f"inter_dim={inter} is not a multiple of 256"
     # Padded, not exact: a non-256-aligned inter_dim (Kimi-K3 I=384 gives 12
     # valid of 16 columns) makes the shuffled stride wider than the payload,
     # and the kernels address the padded stride.
@@ -3138,6 +3148,12 @@ def get_2stage_cfgs(
             cfg = None
             logger.warning(
                 "[fused_moe] discarding tuned inline-sort config with expert_mask"
+            )
+        elif _is_inline_sort_cfg(kn1, kn2) and inter_dim % 256 != 0:
+            cfg = None
+            logger.warning(
+                "[fused_moe] discarding tuned inline-sort config at "
+                f"inter_dim={inter_dim}, which is not a multiple of 256"
             )
         elif _is_inline_sort_cfg(kn1, kn2):
             inline_metadata = _make_mxfp4_metadata(
