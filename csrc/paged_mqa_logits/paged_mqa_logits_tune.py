@@ -189,6 +189,8 @@ class PagedMqaLogitsTuner(TunerCommon):
         gfx, cu_num = self.get_gfx(), self.get_cu_num()
         untunedf = self.get_untuned_gemm_list(args.untune_file)
         untunedf["gfx"], untunedf["cu_num"] = gfx, cu_num
+        if "context_len" not in untunedf.columns:
+            untunedf["context_len"] = ""
         self.untunedf = (
             untunedf.groupby(LOOKUP_KEYS, sort=False)["context_len"]
             .agg(lambda s: _join_contexts(c for v in s for c in _contexts(v)))
