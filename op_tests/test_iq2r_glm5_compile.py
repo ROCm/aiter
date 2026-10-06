@@ -27,7 +27,7 @@ from aiter.iq2r_glm5_compile import (
     iq2r_glm5_source_keys,
     load_glm5_importance,
 )
-from aiter.iq2r_glm53 import iq2r_glm53_gate_bytes
+from aiter.iq2r_glm53 import iq2r_glm53_gate_bytes, iq2r_glm53_pack
 from aiter.ops.iq2r_format import (
     IQ2R_ACTIVATION_BASIS,
     IQ2R_FORMAT_NAME,
@@ -53,82 +53,42 @@ def _layout() -> GLM5Layout:
     )
 
 
-def test_source_layout_reads_plain_glm53_config():
-    quantization_config = {
-        "quant_method": "fp8",
-        "weight_block_size": [128, 128],
-    }
-    dimensions = {
+def test_source_layout_reads_glm53_config():
+    config = {
+        "architectures": ["GlmMoeDsaForCausalLM"],
+        "model_type": "glm_moe_dsa",
         "num_hidden_layers": 78,
         "first_k_dense_replace": 3,
         "n_routed_experts": 256,
         "n_shared_experts": 1,
         "hidden_size": 6144,
         "moe_intermediate_size": 2048,
+        "quantization_config": {
+            "quant_method": "fp8",
+            "weight_block_size": [128, 128],
+        },
     }
-    plain = glm5_source_layout(
-        {
-            "architectures": ["GlmMoeDsaForCausalLM"],
-            "model_type": "glm_moe_dsa",
-            **dimensions,
-            "quantization_config": quantization_config,
-        }
-    )
-
-    assert plain.model_family == "glm_moe_dsa"
-    assert plain.source_root == "model"
-    assert plain.layer_count == 78
-    assert plain.expert_count == 256
-    assert plain.shared_expert_count == 1
-    assert plain.hidden_size == 6144
-    assert plain.intermediate_size == 2048
+    layout = glm5_source_layout(config)
+    assert layout == GLM5Layout(78, 3, 256, 6144, 2048, 128, 128)
+    assert layout.compiled_experts == 257
     with pytest.raises(ValueError, match="GLM MoE DSA"):
-        glm5_source_layout(
-            {
-                "model_type": "llama",
-                **dimensions,
-                "quantization_config": quantization_config,
-            }
-        )
+        glm5_source_layout({**config, "architectures": [], "model_type": "llama"})
+    with pytest.raises(ValueError, match="one shared expert"):
+        glm5_source_layout({**config, "n_shared_experts": 2})
 
 
-def test_plain_glm53_source_keys_use_top_level_model_root():
-    names = iq2r_glm5_source_keys(3, 255, root="model")
+def test_source_keys_match_glm53_checkpoint_names():
+    names = iq2r_glm5_source_keys(3, 255)
     assert names["gate_proj_weight"] == (
         "model.layers.3.mlp.experts.255.gate_proj.weight"
     )
     assert names["down_proj_weight_scale_inv"] == (
         "model.layers.3.mlp.experts.255.down_proj.weight_scale_inv"
     )
-    shared = iq2r_glm5_shared_source_keys(3, root="model")
+    shared = iq2r_glm5_shared_source_keys(3)
     assert shared["gate_proj_weight"] == (
         "model.layers.3.mlp.shared_experts.gate_proj.weight"
     )
-
-
-@pytest.mark.skipif(
-    not Path("/models/zai-org/GLM-5.3/config.json").is_file(),
-    reason="plain GLM-5.3 checkpoint is not mounted",
-)
-def test_real_plain_glm53_index_matches_compiler_contract():
-    model_dir = Path("/models/zai-org/GLM-5.3")
-    config = json.loads((model_dir / "config.json").read_text())
-    layout = glm5_source_layout(config)
-    index = json.loads((model_dir / "model.safetensors.index.json").read_text())
-    weight_map = index["weight_map"]
-
-    assert layout.model_family == "glm_moe_dsa"
-    assert layout.source_root == "model"
-    assert layout.layer_count == 78
-    assert layout.first_moe_layer == 3
-    assert layout.expert_count == 256
-    for layer, expert in ((3, 0), (77, 255), (78, 0)):
-        assert all(
-            name in weight_map
-            for name in iq2r_glm5_source_keys(
-                layer, expert, root=layout.source_root
-            ).values()
-        )
 
 
 def test_interleave_gate_up_uses_aiter_swiglu_row_order():
@@ -162,95 +122,43 @@ def test_block_fp8_dequantization_applies_each_2d_scale_block():
     )
 
 
-def test_loads_compact_glm_calibration_artifact(tmp_path):
+def test_loads_calibration_artifact(tmp_path):
     layout = _layout()
-    targets = {}
-    for layer in range(layout.moe_layers):
-        targets[f"model.layers.{layer}.mlp.experts.gate_up_proj.weight"] = {
-            "importance": torch.full(
-                (layout.expert_count, layout.hidden_size), layer + 1.0
-            )
+    widths = {"gate_up": layout.hidden_size, "down": layout.intermediate_size}
+    # Calibration stores every target as [groups, K]; the shared expert has one group.
+    modules = (("experts", layout.expert_count, 1.0), ("shared_experts", 1, 3.0))
+    targets = {
+        f"model.layers.{layer}.mlp.{module}.{projection}_proj.weight": {
+            "importance": torch.full((groups, width), layer + offset)
         }
-        targets[f"model.layers.{layer}.mlp.experts.down_proj.weight"] = {
-            "importance": torch.full(
-                (layout.expert_count, layout.intermediate_size), layer + 2.0
-            )
-        }
+        for layer in (3, 4)
+        for module, groups, offset in modules
+        for projection, width in widths.items()
+    }
+    artifact = {
+        "format": "iq2r-calibration",
+        "version": 1,
+        "scheme": "iq2r-diagonal-second-moment",
+        "basis": "native",
+        "targets": targets,
+    }
     path = tmp_path / "calibration.pt"
-    torch.save(
-        {
-            "format": "iq2r-calibration",
-            "version": 1,
-            "scheme": "iq2r-diagonal-second-moment",
-            "basis": "native",
-            "targets": targets,
-            "metadata": {
-                "unobserved_target_groups": 0,
-                "unobserved_policy": "error",
-            },
-        },
-        path,
-    )
+    torch.save(artifact, path)
 
     loaded = load_glm5_importance(path, layout)
     assert loaded.quality == "calibrated-o0"
-    assert loaded.gate_up.shape == (2, 2, 4)
+    assert torch.equal(loaded.gate_up[:, 0, 0], torch.tensor([4.0, 5.0]))
     assert loaded.down.shape == (2, 2, 2)
-    # Each per-expert vector is normalized to mean 1.
-    assert torch.equal(loaded.for_projection(3, "gate_up", 0), torch.ones(4))
-
-
-@pytest.mark.parametrize("grouped", [False, True])
-def test_loads_shared_expert_calibration_targets(tmp_path, grouped):
-    layout = GLM5Layout(
-        layer_count=5,
-        first_moe_layer=3,
-        expert_count=2,
-        hidden_size=4,
-        intermediate_size=2,
-        block_n=2,
-        block_k=2,
-        model_family="glm_moe_dsa",
-        source_root="model",
-        shared_expert_count=1,
-    )
-    targets = {}
-    for layer in range(layout.moe_layers):
-        targets[f"model.layers.{layer}.mlp.experts.gate_up_proj.weight"] = {
-            "importance": torch.ones(layout.expert_count, layout.hidden_size)
-        }
-        targets[f"model.layers.{layer}.mlp.experts.down_proj.weight"] = {
-            "importance": torch.ones(layout.expert_count, layout.intermediate_size)
-        }
-        groups = (1,) if grouped else ()
-        targets[f"model.layers.{layer}.mlp.shared_experts.gate_up_proj.weight"] = {
-            "importance": torch.full(groups + (layout.hidden_size,), layer + 3.0)
-        }
-        targets[f"model.layers.{layer}.mlp.shared_experts.down_proj.weight"] = {
-            "importance": torch.full(groups + (layout.intermediate_size,), layer + 4.0)
-        }
-    path = tmp_path / "calibration.pt"
-    torch.save(
-        {
-            "format": "iq2r-calibration",
-            "version": 1,
-            "scheme": "iq2r-diagonal-second-moment",
-            "basis": "native",
-            "targets": targets,
-            "metadata": {
-                "unobserved_target_groups": 0,
-                "unobserved_policy": "error",
-            },
-        },
-        path,
-    )
-
-    loaded = load_glm5_importance(path, layout)
-    assert loaded.shared_gate_up is not None
-    assert loaded.shared_down is not None
     assert loaded.shared_gate_up.shape == (2, 4)
-    assert loaded.shared_down.shape == (2, 2)
-    assert torch.equal(loaded.for_projection(3, "gate_up", 2), torch.ones(4))
+    assert torch.equal(loaded.shared_down[:, 0], torch.tensor([6.0, 7.0]))
+    # Each vector is normalized to mean 1; expert 2 is the fused shared expert.
+    for expert in range(layout.compiled_experts):
+        assert torch.equal(loaded.for_projection(3, "gate_up", expert), torch.ones(4))
+
+    del targets["model.layers.4.mlp.shared_experts.down_proj.weight"]
+    torch.save(artifact, path)
+    with pytest.raises(ValueError, match="shared_experts down targets cover"):
+        load_glm5_importance(path, layout)
 
 
 def test_uniform_importance_requires_explicit_diagnostic_mode():
@@ -260,7 +168,7 @@ def test_uniform_importance_requires_explicit_diagnostic_mode():
 
     loaded = load_glm5_importance(None, layout, diagnostic_uniform_importance=True)
     assert loaded.quality == "diagnostic-uniform-not-o0-quality"
-    assert loaded.metadata["warning"] == "not O0 quality"
+    assert loaded.shared_down.shape == (2, 2)
 
 
 def _has_gfx950() -> bool:
@@ -350,8 +258,6 @@ def test_checkpoint_files_replace_compiled_experts(tmp_path, monkeypatch):
         config,
         json.loads((source / "model.safetensors.index.json").read_text())["weight_map"],
         glm5_source_layout(config),
-        safe_open,
-        save_file,
     )
 
     index = json.loads((output / "model.safetensors.index.json").read_text())
@@ -411,7 +317,6 @@ def test_resume_validates_existing_layer_file(tmp_path):
         intermediate_size=32,
         block_n=16,
         block_k=16,
-        shared_expert_count=1,
     )
     metadata = IQ2RMetadata(logical_n=64, logical_k=32)
     keys = iq2r_compiled_tensor_keys(3, "gate_up")
@@ -433,24 +338,22 @@ def test_resume_validates_existing_layer_file(tmp_path):
         keys["tile_n"]: torch.tensor([128], dtype=torch.int32),
     }
     save_file(tensors, shard, metadata=file_metadata)
-    _validate_projection_shard(shard, layout, 3, "gate_up", _QUALITY, safe_open)
+    _validate_projection_shard(shard, layout, 3, "gate_up", _QUALITY)
 
     # Unpacked gate/up records have a different size.
     unpacked = dict(tensors)
     unpacked[keys["data"]] = torch.zeros((3, metadata.data_bytes), dtype=torch.uint8)
     save_file(unpacked, shard, metadata=file_metadata)
     with pytest.raises(ValueError, match="invalid compiled shard.*expected U8"):
-        _validate_projection_shard(shard, layout, 3, "gate_up", _QUALITY, safe_open)
+        _validate_projection_shard(shard, layout, 3, "gate_up", _QUALITY)
 
     save_file(tensors, shard, metadata={**file_metadata, "iq2r_quality": "other"})
     with pytest.raises(ValueError, match="metadata 'iq2r_quality'"):
-        _validate_projection_shard(shard, layout, 3, "gate_up", _QUALITY, safe_open)
+        _validate_projection_shard(shard, layout, 3, "gate_up", _QUALITY)
 
 
 @pytest.mark.skipif(not _has_gfx950(), reason="requires gfx950")
 def test_compile_packs_layers_and_writes_checkpoint(tmp_path, monkeypatch):
-    from aiter.iq2r_glm53 import iq2r_glm53_pack
-
     source, output = tmp_path / "source", tmp_path / "out"
     _write_source_model(source)
     generator = torch.Generator().manual_seed(0x5310)
@@ -502,12 +405,8 @@ def test_compile_packs_layers_and_writes_checkpoint(tmp_path, monkeypatch):
                 assert torch.equal(
                     handle.get_tensor(keys["auxiliary"]), values[1].cpu()
                 )
-    weight_map = json.loads((output / "model.safetensors.index.json").read_text())[
-        "weight_map"
-    ]
-    assert all((output / name).is_file() for name in set(weight_map.values()))
-    config = json.loads(config_path.read_text())
-    assert config["quantization_config"]["iq2r_layout"] == LAYOUT
+    # test_checkpoint_files_replace_compiled_experts checks the other files.
+    assert config_path == output / "config.json"
 
 
 if __name__ == "__main__":

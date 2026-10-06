@@ -164,62 +164,19 @@ def _materialize_one(
 
 
 @torch.no_grad()
-def iq2r_materialize(
-    data: Tensor,
-    auxiliary: Tensor,
-    metadata: IQ2RMetadata,
-    *,
-    output_dtype: torch.dtype = torch.float32,
-) -> Tensor:
-    """Materialize stacked IQ2R weights as dense ``[E,N,K]`` on the CPU."""
+def iq2r_materialize(data: Tensor, auxiliary: Tensor, metadata: IQ2RMetadata) -> Tensor:
+    """Materialize stacked IQ2R weights as dense float32 ``[E,N,K]`` on the CPU."""
 
-    if not output_dtype.is_floating_point:
-        raise TypeError(f"output_dtype must be floating point, got {output_dtype}")
     iq2r_validate_expert_weights(data, auxiliary, metadata)
-    decoded = torch.stack(
+    return torch.stack(
         [
             _materialize_one(data[expert], auxiliary[expert], metadata)
             for expert in range(data.shape[0])
         ]
     )
-    return decoded.to(output_dtype)
-
-
-@torch.no_grad()
-def iq2r_dense_reference(
-    activations: Tensor,
-    data: Tensor,
-    auxiliary: Tensor,
-    metadata: IQ2RMetadata,
-    *,
-    expert: int = 0,
-    bias: Tensor | None = None,
-    output_dtype: torch.dtype | None = None,
-) -> Tensor:
-    """Dense multiplication oracle for one expert's materialized weights."""
-
-    if activations.ndim != 2 or activations.shape[1] != metadata.logical_k:
-        raise ValueError(
-            f"activations must have shape [M,{metadata.logical_k}], "
-            f"got {tuple(activations.shape)}"
-        )
-    if not (0 <= expert < data.shape[0]):
-        raise ValueError(f"expert {expert} is outside [0,{data.shape[0]})")
-    weights = iq2r_materialize(data, auxiliary, metadata)[expert]
-    result = activations.float().cpu() @ weights.T
-    if bias is not None:
-        if bias.ndim == 2:
-            bias = bias[expert]
-        if tuple(bias.shape) != (metadata.logical_n,):
-            raise ValueError(
-                f"bias must have shape [{metadata.logical_n}] or [E,{metadata.logical_n}]"
-            )
-        result += bias.float().cpu()
-    return result.to(output_dtype or activations.dtype)
 
 
 __all__ = [
-    "iq2r_dense_reference",
     "iq2r_materialize",
     "iq2r_metadata_word",
     "iq2r_physical_tile",

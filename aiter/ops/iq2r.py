@@ -35,35 +35,6 @@ def _iq2r_materialize_out(
     output: Tensor,
     logical_n: int,
     logical_k: int,
-    expert_index: int,
-) -> None: ...
-
-
-@compile_ops("module_iq2r_moe", fc_name="iq2r_route_gather_quant_out", develop=True)
-def _iq2r_route_gather_quant_out(
-    input: Tensor,
-    gather_indices: Tensor,
-    output: Tensor,
-    scales: Tensor,
-    topk: int,
-) -> None: ...
-
-
-@compile_ops(
-    "module_iq2r_moe", fc_name="iq2r_route_direct_gather_quant_out", develop=True
-)
-def _iq2r_route_direct_gather_quant_out(
-    input: Tensor,
-    expert_ids: Tensor,
-    sorted_expert_ids: Tensor,
-    gather_indices: Tensor,
-    scatter_indices: Tensor,
-    tasks: Tensor,
-    task_count: Tensor,
-    output: Tensor,
-    scales: Tensor,
-    topk: int,
-    expert_count: int,
 ) -> None: ...
 
 
@@ -72,11 +43,22 @@ def _iq2r_route_direct_gather_quant_out(
 # ``aiter.iq2r_glm53`` for the orchestration and tuned dispatch.
 
 
+@compile_ops("module_iq2r_moe", fc_name="iq2r_glm53_m1_route_quant_out", develop=True)
+def iq2r_glm53_m1_route_quant_out(
+    input: Tensor,
+    topk_ids: Tensor,
+    scatter_indices: Tensor,
+    tasks: Tensor,
+    task_count: Tensor,
+    output: Tensor,
+    scales: Tensor,
+) -> None: ...
+
+
 @compile_ops("module_iq2r_moe", fc_name="iq2r_glm53_sort_quant_out", develop=True)
 def iq2r_glm53_sort_quant_out(
     input: Tensor,
     topk_ids: Tensor,
-    sorted_expert_ids: Tensor,
     gather_indices: Tensor,
     scatter_indices: Tensor,
     tasks: Tensor,
@@ -88,14 +70,18 @@ def iq2r_glm53_sort_quant_out(
 ) -> None: ...
 
 
-@compile_ops("module_iq2r_moe", fc_name="iq2r_glm53_sort_out", develop=True)
-def iq2r_glm53_sort_out(
+@compile_ops(
+    "module_iq2r_moe", fc_name="iq2r_glm53_prefill_sort_quant_out", develop=True
+)
+def iq2r_glm53_prefill_sort_quant_out(
+    input: Tensor,
     topk_ids: Tensor,
-    sorted_expert_ids: Tensor,
     gather_indices: Tensor,
     scatter_indices: Tensor,
     tasks: Tensor,
     task_count: Tensor,
+    output: Tensor,
+    scales: Tensor,
     scratch: Tensor,
 ) -> None: ...
 
@@ -192,19 +178,6 @@ def _validate_gpu_weights(
         raise ValueError("IQ2R compiled operations require GPU tensors")
 
 
-def _valid_activation_scale_shape(
-    scales: Tensor, rows: int, groups_per_row: int
-) -> bool:
-    row_major = tuple(scales.shape) == (rows, groups_per_row)
-    tile16 = (
-        scales.ndim == 4
-        and scales.shape[0] == (groups_per_row + 3) // 4
-        and scales.shape[1] >= (rows + 15) // 16
-        and scales.shape[2:] == (4, 16)
-    )
-    return scales.dtype == torch.uint8 and (row_major or tile16)
-
-
 @torch.no_grad()
 def iq2r_encode_device(
     weight: Tensor,
@@ -283,10 +256,8 @@ def iq2r_materialize_out(
     auxiliary: Tensor,
     metadata: IQ2RMetadata,
     output: Tensor,
-    *,
-    expert_index: int = 0,
 ) -> None:
-    """Materialize one expert into caller-owned FP32 ``[N,K]`` storage."""
+    """Materialize expert 0 into caller-owned FP32 ``[N,K]`` storage."""
 
     _validate_gpu_weights(data, auxiliary, metadata)
     if output.dtype != torch.float32 or tuple(output.shape) != (
@@ -298,15 +269,8 @@ def iq2r_materialize_out(
         )
     if output.device != data.device or not output.is_contiguous():
         raise ValueError("output must be contiguous and on the IQ2R weight device")
-    if not 0 <= expert_index < data.shape[0]:
-        raise ValueError("expert_index is out of range")
     _iq2r_materialize_out(
-        data,
-        auxiliary,
-        output,
-        metadata.logical_n,
-        metadata.logical_k,
-        expert_index,
+        data, auxiliary, output, metadata.logical_n, metadata.logical_k
     )
 
 
@@ -314,136 +278,14 @@ def iq2r_materialize_device(
     data: Tensor,
     auxiliary: Tensor,
     metadata: IQ2RMetadata,
-    *,
-    expert_index: int = 0,
 ) -> Tensor:
     output = torch.empty(
         (metadata.logical_n, metadata.logical_k),
         dtype=torch.float32,
         device=data.device,
     )
-    iq2r_materialize_out(data, auxiliary, metadata, output, expert_index=expert_index)
+    iq2r_materialize_out(data, auxiliary, metadata, output)
     return output
-
-
-def iq2r_route_gather_quant_out(
-    input: Tensor,
-    gather_indices: Tensor,
-    output: Tensor,
-    scales: Tensor,
-    *,
-    topk: int,
-) -> None:
-    """Gather routes and emit row-major MXFP8/E8M0 blocks in one pass."""
-
-    if input.dtype != torch.bfloat16 or input.ndim != 2:
-        raise ValueError("input must be BF16 [tokens,hidden]")
-    if gather_indices.dtype != torch.int32 or gather_indices.ndim != 1:
-        raise ValueError("gather_indices must be int32 [routes]")
-    if topk <= 0 or gather_indices.numel() != input.shape[0] * topk:
-        raise ValueError("gather_indices length must equal tokens*topk")
-    if input.shape[1] % 32:
-        raise ValueError("IQ2R MXFP8 quantization requires hidden divisible by 32")
-    expected_output = (gather_indices.numel(), input.shape[1])
-    scale_rows = gather_indices.numel()
-    scale_groups = input.shape[1] // 32
-    if output.dtype != torch.float8_e4m3fn or tuple(output.shape) != expected_output:
-        raise ValueError(f"output must be float8_e4m3fn {expected_output}")
-    if not _valid_activation_scale_shape(scales, scale_rows, scale_groups):
-        raise ValueError(
-            f"scales must be row-major uint8 [{scale_rows},{scale_groups}] "
-            "or tile16 uint8 "
-            f"[{(scale_groups + 3) // 4},{(scale_rows + 15) // 16},4,16]"
-        )
-    tensors = (input, gather_indices, output, scales)
-    if any(t.device != input.device for t in tensors):
-        raise ValueError("IQ2R fused gather/quant tensors must share a device")
-    if input.device.type != "cuda":
-        raise ValueError("IQ2R fused gather/quant tensors must be on one GPU")
-    if input.stride(-1) != 1 or input.stride(0) < input.shape[1]:
-        raise ValueError(
-            "IQ2R fused gather/quant input must have contiguous columns and "
-            "non-overlapping rows"
-        )
-    if any(not t.is_contiguous() for t in (gather_indices, output, scales)):
-        raise ValueError(
-            "IQ2R fused gather/quant indices and outputs must be contiguous"
-        )
-    _iq2r_route_gather_quant_out(input, gather_indices, output, scales, topk)
-
-
-def iq2r_route_direct_gather_quant_out(
-    input: Tensor,
-    expert_ids: Tensor,
-    sorted_expert_ids: Tensor,
-    gather_indices: Tensor,
-    scatter_indices: Tensor,
-    tasks: Tensor,
-    task_count: Tensor,
-    output: Tensor,
-    scales: Tensor,
-    *,
-    topk: int,
-    expert_count: int,
-) -> None:
-    """Fuse unsorted one-row task construction with low-M gather/quantization."""
-
-    routes = expert_ids.numel()
-    if not 0 < routes <= 16 or routes % topk:
-        raise ValueError("direct IQ2R routing requires 1..16 complete top-k rows")
-    if expert_ids.dtype != torch.int32 or expert_ids.ndim != 1:
-        raise ValueError("expert_ids must be int32 [routes]")
-    vectors = (sorted_expert_ids, gather_indices, scatter_indices)
-    if any(t.dtype != torch.int32 or tuple(t.shape) != (routes,) for t in vectors):
-        raise ValueError("sorted/gather/scatter tensors must be int32 [routes]")
-    if tasks.dtype != torch.int32 or tasks.ndim != 2 or tasks.shape[1] != 3:
-        raise ValueError("tasks must be int32 [capacity,3]")
-    if tasks.shape[0] < routes:
-        raise ValueError("direct IQ2R routing requires at least one task per route")
-    if task_count.dtype != torch.int32 or tuple(task_count.shape) != (1,):
-        raise ValueError("task_count must be int32 [1]")
-    if input.dtype != torch.bfloat16 or input.ndim != 2:
-        raise ValueError("input must be BF16 [tokens,hidden]")
-    if output.dtype != torch.float8_e4m3fn or tuple(output.shape) != (
-        routes,
-        input.shape[1],
-    ):
-        raise ValueError("output must be FP8 [routes,hidden]")
-    scale_groups = input.shape[1] // 32
-    if not _valid_activation_scale_shape(scales, routes, scale_groups):
-        raise ValueError(
-            "scales must be row-major uint8 [routes,hidden/32] or "
-            "tile16 uint8 [ceil(hidden/128),ceil(routes/16),4,16]"
-        )
-    tensors = (
-        expert_ids,
-        sorted_expert_ids,
-        gather_indices,
-        scatter_indices,
-        tasks,
-        task_count,
-        output,
-        scales,
-    )
-    if input.device.type != "cuda" or any(t.device != input.device for t in tensors):
-        raise ValueError("all direct IQ2R routing tensors must share one GPU")
-    if input.stride(-1) != 1 or input.stride(0) < input.shape[1]:
-        raise ValueError("direct IQ2R input must have contiguous non-overlapping rows")
-    if any(not t.is_contiguous() for t in tensors):
-        raise ValueError("direct IQ2R routing outputs must be contiguous")
-    _iq2r_route_direct_gather_quant_out(
-        input,
-        expert_ids,
-        sorted_expert_ids,
-        gather_indices,
-        scatter_indices,
-        tasks,
-        task_count,
-        output,
-        scales,
-        topk,
-        expert_count,
-    )
 
 
 __all__ = [
@@ -453,11 +295,10 @@ __all__ = [
     "iq2r_glm53_down_route9_out",
     "iq2r_glm53_gate_m1_out",
     "iq2r_glm53_gate_out",
+    "iq2r_glm53_m1_route_quant_out",
+    "iq2r_glm53_prefill_sort_quant_out",
     "iq2r_glm53_route_reduce_out",
-    "iq2r_glm53_sort_out",
     "iq2r_glm53_sort_quant_out",
     "iq2r_materialize_device",
     "iq2r_materialize_out",
-    "iq2r_route_direct_gather_quant_out",
-    "iq2r_route_gather_quant_out",
 ]

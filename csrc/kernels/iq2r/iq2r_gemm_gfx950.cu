@@ -64,16 +64,6 @@ __device__ __forceinline__ uint32_t load_u32(const uint8_t* pointer)
     return *reinterpret_cast<const uint32_t*>(pointer);
 }
 
-__device__ __forceinline__ uint64_t apply_signs(uint64_t magnitude,
-                                                 uint32_t signs)
-{
-    constexpr uint32_t spread = 0x10204080u;
-    constexpr uint32_t sign_mask = 0x80808080u;
-    const uint32_t low = ((signs & 0x0fu) * spread) & sign_mask;
-    const uint32_t high = (((signs >> 4) & 0x0fu) * spread) & sign_mask;
-    return magnitude ^ (static_cast<uint64_t>(high) << 32) ^ low;
-}
-
 __device__ __forceinline__ void wave_min(float& error, int& index)
 {
 #pragma unroll
@@ -380,15 +370,7 @@ __device__ __forceinline__ void iq2r_wait_vmcnt()
     __builtin_amdgcn_s_waitcnt(waitcnt);
 }
 
-template<bool PinToAgpr>
-__device__ __forceinline__ void
-iq2r_pin_accumulator(opus::vector_t<float, 4>& accumulator)
-{
-    if constexpr(PinToAgpr)
-        asm volatile("" : "+a"(accumulator));
-}
-
-template<int AccumulatorBase, bool PinToAgpr = false>
+template<int AccumulatorBase>
 __device__ __forceinline__ void iq2r_triplet_mfma(
     const opus::i32x8_t& activation,
     const opus::i32x8_t* weights,
@@ -405,7 +387,6 @@ __device__ __forceinline__ void iq2r_triplet_mfma(
             scale_b,
             opus::number<0>{},
             opus::number<0>{});
-    iq2r_pin_accumulator<PinToAgpr>(accumulators[AccumulatorBase]);
     accumulators[AccumulatorBase + 1] =
         mma(activation,
             weights[1],
@@ -414,7 +395,6 @@ __device__ __forceinline__ void iq2r_triplet_mfma(
             scale_b,
             opus::number<0>{},
             opus::number<1>{});
-    iq2r_pin_accumulator<PinToAgpr>(accumulators[AccumulatorBase + 1]);
     accumulators[AccumulatorBase + 2] =
         mma(activation,
             weights[2],
@@ -423,7 +403,6 @@ __device__ __forceinline__ void iq2r_triplet_mfma(
             scale_b,
             opus::number<0>{},
             opus::number<2>{});
-    iq2r_pin_accumulator<PinToAgpr>(accumulators[AccumulatorBase + 2]);
 }
 
 __device__ __forceinline__ IQ2RCompressedTriplet
@@ -441,12 +420,6 @@ iq2r_load_compact_triplet(const uint8_t* data, int source_base, int lane)
     return result;
 }
 
-// Large routed-M diagnostic family.  Multiple M atoms share each compact IQ2R
-// weight triplet, so every global weight record and codebook lookup feeds four
-// independent 16x16 output tiles instead of being reloaded for four serial
-// row slabs. The counted wait staircase retires the direct-to-LDS weight
-// transfer while activation loads remain outstanding, then keeps the next
-// triplet in flight across the current tile's decode and MFMAs.
 int64_t expected_data_bytes(int64_t n, int64_t k)
 {
     const int64_t n_blocks = n / kTileN;
@@ -535,9 +508,6 @@ __device__ __forceinline__ IQ2RCompressedTriplet iq2r_scheduled_load_compact_uni
     return out;
 }
 
-__device__ opus::i32x4_t iq2r_scheduled_buffer_load4(opus::i32x4_t, int, int, int)
-    __asm("llvm.amdgcn.raw.buffer.load.v4i32");
-
 __device__ int iq2r_scheduled_buffer_load1(opus::i32x4_t, int, int, int)
     __asm("llvm.amdgcn.raw.buffer.load.i32");
 
@@ -552,22 +522,22 @@ __device__ __forceinline__ IQ2RCompressedQuad iq2r_scheduled_load_quad(
         static_cast<int>(opus::buffer_default_config())};
     const int sb=__builtin_amdgcn_readfirstlane(base);
     IQ2RCompressedQuad out;
-    out.first=__builtin_bit_cast(uint4,iq2r_scheduled_buffer_load4(rsrc,lane*16,sb,0));
-    out.second=__builtin_bit_cast(uint4,iq2r_scheduled_buffer_load4(rsrc,lane*16+1024,sb,0));
+    out.first=__builtin_bit_cast(uint4,iq2r_scheduled_load_dwordx4(rsrc,lane*16,sb,0));
+    out.second=__builtin_bit_cast(uint4,iq2r_scheduled_load_dwordx4(rsrc,lane*16+1024,sb,0));
     out.metadata=iq2r_scheduled_buffer_load1(rsrc,lane*4+2048,sb,0);
     asm volatile("" ::: "memory");
     return out;
 }
 
-// Packed-stack gate records: 9-bit packed indices, sign bit planes and a
-// sign-free codebook (see aiter/iq2r_packed_stack.py).
-template<int MAtoms,int Batch>
+// Packed gate records: 9-bit packed indices, sign bit planes and a sign-free
+// codebook (see iq2r_glm53_pack in aiter/iq2r_glm53.py).
+template<int MAtoms>
 __device__ __forceinline__ void glm53_quad_decode_mfma(
     const IQ2RCompressedQuad& compressed,const uint64_t* codebook,uint32_t bases,
     const IQ2RActivationFragment* activation,const uint32_t* scale_a,
     opus::vector_t<float,4> (&accumulators)[MAtoms][4],int active_m);
 
-template<bool Packed>
+template<int NT>
 __global__ __launch_bounds__(512,1) void glm53_gate_m1_kernel(
     const opus::fp8_t* __restrict__ activations,
     const uint8_t* __restrict__ scales,
@@ -575,39 +545,33 @@ __global__ __launch_bounds__(512,1) void glm53_gate_m1_kernel(
     const uint8_t* __restrict__ all_auxiliary,
     const int32_t* __restrict__ tasks,
     const int32_t* __restrict__ task_count,
-    const int32_t* __restrict__ gather,
     opus::fp8_t* __restrict__ output,
     uint8_t* __restrict__ output_scales,
     int routes,int data_bytes,int auxiliary_bytes)
 {
 #if defined(__gfx950__)
     constexpr int MAtoms=1;
-    constexpr int K=6144, Rows=16*MAtoms, Subtasks=1;
-    static_assert(MAtoms==1);
+    constexpr int K=6144, Rows=16*MAtoms;
     struct Storage {
         alignas(16) uint64_t codebook[kCodebookBytes/8];
-        union {
-            alignas(16) uint8_t cache[8][kQuadBytes];
-            alignas(16) opus::vector_t<float,4> partial[8][4][64];
-        } reuse;
+        alignas(16) opus::vector_t<float,4> partial[8][4][64];
     };
     __shared__ Storage shared;
     const int lane=threadIdx.x,wave=threadIdx.y,linear=wave*64+lane;
     const int lane_row=lane%16,lane_group=lane/16;
     const int num_tasks=task_count[0];
-    const int total=num_tasks*Subtasks*8;
+    const int total=num_tasks*NT;
     for(int work=blockIdx.x;work<total;work+=gridDim.x)
     {
-        const int task=(work/Subtasks)%num_tasks;
-        const int sub=work%Subtasks;
-        const int n_tile=work/(num_tasks*Subtasks);
-        const int row_begin=tasks[task*3]+sub*Rows;
+        const int task=work%num_tasks;
+        const int n_tile=work/num_tasks;
+        const int row_begin=tasks[task*3];
         const int row_end=min(row_begin+Rows,tasks[task*3]+tasks[task*3+1]);
         const int expert=tasks[task*3+2];
         if(row_begin>=row_end || row_begin<0 || row_end>routes || expert<0 || expert>=257) continue;
         const uint8_t* data=all_data+static_cast<int64_t>(expert)*data_bytes;
         const uint8_t* aux=all_auxiliary+static_cast<int64_t>(expert)*auxiliary_bytes;
-        // Previous work ends with a barrier protecting both union and codebook.
+        // Previous work ends with a barrier protecting the codebook and partials.
         shared.codebook[linear]=reinterpret_cast<const uint64_t*>(aux)[linear];
         __syncthreads();
         const int nbase=n_tile*4;
@@ -619,7 +583,6 @@ __global__ __launch_bounds__(512,1) void glm53_gate_m1_kernel(
 #pragma unroll
         for(int m=0;m<MAtoms;++m) rows[m]=min(row_begin+m*16+lane_row,row_end-1);
         opus::vector_t<float,4> accumulators[MAtoms][4]={};
-        opus::gmem<uint8_t> buffer(data,static_cast<unsigned int>(data_bytes));
         int base=(n_tile*48+wave*6)*kQuadBytes;
         IQ2RCompressedQuad pending=iq2r_scheduled_load_quad(data,data_bytes,base,lane);
 #pragma unroll 6
@@ -642,17 +605,15 @@ __global__ __launch_bounds__(512,1) void glm53_gate_m1_kernel(
                 base+=kQuadBytes;
                 pending=iq2r_scheduled_load_quad(data,data_bytes,base,lane);
             }
-            if constexpr(Packed) glm53_quad_decode_mfma<MAtoms,4>(compressed,shared.codebook,bases,a,sa,accumulators,MAtoms);
-            else iq2r_quad_decode_mfma<MAtoms>(compressed,shared.codebook,bases,a,sa,accumulators);
+            glm53_quad_decode_mfma<MAtoms>(compressed,shared.codebook,bases,a,sa,accumulators,MAtoms);
         }
-        // No wave may overwrite another wave's cache before its final read.
         __syncthreads();
 #pragma unroll
         for(int m=0;m<MAtoms;++m)
         {
 #pragma unroll
             for(int atom=0;atom<4;++atom)
-                shared.reuse.partial[wave][atom][lane]=accumulators[m][atom];
+                shared.partial[wave][atom][lane]=accumulators[m][atom];
             __syncthreads();
             if(wave<4)
             {
@@ -665,7 +626,7 @@ __global__ __launch_bounds__(512,1) void glm53_gate_m1_kernel(
                     float value=0.0f;
 #pragma unroll
                     for(int source=0;source<8;++source)
-                        value+=shared.reuse.partial[source][atom][lane][wave];
+                        value+=shared.partial[source][atom][lane][wave];
                     values[atom]=__bfloat162float(__float2bfloat16(value));
                 }
                 // Adjacent lanes hold the interleaved gate and up columns.
@@ -692,144 +653,8 @@ __global__ __launch_bounds__(512,1) void glm53_gate_m1_kernel(
                         const float inverse=1.0f/bs.dq_scale;
 #pragma unroll
                         for(int atom=0;atom<4;++atom)
-                            output[static_cast<int64_t>(output_row)*256+n_tile*32+atom*8+lane_row/2]=opus::fp32_to_fp8(activated[atom]*inverse);
-                        if(lane_row==0) output_scales[static_cast<int64_t>(output_row)*8+n_tile]=bs.byte;
-                    }
-                }
-            }
-            __syncthreads();
-        }
-    }
-#endif
-}
-
-template<bool Packed>
-__global__ __launch_bounds__(512,1) void glm53_gate_m1_kernel_tp4(
-    const opus::fp8_t* __restrict__ activations,
-    const uint8_t* __restrict__ scales,
-    const uint8_t* __restrict__ all_data,
-    const uint8_t* __restrict__ all_auxiliary,
-    const int32_t* __restrict__ tasks,
-    const int32_t* __restrict__ task_count,
-    const int32_t* __restrict__ gather,
-    opus::fp8_t* __restrict__ output,
-    uint8_t* __restrict__ output_scales,
-    int routes,int data_bytes,int auxiliary_bytes)
-{
-#if defined(__gfx950__)
-    constexpr int MAtoms=1;
-    constexpr int K=6144, Rows=16*MAtoms, Subtasks=1;
-    static_assert(MAtoms==1);
-    struct Storage {
-        alignas(16) uint64_t codebook[kCodebookBytes/8];
-        union {
-            alignas(16) uint8_t cache[8][kQuadBytes];
-            alignas(16) opus::vector_t<float,4> partial[8][4][64];
-        } reuse;
-    };
-    __shared__ Storage shared;
-    const int lane=threadIdx.x,wave=threadIdx.y,linear=wave*64+lane;
-    const int lane_row=lane%16,lane_group=lane/16;
-    const int num_tasks=task_count[0];
-    const int total=num_tasks*Subtasks*16;
-    for(int work=blockIdx.x;work<total;work+=gridDim.x)
-    {
-        const int task=(work/Subtasks)%num_tasks;
-        const int sub=work%Subtasks;
-        const int n_tile=work/(num_tasks*Subtasks);
-        const int row_begin=tasks[task*3]+sub*Rows;
-        const int row_end=min(row_begin+Rows,tasks[task*3]+tasks[task*3+1]);
-        const int expert=tasks[task*3+2];
-        if(row_begin>=row_end || row_begin<0 || row_end>routes || expert<0 || expert>=257) continue;
-        const uint8_t* data=all_data+static_cast<int64_t>(expert)*data_bytes;
-        const uint8_t* aux=all_auxiliary+static_cast<int64_t>(expert)*auxiliary_bytes;
-        // Previous work ends with a barrier protecting both union and codebook.
-        shared.codebook[linear]=reinterpret_cast<const uint64_t*>(aux)[linear];
-        __syncthreads();
-        const int nbase=n_tile*4;
-        uint32_t bases=0;
-#pragma unroll
-        for(int atom=0;atom<4;++atom)
-            bases|=static_cast<uint32_t>(aux[kCodebookBytes+nbase+atom])<<(atom*8);
-        int rows[MAtoms];
-#pragma unroll
-        for(int m=0;m<MAtoms;++m) rows[m]=min(row_begin+m*16+lane_row,row_end-1);
-        opus::vector_t<float,4> accumulators[MAtoms][4]={};
-        opus::gmem<uint8_t> buffer(data,static_cast<unsigned int>(data_bytes));
-        int base=(n_tile*48+wave*6)*kQuadBytes;
-        IQ2RCompressedQuad pending=iq2r_scheduled_load_quad(data,data_bytes,base,lane);
-#pragma unroll 6
-        for(int iteration=0;iteration<6;++iteration)
-        {
-            const int kt=wave*6+iteration;
-            IQ2RActivationFragment a[MAtoms]={};uint32_t sa[MAtoms];
-#pragma unroll
-            for(int m=0;m<MAtoms;++m)
-            {
-                const auto* input=reinterpret_cast<const uint8_t*>(activations+static_cast<int64_t>(rows[m])*K);
-                const int ak=kt*128+lane_group*16;
-                *reinterpret_cast<uint4*>(a[m].bytes)=*reinterpret_cast<const uint4*>(input+ak);
-                *reinterpret_cast<uint4*>(a[m].bytes+16)=*reinterpret_cast<const uint4*>(input+ak+64);
-                sa[m]=scales[static_cast<int64_t>(rows[m])*192+kt*4+lane_group]*0x01010101u;
-            }
-            const auto compressed=pending;
-            if(iteration<5)
-            {
-                base+=kQuadBytes;
-                pending=iq2r_scheduled_load_quad(data,data_bytes,base,lane);
-            }
-            if constexpr(Packed) glm53_quad_decode_mfma<MAtoms,4>(compressed,shared.codebook,bases,a,sa,accumulators,MAtoms);
-            else iq2r_quad_decode_mfma<MAtoms>(compressed,shared.codebook,bases,a,sa,accumulators);
-        }
-        // No wave may overwrite another wave's cache before its final read.
-        __syncthreads();
-#pragma unroll
-        for(int m=0;m<MAtoms;++m)
-        {
-#pragma unroll
-            for(int atom=0;atom<4;++atom)
-                shared.reuse.partial[wave][atom][lane]=accumulators[m][atom];
-            __syncthreads();
-            if(wave<4)
-            {
-                const int local_row=m*16+lane_group*4+wave;
-                const int output_row=row_begin+local_row;
-                float values[4];
-#pragma unroll
-                for(int atom=0;atom<4;++atom)
-                {
-                    float value=0.0f;
-#pragma unroll
-                    for(int source=0;source<8;++source)
-                        value+=shared.reuse.partial[source][atom][lane][wave];
-                    values[atom]=__bfloat162float(__float2bfloat16(value));
-                }
-                // Adjacent lanes hold the interleaved gate and up columns.
-                // Read the odd lane before restricting execution to even lanes.
-                float up[4];
-#pragma unroll
-                for(int atom=0;atom<4;++atom) up[atom]=__shfl_xor(values[atom],1);
-                if(lane_row%2==0)
-                {
-                    float activated[4];float abs_max=1.0e-10f;
-#pragma unroll
-                    for(int atom=0;atom<4;++atom)
-                    {
-                        const float swish=values[atom]/(1.0f+__expf(-values[atom]));
-                        activated[atom]=__bfloat162float(__float2bfloat16(swish*(up[atom]+0.0f)));
-                        abs_max=fmaxf(abs_max,fabsf(activated[atom]));
-                    }
-                    abs_max=fmaxf(abs_max,__shfl_xor(abs_max,2));
-                    abs_max=fmaxf(abs_max,__shfl_xor(abs_max,4));
-                    abs_max=fmaxf(abs_max,__shfl_xor(abs_max,8));
-                    if(output_row<row_end)
-                    {
-                        const auto bs=fp_f32_to_e8m0_block_scale<kDefaultMxScaleRoundMode,MxDtype::FP8_E4M3>(abs_max);
-                        const float inverse=1.0f/bs.dq_scale;
-#pragma unroll
-                        for(int atom=0;atom<4;++atom)
-                            output[static_cast<int64_t>(output_row)*512+n_tile*32+atom*8+lane_row/2]=opus::fp32_to_fp8(activated[atom]*inverse);
-                        if(lane_row==0) output_scales[static_cast<int64_t>(output_row)*16+n_tile]=bs.byte;
+                            output[static_cast<int64_t>(output_row)*(NT*32)+n_tile*32+atom*8+lane_row/2]=opus::fp32_to_fp8(activated[atom]*inverse);
+                        if(lane_row==0) output_scales[static_cast<int64_t>(output_row)*NT+n_tile]=bs.byte;
                     }
                 }
             }
@@ -846,15 +671,9 @@ __device__ __forceinline__ int glm53_remap8(int index,int total)
  return xcd<tall?xcd*per+local:tall*per+(xcd-tall)*(per-1)+local;
 }
 
-template<int MAtoms,int Batch>
-__device__ __forceinline__ void glm53_quad_decode_mfma(
-    const IQ2RCompressedQuad& compressed,const uint64_t* codebook,uint32_t bases,
-    const IQ2RActivationFragment* activation,const uint32_t* scale_a,
-    opus::vector_t<float,4> (&accumulators)[MAtoms][4],int active_m);
-
-// Dense gate: waves cover N, while a shared K128 activation tile is reused
-// across the entire CTA. Preserve the eight original K768 partial sums.
-template<int Waves,bool WeightPrefetch,int XCD,int TaskGroup,int Unroll,int Decode=0,int NT=8>
+// Prefill gate: waves cover N, while a shared K128 activation tile is reused
+// across the CTA. K is summed as eight K768 partials, like the decode gate.
+template<int Waves,int XCD,int TaskGroup,int Unroll,int NT>
 __global__ __launch_bounds__(64*Waves,1) void glm53_gate_prefill_kernel(
     const opus::fp8_t* __restrict__ activations,const uint8_t* __restrict__ scales,
     const uint8_t* __restrict__ all_data,const uint8_t* __restrict__ all_auxiliary,
@@ -937,8 +756,7 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_gate_prefill_kernel(
                 s_buffer.template async_load<4>(shared.scales+slot*Rows*4,source_s+kt*4);
             asm volatile("" ::: "memory");
         };
-        IQ2RCompressedQuad pending;
-        if constexpr(WeightPrefetch)pending=iq2r_scheduled_load_quad(data,data_bytes,n_tile*48*kQuadBytes,lane);
+        IQ2RCompressedQuad pending=iq2r_scheduled_load_quad(data,data_bytes,n_tile*48*kQuadBytes,lane);
         issue_a(0,0);
         opus::vector_t<float,4> total[MAtoms][4]={};
 #pragma unroll 1
@@ -950,9 +768,7 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_gate_prefill_kernel(
             {
                 const int kt=partition*6+iter;
                 const int slot=kt&1;
-                IQ2RCompressedQuad compressed;
-                if constexpr(WeightPrefetch)compressed=pending;
-                else compressed=iq2r_scheduled_load_quad(data,data_bytes,(n_tile*48+kt)*kQuadBytes,lane);
+                const IQ2RCompressedQuad compressed=pending;
                 // The previous iteration issued the current A/scales. All
                 // waves must finish consuming the older slot before reuse.
                 asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
@@ -969,13 +785,9 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_gate_prefill_kernel(
                 if(kt<47)
                 {
                     issue_a(kt+1,1-slot);
-                    if constexpr(WeightPrefetch)
-                        pending=iq2r_scheduled_load_quad(data,data_bytes,(n_tile*48+kt+1)*kQuadBytes,lane);
+                    pending=iq2r_scheduled_load_quad(data,data_bytes,(n_tile*48+kt+1)*kQuadBytes,lane);
                 }
-                // Decode>0 reads packed-stack weights: packed indices, sign
-                // planes and a sign-free codebook (Decode = lookup batch).
-                if constexpr(Decode==0)iq2r_quad_sparse_decode_mfma<MAtoms>(compressed,shared.codebook,bases,a,sa,partial,MAtoms);
-                else glm53_quad_decode_mfma<MAtoms,Decode>(compressed,shared.codebook,bases,a,sa,partial,active_m);
+                glm53_quad_decode_mfma<MAtoms>(compressed,shared.codebook,bases,a,sa,partial,active_m);
             }
 #pragma unroll
             for(int m=0;m<MAtoms;++m)
@@ -1025,8 +837,8 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_gate_prefill_kernel(
 #endif
 }
 
-// Experimental entry requires validated nonnegative codebook bytes.
-// OR can combine the sign mask operation into a single v_and_or_b32.
+// Codebook bytes are sign-free (bit 7 clear), so OR applies the sign planes
+// and folds into a single v_and_or_b32.
 __device__ __forceinline__ uint64_t glm53_apply_signs(uint64_t magnitude,uint32_t signs)
 {
     constexpr uint32_t spread=0x10204080u,mask=0x80808080u;
@@ -1035,7 +847,7 @@ __device__ __forceinline__ uint64_t glm53_apply_signs(uint64_t magnitude,uint32_
     return static_cast<uint64_t>(high)<<32|low;
 }
 
-template<int Atom,bool SignOr>
+template<int Atom>
 __device__ __forceinline__ void glm53_decode_packed_atom(
     const IQ2RCompressedTriplet& compressed,
     const uint64_t* codebook,
@@ -1063,7 +875,7 @@ __device__ __forceinline__ void glm53_decode_packed_atom(
         const int codebook_index =
             codeword<3?((index_lows>>(codeword*9))&511u):((index_lows>>27)|(index_highs<<5));
         decoded.codewords[codeword] =
-            (SignOr?glm53_apply_signs(codebook[codebook_index],(signs>>(codeword*8))&255u):apply_signs(codebook[codebook_index],(signs>>(codeword*8))&255u));
+            glm53_apply_signs(codebook[codebook_index],(signs>>(codeword*8))&255u);
     }
     weight_fragment = decoded.words;
     const uint32_t base = (packed_bases >> (Atom * 8)) & 0xffu;
@@ -1071,36 +883,77 @@ __device__ __forceinline__ void glm53_decode_packed_atom(
     scale_b = base + delta;
 }
 
-// TP8: waves cover independent N tiles. Cooperatively cache A once per CTA.
-// Retain two separate K128 accumulators and their final addition so moving K
-// into one wave preserves the existing split-K arithmetic exactly.
-template<int Waves,int MAtoms,int Groups,bool Prefetch,int XCD,int TaskGroup,bool SignOr>
-__global__ __launch_bounds__(64*Waves,1) void glm53_down_tp8_kernel(
+// TP4 (K=512) down: each wave covers KT K128 tiles. Each K tile keeps its own
+// zero-initialized accumulator and the partials add in order ((k0+k1)+k2)+k3.
+template<int Atom,int KT,int MAtoms>
+__device__ __forceinline__ void glm53_down_tp4_atom(
+    const IQ2RCompressedTriplet (&compressed)[KT],const uint64_t* codebook,uint32_t bases,
+    const uint8_t* input,const uint8_t* scales,int active_m,int lane_row,int lane_group,
+    opus::vector_t<float,4> (&sum)[MAtoms])
+{
+    constexpr int K=KT*128;
+    // Issue every K tile's MFMA before the first addition so no add waits on
+    // the MFMA it follows; the ((k0+k1)+k2)+k3 order is unchanged.
+    opus::vector_t<float,4> part[KT][MAtoms];
+    opus::i32x8_t w[KT];uint32_t sb[KT];
+#pragma unroll
+    for(int kt=0;kt<KT;++kt)glm53_decode_packed_atom<Atom>(compressed[kt],codebook,bases,w[kt],sb[kt]);
+#pragma unroll
+    for(int kt=0;kt<KT;++kt)
+    {
+#pragma unroll
+        for(int m=0;m<MAtoms;++m)
+        {
+            if(m>=active_m)continue;
+            const int r=m*16+lane_row,col=kt*128+lane_group*16;
+            IQ2RActivationFragment a;
+            *reinterpret_cast<uint4*>(a.bytes)=*reinterpret_cast<const uint4*>(input+((r*K+col)^((r&15)<<4)));
+            *reinterpret_cast<uint4*>(a.bytes+16)=*reinterpret_cast<const uint4*>(input+((r*K+col+64)^((r&15)<<4)));
+            const uint32_t sa=scales[r*(K/32)+kt*4+lane_group];
+            part[kt][m]=opus::vector_t<float,4>{};
+            auto mma=opus::mfma<opus::fp8_t,opus::fp8_t,opus::fp32_t,16,16,128>{};
+            part[kt][m]=mma(w[kt],a.words,part[kt][m],sb[kt],sa);
+        }
+    }
+#pragma unroll
+    for(int m=0;m<MAtoms;++m)
+    {
+        if(m>=active_m)continue;
+        sum[m]=part[0][m];
+#pragma unroll
+        for(int kt=1;kt<KT;++kt)
+#pragma unroll
+            for(int c=0;c<4;++c)sum[m][c]+=part[kt][m][c];
+    }
+}
+
+template<int Waves,int MAtoms,int Groups,int XCD,int TaskGroup,int KT,int Occupancy=1>
+__global__ __launch_bounds__(64*Waves,Occupancy) void glm53_down_tp4_kernel(
     const opus::fp8_t* __restrict__ activations,
     const uint8_t* __restrict__ activation_scales,
     const uint8_t* __restrict__ all_data,
     const uint8_t* __restrict__ all_auxiliary,
     const int32_t* __restrict__ tasks,
     const int32_t* __restrict__ task_count,
-    const __hip_bfloat16* __restrict__ all_bias,
     __hip_bfloat16* __restrict__ output,
-    int M,int N,int K,int expert_count,int data_bytes,int auxiliary_bytes)
+    int M,int expert_count,int data_bytes,int auxiliary_bytes)
 {
 #if defined(__gfx950__)
-    constexpr int Rows=16*MAtoms,Columns=48*Waves*Groups,Threads=64*Waves;
+    constexpr int K=KT*128,Rows=16*MAtoms,Columns=48*Waves*Groups,Threads=64*Waves;
     struct Storage {
         alignas(16) uint64_t codebook[512];
-        alignas(16) uint8_t input[Rows*256];
-        uint8_t scales[Rows*8];
+        alignas(16) uint8_t input[Rows*K];
+        uint8_t scales[Rows*(K/32)];
     };
     __shared__ Storage shared;
-    const int lane=threadIdx.x,wave=threadIdx.y,linear=wave*64+lane;
+    // A wave-uniform wave index keeps the single-atom variant within 168 VGPRs
+    // (three workgroups per CU) without spilling.
+    const int lane=threadIdx.x,wave=__builtin_amdgcn_readfirstlane(threadIdx.y),linear=wave*64+lane;
     const int lane_row=lane%16,lane_group=lane/16;
     const int nt=task_count[0];
-    opus::gmem<uint8_t> a_buffer(activations,static_cast<unsigned int>(M*256));
-    // Descriptor bounds are bytes; typed offsets below are BF16 elements.
+    opus::gmem<uint8_t> a_buffer(activations,static_cast<unsigned int>(M*K));
     opus::gmem<opus::bf16_t> out_buffer(output,static_cast<unsigned int>(M*6144*sizeof(__hip_bfloat16)));
-    opus::gmem<uint8_t> scale_buffer(activation_scales,static_cast<unsigned int>(M*8));
+    opus::gmem<uint8_t> scale_buffer(activation_scales,static_cast<unsigned int>(M*(K/32)));
     int previous_expert=-1;
     for(int work=blockIdx.x;work<nt*(6144/Columns);work+=gridDim.x)
     {
@@ -1120,305 +973,6 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_down_tp8_kernel(
             task=first+local%valid;output_tile=local/valid;
         }
         const int n_tile=output_tile;
-        const int begin=tasks[task*3],count=tasks[task*3+1],expert=tasks[task*3+2];
-        if(begin<0 || count<=0 || begin+count>M || expert<0 || expert>=expert_count)continue;
-        const uint8_t* data=all_data+static_cast<int64_t>(expert)*data_bytes;
-        const uint8_t* aux=all_auxiliary+static_cast<int64_t>(expert)*auxiliary_bytes;
-        if(previous_expert!=expert)
-        {
-            for(int i=linear;i<512;i+=Threads)shared.codebook[i]=reinterpret_cast<const uint64_t*>(aux)[i];
-            previous_expert=expert;
-        }
-        for(int row_base=begin;row_base<begin+count;row_base+=Rows)
-        {
-            const int row_count=min(Rows,begin+count-row_base);
-            const int active_m=(row_count+15)/16;
-#pragma unroll
-            for(int copy=0;copy<(Rows*256+Threads*16-1)/(Threads*16);++copy)
-            {
-                const int offset=(linear+copy*Threads)*16;
-                const int r=offset/256,col=(offset%256)^((r&15)<<4);
-                const int src=(row_base+min(r,row_count-1))*256+col;
-                const int dest=(wave*64+copy*Threads)*16;
-                if(dest<Rows*256)a_buffer.template async_load<16>(shared.input+dest,src);
-            }
-            if(linear<Rows*2)
-            {
-                const int r=linear/2,col=(linear%2)*4;
-                scale_buffer.template async_load<4>(shared.scales+wave*64*4,(row_base+min(r,row_count-1))*8+col);
-            }
-            IQ2RCompressedTriplet pending[2];
-            uint32_t pending_bases=0;
-            if constexpr(Prefetch)
-            {
-                const int nb=n_tile*(Columns/16)+wave*3;
-#pragma unroll
-                for(int atom=0;atom<3;++atom)pending_bases|=static_cast<uint32_t>(aux[kCodebookBytes+nb+atom])<<(atom*8);
-#pragma unroll
-                for(int kt=0;kt<2;++kt)pending[kt]=iq2r_load_compact_triplet(data,static_cast<int>(triplet_base(physical_tile(nb,kt,2))),lane);
-            }
-            asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
-            __syncthreads();
-
-#pragma unroll 1
-            for(int group=0;group<Groups;++group)
-            {
-        const int n_block=n_tile*(Columns/16)+wave*3+group*Waves*3;
-        uint32_t bases=0;
-        IQ2RCompressedTriplet compressed[2];
-        if constexpr(Prefetch)
-        {
-            bases=pending_bases;
-            compressed[0]=pending[0];compressed[1]=pending[1];
-            if(group+1<Groups)
-            {
-                const int nb=n_block+Waves*3;
-                pending_bases=0;
-#pragma unroll
-                for(int atom=0;atom<3;++atom)pending_bases|=static_cast<uint32_t>(aux[kCodebookBytes+nb+atom])<<(atom*8);
-#pragma unroll
-                for(int kt=0;kt<2;++kt)pending[kt]=iq2r_load_compact_triplet(data,static_cast<int>(triplet_base(physical_tile(nb,kt,2))),lane);
-                asm volatile("" ::: "memory");
-            }
-        }
-        else
-        {
-#pragma unroll
-            for(int atom=0;atom<3;++atom)bases|=static_cast<uint32_t>(aux[kCodebookBytes+n_block+atom])<<(atom*8);
-#pragma unroll
-            for(int kt=0;kt<2;++kt)compressed[kt]=iq2r_load_compact_triplet(data,static_cast<int>(triplet_base(physical_tile(n_block,kt,2))),lane);
-        }
-            // Finish one N16 atom at a time. Retain the exact two K128
-            // partial sums, while shortening the lifetime of decoded weights
-            // and accumulators enough to support a full M64 tile.
-            {
-                opus::vector_t<float,4> first[MAtoms]={};
-                opus::i32x8_t w0;uint32_t sb0;
-                glm53_decode_packed_atom<0,SignOr>(compressed[0],shared.codebook,bases,w0,sb0);
-#pragma unroll
-                for(int m=0;m<MAtoms;++m)
-                {
-                    if(m>=active_m)continue;
-                    const int r=m*16+lane_row,col=lane_group*16;
-                    IQ2RActivationFragment a;
-                    *reinterpret_cast<uint4*>(a.bytes)=*reinterpret_cast<const uint4*>(shared.input+((r*256+col)^((r&15)<<4)));
-                    *reinterpret_cast<uint4*>(a.bytes+16)=*reinterpret_cast<const uint4*>(shared.input+((r*256+col+64)^((r&15)<<4)));
-                    const uint32_t sa=shared.scales[r*8+lane_group];
-                    auto mma=opus::mfma<opus::fp8_t,opus::fp8_t,opus::fp32_t,16,16,128>{};
-                    first[m]=mma(w0,a.words,first[m],sb0,sa);
-                }
-                opus::i32x8_t w1;uint32_t sb1;
-                glm53_decode_packed_atom<0,SignOr>(compressed[1],shared.codebook,bases,w1,sb1);
-#pragma unroll
-                for(int m=0;m<MAtoms;++m)
-                {
-                    if(m>=active_m)continue;
-                    const int r=m*16+lane_row,col=128+lane_group*16;
-                    IQ2RActivationFragment a;
-                    *reinterpret_cast<uint4*>(a.bytes)=*reinterpret_cast<const uint4*>(shared.input+((r*256+col)^((r&15)<<4)));
-                    *reinterpret_cast<uint4*>(a.bytes+16)=*reinterpret_cast<const uint4*>(shared.input+((r*256+col+64)^((r&15)<<4)));
-                    const uint32_t sa=shared.scales[r*8+4+lane_group];
-                    opus::vector_t<float,4> second={};
-                    auto mma=opus::mfma<opus::fp8_t,opus::fp8_t,opus::fp32_t,16,16,128>{};
-                    second=mma(w1,a.words,second,sb1,sa);
-                    const int out_r=m*16+lane_row;
-                    const int out_col=n_block*16+0*16+lane_group*4;
-                    opus::vector_t<opus::bf16_t,4> packed;
-#pragma unroll
-                    for(int c=0;c<4;++c)
-                    {
-                        float value=first[m][c]+second[c];
-                        if(all_bias)value+=__bfloat162float(all_bias[static_cast<int64_t>(expert)*6144+out_col+c]);
-                        packed[c]=__builtin_bit_cast(opus::bf16_t,__float2bfloat16(value));
-                    }
-                    if(out_r<row_count)out_buffer.template store<4>(packed,(row_base+out_r)*6144+out_col);
-                }
-            }
-            {
-                opus::vector_t<float,4> first[MAtoms]={};
-                opus::i32x8_t w0;uint32_t sb0;
-                glm53_decode_packed_atom<1,SignOr>(compressed[0],shared.codebook,bases,w0,sb0);
-#pragma unroll
-                for(int m=0;m<MAtoms;++m)
-                {
-                    if(m>=active_m)continue;
-                    const int r=m*16+lane_row,col=lane_group*16;
-                    IQ2RActivationFragment a;
-                    *reinterpret_cast<uint4*>(a.bytes)=*reinterpret_cast<const uint4*>(shared.input+((r*256+col)^((r&15)<<4)));
-                    *reinterpret_cast<uint4*>(a.bytes+16)=*reinterpret_cast<const uint4*>(shared.input+((r*256+col+64)^((r&15)<<4)));
-                    const uint32_t sa=shared.scales[r*8+lane_group];
-                    auto mma=opus::mfma<opus::fp8_t,opus::fp8_t,opus::fp32_t,16,16,128>{};
-                    first[m]=mma(w0,a.words,first[m],sb0,sa);
-                }
-                opus::i32x8_t w1;uint32_t sb1;
-                glm53_decode_packed_atom<1,SignOr>(compressed[1],shared.codebook,bases,w1,sb1);
-#pragma unroll
-                for(int m=0;m<MAtoms;++m)
-                {
-                    if(m>=active_m)continue;
-                    const int r=m*16+lane_row,col=128+lane_group*16;
-                    IQ2RActivationFragment a;
-                    *reinterpret_cast<uint4*>(a.bytes)=*reinterpret_cast<const uint4*>(shared.input+((r*256+col)^((r&15)<<4)));
-                    *reinterpret_cast<uint4*>(a.bytes+16)=*reinterpret_cast<const uint4*>(shared.input+((r*256+col+64)^((r&15)<<4)));
-                    const uint32_t sa=shared.scales[r*8+4+lane_group];
-                    opus::vector_t<float,4> second={};
-                    auto mma=opus::mfma<opus::fp8_t,opus::fp8_t,opus::fp32_t,16,16,128>{};
-                    second=mma(w1,a.words,second,sb1,sa);
-                    const int out_r=m*16+lane_row;
-                    const int out_col=n_block*16+1*16+lane_group*4;
-                    opus::vector_t<opus::bf16_t,4> packed;
-#pragma unroll
-                    for(int c=0;c<4;++c)
-                    {
-                        float value=first[m][c]+second[c];
-                        if(all_bias)value+=__bfloat162float(all_bias[static_cast<int64_t>(expert)*6144+out_col+c]);
-                        packed[c]=__builtin_bit_cast(opus::bf16_t,__float2bfloat16(value));
-                    }
-                    if(out_r<row_count)out_buffer.template store<4>(packed,(row_base+out_r)*6144+out_col);
-                }
-            }
-            {
-                opus::vector_t<float,4> first[MAtoms]={};
-                opus::i32x8_t w0;uint32_t sb0;
-                glm53_decode_packed_atom<2,SignOr>(compressed[0],shared.codebook,bases,w0,sb0);
-#pragma unroll
-                for(int m=0;m<MAtoms;++m)
-                {
-                    if(m>=active_m)continue;
-                    const int r=m*16+lane_row,col=lane_group*16;
-                    IQ2RActivationFragment a;
-                    *reinterpret_cast<uint4*>(a.bytes)=*reinterpret_cast<const uint4*>(shared.input+((r*256+col)^((r&15)<<4)));
-                    *reinterpret_cast<uint4*>(a.bytes+16)=*reinterpret_cast<const uint4*>(shared.input+((r*256+col+64)^((r&15)<<4)));
-                    const uint32_t sa=shared.scales[r*8+lane_group];
-                    auto mma=opus::mfma<opus::fp8_t,opus::fp8_t,opus::fp32_t,16,16,128>{};
-                    first[m]=mma(w0,a.words,first[m],sb0,sa);
-                }
-                opus::i32x8_t w1;uint32_t sb1;
-                glm53_decode_packed_atom<2,SignOr>(compressed[1],shared.codebook,bases,w1,sb1);
-#pragma unroll
-                for(int m=0;m<MAtoms;++m)
-                {
-                    if(m>=active_m)continue;
-                    const int r=m*16+lane_row,col=128+lane_group*16;
-                    IQ2RActivationFragment a;
-                    *reinterpret_cast<uint4*>(a.bytes)=*reinterpret_cast<const uint4*>(shared.input+((r*256+col)^((r&15)<<4)));
-                    *reinterpret_cast<uint4*>(a.bytes+16)=*reinterpret_cast<const uint4*>(shared.input+((r*256+col+64)^((r&15)<<4)));
-                    const uint32_t sa=shared.scales[r*8+4+lane_group];
-                    opus::vector_t<float,4> second={};
-                    auto mma=opus::mfma<opus::fp8_t,opus::fp8_t,opus::fp32_t,16,16,128>{};
-                    second=mma(w1,a.words,second,sb1,sa);
-                    const int out_r=m*16+lane_row;
-                    const int out_col=n_block*16+2*16+lane_group*4;
-                    opus::vector_t<opus::bf16_t,4> packed;
-#pragma unroll
-                    for(int c=0;c<4;++c)
-                    {
-                        float value=first[m][c]+second[c];
-                        if(all_bias)value+=__bfloat162float(all_bias[static_cast<int64_t>(expert)*6144+out_col+c]);
-                        packed[c]=__builtin_bit_cast(opus::bf16_t,__float2bfloat16(value));
-                    }
-                    if(out_r<row_count)out_buffer.template store<4>(packed,(row_base+out_r)*6144+out_col);
-                }
-            }
-            }
-            __syncthreads();
-        }
-    }
-#endif
-}
-
-// TP4 (K=512) packed-index down: the TP8 packed-index kernel with KT K128 tiles per wave.
-// Each K tile keeps its own zero-initialized accumulator and the partials add
-// in wave order ((k0+k1)+k2)+k3.
-template<int Atom,int KT,int MAtoms,bool Guard=true>
-__device__ __forceinline__ void glm53_down_tp4_atom(
-    const IQ2RCompressedTriplet (&compressed)[KT],const uint64_t* codebook,uint32_t bases,
-    const uint8_t* input,const uint8_t* scales,int active_m,int lane_row,int lane_group,
-    opus::vector_t<float,4> (&sum)[MAtoms])
-{
-    constexpr int K=KT*128;
-    // Issue every K tile's MFMA before the first addition so no add waits on
-    // the MFMA it follows; the ((k0+k1)+k2)+k3 order is unchanged.
-    opus::vector_t<float,4> part[KT][MAtoms];
-    opus::i32x8_t w[KT];uint32_t sb[KT];
-#pragma unroll
-    for(int kt=0;kt<KT;++kt)glm53_decode_packed_atom<Atom,true>(compressed[kt],codebook,bases,w[kt],sb[kt]);
-#pragma unroll
-    for(int kt=0;kt<KT;++kt)
-    {
-#pragma unroll
-        for(int m=0;m<MAtoms;++m)
-        {
-            if(Guard && m>=active_m)continue;
-            const int r=m*16+lane_row,col=kt*128+lane_group*16;
-            IQ2RActivationFragment a;
-            *reinterpret_cast<uint4*>(a.bytes)=*reinterpret_cast<const uint4*>(input+((r*K+col)^((r&15)<<4)));
-            *reinterpret_cast<uint4*>(a.bytes+16)=*reinterpret_cast<const uint4*>(input+((r*K+col+64)^((r&15)<<4)));
-            const uint32_t sa=scales[r*(K/32)+kt*4+lane_group];
-            part[kt][m]=opus::vector_t<float,4>{};
-            auto mma=opus::mfma<opus::fp8_t,opus::fp8_t,opus::fp32_t,16,16,128>{};
-            part[kt][m]=mma(w[kt],a.words,part[kt][m],sb[kt],sa);
-        }
-    }
-#pragma unroll
-    for(int m=0;m<MAtoms;++m)
-    {
-        if(Guard && m>=active_m)continue;
-        sum[m]=part[0][m];
-#pragma unroll
-        for(int kt=1;kt<KT;++kt)
-#pragma unroll
-            for(int c=0;c<4;++c)sum[m][c]+=part[kt][m][c];
-    }
-}
-
-// Guard=false computes every row atom unconditionally (padded rows read clamped
-// valid inputs and are never stored), keeping the MFMA stream branch-free.
-template<int Waves,int MAtoms,int Groups,int XCD,int TaskGroup,int KT,int Chunks=1,bool Tiled=false,int Occupancy=1,bool Prefetch=true,bool Guard=true>
-__global__ __launch_bounds__(64*Waves,Occupancy) void glm53_down_tp4_kernel(
-    const opus::fp8_t* __restrict__ activations,
-    const uint8_t* __restrict__ activation_scales,
-    const uint8_t* __restrict__ all_data,
-    const uint8_t* __restrict__ all_auxiliary,
-    const int32_t* __restrict__ tasks,
-    const int32_t* __restrict__ task_count,
-    const __hip_bfloat16* __restrict__ all_bias,
-    __hip_bfloat16* __restrict__ output,
-    int M,int N,int K_,int expert_count,int data_bytes,int auxiliary_bytes,int chunk)
-{
-#if defined(__gfx950__)
-    constexpr int K=KT*128,Rows=16*MAtoms,Columns=48*Waves*Groups,Threads=64*Waves;
-    struct Storage {
-        alignas(16) uint64_t codebook[512];
-        alignas(16) uint8_t input[Rows*K];
-        uint8_t scales[Rows*(K/32)];
-    };
-    __shared__ Storage shared;
-    const int lane=threadIdx.x,wave=threadIdx.y,linear=wave*64+lane;
-    const int lane_row=lane%16,lane_group=lane/16;
-    const int nt=task_count[0];
-    opus::gmem<uint8_t> a_buffer(activations,static_cast<unsigned int>(M*K));
-    opus::gmem<opus::bf16_t> out_buffer(output,static_cast<unsigned int>(M*6144*sizeof(__hip_bfloat16)));
-    opus::gmem<uint8_t> scale_buffer(activation_scales,static_cast<unsigned int>(M*(K/32)));
-    int previous_expert=-1;
-    for(int work=blockIdx.x;work<nt*(6144/Columns/Chunks);work+=gridDim.x)
-    {
-        int index=work;
-        if constexpr(XCD>0)
-        {
-            const int total=nt*(6144/Columns/Chunks);
-            const int per=(total+XCD-1)/XCD,tall=total%XCD==0?XCD:total%XCD;
-            const int die=work%XCD,local=work/XCD;
-            index=die<tall?die*per+local:tall*per+(die-tall)*(per-1)+local;
-        }
-        int task=index%nt,output_tile=index/nt;
-        if constexpr(TaskGroup>0)
-        {
-            const int first=(index/(TaskGroup*(6144/Columns/Chunks)))*TaskGroup;
-            const int valid=min(TaskGroup,nt-first),local=index%(TaskGroup*(6144/Columns/Chunks));
-            task=first+local%valid;output_tile=local/valid;
-        }
-        const int n_tile=output_tile+chunk*(6144/Columns/Chunks);
         const int begin=tasks[task*3],count=tasks[task*3+1],expert=tasks[task*3+2];
         if(begin<0 || count<=0 || begin+count>M || expert<0 || expert>=expert_count)continue;
         const uint8_t* data=all_data+static_cast<int64_t>(expert)*data_bytes;
@@ -1446,9 +1000,8 @@ __global__ __launch_bounds__(64*Waves,Occupancy) void glm53_down_tp4_kernel(
                 const int r=linear/(K/128),col=(linear%(K/128))*4;
                 scale_buffer.template async_load<4>(shared.scales+wave*64*4,(row_base+min(r,row_count-1))*(K/32)+col);
             }
-            IQ2RCompressedTriplet pending[Prefetch?KT:1];
+            IQ2RCompressedTriplet pending[KT];
             uint32_t pending_bases=0;
-            if constexpr(Prefetch)
             {
                 const int nb=n_tile*(Columns/16)+wave*3;
 #pragma unroll
@@ -1462,22 +1015,11 @@ __global__ __launch_bounds__(64*Waves,Occupancy) void glm53_down_tp4_kernel(
             for(int group=0;group<Groups;++group)
             {
                 const int n_block=n_tile*(Columns/16)+wave*3+group*Waves*3;
-                uint32_t bases=pending_bases;
+                const uint32_t bases=pending_bases;
                 IQ2RCompressedTriplet compressed[KT];
-                if constexpr(!Prefetch)
-                {
-                    bases=0;
-#pragma unroll
-                    for(int atom=0;atom<3;++atom)bases|=static_cast<uint32_t>(aux[kCodebookBytes+n_block+atom])<<(atom*8);
-#pragma unroll
-                    for(int kt=0;kt<KT;++kt)compressed[kt]=iq2r_load_compact_triplet(data,static_cast<int>(triplet_base(physical_tile(n_block,kt,KT))),lane);
-                }
-                else
-                {
 #pragma unroll
                 for(int kt=0;kt<KT;++kt)compressed[kt]=pending[kt];
-                }
-                if constexpr(Prefetch) if(group+1<Groups)
+                if(group+1<Groups)
                 {
                     const int nb=n_block+Waves*3;
                     pending_bases=0;
@@ -1490,22 +1032,17 @@ __global__ __launch_bounds__(64*Waves,Occupancy) void glm53_down_tp4_kernel(
 #define GLM53_DOWN_TP4_ATOM(ATOM) \
                 { \
                     opus::vector_t<float,4> sum[MAtoms]; \
-                    glm53_down_tp4_atom<ATOM,KT,MAtoms,Guard>(compressed,shared.codebook,bases,shared.input,shared.scales,active_m,lane_row,lane_group,sum); \
+                    glm53_down_tp4_atom<ATOM,KT,MAtoms>(compressed,shared.codebook,bases,shared.input,shared.scales,active_m,lane_row,lane_group,sum); \
                     _Pragma("unroll") \
                     for(int m=0;m<MAtoms;++m) \
                     { \
-                        if(Guard && m>=active_m)continue; \
+                        if(m>=active_m)continue; \
                         const int out_r=m*16+lane_row; \
                         const int out_col=n_block*16+ATOM*16+lane_group*4; \
                         opus::vector_t<opus::bf16_t,4> packed; \
                         _Pragma("unroll") \
-                        for(int c=0;c<4;++c) \
-                        { \
-                            float value=sum[m][c]; \
-                            if(all_bias)value+=__bfloat162float(all_bias[static_cast<int64_t>(expert)*6144+out_col+c]); \
-                            packed[c]=__builtin_bit_cast(opus::bf16_t,__float2bfloat16(value)); \
-                        } \
-                        if(out_r<row_count)out_buffer.template store<4>(packed,(Tiled?((out_col/384)*M+row_base+out_r)*384+out_col%384:(row_base+out_r)*6144+out_col)); \
+                        for(int c=0;c<4;++c)packed[c]=__builtin_bit_cast(opus::bf16_t,__float2bfloat16(sum[m][c])); \
+                        if(out_r<row_count)out_buffer.template store<4>(packed,(row_base+out_r)*6144+out_col); \
                     } \
                 }
                 GLM53_DOWN_TP4_ATOM(0) GLM53_DOWN_TP4_ATOM(1) GLM53_DOWN_TP4_ATOM(2)
@@ -1531,7 +1068,7 @@ __device__ __forceinline__ int glm53_ws_source_base(int n_block,int k_tile)
 // each wave decodes a K128 weight triplet once and applies it to every row
 // atom. K tiles are outermost, so each output still accumulates
 // ((k0+k1)+k2)+k3 from zero-initialized per-tile MFMAs, as in glm53_down_tp4_kernel.
-template<int Waves,int Groups,int XCD,int TaskGroup,int KT,int Chunks,int Occupancy,int MAtoms=4,bool Merge=false,bool Prefetch=false,bool KLoop=false,int Ablate=0>
+template<int Waves,int Groups,int XCD,int TaskGroup,int KT,int Chunks,int Occupancy>
 __global__ __launch_bounds__(64*Waves,Occupancy) void glm53_down_prefill_tp4_kernel(
     const opus::fp8_t* __restrict__ activations,
     const uint8_t* __restrict__ activation_scales,
@@ -1543,7 +1080,7 @@ __global__ __launch_bounds__(64*Waves,Occupancy) void glm53_down_prefill_tp4_ker
     int M,int expert_count,int data_bytes,int auxiliary_bytes,int chunk)
 {
 #if defined(__gfx950__)
-    constexpr int K=KT*128,Rows=16*MAtoms,Columns=48*Waves*Groups,Threads=64*Waves;
+    constexpr int MAtoms=4,K=KT*128,Rows=16*MAtoms,Columns=48*Waves*Groups,Threads=64*Waves;
     struct Storage {
         alignas(16) uint64_t codebook[512];
         alignas(16) uint8_t input[Rows*K];
@@ -1575,18 +1112,8 @@ __global__ __launch_bounds__(64*Waves,Occupancy) void glm53_down_prefill_tp4_ker
             task=first+local%valid;output_tile=local/valid;
         }
         const int n_tile=output_tile+chunk*(6144/Columns/Chunks);
-        const int begin=tasks[task*3],expert=tasks[task*3+2];
-        int count=tasks[task*3+1];
+        const int begin=tasks[task*3],count=tasks[task*3+1],expert=tasks[task*3+2];
         if(begin<0 || count<=0 || begin+count>M || expert<0 || expert>=expert_count)continue;
-        if constexpr(Merge)
-        {
-            // Pair consecutive row-contiguous tasks of one expert; the second
-            // task of each pair is covered by the first.
-            int position=0;
-            for(int t=task-1;t>=0 && tasks[t*3+2]==expert && tasks[t*3]+tasks[t*3+1]==tasks[(t+1)*3];--t)++position;
-            if(position&1)continue;
-            if(task+1<nt && tasks[(task+1)*3+2]==expert && tasks[(task+1)*3]==begin+count)count+=tasks[(task+1)*3+1];
-        }
         const uint8_t* data=all_data+static_cast<int64_t>(expert)*data_bytes;
         const uint8_t* aux=all_auxiliary+static_cast<int64_t>(expert)*auxiliary_bytes;
         if(previous_expert!=expert)
@@ -1598,8 +1125,6 @@ __global__ __launch_bounds__(64*Waves,Occupancy) void glm53_down_prefill_tp4_ker
         {
             const int row_count=min(Rows,begin+count-row_base);
             const int active_m=(row_count+15)/16;
-            static_assert(Ablate>=0);
-            if(Ablate!=4 || work==static_cast<int>(blockIdx.x))
 #pragma unroll
             for(int copy=0;copy<(Rows*K+Threads*16-1)/(Threads*16);++copy)
             {
@@ -1616,122 +1141,28 @@ __global__ __launch_bounds__(64*Waves,Occupancy) void glm53_down_prefill_tp4_ker
                 const int r=(linear+part*Threads)/(K/128),col=((linear+part*Threads)%(K/128))*4;
                 scale_buffer.template async_load<4>(shared.scales+(wave*64+part*Threads)*4,(row_base+min(r,row_count-1))*(K/32)+col);
             }
-            IQ2RCompressedTriplet pending[Prefetch?KT:1];
-            uint32_t pending_bases=0;
-            if constexpr(Prefetch)
-            {
-                const int nb=n_tile*(Columns/16)+wave*3;
-#pragma unroll
-                for(int atom=0;atom<3;++atom)pending_bases|=static_cast<uint32_t>(aux[kCodebookBytes+nb+atom])<<(atom*8);
-#pragma unroll
-                for(int kt=0;kt<KT;++kt)pending[kt]=iq2r_load_compact_triplet(data,glm53_ws_source_base<KT>(nb,kt),lane);
-            }
-            if constexpr(Ablate==4)
-            {
-                // Timing only: stage the A tile once per CTA.
-            }
             asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
             __syncthreads();
 #pragma unroll 1
             for(int group=0;group<Groups;++group)
             {
                 const int n_block=n_tile*(Columns/16)+wave*3+group*Waves*3;
-                uint32_t bases=pending_bases;
-                IQ2RCompressedTriplet compressed[KT];
-                if constexpr(Prefetch)
-                {
+                uint32_t bases=0;
 #pragma unroll
-                    for(int kt=0;kt<KT;++kt)compressed[kt]=pending[kt];
-                    if(group+1<Groups)
-                    {
-                        const int nb=n_block+Waves*3;
-                        pending_bases=0;
-#pragma unroll
-                        for(int atom=0;atom<3;++atom)pending_bases|=static_cast<uint32_t>(aux[kCodebookBytes+nb+atom])<<(atom*8);
-#pragma unroll
-                        for(int kt=0;kt<KT;++kt)pending[kt]=iq2r_load_compact_triplet(data,glm53_ws_source_base<KT>(nb,kt),lane);
-                        asm volatile("" ::: "memory");
-                    }
-                }
-                else
-                {
-                    bases=0;
-#pragma unroll
-                    for(int atom=0;atom<3;++atom)bases|=static_cast<uint32_t>(aux[kCodebookBytes+n_block+atom])<<(atom*8);
-                    if constexpr(!KLoop)
-#pragma unroll
-                    for(int kt=0;kt<KT;++kt)compressed[kt]=iq2r_load_compact_triplet(data,glm53_ws_source_base<KT>(n_block,kt),lane);
-                }
+                for(int atom=0;atom<3;++atom)bases|=static_cast<uint32_t>(aux[kCodebookBytes+n_block+atom])<<(atom*8);
                 opus::vector_t<float,4> sum[MAtoms][3];
-                if constexpr(KLoop)
-                {
-                    // Rolled K loop: one compressed K tile live plus a one-ahead
-                    // load, keeping VGPRs low enough for more resident waves.
-                    IQ2RCompressedTriplet current=iq2r_load_compact_triplet(data,glm53_ws_source_base<KT>(n_block,0),lane);
+                // Rolled K loop: one compressed K tile live plus a one-ahead
+                // load, keeping VGPRs low enough for more resident waves.
+                IQ2RCompressedTriplet current=iq2r_load_compact_triplet(data,glm53_ws_source_base<KT>(n_block,0),lane);
 #pragma unroll 1
-                    for(int kt=0;kt<KT;++kt)
-                    {
-                        IQ2RCompressedTriplet next=current;
-                        if(kt+1<KT)next=iq2r_load_compact_triplet(data,glm53_ws_source_base<KT>(n_block,kt+1),lane);
-                        opus::i32x8_t w[3];uint32_t sb[3];
-                        if constexpr(Ablate==2)
-                        {
-#pragma unroll
-                            for(int q=0;q<8;++q){w[0][q]=reinterpret_cast<const int*>(&current.paired)[q%4];w[1][q]=reinterpret_cast<const int*>(&current.paired)[(q+1)%4];w[2][q]=reinterpret_cast<const int*>(&current.third)[q%3];}
-                            sb[0]=sb[1]=sb[2]=127u;
-                        }
-                        else
-                        {
-                        glm53_decode_packed_atom<0,true>(current,shared.codebook,bases,w[0],sb[0]);
-                        glm53_decode_packed_atom<1,true>(current,shared.codebook,bases,w[1],sb[1]);
-                        glm53_decode_packed_atom<2,true>(current,shared.codebook,bases,w[2],sb[2]);
-                        }
-#pragma unroll
-                        for(int m=0;m<MAtoms;++m)
-                        {
-                            if(m>=active_m)continue;
-                            const int r=m*16+lane_row,col=kt*128+lane_group*16;
-                            IQ2RActivationFragment a;
-                            uint32_t sa=127u;
-                            if constexpr(Ablate==3)
-                            {
-#pragma unroll
-                                for(int q=0;q<8;++q)a.words[q]=r*131+q+kt;
-                            }
-                            else
-                            {
-                            *reinterpret_cast<uint4*>(a.bytes)=*reinterpret_cast<const uint4*>(shared.input+((r*K+col)^((r&15)<<4)));
-                            *reinterpret_cast<uint4*>(a.bytes+16)=*reinterpret_cast<const uint4*>(shared.input+((r*K+col+64)^((r&15)<<4)));
-                            sa=shared.scales[r*(K/32)+kt*4+lane_group];
-                            }
-#pragma unroll
-                            for(int atom=0;atom<3;++atom)
-                            {
-                                auto mma=opus::mfma<opus::fp8_t,opus::fp8_t,opus::fp32_t,16,16,128>{};
-                                opus::vector_t<float,4> part{};
-                                if constexpr(Ablate==1)
-                                {
-#pragma unroll
-                                    for(int c=0;c<4;++c)part[c]=__int_as_float((w[atom][c]^w[atom][c+4]^a.words[c]^a.words[c+4])&0x3fffffff)+static_cast<float>(sb[atom]+sa);
-                                }
-                                else part=mma(w[atom],a.words,part,sb[atom],sa);
-                                if(kt==0)sum[m][atom]=part;
-                                else
-#pragma unroll
-                                    for(int c=0;c<4;++c)sum[m][atom][c]+=part[c];
-                            }
-                        }
-                        current=next;
-                    }
-                }
-                else
-#pragma unroll
                 for(int kt=0;kt<KT;++kt)
                 {
+                    IQ2RCompressedTriplet next=current;
+                    if(kt+1<KT)next=iq2r_load_compact_triplet(data,glm53_ws_source_base<KT>(n_block,kt+1),lane);
                     opus::i32x8_t w[3];uint32_t sb[3];
-                    glm53_decode_packed_atom<0,true>(compressed[kt],shared.codebook,bases,w[0],sb[0]);
-                    glm53_decode_packed_atom<1,true>(compressed[kt],shared.codebook,bases,w[1],sb[1]);
-                    glm53_decode_packed_atom<2,true>(compressed[kt],shared.codebook,bases,w[2],sb[2]);
+                    glm53_decode_packed_atom<0>(current,shared.codebook,bases,w[0],sb[0]);
+                    glm53_decode_packed_atom<1>(current,shared.codebook,bases,w[1],sb[1]);
+                    glm53_decode_packed_atom<2>(current,shared.codebook,bases,w[2],sb[2]);
 #pragma unroll
                     for(int m=0;m<MAtoms;++m)
                     {
@@ -1753,6 +1184,7 @@ __global__ __launch_bounds__(64*Waves,Occupancy) void glm53_down_prefill_tp4_ker
                                 for(int c=0;c<4;++c)sum[m][atom][c]+=part[c];
                         }
                     }
+                    current=next;
                 }
 #pragma unroll
                 for(int m=0;m<MAtoms;++m)
@@ -1776,10 +1208,11 @@ __global__ __launch_bounds__(64*Waves,Occupancy) void glm53_down_prefill_tp4_ker
 #endif
 }
 
-// TP8: waves cover independent N tiles. Cooperatively cache A once per CTA.
-// Retain two separate K128 accumulators and their final addition so moving K
-// into one wave preserves the existing split-K arithmetic exactly.
-template<int Waves,int MAtoms,int Groups,bool Prefetch,int XCD,int TaskGroup,int Chunks,bool Tiled>
+// TP8 (K=256) down: waves cover independent N tiles and share one A tile
+// cached per CTA. Each output is the sum of two zero-initialized K128 MFMAs.
+// Chunks splits N across launches; Tiled stores [N/Columns][M][Columns] for
+// glm53_reduce_chunk_kernel, otherwise rows are [M][6144].
+template<int Waves,int MAtoms,int Groups,int XCD,int TaskGroup,int Chunks,bool Tiled>
 __global__ __launch_bounds__(64*Waves,1) void glm53_down_prefill_tp8_kernel(
     const opus::fp8_t* __restrict__ activations,
     const uint8_t* __restrict__ activation_scales,
@@ -1787,9 +1220,8 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_down_prefill_tp8_kernel(
     const uint8_t* __restrict__ all_auxiliary,
     const int32_t* __restrict__ tasks,
     const int32_t* __restrict__ task_count,
-    const __hip_bfloat16* __restrict__ all_bias,
     __hip_bfloat16* __restrict__ output,
-    int M,int N,int K,int expert_count,int data_bytes,int auxiliary_bytes,int chunk)
+    int M,int expert_count,int data_bytes,int auxiliary_bytes,int chunk)
 {
 #if defined(__gfx950__)
     constexpr int Rows=16*MAtoms,Columns=48*Waves*Groups,Threads=64*Waves;
@@ -1854,7 +1286,6 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_down_prefill_tp8_kernel(
             }
             IQ2RCompressedTriplet pending[2];
             uint32_t pending_bases=0;
-            if constexpr(Prefetch)
             {
                 const int nb=n_tile*(Columns/16)+wave*3;
 #pragma unroll
@@ -1869,29 +1300,18 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_down_prefill_tp8_kernel(
             for(int group=0;group<Groups;++group)
             {
         const int n_block=n_tile*(Columns/16)+wave*3+group*Waves*3;
-        uint32_t bases=0;
+        const uint32_t bases=pending_bases;
         IQ2RCompressedTriplet compressed[2];
-        if constexpr(Prefetch)
+        compressed[0]=pending[0];compressed[1]=pending[1];
+        if(group+1<Groups)
         {
-            bases=pending_bases;
-            compressed[0]=pending[0];compressed[1]=pending[1];
-            if(group+1<Groups)
-            {
-                const int nb=n_block+Waves*3;
-                pending_bases=0;
+            const int nb=n_block+Waves*3;
+            pending_bases=0;
 #pragma unroll
-                for(int atom=0;atom<3;++atom)pending_bases|=static_cast<uint32_t>(aux[kCodebookBytes+nb+atom])<<(atom*8);
+            for(int atom=0;atom<3;++atom)pending_bases|=static_cast<uint32_t>(aux[kCodebookBytes+nb+atom])<<(atom*8);
 #pragma unroll
-                for(int kt=0;kt<2;++kt)pending[kt]=iq2r_load_compact_triplet(data,static_cast<int>(triplet_base(physical_tile(nb,kt,2))),lane);
-                asm volatile("" ::: "memory");
-            }
-        }
-        else
-        {
-#pragma unroll
-            for(int atom=0;atom<3;++atom)bases|=static_cast<uint32_t>(aux[kCodebookBytes+n_block+atom])<<(atom*8);
-#pragma unroll
-            for(int kt=0;kt<2;++kt)compressed[kt]=iq2r_load_compact_triplet(data,static_cast<int>(triplet_base(physical_tile(n_block,kt,2))),lane);
+            for(int kt=0;kt<2;++kt)pending[kt]=iq2r_load_compact_triplet(data,static_cast<int>(triplet_base(physical_tile(nb,kt,2))),lane);
+            asm volatile("" ::: "memory");
         }
             // Finish one N16 atom at a time. Retain the exact two K128
             // partial sums, while shortening the lifetime of decoded weights
@@ -1899,7 +1319,7 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_down_prefill_tp8_kernel(
             {
                 opus::vector_t<float,4> first[MAtoms]={};
                 opus::i32x8_t w0;uint32_t sb0;
-                glm53_decode_packed_atom<0,true>(compressed[0],shared.codebook,bases,w0,sb0);
+                glm53_decode_packed_atom<0>(compressed[0],shared.codebook,bases,w0,sb0);
 #pragma unroll
                 for(int m=0;m<MAtoms;++m)
                 {
@@ -1913,7 +1333,7 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_down_prefill_tp8_kernel(
                     first[m]=mma(w0,a.words,first[m],sb0,sa);
                 }
                 opus::i32x8_t w1;uint32_t sb1;
-                glm53_decode_packed_atom<0,true>(compressed[1],shared.codebook,bases,w1,sb1);
+                glm53_decode_packed_atom<0>(compressed[1],shared.codebook,bases,w1,sb1);
 #pragma unroll
                 for(int m=0;m<MAtoms;++m)
                 {
@@ -1932,9 +1352,7 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_down_prefill_tp8_kernel(
 #pragma unroll
                     for(int c=0;c<4;++c)
                     {
-                        float value=first[m][c]+second[c];
-                        if(all_bias)value+=__bfloat162float(all_bias[static_cast<int64_t>(expert)*6144+out_col+c]);
-                        packed[c]=__builtin_bit_cast(opus::bf16_t,__float2bfloat16(value));
+                        packed[c]=__builtin_bit_cast(opus::bf16_t,__float2bfloat16(first[m][c]+second[c]));
                     }
                     if(out_r<row_count)out_buffer.template store<4>(packed,(Tiled?(n_tile*M+row_base+out_r)*Columns+out_col%Columns:(row_base+out_r)*6144+out_col));
                 }
@@ -1942,7 +1360,7 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_down_prefill_tp8_kernel(
             {
                 opus::vector_t<float,4> first[MAtoms]={};
                 opus::i32x8_t w0;uint32_t sb0;
-                glm53_decode_packed_atom<1,true>(compressed[0],shared.codebook,bases,w0,sb0);
+                glm53_decode_packed_atom<1>(compressed[0],shared.codebook,bases,w0,sb0);
 #pragma unroll
                 for(int m=0;m<MAtoms;++m)
                 {
@@ -1956,7 +1374,7 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_down_prefill_tp8_kernel(
                     first[m]=mma(w0,a.words,first[m],sb0,sa);
                 }
                 opus::i32x8_t w1;uint32_t sb1;
-                glm53_decode_packed_atom<1,true>(compressed[1],shared.codebook,bases,w1,sb1);
+                glm53_decode_packed_atom<1>(compressed[1],shared.codebook,bases,w1,sb1);
 #pragma unroll
                 for(int m=0;m<MAtoms;++m)
                 {
@@ -1975,9 +1393,7 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_down_prefill_tp8_kernel(
 #pragma unroll
                     for(int c=0;c<4;++c)
                     {
-                        float value=first[m][c]+second[c];
-                        if(all_bias)value+=__bfloat162float(all_bias[static_cast<int64_t>(expert)*6144+out_col+c]);
-                        packed[c]=__builtin_bit_cast(opus::bf16_t,__float2bfloat16(value));
+                        packed[c]=__builtin_bit_cast(opus::bf16_t,__float2bfloat16(first[m][c]+second[c]));
                     }
                     if(out_r<row_count)out_buffer.template store<4>(packed,(Tiled?(n_tile*M+row_base+out_r)*Columns+out_col%Columns:(row_base+out_r)*6144+out_col));
                 }
@@ -1985,7 +1401,7 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_down_prefill_tp8_kernel(
             {
                 opus::vector_t<float,4> first[MAtoms]={};
                 opus::i32x8_t w0;uint32_t sb0;
-                glm53_decode_packed_atom<2,true>(compressed[0],shared.codebook,bases,w0,sb0);
+                glm53_decode_packed_atom<2>(compressed[0],shared.codebook,bases,w0,sb0);
 #pragma unroll
                 for(int m=0;m<MAtoms;++m)
                 {
@@ -1999,7 +1415,7 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_down_prefill_tp8_kernel(
                     first[m]=mma(w0,a.words,first[m],sb0,sa);
                 }
                 opus::i32x8_t w1;uint32_t sb1;
-                glm53_decode_packed_atom<2,true>(compressed[1],shared.codebook,bases,w1,sb1);
+                glm53_decode_packed_atom<2>(compressed[1],shared.codebook,bases,w1,sb1);
 #pragma unroll
                 for(int m=0;m<MAtoms;++m)
                 {
@@ -2018,9 +1434,7 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_down_prefill_tp8_kernel(
 #pragma unroll
                     for(int c=0;c<4;++c)
                     {
-                        float value=first[m][c]+second[c];
-                        if(all_bias)value+=__bfloat162float(all_bias[static_cast<int64_t>(expert)*6144+out_col+c]);
-                        packed[c]=__builtin_bit_cast(opus::bf16_t,__float2bfloat16(value));
+                        packed[c]=__builtin_bit_cast(opus::bf16_t,__float2bfloat16(first[m][c]+second[c]));
                     }
                     if(out_r<row_count)out_buffer.template store<4>(packed,(Tiled?(n_tile*M+row_base+out_r)*Columns+out_col%Columns:(row_base+out_r)*6144+out_col));
                 }
@@ -2032,8 +1446,9 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_down_prefill_tp8_kernel(
 #endif
 }
 
-// Same nine ordered FP32 FMAs, restricted to the just-produced N range.
-template<int Chunks,bool Tiled>
+// Weighted top-9 sum for one N chunk of tiled prefill route outputs: nine FP32
+// FMAs in route order, then one BF16 rounding.
+template<int Chunks>
 __global__ __launch_bounds__(128) void glm53_reduce_chunk_kernel(
     const __hip_bfloat16* __restrict__ route_output,
     const float* __restrict__ route_weights,const int32_t* __restrict__ scatter,
@@ -2050,7 +1465,7 @@ __global__ __launch_bounds__(128) void glm53_reduce_chunk_kernel(
     {
         const int sorted=__builtin_amdgcn_readfirstlane(scatter[token*9+route]);
         const float weight=__builtin_bit_cast(float,__builtin_amdgcn_readfirstlane(__builtin_bit_cast(uint32_t,route_weights[token*9+route])));
-        const int64_t address=Tiled?(static_cast<int64_t>(col/384)*tokens*9+sorted)*384+col%384:static_cast<int64_t>(sorted)*6144+col;
+        const int64_t address=(static_cast<int64_t>(col/384)*tokens*9+sorted)*384+col%384;
         opus::vector_t<opus::bf16_t,8> values;
         *reinterpret_cast<uint4*>(&values)=*reinterpret_cast<const uint4*>(route_output+address);
 #pragma unroll
@@ -2062,6 +1477,10 @@ __global__ __launch_bounds__(128) void glm53_reduce_chunk_kernel(
     *reinterpret_cast<uint4*>(output+static_cast<int64_t>(token)*6144+col)=*reinterpret_cast<const uint4*>(&packed);
 }
 
+// Down for M<=4: one CTA per (48-column block, token) and one wave per route.
+// Each wave decodes its expert's triplets with a private codebook copy; the
+// routes are then combined with nine ordered FP32 FMAs.
+template<int KT>
 __global__ __launch_bounds__(576,1) void glm53_down_route9_kernel(
     const opus::fp8_t* __restrict__ activations,
     const uint8_t* __restrict__ scales,
@@ -2074,50 +1493,46 @@ __global__ __launch_bounds__(576,1) void glm53_down_route9_kernel(
     int data_bytes, int auxiliary_bytes)
 {
 #if defined(__gfx950__)
-    constexpr int Groups=9,KWaves=1,Atoms=3,N=6144,K=256;
+    constexpr int Atoms=3,N=6144,K=KT*128;
     struct Storage {
-        alignas(16) uint64_t codebook[Groups][kCodebookBytes/8];
+        alignas(16) uint64_t codebook[9][kCodebookBytes/8];
         alignas(16) __hip_bfloat16 routes[9][Atoms*16];
     };
     __shared__ Storage shared;
-    const int lane=threadIdx.x,wave=threadIdx.y;
-    const int route_group=wave/KWaves,kwave=wave%KWaves;
+    const int lane=threadIdx.x,route=threadIdx.y;
     const int lane_row=lane%16,lane_group=lane/16;
-    const int token=blockIdx.y,n_block=static_cast<int>(blockIdx.x)*Atoms;
-    const int triplet=n_block/3*3,atom_offset=n_block%3;
-    for(int group=0;group<9/Groups;++group)
+    const int token=blockIdx.y,triplet=static_cast<int>(blockIdx.x)*Atoms;
+    const int original=token*9+route;
+    const int expert=expert_ids[original],row=scatter[original];
+    const bool valid=expert>=0 && expert<257 && row>=0 && row<static_cast<int>(gridDim.y)*9;
+    const uint8_t* data=all_data+static_cast<int64_t>(expert)*data_bytes;
+    const uint8_t* aux=all_auxiliary+static_cast<int64_t>(expert)*auxiliary_bytes;
+    if(valid)
+        for(int entry=lane;entry<kCodebookBytes/16;entry+=64)
+            reinterpret_cast<uint4*>(shared.codebook[route])[entry]=reinterpret_cast<const uint4*>(aux)[entry];
+    __syncthreads();
+    if(valid)
     {
-        const int route=group*Groups+route_group,original=token*9+route;
-        const int expert=expert_ids[original],row=scatter[original];
-        const bool valid=expert>=0 && expert<257 && row>=0 && row<static_cast<int>(gridDim.y)*9;
-        const uint8_t* data=all_data+static_cast<int64_t>(expert)*data_bytes;
-        const uint8_t* aux=all_auxiliary+static_cast<int64_t>(expert)*auxiliary_bytes;
-        if(valid)
-        for(int entry=kwave*64+lane;entry<kCodebookBytes/16;entry+=KWaves*64)
-            reinterpret_cast<uint4*>(shared.codebook[route_group])[entry]=reinterpret_cast<const uint4*>(aux)[entry];
-        __syncthreads();
-        if(valid)
-        {
-        opus::vector_t<float,4> k_sums[2][Atoms]={};
+        opus::vector_t<float,4> k_sums[KT][Atoms]={};
 #pragma unroll
-        for(int ktile=0;ktile<2;++ktile)
+        for(int ktile=0;ktile<KT;++ktile)
         {
-            const int base=static_cast<int>(triplet_base(physical_tile(triplet,ktile,2)));
+            const int base=static_cast<int>(triplet_base(physical_tile(triplet,ktile,KT)));
             const auto compressed=iq2r_scheduled_load_compact_uniform(data,data_bytes,base,lane);
             IQ2RActivationFragment a={};
             const auto* input=reinterpret_cast<const uint8_t*>(activations+static_cast<int64_t>(row)*K);
             const int ak=ktile*128+lane_group*16;
             *reinterpret_cast<uint4*>(a.bytes)=*reinterpret_cast<const uint4*>(input+ak);
             *reinterpret_cast<uint4*>(a.bytes+16)=*reinterpret_cast<const uint4*>(input+ak+64);
-            uint32_t sa=scales[static_cast<int64_t>(row)*8+ktile*4+lane_group];
+            uint32_t sa=scales[static_cast<int64_t>(row)*(K/32)+ktile*4+lane_group];
             uint32_t bases=0;
 #pragma unroll
             for(int atom=0;atom<3;++atom) bases|=static_cast<uint32_t>(aux[kCodebookBytes+triplet+atom])<<(atom*8);
             opus::i32x8_t b[3];
             uint32_t sb0,sb1,sb2;
-            glm53_decode_packed_atom<0,true>(compressed,shared.codebook[route_group],bases,b[0],sb0);
-            glm53_decode_packed_atom<1,true>(compressed,shared.codebook[route_group],bases,b[1],sb1);
-            glm53_decode_packed_atom<2,true>(compressed,shared.codebook[route_group],bases,b[2],sb2);
+            glm53_decode_packed_atom<0>(compressed,shared.codebook[route],bases,b[0],sb0);
+            glm53_decode_packed_atom<1>(compressed,shared.codebook[route],bases,b[1],sb1);
+            glm53_decode_packed_atom<2>(compressed,shared.codebook[route],bases,b[2],sb2);
             const uint32_t sb=sb0|(sb1<<8)|(sb2<<16);
             asm volatile("" : "+v"(sa));
             iq2r_triplet_mfma<0>(a.words,b,k_sums[ktile],sa*0x01010101u,sb);
@@ -2127,122 +1542,31 @@ __global__ __launch_bounds__(576,1) void glm53_down_route9_kernel(
 #pragma unroll
             for(int atom=0;atom<Atoms;++atom)
             {
-                const float value=k_sums[0][atom][0]+k_sums[1][atom][0];
+                // ((k0+k1)+k2)+k3 in K-tile order.
+                float value=k_sums[0][atom][0];
+#pragma unroll
+                for(int ktile=1;ktile<KT;++ktile)value+=k_sums[ktile][atom][0];
                 shared.routes[route][atom*16+lane_row]=__float2bfloat16(value);
             }
         }
-        }
-        else if(lane_group==0)
-        {
-#pragma unroll
-            for(int atom=0;atom<Atoms;++atom)
-                shared.routes[route][atom*16+lane_row]=__float2bfloat16(0.0f);
-        }
-        __syncthreads();
     }
-    if(wave==0 && lane_group==0)
+    else if(lane_group==0)
+    {
+#pragma unroll
+        for(int atom=0;atom<Atoms;++atom)
+            shared.routes[route][atom*16+lane_row]=__float2bfloat16(0.0f);
+    }
+    __syncthreads();
+    if(route==0 && lane_group==0)
     {
 #pragma unroll
         for(int atom=0;atom<Atoms;++atom)
         {
             float combined=0.0f;
 #pragma unroll
-            for(int route=0;route<9;++route)
-                combined=fmaf(__bfloat162float(shared.routes[route][atom*16+lane_row]),route_weights[token*9+route],combined);
-            output[static_cast<int64_t>(token)*N+(n_block+atom)*16+lane_row]=__float2bfloat16(combined);
-        }
-    }
-#endif
-}
-
-__global__ __launch_bounds__(576,1) void glm53_down_route9_kernel_tp4(
-    const opus::fp8_t* __restrict__ activations,
-    const uint8_t* __restrict__ scales,
-    const uint8_t* __restrict__ all_data,
-    const uint8_t* __restrict__ all_auxiliary,
-    const int32_t* __restrict__ expert_ids,
-    const int32_t* __restrict__ scatter,
-    const float* __restrict__ route_weights,
-    __hip_bfloat16* __restrict__ output,
-    int data_bytes, int auxiliary_bytes)
-{
-#if defined(__gfx950__)
-    constexpr int Groups=9,KWaves=1,Atoms=3,N=6144,K=512;
-    struct Storage {
-        alignas(16) uint64_t codebook[Groups][kCodebookBytes/8];
-        alignas(16) __hip_bfloat16 routes[9][Atoms*16];
-    };
-    __shared__ Storage shared;
-    const int lane=threadIdx.x,wave=threadIdx.y;
-    const int route_group=wave/KWaves,kwave=wave%KWaves;
-    const int lane_row=lane%16,lane_group=lane/16;
-    const int token=blockIdx.y,n_block=static_cast<int>(blockIdx.x)*Atoms;
-    const int triplet=n_block/3*3,atom_offset=n_block%3;
-    for(int group=0;group<9/Groups;++group)
-    {
-        const int route=group*Groups+route_group,original=token*9+route;
-        const int expert=expert_ids[original],row=scatter[original];
-        const bool valid=expert>=0 && expert<257 && row>=0 && row<static_cast<int>(gridDim.y)*9;
-        const uint8_t* data=all_data+static_cast<int64_t>(expert)*data_bytes;
-        const uint8_t* aux=all_auxiliary+static_cast<int64_t>(expert)*auxiliary_bytes;
-        if(valid)
-        for(int entry=kwave*64+lane;entry<kCodebookBytes/16;entry+=KWaves*64)
-            reinterpret_cast<uint4*>(shared.codebook[route_group])[entry]=reinterpret_cast<const uint4*>(aux)[entry];
-        __syncthreads();
-        if(valid)
-        {
-        opus::vector_t<float,4> k_sums[4][Atoms]={};
-#pragma unroll
-        for(int ktile=0;ktile<4;++ktile)
-        {
-            const int base=static_cast<int>(triplet_base(physical_tile(triplet,ktile,4)));
-            const auto compressed=iq2r_scheduled_load_compact_uniform(data,data_bytes,base,lane);
-            IQ2RActivationFragment a={};
-            const auto* input=reinterpret_cast<const uint8_t*>(activations+static_cast<int64_t>(row)*K);
-            const int ak=ktile*128+lane_group*16;
-            *reinterpret_cast<uint4*>(a.bytes)=*reinterpret_cast<const uint4*>(input+ak);
-            *reinterpret_cast<uint4*>(a.bytes+16)=*reinterpret_cast<const uint4*>(input+ak+64);
-            uint32_t sa=scales[static_cast<int64_t>(row)*16+ktile*4+lane_group];
-            uint32_t bases=0;
-#pragma unroll
-            for(int atom=0;atom<3;++atom) bases|=static_cast<uint32_t>(aux[kCodebookBytes+triplet+atom])<<(atom*8);
-            opus::i32x8_t b[3];
-            uint32_t sb0,sb1,sb2;
-            glm53_decode_packed_atom<0,true>(compressed,shared.codebook[route_group],bases,b[0],sb0);
-            glm53_decode_packed_atom<1,true>(compressed,shared.codebook[route_group],bases,b[1],sb1);
-            glm53_decode_packed_atom<2,true>(compressed,shared.codebook[route_group],bases,b[2],sb2);
-            const uint32_t sb=sb0|(sb1<<8)|(sb2<<16);
-            asm volatile("" : "+v"(sa));
-            iq2r_triplet_mfma<0>(a.words,b,k_sums[ktile],sa*0x01010101u,sb);
-        }
-        if(lane_group==0)
-        {
-#pragma unroll
-            for(int atom=0;atom<Atoms;++atom)
-            {
-                const float value=((k_sums[0][atom][0]+k_sums[1][atom][0])+k_sums[2][atom][0])+k_sums[3][atom][0];
-                shared.routes[route][atom*16+lane_row]=__float2bfloat16(value);
-            }
-        }
-        }
-        else if(lane_group==0)
-        {
-#pragma unroll
-            for(int atom=0;atom<Atoms;++atom)
-                shared.routes[route][atom*16+lane_row]=__float2bfloat16(0.0f);
-        }
-        __syncthreads();
-    }
-    if(wave==0 && lane_group==0)
-    {
-#pragma unroll
-        for(int atom=0;atom<Atoms;++atom)
-        {
-            float combined=0.0f;
-#pragma unroll
-            for(int route=0;route<9;++route)
-                combined=fmaf(__bfloat162float(shared.routes[route][atom*16+lane_row]),route_weights[token*9+route],combined);
-            output[static_cast<int64_t>(token)*N+(n_block+atom)*16+lane_row]=__float2bfloat16(combined);
+            for(int r=0;r<9;++r)
+                combined=fmaf(__bfloat162float(shared.routes[r][atom*16+lane_row]),route_weights[token*9+r],combined);
+            output[static_cast<int64_t>(token)*N+(triplet+atom)*16+lane_row]=__float2bfloat16(combined);
         }
     }
 #endif
@@ -2270,7 +1594,7 @@ __device__ __forceinline__ uint64_t glm53_sign_word(uint64_t magnitude,uint32_t 
     return (static_cast<uint64_t>(hi)<<32)|lo;
 }
 
-template<int MAtoms,int Batch>
+template<int MAtoms>
 __device__ __forceinline__ void glm53_quad_decode_mfma(
     const IQ2RCompressedQuad& compressed,const uint64_t* codebook,uint32_t bases,
     const IQ2RActivationFragment* activation,const uint32_t* scale_a,
@@ -2284,29 +1608,15 @@ __device__ __forceinline__ void glm53_quad_decode_mfma(
         const uint32_t highs=(compressed.metadata>>(atom*8))&15u;
         union { opus::i32x8_t words;uint64_t codewords[4]; } decoded;
         uint64_t mag[4];
-        if constexpr(Batch==2) {
-            mag[0]=codebook[lows&511u];
-            mag[1]=codebook[(lows>>9)&511u];
-            asm volatile("" : "+v"(mag[0]), "+v"(mag[1]));
-            decoded.codewords[0]=glm53_sign_word<0>(mag[0],signs);
-            decoded.codewords[1]=glm53_sign_word<1>(mag[1],signs);
-            mag[2]=codebook[(lows>>18)&511u];
-            mag[3]=codebook[(lows>>27)|(highs<<5)];
-            asm volatile("" : "+v"(mag[2]), "+v"(mag[3]));
-            decoded.codewords[2]=glm53_sign_word<2>(mag[2],signs);
-            decoded.codewords[3]=glm53_sign_word<3>(mag[3],signs);
-        }
-        if constexpr(Batch==4) {
-            mag[0]=codebook[lows&511u];
-            mag[1]=codebook[(lows>>9)&511u];
-            mag[2]=codebook[(lows>>18)&511u];
-            mag[3]=codebook[(lows>>27)|(highs<<5)];
-            asm volatile("" : "+v"(mag[0]), "+v"(mag[1]), "+v"(mag[2]), "+v"(mag[3]));
-            decoded.codewords[0]=glm53_sign_word<0>(mag[0],signs);
-            decoded.codewords[1]=glm53_sign_word<1>(mag[1],signs);
-            decoded.codewords[2]=glm53_sign_word<2>(mag[2],signs);
-            decoded.codewords[3]=glm53_sign_word<3>(mag[3],signs);
-        }
+        mag[0]=codebook[lows&511u];
+        mag[1]=codebook[(lows>>9)&511u];
+        mag[2]=codebook[(lows>>18)&511u];
+        mag[3]=codebook[(lows>>27)|(highs<<5)];
+        asm volatile("" : "+v"(mag[0]), "+v"(mag[1]), "+v"(mag[2]), "+v"(mag[3]));
+        decoded.codewords[0]=glm53_sign_word<0>(mag[0],signs);
+        decoded.codewords[1]=glm53_sign_word<1>(mag[1],signs);
+        decoded.codewords[2]=glm53_sign_word<2>(mag[2],signs);
+        decoded.codewords[3]=glm53_sign_word<3>(mag[3],signs);
         const uint32_t sb=((bases>>(atom*8))&255u)+((compressed.metadata>>(atom*8+4))&15u);
 #pragma unroll
         for(int m=0;m<MAtoms;++m)
@@ -2316,14 +1626,12 @@ __device__ __forceinline__ void glm53_quad_decode_mfma(
             accumulators[m][atom]=mma(activation[m].words,decoded.words,accumulators[m][atom],
                                       scale_a[m],sb,opus::number<0>{},opus::number<0>{});
         }
-
     }
 }
 
-// TP8: waves cover independent N tiles. Cooperatively cache A once per CTA.
-// M256 uses one sequential FP32 chain across both K128 tiles.
-// Preserve that chain, including its rounding, in this explicit family.
-template<int Waves,int MAtoms,int Groups,bool Prefetch,int XCD,int TaskGroup,bool SignOr>
+// TP8 (K=256) down, ordered variant: same tiling as glm53_down_prefill_tp8_kernel,
+// but the K1 MFMA accumulates onto the K0 result (one FP32 chain per output).
+template<int Waves,int MAtoms,int Groups,int XCD,int TaskGroup>
 __global__ __launch_bounds__(64*Waves,1) void glm53_down_tp8_ordered_kernel(
     const opus::fp8_t* __restrict__ activations,
     const uint8_t* __restrict__ activation_scales,
@@ -2331,9 +1639,8 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_down_tp8_ordered_kernel(
     const uint8_t* __restrict__ all_auxiliary,
     const int32_t* __restrict__ tasks,
     const int32_t* __restrict__ task_count,
-    const __hip_bfloat16* __restrict__ all_bias,
     __hip_bfloat16* __restrict__ output,
-    int M,int N,int K,int expert_count,int data_bytes,int auxiliary_bytes)
+    int M,int expert_count,int data_bytes,int auxiliary_bytes)
 {
 #if defined(__gfx950__)
     constexpr int Rows=16*MAtoms,Columns=48*Waves*Groups,Threads=64*Waves;
@@ -2398,7 +1705,6 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_down_tp8_ordered_kernel(
             }
             IQ2RCompressedTriplet pending[2];
             uint32_t pending_bases=0;
-            if constexpr(Prefetch)
             {
                 const int nb=n_tile*(Columns/16)+wave*3;
 #pragma unroll
@@ -2413,36 +1719,24 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_down_tp8_ordered_kernel(
             for(int group=0;group<Groups;++group)
             {
         const int n_block=n_tile*(Columns/16)+wave*3+group*Waves*3;
-        uint32_t bases=0;
+        const uint32_t bases=pending_bases;
         IQ2RCompressedTriplet compressed[2];
-        if constexpr(Prefetch)
+        compressed[0]=pending[0];compressed[1]=pending[1];
+        if(group+1<Groups)
         {
-            bases=pending_bases;
-            compressed[0]=pending[0];compressed[1]=pending[1];
-            if(group+1<Groups)
-            {
-                const int nb=n_block+Waves*3;
-                pending_bases=0;
+            const int nb=n_block+Waves*3;
+            pending_bases=0;
 #pragma unroll
-                for(int atom=0;atom<3;++atom)pending_bases|=static_cast<uint32_t>(aux[kCodebookBytes+nb+atom])<<(atom*8);
+            for(int atom=0;atom<3;++atom)pending_bases|=static_cast<uint32_t>(aux[kCodebookBytes+nb+atom])<<(atom*8);
 #pragma unroll
-                for(int kt=0;kt<2;++kt)pending[kt]=iq2r_load_compact_triplet(data,static_cast<int>(triplet_base(physical_tile(nb,kt,2))),lane);
-                asm volatile("" ::: "memory");
-            }
+            for(int kt=0;kt<2;++kt)pending[kt]=iq2r_load_compact_triplet(data,static_cast<int>(triplet_base(physical_tile(nb,kt,2))),lane);
+            asm volatile("" ::: "memory");
         }
-        else
-        {
-#pragma unroll
-            for(int atom=0;atom<3;++atom)bases|=static_cast<uint32_t>(aux[kCodebookBytes+n_block+atom])<<(atom*8);
-#pragma unroll
-            for(int kt=0;kt<2;++kt)compressed[kt]=iq2r_load_compact_triplet(data,static_cast<int>(triplet_base(physical_tile(n_block,kt,2))),lane);
-        }
-            // Finish one N16 atom at a time, carrying K0 directly into
-            // the K1 MFMA as in the original M256 kernel.
+            // One N16 atom at a time: K0 MFMA, then K1 MFMA onto its result.
             {
                 opus::vector_t<float,4> first[MAtoms]={};
                 opus::i32x8_t w0;uint32_t sb0;
-                glm53_decode_packed_atom<0,SignOr>(compressed[0],shared.codebook,bases,w0,sb0);
+                glm53_decode_packed_atom<0>(compressed[0],shared.codebook,bases,w0,sb0);
 #pragma unroll
                 for(int m=0;m<MAtoms;++m)
                 {
@@ -2456,7 +1750,7 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_down_tp8_ordered_kernel(
                     first[m]=mma(w0,a.words,first[m],sb0,sa);
                 }
                 opus::i32x8_t w1;uint32_t sb1;
-                glm53_decode_packed_atom<0,SignOr>(compressed[1],shared.codebook,bases,w1,sb1);
+                glm53_decode_packed_atom<0>(compressed[1],shared.codebook,bases,w1,sb1);
 #pragma unroll
                 for(int m=0;m<MAtoms;++m)
                 {
@@ -2473,19 +1767,14 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_down_tp8_ordered_kernel(
                     const int out_col=n_block*16+0*16+lane_group*4;
                     opus::vector_t<opus::bf16_t,4> packed;
 #pragma unroll
-                    for(int c=0;c<4;++c)
-                    {
-                        float value=second[c];
-                        if(all_bias)value+=__bfloat162float(all_bias[static_cast<int64_t>(expert)*6144+out_col+c]);
-                        packed[c]=__builtin_bit_cast(opus::bf16_t,__float2bfloat16(value));
-                    }
+                    for(int c=0;c<4;++c)packed[c]=__builtin_bit_cast(opus::bf16_t,__float2bfloat16(second[c]));
                     if(out_r<row_count)out_buffer.template store<4>(packed,(row_base+out_r)*6144+out_col);
                 }
             }
             {
                 opus::vector_t<float,4> first[MAtoms]={};
                 opus::i32x8_t w0;uint32_t sb0;
-                glm53_decode_packed_atom<1,SignOr>(compressed[0],shared.codebook,bases,w0,sb0);
+                glm53_decode_packed_atom<1>(compressed[0],shared.codebook,bases,w0,sb0);
 #pragma unroll
                 for(int m=0;m<MAtoms;++m)
                 {
@@ -2499,7 +1788,7 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_down_tp8_ordered_kernel(
                     first[m]=mma(w0,a.words,first[m],sb0,sa);
                 }
                 opus::i32x8_t w1;uint32_t sb1;
-                glm53_decode_packed_atom<1,SignOr>(compressed[1],shared.codebook,bases,w1,sb1);
+                glm53_decode_packed_atom<1>(compressed[1],shared.codebook,bases,w1,sb1);
 #pragma unroll
                 for(int m=0;m<MAtoms;++m)
                 {
@@ -2516,19 +1805,14 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_down_tp8_ordered_kernel(
                     const int out_col=n_block*16+1*16+lane_group*4;
                     opus::vector_t<opus::bf16_t,4> packed;
 #pragma unroll
-                    for(int c=0;c<4;++c)
-                    {
-                        float value=second[c];
-                        if(all_bias)value+=__bfloat162float(all_bias[static_cast<int64_t>(expert)*6144+out_col+c]);
-                        packed[c]=__builtin_bit_cast(opus::bf16_t,__float2bfloat16(value));
-                    }
+                    for(int c=0;c<4;++c)packed[c]=__builtin_bit_cast(opus::bf16_t,__float2bfloat16(second[c]));
                     if(out_r<row_count)out_buffer.template store<4>(packed,(row_base+out_r)*6144+out_col);
                 }
             }
             {
                 opus::vector_t<float,4> first[MAtoms]={};
                 opus::i32x8_t w0;uint32_t sb0;
-                glm53_decode_packed_atom<2,SignOr>(compressed[0],shared.codebook,bases,w0,sb0);
+                glm53_decode_packed_atom<2>(compressed[0],shared.codebook,bases,w0,sb0);
 #pragma unroll
                 for(int m=0;m<MAtoms;++m)
                 {
@@ -2542,7 +1826,7 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_down_tp8_ordered_kernel(
                     first[m]=mma(w0,a.words,first[m],sb0,sa);
                 }
                 opus::i32x8_t w1;uint32_t sb1;
-                glm53_decode_packed_atom<2,SignOr>(compressed[1],shared.codebook,bases,w1,sb1);
+                glm53_decode_packed_atom<2>(compressed[1],shared.codebook,bases,w1,sb1);
 #pragma unroll
                 for(int m=0;m<MAtoms;++m)
                 {
@@ -2559,12 +1843,7 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_down_tp8_ordered_kernel(
                     const int out_col=n_block*16+2*16+lane_group*4;
                     opus::vector_t<opus::bf16_t,4> packed;
 #pragma unroll
-                    for(int c=0;c<4;++c)
-                    {
-                        float value=second[c];
-                        if(all_bias)value+=__bfloat162float(all_bias[static_cast<int64_t>(expert)*6144+out_col+c]);
-                        packed[c]=__builtin_bit_cast(opus::bf16_t,__float2bfloat16(value));
-                    }
+                    for(int c=0;c<4;++c)packed[c]=__builtin_bit_cast(opus::bf16_t,__float2bfloat16(second[c]));
                     if(out_r<row_count)out_buffer.template store<4>(packed,(row_base+out_r)*6144+out_col);
                 }
             }
@@ -2576,8 +1855,8 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_down_tp8_ordered_kernel(
 }
 
 // Each explicit ds_read_b64 contributes one outstanding LDS operation.
-// A group consumes four operations. With lookahead, wait4 completes the
-// current group while permitting the next four reads to remain outstanding.
+// A group consumes four operations. Callers issue the next group first, so
+// wait4 completes the current group while the next four reads stay in flight.
 __device__ __forceinline__ void glm53_issue_codebook(
     const IQ2RCompressedQuad& compressed,const uint64_t* codebook,int atom,
     uint64_t (&mag)[4])
@@ -2598,27 +1877,23 @@ __device__ __forceinline__ void glm53_issue_codebook(
         : "v"(a0), "v"(a1), "v"(a2), "v"(a3) : "memory");
 }
 
-template<int MAtoms,bool Lookahead>
+template<int MAtoms>
 __device__ __forceinline__ void glm53_quad_decode_mfma_cached(
     const IQ2RCompressedQuad& compressed,const uint64_t* codebook,uint32_t bases,
     const IQ2RActivationFragment* activation,const uint32_t* scale_a,
     opus::vector_t<float,4> (&accumulators)[MAtoms][4],int active_m)
 {
     uint64_t pending[4];
-    if constexpr(Lookahead)glm53_issue_codebook(compressed,codebook,0,pending);
+    glm53_issue_codebook(compressed,codebook,0,pending);
 #pragma unroll
     for(int atom=0;atom<4;++atom)
     {
         uint64_t mag[4];
-        if constexpr(Lookahead) {
 #pragma unroll
-            for(int i=0;i<4;++i)mag[i]=pending[i];
-            if(atom<3)glm53_issue_codebook(compressed,codebook,atom+1,pending);
-        } else glm53_issue_codebook(compressed,codebook,atom,mag);
-        if constexpr(Lookahead) {
-            if(atom<3)asm volatile("s_waitcnt lgkmcnt(4)" ::: "memory");
-            else asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
-        } else asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+        for(int i=0;i<4;++i)mag[i]=pending[i];
+        if(atom<3)glm53_issue_codebook(compressed,codebook,atom+1,pending);
+        if(atom<3)asm volatile("s_waitcnt lgkmcnt(4)" ::: "memory");
+        else asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
         const uint32_t signs=atom==0?compressed.first.y:atom==1?compressed.first.w:atom==2?compressed.second.y:compressed.second.w;
         union { opus::i32x8_t words;uint64_t codewords[4]; } decoded;
         decoded.codewords[0]=glm53_sign_word<0>(mag[0],signs);
@@ -2636,7 +1911,9 @@ __device__ __forceinline__ void glm53_quad_decode_mfma_cached(
     }
 }
 
-template<int MAtoms,bool XCD,int LoadMode,int Batch,int NT=8>
+// Decode gate: one CTA per (16-row task, N tile); the eight waves each sum
+// a K768 slice and the partials are reduced through LDS.
+template<bool XCD,int NT>
 __global__ __launch_bounds__(512,1) void glm53_gate_decode_kernel(
     const opus::fp8_t* __restrict__ activations,
     const uint8_t* __restrict__ scales,
@@ -2650,7 +1927,7 @@ __global__ __launch_bounds__(512,1) void glm53_gate_decode_kernel(
     int routes,int data_bytes,int auxiliary_bytes)
 {
 #if defined(__gfx950__)
-    constexpr int K=6144, Rows=16*MAtoms, Subtasks=1;
+    constexpr int K=6144, MAtoms=1;
     struct Storage {
         alignas(16) uint64_t codebook[kCodebookBytes/8];
         union {
@@ -2662,15 +1939,14 @@ __global__ __launch_bounds__(512,1) void glm53_gate_decode_kernel(
     const int lane=threadIdx.x,wave=threadIdx.y,linear=wave*64+lane;
     const int lane_row=lane%16,lane_group=lane/16;
     const int num_tasks=task_count[0];
-    const int total=num_tasks*Subtasks*NT;
+    const int total=num_tasks*NT;
     for(int work=blockIdx.x;work<total;work+=gridDim.x)
     {
         const int index=XCD?glm53_remap8(work,total):work;
-        const int task=XCD?index/(NT*Subtasks):(work/Subtasks)%num_tasks;
-        const int sub=XCD?(index/NT)%Subtasks:work%Subtasks;
-        const int n_tile=XCD?index%NT:work/(num_tasks*Subtasks);
-        const int row_begin=tasks[task*3]+sub*Rows;
-        const int row_end=min(row_begin+Rows,tasks[task*3]+tasks[task*3+1]);
+        const int task=XCD?index/NT:work%num_tasks;
+        const int n_tile=XCD?index%NT:work/num_tasks;
+        const int row_begin=tasks[task*3];
+        const int row_end=min(row_begin+16,row_begin+tasks[task*3+1]);
         const int expert=tasks[task*3+2];
         const int active_m=(row_end-row_begin+15)/16;
         if(row_begin>=row_end || row_begin<0 || row_end>routes || expert<0 || expert>=257) continue;
@@ -2690,9 +1966,7 @@ __global__ __launch_bounds__(512,1) void glm53_gate_decode_kernel(
         opus::vector_t<float,4> accumulators[MAtoms][4]={};
         opus::gmem<uint8_t> buffer(data,static_cast<unsigned int>(data_bytes));
         int base=(n_tile*48+wave*6)*kQuadBytes;
-        IQ2RCompressedQuad pending;
-        if constexpr(LoadMode==1)pending=iq2r_scheduled_load_quad(data,data_bytes,base,lane);
-        else iq2r_issue_quad(buffer,shared.reuse.cache[wave],lane,base);
+        iq2r_issue_quad(buffer,shared.reuse.cache[wave],lane,base);
         for(int iteration=0;iteration<6;++iteration)
         {
             const int kt=wave*6+iteration;
@@ -2707,23 +1981,14 @@ __global__ __launch_bounds__(512,1) void glm53_gate_decode_kernel(
                 *reinterpret_cast<uint4*>(a[m].bytes+16)=*reinterpret_cast<const uint4*>(input+ak+64);
                 sa[m]=scales[static_cast<int64_t>(rows[m])*192+kt*4+lane_group]*0x01010101u;
             }
-            IQ2RCompressedQuad compressed;
-            if constexpr(LoadMode==1) {
-                compressed=pending;
-                if(iteration<5) {
-                    base+=kQuadBytes;
-                    pending=iq2r_scheduled_load_quad(data,data_bytes,base,lane);
-                }
-            } else {
-                iq2r_wait_vmcnt<0>();
-                compressed=iq2r_read_quad(shared.reuse.cache[wave],lane);
-                asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
-                if(iteration<5) {
-                    base+=kQuadBytes;
-                    iq2r_issue_quad(buffer,shared.reuse.cache[wave],lane,base);
-                }
+            iq2r_wait_vmcnt<0>();
+            const IQ2RCompressedQuad compressed=iq2r_read_quad(shared.reuse.cache[wave],lane);
+            asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+            if(iteration<5) {
+                base+=kQuadBytes;
+                iq2r_issue_quad(buffer,shared.reuse.cache[wave],lane,base);
             }
-            glm53_quad_decode_mfma_cached<MAtoms,true>(compressed,shared.codebook,bases,a,sa,accumulators,active_m);
+            glm53_quad_decode_mfma_cached<MAtoms>(compressed,shared.codebook,bases,a,sa,accumulators,active_m);
         }
         // No wave may overwrite another wave's cache before its final read.
         __syncthreads();
@@ -2820,7 +2085,9 @@ __device__ __forceinline__ void glm53_cross_k_decode_mfma(
     }
 }
 
-template<int MAtoms,bool XCD,int LoadMode,int Batch,int NT=8>
+// Decode gate variant that keeps weights in registers (no LDS staging), so
+// work items only synchronize to load a new expert's codebook.
+template<int NT>
 __global__ __launch_bounds__(512,1) void glm53_gate_decode_nobarrier_kernel(
     const opus::fp8_t* __restrict__ activations,
     const uint8_t* __restrict__ scales,
@@ -2834,39 +2101,32 @@ __global__ __launch_bounds__(512,1) void glm53_gate_decode_nobarrier_kernel(
     int routes,int data_bytes,int auxiliary_bytes)
 {
 #if defined(__gfx950__)
-    static_assert(MAtoms==1 && XCD && LoadMode==1 && Batch==4);
-    constexpr int K=6144, Rows=16*MAtoms, Subtasks=1;
+    constexpr int K=6144, MAtoms=1;
     struct Storage {
         alignas(16) uint64_t codebook[kCodebookBytes/8];
-        union {
-            alignas(16) uint8_t cache[8][kQuadBytes];
-            alignas(16) float partial[8][4][4][64];
-        } reuse;
+        alignas(16) float partial[8][4][4][64];
     };
     __shared__ Storage shared;
     const int lane=threadIdx.x,wave=threadIdx.y,linear=wave*64+lane;
     const int lane_row=lane%16,lane_group=lane/16;
     const int num_tasks=task_count[0];
-    const int total=num_tasks*Subtasks*NT;
+    const int total=num_tasks*NT;
     int previous_expert=-1;
     for(int work=blockIdx.x;work<total;work+=gridDim.x)
     {
-        const int index=XCD?glm53_remap8(work,total):work;
-        const int task=XCD?index/(NT*Subtasks):(work/Subtasks)%num_tasks;
-        const int sub=XCD?(index/NT)%Subtasks:work%Subtasks;
-        const int n_tile=XCD?index%NT:work/(num_tasks*Subtasks);
-        const int row_begin=tasks[task*3]+sub*Rows;
-        const int row_end=min(row_begin+Rows,tasks[task*3]+tasks[task*3+1]);
+        const int index=glm53_remap8(work,total);
+        const int task=index/NT,n_tile=index%NT;
+        const int row_begin=tasks[task*3];
+        const int row_end=min(row_begin+16,row_begin+tasks[task*3+1]);
         const int expert=tasks[task*3+2];
         const int active_m=(row_end-row_begin+15)/16;
         if(row_begin>=row_end || row_begin<0 || row_end>routes || expert<0 || expert>=257) continue;
         const uint8_t* data=all_data+static_cast<int64_t>(expert)*data_bytes;
         const uint8_t* aux=all_auxiliary+static_cast<int64_t>(expert)*auxiliary_bytes;
-        // Task expert and validity are uniform across this workgroup.
-        // The previous item ends in a barrier. Codebook storage is disjoint
-        // from the partial-output union, and is valid only in this invocation.
-        // Issue the codebook, bases, gather and first weight loads together;
-        // only the codebook is waited on before the LDS store and barrier.
+        // Task expert and validity are uniform across this workgroup, and the
+        // previous item ends in a barrier. Issue the codebook, bases, gather
+        // and first weight loads together; only the codebook is waited on
+        // before the LDS store and barrier.
         const bool new_expert=expert!=previous_expert;
         uint64_t book=0;
         if(new_expert) book=reinterpret_cast<const uint64_t*>(aux)[linear];
@@ -2879,17 +2139,14 @@ __global__ __launch_bounds__(512,1) void glm53_gate_decode_nobarrier_kernel(
 #pragma unroll
         for(int m=0;m<MAtoms;++m) rows[m]=gather[min(row_begin+m*16+lane_row,row_end-1)]/9;
         opus::vector_t<float,4> accumulators[MAtoms][4]={};
-        opus::gmem<uint8_t> buffer(data,static_cast<unsigned int>(data_bytes));
         int base=(n_tile*48+wave*6)*kQuadBytes;
-        IQ2RCompressedQuad pending;
         uint64_t pending_book[4]={};
-        if constexpr(LoadMode==1)pending=iq2r_scheduled_load_quad(data,data_bytes,base,lane);
+        IQ2RCompressedQuad pending=iq2r_scheduled_load_quad(data,data_bytes,base,lane);
         if(new_expert) {
             shared.codebook[linear]=book;
             __syncthreads();
             previous_expert=expert;
         }
-        if constexpr(LoadMode!=1)iq2r_issue_quad(buffer,shared.reuse.cache[wave],lane,base);
         for(int iteration=0;iteration<6;++iteration)
         {
             const int kt=wave*6+iteration;
@@ -2904,34 +2161,22 @@ __global__ __launch_bounds__(512,1) void glm53_gate_decode_nobarrier_kernel(
                 *reinterpret_cast<uint4*>(a[m].bytes+16)=*reinterpret_cast<const uint4*>(input+ak+64);
                 sa[m]=scales[static_cast<int64_t>(rows[m])*192+kt*4+lane_group]*0x01010101u;
             }
-            IQ2RCompressedQuad compressed;
-            if constexpr(LoadMode==1) {
-                compressed=pending;
-                if(iteration<5) {
-                    base+=kQuadBytes;
-                    pending=iq2r_scheduled_load_quad(data,data_bytes,base,lane);
-                }
-            } else {
-                iq2r_wait_vmcnt<0>();
-                compressed=iq2r_read_quad(shared.reuse.cache[wave],lane);
-                asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
-                if(iteration<5) {
-                    base+=kQuadBytes;
-                    iq2r_issue_quad(buffer,shared.reuse.cache[wave],lane,base);
-                }
+            const IQ2RCompressedQuad compressed=pending;
+            if(iteration<5) {
+                base+=kQuadBytes;
+                pending=iq2r_scheduled_load_quad(data,data_bytes,base,lane);
             }
             glm53_cross_k_decode_mfma<MAtoms>(compressed,pending,shared.codebook,bases,a,sa,accumulators,active_m,pending_book,iteration==0,iteration<5);
         }
-        // LoadMode=1 keeps weights in registers. Codebook LDS is separate
-        // from the partial-output union. The following store barrier and
-        // final reader barrier still protect every shared partial value.
+        // Weights stay in registers, so no barrier is needed before the
+        // partial stores; the store and reader barriers protect the partials.
 #pragma unroll
         for(int m=0;m<MAtoms;++m)
         {
             if(m>=active_m)continue;
 #pragma unroll
             for(int atom=0;atom<4;++atom)
-                for(int c=0;c<4;++c) shared.reuse.partial[wave][atom][c][lane]=accumulators[m][atom][c];
+                for(int c=0;c<4;++c) shared.partial[wave][atom][c][lane]=accumulators[m][atom][c];
             __syncthreads();
             if(wave<4)
             {
@@ -2944,7 +2189,7 @@ __global__ __launch_bounds__(512,1) void glm53_gate_decode_nobarrier_kernel(
                     float value=0.0f;
 #pragma unroll
                     for(int source=0;source<8;++source)
-                        value+=shared.reuse.partial[source][atom][wave][lane];
+                        value+=shared.partial[source][atom][wave][lane];
                     values[atom]=__bfloat162float(__float2bfloat16(value));
                 }
                 // Adjacent lanes hold the interleaved gate and up columns.
@@ -3092,8 +2337,7 @@ void iq2r_materialize_out(const aiter_tensor_t& data,
                           const aiter_tensor_t& auxiliary,
                           aiter_tensor_t& output,
                           int64_t logical_n,
-                          int64_t logical_k,
-                          int64_t expert_index)
+                          int64_t logical_k)
 {
     validate_weights(data, auxiliary, logical_n, logical_k);
     AITER_CHECK(output.is_gpu() && output.device_id == data.device_id,
@@ -3102,8 +2346,6 @@ void iq2r_materialize_out(const aiter_tensor_t& data,
                     output.size(0) == logical_n && output.size(1) == logical_k,
                 "IQ2R materialized output must be float32 [N,K]");
     AITER_CHECK(output.is_contiguous(), "IQ2R materialized output must be contiguous");
-    AITER_CHECK(expert_index >= 0 && expert_index < data.size(0),
-                "IQ2R expert_index is out of range");
     const int64_t elements = logical_n * logical_k;
     constexpr int threads = 256;
     HipDeviceGuard device_guard(data.device_id);
@@ -3112,10 +2354,8 @@ void iq2r_materialize_out(const aiter_tensor_t& data,
                        dim3(threads),
                        0,
                        getCurrentHIPStream(),
-                       static_cast<const uint8_t*>(data.data_ptr()) +
-                           expert_index * data.size(1),
-                       static_cast<const uint8_t*>(auxiliary.data_ptr()) +
-                           expert_index * auxiliary.size(1),
+                       static_cast<const uint8_t*>(data.data_ptr()),
+                       static_cast<const uint8_t*>(auxiliary.data_ptr()),
                        static_cast<float*>(output.data_ptr()),
                        static_cast<int>(logical_n),
                        static_cast<int>(logical_k));
@@ -3214,7 +2454,7 @@ void iq2r_glm53_gate_m1_out(const aiter_tensor_t& activations,
     glm53_check_gate_io(activations, scales, output, output_scales, routes, routes, tp4 ? 512 : 256);
     glm53_check_tasks(tasks, task_count, routes);
     HipDeviceGuard device_guard(data.device_id);
-    hipLaunchKernelGGL((tp4 ? glm53_gate_m1_kernel_tp4<true> : glm53_gate_m1_kernel<true>),
+    hipLaunchKernelGGL((tp4 ? glm53_gate_m1_kernel<16> : glm53_gate_m1_kernel<8>),
                        dim3(2 * static_cast<int>(get_num_cu_func())),
                        dim3(64, 8),
                        0,
@@ -3225,7 +2465,6 @@ void iq2r_glm53_gate_m1_out(const aiter_tensor_t& activations,
                        static_cast<const uint8_t*>(auxiliary.data_ptr()),
                        static_cast<const int32_t*>(tasks.data_ptr()),
                        static_cast<const int32_t*>(task_count.data_ptr()),
-                       nullptr,
                        static_cast<opus::fp8_t*>(output.data_ptr()),
                        static_cast<uint8_t*>(output_scales.data_ptr()),
                        routes,
@@ -3270,15 +2509,13 @@ void iq2r_glm53_gate_out(const aiter_tensor_t& activations,
     int waves = 8;
     if(prefill)
     {
-        launch = tp4 ? glm53_gate_prefill_kernel<4, true, 8, 4, 2, 4, 16>
-                     : glm53_gate_prefill_kernel<4, true, 8, 4, 2, 4, 8>;
+        launch = tp4 ? glm53_gate_prefill_kernel<4, 8, 4, 2, 16> : glm53_gate_prefill_kernel<4, 8, 4, 2, 8>;
         waves  = 4;
     }
     else if(kernel == kGlm53GateDecodeNoBarrier)
-        launch = tp4 ? glm53_gate_decode_nobarrier_kernel<1, true, 1, 4, 16>
-                     : glm53_gate_decode_nobarrier_kernel<1, true, 1, 4, 8>;
+        launch = tp4 ? glm53_gate_decode_nobarrier_kernel<16> : glm53_gate_decode_nobarrier_kernel<8>;
     else
-        launch = tp4 ? glm53_gate_decode_kernel<1, true, 0, 4, 16> : glm53_gate_decode_kernel<1, false, 0, 4, 8>;
+        launch = tp4 ? glm53_gate_decode_kernel<true, 16> : glm53_gate_decode_kernel<false, 8>;
     hipLaunchKernelGGL(launch,
                        dim3(static_cast<int>(grid_multiplier) * static_cast<int>(get_num_cu_func())),
                        dim3(64, waves),
@@ -3328,25 +2565,25 @@ void iq2r_glm53_down_out(const aiter_tensor_t& activations,
         static_cast<const uint8_t*>(data.data_ptr()),                                       \
         static_cast<const uint8_t*>(auxiliary.data_ptr()),                                  \
         static_cast<const int32_t*>(tasks.data_ptr()),                                      \
-        static_cast<const int32_t*>(task_count.data_ptr()), nullptr,                        \
-        static_cast<__hip_bfloat16*>(output.data_ptr()), routes, kGlm53Hidden, K, kGlm53Experts, \
+        static_cast<const int32_t*>(task_count.data_ptr()),                                 \
+        static_cast<__hip_bfloat16*>(output.data_ptr()), routes, kGlm53Experts,             \
         static_cast<int>(data.size(1)), static_cast<int>(auxiliary.size(1))
     // Single: one 16-row atom per pass for decode-sized tasks, three workgroups per CU.
     if(tp4 && kernel == kGlm53DownSingle)
-        hipLaunchKernelGGL((glm53_down_tp4_kernel<4, 1, 2, 8, 4, 4, 1, false, 3>),
-                           grid, dim3(64, 4), 0, getCurrentHIPStream(), GLM53_DOWN_ARGS, 0);
+        hipLaunchKernelGGL((glm53_down_tp4_kernel<4, 1, 2, 8, 4, 4, 3>),
+                           grid, dim3(64, 4), 0, getCurrentHIPStream(), GLM53_DOWN_ARGS);
     else if(kernel == kGlm53DownSingle)
-        hipLaunchKernelGGL((glm53_down_tp8_ordered_kernel<4, 1, 2, true, 8, 4, true>),
+        hipLaunchKernelGGL((glm53_down_tp8_ordered_kernel<4, 1, 2, 8, 4>),
                            grid, dim3(64, 4), 0, getCurrentHIPStream(), GLM53_DOWN_ARGS);
     else if(tp4)
         hipLaunchKernelGGL((glm53_down_tp4_kernel<4, 2, 2, 8, 4, 4>),
-                           grid, dim3(64, 4), 0, getCurrentHIPStream(), GLM53_DOWN_ARGS, 0);
+                           grid, dim3(64, 4), 0, getCurrentHIPStream(), GLM53_DOWN_ARGS);
     else if(kernel == kGlm53DownOrdered)
-        hipLaunchKernelGGL((glm53_down_tp8_ordered_kernel<4, 2, 2, true, 8, 4, true>),
+        hipLaunchKernelGGL((glm53_down_tp8_ordered_kernel<4, 2, 2, 8, 4>),
                            grid, dim3(64, 4), 0, getCurrentHIPStream(), GLM53_DOWN_ARGS);
     else
-        hipLaunchKernelGGL((glm53_down_tp8_kernel<4, 2, 2, true, 8, 4, true>),
-                           grid, dim3(64, 4), 0, getCurrentHIPStream(), GLM53_DOWN_ARGS);
+        hipLaunchKernelGGL((glm53_down_prefill_tp8_kernel<4, 2, 2, 8, 4, 1, false>),
+                           grid, dim3(64, 4), 0, getCurrentHIPStream(), GLM53_DOWN_ARGS, 0);
 #undef GLM53_DOWN_ARGS
     HIP_CALL_LAUNCH(hipGetLastError());
 }
@@ -3374,7 +2611,7 @@ void iq2r_glm53_down_route9_out(const aiter_tensor_t& activations,
                     output.size(1) == kGlm53Hidden,
                 "GLM-5.3 IQ2R route9 output must be BF16 [tokens, 6144]");
     HipDeviceGuard device_guard(data.device_id);
-    hipLaunchKernelGGL((K == 512 ? glm53_down_route9_kernel_tp4 : glm53_down_route9_kernel),
+    hipLaunchKernelGGL((K == 512 ? glm53_down_route9_kernel<4> : glm53_down_route9_kernel<2>),
                        dim3(128, tokens),
                        dim3(64, 9),
                        0,
@@ -3438,22 +2675,20 @@ void iq2r_glm53_down_reduce_out(const aiter_tensor_t& activations,
         // TP4: 16 persistent CTAs per CU with weight-stationary K loops; TP8:
         // N-wave tiles sharing one cached activation tile.
         if(K == 512 && chunks == 1)
-            GLM53_PREFILL_DOWN((glm53_down_prefill_tp4_kernel<4, 2, 8, 4, 4, 1, 3, 4, false, false, true>), 16,
+            GLM53_PREFILL_DOWN((glm53_down_prefill_tp4_kernel<4, 2, 8, 4, 4, 1, 3>), 16,
                                static_cast<__hip_bfloat16*>(route_output.data_ptr()), routes, kGlm53Experts);
         else if(K == 512)
-            GLM53_PREFILL_DOWN((glm53_down_prefill_tp4_kernel<4, 2, 8, 4, 4, 2, 3, 4, false, false, true>), 16,
+            GLM53_PREFILL_DOWN((glm53_down_prefill_tp4_kernel<4, 2, 8, 4, 4, 2, 3>), 16,
                                static_cast<__hip_bfloat16*>(route_output.data_ptr()), routes, kGlm53Experts);
         else if(chunks == 1)
-            GLM53_PREFILL_DOWN((glm53_down_prefill_tp8_kernel<4, 2, 2, true, 8, 4, 1, true>), 8, nullptr,
-                               static_cast<__hip_bfloat16*>(route_output.data_ptr()), routes, kGlm53Hidden, 256,
-                               kGlm53Experts);
+            GLM53_PREFILL_DOWN((glm53_down_prefill_tp8_kernel<4, 2, 2, 8, 4, 1, true>), 8,
+                               static_cast<__hip_bfloat16*>(route_output.data_ptr()), routes, kGlm53Experts);
         else
-            GLM53_PREFILL_DOWN((glm53_down_prefill_tp8_kernel<4, 2, 2, true, 8, 4, 2, true>), 8, nullptr,
-                               static_cast<__hip_bfloat16*>(route_output.data_ptr()), routes, kGlm53Hidden, 256,
-                               kGlm53Experts);
+            GLM53_PREFILL_DOWN((glm53_down_prefill_tp8_kernel<4, 2, 2, 8, 4, 2, true>), 8,
+                               static_cast<__hip_bfloat16*>(route_output.data_ptr()), routes, kGlm53Experts);
 #undef GLM53_PREFILL_DOWN
         const int width = kGlm53Hidden / static_cast<int>(chunks);
-        hipLaunchKernelGGL((chunks == 1 ? glm53_reduce_chunk_kernel<1, true> : glm53_reduce_chunk_kernel<2, true>),
+        hipLaunchKernelGGL((chunks == 1 ? glm53_reduce_chunk_kernel<1> : glm53_reduce_chunk_kernel<2>),
                            dim3(tokens * ((width + 1023) / 1024)),
                            dim3(128),
                            0,

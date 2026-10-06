@@ -1,30 +1,21 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Versioned storage contract for AITER's native-basis IQ2R weights.
+"""Storage layout of AITER's native-basis IQ2R weights.
 
-This module is intentionally CPU-only and has no dependency on a compiled
-extension.  Checkpoint tooling can therefore validate IQ2R metadata and byte
-buffers before allocating GPU memory or launching a kernel.
+CPU-only, with no compiled extension, so checkpoint tooling can size, slice
+and validate IQ2R byte buffers before touching a GPU.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import asdict, dataclass, fields
-from typing import Any
+from dataclasses import dataclass
 
 import torch
 from torch import Tensor
 
-IQ2R_SCHEME = "iq2r"
 IQ2R_FORMAT_NAME = "iq2r-512-fullsign-e8m0-native-v1"
-IQ2R_PACKED_LAYOUT = "iq2r-cdna4-triplet6-v1"
 IQ2R_ACTIVATION_BASIS = "native"
-IQ2R_ARCHITECTURE = "gfx950"
-IQ2R_ACTIVATION_DTYPE = "mxfp8-e4m3-e8m0"
-IQ2R_CODEBOOK_DTYPE = "float8_e4m3fn"
-IQ2R_SCALE_DTYPE = "e8m0"
 
 IQ2R_CODEBOOK_ENTRIES = 512
 IQ2R_VECTOR_SIZE = 8
@@ -46,7 +37,6 @@ IQ2R_TRIPLET_BYTES = IQ2R_ATOM_PAIR_RECORDS_BYTES + (
 IQ2R_GROUP_BYTES = IQ2R_TRIPLETS_PER_GROUP * IQ2R_TRIPLET_BYTES
 IQ2R_CODEBOOK_BYTES = IQ2R_CODEBOOK_ENTRIES * IQ2R_VECTOR_SIZE
 IQ2R_BASE_PADDING_BYTES = 3
-IQ2R_RESERVED_ZERO_CODEWORD = 0
 
 
 def _require_int(name: str, value: int, *, positive: bool = False) -> None:
@@ -114,40 +104,14 @@ def iq2r_storage_bits_per_weight(n: int, k: int) -> float:
 
 @dataclass(frozen=True, slots=True)
 class IQ2RMetadata:
-    """Immutable description of one IQ2R expert projection."""
+    """Shape of one IQ2R expert projection (``N`` outputs, ``K`` inputs)."""
 
     logical_n: int
     logical_k: int
-    scheme: str = IQ2R_SCHEME
-    format_name: str = IQ2R_FORMAT_NAME
-    packed_layout: str = IQ2R_PACKED_LAYOUT
-    activation_basis: str = IQ2R_ACTIVATION_BASIS
-    architecture: str = IQ2R_ARCHITECTURE
-    activation_dtype: str = IQ2R_ACTIVATION_DTYPE
-    codebook_dtype: str = IQ2R_CODEBOOK_DTYPE
-    scale_dtype: str = IQ2R_SCALE_DTYPE
-    codebook_entries: int = IQ2R_CODEBOOK_ENTRIES
-    vector_size: int = IQ2R_VECTOR_SIZE
-    scale_block: int = IQ2R_SCALE_BLOCK
-    tile_n: int = IQ2R_TILE_N
-    tile_k: int = IQ2R_TILE_K
-    lane_record_bytes: int = IQ2R_LANE_RECORD_BYTES
-    n_blocks_per_group: int = IQ2R_N_BLOCKS_PER_GROUP
-    atoms_per_triplet: int = IQ2R_ATOMS_PER_TRIPLET
-    triplet_bytes: int = IQ2R_TRIPLET_BYTES
-    group_bytes: int = IQ2R_GROUP_BYTES
-    codebook_bytes: int = IQ2R_CODEBOOK_BYTES
-    base_padding_bytes: int = IQ2R_BASE_PADDING_BYTES
-    reserved_zero_codeword: int = IQ2R_RESERVED_ZERO_CODEWORD
-    source_model_fingerprint: str | None = None
-    calibration_fingerprint: str | None = None
-    calibration_scheme: str | None = None
-    calibration_corpus_hash: str | None = None
-    calibration_coverage: str | None = None
-    calibration_imputation_policy: str | None = None
 
     def __post_init__(self) -> None:
-        self.validate_layout()
+        # Also applies the type and divisibility checks.
+        iq2r_packed_sizes(self.logical_n, self.logical_k)
 
     @property
     def n_blocks(self) -> int:
@@ -176,80 +140,6 @@ class IQ2RMetadata:
     @property
     def storage_bits_per_weight(self) -> float:
         return iq2r_storage_bits_per_weight(self.logical_n, self.logical_k)
-
-    def validate_layout(self) -> None:
-        _require_int("logical_n", self.logical_n, positive=True)
-        _require_int("logical_k", self.logical_k, positive=True)
-        expected = {
-            "scheme": IQ2R_SCHEME,
-            "format_name": IQ2R_FORMAT_NAME,
-            "packed_layout": IQ2R_PACKED_LAYOUT,
-            "activation_basis": IQ2R_ACTIVATION_BASIS,
-            "architecture": IQ2R_ARCHITECTURE,
-            "activation_dtype": IQ2R_ACTIVATION_DTYPE,
-            "codebook_dtype": IQ2R_CODEBOOK_DTYPE,
-            "scale_dtype": IQ2R_SCALE_DTYPE,
-            "codebook_entries": IQ2R_CODEBOOK_ENTRIES,
-            "vector_size": IQ2R_VECTOR_SIZE,
-            "scale_block": IQ2R_SCALE_BLOCK,
-            "tile_n": IQ2R_TILE_N,
-            "tile_k": IQ2R_TILE_K,
-            "lane_record_bytes": IQ2R_LANE_RECORD_BYTES,
-            "n_blocks_per_group": IQ2R_N_BLOCKS_PER_GROUP,
-            "atoms_per_triplet": IQ2R_ATOMS_PER_TRIPLET,
-            "triplet_bytes": IQ2R_TRIPLET_BYTES,
-            "group_bytes": IQ2R_GROUP_BYTES,
-            "codebook_bytes": IQ2R_CODEBOOK_BYTES,
-            "base_padding_bytes": IQ2R_BASE_PADDING_BYTES,
-            "reserved_zero_codeword": IQ2R_RESERVED_ZERO_CODEWORD,
-        }
-        for name, required in expected.items():
-            actual = getattr(self, name)
-            if actual != required:
-                raise ValueError(
-                    f"unsupported IQ2R {name}: {actual!r}; expected {required!r}"
-                )
-        # Also applies divisibility checks.
-        iq2r_packed_sizes(self.logical_n, self.logical_k)
-
-    def to_dict(self) -> dict[str, Any]:
-        result = asdict(self)
-        result.update(
-            {
-                "padded_k": self.padded_k,
-                "physical_n_blocks": self.physical_n_blocks,
-                "data_bytes": self.data_bytes,
-                "auxiliary_bytes": self.auxiliary_bytes,
-            }
-        )
-        return result
-
-    @classmethod
-    def from_dict(cls, value: Mapping[str, Any]) -> IQ2RMetadata:
-        serialized = dict(value)
-        required = (
-            "logical_n",
-            "logical_k",
-            "scheme",
-            "format_name",
-            "packed_layout",
-            "activation_basis",
-            "architecture",
-            "activation_dtype",
-            "codebook_dtype",
-            "scale_dtype",
-            "reserved_zero_codeword",
-        )
-        missing = [name for name in required if name not in serialized]
-        if missing:
-            raise ValueError(
-                "serialized IQ2R metadata is missing required fields: "
-                + ", ".join(missing)
-            )
-        init_fields = {field.name for field in fields(cls) if field.init}
-        return cls(
-            **{name: item for name, item in serialized.items() if name in init_fields}
-        )
 
 
 def _validate_output_slice(metadata: IQ2RMetadata, start: int, length: int) -> None:
@@ -359,7 +249,6 @@ def iq2r_validate_expert_weights(
 ) -> None:
     """Validate stacked public buffers ``data`` and ``auxiliary``."""
 
-    metadata.validate_layout()
     _validate_byte_matrix("data", data, metadata.data_bytes)
     _validate_byte_matrix("auxiliary", auxiliary, metadata.auxiliary_bytes)
     if data.shape[0] != auxiliary.shape[0]:

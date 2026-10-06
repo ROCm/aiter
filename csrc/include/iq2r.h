@@ -23,26 +23,7 @@ void iq2r_materialize_out(const aiter_tensor_t& data,
                           const aiter_tensor_t& auxiliary,
                           aiter_tensor_t& output,
                           int64_t logical_n,
-                          int64_t logical_k,
-                          int64_t expert_index);
-
-void iq2r_route_gather_quant_out(const aiter_tensor_t& input,
-                                 const aiter_tensor_t& gather_indices,
-                                 aiter_tensor_t& output,
-                                 aiter_tensor_t& scales,
-                                 int64_t topk);
-
-void iq2r_route_direct_gather_quant_out(const aiter_tensor_t& input,
-                                        const aiter_tensor_t& expert_ids,
-                                        aiter_tensor_t& sorted_expert_ids,
-                                        aiter_tensor_t& gather_indices,
-                                        aiter_tensor_t& scatter_indices,
-                                        aiter_tensor_t& tasks,
-                                        aiter_tensor_t& task_count,
-                                        aiter_tensor_t& output,
-                                        aiter_tensor_t& scales,
-                                        int64_t topk,
-                                        int64_t expert_count);
+                          int64_t logical_k);
 
 // GLM-5.3 IQ2R packed MoE (6144 hidden, 256 routed + 1 fused shared expert,
 // top-9). TP4 and TP8 are selected by the packed weight shapes.
@@ -60,9 +41,16 @@ enum Glm53DownKernel : int64_t
     kGlm53DownSingle  = 2,
 };
 
+void iq2r_glm53_m1_route_quant_out(const aiter_tensor_t& input,
+                                   const aiter_tensor_t& topk_ids,
+                                   aiter_tensor_t& scatter_indices,
+                                   aiter_tensor_t& tasks,
+                                   aiter_tensor_t& task_count,
+                                   aiter_tensor_t& output,
+                                   aiter_tensor_t& scales);
+
 void iq2r_glm53_sort_quant_out(const aiter_tensor_t& input,
                                const aiter_tensor_t& topk_ids,
-                               aiter_tensor_t& sorted_expert_ids,
                                aiter_tensor_t& gather_indices,
                                aiter_tensor_t& scatter_indices,
                                aiter_tensor_t& tasks,
@@ -72,13 +60,15 @@ void iq2r_glm53_sort_quant_out(const aiter_tensor_t& input,
                                aiter_tensor_t& gate_tasks,
                                aiter_tensor_t& gate_task_count);
 
-void iq2r_glm53_sort_out(const aiter_tensor_t& topk_ids,
-                         aiter_tensor_t& sorted_expert_ids,
-                         aiter_tensor_t& gather_indices,
-                         aiter_tensor_t& scatter_indices,
-                         aiter_tensor_t& tasks,
-                         aiter_tensor_t& task_count,
-                         aiter_tensor_t& scratch);
+void iq2r_glm53_prefill_sort_quant_out(const aiter_tensor_t& input,
+                                       const aiter_tensor_t& topk_ids,
+                                       aiter_tensor_t& gather_indices,
+                                       aiter_tensor_t& scatter_indices,
+                                       aiter_tensor_t& tasks,
+                                       aiter_tensor_t& task_count,
+                                       aiter_tensor_t& output,
+                                       aiter_tensor_t& scales,
+                                       aiter_tensor_t& scratch);
 
 void iq2r_glm53_route_reduce_out(const aiter_tensor_t& route_output,
                                  const aiter_tensor_t& route_weights,

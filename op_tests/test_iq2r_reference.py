@@ -9,7 +9,6 @@ from aiter.ops.iq2r_format import (
     IQ2R_CODEBOOK_BYTES,
     IQ2R_GROUP_BYTES,
     IQ2R_TRIPLET_BYTES,
-    IQ2R_VECTOR_SIZE,
     IQ2RMetadata,
 )
 from aiter.ops.iq2r_reference import (
@@ -32,20 +31,10 @@ def _empty_fixture(n=96, k=128):
 def test_six_block_physical_grouping_and_triplet_offsets():
     metadata, data, _ = _empty_fixture(n=192, k=256)
     assert [iq2r_physical_tile(nb, 0, 2) for nb in range(12)] == [
-        0,
-        1,
-        2,
-        3,
-        4,
-        5,
-        12,
-        13,
-        14,
-        15,
-        16,
-        17,
+        *range(6),
+        *range(12, 18),
     ]
-    assert [iq2r_physical_tile(nb, 1, 2) for nb in range(6)] == [6, 7, 8, 9, 10, 11]
+    assert [iq2r_physical_tile(nb, 1, 2) for nb in range(6)] == list(range(6, 12))
 
     flat = data[0]
     records0, shared0 = iq2r_tile_views(flat, 0, 0, metadata.k_tiles)
@@ -107,10 +96,6 @@ def test_materializer_decodes_codebook_sign_index_and_e8m0_scale():
         records, atom_metadata = iq2r_tile_views(data[0], atom, 0, metadata.k_tiles)
         records[:, :4] = 1
         records[:, 4:] = 0
-        records[0, 0] = 1
-        records[0, 1] = 1
-        records[0, 2] = 1
-        records[0, 3] = 1
         records[0, 4] = 0b00000001
         word = iq2r_metadata_word(atom_metadata, 0)
         word |= 0b0001 << (atom * 8)  # first index is 257
@@ -128,19 +113,6 @@ def test_materializer_decodes_codebook_sign_index_and_e8m0_scale():
     )
     torch.testing.assert_close(decoded[0, 0, :16], expected, rtol=0, atol=0)
     assert torch.isfinite(decoded).all()
-
-
-def test_reserved_zero_codeword_makes_padded_k_exact_zero():
-    _, data, auxiliary = _empty_fixture(n=96, k=2880)
-    # Entry one is non-zero while every record remains reserved entry zero.
-    codebook = torch.zeros((512, IQ2R_VECTOR_SIZE), dtype=torch.float32)
-    codebook[1] = 3
-    auxiliary[0, :IQ2R_CODEBOOK_BYTES] = (
-        codebook.to(torch.float8_e4m3fn).view(torch.uint8).reshape(-1)
-    )
-    padded_metadata = IQ2RMetadata(96, 2944)
-    padded = iq2r_materialize(data, auxiliary, padded_metadata)
-    torch.testing.assert_close(padded[..., 2880:], torch.zeros_like(padded[..., 2880:]))
 
 
 def test_materializer_rejects_nonzero_reserved_codeword():

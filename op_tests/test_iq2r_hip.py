@@ -65,8 +65,8 @@ def test_device_kernels_honor_noncurrent_gpu():
     torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
 
 
-# N=96 leaves a partially filled six-block group; K=2048 is the GLM-5.3 TP1
-# down-projection depth.
+# N=64 fills four of a six-block group and N=96 fills one group; K=2048 is
+# the GLM-5.3 TP1 down-projection depth.
 @pytest.mark.parametrize("n", [64, 96])
 def test_device_materializer_matches_independent_host_decoder(n):
     metadata = IQ2RMetadata(n, 2048)

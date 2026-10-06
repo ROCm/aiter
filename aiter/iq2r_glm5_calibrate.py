@@ -30,7 +30,7 @@ import re
 import tempfile
 import types
 from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -62,45 +62,24 @@ class TargetSpec:
     name: str
     groups: int
     width: int
-    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 def glm5_target_specs(config) -> list[TargetSpec]:
     """Return the routed (one group per expert) and shared (one group) targets."""
 
-    shared_experts = getattr(config, "n_shared_experts", 0) or 0
+    if getattr(config, "n_shared_experts", None) != 1:
+        raise ValueError("GLM-5 IQ2R calibration requires exactly one shared expert")
+    widths = {"gate_up": config.hidden_size, "down": config.moe_intermediate_size}
     specs = []
     for layer in range(config.first_k_dense_replace, config.num_hidden_layers):
-        widths = {
-            "gate_up": config.hidden_size,
-            "down": config.moe_intermediate_size,
-        }
         for projection, width in widths.items():
             specs.append(
                 TargetSpec(
-                    routed_target(layer, projection),
-                    config.num_local_experts,
-                    width,
-                    {"layer": layer, "groups": "experts", "projection": projection},
+                    routed_target(layer, projection), config.num_local_experts, width
                 )
             )
-        if not shared_experts:
-            continue
-        widths["down"] *= shared_experts
         for projection, width in widths.items():
-            specs.append(
-                TargetSpec(
-                    shared_target(layer, projection),
-                    1,
-                    width,
-                    {
-                        "layer": layer,
-                        "groups": "shared",
-                        "routing_weighted": False,
-                        "projection": projection,
-                    },
-                )
-            )
+            specs.append(TargetSpec(shared_target(layer, projection), 1, width))
     return specs
 
 
@@ -174,7 +153,7 @@ class DiagonalSecondMomentAccumulator:
         """Return the artifact targets: importance [groups, K] plus counts."""
 
         targets = {}
-        for name, spec in self.specs.items():
+        for name in self.specs:
             denominator = self.denominators[name]
             importance = self.sums[name] / denominator.clamp_min(1e-30).unsqueeze(1)
             targets[name] = {
@@ -182,7 +161,6 @@ class DiagonalSecondMomentAccumulator:
                 "denominator": denominator.clone(),
                 "hit_count": self.hit_counts[name].clone(),
                 "forced_hit_count": self.forced_hit_counts[name].clone(),
-                "metadata": dict(spec.metadata),
             }
         return targets
 
@@ -212,45 +190,28 @@ class GLM5CalibrationObserver:
         self._handles = []
 
     def install(self) -> None:
-        from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import (
-            GlmMoeDsaExperts,
-        )
-
-        expert_types: tuple[type, ...] = (GlmMoeDsaExperts,)
-        try:
-            from transformers.integrations.finegrained_fp8 import FP8Experts
-        except ImportError:
-            pass
-        else:
-            expert_types += (FP8Experts,)
-        if self._forwards or self._handles:
-            raise RuntimeError("GLM calibration observers are already installed")
-        routed = {}
-        shared = {}
+        # The routed experts module is GlmMoeDsaExperts, or FP8Experts for the
+        # block-FP8 checkpoint; the patterns match the module path only.
+        found = {"routed": {}, "shared": {}}
         for name, module in self.model.named_modules():
-            match = _ROUTED_EXPERTS.search(name)
-            if match is not None and isinstance(module, expert_types):
-                routed[int(match.group(1))] = module
-            match = _SHARED_EXPERTS.search(name)
-            if match is not None:
-                shared[int(match.group(1))] = module
-        if sorted(routed) != list(self.layers):
-            raise RuntimeError(
-                f"found GLM routed experts for layers {sorted(routed)}, "
-                f"expected {self.layers.start}..{self.layers.stop - 1}"
-            )
-        has_shared = bool(getattr(self.model.config, "n_shared_experts", 0) or 0)
-        if has_shared and sorted(shared) != list(self.layers):
-            raise RuntimeError(
-                f"found GLM shared experts for layers {sorted(shared)}, "
-                f"expected {self.layers.start}..{self.layers.stop - 1}"
-            )
+            for kind, pattern in (
+                ("routed", _ROUTED_EXPERTS),
+                ("shared", _SHARED_EXPERTS),
+            ):
+                match = pattern.search(name)
+                if match is not None:
+                    found[kind][int(match.group(1))] = module
+        for kind, modules in found.items():
+            if sorted(modules) != list(self.layers):
+                raise RuntimeError(
+                    f"found GLM {kind} experts for layers {sorted(modules)}, "
+                    f"expected {self.layers.start}..{self.layers.stop - 1}"
+                )
+        routed, shared = found["routed"], found["shared"]
         for layer in self.layers:
             module = routed[layer]
             self._forwards.append((module, module.forward))
             module.forward = types.MethodType(self._routed_forward(layer), module)
-            if not has_shared:
-                continue
             for projection, linear in (
                 ("gate_up", shared[layer].gate_proj),
                 ("down", shared[layer].down_proj),
@@ -282,22 +243,6 @@ class GLM5CalibrationObserver:
 
     def run(self, input_ids: Tensor) -> None:
         self.model.model(input_ids=input_ids, use_cache=False)
-
-    def metadata(self) -> dict[str, Any]:
-        forced = self.force_mask.nonzero().tolist()
-        return {
-            "model_adapter": "glm_moe_dsa",
-            "first_moe_layer": self.layers.start,
-            "forced_layer_experts": [
-                [int(layer), int(expert)] for layer, expert in forced
-            ],
-            "forced_layer_input_weight": 1.0,
-            "forced_layer_input_routing_weighted": False,
-            "routing_weighted": True,
-            "routing_weighted_scope": "naturally-observed-layer-expert-pairs",
-            "shared_expert_routing_weighted": False,
-            "shared_expert_scope": "natural-tokens",
-        }
 
     def _shared_hook(self, target: str):
         def hook(module, args):
@@ -510,18 +455,10 @@ def capture_glm5_calibration(
         "corpus_sha256": corpus_digest(texts),
         "sequence_length": sequence_length,
         "token_count": natural_tokens,
-        "random_fill_tokens": 0,
         "forced_layer_input_tokens": forced_tokens,
+        "forced_layer_experts": observer.force_mask.nonzero().tolist(),
         "hit_count_min": int(hit_counts.min()),
         "hit_count_max": int(hit_counts.max()),
-        "unobserved_target_groups": 0,
-        "unobserved_policy": "error",
-        "forced_target_groups": [
-            [name, group]
-            for name, target in targets.items()
-            for group in target["forced_hit_count"].nonzero().flatten().tolist()
-        ],
-        **observer.metadata(),
     }
     return {
         "format": _CALIBRATION_FORMAT,
@@ -634,16 +571,6 @@ def calibrate_glm5(
             "model_type": config.model_type,
             "architectures": list(getattr(config, "architectures", None) or ()),
             "model_config_sha256": config_fingerprint(config),
-            "model_shape": {
-                key: getattr(config, key)
-                for key in (
-                    "num_hidden_layers",
-                    "num_local_experts",
-                    "hidden_size",
-                    "intermediate_size",
-                )
-                if hasattr(config, key)
-            },
             "device_map": device_map if isinstance(device_map, str) else None,
         }
     )

@@ -16,176 +16,9 @@
 namespace aiter {
 namespace {
 
-constexpr int kThreads       = 256;
-constexpr int kQuantThreads  = 64;
-constexpr int kTaskColumns   = 3;
-constexpr int kMaxExperts    = 512;
-constexpr int kQuantGroup    = 32;
-
-bool iq2r_valid_scale_shape(
-    const aiter_tensor_t& scales, int64_t rows, int64_t groups_per_row)
-{
-    return (scales.dim() == 2 && scales.size(0) == rows &&
-            scales.size(1) == groups_per_row) ||
-           (scales.dim() == 4 && scales.size(0) == (groups_per_row + 3) / 4 &&
-            scales.size(1) >= (rows + 15) / 16 && scales.size(2) == 4 &&
-            scales.size(3) == 16);
-}
-
-__device__ __forceinline__ int64_t iq2r_scale_offset(
-    int row,
-    int group,
-    int groups_per_row,
-    int m_blocks,
-    bool tiled_scales)
-{
-    if(tiled_scales)
-        return (static_cast<int64_t>(group / 4) * m_blocks + row / 16) * 64 +
-               (group % 4) * 16 + row % 16;
-    return static_cast<int64_t>(row) * groups_per_row + group;
-}
-
-// Each lane owns one complete 32-value MX block, matching AITER's canonical
-// dynamic_per_group_scaled_quant implementation for group_size=32.  Folding
-// the indexed gather into this pass avoids materializing and rereading a BF16
-// [routes, hidden] tensor.
-__global__ __launch_bounds__(kQuantThreads) void iq2r_route_gather_quant_kernel(
-    const opus::bf16_t* __restrict__ input,
-    const int32_t* __restrict__ gather_indices,
-    opus::fp8_t* __restrict__ output,
-    uint8_t* __restrict__ scales,
-    int64_t groups,
-    int hidden,
-    int input_stride,
-    int groups_per_row,
-    int topk,
-    int scale_m_blocks,
-    bool tiled_scales)
-{
-    const int64_t group_id =
-        static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if(group_id >= groups)
-        return;
-
-    const int route = static_cast<int>(group_id / groups_per_row);
-    const int group = static_cast<int>(group_id % groups_per_row);
-    const int source_route = gather_indices[route];
-    const int token = source_route / topk;
-    const int64_t input_offset =
-        static_cast<int64_t>(token) * input_stride + group * kQuantGroup;
-    const int64_t output_offset =
-        static_cast<int64_t>(route) * hidden + group * kQuantGroup;
-
-    using input_vector = opus::vector_t<opus::bf16_t, kQuantGroup>;
-    using output_vector = opus::vector_t<opus::fp8_t, kQuantGroup>;
-    const input_vector values =
-        *reinterpret_cast<const input_vector*>(input + input_offset);
-
-    float abs_max = 1.0e-10f;
-#pragma unroll
-    for(int element = 0; element < kQuantGroup; ++element)
-        abs_max = fmaxf(abs_max, fabsf(static_cast<float>(values[element])));
-
-    const auto block_scale =
-        fp_f32_to_e8m0_block_scale<kDefaultMxScaleRoundMode, MxDtype::FP8_E4M3>(
-            abs_max);
-    const float inverse_scale = 1.0f / block_scale.dq_scale;
-    output_vector quantized;
-#pragma unroll
-    for(int element = 0; element < kQuantGroup; ++element)
-        quantized[element] =
-            opus::fp32_to_fp8(static_cast<float>(values[element]) * inverse_scale);
-
-    *reinterpret_cast<output_vector*>(output + output_offset) = quantized;
-    scales[iq2r_scale_offset(
-        route, group, groups_per_row, scale_m_blocks, tiled_scales)] =
-        block_scale.byte;
-}
-
-// Decode-specialized path for a single token. Its routes are one row per
-// expert, so sorting them costs more than it saves. Build one-row tasks in
-// original route order and quantize the token once before broadcasting the
-// packed row to all of its top-k routes.
-constexpr int kDirectQuantThreads = 128;
-
-// One thread per 32-column group: 128 threads cover hidden sizes up to 4096,
-// 256 threads cover GLM-5.3 (6144 hidden, 192 groups).
-template <int Threads>
-__global__ __launch_bounds__(Threads)
-void iq2r_route_direct_gather_quant_kernel(
-    const opus::bf16_t* __restrict__ input,
-    const int32_t* __restrict__ expert_ids,
-    int32_t* __restrict__ sorted_expert_ids,
-    int32_t* __restrict__ gather_indices,
-    int32_t* __restrict__ scatter_indices,
-    int32_t* __restrict__ tasks,
-    int32_t* __restrict__ task_count,
-    opus::fp8_t* __restrict__ output,
-    uint8_t* __restrict__ scales,
-    int routes,
-    int hidden,
-    int input_stride,
-    int groups_per_row,
-    int topk,
-    int expert_count,
-    int scale_m_blocks,
-    bool tiled_scales)
-{
-    const int token = static_cast<int>(blockIdx.x);
-    const int group = static_cast<int>(threadIdx.x);
-    if(token >= routes / topk || group >= groups_per_row)
-        return;
-
-    if(group < topk)
-    {
-        const int route = token * topk + group;
-        const int expert = expert_ids[route];
-        const int valid_expert = expert >= 0 && expert < expert_count ? expert : -1;
-        sorted_expert_ids[route] = expert;
-        gather_indices[route] = route;
-        scatter_indices[route] = route;
-        tasks[route * kTaskColumns] = route;
-        tasks[route * kTaskColumns + 1] = 1;
-        tasks[route * kTaskColumns + 2] = valid_expert;
-        if(token == 0 && group == 0)
-            task_count[0] = routes;
-    }
-
-    const int column_begin = group * kQuantGroup;
-    const int64_t input_offset =
-        static_cast<int64_t>(token) * input_stride + column_begin;
-
-    using input_vector = opus::vector_t<opus::bf16_t, kQuantGroup>;
-    using output_vector = opus::vector_t<opus::fp8_t, kQuantGroup>;
-    const input_vector values =
-        *reinterpret_cast<const input_vector*>(input + input_offset);
-
-    float abs_max = 1.0e-10f;
-#pragma unroll
-    for(int element = 0; element < kQuantGroup; ++element)
-        abs_max = fmaxf(abs_max, fabsf(static_cast<float>(values[element])));
-
-    const auto block_scale =
-        fp_f32_to_e8m0_block_scale<kDefaultMxScaleRoundMode, MxDtype::FP8_E4M3>(
-            abs_max);
-    const float inverse_scale = 1.0f / block_scale.dq_scale;
-    output_vector quantized;
-#pragma unroll
-    for(int element = 0; element < kQuantGroup; ++element)
-        quantized[element] =
-            opus::fp32_to_fp8(static_cast<float>(values[element]) * inverse_scale);
-
-    for(int route_in_token = 0; route_in_token < topk; ++route_in_token)
-    {
-        const int route = token * topk + route_in_token;
-        const int64_t output_offset =
-            static_cast<int64_t>(route) * hidden + column_begin;
-        *reinterpret_cast<output_vector*>(output + output_offset) = quantized;
-        scales[iq2r_scale_offset(
-            route, group, groups_per_row, scale_m_blocks, tiled_scales)] =
-            block_scale.byte;
-    }
-}
+constexpr int kThreads     = 256;
+constexpr int kTaskColumns = 3;
+constexpr int kQuantGroup  = 32;
 
 // GLM-5.3 IQ2R packed MoE routing.
 // GLM-5.3 routing: 256 routed experts plus the fused shared expert 256, top-9.
@@ -193,41 +26,6 @@ constexpr int kGlm53Experts = 257;
 constexpr int kGlm53TopK    = 9;
 constexpr int kGlm53Hidden  = 6144;
 constexpr int kGlm53Groups  = kGlm53Hidden / kQuantGroup;
-
-__device__ __forceinline__ int iq2r_block_inclusive_scan_256(int value, int* wave_totals)
-{
-    const int lane = static_cast<int>(threadIdx.x) & 63;
-    const int wave = static_cast<int>(threadIdx.x) >> 6;
-#pragma unroll
-    for(int delta = 1; delta < 64; delta <<= 1)
-    {
-        const int previous = __shfl_up(value, delta, 64);
-        if(lane >= delta)
-            value += previous;
-    }
-    if(lane == 63)
-        wave_totals[wave] = value;
-    __syncthreads();
-
-    if(wave == 0)
-    {
-        int total = lane < 4 ? wave_totals[lane] : 0;
-#pragma unroll
-        for(int delta = 1; delta < 64; delta <<= 1)
-        {
-            const int previous = __shfl_up(total, delta, 64);
-            if(lane >= delta)
-                total += previous;
-        }
-        if(lane < 4)
-            wave_totals[lane] = total;
-    }
-    __syncthreads();
-
-    if(wave > 0)
-        value += wave_totals[wave - 1];
-    return value;
-}
 
 // Prefill route sort in three passes. Each 256-route chunk owns its histogram
 // and ranks; the prefix passes assign disjoint expert ranges before the scatter.
@@ -250,7 +48,8 @@ __global__ __launch_bounds__(256) void glm53_sort_histogram(
     histogram[blockIdx.x*512+t+256]=counts[t+256];
 }
 
-__device__ __forceinline__ int glm53_scan512(int x,int* waves)
+// Inclusive block scan; waves holds one total per wave of the block.
+__device__ __forceinline__ int glm53_block_scan(int x,int* waves)
 {
     const int lane=threadIdx.x%64,wave=threadIdx.x/64;
 #pragma unroll
@@ -272,7 +71,7 @@ __global__ __launch_bounds__(512) void glm53_sort_chunk_prefix(int32_t* histogra
     __shared__ int waves[8];
     const int expert=blockIdx.x,chunk=threadIdx.x;
     const int n=chunk<chunks?histogram[chunk*512+expert]:0;
-    const int prefix=glm53_scan512(n,waves);
+    const int prefix=glm53_block_scan(n,waves);
     if(chunk<chunks)histogram[chunk*512+expert]=prefix-n;
     if(chunk==511)histogram[chunks*512+expert]=prefix;
 }
@@ -284,10 +83,10 @@ __global__ __launch_bounds__(512) void glm53_sort_expert_prefix(
     __shared__ int waves[8];
     const int expert=threadIdx.x;
     const int count=expert<258?histogram[chunks*512+expert]:0;
-    const int begin=glm53_scan512(count,waves)-count;
+    const int begin=glm53_block_scan(count,waves)-count;
     histogram[chunks*512+512+expert]=begin;
     const int nt=(count+task_rows-1)/task_rows;
-    const int task_end=glm53_scan512(nt,waves);
+    const int task_end=glm53_block_scan(nt,waves);
     if(expert==511)task_count[0]=task_end<=task_capacity?task_end:-1;
     for(int i=0;i<nt;++i)
     {
@@ -302,42 +101,28 @@ __global__ __launch_bounds__(512) void glm53_sort_expert_prefix(
 }
 
 __global__ __launch_bounds__(256) void glm53_sort_scatter(
-    const int32_t* ids,int32_t* sorted_ids,int32_t* gather,int32_t* scatter,
+    const int32_t* ids,int32_t* gather,int32_t* scatter,
     const int32_t* histogram,int routes)
 {
     const int route=blockIdx.x*256+threadIdx.x;
     if(route<routes)
     {
         const int id=ids[route];
-        const int expert=(id>=0 && id<257)?id:-1;
-        const int bucket=expert>=0?expert:257;
+        const int bucket=(id>=0 && id<257)?id:257;
         const int rank=scatter[route]+histogram[blockIdx.x*512+bucket]+histogram[((routes+255)/256)*512+512+bucket];
-        sorted_ids[rank]=expert;
         gather[rank]=route;
         scatter[route]=rank;
     }
 }
 
-// Quantizes one 32-column group of a token row to FP8 with an E8M0 scale.
-__device__ __forceinline__ void glm53_quant_group(
-    const opus::bf16_t* __restrict__ input,
-    opus::fp8_t* __restrict__ output,
-    uint8_t* __restrict__ scales,
-    int tokens,
-    int input_stride,
-    int group_id)
+using glm53_fp8_group = opus::vector_t<opus::fp8_t, kQuantGroup>;
+
+// Quantizes 32 BF16 values to FP8 with one E8M0 block scale; returns the scale.
+__device__ __forceinline__ uint8_t glm53_quant32(const opus::bf16_t* __restrict__ input,
+                                                 glm53_fp8_group& quantized)
 {
-    if(group_id >= tokens * kGlm53Groups)
-        return;
-
-    const int token             = group_id / kGlm53Groups;
-    const int group             = group_id % kGlm53Groups;
-    const int64_t input_offset  = static_cast<int64_t>(token) * input_stride + group * kQuantGroup;
-    const int64_t output_offset = static_cast<int64_t>(token) * kGlm53Hidden + group * kQuantGroup;
-
     using input_vector        = opus::vector_t<opus::bf16_t, kQuantGroup>;
-    using output_vector       = opus::vector_t<opus::fp8_t, kQuantGroup>;
-    const input_vector values = *reinterpret_cast<const input_vector*>(input + input_offset);
+    const input_vector values = *reinterpret_cast<const input_vector*>(input);
 
     float abs_max = 1.0e-10f;
 #pragma unroll
@@ -347,7 +132,7 @@ __device__ __forceinline__ void glm53_quant_group(
     const auto block_scale =
         fp_f32_to_e8m0_block_scale<kDefaultMxScaleRoundMode, MxDtype::FP8_E4M3>(abs_max);
     const float inverse_scale = 1.0f / block_scale.dq_scale;
-    union { output_vector quantized; uint32_t words[8]; } packed;
+    union { glm53_fp8_group quantized; uint32_t words[8]; } packed;
 #pragma unroll
     for(int word=0;word<8;++word) {
         const float x0=static_cast<float>(values[word*4])*inverse_scale;
@@ -358,8 +143,64 @@ __device__ __forceinline__ void glm53_quant_group(
         bits=__builtin_amdgcn_cvt_pk_fp8_f32(x2,x3,bits,1);
         packed.words[word]=static_cast<uint32_t>(bits);
     }
-    *reinterpret_cast<output_vector*>(output+output_offset)=packed.quantized;
-    scales[static_cast<int64_t>(token) * kGlm53Groups + group] = block_scale.byte;
+    quantized = packed.quantized;
+    return block_scale.byte;
+}
+
+// Quantizes one 32-column group of a token row (group_id = token * 192 + group).
+__device__ __forceinline__ void glm53_quant_group(
+    const opus::bf16_t* __restrict__ input,
+    opus::fp8_t* __restrict__ output,
+    uint8_t* __restrict__ scales,
+    int tokens,
+    int input_stride,
+    int group_id)
+{
+    if(group_id >= tokens * kGlm53Groups)
+        return;
+    const int token = group_id / kGlm53Groups;
+    const int group = group_id % kGlm53Groups;
+    glm53_fp8_group quantized;
+    const uint8_t scale =
+        glm53_quant32(input + static_cast<int64_t>(token) * input_stride + group * kQuantGroup, quantized);
+    *reinterpret_cast<glm53_fp8_group*>(output + static_cast<int64_t>(token) * kGlm53Hidden +
+                                        group * kQuantGroup) = quantized;
+    scales[static_cast<int64_t>(token) * kGlm53Groups + group] = scale;
+}
+
+__global__ __launch_bounds__(256) void glm53_quant_kernel(
+    const opus::bf16_t* input,opus::fp8_t* output,uint8_t* scales,int tokens,int stride)
+{
+    glm53_quant_group(input,output,scales,tokens,stride,
+        static_cast<int>(blockIdx.x)*256+static_cast<int>(threadIdx.x));
+}
+
+// M1 front end: the nine routes of one token become nine one-row tasks in
+// route order (sorting them costs more than it saves). The token is quantized
+// once and its row copied to all nine routes.
+__global__ __launch_bounds__(256) void glm53_m1_route_quant_kernel(
+    const opus::bf16_t* input,const int32_t* ids,int32_t* scatter,int32_t* tasks,
+    int32_t* count,opus::fp8_t* output,uint8_t* scales)
+{
+    const int t=threadIdx.x;
+    if(t<kGlm53TopK)
+    {
+        const int id=ids[t];
+        scatter[t]=t;
+        tasks[t*kTaskColumns]=t;
+        tasks[t*kTaskColumns+1]=1;
+        tasks[t*kTaskColumns+2]=id>=0 && id<kGlm53Experts?id:-1;
+        if(t==0)count[0]=kGlm53TopK;
+    }
+    if(t>=kGlm53Groups)return;
+    glm53_fp8_group quantized;
+    const uint8_t scale=glm53_quant32(input+t*kQuantGroup,quantized);
+#pragma unroll
+    for(int route=0;route<kGlm53TopK;++route)
+    {
+        *reinterpret_cast<glm53_fp8_group*>(output+route*kGlm53Hidden+t*kQuantGroup)=quantized;
+        scales[route*kGlm53Groups+t]=scale;
+    }
 }
 
 // Decode route sort in one CTA: one thread per routed expert, wave scans for
@@ -368,7 +209,6 @@ __device__ __forceinline__ void glm53_quant_group(
 // routes are appended after the routed experts.
 __device__ __forceinline__ void glm53_sort_routes(
     const int32_t* __restrict__ expert_ids,
-    int32_t* __restrict__ sorted_expert_ids,
     int32_t* __restrict__ gather_indices,
     int32_t* __restrict__ scatter_indices,
     int32_t* __restrict__ tasks,
@@ -404,7 +244,7 @@ __device__ __forceinline__ void glm53_sort_routes(
     }
     __syncthreads();
 
-    const int count_prefix = iq2r_block_inclusive_scan_256(counts[expert], wave_totals);
+    const int count_prefix = glm53_block_scan(counts[expert], wave_totals);
     offsets[expert]        = count_prefix - counts[expert];
     cursors[expert]        = offsets[expert];
     if(expert == kRouted - 1)
@@ -425,10 +265,9 @@ __device__ __forceinline__ void glm53_sort_routes(
     {
         const int local                 = local_expert(expert_ids[route]);
         const int bucket                = local >= 0 ? local : kGlm53Experts;
-        const int sorted_route          = atomicAdd(cursors + bucket, 1);
-        sorted_expert_ids[sorted_route] = local;
-        gather_indices[sorted_route]    = route;
-        scatter_indices[route]          = sorted_route;
+        const int sorted_route       = atomicAdd(cursors + bucket, 1);
+        gather_indices[sorted_route] = route;
+        scatter_indices[route]       = sorted_route;
     }
     __syncthreads();
 
@@ -436,7 +275,7 @@ __device__ __forceinline__ void glm53_sort_routes(
     // Each task prefix fits in 16 bits: routes <= 9216 give at most 834 tasks. Summing the packed pair
     // cannot carry from the low field to the high.
     const int local_gate_tasks=(counts[expert]+15)/16;
-    const int packed_prefix=iq2r_block_inclusive_scan_256(local_tasks+(local_gate_tasks<<16),wave_totals);
+    const int packed_prefix=glm53_block_scan(local_tasks+(local_gate_tasks<<16),wave_totals);
     const int task_prefix=packed_prefix&65535;
     const int gate_begin=(packed_prefix>>16)-local_gate_tasks;
     const int task_begin  = task_prefix - local_tasks;
@@ -513,20 +352,20 @@ __device__ __forceinline__ void glm53_sort_routes(
 // CTA 0 sorts the routes while the other CTAs quantize each token once; the
 // gate GEMM gathers token rows through the sorted route order.
 __global__ __launch_bounds__(256) void glm53_sort_quant_kernel(
-    const opus::bf16_t* input,const int32_t* ids,int32_t* sorted,
+    const opus::bf16_t* input,const int32_t* ids,
     int32_t* gather,int32_t* scatter,int32_t* tasks,int32_t* count,
     opus::fp8_t* output,uint8_t* scales,int tokens,int stride,int capacity,int32_t* gate_tasks,int32_t* gate_count,int gate_capacity)
 {
     if(blockIdx.x==0)
-        glm53_sort_routes(ids,sorted,gather,scatter,tasks,count,
+        glm53_sort_routes(ids,gather,scatter,tasks,count,
             tokens*kGlm53TopK,capacity,gate_tasks,gate_count,gate_capacity);
     else
         glm53_quant_group(input,output,scales,tokens,stride,
             (static_cast<int>(blockIdx.x)-1)*256+static_cast<int>(threadIdx.x));
 }
 
-// Weighted top-9 reduction: one wave owns 512 columns. Preserves the nine
-// ordered FP32 FMAs of the route-major reduction.
+// Weighted top-9 sum: one wave owns 512 columns; nine FP32 FMAs in route
+// order, then one BF16 rounding.
 __global__ __launch_bounds__(64) void glm53_route_reduce_kernel(
     const __hip_bfloat16* __restrict__ route_output,
     const float* __restrict__ route_weights,const int32_t* __restrict__ scatter,
@@ -576,154 +415,6 @@ __global__ __launch_bounds__(64) void glm53_route_reduce_kernel(
 
 } // namespace
 
-void iq2r_route_gather_quant_out(const aiter_tensor_t& input,
-                                 const aiter_tensor_t& gather_indices,
-                                 aiter_tensor_t& output,
-                                 aiter_tensor_t& scales,
-                                 int64_t topk)
-{
-    AITER_CHECK(input.is_gpu() && gather_indices.is_gpu() && output.is_gpu() &&
-                    scales.is_gpu(),
-                "IQ2R fused gather/quant requires GPU tensors");
-    const int device = input.device_id;
-    AITER_CHECK(gather_indices.device_id == device && output.device_id == device &&
-                    scales.device_id == device,
-                "IQ2R fused gather/quant tensors must share a GPU");
-    AITER_CHECK(input.dtype() == AITER_DTYPE_bf16 &&
-                    gather_indices.dtype() == AITER_DTYPE_i32 &&
-                    output.dtype() == AITER_DTYPE_fp8 &&
-                    scales.dtype() == AITER_DTYPE_u8,
-                "IQ2R fused gather/quant dtype mismatch");
-    const int64_t groups_per_row = input.size(1) / kQuantGroup;
-    AITER_CHECK(input.dim() == 2 && gather_indices.dim() == 1 &&
-                    output.dim() == 2 && topk > 0 &&
-                    output.size(0) == input.size(0) * topk &&
-                    gather_indices.numel() == output.size(0) &&
-                    output.size(1) == input.size(1) &&
-                    output.size(1) % kQuantGroup == 0 &&
-                    iq2r_valid_scale_shape(
-                        scales, output.size(0), groups_per_row),
-                "IQ2R fused gather/quant shape mismatch");
-    AITER_CHECK(input.stride(1) == 1 && input.stride(0) >= input.size(1) &&
-                    gather_indices.is_contiguous() && output.is_contiguous() &&
-                    scales.is_contiguous(),
-                "IQ2R fused gather/quant input must have contiguous columns and "
-                "non-overlapping rows; outputs must be contiguous");
-
-    const bool tiled_scales = scales.dim() == 4;
-    const int scale_m_blocks = static_cast<int>((output.size(0) + 15) / 16);
-    const int64_t groups = output.size(0) * groups_per_row;
-    HipDeviceGuard device_guard(device);
-    hipLaunchKernelGGL(iq2r_route_gather_quant_kernel,
-                       dim3((groups + kQuantThreads - 1) / kQuantThreads),
-                       dim3(kQuantThreads),
-                       0,
-                       getCurrentHIPStream(),
-                       static_cast<const opus::bf16_t*>(input.data_ptr()),
-                       static_cast<const int32_t*>(gather_indices.data_ptr()),
-                       static_cast<opus::fp8_t*>(output.data_ptr()),
-                       static_cast<uint8_t*>(scales.data_ptr()),
-                       groups,
-                       static_cast<int>(input.size(1)),
-                       static_cast<int>(input.stride(0)),
-                       static_cast<int>(groups_per_row),
-                       static_cast<int>(topk),
-                       scale_m_blocks,
-                       tiled_scales);
-    HIP_CALL_LAUNCH(hipGetLastError());
-}
-
-void iq2r_route_direct_gather_quant_out(const aiter_tensor_t& input,
-                                        const aiter_tensor_t& expert_ids,
-                                        aiter_tensor_t& sorted_expert_ids,
-                                        aiter_tensor_t& gather_indices,
-                                        aiter_tensor_t& scatter_indices,
-                                        aiter_tensor_t& tasks,
-                                        aiter_tensor_t& task_count,
-                                        aiter_tensor_t& output,
-                                        aiter_tensor_t& scales,
-                                        int64_t topk,
-                                        int64_t expert_count)
-{
-    AITER_CHECK(input.is_gpu() && expert_ids.is_gpu() &&
-                    sorted_expert_ids.is_gpu() && gather_indices.is_gpu() &&
-                    scatter_indices.is_gpu() && tasks.is_gpu() && task_count.is_gpu() &&
-                    output.is_gpu() && scales.is_gpu(),
-                "IQ2R direct routing requires GPU tensors");
-    const int device = input.device_id;
-    AITER_CHECK(expert_ids.device_id == device &&
-                    sorted_expert_ids.device_id == device &&
-                    gather_indices.device_id == device &&
-                    scatter_indices.device_id == device && tasks.device_id == device &&
-                    task_count.device_id == device && output.device_id == device &&
-                    scales.device_id == device,
-                "IQ2R direct routing tensors must share a GPU");
-    AITER_CHECK(input.dtype() == AITER_DTYPE_bf16 &&
-                    expert_ids.dtype() == AITER_DTYPE_i32 &&
-                    sorted_expert_ids.dtype() == AITER_DTYPE_i32 &&
-                    gather_indices.dtype() == AITER_DTYPE_i32 &&
-                    scatter_indices.dtype() == AITER_DTYPE_i32 &&
-                    tasks.dtype() == AITER_DTYPE_i32 &&
-                    task_count.dtype() == AITER_DTYPE_i32 &&
-                    output.dtype() == AITER_DTYPE_fp8 &&
-                    scales.dtype() == AITER_DTYPE_u8,
-                "IQ2R direct routing tensor dtypes are invalid");
-    const int64_t routes = expert_ids.numel();
-    AITER_CHECK(routes > 0 && routes <= 16 && topk > 0 && routes % topk == 0,
-                "IQ2R direct routing requires 1..16 complete top-k route rows");
-    const int64_t groups_per_row = input.size(1) / kQuantGroup;
-    AITER_CHECK(input.dim() == 2 && input.size(0) * topk == routes &&
-                    input.size(1) % kQuantGroup == 0 &&
-                    output.dim() == 2 && output.size(0) == routes &&
-                    output.size(1) == input.size(1) &&
-                    iq2r_valid_scale_shape(scales, routes, groups_per_row) &&
-                    sorted_expert_ids.numel() == routes &&
-                    gather_indices.numel() == routes &&
-                    scatter_indices.numel() == routes && tasks.dim() == 2 &&
-                    tasks.size(0) >= routes && tasks.size(1) == kTaskColumns &&
-                    task_count.dim() == 1 && task_count.size(0) == 1,
-                "IQ2R direct routing shape mismatch");
-    AITER_CHECK(input.stride(1) == 1 && input.stride(0) >= input.size(1) &&
-                    expert_ids.is_contiguous() && sorted_expert_ids.is_contiguous() &&
-                    gather_indices.is_contiguous() && scatter_indices.is_contiguous() &&
-                    tasks.is_contiguous() && task_count.is_contiguous() &&
-                    output.is_contiguous() && scales.is_contiguous(),
-                "IQ2R direct routing tensors must be contiguous");
-    AITER_CHECK(expert_count > 0 && expert_count <= kMaxExperts,
-                "IQ2R direct routing supports at most 512 experts");
-    AITER_CHECK(groups_per_row <= 2 * kDirectQuantThreads,
-                "IQ2R direct routing supports hidden sizes up to 8192");
-
-    const bool tiled_scales = scales.dim() == 4;
-    const int scale_m_blocks = static_cast<int>((routes + 15) / 16);
-    const bool wide = groups_per_row > kDirectQuantThreads;
-    HipDeviceGuard device_guard(device);
-    hipLaunchKernelGGL((wide ? iq2r_route_direct_gather_quant_kernel<2 * kDirectQuantThreads>
-                             : iq2r_route_direct_gather_quant_kernel<kDirectQuantThreads>),
-                       dim3(static_cast<uint32_t>(input.size(0))),
-                       dim3(wide ? 2 * kDirectQuantThreads : kDirectQuantThreads),
-                       0,
-                       getCurrentHIPStream(),
-                       static_cast<const opus::bf16_t*>(input.data_ptr()),
-                       static_cast<const int32_t*>(expert_ids.data_ptr()),
-                       static_cast<int32_t*>(sorted_expert_ids.data_ptr()),
-                       static_cast<int32_t*>(gather_indices.data_ptr()),
-                       static_cast<int32_t*>(scatter_indices.data_ptr()),
-                       static_cast<int32_t*>(tasks.data_ptr()),
-                       static_cast<int32_t*>(task_count.data_ptr()),
-                       static_cast<opus::fp8_t*>(output.data_ptr()),
-                       static_cast<uint8_t*>(scales.data_ptr()),
-                       static_cast<int>(routes),
-                       static_cast<int>(input.size(1)),
-                       static_cast<int>(input.stride(0)),
-                       static_cast<int>(groups_per_row),
-                       static_cast<int>(topk),
-                       static_cast<int>(expert_count),
-                       scale_m_blocks,
-                       tiled_scales);
-    HIP_CALL_LAUNCH(hipGetLastError());
-}
-
 namespace {
 
 void glm53_check_routes(std::initializer_list<const aiter_tensor_t*> tensors,
@@ -752,14 +443,74 @@ void glm53_check_task_table(const aiter_tensor_t& tasks,
                 "GLM-5.3 IQ2R task count must be one int32");
 }
 
+void glm53_check_input(const aiter_tensor_t& input, int64_t min_tokens, int64_t max_tokens)
+{
+    AITER_CHECK(input.is_gpu() && input.dtype() == AITER_DTYPE_bf16 && input.dim() == 2 &&
+                    input.size(1) == kGlm53Hidden && input.stride(1) == 1 &&
+                    input.size(0) >= min_tokens && input.size(0) <= max_tokens,
+                "GLM-5.3 IQ2R input must be BF16 [tokens, 6144] with contiguous rows and a "
+                "supported token count");
+}
+
+void glm53_check_quant_output(const aiter_tensor_t& output,
+                              const aiter_tensor_t& scales,
+                              int device,
+                              int64_t rows)
+{
+    AITER_CHECK(output.is_gpu() && output.device_id == device && output.is_contiguous() &&
+                    output.dtype() == AITER_DTYPE_fp8 && output.dim() == 2 &&
+                    output.size(0) == rows && output.size(1) == kGlm53Hidden,
+                "GLM-5.3 IQ2R quantized input must be FP8 [rows, 6144]");
+    AITER_CHECK(scales.is_gpu() && scales.device_id == device && scales.is_contiguous() &&
+                    scales.dtype() == AITER_DTYPE_u8 && scales.dim() == 2 &&
+                    scales.size(0) == rows && scales.size(1) == kGlm53Groups,
+                "GLM-5.3 IQ2R input scales must be uint8 [rows, 192]");
+}
+
 } // namespace
+
+// M1 front end: nine one-row tasks in route order; the quantized token row is
+// written once per route.
+void iq2r_glm53_m1_route_quant_out(const aiter_tensor_t& input,
+                                   const aiter_tensor_t& topk_ids,
+                                   aiter_tensor_t& scatter_indices,
+                                   aiter_tensor_t& tasks,
+                                   aiter_tensor_t& task_count,
+                                   aiter_tensor_t& output,
+                                   aiter_tensor_t& scales)
+{
+    const int device = input.device_id;
+    glm53_check_input(input, 1, 1);
+    glm53_check_routes({&topk_ids, &scatter_indices}, device, kGlm53TopK);
+    AITER_CHECK(tasks.is_gpu() && tasks.device_id == device && tasks.is_contiguous() &&
+                    tasks.dtype() == AITER_DTYPE_i32 && tasks.dim() == 2 &&
+                    tasks.size(0) >= kGlm53TopK && tasks.size(1) == kTaskColumns &&
+                    task_count.is_gpu() && task_count.device_id == device &&
+                    task_count.dtype() == AITER_DTYPE_i32 && task_count.numel() == 1,
+                "GLM-5.3 IQ2R M1 tasks must be int32 [>=9, 3] with one int32 count");
+    glm53_check_quant_output(output, scales, device, kGlm53TopK);
+
+    HipDeviceGuard device_guard(device);
+    hipLaunchKernelGGL(glm53_m1_route_quant_kernel,
+                       dim3(1),
+                       dim3(256),
+                       0,
+                       getCurrentHIPStream(),
+                       static_cast<const opus::bf16_t*>(input.data_ptr()),
+                       static_cast<const int32_t*>(topk_ids.data_ptr()),
+                       static_cast<int32_t*>(scatter_indices.data_ptr()),
+                       static_cast<int32_t*>(tasks.data_ptr()),
+                       static_cast<int32_t*>(task_count.data_ptr()),
+                       static_cast<opus::fp8_t*>(output.data_ptr()),
+                       static_cast<uint8_t*>(scales.data_ptr()));
+    HIP_CALL_LAUNCH(hipGetLastError());
+}
 
 // Decode front end for 2..1024 tokens: block 0 sorts the 9 routes per token
 // into M32 down tasks and M16 gate tasks, the remaining blocks quantize each
 // token row once to MXFP8 in token order.
 void iq2r_glm53_sort_quant_out(const aiter_tensor_t& input,
                                const aiter_tensor_t& topk_ids,
-                               aiter_tensor_t& sorted_expert_ids,
                                aiter_tensor_t& gather_indices,
                                aiter_tensor_t& scatter_indices,
                                aiter_tensor_t& tasks,
@@ -770,24 +521,13 @@ void iq2r_glm53_sort_quant_out(const aiter_tensor_t& input,
                                aiter_tensor_t& gate_task_count)
 {
     const int device = input.device_id;
-    AITER_CHECK(input.is_gpu() && input.dtype() == AITER_DTYPE_bf16 && input.dim() == 2 &&
-                    input.size(1) == kGlm53Hidden && input.stride(1) == 1 &&
-                    input.size(0) >= 2 && input.size(0) <= 1024,
-                "GLM-5.3 IQ2R sort-quant expects BF16 [2..1024, 6144]");
+    glm53_check_input(input, 2, 1024);
     const int tokens     = static_cast<int>(input.size(0));
     const int64_t routes = static_cast<int64_t>(tokens) * kGlm53TopK;
-    glm53_check_routes(
-        {&topk_ids, &sorted_expert_ids, &gather_indices, &scatter_indices}, device, routes);
+    glm53_check_routes({&topk_ids, &gather_indices, &scatter_indices}, device, routes);
     glm53_check_task_table(tasks, task_count, device, routes, 32);
     glm53_check_task_table(gate_tasks, gate_task_count, device, routes, 16);
-    AITER_CHECK(output.is_gpu() && output.device_id == device && output.is_contiguous() &&
-                    output.dtype() == AITER_DTYPE_fp8 && output.dim() == 2 &&
-                    output.size(0) == tokens && output.size(1) == kGlm53Hidden,
-                "GLM-5.3 IQ2R sort-quant output must be FP8 [tokens, 6144]");
-    AITER_CHECK(scales.is_gpu() && scales.device_id == device && scales.is_contiguous() &&
-                    scales.dtype() == AITER_DTYPE_u8 && scales.dim() == 2 &&
-                    scales.size(0) == tokens && scales.size(1) == kGlm53Groups,
-                "GLM-5.3 IQ2R sort-quant scales must be uint8 [tokens, 192]");
+    glm53_check_quant_output(output, scales, device, tokens);
 
     HipDeviceGuard device_guard(device);
     hipLaunchKernelGGL(glm53_sort_quant_kernel,
@@ -797,7 +537,6 @@ void iq2r_glm53_sort_quant_out(const aiter_tensor_t& input,
                        getCurrentHIPStream(),
                        static_cast<const opus::bf16_t*>(input.data_ptr()),
                        static_cast<const int32_t*>(topk_ids.data_ptr()),
-                       static_cast<int32_t*>(sorted_expert_ids.data_ptr()),
                        static_cast<int32_t*>(gather_indices.data_ptr()),
                        static_cast<int32_t*>(scatter_indices.data_ptr()),
                        static_cast<int32_t*>(tasks.data_ptr()),
@@ -813,24 +552,27 @@ void iq2r_glm53_sort_quant_out(const aiter_tensor_t& input,
     HIP_CALL_LAUNCH(hipGetLastError());
 }
 
-// Prefill route sort: per-chunk expert histograms, a column-wise prefix over
-// chunks, an expert prefix that emits M64 tasks, then a stable scatter.
-void iq2r_glm53_sort_out(const aiter_tensor_t& topk_ids,
-                         aiter_tensor_t& sorted_expert_ids,
-                         aiter_tensor_t& gather_indices,
-                         aiter_tensor_t& scatter_indices,
-                         aiter_tensor_t& tasks,
-                         aiter_tensor_t& task_count,
-                         aiter_tensor_t& scratch)
+// Prefill front end for 2..4096 tokens. Route sort: per-chunk expert
+// histograms, a column-wise prefix over chunks, an expert prefix that emits
+// M64 tasks, then a stable scatter. Each token row is quantized once.
+void iq2r_glm53_prefill_sort_quant_out(const aiter_tensor_t& input,
+                                       const aiter_tensor_t& topk_ids,
+                                       aiter_tensor_t& gather_indices,
+                                       aiter_tensor_t& scatter_indices,
+                                       aiter_tensor_t& tasks,
+                                       aiter_tensor_t& task_count,
+                                       aiter_tensor_t& output,
+                                       aiter_tensor_t& scales,
+                                       aiter_tensor_t& scratch)
 {
     constexpr int kTaskRows = 64;
-    const int device        = topk_ids.device_id;
-    const int64_t routes    = topk_ids.numel();
-    AITER_CHECK(topk_ids.is_gpu() && routes > 0 && routes <= 131072,
-                "GLM-5.3 IQ2R sort supports 1..131072 routes");
-    glm53_check_routes(
-        {&topk_ids, &sorted_expert_ids, &gather_indices, &scatter_indices}, device, routes);
+    const int device        = input.device_id;
+    glm53_check_input(input, 2, 4096);
+    const int tokens        = static_cast<int>(input.size(0));
+    const int64_t routes    = static_cast<int64_t>(tokens) * kGlm53TopK;
+    glm53_check_routes({&topk_ids, &gather_indices, &scatter_indices}, device, routes);
     glm53_check_task_table(tasks, task_count, device, routes, kTaskRows);
+    glm53_check_quant_output(output, scales, device, tokens);
     const int chunks = static_cast<int>((routes + 255) / 256);
     AITER_CHECK(scratch.is_gpu() && scratch.device_id == device && scratch.is_contiguous() &&
                     scratch.dtype() == AITER_DTYPE_i32 &&
@@ -840,7 +582,6 @@ void iq2r_glm53_sort_out(const aiter_tensor_t& topk_ids,
     HipDeviceGuard device_guard(device);
     const auto stream = getCurrentHIPStream();
     const auto* ids   = static_cast<const int32_t*>(topk_ids.data_ptr());
-    auto* sorted      = static_cast<int32_t*>(sorted_expert_ids.data_ptr());
     auto* gather      = static_cast<int32_t*>(gather_indices.data_ptr());
     auto* scatter     = static_cast<int32_t*>(scatter_indices.data_ptr());
     auto* histogram   = static_cast<int32_t*>(scratch.data_ptr());
@@ -866,11 +607,20 @@ void iq2r_glm53_sort_out(const aiter_tensor_t& topk_ids,
                        0,
                        stream,
                        ids,
-                       sorted,
                        gather,
                        scatter,
                        histogram,
                        count);
+    hipLaunchKernelGGL(glm53_quant_kernel,
+                       dim3((tokens * kGlm53Groups + 255) / 256),
+                       dim3(256),
+                       0,
+                       stream,
+                       static_cast<const opus::bf16_t*>(input.data_ptr()),
+                       static_cast<opus::fp8_t*>(output.data_ptr()),
+                       static_cast<uint8_t*>(scales.data_ptr()),
+                       tokens,
+                       static_cast<int>(input.stride(0)));
     HIP_CALL_LAUNCH(hipGetLastError());
 }
 

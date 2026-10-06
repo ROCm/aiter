@@ -40,11 +40,10 @@ from .ops.iq2r import (
     iq2r_glm53_down_route9_out,
     iq2r_glm53_gate_m1_out,
     iq2r_glm53_gate_out,
+    iq2r_glm53_m1_route_quant_out,
+    iq2r_glm53_prefill_sort_quant_out,
     iq2r_glm53_route_reduce_out,
-    iq2r_glm53_sort_out,
     iq2r_glm53_sort_quant_out,
-    iq2r_route_direct_gather_quant_out,
-    iq2r_route_gather_quant_out,
 )
 
 HIDDEN = 6144
@@ -240,7 +239,7 @@ class IQ2RGlm53Config:
     down_chunks: int
 
 
-def _default_config(tokens: int, intermediate_size: int) -> IQ2RGlm53Config:
+def _default_config(tokens: int) -> IQ2RGlm53Config:
     if tokens > DEFAULT_DECODE_TOKENS:
         return IQ2RGlm53Config("prefill", 2, "prefill", 0, 1 if tokens <= 2560 else 2)
     down = "route9" if tokens in (1, 2, 4) else "packed"
@@ -266,7 +265,7 @@ def iq2r_glm53_config(tokens: int, intermediate_size: int) -> IQ2RGlm53Config:
         (get_gfx(), get_cu_num(), tokens, intermediate_size)
     )
     if row is None:
-        return _default_config(tokens, intermediate_size)
+        return _default_config(tokens)
     if AITER_LOG_TUNED_CONFIG:
         logger.info(
             f"IQ2R GLM-5.3 M={tokens} I={intermediate_size}: tuned {row} "
@@ -301,7 +300,6 @@ class IQ2RGlm53Workspace:
     intermediate_fp8: Tensor
     intermediate_scales: Tensor
     route_output: Tensor
-    sorted_expert_ids: Tensor
     gather_indices: Tensor
     scatter_indices: Tensor
     tasks: Tensor
@@ -309,7 +307,6 @@ class IQ2RGlm53Workspace:
     gate_tasks: Tensor
     gate_task_count: Tensor
     sort_scratch: Tensor
-    token_identity: Tensor
 
     @classmethod
     def allocate(
@@ -337,7 +334,6 @@ class IQ2RGlm53Workspace:
             route_output=torch.empty(
                 (routes, HIDDEN), dtype=torch.bfloat16, device=device
             ),
-            sorted_expert_ids=torch.empty((routes,), **i32),
             gather_indices=torch.empty((routes,), **i32),
             scatter_indices=torch.empty((routes,), **i32),
             tasks=torch.empty(
@@ -348,7 +344,6 @@ class IQ2RGlm53Workspace:
             gate_tasks=torch.empty((_task_capacity(decode_routes, 16), 3), **i32),
             gate_task_count=torch.empty((1,), **i32),
             sort_scratch=torch.empty(((routes + 255) // 256 * 512 + 1024,), **i32),
-            token_identity=torch.arange(max_tokens, **i32),
         )
 
 
@@ -398,7 +393,6 @@ def iq2r_glm53_moe_out(
         config = iq2r_glm53_config(tokens, workspace.intermediate_size)
     routes = tokens * TOPK
     ids = topk_ids.reshape(-1)
-    sorted_ids = workspace.sorted_expert_ids[:routes]
     gather = workspace.gather_indices[:routes]
     scatter = workspace.scatter_indices[:routes]
     tasks = workspace.tasks
@@ -412,10 +406,9 @@ def iq2r_glm53_moe_out(
     if tokens == 1:
         # Nine one-row tasks; each route gets its own copy of the quantized row.
         tasks = tasks[:routes]
-        iq2r_route_direct_gather_quant_out(
-            hidden_states, ids, sorted_ids, gather, scatter, tasks, count,
-            quant, quant_scales, topk=TOPK, expert_count=EXPERTS,
-        )  # fmt: skip
+        iq2r_glm53_m1_route_quant_out(
+            hidden_states, ids, scatter, tasks, count, quant, quant_scales
+        )
         iq2r_glm53_gate_m1_out(
             quant, quant_scales, gate_up_data, gate_up_auxiliary, tasks, count,
             intermediate, intermediate_scales,
@@ -426,8 +419,8 @@ def iq2r_glm53_moe_out(
         tasks = tasks[: _task_capacity(routes, 32)]
         gate_tasks = workspace.gate_tasks[: _task_capacity(routes, 16)]
         iq2r_glm53_sort_quant_out(
-            hidden_states, ids, sorted_ids, gather, scatter, tasks, count,
-            quant, quant_scales, gate_tasks, workspace.gate_task_count,
+            hidden_states, ids, gather, scatter, tasks, count, quant, quant_scales,
+            gate_tasks, workspace.gate_task_count,
         )  # fmt: skip
         iq2r_glm53_gate_out(
             quant, quant_scales, gate_up_data, gate_up_auxiliary, gate_tasks,
@@ -436,12 +429,9 @@ def iq2r_glm53_moe_out(
         )  # fmt: skip
     else:
         tasks = tasks[: _task_capacity(routes, 64)]
-        iq2r_glm53_sort_out(
-            ids, sorted_ids, gather, scatter, tasks, count, workspace.sort_scratch
-        )
-        iq2r_route_gather_quant_out(
-            hidden_states, workspace.token_identity[:tokens], quant, quant_scales,
-            topk=1,
+        iq2r_glm53_prefill_sort_quant_out(
+            hidden_states, ids, gather, scatter, tasks, count, quant, quant_scales,
+            workspace.sort_scratch,
         )  # fmt: skip
         iq2r_glm53_gate_out(
             quant, quant_scales, gate_up_data, gate_up_auxiliary, tasks, count,

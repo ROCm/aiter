@@ -20,6 +20,7 @@ from .iq2r_format import (
     IQ2R_TILE_N,
     IQ2R_VECTOR_SIZE,
     iq2r_packed_sizes,
+    iq2r_padded_k,
     iq2r_physical_n_blocks,
 )
 from .iq2r_reference import (
@@ -37,14 +38,8 @@ _IQ2_XXS_GRID_BYTES = base64.b64decode(
 )
 
 
-def _pad_k(values: Tensor, padded_k: int, value: float = 0.0) -> Tensor:
-    if values.shape[-1] > padded_k:
-        raise ValueError(f"cannot pad K={values.shape[-1]} to smaller K={padded_k}")
-    if values.shape[-1] == padded_k:
-        return values
-    return torch.nn.functional.pad(
-        values, (0, padded_k - values.shape[-1]), value=value
-    )
+def _pad_k(values: Tensor, padded_k: int) -> Tensor:
+    return torch.nn.functional.pad(values, (0, padded_k - values.shape[-1]))
 
 
 def iq2r_scale_blocks(values: Tensor) -> Tensor:
@@ -125,7 +120,7 @@ def iq2r_learn_codebook(
 
     if weight.ndim != 2 or importance.shape != (weight.shape[1],):
         raise ValueError("weight and importance must have shapes [N,K] and [K]")
-    padded_k = ((weight.shape[1] + IQ2R_TILE_K - 1) // IQ2R_TILE_K) * IQ2R_TILE_K
+    padded_k = iq2r_padded_k(weight.shape[1])
     padded_weight = _pad_k(weight.float(), padded_k)
     padded_importance = _pad_k(importance.float(), padded_k)
     fragments = iq2r_scale_blocks(padded_weight).reshape(-1, 4, IQ2R_VECTOR_SIZE)
@@ -178,15 +173,13 @@ def iq2r_encode_reference(
     if weight.ndim != 2:
         raise ValueError("weight must have shape [N,K]")
     n, k = weight.shape
-    if n % IQ2R_TILE_N or k % IQ2R_SCALE_BLOCK:
-        raise ValueError("IQ2R requires N%16==0 and K%32==0")
+    data_bytes, auxiliary_bytes = iq2r_packed_sizes(n, k)
     if importance.shape != (k,):
         raise ValueError(f"importance must have shape [{k}]")
     if not 0 <= exponent_radius <= 16:
         raise ValueError("exponent_radius must be in [0,16]")
     codebook = iq2r_reserve_zero_codeword(codebook).float()
-    data_bytes, auxiliary_bytes = iq2r_packed_sizes(n, k)
-    padded_k = ((k + IQ2R_TILE_K - 1) // IQ2R_TILE_K) * IQ2R_TILE_K
+    padded_k = iq2r_padded_k(k)
     padded_weight = _pad_k(weight.float(), padded_k)
     padded_importance = _pad_k(importance.float(), padded_k)
     fragments = iq2r_scale_blocks(padded_weight)

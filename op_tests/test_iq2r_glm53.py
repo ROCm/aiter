@@ -5,10 +5,12 @@
 
 from types import SimpleNamespace
 
+import pandas as pd
 import pytest
 import torch
 
 from aiter.iq2r_glm53 import (
+    IQ2RGlm53Config,
     IQ2RGlm53Workspace,
     _default_config,
     iq2r_glm53_config,
@@ -16,6 +18,8 @@ from aiter.iq2r_glm53 import (
     iq2r_glm53_pack,
     iq2r_glm53_slice_gate,
 )
+from aiter.jit.core import AITER_CONFIGS
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.ops.iq2r import iq2r_encode_device, iq2r_materialize_device
 from aiter.ops.iq2r_encoder import iq2r_initial_codebook
 from aiter.ops.iq2r_format import (
@@ -141,7 +145,7 @@ def _reference_moe(layer, hidden, topk_weights, topk_ids):
     return output.to(torch.bfloat16)
 
 
-@pytest.mark.parametrize("tokens", [1, 2, 4, 8, 64, 128, 256, 300, 2048, 3000])
+@pytest.mark.parametrize("tokens", [1, 2, 4, 8, 24, 64, 100, 128, 256, 2048, 3000])
 def test_glm53_moe_matches_reference(glm53_layer, tokens):
     layer = glm53_layer
     hidden, topk_weights, topk_ids = _routing(tokens, 0x5300 + tokens)
@@ -272,16 +276,19 @@ def _slice_rows(data, metadata, start, length):
 
 
 def test_glm53_tuned_config():
+    """Tuned rows are used as written; other token counts get the defaults."""
+    table = pd.read_csv(AITER_CONFIGS.AITER_CONFIG_IQ2R_GLM53_FILE)
+    rows = table[(table.gfx == get_gfx_runtime()) & (table.cu_num == get_cu_num())]
+    for row in rows.itertuples():
+        assert iq2r_glm53_config(row.token, row.inter_dim) == IQ2RGlm53Config(
+            row.gate_kernel,
+            row.gate_grid,
+            row.down_kernel,
+            row.down_grid,
+            row.down_chunks,
+        )
     for intermediate in (256, 512):
-        assert iq2r_glm53_config(1, intermediate).down_kernel == "route9"
-        assert iq2r_glm53_config(64, intermediate).gate_kernel == "nobarrier"
-        assert iq2r_glm53_config(1024, intermediate).down_kernel == "prefill"
-        assert iq2r_glm53_config(4096, intermediate).down_chunks == 2
-        # Untuned token counts fall back to the default heuristic.
-        assert iq2r_glm53_config(77, intermediate) == _default_config(77, intermediate)
-    assert iq2r_glm53_config(16, 512).down_kernel == "single"
-    assert iq2r_glm53_config(128, 256).down_kernel == "packed"
-    assert iq2r_glm53_config(256, 256).down_kernel == "ordered"
+        assert iq2r_glm53_config(77, intermediate) == _default_config(77)
 
 
 if __name__ == "__main__":

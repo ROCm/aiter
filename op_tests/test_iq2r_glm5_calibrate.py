@@ -15,7 +15,6 @@ from aiter.iq2r_glm5_calibrate import (
     load_texts,
     main,
     routed_target,
-    save_calibration,
     shared_target,
     token_batches,
 )
@@ -198,13 +197,10 @@ def test_target_specs_cover_routed_and_shared_experts_per_layer():
         (1, 6),
         (1, 2),
     ]
-    assert specs[2].metadata == {
-        "layer": 3,
-        "groups": "shared",
-        "routing_weighted": False,
-        "projection": "gate_up",
-    }
     assert len(specs) == 8
+    config.n_shared_experts = 2
+    with pytest.raises(ValueError, match="one shared expert"):
+        glm5_target_specs(config)
 
 
 def test_capture_matches_routed_and_shared_references():
@@ -269,7 +265,6 @@ def test_capture_matches_routed_and_shared_references():
     assert metadata["token_count"] == tokens
     assert metadata["forced_layer_input_tokens"] == 0
     assert metadata["forced_layer_experts"] == []
-    assert metadata["unobserved_target_groups"] == 0
 
 
 def test_capture_forces_dormant_experts_from_layer_inputs():
@@ -313,47 +308,7 @@ def test_capture_forces_dormant_experts_from_layer_inputs():
         assert shared["hit_count"].tolist() == [tokens]
 
 
-def test_artifact_loads_into_iq2r_compiler(tmp_path):
-    model = _tiny_model()
-    payload = capture_glm5_calibration(
-        model,
-        _CharTokenizer(),
-        _TEXTS,
-        sequence_length=32,
-        max_tokens=64,
-        device="cpu",
-    )
-    path = tmp_path / "calibration.pt"
-    save_calibration(payload, path)
-    assert [entry.name for entry in tmp_path.iterdir()] == ["calibration.pt"]
-
-    config = model.config
-    layout = GLM5Layout(
-        layer_count=config.num_hidden_layers,
-        first_moe_layer=config.first_k_dense_replace,
-        expert_count=config.num_local_experts,
-        hidden_size=config.hidden_size,
-        intermediate_size=config.moe_intermediate_size,
-        block_n=16,
-        block_k=16,
-        shared_expert_count=1,
-    )
-    loaded = load_glm5_importance(path, layout)
-    assert loaded.quality == "calibrated-o0"
-    assert loaded.gate_up.shape == (2, 8, 32)
-    assert loaded.down.shape == (2, 8, 16)
-    assert loaded.shared_gate_up.shape == (2, 32)
-    assert loaded.shared_down.shape == (2, 16)
-    targets = payload["targets"]
-    assert torch.equal(
-        loaded.gate_up[1], targets[routed_target(2, "gate_up")]["importance"]
-    )
-    assert torch.equal(
-        loaded.shared_down[0], targets[shared_target(1, "down")]["importance"][0]
-    )
-
-
-def test_cli_writes_artifact_from_saved_checkpoint(tmp_path):
+def test_cli_artifact_loads_into_iq2r_compiler(tmp_path):
     model = _tiny_model()
     tokenizers = pytest.importorskip("tokenizers")
     from transformers import PreTrainedTokenizerFast
@@ -396,14 +351,35 @@ def test_cli_writes_artifact_from_saved_checkpoint(tmp_path):
         )
         == 0
     )
+    # The atomic save leaves no temporary file behind.
+    assert [entry.name for entry in output.parent.iterdir()] == ["calibration.pt"]
     payload = torch.load(output, map_location="cpu", weights_only=True)
     assert payload["format"] == "iq2r-calibration"
     assert len(payload["targets"]) == 8
     metadata = payload["metadata"]
     assert metadata["token_count"] == 96
     assert metadata["model_type"] == "glm_moe_dsa"
-    assert metadata["model_shape"]["num_local_experts"] == 8
     assert len(metadata["model_config_sha256"]) == 64
+
+    config = model.config
+    layout = GLM5Layout(
+        layer_count=config.num_hidden_layers,
+        first_moe_layer=config.first_k_dense_replace,
+        expert_count=config.num_local_experts,
+        hidden_size=config.hidden_size,
+        intermediate_size=config.moe_intermediate_size,
+        block_n=16,
+        block_k=16,
+    )
+    loaded = load_glm5_importance(output, layout)
+    assert loaded.quality == "calibrated-o0"
+    targets = payload["targets"]
+    assert torch.equal(
+        loaded.gate_up[1], targets[routed_target(2, "gate_up")]["importance"]
+    )
+    assert torch.equal(
+        loaded.shared_down[0], targets[shared_target(1, "down")]["importance"][0]
+    )
 
 
 if __name__ == "__main__":

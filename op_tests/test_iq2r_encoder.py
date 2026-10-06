@@ -65,12 +65,12 @@ def test_reference_encode_decode_round_trip_and_physical_padding(n):
 
 
 def test_reference_encoder_preserves_zero_padded_k():
-    weight, importance = _inputs(n=16, k=2880)
+    weight, importance = _inputs(n=16, k=160)
     data, auxiliary = iq2r_encode_reference(weight, importance, iq2r_initial_codebook())
     padded = iq2r_materialize(
-        data.unsqueeze(0), auxiliary.unsqueeze(0), IQ2RMetadata(16, 2944)
+        data.unsqueeze(0), auxiliary.unsqueeze(0), IQ2RMetadata(16, 256)
     )
-    torch.testing.assert_close(padded[..., 2880:], torch.zeros_like(padded[..., 2880:]))
+    torch.testing.assert_close(padded[..., 160:], torch.zeros_like(padded[..., 160:]))
 
 
 if __name__ == "__main__":
