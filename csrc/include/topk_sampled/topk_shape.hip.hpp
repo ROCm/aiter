@@ -289,11 +289,11 @@ static float auto_margin(int K, int S, int N)
     return (float)std::min(std::max(m, 1.4), 3.0);
 }
 
-// Upper edge of the same 3-sigma window, in candidates.
-static inline double candidate_hi(int K, int S, int N, double margin)
+// Upper edge of the same window, in candidates: `sigmas` above the expected count.
+static inline double candidate_hi(int K, int S, int N, double margin, double sigmas = 3.0)
 {
     const double R = std::max(1.0, margin * (double)K * (double)S / (double)N);
-    return margin * (double)K * (1.0 + 3.0 / std::sqrt(R));
+    return margin * (double)K * (1.0 + sigmas / std::sqrt(R));
 }
 
 enum TopkPath : int
@@ -462,9 +462,24 @@ static inline int derive_sample_s_for_n(int M, int N, int K, float margin_unused
     return SAMPLE_S_MAX;
 }
 
-static inline int derive_cap(int K, float margin, int S, int N)
+// Room the cap keeps above the expected candidate count. A row that overflows
+// the cap takes phase_c's whole-row fallback, and at the window's three-sigma
+// edge that happened often: with the 4096 cap, M=1024 N=393216 overflowed 17-50
+// of 163840 rows (randn, uniform16, bf16, recency), and N=458752 ran 1.27x-1.74x
+// slower than with 8192. Where the 8192 cap is free -- one block per CU, so the
+// indices stay in LDS -- five sigma of room is taken: N=323584..475136 at
+// 33 <= M <= 256, and 80896..118784 plus 393216..475136 at M <= 32, where S
+// differs. With more blocks per CU an 8192 cap makes phase_c keys-only, 1-3%
+// slower at M=1024/4096 when nothing overflows, so there it takes 4.75 sigma,
+// N=337920..475136. Four sigma (from 389120) still left M=1024 overflowing in
+// 3-33% of calls at 340K-385K on bf16/recency rows, M=4096 in up to 75%; below
+// 338K it is at most 2 of 48 calls. N=262144 keeps 4096 either way (5.8 sigma).
+constexpr double CAP_ROOM_SIGMA           = 5.0;
+constexpr double CAP_ROOM_SIGMA_KEYS_ONLY = 4.75;
+
+static inline int derive_cap(int K, float margin, int S, int N, double room_sigma)
 {
-    const double hi = candidate_hi(K, S, N, margin);
+    const double hi = candidate_hi(K, S, N, margin, room_sigma);
     int cap         = PHASE_C_CAP;
     while(cap < (int)hi && cap < PHASE_C_CAP_MAX)
         cap *= 2;
@@ -723,7 +738,8 @@ static inline ShapeParams derive_shape_params(int M,
 #endif
     const int rank =
         std::max(1, (int)(eff_margin * FB_FORCE_RANK_SCALE * (double)K * (double)S / (double)N));
-    const int cap = derive_cap(K, margin, S, N);
+    const int cap = derive_cap(
+        K, margin, S, N, grid_blocks_per_cu(M) > 1 ? CAP_ROOM_SIGMA_KEYS_ONLY : CAP_ROOM_SIGMA);
 
     p.S      = S;
     p.margin = margin;
