@@ -327,6 +327,12 @@ TUNER_FAMILIES = {
         "timeout": 3600,
         "config_property": "AITER_CONFIG_FMOE_FILE",
     },
+    "mqa_logits": {
+        "script": "csrc/mqa_logits/mqa_logits_tune.py",
+        "csv_pattern": "tuned_mqa_logits",
+        "exclude_patterns": ["untuned"],
+        "config_property": "AITER_CONFIG_MQA_LOGITS_FILE",
+    },
     "gradlib_bf16": {
         "script": "gradlib/gradlib/gemm_tuner.py",
         "csv_pattern": "bf16_tuned_gemm",
@@ -345,12 +351,6 @@ TUNER_FAMILIES = {
         "exclude_patterns": ["untuned"],
         "timeout": 1800,
         "config_property": "AITER_CONFIG_GDN_K5_OPT_FILE",
-    },
-    "mqa_logits": {
-        "script": "csrc/mqa_logits/mqa_logits_tune.py",
-        "csv_pattern": "tuned_mqa_logits",
-        "exclude_patterns": ["untuned"],
-        "config_property": "AITER_CONFIG_MQA_LOGITS_FILE",
     },
 }
 
@@ -450,6 +450,9 @@ class TestRunConfig(unittest.TestCase):
     def test_fmoe(self):
         self._test_family("fmoe")
 
+    def test_mqa_logits(self):
+        self._test_family("mqa_logits")
+
     def test_gradlib_bf16(self):
         self._test_family("gradlib_bf16")
 
@@ -458,9 +461,6 @@ class TestRunConfig(unittest.TestCase):
 
     def test_gdn_k5_opt(self):
         self._test_family("gdn_k5_opt")
-
-    def test_mqa_logits(self):
-        self._test_family("mqa_logits")
 
 
 @unittest.skipUnless(_gpu_available(), "No GPU available")

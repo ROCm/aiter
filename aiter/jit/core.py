@@ -225,6 +225,11 @@ AITER_CONFIG_CONV3D_BF16 = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_conv3d.csv",
 )
 
+AITER_CONFIG_MQA_LOGITS = os.getenv(
+    "AITER_CONFIG_MQA_LOGITS",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_mqa_logits.csv",
+)
+
 # K5 opt BV tuned config. Per-model tuned rows live under model_configs/
 # (qwen3_5_*_chunk_gdn_h_opt_tuned.csv) and get merged into this canonical file by
 # get_config_file. It ships header-only: with no per-model table present
@@ -238,11 +243,6 @@ AITER_CONFIG_GDN_K5_OPT = os.getenv(
 AITER_CONFIG_DISPATCH_COMBINE_INTRANODE = os.getenv(
     "AITER_CONFIG_DISPATCH_COMBINE_INTRANODE",
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_dispatch_combine_intranode.csv",
-)
-
-AITER_CONFIG_MQA_LOGITS = os.getenv(
-    "AITER_CONFIG_MQA_LOGITS",
-    f"{AITER_ROOT_DIR}/aiter/configs/tuned_mqa_logits.csv",
 )
 
 
@@ -398,6 +398,14 @@ class AITER_CONFIG:
         )
 
     @property
+    def AITER_CONFIG_MQA_LOGITS_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_MQA_LOGITS",
+            AITER_CONFIG_MQA_LOGITS,
+            "tuned_mqa_logits",
+        )
+
+    @property
     def AITER_CONFIG_GDN_K5_OPT_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_GDN_K5_OPT",
@@ -411,14 +419,6 @@ class AITER_CONFIG:
             "AITER_CONFIG_DISPATCH_COMBINE_INTRANODE",
             AITER_CONFIG_DISPATCH_COMBINE_INTRANODE,
             "tuned_dispatch_combine_intranode",
-        )
-
-    @property
-    def AITER_CONFIG_MQA_LOGITS_FILE(self):
-        return self.get_config_file(
-            "AITER_CONFIG_MQA_LOGITS",
-            AITER_CONFIG_MQA_LOGITS,
-            "tuned_mqa_logits",
         )
 
     @property
