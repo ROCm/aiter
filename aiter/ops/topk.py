@@ -631,10 +631,11 @@ def _sampled_supports_cached(numRows: int, stride0: int, k: int) -> bool:
     shapes in reports/odd_n_ab.tsv -- a constant ~5 us offset that did not grow
     with the work, which is what host overhead looks like.
 
-    Safe to cache: topk_sampled_supports is a pure function of these three ints.
-    It computes sampled::params_for -> derive_shape_params, which reads no device
-    state (CU_COUNT is a constexpr in topk_shape.hip.hpp, and there is no
-    hipGetDeviceProperties anywhere in that header).
+    Safe to cache: past the target check, topk_sampled_supports is a pure function
+    of these three ints. It computes sampled::params_for -> derive_shape_params,
+    which reads no device state (CU_COUNT is a constexpr in topk_shape.hip.hpp).
+    The target check reads the GPU architecture once per process and declines
+    everything off gfx950.
     """
     return bool(topk_sampled_supports(numRows, stride0, k))
 

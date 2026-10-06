@@ -29,7 +29,16 @@
 
 #include "opus/opus.hpp"
 
-constexpr int WAVE_SIZE    = opus::get_warp_size();
+constexpr int WAVE_SIZE = opus::get_warp_size();
+// The kernels are wave64 code tuned for gfx950, and their launch plan assumes
+// its 256 CUs and 160 KiB of LDS (topk_shape.hip.hpp). A device pass for any
+// other target compiles each kernel to a trap so the module that carries them
+// still builds there; topk_sampled_supports() keeps them from being launched.
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx950__)
+#define TOPK_SAMPLED_DEVICE 0
+#else
+#define TOPK_SAMPLED_DEVICE 1
+#endif
 constexpr int FP32_EPT     = 4; // floats per dwordx4 load
 constexpr int RADIX_PASSES = 4; // 4 x 8-bit covers all 32 sortable bits
 
@@ -612,7 +621,8 @@ constexpr int WIDE_COARSE       = 64;
 constexpr int WIDE_FINE         = 1 << WIDE_BITS;
 constexpr int WIDE_COARSE_SLOTS = WIDE_COARSE * HIST_REP;
 constexpr int WIDE_WORDS        = WIDE_COARSE_SLOTS + WIDE_FINE;
-static_assert(WIDE_COARSE == WAVE_SIZE && WIDE_FINE == WIDE_COARSE * WAVE_SIZE,
+static_assert(!TOPK_SAMPLED_DEVICE ||
+                  (WIDE_COARSE == WAVE_SIZE && WIDE_FINE == WIDE_COARSE * WAVE_SIZE),
               "the two-level scan puts one bucket per lane at each level");
 
 __host__ __device__ static inline constexpr int wide_buffer_count(int nwide, bool reuse)

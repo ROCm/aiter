@@ -28,6 +28,7 @@ __global__ void phase_small_n_topk(const float* __restrict__ input,
                                    TopkOut<WRITE_VALUES> dst,
                                    int npasses)
 {
+#if TOPK_SAMPLED_DEVICE
     const int row       = blockIdx.x;
     const int row_start = RAGGED ? extents.row_start(row, pitch) : 0;
     int len;
@@ -105,6 +106,9 @@ __global__ void phase_small_n_topk(const float* __restrict__ input,
         __syncthreads();
         pad_topk_tail<WRITE_VALUES>(out, val, k_out, K);
     }
+#else
+    __builtin_trap();
+#endif
 }
 
 template <bool RAGGED, bool NT, bool NT_STORE = NT, int PB_B = 0>
@@ -119,6 +123,7 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
                                     unsigned int* __restrict__ cand_bad,
                                     int cap)
 {
+#if TOPK_SAMPLED_DEVICE
     const int row     = blockIdx.y;
     const int len     = row_len_of<RAGGED>(row, pitch, extents);
     const float* ri   = input + (size_t)row * pitch + (RAGGED ? extents.row_start(row, pitch) : 0);
@@ -434,6 +439,9 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
             }
         }
     }
+#else
+    __builtin_trap();
+#endif
 }
 
 template <bool RAGGED, bool WRITE_VALUES, bool REUSE_WIDE = false>
@@ -455,6 +463,7 @@ phase_c_select_contig(const float* __restrict__ input,
                       int nwide,
                       const uint32_t* __restrict__ threshold)
 {
+#if TOPK_SAMPLED_DEVICE
     const int row       = blockIdx.x;
     const int row_start = RAGGED ? extents.row_start(row, pitch) : 0;
     const int len       = row_len_of<RAGGED>(row, pitch, extents);
@@ -700,4 +709,7 @@ phase_c_select_contig(const float* __restrict__ input,
         __syncthreads();
         pad_topk_tail<WRITE_VALUES>(out, val, k_out, K);
     }
+#else
+    __builtin_trap();
+#endif
 }

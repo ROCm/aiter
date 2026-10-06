@@ -1028,6 +1028,7 @@ __global__ __launch_bounds__(1024) PHASE_A_OCCUPANCY
                            int K,
                            int nwide)
 {
+#if TOPK_SAMPLED_DEVICE
     const int row   = blockIdx.x;
     const int len   = row_len_of<RAGGED>(row, pitch, extents);
     const float* ri = input + (size_t)row * pitch + (RAGGED ? extents.row_start(row, pitch) : 0);
@@ -1221,6 +1222,9 @@ __global__ __launch_bounds__(1024) PHASE_A_OCCUPANCY
         threshold[row]   = pivot;
         threshold_f[row] = sortable_to_fp32(pivot);
     }
+#else
+    __builtin_trap();
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -1669,10 +1673,18 @@ int64_t topk_sampled_workspace_size(int64_t numRows, int64_t stride0, int64_t k)
 
 // Reports whether this op can serve the shape at all, so Python can route
 // around it instead of taking an AITER_CHECK abort. Kept in C++ because every
-// term it tests (LDS residency, dwordx4 geometry, the Phase C LDS cap) is a
-// property of these kernels, not of the caller.
+// term it tests (the target, LDS residency, dwordx4 geometry, the Phase C LDS
+// cap) is a property of these kernels, not of the caller.
 bool topk_sampled_supports(int64_t numRows, int64_t stride0, int64_t k)
 {
+    // gfx950 only: elsewhere the kernels are traps (TOPK_SAMPLED_DEVICE), and
+    // the launch plan's LDS would not fit -- at N=262144 k=2048 phase_c asks
+    // for 100,352 B of dynamic LDS at M=1 and 67,584 B at M=64, against
+    // gfx942's 65,536 B. Read once per process: the device query costs far more
+    // than the rest of this test, which the entry repeats on every call.
+    static const bool arch_ok = get_gpu_arch() == "gfx950";
+    if(!arch_ok)
+        return false;
     if(numRows <= 0 || stride0 <= 0 || k <= 0)
         return false;
     if(k > PHASE_C_CAP_MAX)
@@ -1787,6 +1799,7 @@ void top_k_per_row_prefill_sampled(
             else
                 topk_small_n<false, false>(in, M, N, row_starts, row_ends, K, idx, nullptr, stream);
         }
+        HIP_CALL_LAUNCH(hipGetLastError());
         return;
     }
 
@@ -1814,4 +1827,7 @@ void top_k_per_row_prefill_sampled(
             topk_fused_impl<false, false>(
                 in, M, N, row_starts, row_ends, K, idx, nullptr, b, lp, stream);
     }
+    // A refused launch (too much LDS, a bad grid) is otherwise silent: the
+    // `<<<>>>` launches only record it, and the output keeps whatever it held.
+    HIP_CALL_LAUNCH(hipGetLastError());
 }
