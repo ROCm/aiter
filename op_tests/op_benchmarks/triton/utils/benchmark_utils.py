@@ -320,7 +320,7 @@ def parse_vgpr_usage(file_path, table_start="result-table-name"):
     # Print extracted information
     print("\n".join(vgpr_info))
     table = PrettyTable()
-    table.field_names = re.split(r" {1,}", table_lines[0].strip())
+    table.field_names = re.split(r" {2,}", table_lines[0].strip())
     [table.add_row(line.split()[1:]) for line in table_lines[1:]]
 
     print(table)

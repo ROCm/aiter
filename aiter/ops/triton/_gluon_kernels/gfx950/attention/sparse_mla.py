@@ -47,6 +47,7 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.language.core import PropagateNan
 from triton.language.core import _aggregate as aggregate
+from triton.language.target_info import is_hip_cdna4
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
@@ -2276,14 +2277,18 @@ def _sparse_mla(
     )
     # Staged walks on 16x16x32: per-tensor fp8, and bf16 with the rope inside.
     # Rope-appended rows with sentinels keep 16x16x16 up to 16 heads (register-bound).
-    STAGED_K32: gl.constexpr = (
-        MAIN_FMT == "fp8_scalar"
-        and ((not HAS_EXTRA) or EXTRA_FMT == "fp8_scalar")
-        and not (ROPE_SEPARATE and HAS_INVALID and BLOCK_M <= 16)
-    ) or (
-        MAIN_FMT == "bf16"
-        and not ROPE_SEPARATE
-        and ((not HAS_EXTRA) or EXTRA_FMT == "bf16")
+    # bf16 16x16x32 is gfx950's; gfx942 tops out at 16x16x16.
+    STAGED_K32: gl.constexpr = is_hip_cdna4() and (
+        (
+            MAIN_FMT == "fp8_scalar"
+            and ((not HAS_EXTRA) or EXTRA_FMT == "fp8_scalar")
+            and not (ROPE_SEPARATE and HAS_INVALID and BLOCK_M <= 16)
+        )
+        or (
+            MAIN_FMT == "bf16"
+            and not ROPE_SEPARATE
+            and ((not HAS_EXTRA) or EXTRA_FMT == "bf16")
+        )
     )
     gl.static_assert(
         UNI_TILE or (MAIN_FMT != "fp8_scalar" and MAIN_FMT != "fp8_dsv32_mla"),
