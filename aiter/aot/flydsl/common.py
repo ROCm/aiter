@@ -35,6 +35,7 @@ class OpKind(enum.Enum):
     CONV = "conv"
     GROUPED_MOE = "grouped_moe"
     CHUNK_GDN_H = "chunk_gdn_h"
+    UNIFIED_ATTENTION = "unified_attention"
     MEGA_MOE = "mega_moe"
     FMHA_FP8 = "fmha_fp8"
 
@@ -134,17 +135,18 @@ def override_env(var_name: str, value: str | None) -> Iterator[None]:
 
 
 def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
-    """Load DEFAULT_CSVS + parse_csv for the named kind and return its
-    job list. Note: importing .gemm / .moe / .chunk_gdn_h here also
-    runs their module-level imports, which pull in FlyDSL (e.g.
-    ``flydsl.expr``). Job collection is therefore not free in the
-    parent process, just shifted once out of every child."""
+    """Collect fixed jobs or parse the configured CSVs for the selected family.
+    Family imports may load FlyDSL in the parent process."""
     if kind is OpKind.MEGA_MOE:
         from .mega_moe import default_jobs
 
         return default_jobs()
     if kind is OpKind.FMHA_FP8:
         from .fmha_fp8 import default_jobs
+
+        return default_jobs()
+    if kind is OpKind.UNIFIED_ATTENTION:
+        from .unified_attention import default_jobs
 
         return default_jobs()
     if kind is OpKind.MOE:
@@ -181,6 +183,8 @@ def _compile_one_config_for(kind: OpKind) -> Callable[..., dict[str, Any]]:
         from .grouped_moe import compile_one_config
     elif kind is OpKind.CHUNK_GDN_H:
         from .chunk_gdn_h import compile_one_config
+    elif kind is OpKind.UNIFIED_ATTENTION:
+        from .unified_attention import compile_one_config
     else:
         raise ValueError(f"unknown FlyDSL AOT kind: {kind!r}")
     return compile_one_config

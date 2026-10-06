@@ -4,7 +4,8 @@
 """FP8 paged-attention tile kernel.
 
 K/V use e4m3 (FNUZ on gfx942, OCP on gfx950); BF16/FP16 Q and probabilities P
-are quantized to FP8. Q/key scales fold into QK, value scale and 1/FP8_MAX into
+are quantized to FP8. Prequantized Q bypasses normalization and folds its
+per-tensor descale into QK. Q/key scales fold into QK, value scale and 1/FP8_MAX into
 the epilogue; softmax max/sum stay f32. Tuned gfx950 BF16 per-token MTP3/MTP4
 uses K128 MFMA instead of K32, preserving normalized Q/P and operand layouts.
 Tuned gfx950 BF16 scalar decode casts Q/P directly, without normalization or
@@ -13,13 +14,13 @@ Per-token scales retain range normalization.
 
 Logical layouts (not preshuffled):
 
-* ``query``        [num_seqs, num_q_heads, head_dim]  f16/bf16 (head_dim contiguous)
+* ``query``        [num_seqs, num_q_heads, head_dim]  f16/bf16/fp8 (head_dim contiguous)
 * ``key_cache``    [num_blocks, num_kv_heads, head_dim//16, block_size, 16]  fp8
 * ``value_cache``  [num_blocks, num_kv_heads, block_size//16, head_dim, 16] (trans_v)
                    or [num_blocks, num_kv_heads, head_dim, block_size] (plain), by rank
 * ``block_tables`` [num_seqs, max_blocks_per_seq]  int32
 * ``context_lengths`` [num_seqs]  int32
-* ``output``       [num_seqs, num_q_heads, head_dim]  same dtype as query
+* ``output``       [num_seqs, num_q_heads, head_dim]  f16/bf16 (same as 16-bit Q)
 * K/V scales      [1] per-tensor or [num_blocks, num_kv_heads, block_size] per-token
 
 Four-wave CTAs process 256-token blocks: QK splits tokens, PV splits head dim,
@@ -72,6 +73,7 @@ def compile_pa_decode_tile(
     sliding_window: int = 0,
     use_sinks: bool = False,
     sink_dtype_str: str = "f32",
+    output_dtype: str | None = None,
 ):
     """Select and cache a PA-decode kernel and launch wrapper.
 
@@ -101,6 +103,8 @@ def compile_pa_decode_tile(
     if sliding_window > 0 and not use_work_plan:
         raise ValueError("positive sliding_window requires work_plan")
     is_gfx950 = "gfx95" in get_rocm_arch()
+    FP8_QUERY = query_dtype == "fp8"
+    output_dtype = query_dtype if output_dtype is None else output_dtype
     IS_BF16 = query_dtype == "bf16"
     TUNED_SHAPE = is_gfx950 and head_dim == 128 and block_size in (16, 128)
     TUNED_PER_TOKEN = TUNED_SHAPE and IS_BF16 and per_token_kv
@@ -203,6 +207,7 @@ def compile_pa_decode_tile(
         sliding_window,
         use_sinks,
         sink_dtype_str,
+        output_dtype,
     )
     cached = _PA_DECODE_TILE_CACHE.get(cache_key)
     if cached is not None:
@@ -233,8 +238,11 @@ def compile_pa_decode_tile(
     assert query_dtype in (
         "f16",
         "bf16",
-    ), f"pa_decode_tile only supports query_dtype in ('f16', 'bf16'), got {query_dtype}"
-    Q_DTYPE = fx.BFloat16 if IS_BF16 else fx.Float16
+        "fp8",
+    ), f"pa_decode_tile only supports query_dtype in ('f16', 'bf16', 'fp8'), got {query_dtype}"
+    assert output_dtype in ("bf16", "f16")
+    Q_DTYPE = fx.BFloat16 if output_dtype == "bf16" else fx.Float16
+    Q_INPUT_DTYPE = FP8 if FP8_QUERY else Q_DTYPE
 
     assert (
         head_dim % 64 == 0
@@ -355,7 +363,7 @@ def compile_pa_decode_tile(
     SP_ROW_BYTES = TILE_TOK + 16
     sP_bytes = P_BUFFERS * MFMA_MNK * SP_ROW_BYTES  # fp8, padded rows
     sQscale_off = max(sQ_bytes, sP_bytes)
-    sQscale_bytes = 0 if SCALAR_FP8_DECODE else ROWS_PADDED * f32
+    sQscale_bytes = 0 if SCALAR_FP8_DECODE or FP8_QUERY else ROWS_PADDED * f32
     # Tuned rows need 16-byte vector alignment; other paths use bank padding.
     NWARP_PAD = NWARP if TUNE_PAGE128 or PER_TOKEN_M1 or MTP4_FUSED else NWARP + 1
     # Phase-split slices sLmax per M-tile so all pass-1 writes share one barrier.
@@ -407,6 +415,7 @@ def compile_pa_decode_tile(
         planned_start: fx.Int32,
         planned_end: fx.Int32,
         planned_context: fx.Int32,
+        query_scale_ptr: fx.Pointer if FP8_QUERY else fx.Constexpr = 0,
     ):
         tid = fx.Int32(gpu.thread_id("x"))
         warp = tid // WAVE  # 0..NWARP-1
@@ -491,10 +500,16 @@ def compile_pa_decode_tile(
         _q_copy_op = (
             fx.rocdl.BufferCopy128b() if QLOAD_UNIT == 8 else fx.rocdl.BufferCopy64b()
         )
-        q_buf = ptr_buf_tensor(query_ptr, Q_DTYPE)
+        if const_expr(FP8_QUERY):
+            _q_copy_op = (
+                fx.rocdl.BufferCopy64b()
+                if QLOAD_UNIT == 8
+                else fx.rocdl.BufferCopy32b()
+            )
+        q_buf = ptr_buf_tensor(query_ptr, Q_INPUT_DTYPE)
         q_tiled = fx.logical_divide(q_buf, fx.make_layout(1, 1))
-        q_copy_atom = fx.make_copy_atom(_q_copy_op, Q_DTYPE)
-        q_reg = fx.make_rmem_tensor(fx.make_layout(QLOAD_UNIT, 1), Q_DTYPE)
+        q_copy_atom = fx.make_copy_atom(_q_copy_op, Q_INPUT_DTYPE)
+        q_reg = fx.make_rmem_tensor(fx.make_layout(QLOAD_UNIT, 1), Q_INPUT_DTYPE)
 
         def _q_load_chunk(elem_idx):
             fx.copy(q_copy_atom, fx.slice(q_tiled, (None, elem_idx)), q_reg)
@@ -836,6 +851,9 @@ def compile_pa_decode_tile(
         else:
             scale_qk = fx.Float32(softmax_scale * LOG2E) * fx.Float32(key_scale)
             v_scale_f = fx.Float32(value_scale)
+        if const_expr(FP8_QUERY):
+            query_descale = fx.ptr_load(fx.recast_iter(fx.Float32, query_scale_ptr))
+            scale_qk = scale_qk * query_descale
         NEG_INF = fx.Float32(float("-inf"))
         ZERO_F = fx.Float32(0.0)
         # Finite or -inf scores permit nnan's bare max instructions.
@@ -889,7 +907,17 @@ def compile_pa_decode_tile(
 
         # M-tiles quantize disjoint rows, requiring no inter-tile barrier.
         def _quant_q_row(m, q_row_off, q_units):
-            if const_expr(SCALAR_FP8_DECODE):
+            if const_expr(FP8_QUERY):
+                # Preserve the caller's FP8 bytes; no row-wise requantization.
+                for u in range_constexpr(N_QLOADS):
+                    _st_words(
+                        q_row_off
+                        + qh_local * head_dim
+                        + lane16 * QCHUNK
+                        + u * QLOAD_UNIT,
+                        q_units[u].bitcast(fx.Int32),
+                    )
+            elif const_expr(SCALAR_FP8_DECODE):
                 for u in range_constexpr(N_QLOADS):
                     _st_words(
                         q_row_off
@@ -947,7 +975,7 @@ def compile_pa_decode_tile(
                     q_row_off + qh_local * head_dim + lane16 * QCHUNK,
                     fx.Vector.filled(QCHUNK // 4, 0, fx.Int32),
                 )
-                if const_expr(not SCALAR_FP8_DECODE) and lane16 == 0:
+                if const_expr(not SCALAR_FP8_DECODE and not FP8_QUERY) and lane16 == 0:
                     _st1(sQscale_off, qh_local * M_TILES + m, ZERO_F)
 
         gpu.barrier()
@@ -1136,7 +1164,7 @@ def compile_pa_decode_tile(
                 ]
 
             q_scale_vec = None
-            if const_expr(M_TILES > 1):
+            if const_expr(M_TILES > 1 and not FP8_QUERY):
                 q_scale_vec = _lds_load(
                     sQscale_off + lane16 * (M_TILES * f32), fx.Float32, M_TILES
                 )
@@ -1183,7 +1211,11 @@ def compile_pa_decode_tile(
                         )
                         frag_Ss.append(fx.Vector(acc))
 
-                    scale = scale_qk * fx.Float32(q_scale_vec[m])
+                    scale = (
+                        scale_qk
+                        if const_expr(FP8_QUERY)
+                        else scale_qk * fx.Float32(q_scale_vec[m])
+                    )
                     n_valid_tile = (tile_valid - causal_offset[m]).to(fx.Float32)
                     base_tok_f = fx.Int32(warp * TOK_PER_WARP + rgroup * 4).to(
                         fx.Float32
@@ -1619,7 +1651,7 @@ def compile_pa_decode_tile(
                     ]
                 scale = (
                     scale_qk
-                    if const_expr(SCALAR_FP8_DECODE)
+                    if const_expr(SCALAR_FP8_DECODE or FP8_QUERY)
                     else scale_qk * _ld1(sQscale_off, lane16)
                 )  # per-qhead positive score scale
                 n_valid_tile = (tile_valid - causal_offset[0]).to(fx.Float32)
@@ -1957,6 +1989,7 @@ def compile_pa_decode_tile(
         stride_q_head: fx.Int32,
         work_info_ptr: fx.Pointer,
         num_sequences: fx.Int32,
+        query_scale_ptr: fx.Pointer if FP8_QUERY else fx.Constexpr = 0,
     ):
         def _run_task(seq, start, end, context):
             _pa_decode_tile_task(
@@ -1984,6 +2017,7 @@ def compile_pa_decode_tile(
                 start,
                 end,
                 context,
+                query_scale_ptr,
             )
 
         if const_expr(use_work_plan):
@@ -2074,8 +2108,76 @@ def compile_pa_decode_tile(
                 stream=stream,
             )
 
+    # Separate launch ABI keeps the 16-bit path free of a descale argument.
+    @flyc.jit
+    def pa_decode_tile_fp8_launch(
+        output: fx.Pointer,
+        pmax: fx.Pointer,
+        psum: fx.Pointer,
+        pout: fx.Pointer,
+        query: fx.Pointer,
+        key_cache: fx.Pointer,
+        value_cache: fx.Pointer,
+        block_tables: fx.Pointer,
+        context_lengths: fx.Pointer,
+        key_scale: fx.Pointer,
+        value_scale: fx.Pointer,
+        sinks: fx.Pointer,
+        max_blocks_per_seq: fx.Int32,
+        num_seqs: fx.Int32,
+        num_kv_heads: fx.Int32,
+        stride_ks_block: fx.Int32,
+        stride_ks_head: fx.Int32,
+        stride_o_row: fx.Int32,
+        stride_o_head: fx.Int32,
+        stride_q_row: fx.Int32,
+        stride_q_head: fx.Int32,
+        work_info: fx.Pointer,
+        work_capacity: fx.Int32,
+        query_scale: fx.Pointer,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
+        # Ambient contract permits FMAs; explicit per-op fastmath still wins.
+        with CompilationContext.compile_hints({"fastmath": "contract"}):
+            pa_decode_tile_kernel(
+                output,
+                pmax,
+                psum,
+                pout,
+                query,
+                key_cache,
+                value_cache,
+                block_tables,
+                context_lengths,
+                key_scale,
+                value_scale,
+                sinks,
+                max_blocks_per_seq,
+                stride_ks_block,
+                stride_ks_head,
+                stride_o_row,
+                stride_o_head,
+                stride_q_row,
+                stride_q_head,
+                work_info,
+                num_seqs,
+                query_scale,
+            ).launch(
+                grid=(
+                    (num_seqs, num_kv_heads * query_splits, work_capacity // num_seqs)
+                    if batch_first_plan_grid
+                    else (
+                        work_capacity if use_work_plan else num_seqs,
+                        num_kv_heads * query_splits,
+                        1 if use_work_plan else NP,
+                    )
+                ),
+                block=(BLOCK_THREADS, 1, 1),
+                stream=stream,
+            )
+
     compiled = {
-        "launch": pa_decode_tile_launch,
+        "launch": pa_decode_tile_fp8_launch if FP8_QUERY else pa_decode_tile_launch,
         "kernel": pa_decode_tile_kernel,
     }
     return _PA_DECODE_TILE_CACHE.setdefault(cache_key, compiled)

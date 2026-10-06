@@ -52,6 +52,11 @@ def build_flash_attn_dualwave_swp_fp8_module(
     block_m=256,
     batch_interleave_group=1,
     return_lse=False,
+    paged=False,
+    kv_cache_layout="linear",
+    out_dtype="bf16",
+    body_variant="default",
+    gqa_pack_m=False,
 ):
     """Build the gfx950 dual-wave fp8 launcher (dense, packed varlen, or split-K)."""
     gpu_arch = get_hip_arch()
@@ -62,6 +67,11 @@ def build_flash_attn_dualwave_swp_fp8_module(
         )
     if head_dim_v is None:
         head_dim_v = head_dim
+    if paged and int(num_kv_splits) > 1:
+        raise NotImplementedError("paged split-K is not supported")
+    if out_dtype == "f16" and int(num_kv_splits) > 1:
+        # The split-K combine packs and decodes bf16 partials.
+        raise NotImplementedError("f16 output with split-K is not built yet")
 
     if num_kv_heads is None:
         num_kv_heads = num_heads
@@ -87,6 +97,11 @@ def build_flash_attn_dualwave_swp_fp8_module(
         cross_seqlen=cross_seqlen,
         batch_interleave_group=batch_interleave_group,
         return_lse=return_lse,
+        paged=paged,
+        kv_cache_layout=kv_cache_layout,
+        out_dtype=out_dtype,
+        body_variant=body_variant,
+        gqa_pack_m=gqa_pack_m,
     )
     # Builder-level aliases used by SharedStorage and the launch/compile wrappers.
     SPLITK = traits.SPLITK
@@ -105,53 +120,24 @@ def build_flash_attn_dualwave_swp_fp8_module(
     # fx.Array rejects a length of 0.
     _q_lds_elems = BLOCK_M * HEAD_DIM if traits.QLDS else 16
 
-    @fx.struct
-    class SharedStorage:
-        kv: fx.Array[_lds_elem_dtype, traits.LDS_KV_TOTAL_SIZE, 16]
-        vt: fx.Array[fx.BFloat16, traits.VT_BF16_TOTAL, 16]
-        q: fx.Array[_lds_elem_dtype, _q_lds_elems, 16]
+    if traits.PAGED:
 
-    # BN128: two BLOCK_N=64 KV tiles per iteration, one merged softmax correction.
-    @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
-    def flash_attn_dualwave_swp_fp8_bn128_kernel(
-        Q: fx.Tensor,
-        K: fx.Tensor,
-        V: fx.Tensor,
-        O: fx.Tensor,
-        Workspace: fx.Tensor,
-        CuSeqQ: fx.Tensor,
-        CuSeqKv: fx.Tensor,
-        QDescale: fx.Tensor,
-        KDescale: fx.Tensor,
-        VDescale: fx.Tensor,
-        LSE: fx.Tensor,
-        seq_len: fx.Int32,
-        seq_len_kv: fx.Int32,
-        stride_q_n: fx.Int32,
-        stride_kv_n: fx.Int32,
-        softmax_scale: fx.Float32,
-        lse_stride_h: fx.Int32,
-    ):
-        ctx = DualwaveFp8KernelContext(
-            traits,
-            Q,
-            K,
-            V,
-            O,
-            Workspace,
-            CuSeqQ,
-            CuSeqKv,
-            QDescale,
-            KDescale,
-            VDescale,
-            LSE,
-            seq_len,
-            seq_len_kv,
-            stride_q_n,
-            stride_kv_n,
-            softmax_scale,
-            lse_stride_h,
-        )
+        @fx.struct
+        class SharedStorage:
+            kv: fx.Array[_lds_elem_dtype, traits.LDS_KV_TOTAL_SIZE, 16]
+            vt: fx.Array[fx.BFloat16, traits.VT_BF16_TOTAL, 16]
+            q: fx.Array[_lds_elem_dtype, _q_lds_elems, 16]
+            bt: fx.Array[fx.Int32, traits.PAGED_BT_LDS_SIZE, 16]
+
+    else:
+
+        @fx.struct
+        class SharedStorage:
+            kv: fx.Array[_lds_elem_dtype, traits.LDS_KV_TOTAL_SIZE, 16]
+            vt: fx.Array[fx.BFloat16, traits.VT_BF16_TOTAL, 16]
+            q: fx.Array[_lds_elem_dtype, _q_lds_elems, 16]
+
+    def _init_fwd_helpers(ctx):
         ctx.init_types_and_constants()
         ctx.init_runtime_indices()
         ctx.init_lds(SharedStorage)
@@ -164,14 +150,28 @@ def build_flash_attn_dualwave_swp_fp8_module(
         ctx.init_dma_thread_offsets()
         ctx.init_descale()
         ctx.init_tile_bounds()
-        ctx.init_workspace_io()
+        if const_expr(traits.BODY_VARIANT == "default"):
+            ctx.init_workspace_io()
 
-        q_loader = DualwaveFp8QLoader(ctx)
-        gemm_helper = DualwaveFp8GemmHelper(ctx)
-        softmax_helper = DualwaveFp8SoftmaxHelper(ctx)
-        kv_gmem_to_lds = DualwaveFp8KvGmemToLdsLoader(ctx)
-        kv_lds_to_regs = DualwaveFp8KvLdsToVgprLoader(ctx)
-        output_store = DualwaveFp8StoreHelper(ctx)
+        return (
+            DualwaveFp8QLoader(ctx),
+            DualwaveFp8GemmHelper(ctx),
+            DualwaveFp8SoftmaxHelper(ctx),
+            DualwaveFp8KvGmemToLdsLoader(ctx),
+            DualwaveFp8KvLdsToVgprLoader(ctx),
+            DualwaveFp8StoreHelper(ctx),
+        )
+
+    @flyc.jit
+    def _fwd_body(ctx):
+        (
+            q_loader,
+            gemm_helper,
+            softmax_helper,
+            kv_gmem_to_lds,
+            kv_lds_to_regs,
+            output_store,
+        ) = _init_fwd_helpers(ctx)
 
         BN = traits.BLOCK_N
         D_CHUNKS = traits.D_CHUNKS
@@ -236,7 +236,18 @@ def build_flash_attn_dualwave_swp_fp8_module(
         else:
             q_row, q_wide = None, None
 
-        kv_gmem_to_lds.load_k(t0 * BN, t0 % fx.Index(NPF))
+        pages = [None] * 4
+        if const_expr(traits.PAGED):
+            kv_gmem_to_lds.load_block_table_to_lds()
+            rocdl.s_waitcnt(0)
+            rocdl.s_barrier()
+            pages = kv_gmem_to_lds.end_page_ids(
+                kv_gmem_to_lds.begin_page_ids(
+                    [fx.Index(t0) + i for i in range_constexpr(4)]
+                )
+            )
+
+        kv_gmem_to_lds.load_k(t0 * BN, t0 % fx.Index(NPF), pages[0])
         if const_expr(traits.QLDS):
             q_loader.stage_q_to_lds()
             rocdl.s_waitcnt(0)
@@ -244,13 +255,13 @@ def build_flash_attn_dualwave_swp_fp8_module(
             rocdl.s_barrier()
             q_row, q_wide = _load_q_regs()
 
-        kv_gmem_to_lds.load_k((t0 + 1) * BN, (t0 + 1) % fx.Index(NPF))
-        kv_gmem_to_lds.load_v(t0 * BN, t0 % fx.Index(NPF))
-        kv_gmem_to_lds.load_v((t0 + 1) * BN, (t0 + 1) % fx.Index(NPF))
-        kv_gmem_to_lds.load_k((t0 + 2) * BN, (t0 + 2) % fx.Index(NPF))
-        kv_gmem_to_lds.load_k((t0 + 3) * BN, (t0 + 3) % fx.Index(NPF))
-        kv_gmem_to_lds.load_v((t0 + 2) * BN, (t0 + 2) % fx.Index(NPF))
-        kv_gmem_to_lds.load_v((t0 + 3) * BN, (t0 + 3) % fx.Index(NPF))
+        kv_gmem_to_lds.load_k((t0 + 1) * BN, (t0 + 1) % fx.Index(NPF), pages[1])
+        kv_gmem_to_lds.load_v(t0 * BN, t0 % fx.Index(NPF), pages[0])
+        kv_gmem_to_lds.load_v((t0 + 1) * BN, (t0 + 1) % fx.Index(NPF), pages[1])
+        kv_gmem_to_lds.load_k((t0 + 2) * BN, (t0 + 2) % fx.Index(NPF), pages[2])
+        kv_gmem_to_lds.load_k((t0 + 3) * BN, (t0 + 3) % fx.Index(NPF), pages[3])
+        kv_gmem_to_lds.load_v((t0 + 2) * BN, (t0 + 2) % fx.Index(NPF), pages[2])
+        kv_gmem_to_lds.load_v((t0 + 3) * BN, (t0 + 3) % fx.Index(NPF), pages[3])
         if const_expr(traits.QLDS):
             rocdl.s_waitcnt(0)
         else:
@@ -293,17 +304,23 @@ def build_flash_attn_dualwave_swp_fp8_module(
             f_a_buf = _ring_wrap(a_buf + 4)
             f_b_buf = _ring_wrap(a_buf + 5)
 
+            future_pages = [None, None]
+            if const_expr(traits.PAGED):
+                future_pages = kv_gmem_to_lds.end_page_ids(
+                    kv_gmem_to_lds.begin_page_ids([j + 4, j + 5])
+                )
+
             v_k_a = kv_lds_to_regs.load_k(a_buf)
             v_k_b = kv_lds_to_regs.load_k(b_buf)
 
             v_s_a = gemm_helper.qk(v_k_a, q_wide)
             v_s_b = gemm_helper.qk(v_k_b, q_wide)
-            v_v_a = kv_lds_to_regs.load_v(a_buf)
+            v_v_a = kv_lds_to_regs.load_v(a_buf, j * BN if traits.V_SHUFFLED else None)
 
-            kv_gmem_to_lds.load_k((j + 4) * BN, f_a_buf)
-            kv_gmem_to_lds.load_k((j + 5) * BN, f_b_buf)
-            kv_gmem_to_lds.load_v((j + 4) * BN, f_a_buf)
-            kv_gmem_to_lds.load_v((j + 5) * BN, f_b_buf)
+            kv_gmem_to_lds.load_k((j + 4) * BN, f_a_buf, future_pages[0])
+            kv_gmem_to_lds.load_k((j + 5) * BN, f_b_buf, future_pages[1])
+            kv_gmem_to_lds.load_v((j + 4) * BN, f_a_buf, future_pages[0])
+            kv_gmem_to_lds.load_v((j + 5) * BN, f_b_buf, future_pages[1])
 
             _phase_bar()
             _pp_prio(0)
@@ -316,7 +333,9 @@ def build_flash_attn_dualwave_swp_fp8_module(
             v_p_a, l_row = _softmax_part(v_s_a, l_row, m_new)
             _phase_bar()
             _pp_prio(1)
-            v_v_b = kv_lds_to_regs.load_v(b_buf)
+            v_v_b = kv_lds_to_regs.load_v(
+                b_buf, (j + 1) * BN if traits.V_SHUFFLED else None
+            )
             v_o = _pv_part(v_p_a, v_v_a, v_o)
             _phase_bar()
             _pp_prio(0)
@@ -343,6 +362,187 @@ def build_flash_attn_dualwave_swp_fp8_module(
         else:
             output_store.store_splitk_partial_o(v_o, m_row, l_row, q_row)
             output_store.store_empty_split()
+
+    @flyc.jit
+    def _conventional_bn64_body(ctx):
+        (
+            q_loader,
+            gemm_helper,
+            softmax_helper,
+            kv_gmem_to_lds,
+            kv_lds_to_regs,
+            output_store,
+        ) = _init_fwd_helpers(ctx)
+        BN = traits.BLOCK_N
+        D_CHUNKS = traits.D_CHUNKS
+        t0 = fx.Int64(ctx.split_t0)
+        t_end = fx.Int64(ctx.split_t_end)
+
+        kv_gmem_to_lds.load_block_table_to_lds()
+        q_loader.stage_q_to_lds()
+        rocdl.s_waitcnt(0)
+        rocdl.s_barrier()
+        page = kv_gmem_to_lds.end_page_ids(kv_gmem_to_lds.begin_page_ids([t0]))[0]
+        kv_gmem_to_lds.load_k(t0 * BN, fx.Int32(0), page)
+        kv_gmem_to_lds.load_v(t0 * BN, fx.Int32(0), page)
+        ctx.init_q_row()
+        q_row = ctx.q_row
+        q_wide = gemm_helper.load_q_wide()
+
+        m_row = ctx.c_neg_floor
+        l_row = ctx.c_zero_f
+        v_o = [ctx.c_zero_v16f32 for _ in range_constexpr(D_CHUNKS)]
+        init_args = [m_row, l_row] + v_o
+        loop_results = init_args
+        for j, loop_args in range(t0, t_end, fx.Int64(1), init=init_args):
+            j = fx.Int64(j)
+            m_row = loop_args[0]
+            l_row = loop_args[1]
+            v_o = [loop_args[2 + i] for i in range_constexpr(D_CHUNKS)]
+            buf = fx.Int32(j) % fx.Int32(2)
+            next_buf = fx.Int32(1) - buf
+            # Publish the prefetched tile and release the slot all waves last read.
+            rocdl.s_waitcnt(0)
+            rocdl.sched_barrier(0)
+            rocdl.s_barrier()
+            rocdl.sched_barrier(0)
+            pf = j + fx.Int64(1)
+            page = kv_gmem_to_lds.end_page_ids(kv_gmem_to_lds.begin_page_ids([pf]))[0]
+            kv_gmem_to_lds.load_k(pf * BN, next_buf, page)
+            kv_gmem_to_lds.load_v(pf * BN, next_buf, page)
+            v_k = kv_lds_to_regs.load_k(buf)
+            v_s = gemm_helper.qk(v_k, q_wide)
+            if const_expr(traits.CAUSAL):
+                v_s = softmax_helper.causal_mask_tile_if_needed(v_s, fx.Int32(j))
+            else:
+                v_s = softmax_helper.seq_pad_mask_if_needed(v_s, fx.Int32(j))
+            m_tile = softmax_helper.floor_masked_max(softmax_helper.reduce_max(v_s))
+            if const_expr(traits.DUALWAVE_SWP_LAZY_RESCALE):
+                v_o, m_new, l_row = softmax_helper.lazy_correct_o(
+                    v_o, m_row, l_row, m_tile
+                )
+            else:
+                m_new, corr = softmax_helper.rescale_from_tile_max(m_row, m_tile)
+                softmax_helper.scale_o(v_o, corr)
+                l_row = softmax_helper.apply_l_rescale(l_row, corr)
+            v_s = softmax_helper.sub_m(v_s, m_new)
+            v_p = softmax_helper.exp2(v_s, 0)
+            v_p = softmax_helper.exp2(v_p, 16)
+            v_p_fp32 = v_p
+            v_p = gemm_helper.cast_p_fp8_direct(v_p)
+            v_v = kv_lds_to_regs.load_v(buf, j * BN if traits.V_SHUFFLED else None)
+            if const_expr(not traits.V_SHUFFLED):
+                # Inline transpose reads are invisible to LLVM's wait insertion.
+                rocdl.s_waitcnt(lgkmcnt=0)
+            v_o = gemm_helper.pv(v_p, v_v, v_o)
+            # Keep denominator arithmetic beyond the full-tile V branch for PV overlap.
+            l_row = softmax_helper.reduce_sum(l_row, v_p_fp32)
+            loop_results = yield [m_new, l_row] + v_o
+        m_row = loop_results[0]
+        l_row = loop_results[1]
+        v_o = [loop_results[2 + i] for i in range_constexpr(D_CHUNKS)]
+        inv_l_rcp = rocdl.rcp(T.f32, _raw(l_row))
+        inv_l = fx.Float32(
+            (fx.Float32(l_row) > ctx.c_zero_f).select(inv_l_rcp, ctx.c_zero_f)
+        )
+        softmax_helper.scale_o(v_o, inv_l * ctx.vd_fp8)
+        rocdl.s_waitcnt(0)
+        rocdl.s_barrier()
+        output_store.store_final_o(v_o, q_row, m_row, l_row)
+
+    # BN128: two BLOCK_N=64 KV tiles per iteration, one merged softmax correction.
+    @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
+    def flash_attn_dualwave_swp_fp8_bn128_kernel(
+        Q: fx.Tensor,
+        K: fx.Tensor,
+        V: fx.Tensor,
+        O: fx.Tensor,
+        Workspace: fx.Tensor,
+        CuSeqQ: fx.Tensor,
+        CuSeqKv: fx.Tensor,
+        QDescale: fx.Tensor,
+        KDescale: fx.Tensor,
+        VDescale: fx.Tensor,
+        LSE: fx.Tensor,
+        seq_len: fx.Int32,
+        seq_len_kv: fx.Int32,
+        stride_q_n: fx.Int32,
+        stride_kv_n: fx.Int32,
+        softmax_scale: fx.Float32,
+        lse_stride_h: fx.Int32,
+    ):
+        ctx = DualwaveFp8KernelContext(
+            traits,
+            Q,
+            K,
+            V,
+            O,
+            Workspace,
+            CuSeqQ,
+            CuSeqKv,
+            QDescale,
+            KDescale,
+            VDescale,
+            LSE,
+            seq_len,
+            seq_len_kv,
+            stride_q_n,
+            stride_kv_n,
+            softmax_scale,
+            lse_stride_h,
+        )
+        _fwd_body(ctx)
+
+    if traits.PAGED:
+
+        @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
+        def flash_attn_dualwave_swp_fp8_paged_kernel(
+            Q: fx.Tensor,
+            K: fx.Tensor,
+            V: fx.Tensor,
+            O: fx.Tensor,
+            Workspace: fx.Tensor,
+            CuSeqQ: fx.Tensor,
+            CuSeqKv: fx.Tensor,
+            QDescale: fx.Tensor,
+            KDescale: fx.Tensor,
+            VDescale: fx.Tensor,
+            LSE: fx.Tensor,
+            seq_len: fx.Int32,
+            seq_len_kv: fx.Int32,
+            stride_q_n: fx.Int32,
+            stride_kv_n: fx.Int32,
+            softmax_scale: fx.Float32,
+            lse_stride_h: fx.Int32,
+            BlockTable: fx.Tensor,
+            block_table_stride: fx.Int32,
+        ):
+            ctx = DualwaveFp8KernelContext(
+                traits,
+                Q,
+                K,
+                V,
+                O,
+                Workspace,
+                CuSeqQ,
+                CuSeqKv,
+                QDescale,
+                KDescale,
+                VDescale,
+                LSE,
+                seq_len,
+                seq_len_kv,
+                stride_q_n,
+                stride_kv_n,
+                softmax_scale,
+                lse_stride_h,
+                BlockTable=BlockTable,
+                block_table_stride=block_table_stride,
+            )
+            if const_expr(traits.BODY_VARIANT == "conventional_bn64"):
+                _conventional_bn64_body(ctx)
+            else:
+                _fwd_body(ctx)
 
     # Combine kernel: out = sum_s w_s * O_s / sum_s w_s * l_s, w_s = exp2(m_s - m_max).
     # One wave row of 32 lanes covers a (b, h, s) row, 4 contiguous cols/lane.
@@ -476,6 +676,91 @@ def build_flash_attn_dualwave_swp_fp8_module(
                 stream=stream,
             )
 
+    if traits.PAGED:
+
+        @flyc.jit
+        def launch_flash_attn_dualwave_swp_paged(
+            Q: fx.Tensor,
+            K: fx.Tensor,
+            V: fx.Tensor,
+            O: fx.Tensor,
+            Workspace: fx.Tensor,
+            CuSeqQ: fx.Tensor,
+            CuSeqKv: fx.Tensor,
+            QDescale: fx.Tensor,
+            KDescale: fx.Tensor,
+            VDescale: fx.Tensor,
+            LSE: fx.Tensor,
+            batch_size: fx.Int32,
+            seq_len: fx.Int32,
+            seq_len_kv: fx.Int32,
+            stride_q_n: fx.Int32,
+            stride_kv_n: fx.Int32,
+            softmax_scale: fx.Float32,
+            lse_stride_h: fx.Int32,
+            BlockTable: fx.Tensor,
+            block_table_stride: fx.Int32,
+            stream: fx.Stream = fx.Stream(None),  # noqa: B008  framework idiom
+        ):
+            # Make shape/mode traits visible to the JIT cache key.
+            _ = _dualwave_swp_fp8_cache_tag
+            bs_idx = fx.Index(batch_size)
+            sl_idx = fx.Index(seq_len)
+            num_q_blocks = (sl_idx + BLOCK_M - 1) // BLOCK_M
+            grid_heads = NUM_HEADS_Q
+            if const_expr(traits.GQA_PACK_M):
+                block_q = BLOCK_M // traits.GQA_GROUP_SIZE
+                num_q_blocks = (sl_idx + block_q - 1) // block_q
+                grid_heads = traits.NUM_HEADS_KV
+            if const_expr(SPLITK):
+                grid_z = bs_idx * NUM_KV_SPLITS
+            elif const_expr(BATCH_INTERLEAVE_GROUP > 1):
+                grid_z = bs_idx // BATCH_INTERLEAVE_GROUP
+            else:
+                grid_z = bs_idx
+
+            passthrough_entries = (
+                [
+                    ["denormal-fp-math-f32", "preserve-sign,preserve-sign"],
+                    ["no-nans-fp-math", "true"],
+                    ["unsafe-fp-math", "true"],
+                ]
+                if const_expr(daz)
+                else None
+            )
+            flash_attn_dualwave_swp_fp8_paged_kernel(
+                Q,
+                K,
+                V,
+                O,
+                Workspace,
+                CuSeqQ,
+                CuSeqKv,
+                QDescale,
+                KDescale,
+                VDescale,
+                LSE,
+                seq_len,
+                seq_len_kv,
+                stride_q_n,
+                stride_kv_n,
+                softmax_scale,
+                lse_stride_h,
+                BlockTable,
+                block_table_stride,
+                value_attrs={
+                    "rocdl.waves_per_eu": 1,
+                    "rocdl.flat_work_group_size": f"{BLOCK_SIZE},{BLOCK_SIZE}",
+                    "passthrough": passthrough_entries,
+                },
+            ).launch(
+                grid=(grid_heads * BATCH_INTERLEAVE_GROUP, num_q_blocks, grid_z),
+                block=(BLOCK_SIZE, 1, 1),
+                stream=stream,
+            )
+
+        launch_flash_attn_dualwave_swp = launch_flash_attn_dualwave_swp_paged
+
     _dualwave_swp_llvm_options = {
         "enable-post-misched": False,
         "lsr-drop-solution": True,
@@ -508,6 +793,8 @@ def build_flash_attn_dualwave_swp_fp8_module(
         v_descale=None,
         lse=None,
         lse_stride_h=0,
+        block_table=None,
+        block_table_stride=None,
         stream=None,
     ):
         """Normalise the launch arguments shared by the run and compile paths."""
@@ -529,17 +816,31 @@ def build_flash_attn_dualwave_swp_fp8_module(
             raise ValueError(
                 "num_kv_splits > 1 requires a fp32 workspace (see dualwave_splitk_workspace_elems)"
             )
-        # O is bf16 and would be corrupted by the fp32 LSE stores. lse_stride_h
-        # sizes the LSE buffer descriptor, so leaving it at 0 gives num_records=0
-        # and the hardware silently drops every LSE store.
+        # O contains 16-bit output, not fp32 LSE. A nonzero lse_stride_h is required
+        # to bound the LSE descriptor.
         if RETURN_LSE and (lse is None or not lse_stride_h):
             raise ValueError(
                 "return_lse=True requires a fp32 lse tensor and a non-zero "
                 f"lse_stride_h, got lse={'None' if lse is None else 'tensor'}, "
                 f"lse_stride_h={lse_stride_h}"
             )
+        if traits.PAGED:
+            if block_table is None or cu_seqlens_q is None or cu_seqlens_kv is None:
+                raise ValueError(
+                    "paged requires block_table, cu_seqlens_q and per-sequence KV lengths"
+                )
+            if seq_len_kv > traits.PAGED_BT_LDS_SIZE * traits.BLOCK_N:
+                raise ValueError(
+                    "paged KV length exceeds the 2048-page LDS block-table limit"
+                )
+            if block_table_stride is None:
+                block_table_stride = block_table.stride(0)
+            if block_table_stride < -(-seq_len_kv // traits.BLOCK_N):
+                raise ValueError(
+                    "block_table_stride is smaller than the maximum KV page count"
+                )
         ws = workspace if SPLITK else O
-        return (
+        args = (
             Q,
             K,
             V,
@@ -560,6 +861,9 @@ def build_flash_attn_dualwave_swp_fp8_module(
             lse_stride_h,
             fx.Stream(stream),
         )
+        if traits.PAGED:
+            args = args[:-1] + (block_table, block_table_stride, args[-1])
+        return args
 
     def _launch(*args, **kwargs):
         with CompilationContext.compile_hints(_dualwave_swp_compile_hints):

@@ -23,10 +23,23 @@ class DualwaveFp8StoreHelper(DualwaveFp8KernelContext):
     def __init__(self, ctx):
         super().__init__(ctx)
 
+    def _pack_out_pair(self, a, b):
+        """Pack two f32 outputs into one i32 (a -> lo16, b -> hi16).
+
+        bf16 and f16 are both 2 bytes with the same lo/hi ordering, so only the
+        conversion differs; the lane-swap and store code downstream is shared.
+        """
+        if const_expr(self.traits.OUT_F16):
+            v2 = rocdl.cvt_pkrtz(
+                Vec.make_type(2, fx.Float16), as_mlir_value(a), as_mlir_value(b)
+            )
+            return as_mlir_value(Vec(v2, (2,), fx.Float16).bitcast(fx.Int32)[0])
+        return rocdl.cvt_pk_bf16_f32(a, b)
+
     def _o_pack_2dw(self, v_o, dc, store_group):
         r_base = store_group * 4
-        lo = rocdl.cvt_pk_bf16_f32(Vec(v_o[dc])[r_base], Vec(v_o[dc])[r_base + 1])
-        hi = rocdl.cvt_pk_bf16_f32(Vec(v_o[dc])[r_base + 2], Vec(v_o[dc])[r_base + 3])
+        lo = self._pack_out_pair(Vec(v_o[dc])[r_base], Vec(v_o[dc])[r_base + 1])
+        hi = self._pack_out_pair(Vec(v_o[dc])[r_base + 2], Vec(v_o[dc])[r_base + 3])
         return lo, hi
 
     def _swap_half_partner(self, dw):
@@ -59,6 +72,21 @@ class DualwaveFp8StoreHelper(DualwaveFp8KernelContext):
         for dc in range_constexpr(self.traits.D_CHUNKS):
             for g in range_constexpr(2):
                 o_pack = self._packed_o_128_vec(v_o, dc, g)
+                if const_expr(self.traits.PAGED):
+                    has_keys = self.seqlen_kv_v > 0
+                    if const_expr(self.traits.CAUSAL):
+                        has_keys = has_keys & (
+                            fx.Int32(q_row) + self.delta_i32 >= fx.Int32(0)
+                        )
+                    # Minimum pipeline padding can execute an all-masked row;
+                    # the public empty-window result is zero, not softmax NaN.
+                    o_pack = Vec.from_elements(
+                        [
+                            has_keys.select(o_pack[i], fx.Int32(0))
+                            for i in range_constexpr(4)
+                        ],
+                        fx.Int32,
+                    )
                 d_col = (dc * self.traits.D_CHUNK) + (2 * g + self.lane_div_32) * 8
                 o_global = self.global_idx_o(q_row, d_col)
                 self.buffer_store_128(o_pack, o_global)

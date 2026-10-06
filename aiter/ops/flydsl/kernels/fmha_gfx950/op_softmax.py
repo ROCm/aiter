@@ -94,6 +94,19 @@ class DualwaveFp8SoftmaxHelper(DualwaveFp8KernelContext):
         a_lo, a_hi, b_lo, b_hi = _run(v_s_a, v_s_b)
         return (a_lo, a_hi), (b_lo, b_hi)
 
+    def causal_mask_tile_if_needed(self, v_s, tile_idx):
+        @flyc.jit
+        def _run(v_s, tile_idx):
+            s_lo, s_hi = v_s
+            kv_end_pos = (tile_idx + 1) * self.traits.BLOCK_N
+            if self.ctx_ref.q_start_pos_i32 + self.delta_i32 < fx.Int32(kv_end_pos):
+                lo_list, hi_list = self.v_s_vec_to_lists(v_s)
+                self._causal_mask_inplace((lo_list, hi_list), tile_idx)
+                s_lo, s_hi = _score_lists_to_vecs((lo_list, hi_list))
+            return s_lo, s_hi
+
+        return _run(v_s, tile_idx)
+
     def _seq_pad_mask_inplace(self, v_s_lists, tile_idx):
         traits = self.traits
         s_lo, s_hi = v_s_lists
