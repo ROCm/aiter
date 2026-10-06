@@ -275,9 +275,14 @@ def compile_mixed_moe_gemm1_common(
     # ABI v33 adds four runtime SiTUv2 beta scalars; heterogeneous ABI tracks one
     # version ahead of the ordinary kernel.
     kernel_version = 34 if heterogeneous_b else 33
+    # The ordinary async main loop orders each half's X DMA before its other
+    # loads and waits for it before the next barrier (see interleaved_half). The
+    # tag keeps kernels compiled before that change out of the cache.
+    dma_wait_fix = use_async_copy and not heterogeneous_b
+    dma_wait_tag = "_dmaw" if dma_wait_fix else ""
     module_name = (
         f"mfma_moe1_silu_mul_a{a_dtype}_w{b_dtype}_{out_s}"
-        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}{act_tag}{v2out_tag}{heterogeneous_tag}_v{kernel_version}"
+        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}{act_tag}{v2out_tag}{heterogeneous_tag}{dma_wait_tag}_v{kernel_version}"
     ).replace("-", "_")
 
     cshuffle_elem_bytes = 4 if need_quant else (4 if out_is_f32 else 2)
@@ -685,6 +690,19 @@ def compile_mixed_moe_gemm1_common(
                     tile_m // 32 // fp4_ratio
                     + tile_n // 32 * gui_ratio * body_b_load_mult
                 )
+                if const_expr(dma_wait_fix):
+                    # The wait before each half's barrier must cover the X DMA
+                    # issued in the previous half, which other waves read after
+                    # the barrier. Only the B loads are guaranteed to be issued
+                    # after that DMA (a sched_barrier pins them there), so only
+                    # they may stay outstanding. Counting the X tile as well let
+                    # the compiler place the scale loads between the two X DMAs
+                    # of the first half, and the second DMA could still be in
+                    # flight at the barrier: an intermittent race on rows
+                    # 16-31 of a 32-row block.
+                    body_vmcnt_before_barrier = (
+                        tile_n // 32 * gui_ratio * body_b_load_mult
+                    )
                 expert_off_idx = expert_idx * arith.constant(2 * inter_dim, index=True)
                 if const_expr(shared_b):
                     weight_expert_off_idx = arith.index(0)
@@ -1544,6 +1562,10 @@ def compile_mixed_moe_gemm1_common(
                     )
                     if const_expr(use_async_copy and next_k_dma_py < int(k_dim)):
                         prefetch_x_to_lds(abs_k_dma, lds_write)
+                        if const_expr(dma_wait_fix):
+                            # no later load may be scheduled between or above the
+                            # DMAs (body_vmcnt_before_barrier counts on it)
+                            rocdl.sched_barrier(0)
                     if const_expr(not use_async_copy):
                         x_regs = load_x_tile(abs_k_dma)
 
