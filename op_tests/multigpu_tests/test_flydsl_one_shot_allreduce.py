@@ -207,7 +207,10 @@ _FUSED_SHAPE_CASES = tuple(
 # so m=1 passes even with the per-lane mask removed entirely. m=32 is what puts
 # a *real* row under the pad, which is the only arrangement where a leaked load
 # reads live data and a leaked store corrupts a neighbour.
-FUSED_PAD_HIDDENS = (896, 2304, 2880)
+#
+# 9000 -> 9216 is the first kind of width above 8192: atoms=1 tops out at 1024
+# threads x 8 elements, so a row that wide pads onto a two-atom block (BLOCK 576).
+FUSED_PAD_HIDDENS = (896, 2304, 2880, 9000)
 _FUSED_PAD_SHAPE_CASES = tuple(
     (m, hidden, f"{m}x{hidden}pad")
     for hidden in FUSED_PAD_HIDDENS
@@ -1236,6 +1239,34 @@ def test_one_shot_allreduce_rmsnorm_padding_is_least_wire():
                 f"hidden={hidden} has a native geometry {native[0]} but "
                 f"resolved to a padded {(block, atoms, h_pad)}"
             )
+
+
+def test_one_shot_allreduce_rmsnorm_padded_hidden_limits():
+    """What padding can and cannot address on the fused one-shot.
+
+    Host-side and GPU-free. The only requirement is a whole number of 16 B atoms
+    (a multiple of 8 bf16); the ceiling is the 1024-thread block times the widest
+    ``SUPPORTED_ATOMS`` (4), i.e. 32768. Past it, and off the atom grid, the
+    host raises naming the constraint rather than building something else.
+    """
+    from aiter.ops.flydsl.kernels.one_shot_allreduce import (
+        SUPPORTED_ATOMS,
+        fused_padded_block,
+        fused_padded_block_options,
+    )
+
+    ceiling = 1024 * 8 * max(SUPPORTED_ATOMS)
+    assert ceiling == 32768
+    widest = max(h for h in range(8, 2 * ceiling + 1, 8) if fused_padded_block_options(h))
+    assert widest == ceiling, f"widest padded hidden {widest}, not {ceiling}"
+
+    for hidden in (ceiling + 8, 2 * ceiling):
+        with pytest.raises(ValueError, match="no padded fused build"):
+            fused_padded_block(hidden)
+    for hidden in (2884, 1001, 2879):
+        assert not fused_padded_block_options(hidden)
+        with pytest.raises(ValueError, match="multiple of 8"):
+            fused_padded_block(hidden)
 
 
 def test_one_shot_allreduce_rmsnorm_geom_for_pinned_block_pads():

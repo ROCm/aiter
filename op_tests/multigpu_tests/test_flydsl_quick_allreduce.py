@@ -37,8 +37,8 @@ pinned per lap: all-INT4 at TP8, and one lap lossless to isolate the other.
 The fused epilogue (``FlyQuickAllReduceRMSNorm``: all-reduce + residual add +
 RMSNorm) has its own ``test_quick_allreduce_rmsnorm_*`` sweeps, one table each:
 SQNR against an fp32 oracle, bit-exactness of ``residual_out`` on the lossless
-wire (native, padded-width and pinned-super-tile geometries), mesh rank
-agreement, and
+wire (native, padded-width and pinned-super-tile geometries), padded widths on
+the INT4 wire (SQNR), mesh rank agreement, and
 ``test_quick_allreduce_host_checks``.
 
 Every mesh row also checks that all ranks wrote bit-identical output: each
@@ -1146,9 +1146,21 @@ _FUSED_MESH_STS = (1, 8)
 #: Graded with a **lossless** wire on purpose. Padding must be invisible to the
 #: answer, so under fp16 a padded build has to produce the same bits a native
 #: one would.
+#:
+#: 2880 -> 3072 is the gpt-oss width (BLOCK 384, three waves) and is run at every
+#: world size, where a rank owns 4, 2 and 1 atoms of a tile. 7680 -> 8192 at TP8
+#: is the widest block there is (1024 threads, one atom per row), so a pad lane
+#: reaching past it has nowhere left to hide. The ``11``-token rows leave a
+#: partial last tile.
 _FUSED_PAD_CASES = (
     (2, 512, 1536, "tp2-1536pad2048"),
     (2, 11, 1536, "tp2-1536pad2048-partial-tile"),
+    (2, 512, 2880, "tp2-2880pad3072"),
+    (4, 512, 2880, "tp4-2880pad3072"),
+    (4, 11, 2880, "tp4-2880pad3072-partial-tile"),
+    (8, 512, 2880, "tp8-2880pad3072"),
+    (8, 11, 2880, "tp8-2880pad3072-partial-tile"),
+    (8, 64, 7680, "tp8-7680pad8192-widest-block"),
 )
 
 # (tp, tokens, hidden) of the lossless one-live-rank residual equality.
@@ -1287,6 +1299,27 @@ def test_quick_allreduce_rmsnorm_padded_is_bit_exact(
     )
     fails += _fused_exact_fails(rows, "a pad lane is reaching the real row")
     _check(f"{label}/{algorithm}", fails)
+    return _fused_summary(rows)
+
+
+@benchmark()
+def test_quick_allreduce_rmsnorm_padded_sqnr(tp, tokens, hidden, label, algorithm):
+    """Padded widths on the shipping INT4 wire, graded like the native ones.
+
+    The bit-exact test above isolates the addressing on a lossless wire; this one
+    runs the codec that ships. A padded row puts zero columns into the quantized
+    tile, so a pad lane that picks up a non-zero value (or a group scale that
+    straddles the row boundary) shows up as lost SQNR on ``out`` and
+    ``residual_out``, or as a broken ``out`` vs ``norm(residual_out)``
+    self-consistency, not as a bit difference.
+    """
+    batch = _fused_batch(
+        (tp, "pad-sqnr", algorithm),
+        [(t, h) for w, t, h, _ in _FUSED_PAD_CASES if w == tp],
+        algorithm=algorithm,
+    )
+    rows = batch[(tokens, hidden)]
+    _check(f"{label}/{algorithm}", _fused_sqnr_fails(rows))
     return _fused_summary(rows)
 
 
@@ -1494,6 +1527,60 @@ def _host_padded_row_block_is_least_wire() -> list[str]:
     return fails
 
 
+def _host_padded_hidden_limits() -> list[str]:
+    """What padding can and cannot address, per world size.
+
+    The only requirement is a whole number of 16 B atoms (a multiple of 8 bf16).
+    The ceiling is the 1024-thread block times the atoms a rank owns of a tile
+    (``ATOMS // world_size``: 4, 2, 1), so 32768 / 16384 / 8192 at TP2 / TP4 /
+    TP8. Past it, and off the atom grid, the host raises naming the constraint.
+    """
+    from aiter.ops.flydsl.kernels.quick_allreduce_fusions import (
+        quick_reduce_padded_row_block_options,
+    )
+
+    ceilings = {2: 32768, 4: 16384, 8: 8192}
+    fails = []
+    for world_size in SUPPORTED_WORLDS:
+        ceiling = ceilings[world_size]
+        widest = max(
+            h
+            for h in range(8, 2 * 32768 + 1, 8)
+            if quick_reduce_padded_row_block_options(h, world_size)
+        )
+        if widest != ceiling:
+            fails.append(f"tp={world_size}: widest padded hidden {widest}, not {ceiling}")
+        for hidden in (ceiling + 8, 2 * ceiling):
+            fails += _expect_raises(
+                f"hidden={hidden} tp={world_size}",
+                "no padded fused build",
+                lambda h=hidden, w=world_size: _padded_pick(h, w),
+            )
+        for hidden in (2884, 1001, 2879):
+            if quick_reduce_padded_row_block_options(hidden, world_size):
+                fails.append(f"hidden={hidden} tp={world_size}: not a multiple of 8")
+            fails += _expect_raises(
+                f"hidden={hidden} tp={world_size}",
+                "multiple of 8",
+                lambda h=hidden, w=world_size: _padded_pick(h, w),
+            )
+    return fails
+
+
+def _padded_pick(hidden: int, world_size: int):
+    from aiter.ops.flydsl.kernels.quick_allreduce_fusions import (
+        _quick_reduce_atoms_choices,
+        padded_row_block,
+    )
+    from aiter.ops.flydsl.kernels.quick_allreduce_codec import BLOCK_ALIGN
+
+    return padded_row_block(
+        hidden,
+        atoms_choices=_quick_reduce_atoms_choices(world_size),
+        align=BLOCK_ALIGN,
+    )
+
+
 def _host_mesh_fanout_quad_budget_gates_narrow_blocks() -> list[str]:
     """The mesh needs a quad per (peer, sector) of a stripe, and the gate knows.
 
@@ -1626,6 +1713,7 @@ _HOST_CHECKS = {
     "rejects_unsupported_hidden": _host_rejects_unsupported_hidden,
     "supported_hiddens": _host_supported_hiddens,
     "padded_row_block_is_least_wire": _host_padded_row_block_is_least_wire,
+    "padded_hidden_limits": _host_padded_hidden_limits,
     "mesh_fanout_quad_budget": _host_mesh_fanout_quad_budget_gates_narrow_blocks,
     "row_block_is_first_option": _host_row_block_is_first_option,
     "fused_one_shot_block_options": _host_fused_one_shot_block_options,
@@ -2067,6 +2155,13 @@ def main():
             test_quick_allreduce_rmsnorm_padded_is_bit_exact(
                 tp, tokens, hidden, label, algorithm
             )
+            for (tp, tokens, hidden, label), algorithm in itertools.product(pad, algos)
+        ],
+    )
+    _summarize(
+        "flydsl quick allreduce rmsnorm padded width (INT4 wire, sqnr)",
+        [
+            test_quick_allreduce_rmsnorm_padded_sqnr(tp, tokens, hidden, label, algorithm)
             for (tp, tokens, hidden, label), algorithm in itertools.product(pad, algos)
         ],
     )
