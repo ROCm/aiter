@@ -5,7 +5,7 @@
 import torch
 from torch import Tensor
 
-from ..jit.core import compile_ops
+from ..jit.core import ENABLE_CK, compile_ops
 
 MD_NAME = "module_norm"
 
@@ -28,7 +28,7 @@ def gen_layer_norm_fake_tensors(
 @compile_ops(
     "module_norm", fc_name="layernorm2d_fwd", gen_fake=gen_layer_norm_fake_tensors
 )
-def layer_norm(
+def layer_norm_ck(
     input: Tensor,
     # normalized_shape: List[int],
     weight: Tensor | None = None,
@@ -41,7 +41,7 @@ def layer_norm(
 @compile_ops(
     "module_norm", fc_name="layernorm2d_fwd", gen_fake=gen_layer_norm_fake_tensors
 )
-def layernorm2d_fwd(
+def layernorm2d_fwd_ck(
     input: Tensor,
     # normalized_shape: List[int],
     weight: Tensor,
@@ -51,8 +51,8 @@ def layernorm2d_fwd(
 ) -> Tensor: ...
 
 
-@compile_ops("module_norm")
-def layernorm2d_fwd_with_add(
+@compile_ops("module_norm", fc_name="layernorm2d_fwd_with_add")
+def layernorm2d_fwd_with_add_ck(
     out: Tensor,
     input: Tensor,
     residual_in: Tensor,
@@ -64,8 +64,8 @@ def layernorm2d_fwd_with_add(
 ) -> None: ...
 
 
-@compile_ops("module_norm")
-def layernorm2d_fwd_with_smoothquant(
+@compile_ops("module_norm", fc_name="layernorm2d_fwd_with_smoothquant")
+def layernorm2d_fwd_with_smoothquant_ck(
     out: Tensor,
     input: Tensor,
     xscale: Tensor,
@@ -77,7 +77,118 @@ def layernorm2d_fwd_with_smoothquant(
 ) -> None: ...
 
 
-@compile_ops("module_norm")
+@compile_ops("module_norm", fc_name="layernorm2d_fwd_with_add_smoothquant")
+def layernorm2d_fwd_with_add_smoothquant_ck(
+    out: Tensor,
+    input: Tensor,
+    residual_in: Tensor,
+    residual_out: Tensor,
+    xscale: Tensor,
+    yscale: Tensor,
+    weight: Tensor,
+    bias: Tensor,
+    epsilon: float,
+    x_bias: Tensor | None = None,
+) -> None: ...
+
+
+# The Triton kernels take 2-D rows and have no x_bias input; the CK kernels add
+# x_bias to the input and treat any shape as (numel / N, N).
+def _triton_rows(input: Tensor, x_bias: Tensor | None) -> Tensor:
+    if x_bias is not None:
+        input = input + x_bias
+    return input.reshape(-1, input.shape[-1])
+
+
+def layer_norm(
+    input: Tensor,
+    weight: Tensor | None = None,
+    bias: Tensor | None = None,
+    epsilon: float = 1e-5,
+    x_bias: Tensor | None = None,
+) -> Tensor:
+    if not ENABLE_CK:
+        from .triton.normalization.norm import layer_norm as layer_norm_triton
+
+        out = layer_norm_triton(_triton_rows(input, x_bias), weight, bias, epsilon)
+        return out.view(input.shape)
+    return layer_norm_ck(input, weight, bias, epsilon, x_bias)
+
+
+def layernorm2d_fwd(
+    input: Tensor,
+    weight: Tensor,
+    bias: Tensor,
+    epsilon: float = 1e-5,
+    x_bias: Tensor | None = None,
+) -> Tensor:
+    if not ENABLE_CK:
+        return layer_norm(input, weight, bias, epsilon, x_bias)
+    return layernorm2d_fwd_ck(input, weight, bias, epsilon, x_bias)
+
+
+def layernorm2d_fwd_with_add(
+    out: Tensor,
+    input: Tensor,
+    residual_in: Tensor,
+    residual_out: Tensor,
+    weight: Tensor,
+    bias: Tensor,
+    epsilon: float,
+    x_bias: Tensor | None = None,
+) -> None:
+    if not ENABLE_CK:
+        from .triton.normalization.norm import (
+            layernorm2d_fwd_with_add as layernorm2d_fwd_with_add_triton,
+        )
+
+        n = input.shape[-1]
+        layernorm2d_fwd_with_add_triton(
+            out.view(-1, n),
+            _triton_rows(input, x_bias),
+            residual_in.reshape(-1, n),
+            residual_out.view(-1, n),
+            weight,
+            bias,
+            epsilon,
+        )
+        return
+    layernorm2d_fwd_with_add_ck(
+        out, input, residual_in, residual_out, weight, bias, epsilon, x_bias
+    )
+
+
+def layernorm2d_fwd_with_smoothquant(
+    out: Tensor,
+    input: Tensor,
+    xscale: Tensor,
+    yscale: Tensor,
+    weight: Tensor,
+    bias: Tensor,
+    epsilon: float,
+    x_bias: Tensor | None = None,
+) -> None:
+    if not ENABLE_CK:
+        from .triton.normalization.norm import (
+            layernorm2d_fwd_with_smoothquant as layernorm2d_fwd_with_smoothquant_triton,
+        )
+
+        n = input.shape[-1]
+        layernorm2d_fwd_with_smoothquant_triton(
+            out.view(-1, n),
+            _triton_rows(input, x_bias),
+            xscale,
+            yscale,
+            weight,
+            bias,
+            epsilon,
+        )
+        return
+    layernorm2d_fwd_with_smoothquant_ck(
+        out, input, xscale, yscale, weight, bias, epsilon, x_bias
+    )
+
+
 def layernorm2d_fwd_with_add_smoothquant(
     out: Tensor,
     input: Tensor,
@@ -89,7 +200,37 @@ def layernorm2d_fwd_with_add_smoothquant(
     bias: Tensor,
     epsilon: float,
     x_bias: Tensor | None = None,
-) -> None: ...
+) -> None:
+    if not ENABLE_CK:
+        from .triton.normalization.norm import (
+            layernorm2d_fwd_with_add_smoothquant as layernorm2d_fwd_with_add_smoothquant_triton,
+        )
+
+        n = input.shape[-1]
+        layernorm2d_fwd_with_add_smoothquant_triton(
+            out.view(-1, n),
+            _triton_rows(input, x_bias),
+            residual_in.reshape(-1, n),
+            residual_out.view(-1, n),
+            xscale,
+            yscale,
+            weight,
+            bias,
+            epsilon,
+        )
+        return
+    layernorm2d_fwd_with_add_smoothquant_ck(
+        out,
+        input,
+        residual_in,
+        residual_out,
+        xscale,
+        yscale,
+        weight,
+        bias,
+        epsilon,
+        x_bias,
+    )
 
 
 # @compile_ops("module_norm")
