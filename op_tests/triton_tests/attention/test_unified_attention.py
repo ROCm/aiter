@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import itertools
 from types import SimpleNamespace
 
 import pytest
@@ -725,3 +726,290 @@ def test_triton_unified_attn(
             torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol),
             f"{torch.max(torch.abs(output - ref_output))}",
         )
+
+
+@pytest.mark.parametrize("sliding_window", [None, 1024])
+@pytest.mark.parametrize(
+    "q_dtype, kv_dtype, shuffled_kv_cache, block_size",
+    [
+        (torch.bfloat16, torch.bfloat16, False, 64),
+        (e4m3_dtype, e4m3_dtype, False, 64),
+        # get_dtype_str() maps fp16 to the bf16 tag, so the DT_bf16_bf16
+        # entries serve fp16 too; same 2-byte layout, same tile math
+        (torch.float16, torch.float16, False, 64),
+        (torch.bfloat16, torch.bfloat16, True, 64),
+        (e4m3_dtype, e4m3_dtype, True, 64),
+        (torch.bfloat16, torch.bfloat16, True, 128),
+        (e4m3_dtype, e4m3_dtype, True, 128),
+        # mixed dtype: bf16 queries over an fp8 KV cache; the LDS tile is
+        # sized by kv_cache_dtype, so this must not be rejected
+        (torch.bfloat16, e4m3_dtype, True, 64),
+    ],
+)
+@pytest.mark.parametrize("head_size", [256, 512])
+@pytest.mark.parametrize("seq_lens", [[(1, 2048)], [(1023, 2048)], [(2048, 2048)]])
+@torch.inference_mode()
+def test_triton_unified_attn_gfx942_large_prefill(
+    head_size: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    shuffled_kv_cache: bool,
+    block_size: int,
+    sliding_window: int | None,
+    seq_lens: list[tuple[int, int]],
+) -> None:
+    """Executable coverage for the gfx942 large-prefill attn_2d entries.
+
+    The general test never exceeds max_seqlen_q 777 (below the Q_GEQ_1024
+    composites) and skips the shuffled 2D Triton path on gfx942, so the
+    Q>=1024, head 256/512 and SHUF specializations are otherwise never
+    compiled or numerically checked. This runs one 1-, 1023- or 2048-token
+    prefill/decode per (head, dtype, shuffled, page) combination (the Q=1
+    arm pins shuffled decode to the stage-1 Q_LEQ_1 entries) — enough to
+    select, compile and validate each entry — and asserts the resolved
+    config key and tuned BLOCK_M, pinning the 1023/1024 threshold from
+    both sides: below the threshold, plain calls resolve to the D-only
+    entries and shuffled calls to the Q-agnostic D_GEQ_*.SHUF.* entries.
+    Page 64 hits the tuned SHUF.BS_LEQ_64 entries, page 128 the
+    BS-agnostic M16/stages-1 fallbacks (the only LDS-safe configs at
+    TILE 128).
+    The sliding_window=1024 arm mirrors the Gemma-4 production call shape:
+    these entries were tuned for sliding-window prefill, and the general
+    test's windowed cases all stay below Q_GEQ_1024, so this is the only
+    place the composite configs are exercised together with a window.
+    The same window is passed to the kernel and the independent reference.
+    """
+    if DEVICE_ARCH != "gfx942":
+        pytest.skip(f"gfx942-tuned entries, skip {DEVICE_ARCH}")
+
+    from aiter.ops.triton.utils.unified_attention_utils import (
+        _axis_values,
+        _load,
+        _lookup,
+    )
+
+    num_heads = (32, 4)
+    (
+        query,
+        key_cache_orig,
+        value_cache_orig,
+        key_cache,
+        value_cache,
+        sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        _maybe_quant_query,
+        _query_scales,
+        q_descale,
+        k_descale,
+        v_descale,
+        output_scale,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=(2048 + block_size - 1) // block_size,
+        block_size=block_size,
+        head_size=head_size,
+        num_heads=num_heads,
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
+        out_dtype=torch.bfloat16,
+        shuffled_kv_cache=shuffled_kv_cache,
+        use_q_descale=q_dtype == e4m3_dtype,
+        use_kv_descale=kv_dtype == e4m3_dtype,
+        sliding_window=sliding_window,
+        device="cuda",
+    )
+
+    # assert the intended table entry serves this call
+    dt_tag = "fp8_fp8" if q_dtype == e4m3_dtype else "bf16_bf16"  # fp16 maps to bf16
+    mixed_dtype = (
+        q_dtype != kv_dtype
+    )  # no dtype-specific entry; generic configs serve it
+    # decode without a sliding window takes the 3D kernel on gfx942
+    # (use_2d_kernel needs sliding_window > 0 there); assert that table
+    # instead of attn_2d for those cases
+    is_3d = max_query_len == 1 and sliding_window is None
+    table, axes, _ = _load("attn_3d" if is_3d else "attn_2d", "triton", "gfx942")
+    if is_3d:
+        if shuffled_kv_cache:
+            expected_key = (
+                f"D_GEQ_{head_size}.SHUF" if head_size == 256 else f"D_GEQ_{head_size}"
+            )
+            expected_block_m = 16
+        else:
+            # pre-existing entries: d512 stage-1, everything else 'any'
+            expected_key = f"D_GEQ_{head_size}" if head_size == 512 else "any"
+            expected_block_m = 16
+    elif max_query_len == 1:
+        # decode: d256 shuffled routes to the SHUF stage-1 entry (the
+        # stage-2 D_GEQ_256.Q_LEQ_1 exceeds LDS at TILE 128); d512 decode
+        # is already stage-1 and needs no SHUF variant
+        if shuffled_kv_cache:
+            # d256 gets the SHUF stage-1 entry; d512 decode is already stage-1
+            expected_key = (
+                "D_GEQ_256.Q_LEQ_1.SHUF"
+                if head_size == 256
+                else f"D_GEQ_512.Q_LEQ_1{'.DT_fp8_fp8' if dt_tag == 'fp8_fp8' else ''}"
+            )
+        else:
+            # fp8 decode resolves to the dtype-specific Q_LEQ_1 entries
+            expected_key = f"D_GEQ_{head_size}.Q_LEQ_1{'.DT_fp8_fp8' if dt_tag == 'fp8_fp8' else ''}"
+        expected_block_m = 16
+    elif max_query_len < 1024 and shuffled_kv_cache:
+        # sub-threshold shuffled prefill: the Q-agnostic SHUF entry (M16/s1,
+        # the LDS-safe family at every supported page)
+        expected_key = f"D_GEQ_{head_size}.SHUF.DT_{dt_tag}"
+        expected_block_m = 16
+    elif max_query_len < 1024:
+        # below the crossover the D-only entries win; d512 fp8 resolves to
+        # the dtype-specific D_GEQ_512.DT_fp8_fp8 entry
+        if head_size == 512 and dt_tag == "fp8_fp8":
+            expected_key = "D_GEQ_512.DT_fp8_fp8"
+        else:
+            expected_key = f"D_GEQ_{head_size}"
+        expected_block_m = 16
+    elif shuffled_kv_cache and block_size <= 64:
+        expected_key = f"D_GEQ_{head_size}.Q_GEQ_1024.SHUF.BS_LEQ_64.DT_{dt_tag}"
+        # tuned per dtype: bf16 M16, fp8 M128 (d256) / M32 (d512)
+        expected_block_m = {"bf16_bf16": 16}.get(dt_tag) or (
+            128 if head_size == 256 else 32
+        )
+    elif shuffled_kv_cache:
+        expected_key = f"D_GEQ_{head_size}.Q_GEQ_1024.SHUF.DT_{dt_tag}"
+        expected_block_m = 16
+    else:
+        # the windowed d512 fp8 composite is a separate SW-scoped entry
+        # without SPLIT_UNMASKED_LOOP (the kernel static-asserts the split
+        # loop off for sliding windows)
+        if sliding_window is not None and head_size == 512 and dt_tag == "fp8_fp8":
+            expected_key = "D_GEQ_512.Q_GEQ_1024.SW.DT_fp8_fp8"
+        else:
+            expected_key = f"D_GEQ_{head_size}.Q_GEQ_1024.DT_{dt_tag}"
+        # all composites tuned to M64 (d512 fp8 retuned from M128 to M64
+        # with TILE 32 / waves 1 per review measurement)
+        expected_block_m = 64
+    key, config = _lookup(
+        table,
+        axes,
+        _axis_values(
+            head_size,
+            max_query_len,
+            max_kv_len,
+            sliding_window if sliding_window is not None else 0,
+            shuffled_kv_cache,
+            block_size,
+            q_dtype,
+            kv_dtype,
+        ),
+    )
+    if not mixed_dtype:
+        assert key == expected_key, f"expected {expected_key}, matched {key}"
+    assert mixed_dtype or config["BLOCK_M"] == expected_block_m, (
+        f"expected BLOCK_M={expected_block_m} via {expected_key},"
+        f" got {config['BLOCK_M']}"
+    )
+
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        shuffled_kv_cache=shuffled_kv_cache,
+        backend="triton",
+    )
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache_orig,
+        value_cache=value_cache_orig,
+        query_lens=[x[0] for x in seq_lens],
+        kv_lens=[x[1] for x in seq_lens],
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+        sliding_window=sliding_window,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+    is_fp8 = kv_dtype.itemsize == 1 or q_dtype.itemsize == 1
+    atol, rtol = (1.5e-1, 1.5e-1) if is_fp8 else (1.5e-2, 1e-2)
+    torch.testing.assert_close(
+        output.to(torch.float32), ref_output.to(torch.float32), atol=atol, rtol=rtol
+    )
+
+
+UNIFIED_ATTENTION_ARCHS = (
+    "gfx1100",
+    "gfx1151",
+    "gfx1200",
+    "gfx1201",
+    "gfx1250",
+    "gfx942",
+    "gfx950",
+)
+
+
+@pytest.mark.parametrize("arch", UNIFIED_ATTENTION_ARCHS)
+def test_unified_attn_split_unmasked_loop_sw_shuf_siblings(arch):
+    """SPLIT_UNMASKED_LOOP must never resolve for a windowed or shuffled call.
+
+    The kernel static-asserts the flag off for both, so any entry carrying it
+    needs SW/SHUF siblings that omit it: a bool axis falls back to the
+    untagged key, which would otherwise hand the flag to a rejected call.
+    """
+    from aiter.ops.triton.utils.unified_attention_utils import (
+        _axis_values,
+        _load,
+        _lookup,
+    )
+
+    dtypes = (torch.bfloat16, e4m3_dtype, torch.uint8)
+    grid = [
+        _axis_values(*args)
+        for args in itertools.product(
+            (32, 64, 128, 192, 256, 512, 576, 1024),
+            (1, 2, 255, 256, 512, 1023, 1024, 2048, 8192),
+            (1024, 4096),
+            (0, 1024),
+            (False, True),
+            (1, 16, 32, 64, 128, 256),
+            dtypes,
+            dtypes,
+        )
+    ]
+
+    hazards = set()
+    for op in ("attn_2d", "attn_3d"):
+        table, axes, _ = _load(op, "triton", arch)
+        for values in grid:
+            key, config = _lookup(table, axes, values)
+            if not config.get("SPLIT_UNMASKED_LOOP"):
+                continue
+            if values["SW"]:
+                hazards.add((op, key, "sliding window"))
+            if values["SHUF"]:
+                hazards.add((op, key, "shuffled kv cache"))
+
+    assert not hazards, (
+        f"{arch}: SPLIT_UNMASKED_LOOP resolves for calls the kernel rejects: "
+        + "; ".join(f"{op}[{key}] with {why}" for op, key, why in sorted(hazards))
+    )

@@ -511,15 +511,55 @@ def is_reduce_gluon_available(params: _UAParams, NUM_SEGMENTS, backend: str):
     return use_gluon and use_gluon_arch
 
 
-def _unified_attention_2d_triton(params: _UAParams):
-    if params.shuffled_kv_cache and (
-        params.q_dtype == e4m3_dtype and params.kv_cache_dtype == e4m3_dtype
-    ):
+def _check_shuffled_page_triton(params: _UAParams):
+    """Page bounds for the shuffled Triton kernels, which pin TILE_SIZE to
+    the page (the Gluon loaders keep their tuned tile and only require
+    block_size >= k_width). Called by both the 2D and 3D Triton paths."""
+    if not params.shuffled_kv_cache:
+        return
+    if params.q_dtype == e4m3_dtype and params.kv_cache_dtype == e4m3_dtype:
         assert (
             params.block_size >= 32
         ), "For A8W8 Unified Attention with pre-shuffled KV cache, only block_size >= 32 is supported"
 
+
+def _check_shuffled_tile_lds(params: _UAParams, config: dict):
+    """A shuffled Triton kernel reads TILE_SIZE (pinned to the page) rows of
+    K and V per iteration. With num_stages > 1 the pipeliner stages two
+    iterations of each tile, and combinations whose staged tiles exceed the
+    architecture's LDS cap do not compile (observed on gfx942: stages-2,
+    page 128, head 256, bf16 -> 131072 B vs a 64 KiB cap). Stage-1 configs
+    launch at any page (verified up to page 256 on gfx942), so only the
+    multi-stage oversized combinations are rejected."""
+    if not params.shuffled_kv_cache or config.get("num_stages", 1) <= 1:
+        return
+    tile = params.block_size
+    # the LDS tile is the K/V load (kv_cache_dtype); Q is staged separately
+    # in the query load/accumulator. Use the padded head dimension, like the
+    # kernel's HEAD_SIZE_PADDED.
+    head = triton.next_power_of_2(params.head_size)
+    staged = config["num_stages"] * tile * head * params.kv_cache_dtype.itemsize
+    lds_cap = arch_info._LDS_CAP_BYTES.get(DEVICE_ARCH)
+    if lds_cap is None:
+        return
+    # RDNA4 has far more LDS per CU than a Triton kernel can address with
+    # 16-bit offset immediates; keep the Triton check within the 64 KiB
+    # directly-addressable window there (the gluon path is not checked here).
+    if DEVICE_ARCH == "gfx1250":
+        lds_cap = min(lds_cap, 65536)
+    assert staged <= lds_cap, (
+        f"Unified Attention Triton path with pre-shuffled KV cache: page "
+        f"{tile} x head {params.head_size} with num_stages "
+        f"{config['num_stages']} stages {staged} B per tile, exceeding the "
+        f"{DEVICE_ARCH} LDS cap of {lds_cap} B; use a smaller page or a "
+        f"stage-1 config"
+    )
+
+
+def _unified_attention_2d_triton(params: _UAParams):
+    _check_shuffled_page_triton(params)
     config = get_unified_attention_config("attn_2d", params, backend="triton")
+    _check_shuffled_tile_lds(params, config)
     config["BLOCK_M"] = max(
         config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv)
     )
@@ -594,7 +634,9 @@ def _unified_attention_3d_triton(
     NUM_SEGMENTS,
     TILE_SIZE,
 ):
+    _check_shuffled_page_triton(params)
     config = get_unified_attention_config("attn_3d", params, backend="triton")
+    _check_shuffled_tile_lds(params, config)
     config["BLOCK_M"] = max(
         config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv)
     )
