@@ -214,21 +214,28 @@ def _shipped_config(batch_size, next_n):
     return rows.get(batch_size)
 
 
-def _launch_shipped_row():
+def _dispatch_shipped_row():
     expected = _shipped_config(64, 8)
     original = pmql.run_paged_mqa_logits
     launched = {}
 
     def spy(config, *args, **kwargs):
         launched["config"] = dict(config)
-        return original(config, *args, **kwargs)
+        return args[3]
 
     pmql.run_paged_mqa_logits = spy
     try:
-        shape = (64, 8, HEADS, HEAD_DIM, KV_BLOCK_SIZE, True)
-        inp = build_inputs(shape, 8192, 8192)
-        pmql.paged_mqa_logits(*launch_args(inp))
-        torch.cuda.synchronize()
+        pmql.paged_mqa_logits(
+            torch.empty((64, 8, HEADS, HEAD_DIM), dtype=dtypes.fp8),
+            torch.empty((1, KV_BLOCK_SIZE, 1, HEAD_DIM + 4), dtype=torch.uint8),
+            torch.empty((64 * 8, HEADS), dtype=torch.float32),
+            torch.empty((64 * 8, KV_BLOCK_SIZE), dtype=torch.float32),
+            torch.ones((64,), dtype=torch.int32),
+            torch.zeros((64, 1), dtype=torch.int32),
+            KV_BLOCK_SIZE,
+            True,
+            KV_BLOCK_SIZE,
+        )
     finally:
         pmql.run_paged_mqa_logits = original
     assert launched["config"] == expected, (
@@ -238,13 +245,15 @@ def _launch_shipped_row():
 
 
 def check_launches_shipped_row():
-    if _shipped_config(64, 8) is None:
+    expected = _shipped_config(64, 8)
+    if expected is None:
         aiter.logger.warning(
             "paged_mqa_logits shipped-row check skipped on %s cu=%s",
             get_gfx_runtime(),
             get_cu_num(),
         )
         return
+    assert expected != pmql.DEFAULT_CONFIG, expected
     # chip_info is imported under two names, so GPU_ARCHS only applies in a new process.
     other = "gfx942" if get_gfx_runtime() != "gfx942" else "gfx950"
     env = {**os.environ, "GPU_ARCHS": other, _SHIPPED_ROW_CHILD: "1"}
@@ -293,7 +302,7 @@ def check_flydsl_fallback_keeps_gluon_knobs():
 def main():
     if os.environ.get(_SHIPPED_ROW_CHILD):
         assert get_gfx() != get_gfx_runtime()
-        _launch_shipped_row()
+        _dispatch_shipped_row()
         return
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning("paged_mqa_logits unsupported on %s; skipping", get_gfx())
