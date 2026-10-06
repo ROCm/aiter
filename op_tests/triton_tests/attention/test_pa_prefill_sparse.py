@@ -471,7 +471,8 @@ def test_pa_prefill_sparse_gfx950(T, H, D, prefix_len):
 
 def _sparse_prefill_single_source_torch(q, kv, indices, indptr, attn_sink, scale):
     """Vectorized fp32 reference for one KV pool: pads each row's ragged slot list
-    to the longest row and masks ``-1`` / padding. ``attn_sink=None`` means no sink."""
+    to the longest row and masks padding and slots outside ``[0, len(kv))``.
+    ``attn_sink=None`` means no sink."""
     T, H, _ = q.shape
     lens = (indptr[1:] - indptr[:-1]).long()
     K = max(int(lens.max().item()), 1)
@@ -481,8 +482,8 @@ def _sparse_prefill_single_source_torch(q, kv, indices, indptr, attn_sink, scale
         max=max(indices.numel() - 1, 0)
     )
     slots = torch.where(in_row, indices.long()[flat] if indices.numel() else -1, -1)
-    valid = slots >= 0
-    kv_g = kv.float()[slots.clamp(min=0)]  # [T, K, D]
+    valid = (slots >= 0) & (slots < kv.shape[0])
+    kv_g = kv.float()[slots.clamp(0, max(kv.shape[0] - 1, 0))]  # [T, K, D]
     scores = torch.einsum("thd,tkd->thk", q.float(), kv_g) * scale
     scores = scores.masked_fill(~valid[:, None, :], float("-inf"))
     if attn_sink is not None:
@@ -493,6 +494,25 @@ def _sparse_prefill_single_source_torch(q, kv, indices, indptr, attn_sink, scale
     w = (scores - cmax).exp()
     w = w / w.sum(dim=-1, keepdim=True).clamp(min=1e-30)
     return torch.einsum("thk,tkd->thd", w[..., :K], kv_g).to(q.dtype)
+
+
+def _inject_invalid_slots(indices, num_kv):
+    """Mark slots invalid in place: 1/8 to -1, 1/32 to exactly num_kv (the
+    first row past the pool) and 1/32 to far past it, up to the int32 max."""
+    n = indices.numel()
+    if not n:
+        return
+    perm = torch.randperm(n, device=indices.device)
+    indices[perm[: n // 8]] = -1
+    indices[perm[n // 8 : n // 8 + n // 32]] = num_kv
+    far = perm[n // 8 + n // 32 : n // 8 + 2 * (n // 32)]
+    indices[far] = torch.randint(
+        num_kv + 1,
+        2**31 - 1,
+        (far.numel(),),
+        dtype=indices.dtype,
+        device=indices.device,
+    )
 
 
 # DSv4.1-Flash TP4: H=16 per rank, D=512, top-512 + 128 SWA = 640 slots.
@@ -524,9 +544,7 @@ def test_pa_prefill_sparse_single_source(T, H, max_len, sentinels, with_sink):
         0, num_kv, (int(indptr[-1]),), dtype=torch.int32, device=dev
     )
     if sentinels and indices.numel():
-        indices[torch.randperm(indices.numel(), device=dev)[: indices.numel() // 8]] = (
-            -1
-        )
+        _inject_invalid_slots(indices, num_kv)
         row = int(torch.nonzero(lens >= 32)[0]) if bool((lens >= 32).any()) else None
         if row is not None:  # a whole leading tile of -1
             s = int(indptr[row])
@@ -572,9 +590,7 @@ def test_pa_prefill_sparse_single_source_other_head_dims(D, sentinels):
         0, num_kv, (int(indptr[-1]),), dtype=torch.int32, device=dev
     )
     if sentinels:
-        indices[torch.randperm(indices.numel(), device=dev)[: indices.numel() // 8]] = (
-            -1
-        )
+        _inject_invalid_slots(indices, num_kv)
     scale = D**-0.5
 
     ref = _sparse_prefill_single_source_torch(q, kv, indices, indptr, sink, scale)
