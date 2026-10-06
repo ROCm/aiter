@@ -312,7 +312,8 @@ def _sparse_attn_prefill_kernel(
     BLOCK_D: tl.constexpr,
     BLOCK_K: tl.constexpr,
     # False promises every slot in [indptr[i], indptr[i+1]) is a valid row, so
-    # the -1 / out-of-pool check drops out of the inner loop.
+    # no slot is masked out of the softmax (a broken promise gives wrong
+    # results, never an out-of-pool read).
     HAS_INVALID: tl.constexpr = True,
     USE_EXP2: tl.constexpr = False,
     # head_dim == BLOCK_D and num_heads % BLOCK_H == 0: no q/kv/out masks.
@@ -346,10 +347,7 @@ def _sparse_attn_prefill_kernel(
 
     if USE_EXP2:
         scale = scale * 1.4426950408889634  # log2(e): softmax runs in base 2
-    # Finite start for the running max: masked (-inf) scores then exponentiate
-    # to exactly 0 and exp(m_i - m_new) never sees -inf - -inf, so a tile with
-    # no valid slot needs no NaN guard.
-    m_i = tl.full((BLOCK_H,), -1.0e30, dtype=tl.float32)
+    m_i = tl.full((BLOCK_H,), float("-inf"), dtype=tl.float32)
     l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
     acc = tl.zeros((BLOCK_H, BLOCK_D), dtype=tl.float32)
 
@@ -376,7 +374,10 @@ def _sparse_attn_prefill_kernel(
             # vectorized); their scores are masked to -inf below.
             slot = tl.where(valid, slot, 0)
         else:
+            # Caller promises every slot is valid; still keep the unmasked
+            # gather inside the pool if that promise is broken.
             valid = in_range
+            slot = tl.where(slot.to(tl.uint32, bitcast=True) < num_kv, slot, 0)
 
         # 64-bit before the multiply, same as the decode kernel: a slot index
         # fits 32 bits (the index buffer is int32 by ABI) but `slot *
@@ -410,8 +411,13 @@ def _sparse_attn_prefill_kernel(
 
         m_block = tl.max(scores, axis=1) * scale
         m_new = tl.maximum(m_i, m_block)
-        alpha = _exp(m_i - m_new, USE_EXP2)
-        p = _exp(scores * scale - m_new[:, None], USE_EXP2)
+        alpha = tl.where(m_new == float("-inf"), 0.0, _exp(m_i - m_new, USE_EXP2))
+        p = tl.where(
+            m_new[:, None] == float("-inf"),
+            0.0,
+            _exp(scores * scale - m_new[:, None], USE_EXP2),
+        )
+        p = tl.where(head_mask[:, None] & valid[None, :], p, 0.0)
         l_new = l_i * alpha + tl.sum(p, axis=1)
 
         acc = acc * alpha[:, None] + tl.dot(p.to(kv.dtype), kv)

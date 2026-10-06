@@ -71,8 +71,9 @@ def pa_prefill_sparse(
         attn_sink:         [H] fp32 — per-head softmax-denom bias.
         softmax_scale:     float.
         has_invalid:       whether index lists may hold ``-1`` / out-of-pool
-            slots. ``False`` lets the kernel skip those checks; ``None`` picks
-            a heuristic on gfx1250 and assumes ``True`` elsewhere.
+            slots. ``False`` skips masking them (a broken promise gives wrong
+            results but never reads outside the pool); ``None`` picks a
+            heuristic on gfx1250 and assumes ``True`` elsewhere.
         out:               optional [T, H, D] output buffer, written in place.
 
     Returns:
@@ -239,11 +240,13 @@ def pa_prefill_sparse(
             float(softmax_scale),
         )
 
-        if DEVICE_ARCH == "gfx942" and num_heads <= 16:
-            # Fixed config from a sweep at DSv4.1-Flash TP4 (H=16, D=512,
-            # top-512 + 128 SWA, M=16384) with Triton 3.7.1: ~1.5x over the
-            # autotune default (BLOCK_H=32, 4 warps), which masks half of every
-            # 32-row tile at H=16.
+        if DEVICE_ARCH == "gfx942" and num_heads in (8, 16) and head_dim == 512:
+            # Fixed config from a sweep on Triton 3.7.1 at D=512: 2.4-2.9x over
+            # the autotune default for H in {8, 16} and 32-640 slots per query
+            # (production: DSv4.1-Flash TP4, H=16, top-512 + 128 SWA). One wave
+            # per program puts 4 programs on a CU; kpack=2 halves the LDS
+            # operand reads and frees the registers that make 2 stages pay.
+            # Other shapes stay on autotune.
             block_h = 16
             _sparse_attn_prefill_kernel.fn[
                 (num_queries, triton.cdiv(num_heads, block_h))
@@ -252,14 +255,15 @@ def pa_prefill_sparse(
                 HAS_ATTN_SINK=has_attn_sink,
                 BLOCK_H=block_h,
                 BLOCK_D=block_d,
-                BLOCK_K=32,
+                BLOCK_K=16,
                 HAS_INVALID=True if has_invalid is None else has_invalid,
                 USE_EXP2=True,
                 EVEN_HD=block_d == head_dim and num_heads % block_h == 0,
-                num_warps=2,
-                num_stages=1,
-                waves_per_eu=0,
+                num_warps=1,
+                num_stages=2,
+                waves_per_eu=1,
                 matrix_instr_nonkdim=16,
+                kpack=2,
             )
             return out
 
@@ -271,6 +275,7 @@ def pa_prefill_sparse(
             *args,
             HAS_ATTN_SINK=has_attn_sink,
             BLOCK_D=block_d,
+            HAS_INVALID=True if has_invalid is None else has_invalid,
         )
         return out
 

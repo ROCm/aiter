@@ -550,3 +550,60 @@ def test_pa_prefill_sparse_single_source(T, H, max_len, sentinels, with_sink):
     )
     assert ret is out
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+# Head dims other than 512 take the autotuned launch on every arch.
+@pytest.mark.parametrize("D", [128, 576])
+@pytest.mark.parametrize("sentinels", [True, False])
+def test_pa_prefill_sparse_single_source_other_head_dims(D, sentinels):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    if DEVICE_ARCH in ("gfx950", "gfx1250"):
+        pytest.skip("covers the Triton single-source branch")
+
+    torch.manual_seed(1)
+    T, H, num_kv, dev = 257, 16, 2048, "cuda"
+    q = torch.randn(T, H, D, dtype=torch.bfloat16, device=dev)
+    kv = torch.randn(num_kv, D, dtype=torch.bfloat16, device=dev)
+    sink = torch.randn(H, dtype=torch.float32, device=dev)
+    lens = torch.randint(1, 200, (T,), device=dev)
+    indptr = torch.zeros(T + 1, dtype=torch.int32, device=dev)
+    indptr[1:] = lens.cumsum(0)
+    indices = torch.randint(
+        0, num_kv, (int(indptr[-1]),), dtype=torch.int32, device=dev
+    )
+    if sentinels:
+        indices[torch.randperm(indices.numel(), device=dev)[: indices.numel() // 8]] = (
+            -1
+        )
+    scale = D**-0.5
+
+    ref = _sparse_prefill_single_source_torch(q, kv, indices, indptr, sink, scale)
+    out = pa_prefill_sparse(
+        q, kv, indices, indptr, None, None, None, sink, scale, has_invalid=sentinels
+    )
+    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+# has_invalid=False is a promise; breaking it may give wrong numbers but must
+# never read outside the KV pool.
+@pytest.mark.parametrize("H", [8, 16])
+def test_pa_prefill_sparse_broken_has_invalid_promise_stays_in_bounds(H):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    if DEVICE_ARCH in ("gfx950", "gfx1250"):
+        pytest.skip("covers the Triton single-source branch")
+
+    torch.manual_seed(2)
+    T, D, num_kv, dev = 512, 512, 1024, "cuda"
+    q = torch.randn(T, H, D, dtype=torch.bfloat16, device=dev)
+    kv = torch.randn(num_kv, D, dtype=torch.bfloat16, device=dev)
+    indptr = torch.arange(0, (T + 1) * 64, 64, dtype=torch.int32, device=dev)
+    indices = torch.randint(0, num_kv, (T * 64,), dtype=torch.int32, device=dev)
+    indices[::3] = -1
+    indices[1::7] = num_kv + 10_000_000  # far past the pool
+    out = pa_prefill_sparse(
+        q, kv, indices, indptr, None, None, None, None, D**-0.5, has_invalid=False
+    )
+    torch.cuda.synchronize()
+    assert torch.isfinite(out).all()
