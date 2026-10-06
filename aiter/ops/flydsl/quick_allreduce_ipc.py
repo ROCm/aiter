@@ -77,6 +77,8 @@ class UncachedIpcHeap:
             ctypes.c_int,
             ctypes.c_size_t,
         ]
+        cls._hip.hipDeviceSynchronize.restype = ctypes.c_int
+        cls._hip.hipDeviceSynchronize.argtypes = []
         cls._hip.hipMemcpy.restype = ctypes.c_int
         cls._hip.hipMemcpy.argtypes = [
             ctypes.c_void_p,
@@ -129,8 +131,9 @@ class UncachedIpcHeap:
         cls._hip_check(err, what="hipIpcCloseMemHandle")
 
     @classmethod
-    def alloc(cls, size: int, flags: int | None = None) -> int:
-        """Zeroed device allocation, IPC-shareable, in the given memory mode.
+    def alloc(cls, size: int, flags: int | None = None, fill: int = 0) -> int:
+        """Device allocation with every byte set to *fill*, IPC-shareable, in the
+        given memory mode.
 
         *flags* is a ``hipExtMallocWithFlags`` mode; ``None`` means uncached.
         Only uncached and fine-grained are used in practice -- coarse-grained
@@ -154,8 +157,13 @@ class UncachedIpcHeap:
             ctypes.c_uint(int(flags)),
         )
         cls._hip_check(err, what=f"hipExtMallocWithFlags(flags={int(flags):#x})")
-        err = hip.hipMemset(buf, 0, ctypes.c_size_t(size))
+        err = hip.hipMemset(buf, int(fill), ctypes.c_size_t(size))
         cls._hip_check(err, what="hipMemset")
+        # hipMemset may return before the fill has landed. A peer writes into
+        # this buffer as soon as it has the IPC handle, and a fill landing after
+        # such a write would erase it.
+        err = hip.hipDeviceSynchronize()
+        cls._hip_check(err, what="hipDeviceSynchronize")
         return int(buf.value)
 
     @classmethod

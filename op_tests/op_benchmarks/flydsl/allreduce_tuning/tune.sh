@@ -66,17 +66,18 @@ export AITER_FLY_AR=1
 export FLYDSL_EXTRA_SOURCE_DIRS=$REPO/aiter/ops/flydsl/kernels${FLYDSL_EXTRA_SOURCE_DIRS:+:$FLYDSL_EXTRA_SOURCE_DIRS}
 
 # --- candidates ----------------------------------------------------------------------
+# The pinned rows mirror _FLY_MESH_GRID, _FLY_RING_GRID and _FLY1S_GRID in the bench.
 MESH_PINNED=""
-for b in 64 128 256 512; do for st in 1 8; do for ss in "" _ss; do
-  MESH_PINNED+=" fly_int4_b${b}_st${st}_g128${ss}"
-done; done; done
+for b in 256 512; do for st in 1 8; do
+  MESH_PINNED+=" fly_int4_b${b}_st${st}_g128"
+done; done
 RING_PINNED=""
-for b in 64 128 256 512; do for st in 8 16 32; do
+for b in 128 256 512; do for st in 8 16 32; do
   RING_PINNED+=" fly_int4_ring_b${b}_st${st}_g128"
 done; done
 ONESHOT_PINNED="fly_1stage_b256_a1_g64 fly_1stage_b256_a1_g128 fly_1stage_b128_a1_g128 \
-fly_1stage_b64_a1_g64 fly_1stage_b64_a1_g256 fly_1stage_b512_a1_g64 \
-fly_1stage_b256_a2_g64 fly_1stage_b256_a4_g64 fly_1stage_b512_a4_g64"
+fly_1stage_b64_a1_g64 fly_1stage_b512_a1_g64 fly_1stage_b512_a2_g64 \
+fly_1stage_b256_a2_g64 fly_1stage_b256_a4_g64 fly_1stage_b512_a4_g64 fly_1stage_b512_a4_g128"
 
 FAST_C="cdr cdr_naive qr_int4 fly_auto fly_1stage $ONESHOT_PINNED $MESH_PINNED $RING_PINNED"
 # Exact mode only ever reaches the one-shot (quantized rows are n/a).
@@ -89,7 +90,7 @@ REPORT_C="cdr cdr_naive qr_int4 rccl fly_auto"
 WARMUP=5; ITERS=50
 SHAPES=$HERE/shapes; FUSED_SHAPES=$HERE/fused/shapes
 if [[ $SMOKE == 1 ]]; then
-  FAST_C="cdr fly_auto fly_1stage fly_1stage_b256_a1_g128 fly_int4_b256_st1_g128_ss"
+  FAST_C="cdr fly_auto fly_1stage fly_1stage_b256_a1_g128 fly_int4_b256_st1_g128"
   EXACT_C="cdr fly_auto fly_1stage fly_1stage_b256_a1_g128"
   VAL_FAST_C=$FAST_C; VAL_EXACT_C=$EXACT_C
   REPORT_C="cdr fly_auto"
@@ -261,7 +262,7 @@ EOF
   [[ -n $fly1s ]] || die "failed to enumerate fused_fly1s candidates"
   # Every fused one-shot row (ladder default, pinned unsplit grid, split-H grid) plus
   # exact baselines and the quantized mesh for the fast-mode boundary.
-  cands="fused_cdr_1stage fused_cdr_2stage separate_cdr separate_rccl fused_fly_auto fused_fly_mesh fused_fly_mesh_ss $fly1s"
+  cands="fused_cdr_1stage fused_cdr_2stage separate_cdr separate_rccl fused_fly_auto fused_fly_mesh $fly1s"
   if [[ $SMOKE == 1 ]]; then cands="fused_cdr_1stage fused_fly_auto $(cut -d' ' -f1-3 <<<"$fly1s")"; fi
   log "fused sweep: $(wc -w <<<"$cands") candidates, tp=[$TPS] widths=[$WIDTHS]"
   for tp in $TPS; do tp_ok "$tp" || continue

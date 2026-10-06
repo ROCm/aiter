@@ -1,7 +1,7 @@
 """Fit xGMI FUSED_ONESHOT_LADDER rungs and FUSED_FAMILY_POLICY bounds from
 the fused sweep (<sweep_dir>/tp{tp}_w{h}.csv).
 
-A rung is ``(min_bytes, atoms, grid_cap, fanout, skip_self, split)`` and is
+A rung is ``(min_bytes, atoms, grid_cap, fanout, split)`` and is
 shared by every width, so a rung's time at (width, M) is the measured row whose
 geometry the engine would resolve it to (``OneShotAllReduceRMSNorm._geom_for``
 on a bare, unpinned, pad-on instance) -- looked up by the knobs parsed from each
@@ -25,7 +25,7 @@ from aiter.ops.flydsl.one_shot_allreduce import OneShotAllReduceRMSNorm
 SQNR_FLOOR = 40.0
 _VAR = re.compile(
     r"_a(?P<a>\d+)_g(?P<g>\d+)_\w*?_b(?P<b>\d+)(?P<peer>_peer)?_rms_h\d+(?:p(?P<p>\d+))?"
-    r"(?:_k(?P<k>\d+))?(?P<ss>_r\*_ss)?/"
+    r"(?:_k(?P<k>\d+))?/"
 )
 ATOMS = (1, 2, 4)
 CAPS = (8, 32, 64, 128, 256)
@@ -42,7 +42,6 @@ def parse(variant):
         int(m["b"]),
         int(m["k"] or 1),
         int(m["p"] or 0),
-        bool(m["ss"]),
     )
 
 
@@ -56,12 +55,12 @@ def _bare():
 _ENG = _bare()
 
 
-def resolve(h, atoms, cap, ss, split):
+def resolve(h, atoms, cap, split):
     """Knob tuple the engine builds for this rung at width *h*."""
     a, h_pad, k = _ENG._geom_for(h, atoms, split)
     block = h_pad // (8 * a * k)
     cap_eff = max(k, cap // k * k)
-    return (a, cap_eff, block, k, h_pad if h_pad != h else 0, bool(ss))
+    return (a, cap_eff, block, k, h_pad if h_pad != h else 0)
 
 
 def load(sweep_dir, metric):
@@ -94,7 +93,7 @@ def load(sweep_dir, metric):
                     meas=meas,
                     best=min(meas.values()) if meas else math.inf,
                     cdr=min(t("fused_cdr_1stage"), t("fused_cdr_2stage")),
-                    mesh=min(t("fused_fly_mesh"), t("fused_fly_mesh_ss")),
+                    mesh=t("fused_fly_mesh"),
                     shipped=t("fused_fly_1stage"),
                 )
             )
@@ -104,14 +103,13 @@ def load(sweep_dir, metric):
 def configs():
     for a in ATOMS:
         for cap in CAPS:
-            for ss in (False, True):
-                for k in SPLITS:
-                    yield (a, cap, ss, k)
+            for k in SPLITS:
+                yield (a, cap, k)
 
 
 def cfg_time(shape, cfg):
-    a, cap, ss, k = cfg
-    return shape["meas"].get(resolve(shape["h"], a, cap, ss, k), math.inf)
+    a, cap, k = cfg
+    return shape["meas"].get(resolve(shape["h"], a, cap, k), math.inf)
 
 
 def fit_ladder(shapes, max_rungs, penalty):
@@ -191,9 +189,9 @@ def best_threshold(shapes, below, above):
 
 
 def fmt_rung(mb, cfg):
-    a, cap, ss, k = cfg
+    a, cap, k = cfg
     kb = f"{mb >> 10} << 10" if mb else "0"
-    return f'({kb}, {a}, {cap}, "peer", {ss}, {k})'
+    return f'({kb}, {a}, {cap}, "peer", {k})'
 
 
 def main():

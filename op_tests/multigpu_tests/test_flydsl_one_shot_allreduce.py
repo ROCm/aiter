@@ -14,8 +14,8 @@ it walks ``ONESHOT_LADDER`` and picks a rung by payload size -- on payloads
 derived from ``allreduce_policy``: at every world size, both ends of each
 rung's slice of the window the policy routes to the one-shot. Next to it, a
 few spot checks run pinned configurations no shipped rung uses, one world size
-each. ``--atoms``, ``--grid-cap``, ``--fanout``, ``--block`` or ``--skip-self``
-pin a configuration instead.
+each. ``--atoms``, ``--grid-cap``, ``--fanout`` or ``--block`` pin a
+configuration instead.
 
 ``test_one_shot_allreduce`` checks three things per shape, and the second
 matters more than the first:
@@ -34,9 +34,20 @@ ladder or policy the payload derivation does not follow fails rather than
 silently leaving a rung untested.
 
 ``test_one_shot_allreduce_run_ahead`` makes repeated back-to-back calls under
-deliberate rank skew. The inbox is double-buffered by ``colour & 1`` and the
-safety argument depends on a straggler's read of call k finishing before
-anyone's push for call k+2; a quiescent test never exercises that.
+deliberate rank skew. The inbox rotates through three buffers by colour, and
+the safety argument depends on a straggler's read of round k finishing before
+anyone's push for round k+2 lands in the buffer it re-armed; a quiescent test
+never exercises that.
+
+``test_one_shot_allreduce_fresh_inputs`` makes back-to-back calls with a new
+input on every call, at varying sizes and under rank skew, and checks each
+result bit for bit against an fp32 rank-order reference. A static input cannot
+see a read of a stale inbox slot: the stale data is the right answer. The
+slots are re-armed rather than flagged, so the run also feeds the kernel the
+NaN pattern it uses as a sentinel.
+
+``test_one_shot_allreduce_rmsnorm_fresh_inputs`` does the same for the fused
+kernel, where a stale slot would also show up in ``residual_out``.
 
 The fused suites add a fourth check: ``residual_out`` must be **bit-exact**
 against the reference, not merely close. Both sides sum in rank order in fp32
@@ -116,8 +127,8 @@ SPOT_SHAPES = [(m, HIDDEN) for m in (1, 3, 5, 8, 16)] + [
     (1, 3072),
 ]
 
-# Each replay advances the device-side colour and alternates the inbox parity
-# slot, so only repeated replays show the captured launch advancing that state
+# Each replay advances the device-side colour and rotates the inbox buffer, so
+# only repeated replays show the captured launch advancing that state
 # rather than freezing it.
 GRAPH_REPLAYS = 4
 
@@ -134,7 +145,6 @@ SPOT_CONFIGS = (
             "grid_cap": 64,
             "fanout": "peer",
             "block": 512,
-            "skip_self": False,
         },
     ),
     (
@@ -144,17 +154,29 @@ SPOT_CONFIGS = (
             "grid_cap": 64,
             "fanout": "peer",
             "block": 512,
-            "skip_self": True,
+        },
+    ),
+    (
+        8,
+        {
+            "atoms": 2,
+            "grid_cap": 64,
+            "fanout": "peer",
+            "block": 256,
         },
     ),
 )
 
 RUN_AHEAD_M = 5
 RUN_AHEAD_ITERS = 200
+# Fresh-input stress: calls, and the token counts they cycle through at HIDDEN.
+# 160 x 7168 is 2.2 MiB, several tiles per block at every rung's grid cap.
+FRESH_ITERS = 300
+FRESH_TOKENS = (1, 2, 3, 8, 1, 160, 4, 1)
 SQNR_FLOOR_DB = 45.0
 
-# Seconds to wait for each rank of a spawn. The kernels spin on flags written
-# by peers, so a protocol bug or a dead rank hangs the rest; this fails the
+# Seconds to wait for each rank of a spawn. The kernels spin on inbox slots
+# written by peers, so a protocol bug or a dead rank hangs the rest; this fails the
 # spawn instead of leaving it to CI's per-file timeout. A full default run of
 # either FlyDSL all-reduce test takes a few minutes, JIT included.
 SPAWN_TIMEOUT_S = 600
@@ -209,9 +231,11 @@ FUSED_ATOMS_CASES = ((2, 4096), (2, 8192), (4, 4096), (4, 8192))
 # engine solve for atoms at each width.
 FUSED_BLOCK_CASES = ((512, 4096), (256, 8192), (448, 7168))
 
-# Self-skip on the fused kernel: this rank's contribution comes out of registers
-# instead of out of its own inbox.
-FUSED_SKIP_SELF_CASES = ((1, 4096), (8, 7168), (32, 8192))
+# Fresh-input stress on the fused kernel, at the Qwen3-235B width. ``None``
+# walks the shipped ladder; 4 forces a split build, whose exchange words rotate
+# with the inbox colour.
+FUSED_FRESH_HIDDEN = 4096
+FUSED_FRESH_SPLITS = (None, 4)
 
 # Split rows: ``split`` workgroups per token row, joined through the HBM
 # exchange word. Every split the shipped widths have below 16, with 7168's odd
@@ -299,6 +323,46 @@ def _metrics(out, ref, tp: int) -> dict:
     }
 
 
+def _rank_order_sum(parts: list[torch.Tensor]) -> torch.Tensor:
+    """fp32 sum in rank order, rounded to bf16 once: what the kernel computes,
+    bit for bit."""
+    acc = parts[0].float()
+    for p in parts[1:]:
+        acc = acc + p.float()
+    return acc.to(torch.bfloat16)
+
+
+def _fresh_inputs(eng, rank: int, tp: int, device) -> dict:
+    """``FRESH_ITERS`` calls, each on a new input and into its own output, with
+    no host sync in between, then every result checked bit for bit.
+
+    Rank 0 is dragged now and then so the others run ahead. Every 7th call
+    carries the bf16 NaN ``0xFFFF`` in some lanes of every rank, which is the
+    inbox sentinel; the result there need only be NaN.
+    """
+    drag = torch.randn(2048, 2048, device=device, dtype=torch.float32)
+    calls = []
+    for it in range(FRESH_ITERS):
+        m = FRESH_TOKENS[it % len(FRESH_TOKENS)]
+        parts = _parts(m, HIDDEN, tp, 7 + it, device)
+        if it % 7 == 3:
+            for p in parts:
+                p.view(torch.int16).view(-1)[it % 5 :: 97] = -1
+        if rank == 0 and it % 5 == 0:
+            drag = drag @ drag.T * 1e-6
+        inp = parts[rank].contiguous()
+        out = torch.empty_like(inp)
+        eng.allreduce(inp, out)
+        calls.append((out, _rank_order_sum(parts)))
+    torch.cuda.synchronize()
+    mismatches = 0
+    for out, ref in calls:
+        nan = ref.isnan()
+        mismatches += int((out.view(torch.int16) != ref.view(torch.int16))[~nan].sum())
+        mismatches += int((~out.isnan() & nan).sum())
+    return {"calls": len(calls), "mismatches": mismatches}
+
+
 def _worst(a: dict, b: dict) -> dict:
     return {
         "sqnr_db": min(a["sqnr_db"], b["sqnr_db"]),
@@ -366,6 +430,53 @@ def _bits_agree(tensor, tp, dist) -> int | None:
     return None
 
 
+def _fused_fresh_inputs(eng, rank: int, tp: int, hidden: int, device) -> list[str]:
+    """``FRESH_ITERS`` fused calls, each on new inputs and into its own outputs,
+    with no host sync in between, then every result checked.
+
+    Same skew and sentinel pattern as ``_fresh_inputs``. ``residual_out`` must
+    match the reference bit for bit wherever the reference is not NaN, and be
+    NaN where it is. ``out`` goes through ``rsqrt``, so it is graded on SQNR,
+    over the rows the sentinel left finite: a split build clamps a NaN partial
+    in its exchange, so a NaN row's norm need not be NaN.
+    """
+    eng.preload(hidden)
+    torch.manual_seed(5)
+    weight = torch.randn(hidden, dtype=torch.bfloat16, device=device)
+    drag = torch.randn(2048, 2048, device=device, dtype=torch.float32)
+    calls = []
+    for it in range(FRESH_ITERS):
+        m = FRESH_TOKENS[it % len(FRESH_TOKENS)]
+        parts = _parts(m, hidden, tp, 7 + it, device)
+        residual = torch.randn(m, hidden, dtype=torch.bfloat16, device=device)
+        if it % 7 == 3:
+            for p in parts:
+                p.view(torch.int16).view(-1)[it % 5 :: 97] = -1
+        if rank == 0 and it % 5 == 0:
+            drag = drag @ drag.T * 1e-6
+        inp = parts[rank].contiguous()
+        out, res_out = eng.allreduce_rmsnorm(inp, residual, weight, RMS_EPS)
+        calls.append(
+            (it, out, res_out, *_fused_reference(parts, residual, weight, RMS_EPS))
+        )
+    torch.cuda.synchronize()
+    bad = []
+    for it, out, res_out, out_ref, res_ref in calls:
+        nan = res_ref.isnan()
+        n = int((res_out.view(torch.int16) != res_ref.view(torch.int16))[~nan].sum())
+        n += int((~res_out.isnan() & nan).sum())
+        if n:
+            bad.append(f"call {it}: residual_out differs in {n} bf16 lanes")
+        finite = ~out_ref.isnan().any(-1)
+        if finite.any():
+            db = _sqnr_db(out_ref[finite].float(), out[finite].float())
+            if db < SQNR_FLOOR_DB:
+                bad.append(f"call {it}: out SQNR {db:.2f} dB")
+    if len(bad) > 5:
+        bad = bad[:5] + [f"... {len(bad) - 5} more of {len(calls)} calls"]
+    return bad
+
+
 def _log_path(world_size: int, rank: int, mode: str, tag: str) -> str:
     """One log per (world size, rank, mode, knobs) so concurrent spawn
     configurations cannot overwrite each other's failure tails.
@@ -383,7 +494,6 @@ def _fused_spawn(
     atoms: int | None = DEFAULT_ATOMS,
     grid_cap: int | None = DEFAULT_GRID_CAP,
     fanout: str | None = DEFAULT_FANOUT,
-    skip_self: bool | None = None,
     block: int | None = None,
     mode: str = "fused",
     iters: int = RUN_AHEAD_ITERS,
@@ -420,8 +530,6 @@ def _fused_spawn(
     tag = f"a{atoms}"
     if block is not None:
         tag += f"_b{block}"
-    if skip_self is not None:
-        tag += "_ss" if skip_self else "_noss"
     if split is not None:
         tag += f"_k{split}"
     if grid_cap is not None:
@@ -455,8 +563,6 @@ def _fused_spawn(
             cmd += ["--grid-cap", str(grid_cap)]
         if fanout is not None:
             cmd += ["--fanout", fanout]
-        if skip_self is not None:
-            cmd += ["--skip-self" if skip_self else "--no-skip-self"]
         if block is not None:
             cmd += ["--block", str(block)]
         if split is not None:
@@ -523,8 +629,10 @@ def _run_rank_fused(args, rank, device, dist) -> None:
     ``fused_slice_lag`` builds with the factory's test-only
     ``debug_slice_delay``, injected by wrapping the factory rather than through
     the engine's API: slice 0 of every row group stalls between contributing to
-    the exchange and reading it, so its siblings run ahead into the other
-    parity's word.
+    the exchange and reading it, so its siblings run ahead into the next
+    colour's word.
+
+    ``fused_fresh`` is the fused counterpart of ``_fresh_inputs``.
     """
     from aiter.ops.flydsl import one_shot_allreduce as _host
     from aiter.ops.flydsl.one_shot_allreduce import OneShotAllReduceRMSNorm
@@ -550,7 +658,6 @@ def _run_rank_fused(args, rank, device, dist) -> None:
         grid_cap=args.grid_cap,
         fanout=args.fanout,
         block=args.block,
-        skip_self=args.skip_self,
         split=args.split,
         # As in the plain test: the payload ceiling is a speed policy, not a
         # correctness limit, so it must not decide what this test covers.
@@ -619,8 +726,8 @@ def _run_rank_fused(args, rank, device, dist) -> None:
         checks = 0
         for it in range(args.iters):
             # Rank 0 arrives late every third call, so the others run ahead into
-            # the other parity slot -- the case the double-buffered inbox exists
-            # for, and one a quiescent loop never reaches. (Slice lag skews the
+            # the next inbox buffer -- the case the buffer rotation exists for,
+            # and one a quiescent loop never reaches. (Slice lag skews the
             # workgroups of one row instead, inside the kernel.)
             if args.mode == "fused_run_ahead" and rank == 0 and it % 3 == 0:
                 for _ in range(3):
@@ -640,6 +747,10 @@ def _run_rank_fused(args, rank, device, dist) -> None:
         torch.cuda.synchronize()
         if bad or _sqnr_db(out_ref.float(), out.float()) < SQNR_FLOOR_DB:
             failures.append(f"{args.mode} loop: {bad} bad checks of {checks}")
+    elif args.mode == "fused_fresh":
+        failures.extend(
+            _fused_fresh_inputs(eng, rank, args.tp, args.hiddens[0], device)
+        )
     else:
         for m, hidden in zip(args.tokens, args.hiddens, strict=True):
             failures.append(_check(m, hidden, f"{m}x{hidden}"))
@@ -781,7 +892,7 @@ def _run_rank(
             rows.append(res)
 
         # Run-ahead: many back-to-back calls with rank 0 deliberately late, so
-        # the others get a chance to run ahead into the other parity slot.
+        # the others get a chance to run ahead into the next inbox buffer.
         parts = _parts(RUN_AHEAD_M, HIDDEN, tp, 99, device)
         inp = parts[rank].contiguous()
         out = torch.empty_like(inp)
@@ -802,11 +913,17 @@ def _run_rank(
         checks += 1
         bad += _sqnr_db(ref, out) < SQNR_FLOOR_DB
         run_ahead = {"checks": checks, "bad_checks": bad}
+        fresh = _fresh_inputs(eng, rank, tp, device)
     finally:
         dist.barrier()
         eng.close()
         dist.destroy_process_group()
-    return {"rows": rows, "run_ahead": run_ahead, "production_cfgs": production_cfgs}
+    return {
+        "rows": rows,
+        "run_ahead": run_ahead,
+        "fresh": fresh,
+        "production_cfgs": production_cfgs,
+    }
 
 
 def _spawn_pool(
@@ -863,17 +980,16 @@ _FAILURES: list[str] = []
 # Tuning knobs the command line can pin. They are test-function arguments, so
 # they select the engine, but not table columns: the ``variant`` column names
 # the binary that actually ran, which is what a pinned knob changes.
-KNOBS = ("atoms", "grid_cap", "fanout", "block", "skip_self")
+KNOBS = ("atoms", "grid_cap", "fanout", "block")
 
 
-def _engine_kw(atoms, grid_cap, fanout, block, skip_self) -> dict:
+def _engine_kw(atoms, grid_cap, fanout, block) -> dict:
     """OneShotAllReduce kwargs for the knobs that are pinned (not None)."""
     kw = {
         "atoms": atoms,
         "grid_cap": grid_cap,
         "fanout": fanout,
         "block": block,
-        "skip_self": skip_self,
     }
     return {k: v for k, v in kw.items() if v is not None}
 
@@ -911,9 +1027,8 @@ def test_one_shot_allreduce(
     grid_cap=None,
     fanout=None,
     block=None,
-    skip_self=None,
 ):
-    engine_kw = _engine_kw(atoms, grid_cap, fanout, block, skip_self)
+    engine_kw = _engine_kw(atoms, grid_cap, fanout, block)
     key = _key(tp, engine_kw)
     i = _CASES[key].index((tokens, hidden, graph))
     rows = [r["rows"][i] for r in _ranks(key)]
@@ -956,9 +1071,8 @@ def test_one_shot_allreduce_run_ahead(
     grid_cap=None,
     fanout=None,
     block=None,
-    skip_self=None,
 ):
-    engine_kw = _engine_kw(atoms, grid_cap, fanout, block, skip_self)
+    engine_kw = _engine_kw(atoms, grid_cap, fanout, block)
     runs = [r["run_ahead"] for r in _ranks(_key(tp, engine_kw))]
     _check(
         f"tp={tp} run-ahead {engine_kw}",
@@ -972,6 +1086,33 @@ def test_one_shot_allreduce_run_ahead(
         "gfx": ARCH,
         "checks": runs[0]["checks"],
         "bad_checks": sum(r["bad_checks"] for r in runs),
+    }
+
+
+@benchmark()
+def test_one_shot_allreduce_fresh_inputs(
+    tp,
+    iters,
+    atoms=None,
+    grid_cap=None,
+    fanout=None,
+    block=None,
+):
+    engine_kw = _engine_kw(atoms, grid_cap, fanout, block)
+    runs = [r["fresh"] for r in _ranks(_key(tp, engine_kw))]
+    _check(
+        f"tp={tp} fresh inputs {engine_kw}",
+        [
+            f"rank {rank}: {r['mismatches']} bf16 lanes differ from the "
+            f"rank-order reference over {r['calls']} calls"
+            for rank, r in enumerate(runs)
+            if r["mismatches"]
+        ],
+    )
+    return {
+        "gfx": ARCH,
+        "calls": runs[0]["calls"],
+        "mismatches": sum(r["mismatches"] for r in runs),
     }
 
 
@@ -1136,12 +1277,12 @@ def test_one_shot_allreduce_rmsnorm_geom_for_pinned_block_pads():
     # A split rung pins block as the slice's width: 4096 has no unsplit b64
     # build, only k8/k4/k2 ones, and supports_hidden must still say yes -- the
     # launch's _check gates on it. Rungs are (floor, atoms, cap, fanout,
-    # skip_self, split).
+    # split).
     for block, split in ((128, 1), (256, 1), (512, 1), (1024, 1), (64, 8)):
         eng = OneShotAllReduceRMSNorm.__new__(OneShotAllReduceRMSNorm)
         eng.block = block
         eng.pad = True
-        eng._ladder = ((0, 1, 64, None, False, split),)
+        eng._ladder = ((0, 1, 64, None, split),)
         if eng.supports_hidden(4096):
             atoms, h_pad, k = OneShotAllReduceRMSNorm._geom_for(eng, 4096, 1, split)
             assert block * atoms * 8 * k == h_pad, (block, atoms, h_pad, k)
@@ -1202,38 +1343,35 @@ def test_one_shot_allreduce_rmsnorm_block(block, hidden, world_size):
 
 
 @pytest.mark.parametrize("world_size", SUPPORTED_WORLDS)
-@pytest.mark.parametrize("m,hidden", FUSED_SKIP_SELF_CASES)
-def test_one_shot_allreduce_rmsnorm_skip_self(m, hidden, world_size):
-    """Self-skip under the fused epilogue.
+@pytest.mark.parametrize("split", FUSED_FRESH_SPLITS)
+def test_one_shot_allreduce_rmsnorm_fresh_inputs(split, world_size):
+    """The fused kernel on a new input every call, at varying sizes and under
+    rank skew, checked against the reference call by call.
 
-    The plain kernel's self-skip cases cover the wire -- one fewer store, one
-    fewer flag, a remapped spin lane. What is specific here is that the fused
-    epilogue consumes the *unrounded* fp32 accumulator, so it is the path where
-    substituting the register copy for the inbox copy could change a rounding.
-    ``residual_out`` is bit-exact against the reference, so it cannot.
+    The plain fresh-input test's argument applies unchanged: a static input
+    cannot see a read of a stale inbox slot, because the stale data is the
+    right answer. Every 7th call also carries the inbox sentinel.
     """
-    pairs = [(m, hidden)]
-    batch = _batch_cache_lookup(
-        (world_size, "fused", "ss", m, hidden),
-        pairs,
-        # Explicit: key[2] is a label here, not an atoms value, so the
-        # positional inference in _batch_cache_lookup must not be relied on.
-        atoms=DEFAULT_ATOMS,
-        skip_self=True,
+    ranks = _fused_spawn(
+        world_size,
+        [(1, FUSED_FRESH_HIDDEN)],
+        atoms=None,
+        grid_cap=None,
+        fanout=None,
+        split=split,
+        mode="fused_fresh",
     )
-    for rank, bad in enumerate(batch[(m, hidden)]):
-        assert (
-            not bad
-        ), f"{m}x{hidden} skip_self, tp={world_size}, rank {rank}: " + "; ".join(bad)
+    for rank, bad in enumerate(ranks):
+        assert not bad, f"tp={world_size} split={split}, rank {rank}: " + "; ".join(bad)
 
 
 @pytest.mark.parametrize("world_size", SUPPORTED_WORLDS)
 def test_one_shot_allreduce_rmsnorm_run_ahead(world_size):
     """The fused kernel under deliberate rank skew.
 
-    The epilogue reuses one LDS buffer across every token of the grid-stride
-    loop, ordered only by the barrier already inside ``_publish``. A quiescent
-    single call never puts weight on that argument; this does.
+    The epilogue rotates its LDS partials through one set per colour across
+    the tokens of the grid-stride loop, with no barrier between tokens. A
+    quiescent single call never puts weight on that argument; this does.
     """
     ranks = _fused_spawn(
         world_size, [(RUN_AHEAD_M, 4096)], mode="fused_run_ahead", iters=RUN_AHEAD_ITERS
@@ -1308,9 +1446,9 @@ def test_one_shot_allreduce_rmsnorm_split_slice_lag(world_size):
 
     Slice 0 of every row group stalls between contributing and reading
     (``debug_slice_delay``), so its siblings finish the row and run on into the
-    other parity's word. That can only happen within a launch, so the grid cap
+    next colour's word. That can only happen within a launch, so the grid cap
     is pinned to two row groups: at M=8 every workgroup handles four rows per
-    call, crossing parities three times.
+    call, crossing colours three times.
     """
     split = 4
     ranks = _fused_spawn(
@@ -1369,29 +1507,29 @@ def test_one_shot_allreduce_rmsnorm_split_factory():
         make_one_shot_allreduce_kernel as mk,
     )
 
-    base = dict(world_size=4, grid=64, fusion="rmsnorm", hidden=7168, atoms=1)
+    base = dict(world_size=4, grid=64, rank=0, fusion="rmsnorm", hidden=7168, atoms=1)
     with pytest.raises(ValueError, match="only meaningful for a fused"):
-        mk(world_size=4, grid=64, split=2)
+        mk(world_size=4, grid=64, rank=0, split=2)
     with pytest.raises(ValueError, match="split must be one of"):
         mk(**base, split=3)
     with pytest.raises(ValueError, match="needs a native geometry"):
-        mk(world_size=4, grid=64, fusion="rmsnorm", hidden=3072, h_pad=4096, atoms=2, split=2)
+        mk(**{**base, "hidden": 3072, "atoms": 2}, h_pad=4096, split=2)
     with pytest.raises(ValueError, match="does not divide"):
-        mk(world_size=4, grid=63, fusion="rmsnorm", hidden=4096, atoms=1, split=7)
+        mk(**{**base, "grid": 63, "hidden": 4096}, split=7)
     with pytest.raises(ValueError, match="not a multiple of split"):
         mk(**base, split=7)  # 64 % 7
     with pytest.raises(ValueError, match="needs a split build"):
         mk(**base, debug_slice_delay=2)
     # 16 slices of 16 waves: 256 writers, one more than the arrival count holds.
     with pytest.raises(ValueError, match="counts arrivals"):
-        mk(world_size=4, grid=64, fusion="rmsnorm", hidden=131072, atoms=1, split=16)
+        mk(**{**base, "hidden": 131072}, split=16)
 
     spec = mk(**base, split=2)
     assert (spec["split"], spec["block"], spec["tile_bytes"]) == (2, 448, 7168)
     # No LDS: a split build reduces across waves through HBM.
     assert spec["lds_bytes"] == 0
-    # Words: 2 parities x 32 groups, a line each; prev: 64 workgroups x 2 x 8 B.
-    assert spec["xchg_bytes"] == 2 * 32 * 128 + 64 * 2 * 8
+    # Words: 3 colours x 32 groups, a line each; prev: 64 workgroups x 3 x 8 B.
+    assert spec["xchg_bytes"] == 3 * 32 * 128 + 64 * 3 * 8
     unsplit = mk(**base)
     assert (unsplit["split"], unsplit["xchg_bytes"]) == (1, 0)
     assert unsplit["lds_bytes"] > 0
@@ -1422,9 +1560,9 @@ def test_one_shot_allreduce_rmsnorm_split_host_resolution():
     assert geom(4096, 2, 1) == (2, 4096, 1)
     assert geom(3000, 2, 2)[2] == 1  # padded: unsplit
 
-    key = E._cfg_key(bare(), 7168, (0, 1, 64, "peer", False, 7))
-    assert (key[2], key[6]) == (63, 7)  # cap 64 -> 9 groups of 7
-    assert E._cfg_key(bare(), 7168, (0, 2, 64, "peer", False, 1))[2] == 64
+    key = E._cfg_key(bare(), 7168, (0, 1, 64, "peer", 7))
+    assert (key[2], key[5]) == (63, 7)  # cap 64 -> 9 groups of 7
+    assert E._cfg_key(bare(), 7168, (0, 2, 64, "peer", 1))[2] == 64
 
     row = lambda h: h * 2  # noqa: E731 -- bytes per token
     assert E._tiles_and_grid({"grid": 63, "split": 7}, 7168, 3 * row(7168)) == (21, 21)
@@ -1498,7 +1636,7 @@ def test_one_shot_allreduce_rmsnorm_ladder_rungs():
     rungs = [r for v in FUSED_ONESHOT_LADDER.values() for r in v]
     rungs += list(fused_oneshot_ladder(3, "pcie"))  # the unlisted default
     for rung in rungs:
-        assert len(rung) == 6 and rung[5] in SUPPORTED_SPLITS, rung
+        assert len(rung) == 5 and rung[4] in SUPPORTED_SPLITS, rung
 
 
 # ---------------------------------------------------------------------------
@@ -1565,14 +1703,6 @@ def main():
         choices=(*SUPPORTED_BLOCKS, None),
     )
     parser.add_argument(
-        "--skip-self",
-        type=int,
-        nargs="*",
-        default=[None],
-        choices=(0, 1, None),
-        help="Pin skip_self off (0) or on (1).",
-    )
-    parser.add_argument(
         "--extended",
         action="store_true",
         help="Run the spot-check configurations at every world size, and the\n"
@@ -1607,10 +1737,9 @@ def main():
             "grid_cap": grid_cap,
             "fanout": fanout,
             "block": block,
-            "skip_self": None if skip_self is None else bool(skip_self),
         }
-        for atoms, grid_cap, fanout, block, skip_self in itertools.product(
-            args.atoms, args.grid_cap, args.fanout, args.block, args.skip_self
+        for atoms, grid_cap, fanout, block in itertools.product(
+            args.atoms, args.grid_cap, args.fanout, args.block
         )
     ]
     ladder = configs == [dict.fromkeys(KNOBS)]
@@ -1667,6 +1796,13 @@ def main():
             for tp, knobs, _shapes, _graph in spawns
         ],
     )
+    _summarize(
+        "flydsl one-shot allreduce fresh inputs",
+        [
+            test_one_shot_allreduce_fresh_inputs(tp, FRESH_ITERS, **knobs)
+            for tp, knobs, _shapes, _graph in spawns
+        ],
+    )
 
     if not args.plain_only:
         for tp in tps:
@@ -1685,6 +1821,21 @@ def main():
                 for bad in shape_bads
                 if bad
             ]
+            for split in FUSED_FRESH_SPLITS:
+                fresh_ranks = _fused_spawn(
+                    tp,
+                    [(1, FUSED_FRESH_HIDDEN)],
+                    atoms=None,
+                    grid_cap=None,
+                    fanout=None,
+                    split=split,
+                    mode="fused_fresh",
+                )
+                fused_fails += [
+                    f"fused fresh tp={tp} split={split} rank {r}: {bad}"
+                    for r, bad in enumerate(fresh_ranks)
+                    if bad
+                ]
             if fused_fails:
                 _FAILURES.extend(fused_fails)
             aiter.logger.info("fused tp=%s: %d failures", tp, len(fused_fails))
@@ -1707,12 +1858,6 @@ if __name__ == "__main__":
     _rank_parser.add_argument("--atoms", type=int, default=None)
     _rank_parser.add_argument("--grid-cap", type=int, default=None)
     _rank_parser.add_argument("--fanout", default=None, choices=("peer", "atom"))
-    _rank_parser.add_argument(
-        "--skip-self",
-        dest="skip_self",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-    )
     _rank_parser.add_argument("--block", type=int, default=None)
     _rank_parser.add_argument("--split", type=int, default=None)
     _rank_parser.add_argument("--input-scale", type=float, default=1.0)
@@ -1720,7 +1865,7 @@ if __name__ == "__main__":
     _rank_parser.add_argument(
         "--mode",
         default="fused",
-        choices=("fused", "fused_run_ahead", "fused_slice_lag"),
+        choices=("fused", "fused_run_ahead", "fused_slice_lag", "fused_fresh"),
     )
     _rank_parser.add_argument("--tokens", default="")
     _rank_parser.add_argument("--hiddens", default="")

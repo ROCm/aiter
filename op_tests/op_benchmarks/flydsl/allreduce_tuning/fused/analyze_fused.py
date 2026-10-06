@@ -2,7 +2,7 @@
 
 Per (tp, width, M): incumbent cdr (min of fused 1stage/2stage), the shipped
 fused one-shot ladder, best unsplit / best split pinned row, overall winner and
-its resolved knobs (atoms, grid cap, skip_self, split) parsed from the variant.
+its resolved knobs (atoms, grid cap, split) parsed from the variant.
 """
 
 import argparse
@@ -16,7 +16,7 @@ import pandas as pd
 SQNR_FLOOR = 40.0
 _VAR = re.compile(
     r"_a(?P<a>\d+)_g(?P<g>\d+)_\w*?_b(?P<b>\d+)(?P<peer>_peer)?_rms_h\d+(?:p(?P<p>\d+))?"
-    r"(?:_k(?P<k>\d+))?(?P<ss>_r\*_ss)?/"
+    r"(?:_k(?P<k>\d+))?/"
 )
 
 
@@ -29,8 +29,6 @@ def knobs(variant: str) -> str:
         s += f" k{m['k']}"
     if m["p"]:
         s += f" pad{m['p']}"
-    if m["ss"]:
-        s += " ss"
     return s
 
 
@@ -69,7 +67,7 @@ def load(sweep_dir):
                     cdr=cdr,
                     sep_cdr=t("separate_cdr"),
                     auto=t("fused_fly_auto"),
-                    mesh=min(t("fused_fly_mesh"), t("fused_fly_mesh_ss")),
+                    mesh=t("fused_fly_mesh"),
                     ladder=t("fused_fly_1stage"),
                     best_unsplit=unsplit.get(bu, float("nan")),
                     best_split=split.get(bs, float("nan")),

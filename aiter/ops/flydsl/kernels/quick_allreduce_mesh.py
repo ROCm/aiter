@@ -16,14 +16,13 @@ Geometry, cache policy and the wire codec live in
 ``quick_allreduce_shared`` and ``quick_allreduce_codec``, which the ring
 and one-shot schedules share byte for byte.
 
-Two tuning knobs besides the super-tile:
+One tuning knob besides the super-tile: ``block``, threads per workgroup. It
+sets the tile (``block * ATOMS * 16 B``), hence how many blocks a payload gets
+and how many flags it costs.
 
-* ``block`` -- threads per workgroup. It sets the tile (``block * ATOMS * 16 B``),
-  hence how many blocks a payload gets and how many flags it costs.
-* ``skip_self`` -- drop this rank's round trip through its own inbox:
-  its reduce-scatter share is added from registers, and its reduced chunk
-  is decoded from the same packet it sends. It needs the rank at trace time,
-  which costs one binary per rank.
+A rank never round-trips through its own inbox: its reduce-scatter share is
+added from registers, and its reduced chunk is decoded from the same packet it
+sends. That needs the rank at trace time, which costs one binary per rank.
 """
 
 import flydsl.compiler as flyc
@@ -173,18 +172,23 @@ def clamp_grid_cap(
 
 
 # Per-``(link, world_size)`` tuning ladder: ``(min_bytes, super_tile, grid_cap,
-# block, skip_self)`` rungs, ascending.
+# block)`` rungs, ascending.
+#
+#   TP2  ST=1 everywhere.
+#   TP4  ST=8 everywhere.
+#   TP8  ST=1 up to 768 KiB then ST=8.
+#  ``(min_bytes, super_tile, grid_cap, block)``
 MESH_ST_LADDER = {
-    ("xgmi", 2): ((0, 1, 128, 256, True), (4 << 20, 1, 128, 512, True)),
-    ("xgmi", 4): ((0, 8, 128, 256, True), (4 << 20, 1, 128, 512, True)),
+    ("xgmi", 2): ((0, 1, 128, 256), (4 << 20, 1, 128, 512)),
+    ("xgmi", 4): ((0, 8, 128, 256), (4 << 20, 1, 128, 512)),
     ("xgmi", 8): (
-        (0, 1, 128, 256, True),
-        (4 << 20, 1, 128, 512, True),
-        (6 << 20, 8, 128, 512, True),
+        (0, 1, 128, 256),
+        (4 << 20, 1, 128, 512),
+        (6 << 20, 8, 128, 512),
     ),
-    ("pcie", 2): ((0, 1, 128, 256, True), (4 << 20, 8, 128, 512, True)),
-    ("pcie", 4): ((0, 1, 128, 256, True), (768 << 10, 8, 128, 512, True)),
-    ("pcie", 8): ((0, 1, 128, 256, True), (96 << 10, 8, 128, 512, True)),
+    ("pcie", 2): ((0, 1, 128, 256), (4 << 20, 8, 128, 512)),
+    ("pcie", 4): ((0, 1, 128, 256), (768 << 10, 8, 128, 512)),
+    ("pcie", 8): ((0, 8, 128, 512),),
 }
 
 
@@ -226,8 +230,7 @@ def make_quick_allreduce_mesh_kernel(
     hidden: int | None = None,
     block: int | None = None,
     h_pad: int | None = None,
-    skip_self: bool = False,
-    rank: int | None = None,
+    rank: int,
 ):
     if fusion not in FUSIONS:
         raise ValueError(f"fusion must be one of {FUSIONS}, got {fusion!r}")
@@ -247,11 +250,8 @@ def make_quick_allreduce_mesh_kernel(
         )
     if codec not in MESH_CODECS:
         raise ValueError(f"codec must be one of {MESH_CODECS}, got {codec!r}")
-    if skip_self and not 0 <= (rank if rank is not None else -1) < world_size:
-        raise ValueError(
-            f"skip_self needs the rank at trace time, got rank={rank!r} for "
-            f"world_size={world_size}"
-        )
+    if not 0 <= int(rank) < world_size:
+        raise ValueError(f"rank must be in [0, {world_size}), got {rank}")
 
     fused = fusion == "rmsnorm"
     if fused:
@@ -312,9 +312,10 @@ def make_quick_allreduce_mesh_kernel(
     wire_tile_i32 = release_i32_off + 16
     wire_tile_bytes = wire_tile_i32 * 4
 
-    # This rank's own index as a trace-time constant, or None when the self
-    # slot is being used.
-    self_rank = int(rank) if skip_self else None
+    # This rank's own index as a trace-time constant: its own slice of every
+    # tile never leaves registers, and "all peers but me" is only expressible
+    # over trace-time peer indices.
+    self_rank = int(rank)
     # Destinations this rank pushes packets and flags to, in rank order. Every
     # per-destination structure below -- LDS pack rows, fanout quads, flag
     # lanes -- is indexed by position in this list, not by rank.
@@ -662,8 +663,8 @@ def make_quick_allreduce_mesh_kernel(
             *atoms* is this thread's share of the whole tile, as loaded by
             ``_load_tile_atoms``: always ``ATOMS`` (8) 16 B atoms. Destination *d*
             owns ``atoms[d * rank_atoms : (d+1) * rank_atoms]``. Those packets
-            are later NT-stored into *d*'s reduce-scatter inbox. Under
-            skip_self our own slice is never packed: it stays in registers.
+            are later NT-stored into *d*'s reduce-scatter inbox. Our own
+            slice is never packed: it stays in registers.
             """
             for j, dest in enumerate(push_peers):
                 for k in range_constexpr(rank_atoms):
@@ -679,21 +680,21 @@ def make_quick_allreduce_mesh_kernel(
 
             After reduce-scatter this rank holds ``rank_atoms`` reduced
             atoms. Copy the same packets into every destination slot so the
-            NT fanout can push them into every peer's all-gather inbox.
+            NT fanout can push them into every peer's all-gather inbox, and
+            return our own chunk decoded from those same packets.
             """
-            own = [] if const_expr(self_rank is not None) else None
+            own = []
             for k in range_constexpr(rank_atoms):
                 words, scale, is_leader = _codec_quant(c, accs[k], lane, tid)
                 for j in range_constexpr(n_push):
                     _lds_write_packet(
                         fx.Int32(j * rank_atoms + k), words, scale, is_leader
                     )
-                if const_expr(own is not None):
-                    own.append(
-                        _codec_dequant(
-                            c, words, _scale_from_word(c, scale, pair_in_slot), tid
-                        )
+                own.append(
+                    _codec_dequant(
+                        c, words, _scale_from_word(c, scale, pair_in_slot), tid
                     )
+                )
             return own
 
         def _fanout_nt(phase, inbox_src, sub):
@@ -797,13 +798,11 @@ def make_quick_allreduce_mesh_kernel(
                 current = _load_flag(flag)
 
         def _wait_release(phase, color):
-            # Lane ``t`` watches one source. Without skip_self that is source
-            # ``t``; with it our own flag is never published, so the N-1 lanes
-            # step over our own index.
+            # Lane ``t`` watches one source. Our own flag is never published,
+            # so the N-1 lanes step over our own index.
             spin_src = tid
-            if const_expr(self_rank is not None):  # noqa: SIM102
-                if tid >= fx.Int32(self_rank):
-                    spin_src = tid + fx.Int32(1)
+            if tid >= fx.Int32(self_rank):
+                spin_src = tid + fx.Int32(1)
             if tid < n_push:
                 elem = _sub_tile_i32(phase, spin_src, fx.Int32(0)) + fx.Int32(
                     release_i32_off
@@ -835,12 +834,12 @@ def make_quick_allreduce_mesh_kernel(
             words, word = _codec_load(c, _get, tid, scale_slot)
             return words, _scale_from_word(c, word, pair_in_slot)
 
-        def _reduce_scattered(sub, own=None):
-            """Dequant-accumulate every peer's reduce-scatter packet for *sub*."""
+        def _reduce_scattered(sub, own):
+            """Dequant-accumulate every peer's reduce-scatter packet for *sub*,
+            and *own*, our share from registers, in rank order."""
             accs = [None] * rank_atoms
             for src in range_constexpr(world_size):
                 for k in range_constexpr(rank_atoms):
-                    # self_rank is None if self-skip is disabled.
                     if const_expr(src == self_rank):
                         if const_expr(accs[k] is None):
                             accs[k] = own[k]
@@ -857,11 +856,13 @@ def make_quick_allreduce_mesh_kernel(
             return accs
 
         def _recv_all_gather(sub, own=None):
-            """Dequantize every peer's all-gather packet back into full-tile atoms."""
+            """Dequantize every peer's all-gather packet back into full-tile atoms.
+
+            Our own chunk is *own*, or ``None`` where it has been stored already.
+            """
             gathered = []
             for src in range_constexpr(world_size):
                 for k in range_constexpr(rank_atoms):
-                    # self_rank is None if self-skip is disabled.
                     if const_expr(src == self_rank):
                         gathered.append(None if own is None else own[k])
                     else:
@@ -871,8 +872,8 @@ def make_quick_allreduce_mesh_kernel(
                         gathered.append(_codec_dequant(c, words, scale, tid))
             return gathered
 
-        # Self-skip at ST>1 carries nothing in registers between the three
-        # super-tile loops; these move our own share and reduced chunk instead.
+        # ST>1 carries nothing in registers between the three super-tile
+        # loops; these move our own share and reduced chunk instead.
         def _load_own_share(tile, k):
             """Our reduce-scatter share of *tile*, reloaded from the input. A
             fused build reads it through the same per-row route as
@@ -899,9 +900,9 @@ def make_quick_allreduce_mesh_kernel(
 
         def _unstash_own(tile):
             """The own slot for ``_recv_all_gather`` in the third loop: what
-            ``_stash_own`` parked on a fused self-skip build, else ``None`` (no
-            self-skip, or a plain build whose store was final)."""
-            if const_expr(fused and self_rank is not None):
+            ``_stash_own`` parked on a fused build, else ``None`` (a plain
+            build, whose store was final)."""
+            if const_expr(fused):
                 return [
                     _load_raw_atom(out_buf, tile, self_rank * rank_atoms + k)
                     for k in range_constexpr(rank_atoms)
@@ -936,11 +937,8 @@ def make_quick_allreduce_mesh_kernel(
 
                 _wait_release(PHASE_REDUCE_SCATTER, color)
                 # ST=1 keeps the whole tile in registers across the wait, so
-                # under skip_self our share is simply read back out of it.
-                own_rs = None
-                if const_expr(self_rank is not None):
-                    own_rs = _own_atoms(atoms)
-                acc = _reduce_scattered(fx.Int32(0), own_rs)
+                # our share is simply read back out of it.
+                acc = _reduce_scattered(fx.Int32(0), _own_atoms(atoms))
 
                 own_ag = _pack_all_gather(acc)
                 gpu.barrier()
@@ -979,24 +977,20 @@ def make_quick_allreduce_mesh_kernel(
                 _wait_release(PHASE_REDUCE_SCATTER, color)
 
                 for s in range(fx.Int32(0), n_this, fx.Int32(1)):
-                    # Under skip_self nothing is carried from the first loop --
-                    # that would be ST tiles of registers across the wait -- so
-                    # our share is reloaded from the input, a local cached read
-                    # against the uncached inbox read it replaces. Likewise our
-                    # reduced chunk is stored now rather than carried to the
-                    # third loop; the all-gather publish below releases it.
+                    # Nothing is carried from the first loop -- that would be ST
+                    # tiles of registers across the wait -- so our share is
+                    # reloaded from the input, a local cached read against the
+                    # uncached inbox read it replaces. Likewise our reduced
+                    # chunk is stored now rather than carried to the third loop;
+                    # the all-gather publish below releases it.
                     tile = bid + (i + s) * n_blocks
-                    own_rs = None
-                    if const_expr(self_rank is not None):
-                        own_rs = [
-                            _load_own_share(tile, k)
-                            for k in range_constexpr(rank_atoms)
-                        ]
+                    own_rs = [
+                        _load_own_share(tile, k) for k in range_constexpr(rank_atoms)
+                    ]
                     acc = _reduce_scattered(s, own_rs)
                     own_ag = _pack_all_gather(acc)
-                    if const_expr(own_ag is not None):
-                        for k in range_constexpr(rank_atoms):
-                            _stash_own(tile, k, own_ag[k])
+                    for k in range_constexpr(rank_atoms):
+                        _stash_own(tile, k, own_ag[k])
                     gpu.barrier()
                     _fanout_nt(PHASE_ALL_GATHER, rank, s)
                     if (s + fx.Int32(1)) < n_this:
@@ -1093,12 +1087,8 @@ def make_quick_allreduce_mesh_kernel(
     # The inbox memory type and wire codec both change the emitted code, so
     # both have to be part of the symbol name -- two variants that differ only
     # in cache bits or wire format must not collide in the JIT cache.
-    tag = f"ws{world_size}_st{super_tile}_g{grid}_{inbox_memory}_{codec}"
-    tag += f"_b{block}"
-    if skip_self:
-        # ``_r<n>_`` is the rank field the bench's variant comparison already
-        # collapses before checking that the ranks agree.
-        tag += f"_r{self_rank}_ss"
+    tag = f"ws{world_size}_r{self_rank}_st{super_tile}_g{grid}_{inbox_memory}"
+    tag += f"_{codec}_b{block}"
     if fused:
         # h_pad changes both the geometry and which loads carry a mask, so a
         # padded build must not share a JIT key with the plain one.
@@ -1143,5 +1133,5 @@ def make_quick_allreduce_mesh_kernel(
         "padded": padded,
         "atoms_per_row": atoms_per_row,
         "rows_per_tile": rows_per_tile,
-        "skip_self": skip_self,
+        "rank": self_rank,
     }

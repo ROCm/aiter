@@ -4,16 +4,20 @@
 """gfx942/gfx950 TP∈{2,4,8} exact one-shot (1-stage) all-reduce.
 
 Decode-regime kernel: bf16 in, fp32 accumulate, bf16 out, no codec. One
-communication round and no grid-wide barrier -- each rank pushes its whole
-tile into every peer's inbox, publishes a colour flag, waits for the N flags,
-then reduces N copies out of its own inbox.
+communication round, no grid-wide barrier and no flags -- each rank pushes its
+whole tile into every peer's inbox, and the payload is its own flag (a Lamport
+scheme). Inbox slots hold a sentinel value until a peer's data lands. The receiver
+polls its 16 B per source until no half-word is the sentinel, reduces the N
+copies, and re-arms the slot two rounds ahead.
 
 This kernel trades wire volume for round trips:
-(N-1)*S pushed rather than (N-1)*S read, but ~2 serialized fabric traversals
-rather than ~6.
+(N-1)*S pushed rather than (N-1)*S read, but one serialized fabric traversal.
 
 No LDS is needed: thread ``t``'s 16 B lands at the same offset in every destination,
 so it can be pushed straight from registers.
+
+On a cacheable (fine-grained) inbox each wave writes its push back out of L2,
+and the re-arm is written through.
 
 Padded builds (a hidden dim with no native row geometry) mask their pad columns
 with a per-row buffer descriptor bounded to ``hidden*2`` bytes: pad columns are
@@ -59,21 +63,17 @@ from .quick_allreduce_shared import (
     _CM_SC0,
     _CM_SC1,
     _INBOX_POLICY,
-    FLAG_I32_PER_LANE,
-    FLAG_LANES,
     SUPPORTED_WORLDS,
     WAVE,
-    _acquire_inbox,
     _buffer_load,
     _buffer_ptr,
+    _buffer_store,
     _color_io,
     _global_ptr,
     _i32_to_bytes,
-    _load_flag,
     _load_peers,
-    _payload_io,
+    _poll_v4i32,
     _release_inbox,
-    _store_flag_peer,
     _store_v4i32_peer,
     _to_sgpr_i64,
     atom_bf16_to_f32,
@@ -85,16 +85,16 @@ DEFAULT_BLOCK = 256
 # Threads per block, which sets the tile width: ``tile = block * atoms * 16 B``.
 # It sets the parallelism floor at a given payload.
 #
-# The trade is flags and per-block fixed cost: the flag count (``blocks * (N-1)``)
-# rises by the same factor the block count does.
+# The trade is per-block fixed cost: every block polls and re-arms its own
+# slots, so that work rises by the same factor the block count does.
 SUPPORTED_BLOCKS = (64, 128, 256, 512)
 # 16 B per thread per atom -- one ``global_store_dwordx4``.
 ATOM_BYTES = 16
 ATOM_I32 = ATOM_BYTES // 4
 DEFAULT_ATOMS = 1
 # Atoms per thread per tile. More atoms means a bigger tile, hence fewer blocks
-# and fewer flags for a given payload, at the cost of coarser load balance on
-# the last partial tile.
+# for a given payload, at the cost of coarser load balance on the last partial
+# tile.
 SUPPORTED_ATOMS = (1, 2, 4)
 DEFAULT_GRID_CAP = 64
 # Workgroups one fused token row is split over. 1 is one workgroup per row, the
@@ -105,7 +105,7 @@ SUPPORTED_SPLITS = (1, 2, 4, 7, 8, 14, 16)
 DEFAULT_SPLIT = 1
 
 # Per-``(link, world_size)`` tuning ladder: ``(min_bytes, atoms, grid_cap,
-# fanout, block, skip_self)`` rungs. The host builds one engine per rung and
+# fanout, block)`` rungs. The host builds one engine per rung and
 # selects by payload size at launch. Created from a tuning sweep.
 #
 # ``atoms`` and ``block`` both scale the tile, and their product is what
@@ -115,38 +115,40 @@ DEFAULT_SPLIT = 1
 #
 #   PCIe
 #
-#     TP2  block 512, atoms=1/4 -- the 8 KiB tile to 384 KiB (the whole fast-mode
-#                               window, where the mesh takes over), then the
-#                               32 KiB tile with cap 128 over the rest of the
-#                               exact-mode window, which runs to 64 MiB.
-#     TP4  block 256, atoms=1/2/4 -- Three-phases: the 4 KiB tile wins to 42 KiB,
-#                               the 8 KiB tile to ~98 KiB, the 16 KiB tile above.
-#     TP8  block 512, atoms=1/2 -- the 8 KiB tile to 16 KiB, then the 16 KiB
-#                               tile over the rest of the 80 KiB window. The
-#                               wide workgroup wins at every size.
+#     TP2  b256 a1 cap128 -- the 4 KiB tile to 384 KiB, then b512 a4 cap128,
+#                            the 32 KiB tile, over the rest of the exact-mode
+#                            window, which runs to 64 MiB.
+#     TP4  b128 a1 cap128 -- the 2 KiB tile to 96 KiB, then b512 a2 cap64, the
+#                            16 KiB tile, to the 1 MiB exact-mode ceiling.
+#     TP8  b64 a1 cap64   -- the 1 KiB tile, except b256 a1 cap64, the 4 KiB
+#                            tile, from 48 to 192 KiB.
 #
 #   xGMI
 #
-#     TP2  atoms=1 cap128 b256 -- one rung over the whole window
+#     TP2  atoms=1 cap128 b128/b256 -- the 2 KiB tile to 256 KiB, the most it
+#                               covers in one round, then the 4 KiB tile.
 #     TP4  atoms=1 cap128 b256 -- one rung over the whole window
-#     TP8  atoms=1 cap128 b256 -- one rung over the whole window
+#     TP8  atoms=1 cap128 b128 -- one rung over the whole window
 ONESHOT_LADDER = {
     ("pcie", 2): (
-        (0, 1, 64, "peer", 512, True),
-        (384 << 10, 4, 128, "peer", 512, True),
+        (0, 1, 128, "peer", 256),
+        (384 << 10, 4, 128, "peer", 512),
     ),
     ("pcie", 4): (
-        (0, 1, 64, "peer", 256, True),
-        (48 << 10, 2, 64, "atom", 256, True),
-        (96 << 10, 4, 128, "peer", 256, True),
+        (0, 1, 128, "peer", 128),
+        (96 << 10, 2, 64, "peer", 512),
     ),
     ("pcie", 8): (
-        (0, 1, 64, "peer", 512, True),
-        (16 << 10, 2, 64, "peer", 512, True),
+        (0, 1, 64, "peer", 64),
+        (48 << 10, 1, 64, "peer", 256),
+        (192 << 10, 1, 64, "peer", 64),
     ),
-    ("xgmi", 2): ((0, 1, 128, "peer", 256, False),),
-    ("xgmi", 4): ((0, 1, 128, "peer", 256, False),),
-    ("xgmi", 8): ((0, 1, 128, "peer", 256, False),),
+    ("xgmi", 2): (
+        (0, 1, 128, "peer", 128),
+        (256 << 10, 1, 128, "peer", 256),
+    ),
+    ("xgmi", 4): ((0, 1, 128, "peer", 256),),
+    ("xgmi", 8): ((0, 1, 128, "peer", 128),),
 }
 
 
@@ -166,36 +168,34 @@ def oneshot_ladder(world_size: int, link: str = "pcie"):
                 DEFAULT_GRID_CAP,
                 DEFAULT_FANOUT,
                 DEFAULT_BLOCK,
-                DEFAULT_SKIP_SELF,
             ),
         ),
     )
 
 
 # In the plain schedule ``atoms`` sets the *tile width*: tile = BLOCK*atoms*16 B,
-# so a bigger atom count means fewer, fatter tiles and fewer flags. TP2 and TP8
-# pick atoms=4 for exactly that reason.
+# so a bigger atom count means fewer, fatter tiles for a given payload.
 #
 # In the fused schedule the tile is pinned to one token row -- or, with
 # ``split``, to one 1/split slice of it -- because RMSNorm reduces over the row.
 # ``atoms`` therefore sets the *block width* instead -- BLOCK =
-# hidden/(split*8*atoms) -- and the tile, the flag count and the block count are
-# all independent of it.
+# hidden/(split*8*atoms) -- and the tile and the block count are both
+# independent of it.
 #
-# Rungs are ``(min_bytes, atoms, grid_cap, fanout, skip_self, split)``. Rungs
-# select by payload, which at a fixed hidden is the token count, so "split the
-# row at M=1, not at M=4" is two rungs.
+# Rungs are ``(min_bytes, atoms, grid_cap, fanout, split)``. Rungs select by
+# payload, which at a fixed hidden is the token count, so "split the row at
+# M=1, not at M=4" is two rungs.
 FUSED_ONESHOT_LADDER = {
     # PCIe: from measurements on MI350P
-    ("pcie", 2): ((0, 1, 128, "peer", True, 1),),
-    ("pcie", 4): ((0, 2, 64, "peer", False, 1), (168 << 10, 4, 32, "peer", True, 1)),
-    ("pcie", 8): ((0, 2, 128, "peer", False, 1), (144 << 10, 2, 8, "peer", True, 1)),
+    ("pcie", 2): ((0, 1, 128, "peer", 1),),
+    ("pcie", 4): ((0, 2, 64, "peer", 1), (168 << 10, 4, 32, "peer", 1)),
+    ("pcie", 8): ((0, 2, 128, "peer", 1), (144 << 10, 2, 8, "peer", 1)),
     # xGMI: from measurements on MI325X.
     # Split (k > 1) wins at TP4/TP8 for small M; TP2 never benefits from splitting
     # the hidden dim.
-    ("xgmi", 2): ((0, 1, 128, "peer", True, 1),),
-    ("xgmi", 4): ((0, 1, 128, "peer", True, 16), (144 << 10, 1, 128, "peer", True, 1)),
-    ("xgmi", 8): ((0, 1, 64, "peer", True, 16), (56 << 10, 1, 128, "peer", True, 16)),
+    ("xgmi", 2): ((0, 1, 128, "peer", 1),),
+    ("xgmi", 4): ((0, 1, 128, "peer", 16), (144 << 10, 1, 128, "peer", 1)),
+    ("xgmi", 8): ((0, 1, 64, "peer", 16), (56 << 10, 1, 128, "peer", 16)),
 }
 
 
@@ -203,7 +203,7 @@ def fused_oneshot_ladder(world_size: int, link: str = "pcie"):
     """Rungs for *(link, world_size)* under ``fusion="rmsnorm"``."""
     return FUSED_ONESHOT_LADDER.get(
         (str(link), int(world_size)),
-        ((0, 1, DEFAULT_GRID_CAP, DEFAULT_FANOUT, DEFAULT_SKIP_SELF, DEFAULT_SPLIT),),
+        ((0, 1, DEFAULT_GRID_CAP, DEFAULT_FANOUT, DEFAULT_SPLIT),),
     )
 
 
@@ -276,14 +276,9 @@ def fused_atoms_for_block(hidden: int, block: int) -> int:
     )
 
 
-# Inbox slots are indexed by ``colour & 1``. Two buffers is exactly enough to
-# let one rank run a whole call ahead of another without overwriting a slot the
-# straggler has not read.
-PARITIES = 2
-# 64 B handshake sector at the tail of each wire slot, as 16 i32 copies of the
-# colour -- one 8 B store from each of ``FLAG_LANES`` lanes.
-FLAG_I32 = 16
-# Read our own inbox with the caches bypassed (avoids reading stale values).
+# Read our own inbox with the caches bypassed: a peer wrote these lines
+# microseconds ago and an L1 hit here is a stale hit. Same reasoning as the
+# ring kernel's ``_RECV_POLICY``.
 _RECV_POLICY = _CM_SC0 | _CM_SC1
 
 # Which axis of the (peer, atom) fanout runs fastest across consecutive stores.
@@ -297,13 +292,58 @@ _RECV_POLICY = _CM_SC0 | _CM_SC1
 FANOUT_ORDERS = ("peer", "atom")
 DEFAULT_FANOUT = "peer"
 
-# ``s_sleep`` interval for the flag spin, 0 to spin flat out.
-DEFAULT_SPIN_SLEEP = 0
+# Three inbox buffers rotate by colour. Round ``c`` reads buffer ``c``, and
+# re-arms buffer ``c + 2`` (mod 3) with the sentinel. No peer can be writing that
+# one: a peer is at most one round ahead, and that round uses ``c + 1``.
+INBOX_BUFFERS = 3
+# The sentinel is bf16 (and fp16) NaN ``0xFFFF`` in every half-word, so an unused
+# inbox is just a ``0xFF`` memset. A sender rewrites a sentinel half-word in its
+# own payload to ``0x7FFF``, which is still NaN, so the result is unchanged.
+SENTINEL_FILL_BYTE = 0xFF
+# Bit 15 of both half-words of an i32, as a signed i32.
+_HALF_SIGN_BITS = -0x7FFF8000  # 0x80008000
 
-# Whether a rank pushes its own contribution through its own inbox. Keeping it
-# costs a store, a load and a flag per tile in memory the rank already holds in
-# registers, which is 1/N of each; dropping it specialises the binary per rank.
-DEFAULT_SKIP_SELF = False
+
+def _sentinel_mask(atom_i32):
+    """Bit 15 of every half-word of *atom_i32* that is the sentinel ``0xFFFF``.
+
+    Branch-free zero test per 16-bit lane on the complement: a half-word of
+    ``~x`` is non-zero iff adding ``0x7FFF`` to its low 15 bits, or its own bit
+    15, sets bit 15. The low 15 bits are masked first, so no carry crosses into
+    the upper half-word.
+    """
+    x = atom_i32 ^ -1
+    nonzero = ((x & 0x7FFF7FFF) + 0x7FFF7FFF) | x
+    return (nonzero & _HALF_SIGN_BITS) ^ _HALF_SIGN_BITS
+
+
+def _canonicalize(atom_i32):
+    """*atom_i32* with every sentinel half-word ``0xFFFF`` turned into ``0x7FFF``."""
+    return atom_i32 ^ _sentinel_mask(atom_i32)
+
+
+def _has_sentinel(vec_i32):
+    """Whether any half-word of the i32 vector *vec_i32* is still the sentinel."""
+    mask = _sentinel_mask(vec_i32)
+    acc = mask[0]
+    for i in range(1, vec_i32.numel):
+        acc = acc | mask[i]
+    return acc != 0
+
+
+class _LdsWindow:
+    """``base[offset + i]``: one colour's set of the per-wave LDS partials, in
+    the indexing ``block_reduce_add`` uses."""
+
+    def __init__(self, base, offset):
+        self.base = base
+        self.offset = offset
+
+    def __getitem__(self, i):
+        return self.base[self.offset + i]
+
+    def __setitem__(self, i, value):
+        self.base[self.offset + i] = value
 
 
 def make_one_shot_allreduce_kernel(
@@ -313,9 +353,7 @@ def make_one_shot_allreduce_kernel(
     grid: int,
     inbox_memory: str = "uncached",
     fanout: str = DEFAULT_FANOUT,
-    spin_sleep: int = DEFAULT_SPIN_SLEEP,
-    skip_self: bool = False,
-    rank: int | None = None,
+    rank: int,
     block: int | None = None,
     fusion: str = "none",
     hidden: int | None = None,
@@ -333,7 +371,7 @@ def make_one_shot_allreduce_kernel(
     ``debug_slice_delay`` is for tests only: when set, the waves of slice 0
     sleep ``debug_slice_delay`` x ``s_sleep 127`` on every third row *after*
     contributing to the exchange and *before* reading it, so their siblings
-    complete the row and run ahead into the other parity's word while slice 0
+    complete the row and run ahead into the next colour's word while slice 0
     still reads this one -- the case the exchange's reuse argument is about.
     Only a workgroup that handles several rows in one launch can be overtaken
     (launches on a stream do not overlap), so a test pairs it with a small
@@ -358,11 +396,8 @@ def make_one_shot_allreduce_kernel(
         raise ValueError(
             f"world_size must be one of {SUPPORTED_WORLDS}, got {world_size}"
         )
-    if skip_self and not 0 <= (rank if rank is not None else -1) < world_size:
-        raise ValueError(
-            f"skip_self needs the rank at trace time, got rank={rank!r} for "
-            f"world_size={world_size}"
-        )
+    if not 0 <= int(rank) < world_size:
+        raise ValueError(f"rank must be in [0, {world_size}), got {rank}")
     if atoms not in SUPPORTED_ATOMS:
         raise ValueError(f"atoms must be one of {SUPPORTED_ATOMS}, got {atoms!r}")
     if inbox_memory not in _INBOX_POLICY:
@@ -371,16 +406,12 @@ def make_one_shot_allreduce_kernel(
         )
     if fanout not in FANOUT_ORDERS:
         raise ValueError(f"fanout must be one of {FANOUT_ORDERS}, got {fanout!r}")
-    if not 0 <= int(spin_sleep) <= 0xFFFF:
-        raise ValueError(f"spin_sleep must fit s_sleep's imm16, got {spin_sleep!r}")
     if grid < 1:
         raise ValueError(f"grid must be positive, got {grid}")
 
     policy = _INBOX_POLICY[inbox_memory]
     payload_policy = policy["payload"]
-    flag_policy = policy["flag"]
     release_scope = policy["release"]
-    acquire_scope = policy["acquire"]
 
     fused = fusion == "rmsnorm"
     if fused:
@@ -437,13 +468,14 @@ def make_one_shot_allreduce_kernel(
         xchg_clamp_units(n_writers)
     # Row groups: ``split`` consecutive workgroups share one row.
     n_groups = grid // split
-    # Exchange state, split builds only: one word per (parity, group), each on
-    # its own line, then this workgroup's last-complete word per parity.
-    xchg_prev_off = PARITIES * n_groups * XCHG_LINE_BYTES
-    xchg_bytes = xchg_prev_off + grid * PARITIES * 8 if split > 1 else 0
-    # Per-wave partials for the block-wide sum of squares. The plain build has
-    # no LDS at all, and nor does a split one: its waves reduce through HBM.
-    lds_bytes = n_waves * 4 if fused and split == 1 else 0
+    # Exchange state, split builds only: one word per (colour, group), each on
+    # its own line, then this workgroup's last-complete word per colour.
+    xchg_prev_off = INBOX_BUFFERS * n_groups * XCHG_LINE_BYTES
+    xchg_bytes = xchg_prev_off + grid * INBOX_BUFFERS * 8 if split > 1 else 0
+    # Per-wave partials for the block-wide sum of squares, one set per colour.
+    # The plain build has no LDS at all, and nor does a split one: its waves
+    # reduce through HBM.
+    lds_bytes = INBOX_BUFFERS * n_waves * 4 if fused and split == 1 else 0
 
     tile_bytes = block * atoms * ATOM_BYTES
     tile_i32 = tile_bytes // 4
@@ -453,20 +485,18 @@ def make_one_shot_allreduce_kernel(
     # build views an (M, hidden) operand as (M*split, hidden/split) -- the same
     # memory -- so its "row" here is one slice.
     row_stride_i32 = (hidden // split // 2) if fused else tile_i32
-    # Payload then the 64 B handshake sector.
-    wire_tile_i32 = tile_i32 + FLAG_I32
-    wire_tile_bytes = wire_tile_i32 * 4
-    data_bytes = PARITIES * grid * world_size * wire_tile_bytes
+    data_bytes = INBOX_BUFFERS * grid * world_size * tile_bytes
 
-    # This rank's own index as a trace-time constant, or None when the self
-    # slot is being used. It has to be compile-time: the peer fanout, the flag
-    # publish and the reduce are all unrolled over trace-time peer indices, and
-    # "all peers but me" is only expressible there. The cost is one kernel
-    # binary per rank -- but a process is one rank, so it compiles exactly one.
-    self_rank = int(rank) if skip_self else None
-    # Peers this rank pushes payload and flags to. With ``skip_self`` our own
-    # inbox slot is simply never touched: the wire format is unchanged, the slot
-    # is still allocated, and no peer can observe the difference.
+    # This rank's own index as a trace-time constant. It has to be
+    # compile-time: the peer fanout, the poll and the reduce are all unrolled
+    # over trace-time peer indices, and "all peers but me" is only expressible
+    # there. The cost is one kernel binary per rank -- but a process is one
+    # rank, so it compiles exactly one.
+    self_rank = int(rank)
+    # Peers this rank pushes payload to. Our own contribution never round-trips
+    # through our own inbox: it stays in registers. Our own inbox slot is simply
+    # never touched -- the wire format is unchanged, the slot is still
+    # allocated, and no peer can observe the difference.
     push_peers = [p for p in range(world_size) if p != self_rank]
 
     # (peer, atom) iteration order for the fanout, unrolled at trace time.
@@ -478,7 +508,15 @@ def make_one_shot_allreduce_kernel(
     # LDS for the fused sum-of-squares. Carries the per-wave partial sums
     # only: the 1/hidden, the +eps and the rsqrt all happen afterwards in
     # registers, per thread, so no scale is ever broadcast through LDS.
-    _RmsShared = make_wave_partials(n_waves) if fused and split == 1 else None
+    #
+    # One set per colour, because nothing else separates one tile's reads of
+    # the partials from the next tile's writes: there is no barrier between
+    # tiles. A wave writes a set again three tiles later, after it has passed
+    # the reduction barrier of the two tiles in between, which every wave
+    # reaches only once it has finished reading this one.
+    _RmsShared = (
+        make_wave_partials(INBOX_BUFFERS * n_waves) if fused and split == 1 else None
+    )
 
     # One signature for both modes. The fused-only arguments are present (and
     # passed as zeros) in a plain build rather than being appended to a second
@@ -504,7 +542,7 @@ def make_one_shot_allreduce_kernel(
         tid = fx.Int32(gpu.thread_id("x"))
         bid = fx.Int32(gpu.block_id("x"))
 
-        # The tiled copy is used by both modes now. ``hbm_row_layout`` (one
+        # The tiled copy is used by both modes. ``hbm_row_layout`` (one
         # atom-wide row) and ``hbm_copy`` are built unconditionally; a padded
         # build addresses each row through a per-row buffer descriptor
         # (``_rowbuf_atom_row``) while an unpadded one slices the whole-tensor
@@ -528,10 +566,6 @@ def make_one_shot_allreduce_kernel(
         peers = _load_peers(peer_ptrs, world_size)
         peer_vec = fx.Vector.from_elements(peers, dtype=fx.Int64)
         inbox = _buffer_ptr(_to_sgpr_i64(peer_vec[rank]), T.i32, 16)
-
-        _load_payload, _store_payload = _payload_io(
-            inp_ptr, out_ptr, nbytes, num_tiles, atoms, block, tid
-        )
 
         hbm_i32_ptr = fx.PointerType.get(
             T.i32, address_space=fx.AddressSpace.Global, alignment=16
@@ -592,8 +626,8 @@ def make_one_shot_allreduce_kernel(
             group = bid // fx.Int32(split)
             part = bid % fx.Int32(split)
 
-        def _slot_i32(parity, src):
-            """i32 offset of the wire slot ``[parity][bid][src]``.
+        def _slot_i32(buf, src):
+            """i32 offset of the wire slot ``[buf][bid][src]``.
 
             Plain arithmetic rather than ``crd2idx`` on a 3-D layout: at
             ``grid == 1`` the middle mode is unit and gets coalesced away,
@@ -601,10 +635,17 @@ def make_one_shot_allreduce_kernel(
             (negative) index. The ring kernel hit exactly this.
             """
             return (
-                parity * fx.Int32(grid * world_size * wire_tile_i32)
-                + bid * fx.Int32(world_size * wire_tile_i32)
-                + src * fx.Int32(wire_tile_i32)
+                buf * fx.Int32(grid * world_size * tile_i32)
+                + bid * fx.Int32(world_size * tile_i32)
+                + src * fx.Int32(tile_i32)
             )
+
+        def _wrap(color):
+            """*color* reduced into ``[0, INBOX_BUFFERS)``, for a *color* below
+            twice that."""
+            if color >= fx.Int32(INBOX_BUFFERS):
+                color = color - fx.Int32(INBOX_BUFFERS)
+            return color
 
         def _hbm_atom_row(buf, tile, atom):
             return fx.make_view(
@@ -640,119 +681,117 @@ def make_one_shot_allreduce_kernel(
         def _store_tile(tile, vals):
             _store_rows(out_buf, tile, vals)
 
-        def _fanout(parity, my_atoms):
+        def _fanout(buf, my_atoms):
             """Push this thread's atoms into every peer's slot for this rank.
 
             Thread ``t``'s data lands at the same offset in every destination,
             so it goes straight from registers -- no LDS staging.
 
-            ``skip_self`` decides whether the fanout includes our own inbox.
-            Keeping it makes the receive loop uniform over ``world_size``;
-            dropping it removes 1/N of the stores, 1/N of the reduce's loads and
-            1/N of the flags, at the cost of one kernel binary per rank.
+            Our own inbox is not among the destinations: our contribution stays
+            in registers, which saves 1/N of the stores, the polls and the
+            re-arms.
+
+            On a cacheable inbox an ``nt`` push can sit in this XCD's L2 until
+            something evicts it, so each wave writes it back with a release
+            fence.
             """
             for peer, atom in fanout_pairs:
                 _store_v4i32_peer(
                     peer_vec[peer]
                     + _i32_to_bytes(
-                        _slot_i32(parity, rank)
+                        _slot_i32(buf, rank)
                         + fx.Int32(atom * block * ATOM_I32)
                         + tid * fx.Int32(ATOM_I32)
                     ),
                     my_atoms[atom],
                     payload_policy,
                 )
-
-        def _publish(parity, color):
-            """Drain the payload stores, then write *color* into every peer.
-
-            ``vmcnt(0)`` retires this wave's stores; the barrier joins the other
-            waves, whose ``vmcnt`` is separate. On a cacheable inbox retiring is
-            not enough -- the lines can sit in this XCD's L2 -- so the release
-            fence writes them back and waits for that before the flag goes out.
-            Every workgroup issues its own writeback: L2 is per-XCD.
-            """
-            rocdl.s_waitcnt(vmcnt=0)
-            gpu.barrier()
             if const_expr(release_scope is not None):
                 _release_inbox(release_scope)
-            # FLAG_LANES lanes, 8 B each -> the 64 B sector, unrolled over the
-            # destinations. The peer index must be a trace-time constant: an
-            # earlier version keyed it off the lane (``peer = tid // 4``, 4 lanes
-            # per destination), which made ``peer_vec[peer]`` a *lane-varying*
-            # extract from a 4xi64 vector. That lowers to a scratch round-trip,
-            # and at ``atoms>1`` the register pressure made it land in the
-            # payload: 8 B of peer pointer at 16 B stride over a 64 B span, once
-            # per 256 B, in atom 0 of the highest-numbered rank's inbox. See the
-            # ``SUPPORTED_ATOMS`` note. ``_fanout`` always unrolled; this is now
-            # consistent with it.
-            if tid < fx.Int32(FLAG_LANES):
-                elem = (
-                    _slot_i32(parity, rank)
-                    + fx.Int32(tile_i32)
-                    + tid * fx.Int32(FLAG_I32_PER_LANE)
-                )
-                for peer in push_peers:
-                    _store_flag_peer(
-                        peer_vec[peer] + _i32_to_bytes(elem), color, flag_policy
-                    )
 
-        def _wait(parity, color):
-            """Spin until every rank's flag in our own inbox shows *color*.
+        def _recv_i32(buf, src, atom):
+            """i32 offset of this thread's 16 B of *atom* in the slot of *src*."""
+            return (
+                _slot_i32(buf, fx.Int32(src))
+                + fx.Int32(atom * block * ATOM_I32)
+                + tid * fx.Int32(ATOM_I32)
+            )
 
-            One spinner per source. The fences after the join are placed there,
-            not inside the spin, on purpose: if the flag is already present the
-            loop body never runs, and a fence placed only inside it would be
-            skipped in the common case.
+        def _load_recv(buf, src, atom):
+            return _buffer_load(
+                inbox, _recv_i32(buf, src, atom), ATOM_I32, fx.Int32, _RECV_POLICY
+            )
 
-            The fences depend on the inbox type (``_INBOX_POLICY``). A cacheable
-            inbox gets a writeback then a system-scope acquire, i.e., an L1+L2
-            invalidate, so the payload loads cannot hit a stale line. Write back
-            *before* invalidating, or the output lines this block already wrote
-            are discarded. The uncached inbox has no stale line to invalidate:
-            the memory is never cached and the loads bypass L1 and L2
-            (``_RECV_POLICY``). It gets a workgroup-scope acquire, which only
-            keeps the payload loads below the spin.
+        def _poll(buf):
+            """Receive: this thread's 16 B of every atom of every source,
+            keyed ``(src, atom)``, once none of them is the sentinel.
+
+            The first reads all go out before any is tested. Until every slot
+            has landed, every slot is then re-read on each pass, together,
+            rather than one source at a time: a serial spin would leave the later
+            sources' reads stale, and pay one more round trip per source after
+            the last one lands. Re-reading a slot that has already landed is
+            harmless, since nobody writes it again this round. The re-reads go
+            through ``_poll_v4i32``, so the spin cannot be deleted.
             """
-            # Lane ``t`` watches one source. Without ``skip_self`` that is
-            # source ``t``; with it our own flag is never published, so the
-            # N-1 lanes step over our own index and the last lane sits out.
-            # Computed before the guard rather than nested inside it, so the
-            # remap is a flat ``scf.if`` yielding one value.
-            spin_src = tid
-            if const_expr(skip_self):  # noqa: SIM102
-                if tid >= fx.Int32(self_rank):
-                    spin_src = tid + fx.Int32(1)
-            if tid < fx.Int32(len(push_peers)):
-                flag = peer_vec[rank] + _i32_to_bytes(
-                    _slot_i32(parity, spin_src) + fx.Int32(tile_i32)
-                )
-                # `sc0 sc1`, so each retry is fetched past L1 and L2 and no
-                # fence is needed in the loop; the fences below order the
-                # payload reads after it, once, after the join.
-                current = _load_flag(flag)
-                while current != color:
-                    if const_expr(spin_sleep):
-                        # Back off between polls. Each iteration is a load that
-                        # bypasses both caches, and under arrival skew that runs
-                        # for the whole skew window against the same line the
-                        # peer is trying to write.
-                        rocdl.s_sleep(spin_sleep)
-                    current = _load_flag(flag)
-            gpu.barrier()
-            rocdl.s_waitcnt(vmcnt=0)
-            if const_expr(release_scope is not None):
-                _release_inbox(release_scope)
-            _acquire_inbox(acquire_scope)
+            keys = [
+                (src, atom) for src in push_peers for atom in range_constexpr(atoms)
+            ]
+            addrs = [
+                peer_vec[rank] + _i32_to_bytes(_recv_i32(buf, src, atom))
+                for src, atom in keys
+            ]
 
-        def _reduce_f32(parity, my_atoms):
+            def _pack(vecs):
+                return fx.Vector.from_elements(
+                    [v[e] for v in vecs for e in range_constexpr(ATOM_I32)], fx.Int32
+                )
+
+            got = _pack([_load_recv(buf, src, atom) for src, atom in keys])
+            while _has_sentinel(got):
+                got = _pack([_poll_v4i32(addr) for addr in addrs])
+            return {
+                key: fx.Vector.from_elements(
+                    [got[i * ATOM_I32 + e] for e in range_constexpr(ATOM_I32)],
+                    fx.Int32,
+                )
+                for i, key in enumerate(keys)
+            }
+
+        def _rearm(buf):
+            """Put the sentinel back in every slot this thread reads, in *buf*.
+
+            On a cacheable inbox the sentinel is written through (``sc0 sc1``).
+            An ``nt`` store could leave it dirty in our own L2, where it would
+            hide a peer's later push from the poll, and its eventual eviction
+            would overwrite that push in memory. The stores are local, so
+            writing through costs no fabric traffic.
+            """
+            sentinel = fx.Vector.filled((ATOM_I32,), -1, fx.Int32)
+            for src in push_peers:
+                for atom in range_constexpr(atoms):
+                    if const_expr(release_scope is not None):
+                        _buffer_store(
+                            inbox,
+                            _recv_i32(buf, src, atom),
+                            sentinel,
+                            _CM_SC0 | _CM_SC1,
+                        )
+                    else:
+                        _store_v4i32_peer(
+                            peer_vec[rank] + _i32_to_bytes(_recv_i32(buf, src, atom)),
+                            sentinel,
+                            payload_policy,
+                        )
+
+        def _reduce_f32(my_atoms, polled):
             """Sum this thread's atom across all N contributions, in rank order.
 
             Rank order, not a rotated order: every rank must accumulate in the
             same sequence or the results differ in the last bit across ranks.
             ``cross_device_reduce`` makes the same promise for the same reason.
-            Under ``skip_self`` our own contribution comes out of the registers
-            rather than out of the inbox.
+            Our own contribution comes out of the registers; the peers' come
+            from *polled*, ``_poll``'s result.
 
             Left unrounded: the plain path rounds once in ``_reduce``, and the
             fused path needs the fp32 accumulator for the norm.
@@ -762,30 +801,24 @@ def make_one_shot_allreduce_kernel(
                 acc = None
                 for src in range_constexpr(world_size):
                     if const_expr(src == self_rank):
-                        v = atom_bf16_to_f32(my_atoms[atom])
+                        raw = my_atoms[atom]
                     else:
-                        elem = (
-                            _slot_i32(parity, fx.Int32(src))
-                            + fx.Int32(atom * block * ATOM_I32)
-                            + tid * fx.Int32(ATOM_I32)
-                        )
-                        v = atom_bf16_to_f32(
-                            _buffer_load(inbox, elem, ATOM_I32, fx.Int32, _RECV_POLICY)
-                        )
+                        raw = polled[(src, atom)]
+                    v = atom_bf16_to_f32(raw)
                     acc = v if acc is None else acc + v
                 outs.append(acc)
             return outs
 
-        def _reduce(parity, my_atoms):
+        def _reduce(my_atoms, polled):
             """The plain path's result: one rounding, at the end of the sum."""
-            return [atom_f32_to_bf16(a) for a in _reduce_f32(parity, my_atoms)]
+            return [atom_f32_to_bf16(a) for a in _reduce_f32(my_atoms, polled)]
 
-        def _xchg(tile, parity, wave_sum, prev_same):
+        def _xchg(tile, color, wave_sum, prev_same):
             """Join this wave's sum of squares with every other wave of the row.
 
             ``n_writers`` waves -- every wave of every slice of the row -- each
             add ``fixed(wave_sum) << 8 | 1`` to the row group's word for this
-            parity (``quick_allreduce_fusions.xchg_contribution``), with a
+            colour (``quick_allreduce_fusions.xchg_contribution``), with a
             relaxed agent-scope 64-bit atomic whose result is left *unused*:
             that is the no-return form, and a returning one measured ~0.25 us
             slower. Count and sum move in one atomic op, so a wave that sees the
@@ -795,19 +828,21 @@ def make_one_shot_allreduce_kernel(
             addition is order-independent, so every wave on every rank decodes
             the same bits whatever order the writers arrived in.
 
-            The word is never reset. *prev_same* is its value when this parity
-            last completed; this call is done when ``cur - prev_same`` counts
+            The word rotates with the inbox colour, so the group's workgroups,
+            which run the same rows from the same colour, agree on it. It is
+            never reset. *prev_same* is its value when this colour last
+            completed; this call is done when ``cur - prev_same`` counts
             ``n_writers`` arrivals. That value cannot be overtaken: before any
-            wave can add to this parity again it must pass the *other* parity's
-            exchange, which needs every wave's contribution there, which each
-            wave makes only after it has finished reading this one.
+            wave can add to this colour's word again it must pass the other two
+            colours' exchanges, which need every wave's contribution there,
+            which each wave makes only after it has finished reading this one.
 
             Returns ``(row sum of squares, cur)``; *cur* becomes ``prev`` for
-            this parity's next use.
+            this colour's next use.
             """
             word = _global_ptr(
                 xchg_ptr
-                + fx.Int64(parity * fx.Int32(n_groups) + group)
+                + fx.Int64(color * fx.Int32(n_groups) + group)
                 * fx.Int64(XCHG_LINE_BYTES),
                 T.i64,
                 8,
@@ -820,7 +855,7 @@ def make_one_shot_allreduce_kernel(
                 )
             if const_expr(debug_slice_delay):
                 # Test-only: contributed, not yet read. The siblings complete
-                # this row without us and run on into the other parity's word.
+                # this row without us and run on into the next colour's word.
                 if (part == fx.Int32(0)) & (
                     (tile // fx.Int32(split)) % fx.Int32(3) == fx.Int32(0)
                 ):
@@ -834,8 +869,6 @@ def make_one_shot_allreduce_kernel(
                 syncscope=rocdl.SyncScope.AgentOneAs,
             )
             while xchg_arrivals(cur - prev_same) != fx.Int64(n_writers):
-                if const_expr(spin_sleep):
-                    rocdl.s_sleep(spin_sleep)
                 cur = fx.generic_load(
                     word,
                     dtype=fx.Int64,
@@ -844,35 +877,39 @@ def make_one_shot_allreduce_kernel(
                 )
             return xchg_total(cur - prev_same), cur
 
-        def _epilogue(tile, x_atoms, w_atoms, parity, sq_lds, my_atoms, prev_same):
-            """bf16 round-trip, residual add, RMSNorm.
+        def _epilogue(tile, x_atoms, w_atoms, color, sq_lds, accs, prev_same):
+            """bf16 round-trip, residual add, RMSNorm, on the reduced *accs*.
 
             The arithmetic lives in ``quick_allreduce_fusions``, which the mesh
             and ring epilogues share; what stays here is the store placement.
-            ``residual_out`` is written *before* the reduction, so it is in
+            ``residual_out`` is written *before* the row reduction, so it is in
             flight across the barrier (or, split, the exchange) rather than
             issued behind it -- it has no dependence on the norm.
 
             Returns the exchange word a split build saw complete (the next
-            ``prev`` for this parity), None otherwise.
+            ``prev`` for this colour), None otherwise.
             """
-            accs = residual_add(_reduce_f32(parity, my_atoms), x_atoms)
+            accs = residual_add(accs, x_atoms)
             _store_rows(res_out_buf, tile, pack_bf16(accs))
             done = None
             if const_expr(split > 1):
                 # The row spans ``split`` workgroups: reduce this wave's share,
                 # then join the rest through HBM. 1/hidden is the whole row's.
                 wave_sum = wave_reduce_add(rms_local_sumsq([accs]))[0]
-                total, done = _xchg(tile, parity, wave_sum, prev_same)
+                total, done = _xchg(tile, color, wave_sum, prev_same)
                 rstd = rstd_from_total(total, eps, hidden)
             else:
                 # One block covers one row, so there is a single row to reduce.
-                rstds = rms_rstd([accs], eps, hidden, tid=tid, block=block, lds=sq_lds)
+                lds = None
+                if const_expr(sq_lds is not None):
+                    lds = _LdsWindow(sq_lds, color * fx.Int32(n_waves))
+                rstds = rms_rstd([accs], eps, hidden, tid=tid, block=block, lds=lds)
                 rstd = rstds[0]
             _store_tile(tile, scale_by_weight(accs, rstd, w_atoms))
             return done
 
         sq_lds = None
+        w_atoms = None
         if const_expr(fused):
             # The gain is one row shared by every token, so it is read once here
             # rather than once per token -- a split build reads its own slice.
@@ -886,75 +923,111 @@ def make_one_shot_allreduce_kernel(
                 # fresh LDS symbol per trace-time visit.
                 sq_lds = fx.SharedAllocator().allocate(_RmsShared).peek().wave.ptr
 
+        def _round(tile, color, raw_atoms, x_atoms, prev_same):
+            """One tile, from its input atoms (and, fused, its residual atoms).
+
+            Returns ``(next colour, done)``: *done* is the exchange word a split
+            build saw complete, None otherwise. The colour is the buffer index
+            itself, kept in [0, 3), so it never wraps out of step with the
+            rotation.
+            """
+            my_atoms = [_canonicalize(v) for v in raw_atoms]
+            _fanout(color, my_atoms)
+            polled = _poll(color)
+            done = None
+            if const_expr(fused):
+                done = _epilogue(
+                    tile,
+                    x_atoms,
+                    w_atoms,
+                    color,
+                    sq_lds,
+                    _reduce_f32(my_atoms, polled),
+                    prev_same,
+                )
+            else:
+                _store_tile(tile, _reduce(my_atoms, polled))
+            _rearm(_wrap(color + fx.Int32(2)))
+            return _wrap(color + fx.Int32(1)), done
+
+        def _load_residual(tile):
+            """The residual atoms of *tile*, None in a plain build.
+
+            Issued before the push on purpose: the residual is plain HBM with
+            no dependence on any peer, so this load retires during the poll
+            instead of after it.
+            """
+            if const_expr(fused):
+                return _load_rows(res_in_buf, tile)
+            return None
+
         # Stride by the *launched* grid, not the compile-time cap: the host may
         # launch fewer blocks than ``grid``, and striding by the cap would leave
         # every tile above n_blocks unprocessed.
         n_block_tiles = (num_tiles - bid + n_blocks - fx.Int32(1)) // n_blocks
+        # The host never launches more blocks than tiles, so every block has a
+        # first tile, and its input is read before the colour: the two loads are
+        # then in flight together rather than one after the other.
+        first_atoms = _load_tile(bid)
+        first_x = _load_residual(bid)
         color = _load_color()
-        # Split build: the exchange word's value when each parity last
-        # completed -- ``prev_same`` for the coming row's parity, ``prev_other``
-        # for the other -- rotated every row and persisted per workgroup across
-        # launches. Defined in every build because the loop below assigns them
-        # (the rewriter carries whatever the body assigns); unsplit, they pass
-        # through the loop untouched and fold away.
-        prev_same = fx.Int64(0)
-        prev_other = fx.Int64(0)
+        # Split build: the exchange word's value when each colour last
+        # completed -- ``prev_0`` for the coming row's colour, ``prev_1`` and
+        # ``prev_2`` for the two after it -- rotated every row and persisted per
+        # workgroup across launches. Defined in every build because the loop
+        # below assigns them (the rewriter carries whatever the body assigns);
+        # unsplit, they pass through the loop untouched and fold away.
+        prev_0 = fx.Int64(0)
+        prev_1 = fx.Int64(0)
+        prev_2 = fx.Int64(0)
         if const_expr(split > 1):
             prev_base = (
                 xchg_ptr
                 + fx.Int64(xchg_prev_off)
-                + fx.Int64(bid) * fx.Int64(PARITIES * 8)
+                + fx.Int64(bid) * fx.Int64(INBOX_BUFFERS * 8)
             )
 
             def _prev_word(slot):
-                """This workgroup's persisted exchange word for parity *slot*."""
+                """This workgroup's persisted exchange word for colour *slot*."""
                 return _global_ptr(prev_base + fx.Int64(slot) * fx.Int64(8), T.i64, 8)
 
-            prev_same = fx.generic_load(_prev_word(color & fx.Int32(1)), dtype=fx.Int64)
-            prev_other = fx.generic_load(
-                _prev_word((color + fx.Int32(1)) & fx.Int32(1)), dtype=fx.Int64
+            prev_0 = fx.generic_load(_prev_word(color), dtype=fx.Int64)
+            prev_1 = fx.generic_load(
+                _prev_word(_wrap(color + fx.Int32(1))), dtype=fx.Int64
             )
-        for i in range(fx.Int32(0), n_block_tiles, fx.Int32(1)):
+            prev_2 = fx.generic_load(
+                _prev_word(_wrap(color + fx.Int32(2))), dtype=fx.Int64
+            )
+        first = _round(bid, color, first_atoms, first_x, prev_0)
+        color = first[0]
+        if const_expr(split > 1):
+            # The next row uses the next colour.
+            prev_0 = prev_1
+            prev_1 = prev_2
+            prev_2 = first[1]
+        for i in range(fx.Int32(1), n_block_tiles, fx.Int32(1)):
+            # The last round's re-arm must land before this round's push: a peer
+            # that sees the push can be one round further on, writing into the
+            # slot just re-armed. Between calls the kernel boundary does this.
+            rocdl.s_waitcnt(vmcnt=0)
             tile = bid + i * n_blocks
-            parity = color & fx.Int32(1)
-            my_atoms = _load_tile(tile)
-            # Issued before the handshake on purpose: the residual is plain
-            # HBM with no dependence on any peer, so this load retires
-            # during the flag spin instead of after it.
-            if const_expr(fused):
-                x_atoms = _load_rows(res_in_buf, tile)
-            _fanout(parity, my_atoms)
-            _publish(parity, color)
-            _wait(parity, color)
-            if const_expr(fused):
-                done = _epilogue(
-                    tile, x_atoms, w_atoms, parity, sq_lds, my_atoms, prev_same
-                )
-                if const_expr(split > 1):
-                    # The next row uses the other parity.
-                    prev_same = prev_other
-                    prev_other = done
-            else:
-                _store_tile(tile, _reduce(parity, my_atoms))
-            color = color + fx.Int32(1)
-            # 0 is the unset sentinel. The
-            # inbox slot is `color & 1`, and the colour before the wrap is -1,
-            # which is odd: resuming at 1 would put two consecutive tiles in
-            # the same slot, and a rank one tile ahead would overwrite data a
-            # peer is still reading.
-            if color == fx.Int32(0):
-                color = fx.Int32(2)
+            step = _round(tile, color, _load_tile(tile), _load_residual(tile), prev_0)
+            color = step[0]
+            if const_expr(split > 1):
+                prev_0 = prev_1
+                prev_1 = prev_2
+                prev_2 = step[1]
+        if const_expr(split > 1):
+            slot_1 = _wrap(color + fx.Int32(1))
+            slot_2 = _wrap(color + fx.Int32(2))
         if tid == 0:
             _store_color(color)
             if const_expr(split > 1):
                 # Every wave decoded the same completed words, so any one
-                # thread's copy is the workgroup's. The wrap above keeps the
-                # parities alternating, so ``color``'s parity is still
-                # ``prev_same``'s.
-                fx.generic_store(_prev_word(color & fx.Int32(1)), prev_same)
-                fx.generic_store(
-                    _prev_word((color + fx.Int32(1)) & fx.Int32(1)), prev_other
-                )
+                # thread's copy is the workgroup's.
+                fx.generic_store(_prev_word(color), prev_0)
+                fx.generic_store(_prev_word(slot_1), prev_1)
+                fx.generic_store(_prev_word(slot_2), prev_2)
         gpu.barrier()
 
     flat_wg = f"{block},{block}"
@@ -993,7 +1066,7 @@ def make_one_shot_allreduce_kernel(
             value_attrs={"rocdl.flat_work_group_size": flat_wg},
         ).launch(grid=(grid_x, 1, 1), block=(block, 1, 1), stream=stream)
 
-    tag = f"ws{world_size}_a{atoms}_g{grid}_{inbox_memory}_b{block}"
+    tag = f"ws{world_size}_r{self_rank}_a{atoms}_g{grid}_{inbox_memory}_b{block}"
     if atoms > 1:
         tag += f"_{fanout}"
     if fused:
@@ -1009,13 +1082,6 @@ def make_one_shot_allreduce_kernel(
             tag += f"_k{split}"
             if debug_slice_delay:
                 tag += f"_dly{debug_slice_delay}"
-    if spin_sleep:
-        tag += f"_sl{spin_sleep}"
-    if skip_self:
-        # ``_r<n>_`` is the rank field the bench's variant comparison already
-        # knows to collapse before checking that the ranks agree; a build
-        # specialised per rank legitimately reports a different string on each.
-        tag += f"_r{self_rank}_ss"
     launch_one_shot_allreduce.func.__name__ = f"launch_one_shot_allreduce_{tag}"
     try:
         one_shot_allreduce.func.__name__ = f"one_shot_allreduce_{tag}"
@@ -1027,7 +1093,8 @@ def make_one_shot_allreduce_kernel(
         "data_bytes": data_bytes,
         "lds_bytes": lds_bytes,
         "tile_bytes": tile_bytes,
-        "wire_tile_bytes": wire_tile_bytes,
+        # No handshake sector: a wire slot is just the payload.
+        "wire_tile_bytes": tile_bytes,
         # Shims for ``quick_allreduce._StEngine``, which is reused verbatim for the IPC
         # inbox and peer table. This schedule has no super-tile (one round per
         # tile, nothing to batch) and no per-rank tile split (every rank sends
@@ -1039,8 +1106,9 @@ def make_one_shot_allreduce_kernel(
         "world_size": world_size,
         "inbox_memory": inbox_memory,
         "fanout": fanout,
-        "spin_sleep": spin_sleep,
-        "skip_self": skip_self,
+        "rank": self_rank,
+        # Byte every inbox byte starts as.
+        "inbox_fill": SENTINEL_FILL_BYTE,
         "grid": grid,
         "block": block,
         "fusion": fusion,

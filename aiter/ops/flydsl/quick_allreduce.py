@@ -13,9 +13,8 @@ they are named for the topology of each lap instead:
 Super-tile ST∈{1,8} on the mesh, ST∈{1,8,16,32} on the ring. INT4 nibble or
 INT6 bit-plane pair, both with group-16 E4M3 scales. Payload HBM is bf16.
 
-Two more tuning knobs ride every ladder rung: ``block`` (threads per workgroup,
-which sets the tile) and, on the mesh only, ``skip_self`` (no round trip through
-this rank's own inbox). Ladders are keyed on ``(link, world_size)``.
+One more tuning knob rides every ladder rung: ``block`` (threads per workgroup,
+which sets the tile). Ladders are keyed on ``(link, world_size)``.
 """
 
 from __future__ import annotations
@@ -119,11 +118,12 @@ class _Algorithm:
     accepts, and where the size floor sits. That is this record.
 
     ``build`` is keyword-only and always receives ``rank``, ``rs_codec``,
-    ``ag_codec``, ``block`` and ``skip_self``, whether or not a given schedule
-    uses them. The ring bakes ``rank`` in at compile time -- the chunk a step
-    operates on is ``(rank - step) % N``, which has to be a Python constant to
-    index a register-resident atom list -- while the mesh takes it as a runtime
-    kernel argument and bakes it in only under ``skip_self``.
+    ``ag_codec`` and ``block``, whether or not a given schedule uses them. Both
+    bake ``rank`` in at compile time. The ring needs it because the chunk a
+    step operates on is ``(rank - step) % N``, which has to be a Python
+    constant to index a register-resident atom list. The mesh needs it to keep
+    its own share of every tile in registers instead of round-tripping it
+    through its own inbox.
     """
 
     name: str
@@ -146,9 +146,9 @@ class _Algorithm:
         return dict(self.min_bytes_by_world).get(int(world_size), self.min_bytes)
 
     # ``(world_size, link) -> ((min_payload_bytes, super_tile, grid_cap,
-    # block, skip_self), ...)``, ascending. When the caller did not pin
-    # ``super_tile``, ``FlyQuickAllReduce`` builds an engine per rung and
-    # selects by payload size at launch.
+    # block), ...)``, ascending. When the caller did not pin ``super_tile``,
+    # ``FlyQuickAllReduce`` builds an engine per rung and selects by payload
+    # size at launch.
     #
     # Keyed on world size because the rungs genuinely move with it: publishes
     # per rank are ``num_tiles / ST * 2(N-1)``, so the batching crossover
@@ -157,8 +157,6 @@ class _Algorithm:
     # size"; no schedule uses that any more, but the code path stays because
     # pinning ``super_tile`` still collapses to it.
     st_ladder: Callable[[int, str], tuple] | None = None
-    # Whether the schedule has a round trip through its own inbox to skip.
-    supports_skip_self: bool = False
 
     def ladder_for(self, world_size: int, link: str = "pcie") -> tuple:
         """Rungs for *(link, world_size)*; ``()`` when there is no ladder."""
@@ -177,7 +175,6 @@ def _build_mesh(
     rs_codec,
     ag_codec,
     block=None,
-    skip_self=False,
     fusion="none",
     hidden=None,
     h_pad=None,
@@ -194,21 +191,11 @@ def _build_mesh(
         inbox_memory=inbox_memory,
         codec=rs_codec,
         block=block,
-        skip_self=skip_self,
-        rank=rank if skip_self else None,
+        rank=rank,
         fusion=fusion,
         hidden=hidden,
         h_pad=h_pad,
     )
-
-
-def _build_ring(*, skip_self, **kw):
-    if skip_self:
-        raise ValueError(
-            "skip_self does not apply to the ring: it never writes its own "
-            "inbox, so there is no round trip to skip"
-        )
-    return make_quick_allreduce_ring_kernel(**kw)
 
 
 ALGORITHMS = {
@@ -222,12 +209,11 @@ ALGORITHMS = {
         min_batch_blocks=_MIN_BATCH_BLOCKS,
         default_super_tile=8,
         st_ladder=mesh_st_ladder,
-        supports_skip_self=True,
         fused_block_ok=mesh_fanout_fits,
     ),
     "ring": _Algorithm(
         name="ring",
-        build=_build_ring,
+        build=make_quick_allreduce_ring_kernel,
         super_tiles=RING_SUPER_TILES,
         rs_codecs=RS_CODECS,
         ag_codecs=AG_CODECS,
@@ -287,7 +273,7 @@ def _resolve_codecs(algo, world_size, rs_codec, ag_codec):
 
 
 def batches_publishes(inbox_memory: str, algorithm: str, link: str) -> bool:
-    """Whether ``FlyQuickAllReduce`` batches publishes by default.
+    """Whether ``FlyQuickAllReduce`` batches publishes into super-tiles.
 
     Always with a release fence, where every publish is an L2 writeback. The
     PCIe ring batches without one too: each of its ``2(N-1)`` hops ends in a
@@ -335,10 +321,9 @@ class FlyQuickAllReduce:
     defaulting to ``MIN_PAYLOAD_BYTES``.
 
     ``link`` selects the tuning ladder and is detected from the KFD topology
-    when not given. ``block`` and ``skip_self`` override those knobs on every
-    rung, ``None`` leaving each rung's own value; ``skip_self`` is mesh-only.
-    Under ``skip_self`` the mesh specialises its binary to this rank, so the
-    JIT symbol carries an ``_r<n>_`` field.
+    when not given. ``block`` overrides that knob on every rung, ``None``
+    leaving each rung's own value. Both schedules specialise their binary to
+    this rank, so the JIT symbol carries an ``_r<n>_`` field.
     """
 
     def __init__(
@@ -351,14 +336,12 @@ class FlyQuickAllReduce:
         super_tile: int | None = None,
         grid_cap: int | None = None,
         inbox_memory: str = "auto",
-        batch_publishes: bool | None = None,
         min_bytes: int | None = None,
         algorithm: str = DEFAULT_ALGORITHM,
         rs_codec: str | None = None,
         ag_codec: str | None = None,
         link: str | None = None,
         block: int | None = None,
-        skip_self: bool | None = None,
     ):
         if world_size not in SUPPORTED_WORLDS:
             raise ValueError(
@@ -375,11 +358,6 @@ class FlyQuickAllReduce:
             raise ValueError(f"link must be 'pcie' or 'xgmi', got {link!r}")
         if block is not None and block not in SUPPORTED_BLOCKS:
             raise ValueError(f"block must be one of {SUPPORTED_BLOCKS}, got {block!r}")
-        if skip_self and not algo.supports_skip_self:
-            raise ValueError(
-                f"skip_self does not apply to algorithm={algorithm!r}: it never "
-                "writes its own inbox, so there is no round trip to skip"
-            )
         # ``None`` means "use the schedule's own policy", which for both is
         # the payload-size ladder. Passing a value pins one super-tile for
         # every size, which is what the benchmark variants and the tuning
@@ -411,16 +389,13 @@ class FlyQuickAllReduce:
         if cap < 1:
             raise ValueError(f"grid_cap must be positive, got {cap}")
 
-        def _knobs(rung_block, rung_skip):
-            """A rung's ``(block, skip_self)`` with the caller's overrides."""
-            b = int(rung_block if block is None else block)
-            ss = bool(rung_skip if skip_self is None else skip_self)
-            return b, ss
+        def _block(rung_block):
+            """A rung's ``block`` with the caller's override."""
+            return int(rung_block if block is None else block)
 
-        # Rungs to build, each ``(min_bytes, super_tile, grid_cap, block,
-        # skip_self)``. Pinning ``super_tile`` collapses the ladder to that one
-        # rung -- a caller who named a super-tile gets exactly it, at every
-        # size.
+        # Rungs to build, each ``(min_bytes, super_tile, grid_cap, block)``.
+        # Pinning ``super_tile`` collapses the ladder to that one rung -- a
+        # caller who named a super-tile gets exactly it, at every size.
         #
         # ``grid_cap`` is a *ceiling*, not a pin: it bounds every rung rather
         # than disabling size-dependent selection. Raising it above a rung's own
@@ -430,11 +405,11 @@ class FlyQuickAllReduce:
         world_ladder = algo.ladder_for(world_size, link)
         if world_ladder and not pinned_st:
             ladder = tuple(
-                (floor, st, min(rung_cap, cap), *_knobs(b, ss))
-                for floor, st, rung_cap, b, ss in world_ladder
+                (floor, st, min(rung_cap, cap), _block(b))
+                for floor, st, rung_cap, b in world_ladder
             )
         else:
-            ladder = ((0, int(super_tile), cap, *_knobs(BLOCK, False)),)
+            ladder = ((0, int(super_tile), cap, _block(BLOCK)),)
         inbox_flags, resolved_inbox = _resolve_inbox_flags(inbox_memory, world_size)
         self._device_index = _cuda_index(device)
         self.group = group
@@ -454,11 +429,7 @@ class FlyQuickAllReduce:
         )
         lds_capacity = get_lds_capacity_bytes(arch)
 
-        self._batch_publishes = (
-            batches_publishes(resolved_inbox, algorithm, link)
-            if batch_publishes is None
-            else bool(batch_publishes)
-        )
+        self._batch_publishes = batches_publishes(resolved_inbox, algorithm, link)
 
         self.min_bytes = (
             algo.floor_bytes(self.world_size) if min_bytes is None else int(min_bytes)
@@ -466,14 +437,13 @@ class FlyQuickAllReduce:
         if self.min_bytes < 0:
             raise ValueError(f"min_bytes must be non-negative, got {self.min_bytes}")
 
-        # One engine per distinct ``(super_tile, block, skip_self)``, keyed
-        # that way in ``_by_cfg``. Each ``(block, skip_self)`` also gets an ST=1
-        # engine: _pick_cfg falls back to it when a payload has fewer tiles than
-        # the chosen super-tile, and the fallback has to share the rung's block
-        # -- a different tile size would change the tile count it was picked
-        # for. Engines are built in a fixed order because each does its own IPC
-        # handle exchange, which is a collective -- ranks disagreeing on the
-        # order would deadlock.
+        # One engine per distinct ``(super_tile, block)``, keyed that way in
+        # ``_by_cfg``. Each ``block`` also gets an ST=1 engine: _pick_cfg falls
+        # back to it when a payload has fewer tiles than the chosen super-tile,
+        # and the fallback has to share the rung's block -- a different tile
+        # size would change the tile count it was picked for. Engines are built
+        # in a fixed order because each does its own IPC handle exchange, which
+        # is a collective -- ranks disagreeing on the order would deadlock.
         #
         # The rungs go in first so an ST=1 that the ladder *sites* keeps its own
         # cap. Only then is the fallback filled in, and at the smallest cap
@@ -485,20 +455,17 @@ class FlyQuickAllReduce:
         # built a 194 MiB inbox to launch at most 32 blocks into, and did it on
         # every object ever constructed.
         caps = {}
-        for _floor, st, rung_cap, b, ss in ladder:
-            caps.setdefault((st, b, ss), rung_cap)
-        for b, ss in {(b, ss) for _st, b, ss in list(caps)}:
-            caps.setdefault(
-                (1, b, ss),
-                min(c for (_st, cb, css), c in caps.items() if (cb, css) == (b, ss)),
-            )
+        for _floor, st, rung_cap, b in ladder:
+            caps.setdefault((st, b), rung_cap)
+        for b in {b for _st, b in list(caps)}:
+            caps.setdefault((1, b), min(c for (_st, cb), c in caps.items() if cb == b))
         self._ladder = ladder if (world_ladder and not pinned_st) else ()
         self._primary = ladder[0][1:2] + ladder[0][3:]
         self._by_cfg = {}
         try:
             with torch.cuda.device(self._device_index):
                 for key in sorted(caps):
-                    st, b, ss = key
+                    st, b = key
                     # A persistent kernel deadlocks if it launches more workgroups
                     # than fit, and the ranks have to agree on the number: take the
                     # minimum across the group so a heterogeneous node converges.
@@ -521,7 +488,6 @@ class FlyQuickAllReduce:
                         rs_codec=rs_codec,
                         ag_codec=ag_codec,
                         block=b,
-                        skip_self=ss,
                     )
                     if spec["lds_bytes"] > lds_capacity:
                         raise ValueError(
@@ -541,7 +507,7 @@ class FlyQuickAllReduce:
             raise
 
         primary = self._by_cfg[self._primary]
-        self.super_tile, self.block, self.skip_self = self._primary
+        self.super_tile, self.block = self._primary
         self.buf_bytes = primary.buf_bytes
         self.lds_bytes = primary.lds_bytes
         self.tile_bytes = primary.tile_bytes
@@ -562,8 +528,8 @@ class FlyQuickAllReduce:
         """
         return sum(eng.buf_bytes for eng in self._by_cfg.values())
 
-    def _ladder_cfg(self, live_bytes: int) -> tuple[int, int, bool]:
-        """``(super_tile, block, skip_self)`` the ladder assigns to *live_bytes*.
+    def _ladder_cfg(self, live_bytes: int) -> tuple[int, int]:
+        """``(super_tile, block)`` the ladder assigns to *live_bytes*.
 
         Publishes per rank are ``num_tiles / ST * 2(N-1)`` and cost a full L2
         writeback each, so a bigger payload wants a bigger ST -- but ST also
@@ -572,9 +538,9 @@ class FlyQuickAllReduce:
         ``RING_ST_LADDER``.
         """
         cfg = self._primary
-        for floor, st, _cap, b, ss in self._ladder:
+        for floor, st, _cap, b in self._ladder:
             if live_bytes >= floor:
-                cfg = (st, b, ss)
+                cfg = (st, b)
         return cfg
 
     @staticmethod
@@ -582,7 +548,7 @@ class FlyQuickAllReduce:
         tile_bytes = int(block) * ATOMS * 16
         return max(1, (live_bytes + tile_bytes - 1) // tile_bytes)
 
-    def _pick_cfg(self, live_bytes: int) -> tuple[tuple[int, int, bool], int]:
+    def _pick_cfg(self, live_bytes: int) -> tuple[tuple[int, int], int]:
         """Engine key for a *live_bytes* payload, and its tile count.
 
         The ladder chooses the rung, which fixes the block and so the tile
@@ -599,15 +565,15 @@ class FlyQuickAllReduce:
         there is a whole one to take. Measured on MI350P at 1024x7168, TP4:
         577.71 us at ST=1 against 269.01 at ST=8.
         """
-        want, b, ss = self._ladder_cfg(live_bytes)
+        want, b = self._ladder_cfg(live_bytes)
         num_tiles = self._num_tiles(live_bytes, b)
         if want == 1:
             st = 1
         elif self._batch_publishes:
             st = want if num_tiles >= want else 1
         else:
-            st = want if num_tiles > self._by_cfg[(want, b, ss)].grid else 1
-        return (st, b, ss), num_tiles
+            st = want if num_tiles > self._by_cfg[(want, b)].grid else 1
+        return (st, b), num_tiles
 
     def _grid_x(self, num_tiles: int, super_tile: int, grid: int | None = None) -> int:
         """Blocks to launch for *num_tiles* tiles under *super_tile*.
@@ -700,7 +666,7 @@ class FlyQuickAllReduce:
         with torch.cuda.device(self._device_index):
             _run_compiled(eng.launch, *args)
 
-    def cfgs_for(self, lo: int, hi: int) -> list[tuple[int, int, bool]]:
+    def cfgs_for(self, lo: int, hi: int) -> list[tuple[int, int]]:
         """``_by_cfg`` keys a payload of ``lo..hi`` bytes (inclusive) can
         select, in build order."""
         floors = [rung[0] for rung in self._ladder]
@@ -843,7 +809,6 @@ class FlyQuickAllReduceRMSNorm:
         atoms_per_row: int | None = None,
         hiddens: tuple[int, ...] = (),
         pad: bool = True,
-        skip_self: bool = False,
     ):
         if world_size not in SUPPORTED_WORLDS:
             raise ValueError(
@@ -859,11 +824,6 @@ class FlyQuickAllReduceRMSNorm:
             raise ValueError(
                 f"super_tile must be one of {algo.super_tiles} for "
                 f"algorithm={algorithm!r}, got {super_tile!r}"
-            )
-        if skip_self and not algo.supports_skip_self:
-            raise ValueError(
-                f"skip_self does not apply to algorithm={algorithm!r}: it never "
-                "writes its own inbox, so there is no round trip to skip"
             )
         rs_codec, ag_codec = _resolve_codecs(algo, int(world_size), rs_codec, ag_codec)
         group_world = dist.get_world_size(group=group)
@@ -921,7 +881,6 @@ class FlyQuickAllReduceRMSNorm:
         self.min_bytes = algo.floor_bytes(self.world_size)
         self.max_bytes = max_bytes
         self.pad = bool(pad)
-        self.skip_self = bool(skip_self)
 
         # Rungs to build, as ``(super_tile, grid_cap)``. Same ladder the plain
         # class walks; pinning ``super_tile`` collapses it to one rung.
@@ -929,7 +888,7 @@ class FlyQuickAllReduceRMSNorm:
         if world_ladder and not pinned_st:
             self._ladder = world_ladder
             self._rungs = [
-                (st, min(rung_cap, cap)) for _, st, rung_cap, _b, _ss in world_ladder
+                (st, min(rung_cap, cap)) for _, st, rung_cap, _b in world_ladder
             ]
         else:
             st = algo.default_super_tile if super_tile is None else int(super_tile)
@@ -1068,7 +1027,6 @@ class FlyQuickAllReduceRMSNorm:
                 inbox_memory=self.inbox_memory,
                 rs_codec=self.rs_codec,
                 ag_codec=self.ag_codec,
-                skip_self=self.skip_self,
                 fusion="rmsnorm",
                 hidden=hidden,
                 block=block,
@@ -1121,7 +1079,7 @@ class FlyQuickAllReduceRMSNorm:
 
     def _ladder_st(self, live_bytes: int) -> int:
         st = min(self._by_cap)
-        for floor, rung_st, _cap, _b, _ss in self._ladder:
+        for floor, rung_st, _cap, _b in self._ladder:
             if live_bytes >= floor:
                 st = rung_st
         return st

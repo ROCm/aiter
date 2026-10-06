@@ -35,8 +35,6 @@ from .kernels.one_shot_allreduce import (
     DEFAULT_BLOCK,
     DEFAULT_FANOUT,
     DEFAULT_GRID_CAP,
-    DEFAULT_SKIP_SELF,
-    DEFAULT_SPIN_SLEEP,
     DEFAULT_SPLIT,
     SUPPORTED_ATOMS,
     SUPPORTED_BLOCKS,
@@ -93,10 +91,10 @@ class OneShotAllReduce:
     One exception: at TP2 it picks ``uncached`` on PCIe too, since a single
     remote destination cannot collapse.
 
-    ``skip_self`` drops the round trip this rank does through its own inbox.
-    It specialises the kernel to this rank, so the JIT symbol carries an ``_r<n>_``
-    field and the binary is not shared across ranks -- one extra compile per process,
-    not per world.
+    A rank never round-trips through its own inbox: its own contribution stays
+    in registers. That specialises the kernel to this rank, so the JIT symbol
+    carries an ``_r<n>_`` field and the binary is not shared across ranks -- one
+    compile per process, not per world.
     """
 
     def __init__(
@@ -113,8 +111,6 @@ class OneShotAllReduce:
         block: int | None = None,
         max_bytes: int | None = None,
         link: str | None = None,
-        spin_sleep: int = DEFAULT_SPIN_SLEEP,
-        skip_self: bool | None = None,
     ):
         if world_size not in SUPPORTED_WORLDS:
             raise ValueError(
@@ -170,21 +166,9 @@ class OneShotAllReduce:
         self.max_bytes = (
             max_payload_bytes(world_size, link) if max_bytes is None else int(max_bytes)
         )
-        self.spin_sleep = int(spin_sleep)
 
-        # ``skip_self``: None means "whatever the rung says".
-        ss = None if skip_self is None else bool(skip_self)
         if pinned:
-            self._ladder = (
-                (
-                    0,
-                    int(atoms),
-                    cap,
-                    fanout,
-                    int(block),
-                    DEFAULT_SKIP_SELF if ss is None else ss,
-                ),
-            )
+            self._ladder = ((0, int(atoms), cap, fanout, int(block)),)
         else:
             ceiling = cap if grid_cap is not None else None
             self._ladder = tuple(
@@ -194,9 +178,8 @@ class OneShotAllReduce:
                     rung_cap if ceiling is None else min(rung_cap, ceiling),
                     f,
                     b,
-                    s if ss is None else ss,
                 )
-                for floor, a, rung_cap, f, b, s in oneshot_ladder(world_size, link)
+                for floor, a, rung_cap, f, b in oneshot_ladder(world_size, link)
             )
 
         # One engine per distinct rung config, built in a fixed sorted order:
@@ -221,8 +204,6 @@ class OneShotAllReduce:
                         inbox_memory=resolved_inbox,
                         fanout=key[2],
                         block=key[3],
-                        spin_sleep=int(spin_sleep),
-                        skip_self=key[4],
                         rank=self.rank,
                     )
                     self._by_cfg[key] = (
@@ -249,7 +230,6 @@ class OneShotAllReduce:
         self.grid_cap = first[1]
         self.fanout = first[2]
         self.block = first[3]
-        self.skip_self = first[4]
         self.tile_bytes = spec["tile_bytes"]
         self.wire_tile_bytes = spec["wire_tile_bytes"]
         self.buf_bytes = eng.buf_bytes
@@ -262,11 +242,11 @@ class OneShotAllReduce:
     @staticmethod
     def _cfg_of(rung) -> tuple:
         """A ladder rung's engine key: everything but its ``min_bytes``."""
-        _floor, atoms, cap, fanout, block, skip_self = rung
-        return (int(atoms), int(cap), fanout, int(block), bool(skip_self))
+        _floor, atoms, cap, fanout, block = rung
+        return (int(atoms), int(cap), fanout, int(block))
 
     def _pick_cfg(self, live_bytes: int) -> tuple:
-        """``(atoms, grid_cap, fanout, block, skip_self)`` the ladder assigns to
+        """``(atoms, grid_cap, fanout, block)`` the ladder assigns to
         *live_bytes*."""
         chosen = self._ladder[0]
         for rung in self._ladder:
@@ -454,8 +434,7 @@ class OneShotAllReduceRMSNorm:
     ``split`` spreads each row over that many workgroups instead (``block *
     atoms * 8 * split == hidden``), which joins the row's sum of squares through
     one HBM exchange word; at decode sizes one workgroup per row leaves most of
-    the GPU idle. Like ``skip_self`` it overrides every ladder rung rather than
-    pinning one. A width with no split geometry for the requested value takes
+    the GPU idle. It overrides every ladder rung rather than pinning one. A width with no split geometry for the requested value takes
     the nearest one it has, and a padded width runs unsplit.
     """
 
@@ -473,8 +452,6 @@ class OneShotAllReduceRMSNorm:
         block: int | None = None,
         max_bytes: int | None = None,
         link: str | None = None,
-        spin_sleep: int = DEFAULT_SPIN_SLEEP,
-        skip_self: bool | None = None,
         hiddens: tuple[int, ...] = (),
         pad: bool = True,
         split: int | None = None,
@@ -533,7 +510,6 @@ class OneShotAllReduceRMSNorm:
         self.max_bytes = (
             max_payload_bytes(world_size, link) if max_bytes is None else int(max_bytes)
         )
-        self.spin_sleep = int(spin_sleep)
         self.block = None if block is None else int(block)
         # Whether a width with no native geometry may run on a wider workgroup
         # with the lanes past the real row masked off.
@@ -541,8 +517,7 @@ class OneShotAllReduceRMSNorm:
 
         # ``FUSED_ONESHOT_LADDER``: ``atoms`` sets tile
         # width in the plain schedule and block width here.
-        ss = None if skip_self is None else bool(skip_self)
-        # ``split`` overrides every rung, as ``skip_self`` does.
+        # ``split`` overrides every rung.
         k = None if split is None else int(split)
         if pinned:
             self._ladder = (
@@ -551,7 +526,6 @@ class OneShotAllReduceRMSNorm:
                     DEFAULT_ATOMS if atoms is None else int(atoms),
                     DEFAULT_GRID_CAP if grid_cap is None else int(grid_cap),
                     DEFAULT_FANOUT if fanout is None else fanout,
-                    DEFAULT_SKIP_SELF if ss is None else ss,
                     DEFAULT_SPLIT if k is None else k,
                 ),
             )
@@ -563,17 +537,15 @@ class OneShotAllReduceRMSNorm:
                     a,
                     rung_cap if ceiling is None else min(rung_cap, ceiling),
                     f,
-                    s if ss is None else ss,
                     rung_split if k is None else k,
                 )
-                for floor, a, rung_cap, f, s, rung_split in fused_oneshot_ladder(
+                for floor, a, rung_cap, f, rung_split in fused_oneshot_ladder(
                     world_size, link
                 )
             )
-        self.skip_self = self._ladder[0][4]
-        self.split = self._ladder[0][5]
+        self.split = self._ladder[0][4]
 
-        # (hidden, atoms, grid_cap, fanout, skip_self, h_pad, split) -> (engine, spec)
+        # (hidden, atoms, grid_cap, fanout, h_pad, split) -> (engine, spec)
         self._by_cfg: dict[tuple, tuple] = {}
         try:
             for h in sorted({int(x) for x in hiddens}):
@@ -657,10 +629,10 @@ class OneShotAllReduceRMSNorm:
         a row group is ``split`` consecutive workgroups and all of them must be
         launched -- so a cap of 64 runs 63 workgroups at split=7.
         """
-        _floor, a, cap, f, s, k = rung
+        _floor, a, cap, f, k = rung
         atoms, h_pad, split = self._geom_for(hidden, a, k)
         cap = max(split, int(cap) // split * split)
-        return (int(hidden), atoms, cap, f, bool(s), h_pad, split)
+        return (int(hidden), atoms, cap, f, h_pad, split)
 
     def _build_hidden(self, hidden: int) -> None:
         """Build every rung for hidden dim. Collective: all ranks must call it in
@@ -675,13 +647,11 @@ class OneShotAllReduceRMSNorm:
                 grid=key[2],
                 inbox_memory=self.inbox_memory,
                 fanout=key[3],
-                spin_sleep=self.spin_sleep,
-                skip_self=key[4],
                 rank=self.rank,
                 fusion="rmsnorm",
                 hidden=key[0],
-                h_pad=key[5],
-                split=key[6],
+                h_pad=key[4],
+                split=key[5],
             )
             with torch.cuda.device(self._device_index):
                 self._by_cfg[key] = (
@@ -723,7 +693,7 @@ class OneShotAllReduceRMSNorm:
         """
         hidden = int(hidden)
         if any(
-            r[5] > 1 and self._split_geom_for(hidden, r[1], r[5]) is not None
+            r[4] > 1 and self._split_geom_for(hidden, r[1], r[4]) is not None
             for r in self._ladder
         ):
             return True
@@ -739,7 +709,7 @@ class OneShotAllReduceRMSNorm:
 
     def pads_hidden(self, hidden: int) -> int:
         """``h_pad`` this width would run at, or hidden dim when it needs no padding."""
-        _floor, atoms, _cap, _f, _s, split = self._ladder[0]
+        _floor, atoms, _cap, _f, split = self._ladder[0]
         return self._geom_for(int(hidden), atoms, split)[1]
 
     # -- launch --------------------------------------------------------------

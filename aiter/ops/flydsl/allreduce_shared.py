@@ -18,7 +18,7 @@ _SUPPORTED_ARCHS = ("gfx942", "gfx950")
 
 # How the IPC inbox is allocated. The wire protocol is identical in every
 # mode; only the memory type changes.
-INBOX_MEMORY_MODES = ("auto", "uncached", "finegrained", "default")
+INBOX_MEMORY_MODES = ("auto", "uncached", "finegrained")
 
 
 def _cuda_index(device) -> int:
@@ -53,7 +53,6 @@ def _resolve_inbox_flags(mode: str, world_size: int) -> tuple[int, str]:
     flags = {
         "uncached": UncachedIpcHeap._HIP_DEVICE_MALLOC_UNCACHED,
         "finegrained": UncachedIpcHeap._HIP_DEVICE_MALLOC_FINEGRAINED,
-        "default": UncachedIpcHeap._HIP_DEVICE_MALLOC_DEFAULT,
     }[mode]
     return flags, mode
 
@@ -81,7 +80,6 @@ class _StEngine:
         self.rank_tile_bytes = spec["rank_tile_bytes"]
         self.wire_tile_bytes = spec["wire_tile_bytes"]
         self.block = spec["block"]
-        self.skip_self = spec.get("skip_self", False)
         self._peer_bases = [None] * world_size
         self._buf_ptr = None
         self._meta_ptr = None
@@ -92,7 +90,9 @@ class _StEngine:
         try:
             # The inbox is the only allocation peers write into, so it is the
             # only one whose memory type matters for fabric throughput.
-            self._buf_ptr = UncachedIpcHeap.alloc(self.buf_bytes, inbox_flags)
+            self._buf_ptr = UncachedIpcHeap.alloc(
+                self.buf_bytes, inbox_flags, fill=spec.get("inbox_fill", 0)
+            )
             my_handle = UncachedIpcHeap.get_mem_handle_bytes(self._buf_ptr)
             all_meta = UncachedIpcHeap.gather_object_list_via_broadcast(
                 group, (my_handle, 0)

@@ -92,25 +92,20 @@ def test_ladders_are_well_formed(ws):
             assert rungs, (name, link)
             assert rungs[0][0] == 0, (name, link)
             assert [r[0] for r in rungs] == sorted(r[0] for r in rungs), (name, link)
-            for _floor, st, cap, block, skip_self in rungs:
+            for _floor, st, cap, block in rungs:
                 assert st in valid_st, (name, link, st)
                 assert cap >= 1, (name, link, cap)
                 assert block in TWO_STAGE_BLOCKS, (name, link, block)
-                assert isinstance(skip_self, bool), (name, link, skip_self)
-                # The ring never writes its own inbox, so it has no self round
-                # trip to skip; the host rejects the combination.
-                assert not (name == "ring" and skip_self), (link, ws)
 
     for link in P.LINKS:
         one = oneshot_ladder(ws, link)
         assert one and one[0][0] == 0, link
         assert [r[0] for r in one] == sorted(r[0] for r in one), link
-        for _floor, atoms, cap, fanout, block, skip_self in one:
+        for _floor, atoms, cap, fanout, block in one:
             assert atoms in SUPPORTED_ATOMS, (link, atoms)
             assert cap >= 1, (link, cap)
             assert fanout in ("peer", "atom"), (link, fanout)
             assert block in SUPPORTED_BLOCKS, (link, block)
-            assert isinstance(skip_self, bool), (link, skip_self)
 
 
 @pytest.mark.parametrize("ws", WORLDS)
@@ -233,7 +228,9 @@ def test_oneshot_min_override():
             P.resolve_oneshot("xgmi", 8).max_bytes
             == P.FAMILY_POLICY[("xgmi", 8)].oneshot_max_exact
         )
-        assert P.resolve_quant("xgmi", 8).floor == P.FAMILY_POLICY[("xgmi", 8)].oneshot_max
+        assert (
+            P.resolve_quant("xgmi", 8).floor == P.FAMILY_POLICY[("xgmi", 8)].oneshot_max
+        )
     # 0 is a valid override: accept every size down to the custom-AR floor.
     with _env(AITER_FLY_AR_ONESHOT_MIN_BYTES="0"):
         assert P.resolve_oneshot("xgmi", 8).min_bytes == 0
