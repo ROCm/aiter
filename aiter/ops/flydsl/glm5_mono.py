@@ -10,6 +10,8 @@ experts with an in-kernel all-reduce. Device code from ROCm/FlyDSL#1204,
 host wrapper and TP4 paths from ROCm/ATOM#2435.
 """
 
+import torch
+
 from aiter.ops.flydsl.kernels.glm5_mono.config import (
     GLM5_KERNEL_SAMPLES,
     AttentionWeight,
@@ -24,6 +26,9 @@ from aiter.ops.flydsl.kernels.glm5_mono.glm.op import (
     prepare_glm5_weights,
 )
 from aiter.ops.flydsl.kernels.glm5_mono.weights import LayerWeights
+from aiter.ops.flydsl.kernels.glm5_mono.weights import (
+    _unshuffle_linear_weight as _unshuffle,
+)
 
 __all__ = [
     "GLM5_KERNEL_SAMPLES",
@@ -37,7 +42,15 @@ __all__ = [
     "glm5_mono_launch_rows",
     "glm5_tp_config",
     "prepare_glm5_weights",
+    "unshuffle_linear_weight",
 ]
+
+
+def unshuffle_linear_weight(weight: torch.Tensor) -> torch.Tensor:
+    """Invert ``shuffle_weight(layout=(16, 16))`` for a one-byte 2D weight."""
+    view = weight.view(weight.dtype)
+    view.is_shuffled = True
+    return _unshuffle(view)
 
 
 def glm5_mono_launch_rows(rows: int, query_length: int = 1) -> tuple[int, int]:
