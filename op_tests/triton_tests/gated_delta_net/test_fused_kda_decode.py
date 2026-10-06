@@ -726,7 +726,14 @@ def test_spec_decode_honours_non_contiguous_index_strides(
 
 @pytest.mark.parametrize(
     "invalid_layout",
-    ["narrow_conv_cache", "zero_sequence_stride", "zero_token_stride"],
+    [
+        "narrow_conv_cache",
+        "zero_sequence_stride",
+        "zero_token_stride",
+        "short_state_indices",
+        "short_accepted_tokens",
+        "short_conv_indices",
+    ],
 )
 def test_spec_decode_rejects_invalid_layout(invalid_layout):
     num_spec = 7
@@ -742,10 +749,21 @@ def test_spec_decode_rejects_invalid_layout(invalid_layout):
         packed = inp["state_indices"]
         inp["state_indices"] = packed[:1].expand_as(packed)
         match = "positive sequence stride"
-    else:
+    elif invalid_layout == "zero_token_stride":
         packed = inp["state_indices"]
         inp["state_indices"] = packed[:, :1].expand_as(packed)
         match = "positive token stride"
+    else:
+        key, name = {
+            "short_state_indices": ("state_indices", "ssm_state_indices"),
+            "short_accepted_tokens": (
+                "num_accepted_tokens",
+                "num_accepted_tokens",
+            ),
+            "short_conv_indices": ("conv_state_indices", "conv_state_indices"),
+        }[invalid_layout]
+        inp[key] = inp[key][:-1]
+        match = rf"{name} must cover every sequence"
     with pytest.raises(ValueError, match=match):
         _run_spec(inp)
 

@@ -105,16 +105,24 @@ def fused_kda_decode(
             raise ValueError(
                 "Spec decode requires 2-D ssm_state_indices and conv_state_indices"
             )
+        if ssm_state_indices.shape[0] < batch:
+            raise ValueError(
+                "ssm_state_indices must cover every sequence: "
+                f"got {ssm_state_indices.shape[0]} rows for batch {batch}"
+            )
         for name, vec in (
             ("num_accepted_tokens", num_accepted_tokens),
             ("conv_state_indices", conv_state_indices),
         ):
             if vec.ndim != 1:
                 raise ValueError(f"{name} must be 1-D, got shape {tuple(vec.shape)}")
-        # No length check: a padded caller passes these at different lengths,
-        # and the kernels drop padded rows at their seq_T == 0 return before
-        # reading either. conv_state_indices carries a stride because the
-        # natural caller slices it as ssm_state_indices[:, 0], stride S not 1.
+            if vec.shape[0] < batch:
+                raise ValueError(
+                    f"{name} must cover every sequence: got {vec.shape[0]} "
+                    f"entries for batch {batch}"
+                )
+        # conv_state_indices carries a stride because the natural caller slices
+        # it as ssm_state_indices[:, 0], stride S not 1.
         stride_cidx = conv_state_indices.stride(0)
         # Stride 0 (an expanded tensor) would give every sequence the first
         # sequence's conv slot, so they would all share one live cache entry.
