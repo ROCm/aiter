@@ -803,7 +803,11 @@ def topk_select_backend(
     ):
         return "plain"
     if "sampled" in available and _sampled_takes(
-        rows, width, k, yield_to_plain="plain" in available and not ragged, ragged=ragged
+        rows,
+        width,
+        k,
+        yield_to_plain="plain" in available and not ragged,
+        ragged=ragged,
     ):
         return "sampled"
     if "plain" in available and _plain_takes(rows, width, k):
