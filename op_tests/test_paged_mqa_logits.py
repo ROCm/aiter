@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import itertools
 import math
+import os
 
 import pandas as pd
 import torch
@@ -22,7 +23,12 @@ import torch
 import aiter
 import aiter.paged_mqa_logits as pmql
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import (
+    get_cu_num,
+    get_gfx,
+    get_gfx_custom_op_core,
+    get_gfx_runtime,
+)
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -193,10 +199,73 @@ def test_paged_mqa_logits(batch, next_n, kv_len, context_lens_dim):
     return ret
 
 
+def _shipped_config(batch_size, next_n):
+    pmql.reload_tuned_table()
+    rows = pmql._load_tuned_table().get(
+        (
+            get_gfx_runtime(),
+            get_cu_num(),
+            next_n,
+            HEADS,
+            HEAD_DIM,
+            KV_BLOCK_SIZE,
+            True,
+        ),
+        {},
+    )
+    return rows.get(batch_size)
+
+
+def _clear_gfx_caches():
+    get_gfx.cache_clear()
+    get_gfx_custom_op_core.cache_clear()
+    pmql.get_paged_mqa_logits_config.cache_clear()
+
+
+def check_launches_shipped_row():
+    expected = _shipped_config(64, 8)
+    if expected is None:
+        aiter.logger.warning(
+            "paged_mqa_logits shipped-row check skipped on %s cu=%s",
+            get_gfx_runtime(),
+            get_cu_num(),
+        )
+        return
+    other = "gfx942" if get_gfx_runtime() != "gfx942" else "gfx950"
+    old_arch = os.environ.get("GPU_ARCHS")
+    os.environ["GPU_ARCHS"] = other
+    _clear_gfx_caches()
+    original = pmql.run_paged_mqa_logits
+    launched = {}
+
+    def spy(config, *args, **kwargs):
+        launched["config"] = dict(config)
+        return original(config, *args, **kwargs)
+
+    pmql.run_paged_mqa_logits = spy
+    try:
+        assert get_gfx() == other
+        shape = (64, 8, HEADS, HEAD_DIM, KV_BLOCK_SIZE, True)
+        inp = build_inputs(shape, 8192, 8192)
+        pmql.paged_mqa_logits(*launch_args(inp))
+        assert launched["config"] == expected, (
+            f"GPU_ARCHS={other} launched {launched.get('config')}, "
+            f"shipped row {expected}"
+        )
+    finally:
+        pmql.run_paged_mqa_logits = original
+        if old_arch is None:
+            os.environ.pop("GPU_ARCHS", None)
+        else:
+            os.environ["GPU_ARCHS"] = old_arch
+        _clear_gfx_caches()
+
+
 def main():
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning("paged_mqa_logits unsupported on %s; skipping", get_gfx())
         return
+    check_launches_shipped_row()
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,

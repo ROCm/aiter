@@ -26,7 +26,7 @@ import torch
 
 from aiter import logger
 from aiter.jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 
 __all__ = ["get_paged_mqa_logits_config", "paged_mqa_logits"]
 
@@ -104,7 +104,7 @@ def get_paged_mqa_logits_config(
     preshuffle: bool,
 ) -> dict:
     """Tuned backend and knobs for one call shape on the current GPU."""
-    gfx, cu_num = get_gfx(), get_cu_num()
+    gfx, cu_num = get_gfx_runtime(), get_cu_num()
     rows = _load_tuned_table().get(
         (gfx, cu_num, next_n, heads, head_dim, kv_block_size, bool(preshuffle)), {}
     )
@@ -154,7 +154,7 @@ def _flydsl_kernel():
 
 def flydsl_supports(q_fp8, kv_cache, weights, Preshuffle, KVBlockSize) -> bool:
     """Whether the gfx950 FlyDSL kernel can serve this call."""
-    if get_gfx() != "gfx950" or not Preshuffle or q_fp8.dim() != 4:
+    if get_gfx_runtime() != "gfx950" or not Preshuffle or q_fp8.dim() != 4:
         return False
     mod = _flydsl_kernel()
     if mod is None:
