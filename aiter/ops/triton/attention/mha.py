@@ -786,6 +786,7 @@ def _flash_attn_forward(
                 and v_strides[1] % 8 == 0
             ),
             **config,
+            enable_fp_fusion=True,
         )
 
     return o, softmax_lse, s_dmask, philox_seed, philox_offset
