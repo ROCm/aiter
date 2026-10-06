@@ -1728,6 +1728,9 @@ def _dsv4_gather(
     """Issue one fp8_dsv4_mla tile's gathers from slot ids read a tile earlier.
     Returns (x, sc, k_rope, valid), valid in the score-column layout."""
     SHIFT: gl.constexpr = seg.fmt.BLOCK_SIZE.bit_length() - 1
+    gl.static_assert(
+        seg.fmt.BLOCK_SIZE == 1 << SHIFT, "fp8_dsv4_mla pages must be a power of two"
+    )
     fmt = seg.fmt
     cache_ptr = seg.cache_ptr
     cs0 = seg.cs0

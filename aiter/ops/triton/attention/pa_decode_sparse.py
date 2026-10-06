@@ -641,6 +641,11 @@ def _pa_decode_sparse_gfx950_gluon(
     else:
         main_fmt = "fp8_dsv4_mla" if main_is_fp8 else "bf16"
         extra_fmt = "fp8_dsv4_mla" if extra_is_fp8 else "bf16"
+        # The fp8_dsv4_mla gather splits slot ids into (page, row) by shifts.
+        for fmt, block in ((main_fmt, main_block), (extra_fmt, extra_block)):
+            assert (
+                fmt != "fp8_dsv4_mla" or block & (block - 1) == 0
+            ), f"fp8_dsv4_mla page size must be a power of two, got {block}"
 
     # Alignment hint for the page strides so row gathers can vectorize: the largest
     # power of 2 (<= 16) dividing both.
@@ -705,8 +710,12 @@ def _pa_decode_sparse_gfx950_gluon(
         assert inv_rope_positions.shape == (num_queries,)
         assert inv_rope_positions.stride(0) == 1
         assert inv_rope_cos_sin_cache.dtype == torch.float32
-        assert inv_rope_cos_sin_cache.shape[-1] == ROPE_DIM
-        assert inv_rope_cos_sin_cache.stride(-1) == 1
+        # [P, 64]: the kernel steps rows by stride(0)
+        assert inv_rope_cos_sin_cache.ndim == 2
+        assert inv_rope_cos_sin_cache.shape[1] == ROPE_DIM
+        assert inv_rope_cos_sin_cache.stride(1) == 1
+        assert inv_rope_positions.device == q.device
+        assert inv_rope_cos_sin_cache.device == q.device
     if out_mxfp8 is not None:
         assert out is None, "out and out_mxfp8 are mutually exclusive"
         out_data, out_scale = out_mxfp8
@@ -714,6 +723,7 @@ def _pa_decode_sparse_gfx950_gluon(
         assert out_data.shape == (num_queries, num_heads * head_dim)
         assert out_scale.shape == (num_queries, num_heads * head_dim // 32)
         assert out_data.stride(-1) == 1 and out_scale.stride(-1) == 1
+        assert out_data.device == q.device and out_scale.device == q.device
         out = out_data.view(num_queries, num_heads, head_dim)
     else:
         out_scale = None
