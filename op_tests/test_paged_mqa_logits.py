@@ -240,7 +240,7 @@ def check_launches_shipped_row():
 
     def spy(config, *args, **kwargs):
         launched["config"] = dict(config)
-        return original(config, *args, **kwargs)
+        return args[3]
 
     pmql.run_paged_mqa_logits = spy
     try:
