@@ -628,7 +628,8 @@ def test_pa_mqa_logits_fp4_page8(
     batch, max_ctx, next_n=1, heads=32, head_dim=DEFAULT_HEAD_DIM, num_iters=20
 ):
     """kv_block_size=8: the row-group kernel (pa_mqa_logits_fp4_rowgroup) in
-    its 8-row-page cache layout, pages in a random order."""
+    its 8-row-page cache layout, pages in a random order, a sequence's next_n
+    rows as its ragged rows (row n seeing context - next_n + n + 1 keys)."""
 
     setup_seed(SEED)
     page = 8
@@ -670,6 +671,11 @@ def test_pa_mqa_logits_fp4_page8(
         weight_scale=weight_scale,
     )
     out = torch.full((batch * next_n, t_max), float("-inf"), device=dev)
+    query_start_loc = torch.arange(
+        0, (batch + 1) * next_n, next_n, dtype=torch.int32, device=dev
+    )
+    lag = torch.arange(next_n - 1, -1, -1, dtype=torch.int32, device=dev)
+    row_ends = (context_lens[:, None] - lag).reshape(-1)
 
     def launch():
         flydsl_pa_mqa_logits_fp4(
@@ -679,11 +685,13 @@ def test_pa_mqa_logits_fp4_page8(
             kv_scale,
             block_tables,
             weights,
-            context_lens,
+            None,
             t_max,
             weight_scale=weight_scale,
-            next_n=next_n,
             kv_block_size=page,
+            row_ends=row_ends,
+            query_start_loc=query_start_loc,
+            max_query_len=next_n,
             out=out,
         )
 

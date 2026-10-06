@@ -27,10 +27,13 @@ K chunk ``c`` of a tile is head dims ``[32 c, 32 c + 32)``: 16 packed e2m1
 bytes, one e8m0. A tile load (fixed ``t % 4``) reads 128 contiguous bytes of
 each of the wave's 8 pages.
 
-Rows. A wave scores ``rows_per_wave`` query rows of one sequence off each key
-it loads, and a workgroup holds all of the sequence's rows (``next_n /
-rows_per_wave`` row groups walking the same steps): a speculative step's rows
-read the context once rather than once a row.
+Rows. The scores are a GEMM: M a sequence's query rows times the heads, N
+its keys. M is cut into tiles of whole rows (``tile_m``, a multiple of the
+heads, so a row's head sum stays in its tile), a decode step's few rows one
+tile and a prefill's many rows many; a workgroup scores one tile against a
+run of keys, its waves ``rows_per_wave`` rows each (``tile_m / heads /
+rows_per_wave`` row groups walking the same steps), so a tile's rows read
+each key once rather than once a row.
 
 Reduction. A row's logit is a sum over heads, spread over the four 16-lane
 groups of the MFMA output. Two permlane32 swaps and one permlane16 swap reduce
@@ -41,6 +44,7 @@ wave's 64 keys.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from functools import lru_cache
 
 import flydsl.compiler as flyc
@@ -54,6 +58,7 @@ from flydsl.expr.primitive import range_constexpr
 from flydsl.expr.typing import Float4E2M1FN, Int32, T, as_ir_value
 
 from aiter.ops.flydsl.kernels.dpp_utils import update_dpp_i32
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 from .pa_mqa_logits_fp4_common import _load_vec4_i32
 
@@ -301,35 +306,37 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
     page_size: int,
     heads: int,
     head_dim: int,
-    next_n: int,
+    tile_m: int,
     rows_per_wave: int,
     max_blocks_per_seq: int,
     bt_stride: int,
     num_warps: int,
     weights_bf16: bool,
-    has_row_ends: bool,
     depth: int,
     shallow_depth: int | None = None,
     kv_nt: bool = False,
     out_nt: bool = False,
     wave_min_steps: int = 2,
-    ragged: bool = False,
     pages_per_block: int = 1,
 ):
-    """``ragged``: a sequence's rows are query_start_loc's (at most next_n,
-    any count, 0 included) in flattened row order, not next_n each, and its
-    length its last row's bound (row ends required). ``pages_per_block``: a
-    block-table entry names that many consecutive pages (its first's id
-    divided by it)."""
+    """The MQA as a GEMM: M a sequence's query rows (query_start_loc's, any
+    count, 0 included) times the heads, cut into tiles of ``tile_m`` (whole
+    rows: a multiple of ``heads``, so a row's head sum is the tile's), N its
+    keys up to each row's bound (row_ends; a sequence's length its last
+    row's). A workgroup scores one tile against a run of its sequence's keys,
+    ``rows_per_wave`` rows a wave. ``pages_per_block``: a block-table entry
+    names that many consecutive pages (its first's id divided by it)."""
     assert page_size in SUPPORTED_PAGE_SIZES, page_size
-    assert not ragged or has_row_ends, "ragged rows take their row ends"
     assert heads % MFMA_M == 0 and heads // MFMA_M <= 8, heads
     assert head_dim % 128 == 0, head_dim
-    assert next_n % rows_per_wave == 0, (next_n, rows_per_wave)
+    assert tile_m % heads == 0, (tile_m, heads)
+    # query rows a tile
+    tile_rows = tile_m // heads
+    assert tile_rows % rows_per_wave == 0, (tile_rows, rows_per_wave)
     m_tiles = heads // MFMA_M
     k_tiles = head_dim // 128
     rows = rows_per_wave
-    row_groups = next_n // rows
+    row_groups = tile_rows // rows
     assert num_warps % row_groups == 0, (num_warps, row_groups)
     # waves walking a row group's keys, each taking every streams-th step
     streams = num_warps // row_groups
@@ -340,10 +347,10 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
     pages_per_step = STEP_KEYS // page_size if lane_major else 1
     lanes_per_page = page_size // 4
     # one row a wave off per-row tables (a candidate layer)
-    per_row_tables = lane_major and rows == next_n == 1
+    per_row_tables = lane_major and rows == tile_rows == 1
     interleave = not per_row_tables
     # steps a wave's walk takes to read depth (not shallow_depth) steps ahead
-    deep_walk = _DEEP_WALK_LIGHT[page_size] if rows * heads <= 128 else _DEEP_WALK
+    deep_walk = _DEEP_WALK_LIGHT if rows * heads <= 128 else _DEEP_WALK
     # a workgroup's least quota: wave_min_steps for each of its streams
     min_walk = wave_min_steps * streams
     # bytes from tile nt to nt + 1 within a K chunk's rows
@@ -362,7 +369,7 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
 
     @flyc.kernel
     def pa_mqa_logits_fp4_rowgroup_kernel(
-        # rows: B * NEXT_N, or (ragged) query_start_loc[B]
+        # rows: query_start_loc[B]
         out_ptr: fx.Int64,  # [rows, stride_out] f32
         q_ptr: fx.Int64,  # [rows, H, D / 2] u8
         qs_ptr: fx.Int64,  # [rows, K_TILES, 4, 16, qs_pad] u8
@@ -370,9 +377,8 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
         kvs_ptr: fx.Int64,  # [num_pages, kvs_page] u8
         bt_ptr: fx.Int64,  # [B, max_blocks_per_seq] i32, rows bt_stride apart
         w_ptr: fx.Int64,  # [rows, H] f32 | bf16
-        ctx_ptr: fx.Int64,  # [B] i32 (ends_ptr when ragged)
-        ends_ptr: fx.Int64,  # [rows] i32 (ctx_ptr when absent)
-        qsl_ptr: fx.Int64,  # [B + 1] i32 query_start_loc (ctx_ptr unless ragged)
+        ends_ptr: fx.Int64,  # [rows] i32 each row's key bound
+        qsl_ptr: fx.Int64,  # [B + 1] i32 query_start_loc
         stride_out: Int32,
         weight_scale: fx.Float32,
         last_page: Int32,
@@ -385,8 +391,8 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
         # the way (pages, then keys, then bounds...) each cost a scalar-load
         # round trip, which an isolated launch pays in full.
         args_read = _read_all(
-            out_ptr, q_ptr, qs_ptr, kv_ptr, kvs_ptr, bt_ptr, w_ptr, ctx_ptr,
-            ends_ptr, qsl_ptr, stride_out, weight_scale, last_page, batch,
+            out_ptr, q_ptr, qs_ptr, kv_ptr, kvs_ptr, bt_ptr, w_ptr, ends_ptr,
+            qsl_ptr, stride_out, weight_scale, last_page, batch,
             base_slots, max_steps,
         )  # fmt: skip
         tid = gpu.thread_idx.x
@@ -423,48 +429,47 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
             return x + y
 
         def wave_fold(chunk0, f, wave_op, combine):
-            """wave_op over the lanes of combine over every chunk's f(steps):
-            chunk 0 from ``chunk0`` (read up front), the rest read here."""
-            acc = fx.Int32(f(chunk0[2]))
+            """wave_op over the lanes of combine over every chunk's f(steps,
+            tiles): chunk 0 from ``chunk0`` (read up front), the rest read
+            here."""
+            acc = fx.Int32(f(chunk0[2], chunk0[3]))
             for c in range(fx.Int32(1), n_chunks):
-                acc = fx.Int32(combine(acc, f(chunk_steps(c)[2])))
+                chunk = chunk_steps(c)
+                acc = fx.Int32(combine(acc, f(chunk[2], chunk[3])))
             return _uniform(wave_op(acc))
 
         def assign_work(slot, chunk0, total):
-            """The smallest quota of steps a workgroup that fits every
-            sequence's ceil(steps / quota) workgroups in the grid (as
+            """The smallest quota of steps a workgroup that fits every M
+            tile's ceil(steps / quota) workgroups in the grid (as
             `compute_varctx_schedule` does, but in each workgroup: no launch
             of its own), never under min_walk; the slot's sequence is where
-            its index falls in the running sum of those counts.
+            its index falls in the running sum of those counts, its tile and
+            part where it falls within the sequence's.
 
             The quota lies between ceil(total / grid), which may not fit,
-            and ceil(total / (grid - sequences)), which does (a sequence's
-            ceil adds under one): _QUOTA_TRIES quotas spread over that span
-            are counted, the smallest that fits is taken.
+            and ceil(total / (grid - tiles)), which does (a tile's ceil adds
+            under one): _QUOTA_TRIES quotas spread over that span are
+            counted, the smallest that fits is taken.
 
-            -> (sequence, first step, end, the step stride's multiplier,
-            quota). Interleaved, the j-th of a sequence's takes workgroups
-            walks its j-th step of each takes * streams (as the static split
-            does); else steps [j * quota, (j + 1) * quota)."""
-            live = wave_fold(
-                chunk0,
-                lambda n: (n > fx.Int32(0)).select(fx.Int32(1), fx.Int32(0)),
-                _wave_sum,
-                _add,
-            )
+            -> (sequence, tile, first step, end, the step stride's
+            multiplier, quota). Interleaved, the j-th of a tile's parts
+            workgroups walks its j-th step of each parts * streams (as the
+            static split does); else steps [j * quota, (j + 1) * quota)."""
+            live = wave_fold(chunk0, lambda n, t: t, _wave_sum, _add)
             per = pick_quota(
                 total,
                 live,
                 lambda q, rcp: wave_fold(
-                    chunk0, lambda n: _ceil_div(n, q, rcp), _wave_sum, _add
+                    chunk0, lambda n, t: t * _ceil_div(n, q, rcp), _wave_sum, _add
                 ),
             )
             per_rcp = fx.Float32(1.0) / per.to(fx.Float32)
 
-            def share_in(seq, steps, base, seq_w, j_w, n_w, takes_w, found_w):
+            def share_in(seq, steps, tiles, base, seq_w, j_w, n_w, parts_w, found_w):
                 """A chunk's part of the running sum from base: the slot's
                 sequence, if its index falls in this chunk."""
-                takes = _ceil_div(steps, per, per_rcp)
+                parts = _ceil_div(steps, per, per_rcp)
+                takes = tiles * parts
                 incl = base + _wave_inclusive_scan(takes)
                 run = incl - takes
                 hit = fx.Int64(rocdl.ballot(T.i64, (run <= slot) & (slot < incl)))
@@ -475,33 +480,36 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
                     found.select(_uniform(_readlane(seq, at)), seq_w),
                     found.select(_uniform(_readlane(slot - run, at)), j_w),
                     found.select(_uniform(_readlane(steps, at)), n_w),
-                    found.select(_uniform(_readlane(takes, at)), takes_w),
+                    found.select(_uniform(_readlane(parts, at)), parts_w),
                     found.select(fx.Int32(1), found_w),
                 )
 
-            base, seq_w, j_w, n_w, takes_w, found_w = share_in(
-                chunk0[0], chunk0[2], *([fx.Int32(0)] * 6)
+            base, seq_w, j_w, n_w, parts_w, found_w = share_in(
+                chunk0[0], chunk0[2], chunk0[3], *([fx.Int32(0)] * 6)
             )
             for c in range(fx.Int32(1), n_chunks):
-                seq_c, _, steps_c = chunk_steps(c)
-                base, seq_w, j_w, n_w, takes_w, found_w = share_in(
-                    seq_c, steps_c, base, seq_w, j_w, n_w, takes_w, found_w
+                seq_c, _, steps_c, tiles_c = chunk_steps(c)
+                base, seq_w, j_w, n_w, parts_w, found_w = share_in(
+                    seq_c, steps_c, tiles_c, base, seq_w, j_w, n_w, parts_w, found_w
                 )
+            # tile-major within the sequence: a tile's parts side by side
+            parts_w = fx.max(parts_w, fx.Int32(1))
+            tile_w = j_w // parts_w
+            j_w = j_w - tile_w * parts_w
             if fx.const_expr(interleave):
                 start_w = j_w * fx.Int32(streams)
                 stop_w = n_w
-                mult_w = takes_w
+                mult_w = parts_w
             else:
                 start_w = j_w * per
                 stop_w = start_w + per
                 mult_w = fx.Int32(1)
             # a slot past every sequence's share does nothing
             stop_w = (found_w != fx.Int32(0)).select(stop_w, start_w)
-            return seq_w, start_w, stop_w, mult_w, per
+            return seq_w, tile_w, start_w, stop_w, mult_w, per
 
         # This workgroup's work: one sequence's steps [s0, s_hi), shared out
         # by length -- a long sequence gets more workgroups than a short one
-        ctx_bt = _addr_i32_buffer(ctx_ptr)
         ends_bt = _addr_i32_buffer(ends_ptr)
         qsl_bt = _addr_i32_buffer(qsl_ptr)
         # Sequences in chunks of WARP_SIZE, lane l holding chunk c's c * WARP_SIZE
@@ -511,24 +519,25 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
         # batch, and prefill batches come in every length)
         n_chunks = (batch + fx.Int32(WARP_SIZE - 1)) // fx.Int32(WARP_SIZE)
 
-        def seq_length(seq):
-            """Sequence seq's length: its context_lens entry, or (ragged) its
-            last row's bound, 0 for a sequence of no rows."""
-            if fx.const_expr(ragged):
-                first = fx.Int32(qsl_bt[seq])
-                end = fx.Int32(qsl_bt[seq + fx.Int32(1)])
-                last = fx.Int32(ends_bt[fx.max(end - fx.Int32(1), fx.Int32(0))])
-                return (end > first).select(last, fx.Int32(0))
-            return fx.Int32(ctx_bt[seq])
+        def seq_shape(seq):
+            """(row count, length) of sequence seq: its rows and its last
+            row's bound, 0 for a sequence of no rows."""
+            first = fx.Int32(qsl_bt[seq])
+            end = fx.Int32(qsl_bt[seq + fx.Int32(1)])
+            last = fx.Int32(ends_bt[fx.max(end - fx.Int32(1), fx.Int32(0))])
+            return end - first, (end > first).select(last, fx.Int32(0))
 
         def chunk_steps(c):
-            """This lane's sequence of chunk c, its length and its steps (0
-            past the batch)."""
+            """This lane's sequence of chunk c, its length, its steps and its
+            M tiles (0 past the batch)."""
             seq = c * fx.Int32(WARP_SIZE) + lane
             inside = seq < batch
-            n = seq_length(inside.select(seq, fx.Int32(0)))
+            count, n = seq_shape(inside.select(seq, fx.Int32(0)))
             n = (inside & (n > fx.Int32(0))).select(n, fx.Int32(0))
-            return seq, n, (n + fx.Int32(STEP_KEYS - 1)) // STEP_KEYS
+            tiles = (n > fx.Int32(0)).select(
+                (count + fx.Int32(tile_rows - 1)) // fx.Int32(tile_rows), fx.Int32(0)
+            )
+            return seq, n, (n + fx.Int32(STEP_KEYS - 1)) // STEP_KEYS, tiles
 
         def lane_steps():
             """Chunk 0, the only one at decode batches, read up front."""
@@ -540,7 +549,7 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
             (a read here is a round trip the work choice waits on)."""
             len_s = _uniform(_readlane(chunk0[1], seq % fx.Int32(WARP_SIZE)))
             if seq >= fx.Int32(WARP_SIZE):
-                len_s = _uniform(fx.max(seq_length(seq), fx.Int32(0)))
+                len_s = _uniform(fx.max(seq_shape(seq)[1], fx.Int32(0)))
             return len_s
 
         bt_bt = _addr_i32_buffer(bt_ptr)
@@ -582,28 +591,26 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
         w_bt = _addr_i32_buffer(w_ptr, width=1 if weights_bf16 else 4)
         n0 = (warp % row_groups) * rows
 
-        def seq_rows(seq):
-            """(first row, row count) of sequence seq among the flattened
-            rows: next_n each, or (ragged) query_start_loc's."""
-            if fx.const_expr(ragged):
-                first = fx.Int32(qsl_bt[seq])
-                return first, fx.Int32(qsl_bt[seq + fx.Int32(1)]) - first
-            return seq * fx.Int32(next_n), fx.Int32(next_n)
+        def seq_rows(seq, tile):
+            """(first row, rows from it) of M tile ``tile`` of sequence seq
+            among the flattened rows."""
+            first = fx.Int32(qsl_bt[seq])
+            base = tile * fx.Int32(tile_rows)
+            return first + base, fx.Int32(qsl_bt[seq + fx.Int32(1)]) - first - base
 
         def row_of(first, count, n):
-            """Flattened row of a sequence's row n; a ragged row past its
-            count reads row 0 (it is there) and gets bound 0 (row_bound)."""
-            if fx.const_expr(ragged):
-                return (n < count).select(first + n, fx.Int32(0))
-            return first + n
+            """Flattened row of a tile's row n; a row past the sequence reads
+            row 0 (it is there) and gets bound 0 (row_bound)."""
+            return (n < count).select(first + n, fx.Int32(0))
 
-        def read_rows(seq):
-            """Sequence seq's rows n0 .. n0 + rows - 1 as loaded: per row,
-            the query operands (head 16 mi + l, K chunk 4 kt + g, 16 bytes),
-            the scale dwords and this lane's head weights (heads 16 mi + 4 g
-            .. + 3; bf16 pairs as dwords). Flat, in that order."""
+        def read_rows(seq, tile):
+            """Rows n0 .. n0 + rows - 1 of sequence seq's M tile ``tile`` as
+            loaded: per row, the query operands (head 16 mi + l, K chunk 4 kt
+            + g, 16 bytes), the scale dwords and this lane's head weights
+            (heads 16 mi + 4 g .. + 3; bf16 pairs as dwords). Flat, in that
+            order."""
             raw = []
-            first, count = seq_rows(seq)
+            first, count = seq_rows(seq, tile)
             for r in range_constexpr(rows):
                 row = row_of(first, count, n0 + r)
                 for kt in range_constexpr(k_tiles):
@@ -629,15 +636,12 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
                         raw.append(_load_vec4_i32(w_bt, head0))
             return raw
 
-        def read_row_ends(seq):
-            """Sequence seq's rows' bounds as given (row_ends): read with
-            the first pages; without row_ends, from the length (no read)."""
-            if fx.const_expr(has_row_ends):
-                first, count = seq_rows(seq)
-                return [
-                    fx.Int32(ends_bt[row_of(first, count, n0 + r)]) for r in range(rows)
-                ]
-            return [fx.Int32(0)] * rows
+        def read_row_ends(seq, tile):
+            """The bounds of read_rows' rows, read with the first pages."""
+            first, count = seq_rows(seq, tile)
+            return [
+                fx.Int32(ends_bt[row_of(first, count, n0 + r)]) for r in range(rows)
+            ]
 
         def first_pages(seq, start, stride):
             """The pages of the walk's first steps (the ones its first key
@@ -648,19 +652,25 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
             ]
 
         def choose_work(slot, chunk0, b_st):
-            """(sequence, first step, end, its length, deep, the step stride's
-            multiplier): the static split
-            while its walk is no longer than the length-balanced share's +
-            _STATIC_SLACK steps (it needs no more arithmetic, and when the
-            longest sequence is at max_seq_len its reads went out with the
-            lengths), else assign_work's share."""
-            total = wave_fold(chunk0, lambda n: n, _wave_sum, _add)
-            longest = wave_fold(chunk0, lambda n: n, _wave_max, fx.max)
+            """(sequence, M tile, first step, end, deep, the step stride's
+            multiplier): the static split (a sequence's one tile)
+            while no sequence has two tiles and its walk is no longer than
+            the length-balanced share's + _STATIC_SLACK steps (it needs no
+            more arithmetic, and when the longest sequence is at max_seq_len
+            its reads went out with the lengths), else assign_work's share."""
+            total = wave_fold(chunk0, lambda n, t: n * t, _wave_sum, _add)
+            longest = wave_fold(chunk0, lambda n, t: n, _wave_max, fx.max)
+            most_tiles = wave_fold(chunk0, lambda n, t: t, _wave_max, fx.max)
             share = (total + base_slots - fx.Int32(1)) // base_slots
             dyn_walk = (share + fx.Int32(streams - 1)) // fx.Int32(streams)
             # the static sequence's own steps bound its workgroups
             steps_b = (seq_len(b_st, chunk0) + fx.Int32(STEP_KEYS - 1)) // STEP_KEYS
-            b_c, s0_c, mult_c = b_st, static_start(longest), static_mult
+            b_c, t_c, s0_c, mult_c = (
+                b_st,
+                fx.Int32(0),
+                static_start(longest),
+                static_mult,
+            )
             if fx.const_expr(interleave):
                 per_wave = parts * fx.Int32(streams)
                 static_walk = (longest + per_wave - fx.Int32(1)) // per_wave
@@ -672,11 +682,13 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
             s_hi_c = ((part < parts) & (s_hi_c > s0_c)).select(s_hi_c, s0_c)
             walk_c = static_walk
             per_c = share
-            if static_walk > dyn_walk + fx.Int32(_STATIC_SLACK):
-                b_c, s0_c, s_hi_c, mult_c, per_c = assign_work(slot, chunk0, total)
+            if (static_walk > dyn_walk + fx.Int32(_STATIC_SLACK)) | (
+                most_tiles > fx.Int32(1)
+            ):
+                b_c, t_c, s0_c, s_hi_c, mult_c, per_c = assign_work(slot, chunk0, total)
                 walk_c = (per_c + fx.Int32(streams - 1)) // fx.Int32(streams)
             deep_c = (walk_c >= fx.Int32(deep_walk)).select(fx.Int32(1), fx.Int32(0))
-            return b_c, s0_c, s_hi_c, seq_len(b_c, chunk0), deep_c, mult_c
+            return b_c, t_c, s0_c, s_hi_c, deep_c, mult_c
 
         # The static split, known before the lengths are: a workgroup takes
         # sequence b's part p (static_start); its first pages and rows are
@@ -728,11 +740,11 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
         pages = first_pages(b, s0, mult * fx.Int32(streams))
         static_pages = pages
         # (read here only by a wave walking its sequence alone, see below)
-        rows_raw = read_rows(b) if streams == 1 else []
-        row_ends_raw = read_row_ends(b)
-        static_rows = list(rows_raw) + (list(row_ends_raw) if has_row_ends else [])
+        rows_raw = read_rows(b, fx.Int32(0)) if streams == 1 else []
+        row_ends_raw = read_row_ends(b, fx.Int32(0))
+        static_rows = list(rows_raw) + list(row_ends_raw)
         if fx.const_expr(num_warps == 1):
-            b_c, s0_c, s_hi_c, len_c, deep_c, mult_c = choose_work(slot, chunk0, b_st)
+            b_c, t_c, s0_c, s_hi_c, deep_c, mult_c = choose_work(slot, chunk0, b_st)
         else:
             # One wave works it out for its workgroup, which all of them
             # share: every wave reading the lengths sent the grid's waves at
@@ -751,10 +763,11 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
                 at = fx.add_offset(rows_lds, group_words + fx.Int32(off) + lane * width)
                 return fx.make_view(at, fx.make_layout(width, 1)), width
 
-            def stage_group_rows(seq):
-                """Sequence seq's rows staged by its row group's first wave."""
+            def stage_group_rows(seq, tile):
+                """Sequence seq's M tile's rows staged by its row group's first
+                wave."""
                 if stream == fx.Int32(0):
-                    stage_rows(read_rows(seq))
+                    stage_rows(read_rows(seq, tile))
 
             def stage_rows(items):
                 """A row group's query rows into its LDS, for every wave."""
@@ -779,18 +792,18 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
                 chunk0_w = lane_steps()
                 if fx.const_expr(row_groups == 1):
                     # (after the lengths: they are what the choice waits on)
-                    rows_guess = read_rows(b_st)
-                b_w, s0_w, s_hi_w, len_w, deep_w, mult_w = choose_work(
+                    rows_guess = read_rows(b_st, fx.Int32(0))
+                b_w, t_w, s0_w, s_hi_w, deep_w, mult_w = choose_work(
                     slot, chunk0_w, b_st
                 )
                 if fx.const_expr(row_groups == 1):
                     # (staged before the branch, or LLVM merges the two reads
                     # into one issued after the choice)
                     stage_rows(rows_guess)
-                    if b_w != b_st:
-                        stage_rows(read_rows(b_w))
+                    if (b_w != b_st) | (t_w != fx.Int32(0)):
+                        stage_rows(read_rows(b_w, t_w))
                 for h, vals in enumerate(
-                    ([b_w, s0_w, s_hi_w, deep_w], [len_w, mult_w, len_w, len_w])
+                    ([b_w, s0_w, s_hi_w, deep_w], [t_w, mult_w, t_w, t_w])
                 ):
                     work_reg = fx.make_rmem_tensor(4, fx.Int32)
                     work_reg.store(fx.Vector.from_elements(vals, dtype=fx.Int32))
@@ -803,30 +816,31 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
                 work.append(fx.Vector(work_reg.load()))
             b_c, s0_c = _uniform(work[0][0]), _uniform(work[0][1])
             s_hi_c, deep_c = _uniform(work[0][2]), _uniform(work[0][3])
-            len_c, mult_c = _uniform(work[1][0]), _uniform(work[1][1])
+            t_c, mult_c = _uniform(work[1][0]), _uniform(work[1][1])
         if (b_c != b) | (s0_c != s0) | (mult_c != mult):
             pages = first_pages(b_c, s0_c, mult_c * fx.Int32(streams))
+        if (b_c != b) | (t_c != fx.Int32(0)):
             if fx.const_expr(streams == 1):
-                rows_raw = read_rows(b_c)
-            if fx.const_expr(has_row_ends):
-                row_ends_raw = read_row_ends(b_c)
+                rows_raw = read_rows(b_c, t_c)
+            row_ends_raw = read_row_ends(b_c, t_c)
         b, s0, s_hi, mult = b_c, s0_c, s_hi_c, mult_c
+        tile = t_c
         deep = deep_c != fx.Int32(0)
         # A workgroup past every sequence's share (the grid follows the
         # launch's max_seq_len, the shares the real lengths) reads nothing
         # more: no query rows, no keys for steps that are not there
         if s_hi > s0:
-            first_b, count_b = seq_rows(b)
+            first_b, count_b = seq_rows(b, tile)
             row0 = first_b + n0
 
             # A workgroup's waves of a row group walk one sequence's steps side
             # by side with the same query rows: its first wave reads them (ahead
             # of its keys) into LDS for all (every wave reading its own copy put
             # streams times the requests on the memory system as a launch starts:
-            # V4.1 next_n 6 at 1K keys, a wave's start 4.2 -> ~2.3 us)
+            # V4.1 6 rows a sequence at 1K keys, a wave's start 4.2 -> ~2.3 us)
             # (one row group: staged with the work assignment, above)
             if fx.const_expr(streams > 1 and row_groups > 1):
-                stage_group_rows(b)
+                stage_group_rows(b, tile)
 
             mfma_atom = fx.make_mma_atom(
                 fx.rocdl.cdna4.MFMA_Scale(
@@ -867,7 +881,8 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
                 if fx.const_expr(not lane_major):
                     # One page a wave: made wave-uniform, its 64-bit base is
                     # scalar arithmetic rather than per lane (page 64 H = 64
-                    # next_n 1, B = 64 at 16K keys: 26 -> 20 us, 165 -> 142 VGPRs)
+                    # 1 row a sequence, B = 64 at 16K keys: 26 -> 20 us, 165 ->
+                    # 142 VGPRs)
                     phys = _uniform(phys)
                 kv_page_base = fx.Int64(kv_ptr) + fx.Int64(phys) * kv_page
                 kvs_page_base = fx.Int64(kvs_ptr) + fx.Int64(phys) * kvs_page
@@ -922,12 +937,9 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
                 # order unlike the back edge's makes every trip wait for more (pages
                 # all after the keys: a refill waited on all but one read in flight)
                 later_pages = []
-                # (a bound on the walk from what is in hand: given row_ends may
-                # still be in flight; rows bounded by the length end by it)
+                # (a bound on the walk from what is in hand: the row ends may
+                # still be in flight)
                 walk_cap = s_hi
-                if fx.const_expr(not has_row_ends):
-                    len_steps = (len_c + fx.Int32(STEP_KEYS - 1)) // STEP_KEYS
-                    walk_cap = fx.min(s_hi, len_steps)
                 # the steps under walk_cap, for the same reuse before the walk's
                 # length is known
                 cap_k = fx.max(
@@ -1020,15 +1032,11 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
                 # bounds, and nothing above does.
                 ends = []
                 for r in range_constexpr(rows):
-                    if fx.const_expr(has_row_ends):
-                        e = _uniform(row_ends_raw[r])
-                    else:
-                        # row n of count sees length - count + n + 1 keys
-                        e = len_c - (count_b - fx.Int32(1)) + n0 + r
-                    if fx.const_expr(ragged):
-                        # a row past its sequence's count: bound 0, so no
-                        # key of the walk and no store of the window
-                        e = (n0 + r < count_b).select(e, fx.Int32(0))
+                    # a row past its sequence's count: bound 0, so no key of
+                    # the walk and no store of the window
+                    e = (n0 + r < count_b).select(
+                        _uniform(row_ends_raw[r]), fx.Int32(0)
+                    )
                     ends.append(fx.max(e, fx.Int32(0)))
                 max_end = fx.max(*ends)
                 n_steps = (max_end + fx.Int32(STEP_KEYS - 1)) // STEP_KEYS
@@ -1262,38 +1270,34 @@ def compile_pa_mqa_logits_fp4_rowgroup(
     page_size: int,
     heads: int,
     head_dim: int,
-    next_n: int,
+    tile_m: int,
     rows_per_wave: int,
     max_blocks_per_seq: int,
     bt_stride: int,
     num_warps: int,
     weights_bf16: bool,
-    has_row_ends: bool,
     depth: int,
     shallow_depth: int | None,
     kv_nt: bool,
     out_nt: bool,
     wave_min_steps: int,
-    ragged: bool,
-    pages_per_block: int = 1,
+    pages_per_block: int,
 ):
     kfn, row_groups = build_pa_mqa_logits_fp4_rowgroup_module(
         page_size=page_size,
         heads=heads,
         head_dim=head_dim,
-        next_n=next_n,
+        tile_m=tile_m,
         rows_per_wave=rows_per_wave,
         max_blocks_per_seq=max_blocks_per_seq,
         bt_stride=bt_stride,
         num_warps=num_warps,
         weights_bf16=weights_bf16,
-        has_row_ends=has_row_ends,
         depth=depth,
         shallow_depth=shallow_depth,
         kv_nt=kv_nt,
         out_nt=out_nt,
         wave_min_steps=wave_min_steps,
-        ragged=ragged,
         pages_per_block=pages_per_block,
     )
     block_threads = num_warps * WARP_SIZE
@@ -1307,7 +1311,6 @@ def compile_pa_mqa_logits_fp4_rowgroup(
         kvs: fx.Int64,
         bt: fx.Int64,
         w: fx.Int64,
-        ctx: fx.Int64,
         ends: fx.Int64,
         qsl: fx.Int64,
         stride_out: fx.Int32,
@@ -1320,7 +1323,7 @@ def compile_pa_mqa_logits_fp4_rowgroup(
         stream: fx.Stream,
     ):
         kfn(
-            out, q, qs, kv, kvs, bt, w, ctx, ends, qsl, stride_out,
+            out, q, qs, kv, kvs, bt, w, ends, qsl, stride_out,
             weight_scale, last_page, batch, base_slots, max_steps,
         ).launch(
             grid=(fx.Int64(grid_x), 1, 1),
@@ -1331,8 +1334,10 @@ def compile_pa_mqa_logits_fp4_rowgroup(
     return launch_pa_mqa_logits_fp4_rowgroup, row_groups
 
 
-def default_rows_per_wave(next_n: int, heads: int, batch: int, max_seq_len: int) -> int:
-    """Rows a wave scores off one key load: as many as divide next_n, up to
+def default_rows_per_wave(
+    tile_rows: int, heads: int, tiles: int, max_seq_len: int
+) -> int:
+    """Rows a wave scores off one key load: as many as divide tile_rows, up to
     what the registers hold at two waves a SIMD (each row keeps its query,
     weights and sums: 6 rows of 32 heads ~220 VGPRs at depth 2). Over 3 rows
     only when a wave at one a SIMD would walk 16+ steps: a wave's setup grows
@@ -1346,9 +1351,9 @@ def default_rows_per_wave(next_n: int, heads: int, batch: int, max_seq_len: int)
         * 4
     )
     steps = -(-max_seq_len // STEP_KEYS)
-    long_walks = batch * steps >= simds * 16
+    long_walks = tiles * steps >= simds * 16
     cap = 3 if heads > 32 or not long_walks else 6
-    return max(r for r in range(1, min(cap, next_n) + 1) if next_n % r == 0)
+    return max(r for r in range(1, min(cap, tile_rows) + 1) if tile_rows % r == 0)
 
 
 def _light_waves(rows: int, heads: int) -> bool:
@@ -1356,44 +1361,47 @@ def _light_waves(rows: int, heads: int) -> bool:
     return rows * heads <= 128
 
 
-def _single_wave_workgroups(page_size, rows, next_n, heads) -> bool:
+def _single_wave_workgroups(page_size, rows, tile_rows, heads) -> bool:
     """One-row waves on per-row tables (a candidate layer: many short walks),
     and light waves on 64-row pages (default_workgroups)."""
     if page_size < STEP_KEYS:
-        return rows == next_n == 1
-    return rows == next_n and _light_waves(rows, heads)
+        return rows == tile_rows == 1
+    return rows == tile_rows and _light_waves(rows, heads)
 
 
-def default_kv_nt(page_size: int, rows: int, next_n: int) -> bool:
+def default_kv_nt(page_size: int, rows: int, tile_rows: int) -> bool:
     """Nontemporal key loads, where each key is read once (a wave holds all of
-    its sequence's rows). Page 8 (fp4_mqa_p8_bench.py, 100K keys a row, warm
+    its tile's rows). Page 8 (fp4_mqa_p8_bench.py, 100K keys a row, warm
     caches): 6 rows a wave on (T = 768 full 285 vs 291 us); per-row tables
-    (next_n = 1) share pages across rows: off (reindex 141 vs 165 us). Page 64
-    on (p64_varlen.py COLD=1, B = 64 at 100K keys, keys out of the MALL as in
-    a forward: H = 64 next_n 1 / 2 91 / 105 vs 100 / 118 us, H = 32 next_n 6
-    133 vs 146 us)."""
-    if rows != next_n:
+    (one-row tiles) share pages across rows: off (reindex 141 vs 165 us).
+    Page 64 on (p64_varlen.py COLD=1, B = 64 at 100K keys, keys out of the
+    MALL as in a forward: H = 64 1 / 2 rows 91 / 105 vs 100 / 118 us, H = 32
+    6 rows 133 vs 146 us)."""
+    if rows != tile_rows:
         return False
     if page_size < STEP_KEYS:
-        return next_n > 1
+        return tile_rows > 1
     return True
 
 
-# Steps of keys in flight per wave, chosen in the kernel from the real
-# per-wave walk (the lengths it reads; max_seq_len says nothing about them):
-# _DEEP_DEPTH on walks of _DEEP_WALK+ steps (_DEEP_WALK_LIGHT[page size] for
-# light waves), else _SHALLOW_DEPTH. Deeper pays on long walks only: a wave's
-# last depth reads are past its walk and its first ones wait longer
-# (p8_kernel_ab.py / p64_varlen.py, cold: V4.1 full layers T = 768, 98 steps
-# a wave, 245 vs 255 us, T = 192, 25 steps, 75 vs 70 us; page 64 H = 64
-# next_n 1: 98 steps 87 vs 92 us, 51 steps 51 vs 55 us, 16 steps 8.0 vs 7.4).
-# Light waves from 8 steps on page 64, 16 on page 8, against 32 for both
-# (cand_vs_cur.sh, 2 rounds: page 64 H = 64 next_n 2 B = 64 at 16K keys
-# 25.4 -> 24.0 us, B = 16 spread 23.4 -> 22.6, the rest within -2..+2%; page
-# 8 reindex T >= 192 1-3% faster; page 8 at 8 costs T = 48 full 4%)
+# Steps of keys in flight per wave. Page 64: chosen in the kernel from the
+# real per-wave walk (the lengths it reads; max_seq_len says nothing about
+# them): _DEEP_DEPTH on walks of _DEEP_WALK+ steps (_DEEP_WALK_LIGHT for light
+# waves), else _SHALLOW_DEPTH. Deeper pays on long walks only: a wave's last
+# depth reads are past its walk and its first ones wait longer (p64_varlen.py,
+# cold, H = 64 1 row a sequence: 98 steps 87 vs 92 us, 51 steps 51 vs 55 us,
+# 16 steps 8.0 vs 7.4; light waves from 8 steps against 32: H = 64 2 rows
+# B = 64 at 16K keys 25.4 -> 24.0 us, B = 16 spread 23.4 -> 22.6). Only
+# _SHALLOW_DEPTH there loses up to 11% (mqa_depth_ab.py, B = 64 2 rows at
+# 100K keys 103 vs 116 us). Page 8: _SHALLOW_DEPTH alone. The two walks in
+# one kernel cost registers (6 rows of 32 heads: 256 VGPRs and 40 spilled,
+# against 238 and none), and one walk is as fast or faster on every shape
+# measured (mqa_depth_ab.py, cold: 6 rows B = 64 at 131K keys 185 -> 157 us,
+# per-row tables T = 192 / 768 at 16K keys 85 -> 71 / 447 -> 368 us, T = 6 /
+# 48 3 / 6% faster, the rest within +-1%; prefill 8192 rows 144 -> 141 us)
 _DEEP_DEPTH, _SHALLOW_DEPTH = 3, 2
 _DEEP_WALK = 64
-_DEEP_WALK_LIGHT = {8: 16, 64: 8}
+_DEEP_WALK_LIGHT = 8
 
 
 # Steps a wave's static walk may exceed the balanced share's by and still be
@@ -1416,22 +1424,22 @@ _ROW_WALK_LONG = 16
 def default_workgroups(
     page_size: int,
     heads: int,
-    batch: int,
+    tiles: int,
     rows: int,
     max_seq_len: int,
     num_warps: int,
     streams: int,
 ) -> int:
-    """Workgroups a launch gets, which the schedule shares out over the batch
-    by each sequence's real length. A function of the batch and max_seq_len
-    only, so a captured graph keeps its grid.
+    """Workgroups a launch gets, which the schedule shares out over its M
+    tiles (at most ``tiles``) by each one's real length. A function of the
+    batch's shape and max_seq_len only, so a captured graph keeps its grid.
 
     One row a wave on per-row tables (a candidate layer, V4.1's indexer
     shapes, fp4_mqa_p8_bench.py / p8_graph_bench.py): enough for each to walk
     _ROW_WALK steps of a full-length row. Light waves in single-wave
     workgroups on 64-row pages: one a SIMD -- each wave's setup (the work
     assignment, then the page and key trips) is paid once, and its loads keep
-    up alone (p64_varlen.py COLD=1, H = 64 next_n 1, B = 64 at 100K keys, even
+    up alone (p64_varlen.py COLD=1, H = 64 1 row, B = 64 at 100K keys, even
     / spread lengths: 91 / 52 us, where 2 a SIMD 94 / 53 and 6 a SIMD 98 /
     61). Not multi-wave workgroups of light waves (V4.1 full layers at 64-row
     pages, 3 rows of 32 heads a wave, T = 12 / 24 / 48: 14.2 / 20.5 / 32.7 us
@@ -1446,125 +1454,92 @@ def default_workgroups(
         * 4
     )
     if page_size < STEP_KEYS and rows == 1:
-        walk = next((w for top, w in _ROW_WALK if batch * steps <= top), _ROW_WALK_LONG)
-        ctas = batch * -(-steps // (streams * walk))
+        walk = next((w for top, w in _ROW_WALK if tiles * steps <= top), _ROW_WALK_LONG)
+        ctas = tiles * -(-steps // (streams * walk))
     elif page_size >= STEP_KEYS and num_warps == 1 and _light_waves(rows, heads):
         ctas = simds // num_warps
     else:
         ctas = 2 * simds // num_warps
-    # at least one a sequence, at most one a 2-step walk
-    return max(batch, min(ctas, batch * max(1, steps // (streams * 2))))
+    # at least one an M tile, at most one a 2-step walk
+    return max(tiles, min(ctas, tiles * max(1, steps // (streams * 2))))
 
 
-def flydsl_pa_mqa_logits_fp4_rowgroup(
-    q_fp4: torch.Tensor,
-    q_scale: torch.Tensor,
-    kv_cache: torch.Tensor,
-    kv_scale: torch.Tensor,
-    block_tables: torch.Tensor,
-    weights: torch.Tensor,
-    context_lens: torch.Tensor | None,
-    max_seq_len: int,
+# Query rows an M tile may hold (tile_m = rows x heads, a row's heads in one
+# tile): a sequence's rows fill tiles of the largest tier, a launch of fewer
+# rows a sequence takes the smallest tier that holds them all.
+TILE_ROWS = (1, 2, 3, 4, 6, 8)
+
+
+@dataclass(frozen=True)
+class Fp4MqaPlan:
+    """A launch of `flydsl_pa_mqa_logits_fp4_rowgroup` (`make_fp4_mqa_plan`):
+    a function of the batch's shape alone, so a captured graph keeps it.
+
+    tile_m         an M tile's (row, head) pairs: tile_rows rows of all heads
+    rows_per_wave  query rows a wave scores off one key load (divides the
+                   tile's rows)
+    num_warps      waves a workgroup; a multiple of the tile's row groups
+    workgroups     the grid, shared out over the M tiles by length
+    max_seq_len    the logits' width, keys a row may see at most
+    pages_per_block block-table pages an entry names
+    wave_min_steps fewest steps a wave of a busy workgroup walks
+    depth          steps of keys in flight per wave (shallow_depth, if any, on
+                   short walks)
+    kv_nt / out_nt nontemporal key loads / logit stores
+    """
+
+    heads: int
+    page_size: int
+    tile_m: int
+    rows_per_wave: int
+    num_warps: int
+    workgroups: int
+    max_seq_len: int
+    pages_per_block: int
+    kv_nt: bool
+    depth: int
+    shallow_depth: int | None
+    wave_min_steps: int = 2
+    out_nt: bool = False
+
+
+@lru_cache(maxsize=1024)
+def make_fp4_mqa_plan(
     *,
-    weight_scale: float = 1.0,
-    row_ends: torch.Tensor | None = None,
-    query_start_loc: torch.Tensor | None = None,
-    max_query_len: int | None = None,
+    num_seqs: int,
+    max_qlen: int,
+    num_rows: int,
+    heads: int,
+    page_size: int,
+    max_seq_len: int,
     pages_per_block: int = 1,
     rows_per_wave: int | None = None,
     num_warps: int | None = None,
     workgroups: int | None = None,
-    wave_min_steps: int = 2,
     depth: int | None = None,
     kv_nt: bool | None = None,
+    wave_min_steps: int = 2,
     out_nt: bool = False,
-    out: torch.Tensor | None = None,
-    stream: torch.cuda.Stream | None = None,
-) -> torch.Tensor:
-    """Logits of every query row against its sequence's keys, from 8- or
-    64-row pages.
-
-    q_fp4         [B, NEXT_N, H, D / 2] u8 e2m1; q_scale from `pack_q_scales`
-    kv_cache      [num_pages, ...] u8, kv_scale [num_pages, ...] u8 in this
-                  module's page layout (`pack_kv_cache`); page size from them
-    block_tables  [B, max_blocks] i32, a sequence's blocks of pages_per_block
-                  consecutive pages, each named by its first page's id /
-                  pages_per_block (a page: one page size of keys). A
-                  candidate layer passes each query row as its own sequence
-                  (NEXT_N = 1) with its kept blocks as the table
-    weights       [B * NEXT_N, H] f32 or bf16, times weight_scale
-    context_lens  [B] i32; row n of a sequence sees context - NEXT_N + n + 1
-                  keys unless row_ends [B * NEXT_N] i32 gives each row's bound
-    out           [B * NEXT_N, >= max_seq_len] f32. Columns past a row's bound
-                  are left as they were.
-
-    Ragged: with ``query_start_loc`` [B + 1] i32, sequence b's rows are the
-    flattened rows query_start_loc[b] .. query_start_loc[b + 1] - 1, any
-    count up to ``max_query_len`` (0 too, as cudagraph padding has):
-    q_fp4 [rows, 1, H, D / 2], q_scale, weights, row_ends and out by
-    flattened row. row_ends is then required and context_lens not taken
-    (None): a sequence's length is its last row's bound. A sequence's rows
-    still share each key load, as NEXT_N rows do.
-
-    Work is shared out by length, a long sequence getting more workgroups
-    than a short one, by each workgroup from the lengths: no launch of its
-    own, and the grid, ``workgroups`` (at least B), follows the batch and
-    max_seq_len alone, so a captured graph keeps it.
-
-    Tuning, defaulted from the shape (see the default_* functions):
-    rows_per_wave  query rows a wave scores off one key load (divides NEXT_N)
-    num_warps      waves a workgroup; a multiple of NEXT_N / rows_per_wave
-    workgroups     the grid, shared out over the sequences by length
-    wave_min_steps fewest steps a wave of a busy workgroup walks
-    depth          steps of keys in flight per wave
-    kv_nt / out_nt nontemporal key loads / logit stores
-    """
-    ragged = query_start_loc is not None
-    if ragged:
-        assert max_query_len is not None and max_query_len >= 1, max_query_len
-        assert (
-            row_ends is not None and context_lens is None
-        ), "ragged rows take row_ends, and their lengths from them"
-        assert q_fp4.shape[1] == 1, "ragged rows: q_fp4 [rows, 1, H, D / 2]"
-        assert query_start_loc.dtype == torch.int32 and query_start_loc.is_contiguous()
-        total_rows, _, heads, half = q_fp4.shape
-        batch, next_n = query_start_loc.shape[0] - 1, max_query_len
-    else:
-        batch, next_n, heads, half = q_fp4.shape
-        total_rows = batch * next_n
-    head_dim = half * 2
-    num_pages = kv_cache.shape[0]
-    kv_page = kv_cache[0].numel()
-    for p in SUPPORTED_PAGE_SIZES:
-        if page_bytes(p, head_dim)[0] == kv_page:
-            page_size = p
-            break
-    else:
-        raise ValueError(f"no supported page size has {kv_page} value bytes a page")
-    assert kv_scale[0].numel() == page_bytes(page_size, head_dim)[1]
-    for t in (kv_cache, kv_scale):
-        # the kernel addresses page i at i * page bytes
-        assert t[0].is_contiguous() and t.stride(0) == t[0].numel(), t.stride()
-    # callers may hand over buffers sized for a larger batch: rows past
-    # B (B * NEXT_N) are not read
-    assert block_tables.dtype == torch.int32 and block_tables.stride(1) == 1
-    assert block_tables.shape[0] >= batch
-    if not ragged:
-        assert context_lens.dtype == torch.int32 and context_lens.shape[0] >= batch
-    assert weights.shape[0] >= total_rows and weights.shape[1] == heads
-    assert weights.stride(1) == 1 and weights.stride(0) == heads
-    assert weights.dtype in (torch.float32, torch.bfloat16)
-    if row_ends is not None:
-        assert row_ends.dtype == torch.int32 and row_ends.shape == (total_rows,)
-    rows = rows_per_wave or default_rows_per_wave(next_n, heads, batch, max_seq_len)
-    if kv_nt is None:
-        kv_nt = default_kv_nt(page_size, rows, next_n)
-    # a workgroup holds every row group of its sequence; light waves go
-    # alone (see default_workgroups)
-    row_groups = next_n // rows
+) -> Fp4MqaPlan:
+    """The launch for ``num_seqs`` sequences of at most ``max_qlen`` query
+    rows, ``num_rows`` in all, of ``heads`` heads against keys on
+    ``page_size``-row pages up to ``max_seq_len``: the M tile from
+    TILE_ROWS, the rest defaulted from the shape (the default_* functions)
+    unless given."""
+    assert page_size in SUPPORTED_PAGE_SIZES, page_size
+    tile_rows = next((t for t in TILE_ROWS if t >= max_qlen), TILE_ROWS[-1])
+    # the M tiles there can be
+    tiles = max(
+        1,
+        min(num_seqs * -(-max_qlen // tile_rows), -(-num_rows // tile_rows) + num_seqs),
+    )
+    rows = rows_per_wave or default_rows_per_wave(tile_rows, heads, tiles, max_seq_len)
+    # a workgroup holds every row group of its tile; light waves go alone
+    # (see default_workgroups)
+    row_groups = tile_rows // rows
     if num_warps is None:
         num_warps = (
-            1 if _single_wave_workgroups(page_size, rows, next_n, heads)
+            1 if _single_wave_workgroups(page_size, rows, tile_rows, heads)
             else DEFAULT_NUM_WARPS
         )  # fmt: skip
     num_warps = -(-num_warps // row_groups) * row_groups
@@ -1572,51 +1547,124 @@ def flydsl_pa_mqa_logits_fp4_rowgroup(
         workgroups = default_workgroups(
             page_size,
             heads,
-            batch,
+            tiles,
             rows,
             max_seq_len,
             num_warps,
             num_warps // row_groups,
         )
-    # at least one a sequence: the work assignment relies on it
-    workgroups = max(workgroups, batch)
     shallow_depth = None
-    if depth is None:
+    if depth is None and page_size < STEP_KEYS:
+        depth = _SHALLOW_DEPTH
+    elif depth is None:
         depth, shallow_depth = _DEEP_DEPTH, _SHALLOW_DEPTH
-    launcher, _ = compile_pa_mqa_logits_fp4_rowgroup(
-        page_size=page_size,
+    return Fp4MqaPlan(
         heads=heads,
-        head_dim=head_dim,
-        next_n=next_n,
+        page_size=page_size,
+        tile_m=tile_rows * heads,
         rows_per_wave=rows,
-        max_blocks_per_seq=block_tables.shape[1],
-        bt_stride=block_tables.stride(0),
         num_warps=num_warps,
-        weights_bf16=weights.dtype == torch.bfloat16,
-        has_row_ends=row_ends is not None,
+        # at least one an M tile: the work assignment relies on it
+        workgroups=max(workgroups, tiles),
+        max_seq_len=max_seq_len,
+        pages_per_block=pages_per_block,
+        kv_nt=default_kv_nt(page_size, rows, tile_rows) if kv_nt is None else kv_nt,
         depth=depth,
         shallow_depth=shallow_depth,
-        kv_nt=kv_nt,
-        out_nt=out_nt,
         wave_min_steps=wave_min_steps,
-        ragged=ragged,
-        pages_per_block=pages_per_block,
+        out_nt=out_nt,
     )
-    if ragged:
-        # the kernel reads the lengths off the row ends
-        context_lens = row_ends
+
+
+def flydsl_pa_mqa_logits_fp4_rowgroup(
+    plan: Fp4MqaPlan,
+    q_fp4: torch.Tensor,
+    q_scale: torch.Tensor,
+    kv_cache: torch.Tensor,
+    kv_scale: torch.Tensor,
+    block_tables: torch.Tensor,
+    weights: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    row_ends: torch.Tensor,
+    *,
+    weight_scale: float = 1.0,
+    out: torch.Tensor | None = None,
+    stream: torch.cuda.Stream | None = None,
+) -> torch.Tensor:
+    """Logits of every query row against its sequence's keys, from 8- or
+    64-row pages, as ``plan`` (`make_fp4_mqa_plan`) launches it.
+
+    q_fp4           [rows, H, D / 2] u8 e2m1; q_scale [rows, ...] from
+                    `pack_q_scales`
+    kv_cache        [num_pages, ...] u8, kv_scale [num_pages, ...] u8 in this
+                    module's page layout (`pack_kv_cache`)
+    block_tables    [B, max_blocks] i32, a sequence's blocks of
+                    plan.pages_per_block consecutive pages, each named by its
+                    first page's id / pages_per_block. A candidate layer
+                    passes each query row as its own sequence with its kept
+                    blocks as the table
+    weights         [rows, H] f32 or bf16, times weight_scale
+    query_start_loc [B + 1] i32: sequence b's rows are the flattened rows
+                    query_start_loc[b] .. query_start_loc[b + 1] - 1, any
+                    count (0 too, as cudagraph padding has)
+    row_ends        [rows] i32, each row's key bound; a sequence's length
+                    is its last row's
+    out             [rows, >= plan.max_seq_len] f32. Columns past a row's
+                    bound are left as they were.
+
+    Work is shared out by length, a long sequence's M tiles getting more
+    workgroups than a short one's, by each workgroup from the lengths: no
+    launch of its own.
+    """
+    num_rows, heads, half = q_fp4.shape
+    batch = query_start_loc.shape[0] - 1
+    head_dim = half * 2
+    assert heads == plan.heads and page_bytes(plan.page_size, head_dim) == (
+        kv_cache[0].numel(),
+        kv_scale[0].numel(),
+    ), "the plan's heads and page size must be the operands'"
+    for t in (kv_cache, kv_scale):
+        # the kernel addresses page i at i * page bytes
+        assert t[0].is_contiguous() and t.stride(0) == t[0].numel(), t.stride()
+    # callers may hand over buffers sized for a larger batch: rows past
+    # the last sequence's are not read
+    assert block_tables.dtype == torch.int32 and block_tables.stride(1) == 1
+    assert block_tables.shape[0] >= batch
+    assert query_start_loc.dtype == torch.int32 and query_start_loc.is_contiguous()
+    assert row_ends.dtype == torch.int32 and row_ends.shape == (num_rows,)
+    assert weights.shape[0] >= num_rows and weights.shape[1] == heads
+    assert weights.stride(1) == 1 and weights.stride(0) == heads
+    assert weights.dtype in (torch.float32, torch.bfloat16)
+    launcher, _ = compile_pa_mqa_logits_fp4_rowgroup(
+        page_size=plan.page_size,
+        heads=heads,
+        head_dim=head_dim,
+        tile_m=plan.tile_m,
+        rows_per_wave=plan.rows_per_wave,
+        max_blocks_per_seq=block_tables.shape[1],
+        bt_stride=block_tables.stride(0),
+        num_warps=plan.num_warps,
+        weights_bf16=weights.dtype == torch.bfloat16,
+        depth=plan.depth,
+        shallow_depth=plan.shallow_depth,
+        kv_nt=plan.kv_nt,
+        out_nt=plan.out_nt,
+        wave_min_steps=plan.wave_min_steps,
+        pages_per_block=plan.pages_per_block,
+    )
     if out is None:
         out = torch.full(
-            (total_rows, max_seq_len),
+            (num_rows, plan.max_seq_len),
             float("-inf"),
             dtype=torch.float32,
             device=q_fp4.device,
         )
-    assert out.shape[0] >= total_rows and out.shape[1] >= max_seq_len
+    assert out.shape[0] >= num_rows and out.shape[1] >= plan.max_seq_len
     assert out.stride(1) == 1
-    for t in (q_fp4, q_scale, context_lens):
+    for t in (q_fp4, q_scale):
         assert t.is_contiguous(), "the kernel addresses its operands as dense"
-    launcher(
+    _run_compiled(
+        launcher,
         out.data_ptr(),
         q_fp4.data_ptr(),
         q_scale.data_ptr(),
@@ -1624,16 +1672,15 @@ def flydsl_pa_mqa_logits_fp4_rowgroup(
         kv_scale.data_ptr(),
         block_tables.data_ptr(),
         weights.data_ptr(),
-        context_lens.data_ptr(),
-        (row_ends if row_ends is not None else context_lens).data_ptr(),
-        (query_start_loc if ragged else context_lens).data_ptr(),
+        row_ends.data_ptr(),
+        query_start_loc.data_ptr(),
         out.stride(0),
         float(weight_scale),
-        num_pages - 1,
+        kv_cache.shape[0] - 1,
         batch,
-        workgroups,
-        -(-max_seq_len // STEP_KEYS),
-        workgroups,
+        plan.workgroups,
+        -(-plan.max_seq_len // STEP_KEYS),
+        plan.workgroups,
         stream or torch.cuda.current_stream(),
     )
     return out

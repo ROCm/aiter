@@ -19,8 +19,11 @@ from .pa_mqa_logits_fp4_common import (
     _load_vec4_i32,
     compute_varctx_schedule,
 )
-from .pa_mqa_logits_fp4_rowgroup import SUPPORTED_PAGE_SIZES as ROWGROUP_PAGE_SIZES
-from .pa_mqa_logits_fp4_rowgroup import flydsl_pa_mqa_logits_fp4_rowgroup
+from .pa_mqa_logits_fp4_rowgroup import (
+    Fp4MqaPlan,
+    flydsl_pa_mqa_logits_fp4_rowgroup,
+    make_fp4_mqa_plan,
+)
 
 DEFAULT_HEADS = 64
 DEFAULT_HEAD_DIM = 128
@@ -567,6 +570,7 @@ def flydsl_pa_mqa_logits_fp4(
     query_start_loc: torch.Tensor | None = None,
     max_query_len: int | None = None,
     pages_per_block: int = 1,
+    plan: Fp4MqaPlan | None = None,
     stream: torch.cuda.Stream | None = None,
 ) -> torch.Tensor:
     """Decode/varctx FP4 paged MQA logits (gfx950).
@@ -577,49 +581,47 @@ def flydsl_pa_mqa_logits_fp4(
     ``next_n`` and ``>= batch*next_n`` by construction. Pass a smaller explicit
     value to trade parallelism for fewer no-op CTAs.
 
-    ``kv_block_size`` 8 and 64 run ``pa_mqa_logits_fp4_rowgroup``: a wave
-    scores a group of a sequence's rows off each key load, where this kernel
-    reads every key once per row, and its per-launch cost is lower at every
-    size (p64_dispatch_threshold.py, cold, B = 1-16, next_n 1/2/6, H 32/64:
-    1.25-2.9x at the sizes this kernel used to keep, below 8192 row-steps).
-    Page 64 keeps this layout (and its writers); page 8 has its own
-    (``pack_kv_cache`` there). ``q_scale`` is the same. That kernel shares the work out by
-    length itself: ``cta_info``, ``block_k``, ``num_warps`` and
-    ``parallel_unit_num`` do not apply. A given ``out`` is left as it was past
-    each row's context (no -inf fill: the caller owns those columns); without
-    ``out`` the result is allocated -inf as here. Only that kernel takes
-    ``row_ends`` (each row's bound) and the ragged rows (``query_start_loc``,
-    ``max_query_len``; ``q_fp4`` then [rows, 1, H, D / 2]) and a table entry
-    naming ``pages_per_block`` consecutive pages: see
-    ``flydsl_pa_mqa_logits_fp4_rowgroup``.
+    Ragged rows run ``pa_mqa_logits_fp4_rowgroup`` (8- or 64-row pages):
+    ``query_start_loc`` [B + 1] each sequence's first row, ``row_ends``
+    [rows] each row's bound, a sequence at most ``max_query_len`` rows,
+    ``q_fp4`` [rows, 1, H, D / 2], a table entry naming ``pages_per_block``
+    consecutive pages, and a ``plan`` (`make_fp4_mqa_plan`, else one for this
+    call's shape). A sequence's rows share each key load, where this kernel
+    reads every key once per row, and the work is shared out by length in the
+    kernel: ``cta_info``, ``block_k``, ``num_warps`` and ``parallel_unit_num``
+    do not apply, and a given ``out`` is left as it was past each row's bound.
+    Without them the call runs this kernel, as it always has (64-row pages).
     """
-    if kv_block_size in ROWGROUP_PAGE_SIZES:
-        if query_start_loc is None and q_fp4.shape[1] != next_n:
-            raise ValueError(
-                f"q_fp4 next_n dim ({q_fp4.shape[1]}) != next_n ({next_n})"
+    if query_start_loc is not None:
+        num_rows = row_ends.shape[0]
+        if plan is None:
+            plan = make_fp4_mqa_plan(
+                num_seqs=query_start_loc.shape[0] - 1,
+                max_qlen=max_query_len,
+                num_rows=num_rows,
+                heads=q_fp4.shape[-2],
+                page_size=kv_block_size,
+                max_seq_len=max_seq_len,
+                pages_per_block=pages_per_block,
             )
         return flydsl_pa_mqa_logits_fp4_rowgroup(
-            q_fp4,
-            q_scale,
+            plan,
+            q_fp4.reshape(num_rows, *q_fp4.shape[-2:]),
+            q_scale.reshape(num_rows, -1),
             kv_cache,
             kv_scale,
             block_tables,
             weights,
-            context_lens,
-            max_seq_len,
+            query_start_loc,
+            row_ends,
             weight_scale=weight_scale,
-            row_ends=row_ends,
-            query_start_loc=query_start_loc,
-            max_query_len=max_query_len,
-            pages_per_block=pages_per_block,
             out=out,
             stream=stream,
         )
-    if row_ends is not None or query_start_loc is not None or pages_per_block != 1:
+    if row_ends is not None or plan is not None or pages_per_block != 1:
         raise ValueError(
-            "row_ends / ragged rows / pages_per_block need kv_block_size in "
-            f"{ROWGROUP_PAGE_SIZES}, "
-            f"got {kv_block_size}"
+            "row_ends / plan / pages_per_block take the ragged rows: pass "
+            "query_start_loc"
         )
     batch_size, q_next_n, heads, head_dim_packed = q_fp4.shape
     head_dim = head_dim_packed * 2
