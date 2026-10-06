@@ -56,6 +56,16 @@ def tilescale_supported(M: int, N: int, K: int, a_fmt: int, b_fmt: int, bias: bo
     return (a_fmt, b_fmt, b_codes, b_ilv, int(bias), M, N, K) in _rows()
 
 
+def a4w4_b_ilv(M: int, N: int, K: int) -> int:
+    """Role B's scale interleave of the A4W4 tilescale kernel for (M, N, K), or ``ts_b_ilv(K)`` if none exists."""
+    for r in _rows():
+        if r[:2] == (4, 4) and r[5:] == (M, N, K):
+            return r[3]
+    from .tilescale import ts_b_ilv
+
+    return ts_b_ilv(K)
+
+
 def gemm_mx_tilescale(
     A: Tensor,
     B: Tensor,

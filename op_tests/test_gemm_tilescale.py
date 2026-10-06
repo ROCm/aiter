@@ -117,3 +117,36 @@ def test_missing_shape_raises():
     out = torch.empty(256, 256, dtype=torch.bfloat16, device="cuda")
     with pytest.raises(Exception):
         gemm_a6w4_tilescale(A, B, S, S, out, 1024)
+
+
+def _codes(fmt, rows, K, g):
+    return torch.randint(0, 16 if fmt == 4 else 64, (rows, K), dtype=torch.uint8, device="cuda", generator=g)
+
+
+def _pack(fmt, codes, b_codes=0):
+    if fmt == 6:
+        return TS.pack_fp6_codes_ref(codes)
+    return TS.pack_fp4_codes_ref(codes, "k128" if b_codes else "row")
+
+
+@requires_gfx950
+@pytest.mark.parametrize("row", [r for r in ROWS if _small(r)], ids=lambda r: r["knl_name"])
+def test_row_vs_fp64(row):
+    """Every small manifest row, whatever its format pair, against the fp64 product of its dequantized operands."""
+    M, N, K, bias = row["M"], row["N"], row["K"], bool(row["bias"])
+    af, bf = row["a_fmt"], row["b_fmt"]
+    g = torch.Generator(device="cuda").manual_seed(M * 7 + N * 3 + K + af * 11 + bf)
+    a, b = _codes(af, M, K, g), _codes(bf, N, K, g)
+    sa = torch.randint(118, 133, (M, K // 32), dtype=torch.uint8, device="cuda", generator=g)
+    sb = torch.randint(118, 133, (N, K // 32), dtype=torch.uint8, device="cuda", generator=g)
+    bv = torch.randn(N, dtype=torch.bfloat16, device="cuda", generator=g) if bias else None
+    out = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
+    gemm_mx_tilescale(_pack(af, a), _pack(bf, b, row["b_codes"]), TS.pack_scales_ref(sa, is_b=False),
+                      TS.pack_scales_ref(sb, is_b=True, ilv=row["b_ilv"]), out, af, bf, K, bv, row["b_codes"],
+                      row["b_ilv"])
+    fa, fb = (TS.FP4 if af == 4 else TS.FP6), (TS.FP4 if bf == 4 else TS.FP6)
+    ref = TS.dequant_ref(a, sa, fa) @ TS.dequant_ref(b, sb, fb).t()
+    if bv is not None:
+        ref = ref + bv.double()
+    err = (out.double() - ref).abs()
+    assert float(err.max()) <= float(ref.abs().max()) * 2**-7, float(err.max())
