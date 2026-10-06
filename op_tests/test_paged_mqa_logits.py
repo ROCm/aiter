@@ -5,9 +5,8 @@
 
 Inputs follow the DSA indexer decode call: compact Q ``[B, next_n, 32, 128]``,
 a 16x16-preshuffled ``[num_blocks, 64, 1, 132]`` uint8 KV cache with scattered
-pages, a preallocated ``[B * next_n, max_model_len]`` output, and context
-lengths either per sequence ``[B]`` or per Q row ``[B, next_n]`` (vLLM passes
-the 2D table).
+pages, a preallocated ``[B * next_n, max_model_len]`` output, and one context
+length per sequence ``[B]``.
 """
 
 from __future__ import annotations
@@ -134,18 +133,10 @@ def launch_args(inp):
     )
 
 
-def _row_context_lens(context_len, batch_size, next_n):
-    """vLLM's (B, next_n) table: row j of a sequence sees context_len - next_n + 1 + j."""
-    rows = context_len - next_n + 1 + torch.arange(next_n, dtype=torch.int32)
-    return rows.expand(batch_size, next_n).contiguous()
-
-
 @benchmark()
-def test_paged_mqa_logits(batch, next_n, kv_len, context_lens_dim):
+def test_paged_mqa_logits(batch, next_n, kv_len):
     shape = (batch, next_n, HEADS, HEAD_DIM, KV_BLOCK_SIZE, True)
     inp = build_inputs(shape, kv_len, MAX_MODEL_LEN)
-    if context_lens_dim == 2:
-        inp["context_lens"] = _row_context_lens(kv_len, batch, next_n)
     ref = run_torch(inp, kv_len)
     args = launch_args(inp)
     picked = pmql.get_paged_mqa_logits_config(
@@ -336,20 +327,12 @@ def main():
         default=[8192],
         help="Tokens per sequence.\n    e.g.: --kv-len 8192 65536",
     )
-    parser.add_argument(
-        "--context-lens-dim",
-        type=int,
-        nargs="*",
-        default=[1, 2],
-        choices=[1, 2],
-        help="context_lens as [B] (1) or vLLM's per-row [B, next_n] (2).",
-    )
     args = parser.parse_args()
 
     rows = [
-        test_paged_mqa_logits(batch, next_n, kv_len, dim)
-        for batch, next_n, kv_len, dim in itertools.product(
-            args.batch, args.next_n, args.kv_len, args.context_lens_dim
+        test_paged_mqa_logits(batch, next_n, kv_len)
+        for batch, next_n, kv_len in itertools.product(
+            args.batch, args.next_n, args.kv_len
         )
     ]
     df = pd.DataFrame(rows)

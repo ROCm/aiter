@@ -138,13 +138,6 @@ def reload_tuned_table() -> None:
     get_paged_mqa_logits_config.cache_clear()
 
 
-def _per_sequence_context_lens(context_lens: torch.Tensor) -> torch.Tensor:
-    # Both kernels take one length per sequence: the last column of (B, next_n).
-    if context_lens.dim() == 2 and context_lens.shape[1] > 1:
-        return context_lens[:, -1].contiguous()
-    return context_lens
-
-
 @functools.lru_cache(maxsize=1)
 def _flydsl_kernel():
     try:
@@ -199,7 +192,6 @@ def run_paged_mqa_logits(
     KVBlockSize: int,
 ) -> torch.Tensor:
     """Launch one explicit config. ``paged_mqa_logits`` and the tuner share it."""
-    context_lens = _per_sequence_context_lens(context_lens)
     if config["backend"] == "flydsl":
         _flydsl_kernel().flydsl_fp8_paged_mqa_logits(
             q_fp8,
@@ -256,8 +248,7 @@ def paged_mqa_logits(
         weights: ``[B * next_n, H]`` float32 head weights.
         out_logits: ``[B * next_n, >= max_model_len]`` float32 output. Only
             columns inside each row's causal bound are written.
-        context_lens: ``[B]`` or ``[B, next_n]`` int32. With a 2D table the
-            last column is the sequence length.
+        context_lens: ``[B]`` int32 sequence lengths.
         kv_indices: ``[B, max_blocks]`` int32 block table.
         max_model_len: Logical row width.
 
