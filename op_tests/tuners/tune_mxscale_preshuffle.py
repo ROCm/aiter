@@ -14,10 +14,7 @@ from aiter.ops.flydsl.gemm_tune.flydsl_gemm_mxscale_preshuffle_common import (
     candidates_for,
     kernels_list,
 )
-from aiter.ops.flydsl.mxscale_preshuffle_kernels import (
-    flydsl_mxscale_preshuffle_gemm,
-    gemm_mxscale_preshuffle,
-)
+from aiter.ops.flydsl.mxscale_preshuffle_kernels import gemm_mxscale_preshuffle
 from aiter.ops.quant import per_1x32_f4_quant, per_1x32_f8_scale_f8_quant
 from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight
 from aiter.utility import fp4_utils
@@ -84,7 +81,7 @@ def generate_data(
 
 def run_gemm_flydsl(A, B, a_scale, b_scale, out, kernel_id, a_dtype, b_dtype):
     instance = kernels_list[kernel_id]
-    flydsl_mxscale_preshuffle_gemm(
+    gemm_mxscale_preshuffle(
         A,
         B,
         a_scale,
@@ -135,6 +132,10 @@ class MxscalePreShuffleTuner(GemmCommonTuner):
         ref_keys = ["a_deq", "b_deq"]
         tasks = []
         for kernel_id, instance in candidates_for(a_dtype, b_dtype, M, N, K):
+            # tile_m=16 is the coarse blockscale specialization. This tuner
+            # measures the per-1x32 MX path, which packs M in pairs of 32.
+            if instance.tile_m % 32 != 0:
+                continue
             info = (info_keys, kernel_id, instance.split_k, instance.name, "flydsl")
             tasks.append(
                 (
