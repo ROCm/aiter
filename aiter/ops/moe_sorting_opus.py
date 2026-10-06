@@ -36,3 +36,25 @@ def moe_sorting_opus_fwd(
     m_indices: torch.Tensor | None = None,
     reverse_sorted: torch.Tensor | None = None,
 ) -> None: ...
+
+
+@compile_ops("module_moe_sorting_opus", develop=True)
+def mxfp4_moe_sort_quant_fwd(
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    sorted_weights: torch.Tensor,
+    sorted_expert_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    moe_buf: torch.Tensor,
+    activation_quant: torch.Tensor,
+    activation_scale_token: torch.Tensor,
+    num_experts: int,
+) -> None:
+    """Fused route sort + compact MXFP4 activation quantization.
+
+    gfx950 only, ``model_dim=7168``, ``block_m=32``, ``M`` in ``[1, 128]``.
+    ``(num_experts, topk)`` must be one of ``(256, 8)``, ``(384, 8)`` or
+    ``(385, 9)`` -- the expert histogram is a kernel template parameter.
+    """

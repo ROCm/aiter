@@ -28,6 +28,24 @@ void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
                           std::optional<aiter_tensor_t> m_indices        = std::nullopt,
                           std::optional<aiter_tensor_t> reverse_sorted   = std::nullopt);
 
+// Narrow gfx950 decode helper. It fuses route sorting, BF16->MXFP4 activation
+// quantization and routed-output zeroing for H=7168, block_m=32 batches of
+// M in [1, 128]. (num_experts, topk) must be one of (256,8), (384,8) or
+// (385,9) -- the expert histogram is a template parameter. Emits compact
+// per-token E8M0 scales, which FlyDSL GEMM1 can consume directly; callers that
+// need the sorted-row layout run the conventional conversion afterwards.
+void mxfp4_moe_sort_quant_fwd(aiter_tensor_t& hidden_states,
+                              aiter_tensor_t& topk_ids,
+                              aiter_tensor_t& topk_weights,
+                              aiter_tensor_t& sorted_token_ids,
+                              aiter_tensor_t& sorted_weights,
+                              aiter_tensor_t& sorted_expert_ids,
+                              aiter_tensor_t& num_valid_ids,
+                              aiter_tensor_t& moe_buf,
+                              aiter_tensor_t& activation_quant,
+                              aiter_tensor_t& activation_scale_token,
+                              int num_experts);
+
 #ifdef MOE_SORTING_OPUS_IMPL
 // ============================================================================
 // Implementation section - only compiled in the .cu translation unit
