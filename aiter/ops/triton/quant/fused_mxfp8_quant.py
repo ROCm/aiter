@@ -4,6 +4,9 @@
 import torch
 import triton
 
+from aiter.ops.triton._gluon_kernels.gfx1250.quant.fused_mxfp8_quant import (
+    _gluon_fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_kernel,
+)
 from aiter.ops.triton._triton_kernels.quant.fused_mxfp8_quant import (
     _fused_deepseek_v4_dequant_gather_k_cache_kernel,
     _fused_deepseek_v4_quantize_and_insert_k_kernel,
@@ -13,6 +16,7 @@ from aiter.ops.triton._triton_kernels.quant.fused_mxfp8_quant import (
     _fused_flatten_mxfp8_quant_kernel,
     _fused_rms_mxfp8_kernel,
 )
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 __all__ = [
     "fused_deepseek_v4_compress_norm_rope_store",
@@ -293,6 +297,7 @@ def fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
     q_packed_out: torch.Tensor | None = None,
     q_rope_out: torch.Tensor | None = None,
     use_fnuz: bool = False,
+    backend: str = "auto",
 ):
     """The whole DSv4 decode producer in one launch.
 
@@ -310,6 +315,10 @@ def fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
         cos_sin_cache: ``[max_pos, 64]`` fp32, laid out cos || sin.
         padded_heads: the head count the decode kernel expects; slots at or
             past ``H`` are zero-filled.
+        backend: ``"auto"`` runs the Gluon kernel on gfx1250 and the Triton
+            one elsewhere; ``"gluon"`` and ``"triton"`` force one. The two
+            share a contract and are held to each other bit for bit, except
+            Q with the norm on, whose sum is reduced in a different order.
 
     Returns:
         ``q_bf16`` when ``pack_q`` is False, else
@@ -333,6 +342,18 @@ def fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
         raise RuntimeError(
             f"kv_cache records must be {_V4_REC_ALIGNED} B, got "
             f"{kv_cache.shape[-1]}"
+        )
+    if backend == "auto":
+        use_gluon = get_arch() == "gfx1250"
+    elif backend == "gluon":
+        if get_arch() != "gfx1250":
+            raise RuntimeError("Gluon kernel only supported on gfx1250 hardware")
+        use_gluon = True
+    elif backend == "triton":
+        use_gluon = False
+    else:
+        raise ValueError(
+            f"Invalid backend: {backend}. Choose from auto, gluon, or triton"
         )
     q = q.contiguous()
     kv = kv.contiguous()
@@ -369,10 +390,15 @@ def fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
         q_packed = q_rope = q_out
 
     fp8_max = 224.0 if use_fnuz else float(torch.finfo(torch.float8_e4m3fn).max)
+    if use_gluon:
+        # one warp per (token, slot): every reduction stays a shuffle
+        kernel = _gluon_fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_kernel
+        launch_kw = {"NUM_WARPS": 1, "num_warps": 1}
+    else:
+        kernel = _fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_kernel
+        launch_kw = {"num_warps": 4}
     # One extra slot along dim 1 carries the KV row for the token.
-    _fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_kernel[
-        (t, padded_heads + 1)
-    ](
+    kernel[(t, padded_heads + 1)](
         q,
         q_out,
         q_packed,
@@ -400,7 +426,7 @@ def fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
         bool(pack_q),
         bool(write_q),
         bool(use_fnuz),
-        num_warps=4,
+        **launch_kw,
     )
     if pack_q:
         return q_out, q_packed.view(torch.float8_e4m3fn), q_rope

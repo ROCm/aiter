@@ -16,6 +16,9 @@ worth it -- the question VLLM_DSV4_QPACK_FUSION exists to answer:
 
 ``--no-write-q`` measures the pure-decode shortcut, where the bf16 Q is never
 read back and the producer may skip writing it.
+
+``--backend both`` runs the producer as the Triton reference and as the
+gfx1250 Gluon port, and adds a ``gluon vs triton`` line per token count.
 """
 import argparse
 import sys
@@ -65,9 +68,12 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--tokens", type=int, nargs="+", default=[1, 64, 256, 1024])
-    p.add_argument("--heads", type=int, default=16, help="local Q heads")
-    p.add_argument("--padded-heads", type=int, default=16,
+    # 32 is DSv4-Pro at tp4; a 16-head default measured a grid half the width
+    p.add_argument("--heads", type=int, default=32, help="local Q heads")
+    p.add_argument("--padded-heads", type=int, default=32,
                    help="head count the attention kernel wants; >= --heads")
+    p.add_argument("--backend", choices=("triton", "gluon", "both"),
+                   default="both", help="which producer kernel to time")
     p.add_argument("--block", type=int, default=64, help="paged cache block size")
     p.add_argument("--no-q-norm", dest="q_norm", action="store_false",
                    help="skip the per-head RMSNorm on Q")
@@ -82,41 +88,50 @@ def main():
     if a.padded_heads < a.heads:
         sys.exit("--padded-heads must be >= --heads")
 
+    backends = ("triton", "gluon") if a.backend == "both" else (a.backend,)
+
     print("dsv4 producer  heads=%d padded=%d block=%d q_norm=%s write_q=%s"
           % (a.heads, a.padded_heads, a.block, a.q_norm, a.write_q))
-    print("%-8s %-11s %-11s %-11s %-11s %s"
-          % ("tokens", "pack=on us", "pack=off us", "q_pack us",
+    print("%-8s %-8s %-11s %-11s %-11s %-11s %s"
+          % ("tokens", "backend", "pack=on us", "pack=off us", "q_pack us",
              "fused GB/s", "fused vs split"))
 
     for t in a.tokens:
         nb = max(1, (t + a.block - 1) // a.block * 2)
         q, kv, cache, slot, pos, cs = build(t, a.heads, a.padded_heads, nb, a.block)
         args = (q, kv, cache, slot, pos, cs, a.block, 1e-6, a.padded_heads)
-        kw = dict(apply_q_norm=a.q_norm, write_q=a.write_q)
 
-        def fused():
-            fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(*args, pack_q=True, **kw)
+        fused_us = {}
+        for b in backends:
+            kw = dict(apply_q_norm=a.q_norm, write_q=a.write_q, backend=b)
 
-        def unfused():
-            fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(*args, pack_q=False, **kw)
+            def fused():
+                fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(*args, pack_q=True, **kw)
 
-        q_out = fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
-            *args, pack_q=False, **kw
-        )
+            def unfused():
+                fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(*args, pack_q=False, **kw)
 
-        def only_pack():
-            fused_deepseek_v4_mxfp8_quant_q_pack(q_out)
+            q_out = fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+                *args, pack_q=False, **kw
+            )
 
-        for fn in (fused, unfused, only_pack):  # compile outside the timed region
-            fn()
-        torch.cuda.synchronize()
+            def only_pack():
+                fused_deepseek_v4_mxfp8_quant_q_pack(q_out)
 
-        f = triton.testing.do_bench_cudagraph(fused, rep=a.rep) * 1e3
-        u = triton.testing.do_bench_cudagraph(unfused, rep=a.rep) * 1e3
-        k = triton.testing.do_bench_cudagraph(only_pack, rep=a.rep) * 1e3
-        gbs = producer_bytes(t, a.heads, a.padded_heads, True, a.write_q) / (f * 1e-6) / 1e9
-        print("%-8d %-11.2f %-11.2f %-11.2f %-11.1f %.2fx"
-              % (t, f, u, k, gbs, (u + k) / f))
+            for fn in (fused, unfused, only_pack):  # compile outside the timed region
+                fn()
+            torch.cuda.synchronize()
+
+            f = triton.testing.do_bench_cudagraph(fused, rep=a.rep) * 1e3
+            u = triton.testing.do_bench_cudagraph(unfused, rep=a.rep) * 1e3
+            k = triton.testing.do_bench_cudagraph(only_pack, rep=a.rep) * 1e3
+            gbs = producer_bytes(t, a.heads, a.padded_heads, True, a.write_q) / (f * 1e-6) / 1e9
+            fused_us[b] = f
+            print("%-8d %-8s %-11.2f %-11.2f %-11.2f %-11.1f %.2fx"
+                  % (t, b, f, u, k, gbs, (u + k) / f))
+        if len(fused_us) == 2:
+            print("%-8d gluon vs triton (pack=on): %.2fx"
+                  % (t, fused_us["triton"] / fused_us["gluon"]))
 
 
 if __name__ == "__main__":

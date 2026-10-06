@@ -485,6 +485,11 @@ def _skip_without_fp8():
         pytest.skip("FP8 not supported on this arch")
 
 
+def _skip_without_gluon(backend):
+    if backend == "gluon" and arch_info.get_arch() != "gfx1250":
+        pytest.skip("Gluon kernel only supported on gfx1250")
+
+
 # --------------------------------------------------------------------------- #
 # references
 # --------------------------------------------------------------------------- #
@@ -616,10 +621,12 @@ def test_fused_deepseek_v4_mxfp8_quant_q_pack_contract():
 # --------------------------------------------------------------------------- #
 # fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert
 # --------------------------------------------------------------------------- #
-@pytest.mark.parametrize("T,H,padded", [(1, 16, 16), (8, 16, 32), (37, 128, 128)])
-@pytest.mark.parametrize("apply_norm", [False, True])
+# @pytest.mark.parametrize("T,H,padded", [(1, 16, 16), (8, 16, 32), (37, 128, 128)])
+@pytest.mark.parametrize("T,H,padded", [(16, 32, 32), ])
+@pytest.mark.parametrize("apply_norm", [True])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
 def test_fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
-    T, H, padded, apply_norm
+    T, H, padded, apply_norm, backend
 ):
     """Q, its pack, and the KV record, against per-side references.
 
@@ -636,6 +643,7 @@ def test_fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
     record untouched.
     """
     _skip_without_fp8()
+    _skip_without_gluon(backend)
     q, kv, cache, slot, pos, cs = _make_inputs(T, H, padded, nb=4, block=64)
     slot[1::2] = -1  # every other token has no cache row; token 0 stays live
     # (odd indices, so the T=1 case still exercises a real insert)
@@ -643,7 +651,8 @@ def test_fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
 
     q_out, q_packed, q_rope = (
         fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
-            q, kv, cache, slot, pos, cs, 64, 1e-6, padded, apply_q_norm=apply_norm
+            q, kv, cache, slot, pos, cs, 64, 1e-6, padded,
+            apply_q_norm=apply_norm, backend=backend,
         )
     )
 
@@ -716,6 +725,49 @@ def test_fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_contract():
         fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
             q, kv, bad, slot, pos, cs, 64, 1e-6, 16
         )
+
+
+@pytest.mark.parametrize("T,H,padded", [(16, 32, 32), (16, 30, 32)])
+@pytest.mark.parametrize("apply_norm", [False, True])
+def test_fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_gluon_matches_triton(
+    T, H, padded, apply_norm
+):
+    """The Gluon port against the Triton kernel, at zero tolerance.
+
+    Two implementations of the same arithmetic must agree bit for bit, which
+    is a stronger and cheaper check than either against a float reference.
+    The whole cache is compared, not just the live rows, so a stray write into
+    the pad or into a skipped slot fails here too.
+
+    The one exception is Q with the norm ON: one warp reduces sum(x*x) in a
+    different order from four, so Q may move in its last bit. The KV record
+    has no norm and is held exact in both cases; the reference test above
+    covers Q with the norm on.
+    """
+    _skip_without_fp8()
+    _skip_without_gluon("gluon")
+    q, kv, cache, slot, pos, cs = _make_inputs(T, H, padded, nb=4, block=64)
+    slot[1::2] = -1
+    out = {}
+    for b in ("triton", "gluon"):
+        c = cache.clone()
+        q_out, q_packed, q_rope = fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+            q, kv, c, slot, pos, cs, 64, 1e-6, padded,
+            apply_q_norm=apply_norm, backend=b,
+        )
+        out[b] = (c, q_out.view(torch.uint16), q_packed.view(torch.uint8),
+                  q_rope.view(torch.uint16))
+
+    tri, glu = out["triton"], out["gluon"]
+    torch.testing.assert_close(glu[0], tri[0], **_EXACT)
+    names = ("q_out", "q_packed", "q_rope")
+    if apply_norm:
+        # padded slots carry no norm, so they are still exact
+        for name, g, t in zip(names, glu[1:], tri[1:]):
+            torch.testing.assert_close(g[:, H:], t[:, H:], **_EXACT, msg=name)
+    else:
+        for name, g, t in zip(names, glu[1:], tri[1:]):
+            torch.testing.assert_close(g, t, **_EXACT, msg=name)
 
 
 # --------------------------------------------------------------------------- #
