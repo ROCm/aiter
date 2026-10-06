@@ -966,19 +966,22 @@ class FmoeTuner(TunerCommon):
         #   a=a1_qt, w1=w1_qt_shuf, w1_scale=w1_scale_shuf, a1_scale=a1_scale_sort,
         #   v2_output_layout=True, ...). Recipe mirrors
         # mxfp4_v2_tune_utils.populate_baseline_v2_intermediate.
-        d = _v2_gen(
-            token,
-            model_dim,
-            inter_dim,
-            expert,
-            topk,
-            blockM,
-            adtype=adtype,
-            b_dtype=b_dtype,
-            activation=act_type,
-            situ_beta=DEFAULT_SITUV2_BETA,
-            situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
-        )
+        # Generate on the GPU: the CPU fp4 packing of E x 2I x H weights takes
+        # tens of minutes per shape at E=385.
+        with torch.device(device):
+            d = _v2_gen(
+                token,
+                model_dim,
+                inter_dim,
+                expert,
+                topk,
+                blockM,
+                adtype=adtype,
+                b_dtype=b_dtype,
+                activation=act_type,
+                situ_beta=DEFAULT_SITUV2_BETA,
+                situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
+            )
         v = _v2_build_inputs(d, token, model_dim, inter_dim, expert, topk, blockM)
         # Precompute the sorted A-scale here so it is NOT timed in the run func.
         a1_scale_sort = moe_mxfp4_sort(
