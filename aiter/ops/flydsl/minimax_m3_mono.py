@@ -11,7 +11,7 @@ the same layers with the same step shape, or the group deadlocks.
 
 from __future__ import annotations
 
-import weakref
+from collections.abc import Sequence
 from dataclasses import dataclass, fields
 from typing import NamedTuple
 
@@ -44,14 +44,23 @@ __all__ = [
     "MAX_TOKENS",
     "CacheLayout",
     "MiniMaxM3MonoDecode",
+    "MonoLayerCaches",
     "MonoLayerWeights",
 ]
 
 _FP8 = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
 _EXPERTS = N_ROUTED + 1
-# Engine-owned buffers the op must not keep alive: a launch after the engine frees
-# one would read or write freed memory, so ``run`` checks them instead.
-_CACHES = ("k_cache", "v_cache", "k_scale", "v_scale", "index_cache")
+
+
+class MonoLayerCaches(NamedTuple):
+    """The engine-owned tensors of one layer that can be reallocated: the op does
+    not keep them alive, and ``run`` checks them against the registered ones."""
+
+    k_cache: torch.Tensor
+    v_cache: torch.Tensor
+    k_scale: torch.Tensor
+    v_scale: torch.Tensor
+    index_cache: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -89,6 +98,10 @@ class MonoLayerWeights:
     k_scale: torch.Tensor
     v_scale: torch.Tensor
     index_cache: torch.Tensor
+
+    @property
+    def caches(self) -> MonoLayerCaches:
+        return MonoLayerCaches(*(getattr(self, f) for f in MonoLayerCaches._fields))
 
 
 def _check(ok: bool, what: str) -> None:
@@ -166,7 +179,6 @@ def _validate(w: MonoLayerWeights, cache: CacheLayout, gate_fp32: bool) -> None:
 class _Layer(NamedTuple):
     layer_id: int
     weights: tuple[torch.Tensor, ...]  # held: the kernel reads them every step
-    caches: tuple[weakref.ref, ...]  # storages of _CACHES
     ptrs: dict[str, int]
     k1_args: torch.Tensor
 
@@ -263,10 +275,8 @@ class MiniMaxM3MonoDecode:
         ``block_pages``: page-16 ids one KV cache block spans in the K-side
         numbering (``CacheLayout.block_pages``). The kernels hold raw pointers:
         call this again whenever a tensor it was given is reallocated (an
-        engine's KV cache after memory profiling). The weights are kept alive;
-        the caches and KV scales are not, and ``run`` raises once one of them is
-        freed. A cache that is replaced while the old one stays alive cannot be
-        detected here.
+        engine's KV cache after memory profiling); ``run`` raises until then. The
+        weights are kept alive, the ``MonoLayerCaches`` tensors are not.
         """
         cache = CacheLayout(block_pages, self.cache.scalar_kv_scale)
         if cache != self.cache:
@@ -300,12 +310,29 @@ class MiniMaxM3MonoDecode:
         self._layers.append(
             _Layer(
                 layer_id,
-                tuple(t for name, t in tensors.items() if name not in _CACHES),
-                tuple(weakref.ref(tensors[n].untyped_storage()) for n in _CACHES),
+                tuple(
+                    t for name, t in tensors.items()
+                    if name not in MonoLayerCaches._fields
+                ),
                 {name: t.data_ptr() for name, t in tensors.items()},
                 k1_args,
             )
-        )
+        )  # fmt: skip
+
+    def _check_caches(self, caches: Sequence[MonoLayerCaches]) -> None:
+        if len(caches) != len(self._layers):
+            raise RuntimeError(
+                f"MiniMax-M3 mono decode: {len(caches)} layers' caches given, "
+                f"{len(self._layers)} registered"
+            )
+        for layer, current in zip(self._layers, caches):
+            for name, t in zip(MonoLayerCaches._fields, current):
+                if t.data_ptr() != layer.ptrs[name]:
+                    raise RuntimeError(
+                        f"MiniMax-M3 mono decode: layer {layer.layer_id}'s {name} "
+                        "is not the registered tensor; call register_layers() "
+                        "after reallocating a cache"
+                    )
 
     def _kernel(self, tokens: int):
         k = self._kernels.get(tokens)
@@ -328,6 +355,7 @@ class MiniMaxM3MonoDecode:
         slot_mapping: torch.Tensor,
         block_table: torch.Tensor,
         seq_lens: torch.Tensor,
+        caches: Sequence[MonoLayerCaches],
         query_len: int = 1,
         aux_layers: tuple[int, ...] = (),
     ) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]:
@@ -339,10 +367,12 @@ class MiniMaxM3MonoDecode:
         ``block * SPARSE_BLOCK + offset`` in cache blocks (negative to skip the
         write). ``block_table`` / ``seq_lens``: int32, a row per token (a request
         of ``query_len`` tokens repeats its row, token j seeing
-        ``seq_len - (query_len - 1 - j)`` keys). ``aux_layers``: registered layer
-        ids whose output stream (FFN output plus residual) to return, in order.
-        Returns the last layer's TP-reduced FFN output and its residual, the
-        final norm's inputs, and the requested layer outputs.
+        ``seq_len - (query_len - 1 - j)`` keys). ``caches``: every registered
+        layer's caches as the engine holds them now, in registration order; any
+        that is not the registered tensor raises before a launch. ``aux_layers``:
+        registered layer ids whose output stream (FFN output plus residual) to
+        return, in order. Returns the last layer's TP-reduced FFN output and its
+        residual, the final norm's inputs, and the requested layer outputs.
         """
         n = hidden.shape[0]
         _check(1 <= n <= MAX_TOKENS, f"step of {n} tokens")
@@ -360,13 +390,7 @@ class MiniMaxM3MonoDecode:
             and block_table.stride(1) == 1,
             "block_table and seq_lens must be int32 with a contiguous row per token",
         )
-        for layer in self._layers:
-            if any(ref() is None for ref in layer.caches):
-                raise RuntimeError(
-                    f"MiniMax-M3 mono decode: layer {layer.layer_id}'s KV cache, "
-                    "index cache or KV scale was freed; call register_layers() "
-                    "with the current tensors"
-                )
+        self._check_caches(caches)
         if n not in self._kernels and torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 f"MiniMax-M3 mono decode: the {n}-token kernel is not compiled; "

@@ -26,8 +26,9 @@ Determinism: the same decode step runs repeatedly and must be bit-identical
 Placement: the same step with its blocks moved to ids whose bytes lie just below
 and past 2^31 and 2^32 in the KV and index caches gives the same output.
 
-Guards: on every rank, before any launch, ``run`` raises once a registered cache
-is freed and when CUDA graph capture reaches an uncompiled step size.
+Guards: on every rank, before any launch, ``run`` raises when a cache was
+reallocated without ``register_layers()`` (the old one still alive) and when CUDA
+graph capture reaches an uncompiled step size; after re-registering it runs.
 
 Runs on gfx950 with 256 compute units and at least four GPUs; skips otherwise.
 """
@@ -257,7 +258,7 @@ def _register(op, layers, layout):
     )
 
 
-def _run(op, step, hidden=None, residual=None):
+def _run(op, step, layers, hidden=None, residual=None):
     return op.run(
         step["hidden"] if hidden is None else hidden,
         step["residual"] if residual is None else residual,
@@ -265,6 +266,7 @@ def _run(op, step, hidden=None, residual=None):
         step["slot_mapping"],
         step["block_table"],
         step["seq_lens"],
+        [w.caches for w in layers],
     )
 
 
@@ -301,7 +303,7 @@ def _determinism_rank(rank, init_method, layout, n_layers, tokens, iters, pad):
             dist.barrier()
             if delayed.randrange(TP) == rank:
                 torch.cuda._sleep(DELAY_CYCLES)
-            h, r, _ = _run(op, step, hidden, residual)
+            h, r, _ = _run(op, step, layers, hidden, residual)
             out = torch.cat([h, r], -1)[:live].float()
             torch.cuda.synchronize()
             if not torch.isfinite(out).all():
@@ -339,7 +341,7 @@ def _placement_rank(rank, init_method, layout, n_layers, tokens):
             op = _make_op(rank, device, layout)
             try:
                 _register(op, layers, layout)
-                h, r, _ = _run(op, step)
+                h, r, _ = _run(op, step, layers)
                 outs.append(torch.cat([h, r], -1).float().cpu())
             finally:
                 op.close()
@@ -364,7 +366,7 @@ def _guards_rank(rank, init_method):
     failures = []
     try:
         _register(op, layers, "engine")
-        _run(op, step)
+        _run(op, step, layers)
         torch.cuda.synchronize()
 
         one = {name: t[:1] for name, t in step.items()}
@@ -375,7 +377,7 @@ def _guards_rank(rank, init_method):
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", "The CUDA Graph is empty")
                 with torch.cuda.graph(torch.cuda.CUDAGraph(), stream=stream):
-                    _run(op, one)
+                    _run(op, one, layers)
 
         _expect_raise(
             failures, "capture of an uncompiled step size", RuntimeError,
@@ -383,15 +385,17 @@ def _guards_rank(rank, init_method):
         )  # fmt: skip
         torch.cuda.synchronize()
 
-        moved = [
+        # The engine reallocates a cache and misses register_layers(); the old
+        # cache stays alive, so only the pointer comparison can catch it.
+        realloc = [
             dataclasses.replace(w, index_cache=w.index_cache.clone()) for w in layers
         ]
-        _register(op, moved, "engine")
-        del moved
         _expect_raise(
-            failures, "run after a registered cache was freed", RuntimeError,
-            "was freed", lambda: _run(op, step),
+            failures, "run after a missed register_layers()", RuntimeError,
+            "not the registered tensor", lambda: _run(op, step, realloc),
         )  # fmt: skip
+        _register(op, realloc, "engine")
+        _run(op, step, realloc)
         torch.cuda.synchronize()
         dist.barrier()
     finally:
