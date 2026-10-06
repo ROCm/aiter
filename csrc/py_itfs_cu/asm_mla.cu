@@ -827,6 +827,13 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     if (kv_dtype != AITER_DTYPE_i8 && kv_dtype != AITER_DTYPE_u8) {
         AITER_CHECK(head_size == KV->size(3), __func__, ":only support head_size == KV.size(3) for now");
     }
+    // The decode kernels are built for DeepSeek's MLA row (512 latent + 64 RoPE) and take
+    // no head size, so a narrower row is read past its end instead of being rejected.
+    AITER_CHECK(head_size == 576, __func__,
+                ": only support 576-element MLA rows (kv_lora_rank 512 + qk_rope_head_dim 64), got head_size ",
+                head_size);
+    AITER_CHECK(output->size(2) == 512, __func__,
+                ": only support v_head_dim 512, got ", output->size(2));
     
     if(q_dtype == AITER_DTYPE_fp8)
     {
