@@ -135,6 +135,7 @@ def _gfx950_gluon_supported(params: _UAParams):
     return (
         DEVICE_ARCH == "gfx950"
         and _unified_attention_kernel_gfx950 is not None
+        and params.causal
         # softcap hits an AMDGPU backend assert (GCNRewritePartialRegUses) on Triton 3.8
         and not params.softcap
         and not params.use_qq_bias
@@ -196,8 +197,6 @@ def unified_attention(
     # backend
     backend: str | None = None,  # "triton" | "gluon"
 ):
-    assert causal, "Only causal attention is supported"
-
     if backend is None:
         backend = "gluon" if _is_gluon_available() else "triton"
     backend = backend.lower()
@@ -211,6 +210,10 @@ def unified_attention(
         ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
 
     use_alibi_slopes = alibi_slopes is not None
+    assert (
+        causal or not use_alibi_slopes
+    ), "ALiBi is not supported with non-causal attention"
+
     use_qq_bias = qq_bias is not None
     SLIDING_WINDOW = 1 + window_size[0]
 
@@ -462,6 +465,7 @@ def is_2d_gluon_available(params: _UAParams, backend: str):
     if DEVICE_ARCH == "gfx1250":
         use_gluon_arch = (
             _unified_attention_kernel_2d_gfx1250 is not None
+            and params.causal
             and not params.softcap
             and not params.use_qq_bias
             and not params.use_alibi_slopes
@@ -483,6 +487,7 @@ def is_3d_gluon_available(params: _UAParams, backend: str):
     if DEVICE_ARCH == "gfx1250":
         use_gluon_arch = (
             _unified_attention_kernel_3d_gfx1250 is not None
+            and params.causal
             and params.shuffled_kv_cache
         )
     elif DEVICE_ARCH == "gfx950":
@@ -582,6 +587,7 @@ def _unified_attention_2d_triton(params: _UAParams):
         ALL_DECODE=params.all_decode,
         SHUFFLED_KV_CACHE=params.shuffled_kv_cache,
         K_WIDTH=params.k_width,
+        CAUSAL=params.causal,
         **config,
     )
 
@@ -661,6 +667,7 @@ def _unified_attention_3d_triton(
         IS_KV_FP8=(params.kv_cache_dtype == e4m3_dtype),
         NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
         TILE_SIZE=TILE_SIZE,
+        CAUSAL=params.causal,
         **config,
     )
 

@@ -334,21 +334,22 @@ def ref_paged_attn(
             k = torch.repeat_interleave(k, q.shape[1] // k.shape[1], dim=1)
             v = torch.repeat_interleave(v, q.shape[1] // v.shape[1], dim=1)
         attn = torch.einsum("qhd,khd->hqk", q, k).float()
-        empty_mask = torch.ones(query_len, kv_len, device=q.device)
-        mask = torch.triu(empty_mask, diagonal=kv_len - query_len + 1).bool()
+        empty_mask = torch.ones(query_len, kv_len, device=q.device, dtype=torch.bool)
+        if causal:
+            mask = torch.triu(empty_mask, diagonal=kv_len - query_len + 1)
+        else:
+            mask = torch.zeros_like(empty_mask)
         if sliding_window is not None:
-            sliding_window_mask = (
-                torch.triu(
-                    empty_mask, diagonal=kv_len - (query_len + sliding_window) + 1
-                )
-                .bool()
-                .logical_not()
-            )
-            mask |= sliding_window_mask
+            query_pos = torch.arange(query_len, device=q.device) + (kv_len - query_len)
+            key_pos = torch.arange(kv_len, device=q.device)
+            qk_dist = query_pos[:, None] - key_pos[None, :]
+            if not causal:
+                # The window is two-sided: |q_abs - k| < sliding_window.
+                qk_dist = qk_dist.abs()
+            mask |= qk_dist >= sliding_window
         if soft_cap is not None and soft_cap > 0:
             attn = soft_cap * torch.tanh(attn / soft_cap)
-        if causal:
-            attn.masked_fill_(mask, float("-inf"))
+        attn.masked_fill_(mask, float("-inf"))
         if sinks is not None:
             s_aux = sinks[:, None, None].repeat_interleave(attn.shape[-2], dim=-2)
             attn = torch.cat((attn, s_aux), dim=-1)
@@ -616,6 +617,7 @@ def test_triton_unified_attn(
             shuffled_kv_cache=shuffled_kv_cache,
             block_size=block_size,
             k_width=16 // kv_dtype.itemsize,
+            causal=True,
         ),
         backend,
     )
@@ -725,3 +727,140 @@ def test_triton_unified_attn(
             torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol),
             f"{torch.max(torch.abs(output - ref_output))}",
         )
+
+
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        [(64, 256)],
+        [(64, 249)],
+        [(64, 2048)],
+        [(64, 2041)],
+        [(1, 2048), (1, 997)],
+        [(64, 256), (1, 2041), (17, 97)],
+    ],
+)
+@pytest.mark.parametrize("num_heads", [(8, 1)])
+@pytest.mark.parametrize("head_size", [64])
+@pytest.mark.parametrize("block_size", [16])
+# A window below the query lengths, so its right edge masks; a wider one
+# degenerates to the causal single-sided case.
+@pytest.mark.parametrize("sliding_window", [None, 16])
+@pytest.mark.parametrize("shuffled_kv_cache", [False, True])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+@torch.inference_mode()
+def test_triton_unified_attn_noncausal(
+    seq_lens: list[tuple[int, int]],
+    num_heads: tuple[int, int],
+    head_size: int,
+    sliding_window: int | None,
+    block_size: int,
+    shuffled_kv_cache: bool,
+    backend: str,  # "triton" | "gluon"
+) -> None:
+    dtype = torch.bfloat16
+    if backend == "gluon" and not _is_gluon_available():
+        pytest.skip(f"skip gluon backend, not available on {DEVICE_ARCH}")
+    use_gluon_2d = is_2d_gluon_available(
+        SimpleNamespace(
+            q_dtype=dtype,
+            kv_cache_dtype=dtype,
+            softcap=None,
+            use_qq_bias=False,
+            use_alibi_slopes=False,
+            head_size=head_size,
+            head_size_v=head_size,
+            shuffled_kv_cache=shuffled_kv_cache,
+            block_size=block_size,
+            k_width=16 // dtype.itemsize,
+            causal=False,
+        ),
+        backend,
+    )
+    torch.manual_seed(0)
+    # shuffling only supported for gfx1250 gluon kernels
+    if shuffled_kv_cache and not use_gluon_2d:
+        pytest.skip("skip shuffled_kv_cache, 2d gluon not available")
+    query_lens = [x[0] for x in seq_lens]
+    kv_lens_list = [x[1] for x in seq_lens]
+    (
+        query,
+        key_cache_orig,
+        value_cache_orig,
+        key_cache,
+        value_cache,
+        sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        _maybe_quant_query,
+        _query_scales,
+        q_descale,
+        k_descale,
+        v_descale,
+        output_scale,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=2048,
+        block_size=block_size,
+        head_size=head_size,
+        num_heads=num_heads,
+        sliding_window=sliding_window,
+        q_dtype=dtype,
+        kv_dtype=dtype,
+        out_dtype=dtype,
+        shuffled_kv_cache=shuffled_kv_cache,
+        device="cuda",
+    )
+
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=False,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        sinks=sinks,
+        output_scale=output_scale,
+        shuffled_kv_cache=shuffled_kv_cache,
+        backend=backend,
+    )
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache_orig,
+        value_cache=value_cache_orig,
+        query_lens=query_lens,
+        kv_lens=kv_lens_list,
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=dtype,
+        sliding_window=sliding_window,
+        sinks=sinks,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        causal=0,
+    )
+
+    torch.testing.assert_close(
+        output.to(torch.float32),
+        ref_output.to(torch.float32),
+        atol=1.5e-2,
+        rtol=1e-2,
+    )
