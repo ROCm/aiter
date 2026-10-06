@@ -149,7 +149,6 @@ def emit_index_scores(
     assert local_blocks >= 1, "the block of the current token must be pinned"
     l16 = lane % 16
     g4 = lane // 16
-    r_ic = rsrc(index_cache)
     rows = step_rows(seq_lens, tokens, q_len, heads)
     seq = rows.seq
     # every request's scored blocks in one list, a task per wave across the grid;
@@ -201,10 +200,12 @@ def emit_index_scores(
         """Key tiles ``tiles`` (16 keys each) of a block, in flight: lane g4 =
         lane / 16 reads its key's bytes 32 g4 .. 32 g4 + 32 with two 16 B loads
         (half the load instructions of eight-byte operand reads scattered over
-        the rows); ``split_tiles`` makes them MFMA operands."""
+        the rows); ``split_tiles`` makes them MFMA operands. ``page`` is uniform:
+        a 64-bit base at it keeps the offsets 32-bit for a cache of any size."""
+        r_ic = rsrc(index_cache + fx.Int64(page) * INDEX_BLOCK_BYTES)
         words = []
         for i in tiles:
-            row = (page * INDEX_BLOCK_BYTES + (16 * i + l16) * HEAD_DIM + 32 * g4) // 4
+            row = ((16 * i + l16) * HEAD_DIM + 32 * g4) // 4
             for h in range_constexpr(2):
                 w = fx.Vector(
                     bo.buffer_load(r_ic, row + 4 * h, vec_width=4, dtype=T.i32)

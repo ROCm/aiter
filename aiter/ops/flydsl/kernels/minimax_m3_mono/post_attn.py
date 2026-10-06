@@ -807,7 +807,6 @@ def build_post_attn_kernel(
         # dynamic if / for as region state, so names must not be shared across stages.
         # ============================================================ 1. split
         def stage_split():
-            r_k, r_v = rsrc(k_cache), rsrc(v_cache)
             r_ks, r_vs = rsrc(k_scale), rsrc(v_scale)
             PPW = SPLIT_KEYS // WAVES // PAGE16  # pages per wave
             for ts in range(start("split"), N_SPLIT * tokens, G):
@@ -843,6 +842,10 @@ def build_post_attn_kernel(
                     uniform(fx.ptr_load(blk + (wave * PPW + j))) for j in range(PPW)
                 ]
                 qv = ld_bf16x4(rsrc(q), tok * O_K + tid * 4, CM_K1)
+                # The wave's pages are consecutive: a 64-bit base at the first keeps
+                # the lane offsets 32-bit for a cache of any size.
+                page_base = fx.Int64(pages[0]) * PAGE_BYTES
+                r_k, r_v = rsrc(k_cache + page_base), rsrc(v_cache + page_base)
                 # K (QK B operand, key = lane % 16 of page j), V (PV B operand: dims
                 # 16 jd + lane % 16, keys 8 (lane / 16) .. + 8), per-token scales
                 kw = []
@@ -853,7 +856,7 @@ def build_post_attn_kernel(
                                 bo.buffer_load(
                                     r_k,
                                     (
-                                        pages[j] * PAGE_BYTES
+                                        (pages[j] - pages[0]) * PAGE_BYTES
                                         + (2 * s + g4 // 2) * 256
                                         + l16 * 16
                                         + (g4 % 2) * 8
@@ -865,7 +868,7 @@ def build_post_attn_kernel(
                                 )
                             ).bitcast(fx.Int64)[0]
                         )
-                vpg = (g4 // 2 == 0).select(pages[0], pages[1])
+                vpg = (g4 // 2 == 0).select(fx.Int32(0), pages[1] - pages[0])
                 vw = [
                     fx.Vector(
                         bo.buffer_load(

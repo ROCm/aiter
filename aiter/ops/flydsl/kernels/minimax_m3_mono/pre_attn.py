@@ -37,6 +37,7 @@ from aiter.ops.flydsl.kernels.minimax_m3_mono.common import (
     div_rn,
     fp8_pack4,
     hw_rsq,
+    readlane,
     release_stores,
     rsrc,
     traced,
@@ -487,6 +488,46 @@ def emit_pre_attn(
             # page-16 id of the slot in the K numbering, and the token within it
             b = (slot // SPARSE_BLOCK) * block_pages + (slot % SPARSE_BLOCK) // PAGE16
             t = slot % PAGE16
+
+            def each_half(store, *args):
+                """``store(first_lane, *args)`` on each half wave (a token each), so
+                a cache descriptor at that token's page is uniform where it is used:
+                its 64-bit base keeps the offsets 32-bit for a cache of any size."""
+                for h in range_constexpr(2):
+                    if lane // 32 == h:
+                        store(32 * h, *args)
+
+            def page_rsrc(cache_ptr, first_lane):
+                return rsrc(cache_ptr + fx.Int64(readlane(b, first_lane)) * PAGE_BYTES)
+
+            def store_v(first_lane, vs):
+                r_v = page_rsrc(v_cache, first_lane)
+                for j in range_constexpr(ELEMS):
+                    q8 = fp8_pack4(fp8_sat(e[j] / vs), 0.0, 0.0, 0.0) & 0xFF
+                    bo.buffer_store(
+                        fx.Int8(q8),
+                        r_v,
+                        (d0 + j) * PAGE16 + t,
+                        cache_modifier=cm_out,
+                    )
+
+            def store_k(first_lane, qk):
+                bo.buffer_store(
+                    fp8_pack4(qk[0], qk[1], qk[2], qk[3]),
+                    page_rsrc(k_cache, first_lane),
+                    ((d0 // 16) * (PAGE16 * 16) + t * 16 + d0 % 16) // 4,
+                    cache_modifier=cm_out,
+                )
+
+            def store_index_k(first_lane, qi):
+                row = fx.Int64(readlane(slot, first_lane)) * HEAD_DIM
+                bo.buffer_store(
+                    fp8_pack4(qi[0], qi[1], qi[2], qi[3]),
+                    rsrc(index_cache + row),
+                    d0 // 4,
+                    cache_modifier=cm_out,
+                )
+
             if is_v:
                 if const_expr(scalar_kv):
                     vs = fx.Float32(
@@ -505,15 +546,7 @@ def emit_pre_attn(
                             bo.buffer_store(
                                 vs, rsrc(v_scale), b * PAGE16 + t, cache_modifier=cm_out
                             )
-                    r_v = rsrc(v_cache)
-                    for j in range_constexpr(ELEMS):
-                        q8 = fp8_pack4(fp8_sat(e[j] / vs), 0.0, 0.0, 0.0) & 0xFF
-                        bo.buffer_store(
-                            fx.Int8(q8),
-                            r_v,
-                            b * PAGE_BYTES + (d0 + j) * PAGE16 + t,
-                            cache_modifier=cm_out,
-                        )
+                    each_half(store_v, vs)
             else:
                 out = head_norm_rope(e, lane, gw4, cs, sn, eps)
                 if is_q:
@@ -550,26 +583,10 @@ def emit_pre_attn(
                                     cache_modifier=cm_out,
                                 )
                         qk = [fp8_sat(bf16_round(out[j]) / ksc) for j in range(ELEMS)]
-                        bo.buffer_store(
-                            fp8_pack4(qk[0], qk[1], qk[2], qk[3]),
-                            rsrc(k_cache),
-                            (
-                                b * PAGE_BYTES
-                                + (d0 // 16) * (PAGE16 * 16)
-                                + t * 16
-                                + d0 % 16
-                            )
-                            // 4,
-                            cache_modifier=cm_out,
-                        )
+                        each_half(store_k, qk)
                 if (ht == IK_TASK) & (slot >= 0):
                     qi = [bf16_round(out[j]) for j in range(ELEMS)]
-                    bo.buffer_store(
-                        fp8_pack4(qi[0], qi[1], qi[2], qi[3]),
-                        rsrc(index_cache),
-                        (slot * HEAD_DIM + d0) // 4,
-                        cache_modifier=cm_out,
-                    )
+                    each_half(store_index_k, qi)
 
         if const_expr(signal is not None):
             # every token's flag once the whole CTA's stores are out

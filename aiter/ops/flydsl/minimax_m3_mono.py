@@ -11,7 +11,9 @@ the same layers with the same step shape, or the group deadlocks.
 
 from __future__ import annotations
 
+import weakref
 from dataclasses import dataclass, fields
+from typing import NamedTuple
 
 import torch
 import torch.distributed as dist
@@ -47,6 +49,9 @@ __all__ = [
 
 _FP8 = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
 _EXPERTS = N_ROUTED + 1
+# Engine-owned buffers the op must not keep alive: a launch after the engine frees
+# one would read or write freed memory, so ``run`` checks them instead.
+_CACHES = ("k_cache", "v_cache", "k_scale", "v_scale", "index_cache")
 
 
 @dataclass(frozen=True)
@@ -158,6 +163,14 @@ def _validate(w: MonoLayerWeights, cache: CacheLayout, gate_fp32: bool) -> None:
         _check(getattr(w, name).is_contiguous(), f"{name} must be contiguous")
 
 
+class _Layer(NamedTuple):
+    layer_id: int
+    weights: tuple[torch.Tensor, ...]  # held: the kernel reads them every step
+    caches: tuple[weakref.ref, ...]  # storages of _CACHES
+    ptrs: dict[str, int]
+    k1_args: torch.Tensor
+
+
 class _PeerBuffer:
     """One uncached buffer per rank, every rank holding every peer's address."""
 
@@ -191,9 +204,11 @@ class MiniMaxM3MonoDecode:
     """Owns the fused sparse-layer kernels, their scratch and the peer buffer.
 
     ``group``: the TP group's CPU (gloo) process group, used once to exchange the
-    peer buffer handles. Build it outside CUDA graph capture; ``run`` may be
-    captured once each step size has been run eagerly (the first call of a size
-    compiles its kernel).
+    peer buffer handles. Build it outside CUDA graph capture.
+
+    The first ``run`` of each token count compiles that count's kernel, so run
+    every count a graph will capture (1..MAX_TOKENS) eagerly first; capturing an
+    uncompiled count raises.
     """
 
     def __init__(
@@ -224,7 +239,7 @@ class MiniMaxM3MonoDecode:
             init_blocks, local_blocks,
         )  # fmt: skip
         self._kernels: dict[int, object] = {}
-        self._layers: list[tuple[int, MonoLayerWeights, torch.Tensor]] = []
+        self._layers: list[_Layer] = []
 
         u8, bf16 = torch.uint8, torch.bfloat16
         self._scratch1 = torch.zeros(K1_SCRATCH, dtype=u8, device=device)
@@ -248,7 +263,10 @@ class MiniMaxM3MonoDecode:
         ``block_pages``: page-16 ids one KV cache block spans in the K-side
         numbering (``CacheLayout.block_pages``). The kernels hold raw pointers:
         call this again whenever a tensor it was given is reallocated (an
-        engine's KV cache after memory profiling).
+        engine's KV cache after memory profiling). The weights are kept alive;
+        the caches and KV scales are not, and ``run`` raises once one of them is
+        freed. A cache that is replaced while the old one stays alive cannot be
+        detected here.
         """
         cache = CacheLayout(block_pages, self.cache.scalar_kv_scale)
         if cache != self.cache:
@@ -278,7 +296,16 @@ class MiniMaxM3MonoDecode:
         k1_args = torch.tensor(
             [ptrs[a] for a in K1_ARGS], dtype=torch.int64, device=self._step.device
         )
-        self._layers.append((layer_id, weights, k1_args))
+        tensors = {f.name: getattr(weights, f.name) for f in fields(weights)}
+        self._layers.append(
+            _Layer(
+                layer_id,
+                tuple(t for name, t in tensors.items() if name not in _CACHES),
+                tuple(weakref.ref(tensors[n].untyped_storage()) for n in _CACHES),
+                {name: t.data_ptr() for name, t in tensors.items()},
+                k1_args,
+            )
+        )
 
     def _kernel(self, tokens: int):
         k = self._kernels.get(tokens)
@@ -333,28 +360,40 @@ class MiniMaxM3MonoDecode:
             and block_table.stride(1) == 1,
             "block_table and seq_lens must be int32 with a contiguous row per token",
         )
+        for layer in self._layers:
+            if any(ref() is None for ref in layer.caches):
+                raise RuntimeError(
+                    f"MiniMax-M3 mono decode: layer {layer.layer_id}'s KV cache, "
+                    "index cache or KV scale was freed; call register_layers() "
+                    "with the current tensors"
+                )
+        if n not in self._kernels and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                f"MiniMax-M3 mono decode: the {n}-token kernel is not compiled; "
+                "run each step size eagerly before CUDA graph capture"
+            )
         kernel = self._kernel(n)
         self._ars[0][:n].copy_(hidden)
         res = residual
         aux = []
         stream = torch.cuda.current_stream()
-        for i, (layer_id, w, k1_args) in enumerate(self._layers):
+        for i, layer in enumerate(self._layers):
+            p = layer.ptrs
             out = self._h_mids[(i + 1) % 2]
             kernel(
                 self._h.data_ptr(), self._q.data_ptr(), block_table.data_ptr(),
-                seq_lens.data_ptr(), w.k_cache.data_ptr(), w.v_cache.data_ptr(),
-                w.k_scale.data_ptr(), w.v_scale.data_ptr(), w.w_o.data_ptr(),
-                w.s_o.data_ptr(), w.post_norm.data_ptr(), w.gate.data_ptr(),
-                w.gate_bias.data_ptr(), w.w13.data_ptr(), w.s13.data_ptr(),
-                w.w2.data_ptr(), w.s2.data_ptr(), out.data_ptr(),
+                seq_lens.data_ptr(), p["k_cache"], p["v_cache"], p["k_scale"],
+                p["v_scale"], p["w_o"], p["s_o"], p["post_norm"], p["gate"],
+                p["gate_bias"], p["w13"], p["s13"], p["w2"], p["s2"], out.data_ptr(),
                 self._ars[(i + 1) % 2].data_ptr(), self._scratch4.data_ptr(),
                 self._peers.local, self._peers.addresses.data_ptr(),
-                self._step.data_ptr(), self.rank, layer_id, block_table.shape[1],
-                query_len, k1_args.data_ptr(), positions.data_ptr(),
-                slot_mapping.data_ptr(), res.data_ptr(), stream=stream,
+                self._step.data_ptr(), self.rank, layer.layer_id,
+                block_table.shape[1], query_len, layer.k1_args.data_ptr(),
+                positions.data_ptr(), slot_mapping.data_ptr(), res.data_ptr(),
+                stream=stream,
             )  # fmt: skip
             res = out[:n]
-            if layer_id in aux_layers:
+            if layer.layer_id in aux_layers:
                 aux.append(self._ars[(i + 1) % 2][:n] + res)
         self._step.add_(1)
         return self._ars[len(self._layers) % 2][:n], res, aux
