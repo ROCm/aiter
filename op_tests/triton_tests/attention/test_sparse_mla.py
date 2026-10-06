@@ -32,8 +32,8 @@ def _skip_unless_supported(dots="bf16", fmt="bf16"):
     arch = arch_info.get_arch()
     if arch not in SUPPORTED_ARCHS:
         pytest.skip(f"sparse_mla_fwd does not support {arch}")
-    if dots == "fp8" and arch not in FP8_ARCHS:
-        pytest.skip(f"fp8 dots are {'/'.join(FP8_ARCHS)}-only")
+    if dots == "fp8" and arch not in FP8_SCALAR_ARCHS:
+        pytest.skip(f"fp8 dots are {'/'.join(FP8_SCALAR_ARCHS)}-only")
     if fmt == "tensor" and arch not in FP8_SCALAR_ARCHS:
         pytest.skip(f"the fp8_scalar cache is {'/'.join(FP8_SCALAR_ARCHS)}-only")
     if fmt == "dsmla" and arch not in FP8_ARCHS:
@@ -162,14 +162,15 @@ def test_sparse_mla(fmt, dots, tol, H, C, topk, ragged, pool):
 def test_dot_precision_arch_gate(arch):
     """The fp8-dot gate, for every arch, from any machine.
 
-    The matrix above skips its fp8 cases off gfx950, so the gate has no
-    coverage on any arch without this.
+    The matrix above only runs its fp8 cases on the arch it is on.
     """
     assert smd._resolve_dot_precision("bf16", "fp8_scalar", arch) is False
-    if arch in FP8_ARCHS:
+    if arch in FP8_SCALAR_ARCHS:
         assert smd._resolve_dot_precision("fp8", "fp8_scalar", arch) is True
+        with pytest.raises(ValueError, match="needs an fp8 cache"):
+            smd._resolve_dot_precision("fp8", "bf16", arch)
     else:
-        with pytest.raises(ValueError, match="fnuz"):
+        with pytest.raises(ValueError, match="not supported"):
             smd._resolve_dot_precision("fp8", "fp8_scalar", arch)
 
 
@@ -237,12 +238,13 @@ def test_foreign_fp8_cache_dtype_rejected():
 def test_launch_config_published(arch):
     """Every supported arch ships its launch config, checked from any machine."""
     assert {"BLOCK_K", "num_warps"} <= smd._get_config(arch).keys()
+    assert {"BLOCK_K", "num_warps"} <= smd._get_config(arch, fp8_dots=True).keys()
 
 
 def test_lds_budget_gfx950_is_unchecked():
     """gfx950 is left to the launcher, though arch_info lists its LDS too.
 
-    The footprint model holds only for gfx942's bf16, non-async tiles.
+    The footprint model holds only for gfx942's non-async tiles.
     """
     smd._check_lds_budget("gfx950", 64, 2048, 64, kv_lds_pad=16)
 
@@ -286,6 +288,24 @@ def test_lds_budget_gfx942_boundary(kv_lds_pad, kv_lora_rank, rope, need):
         return
     with pytest.raises(ValueError, match=rf"needs {need} B of LDS"):
         smd._check_lds_budget("gfx942", block_k, kv_lora_rank, rope, kv_lds_pad)
+
+
+@pytest.mark.parametrize(
+    "kv_lora_rank, rope, need",
+    [(512, 0, None), (512, 64, None), (1024, 0, 67584), (512, 512, 68608)],
+)
+def test_lds_budget_gfx942_fp8_tile(kv_lora_rank, rope, need):
+    """CPU-only: fp8 dots' one-byte tiles, at their own BLOCK_K on gfx942.
+
+    512/0 and 512/64 compile to the 34816 and 39936 B the model gives them.
+    """
+    block_k = smd._get_config("gfx942", fp8_dots=True)["BLOCK_K"]
+    args = ("gfx942", block_k, kv_lora_rank, rope, 0)
+    if need is None:
+        smd._check_lds_budget(*args, fp8_dots=True)
+        return
+    with pytest.raises(ValueError, match=rf"needs {need} B of LDS"):
+        smd._check_lds_budget(*args, fp8_dots=True)
 
 
 def test_ds_mla_format():
