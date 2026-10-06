@@ -7713,6 +7713,14 @@ template <typename T, typename IdxT, bool WRITE_TOPK_VALUES>
 inline bool dispatch_topk_plain_gfx950(T const* in, int batch_size, int64_t len, IdxT k, T* out,
                                        IdxT* out_idx, bool select_min, hipStream_t stream)
 {
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx950__)
+    // A device pass for another target. The kernels below are wave64 code that
+    // asks for more LDS than gfx942 has (74,452 B for the wide first digit),
+    // and the only caller runs this on gfx950 (topk_oneblock_is_gfx950), so
+    // they are left out of that target's code object: the host still
+    // registers them, and nothing launches them there.
+    return false;
+#else
     if(len < 16 * 1024)
     {
         int const num_cu = topk_oneblock_num_cu();
@@ -7753,6 +7761,7 @@ inline bool dispatch_topk_plain_gfx950(T const* in, int batch_size, int64_t len,
         return true;
     }
     return false;
+#endif
 }
 
 // Whether dispatch_topk_oneblock<float, int, 1024, WRITE_TOPK_VALUES, Prefill>
@@ -7794,22 +7803,22 @@ inline void dispatch_topk_oneblock(void* buf, size_t& buf_size, T const* in, Idx
         }
         else if(specialized)
         {
-            // Other large-BPP parts keep the windows they were tuned with; the
-            // gfx950 ranges above have not been measured on them.
-            if(len >= 16384 && len <= 32770)
-            {
-                radix_topk_one_block_lds_tail_kernel<T, IdxT, BlockSize, WRITE_TOPK_VALUES>
-                    <<<batch_size, BlockSize, 0, stream>>>(
-                        in, len, k, out, out_idx, select_min);
-                return;
-            }
-            if(len >= 4096 && len <= 8194)
+            // Other large-BPP parts keep the register window they were tuned
+            // with; the gfx950 ranges above have not been measured on them.
+            // The LDS-tail window is not among them: its kernel wants 75,088 B
+            // of LDS, past gfx942's 65,536 B, and assumes wave64, which gfx1250
+            // is not, so those rows take the generic kernel below. The register
+            // window is wave64 only too: at wave32 a 1024-thread block is 32
+            // waves, past the 16 its bucket reduce scans.
+#if !defined(__HIP_DEVICE_COMPILE__) || defined(__GFX9__)
+            if(len >= 4096 && len <= 8194 && get_warp_size_func() == 64)
             {
                 int const ept = static_cast<int>((len + BlockSize - 1) / BlockSize);
                 if(topk_oneblock_reg_launch<T, IdxT, BlockSize, WRITE_TOPK_VALUES, 12, 8, 4, 9, false>(
                        ept, batch_size, stream, in, len, k, out, out_idx, select_min))
                     return;
             }
+#endif
         }
     }
 
