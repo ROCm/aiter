@@ -45,6 +45,15 @@ _MXFP8_LEGACY_BLOCK_SIZE = 128
 _LOGGER = AiterTritonLogger()
 
 
+def _has_scaled_downcast() -> bool:
+    # Older Triton builds lack this Gluon API, so selecting the gfx950 kernel
+    # makes MXFP4/MXFP8 model loading fail at compile time.
+    from triton.experimental.gluon import language as gl
+
+    cdna4 = getattr(getattr(gl, "amd", None), "cdna4", None)
+    return callable(getattr(cdna4, "scaled_downcast", None))
+
+
 def _use_gluon(backend: str | None, supported: bool, requirement: str) -> bool:
     # None picks Gluon where supported; "triton" and "gluon" force that kernel.
     if backend not in (None, "triton", "gluon"):
@@ -303,8 +312,11 @@ def dynamic_mxfp4_quant(
     # everything else uses the Triton path below.
     if _use_gluon(
         backend,
-        arch_info.get_arch() == "gfx950" and x.dtype == torch.bfloat16 and not use_sr,
-        "gfx950, bf16 input and use_sr=False",
+        arch_info.get_arch() == "gfx950"
+        and x.dtype == torch.bfloat16
+        and not use_sr
+        and _has_scaled_downcast(),
+        "gfx950, bf16 input, use_sr=False and Triton gl.amd.cdna4.scaled_downcast",
     ):
         from aiter.ops.triton._gluon_kernels.gfx950.quant.quant import (
             gluon_dynamic_mxfp4_quant_kernel_gfx950,
@@ -514,8 +526,10 @@ def dynamic_mxfp8_quant(
         backend,
         arch_info.get_arch() == "gfx950"
         and x.dtype == torch.bfloat16
-        and quant_dtype == torch.float8_e4m3fn,
-        "gfx950, bf16 input and quant_dtype=torch.float8_e4m3fn",
+        and quant_dtype == torch.float8_e4m3fn
+        and _has_scaled_downcast(),
+        "gfx950, bf16 input, quant_dtype=torch.float8_e4m3fn and "
+        "Triton gl.amd.cdna4.scaled_downcast",
     ):
         from aiter.ops.triton._gluon_kernels.gfx950.quant.quant import (
             gluon_dynamic_mxfp8_quant_kernel_gfx950,
