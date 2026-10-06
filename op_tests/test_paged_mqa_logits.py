@@ -16,6 +16,8 @@ import argparse
 import itertools
 import math
 import os
+import subprocess
+import sys
 
 import pandas as pd
 import torch
@@ -23,12 +25,7 @@ import torch
 import aiter
 import aiter.paged_mqa_logits as pmql
 from aiter import dtypes
-from aiter.jit.utils.chip_info import (
-    get_cu_num,
-    get_gfx,
-    get_gfx_custom_op_core,
-    get_gfx_runtime,
-)
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -38,6 +35,7 @@ HEADS = 32
 HEAD_DIM = 128
 KV_BLOCK_SIZE = 64
 MAX_MODEL_LEN = 131072
+_SHIPPED_ROW_CHILD = "AITER_TEST_PAGED_MQA_LOGITS_SHIPPED_ROW"
 
 
 def _preshuffle(raw, head_dim):
@@ -216,52 +214,48 @@ def _shipped_config(batch_size, next_n):
     return rows.get(batch_size)
 
 
-def _clear_gfx_caches():
-    get_gfx.cache_clear()
-    get_gfx_custom_op_core.cache_clear()
-    pmql.get_paged_mqa_logits_config.cache_clear()
+def _launch_shipped_row():
+    expected = _shipped_config(64, 8)
+    original = pmql.run_paged_mqa_logits
+    launched = {}
+
+    def spy(config, *args, **kwargs):
+        launched["config"] = dict(config)
+        return original(config, *args, **kwargs)
+
+    pmql.run_paged_mqa_logits = spy
+    try:
+        shape = (64, 8, HEADS, HEAD_DIM, KV_BLOCK_SIZE, True)
+        inp = build_inputs(shape, 8192, 8192)
+        pmql.paged_mqa_logits(*launch_args(inp))
+        torch.cuda.synchronize()
+    finally:
+        pmql.run_paged_mqa_logits = original
+    assert launched["config"] == expected, (
+        f"GPU_ARCHS={os.environ['GPU_ARCHS']} launched {launched['config']}, "
+        f"shipped row {expected}"
+    )
 
 
 def check_launches_shipped_row():
-    expected = _shipped_config(64, 8)
-    if expected is None:
+    if _shipped_config(64, 8) is None:
         aiter.logger.warning(
             "paged_mqa_logits shipped-row check skipped on %s cu=%s",
             get_gfx_runtime(),
             get_cu_num(),
         )
         return
+    # chip_info is imported under two names, so GPU_ARCHS only applies in a new process.
     other = "gfx942" if get_gfx_runtime() != "gfx942" else "gfx950"
-    old_arch = os.environ.get("GPU_ARCHS")
-    os.environ["GPU_ARCHS"] = other
-    _clear_gfx_caches()
-    original = pmql.run_paged_mqa_logits
-    launched = {}
-
-    def spy(config, *args, **kwargs):
-        launched["config"] = dict(config)
-        return args[3]
-
-    pmql.run_paged_mqa_logits = spy
-    try:
-        assert get_gfx() == other
-        shape = (64, 8, HEADS, HEAD_DIM, KV_BLOCK_SIZE, True)
-        inp = build_inputs(shape, 8192, 8192)
-        pmql.paged_mqa_logits(*launch_args(inp))
-        assert launched["config"] == expected, (
-            f"GPU_ARCHS={other} launched {launched.get('config')}, "
-            f"shipped row {expected}"
-        )
-    finally:
-        pmql.run_paged_mqa_logits = original
-        if old_arch is None:
-            os.environ.pop("GPU_ARCHS", None)
-        else:
-            os.environ["GPU_ARCHS"] = old_arch
-        _clear_gfx_caches()
+    env = {**os.environ, "GPU_ARCHS": other, _SHIPPED_ROW_CHILD: "1"}
+    subprocess.run([sys.executable, os.path.abspath(__file__)], env=env, check=True)
 
 
 def main():
+    if os.environ.get(_SHIPPED_ROW_CHILD):
+        assert get_gfx() != get_gfx_runtime()
+        _launch_shipped_row()
+        return
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning("paged_mqa_logits unsupported on %s; skipping", get_gfx())
         return
