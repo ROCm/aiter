@@ -1,7 +1,7 @@
 {
     "_kernel_unified_attention_sparse_mla_2d": {
-        "BLOCK_M": 32,
-        "num_warps": 8,
+        "BLOCK_M": 64,
+        "num_warps": 4,
         "num_stages": 1
     }
 }
