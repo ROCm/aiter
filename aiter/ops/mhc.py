@@ -3,6 +3,7 @@
 
 import functools
 import math
+from typing import Optional
 
 import torch
 from torch import Tensor
@@ -1059,3 +1060,267 @@ def mhc_fused_post_pre(
         )
 
     return post_mix, comb_mix, layer_input_out, next_residual
+
+
+# ---- delayed mHC seam, with gfx942 ASM kernels (hsa/gfx942/mhc_seam/) ----
+#
+# The delayed seam of the DeepSeek-V4 family: the post-mix of the previous sub-layer,
+# the stream collapse with the carried pre gate and the gates of the next pre
+# projection, as ``mhc_fused_post_pre_delayed_rmsnorm`` (Triton) computes them, without
+# its RMSNorm. The ASM kernels exist for gfx942, hc_mult = 4 and hidden_size = 5120
+# (DeepSeek-V4.1-Flash) only; the op has no other path and raises outside that
+# configuration (probe: mhc_fused_post_pre_delayed_asm_supported). Other configurations
+# use ``mhc_fused_post_pre_delayed_rmsnorm`` (Triton, folds the RMSNorm) or ``mhc_post``
+# + ``mhc_pre``.
+
+MHC_SEAM_HC_MULT = 4
+MHC_SEAM_HIDDEN_SIZE = 5120
+# Below this many tokens the few-token kernel runs (one short wave per 128-column slice
+# and token: post, collapse and the pre GEMM partials); from it the persistent fused
+# kernel (512-column chunks, ~11 us fixed cost). Every wave of the few-token kernel reads
+# its fn slice, so its time grows with T; on MI300X-class GPUs the two cross at about 60
+# tokens. Both are followed by the ASM gates.
+MHC_SEAM_SMALL_MAX_T = 60
+MHC_SEAM_SMALL_SLICE = 128
+MHC_SEAM_FUSED_CHUNK = 512
+# From this many tokens the new residual no longer fits in the 256 MB MALL, and
+# nontemporal stores are about 1 % faster.
+MHC_SEAM_STORE_NT_MIN_T = 8192
+# Tokens per launch: keeps every tensor under 4 GiB (the kernels use 32-bit offsets).
+MHC_SEAM_MAX_T_PER_LAUNCH = 65536
+
+
+@compile_ops("module_mhc_seam_asm", fc_name="mhc_seam_fused_asm", ffi_type="ctypes")
+def mhc_seam_fused_asm(
+    residual_out: Tensor,
+    layer_input: Tensor,
+    part: Tensor,
+    residual: Tensor,
+    sublayer_out: Tensor,
+    post_layer_mix: Tensor,
+    comb_res_mix: Tensor,
+    pre_mix: Tensor,
+    fn: Tensor,
+    workers: int = 0,
+    store_nt: bool = False,
+) -> None: ...
+
+
+@compile_ops("module_mhc_seam_asm", fc_name="mhc_seam_small_asm", ffi_type="ctypes")
+def mhc_seam_small_asm(
+    residual_out: Tensor,
+    layer_input: Tensor,
+    part: Tensor,
+    residual: Tensor,
+    sublayer_out: Tensor,
+    post_layer_mix: Tensor,
+    comb_res_mix: Tensor,
+    pre_mix: Tensor,
+    fn: Tensor,
+) -> None: ...
+
+
+@compile_ops("module_mhc_seam_asm", fc_name="mhc_seam_gates_asm", ffi_type="ctypes")
+def mhc_seam_gates_asm(
+    post_mix: Tensor,
+    comb_mix: Tensor,
+    pre_mix: Tensor,
+    part: Tensor,
+    hc_scale: Tensor,
+    hc_base: Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    hc_hidden_size: int,
+) -> None: ...
+
+
+def mhc_fused_post_pre_delayed_asm_supported(
+    hidden_size: int, hc_mult: int, arch: Optional[str] = None  # noqa: UP045
+) -> bool:
+    """True where :func:`mhc_fused_post_pre_delayed` runs: gfx942, hc_mult 4,
+    hidden_size 5120. Elsewhere the op raises NotImplementedError; callers check
+    this first and keep their own path otherwise."""
+    if arch is None:
+        arch = get_gfx_runtime()
+    return (
+        arch == "gfx942"
+        and hc_mult == MHC_SEAM_HC_MULT
+        and hidden_size == MHC_SEAM_HIDDEN_SIZE
+    )
+
+
+_MHC_IDENTITY_PRE: dict = {}
+
+
+def _mhc_identity_pre(m: int, hc_mult: int, device) -> torch.Tensor:
+    """(m, hc_mult) fp32 rows [1, 0, ..., 0]: the identity pre gate. Built once per device
+    for up to MHC_SEAM_MAX_T_PER_LAUNCH rows and sliced, so the identity costs no kernels;
+    built per call while a CUDA graph is being captured (the cached buffer must not be
+    initialised inside a graph)."""
+    key = (str(device), hc_mult)
+    buf = _MHC_IDENTITY_PRE.get(key)
+    if buf is None or buf.shape[0] < m:
+        capturing = torch.cuda.is_current_stream_capturing()
+        n = m if capturing else max(m, MHC_SEAM_MAX_T_PER_LAUNCH)
+        buf = torch.zeros(n, hc_mult, dtype=dtypes.fp32, device=device)
+        buf[:, 0] = 1.0
+        if capturing:
+            return buf
+        _MHC_IDENTITY_PRE[key] = buf
+    return buf[:m]
+
+
+def mhc_fused_post_pre_delayed_fake(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    pre_mix: Optional[torch.Tensor],  # noqa: UP045
+    sublayer_out: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    m, hc_mult, hidden_size = residual.shape
+    device = residual.device
+    return (
+        torch.empty_like(residual),
+        torch.empty(m, hc_mult, 1, dtype=dtypes.fp32, device=device),
+        torch.empty(m, hc_mult, hc_mult, dtype=dtypes.fp32, device=device),
+        torch.empty(m, hidden_size, dtype=dtypes.bf16, device=device),
+        torch.empty(m, hc_mult, dtype=dtypes.fp32, device=device),
+    )
+
+
+@torch_compile_guard(mutates_args=[], gen_fake=mhc_fused_post_pre_delayed_fake)
+def mhc_fused_post_pre_delayed(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    pre_mix: Optional[torch.Tensor],  # noqa: UP045
+    sublayer_out: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Delayed mHC seam: post-mix, collapse with the carried pre gate, next gates.
+
+    Same arguments and results as ``mhc_fused_post_pre_delayed_rmsnorm`` without the
+    RMSNorm, with the post block always applied:
+
+        residual_out[t, j] = sum_i comb_res_mix[t, i, j] residual[t, i]
+                             + post_layer_mix[t, j] sublayer_out[t]
+        layer_input[t]     = sum_j pre_mix[t, j] residual_out[t, j]
+        post_mix, comb_mix, next_pre_mix = the gates of residual_out (as ``mhc_pre``)
+
+    residual_out reproduces ``mhc_post`` bit for bit (its fp32 order and bf16
+    truncation); layer_input is the fp32 sum over streams 0..3 rounded to nearest even.
+
+    Runs the ASM kernels of hsa/gfx942/mhc_seam in two launches: one kernel for the
+    post, the collapse and the split-K partials of the pre GEMM (below
+    MHC_SEAM_SMALL_MAX_T tokens one short wave per 128-column slice and token, from it a
+    persistent kernel over 512-column chunks), then the gates from the partials.
+
+    Supported only on gfx942 with 4 residual streams and hidden_size 5120
+    (DeepSeek-V4.1-Flash); anything else raises NotImplementedError. Check with
+    ``mhc_fused_post_pre_delayed_asm_supported(hidden_size, hc_mult)`` first. Other
+    configurations: ``mhc_fused_post_pre_delayed_rmsnorm`` (Triton, folds the RMSNorm)
+    or ``mhc_post`` + ``mhc_pre``.
+
+    Args:
+        residual: (T, 4, H) bf16 residual streams entering the seam.
+        fn: (24, 4 * H) fp32 gate projection; hc_scale (3,), hc_base (24,) fp32.
+        rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat:
+            the model's hc constants.
+        pre_mix: (T, 4) fp32 pre gate carried from the previous seam; None means the
+            identity gate (the collapse is stream 0).
+        sublayer_out: (T, H) bf16 output of the previous sub-layer.
+        post_layer_mix / comb_res_mix: (T, 4[, 1]) / (T, 4, 4) fp32 gates of the
+            previous seam.
+
+    Returns:
+        (residual_out (T, 4, H) bf16, post_mix (T, 4, 1), comb_mix (T, 4, 4),
+         layer_input (T, H) bf16, next_pre_mix (T, 4)); the gates are fp32.
+    """
+    assert residual.dim() == 3 and residual.dtype == dtypes.bf16
+    m, hc_mult, hidden_size = residual.shape
+    arch = get_gfx_runtime()
+    if not mhc_fused_post_pre_delayed_asm_supported(hidden_size, hc_mult, arch):
+        raise NotImplementedError(
+            "mhc_fused_post_pre_delayed runs on gfx942 with 4 residual streams and "
+            f"hidden size {MHC_SEAM_HIDDEN_SIZE}; got {arch}, {hc_mult} streams, hidden "
+            f"size {hidden_size}. Check with mhc_fused_post_pre_delayed_asm_supported() "
+            "first. Other configurations: mhc_fused_post_pre_delayed_rmsnorm (Triton, "
+            "folds the RMSNorm) or mhc_post + mhc_pre."
+        )
+    hc_mult3 = 2 * hc_mult + hc_mult * hc_mult
+    hc_hidden_size = hc_mult * hidden_size
+    assert fn.shape == (hc_mult3, hc_hidden_size) and fn.dtype == dtypes.fp32
+    assert hc_scale.shape == (3,) and hc_base.shape == (hc_mult3,)
+    assert hc_scale.dtype == hc_base.dtype == dtypes.fp32
+    assert sublayer_out.shape == (m, hidden_size) and sublayer_out.dtype == dtypes.bf16
+    device = residual.device
+    residual = residual.contiguous()
+    sublayer_out = sublayer_out.contiguous()
+    fn = fn.contiguous()
+    hc_scale = hc_scale.contiguous()
+    hc_base = hc_base.contiguous()
+    post_2d = post_layer_mix.reshape(m, hc_mult).to(dtypes.fp32).contiguous()
+    comb_3d = comb_res_mix.reshape(m, hc_mult, hc_mult).to(dtypes.fp32).contiguous()
+    if pre_mix is None:
+        pre_2d = _mhc_identity_pre(m, hc_mult, device)
+    else:
+        pre_2d = pre_mix.reshape(m, hc_mult).to(dtypes.fp32).contiguous()
+
+    residual_out = torch.empty_like(residual)
+    layer_input = torch.empty(m, hidden_size, dtype=dtypes.bf16, device=device)
+    post_mix = torch.empty(m, hc_mult, 1, dtype=dtypes.fp32, device=device)
+    comb_mix = torch.empty(m, hc_mult, hc_mult, dtype=dtypes.fp32, device=device)
+    next_pre_mix = torch.empty(m, hc_mult, dtype=dtypes.fp32, device=device)
+    gate_args = (
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        hc_hidden_size,
+    )
+
+    for t0 in range(0, m, MHC_SEAM_MAX_T_PER_LAUNCH):
+        t1 = min(m, t0 + MHC_SEAM_MAX_T_PER_LAUNCH)
+        n = t1 - t0
+        seam_in = (
+            residual[t0:t1],
+            sublayer_out[t0:t1],
+            post_2d[t0:t1],
+            comb_3d[t0:t1],
+            pre_2d[t0:t1],
+        )
+        gates_out = (post_mix[t0:t1], comb_mix[t0:t1], next_pre_mix[t0:t1])
+        # part[s, t, 0:24]: the mixes of column slice s, part[s, t, 24]: its sum of
+        # squares; slices of 128 columns (few-token kernel) or 512 (fused kernel)
+        small = n < MHC_SEAM_SMALL_MAX_T
+        sl = MHC_SEAM_SMALL_SLICE if small else MHC_SEAM_FUSED_CHUNK
+        part = torch.empty(hidden_size // sl, n, 32, dtype=dtypes.fp32, device=device)
+        seam_out = (residual_out[t0:t1], layer_input[t0:t1], part)
+        if small:
+            mhc_seam_small_asm(*seam_out, *seam_in, fn)
+        else:
+            mhc_seam_fused_asm(*seam_out, *seam_in, fn, 0, n >= MHC_SEAM_STORE_NT_MIN_T)
+        mhc_seam_gates_asm(*gates_out, part, *gate_args)
+
+    return residual_out, post_mix, comb_mix, layer_input, next_pre_mix
