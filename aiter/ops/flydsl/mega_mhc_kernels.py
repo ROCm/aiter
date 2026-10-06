@@ -40,6 +40,8 @@ MEGA_MHC_DEFAULTS = {
     "FN_EARLY": 4,  # P5: streams (of 4) of chunk 0's fn loaded ahead of the R/y prefetch
     "DIST_FINISH": False,  # D2: every split rescales its own x1 columns (bf16, KS > 1)
     "DIST_SPIN": 1024,  # D2: polls a waiting split spins before it hands its columns off
+    "LATE_DESC": False,  # D3: build late-use descriptors after the first loads are issued
+    "SHUFFLE_DPP": 0,  # D3b: lane xor exchange by DPP: 1 = Sinkhorn gates, 2 = also main pass
 }
 
 _TOKENS_CFG = {
@@ -65,6 +67,10 @@ _QUANT_SPLIT_FP8 = (10, 0.95)
 # round trip costs more than the one-to-three-token rescale it replaces (+0.2-0.3 us), from
 # T = 4 it wins (-6%, growing to -30% at T = 16..128).
 _DIST_MIN_T = 4
+
+# D3 LATE_DESC (sweep/d3_hoist_loads.md): it pays only from nine token blocks up (T > 128) and
+# up to ~24 blocks (T <= 384); below and above it measures <= 1%.
+_LATE_DESC_T = (128, 384)
 
 
 def get_mega_mhc_config(
@@ -129,6 +135,21 @@ def get_mega_mhc_config(
       measured 2-4% faster than 16-token/4-warp at T = 16384..32768 (P1 sweep,
       ``sweep/p1_triton_geometry.md``).
 
+    * Policy configs set ``SHUFFLE_DPP = 1`` (D3b, ``sweep/d3_hoist_loads.md``): the Sinkhorn
+      gates exchange values between the lanes of a 16-lane row with DPP (``v_mov_b32_dpp``)
+      instead of ``shuffle_xor`` (``ds_swizzle_b32`` + ``s_waitcnt lgkmcnt(0)``, ~40% of the
+      finisher wave). It permutes the same values in the same order, so every output is
+      bit-identical. Decode, bf16 and FP8: -13..-17% at T = 1..192, -10% at T = 256..384, -7%
+      at T = 400 (eager and CUDA-graph replay); T = 2048 and the P4 split-K shapes: -2..-4%;
+      FP8 KS = 1 -1%; bf16 token kernel (T >= 16384) -1%. Off for the bf16 column kernel with
+      ``NUM_KSPLIT == 1`` (the unsplit sizes above T = 2048): it is +0.8..1.2% slower there.
+    * Decode split-K with 129 <= T <= 384 (bf16; FP8 only with 20 splits) sets ``LATE_DESC``
+      (D3, ``sweep/d3_hoist_loads.md``): the descriptors of the late-use pointers (R' / x1 /
+      output stores, finish scratch) are built after the first loads are in flight, so no
+      scalar-load round trip sits in front of the first ``buffer_load``. bf16 T = 144..384:
+      -2..-4%; FP8 T = 144..192: -9% (eager and graph). Neutral (<= 1%) at T <= 128 and at
+      T >= 400 and 3-5% slower for FP8 at 10 splits (T = 208..256), so it is off there.
+
     ``NT_STREAMS`` stays off at every size (D1, ``sweep/d1_nt_streams_decode.md``):
     paired off/on timing finds no (dtype, T) range where it wins by >= 2% in both
     the eager kernel time and the CUDA-graph per-launch time. Decode (T <= 192) is
@@ -139,7 +160,7 @@ def get_mega_mhc_config(
 
     if arch not in _GFX:
         raise RuntimeError(f"[flydsl_mega_mhc] unsupported arch {arch}")
-    cfg = dict(MEGA_MHC_DEFAULTS)
+    cfg = dict(MEGA_MHC_DEFAULTS, SHUFFLE_DPP=1)
     tok_round = 64 * cu_num
     tok_fill = T / (-(-T // tok_round) * tok_round)  # fill of the last WG wave
     if T >= tok_round and (out_fp8 or tok_fill >= 0.95):
@@ -171,6 +192,7 @@ def get_mega_mhc_config(
     rounds = -(-nblk // cu_num)
     fill = nblk / (rounds * cu_num)  # how full the last round of WGs is at KS = 1
     persist = False
+    decode_split = ks > 1  # the fill-the-GPU split (not the P4 wave-quantization one)
     if ks == 1:
         want, fill_max = _QUANT_SPLIT_FP8 if out_fp8 else _QUANT_SPLIT_BF16
         # below ~0.6 * CUs blocks one round is latency-bound: a split does not pay
@@ -195,12 +217,24 @@ def get_mega_mhc_config(
         cfg["FN_EARLY"] = 1  # P5: -4..-5% at T = 2544, 3904..4096
     if not out_fp8 and ks > 1 and T >= _DIST_MIN_T:
         cfg = _with_dist_finish(T, H, cfg, cu_num)
+    if not out_fp8 and ks == 1:
+        cfg["SHUFFLE_DPP"] = (
+            0  # D3b: bf16 column kernel with the x1 stage: +0.8..1.2% with DPP
+        )
+    if (
+        decode_split
+        and _LATE_DESC_T[0] < T <= _LATE_DESC_T[1]
+        and (not out_fp8 or ks == _MAX_SPLIT)
+    ):
+        cfg["LATE_DESC"] = True  # D3: scalar-load round trip off the critical path
     try:
         check_config(H, cfg)
     except ValueError:
         if T < tok_round or out_fp8:
             raise
-        cfg = dict(MEGA_MHC_DEFAULTS, **_TOKENS_CFG)  # H too narrow for 8 col warps
+        cfg = dict(
+            MEGA_MHC_DEFAULTS, SHUFFLE_DPP=1, **_TOKENS_CFG
+        )  # H too narrow for 8 col warps
         check_config(H, cfg)
     return cfg
 

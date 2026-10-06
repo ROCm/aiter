@@ -86,6 +86,19 @@ out-of-range loads, and the tile rides through the block's reduce and finish as 
 loop-carried value. Net effect measured in ``sweep/p4_persistent_overlap.md``: FP8
 -2.3..-3.1% at two or three full rounds, bf16 (with the x1 LDS stage) 0.4-3.6% slower
 because the carried tile pushes the kernel to 253-256 VGPRs.
+
+Entry chain (D3, ``sweep/d3_hoist_loads.md``). The kernel's first loads are all independent,
+so the only serial latency in front of them is scalar: the early-exit test needs ``n_tok`` and
+``n_blk`` and every buffer descriptor needs its pointer. ``n_tok`` / ``n_blk`` sit right after
+``fn`` in the argument list so they are inside the hardware-preloaded kernarg dwords (no
+``s_load`` before the early-exit branch). ``LATE_DESC`` additionally builds the descriptors of
+the pointers that are not preloaded and are used late (R' / x1 / output stores, gate outputs,
+finish scratch) after the first loads are issued, so no scalar wait sits in front of them.
+
+``SHUFFLE_DPP`` (D3b): 1 = the Sinkhorn gates exchange values between the lanes of a 16-lane
+row by DPP instead of ``shuffle_xor`` (``ds_swizzle_b32`` + ``s_waitcnt lgkmcnt(0)``, the
+long pole of the finisher wave); 2 = also the main-pass reductions (FP8 amax, row sums).
+The same values are combined in the same order, so outputs are bit-identical.
 """
 
 import functools
@@ -99,6 +112,7 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels import buffer_ops as bops
+from aiter.ops.flydsl.kernels.dpp_utils import dpp_xor_f32
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
@@ -131,6 +145,10 @@ DIST_MASK = 3
 DIST_RSTD = 16
 DIST_SPIN = 1024  # default polls (~1 us each) a split waits before it hands off
 DIST_MAX_KS = 24  # hand-off bits in the low 24 bits of the mask word
+
+
+class _NS:
+    """attribute bag for values the kernel builds late"""
 
 
 def _put(t, idx, val):
@@ -257,6 +275,10 @@ def check_config(H: int, cfg: dict, out_fp8: bool = False) -> None:
         raise ValueError(f"FN_EARLY must be in 0..{N_STREAMS}")
     if cfg.get("FN_EARLY", N_STREAMS) != N_STREAMS and ws == "tokens" and w > 1:
         raise ValueError("FN_EARLY does not apply to the LDS-shared fn path")
+    if cfg.get("SHUFFLE_DPP", 0) not in (0, 1, 2):
+        raise ValueError("SHUFFLE_DPP must be 0 (off), 1 (finish gates) or 2 (all)")
+    if cfg.get("LATE_DESC") and cfg.get("PERSIST_WGS", 0):
+        raise ValueError("LATE_DESC does not combine with PERSIST_WGS")
     if cfg.get("DIST_FINISH"):
         if out_fp8:
             raise ValueError("DIST_FINISH is a bf16 finish (FP8 only rescales scales)")
@@ -349,6 +371,8 @@ def kernel_name(cfg: dict, has_post: bool, identity_pre: bool, out_fp8: bool) ->
             if cfg.get("FN_EARLY", N_STREAMS) != N_STREAMS
             else ""
         )
+        + ("_late" if cfg.get("LATE_DESC") else "")
+        + (f"_dpp{cfg['SHUFFLE_DPP']}" if cfg.get("SHUFFLE_DPP") else "")
         + (
             f"_pw{cfg['PERSIST_WGS']}{'p' if cfg.get('PERSIST_PREFETCH', True) else ''}"
             if cfg.get("PERSIST_WGS")
@@ -393,6 +417,8 @@ def compile_mega_mhc(
     FN_EARLY: int = N_STREAMS,
     DIST_FINISH: bool = False,
     DIST_SPIN: int = DIST_SPIN,
+    LATE_DESC: bool = False,
+    SHUFFLE_DPP: int = 0,
 ):
     """Compile the Mega-mHC kernel for one knob set; returns the ``@flyc.jit`` launcher."""
     cfg = {
@@ -412,6 +438,8 @@ def compile_mega_mhc(
         "FN_EARLY": FN_EARLY,
         "DIST_FINISH": DIST_FINISH,
         "DIST_SPIN": DIST_SPIN,
+        "LATE_DESC": LATE_DESC,
+        "SHUFFLE_DPP": SHUFFLE_DPP,
     }
     check_config(H, cfg, OUT_FP8)
     assert H % FP8_GROUP == 0 and SINKHORN_ITERS >= 1
@@ -511,6 +539,18 @@ def compile_mega_mhc(
     def sigmoid(x):
         return F32(1.0) / (F32(1.0) + exp(F32(0.0) - x))
 
+    def xor_gates(x, off):
+        """lane xor inside a 16-lane row: the Sinkhorn gates (SHUFFLE_DPP >= 1)"""
+        if SHUFFLE_DPP >= 1:
+            return dpp_xor_f32(x, off)
+        return x.shuffle_xor(off, WAVE)
+
+    def xor_main(x, off):
+        """lane xor in the main pass (fp8 amax, partial sums; SHUFFLE_DPP == 2)"""
+        if SHUFFLE_DPP >= 2:
+            return dpp_xor_f32(x, off)
+        return x.shuffle_xor(off, WAVE)
+
     def div(x, y):
         if fx.const_expr(SINKHORN_RCP):
             return x * rcp(y)
@@ -524,6 +564,8 @@ def compile_mega_mhc(
         comb_mix: fx.Pointer,  # (T, 4, 4) fp32 [h][j]      [HAS_POST]
         pre_mix: fx.Pointer,  # (T, 4) fp32                [not IDENTITY_PRE]
         fn: fx.Pointer,  # (2, 24, 4H) bf16 hi/lo, or (24, 4H) fp32
+        n_tok: fx.Int32,  # n_tok, n_blk sit inside the 14 preloaded kernarg dwords
+        n_blk: fx.Int32,
         hc_scale: fx.Pointer,  # (3,) fp32
         hc_base: fx.Pointer,  # (24,) fp32
         norm_w: fx.Pointer,  # (H,) bf16
@@ -535,8 +577,6 @@ def compile_mega_mhc(
         pre_out: fx.Pointer,  # (T, 4) fp32
         partials: fx.Pointer,  # (T, KS, 32) fp32            [KS > 1]
         counters: fx.Pointer,  # (nblk * 32,) int32         [KS > 1]
-        n_tok: fx.Int32,
-        n_blk: fx.Int32,
         rms_eps: fx.Float32,
         hc_pre_eps: fx.Float32,
         hc_sinkhorn_eps: fx.Float32,
@@ -565,26 +605,42 @@ def compile_mega_mhc(
         post_t = ptr_buf_tensor(post_mix, F32, num_records_bytes=nt64 * 16)
         comb_t = ptr_buf_tensor(comb_mix, F32, num_records_bytes=nt64 * 64)
         pre_t = ptr_buf_tensor(pre_mix, F32, num_records_bytes=nt64 * 16)
-        scale_t = ptr_buf_tensor(hc_scale, F32, num_records_bytes=12)
-        base_t = ptr_buf_tensor(hc_base, F32, num_records_bytes=N_MIX * 4)
-        w_t = ptr_buf_tensor(norm_w, I32, unit_elems=4, num_records_bytes=H * 2)
-        if fx.const_expr(OUT_FP8):
-            osc_t = ptr_buf_tensor(out_scale, F32, num_records_bytes=nt64 * (NG * 4))
-        else:
-            out_t = ptr_buf_tensor(
-                out, I32, unit_elems=4, num_records_bytes=nt64 * (H * 2)
+        # Descriptors of the late-use pointers (finish, R' stores, gate outputs). Their
+        # pointers are beyond the preloaded kernargs, so building them costs a scalar
+        # load round trip: with LATE_DESC the kernel builds them after the first loads
+        # are in flight (``make_late`` in ``body``), else here.
+        LT = _NS()
+
+        def make_late():
+            LT.scale_t = ptr_buf_tensor(hc_scale, F32, num_records_bytes=12)
+            LT.base_t = ptr_buf_tensor(hc_base, F32, num_records_bytes=N_MIX * 4)
+            LT.w_t = ptr_buf_tensor(norm_w, I32, unit_elems=4, num_records_bytes=H * 2)
+            if fx.const_expr(OUT_FP8):
+                LT.osc_t = ptr_buf_tensor(
+                    out_scale, F32, num_records_bytes=nt64 * (NG * 4)
+                )
+            else:
+                LT.out_t = ptr_buf_tensor(
+                    out, I32, unit_elems=4, num_records_bytes=nt64 * (H * 2)
+                )
+            LT.posto_t = ptr_buf_tensor(post_out, F32, num_records_bytes=nt64 * 16)
+            LT.combo_t = ptr_buf_tensor(comb_out, F32, num_records_bytes=nt64 * 64)
+            LT.preo_t = ptr_buf_tensor(pre_out, F32, num_records_bytes=nt64 * 16)
+            LT.part_t = ptr_buf_tensor(
+                partials, F32, num_records_bytes=nt64 * (KS * PSLOT * 4)
             )
-        posto_t = ptr_buf_tensor(post_out, F32, num_records_bytes=nt64 * 16)
-        combo_t = ptr_buf_tensor(comb_out, F32, num_records_bytes=nt64 * 64)
-        preo_t = ptr_buf_tensor(pre_out, F32, num_records_bytes=nt64 * 16)
-        part_t = ptr_buf_tensor(
-            partials, F32, num_records_bytes=nt64 * (KS * PSLOT * 4)
-        )
-        part4_t = ptr_buf_tensor(
-            partials, F32, unit_elems=4, num_records_bytes=nt64 * (KS * PSLOT * 4)
-        )
-        cnt_t = ptr_buf_tensor(counters, I32, num_records_bytes=fx.Int64(n_blk) * 128)
-        rstdg_t = ptr_buf_tensor(counters, F32, num_records_bytes=fx.Int64(n_blk) * 128)
+            LT.part4_t = ptr_buf_tensor(
+                partials, F32, unit_elems=4, num_records_bytes=nt64 * (KS * PSLOT * 4)
+            )
+            LT.cnt_t = ptr_buf_tensor(
+                counters, I32, num_records_bytes=fx.Int64(n_blk) * 128
+            )
+            LT.rstdg_t = ptr_buf_tensor(
+                counters, F32, num_records_bytes=fx.Int64(n_blk) * 128
+            )
+
+        if fx.const_expr(not LATE_DESC):
+            make_late()
 
         def make_views():
             alloc = fx.SharedAllocator()
@@ -635,16 +691,38 @@ def compile_mega_mhc(
                     buf_base_i64(ptr).ir_value(), num_records_bytes=nbytes
                 )
 
+            RS = _NS()  # descriptors past the preloaded kernargs (see LATE_DESC)
+
+            def make_rs_out():
+                RS.rout = rs_rows(residual_out, K4 * 2)
+
+            def make_rs_x1():
+                if fx.const_expr(OUT_FP8):
+                    RS.q = rs_rows(out, H)
+                    RS.sc = rs_rows(out_scale, NG * 4)
+                else:
+                    RS.x1 = rs_rows(out, H * 2)
+
+            def make_rs_w():
+                RS.w = rs_flat(norm_w, H * 2)
+
             rs_res = rs_rows(residual, K4 * 2)
-            rs_rout = rs_rows(residual_out, K4 * 2)
+            if fx.const_expr(not LATE_DESC):
+                make_rs_out()
             rs_y = rs_rows(sublayer, H * 2)
-            if fx.const_expr(OUT_FP8):
-                rs_q = rs_rows(out, H)
-                rs_sc = rs_rows(out_scale, NG * 4)
-            else:
-                rs_x1 = rs_rows(out, H * 2)
+            if fx.const_expr(not LATE_DESC):
+                make_rs_x1()
             rs_fn = rs_flat(fn, fn_units * 16 if FN_PREPACKED else fn32_units * 16)
-            rs_w = rs_flat(norm_w, H * 2)
+            if fx.const_expr(not LATE_DESC):
+                make_rs_w()
+
+            def make_late_all():
+                """LATE_DESC: build every late descriptor once the first loads are in
+                flight (their pointers are not preloaded: a scalar load round trip)"""
+                make_rs_out()
+                make_rs_x1()
+                make_rs_w()
+                make_late()
 
             # The streams (R, y, R', x1, fp8 out) use the elementwise layout: 4
             # consecutive lanes cover 64 contiguous bytes of one token row, so a
@@ -788,7 +866,7 @@ def compile_mega_mhc(
                 if fx.const_expr(X1L < NQ):
                     _st(
                         unit,
-                        rs_x1,
+                        RS.x1,
                         in_l.select(OOB, v_y),
                         (cb + mt * 16 * H) * 2,
                         0,
@@ -817,7 +895,7 @@ def compile_mega_mhc(
                 for c in range_constexpr(NC):
                     cb = chunk_col(iv, c)
                     if fx.const_expr(OUT_FP8):
-                        wv = bf16x8(_ld(rs_w, v_w, cb * 2, 4, 0)).to(F32)
+                        wv = bf16x8(_ld(RS.w, v_w, cb * 2, 4, 0)).to(F32)
                     for mt in range_constexpr(MT):
                         g = gates[mt]
                         base = (mt * NC + c) * PER_C
@@ -881,8 +959,8 @@ def compile_mega_mhc(
                             amax = F32(0.0)
                             for e in range_constexpr(8):
                                 amax = fx.maximumf(amax, fx.absf(v[e]))
-                            amax = fx.maximumf(amax, amax.shuffle_xor(1, WAVE))
-                            amax = fx.maximumf(amax, amax.shuffle_xor(2, WAVE))
+                            amax = fx.maximumf(amax, xor_main(amax, 1))
+                            amax = fx.maximumf(amax, xor_main(amax, 2))
                             zero = amax == F32(0.0)
                             scale = zero.select(F32(1.0), amax * F32(1.0 / FP8_MAX))
                             inv = zero.select(F32(0.0), F32(FP8_MAX) * rcp(amax))
@@ -917,7 +995,7 @@ def compile_mega_mhc(
                             for c in range_constexpr(NC):
                                 _st(
                                     st_r[(mt, jj)][c],
-                                    rs_rout,
+                                    RS.rout,
                                     v_r,
                                     (cb0 + c * 32) * 2 + (mt * 16 * K4 + jj * H) * 2,
                                     cm_stream,
@@ -926,10 +1004,10 @@ def compile_mega_mhc(
                         cb = cb0 + c * 32
                         if fx.const_expr(OUT_FP8):
                             qv, scale = st_x[mt][c]
-                            _st(qv, rs_q, v_q, cb + mt * 16 * H, 0)
+                            _st(qv, RS.q, v_q, cb + mt * 16 * H, 0)
                             _st(
                                 scale,
-                                rs_sc,
+                                RS.sc,
                                 v_sc,
                                 (cb // FP8_GROUP) * 4 + mt * 16 * NG * 4,
                                 0,
@@ -940,7 +1018,7 @@ def compile_mega_mhc(
                             else:
                                 _st(
                                     st_x[mt][c],
-                                    rs_x1,
+                                    RS.x1,
                                     v_y,
                                     (cb + mt * 16 * H) * 2,
                                     0,
@@ -978,6 +1056,16 @@ def compile_mega_mhc(
                 tiles0 = [Vec(t) for t in pre_tiles]
             else:
                 tiles0 = load_tile(I32(0), never_oob)
+            # LATE_DESC: with one k-step per warp (decode) the fn operands of that
+            # step are issued here too, so gates, R/y and the whole fn slice are in
+            # flight before any descriptor needs a scalar-loaded pointer
+            pre_fns = None
+            if fx.const_expr(LATE_DESC):
+                if fx.const_expr(NK == 1 and not FN_LDS):
+                    pre_fns = []
+                    for s_e in range_constexpr(FN_EARLY):
+                        pre_fns += load_fn(I32(0), 0, s_e, never_oob)
+                make_late_all()
             if fx.const_expr(pro):
                 ret = [Vec(t) for t in tiles0]
             else:
@@ -1054,9 +1142,12 @@ def compile_mega_mhc(
                         fn_to_lds(g, 1 - buf)
                         gpu.barrier()
                     else:
-                        fns = []
-                        for s in range_constexpr(FN_EARLY):
-                            fns += load_fn(k, 0, s, never_oob)
+                        if fx.const_expr(pre_fns is not None):
+                            fns = pre_fns
+                        else:
+                            fns = []
+                            for s in range_constexpr(FN_EARLY):
+                                fns += load_fn(k, 0, s, never_oob)
                         nxt = load_tile(k + 1, k + 1 == I32(NK))
                         acc, sqr, sqx = step(k, cur, fns, acc, sqr, sqx)
                     return nxt, acc, sqr, sqx
@@ -1088,8 +1179,8 @@ def compile_mega_mhc(
                     s_r = sqr[mt]
                     s_x = sqx[mt]
                     for off in (1, 2):
-                        s_r = s_r + s_r.shuffle_xor(off, WAVE)
-                        s_x = s_x + s_x.shuffle_xor(off, WAVE)
+                        s_r = s_r + xor_main(s_r, off)
+                        s_x = s_x + xor_main(s_x, off)
                     tl_base = tok_w - tok0 + mt * 16
                     for nt in range_constexpr(2):
                         n = nt * 16 + row
@@ -1098,9 +1189,7 @@ def compile_mega_mhc(
                             v = acc[mt * 2 + nt][i]
                             if fx.const_expr(nt == 1):
                                 # rows 16..23: hi part in columns 0..7 + lo part in 8..15
-                                v = (row < 8).select(
-                                    v + v.shuffle_xor(8, WAVE), F32(0.0)
-                                )
+                                v = (row < 8).select(v + xor_main(v, 8), F32(0.0))
                                 src = (
                                     kg * 4 + i
                                 ) * 4  # token t's sums sit on lanes 4t..4t+3
@@ -1124,42 +1213,44 @@ def compile_mega_mhc(
                         s_r = fin[fb + N_MIX]
                         s_x = fin[fb + N_MIX + 1]
                         rstd = fx.rsqrt(s_r * F32(1.0 / K4) + rms_eps)
-                        sc = scale_t[(e < 8).select(e // 4, I32(0))]
+                        sc = LT.scale_t[(e < 8).select(e // 4, I32(0))]
                         gate = sigmoid(
-                            m_e * rstd * sc + base_t[(e < 8).select(e, I32(0))]
+                            m_e * rstd * sc + LT.base_t[(e < 8).select(e, I32(0))]
                         )
                         is_pre = e < 4
                         is_post = (e >= 4) & (e < 8)
                         n4 = n_tok * 4
-                        _put(preo_t, is_pre.select(tok * 4 + e, n4), gate + hc_pre_eps)
                         _put(
-                            posto_t,
+                            LT.preo_t, is_pre.select(tok * 4 + e, n4), gate + hc_pre_eps
+                        )
+                        _put(
+                            LT.posto_t,
                             is_post.select(tok * 4 + e - 4, n4),
                             gate * hc_post_mult,
                         )
-                        a = m_c * rstd * scale_t[2] + base_t[8 + e]
+                        a = m_c * rstd * LT.scale_t[2] + LT.base_t[8 + e]
                         mx = a
                         for off in (1, 2):
-                            mx = fx.maximumf(mx, mx.shuffle_xor(off, WAVE))
+                            mx = fx.maximumf(mx, xor_gates(mx, off))
                         P = exp(a - mx)
                         rs = P
                         for off in (1, 2):
-                            rs = rs + rs.shuffle_xor(off, WAVE)
+                            rs = rs + xor_gates(rs, off)
                         P = div(P, rs) + hc_sinkhorn_eps
                         cs = P
                         for off in (4, 8):
-                            cs = cs + cs.shuffle_xor(off, WAVE)
+                            cs = cs + xor_gates(cs, off)
                         P = div(P, cs + hc_sinkhorn_eps)
                         for _ in range_constexpr(SINKHORN_ITERS - 1):
                             rs = P
                             for off in (1, 2):
-                                rs = rs + rs.shuffle_xor(off, WAVE)
+                                rs = rs + xor_gates(rs, off)
                             P = div(P, rs + hc_sinkhorn_eps)
                             cs = P
                             for off in (4, 8):
-                                cs = cs + cs.shuffle_xor(off, WAVE)
+                                cs = cs + xor_gates(cs, off)
                             P = div(P, cs + hc_sinkhorn_eps)
-                        _put(combo_t, tok * 16 + e, P)
+                        _put(LT.combo_t, tok * 16 + e, P)
                         if fx.const_expr(with_rstd):
                             _put(rstdn, tl, fx.rsqrt(s_x * F32(1.0 / H) + norm_eps))
 
@@ -1183,7 +1274,7 @@ def compile_mega_mhc(
                                 )
                             )
                         )
-                        wv.append(buf_copy_load(w_t, c8_0 + q * 4, I32, 4))
+                        wv.append(buf_copy_load(LT.w_t, c8_0 + q * 4, I32, 4))
                     return xs, wv
 
                 def stage_x1_out(xs):
@@ -1191,7 +1282,7 @@ def compile_mega_mhc(
                     c8_0 = col_w // 8 + ekg
                     for q in range_constexpr(X1L):
                         buf_copy_store(
-                            out_t,
+                            LT.out_t,
                             (tok0 + erow) * H8 + c8_0 + q * 4,
                             xs[q],
                             I32,
@@ -1203,7 +1294,7 @@ def compile_mega_mhc(
                     for q in range_constexpr(X1L):
                         r_o = (bf16x8(xs[q]).to(F32) * rs_e) * bf16x8(wv[q]).to(F32)
                         buf_copy_store(
-                            out_t,
+                            LT.out_t,
                             (tok0 + erow) * H8 + c8_0 + q * 4,
                             as_i32x4(r_o.to(BF16)),
                             I32,
@@ -1232,12 +1323,12 @@ def compile_mega_mhc(
                     return tl_g, c8, r_live.select((tok0 + tl_g) * H8 + c8, n_tok * H8)
 
                 def hbm_ld(idx):
-                    return buf_copy_load(out_t, idx, I32, 4, cache_modifier=cm_fin)
+                    return buf_copy_load(LT.out_t, idx, I32, 4, cache_modifier=cm_fin)
 
                 def hbm_st(tl_g, c8, idx, xv):
-                    r_wv = bf16x8(buf_copy_load(w_t, c8, I32, 4)).to(F32)
+                    r_wv = bf16x8(buf_copy_load(LT.w_t, c8, I32, 4)).to(F32)
                     r_o = (bf16x8(xv).to(F32) * rstdn[tl_g]) * r_wv
-                    buf_copy_store(out_t, idx, as_i32x4(r_o.to(BF16)), I32, 4)
+                    buf_copy_store(LT.out_t, idx, as_i32x4(r_o.to(BF16)), I32, 4)
 
                 def rescale_x1_hbm(rtid, NTHR):
                     n_u = rows_valid * RT
@@ -1287,11 +1378,15 @@ def compile_mega_mhc(
                                 )
                                 r_sv.append(
                                     buf_copy_load(
-                                        osc_t, r_idx[g], F32, 1, cache_modifier=cm_fin
+                                        LT.osc_t,
+                                        r_idx[g],
+                                        F32,
+                                        1,
+                                        cache_modifier=cm_fin,
                                     )
                                 )
                             for g in range_constexpr(RS_G):
-                                _put(osc_t, r_idx[g], r_sv[g] * rstdn[r_tl[g]])
+                                _put(LT.osc_t, r_idx[g], r_sv[g] * rstdn[r_tl[g]])
                     else:
                         if fx.const_expr(X1L > 0):
                             rescale_x1_split(rtid, NTHR)
@@ -1338,7 +1433,7 @@ def compile_mega_mhc(
                         for s in range_constexpr(1, K_WARPS):
                             v = v + red[s * BM * PSLOT + e]
                         tl = e // PSLOT
-                        _put(part_t, ((tok0 + tl) * KS + ks) * PSLOT + e % PSLOT, v)
+                        _put(LT.part_t, ((tok0 + tl) * KS + ks) * PSLOT + e % PSLOT, v)
                     rocdl.s_waitcnt(vmcnt=0)
                     gpu.barrier()
 
@@ -1373,7 +1468,7 @@ def compile_mega_mhc(
                                 uidx = ((tok0 + tl) * KS + kk) * (PSLOT // 4) + q4
                                 uidx = live.select(uidx, n_tok * (KS * PSLOT // 4))
                                 acc4 = acc4 + buf_copy_load(
-                                    part4_t, uidx, F32, 4, cache_modifier=cm_fin
+                                    LT.part4_t, uidx, F32, 4, cache_modifier=cm_fin
                                 )
                             for i in range_constexpr(4):
                                 _put(red, (g_id * UNITS + u) * 4 + i, acc4[i])
@@ -1410,7 +1505,9 @@ def compile_mega_mhc(
                         if wi == I32(0):
                             if lane < I32(BM):
                                 _put(
-                                    rstdg_t, blk * 32 + DIST_RSTD + lane, x1_rstd(lane)
+                                    LT.rstdg_t,
+                                    blk * 32 + DIST_RSTD + lane,
+                                    x1_rstd(lane),
                                 )
                             rocdl.s_waitcnt(vmcnt=0)
                             if lane == I32(0):
@@ -1456,11 +1553,15 @@ def compile_mega_mhc(
                                         )
                                         x_h = bf16x8(hbm_ld(idx_h)).to(F32)
                                         w_h = bf16x8(
-                                            buf_copy_load(w_t, c8_h, I32, 4)
+                                            buf_copy_load(LT.w_t, c8_h, I32, 4)
                                         ).to(F32)
                                         r_h = (x_h * x1_rstd(tl_h)) * w_h
                                         buf_copy_store(
-                                            out_t, idx_h, as_i32x4(r_h.to(BF16)), I32, 4
+                                            LT.out_t,
+                                            idx_h,
+                                            as_i32x4(r_h.to(BF16)),
+                                            I32,
+                                            4,
                                         )
                     else:
                         xs, wv = load_x1_lds()
@@ -1530,7 +1631,7 @@ def compile_mega_mhc(
                         if flag[1] != I32(3):
                             fence(fx.AtomicOrdering.Acquire)
                             r_e = buf_copy_load(
-                                rstdg_t,
+                                LT.rstdg_t,
                                 blk * 32 + DIST_RSTD + erow,
                                 F32,
                                 1,
@@ -1544,7 +1645,7 @@ def compile_mega_mhc(
                         sum_partials()
                         finish()
                         if tid == I32(0):
-                            _put(cnt_t, blk * 32, I32(0))
+                            _put(LT.cnt_t, blk * 32, I32(0))
                 if fx.const_expr(PERSIST):
                     ret = [Vec(t) for t in tiles_next]
                 else:
@@ -1605,6 +1706,8 @@ def compile_mega_mhc(
             comb_mix,
             pre_mix,
             fn,
+            n_tok,
+            n_blk,
             hc_scale,
             hc_base,
             norm_w,
@@ -1616,8 +1719,6 @@ def compile_mega_mhc(
             pre_out,
             partials,
             counters,
-            n_tok,
-            n_blk,
             rms_eps,
             hc_pre_eps,
             hc_sinkhorn_eps,

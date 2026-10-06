@@ -11,6 +11,8 @@ Four tables:
   test_mega_mhc_streams  two seams on two streams at once (per-stream scratch).
   test_mega_mhc_dist     DIST_FINISH (D2) bit-exact against the classic finisher, also with
                          forced hand-off (DIST_SPIN=0) and on two streams at once.
+  test_mega_mhc_late     LATE_DESC (D3) and SHUFFLE_DPP (D3b) bit-exact against the same
+                         knob set without them, classic and distributed finisher, bf16 and FP8.
 """
 
 import argparse
@@ -466,6 +468,63 @@ def test_mega_mhc_dist(T, H, ksplit, coherence, mode):
     return ret
 
 
+@benchmark()
+def test_mega_mhc_late(T, H, ksplit, coherence, mode, out_dtype):
+    """LATE_DESC (descriptors built after the first loads) only moves instructions and
+    SHUFFLE_DPP swaps ``ds_swizzle`` lane exchanges for DPP ones (same values, same order):
+    outputs must be bit-identical to the same knob set without them, with the classic
+    finisher and (bf16, when the grid is resident) the distributed one."""
+    from aiter.ops.flydsl import flydsl_mega_mhc
+    from aiter.ops.flydsl.kernels.mega_mhc import dist_residency_error
+
+    base = {
+        "BLOCK_M": 16,
+        "WARPS_PER_WG": 8,
+        "NUM_KSPLIT": ksplit,
+        "TILE_K": 64 if H % (ksplit * 8 * 64) == 0 else 32,
+        "COHERENCE": coherence,
+    }
+    cu = torch.cuda.get_device_properties(0).multi_processor_count
+    args, kw, ref = _call_kwargs(mode, T, H)
+    ret = {"gfx": get_gfx()}
+    variants = [("classic", {})]
+    if out_dtype == "bf16" and not dist_residency_error(
+        T, dict(base, DIST_FINISH=True), cu
+    ):
+        variants.append(("dist", {"DIST_FINISH": True}))
+    for name, extra in variants:
+        plain = [
+            x.clone() if torch.is_tensor(x) else x
+            for x in flydsl_mega_mhc(
+                *args, out_dtype=out_dtype, config=dict(base, **extra), **kw
+            )
+        ]
+        if out_dtype == "fp8":  # layer_input is a (q, scale) tuple
+            plain[3] = tuple(x.clone() for x in plain[3])
+        cfg = dict(base, LATE_DESC=True, SHUFFLE_DPP=1, **extra)
+        outs = [
+            flydsl_mega_mhc(*args, out_dtype=out_dtype, config=cfg, **kw)
+            for _ in range(10)
+        ]
+        torch.cuda.synchronize()
+
+        def same(a, b):
+            if isinstance(a, tuple):
+                return all(torch.equal(x, y) for x, y in zip(a, b))
+            return torch.equal(a, b)
+
+        bad = sum(any(not same(a, b) for a, b in zip(o[1:], plain[1:])) for o in outs)
+        ret[f"{name} != plain"] = bad
+        ret[f"{name} err"] = check_outputs(
+            f"late {name} T={T}", outs[-1], ref, out_dtype, mode
+        )
+        if bad:
+            _FAILURES.append(
+                f"late {name} T={T} ks={ksplit} {coherence} {out_dtype}: {bad} bad"
+            )
+    return ret
+
+
 def _scratch_sizes(T, H, out_dtype):
     """(partial floats, counter ints) the policy's split-K scratch needs at T."""
     from aiter.ops.flydsl.kernels.mega_mhc import grid_size
@@ -696,6 +755,26 @@ def main():
     ]
     aiter.logger.info(
         "mega-mhc DIST_FINISH check (markdown):\n%s",
+        pd.DataFrame(rows).to_markdown(index=False),
+    )
+
+    late_cases = [
+        [1, 20, 0],
+        [4, 20, 0],
+        [32, 20, 0],
+        [144, 10, 0],
+        [400, 5, 0],
+        [1024, 4, 0],
+        [64, 10, 1],
+    ]
+    rows = [
+        test_mega_mhc_late(T, H, ks, "agent" if agent else "xcd", mode, d)
+        for (T, ks, agent), H, mode, d in itertools.product(
+            late_cases, args.hidden, args.mode, args.out_dtype
+        )
+    ]
+    aiter.logger.info(
+        "mega-mhc LATE_DESC/SHUFFLE_DPP check (markdown):\n%s",
         pd.DataFrame(rows).to_markdown(index=False),
     )
 
