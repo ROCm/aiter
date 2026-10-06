@@ -16,7 +16,12 @@ from aiter import dtypes
 from aiter.jit.core import is_experimental_enabled
 from aiter.jit.utils.asm_guard import require_gfx1250_asm
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
-from aiter.ops.attention import get_mla_decode_fwd_max_splits
+from aiter.ops.attention import (
+    _mla_decode_head_plan,
+    _MlaBackendId,
+    _MlaHeadPlanKind,
+    get_mla_decode_fwd_max_splits,
+)
 
 _FLYDSL_MLA_REDUCE_TARGET_GFX = ("gfx942", "gfx950")
 _FLYDSL_MLA_REDUCE_TARGET_H = 16
@@ -663,6 +668,7 @@ def mla_decode_fwd(
     cp_world_size=1,
     cp_rank=0,
     causal=True,
+    fast_mode=True,
 ):
     device = q.device
     assert logit_cap <= 0, f"{logit_cap=} is not support yet"
@@ -865,98 +871,40 @@ def mla_decode_fwd(
     else:
         if num_kv_splits is None:
             num_kv_splits = get_mla_decode_fwd_max_splits(
-                ori_nhead, max_seqlen_q, q.dtype, kv_buffer.dtype
+                ori_nhead,
+                max_seqlen_q,
+                q.dtype,
+                (
+                    dtypes.fp8
+                    if kv_buffer.dtype in (torch.int8, torch.uint8)
+                    else kv_buffer.dtype
+                ),
             )
-        use_flydsl_ps1 = (
-            os.environ.get("AITER_MLA_DECODE_PS1_FLYDSL", "0") == "1"
-            and get_gfx() == "gfx1250"
-            and page_size == 1
-            and q.dtype == dtypes.fp8
-            and kv_buffer.dtype == dtypes.fp8
-            and nhead in (16, 32, 64, 96, 128)
-            and (nhead in (16, 96) or max_seqlen_q == 1)
-            and (cp_world_size == 1 or g_kv_indptr is not None)
-            and not intra_batch_mode
-            and q_scale is not None
-            and kv_scale is not None
+        head_plan = _mla_decode_head_plan(
+            ori_nhead,
+            max_seqlen_q,
+            q.dtype,
+            kv_buffer.dtype,
+            fast_mode=fast_mode,
+            intra_batch_mode=intra_batch_mode,
+            page_size=page_size,
+            cp_world_size=cp_world_size,
+            cp_round_robin=g_kv_indptr is not None,
+            has_scales=q_scale is not None and kv_scale is not None,
         )
+        use_ps1_asm = head_plan.backend == _MlaBackendId.PS1_FP8_ASM
+        use_flydsl_ps1 = use_ps1_asm or head_plan.backend == _MlaBackendId.FLYDSL_PS1
         if use_flydsl_ps1:
             pass
-        elif (
-            nhead == 16
-            or (
-                get_gfx() == "gfx942"
-                and nhead == 128
-                and q.dtype == dtypes.fp8
-                and kv_buffer.dtype == dtypes.fp8
-            )
-            or (
-                get_gfx() == "gfx950"
-                and nhead == 128
-                and q.dtype == dtypes.fp8
-                and kv_buffer.dtype == dtypes.fp8
-                and is_experimental_enabled()
-            )
-            or (
-                get_gfx() == "gfx942"
-                and nhead in (16, 32, 64)
-                and nhead * max_seqlen_q == 128
-                and q.dtype == dtypes.fp8
-                and kv_buffer.dtype == dtypes.fp8
-                and is_experimental_enabled()
-            )
-            or (
-                get_gfx() == "gfx950"
-                and q.dtype == dtypes.fp8
-                and kv_buffer.dtype == dtypes.fp8
-                and ((nhead == 32) or (nhead == 64) or (nhead == 128))
-            )
-            or (
-                get_gfx() == "gfx950"
-                and nhead == 8
-                and q.dtype == dtypes.fp8
-                and kv_buffer.dtype == dtypes.fp8
-                and max_seqlen_q == 4
-            )
-            or (
-                get_gfx() == "gfx942"
-                and nhead == 8
-                and q.dtype == dtypes.bf16
-                and kv_buffer.dtype == dtypes.bf16
-                and max_seqlen_q == 2
-            )
-            or (
-                get_gfx() == "gfx942"
-                and nhead == 64
-                and q.dtype == dtypes.fp8
-                and kv_buffer.dtype == dtypes.fp8
-                and max_seqlen_q == 1
-            )
-            or (
-                get_gfx() == "gfx950"
-                and q.dtype == dtypes.bf16
-                and kv_buffer.dtype == dtypes.bf16
-            )
-            or (
-                get_gfx() == "gfx950"
-                and nhead == 96
-                and q.dtype == dtypes.fp8
-                and kv_buffer.dtype == dtypes.fp8
-                and max_seqlen_q <= 6
-            )
-            or (
-                get_gfx() == "gfx950"
-                and q.dtype == dtypes.fp8
-                and kv_buffer.dtype == dtypes.fp8
-                and nhead == 12
-                and nhead * max_seqlen_q <= 128
-            )
+        elif head_plan.plan in (
+            _MlaHeadPlanKind.NATIVE,
+            _MlaHeadPlanKind.ACCEPTED_NON_NATIVE,
         ):
             # Natively support cases
             pass
-        elif nhead in range(32, 128 + 1, 16) and persistent_mode:
-            fold_factor = ori_nhead // 16
-            nhead = 16
+        elif head_plan.plan == _MlaHeadPlanKind.FOLDED:
+            fold_factor = head_plan.qk_batch_ratio
+            nhead = head_plan.kernel_num_heads
             total_s = ori_total_s * fold_factor
             if max_seqlen_q == 1:
                 q = q.view(total_s, nhead, -1)
@@ -1003,21 +951,7 @@ def mla_decode_fwd(
             else None
         )
 
-        use_hk = (
-            get_gfx() in ("gfx942", "gfx950")
-            and nhead * max_seqlen_q == 128
-            and q.dtype == dtypes.fp8
-            and kv_buffer.dtype == dtypes.fp8
-            and page_size in (1, 64)
-            and is_experimental_enabled()
-        ) or (
-            get_gfx() == "gfx950"
-            and nhead * max_seqlen_q == 64
-            and q.dtype == dtypes.fp8
-            and kv_buffer.dtype == dtypes.fp8
-            and page_size in (1, 64)
-            and is_experimental_enabled()
-        )
+        use_hk = head_plan.backend == _MlaBackendId.HK
 
         # Opt-in opus merged-buffer fp8 path (gfx950). Requires a single
         # merged d=576 fp8 q/kv buffer and per-tensor scalar float q/kv scales,
@@ -1028,22 +962,8 @@ def mla_decode_fwd(
             and q_scale is not None
             and kv_scale is not None
         )
-        opus_is_bf16 = q.dtype == dtypes.bf16 and kv_buffer.dtype == dtypes.bf16
-        use_opus = (
-            os.environ.get("AITER_MLA_USE_OPUS", "0") == "1"
-            and get_gfx() == "gfx950"
-            and page_size == 1
-            and (opus_is_fp8 or opus_is_bf16)
-        )
+        use_opus = head_plan.backend == _MlaBackendId.OPUS
 
-        # Head counts with code objects exported from the FlyDSL PS1 kernel
-        # (hsa/gfx1250/mla_dsl/mla_dsl.csv) take them by default;
-        # AITER_MLA_DECODE_PS1_ASM=0 keeps them on FlyDSL JIT.
-        use_ps1_asm = (
-            use_flydsl_ps1
-            and nhead in (96, 128)
-            and os.environ.get("AITER_MLA_DECODE_PS1_ASM", "1") == "1"
-        )
         if use_ps1_asm:
             aiter.mla_ps1_fp8_asm_fwd(
                 logits.view(-1, nhead, v_head_dim),

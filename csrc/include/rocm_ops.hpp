@@ -2387,6 +2387,44 @@ namespace py = pybind11;
 
 #define MLA_METADATA_PYBIND                              \
     AITER_SET_STREAM_PYBIND;                             \
+    m.def("get_mla_decode_head_plan_v1",                 \
+          &get_mla_decode_head_plan_v1,                  \
+          "get_mla_decode_head_plan_v1",                 \
+          py::arg("num_heads_k"),                        \
+          py::arg("num_heads_per_head_k"),               \
+          py::arg("max_seqlen_qo"),                      \
+          py::arg("uni_seqlen_qo"),                      \
+          py::arg("dtype_q_nope"),                       \
+          py::arg("dtype_kv_nope"),                      \
+          py::arg("fast_mode"),                          \
+          py::arg("intra_batch_mode"),                   \
+          py::arg("arch"),                               \
+          py::arg("enable_experimental"),                \
+          py::arg("flydsl_ps1"),                         \
+          py::arg("v_head_dim"),                         \
+          py::arg("page_size"),                          \
+          py::arg("cp_world_size"),                      \
+          py::arg("cp_round_robin"),                     \
+          py::arg("has_scales"),                         \
+          py::arg("use_opus"),                           \
+          py::arg("use_ps1_asm"));                       \
+    m.def("mla_reduce_v1_supports",                      \
+          &mla_reduce_v1_supports,                       \
+          "mla_reduce_v1_supports",                      \
+          py::arg("num_heads"),                          \
+          py::arg("head_dim"));                          \
+    m.def("mla_metadata_cluster_multiplier_v1",          \
+          &mla_metadata_cluster_multiplier_v1,           \
+          "mla_metadata_cluster_multiplier_v1",          \
+          py::arg("arch"),                               \
+          py::arg("enable_experimental"),                \
+          py::arg("num_heads"),                          \
+          py::arg("max_seqlen_qo"),                      \
+          py::arg("mla_version"),                        \
+          py::arg("dtype_q_nope"),                       \
+          py::arg("dtype_q_rope"),                       \
+          py::arg("dtype_kv_nope"),                      \
+          py::arg("dtype_kv_rope"));                     \
     m.def("get_mla_metadata_v1",                         \
           &get_mla_metadata_v1,                          \
           "get_mla_metadata_v1",                         \
