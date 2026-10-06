@@ -366,7 +366,7 @@ def unified_attention(
                 q.shape[0],
                 num_query_heads,
                 NUM_SEGMENTS,
-                triton.next_power_of_2(head_size),
+                triton.next_power_of_2(head_size_v),
                 dtype=torch.float32,
                 device=q.device,
             )
@@ -564,6 +564,8 @@ def _unified_attention_2d_triton(params: _UAParams):
         BLOCK_SIZE=params.block_size,
         HEAD_SIZE=params.head_size,
         HEAD_SIZE_PADDED=triton.next_power_of_2(params.head_size),
+        HEAD_SIZE_V=params.head_size_v,
+        HEAD_SIZE_V_PADDED=triton.next_power_of_2(params.head_size_v),
         USE_ALIBI_SLOPES=params.use_alibi_slopes,
         USE_QQ_BIAS=params.use_qq_bias,
         USE_SOFTCAP=(params.softcap > 0),
@@ -639,6 +641,8 @@ def _unified_attention_3d_triton(
         BLOCK_SIZE=params.block_size,
         HEAD_SIZE=params.head_size,
         HEAD_SIZE_PADDED=triton.next_power_of_2(params.head_size),
+        HEAD_SIZE_V=params.head_size_v,
+        HEAD_SIZE_V_PADDED=triton.next_power_of_2(params.head_size_v),
         USE_ALIBI_SLOPES=params.use_alibi_slopes,
         USE_QQ_BIAS=params.use_qq_bias,
         USE_SOFTCAP=(params.softcap > 0),
@@ -673,8 +677,10 @@ def _reduce_segments_triton(
     NUM_SEGMENTS,
     TILE_SIZE,
 ):
-    head_size_padded = triton.next_power_of_2(params.head_size)
-    config = get_unified_attention_config("reduce", params, backend="triton")
+    head_size_padded = triton.next_power_of_2(params.head_size_v)
+    config = get_unified_attention_config(
+        "reduce", params._replace(head_size=params.head_size_v), backend="triton"
+    )
 
     reduce_segments[(params.num_tokens, params.num_query_heads)](
         output_ptr=params.out,
@@ -688,7 +694,7 @@ def _reduce_segments_triton(
         output_stride_0=params.out.stride(0),
         output_stride_1=params.out.stride(1),
         block_table_stride=params.block_table.stride(0),
-        HEAD_SIZE=params.head_size,
+        HEAD_SIZE=params.head_size_v,
         HEAD_SIZE_PADDED=head_size_padded,
         query_start_len_ptr=params.cu_seqlens_q,
         NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
