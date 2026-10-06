@@ -354,10 +354,17 @@ def build_qsa_k2_module(
 
         vec_layout = fx.make_layout(vec, 1)
         g_copy = buf_copy_atom(16, BFloat16)
-        # Both widths use the 16-byte buffer atom. A raw global
-        # ``8xbf16`` view lowers that atom to ``cdna3.buffer_copy`` on
-        # address space ``global``, which the legalizer rejects.
-        kv_copy = g_copy
+        # Wide K/V gathers are per-lane 64-bit addresses. A buffer resource
+        # has to be wave-uniform, so the same copy there becomes a
+        # v_readfirstlane waterfall, one iteration per distinct page. The
+        # buffer atom on a raw global view lowers to a global
+        # ``cdna3.buffer_copy`` the legalizer rejects, so every K/V gather
+        # has to take ``kv_copy``.
+        kv_copy = (
+            fx.make_copy_atom(fx.UniversalCopy128b(), BFloat16)
+            if const_expr(wide_cache)
+            else g_copy
+        )
         lds_copy = fx.make_copy_atom(fx.UniversalCopy128b(), BFloat16)
         lds_copy64 = fx.make_copy_atom(fx.UniversalCopy64b(), BFloat16)
         kv_tile, kv_tv = fx.make_layout_tv(
@@ -367,9 +374,10 @@ def build_qsa_k2_module(
         kv_store = fx.make_tiled_copy(lds_copy, kv_tv, kv_tile).get_slice(tid)
         # A V# voffset is 32 bits. A cache that fits in 4 GiB keeps one
         # uniform descriptor. A larger cache is a separate compile: each
-        # gathered row is rebased in 64-bit, then a descriptor covers only
-        # that row. The two bodies are not both traced. Invalid pages are
-        # clamped before the address is formed.
+        # gathered row is a per-lane 64-bit address and a raw 128-bit load.
+        # A descriptor on that address would serialize the gather. The two
+        # bodies are not both traced. Invalid pages are clamped before the
+        # address is formed, so the load does not rely on descriptor OOB-zero.
         if const_expr(wide_cache):
             k_base = buf_base_i64(k_cache)
             v_base = buf_base_i64(v_cache)
@@ -381,7 +389,6 @@ def build_qsa_k2_module(
             page_elems64 = Int64(kv_strides[0])
             token_elems64 = Int64(kv_strides[1])
             head_elems64 = Int64(kv_strides[2])
-            row_bytes = head_dim * 2
 
             def kv_row(base, phys, page_off):
                 addr = base + (
@@ -389,16 +396,13 @@ def build_qsa_k2_module(
                     + Int64(page_off) * token_elems64
                     + Int64(kv_h) * head_elems64
                 ) * Int64(2)
-                view = fx.make_view(
-                    fx.inttoptr(row_ptr_ty, addr),
-                    fx.make_layout((head_dim,), (1,)),
+                flat = fx.Tensor(
+                    fx.make_view(
+                        fx.inttoptr(row_ptr_ty, addr),
+                        fx.make_layout((head_dim,), (1,)),
+                    )
                 )
-                return fx.logical_divide(
-                    fx.rocdl.make_buffer_tensor(
-                        view, max_size=False, num_records_bytes=row_bytes
-                    ),
-                    vec_layout,
-                )
+                return fx.logical_divide(flat, vec_layout)
 
         else:
             k_buf = fx.rocdl.make_buffer_tensor(k_cache)
