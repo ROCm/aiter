@@ -95,7 +95,8 @@ def pa_prefill_sparse(
         has_invalid:       gfx1250 only: whether index lists may hold ``-1``
             sentinels (``None`` picks a heuristic). The other branches always
             skip ``-1`` and out-of-pool slots.
-        out:               optional [T, H, D] output buffer, written in place.
+        out:               optional contiguous [T, H, D] buffer on q's device,
+            same dtype as q; written in place and returned.
 
     Returns:
         [T, H, D] attention output, same dtype as q.
@@ -107,10 +108,11 @@ def pa_prefill_sparse(
             out.shape == q.shape and out.dtype == q.dtype
         ), f"out {tuple(out.shape)} {out.dtype} != q {tuple(q.shape)} {q.dtype}"
         assert out.device == q.device, f"out on {out.device}, q on {q.device}"
-        # gfx950 writes the last dim with unit stride regardless of out.stride(2).
+        # Every branch writes [T, H, D] in place: overlapping views (e.g. an
+        # expand() over heads) would race, and gfx950 ignores out.stride(2).
         assert (
-            out.stride(-1) == 1
-        ), f"out last dim must be contiguous, got {out.stride()}"
+            out.is_contiguous()
+        ), f"out must be contiguous, got strides {out.stride()}"
     if DEVICE_ARCH == "gfx1250":
         if not q.is_cuda:
             raise RuntimeError("pa_prefill_sparse requires CUDA/HIP tensors")

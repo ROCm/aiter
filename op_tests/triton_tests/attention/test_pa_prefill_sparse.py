@@ -631,16 +631,23 @@ def test_pa_prefill_sparse_rejects_non_positive_scale(scale):
         pa_prefill_sparse(q, kv, indices, indptr, None, None, None, None, scale)
 
 
-def test_pa_prefill_sparse_rejects_strided_out():
+# Strided or overlapping out= buffers would be written wrongly (gfx950 ignores
+# out.stride(2)) or raced on (an expand() over heads), so they are rejected.
+@pytest.mark.parametrize("layout", ["transposed", "expanded_heads"])
+def test_pa_prefill_sparse_rejects_non_contiguous_out(layout):
     _triton_branch_only()
-    q = torch.randn(4, 16, 512, dtype=torch.bfloat16, device="cuda")
-    kv = torch.randn(8, 512, dtype=torch.bfloat16, device="cuda")
-    indptr = torch.arange(0, 5, dtype=torch.int32, device="cuda")
-    indices = torch.zeros(4, dtype=torch.int32, device="cuda")
-    out = torch.empty(4, 512, 16, dtype=torch.bfloat16, device="cuda").transpose(1, 2)
-    with pytest.raises(AssertionError, match="last dim"):
+    T, H, D = 4, 16, 512
+    q = torch.randn(T, H, D, dtype=torch.bfloat16, device="cuda")
+    kv = torch.randn(8, D, dtype=torch.bfloat16, device="cuda")
+    indptr = torch.arange(0, T + 1, dtype=torch.int32, device="cuda")
+    indices = torch.zeros(T, dtype=torch.int32, device="cuda")
+    if layout == "transposed":
+        out = torch.empty(T, D, H, dtype=q.dtype, device="cuda").transpose(1, 2)
+    else:
+        out = torch.empty(T, 1, D, dtype=q.dtype, device="cuda").expand(T, H, D)
+    with pytest.raises(AssertionError, match="contiguous"):
         pa_prefill_sparse(
-            q, kv, indices, indptr, None, None, None, None, 512**-0.5, out=out
+            q, kv, indices, indptr, None, None, None, None, D**-0.5, out=out
         )
 
 
