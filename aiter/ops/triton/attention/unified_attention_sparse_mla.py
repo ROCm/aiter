@@ -1,3 +1,5 @@
+import functools
+
 import triton
 
 from aiter.ops.triton._triton_kernels.attention.unified_attention_sparse_mla import (
@@ -6,6 +8,21 @@ from aiter.ops.triton._triton_kernels.attention.unified_attention_sparse_mla imp
 from aiter.ops.triton.utils.tuned_config_utils import get_tuned_kernel_config
 
 _FALLBACK = triton.Config({"BLOCK_M": 16}, num_warps=4, num_stages=1)
+
+
+@functools.cache
+def _launch_config() -> triton.Config:
+    """Read-only launch config, resolved once per process.
+
+    Decode runs this per step, and an arch with no published entry warns on
+    every miss, so the uncached call would log once per launch.
+    """
+    return get_tuned_kernel_config(
+        "attention",
+        "UNIFIED_ATTENTION_SPARSE_MLA",
+        "_kernel_unified_attention_sparse_mla_2d",
+        _FALLBACK,
+    )
 
 
 def unified_attention_sparse_mla(
@@ -52,12 +69,7 @@ def unified_attention_sparse_mla(
     k = kv
     v = kv[..., :kv_lora_rank]
 
-    cfg = get_tuned_kernel_config(
-        "attention",
-        "UNIFIED_ATTENTION_SPARSE_MLA",
-        "_kernel_unified_attention_sparse_mla_2d",
-        _FALLBACK,
-    )
+    cfg = _launch_config()
     BLOCK_M = cfg.kwargs["BLOCK_M"]
     # The grid has num_query_heads // BLOCK_M programs per token, so BLOCK_M must
     # divide the head count; halve a larger tuned value until it does.
