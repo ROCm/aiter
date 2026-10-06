@@ -195,9 +195,13 @@ def worker(rank, args, port):
     for r, c in enumerate(ctxs):
         p = torch.arange(c - 1, device=dev)
         blocks = block_table[r, p // BLOCK].long()
-        vals, scales = quant_ue8m0(
-            torch.randn(c - 1, INDEX_DIM, device=dev, generator=gen) * 0.5
-        )
+        k = torch.randn(c - 1, INDEX_DIM, device=dev, generator=gen) * 0.5
+        if args.cluster:
+            base = torch.randn(1, INDEX_DIM, device=dev, generator=gen) * 0.5
+            k = base + args.cluster * k
+        if args.zero_frac:
+            k[torch.rand(c - 1, device=dev, generator=gen) < args.zero_frac] = 0
+        vals, scales = quant_ue8m0(k)
         write_keys(index_cache, blocks, p % BLOCK, vals, scales, shuffled)
 
     kv = (
@@ -303,7 +307,8 @@ def worker(rank, args, port):
         q = q.to(torch.bfloat16).float()
         score = (torch.relu(q @ keys_f.T) * mid["index_w"][r].float()[:, None]).sum(0)
         n = min(c, TOPK)
-        ref = set(torch.topk(score, n).indices.tolist())
+        ref_values, ref_idx = torch.topk(score, n)
+        ref = set(ref_idx.tolist())
         got_slots = out_indices[indptr[r] : indptr[r] + n].long()
         slot_to_pos = torch.full(
             (total_blocks * BLOCK,), -1, dtype=torch.long, device=dev
@@ -312,11 +317,19 @@ def worker(rank, args, port):
         got = slot_to_pos[got_slots].tolist()
         overlap = len(ref & set(got)) / n
         distinct = len(set(got)) == n and min(got) >= 0
-        ok = same_scale and byte_match >= 0.99 and overlap >= 0.999 and distinct
+        # Ties make the picked set ambiguous; the picked score values are not.
+        got_values = score[torch.tensor(got, device=dev).clamp_min(0)]
+        got_values = got_values.sort(descending=True).values
+        value_err = (
+            (got_values - ref_values).abs().max()
+            / ref_values.abs().max().clamp_min(1e-30)
+        ).item()
+        ok = same_scale and byte_match >= 0.99 and value_err <= 1e-4 and distinct
         if rank == 0 or not ok:
             print(
                 f"[{'PASS' if ok else 'FAIL'}] rank {rank} row {r} ctx {c}: new-key scale exact={same_scale} "
-                f"bytes {byte_match:.4f} | picks distinct={distinct} overlap {overlap:.4f}",
+                f"bytes {byte_match:.4f} | picks distinct={distinct} overlap {overlap:.4f} "
+                f"top-{n} value err {value_err:.1e}",
                 flush=True,
             )
         if not ok:
@@ -367,6 +380,8 @@ def main():
     parser.add_argument(
         "--shuffled", action=argparse.BooleanOptionalAction, default=True
     )
+    parser.add_argument("--cluster", type=float, default=0.0)
+    parser.add_argument("--zero-frac", type=float, default=0.0)
     parser.add_argument("--port", type=int, default=29741)
     args = parser.parse_args()
     if get_gfx_runtime() != "gfx950":
