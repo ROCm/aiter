@@ -30,12 +30,15 @@ from aiter.ops.flydsl.kernels.one_shot_allreduce import (
 from aiter.ops.flydsl.kernels.quick_allreduce_codec import (
     SUPPORTED_BLOCKS as TWO_STAGE_BLOCKS,
 )
+from aiter.ops.flydsl.kernels.quick_allreduce_fusions import FUSED_QR_ROW_ATOMS
 from aiter.ops.flydsl.kernels.quick_allreduce_mesh import (
     SUPER_TILES,
+    fused_mesh_st_ladder,
     mesh_st_ladder,
 )
 from aiter.ops.flydsl.kernels.quick_allreduce_ring import (
     RING_SUPER_TILES,
+    fused_ring_st_ladder,
     ring_st_ladder,
 )
 from aiter.ops.flydsl.one_shot_allreduce import max_payload_bytes
@@ -106,6 +109,27 @@ def test_ladders_are_well_formed(ws):
             assert cap >= 1, (link, cap)
             assert fanout in ("peer", "atom"), (link, fanout)
             assert block in SUPPORTED_BLOCKS, (link, block)
+
+
+@pytest.mark.parametrize("ws", WORLDS)
+def test_fused_ladders_are_well_formed(ws):
+    """The fused mesh/ring ladders obey the same rules as the plain ones, with
+    ``(min_bytes, super_tile, grid_cap)`` rungs, and every ``FUSED_QR_ROW_ATOMS``
+    entry divides a rank's reduce-scatter chunk (``ATOMS // world_size`` atoms)."""
+    for link in P.LINKS:
+        for name, rungs, valid_st in (
+            ("mesh", fused_mesh_st_ladder(ws, link), SUPER_TILES),
+            ("ring", fused_ring_st_ladder(ws, link), RING_SUPER_TILES),
+        ):
+            assert rungs, (name, link)
+            assert rungs[0][0] == 0, (name, link)
+            assert [r[0] for r in rungs] == sorted(r[0] for r in rungs), (name, link)
+            for _floor, st, cap in rungs:
+                assert st in valid_st, (name, link, st)
+                assert cap >= 1, (name, link, cap)
+    for (link, world, algorithm), atoms in FUSED_QR_ROW_ATOMS.items():
+        assert link in P.LINKS and algorithm in ("mesh", "ring"), (link, algorithm)
+        assert atoms >= 1 and (8 // world) % atoms == 0, (link, world, algorithm, atoms)
 
 
 @pytest.mark.parametrize("ws", WORLDS)

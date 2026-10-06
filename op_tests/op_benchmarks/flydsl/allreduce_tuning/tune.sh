@@ -9,8 +9,10 @@
 #   check        verify GPUs, deps, fabric type and that the benchmark can be imported
 #   sweep        plain all-reduce sweep  (fast accuracy; fitting data)      -> $OUT/sweep
 #   fit          fit family policy + ladders from the sweep                  -> $OUT/fit/fit.txt
-#   fused-sweep  fused all-reduce+RMSNorm one-shot sweep (split-H)           -> $OUT/fused/sweep
-#   fused-fit    fit FUSED_ONESHOT_LADDER + FUSED_FAMILY_POLICY              -> $OUT/fused/fit.txt
+#   fused-sweep  fused all-reduce+RMSNorm sweep: one-shot (split-H) and
+#                quantized mesh/ring (atoms per row x super-tile)            -> $OUT/fused/sweep
+#   fused-fit    fit FUSED_ONESHOT_LADDER, FUSED_{MESH,RING}_ST_LADDER,
+#                FUSED_QR_ROW_ATOMS + FUSED_FAMILY_POLICY                    -> $OUT/fused/fit.txt
 #   ---- paste the fitted values into the source tables (README step 5), then: ----
 #   test         run the table-invariant unit tests (after pasting, before validate)
 #   validate     re-sweep the shipped dispatcher (fly_auto) vs pinned rows   -> $OUT/validate
@@ -249,26 +251,42 @@ cmd_report() {
   log "report tables -> $OUT/report/*.md"
 }
 
-cmd_fused_sweep() {
-  NGPU=$(ngpu); resolve_link; write_provenance
-  local fly1s cands
-  fly1s=$($PY - "$BENCH" <<'EOF' 2>/dev/null | tail -1
+# Bench candidate keys for which a Python predicate on the candidate `c` holds.
+bench_keys() {
+  $PY - "$BENCH" "$1" <<'EOF' 2>/dev/null | tail -1
 import importlib.util, sys
 s = importlib.util.spec_from_file_location("b", sys.argv[1])
 b = importlib.util.module_from_spec(s); sys.modules["b"] = b; s.loader.exec_module(b)
-print(" ".join(c.key for c in b.CANDIDATES if c.family == "fused_fly1s"))
+print(" ".join(c.key for c in b.CANDIDATES if eval(sys.argv[2], {"c": c})))
 EOF
-)
+}
+
+cmd_fused_sweep() {
+  NGPU=$(ngpu); resolve_link; write_provenance
+  local fly1s flyqr cands qr_cands
+  fly1s=$(bench_keys 'c.family == "fused_fly1s"')
   [[ -n $fly1s ]] || die "failed to enumerate fused_fly1s candidates"
+  # The atoms-per-row x super-tile grid of the quantized fused schedules.
+  flyqr=$(bench_keys 'c.family == "fused_flyqr" and c.atoms_per_row is not None')
+  [[ -n $flyqr ]] || die "failed to enumerate fused_flyqr candidates"
   # Every fused one-shot row (ladder default, pinned unsplit grid, split-H grid) plus
   # exact baselines and the quantized mesh for the fast-mode boundary.
   cands="fused_cdr_1stage fused_cdr_2stage separate_cdr separate_rccl fused_fly_auto fused_fly_mesh $fly1s"
-  if [[ $SMOKE == 1 ]]; then cands="fused_cdr_1stage fused_fly_auto $(cut -d' ' -f1-3 <<<"$fly1s")"; fi
-  log "fused sweep: $(wc -w <<<"$cands") candidates, tp=[$TPS] widths=[$WIDTHS]"
+  # A chunk of its own (``qr_tp<N>_w<H>``): every row is an engine with its own
+  # inbox, so this keeps the per-run inbox total down, and an older sweep
+  # directory picks up the quantized rows without re-running the one-shot.
+  qr_cands="fused_fly_mesh fused_fly_ring $flyqr"
+  if [[ $SMOKE == 1 ]]; then
+    cands="fused_cdr_1stage fused_fly_auto $(cut -d' ' -f1-3 <<<"$fly1s")"
+    qr_cands="fused_fly_mesh_a1_st1_g128 fused_fly_ring_a1_st8_g128"
+  fi
+  log "fused sweep: $(wc -w <<<"$cands") one-shot + $(wc -w <<<"$qr_cands") mesh/ring candidates, tp=[$TPS] widths=[$WIDTHS]"
   for tp in $TPS; do tp_ok "$tp" || continue
     for h in $WIDTHS; do
       bench_chunk "tp${tp}_w${h}" "$OUT/fused/sweep" --fusion ar_rmsnorm -tp "$tp" \
         --shape-csv "$FUSED_SHAPES/fused_w${h}.csv" -c $cands
+      bench_chunk "qr_tp${tp}_w${h}" "$OUT/fused/sweep" --fusion ar_rmsnorm -tp "$tp" \
+        --shape-csv "$FUSED_SHAPES/fused_w${h}.csv" -c $qr_cands
     done
   done
   finish

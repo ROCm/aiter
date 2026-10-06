@@ -129,6 +129,28 @@ def ring_st_ladder(world_size: int, link: str = "pcie"):
     return RING_ST_LADDER.get((str(link), int(world_size)), RING_ST_LADDER[("pcie", 4)])
 
 
+# The fused (all-reduce + RMSNorm) build's own ladder: ``(min_bytes,
+# super_tile, grid_cap)`` rungs, ascending. No ``block``: a fused build sizes
+# its workgroup to the token row (``quick_allreduce_fusions.FUSED_QR_ROW_ATOMS``
+# picks the row width), so the plain rung's block does not apply.
+FUSED_RING_ST_LADDER = {
+    ("xgmi", 2): ((0, 8, 128), (24 << 20, 16, 128)),
+    ("xgmi", 4): ((0, 8, 128), (24 << 20, 16, 128), (48 << 20, 32, 128)),
+    ("xgmi", 8): ((0, 16, 128), (48 << 20, 32, 128)),
+    ("pcie", 2): ((0, 16, 128),),
+    ("pcie", 4): ((0, 32, 128),),
+    ("pcie", 8): ((0, 32, 128),),
+}
+
+
+def fused_ring_st_ladder(world_size: int, link: str = "pcie"):
+    """Fused rungs for *(link, world_size)*, or the PCIe TP4 shape for an
+    unlisted one."""
+    return FUSED_RING_ST_LADDER.get(
+        (str(link), int(world_size)), FUSED_RING_ST_LADDER[("pcie", 4)]
+    )
+
+
 # Wire formats accepted per lap.
 #
 # Both laps take the same set, but they are separate arguments because they are

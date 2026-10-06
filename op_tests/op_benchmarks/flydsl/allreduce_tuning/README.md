@@ -10,7 +10,7 @@ Two independent tuning problems share the tooling:
 | Problem | What is tuned | Tables it feeds |
 |---|---|---|
 | **Plain all-reduce** | which family (one-shot / quantized mesh / quantized ring) per payload size, and which instance (block, super-tile, grid cap) inside each family | `FAMILY_POLICY`, `ONESHOT_LADDER`, `MESH_ST_LADDER`, `RING_ST_LADDER` |
-| **Fused all-reduce + RMSNorm** | one-shot rungs (atoms, grid cap, hidden-dim split) and the one-shot windows | `FUSED_ONESHOT_LADDER`, `FUSED_FAMILY_POLICY` |
+| **Fused all-reduce + RMSNorm** | one-shot rungs (atoms, grid cap, hidden-dim split), the quantized mesh/ring instance (atoms per row, super-tile) and the family windows | `FUSED_ONESHOT_LADDER`, `FUSED_MESH_ST_LADDER`, `FUSED_RING_ST_LADDER`, `FUSED_QR_ROW_ATOMS`, `FUSED_FAMILY_POLICY` |
 
 Tables are keyed `(link, world_size)` with `link` in `pcie` / `xgmi`. The driver detects the fabric
 from the KFD topology (`has_xgmi_peer_links()`), so a run on an 8x MI325X box fits the `("xgmi", N)`
@@ -113,17 +113,38 @@ regret against a per-shape oracle. Read the report top to bottom:
 ./tune.sh fused-fit
 ```
 
-The sweep (`--fusion ar_rmsnorm`) runs every fused one-shot row -- ladder default, pinned unsplit grids, and
-all legal hidden-dim split (`k`) rows (137 rows) -- plus the `cdr` fused/separate baselines, `fused_fly_auto`
-and the quantized mesh, for M = 1..2048 at each width (`fused/shapes/fused_w*.csv`). About 45 minutes for the
-full set; output `out/<host>/fused/sweep/tp<N>_w<H>.{csv,md,log}`.
+The sweep (`--fusion ar_rmsnorm`) runs two chunks per (TP, width), for M = 1..2048 at each width
+(`fused/shapes/fused_w*.csv`):
+
+* `tp<N>_w<H>`: every fused one-shot row -- ladder default, pinned unsplit grids, and all legal hidden-dim
+  split (`k`) rows (137 rows) -- plus the `cdr` fused/separate baselines, `fused_fly_auto` and the quantized
+  mesh. About 45 minutes for the full set.
+* `qr_tp<N>_w<H>`: the quantized fused mesh and ring, pinned per atoms per row x super-tile x grid cap
+  (`fused_fly_<mesh|ring>_a<apr>_st<st>_g<cap>`, caps 32/64/128/256, 72 rows), plus `fused_fly_mesh` /
+  `fused_fly_ring` on their shipped ladders. Rows are skipped where they cannot build as named: an
+  `atoms_per_row` the width or world size does not have, or a cap above the CU count (a fused launch is held
+  to one workgroup per CU). Being its own
+  chunk, an older sweep directory picks it up on a plain re-run of `fused-sweep` without redoing the one-shot.
+
+Output: `out/<host>/fused/sweep/{,qr_}tp<N>_w<H>.{csv,md,log}`.
 
 `fused-fit` writes `out/<host>/fused/fit.txt` (and a per-shape comparison in `fused/summary.txt`). Per world
 size it prints:
 
 * `FUSED_ONESHOT_LADDER rungs`: paste-ready rungs `(min_bytes, atoms, grid_cap, "peer", split)`,
   found by dynamic programming over payload breakpoints (`--rungs N`, default 3, penalised per rung).
-* `oneshot_max_exact (vs cdr)` and `oneshot_max (vs mesh)`: the `FUSED_FAMILY_POLICY` bounds.
+* `FUSED_MESH_ST_LADDER rungs` / `FUSED_RING_ST_LADDER rungs`: paste-ready `(min_bytes, super_tile,
+  grid_cap)` rungs -- super-tile and cap chosen together per rung -- and the
+  `FUSED_QR_ROW_ATOMS[(link, N, alg)]` entry they were fitted with. One
+  `atoms_per_row` serves every width (a width without it runs the nearest it has, as the engine does), so it is
+  chosen first -- the line `log-regret by atoms_per_row` shows the margin -- and each candidate gets its own
+  super-tile ladder. `shipped/fitted` is the speedup over today's tables inside that family's window. Fitted
+  above `oneshot_max` only, since nothing below it dispatches to the mesh or ring. Needs the `qr_` chunks;
+  without them the fit says so and fits the one-shot only.
+* `oneshot_max_exact (vs cdr)`, `oneshot_max (vs quant)` -- against the fitted mesh/ring, whichever
+  `mesh_max` routes the shape to -- and `mesh_max (vs ring)`, combined into a paste-ready `FusedPolicy(...)`
+  line. `mesh_max=None` means the mesh won up to the top of the sweep (no ring); `mesh_max == oneshot_max`
+  means the ring won everywhere above the one-shot.
 * a per-shape table and the in-window geomeans: `ladder/best` (how close the fitted ladder is to the
   per-shape best), `cdr/ladder` (the speedup over aiter) and `shipped/ladder` (how much the currently
   shipped ladder loses against the fitted one).
@@ -140,7 +161,10 @@ widths with few legal splits (e.g. 3072, only k=2) do not show large regret.
 | `ladder mesh` comment lines | `MESH_ST_LADDER` in `aiter/ops/flydsl/kernels/quick_allreduce_mesh.py` |
 | `ladder ring` comment lines | `RING_ST_LADDER` in `aiter/ops/flydsl/kernels/quick_allreduce_ring.py` (leave unchanged if ring is "not dispatched here") |
 | fused `FUSED_ONESHOT_LADDER rungs` | `FUSED_ONESHOT_LADDER` in `aiter/ops/flydsl/kernels/one_shot_allreduce.py` |
-| fused `oneshot_max` / `oneshot_max_exact` | `FUSED_FAMILY_POLICY` in `aiter/ops/flydsl/allreduce_policy.py` (keep `mesh_max=None` where the ring never wins) |
+| fused `FUSED_MESH_ST_LADDER rungs` | `FUSED_MESH_ST_LADDER` in `aiter/ops/flydsl/kernels/quick_allreduce_mesh.py` |
+| fused `FUSED_RING_ST_LADDER rungs` | `FUSED_RING_ST_LADDER` in `aiter/ops/flydsl/kernels/quick_allreduce_ring.py` |
+| fused `FUSED_QR_ROW_ATOMS[...]` | `FUSED_QR_ROW_ATOMS` in `aiter/ops/flydsl/kernels/quick_allreduce_fusions.py` |
+| fused `FusedPolicy(...)` | `FUSED_FAMILY_POLICY` in `aiter/ops/flydsl/allreduce_policy.py` |
 
 Translating candidate names from the mesh/ring ladder lines into rungs
 `(min_bytes, super_tile, grid_cap, block)`:
@@ -188,7 +212,8 @@ driver does it).
 
 For the fused tables there is no separate validate command: re-run the fused sweep into a fresh directory
 (`./tune.sh --out out/after fused-sweep && ./tune.sh --out out/after fused-fit`) and check that the in-window
-`shipped/ladder` geomean is ~1.00 (the shipped ladder now equals the fitted one) and `fused_fly_auto` is
+`shipped/ladder` geomean and each mesh/ring `shipped/fitted` are ~1.00 (the shipped tables now equal the
+fitted ones) and `fused_fly_auto` is
 not losing to the best pinned row in `fused/summary.txt`.
 
 ### 7. Optional: reference report
@@ -211,7 +236,7 @@ Writes markdown tables of `fly_auto` against `cdr`, `cdr_naive`, `qr_int4`, `rcc
   (median across ranks), not the max.
 * Adding a kernel knob or candidate: add it to `CANDIDATES` in `../bench_comm_allreduce.py`, then to the
   candidate lists at the top of `tune.sh` (`MESH_PINNED`, `ONESHOT_PINNED`, ...). The fused sweep enumerates
-  `fused_fly1s` candidates automatically.
+  its `fused_fly1s` and pinned `fused_flyqr` candidates automatically.
 * Everything here is read-only with respect to the source tree: nothing but you edits the policy tables.
 
 ## Layout
@@ -221,7 +246,7 @@ tune.sh                     driver (setup/check/sweep/fit/fused-*/validate/audit
 fit_allreduce_policy.py     plain fit + --audit-auto (imports CANDIDATES from ../bench_comm_allreduce.py)
 shapes/                     plain sweep shape sets (M,K,label)
 fused/analyze_fused.py      per-shape summary of the fused sweep
-fused/fit_fused.py          fused ladder / window fit
+fused/fit_fused.py          fused ladders (one-shot, mesh, ring), row width and window fit
 fused/shapes/               fused sweep shape sets, one per hidden size
 reference/                  results of the last xGMI (MI325X, gfx942) tuning, for comparison with a new run
 out/                        sweep data, fits, logs (git-ignored; large)

@@ -54,6 +54,7 @@ from .kernels.quick_allreduce_mesh import (
     MESH_CODECS,
     SUPER_TILES,
     clamp_grid_cap,
+    fused_mesh_st_ladder,
     make_quick_allreduce_mesh_kernel,
     mesh_fanout_fits,
     mesh_st_ladder,
@@ -62,6 +63,7 @@ from .kernels.quick_allreduce_ring import (
     AG_CODECS,
     RING_SUPER_TILES,
     RS_CODECS,
+    fused_ring_st_ladder,
     make_quick_allreduce_ring_kernel,
     ring_st_ladder,
 )
@@ -157,12 +159,19 @@ class _Algorithm:
     # size"; no schedule uses that any more, but the code path stays because
     # pinning ``super_tile`` still collapses to it.
     st_ladder: Callable[[int, str], tuple] | None = None
+    fused_st_ladder: Callable[[int, str], tuple] | None = None
 
     def ladder_for(self, world_size: int, link: str = "pcie") -> tuple:
         """Rungs for *(link, world_size)*; ``()`` when there is no ladder."""
         if self.st_ladder is None:
             return ()
         return tuple(self.st_ladder(int(world_size), str(link)))
+
+    def fused_ladder_for(self, world_size: int, link: str = "pcie") -> tuple:
+        """Fused rungs for *(link, world_size)*; ``()`` when there is no ladder."""
+        if self.fused_st_ladder is None:
+            return ()
+        return tuple(self.fused_st_ladder(int(world_size), str(link)))
 
 
 def _build_mesh(
@@ -209,6 +218,7 @@ ALGORITHMS = {
         min_batch_blocks=_MIN_BATCH_BLOCKS,
         default_super_tile=8,
         st_ladder=mesh_st_ladder,
+        fused_st_ladder=fused_mesh_st_ladder,
         fused_block_ok=mesh_fanout_fits,
     ),
     "ring": _Algorithm(
@@ -221,6 +231,7 @@ ALGORITHMS = {
         min_batch_blocks=_MIN_BATCH_BLOCKS,
         default_super_tile=8,
         st_ladder=ring_st_ladder,
+        fused_st_ladder=fused_ring_st_ladder,
         min_bytes_by_world=tuple(_RING_MIN_PAYLOAD_BYTES_BY_WORLD.items()),
     ),
 }
@@ -891,14 +902,12 @@ class FlyQuickAllReduceRMSNorm:
         self.max_bytes = max_bytes
         self.pad = bool(pad)
 
-        # Rungs to build, as ``(super_tile, grid_cap)``. Same ladder the plain
-        # class walks; pinning ``super_tile`` collapses it to one rung.
-        world_ladder = algo.ladder_for(self.world_size, link)
+        # Rungs to build, as ``(super_tile, grid_cap)``, from the fused ladder;
+        # pinning ``super_tile`` collapses it to one rung.
+        world_ladder = algo.fused_ladder_for(self.world_size, link)
         if world_ladder and not pinned_st:
             self._ladder = world_ladder
-            self._rungs = [
-                (st, min(rung_cap, cap)) for _, st, rung_cap, _b in world_ladder
-            ]
+            self._rungs = [(st, min(rung_cap, cap)) for _, st, rung_cap in world_ladder]
         else:
             st = algo.default_super_tile if super_tile is None else int(super_tile)
             self._ladder = ()
@@ -1088,7 +1097,7 @@ class FlyQuickAllReduceRMSNorm:
 
     def _ladder_st(self, live_bytes: int) -> int:
         st = min(self._by_cap)
-        for floor, rung_st, _cap, _b in self._ladder:
+        for floor, rung_st, _cap in self._ladder:
             if live_bytes >= floor:
                 st = rung_st
         return st

@@ -256,6 +256,7 @@ Examples::
 """
 
 import argparse
+import functools
 import logging
 import math
 import os
@@ -647,6 +648,9 @@ class Candidate:
     # Workgroups per token row, family "fused_fly1s" (with ``block`` then the
     # width of one slice's workgroup). None leaves it to the rung.
     split: int | None = None
+    # Atoms per token row, family "fused_flyqr": the width-portable form of the
+    # fused block (``FUSED_QR_ROW_ATOMS``). None takes the widest block.
+    atoms_per_row: int | None = None
     # Rows that only exist under --fusion ar_rmsnorm. A fused candidate is never
     # run in plain mode and vice versa: the two modes compute different things
     # and are graded against different references, so mixing them in one table
@@ -731,6 +735,7 @@ class Candidate:
         would build one engine per (config, shape) in a sweep and exhaust the
         IPC heap. ``block`` is safe to key on because it is a *policy* (pin this
         width, or take the widest), resolved per hidden inside the engine.
+        ``atoms_per_row`` is the same policy in its portable form.
         """
         return (
             self.algorithm,
@@ -739,6 +744,7 @@ class Candidate:
             self.rs_codec,
             self.ag_codec,
             self.block,
+            self.atoms_per_row,
         )
 
     @property
@@ -982,6 +988,52 @@ def _fused_flyqr_grid_rows():
     return tuple(rows)
 
 
+# The knob grid the fused super-tile ladders (``FUSED_MESH_ST_LADDER``,
+# ``FUSED_RING_ST_LADDER``) and ``FUSED_QR_ROW_ATOMS`` are fitted over: atoms per
+# row x super-tile x grid cap. A fused launch is held to one workgroup per CU. 
+# An ``atoms_per_row`` a world size or width does not have, or a cap above 
+# the CU count, is skipped there by ``_flyqr_atoms_ok``.
+_FUSED_FLYQR_ROW_ATOMS = (1, 2, 4)
+_FUSED_FLYQR_CAPS = (32, 64, 128, 256)
+
+
+def _fused_flyqr_tune_rows():
+    """``_FUSED_FLYQR_ROW_ATOMS`` x super-tile x ``_FUSED_FLYQR_CAPS`` rows for
+    the fused mesh and ring.
+
+    Keyed ``fused_fly_<algorithm>_a<atoms_per_row>_st<st>_g<cap>``. A pinned
+    super-tile still falls back to ST=1 below a whole super-tile of tiles, just
+    as a ladder rung does, so each row times exactly what a one-rung ladder of
+    that super-tile would.
+    """
+    rows = []
+    for algorithm, floor in (("mesh", 15.0), ("ring", 10.0)):
+        if algorithm not in ALGORITHMS:
+            continue
+        for apr in _FUSED_FLYQR_ROW_ATOMS:
+            for st in ALGORITHMS[algorithm].super_tiles:
+                for cap in _FUSED_FLYQR_CAPS:
+                    rows.append(
+                        Candidate(
+                            f"fused_fly_{algorithm}_a{apr}_st{st}_g{cap}",
+                            "fused_flyqr",
+                            floor,  # same floors as the unpinned rows of each schedule
+                            False,
+                            fusion=True,
+                            algorithm=algorithm,
+                            super_tile=st,
+                            grid_cap=cap,
+                            atoms_per_row=apr,
+                        )
+                    )
+    return tuple(rows)
+
+
+@functools.cache
+def _cu_count() -> int:
+    return int(torch.cuda.get_device_properties(0).multi_processor_count)
+
+
 # Floors sit ~5 dB below what each candidate measures on a healthy gfx950 build
 # (the parenthesised bf16 / fp16 numbers), which catches a real regression
 # without tripping on rounding. The exact kernels are at the payload dtype's
@@ -1118,8 +1170,10 @@ CANDIDATES = (
     Candidate(
         "fused_fly_mesh", "fused_flyqr", 15.0, False, fusion=True, algorithm="mesh"
     ),
-    # ... plus their pinned-block rows, see `_fused_flyqr_grid_rows`.
+    # ... plus their pinned-block rows, see `_fused_flyqr_grid_rows`, and the
+    # atoms-per-row x super-tile grid, see `_fused_flyqr_tune_rows`.
     *_fused_flyqr_grid_rows(),
+    *_fused_flyqr_tune_rows(),
     # The fused mesh pinned per super-tile, against `fused_fly_mesh` on the
     # ladder.
     *(
@@ -1314,6 +1368,8 @@ def _flyqr_block_ok(hidden: int, world_size: int, cand: Candidate) -> bool:
     )
     if not native and not padded:
         return False
+    if cand.atoms_per_row is not None:
+        return _flyqr_atoms_ok(hidden, world_size, cand)
     if cand.block is None:
         return True
     if _flyqr_block_options is None:
@@ -1324,6 +1380,30 @@ def _flyqr_block_ok(hidden: int, world_size: int, cand: Candidate) -> bool:
         b == cand.block
         for b, _a, _h in _flyqr_padded_block_options(int(hidden), int(world_size))
     )
+
+
+def _flyqr_atoms_ok(hidden: int, world_size: int, cand: Candidate) -> bool:
+    """Whether the engine builds exactly ``cand.atoms_per_row`` at this width,
+    at a grid cap the device does not clamp away (one workgroup per CU)."""
+    if FlyQuickAllReduceRMSNorm is None or _resolve_codecs is None:
+        return False
+    if cand.grid_cap is not None and cand.grid_cap > _cu_count():
+        return False
+    algo = ALGORITHMS[cand.algorithm]
+    if (8 // int(world_size)) % int(cand.atoms_per_row):
+        return False
+    eng = FlyQuickAllReduceRMSNorm.__new__(FlyQuickAllReduceRMSNorm)
+    eng.world_size = int(world_size)
+    eng._algo = algo
+    eng.rs_codec, _ag = _resolve_codecs(
+        algo, int(world_size), cand.rs_codec, cand.ag_codec
+    )
+    eng.block = None
+    eng.atoms_per_row = int(cand.atoms_per_row)
+    eng.pad = _bench_fly_pad_enabled()
+    if not eng.supports_hidden(int(hidden)):
+        return False
+    return eng._geom_for(int(hidden))[1] == cand.atoms_per_row
 
 
 def applicable(
@@ -2836,7 +2916,7 @@ def _worker(
                     continue
                 eng.preload(hidden)
 
-    flyqr_rms = {}  # (algorithm, st, grid_cap, rs, ag) -> FlyQuickAllReduceRMSNorm
+    flyqr_rms = {}  # Candidate.flyqr_rms_cfg -> FlyQuickAllReduceRMSNorm
     # One object per distinct config, each building a per-hidden IPC inbox on
     # demand: a fused two-shot build sizes its block to the token row, so the
     # whole geometry -- tile, wire slots, codec offsets -- depends on the width.
@@ -2872,16 +2952,28 @@ def _worker(
                         "rs_codec",
                         "ag_codec",
                         "block",
+                        "atoms_per_row",
                     ),
                 ),
             )
             # Measure every size the sweep asks for, as the plain fly rows do.
             flyqr_rms[cfg].min_bytes = 0
         # Build and preload every (config, hidden) this sweep will touch, in
-        # the same total order as above.
+        # the same total order as above. A row pinned to an ``atoms_per_row``
+        # this width lacks is skipped at it, so its engine builds no inbox there.
+        qr_cands = {
+            c.flyqr_rms_cfg: c
+            for c in CANDIDATES
+            if c.family == "fused_flyqr" and c.key in keys
+        }
         for hidden in sorted({h for _, h in shapes}):
             for cfg, eng in flyqr_rms.items():
                 if not eng.supports_hidden(hidden):
+                    continue
+                cand = qr_cands[cfg]
+                if cand.atoms_per_row is not None and not _flyqr_atoms_ok(
+                    hidden, tp_size, cand
+                ):
                     continue
                 eng.preload(hidden)
 

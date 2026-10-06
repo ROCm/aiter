@@ -89,6 +89,7 @@ from .quick_allreduce_shared import (
 # Re-exported for the host, which imports its tile math from this module.
 __all__ = [
     "DEFAULT_GRID_CAP",
+    "FUSED_MESH_ST_LADDER",
     "MESH_CODECS",
     "MESH_ST_LADDER",
     "SUPER_TILES",
@@ -97,6 +98,7 @@ __all__ = [
     "TILE_BYTES",
     "WORLD",
     "clamp_grid_cap",
+    "fused_mesh_st_ladder",
     "make_quick_allreduce_mesh_kernel",
     "mesh_st_ladder",
 ]
@@ -195,6 +197,25 @@ MESH_ST_LADDER = {
 def mesh_st_ladder(world_size: int, link: str = "pcie"):
     """Rungs for *(link, world_size)*, or ``()`` when there is no ladder."""
     return MESH_ST_LADDER.get((str(link), int(world_size)), ())
+
+
+# The fused (all-reduce + RMSNorm) build's own ladder: ``(min_bytes,
+# super_tile, grid_cap)`` rungs, ascending. No ``block``: a fused build sizes
+# its workgroup to the token row (``quick_allreduce_fusions.FUSED_QR_ROW_ATOMS``
+# picks the row width).
+FUSED_MESH_ST_LADDER = {
+    ("xgmi", 2): ((0, 1, 128),),
+    ("xgmi", 4): ((0, 8, 128), (4 << 20, 1, 128)),
+    ("xgmi", 8): ((0, 1, 128), (6 << 20, 8, 128)),
+    ("pcie", 2): ((0, 1, 128), (4 << 20, 8, 128)),
+    ("pcie", 4): ((0, 1, 128), (768 << 10, 8, 128)),
+    ("pcie", 8): ((0, 8, 128),),
+}
+
+
+def fused_mesh_st_ladder(world_size: int, link: str = "pcie"):
+    """Fused rungs for *(link, world_size)*, or ``()`` when there is no ladder."""
+    return FUSED_MESH_ST_LADDER.get((str(link), int(world_size)), ())
 
 
 # Wire formats the mesh can build.
