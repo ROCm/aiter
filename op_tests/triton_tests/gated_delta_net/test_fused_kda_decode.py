@@ -302,7 +302,7 @@ def test_fused_kda_decode_rejects_invalid_out(invalid_out, match):
     elif invalid_out == "dtype":
         out = torch.zeros(batch, Hloc * D, dtype=torch.float32, device=device)
     else:
-        out = torch.zeros(batch, Hloc * D, dtype=torch.bfloat16)
+        out = torch.zeros(batch, Hloc * D, dtype=torch.bfloat16, device="cpu")
     with pytest.raises(ValueError, match=match):
         fused_kda_decode(
             inp["mixed_qkv"],
