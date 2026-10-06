@@ -495,7 +495,7 @@ pytest op_tests/triton_tests/gemm/basic/   # one subset
 
 ## PR Checklist
 
-- The PR must have a decent description. Try to follow AITER's PR template:
+- The PR must have a clear description covering the following topics:
   - **Motivation:** What's the purpose of the PR? Are you fixing something that is broken? Why are
     you adding a new feature? Are you shipping an optimization?
   - **Technical details:** Describe the implementation details in prose since the diff hunk already
@@ -515,7 +515,9 @@ pytest op_tests/triton_tests/gemm/basic/   # one subset
     that make sense. Code owners can, and will, close the PR if it's stale for a long time.
   - Do not let your coding agents open a PR and leave it rotting. Please follow along.
 - Add labels:
-  - Add **Triton/Gluon** label to your PR. This enables quick search from maintainer's part.
+  - The **Triton/Gluon** label is added automatically based on the changed files, making related PRs
+    easy for maintainers to find. Please double check if **Triton/Gluon** label is automatically
+    added and do it manually if it's absent.
   - **gfx942** Triton CI is now opt-in, add **ci:triton-300x** label if you are touching anything
     **gfx942**-related.
 - PR size:
@@ -524,13 +526,13 @@ pytest op_tests/triton_tests/gemm/basic/   # one subset
   - Prefer many small PRs over a single giant PR. Structure your code changes in a logical way,
     starting from the foundations. You can use a series of stacked PRs to build the final desired
     outcome incrementally.
-- Perform a first round of code review by yourself, to catch basic mistakes, before asking a review
-  from someone else. Reviewer time is precious in the age of agentic coding tools.
-- Sometimes, as the PR evolves, its title and decription get outdated. Please double check if the PR
-  information is up to date before merging.
-- If you have write access to [AITER ROCm fork](https://github.com/ROCm/aiter), PR from it instead
-  of your own fork. When PR-ing from a fork, Docker access is unauthenticated. This may cause CI
-  issues to to rate limiting.
+- Perform an initial self-review to catch basic mistakes before requesting a review from someone
+  else. Reviewer time is precious in the age of agentic coding tools.
+- Sometimes, as the PR evolves, its title and description get outdated. Please double check if the
+  PR information is up to date before merging.
+- If you have write access to the [AITER ROCm fork](https://github.com/ROCm/aiter), open the PR from
+  there instead of your own fork. When opening a PR from a fork, Docker access is unauthenticated,
+  which may cause CI issues due to rate limiting.
 - Strip the **Co-authored-by: AI agent** part of your commits before merging.
 
 **Warning:** PRs that don't comply with the checklist won't be reviewed or merged. Please be a good
