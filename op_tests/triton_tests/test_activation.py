@@ -88,7 +88,12 @@ def torch_act_mul_and_mxfp4_quant(
             (280, 20),
             (32, 128),
         ]
-        for shuffle, padding in [(False, False), (False, True), (True, True)]
+        for shuffle, padding in [
+            (False, False),
+            (False, True),
+            (True, False),
+            (True, True),
+        ]
         if not shuffle or n % 512 == 0
     ],
 )
@@ -100,9 +105,6 @@ def test_act_mul_and_mxfp4_quant(
 
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
-
-    if shuffle and N % 512 != 0:
-        pytest.skip()
 
     torch.manual_seed(20)
     x = torch.randn((M, N), dtype=dtype, device="cuda")

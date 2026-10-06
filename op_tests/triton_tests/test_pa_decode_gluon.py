@@ -2257,7 +2257,10 @@ def sliding_window_performance_test():
 
 
 @pytest.mark.parametrize("case_set_name", CASE_SET_NAME_OPTIONS)
-def test_multi_case_set(case_set_name):
+def test_multi_case_set(case_set_name, monkeypatch):
+    if case_set_name.endswith("_performance"):
+        # Performance case sets must still report real timing under pytest.
+        monkeypatch.setitem(globals(), "run_gluon_kernel", _timed_gluon_kernel)
     if case_set_name == "normal_accuracy":
         normal_accuracy_test()
     elif case_set_name == "normal_performance":

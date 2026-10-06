@@ -396,3 +396,20 @@ def test_op_expert_parallel_rejects_bad_inputs():
             expert_map=expert_map[:-1].contiguous(),
             gate_valid=gate_valid,
         )
+
+
+def test_default_backend():
+    """Exercise automatic backend selection without repeating the full matrix."""
+    test_op(
+        m=16,
+        n=128,
+        k=128,
+        do_gather=True,
+        do_scatter=True,
+        has_y_gammas=True,
+        apply_swiglu=True,
+        n_expts_tot=2,
+        n_expts_act=1,
+        hbm_swizzling=False,
+        backend=None,
+    )
