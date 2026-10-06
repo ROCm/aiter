@@ -407,7 +407,6 @@ def _check_packed(rank, world_size, heads, sequence, device, op_cls, name):
         quantize_mxfp4_q,
         quantize_mxfp6_k,
         quantize_mxfp6_q,
-        quantize_v_mxfp4,
     )
     from aiter.ops.mha_v4_quant import (
         MHA_V4_KV_SCALE_LOOKAHEAD_ROWS,
@@ -415,6 +414,8 @@ def _check_packed(rank, world_size, heads, sequence, device, op_cls, name):
         MHA_V4_MXFP4_K_SCALE_SLACK_BYTES,
         MHA_V4_MXFP4_V_SCALE_SLACK_BYTES,
         MHA_V4_QUERY_TILE_ROWS,
+        _mxfp4_v_buffers,
+        _quantize_v_mxfp4_hip,
         quantize_v_mxfp4_fp6_p,
         quantize_v_mxfp6_fp6_p,
     )
@@ -427,6 +428,15 @@ def _check_packed(rank, world_size, heads, sequence, device, op_cls, name):
     softmax_scale = 0.125
     heads_local = heads // world_size
     seq_full = sequence * world_size
+
+    def _quantize_v_mxfp4_default(value):
+        # Main removed the public DEFAULT-layout MXFP4 V packer; the private HIP
+        # producer still emits the token order the DEFAULT transport uses.
+        batch, sequence, heads, _ = value.shape
+        raw, scale = _mxfp4_v_buffers(value, batch, sequence, heads)
+        _quantize_v_mxfp4_hip(raw, scale, value)
+        return raw, scale
+
     packers = {
         "int8": (lambda value: quantize_int8(value), quantize_int8, quantize_fp8),
         "e4m3": (
@@ -434,7 +444,7 @@ def _check_packed(rank, world_size, heads, sequence, device, op_cls, name):
             quantize_fp8_rotated,
             quantize_fp8,
         ),
-        "mxfp4": (quantize_mxfp4_q, quantize_mxfp4_k, quantize_v_mxfp4),
+        "mxfp4": (quantize_mxfp4_q, quantize_mxfp4_k, _quantize_v_mxfp4_default),
         "mxfp6": (quantize_mxfp6_q, quantize_mxfp6_k, None),
     }
     codecs = (qk_codec, qk_codec, v_codec)
@@ -925,23 +935,6 @@ def _check_e4m3_pc(rank, world_size, heads, sequence, device, op_cls):
             f"{label} payload",
         )
         _exact(scales[2], expected_scales, f"{label} scales")
-    # Zero channels and sub-1e-12 amax channels clamp to the same positive descale
-    # and zero payload as quantize_v_fp8.
-    for label, fill in (("all-zero", None), ("tiny-amax", 1.0e-14)):
-        tiny = torch.zeros_like(inputs[2])
-        if fill is not None:
-            tiny[..., 7] = fill
-        expected_payload, expected_scales = quantize_v_fp8(
-            _full_bshd(tiny, rank, world_size)
-        )
-        tiny_payloads, tiny_scales = _submit_roles(op, (inputs[0], inputs[1], tiny))
-        torch.cuda.synchronize()
-        _exact(
-            tiny_payloads[2],
-            expected_payload.view(torch.uint8).flatten(),
-            f"e4m3_pc {label} payload",
-        )
-        _exact(tiny_scales[2], expected_scales, f"e4m3_pc {label} scales")
     # The dense f6f8 attention needs world_size * sequence % 128 == 0.
     if seq_full % 128 == 0:
         full_qk = tuple(_full_bshd(value, rank, world_size) for value in inputs[:2])
@@ -970,6 +963,25 @@ def _check_e4m3_pc(rank, world_size, heads, sequence, device, op_cls):
             softmax_scale=0.125,
         )
         _exact(actual, expected, "e4m3_pc packed/raw f6f8 attention")
+    # Zero inputs give zero payload; nonzero inputs below 1e-12 use the clamped
+    # scale but need not give zero payload. Runs after the attention check because
+    # submissions alias two-deep parity buffers, and a further submit would
+    # overwrite the call-3 buffers the consumer reads.
+    for label, fill in (("all-zero", None), ("tiny-amax", 1.0e-14)):
+        tiny = torch.zeros_like(inputs[2])
+        if fill is not None:
+            tiny[..., 7] = fill
+        expected_payload, expected_scales = quantize_v_fp8(
+            _full_bshd(tiny, rank, world_size)
+        )
+        tiny_payloads, tiny_scales = _submit_roles(op, (inputs[0], inputs[1], tiny))
+        torch.cuda.synchronize()
+        _exact(
+            tiny_payloads[2],
+            expected_payload.view(torch.uint8).flatten(),
+            f"e4m3_pc {label} payload",
+        )
+        _exact(tiny_scales[2], expected_scales, f"e4m3_pc {label} scales")
     return op, lambda: _submit_roles(op, inputs)
 
 
