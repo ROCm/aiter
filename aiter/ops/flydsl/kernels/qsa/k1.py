@@ -243,11 +243,18 @@ def build_qsa_k1_scores_module(
         lane_kg = _idiv(lane, Int32(16))
         vec_layout = fx.make_layout(vec, 1)
         g_copy = buf_copy_atom(16, BFloat16)
+        # A buffer resource is wave-uniform, so a per-lane wide row would
+        # waterfall. The wide gather is a raw 128-bit load instead.
+        k_copy = (
+            fx.make_copy_atom(fx.UniversalCopy128b(), BFloat16)
+            if const_expr(wide_cache)
+            else g_copy
+        )
         q_buf = fx.rocdl.make_buffer_tensor(q)
         # A V# voffset is 32 bits. A cache that fits in 4 GiB keeps one
         # uniform descriptor. A larger cache is a separate compile: each
-        # gathered row rebases its page in 64-bit, then a descriptor covers
-        # only that row. The two bodies are not both traced.
+        # gathered row rebases its page in 64-bit and is read with a raw
+        # 128-bit load. The two bodies are not both traced.
         if const_expr(wide_cache):
             k_base = buf_base_i64(k_cache)
             row_ptr_ty = fx.PointerType.get(
@@ -258,7 +265,6 @@ def build_qsa_k1_scores_module(
             page_elems64 = Int64(k_strides[0])
             token_elems64 = Int64(k_strides[1])
             head_elems64 = Int64(k_strides[2])
-            row_bytes = _D * 2
 
             def k_page_row(phys, page_off):
                 addr = k_base + (
@@ -266,16 +272,13 @@ def build_qsa_k1_scores_module(
                     + Int64(page_off) * token_elems64
                     + Int64(zero) * head_elems64
                 ) * Int64(2)
-                view = fx.make_view(
-                    fx.inttoptr(row_ptr_ty, addr),
-                    fx.make_layout((_D,), (1,)),
+                flat = fx.Tensor(
+                    fx.make_view(
+                        fx.inttoptr(row_ptr_ty, addr),
+                        fx.make_layout((_D,), (1,)),
+                    )
                 )
-                return fx.logical_divide(
-                    fx.rocdl.make_buffer_tensor(
-                        view, max_size=False, num_records_bytes=row_bytes
-                    ),
-                    vec_layout,
-                )
+                return fx.logical_divide(flat, vec_layout)
 
         else:
             k_buf = fx.rocdl.make_buffer_tensor(k_cache)
@@ -356,7 +359,7 @@ def build_qsa_k1_scores_module(
                 d_chunk = chunk + Int32(part * (block_threads // block_n))
                 k_src = fx.slice(k_row, (None, d_chunk))
                 k_frag = fx.make_fragment_like(k_src)
-                fx.copy(g_copy, k_src, k_frag)
+                fx.copy(k_copy, k_src, k_frag)
                 k_vec = fx.Vector(fx.memref_load_vec(k_frag))
                 kd0 = d_chunk * Int32(vec)
                 for i in range_constexpr(vec):
@@ -529,9 +532,16 @@ def build_qsa_k1_prefill_scores_module(
         lane_kg = _idiv(lane, Int32(16))
         vec_layout = fx.make_layout(vec, 1)
         g_copy = buf_copy_atom(16, BFloat16)
+        # A buffer resource is wave-uniform, so a per-lane wide row would
+        # waterfall. The wide gather is a raw 128-bit load instead.
+        k_copy = (
+            fx.make_copy_atom(fx.UniversalCopy128b(), BFloat16)
+            if const_expr(wide_cache)
+            else g_copy
+        )
         q_buf = fx.rocdl.make_buffer_tensor(q)
         # Same 4 GiB split as the one-row scorer: one whole-cache descriptor,
-        # or a separate compile that rebases each gathered row.
+        # or a separate compile that reads each gathered row raw.
         if const_expr(wide_cache):
             k_base = buf_base_i64(k_cache)
             row_ptr_ty = fx.PointerType.get(
@@ -542,7 +552,6 @@ def build_qsa_k1_prefill_scores_module(
             page_elems64 = Int64(k_strides[0])
             token_elems64 = Int64(k_strides[1])
             head_elems64 = Int64(k_strides[2])
-            row_bytes = _D * 2
 
             def k_page_row(phys, page_off):
                 addr = k_base + (
@@ -550,16 +559,13 @@ def build_qsa_k1_prefill_scores_module(
                     + Int64(page_off) * token_elems64
                     + Int64(zero) * head_elems64
                 ) * Int64(2)
-                view = fx.make_view(
-                    fx.inttoptr(row_ptr_ty, addr),
-                    fx.make_layout((_D,), (1,)),
+                flat = fx.Tensor(
+                    fx.make_view(
+                        fx.inttoptr(row_ptr_ty, addr),
+                        fx.make_layout((_D,), (1,)),
+                    )
                 )
-                return fx.logical_divide(
-                    fx.rocdl.make_buffer_tensor(
-                        view, max_size=False, num_records_bytes=row_bytes
-                    ),
-                    vec_layout,
-                )
+                return fx.logical_divide(flat, vec_layout)
 
         else:
             k_buf = fx.rocdl.make_buffer_tensor(k_cache)
@@ -661,7 +667,7 @@ def build_qsa_k1_prefill_scores_module(
                     )
                 k_src = fx.slice(k_row, (None, d_chunk))
                 k_frag = fx.make_fragment_like(k_src)
-                fx.copy(g_copy, k_src, k_frag)
+                fx.copy(k_copy, k_src, k_frag)
                 k_vec = fx.Vector(fx.memref_load_vec(k_frag))
                 d0 = d_chunk * Int32(vec)
                 for i in range_constexpr(vec):
