@@ -348,6 +348,13 @@ def _check_geometry(fmt, d_qk, kv_lora_rank, qk_rope_head_dim):
         return
     if fmt == "fp8_g64":
         return  # the whole row is the head; geometry args are not read
+    # The kernel's LDS tiles and Gluon tensors are kv_lora_rank / qk_rope_head_dim wide.
+    for name, dim in (
+        ("kv_lora_rank", kv_lora_rank),
+        ("qk_rope_head_dim", qk_rope_head_dim),
+    ):
+        if dim & (dim - 1):
+            raise ValueError(f"{name} must be a power of two, got {dim}")
     if d_qk != kv_lora_rank + qk_rope_head_dim:
         hint = (
             " A bf16 or fp8_scalar cache carries no rope information: pass "

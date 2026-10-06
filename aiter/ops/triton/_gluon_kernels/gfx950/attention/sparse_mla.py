@@ -906,8 +906,9 @@ def _qk_scores(cfg, q_dot, q_rope_dot, kv_smem, rope_smem):
     buffer (MFMA accumulates natively, so KV_DIM + ROPE_DIM is two dots)."""
     S = gl.zeros([cfg.BLOCK_M, cfg.BLOCK_K], gl.float32, layout=cfg.qk_layout)
     if cfg.Q_LDS:
-        # 128-dim chunks of Q and the matching K slice.
-        QC: gl.constexpr = 128
+        # 128-dim chunks of Q and the matching K slice (one chunk below 128).
+        QC: gl.constexpr = min(128, cfg.KV_DIM)
+        gl.static_assert(cfg.KV_DIM % QC == 0, "Q_LDS chunks must tile KV_DIM")
         for c in gl.static_range(cfg.KV_DIM // QC):
             q_c = q_dot.slice(c * QC, QC, dim=1).load(cfg.q_layout)
             k_c = kv_smem.slice(c * QC, QC, dim=1).permute([1, 0]).load(cfg.k_layout)
