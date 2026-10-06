@@ -92,10 +92,9 @@ def pa_prefill_sparse(
         kv_indptr_extend:  [T+1] int32 — true prefix sum. ``None`` for none.
         attn_sink:         [H] fp32 — per-head softmax-denom bias.
         softmax_scale:     float.
-        has_invalid:       whether index lists may hold ``-1`` / out-of-pool
-            slots. ``False`` skips masking them (a broken promise gives wrong
-            results but never reads outside the pool); ``None`` picks a
-            heuristic on gfx1250 and assumes ``True`` elsewhere.
+        has_invalid:       gfx1250 only: whether index lists may hold ``-1``
+            sentinels (``None`` picks a heuristic). The other branches always
+            skip ``-1`` and out-of-pool slots.
         out:               optional [T, H, D] output buffer, written in place.
 
     Returns:
@@ -284,7 +283,6 @@ def pa_prefill_sparse(
                 *args,
                 HAS_ATTN_SINK=has_attn_sink,
                 BLOCK_D=block_d,
-                HAS_INVALID=True if has_invalid is None else has_invalid,
                 USE_EXP2=True,
                 # The unmasked gather redirects bad slots to row 0, which must exist.
                 EVEN_HD=block_d == head_dim
@@ -304,7 +302,6 @@ def pa_prefill_sparse(
             *args,
             HAS_ATTN_SINK=has_attn_sink,
             BLOCK_D=block_d,
-            HAS_INVALID=True if has_invalid is None else has_invalid,
         )
         return out
 

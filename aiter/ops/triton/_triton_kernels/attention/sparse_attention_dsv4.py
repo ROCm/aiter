@@ -278,7 +278,6 @@ _sparse_attn_prefill_kernel_repr = make_kernel_repr(
         "BLOCK_H",
         "BLOCK_D",
         "BLOCK_K",
-        "HAS_INVALID",
         "USE_EXP2",
         "EVEN_HD",
     ],
@@ -314,10 +313,6 @@ def _sparse_attn_prefill_kernel(
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_K: tl.constexpr,
-    # False promises every slot in [indptr[i], indptr[i+1]) is a valid row, so
-    # no slot is masked out of the softmax (a broken promise gives wrong
-    # results, never an out-of-pool read).
-    HAS_INVALID: tl.constexpr = True,
     USE_EXP2: tl.constexpr = False,
     # head_dim == BLOCK_D and num_heads % BLOCK_H == 0: no q/kv/out masks.
     EVEN_HD: tl.constexpr = False,
@@ -369,18 +364,12 @@ def _sparse_attn_prefill_kernel(
     for k_start in tl.range(0, kv_len, BLOCK_K):
         k_pos = k_start + k_offsets
         in_range = k_pos < kv_len
-        if HAS_INVALID:
-            # One unsigned compare covers both -1 (wraps to 2^32 - 1) and slots
-            # past the pool; two signed compares cost ~10% of the kernel.
-            valid = in_range & (slot.to(tl.uint32, bitcast=True) < num_kv)
-            # Point invalid lanes at row 0 so the gather stays unmasked (and
-            # vectorized); their scores are masked to -inf below.
-            slot = tl.where(valid, slot, 0)
-        else:
-            # Caller promises every slot is valid; still keep the unmasked
-            # gather inside the pool if that promise is broken.
-            valid = in_range
-            slot = tl.where(slot.to(tl.uint32, bitcast=True) < num_kv, slot, 0)
+        # One unsigned compare covers both -1 (wraps to 2^32 - 1) and slots
+        # past the pool; two signed compares cost ~10% of the kernel.
+        valid = in_range & (slot.to(tl.uint32, bitcast=True) < num_kv)
+        # Point invalid lanes at row 0 so the gather stays unmasked (and
+        # vectorized); their scores are masked to -inf below.
+        slot = tl.where(valid, slot, 0)
 
         # 64-bit before the multiply, same as the decode kernel: a slot index
         # fits 32 bits (the index buffer is int32 by ABI) but `slot *

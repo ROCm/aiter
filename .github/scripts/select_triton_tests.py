@@ -26,6 +26,7 @@ CONFIGS = SRC + "configs/"
 GFX942_LAUNCH_PATHS = (
     SRC + "attention/pa_prefill_sparse.py",
     SRC + "_triton_kernels/attention/sparse_attention_dsv4.py",
+    "op_tests/triton_tests/attention/test_pa_prefill_sparse.py",
 )
 TESTS = "op_tests/triton_tests/"
 BENCH = "op_tests/op_benchmarks/triton/"

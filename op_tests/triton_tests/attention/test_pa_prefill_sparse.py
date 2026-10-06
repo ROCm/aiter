@@ -545,7 +545,6 @@ def test_pa_prefill_sparse_single_source(T, H, max_len, sentinels, with_sink):
         None,
         sink,
         scale,
-        has_invalid=sentinels,
         out=out,
     )
     assert ret is out
@@ -579,34 +578,8 @@ def test_pa_prefill_sparse_single_source_other_head_dims(D, sentinels):
     scale = D**-0.5
 
     ref = _sparse_prefill_single_source_torch(q, kv, indices, indptr, sink, scale)
-    out = pa_prefill_sparse(
-        q, kv, indices, indptr, None, None, None, sink, scale, has_invalid=sentinels
-    )
+    out = pa_prefill_sparse(q, kv, indices, indptr, None, None, None, sink, scale)
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
-
-
-# has_invalid=False is a promise; breaking it may give wrong numbers but must
-# never read outside the KV pool.
-@pytest.mark.parametrize("H", [8, 16])
-def test_pa_prefill_sparse_broken_has_invalid_promise_stays_in_bounds(H):
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA required")
-    if DEVICE_ARCH in ("gfx950", "gfx1250"):
-        pytest.skip("covers the Triton single-source branch")
-
-    torch.manual_seed(2)
-    T, D, num_kv, dev = 512, 512, 1024, "cuda"
-    q = torch.randn(T, H, D, dtype=torch.bfloat16, device=dev)
-    kv = torch.randn(num_kv, D, dtype=torch.bfloat16, device=dev)
-    indptr = torch.arange(0, (T + 1) * 64, 64, dtype=torch.int32, device=dev)
-    indices = torch.randint(0, num_kv, (T * 64,), dtype=torch.int32, device=dev)
-    indices[::3] = -1
-    indices[1::7] = num_kv + 10_000_000  # far past the pool
-    out = pa_prefill_sparse(
-        q, kv, indices, indptr, None, None, None, None, D**-0.5, has_invalid=False
-    )
-    torch.cuda.synchronize()
-    assert torch.isfinite(out).all()
 
 
 def _triton_branch_only():
@@ -653,3 +626,21 @@ def test_pa_prefill_sparse_rejects_strided_out():
         pa_prefill_sparse(
             q, kv, indices, indptr, None, None, None, None, 512**-0.5, out=out
         )
+
+
+# out= on whichever branch this device takes (Triton fallback, gfx950 or
+# gfx1250 Gluon): the supplied buffer is returned and holds the same result.
+def test_pa_prefill_sparse_out_buffer_every_branch():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    T, H, D = 512, 64, 512
+    two_sources = DEVICE_ARCH == "gfx1250"
+    q, ukv, p_idx, p_indptr, kv, e_idx, e_indptr, sink, scale = _make_inputs(
+        T, H, D, 128, 128 if two_sources else 1, T * 128, T * 128 if two_sources else 1
+    )
+    extend = (kv, e_idx, e_indptr) if two_sources else (None, None, None)
+    ref = pa_prefill_sparse(q, ukv, p_idx, p_indptr, *extend, sink, scale)
+    out = torch.full_like(q, float("nan"))
+    ret = pa_prefill_sparse(q, ukv, p_idx, p_indptr, *extend, sink, scale, out=out)
+    assert ret is out
+    assert torch.equal(out, ref)

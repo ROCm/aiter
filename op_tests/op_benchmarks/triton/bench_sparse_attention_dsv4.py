@@ -3,8 +3,10 @@
 
 """Benchmark for the DSV4 sparse MLA prefill kernels.
 
-Benchmarks the Triton prefill kernel against the Gluon (CDNA4 / gfx950) prefill
-backend and reports the speedup over Triton. The Gluon backend is the unified
+Benchmarks the autotuned Triton prefill kernel, the public `pa_prefill_sparse`
+entry (which takes the pinned per-arch launch, e.g. on gfx942 for H=8/16 at
+D=512), and the Gluon (CDNA4 / gfx950) prefill backend, and reports the speedup
+over Triton. The Gluon backend is the unified
 `mla_gluon(..., has_pe=False)` entry (HAS_PE=False over the shared `_mla_gluon`
 kernel) — the backend the production entrance uses. When Gluon is unavailable
 (non-gfx950 arch, or Triton < 3.6), only the Triton perf is reported.
@@ -22,6 +24,7 @@ import triton
 from aiter.ops.triton._triton_kernels.attention.sparse_attention_dsv4 import (
     _sparse_attn_prefill_kernel as csa_prefill_tl,
 )
+from aiter.ops.triton.attention.pa_prefill_sparse import pa_prefill_sparse
 
 # The Gluon prefill kernel is opt-in (gfx950 + Triton >= 3.6). Probe it once at
 # import time; the benchmark falls back to Triton-only when unavailable.
@@ -46,6 +49,20 @@ HEAD_DIM = NOPE_DIM + ROPE_DIM  # 512
 # ---------------------------------------------------------------------------
 # Bench data builder
 # ---------------------------------------------------------------------------
+def _alloc_kv(num_kv: int, device: str):
+    """KV pool as a view into a >2 GiB buffer, as vLLM passes it.
+
+    Triton on AMD specializes pointers whose storage is under 2 GiB for buffer
+    ops; a standalone small allocation would compile a different variant than
+    the one production runs.
+    """
+    rows = max(num_kv, (2**31 + 2**20) // (HEAD_DIM * 2))
+    pool = torch.empty(rows, HEAD_DIM, dtype=torch.bfloat16, device=device)
+    kv = pool[:num_kv]
+    kv.normal_()
+    return kv
+
+
 def _build_csr(num_q: int, max_slots: int, max_topk: int, device: str):
     lens = torch.randint(
         max(1, max_topk // 4),
@@ -101,6 +118,20 @@ def _launch_prefill(
     scale,
 ):
     block_d = triton.next_power_of_2(head_dim)
+    if backend == "pa_prefill_sparse":
+        pa_prefill_sparse(
+            q,
+            kv,
+            indices,
+            indptr,
+            None,
+            None,
+            None,
+            attn_sink if has_sink else None,
+            scale,
+            out=out,
+        )
+        return
     if backend == "gluon":
         mla_gluon(
             q,  # q_nope = combined-D query
@@ -208,7 +239,7 @@ def run_prefill_bench(args, device: str):
         q = torch.randn(
             num_queries, num_heads, HEAD_DIM, dtype=torch.bfloat16, device=device
         )
-        kv = torch.randn(num_kv, HEAD_DIM, dtype=torch.bfloat16, device=device)
+        kv = _alloc_kv(num_kv, device)
         indices, indptr, _ = _build_csr(num_queries, num_kv, topk, device)
         nnz = int(indptr[-1].item())  # number of non-zeros
         scale = 1.0 / (HEAD_DIM**0.5)
@@ -229,6 +260,11 @@ def run_prefill_bench(args, device: str):
             "triton", q, kv, indices, indptr, num_queries, num_heads, scale
         )
         tri_tflops, tri_gbps = _perf(tri_ms)
+        pa_ms = _time_backend(
+            "pa_prefill_sparse", q, kv, indices, indptr, num_queries, num_heads, scale
+        )
+        pa_tflops, _pa_gbps = _perf(pa_ms)
+        pa_cols = (pa_ms, pa_tflops, f"{tri_ms / pa_ms:.2f}x")
 
         if HAS_GLUON:
             glu_ms = _time_backend(
@@ -244,6 +280,7 @@ def run_prefill_bench(args, device: str):
                     topk,
                     tri_ms,
                     tri_tflops,
+                    *pa_cols,
                     glu_ms,
                     glu_tflops,
                     f"{speedup:.2f}x",
@@ -251,7 +288,16 @@ def run_prefill_bench(args, device: str):
             )
         else:
             rows.append(
-                (num_queries, num_heads, num_kv, topk, tri_ms, tri_tflops, tri_gbps)
+                (
+                    num_queries,
+                    num_heads,
+                    num_kv,
+                    topk,
+                    tri_ms,
+                    tri_tflops,
+                    tri_gbps,
+                    *pa_cols,
+                )
             )
 
     if HAS_GLUON:
@@ -262,12 +308,26 @@ def run_prefill_bench(args, device: str):
             "topk",
             "triton ms",
             "triton TFLOPS",
+            "pa_prefill_sparse ms",
+            "pa_prefill_sparse TFLOPS",
+            "vs triton",
             "gluon ms",
             "gluon TFLOPS",
             "speedup",
         ]
     else:
-        headers = ["Q", "H", "Kv", "topk", "triton ms", "triton TFLOPS", "triton GB/s"]
+        headers = [
+            "Q",
+            "H",
+            "Kv",
+            "topk",
+            "triton ms",
+            "triton TFLOPS",
+            "triton GB/s",
+            "pa_prefill_sparse ms",
+            "pa_prefill_sparse TFLOPS",
+            "vs triton",
+        ]
     _print_table("PREFILL", headers, rows)
 
 
@@ -304,7 +364,7 @@ def check_correctness(device: str):
     indices, indptr, _ = _build_csr(num_queries, num_kv, topk, device)
     scale = 1.0 / (HEAD_DIM**0.5)
 
-    backends = ["triton", "gluon"] if HAS_GLUON else ["triton"]
+    backends = ["triton", "pa_prefill_sparse"] + (["gluon"] if HAS_GLUON else [])
     for backend in backends:
         for has_sink in (False, True):
             attn_sink = (
@@ -355,6 +415,9 @@ def _parse_args():
             "4096,128,4096,1024",
             "8192,128,8192,512",
             "8192,128,8192,1024",
+            # DSv4.1-Flash TP4 prefill on gfx942: top-512 + 128 SWA
+            "16384,16,65536,640",
+            "16384,8,65536,640",
         ],
     )
     args = p.parse_args()
