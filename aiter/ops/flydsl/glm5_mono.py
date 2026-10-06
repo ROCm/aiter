@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+
+"""GLM-5 fused decode-layer MonoKernel for gfx950.
+
+One persistent launch per MoE layer and rank covers input RMSNorm, the MLA
+projections, RoPE and KV-cache insert, sparse attention over precomputed
+indices, o_proj with an in-kernel all-reduce, the router, and the MXFP4
+experts with an in-kernel all-reduce. Device code from ROCm/FlyDSL#1204,
+host wrapper and TP4 paths from ROCm/ATOM#2435.
+"""
+
+from aiter.ops.flydsl.kernels.glm5_mono.config import (
+    GLM5_KERNEL_SAMPLES,
+    AttentionWeight,
+    KvCacheLayout,
+    Mxfp4ScaleLayout,
+    Mxfp4WeightLayout,
+    glm5_kernel_samples,
+    glm5_tp_config,
+)
+from aiter.ops.flydsl.kernels.glm5_mono.glm.op import (
+    Glm5MonoKernel,
+    prepare_glm5_weights,
+)
+from aiter.ops.flydsl.kernels.glm5_mono.weights import LayerWeights
+
+__all__ = [
+    "GLM5_KERNEL_SAMPLES",
+    "AttentionWeight",
+    "Glm5MonoKernel",
+    "KvCacheLayout",
+    "LayerWeights",
+    "Mxfp4ScaleLayout",
+    "Mxfp4WeightLayout",
+    "glm5_kernel_samples",
+    "glm5_mono_launch_rows",
+    "glm5_tp_config",
+    "prepare_glm5_weights",
+]
+
+
+def glm5_mono_launch_rows(rows: int, query_length: int = 1) -> tuple[int, int]:
+    """Return ``(padded_rows, chunk)`` for a decode step of ``rows`` query rows.
+
+    A one-row launch never completes on gfx950, so one row is padded to two.
+    The pad row must carry slot -1 and an empty sparse-index range, so it
+    writes no cache entry and attends to nothing.
+    """
+    padded = 2 if rows == 1 and query_length == 1 else rows
+    return padded, glm5_kernel_samples(padded, query_length)
