@@ -38,6 +38,26 @@ def _gemm_tilescale_asm(
 
 
 @functools.lru_cache(maxsize=None)
+def _manifest(arch: str = "gfx950"):
+    path = os.path.join(AITER_META_DIR, "hsa", arch, "tsgemm", "tsgemm_bf16_per1x32.csv")
+    if not os.path.exists(path):
+        return ()
+    with open(path) as f:
+        return tuple(
+            {k: (v if k in ("knl_name", "co_name") else int(v)) for k, v in r.items()}
+            for r in csv.DictReader(f)
+            if int(r["ts_ver"]) == TILESCALE_VERSION
+        )
+
+
+@functools.lru_cache(maxsize=None)
+def _generic(arch: str = "gfx950"):
+    """{(a_fmt, b_fmt, b_codes, b_ilv, bias, kcls): kmin} of the shape-generic rows."""
+    return {(r["a_fmt"], r["b_fmt"], r["b_codes"], r["b_ilv"], r["bias"], r["kcls"]): r["kmin"]
+            for r in _manifest(arch) if r["abi"] == 2}
+
+
+@functools.lru_cache(maxsize=None)
 def _rows(arch: str = "gfx950"):
     path = os.path.join(AITER_META_DIR, "hsa", arch, "tsgemm", "tsgemm_bf16_per1x32.csv")
     if not os.path.exists(path):
@@ -53,7 +73,14 @@ def _rows(arch: str = "gfx950"):
 
 def tilescale_supported(M: int, N: int, K: int, a_fmt: int, b_fmt: int, bias: bool = False, b_codes: int = 0,
                         b_ilv: int = 0) -> bool:
-    return (a_fmt, b_fmt, b_codes, b_ilv, int(bias), M, N, K) in _rows()
+    """Whether a kernel exists for the call: an exact-shape row, or the shape-generic row of K's K-loop class
+    (M, N multiples of 256, K a multiple of 512 and at least the row's kmin)."""
+    if (a_fmt, b_fmt, b_codes, b_ilv, int(bias), M, N, K) in _rows():
+        return True
+    if M % 256 or N % 256 or K % 512:
+        return False
+    kmin = _generic().get((a_fmt, b_fmt, b_codes, b_ilv, int(bias), (K // 128) % 12))
+    return kmin is not None and K >= kmin
 
 
 def a4w4_b_ilv(M: int, N: int, K: int) -> int:

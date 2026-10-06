@@ -22,6 +22,9 @@
 //   0  the FlyDSL MXFP4 GEMM's 160-byte kernarg (A4W4)
 //   1  the FlyDSL MXFP6 GEMM's 156-byte kernarg, 172 with bias (A6W6, and A6W4 with B's C1 slot
 //      aliasing B: the kernel never reads it)
+//   2  abi 1 with K in the dword after N: the shape-generic kernels (M = N = K = 0 in the manifest), which
+//      serve every M, N (multiples of 256) and every K in their K-loop class -- K/128 = kcls (mod 12) and
+//      K >= kmin -- one tile per workgroup (grid = tiles).
 namespace {
 constexpr size_t kTensorAlignment = 16;
 
@@ -58,7 +61,7 @@ struct __attribute__((packed)) KernelArgsFly6
     uint32_t sb_dwords;
     uint32_t M;
     uint32_t N;
-    uint32_t mn_pad;
+    uint32_t K; // abi 2 only (0 for abi 1)
     void* ptr_bias;
     uint32_t bias_elems;
 };
@@ -113,6 +116,17 @@ const tsgemmConfig* find_row(const std::string& arch,
             found = &c;
             break;
         }
+    }
+    // No exact row: the shape-generic kernel of this K-loop class, if any.
+    for(const auto& kv : cfg_tsgemm_bf16_per1x32)
+    {
+        if(found != nullptr)
+            break;
+        const auto& c = kv.second;
+        if(c.arch == arch && c.abi == 2 && c.a_fmt == a_fmt && c.b_fmt == b_fmt &&
+           c.b_codes == b_codes && c.b_ilv == b_ilv && c.bias == static_cast<int>(bias) &&
+           K % 512 == 0 && (K / 128) % 12 == c.kcls && K >= c.kmin)
+            found = &c;
     }
     cache.emplace(key, found);
     return found;
@@ -180,7 +194,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     const std::string arch = get_gpu_arch();
     const tsgemmConfig* cfg =
         find_row(arch, a_fmt, b_fmt, b_codes, b_ilv, bias != nullptr, M, N, K);
-    AITER_CHECK(cfg != nullptr && cfg->grid > 0,
+    AITER_CHECK(cfg != nullptr && (cfg->grid > 0 || cfg->abi == 2),
                 __func__,
                 " no tilescale kernel for a" + std::to_string(a_fmt) + "w" +
                     std::to_string(b_fmt) + " " + std::to_string(M) + "x" + std::to_string(N) +
@@ -218,7 +232,9 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     }
     else
     {
-        AITER_CHECK(cfg->abi == 1 && a_fmt == 6, __func__, " unknown abi / format pairing");
+        AITER_CHECK((cfg->abi == 1 || cfg->abi == 2) && a_fmt == 6,
+                    __func__,
+                    " unknown abi / format pairing");
         std::memset(&a6, 0, sizeof(a6));
         a6.A0 = memref(pa, M, K / 2);
         a6.A1 = memref(pa + M * K / 2, M, K / 4);
@@ -243,7 +259,8 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         a6.sb_dwords = static_cast<uint32_t>(bytes(B_scale) / 4);
         a6.M         = static_cast<uint32_t>(M);
         a6.N         = static_cast<uint32_t>(N);
-        arg_size     = kFly6NoBias;
+        a6.K         = cfg->abi == 2 ? static_cast<uint32_t>(K) : 0u;
+        arg_size     = kFly6NoBias + (cfg->abi == 2 ? 4 : 0);
         if(bias != nullptr)
         {
             a6.ptr_bias   = bias->ptr;
@@ -259,5 +276,6 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     const char* co   = cfg->co_name.c_str();
     AiterAsmKernel* impl =
         &impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name, co); });
-    impl->launch_kernel({args, &arg_size, cfg->grid, 1, 1, 256, 1, 1, stream});
+    const int grid = cfg->abi == 2 ? static_cast<int>((M / 256) * (N / 256)) : cfg->grid;
+    impl->launch_kernel({args, &arg_size, grid, 1, 1, 256, 1, 1, stream});
 }

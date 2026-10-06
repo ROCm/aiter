@@ -34,7 +34,8 @@ def _manifest():
         return [{k: (v if k in ("knl_name", "co_name") else int(v)) for k, v in r.items()} for r in csv.DictReader(f)]
 
 
-ROWS = _manifest()
+ROWS = [r for r in _manifest() if r["abi"] != 2]  # exact-shape rows
+GENERIC_ROWS = [r for r in _manifest() if r["abi"] == 2]
 A6W4 = [r for r in ROWS if (r["a_fmt"], r["b_fmt"]) == (6, 4)]
 
 
@@ -150,3 +151,38 @@ def test_row_vs_fp64(row):
         ref = ref + bv.double()
     err = (out.double() - ref).abs()
     assert float(err.max()) <= float(ref.abs().max()) * 2**-7, float(err.max())
+
+
+GENERIC = GENERIC_ROWS
+
+
+def _generic_shapes(row):
+    k0 = row["kmin"]
+    return [(768, 1280, k0), (512, 768, k0 + 1536)]
+
+
+@requires_gfx950
+@pytest.mark.parametrize("row", GENERIC, ids=lambda r: r["knl_name"])
+def test_generic_row_vs_fp64(row):
+    """A shape-generic row on shapes no exact-shape row covers, two K values of its class."""
+    for M, N, K in _generic_shapes(row):
+        assert (K // 128) % 12 == row["kcls"]
+        assert tilescale_supported(M, N, K, row["a_fmt"], row["b_fmt"], bool(row["bias"]), row["b_codes"])
+        r = dict(row, M=M, N=N, K=K)
+        test_row_vs_fp64(r)
+
+
+@requires_gfx950
+@pytest.mark.parametrize("cls", sorted({r["kcls"] for r in GENERIC}))
+@pytest.mark.parametrize("bias", [0, 1])
+def test_generic_a6w4_bitwise_vs_a6w6(cls, bias):
+    row = next(r for r in GENERIC if r["kcls"] == cls and r["bias"] == bias and r["b_fmt"] == 4)
+    for M, N, K in _generic_shapes(row):
+        a6, b4, sa, sb, bv = _operands(M, N, K, 5 + M + K, bool(bias))
+        A, SA, SB = TS.pack_fp6_codes_ref(a6), TS.pack_scales_ref(sa, is_b=False), TS.pack_scales_ref(sb, is_b=True)
+        B6 = TS.pack_fp6_codes_ref(((b4 & 8) << 2) | ((b4 & 6) << 2) | ((b4 & 1) << 2))
+        ref = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
+        gemm_mx_tilescale(A, B6, SA, SB, ref, 6, 6, K, bv)
+        out = torch.empty_like(ref)
+        gemm_a6w4_tilescale(A, TS.pack_fp4_codes_ref(b4, "k128"), SA, SB, out, K, bv)
+        assert torch.equal(out.view(torch.int16), ref.view(torch.int16))
