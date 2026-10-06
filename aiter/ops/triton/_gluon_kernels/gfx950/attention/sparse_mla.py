@@ -153,14 +153,14 @@ def _cache_load(
 
 
 @gluon.jit
-def _fp8_to_f32(x_u8):
-    return x_u8.to(gl.float8e4nv, bitcast=True).to(gl.float32)
+def _fp8_to_f32(x_u8, FP8_TY: gl.constexpr):
+    return x_u8.to(FP8_TY, bitcast=True).to(gl.float32)
 
 
 @gluon.jit
-def _fp8_to_bf16(x_u8):
+def _fp8_to_bf16(x_u8, FP8_TY: gl.constexpr):
     # Exact: fp8's 3 mantissa bits fit bf16's 8.
-    return x_u8.to(gl.float8e4nv, bitcast=True).to(gl.bfloat16)
+    return x_u8.to(FP8_TY, bitcast=True).to(gl.bfloat16)
 
 
 @gluon.jit
@@ -328,6 +328,11 @@ class Cfg:
     IDX_BUFFER_LOAD: gl.constexpr
     FP8_MFMA: gl.constexpr  # "fp8_scalar" only: feed the matrix core the cache's
     # own fp8 instead of dequantizing to bf16
+    # fp8 encoding of the cache, q and the dot operands: e4m3fnuz (gfx942's native,
+    # which its fp8 MFMA reads) or OCP e4m3 (gfx950's)
+    FP8_FNUZ: gl.constexpr
+    FP8_TY: gl.constexpr
+    FP8_MAX: gl.constexpr
     # Cache policy per load site
     GATHER_CACHE: gl.constexpr
     IDX_CACHE: gl.constexpr
@@ -386,6 +391,7 @@ class Cfg:
         DSV4_WALK=False,
         SCL_DWORD=False,
         STAGED_K32=False,
+        FP8_FNUZ=False,
     ):
         self.BLOCK_M = gl.constexpr(BLOCK_M)
         self.BLOCK_K = gl.constexpr(BLOCK_K)
@@ -407,6 +413,9 @@ class Cfg:
         self.HEAD_ALIGNED = gl.constexpr(HEAD_ALIGNED)
         self.IDX_BUFFER_LOAD = gl.constexpr(IDX_BUFFER_LOAD)
         self.FP8_MFMA = gl.constexpr(FP8_MFMA)
+        self.FP8_FNUZ = gl.constexpr(FP8_FNUZ)
+        self.FP8_TY = gl.constexpr(gl.float8e4b8 if FP8_FNUZ else gl.float8e4nv)
+        self.FP8_MAX = gl.constexpr(240.0 if FP8_FNUZ else 448.0)
         self.GATHER_CACHE = gl.constexpr(GATHER_CACHE)
         self.IDX_CACHE = gl.constexpr(IDX_CACHE)
         self.ASYNC_LDS = gl.constexpr(ASYNC_LDS)
@@ -735,13 +744,13 @@ def _deq_store(x_u8, sc, kv_smem, off, cfg, fmt, AXIS: gl.constexpr):
                 x_u8.to(gl.float8e4nv, bitcast=True), sc, gl.bfloat16
             )
         elif fmt.KIND == "fp8_scalar":
-            val = _fp8_to_bf16(x_u8)
+            val = _fp8_to_bf16(x_u8, cfg.FP8_TY)
         else:
             gl.static_assert(
                 fmt.KIND == "fp8_g64" or fmt.KIND == "fp8_dsv32_mla",
                 "fp8_dsv4_mla dequantizes with DEQ upcast or asm",
             )
-            val = (_fp8_to_f32(x_u8) * sc).to(gl.bfloat16)
+            val = (_fp8_to_f32(x_u8, cfg.FP8_TY) * sc).to(gl.bfloat16)
         if AXIS == 1:
             kv_smem.slice(off, x_u8.shape[1], dim=1).store(val)
         else:
@@ -1207,7 +1216,7 @@ def _stage(cfg, seg, x_u8, sc, k_rope, kv_smem, rope_smem):
         elif fmt.KIND == "fp8_dsv32_mla":
             rope_smem.store(k_rope)
         elif fmt.KIND == "fp8_scalar" and cfg.ROPE_SEPARATE:
-            rope_smem.store(_fp8_to_bf16(k_rope))
+            rope_smem.store(_fp8_to_bf16(k_rope, cfg.FP8_TY))
         # "fp8_g64": the whole head is one fp8 tile; nothing else to store.
 
 
@@ -2239,6 +2248,9 @@ def _sparse_mla(
     IDX_BUFFER_LOAD: gl.constexpr,
     HAS_INVALID: gl.constexpr,
     FP8_MFMA: gl.constexpr = False,
+    # fp8 is e4m3fnuz (gfx942) rather than OCP e4m3: the cache, the q this kernel
+    # quantizes, and the fp8 dot operands.
+    FP8_FNUZ: gl.constexpr = False,
     # q already quantized to e4m3 by the caller, plus the scalar f32 scale it
     # was quantized with. This is the calling convention aiter's asm
     # mla_decode_fwd uses, where vLLM passes layer._q_scale.
@@ -2397,6 +2409,7 @@ def _sparse_mla(
         DSV4_WALK,
         CS0_ALIGN >= 4,
         STAGED_K32,
+        FP8_FNUZ,
     )
     main_fmt = Fmt(
         cfg,
