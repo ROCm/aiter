@@ -42,6 +42,9 @@ MEGA_MHC_DEFAULTS = {
     "DIST_SPIN": 1024,  # D2: polls a waiting split spins before it hands its columns off
     "LATE_DESC": False,  # D3: build late-use descriptors after the first loads are issued
     "SHUFFLE_DPP": 0,  # D3b: lane xor exchange by DPP: 1 = Sinkhorn gates, 2 = also main pass
+    "SEG128": False,  # G1: 128 B-line stream layout (8 lanes per row line, TILE_K = 64)
+    "NT_LD": False,  # G1: nt hint on the R / y stream loads only
+    "NT_ST": False,  # G1: nt hint on the R' / FP8 q stream stores only
 }
 
 _TOKENS_CFG = {
@@ -71,6 +74,34 @@ _DIST_MIN_T = 4
 # D3 LATE_DESC (sweep/d3_hoist_loads.md): it pays only from nine token blocks up (T > 128) and
 # up to ~24 blocks (T <= 384); below and above it measures <= 1%.
 _LATE_DESC_T = (128, 384)
+
+# G1 SEG128 + nt (sweep/g1_seg128.md). nt on the stream loads pays only once the bytes the seam
+# moves (R, y read + R', out written) no longer fit the 256 MB MALL; below that the eager
+# (MALL-hot) kernel is up to 44% slower with it. Measured boundaries at H = 5120: bf16 loses at
+# T = 2496 (256 MB) and wins from 2560 (262 MB); fp8 loses at 2752 (270 MB), wins at 3072 (301 MB).
+_NT_LD_MIN_BYTES = {False: 262e6, True: 300e6}  # keyed on out_fp8
+_G1_BF16_DECODE_MIN_T = 256  # bf16 10-way decode split: T = 160 / 208 gain < 1%
+
+
+def _seam_bytes(T: int, H: int, out_fp8: bool) -> float:
+    """HBM bytes of one post-mix seam: R (4H) + y read, R' (4H) + bf16 x1 / FP8 q + scales."""
+    return T * H * (2 * 4 + 2 + 2 * 4 + (1 + 4 / 32 if out_fp8 else 2))
+
+
+def _with_seg128(T: int, H: int, cfg: dict, out_fp8: bool, decode_split: bool) -> dict:
+    """``cfg`` with the G1 128 B-line stream layout and nt hints where both the eager and
+    the CUDA-graph time measured > 1% faster (see ``get_mega_mhc_config``)."""
+    if cfg["TILE_K"] != 64:
+        return cfg
+    ks = cfg["NUM_KSPLIT"]
+    nt_ld = _seam_bytes(T, H, out_fp8) >= _NT_LD_MIN_BYTES[out_fp8]
+    if decode_split:
+        if ks == 5 or (ks == 10 and not out_fp8 and T < _G1_BF16_DECODE_MIN_T):
+            return cfg
+        return dict(cfg, SEG128=True, NT_ST=True)
+    if ks == 5 and not nt_ld:  # bf16 P4 split at T = 2464..2559: no variant wins
+        return cfg
+    return dict(cfg, SEG128=True, NT_ST=True, NT_LD=nt_ld)
 
 
 def get_mega_mhc_config(
@@ -150,6 +181,24 @@ def get_mega_mhc_config(
       -2..-4%; FP8 T = 144..192: -9% (eager and graph). Neutral (<= 1%) at T <= 128 and at
       T >= 400 and 3-5% slower for FP8 at 10 splits (T = 208..256), so it is off there.
 
+    * G1 (``sweep/g1_seg128.md``): every ``TILE_K == 64`` kernel uses the 128 B-line stream
+      layout ``SEG128`` with the nt hint on the R' / FP8 q stores (``NT_ST``), and from a seam
+      footprint (R, y read + R', out written) of 262 MB (bf16, T >= 2560 at H = 5120) / 300 MB
+      (FP8, T >= 3064) also on the R / y loads (``NT_LD``), except where no variant wins:
+      the 5-way decode split (T = 385..816), the bf16 10-way decode split below T = 256 and
+      the bf16 P4 5-way split below the ``NT_LD`` footprint (T = 2464..2559). Rule: a
+      (dtype, regime) is switched on only if every measured T improves by > 1% in both the
+      eager kernel time (``run_perftest``, inputs MALL-hot) and the CUDA-graph per-launch
+      time (two rotating input sets from T = 2048, HBM-honest; one set below), paired and
+      interleaved, 3 processes x 5 repeats. SEG128 alone measures -9..+5% (mostly within
+      +-3%); the gain is the nt hint, which the 128 B lines make pay (nt loads on the 64 B
+      layout are slower almost everywhere, by up to 55%).
+      Measured (eager / graph): bf16 T = 4096 -7.1% / -6.0%, 8192 -6.4% / -8.1%, 16384
+      (token kernel) -2.6% / -11.2%, 16400 -9.0% / -11.1%; FP8 4096 -8.6% / -9.3%, 8192
+      (persistent walk) -8.6% / -10.0%, 16384 -7.4% / -6.0%; decode T = 384 -7% / -8%,
+      T = 2048 -3% / -27..-29% (NT_ST only; the graph gain is partly the second input set
+      staying MALL-resident). ``SEG128`` / ``NT_LD`` / ``NT_ST`` are bit-identical knobs.
+
     ``NT_STREAMS`` stays off at every size (D1, ``sweep/d1_nt_streams_decode.md``):
     paired off/on timing finds no (dtype, T) range where it wins by >= 2% in both
     the eager kernel time and the CUDA-graph per-launch time. Decode (T <= 192) is
@@ -181,6 +230,7 @@ def get_mega_mhc_config(
                 )
         else:
             cfg.update(_TOKENS_CFG)
+        cfg = _with_seg128(T, H, cfg, out_fp8, False)
         check_config(H, cfg)
         return cfg
     nblk = -(-T // 16)
@@ -227,6 +277,7 @@ def get_mega_mhc_config(
         and (not out_fp8 or ks == _MAX_SPLIT)
     ):
         cfg["LATE_DESC"] = True  # D3: scalar-load round trip off the critical path
+    cfg = _with_seg128(T, H, cfg, out_fp8, decode_split)
     try:
         check_config(H, cfg)
     except ValueError:
@@ -235,6 +286,7 @@ def get_mega_mhc_config(
         cfg = dict(
             MEGA_MHC_DEFAULTS, SHUFFLE_DPP=1, **_TOKENS_CFG
         )  # H too narrow for 8 col warps
+        cfg = _with_seg128(T, H, cfg, out_fp8, False)
         check_config(H, cfg)
     return cfg
 
