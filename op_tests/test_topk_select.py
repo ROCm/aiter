@@ -28,6 +28,7 @@ from aiter import dtypes
 from aiter.jit.utils.chip_info import _LDS_CAPACITY_BYTES as LDS_CAPACITY
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.tensor_shim import wave_size_of
+from aiter.ops.topk import topk_sampled_supports
 from aiter.ops.topk_select import (
     _available,
     topk_select,
@@ -66,7 +67,7 @@ def test_topk_select(m, n, k, tie, deterministic):
     x = torch.randn(m, n, dtype=dtypes.fp32)
     row_lens = torch.full((m,), n, dtype=dtypes.i32)
     ref = run_torch(x, row_lens, k)
-    serving = _available(n, k, wave_size_of(x.device.index), False)
+    serving = _serving(m, n, k, wave_size_of(x.device.index), False)
 
     candidates = {
         "topk_select": lambda: topk_select(x, k, tie=tie, deterministic=deterministic)[
@@ -191,6 +192,22 @@ def test_half_invariants(m, n):
     return failures
 
 
+def _serving(rows, width, k, wave, ragged):
+    """The backends that serve this shape on this device.
+
+    `_available` plus the row-count half of sampled's predicate, which it cannot
+    ask; off gfx950 that half declines every shape.
+    """
+    served = set(_available(width, k, wave, ragged))
+    if "sampled" in served and not topk_sampled_supports(rows, width, k):
+        served.discard("sampled")
+    return frozenset(served)
+
+
+class _NotServed(AssertionError):
+    """The backend asked for does not serve the shape on this device."""
+
+
 def _run_single_backend(x, row_lens, k, backend, end=None, output_idx=None):
     """Call one backend through the entry by hiding the others from it.
 
@@ -212,7 +229,11 @@ def _run_single_backend(x, row_lens, k, backend, end=None, output_idx=None):
     try:
         rows, width = x.shape
         wave = wave_size_of(x.device.index)
-        served = ts._available(width, k, wave, end is not None) & {backend}
+        served = _serving(rows, width, k, wave, end is not None) & {backend}
+        if not served:
+            raise _NotServed(
+                f"{backend} does not serve {rows}x{width} k={k} on {get_gfx()}"
+            )
         picked = ts.topk_select_backend(rows, width, k, served)
         if picked != backend:
             raise AssertionError(f"asked for {backend}, the dispatch chose {picked}")
@@ -247,7 +268,7 @@ def test_strided_layouts():
     backends wrote dense rows into a strided `output_idx` or read a strided
     `end` as dense, and all of them returned plausible tensors.
     """
-    failures = []
+    failures, not_served = [], set()
     for backend, m, n, k, dtype in _STRIDED_ROUTES:
         for layout in ("input", "input+end", "output", "end"):
             torch.manual_seed(0)
@@ -275,6 +296,11 @@ def test_strided_layouts():
             try:
                 idx = _run_single_backend(x, lens, k, backend, end=end, output_idx=out)
                 torch.cuda.synchronize()
+            except _NotServed:
+                # A route this device does not have, e.g. stream at these widths
+                # on gfx942; reported below rather than counted as a failure.
+                not_served.add(f"{backend} {m}x{n} k={k} {layout}")
+                continue
             except Exception as e:  # noqa: BLE001
                 failures.append(f"{label}: {type(e).__name__}: {e}")
                 continue
@@ -286,6 +312,13 @@ def test_strided_layouts():
                 failures.append(f"{label}: not written into output_idx in place")
     for label in failures:
         aiter.logger.error("STRIDED LAYOUT FAILED: %s", label)
+    if not_served:
+        aiter.logger.warning(
+            "strided layouts: %d routes not served on %s, skipped: %s",
+            len(not_served),
+            get_gfx(),
+            sorted(not_served),
+        )
     return failures
 
 
