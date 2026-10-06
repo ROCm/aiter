@@ -827,10 +827,12 @@ def _num_cus(device_index: int = 0) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
-# Blocks pass A should end up with, in units of the CU count.
+# Blocks pass A should end up with, in units of the CU count, and the most
+# segments per sequence taken for that reason alone.
 _SEG_TARGET_BLOCKS = 3
 _SEG_MAX_SEGMENTS = 16
-_SEG_MAX_CHUNKS = 32
+# Longest segment, however many segments that takes.
+_SEG_MAX_CHUNKS = 64
 _SEG_MIN_CHUNKS = 64
 
 _SCAN_BV_NARROW = 16
@@ -852,7 +854,10 @@ def _choose_chunks_per_seg(n_chunks_max: int, n_seqs: int, H: int, V: int) -> in
     H=12, V=128 that is 48 blocks against 256 CUs. Segmenting buys blocks by
     turning one pass into three -- pass A, the cross-segment scan, and pass C --
     so what decides the length is the block count it lands on rather than the
-    sequence length on its own.
+    sequence length on its own. Once taken, segments are also kept to
+    ``_SEG_MAX_CHUNKS``: on gfx950, 64-chunk segments beat longer ones by up to
+    1.9x on long few-head sequences (1 x 131072 x 4), where the occupancy target
+    alone gives 256-chunk ones.
     """
     override = os.getenv("CHUNK_DELTA_ATTN_FLASH_KDA_SEG", "").strip()
     if override:
@@ -867,12 +872,12 @@ def _choose_chunks_per_seg(n_chunks_max: int, n_seqs: int, H: int, V: int) -> in
     # up for.
     if n_chunks_max < _SEG_MIN_CHUNKS:
         return n_chunks_max
-    # Enough segments to fill the device, and enough to keep a segment's own
-    # serial walk from becoming the limit on a long sequence. Capped over both,
-    # since the two extra passes scale with the segment count.
-    segs = min(
-        _SEG_MAX_SEGMENTS,
-        max(_SEG_TARGET_BLOCKS * cus / blocks, n_chunks_max / _SEG_MAX_CHUNKS),
+    # Enough segments to fill the device, capped since the two extra passes
+    # scale with the segment count; and however many more it takes to keep a
+    # segment's own serial walk from becoming the limit on a long sequence.
+    segs = max(
+        min(_SEG_MAX_SEGMENTS, _SEG_TARGET_BLOCKS * cus / blocks),
+        n_chunks_max / _SEG_MAX_CHUNKS,
     )
     # To a power of two, the grid the constants were calibrated on.
     return max(1, min(n_chunks_max, 1 << round(math.log2(n_chunks_max / segs))))
