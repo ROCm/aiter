@@ -425,6 +425,175 @@ def test_flydsl_compress_attn(shape_label, bs, mtp, mode, path):
     }
 
 
+STRIDE_IN_ROW_PAD = 64  # extra bf16 columns per kv_in/score_in row (even)
+STRIDE_STATE_POS_PAD = 32  # extra f32 columns per kv_state/score_state ring row
+STRIDE_STATE_SLOT_PAD = 128  # extra f32 elements per state slot (arena entry)
+
+
+def _strided_in_view(dense):
+    """Column slice of a wider NaN-filled buffer: stride(0) > DIM_FULL,
+    stride(-1) == 1. Any row-stride slip lands in the NaN pad columns."""
+    n, dim_full = dense.shape
+    buf = torch.full((n, dim_full + STRIDE_IN_ROW_PAD), float("nan"), dtype=dense.dtype)
+    view = buf[:, :dim_full]
+    view.copy_(dense)
+    return view
+
+
+def _strided_state_view(dense, slot_of_batch):
+    """Per-request arena view of a [bs, state_size, dim_full] state: ring rows
+    padded (pos stride > DIM_FULL), slot stride > state_size*pos_stride, one
+    spare leading slot, and batch b stored at arena slot ``slot_of_batch[b]``.
+    Everything outside the view stays NaN."""
+    bs, state_size, dim_full = dense.shape
+    n_slots = bs + 1
+    pos_stride = dim_full + STRIDE_STATE_POS_PAD
+    slot_stride = state_size * pos_stride + STRIDE_STATE_SLOT_PAD
+    arena = torch.full((n_slots * slot_stride,), float("nan"), dtype=dense.dtype)
+    view = arena.as_strided(
+        (n_slots, state_size, dim_full), (slot_stride, pos_stride, 1)
+    )
+    for b in range(bs):
+        view[int(slot_of_batch[b])].copy_(dense[b])
+    return view
+
+
+@benchmark()
+def test_flydsl_compress_attn_strided(shape_label, bs, mtp, path):
+    """Strided-view coverage for the stride arguments the kernel takes.
+
+    ``kv_in``/``score_in`` get a padded row stride and ``kv_state``/
+    ``score_state`` become arena views with a padded ring (pos) stride and a
+    slot stride larger than ``state_size*DIM_FULL``; ``state_slot_mapping`` is
+    a non-identity permutation into the arena so slot != batch. All padding is
+    NaN. Decode mode reads the state cache for every sequence (window_len > 0).
+
+    The strided run must be bit-identical to the same kernel on dense copies
+    (strides are runtime args, so it is the same compiled kernel) and match the
+    pure-torch reference. A dropped, swapped or mis-scaled kv_in row stride,
+    state slot stride or state pos stride reads NaN pad or another slot's data.
+    """
+    shape = _shape_by_label(shape_label)
+    _, D, RD, ratio, overlap, quant_mode, ue8m0, _preshuffle = shape
+    quant = quant_mode in ("fp8", "fp4")
+    use_2kernel = path == "2kernel"
+    inp = _build_inputs(shape, bs, mtp, "decode")
+
+    # Dense run: arena slot contents compacted into a contiguous state with the
+    # same slot indexing, so both runs see identical data under the same mapping.
+    slot_of_batch = torch.arange(bs, 0, -1, dtype=torch.int32)  # b -> bs - b
+    kv_state_s = _strided_state_view(inp["kv_state"], slot_of_batch)
+    score_state_s = _strided_state_view(inp["score_state"], slot_of_batch)
+    assert kv_state_s.stride(1) > kv_state_s.shape[2]
+    assert kv_state_s.stride(0) > kv_state_s.shape[1] * kv_state_s.shape[2]
+
+    dense_inp = dict(inp)
+    dense_inp["state_slot_mapping"] = slot_of_batch
+    dense_inp["kv_state"] = kv_state_s.contiguous()
+    dense_inp["score_state"] = score_state_s.contiguous()
+    dense_inp["kv_cache"] = inp["kv_cache"].clone()
+    dense_inp["cache_scale"] = (
+        inp["cache_scale"].clone() if inp["cache_scale"] is not None else None
+    )
+
+    str_inp = dict(dense_inp)
+    str_inp["kv_in"] = _strided_in_view(inp["kv_in"])
+    str_inp["score_in"] = _strided_in_view(inp["score_in"])
+    str_inp["kv_state"] = kv_state_s
+    str_inp["score_state"] = score_state_s
+    str_inp["kv_cache"] = inp["kv_cache"].clone()
+    str_inp["cache_scale"] = (
+        inp["cache_scale"].clone() if inp["cache_scale"] is not None else None
+    )
+    assert str_inp["kv_in"].stride(0) > str_inp["kv_in"].shape[1]
+
+    ref_inp = dict(dense_inp)
+    ref_inp["kv_cache"] = inp["kv_cache"].clone()
+    ref_inp["cache_scale"] = (
+        inp["cache_scale"].clone() if inp["cache_scale"] is not None else None
+    )
+
+    _run_kernel(dense_inp, use_2kernel=use_2kernel)
+    _, us_kernel = run_perftest(_run_kernel, str_inp, use_2kernel=use_2kernel)
+
+    fused_compress_attn_reference(
+        kv_in=ref_inp["kv_in"],
+        score_in=ref_inp["score_in"],
+        kv_state=ref_inp["kv_state"],
+        score_state=ref_inp["score_state"],
+        plan_gpu=ref_inp["plan_gpu"],
+        state_slot_mapping=ref_inp["state_slot_mapping"],
+        ape=ref_inp["ape"],
+        rms_weight=ref_inp["rms_weight"],
+        rms_eps=ref_inp["rms_eps"],
+        cos_cache=ref_inp["cos_cache"],
+        sin_cache=ref_inp["sin_cache"],
+        kv_cache=ref_inp["kv_cache"],
+        block_tables=ref_inp["block_tables"],
+        k_per_block=ref_inp["k_per_block"],
+        overlap=overlap,
+        ratio=ratio,
+        head_dim=D,
+        rope_head_dim=RD,
+        quant=quant,
+        quant_mode=quant_mode,
+        cache_scale=ref_inp["cache_scale"],
+        use_ue8m0=ue8m0,
+        preshuffle=inp["preshuffle"],  # arch-adjusted (False on gfx1250)
+    )
+
+    msg = f"{shape_label}/strided/{path} bs={bs} mtp={mtp}"
+    # (1) Strided views vs dense copies through the same kernel: bit-identical.
+    assert torch.equal(
+        str_inp["kv_cache"].view(torch.uint8), dense_inp["kv_cache"].view(torch.uint8)
+    ), f"{msg}: kv_cache differs between strided and dense inputs"
+    if str_inp["cache_scale"] is not None:
+        assert torch.equal(
+            str_inp["cache_scale"].view(torch.uint8),
+            dense_inp["cache_scale"].view(torch.uint8),
+        ), f"{msg}: cache_scale differs between strided and dense inputs"
+
+    # (2) Strided run vs the pure-torch reference (same tolerances as the sweep).
+    if quant_mode == "fp4":
+        err = _check_fp4_cache(
+            str_inp["kv_cache"],
+            str_inp["cache_scale"],
+            ref_inp["kv_cache"],
+            ref_inp["cache_scale"],
+            msg,
+        )
+        max_err = 0.05
+    elif quant:
+        err = _check_fp8_cache(
+            str_inp["kv_cache"],
+            str_inp["cache_scale"],
+            ref_inp["kv_cache"],
+            ref_inp["cache_scale"],
+            msg,
+        )
+        max_err = 0.05
+    else:
+        assert not torch.isnan(str_inp["kv_cache"].to(dtypes.fp32)).any(), (
+            f"{msg}: NaN in kv_cache (read from stride padding)"
+        )
+        err = checkAllclose(
+            str_inp["kv_cache"].to(dtypes.fp32),
+            ref_inp["kv_cache"].to(dtypes.fp32),
+            rtol=1e-2,
+            atol=2e-2,
+            tol_err_ratio=0.02,
+            msg=f"{msg} kv_cache(bf16)",
+        )
+        max_err = 0.02
+    assert err < max_err, f"{msg}: mismatch ratio {err} vs reference"
+    return {
+        "gfx": get_gfx(),
+        "us_kernel": us_kernel,
+        "TB/s": inp["nbytes"] / us_kernel / 1e6,
+        "err_pct": err,
+    }
+
+
 def _hca_cos_sin(max_pos, rope_dim):
     inv_freq = 1.0 / (
         10000 ** (torch.arange(0, rope_dim, 2, dtype=torch.float32) / rope_dim)
@@ -903,6 +1072,15 @@ def main():
         help="""Which modes to sweep.""",
     )
     parser.add_argument(
+        "--strided-bs",
+        type=int,
+        nargs="*",
+        default=[1, 4, 65],
+        help="""Batch sizes for the strided-view check (padded kv_in row stride,
+        arena state slot/ring strides, non-identity slot mapping) against dense
+        copies and the torch ref. Empty to skip.""",
+    )
+    parser.add_argument(
         "--fp8-bs",
         type=int,
         nargs="*",
@@ -956,6 +1134,24 @@ def main():
                     test_flydsl_compress_attn(shape_label, bs, mtp, mode, "2kernel")
                 )
     summarize("flydsl_compress_attn", main_rows)
+
+    # --- Table 1b: strided kv_in / arena-view state (padded row, ring and slot
+    # strides) vs dense copies + torch ref. BF16 shapes cover the Phase-1 state
+    # and Phase-2 input addressing for both the overlap and non-overlap layouts.
+    strided_rows = []
+    for shape_label, mtp, bs in itertools.product(
+        [s for s in ("csa_main", "hca_main") if s in args.shapes],
+        args.mtp,
+        args.strided_bs,
+    ):
+        strided_rows.append(
+            test_flydsl_compress_attn_strided(shape_label, bs, mtp, "single")
+        )
+        if shape_label == "hca_main":
+            strided_rows.append(
+                test_flydsl_compress_attn_strided(shape_label, bs, mtp, "2kernel")
+            )
+    summarize("flydsl_compress_attn_strided", strided_rows)
 
     # The fp8 nm-asm cross-checks have their own arg shape, so each gets its own
     # table (forcing them into the main table would just scatter NaN columns).
