@@ -24,6 +24,7 @@ enum class QuantType : int
     per_128x128,
     per_256x128,
     per_1024x128,
+    iq2r_2bit,
 };
 
 enum class MlaVersion : int
