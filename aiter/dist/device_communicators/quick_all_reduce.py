@@ -239,7 +239,6 @@ class FlyDSLAllReduceRMSNorm:
             "device": self.device,
             "rank": self.rank,
             "world_size": self.world_size,
-            "pad": fly_policy.fused_pad_enabled(),
         }
         if family == "oneshot":
             return OneShotAllReduceRMSNorm(

@@ -822,7 +822,6 @@ class FlyQuickAllReduceRMSNorm:
         block: int | None = None,
         atoms_per_row: int | None = None,
         hiddens: tuple[int, ...] = (),
-        pad: bool = True,
         link: str | None = None,
     ):
         if world_size not in SUPPORTED_WORLDS:
@@ -900,7 +899,6 @@ class FlyQuickAllReduceRMSNorm:
         # pushes the whole payload to every peer.
         self.min_bytes = algo.floor_bytes(self.world_size)
         self.max_bytes = max_bytes
-        self.pad = bool(pad)
 
         # Rungs to build, as ``(super_tile, grid_cap)``, from the fused ladder;
         # pinning ``super_tile`` collapses it to one rung.
@@ -954,8 +952,6 @@ class FlyQuickAllReduceRMSNorm:
         Ascending ``h_pad``, so ``[0]`` is the least wire volume that every
         constraint accepts.
         """
-        if not self.pad:
-            return ()
         opts = quick_reduce_padded_row_block_options(int(hidden), self.world_size)
         opts = tuple(o for o in opts if self._block_ok(o[0]))
         if self.block is not None:

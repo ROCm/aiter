@@ -453,7 +453,6 @@ class OneShotAllReduceRMSNorm:
         max_bytes: int | None = None,
         link: str | None = None,
         hiddens: tuple[int, ...] = (),
-        pad: bool = True,
         split: int | None = None,
     ):
         if world_size not in SUPPORTED_WORLDS:
@@ -511,9 +510,6 @@ class OneShotAllReduceRMSNorm:
             max_payload_bytes(world_size, link) if max_bytes is None else int(max_bytes)
         )
         self.block = None if block is None else int(block)
-        # Whether a width with no native geometry may run on a wider workgroup
-        # with the lanes past the real row masked off.
-        self.pad = bool(pad)
 
         # ``FUSED_ONESHOT_LADDER``: ``atoms`` sets tile
         # width in the plain schedule and block width here.
@@ -604,7 +600,7 @@ class OneShotAllReduceRMSNorm:
         elif native:
             return self._nearest([a for _b, a in native], rung_atoms), hidden, 1
 
-        opts = fused_padded_block_options(hidden) if self.pad else ()
+        opts = fused_padded_block_options(hidden)
         if self.block:
             pinned = [o for o in opts if o[0] == self.block]
             if pinned:
@@ -700,12 +696,12 @@ class OneShotAllReduceRMSNorm:
         if self.block is not None:
             if any(b == self.block for b, _ in fused_block_options(hidden)):
                 return True
-            return self.pad and any(
+            return any(
                 b == self.block for b, _a, _h in fused_padded_block_options(hidden)
             )
         if fused_block_options(hidden):
             return True
-        return self.pad and bool(fused_padded_block_options(hidden))
+        return bool(fused_padded_block_options(hidden))
 
     def pads_hidden(self, hidden: int) -> int:
         """``h_pad`` this width would run at, or hidden dim when it needs no padding."""
@@ -757,9 +753,8 @@ class OneShotAllReduceRMSNorm:
                 if self.block is not None
                 else f"atoms={[r[1] for r in self._ladder]}"
             )
-            padding = "" if self.pad else " (padding is off for this engine)"
             raise ValueError(
-                f"no fused build for hidden={hidden} at {pin}{padding}: one block "
+                f"no fused build for hidden={hidden} at {pin}: one block "
                 "covers one row, so hidden/(8*atoms) must be a multiple of 64 and "
                 f"at most 1024 -- the legal (block, atoms) pairs for this width "
                 f"are {fused_block_options(hidden)}"

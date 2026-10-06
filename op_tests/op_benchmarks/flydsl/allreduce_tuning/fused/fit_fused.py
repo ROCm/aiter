@@ -6,7 +6,7 @@ present, <sweep_dir>/qr_tp{tp}_w{h}.csv (the quantized mesh/ring grid), and fits
 * ``FUSED_ONESHOT_LADDER`` -- a rung is ``(min_bytes, atoms, grid_cap, fanout,
   split)`` and is shared by every width, so a rung's time at (width, M) is the
   measured row whose geometry the engine would resolve it to
-  (``OneShotAllReduceRMSNorm._geom_for`` on a bare, unpinned, pad-on instance)
+  (``OneShotAllReduceRMSNorm._geom_for`` on a bare, unpinned instance)
   -- looked up by the knobs parsed from each row's variant.
 * ``FUSED_MESH_ST_LADDER`` / ``FUSED_RING_ST_LADDER`` and ``FUSED_QR_ROW_ATOMS``
   -- per schedule, one ``atoms_per_row`` for every width (a width that lacks it
@@ -75,7 +75,6 @@ def parse(variant):
 def _bare():
     eng = OneShotAllReduceRMSNorm.__new__(OneShotAllReduceRMSNorm)
     eng.block = None
-    eng.pad = True
     return eng
 
 
@@ -95,7 +94,7 @@ def qr_resolve(h, tp, alg, apr):
     """``atoms_per_row`` a fused *alg* engine pinned to *apr* (None: unpinned)
     actually builds at width *h* -- the nearest the width has -- or None when
     the width does not fuse at all. ``FlyQuickAllReduceRMSNorm._geom_for`` on a
-    bare, pad-on instance."""
+    bare instance."""
     algo = ALGORITHMS[alg]
     eng = FlyQuickAllReduceRMSNorm.__new__(FlyQuickAllReduceRMSNorm)
     eng.world_size = int(tp)
@@ -103,7 +102,6 @@ def qr_resolve(h, tp, alg, apr):
     eng.rs_codec, _ag = _resolve_codecs(algo, int(tp), None, None)
     eng.block = None
     eng.atoms_per_row = None if apr is None else int(apr)
-    eng.pad = True
     if not eng.supports_hidden(int(h)):
         return None
     return eng._geom_for(int(h))[1]

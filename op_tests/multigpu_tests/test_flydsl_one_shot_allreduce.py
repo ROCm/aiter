@@ -1280,27 +1280,26 @@ def test_one_shot_allreduce_rmsnorm_geom_for_pinned_block_pads():
     exactly this pair, so ``supports_hidden`` said yes while the warm launch
     crashed.
 
-    ``_geom_for`` reads only ``self.block``/``self.pad``/``self._ladder``, so it
+    ``_geom_for`` reads only ``self.block``/``self._ladder``, so it
     is exercised on a bare instance -- host-side and GPU-free, no process group.
     """
     from aiter.ops.flydsl.kernels.one_shot_allreduce import fused_block_options
     from aiter.ops.flydsl.one_shot_allreduce import OneShotAllReduceRMSNorm
 
-    def geom(block, pad, hidden, rung_atoms=1):
+    def geom(block, hidden, rung_atoms=1):
         eng = OneShotAllReduceRMSNorm.__new__(OneShotAllReduceRMSNorm)
         eng.block = block
-        eng.pad = pad
         return OneShotAllReduceRMSNorm._geom_for(eng, hidden, rung_atoms)
 
     # 4096 admits 512/256/128 natively; 1024 only by padding to h_pad=8192.
     assert 1024 not in [b for b, _ in fused_block_options(4096)]
 
-    # The regression: pinned non-native block, padding on -> resolves, no raise.
-    atoms, h_pad, split = geom(1024, True, 4096)
+    # The regression: pinned non-native block -> resolves, no raise.
+    atoms, h_pad, split = geom(1024, 4096)
     assert h_pad == 8192 and 1024 * atoms * 8 == h_pad and split == 1
 
     # A pinned block the width *does* admit natively stays native (h_pad==hidden).
-    assert geom(512, True, 4096) == (1, 4096, 1)
+    assert geom(512, 4096) == (1, 4096, 1)
 
     # supports_hidden and _geom_for must give the same yes/no on the pin. When
     # supports_hidden says yes, _geom_for must return a geometry that honours
@@ -1312,7 +1311,6 @@ def test_one_shot_allreduce_rmsnorm_geom_for_pinned_block_pads():
     for block, split in ((128, 1), (256, 1), (512, 1), (1024, 1), (64, 8)):
         eng = OneShotAllReduceRMSNorm.__new__(OneShotAllReduceRMSNorm)
         eng.block = block
-        eng.pad = True
         eng._ladder = ((0, 1, 64, None, split),)
         if eng.supports_hidden(4096):
             atoms, h_pad, k = OneShotAllReduceRMSNorm._geom_for(eng, 4096, 1, split)
@@ -1320,11 +1318,6 @@ def test_one_shot_allreduce_rmsnorm_geom_for_pinned_block_pads():
             assert k == split, (block, split, k)
         else:
             assert split == 1, (block, split)
-
-    # Padding off: a pinned non-native block has no geometry, so _geom_for hands
-    # back the rung atoms and lets the build raise -- it must not resolve to a
-    # padded width behind the caller's back.
-    assert geom(1024, False, 4096) == (1, 4096, 1)
 
 
 @pytest.mark.parametrize("world_size", SUPPORTED_WORLDS)
@@ -1576,10 +1569,9 @@ def test_one_shot_allreduce_rmsnorm_split_host_resolution():
     """
     from aiter.ops.flydsl.one_shot_allreduce import OneShotAllReduceRMSNorm as E
 
-    def bare(block=None, pad=True):
+    def bare(block=None):
         eng = E.__new__(E)
         eng.block = block
-        eng.pad = pad
         return eng
 
     def geom(hidden, rung_atoms, rung_split, block=None):

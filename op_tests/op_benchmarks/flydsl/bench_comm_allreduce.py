@@ -430,13 +430,6 @@ def _bench_fly_accuracy_mode() -> str:
     return os.environ.get(_FLY_ACCURACY_ENV, _FLY_ACCURACY_DEFAULT)
 
 
-def _bench_fly_pad_enabled() -> bool:
-    """Whether the bench admits padded fused builds, matching production."""
-    if _fused_padded_block_options is None:
-        return False
-    return policy.fused_pad_enabled()
-
-
 class _FlyAutoWindow:
     """The composed dispatch window, in the shape the bench's probes expect."""
 
@@ -1326,7 +1319,6 @@ def _fused_hidden_ok(hidden: int, cand: Candidate) -> bool:
     """
     if _fused_hidden_supported is None:
         return False
-    pad = _bench_fly_pad_enabled()
     if cand.split is not None and cand.split > 1:
         if _fused_split_options is None:
             return False
@@ -1339,15 +1331,13 @@ def _fused_hidden_ok(hidden: int, cand: Candidate) -> bool:
             return False
         if any(b == cand.block for b, _ in _fused_block_options(int(hidden))):
             return True
-        return pad and any(
+        return any(
             b == cand.block for b, _a, _h in _fused_padded_block_options(int(hidden))
         )
     atoms = 1 if cand.atoms is None else cand.atoms
     if _fused_hidden_supported(int(hidden), atoms):
         return True
-    return pad and any(
-        a == atoms for _b, a, _h in _fused_padded_block_options(int(hidden))
-    )
+    return any(a == atoms for _b, a, _h in _fused_padded_block_options(int(hidden)))
 
 
 def _flyqr_block_ok(hidden: int, world_size: int, cand: Candidate) -> bool:
@@ -1361,11 +1351,8 @@ def _flyqr_block_ok(hidden: int, world_size: int, cand: Candidate) -> bool:
     """
     if _flyqr_hidden_supported is None:
         return False
-    pad = _bench_fly_pad_enabled()
     native = _flyqr_hidden_supported(int(hidden), int(world_size))
-    padded = pad and bool(
-        _flyqr_padded_block_options(int(hidden), int(world_size))
-    )
+    padded = bool(_flyqr_padded_block_options(int(hidden), int(world_size)))
     if not native and not padded:
         return False
     if cand.atoms_per_row is not None:
@@ -1376,7 +1363,7 @@ def _flyqr_block_ok(hidden: int, world_size: int, cand: Candidate) -> bool:
         return False
     if any(b == cand.block for b, _ in _flyqr_block_options(int(hidden), int(world_size))):
         return True
-    return pad and any(
+    return any(
         b == cand.block
         for b, _a, _h in _flyqr_padded_block_options(int(hidden), int(world_size))
     )
@@ -1400,7 +1387,6 @@ def _flyqr_atoms_ok(hidden: int, world_size: int, cand: Candidate) -> bool:
     )
     eng.block = None
     eng.atoms_per_row = int(cand.atoms_per_row)
-    eng.pad = _bench_fly_pad_enabled()
     if not eng.supports_hidden(int(hidden)):
         return False
     return eng._geom_for(int(hidden))[1] == cand.atoms_per_row
@@ -2889,10 +2875,6 @@ def _worker(
                 rank=rank,
                 world_size=tp_size,
                 max_bytes=_fly1s_ceiling(tp_size),
-                # Same padding policy the shipped dispatcher builds with, so a
-                # width with no native geometry fuses here exactly where it does
-                # in production. ``applicable`` gates on the same flag.
-                pad=_bench_fly_pad_enabled(),
                 **kw,
             )
         # Build and preload every (config, hidden) this sweep will touch, before
@@ -2943,7 +2925,6 @@ def _worker(
                 rank=rank,
                 world_size=tp_size,
                 algorithm=cfg[0],
-                pad=_bench_fly_pad_enabled(),
                 **_fly_kwargs(
                     cfg[1:],
                     (
