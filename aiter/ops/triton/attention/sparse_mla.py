@@ -77,8 +77,8 @@ SUPPORTED_ARCHS = ("gfx942", "gfx950")
 # fp8 matrix core and vLLM's fp8 KV cache use), OCP e4m3 on gfx950.
 FNUZ_ARCHS = ("gfx942",)
 
-# fp8 q, fp8 dots and the per-128 fp8_dsv32_mla cache are gfx950-only. The
-# per-tensor fp8_scalar cache also runs on gfx942, under bf16 dots.
+# fp8 q and the per-128 fp8_dsv32_mla cache are gfx950-only. The per-tensor
+# fp8_scalar cache, and the fp8 dots that run on it, also run on gfx942.
 FP8_ARCHS = ("gfx950",)
 FP8_SCALAR_ARCHS = ("gfx942", "gfx950")
 
@@ -89,15 +89,20 @@ FP8_SCALAR_ARCHS = ("gfx942", "gfx950")
 PACKED_ARCHS = ("gfx950",)
 
 
-def _get_config(arch: str | None = None) -> dict:
+def _get_config(arch: str | None = None, fp8_dots: bool = False) -> dict:
     """The _sparse_mla launch config published for arch, the running one by default.
 
     BLOCK_K is per arch because gfx950's tile does not fit gfx942's 64 KB of
     LDS. num_warps is its own entry rather than BLOCK_K // 16, so the smaller
-    tile does not halve the warps too.
+    tile does not halve the warps too. An arch may publish a separate
+    _sparse_mla_fp8 entry for fp8 dots, whose one-byte tiles fit twice the
+    BLOCK_K in the same LDS.
     """
     cfg_dir = resolve_config_dir("attention", "SPARSE_MLA", backend="gluon", arch=arch)
-    return dict(load_config_json(f"{cfg_dir}/DEFAULT.json")["_sparse_mla"])
+    configs = load_config_json(f"{cfg_dir}/DEFAULT.json")
+    if fp8_dots and "_sparse_mla_fp8" in configs:
+        return dict(configs["_sparse_mla_fp8"])
+    return dict(configs["_sparse_mla"])
 
 
 def _check_packed_arch(arch: str) -> None:
@@ -142,15 +147,18 @@ def _check_fp8_arch(arch: str, fmt: str, q_dtype: torch.dtype) -> None:
         )
 
 
-# Row pitch padding, and the scratch the kernel takes beyond the tiles. Both
-# hold only for bf16 tiles with the async path off, which is every gfx942
-# launch: fp8 dots are rejected there and its launch config keeps ASYNC_LDS off.
-# A nonzero KV_LDS_PAD replaces the pad on the KV tile alone.
+# Row pitch padding, and the scratch the kernel takes beyond the tiles, in tile
+# elements, with the async path off, which is every gfx942 launch. bf16 tiles
+# pad by 8; fp8 tiles (fp8 dots) are one byte per element and pad by 16. A
+# nonzero KV_LDS_PAD replaces the pad on the KV tile alone.
 _LDS_PAD = 8
-_LDS_SCRATCH_PER_BLOCK_K = 32
+_LDS_PAD_FP8 = 16
+_LDS_SCRATCH_PER_BLOCK_K = 16
 
 
-def _check_lds_budget(arch, block_k, kv_lora_rank, qk_rope_head_dim, kv_lds_pad):
+def _check_lds_budget(
+    arch, block_k, kv_lora_rank, qk_rope_head_dim, kv_lds_pad, fp8_dots=False
+):
     """Reject a geometry whose tiles cannot fit, naming what would.
 
     kv_lds_pad is the launch's KV_LDS_PAD, so prefill is checked at the wider
@@ -162,9 +170,10 @@ def _check_lds_budget(arch, block_k, kv_lora_rank, qk_rope_head_dim, kv_lds_pad)
     if arch != "gfx942":
         return
     budget = arch_info._LDS_CAP_BYTES[arch]
-    rope = block_k * (qk_rope_head_dim + _LDS_PAD) * 2 if qk_rope_head_dim else 0
-    need = (
-        block_k * (kv_lora_rank + (kv_lds_pad or _LDS_PAD)) * 2
+    elt, pad = (1, _LDS_PAD_FP8) if fp8_dots else (2, _LDS_PAD)
+    rope = block_k * (qk_rope_head_dim + pad) if qk_rope_head_dim else 0
+    need = elt * (
+        block_k * (kv_lora_rank + (kv_lds_pad or pad))
         + rope
         + _LDS_SCRATCH_PER_BLOCK_K * block_k
     )
@@ -239,10 +248,9 @@ def _resolve_dot_precision(dot_precision: str, fmt: str, arch: str) -> bool:
         )
     if dot_precision == "bf16":
         return False
-    if arch not in FP8_ARCHS:
+    if arch not in FP8_SCALAR_ARCHS:
         raise ValueError(
-            f"dot_precision='fp8' is not supported on {arch}: the kernel feeds the "
-            f"matrix core OCP e4m3, but {arch}'s native fp8 is fnuz. Use "
+            f"dot_precision='fp8' is not supported on {arch}. Use "
             "dot_precision='bf16'."
         )
     if fmt == "fp8_dsv32_mla":
@@ -497,8 +505,8 @@ def sparse_mla_fwd(
     dtype and kv_scale; each row gives what the caller has to pass. R is the
     QK width, kv_lora_rank + qk_rope_head_dim. fp8 is read in the arch's native
     encoding: e4m3fnuz on gfx942, OCP e4m3 on gfx950. gfx942 takes the
-    fp8_scalar cache under bf16 dots; the other fp8 formats, like fp8 q, are
-    gfx950-only.
+    fp8_scalar cache under either dot precision; the other fp8 formats, like
+    fp8 q, are gfx950-only.
 
         format         kv_buffer                     kv_scale        geometry args
         bf16           [slots, R], [nb, block, R],   None            as the model
@@ -560,7 +568,7 @@ def sparse_mla_fwd(
                 gfx942.
             "fp8": the cache's own code points go to the fp8 matrix core with no
                 dequant, and the per-tensor scale folds outside the tile loop.
-                tensor scale fp8 kv cache only; gfx950 only.
+                tensor scale fp8 kv cache only; gfx942 and gfx950.
 
             q is adapted to the choice. bf16 q is quantized in the kernel
             prologue, one scale per (query, head-block) tile; fp8 q is passed
@@ -723,7 +731,7 @@ def sparse_mla_fwd(
     # Tuned launch config (gfx950 / MI355). H < 16 runs natively at
     # BLOCK_M = next_pow2(H) instead of padding heads
     block_m = 16 if num_heads >= 16 else max(8, 1 << (num_heads - 1).bit_length())
-    cfg = _get_config()
+    cfg = _get_config(fp8_dots=fp8_dots)
     block_k = cfg["BLOCK_K"]
     num_warps = cfg["num_warps"]
 
@@ -825,7 +833,9 @@ def sparse_mla_fwd(
     kv_lds_pad = (
         16 if num_queries >= _PREFILL_MIN_ROWS and not fp8_dots and not own_pad else 0
     )
-    _check_lds_budget(arch, block_k, kv_lora_rank, qk_rope_head_dim, kv_lds_pad)
+    _check_lds_budget(
+        arch, block_k, kv_lora_rank, qk_rope_head_dim, kv_lds_pad, fp8_dots
+    )
 
     # The 32/64-head programs and the decode XCD remap below are tuned on gfx950.
     staged = fmt == "fp8_scalar" or (fmt == "bf16" and qk_rope_head_dim == 0)
