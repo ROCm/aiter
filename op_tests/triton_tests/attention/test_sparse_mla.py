@@ -13,14 +13,15 @@ import torch
 import aiter.ops.triton.attention.sparse_mla as smd
 from aiter.ops.triton.attention.sparse_mla import (
     FP8_ARCHS,
+    FP8_SCALAR_ARCHS,
     SUPPORTED_ARCHS,
     sparse_mla_fwd,
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 
-# The arch-native fp8, as a producer on this machine writes it. That is OCP e4m3,
-# what the kernel reads, only on FP8_ARCHS; the fp8 cases skip everywhere else.
+# The arch-native fp8, as a producer on this machine writes it, which is the
+# encoding the kernel reads.
 FP8_DTYPE = get_fp8_e4m3_dtype()
 FP8_MAX = torch.finfo(FP8_DTYPE).max
 KV_LORA, ROPE = 512, 64
@@ -31,8 +32,12 @@ def _skip_unless_supported(dots="bf16", fmt="bf16"):
     arch = arch_info.get_arch()
     if arch not in SUPPORTED_ARCHS:
         pytest.skip(f"sparse_mla_fwd does not support {arch}")
-    if (dots == "fp8" or fmt != "bf16") and arch not in FP8_ARCHS:
-        pytest.skip(f"fp8 is read as OCP e4m3, and {arch}'s native fp8 is fnuz")
+    if dots == "fp8" and arch not in FP8_ARCHS:
+        pytest.skip(f"fp8 dots are {'/'.join(FP8_ARCHS)}-only")
+    if fmt == "tensor" and arch not in FP8_SCALAR_ARCHS:
+        pytest.skip(f"the fp8_scalar cache is {'/'.join(FP8_SCALAR_ARCHS)}-only")
+    if fmt == "dsmla" and arch not in FP8_ARCHS:
+        pytest.skip(f"the fp8_dsv32_mla cache is {'/'.join(FP8_ARCHS)}-only")
 
 
 def quantize_flat_fp8(kv):
@@ -186,32 +191,46 @@ def test_packed_cache_arch_gate(arch):
 def test_fp8_arch_gate(arch):
     """fp8 q and fp8 caches, for every arch, from any machine."""
     smd._check_fp8_arch(arch, "bf16", torch.bfloat16)
+    if arch in FP8_SCALAR_ARCHS:
+        smd._check_fp8_arch(arch, "fp8_scalar", torch.bfloat16)
     for fmt, q_dtype in (
-        ("fp8_scalar", torch.bfloat16),
         ("fp8_dsv32_mla", torch.bfloat16),
         ("bf16", torch.float8_e4m3fn),
     ):
         if arch in FP8_ARCHS:
             smd._check_fp8_arch(arch, fmt, q_dtype)
         else:
-            with pytest.raises(ValueError, match="fnuz"):
+            with pytest.raises(ValueError, match="takes bf16 q"):
                 smd._check_fp8_arch(arch, fmt, q_dtype)
 
 
-@pytest.mark.parametrize("fmt", ["tensor", "dsmla"])
-def test_native_fp8_cache_rejected(fmt):
-    """This arch's own fp8 behind a uint8 view, through the public wrapper.
-
-    Only the arch tells those bytes apart from OCP, and going through
+def test_native_dsmla_cache_rejected():
+    """This arch's own fp8_dsv32_mla records behind a uint8 view, through the
+    public wrapper, where only fp8_scalar is supported. Going through
     sparse_mla_fwd also catches the gate losing its one call site.
     """
     arch = arch_info.get_arch()
     if arch not in SUPPORTED_ARCHS or arch in FP8_ARCHS:
-        pytest.skip(f"fp8 caches run on {arch}")
-    q, cache, ks, idx, ptr, _ = _build(fmt, 1, 16, 64, 1024, ragged=False)
+        pytest.skip(f"fp8_dsv32_mla runs on {arch}")
+    q, cache, ks, idx, ptr, _ = _build("dsmla", 1, 16, 64, 1024, ragged=False)
     assert cache.dtype == torch.uint8
-    with pytest.raises(ValueError, match="fnuz"):
+    with pytest.raises(ValueError, match="takes bf16 q"):
         sparse_mla_fwd(q, cache, ptr, idx, D_QK**-0.5, kv_scale=ks)
+
+
+def test_foreign_fp8_cache_dtype_rejected():
+    """A typed fp8 cache in the other arch's encoding is refused, not misread."""
+    arch = arch_info.get_arch()
+    if arch not in FP8_SCALAR_ARCHS:
+        pytest.skip(f"no fp8 cache runs on {arch}")
+    q, cache, ks, idx, ptr, _ = _build("tensor", 1, 16, 64, 1024, ragged=False)
+    foreign = (
+        torch.float8_e4m3fn
+        if FP8_DTYPE == torch.float8_e4m3fnuz
+        else torch.float8_e4m3fnuz
+    )
+    with pytest.raises(ValueError, match=f"is not {arch}'s fp8"):
+        sparse_mla_fwd(q, cache.view(foreign), ptr, idx, D_QK**-0.5, kv_scale=ks)
 
 
 @pytest.mark.parametrize("arch", SUPPORTED_ARCHS)
