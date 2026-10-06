@@ -62,7 +62,8 @@ class AttentionA2AIntraNodeOp:
     descale per destination tensor (F32_PER_TENSOR). e4m3_pc is V-only and
     packed-only: its ordinary FP8 BSHD bytes use contiguous float32 [1, Hlocal, 128]
     descales (F32_PER_CHANNEL), for example with dense MHA V4 f6f8. Zero channels
-    retain the MHA V4 reference's zero scale and NaN FP8 payload.
+    clamp amax to 1e-12, giving a positive descale and zero payload, matching
+    quantize_v_fp8.
     hadamard=True applies normalized Walsh-Hadamard
     to Q/K before quantization;
     V is unchanged. The default is enabled for packed output and disabled otherwise.

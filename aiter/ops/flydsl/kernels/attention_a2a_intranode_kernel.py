@@ -1571,9 +1571,11 @@ def make_attention_a2a_kernel(
             scale = fx.Float32(1.0)
             if const_expr(not v4_amax):
                 maximum = reduce_partial_amax(local_scales, dest_pe)
-                scale = maximum / fx.Float32(
-                    127.0 if codec == "int8" else (240.0 if fp8_fnuz else 448.0)
-                )
+                if const_expr(codec == "int8"):
+                    scale = maximum / fx.Float32(127.0)
+                else:
+                    # Match torch's amax / dtype_max: fp32 reciprocal, then one multiply.
+                    scale = maximum * fx.Float32(1.0 / (240.0 if fp8_fnuz else 448.0))
                 scale = (scale > 0.0).select(scale, fx.Float32(1.0))
                 if (dest_pe == rank) & (peer_warp == 0) & (lane == 0):
                     buf_copy_store(local_scales, 0, scale, fx.Float32)
@@ -1845,6 +1847,8 @@ def make_attention_a2a_kernel(
                             )
                             partial = buf_copy_load(peer_scales, i, fx.Float32)
                             maximum = maximum.maximumf(partial)
+                        # Clamp amax like quantize_v_fp8 so zero channels get a positive descale.
+                        maximum = maximum.maximumf(fx.Float32(1.0e-12))
                         # The per-channel descale uses a rounded FP32 reciprocal multiply.
                         scale = maximum * fx.Float32(
                             1.0 / (240.0 if fp8_fnuz else 448.0)

@@ -550,7 +550,56 @@ def _check_packed(rank, world_size, heads, sequence, device, op_cls, name):
             torch.zeros_like(payloads[2][payload_bytes:]),
             f"{name} V slack",
         )
+    if qk_codec == "e4m3":
+        _check_e4m3_scale_rounding(
+            op,
+            rank,
+            world_size,
+            heads,
+            sequence,
+            device,
+            inputs[2],
+            quantize_fp8_rotated,
+        )
     return op, lambda: _submit_roles(op, inputs)
+
+
+def _check_e4m3_scale_rounding(
+    op, rank, world_size, heads, sequence, device, v_input, quantize_fp8_rotated
+):
+    """Per-tensor Q/K scale must be amax * fp32(1/FP8_MAX), not amax / FP8_MAX.
+
+    One nonzero element c per row rotates to +-c/sqrt(128) everywhere, so the BF16
+    rotated amax is exactly bf16(c * 0.0883883...). c = 5.75 (FP8_MAX 448) gives 0.5078125
+    and c = 6.0 (FP8_MAX 240) gives 0.53125; for these division and reciprocal-multiply
+    differ by one fp32 ulp.
+    """
+    fp8_max = _CTX.fp8_max
+    c, target, recip_bits = (
+        (5.75, 0.5078125, 0x3A94924A)
+        if fp8_max == 448.0
+        else (6.0, 0.53125, 0x3B111112)
+    )
+    qk = torch.zeros((1, sequence, heads, 128), dtype=torch.bfloat16, device=device)
+    qk[:, 1:, :, 5] = c
+    full = _full_bshd(qk, rank, world_size)
+    expected_payload, expected_scales = quantize_fp8_rotated(full)
+    assert expected_scales.view(torch.int32).item() == recip_bits, (
+        f"e4m3 rounding case: reference scale {expected_scales.item()} is not the "
+        f"reciprocal-multiply value for amax {target}"
+    )
+    payloads, scales = _submit_roles(op, (qk, qk, v_input))
+    torch.cuda.synchronize()
+    for role in (0, 1):
+        label = f"e4m3 scale rounding {'QK'[role]}"
+        _exact(
+            payloads[role],
+            expected_payload.view(torch.uint8).flatten(),
+            f"{label} payload",
+        )
+        _exact(
+            scales[role].view_as(expected_scales), expected_scales, f"{label} scales"
+        )
 
 
 # Per-codec (relL2 max, output/reference norm-ratio range) against fp32 SDPA on
@@ -863,6 +912,23 @@ def _check_e4m3_pc(rank, world_size, heads, sequence, device, op_cls):
             f"{label} payload",
         )
         _exact(scales[2], expected_scales, f"{label} scales")
+    # Zero channels and sub-1e-12 amax channels clamp to the same positive descale
+    # and zero payload as quantize_v_fp8.
+    for label, fill in (("all-zero", None), ("tiny-amax", 1.0e-14)):
+        tiny = torch.zeros_like(inputs[2])
+        if fill is not None:
+            tiny[..., 7] = fill
+        expected_payload, expected_scales = quantize_v_fp8(
+            _full_bshd(tiny, rank, world_size)
+        )
+        tiny_payloads, tiny_scales = _submit_roles(op, (inputs[0], inputs[1], tiny))
+        torch.cuda.synchronize()
+        _exact(
+            tiny_payloads[2],
+            expected_payload.view(torch.uint8).flatten(),
+            f"e4m3_pc {label} payload",
+        )
+        _exact(tiny_scales[2], expected_scales, f"e4m3_pc {label} scales")
     # The dense f6f8 attention needs world_size * sequence % 128 == 0.
     if seq_full % 128 == 0:
         full_qk = tuple(_full_bshd(value, rank, world_size) for value in inputs[:2])
