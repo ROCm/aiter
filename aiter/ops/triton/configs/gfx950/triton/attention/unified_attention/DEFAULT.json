@@ -200,10 +200,10 @@
   },
   "attn_3d": {
     "D_GEQ_512": {
-      "BLOCK_M": 16,
-      "num_warps": 4,
+      "BLOCK_M": 32,
+      "num_warps": 2,
       "num_stages": 1,
-      "waves_per_eu": 2
+      "waves_per_eu": 1
     },
     "any": {
       "BLOCK_M": 16,
@@ -247,11 +247,11 @@
   },
   "kv_split": {
     "D_GEQ_512.DT_fp8_fp8": {
-      "MIN_SEGMENTS": 16,
-      "SEGMENTS_PER_CU": 8,
+      "MIN_SEGMENTS": 4,
+      "SEGMENTS_PER_CU": 4,
       "MAX_SEGMENTS": 128,
       "SEGMENT_TILE_MAX": 64,
-      "TILE_SIZE_MIN": 32,
+      "TILE_SIZE_MIN": 64,
       "TILE_SIZE_MAX": 64
     },
     "D_GEQ_512": {
