@@ -777,6 +777,9 @@ class FlyQuickAllReduceRMSNorm:
 
     Supported widths are multiples of 1024 up to 8192 -- 7168 and 5120
     included.
+
+    ``link`` selects the super-tile ladder, as in ``FlyQuickAllReduce``, and is
+    detected from the KFD topology when not given.
     """
 
     #: Fused launches are capped at one workgroup per CU. That is not a
@@ -809,11 +812,16 @@ class FlyQuickAllReduceRMSNorm:
         atoms_per_row: int | None = None,
         hiddens: tuple[int, ...] = (),
         pad: bool = True,
+        link: str | None = None,
     ):
         if world_size not in SUPPORTED_WORLDS:
             raise ValueError(
                 f"world_size must be one of {SUPPORTED_WORLDS}, got {world_size}"
             )
+        if link is None:
+            link = "xgmi" if has_xgmi_peer_links() else "pcie"
+        if link not in ("pcie", "xgmi"):
+            raise ValueError(f"link must be 'pcie' or 'xgmi', got {link!r}")
         if algorithm not in ALGORITHMS:
             raise ValueError(
                 f"algorithm must be one of {tuple(ALGORITHMS)}, got {algorithm!r}"
@@ -853,6 +861,7 @@ class FlyQuickAllReduceRMSNorm:
         self.rank = int(rank)
         self.world_size = int(world_size)
         self.algorithm = algorithm
+        self.link = link
         self.rs_codec = rs_codec
         self.ag_codec = ag_codec
         self.inbox_memory = resolved_inbox
@@ -884,7 +893,7 @@ class FlyQuickAllReduceRMSNorm:
 
         # Rungs to build, as ``(super_tile, grid_cap)``. Same ladder the plain
         # class walks; pinning ``super_tile`` collapses it to one rung.
-        world_ladder = algo.ladder_for(self.world_size)
+        world_ladder = algo.ladder_for(self.world_size, link)
         if world_ladder and not pinned_st:
             self._ladder = world_ladder
             self._rungs = [

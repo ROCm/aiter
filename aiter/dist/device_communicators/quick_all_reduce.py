@@ -250,6 +250,7 @@ class FlyDSLAllReduceRMSNorm:
             **common,
             algorithm=algorithm,
             atoms_per_row=fused_qr_row_atoms(self.world_size, algorithm, self.link),
+            link=self.link,
         )
         eng.min_bytes = 0
         return eng
