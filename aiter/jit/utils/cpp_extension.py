@@ -1559,6 +1559,8 @@ def _get_num_workers(verbose: bool) -> int | None:
 
 
 def _run_ninja_build(build_directory: str, verbose: bool, error_prefix: str) -> None:
+    # Stream compiler progress without changing the application logger format.
+    verbose = verbose or os.getenv("AITER_JIT_VERBOSE", "0") == "1"
     command = ["ninja", "-v"]
     num_workers = _get_num_workers(verbose)
     if num_workers is not None:
