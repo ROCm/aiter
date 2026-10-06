@@ -44,9 +44,9 @@ set_start_method("spawn", force=True)
 
 SUPPORTED_ARCHS = ("gfx942", "gfx950")
 
-# Seconds to wait for each rank of a spawn. The kernels spin on flags written
-# by peers, so a protocol bug is a hang rather than an error; this turns it
-# into a failure.
+# Seconds to wait for each rank of a spawn. The kernels spin on flags or inbox
+# slots written by peers, so a protocol bug is a hang rather than an error;
+# this turns it into a failure.
 SPAWN_TIMEOUT_S = 600
 
 try:

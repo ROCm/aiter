@@ -195,24 +195,12 @@ class FlyQuickAllToAll(_LadderedIpcOp):
         laddered = bool(world_ladder) and not pinned_st
         if laddered:
             ladder = tuple(
-                (
-                    floor,
-                    st,
-                    min(rung_cap, cap),
-                    int(b if block is None else block),
-                    False,
-                )
-                for floor, st, rung_cap, b, _ss in world_ladder
+                (floor, st, min(rung_cap, cap), int(b if block is None else block))
+                for floor, st, rung_cap, b in world_ladder
             )
         else:
             ladder = (
-                (
-                    0,
-                    int(super_tile),
-                    cap,
-                    int(BLOCK if block is None else block),
-                    False,
-                ),
+                (0, int(super_tile), cap, int(BLOCK if block is None else block)),
             )
         inbox_flags, resolved_inbox = _resolve_inbox_flags(inbox_memory, world_size)
 
@@ -224,7 +212,7 @@ class FlyQuickAllToAll(_LadderedIpcOp):
         self.inbox_memory = resolved_inbox
         self.min_bytes = int(min_bytes)
 
-        def _build(*, super_tile, grid, block, skip_self):
+        def _build(*, super_tile, grid, block):
             return algo.build(
                 world_size=int(world_size),
                 rank=int(rank),

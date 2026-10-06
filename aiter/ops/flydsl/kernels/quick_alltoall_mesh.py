@@ -98,14 +98,11 @@ PARITIES = 2
 # One 64 B handshake sector at the tail of every wire slot.
 FLAG_I32 = 16
 
-# ``(min_bytes, super_tile, grid_cap, block, skip_self)`` rungs, ascending, keyed
-# on ``(link, world_size)``; *min_bytes* is the whole input. ``skip_self`` is
-# unused -- the all-to-all never routes its own chunk through the inbox -- and
-# kept so the host's ladder machinery is shared with the all-reduce. Seeded
-# from the all-reduce mesh; to be refitted with ``bench_comm.py --operation
-# a2a``.
+# ``(min_bytes, super_tile, grid_cap, block)`` rungs, ascending, keyed on
+# ``(link, world_size)``; *min_bytes* is the whole input. Seeded from the
+# all-reduce mesh; to be refitted with ``bench_comm.py --operation a2a``.
 A2A_MESH_ST_LADDER = {
-    (link, ws): ((0, 1, 128, 256, False), (4 << 20, 8, 128, 512, False))
+    (link, ws): ((0, 1, 128, 256), (4 << 20, 8, 128, 512))
     for link in ("xgmi", "pcie")
     for ws in SUPPORTED_WORLDS
 }
@@ -480,5 +477,4 @@ def make_quick_alltoall_mesh_kernel(
         "rank_atoms": rank_atoms,
         "grid": grid,
         "block": block,
-        "skip_self": False,
     }

@@ -246,15 +246,10 @@ class FlyDSLAllReduceRMSNorm:
                 **common, max_bytes=self.policy.oneshot_max, link=self.link
             )
         algorithm = "mesh" if family == "mesh" else "ring"
-
-        # The mesh algorithm skips its own inbox round trip.
-        # The ring algorithm has no such round trip.
-        skip_self_roundtrip = algorithm == "mesh"
         eng = QuickAllReduceInt4RMSNorm(
             **common,
             algorithm=algorithm,
             atoms_per_row=fused_qr_row_atoms(self.world_size, algorithm, self.link),
-            skip_self=skip_self_roundtrip,
         )
         eng.min_bytes = 0
         return eng

@@ -139,12 +139,8 @@ def row_block_options(
 
 
 # -- fusion-agnostic: geometry with padding -----------------------------------
-#: Largest payload a padded build may address, in bytes.
-#:
-#: ``buffer_ops.buffer_load``/``buffer_store`` implement ``mask=`` by replacing a
-#: masked lane's byte offset with ``0x7FFFFFFF``, which is only out of bounds
-#: while the descriptor's ``num_records`` is no larger. Past that a pad lane
-#: would read and write real memory.
+#: Largest payload a padded build may address, in bytes: the 31-bit byte-offset
+#: range. The host gates reject a padded fused payload above it.
 PAD_MASK_MAX_BYTES = 0x7FFFFFFF
 
 
@@ -234,8 +230,7 @@ def make_rowbuf_atom_row(
     live bytes of that row. Pad columns (element index >= hidden) exceed
     ``num_records`` for the descriptor, so a plain ``buffer_load_dwordx4`` returns
     0 and a plain ``buffer_store_dwordx4`` is dropped by the hardware -- no
-    exec-mask split, no per-lane predicate arithmetic. This is the tiled-copy
-    equivalent of the old ``buffer_ops.buffer_load/store(mask=)`` path.
+    exec-mask split, no per-lane predicate arithmetic.
 
     A fused tile is ``rows_per_tile`` token rows laid end to end, so the atom
     index splits into a row ``r`` and an atom-within-row ``a`` via ``divmod``.

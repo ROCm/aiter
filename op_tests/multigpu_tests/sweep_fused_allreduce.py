@@ -41,8 +41,8 @@ Two knobs matter more than the rest:
     comparison comes back empty. The default here lifts it past the largest
     shape so the curve is visible all the way to where it stops winning.
 
-The FlyDSL rows include the pinned ``_b<block>[_ss]`` grid, not just the
-ladder-driven rows: block and self-skip move the fused kernels by up to 2.6x, so
+The FlyDSL rows include the pinned ``_b<block>`` grid, not just the
+ladder-driven rows: tuning moves the fused kernels by up to 2.6x, so
 a comparison built from the unpinned rows alone understates them badly. Each
 distinct config is an engine with its own IPC inbox -- ~470 MiB per rank at
 TP2/hidden=8192 with everything on -- so trim with ``-c`` when sweeping a single
@@ -123,7 +123,7 @@ def _bench_keys(family: str, algorithm: str | None = None) -> tuple[str, ...]:
     )
 
 
-#: Every FlyDSL fused row, per schedule. The pinned `_b<block>[_ss]` rows are
+#: Every FlyDSL fused row, per schedule. The pinned `_b<block>` rows are
 #: what makes these comparisons fair: tuning moves the fused kernels by up to
 #: 2.6x, so a table built from the unpinned rows alone understates them.
 FLY_1STAGE = _bench_keys("fused_fly1s")

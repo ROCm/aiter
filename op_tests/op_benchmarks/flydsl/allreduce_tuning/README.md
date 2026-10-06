@@ -9,8 +9,8 @@ Two independent tuning problems share the tooling:
 
 | Problem | What is tuned | Tables it feeds |
 |---|---|---|
-| **Plain all-reduce** | which family (one-shot / quantized mesh / quantized ring) per payload size, and which instance (block, super-tile, grid cap, skip-self) inside each family | `FAMILY_POLICY`, `ONESHOT_LADDER`, `MESH_ST_LADDER`, `RING_ST_LADDER` |
-| **Fused all-reduce + RMSNorm** | one-shot rungs (atoms, grid cap, skip-self, hidden-dim split) and the one-shot windows | `FUSED_ONESHOT_LADDER`, `FUSED_FAMILY_POLICY` |
+| **Plain all-reduce** | which family (one-shot / quantized mesh / quantized ring) per payload size, and which instance (block, super-tile, grid cap) inside each family | `FAMILY_POLICY`, `ONESHOT_LADDER`, `MESH_ST_LADDER`, `RING_ST_LADDER` |
+| **Fused all-reduce + RMSNorm** | one-shot rungs (atoms, grid cap, hidden-dim split) and the one-shot windows | `FUSED_ONESHOT_LADDER`, `FUSED_FAMILY_POLICY` |
 
 Tables are keyed `(link, world_size)` with `link` in `pcie` / `xgmi`. The driver detects the fabric
 from the KFD topology (`has_xgmi_peer_links()`), so a run on an 8x MI325X box fits the `("xgmi", N)`
@@ -114,14 +114,14 @@ regret against a per-shape oracle. Read the report top to bottom:
 ```
 
 The sweep (`--fusion ar_rmsnorm`) runs every fused one-shot row -- ladder default, pinned unsplit grids, and
-all legal hidden-dim split (`k`) rows (273 rows) -- plus the `cdr` fused/separate baselines, `fused_fly_auto`
+all legal hidden-dim split (`k`) rows (137 rows) -- plus the `cdr` fused/separate baselines, `fused_fly_auto`
 and the quantized mesh, for M = 1..2048 at each width (`fused/shapes/fused_w*.csv`). About 45 minutes for the
 full set; output `out/<host>/fused/sweep/tp<N>_w<H>.{csv,md,log}`.
 
 `fused-fit` writes `out/<host>/fused/fit.txt` (and a per-shape comparison in `fused/summary.txt`). Per world
 size it prints:
 
-* `FUSED_ONESHOT_LADDER rungs`: paste-ready rungs `(min_bytes, atoms, grid_cap, "peer", skip_self, split)`,
+* `FUSED_ONESHOT_LADDER rungs`: paste-ready rungs `(min_bytes, atoms, grid_cap, "peer", split)`,
   found by dynamic programming over payload breakpoints (`--rungs N`, default 3, penalised per rung).
 * `oneshot_max_exact (vs cdr)` and `oneshot_max (vs mesh)`: the `FUSED_FAMILY_POLICY` bounds.
 * a per-shape table and the in-window geomeans: `ladder/best` (how close the fitted ladder is to the
@@ -143,11 +143,11 @@ widths with few legal splits (e.g. 3072, only k=2) do not show large regret.
 | fused `oneshot_max` / `oneshot_max_exact` | `FUSED_FAMILY_POLICY` in `aiter/ops/flydsl/allreduce_policy.py` (keep `mesh_max=None` where the ring never wins) |
 
 Translating candidate names from the mesh/ring ladder lines into rungs
-`(min_bytes, super_tile, grid_cap, block, skip_self)`:
+`(min_bytes, super_tile, grid_cap, block)`:
 
-* mesh `fly_int4_b256_st8_g128_ss` -> `(min_bytes, 8, 128, 256, True)` (`b`=block, `st`=super-tile,
-  `g`=grid cap, `_ss` = skip-self)
-* ring `fly_int4_ring_b512_st16_g128` -> `(min_bytes, 16, 128, 512, False)` (ring skip-self is always False)
+* mesh `fly_int4_b256_st8_g128` -> `(min_bytes, 8, 128, 256)` (`b`=block, `st`=super-tile,
+  `g`=grid cap)
+* ring `fly_int4_ring_b512_st16_g128` -> `(min_bytes, 16, 128, 512)`
 * `min_bytes` is the byte count printed in front of each candidate (first rung is 0).
 
 Things the fit does **not** decide, which you should set by hand from the sweep tables (`sweep/*.md`):

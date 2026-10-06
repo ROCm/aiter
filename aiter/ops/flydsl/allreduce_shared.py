@@ -24,7 +24,7 @@ _SUPPORTED_ARCHS = ("gfx942", "gfx950")
 
 # How the IPC inbox is allocated. The wire protocol is identical in every
 # mode; only the memory type changes.
-INBOX_MEMORY_MODES = ("auto", "uncached", "finegrained", "default")
+INBOX_MEMORY_MODES = ("auto", "uncached", "finegrained")
 
 
 def _cuda_index(device) -> int:
@@ -59,7 +59,6 @@ def _resolve_inbox_flags(mode: str, world_size: int) -> tuple[int, str]:
     flags = {
         "uncached": UncachedIpcHeap._HIP_DEVICE_MALLOC_UNCACHED,
         "finegrained": UncachedIpcHeap._HIP_DEVICE_MALLOC_FINEGRAINED,
-        "default": UncachedIpcHeap._HIP_DEVICE_MALLOC_DEFAULT,
     }[mode]
     return flags, mode
 
@@ -87,7 +86,6 @@ class _StEngine:
         self.rank_tile_bytes = spec["rank_tile_bytes"]
         self.wire_tile_bytes = spec["wire_tile_bytes"]
         self.block = spec["block"]
-        self.skip_self = spec.get("skip_self", False)
         self._peer_bases = [None] * world_size
         self._buf_ptr = None
         self._meta_ptr = None
@@ -98,7 +96,9 @@ class _StEngine:
         try:
             # The inbox is the only allocation peers write into, so it is the
             # only one whose memory type matters for fabric throughput.
-            self._buf_ptr = UncachedIpcHeap.alloc(self.buf_bytes, inbox_flags)
+            self._buf_ptr = UncachedIpcHeap.alloc(
+                self.buf_bytes, inbox_flags, fill=spec.get("inbox_fill", 0)
+            )
             my_handle = UncachedIpcHeap.get_mem_handle_bytes(self._buf_ptr)
             all_meta = UncachedIpcHeap.gather_object_list_via_broadcast(
                 group, (my_handle, 0)
@@ -279,8 +279,8 @@ class _LadderedIpcOp:
     """A set of IPC engines, one per ladder rung, and the launch that picks one.
 
     Everything an IPC collective does *around* its kernel: one ``_StEngine``
-    (inbox + compiled binary) per distinct ``(super_tile, block, skip_self)``,
-    selection by payload size, the persistent-grid launch, preload and cleanup.
+    (inbox + compiled binary) per distinct ``(super_tile, block)``, selection
+    by payload size, the persistent-grid launch, preload and cleanup.
     Subclasses validate their payload, call :meth:`_init_engines` once, and
     launch through :meth:`_launch_eng`. A subclass whose kernel sees something
     other than the whole payload overrides :meth:`_kernel_nbytes`.
@@ -305,15 +305,13 @@ class _LadderedIpcOp:
     ) -> None:
         """Build every engine the *ladder* rungs need.
 
-        *ladder* is ``((min_bytes, super_tile, grid_cap, block, skip_self),
-        ...)``, ascending; *laddered* says whether to select among the rungs
-        by payload (``False`` pins the first). *build* is called with
-        ``super_tile``, ``grid``, ``block`` and ``skip_self`` and returns a
-        kernel spec.
+        *ladder* is ``((min_bytes, super_tile, grid_cap, block), ...)``,
+        ascending; *laddered* says whether to select among the rungs by payload
+        (``False`` pins the first). *build* is called with ``super_tile``,
+        ``grid`` and ``block`` and returns a kernel spec.
 
-        One engine per distinct ``(super_tile, block, skip_self)``, keyed that
-        way in ``_by_cfg``. Each ``(block, skip_self)`` also gets an ST=1
-        engine: ``_pick_cfg`` falls back to it when a payload has fewer tiles
+        One engine per distinct ``(super_tile, block)``, keyed that way in
+        ``_by_cfg``. Each ``block`` also gets an ST=1 engine: ``_pick_cfg`` falls back to it when a payload has fewer tiles
         than the chosen super-tile, and the fallback has to share the rung's
         block -- a different tile size would change the tile count it was
         picked for. Engines are built in a fixed order because each does its
@@ -343,13 +341,10 @@ class _LadderedIpcOp:
         self._by_cfg = {}
 
         caps = {}
-        for _floor, st, rung_cap, b, ss in ladder:
-            caps.setdefault((st, b, ss), rung_cap)
-        for b, ss in {(b, ss) for _st, b, ss in list(caps)}:
-            caps.setdefault(
-                (1, b, ss),
-                min(c for (_st, cb, css), c in caps.items() if (cb, css) == (b, ss)),
-            )
+        for _floor, st, rung_cap, b in ladder:
+            caps.setdefault((st, b), rung_cap)
+        for b in {b for _st, b in list(caps)}:
+            caps.setdefault((1, b), min(c for (_st, cb), c in caps.items() if cb == b))
         cu_count = int(
             torch.cuda.get_device_properties(self._device_index).multi_processor_count
         )
@@ -357,7 +352,7 @@ class _LadderedIpcOp:
         try:
             with torch.cuda.device(self._device_index):
                 for key in sorted(caps):
-                    st, b, ss = key
+                    st, b = key
                     # A persistent kernel deadlocks if it launches more workgroups
                     # than fit, and the ranks have to agree on the number: take the
                     # minimum across the group so a heterogeneous node converges.
@@ -375,7 +370,6 @@ class _LadderedIpcOp:
                         super_tile=st,
                         grid=int(shared_grid.item()),
                         block=b,
-                        skip_self=ss,
                     )
                     if spec["lds_bytes"] > lds_capacity:
                         raise ValueError(
@@ -394,7 +388,7 @@ class _LadderedIpcOp:
             raise
 
         primary = self._by_cfg[self._primary]
-        self.super_tile, self.block, self.skip_self = self._primary
+        self.super_tile, self.block = self._primary
         self.buf_bytes = primary.buf_bytes
         self.lds_bytes = primary.lds_bytes
         self.tile_bytes = primary.tile_bytes
@@ -418,8 +412,8 @@ class _LadderedIpcOp:
         payload: the whole payload here."""
         return int(live_bytes)
 
-    def _ladder_cfg(self, live_bytes: int) -> tuple[int, int, bool]:
-        """``(super_tile, block, skip_self)`` the ladder assigns to *live_bytes*.
+    def _ladder_cfg(self, live_bytes: int) -> tuple[int, int]:
+        """``(super_tile, block)`` the ladder assigns to *live_bytes*.
 
         Publishes per rank fall as the super-tile grows, and on a cacheable
         inbox each costs a full L2 writeback, so a bigger payload wants a bigger
@@ -427,9 +421,9 @@ class _LadderedIpcOp:
         maximised. The rungs are the measured trade.
         """
         cfg = self._primary
-        for floor, st, _cap, b, ss in self._ladder:
+        for floor, st, _cap, b in self._ladder:
             if live_bytes >= floor:
-                cfg = (st, b, ss)
+                cfg = (st, b)
         return cfg
 
     @staticmethod
@@ -443,7 +437,7 @@ class _LadderedIpcOp:
         tile_bytes = int(block) * ATOMS * 16
         return max(1, (live_bytes + tile_bytes - 1) // tile_bytes)
 
-    def _pick_cfg(self, live_bytes: int) -> tuple[tuple[int, int, bool], int]:
+    def _pick_cfg(self, live_bytes: int) -> tuple[tuple[int, int], int]:
         """Engine key for a *live_bytes* payload, and its tile count.
 
         The ladder chooses the rung, which fixes the block and so the tile
@@ -460,15 +454,15 @@ class _LadderedIpcOp:
         there is a whole one to take. Measured on MI350P at 1024x7168, TP4:
         577.71 us at ST=1 against 269.01 at ST=8.
         """
-        want, b, ss = self._ladder_cfg(live_bytes)
+        want, b = self._ladder_cfg(live_bytes)
         num_tiles = self._num_tiles(live_bytes, b)
         if want == 1:
             st = 1
         elif self._batch_publishes:
             st = want if num_tiles >= want else 1
         else:
-            st = want if num_tiles > self._by_cfg[(want, b, ss)].grid else 1
-        return (st, b, ss), num_tiles
+            st = want if num_tiles > self._by_cfg[(want, b)].grid else 1
+        return (st, b), num_tiles
 
     def _grid_x(self, num_tiles: int, super_tile: int, grid: int | None = None) -> int:
         """Blocks to launch for *num_tiles* tiles under *super_tile*.
@@ -528,7 +522,7 @@ class _LadderedIpcOp:
         with torch.cuda.device(self._device_index):
             _run_compiled(eng.launch, *args)
 
-    def cfgs_for(self, lo: int, hi: int) -> list[tuple[int, int, bool]]:
+    def cfgs_for(self, lo: int, hi: int) -> list[tuple[int, int]]:
         """``_by_cfg`` keys a payload of ``lo..hi`` bytes (inclusive) can
         select, in build order."""
         floors = [rung[0] for rung in self._ladder]

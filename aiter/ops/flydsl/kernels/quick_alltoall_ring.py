@@ -81,11 +81,10 @@ __all__ = [
 # knob that amortizes them, as in the all-reduce ring.
 A2A_RING_SUPER_TILES = (1, 8, 16, 32)
 
-# ``(min_bytes, super_tile, grid_cap, block, skip_self)``, as for the mesh.
-# Seeded from the all-reduce ring; to be refitted with ``bench_comm.py
-# --operation a2a``.
+# ``(min_bytes, super_tile, grid_cap, block)``, as for the mesh. Seeded from
+# the all-reduce ring; to be refitted with ``bench_comm.py --operation a2a``.
 A2A_RING_ST_LADDER = {
-    (link, ws): ((0, 8, 128, 256, False), (16 << 20, 8, 128, 512, False))
+    (link, ws): ((0, 8, 128, 256), (16 << 20, 8, 128, 512))
     for link in ("xgmi", "pcie")
     for ws in SUPPORTED_WORLDS
 }
@@ -419,5 +418,4 @@ def make_quick_alltoall_ring_kernel(
         "rank_atoms": rank_atoms,
         "grid": grid,
         "block": block,
-        "skip_self": False,
     }
