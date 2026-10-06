@@ -86,6 +86,7 @@ FAMILIES = [
     ("AITER_CONFIG_FHMOE", "tuned_fhmoe"),
     ("AITER_CONFIG_GROUPED_FMOE", "tuned_grouped_fmoe"),
     ("AITER_CONFIG_GDN_K5_OPT", "chunk_gdn_h_opt_tuned"),
+    ("AITER_CONFIG_MQA_LOGITS", "tuned_mqa_logits"),
 ]
 
 
@@ -297,6 +298,9 @@ class TestConfigShapeCollision(unittest.TestCase):
 
     def test_gdn_k5_opt(self):
         self._check_family("AITER_CONFIG_GDN_K5_OPT", "chunk_gdn_h_opt_tuned")
+
+    def test_mqa_logits(self):
+        self._check_family("AITER_CONFIG_MQA_LOGITS", "tuned_mqa_logits")
 
 
 def _fix_real_tree():
