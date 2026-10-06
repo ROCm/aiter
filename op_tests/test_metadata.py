@@ -32,6 +32,23 @@ UNI_SEQLEN_QO = 1
 MAX_SPLIT_PER_BATCH = 16
 IS_CAUSAL = True
 
+# ---------------------------------------------------------------------------
+# DeepSeek-V3 decode with DP attention on gfx942 (head-folds). 128 bf16 q-heads
+# are not natively supported there, so the planner sets qk_batch_ratio = 8,
+# num_heads = 16 and num_batches *= 8. Only uni_seqlen_qo == -1 reaches the
+# QoState branch that has to map a folded batch id back onto the caller's
+# unfolded qo_indptr -- the sweep above pins uni_seqlen_qo = 1 and never does.
+# vLLM's DP-attention decode runs exactly that, with zero-length cudagraph pad
+# slots on top.
+# ---------------------------------------------------------------------------
+NON_UNI_SEQLEN_QO = -1
+FOLD_NHEAD = 128
+FOLD_BATCH = 4
+FOLD_NUM_REAL = 3  # remaining slots are cudagraph padding (qo_len == kv_len == 0)
+FOLD_CTX_LEN = 256
+FOLD_KV_LORA_RANK = 512
+FOLD_QK_ROPE_HEAD_DIM = 64
+
 # Default serving sweep (kimi Makefile / perf_sweep.sh), plus the batch counts
 # that only prefill reaches. num_batches is the concurrency for decode, so the
 # kimi row tops out at 128 -- but a DSA prefill chunk carries one batch per query
@@ -61,7 +78,9 @@ def kimi_nhead(tp: int) -> int:
     return max(KIMI_TOTAL_QO_HEADS // tp, MLA_MIN_HEADS)
 
 
-def build_decode_inputs(batch_size, ctx_len, dtype, kvtype, nhead, *, jitter, seed):
+def build_decode_inputs(
+    batch_size, ctx_len, dtype, kvtype, nhead, *, jitter, seed, qo_lens=None
+):
     """
     Build the decode-time inputs for one (batch_size, ctx_len) shape, mirroring
     what atom feeds get_mla_metadata_v1:
@@ -74,6 +93,9 @@ def build_decode_inputs(batch_size, ctx_len, dtype, kvtype, nhead, *, jitter, se
     With ``jitter`` the per-sequence KV length is drawn from
     [ctx_len // 2, ctx_len] to emulate the spread of a real in-flight batch;
     otherwise every sequence is exactly ``ctx_len`` long.
+
+    ``qo_lens`` overrides the one-token-per-sequence assumption; a zero there is
+    a cudagraph pad slot and drops that sequence's KV to zero as well.
     """
     if jitter:
         rng = random.Random(seed)
@@ -83,7 +105,13 @@ def build_decode_inputs(batch_size, ctx_len, dtype, kvtype, nhead, *, jitter, se
     else:
         kv_lens = [ctx_len] * batch_size
 
-    qo_indptr = torch.arange(batch_size + 1, dtype=torch.int32, device="cuda")
+    if qo_lens is None:
+        qo_indptr = torch.arange(batch_size + 1, dtype=torch.int32, device="cuda")
+    else:
+        kv_lens = [0 if q == 0 else k for q, k in zip(qo_lens, kv_lens)]
+        qo_lens_t = torch.tensor(qo_lens, dtype=torch.int32, device="cuda")
+        qo_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device="cuda")
+        qo_indptr[1:] = qo_lens_t.cumsum(0)
 
     kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device="cuda")
     kv_indptr[1:] = torch.tensor(kv_lens, dtype=torch.int32, device="cuda").cumsum(0)
@@ -132,7 +160,7 @@ def alloc_outputs(out_meta):
     }
 
 
-def call_metadata(inputs, outs, dtype, kvtype):
+def call_metadata(inputs, outs, dtype, kvtype, uni_seqlen_qo=UNI_SEQLEN_QO):
     """Run get_mla_metadata_v1 into the provided output buffers (in place)."""
     aiter.get_mla_metadata_v1(
         inputs["qo_indptr"],
@@ -150,7 +178,7 @@ def call_metadata(inputs, outs, dtype, kvtype):
         page_size=PAGE_SIZE,
         kv_granularity=KV_GRANULARITY,
         max_seqlen_qo=MAX_SEQLEN_QO,
-        uni_seqlen_qo=UNI_SEQLEN_QO,
+        uni_seqlen_qo=uni_seqlen_qo,
         fast_mode=True,
         max_split_per_batch=MAX_SPLIT_PER_BATCH,
         dtype_q_nope=dtype,
@@ -314,6 +342,95 @@ def test_metadata(
     return ret
 
 
+def check_qo_fold(uni_seqlen_qo, qo_lens, label):
+    """Plan one folded decode shape and assert its reduce map covers every row."""
+    dtype = kvtype = dtypes.bf16
+    inputs, out_meta, _kv_lens = build_decode_inputs(
+        FOLD_BATCH,
+        FOLD_CTX_LEN,
+        dtype,
+        kvtype,
+        FOLD_NHEAD,
+        jitter=False,
+        seed=0,
+        qo_lens=qo_lens,
+    )
+    outs = alloc_outputs(out_meta)
+    call_metadata(inputs, outs, dtype, kvtype, uni_seqlen_qo=uni_seqlen_qo)
+    torch.cuda.synchronize()
+
+    total_qo = int(inputs["qo_indptr"][-1].item())
+    reduce_indptr = outs["reduce_indptr"]
+    num_tiles = reduce_indptr.numel() - 1
+    # Tiles per batch is the planner's fold factor, so this is the row count of
+    # the folded q/o views mla_decode_fwd builds through _fold_seqlen_indptr.
+    # reduce_final_map is the reducer's store address range in those rows.
+    folded_rows = total_qo * (num_tiles // FOLD_BATCH)
+
+    steps = reduce_indptr[1:] - reduce_indptr[:-1]
+    active = steps > 0
+    rfm = outs["reduce_final_map"].reshape(-1, 2)[:num_tiles][active]
+    bad = (rfm[:, 0] < 0) | (rfm[:, 1] > folded_rows) | (rfm[:, 1] < rfm[:, 0])
+    assert not bool(bad.any()), (
+        f"[{label}] {int(bad.sum())} of {int(active.sum())} active reduce_final_map "
+        f"rows are outside [0, {folded_rows}] or non-monotone: "
+        f"{rfm[bad].tolist()[:8]}"
+    )
+
+    head_dim = FOLD_KV_LORA_RANK + FOLD_QK_ROPE_HEAD_DIM
+    total_kv = int(inputs["kv_indptr"][-1].item())
+    q = torch.randn(total_qo, FOLD_NHEAD, head_dim, dtype=dtype, device="cuda")
+    kv_buffer = torch.randn(
+        total_kv, PAGE_SIZE, KIMI_NHEAD_KV, head_dim, dtype=kvtype, device="cuda"
+    )
+    kv_indices = torch.arange(total_kv, dtype=torch.int32, device="cuda")
+    # A row the reducer never stores to keeps its fill, so NaN is what turns
+    # "left unwritten" into something assertable.
+    o = torch.full(
+        (total_qo, FOLD_NHEAD, FOLD_KV_LORA_RANK),
+        float("nan"),
+        dtype=dtype,
+        device="cuda",
+    )
+    aiter.mla.mla_decode_fwd(
+        q,
+        kv_buffer,
+        o,
+        inputs["qo_indptr"],
+        inputs["kv_indptr"],
+        kv_indices,
+        inputs["kv_last_page_lens"],
+        MAX_SEQLEN_QO,
+        page_size=PAGE_SIZE,
+        nhead_kv=KIMI_NHEAD_KV,
+        work_meta_data=outs["work_meta_data"],
+        work_indptr=outs["work_indptr"],
+        work_info_set=outs["work_info_set"],
+        reduce_indptr=outs["reduce_indptr"],
+        reduce_final_map=outs["reduce_final_map"],
+        reduce_partial_map=outs["reduce_partial_map"],
+    )
+    torch.cuda.synchronize()
+
+    unwritten = int(torch.isnan(o).any(-1).sum().item())
+    assert unwritten == 0, (
+        f"[{label}] {unwritten} of {total_qo * FOLD_NHEAD} (row, head) pairs of o "
+        "were never written"
+    )
+
+
+def test_qo_fold_nonuniform():
+    """Folded planner x non-uniform qo: the DP-attention decode path (see FOLD_*)."""
+    unpadded = [1] * FOLD_BATCH
+    padded = [1] * FOLD_NUM_REAL + [0] * (FOLD_BATCH - FOLD_NUM_REAL)
+    for uni_seqlen_qo, qo_lens, label in (
+        (UNI_SEQLEN_QO, unpadded, "uniform"),
+        (NON_UNI_SEQLEN_QO, unpadded, "non-uniform"),
+        (NON_UNI_SEQLEN_QO, padded, "non-uniform+pad"),
+    ):
+        check_qo_fold(uni_seqlen_qo, qo_lens, label)
+
+
 def main():
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning(
@@ -385,6 +502,10 @@ def main():
         f"kv_gran={KV_GRANULARITY} max_split_per_batch={MAX_SPLIT_PER_BATCH} "
         f"jitter={args.jitter}"
     )
+
+    # Correctness only, fixed tiny shape: kept out of the sweep table below.
+    test_qo_fold_nonuniform()
+    print("folded + non-uniform qo regression: pass")
 
     rows = []
     all_match = True
