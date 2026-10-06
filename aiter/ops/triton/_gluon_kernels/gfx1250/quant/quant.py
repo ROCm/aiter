@@ -367,6 +367,7 @@ def gluon_dynamic_mxfp8_quant_kernel_gfx1250(
 ):
     # NUM_BUFFERS=1: synchronous, no prefetch.
     gl.static_assert(NUM_BUFFERS >= 1, "LDS kernel requires NUM_BUFFERS >= 1")
+    # fp8 TDM async_store corrupted data in tiles wider than 1024; not verified safe.
     gl.static_assert(
         BLOCK_SIZE_N <= 1024,
         "BLOCK_SIZE_N > 1024 not yet verified safe for fp8 TDM async_store",

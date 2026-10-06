@@ -60,6 +60,6 @@
     "BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 256, "NUM_ITER": 2, "NUM_WARPS": 2, "NUM_BUFFERS": 1, "waves_per_eu": 4
   },
   "any": {
-    "BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 128, "NUM_ITER": 1, "NUM_WARPS": 4, "NUM_BUFFERS": 2, "waves_per_eu": 4
+    "BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 256, "NUM_ITER": 2, "NUM_WARPS": 2, "NUM_BUFFERS": 1, "waves_per_eu": 4
   }
 }

@@ -300,6 +300,7 @@ def dynamic_mxfp4_quant(
             and blockscale_e8m0.dtype == torch.uint8
         )
 
+    # Every gfx1250 input has a Gluon kernel; the call only validates `backend`.
     if arch_info.get_arch() == "gfx1250" and _use_gluon(backend, True, "gfx1250"):
         from aiter.ops.triton._gluon_kernels.gfx1250.quant.quant import (
             gluon_dynamic_mxfp4_quant_kernel_gfx1250,
