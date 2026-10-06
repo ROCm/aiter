@@ -15,7 +15,7 @@ reference, and writes the fastest correct one per shape::
 Context length is not a lookup key (the op cannot read it without a host
 sync), so a shape listed at several ``context_len`` values in the untuned file
 gets the config with the lowest geomean time across them. The tuned row records
-the contexts (``8192;32768``) and that geomean. A FlyDSL winner still stores
+the contexts (``8192;60000``) and that geomean. A FlyDSL winner still stores
 the winning Gluon ``ChunkK`` and ``WavePerEU`` for the op's fallback.
 """
 
