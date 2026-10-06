@@ -290,7 +290,10 @@ class MegaMoeTPEngine:
         if self.gfx != "gfx950":
             raise ValueError(f"fused TP MegaMoE needs gfx950, not {self.gfx}")
         self.agr = max(1, -(-self.mmax // self.n_cta))
-        if self._lds(1, False) > LDS_LIMIT:
+        # (the static schedule runs batches above the dynamic one's DYN_MAX
+        # tokens and below lb_min: none when LB takes over right there)
+        static = not (self.schedule == "dynamic" and self.lb_min and self.lb_min <= DYN_MAX + 1)
+        if static and self._lds(1, False) > LDS_LIMIT:
             ok = self.mmax
             while ok > 1 and self._lds(1, False, mmax=ok) > LDS_LIMIT:
                 ok -= max(1, ok // 64)

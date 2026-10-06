@@ -56,7 +56,8 @@ def _u(v):
 
 
 ZT = 16  # router: rows per tile
-NRT_MAX = 32  # router row tiles (m / 16)
+NRT_MAX = 128  # router row tiles (m / 16)
+ROWF = NRT_MAX * 16  # router row flags (m)
 
 
 @functools.cache
@@ -210,7 +211,7 @@ def compile_sp_rs_norm(
                      fx.inttoptr(fx.PointerType.get(T.i32, fx.AddressSpace.Shared, 4), L + off))
 
     def zflag(a, rt, ks):
-        return fx.Int64(a["ctrl"]) + fx.Int64((i32(5 * NB + 512) + rt * i32(KS_MAX) + ks) * i32(4))
+        return fx.Int64(a["ctrl"]) + fx.Int64((i32(5 * NB + ROWF) + rt * i32(KS_MAX) + ks) * i32(4))
 
     def rt_tiles(m):
         # the most K slices (a divisor of H / 128) with a CTA per task
@@ -658,7 +659,7 @@ class SpRsNorm:
         arena.commit()
         self.arena = arena
         # ctrl: per-CTA epochs, [tl] stamps, router row flags, tile counters
-        self.ctrl = torch.zeros(NB * 5 + 512 + NRT_MAX * KS_MAX, dtype=torch.int32, device=device)
+        self.ctrl = torch.zeros(NB * 5 + ROWF + NRT_MAX * KS_MAX, dtype=torch.int32, device=device)
         self._zp = torch.empty(
             (NRT_MAX * KS_MAX * ZT * max(E, 1),) if router else (1,),
             dtype=torch.float32,

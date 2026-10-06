@@ -62,7 +62,7 @@ NPRE_MAX = 16
 FLAG_YAG = FLAG_PRE + NPRE_MAX * MAX_TP * NCTA_MAX
 FLAG_AGQ = FLAG_YAG + NCK_MAX * MAX_TP * NCTA_MAX
 #   FLAG_TN + r*TN_MAX + i                     tail (tn): rank r sent its output row i
-TN_MAX = 512
+TN_MAX = 2048
 FLAG_TN = FLAG_AGQ + NCHA_MAX * MAX_TP
 FLAG_INTS = FLAG_TN + MAX_TP * TN_MAX
 
@@ -97,7 +97,7 @@ CTRL_CLM = CTRL_AGG + NCHA_MAX * LRDY_STRIDE
 #                                                256 atomics on one serialize)
 #   CTRL_COLC + (bank*NCK_MAX + c)*LRDY_STRIDE   GEMM2 units done of column group c
 #   CTRL_G1C + (bank*NCHLB_MAX + j)*G1C_STRIDE   GEMM1 pieces done of row chunk j
-NCHLB_MAX = 512
+NCHLB_MAX = 1024
 G1C_STRIDE = 16
 CTRL_LBSEQ = CTRL_CLM + 2 * LRDY_STRIDE
 CTRL_LBR = CTRL_LBSEQ + LRDY_STRIDE
@@ -234,9 +234,11 @@ def mega_moe_tp_consts(
         max(RG * c["SI_STRIDE"], agr * (c["XB"] + H // 32) - RG * (I // 32))
     )
     c["L_INTERS"] = take(RG * (I // 32))
-    # LB: one row chunk's routes at a time (the rest: up to every route)
-    c["L_RIX"] = take((256 if lb else TMAX) * 4)
-    c["L_WT"] = take((256 if lb else TMAX) * 4)
+    # LB: one row chunk's routes at a time; the dynamic schedule: an expert's
+    # routes of at most DYN_MAX tokens; else up to every token's
+    nrix = 256 if lb else min(TMAX, DYN_MAX) if dyn_e else TMAX
+    c["L_RIX"] = take(nrix * 4)
+    c["L_WT"] = take(nrix * 4)
     c["L_CTL"] = take(128 * 4)
     c["L_DYN"] = take((2 * c["NBW"] + dyn_e) * 4)
     # row chunks of the dynamic schedule: routes per expert, then one packed
@@ -516,6 +518,7 @@ def compile_mega_moe_tp(
     RBITS = TMAX.bit_length()
     # LB plan: routing loads (4 routes each) per compute thread
     LB_IT = (TMAX * TOPK // 4 + NT - 1) // NT
+    LB_B = min(LB_IT, 10)
     # LB GEMM1 inter pieces per row chunk: picked at run time (the candidates,
     # the first kept on ties), or forced (lbp)
     LB_PS = [p for p in range(1, KS2 + 1) if KS2 % p == 0]
@@ -2654,16 +2657,19 @@ def compile_mega_moe_tp(
             )
         rid = rsrc(a["ids"], n * i32(4))
         n4 = n // i32(4)
-        # every load of the thread in flight at once (one at a time is ~1 us each)
-        vs = [
-            fx.Vector(bld(rid, fx.min(tid + i32(it * NT), n4 - i32(1)) * i32(16), 0, V4I, 0))
-            for it in range(LB_IT)
-        ]
-        for it in range_constexpr(LB_IT):
-            q = tid + i32(it * NT)
-            for j in range_constexpr(4):
-                e = fx.Int32(vs[it][j])
-                _lb_count(L, e, q < n4, q * i32(4) + i32(j) < lo)
+        # LB_B loads of the thread in flight at once (one at a time is ~1 us
+        # each), as many rounds as the batch's routes need
+        for r0_ in range(i32(0), n4, i32(NT * LB_B)):
+            r0 = i32(r0_)
+            vs = [
+                fx.Vector(bld(rid, fx.min(r0 + tid + i32(it * NT), n4 - i32(1)) * i32(16), 0, V4I, 0))
+                for it in range(LB_B)
+            ]
+            for it in range_constexpr(LB_B):
+                q = r0 + tid + i32(it * NT)
+                for j in range_constexpr(4):
+                    e = fx.Int32(vs[it][j])
+                    _lb_count(L, e, q < n4, q * i32(4) + i32(j) < lo)
         for idx_ in range(n4 * i32(4) + tid, n, i32(NT)):
             idx = i32(idx_)
             e = fx.Int32(bld(rid, idx * i32(4), 0, T.i32, 0))
