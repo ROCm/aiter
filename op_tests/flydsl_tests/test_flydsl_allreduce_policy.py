@@ -31,8 +31,12 @@ from aiter.ops.flydsl.kernels.quick_allreduce_codec import (
     SUPPORTED_BLOCKS as TWO_STAGE_BLOCKS,
 )
 from aiter.ops.flydsl.kernels.quick_allreduce_mesh import (
+    RELAY_MAX_DEN,
     SUPER_TILES,
+    make_quick_allreduce_mesh_kernel,
     mesh_st_ladder,
+    relay_blocks,
+    relay_tile_fraction,
 )
 from aiter.ops.flydsl.kernels.quick_allreduce_ring import (
     RING_SUPER_TILES,
@@ -155,6 +159,73 @@ def test_ladder_rungs_fall_inside_their_dispatch_window(ws):
             assert floor < quant.mesh_max, ("mesh", link, ws, floor)
     # Ring rungs are offsets into an unbounded window, so only the ordering
     # above constrains them.
+
+
+RELAY_FRACTIONS = [(1, 4), (3, 8), (1, 2), (5, 8), (3, 4), (1, 1)]
+
+
+@pytest.mark.parametrize("relay", RELAY_FRACTIONS)
+def test_relay_blocks_hit_the_fraction(relay):
+    """With a whole number of ``den`` cycles the realized fraction is exactly
+    ``num/den``, the relay blocks lead each cycle, and ``(1, 1)`` is every block."""
+    num, den = relay
+    n_blocks = den * 16
+    flags = relay_blocks(n_blocks, relay)
+    assert sum(flags) * den == num * n_blocks
+    assert flags[:den] == [True] * num + [False] * (den - num)
+    if relay == (1, 1):
+        assert all(flags)
+
+
+@pytest.mark.parametrize(
+    "relay", [(0, 2), (3, 2), (1, RELAY_MAX_DEN + 1), (1, 0), (-1, 2)]
+)
+def test_relay_fraction_out_of_range_raises(relay):
+    with pytest.raises(ValueError):
+        relay_blocks(16, relay)
+
+
+def test_relay_tile_fraction():
+    # 8192x5120 bf16 at block 512: 1280 tiles over 128 blocks.
+    assert relay_tile_fraction(1280, 128, (1, 2)) == 0.5
+    assert relay_tile_fraction(1280, 128, (1, 1)) == 1.0
+    # Fewer blocks than a full cycle skew the realized fraction.
+    assert relay_tile_fraction(16, 16, (1, 4)) == 0.25
+    assert relay_tile_fraction(8, 8, (3, 8)) == 0.375
+    assert relay_tile_fraction(5, 5, (1, 2)) == 0.6
+    # Every tile has exactly one owner, relay or not.
+    n_blocks, num_tiles = 40, 1000
+    relay = (3, 8)
+    owned = [len(range(b, num_tiles, n_blocks)) for b in range(n_blocks)]
+    assert sum(owned) == num_tiles
+    want = sum(o for o, r in zip(owned, relay_blocks(n_blocks, relay)) if r)
+    assert relay_tile_fraction(num_tiles, n_blocks, relay) == want / num_tiles
+    assert relay_tile_fraction(0, 8, (1, 2)) == 0.0
+
+
+@pytest.mark.parametrize("block", TWO_STAGE_BLOCKS)
+@pytest.mark.parametrize("st", SUPER_TILES)
+def test_relay_bounce_mirrors_the_inbox(block, st):
+    """The bounce is slot for slot the size of the receiver's inbox."""
+    kw = {"world_size": 2, "super_tile": st, "block": block, "skip_self": True}
+    direct = make_quick_allreduce_mesh_kernel(grid=128, rank=0, **kw)
+    relay = make_quick_allreduce_mesh_kernel(grid=128, rank=0, relay=(1, 2), **kw)
+    assert relay["bounce_bytes"] == relay["flags_bytes"] + relay["data_bytes"]
+    assert relay["bounce_bytes"] == direct["flags_bytes"] + direct["data_bytes"]
+    assert direct["relay"] is None and relay["relay"] == (1, 2)
+
+
+@pytest.mark.parametrize(
+    "kw",
+    [
+        {"world_size": 4, "skip_self": True, "rank": 0},
+        {"world_size": 2, "skip_self": False},
+        {"world_size": 2, "skip_self": True, "rank": 0, "inbox_memory": "finegrained"},
+    ],
+)
+def test_relay_factory_rejects_unsupported_configs(kw):
+    with pytest.raises(ValueError):
+        make_quick_allreduce_mesh_kernel(grid=128, relay=(1, 2), **kw)
 
 
 def _env(**kw):

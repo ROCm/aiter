@@ -25,6 +25,12 @@ Two tuning knobs besides the super-tile:
   its reduce-scatter share is added from registers, and its reduced chunk
   is decoded from the same packet it sends. It needs the rank at trace time,
   which costs one binary per rank.
+
+At TP2 a fixed fraction of the blocks, the *relay* blocks, can write their
+packet into a bounce buffer on a third GPU instead of the peer's inbox, so a
+share of each direction's traffic takes the two xGMI links through that GPU.
+The peer reads it from the bounce in place of its inbox. Flags, colours and the
+reduction order are unchanged.
 """
 
 import flydsl.compiler as flyc
@@ -49,6 +55,9 @@ from .quick_allreduce_codec import (
     thread_lane,
 )
 from .quick_allreduce_shared import (
+    _CM_NT,
+    _CM_SC0,
+    _CM_SC1,
     _INBOX_POLICY,
     ATOMS,
     BLOCK,
@@ -63,6 +72,7 @@ from .quick_allreduce_shared import (
     _acquire_inbox,
     _buffer_load,
     _buffer_ptr,
+    _buffer_store,
     _color_io,
     _i32_to_bytes,
     _load_flag,
@@ -79,15 +89,20 @@ from .quick_allreduce_shared import (
 __all__ = [
     "DEFAULT_GRID_CAP",
     "MESH_CODECS",
+    "MESH_RELAY_DEFAULTS",
     "MESH_ST_LADDER",
+    "RELAY_MAX_DEN",
     "SUPER_TILES",
     "SUPPORTED_BLOCKS",
     "SUPPORTED_WORLDS",
     "TILE_BYTES",
     "WORLD",
+    "check_relay",
     "clamp_grid_cap",
     "make_quick_allreduce_mesh_kernel",
     "mesh_st_ladder",
+    "relay_blocks",
+    "relay_tile_fraction",
 ]
 
 PHASES = 2
@@ -179,8 +194,58 @@ def mesh_st_ladder(world_size: int, link: str = "pcie"):
     return MESH_ST_LADDER.get((str(link), int(world_size)), ())
 
 
+# ``(link, world_size, arch) -> (relay_min_bytes, (num, den))``: from which
+# payload relay engines run, and the share of blocks they relay. Measured under
+# CUDA-graph replay on an idle node with the 4-bit wire at hidden size 5120, as
+# the speedup over the direct engine: 3/8 gives 1.33-1.41x from 20 to 120 MiB,
+# 1.18-1.20x over 5-10 MiB, 1.14x at 2.5 MiB, 1.04-1.09x from 0.5 to 1.25 MiB,
+# and loses below that. 1/4 and 1/2 are slower than 3/8 at every size from 5 MiB.
+MESH_RELAY_DEFAULTS = {("xgmi", 2, "gfx950"): (480 << 10, (3, 8))}
+
 # Wire formats the mesh can build.
 MESH_CODECS = ("int4", "int5", "int6", "fp16")
+
+# Largest ``den`` of a relay fraction. Block ``b`` relays when ``b % den < num``,
+# and blocks reach XCDs round-robin, so at ``den = 8`` the relay blocks fill whole
+# XCDs. That placement measured faster than spreading them over every XCD.
+RELAY_MAX_DEN = 8
+
+# A relay block's payload stores go out at system scope (``sc0 sc1``). The
+# ``vmcnt(0)`` before the flag then means the payload is visible on the relay,
+# which the flag, landing in the peer's inbox, does not otherwise order.
+_RELAY_STORE_CM = _CM_SC0 | _CM_SC1 | _CM_NT
+
+
+def check_relay(relay):
+    num, den = (int(x) for x in relay)
+    if not 0 < num <= den <= RELAY_MAX_DEN:
+        raise ValueError(
+            f"relay must be (num, den) with 0 < num <= den <= {RELAY_MAX_DEN}, "
+            f"got {tuple(relay)!r}"
+        )
+    return num, den
+
+
+def relay_blocks(n_blocks: int, relay) -> list[bool]:
+    """Which of *n_blocks* launched blocks are relay blocks, as the kernel decides."""
+    num, den = check_relay(relay)
+    return [b % den < num for b in range(int(n_blocks))]
+
+
+def relay_tile_fraction(num_tiles: int, n_blocks: int, relay) -> float:
+    """Fraction of *num_tiles* tiles owned by relay blocks.
+
+    Block ``b`` owns tiles ``b, b + n_blocks, ...``. The fraction differs from
+    ``num/den`` when ``n_blocks`` is not a multiple of ``den``.
+    """
+    if num_tiles < 1:
+        return 0.0
+    owned = sum(
+        max(0, -(-(int(num_tiles) - b) // int(n_blocks)))
+        for b, is_relay in enumerate(relay_blocks(n_blocks, relay))
+        if is_relay
+    )
+    return owned / int(num_tiles)
 
 
 def make_quick_allreduce_mesh_kernel(
@@ -193,6 +258,7 @@ def make_quick_allreduce_mesh_kernel(
     block: int = BLOCK,
     skip_self: bool = False,
     rank: int | None = None,
+    relay: tuple[int, int] | None = None,
 ):
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(
@@ -211,6 +277,14 @@ def make_quick_allreduce_mesh_kernel(
             f"skip_self needs the rank at trace time, got rank={rank!r} for "
             f"world_size={world_size}"
         )
+    if relay is not None:
+        relay = check_relay(relay)
+        if world_size != 2 or not skip_self or inbox_memory != "uncached":
+            raise ValueError(
+                "relay needs world_size=2, skip_self and an uncached inbox, got "
+                f"world_size={world_size}, skip_self={skip_self}, "
+                f"inbox_memory={inbox_memory!r}"
+            )
     c = codecs_for_block(block)[codec]
     tile_bytes = block * ATOMS * 16
     quads_per_block = block // QUAD_LANES
@@ -312,9 +386,20 @@ def make_quick_allreduce_mesh_kernel(
         pack = lds.pack.view(pack_layout)
         smem_ptr = lds.pack.ptr
 
-        peers = _load_peers(peer_ptrs, world_size)
-        peer_vec = fx.Vector.from_elements(peers, dtype=fx.Int64)
+        # With a relay the table ends in this rank's bounce-out and bounce-in.
+        peers = _load_peers(peer_ptrs, world_size + (2 if relay is not None else 0))
+        peer_vec = fx.Vector.from_elements(peers[:world_size], dtype=fx.Int64)
         inbox = _buffer_ptr(_to_sgpr_i64(peer_vec[rank]), T.i32, 4)
+        recv_buf = inbox
+        if const_expr(relay is not None):
+            # Uniform per block, and the same on both ranks for the same tiles.
+            is_relay = (bid % fx.Int32(relay[1])) < fx.Int32(relay[0])
+            bounce_out = _buffer_ptr(_to_sgpr_i64(peers[world_size]), T.i32, 4)
+            recv_buf = _buffer_ptr(
+                _to_sgpr_i64(is_relay.select(peers[world_size + 1], peer_vec[rank])),
+                T.i32,
+                4,
+            )
 
         def _push_base(j):
             """Inbox base of destination *j*, a lane-varying ``push_peers`` index."""
@@ -336,6 +421,11 @@ def make_quick_allreduce_mesh_kernel(
             encode=_atom_f16_to_bf16,
         )
         _load_color, _store_color = _color_io(colors_ptr, bid)
+
+        def _store_peer(j, wire_off, v4):
+            _store_v4i32_peer(
+                _push_base(j) + _i32_to_bytes(wire_off), v4, payload_policy
+            )
 
         def _pack_off(peer, i32_idx):
             return fx.get_scalar(fx.crd2idx((peer, i32_idx), pack_layout))
@@ -462,10 +552,19 @@ def make_quick_allreduce_mesh_kernel(
                             smem_ptr + _pack_off(pack_row, vec_idx),
                             result_type=fx.Vector.make_type(4, fx.Int32),
                         )
-                        byte_off = _i32_to_bytes(
-                            _sub_tile_i32(phase, inbox_src, sub) + wire_idx
-                        )
-                        _store_v4i32_peer(_push_base(j) + byte_off, v4, payload_policy)
+                        wire_off = _sub_tile_i32(phase, inbox_src, sub) + wire_idx
+                        if const_expr(relay is not None):
+                            if is_relay:
+                                _buffer_store(
+                                    bounce_out,
+                                    wire_off,
+                                    v4,
+                                    cache_modifier=_RELAY_STORE_CM,
+                                )
+                            else:
+                                _store_peer(j, wire_off, v4)
+                        else:
+                            _store_peer(j, wire_off, v4)
 
         def _publish(phase, inbox_src, color):
             """Drain payload NT stores, then write *color* into every peer inbox.
@@ -550,7 +649,7 @@ def make_quick_allreduce_mesh_kernel(
                 base = base + fx.Int32(k * c.rank_tile_i32)
 
             def _get(off):
-                return _buffer_load(inbox, base + off, 1, fx.Int32, recv_policy)[0]
+                return _buffer_load(recv_buf, base + off, 1, fx.Int32, recv_policy)[0]
 
             words, word = _codec_load(c, _get, tid, scale_slot)
             return words, _scale_from_word(c, word, pair_in_slot)
@@ -723,6 +822,8 @@ def make_quick_allreduce_mesh_kernel(
 
     tag = f"ws{world_size}_st{super_tile}_g{grid}_{inbox_memory}_{codec}"
     tag += f"_b{block}"
+    if relay is not None:
+        tag += f"_rly{relay[0]}o{relay[1]}"
     if skip_self:
         # ``_r<n>_`` is the rank field the bench's variant comparison already
         # collapses before checking that the ranks agree.
@@ -752,4 +853,7 @@ def make_quick_allreduce_mesh_kernel(
         "grid": grid,
         "block": block,
         "skip_self": skip_self,
+        "relay": relay,
+        # The bounce mirrors the receiver's inbox slot for slot.
+        "bounce_bytes": flags_i32 * 4 + PHASES * grid * world_size * wire_tile_bytes,
     }
