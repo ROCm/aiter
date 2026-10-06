@@ -15,6 +15,7 @@ from aiter.ops.triton.utils.config_utils import (
     select_leq_config,
 )
 from aiter.ops.triton.utils.gmm_common import is_power_of_2
+from aiter.ops.triton.utils.quant_config_utils import table_axes
 
 
 def test_select_leq_config_one_axis():
@@ -114,11 +115,26 @@ def test_quant_config_table(path):
 def test_quant_config_resolves_every_shape(path):
     with open(path) as f:
         table = json.load(f)
-    axis_names = {
-        part.split("_")[0] for key in table if key != "any" for part in key.split(".")
-    }
-    other = ({"N", "K"} & axis_names or {"N"}).pop()
-    for m in (1, 2, 3, 8, 17, 32, 33, 100, 1024, 1025, 8192, 131072):
-        for v in (32, 64, 96, 128, 1024, 1025, 3072, 7168, 16384, 16385, 53248):
-            cfg = select_leq_config(table, axes=("M", other), M=m, **{other: v})
+    axes = table_axes(table)
+    for first in (1, 2, 3, 8, 17, 32, 33, 100, 1024, 1025, 8192, 131072):
+        for second in (32, 64, 96, 128, 1024, 1025, 3072, 7168, 16384, 16385, 53248):
+            cfg = select_leq_config(
+                table, axes=axes, **dict(zip(axes, (first, second)))
+            )
             assert _REQUIRED <= set(cfg)
+
+
+@pytest.mark.parametrize("path", _QUANT_JSONS, ids=_ids(_QUANT_JSONS))
+def test_quant_config_axes_cover_every_key(path):
+    with open(path) as f:
+        table = json.load(f)
+    axes = table_axes(table)
+    assert len(axes) == 2, axes
+    for key in table:
+        if key != "any":
+            assert {part.split("_")[0] for part in key.split(".")} <= set(axes), key
+
+
+def test_table_axes_rejects_mixed_orders():
+    with pytest.raises(ValueError, match="share one axis order"):
+        table_axes({"N_LEQ_1.M_LEQ_1": {}, "M_LEQ_2.N_LEQ_2": {}, "any": {}})

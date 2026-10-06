@@ -306,7 +306,7 @@ def dynamic_mxfp4_quant(
             gluon_dynamic_mxfp4_quant_kernel_gfx1250,
         )
 
-        cfg = get_quant_config("MXFP4", ("N", "M"), M=M, N=N)
+        cfg = get_quant_config("MXFP4", M=M, N=N)
         NUM_ITER = cfg["NUM_ITER"]
         BLOCK_SIZE_M = cfg["BLOCK_SIZE_M"]
         BLOCK_SIZE_N = cfg["BLOCK_SIZE_N"]
@@ -345,7 +345,7 @@ def dynamic_mxfp4_quant(
             gluon_dynamic_mxfp4_quant_kernel_gfx950,
         )
 
-        cfg = get_quant_config("MXFP4", ("M", "N"), M=M, N=N)
+        cfg = get_quant_config("MXFP4", M=M, N=N)
         NUM_ITER = cfg["NUM_ITER"]
         BLOCK_SIZE_M = cfg["BLOCK_SIZE_M"]
         BLOCK_SIZE_N = cfg["BLOCK_SIZE_N"]
@@ -556,7 +556,7 @@ def dynamic_mxfp8_quant(
             gluon_dynamic_mxfp8_quant_kernel_gfx1250,
         )
 
-        cfg = get_quant_config("MXFP8", ("M", "K"), M=M, K=K)
+        cfg = get_quant_config("MXFP8", M=M, K=K)
         NUM_ITER = cfg["NUM_ITER"]
         BLOCK_SIZE_M = cfg["BLOCK_SIZE_M"]
         BLOCK_SIZE_N = cfg["BLOCK_SIZE_N"]
@@ -596,7 +596,7 @@ def dynamic_mxfp8_quant(
             gluon_dynamic_mxfp8_quant_kernel_gfx950,
         )
 
-        cfg = get_quant_config("MXFP8", ("M", "K"), M=M, K=K)
+        cfg = get_quant_config("MXFP8", M=M, K=K)
 
         NUM_ITER = cfg["NUM_ITER"]
         BLOCK_SIZE_M = cfg["BLOCK_SIZE_M"]

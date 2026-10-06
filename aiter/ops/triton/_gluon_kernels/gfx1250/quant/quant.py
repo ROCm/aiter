@@ -80,14 +80,14 @@ def _mxfp4_quant_tile(
         x_reg, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
     )
 
-    out_smem.store(out_fp4)
+    out_buf = out_smem.index(compute_idx % NUM_BUFFERS)
+    out_buf.store(out_fp4)
     gl.barrier()
     gl.amd.gfx1250.tdm.async_store(
         out_desc,
         [pid_m * BLOCK_SIZE_M, pid_n * (BLOCK_SIZE_N // 2)],
-        out_smem,
+        out_buf,
     )
-    gl.amd.gfx1250.tdm.async_wait(0)
 
     bs_offs_m = pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M)
     bs_offs_n = pid_n * NUM_QUANT_BLOCKS + gl.arange(0, NUM_QUANT_BLOCKS)
@@ -162,7 +162,7 @@ def gluon_dynamic_mxfp4_quant_kernel_gfx1250(
     )
     out_smem = gl.allocate_shared_memory(
         x_fp4_ptr.type.element_ty,
-        shape=[BLOCK_SIZE_M, BLOCK_SIZE_N // 2],
+        shape=[NUM_BUFFERS, BLOCK_SIZE_M, BLOCK_SIZE_N // 2],
         layout=SHARED_LAYOUT_O,
     )
 
@@ -254,6 +254,9 @@ def gluon_dynamic_mxfp4_quant_kernel_gfx1250(
             EVEN_M_N,
         )
         compute_idx += 1
+
+    # The CTA must not retire with a TDM store still outstanding.
+    gl.amd.gfx1250.tdm.async_wait(0)
 
 
 _gluon_dynamic_mxfp8_quant_kernel_gfx1250_repr = make_kernel_repr(
@@ -350,12 +353,12 @@ def gluon_dynamic_mxfp8_quant_kernel_gfx1250(
     x_ptr,
     x_fp8_ptr,
     bs_ptr,
-    stride_x_m_in: gl.constexpr,
-    stride_x_n_in: gl.constexpr,
-    stride_x_fp8_m_in: gl.constexpr,
-    stride_x_fp8_n_in: gl.constexpr,
-    stride_bs_m_in: gl.constexpr,
-    stride_bs_n_in: gl.constexpr,
+    stride_x_m_in,
+    stride_x_n_in,
+    stride_x_fp8_m_in,
+    stride_x_fp8_n_in,
+    stride_bs_m_in,
+    stride_bs_n_in,
     M,
     N,
     BLOCK_SIZE_M: gl.constexpr,
@@ -375,6 +378,14 @@ def gluon_dynamic_mxfp8_quant_kernel_gfx1250(
 
     pid_m = gl.program_id(0)
     start_n = gl.program_id(1) * NUM_ITER
+
+    # Cast strides to int64, in case M*N > max int32.
+    stride_x_m = gl.cast(stride_x_m_in, gl.int64)
+    stride_x_n = gl.cast(stride_x_n_in, gl.int64)
+    stride_x_fp8_m = gl.cast(stride_x_fp8_m_in, gl.int64)
+    stride_x_fp8_n = gl.cast(stride_x_fp8_n_in, gl.int64)
+    stride_bs_m = gl.cast(stride_bs_m_in, gl.int64)
+    stride_bs_n = gl.cast(stride_bs_n_in, gl.int64)
 
     NUM_QUANT_BLOCKS: gl.constexpr = BLOCK_SIZE_N // MXFP8_QUANT_BLOCK_SIZE
 
@@ -413,28 +424,26 @@ def gluon_dynamic_mxfp8_quant_kernel_gfx1250(
     )
 
     x_base = (
-        x_ptr
-        + pid_m * BLOCK_SIZE_M * stride_x_m_in
-        + start_n * BLOCK_SIZE_N * stride_x_n_in
+        x_ptr + pid_m * BLOCK_SIZE_M * stride_x_m + start_n * BLOCK_SIZE_N * stride_x_n
     )
     x_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=x_base,
         shape=(M - pid_m * BLOCK_SIZE_M, N - start_n * BLOCK_SIZE_N),
-        strides=(stride_x_m_in, stride_x_n_in),
+        strides=(stride_x_m, stride_x_n),
         block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N),
         layout=SHARED_LAYOUT_X,
     )
     out_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=x_fp8_ptr,
         shape=(M, N),
-        strides=(stride_x_fp8_m_in, stride_x_fp8_n_in),
+        strides=(stride_x_fp8_m, stride_x_fp8_n),
         block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N),
         layout=SHARED_LAYOUT_OUT,
     )
     bs_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=bs_ptr,
         shape=(M, (N + MXFP8_QUANT_BLOCK_SIZE - 1) // MXFP8_QUANT_BLOCK_SIZE),
-        strides=(stride_bs_m_in, stride_bs_n_in),
+        strides=(stride_bs_m, stride_bs_n),
         block_shape=(BLOCK_SIZE_M, NUM_QUANT_BLOCKS),
         layout=SHARED_LAYOUT_BS,
     )
