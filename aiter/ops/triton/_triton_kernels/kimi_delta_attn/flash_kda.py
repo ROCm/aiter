@@ -152,6 +152,7 @@ def _flash_kda_prepare_kernel(
     ws_kr,
     ws_gt,
     ws_inv_mqk,
+    ws_beta,
     cu_seqlens,
     chunk_indices,
     scale,
@@ -271,6 +272,8 @@ def _flash_kda_prepare_kernel(
 
     p_beta = beta_raw + (bos + t_off) * H + i_h + o_c * H
     b_beta = tl.sigmoid(tl.load(p_beta, mask=m_c, other=0.0).to(tl.float32))
+    # For the Gluon K2, which copies it into LDS with the chunk's other tiles.
+    tl.store(ws_beta + ws_idx * C + o_c, b_beta, cache_modifier=CM_WS)
 
     # The intra-chunk matrices need decay *differences* between two rows of the
     # same chunk. Those are O(1) near the diagonal even when each row's decay from
@@ -795,11 +798,12 @@ def _log_route(k1_gluon: bool, k2_gluon: bool, C: int, K: int, V: int) -> None:
 # allows. The zero floor keeps the pair self-consistent -- a device with no
 # published table takes the wide branch and finds this same schedule there.
 _K2_GLUON_FALLBACK = triton.Config({"BW": 32, "MIN_BLOCKS_PER_CU": 0}, num_warps=2)
+_K2C_GLUON_FALLBACK = triton.Config({"BW": 64}, num_warps=4)
 
 
 @functools.cache
-def _k2_gluon_schedule(W: int, num_segs: int, H: int) -> tuple[int, int]:
-    """``(BW, num_warps)`` for the Gluon K2, which does not autotune.
+def _k2_gluon_schedule(W: int, num_segs: int, H: int) -> tuple[int, int, int]:
+    """``(BW, num_warps, waves_per_eu)`` for the Gluon pass A, which does not autotune.
 
     The warps can only split BW -- the state is the B operand of ``dot(kd, h)``
     and its K axis is the contraction axis -- so a count above ``BW // 16``
@@ -808,18 +812,36 @@ def _k2_gluon_schedule(W: int, num_segs: int, H: int) -> tuple[int, int]:
     ``cdiv(W, BW) * num_segs * H``: the wide tile reads the per-chunk workspace
     half as many times, but only while there are still enough blocks to fill the
     device, so it is taken above a published blocks-per-CU floor.
+
+    ``waves_per_eu`` (0 leaves it to the compiler) is the occupancy hint: the
+    LDS-prefetching kernel wants ~280 VGPRs, and holding it to 256 (a few
+    spills) for 2 waves per SIMD beats letting it drop to one.
     """
-    wide = chunk_delta_attn_tuned_config(
+    cfg = chunk_delta_attn_tuned_config(
         "k2_ab_fused_gluon_wide", _K2_GLUON_FALLBACK, backend="gluon"
     )
-    bw = wide.kwargs["BW"]
+    bw = cfg.kwargs["BW"]
     blocks = (W // bw) * num_segs * H
-    if W % bw == 0 and blocks >= wide.kwargs["MIN_BLOCKS_PER_CU"] * _num_cus():
-        return bw, wide.num_warps
-    narrow = chunk_delta_attn_tuned_config(
-        "k2_ab_fused_gluon_narrow", _K2_GLUON_FALLBACK, backend="gluon"
+    if W % bw != 0 or blocks < cfg.kwargs["MIN_BLOCKS_PER_CU"] * _num_cus():
+        cfg = chunk_delta_attn_tuned_config(
+            "k2_ab_fused_gluon_narrow", _K2_GLUON_FALLBACK, backend="gluon"
+        )
+    return cfg.kwargs["BW"], cfg.num_warps, cfg.kwargs.get("waves_per_eu", 0)
+
+
+@functools.cache
+def _k2c_gluon_schedule(segmented: bool) -> tuple[int, int]:
+    """``(BW, num_warps)`` for the Gluon pass C.
+
+    Wider tiles amortize a block's workspace reads over more of V, but the
+    widest only pays once segmenting has supplied the blocks.
+    """
+    cfg = chunk_delta_attn_tuned_config(
+        "k2_c_gluon_segmented" if segmented else "k2_c_gluon",
+        _K2C_GLUON_FALLBACK,
+        backend="gluon",
     )
-    return narrow.kwargs["BW"], narrow.num_warps
+    return cfg.kwargs["BW"], cfg.num_warps
 
 
 @functools.cache
@@ -1131,6 +1153,8 @@ def flash_kda_fwd(
     # read twice per chunk on K2's serial path. The CUTLASS FlashKDA picks fp16
     # here for the same reason.
     ws_inv_mqk = torch.empty(H * total_tiles, 2 * C, C, dtype=torch.float16, device=dev)
+    # sigmoid(beta) per tile, for the Gluon K2.
+    ws_beta = torch.empty(H * total_tiles, C, dtype=torch.float32, device=dev)
 
     use_gluon_k1 = AITER_FDA_USE_GLUON_K1 and _gluon_k1_usable(C, K)
     if use_gluon_k1:
@@ -1150,6 +1174,7 @@ def flash_kda_fwd(
             ws_kr=ws_kr,
             ws_gt=ws_gt,
             ws_inv_mqk=ws_inv_mqk,
+            ws_beta=ws_beta,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
             scale=scale,
@@ -1178,6 +1203,7 @@ def flash_kda_fwd(
             ws_kr=ws_kr,
             ws_gt=ws_gt,
             ws_inv_mqk=ws_inv_mqk,
+            ws_beta=ws_beta,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
             scale=scale,
@@ -1248,9 +1274,13 @@ def flash_kda_fwd(
         "cache_stride": cache_stride,
     }
 
-    # Only pass A can go to Gluon, so an unsegmented shape reaches none of it.
-    use_gluon_k2 = AITER_FDA_USE_GLUON_K2 and _gluon_k2_usable(C, K, V) and max_segs > 1
+    # Gluon covers pass A and pass C; an unsegmented shape runs only pass C.
+    use_gluon_k2 = AITER_FDA_USE_GLUON_K2 and _gluon_k2_usable(C, K, V)
     _log_route(use_gluon_k1, use_gluon_k2, C, K, V)
+    if use_gluon_k2:
+        from aiter.ops.triton._gluon_kernels.gfx950.kimi_delta_attn import (
+            flash_kda_k2 as _g2,
+        )
 
     def _launch_k2(*, W, **kw):
         launch_args = {
@@ -1271,18 +1301,14 @@ def flash_kda_fwd(
         b_seg = torch.empty(num_segs, H, K, V, dtype=torch.float32, device=dev)
         A_seg = torch.empty(num_segs, H, K, K, dtype=torch.bfloat16, device=dev)
         if use_gluon_k2:
-            from aiter.ops.triton._gluon_kernels.gfx950.kimi_delta_attn import (
-                flash_kda_k2 as _g2,
-            )
-
-            bw, nw = _k2_gluon_schedule(V, num_segs, H)
+            bw, nw, wpe = _k2_gluon_schedule(V, num_segs, H)
             _g2.k2_ab_fused_fast[(triton.cdiv(V, bw), num_segs * H)](
                 ws_kd=ws_kd,
                 ws_kr=ws_kr,
                 ws_gt=ws_gt,
+                ws_beta=ws_beta,
                 ws_inv_mqk=ws_inv_mqk,
                 v_input=v,
-                beta_raw=beta,
                 h_out_b=b_seg,
                 h_out_a=A_seg,
                 seg_chunk_base=seg_chunk_base,
@@ -1298,6 +1324,7 @@ def flash_kda_fwd(
                 NUM_XCDS=get_num_xcds(),
                 **_g2.build_layouts(nw),
                 num_warps=nw,
+                waves_per_eu=wpe,
             )
         else:
             for buf, width, identity, has_v in (
@@ -1339,20 +1366,57 @@ def flash_kda_fwd(
         h_in = None if paged else h0
 
     # Pass C: re-run each segment from its true incoming state, writing outputs.
-    _launch_k2(
-        v_input=v,
-        out=o,
-        h_in=h_in,
-        h_out=None,
-        final_state=final_state,
-        W=V,
-        INIT_IDENTITY=False,
-        HAS_H_IN=h_in is not None or paged,
-        HAS_V=True,
-        COMPUTE_OUTPUT=True,
-        STORE_H_OUT=False,
-        STORE_FINAL=store_final,
-        **(paged_args if paged else {}),
-    )
+    if use_gluon_k2:
+        bw, nw = _k2c_gluon_schedule(max_segs > 1)
+        _g2.k2_c_fast[(triton.cdiv(V, bw), num_segs * H)](
+            ws_kd=ws_kd,
+            ws_qd=ws_qd,
+            ws_kr=ws_kr,
+            ws_gt=ws_gt,
+            ws_beta=ws_beta,
+            ws_inv_mqk=ws_inv_mqk,
+            v_input=v,
+            out=o,
+            h_in=h_in,
+            final_state=final_state,
+            seg_chunk_base=seg_chunk_base,
+            seg_nchunks=seg_nchunks,
+            seg_tok_base=seg_tok_base,
+            seg_tok_end=seg_tok_end,
+            seg_seq=seg_seq,
+            seg_is_last=seg_is_last,
+            **paged_args,
+            TOTAL_TILES=total_tiles,
+            H=H,
+            K=K,
+            V=V,
+            C=C,
+            BW=bw,
+            **_g2.build_layouts(nw),
+            HAS_H_IN=h_in is not None,
+            STORE_FINAL=store_final,
+            STATE_V_FIRST=state_v_first,
+            PAGED_CACHE=paged,
+            PAGED_H_IN=paged and h_in is None,
+            CM_OUT=CM_OUT_STORE,
+            NUM_XCDS=get_num_xcds(),
+            num_warps=nw,
+        )
+    else:
+        _launch_k2(
+            v_input=v,
+            out=o,
+            h_in=h_in,
+            h_out=None,
+            final_state=final_state,
+            W=V,
+            INIT_IDENTITY=False,
+            HAS_H_IN=h_in is not None or paged,
+            HAS_V=True,
+            COMPUTE_OUTPUT=True,
+            STORE_H_OUT=False,
+            STORE_FINAL=store_final,
+            **(paged_args if paged else {}),
+        )
 
     return o, final_state

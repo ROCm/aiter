@@ -424,8 +424,10 @@ def test_published_k2_schedules_can_split_their_tile():
     for W in (64, 128, 256):
         for num_segs in (1, 2, 8, 64, 512):
             for H in (1, 4, 12, 64):
-                reached.add(_flash_kda._k2_gluon_schedule(W, num_segs, H))
+                reached.add(_flash_kda._k2_gluon_schedule(W, num_segs, H)[:2])
     assert len(reached) > 1, f"only one schedule reachable: {reached}"
+    # Pass C splits its tile the same way.
+    reached |= {_flash_kda._k2c_gluon_schedule(seg) for seg in (False, True)}
     for bw, nw in sorted(reached):
         assert bw % 16 == 0, f"BW={bw} is not a whole number of MFMA tiles"
         assert nw <= bw // 16, f"BW={bw} cannot be split {nw} ways"
@@ -463,9 +465,8 @@ _CASES = {
         },
     ),
     "weak gate": lambda: (make_inputs(1, 512, 4), {"lower_bound": -0.01}),
-    # Only a segmented schedule has a pass A, and pass A is the only thing the
-    # Gluon K2 is routed to, so these are the cases where K2's route is visible
-    # at all -- see test_cases_reach_the_gluon_k2.
+    # Only a segmented schedule has a pass A, so these are the cases where the
+    # Gluon pass A is reached at all -- see test_cases_reach_the_gluon_k2.
     "segmented": lambda: (
         make_inputs(1, 1024, 4),
         {"output_final_state": True, "chunks_per_seg": 4},
@@ -520,9 +521,10 @@ def test_routes_agree(case):
 
     Both sides write the same ABI and nothing downstream is told which one ran,
     so a divergence here is a bug in whichever kernel moved rather than a
-    tolerance to widen. Measured across these cases: K2's two implementations
-    agree to the bit, and K1's differ at 3e-4 to 1e-3 on the output and under
-    3e-5 on the state, so the bounds are really about K1.
+    tolerance to widen. Measured across these cases: K1's two implementations
+    differ at 3e-4 to 1e-3 on the output and under 3e-5 on the state, and K2's
+    pass C by an ulp or two of the output, its output projection being ordered
+    differently.
     """
     args, kw = _CASES[case]()
     with _route(k1=False, k2=False):
@@ -538,10 +540,9 @@ def test_routes_agree(case):
 def test_cases_reach_the_gluon_k2():
     """The cases above have to exercise the route they are comparing.
 
-    ``use_gluon_k2`` is tested inside ``max_segs > 1``, so an unsegmented shape
-    runs the Triton K2 whichever way the flag is set and test_routes_agree is
-    comparing it against itself. Every non-segmented case here was in exactly
-    that position, and nothing in the assertions would have said so.
+    Pass C goes to Gluon on every shape, pass A only on segmented ones, so an
+    unsegmented case says nothing about pass A; nothing in the assertions of
+    test_routes_agree would say which kernels a case actually reached.
     """
     if not _flash_kda._gluon_k2_usable(FLASH_KDA_CHUNK, K_DIM, K_DIM):
         pytest.skip("this arch or tile shape never routes K2 to Gluon")
@@ -549,30 +550,38 @@ def test_cases_reach_the_gluon_k2():
         flash_kda_k2 as _g2,
     )
 
-    reached = set()
-    saved = _g2.k2_ab_fused_fast
+    reached = {"k2_ab_fused_fast": set(), "k2_c_fast": set()}
+    saved = {name: getattr(_g2, name) for name in reached}
 
     class _Counting:
+        def __init__(self, name):
+            self.name = name
+
         def __getitem__(self, grid):
-            inner = saved[grid]
+            inner = saved[self.name][grid]
 
             def launch(**kw):
-                reached.add(current)
+                reached[self.name].add(current)
                 return inner(**kw)
 
             return launch
 
-    _g2.k2_ab_fused_fast = _Counting()
+    for name in reached:
+        setattr(_g2, name, _Counting(name))
     try:
         for current, make in _CASES.items():
             args, kw = make()
             with _route(k1=True, k2=True):
                 run_flash(*args, **kw)
     finally:
-        _g2.k2_ab_fused_fast = saved
+        for name, fn in saved.items():
+            setattr(_g2, name, fn)
 
-    want = {name for name in _CASES if name.startswith("segmented")}
-    assert want <= reached, f"never reached the Gluon K2: {sorted(want - reached)}"
+    want_a = {name for name in _CASES if name.startswith("segmented")}
+    missing_a = want_a - reached["k2_ab_fused_fast"]
+    missing_c = set(_CASES) - reached["k2_c_fast"]
+    assert not missing_a, f"never reached the Gluon pass A: {sorted(missing_a)}"
+    assert not missing_c, f"never reached the Gluon pass C: {sorted(missing_c)}"
 
 
 # A weak gate is the only setting that exposes the intra-chunk inverse. At the
@@ -816,9 +825,16 @@ def _kimi_kwargs(q, k, v, g, beta, A_log, dt_bias, scale, **kw):
     }
 
 
+@pytest.mark.parametrize("gluon_k2", [False, True])
 @pytest.mark.parametrize("T,chunks_per_seg", [(256, 0), (1024, 4)])
-def test_paged_cache_matches_dense(T, chunks_per_seg):
-    """In-kernel paged I/O matches gather into a dense V-first state."""
+def test_paged_cache_matches_dense(T, chunks_per_seg, gluon_k2):
+    """In-kernel paged I/O matches gather into a dense V-first state.
+
+    On both K2 routes: the two pass C kernels each carry their own paged loads
+    and stores.
+    """
+    if gluon_k2 and not _flash_kda._gluon_k2_usable(FLASH_KDA_CHUNK, K_DIM, K_DIM):
+        pytest.skip("this arch or tile shape never routes K2 to Gluon")
     H = 4
     q, k, v, g, beta, A_log, dt_bias, scale = make_inputs(1, T, H)
     h0 = torch.randn(1, H, K_DIM, K_DIM, device=device, dtype=torch.float32) * 0.1
@@ -835,7 +851,6 @@ def test_paged_cache_matches_dense(T, chunks_per_seg):
         "state_v_first": True,
         "chunks_per_seg": chunks_per_seg,
     }
-    o_dense, ht = flash_kda_fwd(**common, initial_state=h0, output_final_state=True)
     cache, indices, _storage = _paged_pool(1, H, h0)
     ptr_before = cache.data_ptr()
     out = torch.empty_like(v)
@@ -848,11 +863,13 @@ def test_paged_cache_matches_dense(T, chunks_per_seg):
         "state_indices": indices,
         "has_initial_state": torch.ones(1, device=device, dtype=torch.bool),
     }
-    # First paged launch autotunes a new PAGED_CACHE specialization; compare
-    # after that, not against a trial config.
-    flash_kda_fwd(**paged_kw)
-    cache[indices] = h0
-    o_paged, ht_paged = flash_kda_fwd(**paged_kw)
+    with _route(k2=gluon_k2):
+        o_dense, ht = flash_kda_fwd(**common, initial_state=h0, output_final_state=True)
+        # First paged launch autotunes a new PAGED_CACHE specialization; compare
+        # after that, not against a trial config.
+        flash_kda_fwd(**paged_kw)
+        cache[indices] = h0
+        o_paged, ht_paged = flash_kda_fwd(**paged_kw)
     assert ht_paged is None
     assert o_paged.data_ptr() == out.data_ptr()
     assert cache.data_ptr() == ptr_before, "paged cache must not be packed/copied"
