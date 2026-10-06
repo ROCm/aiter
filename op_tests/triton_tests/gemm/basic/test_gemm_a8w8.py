@@ -211,7 +211,8 @@ def test_gemm_fp8(in_dtype, m, n, k, impl: str):
 @pytest.mark.parametrize(
     "out_dtype, m, n, k, layout, output",
     [
-        ("bf16" if i % 2 == 0 else "int32", *shape, layout, output)
+        # Keep both buffer modes per dtype; rotate dtypes across shapes/layouts.
+        ("bf16" if (i // 2 + i // 8) % 2 == 0 else "int32", *shape, layout, output)
         for i, (shape, layout, output) in enumerate(
             (shape, layout, output)
             for shape in get_fewer_x_vals()

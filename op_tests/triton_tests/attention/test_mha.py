@@ -711,10 +711,11 @@ def test_mha_varlen_return_lse_softmax(
 # Production shapes based on real models:
 #   HQ=32, HK=8:  Llama 3 8B (GQA 4:1)
 #   HQ=64, HK=8:  Llama 3 70B (GQA 8:1)
-#   HQ=32, HK=32: Llama 2 7B (MHA)
 @pytest.mark.parametrize("BATCH", [1, 4])
-@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(512, 512), (512, 1024), (1024, 512)])
-@pytest.mark.parametrize("NUM_Q_HEADS", [32])
+@pytest.mark.parametrize(
+    "SEQLEN_Q, SEQLEN_K, NUM_Q_HEADS",
+    [(512, 512, 32), (512, 1024, 64), (1024, 512, 32)],
+)
 @pytest.mark.parametrize("NUM_K_HEADS", [8])
 @pytest.mark.parametrize("HEAD_SZ", [128])
 # Fused causal and causal dropout backward currently produce NaNs.
@@ -741,11 +742,6 @@ def test_mha_backward(
     dtype=torch.bfloat16,
 ):
     HAS_DROPOUT = DROPOUT > 0.0
-
-    if FUSED and CAUSAL:
-        pytest.skip("FUSED+CAUSAL results in NaNs")
-    if CAUSAL and HAS_DROPOUT:
-        pytest.skip("CAUSAL+DROPOUT backward results in NaNs")
 
     torch.cuda.empty_cache()
     torch.manual_seed(20)
@@ -872,8 +868,10 @@ def test_mha_backward_sbhd_do(
         torch.testing.assert_close(tri, ref.to(tri.dtype), atol=atol, rtol=rtol)
 
 
-@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(512, 512), (512, 1024), (1024, 512)])
-@pytest.mark.parametrize("NUM_Q_HEADS", [32])
+@pytest.mark.parametrize(
+    "SEQLEN_Q, SEQLEN_K, NUM_Q_HEADS",
+    [(512, 512, 32), (512, 1024, 64), (1024, 512, 32)],
+)
 # Fused causal and causal dropout backward currently produce NaNs.
 @pytest.mark.parametrize(
     "CAUSAL, DROPOUT, FUSED",
@@ -898,11 +896,6 @@ def test_mha_backward_varlen(
     HEAD_SZ = 128
     NUM_K_HEADS = 8
     HAS_DROPOUT = DROPOUT > 0.0
-
-    if FUSED and CAUSAL:
-        pytest.skip("FUSED+CAUSAL results in NaNs")
-    if CAUSAL and HAS_DROPOUT:
-        pytest.skip("CAUSAL+DROPOUT backward results in NaNs")
 
     torch.cuda.empty_cache()
     torch.manual_seed(20)

@@ -79,7 +79,6 @@ def test_qk_cat(B: int, QH_PER_KH: int, KH: int, D_nope: int, D_pe: int, dtype):
 @pytest.mark.parametrize("max_embed_positions", [131072])
 @pytest.mark.parametrize("reuse_freqs_front_part", [True, False])
 @pytest.mark.parametrize("rotate_style", [RotateStyle.GPTJ, RotateStyle.NEOX])
-# @pytest.mark.parametrize("dtype", [torch.bfloat16]) # TODO fp16 results in ~0.6 error rate
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_qk_rope_cat(
     B: int,

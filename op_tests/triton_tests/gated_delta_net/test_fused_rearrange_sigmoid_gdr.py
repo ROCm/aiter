@@ -202,7 +202,7 @@ def test_fused_rearrange_sigmoid_gdr_sweep(
 
     if dtype == torch.bfloat16:
         rtol, atol = 0.05, 0.1
-    elif dtype == torch.bfloat16:
+    elif dtype == torch.float16:
         rtol, atol = 0.03, 0.08
     else:
         rtol, atol = 0.02, 0.05

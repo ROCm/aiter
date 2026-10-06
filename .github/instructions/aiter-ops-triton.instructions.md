@@ -358,6 +358,17 @@ All weight/scale pre-shuffle helpers are unified in
 
 ## Tests and benchmarks
 
+Reduced correctness grids use BF16 for ordinary floating-point inputs and
+outputs rather than repeating the same grid for FP16 and FP32. This is a CI
+coverage policy, not a restriction on supported kernel dtypes. Keep FP32
+split-K outputs and FP32 reference/accumulation math where accuracy requires
+it. Integer GEMM outputs sample BF16 and INT32 evenly without duplicating each
+input configuration; retain both supplied-output and allocated-output paths.
+Keep FP8/FP4 coverage, sampling e4m3/e5m2 approximately 80/20 where both exercise
+the same kernel. Preserve distinct dispatch paths, masking/boundary shapes,
+and regression cases; avoid multiplying redundant large shapes. New tests in
+these reduced grids should follow the same policy.
+
 - Every new Triton or Gluon kernel must ship a unit test under
   `op_tests/triton_tests/<category>/`, mirroring the kernel's category (a new
   `gemm/basic/` kernel gets `op_tests/triton_tests/gemm/basic/test_<op>.py`).
