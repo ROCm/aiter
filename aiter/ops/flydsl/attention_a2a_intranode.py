@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import math
+from typing import NamedTuple
 
 import flydsl.expr as fx
 import mori.shmem as ms
@@ -43,6 +44,18 @@ def _role_format(return_packed, role):
 def _require_raw_buffer_extent(role, extent):
     if extent > _MAX_RAW_BUFFER_BYTES:
         raise ValueError(f"{role} extent {extent} exceeds raw-buffer limit")
+
+
+class PackedRoleResult(NamedTuple):
+    """Packed payload and scale for one role from `submit_role`.
+
+    These alias the op's double-buffered storage; they are not copies and are
+    reused two Q/K/V trios later. Consumers must be ordered after the submit on
+    its stream (same stream, or an event recorded after submit_role).
+    """
+
+    payload: torch.Tensor
+    scale: torch.Tensor
 
 
 class AttentionA2AIntraNodeOp:
@@ -541,6 +554,11 @@ class AttentionA2AIntraNodeOp:
 
         Producers and prior consumers must be ordered before their side-stream
         reads/writes. The caller retains inputs until V completes on that stream.
+
+        Returns, per mode:
+        - return_packed: PackedRoleResult(payload, scale) for every role.
+        - quantized BF16 (dequant): None for Q/K; the three BF16 outputs after V.
+        - lossless BF16: None for Q/K; the three outputs after V.
         """
         if role not in (0, 1, 2) or role != getattr(self, "_next_role", 0):
             raise ValueError("submit Q, K, V in order without interleaving trios")
@@ -593,10 +611,17 @@ class AttentionA2AIntraNodeOp:
         )
         self._submit_role_launch(role, args)
         self._next_role = (role + 1) % 3
+        packed_result = (
+            PackedRoleResult(
+                self.outputs_sets[parity][role], self.scales_sets[parity][role]
+            )
+            if self.return_packed
+            else None
+        )
         if role == 2:
             if self.return_packed:
                 self._epoch += 1
-                return self.outputs_sets[parity], self.scales_sets[parity]
+                return packed_result
             if self.quant:
                 bf16_outputs = self.bf16_outputs_sets[parity]
                 args = (
@@ -615,7 +640,7 @@ class AttentionA2AIntraNodeOp:
                 return bf16_outputs
             self._epoch += 1
             return self.outputs_sets[parity]
-        return None
+        return packed_result
 
     def _submit_role_launch(self, i, args):
         launch_args = (*(fx.Int64(arg) for arg in args[:-1]), args[-1])

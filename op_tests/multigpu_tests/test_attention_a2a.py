@@ -143,9 +143,22 @@ def _input(rank, heads, sequence, device, salt=0, outliers=True):
 
 
 def _submit_roles(op, inputs):
+    parity = op._epoch % 2
+    results = []
     for role, value in enumerate(inputs):
         result = op.submit_role(role, value)
-    return result
+        results.append(result)
+    if not op.return_packed:
+        return result
+    for role, r in enumerate(results):
+        assert r.payload.data_ptr() == op.outputs_sets[parity][role].data_ptr()
+        assert r.scale.data_ptr() == op.scales_sets[parity][role].data_ptr()
+    prev = getattr(op, "_test_prev_payload_ptrs", None)
+    ptrs = tuple(r.payload.data_ptr() for r in results)
+    if prev is not None:
+        assert ptrs != prev, "consecutive trios must alternate parity buffers"
+    op._test_prev_payload_ptrs = ptrs
+    return tuple(r.payload for r in results), tuple(r.scale for r in results)
 
 
 def _from_ranks(tensors, rank, world_size):
