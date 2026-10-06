@@ -85,6 +85,15 @@ _LAZY_IMPORTS = {
         ".kernels.mqa_logits.pa_mqa_logits_fp4",
         "flydsl_pa_mqa_logits_fp4",
     ),
+    "flydsl_pa_mqa_logits_fp4_rowgroup": (
+        ".kernels.mqa_logits.pa_mqa_logits_fp4_rowgroup",
+        "flydsl_pa_mqa_logits_fp4_rowgroup",
+    ),
+    "Fp4MqaPlan": (".kernels.mqa_logits.pa_mqa_logits_fp4_rowgroup", "Fp4MqaPlan"),
+    "make_fp4_mqa_plan": (
+        ".kernels.mqa_logits.pa_mqa_logits_fp4_rowgroup",
+        "make_fp4_mqa_plan",
+    ),
     "flydsl_pa_mqa_logits_fp4_prefill": (
         ".kernels.mqa_logits.pa_mqa_logits_fp4_prefill",
         "flydsl_pa_mqa_logits_fp4_prefill",
@@ -122,6 +131,7 @@ __all__ = [
     "FP8_MQA_LOGITS_VARIANTS",
     "BlockMfmaDecodeConfig",
     "DecodeConfig",
+    "Fp4MqaPlan",
     "GateMode",
     "QuickAllReduceInt4",
     "WaveDecodeConfig",
@@ -142,6 +152,7 @@ __all__ = [
     "flydsl_moe_stage2",
     "flydsl_pa_mqa_logits_fp4",
     "flydsl_pa_mqa_logits_fp4_prefill",
+    "flydsl_pa_mqa_logits_fp4_rowgroup",
     "flydsl_pa_mqa_logits_fp4_varqlen",
     "flydsl_preshuffle_gemm_a8",
     "flydsl_qk_norm_rope_quant",
@@ -149,6 +160,7 @@ __all__ = [
     "gather_kv_b_proj_flydsl_fp8_supported",
     "gather_kv_b_proj_flydsl_supported",
     "gemm_decode_bf16",
+    "make_fp4_mqa_plan",
     "pa_decode",
 ]
 
