@@ -25,10 +25,13 @@ that exists: LEQ bounds ascending, then GEQ descending, then "any". So the
 leftmost axis wins: D before Q is what makes head_size outrank max_seqlen_q.
 Dtypes fall back too: DT_fp8_fp8, then DT_fp8_any, DT_any_fp8, then "any".
 
-Because the leftmost axis wins outright, D_GEQ_256 beats D_GEQ_129.Q_GEQ_256 at
-head_size 256 despite saying less. An entry narrowing a rightward axis has to be
-repeated at every bound of a leftward one, which is why some keys differ only in
-that.
+Because the leftmost axis wins outright, D_GEQ_256 beats Q_GEQ_256 at head_size
+256 despite saying less. An entry narrowing a rightward axis has to be repeated
+at every bound of a leftward one, which is why some keys differ only in that.
+
+LEQ bounds nest, so a range is a pair of them: D_LEQ_128 claims head_size <= 128
+first, leaving D_LEQ_256 with 129-256. Adding a D_LEQ_256 entry therefore needs
+a D_LEQ_128 one beside it, holding what those smaller sizes resolved to before.
 
 A section with no axes, like reduce above, is just a config.
 
