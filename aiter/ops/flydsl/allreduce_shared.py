@@ -69,6 +69,7 @@ class _StEngine:
         rank: int,
         world_size: int,
         inbox_flags: int,
+        extra_ptrs: tuple[int, ...] = (),
     ):
         self.spec = spec
         self.launch = spec["launch"]
@@ -106,7 +107,9 @@ class _StEngine:
                     self._peer_bases[r] = base
                     peer_ptrs[r] = base + off
 
-            peer_bytes = world_size * 8
+            # Device-side table: the inbox of every rank, then ``extra_ptrs``.
+            table = (*peer_ptrs, *extra_ptrs)
+            peer_bytes = len(table) * 8
             color_bytes = self.grid * 4
             # Peer-pointer table and per-block colours: written by the host once
             # and by this rank's own kernel, never by a peer. Stays uncached in
@@ -117,7 +120,7 @@ class _StEngine:
             self._colors = self._meta_ptr + peer_bytes
             UncachedIpcHeap.copy_host_to_device(
                 self._gpu_peer_ptrs,
-                (ctypes.c_int64 * world_size)(*peer_ptrs),
+                (ctypes.c_int64 * len(table))(*table),
                 peer_bytes,
             )
             UncachedIpcHeap.copy_host_to_device(

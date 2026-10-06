@@ -20,6 +20,8 @@ class UncachedIpcHeap:
     _HIP_DEVICE_MALLOC_FINEGRAINED = 0x1
     _HIP_DEVICE_MALLOC_UNCACHED = 0x3
     _HIP_MEMCPY_HOST_TO_DEVICE = 1
+    _HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED = 704
+    _PCI_BUS_ID_BYTES = 32
     _hip = None
     _hipIpcMemHandle_t = None
 
@@ -77,6 +79,20 @@ class UncachedIpcHeap:
             ctypes.c_int,
             ctypes.c_size_t,
         ]
+        cls._hip.hipDeviceGetPCIBusId.restype = ctypes.c_int
+        cls._hip.hipDeviceGetPCIBusId.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_int,
+        ]
+        cls._hip.hipGetDevice.restype = ctypes.c_int
+        cls._hip.hipGetDevice.argtypes = [ctypes.POINTER(ctypes.c_int)]
+        cls._hip.hipSetDevice.restype = ctypes.c_int
+        cls._hip.hipSetDevice.argtypes = [ctypes.c_int]
+        cls._hip.hipDeviceEnablePeerAccess.restype = ctypes.c_int
+        cls._hip.hipDeviceEnablePeerAccess.argtypes = [ctypes.c_int, ctypes.c_uint]
+        cls._hip.hipGetLastError.restype = ctypes.c_int
+        cls._hip.hipGetLastError.argtypes = []
         cls._hip.hipMemcpy.restype = ctypes.c_int
         cls._hip.hipMemcpy.argtypes = [
             ctypes.c_void_p,
@@ -157,6 +173,35 @@ class UncachedIpcHeap:
         err = hip.hipMemset(buf, 0, ctypes.c_size_t(size))
         cls._hip_check(err, what="hipMemset")
         return int(buf.value)
+
+    @classmethod
+    def pci_bus_id(cls, device: int) -> str:
+        """PCI bus ID of local device *device*, to compare across processes."""
+        hip = cls._load_hip()
+        buf = ctypes.create_string_buffer(cls._PCI_BUS_ID_BYTES)
+        err = hip.hipDeviceGetPCIBusId(buf, cls._PCI_BUS_ID_BYTES, int(device))
+        cls._hip_check(err, what="hipDeviceGetPCIBusId")
+        return buf.value.decode()
+
+    @classmethod
+    def enable_peer_access(cls, device: int, peer: int) -> None:
+        """Let kernels on *device* access memory allocated on *peer*."""
+        if int(device) == int(peer):
+            return
+        hip = cls._load_hip()
+        current = ctypes.c_int()
+        cls._hip_check(hip.hipGetDevice(ctypes.byref(current)), what="hipGetDevice")
+        cls._hip_check(hip.hipSetDevice(int(device)), what="hipSetDevice")
+        try:
+            err = hip.hipDeviceEnablePeerAccess(int(peer), 0)
+            if int(err) == cls._HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED:
+                # Torch enabled it already. HIP keeps the status as the
+                # thread's last error, which torch's next call would raise.
+                hip.hipGetLastError()
+            else:
+                cls._hip_check(err, what=f"hipDeviceEnablePeerAccess({peer})")
+        finally:
+            cls._hip_check(hip.hipSetDevice(current.value), what="hipSetDevice")
 
     @classmethod
     def alloc_uncached(cls, size: int) -> int:
