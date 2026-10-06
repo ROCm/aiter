@@ -398,16 +398,16 @@ def test_fused_fast_mode_reaches_past_the_oneshot(cell):
     assert len(families) >= 2
 
 
-def test_fused_pcie_tp2_empty_mesh_reaches_the_ring():
-    """The pcie/2 fast cell has an empty mesh window, so it skips straight to
-    the ring.
+def test_fused_empty_mesh_window_reaches_the_ring():
+    """A policy with an empty mesh window skips straight to the ring.
 
-    Its ``mesh_max`` equals its ``oneshot_max``: the mesh interval
-    ``(oneshot_max, mesh_max]`` is empty, so no payload is ever dispatched to
+    ``mesh_max`` equal to ``oneshot_max`` makes the mesh interval
+    ``(oneshot_max, mesh_max]`` empty, so no payload is ever dispatched to
     mesh and the ring picks up everything above the one-shot.
     """
-    p = P.resolve_fused("pcie", 2, mode="fast")
-    assert p.mesh_max == p.oneshot_max
+    p = P.FusedPolicy(
+        oneshot_max=1 << 20, oneshot_max_exact=32 << 20, mesh_max=1 << 20, ring_max=None
+    )
     assert P.fused_families_reachable(p) == ("oneshot", "ring")
     assert P.pick_fused_family(p.oneshot_max, p) == "oneshot"
     assert P.pick_fused_family(p.oneshot_max + 1, p) == "ring"

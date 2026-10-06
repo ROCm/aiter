@@ -164,13 +164,13 @@ class FusedPolicy:
 FUSED_FAMILY_POLICY: dict[tuple[str, int], FusedPolicy] = {
     # --- PCIe: Policy from measurements (on gfx950/MI350P) --------------------
     ("pcie", 2): FusedPolicy(
-        oneshot_max=1792 << 10, oneshot_max_exact=32 << 20, mesh_max=1792 << 10, ring_max=None
+        oneshot_max=672 << 10, oneshot_max_exact=32 << 20, mesh_max=768 << 10, ring_max=None
     ),
     ("pcie", 4): FusedPolicy(
-        oneshot_max=256 << 10, oneshot_max_exact=1344 << 10, mesh_max=8 << 20, ring_max=None
+        oneshot_max=336 << 10, oneshot_max_exact=32 << 20, mesh_max=21 << 20, ring_max=None
     ),
     ("pcie", 8): FusedPolicy(
-        oneshot_max=64 << 10, oneshot_max_exact=2 << 20, mesh_max=128 << 20, ring_max=None
+        oneshot_max=168 << 10, oneshot_max_exact=32 << 20, mesh_max=None, ring_max=None
     ),
     # --- xGMI: Policy from measurements (on gfx942/MI300X) --------------------
     # No ring algorithm, mesh is always better above oneshot_max.

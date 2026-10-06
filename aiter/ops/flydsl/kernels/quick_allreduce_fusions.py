@@ -374,9 +374,11 @@ def quick_reduce_row_block_at(
 #: depends on the width, which ``atoms_per_row`` values exist does not.
 FUSED_QR_ROW_ATOMS: dict[tuple[str, int, str], int] = {
     # PCIe: From measurements
+    ("pcie", 2, "mesh"): 4,
     ("pcie", 2, "ring"): 2,
     ("pcie", 4, "mesh"): 2,
     ("pcie", 4, "ring"): 2,
+    ("pcie", 8, "mesh"): 1,
     # xGMI: From measurements
     ("xgmi", 2, "ring"): 4,
     ("xgmi", 4, "mesh"): 2,
