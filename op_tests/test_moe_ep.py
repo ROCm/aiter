@@ -399,6 +399,53 @@ def _calc_diff(x: torch.Tensor, y: torch.Tensor) -> float:
 summary_table = []
 
 
+def _check_persistent_graph(captured):
+    """Check live route bounds and untouched padding across graph replays."""
+    alignment = max(
+        call.keywords["tile_m"] for name, call in captured if name in ("gemm1", "gemm2")
+    )
+    for name, launch in captured:
+        if name not in ("gemm1", "gemm2"):
+            continue
+        output, *_, prefix = launch.args
+        saved_prefix = prefix.clone()
+        expected = output.clone()
+        rows = launch.keywords["contiguous_m"]
+        graph = torch.cuda.CUDAGraph()
+        torch.cuda.synchronize()
+        with torch.cuda.graph(graph):
+            launch()
+        try:
+            for limit in (None, 1, 0, None):
+                if limit is None:
+                    prefix.copy_(saved_prefix)
+                else:
+                    prefix.copy_(saved_prefix.clamp(max=limit))
+                valid = torch.zeros(rows, dtype=torch.bool, device=output.device)
+                start = 0
+                for end in prefix.cpu().tolist():
+                    valid[start:end] = True
+                    start = (end + alignment - 1) // alignment * alignment
+                output.fill_(17)
+                graph.replay()
+                torch.cuda.synchronize()
+                actual_rows = output.reshape(rows, -1)
+                torch.testing.assert_close(
+                    actual_rows[valid],
+                    expected.reshape(rows, -1)[valid],
+                    rtol=0,
+                    atol=0,
+                )
+                assert torch.all(
+                    actual_rows[~valid] == 17
+                ), f"{name}: graph replay wrote outside live expert rows"
+        finally:
+            prefix.copy_(saved_prefix)
+            launch()
+            torch.cuda.synchronize()
+        print(f"[persistent-graph] {name}: full, one-row, empty, full PASSED")
+
+
 def test_fmoe_ep_mxfp4(
     quant_label,
     token,
@@ -411,6 +458,7 @@ def test_fmoe_ep_mxfp4(
     ep_mode="real",
     fake_ep_rank=0,
     const_init=None,
+    check_persistent_graph=False,
 ):
     """End-to-end EP fused_moe with per_1x32 mxfp4 weights.
     quant_label ∈ {"a8w4_mxfp4", "a4w4_mxfp4"}.
@@ -782,7 +830,7 @@ def test_fmoe_ep_mxfp4(
     )
     gemm1_us = None
     gemm2_us = None
-    if _ep_kernel_bench and _gfx == "gfx1250":
+    if (_ep_kernel_bench or check_persistent_graph) and _gfx == "gfx1250":
         from aiter.ops.flydsl import grouped_moe_gfx1250 as _grouped
 
         _cap: list = []
@@ -804,6 +852,8 @@ def test_fmoe_ep_mxfp4(
             )
         finally:
             _grouped.kernel_bench_callable = None
+        if check_persistent_graph:
+            _check_persistent_graph(_cap)
         _ku = {}
         for _name, _callable in _cap:
             _, _u = run_perftest(
@@ -863,6 +913,9 @@ def test_fmoe_ep_mxfp4(
             f"[aiter] {_msg} logits_diff={logits_diff:.6f} "
             f"(tol {_logits_diff_tol}) {_verdict}"
         )
+        assert (
+            logits_diff < _logits_diff_tol
+        ), f"{_msg}: logits_diff={logits_diff} exceeds {_logits_diff_tol}"
     else:
         err = checkAllclose(ref, out, atol=5e-2, rtol=5e-2, msg=_msg)
 
@@ -1020,7 +1073,16 @@ parser.add_argument(
     Mirrors flydsl_tests/test_flydsl_grouped_gemm.py --const-init.""",
 )
 
+parser.add_argument(
+    "--seed", type=int, default=0, help="Random input and routing seed."
+)
+parser.add_argument(
+    "--check-persistent-graph",
+    action="store_true",
+    help="Check both grouped GEMMs with changing live route bounds in a HIP graph.",
+)
 args = parser.parse_args()
+torch.manual_seed(args.seed)
 gpu_arch = get_gfx()
 
 for test in args.test:
@@ -1158,6 +1220,7 @@ for test in args.test:
                             ep_mode=args.ep_mode,
                             fake_ep_rank=args.fake_ep_rank,
                             const_init=args.const_init,
+                            check_persistent_graph=args.check_persistent_graph,
                         )
     elif test == "g1u1_fp8smoothquant":
         for dtype in args.dtype:

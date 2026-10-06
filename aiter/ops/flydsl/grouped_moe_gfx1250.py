@@ -584,6 +584,8 @@ def _grouped_a8w4_tdm_moe(
     tdm_as_in_prologue=0,
     tdm_b_th=0,
     lds_soa_load_interleave=0,
+    persistent_workers=0,
+    persistent_workers2=0,
     data_format="a8w4",
     expert_mask=None,
     num_local_tokens=None,
@@ -1053,6 +1055,7 @@ def _grouped_a8w4_tdm_moe(
             stage1_quant_out=1,
             quant_scale=a2_scale,
             quant_wmma_rep=wmma_rep2,
+            persistent_workers=persistent_workers,
             cluster_m=cluster_m,
             cluster_n=cluster_n,
             waves_per_tensor_tdm=waves_per_tensor_tdm,
@@ -1090,6 +1093,7 @@ def _grouped_a8w4_tdm_moe(
             bias=_b1,
             swiglu_limit=sl,
             num_buffers=num_buffers,
+            persistent_workers=persistent_workers,
             cluster_m=cluster_m,
             cluster_n=cluster_n,
             waves_per_tensor_tdm=waves_per_tensor_tdm,
@@ -1136,6 +1140,7 @@ def _grouped_a8w4_tdm_moe(
         stage1_act=0,
         bias=_b2,
         num_buffers=num_buffers2,
+        persistent_workers=persistent_workers2,
         cluster_m=cluster_m2,
         cluster_n=cluster_n2,
         waves_per_tensor_tdm=waves_per_tensor_tdm2,
@@ -1215,6 +1220,7 @@ def _grouped_a8w4_tdm_moe(
                         stage1_quant_out=1,
                         quant_scale=a2_scale,
                         quant_wmma_rep=wmma_rep2,
+                        persistent_workers=persistent_workers,
                         cluster_m=cluster_m,
                         cluster_n=cluster_n,
                         waves_per_tensor_tdm=waves_per_tensor_tdm,
@@ -1253,6 +1259,7 @@ def _grouped_a8w4_tdm_moe(
                         bias=_b1,
                         swiglu_limit=sl,
                         num_buffers=num_buffers,
+                        persistent_workers=persistent_workers,
                         cluster_m=cluster_m,
                         cluster_n=cluster_n,
                         waves_per_tensor_tdm=waves_per_tensor_tdm,
@@ -1289,6 +1296,7 @@ def _grouped_a8w4_tdm_moe(
                     stage1_act=0,
                     bias=_b2,
                     num_buffers=num_buffers2,
+                    persistent_workers=persistent_workers2,
                     cluster_m=cluster_m2,
                     cluster_n=cluster_n2,
                     waves_per_tensor_tdm=waves_per_tensor_tdm2,
@@ -1575,6 +1583,13 @@ def grouped_gemm_gfx1250_a8w4(
             _tdm_kw["lds_soa_load_interleave"] = _as_int(
                 cfg_row.get("lds_soa_load_interleave"), 0
             )
+            if stage2_scatter is None:
+                _tdm_kw["persistent_workers"] = _as_int(
+                    cfg_row.get("tdm_persistent_workers"), 0
+                )
+                _tdm_kw["persistent_workers2"] = _as_int(
+                    cfg_row.get("tdm_persistent_workers2"), 0
+                )
 
         # Env overrides for tuning (present-check so any set value wins over CSV /
         # defaults). Stage2 (*2) falls back to the stage1 value when unset. Set

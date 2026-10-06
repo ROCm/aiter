@@ -169,6 +169,7 @@ def launch_gemm_a8w4_tdm(
     a_row_stride_bytes: Constexpr[int] = 0,
     a_scale_row_stride_bytes: Constexpr[int] = 0,
     lds_soa_load_interleave: Constexpr[int] = 0,
+    persistent_workers: Constexpr[int] = 0,
 ):
     """Launch the grouped contiguous-M a8w4 MoE GEMM for gfx1250.
 
@@ -196,6 +197,10 @@ def launch_gemm_a8w4_tdm(
        check -- so the callers that choose cluster_n enforce it
        (batched_gemm_mxfp4._pick_cluster_n and its assert).
     """
+    if persistent_workers:
+        assert cluster_m == 1, "persistent workers require cluster_m=1"
+        assert persistent_workers % cluster_n == 0
+        assert not enable_ep_scatter, "persistent workers do not support EP scatter"
     # Resolve per-row settings before specializing the layout and cache key.
     lds_soa_load_interleave_on = (
         lds_soa_load_interleave
@@ -219,6 +224,29 @@ def launch_gemm_a8w4_tdm(
     # Double buffering is sufficient: the carry reads the other LDS buffer
     # before the post-compute barrier permits reusing the current buffer.
     next_stage_on = 1 if (next_stage_prefetch and num_buffers >= 2) else 0
+    # All inputs are constexpr; avoid a long DSL-rewritten boolean chain.
+    rolled_drain = all(
+        (
+            persistent_workers,
+            not stage1_act,
+            a_is_fp4,
+            num_buffers == 4,
+            K == 2048,
+            tile_m == 256,
+            tile_n == 256,
+            tile_k == 256,
+            m_warp == 2,
+            n_warp == 2,
+            num_waves_per_tensor_tdm == 2,
+            cluster_m == 1,
+            cluster_n == 1,
+            planar_lds_on,
+            interleaved_lds_load_on,
+            not next_stage_on,
+            not tdm_as_in_prologue,
+            not enable_ep_scatter,
+        )
+    )
     # Keep the experiment switch as an override while normal dispatch obtains
     # both cluster dimensions from the tuned configuration.
     cluster_m = 1 if FORCE_1X4_CLUSTER else cluster_m
@@ -261,6 +289,8 @@ def launch_gemm_a8w4_tdm(
         a_row_stride_bytes,
         a_scale_row_stride_bytes,
         ep_quant_bits,
+        persistent_workers,
+        rolled_drain,
     )
     _ = cache_tag
     if enable_ep_scatter:
@@ -425,6 +455,8 @@ def launch_gemm_a8w4_tdm(
     _planar_lds = "_planarlds" if planar_lds_on else ""
     _interleaved_lds_load = "_interleavelds" if interleaved_lds_load_on else ""
     _epq = f"_epq{ep_quant_bits}" if ep_quant_bits else ""
+    _persistent = f"_pw{persistent_workers}" if persistent_workers else ""
+    _drain = "_rolleddrain" if rolled_drain else ""
     _kname = (
         f"a8w4_tdm_{_afp}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
@@ -434,11 +466,21 @@ def launch_gemm_a8w4_tdm(
         f"{_b_tdm_th}{_waves_per_tensor}{_ep}{_epq}"
         f"{_mma_group}{_ds_first}"
         f"{_explicit_vgpr_partition}{_planar_lds}"
-        f"{_interleaved_lds_load}"
+        f"{_interleaved_lds_load}{_persistent}{_drain}"
     )
 
-    @flyc.kernel(name=_kname, known_block_size=[block, 1, 1])
-    def kernel(
+    # Compile the static path directly, preserving its launch ABI and the
+    # compiler's knowledge of block IDs. Only persistent workers need a helper
+    # whose task coordinates are runtime values inside the worker loop.
+    task_decorator = (
+        flyc.jit
+        if persistent_workers
+        else flyc.kernel(name=_kname, known_block_size=[block, 1, 1])
+    )
+    task_index_type = fx.Int32 if persistent_workers else Constexpr[int]
+
+    @task_decorator
+    def gemm_task(
         arg_c: fx.Pointer,
         arg_a: fx.Pointer,
         arg_b: fx.Pointer,
@@ -453,6 +495,8 @@ def launch_gemm_a8w4_tdm(
         f32_swiglu_limit: fx.Float32,
         f32_situ_beta: fx.Float32,
         f32_situ_linear_beta: fx.Float32,
+        task_id: task_index_type,
+        schedule_rows: task_index_type,
     ):
         K_TILES = K // tile_k
         A_KROW = K // A_PACK
@@ -460,7 +504,7 @@ def launch_gemm_a8w4_tdm(
         K4 = K // 4
 
         tid = fx.thread_idx.x
-        bid_x = fx.block_idx.x
+        bid_x = task_id if persistent_workers else fx.block_idx.x
         wave = rocdl.readfirstlane(T.i32, tid // WAVE)
         lane = tid % WAVE
         lane16 = lane % 16
@@ -472,7 +516,7 @@ def launch_gemm_a8w4_tdm(
         TILES_PER_GROUP = 16
         assert TILES_PER_GROUP % cluster_m == 0
         total_n_tiles = ceildiv(i32_n, tile_n)
-        total_m_tiles = ceildiv(i32_m, tile_m)
+        total_m_tiles = ceildiv(schedule_rows if persistent_workers else i32_m, tile_m)
         swz_id = bid_x // cluster_n if cluster_n > 1 else bid_x
         local_n = bid_x - swz_id * cluster_n if cluster_n > 1 else 0
         n_units = total_n_tiles // cluster_n if cluster_n > 1 else total_n_tiles
@@ -1583,31 +1627,50 @@ def launch_gemm_a8w4_tdm(
 
                     dispatch_wave_job(steady_mid)
 
-                    for j in range_constexpr(PRE):
-                        kt = n_steady + j
-                        buf = kt % num_buffers
-                        has_next = next_stage_on and j + 1 < PRE
-                        if const_expr(not next_stage_on):
-                            pipeline_fence(
-                                outstanding=TDM_PER * max(0, num_buffers - 2 - j)
+                    if const_expr(rolled_drain):
+                        # Keep LDS stage addresses dynamic to avoid expanding
+                        # the last drain tile into per-load address arithmetic.
+                        for j in range(PRE):
+                            kt = n_steady + j
+                            # Tensor wait counts must be compile-time immediates.
+                            for wait_stage in range_constexpr(PRE):
+                                if j == wait_stage:
+                                    pipeline_fence(
+                                        outstanding=TDM_PER
+                                        * max(0, num_buffers - 2 - wait_stage)
+                                    )
+                            compute_ktile(
+                                kt % num_buffers,
+                                kt,
+                                None,
+                                interleaved_lds_load=interleaved_lds_load,
                             )
-                        next_stage_buf = (
-                            (kt + 1) % num_buffers if const_expr(has_next) else None
-                        )
-                        compute_ktile(
-                            buf,
-                            kt,
-                            None,
-                            next_stage_on,
-                            next_stage_buf,
-                            None,
-                            (
-                                TDM_PER * max(0, num_buffers - 2 - j)
-                                if const_expr(has_next)
-                                else None
-                            ),
-                            interleaved_lds_load=interleaved_lds_load,
-                        )
+                    else:
+                        for j in range_constexpr(PRE):
+                            kt = n_steady + j
+                            buf = kt % num_buffers
+                            has_next = next_stage_on and j + 1 < PRE
+                            if const_expr(not next_stage_on):
+                                pipeline_fence(
+                                    outstanding=TDM_PER * max(0, num_buffers - 2 - j)
+                                )
+                            next_stage_buf = (
+                                (kt + 1) % num_buffers if const_expr(has_next) else None
+                            )
+                            compute_ktile(
+                                buf,
+                                kt,
+                                None,
+                                next_stage_on,
+                                next_stage_buf,
+                                None,
+                                (
+                                    TDM_PER * max(0, num_buffers - 2 - j)
+                                    if const_expr(has_next)
+                                    else None
+                                ),
+                                interleaved_lds_load=interleaved_lds_load,
+                            )
 
             # This is a compile-time selection. The interleaved version has one
             # mainloop body and no wave-parity branch.
@@ -2194,6 +2257,67 @@ def launch_gemm_a8w4_tdm(
                     rocdl.s_wait_storecnt(0)
                 tdm_ops.tensor_wait(0)
 
+        if const_expr(persistent_workers > 0):
+            # Every wave must retire the output store before another wave
+            # reuses the same LDS arena for the next task's input.
+            workgroup_barrier()
+
+    @flyc.kernel(name=_kname, known_block_size=[block, 1, 1])
+    def kernel(
+        arg_c: fx.Pointer,
+        arg_a: fx.Pointer,
+        arg_b: fx.Pointer,
+        arg_scale_a: fx.Pointer,
+        arg_scale_b: fx.Pointer,
+        arg_m_tile_map: fx.Pointer,
+        arg_bias: fx.Pointer,
+        arg_quant_scale: fx.Pointer,
+        arg_ep_row_map: fx.Pointer,
+        i32_m: fx.Int32,
+        i32_n: fx.Int32,
+        f32_swiglu_limit: fx.Float32,
+        f32_situ_beta: fx.Float32,
+        f32_situ_linear_beta: fx.Float32,
+    ):
+        def run_task(task_id, rows):
+            # i32_m remains the allocation capacity: the scale buffer's
+            # descriptor must include the padding in its shuffled layout.
+            gemm_task(
+                arg_c,
+                arg_a,
+                arg_b,
+                arg_scale_a,
+                arg_scale_b,
+                arg_m_tile_map,
+                arg_bias,
+                arg_quant_scale,
+                arg_ep_row_map,
+                i32_m,
+                i32_n,
+                f32_swiglu_limit,
+                f32_situ_beta,
+                f32_situ_linear_beta,
+                task_id,
+                rows,
+            )
+
+        if const_expr(persistent_workers > 0):
+            # Read the live route extent on every graph replay. The grid is
+            # fixed, but workers only visit populated tiles. The stride is a
+            # multiple of cluster_n so multicast peers remain in lockstep.
+            map_ptr_type = fx.PointerType.get(
+                elem_ty=fx.Int32.ir_type,
+                address_space=fx.AddressSpace.Global,
+                alignment=4,
+            )
+            tile_map = fx.recast_iter(map_ptr_type, arg_m_tile_map)
+            rows = tile_map[n_experts - 1]
+            tasks = ceildiv(rows, tile_m) * ceildiv(i32_n, tile_n)
+            for task_id in range(fx.block_idx.x, tasks, persistent_workers):
+                run_task(task_id, rows)
+        else:
+            run_task(fx.block_idx.x, i32_m)
+
     m_tiles = ceildiv(i32_m, tile_m)
     n_tiles = ceildiv(N, tile_n)
     if arg_ep_row_map is None:
@@ -2216,12 +2340,22 @@ def launch_gemm_a8w4_tdm(
         f32_situ_beta,
         f32_situ_linear_beta,
     )
-    grid = (((m_tiles + cluster_m - 1) // cluster_m) * n_tiles, cluster_m, 1)
+    grid = (
+        (
+            persistent_workers
+            if persistent_workers
+            else ((m_tiles + cluster_m - 1) // cluster_m) * n_tiles
+        ),
+        cluster_m,
+        1,
+    )
+    launch_kernel = kernel if persistent_workers else gemm_task
+    launch_args = kargs if persistent_workers else kargs + (0, 0)
     if cluster_m > 1 or cluster_n > 1:
         # Geometry must reach BOTH the definition and the launch site, or the
         # cluster never forms and the TDM loads silently fall back to per-load.
-        kernel(
-            *kargs,
+        launch_kernel(
+            *launch_args,
             value_attrs={"rocdl.cluster_dims": f"{cluster_n},{cluster_m},1"},
         ).launch(
             grid=grid,
@@ -2230,7 +2364,9 @@ def launch_gemm_a8w4_tdm(
             cluster=(cluster_n, cluster_m, 1),
         )
     else:
-        kernel(*kargs).launch(grid=grid, block=(block, 1, 1), stream=stream)
+        launch_kernel(*launch_args).launch(
+            grid=grid, block=(block, 1, 1), stream=stream
+        )
 
 
 launch_gemm_a8w4_tdm.compile_hints["llvm_options"] = {
