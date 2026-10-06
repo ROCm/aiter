@@ -658,6 +658,17 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
             the length-balanced share's + _STATIC_SLACK steps (it needs no
             more arithmetic, and when the longest sequence is at max_seq_len
             its reads went out with the lengths), else assign_work's share."""
+            if fx.const_expr(per_row_tables):
+                # every row its own sequence, as long as its candidates: the
+                # static split is the balanced one, and reading every other
+                # row's length costs more than the walk
+                steps_b = (seq_len(b_st, chunk0) + fx.Int32(STEP_KEYS - 1)) // STEP_KEYS
+                s0_c = static_start(max_steps)
+                per_st = static_quota(max_steps)
+                s_hi_c = fx.min(s0_c + per_st, steps_b)
+                s_hi_c = ((part < parts) & (s_hi_c > s0_c)).select(s_hi_c, s0_c)
+                deep_c = (per_st >= fx.Int32(deep_walk)).select(fx.Int32(1), fx.Int32(0))
+                return b_st, fx.Int32(0), s0_c, s_hi_c, deep_c, static_mult
             total = wave_fold(chunk0, lambda n, t: n * t, _wave_sum, _add)
             longest = wave_fold(chunk0, lambda n, t: n, _wave_max, fx.max)
             most_tiles = wave_fold(chunk0, lambda n, t: t, _wave_max, fx.max)
