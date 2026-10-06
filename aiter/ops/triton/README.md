@@ -93,7 +93,7 @@ configs/<arch>/<backend>/<op>/<d_type>/<CONFIG_NAME>-<suffix>.json
 #        gfx1250  gluon     moe   a8w4
 ```
 
-`<op>` is one of `gemm`, `moe`, `conv`, `mhc`, `attention`, `gmm`, `fusions`.
+`<op>` is one of `gemm`, `moe`, `conv`, `mhc`, `attention`, `gmm`, `fusions`, `quant`.
 The flat, arch-prefixed directories (`configs/gemm/`, `configs/moe/`,
 `configs/conv/`, the loose files at the top of `configs/`) and the fallback
 code that reached them are gone.
@@ -143,6 +143,7 @@ module on top of it, and every function has exactly one home:
 | `utils/mhc_config_utils.py` | `get_mhc_config`, `get_mhc_post_config` |
 | `utils/moe_config_utils.py` | `get_moe_dispatch` — the only MOE config fetcher |
 | `utils/tuned_config_utils.py` | `get_tuned_kernel_config` |
+| `utils/quant_config_utils.py` | `get_quant_config` — Gluon quant launch configs |
 
 Attention and GMM kernels read their single `DEFAULT.json` straight off the
 core (`resolve_config_dir()` + `load_config_json()`); a family module earns
@@ -248,7 +249,9 @@ place the layout is encoded, and it goes stale silently.
 Flat dispatch tables whose keys mean “value less than or equal to this upper
 bound” use `select_leq_config(configs, value, prefix="N_LEQ_")`. It selects
 the smallest matching numeric bound and falls back to `any`, returning a copy
-that the caller may consume. Do not duplicate this selection loop in wrappers.
+that the caller may consume. Tables keyed on several axes use
+`select_leq_config(table, axes=("M", "N"), M=m, N=n)` with keys such as
+`M_LEQ_32.N_LEQ_1024`. Do not duplicate this selection loop in wrappers.
 
 Kernels that carry a Python autotune search space (opt-in tuning) pin their
 single default tile per arch via
