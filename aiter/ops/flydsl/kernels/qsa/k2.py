@@ -289,6 +289,7 @@ def build_qsa_k2_module(
         class SharedStorage:
             kv: fx.Array[BFloat16, block_n * head_dim + v_elem_off, 16]
             scores: fx.Array[Float32, qk_score_slots, 16]
+            partial: fx.Array[Int32, num_waves, 4]
 
         _k_field, _v_field = "kv", "kv"
     else:
@@ -297,6 +298,7 @@ def build_qsa_k2_module(
         class SharedStorage:
             kv: fx.Array[BFloat16, block_n * k_stride, 16]
             scores: fx.Array[Float32, qk_score_slots, 16]
+            partial: fx.Array[Int32, num_waves, 4]
 
         _k_field, _v_field = "kv", "kv"
 
@@ -518,12 +520,70 @@ def build_qsa_k2_module(
         req = token_to_req[row]
         valid_req = (req >= zero) & (req < n_req)
         safe_req = valid_req.select(req, zero)
+        # -1 is padding, and it is usually a suffix, but a live token may
+        # sit behind a masked column. Prefill stops at the last nonnegative
+        # index so the suffix is not gathered, and keeps every hole in front
+        # of it. A live final column is the whole width: one load, no scan.
+        # The result is the same on every lane, so the tile loop and its
+        # barriers stay workgroup-uniform. Decode keeps the full width: its
+        # splits are cut from that width on the host, and the scan cost more
+        # than the masked suffix tiles it skipped.
+        if const_expr(not decode_tr_pv):
+            scan_partial = storage.partial.view(fx.make_layout(num_waves, 1))
+
+        def _scan_last_valid(partial):
+            span = _idiv(n_sel + Int32(block_threads - 1), Int32(block_threads))
+            none = Int32(-1)
+            for _i, state in range(
+                fx.Int64(0),
+                fx.Int64(span),
+                fx.Int64(1),
+                init=[none],
+            ):
+                mine = Int32(state[0])
+                col_i = tid + Int32(_i) * Int32(block_threads)
+                in_width = col_i < n_sel
+                tok = indices[row, in_width.select(col_i, zero)]
+                mine = (in_width & (tok >= zero)).select(col_i, mine)
+                scan_state = yield [mine]
+            val = Int32(scan_state)
+            for sh in (32, 16, 8, 4, 2, 1):
+                peer = val.shuffle_xor(Int32(sh), Int32(64))
+                val = (val > peer).select(val, peer)
+            # Every lane of the wave holds the same max, so the store is uniform.
+            partial[wave] = val
+            gpu.barrier()
+            last = Int32(partial[0])
+            for w in range_constexpr(num_waves):
+                if const_expr(w > 0):
+                    other = Int32(partial[Int32(w)])
+                    last = (last > other).select(last, other)
+            return last + one
+
+        @flyc.jit
+        def _row_valid_cols():
+            cols = zero
+            if n_sel > zero:
+                last_tok = indices[row, n_sel - one]
+                cols = n_sel
+                if last_tok >= zero:
+                    cols = n_sel
+                else:
+                    cols = _scan_last_valid(scan_partial)
+            return cols
+
+        if const_expr(decode_tr_pv):
+            row_cols = n_sel
+        else:
+            row_cols = _row_valid_cols()
         total_tiles = _idiv(n_sel + Int32(block_n - 1), Int32(block_n))
         tile_start = _idiv(split * total_tiles, Int32(n_splits))
         tile_end = _idiv((split + one) * total_tiles, Int32(n_splits))
+        row_tiles = _idiv(row_cols + Int32(block_n - 1), Int32(block_n))
+        tile_end = (tile_end < row_tiles).select(tile_end, row_tiles)
         col_start = tile_start * Int32(block_n)
         col_end_unclamped = tile_end * Int32(block_n)
-        col_end = (col_end_unclamped < n_sel).select(col_end_unclamped, n_sel)
+        col_end = (col_end_unclamped < row_cols).select(col_end_unclamped, row_cols)
         col = tid % Int32(block_n)
         chunk_owner = _idiv(tid, Int32(block_n))
 
@@ -1085,6 +1145,7 @@ def build_qsa_k2_module(
         # The three carried registers ride behind the accumulator so the
         # epilogue's ``results`` indices are unchanged.
         n_tiles = tile_end - tile_start
+        n_tiles = (tile_end > tile_start).select(n_tiles, zero)
         for tile64, state in range(
             fx.Int64(0),
             fx.Int64(n_tiles),
