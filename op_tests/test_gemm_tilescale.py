@@ -34,8 +34,8 @@ def _manifest():
         return [{k: (v if k in ("knl_name", "co_name") else int(v)) for k, v in r.items()} for r in csv.DictReader(f)]
 
 
-ROWS = [r for r in _manifest() if r["abi"] != 2]  # exact-shape rows
-GENERIC_ROWS = [r for r in _manifest() if r["abi"] == 2]
+ROWS = [r for r in _manifest() if r["abi"] not in (2, 3)]  # exact-shape rows
+GENERIC_ROWS = [r for r in _manifest() if r["abi"] in (2, 3)]
 A6W4 = [r for r in ROWS if (r["a_fmt"], r["b_fmt"]) == (6, 4)]
 
 
@@ -153,7 +153,7 @@ def test_row_vs_fp64(row):
     assert float(err.max()) <= float(ref.abs().max()) * 2**-7, float(err.max())
 
 
-GENERIC = GENERIC_ROWS
+GENERIC = [r for r in GENERIC_ROWS if r["abi"] == 2]
 
 
 def _generic_shapes(row):
@@ -186,3 +186,14 @@ def test_generic_a6w4_bitwise_vs_a6w6(cls, bias):
         out = torch.empty_like(ref)
         gemm_a6w4_tilescale(A, TS.pack_fp4_codes_ref(b4, "k128"), SA, SB, out, K, bv)
         assert torch.equal(out.view(torch.int16), ref.view(torch.int16))
+
+
+
+@requires_gfx950
+@pytest.mark.parametrize("shape", [(512, 512, 1024), (768, 1280, 3072), (1024, 512, 2048), (512, 768, 4608)])
+def test_a4w4_k_generic_vs_fp64(shape):
+    """The K-generic A4W4 row (abi 3) on shapes no exact-shape row covers."""
+    M, N, K = shape
+    row = next(r for r in GENERIC_ROWS if (r["a_fmt"], r["b_fmt"]) == (4, 4))
+    assert tilescale_supported(M, N, K, 4, 4, False, 0, row["b_ilv"])
+    test_row_vs_fp64(dict(row, M=M, N=N, K=K))

@@ -25,6 +25,9 @@
 //   2  abi 1 with K in the dword after N: the shape-generic kernels (M = N = K = 0 in the manifest), which
 //      serve every M, N (multiples of 256) and every K in their K-loop class -- K/128 = kcls (mod 12) and
 //      K >= kmin -- one tile per workgroup (grid = tiles).
+//   3  the K-generic A4W4 kernel: the first 112 bytes of abi 0 with K in the dword after N; serves every
+//      M, N (multiples of 256) and every K that is a multiple of 512 and >= kmin (kcls 12: any K-loop
+//      class), B scales at interleave 4; one tile per workgroup.
 namespace {
 constexpr size_t kTensorAlignment = 16;
 
@@ -44,7 +47,7 @@ struct __attribute__((packed)) KernelArgsFly4
     uint32_t sb_dwords;
     uint32_t M;
     uint32_t N;
-    uint32_t mn_pad;
+    uint32_t K; // abi 3 only (0 for abi 0)
     Memref C1, C2;
 };
 static_assert(sizeof(KernelArgsFly4) == 160, "fly4 kernarg must be 160 bytes");
@@ -123,9 +126,10 @@ const tsgemmConfig* find_row(const std::string& arch,
         if(found != nullptr)
             break;
         const auto& c = kv.second;
-        if(c.arch == arch && c.abi == 2 && c.a_fmt == a_fmt && c.b_fmt == b_fmt &&
-           c.b_codes == b_codes && c.b_ilv == b_ilv && c.bias == static_cast<int>(bias) &&
-           K % 512 == 0 && (K / 128) % 12 == c.kcls && K >= c.kmin)
+        if(c.arch == arch && (c.abi == 2 || c.abi == 3) && c.a_fmt == a_fmt &&
+           c.b_fmt == b_fmt && c.b_codes == b_codes && c.b_ilv == b_ilv &&
+           c.bias == static_cast<int>(bias) && K % 512 == 0 &&
+           (c.kcls == 12 || (K / 128) % 12 == c.kcls) && K >= c.kmin)
             found = &c;
     }
     cache.emplace(key, found);
@@ -194,7 +198,8 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     const std::string arch = get_gpu_arch();
     const tsgemmConfig* cfg =
         find_row(arch, a_fmt, b_fmt, b_codes, b_ilv, bias != nullptr, M, N, K);
-    AITER_CHECK(cfg != nullptr && (cfg->grid > 0 || cfg->abi == 2),
+    const bool generic = cfg != nullptr && (cfg->abi == 2 || cfg->abi == 3);
+    AITER_CHECK(cfg != nullptr && (cfg->grid > 0 || generic),
                 __func__,
                 " no tilescale kernel for a" + std::to_string(a_fmt) + "w" +
                     std::to_string(b_fmt) + " " + std::to_string(M) + "x" + std::to_string(N) +
@@ -206,11 +211,11 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     KernelArgsFly6 a6;
     void* args      = nullptr;
     size_t arg_size = 0;
-    if(cfg->abi == 0)
+    if(cfg->abi == 0 || cfg->abi == 3)
     {
         AITER_CHECK(a_fmt == 4 && b_fmt == 4 && bias == nullptr,
                     __func__,
-                    " abi 0 rows are A4W4 without bias");
+                    " abi 0 / 3 rows are A4W4 without bias");
         std::memset(&a4, 0, sizeof(a4));
         a4.A         = memref(pa, M, K / 2);
         a4.B         = memref(pb, N, K / 2);
@@ -227,8 +232,9 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         a4.sb_dwords = static_cast<uint32_t>(bytes(B_scale) / 4);
         a4.M         = static_cast<uint32_t>(M);
         a4.N         = static_cast<uint32_t>(N);
+        a4.K         = cfg->abi == 3 ? static_cast<uint32_t>(K) : 0u;
         args         = &a4;
-        arg_size     = sizeof(a4);
+        arg_size     = cfg->abi == 3 ? offsetof(KernelArgsFly4, C1) : sizeof(a4);
     }
     else
     {
@@ -276,6 +282,6 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     const char* co   = cfg->co_name.c_str();
     AiterAsmKernel* impl =
         &impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name, co); });
-    const int grid = cfg->abi == 2 ? static_cast<int>((M / 256) * (N / 256)) : cfg->grid;
+    const int grid = generic ? static_cast<int>((M / 256) * (N / 256)) : cfg->grid;
     impl->launch_kernel({args, &arg_size, grid, 1, 1, 256, 1, 1, stream});
 }

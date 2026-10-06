@@ -54,7 +54,7 @@ def _manifest(arch: str = "gfx950"):
 def _generic(arch: str = "gfx950"):
     """{(a_fmt, b_fmt, b_codes, b_ilv, bias, kcls): kmin} of the shape-generic rows."""
     return {(r["a_fmt"], r["b_fmt"], r["b_codes"], r["b_ilv"], r["bias"], r["kcls"]): r["kmin"]
-            for r in _manifest(arch) if r["abi"] == 2}
+            for r in _manifest(arch) if r["abi"] in (2, 3)}
 
 
 @functools.lru_cache(maxsize=None)
@@ -79,8 +79,12 @@ def tilescale_supported(M: int, N: int, K: int, a_fmt: int, b_fmt: int, bias: bo
         return True
     if M % 256 or N % 256 or K % 512:
         return False
-    kmin = _generic().get((a_fmt, b_fmt, b_codes, b_ilv, int(bias), (K // 128) % 12))
-    return kmin is not None and K >= kmin
+    g = _generic()
+    for kcls in ((K // 128) % 12, 12):  # 12: a row serving every K-loop class
+        kmin = g.get((a_fmt, b_fmt, b_codes, b_ilv, int(bias), kcls))
+        if kmin is not None and K >= kmin:
+            return True
+    return False
 
 
 def a4w4_b_ilv(M: int, N: int, K: int) -> int:
