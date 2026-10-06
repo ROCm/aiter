@@ -345,9 +345,10 @@ _DENSE_K5_OFFSETS_MAX = 32
 _DENSE_K5_OFFSETS = OrderedDict()
 # Serial K5 cost scales with the longest sequence's chunks (~1.6 us/chunk);
 # blocked scales with total_blocks * H (~0.18 us/block/head) plus a fixed carry
-# pass (~25 chunks). gfx950 break-even is ratio ~9 and ~40 chunks, so 6 and 64
-# leave margin; the ratio also bounds the maps/entry scratch.
-_BLOCKED_MIN_CHUNKS = 64
+# pass (~25 chunks). gfx950 break-even is ratio ~9, so 6 leaves margin and
+# bounds the maps/entry scratch. Blocked loses to serial on balanced
+# two-sequence splits under ~96 chunks ([4064,4065], [3000,5129]); wins from 97.
+_BLOCKED_MIN_CHUNKS = 96
 _BLOCKED_MAX_WORK_PER_CHUNK = 6
 
 
@@ -1296,11 +1297,12 @@ def _chunk_gated_delta_rule_fwd_h_blocked(
     H, V = u.shape[1], u.shape[-1]
     stream = torch.cuda.current_stream(k.device)
     maps_buf, entry_buf = _blocked_scratch(k.device, blocks, H, K + V, K, stream)
+    g32 = _as_fp32_contig(g) if g is not None else None
     maps = _build_chunk_gdn_block_maps(
         k,
         w,
         u,
-        g,
+        g32,
         prefill_metadata=prefill_metadata,
         bv=map_bv,
         out=maps_buf,
@@ -1346,7 +1348,7 @@ def _chunk_gated_delta_rule_fwd_h_blocked(
         u,
         w,
         v_new,
-        _as_fp32_contig(g) if g is not None else dummy,
+        g32 if g32 is not None else dummy,
         dummy,
         h,
         entry,
