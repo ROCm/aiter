@@ -17,6 +17,7 @@ Usage:
 """
 
 import argparse
+import functools
 
 import torch
 import triton
@@ -25,6 +26,7 @@ from aiter.ops.triton._triton_kernels.attention.sparse_attention_dsv4 import (
     _sparse_attn_prefill_kernel as csa_prefill_tl,
 )
 from aiter.ops.triton.attention.pa_prefill_sparse import pa_prefill_sparse
+from aiter.ops.triton.utils._triton import arch_info
 
 # The Gluon prefill kernel is opt-in (gfx950 + Triton >= 3.6). Probe it once at
 # import time; the benchmark falls back to Triton-only when unavailable.
@@ -103,6 +105,19 @@ def _ref_prefill(q, kv, indices, indptr, scale, attn_sink=None):
 # ---------------------------------------------------------------------------
 # Kernel launchers
 # ---------------------------------------------------------------------------
+@functools.lru_cache
+def _extend_source(device, dtype, num_queries):
+    """Second KV source for `pa_prefill_sparse`: gfx1250 requires one, so pass an
+    empty one there (built once per shape, outside the timed loop)."""
+    if arch_info.get_arch() != "gfx1250":
+        return None, None, None
+    return (
+        torch.empty(1, HEAD_DIM, dtype=dtype, device=device),
+        torch.empty(0, dtype=torch.int32, device=device),
+        torch.zeros(num_queries + 1, dtype=torch.int32, device=device),
+    )
+
+
 def _launch_prefill(
     backend,
     q,
@@ -124,9 +139,7 @@ def _launch_prefill(
             kv,
             indices,
             indptr,
-            None,
-            None,
-            None,
+            *_extend_source(q.device, q.dtype, num_queries),
             attn_sink if has_sink else None,
             scale,
             out=out,
