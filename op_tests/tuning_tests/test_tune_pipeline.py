@@ -345,6 +345,27 @@ class TestTunePipeline(unittest.TestCase):
                 "timeout": 900,
                 "timeout_mp1": 900,
             },
+            # Tie-dense `equal` rows: `sampled` beats the shape router by >5x on
+            # both, so each shape writes a row (randn would correctly write none).
+            "topk_select": {
+                "script": "csrc/topk_select/topk_select_tune.py",
+                "header": ["rows", "width", "k", "dist"],
+                "shapes": [(4096, 8192, 2048, "equal"), (1, 8192, 64, "equal")],
+                "keys": [
+                    "gfx",
+                    "cu_num",
+                    "rows_lo",
+                    "rows_hi",
+                    "width_lo",
+                    "width_hi",
+                    "k",
+                    "backend",
+                    "us",
+                    "dists",
+                ],
+                "timeout": 900,
+                "timeout_mp1": 900,
+            },
             "a6w6_blockscale": {
                 "script": "csrc/gemm_a6w6/gemm_a6w6_tune.py",
                 "header": ["M", "N", "K"],
@@ -622,6 +643,12 @@ class TestTunePipeline(unittest.TestCase):
 
     def test_gdn_k5_opt_mp1(self):
         self._run_one("gdn_k5_opt", mp=1)
+
+    def test_topk_select_mp1(self):
+        self._run_one("topk_select", mp=1)
+
+    def test_topk_select_mp_default(self):
+        self._run_one("topk_select", mp=None)
 
 
 @unittest.skipUnless(_gpu_available(), "No GPU available")

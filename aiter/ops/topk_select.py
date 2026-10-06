@@ -18,7 +18,8 @@ none able to cover the whole domain:
     stream   one workgroup per row, reading the row once. Owns the narrow rows
              and the large-M end of the wide ones.
 
-`topk_select` picks between them. The parameter names, order and return shape
+`topk_select` picks between them by shape, or by an offline-tuned table when one
+is loaded (csrc/topk_select/README.md). The parameter names, order and return shape
 follow `deep_select.topk` so code written against DeepSelect ports across; where
 this cannot honour DeepSelect's behaviour it raises rather than diverging
 silently. The differences are listed on `topk_select` itself.
@@ -578,6 +579,72 @@ def _available(
     return frozenset(out)
 
 
+def _sampled_ok(device: int) -> bool:
+    """`_available`'s ``sampled_ok`` for a call on this GPU."""
+    return (
+        _sampled_on_device(device)
+        and os.environ.get("AITER_DISABLE_TOPK_SAMPLED", "0") != "1"
+    )
+
+
+# The row-count halves of serving predicates, which `_available` cannot ask
+# because it is memoized without the row count. A backend added with such a
+# limit registers it here, and `_servable` -- what a tuned table may pick from --
+# honours it with no other change.
+_ROW_PREDICATES = {
+    "sampled": lambda rows, width, k, device: _sampled_supports_cached(
+        rows, width, k, device
+    ),
+}
+
+
+def _servable(
+    rows: int,
+    width: int,
+    k: int,
+    wave_size: int,
+    ragged: bool,
+    fp32: bool,
+    device: int,
+    sampled_ok: bool,
+) -> frozenset:
+    """Backends that can serve this exact call shape on this GPU, row count included."""
+    return frozenset(
+        b
+        for b in _available(width, k, wave_size, ragged, fp32, sampled_ok)
+        if b not in _ROW_PREDICATES or _ROW_PREDICATES[b](rows, width, k, device)
+    )
+
+
+def _allowed(tie: str | None, deterministic: bool) -> frozenset:
+    allowed = frozenset(_BACKENDS_BY_TIE[tie])
+    return allowed - _NONDETERMINISTIC if deterministic else allowed
+
+
+def _router_choice(
+    rows: int,
+    width: int,
+    k: int,
+    wave_size: int,
+    ragged: bool,
+    tie: str | None,
+    deterministic: bool,
+    fp32: bool,
+    device: int,
+    sampled_ok: bool,
+) -> str:
+    """What the shape rules pick, with no tuned table."""
+    available = _available(width, k, wave_size, ragged, fp32, sampled_ok) & _allowed(
+        tie, deterministic
+    )
+    if not available:
+        raise RuntimeError(
+            f"no backend serves rows={rows} width={width} topk={k} "
+            f"tie={tie!r} deterministic={deterministic} fp32={fp32}"
+        )
+    return topk_select_backend(rows, width, k, available, ragged=ragged, device=device)
+
+
 @lru_cache(maxsize=1024)
 def _choose(
     rows: int,
@@ -590,24 +657,35 @@ def _choose(
     fp32: bool,
     device: int,
     sampled_ok: bool,
+    dtype: str = "float32",
 ) -> str:
     """The backend for one call shape on one GPU, resolved once.
 
     Every input is a scalar the caller varies rarely, and the whole decision --
     which backends can serve, which the promises leave, which the shape rules
-    name -- is a pure function of them. Memoized as one step so the serving path
-    is a dict lookup rather than a set build, an intersection and a rule chain.
+    name -- is a pure function of them and of the tuned table
+    (`aiter.ops.topk_select_tuning`, read once per process). Memoized as one
+    step so the serving path is a dict lookup rather than a set build, an
+    intersection and a rule chain.
+
+    A tuned row applies only to calls of the dtype it was tuned on, and may
+    only pick from what the promises leave and this exact shape can serve
+    (`_servable`); anything else falls through to the shape rules.
     """
-    allowed = frozenset(_BACKENDS_BY_TIE[tie])
-    if deterministic:
-        allowed -= _NONDETERMINISTIC
-    available = _available(width, k, wave_size, ragged, fp32, sampled_ok) & allowed
-    if not available:
-        raise RuntimeError(
-            f"no backend serves rows={rows} width={width} topk={k} "
-            f"tie={tie!r} deterministic={deterministic} fp32={fp32}"
-        )
-    return topk_select_backend(rows, width, k, available, ragged=ragged, device=device)
+    shape = (rows, width, k, wave_size, ragged, tie, deterministic, fp32, device)
+    router = _router_choice(*shape, sampled_ok)
+    from aiter.ops.topk_select_tuning import lookup_tuned, warn_unavailable_tuned
+
+    tuned = lookup_tuned(
+        rows, width, k, ragged, tie, deterministic, dtype=dtype, device=device
+    )
+    if tuned is None or tuned == router:
+        return router
+    servable = _servable(rows, width, k, wave_size, ragged, fp32, device, sampled_ok)
+    if tuned in servable & _allowed(tie, deterministic):
+        return tuned
+    warn_unavailable_tuned(tuned, rows, width, k)
+    return router
 
 
 def _plain_k2048_multiblock(rows: int, width: int, ragged: bool) -> bool:
@@ -1045,7 +1123,12 @@ def topk_select(
         # caller's buffer at the end, like a reordered one.
         idx = torch.empty((rows, topk), dtype=torch.int32, device=input.device)
 
-    backend = _choose(
+    if os.environ.get("AITER_TOPK_SELECT_RECORD"):
+        from aiter.ops.topk_select_tuning import maybe_record
+
+        maybe_record(input, row_lens, topk, end is not None, tie, deterministic)
+
+    shape = (
         rows,
         width,
         topk,
@@ -1055,25 +1138,47 @@ def topk_select(
         deterministic,
         input.dtype is torch.float32,
         input.device.index,
-        _sampled_on_device(input.device.index)
-        and os.environ.get("AITER_DISABLE_TOPK_SAMPLED", "0") != "1",
+        _sampled_ok(input.device.index),
     )
-    gathered = None
-    if _whole_row_takes(
-        backend, rows, width, topk, end is not None, return_value or sorted
-    ):
-        gathered = _select_whole_rows(input, idx, return_value or sorted)
-    else:
-        _dispatch(
+    dtype = str(input.dtype).removeprefix("torch.")
+    backend = _choose(*shape, dtype=dtype)
+    try:
+        gathered = _select_into(
             backend,
             input,
             row_lens,
             idx,
             topk,
             rows,
-            end is not None,
+            end,
             tie,
             deterministic,
+            return_value or sorted,
+        )
+    except Exception as e:
+        # Only a tuned table can name a backend the shape rules would not; if
+        # that one raises, this call and every later one of its shape go to
+        # the shape rules' choice instead. A device-side fault cannot be caught
+        # here -- the tuner runs each candidate in its own process for that.
+        router = _router_choice(*shape)
+        from aiter.ops.topk_select_tuning import retire_tuned
+
+        if router == backend or not retire_tuned(
+            backend, router, e, *shape[:3], *shape[4:7], dtype=dtype
+        ):
+            raise
+        _choose.cache_clear()
+        gathered = _select_into(
+            router,
+            input,
+            row_lens,
+            idx,
+            topk,
+            rows,
+            end,
+            tie,
+            deterministic,
+            return_value or sorted,
         )
 
     values = None
@@ -1171,6 +1276,20 @@ def _stream_scratch(input, dtype=None):
     to specialise on.
     """
     return torch.empty(1, 1, dtype=dtype or input.dtype, device=input.device)
+
+
+def _select_into(
+    backend, input, row_lens, idx, topk, rows, end, tie, deterministic, with_values
+):
+    """Run one backend into `idx`; the values too where the whole-row path made them."""
+    if _whole_row_takes(
+        backend, rows, input.shape[1], topk, end is not None, with_values
+    ):
+        return _select_whole_rows(input, idx, with_values)
+    _dispatch(
+        backend, input, row_lens, idx, topk, rows, end is not None, tie, deterministic
+    )
+    return None
 
 
 def _dispatch(

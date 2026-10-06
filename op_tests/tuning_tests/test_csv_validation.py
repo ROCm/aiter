@@ -7,6 +7,7 @@ Catches: duplicates, invalid times, high errRatio, git merge conflicts,
 missing untuned files.
 """
 
+import ast
 import os
 import re
 import unittest
@@ -33,7 +34,39 @@ class TestCSVValidation(unittest.TestCase):
         "bf16": "bf16_tuned_gemm.csv",
         "bf16_batched": "bf16_tuned_batched_gemm.csv",
         "fmoe": "tuned_fmoe.csv",
+        "topk_select": "topk_select_tuned.csv",
     }
+
+    TOPK_SELECT_KEYS: ClassVar[list[str]] = [
+        "gfx",
+        "cu_num",
+        "rows_lo",
+        "rows_hi",
+        "width_lo",
+        "width_hi",
+        "k",
+        "dtype",
+        "ragged",
+        "tie",
+        "deterministic",
+        "mode",
+    ]
+
+    @staticmethod
+    def _topk_select_backends():
+        """Backend names as declared in topk_select.py, read without importing
+        aiter, so a backend added there is accepted here with no edit."""
+        src = os.path.join(AITER_ROOT, "aiter", "ops", "topk_select.py")
+        with open(src) as f:
+            tree = ast.parse(f.read())
+        for node in tree.body:
+            if (
+                isinstance(node, ast.Assign)
+                and getattr(node.targets[0], "id", "") == "_BACKENDS_BY_TIE"
+            ):
+                table = ast.literal_eval(node.value)
+                return {b for names in table.values() for b in names}
+        raise AssertionError("_BACKENDS_BY_TIE not found in topk_select.py")
 
     def _load_csv(self, name):
         path = os.path.join(CONFIGS_DIR, self.TUNED_CSVS[name])
@@ -124,6 +157,64 @@ class TestCSVValidation(unittest.TestCase):
                 "_tag",
             ],
         )
+
+    def _topk_select_tables(self):
+        for root in (CONFIGS_DIR, os.path.join(CONFIGS_DIR, "model_configs")):
+            if not os.path.isdir(root):
+                continue
+            for f in sorted(os.listdir(root)):
+                if "topk_select_tuned" in f and "untuned" in f:
+                    continue
+                if "topk_select_tuned" in f and f.endswith(".csv"):
+                    yield os.path.join(root, f)
+
+    def test_topk_select_tables_well_formed(self):
+        backends = self._topk_select_backends()
+        spec = re.compile(r"^.+@[0-9]+x[0-9]+$")
+        for path in self._topk_select_tables():
+            with self.subTest(csv=os.path.relpath(path, AITER_ROOT)):
+                df = pd.read_csv(path, keep_default_na=False)
+                df.columns = df.columns.str.strip()
+                missing = [
+                    c for c in [*self.TOPK_SELECT_KEYS, "backend"] if c not in df
+                ]
+                self.assertFalse(missing, f"missing columns {missing}")
+                dupes = df[df.duplicated(subset=self.TOPK_SELECT_KEYS, keep=False)]
+                self.assertEqual(len(dupes), 0, f"duplicate bands:\n{dupes.head(10)}")
+                bad_backend = df[~df["backend"].isin(backends)]
+                self.assertEqual(
+                    len(bad_backend), 0, f"unknown backend:\n{bad_backend.head(5)}"
+                )
+                for lo, hi in (("rows_lo", "rows_hi"), ("width_lo", "width_hi")):
+                    bad = df[(df[lo] < 1) | (df[hi] < df[lo])]
+                    self.assertEqual(len(bad), 0, f"bad {lo}/{hi}:\n{bad.head(5)}")
+                bad_k = df[(df["k"] < 1) | (df["k"] > df["width_hi"])]
+                self.assertEqual(len(bad_k), 0, f"k outside width:\n{bad_k.head(5)}")
+                bad_mode = df[~df["mode"].isin(["graph", "eager"])]
+                self.assertEqual(len(bad_mode), 0, f"bad mode:\n{bad_mode.head(5)}")
+                bad_dtype = df[~df["dtype"].isin(["float32", "bfloat16", "float16"])]
+                self.assertEqual(len(bad_dtype), 0, f"bad dtype:\n{bad_dtype.head(5)}")
+                if "dists" in df:
+                    for i, cell in enumerate(df["dists"].astype(str)):
+                        for s in filter(None, cell.split(";")):
+                            self.assertRegex(s, spec, f"row {i + 2}: dists entry")
+                            # A recorded sample's path exists only where it was
+                            # recorded; --run_config could never verify the row.
+                            dist = s.rsplit("@", 1)[0]
+                            self.assertFalse(
+                                "/" in dist or dist.endswith((".pt", ".pth")),
+                                f"row {i + 2}: shipped tables must be tuned on "
+                                f"presets, not recorded samples ({dist})",
+                            )
+
+    def test_topk_select_backends_read_from_source(self):
+        self.assertLessEqual(
+            {"argmax", "small_k", "plain", "decode", "stream", "sampled"},
+            self._topk_select_backends(),
+        )
+
+    def test_topk_select_no_duplicates(self):
+        self._check_no_duplicates("topk_select", extra_keys=self.TOPK_SELECT_KEYS[2:])
 
     def test_flydsl_stage2_sort_block_matches_fmoe_config(self):
         """Stage2 must consume the same sorting layout emitted by stage1."""
@@ -217,6 +308,7 @@ class TestCSVValidation(unittest.TestCase):
             "a8w8_untuned_batched_gemm.csv",
             "bf16_untuned_batched_gemm.csv",
             "untuned_fmoe.csv",
+            "topk_select_untuned.csv",
         ]
         for f in untuned_files:
             with self.subTest(file=f):

@@ -334,6 +334,13 @@ TUNER_FAMILIES = {
         "timeout": 1800,
         "config_property": "AITER_CONFIG_GDN_K5_OPT_FILE",
     },
+    "topk_select": {
+        "script": "csrc/topk_select/topk_select_tune.py",
+        "csv_pattern": "topk_select_tuned",
+        "exclude_patterns": ["untuned"],
+        "timeout": 1800,
+        "config_property": "AITER_CONFIG_TOPK_SELECT_FILE",
+    },
 }
 
 
@@ -434,6 +441,9 @@ class TestRunConfig(unittest.TestCase):
 
     def test_gdn_k5_opt(self):
         self._test_family("gdn_k5_opt")
+
+    def test_topk_select(self):
+        self._test_family("topk_select")
 
 
 @unittest.skipUnless(_gpu_available(), "No GPU available")

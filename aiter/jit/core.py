@@ -203,6 +203,15 @@ AITER_CONFIG_DISPATCH_COMBINE_INTRANODE = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_dispatch_combine_intranode.csv",
 )
 
+# topk_select backend table. Per-model tables live under model_configs/
+# (*topk_select_tuned*.csv) and get merged into this canonical file by
+# get_config_file. It ships header-only, and topk_select_untuned.csv carries the
+# tuner's band lookup keys so the merge's duplicate check keys on bands.
+AITER_CONFIG_TOPK_SELECT = os.getenv(
+    "AITER_CONFIG_TOPK_SELECT",
+    f"{AITER_ROOT_DIR}/aiter/configs/topk_select_tuned.csv",
+)
+
 
 class AITER_CONFIG:
     @property
@@ -315,6 +324,14 @@ class AITER_CONFIG:
             "AITER_CONFIG_GDN_K5_OPT",
             AITER_CONFIG_GDN_K5_OPT,
             "chunk_gdn_h_opt_tuned",
+        )
+
+    @property
+    def AITER_CONFIG_TOPK_SELECT_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_TOPK_SELECT",
+            AITER_CONFIG_TOPK_SELECT,
+            "topk_select_tuned",
         )
 
     @property

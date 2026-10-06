@@ -14,6 +14,7 @@ Minimal test suite for validating the aiter tuning infrastructure.
 | `test_tune_pipeline.py` | 2 | Yes | End-to-end: run each tuner on small shapes (mp=1 + mp=default), verify output CSV; `--compare --update_improved`; `AITER_ONLINE_TUNE` e2e |
 | `test_asm_splitk_guard.py` | 1 | No | `GemmTuner.asm_gemm_all_solutions` SplitK semaphore grid guard |
 | `test_run_config.py` | 2 | Yes | Run --run_config on ALL existing tuned CSVs (configs + model_configs) |
+| `test_topk_select_tuner.py` | 1 | Partly | topk_select tuner: oracle negative controls, table lookup/loading through `AITER_CONFIGS` (env lists, model_configs merge, a band claimed twice falls back without raising), band grouping, input validation, no_regress/minimax, second-process reproduction gate, crash/timeout isolation, recorder (per-band cap, multi-process), run_config verdicts; GPU cases skip without a GPU |
 
 ## Tuner family coverage
 
@@ -29,6 +30,7 @@ Minimal test suite for validating the aiter tuning infrastructure.
 | `fmoe` | `csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py` | `tuned_fmoe.csv` + model_configs | ✓ | ✓ (bf16/fp8/int8/gelu) |
 | `gradlib_bf16` | `gradlib/gradlib/gemm_tuner.py` | `bf16_tuned_gemm.csv` | ✓ | ✓ (hipBLASLt/ASM/FlyDSL) |
 | `gdn_k5_opt` | `csrc/gdn_k5/chunk_gdn_h_opt_tune.py` | `model_configs/*_chunk_gdn_h_opt_tuned.csv` | ✓ | ✓ (shape-only varlen smoke) |
+| `topk_select` | `csrc/topk_select/topk_select_tune.py` | `topk_select_tuned.csv` (ships empty) + `model_configs/*topk_select_tuned*.csv` | ✓ (oracle + regression verdict) | ✓ (tie-dense `equal`, mp=1 + mp=default) |
 
 ## Config resolution
 
@@ -47,7 +49,8 @@ If `AITER_CONFIGS` is unavailable (e.g. aiter not installed), the test falls bac
 python3 -m unittest op_tests.tuning_tests.test_csv_validation \
   op_tests.tuning_tests.test_tuner_infra \
   op_tests.tuning_tests.test_mp_tuner_logic \
-  op_tests.tuning_tests.test_online_tune -v
+  op_tests.tuning_tests.test_online_tune \
+  op_tests.tuning_tests.test_topk_select_tuner -v
 
 # Level 2: pipeline smoke (~10min)
 python3 -m unittest op_tests.tuning_tests.test_tune_pipeline -v
@@ -105,6 +108,6 @@ TUNE_TEST_CONFIG="aiter/configs/a8w8_blockscale_tuned_gemm.csv:aiter/configs/mod
 python3 -m unittest op_tests.tuning_tests.test_run_config.TestRunConfigCustom -v
 ```
 
-Available families: `a8w8`, `a8w8_bpreshuffle`, `a8w8_blockscale`, `a8w8_blockscale_bpreshuffle`, `a4w4_blockscale`, `batched_a8w8`, `batched_bf16`, `fmoe`, `gradlib_bf16`, `gdn_k5_opt`
+Available families: `a8w8`, `a8w8_bpreshuffle`, `a8w8_blockscale`, `a8w8_blockscale_bpreshuffle`, `a4w4_blockscale`, `batched_a8w8`, `batched_bf16`, `fmoe`, `gradlib_bf16`, `gdn_k5_opt`, `topk_select`
 
 The test checks both **exit code** and **per-shape status** — shapes with `ERROR` (kernel crash) or `MISMATCH` (accuracy exceeded errRatio) will fail the test.
