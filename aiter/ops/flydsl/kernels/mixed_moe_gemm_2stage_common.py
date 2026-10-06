@@ -21,6 +21,8 @@ A8W4 path is selected by `a_dtype='fp8', b_dtype='fp4'` plus
 `gate_mode=GateMode.INTERLEAVE` + `a_scale_one=True` in stage1.
 """
 
+import os
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
@@ -280,9 +282,22 @@ def compile_mixed_moe_gemm1_common(
     # tag keeps kernels compiled before that change out of the cache.
     dma_wait_fix = use_async_copy and not heterogeneous_b
     dma_wait_tag = "_dmaw" if dma_wait_fix else ""
+    # AITER_MOE_SKIP_INTER_PAD=1: with gate/up interleaved, the last
+    # 2*inter_dim_pad of the 2*inter_dim N columns are the intermediate pad.
+    # Workgroups whose N tile lies wholly in it read w1 and its scales through
+    # zero-sized buffer resources: every such load returns 0 without touching
+    # memory, and the tile still stores the zeros stage 2 reads. Off: the IR is
+    # unchanged.
+    pad_skip_s1 = (
+        os.environ.get("AITER_MOE_SKIP_INTER_PAD", "0") == "1"
+        and inter_dim_pad > 0
+        and gate_up_interleave
+        and not heterogeneous_b
+    )
+    padskip_tag = "_padskip" if pad_skip_s1 else ""
     module_name = (
         f"mfma_moe1_silu_mul_a{a_dtype}_w{b_dtype}_{out_s}"
-        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}{act_tag}{v2out_tag}{heterogeneous_tag}{dma_wait_tag}_v{kernel_version}"
+        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}{act_tag}{v2out_tag}{heterogeneous_tag}{dma_wait_tag}{padskip_tag}_v{kernel_version}"
     ).replace("-", "_")
 
     cshuffle_elem_bytes = 4 if need_quant else (4 if out_is_f32 else 2)
@@ -556,6 +571,13 @@ def compile_mixed_moe_gemm1_common(
                 by = workgroup_in_group // group_size_m
 
             by_n = by * arith.constant(tile_n, index=True)
+            if const_expr(pad_skip_s1):
+                # the N tile starts at or past the first pad column: all pad
+                pad_tile_s1 = arith.cmpi(
+                    CmpIPredicate.uge,
+                    by_n,
+                    arith.constant(2 * inter_dim - 2 * inter_dim_pad, index=True),
+                )
 
             k_base_idx = arith.index(0)
             if const_expr(is_splitk):
@@ -632,6 +654,12 @@ def compile_mixed_moe_gemm1_common(
             mn_w = arith.constant(experts * (2 * inter_dim), index=True)
             sw_nbytes_idx = mn_w * kblk_w
             sw_nbytes_i32 = fx.Int32(sw_nbytes_idx)
+            if const_expr(pad_skip_s1):
+                sw_nbytes_i32 = arith.select(
+                    pad_tile_s1,
+                    arith.constant(0, type=T.i32),
+                    sw_nbytes_i32.ir_value(),
+                )
             sw_rsrc = ptr_rsrc(arg_scale_w, sw_nbytes_i32)
             shared_scale_rows = arith.constant(
                 ((2 * inter_dim + 255) // 256) * 256, index=True
@@ -741,9 +769,16 @@ def compile_mixed_moe_gemm1_common(
                 expert_byte_off = fx.Int64(
                     expert_idx * arith.constant(per_expert_w_bytes, index=True)
                 )
+                w_records_e = per_expert_w_bytes
+                if const_expr(pad_skip_s1):
+                    w_records_e = arith.select(
+                        pad_tile_s1,
+                        arith.constant(0, type=T.i32),
+                        arith.constant(per_expert_w_bytes, type=T.i32),
+                    )
                 w_rsrc_e = buffer_ops.create_buffer_resource_from_addr(
                     (w_addr_i64 + expert_byte_off).ir_value(),
-                    num_records_bytes=per_expert_w_bytes,
+                    num_records_bytes=w_records_e,
                 )
 
                 x_load_bytes = 16
@@ -3365,6 +3400,22 @@ def compile_mixed_moe_gemm2_common(
             f"{cumul_tag}{xcd_tag}{acc_tag}"
         )
     variant_tags += "_aglobal" if use_global_a else "_abuffer"
+    # AITER_MOE_SKIP_INTER_PAD=1: fp4 B cells whose K lies in the intermediate
+    # pad (K >= inter_dim - inter_dim_pad, whole 32-value cells) are loaded
+    # through an out-of-range offset: zeros, no memory traffic. The MFMA already
+    # multiplied zeros there (the pad's w2 columns are zero). The offset must
+    # stay a valid 32-bit buffer offset past the resource. Off: the IR is
+    # unchanged.
+    pad_skip_s2 = (
+        os.environ.get("AITER_MOE_SKIP_INTER_PAD", "0") == "1"
+        and inter_dim_pad > 0
+        and is_f4_b
+        and not heterogeneous_b
+        and (int(inter_dim) - int(inter_dim_pad)) % 32 == 0
+        and int(w_nbytes) < 2**31
+    )
+    if pad_skip_s2:
+        variant_tags += f"_padskip{int(inter_dim) - int(inter_dim_pad)}"
     module_name = (
         f"mfma_moe2_a{a_dtype}_w{b_dtype}_{out_s}_{epilog_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}{variant_tags}"
@@ -3884,7 +3935,9 @@ def compile_mixed_moe_gemm2_common(
                     k1 = lane_div_16
                     vec_elems = kpack_bytes // int(b_elem_bytes)
 
-                    def load_cell(rsrc, expert_base, stride_n0, elem_type, k0):
+                    def load_cell(
+                        rsrc, expert_base, stride_n0, elem_type, k0, pad_check=False
+                    ):
                         idx_pack = (
                             expert_base
                             + blk[ni] * arith.constant(stride_n0, index=True)
@@ -3892,6 +3945,23 @@ def compile_mixed_moe_gemm2_common(
                             + k1 * arith.constant(b_stride_klane, index=True)
                             + intra[ni] * arith.constant(b_stride_nlane, index=True)
                         )
+                        if const_expr(pad_skip_s2 and pad_check):
+                            # this lane's 32 fp4 values start at K = k0*128 + k1*32
+                            k_val = k0 * arith.constant(
+                                128, index=True
+                            ) + k1 * arith.constant(32, index=True)
+                            in_pad = arith.cmpi(
+                                CmpIPredicate.uge,
+                                k_val,
+                                arith.constant(
+                                    int(inter_dim) - int(inter_dim_pad), index=True
+                                ),
+                            )
+                            idx_pack = arith.select(
+                                in_pad,
+                                arith.constant(int(w_nbytes), index=True),
+                                idx_pack,
+                            )
                         b16 = _buffer_load_vec(
                             buffer_ops,
                             rsrc,
@@ -3932,6 +4002,7 @@ def compile_mixed_moe_gemm2_common(
                         b_stride_n0,
                         w_elem_type(),
                         routed_k0_base,
+                        pad_check=True,
                     )
                     if const_expr(is_f8_b):
                         b2, b3 = load_cell(
