@@ -75,7 +75,7 @@ def _l2norm(x):
 
 _k1_prepare_repr = make_kernel_repr(
     "k1_prepare_gluon",
-    ["C", "K", "BC", "IS_VARLEN", "HAS_BIAS"],
+    ["C", "K", "BC", "IS_VARLEN", "HAS_BIAS", "STORE_BETA"],
 )
 
 
@@ -108,11 +108,12 @@ def k1_prepare_gluon(
     HAS_BIAS: gl.constexpr,
     CM_WS: gl.constexpr = "",
     CM_LOAD: gl.constexpr = ".cg",
+    STORE_BETA: gl.constexpr = False,
 ):
     """FlashKDA K1 on gfx950; same workspace contract as the Triton prepare kernel.
 
-    Also writes ``sigmoid(beta)`` to ``ws_beta``, which the Gluon K2 copies into
-    LDS with the chunk's other tiles.
+    With ``STORE_BETA`` also writes ``sigmoid(beta)`` to ``ws_beta``, which the
+    Gluon K2 copies into LDS with the chunk's other tiles.
     """
     gl.static_assert(C == 32 and K == 128)
     NUM_DOUBLING: gl.constexpr = BC.bit_length() - 2
@@ -252,9 +253,10 @@ def k1_prepare_gluon(
             other=0.0,
         ).to(gl.float32)
     )
-    gl.amd.cdna4.buffer_store(
-        b_beta, ws_beta, (ws_idx * C).to(gl.int32) + o_i_r, cache=CM_WS
-    )
+    if STORE_BETA:
+        gl.amd.cdna4.buffer_store(
+            b_beta, ws_beta, (ws_idx * C).to(gl.int32) + o_i_r, cache=CM_WS
+        )
 
     b_gm = b_gcum - b_gp[None, :]
     b_dec = _exp2(b_gm)
@@ -424,6 +426,7 @@ def gluon_k1_prepare(
         BC=BC,
         IS_VARLEN=cu_seqlens is not None,
         HAS_BIAS=dt_bias is not None,
+        STORE_BETA=ws_beta is not None,
         CM_WS=CM_WS,
         CM_LOAD=CM_LOAD,
         num_warps=_NUM_WARPS,

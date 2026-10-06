@@ -165,7 +165,7 @@ def _issue_chunk(
 
 _k2_ab_fused_repr = make_kernel_repr(
     "k2_ab_fused_gluon",
-    ["C", "K", "V", "BW"],
+    ["C", "K", "V", "BW", "NUM_WARPS"],
 )
 
 
@@ -202,6 +202,7 @@ def k2_ab_fused_gluon(
     SH_PLAIN: gl.constexpr,
     SH_1D: gl.constexpr,
     NUM_XCDS: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
 ):
     """Both pass-A recurrences in one launch, sharing every operand load.
 
@@ -235,8 +236,10 @@ def k2_ab_fused_gluon(
     tok_base = gl.load(seg_tok_base + i_seg).to(gl.int64)
     tok_end = gl.load(seg_tok_end + i_seg).to(gl.int64)
 
+    # The launch's warp count, as a constexpr so it can name the kernel.
+    gl.static_assert(NUM_WARPS == gl.num_warps())
     BLK_V: gl.constexpr = gl.BlockedLayout(
-        [1, 8], [64 // (BW // 8), BW // 8], [gl.num_warps(), 1], [1, 0]
+        [1, 8], [64 // (BW // 8), BW // 8], [NUM_WARPS, 1], [1, 0]
     )
     o_c_s = gl.arange(0, C, layout=gl.SliceLayout(1, BLK))
     o_k_s = gl.arange(0, K, layout=gl.SliceLayout(0, BLK))
@@ -244,7 +247,7 @@ def k2_ab_fused_gluon(
     o_c_cc = gl.arange(0, C, layout=gl.SliceLayout(0, BLK_CC))
     o_c_v = gl.arange(0, C, layout=gl.SliceLayout(1, BLK_V))
     o_w_v = i_w * BW + gl.arange(0, BW, layout=gl.SliceLayout(0, BLK_V))
-    NT: gl.constexpr = 64 * gl.num_warps()
+    NT: gl.constexpr = 64 * NUM_WARPS
     gl.static_assert(NT >= K and NT >= C)
     o_t = gl.arange(0, NT, layout=BLK_1D)
     o_c_m = gl.arange(0, C, layout=gl.SliceLayout(1, MMA))
@@ -321,7 +324,18 @@ def k2_ab_fused_gluon(
 
 _k2_c_repr = make_kernel_repr(
     "k2_c_gluon",
-    ["C", "K", "V", "BW", "HAS_H_IN", "STORE_FINAL", "PAGED_CACHE", "PAGED_H_IN"],
+    [
+        "C",
+        "K",
+        "V",
+        "BW",
+        "HAS_H_IN",
+        "STORE_FINAL",
+        "STATE_V_FIRST",
+        "PAGED_CACHE",
+        "PAGED_H_IN",
+        "NUM_WARPS",
+    ],
 )
 
 
@@ -372,6 +386,7 @@ def k2_c_gluon(
     PAGED_H_IN: gl.constexpr,
     CM_OUT: gl.constexpr,
     NUM_XCDS: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
 ):
     """Pass C (the output pass): the recurrence of one segment from its incoming state.
 
@@ -407,8 +422,10 @@ def k2_c_gluon(
     if PAGED_CACHE:
         slot = gl.load(state_indices + i_n).to(gl.int64)
 
+    # The launch's warp count, as a constexpr so it can name the kernel.
+    gl.static_assert(NUM_WARPS == gl.num_warps())
     BLK_V: gl.constexpr = gl.BlockedLayout(
-        [1, 8], [64 // (BW // 8), BW // 8], [gl.num_warps(), 1], [1, 0]
+        [1, 8], [64 // (BW // 8), BW // 8], [NUM_WARPS, 1], [1, 0]
     )
     o_c_s = gl.arange(0, C, layout=gl.SliceLayout(1, BLK))
     o_k_s = gl.arange(0, K, layout=gl.SliceLayout(0, BLK))
@@ -416,7 +433,7 @@ def k2_c_gluon(
     o_c_cc = gl.arange(0, C, layout=gl.SliceLayout(0, BLK_CC))
     o_c_v = gl.arange(0, C, layout=gl.SliceLayout(1, BLK_V))
     o_w_v = i_w * BW + gl.arange(0, BW, layout=gl.SliceLayout(0, BLK_V))
-    NT: gl.constexpr = 64 * gl.num_warps()
+    NT: gl.constexpr = 64 * NUM_WARPS
     gl.static_assert(NT >= K and NT >= C)
     o_t = gl.arange(0, NT, layout=BLK_1D)
     o_c_m = gl.arange(0, C, layout=gl.SliceLayout(1, MMA))

@@ -122,6 +122,7 @@ _K1_FALLBACK_CONFIG = triton.Config({}, num_warps=2, num_stages=1)
     {
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
         "HAS_BIAS": lambda args: args["dt_bias"] is not None,
+        "STORE_BETA": lambda args: args["ws_beta"] is not None,
     }
 )
 @triton.autotune(
@@ -170,6 +171,7 @@ def _flash_kda_prepare_kernel(
     HAS_BIAS: tl.constexpr,
     CM_QKG: tl.constexpr = "",
     CM_WS: tl.constexpr = "",
+    STORE_BETA: tl.constexpr = False,
 ):
     """Per-chunk prepare: decayed q/k, gate total, Mqk, and (I - L)^-1."""
     i_t = tl.program_id(0).to(tl.int64)
@@ -273,7 +275,8 @@ def _flash_kda_prepare_kernel(
     p_beta = beta_raw + (bos + t_off) * H + i_h + o_c * H
     b_beta = tl.sigmoid(tl.load(p_beta, mask=m_c, other=0.0).to(tl.float32))
     # For the Gluon K2, which copies it into LDS with the chunk's other tiles.
-    tl.store(ws_beta + ws_idx * C + o_c, b_beta, cache_modifier=CM_WS)
+    if STORE_BETA:
+        tl.store(ws_beta + ws_idx * C + o_c, b_beta, cache_modifier=CM_WS)
 
     # The intra-chunk matrices need decay *differences* between two rows of the
     # same chunk. Those are O(1) near the diagonal even when each row's decay from
@@ -1153,10 +1156,18 @@ def flash_kda_fwd(
     # read twice per chunk on K2's serial path. The CUTLASS FlashKDA picks fp16
     # here for the same reason.
     ws_inv_mqk = torch.empty(H * total_tiles, 2 * C, C, dtype=torch.float16, device=dev)
-    # sigmoid(beta) per tile, for the Gluon K2.
-    ws_beta = torch.empty(H * total_tiles, C, dtype=torch.float32, device=dev)
-
+    # Gluon covers pass A and pass C; an unsegmented shape runs only pass C.
     use_gluon_k1 = AITER_FDA_USE_GLUON_K1 and _gluon_k1_usable(C, K)
+    use_gluon_k2 = AITER_FDA_USE_GLUON_K2 and _gluon_k2_usable(C, K, V)
+    _log_route(use_gluon_k1, use_gluon_k2, C, K, V)
+    # sigmoid(beta) per tile, which only the Gluon K2 reads; the Triton K2
+    # applies the sigmoid to the raw beta itself.
+    ws_beta = (
+        torch.empty(H * total_tiles, C, dtype=torch.float32, device=dev)
+        if use_gluon_k2
+        else None
+    )
+
     if use_gluon_k1:
         from aiter.ops.triton._gluon_kernels.gfx950.kimi_delta_attn.flash_kda_k1 import (
             gluon_k1_prepare,
@@ -1274,9 +1285,6 @@ def flash_kda_fwd(
         "cache_stride": cache_stride,
     }
 
-    # Gluon covers pass A and pass C; an unsegmented shape runs only pass C.
-    use_gluon_k2 = AITER_FDA_USE_GLUON_K2 and _gluon_k2_usable(C, K, V)
-    _log_route(use_gluon_k1, use_gluon_k2, C, K, V)
     if use_gluon_k2:
         from aiter.ops.triton._gluon_kernels.gfx950.kimi_delta_attn import (
             flash_kda_k2 as _g2,
@@ -1323,6 +1331,7 @@ def flash_kda_fwd(
                 BW=bw,
                 NUM_XCDS=get_num_xcds(),
                 **_g2.build_layouts(nw),
+                NUM_WARPS=nw,
                 num_warps=nw,
                 waves_per_eu=wpe,
             )
@@ -1400,6 +1409,7 @@ def flash_kda_fwd(
             PAGED_H_IN=paged and h_in is None,
             CM_OUT=CM_OUT_STORE,
             NUM_XCDS=get_num_xcds(),
+            NUM_WARPS=nw,
             num_warps=nw,
         )
     else:
