@@ -730,6 +730,10 @@ def test_spec_decode_honours_non_contiguous_index_strides(
         "narrow_conv_cache",
         "zero_sequence_stride",
         "zero_token_stride",
+        "zero_beta_token_stride",
+        "zero_out_gate_token_stride",
+        "empty_spec_row",
+        "single_token_spec_row",
         "short_state_indices",
         "short_accepted_tokens",
         "short_conv_indices",
@@ -753,6 +757,18 @@ def test_spec_decode_rejects_invalid_layout(invalid_layout):
         packed = inp["state_indices"]
         inp["state_indices"] = packed[:, :1].expand_as(packed)
         match = "positive token stride"
+    elif invalid_layout == "zero_beta_token_stride":
+        inp["beta"] = inp["beta"][:, :1].expand_as(inp["beta"])
+        match = "beta must have a positive token stride"
+    elif invalid_layout == "zero_out_gate_token_stride":
+        inp["out_gate"] = inp["out_gate"][:1].expand_as(inp["out_gate"])
+        match = "out_gate must have a positive token stride"
+    elif invalid_layout == "empty_spec_row":
+        inp["state_indices"] = inp["state_indices"][:, :0]
+        match = "at least 2 state-index entries"
+    elif invalid_layout == "single_token_spec_row":
+        inp["state_indices"] = inp["state_indices"][:, :1]
+        match = "at least 2 state-index entries"
     else:
         key, name = {
             "short_state_indices": ("state_indices", "ssm_state_indices"),

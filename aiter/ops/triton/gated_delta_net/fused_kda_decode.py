@@ -105,6 +105,11 @@ def fused_kda_decode(
             raise ValueError(
                 "Spec decode requires 2-D ssm_state_indices and conv_state_indices"
             )
+        if ssm_state_indices.shape[1] < 2:
+            raise ValueError(
+                "Spec decode requires at least 2 state-index entries per sequence, "
+                f"got {ssm_state_indices.shape[1]}"
+            )
         if ssm_state_indices.shape[0] < batch:
             raise ValueError(
                 "ssm_state_indices must cover every sequence: "
@@ -201,6 +206,14 @@ def fused_kda_decode(
 
     stride_beta_tok = beta.stride(1) if beta.dim() == 3 else beta.stride(0)
     stride_og_tok = out_gate.stride(0)
+    if stride_beta_tok <= 0:
+        raise ValueError(
+            f"beta must have a positive token stride, got {stride_beta_tok}"
+        )
+    if stride_og_tok <= 0:
+        raise ValueError(
+            f"out_gate must have a positive token stride, got {stride_og_tok}"
+        )
 
     # Tokens per speculative sequence: num_speculative_tokens + 1. H and this
     # width are not specialized: the parallel kernel indexes heads from
