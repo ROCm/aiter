@@ -251,6 +251,45 @@ def check_launches_shipped_row():
     subprocess.run([sys.executable, os.path.abspath(__file__)], env=env, check=True)
 
 
+def check_flydsl_fallback_keeps_gluon_knobs():
+    original_cfg = pmql.get_paged_mqa_logits_config
+    original_supports = pmql.flydsl_supports
+    original_run = pmql.run_paged_mqa_logits
+    q = torch.empty((1, 1, HEADS, HEAD_DIM), dtype=dtypes.fp8)
+    kv = torch.empty((1, KV_BLOCK_SIZE, 1, HEAD_DIM + 4), dtype=torch.uint8)
+    weights = torch.empty((1, HEADS), dtype=torch.float32)
+    out = torch.empty((1, 64), dtype=torch.float32)
+    lens = torch.ones((1,), dtype=torch.int32)
+    indices = torch.zeros((1, 1), dtype=torch.int32)
+
+    def launch(row):
+        launched = {}
+
+        def spy(config, *args, **kwargs):
+            launched["config"] = dict(config)
+            return args[3]
+
+        pmql.get_paged_mqa_logits_config = lambda *a, **k: dict(row)
+        pmql.flydsl_supports = lambda *a, **k: False
+        pmql.run_paged_mqa_logits = spy
+        pmql.paged_mqa_logits(
+            q, kv, weights, out, lens, indices, 64, True, KV_BLOCK_SIZE
+        )
+        return launched["config"]
+
+    try:
+        assert launch(
+            {"backend": "flydsl", "ChunkK": 128, "WavePerEU": 4, "wg_per_cu": 2}
+        ) == {"backend": "gluon", "ChunkK": 128, "WavePerEU": 4, "wg_per_cu": 0}
+        assert launch(
+            {"backend": "flydsl", "ChunkK": 0, "WavePerEU": 0, "wg_per_cu": 2}
+        ) == dict(pmql.DEFAULT_CONFIG)
+    finally:
+        pmql.get_paged_mqa_logits_config = original_cfg
+        pmql.flydsl_supports = original_supports
+        pmql.run_paged_mqa_logits = original_run
+
+
 def main():
     if os.environ.get(_SHIPPED_ROW_CHILD):
         assert get_gfx() != get_gfx_runtime()
@@ -260,6 +299,7 @@ def main():
         aiter.logger.warning("paged_mqa_logits unsupported on %s; skipping", get_gfx())
         return
     check_launches_shipped_row()
+    check_flydsl_fallback_keeps_gluon_knobs()
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,

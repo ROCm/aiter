@@ -15,7 +15,8 @@ reference, and writes the fastest correct one per shape::
 Context length is not a lookup key (the op cannot read it without a host
 sync), so a shape listed at several ``context_len`` values in the untuned file
 gets the config with the lowest geomean time across them. The tuned row records
-the contexts (``8192;32768``) and that geomean.
+the contexts (``8192;32768``) and that geomean. A FlyDSL winner still stores
+the winning Gluon ``ChunkK`` and ``WavePerEU`` for the op's fallback.
 """
 
 from __future__ import annotations
@@ -270,10 +271,15 @@ class PagedMqaLogitsTuner(TunerCommon):
             f"(best per backend {per_backend})",
             flush=True,
         )
+        chosen = dict(configs[pick])
+        if chosen["backend"] == "flydsl" and "gluon" in best:
+            gluon = configs[best["gluon"]]
+            chosen["ChunkK"] = gluon["ChunkK"]
+            chosen["WavePerEU"] = gluon["WavePerEU"]
         return {
             **{k: row[k] for k in LOOKUP_KEYS},
             "context_len": row["context_len"],
-            **configs[pick],
+            **chosen,
             "us": round(scores[pick], 2),
             "gluon_us": per_backend.get("gluon", pd.NA),
             "flydsl_us": per_backend.get("flydsl", pd.NA),

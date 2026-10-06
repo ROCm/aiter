@@ -13,7 +13,9 @@ Rows are keyed on ``(gfx, cu_num, batch_size, next_n, heads, head_dim,
 kv_block_size, preshuffle)``: everything a decode CUDA graph fixes at capture.
 Context length is not a key because reading it would need a host sync. A
 batch size with no row uses the row of the largest tuned batch size below it;
-a shape with no row at all uses Gluon with ``ChunkK=256, WavePerEU=2``.
+a shape with no row at all uses Gluon with ``ChunkK=256, WavePerEU=2``. A
+FlyDSL row the kernel cannot run uses that row's Gluon knobs, and those
+defaults when the row stored zeros.
 """
 
 from __future__ import annotations
@@ -269,7 +271,13 @@ def paged_mqa_logits(
     if config["backend"] == "flydsl" and not flydsl_supports(
         q_fp8, kv_cache, weights, Preshuffle, KVBlockSize
     ):
-        config = dict(DEFAULT_CONFIG)
+        # 0 means this FlyDSL row has no stored Gluon candidate.
+        config = {
+            "backend": "gluon",
+            "ChunkK": config["ChunkK"] or DEFAULT_CONFIG["ChunkK"],
+            "WavePerEU": config["WavePerEU"] or DEFAULT_CONFIG["WavePerEU"],
+            "wg_per_cu": 0,
+        }
     return run_paged_mqa_logits(
         config,
         q_fp8,
