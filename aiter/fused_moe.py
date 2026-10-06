@@ -271,8 +271,6 @@ def _fused_decode_sort_quant(
     )
 
 
-
-
 # Optional hook for collecting per-stage benchmark callables.
 kernel_bench_callable = None
 
