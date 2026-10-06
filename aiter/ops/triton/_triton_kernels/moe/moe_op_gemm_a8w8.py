@@ -148,6 +148,8 @@ def _moe_gemm_a8w8(
     X_static_scale,
     W_static_scale,
     Quant_static_scale,
+    X_token_scale,
+    W_expt_scale,
     B,
     stride_b_e,  # Bias
     Gammas,
@@ -288,6 +290,11 @@ def _moe_gemm_a8w8(
         GatherIndx += start_m
         # no needs to bounds-check here because `offs_x_m` wraps around M dim
         offs_x_m = tl.load(GatherIndx + offs_x_m) // N_EXPTS_ACT
+    if X_token_scale is not None:
+        if GatherIndx is None:
+            offs_x_scale_m = start_m + offs_x_m
+        else:
+            offs_x_scale_m = offs_x_m
     offs_x_k = BLOCK_K * pid_k + tl.arange(0, BLOCK_K)
     XPtrs = (
         X
@@ -371,32 +378,42 @@ def _moe_gemm_a8w8(
         if USE_FNUZ:
             # fnuz path (gfx942): manual E8M0→fp32, then tl.dot.
             # x_scales: [BLOCK_M, MX_SCALE_BLOCK_K], w_scales: [BLOCK_N, MX_SCALE_BLOCK_K]
-            a_f32 = x.to(tl.float32)
-            b_f32 = w.to(tl.float32)
             a_sc = (x_scales.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
             b_sc = (w_scales.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
-            # broadcast each block-scale across its MX_PACK_DIVISOR elements.
-            # a_sc: [BLOCK_M, MX_SCALE_BLOCK_K] → a_sc_full: [BLOCK_M, BLOCK_K]
-            # b_sc: [BLOCK_N, MX_SCALE_BLOCK_K], w layout is [K, N] so we need
-            # b_sc_full transposed: [BLOCK_K, BLOCK_N]
-            a_sc_full = tl.reshape(
-                tl.broadcast_to(
-                    a_sc[:, :, None], (BLOCK_M, MX_SCALE_BLOCK_K, MX_PACK_DIVISOR)
-                ),
-                (BLOCK_M, BLOCK_K),
-            )
-            b_sc_t = tl.reshape(
-                tl.broadcast_to(
-                    b_sc[:, :, None], (BLOCK_N, MX_SCALE_BLOCK_K, MX_PACK_DIVISOR)
-                ),
-                (BLOCK_N, BLOCK_K),
-            )
-            b_sc_full = tl.trans(b_sc_t)  # [BLOCK_K, BLOCK_N]
-            acc += tl.dot(
-                a_f32 * a_sc_full,
-                b_f32 * b_sc_full,
-                input_precision="ieee",
-            )
+            if MX_SCALE_BLOCK_K == 1:
+                # One scale per operand per K-step, so it is constant across the
+                # dot: scaling the result is equivalent to scaling the operands,
+                # and the MFMA stays FP8 instead of being promoted to FP32.
+                acc += (
+                    tl.dot(x, w, input_precision="ieee")
+                    * tl.reshape(a_sc, (BLOCK_M, 1))
+                    * tl.reshape(b_sc, (1, BLOCK_N))
+                )
+            else:
+                # Broadcast each block-scale across its MX_PACK_DIVISOR elements.
+                # a_sc: [BLOCK_M, MX_SCALE_BLOCK_K] -> [BLOCK_M, BLOCK_K]
+                # b_sc: [BLOCK_N, MX_SCALE_BLOCK_K]; w is [K, N], so b_sc_full
+                # is transposed to [BLOCK_K, BLOCK_N].
+                a_f32 = x.to(tl.float32)
+                b_f32 = w.to(tl.float32)
+                a_sc_full = tl.reshape(
+                    tl.broadcast_to(
+                        a_sc[:, :, None], (BLOCK_M, MX_SCALE_BLOCK_K, MX_PACK_DIVISOR)
+                    ),
+                    (BLOCK_M, BLOCK_K),
+                )
+                b_sc_t = tl.reshape(
+                    tl.broadcast_to(
+                        b_sc[:, :, None], (BLOCK_N, MX_SCALE_BLOCK_K, MX_PACK_DIVISOR)
+                    ),
+                    (BLOCK_N, BLOCK_K),
+                )
+                b_sc_full = tl.trans(b_sc_t)  # [BLOCK_K, BLOCK_N]
+                acc += tl.dot(
+                    a_f32 * a_sc_full,
+                    b_f32 * b_sc_full,
+                    input_precision="ieee",
+                )
         else:
             acc = tl.dot_scaled(
                 x, x_scales, "e4m3", w, w_scales, "e4m3", acc=acc, fast_math=True
@@ -440,27 +457,36 @@ def _moe_gemm_a8w8(
             w_scales = tl.full((BLOCK_N, MX_SCALE_BLOCK_K), 127, dtype=tl.uint8)
 
         if USE_FNUZ:
-            a_f32 = x.to(tl.float32)
-            b_f32 = w.to(tl.float32)
             a_sc = (x_scales.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
             b_sc = (w_scales.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
-            a_sc_full = tl.reshape(
-                tl.broadcast_to(
-                    a_sc[:, :, None], (BLOCK_M, MX_SCALE_BLOCK_K, MX_PACK_DIVISOR)
-                ),
-                (BLOCK_M, BLOCK_K),
-            )
-            b_sc_full = tl.reshape(
-                tl.broadcast_to(
-                    b_sc[:, None, :], (BLOCK_N, MX_PACK_DIVISOR, MX_SCALE_BLOCK_K)
-                ),
-                (BLOCK_N, BLOCK_K),
-            )
-            acc += tl.dot(
-                a_f32 * a_sc_full,
-                tl.trans(b_f32 * b_sc_full),
-                input_precision="ieee",
-            )
+            if MX_SCALE_BLOCK_K == 1:
+                # Same accumulator-side scaling as the EVEN_K branch above.
+                acc += (
+                    tl.dot(x, w, input_precision="ieee")
+                    * tl.reshape(a_sc, (BLOCK_M, 1))
+                    * tl.reshape(b_sc, (1, BLOCK_N))
+                )
+            else:
+                a_f32 = x.to(tl.float32)
+                b_f32 = w.to(tl.float32)
+                a_sc_full = tl.reshape(
+                    tl.broadcast_to(
+                        a_sc[:, :, None], (BLOCK_M, MX_SCALE_BLOCK_K, MX_PACK_DIVISOR)
+                    ),
+                    (BLOCK_M, BLOCK_K),
+                )
+                b_sc_t = tl.reshape(
+                    tl.broadcast_to(
+                        b_sc[:, :, None], (BLOCK_N, MX_SCALE_BLOCK_K, MX_PACK_DIVISOR)
+                    ),
+                    (BLOCK_N, BLOCK_K),
+                )
+                b_sc_full = tl.trans(b_sc_t)  # [BLOCK_K, BLOCK_N]
+                acc += tl.dot(
+                    a_f32 * a_sc_full,
+                    b_f32 * b_sc_full,
+                    input_precision="ieee",
+                )
         else:
             acc = tl.dot_scaled(
                 x, x_scales, "e4m3", w, w_scales, "e4m3", acc=acc, fast_math=True
@@ -471,6 +497,12 @@ def _moe_gemm_a8w8(
         acc = acc * tl.load(X_static_scale)
     if W_static_scale is not None:
         acc = acc * tl.load(W_static_scale)
+    # per-token / per-expert fp8 scales
+    if X_token_scale is not None:
+        x_token_sc = tl.load(X_token_scale + offs_x_scale_m.to(index_type))
+        acc = acc * x_token_sc[:, None]
+    if W_expt_scale is not None:
+        acc = acc * tl.load(W_expt_scale + expt_id)
     # bias
     offs_m = BLOCK_M * block_id + tl.arange(0, BLOCK_M)
     offs_y_n = BLOCK_N * pid_n + tl.arange(0, BLOCK_N)
