@@ -33,7 +33,6 @@ namespace py = pybind11;
         .value("Swiglu", ActivationType::Swiglu)                                            \
         .value("Situv2", ActivationType::Situv2)                                            \
         .value("GeluTanh", ActivationType::GeluTanh)                                        \
-        .value("Relu2", ActivationType::Relu2)                                              \
         .export_values();                                                                   \
     pybind11::enum_<MlaVersion>(m, "MlaVersion")                                            \
         .value("V32", MlaVersion::V32)                                                      \
@@ -1821,7 +1820,8 @@ namespace py = pybind11;
           py::arg("rope_dim"),                                                               \
           py::arg("group_size")    = 32,                                                     \
           py::arg("shuffle_scale") = true,                                                   \
-          py::arg("do_rotate_act") = true);                                                  \
+          py::arg("do_rotate_act") = true,                                                   \
+          py::arg("round_rope")    = false);                                                 \
     m.def("rope_rotate_activation",                                                          \
           &aiter::rope_rotate_activation,                                                    \
           py::arg("out"),                                                                    \
