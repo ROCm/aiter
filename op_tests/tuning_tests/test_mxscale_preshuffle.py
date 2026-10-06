@@ -172,6 +172,28 @@ def test_rejects_unknown_dtype():
     raise AssertionError("unknown a_dtype must be rejected")
 
 
+def test_per_1x32_rejects_blockscale_tile_m():
+    dummy = torch.empty(0)
+    out = torch.empty((16, 128), dtype=torch.bfloat16)
+    try:
+        gemm_mxscale_preshuffle(
+            dummy,
+            dummy,
+            dummy,
+            dummy,
+            out,
+            a_dtype="fp8",
+            b_dtype="fp8",
+            tile_m=16,
+            tile_n=128,
+            tile_k=256,
+        )
+    except ValueError as err:
+        assert "multiple of 32" in str(err)
+        return
+    raise AssertionError("tile_m=16 must be rejected on the per-1x32 path")
+
+
 def test_rejects_unshuffled_scale_nbytes():
     M, N, K = 32, 64, 256
     A = torch.empty((M, K), dtype=torch.uint8)

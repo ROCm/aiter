@@ -555,6 +555,12 @@ def gemm_mxscale_preshuffle(
             if split_k is None:
                 split_k = instance.split_k
 
+    if int(tile_m) % 32 != 0:
+        raise ValueError(
+            f"per-1x32 MX preshuffle requires tile_m ({tile_m}) to be a "
+            "multiple of 32; tile_m=16 is the coarse blockscale specialization"
+        )
+
     expected_a_scale = _mx_scale_nbytes(M, K)
     expected_b_scale = _mx_scale_nbytes(N, K)
     if a_scale.numel() * a_scale.element_size() != expected_a_scale:
