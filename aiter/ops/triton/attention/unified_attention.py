@@ -255,12 +255,22 @@ def unified_attention(
             "Unified Attention with pre-shuffled KV cache requires a power-of-2 "
             f"page, got block_size={block_size}"
         )
+        # The shuffled kernels lay V out with HEAD_SIZE, and a shuffled v does not
+        # expose its head size as the last dim, so compare per-page element counts.
+        assert k.shape[1:].numel() == v.shape[1:].numel(), (
+            "Unified Attention with pre-shuffled KV cache requires the value head "
+            "size to match the query/key head size"
+        )
 
     num_seqs = len(seqused_k)
     num_queries_per_kv = num_query_heads // num_kv_heads
     # only the plain layout exposes v's head size as its last dimension; a
     # shuffled value cache carries the vectorization width there instead.
     head_size_v = head_size if shuffled_kv_cache else v.shape[-1]
+    assert out.shape[-1] == head_size_v, (
+        f"out last dim must be the value head size {head_size_v}, "
+        f"got {out.shape[-1]}"
+    )
 
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)

@@ -867,3 +867,70 @@ def test_triton_unified_attn_asym_head(
         )
         <= tol_err_ratio
     )
+
+
+@pytest.mark.parametrize("case", ["shuffled_kv_cache", "out_qk_width"])
+@torch.inference_mode()
+def test_triton_unified_attn_asym_head_guards(case: str) -> None:
+    head_size, v_head_size = 192, 128
+    (
+        query,
+        _key_cache_orig,
+        _value_cache_orig,
+        key_cache,
+        value_cache,
+        sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        _maybe_quant_query,
+        _query_scales,
+        _q_descale,
+        _k_descale,
+        _v_descale,
+        _output_scale,
+    ) = generate_data(
+        seq_lens=[(1, 523)],
+        num_blocks=64,
+        block_size=64,
+        head_size=head_size,
+        v_head_size=v_head_size,
+        num_heads=(8, 1),
+        device="cuda",
+    )
+    shuffled = case == "shuffled_kv_cache"
+    if shuffled:
+        # shuffle_kv_cache wants matching heads, so shuffle k and v on their own
+        key_cache = shuffle_kv_cache(key_cache, key_cache)[0]
+        value_cache = shuffle_kv_cache(value_cache, value_cache)[1]
+    else:
+        # the old convention: out sized by the qk head
+        output = output.new_empty((*output.shape[:-1], head_size))
+
+    with pytest.raises(AssertionError, match="value head size"):
+        unified_attention(
+            q=query,
+            k=key_cache,
+            v=value_cache,
+            out=output,
+            cu_seqlens_q=cu_query_lens,
+            seqused_k=kv_lens,
+            max_seqlen_q=max_query_len,
+            max_seqlen_k=max_kv_len,
+            softmax_scale=scale,
+            causal=True,
+            window_size=window_size,
+            block_table=block_tables,
+            softcap=0,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
+            sinks=sinks,
+            shuffled_kv_cache=shuffled,
+            backend="triton",
+        )
