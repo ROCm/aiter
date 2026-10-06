@@ -1,1 +1,1 @@
-batch_size,next_n,heads,head_dim,kv_block_size,preshuffle,context_len
+batch_size,next_n,heads,head_dim,kv_block_size,preshuffle
