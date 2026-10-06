@@ -240,7 +240,7 @@ def build_glm5_monokernel(
     N_SPLIT = topk // SPLIT_KEYS
     QB_ROWS = H * (NOPE_DIM + PE_DIM)
     N_QB = QB_ROWS // Q_B_TILE
-    assert not with_indexer or (INDEX_Q_ROWS // INDEX_TILE == G and N_QB * 2 == G)
+    assert not with_indexer or (INDEX_Q_ROWS // INDEX_TILE == G and N_QB in (G // 2, G))
     QB_PER_HEAD = (NOPE_DIM + PE_DIM) // Q_B_TILE
     N_UK = H * KV_LORA // UK_TILE
     UK_PER_HEAD = KV_LORA // UK_TILE
@@ -2480,6 +2480,7 @@ def build_glm5_monokernel(
                                     cache_modifier=CM_DEV,
                                 )
                             )
+                        lds_st(attn_keys, lane, idx)
                     elif const_expr(use_atom_kv_cache):
                         idx = fx.Int32(0)
                         if sparse:
