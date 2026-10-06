@@ -278,6 +278,9 @@ _sparse_attn_prefill_kernel_repr = make_kernel_repr(
         "BLOCK_H",
         "BLOCK_D",
         "BLOCK_K",
+        "HAS_INVALID",
+        "USE_EXP2",
+        "EVEN_HD",
     ],
 )
 

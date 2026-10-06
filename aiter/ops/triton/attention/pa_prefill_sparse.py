@@ -18,6 +18,8 @@ take a 1-D ``(kv_indices, kv_indptr)`` pair over one pool.
     else    -> triton ``_sparse_attn_prefill_kernel`` (single source)
 """
 
+import functools
+
 import torch
 import triton
 
@@ -32,10 +34,30 @@ from aiter.ops.triton.gluon.mla_gluon import (
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.tuned_config_utils import get_tuned_kernel_config
 
 DEVICE_ARCH = arch_info.get_arch()
 
 _LOGGER = AiterTritonLogger()
+
+
+# Returned by the lookup where nothing is published for the device and shape.
+_NO_PINNED_CONFIG = triton.Config({})
+
+
+@functools.lru_cache
+def _pinned_prefill_config(num_heads: int, head_dim: int) -> triton.Config | None:
+    """Published single-source prefill tile for this device and shape, if any.
+
+    Shapes without an entry return None and use the autotuned launch.
+    """
+    cfg = get_tuned_kernel_config(
+        "attention",
+        "SPARSE_ATTENTION_DSV4",
+        f"_sparse_attn_prefill_kernel_H{num_heads}_D{head_dim}",
+        fallback=_NO_PINNED_CONFIG,
+    )
+    return None if cfg is _NO_PINNED_CONFIG else cfg
 
 
 def pa_prefill_sparse(
@@ -85,6 +107,11 @@ def pa_prefill_sparse(
         assert (
             out.shape == q.shape and out.dtype == q.dtype
         ), f"out {tuple(out.shape)} {out.dtype} != q {tuple(q.shape)} {q.dtype}"
+        assert out.device == q.device, f"out on {out.device}, q on {q.device}"
+        # gfx950 writes the last dim with unit stride regardless of out.stride(2).
+        assert (
+            out.stride(-1) == 1
+        ), f"out last dim must be contiguous, got {out.stride()}"
     if DEVICE_ARCH == "gfx1250":
         if not q.is_cuda:
             raise RuntimeError("pa_prefill_sparse requires CUDA/HIP tensors")
@@ -212,6 +239,9 @@ def pa_prefill_sparse(
             kv_indices_extend,
             kv_indptr_extend,
         )
+        if not softmax_scale > 0:
+            # The kernel scales after the row max, which needs a positive scale.
+            raise ValueError(f"softmax_scale must be > 0, got {softmax_scale}")
         has_attn_sink = attn_sink is not None
         if has_attn_sink:
             attn_sink = attn_sink.contiguous()
@@ -240,30 +270,29 @@ def pa_prefill_sparse(
             float(softmax_scale),
         )
 
-        if DEVICE_ARCH == "gfx942" and num_heads in (8, 16) and head_dim == 512:
-            # Fixed config from a sweep on Triton 3.7.1 at D=512: 2.4-2.9x over
-            # the autotune default for H in {8, 16} and 32-640 slots per query
-            # (production: DSv4.1-Flash TP4, H=16, top-512 + 128 SWA). One wave
-            # per program puts 4 programs on a CU; kpack=2 halves the LDS
-            # operand reads and frees the registers that make 2 stages pay.
-            # Other shapes stay on autotune.
-            block_h = 16
+        pinned = (
+            _pinned_prefill_config(num_heads, head_dim)
+            if DEVICE_ARCH == "gfx942"
+            else None
+        )
+        if pinned is not None:
+            # Published per-shape tile (configs/gfx942/.../sparse_attention_dsv4).
+            block_h = pinned.kwargs["BLOCK_H"]
             _sparse_attn_prefill_kernel.fn[
                 (num_queries, triton.cdiv(num_heads, block_h))
             ](
                 *args,
                 HAS_ATTN_SINK=has_attn_sink,
-                BLOCK_H=block_h,
                 BLOCK_D=block_d,
-                BLOCK_K=16,
                 HAS_INVALID=True if has_invalid is None else has_invalid,
                 USE_EXP2=True,
-                EVEN_HD=block_d == head_dim and num_heads % block_h == 0,
-                num_warps=1,
-                num_stages=2,
-                waves_per_eu=1,
-                matrix_instr_nonkdim=16,
-                kpack=2,
+                # The unmasked gather redirects bad slots to row 0, which must exist.
+                EVEN_HD=block_d == head_dim
+                and num_heads % block_h == 0
+                and unified_kv.shape[0] > 0,
+                num_warps=pinned.num_warps,
+                num_stages=pinned.num_stages,
+                **pinned.kwargs,
             )
             return out
 

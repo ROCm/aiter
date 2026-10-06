@@ -607,3 +607,49 @@ def test_pa_prefill_sparse_broken_has_invalid_promise_stays_in_bounds(H):
     )
     torch.cuda.synchronize()
     assert torch.isfinite(out).all()
+
+
+def _triton_branch_only():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    if DEVICE_ARCH in ("gfx950", "gfx1250"):
+        pytest.skip("covers the Triton single-source branch")
+
+
+# An empty pool leaves nothing to gather: every query gets the sink-only (zero) output.
+@pytest.mark.parametrize("H", [8, 16])
+def test_pa_prefill_sparse_empty_kv_pool(H):
+    _triton_branch_only()
+    T, D, dev = 64, 512, "cuda"
+    q = torch.randn(T, H, D, dtype=torch.bfloat16, device=dev)
+    kv = torch.empty(0, D, dtype=torch.bfloat16, device=dev)
+    indptr = torch.arange(0, (T + 1) * 16, 16, dtype=torch.int32, device=dev)
+    indices = torch.full((T * 16,), -1, dtype=torch.int32, device=dev)
+    sink = torch.randn(H, dtype=torch.float32, device=dev)
+    out = pa_prefill_sparse(q, kv, indices, indptr, None, None, None, sink, D**-0.5)
+    torch.cuda.synchronize()
+    assert torch.equal(out, torch.zeros_like(out))
+
+
+@pytest.mark.parametrize("scale", [0.0, -0.1])
+def test_pa_prefill_sparse_rejects_non_positive_scale(scale):
+    _triton_branch_only()
+    q = torch.randn(4, 16, 512, dtype=torch.bfloat16, device="cuda")
+    kv = torch.randn(8, 512, dtype=torch.bfloat16, device="cuda")
+    indptr = torch.arange(0, 5, dtype=torch.int32, device="cuda")
+    indices = torch.zeros(4, dtype=torch.int32, device="cuda")
+    with pytest.raises(ValueError, match="softmax_scale"):
+        pa_prefill_sparse(q, kv, indices, indptr, None, None, None, None, scale)
+
+
+def test_pa_prefill_sparse_rejects_strided_out():
+    _triton_branch_only()
+    q = torch.randn(4, 16, 512, dtype=torch.bfloat16, device="cuda")
+    kv = torch.randn(8, 512, dtype=torch.bfloat16, device="cuda")
+    indptr = torch.arange(0, 5, dtype=torch.int32, device="cuda")
+    indices = torch.zeros(4, dtype=torch.int32, device="cuda")
+    out = torch.empty(4, 512, 16, dtype=torch.bfloat16, device="cuda").transpose(1, 2)
+    with pytest.raises(AssertionError, match="last dim"):
+        pa_prefill_sparse(
+            q, kv, indices, indptr, None, None, None, None, 512**-0.5, out=out
+        )

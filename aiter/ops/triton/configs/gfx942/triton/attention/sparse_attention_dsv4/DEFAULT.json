@@ -1,0 +1,20 @@
+{
+    "_sparse_attn_prefill_kernel_H8_D512": {
+        "BLOCK_H": 16,
+        "BLOCK_K": 16,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 2,
+        "num_warps": 1,
+        "num_stages": 2
+    },
+    "_sparse_attn_prefill_kernel_H16_D512": {
+        "BLOCK_H": 16,
+        "BLOCK_K": 16,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 2,
+        "num_warps": 1,
+        "num_stages": 2
+    }
+}
