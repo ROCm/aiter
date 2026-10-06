@@ -22,7 +22,7 @@ from aiter.dist.parallel_state import (
     set_custom_all_reduce,
 )
 from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
-from aiter.test_common import benchmark, checkAllclose, perftest
+from aiter.test_common import checkAllclose, perftest
 
 logger = logging.getLogger("aiter")
 
@@ -44,14 +44,68 @@ def barrier_before_teardown():
     torch.cuda.synchronize()
 
 
-def allreduce_custom(
+def _run_allreduce_case(rankID, tp_size, case_idx, shape, dtype, withGraph, graphs):
+    """All-reduce one shape on an initialized rank and check it against the
+    sum of every rank's input.
+
+    Each rank regenerates all ``tp_size`` inputs from the same ``case_idx``
+    seed and keeps its own, so the reference is available locally and only
+    scalars go back to the parent. In graph mode the captured graph and its
+    buffers are appended to ``graphs`` and must outlive the whole sweep:
+    custom all-reduce caches the peer IPC address of every captured buffer by
+    its local pointer, so freeing one and capturing a later shape at the
+    same address would replay with stale peer pointers. A model keeps all
+    its captured graphs alive the same way.
+    """
+    gen = torch.Generator(device="cuda").manual_seed(case_idx)
+    ref = torch.zeros(shape, dtype=dtype, device="cuda")
+    for rank in range(tp_size):
+        xr = torch.randn(shape, dtype=dtype, device="cuda", generator=gen)
+        ref += xr
+        if rank == rankID:
+            x = xr
+
+    if withGraph:
+        graph = torch.cuda.CUDAGraph()
+        with graph_capture() as gc, torch.cuda.graph(graph, stream=gc.stream):
+            out = tensor_model_parallel_all_reduce(x)
+        out.fill_(0)
+        graphs.append((graph, x, out))
+
+        @perftest()
+        def run_ca():
+            graph.replay()
+
+        _, us = run_ca()
+    else:
+
+        @perftest()
+        def run_ca(x):
+            return tensor_model_parallel_all_reduce(x)
+
+        out, us = run_ca(x)
+
+    msg = (
+        f"test_allreduce_custom: rank={rankID} {shape=} {dtype=} {withGraph=} "
+        f"{us:>8.2f}"
+    )
+    return {"us": us, "err": checkAllclose(ref, out, msg=msg)}
+
+
+def allreduce_custom_sweep(
     tp_size,
     pp_size,
     rankID,
-    x,
+    shapes,
+    dtype,
     withGraph=False,
     distributed_init_method: str | None = None,
 ):
+    """Run every shape on one rank inside a single distributed init.
+
+    Setting up the TP group dominates a single shape (~30 s at TP8 vs.
+    microseconds of kernel time), so the group is created and torn down once.
+    """
     device = torch.device(f"cuda:{rankID}")
     torch.cuda.set_device(device)
     # init
@@ -63,80 +117,57 @@ def allreduce_custom(
         distributed_init_method=distributed_init_method,
     )
     ensure_model_parallel_initialized(tp_size, pp_size)
-    x = x.to(device)
-    # dist.barrier(device_ids=[i for i in range(tp_size)])
 
     # warmup and align all gpu
     group = get_tp_group().device_group
     dist.all_reduce(torch.zeros(1).cuda(), group=group)
     torch.cuda.synchronize()
 
-    if withGraph:
-        graph = torch.cuda.CUDAGraph()
-        with graph_capture() as gc, torch.cuda.graph(graph, stream=gc.stream):
-            out = tensor_model_parallel_all_reduce(x)
-        out.fill_(0)
-
-        @perftest()
-        def run_ca():
-            graph.replay()
-
-        _, us = run_ca()
-        out = (out, us)
-    else:
-
-        @perftest()
-        def run_ca(x):
-            return tensor_model_parallel_all_reduce(x)
-
-        out = run_ca(x)
+    graphs = []
+    results = [
+        _run_allreduce_case(rankID, tp_size, case_idx, shape, dtype, withGraph, graphs)
+        for case_idx, shape in enumerate(shapes)
+    ]
 
     # destroy
     if dist.is_initialized():
         barrier_before_teardown()
         destroy_model_parallel()
         destroy_distributed_environment()
+        graphs.clear()
         torch.cuda.empty_cache()
-    return out
+    return results
 
 
-@benchmark()
-def test_allreduce_custom(
-    tp_size,
-    pp_size,
-    shape,
-    dtype,
-    withGraph=False,
-    distributed_init_method: str | None = None,
-):
+def test_allreduce_custom(tp_size, pp_size, shapes, dtype, withGraph=False):
+    """Sweep ``shapes`` on one TP group and return one summary row per shape."""
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"
-    pool = Pool(processes=tp_size)
-    ref = torch.zeros(shape, dtype=dtype)
-    rets = []
-    for i in range(tp_size):
-        x = torch.randn(shape, dtype=dtype)
-        ref += x
-        rets.append(
+    init_method = get_distributed_init_method(get_ip(), get_open_port())
+    with Pool(processes=tp_size) as pool:
+        rets = [
             pool.apply_async(
-                allreduce_custom,
-                args=(tp_size, pp_size, i, x, withGraph, distributed_init_method),
+                allreduce_custom_sweep,
+                args=(tp_size, pp_size, rank, shapes, dtype, withGraph, init_method),
             )
+            for rank in range(tp_size)
+        ]
+        per_rank = [el.get() for el in rets]
+    rows = []
+    for i, shape in enumerate(shapes):
+        all_us = [results[i]["us"] for results in per_rank]
+        rows.append(
+            {
+                "tp_size": tp_size,
+                "shape": shape,
+                "dtype": dtype,
+                "withGraph": withGraph,
+                "min_us": min(all_us),
+                "max_us": max(all_us),
+                "err": max(results[i]["err"] for results in per_rank),
+            }
         )
-    pool.close()
-    pool.join()
-    rets = [el.get() for el in rets]
-    all_us = [us for _, us in rets]
-    max_err = 0.0
-    for out, us in rets:
-        msg = f"test_allreduce_custom: {shape=} {dtype=} {withGraph=} {us:>8.2f}"
-        err = checkAllclose(ref, out.to(ref), msg=msg)
-        max_err = max(max_err, err)
-    return {
-        "min_us": min(all_us),
-        "max_us": max(all_us),
-        "err": max_err,
-    }
+    return rows
 
 
 def _allreduce_tail_regression(
@@ -362,20 +393,9 @@ if __name__ == "__main__":
         l_shape = [args.shape]
     else:
         l_shape = gen_sizes(dtype)
-    df = []
-    for shape in l_shape:
-        ret = test_allreduce_custom(
-            args.tp_size,
-            1,
-            shape,
-            dtype,
-            withGraph=with_graph,
-            distributed_init_method=get_distributed_init_method(
-                get_ip(), get_open_port()
-            ),
-        )
-        df.append(ret)
-    df = pd.DataFrame(df)
+    df = pd.DataFrame(
+        test_allreduce_custom(args.tp_size, 1, l_shape, dtype, withGraph=with_graph)
+    )
     show_cols = [
         "tp_size",
         "shape",
