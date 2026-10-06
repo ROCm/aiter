@@ -5,6 +5,7 @@
 #include "aiter_tensor.h"
 #include "aiter_stream.h"
 #include "hip_reduce.h"
+#include "opus/opus.hpp"
 #include <hipcub/hipcub.hpp>
 #include <hipcub/util_type.hpp>
 
@@ -1960,7 +1961,12 @@ vectorized_process_stage_masks_exact_32768(T const* in, bool select_min)
 template <int ctrl, int row_mask, int bank_mask>
 __device__ __forceinline__ int dpp_add(int x)
 {
-    return x + __builtin_amdgcn_update_dpp(0, x, ctrl, row_mask, bank_mask, false);
+    return x + opus::upd_dpp(0,
+                             x,
+                             opus::number<ctrl>{},
+                             opus::number<row_mask>{},
+                             opus::number<bank_mask>{},
+                             opus::bool_constant<false>{});
 }
 
 // Inclusive add-scan across one wave64, the GCN row_shr/row_bcast sequence.
@@ -1982,9 +1988,12 @@ __device__ __forceinline__ int wave_inclusive_sum_dpp(int x)
 template <int ctrl, int row_mask, int bank_mask>
 __device__ __forceinline__ uint32_t dpp_add_u32(uint32_t x)
 {
-    uint32_t const moved = static_cast<uint32_t>(
-        __builtin_amdgcn_update_dpp(0, static_cast<int>(x), ctrl, row_mask, bank_mask, false));
-    return x + moved;
+    return x + opus::upd_dpp(0u,
+                             x,
+                             opus::number<ctrl>{},
+                             opus::number<row_mask>{},
+                             opus::number<bank_mask>{},
+                             opus::bool_constant<false>{});
 }
 
 __device__ __forceinline__ uint32_t wave_inclusive_sum_dpp_u32(uint32_t x)
@@ -5218,8 +5227,8 @@ __device__ __forceinline__ bool lds_tail_sampled_stage_n(T const* in,
                 }
             }
         }
-        below += __builtin_amdgcn_update_dpp(0, below, 0xb1, 0xf, 0xf, false); // quad_perm:[1,0,3,2]
-        below += __builtin_amdgcn_update_dpp(0, below, 0x4e, 0xf, 0xf, false); // quad_perm:[2,3,0,1]
+        below = dpp_add<0xb1, 0xf, 0xf>(below); // quad_perm:[1,0,3,2]
+        below = dpp_add<0x4e, 0xf, 0xf>(below); // quad_perm:[2,3,0,1]
         if(part == 0 && i < cross_count && below < k - before)
             __builtin_nontemporal_store(candidate_indices[i], out_idx + before + below);
     }
