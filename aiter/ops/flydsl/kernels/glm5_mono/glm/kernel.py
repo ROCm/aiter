@@ -187,6 +187,12 @@ def build_glm5_monokernel(
     uv_scale_rows: int = 128,
     native_fp4_mfma: bool = False,
     timeline: bool = False,
+    index_paged: bool = False,
+    index_block_size: int = 64,
+    index_block_bytes: int = 0,
+    index_shuffled: bool = False,
+    block_table_stride: int = 0,
+    index_k_bf16: bool = False,
 ):
     """Return the ``@flyc.jit`` launcher for one rank's whole layer.
 
@@ -194,6 +200,15 @@ def build_glm5_monokernel(
     every task, and once its inputs have arrived, into the ``timeline`` buffer:
     int64 ``[sum(task counts), TL_COLS]`` (start, hint seen, inputs staged, compute
     done, end, then free debug marks) in ``stage_tasks`` order.
+
+    ``index_paged=True`` keeps the index keys in vLLM's paged FP8 cache: per
+    block, ``index_block_size x 128`` E4M3 values (``index_shuffled``: 16-token x
+    16-byte tiles) followed by one power-of-two f32 scale per token, with blocks
+    ``index_block_bytes`` apart.  Every row is its own request: ``req_ids`` picks
+    its ``block_table`` row (``block_table_stride`` entries), keys cover
+    positions ``0 .. positions[s]``, and the top-k is published as global cache
+    slots to ``out_indices`` at the row's ``sparse_kv_indptr`` offset.
+    ``index_k_bf16`` reads the index K projection as packed bf16.
     """
     assert uv_scale_rows in (64, 128)
     assert heads % WAVES == 0, "split attention maps one local head to each wave"
@@ -217,6 +232,14 @@ def build_glm5_monokernel(
     assert not (
         attention_bf16 and with_indexer
     ), "BF16 attention uses the external indexer"
+    assert not index_paged or (
+        with_indexer
+        and use_atom_kv_cache
+        and block_table_stride > 0
+        and index_block_bytes >= index_block_size * (INDEX_DIM + 4)
+        and index_block_bytes % 4 == 0
+        and (not index_shuffled or index_block_size % 16 == 0)
+    )
     H = heads
     L = H if output_heads is None else output_heads
     W = npes
@@ -263,7 +286,11 @@ def build_glm5_monokernel(
     DN_TILE = dn_tile(S, expert_mxfp4)
     N_DN_TILES = HIDDEN // DN_TILE
     RED_WORDS = WAVES * 64 * 4
-    LDS_KEYS = max(264 if with_indexer else 0, SPLIT_KEYS, S * MOE_SLOTS)
+    LDS_KEYS = max(
+        (272 if index_paged else 264) if with_indexer else 0,
+        SPLIT_KEYS,
+        S * MOE_SLOTS,
+    )
 
     # TileRT lineage: use one phase-overlaid arena instead of summing every
     # stage's LDS requirement.  The Kimi kernel reuses this same fusion pattern.
@@ -275,9 +302,14 @@ def build_glm5_monokernel(
         SAMPLE_TILE * HIDDEN // 2,
         S * HIDDEN // 4,
         SPLIT_X_WORDS,
-        index_max_seq,
+        0 if index_paged else index_max_seq,
         down_x_words(S, expert_inter, expert_mxfp4, native_fp4_mfma),
     )
+    # Radix keys of positions below SEL_LDS stay in LDS; the rest are re-read
+    # from the score mailbox.
+    SEL_LDS = X_WORDS // THREADS * THREADS
+    SEL_ITEMS = 8
+    SEL_CHUNK = THREADS * SEL_ITEMS
     MISC_OFF = X_WORDS
     MISC_WORDS = max(
         8 + S * (XQ_GROUPS if native_fp4_mfma else XQ_BLOCKS),
@@ -374,6 +406,9 @@ def build_glm5_monokernel(
         peers: Int64,
         timeline_buf: Int64,
         step: Int64,
+        block_table: Int64,
+        req_ids: Int64,
+        out_indices: Int64,
         rank: Int32,
         layer: Int32,
     ):
@@ -454,6 +489,38 @@ def build_glm5_monokernel(
 
         def row_writes_cache(s):
             return row_slot(s) >= 0
+
+        def index_bound(s):
+            return row_writes_cache(s).select(row_position(s) + 1, fx.Int32(0))
+
+        def index_request(s):
+            return fx.Int32(bo.buffer_load(_rsrc(req_ids), s, vec_width=1, dtype=T.i32))
+
+        def index_block(req, key):
+            return fx.Int32(
+                bo.buffer_load(
+                    _rsrc(block_table),
+                    req * block_table_stride + key // index_block_size,
+                    vec_width=1,
+                    dtype=T.i32,
+                )
+            )
+
+        def index_value_word(block, off, d):
+            """Dword holding index-cache values d .. d + 3 (d % 4 == 0) of one token."""
+            if const_expr(index_shuffled):
+                byte = (off // 16) * (16 * INDEX_DIM) + (off % 16) * 16
+                byte = byte + (d // 16) * 256 + d % 16
+            else:
+                byte = off * INDEX_DIM + d
+            return block * (index_block_bytes // 4) + byte // 4
+
+        def index_scale_word(block, off):
+            return (
+                block * (index_block_bytes // 4)
+                + index_block_size * INDEX_DIM // 4
+                + off
+            )
 
         def lds_ld(ptr, i):
             return fx.ptr_load(ptr + i)
@@ -1718,20 +1785,34 @@ def build_glm5_monokernel(
                         )
 
                     if t < INDEX_DIM // QKV_A_TILE:
+                        if const_expr(index_k_bf16):
 
-                        def u_index_k(c):
-                            kc = (wave * QA_UNITS + c) * 2
-                            return unit_fp8x2(
-                                r_wik,
-                                r_sik,
-                                t,
-                                kc,
-                                QA_NKC,
-                                HIDDEN,
-                                (n_sel(group_count) * HIDDEN + kc * 64) // 2,
-                            )
+                            def u_index_k(c):
+                                kc = wave * IW_CPW + c
+                                return unit_bf16(
+                                    r_wik,
+                                    t,
+                                    kc,
+                                    QA_NKC,
+                                    (n_sel(group_count) * HIDDEN + kc * 64) // 2,
+                                )
 
-                        ik_acc = run_units(u_index_k, QA_UNITS, QA_UNITS)
+                            ik_acc = run_units(u_index_k, IW_CPW, IW_CPW)
+                        else:
+
+                            def u_index_k(c):
+                                kc = (wave * QA_UNITS + c) * 2
+                                return unit_fp8x2(
+                                    r_wik,
+                                    r_sik,
+                                    t,
+                                    kc,
+                                    QA_NKC,
+                                    HIDDEN,
+                                    (n_sel(group_count) * HIDDEN + kc * 64) // 2,
+                                )
+
+                            ik_acc = run_units(u_index_k, QA_UNITS, QA_UNITS)
                         iw_acc = [fx.Float32(0.0) for _ in range(4)]
                         if t < INDEX_HEADS // QKV_A_TILE:
                             iw_acc = run_units(u_index_w, IW_CPW, IW_CPW)
@@ -1922,14 +2003,52 @@ def build_glm5_monokernel(
                         if tid < PE_DIM // 2:
                             c, sn = cs[s], sns[s]
                             v0, v1 = v0 * c - v1 * sn, v0 * sn + v1 * c
-                        bo.buffer_store(
-                            fx.Vector.from_elements([v0, v1], fx.Float32).to(
-                                fx.BFloat16
-                            ),
-                            r_index_cache,
-                            (pos0 + s) * INDEX_DIM + i0,
-                        )
-                        put_bf(mb("index_k_new"), s * INDEX_DIM + i0, [v0, v1])
+                        if const_expr(index_paged):
+                            # vLLM's ue8m0 quant: scale = 2^ceil(log2(max(amax, 1e-4) / 448))
+                            amax = wave_max(fx.max(fmath.absf(v0), fmath.absf(v1)))
+                            bits = div_rn(
+                                fx.max(amax, fx.Float32(1.0e-4)),
+                                fx.Float32(FP8_MAX),
+                                fx.Float32(1.0 / FP8_MAX),
+                            ).bitcast(fx.Int32)
+                            exponent = (bits >> 23) & fx.Int32(0xFF)
+                            exponent = exponent + (
+                                (bits & fx.Int32(0x7FFFFF)) != 0
+                            ).select(fx.Int32(1), fx.Int32(0))
+                            k_scale = (exponent << 23).bitcast(fx.Float32)
+                            k_inv = ((fx.Int32(254) - exponent) << 23).bitcast(
+                                fx.Float32
+                            )
+                            q0, q1 = v0 * k_inv, v1 * k_inv
+                            word = fp8_pack4(q0, q1, _xshfl(q0, 1), _xshfl(q1, 1))
+                            slot = row_slot(s)
+                            block = slot // index_block_size
+                            off = slot % index_block_size
+                            if row_writes_cache(s) & (tid % 2 == 0):
+                                bo.buffer_store(
+                                    word,
+                                    r_index_cache,
+                                    index_value_word(block, off, i0),
+                                )
+                            if row_writes_cache(s) & (tid == 0):
+                                bo.buffer_store(
+                                    k_scale, r_index_cache, index_scale_word(block, off)
+                                )
+                            d0, d1 = _fp8_roundtrip(q0, q1)
+                            put_bf(
+                                mb("index_k_new"),
+                                s * INDEX_DIM + i0,
+                                [d0 * k_scale, d1 * k_scale],
+                            )
+                        else:
+                            bo.buffer_store(
+                                fx.Vector.from_elements([v0, v1], fx.Float32).to(
+                                    fx.BFloat16
+                                ),
+                                r_index_cache,
+                                (pos0 + s) * INDEX_DIM + i0,
+                            )
+                            put_bf(mb("index_k_new"), s * INDEX_DIM + i0, [v0, v1])
                     gpu.barrier()
                     if tid == 0:
                         put(mb("index_ready"), s, fx.Int32(1))
@@ -2181,7 +2300,7 @@ def build_glm5_monokernel(
             stamp("uk", t, 4)
 
         # ====================== 4b. fused sparse index score + exact top-2048
-        if const_expr(with_indexer):
+        if const_expr(with_indexer and not index_paged):
             r_index_cache = _rsrc(indices)
             N_INDEX_SPLIT = index_max_seq // INDEX_KEYS_PER_TASK
 
@@ -2431,6 +2550,314 @@ def build_glm5_monokernel(
                 # Every lane contributed compact indices.  Make all of those
                 # device-memory stores visible before lane 0 publishes the one
                 # readiness tag consumed by the attention CTAs.
+                fx.memory_fence(ordering=fx.AtomicOrdering.Release, syncscope="agent")
+                gpu.barrier()
+                if tid == 0:
+                    put(mb("indices_ready"), s, fx.Int32(1))
+                stamp("index_select", s, 4)
+
+        if const_expr(index_paged):
+            r_index_cache = _rsrc(indices)
+            r_out_indices = _rsrc(out_indices)
+            r_index_scores = _rsrc(mb("index_scores"))
+            r_index_out = _rsrc(mb("indices"))
+            SEL_LDS_CHUNKS = SEL_LDS // SEL_CHUNK
+
+            def load_index_q8(head, k):
+                words = fx.Vector.from_elements(
+                    [lds_ld(xs, (head * INDEX_DIM + k) // 2 + j) for j in range(4)],
+                    fx.Float32,
+                )
+                return words.bitcast(fx.BFloat16)
+
+            def radix_key(bits):
+                return (bits >= 0).select(bits ^ fx.Int32(-(2**31)), ~bits)
+
+            def stored_key(s, i):
+                bits = fx.Int32(
+                    bo.buffer_load(
+                        r_index_scores,
+                        (s * index_max_seq + i) * 2,
+                        vec_width=1,
+                        dtype=T.i32,
+                        cache_modifier=CM_DEV,
+                    )
+                )
+                return fx.Uint32(radix_key(bits))
+
+            for s in range_constexpr(S):
+                bound = index_bound(s)
+                req = index_request(s)
+                pos = bound - 1
+                n_tiles = (bound + INDEX_KEYS_PER_TASK - 1) // INDEX_KEYS_PER_TASK
+                first_cta = (101 + s * (G // S)) % G
+                for tile in range((bid + (G - first_cta)) & (G - 1), n_tiles, G):
+                    tile = fx.Int32(tile)
+                    get(mb("index_ready"), s)
+                    if tid < INDEX_HEADS:
+                        lds_st(keys, tid, get(mb("index_w"), s * INDEX_HEADS + tid))
+                    for b in range_constexpr((INDEX_Q_ROWS // 2) // THREADS):
+                        q_pair = tid + b * THREADS
+                        q_elem = q_pair * 2
+                        kq = q_elem % INDEX_DIM
+                        q0, q1 = get_bf2_many(
+                            [(mb("index_q"), s * INDEX_Q_ROWS + q_elem)]
+                        )[0]
+                        if kq < PE_DIM:
+                            c = ld_bf16(_rsrc(rope_cos), pos * (PE_DIM // 2) + kq // 2)
+                            sn = ld_bf16(_rsrc(rope_sin), pos * (PE_DIM // 2) + kq // 2)
+                            q0, q1 = q0 * c - q1 * sn, q0 * sn + q1 * c
+                        lds_st(xs, q_pair, bf16_pair(q0, q1))
+                    gpu.barrier()
+                    key_group = wave // 2
+                    head_group = wave % 2
+                    key_pos = tile * INDEX_KEYS_PER_TASK + key_group * 16 + lane % 16
+                    safe_key = fx.min(key_pos, bound - 1)
+                    head = head_group * 16 + lane % 16
+                    block = index_block(req, safe_key)
+                    off = safe_key % index_block_size
+                    is_new = safe_key == pos
+                    k_scale = is_new.select(
+                        fx.Float32(1.0),
+                        ld_f32(r_index_cache, index_scale_word(block, off)),
+                    )
+                    score_frag = fx.Vector.filled(4, 0.0, fx.Float32)
+                    for k32 in range_constexpr(INDEX_DIM // 32):
+                        k = k32 * 32 + (lane // 16) * 8
+                        qv = load_index_q8(head, k)
+                        kw = fx.Vector(
+                            bo.buffer_load(
+                                r_index_cache,
+                                index_value_word(block, off, k),
+                                vec_width=2,
+                                dtype=T.i32,
+                            )
+                        )
+                        kv = _fp8_to_bf16x8(kw[0], kw[1])
+                        if is_new:
+                            kv_pairs = get_bf2_many(
+                                [
+                                    (mb("index_k_new"), s * INDEX_DIM + k + j * 2)
+                                    for j in range(4)
+                                ]
+                            )
+                            kv_values = []
+                            for pair in kv_pairs:
+                                kv_values += list(pair)
+                            kv = fx.Vector.from_elements(kv_values, fx.Float32).to(
+                                fx.BFloat16
+                            )
+                        score_frag = fx.Vector(
+                            rocdl.mfma_f32_16x16x32_bf16(
+                                T.vec(4, T.f32), [qv, kv, score_frag]
+                            )
+                        )
+                    partial = fx.Float32(0.0)
+                    for e in range_constexpr(4):
+                        index_head = head_group * 16 + (lane // 16) * 4 + e
+                        weight = lds_ld(keys, index_head).bitcast(fx.Float32)
+                        partial = (
+                            partial + fx.max(score_frag[e], fx.Float32(0.0)) * weight
+                        )
+                    partial = partial * k_scale
+                    partial = _xred(partial, 16, lambda a, b: a + b)
+                    partial = _xred(partial, 32, lambda a, b: a + b)
+                    if lane < 16:
+                        lds_st(red, wave * 16 + lane, partial)
+                    gpu.barrier()
+                    if (wave % 2 == 0) & (lane < 16) & (key_pos < bound):
+                        score = lds_ld(red, wave * 16 + lane) + lds_ld(
+                            red, (wave + 1) * 16 + lane
+                        )
+                        put(mb("index_scores"), s * index_max_seq + key_pos, score)
+
+            def select_digit(shift, prefix, remain):
+                digit = 255 - fx.min(tid, 255)
+                count = (tid < 256).select(lds_ld(keys, digit), fx.Int32(0))
+                inclusive = fx.coop.warp_inclusive_scan(
+                    count, fx.ReductionOp.ADD, width=64
+                )
+                wave_total = read_lane_i32(inclusive, 63)
+                if (wave < 4) & (lane == 63):
+                    lds_st(keys, 256 + wave, wave_total)
+                gpu.barrier()
+                before_wave = fx.Int32(0)
+                for w in range_constexpr(4):
+                    before_wave = before_wave + (wave > w).select(
+                        lds_ld(keys, 256 + w), fx.Int32(0)
+                    )
+                above = before_wave + inclusive - count
+                hit = (tid < 256) & (above < remain) & (above + count >= remain)
+                gpu.barrier()
+                if hit:
+                    lds_st(keys, 256, fx.Int32(prefix | (fx.Uint32(digit) << shift)))
+                    lds_st(keys, 257, remain - above)
+                gpu.barrier()
+                return fx.Uint32(lds_ld(keys, 256)), lds_ld(keys, 257)
+
+            def scan_flags(flags):
+                local = fx.Int32(0)
+                local_offsets = []
+                for flag in flags:
+                    local_offsets.append(local)
+                    local = local + flag.select(fx.Int32(1), fx.Int32(0))
+                inclusive = fx.coop.warp_inclusive_scan(
+                    local, fx.ReductionOp.ADD, width=64
+                )
+                wave_total = read_lane_i32(inclusive, 63)
+                if lane == 63:
+                    lds_st(keys, 256 + wave, wave_total)
+                gpu.barrier()
+                before_wave = fx.Int32(0)
+                total = fx.Int32(0)
+                for w in range_constexpr(WAVES):
+                    wave_count = lds_ld(keys, 256 + w)
+                    before_wave = before_wave + (wave > w).select(
+                        wave_count, fx.Int32(0)
+                    )
+                    total = total + wave_count
+                thread_base = before_wave + inclusive - local
+                return [thread_base + off for off in local_offsets], total
+
+            for s in range(start("index_select"), S, G):
+                s = fx.Int32(s)
+                stamp("index_select", s, 0)
+                bound = index_bound(s)
+                req = index_request(s)
+                count = fx.min(fx.Int32(topk), bound)
+                out_begin, _ = row_index_bounds(s)
+                n_chunks = (bound + SEL_CHUNK - 1) // SEL_CHUNK
+                lds_chunks = fx.min(n_chunks, fx.Int32(SEL_LDS_CHUNKS))
+
+                def chunk_items(chunk):
+                    return [
+                        chunk * SEL_CHUNK + tid * SEL_ITEMS + j
+                        for j in range_constexpr(SEL_ITEMS)
+                    ]
+
+                def publish(p, i):
+                    slot = index_block(req, i) * index_block_size + i % index_block_size
+                    bo.buffer_store(
+                        slot, r_index_out, s * topk + p, cache_modifier=CM_DEV
+                    )
+                    bo.buffer_store(
+                        slot, r_out_indices, out_begin + p, cache_modifier=CM_DEV
+                    )
+
+                if bound > 0:
+                    if tid < 256:
+                        lds_st(keys, tid, fx.Int32(0))
+                    gpu.barrier()
+                    for chunk in range(fx.Int32(0), n_chunks, fx.Int32(1)):
+                        items = chunk_items(fx.Int32(chunk))
+                        vals = poll(
+                            [
+                                (
+                                    mb("index_scores"),
+                                    s * index_max_seq + fx.min(i, bound - 1),
+                                    1,
+                                )
+                                for i in items
+                            ]
+                        )
+                        for j in range_constexpr(SEL_ITEMS):
+                            i = items[j]
+                            key = radix_key(vals[j][0])
+                            if i < bound:
+                                if i < SEL_LDS:
+                                    lds_st(xs, i, key.bitcast(fx.Float32))
+                                digit = fx.Int32((fx.Uint32(key) >> 24) & fx.Uint32(255))
+                                fx.atomic_add(
+                                    keys + digit, fx.Int32(1), syncscope="workgroup"
+                                )
+                    gpu.barrier()
+
+                    def radix_pass(shift, prefix_mask, prefix, remain):
+                        if tid < 256:
+                            lds_st(keys, tid, fx.Int32(0))
+                        gpu.barrier()
+
+                        def count_digit(key, i):
+                            if (i < bound) & ((key & fx.Uint32(prefix_mask)) == prefix):
+                                digit = fx.Int32((key >> shift) & fx.Uint32(255))
+                                fx.atomic_add(
+                                    keys + digit, fx.Int32(1), syncscope="workgroup"
+                                )
+
+                        for chunk in range(fx.Int32(0), lds_chunks, fx.Int32(1)):
+                            items = chunk_items(fx.Int32(chunk))
+                            for j in range_constexpr(SEL_ITEMS):
+                                key = fx.Uint32(
+                                    lds_ld(xs, fx.min(items[j], SEL_LDS - 1)).bitcast(
+                                        fx.Int32
+                                    )
+                                )
+                                count_digit(key, items[j])
+                        for chunk in range(lds_chunks, n_chunks, fx.Int32(1)):
+                            items = chunk_items(fx.Int32(chunk))
+                            for j in range_constexpr(SEL_ITEMS):
+                                i = items[j]
+                                count_digit(stored_key(s, fx.min(i, bound - 1)), i)
+                        gpu.barrier()
+                        return select_digit(shift, prefix, remain)
+
+                    prefix, remain = select_digit(24, fx.Uint32(0), count)
+                    prefix, remain = radix_pass(16, 0xFF000000, prefix, remain)
+                    prefix, remain = radix_pass(8, 0xFFFF0000, prefix, remain)
+                    prefix, remain = radix_pass(0, 0xFFFFFF00, prefix, remain)
+
+                    threshold = prefix
+                    if tid == 0:
+                        lds_st(keys, 264, fx.Int32(0))
+                        lds_st(keys, 265, fx.Int32(0))
+                    gpu.barrier()
+
+                    def gather(items, item_keys):
+                        gt = [
+                            (i < bound) & (key > threshold)
+                            for i, key in zip(items, item_keys)
+                        ]
+                        eq = [
+                            (i < bound) & (key == threshold)
+                            for i, key in zip(items, item_keys)
+                        ]
+                        gt_base = lds_ld(keys, 264)
+                        eq_base = lds_ld(keys, 265)
+                        gt_offsets, n_gt = scan_flags(gt)
+                        gpu.barrier()
+                        eq_offsets, n_eq = scan_flags(eq)
+                        gpu.barrier()
+                        for j in range_constexpr(SEL_ITEMS):
+                            if gt[j]:
+                                publish(gt_base + gt_offsets[j], items[j])
+                            e = eq_base + eq_offsets[j]
+                            if eq[j] & (e < topk):
+                                lds_st(red, e, items[j].bitcast(fx.Float32))
+                        if tid == 0:
+                            lds_st(keys, 264, gt_base + n_gt)
+                            lds_st(keys, 265, eq_base + n_eq)
+                        gpu.barrier()
+
+                    for chunk in range(fx.Int32(0), lds_chunks, fx.Int32(1)):
+                        items = chunk_items(fx.Int32(chunk))
+                        gather(
+                            items,
+                            [
+                                fx.Uint32(
+                                    lds_ld(xs, fx.min(i, SEL_LDS - 1)).bitcast(fx.Int32)
+                                )
+                                for i in items
+                            ],
+                        )
+                    for chunk in range(lds_chunks, n_chunks, fx.Int32(1)):
+                        items = chunk_items(fx.Int32(chunk))
+                        gather(items, [stored_key(s, fx.min(i, bound - 1)) for i in items])
+                    out_gt = lds_ld(keys, 264)
+                    need_eq = count - out_gt
+                    for batch in range_constexpr((topk + THREADS - 1) // THREADS):
+                        j = tid + batch * THREADS
+                        if j < need_eq:
+                            publish(out_gt + j, lds_ld(red, j).bitcast(fx.Int32))
                 fx.memory_fence(ordering=fx.AtomicOrdering.Release, syncscope="agent")
                 gpu.barrier()
                 if tid == 0:
@@ -3924,6 +4351,9 @@ def build_glm5_monokernel(
         peers: Int64,
         timeline_buf: Int64,
         step: Int64,
+        block_table: Int64,
+        req_ids: Int64,
+        out_indices: Int64,
         rank: Int32,
         layer: Int32,
         stream: fx.Stream = fx.Stream(None),
@@ -3965,6 +4395,9 @@ def build_glm5_monokernel(
             peers,
             timeline_buf,
             step,
+            block_table,
+            req_ids,
+            out_indices,
             rank,
             layer,
         ).launch(grid=(G,), block=(THREADS,), stream=stream)

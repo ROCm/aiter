@@ -137,6 +137,12 @@ class Glm5MonoKernel:
         dcp_size: int = 1,
         native_fp4_mfma: bool = False,
         timeline=False,
+        index_paged: bool = False,
+        index_block_size: int = 64,
+        index_block_bytes: int = 0,
+        index_shuffled: bool = False,
+        block_table_stride: int = 0,
+        index_k_bf16: bool = False,
     ):
         expected_config = glm5_tp_config(npes)
         if W.config != expected_config:
@@ -163,6 +169,10 @@ class Glm5MonoKernel:
         self.launches_per_step = launches_per_step
         self.with_indexer = with_indexer
         self.index_max_seq = index_max_seq
+        self.index_paged = index_paged
+        self.index_block_size = index_block_size
+        self.index_block_bytes = index_block_bytes
+        self.block_table_stride = block_table_stride
         self.attention_weight = AttentionWeight(attention_weight)
         self.kv_cache_layout = as_kv_cache_layout(kv_cache_layout)
         if kv_cache_dtype not in ("bf16", "fp8"):
@@ -188,19 +198,20 @@ class Glm5MonoKernel:
         if with_indexer:
             required = (
                 "w_index_k",
-                "s_index_k",
                 "w_index_w",
                 "w_index_q",
                 "s_index_q",
                 "g_index_k",
                 "b_index_k",
-            )
+            ) + (() if index_k_bf16 else ("s_index_k",))
             missing = [name for name in required if name not in t]
             if missing:
                 raise ValueError(
                     f"with_indexer=True requires weights: {', '.join(missing)}"
                 )
-            self.packed["w_index_k"] = pack_fp8(t["w_index_k"])
+            self.packed["w_index_k"] = (
+                pack_bf16(t["w_index_k"]) if index_k_bf16 else pack_fp8(t["w_index_k"])
+            )
             self.packed["w_index_q"] = pack_fp8(t["w_index_q"])
             self.packed["w_index_w"] = pack_bf16(t["w_index_w"])
         self.scr_layout, self.sym_layout = layout(
@@ -238,7 +249,7 @@ class Glm5MonoKernel:
                     index_tensors[name].data_ptr()
                     for name in (
                         "w_index_k",
-                        "s_index_k",
+                        "w_index_k" if index_k_bf16 else "s_index_k",
                         "w_index_w",
                         "w_index_q",
                         "s_index_q",
@@ -297,6 +308,12 @@ class Glm5MonoKernel:
                 else W.t["w_uv"].shape[0] // W.t["s_uv"].shape[0]
             ),
             timeline=timeline,
+            index_paged=index_paged,
+            index_block_size=index_block_size,
+            index_block_bytes=index_block_bytes,
+            index_shuffled=index_shuffled,
+            block_table_stride=block_table_stride,
+            index_k_bf16=index_k_bf16,
         )
 
     def debug(
@@ -342,6 +359,9 @@ class Glm5MonoKernel:
         positions=None,
         slot_mapping=None,
         sparse_kv_indptr=None,
+        block_table=None,
+        req_ids=None,
+        out_indices=None,
     ):
         """One layer.  Mailbox epochs are ``step * launches_per_step + layer + 1``: layers sharing
         this scratch within a decode step need distinct ``layer``; call
@@ -361,7 +381,36 @@ class Glm5MonoKernel:
             raise ValueError("fused indexer does not support chunked launches")
         if not advance and chunks != 1:
             raise ValueError("chunked launches must advance mailbox epochs")
-        if self.with_indexer:
+        if self.index_paged:
+            if index_cache is None or index_cache.element_size() != 1:
+                raise ValueError("index_paged requires the 1-byte paged index cache")
+            if (
+                index_cache.dim() != 3
+                or index_cache.shape[1:] != (self.index_block_size, INDEX_DIM + 4)
+                or index_cache.stride(0) * index_cache.element_size()
+                != self.index_block_bytes
+                or index_cache.stride(1) != INDEX_DIM + 4
+            ):
+                raise ValueError(
+                    f"index cache must be [blocks, {self.index_block_size}, {INDEX_DIM + 4}] "
+                    f"with {self.index_block_bytes}-byte blocks, got "
+                    f"{tuple(index_cache.shape)} strides {index_cache.stride()}"
+                )
+            for name, value in (
+                ("block_table", block_table),
+                ("req_ids", req_ids),
+                ("out_indices", out_indices),
+            ):
+                if value is None or value.dtype is not torch.int32:
+                    raise ValueError(f"index_paged requires int32 {name}")
+            if block_table.stride(0) != self.block_table_stride or block_table.stride(1) != 1:
+                raise ValueError(
+                    f"block_table rows must be {self.block_table_stride} contiguous entries, "
+                    f"got strides {block_table.stride()}"
+                )
+            if req_ids.numel() < total_samples or not req_ids.is_contiguous():
+                raise ValueError(f"req_ids must hold {total_samples} contiguous ids")
+        elif self.with_indexer:
             if index_cache is None:
                 raise ValueError("index_cache is required when with_indexer=True")
             if (
@@ -470,6 +519,9 @@ class Glm5MonoKernel:
                     else (0 if self.timeline is None else p(self.timeline))
                 ),
                 p(self.step),
+                p(block_table) if self.index_paged else 0,
+                p(req_ids) + row * 4 if self.index_paged else 0,
+                p(out_indices) if self.index_paged else 0,
                 self.rank,
                 layer,
                 stream=torch.cuda.current_stream(),
@@ -549,6 +601,7 @@ class Glm5MonoKernel:
             xq=self.debug("xqd", (S, HIDDEN), pairs=False),
         )
         if self.with_indexer:
+            result["index_k"] = self.debug("index_k", (S, INDEX_DIM))
             result["index_q"] = self.debug("index_q", (S, 32, INDEX_DIM), bf2=True)
             result["index_w"] = self.debug("index_w", (S, 32))
             off = self.scr_layout["indices"]
