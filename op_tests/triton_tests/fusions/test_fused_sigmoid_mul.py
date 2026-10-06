@@ -118,3 +118,59 @@ def test_fused_sigmoid_mul_rejects_bad_inputs(bad, match):
         gate = torch.randn(16, 8, dtype=torch.bfloat16, device="cuda").t()
     with pytest.raises(AssertionError, match=match):
         fused_sigmoid_mul(x, gate)
+
+
+# Kimi-K3 TP8 MLA output gate, per rank: 12 heads x v_head_dim 128.
+_K3_GATE_WIDTH = 1536
+# The gate is the last shard of the merged [q_a | kv_a | gate] GEMM output.
+_K3_MERGED_ROW = 1536 + 576 + _K3_GATE_WIDTH
+# attn_out kept at the 16 heads the ASM MLA kernels run at (16 x 128).
+_K3_PADDED_ATTN_ROW = 2048
+
+
+@pytest.mark.parametrize(
+    "n_tokens", [1, 7, 56, 64, 1166, 7827], ids=lambda n: f"tokens{n}"
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("x_layout", ["contiguous", "padded_heads"])
+@pytest.mark.parametrize("use_explicit_out", [False, True])
+def test_fused_sigmoid_mul_row_strided(n_tokens, dtype, x_layout, use_explicit_out):
+    """Row-strided 2-D views, as the K3 MLA gate passes them: the gate is a column
+    slice of the merged GEMM output, attn_out optionally a slice of a padded buffer."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    torch.manual_seed(0)
+    merged = torch.randn(n_tokens, _K3_MERGED_ROW, dtype=dtype, device="cuda")
+    gate = merged[:, _K3_MERGED_ROW - _K3_GATE_WIDTH :]
+    if x_layout == "padded_heads":
+        x_buf = torch.randn(n_tokens, _K3_PADDED_ATTN_ROW, dtype=dtype, device="cuda")
+        x = x_buf[:, :_K3_GATE_WIDTH]
+    else:
+        x_buf = torch.randn(n_tokens, _K3_GATE_WIDTH, dtype=dtype, device="cuda")
+        x = x_buf
+    ref = torch_sigmoid_mul_ref(x, gate)
+    merged_before, x_buf_before = merged.clone(), x_buf.clone()
+
+    if use_explicit_out:
+        out = torch.empty(n_tokens, _K3_GATE_WIDTH, dtype=dtype, device="cuda")
+        ret = fused_sigmoid_mul(x, gate, out)
+        assert ret is out
+        assert torch.equal(x_buf, x_buf_before), "x must be left untouched"
+    else:
+        ret = fused_sigmoid_mul(x, gate)
+        assert ret is x
+        assert torch.equal(
+            x_buf[:, _K3_GATE_WIDTH:], x_buf_before[:, _K3_GATE_WIDTH:]
+        ), "in-place write must stay inside the x view"
+
+    torch.testing.assert_close(ret, ref, rtol=1e-2, atol=1e-2)
+    assert torch.equal(merged, merged_before), "the gate source must be untouched"
+
+
+def test_fused_sigmoid_mul_rejects_non_2d_strided():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    x = torch.randn(4, 8, 32, device="cuda")[:, :, :16]
+    gate = torch.randn(4, 8, 16, device="cuda")
+    with pytest.raises(AssertionError, match="2-D"):
+        fused_sigmoid_mul(x, gate)

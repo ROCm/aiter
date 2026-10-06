@@ -62,6 +62,14 @@ FAMILIES = [
         "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE",
         "a8w8_blockscale_bpreshuffle_tuned_gemm",
     ),
+    (
+        "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE",
+        "a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm",
+    ),
+    (
+        "AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE",
+        "a8w8_mxfp8_bpreshuffle_tuned_gemm",
+    ),
     ("AITER_CONFIG_A8W8_BATCHED_GEMM", "a8w8_tuned_batched_gemm"),
     ("AITER_CONFIG_BF16_BATCHED_GEMM", "bf16_tuned_batched_gemm"),
     (
@@ -216,6 +224,12 @@ class TestConfigShapeCollision(unittest.TestCase):
         self._check_family(
             "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE",
             "a8w8_blockscale_bpreshuffle_tuned_gemm",
+        )
+
+    def test_a8w8_blockscale_mxscale_bpreshuffle(self):
+        self._check_family(
+            "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE",
+            "a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm",
         )
 
     def test_a8w8_batched(self):
