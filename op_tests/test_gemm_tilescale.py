@@ -127,7 +127,7 @@ def _codes(fmt, rows, K, g):
 def _pack(fmt, codes, b_codes=0):
     if fmt == 6:
         return TS.pack_fp6_codes_ref(codes)
-    return TS.pack_fp4_codes_ref(codes, "k128" if b_codes else "row")
+    return TS.pack_fp4_codes_ref(codes, ("row", "k128", "kouter")[b_codes])
 
 
 @requires_gfx950
@@ -143,7 +143,8 @@ def test_row_vs_fp64(row):
     bv = torch.randn(N, dtype=torch.bfloat16, device="cuda", generator=g) if bias else None
     out = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
     gemm_mx_tilescale(_pack(af, a), _pack(bf, b, row["b_codes"]), TS.pack_scales_ref(sa, is_b=False),
-                      TS.pack_scales_ref(sb, is_b=True, ilv=row["b_ilv"]), out, af, bf, K, bv, row["b_codes"],
+                      TS.pack_scales_ref(sb, is_b=True, ilv=row["b_ilv"], kouter=row["b_codes"] == 2), out, af, bf, K,
+                      bv, row["b_codes"],
                       row["b_ilv"])
     fa, fb = (TS.FP4 if af == 4 else TS.FP6), (TS.FP4 if bf == 4 else TS.FP6)
     ref = TS.dequant_ref(a, sa, fa) @ TS.dequant_ref(b, sb, fb).t()
@@ -197,3 +198,48 @@ def test_a4w4_k_generic_vs_fp64(shape):
     row = next(r for r in GENERIC_ROWS if (r["a_fmt"], r["b_fmt"]) == (4, 4))
     assert tilescale_supported(M, N, K, 4, 4, False, 0, row["b_ilv"])
     test_row_vs_fp64(dict(row, M=M, N=N, K=K))
+
+
+@requires_gfx950
+@pytest.mark.parametrize("bias", [False, True])
+def test_a6w6_split_c1_plane(bias):
+    """B's C1 plane in its own buffer gives the same bits as the one-buffer operand."""
+    M, N, K = 16384, 9216, 3072
+    if not tilescale_supported(M, N, K, 6, 6, bias):
+        pytest.skip("no A6W6 kernel")
+    g = torch.Generator(device="cuda").manual_seed(11)
+    a6 = torch.randint(0, 64, (M, K), dtype=torch.uint8, device="cuda", generator=g)
+    b6 = torch.randint(0, 64, (N, K), dtype=torch.uint8, device="cuda", generator=g)
+    sa = torch.randint(118, 133, (M, K // 32), dtype=torch.uint8, device="cuda", generator=g)
+    sb = torch.randint(118, 133, (N, K // 32), dtype=torch.uint8, device="cuda", generator=g)
+    bv = torch.randn(N, dtype=torch.bfloat16, device="cuda", generator=g) if bias else None
+    A, B = TS.pack_fp6_codes_ref(a6), TS.pack_fp6_codes_ref(b6)
+    SA, SB = TS.pack_scales_ref(sa, is_b=False), TS.pack_scales_ref(sb, is_b=True)
+    ref = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
+    gemm_mx_tilescale(A, B, SA, SB, ref, 6, 6, K, bv)
+    c0, c1 = B[: N * K // 2].clone(), B[N * K // 2 :].clone()
+    out = torch.empty_like(ref)
+    gemm_mx_tilescale(A, c0, SA, SB, out, 6, 6, K, bv, b_c1=c1)
+    assert torch.equal(out.view(torch.int16), ref.view(torch.int16))
+
+
+KOUTER = [r for r in ROWS if r["b_codes"] == 2]
+
+
+@requires_gfx950
+@pytest.mark.parametrize("row", KOUTER, ids=lambda r: r["knl_name"])
+def test_a4w4_kouter_bitwise_vs_row(row):
+    """B in the K256-outer form (codes and scale slab) gives the same bits as the row-major form of the same B."""
+    M, N, K, ilv = row["M"], row["N"], row["K"], row["b_ilv"]
+    g = torch.Generator(device="cuda").manual_seed(M + N + K)
+    a, b = _codes(4, M, K, g), _codes(4, N, K, g)
+    sa = torch.randint(118, 133, (M, K // 32), dtype=torch.uint8, device="cuda", generator=g)
+    sb = torch.randint(118, 133, (N, K // 32), dtype=torch.uint8, device="cuda", generator=g)
+    A, SA = _pack(4, a), TS.pack_scales_ref(sa, is_b=False)
+    outs = []
+    for bc in (0, 2):
+        out = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
+        gemm_mx_tilescale(A, _pack(4, b, bc), SA, TS.pack_scales_ref(sb, is_b=True, ilv=ilv, kouter=bc == 2), out,
+                          4, 4, K, None, bc, ilv)
+        outs.append(out)
+    assert torch.equal(outs[0].view(torch.int16), outs[1].view(torch.int16))

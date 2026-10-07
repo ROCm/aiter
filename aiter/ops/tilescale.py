@@ -11,13 +11,17 @@ Codes
   * FP4 (E2M1) ``"row"``: plain row-major ``[R, K/2]`` bytes, low nibble = even k. One 32-value group is 16 bytes.
   * FP4 (E2M1) ``"k128"``: the same bytes K128-blocked, ``[R/16, K/128, 16, 64]``: every 16-row x 128-K block is one
     contiguous KiB. For kernels that stage K128 per step, where a row's 64 bytes are half a cache line.
+  * FP4 (E2M1) ``"kouter"`` (role B): K256-outer, ``[K/256, R, 128]``, with the scale slab K256-outer too
+    (``kouter=True`` below): every 256-aligned range of K is one contiguous byte range of the codes and of the
+    scales. For a weight whose contraction axis is split across devices (each part lands in place).
   * FP6 (E2M3): a 32-value group is 24 bytes, value i at bits 6i..6i+5 little-endian. Bytes 0-15 of every group
     form plane C0, bytes 16-23 plane C1; both K128-blocked, in one buffer: C0 ``[R/16, K/128, 16, 64]`` then
     C1 ``[R/32, K/128, 32, 32]``, ``R*K*3/4`` bytes in total.
 
 Scales: one E8M0 byte per 1x32 block, ``R*K/32`` bytes, in a slab tiled per 256 rows. The byte position of
 (row, k-block) is ``ts_scale_byte``; it depends on the operand role, on the parity of K/256 and, for role B only, on
-an optional 4-row interleave (``ilv``) that kernels folding the C store into the K loop use (``ts_b_ilv``).
+an optional 4-row interleave (``ilv``) that kernels folding the C store into the K loop use (``ts_b_ilv``). The slab
+is ``[R/128 (wi), K/256 (J), 1 KiB]``; its K256-outer form (role B, with ``"kouter"`` codes) is ``[J, wi, 1 KiB]``.
 
 Not part of the layout: the Hadamard rotation, the scale rule and the rounding of the quantizer. ``TilescaleMeta``
 records them for tests; GEMM entry points take raw tensors and ints.
@@ -68,10 +72,15 @@ def ts_scale_bytes(rows: int, K: int) -> int:
     return _ceil(rows, TILE) * K // 32
 
 
-def ts_scale_byte(row: torch.Tensor, kblk: torch.Tensor, *, is_b: bool, K: int, ilv: int = 0) -> torch.Tensor:
-    """Byte offset in the scale slab of (row, 32-wide k-block ``kblk``); broadcasting int64 tensors."""
+def ts_scale_byte(
+    row: torch.Tensor, kblk: torch.Tensor, *, is_b: bool, K: int, ilv: int = 0, kouter: bool = False, rows: int = 0
+) -> torch.Tensor:
+    """Byte offset in the scale slab of (row, 32-wide k-block ``kblk``); broadcasting int64 tensors. ``kouter``
+    (role B): the K256-outer slab of ``rows`` (padded to 256) rows."""
     if ilv not in (0, 4) or (ilv and not is_b):
         raise ValueError(f"ilv must be 0, or 4 for role B (is_b={is_b}, ilv={ilv})")
+    if kouter and not (is_b and rows):
+        raise ValueError("the K256-outer slab is role B and needs rows")
     if K % TILE:
         raise ValueError(f"K must be a multiple of {TILE}, got {K}")
     row = torch.as_tensor(row, dtype=torch.int64)
@@ -92,18 +101,20 @@ def ts_scale_byte(row: torch.Tensor, kblk: torch.Tensor, *, is_b: bool, K: int, 
     r = (loc >> 2) if ilv else (loc & 15)
     t = (loc & 3) if ilv else (loc >> 4)
     last = r_region * 2 + lo
+    if kouter:  # [J, wi, 1 KiB]: J = kblk / 8 (= (kh << ku_shift) + u)
+        return ((kblk >> 3) * (_ceil(rows, TILE) // 128) + wi) * 1024 + g * 256 + r * 16 + last * 4 + t
     base = ((wi * kk + (kh << ku_shift)) * 64 + r) * 4
     return (base + u * 256 + g * 64 + last) * 4 + t
 
 
-def _scale_map(rows: int, K: int, is_b: bool, ilv: int, device) -> torch.Tensor:
+def _scale_map(rows: int, K: int, is_b: bool, ilv: int, device, kouter: bool = False) -> torch.Tensor:
     rp = _ceil(rows, TILE)
     r = torch.arange(rp, device=device).view(-1, 1)
     k = torch.arange(K // 32, device=device).view(1, -1)
-    return ts_scale_byte(r, k, is_b=is_b, K=K, ilv=ilv)
+    return ts_scale_byte(r, k, is_b=is_b, K=K, ilv=ilv, kouter=kouter, rows=rp)
 
 
-def pack_scales_ref(scales: torch.Tensor, *, is_b: bool, ilv: int = 0) -> torch.Tensor:
+def pack_scales_ref(scales: torch.Tensor, *, is_b: bool, ilv: int = 0, kouter: bool = False) -> torch.Tensor:
     """``[R, K/32]`` E8M0 (uint8) -> the tilescale slab (uint8, ``ts_scale_bytes(R, K)``)."""
     R, kb = scales.shape
     K = kb * 32
@@ -111,12 +122,14 @@ def pack_scales_ref(scales: torch.Tensor, *, is_b: bool, ilv: int = 0) -> torch.
     full = torch.full((rp, kb), 127, dtype=torch.uint8, device=scales.device)
     full[:R] = scales.view(torch.uint8)
     out = torch.empty(rp * kb, dtype=torch.uint8, device=scales.device)
-    out[_scale_map(R, K, is_b, ilv, scales.device).reshape(-1)] = full.reshape(-1)
+    out[_scale_map(R, K, is_b, ilv, scales.device, kouter).reshape(-1)] = full.reshape(-1)
     return out
 
 
-def unpack_scales_ref(slab: torch.Tensor, rows: int, K: int, *, is_b: bool, ilv: int = 0) -> torch.Tensor:
-    m = _scale_map(rows, K, is_b, ilv, slab.device)
+def unpack_scales_ref(
+    slab: torch.Tensor, rows: int, K: int, *, is_b: bool, ilv: int = 0, kouter: bool = False
+) -> torch.Tensor:
+    m = _scale_map(rows, K, is_b, ilv, slab.device, kouter)
     return slab.view(torch.uint8).reshape(-1)[m][:rows].contiguous()
 
 
@@ -147,6 +160,8 @@ def pack_fp4_codes_ref(codes: torch.Tensor, layout: str = "row") -> torch.Tensor
         return b.contiguous()
     if layout == "k128":
         return _blocked(b, 16, 64).view(b.shape)
+    if layout == "kouter":
+        return b.view(b.shape[0], -1, 128).transpose(0, 1).contiguous().view(b.shape)
     raise ValueError(f"unknown FP4 code layout {layout!r}")
 
 
@@ -155,6 +170,8 @@ def unpack_fp4_codes_ref(buf: torch.Tensor, rows: int, K: int, layout: str = "ro
     b = buf.view(torch.uint8).reshape(rp, K // 2)
     if layout == "k128":
         b = _unblocked(b.reshape(-1), rp, 16, 64, K // 128)
+    elif layout == "kouter":
+        b = b.reshape(K // 256, rp, 128).transpose(0, 1).reshape(rp, K // 2)
     elif layout != "row":
         raise ValueError(f"unknown FP4 code layout {layout!r}")
     return torch.stack((b & 15, b >> 4), -1).reshape(rp, K)[:rows].contiguous()

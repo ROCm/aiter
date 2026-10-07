@@ -152,8 +152,9 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      int64_t b_fmt,
      int64_t b_codes,
      int64_t b_ilv,
+     aiter_tensor_t* B_c1, // optional: an FP6 B's C1 plane in its own buffer (B then holds C0 only)
      hipStream_t stream),
-    (A, B, A_scale, B_scale, out, K, bias, a_fmt, b_fmt, b_codes, b_ilv, stream))
+    (A, B, A_scale, B_scale, out, K, bias, a_fmt, b_fmt, b_codes, b_ilv, B_c1, stream))
 {
     AITER_CHECK(out->dtype() == AITER_DTYPE_bf16, __func__, " only BFloat16 output");
     AITER_CHECK(out->dim() == 2 && out->is_contiguous(),
@@ -177,7 +178,13 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     const auto bytes = [](const aiter_tensor_t* t) {
         return static_cast<int64_t>(t->numel()) * t->element_size();
     };
-    AITER_CHECK(bytes(A) == code_bytes(a_fmt, M, K) && bytes(B) == code_bytes(b_fmt, N, K),
+    if(B_c1 != nullptr)
+        AITER_CHECK(b_fmt == 6 && B_c1->is_contiguous() && B_c1->device_id == B->device_id &&
+                        bytes(B) == N * K / 2 && bytes(B_c1) == N * K / 4,
+                    __func__,
+                    " B_c1: an FP6 B's C1 plane (N*K/4 bytes) with B its C0 plane (N*K/2 bytes)");
+    AITER_CHECK(bytes(A) == code_bytes(a_fmt, M, K) &&
+                    (B_c1 != nullptr || bytes(B) == code_bytes(b_fmt, N, K)),
                 __func__,
                 " A/B byte sizes do not match their formats");
     AITER_CHECK(bytes(A_scale) == M * K / 32 && bytes(B_scale) == N * K / 32,
@@ -247,7 +254,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         if(b_fmt == 6)
         {
             a6.B0 = memref(pb, N, K / 2);
-            a6.B1 = memref(pb + N * K / 2, N, K / 4);
+            a6.B1 = memref(B_c1 != nullptr ? static_cast<char*>(B_c1->ptr) : pb + N * K / 2, N, K / 4);
         }
         else
         {

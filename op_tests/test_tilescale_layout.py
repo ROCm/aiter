@@ -121,3 +121,19 @@ def test_fp4_values_are_exact_fp6():
     c4 = torch.arange(16, device=DEV, dtype=torch.uint8)
     c6 = ((c4 & 8) << 2) | ((c4 & 6) << 2) | ((c4 & 1) << 2)
     assert torch.equal(TS.code_values(c4, TS.FP4), TS.code_values(c6, TS.FP6))
+
+
+@pytest.mark.parametrize("K", [3072, 2560])
+@pytest.mark.parametrize("ilv", [0, 4])
+def test_kouter_slab_is_k256_outer(K, ilv):
+    """The K256-outer slab is the standard role-B slab [wi, J, 1 KiB] with its two outer axes swapped, and every
+    256-aligned K range of it is contiguous."""
+    rows = 768
+    std = TS._scale_map(rows, K, True, ilv, "cpu").reshape(-1)
+    ko = TS._scale_map(rows, K, True, ilv, "cpu", kouter=True).reshape(-1)
+    nwi, kk = rows // 128, K // 256
+    assert torch.equal(torch.sort(ko).values, torch.arange(ko.numel()))
+    swap = (std // 1024 % kk) * nwi + std // 1024 // kk  # J * nwi + wi
+    assert torch.equal(ko, swap * 1024 + std % 1024)
+    codes = torch.randint(0, 16, (rows, K), dtype=torch.uint8)
+    assert torch.equal(TS.unpack_fp4_codes_ref(TS.pack_fp4_codes_ref(codes, "kouter"), rows, K, "kouter"), codes)

@@ -70,3 +70,11 @@ a_fmt,b_fmt,b_codes,b_ilv,bias,M,N,K,kcls,kmin,grid,abi,ts_ver,knl_name,co_name
 6,4,1,0,0,0,0,0,8,2560,0,2,1,aiter_ts_a6w4_g8,aiter_ts_a6w4_g8.co
 6,4,1,0,1,0,0,0,8,2560,0,2,1,aiter_ts_a6w4_g8_bias,aiter_ts_a6w4_g8_bias.co
 4,4,0,4,0,0,0,0,12,1024,0,3,1,aiter_ts_a4w4_g,aiter_ts_a4w4_g.co
+4,4,2,4,0,16384,12288,3072,0,0,3072,0,1,aiter_ts_a4w4_ko_16384x12288x3072,aiter_ts_a4w4_ko_16384x12288x3072.co
+4,4,2,4,0,16384,3072,12288,0,0,768,0,1,aiter_ts_a4w4_ko_16384x3072x12288,aiter_ts_a4w4_ko_16384x3072x12288.co
+4,4,2,4,0,16384,3072,9216,0,0,768,0,1,aiter_ts_a4w4_ko_16384x3072x9216,aiter_ts_a4w4_ko_16384x3072x9216.co
+4,4,2,4,0,16384,3072,3072,0,0,768,0,1,aiter_ts_a4w4_ko_16384x3072x3072,aiter_ts_a4w4_ko_16384x3072x3072.co
+4,4,2,4,0,8192,12288,3072,0,0,1536,0,1,aiter_ts_a4w4_ko_8192x12288x3072,aiter_ts_a4w4_ko_8192x12288x3072.co
+4,4,2,4,0,8192,3072,12288,0,0,384,0,1,aiter_ts_a4w4_ko_8192x3072x12288,aiter_ts_a4w4_ko_8192x3072x12288.co
+4,4,2,4,0,8192,3072,9216,0,0,384,0,1,aiter_ts_a4w4_ko_8192x3072x9216,aiter_ts_a4w4_ko_8192x3072x9216.co
+4,4,2,4,0,8192,3072,3072,0,0,384,0,1,aiter_ts_a4w4_ko_8192x3072x3072,aiter_ts_a4w4_ko_8192x3072x3072.co

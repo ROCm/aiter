@@ -4,8 +4,8 @@
 """MX GEMMs on the tilescale layout (``aiter.ops.tilescale``): ``out[M, N] = A @ B^T (+ bias)``, bf16 out.
 
 ``a_fmt`` / ``b_fmt``: 4 (E2M1) or 6 (E2M3). FP6 operands are tilescale FP6 buffers (C0 then C1 planes), FP4
-operands tilescale FP4 bytes in the ``b_codes`` layout (0 = "row", 1 = "k128"; A operands are "row"). Scales are
-tilescale slabs, role B with interleave ``b_ilv``. Kernels are selected from the ``tsgemm`` manifest;
+operands tilescale FP4 bytes in the ``b_codes`` layout (0 = "row", 1 = "k128", 2 = "kouter" with its K256-outer
+scale slab; A operands are "row"). Scales are tilescale slabs, role B with interleave ``b_ilv``. Kernels are selected from the ``tsgemm`` manifest;
 ``tilescale_supported`` says whether a call has one (pure Python on ints, safe inside compiled regions).
 """
 
@@ -18,7 +18,7 @@ from torch import Tensor
 from ..jit.core import AITER_META_DIR, compile_ops
 from .tilescale import TILESCALE_VERSION
 
-FP4_CODES = {"row": 0, "k128": 1}
+FP4_CODES = {"row": 0, "k128": 1, "kouter": 2}
 
 
 @compile_ops("module_gemm_tilescale_asm", fc_name="gemm_tilescale_asm", ffi_type="ctypes")
@@ -34,6 +34,7 @@ def _gemm_tilescale_asm(
     b_fmt: int,
     b_codes: int,
     b_ilv: int,
+    B_c1: Tensor | None,
 ) -> None: ...
 
 
@@ -109,11 +110,13 @@ def gemm_mx_tilescale(
     bias: Tensor | None = None,
     b_codes: int = 0,
     b_ilv: int = 0,
+    b_c1: Tensor | None = None,
 ) -> Tensor:
-    """``out[M, N] = A @ B^T (+ bias)``; raises if the manifest has no kernel for the call."""
+    """``out[M, N] = A @ B^T (+ bias)``; raises if the manifest has no kernel for the call. ``b_c1``: an FP6 B's
+    C1 plane in its own buffer (``B`` then holds the C0 plane only)."""
     if out.ndim != 2:
         raise ValueError(f"gemm_mx_tilescale expects a 2D output, got {out.ndim}D")
-    _gemm_tilescale_asm(A, B, A_scale, B_scale, out, K, bias, a_fmt, b_fmt, b_codes, b_ilv)
+    _gemm_tilescale_asm(A, B, A_scale, B_scale, out, K, bias, a_fmt, b_fmt, b_codes, b_ilv, b_c1)
     return out
 
 
@@ -121,9 +124,9 @@ def gemm_a6w4_tilescale(A, B, A_scale, B_scale, out, K, bias=None, b_codes=FP4_C
     return gemm_mx_tilescale(A, B, A_scale, B_scale, out, 6, 4, K, bias, b_codes, 0)
 
 
-def gemm_a6w6_tilescale(A, B, A_scale, B_scale, out, K, bias=None):
-    return gemm_mx_tilescale(A, B, A_scale, B_scale, out, 6, 6, K, bias, 0, 0)
+def gemm_a6w6_tilescale(A, B, A_scale, B_scale, out, K, bias=None, b_c1=None):
+    return gemm_mx_tilescale(A, B, A_scale, B_scale, out, 6, 6, K, bias, 0, 0, b_c1)
 
 
-def gemm_a4w4_tilescale(A, B, A_scale, B_scale, out, K, b_ilv=0):
-    return gemm_mx_tilescale(A, B, A_scale, B_scale, out, 4, 4, K, None, 0, b_ilv)
+def gemm_a4w4_tilescale(A, B, A_scale, B_scale, out, K, b_ilv=0, b_codes=FP4_CODES["row"]):
+    return gemm_mx_tilescale(A, B, A_scale, B_scale, out, 4, 4, K, None, b_codes, b_ilv)
