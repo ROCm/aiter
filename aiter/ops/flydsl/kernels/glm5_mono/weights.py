@@ -421,6 +421,47 @@ def prepare_mxfp4_expert_storage(
     )
 
 
+def pack_dense_mlp(
+    gate_up: torch.Tensor,
+    gate_up_scale: torch.Tensor,
+    down: torch.Tensor,
+    down_scale: torch.Tensor,
+    slices: int,
+) -> dict[str, torch.Tensor]:
+    """Store a dense MXFP4 MLP as ``slices`` AITER-shuffled expert slices.
+
+    Inputs are row-major MXFP4 with one E8M0 scale per 32 inputs: ``gate_up``
+    ``[2 * I, K // 2]`` (gate rows, then up rows) and ``down`` ``[N, I // 2]``.
+    Slice ``j`` takes intermediates ``j * I // slices`` onward, so summing the
+    slices' outputs gives the dense MLP. Returns ``w_ug``, ``s_ug``, ``w_dn`` and
+    ``s_dn`` in the ATOM expert layout, ready for ``Glm5MonoKernel(dense_experts=)``.
+    """
+    from aiter.ops.shuffle import shuffle_scale, shuffle_weight
+
+    two_inter, half_k = gate_up.shape
+    inter = two_inter // 2
+    hidden, half_inter = down.shape
+    part = inter // slices
+    _need(
+        inter % slices == 0 and part % 32 == 0 and half_inter * 2 == inter,
+        f"dense MLP of {inter} intermediates does not split into {slices} slices",
+    )
+    gu = gate_up.view(torch.uint8).view(2, slices, part, half_k).transpose(0, 1)
+    gus = gate_up_scale.view(torch.uint8).view(2, slices, part, -1).transpose(0, 1)
+    dn = down.view(torch.uint8).view(hidden, slices, part // 2).transpose(0, 1)
+    dns = down_scale.view(torch.uint8).view(hidden, slices, part // 32).transpose(0, 1)
+    w_ug = shuffle_weight(gu.reshape(slices, 2 * part, half_k).contiguous(), (16, 16))
+    w_dn = shuffle_weight(dn.contiguous(), (16, 16))
+    w_ug.is_shuffled = True
+    w_dn.is_shuffled = True
+    return {
+        "w_ug": w_ug,
+        "s_ug": shuffle_scale(gus.reshape(slices * 2 * part, -1).contiguous()),
+        "w_dn": w_dn,
+        "s_dn": shuffle_scale(dns.reshape(slices * hidden, -1).contiguous()),
+    }
+
+
 def prepare_aiter_mxfp4_expert_storage(
     weights: LayerWeights,
 ) -> tuple[torch.Tensor, ...]:

@@ -143,6 +143,7 @@ class Glm5MonoKernel:
         index_shuffled: bool = False,
         block_table_stride: int = 0,
         index_k_bf16: bool = False,
+        dense_experts: int = 0,
     ):
         expected_config = glm5_tp_config(npes)
         if W.config != expected_config:
@@ -168,6 +169,12 @@ class Glm5MonoKernel:
         self.W, self.S, self.rank, self.npes, self.topk = W, samples, rank, npes, topk
         self.launches_per_step = launches_per_step
         self.with_indexer = with_indexer
+        if dense_experts and W.physical_experts != dense_experts:
+            raise ValueError(
+                f"dense_experts={dense_experts} needs that many expert slices, "
+                f"got physical_experts={W.physical_experts}"
+            )
+        self.dense_experts = dense_experts
         self.index_max_seq = index_max_seq
         self.index_paged = index_paged
         self.index_block_size = index_block_size
@@ -314,6 +321,7 @@ class Glm5MonoKernel:
             index_shuffled=index_shuffled,
             block_table_stride=block_table_stride,
             index_k_bf16=index_k_bf16,
+            dense_experts=dense_experts,
         )
 
     def debug(

@@ -25,7 +25,7 @@ from aiter.ops.flydsl.kernels.glm5_mono.glm.op import (
     Glm5MonoKernel,
     prepare_glm5_weights,
 )
-from aiter.ops.flydsl.kernels.glm5_mono.weights import LayerWeights
+from aiter.ops.flydsl.kernels.glm5_mono.weights import LayerWeights, pack_dense_mlp
 from aiter.ops.flydsl.kernels.glm5_mono.weights import (
     _unshuffle_linear_weight as _unshuffle,
 )
@@ -41,6 +41,7 @@ __all__ = [
     "glm5_kernel_samples",
     "glm5_mono_launch_rows",
     "glm5_tp_config",
+    "pack_dense_mlp",
     "prepare_glm5_weights",
     "unshuffle_linear_weight",
 ]

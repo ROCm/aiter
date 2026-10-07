@@ -193,6 +193,7 @@ def build_glm5_monokernel(
     index_shuffled: bool = False,
     block_table_stride: int = 0,
     index_k_bf16: bool = False,
+    dense_experts: int = 0,
 ):
     """Return the ``@flyc.jit`` launcher for one rank's whole layer.
 
@@ -209,6 +210,10 @@ def build_glm5_monokernel(
     positions ``0 .. positions[s]``, and the top-k is published as global cache
     slots to ``out_indices`` at the row's ``sparse_kv_indptr`` offset.
     ``index_k_bf16`` reads the index K projection as packed bf16.
+
+    ``dense_experts > 0`` runs a dense MLP instead of the MoE: its intermediate
+    dimension is stored as that many expert-shaped slices, every row routes to all
+    of them with weight 1, and the router GEMV is skipped.
     """
     assert uv_scale_rows in (64, 128)
     assert heads % WAVES == 0, "split attention maps one local head to each wave"
@@ -240,11 +245,14 @@ def build_glm5_monokernel(
         and index_block_bytes % 4 == 0
         and (not index_shuffled or index_block_size % 16 == 0)
     )
+    assert 0 <= dense_experts <= MOE_SLOTS
+    assert not dense_experts or (S > 1 and atom_experts)
     H = heads
     L = H if output_heads is None else output_heads
     W = npes
     D = dcp_size
     expert_inter = inter
+    SHARED = 0 if dense_experts else SHARED_EXPERT
     assert D == 1 or (D == W and H == L * D)
     I_PER_SLOT = expert_inter // UG_TILE
     G = BLOCKS
@@ -1476,6 +1484,8 @@ def build_glm5_monokernel(
 
         def load_bias():
             """This lane's 4 expert biases (issue before the scores wait)."""
+            if const_expr(dense_experts):
+                return None
             return [ld_f32(_rsrc(bias), lane + i * 64) for i in range(N_EXPERTS // 64)]
 
         def route_top8(s, raws=None, bs=None):
@@ -3609,7 +3619,8 @@ def build_glm5_monokernel(
                     r_ln,
                 )
 
-            pre = [u_r(c) for c in range(R_CPW)]
+            if const_expr(not dense_experts):
+                pre = [u_r(c) for c in range(R_CPW)]
             hint_wait(
                 N_ROW_TILES,
                 lambda k: (
@@ -3677,42 +3688,52 @@ def build_glm5_monokernel(
                     if lane == 0:
                         put(mb("xqs"), x_s * XQ_BLOCKS + x_blk, qs)
             gpu.barrier()
-            acc = run_units(u_r, R_CPW, R_CPW, pre)
-            fx.ptr_store(
-                fx.Vector.from_elements(acc, fx.Float32), red + (wave * 64 + lane) * 4
-            )
-            gpu.barrier()
-            stamp("router", tt, 3)
-            if tid < ROUTER_TILE:
-                r = tid % ROUTER_TILE
-                n = fx.Int32(0)
-                logit = fx.Float32(0.0)
-                for w in range_constexpr(WAVES):
-                    for f in range_constexpr(2):
-                        m = f * ROUTER_TILE + r
-                        logit = logit + lds_ld(
-                            red,
-                            (w * 64 + f * ROUTER_TILE + n + 16 * (m // 4)) * 4 + m % 4,
-                        )
-                put(
-                    mb("scores"),
-                    router_sample * N_EXPERTS + t * ROUTER_TILE + r,
-                    _rcp(1.0 + _exp(-logit)),
+            if const_expr(not dense_experts):
+                acc = run_units(u_r, R_CPW, R_CPW, pre)
+                fx.ptr_store(
+                    fx.Vector.from_elements(acc, fx.Float32),
+                    red + (wave * 64 + lane) * 4,
                 )
+                gpu.barrier()
+                stamp("router", tt, 3)
+                if tid < ROUTER_TILE:
+                    r = tid % ROUTER_TILE
+                    n = fx.Int32(0)
+                    logit = fx.Float32(0.0)
+                    for w in range_constexpr(WAVES):
+                        for f in range_constexpr(2):
+                            m = f * ROUTER_TILE + r
+                            logit = logit + lds_ld(
+                                red,
+                                (w * 64 + f * ROUTER_TILE + n + 16 * (m // 4)) * 4
+                                + m % 4,
+                            )
+                    put(
+                        mb("scores"),
+                        router_sample * N_EXPERTS + t * ROUTER_TILE + r,
+                        _rcp(1.0 + _exp(-logit)),
+                    )
             stamp("router", tt, 4)
 
         def dn_route(bs):
             """Expert-down routing: one whole wave per sample, in wave-sized batches."""
             for sample_batch in range_constexpr(sample_wave_batches(S)):
                 route_sample = wave + sample_batch * WAVES
-                if route_sample < S:
+                if const_expr(dense_experts):
+                    # slot j < dense_experts: slice j, weight 1; spare slots weigh 0
+                    if (route_sample < S) & (lane < MOE_SLOTS):
+                        q = route_sample * MOE_SLOTS + lane
+                        used = lane < dense_experts
+                        lds_st(keys, q, used.select(lane, fx.Int32(SHARED)))
+                        lds_st(dnw, q, used.select(fx.Float32(1.0), fx.Float32(0.0)))
+                elif route_sample < S:
                     e, w = route_top8(route_sample, bs=bs)
                     if (
                         lane < MOE_SLOTS
                     ):  # slot 0: the shared expert, then pick lane (slot lane + 1)
                         q = route_sample * MOE_SLOTS + (lane + 1) % MOE_SLOTS
                         lds_st(
-                            keys, q, (lane == TOP_K).select(fx.Int32(SHARED_EXPERT), e)
+                            keys, q, (lane == TOP_K).select(fx.Int32(SHARED), e)
                         )
                         lds_st(dnw, q, (lane == TOP_K).select(fx.Float32(1.0), w))
 
@@ -3884,7 +3905,7 @@ def build_glm5_monokernel(
                 # the shared expert's weights do not depend on routing: prefetch them (the
                 # later zero-weight MMAs of the other tasks are cheaper than a branch)
                 pre = [
-                    u_ug8(cc, fx.Int32(SHARED_EXPERT), has_sh)
+                    u_ug8(cc, fx.Int32(SHARED), has_sh)
                     for cc in range(UG8_CPW // 2)
                 ]
                 hint_wait(
@@ -3969,7 +3990,7 @@ def build_glm5_monokernel(
                     put(mb("sel"), slot, e_sel)
                     put(mb("prob"), slot, lds_ld(misc, 0))
                     if has_sh:
-                        put(mb("sel"), 0, fx.Int32(SHARED_EXPERT))
+                        put(mb("sel"), 0, fx.Int32(SHARED))
                         put(mb("prob"), 0, fx.Float32(1.0))
                 stamp("ug", u, 4)
         elif const_expr(S > 1):
@@ -4107,7 +4128,7 @@ def build_glm5_monokernel(
                                 lds_ld(dnw, sn * MOE_SLOTS + sl),
                             )
 
-                    shared_pre = ug8_units(fx.Int32(SHARED_EXPERT), None, has_sh)
+                    shared_pre = ug8_units(fx.Int32(SHARED), None, has_sh)
                     cur = ug8_units(_uniform(lds_ld(keys, slot)), 0)
                     if has_sh:
                         reduce_rows(
@@ -4291,7 +4312,7 @@ def build_glm5_monokernel(
                 e, w = route_top8(s_u, raws, bs)
                 i_pk = fx.max(slot - 1, 0)
                 e_sel = _uniform(
-                    (slot == 0).select(fx.Int32(SHARED_EXPERT), read_lane_i32(e, i_pk))
+                    (slot == 0).select(fx.Int32(SHARED), read_lane_i32(e, i_pk))
                 )
                 prob = (slot == 0).select(
                     fx.Float32(1.0),
