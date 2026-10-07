@@ -316,6 +316,7 @@ def _skip_unless_gfx1250():
         (4, 4096, 1024, True),
         (8, 17408, 4096, True),
         (16, 4096, 1024, False),
+        (2048, 128, 4096, True),
     ],
 )
 def test_gemm_a16w16_auto_backend_opt_in(monkeypatch, M, N, K, expect_triton):
@@ -330,6 +331,23 @@ def test_gemm_a16w16_auto_backend_opt_in(monkeypatch, M, N, K, expect_triton):
     torch.testing.assert_close(out, F.linear(x, w), atol=1e-1, rtol=1e-2)
     assert len(spy.async_copy) == (1 if expect_triton else 0)
     assert not any(spy.async_copy)
+
+
+@pytest.mark.parametrize(
+    "M, N, K",
+    [(1, 4096, 1024), (16, 4096, 1024), (4096, 4096, 1024), (2048, 128, 4096)],
+)
+def test_gemm_a16w16_explicit_triton_on_opt_in_configs(monkeypatch, M, N, K):
+    _skip_unless_gfx1250()
+    monkeypatch.setenv("CU_NUM", "256")
+    spy = _TritonLaunchSpy(_gemm_a16w16_module._gemm_a16_w16_kernel)
+    monkeypatch.setattr(_gemm_a16w16_module, "_gemm_a16_w16_kernel", spy)
+    x, w, _, _, _ = generate_gemm_a16w16_inputs(M, N, K, torch.bfloat16, output=False)
+
+    out = gemm_a16w16(x, w, backend="triton")
+
+    torch.testing.assert_close(out, F.linear(x, w), atol=1e-1, rtol=1e-2)
+    assert len(spy.async_copy) == 1
 
 
 def test_gemm_a16w16_persistent_ignores_opt_in(monkeypatch):

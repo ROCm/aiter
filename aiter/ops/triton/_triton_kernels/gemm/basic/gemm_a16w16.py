@@ -184,4 +184,6 @@ def _get_config(
     K: int,
 ):
     config, is_tuned = get_gemm_config("GEMM-A16W16", M, N, K, backend="triton")
+    # auto-detect opt-in marker, not a kernel arg
+    config.pop("backend", None)
     return compute_splitk_params(config, K), is_tuned
