@@ -318,6 +318,8 @@ PLAT_TO_VCVARS = {
 
 
 def get_cxx_compiler():
+    if int(os.environ.get("AITER_USE_ASAN", "0")) != 0 and "CXX" not in os.environ:
+        return _join_rocm_home("llvm", "bin", "clang++")
     return os.environ.get("CXX", "c++")
 
 

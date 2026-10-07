@@ -761,6 +761,7 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
             "bd_dir": self.bd_dir,
             "PY": sys.executable,
             "AITER_REBUILD": 0,
+            "AITER_USE_ASAN": False,
             "AITER_LOG_MORE": 0,
             "AITER_DISABLE_KERNARG_PRELOAD": True,
             "AITER_ROOT_DIR": self.root,
@@ -791,7 +792,12 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
         }
         self.core = _load_functions(
             JIT_CACHE_PATH.parents[1] / "core.py",
-            ["build_module", "_stage_blob_sources", "rename_cpp_to_cu"],
+            [
+                "build_module",
+                "_stage_blob_sources",
+                "rename_cpp_to_cu",
+                "_asan_build_flags",
+            ],
             namespace,
         )
 
@@ -823,6 +829,29 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
         self.assertTrue(
             jit_cache.compiled_kids_are_current(self.sidecar, self.artifact, {1, 7, 9})
         )
+
+    def test_asan_flags_survive_optional_flag_filter(self):
+        self.core["AITER_USE_ASAN"] = True
+        self.core["hip_flag_checker"] = lambda _flag: False
+        compiler = mock.Mock(wraps=self.core["_jit_compile"])
+        self.core["_jit_compile"] = compiler
+        self.build(7)
+        flags = compiler.call_args.kwargs
+        for field in ("extra_cflags", "extra_cuda_cflags", "extra_ldflags"):
+            self.assertIn("-fsanitize=address", flags[field])
+            self.assertIn("-shared-libsan", flags[field])
+        self.assertIn("--offload-arch=gfx942:xnack+", flags["extra_cuda_cflags"])
+        self.assertNotIn("--offload-arch=gfx942", flags["extra_cuda_cflags"])
+        self.assertIn("-Werror=option-ignored", flags["extra_cuda_cflags"])
+
+    def test_normal_build_does_not_add_sanitizer_flags(self):
+        compiler = mock.Mock(wraps=self.core["_jit_compile"])
+        self.core["_jit_compile"] = compiler
+        self.build(7)
+        flags = compiler.call_args.kwargs
+        for field in ("extra_cflags", "extra_cuda_cflags", "extra_ldflags"):
+            self.assertNotIn("-fsanitize=address", flags[field])
+        self.assertIn("--offload-arch=gfx942", flags["extra_cuda_cflags"])
 
     def test_repeated_build_installs_new_kids_under_stable_target_name(self):
         self.build(7)
