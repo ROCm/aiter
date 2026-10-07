@@ -1917,3 +1917,57 @@ def test_fp8_repeat_launch_is_bit_exact_under_load():
     base = outs[100]
     bad = sum(1 for o in outs if not torch.equal(o, base))
     assert bad == 0, f"{bad}/200 launches differed bitwise from the reference launch"
+
+
+def _fp8_public_varlen_inputs(seq_len=256, num_heads=4, head_dim=128):
+    torch.manual_seed(FP8_SEED)
+    shape = (seq_len, num_heads, head_dim)
+    q, qs = _fp8_quant(torch.randn(shape, device="cuda", dtype=torch.bfloat16) * 3)
+    k, ks = _fp8_quant(torch.randn(shape, device="cuda", dtype=torch.bfloat16))
+    v, vs = _fp8_quant(torch.randn(shape, device="cuda", dtype=torch.bfloat16) * 4)
+    cu = torch.tensor([0, seq_len], dtype=torch.int32, device="cuda")
+    return (q, k, v), (qs, ks, vs), cu
+
+
+@_gfx950_only
+def test_fp8_public_varlen_descale_routes_to_flydsl():
+    """flash_attn_varlen_func passes per-tensor descales to the FlyDSL fp8 kernel."""
+    from aiter import flash_attn_varlen_func
+
+    (q, k, v), (qs, ks, vs), cu = _fp8_public_varlen_inputs()
+    L = q.shape[0]
+    out = flash_attn_varlen_func(
+        q, k, v, cu, cu, L, L, causal=True, q_descale=qs, k_descale=ks, v_descale=vs
+    )
+    ref = _ref_attention(
+        _fp8_dequant(q, qs)[None],
+        _fp8_dequant(k, ks)[None],
+        _fp8_dequant(v, vs)[None],
+        causal=True,
+    )[0]
+    rel, err, _ = _fp8_rel_err(out.float(), ref)
+    assert rel < 0.05, f"rel err {rel:.4f} (abs {err:.4f})"
+
+
+@_gfx950_only
+def test_fp8_public_varlen_descale_rejects_unsupported():
+    """Descales must not be dropped silently when the FlyDSL fp8 path declines."""
+    from aiter import flash_attn_varlen_func
+
+    (q, k, v), (qs, ks, vs), cu = _fp8_public_varlen_inputs()
+    L = q.shape[0]
+    with pytest.raises(ValueError, match="flash_attn_varlen_fp8_pertensor_func"):
+        flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu,
+            cu,
+            L,
+            L,
+            causal=True,
+            window_size=(64, 0, 0),
+            q_descale=qs,
+            k_descale=ks,
+            v_descale=vs,
+        )
