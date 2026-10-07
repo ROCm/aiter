@@ -14,7 +14,9 @@ E4M3FNUZ K/V with page 32, 64 or 128, per-tensor fp32 descales, and bf16
 output. That covers both Gemma-4 layer types. One launch serves a whole varlen
 batch: multi-token sequences run as prefill tiles, one-token sequences as KV
 splits that a second launch combines. A batch of only one-token sequences runs
-a decode-only build of the same kernel.
+a decode-only build of the same kernel. A lone multi-token sequence has no
+decode combine; when its tiles cannot fill the GPU it splits their KV range,
+and a prefill combine merges the splits.
 """
 
 from __future__ import annotations
@@ -28,6 +30,8 @@ from .kernels.flash_attn_fp8_gfx942 import (
     build_flash_attn_fp8_gfx942_combine_module,
     build_flash_attn_fp8_gfx942_module,
     plan_num_kv_splits,
+    plan_prefill_splits,
+    prefill_block_k,
     prefill_block_q,
 )
 
@@ -53,6 +57,11 @@ def is_flydsl_available(device_index: int) -> bool:
         return False
     props = torch.cuda.get_device_properties(device_index)
     return props.gcnArchName.split(":", 1)[0] == "gfx942"
+
+
+@cache
+def _num_cus(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
 def _window_keys(window_size):
@@ -297,13 +306,19 @@ def _cede_to_triton(
         if head_size == 256 and block_size == 64 and window is not None:
             return num_seqs >= 256 or (num_seqs == 96 and 4096 <= max_seqlen_k < 32768)
         return False
-    # Initial prefills and prefix chunks through 512 queries lack a repeatable
-    # margin for both Gemma-4 layer types. Above 512 FlyDSL crosses over.
-    if 1 < max_seqlen_q <= 512:
-        return True
-    # The tested N32 and N64 head-256 prefill shapes both lose cells to the
-    # page-32 Triton table. Keep this page on Triton until a winning tile lands.
-    return head_size == 256 and block_size == 32 and window is not None
+    if num_seqs == 1:
+        # A lone sequence: a prefix chunk over a cached prefix of at least
+        # four tiles splits its KV range and wins. A short fresh prefill is
+        # latency bound, and Triton's lighter prologue wins through 256 tokens
+        # at head 512 and 384 at head 256 (page 32).
+        prefix = max_seqlen_k - max_seqlen_q
+        if window is not None:
+            prefix = min(prefix, window - 1)
+        short = 384 if head_size == 256 else 256
+        return max_seqlen_q <= short and prefix < 4 * prefill_block_k(head_size)
+    # Mixed batches cannot split a chunk's KV range, so a short chunk over a
+    # long prefix walks it alone; through 512 queries Triton keeps the batch.
+    return max_seqlen_q <= 512
 
 
 def _as_i8(t: torch.Tensor) -> torch.Tensor:
@@ -339,17 +354,34 @@ def _launch(
     block_size,
     num_seqs,
     num_kv_splits=None,
+    num_prefill_splits=None,
 ):
     """Launch for a call that passed _supported. window is the inclusive key
-    count or None; num_kv_splits forces the decode split count."""
-    _, num_query_heads, head_size = q.shape
+    count or None; num_kv_splits forces the decode split count, and
+    num_prefill_splits the KV split count of a lone multi-token sequence."""
+    num_tokens, num_query_heads, head_size = q.shape
     decode_only = max_seqlen_q == 1
+    # A lone multi-token sequence (a prefill or a prefix chunk) has no decode
+    # slots, so it needs no decode combine; it may split its KV range instead.
+    lone_prefill = not decode_only and num_seqs == 1
     # Triton's q-block count: an upper bound on any batch's prefill tiles.
     tile_slots = (
         0
         if decode_only
-        else q.shape[0] // prefill_block_q(num_query_heads, num_kv_heads) + num_seqs
+        else num_tokens // prefill_block_q(num_query_heads, num_kv_heads) + num_seqs
     )
+    psplits = 1
+    if lone_prefill:
+        psplits = num_prefill_splits or plan_prefill_splits(
+            max_seqlen_q,
+            max_seqlen_k,
+            num_tokens,
+            num_query_heads,
+            num_kv_heads,
+            window,
+            head_size,
+            _num_cus(q.device.index),
+        )
     splits = num_kv_splits or plan_num_kv_splits(
         num_seqs,
         max_seqlen_k,
@@ -361,12 +393,13 @@ def _launch(
     # Each decode wave runs one split; the unified kernel has four per workgroup.
     waves = 1 if decode_only else 4
     groups = (splits + waves - 1) // waves
+    decode_slots = 0 if lone_prefill else num_seqs * groups
     stream = torch.cuda.current_stream(q.device)
-    workspace = _workspace(
-        q.device,
-        stream,
-        max(4, num_seqs * num_query_heads * groups * waves * (head_size + 4)),
-    )
+    if lone_prefill:
+        partials = num_tokens * num_query_heads * psplits if psplits > 1 else 0
+    else:
+        partials = num_seqs * num_query_heads * groups * waves
+    workspace = _workspace(q.device, stream, max(4, partials * (head_size + 4)))
     with torch.cuda.device(q.device):
         kernel = build_flash_attn_fp8_gfx942_module(
             head_size,
@@ -377,7 +410,6 @@ def _launch(
             k.stride()[:3] + v.stride()[:3],
             decode_only=decode_only,
         )
-        combine = build_flash_attn_fp8_gfx942_combine_module(head_size, num_query_heads)
         kernel(
             _as_i8(q),
             _as_i8(k),
@@ -392,15 +424,27 @@ def _launch(
             _as_1d_descale(v_descale),
             num_seqs,
             tile_slots,
+            psplits,
             groups,
             # Binary-search steps over cu_seqlens_q's num_seqs + 1 entries.
-            max(1, num_seqs.bit_length()),
+            (num_seqs - 1).bit_length(),
             block_table.stride(0),
             float(softmax_scale),
-            tile_slots + num_seqs * groups,
+            tile_slots * psplits + decode_slots,
             stream=stream,
         )
-        combine(workspace, out, cu_seqlens_q, num_seqs, groups * waves, stream=stream)
+        if psplits > 1:
+            combine = build_flash_attn_fp8_gfx942_combine_module(
+                head_size, num_query_heads, prefill=True
+            )
+            combine(workspace, out, cu_seqlens_q, num_tokens, psplits, stream=stream)
+        elif not lone_prefill:
+            combine = build_flash_attn_fp8_gfx942_combine_module(
+                head_size, num_query_heads
+            )
+            combine(
+                workspace, out, cu_seqlens_q, num_seqs, groups * waves, stream=stream
+            )
     return out
 
 

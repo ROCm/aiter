@@ -223,9 +223,9 @@ def interleave_kv(k, v):
     return kv[..., :head_dim], kv[..., head_dim:]
 
 
-def direct_candidate(case, kv_lens, splits=None):
+def direct_candidate(case, kv_lens, splits=None, prefill_splits=None):
     """Launch past the support gate and dispatch policy; splits forces the
-    decode split count."""
+    decode split count, prefill_splits a lone sequence's KV split count."""
     from aiter.ops.flydsl import unified_attention_kernels as adapter
 
     def launch():
@@ -248,6 +248,7 @@ def direct_candidate(case, kv_lens, splits=None):
             block_size=case["k"].shape[1],
             num_seqs=len(kv_lens),
             num_kv_splits=splits,
+            num_prefill_splits=prefill_splits,
         )
 
     return launch
@@ -397,6 +398,28 @@ def test_splitk_combine(shape, splits):
 
 
 @benchmark()
+def test_prefill_splits(shape, page, chunk, splits):
+    """A lone prefix chunk whose KV range splits across workgroups, merged by
+    the prefill combine; None takes the planner's count."""
+    from aiter.ops.flydsl import unified_attention_kernels as adapter
+
+    query_lens, kv_lens = [chunk[0]], [chunk[1]]
+    case = make_case(query_lens, kv_lens, shape, page)
+    case["softmax_scale"] = 1.0
+    want = reference(case, query_lens, kv_lens)
+    case["k"], case["v"] = interleave_kv(case["k"], case["v"])
+    launch = direct_candidate(case, kv_lens, prefill_splits=splits)
+    launch()
+    # Every split must write its partial before the combine reads it.
+    for workspace in adapter._workspaces.values():
+        workspace.fill_(float("nan"))
+    case["out"].fill_(float("nan"))
+    ret = measure({"prefill_splits": launch}, case, want, query_lens, kv_lens)
+    ret["splits run"] = splits or "planned"
+    return ret
+
+
+@benchmark()
 def test_paged_addressing(shape, boundary_gib, layout):
     query_lens, kv_lens = [1, 33], [65, 1057]
     original = make_case(query_lens, kv_lens, shape)
@@ -486,11 +509,32 @@ def test_routing_backend_gate(config):
 
 
 def test_cede_policy():
-    from aiter.ops.flydsl.kernels.flash_attn_fp8_gfx942 import plan_num_kv_splits
+    from aiter.ops.flydsl.kernels.flash_attn_fp8_gfx942 import (
+        plan_num_kv_splits,
+        plan_prefill_splits,
+    )
     from aiter.ops.flydsl.unified_attention_kernels import _cede_to_triton
 
-    assert _cede_to_triton(512, 512, 1, 512, 128, None)
-    assert not _cede_to_triton(512, 768, 1, 768, 128, None)
+    # Lone sequences: short fresh prefills cede (through 256 tokens at head
+    # 512, 384 at head 256); longer ones, and prefix chunks over at least four
+    # tiles of cached prefix, are served.
+    assert _cede_to_triton(512, 256, 1, 256, 64, None)
+    assert _cede_to_triton(256, 32, 1, 32, 32, 1024)
+    assert _cede_to_triton(256, 200, 1, 300, 64, 1024)
+    assert _cede_to_triton(256, 384, 1, 384, 32, 1024)
+    assert not _cede_to_triton(256, 512, 1, 512, 32, 1024)
+    assert not _cede_to_triton(512, 384, 1, 384, 128, None)
+    assert not _cede_to_triton(512, 16, 1, 4096, 64, None)
+    assert not _cede_to_triton(256, 16, 1, 16384, 32, 1024)
+    assert not _cede_to_triton(256, 4096, 1, 4096, 32, 1024)
+    # Mixed batches keep chunks through 512 queries on Triton.
+    assert _cede_to_triton(512, 512, 4, 4096, 64, None)
+    assert not _cede_to_triton(512, 1024, 33, 16384, 64, None)
+    # A fresh prefill never splits; a short chunk fills the GPU.
+    assert plan_prefill_splits(4096, 4096, 4096, 32, 4, None, 512, 304) == 1
+    assert plan_prefill_splits(16, 4096, 16, 32, 4, None, 512, 304) == 38
+    assert plan_prefill_splits(256, 4096, 256, 32, 4, None, 512, 304) == 2
+    assert plan_prefill_splits(16, 4096, 16, 32, 16, 1024, 256, 304) == 7
     assert _cede_to_triton(512, 1, 16, 32768, 64, None)
     assert _cede_to_triton(512, 1, 40, 4096, 64, None)
     assert _cede_to_triton(512, 1, 32, 4096, 64, None)
@@ -539,7 +583,8 @@ def test_warm_cache_run_only(shape, path):
 def test_aot_matrix(shape, tp, page, layout, path):
     """Exercise every attention AOT key for TP1/TP4 under run-only mode."""
     if path == "prefill":
-        query_lens, kv_lens = [512], [512]
+        # A prefix chunk: the unified build, and its KV splits' combine.
+        query_lens, kv_lens = [64], [1024]
     else:
         query_lens, kv_lens = [1] * 4, [1024] * 4
     case = make_case(query_lens, kv_lens, shape, page=page, seed=23, tp=tp)
@@ -646,6 +691,16 @@ def main():
             "split-K combine",
             test_splitk_combine,
             itertools.product(args.shape, args.splits),
+        ),
+        (
+            "prefill KV splits",
+            test_prefill_splits,
+            itertools.product(
+                args.shape,
+                args.page,
+                [(16, 1500), (37, 4096), (300, 3000)],
+                [None, 3, 8],
+            ),
         ),
         (
             "paged addressing",

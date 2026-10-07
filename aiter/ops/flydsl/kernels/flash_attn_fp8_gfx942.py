@@ -5,17 +5,20 @@
 
 Covers Gemma-4's layer shapes: head 512 with GQA 8:1 and no window, and head
 256 with GQA 2:1 and a sliding window. Q/K/V are FP8 E4M3FNUZ with per-tensor
-FP32 descales; the output is BF16. K and V are paged with page 32 or 64 and
-may be strided views (vLLM hands K and V as views of one cache tensor).
+FP32 descales; the output is BF16. K and V are paged with page 32, 64 or 128
+and may be strided views (vLLM hands K and V as views of one cache tensor).
 
 Grid y has two regions. Tile slots follow Triton's q-block mapping (sequence
 s owns slots from cu_q[s] // tokens + s, found by binary search, heaviest
 first); each runs the prefill body over 64 // GQA query tokens of a
 multi-token sequence with four waves, so prefix-cached chunks are prefill
-tiles with q_len < k_len. Decode slots give each wave one split of a
-one-token sequence, running a 32-key decode body entirely in registers: K
-loads straight into MFMA operands, and V is byte-transposed in place, so
-decode waves need no LDS and no barriers. A combine launch merges the splits.
+tiles with q_len < k_len. A tile's page ids are looked up a tile ahead of its
+K/V loads. A lone multi-token sequence may split each tile's KV range over
+psplits adjacent slots, which write fp32 partials for a prefill combine.
+Decode slots give each wave one split of a one-token sequence, running a
+32-key decode body entirely in registers: K loads straight into MFMA
+operands, and V is byte-transposed in place, so decode waves need no LDS and
+no barriers. A combine launch merges the splits.
 
 Both GEMMs use mfma_f32_16x16x32_fp8_fp8 in transposed form (S^T = K Q^T,
 O^T += V^T P^T), so P needs no cross-lane moves. P is scaled by 240 before
@@ -98,6 +101,11 @@ def _vt_offset(depth, key4, keys):
     return (depth // 32) * (32 * keys) + key4 * 128 + bank * 4
 
 
+def _sload(rsrc, index):
+    """One dword at a wave-uniform dword index, as an s_buffer_load."""
+    return fx.Int32(buffer_ops.buffer_load(rsrc, index, vec_width=1, is_scalar=True))
+
+
 def _transpose4(words):
     """4x4 byte transpose in registers: byte t of word s is byte s of words[t]."""
     lo = [rocdl.perm_b32(words[2 * i + 1], words[2 * i], 0x05010400) for i in range(2)]
@@ -150,6 +158,48 @@ def prefill_block_q(num_q_heads, num_kv_heads):
     return 4 * (16 // (num_q_heads // num_kv_heads))
 
 
+def prefill_block_k(head_dim):
+    """Keys per prefill tile."""
+    return 64 if head_dim == 256 else 32
+
+
+# Prefill splits keep at least this many cached-prefix tiles each, and their
+# fp32 partials stay under this many bytes.
+PREFILL_SPLIT_MIN_TILES = 2
+PREFILL_SPLIT_MAX_BYTES = 64 << 20
+
+
+def plan_prefill_splits(
+    max_seqlen_q,
+    max_seqlen_k,
+    num_tokens,
+    num_q_heads,
+    num_kv_heads,
+    window,
+    head_dim,
+    num_cus,
+):
+    """KV splits for a lone multi-token sequence: a prefill or a prefix chunk,
+    whose max_seqlen_q and max_seqlen_k are then its own lengths.
+
+    A short chunk over a long cached prefix has too few query tiles to fill
+    the GPU, so each tile walks the prefix alone. Fitted on MI325X (page 64,
+    chunks of 16-1024 queries over 1K-16K keys): about one workgroup per CU
+    is best, with at least two prefix tiles per split. A fresh prefill never
+    gains, since its causal ramp already spreads the keys over its tiles.
+    """
+    tiles = -(-max_seqlen_q // prefill_block_q(num_q_heads, num_kv_heads))
+    prefix = max_seqlen_k - max_seqlen_q
+    if window is not None:
+        prefix = min(prefix, window - 1)
+    splits = min(
+        num_cus // (tiles * num_kv_heads),
+        prefix // prefill_block_k(head_dim) // PREFILL_SPLIT_MIN_TILES,
+    )
+    row_bytes = num_tokens * num_q_heads * (head_dim + 4) * 4
+    return max(1, min(splits, PREFILL_SPLIT_MAX_BYTES // row_bytes))
+
+
 @lru_cache(maxsize=32)
 def build_flash_attn_fp8_gfx942_module(
     dim,
@@ -189,7 +239,7 @@ def build_flash_attn_fp8_gfx942_module(
     vchunks = dim // 256
     stride = dim + 4
     wleft = NO_WINDOW if window is None else window - 1
-    pn = prefill_keys or (64 if dim == 256 else 32)
+    pn = prefill_keys or prefill_block_k(dim)
     lds_bytes = 2 * pn * dim
     if pn not in (32, 64) or lds_bytes > 65536:
         raise ValueError("prefill_keys must be 32 or 64 and fit in LDS")
@@ -198,6 +248,12 @@ def build_flash_attn_fp8_gfx942_module(
     pvt = pn * dim
     k_loads = pn * dim // 4096
     v_loads = pn // 16 * lpr
+    # Pages a prefill tile spans. K load i covers 4096 // dim keys from key
+    # i * 4096 // dim, and wave w's V loads cover pn // 4 keys from w * pn // 4,
+    # so each load sits in one page.
+    nslots = max(1, pn // page_size)
+    kslot = [i * 4096 // dim // page_size if nslots > 1 else 0 for i in range(k_loads)]
+    nchunks = k_loads + v_loads
     k_strides, v_strides = tuple(kv_strides[:3]), tuple(kv_strides[3:])
     # Waves per workgroup; each decode wave runs one split.
     waves = 1 if decode_only else 4
@@ -221,6 +277,7 @@ def build_flash_attn_fp8_gfx942_module(
         VD: fx.Tensor,
         num_seqs: fx.Int32,
         tile_slots: fx.Int32,
+        psplits: fx.Int32,
         groups: fx.Int32,
         search_iters: fx.Int32,
         bt_stride: fx.Int32,
@@ -235,43 +292,23 @@ def build_flash_attn_fp8_gfx942_module(
         y = fx.Int32(gpu.block_id("y"))
         if const_expr(not decode_only):
             buf = fx.SharedAllocator().allocate(SharedStorage).peek().buf.ptr
-        log_scale = (
-            fx.Float32(fx.memref_load(QD, 0))
-            * fx.Float32(fx.memref_load(KD, 0))
-            * scale
-            * 1.4426950408889634
-        )
-        vscale = fx.Float32(fx.memref_load(VD, 0)) / 240.0
+
+        def descales():
+            """(log2-domain QK scale, V descale over P's 240), loaded by each
+            role next to its sequence lengths."""
+            log_scale = (
+                fx.Float32(fx.memref_load(QD, 0))
+                * fx.Float32(fx.memref_load(KD, 0))
+                * scale
+                * 1.4426950408889634
+            )
+            return log_scale, fx.Float32(fx.memref_load(VD, 0)) * (1.0 / 240.0)
+
         qp, kp, vp, op = fx.get_iter(Q), fx.get_iter(K), fx.get_iter(V), fx.get_iter(O)
         pp, btp = fx.get_iter(Part), fx.get_iter(BT)
         splits = groups * waves
         sel_pair = (g % 2 == 0).select(fx.Int32(0x06020400), fx.Int32(0x03070105))
         sel_quad = (g < 2).select(fx.Int32(0x05040100), fx.Int32(0x03020706))
-
-        def kv_src(seq, klen, base_tok, key, d, strides):
-            s_page, s_tok, s_head = strides
-            tok = base_tok + key
-            # Past klen, reload a valid key: stale FNUZ bytes can be NaN.
-            safe_tok = (tok < klen).select(tok, base_tok)
-            # Per-load page lookup: a 64-key tile spans two pages at page 32.
-            page = fx.Int32(
-                _load(
-                    btp,
-                    (
-                        fx.Int64(seq) * fx.Int64(bt_stride)
-                        + fx.Int64(safe_tok // page_size)
-                    )
-                    * 4,
-                    T.i32,
-                    4,
-                )
-            )
-            return (
-                fx.Int64(page) * s_page
-                + fx.Int64(safe_tok % page_size) * s_tok
-                + fx.Int64(kvh) * s_head
-                + fx.Int64(d)
-            )
 
         def transpose_store(words, base, key4s, depths, keys):
             # Issue each shuffle round for all words before consuming it.
@@ -287,20 +324,27 @@ def build_flash_attn_fp8_gfx942_module(
                 _store(buf, base + _vt_offset(depths[n], key4s[n], keys), packed, 4)
 
         if const_expr(not decode_only):  # noqa: SIM102 - constexpr guard
-            if y < tile_slots:
+            if y < tile_slots * psplits:
                 # ---- prefill role ----
-                yy = tile_slots - 1 - y
+                # Scalar loads: these sit on every tile's critical path, and a
+                # vector load would wait out the whole vmcnt queue.
+                cuq = buffer_ops.create_buffer_resource(CuQ, max_size=True)
+                usedk = buffer_ops.create_buffer_resource(UsedK, max_size=True)
+                # Heaviest tiles first; the KV splits of a tile are adjacent.
+                yy = tile_slots - 1 - y // psplits
+                psplit = y % psplits
                 for _it, bs in range(
                     fx.Int32(0), search_iters, fx.Int32(1), init=[fx.Int32(0), num_seqs]
                 ):
                     lo, hi = fx.Int32(bs[0]), fx.Int32(bs[1])
                     mid = (lo + hi) // 2
-                    ok = fx.Int32(fx.memref_load(CuQ, mid)) // tokens + mid <= yy
+                    ok = _sload(cuq, mid) // tokens + mid <= yy
                     found = yield [ok.select(mid, lo), ok.select(hi, mid)]
                 pseq = fx.Int32(found[0])
-                pq0 = fx.Int32(fx.memref_load(CuQ, pseq))
-                pqlen = fx.Int32(fx.memref_load(CuQ, pseq + 1)) - pq0
-                pklen = fx.Int32(fx.memref_load(UsedK, pseq))
+                pq0 = _sload(cuq, pseq)
+                pqlen = _sload(cuq, pseq + 1) - pq0
+                pklen = _sload(usedk, pseq)
+                log_scale, vscale = descales()
                 ptile = yy - (pq0 // tokens + pseq)
                 if (pqlen > 1) & (ptile * tokens < pqlen):
                     pqbase = pklen - pqlen
@@ -324,19 +368,73 @@ def build_flash_attn_fp8_gfx942_module(
                         for ks in range(ksteps)
                     ]
 
-                    def p_fetch(block):
+                    plast_page = (pklen - 1) // page_size
+                    vslot = fx.Int32(rocdl.readfirstlane(T.i32, wave)) * (pn // 4)
+                    vslot = vslot // page_size
+
+                    def p_clamp(block):
+                        return (block < pend).select(block, pend - 1)
+
+                    def p_pages(block):
+                        """Block-table entries of the pages a valid tile spans,
+                        clamped to the sequence's last page. Uniform vector
+                        loads: they queue behind the K/V loads in flight, so
+                        waiting for those never waits for these."""
+                        first = block * pn // page_size
+                        return [
+                            _load(
+                                btp,
+                                (
+                                    fx.Int64(pseq) * fx.Int64(bt_stride)
+                                    + fx.Int64(
+                                        (first + h < plast_page).select(
+                                            first + h, plast_page
+                                        )
+                                    )
+                                )
+                                * 4,
+                                T.i32,
+                                4,
+                            )
+                            for h in range(nslots)
+                        ]
+
+                    def p_fetch(block, pages):
                         base_tok = block * pn
+                        pages = [fx.Int32(rocdl.readfirstlane(T.i32, p)) for p in pages]
+
+                        def bases(strides):
+                            return [
+                                fx.Int64(p) * strides[0] + fx.Int64(kvh) * strides[2]
+                                for p in pages
+                            ]
+
+                        def src(base0, base, key, d, s_tok):
+                            # Past klen, reload the tile's first key: stale FNUZ
+                            # bytes can be NaN.
+                            tok = base_tok + key
+                            ok = tok < pklen
+                            off = ok.select(tok, base_tok) & (page_size - 1)
+                            return (
+                                ok.select(base, base0)
+                                + fx.Int64(off) * s_tok
+                                + fx.Int64(d)
+                            )
+
+                        kb, vb = bases(k_strides), bases(v_strides)
+                        vbase = (
+                            vb[0] if nslots == 1 else (vslot == 0).select(vb[0], vb[1])
+                        )
                         kc = [
                             fx.Vector(
                                 _load(
                                     kp,
-                                    kv_src(
-                                        pseq,
-                                        pklen,
-                                        base_tok,
+                                    src(
+                                        kb[0],
+                                        kb[kslot[i]],
                                         (tid * 16 + i * 4096) // dim,
                                         (tid * 16 + i * 4096) % dim,
-                                        k_strides,
+                                        k_strides[1],
                                     ),
                                     fx.Vector.make_type(4, fx.Int32),
                                     16,
@@ -348,13 +446,12 @@ def build_flash_attn_fp8_gfx942_module(
                             fx.Vector(
                                 _load(
                                     vp,
-                                    kv_src(
-                                        pseq,
-                                        pklen,
-                                        base_tok,
+                                    src(
+                                        vb[0],
+                                        vbase,
                                         (wave * (pn // 16) + idx // lpr) * 4 + g,
                                         c * (dim // 16) + idx % lpr * 16,
-                                        v_strides,
+                                        v_strides[1],
                                     ),
                                     fx.Vector.make_type(4, fx.Int32),
                                     16,
@@ -365,13 +462,12 @@ def build_flash_attn_fp8_gfx942_module(
                         return kc + vc
 
                     @flyc.jit
-                    def p_fetch_guarded(block):
+                    def p_fetch_guarded(block, pages):
                         p_chunks = [
-                            fx.Vector.filled(4, 0, fx.Int32)
-                            for _ in range(k_loads + v_loads)
+                            fx.Vector.filled(4, 0, fx.Int32) for _ in range(nchunks)
                         ]
                         if block < pend:
-                            p_chunks = p_fetch(block)
+                            p_chunks = p_fetch(block, pages)
                         return p_chunks
 
                     def p_commit(chunks):
@@ -430,18 +526,26 @@ def build_flash_attn_fp8_gfx942_module(
                     def chain(ks, kb):
                         return kb * 2 + ks % 2 if kb_n == 2 else kb
 
+                    # This split's tiles: pstart + psplit, then every psplits-th.
+                    pfirst_blk = pstart + psplit
                     p_init = (
                         [fx.Float32(-1.0e30), fx.Float32(0.0)]
                         + [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(dblocks)]
-                        + p_fetch_guarded(pstart)
+                        + p_fetch_guarded(pfirst_blk, p_pages(p_clamp(pfirst_blk)))
+                        + p_pages(p_clamp(pfirst_blk + psplits))
                     )
-                    for block, state in range(pstart, pend, fx.Int32(1), init=p_init):
+                    for block, state in range(pfirst_blk, pend, psplits, init=p_init):
                         block = fx.Int32(block)
                         rocdl.sched_barrier(0)
-                        p_commit(state[2 + dblocks :])
+                        p_commit(state[2 + dblocks : 2 + dblocks + nchunks])
                         gpu.barrier()
-                        # The next tile's loads stay in flight through this tile's MFMAs.
-                        p_ahead = p_fetch_guarded(block + 1)
+                        # The next tile's loads stay in flight through this tile's
+                        # MFMAs. Its pages were looked up a tile earlier, so the
+                        # loads issue without waiting on the block table.
+                        p_ahead = p_fetch_guarded(
+                            block + psplits, list(state[2 + dblocks + nchunks :])
+                        )
+                        p_pages_ahead = p_pages(p_clamp(block + 2 * psplits))
                         rocdl.sched_barrier(0)
                         p_acc = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(4)]
                         p_group = [p_read_k(kb, ks) for ks, kb in qk_order[0:8]]
@@ -542,36 +646,59 @@ def build_flash_attn_fp8_gfx942_module(
                                 )
                             p_vgroup = p_nxt
                         gpu.barrier()
-                        presult = yield [p_m, p_denom] + p_next + p_ahead
+                        presult = yield (
+                            [p_m, p_denom] + p_next + p_ahead + p_pages_ahead
+                        )
 
+                    p_orow = (fx.Int64(pq0) + fx.Int64(pqtok)) * num_q_heads + fx.Int64(
+                        phead
+                    )
                     if pqtok < pqlen:
-                        p_norm = vscale / fx.Float32(presult[1])
-                        p_orow = (
-                            fx.Int64(pq0) + fx.Int64(pqtok)
-                        ) * num_q_heads + fx.Int64(phead)
-                        for db in range_constexpr(dblocks):
-                            vals = fx.Vector(presult[db + 2])
-                            dest = (p_orow * dim + fx.Int64(db * 16 + g * 4)) * 2
-                            _store(
-                                op,
-                                dest,
-                                _pack_bf16(vals[0] * p_norm, vals[1] * p_norm),
-                                4,
-                            )
-                            _store(
-                                op,
-                                dest + 4,
-                                _pack_bf16(vals[2] * p_norm, vals[3] * p_norm),
-                                4,
-                            )
-        if y >= tile_slots:
+                        if psplits == 1:
+                            p_norm = vscale / fx.Float32(presult[1])
+                            for db in range_constexpr(dblocks):
+                                vals = fx.Vector(presult[db + 2])
+                                dest = (p_orow * dim + fx.Int64(db * 16 + g * 4)) * 2
+                                _store(
+                                    op,
+                                    dest,
+                                    _pack_bf16(vals[0] * p_norm, vals[1] * p_norm),
+                                    4,
+                                )
+                                _store(
+                                    op,
+                                    dest + 4,
+                                    _pack_bf16(vals[2] * p_norm, vals[3] * p_norm),
+                                    4,
+                                )
+                        else:
+                            # Partials in the decode layout, one row per token
+                            # and head; an empty split leaves m at -1e30.
+                            pbase = (
+                                p_orow * fx.Int64(psplits) + fx.Int64(psplit)
+                            ) * stride
+                            vs4 = fx.Vector.filled(4, vscale, fx.Float32)
+                            for db in range_constexpr(dblocks):
+                                _store(
+                                    pp,
+                                    (pbase + fx.Int64(db * 16 + g * 4)) * 4,
+                                    fx.Vector(presult[db + 2]) * vs4,
+                                    16,
+                                )
+                            if g == 0:
+                                _store(pp, (pbase + dim) * 4, fx.Float32(presult[0]), 4)
+                                _store(
+                                    pp, (pbase + dim + 1) * 4, fx.Float32(presult[1]), 4
+                                )
+        if y >= tile_slots * psplits:
             # ---- decode role: one split per wave, 32-key tiles in registers ----
-            u = y - tile_slots
+            u = y - tile_slots * psplits
             dseq = u // groups
             dsplit = (u % groups) * waves + fx.Int32(rocdl.readfirstlane(T.i32, wave))
             dq0 = fx.Int32(fx.memref_load(CuQ, dseq))
             dqlen = fx.Int32(fx.memref_load(CuQ, dseq + 1)) - dq0
             dklen = fx.Int32(fx.memref_load(UsedK, dseq))
+            log_scale, vscale = descales()
             if dqlen == 1:
                 dlow = dklen - 1 - wleft
                 dfirst = (dlow > 0).select(dlow, fx.Int32(0)) // NK
@@ -824,6 +951,7 @@ def build_flash_attn_fp8_gfx942_module(
         VD: fx.Tensor,
         num_seqs: fx.Int32,
         tile_slots: fx.Int32,
+        psplits: fx.Int32,
         groups: fx.Int32,
         search_iters: fx.Int32,
         bt_stride: fx.Int32,
@@ -845,6 +973,7 @@ def build_flash_attn_fp8_gfx942_module(
             VD,
             num_seqs,
             tile_slots,
+            psplits,
             groups,
             search_iters,
             bt_stride,
@@ -860,14 +989,17 @@ def build_flash_attn_fp8_gfx942_module(
     return launch
 
 
-@lru_cache(maxsize=4)
-def build_flash_attn_fp8_gfx942_combine_module(dim, num_q_heads):
-    """Return the launcher that merges split partials for one-token sequences.
+@lru_cache(maxsize=8)
+def build_flash_attn_fp8_gfx942_combine_module(dim, num_q_heads, prefill=False):
+    """Return the launcher that merges split partials.
 
-    Part holds dim floats (scaled by V's descale), then m and l, per (seq,
-    head, split), padded to dim + 4 floats. Multi-token sequences are skipped.
-    Splits merge eight at a time, all eight loaded before any is merged: the
-    merge is cheap and the load latency is not.
+    Part holds dim floats (scaled by V's descale), then m and l, per (row,
+    head, split), padded to dim + 4 floats. By default grid y is the sequence
+    and a row is a one-token sequence; multi-token sequences are skipped.
+    prefill merges the KV splits of a lone multi-token sequence instead: grid y
+    is the query token, and tokens past the sequence are skipped. Splits merge
+    eight at a time, all eight loaded before any is merged: the merge is cheap
+    and the load latency is not.
     """
     stride = dim + 4
     vecs = dim // 256
@@ -877,15 +1009,19 @@ def build_flash_attn_fp8_gfx942_combine_module(dim, num_q_heads):
     def combine(Part: fx.Tensor, O: fx.Tensor, CuQ: fx.Tensor, num_splits: fx.Int32):
         lane = fx.Int32(gpu.thread_id("x"))
         head = fx.Int32(gpu.block_id("x"))
-        seq = fx.Int32(gpu.block_id("y"))
-        q0 = fx.Int64(fx.memref_load(CuQ, seq))
-        is_decode = (
-            fx.Int32(fx.memref_load(CuQ, seq + 1)) - fx.Int32(fx.memref_load(CuQ, seq))
-            == 1
-        )
-        trips = is_decode.select(num_splits, fx.Int32(0))
+        y = fx.Int32(gpu.block_id("y"))
+        if const_expr(prefill):
+            q0 = fx.Int64(y)
+            valid = y < fx.Int32(fx.memref_load(CuQ, 1))
+        else:
+            q0 = fx.Int64(fx.memref_load(CuQ, y))
+            valid = (
+                fx.Int32(fx.memref_load(CuQ, y + 1)) - fx.Int32(fx.memref_load(CuQ, y))
+                == 1
+            )
+        trips = valid.select(num_splits, fx.Int32(0))
         pp, op = fx.get_iter(Part), fx.get_iter(O)
-        row = (fx.Int64(seq) * num_q_heads + fx.Int64(head)) * fx.Int64(num_splits)
+        row = (fx.Int64(y) * num_q_heads + fx.Int64(head)) * fx.Int64(num_splits)
         init = [fx.Float32(-1.0e30), fx.Float32(0.0)] + [
             fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(vecs)
         ]
@@ -942,7 +1078,7 @@ def build_flash_attn_fp8_gfx942_combine_module(dim, num_q_heads):
                 vw = fx.Vector.filled(4, w[u], fx.Float32)
                 accs = [accs[i] + os_[u][i] * vw for i in range(vecs)]
             result = yield [m_new, l_new] + accs
-        if is_decode:
+        if valid:
             inv = 1.0 / fx.Float32(result[1])
             words = []
             for i in range_constexpr(vecs):

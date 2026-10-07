@@ -10,8 +10,9 @@ the page size, the K/V strides, and whether the batch is decode-only, so the
 set a model can reach is finite: per shape in ``DEFAULT_SHAPES``, every page
 size the adapter serves times two K/V layouts (separate contiguous caches, and
 vLLM's views of one ``[blocks, kv_heads, page, 2 * head_dim]`` cache) times
-the unified and decode-only builds, plus one combine kernel per (head dim,
-query heads). Each job takes its launcher from the builders the adapter calls,
+the unified and decode-only builds, plus two combine kernels per (head dim,
+query heads): one merges decode splits, the other a lone prefix chunk's KV
+splits. Each job takes its launcher from the builders the adapter calls,
 with the same arguments, and invokes it under ``FakeTensorMode`` +
 ``COMPILE_ONLY=1`` on fake tensors whose dtypes, ranks, and strides match the
 runtime call.
@@ -88,16 +89,19 @@ def default_jobs(shapes: dict[str, list] = DEFAULT_SHAPES) -> list[dict]:
                                 "mode": mode,
                             }
                         )
-            jobs.append(
-                {
-                    "kernel_name": (
-                        f"flydsl_unified_attn_gfx942_combine_h{num_heads}_d{head_dim}"
-                    ),
-                    "path": "combine",
-                    "num_heads": num_heads,
-                    "head_dim": head_dim,
-                }
-            )
+            for prefill in (False, True):
+                jobs.append(
+                    {
+                        "kernel_name": (
+                            f"flydsl_unified_attn_gfx942_combine_h{num_heads}"
+                            f"_d{head_dim}{'_prefill' if prefill else ''}"
+                        ),
+                        "path": "combine",
+                        "num_heads": num_heads,
+                        "head_dim": head_dim,
+                        "prefill": prefill,
+                    }
+                )
     return dedupe_jobs(jobs)
 
 
@@ -156,6 +160,7 @@ def _compile_attention(
         _FAKE_SEQS,
         _FAKE_TOKENS,
         1,
+        1,
         3,
         4,
         1.0,
@@ -164,14 +169,16 @@ def _compile_attention(
     )
 
 
-def _compile_combine(num_heads, head_dim):
+def _compile_combine(num_heads, head_dim, prefill):
     import torch
 
     from aiter.ops.flydsl.kernels.flash_attn_fp8_gfx942 import (
         build_flash_attn_fp8_gfx942_combine_module,
     )
 
-    combine = build_flash_attn_fp8_gfx942_combine_module(head_dim, num_heads)
+    combine = build_flash_attn_fp8_gfx942_combine_module(
+        head_dim, num_heads, prefill=prefill
+    )
     combine(
         torch.empty((1024,), dtype=torch.float32),
         torch.empty((_FAKE_TOKENS, num_heads, head_dim), dtype=torch.bfloat16),

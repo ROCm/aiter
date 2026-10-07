@@ -85,7 +85,8 @@ num_kv_heads, head_dim, window`, heads per rank). It has no CSV and does not
 accept `--csv`.
 
 ```bash
-# Gemma-4-31B at TP1 and TP4: 48 attention kernels and 4 combine kernels
+# Gemma-4-31B at TP1 and TP4: 48 attention kernels and 8 combine kernels
+# (decode splits and prefill splits per head dim and head count)
 python -m aiter.aot.flydsl.unified_attention
 ```
 
