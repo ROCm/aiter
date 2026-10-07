@@ -100,6 +100,19 @@ def _num_cache_slots(state: torch.Tensor, conv_state: torch.Tensor) -> int:
     return min(state.shape[0], conv_state.shape[0], _INT32_MAX)
 
 
+def _check_dense_cache_slots(
+    name: str,
+    tensor: torch.Tensor,
+    inner_strides: tuple[int, ...],
+) -> None:
+    """Require disjoint, dense cache slots while allowing padding between slots."""
+    if (
+        tensor.stride()[1:] != inner_strides
+        or tensor.stride(0) < tensor.shape[1:].numel()
+    ):
+        raise ValueError(f"`{name}` must have dense, non-overlapping cache slots.")
+
+
 def _check_i32_addressing(
     name: str,
     tensor: torch.Tensor,
@@ -199,6 +212,7 @@ def _validate_kda_inputs(
         )
     if conv_state.dtype != torch.bfloat16:
         raise ValueError("`conv_state` must have dtype torch.bfloat16.")
+    _check_dense_cache_slots("conv_state", conv_state, (_CONV_WIDTH - 1, 1))
     if state.ndim != 4 or state.shape[1:] != (
         _HEADS,
         _DIM,
@@ -209,8 +223,7 @@ def _validate_kda_inputs(
         )
     if state.dtype != torch.float32:
         raise ValueError("`state` must have dtype torch.float32.")
-    if state.stride()[-3:] != (_DIM * _DIM, _DIM, 1):
-        raise ValueError("`state` must be contiguous within each cache slot.")
+    _check_dense_cache_slots("state", state, (_DIM * _DIM, _DIM, 1))
     _check_tensor(
         "raw_beta",
         raw_beta,
@@ -290,6 +303,10 @@ def _validate_kda_inputs(
         inner_strides=(1,),
     )
     _check_i32_addressing("out", out, first_dim=1)
+    # The final head need not include trailing padding in the batch stride.
+    head_span = (_HEADS - 1) * out.stride(2) + _DIM
+    if out.stride(2) < _DIM or (batch > 1 and out.stride(1) < head_span):
+        raise ValueError("`out` must have non-overlapping batch and head rows.")
     return out
 
 
@@ -316,6 +333,9 @@ def flydsl_kda_decode(
     :func:`is_flydsl_kda_decode_supported` before dispatch.
     Strides and byte spans must fit non-negative int32 buffer addressing,
     except cache slot strides, which are rebased in int64.
+    Both caches require dense inner dimensions and non-overlapping slots;
+    padding between slots is supported. Output batch and head rows must not
+    overlap, but may also be padded.
     Uses RMSNorm/sigmoid gating. Cache slot zero is reserved: non-positive
     ``state_indices`` produce zero output and leave both caches unchanged.
     Indices at or above ``min(state.shape[0], conv_state.shape[0])`` are

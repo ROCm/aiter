@@ -264,7 +264,7 @@ def _relative_rmse(
     )
 
 
-def _run(inputs: Inputs) -> torch.Tensor:
+def _run(inputs: Inputs, out: torch.Tensor | None = None) -> torch.Tensor:
     return flydsl_kda_decode(
         x=inputs.x,
         conv_weight=inputs.conv_weight,
@@ -280,6 +280,7 @@ def _run(inputs: Inputs) -> torch.Tensor:
         output_gate=inputs.output_gate,
         norm_weight=inputs.norm_weight,
         norm_eps=_NORM_EPS,
+        out=out,
     )
 
 
@@ -317,6 +318,7 @@ def _run_with_f_b(
     f_a: torch.Tensor,
     f_b_weight: torch.Tensor,
     inputs: Inputs,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return flydsl_kda_decode_with_f_b(
         f_a=f_a,
@@ -334,6 +336,7 @@ def _run_with_f_b(
         output_gate=inputs.output_gate,
         norm_weight=inputs.norm_weight,
         norm_eps=_NORM_EPS,
+        out=out,
     )
 
 
@@ -572,8 +575,94 @@ def test_decode_api_rejects_invalid_input_rank() -> None:
         _run(inputs)
 
 
+@pytest.mark.parametrize("fused_f_b", [False, True])
+@pytest.mark.parametrize(
+    "name, strides",
+    [
+        ("conv_state", (0, 3, 1)),
+        ("conv_state", (_CHANNELS * 3 - 1, 3, 1)),
+        ("conv_state", (_CHANNELS * 3, 0, 1)),
+        ("conv_state", (_CHANNELS * 3, 3, 0)),
+        ("conv_state", (_CHANNELS * 6, 6, 2)),
+        ("state", (0, _DIM * _DIM, _DIM, 1)),
+        ("state", (_HEADS * _DIM * _DIM - 1, _DIM * _DIM, _DIM, 1)),
+        ("out", (0, _HEADS * _DIM, 0, 1)),
+        ("out", (0, _HEADS * _DIM, _DIM - 1, 1)),
+        ("out", (0, 0, _DIM, 1)),
+        ("out", (0, (_HEADS - 1) * (_DIM + 7) + _DIM - 1, _DIM + 7, 1)),
+    ],
+)
+def test_api_rejects_unsafe_write_layouts(
+    monkeypatch: pytest.MonkeyPatch,
+    fused_f_b: bool,
+    name: str,
+    strides: tuple[int, ...],
+) -> None:
+    from aiter.ops.flydsl import kda_decode
+
+    def unexpected_compile(*args):
+        pytest.fail("Unsafe write layouts must be rejected before kernel compilation.")
+
+    monkeypatch.setattr(kda_decode, "create_kda_decode_kernel", unexpected_compile)
+    monkeypatch.setattr(
+        kda_decode, "create_kda_decode_fused_projection_kernel", unexpected_compile
+    )
+    with FakeTensorMode():
+        f_a, f_b_weight, inputs = _make_fb_inputs(batch=2)
+        out = torch.empty((1, 2, _HEADS, _DIM), dtype=torch.bfloat16, device=_DEVICE)
+        tensor = out if name == "out" else getattr(inputs, name)
+        view = torch.empty_strided(
+            tensor.shape, strides, dtype=tensor.dtype, device=_DEVICE
+        )
+        if name == "out":
+            out = view
+        else:
+            setattr(inputs, name, view)
+        with pytest.raises(ValueError, match=f"`{name}`.*non-overlapping"):
+            if fused_f_b:
+                _run_with_f_b(f_a, f_b_weight, inputs, out=out)
+            else:
+                _run(inputs, out=out)
+
+
+@pytest.mark.parametrize("fused_f_b", [False, True])
+@pytest.mark.parametrize("padding", [0, 7])
+@pytest.mark.parametrize("trailing_padding", [0, 17])
+def test_api_accepts_non_overlapping_write_layouts(
+    fused_f_b: bool,
+    padding: int,
+    trailing_padding: int,
+) -> None:
+    f_a, f_b_weight, inputs = _make_fb_inputs(batch=2)
+    if padding == 0:
+        inputs.conv_state = inputs.conv_state.contiguous()
+        inputs.state = inputs.state.contiguous()
+    reference_inputs = _copy_inputs(inputs)
+    reference = _reference(reference_inputs)
+    head_stride = _DIM + padding
+    batch_stride = (_HEADS - 1) * head_stride + _DIM + trailing_padding
+    out = torch.empty_strided(
+        (1, 2, _HEADS, _DIM),
+        (0, batch_stride, head_stride, 1),
+        dtype=torch.bfloat16,
+        device=_DEVICE,
+    )
+    if fused_f_b:
+        actual = _run_with_f_b(f_a, f_b_weight, inputs, out=out)
+    else:
+        actual = _run(inputs, out=out)
+    torch.cuda.synchronize()
+
+    assert actual is out
+    assert _relative_rmse(reference, actual) < 1e-3
+    assert _relative_rmse(reference_inputs.state, inputs.state) < 1e-3
+    assert torch.equal(reference_inputs.conv_state, inputs.conv_state)
+
+
 @pytest.mark.parametrize(
     "fused_f_b, name, dim",
+    # Convolution inner strides are fixed by dense-cache validation, so their
+    # byte span cannot overflow. Invalid layouts are covered above instead.
     [
         (fused_f_b, name, dim)
         for fused_f_b in (False, True)
@@ -581,8 +670,6 @@ def test_decode_api_rejects_invalid_input_rank() -> None:
             ("x", 0),
             ("conv_weight", 0),
             ("conv_weight", 1),
-            ("conv_state", 1),
-            ("conv_state", 2),
             ("raw_beta", 1),
             ("output_gate", 0),
             ("output_gate", 1),
@@ -635,19 +722,11 @@ def test_api_rejects_i32_address_overflow(
             out = view
         else:
             setattr(inputs, name, view)
-        kwargs = {
-            field: getattr(inputs, field)
-            for field in Inputs.__dataclass_fields__
-            if field != "raw_g"
-        }
-        kwargs.update(
-            conv_bias=None, lower_bound=_LOWER_BOUND, norm_eps=_NORM_EPS, out=out
-        )
         with pytest.raises(ValueError, match=f"`{name}`.*int32"):
             if fused_f_b:
-                flydsl_kda_decode_with_f_b(f_a=f_a, f_b_weight=f_b_weight, **kwargs)
+                _run_with_f_b(f_a, f_b_weight, inputs, out=out)
             else:
-                flydsl_kda_decode(raw_g=inputs.raw_g, **kwargs)
+                _run(inputs, out=out)
 
 
 def test_unused_singleton_stride_must_still_fit_launcher_int32() -> None:
