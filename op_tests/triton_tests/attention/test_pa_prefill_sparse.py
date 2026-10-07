@@ -3,7 +3,6 @@
 
 import pytest
 import torch
-import triton
 
 from aiter.ops.triton.attention.pa_prefill_sparse import pa_prefill_sparse
 from aiter.ops.triton.utils._triton import arch_info
@@ -700,36 +699,33 @@ def test_pa_prefill_sparse_int64_indices(H):
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
 
 
-# The validity check must not rely on num_kv fitting int32. A pool that large
-# cannot be allocated in a test, so launch the kernel with an oversized bound
-# over a small pool: negative slots must still be rejected (accepting one would
-# read before the buffer) while every slot inside the real pool stays valid.
-@pytest.mark.parametrize("bound", [2**31 + 5, 2**33])
-@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
-def test_sparse_attn_prefill_kernel_huge_num_kv(bound, index_dtype):
+# The validity check must not rely on num_kv fitting int32. A real pool that
+# large cannot be allocated in a test, so expand one KV row to the full row
+# count (stride 0, no memory): every slot then reads the same row, and with a
+# sink the output still depends on how many slots were accepted,
+#   out = v * n e^s / (n e^s + e^sink),
+# so a negative slot wrongly accepted as valid changes it.
+@pytest.mark.parametrize("num_rows", [2**31 + 5, 2**33])
+def test_pa_prefill_sparse_huge_pool_rejects_negative_slots(num_rows):
     _triton_branch_only()
-    from aiter.ops.triton._triton_kernels.attention.sparse_attention_dsv4 import (
-        _sparse_attn_prefill_kernel,
-    )
-
     torch.manual_seed(4)
-    T, H, D, num_kv, dev = 256, 16, 512, 2048, "cuda"
+    T, H, D, L, dev = 256, 16, 512, 64, "cuda"
     q = torch.randn(T, H, D, dtype=torch.bfloat16, device=dev)
-    kv = torch.randn(num_kv, D, dtype=torch.bfloat16, device=dev)
+    row = torch.randn(1, D, dtype=torch.bfloat16, device=dev)
+    kv = row.expand(num_rows, D)
     sink = torch.randn(H, dtype=torch.float32, device=dev)
-    indptr = torch.arange(0, (T + 1) * 64, 64, dtype=index_dtype, device=dev)
-    indices = torch.randint(0, num_kv, (T * 64,), dtype=index_dtype, device=dev)
+    indptr = torch.arange(0, (T + 1) * L, L, dtype=torch.int32, device=dev)
+    indices = torch.randint(0, 2**31 - 1, (T * L,), dtype=torch.int32, device=dev)
     indices[0::3] = -1
     indices[1::7] = -(2**31)
-    out = torch.empty_like(q)
-    _sparse_attn_prefill_kernel[lambda meta: (T, triton.cdiv(H, meta["BLOCK_H"]))](
-        q, kv, indices, indptr, sink, out,
-        q.stride(0), q.stride(1), q.stride(2), kv.stride(0), kv.stride(1),
-        out.stride(0), out.stride(1), out.stride(2),
-        H, D, bound, D**-0.5,
-        HAS_ATTN_SINK=True, BLOCK_D=D,
-    )  # fmt: skip
-    ref = _sparse_prefill_single_source_torch(q, kv, indices, indptr, sink, D**-0.5)
+    scale = D**-0.5
+    out = pa_prefill_sparse(q, kv, indices, indptr, None, None, None, sink, scale)
+
+    n = (indices.view(T, L) >= 0).sum(1).float()[:, None]  # accepted slots per query
+    s_ = (q.float() @ row.float()[0]) * scale  # [T, H]: every key scores the same
+    m = torch.maximum(s_, sink[None, :])
+    w = n * torch.exp(s_ - m) / (n * torch.exp(s_ - m) + torch.exp(sink[None, :] - m))
+    ref = (w[..., None] * row.float()[0]).to(q.dtype)
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
 
 
