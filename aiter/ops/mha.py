@@ -3657,6 +3657,51 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         )
 
 
+def _varlen_descale_reject_reason(
+    q,
+    k,
+    v,
+    q_descale,
+    k_descale,
+    v_descale,
+    dropout_p,
+    window_size,
+    bias,
+    alibi_slopes,
+    block_table,
+    out,
+    sink_ptr,
+    return_attn_probs,
+):
+    """Best-effort reason why the FlyDSL FP8 varlen path declined a descale call."""
+    if get_gfx() != "gfx950":
+        return f"the FlyDSL FP8 kernel needs gfx950, got {get_gfx()}"
+    if not (q.dtype == k.dtype == v.dtype == torch.float8_e4m3fn):
+        return f"q/k/v must be float8_e4m3fn, got {q.dtype}/{k.dtype}/{v.dtype}"
+    if q.dim() != 3:
+        return "q/k/v must be 3D [total_tokens, heads, head_dim]"
+    for name, s in (("q", q_descale), ("k", k_descale), ("v", v_descale)):
+        if not (torch.is_tensor(s) and s.dtype == torch.float32 and s.numel() == 1):
+            return f"{name}_descale must be a 1-element float32 tensor"
+    if dropout_p != 0.0:
+        return "dropout is not supported"
+    if any(w >= 0 for w in window_size[:2]) or (
+        len(window_size) > 2 and window_size[2] != 0
+    ):
+        return f"sliding window / sink tokens are not supported, got {window_size=}"
+    if bias is not None or alibi_slopes is not None:
+        return "bias/alibi is not supported"
+    if sink_ptr is not None:
+        return "sink_ptr is not supported"
+    if block_table is not None:
+        return "block_table is not supported"
+    if return_attn_probs:
+        return "return_attn_probs is not supported"
+    if out is not None and (out.dtype != torch.bfloat16 or not out.is_contiguous()):
+        return "out must be a contiguous bfloat16 tensor"
+    return "unsupported head configuration or softmax_scale"
+
+
 def flash_attn_varlen_func(
     q,
     k,
@@ -3682,6 +3727,9 @@ def flash_attn_varlen_func(
     cu_seqlens_q_padded: torch.Tensor | None = None,
     cu_seqlens_k_padded: torch.Tensor | None = None,
     sink_ptr: Tensor | None = None,
+    q_descale: Tensor | None = None,
+    k_descale: Tensor | None = None,
+    v_descale: Tensor | None = None,
 ):
     if block_table is not None and (
         cu_seqlens_q_padded is not None or cu_seqlens_k_padded is not None
@@ -3786,7 +3834,12 @@ def flash_attn_varlen_func(
             return sink_ptr is not None
         return sink_ptr is None
 
-    if can_try_gfx1250_fmha_fwd_with_sink_varlen_asm():
+    # Per-tensor descales are only honored by the FlyDSL FP8 path below.
+    has_descale = (
+        q_descale is not None or k_descale is not None or v_descale is not None
+    )
+
+    if not has_descale and can_try_gfx1250_fmha_fwd_with_sink_varlen_asm():
         return FlashAttnVarlenFunc.apply(
             q,
             k,
@@ -3842,9 +3895,38 @@ def flash_attn_varlen_func(
             block_table=block_table,
             out=out,
             sink=sink_ptr,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
         )
         if _flydsl_result is not None:
             return _flydsl_result
+
+    if has_descale:
+        # The CK/Triton fallbacks below do not take descales; running them would
+        # silently drop the scales and return wrong results.
+        reason = _varlen_descale_reject_reason(
+            q,
+            k,
+            v,
+            q_descale,
+            k_descale,
+            v_descale,
+            dropout_p,
+            window_size,
+            bias,
+            alibi_slopes,
+            block_table,
+            out,
+            sink_ptr,
+            return_attn_probs,
+        )
+        raise ValueError(
+            "flash_attn_varlen_func: q/k/v_descale are only supported on the "
+            f"FlyDSL FP8 path, which declined this call ({reason}). Use "
+            "flash_attn_varlen_fp8_pertensor_func for per-tensor FP8 attention "
+            "with these options."
+        )
 
     if not ENABLE_CK:
         from .triton.attention.mha import (
