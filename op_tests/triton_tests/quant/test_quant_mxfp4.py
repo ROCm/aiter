@@ -224,6 +224,13 @@ def torch_dequant_nvfp4(
 @pytest.mark.parametrize(
     "M, N",
     [
+        # Shapes in different gfx1250 Gluon config buckets.
+        (1, 3072),
+        (4, 3072),
+        (8, 7168),
+        (32, 1024),
+        (256, 3072),
+        (40, 20000),
         (1, 4),
         (1, 28),
         (1, 32),
@@ -245,7 +252,7 @@ def torch_dequant_nvfp4(
         (6000, 5000),
     ],
 )
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_dynamic_mxfp4_quant(M: int, N: int, dtype):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     torch.manual_seed(20)
@@ -609,3 +616,31 @@ def test_mxfp4_quant_op_asm_matches_bits(scaling_mode):
         amax = x.reshape(m, -1, 32).abs().amax(-1).double().clamp(min=6 * 2**-126)
         ref = torch.ceil(torch.log2(amax / 6)).to(torch.int32) + 127
         torch.testing.assert_close(outs[0][1].int(), ref, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("M, N", [(1, 3072), (300, 1024), (33, 100)])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_dynamic_mxfp4_quant_gluon_matches_triton(M: int, N: int, dtype):
+    arch = arch_info.get_arch()
+    if arch not in ("gfx950", "gfx1250"):
+        pytest.skip("The Gluon backend requires gfx950 or gfx1250")
+    if arch == "gfx950" and dtype != torch.bfloat16:
+        pytest.skip("The gfx950 Gluon kernel requires bf16 input")
+    torch.manual_seed(20)
+    x = torch.randn((M, N), dtype=dtype, device="cuda")
+
+    gluon_out, gluon_scale = dynamic_mxfp4_quant(x, backend="gluon")
+    triton_out, triton_scale = dynamic_mxfp4_quant(x, backend="triton")
+
+    torch.testing.assert_close(gluon_scale, triton_scale, atol=0, rtol=0)
+    torch.testing.assert_close(gluon_out, triton_out, atol=0, rtol=0)
+
+
+def test_dynamic_mxfp4_quant_backend_validation():
+    x = torch.randn((4, 64), dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="Unknown backend"):
+        dynamic_mxfp4_quant(x, backend="cuda")
+    # gfx1250 runs Gluon for every dtype; elsewhere fp16 has no Gluon kernel.
+    if arch_info.get_arch() != "gfx1250":
+        with pytest.raises(RuntimeError, match="Gluon backend requires"):
+            dynamic_mxfp4_quant(x.half(), backend="gluon")
