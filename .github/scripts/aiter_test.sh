@@ -120,21 +120,6 @@ for file in "${sharded_files[@]}"; do
                 "$file"
             )
             ;;
-        op_tests/multigpu_tests/test_mega_moe_TP.py)
-            {
-                echo "Running fused TP MegaMoE correctness on 8 GPUs when supported"
-            } | tee -a latest_test.log
-            test_cmd=(
-                timeout 60m
-                torchrun
-                --standalone
-                --nproc_per_node=8
-                "$file"
-                --models glm5 m3
-                --tokens 8 64 256
-                --seeds 2
-            )
-            ;;
         op_tests/test_mla_persistent.py|op_tests/test_mla_persistent_round_robin.py)
             {
                 echo "Using AITER_MLA_DECODE_PERSISTENT_MAX_BATCH=0 for $file"
