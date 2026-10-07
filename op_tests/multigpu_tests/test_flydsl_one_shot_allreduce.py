@@ -1,7 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Correctness and timing for the exact one-shot (1-stage) all-reduce (``OneShotAllReduce``).
+"""Correctness and timing for the exact one-shot (1-stage) all-reduce and its
+fused form (``OneShotAllReduceRMSNorm``).
+
+Two kernels, one schedule: ``OneShotAllReduce`` (plain) and
+``OneShotAllReduceRMSNorm`` (all-reduce + residual add + RMSNorm, the drop-in
+for ``aiter::allreduce_fusion_kernel_1stage<T, T, N, false>``).
 
 ``python3`` this file runs three sweeps, each ending in a markdown table. A
 default run drives the engine as production does -- no tuning knob pinned, so
@@ -41,21 +46,35 @@ see a read of a stale inbox slot: the stale data is the right answer. The
 slots are re-armed rather than flagged, so the run also feeds the kernel the
 NaN pattern it uses as a sentinel.
 
+``test_one_shot_allreduce_rmsnorm_fresh_inputs`` does the same for the fused
+kernel, where a stale slot would also show up in ``residual_out``.
+
+The fused suites add a fourth check: ``residual_out`` must be **bit-exact**
+against the reference, not merely close. Both sides sum in rank order in fp32
+and round exactly once, so equality is the correct expectation -- and it is the
+only cheap way to catch a missing bf16 round-trip before the residual add, an
+error SQNR on ``out`` is far too loose to see and that compounds per layer in a
+real model.
+
 ``--extended`` runs the spot-check configurations at every world size, and the
 spot-check shapes on the production engine too.
 
-Every rank is a ``multiprocessing`` spawn worker; one spawn per engine
-configuration and world size runs every sweep. OneShotAllReduce runs on
-gfx942/gfx950 at TP in {2, 4, 8}; other archs skip, and ``main()`` skips a
-world size when fewer GPUs are visible than TP.
+Every rank is a ``multiprocessing`` spawn worker (plain tests) or a subprocess
+(fused tests); one spawn per engine configuration and world size runs every
+sweep. OneShotAllReduce runs on gfx942/gfx950 at TP in {2, 4, 8}; other archs
+skip, and ``main()`` skips a world size when fewer GPUs are visible than TP.
 """
 
 from __future__ import annotations
 
 import argparse
 import itertools
+import json
 import os
+import subprocess
 import sys
+import tempfile
+import time
 from multiprocessing import Pool, freeze_support, set_start_method
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -75,6 +94,9 @@ set_start_method("spawn", force=True)
 
 from aiter.ops.flydsl import allreduce_policy as fly_policy
 from aiter.ops.flydsl.kernels.one_shot_allreduce import (
+    DEFAULT_ATOMS,
+    DEFAULT_FANOUT,
+    DEFAULT_GRID_CAP,
     SUPPORTED_BLOCKS,
     oneshot_ladder,
 )
@@ -158,6 +180,86 @@ SQNR_FLOOR_DB = 45.0
 # spawn instead of leaving it to CI's per-file timeout. A full default run of
 # either FlyDSL all-reduce test takes a few minutes, JIT included.
 SPAWN_TIMEOUT_S = 600
+
+# Fused (all-reduce + residual add + RMSNorm) coverage. The tile is one token
+# row there, so `hidden` is baked into the kernel and every distinct width is a
+# distinct build -- unlike the plain kernel, where hidden is just payload bytes.
+#
+# 4096 at m in {1, 32} is the Qwen3-235B decode shape that motivated the kernel;
+# 7168 keeps parity with the plain list above; 2048 and 8192 are the ends of the
+# supported range (BLOCK 256 and 1024 at atoms=1).
+FUSED_HIDDENS = (2048, 4096, 7168, 8192)
+FUSED_M = (1, 2, 5, 8, 32)
+RMS_EPS = 1e-6
+
+_FUSED_SHAPE_CASES = tuple(
+    (m, hidden, f"{m}x{hidden}") for hidden in FUSED_HIDDENS for m in FUSED_M
+)
+
+# Widths with no native row geometry, which run on a *padded* workgroup: BLOCK
+# covers h_pad and the lanes past the real row are masked off.
+#
+# 896 -> 1024 and 2304 -> 2560 pad within one atom of the row; 2880 -> 3072 is
+# the gpt-oss width and the one that motivated this.
+#
+# ``m`` has to reach past one row. With a single token every pad lane addresses
+# past the end of the tensor, where the descriptor bound masks it for free --
+# so m=1 passes even with the per-lane mask removed entirely. m=32 is what puts
+# a *real* row under the pad, which is the only arrangement where a leaked load
+# reads live data and a leaked store corrupts a neighbour.
+#
+# 9000 -> 9216 is the first kind of width above 8192: atoms=1 tops out at 1024
+# threads x 8 elements, so a row that wide pads onto a two-atom block (BLOCK 576).
+FUSED_PAD_HIDDENS = (896, 2304, 2880, 9000)
+_FUSED_PAD_SHAPE_CASES = tuple(
+    (m, hidden, f"{m}x{hidden}pad")
+    for hidden in FUSED_PAD_HIDDENS
+    for m in (1, 5, 32)
+)
+
+# `atoms` sets the *block width* in a fused build (BLOCK = hidden/(8*atoms)),
+# not the tile width, so these cases exercise the reduction ladder rather than
+# the wire -- the plain kernel's atoms cases already cover the wire.
+#
+# atoms=4 at hidden=4096 is BLOCK=128, two waves: the low end, where the LDS
+# partial count drops to 2. An off-by-one in the `BLOCK//64` unrolled combine
+# survives BLOCK=512 and dies here.
+#
+# It also catches a stride bug the default cannot see at all: the per-atom term
+# in the fanout is `atom * BLOCK * ATOM_I32`, which is identically zero at
+# atoms=1 no matter how wrong BLOCK is.
+FUSED_ATOMS_CASES = ((2, 4096), (2, 8192), (4, 4096), (4, 8192))
+
+# The same geometries reached from the other side: pin `block` and let the
+# engine solve for atoms at each width.
+FUSED_BLOCK_CASES = ((512, 4096), (256, 8192), (448, 7168))
+
+# Fresh-input stress on the fused kernel, at the Qwen3-235B width. ``None``
+# walks the shipped ladder; 4 forces a split build, whose exchange words rotate
+# with the inbox colour.
+FUSED_FRESH_HIDDEN = 4096
+FUSED_FRESH_SPLITS = (None, 4)
+
+# Split rows: ``split`` workgroups per token row, joined through the HBM
+# exchange word. Every split the shipped widths have below 16, with 7168's odd
+# 7 in particular (its grid cap rounds to 63). M=3 and M=5 leave a group count
+# that does not divide the cap, so the last pass of the grid-stride loop is
+# partial.
+FUSED_SPLIT_CASES = ((2, 4096), (4, 4096), (2, 7168), (7, 7168), (4, 8192), (16, 8192))
+FUSED_SPLIT_M = (1, 2, 3, 5)
+# Calls per shape in a split spawn. The exchange word is never reset and each
+# workgroup's ``prev`` persists across launches, so a bug in that bookkeeping
+# only shows from the second call on; every repeat must reproduce the first
+# call's bits.
+FUSED_SPLIT_REPEAT = 50
+# Input magnitudes at the two ends of the fixed-point exchange: its resolution
+# (2**-16 per writer) against a small row, and its range against a large one.
+FUSED_SPLIT_SCALES = (1e-2, 300.0)
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
 
 
 def _production_payloads(tp: int, link: str) -> tuple[list[int], tuple[int, int]]:
@@ -270,6 +372,443 @@ def _worst(a: dict, b: dict) -> dict:
         "lanes_differing": max(a["lanes_differing"], b["lanes_differing"]),
         "err": max(a["err"], b["err"]),
     }
+
+
+# ---------------------------------------------------------------------------
+# Fused (subprocess) helpers -- used by OneShotAllReduceRMSNorm test suite
+# ---------------------------------------------------------------------------
+
+
+def _fused_reference(parts, residual, weight, eps):
+    """The C++ contract of ``allreduce_fusion_kernel_1stage<T, T, N, false>``.
+
+    Returns ``(out_ref, residual_out_ref)``. The bf16 round-trip on the third
+    line is not an accident and not an optimization: the unfused path
+    all-reduces into a bf16 tensor before adding the residual, and the fused
+    kernel is required to be a drop-in, so it throws the extra f32 mantissa
+    bits away too. Dropping it here would make this reference disagree with
+    both kernels.
+    """
+    ar = torch.zeros_like(parts[0], dtype=torch.float32)
+    for p in parts:  # rank order, matching the kernel's accumulation order
+        ar += p.float()
+    ar = ar.to(torch.bfloat16).float()
+    s = ar + residual.float()
+    residual_out = s.to(torch.bfloat16)
+    rstd = torch.rsqrt(s.pow(2).mean(-1, keepdim=True) + eps)
+    return (s * rstd * weight.float()).to(torch.bfloat16), residual_out
+
+
+def _fused_inputs(m, hidden, tp, device, scale=1.0):
+    """Per-rank contributions, residual and gain. Same seed on every rank.
+
+    *scale* multiplies the contributions and the residual (not the gain), which
+    moves the row's sum of squares by ``scale**2``.
+    """
+    torch.manual_seed(1234 + m * 8191 + hidden)
+    parts = [
+        torch.randn(m, hidden, dtype=torch.bfloat16, device=device) * (r + 1)
+        for r in range(tp)
+    ]
+    residual = torch.randn(m, hidden, dtype=torch.bfloat16, device=device)
+    weight = torch.randn(hidden, dtype=torch.bfloat16, device=device)
+    if scale != 1.0:
+        parts = [(p.float() * scale).to(torch.bfloat16) for p in parts]
+        residual = (residual.float() * scale).to(torch.bfloat16)
+    return parts, residual, weight
+
+
+def _bits_agree(tensor, tp, dist) -> int | None:
+    """Rank of the first peer whose raw bits differ from rank 0's, or None.
+
+    Widened to int32 because gloo rejects int16 ("Invalid scalar type"); the
+    widening is exact, so the comparison is still on bits.
+    """
+    bits = tensor.view(torch.int16).to(torch.int32).cpu()
+    gathered = [torch.empty_like(bits) for _ in range(tp)]
+    dist.all_gather(gathered, bits)
+    for r, g in enumerate(gathered):
+        if not torch.equal(g, gathered[0]):
+            return r
+    return None
+
+
+def _fused_fresh_inputs(eng, rank: int, tp: int, hidden: int, device) -> list[str]:
+    """``FRESH_ITERS`` fused calls, each on new inputs and into its own outputs,
+    with no host sync in between, then every result checked.
+
+    Same skew and sentinel pattern as ``_fresh_inputs``. ``residual_out`` must
+    match the reference bit for bit wherever the reference is not NaN, and be
+    NaN where it is. ``out`` goes through ``rsqrt``, so it is graded on SQNR,
+    over the rows the sentinel left finite: a split build clamps a NaN partial
+    in its exchange, so a NaN row's norm need not be NaN.
+    """
+    eng.preload(hidden)
+    torch.manual_seed(5)
+    weight = torch.randn(hidden, dtype=torch.bfloat16, device=device)
+    drag = torch.randn(2048, 2048, device=device, dtype=torch.float32)
+    calls = []
+    for it in range(FRESH_ITERS):
+        m = FRESH_TOKENS[it % len(FRESH_TOKENS)]
+        parts = _parts(m, hidden, tp, 7 + it, device)
+        residual = torch.randn(m, hidden, dtype=torch.bfloat16, device=device)
+        if it % 7 == 3:
+            for p in parts:
+                p.view(torch.int16).view(-1)[it % 5 :: 97] = -1
+        if rank == 0 and it % 5 == 0:
+            drag = drag @ drag.T * 1e-6
+        inp = parts[rank].contiguous()
+        out, res_out = eng.allreduce_rmsnorm(inp, residual, weight, RMS_EPS)
+        calls.append(
+            (it, out, res_out, *_fused_reference(parts, residual, weight, RMS_EPS))
+        )
+    torch.cuda.synchronize()
+    bad = []
+    for it, out, res_out, out_ref, res_ref in calls:
+        nan = res_ref.isnan()
+        n = int((res_out.view(torch.int16) != res_ref.view(torch.int16))[~nan].sum())
+        n += int((~res_out.isnan() & nan).sum())
+        if n:
+            bad.append(f"call {it}: residual_out differs in {n} bf16 lanes")
+        finite = ~out_ref.isnan().any(-1)
+        if finite.any():
+            db = _sqnr_db(out_ref[finite].float(), out[finite].float())
+            if db < SQNR_FLOOR_DB:
+                bad.append(f"call {it}: out SQNR {db:.2f} dB")
+    if len(bad) > 5:
+        bad = bad[:5] + [f"... {len(bad) - 5} more of {len(calls)} calls"]
+    return bad
+
+
+def _log_path(world_size: int, rank: int, mode: str, tag: str) -> str:
+    """One log per (world size, rank, mode, knobs) so concurrent spawn
+    configurations cannot overwrite each other's failure tails.
+
+    *tag* has to name every pinned knob, not just ``atoms``: a block-pinned
+    fused spawn leaves atoms unset, so two of them would otherwise share a path.
+    """
+    return f"/tmp/flydsl_one_shot_allreduce_tp{world_size}_{mode}_{tag}_rank{rank}.log"
+
+
+def _fused_spawn(
+    world_size: int,
+    pairs: list[tuple[int, int]],
+    *,
+    atoms: int | None = DEFAULT_ATOMS,
+    grid_cap: int | None = DEFAULT_GRID_CAP,
+    fanout: str | None = DEFAULT_FANOUT,
+    block: int | None = None,
+    mode: str = "fused",
+    iters: int = RUN_AHEAD_ITERS,
+    split: int | None = None,
+    input_scale: float = 1.0,
+    repeat: int = 1,
+) -> list:
+    """Subprocess-based spawn for fused (``OneShotAllReduceRMSNorm``) tests.
+
+    Each rank is relaunched as a subprocess with ``--rank``/``--mode`` flags so
+    it enters ``_run_rank_fused`` directly. Results are collected via a JSON
+    file written by rank 0. Returns a list of bad-lists, one per rank.
+    """
+    if world_size not in SUPPORTED_WORLDS:
+        raise ValueError(f"unsupported world_size={world_size}")
+    n_gpu = torch.cuda.device_count()
+    if n_gpu < world_size:
+        import pytest
+
+        pytest.skip(f"OneShotAllReduceRMSNorm needs {world_size} GPUs, have {n_gpu}")
+    init_method = get_distributed_init_method(get_ip(), get_open_port())
+    out_path = os.path.join(
+        tempfile.mkdtemp(prefix="flydsl_one_shot_fused_"), "rank0.json"
+    )
+    env = dict(os.environ)
+    env["PYTHONPATH"] = (
+        f"{_REPO_ROOT}:{env['PYTHONPATH']}" if env.get("PYTHONPATH") else _REPO_ROOT
+    )
+    env["PYTHONUNBUFFERED"] = "1"
+    if ARCH is not None:
+        env.setdefault("FLYDSL_GPU_ARCH", ARCH)
+    tokens = ",".join(str(t) for t, _ in pairs)
+    hiddens = ",".join(str(h) for _, h in pairs)
+    tag = f"a{atoms}"
+    if block is not None:
+        tag += f"_b{block}"
+    if split is not None:
+        tag += f"_k{split}"
+    if grid_cap is not None:
+        tag += f"_g{grid_cap}"
+    if input_scale != 1.0:
+        tag += f"_x{input_scale:g}"
+    procs = []
+    logs = []
+    for rank in range(world_size):
+        cmd = [
+            sys.executable,
+            os.path.abspath(__file__),
+            "--rank",
+            str(rank),
+            "--init-method",
+            init_method,
+            "--tp",
+            str(world_size),
+            "--mode",
+            mode,
+            "--tokens",
+            tokens,
+            "--hiddens",
+            hiddens,
+            "--iters",
+            str(iters),
+        ]
+        if atoms is not None:
+            cmd += ["--atoms", str(atoms)]
+        if grid_cap is not None:
+            cmd += ["--grid-cap", str(grid_cap)]
+        if fanout is not None:
+            cmd += ["--fanout", fanout]
+        if block is not None:
+            cmd += ["--block", str(block)]
+        if split is not None:
+            cmd += ["--split", str(split)]
+        if input_scale != 1.0:
+            cmd += ["--input-scale", repr(float(input_scale))]
+        if repeat != 1:
+            cmd += ["--repeat", str(repeat)]
+        if rank == 0:
+            cmd += ["--out", out_path]
+        log = open(  # noqa: SIM115
+            _log_path(world_size, rank, mode, tag),
+            "w",
+        )
+        procs.append(
+            subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT)
+        )
+        logs.append(log)
+    rc = 0
+    deadline = time.time() + float(os.environ.get("FLYDSL_QR_TIMEOUT", str(SPAWN_TIMEOUT_S)))
+    for proc in procs:
+        try:
+            rc |= proc.wait(timeout=max(1.0, deadline - time.time()))
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            rc |= 1
+    for log in logs:
+        log.close()
+    if rc != 0:
+        tails = []
+        for rank in range(world_size):
+            path = _log_path(world_size, rank, mode, tag)
+            try:
+                with open(path) as fh:
+                    tails.append(f"===== rank {rank} =====\n{fh.read()[-4000:]}")
+            except OSError:
+                pass
+        raise RuntimeError(
+            "OneShotAllReduceRMSNorm ranks failed\n" + "\n".join(tails)
+        )
+    with open(out_path) as fh:
+        payload = json.load(fh)
+    ranks = payload["ranks"]
+    if len(ranks) != world_size:
+        raise RuntimeError(
+            f"OneShotAllReduceRMSNorm gathered {len(ranks)} ranks, expected {world_size}"
+        )
+    return ranks
+
+
+def _run_rank_fused(args, rank, device, dist) -> None:
+    """``OneShotAllReduceRMSNorm``: the same three questions as the plain kernel,
+    plus one the plain kernel cannot ask.
+
+    ``residual_out`` is checked for **bit-exactness**, not SQNR. Both the kernel
+    and ``_fused_reference`` sum in rank order in fp32 and round exactly once,
+    so equality is the correct expectation and anything else is a bug. It is
+    also the only cheap detector for a missing bf16 round-trip: SQNR on ``out``
+    is far too loose to notice one, and the error it hides compounds per layer.
+
+    ``out`` goes through ``rsqrt``, whose hardware approximation legitimately
+    differs from torch's, so it is graded on SQNR.
+
+    ``fused_slice_lag`` builds with the factory's test-only
+    ``debug_slice_delay``, injected by wrapping the factory rather than through
+    the engine's API: slice 0 of every row group stalls between contributing to
+    the exchange and reading it, so its siblings run ahead into the next
+    colour's word.
+
+    ``fused_fresh`` is the fused counterpart of ``_fresh_inputs``.
+    """
+    from aiter.ops.flydsl import one_shot_allreduce as _host
+    from aiter.ops.flydsl.one_shot_allreduce import OneShotAllReduceRMSNorm
+
+    if args.mode == "fused_slice_lag":
+        _factory = _host.make_one_shot_allreduce_kernel
+
+        def _lagging_factory(**kw):
+            if kw.get("split", 1) > 1:
+                kw["debug_slice_delay"] = 4
+            return _factory(**kw)
+
+        _host.make_one_shot_allreduce_kernel = _lagging_factory
+
+    eng = OneShotAllReduceRMSNorm(
+        group=dist.group.WORLD,
+        device=device,
+        rank=rank,
+        world_size=args.tp,
+        # atoms and block are the same knob here -- the row has to fit one
+        # workgroup -- so the caller pins one and leaves the other None.
+        atoms=args.atoms,
+        grid_cap=args.grid_cap,
+        fanout=args.fanout,
+        block=args.block,
+        split=args.split,
+        # As in the plain test: the payload ceiling is a speed policy, not a
+        # correctness limit, so it must not decide what this test covers.
+        max_bytes=1 << 30,
+    )
+
+    def _check(m, hidden, tag):
+        bad = []
+        parts, residual, weight = _fused_inputs(
+            m, hidden, args.tp, device, scale=args.input_scale
+        )
+        inp = parts[rank].contiguous()
+        # Build and JIT this width up front, so the checked call below is
+        # never the one that compiles.
+        eng.preload(hidden)
+
+        out, res_out = eng.allreduce_rmsnorm(inp, residual, weight, RMS_EPS)
+        torch.cuda.synchronize()
+
+        # Later calls must reproduce the first one's bits exactly: a split
+        # build carries its exchange state across launches, and only a
+        # second call reads what the first one left behind.
+        for i in range(1, args.repeat):
+            o2, r2 = eng.allreduce_rmsnorm(inp, residual, weight, RMS_EPS)
+            torch.cuda.synchronize()
+            if not (
+                torch.equal(o2.view(torch.int16), out.view(torch.int16))
+                and torch.equal(r2.view(torch.int16), res_out.view(torch.int16))
+            ):
+                bad.append(f"{tag}: call {i} differs from call 0")
+                break
+
+        out_ref, res_ref = _fused_reference(parts, residual, weight, RMS_EPS)
+
+        db = _sqnr_db(out_ref.float(), out.float())
+        if db < SQNR_FLOOR_DB:
+            bad.append(
+                f"{tag}: out SQNR {db:.2f} dB below the {SQNR_FLOOR_DB} dB floor"
+            )
+
+        if not torch.equal(res_out.view(torch.int16), res_ref.view(torch.int16)):
+            n = int((res_out.view(torch.int16) != res_ref.view(torch.int16)).sum())
+            bad.append(
+                f"{tag}: residual_out differs from the reference in {n} of "
+                f"{res_out.numel()} bf16 lanes (the all-reduce is not rank-ordered, "
+                "or the bf16 round-trip before the residual add is missing)"
+            )
+
+        for name, t in (("out", out), ("residual_out", res_out)):
+            r = _bits_agree(t, args.tp, dist)
+            if r is not None:
+                bad.append(f"{tag}: {name} on rank {r} differs from rank 0")
+        return bad
+
+    failures = []
+    if args.mode in ("fused_run_ahead", "fused_slice_lag"):
+        m, hidden = args.tokens[0], args.hiddens[0]
+        parts, residual, weight = _fused_inputs(m, hidden, args.tp, device)
+        inp = parts[rank].contiguous()
+        out = torch.empty_like(inp)
+        res_out = torch.empty_like(inp)
+        eng.preload(hidden)
+        out_ref, res_ref = _fused_reference(parts, residual, weight, RMS_EPS)
+        drag = torch.randn(4096, 4096, device=device, dtype=torch.float32)
+        bad = 0
+        checks = 0
+        for it in range(args.iters):
+            # Rank 0 arrives late every third call, so the others run ahead into
+            # the next inbox buffer -- the case the buffer rotation exists for,
+            # and one a quiescent loop never reaches. (Slice lag skews the
+            # workgroups of one row instead, inside the kernel.)
+            if args.mode == "fused_run_ahead" and rank == 0 and it % 3 == 0:
+                for _ in range(3):
+                    drag = drag @ drag.T * 1e-6
+            eng.allreduce_rmsnorm(
+                inp, residual, weight, RMS_EPS, out=out, residual_out=res_out
+            )
+            if it % 25 == 0:
+                torch.cuda.synchronize()
+                checks += 1
+                if _sqnr_db(
+                    out_ref.float(), out.float()
+                ) < SQNR_FLOOR_DB or not torch.equal(
+                    res_out.view(torch.int16), res_ref.view(torch.int16)
+                ):
+                    bad += 1
+        torch.cuda.synchronize()
+        if bad or _sqnr_db(out_ref.float(), out.float()) < SQNR_FLOOR_DB:
+            failures.append(f"{args.mode} loop: {bad} bad checks of {checks}")
+    elif args.mode == "fused_fresh":
+        failures.extend(
+            _fused_fresh_inputs(eng, rank, args.tp, args.hiddens[0], device)
+        )
+    else:
+        for m, hidden in zip(args.tokens, args.hiddens, strict=True):
+            failures.append(_check(m, hidden, f"{m}x{hidden}"))
+
+    gathered = [None] * args.tp
+    dist.all_gather_object(gathered, failures)
+    if rank == 0 and args.out:
+        with open(args.out, "w") as fh:
+            json.dump({"ranks": gathered}, fh)
+    dist.barrier()
+    eng.close()
+    dist.destroy_process_group()
+
+
+# One `_fused_spawn` call per group of shapes that share every axis baked
+# into the compiled kernel as a Python-level constant.
+_BATCH_CACHE: dict[tuple, dict[tuple[int, int], list]] = {}
+
+
+def _index_by_shape(
+    ranks: list, pairs: list[tuple[int, int]]
+) -> dict[tuple[int, int], list]:
+    """Reshape `_fused_spawn`'s per-rank, per-shape bad-lists into a per-shape view.
+
+    ``ranks[r]`` holds one bad-list per pair, in ``pairs`` order. Slicing out
+    one shape's bad-list from every rank reproduces exactly what a single-shape
+    ``_fused_spawn`` call would have returned for that rank.
+    """
+    return {
+        pair: [rank_shapes[i] for rank_shapes in ranks] for i, pair in enumerate(pairs)
+    }
+
+
+def _batch_cache_lookup(
+    key: tuple, pairs: list[tuple[int, int]], **spawn_kwargs
+) -> dict:
+    """One ``_fused_spawn`` call per `key`, all shapes computed at once.
+
+    ``key`` is ``(world_size, mode)`` or ``(world_size, mode, atoms)``; every
+    axis in it is one that forces a separate spawn. Anything passed in
+    ``spawn_kwargs`` is such an axis too, so it has to be reflected in *key* --
+    two lookups that differ only in a kwarg would otherwise share one cached
+    spawn.
+    """
+    if key not in _BATCH_CACHE:
+        world_size, mode = key[0], key[1]
+        spawn_kwargs.setdefault("atoms", key[2] if len(key) > 2 else DEFAULT_ATOMS)
+        ranks = _fused_spawn(world_size, pairs, mode=mode, **spawn_kwargs)
+        _BATCH_CACHE[key] = _index_by_shape(ranks, pairs)
+    return _BATCH_CACHE[key]
+
+
+# ---------------------------------------------------------------------------
+# Plain (pool-based) scaffolding -- used by OneShotAllReduce test suite
+# ---------------------------------------------------------------------------
 
 
 def _run_rank(
@@ -390,12 +929,17 @@ def _run_rank(
     }
 
 
-def _spawn(
+def _spawn_pool(
     world_size: int,
     engine_kw: dict,
     cases: list[tuple],
     window: tuple[int, int] | None = None,
 ) -> list[dict]:
+    """Pool-based spawn for plain ``OneShotAllReduce`` tests.
+
+    Returns a list of dicts (one per rank) each with ``rows``, ``run_ahead``
+    and ``production_cfgs`` keys.
+    """
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(f"unsupported world_size={world_size}")
     init_method = get_distributed_init_method(get_ip(), get_open_port())
@@ -459,7 +1003,7 @@ def _key(tp: int, engine_kw: dict) -> tuple:
 
 def _ranks(key: tuple) -> list[dict]:
     if key not in _RESULTS:
-        _RESULTS[key] = _spawn(key[0], dict(key[1]), _CASES[key], _WINDOWS.get(key))
+        _RESULTS[key] = _spawn_pool(key[0], dict(key[1]), _CASES[key], _WINDOWS.get(key))
     return _RESULTS[key]
 
 
@@ -468,6 +1012,11 @@ def _check(label: str, fails: list[str]) -> None:
         msg = f"{label}: " + "; ".join(fails)
         aiter.logger.error(msg)
         _FAILURES.append(msg)
+
+
+# ---------------------------------------------------------------------------
+# Plain test functions
+# ---------------------------------------------------------------------------
 
 
 @benchmark()
@@ -594,6 +1143,530 @@ def test_one_shot_allreduce_coverage(tp, window):
     }
 
 
+# ---------------------------------------------------------------------------
+# Fused test functions
+# ---------------------------------------------------------------------------
+
+
+import pytest
+
+pytestmark = pytest.mark.skipif(
+    ARCH not in SUPPORTED_ARCHS,
+    reason="OneShotAllReduce unsupported arch (need gfx942 or gfx950)",
+)
+
+
+@pytest.mark.parametrize("world_size", SUPPORTED_WORLDS)
+@pytest.mark.parametrize("m,hidden,label", _FUSED_SHAPE_CASES)
+def test_one_shot_allreduce_rmsnorm(m, hidden, label, world_size):
+    """``OneShotAllReduceRMSNorm`` against an fp32 reference of the C++ contract.
+
+    Per shape: ``out`` at the bf16 SQNR floor, ``residual_out`` **bit-exact**,
+    and both outputs bit-identical across ranks. See ``_run_rank_fused`` for why
+    the middle one is an equality rather than a tolerance.
+    """
+    group_pairs = [(mm, hh) for mm, hh, _ in _FUSED_SHAPE_CASES]
+    batch = _batch_cache_lookup((world_size, "fused"), group_pairs)
+    for rank, bad in enumerate(batch[(m, hidden)]):
+        assert not bad, f"{label}, tp={world_size}, rank {rank}: " + "; ".join(bad)
+
+
+@pytest.mark.parametrize("world_size", SUPPORTED_WORLDS)
+@pytest.mark.parametrize("m,hidden,label", _FUSED_PAD_SHAPE_CASES)
+def test_one_shot_allreduce_rmsnorm_padded(m, hidden, label, world_size):
+    """Widths that only exist because the workgroup is padded past the row.
+
+    Graded exactly like the native widths -- and that is the point. Padding is
+    supposed to be invisible to the answer: the pad lanes load 0, push 0 on the
+    wire and add 0 to the sum of squares, and their stores are dropped, so
+    ``residual_out`` must still be **bit-exact** against the fp32 reference.
+
+    Anything that leaks shows up here rather than as a tolerance wobble. A
+    mask that is one atom too wide reads the next row's first 16 B into the
+    norm; a store that is not dropped overwrites the next row's first 16 B.
+    Both change bits that the equality check sees.
+    """
+    group_pairs = [(mm, hh) for mm, hh, _ in _FUSED_PAD_SHAPE_CASES]
+    # key[2] is read as ``atoms`` by ``_batch_cache_lookup``; the trailing
+    # "pad" is only there to keep this group's spawn out of the plain fused
+    # cache entry, which shares both the mode and the atoms value.
+    batch = _batch_cache_lookup(
+        (world_size, "fused", DEFAULT_ATOMS, "pad"), group_pairs
+    )
+    for rank, bad in enumerate(batch[(m, hidden)]):
+        assert not bad, f"{label}, tp={world_size}, rank {rank}: " + "; ".join(bad)
+
+
+def test_one_shot_allreduce_rmsnorm_padding_is_least_wire():
+    """The padded pick is the narrowest legal width at or above hidden dim.
+
+    Host-side and GPU-free. Guards the selection rule rather than the kernel:
+    padding costs ``(h_pad-hidden)/hidden`` extra wire on a bandwidth-bound
+    schedule, so taking anything but the least is a silent throughput loss.
+
+    Also pins the half of the contract that matters more -- a width with a
+    native geometry must not pad at all, or every shipped shape pays for this.
+    """
+    from aiter.ops.flydsl.kernels.one_shot_allreduce import (
+        fused_block_options,
+        fused_padded_block,
+        fused_padded_block_options,
+    )
+
+    # Every width the padded GPU cases use must have *no* native geometry, or
+    # those cases would be passing on the unpadded path and proving nothing.
+    for hidden in FUSED_PAD_HIDDENS:
+        assert not fused_block_options(hidden), (
+            f"hidden={hidden} is in FUSED_PAD_HIDDENS but builds natively, so "
+            "test_one_shot_allreduce_rmsnorm_padded is not testing padding"
+        )
+        assert fused_padded_block(hidden)[2] > hidden
+
+    for hidden in range(8, 40961, 8):
+        opts = fused_padded_block_options(hidden)
+        if not opts:
+            continue
+        block, atoms, h_pad = fused_padded_block(hidden)
+        assert h_pad >= hidden
+        assert h_pad == min(o[2] for o in opts), (
+            f"hidden={hidden} padded to {h_pad}, but {min(o[2] for o in opts)} "
+            "is legal and moves fewer bytes"
+        )
+        assert block * atoms * 8 == h_pad
+        native = fused_block_options(hidden)
+        if native:
+            assert (h_pad, block, atoms) == (hidden, *native[0]), (
+                f"hidden={hidden} has a native geometry {native[0]} but "
+                f"resolved to a padded {(block, atoms, h_pad)}"
+            )
+
+
+def test_one_shot_allreduce_rmsnorm_padded_hidden_limits():
+    """What padding can and cannot address on the fused one-shot.
+
+    Host-side and GPU-free. The only requirement is a whole number of 16 B atoms
+    (a multiple of 8 bf16); the ceiling is the 1024-thread block times the widest
+    ``SUPPORTED_ATOMS`` (4), i.e. 32768. Past it, and off the atom grid, the
+    host raises naming the constraint rather than building something else.
+    """
+    from aiter.ops.flydsl.kernels.one_shot_allreduce import (
+        SUPPORTED_ATOMS,
+        fused_padded_block,
+        fused_padded_block_options,
+    )
+
+    ceiling = 1024 * 8 * max(SUPPORTED_ATOMS)
+    assert ceiling == 32768
+    widest = max(h for h in range(8, 2 * ceiling + 1, 8) if fused_padded_block_options(h))
+    assert widest == ceiling, f"widest padded hidden {widest}, not {ceiling}"
+
+    for hidden in (ceiling + 8, 2 * ceiling):
+        with pytest.raises(ValueError, match="no padded fused build"):
+            fused_padded_block(hidden)
+    for hidden in (2884, 1001, 2879):
+        assert not fused_padded_block_options(hidden)
+        with pytest.raises(ValueError, match="multiple of 8"):
+            fused_padded_block(hidden)
+
+
+def test_one_shot_allreduce_rmsnorm_geom_for_pinned_block_pads():
+    """A pinned block a width lacks natively resolves through the padded set.
+
+    ``OneShotAllReduceRMSNorm._geom_for`` is the resolver ``supports_hidden``
+    and the launch path both go through. The two must agree on a pinned block:
+    the bench sweeps ``block=1024``, which hidden=4096 admits only via padding
+    (its native blocks are 512/256/128). An earlier ``_geom_for`` sent every
+    pinned block through the native-only ``fused_atoms_for_block`` and raised on
+    exactly this pair, so ``supports_hidden`` said yes while the warm launch
+    crashed.
+
+    ``_geom_for`` reads only ``self.block``/``self._ladder``, so it
+    is exercised on a bare instance -- host-side and GPU-free, no process group.
+    """
+    from aiter.ops.flydsl.kernels.one_shot_allreduce import fused_block_options
+    from aiter.ops.flydsl.one_shot_allreduce import OneShotAllReduceRMSNorm
+
+    def geom(block, hidden, rung_atoms=1):
+        eng = OneShotAllReduceRMSNorm.__new__(OneShotAllReduceRMSNorm)
+        eng.block = block
+        return OneShotAllReduceRMSNorm._geom_for(eng, hidden, rung_atoms)
+
+    # 4096 admits 512/256/128 natively; 1024 only by padding to h_pad=8192.
+    assert 1024 not in [b for b, _ in fused_block_options(4096)]
+
+    # The regression: pinned non-native block -> resolves, no raise.
+    atoms, h_pad, split = geom(1024, 4096)
+    assert h_pad == 8192 and 1024 * atoms * 8 == h_pad and split == 1
+
+    # A pinned block the width *does* admit natively stays native (h_pad==hidden).
+    assert geom(512, 4096) == (1, 4096, 1)
+
+    # supports_hidden and _geom_for must give the same yes/no on the pin. When
+    # supports_hidden says yes, _geom_for must return a geometry that honours
+    # the pin rather than raising.
+    # A split rung pins block as the slice's width: 4096 has no unsplit b64
+    # build, only k8/k4/k2 ones, and supports_hidden must still say yes -- the
+    # launch's _check gates on it. Rungs are (floor, atoms, cap, fanout,
+    # split).
+    for block, split in ((128, 1), (256, 1), (512, 1), (1024, 1), (64, 8)):
+        eng = OneShotAllReduceRMSNorm.__new__(OneShotAllReduceRMSNorm)
+        eng.block = block
+        eng._ladder = ((0, 1, 64, None, split),)
+        if eng.supports_hidden(4096):
+            atoms, h_pad, k = OneShotAllReduceRMSNorm._geom_for(eng, 4096, 1, split)
+            assert block * atoms * 8 * k == h_pad, (block, atoms, h_pad, k)
+            assert k == split, (block, split, k)
+        else:
+            assert split == 1, (block, split)
+
+
+@pytest.mark.parametrize("world_size", SUPPORTED_WORLDS)
+@pytest.mark.parametrize("atoms,hidden", FUSED_ATOMS_CASES)
+def test_one_shot_allreduce_rmsnorm_atoms(atoms, hidden, world_size):
+    """Narrower blocks: ``atoms`` sets BLOCK = hidden/(8*atoms) in a fused build.
+
+    Covers the low end of the reduction ladder (atoms=4 at hidden=4096 is a
+    two-wave block) and the per-atom fanout stride, which is identically zero
+    at the atoms=1 default and so is untested by every case above.
+    """
+    pairs = [(m, hidden) for m in (1, 8)]
+    # hidden is in the key as well as atoms: two cases can share an atoms value
+    # and differ only in width, and they are different spawns.
+    batch = _batch_cache_lookup((world_size, "fused", atoms, hidden), pairs)
+    for m, _ in pairs:
+        for rank, bad in enumerate(batch[(m, hidden)]):
+            assert not bad, (
+                f"{m}x{hidden} atoms={atoms}, tp={world_size}, rank {rank}: "
+                + "; ".join(bad)
+            )
+
+
+@pytest.mark.parametrize("world_size", SUPPORTED_WORLDS)
+@pytest.mark.parametrize("block,hidden", FUSED_BLOCK_CASES)
+def test_one_shot_allreduce_rmsnorm_block(block, hidden, world_size):
+    """Pinning ``block`` instead of ``atoms``, which is the tuner's currency.
+
+    The engine has to solve ``block * atoms * 8 == hidden`` for atoms at this
+    width and build the same kernel the equivalent atoms pin would. What this
+    catches that ``..._atoms`` does not is the resolution itself: an off-by-one
+    there produces a *valid* kernel of the wrong width, which still runs.
+    """
+    pairs = [(m, hidden) for m in (1, 8)]
+    batch = _batch_cache_lookup(
+        (world_size, "fused", f"b{block}", hidden),
+        pairs,
+        atoms=None,
+        block=block,
+    )
+    for m, _ in pairs:
+        for rank, bad in enumerate(batch[(m, hidden)]):
+            assert not bad, (
+                f"{m}x{hidden} block={block}, tp={world_size}, rank {rank}: "
+                + "; ".join(bad)
+            )
+
+
+@pytest.mark.parametrize("world_size", SUPPORTED_WORLDS)
+@pytest.mark.parametrize("split", FUSED_FRESH_SPLITS)
+def test_one_shot_allreduce_rmsnorm_fresh_inputs(split, world_size):
+    """The fused kernel on a new input every call, at varying sizes and under
+    rank skew, checked against the reference call by call.
+
+    The plain fresh-input test's argument applies unchanged: a static input
+    cannot see a read of a stale inbox slot, because the stale data is the
+    right answer. Every 7th call also carries the inbox sentinel.
+    """
+    ranks = _fused_spawn(
+        world_size,
+        [(1, FUSED_FRESH_HIDDEN)],
+        atoms=None,
+        grid_cap=None,
+        fanout=None,
+        split=split,
+        mode="fused_fresh",
+    )
+    for rank, bad in enumerate(ranks):
+        assert not bad, f"tp={world_size} split={split}, rank {rank}: " + "; ".join(bad)
+
+
+@pytest.mark.parametrize("world_size", SUPPORTED_WORLDS)
+def test_one_shot_allreduce_rmsnorm_run_ahead(world_size):
+    """The fused kernel under deliberate rank skew.
+
+    The epilogue rotates its LDS partials through one set per colour across
+    the tokens of the grid-stride loop, with no barrier between tokens. A
+    quiescent single call never puts weight on that argument; this does.
+    """
+    ranks = _fused_spawn(
+        world_size, [(RUN_AHEAD_M, 4096)], mode="fused_run_ahead", iters=RUN_AHEAD_ITERS
+    )
+    for rank, bad in enumerate(ranks):
+        assert not bad, f"tp={world_size}, rank {rank}: " + "; ".join(bad)
+
+
+@pytest.mark.parametrize("world_size", SUPPORTED_WORLDS)
+@pytest.mark.parametrize("split,hidden", FUSED_SPLIT_CASES)
+def test_one_shot_allreduce_rmsnorm_split(split, hidden, world_size):
+    """A token row spread over ``split`` workgroups.
+
+    The same three checks as every fused case -- SQNR on ``out``, bit-exact
+    ``residual_out``, both bit-identical across ranks -- which the split build
+    has to meet through its HBM exchange: the sum of squares is joined with
+    integer atomics precisely so the ranks cannot disagree. ``out`` may differ
+    from the unsplit build's in the last ulp (a different reduction tree), which
+    the SQNR floor allows.
+
+    Each shape is called ``FUSED_SPLIT_REPEAT`` times and every call must
+    reproduce the first one's bits: the exchange word is never reset and each
+    workgroup's ``prev`` persists across launches.
+    """
+    pairs = [(m, hidden) for m in FUSED_SPLIT_M]
+    batch = _batch_cache_lookup(
+        (world_size, "fused", "split", split, hidden),
+        pairs,
+        # Explicit: key[2] is a label here, not an atoms value. atoms=None lets
+        # the engine resolve the slice geometry from the ladder's atoms.
+        atoms=None,
+        split=split,
+        repeat=FUSED_SPLIT_REPEAT,
+    )
+    for m, _ in pairs:
+        for rank, bad in enumerate(batch[(m, hidden)]):
+            assert not bad, (
+                f"{m}x{hidden} split={split}, tp={world_size}, rank {rank}: "
+                + "; ".join(bad)
+            )
+
+
+@pytest.mark.parametrize("world_size", SUPPORTED_WORLDS)
+@pytest.mark.parametrize("scale", FUSED_SPLIT_SCALES)
+def test_one_shot_allreduce_rmsnorm_split_magnitude(scale, world_size):
+    """The fixed-point exchange at both ends of its range.
+
+    A small row puts weight on the exchange's resolution (2**-16 per writer)
+    and a large one on its range (the per-writer clamp). Both have to stay on
+    the same SQNR floor. split=4 at 7168 also exercises the host's fallback to
+    the nearest split the width has (2).
+    """
+    pairs = [(1, 7168), (2, 8192)]
+    batch = _batch_cache_lookup(
+        (world_size, "fused", "split_scale", scale),
+        pairs,
+        atoms=None,
+        split=4,
+        input_scale=scale,
+    )
+    for m, hidden in pairs:
+        for rank, bad in enumerate(batch[(m, hidden)]):
+            assert not bad, (
+                f"{m}x{hidden} split=4 x{scale:g}, tp={world_size}, rank {rank}: "
+                + "; ".join(bad)
+            )
+
+
+@pytest.mark.parametrize("world_size", SUPPORTED_WORLDS)
+def test_one_shot_allreduce_rmsnorm_split_slice_lag(world_size):
+    """The exchange's reuse argument under deliberate skew inside one row.
+
+    Slice 0 of every row group stalls between contributing and reading
+    (``debug_slice_delay``), so its siblings finish the row and run on into the
+    next colour's word. That can only happen within a launch, so the grid cap
+    is pinned to two row groups: at M=8 every workgroup handles four rows per
+    call, crossing colours three times.
+    """
+    split = 4
+    ranks = _fused_spawn(
+        world_size,
+        [(8, 8192)],
+        atoms=None,
+        grid_cap=2 * split,
+        split=split,
+        mode="fused_slice_lag",
+        iters=RUN_AHEAD_ITERS,
+    )
+    for rank, bad in enumerate(ranks):
+        assert not bad, f"tp={world_size}, rank {rank}: " + "; ".join(bad)
+
+
+def test_one_shot_allreduce_rmsnorm_split_options():
+    """``fused_split_options`` is the geometry every split build draws from.
+
+    GPU-free. Pins the sets the shipped widths have -- 7168 splits only into
+    {2, 7, 14} -- and the invariants each option must meet: the slices tile the
+    row in whole waves, and every wave of the row fits the exchange word's
+    arrival count.
+    """
+    from aiter.ops.flydsl.kernels.one_shot_allreduce import (
+        SUPPORTED_SPLITS,
+        fused_block_options,
+        fused_split_options,
+    )
+    from aiter.ops.flydsl.kernels.quick_allreduce_fusions import XCHG_COUNT_BITS
+
+    def splits(hidden):
+        return {k for k, _b, _a in fused_split_options(hidden)}
+
+    assert splits(7168) == {1, 2, 7, 14}
+    assert splits(8192) == {1, 2, 4, 8, 16}
+    assert splits(4096) == {1, 2, 4, 8}
+    for hidden in range(512, 16385, 512):
+        opts = fused_split_options(hidden)
+        # split=1 is exactly the unsplit geometry, in the same order.
+        assert [(b, a) for k, b, a in opts if k == 1] == list(fused_block_options(hidden))
+        for k, b, a in opts:
+            assert k in SUPPORTED_SPLITS
+            assert k * b * a * 8 == hidden and b % 64 == 0, (hidden, k, b, a)
+            if k > 1:
+                assert k * (b // 64) < 1 << XCHG_COUNT_BITS, (hidden, k, b, a)
+
+
+def test_one_shot_allreduce_rmsnorm_split_factory():
+    """The factory's split contract, GPU-free: what it rejects and what it
+    reports.
+
+    Building a spec traces nothing -- the kernel compiles on first launch --
+    so every assertion here runs without a device.
+    """
+    from aiter.ops.flydsl.kernels.one_shot_allreduce import (
+        make_one_shot_allreduce_kernel as mk,
+    )
+
+    base = dict(world_size=4, grid=64, rank=0, fusion="rmsnorm", hidden=7168, atoms=1)
+    with pytest.raises(ValueError, match="only meaningful for a fused"):
+        mk(world_size=4, grid=64, rank=0, split=2)
+    with pytest.raises(ValueError, match="split must be one of"):
+        mk(**base, split=3)
+    with pytest.raises(ValueError, match="needs a native geometry"):
+        mk(**{**base, "hidden": 3072, "atoms": 2}, h_pad=4096, split=2)
+    with pytest.raises(ValueError, match="does not divide"):
+        mk(**{**base, "grid": 63, "hidden": 4096}, split=7)
+    with pytest.raises(ValueError, match="not a multiple of split"):
+        mk(**base, split=7)  # 64 % 7
+    with pytest.raises(ValueError, match="needs a split build"):
+        mk(**base, debug_slice_delay=2)
+    # 16 slices of 16 waves: 256 writers, one more than the arrival count holds.
+    with pytest.raises(ValueError, match="counts arrivals"):
+        mk(**{**base, "hidden": 131072}, split=16)
+
+    spec = mk(**base, split=2)
+    assert (spec["split"], spec["block"], spec["tile_bytes"]) == (2, 448, 7168)
+    # No LDS: a split build reduces across waves through HBM.
+    assert spec["lds_bytes"] == 0
+    # Words: 3 colours x 32 groups, a line each; prev: 64 workgroups x 3 x 8 B.
+    assert spec["xchg_bytes"] == 3 * 32 * 128 + 64 * 3 * 8
+    unsplit = mk(**base)
+    assert (unsplit["split"], unsplit["xchg_bytes"]) == (1, 0)
+    assert unsplit["lds_bytes"] > 0
+
+
+def test_one_shot_allreduce_rmsnorm_split_host_resolution():
+    """The host side of split, GPU-free: ``_geom_for``, ``_cfg_key`` and the
+    launch geometry.
+
+    A requested split the width lacks falls to the nearest one it has (ties to
+    the smaller); padded widths run unsplit; the grid cap rounds down to whole
+    row groups; the launch covers whole row groups and nothing past the cap.
+    """
+    from aiter.ops.flydsl.one_shot_allreduce import OneShotAllReduceRMSNorm as E
+
+    def bare(block=None):
+        eng = E.__new__(E)
+        eng.block = block
+        return eng
+
+    def geom(hidden, rung_atoms, rung_split, block=None):
+        return E._geom_for(bare(block), hidden, rung_atoms, rung_split)
+
+    assert geom(7168, 2, 4) == (1, 7168, 2)  # 7168 has {2, 7, 14}
+    assert geom(8192, 2, 4) == (2, 8192, 4)
+    assert geom(7168, 1, 7, block=128) == (1, 7168, 7)  # block is the slice's
+    assert geom(4096, 2, 1) == (2, 4096, 1)
+    assert geom(3000, 2, 2)[2] == 1  # padded: unsplit
+
+    key = E._cfg_key(bare(), 7168, (0, 1, 64, "peer", 7))
+    assert (key[2], key[5]) == (63, 7)  # cap 64 -> 9 groups of 7
+    assert E._cfg_key(bare(), 7168, (0, 2, 64, "peer", 1))[2] == 64
+
+    row = lambda h: h * 2  # noqa: E731 -- bytes per token
+    assert E._tiles_and_grid({"grid": 63, "split": 7}, 7168, 3 * row(7168)) == (21, 21)
+    assert E._tiles_and_grid({"grid": 64, "split": 4}, 8192, 40 * row(8192)) == (160, 64)
+    assert E._tiles_and_grid({"grid": 64}, 7168, 3 * row(7168)) == (3, 3)  # unsplit
+
+
+def test_one_shot_allreduce_rmsnorm_split_exchange_word():
+    """The exchange word's arithmetic, mirrored in Python.
+
+    The kernel never resets the word and decodes ``cur - prev`` modulo 2**64,
+    so this checks, for writer counts up to the limit and start values that
+    wrap: a call is never seen complete before its last writer; a complete
+    call decodes to exactly the sum of its contributions; and no call's sum
+    can carry into the sign bit, whatever the partials -- the per-writer clamp
+    bounds infinities and NaNs too.
+    """
+    import random
+
+    from aiter.ops.flydsl.kernels.quick_allreduce_fusions import (
+        XCHG_COUNT_BITS,
+        XCHG_FIX_BITS,
+        XCHG_SUM_BITS,
+        xchg_clamp_units,
+    )
+
+    mask = (1 << 64) - 1
+    count_mask = (1 << XCHG_COUNT_BITS) - 1
+
+    def contribution(partial, n):
+        # Mirrors xchg_contribution: a select-based clamp (a NaN compares false
+        # and clamps), then round to the nearest fixed-point unit.
+        clamp = xchg_clamp_units(n) * 2.0**-XCHG_FIX_BITS
+        u = partial if partial < clamp else clamp
+        q = int(u * 2.0**XCHG_FIX_BITS + 0.5)
+        return (q << XCHG_COUNT_BITS) + 1
+
+    rng = random.Random(0)
+    for n in (1, 2, 7, 14, 16, 64, 255):
+        c = xchg_clamp_units(n)
+        assert c & (c - 1) == 0 and n * c < 1 << XCHG_SUM_BITS
+        for start in (0, (1 << 64) - (3 << 40), rng.getrandbits(64)):
+            word = prev = start
+            for _call in range(3):
+                partials = [
+                    rng.choice(
+                        (0.0, rng.random() * 10.0 ** rng.randint(-6, 12), 1e30,
+                         float("inf"), float("nan"))
+                    )
+                    for _ in range(n)
+                ]
+                adds = [contribution(p, n) for p in partials]
+                rng.shuffle(adds)  # arrival order must not matter
+                for arrived, a in enumerate(adds):
+                    assert ((word - prev) & mask) & count_mask == arrived
+                    word = (word + a) & mask
+                d = (word - prev) & mask
+                assert d & count_mask == n and d < 1 << 63
+                assert d >> XCHG_COUNT_BITS == sum(a >> XCHG_COUNT_BITS for a in adds)
+                prev = word
+
+
+def test_one_shot_allreduce_rmsnorm_ladder_rungs():
+    """Every fused rung carries a split, and a legal one."""
+    from aiter.ops.flydsl.kernels.one_shot_allreduce import (
+        FUSED_ONESHOT_LADDER,
+        SUPPORTED_SPLITS,
+        fused_oneshot_ladder,
+    )
+
+    rungs = [r for v in FUSED_ONESHOT_LADDER.values() for r in v]
+    rungs += list(fused_oneshot_ladder(3, "pcie"))  # the unlisted default
+    for rung in rungs:
+        assert len(rung) == 5 and rung[4] in SUPPORTED_SPLITS, rung
+
+
+# ---------------------------------------------------------------------------
+# Summary helper and main()
+# ---------------------------------------------------------------------------
+
+
 def _summarize(name: str, rows: list[dict]) -> None:
     if rows:
         df = pd.DataFrame(rows).drop(columns=list(KNOBS), errors="ignore")
@@ -657,6 +1730,11 @@ def main():
         action="store_true",
         help="Run the spot-check configurations at every world size, and the\n"
         "spot-check shapes on the shipped ladder too.",
+    )
+    parser.add_argument(
+        "--plain-only",
+        action="store_true",
+        help="skip the fused (all-reduce + residual + RMSNorm) suites",
     )
     args = parser.parse_args()
 
@@ -749,6 +1827,42 @@ def main():
         ],
     )
 
+    if not args.plain_only:
+        for tp in tps:
+            fused_pairs = [(m, h) for m, h, _ in _FUSED_SHAPE_CASES]
+            fused_ranks = _fused_spawn(
+                tp,
+                fused_pairs,
+                atoms=DEFAULT_ATOMS,
+                grid_cap=DEFAULT_GRID_CAP,
+                fanout=DEFAULT_FANOUT,
+                mode="fused",
+            )
+            fused_fails = [
+                f"fused tp={tp} rank {r}: {bad}"
+                for r, shape_bads in enumerate(fused_ranks)
+                for bad in shape_bads
+                if bad
+            ]
+            for split in FUSED_FRESH_SPLITS:
+                fresh_ranks = _fused_spawn(
+                    tp,
+                    [(1, FUSED_FRESH_HIDDEN)],
+                    atoms=None,
+                    grid_cap=None,
+                    fanout=None,
+                    split=split,
+                    mode="fused_fresh",
+                )
+                fused_fails += [
+                    f"fused fresh tp={tp} split={split} rank {r}: {bad}"
+                    for r, bad in enumerate(fresh_ranks)
+                    if bad
+                ]
+            if fused_fails:
+                _FAILURES.extend(fused_fails)
+            aiter.logger.info("fused tp=%s: %d failures", tp, len(fused_fails))
+
     if _FAILURES:
         raise SystemExit(
             f"{len(_FAILURES)} OneShotAllReduce check(s) failed:\n  "
@@ -758,9 +1872,51 @@ def main():
 
 if __name__ == "__main__":
     freeze_support()
-    from time import perf_counter
+    # When relaunched as a subprocess rank worker (fused tests), dispatch
+    # directly to the rank entry point and exit. Otherwise run main().
+    _rank_parser = argparse.ArgumentParser(add_help=False)
+    _rank_parser.add_argument("--rank", type=int, default=None)
+    _rank_parser.add_argument("--init-method", default=None)
+    _rank_parser.add_argument("--tp", type=int, default=2)
+    _rank_parser.add_argument("--atoms", type=int, default=None)
+    _rank_parser.add_argument("--grid-cap", type=int, default=None)
+    _rank_parser.add_argument("--fanout", default=None, choices=("peer", "atom"))
+    _rank_parser.add_argument("--block", type=int, default=None)
+    _rank_parser.add_argument("--split", type=int, default=None)
+    _rank_parser.add_argument("--input-scale", type=float, default=1.0)
+    _rank_parser.add_argument("--repeat", type=int, default=1)
+    _rank_parser.add_argument(
+        "--mode",
+        default="fused",
+        choices=("fused", "fused_run_ahead", "fused_slice_lag", "fused_fresh"),
+    )
+    _rank_parser.add_argument("--tokens", default="")
+    _rank_parser.add_argument("--hiddens", default="")
+    _rank_parser.add_argument("--iters", type=int, default=RUN_AHEAD_ITERS)
+    _rank_parser.add_argument("--out", default=None)
+    known, rest = _rank_parser.parse_known_args()
+    if known.rank is not None:
+        import torch.distributed as dist
 
-    start = perf_counter()
-    main()
-    end = perf_counter()
-    aiter.logger.info(f"Test execution took {end - start:.2f}s")
+        known.tokens = [int(t) for t in known.tokens.split(",") if t]
+        known.hiddens = [int(h) for h in known.hiddens.split(",") if h]
+        if len(known.tokens) != len(known.hiddens):
+            raise SystemExit("tokens and hiddens lists must match")
+        rank = known.rank
+        device = torch.device(f"cuda:{rank}")
+        torch.cuda.set_device(device)
+        dist.init_process_group(
+            backend="gloo",
+            init_method=known.init_method,
+            world_size=known.tp,
+            rank=rank,
+        )
+        _run_rank_fused(known, rank, device, dist)
+    else:
+        from time import perf_counter
+
+        start = perf_counter()
+        sys.argv = [sys.argv[0]] + rest
+        main()
+        end = perf_counter()
+        aiter.logger.info(f"Test execution took {end - start:.2f}s")

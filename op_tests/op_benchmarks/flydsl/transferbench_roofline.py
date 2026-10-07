@@ -88,6 +88,28 @@ WIRE_RATIO = {
     # dtype.
     "fly_1stage": 1.0,
     "rccl": 1.0,
+    # ---- --fusion ar_rmsnorm rows -----------------------------------------
+    # Fusing an RMSNorm epilogue changes what happens to the bytes after they
+    # land, never how many cross the fabric, so every ratio here is its plain
+    # counterpart's.
+    "fused_cdr_1stage": 1.0,
+    "fused_cdr_2stage": 1.0,
+    "fused_fly_1stage": 1.0,
+    "fused_qr_fp8": 8.0 / 16.0 + SCALE_RATIO,
+    "fused_qr_int4": 4.0 / 16.0 + SCALE_RATIO,
+    "fused_fly_ring": 4.0 / 16.0 + SCALE_RATIO,
+    "fused_fly_mesh": 4.0 / 16.0 + SCALE_RATIO,
+    # Follows its reported variant, as ``fly_auto`` does.
+    "fused_fly_auto": 1.0,
+    # Two-launch baselines: the all-reduce is the plain kernel, and the norm
+    # that follows it is local -- no fabric traffic at all.
+    "separate_cdr": 1.0,
+    "separate_rccl": 1.0,
+    "separate_fly1s": 1.0,
+    "separate_qr_int4": 4.0 / 16.0 + SCALE_RATIO,
+    "separate_flyring": 4.0 / 16.0 + SCALE_RATIO,
+    "separate_flymesh": 4.0 / 16.0 + SCALE_RATIO,
+    "separate_fly_auto": 1.0,
 }
 
 # Which traffic pattern each candidate actually runs, independent of the shape.
@@ -173,9 +195,10 @@ def round16(nbytes) -> int:
 
 # Tuning suffixes that never change the wire shape: ``_b<N>`` (block size),
 # ``_st<N>`` (two-shot/ring super-tile), ``_g<N>`` (grid cap), ``_a<N>`` (atoms
-# per thread), ``_fa`` (fanout order). All of them change how the bytes are
-# scheduled, none of them change how many there are or which pattern is driven.
-_TUNING_SUFFIX = re.compile(r"_(?:b\d+|st\d+|g\d+|a\d+|fa)$")
+# per thread), ``_fa`` (fanout order), ``_k<N>`` (fused one-shot row split). All
+# of them change how the bytes are scheduled, none of them change how many there
+# are or which pattern is driven.
+_TUNING_SUFFIX = re.compile(r"_(?:b\d+|st\d+|g\d+|a\d+|fa|k\d+)$")
 
 # A pinned reduce-scatter codec, ``fly_int4_ring_st8_int6``: the RS lap runs at
 # that width and the AG lap stays int4. Anchored on the ring family because
@@ -222,7 +245,10 @@ _warned_keys: set = set()
 def wire_ratio(cand_key: str, variant=None) -> float:
     """Wire bytes per payload byte for *cand_key*."""
 
-    if cand_key.startswith("fly_"):
+    # ``fly_*``, ``fused_fly_*`` and ``separate_fly_auto``: every FlyDSL row
+    # reports the kernel it ran, and the ``*fly_auto`` policies have no static
+    # wire at all -- it is whichever family they picked at this shape.
+    if "fly_" in cand_key:
         ratio = variant_wire_ratio(variant)
         if ratio is not None:
             return ratio

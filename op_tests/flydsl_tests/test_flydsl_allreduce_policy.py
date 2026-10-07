@@ -30,12 +30,15 @@ from aiter.ops.flydsl.kernels.one_shot_allreduce import (
 from aiter.ops.flydsl.kernels.quick_allreduce_codec import (
     SUPPORTED_BLOCKS as TWO_STAGE_BLOCKS,
 )
-from aiter.ops.flydsl.kernels.quick_allreduce_int4 import (
+from aiter.ops.flydsl.kernels.quick_allreduce_fusions import FUSED_QR_ROW_ATOMS
+from aiter.ops.flydsl.kernels.quick_allreduce_mesh import (
     SUPER_TILES,
+    fused_mesh_st_ladder,
     mesh_st_ladder,
 )
-from aiter.ops.flydsl.kernels.quick_allreduce_int4_ring import (
+from aiter.ops.flydsl.kernels.quick_allreduce_ring import (
     RING_SUPER_TILES,
+    fused_ring_st_ladder,
     ring_st_ladder,
 )
 from aiter.ops.flydsl.one_shot_allreduce import max_payload_bytes
@@ -106,6 +109,27 @@ def test_ladders_are_well_formed(ws):
             assert cap >= 1, (link, cap)
             assert fanout in ("peer", "atom"), (link, fanout)
             assert block in SUPPORTED_BLOCKS, (link, block)
+
+
+@pytest.mark.parametrize("ws", WORLDS)
+def test_fused_ladders_are_well_formed(ws):
+    """The fused mesh/ring ladders obey the same rules as the plain ones, with
+    ``(min_bytes, super_tile, grid_cap)`` rungs, and every ``FUSED_QR_ROW_ATOMS``
+    entry divides a rank's reduce-scatter chunk (``ATOMS // world_size`` atoms)."""
+    for link in P.LINKS:
+        for name, rungs, valid_st in (
+            ("mesh", fused_mesh_st_ladder(ws, link), SUPER_TILES),
+            ("ring", fused_ring_st_ladder(ws, link), RING_SUPER_TILES),
+        ):
+            assert rungs, (name, link)
+            assert rungs[0][0] == 0, (name, link)
+            assert [r[0] for r in rungs] == sorted(r[0] for r in rungs), (name, link)
+            for _floor, st, cap in rungs:
+                assert st in valid_st, (name, link, st)
+                assert cap >= 1, (name, link, cap)
+    for (link, world, algorithm), atoms in FUSED_QR_ROW_ATOMS.items():
+        assert link in P.LINKS and algorithm in ("mesh", "ring"), (link, algorithm)
+        assert atoms >= 1 and (8 // world) % atoms == 0, (link, world, algorithm, atoms)
 
 
 @pytest.mark.parametrize("ws", WORLDS)
@@ -315,6 +339,186 @@ def test_selectors_reject_non_contiguous():
     t = _full_storage_transpose(max(one.min_bytes, 1 << 12))
     assert CustomAllreduce._should_fly_oneshot(ca, t.contiguous(), True, False)
     assert not CustomAllreduce._should_fly_oneshot(ca, t, True, False)
+
+
+# ---------------------------------------------------------------------------
+# Fused all-reduce+RMSNorm sub-API.
+#
+# The fused families all live in one aiter slot (QuickAllReduce), so unlike the
+# plain path they keep a single unified view -- FusedPolicy -- with its own
+# resolver, family picker, reachability and env overrides. accuracy_mode adds a
+# second axis the plain path does not have: exact (default) leaves only the
+# one-shot reachable, fast opens the quantized mesh/ring beyond it.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("cell", CELLS)
+def test_fused_every_cell_has_a_policy(cell):
+    assert cell in P.FUSED_FAMILY_POLICY
+
+
+def test_accuracy_mode_env():
+    assert P.DEFAULT_ACCURACY == "exact"
+    with _env(AITER_FLY_AR_ACCURACY="exact"):
+        assert P.accuracy_mode() == "exact"
+    with _env(AITER_FLY_AR_ACCURACY="fast"):
+        assert P.accuracy_mode() == "fast"
+    # Unset and garbage both fall back to the exact default rather than
+    # silently enabling the quantized families.
+    with mock.patch.dict(os.environ, {}, clear=True):
+        assert P.accuracy_mode() == P.DEFAULT_ACCURACY
+    with _env(AITER_FLY_AR_ACCURACY="lossy"):
+        assert P.accuracy_mode() == P.DEFAULT_ACCURACY
+
+
+@pytest.mark.parametrize("cell", CELLS)
+def test_fused_exact_mode_is_oneshot_only(cell):
+    """Exact mode never reaches a quantized family, on any cell.
+
+    Dropping this would silently quantize the fused output by default -- an
+    accuracy regression for a tensor that feeds the next layer. The one-shot
+    serves up to its widened ``oneshot_max_exact`` ceiling and above that the
+    path declines.
+    """
+    link, ws = cell
+    p = P.resolve_fused(link, ws, mode="exact")
+    assert p.mesh_max == 0
+    assert p.ring_max == 0
+    assert P.fused_families_reachable(p) == ("oneshot",)
+    assert p.oneshot_max == P.FUSED_FAMILY_POLICY[cell].oneshot_max_exact
+
+
+@pytest.mark.parametrize("cell", CELLS)
+def test_fused_fast_mode_reaches_past_the_oneshot(cell):
+    """Fast mode opens at least one quantized family beyond the one-shot."""
+    link, ws = cell
+    p = P.resolve_fused(link, ws, mode="fast")
+    families = P.fused_families_reachable(p)
+    assert families[0] == "oneshot"
+    assert len(families) >= 2
+
+
+def test_fused_empty_mesh_window_reaches_the_ring():
+    """A policy with an empty mesh window skips straight to the ring.
+
+    ``mesh_max`` equal to ``oneshot_max`` makes the mesh interval
+    ``(oneshot_max, mesh_max]`` empty, so no payload is ever dispatched to
+    mesh and the ring picks up everything above the one-shot.
+    """
+    p = P.FusedPolicy(
+        oneshot_max=1 << 20, oneshot_max_exact=32 << 20, mesh_max=1 << 20, ring_max=None
+    )
+    assert P.fused_families_reachable(p) == ("oneshot", "ring")
+    assert P.pick_fused_family(p.oneshot_max, p) == "oneshot"
+    assert P.pick_fused_family(p.oneshot_max + 1, p) == "ring"
+
+
+@pytest.mark.parametrize("cell", CELLS)
+def test_fused_pick_family_is_monotone(cell):
+    """The fused family choice never goes backwards as the payload grows, and
+    every family it picks is one the policy says is reachable."""
+    link, ws = cell
+    p = P.resolve_fused(link, ws, mode="fast")
+    reachable = P.fused_families_reachable(p)
+    order = {"oneshot": 0, "mesh": 1, "ring": 2}
+    seen = []
+    for n in (1 << k for k in range(4, 31)):
+        fam = P.pick_fused_family(n, p)
+        assert fam in reachable, (cell, n, fam, reachable)
+        seen.append(order[fam])
+    assert seen == sorted(seen)
+
+
+def test_fused_family_windows_partition_by_size():
+    """On a cell with all three families, the boundaries hand off cleanly.
+
+    pcie/4 fast reaches one-shot, mesh and ring, so it exercises both
+    crossovers at once.
+    """
+    p = P.resolve_fused("pcie", 4, mode="fast")
+    assert P.fused_families_reachable(p) == ("oneshot", "mesh", "ring")
+    assert P.pick_fused_family(p.oneshot_max, p) == "oneshot"
+    assert P.pick_fused_family(p.oneshot_max + 1, p) == "mesh"
+    assert P.pick_fused_family(p.mesh_max, p) == "mesh"
+    assert P.pick_fused_family(p.mesh_max + 1, p) == "ring"
+
+
+@pytest.mark.parametrize("mode", P.ACCURACY_MODES)
+@pytest.mark.parametrize("cell", CELLS)
+def test_fused_family_range_matches_the_picker(cell, mode):
+    """``fused_family_range`` is what ``prime`` preloads, so every payload the
+    dispatcher accepts must fall in exactly one reachable family's range, and
+    that family must be the one ``pick_fused_family`` sends it to.
+
+    A range that is too narrow leaves a binary to JIT inside a graph capture.
+    """
+    link, ws = cell
+    p = P.resolve_fused(link, ws, mode=mode)
+    reachable = P.fused_families_reachable(p)
+    ranges = {fam: P.fused_family_range(fam, p) for fam in ("oneshot", "mesh", "ring")}
+    top = 0xFFFFFFFF if p.max_bytes is None else p.max_bytes
+    edges = {p.min_bytes, p.oneshot_max, p.oneshot_max + 1, top}
+    if p.mesh_max is not None:
+        edges.update((p.mesh_max, p.mesh_max + 1))
+    edges.update(1 << k for k in range(4, 32))
+    for n in sorted(edges):
+        if not p.min_bytes <= n <= top:
+            continue
+        owners = [f for f, (lo, hi) in ranges.items() if lo <= n <= hi]
+        assert owners == [P.pick_fused_family(n, p)], (n, owners, ranges)
+        assert owners[0] in reachable, (n, owners, reachable)
+
+
+def test_fused_family_range_rejects_unknown_family():
+    with pytest.raises(ValueError):
+        P.fused_family_range("tree", P.resolve_fused("pcie", 4, mode="fast"))
+
+
+def test_fused_max_bytes_is_none_when_a_family_is_unbounded():
+    """An open-ended family means no integer ceiling; exact mode has one."""
+    assert P.resolve_fused("pcie", 4, mode="fast").max_bytes is None
+    assert P.resolve_fused("xgmi", 2, mode="fast").max_bytes is None
+    assert isinstance(P.resolve_fused("pcie", 4, mode="exact").max_bytes, int)
+
+
+def test_fused_byte_overrides():
+    table_one = P.FUSED_FAMILY_POLICY[("pcie", 8)].oneshot_max_exact
+    with _env(AITER_FLY_AR_FUSED_ONESHOT_MAX_BYTES="65536"):
+        assert P.resolve_fused("pcie", 8, mode="exact").oneshot_max == 65536
+    with _env(AITER_FLY_AR_FUSED_MESH_MAX_BYTES="1048576"):
+        # The mesh window is floored at the one-shot ceiling.
+        p = P.resolve_fused("pcie", 4, mode="fast")
+        assert p.mesh_max == max(1048576, p.oneshot_max)
+    # -1 is the house sentinel for "unset, use the table".
+    with _env(AITER_FLY_AR_FUSED_ONESHOT_MAX_BYTES="-1"):
+        assert P.resolve_fused("pcie", 8, mode="exact").oneshot_max == table_one
+    # Garbage warns and is ignored.
+    with _env(AITER_FLY_AR_FUSED_ONESHOT_MAX_BYTES="lots"):
+        assert P.resolve_fused("pcie", 8, mode="exact").oneshot_max == table_one
+
+
+def test_fused_exact_mode_ignores_the_mesh_override():
+    """The mesh override is meaningless in exact mode, which has no mesh
+    window, so it is dropped rather than reopening one."""
+    with _env(AITER_FLY_AR_FUSED_MESH_MAX_BYTES="1048576"):
+        p = P.resolve_fused("pcie", 4, mode="exact")
+        assert p.mesh_max == 0
+        assert P.fused_families_reachable(p) == ("oneshot",)
+
+
+def test_fused_min_bytes_override():
+    with _env(AITER_FLY_AR_FUSED_MIN_BYTES="12345"):
+        assert P.resolve_fused("pcie", 2, mode="fast").min_bytes == 12345
+        assert P.resolve_fused("xgmi", 4, mode="exact").min_bytes == 12345
+
+
+def test_resolve_fused_rejects_unknown_keys():
+    with pytest.raises(ValueError):
+        P.resolve_fused("infiniband", 4)
+    with pytest.raises(ValueError):
+        P.resolve_fused("pcie", 3)
+    with pytest.raises(ValueError):
+        P.resolve_fused("pcie", 4, mode="lossy")
 
 
 if __name__ == "__main__":

@@ -292,7 +292,28 @@ class CudaCommunicator(DeviceCommunicatorBase):
             if self._ar_1stage_override is not None
             else (total_bytes <= total_bytes_limit)
         )
+        
         qr_comm = self.qr_comm
+
+        # FlyDSL fused first when enabled, ahead of the use_1stage gate. Its
+        # engines live in qr_comm; the policy's min_bytes keeps it off the
+        # decode shapes where cdr_fused:1stage wins.
+        if (
+            not use_general_path
+            and x_pad_to_multiple == 0
+            and input_n == n
+            and not gemma_norm
+            and qr_comm is not None
+            and not qr_comm.disabled
+            and qr_comm.should_fly_allreduce_rmsnorm(input_, res_inp_, weight_)
+        ):
+            out, res_out = qr_comm.quick_all_reduce_rmsnorm(
+                input_, res_inp_, weight_, eps, n
+            )
+            assert out is not None
+            assert res_out is not None
+            return out, res_out
+
         if (
             not use_1stage
             and not use_general_path

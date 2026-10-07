@@ -3,7 +3,7 @@
 
 """Codec-level tests for the quick-allreduce wire formats.
 
-Single GPU, no IPC: these cover the codec, while ``test_flydsl_quick_allreduce_int4.py``
+Single GPU, no IPC: these cover the codec, while ``test_flydsl_quick_allreduce.py``
 covers the schedules that carry it.
 
 Two properties are load-bearing:
@@ -47,8 +47,8 @@ from flydsl.expr.typing import Int32, Int64, Stream, T
 
 from aiter.ops.flydsl.kernels.quick_allreduce_codec import (
     CODECS,
+    MAX_BLOCK,
     SECTOR_I32,
-    SUPPORTED_BLOCKS,
     _atom_bf16_to_f16,
     _atom_f16_to_bf16,
     _clamp_fp16_overflow,
@@ -72,10 +72,24 @@ pytestmark = pytest.mark.skipif(
 
 #: One thread's contribution to a row: 8 bf16 values, 16 B -- the codec's own
 #: atom, not the collective's 8-atom tile. A "row" is one such atom for the
-#: whole block: BLOCK * 8 bf16 elements.
+#: whole block: ``block * 8`` bf16 elements.
 _ATOM_BF16 = 8
 TILE_ELEMS = BLOCK * _ATOM_BF16
 _GRID_CAP = 256
+
+# Workgroup widths under test.
+#
+# 256 is the regression guard: every offset the codec derives has to reproduce
+# the shipped geometry there exactly. 512 and 896 are what the fused quick-reduce
+# actually builds -- ``hidden/8`` for 4096 and 7168 -- where one 16 B atom is one
+# token row. 896 is also the only non-power-of-two width in play (14 waves), so
+# it is where a wave-count assumption would surface. 64 and 128 are the plain
+# menu's small widths; 64 is the one that needs the scale region sector-padded.
+BLOCK_WIDTHS = (64, 128, BLOCK, 512, 896)
+
+
+def tile_elems(block: int) -> int:
+    return block * _ATOM_BF16
 
 
 def _global_i32_ptr(addr_i64):
@@ -205,19 +219,18 @@ def codec_roundtrip(
 ) -> torch.Tensor:
     """Quantize and dequantize *x* with the real kernel codec.
 
-    *x* is bf16 on a GPU with a whole number of rows of ``block * 8`` elements
-    (:data:`TILE_ELEMS` at the default block). ``via_memory=False`` skips the
-    LDS staging and keeps the quantized words in registers; the two must agree
-    bit for bit.
+    *x* is bf16 on a GPU with a whole number of ``tile_elems(block)``.
+    ``via_memory=False`` skips the LDS staging and keeps the quantized words in
+    registers; the two must agree bit for bit.
     """
-    row_elems = block * _ATOM_BF16
     if x.dtype != torch.bfloat16 or not x.is_cuda:
         raise ValueError("codec_roundtrip needs a bf16 CUDA tensor")
-    if x.numel() % row_elems:
-        raise ValueError(f"numel must be a multiple of {row_elems}, got {x.numel()}")
+    elems = tile_elems(block)
+    if x.numel() % elems:
+        raise ValueError(f"numel must be a multiple of {elems}, got {x.numel()}")
     x = x.contiguous()
     out = torch.empty_like(x)
-    num_rows = x.numel() // row_elems
+    num_rows = x.numel() // elems
     grid_x = max(1, min(num_rows, _GRID_CAP))
     eng = _engine(codec_name, via_memory, block)
     args = (
@@ -252,7 +265,7 @@ def _payload(
     *, n_tiles: int, seed: int, scale: float = 1.0, block: int = BLOCK
 ) -> torch.Tensor:
     g = torch.Generator().manual_seed(seed)
-    n = n_tiles * block * _ATOM_BF16
+    n = n_tiles * tile_elems(block)
     x = torch.randn(n, generator=g, dtype=torch.float32) * scale
     return x.to(device="cuda:0", dtype=torch.bfloat16)
 
@@ -276,15 +289,20 @@ def _err_bound(bias: int) -> float:
     return E4M3_REL_SLACK + 1.05 / bias
 
 
-@pytest.mark.parametrize("block", SUPPORTED_BLOCKS)
+@pytest.mark.parametrize("block", BLOCK_WIDTHS)
 @pytest.mark.parametrize("codec_name", CODEC_NAMES)
 def test_memory_path_matches_register_path(codec_name, block):
     """Staging through the wire layout must not change a single bit.
 
     This is the store/load consistency check. It would catch the two sides
     disagreeing about where the INT6 2-bit plane lives, or a half-swap between
-    the threads that share one of its i32 slots. At every block, because the
-    plane and scale offsets scale with it.
+    the threads that share one of its i32 slots.
+
+    Necessary at every block width, because every region offset scales with it
+    -- but not sufficient: a thread-to-slot mapping that is wrong *and*
+    self-consistent passes here, since both sides would be wrong together. What
+    pins the mapping is the accuracy set below, which grades against a group
+    extremum computed in torch.
     """
     x = _payload(n_tiles=2, seed=17, block=block)
     through_lds = codec_roundtrip(x, codec_name, via_memory=True, block=block)
@@ -296,9 +314,11 @@ def test_memory_path_matches_register_path(codec_name, block):
     )
 
 
-@pytest.mark.parametrize("block", SUPPORTED_BLOCKS)
+@pytest.mark.parametrize("block", BLOCK_WIDTHS)
 @pytest.mark.parametrize("codec_name", CODEC_NAMES)
 def test_error_within_analytic_bound(codec_name, block):
+    """The bound has no free parameters and no block term, so a width that
+    quantizes against the wrong group fails it."""
     x = _payload(n_tiles=4, seed=23, block=block)
     y = codec_roundtrip(x, codec_name, block=block)
     xg, yg = _groups(x), _groups(y)
@@ -308,22 +328,28 @@ def test_error_within_analytic_bound(codec_name, block):
     assert worst <= bound, f"max |err|/|ext| {worst:.4f} > {bound:.4f}"
 
 
+@pytest.mark.parametrize("block", BLOCK_WIDTHS)
 @pytest.mark.parametrize("codec_name", CODEC_NAMES)
-def test_reconstruction_stays_in_range(codec_name):
+def test_reconstruction_stays_in_range(codec_name, block):
     """A saturating codec cannot amplify: nothing may exceed the group extremum."""
-    x = _payload(n_tiles=4, seed=29)
-    y = codec_roundtrip(x, codec_name)
+    x = _payload(n_tiles=4, seed=29, block=block)
+    y = codec_roundtrip(x, codec_name, block=block)
     xg, yg = _groups(x), _groups(y)
     ext = _signed_extremum(xg).abs().clamp_min(1e-20)
     worst = float((yg.abs().max(-1).values / ext).max())
     assert worst <= 1.0 + E4M3_REL_SLACK + 1e-3, f"max |y|/|ext| {worst:.4f}"
 
 
+@pytest.mark.parametrize("block", BLOCK_WIDTHS)
 @pytest.mark.parametrize("codec_name", CODEC_NAMES)
-def test_group_extremum_keeps_its_sign(codec_name):
-    """The extremum drives the scale, so it must survive with its sign intact."""
-    x = _payload(n_tiles=2, seed=31)
-    xg, yg = _groups(x), _groups(codec_roundtrip(x, codec_name))
+def test_group_extremum_keeps_its_sign(codec_name, block):
+    """The extremum drives the scale, so it must survive with its sign intact.
+
+    The sharpest of the mapping checks: the scale a thread reads has to be the
+    one its own pair wrote, and at a new block width that is a fresh claim.
+    """
+    x = _payload(n_tiles=2, seed=31, block=block)
+    xg, yg = _groups(x), _groups(codec_roundtrip(x, codec_name, block=block))
     idx = xg.abs().argmax(-1, keepdim=True)
     x_ext = xg.gather(-1, idx).squeeze(-1)
     y_ext = yg.gather(-1, idx).squeeze(-1)
@@ -372,13 +398,15 @@ E4M3_MAX = 480.0
 E4M3_FLOOR = 2.0**-7
 
 
-def _spike_group(ext_value: float, fill: float = 0.02) -> torch.Tensor:
+def _spike_group(
+    ext_value: float, fill: float = 0.02, block: int = BLOCK
+) -> torch.Tensor:
     """One tile whose first group has extremum *ext_value*; every other element is *fill*.
 
     :func:`_groups` reshapes flat into 16-wide runs, so element 0 is exactly
     this group's extremum as long as *fill* cannot compete with it.
     """
-    x = torch.full((TILE_ELEMS,), fill, dtype=torch.float32)
+    x = torch.full((tile_elems(block),), fill, dtype=torch.float32)
     x[0] = ext_value
     return x.to(device="cuda:0", dtype=torch.bfloat16)
 
@@ -440,7 +468,14 @@ def test_extremum_below_e4m3_floor_survives_instead_of_zeroing(codec_name):
 # all-gather transport in isolation.
 
 
-@pytest.mark.parametrize("block", SUPPORTED_BLOCKS)
+@pytest.mark.parametrize("block", BLOCK_WIDTHS)
+def test_fp16_codec_roundtrip_is_identity(block):
+    x = _payload(n_tiles=2, seed=53, block=block)
+    y = codec_roundtrip(x, "fp16", block=block)
+    assert torch.equal(x, y), "fp16 passthrough must not alter a single bit"
+
+
+@pytest.mark.parametrize("block", BLOCK_WIDTHS)
 @pytest.mark.parametrize("codec_name", ("int4", "int6", "fp16"))
 def test_rank_tile_regions_are_whole_sectors(codec_name, block):
     """Every region starts and the rank-tile ends on a 64 B fabric sector.
@@ -466,34 +501,86 @@ def test_rank_tile_regions_are_whole_sectors(codec_name, block):
     assert c.rank_tile_i32 - c.scale_i32_off >= block // 8
 
 
-def test_default_block_keeps_the_original_geometry():
-    """``block=256`` is the geometry every kernel shipped with."""
-    geometry = {
-        n: (c.hi2_i32_off, c.scale_i32_off, c.rank_tile_i32) for n, c in CODECS.items()
-    }
-    assert geometry == {
-        "int4": (None, 256, 288),
-        "int6": (256, 384, 416),
-        "fp16": (None, None, 1024),
-    }
-
-
-def test_fp16_codec_roundtrip_is_identity():
-    x = _payload(n_tiles=2, seed=53)
-    y = codec_roundtrip(x, "fp16")
-    assert torch.equal(x, y), "fp16 passthrough must not alter a single bit"
-
-
-@pytest.mark.parametrize("block", SUPPORTED_BLOCKS)
+@pytest.mark.parametrize("block", BLOCK_WIDTHS)
 def test_fp16_codec_memory_path_matches_register_path(block):
+    """fp16's rank-tile is ``block*4`` i32 and its planes stride by ``block``,
+    so this is the width-sensitive half of the passthrough format."""
     x = _payload(n_tiles=2, seed=59, block=block)
     through_lds = codec_roundtrip(x, "fp16", via_memory=True, block=block)
     in_regs = codec_roundtrip(x, "fp16", via_memory=False, block=block)
     assert torch.equal(through_lds, in_regs)
 
 
+@pytest.mark.parametrize("codec_name", CODEC_NAMES)
+def test_accuracy_is_block_invariant(codec_name):
+    """A quantization group is 16 elements whatever the block width.
+
+    So the RMS error must not move with it. This is the test that fails if
+    ``scale_slot_of`` pairs the wrong threads at a width it was never run at:
+    the error would still be bounded (the codec saturates) and the memory and
+    register paths would still agree, but a group would be scaled by a
+    neighbour's extremum and the RMS would climb.
+    """
+    rms = {}
+    for block in BLOCK_WIDTHS:
+        x = _payload(n_tiles=8, seed=67, block=block)
+        rms[block] = float(
+            (codec_roundtrip(x, codec_name, block=block).float() - x.float())
+            .pow(2)
+            .mean()
+            .sqrt()
+        )
+    base = rms[BLOCK]
+    for block, got in rms.items():
+        assert abs(got - base) / base < 0.05, (
+            f"{codec_name} RMS error {got:.5f} at block={block} against "
+            f"{base:.5f} at {BLOCK}: the group mapping moved with the width"
+        )
+
+
+# Geometry only -- no GPU, no kernel. Pins the arithmetic that every offset
+# above is derived from.
+
+
+@pytest.mark.parametrize("block", (64, 128, 256, 384, 512, 640, 896, MAX_BLOCK))
+def test_codec_regions_stay_on_the_sector_grid(block):
+    """Every rank-tile is a whole number of 64 B fabric sectors at every legal
+    width. A fractional one would have the fanout address past its end."""
+    for codec in codecs_for_block(block).values():
+        assert codec.block == block
+        assert codec.rank_tile_bytes % 64 == 0, (codec.name, codec.rank_tile_bytes)
+        assert codec.n_sectors == codec.rank_tile_bytes // 64
+        if codec.has_scale:
+            assert codec.scale_i32_off < codec.rank_tile_i32
+        if codec.hi2_i32_off is not None:
+            assert codec.hi2_i32_off < codec.scale_i32_off
+
+
+def test_default_block_reproduces_the_shipped_geometry():
+    """The parameterization must be a no-op at 256: these are the offsets the
+    shipped kernels were measured and tuned with."""
+    t = codecs_for_block(BLOCK)
+    assert (t["int4"].scale_i32_off, t["int4"].rank_tile_i32) == (256, 288)
+    assert (
+        t["int6"].hi2_i32_off,
+        t["int6"].scale_i32_off,
+        t["int6"].rank_tile_i32,
+    ) == (256, 384, 416)
+    assert t["fp16"].rank_tile_i32 == 1024
+    assert t["int4"].rank_tile_bytes == 1152 and t["int4"].n_sectors == 18
+    assert t is CODECS, "the module table must be the cached default-width one"
+
+
+@pytest.mark.parametrize("block", (0, 96, 192, 320, MAX_BLOCK + 128))
+def test_illegal_block_widths_raise(block):
+    """Off-grid or out-of-range widths are rejected at build time rather than
+    producing a kernel that addresses past a rank-tile."""
+    with pytest.raises(ValueError):
+        codecs_for_block(block)
+
+
 def _resolve(algorithm, world_size, rs=None, ag=None):
-    from aiter.ops.flydsl import quick_allreduce_int4 as host
+    from aiter.ops.flydsl import quick_allreduce as host
 
     return host._resolve_codecs(host.ALGORITHMS[algorithm], world_size, rs, ag)
 
