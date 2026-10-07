@@ -19,6 +19,7 @@ Supported kernel families:
   - ``flydsl_mxfp8_128_bpreshuffle_wmma_*``   gfx1250 mxfp8_128 GEMM kernels
   - ``flydsl_mxfp8_128_bpreshuffle_compute_wmma_*`` gfx1250 compute-bound mxfp8_128 kernels
   - ``flydsl_mxfp8_32_bpreshuffle_{,compute_}wmma_*`` the same kernels on 1x32 scales
+  - ``flydsl_decode_*``                       gfx950 decode MXFP4 GEMM kernels
   - ``flydsl_mxpsh_*``                        gfx950 MX-microscale preshuffle GEMM
   - ``flydsl_bmm_mxfp8_mfma_*``               gfx950 mxscale batched GEMM kernels
 
@@ -65,6 +66,7 @@ from aiter.ops.flydsl.batched_gemm_a8w8_gfx950 import (
 from aiter.ops.flydsl.bpreshuffle_gemm_gfx1250 import (
     parse_wmma_kernel_name as parse_ptpc_wmma_kernel_name,
 )
+from aiter.ops.flydsl.decode_gemm_mxfp4 import parse_flydsl_decode_name
 from aiter.ops.flydsl.gemm_a8w8_bpreshuffle_8wave import (
     compile_8wave_gemm,
     parse_8wave_kernel_name,
@@ -75,6 +77,10 @@ from aiter.ops.flydsl.gemm_kernels import (
 )
 from aiter.ops.flydsl.gemm_tune.flydsl_gemm_mxscale_preshuffle_common import (
     parse_kernel_name as parse_mxscale_preshuffle_kernel_name,
+)
+from aiter.ops.flydsl.kernels.decode_gemm_mxfp4 import compile_decode_gemm_mxfp4
+from aiter.ops.flydsl.kernels.decode_gemm_mxfp4_reduce import (
+    compile_decode_gemm_mxfp4_reduce,
 )
 from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 import (
     GEMM_A16W16_DTYPE_BF16,
@@ -112,6 +118,7 @@ from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
 from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
     parse_wmma_kernel_name as parse_mxfp8_128_wmma_kernel_name,
 )
+from aiter.ops.gemm_op_common import find_padded_m_row
 
 # Keep the default AOT coverage aligned with runtime config resolution.
 DEFAULT_CSVS = [
@@ -223,6 +230,25 @@ def _bmm_mfma_job(
     }
 
 
+DECODE_MAX_M = 16
+
+
+def _decode_served_ms(row_keys, gfx, cu_num, m, n, k):
+    """Actual M in 1..DECODE_MAX_M whose runtime lookup lands on the row at M=m.
+
+    Mirrors get_GEMM_config (aiter/ops/gemm_op_a4w4.py): try M itself, then M
+    padded at getPaddedM granularity 0 and 1, first present row wins. The
+    padding comes from the same compiled helper the runtime calls."""
+    served = []
+    for actual in range(1, DECODE_MAX_M + 1):
+        hit, padded = find_padded_m_row(
+            row_keys, lambda pm: (gfx, cu_num, pm, n, k), actual, n, k
+        )
+        if hit is not None and padded == m:
+            served.append(actual)
+    return served
+
+
 def parse_csv(csv_path: str):
     """Parse a GEMM tuned CSV and return a list of unique FlyDSL compile jobs."""
     jobs = []
@@ -230,105 +256,128 @@ def parse_csv(csv_path: str):
     batched_skipped = set()
 
     with open(csv_path, newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            kernel_name = row.get("kernelName", "").strip()
-            libtype = row.get("libtype", "").strip()
-            if libtype != "flydsl" or not kernel_name.startswith("flydsl_"):
-                continue
+        all_rows = list(csv.DictReader(f))
+    # Keys of every row, not only FlyDSL ones: a non-FlyDSL row at the exact M
+    # shadows a padded FlyDSL row at runtime.
+    row_keys = {
+        (
+            r.get("gfx", "").strip(),
+            int(r.get("cu_num", "0")),
+            int(r["M"]),
+            int(r["N"]),
+            int(r["K"]),
+        ): True
+        for r in all_rows
+        if "b" not in r and r.get("M")
+    }
 
-            if "b" in row:  # a batched table
-                job = None
-                if kernel_name.startswith(f"{BMM_MFMA_NAME_PREFIX}_"):
-                    job = _bmm_mfma_job(
-                        row, kernel_name, int(row["b"]), int(row["n"]), int(row["k"])
-                    )
-                if job is None:
-                    batched_skipped.add(kernel_name)
-                elif job_identity(job) not in seen:
+    for row in all_rows:
+        kernel_name = row.get("kernelName", "").strip()
+        libtype = row.get("libtype", "").strip()
+        is_decode = kernel_name.startswith("flydsl_decode_")
+        if not kernel_name.startswith("flydsl_") or (
+            libtype != "flydsl" and not is_decode
+        ):
+            continue
+
+        if "b" in row:  # a batched table
+            job = None
+            if kernel_name.startswith(f"{BMM_MFMA_NAME_PREFIX}_"):
+                job = _bmm_mfma_job(
+                    row, kernel_name, int(row["b"]), int(row["n"]), int(row["k"])
+                )
+            if job is None:
+                batched_skipped.add(kernel_name)
+            elif job_identity(job) not in seen:
+                seen.add(job_identity(job))
+                jobs.append(job)
+            continue
+
+        m = int(row["M"])
+        n = int(row["N"])
+        k = int(row["K"])
+        cu_num = int(row.get("cu_num", "0"))
+        gfx = row.get("gfx", "").strip()
+
+        if row.get("kernelId", "").strip() == "bmm":  # the batched GEMM, B = 1
+            # A 128-wide GEMM x_scale is column-major (blockscale), read by
+            # the transposed kernel, except at M = 1 where both coincide.
+            layouts = (
+                (False, True)
+                if row.get("w_scale_block", "128x128").strip() == "128x128"
+                else (False,)
+            )
+            for transposed in layouts:
+                job = _bmm_mfma_job(row, kernel_name, 1, n, k, transposed)
+                if job is not None and job_identity(job) not in seen:
                     seen.add(job_identity(job))
                     jobs.append(job)
+            continue
+
+        if is_decode:
+            if job_arch(cu_num, gfx) != "gfx950":
                 continue
-
-            m = int(row["M"])
-            n = int(row["N"])
-            k = int(row["K"])
-            cu_num = int(row.get("cu_num", "0"))
-            gfx = row.get("gfx", "").strip()
-
-            if row.get("kernelId", "").strip() == "bmm":  # the batched GEMM, B = 1
-                # A 128-wide GEMM x_scale is column-major (blockscale), read by
-                # the transposed kernel, except at M = 1 where both coincide.
-                layouts = (
-                    (False, True)
-                    if row.get("w_scale_block", "128x128").strip() == "128x128"
-                    else (False,)
+            params = parse_flydsl_decode_name(kernel_name)
+            if params is not None:
+                params = {"kind": "decode", **params}
+        elif kernel_name.startswith("flydsl_bpreshuflle_"):
+            params = _parse_preshuffle_kernel_name(kernel_name)
+        elif kernel_name.startswith("flydsl_mxpsh_"):
+            params = parse_mxscale_preshuffle_kernel_name(kernel_name)
+            if params is not None:
+                params = dict(params)
+                params["kind"] = "mxscale_preshuffle"
+                params["blockscale"] = True
+        elif kernel_name.startswith("flydsl_bpreshuffle_8w_"):
+            params = parse_8wave_kernel_name(kernel_name)
+            if params is not None:
+                params = dict(params)
+                params["kind"] = "8wave"
+        elif kernel_name.startswith(
+            (
+                f"{MXFP8_128_WMMA_PREFIX}_",
+                f"{MXFP8_128_COMPUTE_WMMA_PREFIX}_",
+            )
+        ):
+            params = parse_mxfp8_128_wmma_kernel_name(kernel_name)
+            if params is not None:
+                params = dict(params)
+                params["kind"] = "mxfp8_wmma"
+                params["scale_block"] = SCALE_BLOCK_SIZE
+        elif kernel_name.startswith(
+            (f"{MX32_WMMA_NAME_PREFIX}_", f"{MX32_COMPUTE_WMMA_NAME_PREFIX}_")
+        ):
+            params = parse_mxfp8_32_wmma_kernel_name(kernel_name)
+            if params is not None:
+                params = dict(params)
+                params["kind"] = "mxfp8_wmma"
+                params["scale_block"] = MX32_BLOCK_K
+        elif kernel_name.startswith("flydsl_bpreshuffle_wmma_"):
+            params = parse_ptpc_wmma_kernel_name(kernel_name)
+            if params is not None:
+                params = dict(params)
+                params["kind"] = "ptpc_wmma"
+        elif kernel_name.startswith("flydsl_hgemm"):
+            params = get_flydsl_hgemm_kernel_params(kernel_name)
+            if params is not None:
+                params = dict(params)
+                params["kind"] = (
+                    "a16w16_gfx1250" if params["target_gfx"] == "gfx1250" else "hgemm"
                 )
-                for transposed in layouts:
-                    job = _bmm_mfma_job(row, kernel_name, 1, n, k, transposed)
-                    if job is not None and job_identity(job) not in seen:
-                        seen.add(job_identity(job))
-                        jobs.append(job)
-                continue
+        else:
+            params = None
 
-            if kernel_name.startswith("flydsl_bpreshuflle_"):
-                params = _parse_preshuffle_kernel_name(kernel_name)
-            elif kernel_name.startswith("flydsl_mxpsh_"):
-                params = parse_mxscale_preshuffle_kernel_name(kernel_name)
-                if params is not None:
-                    params = dict(params)
-                    params["kind"] = "mxscale_preshuffle"
-                    params["blockscale"] = True
-            elif kernel_name.startswith("flydsl_bpreshuffle_8w_"):
-                params = parse_8wave_kernel_name(kernel_name)
-                if params is not None:
-                    params = dict(params)
-                    params["kind"] = "8wave"
-            elif kernel_name.startswith(
-                (
-                    f"{MXFP8_128_WMMA_PREFIX}_",
-                    f"{MXFP8_128_COMPUTE_WMMA_PREFIX}_",
-                )
-            ):
-                params = parse_mxfp8_128_wmma_kernel_name(kernel_name)
-                if params is not None:
-                    params = dict(params)
-                    params["kind"] = "mxfp8_wmma"
-                    params["scale_block"] = SCALE_BLOCK_SIZE
-            elif kernel_name.startswith(
-                (f"{MX32_WMMA_NAME_PREFIX}_", f"{MX32_COMPUTE_WMMA_NAME_PREFIX}_")
-            ):
-                params = parse_mxfp8_32_wmma_kernel_name(kernel_name)
-                if params is not None:
-                    params = dict(params)
-                    params["kind"] = "mxfp8_wmma"
-                    params["scale_block"] = MX32_BLOCK_K
-            elif kernel_name.startswith("flydsl_bpreshuffle_wmma_"):
-                params = parse_ptpc_wmma_kernel_name(kernel_name)
-                if params is not None:
-                    params = dict(params)
-                    params["kind"] = "ptpc_wmma"
-            elif kernel_name.startswith("flydsl_hgemm"):
-                params = get_flydsl_hgemm_kernel_params(kernel_name)
-                if params is not None:
-                    params = dict(params)
-                    params["kind"] = (
-                        "a16w16_gfx1250"
-                        if params["target_gfx"] == "gfx1250"
-                        else "hgemm"
-                    )
-            else:
-                params = None
+        if params is None:
+            print(f"  [WARN] Unknown FlyDSL GEMM kernel name: {kernel_name}, skipping")
+            continue
 
-            if params is None:
-                print(
-                    f"  [WARN] Unknown FlyDSL GEMM kernel name: {kernel_name}, skipping"
-                )
-                continue
-
+        # The decode kernel specializes on the actual M, so each M the row
+        # serves needs its own cache entry.
+        ms = _decode_served_ms(row_keys, gfx, cu_num, m, n, k) if is_decode else [m]
+        for job_m in ms:
             job = {
                 "kernel_name": kernel_name,
-                "m": m,
+                "m": job_m,
                 "n": n,
                 "k": k,
                 "cu_num": cu_num,
@@ -743,6 +792,53 @@ def _compile_mxscale_preshuffle_to_cache(
         )
 
 
+def _compile_decode_mxfp4_to_cache(
+    *,
+    m: int,
+    n: int,
+    k: int,
+    tile_n: int,
+    k_waves: int,
+    num_buffers: int,
+    split_k: int,
+    **kwargs,
+):
+    del kwargs
+
+    import torch
+
+    dev = torch.device("cpu")
+    padded_k = (k + 255) // 256 * 256
+    # Match the wrapper's flattened int32 operand views and output dtype/rank.
+    a = torch.empty((m * k // 8,), device=dev, dtype=torch.int32)
+    b = torch.empty((n * k // 8,), device=dev, dtype=torch.int32)
+    scale_a = torch.empty((padded_k // 4,), device=dev, dtype=torch.int32)
+    scale_b = torch.empty((n * padded_k // 128,), device=dev, dtype=torch.int32)
+    out = torch.empty((m * n,), device=dev, dtype=torch.bfloat16)
+    target = (
+        torch.empty((split_k * m * n,), device=dev, dtype=torch.float32)
+        if split_k > 1
+        else out
+    )
+    exe = compile_decode_gemm_mxfp4(
+        M=m,
+        N=n,
+        K=k,
+        tile_n=tile_n,
+        k_waves=k_waves,
+        num_buffers=num_buffers,
+        split_k=split_k,
+    )
+    _compile_executable_to_cache(exe, a, b, scale_a, scale_b, target, fx.Stream(0))
+    if split_k > 1:
+        _compile_executable_to_cache(
+            compile_decode_gemm_mxfp4_reduce(M=m, N=n, split_k=split_k),
+            target,
+            out,
+            fx.Stream(0),
+        )
+
+
 def _compile_8wave_to_cache(
     *,
     m: int,
@@ -1038,6 +1134,12 @@ def compile_one_config(
                 _compile_preshuffle_to_cache(m=m, n=n, k=k, **kwargs)
             elif kind == "mxscale_preshuffle":
                 _compile_mxscale_preshuffle_to_cache(m=m, n=n, k=k, **kwargs)
+            elif kind == "decode":
+                if aot_arch != "gfx950":
+                    raise ValueError(
+                        f"Decode MXFP4 only supports gfx950, got {aot_arch}"
+                    )
+                _compile_decode_mxfp4_to_cache(m=m, n=n, k=k, **kwargs)
             elif kind == "8wave":
                 _compile_8wave_to_cache(m=m, n=n, k=k, **kwargs)
             elif kind == "mxfp8_wmma":
