@@ -172,9 +172,11 @@ def flydsl_grouped_gemm_a8w4_masked(
     if persistent_workers < 0:
         raise ValueError("persistent_workers must be nonnegative")
     if persistent_workers:
-        if cluster_m != 1 or stage2_scatter is not None:
+        if cluster_m != 1:
+            raise ValueError("persistent workers require cluster_m=1")
+        if stage2_scatter is not None and stage2_scatter.combine_quant_bits:
             raise ValueError(
-                "persistent workers require cluster_m=1 and no fused EP scatter"
+                "persistent EP scatter requires an unquantized combine wire"
             )
         persistent_workers = (
             (persistent_workers + cluster_n - 1) // cluster_n * cluster_n

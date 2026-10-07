@@ -200,7 +200,9 @@ def launch_gemm_a8w4_tdm(
     if persistent_workers:
         assert cluster_m == 1, "persistent workers require cluster_m=1"
         assert persistent_workers % cluster_n == 0
-        assert not enable_ep_scatter, "persistent workers do not support EP scatter"
+        assert not (enable_ep_scatter and ep_quant_bits), (
+            "persistent EP scatter requires an unquantized combine wire"
+        )
     # Resolve per-row settings before specializing the layout and cache key.
     lds_soa_load_interleave_on = (
         lds_soa_load_interleave
@@ -2259,7 +2261,8 @@ def launch_gemm_a8w4_tdm(
 
         if const_expr(persistent_workers > 0):
             # Every wave must retire the output store before another wave
-            # reuses the same LDS arena for the next task's input.
+            # reuses the same LDS arena for the next task's input. This also
+            # covers the fused scatter's tensor_wait above.
             workgroup_barrier()
 
     @flyc.kernel(name=_kname, known_block_size=[block, 1, 1])

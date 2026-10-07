@@ -185,9 +185,9 @@ def _find_grouped_config(
     if not matches:
         matches = [row for row in rows if _matches(row, require_cu_num=False)]
     # A row that names ep_fused explicitly was tuned for that path, so it wins
-    # over an otherwise equal row that serves both. These are hand-picked, not
-    # tuned: measuring the fused path needs a live multi-rank arena for gemm2's
-    # scatter epilogue, which the single-GPU bench cannot stand up.
+    # over an otherwise equal row that serves both. Measuring the fused path
+    # needs a live multi-rank arena for GEMM2's scatter epilogue, so its tuning
+    # must use the multi-GPU benchmark.
     ep_specific = [row for row in matches if _cell(row, "ep_fused")]
     if ep_specific:
         matches = ep_specific
@@ -1587,6 +1587,12 @@ def grouped_gemm_gfx1250_a8w4(
                 _tdm_kw["persistent_workers"] = _as_int(
                     cfg_row.get("tdm_persistent_workers"), 0
                 )
+            # Scatter needs its own measured worker count; generic rows were
+            # tuned with a local GEMM2 store. Quantized scatter stays nonpersistent.
+            if stage2_scatter is None or (
+                _as_int(cfg_row.get("ep_fused"), 0) == 1
+                and not stage2_scatter.combine_quant_bits
+            ):
                 _tdm_kw["persistent_workers2"] = _as_int(
                     cfg_row.get("tdm_persistent_workers2"), 0
                 )
