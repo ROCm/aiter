@@ -306,7 +306,8 @@ def get_unified_attention_config(
     """
     config = _get_unified_attention_config_cached(
         op,
-        params.head_size,
+        # no asymmetric-head configs yet, pick by the wider of the two heads
+        max(params.head_size, params.head_size_v),
         params.max_seqlen_q,
         params.max_seqlen_k,
         params.sliding_window,
@@ -326,7 +327,7 @@ def explain(op: str, params, backend: str = "triton", arch: str | None = None) -
     """Report which entry a lookup lands on, and the config it yields."""
     table, axes, cfg_dir = _load(op, backend, arch)
     values = _axis_values(
-        params.head_size,
+        max(params.head_size, params.head_size_v),
         params.max_seqlen_q,
         params.max_seqlen_k,
         params.sliding_window,

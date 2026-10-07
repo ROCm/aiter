@@ -84,6 +84,17 @@ def _reduce_float(value, device, op):
     return float(result.item())
 
 
+def _rel_l2(output, reference):
+    """Relative L2 error over all ranks; -1.0 when the reference is all zero."""
+    error_sq = torch.sum((output.float() - reference) ** 2)
+    reference_sq = torch.sum(reference**2)
+    dist.all_reduce(error_sq)
+    dist.all_reduce(reference_sq)
+    if not reference_sq.item():
+        return -1.0
+    return float(torch.sqrt(error_sq / reference_sq))
+
+
 def _next_power_of_two(value):
     return 1 << (int(value) - 1).bit_length()
 
@@ -335,11 +346,7 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
             moe.experts,
             moe.swiglu_limit,
         )
-        error_sq = torch.sum((output.float() - reference) ** 2)
-        reference_sq = torch.sum(reference**2)
-        dist.all_reduce(error_sq)
-        dist.all_reduce(reference_sq)
-        rel_l2 = float(torch.sqrt(error_sq / reference_sq))
+        rel_l2 = _rel_l2(output, reference)
         if rel_l2 >= args.rtol:
             raise AssertionError(f"bs={tokens} relL2={rel_l2:.6f} exceeds {args.rtol}")
 
@@ -379,6 +386,63 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
             f"stage1={stage1_ms[0]:.4f}/{stage1_ms[1]:.4f}ms "
             f"stage2={stage2_ms[0]:.4f}/{stage2_ms[1]:.4f}ms "
             f"e2e={e2e_ms[0]:.4f}/{e2e_ms[1]:.4f}ms mean/max",
+            flush=True,
+        )
+    if args.pad_tail_rows:
+        _check_pad_tail(moe, x, weights, ids, ref_weights, args, rank, world, device)
+
+
+def _check_pad_tail(moe, x, weights, ids, ref_weights, args, rank, world, device):
+    """Whole -1 rows with mask_invalid_slots=True: exact zeros, real rows intact.
+
+    Runs after the unmasked passes above, so the combine input still holds
+    their values; a masked slot that read it would show up as nonzero.
+    """
+    tokens = x.shape[0]
+    real = max(tokens - args.pad_tail_rows, 0)
+    masked_ids = ids.clone()
+    masked_ids[real:] = -1
+
+    def masked():
+        return moe(x, weights, masked_ids, mask_invalid_slots=True)[:tokens]
+
+    eager_output = masked().clone()
+    _barrier()
+    pad_zero = bool((eager_output[real:] == 0).all())
+    if not _reduce_float(pad_zero, device, dist.ReduceOp.MIN):
+        raise AssertionError(f"bs={tokens} masked pad rows are not zero")
+    reference = _reference(
+        x[:real],
+        weights[:real],
+        ids[:real],
+        ref_weights,
+        rank,
+        world,
+        moe.model_dim,
+        moe.inter_dim,
+        moe.experts,
+        moe.swiglu_limit,
+    )
+    # -1: every row of every rank is padding, so there is nothing to compare.
+    rel_l2 = _rel_l2(eager_output[:real], reference)
+    if rel_l2 >= args.rtol:
+        raise AssertionError(
+            f"bs={tokens} pad_tail={args.pad_tail_rows} relL2={rel_l2:.6f} "
+            f"exceeds {args.rtol}"
+        )
+    state = {}
+
+    def capture():
+        state["output"] = masked()
+
+    _time_graph(capture, device, 1)
+    graph_exact = torch.equal(state["output"], eager_output)
+    if not _reduce_float(graph_exact, device, dist.ReduceOp.MIN):
+        raise AssertionError(f"bs={tokens} CUDA Graph replay changed masked output")
+    if rank == 0:
+        print(
+            f"[MEGA-V2] bs={tokens} pad_tail={args.pad_tail_rows} "
+            f"relL2={rel_l2:.6f} pad_rows=ZERO graph_replay=PASS",
             flush=True,
         )
 
@@ -452,6 +516,13 @@ def main():
     parser.add_argument("--force-fanout-boundary", action="store_true")
     parser.add_argument("--inject-invalid-route", action="store_true")
     parser.add_argument("--force-padding-boundary", action="store_true")
+    parser.add_argument(
+        "--pad-tail-rows",
+        type=int,
+        default=0,
+        help="Also route each rank's last N rows to -1 (whole rows) and check "
+        "forward(mask_invalid_slots=True) returns them as zeros",
+    )
     args = parser.parse_args()
     if (
         sum(

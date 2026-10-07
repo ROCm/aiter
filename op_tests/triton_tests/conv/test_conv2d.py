@@ -20,10 +20,10 @@ Plus test_cross_method (differential correctness) that runs every NCHW
 kernel on shapes routable by all of them and verifies they all match
 F.conv2d. NCHW-only by design; 2 cases (one per dtype).
 
-Plus 7 exact-route and configuration-precedence regression cases, and 2
-scalar-parameter cases (one per layout).
+Plus 7 exact-route and configuration-precedence regression cases, 2
+scalar-parameter cases, 1 cache-clear case, and 2 inference-tensor cases.
 
-Total: 12 + 12 + 12 + 36 + 2 + 7 + 2 = 83 cases.
+Total: 12 + 12 + 12 + 36 + 2 + 7 + 2 + 1 + 2 = 86 cases.
 
 Where a kernel's guard rejects a shape (e.g. winograd on a 5x5), the
 shape is silently skipped inside run_all_methods.
@@ -167,6 +167,44 @@ def test_conv2d_weight_pack_cache_clear_is_scoped(monkeypatch):
         conv_prepack,
         clear_conv2d_weight_pack_caches,
         CONV2D_WEIGHT_PACK_CACHE_NAMES,
+    )
+
+
+def test_inference_weight_bypasses_pack_cache_and_observes_updates(monkeypatch):
+    cache = conv_prepack._LRUPackCache(maxsize=2)
+    monkeypatch.setattr(conv_prepack, "_PACK_CACHE_3x3", cache)
+
+    with torch.inference_mode():
+        weight = torch.arange(18, dtype=torch.float16, device="cpu").reshape(2, 1, 3, 3)
+        first, _ = conv_prepack.get_or_make_weight_pack_3x3(weight, block_c=4)
+        second, _ = conv_prepack.get_or_make_weight_pack_3x3(weight, block_c=4)
+        weight.add_(10)
+        refreshed, _ = conv_prepack.get_or_make_weight_pack_3x3(weight, block_c=4)
+
+    assert not cache._d, "inference weights must not enter the global cache"
+    assert second is not first, "inference weight unexpectedly reused a pack"
+    assert refreshed is not second, "updated inference weight reused a stale pack"
+    expected = weight.reshape(2, 1, 9).permute(0, 2, 1)
+    torch.testing.assert_close(refreshed[:, :, :1], expected)
+
+
+def test_conv2d_inference_weight_observes_updates():
+    torch.manual_seed(0)
+    with torch.inference_mode():
+        x = torch.randn(1, 64, 16, 16, device="cuda", dtype=torch.float16)
+        weight = torch.randn(32, 64, 3, 3, device="cuda", dtype=torch.float16)
+
+        output = conv2d_module.conv2d(x, weight, padding=1)
+        reference = F.conv2d(x.float(), weight.float(), padding=1)
+
+        weight.add_(0.25)
+        output_after_update = conv2d_module.conv2d(x, weight, padding=1)
+        reference_after_update = F.conv2d(x.float(), weight.float(), padding=1)
+
+    rtol, atol = dynamic_conv_tolerances(torch.float16, 64 * 3 * 3)
+    torch.testing.assert_close(output.float(), reference, rtol=rtol, atol=atol)
+    torch.testing.assert_close(
+        output_after_update.float(), reference_after_update, rtol=rtol, atol=atol
     )
 
 

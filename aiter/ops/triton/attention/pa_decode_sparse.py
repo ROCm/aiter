@@ -32,7 +32,7 @@ from aiter.ops.triton._triton_kernels.attention.pa_decode_sparse import (
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.common_utils import max_addressable_bytes
-from aiter.ops.triton.utils.device_info import get_num_sms
+from aiter.ops.triton.utils.device_info import get_num_sms, get_num_xcds
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 
@@ -89,6 +89,9 @@ def pa_decode_sparse(
     extra_indices: torch.Tensor | None = None,
     extra_indptr: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
+    inv_rope_positions: torch.Tensor | None = None,
+    inv_rope_cos_sin_cache: torch.Tensor | None = None,
+    out_mxfp8: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Sparse paged-decode attention with split-K + widened BLOCK_H.
 
@@ -117,6 +120,8 @@ def pa_decode_sparse(
             isolation and for callers that fold the reduce into a downstream op.
         extra_cache/extra_indices/extra_indptr: gfx950 packed-only — the SWA+top-k
             two-loop's second (top-k) cache + index set; must be None otherwise.
+        inv_rope_positions/inv_rope_cos_sin_cache/out_mxfp8: gfx950 gluon only —
+            the output epilogue (see _pa_decode_sparse_gfx950_gluon).
 
     On gfx950 the DSv4 gluon driver handles this: a 3D ``unified_kv`` selects the
     packed fp8_dsv4_mla (584 B rows) / bf16 block cache (``extra_*`` = the
@@ -186,11 +191,17 @@ def pa_decode_sparse(
                 skip_reduce=skip_reduce,
                 has_invalid=bool(has_invalid),
                 out=out,
+                inv_rope_positions=inv_rope_positions,
+                inv_rope_cos_sin_cache=inv_rope_cos_sin_cache,
+                out_mxfp8=out_mxfp8,
             )
 
     assert (
         extra_cache is None and extra_indices is None and extra_indptr is None
     ), "extra_cache/extra_indices/extra_indptr are gfx950 packed-only"
+    assert (
+        inv_rope_positions is None and out_mxfp8 is None
+    ), "the output epilogue is gfx950 gluon-only"
 
     quant_kv = kv_scales is not None
     if quant_kv:
@@ -466,6 +477,51 @@ def _decode_num_splits_occ(num_queries, heads_blocks, avg_main, avg_extra, block
     return max(1, min(cta_cap, tiles, _MAX_SPLITS))
 
 
+def _last_round_fills(programs, num_sms):
+    """The grid's last round of programs is full or more than half full."""
+    left = programs % num_sms
+    return left == 0 or 2 * left > num_sms
+
+
+def _rounds_suit_32(num_heads, num_queries, num_splits, tiles):
+    """The 32-head grid ends on a full or more-than-half-full round (up to four
+    rounds), or its programs have four or more tiles (past four rounds)."""
+    num_sms = get_num_sms()
+    programs = num_queries * (num_heads // 32) * num_splits
+    if programs <= 4 * num_sms:
+        return _last_round_fills(programs, num_sms)
+    return tiles >= 4
+
+
+def _dsv4_block_m(num_heads, num_queries, num_splits, row_tiles, has_extra):
+    """Heads per program (16, 32 or 64) for fp8_dsv4_mla at 32 or 64 heads: 64
+    for top-k launches without split-K from one full round of rows (up to four
+    rounds, the last more than half full); else 32 past one tile per program."""
+    num_sms = get_num_sms()
+    rows_fill = num_queries >= num_sms and (
+        _last_round_fills(num_queries, num_sms) or num_queries > 4 * num_sms
+    )
+    if num_heads == 64 and has_extra and num_splits == 1 and rows_fill:
+        return 64
+    tiles = row_tiles / num_splits
+    if tiles > 1 and _rounds_suit_32(num_heads, num_queries, num_splits, tiles):
+        return 32
+    return 16
+
+
+def _staged_block_m(num_heads, num_queries, num_splits, row_tiles):
+    """Heads per program (16, 32 or 64) at 32 or 64 heads for the staged walks
+    (per-tensor fp8; bf16 with the rope inside): 64 without split-K once
+    2 x rows > CUs; else 32 from two tiles per program."""
+    num_sms = get_num_sms()
+    if num_heads == 64 and num_splits == 1 and 2 * num_queries > num_sms:
+        return 64
+    tiles = row_tiles / num_splits
+    if tiles >= 2 and _rounds_suit_32(num_heads, num_queries, num_splits, tiles):
+        return 32
+    return 16
+
+
 def _launch_splits(num_splits):
     """Split programs to launch: past 2, rounded up to a multiple of 4, so the
     reduce (unrolled over the launched count) compiles for few counts. The extra
@@ -488,6 +544,9 @@ def _pa_decode_sparse_gfx950_gluon(
     skip_reduce=False,
     out=None,
     has_invalid=False,
+    inv_rope_positions=None,
+    inv_rope_cos_sin_cache=None,
+    out_mxfp8=None,
 ):
     """Merged gfx950 gluon DSv4 sparse-MLA decode driver. Format from cache.ndim:
     3D [nb, block, 584] -> packed fp8_dsv4_mla (uint8: 448 NoPE fp8 e4m3 OCP +
@@ -496,6 +555,13 @@ def _pa_decode_sparse_gfx950_gluon(
                            else a single segment.
     2D [pages, D]       -> uniform pool: fp8 (uint8) + cache_scales
                            [pages, D//64] fp32, or bf16 (cache_scales None).
+
+    The output epilogue applies what vLLM runs on the rows before wo_a:
+    inv_rope_positions [N] with inv_rope_cos_sin_cache [P, 64] f32 (cos | sin)
+    rotate the trailing 64 lanes of each row back (inverse GPT-J RoPE), and
+    out_mxfp8 = (data [N, H * D] e4m3, scale [N, H * D // 32] uint8 E8M0)
+    replaces out with its MXFP8 quantization; data viewed as [N, H, D] is
+    returned.
     """
     assert q.ndim == 3, f"expected q=[b,h,d], got {q.shape}"
     assert DEVICE_ARCH == "gfx950", "gluon DSv4 decode kernel is gfx950-only"
@@ -575,6 +641,11 @@ def _pa_decode_sparse_gfx950_gluon(
     else:
         main_fmt = "fp8_dsv4_mla" if main_is_fp8 else "bf16"
         extra_fmt = "fp8_dsv4_mla" if extra_is_fp8 else "bf16"
+        # The fp8_dsv4_mla gather splits slot ids into (page, row) by shifts.
+        for fmt, block in ((main_fmt, main_block), (extra_fmt, extra_block)):
+            assert (
+                fmt != "fp8_dsv4_mla" or block & (block - 1) == 0
+            ), f"fp8_dsv4_mla page size must be a power of two, got {block}"
 
     # Alignment hint for the page strides so row gathers can vectorize: the largest
     # power of 2 (<= 16) dividing both.
@@ -595,16 +666,77 @@ def _pa_decode_sparse_gfx950_gluon(
         and max_addressable_bytes(extra_indices) < MAX_BYTES
     )
     use_buffer_load = main_use_buffer_load and extra_use_buffer_load
-    HEAD_ALIGNED = num_heads % BLOCK_M == 0
-    heads_blocks = (num_heads + BLOCK_M - 1) // BLOCK_M
-    out = _check_out(out, q, torch.bfloat16)
-
+    packed_fp8 = (
+        not FLAT_POOL
+        and main_fmt == "fp8_dsv4_mla"
+        and (not has_extra or extra_fmt == "fp8_dsv4_mla")
+    )
+    prefill = num_queries >= _PREFILL_MIN_ROWS
+    row_tiles = max(avg_main, avg_extra) / BLOCK_K
+    # Split count from the 16-head grid, for every program size.
     if kv_splits is not None:
         num_splits = max(1, int(kv_splits))
     else:
         num_splits = _decode_num_splits_occ(
-            num_queries, heads_blocks, avg_main, avg_extra, BLOCK_K
+            num_queries,
+            (num_heads + BLOCK_M - 1) // BLOCK_M,
+            avg_main,
+            avg_extra,
+            BLOCK_K,
         )
+    staged_bf16 = (
+        not FLAT_POOL and main_fmt == "bf16" and (not has_extra or extra_fmt == "bf16")
+    )
+    # 32- and 64-head programs (8 warps) stage each key tile once for all heads.
+    if num_heads in (32, 64):
+        if packed_fp8:
+            BLOCK_M = _dsv4_block_m(
+                num_heads, num_queries, num_splits, row_tiles, has_extra
+            )
+        elif staged_bf16:
+            BLOCK_M = _staged_block_m(num_heads, num_queries, num_splits, row_tiles)
+    if BLOCK_M > 16:
+        num_warps = 8
+    HEAD_ALIGNED = num_heads % BLOCK_M == 0
+    heads_blocks = (num_heads + BLOCK_M - 1) // BLOCK_M
+    inv_rope = inv_rope_positions is not None
+    assert inv_rope == (
+        inv_rope_cos_sin_cache is not None
+    ), "inv_rope_positions and inv_rope_cos_sin_cache go together"
+    assert not (
+        skip_reduce and (inv_rope or out_mxfp8 is not None)
+    ), "the output epilogue runs in the reduce, so skip_reduce cannot be set"
+    if inv_rope:
+        assert inv_rope_positions.shape == (num_queries,)
+        assert inv_rope_positions.stride(0) == 1
+        assert inv_rope_cos_sin_cache.dtype == torch.float32
+        # [P, 64]: the kernel steps rows by stride(0)
+        assert inv_rope_cos_sin_cache.ndim == 2
+        assert inv_rope_cos_sin_cache.shape[1] == ROPE_DIM
+        assert inv_rope_cos_sin_cache.stride(1) == 1
+        assert inv_rope_positions.device == q.device
+        assert inv_rope_cos_sin_cache.device == q.device
+    if out_mxfp8 is not None:
+        assert out is None, "out and out_mxfp8 are mutually exclusive"
+        out_data, out_scale = out_mxfp8
+        assert out_data.dtype == torch.float8_e4m3fn and out_scale.dtype == torch.uint8
+        assert out_data.shape == (num_queries, num_heads * head_dim)
+        assert out_scale.shape == (num_queries, num_heads * head_dim // 32)
+        assert out_data.stride(-1) == 1 and out_scale.stride(-1) == 1
+        assert out_data.device == q.device and out_scale.device == q.device
+        out = out_data.view(num_queries, num_heads, head_dim)
+    else:
+        out_scale = None
+        out = _check_out(out, q, torch.bfloat16)
+    epilogue = {
+        "pos_ptr": inv_rope_positions,
+        "cos_sin_ptr": inv_rope_cos_sin_cache,
+        "cs_stride": inv_rope_cos_sin_cache.stride(0) if inv_rope else 0,
+        "out_scale_ptr": out_scale,
+        "os_stride0": out_scale.stride(0) if out_scale is not None else 0,
+        "INV_ROPE": inv_rope,
+        "OUT_MXFP8": out_scale is not None,
+    }
 
     # Q is read once per query without split-K, and re-read by every split
     q_cache = ".cg" if num_splits == 1 else ""
@@ -646,13 +778,7 @@ def _pa_decode_sparse_gfx950_gluon(
         # Prefill rows re-read each other's KV rows, so cache the gather instead of .cg.
         prefill_kw["GATHER_CACHE"] = ""
         if main_fmt == extra_fmt == "fp8_dsv4_mla":
-            prefill_kw.update(
-                # Over 64-bit gathers the prefetched ids and the has_invalid redirect
-                # together spill the tile loop.
-                IDX_PREFETCH=use_buffer_load or not has_invalid,
-                SLOT_U32=max(s0, s1) < (1 << 24),
-                KV_LDS_PAD=16,
-            )
+            prefill_kw["SLOT_U32"] = max(s0, s1) < (1 << 24)
             nope_chunk = max(1, BLOCK_K // 8)
 
     waves_per_eu = 2
@@ -664,7 +790,6 @@ def _pa_decode_sparse_gfx950_gluon(
 
     # Unpeeled is faster at prefill and, on the 64-bit gathers, unless split-K
     # leaves each program a few tiles. Decode on buffer loads is faster peeled.
-    row_tiles = max(avg_main, avg_extra) / BLOCK_K
     short_splits = num_splits > 1 and row_tiles <= 4 * num_splits
     unpeel = num_queries >= _PREFILL_MIN_ROWS if use_buffer_load else not short_splits
 
@@ -676,14 +801,25 @@ def _pa_decode_sparse_gfx950_gluon(
     # than one split to give back.
     adaptive_splits = num_splits > 1
 
-    # Fuse the dsv4 dequant into v_cvt_scalef32_pk_bf16_fp8. The asm fallback
-    # gathers an extra int16 tile, so it only pays off at one workgroup per CU.
-    if _HAS_SCALED_UPCAST:
-        deq = "upcast"
-    elif one_wg_per_cu:
-        deq = "asm"
-    else:
-        deq = "none"
+    # dsv4 dequant: the scaled upcast if this Triton has it, else inline asm.
+    deq = "upcast" if _HAS_SCALED_UPCAST else "asm"
+
+    # The 16-lane row gather needs row-axis dequant chunks of 4+ rows per warp.
+    if packed_fp8 and chunk_axis == 0:
+        nope_chunk = max(nope_chunk, 4 * num_warps)
+    if packed_fp8:
+        # Rows that share KV rows reuse them through the cache, so skip .cg.
+        prefill_kw["GATHER_CACHE"] = ""
+
+    # One XCD (and L2) for programs that read the same KV rows: a row's head blocks,
+    # or neighbouring rows of bf16's 32/64-head programs without split-K. Not for
+    # SWA-only prefill or launches padded past the split count.
+    rows_share = heads_blocks > 1 or (staged_bf16 and BLOCK_M > 16 and num_splits == 1)
+    xcd_remap = (
+        get_num_xcds()
+        if rows_share and grid_splits == num_splits and (has_extra or not prefill)
+        else 0
+    )
 
     # Grid dim 0 varies fastest and XCD assignment is round-robin over the linear
     # workgroup id, so the axis order decides what shares an XCD's L2.
@@ -755,9 +891,15 @@ def _pa_decode_sparse_gfx950_gluon(
         IDX_BUFFER_LOAD=idx_use_buffer_load,
         HAS_INVALID=has_invalid,
         UNPEEL=unpeel,
+        XCD_REMAP=xcd_remap,
+        # Gather a tile ahead only for fp8_dsv4_mla's 32-head programs below prefill
+        # size.
+        DSV4_PREFETCH=packed_fp8 and BLOCK_M == 32 and not prefill,
         num_warps=num_warps,
         waves_per_eu=waves_per_eu,
         **prefill_kw,
+        # The epilogue runs where the output is written.
+        **(epilogue if num_splits == 1 else {}),
     )
 
     if num_splits == 1:
@@ -787,6 +929,8 @@ def _pa_decode_sparse_gfx950_gluon(
         NUM_SPLITS=grid_splits,
         HEAD_ALIGNED=True,
         ADAPTIVE_SPLITS=adaptive_splits,
+        ROPE_DIM=ROPE_DIM,
+        **epilogue,
         # A 2-split tile spans two warps; more warps would hold duplicate lanes.
         num_warps=min(4, grid_splits),
     )
