@@ -333,7 +333,7 @@ elif [[ "$TEST_TYPE" == "triton" ]]; then
     FILE_TIMES[op_tests/triton_tests/fusions/test_fused_clamp_act_mul.py]=14
     FILE_TIMES[op_tests/triton_tests/moe/test_moe_routing_herd.py]=14
     FILE_TIMES[op_tests/triton_tests/test_fused_rearrange_sigmoid_gdr.py]=14
-    FILE_TIMES[op_tests/triton_tests/attention/test_pa_prefill_sparse.py]=12
+    FILE_TIMES[op_tests/triton_tests/attention/test_pa_prefill_sparse.py]=20
     FILE_TIMES[op_tests/triton_tests/gated_delta_net/test_fused_kda_decode.py]=12
     FILE_TIMES[op_tests/triton_tests/gemm/basic/test_gemm_a16wfp4.py]=12
     FILE_TIMES[op_tests/triton_tests/gemm/basic/test_gemm_a8wfp4.py]=12

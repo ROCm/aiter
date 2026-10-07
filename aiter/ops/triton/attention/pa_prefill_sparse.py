@@ -292,10 +292,10 @@ def pa_prefill_sparse(
                 HAS_ATTN_SINK=has_attn_sink,
                 BLOCK_D=block_d,
                 USE_EXP2=True,
-                # The unmasked gather redirects bad slots to row 0, which must exist.
-                EVEN_HD=block_d == head_dim
-                and num_heads % block_h == 0
-                and unified_kv.shape[0] > 0,
+                # Drops the head/dim masks only; invalid KV rows are still
+                # masked out of the gather (never loaded), so an empty pool
+                # or a non-finite unused row is safe.
+                EVEN_HD=block_d == head_dim and num_heads % block_h == 0,
                 num_warps=pinned.num_warps,
                 num_stages=pinned.num_stages,
                 **pinned.kwargs,

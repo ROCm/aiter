@@ -354,10 +354,10 @@ def _sparse_attn_prefill_kernel(
     kv_len = kv_end - kv_start
 
     k_offsets = tl.arange(0, BLOCK_K)
-    # Prefetch first tile's slot indices so the indirect int32 load can overlap
-    # the next iteration's QK MFMA latency.
-    # Out-of-range lanes read row 0 rather than -1, so the gather needs no mask
-    # (the scores are masked instead), which keeps it vectorized.
+    # Prefetch first tile's slot indices so the indirect index load can overlap
+    # the next iteration's QK MFMA latency. Lanes past the row's end get slot 0
+    # only as a placeholder; the validity check below masks them out of both
+    # the gather and the scores.
     slot = tl.load(
         kv_indices_ptr + kv_start + k_offsets, mask=k_offsets < kv_len, other=0
     )

@@ -66,6 +66,14 @@ def _alloc_kv(num_kv: int, device: str):
 
 
 def _build_csr(num_q: int, max_slots: int, max_topk: int, device: str):
+    """Ragged slot lists: per query a random length in [max_topk // 4, max_topk]
+    and that many distinct slots in [0, max_slots).
+
+    Vectorized, O(num_q * max_topk) with one host sync: sorted uniform draws over
+    [0, max_slots - max_topk] plus 0..max_topk-1 are strictly increasing, so the
+    slots in a row are distinct and stay in range.
+    """
+    assert max_topk <= max_slots, f"{max_topk=} > {max_slots=}"
     lens = torch.randint(
         max(1, max_topk // 4),
         max_topk + 1,
@@ -73,12 +81,13 @@ def _build_csr(num_q: int, max_slots: int, max_topk: int, device: str):
         dtype=torch.int32,
         device=device,
     )
-    flat, ptr = [], [0]
-    for i in range(num_q):
-        L = int(lens[i].item())
-        flat.append(torch.randperm(max_slots, device=device, dtype=torch.int32)[:L])
-        ptr.append(ptr[-1] + L)
-    return torch.cat(flat), torch.tensor(ptr, dtype=torch.int32, device=device), lens
+    draws = torch.randint(0, max_slots - max_topk + 1, (num_q, max_topk), device=device)
+    slots = draws.sort(dim=1).values + torch.arange(max_topk, device=device)
+    keep = torch.arange(max_topk, device=device)[None, :] < lens[:, None]
+    flat = slots[keep].to(torch.int32)
+    ptr = torch.zeros(num_q + 1, dtype=torch.int32, device=device)
+    ptr[1:] = lens.cumsum(0)
+    return flat, ptr, lens
 
 
 def _ref_prefill(q, kv, indices, indptr, scale, attn_sink=None):
