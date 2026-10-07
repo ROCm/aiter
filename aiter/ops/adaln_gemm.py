@@ -6,8 +6,9 @@
 * ``adaln_fwd(x, w, bias, out)``:  ``out[32, N] = x[32, K] @ w[N, K]^T + bias``
 * ``adaln_dgrad(dy, w, out)``:     ``out[32, K] = dy[32, N] @ w[N, K]``
 
-  (both one launch with a deterministic split-K reduce; the fp32 workspace and int32 counters they need are allocated
-  here per (pass, device, N, K) and reused -- the counters stay zero between calls)
+  (deterministic; the fp32 workspace and int32 flags / counters a row needs are allocated here per (pass, device, N,
+  K) and reused -- they stay zero between calls. A dgrad row may write K-split partial sums into the workspace and
+  reduce them in a second launch.)
 * ``adaln_wgrad(dy, x, out)``:     ``out[N, K] = dy[32, N]^T @ x[32, K]`` (``out`` may be a parameter's main_grad)
 
 Kernels exist for exact (pass, N, K); ``adaln_gemm_supported`` says whether one does (pure Python on ints, safe inside
