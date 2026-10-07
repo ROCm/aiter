@@ -456,13 +456,18 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
     kpe_smem = gl.allocate_shared_memory(k_pe_ptr.dtype.element_ty, [BLOCK_D_pe], SH)
     cos_smem = gl.allocate_shared_memory(cos_ptr.dtype.element_ty, [FREQ_W], SH)
     sin_smem = gl.allocate_shared_memory(sin_ptr.dtype.element_ty, [FREQ_W], SH)
+    # q_pe is always roped in registers then stored at the q_out dtype, so it
+    # always needs a q_out-dtype staging buffer -- q_pe may be bf16 while q_out
+    # is fp8 (e.g. when q_nope arrives pre-quantized to fp8 for a direct
+    # passthrough). Allocating it unconditionally lets the q_nope passthrough
+    # and the q_pe cast use independent dtypes.
+    qpe_smem_out = gl.allocate_shared_memory(
+        q_out_ptr.dtype.element_ty, [BLOCK_D_pe], SH
+    )
     if not Q_OUT_MATCHES:
-        # q_out-dtype staging buffers for the cast path.
+        # q_out-dtype staging buffer for the q_nope cast path.
         qn_smem_out = gl.allocate_shared_memory(
             q_out_ptr.dtype.element_ty, [BLOCK_D_nope], SH
-        )
-        qpe_smem_out = gl.allocate_shared_memory(
-            q_out_ptr.dtype.element_ty, [BLOCK_D_pe], SH
         )
 
     if pid < B * QH:
@@ -567,20 +572,20 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
             BLOCK_D_pe,
             SH,
         )
+        # q_pe is roped in registers; always stage it at the q_out dtype (fp8
+        # when the cache is fp8), independent of q_nope's dtype.
+        qpe_smem_out.store(q_pe.to(q_out_ptr.dtype.element_ty))
         if Q_OUT_MATCHES:
-            # Same dtype: qn_smem already holds the bit-identical q_nope from the
-            # async_load, so TDM-store directly (skip the LDS round-trip).
-            qpe_smem.store(q_pe.to(q_out_ptr.dtype.element_ty))
+            # q_nope already matches the q_out dtype: TDM-store its load buffer
+            # directly (passthrough, no LDS round-trip, no cast). When q_nope is
+            # pre-quantized to fp8 this halves the dominant q_nope read.
             gl.amd.gfx1250.tdm.async_store(q_out_nope_desc, [0], qn_smem)
-            gl.amd.gfx1250.tdm.async_store(q_out_pe_desc, [0], qpe_smem)
         else:
-            # Differing dtype: load q_nope to registers, cast to the q_out dtype
-            # and stage into the q_out-dtype buffers before the TDM-store.
+            # q_nope dtype differs from q_out: load, cast, stage, store.
             q_nope = qn_smem.load(L_NOPE)
             qn_smem_out.store(q_nope.to(q_out_ptr.dtype.element_ty))
-            qpe_smem_out.store(q_pe.to(q_out_ptr.dtype.element_ty))
             gl.amd.gfx1250.tdm.async_store(q_out_nope_desc, [0], qn_smem_out)
-            gl.amd.gfx1250.tdm.async_store(q_out_pe_desc, [0], qpe_smem_out)
+        gl.amd.gfx1250.tdm.async_store(q_out_pe_desc, [0], qpe_smem_out)
 
         if is_kv and pid_slot >= 0:
             if BLOCK_SIZE > 1:
