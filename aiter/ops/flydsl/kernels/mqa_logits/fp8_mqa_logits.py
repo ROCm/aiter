@@ -21,6 +21,7 @@ from dataclasses import dataclass
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
@@ -88,7 +89,9 @@ def _load_row_weights(weights, H, cp_atom, tc_c, m_tiles, mfma_n, row):
     return [Vec(frag[None, mi, 0].load()) for mi in range_constexpr(m_tiles)]
 
 
-def _emit_col_sum(mfma, mma, gemm_kw, a_row, b_pack, w_row, kv_scale, f32_0):
+def _emit_col_sum(
+    mfma, mma, gemm_kw, a_row, b_pack, w_row, kv_scale, f32_0, reduce=True
+):
     """One lane's logit contribution for a single (query row, n-tile) pair.
 
     ``a_row``/``w_row`` are that row's per-(mi, kk) A-fragments and per-(mi, ii)
@@ -96,6 +99,8 @@ def _emit_col_sum(mfma, mma, gemm_kw, a_row, b_pack, w_row, kv_scale, f32_0):
     ``kv_scale`` (>=0) is hoisted out of the head sum: ReLU is
     positive-homogeneous, so ReLU(s*x) = s*ReLU(x) and the whole column sum is
     scaled once instead of every head term -- drops M_TILES*ACC_ELEMS muls to one.
+    ``reduce=False`` skips the cross-lane head reduce and returns this lane's
+    scaled partial, for ``_reduce_scatter_heads``.
     """
     col_sum = f32_0
     for mi in range_constexpr(len(a_row)):
@@ -107,6 +112,8 @@ def _emit_col_sum(mfma, mma, gemm_kw, a_row, b_pack, w_row, kv_scale, f32_0):
         for ii in range_constexpr(mfma.ACC_ELEMS):
             col_sum = col_sum + Vec(acc)[ii].maximumf(f32_0) * w_row[mi][ii]
     col_sum = col_sum * kv_scale
+    if not reduce:
+        return col_sum
 
     # Head-reduce within the wave (width 64) via the atom's shuffle_xor
     # butterfly (16, 32 for the 16x16 atoms); the offsets must cover every lane
@@ -128,7 +135,7 @@ def _emit_acc_issue(mfma, mma, gemm_kw, a_row, b_pack):
     return c_frags
 
 
-def _emit_acc_reduce(mfma, c_frags, w_row, kv_scale, f32_0):
+def _emit_acc_reduce(mfma, c_frags, w_row, kv_scale, f32_0, reduce=True):
     """Phase 2 of a software-pipelined ``_emit_col_sum``: consume the accumulators."""
     col_sum = f32_0
     for mi in range_constexpr(len(c_frags)):
@@ -136,9 +143,56 @@ def _emit_acc_reduce(mfma, c_frags, w_row, kv_scale, f32_0):
         for ii in range_constexpr(mfma.ACC_ELEMS):
             col_sum = col_sum + Vec(acc)[ii].maximumf(f32_0) * w_row[mi][ii]
     col_sum = col_sum * kv_scale
+    if not reduce:
+        return col_sum
     for sh in mfma.shuffle_offsets:
         col_sum = col_sum + col_sum.shuffle_xor(sh, 64)
     return col_sum
+
+
+def _permlane_swap(swap, x, y):
+    """``v_permlane{32,16}_swap`` on two f32 registers -> ``(x', y')``.
+
+    permlane32: ``x' = [x lanes 0-31, y lanes 0-31]``,
+    ``y' = [x lanes 32-63, y lanes 32-63]``. permlane16 does the same per
+    32-lane half with 16-lane rows.
+    """
+    pair = swap(
+        llvm.StructType.get_literal([T.i32, T.i32]),
+        x.bitcast(fx.Int32).ir_value(),
+        y.bitcast(fx.Int32).ir_value(),
+        False,
+        False,
+    )
+    return tuple(
+        fx.Int32(llvm.extractvalue(T.i32, pair, [j])).bitcast(fx.Float32)
+        for j in range(2)
+    )
+
+
+def _reduce_scatter_heads(mfma, partials):
+    """Head-reduce ``G = 64 // MFMA_N`` n-tiles' partials at once (reduce-scatter).
+
+    ``partials[g]`` is this lane's un-reduced (already kv_scale-multiplied)
+    column sum for n-tile ``g`` of the group: lane ``l`` holds column
+    ``l % MFMA_N`` and lane group ``l // MFMA_N`` holds a slice of the heads.
+    Returns one value in which lane ``l`` holds the full head sum of the group's
+    column ``l`` (tile-major: n-tile ``l // MFMA_N``, column ``l % MFMA_N``), so
+    all 64 lanes store one contiguous 64-column run. One permlane swap + add per
+    pair replaces the per-n-tile shuffle butterfly and its idle writer lanes.
+    """
+    if mfma.MFMA_N == 32:
+        x, y = _permlane_swap(rocdl.permlane32_swap, partials[0], partials[1])
+        return x + y
+    assert mfma.MFMA_N == 16, mfma.MFMA_N
+    # Fold lane groups g and g+2 (xor 32) of n-tiles (0, 2) and (1, 3), then
+    # g and g+1 (xor 16) across the two results.
+    x, y = _permlane_swap(rocdl.permlane32_swap, partials[0], partials[2])
+    lo = x + y  # rows 0,1: n-tile 0; rows 2,3: n-tile 2
+    x, y = _permlane_swap(rocdl.permlane32_swap, partials[1], partials[3])
+    hi = x + y  # rows 0,1: n-tile 1; rows 2,3: n-tile 3
+    x, y = _permlane_swap(rocdl.permlane16_swap, lo, hi)
+    return x + y
 
 
 def _emit_row_neg_inf_fill(
@@ -729,6 +783,7 @@ def _build_kernel_mfma_lds_pipe(
     num_buffers: int = 2,
     prefetch_depth: int = 2,
     sw_pipe: bool = False,
+    rs_head: bool = False,
 ):
     """LDS multi-buffered variant for gfx950 MfmaAtoms (scaled CDNA4 atoms).
 
@@ -745,7 +800,10 @@ def _build_kernel_mfma_lds_pipe(
         rows ``[w*RPW, (w+1)*RPW)``). KV reuse factor becomes ``RPW * WPB``.
 
     A-frags are loaded from global memory to registers; B-frags are read from LDS.
-    The epilogue is identical to the direct-load builder.
+    The epilogue is identical to the direct-load builder, unless ``rs_head``:
+    then the ``64 // MFMA_N`` n-tiles of a group are head-reduced together by
+    ``_reduce_scatter_heads`` and stored by all 64 lanes as one contiguous
+    run, instead of one shuffle butterfly and one MFMA_N-lane store per n-tile.
     """
     H = num_heads
     D = head_size
@@ -773,6 +831,12 @@ def _build_kernel_mfma_lds_pipe(
     N_TILES = BKV // mfma.MFMA_N
     M_TILES = H // mfma.MFMA_M
     K_STEPS = D // mfma.MFMA_K
+    # n-tiles per reduce-scatter group: one per MFMA_N-lane group of the wave.
+    RS_GROUP = 64 // mfma.MFMA_N
+    assert not rs_head or N_TILES % RS_GROUP == 0, (
+        f"rs_head needs N_TILES ({N_TILES}) to be a multiple of "
+        f"64 // MFMA_N ({RS_GROUP})"
+    )
 
     # LDS multi-buffer: NUM_BUFFERS slots of [BKV, D] fp8 (row-major, row == KV
     # column index). Addressed as i32 dwords for the vector reads.
@@ -840,7 +904,8 @@ def _build_kernel_mfma_lds_pipe(
     _kname = (
         f"fp8_mqa_logits_H{H}_D{D}_mfma{mfma.name}"
         f"_bkv{BKV}_r{RPW}_w{WPB}_lds{NUM_BUFFERS}{_pd_tag}"
-        f"{'_swizzled' if swizzle else ''}{'_swp' if sw_pipe else ''}{_cl_tag}_flydsl"
+        f"{'_swizzled' if swizzle else ''}{'_swp' if sw_pipe else ''}"
+        f"{'_rs' if rs_head else ''}{_cl_tag}_flydsl"
     )
 
     @flyc.kernel(name=_kname, known_block_size=[MR_BLOCK_THREADS, 1, 1])
@@ -1110,7 +1175,35 @@ def _build_kernel_mfma_lds_pipe(
                 for j in range_constexpr(RPW)
             ]
 
-            if const_expr(not sw_pipe):
+            if const_expr(rs_head and not sw_pipe):
+                for j in range_constexpr(RPW):
+                    out_row_t = out_row_ts[j]
+                    for g in range_constexpr(N_TILES // RS_GROUP):
+                        parts = [
+                            _emit_col_sum(
+                                mfma,
+                                mma,
+                                gemm_kw,
+                                a_packs[j],
+                                b_packs[g * RS_GROUP + q],
+                                w_frag[j],
+                                kv_scales_tile[g * RS_GROUP + q],
+                                f32_0,
+                                reduce=False,
+                            )
+                            for q in range_constexpr(RS_GROUP)
+                        ]
+                        col_sum = _reduce_scatter_heads(mfma, parts)
+                        # Lane l owns the group's column l (tile-major).
+                        col = col0 + fx.Int32(g * 64) + lane
+                        in_window = (col >= starts[j]) & (col < ends[j])
+
+                        def _store():
+                            out_row_t[col] = col_sum  # noqa: B023
+
+                        if in_window:
+                            _store()
+            elif const_expr(not sw_pipe):
                 for j in range_constexpr(RPW):
                     out_row_t = out_row_ts[j]
                     for ni in range_constexpr(N_TILES):
@@ -1149,6 +1242,9 @@ def _build_kernel_mfma_lds_pipe(
                 cf = _emit_acc_issue(
                     mfma, mma, gemm_kw, a_packs[items[0][0]], b_packs[items[0][1]]
                 )
+                # rs_head: partials of the current reduce-scatter group. Items
+                # are row-major, so a group's n-tiles are consecutive items.
+                parts = []
                 for k in range_constexpr(len(items)):
                     j, ni = items[k]
                     out_row_t = out_row_ts[j]
@@ -1161,17 +1257,40 @@ def _build_kernel_mfma_lds_pipe(
                             mfma, mma, gemm_kw, a_packs[jn], b_packs[nin]
                         )
                     col_sum = _emit_acc_reduce(
-                        mfma, cf, w_frag[j], kv_scales_tile[ni], f32_0
+                        mfma,
+                        cf,
+                        w_frag[j],
+                        kv_scales_tile[ni],
+                        f32_0,
+                        reduce=not rs_head,
                     )
 
-                    in_window = (col >= starts[j]) & (col < ends[j])
-                    is_writer = (lane_div_N == fx.Int32(0)) & in_window
+                    if const_expr(rs_head):
+                        parts.append(col_sum)
+                        if const_expr(len(parts) == RS_GROUP):
+                            col_sum = _reduce_scatter_heads(mfma, parts)
+                            parts = []
+                            col = (
+                                col0
+                                + fx.Int32((ni // RS_GROUP) * RS_GROUP * mfma.MFMA_N)
+                                + lane
+                            )
+                            in_window = (col >= starts[j]) & (col < ends[j])
 
-                    def _store():
-                        out_row_t[col] = col_sum  # noqa: B023
+                            def _store():
+                                out_row_t[col] = col_sum  # noqa: B023
 
-                    if is_writer:
-                        _store()
+                            if in_window:
+                                _store()
+                    else:
+                        in_window = (col >= starts[j]) & (col < ends[j])
+                        is_writer = (lane_div_N == fx.Int32(0)) & in_window
+
+                        def _store():
+                            out_row_t[col] = col_sum  # noqa: B023
+
+                        if is_writer:
+                            _store()
 
                     if const_expr(k + 1 < len(items)):
                         cf = cf_next
