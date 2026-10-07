@@ -104,7 +104,8 @@ def _emit_col_sum(
     positive-homogeneous, so ReLU(s*x) = s*ReLU(x) and the whole column sum is
     scaled once instead of every head term -- drops M_TILES*ACC_ELEMS muls to one.
     ``reduce=False`` skips the cross-lane head reduce and returns this lane's
-    scaled partial, for ``warp_reduce_scatter_strided``.
+    scaled partial, for ``warp_reduce_scatter_strided``. ``kv_scale=None``
+    leaves the sum unscaled, for a caller that scales after the reduce.
     """
     col_sum = f32_0
     for mi in range_constexpr(len(a_row)):
@@ -115,7 +116,8 @@ def _emit_col_sum(
         acc = c_frag.load()
         for ii in range_constexpr(mfma.ACC_ELEMS):
             col_sum = col_sum + Vec(acc)[ii].maximumf(f32_0) * w_row[mi][ii]
-    col_sum = col_sum * kv_scale
+    if kv_scale is not None:
+        col_sum = col_sum * kv_scale
     if not reduce:
         return col_sum
 
@@ -143,7 +145,8 @@ def _emit_acc_reduce(mfma, c_frags, w_row, kv_scale, f32_0, reduce=True):
         acc = c_frags[mi].load()
         for ii in range_constexpr(mfma.ACC_ELEMS):
             col_sum = col_sum + Vec(acc)[ii].maximumf(f32_0) * w_row[mi][ii]
-    col_sum = col_sum * kv_scale
+    if kv_scale is not None:
+        col_sum = col_sum * kv_scale
     if not reduce:
         return col_sum
     return warp_reduce_strided(col_sum, fx.ReductionOp.ADD, stride=mfma.MFMA_N)
@@ -726,6 +729,7 @@ def _build_kernel_mfma_lds_pipe(
     prefetch_depth: int = 2,
     sw_pipe: bool = False,
     rs_head: bool = False,
+    lds_scales: bool = False,
 ):
     """LDS multi-buffered variant for gfx950 MfmaAtoms (scaled CDNA4 atoms).
 
@@ -746,6 +750,9 @@ def _build_kernel_mfma_lds_pipe(
     then the ``64 // MFMA_N`` n-tiles of a group are head-reduced together by
     ``warp_reduce_scatter_strided`` and stored by all 64 lanes as one contiguous
     run, instead of one shuffle butterfly and one MFMA_N-lane store per n-tile.
+    ``lds_scales`` stages the tile's kv_scales into the LDS slot with the same
+    async DMA as the KV bytes, instead of a blocking per-n-tile global load
+    every wave repeats.
     """
     H = num_heads
     D = head_size
@@ -795,15 +802,26 @@ def _build_kernel_mfma_lds_pipe(
         NUM_BUFFERS >= PREFETCH_DEPTH >= 1
     ), f"need num_buffers({NUM_BUFFERS}) >= prefetch_depth({PREFETCH_DEPTH}) >= 1"
     _need_barrier_b = NUM_BUFFERS <= PREFETCH_DEPTH
-    SLOT_BYTES = BKV * D  # fp8, 1 byte/elem
+    KV_BYTES = BKV * D  # fp8, 1 byte/elem
+    # lds_scales: the tile's BKV f32 kv_scales follow the KV bytes in the slot,
+    # padded to whole 64-lane DMAs (one 4-byte element per lane); 256 B keeps
+    # the slot a multiple of the DMA's 128-byte destination alignment.
+    SCALE_DMAS = ceildiv(BKV, 64) if lds_scales else 0
+    SCALE_BYTES = SCALE_DMAS * 64 * 4
+    SLOT_BYTES = KV_BYTES + SCALE_BYTES
     SLOT_I32 = SLOT_BYTES // 4
+    SCALE_DW = KV_BYTES // 4  # slot-relative dword offset of the scales
     # gfx950 raw_ptr_buffer_load_lds supports size=16 (dwordx4).
     DMA_BYTES = 16
-    assert SLOT_BYTES % (MR_BLOCK_THREADS * DMA_BYTES) == 0, (
-        f"SLOT_BYTES={SLOT_BYTES} must be divisible by "
+    assert KV_BYTES % (MR_BLOCK_THREADS * DMA_BYTES) == 0, (
+        f"KV_BYTES={KV_BYTES} must be divisible by "
         f"MR_BLOCK_THREADS*DMA_BYTES={MR_BLOCK_THREADS * DMA_BYTES}"
     )
-    NUM_ASYNC_LOADS = SLOT_BYTES // (MR_BLOCK_THREADS * DMA_BYTES)
+    NUM_KV_DMAS = KV_BYTES // (MR_BLOCK_THREADS * DMA_BYTES)
+    # Every wave issues every scale DMA (identical bytes, so the overlapping
+    # writes are benign): that keeps the per-wave VMEM count uniform, which the
+    # compile-time vmcnt below relies on.
+    NUM_ASYNC_LOADS = NUM_KV_DMAS + SCALE_DMAS
     # vmcnt to leave outstanding at the top of each tile: the DMAs of the
     # PREFETCH_DEPTH-1 tiles queued behind the one about to be read.
     _WAIT_VMCNT = (PREFETCH_DEPTH - 1) * NUM_ASYNC_LOADS
@@ -847,7 +865,7 @@ def _build_kernel_mfma_lds_pipe(
         f"fp8_mqa_logits_H{H}_D{D}_mfma{mfma.name}"
         f"_bkv{BKV}_r{RPW}_w{WPB}_lds{NUM_BUFFERS}{_pd_tag}"
         f"{'_swizzled' if swizzle else ''}{'_swp' if sw_pipe else ''}"
-        f"{'_rs' if rs_head else ''}{_cl_tag}_flydsl"
+        f"{'_rs' if rs_head else ''}{'_ls' if lds_scales else ''}{_cl_tag}_flydsl"
     )
 
     @flyc.kernel(name=_kname, known_block_size=[MR_BLOCK_THREADS, 1, 1])
@@ -889,6 +907,7 @@ def _build_kernel_mfma_lds_pipe(
         kv_i32 = GTensor(KV, dtype=T.i32, shape=(-1,))
         kv_rsrc = kv_i32.rsrc
         sc_t = GTensor(kv_scales, dtype=T.f32, shape=(-1,))
+        sc_rsrc = sc_t.rsrc
         cs_t = GTensor(cu_starts, dtype=T.i32, shape=(-1,))
         ce_t = GTensor(cu_ends, dtype=T.i32, shape=(-1,))
         _stride_i64 = fx.Int64(fx.Uint32(stride_logits_s))
@@ -927,7 +946,7 @@ def _build_kernel_mfma_lds_pipe(
             d = fx.Int32(D)
             seq_len_kv_m_1 = seq_len_kv - fx.Int32(1)
 
-            for i in range_constexpr(NUM_ASYNC_LOADS):
+            for i in range_constexpr(NUM_KV_DMAS):
                 lin_bytes = (tid + fx.Int32(i * MR_BLOCK_THREADS)) * dma_bytes
                 row_local = lin_bytes // d
                 d_off = lin_bytes - row_local * d
@@ -957,6 +976,31 @@ def _build_kernel_mfma_lds_pipe(
                     fx.Int32(0),
                     fx.Int32(1),
                 )
+
+            # kv_scales[col0 + s*64 + lane] -> slot scale dword s*64 + lane.
+            # Same wave-uniform destination in every wave (see SCALE_DMAS).
+            for s in range_constexpr(SCALE_DMAS):
+                sc_byte_i32 = slot_byte_i32 + fx.Int32(KV_BYTES + s * 64 * 4)
+                sc_lds_ptr = buffer_ops.get_element_ptr(
+                    lds_ptr0,
+                    rocdl.readfirstlane(
+                        fx.Int64.ir_type, fx.Int64(fx.Uint32(sc_byte_i32)).ir_value()
+                    ),
+                )
+                sc_col = fx.min(col0_i32 + fx.Int32(s * 64) + lane, seq_len_kv_m_1)
+                rocdl.raw_ptr_buffer_load_lds(
+                    sc_rsrc,
+                    sc_lds_ptr,
+                    fx.Int32(4),
+                    fx.Int32(sc_col * fx.Int32(4)),
+                    fx.Int32(0),
+                    fx.Int32(0),
+                    fx.Int32(1),
+                )
+
+        def _lds_read_scale(dword_idx):
+            """One f32 kv_scale out of the staged LDS tile."""
+            return fx.ptr_load(lds_ptr + dword_idx).bitcast(fx.Float32)
 
         # ---- Preload this wave's RPW rows: window, Q A-frags, weights ----
         starts = [None] * RPW
@@ -1069,13 +1113,23 @@ def _build_kernel_mfma_lds_pipe(
             # batch the LDS loads and hide their lgkmcnt latency behind the MFMA work.
             b_packs = [[None] * K_STEPS for _ in range_constexpr(N_TILES)]
             cols = [None] * N_TILES
+            # kv_scales_tile[ni]: this lane's column scale, applied before the
+            # head reduce. lds_scales + rs_head instead scales once after the
+            # reduce-scatter, with the scale of the column the lane then owns
+            # (rs_scales[g]) -- one multiply per group instead of per n-tile.
             kv_scales_tile = [None] * N_TILES
+            rs_scales = [None] * (N_TILES // RS_GROUP)
             for ni in range_constexpr(N_TILES):
                 col = col0 + fx.Int32(ni * mfma.MFMA_N) + lane_mod_N
                 cols[ni] = col
-                col_cl = fx.min(col, seq_len_kv - fx.Int32(1))
-                kv_scales_tile[ni] = fx.Float32(sc_t[col_cl])
+                if const_expr(not lds_scales):
+                    col_cl = fx.min(col, seq_len_kv - fx.Int32(1))
+                    kv_scales_tile[ni] = fx.Float32(sc_t[col_cl])
                 col_local = fx.Int32(ni * mfma.MFMA_N) + lane_mod_N
+                if const_expr(lds_scales and not rs_head):
+                    kv_scales_tile[ni] = _lds_read_scale(
+                        slot_dword + fx.Int32(SCALE_DW) + col_local
+                    )
                 for kk in range_constexpr(K_STEPS):
                     if const_expr(swizzle):
                         # phys_dword = n*DW_PER_COL
@@ -1097,6 +1151,11 @@ def _build_kernel_mfma_lds_pipe(
 
                     b_packs[ni][kk] = mfma.make_frag(
                         _lds_read_frag(slot_dword + frag_dword)
+                    )
+            if const_expr(lds_scales and rs_head):
+                for g in range_constexpr(N_TILES // RS_GROUP):
+                    rs_scales[g] = _lds_read_scale(
+                        slot_dword + fx.Int32(SCALE_DW + g * 64) + lane
                     )
 
             # Prefetch tile i+PREFETCH_DEPTH into slot (i+PD)%NB.  When NB>PD that
@@ -1138,6 +1197,8 @@ def _build_kernel_mfma_lds_pipe(
                         col_sum = warp_reduce_scatter_strided(
                             parts, fx.ReductionOp.ADD, stride=mfma.MFMA_N
                         )
+                        if const_expr(lds_scales):
+                            col_sum = col_sum * rs_scales[g]
                         # Lane l owns the group's column l (tile-major).
                         col = col0 + fx.Int32(g * 64) + lane
                         in_window = (col >= starts[j]) & (col < ends[j])
@@ -1215,6 +1276,8 @@ def _build_kernel_mfma_lds_pipe(
                             col_sum = warp_reduce_scatter_strided(
                                 parts, fx.ReductionOp.ADD, stride=mfma.MFMA_N
                             )
+                            if const_expr(lds_scales):
+                                col_sum = col_sum * rs_scales[ni // RS_GROUP]
                             parts = []
                             col = (
                                 col0

@@ -311,6 +311,7 @@ def _mk_builder(
     prefetch_depth=2,
     sw_pipe=False,
     rs_head=False,
+    lds_scales=False,
 ):
     """Registry entry factory.
 
@@ -343,6 +344,7 @@ def _mk_builder(
             prefetch_depth=prefetch_depth,
             sw_pipe=sw_pipe,
             rs_head=rs_head,
+            lds_scales=lds_scales,
         )
     return builder, mfma.MFMA_M
 
@@ -444,6 +446,30 @@ if _ARCH == "gfx950":
             "mfma16x16x128_bkv64_r2_w4_lds3_swp_rs": _mk_builder(
                 2, 4, mfma=_K128, bkv=64, lds=3, sw_pipe=True, rs_head=True
             ),
+            # -- kv_scales staged in LDS with the KV tile (_ls) --
+            "mfma32x32x64_bkv64_r2_w4_lds3_swp_ls": _mk_builder(
+                2, 4, mfma=_K64, bkv=64, lds=3, sw_pipe=True, lds_scales=True
+            ),
+            "mfma32x32x64_bkv64_r2_w4_lds3_swp_rs_ls": _mk_builder(
+                2,
+                4,
+                mfma=_K64,
+                bkv=64,
+                lds=3,
+                sw_pipe=True,
+                rs_head=True,
+                lds_scales=True,
+            ),
+            "mfma16x16x128_bkv64_r2_w4_lds3_swp_rs_ls": _mk_builder(
+                2,
+                4,
+                mfma=_K128,
+                bkv=64,
+                lds=3,
+                sw_pipe=True,
+                rs_head=True,
+                lds_scales=True,
+            ),
             "mfma32x32x64_bkv128_r1_w2_lds3": _mk_builder(
                 1, 2, mfma=_K64, bkv=128, lds=3
             ),
@@ -489,7 +515,7 @@ DEFAULT_VARIANT = (
 # then block_kv (None -> _BLOCK_KV), RPB, WPB, and the LDS buffer count.
 _TAG_RE = re.compile(
     r"^mfma(?P<shape>\d+x\d+x\d+)?(?:_bkv(?P<bkv>\d+))?"
-    r"_r(?P<rpb>\d+)_w(?P<wpb>\d+)(?:_lds(?P<lds>\d+))?(?:_swp)?(?:_rs)?$"
+    r"_r(?P<rpb>\d+)_w(?P<wpb>\d+)(?:_lds(?P<lds>\d+))?(?:_swp)?(?:_rs)?(?:_ls)?$"
 )
 
 
