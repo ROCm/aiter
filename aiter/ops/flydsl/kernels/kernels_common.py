@@ -119,6 +119,84 @@ def atomic_max_i32(memref, val, offset, syncscope):
     return _atomic_rmw_i32(_llvm.AtomicBinOp.max, memref, val, offset, syncscope)
 
 
+# Cross-lane-group reductions, spelled like ``fx.coop``'s warp collectives.
+#
+# ``fx.coop.warp_reduce`` / ``warp_reduce_batched`` fold *contiguous* groups of
+# ``width`` lanes (XOR distances 1 .. width/2). An MFMA accumulator needs the
+# opposite: fold the lanes that differ only in the bits at and above ``stride``
+# (the lane groups holding different M rows) while keeping the low bits (the N
+# column) apart. Same signatures as ``fx.coop`` plus ``stride``, so these can be
+# replaced by ``fx.coop`` once it grows a lane-stride option.
+
+
+def _combine(op, lhs, rhs):
+    if op is fx.ReductionOp.ADD:
+        return lhs + rhs
+    if op is fx.ReductionOp.MAX:
+        return lhs.maximumf(rhs)
+    raise TypeError(f"unsupported ReductionOp, got {op!r}")
+
+
+def _permlane_swap(swap, x, y):
+    """``v_permlane{32,16}_swap`` on two 32-bit float registers -> ``(x', y')``.
+
+    permlane32: ``x' = [x lanes 0-31, y lanes 0-31]``,
+    ``y' = [x lanes 32-63, y lanes 32-63]``. permlane16 does the same within
+    each 32-lane half, on 16-lane rows. gfx950 only.
+    """
+    pair = swap(
+        _llvm.StructType.get_literal([T.i32, T.i32]),
+        x.bitcast(fx.Int32).ir_value(),
+        y.bitcast(fx.Int32).ir_value(),
+        False,
+        False,
+    )
+    return tuple(
+        fx.Int32(_llvm.extractvalue(T.i32, pair, [j])).bitcast(fx.Float32)
+        for j in range(2)
+    )
+
+
+def warp_reduce_strided(value, op, *, stride, width=64):
+    """Reduce *value* over the lanes ``l ^ (k * stride)``; every lane gets its result.
+
+    The ``width // stride`` lanes sharing ``l % stride`` are folded together.
+    Distinct ``l % stride`` stay independent. Lowered as an XOR butterfly over
+    ``stride, 2*stride, .. width/2``. On gfx950 LLVM already turns the
+    XOR-32 shuffle into ``v_permlane32_swap``.
+    """
+    sh = stride
+    while sh < width:
+        value = _combine(op, value, value.shuffle_xor(sh, width))
+        sh <<= 1
+    return value
+
+
+def warp_reduce_scatter_strided(values, op, *, stride):
+    """Strided reduce of ``64 // stride`` batches, with lane ``l`` owning one result.
+
+    ``values[g]`` is this lane's contribution to batch ``(g, l % stride)``.
+    Lane ``l`` returns the fold over its ``64 // stride`` lane groups of batch
+    ``(l // stride, l % stride)``, so the ``64 // stride`` results come out
+    tile-major across the wave. One permlane swap + combine per batch pair
+    replaces a full butterfly per batch, and every lane ends up with a distinct
+    result. gfx950 (``v_permlane{32,16}_swap``), ``stride`` 32 or 16.
+    """
+    assert len(values) == 64 // stride, (len(values), stride)
+    if stride == 32:
+        x, y = _permlane_swap(fx.rocdl.permlane32_swap, values[0], values[1])
+        return _combine(op, x, y)
+    assert stride == 16, stride
+    # Fold lane groups g and g+2 (XOR 32) of batches (0, 2) and (1, 3), then
+    # g and g+1 (XOR 16) across the two results.
+    x, y = _permlane_swap(fx.rocdl.permlane32_swap, values[0], values[2])
+    lo = _combine(op, x, y)  # rows 0,1: batch 0; rows 2,3: batch 2
+    x, y = _permlane_swap(fx.rocdl.permlane32_swap, values[1], values[3])
+    hi = _combine(op, x, y)  # rows 0,1: batch 1; rows 2,3: batch 3
+    x, y = _permlane_swap(fx.rocdl.permlane16_swap, lo, hi)
+    return _combine(op, x, y)
+
+
 def get_warp_size(arch=None):
     """Return the wavefront/warp size for the given GPU architecture.
 

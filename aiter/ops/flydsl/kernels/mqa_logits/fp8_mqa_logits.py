@@ -21,12 +21,16 @@ from dataclasses import dataclass
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from .. import buffer_ops
-from ..kernels_common import ceildiv, create_llvm_ptr
+from ..kernels_common import (
+    ceildiv,
+    create_llvm_ptr,
+    warp_reduce_scatter_strided,
+    warp_reduce_strided,
+)
 from ..tensor_shim import GTensor
 
 Vec = fx.Vector
@@ -100,7 +104,7 @@ def _emit_col_sum(
     positive-homogeneous, so ReLU(s*x) = s*ReLU(x) and the whole column sum is
     scaled once instead of every head term -- drops M_TILES*ACC_ELEMS muls to one.
     ``reduce=False`` skips the cross-lane head reduce and returns this lane's
-    scaled partial, for ``_reduce_scatter_heads``.
+    scaled partial, for ``warp_reduce_scatter_strided``.
     """
     col_sum = f32_0
     for mi in range_constexpr(len(a_row)):
@@ -115,12 +119,9 @@ def _emit_col_sum(
     if not reduce:
         return col_sum
 
-    # Head-reduce within the wave (width 64) via the atom's shuffle_xor
-    # butterfly (16, 32 for the 16x16 atoms); the offsets must cover every lane
-    # group so the full H-wide sum is produced.
-    for sh in mfma.shuffle_offsets:
-        col_sum = col_sum + col_sum.shuffle_xor(sh, 64)
-    return col_sum
+    # Head-reduce within the wave: the lanes holding distinct heads for a fixed
+    # column are those differing in lane // MFMA_N.
+    return warp_reduce_strided(col_sum, fx.ReductionOp.ADD, stride=mfma.MFMA_N)
 
 
 def _emit_acc_issue(mfma, mma, gemm_kw, a_row, b_pack):
@@ -145,54 +146,7 @@ def _emit_acc_reduce(mfma, c_frags, w_row, kv_scale, f32_0, reduce=True):
     col_sum = col_sum * kv_scale
     if not reduce:
         return col_sum
-    for sh in mfma.shuffle_offsets:
-        col_sum = col_sum + col_sum.shuffle_xor(sh, 64)
-    return col_sum
-
-
-def _permlane_swap(swap, x, y):
-    """``v_permlane{32,16}_swap`` on two f32 registers -> ``(x', y')``.
-
-    permlane32: ``x' = [x lanes 0-31, y lanes 0-31]``,
-    ``y' = [x lanes 32-63, y lanes 32-63]``. permlane16 does the same per
-    32-lane half with 16-lane rows.
-    """
-    pair = swap(
-        llvm.StructType.get_literal([T.i32, T.i32]),
-        x.bitcast(fx.Int32).ir_value(),
-        y.bitcast(fx.Int32).ir_value(),
-        False,
-        False,
-    )
-    return tuple(
-        fx.Int32(llvm.extractvalue(T.i32, pair, [j])).bitcast(fx.Float32)
-        for j in range(2)
-    )
-
-
-def _reduce_scatter_heads(mfma, partials):
-    """Head-reduce ``G = 64 // MFMA_N`` n-tiles' partials at once (reduce-scatter).
-
-    ``partials[g]`` is this lane's un-reduced (already kv_scale-multiplied)
-    column sum for n-tile ``g`` of the group: lane ``l`` holds column
-    ``l % MFMA_N`` and lane group ``l // MFMA_N`` holds a slice of the heads.
-    Returns one value in which lane ``l`` holds the full head sum of the group's
-    column ``l`` (tile-major: n-tile ``l // MFMA_N``, column ``l % MFMA_N``), so
-    all 64 lanes store one contiguous 64-column run. One permlane swap + add per
-    pair replaces the per-n-tile shuffle butterfly and its idle writer lanes.
-    """
-    if mfma.MFMA_N == 32:
-        x, y = _permlane_swap(rocdl.permlane32_swap, partials[0], partials[1])
-        return x + y
-    assert mfma.MFMA_N == 16, mfma.MFMA_N
-    # Fold lane groups g and g+2 (xor 32) of n-tiles (0, 2) and (1, 3), then
-    # g and g+1 (xor 16) across the two results.
-    x, y = _permlane_swap(rocdl.permlane32_swap, partials[0], partials[2])
-    lo = x + y  # rows 0,1: n-tile 0; rows 2,3: n-tile 2
-    x, y = _permlane_swap(rocdl.permlane32_swap, partials[1], partials[3])
-    hi = x + y  # rows 0,1: n-tile 1; rows 2,3: n-tile 3
-    x, y = _permlane_swap(rocdl.permlane16_swap, lo, hi)
-    return x + y
+    return warp_reduce_strided(col_sum, fx.ReductionOp.ADD, stride=mfma.MFMA_N)
 
 
 def _emit_row_neg_inf_fill(
@@ -350,18 +304,6 @@ class MfmaAtom:
         """f32 accumulator elements per lane (``vec<ACC_ELEMS x f32>``)."""
         return self.MFMA_M * self.MFMA_N // 64
 
-    @property
-    def shuffle_offsets(self) -> tuple:
-        """``shuffle_xor`` offsets for the in-wave head-reduce butterfly.
-
-        The lanes holding distinct heads for a fixed column are exactly those
-        differing in ``lane // MFMA_N``, so the butterfly is the powers of two
-        from MFMA_N up to the 64-lane wave: (16, 32) for the 16x16 atoms,
-        (32,) for 32x32.
-        """
-        return tuple(
-            self.MFMA_N << k for k in range((64 // self.MFMA_N).bit_length() - 1)
-        )
 
 
 #: gfx942/CDNA3 dense MFMA: 16x16 output tile, K=32 fp8 elements/step.
@@ -802,7 +744,7 @@ def _build_kernel_mfma_lds_pipe(
     A-frags are loaded from global memory to registers; B-frags are read from LDS.
     The epilogue is identical to the direct-load builder, unless ``rs_head``:
     then the ``64 // MFMA_N`` n-tiles of a group are head-reduced together by
-    ``_reduce_scatter_heads`` and stored by all 64 lanes as one contiguous
+    ``warp_reduce_scatter_strided`` and stored by all 64 lanes as one contiguous
     run, instead of one shuffle butterfly and one MFMA_N-lane store per n-tile.
     """
     H = num_heads
@@ -1193,7 +1135,9 @@ def _build_kernel_mfma_lds_pipe(
                             )
                             for q in range_constexpr(RS_GROUP)
                         ]
-                        col_sum = _reduce_scatter_heads(mfma, parts)
+                        col_sum = warp_reduce_scatter_strided(
+                            parts, fx.ReductionOp.ADD, stride=mfma.MFMA_N
+                        )
                         # Lane l owns the group's column l (tile-major).
                         col = col0 + fx.Int32(g * 64) + lane
                         in_window = (col >= starts[j]) & (col < ends[j])
@@ -1268,7 +1212,9 @@ def _build_kernel_mfma_lds_pipe(
                     if const_expr(rs_head):
                         parts.append(col_sum)
                         if const_expr(len(parts) == RS_GROUP):
-                            col_sum = _reduce_scatter_heads(mfma, parts)
+                            col_sum = warp_reduce_scatter_strided(
+                                parts, fx.ReductionOp.ADD, stride=mfma.MFMA_N
+                            )
                             parts = []
                             col = (
                                 col0

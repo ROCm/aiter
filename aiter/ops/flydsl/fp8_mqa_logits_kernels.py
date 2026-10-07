@@ -434,7 +434,7 @@ if _ARCH == "gfx950":
             ),
             # -- reduce-scatter head reduce (_rs): the 64 // MFMA_N n-tiles of
             #    a group are head-reduced with permlane swaps and stored by all
-            #    64 lanes at once (see _reduce_scatter_heads) --
+            #    64 lanes at once (see warp_reduce_scatter_strided) --
             "mfma32x32x64_bkv64_r2_w4_lds3_rs": _mk_builder(
                 2, 4, mfma=_K64, bkv=64, lds=3, rs_head=True
             ),
