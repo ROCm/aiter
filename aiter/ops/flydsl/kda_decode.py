@@ -100,6 +100,33 @@ def _num_cache_slots(state: torch.Tensor, conv_state: torch.Tensor) -> int:
     return min(state.shape[0], conv_state.shape[0], _INT32_MAX)
 
 
+def _check_i32_addressing(
+    name: str,
+    tensor: torch.Tensor,
+    *,
+    first_dim: int = 0,
+) -> None:
+    """Bound strides and the full byte span relative to the buffer base.
+
+    Cache buffers are rebased per slot in i64, so only their inner dimensions
+    contribute. The leading sequence dimension of raw gates and output is
+    unused by the kernel and is also excluded.
+    """
+    strides = tensor.stride()[first_dim:]
+    if any(stride < 0 or stride > _INT32_MAX for stride in strides):
+        raise ValueError(f"`{name}` strides must fit non-negative int32 addressing.")
+    # Include the last element's full width, including vector load/store tails.
+    span_bytes = (
+        1
+        + sum(
+            (size - 1) * stride
+            for size, stride in zip(tensor.shape[first_dim:], strides)
+        )
+    ) * tensor.element_size()
+    if span_bytes > _INT32_MAX:
+        raise ValueError(f"`{name}` byte span must fit int32 buffer addressing.")
+
+
 def _validate_kda_inputs(
     *,
     api_name: str,
@@ -125,6 +152,8 @@ def _validate_kda_inputs(
         raise RuntimeError(f"`{api_name}` requires a gfx950 GPU.")
     if batch <= 0:
         raise ValueError(f"`{batch_source}` must have a non-empty batch dimension.")
+    if batch * _HEADS > _INT32_MAX:
+        raise ValueError("The KDA launch grid must fit int32 addressing.")
     if conv_bias is not None:
         raise ValueError("This specialization requires `conv_bias=None`.")
     if lower_bound is None:
@@ -231,8 +260,22 @@ def _validate_kda_inputs(
         inner_strides=(1,),
     )
 
+    for name, tensor, first_dim in (
+        ("x", x, 0),
+        ("conv_weight", conv_weight, 0),
+        ("conv_state", conv_state, 1),
+        ("raw_beta", raw_beta, 1),
+        ("A_log", A_log, 0),
+        ("dt_bias", dt_bias, 0),
+        ("state", state, 1),
+        ("state_indices", state_indices, 0),
+        ("output_gate", output_gate, 0),
+        ("norm_weight", norm_weight, 0),
+    ):
+        _check_i32_addressing(name, tensor, first_dim=first_dim)
+
     if out is None:
-        return torch.empty(
+        out = torch.empty(
             (1, batch, _HEADS, _DIM),
             dtype=torch.bfloat16,
             device=device,
@@ -246,6 +289,7 @@ def _validate_kda_inputs(
         device=device,
         inner_strides=(1,),
     )
+    _check_i32_addressing("out", out, first_dim=1)
     return out
 
 
@@ -270,6 +314,8 @@ def flydsl_kda_decode(
 
     Requires gfx950, 12 heads, and 128-dim state (Kimi-K3 TP8). Check
     :func:`is_flydsl_kda_decode_supported` before dispatch.
+    Strides and byte spans must fit non-negative int32 buffer addressing,
+    except cache slot strides, which are rebased in int64.
     Uses RMSNorm/sigmoid gating. Cache slot zero is reserved: non-positive
     ``state_indices`` produce zero output and leave both caches unchanged.
     Indices at or above ``min(state.shape[0], conv_state.shape[0])`` are
@@ -314,6 +360,7 @@ def flydsl_kda_decode(
         device=device,
         inner_strides=(_DIM, 1),
     )
+    _check_i32_addressing("raw_g", raw_g, first_dim=1)
 
     executable = create_kda_decode_kernel(
         float(norm_eps),
@@ -377,6 +424,7 @@ def flydsl_kda_decode_with_f_b(
 
     Projects ``f_a`` with ``f_b_weight`` in FP32, then rounds once to BF16
     before the lower-bound decay gate, without storing raw-g in global memory.
+    Uses the same int32 stride/span limits as :func:`flydsl_kda_decode`.
     ``state_indices`` follows the same bounded, unique-live-slot contract as
     :func:`flydsl_kda_decode`.
     """
@@ -403,6 +451,8 @@ def flydsl_kda_decode_with_f_b(
         device=device,
         inner_strides=(_DIM, 1),
     )
+    _check_i32_addressing("f_a", f_a)
+    _check_i32_addressing("f_b_weight", f_b_weight)
     out = _validate_kda_inputs(
         api_name="flydsl_kda_decode_with_f_b",
         batch_source="f_a",

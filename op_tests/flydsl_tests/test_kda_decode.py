@@ -10,6 +10,7 @@ from dataclasses import dataclass
 import pytest
 import torch
 import torch.nn.functional as F
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 pytest.importorskip("flydsl")
 from aiter.ops.flydsl.kda_decode import (
@@ -569,3 +570,105 @@ def test_decode_api_rejects_invalid_input_rank() -> None:
 
     with pytest.raises(ValueError, match="`x` must have rank 2"):
         _run(inputs)
+
+
+@pytest.mark.parametrize(
+    "fused_f_b, name, dim",
+    [
+        (fused_f_b, name, dim)
+        for fused_f_b in (False, True)
+        for name, dim in (
+            ("x", 0),
+            ("conv_weight", 0),
+            ("conv_weight", 1),
+            ("conv_state", 1),
+            ("conv_state", 2),
+            ("raw_beta", 1),
+            ("output_gate", 0),
+            ("output_gate", 1),
+            ("out", 1),
+            ("out", 2),
+        )
+    ]
+    + [(False, "raw_g", 1), (True, "f_a", 0), (True, "f_b_weight", 0)],
+)
+@pytest.mark.parametrize("stride", [2**30, 2**31])
+def test_api_rejects_i32_address_overflow(
+    monkeypatch: pytest.MonkeyPatch,
+    fused_f_b: bool,
+    name: str,
+    dim: int,
+    stride: int,
+) -> None:
+    from aiter.ops.flydsl import kda_decode
+
+    def unexpected_compile(*args):
+        pytest.fail("Unsafe addressing must be rejected before kernel compilation.")
+
+    monkeypatch.setattr(kda_decode, "create_kda_decode_kernel", unexpected_compile)
+    monkeypatch.setattr(
+        kda_decode, "create_kda_decode_fused_projection_kernel", unexpected_compile
+    )
+    # Fake views exercise multi-GiB spans without allocating or accessing them.
+    # 2**30 fits the launcher parameter but overflows the resulting byte span;
+    # 2**31 also overflows the stride parameter itself.
+    with FakeTensorMode():
+        inputs = _make_inputs(batch=2)
+        f_a = torch.empty((2, _DIM), dtype=torch.bfloat16, device=_DEVICE)
+        f_b_weight = torch.empty(
+            (_HEADS, _DIM, _DIM), dtype=torch.bfloat16, device=_DEVICE
+        )
+        out = torch.empty((1, 2, _HEADS, _DIM), dtype=torch.bfloat16, device=_DEVICE)
+        tensor = {"f_a": f_a, "f_b_weight": f_b_weight, "out": out}.get(name)
+        if tensor is None:
+            tensor = getattr(inputs, name)
+        strides = list(tensor.stride())
+        strides[dim] = stride
+        view = torch.empty_strided(
+            tensor.shape, strides, dtype=tensor.dtype, device=_DEVICE
+        )
+        if name == "f_a":
+            f_a = view
+        elif name == "f_b_weight":
+            f_b_weight = view
+        elif name == "out":
+            out = view
+        else:
+            setattr(inputs, name, view)
+        kwargs = {
+            field: getattr(inputs, field)
+            for field in Inputs.__dataclass_fields__
+            if field != "raw_g"
+        }
+        kwargs.update(
+            conv_bias=None, lower_bound=_LOWER_BOUND, norm_eps=_NORM_EPS, out=out
+        )
+        with pytest.raises(ValueError, match=f"`{name}`.*int32"):
+            if fused_f_b:
+                flydsl_kda_decode_with_f_b(f_a=f_a, f_b_weight=f_b_weight, **kwargs)
+            else:
+                flydsl_kda_decode(raw_g=inputs.raw_g, **kwargs)
+
+
+def test_unused_singleton_stride_must_still_fit_launcher_int32() -> None:
+    from aiter.ops.flydsl.kda_decode import _check_i32_addressing
+
+    tensor = torch.empty_strided(
+        (1, _CHANNELS), (2**31, 1), dtype=torch.bfloat16, device="meta"
+    )
+    with pytest.raises(ValueError, match="`x` strides.*int32"):
+        _check_i32_addressing("x", tensor)
+
+
+def test_i32_byte_span_boundary() -> None:
+    from aiter.ops.flydsl.kda_decode import _check_i32_addressing
+
+    # The starting offset fits for both tensors; the entire final BF16 element
+    # must also fit. Use meta tensors to avoid allocating nearly two GiB.
+    safe = torch.empty_strided((2,), (2**30 - 2,), dtype=torch.bfloat16, device="meta")
+    unsafe = torch.empty_strided(
+        (2,), (2**30 - 1,), dtype=torch.bfloat16, device="meta"
+    )
+    _check_i32_addressing("x", safe)
+    with pytest.raises(ValueError, match="`x` byte span.*int32"):
+        _check_i32_addressing("x", unsafe)
