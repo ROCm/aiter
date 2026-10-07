@@ -60,6 +60,33 @@ def escape_1_exit_code():
 
 
 # ---------------------------------------------------------------------------
+# 1b. A mismatch ratio cannot see NaN.
+# ---------------------------------------------------------------------------
+
+
+def _moe_output(seed=0):
+    g = torch.Generator().manual_seed(seed)
+    ref = torch.randn(128, 4096, generator=g, dtype=torch.float32)
+    return (ref / ref.abs().max() * 1928.0).to(torch.bfloat16)
+
+
+def escape_1b_nan_under_the_ratio():
+    rule("1b. tol_err_ratio allows 5% of the output to be NaN")
+    ref = _moe_output()
+    poisoned = ref.clone()
+    n = int(0.05 * ref.numel())
+    poisoned.view(-1)[:n] = float("nan")
+
+    ratio = checkAllclose(poisoned, ref, rtol=MOE_RTOL, atol=MOE_ATOL, printLog=False)
+    print(f"  output elements                  : {ref.numel()}")
+    print(f"  of which NaN                     : {n}")
+    print(f"  mismatching elements             : {ratio:.4f}")
+    print("  default tol_err_ratio            : 0.05")
+    print(f"  -> accepted: {ratio <= 0.05}")
+    return ratio <= 0.05
+
+
+# ---------------------------------------------------------------------------
 # 2. The hardcoded MoE atol=100 absorbs a large constant bias.
 # ---------------------------------------------------------------------------
 
@@ -154,7 +181,7 @@ def catches():
     from aiter.utility.cos_diff import worst_row_cos_diff
     from aiter.utility.tolerance import derive_tolerance
 
-    rule("Same three defects, judged by the gates this branch adds")
+    rule("The same defects, judged by the gates this branch adds")
 
     env = dict(os.environ, AITER_STRICT_ALLCLOSE="1")
     proc = subprocess.run(
@@ -165,6 +192,16 @@ def catches():
         env=env,
     )
     print(f"  1. AITER_STRICT_ALLCLOSE=1       -> exit code {proc.returncode}")
+
+    ref_nan = _moe_output()
+    poisoned = ref_nan.clone()
+    poisoned.view(-1)[: int(0.05 * ref_nan.numel())] = float("nan")
+    try:
+        checkAllclose(poisoned, ref_nan, rtol=MOE_RTOL, atol=MOE_ATOL, strict=True)
+        nan_caught = False
+    except AssertionError:
+        nan_caught = True
+    print(f"  1b. strict mode on 5% NaN        -> rejected: {nan_caught}")
 
     g = torch.Generator().manual_seed(0)
     ref = torch.randn(512, 128, generator=g, dtype=torch.float32)
@@ -188,6 +225,7 @@ def catches():
 
     return (
         proc.returncode != 0
+        and nan_caught
         and ratio > 0.05
         and worst_row_cos_diff(ref, out) > COS_DIFF_THRESHOLD
     )
@@ -200,6 +238,7 @@ if __name__ == "__main__":
 
     results = {
         "exit code": escape_1_exit_code(),
+        "NaN under the ratio": escape_1b_nan_under_the_ratio(),
         "magic tolerance": escape_2_magic_tolerance(),
         "cosine dilution": escape_3_cosine_dilution(),
         "disabled gate": escape_4_disabled_gate(),
@@ -212,7 +251,7 @@ if __name__ == "__main__":
     caught = None
     if gates_available():
         caught = catches()
-        print(f"\n  all three caught by the new gates: {caught}")
+        print(f"\n  caught by the new gates: {caught}")
     else:
         print("\n  (stock checkout: the gates this PR adds are not present)")
 

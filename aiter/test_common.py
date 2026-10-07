@@ -548,6 +548,10 @@ def checkAllclose(
     ``AITER_STRICT_ALLCLOSE``. It has no effect when ``printLog=False``: that is
     the tuner's ranking path, which needs the ratio back rather than an
     exception.
+
+    Strict mode also rejects NaN and Inf regardless of ``tol_err_ratio``. A
+    ratio gate cannot see them: on a 524,288-element MoE output, 5% of the
+    tensor can be NaN and still sit inside the default 0.05 allowance.
     """
     if strict is None:
         strict = printLog and _strict_allclose_default()
@@ -648,11 +652,17 @@ def checkAllclose(
                 f"{msg}catastrophic error: max abs delta {actual_max_delta:.4f}, "
                 f"{percent:.1%} ({num} of {denom}) elements mismatch"
             )
-        if strict and percent > tol_err_ratio:
-            raise AssertionError(
-                f"{msg}{percent:.1%} ({num} of {denom}) elements exceed "
-                f"{atol=} {rtol=}, max abs delta {actual_max_delta:.4f}"
-            )
+        if strict:
+            if not torch.isfinite(a).all() or not torch.isfinite(b).all():
+                raise AssertionError(
+                    f"{msg}non-finite values in the comparison "
+                    f"({percent:.1%} of elements mismatch)"
+                )
+            if percent > tol_err_ratio:
+                raise AssertionError(
+                    f"{msg}{percent:.1%} ({num} of {denom}) elements exceed "
+                    f"{atol=} {rtol=}, max abs delta {actual_max_delta:.4f}"
+                )
         return percent
 
 

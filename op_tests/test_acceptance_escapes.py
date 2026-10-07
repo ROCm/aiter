@@ -118,6 +118,32 @@ def test_strict_flag_raises_without_touching_the_call_site():
         raise AssertionError("strict=True should have raised")
 
 
+def test_nan_hides_under_the_mismatch_ratio():
+    """A ratio gate cannot see NaN, however much of the tensor is NaN.
+
+    ``tol_err_ratio`` allows 5% of elements to miss. On a realistically sized
+    MoE output that is 26,214 elements, so a kernel can emit that many NaNs and
+    the comparison still reports a pass.
+    """
+    ref = _moe_like_reference(max_abs=1928.0, rows=128, cols=4096)
+    poisoned = ref.clone()
+    poisoned.view(-1)[: int(TOL_ERR_RATIO * ref.numel())] = float("nan")
+
+    shipped = checkAllclose(
+        poisoned, ref, rtol=SHIPPED_MOE_RTOL, atol=SHIPPED_MOE_ATOL, printLog=False
+    )
+    assert shipped <= TOL_ERR_RATIO, shipped
+
+    try:
+        checkAllclose(
+            poisoned, ref, rtol=SHIPPED_MOE_RTOL, atol=SHIPPED_MOE_ATOL, strict=True
+        )
+    except AssertionError as exc:
+        assert "non-finite" in str(exc), exc
+    else:
+        raise AssertionError("strict mode should reject NaN regardless of the ratio")
+
+
 def test_strict_leaves_a_passing_comparison_alone():
     """Opt-in must not turn correct results into failures."""
     ref = torch.ones(64, 128)
