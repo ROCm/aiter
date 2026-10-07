@@ -148,6 +148,8 @@ def _moe_gemm_a8w8(
     X_static_scale,
     W_static_scale,
     Quant_static_scale,
+    X_token_scale,
+    W_expt_scale,
     B,
     stride_b_e,  # Bias
     Gammas,
@@ -288,6 +290,11 @@ def _moe_gemm_a8w8(
         GatherIndx += start_m
         # no needs to bounds-check here because `offs_x_m` wraps around M dim
         offs_x_m = tl.load(GatherIndx + offs_x_m) // N_EXPTS_ACT
+    if X_token_scale is not None:
+        if GatherIndx is None:
+            offs_x_scale_m = start_m + offs_x_m
+        else:
+            offs_x_scale_m = offs_x_m
     offs_x_k = BLOCK_K * pid_k + tl.arange(0, BLOCK_K)
     XPtrs = (
         X
@@ -468,18 +475,16 @@ def _moe_gemm_a8w8(
                     ),
                     (BLOCK_M, BLOCK_K),
                 )
-                # Broadcasts on axis 1 where the EVEN_K branch uses axis 2;
-                # at most one can be right. Unreachable while the wrapper pins
-                # BLOCK_K == MX_PACK_DIVISOR, so left as-is.
-                b_sc_full = tl.reshape(
+                b_sc_t = tl.reshape(
                     tl.broadcast_to(
-                        b_sc[:, None, :], (BLOCK_N, MX_PACK_DIVISOR, MX_SCALE_BLOCK_K)
+                        b_sc[:, :, None], (BLOCK_N, MX_SCALE_BLOCK_K, MX_PACK_DIVISOR)
                     ),
                     (BLOCK_N, BLOCK_K),
                 )
+                b_sc_full = tl.trans(b_sc_t)  # [BLOCK_K, BLOCK_N]
                 acc += tl.dot(
                     a_f32 * a_sc_full,
-                    tl.trans(b_f32 * b_sc_full),
+                    b_f32 * b_sc_full,
                     input_precision="ieee",
                 )
         else:
@@ -492,6 +497,12 @@ def _moe_gemm_a8w8(
         acc = acc * tl.load(X_static_scale)
     if W_static_scale is not None:
         acc = acc * tl.load(W_static_scale)
+    # per-token / per-expert fp8 scales
+    if X_token_scale is not None:
+        x_token_sc = tl.load(X_token_scale + offs_x_scale_m.to(index_type))
+        acc = acc * x_token_sc[:, None]
+    if W_expt_scale is not None:
+        acc = acc * tl.load(W_expt_scale + expt_id)
     # bias
     offs_m = BLOCK_M * block_id + tl.arange(0, BLOCK_M)
     offs_y_n = BLOCK_N * pid_n + tl.arange(0, BLOCK_N)

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
 
 import torch
 import triton
@@ -21,6 +22,7 @@ from aiter.ops.triton._triton_kernels.quant.quant import (
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.quant_config_utils import get_quant_config
 from aiter.ops.triton.utils.types import e4m3_dtype
 
 __all__ = [
@@ -43,6 +45,28 @@ _MXFP8_LEGACY_BLOCK_SIZE = 128
 
 
 _LOGGER = AiterTritonLogger()
+
+
+@functools.lru_cache(maxsize=1)
+def _has_scaled_downcast() -> bool:
+    # Older Triton builds lack Gluon or this API; selecting the gfx950 kernel
+    # makes MXFP4/MXFP8 model loading fail at compile time.
+    try:
+        from triton.experimental.gluon import language as gl
+    except ImportError:
+        return False
+
+    cdna4 = getattr(getattr(gl, "amd", None), "cdna4", None)
+    return callable(getattr(cdna4, "scaled_downcast", None))
+
+
+def _use_gluon(backend: str | None, supported: bool, requirement: str) -> bool:
+    # None picks Gluon where supported; "triton" and "gluon" force that kernel.
+    if backend not in (None, "triton", "gluon"):
+        raise ValueError(f"Unknown backend {backend!r}; use None, 'triton' or 'gluon'")
+    if backend == "gluon" and not supported:
+        raise RuntimeError(f"The Gluon backend requires {requirement}")
+    return supported if backend is None else backend == "gluon"
 
 
 def static_per_tensor_quant_fp8_i8(
@@ -185,6 +209,7 @@ def dynamic_mxfp4_quant(
     use_sr: bool = False,
     philox_seed: int | None = None,
     philox_offset: int = 0,
+    backend: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize a two-dimensional tensor to row-wise MXFP4.
 
@@ -204,6 +229,10 @@ def dynamic_mxfp4_quant(
         philox_offset: Non-negative starting Philox counter. Callers must use
             disjoint counter ranges across launches that require independent
             rounding noise. One counter supplies four packed E2M1 pairs.
+        backend: None picks the Gluon kernel where supported (gfx950 with bf16
+            input and ``use_sr=False``, or gfx1250) and the Triton kernel
+            elsewhere. "triton" or "gluon" forces that kernel; "gluon" raises
+            RuntimeError where unsupported.
 
     Returns:
         A tuple ``(x_fp4, blockscale_e8m0)``. The payload has shape
@@ -213,8 +242,14 @@ def dynamic_mxfp4_quant(
     Raises:
         TypeError: If stochastic rounding receives an unsupported dtype or
             non-integer Philox argument.
-        ValueError: If stochastic-rounding arguments or shape are invalid.
-        RuntimeError: If stochastic rounding is requested outside gfx950.
+        ValueError: If stochastic-rounding arguments or shape are invalid, or
+            ``backend`` is unknown.
+        RuntimeError: If stochastic rounding is requested outside gfx950, or
+            ``backend="gluon"`` is not supported for this call.
+
+    By default, gfx950 with bf16 input (and use_sr=False) uses a Gluon kernel
+    with the native hw-cvt instruction, and gfx1250 uses a TDM Gluon kernel;
+    other dtypes/archs, and any use_sr=True call, use the plain Triton kernel.
     """
     _LOGGER.info("DYNAMIC_MXFP4_QUANT: x=%s use_sr=%s", tuple(x.shape), use_sr)
     if use_sr and x.dim() != 2:
@@ -280,61 +315,142 @@ def dynamic_mxfp4_quant(
             and blockscale_e8m0.dtype == torch.uint8
         )
 
-    # for large N values
-    if M <= 32:
-        NUM_ITER = 1
-        BLOCK_SIZE_M = triton.next_power_of_2(M)
-        BLOCK_SIZE_N = 32
-        NUM_WARPS = 1
-        NUM_STAGES = 1
+    # Every gfx1250 input has a Gluon kernel; the call only validates `backend`.
+    if arch_info.get_arch() == "gfx1250" and _use_gluon(backend, True, "gfx1250"):
+        from aiter.ops.triton._gluon_kernels.gfx1250.quant.quant import (
+            gluon_dynamic_mxfp4_quant_kernel_gfx1250,
+        )
+
+        cfg = get_quant_config("MXFP4", M=M, N=N)
+        NUM_ITER = cfg["NUM_ITER"]
+        BLOCK_SIZE_M = cfg["BLOCK_SIZE_M"]
+        BLOCK_SIZE_N = cfg["BLOCK_SIZE_N"]
+        NUM_WARPS = cfg["NUM_WARPS"]
+
+        grid = (
+            triton.cdiv(M, BLOCK_SIZE_M),
+            triton.cdiv(N, BLOCK_SIZE_N * NUM_ITER),
+        )
+        even_m_n = (M % BLOCK_SIZE_M == 0) and (N % (BLOCK_SIZE_N * NUM_ITER) == 0)
+
+        gluon_dynamic_mxfp4_quant_kernel_gfx1250[grid](
+            x,
+            x_fp4,
+            blockscale_e8m0,
+            *x.stride(),
+            *x_fp4.stride(),
+            *blockscale_e8m0.stride(),
+            M=M,
+            N=N,
+            MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
+            EVEN_M_N=even_m_n,
+            NUM_ITER=NUM_ITER,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            num_warps=NUM_WARPS,
+        )
+    # The gfx950 Gluon kernel only supports bf16 (hw-cvt) and no use_sr;
+    # everything else uses the Triton path below.
+    elif _use_gluon(
+        backend,
+        arch_info.get_arch() == "gfx950"
+        and x.dtype == torch.bfloat16
+        and not use_sr
+        and _has_scaled_downcast(),
+        "gfx950, bf16 input, use_sr=False and Triton gl.amd.cdna4.scaled_downcast",
+    ):
+        from aiter.ops.triton._gluon_kernels.gfx950.quant.quant import (
+            gluon_dynamic_mxfp4_quant_kernel_gfx950,
+        )
+
+        cfg = get_quant_config("MXFP4", M=M, N=N)
+        NUM_ITER = cfg["NUM_ITER"]
+        BLOCK_SIZE_M = cfg["BLOCK_SIZE_M"]
+        BLOCK_SIZE_N = cfg["BLOCK_SIZE_N"]
+        NUM_WARPS = cfg["NUM_WARPS"]
+        NUM_STAGES = cfg["NUM_STAGES"]
+
+        grid = (
+            triton.cdiv(M, BLOCK_SIZE_M),
+            triton.cdiv(N, BLOCK_SIZE_N * NUM_ITER),
+        )
+        even_m_n = (M % BLOCK_SIZE_M == 0) and (N % (BLOCK_SIZE_N * NUM_ITER) == 0)
+
+        gluon_dynamic_mxfp4_quant_kernel_gfx950[grid](
+            x,
+            x_fp4,
+            blockscale_e8m0,
+            *x.stride(),
+            *x_fp4.stride(),
+            *blockscale_e8m0.stride(),
+            M=M,
+            N=N,
+            MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
+            EVEN_M_N=even_m_n,
+            NUM_ITER=NUM_ITER,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            NUM_STAGES=NUM_STAGES,
+            num_warps=NUM_WARPS,
+        )
+
     else:
-        NUM_ITER = 4
-        BLOCK_SIZE_M = 64
-        BLOCK_SIZE_N = 64
-        NUM_WARPS = 4
-        NUM_STAGES = 2
+        # for large N values
+        if M <= 32:
+            NUM_ITER = 1
+            BLOCK_SIZE_M = triton.next_power_of_2(M)
+            BLOCK_SIZE_N = 4096 // BLOCK_SIZE_M
+            NUM_WARPS = 4
+            NUM_STAGES = 1
+        else:
+            NUM_ITER = 2
+            BLOCK_SIZE_M = 64
+            BLOCK_SIZE_N = 64
+            NUM_WARPS = 4
+            NUM_STAGES = 2
 
-        if N <= 16384:
-            BLOCK_SIZE_M = 32
-            BLOCK_SIZE_N = 128
+            if N <= 16384:
+                BLOCK_SIZE_M = 32
+                BLOCK_SIZE_N = 256
 
-    # for small N values
-    if N <= 1024:
-        NUM_ITER = 1
-        NUM_STAGES = 1
-        NUM_WARPS = 4
-        BLOCK_SIZE_N = min(256, triton.next_power_of_2(N))
-        # BLOCK_SIZE_N needs to be multiple of 32
-        BLOCK_SIZE_N = max(32, BLOCK_SIZE_N)
-        BLOCK_SIZE_M = min(8, triton.next_power_of_2(M))
+        # for small N values
+        if N <= 1024:
+            NUM_ITER = 1
+            NUM_STAGES = 1
+            NUM_WARPS = 4
+            BLOCK_SIZE_N = min(128, triton.next_power_of_2(N))
+            # BLOCK_SIZE_N needs to be multiple of 32
+            BLOCK_SIZE_N = max(32, BLOCK_SIZE_N)
+            BLOCK_SIZE_M = min(32, triton.next_power_of_2(M))
 
-    grid = (
-        triton.cdiv(M, BLOCK_SIZE_M),
-        triton.cdiv(N, BLOCK_SIZE_N * NUM_ITER),
-    )
+        grid = (
+            triton.cdiv(M, BLOCK_SIZE_M),
+            triton.cdiv(N, BLOCK_SIZE_N * NUM_ITER),
+        )
+        even_m_n = (M % BLOCK_SIZE_M == 0) and (N % (BLOCK_SIZE_N * NUM_ITER) == 0)
 
-    _dynamic_mxfp4_quant_kernel[grid](
-        x,
-        x_fp4,
-        blockscale_e8m0,
-        *x.stride(),
-        *x_fp4.stride(),
-        *blockscale_e8m0.stride(),
-        M=M,
-        N=N,
-        philox_seed=philox_seed if philox_seed is not None else 0,
-        philox_offset=philox_offset,
-        MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
-        SCALING_MODE=0,
-        USE_SR=use_sr,
-        NUM_ITER=NUM_ITER,
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        NUM_STAGES=NUM_STAGES,
-        num_warps=NUM_WARPS,
-        waves_per_eu=0,
-    )
-
+        _dynamic_mxfp4_quant_kernel[grid](
+            x,
+            x_fp4,
+            blockscale_e8m0,
+            *x.stride(),
+            *x_fp4.stride(),
+            *blockscale_e8m0.stride(),
+            M=M,
+            N=N,
+            philox_seed=philox_seed if philox_seed is not None else 0,
+            philox_offset=philox_offset,
+            MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
+            EVEN_M_N=even_m_n,
+            SCALING_MODE=0,
+            USE_SR=use_sr,
+            NUM_ITER=NUM_ITER,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            NUM_STAGES=NUM_STAGES,
+            num_warps=NUM_WARPS,
+            waves_per_eu=0,
+        )
     return (x_fp4, blockscale_e8m0)
 
 
@@ -403,6 +519,8 @@ def dynamic_mxfp8_quant(
     x: torch.Tensor,
     scale: torch.Tensor | None = None,
     quant_dtype: torch.dtype = torch.float8_e4m3fn,
+    *,
+    backend: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Per-1x32 MXFP8 quantization (e8m0 scale + FP8 e4m3 values).
@@ -413,11 +531,20 @@ def dynamic_mxfp8_quant(
         quant_dtype: FP8 dtype to cast quantized values to. On MI3xx
             torch.float8_e4m3fnuz is the canonical FP8 e4m3 type. torch.float8_e4m3fn
             is acceptable on hardware that supports it.
+        backend: None picks the Gluon kernel where supported (gfx950 with bf16
+            input, gfx1250 with bf16/fp16 input, quant_dtype=torch.float8_e4m3fn)
+            and the Triton kernel elsewhere.
+            "triton" or "gluon" forces that kernel; "gluon" raises RuntimeError
+            where unsupported.
 
     Returns:
         Tuple of:
             y: FP8 tensor of shape x.shape.
             s: e8m0 (uint8) scale tensor of shape (..., K // 32).
+
+    By default, gfx950 (bf16) and gfx1250 (bf16/fp16) with
+    quant_dtype=torch.float8_e4m3fn use a Gluon kernel; other combinations use
+    the plain Triton kernel.
     """
     assert x.dim() >= 2, f"x must be at least 2D, got {x.dim()}"
     orig_shape = x.shape
@@ -437,27 +564,107 @@ def dynamic_mxfp8_quant(
         assert scale.shape == (M, Ns), f"scale shape {scale.shape} != ({M},{Ns})"
         assert scale.dtype == torch.uint8
 
-    BLOCK_SIZE_N = triton.next_power_of_2(K)
-    # Bound launch overhead on large token-head batches; the kernel loops rows by stride.
-    NUM_PRGMS = min(M, 32768)
-    grid = (NUM_PRGMS,)
+    if arch_info.get_arch() == "gfx1250" and _use_gluon(
+        backend,
+        x2d.dtype in (torch.bfloat16, torch.float16)
+        and quant_dtype == torch.float8_e4m3fn,
+        "gfx1250, bf16 or fp16 input and quant_dtype=torch.float8_e4m3fn",
+    ):
+        from aiter.ops.triton._gluon_kernels.gfx1250.quant.quant import (
+            gluon_dynamic_mxfp8_quant_kernel_gfx1250,
+        )
 
-    _dynamic_mxfp8_quant_kernel[grid](
-        x2d,
-        y,
-        scale,
-        M,
-        K,
-        x2d.stride(0),
-        x2d.stride(1),
-        y.stride(0),
-        y.stride(1),
-        scale.stride(0),
-        scale.stride(1),
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        QUANT_BLOCK_SIZE=_MXFP8_QUANT_BLOCK_SIZE,
-        NUM_PRGMS=NUM_PRGMS,
-    )
+        cfg = get_quant_config("MXFP8", M=M, K=K)
+        NUM_ITER = cfg["NUM_ITER"]
+        BLOCK_SIZE_M = cfg["BLOCK_SIZE_M"]
+        BLOCK_SIZE_N = cfg["BLOCK_SIZE_N"]
+        NUM_WARPS = cfg["NUM_WARPS"]
+        NUM_BUFFERS = cfg["NUM_BUFFERS"]
+
+        grid = (
+            triton.cdiv(M, BLOCK_SIZE_M),
+            triton.cdiv(K, BLOCK_SIZE_N * NUM_ITER),
+        )
+
+        gluon_dynamic_mxfp8_quant_kernel_gfx1250[grid](
+            x2d,
+            y,
+            scale,
+            *x2d.stride(),
+            *y.stride(),
+            *scale.stride(),
+            M=M,
+            N=K,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            NUM_ITER=NUM_ITER,
+            MXFP8_QUANT_BLOCK_SIZE=_MXFP8_QUANT_BLOCK_SIZE,
+            NUM_BUFFERS=NUM_BUFFERS,
+            num_warps=NUM_WARPS,
+            waves_per_eu=cfg["waves_per_eu"],
+        )
+    elif _use_gluon(
+        backend,
+        arch_info.get_arch() == "gfx950"
+        and x.dtype == torch.bfloat16
+        and quant_dtype == torch.float8_e4m3fn
+        and _has_scaled_downcast(),
+        "gfx950, bf16 input, quant_dtype=torch.float8_e4m3fn and "
+        "Triton gl.amd.cdna4.scaled_downcast",
+    ):
+        from aiter.ops.triton._gluon_kernels.gfx950.quant.quant import (
+            gluon_dynamic_mxfp8_quant_kernel_gfx950,
+        )
+
+        cfg = get_quant_config("MXFP8", M=M, K=K)
+
+        NUM_ITER = cfg["NUM_ITER"]
+        BLOCK_SIZE_M = cfg["BLOCK_SIZE_M"]
+        BLOCK_SIZE_N = cfg["BLOCK_SIZE_N"]
+        NUM_WARPS = cfg["NUM_WARPS"]
+
+        grid = (
+            triton.cdiv(M, BLOCK_SIZE_M),
+            triton.cdiv(K, BLOCK_SIZE_N * NUM_ITER),
+        )
+
+        gluon_dynamic_mxfp8_quant_kernel_gfx950[grid](
+            x2d,
+            y,
+            scale,
+            *x2d.stride(),
+            *y.stride(),
+            *scale.stride(),
+            M=M,
+            N=K,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            NUM_ITER=NUM_ITER,
+            MXFP8_QUANT_BLOCK_SIZE=_MXFP8_QUANT_BLOCK_SIZE,
+            num_warps=NUM_WARPS,
+        )
+    else:
+        BLOCK_SIZE_N = triton.next_power_of_2(K)
+        # Bound launch overhead on large token-head batches; the kernel loops rows by stride.
+        NUM_PRGMS = min(M, 32768)
+        grid = (NUM_PRGMS,)
+
+        _dynamic_mxfp8_quant_kernel[grid](
+            x2d,
+            y,
+            scale,
+            M,
+            K,
+            x2d.stride(0),
+            x2d.stride(1),
+            y.stride(0),
+            y.stride(1),
+            scale.stride(0),
+            scale.stride(1),
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            QUANT_BLOCK_SIZE=_MXFP8_QUANT_BLOCK_SIZE,
+            NUM_PRGMS=NUM_PRGMS,
+        )
 
     y = y.view(*orig_shape[:-1], K)
     s = scale.view(*orig_shape[:-1], Ns)
