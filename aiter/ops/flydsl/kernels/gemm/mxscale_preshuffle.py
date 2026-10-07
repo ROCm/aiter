@@ -145,13 +145,15 @@ def _launch_gemm_impl(
     _bs_a, _bs_b = _wsb.bs_a, _wsb.bs_b
     small_m_bf16 = (
         BM == 16
-        and _bs_a
         and out_dtype == "bf16"
         and batch == 1
         and c_row_stride < 0
         and c_batch_stride < 0
     )
     splitk_fused = small_m_bf16 and k_batch > 1 and BN <= 128
+    packed_row_store = (
+        small_m_bf16 and not multi_row_tile and (k_batch == 1 or splitk_fused)
+    )
     if const_expr(out_dtype == "bf16"):
         out_elem = BFloat16
     else:
@@ -753,15 +755,13 @@ def _launch_gemm_impl(
             ),
             fx.make_layout(1, 1),
         )
-        if const_expr(
-            (k_batch > 1 and not splitk_fused) or (small_m_bf16 and not multi_row_tile)
-        ):
+        if const_expr((k_batch > 1 and not splitk_fused) or packed_row_store):
             c_copy = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), store_elem)
         else:
             c_copy = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), store_elem)
         c_rstride = fx.Int32(c_stride)
         col_w = by_n + wave * (BN // num_waves) + lane_mod_16
-        if const_expr(small_m_bf16 and not multi_row_tile):
+        if const_expr(packed_row_store):
             # Avoid issuing the other 15 rows' masked stores (and their lane
             # exchanges) for the latency-critical single-row specialization.
             for ni in range_constexpr(num_acc_n):

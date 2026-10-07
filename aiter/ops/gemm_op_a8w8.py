@@ -1294,8 +1294,9 @@ def gemm_a8w8_blockscale_bpreshuffle(
 
     # gfx950 e8m0 has two implementations; the scale layout tells them apart.
     #   1-D flat -> the caller pre-shuffled with shuffle_scale_blockscale_a/_b
-    #               (128x128) or shuffle_scale_mx_a/_b (1x32), layouts only the
-    #               mxpsh 2D GEMM reads. Which of the two is read off their size.
+    #               (128x128) or shuffle_scale_a16w4(., 1, False).flatten()
+    #               (1x32, A rows padded to 32 first), layouts only the mxpsh
+    #               2D GEMM reads. Which of the two is read off their size.
     #   2-D raw  -> the batched-B=1 path, which also covers group32 (1x32).
     if (
         get_gfx() == "gfx950"

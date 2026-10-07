@@ -206,8 +206,7 @@ def flydsl_mxscale_preshuffle_gemm(
     # let the last arriving GEMM block reduce them. This avoids a second launch
     # without introducing output atomics or a grid-wide spin wait.
     splitk_fused = (
-        blk.bs_a  # the fused M<=16 reduce needs the broadcast A scale
-        and split_k > 1
+        split_k > 1
         and M <= 16
         and int(tile_m) == 16
         and out_dtype == "bf16"

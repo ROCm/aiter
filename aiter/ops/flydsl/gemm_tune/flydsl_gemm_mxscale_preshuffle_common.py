@@ -204,9 +204,9 @@ def instance_valid(ki: kernelInstance) -> bool:
     if ki.tile_m % 32 != 0 and not (
         ki.tile_m == 16 and (ki.a_dtype, ki.b_dtype) == ("fp8", "fp8")
     ):
-        # The per-1x32 MX path packs M chunks in pairs. The M=16 exception is
-        # reserved for the blockscale a8w8 path, where one A scale broadcasts;
-        # ``fits_shape`` keeps it out of the MX candidate set.
+        # A scale words pack two 16-row M chunks. The M=16 exception is a8w8
+        # only; ``fits_shape`` keeps it to M<=16, where the one tile reads the
+        # first chunk of every A scale word under either w_scale_block.
         return False
     if ki.tile_n % 16 != 0:  # MFMA emits 16 N-cols; tile_n must be a multiple of 16
         return False
@@ -233,7 +233,7 @@ def fits_shape(ki: kernelInstance, M: int, N: int, K: int, w_scale_block: str) -
         )
     if K % 128 != 0:
         return False
-    if ki.tile_m == 16 and (M > 16 or not blk.bs_a):
+    if ki.tile_m == 16 and M > 16:
         return False
     if blk.bs_b and (ki.a_dtype, ki.b_dtype) != ("fp8", "fp8"):
         return False
