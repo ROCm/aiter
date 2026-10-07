@@ -2,6 +2,8 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 
+import functools
+
 import torch
 import triton
 
@@ -16,6 +18,7 @@ from aiter.ops.triton._triton_kernels.fusions import (
     _mhc_reduce_apply_kernel,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.mhc_config_utils import (
     get_mhc_config,
@@ -508,6 +511,396 @@ def mhc_post(
     return out
 
 
+# ---- gfx1250: Gluon split kernel + Gluon reduce/apply (TDM + WMMA) ----
+#
+# On gfx1250, mhc_post_pre runs two Gluon launches
+# (_gluon_kernels/gfx1250/fusions/mhc_post_pre.py) -- the post + split-K pre
+# GEMM/sqrsum, then the pre reduce/apply (RMS, sigmoid, Sinkhorn, apply-pre,
+# optional fused RMSNorm) -- matching the two launches of aiter.mhc_fused_post_pre
+# (HIP gemm_sqrsum + mhc_pre_big_fuse[_rmsnorm]). It also accepts the HIP-side
+# layouts ATOM uses: mhc_shuffle_fn weights and the shuffled residual. Other archs,
+# and inputs the Gluon kernels do not cover, use the Triton path.
+
+_IS_GFX1250 = get_arch() == "gfx1250"
+_GLUON_BLOCK_M = 32
+_GLUON_KS = 32  # k-step width; also the shuffled-residual block (mhc_res_ks)
+_GLUON_N_PAD = 32
+_GLUON_RA_CHUNK = 256  # reduce/apply column granule (8 bf16 x 32 lanes)
+_GLUON_RA_NORM_WARPS = 8  # reduce/apply warps per row with fused RMSNorm
+
+
+def _mhc_post_pre_gluon_supported(
+    layer_input,
+    residual_in,
+    phi,
+    alphas,
+    bias,
+    n,
+    sinkhorn_iters,
+    asymmetric_exp_domain,
+    residual_out,
+    layer_input_out,
+    norm_weight,
+    w_preshuffle_bf16,
+    h_post=None,
+    h_res=None,
+) -> bool:
+    if not _IS_GFX1250:
+        return False
+    C = layer_input.size(1)
+    K = n * C
+    # phi is (K, N) and C-contiguous: phi = fn.T for the HIP-layout fn (N, K),
+    # either fp32 or (w_preshuffle_bf16) the int32 mhc_shuffle_fn output.
+    phi_dtype = torch.int32 if w_preshuffle_bf16 else torch.float32
+    return (
+        n == 4  # one warp per stream
+        and phi.dtype == phi_dtype
+        and phi.stride(0) == 1
+        and phi.stride(1) == K
+        # the reduce/apply implements the exp-domain Sinkhorn with >= 1 iteration
+        and asymmetric_exp_domain
+        and sinkhorn_iters > 0
+        and layer_input.dtype == torch.bfloat16
+        and residual_in.dtype == torch.bfloat16
+        and alphas.dtype == torch.float32
+        and bias.dtype == torch.float32
+        and C % _GLUON_RA_CHUNK == 0
+        and layer_input.stride(1) == 1
+        and residual_in.is_contiguous()
+        and (residual_out is None or residual_out.is_contiguous())
+        and (layer_input_out is None or layer_input_out.is_contiguous())
+        and (layer_input_out is None or layer_input_out.dtype == torch.bfloat16)
+        and (h_post is None or h_post.is_contiguous())
+        and (h_res is None or h_res.is_contiguous())
+        and (
+            norm_weight is None
+            or (
+                norm_weight.dtype == torch.bfloat16
+                and norm_weight.is_contiguous()
+                and norm_weight.numel() == C
+            )
+        )
+    )
+
+
+@functools.lru_cache(maxsize=16)
+def _gluon_post_pre_layouts(n: int, num_stages: int, w_preshuffled: bool):
+    from aiter.ops.triton._gluon_kernels.gfx1250.fusions.mhc_post_pre import (
+        create_layouts,
+    )
+
+    return create_layouts(
+        n, _GLUON_BLOCK_M, _GLUON_KS, _GLUON_N_PAD, num_stages, w_preshuffled
+    )
+
+
+@functools.lru_cache(maxsize=16)
+def _gluon_reduce_apply_layouts(n: int, rows: int, num_warps: int):
+    from aiter.ops.triton._gluon_kernels.gfx1250.fusions.mhc_post_pre import (
+        create_reduce_apply_layouts,
+    )
+
+    return create_reduce_apply_layouts(n, rows, num_warps)
+
+
+def _mhc_post_pre_gemm_sqrsum_gluon(
+    gemm_out: torch.Tensor,  # (split_k, M, N) fp32, row stride >= 32
+    gemm_out_sqrsum: torch.Tensor,  # (split_k, M) fp32
+    next_residual: torch.Tensor,  # same layout as residual_in
+    layer_input: torch.Tensor,  # (M, C) bf16
+    residual_in: torch.Tensor,  # (M, n, C) bf16, plain or mhc_res_shuffle'd
+    post_mix: torch.Tensor,  # (M, n) / (M, n, 1) fp32
+    comb_mix: torch.Tensor,  # (M, n, n) fp32 [src, dst]
+    fn: torch.Tensor,  # (N, n * C): fp32, or int32 mhc_shuffle_fn output
+    res_shuffled: bool,
+    num_stages: int = 2,
+) -> None:
+    """Launch the Gluon split kernel. Fills the same buffers as the HIP
+    ``mhc_fused_post_pre_gemm_sqrsum(..., w_preshuffle_bf16=1,
+    res_preshuffle=res_shuffled)``. ``fn`` is either the plain FP32 weight
+    (the bf16 hi/lo split happens in the kernel) or ``mhc_shuffle_fn(fn)``."""
+    from aiter.ops.triton._gluon_kernels.gfx1250.fusions.mhc_post_pre import (
+        _mhc_post_pre_gemm_sqrsum_gfx1250_kernel,
+    )
+
+    M, C = layer_input.shape
+    n = residual_in.size(1)
+    split_k = gemm_out.size(0)
+    n_out = fn.size(0)
+    w_preshuffled = fn.dtype == torch.int32
+    assert C % (split_k * _GLUON_KS) == 0, f"C={C} not divisible by split_k*{_GLUON_KS}"
+    assert (
+        gemm_out.stride(2) == 1 and gemm_out.stride(1) >= _GLUON_N_PAD
+    ), "gemm_out rows must be 32-padded (the kernel writes all 32 columns)"
+    assert gemm_out_sqrsum.shape == (split_k, M) and gemm_out_sqrsum.is_contiguous()
+    assert next_residual.is_contiguous() and residual_in.is_contiguous()
+    assert n_out <= _GLUON_N_PAD and fn.shape == (n_out, n * C) and fn.is_contiguous()
+    assert fn.dtype in (torch.float32, torch.int32)
+    wmma, op_a, op_b, smem_x, smem_res, smem_fn, smem_nres, smem_red, smem_red2 = (
+        _gluon_post_pre_layouts(n, num_stages, w_preshuffled)
+    )
+    grid = (triton.cdiv(M, _GLUON_BLOCK_M), split_k)
+    _mhc_post_pre_gemm_sqrsum_gfx1250_kernel[grid](
+        gemm_out,
+        gemm_out_sqrsum,
+        next_residual,
+        layer_input,
+        residual_in,
+        # packed: the int32 storage holds bf16 [16 hi][16 lo] blocks per row
+        fn.view(torch.bfloat16) if w_preshuffled else fn,
+        post_mix.reshape(M, n).contiguous(),
+        comb_mix.contiguous(),
+        M,
+        layer_input.stride(0),
+        gemm_out.stride(1),
+        C=C,
+        HC=n,
+        N_OUT=n_out,
+        N_PAD=_GLUON_N_PAD,
+        BLOCK_M=_GLUON_BLOCK_M,
+        KS=_GLUON_KS,
+        K_LOOP=C // (split_k * _GLUON_KS),
+        NUM_STAGES=num_stages,
+        RES_SHUFFLED=res_shuffled,
+        W_PRESHUFFLED=w_preshuffled,
+        WMMA=wmma,
+        OP_A=op_a,
+        OP_B=op_b,
+        SMEM_X=smem_x,
+        SMEM_RES=smem_res,
+        SMEM_FN=smem_fn,
+        SMEM_NRES=smem_nres,
+        SMEM_RED=smem_red,
+        SMEM_RED2=smem_red2,
+        num_warps=4,
+        enable_fp_fusion=True,
+    )
+
+
+def _mhc_pre_reduce_apply_gluon(
+    post_mix: torch.Tensor,  # (M, n, 1) / (M, n) fp32 out
+    comb_mix: torch.Tensor,  # (M, n, n) fp32 out
+    layer_input: torch.Tensor,  # (M, C) bf16 out
+    gemm_out: torch.Tensor,  # (split_k, M, N) fp32 split-K partials
+    gemm_out_sqrsum: torch.Tensor,  # (split_k, M) fp32
+    hc_scale: torch.Tensor,  # (3,) fp32
+    hc_base: torch.Tensor,  # (N,) fp32
+    residual: torch.Tensor,  # (M, n, C) bf16, plain or mhc_res_shuffle'd
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    res_shuffled: bool,
+    norm_weight: torch.Tensor | None = None,  # (C,) bf16: fuse RMSNorm
+    norm_eps: float = 1e-6,
+) -> None:
+    """Gluon counterpart of the HIP ``mhc_pre_big_fuse`` /
+    ``mhc_pre_big_fuse_rmsnorm`` (same arguments and outputs)."""
+    from aiter.jit.utils.chip_info import get_cu_num
+    from aiter.ops.triton._gluon_kernels.gfx1250.fusions.mhc_post_pre import (
+        _mhc_pre_reduce_apply_gfx1250_kernel,
+    )
+
+    M, n, C = residual.shape
+    split_k = gemm_out.size(0)
+    assert gemm_out.stride(2) == 1 and gemm_out_sqrsum.is_contiguous()
+    assert post_mix.is_contiguous() and comb_mix.is_contiguous()
+    assert layer_input.is_contiguous() and residual.is_contiguous()
+    fuse_norm = norm_weight is not None
+    if fuse_norm:
+        # The RMSNorm needs the whole row: one row per CTA over all of C, with
+        # 8 warps; the last TDM chunk runs past C and is zero-filled.
+        rows, num_warps, k_blocks = 1, _GLUON_RA_NORM_WARPS, 1
+    else:
+        # 4 rows per CTA; split C across CTAs until the grid fills the GPU.
+        rows, num_warps = 4, 4
+        n_col = C // _GLUON_RA_CHUNK
+        m_blocks = triton.cdiv(M, rows)
+        target = 4 * get_cu_num()
+        k_blocks = max(
+            [
+                k
+                for k in range(1, n_col + 1)
+                if n_col % k == 0 and m_blocks * k <= target
+            ]
+            or [1]
+        )
+    chunk, apply_l, red4, red16, sk, smem_mix, smem_res = _gluon_reduce_apply_layouts(
+        n, rows, num_warps
+    )
+    c_cta = C // k_blocks
+    grid = (triton.cdiv(M, rows), k_blocks)
+    _mhc_pre_reduce_apply_gfx1250_kernel[grid](
+        post_mix,
+        comb_mix,
+        layer_input,
+        gemm_out,
+        gemm_out_sqrsum,
+        hc_scale,
+        hc_base,
+        residual,
+        norm_weight if fuse_norm else layer_input,  # unused unless FUSE_RMSNORM
+        M,
+        gemm_out.stride(1),
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        norm_eps,
+        hc_post_mult_value,
+        C=C,
+        HC=n,
+        S=split_k,
+        ROWS=rows,
+        C_CTA=c_cta,
+        CHUNK=chunk,
+        N_CHUNKS=triton.cdiv(c_cta, chunk),
+        SINKHORN_REPEAT=sinkhorn_repeat,
+        RES_SHUFFLED=res_shuffled,
+        FUSE_RMSNORM=fuse_norm,
+        APPLY=apply_l,
+        RED4=red4,
+        RED16=red16,
+        SK=sk,
+        SMEM_MIX=smem_mix,
+        SMEM_RES=smem_res,
+        num_warps=num_warps,
+        enable_fp_fusion=True,
+    )
+
+
+def _mhc_post_pre_gluon_split_k(M: int, C: int, res_shuffled: bool) -> int:
+    """K-splits for the Gluon split kernel: the tuned HIP decode policy (same
+    workgroup grid as the HIP kernel), reduced until C splits into 32-wide
+    k-steps."""
+    from aiter.ops.mhc import get_mhc_fused_post_pre_config
+
+    split_k = get_mhc_fused_post_pre_config(
+        M, C, w_preshuffle_bf16=True, res_preshuffle=res_shuffled
+    )[0]
+    while C % (split_k * _GLUON_KS) != 0:
+        split_k -= 1
+    return split_k
+
+
+def mhc_post_pre_gfx1250_supported(
+    layer_input: torch.Tensor,
+    residual_in: torch.Tensor,
+    phi: torch.Tensor,
+    alphas: torch.Tensor,
+    bias: torch.Tensor,
+    n: int,
+    sinkhorn_iters: int = 20,
+    asymmetric_exp_domain: bool = True,
+    norm_weight: torch.Tensor | None = None,
+    w_preshuffle_bf16: bool = False,
+) -> bool:
+    """Whether ``mhc_post_pre`` runs the gfx1250 Gluon kernels for these inputs
+    (and therefore accepts ``norm_weight`` / ``w_preshuffle_bf16`` /
+    ``res_preshuffle``). Callers holding HIP-layout state use it to choose
+    between ``mhc_post_pre`` and ``aiter.mhc_fused_post_pre``."""
+    return _mhc_post_pre_gluon_supported(
+        layer_input,
+        residual_in,
+        phi,
+        alphas,
+        bias,
+        n,
+        sinkhorn_iters,
+        asymmetric_exp_domain,
+        None,
+        None,
+        norm_weight,
+        w_preshuffle_bf16,
+    )
+
+
+def _mhc_post_pre_gluon_gfx1250(
+    layer_input: torch.Tensor,
+    residual_in: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb_mix: torch.Tensor,
+    phi: torch.Tensor,
+    alphas: torch.Tensor,
+    bias: torch.Tensor,
+    n: int,
+    eps: float,
+    hc_pre_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_iters: int,
+    hc_sinkhorn_eps: float,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float,
+    res_preshuffle: bool,
+    h_post: torch.Tensor | None = None,
+    h_res: torch.Tensor | None = None,
+    layer_input_out: torch.Tensor | None = None,
+    residual_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """gfx1250 mhc_post_pre: Gluon split kernel + Gluon reduce/apply.
+
+    The kernels write straight into the given outputs (any float dtype for
+    ``h_post`` / ``h_res``); missing ones are created here. Returns
+    ``(h_post (M, n, 1), h_res (M, n, n), layer_input_out (M, C), residual_out)``.
+    """
+    from aiter.ops.mhc import mhc_res_shuffle_enabled
+
+    M, C = layer_input.shape
+    N_total = 2 * n + n * n
+    device = layer_input.device
+    if h_post is None:
+        h_post = torch.empty(M, n, 1, dtype=torch.float32, device=device)
+    if h_res is None:
+        h_res = torch.empty(M, n, n, dtype=torch.float32, device=device)
+    if layer_input_out is None:
+        layer_input_out = torch.empty(M, C, dtype=torch.bfloat16, device=device)
+    if residual_out is None:
+        residual_out = torch.empty_like(residual_in)
+    # Like aiter.mhc_fused_post_pre: the residual is shuffled only where the
+    # shuffled layout is in use (mhc_res_repeat / mhc_res_shuffle apply the same
+    # per-M check), otherwise the caller already holds the plain layout.
+    res_shuffled = bool(res_preshuffle) and mhc_res_shuffle_enabled(M)
+    split_k = _mhc_post_pre_gluon_split_k(M, C, res_shuffled)
+
+    gemm_out_pad = torch.empty(
+        split_k, M, _GLUON_N_PAD, dtype=torch.float32, device=device
+    )
+    gemm_out = gemm_out_pad[:, :, :N_total]
+    gemm_out_sqrsum = torch.empty(split_k, M, dtype=torch.float32, device=device)
+    _mhc_post_pre_gemm_sqrsum_gluon(
+        gemm_out,
+        gemm_out_sqrsum,
+        residual_out,
+        layer_input,
+        residual_in,
+        post_mix,
+        comb_mix,
+        phi.T,  # C-contiguous phi -> the (N, n*C) fn layout, no copy
+        res_shuffled=res_shuffled,
+    )
+    _mhc_pre_reduce_apply_gluon(
+        h_post,
+        h_res,
+        layer_input_out,
+        gemm_out,
+        gemm_out_sqrsum,
+        alphas,
+        bias,
+        residual_out,
+        eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_iters,
+        res_shuffled,
+        norm_weight,
+        norm_eps,
+    )
+    if h_post.ndim == 2:
+        h_post = h_post.unsqueeze(-1)
+    return h_post, h_res, layer_input_out, residual_out
+
+
 def mhc_post_pre(
     layer_input: torch.Tensor,  # (M, C)        bf16 / fp16
     residual_in: torch.Tensor,  # (M, n, C)     bf16 / fp16
@@ -530,6 +923,10 @@ def mhc_post_pre(
     acc_partial: torch.Tensor | None = None,
     acc_sq_partial: torch.Tensor | None = None,
     config: dict | None = None,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 1e-6,
+    w_preshuffle_bf16: bool = False,
+    res_preshuffle: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused mhc_post + (next) mhc_pre across two Triton launches.
 
@@ -546,6 +943,16 @@ def mhc_post_pre(
     The C-tile axis of the split kernel IS the pre's split-K axis (one CTA
     per K-split chunk of size ``n * BLOCK_C`` in the flattened pre input).
 
+    gfx1250: when the inputs fit (n=4, bf16, ``asymmetric_exp_domain=True``,
+    ``sinkhorn_iters > 0``, C % 256 == 0 (% 1024 with ``norm_weight``),
+    contiguous, and a C-contiguous ``phi`` -- ``phi.stride() == (1, n*C)``,
+    i.e. ``fn.T`` of the HIP-layout ``fn``), both launches are Gluon TDM/WMMA
+    kernels: the post + split-K pre GEMM/sqrsum, then the pre reduce/apply
+    (the counterpart of HIP ``mhc_pre_big_fuse`` / ``_rmsnorm``). ``config``
+    is ignored there, and ``h_post`` / ``h_res`` default to fp32 instead of
+    ``layer_input.dtype``. ``norm_weight``, ``w_preshuffle_bf16`` and
+    ``res_preshuffle`` are only supported on that path.
+
     Pipeline:
         residual_out[m, j, c] = post_mix[m, j] * layer_input[m, c]
                               + sum_h comb_mix[m, h, j] * residual_in[m, h, c]
@@ -559,7 +966,8 @@ def mhc_post_pre(
         residual_in:        (M, n, C) bf16 / fp16, prev-layer multi-stream residual
         post_mix:           (M, n) or (M, n, 1) fp32, from preceding mhc_pre
         comb_mix:           (M, n, n) fp32, from preceding mhc_pre; [src, dst]
-        phi:                (n*C, N) bf16 / fp16, next pre's projection matrix
+        phi:                (n*C, N) bf16 / fp16 / fp32, next pre's projection
+                            matrix; N-contiguous or C-contiguous (``fn.T``)
         alphas:             (3,) fp32 — ``[alpha_pre, alpha_post, alpha_res]``.
                             Loaded by the kernel via tl.load; pass the
                             ``hc_scale`` parameter tensor unchanged.
@@ -593,6 +1001,17 @@ def mhc_post_pre(
                             get_mhc_config("MHC_FUSED", M, C, mode="sinkhorn")
                             when None. NUM_KSPLIT is ignored — the split kernel's
                             grid uses ``cdiv(C, BLOCK_C)`` K-splits.
+        norm_weight:        optional (C,) bf16: fuse the next sub-layer's
+                            RMSNorm into ``layer_input_out`` (``norm_eps``), as
+                            HIP ``mhc_pre_big_fuse_rmsnorm`` does. gfx1250 only.
+        w_preshuffle_bf16:  ``phi`` is ``mhc_shuffle_fn(fn).T`` (int32 (K, N)
+                            view of the packed bf16 hi/lo weights) instead of
+                            fp32. gfx1250 only.
+        res_preshuffle:     ``residual_in`` / ``residual_out`` use the shuffled
+                            layout of ``mhc_res_shuffle`` (applied for the M
+                            where ``mhc_res_shuffle_enabled(M)``, plain
+                            otherwise -- the same per-M rule as
+                            ``aiter.mhc_fused_post_pre``). gfx1250 only.
 
     Returns ``(h_post, h_res, layer_input_out, residual_out)``:
         h_post:          (M, n, 1)  hc_post_mult_value * sigmoid(H^post)
@@ -646,6 +1065,51 @@ def mhc_post_pre(
 
     device = layer_input.device
     dtype = layer_input.dtype
+
+    if _mhc_post_pre_gluon_supported(
+        layer_input,
+        residual_in,
+        phi,
+        alphas,
+        bias,
+        n,
+        sinkhorn_iters,
+        asymmetric_exp_domain,
+        residual_out,
+        layer_input_out,
+        norm_weight,
+        w_preshuffle_bf16,
+        h_post,
+        h_res,
+    ):
+        return _mhc_post_pre_gluon_gfx1250(
+            layer_input,
+            residual_in,
+            post_mix,
+            comb_mix,
+            phi,
+            alphas,
+            bias,
+            n,
+            eps,
+            hc_pre_eps,
+            hc_post_mult_value,
+            sinkhorn_iters,
+            hc_sinkhorn_eps,
+            norm_weight,
+            norm_eps,
+            res_preshuffle,
+            h_post,
+            h_res,
+            layer_input_out,
+            residual_out,
+        )
+    if norm_weight is not None or w_preshuffle_bf16 or res_preshuffle:
+        raise NotImplementedError(
+            "mhc_post_pre: norm_weight / w_preshuffle_bf16 / res_preshuffle are only "
+            "implemented by the gfx1250 Gluon path, whose requirements these inputs "
+            "do not meet (see _mhc_post_pre_gluon_supported)"
+        )
 
     N_POW2 = triton.next_power_of_2(n)
     N_POW2_RES = triton.next_power_of_2(n_squared)

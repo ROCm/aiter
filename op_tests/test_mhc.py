@@ -949,12 +949,18 @@ def test_mhc_post_pre(
     # print(f"next_residual_ref: {next_residual_ref}")
     # print(f"next_residual_fused: {next_residual_fused}")
 
+    # gfx1250: Triton mhc_post_pre runs the Gluon kernels and takes the same
+    # HIP-side inputs as the fused call above (packed fn, shuffled residual,
+    # fused RMSNorm) -- the ATOM configuration. Other archs: plain fp32 inputs.
+    triton_hip_layouts = get_gfx_runtime() == "gfx1250"
     run_triton = (
-        _HAS_TRITON_MHC_POST_PRE and not fuse_rmsnorm and m <= TRITON_MHC_POST_PRE_MAX_M
+        _HAS_TRITON_MHC_POST_PRE
+        and (triton_hip_layouts or not fuse_rmsnorm)
+        and m <= TRITON_MHC_POST_PRE_MAX_M
     )
-    if fuse_rmsnorm:
+    if fuse_rmsnorm and not triton_hip_layouts:
         aiter.logger.info(
-            "skip Triton mhc_post_pre: fuse_rmsnorm (Triton has no fused RMSNorm)"
+            "skip Triton mhc_post_pre: fuse_rmsnorm (gfx1250 Gluon path only)"
         )
     elif m > TRITON_MHC_POST_PRE_MAX_M:
         aiter.logger.info(
@@ -964,13 +970,28 @@ def test_mhc_post_pre(
         )
 
     if run_triton:
-        # phi layout (K, N) = (n*C, hc_mult3); fp32 matches HIP ``fn`` for exp-domain SK.
-        phi = fn.T.contiguous()
+        # phi layout (K, N) = (n*C, hc_mult3): the C-contiguous view of the
+        # HIP-layout fn (fp32, or the mhc_shuffle_fn packing), no copy.
+        if triton_hip_layouts:
+            phi = fn_gemm.T
+            triton_residual_in = residual_in_fused
+            triton_kwargs = {
+                "w_preshuffle_bf16": bool(packed),
+                "res_preshuffle": bool(res_preshuffle),
+            }
+            if fuse_rmsnorm:
+                triton_kwargs.update(
+                    norm_weight=norm_weight, norm_eps=extra_args["norm_eps"]
+                )
+        else:
+            phi = fn.T
+            triton_residual_in = residual_in
+            triton_kwargs = {}
         post_mix_2d = post_layer_mix.squeeze(-1)
         (h_post_t, h_res_t, layer_input_t, residual_out_t), triton_us = run_perftest(
             triton_mhc_post_pre,
             layer_input,
-            residual_in,
+            triton_residual_in,
             post_mix_2d,
             comb_res_mix,
             phi,
@@ -983,7 +1004,10 @@ def test_mhc_post_pre(
             sinkhorn_iters=extra_args["sinkhorn_repeat"],
             asymmetric_exp_domain=True,
             hc_sinkhorn_eps=extra_args["hc_sinkhorn_eps"],
+            **triton_kwargs,
         )
+        if triton_hip_layouts and shuffled:
+            residual_out_t = mhc_res_unshuffle(residual_out_t)
         h_post_t = h_post_t.to(post_mix_ref.dtype)
         h_res_t = h_res_t.to(comb_mix_ref.dtype)
         layer_input_t = layer_input_t.to(layer_input_ref.dtype)
