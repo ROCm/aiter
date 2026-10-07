@@ -1121,7 +1121,6 @@ def build_module(
     third_party,
     hipify=False,
     flags_extra_hip_per_source=None,
-    ninja_workers: int | None = None,
     build_after_wait=False,
 ):
     os.makedirs(bd_dir, exist_ok=True)
@@ -1358,7 +1357,6 @@ def build_module(
                 # We install a stable module name. Let Ninja check incremental
                 # dependencies and retry failures, not the Python loader cache.
                 use_versioner=False,
-                ninja_workers=ninja_workers,
             )
             validate_generation()
             if is_python_module and not is_standalone:

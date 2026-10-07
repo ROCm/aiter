@@ -1,5 +1,6 @@
 """Worker limits shared by setup and AITER runtime code."""
 
+import contextlib
 import importlib
 import logging
 import os
@@ -405,6 +406,26 @@ def adopt_legacy_max_jobs() -> None:
         FutureWarning,
         stacklevel=2,
     )
+
+
+@contextlib.contextmanager
+def worker_ceiling(workers: int):
+    """Pin the AITER worker ceiling while nested compilers are launched.
+
+    A parent pool that divides its budget across outer workers sets each
+    child's Ninja budget here instead of threading it through every
+    ``build_module`` call. The previous ``AITER_MAX_JOBS`` value is restored
+    on exit, including when the body raises.
+    """
+    previous = os.environ.get(_WORKER_ENV)
+    os.environ[_WORKER_ENV] = str(max(1, int(workers)))
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(_WORKER_ENV, None)
+        else:
+            os.environ[_WORKER_ENV] = previous
 
 
 def _get_legacy_worker_limit() -> int | None:

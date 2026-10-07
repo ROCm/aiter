@@ -398,6 +398,23 @@ class WorkerAwarenessTest(unittest.TestCase):
         with patch.dict(os.environ, {"AITER_MAX_JOBS": "1"}, clear=True):
             self.assertEqual(get_worker_count(), 1)
 
+    def test_worker_ceiling_scopes_nested_compiler_budget(self):
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            worker_limits, "_automatic_worker_snapshot", return_value=(8, 8, None)
+        ):
+            with worker_limits.worker_ceiling(3):
+                self.assertEqual(os.environ["AITER_MAX_JOBS"], "3")
+                self.assertEqual(get_compile_worker_count(), 3)
+            self.assertNotIn("AITER_MAX_JOBS", os.environ)
+
+    def test_worker_ceiling_restores_previous_ceiling_on_error(self):
+        with patch.dict(os.environ, {"AITER_MAX_JOBS": "5"}, clear=True):
+            with self.assertRaises(RuntimeError):
+                with worker_limits.worker_ceiling(2):
+                    self.assertEqual(os.environ["AITER_MAX_JOBS"], "2")
+                    raise RuntimeError("boom")
+            self.assertEqual(os.environ["AITER_MAX_JOBS"], "5")
+
     def test_nonpositive_aiter_max_jobs_is_clamped_without_mutating_environment(self):
         for raw_value in ("0", "-7"):
             with self.subTest(raw_value=raw_value), patch.dict(

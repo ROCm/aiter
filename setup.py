@@ -10,7 +10,7 @@ import sys
 from setuptools import Distribution, setup
 from setuptools.command.build_ext import build_ext
 
-from aiter_worker_limits import adopt_legacy_max_jobs, get_worker_count
+from aiter_worker_limits import adopt_legacy_max_jobs, get_worker_count, worker_ceiling
 
 adopt_legacy_max_jobs()
 
@@ -347,7 +347,7 @@ if PREBUILD_KERNELS != 0:
             except Exception:  # noqa: BLE001,S110
                 pass
 
-        def build_one_module(one_opt_args, ninja_workers=None):
+        def build_one_module(one_opt_args):
             flags_cc = list(one_opt_args["flags_extra_cc"]) + [
                 f"-DPREBUILD_KERNELS={PREBUILD_KERNELS}"
             ]
@@ -368,12 +368,14 @@ if PREBUILD_KERNELS != 0:
                 is_standalone=False,
                 torch_exclude=one_opt_args.get("torch_exclude", False),
                 third_party=one_opt_args["third_party"],
-                ninja_workers=ninja_workers,
             )
 
         total_workers = get_worker_count()
         outer_workers = min(total_workers, max(1, len(all_opts_args_build)))
-        ninja_workers = max(1, total_workers // outer_workers)
+        # Split the budget between the outer module pool and each module's
+        # inner Ninja invocation. The inner budget travels through the shared
+        # worker-ceiling env var instead of a build_module() argument.
+        inner_workers = max(1, total_workers // outer_workers)
 
         # --- FlyDSL AOT pre-compilation (MOE + GEMM, before CK) ---
         _prev_aot_import = os.environ.get("AITER_AOT_IMPORT")
@@ -390,15 +392,9 @@ if PREBUILD_KERNELS != 0:
                 os.environ["AITER_AOT_IMPORT"] = _prev_aot_import
 
         # --- CK kernel builds ---
-        with ThreadPoolExecutor(max_workers=outer_workers) as executor:
-            list(
-                executor.map(
-                    lambda one_opt_args: build_one_module(
-                        one_opt_args, ninja_workers=ninja_workers
-                    ),
-                    all_opts_args_build,
-                )
-            )
+        with worker_ceiling(inner_workers):
+            with ThreadPoolExecutor(max_workers=outer_workers) as executor:
+                list(executor.map(build_one_module, all_opts_args_build))
 
         # Retune GEMM shapes on the live GPU after the main build phase.
         if PRETUNE_MODULES:

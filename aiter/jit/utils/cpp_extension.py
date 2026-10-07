@@ -1235,7 +1235,6 @@ def _jit_compile(
     hipify=True,
     extra_cuda_cflags_per_source=None,
     use_versioner=True,
-    ninja_workers: int | None = None,
 ) -> None:
     if is_python_module and is_standalone:
         raise ValueError(
@@ -1349,7 +1348,6 @@ def _jit_compile(
                         is_standalone=is_standalone,
                         torch_exclude=torch_exclude,
                         extra_cuda_cflags_per_source=extra_cuda_cflags_per_source,
-                        ninja_workers=ninja_workers,
                     )
             elif verbose:
                 print(
@@ -1382,7 +1380,6 @@ def _write_ninja_file_and_compile_objects(
     build_directory: str,
     verbose: bool,
     with_cuda: bool | None,
-    ninja_workers: int | None = None,
 ) -> None:
     verify_ninja_availability()
 
@@ -1415,7 +1412,6 @@ def _write_ninja_file_and_compile_objects(
         # It would be better if we could tell users the name of the extension
         # that failed to build but there isn't a good way to get it here.
         error_prefix="Error compiling objects for extension",
-        ninja_workers=ninja_workers,
     )
 
 
@@ -1433,7 +1429,6 @@ def _write_ninja_file_and_build_library(
     is_standalone: bool = False,
     torch_exclude: bool = False,
     extra_cuda_cflags_per_source=None,
-    ninja_workers: int | None = None,
 ) -> None:
     verify_ninja_availability()
 
@@ -1470,7 +1465,6 @@ def _write_ninja_file_and_build_library(
         build_directory,
         verbose,
         error_prefix=f"Error building extension '{name}'",
-        ninja_workers=ninja_workers,
     )
 
 
@@ -1549,10 +1543,7 @@ def _get_rocm_arch_flags(cflags: list[str] | None = None) -> list[str]:
     return flags
 
 
-def _get_num_workers(verbose: bool, ninja_workers: int | None = None) -> int:
-    if ninja_workers is not None:
-        return max(1, int(ninja_workers))
-
+def _get_num_workers(verbose: bool) -> int:
     max_jobs = get_compile_worker_count()
     if verbose:
         print(
@@ -1566,12 +1557,11 @@ def _run_ninja_build(
     build_directory: str,
     verbose: bool,
     error_prefix: str,
-    ninja_workers: int | None = None,
 ) -> None:
     # Stream compiler progress without changing the application logger format.
     verbose = verbose or os.getenv("AITER_JIT_VERBOSE", "0") == "1"
     command = ["ninja", "-v"]
-    num_workers = _get_num_workers(verbose, ninja_workers=ninja_workers)
+    num_workers = _get_num_workers(verbose)
     command.extend(["-j", str(num_workers)])
     env = os.environ.copy()
 
