@@ -1323,90 +1323,9 @@ choose_bucket(Counter<T, IdxT>* counter, IdxT const* histogram, const IdxT k, in
 }
 
 /**
- * Scan a local histogram and choose the crossing bucket without writing the
- * inclusive prefixes back to LDS.  The ordinary scan()+choose_bucket() pair
- * stores every prefix through BlockStore, synchronizes, and immediately reads
- * the same values again.  The 32K fp32 LDS-tail path clears the histogram
- * after every choice, so keeping both the original count and inclusive prefix
- * in registers avoids that otherwise-dead round trip.
- */
-template <typename T, typename IdxT, int BitsPerPass, int BlockSize>
-__device__ void scan_and_choose_bucket(Counter<T, IdxT>* counter,
-                                       IdxT const* histogram,
-                                       const IdxT k,
-                                       int const start_bit)
-{
-    constexpr int num_buckets = calc_num_buckets<BitsPerPass>();
-    if constexpr(num_buckets >= BlockSize)
-    {
-        static_assert(num_buckets % BlockSize == 0);
-        constexpr int items_per_thread = num_buckets / BlockSize;
-        using BlockLoad = hipcub::BlockLoad<IdxT,
-                                             BlockSize,
-                                             items_per_thread,
-                                             hipcub::BLOCK_LOAD_TRANSPOSE>;
-        using BlockScan = hipcub::BlockScan<IdxT, BlockSize>;
-
-        __shared__ union
-        {
-            typename BlockLoad::TempStorage load;
-            typename BlockScan::TempStorage scan;
-        } temp_storage;
-
-        IdxT counts[items_per_thread];
-        IdxT inclusive[items_per_thread];
-        BlockLoad(temp_storage.load).Load(histogram, counts);
-        __syncthreads();
-        BlockScan(temp_storage.scan).InclusiveSum(counts, inclusive);
-
-#pragma unroll
-        for(int item = 0; item < items_per_thread; ++item)
-        {
-            IdxT const prev = inclusive[item] - counts[item];
-            IdxT const cur  = inclusive[item];
-            if(prev < k && cur >= k)
-            {
-                int const bucket = static_cast<int>(threadIdx.x) * items_per_thread + item;
-                counter->k       = k - prev;
-                counter->len     = cur - prev;
-                using Bits       = typename aiter::radix_traits<T>::UnsignedBits;
-                counter->kth_value_bits |= static_cast<Bits>(bucket)
-                                           << start_bit;
-            }
-        }
-    }
-    else
-    {
-        using BlockScan = hipcub::BlockScan<IdxT, BlockSize>;
-        __shared__ typename BlockScan::TempStorage temp_storage;
-
-        IdxT count = 0;
-        if(threadIdx.x < num_buckets)
-        {
-            count = histogram[threadIdx.x];
-        }
-        IdxT inclusive = 0;
-        BlockScan(temp_storage).InclusiveSum(count, inclusive);
-
-        if(threadIdx.x < num_buckets)
-        {
-            IdxT const prev = inclusive - count;
-            if(prev < k && inclusive >= k)
-            {
-                counter->k   = k - prev;
-                counter->len = inclusive - prev;
-                using Bits   = typename aiter::radix_traits<T>::UnsignedBits;
-                counter->kth_value_bits |= static_cast<Bits>(threadIdx.x)
-                                           << start_bit;
-            }
-        }
-    }
-}
-
-/**
  * The crossing bucket, without a block-wide prefix sum.
  *
- * `scan_and_choose_bucket` builds the inclusive prefix of all `num_buckets`
+ * A hipcub block-wide scan builds the inclusive prefix of all `num_buckets`
  * counts and then discards every one of them except the single bucket where
  * the running total crosses k.  This reduces per thread, scans only the
  * per-wave totals, and walks the handful of counts belonging to the one thread
@@ -1423,8 +1342,8 @@ __device__ void scan_and_choose_bucket(Counter<T, IdxT>* counter,
  *   M=1       0.703     0.471     0.170
  *   M=1024    2.362     1.777     1.133
  *   M=4096    8.863     6.937     4.494
- * Cross-checked against `scan_and_choose_bucket` on 20 random histograms per
- * k, all four forms agreeing on the chosen bucket.
+ * Cross-checked against the hipcub scan on 20 random histograms per k, all
+ * four forms agreeing on the chosen bucket.
  *
  * `wave_sums` is caller-owned scratch of `BlockSize / WARP_SIZE` entries; the
  * caller must have synchronized since its last use and must synchronize again
