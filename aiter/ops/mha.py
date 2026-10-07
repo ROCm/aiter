@@ -3682,6 +3682,9 @@ def flash_attn_varlen_func(
     cu_seqlens_q_padded: torch.Tensor | None = None,
     cu_seqlens_k_padded: torch.Tensor | None = None,
     sink_ptr: Tensor | None = None,
+    q_descale: Tensor | None = None,
+    k_descale: Tensor | None = None,
+    v_descale: Tensor | None = None,
 ):
     if block_table is not None and (
         cu_seqlens_q_padded is not None or cu_seqlens_k_padded is not None
@@ -3842,6 +3845,9 @@ def flash_attn_varlen_func(
             block_table=block_table,
             out=out,
             sink=sink_ptr,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
         )
         if _flydsl_result is not None:
             return _flydsl_result
