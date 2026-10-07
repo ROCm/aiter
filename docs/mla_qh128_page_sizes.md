@@ -114,10 +114,22 @@ performance. The kernels use FP8-rounded probabilities and delayed softmax
 rescaling, so tests compare against FP32 attention with the stated tolerance,
 not bitwise equality between the two algorithms.
 
-The page1 CO is built from `mla_v3_qh128_ps1.sp3`, source SHA256
-`662da95b53c1bf03e6b72ad043ef25b9a4651be9a44983c7fa988dcd9d45a88f`.
-Rebuilding with the existing `--raw-qk-cover` profile reproduces the original
-CO `6f337d634fe1afc38028f15c1e6133ab2806d20c94c8a03329277acf0160eddc` byte for byte.
-The packaged CO uses the AITER export symbol and has SHA256
-`09c7c911eca85e1e35e9261fd299a4a9ac30b5490b0c36391dc8a0e338e625be`;
-its instruction image is unchanged. The page64 CO is unchanged by this addition.
+## Code object provenance
+
+The updated kernels schedule Q/page-index loads and bounded index prefetch
+earlier, and interleave softmax work with the QK/PV matrix operations. The
+page1 schedule accommodates its four gather TDM operations per mainloop;
+shuffled page64 uses two. They use the 80/88-byte ABIs listed above.
+
+Both code objects were independently rebuilt from their selected SP3 sources.
+Packaging uses the export symbols already registered in `mla_asm.csv`; each
+packaged ELF has a byte-identical `.text` section to its source rebuild.
+
+| Kernel | SP3 source SHA256 | Packaged CO SHA256 |
+|---|---|---|
+| Page1 | `b6aa335f40938ae440d8d6ab18d8901f90c28eaf75bb1b9da1e1dbfd90a353b7` | `79a74f47093139cbb8745a04a3659a6323a9f878cfc5fc7a78992565c774f8ac` |
+| Shuffled page64 | `e647b4c490465ad03726f73cfc5d9352c3535aa99a787d26ee7416d2f77c31cb` | `afd1b9c61332af2112801dd57d2bbe9f8561a7926e1bfc142774ae635e220972` |
+
+The source filenames are `mla_v3_qh128_ps1.sp3` and
+`mla_v3_qh128_ps64.sp3`. The builds use the existing `--raw-qk-cover`
+profile; page64 also uses `--layout shuffled --early 66 --late 90 --scalar-pk8`.
