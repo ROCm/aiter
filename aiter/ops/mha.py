@@ -2475,7 +2475,10 @@ def _flash_attn_backward(
     how_v3_bf16_cvt: int | None = 1,
     sink: Tensor | None = None,
     d_sink: Tensor | None = None,
+    softmax_d: Tensor | None = None,
 ) -> torch.Tensor:
+    """``softmax_d``: D = rowsum(dO * O), fp32 [b, hq, sq], precomputed by the caller; the v3 kernels then skip
+    computing it (the CK path computes its own)."""
     # rtna & rtz are deprecated in gfx950
     if get_gfx() == "gfx950" and how_v3_bf16_cvt != 0:
         how_v3_bf16_cvt = 0
@@ -2563,6 +2566,7 @@ def _flash_attn_backward(
             alibi_slopes,
             rng_state,
             None,
+            softmax_d,
         )
     else:
         (
