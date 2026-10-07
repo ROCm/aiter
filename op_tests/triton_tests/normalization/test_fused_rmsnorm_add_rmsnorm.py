@@ -26,7 +26,7 @@ def reference(x, residual, post_weight, pre_weight):
         * torch.rsqrt(added.square().mean(-1, keepdim=True) + PRE_EPS)
         * (pre_weight.float() + 1.0)
     ).to(torch.bfloat16)
-    return added, pre
+    return added.to(torch.bfloat16), pre
 
 
 @pytest.mark.parametrize("rows, width", [(1, 6656), (64, 6656), (4096, 6656), (7, 257)])
@@ -40,13 +40,14 @@ def test_fused_rmsnorm_add_rmsnorm(rows, width):
     expected_residual, expected_norm = reference(
         x, residual, post_weight, pre_weight
     )
-    residual_out, pre_norm = fused_rmsnorm_add_rmsnorm(
-        x, residual, post_weight, pre_weight, POST_EPS, PRE_EPS
+    residual_out = torch.empty_like(x)
+    pre_norm = fused_rmsnorm_add_rmsnorm(
+        x, residual, post_weight, pre_weight, POST_EPS, PRE_EPS, residual_out
     )
 
-    assert residual_out.dtype == torch.float32
+    assert residual_out.dtype == torch.bfloat16
     assert pre_norm.dtype == torch.bfloat16
-    torch.testing.assert_close(residual_out, expected_residual, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(residual_out, expected_residual, atol=0.02, rtol=0.02)
     torch.testing.assert_close(pre_norm, expected_norm, atol=0.02, rtol=0.02)
 
 
@@ -54,10 +55,14 @@ def test_fused_rmsnorm_add_rmsnorm_torch_compile():
     x = torch.randn((64, 6656), device="cuda", dtype=torch.bfloat16)
     residual = torch.randn_like(x)
     weight = torch.zeros(6656, device="cuda", dtype=torch.bfloat16)
+    compiled_residual = torch.empty_like(x)
+    eager_residual = torch.empty_like(x)
     compiled = torch.compile(fused_rmsnorm_add_rmsnorm, fullgraph=True)
-    actual = compiled(x, residual, weight, weight, POST_EPS, PRE_EPS)
-    expected = fused_rmsnorm_add_rmsnorm(
-        x, residual, weight, weight, POST_EPS, PRE_EPS
+    actual = compiled(
+        x, residual, weight, weight, POST_EPS, PRE_EPS, compiled_residual
     )
-    for got, want in zip(actual, expected):
-        torch.testing.assert_close(got, want, atol=0, rtol=0)
+    expected = fused_rmsnorm_add_rmsnorm(
+        x, residual, weight, weight, POST_EPS, PRE_EPS, eager_residual
+    )
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    torch.testing.assert_close(compiled_residual, eager_residual, atol=0, rtol=0)

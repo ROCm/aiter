@@ -44,6 +44,5 @@ def _fused_rmsnorm_add_rmsnorm_kernel(
     pre_rsqrt = tl.rsqrt(tl.sum(added * added, 0) * inv_width + pre_eps)
     pre_norm = added * pre_rsqrt * (pre_weight + 1.0)
 
-    tl.store(residual_out_ptr + offset, added, valid)
-    # The BF16 destination rounds only the final norm result.
-    tl.store(pre_norm_ptr + offset, pre_norm, valid)
+    tl.store(residual_out_ptr + offset, added.to(tl.bfloat16), valid)
+    tl.store(pre_norm_ptr + offset, pre_norm.to(tl.bfloat16), valid)
