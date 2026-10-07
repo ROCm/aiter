@@ -1050,7 +1050,7 @@ def _stage2_overlap_rate(kernel_rows, idim):
     return (compute + comm - (fused_gemm2 + fused_comm)) / min(compute, comm)
 
 
-def _emit_table(name, rows, max_col_width=100):
+def _emit_table(name, rows, max_col_width=120):
     """Print the rows twice: an aligned frame for whoever opens the log, then the
     one machine-readable line the benchmark driver consumes.
 

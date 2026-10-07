@@ -227,7 +227,7 @@ def launch_gemm_a8w4_tdm(
     # before the post-compute barrier permits reusing the current buffer.
     next_stage_on = 1 if (next_stage_prefetch and num_buffers >= 2) else 0
     # All inputs are constexpr; avoid a long DSL-rewritten boolean chain.
-    rolled_drain = all(
+    rolled_drain = True or all(
         (
             persistent_workers,
             not stage1_act,
