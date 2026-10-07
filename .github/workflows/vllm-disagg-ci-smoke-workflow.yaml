@@ -65,6 +65,7 @@ env:
   CASE_MODEL_FILTER: ${{ inputs.models || '' }}
   CASE_TOPOLOGY_FILTER: ${{ inputs.topologies || '' }}
   AITER_GPU_ARCHS: gfx950
+  AITER_BUILD_MAX_JOBS: "64"
   AITER_WHEEL_ARTIFACT_NAME: aiter-vllm-disagg-wheel-${{ github.run_id }}
 
 jobs:
@@ -123,6 +124,7 @@ jobs:
             -e AITER_USE_SYSTEM_TRITON=1 \
             -e GPU_ARCHS="${AITER_GPU_ARCHS}" \
             -e PREBUILD_KERNELS=0 \
+            -e MAX_JOBS="${AITER_BUILD_MAX_JOBS}" \
             --entrypoint /bin/bash \
             "${BASE_IMAGE}" \
             -lc '
@@ -150,7 +152,7 @@ jobs:
                 "flydsl==${flydsl_version}"
               echo "Prebuilding the gfx950 CKTile A8W8 blockscale module"
               python3 .github/scripts/prebuild_vllm_disagg_cktile.py
-              echo "Building AITER wheel for GPU_ARCHS=${GPU_ARCHS}, PREBUILD_KERNELS=${PREBUILD_KERNELS}"
+              echo "Building AITER wheel for GPU_ARCHS=${GPU_ARCHS}, PREBUILD_KERNELS=${PREBUILD_KERNELS}, MAX_JOBS=${MAX_JOBS}"
               python setup.py bdist_wheel 2>&1 | tee .aiter-build.log
               ls -lh dist/*.whl
               aiter_wheels=(dist/amd_aiter-*.whl)
