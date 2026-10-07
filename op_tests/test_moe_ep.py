@@ -885,7 +885,7 @@ def test_fmoe_ep_mxfp4(
             w2_scale=w2_s,
             num_local_tokens=num_local_tokens,
             num_warmup=3,
-            num_iters=16,
+            num_iters=128,
         )
 
     # Trim to valid prefix (total_recv rows); the [total_recv, trim_M) tail is padding.
