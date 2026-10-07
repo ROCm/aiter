@@ -114,14 +114,13 @@ import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import rocdl as rocdl_ir
 from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels import buffer_ops as bops
 from aiter.ops.flydsl.kernels.dpp_utils import dpp_xor_f32, update_dpp_i32
+from aiter.ops.flydsl.kernels.kernels_common import LOG2E
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
@@ -131,12 +130,12 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
     ptr_buf_tensor,
 )
 
+I32 = fx.Int32
 WAVE = 64
 N_STREAMS = 4
 N_MIX = 24
 PSLOT = 32  # partial row: [0:24] mixes, [24] sum R'^2, [25] sum x1^2
 FP8_GROUP = 32
-LOG2E = 1.4426950408889634
 
 # buffer cache policy bits (gfx950): sc0 = 1, nt = 2
 CM_NT = 2
@@ -167,30 +166,24 @@ def _put(t, idx, val):
     t[idx] = val
 
 
-def _aux(cm):
-    if bops._RAW_PTR_BUFFER_AUX_IS_ATTRIBUTE:
-        return ir.IntegerAttr.get(ir.IntegerType.get_signless(32), cm)
-    return fx.Int32(cm).ir_value()
-
-
+# Stream loads / stores address a byte voffset (dead lanes: the 0x7FFFFFFF OOB sentinel) plus a
+# wave-uniform soffset, with explicit cache bits; element-indexed layout views cannot carry
+# the sentinel, so these stay on the raw buffer ops.
 def _ld(rsrc, voff, soff, n_dw, cm):
     """``n_dw`` dwords at byte offset voff (VGPR) + soff (SGPR); raw i32 vector."""
     ty = T.i32 if n_dw == 1 else T.vec(n_dw, T.i32)
-    return Vec(
-        rocdl_ir.RawPtrBufferLoadOp(
-            ty, rsrc, fx.Int32(voff).ir_value(), fx.Int32(soff).ir_value(), aux=_aux(cm)
-        ).result
-    )
+    return Vec(rocdl.raw_ptr_buffer_load(ty, rsrc, I32(voff), I32(soff), aux=cm))
 
 
 def _st(val, rsrc, voff, soff, cm):
     """Store a scalar / vector at byte offset voff (VGPR) + soff (SGPR)."""
-    rocdl_ir.RawPtrBufferStoreOp(
-        val.ir_value(),
+    bops.buffer_store(
+        val,
         rsrc,
-        fx.Int32(voff).ir_value(),
-        fx.Int32(soff).ir_value(),
-        aux=_aux(cm),
+        I32(voff),
+        cache_modifier=cm,
+        soffset_bytes=I32(soff),
+        offset_is_bytes=True,
     )
 
 
@@ -520,12 +513,16 @@ def compile_mega_mhc(
     F32, BF16, I32 = fx.Float32, fx.BFloat16, fx.Int32
 
     def mfma(a_bf16, b_bf16, acc):
-        return Vec(
-            rocdl.mfma_f32_16x16x32_bf16(
-                T.vec(4, T.f32),
-                [a_bf16.ir_value(), b_bf16.ir_value(), acc.ir_value(), 0, 0, 0],
-            )
-        )
+        """acc + A x B of one 16x16x32 bf16 MFMA on this lane's register operands"""
+        atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, BF16))
+        fa = fx.make_rmem_tensor(8, BF16)
+        fb = fx.make_rmem_tensor(8, BF16)
+        fc = fx.make_rmem_tensor(4, F32)
+        fx.memref_store_vec(a_bf16, fa)
+        fx.memref_store_vec(b_bf16, fb)
+        fx.memref_store_vec(acc, fc)
+        fx.mma_atom_call(atom, fc, fa, fb, fc)
+        return Vec(fx.memref_load_vec(fc))
 
     def bf16x8(v_i32x4):
         return Vec(v_i32x4).bitcast(BF16)
@@ -979,9 +976,9 @@ def compile_mega_mhc(
                             v = x1f * wv
                             amax = F32(0.0)
                             for e in range_constexpr(8):
-                                amax = fx.maximumf(amax, fx.absf(v[e]))
-                            amax = fx.maximumf(amax, amax.shuffle_xor(1, WAVE))
-                            amax = fx.maximumf(amax, amax.shuffle_xor(2, WAVE))
+                                amax = fx.max(amax, fx.absf(v[e]))
+                            amax = fx.max(amax, amax.shuffle_xor(1, WAVE))
+                            amax = fx.max(amax, amax.shuffle_xor(2, WAVE))
                             zero = amax == F32(0.0)
                             scale = zero.select(F32(1.0), amax * F32(1.0 / FP8_MAX))
                             inv = zero.select(F32(0.0), F32(FP8_MAX) * rcp(amax))
@@ -1102,12 +1099,7 @@ def compile_mega_mhc(
                 n_acc, n_sq, n_tiles = 2 * MT, MT * NGT, len(tiles0)
 
                 def pack(acc, sqr, sqx, tiles):
-                    return (
-                        [a.ir_value() for a in acc]
-                        + [F32(x).ir_value() for x in sqr]
-                        + [F32(x).ir_value() for x in sqx]
-                        + [Vec(t).ir_value() for t in tiles]
-                    )
+                    return [*acc, *sqr, *sqx, *tiles]
 
                 def unpack(state):
                     acc = [Vec(state[i]) for i in range_constexpr(n_acc)]
@@ -1282,7 +1274,7 @@ def compile_mega_mhc(
                         a = m_c * rstd * LT.scale_t[2] + LT.base_t[8 + e]
                         mx = a
                         for off in (1, 2):
-                            mx = fx.maximumf(mx, xor_gates(mx, off))
+                            mx = fx.max(mx, xor_gates(mx, off))
                         P = exp(a - mx)
                         rs = P
                         for off in (1, 2):
@@ -1757,12 +1749,10 @@ def compile_mega_mhc(
             n_g = I32(fx.grid_dim.x)
             t_pro = body(tok0, None, True, views)  # block w's k-step 0 tile
             n_t = len(t_pro)
-            for b, st_p in range(
-                w_id, n_blk, n_g, init=[Vec(t).ir_value() for t in t_pro]
-            ):
+            for b, st_p in range(w_id, n_blk, n_g, init=list(t_pro)):
                 tiles_c = [Vec(st_p[i]) for i in range_constexpr(n_t)]
                 t_nx = body(I32(b) * BM, tiles_c, False, views)
-                _ = yield [Vec(t).ir_value() for t in t_nx]
+                _ = yield list(t_nx)
         elif fx.const_expr(KS > 1):
             # the XCD mapping pads the grid to whole groups of 8 token blocks
             if tok0 < n_tok:

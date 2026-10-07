@@ -264,16 +264,17 @@ def test_mega_mhc(T, H, mode, out_dtype):
     nbytes = _traffic(T, H, mode, out_dtype)
     ret = {"gfx": get_gfx()}
     for name, fn in candidates.items():
+        if not T:  # empty-batch edge case: the call must return, nothing to time
+            fn()
+            ret[f"{name} err"] = 0.0
+            continue
         out, us = run_perftest(fn)
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
-        ret[f"{name} err"] = (
-            check_outputs(name, out, ref, out_dtype, mode) if T else 0.0
-        )
+        ret[f"{name} err"] = check_outputs(name, out, ref, out_dtype, mode)
     if T:
         ret["flydsl graph err"] = _graph_err(candidates["flydsl"], ref, out_dtype, mode)
-    ret["floor us"] = nbytes / 6.5e6  # MI355X ~6.5 TB/s achievable HBM
     return ret
 
 
