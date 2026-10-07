@@ -227,3 +227,42 @@ class TestSplitPolicy:
         # The gates the occupancy path still honours.
         assert policy.min_seq_len_kv == 4096
         assert policy.min_tiles_per_split == 8
+
+
+def test_artifact_metadata_matches_measured_table(monkeypatch):
+    """Catches FlyDSL changes that break the metadata read or desync the table."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("needs a GPU")
+    from aiter.jit.utils.chip_info import get_gfx
+    from aiter.ops.flydsl import fp8_mqa_logits_kernels as kernels
+
+    arch = get_gfx()
+    if arch not in occ_mod._MEASURED_OCCUPANCY:
+        pytest.skip(f"no occupancy table for {arch}")
+    seq_len, seq_len_kv, num_heads, head_size = 128, 4096, 32, 128
+    fp8 = torch.float8_e4m3fnuz if arch == "gfx942" else torch.float8_e4m3fn
+    seen = {}
+    real = kernels._auto_num_splits
+
+    def spy(*args, **kwargs):
+        seen.update(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(kernels, "_auto_num_splits", spy)
+    kernels.flydsl_fp8_mqa_logits(
+        torch.randn(seq_len, num_heads, head_size, device="cuda").to(fp8),
+        torch.randn(seq_len_kv, head_size, device="cuda").to(fp8),
+        torch.ones(seq_len_kv, device="cuda"),
+        torch.ones(seq_len, num_heads, device="cuda"),
+        torch.zeros(seq_len, dtype=torch.int32, device="cuda"),
+        torch.full((seq_len,), seq_len_kv, dtype=torch.int32, device="cuda"),
+    )
+    assert {"launcher", "variant"} <= seen.keys(), "split heuristic not reached"
+    fields = occ_mod._artifact_metadata(seen["launcher"])
+    assert fields is not None, "AMDHSA metadata no longer readable from the artifact"
+    occupancy = occ_mod._occupancy_from_metadata(
+        fields, arch, torch.cuda.current_device()
+    )
+    key = (seen["variant"], num_heads, head_size)
+    assert occupancy >= occ_mod._MEASURED_OCCUPANCY[arch][key]

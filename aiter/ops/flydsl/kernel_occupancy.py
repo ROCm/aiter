@@ -3,25 +3,14 @@
 
 """Blocks-per-CU of a compiled FlyDSL fp8_mqa_logits kernel.
 
-Occupancy is a property of the kernel instance, not the device: on gfx942
-``mfma_r2_w4`` holds 8 blocks/CU at num_heads=16 and 2 at num_heads=128.
-
-FlyDSL JITs, so there is no ``hipFunction_t`` to query before first dispatch.
-The artifact carries the AMDHSA metadata occupancy is derived from, so this
-reads that and applies the hardware's allocation rules. Verified equal to
-``hipModuleOccupancyMaxActiveBlocksPerMultiprocessor`` on every buildable
-config: 216/216 on gfx942, 308/308 on gfx950.
-
-Resolution order is artifact metadata, then ``_MEASURED_OCCUPANCY``, then
-``DEFAULT_OCCUPANCY``. The table is the first-launch path, not dead code --
-nothing has an artifact until it has run once.
+Read from the artifact's AMDHSA metadata once the kernel has run, from
+``_MEASURED_OCCUPANCY`` before that, else ``DEFAULT_OCCUPANCY``.
 """
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from functools import lru_cache
 
 import torch
 
@@ -33,16 +22,10 @@ DEFAULT_OCCUPANCY = 2
 
 @dataclass(frozen=True)
 class _ArchLimits:
-    """Register-file and wave-slot limits behind the blocks-per-CU derivation.
+    """Register-file and wave-slot limits per arch.
 
-    ``vgpr_granule`` is the allocation quantum: 86 VGPRs are charged as 88.
-
-    ``unified_agpr`` says whether AGPRs share the VGPR file (CDNA3) or sit in
-    a separate one (CDNA4), i.e. whether a wave's demand is the sum or the max
-    of the two counts. Load-bearing on gfx950, whose bkv256 variants reach
-    vgpr=452/agpr=200: the sum overflows the 512-VGPR file and predicts
-    occupancy 1 where hardware reports 2. Every gfx942 kernel here has agpr=0,
-    so the two rules coincide on that arch.
+    ``unified_agpr``: AGPRs share the VGPR file (CDNA3) or have their own
+    (CDNA4), so a wave needs the sum or the max of the two counts.
     """
 
     vgpr_per_simd: int
@@ -69,10 +52,7 @@ _ARCH_LIMITS = {
     ),
 }
 
-# Keyed by (variant, num_heads, head_size); the entry is the minimum over the
-# convert_*_fn / clean_logits build flags, which can shift the VGPR count
-# across an allocation boundary.
-#
+# (variant, num_heads, head_size) -> min over build flags.
 # Regenerate with op_tests/flydsl/gen_fp8_mqa_logits_occupancy.py.
 _MEASURED_OCCUPANCY = {
     "gfx942": {
@@ -149,8 +129,6 @@ _MEASURED_OCCUPANCY = {
         ("mfma_r4_w4", 128, 64): 2,
         ("mfma_r4_w4", 128, 128): 2,
     },
-    # Most gfx950 variants stage KV through LDS, so these are largely
-    # LDS-bound rather than register-bound.
     "gfx950": {
         ("mfma16x16x128_bkv128_r1_w1", 16, 128): 16,
         ("mfma16x16x128_bkv128_r1_w1", 32, 128): 16,
@@ -317,13 +295,10 @@ _WORKGROUP_RE = re.compile(r"reqd_workgroup_size = array<i32: (\d+)")
 
 
 def _artifact_metadata(launcher) -> dict | None:
-    """AMDHSA resource metadata of *launcher*'s compiled kernel, or None.
-
-    None is normal, not an error: ``_run_compiled`` attaches ``_cf`` only on
-    the first dispatch.
-    """
+    """AMDHSA resource metadata of *launcher*'s compiled kernel, or None
+    before its first dispatch."""
     artifact = getattr(getattr(launcher, "_cf", None), "_keepalive", None)
-    ir_text = getattr(artifact, "_ir_text", None)
+    ir_text = getattr(artifact, "ir", None)
     if not ir_text:
         return None
     body = _METADATA_RE.search(ir_text)
@@ -338,12 +313,8 @@ def _artifact_metadata(launcher) -> dict | None:
 
 
 def _occupancy_from_metadata(fields: dict, arch: str, device_index: int) -> int | None:
-    """Blocks resident per CU implied by *fields*: the binding minimum of the
-    register-file, wave-slot and LDS limits.
-
-    No workgroups-per-CU cap: HIP reports none here, and imposing 16
-    disagreed with it on the 13 smallest kernels.
-    """
+    """Blocks resident per CU: the minimum of the register, wave-slot and LDS
+    limits. No workgroups-per-CU cap, matching HIP."""
     limits = _ARCH_LIMITS.get(arch)
     threads = fields.get("threads_per_block", 0)
     if limits is None or threads <= 0:
@@ -373,11 +344,6 @@ def _occupancy_from_metadata(fields: dict, arch: str, device_index: int) -> int 
     return max(1, min(by_registers, by_wave_slots, by_lds))
 
 
-@lru_cache(maxsize=64)
-def _measured_occupancy(arch: str, variant: str, num_heads: int, head_size: int):
-    return _MEASURED_OCCUPANCY.get(arch, {}).get((variant, num_heads, head_size))
-
-
 def kernel_occupancy(
     launcher,
     *,
@@ -387,15 +353,20 @@ def kernel_occupancy(
     head_size: int,
     device_index: int,
 ) -> int:
-    """Blocks of *launcher* that fit concurrently on one CU (>= 1).
-
-    Never raises: a launch heuristic must not fail because a resource query
-    did.
+    """Blocks of *launcher* that fit concurrently on one CU (>= 1). Never
+    raises. Cached on the launcher once read from its artifact.
     """
+    cached = getattr(launcher, "_aiter_occupancy", None)
+    if cached is not None:
+        return cached
     fields = _artifact_metadata(launcher)
     if fields is not None:
         occupancy = _occupancy_from_metadata(fields, arch, device_index)
         if occupancy is not None:
+            try:
+                launcher._aiter_occupancy = occupancy
+            except AttributeError:
+                pass
             return occupancy
-    measured = _measured_occupancy(arch, variant, num_heads, head_size)
+    measured = _MEASURED_OCCUPANCY.get(arch, {}).get((variant, num_heads, head_size))
     return measured if measured is not None else DEFAULT_OCCUPANCY
