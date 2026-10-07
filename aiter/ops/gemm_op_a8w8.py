@@ -170,7 +170,7 @@ def _parse_flydsl_kernel_name(kernel_name: str):
     return (tm, tn, tk, acp, wpe, xcd_swizzle, lds_stage, scheduler, k_split)
 
 
-_SPLITK_SCALE_MODE_FROM_CODE = {"bs": "blockscale", "mx": "mx128"}
+_SPLITK_SCALE_MODE_FROM_CODE = {"bs": "blockscale"}
 
 
 def _parse_flydsl_splitk_kernel_name(kernel_name: str):
@@ -180,7 +180,7 @@ def _parse_flydsl_splitk_kernel_name(kernel_name: str):
     import re
 
     m = re.match(
-        r"flydsl_bpreshuffle_splitk_(\d+)x(\d+)x(\d+)_sk(\d+)_\w+_\w+_\w+_(\d+)x(\d+)(?:x(\d+))?(?:x(\d+))?(?:_([A-Za-z][A-Za-z0-9]*))?(?:_sm(ep|bs|mx))?(?:_mb([01]))?$",
+        r"flydsl_bpreshuffle_splitk_(\d+)x(\d+)x(\d+)_sk(\d+)_\w+_\w+_\w+_(\d+)x(\d+)(?:x(\d+))?(?:x(\d+))?(?:_([A-Za-z][A-Za-z0-9]*))?(?:_sm(ep|bs))?(?:_mb([01]))?$",
         kernel_name,
     )
     if m is None:
@@ -1370,63 +1370,6 @@ def gemm_a8w8_blockscale_bpreshuffle(
         and x_scale.dtype == dtypes.fp8_e8m0
         and w_scale.dtype == dtypes.fp8_e8m0
     ):
-        # The split-K MX kernel reads raw column-major A and row-major B
-        # scales, not the flat shuffled scales consumed by mxpsh.
-        scale_k = k // 128
-        mx128_layout = (
-            n % 128 == 0
-            and k % 128 == 0
-            and x_scale.ndim == w_scale.ndim == 2
-            and (
-                (x_scale.shape == (scale_k, m) and x_scale.is_contiguous())
-                or (x_scale.shape == (m, scale_k) and x_scale.stride() == (1, m))
-            )
-            and w_scale.shape == (n // 128, scale_k)
-            and w_scale.is_contiguous()
-        )
-        if mx128_layout:
-            splitk_config = get_CKGEMM_config(
-                m,
-                n,
-                k,
-                AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE,
-            )
-            splitk_name = (
-                str(splitk_config.get("kernelName", ""))
-                if splitk_config is not None
-                and splitk_config.get("libtype") == "flydsl"
-                else ""
-            )
-            parsed = (
-                _parse_flydsl_splitk_kernel_name(splitk_name)
-                if splitk_name.startswith("flydsl_bpreshuffle_splitk_")
-                else None
-            )
-            if parsed is not None and parsed[9] == "mx128":
-                tm, tn, tk, sk, acp, wpe, xcd, lds, scheduler, mode, bounded = parsed
-                splitk_x_scale = (
-                    x_scale
-                    if x_scale.shape == (scale_k, m) and x_scale.is_contiguous()
-                    else x_scale.transpose(0, 1).contiguous()
-                )
-                return dispatch_flydsl_splitk(
-                    XQ,
-                    WQ,
-                    splitk_x_scale,
-                    w_scale,
-                    Y,
-                    tm,
-                    tn,
-                    tk,
-                    sk,
-                    use_async_copy=acp,
-                    waves_per_eu=wpe,
-                    xcd_swizzle=xcd,
-                    lds_stage=lds,
-                    scheduler=scheduler,
-                    scale_mode=mode,
-                    use_m_bounded_store=bounded,
-                )
         if x_scale.dim() == 1 and w_scale.dim() == 1:
             config = get_mxscale_bpreshuffle_config(
                 m, n, k, MXPSH_W_SCALE_BLOCK, False  # not bmm

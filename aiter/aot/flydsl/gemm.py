@@ -154,9 +154,9 @@ _SPLITK_RE = re.compile(
     r"(?P<qa>[A-Z0-9]+)_(?P<qw>[A-Z0-9]+)_(?P<out>[A-Z0-9]+)_"
     r"(?P<async_copy>\d+)x(?P<waves_per_eu>\d+)x(?P<xcd_swizzle>\d+)x(?P<lds_stage>\d+)_"
     r"(?P<scheduler>[A-Za-z][A-Za-z0-9]*)"
-    r"(?:_sm(?P<scale_mode>ep|bs|mx))?(?:_mb(?P<use_m_bounded_store>[01]))?$"
+    r"(?:_sm(?P<scale_mode>ep|bs))?(?:_mb(?P<use_m_bounded_store>[01]))?$"
 )
-_SPLITK_SCALE_MODE_FROM_CODE = {"bs": "blockscale", "mx": "mx128"}
+_SPLITK_SCALE_MODE_FROM_CODE = {"bs": "blockscale"}
 _SHORT_DTYPE = {
     "F8": "fp8",
     "I8": "int8",
@@ -781,10 +781,6 @@ def _compile_splitk_to_cache(
     if scale_mode == "blockscale":
         scale_a = torch.empty((k // 128, m), device=dev, dtype=torch.float32)
         scale_b = torch.empty((n // 128, k // 128), device=dev, dtype=torch.float32)
-    elif scale_mode == "mx128":
-        # E8M0 bytes, not fp32 -- the scaled MFMA atom reads them directly.
-        scale_a = torch.empty((k // 128, m), device=dev, dtype=torch.int8)
-        scale_b = torch.empty((n // 128, k // 128), device=dev, dtype=torch.int8)
     else:
         scale_a = torch.empty((max(m, 1),), device=dev, dtype=torch.float32)
         scale_b = torch.empty((max(n, 1),), device=dev, dtype=torch.float32)

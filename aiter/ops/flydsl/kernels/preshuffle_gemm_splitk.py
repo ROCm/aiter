@@ -14,8 +14,7 @@ here rather than in the reduce because scaling is linear and commutes with the s
 which lets the epilogue stay byte-for-byte the base kernel's.
 
 ``scale_mode`` picks how the fp8 scales are applied: ``"epilogue"`` (per-row x per-col),
-``"blockscale"`` (arbitrary fp32 per 128-K block, dequantized by an in-loop fma), or
-``"mx128"`` (E8M0 per 128-K block, fed straight to the scaled MFMA's scale operands).
+or ``"blockscale"`` (arbitrary fp32 per 128-K block, dequantized by an in-loop fma).
 """
 
 import functools
@@ -158,7 +157,7 @@ def compile_preshuffle_gemm_splitk(
     use_async_copy: bool = False,
     xcd_swizzle: int = 0,
     lds_stage: int = 2,
-    scale_mode: str = "epilogue",  # "epilogue" (per-row x per-col), "blockscale", "mx128"
+    scale_mode: str = "epilogue",  # "epilogue" (per-row x per-col), "blockscale"
     scale_block_k: int = 128,
     use_m_bounded_store: bool = False,
     direct_out: bool = False,
@@ -189,10 +188,8 @@ def compile_preshuffle_gemm_splitk(
         raise ValueError(f"split-K supports only epilogue='none', got {epilogue!r}")
     if lds_stage not in (1, 2):
         raise ValueError(f"lds_stage must be 1 or 2, got {lds_stage}")
-    if scale_mode not in ("epilogue", "blockscale", "mx128"):
-        raise ValueError(
-            f"scale_mode must be epilogue/blockscale/mx128, got {scale_mode!r}"
-        )
+    if scale_mode not in ("epilogue", "blockscale"):
+        raise ValueError(f"scale_mode must be epilogue/blockscale, got {scale_mode!r}")
     if split_k < 1 or split_k > (K // tile_k):
         # Splits are cut on the tile boundary — B is addressed through the logical
         # (N, K) layout, so a slice starting mid-tile would straddle the preshuffle
@@ -239,19 +236,14 @@ def compile_preshuffle_gemm_splitk(
     use_mfma_k32 = is_f16_or_bf16 and is_gfx950
 
     is_blockscale = scale_mode == "blockscale"
-    # mx128: same [K/128, M] / [N/128, K/128] scale geometry as blockscale, but the
-    # scales are E8M0 bytes, which the 16x16x128 scaled MFMA consumes natively — so
-    # the dequant is the hardware scale operand rather than an in-loop fp32 fma.
-    is_mx = scale_mode == "mx128"
     # gfx942 has no 16x16x128 scaled MFMA; blockscale dequants in software regardless,
     # so cover each 128-K scale block with 4x standard 16x16x32 fp8 MFMA accumulated
     # into frag_blk (the existing K=64 tiled_mma issues two k-steps per block) and reuse
-    # the same in-loop fp32 dequant. mx128 has no gfx942 path (it needs the
-    # hardware scale operand) and stays gfx950-only.
+    # the same in-loop fp32 dequant.
     use_blockscale_gfx942 = (
         is_fp8 and is_gfx942 and is_blockscale and (tile_k % 128 == 0)
     )
-    if is_blockscale or is_mx:
+    if is_blockscale:
         # The in-loop dequant fuses whole scale blocks per MMA k-step, so the MFMA K
         # depth must be a multiple of the scale block and each tile hold whole blocks.
         if not ((is_gfx950 and use_mfma_scale_128) or use_blockscale_gfx942):
@@ -488,25 +480,6 @@ def compile_preshuffle_gemm_splitk(
         if const_expr(is_blockscale):
             # Per-128-K-block raw MMA result; frag_C holds the running scaled sum.
             frag_blk = fx.make_fragment_like(frag_C, Float32.ir_type)
-        if const_expr(is_mx):
-
-            def _mx_one(sub):
-                """Re-add the unit M/N and K repeat modes an indexed sub-view drops.
-
-                The scaled atom is issued per (mi, ni) so it can carry that sub-block's
-                own E8M0 words, but rmem->vector SSA promotion only matches gemm
-                operands that still carry the fragment's full rank — a rank-collapsed
-                ``[None, mi, k]`` view poisons the pass.
-                """
-                lay = sub.layout
-                return fx.make_view(
-                    fx.get_iter(sub),
-                    fx.make_layout(
-                        fx.make_shape(fx.get_shape(lay), 1, 1),
-                        fx.make_stride(fx.get_stride(lay), 0, 0),
-                    ),
-                )
-
         # ── Async gmem->LDS DMA (buffer_load_lds) for the A tile ──
         if const_expr(use_async_copy):
             dma_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
@@ -736,67 +709,6 @@ def compile_preshuffle_gemm_splitk(
                     return Vec(acc) + Vec(blk) * Vec(sc)
                 return math.fma(blk, sc, acc)
 
-        # ── In-loop E8M0 hardware scale (scale_mode="mx128") ──────
-        if const_expr(is_mx):
-            mx_bx_m = bid_x * tile_m
-            # A/B operand lane map for 16x16x128: lane holds row/col lane%16, so the
-            # per-row A scale is lane-varying and the per-128-column B scale is
-            # wave-uniform (one wave owns a single 16-column group).
-            mx_row = gpu.thread_id("x") % 64 % 16
-            mx_wave = gpu.thread_id("x") // 64
-            # Same 16-column group map as block_scale_vec: wave ni's group starts at
-            # (ni * num_waves + wave) * 16, and all 16 of its columns share one
-            # 128-column scale block, so the index stays lane-uniform.
-            mx_n_blks = [
-                (bid_y * tile_n + (ni * num_waves + mx_wave) * 16) // 128
-                for ni in range_constexpr(num_acc_n)
-            ]
-            mx_sa_rsrc = buffer_ops.create_buffer_resource(
-                arg_scale_a,
-                max_size=False,
-                num_records_bytes=fx.Int64(scale_k) * fx.Int64(i32_m),
-            )
-            mx_sb_rsrc = buffer_ops.create_buffer_resource(
-                arg_scale_b,
-                max_size=False,
-                num_records_bytes=fx.Int64((N // scale_block_k) * scale_k),
-            )
-
-            def mx_scale_words(kb):
-                """Per-sub-tile (scale_a[mi], scale_b[ni]) i32 words, one E8M0 byte each.
-
-                opsel defaults to 0 on the atom, so the byte must sit in bits [7:0];
-                the mask makes the widening unsigned (exponents >= 127 are the common
-                case and a sign-extended byte would corrupt them).
-                """
-                mask = Int32(0xFF)
-                sa = [
-                    Int32(
-                        buffer_ops.buffer_load(
-                            mx_sa_rsrc,
-                            fx.Int32(kb) * Int32(i32_m)
-                            + fx.Int32(mx_bx_m + mi * 16 + mx_row),
-                            vec_width=1,
-                            dtype=T.i8,
-                        )
-                    )
-                    & mask
-                    for mi in range_constexpr(m_repeat)
-                ]
-                sb = [
-                    Int32(
-                        buffer_ops.buffer_load(
-                            mx_sb_rsrc,
-                            fx.Int32(mx_n_blks[ni]) * Int32(scale_k) + fx.Int32(kb),
-                            vec_width=1,
-                            dtype=T.i8,
-                        )
-                    )
-                    & mask
-                    for ni in range_constexpr(num_acc_n)
-                ]
-                return sa, sb
-
         # ── B tile load, with the ragged-tail guard ───────────────
         def load_B(stage, k_global):
             """Load B tile ``k_global`` into ``stage``, zeroing it if the tile is padding.
@@ -863,30 +775,6 @@ def compile_preshuffle_gemm_splitk(
                     )
                     sc = block_scale_vec(k_tile * Int32(blocks_per_tile) + Int32(ki))
                     frag_C.store(scaled_acc(frag_C.load(), frag_blk.load(), sc))
-                elif const_expr(is_mx):
-                    # One k-step spans exactly one 128-K scale block, so a single
-                    # E8M0 byte per operand covers the whole MFMA: the accumulator
-                    # comes out dequantized with no epilogue fixup.
-                    # Global 128-K MFMA step: mx128 has one scale block per step.
-                    sa, sb = mx_scale_words(k_tile * Int32(k_iters) + Int32(ki))
-                    # Scale words are atom state, so one gemm can only carry one (mi, ni)
-                    # pair of them: issue the sub-blocks explicitly instead of letting
-                    # the TiledMma expand them under a single shared scale. Slices drop
-                    # the repeat modes, so each call is one 16x16x128 scaled MFMA
-                    # accumulating in place on its own frag_C sub-fragment.
-                    for ni in range_constexpr(num_acc_n):
-                        for mi in range_constexpr(m_repeat):
-                            scaled_mma = _scale_atom.set_value(
-                                {"scale_a": sa[mi], "scale_b": sb[ni]}
-                            )
-                            acc_one = _mx_one(frag_C[None, mi, ni])
-                            fx.gemm(
-                                _tile_scale_atom(scaled_mma),
-                                acc_one,
-                                _mx_one(frag_A[None, mi, k_coord]),
-                                _mx_one(cur_frag_B[None, ni, k_coord]),
-                                acc_one,
-                            )
                 else:
                     fx.gemm(
                         tiled_mma,
@@ -1069,7 +957,7 @@ def compile_preshuffle_gemm_splitk(
 
         # small enough accumulator to keep operands live over the MMA; blockscale has
         # no epilogue operands to preload (dequant already happened in the K loop).
-        overlap_epi_load = acc_size <= 64 and not (is_blockscale or is_mx)
+        overlap_epi_load = acc_size <= 64 and not is_blockscale
         s_a_vals = s_b_vals = bias_vals = None
         if const_expr(overlap_epi_load):
             s_a_vals, s_b_vals, bias_vals = load_epi_operands()
@@ -1098,10 +986,10 @@ def compile_preshuffle_gemm_splitk(
                 pred_C[p] = Int32(bx_m + mi * 16 + lane_div_16 * 4 + ii) < Int32(i32_m)
             pred_C_retile = thr_r2g_C.retile(pred_C)
 
-        if const_expr(is_blockscale or is_mx or (not is_8bit and not _has_epilogue)):
+        if const_expr(is_blockscale or (not is_8bit and not _has_epilogue)):
             if const_expr(direct_out):
                 frag_C_out.store(Vec(frag_C.load()).to(out_elem_cls))
-            elif const_expr(is_blockscale or is_mx):
+            elif const_expr(is_blockscale):
                 frag_C_out.store(frag_C.load())  # already fp32 and already scaled
             else:
                 frag_C_out.store(Vec(frag_C.load()).to(Float32))

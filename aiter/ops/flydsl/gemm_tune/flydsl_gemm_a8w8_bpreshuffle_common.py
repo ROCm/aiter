@@ -550,7 +550,6 @@ kernels_list_8wave: dict[int, EightWaveKernelInstance] = (
 
 KERNEL_ID_BASE_SPLITK = 2_000_000
 KERNEL_ID_BASE_SPLITK_BLOCKSCALE = 3_000_000
-KERNEL_ID_BASE_SPLITK_MX128 = 5_000_000
 NAME_PREFIX_SPLITK = "flydsl_bpreshuffle_splitk"
 
 # Narrow decode tiles -- same set Part A added to _base_tiles_common.
@@ -583,14 +582,12 @@ def _resolve_split_k_vals():
 
 
 _SPLIT_K_VALS = _resolve_split_k_vals()
-# tk=128 variants, added for the blockscale/mx128 builds only -- see
+# tk=128 variants, added for the blockscale builds only -- see
 # _build_kernels_list_splitk callers.
 _SPLITK_TILES_128 = [(16, 16, 128), (16, 32, 128), (32, 16, 128), (32, 32, 128)]
 
-# "sm" token in SplitKKernelInstance.name: the third code, "mx", is mx128
-# (E8M0 128-block hardware scale) -- see the split-K pipeline section below.
-# Anything not in this table (i.e. "epilogue") falls back to "ep".
-_SCALE_MODE_SPLITK_CODE = {"blockscale": "bs", "mx128": "mx"}
+# "sm" token in SplitKKernelInstance.name. Anything not in this table (i.e. "epilogue") falls back to "ep".
+_SCALE_MODE_SPLITK_CODE = {"blockscale": "bs"}
 
 
 @dataclass
@@ -681,10 +678,7 @@ def kernel_fits_shape_splitk(ki: SplitKKernelInstance, M: int, N: int, K: int) -
     # codegen. Prune those candidates on gfx942 -- the synchronous load path is legal.
     if ki.use_async_copy and get_gfx().startswith("gfx942"):
         return False
-    # mx128 shares blockscale's [K/128, M] / [N/128, K/128] scale geometry (fp8
-    # operands, tile_k a multiple of 128) -- only the scale byte encoding
-    # differs, which the runtime kernel handles, not this shape predicate.
-    if ki.scale_mode in ("blockscale", "mx128") and (
+    if ki.scale_mode == "blockscale" and (
         ki.q_dtype_a != "fp8" or ki.tile_k % 128 != 0
     ):
         return False
@@ -693,11 +687,7 @@ def kernel_fits_shape_splitk(ki: SplitKKernelInstance, M: int, N: int, K: int) -
 
 
 def is_splitk_enabled() -> bool:
-    """Split-K candidates: gfx950 (SILOTIGER-915) and gfx942 (epilogue + blockscale).
-
-    mx128 needs the gfx950 hardware scale operand (no software dequant path), so its
-    kernel list is additionally gated gfx950-only where it is built, below.
-    """
+    """Split-K candidates: gfx950 (SILOTIGER-915) and gfx942 (epilogue + blockscale)."""
     return get_gfx().startswith(("gfx950", "gfx942"))
 
 
@@ -708,7 +698,6 @@ def _build_kernels_list_splitk(
 ) -> dict[int, SplitKKernelInstance]:
     base = {
         "blockscale": KERNEL_ID_BASE_SPLITK_BLOCKSCALE,
-        "mx128": KERNEL_ID_BASE_SPLITK_MX128,
     }.get(scale_mode, KERNEL_ID_BASE_SPLITK)
     kl: dict[int, SplitKKernelInstance] = {}
     idx = base
@@ -749,21 +738,6 @@ kernels_list_splitk_blockscale: dict[int, SplitKKernelInstance] = (
     if is_splitk_enabled()
     else {}
 )
-# Same tile/split_k geometry as blockscale: the tile_m==16/num_acc_n==1 gate
-# that once restricted mx128 lived in the compiled kernel itself and has since
-# been lifted (arbitrary tile_m/num_acc_n via a per-sub-tile scaled MFMA), so
-# there is no extra tile restriction to apply here beyond blockscale's own.
-kernels_list_splitk_mx128: dict[int, SplitKKernelInstance] = (
-    _build_kernels_list_splitk(
-        "mx128",
-        tiles=_SPLITK_TILES + _SPLITK_TILES_128,
-        split_k_vals=_SPLIT_K_VALS + (1,),
-    )
-    # mx128 has no gfx942 path (it needs the hardware scale operand), so it stays
-    # gfx950-only even though is_splitk_enabled() now also covers gfx942.
-    if is_splitk_enabled() and get_gfx().startswith("gfx950")
-    else {}
-)
 
 
 # ===========================================================================
@@ -800,16 +774,6 @@ PIPELINES: tuple[Pipeline, ...] = (
 SPLITK_BLOCKSCALE_PIPELINE = Pipeline(
     "splitk_blockscale",
     kernels_list_splitk_blockscale,
-    kernel_fits_shape_splitk,
-    ("fp8",),
-)
-
-# Third scale mode of the same split-K family, same reason for staying out of
-# PIPELINES: the mx128 (E8M0 128-block hardware scale) tuner script imports
-# this to register its own variant.
-SPLITK_MX128_PIPELINE = Pipeline(
-    "splitk_mx128",
-    kernels_list_splitk_mx128,
     kernel_fits_shape_splitk,
     ("fp8",),
 )

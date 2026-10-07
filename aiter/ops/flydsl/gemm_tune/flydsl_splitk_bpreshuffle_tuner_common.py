@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """``GemmCommonTuner`` scaffolding for the FlyDSL split-K bpreshuffle
-tuner -- ``gemm_a8w8_blockscale_bpreshuffle_tune.py`` (blockscale + mx128).
+tuner -- ``gemm_a8w8_blockscale_bpreshuffle_tune.py`` (blockscale).
 The only axis of variation a subclass overrides is
 ``_tune_task_getter_names()``, returning the ordered tuple of its own
 ``get_flydsl_splitk_*_tune_task`` method names.
