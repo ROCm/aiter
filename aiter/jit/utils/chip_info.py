@@ -36,16 +36,63 @@ def _gpu_info_output() -> str:
     return result.stdout
 
 
+def _gfx_from_text(text: str) -> str | None:
+    match = re.search(r"\b(gfx\w+)\b", text, re.IGNORECASE)
+    return match.group(1).lower() if match else None
+
+
+def _torch_gcn_arch() -> str | None:
+    """Arch from the live HIP device. rocminfo can abort with empty stdout."""
+    try:
+        import torch
+
+        if not torch.cuda.is_available() or torch.cuda.device_count() < 1:
+            return None
+        name = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
+    except Exception:  # noqa: BLE001 device probing must allow CPU-only environments
+        return None
+    return _gfx_from_text(str(name))
+
+
+def _explicit_gpu_arch() -> str | None:
+    gfx = os.getenv("GPU_ARCHS", "").strip()
+    if not gfx or gfx.lower() == "native":
+        return None
+    if ";" in gfx:
+        gfx = gfx.split(";")[-1].strip()
+    return _gfx_from_text(gfx) or gfx.lower()
+
+
+def _torch_cu_num() -> int | None:
+    try:
+        import torch
+
+        if not torch.cuda.is_available() or torch.cuda.device_count() < 1:
+            return None
+        cu = int(torch.cuda.get_device_properties(0).multi_processor_count)
+    except Exception:  # noqa: BLE001 device probing must allow CPU-only environments
+        return None
+    return cu if cu > 0 else None
+
+
 @functools.lru_cache(maxsize=1)
 def _detect_native() -> list[str]:
     try:
         # rocminfo: "Name: gfx942"; hipinfo: "gcnArchName: gfx1200"
         for line in _gpu_info_output().splitlines():
-            match = re.search(r"\b(gfx\w+)\b", line, re.IGNORECASE)
-            if match:
-                return [match.group(1).lower()]
+            arch = _gfx_from_text(line)
+            if arch:
+                return [arch]
     except Exception as e:
         raise RuntimeError(f"Get GPU arch from {_GPU_INFO_TOOL} failed: {e}") from e
+    arch = _torch_gcn_arch() or _explicit_gpu_arch()
+    if arch:
+        logger.warning(
+            "%s returned no gfx arch; using %s from the live device or GPU_ARCHS",
+            _GPU_INFO_TOOL,
+            arch,
+        )
+        return [arch]
     raise RuntimeError(f"No gfx arch found in {_GPU_INFO_TOOL} output.")
 
 
@@ -106,12 +153,13 @@ def get_lds_capacity_bytes(gfx: str | None = None) -> int:
 
 @functools.lru_cache(maxsize=1)
 def get_gfx_runtime() -> str:
-    """Return the arch of the live GPU, always via rocminfo/hipinfo.
+    """Return the arch of the live GPU.
 
-    Unlike get_gfx(), ignores GPU_ARCHS -- always detects the actual running
-    GPU.  Use for runtime dispatch decisions (selecting tuned kernels, picking
-    code paths).  Use get_gfx() for build-time codegen paths (gen_instances,
-    csrc module-level arch selection) where no GPU may be available.
+    Prefers rocminfo/hipinfo. When that prints no gfx name, uses the HIP
+    device name and then an explicit GPU_ARCHS value. Use for runtime
+    dispatch (tuned kernels, code paths). Use get_gfx() for build-time
+    codegen (gen_instances, csrc module-level arch selection) where no GPU
+    may be available.
     """
     gfx_arch = _detect_native()[0]
     supported = set(GFX_MAP.values())
@@ -272,6 +320,8 @@ def _parse_cu_num_hipinfo(output: str) -> list[int]:
 def get_cu_num_custom_op() -> int:
     cu_num = int(os.getenv("CU_NUM", "0"))
     if cu_num == 0:
+        gpu_compute_units: list[int] = []
+        info_error: Exception | None = None
         try:
             output = _gpu_info_output()
             if IS_WINDOWS:
@@ -279,13 +329,26 @@ def get_cu_num_custom_op() -> int:
             else:
                 gpu_compute_units = _parse_cu_num_rocminfo(output)
         except Exception as e:  # noqa: BLE001  blanket catch is intentional here
-            raise RuntimeError(
-                f"Get GPU Compute Unit from {_GPU_INFO_TOOL} failed {e!s}"
+            info_error = e
+        if len(set(gpu_compute_units)) == 1:
+            cu_num = gpu_compute_units[0]
+        else:
+            fallback = _torch_cu_num()
+            if fallback is None:
+                if info_error is not None:
+                    raise RuntimeError(
+                        f"Get GPU Compute Unit from {_GPU_INFO_TOOL} failed {info_error!s}"
+                    ) from info_error
+                raise RuntimeError(
+                    f"No GPU Compute Unit found in {_GPU_INFO_TOOL} output "
+                    f"(parsed {gpu_compute_units})."
+                )
+            logger.warning(
+                "%s did not report one GPU compute-unit count; using %s from the live device",
+                _GPU_INFO_TOOL,
+                fallback,
             )
-        if not gpu_compute_units:
-            raise RuntimeError(f"No GPU Compute Unit found in {_GPU_INFO_TOOL} output.")
-        assert len(set(gpu_compute_units)) == 1
-        cu_num = gpu_compute_units[0]
+            cu_num = fallback
     return cu_num
 
 
