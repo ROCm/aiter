@@ -62,6 +62,12 @@ def e8m0_to_f32(x: torch.Tensor) -> torch.Tensor:
 @pytest.mark.parametrize(
     "M, K",
     [
+        # Shapes in different gfx1250 Gluon config buckets.
+        (1, 3072),
+        (4, 7168),
+        (40, 4096),
+        (4100, 4096),
+        (4100, 1024),
         (1, 32),
         (1, 64),
         (1, 128),
@@ -73,6 +79,12 @@ def e8m0_to_f32(x: torch.Tensor) -> torch.Tensor:
         (128, 1024),
         (137, 64),  # non-power-of-2 M
         (256, 32),
+        # A few shapes spanning bench_quant_mxfp4_fp8.py's default range, plus
+        # non-power-of-2 shapes in between.
+        (8, 1024),
+        (2048, 3072),
+        (16384, 7168),
+        (6000, 5024),
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -437,3 +449,37 @@ def test_fused_flatten_mxfp8_quant_matches_per_1x32_after_flatten():
         atol=1,
         rtol=0,
     )
+
+
+@pytest.mark.parametrize("M, K", [(1, 3072), (40, 4096), (4100, 4096)])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_dynamic_mxfp8_quant_gluon_matches_triton(M: int, K: int, dtype):
+    arch = arch_info.get_arch()
+    if arch not in ("gfx950", "gfx1250"):
+        pytest.skip("The Gluon backend requires gfx950 or gfx1250")
+    if arch == "gfx950" and dtype != torch.bfloat16:
+        pytest.skip("The gfx950 Gluon kernel requires bf16 input")
+    torch.manual_seed(20)
+    x = torch.randn((M, K), dtype=dtype, device="cuda") * 4.0
+
+    y_gluon, s_gluon = dynamic_mxfp8_quant(x, backend="gluon")
+    y_triton, s_triton = dynamic_mxfp8_quant(x, backend="triton")
+
+    torch.testing.assert_close(s_gluon, s_triton, atol=0, rtol=0)
+    torch.testing.assert_close(
+        y_gluon.view(torch.uint8).to(torch.int32),
+        y_triton.view(torch.uint8).to(torch.int32),
+        atol=1,
+        rtol=0,
+    )
+
+
+def test_dynamic_mxfp8_quant_backend_validation():
+    if not arch_info.is_fp8_avail():
+        pytest.skip("FP8 not supported on this arch")
+    x = torch.randn((4, 64), dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="Unknown backend"):
+        dynamic_mxfp8_quant(x, backend="cuda")
+    # fp32 input has no Gluon kernel on any arch.
+    with pytest.raises(RuntimeError, match="Gluon backend requires"):
+        dynamic_mxfp8_quant(x.float(), backend="gluon")

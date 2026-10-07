@@ -684,7 +684,14 @@ def _flash_attn_forward(
     else:
         if config is None:
             config = _get_config(
-                enable_dropout, q.dtype, has_pe=pe_head_dim > 0, head_dim_v=v_head_dim
+                enable_dropout,
+                q.dtype,
+                has_pe=pe_head_dim > 0,
+                head_dim_v=v_head_dim,
+                causal=bool(causal),
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                batch_heads=batch * num_q_heads,
             )
 
         use_int64_strides = _USE_INT64_STRIDES
@@ -1052,7 +1059,11 @@ def flash_attn_func(
     """
     backend = _resolve_backend(backend)
     _LOGGER.info(
-        f"FLASH_ATTN [{backend}]:  q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)}"
+        "FLASH_ATTN [%s]:  q=%s  k=%s  v=%s",
+        backend,
+        tuple(q.shape),
+        tuple(k.shape),
+        tuple(v.shape),
     )
 
     if backend == "gluon":
@@ -1403,7 +1414,11 @@ def flash_attn_varlen_func(
     """
     backend = _resolve_backend(backend)
     _LOGGER.info(
-        f"FLASH_ATTN_VARLEN [{backend}]:  q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)}"
+        "FLASH_ATTN_VARLEN [%s]:  q=%s  k=%s  v=%s",
+        backend,
+        tuple(q.shape),
+        tuple(k.shape),
+        tuple(v.shape),
     )
 
     if backend == "gluon":
