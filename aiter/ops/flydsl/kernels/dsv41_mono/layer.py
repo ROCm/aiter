@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """The mono decode layer's two launches (README): K1 = the attention seam
-(ATOM's slice / gate, the norm into the front's MXFP8) + dsv41_mega_attn's
-front; K2 = dsv41_mega_attn's back (wo_b pushed to every rank) + ATOM's FFN
-seam (the TP sum folded in) + ATOM's MoE (vLLM numerics, ``atomv41.kernels``).
+(``stages.seam``: slice, gate, the norm into vLLM's MXFP8) + the attention front
+(``attention.front``); K2 = the attention back (``attention.back``, wo_b pushed
+to every rank) + the FFN seam (the TP sum folded in) + the MoE (``stages.moe``,
+its all-reduce in-kernel too).
 
 Tags: K1's hand-offs carry 2 e + 1, K2's 2 e + 2 (e: the launch pair's epoch,
 moved on by K2's CTA 0 at its end), so K2's seam may reuse K1's seam regions.
@@ -20,28 +21,26 @@ from flydsl.expr.typing import Int32, Int64, T
 
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 
-from ..dsv41_mega_attn import back as mb_back
-from ..dsv41_mega_attn import front as mb_front
-from ..dsv41_mega_attn.device import BLOCKS, CM_DEV, THREADS, gstore, kernel_symbol, rsrc
-from ..dsv41_mega_attn.plan import HIDDEN, Dims, back_scratch, front_scratch
-from .atomfw.device.ops import bf16_round, bf_hi, bf_lo, butterfly, fp8_pack4, hw_rsq, traced
-from .atomfw.device.ranks import peer_bases
-from .atomfw.device.sync import preg, publish, sreg
-from .atomfw.plan.build_key import key_tuple
-from .atomfw.plan.execution import WAVES, first_task
-from .atomv41.kernels import attn_post as ak2a
-from .atomv41.kernels import attn_pre as ak1
-from .atomv41.kernels import moe as ak2b
-from .atomv41.kernels.debug import mailbox as atom_mailbox
-from .atomv41.kernels.dims import Dims as ADims
-from .atomv41.kernels.moe_shape import SORT_NETS, MoeBuild, route_shape
-from .atomv41.sources import SOURCES
+from .attention import back as mb_back
+from .attention import front as mb_front
+from .attention.device import BLOCKS, CM_DEV, THREADS, gstore, kernel_symbol, rsrc
+from .attention.plan import HIDDEN, Dims, back_scratch, front_scratch
+from .common.device.mx import clamp_fp8
+from .common.device.ops import butterfly, fp8_pack4, traced
+from .common.device.ranks import peer_bases
+from .common.device.sync import Mailbox, preg, publish, sreg
+from .common.plan.build_key import key_tuple
+from .common.plan.execution import WAVES, first_task
+from .sources import SOURCES
+from .stages import moe, seam
+from .stages.dims import Dims as StageDims
+from .stages.moe_shape import SORT_NETS, MoeBuild, route_shape
 
 _STREAM = fx.Stream(None)
 MAX_TOKENS = 48
 X_WORDS = HIDDEN // 4
 X_GROUPS = HIDDEN // 32
-SLICES = ak1.SLICES  # 160
+SLICES = seam.SLICES  # 160
 COUNTER_WORDS = 2 * 256  # the MoE's ug queue and down counts, a word a slot
 COUNTER_BYTES = COUNTER_WORDS * 4
 
@@ -72,7 +71,10 @@ def scratch_layout(s: int, tp: int) -> dict:
     then K1's front and seam, K2's back, the MoE's regions, the normed rows and
     their flags."""
     d = Dims(tp)
-    out = {"ugq": (0, COUNTER_BYTES // 2), "dq": (COUNTER_BYTES // 2, COUNTER_BYTES // 2)}
+    out = {
+        "ugq": (0, COUNTER_BYTES // 2),
+        "dq": (COUNTER_BYTES // 2, COUNTER_BYTES // 2),
+    }
     off = COUNTER_BYTES
 
     def place(regions):
@@ -84,13 +86,12 @@ def scratch_layout(s: int, tp: int) -> dict:
         off = -(-off // 256) * 256
 
     place(front_scratch(s, d))
-    seam = ak1.scratch_layout(s)
-    lo = min(seam[n][0] for n in ("lin", "pmix"))
-    place({n: (seam[n][0] - lo, seam[n][1]) for n in ("lin", "pmix")})
+    place(seam.scratch_layout(s))
     place(back_scratch(s, d, start=0))
-    moe = {n: v for n, v in ak2b.scratch_layout(_moe_key(MonoBuild(s, tp, 1))).items() if n not in ("ugq", "dq")}
-    lo = min(o for o, _ in moe.values())
-    place({n: (o - lo, n_) for n, (o, n_) in moe.items()})
+    regions = moe.scratch_layout(_moe_key(MonoBuild(s, tp, 1))).items()
+    mr = {n: v for n, v in regions if n not in ("ugq", "dq")}
+    lo = min(o for o, _ in mr.values())
+    place({n: (o - lo, n_) for n, (o, n_) in mr.items()})
     place({"normed": (0, s * HIDDEN * 2), "xrdy_moe": (s * HIDDEN * 2 + 256, s * 8)})
     return out
 
@@ -101,70 +102,46 @@ def scratch_bytes(s: int = MAX_TOKENS, tp: int = 2) -> int:
 
 def peer_half_bytes(tp: int) -> int:
     """One parity's peer regions: the attention's partials, then the MoE's."""
-    return ak2a.peer_bytes(MAX_TOKENS, tp) + ak2b.peer_bytes(MAX_TOKENS, tp)
+    return seam.attn_peer_bytes(MAX_TOKENS, tp) + moe.peer_bytes(MAX_TOKENS, tp)
 
 
 def _epoch(epoch):
     return fx.Int32(bo.buffer_load(rsrc(epoch), 0, vec_width=1, dtype=T.i32))
 
 
-def _mark_region(layout, scratch):
-    return {name: scratch + fx.Int64(off) for name, (off, _) in layout.items()}
-
-
 # ---------------------------------------------------------------- K1
 
 
 @traced
-def stage_norm_x8(ca, c, t):
-    """The attention seam's RMSNorm of token t (ATOM ``stage_norm``'s: aiter's
-    fused seam's rounding) -> bf16 -> vLLM's MXFP8 of each 32 (the attention's
-    input quant) -> the front's X8 / X8S, plain at device scope, then its two
-    XRDY flags (one a wqkv K half). 256 threads, 3 chunks of 8 at 8 t + 2048 c."""
-    tid, lane, wave, red = ca["tid"], ca["lane"], ca["wave"], ca["red"]
-    a = ca["args"]
-    tt = fx.min(tid, 255)
-    mine = tid < 256
-    cols = [tt * 8 + 2048 * ch for ch in range(3)]
-    xs = []
-    for ch in range_constexpr(3):
-        base = t * HIDDEN + fx.min(cols[ch], HIDDEN - 8)
-        words = ca["poll"]([(ca["lin"], base // 2 + k, 1) for k in range(4)])
-        v = []
-        for k in range_constexpr(4):
-            v += [bf_lo(words[k][0]), bf_hi(words[k][0])]
-        xs.append([(cols[ch] < HIDDEN).select(x, fx.Float32(0.0)) for x in v])
-    acc = fx.Float32(0.0)
-    for ch in range_constexpr(3):
-        for x in xs[ch]:
-            acc = acc + x * x
-    acc = butterfly(acc, (1, 2, 4, 8, 16, 32))
-    if (lane == 0) & mine:
-        fx.ptr_store(acc, red + wave)
-    gpu.barrier()
-    tot = butterfly(fx.ptr_load(red + lane % 4), (1, 2))
-    r = hw_rsq(ak1.fma(tot, fx.Float32(1.0 / HIDDEN), fx.Float32(ak1.EPS)))
-    for ch in range_constexpr(3):
-        col = fx.min(cols[ch], HIDDEN - 8)
-        ys = [bf16_round((xs[ch][j] * r) * ak1.ld_bf(a["attn_w"], col + j)) for j in range(8)]
-        amax = abs(ys[0])
-        for y in ys[1:]:
-            amax = fx.max(amax, abs(y))
-        code = ak2b.vllm_mx_code(butterfly(amax, (1, 2), fx.max))
-        mul = ((254 - code) << 23).bitcast(fx.Float32)
-        w0 = fp8_pack4(*[ak2b.clamp_fp8(ys[i] * mul) for i in range(4)])
-        w1 = fp8_pack4(*[ak2b.clamp_fp8(ys[4 + i] * mul) for i in range(4)])
-        if mine & (cols[ch] < HIDDEN):
+def store_x8(c, t, col, ys, live):
+    """The attention seam's norm output (``seam.stage_norm``'s 8 columns at
+    ``col``) -> vLLM's MXFP8 of each 32 (the attention's input quant) -> the
+    front's X8 / X8S, plain at device scope."""
+    amax = abs(ys[0])
+    for y in ys[1:]:
+        amax = fx.max(amax, abs(y))
+    code = moe.vllm_mx_code(butterfly(amax, (1, 2), fx.max))
+    mul = ((254 - code) << 23).bitcast(fx.Float32)
+    w0 = fp8_pack4(*[clamp_fp8(ys[i] * mul) for i in range(4)])
+    w1 = fp8_pack4(*[clamp_fp8(ys[4 + i] * mul) for i in range(4)])
+    if live:
+        bo.buffer_store(
+            fx.Vector.from_elements([w0, w1], fx.Int32), rsrc(c["x8"]),
+            t * X_WORDS + col // 4, cache_modifier=CM_DEV,
+        )  # fmt: skip
+        if c["tid"] % 4 == 0:
             bo.buffer_store(
-                fx.Vector.from_elements([w0, w1], fx.Int32), rsrc(c["x8"]),
-                t * X_WORDS + col // 4, cache_modifier=CM_DEV,
-            )  # fmt: skip
-            if tt % 4 == 0:
-                bo.buffer_store(code, rsrc(c["x8s"]), t * X_GROUPS + col // 32, cache_modifier=CM_DEV)
+                code, rsrc(c["x8s"]), t * X_GROUPS + col // 32, cache_modifier=CM_DEV
+            )
+
+
+@traced
+def publish_x8(c, t):
+    """Token t's two XRDY flags (one a wqkv K half) once its X8 / X8S landed."""
     rocdl.s_waitcnt(vmcnt=0)
     gpu.barrier()
-    if tid < 2:
-        c["mb"].put(c["xrdy"], 2 * t + tid, fx.Int32(1))
+    if c["tid"] < 2:
+        c["mb"].put(c["xrdy"], 2 * t + c["tid"], fx.Int32(1))
     gpu.barrier()
 
 
@@ -181,8 +158,8 @@ def build_mono_k1(key: MonoBuild):
     @fx.struct
     class SeamLds:
         red: fx.Array[fx.Float32, WAVES * 2 * 64 * 4, 16]
-        rl: fx.Array[fx.Float32, s * ak1.KT, 16]
-        fl: fx.Array[fx.Float32, ak1.MIX * ak1.KT, 16]
+        rl: fx.Array[fx.Float32, s * seam.KT, 16]
+        fl: fx.Array[fx.Float32, seam.MIX * seam.KT, 16]
 
     @fx.union
     class K1Lds:
@@ -206,7 +183,7 @@ def build_mono_k1(key: MonoBuild):
         _ = keyed
         bid = fx.block_idx.x
         lds = fx.SharedAllocator().allocate(K1Lds)
-        seam = lds.seam.peek()
+        sl = lds.seam.peek()
         ep = _epoch(epoch)
         tag = (ep << 1) + 1
         fargs = {
@@ -219,19 +196,19 @@ def build_mono_k1(key: MonoBuild):
         }  # fmt: skip
         flayout = {n: layout[n] for n in front_scratch(s, Dims(tp))}
         c = mb_front.front_context(fkey, lds.front.peek(), fargs, scratch, tag, flayout)
-        amb = atom_mailbox(tag - 1, scratch, -1, {})
+        amb = Mailbox(tag)
         tid = fx.thread_idx.x
         ca = {
             "S": s, "tid": tid, "bid": bid, "lane": tid % 64, "wave": tid // 64,
-            "rl": seam.rl.ptr, "fl": seam.fl.ptr, "red": seam.red.ptr,
+            "rl": sl.rl.ptr, "fl": sl.fl.ptr, "red": sl.red.ptr,
             "put": amb.put, "put_bf": amb.put_bf, "put_words": amb.put_words, "poll": amb.poll,
             "args": {
                 "res_in": res_in, "pend": pend, "post_in": post_in, "comb_in": comb_in,
                 "pre_in": pre_in, "hc_fn": hc_fn, "hc_scale": hc_scale, "hc_base": hc_base,
-                "attn_w": attn_w, "res_out": res_out, "post_out": post_out,
-                "comb_out": comb_out, "pre_out": pre_out, "aux": 0,
+                "norm_w": attn_w, "res_out": res_out, "post_out": post_out,
+                "comb_out": comb_out, "pre_out": pre_out,
             },
-            "fold": True, "index": False, "aux": False, "ffn": False, "d": ADims(tp),
+            "d": StageDims(tp),
         }  # fmt: skip
         for region in ("lin", "pmix"):
             ca[region] = sreg(scratch, layout[region][0], region)
@@ -240,17 +217,20 @@ def build_mono_k1(key: MonoBuild):
 
         def seam_slice():
             for task in range(first_task(bid, 0), SLICES, BLOCKS):
-                ak1.stage_slice(ca, task)
+                seam.stage_slice(ca, task)
             gpu.barrier()
 
         def seam_rest():
             for t in range(first_task(bid, NORM0), s, BLOCKS):
-                stage_norm_x8(ca, c, t)
+                seam.stage_norm(ca, t, lambda *v: store_x8(c, *v))
+                publish_x8(c, t)
             for t in range(first_task(bid, GATE0), s, BLOCKS):
-                ak1.stage_gate(ca, t)
+                seam.stage_gate(ca, t)
             gpu.barrier()
 
-        mb_front.run_front(c, fkey, bid, x8_given=True, before_wqkv=seam_slice, after_wqkv=seam_rest)
+        mb_front.run_front(
+            c, fkey, bid, x8_given=True, before_wqkv=seam_slice, after_wqkv=seam_rest
+        )
 
     @flyc.jit
     def launch(
@@ -277,6 +257,18 @@ def build_mono_k1(key: MonoBuild):
 # ---------------------------------------------------------------- K2
 
 
+@traced
+def store_normed(normed, t, col, ys, live):
+    """The FFN seam's norm output -> the MoE input row (bf16, device scope:
+    this launch reads it)."""
+    if live:
+        for j in range_constexpr(8):
+            bo.buffer_store(
+                ys[j].to(fx.BFloat16), rsrc(normed), t * HIDDEN + col + j,
+                cache_modifier=CM_DEV,
+            )  # fmt: skip
+
+
 def build_mono_k2(key: MonoBuild):
     s, tp = key.tokens, key.tp
     assert 1 <= s <= MAX_TOKENS
@@ -286,7 +278,8 @@ def build_mono_k2(key: MonoBuild):
     rs = route_shape(mkey)
     assert rs.experts // 64 in SORT_NETS
     BackM = mb_back.back_lds_members(s, Dims(tp))
-    MoeLds = ak2b.moe_smem(s, rs, False)
+    SplitLds, GemvLds = BackM["split"], BackM["gemv"]
+    MoeLds = moe.moe_smem(s, rs, False)
     half = peer_half_bytes(tp)
     GATE0 = SLICES
     NORM0 = SLICES + s
@@ -295,14 +288,14 @@ def build_mono_k2(key: MonoBuild):
     @fx.struct
     class SeamLds:
         red: fx.Array[fx.Float32, WAVES * 2 * 64 * 4, 16]
-        rl: fx.Array[fx.Float32, s * ak1.KT, 16]
-        fl: fx.Array[fx.Float32, ak1.MIX * ak1.KT, 16]
-        pl: fx.Array[fx.Float32, s * ak1.COLS, 16]
+        rl: fx.Array[fx.Float32, s * seam.KT, 16]
+        fl: fx.Array[fx.Float32, seam.MIX * seam.KT, 16]
+        pl: fx.Array[fx.Float32, s * seam.COLS, 16]
 
     @fx.union
     class K2Lds:
-        split: BackM["split"]
-        gemv: BackM["gemv"]
+        split: SplitLds
+        gemv: GemvLds
         seam: SeamLds
         moe: MoeLds
 
@@ -326,7 +319,7 @@ def build_mono_k2(key: MonoBuild):
         bid = fx.block_idx.x
         tid = fx.thread_idx.x
         lds = fx.SharedAllocator().allocate(K2Lds)
-        seam = lds.seam.peek()
+        sl = lds.seam.peek()
         ep = _epoch(epoch)
         tag = (ep << 1) + 2
         par = fx.Int64(ep & 1) * fx.Int64(half)
@@ -342,13 +335,13 @@ def build_mono_k2(key: MonoBuild):
         blayout = {n: layout[n] for n in back_scratch(s, Dims(tp), start=0)}
         views = {"split": lds.split.peek(), "gemv": lds.gemv.peek()}
         c = mb_back.back_context(bkey, views, bargs, scratch, tag, blayout)
-        amb = atom_mailbox(tag - 1, scratch, -1, {})
+        amb = Mailbox(tag)
 
         def push(t, col, v0, v1):
             # this rank's bf16 partial pair to every rank's ATTN region
             for p in range_constexpr(tp):
                 dst = preg(bases[p], 0, "attn")
-                amb.put_bf(dst, 2 * ak2a.attn_region_pair(rank, t, s, col), [v0, v1])
+                amb.put_bf(dst, 2 * seam.attn_region_pair(rank, t, s, col), [v0, v1])
 
         c["wob_out"] = push
         if const_expr(key.timeline):
@@ -360,49 +353,57 @@ def build_mono_k2(key: MonoBuild):
         # ---- the FFN seam: the attention's TP sum folded into the residual
         ca = {
             "S": s, "tid": tid, "bid": bid, "lane": tid % 64, "wave": tid // 64,
-            "rl": seam.rl.ptr, "fl": seam.fl.ptr, "red": seam.red.ptr, "pend_lds": seam.pl.ptr,
+            "rl": sl.rl.ptr, "fl": sl.fl.ptr, "red": sl.red.ptr, "pend_lds": sl.pl.ptr,
             "put": amb.put, "put_bf": amb.put_bf, "put_words": amb.put_words, "poll": amb.poll,
             "peer_addr": lambda p: bases[p], "rank": rank, "sym": own,
             "args": {
                 "res_in": res_in, "post_in": post_in, "comb_in": comb_in, "pre_in": pre_in,
-                "hc_fn": hc_fn, "hc_scale": hc_scale, "hc_base": hc_base, "attn_w": ffn_w,
+                "hc_fn": hc_fn, "hc_scale": hc_scale, "hc_base": hc_base, "norm_w": ffn_w,
                 "res_out": res_out, "post_out": post_out, "comb_out": comb_out,
-                "pre_out": pre_out, "normed": scratch + fx.Int64(layout["normed"][0]),
-                "aux": 0,
+                "pre_out": pre_out,
             },
-            "fold": True, "index": False, "aux": False, "ffn": True, "d": ADims(tp),
-            "normed_cm": CM_DEV,
+            "d": StageDims(tp),
         }  # fmt: skip
+        normed = scratch + fx.Int64(layout["normed"][0])
         for region in ("lin", "pmix"):
             ca[region] = sreg(scratch, layout[region][0], region)
-        mlayout = {n: layout[n] for n in ak2b.scratch_layout(mkey)}
+        mlayout = {n: layout[n] for n in moe.scratch_layout(mkey)}
         mlayout["xrdy"] = layout["xrdy_moe"]
-        margs = ak2b.moe_args(
-            scratch + fx.Int64(layout["normed"][0]), gate_w, bias, w13, w13_s, w2, w2_s,
-            sgu, sgu_s, sw2, sw2_s, out,
-        )  # fmt: skip
-        cb = ak2b.moe_context(s, rs, lds.moe.peek(), amb, bases, mlayout, scratch, margs, rank, own)
+        margs = moe.moe_args(
+            normed, gate_w, bias, w13, w13_s, w2, w2_s, sgu, sgu_s, sw2, sw2_s, out
+        )
+        cb = moe.moe_context(
+            s, rs, lds.moe.peek(), amb, bases, mlayout, scratch, margs, rank, own
+        )
         cb["x_cm"], cb["x_ready"] = CM_DEV, True
         cb["tag"] = ep & 255
         for task in range(first_task(bid, 0), SLICES, BLOCKS):
-            ak2a.stage_reduce(ca, task)
-            ak1.stage_slice(ca, task)
+            seam.stage_reduce(ca, task)
+            seam.stage_slice(ca, task)
         for t in range(first_task(bid, GATE0), s, BLOCKS):
-            ak1.stage_gate(ca, t)
+            seam.stage_gate(ca, t)
         for t in range(first_task(bid, NORM0), s, BLOCKS):
-            ak1.stage_norm(ca, t)
+            seam.stage_norm(ca, t, lambda *v: store_normed(normed, *v))
             publish(cb["put"], cb["xrdy"], t, 1, tid == 0)
         gpu.barrier()
 
         # ---- the MoE, its all-reduce into ``out``
-        ak2b.run_moe(cb, mkey, bid, 0, 0)
+        moe.run_moe(cb, mkey, bid, 0, 0)
 
         def reset():
             # the MoE counter slot 128 launch pairs ahead: its last use long
             # done, its next use far off
             slot = (ep + 128) & 255
-            gstore(scratch + fx.Int64(layout["ugq"][0]) + fx.Int64(slot * 4), fx.Int32(0), words=1)
-            gstore(scratch + fx.Int64(layout["dq"][0]) + fx.Int64(slot * 4), fx.Int32(0), words=1)
+            gstore(
+                scratch + fx.Int64(layout["ugq"][0]) + fx.Int64(slot * 4),
+                fx.Int32(0),
+                words=1,
+            )
+            gstore(
+                scratch + fx.Int64(layout["dq"][0]) + fx.Int64(slot * 4),
+                fx.Int32(0),
+                words=1,
+            )
 
         mb_back.epoch_end(c, epoch, ep, reset)
 

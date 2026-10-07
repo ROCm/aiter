@@ -14,12 +14,13 @@ the ranks' epochs agree.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 
-from .dsv41_mega_attn import MegaLayerWeights, _ensure_writable_flydsl_cache
-from .kernels.dsv41_mega_attn.plan import HEAD_DIM, HIDDEN, KEYS, Dims
+from .kernels.dsv41_mono.attention.plan import HEAD_DIM, HIDDEN, KEYS, Dims
 from .kernels.dsv41_mono.layer import (
     MAX_TOKENS,
     MonoBuild,
@@ -29,17 +30,67 @@ from .kernels.dsv41_mono.layer import (
     scratch_bytes,
 )
 
-__all__ = ["DSV41MonoLayer", "MonoLayerWeights", "MAX_TOKENS"]
+__all__ = ["MAX_TOKENS", "AttnWeights", "DSV41MonoLayer", "MonoLayerWeights"]
 
 _LOG2E = 1.4426950408889634
 HC = 4
+
+
+def _ensure_writable_flydsl_cache() -> None:
+    """aiter points FlyDSL at its bundled, read-only cache; new kernels need a
+    writable one."""
+    cur = os.environ.get("FLYDSL_RUNTIME_CACHE_DIR")
+    if cur and os.access(cur, os.W_OK):
+        return
+    path = Path.home() / ".flydsl" / "cache"
+    path.mkdir(parents=True, exist_ok=True)
+    os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = str(path)
+
+
+@dataclass
+class AttnWeights:
+    """One layer's attention tensors on this rank, in vLLM's loaded layout."""
+
+    layer_id: int
+    wqkv: torch.Tensor  # [1792, 5120] e4m3: [wq_a; wkv]
+    wqkv_scale: torch.Tensor  # [56, 160] uint8 E8M0 (32 x 32 blocks)
+    q_norm: torch.Tensor  # [1280] bf16
+    kv_norm: torch.Tensor  # [512] bf16
+    wq_b: torch.Tensor  # [H * 512, 1280] e4m3
+    wq_b_scale: torch.Tensor  # [H * 16, 40] uint8
+    wo_a: torch.Tensor  # [G * 1024, 4096] e4m3
+    wo_a_scale: torch.Tensor  # [G * 32, 128] uint8
+    wo_b: torch.Tensor  # [5120, G * 1024] e4m3
+    wo_b_scale: torch.Tensor  # [160, G * 32] uint8
+    attn_sink: torch.Tensor  # [>= H] f32
+    cos_sin: torch.Tensor  # [positions, 64] f32 (the layer's rope table)
+    ratio: int  # 0 / 1 / 2: the layer's compress ratio
+
+    def check(self, d: Dims) -> None:
+        h, g = d.heads, d.groups
+        want = {
+            "wqkv": ((1792, HIDDEN), torch.float8_e4m3fn),
+            "wqkv_scale": ((56, HIDDEN // 32), torch.uint8),
+            "wq_b": ((h * HEAD_DIM, 1280), torch.float8_e4m3fn),
+            "wq_b_scale": ((h * HEAD_DIM // 32, 40), torch.uint8),
+            "wo_a": ((g * 1024, d.group_k), torch.float8_e4m3fn),
+            "wo_a_scale": ((g * 32, d.group_k // 32), torch.uint8),
+            "wo_b": ((HIDDEN, g * 1024), torch.float8_e4m3fn),
+            "wo_b_scale": ((HIDDEN // 32, g * 32), torch.uint8),
+        }
+        for name, (shape, dtype) in want.items():
+            t = getattr(self, name)
+            assert (
+                tuple(t.shape) == shape and t.dtype == dtype and t.is_contiguous()
+            ), f"layer {self.layer_id} {name}: {tuple(t.shape)} {t.dtype}, want {shape} {dtype}"
+        assert self.cos_sin.dtype == torch.float32 and self.cos_sin.shape[-1] == 64
 
 
 @dataclass
 class MonoLayerWeights:
     """One layer's tensors on this rank, in vLLM's loaded layout."""
 
-    attn: MegaLayerWeights
+    attn: AttnWeights
     hc_attn_fn: torch.Tensor  # [24, 4 * 5120] f32
     hc_attn_scale: torch.Tensor  # [3] f32
     hc_attn_base: torch.Tensor  # [24] f32
@@ -66,28 +117,36 @@ class DSV41MonoLayer:
 
     def __init__(self, tp: int, rank: int, group, device: torch.device | str = "cuda"):
         _ensure_writable_flydsl_cache()
-        from .kernels.dsv41_mono.atomfw.runtime.peer_memory import PeerBuffer
+        from .kernels.dsv41_mono.common.runtime.peer_memory import PeerBuffer
 
         self.tp, self.rank = tp, rank
         self.d = Dims(tp)
         dev = self.device = torch.device(device)
-        self.scratch = torch.zeros(scratch_bytes(MAX_TOKENS, tp), dtype=torch.uint8, device=dev)
+        self.scratch = torch.zeros(
+            scratch_bytes(MAX_TOKENS, tp), dtype=torch.uint8, device=dev
+        )
         # [epoch, -, -, -, a mark per CTA]
         self.epoch = torch.zeros(4 + 256, dtype=torch.int32, device=dev)
-        self.q = torch.zeros(MAX_TOKENS, self.d.heads, HEAD_DIM, dtype=torch.bfloat16, device=dev)
+        self.q = torch.zeros(
+            MAX_TOKENS, self.d.heads, HEAD_DIM, dtype=torch.bfloat16, device=dev
+        )
         self.kt = torch.zeros(MAX_TOKENS * KEYS, dtype=torch.int32, device=dev)
         self.klen = torch.zeros(2 * MAX_TOKENS, dtype=torch.int32, device=dev)
         self._dummy = torch.zeros(4, dtype=torch.int32, device=dev)
         self._zero_rec = torch.zeros(1024, dtype=torch.uint8, device=dev)
         # the attention seam's outputs, K1 -> K2
-        self.res_mid = torch.zeros(MAX_TOKENS, HC, HIDDEN, dtype=torch.bfloat16, device=dev)
+        self.res_mid = torch.zeros(
+            MAX_TOKENS, HC, HIDDEN, dtype=torch.bfloat16, device=dev
+        )
         self.post_a = torch.zeros(MAX_TOKENS, HC, dtype=torch.float32, device=dev)
         self.comb_a = torch.zeros(MAX_TOKENS, HC, HC, dtype=torch.float32, device=dev)
         self.pre_a = torch.zeros(MAX_TOKENS, HC, dtype=torch.float32, device=dev)
         self.peer = PeerBuffer(2 * peer_half_bytes(tp), group, rank, tp, dev)
         self.peer.bytes.zero_()
         self._qk_scale = (
-            torch.tensor([HEAD_DIM**-0.5 * _LOG2E], dtype=torch.float32).view(torch.int32).item()
+            torch.tensor([HEAD_DIM**-0.5 * _LOG2E], dtype=torch.float32)
+            .view(torch.int32)
+            .item()
         )
         self._kernels: dict = {}
 
@@ -142,8 +201,16 @@ class DSV41MonoLayer:
             assert t_.is_contiguous()
         swa_block = swa_cache.shape[1]
         if ratio:
-            comp, comp_stride, comp_block = comp_cache, comp_cache.stride(0), comp_cache.shape[1]
-            bt, bt_stride, topk = comp_block_table, comp_block_table.stride(0), topk_indices
+            comp, comp_stride, comp_block = (
+                comp_cache,
+                comp_cache.stride(0),
+                comp_cache.shape[1],
+            )
+            bt, bt_stride, topk = (
+                comp_block_table,
+                comp_block_table.stride(0),
+                topk_indices,
+            )
         else:
             comp, comp_stride, comp_block = self._dummy, 0, 1
             bt, bt_stride, topk = self._dummy, 0, self._dummy
