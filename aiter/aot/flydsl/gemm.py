@@ -15,7 +15,6 @@ Supported kernel families:
   - ``flydsl_hgemm_*_gfx1250``                gfx1250 A16W16 GEMM kernels
   - ``flydsl_bpreshuflle_*``                  a8w8 preshuffle GEMM kernels
   - ``flydsl_bpreshuffle_splitk_*``           gfx950 split-K a8w8 preshuffle GEMM (two-pass)
-  - ``flydsl_a4w4_splitk_*``                  gfx950 split-K mxfp4 (a4w4) preshuffle GEMM (two-pass)
   - ``flydsl_bpreshuffle_8w_*``               gfx950 8-wave a8w8 ptpc GEMM kernels
   - ``flydsl_bpreshuffle_wmma_*``             gfx1250 a8w8 ptpc GEMM kernels
   - ``flydsl_mxfp8_128_bpreshuffle_wmma_*``   gfx1250 mxfp8_128 GEMM kernels
@@ -77,9 +76,6 @@ from aiter.ops.flydsl.gemm_kernels import (
     compile_gemm_decode_bf16,
     get_flydsl_hgemm_kernel_params,
     parse_gemm_decode_kernel_name,
-)
-from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a4w4_bpreshuffle_common import (
-    parse_a4w4_splitk_kernel_name as _parse_flydsl_a4w4_splitk_kernel_name,
 )
 from aiter.ops.flydsl.gemm_tune.flydsl_gemm_mxscale_preshuffle_common import (
     parse_kernel_name as parse_mxscale_preshuffle_kernel_name,
@@ -170,13 +166,6 @@ _SHORT_DTYPE = {
     "B16": "bf16",
     "F16": "fp16",
 }
-# ``_parse_flydsl_a4w4_splitk_kernel_name`` discards the OUTDTYPE token (it is
-# not needed for runtime dispatch, which reads dtype off the output tensor
-# instead); AOT needs a concrete torch dtype to allocate fake output/workspace
-# tensors, so pull that token back out of the name here.
-_A4W4_SPLITK_OUTDTYPE_RE = re.compile(
-    r"^flydsl_a4w4_splitk_\d+x\d+x\d+_sk\d+_(?P<out>[A-Z0-9]+)_"
-)
 
 
 def _parse_bool(value: str | None) -> bool:
@@ -398,41 +387,6 @@ def parse_csv(csv_path: str):
 
             if kernel_name.startswith("flydsl_bpreshuffle_splitk_"):
                 params = _parse_splitk_kernel_name(kernel_name)
-            elif kernel_name.startswith("flydsl_a4w4_splitk_"):
-                parsed = _parse_flydsl_a4w4_splitk_kernel_name(kernel_name)
-                out_match = _A4W4_SPLITK_OUTDTYPE_RE.match(kernel_name)
-                out_dtype = (
-                    _SHORT_DTYPE.get(out_match.group("out")) if out_match else None
-                )
-                if parsed is None or out_dtype is None:
-                    params = None
-                else:
-                    (
-                        p_tile_m,
-                        p_tile_n,
-                        p_tile_k,
-                        p_split_k,
-                        p_async_copy,
-                        p_waves_per_eu,
-                        p_xcd_swizzle,
-                        p_lds_stage,
-                        p_scheduler,
-                        p_use_m_bounded_store,
-                    ) = parsed
-                    params = {
-                        "kind": "a4w4_splitk",
-                        "tile_m": p_tile_m,
-                        "tile_n": p_tile_n,
-                        "tile_k": p_tile_k,
-                        "split_k": p_split_k,
-                        "out_dtype": out_dtype,
-                        "use_async_copy": p_async_copy,
-                        "waves_per_eu": p_waves_per_eu,
-                        "xcd_swizzle": p_xcd_swizzle,
-                        "lds_stage": p_lds_stage,
-                        "scheduler": p_scheduler,
-                        "use_m_bounded_store": p_use_m_bounded_store,
-                    }
             elif kernel_name.startswith("flydsl_bpreshuflle_"):
                 params = _parse_preshuffle_kernel_name(kernel_name)
             elif kernel_name.startswith("flydsl_mxpsh_"):
@@ -950,116 +904,6 @@ def _compile_splitk_to_cache(
         )
 
 
-def _compile_a4w4_splitk_to_cache(
-    *,
-    m: int,
-    n: int,
-    k: int,
-    out_dtype: str,
-    tile_m: int,
-    tile_n: int,
-    tile_k: int,
-    split_k: int,
-    use_async_copy: int,
-    waves_per_eu: int,
-    xcd_swizzle: int = 0,
-    lds_stage: int = 2,
-    scheduler: str = "Default",
-    use_m_bounded_store: bool = False,
-    **kwargs,
-):
-    """AOT-compile one a4w4 (mxfp4) split-K candidate.
-
-    Mirrors ``_compile_splitk_to_cache``, but for packed 4-bit operands: A/B
-    carry two fp4 codes per byte, so their storage extent is ``k // 2`` for the
-    logical (unpacked) ``k`` passed here -- the same convention
-    ``flydsl_preshuffle_gemm_splitk_a8`` uses when it doubles K for
-    ``in_dtype="fp4"``. The E8M0 block scales are one byte per 32-K block, row
-    (A) / column (B) major, matching ``shuffle_scale_w4_cdna4``'s output shape.
-
-    Calls ``compile_preshuffle_gemm_splitk``/``compile_preshuffle_gemm_splitk_reduce``
-    -- the same builders ``flydsl_preshuffle_gemm_splitk_a8`` (the runtime
-    dispatch target in ``gemm_op_a4w4.py``) calls internally -- with the
-    identical ``in_dtype="fp4"``/``scale_mode="mxfp4"``/``scale_block_k=32``
-    builder config, so the disk-cache key matches a real deploy-time call.
-    """
-    del kwargs
-    enable_scheduler = str(scheduler).lower() != "off"
-
-    import torch
-
-    dev = torch.device("cpu")
-    out_torch_dtype = _torch_dtype_for_kernel(out_dtype)
-
-    # fp4 packs two 4-bit codes per byte; k is the logical (unpacked) extent.
-    a = torch.empty((m * (k // 2),), device=dev, dtype=torch.int8)
-    b = torch.empty((n * (k // 2),), device=dev, dtype=torch.int8)
-    out = torch.empty((m * n,), device=dev, dtype=out_torch_dtype)
-
-    # E8M0 scales: one byte per 32-K block. A's scale is padded to a multiple
-    # of 32 rows before shuffling (see gemm_op_a4w4.py's dispatch), B's is not.
-    scale_k = k // 32
-    m_pad_scale = ((m + 31) // 32) * 32
-    scale_a = torch.empty((m_pad_scale * scale_k,), device=dev, dtype=torch.int8)
-    scale_b = torch.empty((n * scale_k,), device=dev, dtype=torch.int8)
-
-    bias = unused_tensor_arg(None, torch.empty(0, device=dev, dtype=out_torch_dtype))
-    stream = fx.Stream(0)
-
-    # Workspace: (split_k, m_pad, N) fp32 partials, flat for the launcher. Unused at
-    # split_k=1, where the GEMM writes the final output itself and there is no reduce.
-    m_pad = ((m + tile_m - 1) // tile_m) * tile_m
-    workspace = torch.empty((split_k * m_pad * n,), device=dev, dtype=torch.float32)
-    direct_out = split_k == 1
-
-    gemm_exe = compile_preshuffle_gemm_splitk(
-        N=n,
-        K=k,
-        tile_m=tile_m,
-        tile_n=tile_n,
-        tile_k=tile_k,
-        split_k=split_k,
-        in_dtype="fp4",
-        out_dtype="bf16" if out_torch_dtype == torch.bfloat16 else "fp16",
-        use_async_copy=bool(use_async_copy),
-        waves_per_eu=None if waves_per_eu <= 0 else waves_per_eu,
-        enable_scheduler=enable_scheduler,
-        xcd_swizzle=xcd_swizzle,
-        lds_stage=lds_stage,
-        scale_mode="mxfp4",
-        scale_block_k=32,
-        use_m_bounded_store=use_m_bounded_store,
-        direct_out=direct_out,
-    )
-    _compile_executable_to_cache(
-        gemm_exe,
-        out if direct_out else workspace,
-        a,
-        b,
-        scale_a,
-        scale_b,
-        bias,
-        m,
-        n,
-        stream,
-    )
-
-    if not direct_out:
-        reduce_exe = compile_preshuffle_gemm_splitk_reduce(
-            N=n,
-            split_k=split_k,
-            out_dtype="bf16" if out_torch_dtype == torch.bfloat16 else "fp16",
-        )
-        _compile_executable_to_cache(
-            reduce_exe,
-            out,
-            workspace,
-            m,
-            m_pad,
-            fx.Stream(0),
-        )
-
-
 def _compile_mxscale_preshuffle_to_cache(
     *,
     m: int,
@@ -1464,8 +1308,6 @@ def compile_one_config(
                 _compile_preshuffle_to_cache(m=m, n=n, k=k, **kwargs)
             elif kind == "splitk":
                 _compile_splitk_to_cache(m=m, n=n, k=k, **kwargs)
-            elif kind == "a4w4_splitk":
-                _compile_a4w4_splitk_to_cache(m=m, n=n, k=k, **kwargs)
             elif kind == "mxscale_preshuffle":
                 _compile_mxscale_preshuffle_to_cache(m=m, n=n, k=k, **kwargs)
             elif kind == "8wave":

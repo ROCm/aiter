@@ -66,9 +66,6 @@ def flydsl_preshuffle_gemm_splitk_a8(
     n = WQ.shape[0]
     if in_dtype is None:
         in_dtype = "int8" if XQ.dtype == torch.int8 else "fp8"
-    if in_dtype == "fp4":
-        # XQ/WQ carry two fp4 codes per byte, so the stored extent is K/2.
-        k *= 2
 
     if n % tile_n != 0 or k % tile_k != 0:
         raise ValueError(
@@ -109,7 +106,7 @@ def flydsl_preshuffle_gemm_splitk_a8(
         xcd_swizzle=int(xcd_swizzle),
         lds_stage=int(lds_stage),
         scale_mode=scale_mode,
-        scale_block_k=32 if scale_mode == "mxfp4" else 128,
+        scale_block_k=128,
         use_m_bounded_store=(
             USE_M_BOUNDED_STORE if use_m_bounded_store is None else use_m_bounded_store
         ),

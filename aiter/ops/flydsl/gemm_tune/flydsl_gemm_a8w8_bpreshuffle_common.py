@@ -175,7 +175,7 @@ def max_lds_bytes_for_tune() -> int:
     times per shape). The arch is resolved once at import below, so a
     process-lifetime cache changes nothing.
     """
-    return get_lds_capacity_bytes(get_gfx().split(":", 1)[0])
+    return get_lds_capacity_bytes(get_gfx())
 
 
 def _padded_m(M: int) -> int:
@@ -194,9 +194,7 @@ def _padded_m(M: int) -> int:
         return (M + 127) // 128 * 128
 
 
-def kernel_fits_shape(
-    ki: kernelInstance, M: int, N: int, K: int, *, lds_bytes: int | None = None
-) -> bool:
+def kernel_fits_shape(ki: kernelInstance, M: int, N: int, K: int) -> bool:
     """Whether a preshuffle candidate is worth tuning for this shape.
 
     Ragged M is legal: the device kernel bounds A, scale-A, and C buffer
@@ -205,16 +203,8 @@ def kernel_fits_shape(
     preshuffle group. K remains a tile-divisibility requirement. Changes here
     alter the tuner search space and therefore require affected model shapes to
     be re-tuned.
-
-    ``lds_bytes``, when given, overrides ``kernel_instance_estimated_lds_bytes(ki)``
-    for the LDS clause only -- lets a sibling family (e.g. the a4w4/mxfp4
-    split-K candidates, whose packed-4-bit A-tile footprint this module's
-    dtype table does not represent) delegate to these audited clauses without
-    misrepresenting ``ki.q_dtype_a``.
     """
-    if (
-        lds_bytes if lds_bytes is not None else kernel_instance_estimated_lds_bytes(ki)
-    ) > max_lds_bytes_for_tune():
+    if kernel_instance_estimated_lds_bytes(ki) > max_lds_bytes_for_tune():
         return False
     if N % 16 != 0 or K % ki.tile_k != 0:
         return False
@@ -560,8 +550,6 @@ kernels_list_8wave: dict[int, EightWaveKernelInstance] = (
 
 KERNEL_ID_BASE_SPLITK = 2_000_000
 KERNEL_ID_BASE_SPLITK_BLOCKSCALE = 3_000_000
-# a4w4 (mxfp4) split-K claims 4_000_000 in its own module's ID space; skip past
-# it here too even though the two dicts never collide (separate module).
 KERNEL_ID_BASE_SPLITK_MX128 = 5_000_000
 NAME_PREFIX_SPLITK = "flydsl_bpreshuffle_splitk"
 

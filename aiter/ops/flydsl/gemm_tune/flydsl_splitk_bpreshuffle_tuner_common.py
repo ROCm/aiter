@@ -1,14 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""``GemmCommonTuner`` scaffolding shared by the FlyDSL split-K bpreshuffle
-tuners -- ``gemm_a8w8_blockscale_bpreshuffle_tune.py`` (blockscale + mx128)
-and ``gemm_a4w4_blockscale_bpreshuffle_tune.py`` (mxfp4). Both subclasses'
-``tune()``/``result_to_df()`` bodies were byte-identical (~100 lines) except
-for which per-shape task-getter method(s) ``tune()`` calls -- one for a4w4,
-two for a8w8. That is the only axis of variation, so it is the only thing a
-subclass still overrides here: ``_tune_task_getter_names()``, returning the
-ordered tuple of its own ``get_flydsl_splitk_*_tune_task`` method names.
+"""``GemmCommonTuner`` scaffolding for the FlyDSL split-K bpreshuffle
+tuner -- ``gemm_a8w8_blockscale_bpreshuffle_tune.py`` (blockscale + mx128).
+The only axis of variation a subclass overrides is
+``_tune_task_getter_names()``, returning the ordered tuple of its own
+``get_flydsl_splitk_*_tune_task`` method names.
 Everything else (task-loop shape, ``mp_tuner`` invocation, result-row
 assembly) lives once, in ``FlydslSplitKBpreshuffleTuner`` below.
 

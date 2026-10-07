@@ -26,7 +26,6 @@ from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, gpu, math, range_constexpr, rocdl
 from flydsl.expr.typing import (
     BFloat16,
-    Float4E2M1FN,
     Float8E4M3FN,
     Float8E4M3FNUZ,
     Float16,
@@ -176,8 +175,8 @@ def compile_preshuffle_gemm_splitk(
     only remaining job would be a one-slice copy — unnecessary. The first argument is
     then the output tensor itself, not a workspace.
     """
-    if in_dtype not in ("fp8", "int8", "fp16", "bf16", "fp4"):
-        raise ValueError(f"in_dtype must be fp8/int8/fp16/bf16/fp4, got {in_dtype!r}")
+    if in_dtype not in ("fp8", "int8", "fp16", "bf16"):
+        raise ValueError(f"in_dtype must be fp8/int8/fp16/bf16, got {in_dtype!r}")
     if tile_n < 16:
         raise ValueError(f"tile_n must be at least 16; got tile_n={tile_n}")
     if tile_k <= 0 or K % tile_k != 0:
@@ -190,9 +189,9 @@ def compile_preshuffle_gemm_splitk(
         raise ValueError(f"split-K supports only epilogue='none', got {epilogue!r}")
     if lds_stage not in (1, 2):
         raise ValueError(f"lds_stage must be 1 or 2, got {lds_stage}")
-    if scale_mode not in ("epilogue", "blockscale", "mx128", "mxfp4"):
+    if scale_mode not in ("epilogue", "blockscale", "mx128"):
         raise ValueError(
-            f"scale_mode must be epilogue/blockscale/mx128/mxfp4, got {scale_mode!r}"
+            f"scale_mode must be epilogue/blockscale/mx128, got {scale_mode!r}"
         )
     if split_k < 1 or split_k > (K // tile_k):
         # Splits are cut on the tile boundary — B is addressed through the logical
@@ -221,13 +220,10 @@ def compile_preshuffle_gemm_splitk(
     is_int8 = in_dtype == "int8"
     is_f16 = in_dtype == "fp16"
     is_bf16 = in_dtype == "bf16"
-    is_fp4 = in_dtype == "fp4"
     is_f16_or_bf16 = is_f16 or is_bf16
     is_8bit = is_fp8 or is_int8
-    # fp4 is sub-byte, so every tile/LDS/copy extent is derived from elem_bits and
-    # only collapses to whole bytes at the granularities the hardware moves (>=16B).
-    elem_bits = 4 if is_fp4 else (8 if is_8bit else 16)
-    elem_bytes = elem_bits // 8  # 0 for fp4 — use nbytes() for byte arithmetic
+    elem_bits = 8 if is_8bit else 16
+    elem_bytes = elem_bits // 8
 
     def nbytes(n_elems):
         return n_elems * elem_bits // 8
@@ -239,28 +235,19 @@ def compile_preshuffle_gemm_splitk(
     gpu_arch = get_rocm_arch()
     is_gfx942 = str(gpu_arch).startswith("gfx942")
     is_gfx950 = str(gpu_arch).startswith("gfx950")
-    use_mfma_scale_128 = (is_fp8 or is_fp4) and is_gfx950 and (tile_k % 128 == 0)
+    use_mfma_scale_128 = is_fp8 and is_gfx950 and (tile_k % 128 == 0)
     use_mfma_k32 = is_f16_or_bf16 and is_gfx950
 
     is_blockscale = scale_mode == "blockscale"
     # mx128: same [K/128, M] / [N/128, K/128] scale geometry as blockscale, but the
     # scales are E8M0 bytes, which the 16x16x128 scaled MFMA consumes natively — so
     # the dequant is the hardware scale operand rather than an in-loop fp32 fma.
-    # mxfp4: 4-bit operands with a 32-K E8M0 block, so one 128-K MFMA spans four
-    # scale bytes per operand — supplied by the four lane groups rather than by a
-    # single broadcast byte as in mx128.
-    is_mx32 = scale_mode == "mxfp4"
-    is_mx = scale_mode == "mx128" or is_mx32
-    if is_mx32 != is_fp4:
-        raise ValueError(
-            f"scale_mode='mxfp4' and in_dtype='fp4' imply each other; got "
-            f"scale_mode={scale_mode!r}, in_dtype={in_dtype!r}"
-        )
+    is_mx = scale_mode == "mx128"
     # gfx942 has no 16x16x128 scaled MFMA; blockscale dequants in software regardless,
     # so cover each 128-K scale block with 4x standard 16x16x32 fp8 MFMA accumulated
     # into frag_blk (the existing K=64 tiled_mma issues two k-steps per block) and reuse
-    # the same in-loop fp32 dequant. mx128/mxfp4 have no gfx942 path (they need the
-    # hardware scale operand) and stay gfx950-only.
+    # the same in-loop fp32 dequant. mx128 has no gfx942 path (it needs the
+    # hardware scale operand) and stays gfx950-only.
     use_blockscale_gfx942 = (
         is_fp8 and is_gfx942 and is_blockscale and (tile_k % 128 == 0)
     )
@@ -269,22 +256,15 @@ def compile_preshuffle_gemm_splitk(
         # depth must be a multiple of the scale block and each tile hold whole blocks.
         if not ((is_gfx950 and use_mfma_scale_128) or use_blockscale_gfx942):
             raise ValueError(
-                f"scale_mode={scale_mode!r} requires fp8/fp4 with tile_k%128==0 on "
+                f"scale_mode={scale_mode!r} requires fp8 with tile_k%128==0 on "
                 f"gfx950 (16x16x128 scaled MFMA) or, for blockscale, gfx942 "
                 f"(4x16x16x32 software dequant); got in_dtype={in_dtype!r}, "
                 f"arch={gpu_arch}, tile_k={tile_k}"
             )
-        want_block_k = 32 if is_mx32 else 128
-        if scale_block_k != want_block_k:
+        if scale_block_k != 128:
             raise ValueError(
-                f"scale_mode={scale_mode!r} supports scale_block_k={want_block_k} "
+                f"scale_mode={scale_mode!r} supports scale_block_k=128 "
                 f"only, got {scale_block_k}"
-            )
-        if is_mx32 and (tile_k % 256 != 0 or K % 256 != 0):
-            # The shuffled E8M0 buffer is addressed in 256-K chunks (8 blocks of 32).
-            raise ValueError(
-                f"scale_mode='mxfp4' needs tile_k and K to be multiples of 256; "
-                f"got tile_k={tile_k}, K={K}"
             )
         if tile_k % scale_block_k != 0 or K % scale_block_k != 0:
             raise ValueError(
@@ -297,8 +277,6 @@ def compile_preshuffle_gemm_splitk(
         layout_elem = Float16 if is_f16 else BFloat16
     elif is_int8:
         layout_elem = Int8
-    elif is_fp4:
-        layout_elem = Float4E2M1FN
     else:
         layout_elem = Float8E4M3FN if is_gfx950 else Float8E4M3FNUZ
     # Without direct_out, out_dtype is carried for the reduce pass only and this pass
@@ -331,24 +309,12 @@ def compile_preshuffle_gemm_splitk(
     num_b_loads = nbytes(tile_n * tile_k) // total_threads // 16
     num_ds_load = nbytes(tile_m * tile_k) // 64 // 16  # A LDS reads per wave
     num_gmem_loads = num_a_loads + num_b_loads
-    if is_fp4:
-        # The G2S copy gives every thread one 16B chunk of a K row, so the tile must
-        # be at least total_threads*16 bytes or the thread grid spills past tile_m and
-        # the trailing rows never get written. fp4 halves the tile bytes, which puts
-        # otherwise-legal (tile_m, tile_k) pairs under the floor.
-        thrs_m = total_threads // (tile_k // (a_load_bytes * 8 // elem_bits))
-        if thrs_m > tile_m:
-            raise ValueError(
-                f"tile_m={tile_m}, tile_k={tile_k} is too small for fp4: the A tile is "
-                f"{nbytes(tile_m * tile_k)}B but the {total_threads}-thread G2S copy "
-                f"needs >= {total_threads * a_load_bytes}B (raise tile_k or tile_m)"
-            )
-    if (is_8bit or is_fp4) and is_gfx950:
+    if is_8bit and is_gfx950:
         dsrd_preload, dvmem_preload = _get_preload(tile_m, tile_n, tile_k)
     else:
         dsrd_preload, dvmem_preload = (0, 0)
 
-    a_lds_elems = tile_m * tile_k * (2 if is_fp4 else 1)
+    a_lds_elems = tile_m * tile_k
 
     @fx.struct
     class SharedStorage:
@@ -463,7 +429,7 @@ def compile_preshuffle_gemm_splitk(
         thr_g2r_B = fx.make_tiled_copy_B(buf_copy, tiled_mma).get_slice(tid)
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
-        if const_expr(is_8bit or is_fp4):
+        if const_expr(is_8bit):
             k_blocks16 = nbytes(tile_k) // 16
             if k_blocks16 <= 0 or (k_blocks16 & (k_blocks16 - 1)) != 0:
                 raise ValueError(
@@ -471,7 +437,7 @@ def compile_preshuffle_gemm_splitk(
                     "expected tile_k bytes to be a positive multiple of 16 with (bytes/16) a power of two."
                 )
             swz_bits = k_blocks16.bit_length() - 1  # log2
-            # base = log2(elements per 16B): 4 for 8-bit, 5 for fp4.
+            # base = log2(elements per 16B): 4 for 8-bit.
             swz_base = (128 // elem_bits).bit_length() - 1
             swz = fx.SwizzleType.get(swz_bits, swz_base, swz_bits)
         else:
@@ -770,67 +736,8 @@ def compile_preshuffle_gemm_splitk(
                     return Vec(acc) + Vec(blk) * Vec(sc)
                 return math.fma(blk, sc, acc)
 
-        # ── In-loop E8M0 hardware scale (scale_mode="mxfp4") ──────
-        if const_expr(is_mx32):
-            # 32-K blocks: one 128-K MFMA needs four scale bytes per operand, and the
-            # hardware sources them from the four lane groups (lane//16 = sub-block,
-            # lane%16 = row/col). The buffers are the shuffle_scale_w4_cdna4 layout,
-            # [G/32, K/256, KLane=4, NLane=16, KPack=2, NPack=2] bytes over the
-            # 16-row/16-col group axis G, so a lane's dword is
-            # ((g1*K1 + chunk)*64 + lane) and the byte within it is
-            # kpack*2 + npack. opsel stays 0 — the byte is selected by address and
-            # masked into bits [7:0], which keeps the atom identical to mx128's.
-            mx32_lane = gpu.thread_id("x") % 64
-            mx32_wave = gpu.thread_id("x") // 64
-            mx32_K1 = K // 256
-            mx32_a_grp = [bid_x * m_repeat + mi for mi in range_constexpr(m_repeat)]
-            mx32_b_grp = [
-                bid_y * (tile_n // 16) + ni * num_waves + mx32_wave
-                for ni in range_constexpr(num_acc_n)
-            ]
-            # The shuffled A-scale groups 32 rows, so its real extent is M rounded up
-            # to that group — bounding at M would clip the tail group's dwords to 0.
-            mx32_sa_rsrc = buffer_ops.create_buffer_resource(
-                arg_scale_a,
-                max_size=False,
-                num_records_bytes=fx.Int64((Int32(i32_m) + Int32(31)) // Int32(32))
-                * fx.Int64(32 * scale_k),
-            )
-            mx32_sb_rsrc = buffer_ops.create_buffer_resource(
-                arg_scale_b,
-                max_size=False,
-                num_records_bytes=fx.Int64(N * scale_k),
-            )
-
-            def mx32_byte(rsrc, grp, chunk, sub_byte):
-                g1 = Int32(grp) // Int32(2)
-                npack = Int32(grp) % Int32(2)
-                dword = (g1 * Int32(mx32_K1) + chunk) * Int32(64) + Int32(mx32_lane)
-                return Int32(
-                    buffer_ops.buffer_load(
-                        rsrc,
-                        dword * Int32(4) + sub_byte + npack,
-                        vec_width=1,
-                        dtype=T.i8,
-                    )
-                ) & Int32(0xFF)
-
-            def mx_scale_words(khs):
-                """(scale_a[mi], scale_b[ni]) E8M0 bytes for global 128-K step ``khs``."""
-                chunk = Int32(khs) // Int32(2)
-                sub_byte = (Int32(khs) % Int32(2)) * Int32(2)  # kpack * 2
-                sa = [
-                    mx32_byte(mx32_sa_rsrc, mx32_a_grp[mi], chunk, sub_byte)
-                    for mi in range_constexpr(m_repeat)
-                ]
-                sb = [
-                    mx32_byte(mx32_sb_rsrc, mx32_b_grp[ni], chunk, sub_byte)
-                    for ni in range_constexpr(num_acc_n)
-                ]
-                return sa, sb
-
         # ── In-loop E8M0 hardware scale (scale_mode="mx128") ──────
-        elif const_expr(is_mx):
+        if const_expr(is_mx):
             mx_bx_m = bid_x * tile_m
             # A/B operand lane map for 16x16x128: lane holds row/col lane%16, so the
             # per-row A scale is lane-varying and the per-128-column B scale is
@@ -960,8 +867,7 @@ def compile_preshuffle_gemm_splitk(
                     # One k-step spans exactly one 128-K scale block, so a single
                     # E8M0 byte per operand covers the whole MFMA: the accumulator
                     # comes out dequantized with no epilogue fixup.
-                    # Global 128-K MFMA step: mx128 has one scale block per step and
-                    # mxfp4 four, so the step index (not the block index) is the key.
+                    # Global 128-K MFMA step: mx128 has one scale block per step.
                     sa, sb = mx_scale_words(k_tile * Int32(k_iters) + Int32(ki))
                     # Scale words are atom state, so one gemm can only carry one (mi, ni)
                     # pair of them: issue the sub-blocks explicitly instead of letting
@@ -1275,13 +1181,6 @@ def compile_preshuffle_gemm_splitk(
         elif const_expr(is_int8):
             mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, layout_elem, Int32))
             k_perm = fx.make_layout((8, 4, 2), (1, 16, 8))
-        elif const_expr(is_fp4):
-            # fp4 has no narrow MFMA: the scaled 16x16x128 atom is the only one, and
-            # it is what the kernel rebuilds in-kernel with the E8M0 operands bound.
-            mma_atom = fx.make_mma_atom(
-                fx.rocdl.cdna4.MFMA_Scale(16, 16, 128, layout_elem)
-            )
-            k_perm = fx.make_layout((32, 4), (1, 32))
         else:
             # fp8: narrow atom here; the scale (16x16x128) tiled_mma is rebuilt in-kernel
             mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, layout_elem))
@@ -1306,14 +1205,8 @@ def compile_preshuffle_gemm_splitk(
             fx.make_tile(thrs_m, tile_k),
         )
 
-        # fp4 arrives as packed bytes; retype the iterators so the layout algebra
-        # counts 4-bit elements (every extent below is in elements, not bytes).
-        if const_expr(is_fp4):
-            a_iter = fx.recast_iter(layout_elem, fx.get_iter(arg_a))
-            b_iter = fx.recast_iter(layout_elem, fx.get_iter(arg_b))
-        else:
-            a_iter = fx.get_iter(arg_a)
-            b_iter = fx.get_iter(arg_b)
+        a_iter = fx.get_iter(arg_a)
+        b_iter = fx.get_iter(arg_b)
 
         # Preshuffle B layout (2D hierarchical)
         kp_bytes = 16
