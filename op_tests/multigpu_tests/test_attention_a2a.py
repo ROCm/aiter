@@ -50,6 +50,7 @@ _NATIVE_CASES = (
 _PACKED_CASES = (
     _PackedCase("int8-e4m3", "int8", "e4m3"),
     _PackedCase("e4m3-e4m3", "e4m3", "e4m3"),
+    _PackedCase("mxfp8-e4m3", "mxfp8", "e4m3"),
     _PackedCase("mxfp4-mxfp4", "mxfp4", "mxfp4"),
     _PackedCase("mxfp6-mxfp4", "mxfp6", "mxfp4"),
     _PackedCase("mxfp6-mxfp4-fp6p", "mxfp6", "mxfp4", AttentionPack.V_FOR_FP6_P),
@@ -407,6 +408,8 @@ def _check_packed(rank, world_size, heads, sequence, device, op_cls, name):
         quantize_mxfp4_q,
         quantize_mxfp6_k,
         quantize_mxfp6_q,
+        quantize_mxfp8_k,
+        quantize_mxfp8_q,
     )
     from aiter.ops.mha_v4_quant import (
         MHA_V4_KV_SCALE_LOOKAHEAD_ROWS,
@@ -446,6 +449,7 @@ def _check_packed(rank, world_size, heads, sequence, device, op_cls, name):
         ),
         "mxfp4": (quantize_mxfp4_q, quantize_mxfp4_k, _quantize_v_mxfp4_default),
         "mxfp6": (quantize_mxfp6_q, quantize_mxfp6_k, None),
+        "mxfp8": (quantize_mxfp8_q, quantize_mxfp8_k, quantize_fp8),
     }
     codecs = (qk_codec, qk_codec, v_codec)
     references = []
@@ -1019,7 +1023,7 @@ def test_a2a(world_size, recipe, sequence, heads, blocks):
         keep, exchange = _build_check(
             recipe, _CTX.rank, world_size, heads, sequence, _CTX.device, _CTX.op_cls
         )
-    except AssertionError as exc:
+    except Exception as exc:  # noqa: BLE001
         failure = exc
     # Ranks must agree on the verdict before any benchmark launch: the exchange
     # waits on every peer, so one rank tearing down on a failed check would leave

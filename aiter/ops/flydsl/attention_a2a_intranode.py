@@ -67,8 +67,11 @@ class AttentionA2AIntraNodeOp:
     contain two E2M1 values per byte, low nibble first. Raw MXFP6 payloads contain
     contiguous E2M3 six-bit codes, least-significant bits first.
     Quantized calls return locally dequantized bf16 Q/K/V by default.
-    Set return_packed=True for MHA V4 bytes in
-    (outputs, (q_scales, k_scales, v_scales)); otherwise results are dequantized to bf16.
+    By default, submit_role returns None for Q/K and a tuple of three BF16 outputs
+    for V; quantized outputs are locally dequantized. With return_packed=True, each
+    submit_role returns PackedRoleResult(payload, scale) for that role in MHA V4
+    layout. Results alias double-buffered storage and become ready when the
+    submitted stream work completes.
     e4m3 is the device's native FP8 (E4M3FNUZ on gfx942, OCP E4M3FN on gfx950).
     Packed MX formats are gfx950-only. Packed outputs use role-specific scale layouts:
     MXFP4 V uses token-axis scales in gather order, and E4M3 V uses one float32
