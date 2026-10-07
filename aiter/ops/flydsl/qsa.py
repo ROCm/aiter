@@ -12,10 +12,10 @@ prefill scores 16 query rows per workgroup. The indexer head count is 4 or
 
 ``qsa_sparse_gqa`` writes sparse GQA ``o [M, Hq, D]`` from paged K/V at the
 selected token ids. Decode runs a BLOCK_N=16 two-wave tile with split-K and
-an LSE merge; prefill runs BLOCK_N=32 two waves and writes output directly
-once the grid alone fills the machine. Softmax is online in log2 space and the
-split
-partials are FP32. Expand+tail and the sigmoid gate stay unfused.
+an LSE merge; gfx942 widens that tile to four waves when the grid fits in
+the CUs. Prefill runs BLOCK_N=32 two waves and writes output directly once
+the grid alone fills the machine. Softmax is online in log2 space and the
+split partials are FP32. Expand+tail and the sigmoid gate stay unfused.
 
 The fp32 reference, the paged-cache fixtures, and the concrete shapes
 live in ``op_tests/qsa_ref.py``.
@@ -50,6 +50,7 @@ from .kernels.qsa.indexer_select import (
 )
 from .kernels.qsa.sparse_gqa import (
     _TINY_SPLITS,
+    _gfx942_reg_qk,
     _k2_coverage_reason,
     _launch_config,
     build_qsa_sparse_gqa_module,
@@ -833,6 +834,14 @@ def qsa_sparse_gqa(
     block_n, block_threads, n_splits = _launch_config(
         rows, n_sel, n_kv_heads, head_dim, tiny_splits
     )
+    # gfx950 stays on the fitted 128-thread schedule. gfx942 BN16 with one
+    # workgroup per CU has two idle SIMDs at 128 threads; 256 threads fills
+    # them, and the register QK split keeps that from redoing every K step.
+    if arch == "gfx942" and _gfx942_reg_qk(head_dim, block_n):
+        from aiter.jit.utils.chip_info import get_cu_num
+
+        if int(rows) * n_kv_heads * n_splits <= get_cu_num():
+            block_threads = 256
     if n_splits == 1:
         # The split kernel stores straight into out. A caller workspace
         # is not a second buffer on this path.
