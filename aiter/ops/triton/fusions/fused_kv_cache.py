@@ -137,9 +137,11 @@ def fused_qk_rope_cat_and_cache_mla(
 
     Models without a rotary embedding use fused_qk_cat_and_cache_mla instead.
 
-    Returns:
+    Returns (kv_cache is written in place for every slot >= 0 and not returned):
     - q_out: The output matrix with shape (B, QH, D1+D2).
-    - kv_cache: The output matrix with shape (B_max, KH, D1 + D2) (inplace).
+    - decode_q_pe_out: The rotated q_pe of the first num_decode_toks_for_zeros tokens, shape (num_decode_toks_for_zeros, QH, D2).
+    - k_pe_out: The rotated k_pe with shape (B_slot, KH, D2); rows whose slot is -1 are not written.
+    - q_nope_zeros_out: Zeros with shape (num_decode_toks_for_zeros, QH, D1).
     """
     _LOGGER.info(
         "FUSED_QK_ROPE_CAT_AND_CACHE_MLA: q_nope=%s q_pe=%s k_nope=%s k_pe=%s pos=%s cos=%s sin=%s kv_cache=%s slot_mapping=%s",
@@ -233,11 +235,17 @@ def fused_qk_cat_and_cache_mla(
     fused_qk_rope_cat_and_cache_mla for models without a rotary embedding
     (e.g. Kimi-K3): the PE halves are copied through unrotated, and the q
     concat, the k concat, the k_scale quantization and the KV-cache write stay
-    fused in one launch. Shapes, outputs and the remaining arguments are those
-    of fused_qk_rope_cat_and_cache_mla.
+    fused in one launch. Shapes and the remaining arguments are those of
+    fused_qk_rope_cat_and_cache_mla.
 
     Not available on gfx1250: the gluon kernel stages cos/sin through TDM and
     has no NoPE form.
+
+    Returns (kv_cache is written in place for every slot >= 0 and not returned):
+    - q_out: cat(q_nope, q_pe) with shape (B, QH, D1+D2).
+    - decode_q_pe_out: q_pe of the first num_decode_toks_for_zeros tokens, shape (num_decode_toks_for_zeros, QH, D2).
+    - k_pe_out: A copy of k_pe with shape (B_slot, KH, D2); rows whose slot is -1 are not written.
+    - q_nope_zeros_out: Zeros with shape (num_decode_toks_for_zeros, QH, D1).
     """
     assert DEVICE_ARCH != "gfx1250", (
         "fused_qk_cat_and_cache_mla has no gfx1250 kernel; the gluon "
