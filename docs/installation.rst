@@ -101,13 +101,11 @@ Environment Variables
        count still cap the pool. Ignored when no GPU is visible.
      - ``8``
 
-For an AITER-owned compile, worker-ceiling precedence is explicit
-``AITER_MAX_JOBS`` first, then a valid positive legacy ``MAX_JOBS``, then
-automatic sizing. Runtime JIT reads the legacy value without modifying either
-variable. Standalone package/setup builds, AOT CLIs, and standalone PA-Gluon or
-OPUS builders adopt it into ``AITER_MAX_JOBS`` and emit a ``FutureWarning``.
-Explicit and legacy values are ceilings only: live CPU and memory budgets
-always clamp them. Plain imports do not perform any legacy lookup.
+For an AITER-owned compile, worker-ceiling precedence and the sizing formula
+are documented in the *Build parallelism* section of the top-level README.
+Standalone package/setup builds, AOT CLIs, and standalone PA-Gluon or OPUS
+builders adopt a valid positive legacy ``MAX_JOBS`` into ``AITER_MAX_JOBS``
+and emit a ``FutureWarning``.
 
 Example Configurations
 """"""""""""""""""""""

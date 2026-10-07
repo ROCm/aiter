@@ -398,9 +398,11 @@ def get_automatic_worker_budgets() -> tuple[int, int]:
 def adopt_legacy_max_jobs() -> None:
     """Adopt a valid legacy ``MAX_JOBS`` value at AITER-owned entrypoints.
 
-    This compatibility bridge must not be called from imports or runtime JIT
-    helpers: parent frameworks own their generic ``MAX_JOBS`` setting. AITER's
-    standalone build entrypoints call it explicitly before selecting workers.
+    This compatibility bridge must not be reached from library imports or
+    runtime JIT helpers: parent frameworks own their generic ``MAX_JOBS``
+    setting there. Only AITER's own build entrypoints call it, before selecting
+    workers: ``setup.py`` at module scope, because it is the build entrypoint
+    rather than a library, and the AOT scripts under their ``__main__`` guards.
     """
     if _WORKER_ENV in os.environ:
         return
