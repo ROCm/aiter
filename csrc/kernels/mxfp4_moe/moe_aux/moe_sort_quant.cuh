@@ -4,6 +4,7 @@
 #pragma once
 
 #include "common/arithmetic.hpp"
+#include "mx_quant_utils.h"
 #include "opus/opus.hpp"
 
 namespace aiter::mxfp4_moe::moe_sort_quant {
@@ -297,6 +298,88 @@ __device__ __forceinline__ void quant_subkernel(const __hip_bfloat16 *hidden_sta
     quant_impl<N_QCTAS, THREADS_PER_CTA, D_HIDDEN>(blockIdx.x - 1, M, hidden_states, a_quant, a_scale);
 }
 
+template <int N_QCTAS, int THREADS_PER_CTA, int D_HIDDEN>
+__device__ __forceinline__ void quant_fp8_subkernel(
+    const __hip_bfloat16 *hidden_states,
+    uint8_t *a_quant,
+    uint8_t *a_scale,
+    int M,
+    int input_stride)
+{
+    constexpr int BLOCKS_PER_HIDDEN = D_HIDDEN / 32;
+    constexpr int LANES_PER_BLOCK   = 4;
+    constexpr int BLOCKS_PER_WAVE   = WARP_SIZE / LANES_PER_BLOCK;
+    constexpr int WAVES_PER_CTA     = THREADS_PER_CTA / WARP_SIZE;
+    constexpr int BLOCKS_PER_CTA    = BLOCKS_PER_WAVE * WAVES_PER_CTA;
+    constexpr int TOTAL_THREADS     = N_QCTAS * THREADS_PER_CTA;
+
+    const int quant_cta      = blockIdx.x - 1;
+    const int tid            = threadIdx.x;
+    const int wave_id        = tid / WARP_SIZE;
+    const int lane           = tid % WARP_SIZE;
+    const int block_in_wave  = lane / LANES_PER_BLOCK;
+    const int lane_in_block  = lane % LANES_PER_BLOCK;
+    const int total_blocks   = M * BLOCKS_PER_HIDDEN;
+    const int global_group   = quant_cta * BLOCKS_PER_CTA +
+                             wave_id * BLOCKS_PER_WAVE + block_in_wave;
+    const int group_stride   = TOTAL_THREADS / LANES_PER_BLOCK;
+
+    using ush2 = unsigned short __attribute__((ext_vector_type(2)));
+    using s2   = short __attribute__((ext_vector_type(2)));
+
+    for(int my_block = global_group; my_block < total_blocks; my_block += group_stride)
+    {
+        const int token = my_block / BLOCKS_PER_HIDDEN;
+        const int group = my_block % BLOCKS_PER_HIDDEN;
+        const int kb = token * input_stride + group * 32 + lane_in_block * 8;
+        uint32_t h[4];
+        *reinterpret_cast<int4 *>(h) =
+            *reinterpret_cast<const int4 *>(&hidden_states[kb]);
+
+        uint16_t local_amax = 0;
+#pragma unroll
+        for(int j = 0; j < 4; ++j)
+        {
+            const uint16_t lo = static_cast<uint16_t>(h[j] & 0xffffu) & 0x7fffu;
+            const uint16_t hi = static_cast<uint16_t>(h[j] >> 16) & 0x7fffu;
+            local_amax = max(local_amax, max(lo, hi));
+        }
+        uint32_t a32 = static_cast<uint32_t>(local_amax);
+        a32 = max(a32,
+                  static_cast<uint32_t>(
+                      __builtin_amdgcn_mov_dpp(static_cast<int>(a32), 0xb1, 0xf, 0xf, true)));
+        a32 = max(a32,
+                  static_cast<uint32_t>(
+                      __builtin_amdgcn_mov_dpp(static_cast<int>(a32), 0x4e, 0xf, 0xf, true)));
+        const float amax = __builtin_bit_cast(float, a32 << 16);
+        const auto bs = aiter::fp_f32_to_e8m0_block_scale<
+            aiter::kDefaultMxScaleRoundMode, aiter::MxDtype::FP8_E4M3>(
+            max(amax, 1.0e-10f));
+
+#if defined(__gfx950__)
+        s2 q0{0, 0};
+        s2 q1{0, 0};
+        q0 = __builtin_amdgcn_cvt_scalef32_pk_fp8_bf16(
+            q0, __builtin_bit_cast(ush2, h[0]), bs.dq_scale, false);
+        q0 = __builtin_amdgcn_cvt_scalef32_pk_fp8_bf16(
+            q0, __builtin_bit_cast(ush2, h[1]), bs.dq_scale, true);
+        q1 = __builtin_amdgcn_cvt_scalef32_pk_fp8_bf16(
+            q1, __builtin_bit_cast(ush2, h[2]), bs.dq_scale, false);
+        q1 = __builtin_amdgcn_cvt_scalef32_pk_fp8_bf16(
+            q1, __builtin_bit_cast(ush2, h[3]), bs.dq_scale, true);
+        const uint64_t packed =
+            static_cast<uint64_t>(__builtin_bit_cast(uint32_t, q0)) |
+            (static_cast<uint64_t>(__builtin_bit_cast(uint32_t, q1)) << 32);
+        *reinterpret_cast<uint64_t *>(
+            &a_quant[static_cast<size_t>(my_block) * 32 + lane_in_block * 8]) = packed;
+#else
+        __builtin_trap();
+#endif
+        if(lane_in_block == 0)
+            a_scale[my_block] = bs.byte;
+    }
+}
+
 template <int NE, int TOPK, int MB, int D_HIDDEN, int N_CTAS, int THREADS_PER_CTA>
 __global__ void quant_kernel_impl(
     int M,
@@ -349,14 +432,91 @@ inline void launch(
     int32_t *reverse_sorted, float *sorted_weights,
     uint8_t *a_quant, uint8_t *a_scale,
     int32_t *m_indices,
-    __hip_bfloat16 *bf16_zero_out)
+    __hip_bfloat16 *bf16_zero_out,
+    int input_stride)
 {
+    (void)input_stride;
     sort_quant_kernel_impl<NE, TOPK, MB, D_HIDDEN, N_CTAS, THREADS_PER_CTA>
         <<<N_CTAS, THREADS_PER_CTA, 0, stream>>>(
             M, hidden, topk_ids, topk_w,
             sorted_token_ids, sorted_expert_ids, cumsum, reverse_sorted, sorted_weights,
             a_quant, a_scale, m_indices,
             bf16_zero_out);
+}
+
+template <int NE, int TOPK, int MB, int D_HIDDEN, int N_CTAS, int THREADS_PER_CTA>
+__global__ void sort_quant_fp8_kernel_impl(
+    int M,
+    const __hip_bfloat16 *__restrict__ hidden_states,
+    const int32_t *__restrict__ topk_ids,
+    const float *__restrict__ topk_weight,
+    int32_t *__restrict__ sorted_token_ids,
+    int32_t *__restrict__ sorted_expert_ids,
+    int32_t *__restrict__ cumsum_tensor,
+    int32_t *__restrict__ reverse_sorted,
+    float *__restrict__ sorted_weights,
+    uint8_t *__restrict__ a_quant,
+    uint8_t *__restrict__ a_scale,
+    int32_t *__restrict__ m_indices,
+    __hip_bfloat16 *__restrict__ bf16_zero_out,
+    int input_stride)
+{
+    if(blockIdx.x == 0)
+    {
+        sort_subkernel<NE, TOPK, MB, THREADS_PER_CTA>(
+            topk_ids,
+            topk_weight,
+            sorted_token_ids,
+            sorted_expert_ids,
+            sorted_weights,
+            cumsum_tensor,
+            reverse_sorted,
+            m_indices,
+            M);
+    }
+    else
+    {
+        quant_fp8_subkernel<N_CTAS - 1, THREADS_PER_CTA, D_HIDDEN>(
+            hidden_states, a_quant, a_scale, M, input_stride);
+    }
+    if(bf16_zero_out != nullptr)
+        zero_init_bf16_out_impl<D_HIDDEN, N_CTAS, THREADS_PER_CTA>(M, bf16_zero_out);
+}
+
+template <int NE, int TOPK, int MB, int D_HIDDEN, int N_CTAS, int THREADS_PER_CTA>
+inline void launch_fp8(
+    hipStream_t stream,
+    int M,
+    const __hip_bfloat16 *hidden,
+    const int32_t *topk_ids,
+    const float *topk_w,
+    int32_t *sorted_token_ids,
+    int32_t *sorted_expert_ids,
+    int32_t *cumsum,
+    int32_t *reverse_sorted,
+    float *sorted_weights,
+    uint8_t *a_quant,
+    uint8_t *a_scale,
+    int32_t *m_indices,
+    __hip_bfloat16 *bf16_zero_out,
+    int input_stride)
+{
+    sort_quant_fp8_kernel_impl<NE, TOPK, MB, D_HIDDEN, N_CTAS, THREADS_PER_CTA>
+        <<<N_CTAS, THREADS_PER_CTA, 0, stream>>>(
+            M,
+            hidden,
+            topk_ids,
+            topk_w,
+            sorted_token_ids,
+            sorted_expert_ids,
+            cumsum,
+            reverse_sorted,
+            sorted_weights,
+            a_quant,
+            a_scale,
+            m_indices,
+            bf16_zero_out,
+            input_stride);
 }
 
 template <int NE, int TOPK, int MB, int D_HIDDEN, int N_CTAS, int THREADS_PER_CTA, bool FullGrid>
