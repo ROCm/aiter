@@ -24,6 +24,7 @@ std::vector<at::Tensor> fmha_v3_bwd(const at::Tensor& dout, // [b, sq, hq, d]
                                     std::optional<at::Tensor> dv,                 // [b, sk, hk, d]
                                     std::optional<const at::Tensor> alibi_slopes, // [hq] or [b, hq]
                                     std::optional<const at::Tensor> rng_state,
-                                    std::optional<at::Generator> gen);
+                                    std::optional<at::Generator> gen,
+                                    std::optional<at::Tensor> softmax_d = std::nullopt); // [b, hq, sq] fp32, precomputed
 } // namespace torch_itfs
 } // namespace aiter

@@ -1391,6 +1391,7 @@ def gen_fmha_v3_bwd_fake_tensors(
     alibi_slopes: Tensor | None = None,
     rng_state: Tensor | None = None,
     gen: Generator | None = None,
+    softmax_d: Tensor | None = None,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     return common_mha_bwd_fake_tensors(q, k, v, dq, dk, dv)
 
@@ -1419,6 +1420,7 @@ def fmha_v3_bwd(
     alibi_slopes: Tensor | None = None,
     rng_state: Tensor | None = None,
     gen: Generator | None = None,
+    softmax_d: Tensor | None = None,  # D = rowsum(dO * O), fp32 [b, hq, sq]: skips its kernel
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 

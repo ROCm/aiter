@@ -959,7 +959,8 @@ namespace py = pybind11;
           py::arg("dv")           = std::nullopt, \
           py::arg("alibi_slopes") = std::nullopt, \
           py::arg("rng_state")    = std::nullopt, \
-          py::arg("gen")          = std::nullopt);
+          py::arg("gen")          = std::nullopt, \
+          py::arg("softmax_d")    = std::nullopt);
 
 #define ROCSOLGEMM_PYBIND                                                          \
     m.def("rocb_create_extension", &rocb_create_extension, "create_extension");    \

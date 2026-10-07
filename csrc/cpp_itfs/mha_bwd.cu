@@ -586,6 +586,8 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     auto odo_arg_storage = pack_fmha_bwd_odo_args(odo_args, compact_odo_args);
 
     auto pre_kernel_launch = [&]() {
+        if(a.d_precomputed)
+            return;
         arg_size = odo_arg_storage.size();
         int bdx = (arch_id == "gfx1250") ? 128 : 256;
         int gdx = (a.max_seqlen_q + ts_odo - 1) / ts_odo;

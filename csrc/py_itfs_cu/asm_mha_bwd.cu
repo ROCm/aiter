@@ -28,7 +28,8 @@ std::vector<at::Tensor> fmha_v3_bwd(const at::Tensor &dout,         // [b, sq, h
                                     std::optional<at::Tensor> dv_,
                                     std::optional<const at::Tensor> alibi_slopes_, // [hq] or [b, hq]
                                     std::optional<const at::Tensor> rng_state_,
-                                    std::optional<at::Generator> gen_)
+                                    std::optional<at::Generator> gen_,
+                                    std::optional<at::Tensor> softmax_d_) // [b, hq, sq] fp32: D, precomputed
 {
     if (is_causal) { window_size_right = 0; }
 
@@ -128,7 +129,16 @@ std::vector<at::Tensor> fmha_v3_bwd(const at::Tensor &dout,         // [b, sq, h
     auto stream = at::hip::getCurrentHIPStream();
 
     auto opts = q.options();
-    auto softmax_d = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
+    at::Tensor softmax_d;
+    if (softmax_d_.has_value()) {
+        softmax_d = softmax_d_.value();
+        CHECK_DEVICE(softmax_d);
+        TORCH_CHECK(softmax_d.dtype() == torch::kFloat32 && softmax_d.is_contiguous() &&
+                    softmax_d.sizes() == torch::IntArrayRef({batch_size, num_heads, seqlen_q}),
+                    "softmax_d must be a contiguous fp32 [batch, nheads, seqlen_q] tensor");
+    } else {
+        softmax_d = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
+    }
 
     at::Tensor workspace;
     auto workspace_alloc = [&workspace, opts](size_t bytes, bool zero_init) -> void* {
@@ -325,6 +335,7 @@ std::vector<at::Tensor> fmha_v3_bwd(const at::Tensor &dout,         // [b, sq, h
 
         // dq arrives uninitialised; mha_bwd zeroes it only on the path that needs it.
         args.zero_dq = [&dq]() { dq.zero_(); };
+        args.d_precomputed = softmax_d_.has_value();
 
         float t = aiter::mha_bwd(args, stream_config);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_v3_bwd");

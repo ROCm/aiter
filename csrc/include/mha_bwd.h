@@ -166,6 +166,10 @@ struct mha_bwd_args
     // workspace and the post kernel writes every element of dq, so zeroing dq first
     // would be a wasted full pass over it. Leave empty if dq is already zero.
     std::function<void()> zero_dq{};
+
+    // The caller supplies D = rowsum(dO * O) (fp32 [b, hq, sq] at d_ptr), so the pre kernel that computes it is
+    // not launched.
+    bool d_precomputed = false;
 };
 
 struct __attribute__((packed)) fmha_bwd_dqdkdv_args
