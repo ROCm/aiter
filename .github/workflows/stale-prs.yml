@@ -5,7 +5,7 @@ name: Stale pull requests
 
 on:
   schedule:
-    - cron: '0 0 * * *'
+    - cron: '0 1 * * *'
   workflow_dispatch:
 
 permissions:
@@ -23,9 +23,8 @@ jobs:
       - uses: actions/stale@1e223db275d687790206a7acac4d1a11bd6fe629  # v10.4.0
         with:
           days-before-pr-stale: 15
-          # -1 never closes; unset would fall back to the action's 7-day default.
-          days-before-pr-close: -1
-          days-before-issue-stale: -1
+          days-before-pr-close: 7
+          days-before-issue-stale: 30
           days-before-issue-close: -1
           stale-pr-label: stale
           exempt-pr-labels: 'do-not-close'
@@ -34,3 +33,7 @@ jobs:
           stale-pr-message: >
             No activity for 15 days, so this is now labelled `stale`. A push or
             a comment clears it; `keep-open` exempts it.
+          close-pr-message: 'Closing this PR due to continued inactivity. Please reopen as and when required'
+          stale-issue-message: 'This issue is stale because it has been open 30 days with no activity. Remove the stale label or comment, or this will be closed in 7 days.'
+          close-issue-message: 'Closing this issue after 7 days of inactivity since it was marked stale.'
+
