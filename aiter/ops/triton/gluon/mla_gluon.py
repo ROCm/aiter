@@ -1102,6 +1102,7 @@ def mla_gluon(
     # grid axis 2 is q_pos (qlen). o uses the caller's layout (3-D or 4-D).
     grid_reduce = (batch_size, nhead, qlen)
     sl_b, sl_qs, sl_h, sl_split, _ = logits_buf.stride()
+    reduce_num_warps = 1 if REGIME == "bh16bn128" and NUM_KV_SPLITS <= 4 else 8
     _mla_softmax_reducev_kernel[grid_reduce](
         logits_buf,
         mid_lse,
@@ -1128,7 +1129,7 @@ def mla_gluon(
         USE_2D_VIEW=use_2d_view,
         BLOCK_S=min(64, triton.next_power_of_2(NUM_KV_SPLITS)),
         BLOCK_N=BLOCK_N,
-        num_warps=8,
+        num_warps=reduce_num_warps,
     )
 
     return o, final_lse
