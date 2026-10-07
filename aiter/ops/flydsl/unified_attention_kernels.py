@@ -103,13 +103,30 @@ def _descales_ok(q_descale, k_descale, v_descale) -> bool:
     )
 
 
+def _devices_ok(q, *tensors) -> bool:
+    """All pointers consumed by the kernel must be CUDA tensors on Q's device."""
+    return q.is_cuda and all(
+        isinstance(t, torch.Tensor) and t.is_cuda and t.device == q.device
+        for t in tensors
+    )
+
+
 def _as_1d_descale(d):
     """FlyDSL's from_dlpack rejects a 0-dim tensor; reshape is a view."""
     return d.reshape(1) if d.ndim == 0 else d
 
 
 def _geometry_ok(
-    q, k, v, out, num_kv_heads, block_size, num_queries_per_kv, cu_seqlens_q, num_seqs
+    q,
+    k,
+    v,
+    out,
+    num_kv_heads,
+    block_size,
+    num_queries_per_kv,
+    cu_seqlens_q,
+    block_table,
+    num_seqs,
 ) -> bool:
     """Head dim the kernel is built for; the GQA group divides the 16 MFMA
     rows a wave owns; cu_seqlens covers every sequence."""
@@ -120,8 +137,11 @@ def _geometry_ok(
         head_size in _HEAD_DIMS
         and tuple(k.shape[1:]) == (block_size, num_kv_heads, head_size)
         and num_query_heads == num_kv_heads * num_queries_per_kv
+        and num_queries_per_kv > 0
         and 16 % num_queries_per_kv == 0
         and cu_seqlens_q.numel() == num_seqs + 1
+        and num_seqs > 0
+        and block_table.shape[0] >= num_seqs
     )
 
 
@@ -180,7 +200,21 @@ def _supported(
     skip_reduce,
 ) -> bool:
     """Whether this exact configuration can be served."""
-    if not is_flydsl_available(q.device.index):
+    if not _devices_ok(
+        q,
+        k,
+        v,
+        out,
+        cu_seqlens_q,
+        seqused_k,
+        block_table,
+        q_descale,
+        k_descale,
+        v_descale,
+    ):
+        return False
+    device_index = q.device.index
+    if device_index is None or not is_flydsl_available(device_index):
         return False
     return (
         _dispatch_mode_ok(
@@ -198,6 +232,7 @@ def _supported(
             block_size,
             num_queries_per_kv,
             cu_seqlens_q,
+            block_table,
             num_seqs,
         )
         and _no_unsupported_features(
@@ -207,12 +242,68 @@ def _supported(
     )
 
 
-def _cede_to_triton(head_size, max_seqlen_q, num_seqs, max_seqlen_k) -> bool:
-    """Tiny head-512 decode-only batches, up to 2K keys in all (batch 1 to 2K,
-    batch 2 at 1K), stay on Triton: launch latency dominates there, and Triton
-    is 1.04-1.17x faster on MI325X. Every other batch is faster here and is
-    served."""
-    return head_size == 512 and max_seqlen_q == 1 and num_seqs * max_seqlen_k <= 2048
+def _cede_to_triton(
+    head_size,
+    max_seqlen_q,
+    num_seqs,
+    max_seqlen_k,
+    block_size=None,
+    window=None,
+) -> bool:
+    """Keep measured FlyDSL loss regions on the tuned Triton implementation."""
+    if max_seqlen_q == 1:
+        # Tiny full-attention decode is launch-latency bound.
+        if head_size == 512 and num_seqs * max_seqlen_k <= 2048:
+            return True
+        # Page-32 full decode loses its margin once long-context batches fill
+        # the machine; Triton's page-specific shape is faster there.
+        if (
+            head_size == 512
+            and block_size == 32
+            and (
+                (max_seqlen_k >= 32768 and (num_seqs == 16 or num_seqs >= 32))
+                or (4096 <= max_seqlen_k < 32768 and num_seqs == 32)
+            )
+        ):
+            return True
+        # Page-64 full decode uses the faster two-wave Triton table in these
+        # bandwidth-saturated cells. Page 128 remains faster on FlyDSL.
+        if head_size == 512 and block_size == 64:
+            if max_seqlen_k >= 32768 and num_seqs >= 16:
+                return True
+            if max_seqlen_k >= 4096 and (
+                32 <= num_seqs <= 64 or num_seqs == 128 or num_seqs >= 256
+            ):
+                return True
+        # At page 128 these 4K occupancy points are effectively tied; cede
+        # them so served FlyDSL cells retain a useful margin.
+        if (
+            head_size == 512
+            and block_size == 128
+            and num_seqs in (32, 40, 48, 56, 64, 96)
+            and 4096 <= max_seqlen_k < 32768
+        ):
+            return True
+        # Triton's page-32 sliding decode becomes faster from batch 32.
+        if (
+            head_size == 256
+            and block_size == 32
+            and window is not None
+            and num_seqs >= 24
+        ):
+            return True
+        # The page-64 crossover is much later, with one measured occupancy
+        # hole at batch 96 in the mid-context regime.
+        if head_size == 256 and block_size == 64 and window is not None:
+            return num_seqs >= 256 or (num_seqs == 96 and 4096 <= max_seqlen_k < 32768)
+        return False
+    # Initial prefills and prefix chunks through 512 queries lack a repeatable
+    # margin for both Gemma-4 layer types. Above 512 FlyDSL crosses over.
+    if 1 < max_seqlen_q <= 512:
+        return True
+    # The tested N32 and N64 head-256 prefill shapes both lose cells to the
+    # page-32 Triton table. Keep this page on Triton until a winning tile lands.
+    return head_size == 256 and block_size == 32 and window is not None
 
 
 def _as_i8(t: torch.Tensor) -> torch.Tensor:
@@ -260,7 +351,12 @@ def _launch(
         else q.shape[0] // prefill_block_q(num_query_heads, num_kv_heads) + num_seqs
     )
     splits = num_kv_splits or plan_num_kv_splits(
-        num_seqs, max_seqlen_k, num_kv_heads, window, head_size
+        num_seqs,
+        max_seqlen_k,
+        num_kv_heads,
+        window,
+        head_size,
+        decode_only=decode_only,
     )
     # Each decode wave runs one split; the unified kernel has four per workgroup.
     waves = 1 if decode_only else 4
@@ -375,7 +471,15 @@ def flydsl_unified_attention(
         skip_reduce,
     ):
         return None
-    if _cede_to_triton(q.shape[-1], max_seqlen_q, num_seqs, max_seqlen_k):
+    window = _window_keys(window_size)
+    if _cede_to_triton(
+        q.shape[-1],
+        max_seqlen_q,
+        num_seqs,
+        max_seqlen_k,
+        block_size,
+        window,
+    ):
         return None
     return _launch(
         q,
@@ -387,7 +491,7 @@ def flydsl_unified_attention(
         seqused_k,
         max_seqlen_k,
         softmax_scale,
-        _window_keys(window_size),
+        window,
         block_table,
         q_descale,
         k_descale,

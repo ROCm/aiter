@@ -109,7 +109,14 @@ def _transpose4(words):
     ]
 
 
-def plan_num_kv_splits(num_seqs, max_seqlen_k, num_kv_heads, window, head_dim):
+def plan_num_kv_splits(
+    num_seqs,
+    max_seqlen_k,
+    num_kv_heads,
+    window,
+    head_dim,
+    decode_only=False,
+):
     """Decode split count, fitted to MI325X sweeps (batch 1-256, context
     0.5K-32K): about 128K / head_dim split waves in all, and at least
     head_dim / 128 tiles per split, since each split's partial costs a
@@ -122,6 +129,19 @@ def plan_num_kv_splits(num_seqs, max_seqlen_k, num_kv_heads, window, head_dim):
     splits = min(want, tiles * 128 // head_dim)
     if splits * units < 128:
         splits = min(want, tiles * 256 // head_dim)
+    # Head-512 decode has occupancy holes between the power-of-two batch
+    # points used by the original fit. Extra splits fill those holes and beat
+    # both Triton tables at 4K-32K; mixed batches keep the conservative model.
+    if decode_only and window is None and head_dim == 512 and max_seqlen_k >= 4096:
+        if 20 <= num_seqs < 44:
+            splits = max(splits, 3)
+        elif 44 <= num_seqs < 60:
+            splits = max(splits, 4)
+        elif 60 <= num_seqs < 80:
+            splits = max(splits, 3)
+        elif 80 <= num_seqs < 112:
+            splits = max(splits, 2)
+        splits = min(splits, tiles)
     return max(1, splits)
 
 

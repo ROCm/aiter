@@ -32,21 +32,25 @@ def unified_attention_flydsl(
     backend: str | None = None,  # "triton" | "gluon" | "flydsl"
 ) -> torch.Tensor | None:
     try:
-        from aiter.ops.flydsl.unified_attention_kernels import is_flydsl_available
-    except ImportError:
-        return None
+        from aiter.ops.flydsl.unified_attention_kernels import (
+            flydsl_unified_attention,
+            is_flydsl_available,
+        )
+    except ModuleNotFoundError as error:
+        # An absent optional FlyDSL package means "backend unavailable".
+        # Broken internal imports must retain their original traceback.
+        if error.name == "flydsl":
+            return None
+        raise
 
+    if not q.is_cuda or q.dim() != 3:
+        return None
     q_device_index = q.device.index
     if q_device_index is None:
         q_device_index = torch.cuda.current_device()
     with torch.cuda.device(q_device_index):
         if not is_flydsl_available(q_device_index):
             return None
-
-    try:
-        from aiter.ops.flydsl.unified_attention_kernels import flydsl_unified_attention
-    except ImportError:
-        return None
 
     _num_tokens, num_query_heads, _head_size = q.shape
     kv_cache_dtype = k.dtype
@@ -63,6 +67,8 @@ def unified_attention_flydsl(
         return None
 
     num_seqs = len(seqused_k)
+    if num_query_heads <= 0 or num_kv_heads <= 0 or num_query_heads % num_kv_heads:
+        return None
     num_queries_per_kv = num_query_heads // num_kv_heads
 
     return flydsl_unified_attention(

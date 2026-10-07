@@ -32,7 +32,11 @@ from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 PAGE = 64
 # Gemma-4-31B layers: (head dim, query heads, KV heads, sliding window in keys).
-SHAPES = {"full": (512, 32, 4, None), "sliding": (256, 32, 16, 1024)}
+SHAPES_BY_TP = {
+    1: {"full": (512, 32, 4, None), "sliding": (256, 32, 16, 1024)},
+    4: {"full": (512, 8, 1, None), "sliding": (256, 8, 4, 1024)},
+}
+SHAPES = SHAPES_BY_TP[1]
 # Max |err| against the oracle, as a fraction of max |ref|.
 TOLERANCE = 0.04
 # Speed-vs-Triton column: FlyDSL time over Triton time, below 1.0 is faster.
@@ -132,8 +136,8 @@ def ref_paged_attn(
     return out.to(out_dtype)
 
 
-def make_case(query_lens, kv_lens, shape, page=PAGE, seed=3):
-    head_dim, num_heads, num_kv_heads, window = SHAPES[shape]
+def make_case(query_lens, kv_lens, shape, page=PAGE, seed=3, tp=1):
+    head_dim, num_heads, num_kv_heads, window = SHAPES_BY_TP[tp][shape]
     g = torch.Generator(device="cuda").manual_seed(seed)
 
     def randn(*size):
@@ -254,7 +258,12 @@ def flydsl_candidate(case, kv_lens):
     from aiter.ops.flydsl import unified_attention_kernels as adapter
 
     if adapter._cede_to_triton(
-        case["q"].shape[-1], case["max_seqlen_q"], len(kv_lens), case["max_seqlen_k"]
+        case["q"].shape[-1],
+        case["max_seqlen_q"],
+        len(kv_lens),
+        case["max_seqlen_k"],
+        case["k"].shape[1],
+        window_of(case),
     ):
         return direct_candidate(case, kv_lens)
     return partial(ua.unified_attention, **case, backend="flydsl")
@@ -311,7 +320,7 @@ def test_prefill(shape, page):
     query_lens, kv_lens = [1024, 77], [1024, 77]
     case = make_case(query_lens, kv_lens, shape, page)
     want = reference(case, query_lens, kv_lens)
-    candidates = {"flydsl": partial(ua.unified_attention, **case, backend="flydsl")}
+    candidates = {"flydsl": flydsl_candidate(case, kv_lens)}
     return measure(candidates, case, want, query_lens, kv_lens)
 
 
@@ -341,7 +350,7 @@ def test_mixed_batch(shape, page, scale):
         dtype=dtypes.bf16,
     )
     case["out"] = storage[: sum(query_lens)]
-    candidates = {"flydsl": partial(ua.unified_attention, **case, backend="flydsl")}
+    candidates = {"flydsl": flydsl_candidate(case, kv_lens)}
     ret = measure(candidates, case, want, query_lens, kv_lens)
     assert torch.isnan(
         storage[sum(query_lens) :]
@@ -350,10 +359,23 @@ def test_mixed_batch(shape, page, scale):
 
 
 @benchmark()
+def test_tp4_mixed_batch(shape):
+    """Gemma-4 TP4 local heads through the unified prefill/decode grid."""
+    query_lens = [768, 17, 1, 1]
+    kv_lens = [768, 1024, 513, 4097]
+    case = make_case(query_lens, kv_lens, shape, page=64, tp=4)
+    case["softmax_scale"] = 1.0
+    want = reference(case, query_lens, kv_lens)
+    case["k"], case["v"] = interleave_kv(case["k"], case["v"])
+    candidates = {"flydsl_tp4": partial(ua.unified_attention, **case, backend="flydsl")}
+    return measure(candidates, case, want, query_lens, kv_lens)
+
+
+@benchmark()
 def test_cross_attention_mask(shape, query_len, kv_len):
     case = make_case([query_len], [kv_len], shape)
     want = reference(case, [query_len], [kv_len])
-    candidates = {"flydsl": partial(ua.unified_attention, **case, backend="flydsl")}
+    candidates = {"flydsl": flydsl_candidate(case, [kv_len])}
     return measure(candidates, case, want, [query_len], [kv_len])
 
 
@@ -422,8 +444,14 @@ def test_routing_backend_gate(config):
     if config == "ceded decode":
         query_lens, kv_lens = [1] * 2, [1024] * 2
         case = make_case(query_lens, kv_lens, "full")
+    elif config == "short prefill":
+        query_lens, kv_lens = [256], [256]
+        case = make_case(query_lens, kv_lens, "full")
+    elif config == "page32 sliding decode":
+        query_lens, kv_lens = [1] * 32, [32] * 32
+        case = make_case(query_lens, kv_lens, "sliding", page=32)
     else:
-        query_lens, kv_lens = [256, 1], [256, 700]
+        query_lens, kv_lens = [768, 1], [768, 700]
         case = make_case(query_lens, kv_lens, "sliding")
     if config == "softcap":
         case["softcap"] = 30.0
@@ -457,6 +485,40 @@ def test_routing_backend_gate(config):
     return ret
 
 
+def test_cede_policy():
+    from aiter.ops.flydsl.kernels.flash_attn_fp8_gfx942 import plan_num_kv_splits
+    from aiter.ops.flydsl.unified_attention_kernels import _cede_to_triton
+
+    assert _cede_to_triton(512, 512, 1, 512, 128, None)
+    assert not _cede_to_triton(512, 768, 1, 768, 128, None)
+    assert _cede_to_triton(512, 1, 16, 32768, 64, None)
+    assert _cede_to_triton(512, 1, 40, 4096, 64, None)
+    assert _cede_to_triton(512, 1, 32, 4096, 64, None)
+    assert _cede_to_triton(512, 1, 256, 4096, 64, None)
+    assert not _cede_to_triton(512, 1, 24, 4096, 64, None)
+    assert _cede_to_triton(512, 1, 128, 4096, 64, None)
+    assert _cede_to_triton(512, 1, 16, 32768, 32, None)
+    assert _cede_to_triton(512, 1, 32, 32768, 32, None)
+    assert not _cede_to_triton(512, 1, 24, 32768, 32, None)
+    assert _cede_to_triton(512, 1, 32, 4096, 32, None)
+    assert not _cede_to_triton(512, 1, 24, 4096, 32, None)
+    assert not _cede_to_triton(512, 1, 16, 32768, 128, None)
+    for batch in (32, 40, 48, 56, 64, 96):
+        assert _cede_to_triton(512, 1, batch, 4096, 128, None)
+    assert not _cede_to_triton(512, 1, 48, 32768, 128, None)
+    assert _cede_to_triton(256, 1, 24, 1024, 32, 1024)
+    assert _cede_to_triton(256, 1, 256, 1024, 64, 1024)
+    assert _cede_to_triton(256, 1, 96, 4096, 64, 1024)
+    assert not _cede_to_triton(256, 1, 96, 32768, 64, 1024)
+    assert not _cede_to_triton(256, 1, 128, 1024, 64, 1024)
+    expected_splits = {24: 3, 40: 3, 48: 4, 64: 3, 96: 2}
+    for batch, expected in expected_splits.items():
+        assert (
+            plan_num_kv_splits(batch, 32768, 4, None, 512, decode_only=True) == expected
+        )
+    return {"gfx": get_gfx_runtime(), "policy": "passed"}
+
+
 @benchmark()
 def test_warm_cache_run_only(shape, path):
     from aiter.aot.flydsl.common import run_only_env
@@ -471,6 +533,21 @@ def test_warm_cache_run_only(shape, path):
     # Missing artifacts must raise rather than quietly compile a replacement.
     with run_only_env():
         return measure({"warm_run_only": call}, case, want, query_lens, kv_lens)
+
+
+@benchmark()
+def test_aot_matrix(shape, tp, page, layout, path):
+    """Exercise every attention AOT key for TP1/TP4 under run-only mode."""
+    if path == "prefill":
+        query_lens, kv_lens = [512], [512]
+    else:
+        query_lens, kv_lens = [1] * 4, [1024] * 4
+    case = make_case(query_lens, kv_lens, shape, page=page, seed=23, tp=tp)
+    want = reference(case, query_lens, kv_lens)
+    if layout == "vllm":
+        case["k"], case["v"] = interleave_kv(case["k"], case["v"])
+    call = direct_candidate(case, kv_lens)
+    return measure({"aot_run_only": call}, case, want, query_lens, kv_lens)
 
 
 @benchmark()
@@ -541,6 +618,11 @@ def main():
         action="store_true",
         help="also time FlyDSL against Triton on serving-size batches",
     )
+    parser.add_argument(
+        "--aot-matrix",
+        action="store_true",
+        help="exercise every TP1/TP4 page/layout/mode AOT key",
+    )
     args = parser.parse_args()
     sweeps = [
         ("prefill", test_prefill, itertools.product(args.shape, args.page)),
@@ -554,6 +636,7 @@ def main():
             test_mixed_batch,
             itertools.product(args.shape, args.page, ["1/sqrt(d)", "1 (Gemma-4)"]),
         ),
+        ("TP4 mixed batch", test_tp4_mixed_batch, itertools.product(args.shape)),
         (
             "cross-attention mask",
             test_cross_attention_mask,
@@ -572,8 +655,18 @@ def main():
         (
             "routing/backend gate",
             test_routing_backend_gate,
-            itertools.product(["supported", "softcap", "sinks", "ceded decode"]),
+            itertools.product(
+                [
+                    "supported",
+                    "softcap",
+                    "sinks",
+                    "ceded decode",
+                    "short prefill",
+                    "page32 sliding decode",
+                ]
+            ),
         ),
+        ("cede policy", test_cede_policy, [()]),
         (
             "warm-cache run-only (not full AOT)",
             test_warm_cache_run_only,
@@ -586,6 +679,20 @@ def main():
                 "speed vs Triton",
                 test_speed_vs_triton,
                 itertools.product(args.shape, SERVING),
+            )
+        )
+    if args.aot_matrix:
+        sweeps.append(
+            (
+                "TP1/TP4 AOT matrix",
+                test_aot_matrix,
+                itertools.product(
+                    args.shape,
+                    [1, 4],
+                    args.page,
+                    args.layout,
+                    ["prefill", "decode"],
+                ),
             )
         )
     for name, fn, parameters in sweeps:
