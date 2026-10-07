@@ -51,22 +51,10 @@ class AsmMlaDecodeAotTest(unittest.TestCase):
         )
 
     def test_main_builds_all_gqa16_split_variants(self):
-        executor = Mock()
-        executor.__enter__ = Mock(return_value=executor)
-        executor.__exit__ = Mock(return_value=False)
-        executor.map.return_value = iter([None] * 16)
-
-        with (
-            patch.object(
-                driver.concurrent.futures,
-                "ProcessPoolExecutor",
-                return_value=executor,
-            ) as process_pool,
-            patch.object(driver, "get_worker_count_for", return_value=1) as workers,
-        ):
+        with patch.object(driver, "run_configs") as run_configs:
             driver.main()
 
-        process_config, configs = executor.map.call_args.args
+        configs, process_config = run_configs.call_args.args
         self.assertIs(process_config, driver.process_config)
         self.assertEqual(
             [config.num_kv_splits for config in configs], list(range(1, 17))
@@ -74,29 +62,12 @@ class AsmMlaDecodeAotTest(unittest.TestCase):
         self.assertEqual({config.gqa_ratio for config in configs}, {16})
         self.assertEqual({config.q_dtype for config in configs}, {"__hip_bfloat16"})
         self.assertEqual({config.kv_dtype for config in configs}, {"__hip_bfloat16"})
-        process_pool.assert_called_once_with(
-            max_workers=1,
-            initializer=driver.configure_worker_subprocesses,
-        )
-        workers.assert_called_once_with(16)
 
-    def test_main_surfaces_worker_compile_errors(self):
-        executor = Mock()
-        executor.__enter__ = Mock(return_value=executor)
-        executor.__exit__ = Mock(return_value=False)
-
-        def failed_result():
-            raise RuntimeError("compile failed")
-            yield
-
-        executor.map.return_value = failed_result()
+    def test_main_propagates_runner_failures(self):
         with (
             patch.object(
-                driver.concurrent.futures,
-                "ProcessPoolExecutor",
-                return_value=executor,
+                driver, "run_configs", side_effect=RuntimeError("compile failed")
             ),
-            patch.object(driver, "get_worker_count_for", return_value=1),
             self.assertRaisesRegex(RuntimeError, "compile failed"),
         ):
             driver.main()

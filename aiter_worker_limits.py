@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 import warnings
+from concurrent.futures import ProcessPoolExecutor
 from fractions import Fraction
 
 CPU_CORE_COUNT_UTILIZATION = 0.80
@@ -585,8 +586,8 @@ def _amdsmi_gpu_count() -> int | None:
             pass
 
 
-def _visible_gpu_count() -> int:
-    """Return the number of visible GPUs, preferring amdsmi and masks."""
+def visible_gpu_count() -> int:
+    """Return the number of visible GPUs, preferring masks and amdsmi."""
     masked = _gpu_count_from_env()
     if masked is not None:
         return masked
@@ -621,7 +622,7 @@ def get_gpu_worker_count(work_count: int) -> int:
     result. When no GPU is visible the shared CPU policy is used instead, so
     CPU-only hosts keep the previous behaviour.
     """
-    devices = _visible_gpu_count()
+    devices = visible_gpu_count()
     if devices <= 0:
         return get_worker_count_for(work_count)
     budget = devices * _gpu_workers_per_device()
@@ -648,3 +649,29 @@ def configure_worker_subprocesses() -> None:
             "NUMEXPR_NUM_THREADS": "1",
         }
     )
+
+
+def run_compile_jobs(jobs) -> None:
+    """Run AOT config compilers in a worker-bounded process pool.
+
+    ``jobs`` is a sequence of ``(process_config, configs)`` pairs, one per
+    kernel family. Every family is submitted before any results are consumed so
+    all variants may compile concurrently; consuming the iterators still
+    propagates worker failures to the caller.
+    """
+    jobs = [(process_config, list(configs)) for process_config, configs in jobs]
+    total = sum(len(configs) for _, configs in jobs)
+    with ProcessPoolExecutor(
+        max_workers=get_worker_count_for(total),
+        initializer=configure_worker_subprocesses,
+    ) as executor:
+        result_iterators = [
+            executor.map(process_config, configs) for process_config, configs in jobs
+        ]
+        for results in result_iterators:
+            list(results)
+
+
+def run_configs(configs, process_config) -> None:
+    """Compile one family of AOT configs in a worker-bounded process pool."""
+    run_compile_jobs([(process_config, configs)])

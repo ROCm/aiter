@@ -1,11 +1,6 @@
-import concurrent.futures
 from collections import namedtuple
 
-from aiter_worker_limits import (
-    adopt_legacy_max_jobs,
-    configure_worker_subprocesses,
-    get_worker_count_for,
-)
+from aiter_worker_limits import adopt_legacy_max_jobs, run_configs
 from csrc.cpp_itfs.pa.pa import compile
 
 PAConfig = namedtuple(
@@ -100,11 +95,7 @@ def main():
                             )
                         )
 
-    with concurrent.futures.ProcessPoolExecutor(
-        max_workers=get_worker_count_for(len(configs)),
-        initializer=configure_worker_subprocesses,
-    ) as executor:
-        list(executor.map(process_config, configs))
+    run_configs(configs, process_config)
 
 
 if __name__ == "__main__":

@@ -512,7 +512,7 @@ class WorkerAwarenessTest(unittest.TestCase):
 
     def test_gpu_worker_count_scales_with_visible_devices(self):
         with patch.dict(os.environ, {}, clear=True), patch.object(
-            worker_limits, "_visible_gpu_count", return_value=4
+            worker_limits, "visible_gpu_count", return_value=4
         ):
             self.assertEqual(
                 get_gpu_worker_count(1000), 4 * worker_limits.EST_WORKERS_PER_GPU
@@ -521,25 +521,25 @@ class WorkerAwarenessTest(unittest.TestCase):
     def test_gpu_worker_count_honors_per_device_override(self):
         with patch.dict(
             os.environ, {"AITER_GPU_WORKERS_PER_DEVICE": "2"}, clear=True
-        ), patch.object(worker_limits, "_visible_gpu_count", return_value=3):
+        ), patch.object(worker_limits, "visible_gpu_count", return_value=3):
             self.assertEqual(get_gpu_worker_count(1000), 6)
 
     def test_gpu_worker_count_is_clamped_by_explicit_ceiling(self):
         with patch.dict(os.environ, {"AITER_MAX_JOBS": "5"}, clear=True), patch.object(
-            worker_limits, "_visible_gpu_count", return_value=4
+            worker_limits, "visible_gpu_count", return_value=4
         ):
             self.assertEqual(get_gpu_worker_count(1000), 5)
 
     def test_gpu_worker_count_is_capped_by_submitted_work(self):
         with patch.dict(os.environ, {}, clear=True), patch.object(
-            worker_limits, "_visible_gpu_count", return_value=4
+            worker_limits, "visible_gpu_count", return_value=4
         ):
             self.assertEqual(get_gpu_worker_count(3), 3)
             self.assertEqual(get_gpu_worker_count(0), 1)
 
     def test_gpu_worker_count_falls_back_to_cpu_policy_without_gpu(self):
         with patch.dict(os.environ, {"AITER_MAX_JOBS": "19"}, clear=True), patch.object(
-            worker_limits, "_visible_gpu_count", return_value=0
+            worker_limits, "visible_gpu_count", return_value=0
         ), patch.object(
             worker_limits, "_automatic_worker_snapshot", return_value=(32, 32, None)
         ):
@@ -548,9 +548,9 @@ class WorkerAwarenessTest(unittest.TestCase):
 
     def test_visible_gpu_count_prefers_device_masks(self):
         with patch.dict(os.environ, {"HIP_VISIBLE_DEVICES": "0,1"}, clear=True):
-            self.assertEqual(worker_limits._visible_gpu_count(), 2)
+            self.assertEqual(worker_limits.visible_gpu_count(), 2)
         with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "-1"}, clear=True):
-            self.assertEqual(worker_limits._visible_gpu_count(), 0)
+            self.assertEqual(worker_limits.visible_gpu_count(), 0)
 
     def test_amdsmi_gpu_count_uses_amdsmi_when_available(self):
         class _FakeAmdsmi:

@@ -10,7 +10,7 @@ import torch
 
 from aiter import dtypes, logger
 from aiter.test_common import checkAllclose
-from aiter_worker_limits import configure_worker_subprocesses
+from aiter_worker_limits import configure_worker_subprocesses, visible_gpu_count
 
 _TASK_START_TIMES = None
 _TASK_PIDS = None
@@ -424,7 +424,7 @@ def mp_tuner(
     Returns:
         List of (info, latency, error_ratio) tuples
     """
-    gpu_num = torch.cuda.device_count()
+    gpu_num = visible_gpu_count()
     mp.set_start_method("spawn", force=True)
     mp_num = _resolve_tuner_process_count(gpu_num, mp_num)
     start_idx = 0
