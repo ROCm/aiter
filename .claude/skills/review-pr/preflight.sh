@@ -47,9 +47,10 @@ else
 fi
 
 echo "[persistence]"
-chk "runner is a systemd service (survives a reboot)" \
-    "systemctl list-unit-files 'actions.runner.*' --no-legend 2>/dev/null | grep -q enabled" \
-    "a hand-started runner dies on the next reboot; the job then sits in 'queued' with no failure and no notification -- sudo ./svc.sh install <user> (RUNNER-SETUP.md section 5)"
+svc=$(systemctl list-unit-files 'actions.runner.*' --no-legend 2>/dev/null | awk '{print $1; exit}')
+chk "runner is a systemd service (survives reboot and crash)" \
+    "[ -n \"$svc\" ] && systemctl is-enabled \"$svc\" >/dev/null 2>&1 && [ \"\$(systemctl show -p Restart --value \"$svc\" 2>/dev/null)\" = always ]" \
+    "a hand-started runner dies on the next reboot; the job then sits in 'queued' with no failure and no notification -- install it (sudo ./svc.sh install <user>) and add the Restart=always drop-in (RUNNER-SETUP.md section 5)"
 
 echo "[publish identity]"
 tok=""

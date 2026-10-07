@@ -54,8 +54,16 @@ runner to a reboot and sat silently offline for days.
 Install it as a service instead — the runner package ships the wrapper:
 
     cd <runner-dir>
-    sudo ./svc.sh install <user>    # systemd unit: Restart=always, starts at boot
+    sudo ./svc.sh install <user>    # writes a systemd unit, enabled at boot
     sudo ./svc.sh start
+
+The unit `svc.sh` writes carries no `Restart=`, so it survives a reboot but not a crash. Add a
+drop-in for the other half:
+
+    U=$(systemctl list-unit-files 'actions.runner.*' --no-legend | awk '{print $1; exit}')
+    sudo mkdir -p "/etc/systemd/system/$U.d"
+    printf '[Service]\nRestart=always\nRestartSec=10\n' | sudo tee "/etc/systemd/system/$U.d/restart.conf"
+    sudo systemctl daemon-reload
 
 Do not hand-roll a unit or a keeper loop: a keeper only restarts what it is pointed at, and it
 cannot restart itself.
