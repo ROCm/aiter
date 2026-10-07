@@ -9,33 +9,8 @@ import os
 import torch
 
 from ..jit.core import compile_ops
-from ..jit.utils.chip_info import get_cu_num, get_gfx
+from ..jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
 from ..utility import dtypes
-
-# stride0 at which `sampled` overtakes the FlyDSL one-block prefill path, which
-# is what this function reaches below it. Measured per shape, k=2048, fp32, both
-# ops under one @perftest on the same data (flydsl_us / sampled_us, above 1.00
-# meaning `sampled` is faster):
-#
-#     M \ N     49152   65536  131072  262144
-#     1          0.92    1.06    1.68    2.71
-#     8          0.78    0.90    1.38    2.15
-#     64         0.72    0.83    1.17    1.57
-#     256        0.67    0.79    0.99    1.14
-#     512        0.72    0.77    1.08    1.27
-#     1024       0.89    0.96    1.07    1.30
-#     2048       0.85    0.89    1.02    1.37
-#     4096       0.83    0.92    1.04    1.32
-#
-# The crossover is a clean function of stride0 and not of the row count, so
-# unlike the floor this replaces there is no wide/narrow split. M=256 at 131072
-# is 0.99, a wash, and is left on the simple rule rather than carved out.
-#
-# This supersedes a 32768/49152 floor that was fitted against the mb/ob path.
-# That measurement was not wrong when it was taken; upstream put FlyDSL in front
-# of mb/ob afterwards, which made it a comparison against an op this function no
-# longer reaches at those widths.
-SAMPLED_MIN_STRIDE0 = 131072
 
 
 # Raw binding: no argument validation, correction_bias must be a real tensor.
@@ -363,7 +338,7 @@ def _mb_workspace_size_cached(
     """topk_mb_workspace_size() memoised: 5.06 us per call through the binding.
 
     query_mb_workspace() is a pure function of (numRows, stride0, kTopK)
-    (topk_per_row_kernels.cu:2705 -- no getenv, no device query), so the size is
+    (no getenv, no device query), so the size is
     fixed for a shape and the second call onward is a dict hit.
     """
     return topk_mb_workspace_size(numRows, stride0, k, is_decode)
@@ -374,7 +349,7 @@ def _ob_workspace_size_cached(
     numRows: int, stride0: int, k: int, is_decode: bool
 ) -> int:
     """topk_ob_workspace_size() memoised: 6.74 us per call, pure in
-    (numRows, stride0, kTopK) (topk_per_row_kernels.cu:2721).
+    (numRows, stride0, kTopK), through query_ob_workspace().
 
     This is the one every small shape pays, because low stride0 stays on the
     one-block path: at numRows=64 stride0=512 the binding query cost 6.74 us to
@@ -389,7 +364,7 @@ def _use_mulblocks_cached(
 ) -> bool:
     """topk_use_mulblocks() memoised: 6.34 us per call.
 
-    should_use_mulblocks() (topk_per_row_kernels.cu:2648) compares the shape
+    should_use_mulblocks() in topk_per_row_kernels.cu compares the shape
     against thresholds chosen by CU count, and it already caches that CU count in
     a function-local static -- so the decision is device-pinned in C++ before we
     cache it here. It does re-read TOPK_FORCE_PATH and TOPK_DISPATCH_FACTOR every
@@ -457,6 +432,53 @@ _FLYDSL_TOPK_PREFILL_DISABLED = os.environ.get(
     "AITER_DISABLE_FLYDSL_TOPK_PREFILL", "0"
 ) in ("1", "true", "True", "yes", "YES")
 
+# Per architecture, the stride0 at which `sampled` overtakes the FlyDSL one-block
+# prefill path, which is what top_k_per_row_prefill reaches below it. Measured on
+# gfx950 per shape, k=2048, fp32, both ops under one @perftest on the same data
+# (flydsl_us / sampled_us, above 1.00 meaning `sampled` is faster):
+#
+#     M \ N     49152   65536  131072  262144
+#     1          0.92    1.06    1.68    2.71
+#     8          0.78    0.90    1.38    2.15
+#     64         0.72    0.83    1.17    1.57
+#     256        0.67    0.79    0.99    1.14
+#     512        0.72    0.77    1.08    1.27
+#     1024       0.89    0.96    1.07    1.30
+#     2048       0.85    0.89    1.02    1.37
+#     4096       0.83    0.92    1.04    1.32
+#
+# The crossover is a clean function of stride0 and not of the row count. M=256
+# at 131072 is 0.99, a wash, and is left on the simple rule rather than carved
+# out. An architecture without an entry never routes here, so a new target needs
+# its own measurement before it gets one. The floor was measured at k=2048
+# against FlyDSL; a shape FlyDSL declines, or any shape under
+# AITER_DISABLE_FLYDSL_TOPK_PREFILL=1, falls to mb/ob instead, against which it
+# has not been re-measured.
+_SAMPLED_MIN_STRIDE0 = {"gfx950": 131072}
+
+
+def _should_use_sampled_prefill(
+    numRows: int, stride0: int, stride1: int, k: int, stable: bool
+) -> bool:
+    """Whether top_k_per_row_prefill hands this call to `sampled`.
+
+    stride1 is tested here because topk_sampled_supports() only takes
+    (numRows, stride0, k) and cannot see it. The mb/ob path ignores stride1,
+    while the `sampled` entry rejects stride1 != 1; routing such a call there
+    would turn a working call into an error purely because `sampled` became
+    available.
+    """
+    if stable or stride1 != 1:
+        return False
+    if os.environ.get("AITER_DISABLE_TOPK_SAMPLED", "0") == "1":
+        return False
+    floor = _SAMPLED_MIN_STRIDE0.get(get_gfx_runtime())
+    return (
+        floor is not None
+        and stride0 >= floor
+        and _sampled_supports_cached(numRows, stride0, k)
+    )
+
 
 def top_k_per_row_prefill(
     logits: torch.Tensor,
@@ -481,54 +503,12 @@ def top_k_per_row_prefill(
     tensor-parallel rank selects and orders an identical KV set; the caller sizes
     the workspace for the ob path in that case.
 
-    When stable=False and stride1 == 1 and topk_sampled_supports() returns true and
-    stride0 is at least SAMPLED_MIN_STRIDE0, dispatches to
-    top_k_per_row_prefill_sampled. Set AITER_DISABLE_TOPK_SAMPLED=1 to force the original
-    mb/ob path for A/B or fallback.
-
-    The threshold is shape-aware because a flat one was wrong in both directions.
-    It used to be a flat 32768, which sent every numRows <= 512 shape at
-    stride0 = 32768 to a path that is SLOWER than the mb/ob one it replaced --
-    0.81x to 0.94x, measured through this dispatch with both backends under one
-    @perftest. No gate in the repo could see it: score_grid compares `sampled` against
-    its own earlier baseline, so a cell that is correct, not regressing, and
-    simply worse than the op it replaces is invisible.
-
-    Measured crossover, aiter_us / sampled_us, below 1.00 meaning `sampled` is slower
-    (log/crossover/, k=2048, fp32):
-
-        M \\ N     32K   40K   48K   56K   64K
-        1         0.87  1.05  1.15  1.31  1.22
-        8         0.88  1.05  1.22  1.09  1.27
-        64        0.94  0.95  1.15  1.11  1.28
-        256       0.81  0.84  1.04  1.04  1.23
-        512       0.91  0.92  1.03  1.02  1.19
-        1024      1.25  1.26  1.40  1.45  1.52
-        2048      1.14  1.17  1.28  1.30  1.38
-        4096      1.02  1.04  1.19  1.24  1.34
-
-    numRows >= 1024 wins from 32768 already, so its floor stays there; everything
-    below only turns positive at 49152. Raising the threshold to 65536 for all
-    shapes was the other tempting answer and it gives up the 1.15-1.22x that
-    numRows <= 64 earns at 48K.
-
-    stride1 is part of the routing condition and not of topk_sampled_supports(),
-    which only takes (numRows, stride0, k) and so cannot see it. The mb/ob path
-    ignores stride1 entirely, while the `sampled` entry asserts it is 1; routing a
-    stride1 != 1 call here would therefore turn a working (if questionable) call
-    into an abort purely because `sampled` became available. Keeping the assert for
-    direct callers of top_k_per_row_prefill_sampled and routing around it here
-    preserves the pre-`sampled` behaviour exactly."""
-    # Ahead of the FlyDSL check, and gated at a floor measured against FlyDSL
-    # rather than against mb/ob -- see SAMPLED_MIN_STRIDE0. Behind it this was
-    # unreachable: FlyDSL served every shape tested, M=4096 N=65536 included.
-    if (
-        not stable
-        and stride1 == 1
-        and stride0 >= SAMPLED_MIN_STRIDE0
-        and _sampled_supports_cached(numRows, stride0, k)
-        and os.environ.get("AITER_DISABLE_TOPK_SAMPLED", "0") != "1"
-    ):
+    Shapes _should_use_sampled_prefill accepts go to top_k_per_row_prefill_sampled
+    instead. Set AITER_DISABLE_TOPK_SAMPLED=1 to keep every call on the paths
+    below."""
+    # Ahead of the FlyDSL check: behind it this was unreachable, since FlyDSL
+    # served every shape tested, M=4096 N=65536 included.
+    if _should_use_sampled_prefill(numRows, stride0, stride1, k, stable):
         return top_k_per_row_prefill_sampled(
             logits,
             rowStarts,
@@ -625,11 +605,11 @@ def topk_sampled_supports(numRows: int, stride0: int, k: int) -> bool: ...
 def _sampled_supports_cached(numRows: int, stride0: int, k: int) -> bool:
     """topk_sampled_supports() memoised, because the binding call is not cheap.
 
-    Measured in the correctness image: 4.86 us per call, against a kernel that
-    is 43 us at numRows=64 stride0=65537. Adding one unmemoised call to the
-    validation below cost +12.5% there and +7.5% on average across the twelve
-    shapes in reports/odd_n_ab.tsv -- a constant ~5 us offset that did not grow
-    with the work, which is what host overhead looks like.
+    Measured: 4.86 us per call, against a kernel that is 43 us at numRows=64
+    stride0=65537. Adding one unmemoised call to the validation below cost
+    +12.5% there and +7.5% on average across twelve odd-stride0 shapes -- a
+    constant ~5 us offset that did not grow with the work, which is what host
+    overhead looks like.
 
     Safe to cache: past the target check, topk_sampled_supports is a pure function
     of these three ints. It computes sampled::params_for -> derive_shape_params,
@@ -646,7 +626,7 @@ def _sampled_workspace_size_cached(numRows: int, stride0: int, k: int) -> int:
     measured cost: 4.80 us per call through the binding.
 
     Together with the supports() lookup above, these two were 9.66 us of every
-    call that routes to AVO, and at small M that was the whole call. Measured on
+    call that routes to `sampled`, and at small M that was the whole call. Measured on
     the enqueue side, where a profiler kernel trace cannot see it:
     M=16 N=32768 spent 25.29 us on the host against 25.43 us end to end, so 99.4%
     of the call was the caller's CPU and the GPU work was entirely hidden behind
@@ -675,11 +655,11 @@ def top_k_per_row_prefill_sampled(
     # [0, width) pair when it did not, and the entry cannot tell that from a
     # genuinely ragged batch, so it has always run the bounds-checking kernels.
     # Passing False picks the plain ones: measured through this entry at k=2048
-    # --dist gaussian m=2048 n=131072, phase_b 202.96 -> 193.14 us, phase_a
+    # on gaussian rows, m=2048 n=131072, phase_b 202.96 -> 193.14 us, phase_a
     # 38.31 -> 37.44, phase_c 40.80 -> 41.09, the whole call 282.07 -> 271.67.
     ragged: bool = True,
 ) -> None:
-    """Per-row top-k (prefill) via the topk-prefill-avo kernels.
+    """Per-row top-k (prefill) via the sampled kernels.
 
     Same call shape as top_k_per_row_prefill, and the same workspace rule: this
     allocates on the Python side so the C++ never allocates device scratch. The
@@ -692,8 +672,7 @@ def top_k_per_row_prefill_sampled(
     padding top_k_per_row_prefill writes.
 
     rowStarts and rowEnds bound each row's window [rowStart, rowEnd); emitted
-    indices are absolute column numbers, matching top_k_per_row_prefill
-    (topk_per_row_kernels.cu:377 and :404).
+    indices are absolute column numbers, matching top_k_per_row_prefill.
 
     `values` is optional: pass an fp32 numRows*k tensor to also receive the
     selected scores, or None to skip the stores entirely (it is a template
@@ -708,14 +687,13 @@ def top_k_per_row_prefill_sampled(
     set (csrc/include/aiter_hip_common.h), and only the aiter_safe_call ctypes
     bridge sets it, which this entry does not go through. Before this, passing
     k above the Phase C cap, or stride1 != 1, or a short workspace killed the
-    caller's process with a message instead of raising. Measured with
-    bench/stress_topk.py.
+    caller's process with a message instead of raising.
 
     None of the checks costs a device sync: every term is a scalar argument or
     a tensor attribute. rowStarts/rowEnds CONTENTS are deliberately not checked
     here -- they live in device memory, so validating them host-side would cost
     a D2H sync on every call. The kernel clamps them into [0, stride0] instead
-    (RowExtents in csrc/topk_common.hip.hpp).
+    (RowExtents in csrc/include/topk_sampled/topk_common.hip.hpp).
 
     `workspace` is optional: pass a buffer of at least
     topk_sampled_workspace_size(numRows, stride0, k) bytes to own it yourself, or

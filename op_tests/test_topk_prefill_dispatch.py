@@ -6,7 +6,8 @@ from unittest import mock
 import torch
 
 import aiter
-from aiter.ops.topk import SAMPLED_MIN_STRIDE0
+from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.ops.topk import _SAMPLED_MIN_STRIDE0
 
 
 def _random_logits(num_rows, width):
@@ -20,7 +21,7 @@ def _random_logits(num_rows, width):
 
 
 def test_prefill_sampled_dispatch_routing():
-    """stride0 >= SAMPLED_MIN_STRIDE0 routes top_k_per_row_prefill to `sampled`.
+    """stride0 >= the arch's floor routes top_k_per_row_prefill to `sampled`.
 
     Asserts on whether `sampled` ran and nothing else. Three paths can serve a
     prefill now -- `sampled`, FlyDSL one-block, and mb/ob -- and which of the
@@ -28,10 +29,14 @@ def test_prefill_sampled_dispatch_routing():
     Asserting it made this test fail when upstream added FlyDSL, for a dispatch
     that was behaving correctly.
     """
+    floor = _SAMPLED_MIN_STRIDE0.get(get_gfx_runtime())
+    if floor is None:
+        print("[prefill_sampled_dispatch] SKIP: `sampled` does not route on this arch")
+        return
     num_rows, top_k = 4, 2048
     indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
-    below = SAMPLED_MIN_STRIDE0 // 2
-    at_or_above = SAMPLED_MIN_STRIDE0
+    below = floor // 2
+    at_or_above = floor
 
     def run_prefill(width, stable=False):
         logits, row_starts, row_ends = _random_logits(num_rows, width)
