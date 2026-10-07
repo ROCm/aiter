@@ -30,7 +30,7 @@ def get_config(
         "ptgmm",
         "nptgmm",
     }, f"'{gmm_type}' is an invalid GMM variant."
-    cfg_dir = resolve_config_dir("gmm", "GMM", backend="triton")
+    cfg_dir = resolve_config_dir("gemm", "grouped", backend="triton")
     config_dict = load_config_json(f"{cfg_dir}/DEFAULT.json")
     assert all(
         variant in config_dict for variant in ("gmm", "ptgmm", "nptgmm")

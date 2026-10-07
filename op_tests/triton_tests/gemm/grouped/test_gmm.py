@@ -662,7 +662,7 @@ def test_gmm_get_config_dispatch_gfx950(monkeypatch, M, K, N, G, accumulate, exp
         pytest.skip("Requires gfx950")
 
     cfg = load_config_json(
-        f"{resolve_config_dir('gmm', 'GMM', backend='triton', arch='gfx950')}/DEFAULT.json"
+        f"{resolve_config_dir('gemm', 'grouped', backend='triton', arch='gfx950')}/DEFAULT.json"
     )["gmm"]
     assert (
         _get_gmm_config_for_arch(monkeypatch, "gfx950", "gmm", M, K, N, G, accumulate)
@@ -680,7 +680,7 @@ def test_gmm_get_config_dispatch_other_variants_unaffected(monkeypatch, gmm_type
     if get_arch() != "gfx950":
         pytest.skip("Requires gfx950")
     cfg = load_config_json(
-        f"{resolve_config_dir('gmm', 'GMM', backend='triton', arch='gfx950')}/DEFAULT.json"
+        f"{resolve_config_dir('gemm', 'grouped', backend='triton', arch='gfx950')}/DEFAULT.json"
     )[gmm_type]
     assert "dispatch" not in cfg
     assert (
@@ -699,7 +699,7 @@ def test_gmm_get_config_arch_without_dispatch(monkeypatch):
         pytest.skip("Requires gfx942")
 
     cfg = load_config_json(
-        f"{resolve_config_dir('gmm', 'GMM', backend='triton', arch='gfx942')}/DEFAULT.json"
+        f"{resolve_config_dir('gemm', 'grouped', backend='triton', arch='gfx942')}/DEFAULT.json"
     )["gmm"]
     assert "dispatch" not in cfg
     assert (
