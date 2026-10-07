@@ -97,7 +97,7 @@ CTRL_CLM = CTRL_AGG + NCHA_MAX * LRDY_STRIDE
 #                                                256 atomics on one serialize)
 #   CTRL_COLC + (bank*NCK_MAX + c)*LRDY_STRIDE   GEMM2 units done of column group c
 #   CTRL_G1C + (bank*NCHLB_MAX + j)*G1C_STRIDE   GEMM1 pieces done of row chunk j
-NCHLB_MAX = 1024
+NCHLB_MAX = 2048
 G1C_STRIDE = 16
 CTRL_LBSEQ = CTRL_CLM + 2 * LRDY_STRIDE
 CTRL_LBR = CTRL_LBSEQ + LRDY_STRIDE
@@ -356,6 +356,7 @@ def compile_mega_moe_tp(
     lbq: int = 1,
     tn: int = 0,
     tn_eps: float = 1e-6,
+    tn_gemma: bool = True,
     lbpf: bool = False,
     lbp: int = 0,
 ):
@@ -399,8 +400,10 @@ def compile_mega_moe_tp(
     lbq: (lb) output column chunks per GEMM2 unit (divides the chunk count).
     tn: (ag_rs) the next layer's input fused in: each output row r of this
         rank, once final, becomes res_out[r] = y[r] + res_in[r] and the
-        per-token FP8 quant of GemmaRMSNorm(res_out[r]; nw, tn_eps), whose rows
-        (and fp32 scales) every rank gathers into its qall (sall) arena buffer.
+        per-token FP8 quant of GemmaRMSNorm(res_out[r]; nw, tn_eps) (RMSNorm
+        unless tn_gemma), whose rows (and fp32 scales) every rank gathers into
+        its qall (sall) arena buffer; tn 2: the bf16 normed rows too (qall
+        after the FP8 rows of mmax * tp tokens).
     """
     DYN = dyn_e > 0
     CHUNK = DYN and rch > 0 and nch > 0
@@ -408,7 +411,10 @@ def compile_mega_moe_tp(
         swiglu_limit = 7.0 if act == "swiglu" else float("inf")
     A8 = bool(a8)
     LB = bool(lb)
-    TN = int(tn) == 1
+    TN = int(tn) in (1, 2)
+    # tn 2: also the bf16 rows of the norm (before the quant), gathered after
+    # the FP8 rows in qall (for a co-consumer of the next layer's input in bf16)
+    TNB = int(tn) == 2
     assert not TN or (not ar and not xrep)
     c = mega_moe_tp_consts(
         H, I, MT, TMAX, agr, dyn_e, nab, nsk, nch if CHUNK else 0, A8, LB
@@ -502,6 +508,8 @@ def compile_mega_moe_tp(
     assert not LB or NCH_MAX <= NCHLB_MAX
     LBQ = int(lbq) if LB else 1
     assert NCK % LBQ == 0
+    # (a GEMM2 unit's column groups: whole laps of its weight ring)
+    assert not LB or LBQ * GPC % gemm2_group_step(H, I) == 0
     NCG = NCK // LBQ
     # LB column groups (GEMM2 unit width), in output column chunks: LBQ each,
     # except 12 chunks in groups of 3: 3,3,3,2,1 (a short last group shortens
@@ -580,6 +588,7 @@ def compile_mega_moe_tp(
         + (("_cg" + "x".join(str(w) for w in CGW)) if _cg else "")
         + (f"_lp{LB_PS[0]}" if LB and len(LB_PS) == 1 else "")
         + (f"_tn{int(tn)}e{struct.unpack('<I', struct.pack('<f', tn_eps))[0]:x}" if tn else "")
+        + ("_rms" if tn and not tn_gemma else "")
         + ("_zma" if ZMA else "")
         + (f"_mix{LBMIX_DIV}" if LBMIX else "")
         + ("_mtskip" if MTSKIP else "")
@@ -4824,7 +4833,10 @@ def compile_mega_moe_tp(
         S = fin_split(a)
         step = (S > i32(1)).select(m, i32(gpu.grid_dim.x))
         mine = fin_owned(a) != i32(0)
-        for r_ in range(fin_key(a), m, step):
+        # (S > 1: only the m * S CTAs that final column chunks count a row's
+        # arrivals; the rest, when m * S < the grid, must not touch the counters)
+        start = ((S > i32(1)) & (i32(gpu.block_id("x")) >= m * S)).select(m, fin_key(a))
+        for r_ in range(start, m, step):
             r = i32(r_)
             if tid == i32(0):
                 last = i32(1)
@@ -4876,8 +4888,13 @@ def compile_mega_moe_tp(
         for k in range_constexpr(TN_IT):
             q = fx.min(tid + i32(k * NTT), H8 - i32(1))
             wv = bf16x8_to_f32(bld(rw, q * i32(16), 0, V4I, 0))
+            # GemmaRMSNorm scales by (1 + w), RMSNorm by w
             xk = [
-                fx.Float32(fx.Float32(x * rcp * (w + fx.Float32(1.0))).to(fx.BFloat16).to(fx.Float32))
+                fx.Float32(
+                    fx.Float32(x * rcp * ((w + fx.Float32(1.0)) if tn_gemma else w))
+                    .to(fx.BFloat16)
+                    .to(fx.Float32)
+                )
                 for x, w in zip(f[k], wv)
             ]
             am = am.maximumf(amax(xk))
@@ -4895,6 +4912,15 @@ def compile_mega_moe_tp(
             if q < H8:
                 for p in range_constexpr(TPC):
                     bst(d, peer_rs(a, p, "off_qall"), grow * i32(H) + q * i32(8), 0, AUX_SYS)
+        # tn 2: the bf16 rows too (qall bytes: the FP8 rows of every rank's
+        # tokens, then their bf16 rows)
+        b0 = a["mmax"] * i32(TPC * H)
+        for k in range_constexpr(TN_IT if TNB else 0):
+            q = tid + i32(k * NTT)
+            d = pack_bf16x8(xs[k])
+            if q < H8:
+                for p in range_constexpr(TPC):
+                    bst(d, peer_rs(a, p, "off_qall"), b0 + (grow * i32(H) + q * i32(8)) * i32(2), 0, AUX_SYS)
         if tid == i32(0):
             for p in range_constexpr(TPC):
                 bst(scale.bitcast(fx.Int32), peer_rs(a, p, "off_sall"), grow * i32(4), 0, AUX_SYS)

@@ -177,13 +177,14 @@ class MegaMoeTP:
         topk_ids: torch.Tensor,
         out: torch.Tensor | None = None,
         tail=None,
+        bf16: bool = False,
     ):
         """ag_rs: x_local [m, H] bf16 (this rank's tokens), topk_* [m, topk].
         rs / ar: x [M, H] bf16 (all tokens, same on every rank), topk_* [M, topk].
         ar_ar: x [M, H] bf16 (this rank's partial of every token), topk_* [M, topk]
         (the same routing on every rank). topk_ids int32, topk_weights float32
-        (others are converted per call)."""
-        return self.engine(x_local, topk_weights, topk_ids, out, tail=tail)
+        (others are converted per call). tail / bf16: see MegaMoeTPLayer.forward."""
+        return self.engine(x_local, topk_weights, topk_ids, out, tail=tail, bf16=bf16)
 
     __call__ = forward
 
@@ -198,10 +199,11 @@ class MegaMoeTP:
         """Run the next forwards on another layer's weights of the same shape."""
         self.engine.set_weights(w1, w1_scale, w2, w2_scale)
 
-    def prepare(self, local_tokens, tail: bool = False) -> None:
+    def prepare(self, local_tokens, tail: bool = False, tail_bf16: bool = False) -> None:
         """Collective: compile + arm the launch configs of these local token
-        counts (tail: also their fused-tail variants, ag_rs)."""
-        self.engine.prepare(local_tokens, tail)
+        counts (tail / tail_bf16: also their fused-tail variants without / with
+        the bf16 rows, ag_rs)."""
+        self.engine.prepare(local_tokens, tail, tail_bf16)
 
     def poll_errors(self) -> int:
         """Nonzero if a wait inside the kernel gave up (a peer never arrived)."""

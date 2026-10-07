@@ -70,23 +70,30 @@ def compile_sp_rs_norm(
     topk: int = 0,
     scale: float = 1.0,
     shared_w: float = 0.0,
+    gemma: bool = True,
+    logit_bf16: bool = True,
 ):
     """i8: int8 + fp32 scale per 32 columns (~0.5% rel error); else MXFP8
     (E4M3 + E8M0, ~2%: too coarse for an attention output).
+    gemma: GemmaRMSNorm (scale 1 + w), else RMSNorm (w).
 
     E > 0: also the router of the own rows: once a 16-row tile of the normed
     rows is out, K slices of its logits (bf16 MFMA against Wg [E, H], all E
     experts) on whichever CTAs take them; the last slice of a tile sums them
     and runs the sigmoid + bias top-k of aiter's topk_gating (renormalized,
-    times ``scale``) plus one shared expert (id E, weight shared_w)."""
+    times ``scale``) plus one shared expert (id E, weight shared_w).
+    logit_bf16: the logits rounded to bf16 first (a bf16 gate GEMM), else
+    fp32 (an fp32-output one)."""
     RT = E > 0
-    assert not RT or (E % 64 == 0 and E // 64 == 2 and topk <= 64)
+    EPL = E // 64  # router: experts per lane
+    assert not RT or (E % 64 == 0 and EPL in (2, 4) and topk <= 64)
     assert H % 256 == 0
     NP = H // 8  # 8-column pieces of a row
     KS_DIVS = [d for d in range(KS_MAX, 1, -1) if (H // 128) % d == 0]
     # router: K steps (32 columns per wave) of a slice prefetched; a slice
     # has at least H / KS_MAX / 4 / 32 of them
-    NPF = min(3, H // KS_MAX // 4 // 32)
+    # (E > 128: fewer, the accumulators of all E // 16 expert tiles are live)
+    NPF = min(3 if E <= 128 else 1, H // KS_MAX // 4 // 32)
     PIT = (NP + NTH - 1) // NTH
     assert NP % NTH == 0
     def fbits(v):
@@ -94,7 +101,7 @@ def compile_sp_rs_norm(
 
     name = f"sp_rs_norm_h{H}_tp{tp}_e{fbits(eps)}" + ("_i8" if i8 else "") + (
         f"_rt{E}k{topk}s{fbits(scale)}w{fbits(shared_w)}" if RT else ""
-    )
+    ) + ("" if gemma else "_rms") + ("_lf32" if RT and not logit_bf16 else "")
 
     def i32(v):
         return fx.Int32(v)
@@ -327,7 +334,7 @@ def compile_sp_rs_norm(
         rb = rsrc(a["bias"])
         r = rt * i32(ZT) + rl
         vals, orig, idxs = [], [], []
-        for i in range_constexpr(2):
+        for i in range_constexpr(EPL):
             e = lane + i32(i * 64)
             # every slice's partial in flight at once (slices >= KS: none)
             vs = []
@@ -338,37 +345,65 @@ def compile_sp_rs_norm(
             x = fx.Float32(0.0)
             for live, v in vs:
                 x = x + live.select(v, fx.Float32(0.0))
-            # (the reference rounds the gate GEMM output to bf16)
-            x = fx.Float32(x).to(fx.BFloat16).to(fx.Float32)
+            if const_expr(logit_bf16):
+                # (the reference rounds the gate GEMM output to bf16)
+                x = fx.Float32(x).to(fx.BFloat16).to(fx.Float32)
             sc = fx.Float32(1.0) / (fx.Float32(1.0) + fx.Float32(fmath.exp2(_u(x * fx.Float32(-1.4426950408889634)))))
             orig.append(sc)
             b = fx.Int32(bld(rb, e * i32(4), T.i32)).bitcast(fx.Float32)
             vals.append(sc + b)
             idxs.append(e)
-        # thread-local sort, descending (stable: the lower expert first on ties)
-        sw = vals[1] > vals[0]
-        v0, v1 = sw.select(vals[1], vals[0]), sw.select(vals[0], vals[1])
-        o0, o1 = sw.select(orig[1], orig[0]), sw.select(orig[0], orig[1])
-        i0, i1 = sw.select(idxs[1], idxs[0]), sw.select(idxs[0], idxs[1])
-        cur = i32(0)
-        tot = fx.Float32(0.0)
-        my_id = i32(0)
-        my_w = fx.Float32(0.0)
-        ninf = fx.Float32(float("-inf"))
-        for k in range_constexpr(topk):
-            mv = (cur == i32(0)).select(v0, (cur == i32(1)).select(v1, ninf))
-            mi = (cur == i32(0)).select(i0, i1)
-            mo = (cur == i32(0)).select(o0, o1)
-            mx = wave_red(mv.bitcast(fx.Int32), lane, lambda p_, q_: p_.bitcast(fx.Float32).maximumf(q_.bitcast(fx.Float32)).bitcast(fx.Int32)).bitcast(fx.Float32)
-            bal = fx.Int64(rocdl.ballot(T.i64, _u(mv == mx)))
-            win = i32(fx.ctpop(fx.Int64((bal & (fx.Int64(0) - bal)) - fx.Int64(1))))
-            win = (bal == fx.Int64(0)).select(i32(0), win)
-            wid = i32(rocdl.readlane(T.i32, _u(mi), _u(win)))
-            wgt = fx.Int32(rocdl.readlane(T.i32, _u(mo.bitcast(fx.Int32)), _u(win))).bitcast(fx.Float32)
-            cur = cur + ((lane == win) & (cur < i32(2))).select(i32(1), i32(0))
-            tot = tot + wgt
-            my_id = (lane == i32(k)).select(wid, my_id)
-            my_w = (lane == i32(k)).select(wgt, my_w)
+        if const_expr(EPL == 2):
+            # thread-local sort, descending (stable: the lower expert first on ties)
+            sw = vals[1] > vals[0]
+            v0, v1 = sw.select(vals[1], vals[0]), sw.select(vals[0], vals[1])
+            o0, o1 = sw.select(orig[1], orig[0]), sw.select(orig[0], orig[1])
+            i0, i1 = sw.select(idxs[1], idxs[0]), sw.select(idxs[0], idxs[1])
+            cur = i32(0)
+            tot = fx.Float32(0.0)
+            my_id = i32(0)
+            my_w = fx.Float32(0.0)
+            ninf = fx.Float32(float("-inf"))
+            for k in range_constexpr(topk):
+                mv = (cur == i32(0)).select(v0, (cur == i32(1)).select(v1, ninf))
+                mi = (cur == i32(0)).select(i0, i1)
+                mo = (cur == i32(0)).select(o0, o1)
+                mx = wave_red(mv.bitcast(fx.Int32), lane, lambda p_, q_: p_.bitcast(fx.Float32).maximumf(q_.bitcast(fx.Float32)).bitcast(fx.Int32)).bitcast(fx.Float32)
+                bal = fx.Int64(rocdl.ballot(T.i64, _u(mv == mx)))
+                win = i32(fx.ctpop(fx.Int64((bal & (fx.Int64(0) - bal)) - fx.Int64(1))))
+                win = (bal == fx.Int64(0)).select(i32(0), win)
+                wid = i32(rocdl.readlane(T.i32, _u(mi), _u(win)))
+                wgt = fx.Int32(rocdl.readlane(T.i32, _u(mo.bitcast(fx.Int32)), _u(win))).bitcast(fx.Float32)
+                cur = cur + ((lane == win) & (cur < i32(2))).select(i32(1), i32(0))
+                tot = tot + wgt
+                my_id = (lane == i32(k)).select(wid, my_id)
+                my_w = (lane == i32(k)).select(wgt, my_w)
+        else:
+            # per pick: each lane's best remaining expert, the wave's best of
+            # those (the lowest lane on ties); the winner drops it
+            tot = fx.Float32(0.0)
+            my_id = i32(0)
+            my_w = fx.Float32(0.0)
+            ninf = fx.Float32(float("-inf"))
+            for k in range_constexpr(topk):
+                bv, bo, bi, bj = vals[0], orig[0], idxs[0], i32(0)
+                for j in range_constexpr(1, EPL):
+                    t = vals[j] > bv
+                    bv = t.select(vals[j], bv)
+                    bo = t.select(orig[j], bo)
+                    bi = t.select(idxs[j], bi)
+                    bj = t.select(i32(j), bj)
+                mx = wave_red(bv.bitcast(fx.Int32), lane, lambda p_, q_: p_.bitcast(fx.Float32).maximumf(q_.bitcast(fx.Float32)).bitcast(fx.Int32)).bitcast(fx.Float32)
+                bal = fx.Int64(rocdl.ballot(T.i64, _u(bv == mx)))
+                win = i32(fx.ctpop(fx.Int64((bal & (fx.Int64(0) - bal)) - fx.Int64(1))))
+                win = (bal == fx.Int64(0)).select(i32(0), win)
+                wid = i32(rocdl.readlane(T.i32, _u(bi), _u(win)))
+                wgt = fx.Int32(rocdl.readlane(T.i32, _u(bo.bitcast(fx.Int32)), _u(win))).bitcast(fx.Float32)
+                for j in range_constexpr(EPL):
+                    vals[j] = ((lane == win) & (bj == i32(j))).select(ninf, vals[j])
+                tot = tot + wgt
+                my_id = (lane == i32(k)).select(wid, my_id)
+                my_w = (lane == i32(k)).select(wgt, my_w)
         f = fx.Float32(float(scale)) / tot.maximumf(fx.Float32(1e-20))
         ri = rsrc(a["ids"])
         rw = rsrc(a["tw"])
@@ -523,7 +558,7 @@ def compile_sp_rs_norm(
                 wv = bf16x8(bld(rw, p * i32(16), T.vec(4, T.i32)))
                 if act:
                     bst(
-                        pack_bf16x8([x * rcp * (w + fx.Float32(1.0)) for x, w in zip(fs[k], wv)]),
+                        pack_bf16x8([x * rcp * ((w + fx.Float32(1.0)) if gemma else w) for x, w in zip(fs[k], wv)]),
                         rout,
                         off,
                         AUX_SYS if RT else 0,
@@ -625,7 +660,8 @@ class SpRsNorm:
     router = (E, topk, scale, shared_w): ``forward(..., router=(wg, bias, ids,
     tw))`` also routes the own rows (see compile_sp_rs_norm): wg = the gate
     weight bf16 [E, H], bias fp32 [E]; ids int32 / tw fp32 [m, topk + 1] (the
-    last column the shared expert). Needs m % 16 == 0."""
+    last column the shared expert). Needs m % 16 == 0.
+    gemma / logit_bf16: see compile_sp_rs_norm."""
 
     def __init__(
         self,
@@ -636,6 +672,8 @@ class SpRsNorm:
         device=None,
         i8: bool = True,
         router=None,
+        gemma: bool = True,
+        logit_bf16: bool = True,
     ):
         device = torch.device(device if device is not None else "cuda")
         if device.index is None:
@@ -665,11 +703,11 @@ class SpRsNorm:
             dtype=torch.float32,
             device=device,
         )
-        self._fn = compile_sp_rs_norm(self.H, self.tp, self.eps, bool(i8))
+        self._fn = compile_sp_rs_norm(self.H, self.tp, self.eps, bool(i8), gemma=bool(gemma))
         self._fn_rt = (
             compile_sp_rs_norm(self.H, self.tp, self.eps, bool(i8), *[
                 int(router[0]), int(router[1]), float(router[2]), float(router[3])
-            ])
+            ], gemma=bool(gemma), logit_bf16=bool(logit_bf16))
             if router
             else None
         )

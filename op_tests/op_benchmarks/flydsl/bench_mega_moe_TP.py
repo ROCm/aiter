@@ -74,7 +74,7 @@ import torch
 import torch.distributed as dist
 
 import aiter
-from aiter import dtypes, topk_gating
+from aiter import biased_grouped_topk, dtypes, topk_gating
 from aiter.dist.communication_op import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
@@ -1153,12 +1153,30 @@ def run_case(shape, weights, ctx, args, global_tokens, max_local_tokens) -> dict
 #   + all-gather of the next layer's input).
 
 # model -> (routed experts, routed top-k, routed scale, shared-expert weight, eps)
-E2E_ROUTER = {
-    "m3": (128, 4, 2.0, 1.0, 1e-6),
+@dataclass(frozen=True)
+class E2eModel:
+    """The decoder layer around the MoE, as ATOM runs it."""
+
+    experts: int  # routed (the shared expert: id experts, weight shared_w)
+    topk: int
+    scale: float  # routed scaling factor
+    shared_w: float
+    eps: float
+    gemma: bool  # GemmaRMSNorm (scale 1 + w), else RMSNorm (w)
+    logits_fp32: bool  # fp32 gate GEMM output + biased_grouped_topk (else bf16 + topk_gating)
+    # the model's SwiGLU clamp (the MegaMoE engine's default for swiglu; the
+    # split GEMMs need it explicitly)
+    swiglu_limit: float | None = None
+    # e_score_correction_bias: N(0, 0.05), or GLM-like: around 7 (fp32 needed:
+    # a bf16 ulp there is 1/32), spread little (a learned bias balances the
+    # experts; a wide one on random gate weights would route to a few)
+    bias_glm: bool = False
+
+
+E2E_MODELS = {
+    "m3": E2eModel(128, 4, 2.0, 1.0, 1e-6, gemma=True, logits_fp32=False, swiglu_limit=7.0),
+    "glm5": E2eModel(256, 8, 2.5, 1.0, 1e-5, gemma=False, logits_fp32=True, bias_glm=True),
 }
-# the model's SwiGLU clamp (the MegaMoE engine's default for swiglu; the split
-# GEMMs need it explicitly: e2e inputs are normed activations, not 0.25-scaled)
-E2E_SWIGLU_LIMIT = {"m3": 7.0}
 
 
 @dataclass
@@ -1180,7 +1198,8 @@ E2E_RESIDUAL_SCALE = 16.0
 
 
 def make_e2e_inputs(shape, ctx, tp, global_tokens, seed) -> E2eInputs:
-    E, _, _, _, _ = E2E_ROUTER[shape.name]
+    cfg = E2E_MODELS[shape.name]
+    E = cfg.experts
     H = shape.model_dim
     # every rank: its own partial; the rest is the same on every rank
     gen = torch.Generator(device=ctx.device).manual_seed(seed + 31 * ctx.rank)
@@ -1193,18 +1212,21 @@ def make_e2e_inputs(shape, ctx, tp, global_tokens, seed) -> E2eInputs:
         E2E_RESIDUAL_SCALE * torch.randn((global_tokens, H), generator=shared, device=ctx.device)
     ).to(dtypes.bf16)
 
-    # Gemma norm weights (scale 1 + w): normed rows of RMS ~ shape.x_scale, the
-    # input range the random expert weights are built for
+    # norm weights giving normed rows of RMS ~ shape.x_scale, the input range
+    # the random expert weights are built for (Gemma: the scale is 1 + w)
     def norm_weight():
         noise = 0.1 * torch.randn((H,), generator=shared, device=ctx.device)
-        return (shape.x_scale * (1.0 + noise) - 1.0).to(dtypes.bf16)
+        return (shape.x_scale * (1.0 + noise) - (1.0 if cfg.gemma else 0.0)).to(dtypes.bf16)
 
     w_post = norm_weight()
     w_next = norm_weight()
     wg = (torch.randn((E, H), generator=shared, device=ctx.device) * (3 * H**-0.5)).to(
         dtypes.bf16
     )
-    bias = 0.05 * torch.randn((E,), generator=shared, device=ctx.device)
+    if cfg.bias_glm:
+        bias = 7.0 + 0.01 * torch.randn((E,), generator=shared, device=ctx.device)
+    else:
+        bias = 0.05 * torch.randn((E,), generator=shared, device=ctx.device)
     return E2eInputs(
         part, residual, w_post, w_next, wg, bias.float(), global_tokens, global_tokens // tp
     )
@@ -1213,50 +1235,54 @@ def make_e2e_inputs(shape, ctx, tp, global_tokens, seed) -> E2eInputs:
 class SplitE2e:
     """ATOM's base path (every rank holds every token)."""
 
-    def __init__(self, weights: TpMoeWeights, ctx: DistCtx, max_local_tokens: int, comm):
+    def __init__(
+        self, weights: TpMoeWeights, ctx: DistCtx, max_local_tokens: int, comm, bf16=False
+    ):
         self.shape = weights.shape
-        self.E, self.K, self.scale, shared_w, self.eps = E2E_ROUTER[self.shape.name]
+        self.bf16 = bf16  # the next layer's input in bf16 too (GLM-5's indexer layers)
+        self.cfg = cfg = E2E_MODELS[self.shape.name]
+        self.E, self.K, self.scale, self.eps = cfg.experts, cfg.topk, cfg.scale, cfg.eps
         self.moe = SplitTpMoeAR(weights, ctx, max_local_tokens, comm)
-        self.moe.gemms.kwargs["swiglu_limit"] = E2E_SWIGLU_LIMIT.get(self.shape.name)
+        self.moe.gemms.kwargs["swiglu_limit"] = cfg.swiglu_limit
         total = max_local_tokens * weights.tp_size
         # (ATOM's aiter_topK_meta_data: the shared expert's column preset)
         self.ids = torch.full((total, self.K + 1), self.E, dtype=torch.int32, device=ctx.device)
-        self.tw = torch.full((total, self.K + 1), shared_w, dtype=torch.float32, device=ctx.device)
+        self.tw = torch.full((total, self.K + 1), cfg.shared_w, dtype=torch.float32, device=ctx.device)
 
     def kernel_names(self, global_tokens: int) -> tuple[str, str]:
         return self.moe.kernel_names(global_tokens)
 
     def __call__(self, inp: E2eInputs):
         T, K = inp.global_tokens, self.K
+        gemma = self.cfg.gemma
         normed, res = tensor_model_parallel_fused_allreduce_rmsnorm(
-            inp.part, inp.residual, inp.w_post, self.eps, gemma_norm=True
+            inp.part, inp.residual, inp.w_post, self.eps, gemma_norm=gemma
         )
-        logits = tgemm.mm(normed, inp.wg, None, otype=dtypes.bf16)
         ids, tw = self.ids[:T], self.tw[:T]
-        topk_gating(
-            torch.split(tw, [K, 1], dim=1)[0],
-            torch.split(ids, [K, 1], dim=1)[0],
-            logits,
-            inp.bias,
-            True,
-            self.scale,
-            score_func="sigmoid",
-        )
+        tw_r, ids_r = torch.split(tw, [K, 1], dim=1)[0], torch.split(ids, [K, 1], dim=1)[0]
+        if self.cfg.logits_fp32:
+            logits = tgemm.mm(normed, inp.wg, None, otype=dtypes.fp32)
+            biased_grouped_topk(logits, inp.bias, tw_r, ids_r, 1, 1, True, self.scale)
+        else:
+            logits = tgemm.mm(normed, inp.wg, None, otype=dtypes.bf16)
+            topk_gating(tw_r, ids_r, logits, inp.bias, True, self.scale, score_func="sigmoid")
         plan = self.moe.plans(T)
         sorted_ret = sort_routes(self.shape, tw, ids, plan)
         a1, a1_scale = (
             self.moe.quant(normed, quant_dtype=AQ_DTYPE) if plan.prequant else (normed, None)
         )
         partial = self.moe.gemms(a1, a1_scale, tw, ids, sorted_ret, plan)
-        q, res_out, s = tensor_model_parallel_fused_allreduce_rmsnorm_quant(
+        out = tensor_model_parallel_fused_allreduce_rmsnorm_quant(
             partial.contiguous(),
             res,
             inp.w_next,
             self.eps,
             quant_type="per_token",
-            gemma_norm=True,
+            gemma_norm=gemma,
+            emit_bf16=self.bf16,
         )
-        return q, s, res_out
+        q, res_out, s = out[:3]
+        return (q, s, res_out) + tuple(out[3:])
 
     @torch.no_grad()
     def reference(self, inp: E2eInputs):
@@ -1267,7 +1293,7 @@ class SplitE2e:
         acc = inp.part.float()
         dist.all_reduce(acc)
         res = (acc + inp.residual.float()).to(dtypes.bf16)
-        normed = _gemma_norm(res, inp.w_post, self.eps)
+        normed = _norm(res, inp.w_post, self.eps, self.cfg.gemma)
         ids, tw = self.ids[:T], self.tw[:T]
         plan = self.moe.plans(T)
         sorted_ret = sort_routes(self.shape, tw, ids, plan)
@@ -1277,33 +1303,42 @@ class SplitE2e:
         y = self.moe.gemms(a1, a1_scale, tw, ids, sorted_ret, plan).float()
         dist.all_reduce(y)
         res_out = (y + res.float()).to(dtypes.bf16)
-        return _gemma_norm(res_out, inp.w_next, self.eps).float(), res_out
+        return _norm(res_out, inp.w_next, self.eps, self.cfg.gemma).float(), res_out
 
 
-def _gemma_norm(x, w, eps) -> torch.Tensor:
+def _norm(x, w, eps, gemma) -> torch.Tensor:
     xf = x.float()
     xf = xf * torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + eps)
-    return (xf * (1.0 + w.float())).to(dtypes.bf16)
+    return (xf * ((1.0 + w.float()) if gemma else w.float())).to(dtypes.bf16)
 
 
 class MegaE2e:
     """ATOM's sequence-parallel MegaMoE path (this rank's rows)."""
 
-    def __init__(self, weights: TpMoeWeights, ctx: DistCtx, max_local_tokens: int, tokens):
+    def __init__(
+        self, weights: TpMoeWeights, ctx: DistCtx, max_local_tokens: int, tokens, bf16=False
+    ):
         shape = weights.shape
         self.rank = ctx.rank
-        E, self.K, scale, shared_w, self.eps = E2E_ROUTER[shape.name]
+        self.bf16 = bf16
+        cfg = E2E_MODELS[shape.name]
+        self.K, self.eps = cfg.topk, cfg.eps
         self.fused = MegaMoeTP(
             weights, ctx, max_local_tokens, comm_mode="ag_rs", comm_dtype="fp8"
         )
         self.fused.engine.engine.tn_eps = self.eps
-        self.fused.engine.prepare(sorted({t // weights.tp_size for t in tokens}), tail=True)
+        self.fused.engine.engine.tn_gemma = cfg.gemma
+        self.fused.engine.prepare(
+            sorted({t // weights.tp_size for t in tokens}), tail=not bf16, tail_bf16=bf16
+        )
         self.sprs = SpRsNorm(
             shape.model_dim,
             max_local_tokens * weights.tp_size,
             self.eps,
             device=ctx.device,
-            router=(E, self.K, scale, shared_w),
+            router=(cfg.experts, cfg.topk, cfg.scale, cfg.shared_w),
+            gemma=cfg.gemma,
+            logit_bf16=not cfg.logits_fp32,
         )
         self.ids = torch.empty((max_local_tokens, self.K + 1), dtype=torch.int32, device=ctx.device)
         self.tw = torch.empty((max_local_tokens, self.K + 1), dtype=torch.float32, device=ctx.device)
@@ -1315,11 +1350,12 @@ class MegaE2e:
         ids, tw = self.ids[:m], self.tw[:m]
         out, res = self.sprs(inp.part, inp.residual, inp.w_post, router=(inp.wg, inp.bias, ids, tw))
         res_own = res[rows]
-        _, q, s = self.fused.engine.forward(
-            out[rows], tw, ids, out=self.y[:m], tail=(res_own, res_own, inp.w_next)
+        _, q, s, *b = self.fused.engine.forward(
+            out[rows], tw, ids, out=self.y[:m], tail=(res_own, res_own, inp.w_next),
+            bf16=self.bf16,
         )
         # (the gathered rows are the arena's bytes: E4M3, as the split path's)
-        return q.view(dtypes.fp8), s, res_own
+        return (q.view(dtypes.fp8), s, res_own) + tuple(b)
 
 
 def _dequant(q, s) -> torch.Tensor:
@@ -1331,7 +1367,7 @@ def run_case_e2e(shape, weights, ctx, args, global_tokens, max_local_tokens, tok
     if global_tokens % (16 * tp):
         raise SkipCase("the fused router takes 16-row tiles per rank (tokens % 64)")
     inp = make_e2e_inputs(shape, ctx, tp, global_tokens, args.seed)
-    split = SplitE2e(weights, ctx, max_local_tokens, args.comm_backend)
+    split = SplitE2e(weights, ctx, max_local_tokens, args.comm_backend, bf16=args.e2e_tail_bf16)
     if not jit_warmup(split.moe, shape, ctx, global_tokens):
         raise SkipCase("kernel build failed on rank 0 (see the [jit-warmup] warning above)")
     row = new_row(
@@ -1339,9 +1375,9 @@ def run_case_e2e(shape, weights, ctx, args, global_tokens, max_local_tokens, tok
         split.kernel_names(global_tokens), "",
     )
     row["comm_mode"] = "e2e"
-    mega = MegaE2e(weights, ctx, max_local_tokens, tokens)
-    q0, s0, r0 = split(inp)
-    q1, s1, r1 = mega(inp)
+    mega = MegaE2e(weights, ctx, max_local_tokens, tokens, bf16=args.e2e_tail_bf16)
+    q0, s0, r0, *b0 = split(inp)
+    q1, s1, r1, *b1 = mega(inp)
     barrier()
     m, K = inp.local_tokens, mega.K
     rows = slice(ctx.rank * m, (ctx.rank + 1) * m)
@@ -1364,6 +1400,10 @@ def run_case_e2e(shape, weights, ctx, args, global_tokens, max_local_tokens, tok
     ref_q, ref_r = split.reference(inp)
     keep = same_all.view(-1, 1)
     own = same.view(-1, 1)
+    if b1:
+        # the bf16 rows: both paths round the same normed values
+        row["e2e_bf16_rel_l2"] = rel_l2(b1[0].float() * keep, ref_q * keep)
+        row["e2e_split_bf16_rel_l2"] = rel_l2(b0[0].float(), ref_q)
     row["e2e_split_q_rel_l2"] = rel_l2(_dequant(q0, s0), ref_q)
     row["e2e_split_res_rel_l2"] = rel_l2(r0[rows].float(), ref_r[rows].float())
     gate(
@@ -1399,7 +1439,7 @@ def main_e2e(args) -> int:
         if ctx.custom_comm_error:
             raise RuntimeError(f"--e2e needs aiter's parallel state: {ctx.custom_comm_error}")
         tokens, max_local = _check_tokens(args)
-        models = [m for m in args.models if m in E2E_ROUTER]
+        models = [m for m in args.models if m in E2E_MODELS]
         if ctx.is_main:
             print(
                 f"[ENV] e2e gfx={get_gfx()} tp={args.tp} models={models} "
@@ -1430,7 +1470,12 @@ def main_e2e(args) -> int:
                         f"speedup={row.get('e2e_speedup', float('nan')):.3f} "
                         f"route_match={row['e2e_route_match']:.4f} "
                         f"vs ref: split q/res {row['e2e_split_q_rel_l2']:.4f}/{row['e2e_split_res_rel_l2']:.4f} "
-                        f"mega q/res {row['e2e_q_rel_l2']:.4f}/{row['e2e_res_rel_l2']:.4f}",
+                        f"mega q/res {row['e2e_q_rel_l2']:.4f}/{row['e2e_res_rel_l2']:.4f}"
+                        + (
+                            f" bf16 split/mega {row['e2e_split_bf16_rel_l2']:.4f}/{row['e2e_bf16_rel_l2']:.4f}"
+                            if "e2e_bf16_rel_l2" in row
+                            else ""
+                        ),
                         flush=True,
                     )
                 barrier()
@@ -1442,7 +1487,8 @@ def main_e2e(args) -> int:
             cols = [
                 "model", "global_tokens", "local_tokens", "split_e2e_us", "mega_e2e_us",
                 "e2e_speedup", "e2e_route_match", "e2e_split_q_rel_l2", "e2e_q_rel_l2",
-                "e2e_split_res_rel_l2", "e2e_res_rel_l2", "comm",
+                "e2e_split_res_rel_l2", "e2e_res_rel_l2", "e2e_split_bf16_rel_l2",
+                "e2e_bf16_rel_l2", "comm",
             ]
             cols = [c for c in cols if c in df.columns]
             print("\n" + "=" * 100 + "\nATOM decoder-layer MoE region: split vs mega (us)\n" + "=" * 100)
@@ -1972,7 +2018,7 @@ def parse_args(argv=None):
         help="The MoE region of one ATOM decoder layer: the base path (fused AR+norm, "
         "gate GEMM + top-k, MoE, fused AR+norm+FP8 quant) vs the MegaMoE "
         "sequence-parallel path (SpRsNorm + router, MegaMoE with the fused tail), "
-        "in the ATOM server's environment. Models: " + ", ".join(E2E_ROUTER) + ".",
+        "in the ATOM server's environment. Models: " + ", ".join(E2E_MODELS) + ".",
     )
     p.add_argument(
         "--e2e-rtol",
@@ -1981,6 +2027,11 @@ def parse_args(argv=None):
         help="--e2e: rel_l2 gate, mega's next-layer input and residual vs the "
         "full-precision layer (the tokens both routers route the same way); "
         "ATOM's base path is ~0.1 off it (fp4 activation quant, int4 all-reduce).",
+    )
+    p.add_argument(
+        "--e2e-tail-bf16",
+        action="store_true",
+        help="--e2e: the next layer's input in bf16 too (GLM-5's indexer layers).",
     )
     p.add_argument(
         "--e2e-route-match",

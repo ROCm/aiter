@@ -173,6 +173,13 @@ def _kind(k, j, groups=0):
     return k | (groups << 8) | (j << XQ_SHIFT)
 
 
+def _mt_table(spec: str) -> tuple[int, list[tuple[int, int]]]:
+    """'N' or 'T1:N1,T2:N2,...,N' -> (N, [(T1, N1), ...] sorted by T)."""
+    *rows, last = [x.strip() for x in spec.split(",") if x.strip()]
+    table = sorted(tuple(int(v) for v in r.split(":")) for r in rows)
+    return int(last), table
+
+
 class MegaMoeTPEngine:
 
     def __init__(
@@ -255,15 +262,24 @@ class MegaMoeTPEngine:
             if schedule == "dynamic" and not self.a8
             else 0
         )
-        self.lb_mt = int(os.environ.get("AITER_MEGAMOE_TP_LB_MT", "3"))
+        # row tiles of the LB units: N, or a table "T1:N1,T2:N2,...,N" (up to
+        # Ti global tokens Ni, above them N)
+        self.lb_mt, self.lb_mt_table = _mt_table(os.environ.get("AITER_MEGAMOE_TP_LB_MT", "3"))
         # smaller row tiles up to lb_small_max global tokens (rows per expert
         # are few there: less padded work per unit)
         self.lb_mt_small = int(os.environ.get("AITER_MEGAMOE_TP_LB_MT_SMALL", "3"))
         self.lb_small_max = int(os.environ.get("AITER_MEGAMOE_TP_LB_SMALL_MAX", "512"))
         # GEMM1 column blocks per pass over A (up to lb_small_max: 2)
         self.lb_npp = int(os.environ.get("AITER_MEGAMOE_TP_LB_NPP", "1"))
-        # output column chunks per GEMM2 column group
-        self.lb_q = int(os.environ.get("AITER_MEGAMOE_TP_LB_Q", "1"))
+        # output column chunks per GEMM2 column group: the largest valid one
+        # up to the setting (a divisor of the shape's column chunk count whose
+        # column groups are whole GEMM2 ring laps), else the smallest valid
+        lb_q = int(os.environ.get("AITER_MEGAMOE_TP_LB_Q", "1"))
+        nck = mega_moe_tp_consts(model_dim, inter_dim, 1, 1)["NCK"]
+        gpc = gemm2_chunk_groups(model_dim, inter_dim)
+        step = gemm2_group_step(model_dim, inter_dim)
+        valid = [d for d in range(1, nck + 1) if nck % d == 0 and d * gpc % step == 0]
+        self.lb_q = max((d for d in valid if d <= lb_q), default=min(valid))
         self.ar = comm_mode in ("ar", "ar_ar")
         self.xrep = comm_mode in ("ar", "rs")
         # inputs and routing of every token on every rank
@@ -323,11 +339,13 @@ class MegaMoeTPEngine:
         )
         # tail (tn, ag_rs): every rank's FP8 rows of the next layer's input and
         # their per-token scales, gathered by the kernel
-        # (FP8 rows [tot, H] + scales)
+        # (FP8 rows [tot, H], then (tail bf16) their bf16 rows [tot, H]; scales)
         tn_ok = comm_mode == "ag_rs"
-        self._qall = arena.reserve("qall", (tot * H,) if tn_ok else (1,), torch.uint8)
+        self._qall = arena.reserve("qall", (tot * H * 3,) if tn_ok else (1,), torch.uint8)
         self._sall = arena.reserve("sall", (tot,) if tn_ok else (1,), torch.float32)
         self.tn_eps = 1e-6
+        # the tail's norm: GemmaRMSNorm (scale 1 + w), else RMSNorm (w)
+        self.tn_gemma = True
         self.tn_mode = 1
         arena.commit()
         self.arena = arena
@@ -659,8 +677,9 @@ class MegaMoeTPEngine:
             tot = m * self.tp
             lb = bool(self.lb_min) and tot >= self.lb_min and self.I // 128 >= 2
             if lb:
+                mt = next((n for t, n in self.lb_mt_table if tot <= t), self.lb_mt)
                 cfg = LaunchCfg(
-                    mt=self.lb_mt_small if tot <= self.lb_small_max else self.lb_mt,
+                    mt=self.lb_mt_small if tot <= self.lb_small_max else mt,
                     dyn=True,
                     route_fp8=False,
                     npp=2 if tot <= self.lb_small_max else self.lb_npp,
@@ -774,6 +793,7 @@ class MegaMoeTPEngine:
                 lbq=self.lb_q if cfg.lb else 1,
                 tn=cfg.tn,
                 tn_eps=self.tn_eps,
+                tn_gemma=self.tn_gemma,
                 lbpf=cfg.pf,
                 lbp=cfg.lp,
                 **static,
@@ -845,15 +865,18 @@ class MegaMoeTPEngine:
                 "rank (replicated input)"
             )
 
-    def prepare(self, local_tokens, tail: bool = False) -> None:
+    def prepare(self, local_tokens, tail: bool = False, tail_bf16: bool = False) -> None:
         """Compile and arm the kernel for these local token counts (collective:
         every rank, same list). forward() does this on first use of a launch
-        config, which must not happen inside CUDA graph capture."""
+        config, which must not happen inside CUDA graph capture. tail /
+        tail_bf16: also the configs of forward(tail=..., bf16=False / True)."""
         for m in local_tokens:
             if 0 < m <= self.mmax:
                 self._arm(self.config(int(m)), int(m))
-                if tail and self.tail_ok(int(m)):
-                    self._arm(dataclasses.replace(self.config(int(m)), tn=self.tn_mode), int(m))
+                if self.tail_ok(int(m)):
+                    for on, tn in ((tail, self.tn_mode), (tail_bf16, 2)):
+                        if on:
+                            self._arm(dataclasses.replace(self.config(int(m)), tn=tn), int(m))
 
     def tail_ok(self, m: int) -> bool:
         """forward(tail=...) runs for m local tokens (ag_rs, the LB schedule)."""
@@ -926,12 +949,14 @@ class MegaMoeTPEngine:
         topk_ids: torch.Tensor,
         out: torch.Tensor | None = None,
         tail=None,
+        bf16: bool = False,
     ):
         """tail (ag_rs): (res_in, res_out, norm_w), bf16 [m, H], [m, H], [H]:
         also res_out = y + res_in and every rank's per-token FP8 rows of
-        GemmaRMSNorm(res_out) (eps tn_eps) gathered: returns (y, q [M, H] fp8
-        bytes, scale [M] fp32), views of arena buffers valid until the next
-        forward with a tail."""
+        GemmaRMSNorm(res_out) (eps tn_eps; RMSNorm unless tn_gemma) gathered:
+        returns (y, q [M, H] fp8 bytes, scale [M] fp32), views of arena buffers
+        valid until the next forward with a tail. bf16: also the normed rows
+        before the quant, bf16 [M, H] (a fourth view)."""
         m = self._local_tokens(x_local, topk_weights, topk_ids)
         rows = m * self.tp if self.ar else m  # output rows
         if out is not None and (
@@ -954,7 +979,7 @@ class MegaMoeTPEngine:
             for t, shp in ((res_in, (m, self.H)), (res_out, (m, self.H)), (nw, (self.H,))):
                 if tuple(t.shape) != shp or t.dtype != torch.bfloat16 or not t.is_contiguous():
                     raise ValueError(f"tail: need contiguous bf16 {shp}")
-            cfg = dataclasses.replace(cfg, tn=self.tn_mode)
+            cfg = dataclasses.replace(cfg, tn=2 if bf16 else self.tn_mode)
         # output written in place: ag_rs / rs, and ar when the all-reduce ends
         # locally (one-shot LL); else it lands in the peers' symmetric buffer
         local_y = not self.ar or self._arll(cfg) or self._ag8(cfg)
@@ -977,7 +1002,13 @@ class MegaMoeTPEngine:
         y = y[:rows] if out is None else out
         if tail is not None:
             T_ = m * self.tp
-            return y, self._qall.local[: T_ * self.H].view(T_, self.H), self._sall.local[:T_]
+            qall = self._qall.local
+            q = qall[: T_ * self.H].view(T_, self.H)
+            if bf16:
+                b0 = self.mmax * self.tp * self.H
+                b = qall[b0 : b0 + 2 * T_ * self.H].view(torch.bfloat16).view(T_, self.H)
+                return y, q, self._sall.local[:T_], b
+            return y, q, self._sall.local[:T_]
         return y
 
     __call__ = forward
