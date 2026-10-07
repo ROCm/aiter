@@ -62,21 +62,39 @@ def launch_gemm_a8w8_256x256(
     persistent_n_tiles: Constexpr[int] = 1,
     fused_splitk: Constexpr[bool] = False,
     bounded_m: Constexpr[bool] = True,
+    splitk_fp32: Constexpr[bool] = False,
+    c_cache_modifier: Constexpr[int] = 0,
+    full_stage_prefetch: Constexpr[int] = 0,
 ):
     """N must be a multiple of ``tile_n * cluster_n``; M is unrestricted (a
     multiple of 2 when ``a_preshuffle``); K must be divisible by 128 and at
     least 512 per split."""
 
-    assert (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers) in (
-        (256, 256, 128, 2, 2, 4),
-        (256, 256, 128, 2, 2, 2),
-        (128, 128, 128, 2, 2, 4),
-        (128, 256, 128, 2, 2, 4),
-        (128, 256, 128, 2, 2, 3),
-    ), "only the tuned 2x2-wave profiles are supported"
+    # Tuned profiles: (256,256,128,2,2,{2,4}), (128,128,128,2,2,4),
+    # (128,256,128,2,2,{3,4}).  Other shapes that satisfy the structural
+    # constraints below compile; the quadrant schedule's own asserts reject
+    # the ones it cannot place.
+    assert tile_k == 128, f"compute kernel needs tile_k == 128, got {tile_k}"
+    assert tile_m in (64, 128, 256) and tile_n in (64, 128, 256), (
+        f"compute kernel tile must be 64/128/256 per side, got {tile_m}x{tile_n}"
+    )
+    # Waves 0..3 each own one TDM operand (A, B, A-scale, B-scale): fewer than
+    # four waves would leave operands unloaded.
+    assert (m_warp, n_warp) in ((2, 2), (1, 4), (4, 1), (2, 4), (4, 2)), (
+        f"compute kernel needs >= 4 waves in a supported layout, got {m_warp}x{n_warp}"
+    )
+    assert num_buffers in (2, 3, 4), f"num_buffers must be 2..4, got {num_buffers}"
+    assert (tile_m // m_warp) % 32 == 0 and (tile_n // n_warp) % 32 == 0, (
+        "each wave needs an even number of 16-wide WMMA fragments per side, got "
+        f"warp tile {tile_m // m_warp}x{tile_n // n_warp}"
+    )
     assert (
         cluster_m >= 1 and cluster_n >= 1 and 1 < cluster_m * cluster_n <= 16
     ), f"cluster_m*cluster_n must be 2..16, got {cluster_m}x{cluster_n}"
+    # A 16-wide cluster axis launches and then deadlocks in the cluster barrier.
+    assert cluster_m <= 8 and cluster_n <= 8, (
+        f"each cluster dimension must be <= 8, got {cluster_m}x{cluster_n}"
+    )
     assert split_k in (1, 2, 4, 8), f"split_k must be 1/2/4/8, got {split_k}"
     assert (
         persistent_n_tiles >= 1
@@ -85,6 +103,9 @@ def launch_gemm_a8w8_256x256(
         persistent_n_tiles == 1 or split_k == 1
     ), "persistent_n_tiles>1 requires split_k=1"
     cluster_splitk = fused_splitk and split_k > 1
+    assert not splitk_fp32 or cluster_splitk, "splitk_fp32 needs the fused split-K path"
+    # Bytes per staged C element: FP32 partials keep the split's accumulator.
+    C_ELEM_B = 4 if splitk_fp32 else 2
     assert not fused_splitk or (
         split_k > 1 and tile_m % split_k == 0
     ), "a fused split-K epilogue needs split_k > 1 dividing tile_m"
@@ -139,7 +160,7 @@ def launch_gemm_a8w8_256x256(
     PLANAR_SB_BASE = PLANAR_SA_BASE + num_buffers * STAGE_SA
     PLANAR_END = PLANAR_SB_BASE + num_buffers * STAGE_SB
 
-    ARENA_B = max(PLANAR_END, tile_m * C_LDS_ROW * 2)
+    ARENA_B = max(PLANAR_END, tile_m * C_LDS_ROW * C_ELEM_B)
     # The compile target, not the host: AOT cross-compiles these gfx1250
     # kernels under FLYDSL_GPU_ARCH, which get_rocm_arch() honours.
     arch = get_rocm_arch().split(":", 1)[0]
@@ -156,6 +177,9 @@ def launch_gemm_a8w8_256x256(
         + ("_apre" if a_preshuffle else "")
         + (f"_ps{persistent_n_tiles}" if persistent_n_tiles > 1 else "")
         + ("_fsk" if cluster_splitk else "")
+        + ("_f32p" if splitk_fp32 else "")
+        + (f"_cth{c_cache_modifier}" if c_cache_modifier else "")
+        + (f"_fsp{full_stage_prefetch}" if full_stage_prefetch else "")
     )
 
     def _run_tile(
@@ -875,6 +899,138 @@ def launch_gemm_a8w8_256x256(
                     pre=sched_fence,
                 )
 
+        # --- full-stage prefetch (_fsp): every fragment of the next stage is read
+        # while this stage's WMMAs run, into the other register bank.
+        full_a = [
+            [fx.make_rmem_tensor(16, fx.Int32) for _ in range_constexpr(wmma_m_rep)]
+            for _ in range_constexpr(2)
+        ]
+        full_b = [
+            [fx.make_rmem_tensor(16, fx.Int32) for _ in range_constexpr(wmma_n_rep)]
+            for _ in range_constexpr(2)
+        ]
+
+        def _full_seed_thunks(stage, bank, parity=0):
+            """Scale words first, then one thunk per A / B fragment of ``stage``."""
+            thunks = []
+            for sm in range_constexpr(N_SA):
+
+                def _go_sa(sm=sm):
+                    seed_sa[sm].store(
+                        Vec.from_elements([_stage_load_sa_raw(stage, sm)], fx.Int32)
+                    )
+
+                thunks.append(_go_sa)
+            for sn in range_constexpr(N_SB):
+
+                def _go_sb(sn=sn):
+                    seed_sb[sn].store(
+                        Vec.from_elements([_stage_load_sb_raw(stage, sn)], fx.Int32)
+                    )
+
+                thunks.append(_go_sb)
+            if const_expr(FSP_FRAG_THUNKS):
+                a_th = [
+                    (lambda i=i: full_a[bank][i].store(_stage_load_frag("a", stage, i)))
+                    for i in range_constexpr(wmma_m_rep)
+                ]
+                b_th = [
+                    (lambda j=j: full_b[bank][j].store(_stage_load_frag("b", stage, j)))
+                    for j in range_constexpr(wmma_n_rep)
+                ]
+            else:
+                a_th = _split_frag_thunks("a", stage, full_a[bank], wmma_m_rep)
+                b_th = _split_frag_thunks("b", stage, full_b[bank], wmma_n_rep)
+            # Alternate A-first / B-first across wave parity to spread LDS banks.
+            return thunks + (a_th + b_th if parity == 0 else b_th + a_th)
+
+        # _fsp[WBG] knobs (digits of full_stage_prefetch; bare _fsp = 211).
+        _fsp_code = full_stage_prefetch if full_stage_prefetch >= 100 else 211
+        FSP_WAIT_SLOT = _fsp_code // 100  # WMMAs between barrier signal and wait
+        FSP_SCHED_EVERY = (_fsp_code // 10) % 10  # sched_barrier cadence (0 = none)
+        FSP_FRAG_THUNKS = _fsp_code % 10 == 1  # 1: per fragment, 0: per ds_load
+
+        def _split_frag_thunks(kind, stage, dst, n):
+            """One thunk per ds_load_b128; the fragment is written after its last load."""
+            addr, row, span = _frag_geom(kind, stage)
+            parts = {}
+            out = []
+            for i in range_constexpr(n):
+                for j in range_constexpr(DS_PER_FRAG):
+
+                    def _ld(i=i, j=j):
+                        parts.setdefault(i, []).append(
+                            Vec(lds_load_b128(addr, i * row + span * j))
+                        )
+                        if const_expr(j == DS_PER_FRAG - 1):
+                            dst[i].store(_join(parts.pop(i)))
+
+                    out.append(_ld)
+            return out
+
+        def _compute_stage_full(
+            stage,
+            next_stage,
+            bank,
+            next_bank,
+            future_slot,
+            future_kt,
+            fence_outstanding,
+            has_next,
+            steady=False,
+            boundary=True,
+            parity=0,
+        ):
+            """One K-tile with all fragments already in ``bank``; prefetch the next."""
+            sa_k = [_sa_of(seed_sa[sm].load()[0]) for sm in range_constexpr(N_SA)]
+            sb_k = [_sb_of(seed_sb[sn].load()[0]) for sn in range_constexpr(N_SB)]
+            act, wt = full_a[bank], full_b[bank]
+            rocdl.sched_barrier(0)
+            refill = const_expr(boundary and future_kt is not None)
+            prepared = (
+                _prepare_tdm(future_slot, future_kt) if const_expr(refill) else None
+            )
+            fenced = const_expr(boundary and has_next)
+            n_slots = wmma_m_rep * wmma_n_rep
+            slot_fn = {}
+            if const_expr(fenced):
+
+                def _sig():
+                    # This stage's fragments were read during the previous one.
+                    rocdl.s_wait_dscnt(0)
+                    pipeline_fence_signal(
+                        outstanding=fence_outstanding, use_cluster=False
+                    )
+
+                def _wait():
+                    pipeline_fence_wait(use_cluster=False)
+                    if const_expr(refill):
+                        tdm_ops.tensor_load_2d(prepared)
+
+                slot_fn[0] = [_sig]
+                slot_fn[FSP_WAIT_SLOT] = [_wait]
+                first = FSP_WAIT_SLOT
+            else:
+                first = 0
+            if const_expr(has_next):
+                th = _full_seed_thunks(next_stage, next_bank, parity)
+                span = n_slots - first
+                for k in range_constexpr(len(th)):
+                    at = first + (k * span) // len(th)
+                    slot_fn.setdefault(at, []).append(th[k])
+            for pos in range_constexpr(n_slots):
+                if const_expr(pos in slot_fn):
+                    for fn in slot_fn[pos]:
+                        fn()
+                _mma_block_range(0, 0, act, wt, sa_k, sb_k, pos, 1, False)
+                if const_expr(FSP_SCHED_EVERY > 0 and pos % max(FSP_SCHED_EVERY, 1) == FSP_SCHED_EVERY - 1):
+                    rocdl.sched_barrier(0)
+            rocdl.sched_barrier(0)
+
+        _compute_stage = (
+            _compute_stage_full if const_expr(full_stage_prefetch) else _compute_stage_lean
+        )
+
         SUPERS = K_TILES // KPAIR
         last_delta = (SUPERS - 1) * tdm_global_step
         for i in range_constexpr(num_buffers):
@@ -882,9 +1038,13 @@ def launch_gemm_a8w8_256x256(
             seed_delta = (seed_delta < last_delta).select(seed_delta, last_delta)
             tdm_ops.tensor_load_2d(_prepare_tdm(i, seed_delta))
         pipeline_fence(outstanding=num_buffers - 1, use_cluster=False)
-        for group in _seed_thunks(0):
-            for thunk in group:
+        if const_expr(full_stage_prefetch):
+            for thunk in _full_seed_thunks(0, 0):
                 thunk()
+        else:
+            for group in _seed_thunks(0):
+                for thunk in group:
+                    thunk()
 
         n_full = (SUPERS + num_buffers - 1) // num_buffers - 1
         drain_s = SUPERS - n_full * num_buffers  # 1..num_buffers
@@ -914,7 +1074,7 @@ def launch_gemm_a8w8_256x256(
                 for g in range_constexpr(UNROLL):
                     args = _stage_args(g, rev_delta, num_buffers - 2)
                     boundary = g % KPAIR == KPAIR - 1
-                    _compute_stage_lean(
+                    _compute_stage(
                         *args,
                         True,
                         True,
@@ -943,7 +1103,7 @@ def launch_gemm_a8w8_256x256(
         rocdl.sched_barrier(0)
         for g in range_constexpr(UNROLL):
             if g < drain_s * KPAIR:
-                _compute_stage_lean(
+                _compute_stage(
                     g,
                     (g + 1) % UNROLL,
                     g % 2,
@@ -968,10 +1128,11 @@ def launch_gemm_a8w8_256x256(
                 )
             for wn in range_constexpr(wmma_n_rep):
                 col_rel = wnb + wn * 16 + kgrp * 8
-                h = accs[wm * wmma_n_rep + wn].to(oc)
+                acc = accs[wm * wmma_n_rep + wn]
+                h = acc if const_expr(splitk_fp32) else acc.to(oc)
                 fx.ptr_store(
                     h.bitcast(fx.Int8),
-                    base_ptr + (row_rel * C_LDS_ROW + col_rel) * 2,
+                    base_ptr + (row_rel * C_LDS_ROW + col_rel) * C_ELEM_B,
                 )
         workgroup_barrier(use_cluster=False)
         c_off_rt = c_off_rt_out = blk_m64 * ldc64 + blk_n64
@@ -1005,6 +1166,7 @@ def launch_gemm_a8w8_256x256(
                 mn_oob=mn_oob,
                 flat_tile=_flat_tile,
                 bounded_m=bounded_m,
+                part_elem=fx.Float32 if const_expr(splitk_fp32) else None,
             )
         else:
             gtC = _gv(
@@ -1018,6 +1180,7 @@ def launch_gemm_a8w8_256x256(
                 [mn_oob, tile_n],
                 strides=[ldc64, None],
                 num_warps=num_waves,
+                cache_modifier=c_cache_modifier,
             )
             fx.copy(
                 atomC,

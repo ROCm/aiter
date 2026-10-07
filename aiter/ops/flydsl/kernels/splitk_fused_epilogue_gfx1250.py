@@ -15,6 +15,7 @@ from .tensor_shim import buf_copy_load, buf_copy_store, ptr_buf_tensor
 CPOL_DEVICE = 16
 CPOL_STORE_DEVICE = CPOL_DEVICE | 3
 VEC = 8
+HVEC = VEC // 2  # FP32 partial vectors are loaded as two 16-byte halves
 UNROLL = 32
 MAX_PARTIAL_VECTORS = 128  # 512 dwords per load batch, including split-K 8.
 
@@ -38,6 +39,7 @@ def emit_fused_splitk_epilogue(
     mn_oob,
     flat_tile,
     bounded_m=False,
+    part_elem=None,
 ):
     """Reduce disjoint row ranges using all of a tile's split-K workgroups.
 
@@ -49,25 +51,35 @@ def emit_fused_splitk_epilogue(
     At ``split_k == 2`` the reduced stripe goes straight to global and the
     scratch holds peer rows only; deeper splits keep the padded plane and a
     final LDS + TDM store.  The sum stays in FP32 and in split order.
+
+    ``part_elem`` is the type of the exchanged partials (LDS stripe, scratch
+    planes, peer reads); it defaults to the output ``elem``.  With FP32
+    partials only the final store rounds to ``elem``.
     """
+    pe = elem if part_elem is None else part_elem
+    pbytes = pe.width // 8
+    part_f32 = pbytes == 4
     reduce_m = tile_m // split_k
     reduce_row = split_idx * reduce_m
     peer_m = tile_m - reduce_m
     lean = split_k == 2
     lanes_per_row = tile_n // VEC
     rows_per_iter = block // lanes_per_row
-    partial_vectors = MAX_PARTIAL_VECTORS // (block // 128)
+    # FP32 partials double each vector's VGPRs: halve the batch to match.
+    partial_vectors = MAX_PARTIAL_VECTORS // (block // 128) // (pbytes // 2)
     unroll = min(UNROLL, partial_vectors // split_k, reduce_m // rows_per_iter)
     row0 = tid // lanes_per_row
     col = (tid % lanes_per_row) * VEC
     plane = fx.Int64((peer_m if lean else tile_m) * tile_n)
     partial_base = (
-        fx.recast_iter(
-            fx.PointerType.get(elem.ir_type, partials.address_space), partials
-        )
+        fx.recast_iter(fx.PointerType.get(pe.ir_type, partials.address_space), partials)
         + fx.Int64(flat_tile) * split_k * plane
     )
-    lds_out = fx.recast_iter(elem, lds_base_ptr)
+    lds_out = fx.recast_iter(pe, lds_base_ptr)
+    # Reduced rows land in the published peer rows [0, reduce_m) at the output
+    # type's pitch; with FP32 partials that never reaches the local stripe
+    # at peer_m * c_lds_row * 4 bytes, since reduce_m <= peer_m.
+    lds_res = fx.recast_iter(elem, lds_base_ptr)
 
     # Each scratch plane holds only the rotated peer rows, including on an M
     # tail; the output descriptor discards the invalid logical rows.
@@ -104,9 +116,9 @@ def emit_fused_splitk_epilogue(
         # split-index term.
         peer_buffer = ptr_buf_tensor(
             partial_base + fx.Int64(1 - split_idx) * plane,
-            elem,
-            unit_elems=VEC,
-            num_records_bytes=fx.Int64(reduce_m * tile_n * 2),
+            pe,
+            unit_elems=HVEC if part_f32 else VEC,
+            num_records_bytes=fx.Int64(reduce_m * tile_n * pbytes),
         )
     else:
         # Select the cyclic peer stripe in each uniform buffer base. Keeping
@@ -117,9 +129,9 @@ def emit_fused_splitk_epilogue(
                 + fx.Int64(s) * plane
                 + fx.Int64((split_idx + split_k - s - 1) & (split_k - 1))
                 * (reduce_m * tile_n),
-                elem,
-                unit_elems=VEC,
-                num_records_bytes=fx.Int64(reduce_m * tile_n * 2),
+                pe,
+                unit_elems=HVEC if part_f32 else VEC,
+                num_records_bytes=fx.Int64(reduce_m * tile_n * pbytes),
             )
             for s in range_constexpr(split_k)
         ]
@@ -130,9 +142,24 @@ def emit_fused_splitk_epilogue(
                 lds_out
                 + (peer_m + row0 + (batch * unroll + u) * rows_per_iter) * c_lds_row
                 + col,
-                result_type=T.vec(VEC, elem.ir_type),
+                result_type=T.vec(VEC, pe.ir_type),
             )
         )
+
+    def _peer(buffer, idx):
+        """One VEC-wide partial; FP32 needs two 16-byte buffer loads."""
+        if const_expr(not part_f32):
+            return buf_copy_load(buffer, idx, pe, VEC, cache_modifier=CPOL_DEVICE)
+        lo = fx.Vector(
+            buf_copy_load(buffer, idx * 2, pe, HVEC, cache_modifier=CPOL_DEVICE)
+        )
+        hi = fx.Vector(
+            buf_copy_load(buffer, idx * 2 + 1, pe, HVEC, cache_modifier=CPOL_DEVICE)
+        )
+        return lo.shuffle(hi, list(range(VEC)))
+
+    def _f32(v):
+        return fx.Vector(v) if const_expr(part_f32) else v.extf(T.vec(VEC, T.f32))
 
     for batch in range(reduce_m // (rows_per_iter * unroll)):
         partial_indices = [
@@ -141,17 +168,14 @@ def emit_fused_splitk_epilogue(
         if const_expr(lean):
             # A two-term FP32 sum is commutative, so local-then-peer matches
             # split order bit for bit and needs no branch.
-            peer_parts = [
-                buf_copy_load(peer_buffer, idx, elem, VEC, cache_modifier=CPOL_DEVICE)
-                for idx in partial_indices
-            ]
+            peer_parts = [_peer(peer_buffer, idx) for idx in partial_indices]
             values = [
                 [_local(batch, u), peer_parts[u]] for u in range_constexpr(unroll)
             ]
         else:
             local_parts = [_local(batch, u) for u in range_constexpr(unroll)]
             parts = [
-                [fx.make_rmem_tensor(VEC, elem) for s in range_constexpr(split_k)]
+                [fx.make_rmem_tensor(VEC, pe) for s in range_constexpr(split_k)]
                 for u in range_constexpr(unroll)
             ]
             # Uniform branches skip the unpublished local stripe completely.
@@ -161,26 +185,18 @@ def emit_fused_splitk_epilogue(
                     parts[u][s].store(local_parts[u])
                 if split_idx != fx.Int32(s):
                     for u in range_constexpr(unroll):
-                        parts[u][s].store(
-                            buf_copy_load(
-                                buffers[s],
-                                partial_indices[u],
-                                elem,
-                                VEC,
-                                cache_modifier=CPOL_DEVICE,
-                            )
-                        )
+                        parts[u][s].store(_peer(buffers[s], partial_indices[u]))
             values = [
                 [parts[u][s].load() for s in range_constexpr(split_k)]
                 for u in range_constexpr(unroll)
             ]
         for u in range_constexpr(unroll):
-            acc = values[u][0].extf(T.vec(VEC, T.f32))
+            acc = _f32(values[u][0])
             for s in range_constexpr(1, split_k):
-                acc = acc + values[u][s].extf(T.vec(VEC, T.f32))
+                acc = acc + _f32(values[u][s])
             row = row0 + (batch * unroll + u) * rows_per_iter
             if const_expr(not lean):
-                fx.ptr_store(acc.to(elem), lds_out + row * c_lds_row + col)
+                fx.ptr_store(acc.to(elem), lds_res + row * c_lds_row + col)
             elif const_expr(bounded_m):
                 buf_copy_store(
                     output_buffer,
@@ -202,5 +218,5 @@ def emit_fused_splitk_epilogue(
             strides=[ldc64, None],
             num_warps=block // 32,
         )
-        fx.copy(store_atom, fx.Tensor(fx.make_view(lds_out, out_layout)), tile_out)
+        fx.copy(store_atom, fx.Tensor(fx.make_view(lds_res, out_layout)), tile_out)
         fx.rocdl.tdm_ops.tensor_wait(0)

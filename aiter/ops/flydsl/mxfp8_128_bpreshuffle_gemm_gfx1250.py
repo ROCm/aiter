@@ -115,6 +115,9 @@ def check_persistent_n_tiles(
         )
 
 
+_MAX_CLUSTER_DIM = 8  # per-axis cluster limit on gfx1250 (a 16-wide axis deadlocks)
+
+
 def _run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
     XQ: Tensor,
     WQ: Tensor,
@@ -136,6 +139,9 @@ def _run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
     a_preshuffle: bool = False,
     persistent_n_tiles: int = 1,
     fused_splitk: bool = True,
+    splitk_fp32: bool = False,
+    c_cache_modifier: int = 0,
+    full_stage_prefetch: int = 0,
 ) -> Tensor:
     """Run the gfx1250 WMMA mxfp8_128 bpreshuffle GEMM.
 
@@ -176,6 +182,13 @@ def _run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
         raise RuntimeError(
             f"[FlyDSL gfx1250 mxfp8_128] a gfx1250 cluster holds at most 16 "
             f"workgroups, got {cluster_m}x{cluster_n}"
+        )
+    if cluster_m > _MAX_CLUSTER_DIM or cluster_n > _MAX_CLUSTER_DIM:
+        # A 16-wide cluster axis (e.g. cm16_cn1) launches and then never leaves
+        # the cluster barrier.
+        raise RuntimeError(
+            f"[FlyDSL gfx1250 mxfp8_128] each cluster dimension must be <= "
+            f"{_MAX_CLUSTER_DIM}, got {cluster_m}x{cluster_n}"
         )
     if N % (tile_n * cluster_n) != 0:
         raise RuntimeError(
@@ -255,6 +268,12 @@ def _run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
     check_persistent_n_tiles(
         persistent_n_tiles, N, tile_n, cluster_n, split_k, compute_bound
     )
+    if (c_cache_modifier or full_stage_prefetch) and not compute_bound:
+        raise RuntimeError(
+            "[FlyDSL gfx1250 mxfp8_128] _cth / _fsp are compute-kernel options, got "
+            f"a generic kernelName (c_cache_modifier={c_cache_modifier}, "
+            f"full_stage_prefetch={full_stage_prefetch})"
+        )
 
     if a_preshuffle and a_rows != M + (M & 1):
         raise RuntimeError(
@@ -282,6 +301,14 @@ def _run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
     fused = fused_splitk and _fused_splitk_ok(
         tile_m, cluster_m, cluster_n, split_k, compute_bound
     )
+    if splitk_fp32 and not fused:
+        raise RuntimeError(
+            "[FlyDSL gfx1250 mxfp8_128] _f32p needs the clustered fused split-K "
+            f"epilogue, which this launch cannot use (compute_bound={compute_bound}, "
+            f"fused_splitk={fused_splitk}, tile_m={tile_m}, "
+            f"cluster={cluster_m}x{cluster_n}, split_k={split_k}: needs _fsk, "
+            "split_k > 1, tile_m % split_k == 0 and cluster_m*cluster_n*split_k <= 16)"
+        )
     bounded_m = bool(M % tile_m)
     if fused:
         # One contiguous plane per split of an output tile, holding only the
@@ -300,7 +327,11 @@ def _run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
     partials = (
         None
         if partial_shape is None
-        else torch.empty(partial_shape, dtype=Out.dtype, device=Out.device)
+        else torch.empty(
+            partial_shape,
+            dtype=torch.float32 if (fused and splitk_fp32) else Out.dtype,
+            device=Out.device,
+        )
     )
     gemm_out = Out if partials is None else partials
     out_is_f16 = 1 if out_dtype == "f16" else 0
@@ -340,6 +371,9 @@ def _run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
             persistent_n_tiles,
             fused,
             bounded_m,
+            splitk_fp32=splitk_fp32 and fused,
+            c_cache_modifier=c_cache_modifier,
+            full_stage_prefetch=full_stage_prefetch,
         )
     else:
         launch(*launch_args, BLOCK_K, split_k, False, 0, 1, a_preshuffle)
@@ -366,7 +400,10 @@ BASE_NAME_SUFFIX_RE = (
 )
 NAME_SUFFIX_RE = (
     BASE_NAME_SUFFIX_RE + r"(?P<fused_splitk>_fsk)?"
+    r"(?P<splitk_fp32>_f32p)?"
     r"(?P<a_preshuffle>_apre)?"
+    r"(?:_cth(?P<c_cache_modifier>\d+))?"
+    r"(?P<full_stage_prefetch>_fsp(?P<fsp_cfg>\d{3})?)?"
     r"(?:_ps(?P<persistent_n_tiles>\d+))?$"
 )
 _KERNEL_NAME_RE = re.compile(rf"^{re.escape(WMMA_NAME_PREFIX)}_{NAME_SUFFIX_RE}")
@@ -383,10 +420,19 @@ def parse_wmma_kernel_name(name: str):
     groups = match.groupdict()
     a_preshuffle = groups.pop("a_preshuffle", None) is not None
     fused_splitk = groups.pop("fused_splitk", None) is not None
+    splitk_fp32 = groups.pop("splitk_fp32", None) is not None
+    c_cache_modifier = groups.pop("c_cache_modifier", None)
+    fsp_on = groups.pop("full_stage_prefetch", None) is not None
+    fsp_cfg = groups.pop("fsp_cfg", None)
+    # 0 = off; bare _fsp -> 211 (see the compute kernel's _fsp[WBG] knobs)
+    full_stage_prefetch = (int(fsp_cfg) if fsp_cfg else 211) if fsp_on else 0
     persistent_n_tiles = groups.pop("persistent_n_tiles", None)
     cfg = {key: int(value) for key, value in groups.items()}
     cfg["a_preshuffle"] = a_preshuffle
     cfg["fused_splitk"] = fused_splitk
+    cfg["splitk_fp32"] = splitk_fp32
+    cfg["c_cache_modifier"] = int(c_cache_modifier) if c_cache_modifier else 0
+    cfg["full_stage_prefetch"] = full_stage_prefetch
     cfg["persistent_n_tiles"] = int(persistent_n_tiles) if persistent_n_tiles else 1
     return cfg
 
@@ -493,4 +539,7 @@ def run_gemm_a8w8_mxfp8_128_bpreshuffle_gfx1250(
         a_preshuffle=cfg["a_preshuffle"],
         fused_splitk=cfg["fused_splitk"],
         persistent_n_tiles=cfg["persistent_n_tiles"],
+        splitk_fp32=cfg["splitk_fp32"],
+        c_cache_modifier=cfg["c_cache_modifier"],
+        full_stage_prefetch=cfg["full_stage_prefetch"],
     )

@@ -719,6 +719,9 @@ def _compile_mxfp8_128_wmma_to_cache(
     a_preshuffle: bool = False,
     persistent_n_tiles: int = 1,
     fused_splitk: bool = True,
+    splitk_fp32: bool = False,
+    c_cache_modifier: int = 0,
+    full_stage_prefetch: int = 0,
     **kwargs,
 ):
     del kwargs
@@ -792,6 +795,9 @@ def _compile_mxfp8_128_wmma_to_cache(
                         persistent_n_tiles,
                         fused,
                         bounded_m,
+                        splitk_fp32=splitk_fp32 and fused,
+                        c_cache_modifier=c_cache_modifier,
+                        full_stage_prefetch=full_stage_prefetch,
                     )
             else:
                 launch(
