@@ -27,6 +27,10 @@ sweep ends in a markdown table:
   bit-identical to the fp32 reference, which separates a chunk-addressing or
   flag-protocol bug from a codec one. Run through each production schedule's
   ladder on the shipping payloads, so it covers the geometry that ships.
+* ``test_quick_allreduce_relay`` -- the TP2 mesh with relay devices set, checked
+  against a direct engine on the same inputs. A default run adds these rows
+  only on xGMI, when four GPUs are visible and this arch has relay defaults.
+  The direct TP2 rows always run. Relay rows are eager.
 
 ``--extended`` adds what production never selects: the legacy fixed shipping
 shapes; ``test_quick_allreduce`` again, as a second table, with ``block``
@@ -133,7 +137,7 @@ from aiter.ops.flydsl.kernels.comm.allreduce_shared import (
     BLOCK,
     DEFAULT_GRID_CAP,
 )
-from aiter.ops.flydsl.kernels.comm.quick_allreduce_mesh import clamp_grid_cap
+from aiter.ops.flydsl.kernels.comm.quick_allreduce_mesh import MESH_RELAY_DEFAULTS, clamp_grid_cap
 from aiter.ops.flydsl.quick_allreduce import (
     _resolve_inbox_flags,
     batches_publishes,
@@ -1739,7 +1743,6 @@ def test_quick_allreduce_relay(
             ret[f"{name} us"] = us
             ret[f"{name} TFLOPS"] = flops / us / 1e6
             ret[f"{name} TB/s"] = nbytes / us / 1e6
-        ret["relay vs direct"] = ret["direct us"] / ret["relay us"]
     else:
         ret["n_mismatch"] = max(r["n_mismatch"] for r in rows)
     return ret
@@ -2142,8 +2145,9 @@ def main():
         nargs="*",
         default=None,
         help="TP2 mesh relay rows: pairs of devices that relay rank0->rank1 and\n"
-        "rank1->rank0, outside the TP pair. Default: 2,3 when 4 GPUs are\n"
-        "visible. Give none to run no relay rows.\n"
+        "rank1->rank0, outside the TP pair. Default: 2,3 on xGMI when 4 GPUs\n"
+        "are visible and this arch has relay defaults. Pass an empty value to\n"
+        "run no relay rows.\n"
         "    e.g.: --relay 2,3",
     )
     parser.add_argument(
@@ -2160,11 +2164,6 @@ def main():
         default=["int4", "fp16"],
         choices=("int4", "fp16", "int6"),
         help="Wire formats of the relay rows; fp16 is the lossless one.",
-    )
-    parser.add_argument(
-        "--relay-only",
-        action="store_true",
-        help="Run only the relay rows, not the rest of the sweep.",
     )
     parser.add_argument(
         "-o",
@@ -2218,10 +2217,16 @@ def main():
         _verify(args, tps, algos, dts, link)
 
     # TP2 mesh relay rows. Each distinct (fraction, codec, super-tile) is an
-    # engine and so a spawn.
+    # engine and so a spawn. The direct TP2 rows above always run; these are
+    # the second case, and only when a relay is usable on this host.
     relay_pairs = args.relay
+    if link != "xgmi":
+        if relay_pairs:
+            aiter.logger.warning("relay rows need xGMI; link is %s, skipping", link)
+        relay_pairs = [] if relay_pairs is not None else None
     if relay_pairs is None:
-        relay_pairs = [DEFAULT_RELAY] if n_gpu >= 4 else []
+        has_default = (link, 2, ARCH) in MESH_RELAY_DEFAULTS
+        relay_pairs = [DEFAULT_RELAY] if n_gpu >= 4 and has_default else []
     relay_pairs = [tuple(p) for p in relay_pairs if isinstance(p, tuple)]
     relay = []
     if args.scenario == "verify" and 2 in tps and "mesh" in algos and dts:
