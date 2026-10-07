@@ -12,6 +12,7 @@ import pandas as pd
 import torch
 
 import aiter
+import aiter.fhmoe
 from aiter import dtypes
 from aiter.aot.flydsl.common import override_env, run_only_env
 from aiter.fused_moe import (
@@ -1374,8 +1375,8 @@ def test_output_buffer_contract():
         kw["output"] = None
         return sort(*a, **kw)
 
-    # in_place=False stands in for FLAT, adaptive-aux atomic, and grouped gfx1250
-    # paths, which cannot take the caller's buffer and must copy their result into it.
+    # in_place=False stands in for FLAT, adaptive-aux atomic, grouped gfx1250,
+    # and fhmoe paths, which cannot take the caller's buffer and must copy.
     for in_place in (True, False):
         try:
             if not in_place:
@@ -1392,6 +1393,17 @@ def test_output_buffer_contract():
             assert eager[0] == eager[1] == ref.sum()
         finally:
             aiter.fused_moe._moe_sorting_impl = sort
+
+    # The fhmoe branch has no output slot of its own, so fused_moe copies for it.
+    real_fhmoe = aiter.fhmoe._fhmoe
+    fhmoe_out = torch.randn((token, model_dim), dtype=dtype)
+    try:
+        aiter.fhmoe._fhmoe = lambda **kwargs: fhmoe_out
+        buf = fresh_buffer()
+        assert fused_moe(*args, shared_expert_id=0, output=buf) is buf
+        assert torch.equal(buf, fhmoe_out), "fhmoe result not copied into buf"
+    finally:
+        aiter.fhmoe._fhmoe = real_fhmoe
 
     def expect_raise(described, **kwargs):
         try:
