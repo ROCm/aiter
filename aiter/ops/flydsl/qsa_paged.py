@@ -19,10 +19,10 @@ stay the ones chosen for the whole batch. The indexer head count is 4 or
 
 ``flydsl_qsa_paged_gqa`` writes sparse GQA ``o [M, Hq, D]`` from paged K/V at the
 selected token ids. Decode runs a BLOCK_N=16 two-wave tile with split-K and
-an LSE merge; prefill runs BLOCK_N=32 two waves and writes output directly
-once the grid alone fills the machine. Softmax is online in log2 space and the
-split
-partials are FP32. Expand+tail and the sigmoid gate stay unfused.
+an LSE merge; gfx942 widens that tile to four waves when the grid fits in
+the CUs. Prefill runs BLOCK_N=32 two waves and writes output directly once
+the grid alone fills the machine. Softmax is online in log2 space and the
+split partials are FP32. Expand+tail and the sigmoid gate stay unfused.
 
 ``qsa_layer`` runs the indexer,
 ``qsa_expand_block_indices``, and sparse GQA. A rank-3 query pair missing
@@ -55,8 +55,10 @@ from .kernels.qsa.indexer_select import (
     build_qsa_pack_valid_blocks_module,
 )
 from .kernels.qsa.sparse_gqa import (
+    _GFX942_DECODE_THREADS,
     _GFX942_TINY_SPLITS,
     _TINY_SPLITS,
+    _gfx942_reg_qk,
     _launch_config,
     _paged_gqa_coverage_reason,
     _paged_gqa_lds_bytes,
@@ -1173,9 +1175,10 @@ def flydsl_qsa_paged_gqa(
     ``workspace`` is ``(partial_out, partial_lse)`` for a split launch.
     ``None`` allocates that pair. A one-split launch writes ``out``
     directly and does not read ``workspace``. ``num_cus`` is the CU count
-    the prefill split target uses. ``None`` reads ``get_cu_num()``. A
-    caller that compiles more than one arch in one process passes the
-    count for that arch, because ``get_cu_num()`` is cached for the process.
+    the prefill split target and the gfx942 four-wave gate use. ``None``
+    reads ``get_cu_num()``. A caller that compiles more than one arch in
+    one process passes the count for that arch, because ``get_cu_num()``
+    is cached for the process.
     """
     reason = flydsl_qsa_paged_gqa_supported(q, k_cache, v_cache, indices, page_table)
     if reason is not None:
@@ -1227,6 +1230,14 @@ def flydsl_qsa_paged_gqa(
     block_n, block_threads, n_splits = _launch_config(
         rows, n_sel, n_kv_heads, head_dim, num_cus, tiny_splits
     )
+    # gfx950 stays on the fitted 128-thread schedule. Widen only when the
+    # register QK split is legal and the grid is one workgroup per CU.
+    if (
+        arch == "gfx942"
+        and _gfx942_reg_qk(head_dim, block_n)
+        and int(rows) * n_kv_heads * n_splits <= num_cus
+    ):
+        block_threads = _GFX942_DECODE_THREADS
     if n_splits == 1:
         # The split kernel stores straight into out. A caller workspace
         # is not a second buffer on this path.
