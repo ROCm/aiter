@@ -141,31 +141,31 @@ def test_lds_cap_bytes_constant_unaltered():
 
 
 # =========================================================================
-# C. LIVE RUNNER CANARY (Portable across CPU, NVIDIA, and AMD ROCm)
+# C. LIVE RUNNER CANARY (Real AMD ROCm runners)
 # =========================================================================
 
 def test_live_runner_canary():
-    """Dynamically branches based on actual hardware; never assumes CPU or GPU."""
+    """Live GPU canary: verifies detected architecture on real ROCm runners.
+
+    Skipped when PyTorch cannot establish ROCm GPU availability, avoiding
+    the false assumption that CPU-only PyTorch implies Triton or JAX cannot
+    detect a GPU.
+    """
     try:
         import torch
-        is_rocm = torch.cuda.is_available() and getattr(torch.version, "hip", None) is not None
-        has_cuda = torch.cuda.is_available()
+        is_rocm = (
+            torch.cuda.is_available()
+            and getattr(torch.version, "hip", None) is not None
+        )
     except ImportError:
         is_rocm = False
-        has_cuda = False
+
+    if not is_rocm:
+        pytest.skip(
+            "PyTorch ROCm GPU is not available; skipping live GPU canary."
+        )
 
     arch = arch_info.get_arch()
-    if is_rocm:
-        assert isinstance(arch, str) and arch.startswith("gfx"), (
-            f"Expected detected AMD GPU architecture on ROCm runner, got {arch!r}"
-        )
-    elif has_cuda:
-        # Non-ROCm CUDA environment (e.g. NVIDIA): architecture is not AMD gfx
-        assert arch is None or not str(arch).startswith("gfx"), (
-            f"Expected non-AMD architecture on CUDA/NVIDIA runner, got {arch!r}"
-        )
-    else:
-        # On CPU-only environments without GPU, get_arch() must strictly be None
-        assert arch is None, (
-            f"Expected get_arch() to be None on CPU runner, got {arch!r}"
-        )
+    assert isinstance(arch, str) and arch.startswith("gfx"), (
+        f"Expected detected AMD GPU architecture on ROCm runner, got {arch!r}"
+    )
