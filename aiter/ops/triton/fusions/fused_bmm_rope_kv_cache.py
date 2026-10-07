@@ -9,9 +9,7 @@ from aiter.ops.triton._triton_kernels.fusions.fused_bmm_rope_kv_cache import (
     _fused_fp4_bmm_reduce_kernel,
     _fused_fp4_bmm_rope_cat_and_cache_mla_kernel,
     _fused_fp8_bmm_rope_cat_and_cache_mla_kernel,
-)
-from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
-    _get_config as _get_fp8_config,
+    _get_fp8_config,
 )
 from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a16wfp4 import (
     _get_config as _get_fp4_config,
@@ -98,12 +96,21 @@ def fused_fp4_bmm_rope_cat_and_cache_mla(
         - kv_cache: Updated KV cache (modified in-place)
     """
     _LOGGER.info(
-        "FUSED_FP4_BMM_ROPE_CAT_AND_CACHE_MLA: "
-        f"q_nope={tuple(q_nope.shape)} w_k={tuple(w_k.shape)} w_k_scale={tuple(w_k_scale.shape)} "
-        f"q_pe={tuple(q_pe.shape)} k_nope={tuple(k_nope.shape)} k_rope={tuple(k_rope.shape)} "
-        f"positions={tuple(positions.shape)} cos={tuple(cos.shape)} sin={tuple(sin.shape)} "
-        f"kv_cache={tuple(kv_cache.shape)} slot_mapping={tuple(slot_mapping.shape)} "
-        f"transpose_bm={transpose_bm} prequant={prequant} is_neox={is_neox}"
+        "FUSED_FP4_BMM_ROPE_CAT_AND_CACHE_MLA: q_nope=%s w_k=%s w_k_scale=%s q_pe=%s k_nope=%s k_rope=%s positions=%s cos=%s sin=%s kv_cache=%s slot_mapping=%s transpose_bm=%s prequant=%s is_neox=%s",
+        tuple(q_nope.shape),
+        tuple(w_k.shape),
+        tuple(w_k_scale.shape),
+        tuple(q_pe.shape),
+        tuple(k_nope.shape),
+        tuple(k_rope.shape),
+        tuple(positions.shape),
+        tuple(cos.shape),
+        tuple(sin.shape),
+        tuple(kv_cache.shape),
+        tuple(slot_mapping.shape),
+        transpose_bm,
+        prequant,
+        is_neox,
     )
 
     assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
@@ -441,12 +448,21 @@ def fused_fp8_bmm_rope_cat_and_cache_mla(
         - kv_cache: Updated KV cache (modified in-place)
     """
     _LOGGER.info(
-        "FUSED_FP8_BMM_ROPE_CAT_AND_CACHE_MLA: "
-        f"q_nope={tuple(q_nope.shape)} w_k={tuple(w_k.shape)} w_k_scale={tuple(w_k_scale.shape)} "
-        f"q_pe={tuple(q_pe.shape)} k_nope={tuple(k_nope.shape)} k_rope={tuple(k_rope.shape)} "
-        f"positions={tuple(positions.shape)} cos={tuple(cos.shape)} sin={tuple(sin.shape)} "
-        f"kv_cache={tuple(kv_cache.shape)} slot_mapping={tuple(slot_mapping.shape)} "
-        f"transpose_bm={transpose_bm} group_size={group_size} is_neox={is_neox}"
+        "FUSED_FP8_BMM_ROPE_CAT_AND_CACHE_MLA: q_nope=%s w_k=%s w_k_scale=%s q_pe=%s k_nope=%s k_rope=%s positions=%s cos=%s sin=%s kv_cache=%s slot_mapping=%s transpose_bm=%s group_size=%d is_neox=%s",
+        tuple(q_nope.shape),
+        tuple(w_k.shape),
+        tuple(w_k_scale.shape),
+        tuple(q_pe.shape),
+        tuple(k_nope.shape),
+        tuple(k_rope.shape),
+        tuple(positions.shape),
+        tuple(cos.shape),
+        tuple(sin.shape),
+        tuple(kv_cache.shape),
+        tuple(slot_mapping.shape),
+        transpose_bm,
+        group_size,
+        is_neox,
     )
 
     if cos.dim() == 4:

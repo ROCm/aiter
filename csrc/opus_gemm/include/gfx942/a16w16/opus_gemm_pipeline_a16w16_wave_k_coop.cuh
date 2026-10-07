@@ -633,12 +633,6 @@ void gemm_a16w16_wave_k_coop_accum_kernel(opus_gemm_noscale_kargs kargs)
         full_tile ? 0xffffffffu
                   : (unsigned int)(((kargs.n - col) * kargs.stride_b) * sizeof(D_B)));
 
-    if (split_id == 0) {
-        zero_output_tile_bf16x2<T, D_C>(
-            ptr_y, row, col, kargs.m, kargs.n, kargs.stride_c, tid);
-        __builtin_amdgcn_s_barrier();
-    }
-
     __shared__ char smem[LDS_BYTES];
     char* smem_a = smem;
     char* smem_b = smem + A_BYTES;

@@ -280,8 +280,11 @@ jobs:
 
           if [ -f "/etc/podinfo/gha-render-devices" ]; then
             DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+            # Privileged mode bypasses GPU assignment on shared runners.
+            PRIVILEGED_FLAG=()
           else
             DEVICE_FLAG="--device /dev/dri"
+            PRIVILEGED_FLAG=(--privileged)
           fi
 
           MODEL_MOUNT=""
@@ -304,13 +307,14 @@ jobs:
           $MODEL_MOUNT \
           --ipc=host --group-add video \
           --shm-size=16G \
-          --privileged \
+          "${PRIVILEGED_FLAG[@]}" \
           --cap-add=SYS_PTRACE \
           --env-file /tmp/env_file.txt \
           --security-opt seccomp=unconfined \
           --ulimit memlock=-1 \
           --ulimit stack=67108864 \
           -e ATOM_DISABLE_MMAP=true \
+          -e AITER_JIT_VERBOSE=1 \
           -e HF_TOKEN="${HF_TOKEN:-${{ secrets.HF_TOKEN_TEST }}}" \
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
@@ -361,6 +365,18 @@ jobs:
           MODEL_LOCK_WAIT_SECONDS: "7200"
           MODEL_LOCK_POLL_INTERVAL: "30"
           MODEL_PROGRESS_INTERVAL: "60"
+
+      - name: Prebuild Kimi-K3 GEMM kernel
+        if: >-
+          matrix.model_name == 'Kimi-K3' &&
+          (matrix.run_on_pr == true || github.event_name != 'pull_request')
+        timeout-minutes: 30
+        run: |
+          docker exec atom_aiter_test bash -euc '
+            MAX_JOBS=$(env -u OMP_NUM_THREADS -u OMP_THREAD_LIMIT nproc)
+            export MAX_JOBS
+            exec python3 /app/aiter-test/.github/scripts/prebuild_atom_kimi_k3.py
+          '
 
       - name: Run ATOM accuracy test
         if: matrix.run_on_pr == true || github.event_name != 'pull_request'

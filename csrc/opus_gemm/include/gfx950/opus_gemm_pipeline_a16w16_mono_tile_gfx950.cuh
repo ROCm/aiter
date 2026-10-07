@@ -4,8 +4,8 @@
 // Mono-tile BF16 a16w16 pipeline.
 //
 // Direct port of the upstream yk_gcn mono-tile BF16 kernel template
-// (bf16_gemm/gemm_a16w16_mono_tile_kernel_template.hpp) with two mechanical
-// adjustments to fit the aiter codegen contract:
+// (bf16_gemm/gemm_a16w16_mono_tile_kernel_template.hpp) with AITER integration
+// adjustments:
 //
 //   (1) `opus_gemm_kargs` (yk_gcn) -> `opus_gemm_mono_tile_kargs_gfx950`
 //       (aiter; defined in opus_gemm_traits_a16w16_gfx950.cuh alongside
@@ -13,12 +13,14 @@
 //   (2) The layout-helper namespace is renamed `gemm_mono_tile` ->
 //       `opus_mono_tile_gfx950` to avoid any ODR clash with a separate
 //       upstream build that ships the original symbol name.
+//   (3) The output epilogue supports both BF16 and FP32.  Its lane shuffle and
+//       physical stores are derived from D_C; the upstream template only
+//       instantiates BF16 output.
 //
-// The kernel body is otherwise byte-for-byte identical to the upstream
-// reference. Geometry is locked (T_M=2, T_N=4, T_K=1, W_M=W_N=16, W_K=32,
-// VEC=8, BLOCK_SIZE=512); tile-divisibility / smem-rep constraints are
-// enforced in the traits header static_asserts and re-validated host-side
-// by _validate_a16w16_mono_tile in gen_instances.py.
+// Geometry remains locked to the upstream reference (T_M=2, T_N=4, T_K=1,
+// W_M=W_N=16, W_K=32, VEC=8, BLOCK_SIZE=512); tile-divisibility / smem-rep
+// constraints are enforced in the traits header static_asserts and
+// re-validated host-side by _validate_a16w16_mono_tile in gen_instances.py.
 #pragma once
 
 #include <opus/opus.hpp>
@@ -396,22 +398,55 @@ void gemm_a16w16_mono_tile_kernel_gfx950(opus_gemm_mono_tile_kargs_gfx950 kargs)
 
     auto u_gc = make_layout_gc<T>(lane_id, 0, wave_id_n, kargs.stride_c);
     auto v_c_f16 = cast<D_C>(v_c);
-    // For every 8 D_C elements (= 4 u32), swap lane L's upper-half (last 4
-    // elems) with lane (L^16)'s lower-half (first 4 elems) using
-    // v_permlane16_swap_b32.
-    static_assert(sizeof(D_C) * 8 % sizeof(u32_t) == 0);
-    constexpr int u32_per_chunk = sizeof(D_C) * 8 / sizeof(u32_t);
+    // For every 8 D_C elements, swap lane L's upper half (last 4 elements)
+    // with lane (L^16)'s lower half (first 4 elements).  The original BF16
+    // template hard-coded the two u32 pairs of an 8xbf16 chunk.  FP32 has
+    // four u32 values per half, so derive the pair count from D_C instead of
+    // silently leaving elements 4..7 unswapped.
+    static_assert(sizeof(D_C) * 4 % sizeof(u32_t) == 0);
+    constexpr int u32_per_half = sizeof(D_C) * 4 / sizeof(u32_t);
+    constexpr int u32_per_chunk = 2 * u32_per_half;
     constexpr int num_chunks = sizeof(v_c_f16) / (sizeof(u32_t) * u32_per_chunk);
     auto* p_u32 = reinterpret_cast<u32_t*>(&v_c_f16);
     static_for<num_chunks>([&](auto c) {
         auto* p = p_u32 + c.value * u32_per_chunk;
-        auto r0 = __builtin_amdgcn_permlane16_swap(p[0], p[2], false, true);
-        auto r1 = __builtin_amdgcn_permlane16_swap(p[1], p[3], false, true);
-        p[0] = r0[0]; p[2] = r0[1];
-        p[1] = r1[0]; p[3] = r1[1];
+        static_for<u32_per_half>([&](auto i) {
+            auto r = __builtin_amdgcn_permlane16_swap(
+                p[i.value], p[i.value + u32_per_half], false, true);
+            p[i.value] = r[0];
+            p[i.value + u32_per_half] = r[1];
+        });
     });
 
-    store<T::VEC_C>(g_c, v_c_f16, u_gc, wave_id_m * (T::B_M / T::T_M) * kargs.stride_c + col);
+    // gmem::_store supports at most one 16-byte b128 transaction.  Keep the
+    // logical 8-element cached layout and split each FP32 issue into two
+    // explicit 4-element stores.  Asking the cached layout itself for vec=4
+    // is invalid: its offsets were constructed for vec=8 and would alias the
+    // second physical store with a different logical issue.
+    constexpr int c_store_vec = 16 / sizeof(D_C);
+    constexpr int c_store_groups = T::VEC_C / c_store_vec;
+    static_assert(T::VEC_C % c_store_vec == 0);
+    const int c_base =
+        wave_id_m * (T::B_M / T::T_M) * kargs.stride_c + col;
+    if constexpr (c_store_groups == 1) {
+        store<T::VEC_C>(g_c, v_c_f16, u_gc, c_base);
+    } else {
+        using c_layout = remove_cvref_t<decltype(u_gc)>;
+        constexpr int c_issues =
+            layout_load_traits<c_layout, T::VEC_C>::r_elem.value;
+        auto c_offsets = layout_to_offsets<T::VEC_C>(u_gc);
+        for (int issue = 0; issue < c_issues; ++issue) {
+            static_for<c_store_groups>([&](auto group) {
+                constexpr int group_offset = group.value * c_store_vec;
+                const int value_offset = issue * T::VEC_C + group_offset;
+                auto value = slice<c_store_vec>(
+                    v_c_f16, int(value_offset),
+                    int(value_offset + c_store_vec));
+                g_c.template store<c_store_vec>(
+                    value, c_offsets[issue] + group_offset, c_base);
+            });
+        }
+    }
 #else
     // Non-gfx950 device pass compiles to an empty stub; host-side arch
     // routing in opus_gemm.cu prevents any non-gfx950 device from

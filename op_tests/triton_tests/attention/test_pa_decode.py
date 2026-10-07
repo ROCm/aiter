@@ -7,10 +7,8 @@ import pytest
 import torch
 import triton.language as tl
 
-from aiter import pertoken_quant
+from aiter import logger, pertoken_quant
 from aiter.ops.triton.attention.pa_decode import paged_attention_decode
-
-DEBUG_MODE = False
 
 
 def paged_attention_decode_ref(
@@ -256,6 +254,47 @@ def test_paged_attn(
     torch.testing.assert_close(triton_output, torch_output, rtol=1e-02, atol=1e-02)
 
 
+# test_paged_attn stops at SEQ_LEN=1024, a single 1024-token partition, so it
+# only ever reaches the V1 kernels. SEQ_LEN=4096 spans four partitions, which
+# dispatches to the V2 (partitioned + reduce) kernels; the spy fails the test
+# if a dispatch change ever routes these cases back to V1.
+@pytest.mark.parametrize("B", [1, 4])
+@pytest.mark.parametrize("H_Q, H_KV", [(1, 1), (8, 1)])
+@pytest.mark.parametrize(
+    "dtype, kv_cache_dtype, compute_type, output_type",
+    [
+        (torch.bfloat16, torch.bfloat16, tl.bfloat16, torch.bfloat16),
+        (torch.bfloat16, torch.float8_e4m3fnuz, tl.bfloat16, torch.bfloat16),
+    ],
+)
+def test_paged_attn_v2(
+    B, H_Q, H_KV, dtype, kv_cache_dtype, compute_type, output_type, monkeypatch
+):
+    # paged_attention_decode looks up paged_attn_decode_v2 in its module globals.
+    v2_calls = []
+    paged_attn_decode_v2 = paged_attention_decode.__globals__["paged_attn_decode_v2"]
+
+    def spy(*args, **kwargs):
+        v2_calls.append(True)
+        return paged_attn_decode_v2(*args, **kwargs)
+
+    monkeypatch.setitem(paged_attention_decode.__globals__, "paged_attn_decode_v2", spy)
+
+    test_paged_attn(
+        B,
+        H_Q,
+        H_KV,
+        KV_BLK_SZ=16,
+        SEQ_LEN=4096,
+        NUM_BLK=16,
+        dtype=dtype,
+        kv_cache_dtype=kv_cache_dtype,
+        compute_type=compute_type,
+        output_type=output_type,
+    )
+    assert v2_calls, "SEQ_LEN=4096 was expected to dispatch to the V2 kernels"
+
+
 @pytest.mark.parametrize("B", [1, 4, 57, 64])
 # @pytest.mark.parametrize("H_Q, H_KV", [(1,1), (16, 16), (2,1), (24,4)]) #TODO: GQA failing
 @pytest.mark.parametrize("H_Q, H_KV", [(1, 1), (16, 16)])
@@ -348,26 +387,38 @@ def test_paged_attn_per_token_quant(
         alibi_slopes=None,
     )
 
-    if DEBUG_MODE:
-        print(
-            f"B={B} H_Q={H_Q}, H_KV={H_KV} D={D}, KV_BLK_SZ={KV_BLK_SZ}, SEQ_LEN={SEQ_LEN}, NUM_BLK={NUM_BLK}"
-        )
-        print(f"query={query}")
-        print(
-            f"key_cache_tri.shape={key_cache_tri.shape} key_cache_tri={key_cache_tri}"
-        )
-        print(f"k_scale.shape={k_scale.shape} k_scale={k_scale}")
-        print(
-            f"key_cache_tri_quant.shape={key_cache_tri_quant.shape} key_cache_tri_quant={key_cache_tri_quant}"
-        )
-        print(f"v_scale.shape={v_scale.shape} v_scale={v_scale}")
-        print(
-            f"value_cache_tri.shape={value_cache_tri.shape} value_cache_tri={value_cache_tri}"
-        )
-        print(
-            f"value_cache_tri_quant.shape={value_cache_tri_quant.shape} value_cache_tri_quant={value_cache_tri_quant}"
-        )
-        print(f"triton_output={triton_output}")
+    logger.debug(
+        "B=%d H_Q=%d, H_KV=%d D=%d, KV_BLK_SZ=%d, SEQ_LEN=%d, NUM_BLK=%d",
+        B,
+        H_Q,
+        H_KV,
+        D,
+        KV_BLK_SZ,
+        SEQ_LEN,
+        NUM_BLK,
+    )
+    logger.debug("query=%s", query)
+    logger.debug(
+        "key_cache_tri.shape=%s key_cache_tri=%s", key_cache_tri.shape, key_cache_tri
+    )
+    logger.debug("k_scale.shape=%s k_scale=%s", k_scale.shape, k_scale)
+    logger.debug(
+        "key_cache_tri_quant.shape=%s key_cache_tri_quant=%s",
+        key_cache_tri_quant.shape,
+        key_cache_tri_quant,
+    )
+    logger.debug("v_scale.shape=%s v_scale=%s", v_scale.shape, v_scale)
+    logger.debug(
+        "value_cache_tri.shape=%s value_cache_tri=%s",
+        value_cache_tri.shape,
+        value_cache_tri,
+    )
+    logger.debug(
+        "value_cache_tri_quant.shape=%s value_cache_tri_quant=%s",
+        value_cache_tri_quant.shape,
+        value_cache_tri_quant,
+    )
+    logger.debug("triton_output=%s", triton_output)
     # torch doesn't have support for fp8 data type, so we convert here
     if dtype not in (torch.bfloat16, torch.float16, torch.float32):
         query = query.to(tl_to_torch_dtype[compute_type])
@@ -379,7 +430,6 @@ def test_paged_attn_per_token_quant(
     paged_attention_decode_ref(
         torch_output, query, key_cache, value_cache, block_tables, context_lens
     )
-    if DEBUG_MODE:
-        print(f"torch_output={torch_output}")
+    logger.debug("torch_output=%s", torch_output)
 
     torch.testing.assert_close(triton_output, torch_output, rtol=2.5e-1, atol=2.5e-1)

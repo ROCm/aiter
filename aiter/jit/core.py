@@ -26,6 +26,14 @@ sys.path.insert(0, f"{this_dir}/utils/")
 from chip_info import get_gfx, get_gfx_list, get_gfx_runtime
 from cpp_extension import _jit_compile, executable_path, get_hip_version
 from file_baton import FileBaton
+from jit_cache import (
+    atomic_copy,
+    publish_blob_sources,
+    publish_compiled_kids,
+    require_blob_generation,
+    snapshot_compiled_kids,
+    stage_blob_sources,
+)
 from torch_guard import torch_compile_guard
 
 AITER_REBUILD = int(os.environ.get("AITER_REBUILD", "0"))
@@ -54,9 +62,13 @@ def mp_lock(
     MainFunc: Callable,
     FinalFunc: Callable | None = None,
     WaitFunc: Callable | None = None,
+    build_after_wait: bool = False,
 ):
     """
     Using FileBaton for multiprocessing.
+
+    With build_after_wait, a peer completing does not satisfy this invocation:
+    acquire the lock and run MainFunc with our request-specific arguments.
     """
     baton = FileBaton(lockPath)
     while True:
@@ -72,7 +84,7 @@ def mp_lock(
         # wait() returns True if the holder released normally (work done),
         # or False if it broke a stale lock left by a dead/abandoned holder --
         # in which case we loop and try to acquire + build ourselves.
-        if baton.wait():
+        if baton.wait() and not build_after_wait:
             if WaitFunc is not None:
                 return WaitFunc()
             return None
@@ -116,6 +128,16 @@ AITER_CONFIG_GEMM_A6W6 = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/a6w6_blockscale_tuned_gemm.csv",
 )
 
+AITER_CONFIG_GEMM_A6W4_ASM = (
+    os.getenv("AITER_CONFIG_GEMM_A6W4_ASM", "").strip()
+    or f"{AITER_ROOT_DIR}/aiter/configs/a6w4_asm_tuned_gemm.csv"
+)
+
+AITER_CONFIG_GEMM_A4W6_ASM = (
+    os.getenv("AITER_CONFIG_GEMM_A4W6_ASM", "").strip()
+    or f"{AITER_ROOT_DIR}/aiter/configs/a4w6_asm_tuned_gemm.csv"
+)
+
 AITER_CONFIG_GEMM_A8W8 = os.getenv(
     "AITER_CONFIG_GEMM_A8W8",
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_tuned_gemm.csv",
@@ -129,6 +151,19 @@ AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE = os.getenv(
 AITER_CONFIG_GEMM_A8W8_BLOCKSCALE = os.getenv(
     "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE",
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_tuned_gemm.csv",
+)
+
+# Native E8M0 group32 scales have a different operand contract from the
+# FP32 128x128 blockscale family, so shape-identical rows must stay separate.
+AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_GROUP32 = os.getenv(
+    "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_GROUP32",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_group32_tuned_gemm.csv",
+)
+# E8M0 block-scale GEMM rows (1x32/32x32 and 1x128/128x128) for (16, 16)-
+# preshuffled weights, keyed on the w_scale block as well.
+AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE = os.getenv(
+    "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm.csv",
 )
 
 AITER_CONFIG_FMOE = os.getenv(
@@ -156,6 +191,16 @@ AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv",
 )
 
+AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE = os.getenv(
+    "AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_mxfp8_bpreshuffle_tuned_gemm.csv",
+)
+
+AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_ABPRESHUFFLE = os.getenv(
+    "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_ABPRESHUFFLE",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_abpreshuffle_tuned_gemm.csv",
+)
+
 AITER_CONFIG_A8W8_BATCHED_GEMM = os.getenv(
     "AITER_CONFIG_A8W8_BATCHED_GEMM",
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_tuned_batched_gemm.csv",
@@ -169,8 +214,9 @@ AITER_CONFIG_BF16_BATCHED_GEMM = os.getenv(
 # fp8 e8m0 mxscale (block-scale) batched-GEMM tuned config. Its own family
 # (scale type baked into the filename, matching the a8w8_/bf16_ split) so a
 # future fp32 rowwise-scale variant lands in a separate CSV and never collides
-# on key. The scale type is identified by the filename alone. The
-# per-model tuned data currently lives under model_configs/ (e.g.
+# on key. Within the family the e8m0 weight-scale block (32x32, 128x128, 1x32
+# or 1x128) is the w_scale_block key column. The per-model tuned data
+# currently lives under model_configs/ (e.g.
 # dsv4_batched_gemm_a8w8_blockscale_mxscale_tuned.csv), merged in at runtime by
 # get_config_file; this canonical path may not exist on disk.
 AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE = os.getenv(
@@ -189,9 +235,12 @@ AITER_CONFIG_GEMM_BF16 = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_gemm.csv",
 )
 
-AITER_CONFIG_GDR_DECODE = os.getenv(
-    "AITER_CONFIG_GDR_DECODE",
-    f"{AITER_ROOT_DIR}/aiter/configs/gdr_decode_tuned.csv",
+# Per-model tuned rows live under model_configs/
+# (qwenimage_vae_bf16_tuned_conv3d.csv, wan21_vae_bf16_tuned_conv3d.csv) and
+# get merged into this canonical file by get_config_file. It ships header-only.
+AITER_CONFIG_CONV3D_BF16 = os.getenv(
+    "AITER_CONFIG_CONV3D_BF16",
+    f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_conv3d.csv",
 )
 
 # K5 opt BV tuned config. Per-model tuned rows live under model_configs/
@@ -228,6 +277,22 @@ class AITER_CONFIG:
         )
 
     @property
+    def AITER_CONFIG_GEMM_A6W4_ASM_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A6W4_ASM",
+            AITER_CONFIG_GEMM_A6W4_ASM,
+            "a6w4_asm_tuned_gemm",
+        )
+
+    @property
+    def AITER_CONFIG_GEMM_A4W6_ASM_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A4W6_ASM",
+            AITER_CONFIG_GEMM_A4W6_ASM,
+            "a4w6_asm_tuned_gemm",
+        )
+
+    @property
     def AITER_CONFIG_GEMM_A8W8_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_GEMM_A8W8", AITER_CONFIG_GEMM_A8W8, "a8w8_tuned_gemm"
@@ -247,6 +312,22 @@ class AITER_CONFIG:
             "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE",
             AITER_CONFIG_GEMM_A8W8_BLOCKSCALE,
             "a8w8_blockscale_tuned_gemm",
+        )
+
+    @property
+    def AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_GROUP32_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_GROUP32",
+            AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_GROUP32,
+            "a8w8_blockscale_group32_tuned_gemm",
+        )
+
+    @property
+    def AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE",
+            AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE,
+            "a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm",
         )
 
     @property
@@ -286,6 +367,22 @@ class AITER_CONFIG:
         )
 
     @property
+    def AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE",
+            AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE,
+            "a8w8_mxfp8_bpreshuffle_tuned_gemm",
+        )
+
+    @property
+    def AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_ABPRESHUFFLE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_ABPRESHUFFLE",
+            AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_ABPRESHUFFLE,
+            "a8w8_blockscale_abpreshuffle_tuned_gemm",
+        )
+
+    @property
     def AITER_CONFIG_A8W8_BATCHED_GEMM_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_A8W8_BATCHED_GEMM",
@@ -308,8 +405,10 @@ class AITER_CONFIG:
         )
 
     @property
-    def AITER_CONFIG_GDR_DECODE_FILE(self):
-        return AITER_CONFIG_GDR_DECODE
+    def AITER_CONFIG_CONV3D_BF16_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_CONV3D_BF16", AITER_CONFIG_CONV3D_BF16, "bf16_tuned_conv3d"
+        )
 
     @property
     def AITER_CONFIG_GDN_K5_OPT_FILE(self):
@@ -482,9 +581,9 @@ class AITER_CONFIG:
 
     # Cache is keyed on (self, env_name, ...); this object is a
     # process-lifetime singleton, so the retained reference is not a leak.
-    @functools.lru_cache(maxsize=20)  # noqa: B019
+    @functools.lru_cache(maxsize=64)  # noqa: B019
     def get_config_file(self, env_name, default_file, tuned_file_name):
-        config_env_file = os.getenv(env_name)
+        config_env_file = (os.getenv(env_name) or "").strip()
         # default_file = f"{AITER_ROOT_DIR}/aiter/configs/{tuned_file_name}.csv"
         from pathlib import Path
 
@@ -700,6 +799,26 @@ def rename_cpp_to_cu(els, dst, hipify, recursive=False):
         else:
             do_rename_and_mv(os.path.basename(el), os.path.dirname(el), dst, ret)
     return ret
+
+
+def _stage_blob_sources(
+    blob_gen_cmd, op_dir, src_dir, sources, hipify, seed_files=None
+):
+    """Generate JIT sources in a deterministic transactional working tree."""
+    staging_dir, token = stage_blob_sources(
+        blob_gen_cmd,
+        op_dir,
+        PY,
+        logger=logger,
+        log_commands=AITER_LOG_MORE > 0,
+        seed_files=seed_files,
+        return_token=True,
+    )
+    if staging_dir is None:
+        return sources, None, None
+    generated_sources = rename_cpp_to_cu([staging_dir], src_dir, hipify, recursive=True)
+    require_blob_generation(staging_dir, token)
+    return sources + generated_sources, staging_dir, token
 
 
 @torch_compile_guard()
@@ -1003,6 +1122,7 @@ def build_module(
     hipify=False,
     flags_extra_hip_per_source=None,
     ninja_workers: int | None = None,
+    build_after_wait=False,
 ):
     os.makedirs(bd_dir, exist_ok=True)
     lock_path = f"{bd_dir}/lock_{md_name}"
@@ -1027,8 +1147,22 @@ def build_module(
         opbd_dir = f"{op_dir}/build"
         src_dir = f"{op_dir}/build/srcs"
         os.makedirs(src_dir, exist_ok=True)
-        if os.path.exists(f"{get_user_jit_dir()}/{target_name}"):
-            os.remove(f"{get_user_jit_dir()}/{target_name}")
+
+        def raise_build_error(error):
+            tag = f"\033[31mfailed jit build [{md_name}]\033[0m"
+            logger.error(
+                f"{tag}\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\n-->[History]: {{}}{tag}\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191".format(
+                    re.sub(
+                        "error:",
+                        "\033[31merror:\033[0m",
+                        "-->".join(traceback.format_exception(*sys.exc_info())),
+                        flags=re.IGNORECASE,
+                    ),
+                )
+            )
+            raise RuntimeError(
+                f"[aiter] build [{md_name}] under {opbd_dir} failed !!!!!!"
+            ) from error
 
         sources = rename_cpp_to_cu(srcs, src_dir, hipify)
 
@@ -1119,19 +1253,35 @@ def build_module(
         flags_hip += [f"--offload-arch={arch}" for arch in archs]
         flags_hip = sorted(set(flags_hip))  # remove same flags
         flags_hip = [el for el in flags_hip if hip_flag_checker(el)]
-        def exec_blob(blob_gen_cmd, op_dir, src_dir, sources):
-            if blob_gen_cmd:
-                blob_dir = f"{op_dir}/blob/"
-                os.makedirs(blob_dir, exist_ok=True)
-                _run_blob_generator(blob_gen_cmd, blob_dir)
-                sources += rename_cpp_to_cu([blob_dir], src_dir, hipify, recursive=True)
-            return sources
-
-        if isinstance(blob_gen_cmd, list):
-            for s_blob_gen_cmd in blob_gen_cmd:
-                sources = exec_blob(s_blob_gen_cmd, op_dir, src_dir, sources)
-        else:
-            sources = exec_blob(blob_gen_cmd, op_dir, src_dir, sources)
+        blob_dir = f"{op_dir}/blob"
+        staged_blob_dir = None
+        staged_token = None
+        compiled_kids_snapshot = None
+        seed_files = None
+        if md_name == "module_deepgemm_opus":
+            seed_files = [
+                (
+                    f"{bd_dir}/compiled_kids_opus.json",
+                    "compiled_kids_opus.json",
+                )
+            ]
+        try:
+            sources, staged_blob_dir, staged_token = _stage_blob_sources(
+                blob_gen_cmd,
+                op_dir,
+                src_dir,
+                sources,
+                hipify,
+                seed_files=seed_files,
+            )
+            if staged_blob_dir is not None and md_name == "module_deepgemm_opus":
+                compiled_kids_snapshot = snapshot_compiled_kids(
+                    f"{staged_blob_dir}/compiled_kids_opus.json"
+                )
+                require_blob_generation(staged_blob_dir, staged_token)
+        except Exception as error:  # noqa: BLE001
+            raise_build_error(error)
+        active_blob_dir = staged_blob_dir or blob_dir
 
         extra_include_paths = []
 
@@ -1160,7 +1310,7 @@ def build_module(
                 _extra_inc = [p for p in extra_include if os.path.isdir(str(p))]
             extra_include_paths += [
                 f"{AITER_CSRC_DIR}/include",
-                f"{op_dir}/blob",
+                active_blob_dir,
             ] + _extra_inc
             if not is_standalone and not torch_exclude:
                 extra_include_paths += [f"{AITER_CSRC_DIR}/include/torch"]
@@ -1184,6 +1334,12 @@ def build_module(
                 )
 
         try:
+
+            def validate_generation():
+                if staged_blob_dir is not None:
+                    require_blob_generation(staged_blob_dir, staged_token)
+
+            validate_generation()
             _jit_compile(
                 md_name,
                 sorted(set(sources)),
@@ -1199,29 +1355,53 @@ def build_module(
                 torch_exclude=torch_exclude,
                 hipify=hipify,
                 extra_cuda_cflags_per_source=flags_extra_hip_per_source,
+                # We install a stable module name. Let Ninja check incremental
+                # dependencies and retry failures, not the Python loader cache.
+                use_versioner=False,
                 ninja_workers=ninja_workers,
             )
+            validate_generation()
             if is_python_module and not is_standalone:
-                shutil.copy(f"{opbd_dir}/{target_name}", f"{get_user_jit_dir()}")
+                artifact_path = f"{get_user_jit_dir()}/{target_name}"
             else:
-                shutil.copy(
-                    f"{opbd_dir}/{target_name}", f"{AITER_ROOT_DIR}/op_tests/cpp/mha"
-                )
-        except Exception as e:
-            tag = f"\033[31mfailed jit build [{md_name}]\033[0m"
-            logger.error(
-                f"{tag}\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\n-->[History]: {{}}{tag}\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191".format(
-                    re.sub(
-                        "error:",
-                        "\033[31merror:\033[0m",
-                        "-->".join(traceback.format_exception(*sys.exc_info())),
-                        flags=re.IGNORECASE,
-                    ),
-                )
+                artifact_path = f"{AITER_ROOT_DIR}/op_tests/cpp/mha/{target_name}"
+            installed_identity = atomic_copy(
+                f"{opbd_dir}/{target_name}",
+                artifact_path,
+                validate=validate_generation,
             )
-            raise RuntimeError(
-                f"[aiter] build [{md_name}] under {opbd_dir} failed !!!!!!"
-            ) from e
+        except Exception as error:  # noqa: BLE001
+            raise_build_error(error)
+
+        if staged_blob_dir is not None:
+            if md_name == "module_deepgemm_opus":
+                try:
+                    publish_compiled_kids(
+                        compiled_kids_snapshot,
+                        f"{bd_dir}/compiled_kids_opus.json",
+                        artifact_path,
+                        installed_identity,
+                    )
+                except Exception:
+                    # A stale receipt cannot validate the newly installed .so.
+                    # Do not make a successful build fail because of metadata.
+                    logger.warning(
+                        "JIT build [%s] succeeded, but publishing its compiled-kid "
+                        "metadata failed; the tuner will revalidate by rebuilding",
+                        md_name,
+                        exc_info=AITER_LOG_MORE > 0,
+                    )
+            try:
+                publish_blob_sources(
+                    staged_blob_dir, blob_dir, expected_token=staged_token
+                )
+            except Exception:
+                logger.warning(
+                    "JIT build [%s] succeeded, but publishing its generated-source "
+                    "cache failed; keeping the installed artifact",
+                    md_name,
+                    exc_info=AITER_LOG_MORE > 0,
+                )
 
     def FinalFunc():
         logger.info(
@@ -1229,7 +1409,12 @@ def build_module(
             f"\033[32mfinish build [{md_name}], cost {time.perf_counter() - startTS:.1f}s \033[0m"
         )
 
-    mp_lock(lockPath=lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
+    mp_lock(
+        lockPath=lock_path,
+        MainFunc=MainFunc,
+        FinalFunc=FinalFunc,
+        build_after_wait=build_after_wait,
+    )
 
 
 def _get_ck_exclude_modules():
