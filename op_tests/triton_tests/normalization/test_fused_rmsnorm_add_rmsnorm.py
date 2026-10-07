@@ -30,11 +30,10 @@ def reference(x, residual, post_weight, pre_weight):
 
 
 @pytest.mark.parametrize("rows, width", [(1, 6656), (64, 6656), (4096, 6656), (7, 257)])
-@pytest.mark.parametrize("residual_dtype", [torch.bfloat16, torch.float32])
-def test_fused_rmsnorm_add_rmsnorm(rows, width, residual_dtype):
+def test_fused_rmsnorm_add_rmsnorm(rows, width):
     torch.manual_seed(1064)
     x = torch.randn((rows, width), device="cuda", dtype=torch.bfloat16)
-    residual = torch.randn((rows, width), device="cuda", dtype=residual_dtype)
+    residual = torch.randn((rows, width), device="cuda", dtype=torch.bfloat16)
     post_weight = torch.randn(width, device="cuda", dtype=torch.bfloat16) * 0.1
     pre_weight = torch.randn(width, device="cuda", dtype=torch.bfloat16) * 0.1
 

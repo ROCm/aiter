@@ -23,6 +23,7 @@ def _fused_rmsnorm_add_rmsnorm_kernel(
     residual_out_ptr,
     pre_norm_ptr,
     width,
+    inv_width,
     post_eps,
     pre_eps,
     BLOCK_SIZE_N: tl.constexpr,
@@ -37,10 +38,10 @@ def _fused_rmsnorm_add_rmsnorm_kernel(
     post_weight = tl.load(post_weight_ptr + col, valid, other=0).to(tl.float32)
     pre_weight = tl.load(pre_weight_ptr + col, valid, other=0).to(tl.float32)
 
-    post_rsqrt = tl.rsqrt(tl.sum(x * x, 0) / width + post_eps)
+    post_rsqrt = tl.rsqrt(tl.sum(x * x, 0) * inv_width + post_eps)
     post_norm = x * post_rsqrt * (post_weight + 1.0)
     added = post_norm + residual
-    pre_rsqrt = tl.rsqrt(tl.sum(added * added, 0) / width + pre_eps)
+    pre_rsqrt = tl.rsqrt(tl.sum(added * added, 0) * inv_width + pre_eps)
     pre_norm = added * pre_rsqrt * (pre_weight + 1.0)
 
     tl.store(residual_out_ptr + offset, added, valid)
