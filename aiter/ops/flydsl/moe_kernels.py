@@ -1593,6 +1593,18 @@ def _flydsl_moe_stage1_impl(
             out = torch.empty(
                 (token_num, topk, inter_dim), dtype=torch_out_dtype, device=dev
             )
+    elif _v2_output_layout:
+        # The kernel takes out.view(-1), so an undersized caller buffer is an
+        # out-of-bounds write rather than an error. Check it here.
+        _expected_shape = (
+            max(sorted_token_ids.shape[0], sorted_expert_ids.shape[0] * tile_m),
+            inter_dim // 2 if _need_fp4 else inter_dim,
+        )
+        if tuple(out.shape) != _expected_shape:
+            raise ValueError(
+                f"stage1 out has shape {tuple(out.shape)}, "
+                f"but the v2 output layout requires {_expected_shape}"
+            )
 
     if _is_splitk:
         torch_tmp_out_dtype = dtypes.bf16 if _base_out_dtype == "bf16" else dtypes.fp16

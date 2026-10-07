@@ -116,7 +116,8 @@ AUX_SORT_QUANT_PARAMS = """    int            M,
     void*          a_quant,
     void*          a_scale,
     int32_t*       m_indices,
-    void*          bf16_zero_ptr"""
+    void*          bf16_zero_ptr,
+    int            input_stride"""
 
 AUX_3STAGE_PARAMS = """    int            M,
     const int32_t* topk_ids,
@@ -191,7 +192,24 @@ def _aux_sort_quant_body(ne, topk, mb, h):
         f"            reinterpret_cast<uint8_t*>(a_quant),\n"
         f"            reinterpret_cast<uint8_t*>(a_scale),\n"
         f"            m_indices,\n"
-        f"            reinterpret_cast<__hip_bfloat16*>(bf16_zero_ptr));"
+        f"            reinterpret_cast<__hip_bfloat16*>(bf16_zero_ptr),\n"
+        f"            input_stride);"
+    )
+
+
+def _aux_sort_quant_fp8_body(ne, topk, mb, h):
+    return (
+        f"    aiter::mxfp4_moe::moe_sort_quant::launch_fp8<\n"
+        f"        {ne}, {topk}, {mb}, {h}, kNCtasSort, kThreadsSort>(\n"
+        f"            stream, M,\n"
+        f"            reinterpret_cast<const __hip_bfloat16*>(a_input),\n"
+        f"            topk_ids, topk_weight, sorted_token_ids, sorted_expert_ids,\n"
+        f"            cumsum, reverse_sorted, sorted_weights,\n"
+        f"            reinterpret_cast<uint8_t*>(a_quant),\n"
+        f"            reinterpret_cast<uint8_t*>(a_scale),\n"
+        f"            m_indices,\n"
+        f"            reinterpret_cast<__hip_bfloat16*>(bf16_zero_ptr),\n"
+        f"            input_stride);"
     )
 
 
@@ -291,6 +309,14 @@ class mxfp4_moe_aux_codegen:
                     AUX_SORT_QUANT_PARAMS,
                     _aux_sort_quant_body(ne, topk, mb, h),
                 )
+                if (ne, h, e, topk) == (896, 3584, 384, 16):
+                    yield Instance(
+                        f"aux_sort_quant_fp8_NE{ne}_TOPK{topk}_MB{mb}_H{h}",
+                        "SortQuantFn",
+                        AUX_INC_SORT_QUANT,
+                        AUX_SORT_QUANT_PARAMS,
+                        _aux_sort_quant_fp8_body(ne, topk, mb, h),
+                    )
 
         # sort (threestage): MB in {32, 64, 128}
         for ne, h, e, topk in SHAPES:
