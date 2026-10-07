@@ -569,7 +569,14 @@ def _attn_fwd(
                     + offs_m * stride_lse_m
                 )
                 lse_mask = offs_m < SEQLEN_Q
-                lse = tl.full([BLOCK_M], value=0.0, dtype=tl.float32)
+                # No key contributes to this block, so the normaliser is the empty sum and
+                # the LSE is log(0) = -inf. A finite value would give the block a non-zero
+                # weight in a downstream merge while its output is all zeros.
+                # A row with a sink attends to the sink, so its LSE stays finite.
+                if ENABLE_SINK:
+                    lse = tl.full([BLOCK_M], value=0.0, dtype=tl.float32)
+                else:
+                    lse = tl.full([BLOCK_M], value=float("-inf"), dtype=tl.float32)
                 tl.store(softmax_lse_ptr + offs_lse, lse, mask=lse_mask)
                 # TODO: Should dropout and return encoded softmax be handled here too?
 
@@ -894,8 +901,18 @@ def _attn_fwd(
         # convert back to natural units
         softmax_lse *= LN2
 
-        if IS_CAUSAL:
-            # zero out nans caused by -infs when doing causal
+        if IS_CAUSAL and not ENABLE_SINK:
+            # Rows before causal_start_idx attend to no keys, so their scores are all
+            # -inf and l_i ends up NaN -- the same NaN the comment above describes for
+            # acc. softmax_lse is therefore NaN here, not -inf, so this is required
+            # cleanup rather than a no-op: it replaces that NaN with the -inf an empty
+            # row carries. Removing it lets the NaN reach a downstream merge.
+            lse_causal_mask = (start_m_idx + tl.arange(0, BLOCK_M)) < causal_start_idx
+            softmax_lse = tl.where(lse_causal_mask, float("-inf"), softmax_lse)
+        elif IS_CAUSAL:
+            # With a sink m_i starts at the sink logit instead of -inf, so those rows
+            # give exp2(-inf - sink) = 0 and l_i stays 1.0. No NaN arises and the LSE is
+            # finite, so keep the value this path has always written.
             lse_causal_mask = (start_m_idx + tl.arange(0, BLOCK_M)) < causal_start_idx
             softmax_lse = tl.where(lse_causal_mask, 0.0, softmax_lse)
 
