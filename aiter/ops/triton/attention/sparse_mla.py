@@ -15,11 +15,12 @@ from aiter.ops.triton.attention.pa_decode_sparse import (
     _PREFILL_MIN_ROWS,
     _as_int32_contiguous_1d,
     _launch_splits,
+    _staged_block_m,
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.common_utils import max_addressable_bytes
 from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
-from aiter.ops.triton.utils.device_info import get_num_sms
+from aiter.ops.triton.utils.device_info import get_num_sms, get_num_xcds
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -46,9 +47,17 @@ def _cache_pointers(fmt, kv, d_qk, kv_scale):
         kv = kv.reshape(kv.shape[0], kv.shape[3])
     elif kv.ndim == 3 and kv.shape[2] == d_qk:
         # vLLM paged cache [nb, block_size, R]: indices are global slot ids and
-        # rows are contiguous, so the flat view is stride-identical.
+        # rows are contiguous. With unpadded pages the flat view is
+        # stride-identical; a padded page pitch keeps the paged addressing.
         if not (kv.stride(2) == 1 and kv.stride(1) == kv.shape[2]):
             raise ValueError("a [nb, block, R] pool must have contiguous rows")
+        if kv.stride(0) != kv.shape[1] * kv.shape[2]:
+            block_size = kv.shape[1]
+            if fmt == "bf16":
+                return kv, kv, None, block_size
+            if fmt == "fp8_scalar":
+                u8 = kv.view(torch.uint8)
+                return u8, u8, kv_scale.reshape(1), block_size
         kv = kv.reshape(-1, d_qk)
     if fmt == "bf16":
         return kv, kv, None, 1
@@ -339,6 +348,13 @@ def _check_geometry(fmt, d_qk, kv_lora_rank, qk_rope_head_dim):
         return
     if fmt == "fp8_g64":
         return  # the whole row is the head; geometry args are not read
+    # The kernel's LDS tiles and Gluon tensors are kv_lora_rank / qk_rope_head_dim wide.
+    for name, dim in (
+        ("kv_lora_rank", kv_lora_rank),
+        ("qk_rope_head_dim", qk_rope_head_dim),
+    ):
+        if dim & (dim - 1):
+            raise ValueError(f"{name} must be a power of two, got {dim}")
     if d_qk != kv_lora_rank + qk_rope_head_dim:
         hint = (
             " A bf16 or fp8_scalar cache carries no rope information: pass "
@@ -395,6 +411,9 @@ def _forward_paged(
     extra_kv,
     extra_indptr,
     extra_indices,
+    inv_rope_positions,
+    inv_rope_cos_sin_cache,
+    out_mxfp8,
 ):
     """dsv4 and the SWA+top-k two-loop, until the two launchers merge."""
     from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
@@ -428,6 +447,9 @@ def _forward_paged(
         extra_indices=extra_indices,
         extra_indptr=extra_indptr,
         out=out,
+        inv_rope_positions=inv_rope_positions,
+        inv_rope_cos_sin_cache=inv_rope_cos_sin_cache,
+        out_mxfp8=out_mxfp8,
     )
     return res if isinstance(res, tuple) else (res, None)
 
@@ -453,6 +475,10 @@ def sparse_mla_fwd(
     extra_kv: torch.Tensor | None = None,
     extra_indptr: torch.Tensor | None = None,
     extra_indices: torch.Tensor | None = None,
+    extra_kv_scale: torch.Tensor | None = None,
+    inv_rope_positions: torch.Tensor | None = None,
+    inv_rope_cos_sin_cache: torch.Tensor | None = None,
+    out_mxfp8: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Sparse (top-k gathered) MLA attention.
 
@@ -512,6 +538,11 @@ def sparse_mla_fwd(
             which is not the same as a zero sink.
         extra_kv, extra_indptr, extra_indices: a second segment attended in the
             same pass, for the SWA-window + top-k two-loop. All three together.
+            Either both segments are fp8_scalar block caches (each with its own
+            [1] f32 scale; either dot_precision) or both are fp8_dsv4_mla / bf16
+            block caches (bf16 dots).
+        extra_kv_scale: the extra segment's [1] f32 scale when it is
+            fp8_scalar; defaults to kv_scale.
         dot_precision: what the QK and PV matrix-core ops run in.
 
             "bf16" (default): the KV tile is dequantized to bf16 on its way
@@ -532,6 +563,16 @@ def sparse_mla_fwd(
         return_lse: also return the natural-log log-sum-exp, [C, H] f32, for
             merging partials across context-parallel ranks. A fully masked row
             reports -inf.
+        inv_rope_positions, inv_rope_cos_sin_cache: [C] positions and [P, 64]
+            f32 (cos | sin). The trailing 64 lanes of each output row are
+            rotated back (inverse GPT-J RoPE) before the store. DeepSeek-V4
+            caches only (fp8_dsv4_mla, fp8_g64, the two-loop), whose rope lives
+            inside the row.
+        out_mxfp8: (data [C, H * D] e4m3, scale [C, H * D // 32] uint8 E8M0) in
+            place of out, for the same caches: the output is stored
+            MXFP8-quantized, one scale per 32 lanes, and data viewed as
+            [C, H, D] is returned. It matches vLLM's inverse-RoPE + MXFP8
+            pass on the bf16 rows up to rounding.
 
     Returns:
         (out, lse), out is
@@ -563,23 +604,40 @@ def sparse_mla_fwd(
     if has_extra:
         # The SWA-window + top-k two-loop: both segments are block caches the
         # dsv4 decoder reads. A flat main pool would silently drop the extra one.
-        if kv_buffer.ndim != 3 or fmt not in ("fp8_dsv4_mla", "bf16"):
+        if kv_buffer.ndim != 3 or fmt not in ("fp8_dsv4_mla", "bf16", "fp8_scalar"):
             raise ValueError(
-                "the two-loop needs a 3-D block cache (fp8_dsv4_mla or bf16) as "
-                f"kv_buffer, got {fmt}"
+                "the two-loop needs a 3-D block cache (fp8_dsv4_mla, bf16 or "
+                f"fp8_scalar) as kv_buffer, got {fmt}"
             )
-        extra_fmt = _classify_cache(
-            q, extra_kv, kv_lora_rank, qk_rope_head_dim, None, what="extra_kv"
-        )
-        if extra_kv.ndim != 3 or extra_fmt not in ("fp8_dsv4_mla", "bf16"):
-            raise ValueError(
-                f"extra_kv must be a 3-D fp8_dsv4_mla or bf16 block cache, got "
-                f"{extra_fmt}"
+        if fmt == "fp8_scalar":
+            if extra_kv_scale is None:
+                extra_kv_scale = kv_scale
+            extra_fmt = _classify_cache(
+                q,
+                extra_kv,
+                kv_lora_rank,
+                qk_rope_head_dim,
+                extra_kv_scale,
+                what="extra_kv",
             )
+            if extra_kv.ndim != 3 or extra_fmt != "fp8_scalar":
+                raise ValueError(
+                    "an fp8_scalar kv_buffer needs a 3-D fp8_scalar extra_kv, got "
+                    f"{extra_fmt}"
+                )
+        else:
+            extra_fmt = _classify_cache(
+                q, extra_kv, kv_lora_rank, qk_rope_head_dim, None, what="extra_kv"
+            )
+            if extra_kv.ndim != 3 or extra_fmt not in ("fp8_dsv4_mla", "bf16"):
+                raise ValueError(
+                    f"extra_kv must be a 3-D fp8_dsv4_mla or bf16 block cache, got "
+                    f"{extra_fmt}"
+                )
         _check_index_stream(
             extra_indptr, extra_indices, num_queries, q.device, what="extra_"
         )
-    if fmt in ("fp8_dsv4_mla", "fp8_g64") or has_extra:
+    if fmt in ("fp8_dsv4_mla", "fp8_g64") or (has_extra and fmt != "fp8_scalar"):
         return _forward_paged(
             q,
             kv_buffer,
@@ -598,6 +656,14 @@ def sparse_mla_fwd(
             extra_kv,
             extra_indptr,
             extra_indices,
+            inv_rope_positions,
+            inv_rope_cos_sin_cache,
+            out_mxfp8,
+        )
+    if inv_rope_positions is not None or out_mxfp8 is not None:
+        raise ValueError(
+            "the inverse-RoPE / MXFP8 output epilogue needs a DeepSeek-V4 cache, "
+            f"got {fmt}"
         )
     arch = arch_info.get_arch()
     assert arch in SUPPORTED_ARCHS, f"sparse_mla_fwd does not support {arch}"
@@ -623,6 +689,12 @@ def sparse_mla_fwd(
             )
         q_scale = q_scale.reshape(1).to(torch.float32).contiguous()
     cache, alt, scl, block_size = _cache_pointers(fmt, kv_buffer, d_qk, kv_scale)
+    if has_extra:
+        x_cache, x_alt, x_scl, x_block_size = _cache_pointers(
+            fmt, extra_kv, d_qk, extra_kv_scale
+        )
+        extra_indices = _as_int32_contiguous_1d(extra_indices)
+        extra_indptr = _as_int32_contiguous_1d(extra_indptr)
     fp8_dots = _resolve_dot_precision(dot_precision, fmt, arch)
     if not q_is_fp8:
         # q_scale describes an fp8 q's encoding. With bf16 q the kernel quantizes
@@ -645,19 +717,33 @@ def sparse_mla_fwd(
     block_k = cfg["BLOCK_K"]
     num_warps = cfg["num_warps"]
 
-    num_rows = cache.shape[0] * block_size if cache.ndim >= 2 else cache.shape[0]
-    avg_topk = kv_indices.numel() / max(1, num_queries)
+    def _rows(c, bs):
+        return c.shape[0] * bs if c.ndim >= 2 else c.shape[0]
+
+    num_rows = _rows(cache, block_size)
+    avg_main = kv_indices.numel() / max(1, num_queries)
+    avg_extra = extra_indices.numel() / max(1, num_queries) if has_extra else 0.0
+    avg_topk = avg_main + avg_extra
+    if not has_extra:
+        # The extra segment's slots alias the main one (HAS_EXTRA=False).
+        x_cache, x_alt, x_scl, x_block_size = cache, alt, scl, block_size
+        extra_indices, extra_indptr = kv_indices, kv_indptr
+    x_num_rows = _rows(x_cache, x_block_size)
 
     # Alignment hint for cs0 so row gathers can vectorize.
     cs0_align = 1
     for a in (16, 8, 4, 2):
-        if int(cache.stride(0)) % a == 0:
+        if int(cache.stride(0)) % a == 0 and int(x_cache.stride(0)) % a == 0:
             cs0_align = a
             break
     # buffer_load carries a signed 32-bit offset
     MAX_BYTES = 2**31 - 1
     use_buffer_load = max_addressable_bytes(cache) < MAX_BYTES
-    idx_use_buffer_load = max_addressable_bytes(kv_indices) < MAX_BYTES
+    x_use_buffer_load = max_addressable_bytes(x_cache) < MAX_BYTES
+    idx_use_buffer_load = (
+        max_addressable_bytes(kv_indices) < MAX_BYTES
+        and max_addressable_bytes(extra_indices) < MAX_BYTES
+    )
 
     head_aligned = num_heads % block_m == 0
     heads_blocks = (num_heads + block_m - 1) // block_m
@@ -675,6 +761,10 @@ def sparse_mla_fwd(
         num_splits = max(1, int(kv_splits))
     else:
         num_splits = _mla_num_splits(num_queries, heads_blocks, avg_topk, block_k)
+    main_splits = num_splits
+    if has_extra and avg_main > 0:
+        # Splitting the SWA window past its tile count only makes masked tiles.
+        main_splits = max(1, min(num_splits, math.ceil(avg_main / block_k)))
     # skip_reduce hands the partials to the caller, so only our own reduce pads.
     grid_splits = num_splits if skip_reduce else _launch_splits(num_splits)
 
@@ -716,15 +806,36 @@ def sparse_mla_fwd(
         avg_topk,
         use_buffer_load,
         uni_tile=True,
-        has_extra=False,
+        has_extra=has_extra,
         block_k=block_k,
     )
-    # bf16-staged tiles only; fp8 dots stage raw fp8 in their own layout
-    kv_lds_pad = 16 if num_queries >= _PREFILL_MIN_ROWS and not fp8_dots else 0
+    # bf16-staged tiles only; fp8 dots stage raw fp8 in their own layout, and
+    # gfx950's rope-free walk (16x16x32, STAGED_K32) pads its own tile.
+    own_pad = arch == "gfx950" and not qk_rope_head_dim
+    kv_lds_pad = (
+        16 if num_queries >= _PREFILL_MIN_ROWS and not fp8_dots and not own_pad else 0
+    )
     _check_lds_budget(arch, block_k, kv_lora_rank, qk_rope_head_dim, kv_lds_pad)
+
+    # The 32/64-head programs and the decode XCD remap below are tuned on gfx950.
+    staged = fmt == "fp8_scalar" or (fmt == "bf16" and qk_rope_head_dim == 0)
+    if arch == "gfx950" and staged and num_heads in (32, 64) and not async_lds_on:
+        # 32- or 64-head programs (_staged_block_m).
+        block_m = _staged_block_m(
+            num_heads, num_queries, num_splits, max(avg_main, avg_extra) / block_k
+        )
+        if block_m > 16:
+            num_warps = 8
+            head_aligned = num_heads % block_m == 0
+            heads_blocks = (num_heads + block_m - 1) // block_m
 
     # Q is read once per query without split-K, and re-read by every split
     q_cache = ".cg" if num_splits == 1 else ""
+    # Decode keeps neighbouring rows on one XCD: a spec-decode request's rows read
+    # nearly the same KV rows and share its L2. Prefill rows gain nothing from it.
+    xcd_remap = (
+        get_num_xcds() if arch == "gfx950" and num_queries < _PREFILL_MIN_ROWS else 0
+    )
     grid = (num_queries, grid_splits, heads_blocks)
     _sparse_mla_gfx950[grid](
         q,
@@ -732,38 +843,38 @@ def sparse_mla_fwd(
         alt,
         kv_indices,
         kv_indptr,
-        cache,  # extra_* segment: unread placeholders (HAS_EXTRA=False)
-        alt,
-        kv_indices,
-        kv_indptr,
+        x_cache,  # extra_* segment; aliases main when HAS_EXTRA=False
+        x_alt,
+        extra_indices,
+        extra_indptr,
         attn_sink,
         out,
         part_m,
         part_l,
         part_acc,
         scl,  # f32 side-channel: k_scale ("fp8_scalar") / f32 view ("fp8_dsv32_mla")
-        scl,  # extra segment's slot, unread (HAS_EXTRA=False)
+        x_scl,  # extra segment's, unread when HAS_EXTRA=False
         float(softmax_scale),
         q.stride(0),
         q.stride(1),
         out.stride(0),
         out.stride(1),
         cache.stride(0),
-        cache.stride(0),
+        x_cache.stride(0),
         num_rows,
-        num_rows,
+        x_num_rows,
         pm_stride0,
         pm_stride_s,
         pa_stride0,
         pa_stride_s,
         pa_stride_h,
         num_heads,
-        HAS_EXTRA=False,
+        HAS_EXTRA=has_extra,
         HAS_SINK=has_sink,
         MAIN_FMT=fmt,
         EXTRA_FMT=fmt,
         MAIN_BLOCK_SIZE=block_size,
-        EXTRA_BLOCK_SIZE=block_size,
+        EXTRA_BLOCK_SIZE=x_block_size,
         CS0_ALIGN=cs0_align,
         NOPE_DIM=kv_lora_rank,
         ROPE_DIM=qk_rope_head_dim,
@@ -780,11 +891,12 @@ def sparse_mla_fwd(
         UNI_TILE=True,
         GRID_ORDER="qsh",
         Q_CACHE=q_cache,
-        main_num_splits=num_splits,
+        XCD_REMAP=xcd_remap,
+        main_num_splits=main_splits,
         ADAPTIVE_SPLITS=num_splits > 1,
         DEQ="none",
         MAIN_USE_BUFFER_LOAD=use_buffer_load,
-        EXTRA_USE_BUFFER_LOAD=use_buffer_load,
+        EXTRA_USE_BUFFER_LOAD=x_use_buffer_load,
         IDX_BUFFER_LOAD=idx_use_buffer_load,
         HAS_INVALID=has_invalid,
         FP8_MFMA=fp8_dots,
