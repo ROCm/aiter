@@ -18,6 +18,15 @@ EST_WORKER_RSS_BYTES = 1_500_000_000
 # kernels during AITER compilation are bounded by device contexts and device
 # memory rather than by host CPU or RAM.
 EST_WORKERS_PER_GPU = 8
+# Outer module-pool ceiling for the wheel prebuild. Each entry compiles a whole
+# CK module, so the historical policy never ran more than this many at once;
+# the inner Ninja budget is that pool's share of the same total.
+MAX_OUTER_MODULE_WORKERS = 5
+# Shared help text for CLIs exposing an explicit worker ceiling (``--jobs``).
+JOBS_CLI_HELP = (
+    "Optional worker ceiling, further clamped by AITER CPU/memory limits; "
+    "non-positive values select one worker"
+)
 _WORKER_ENV = "AITER_MAX_JOBS"
 _LEGACY_WORKER_ENV = "MAX_JOBS"
 _GPU_WORKERS_PER_DEVICE_ENV = "AITER_GPU_WORKERS_PER_DEVICE"
@@ -474,9 +483,31 @@ def get_compile_worker_count() -> int:
     return _get_worker_count(honor_legacy_max_jobs=True)
 
 
-def get_worker_count_for(work_count: int) -> int:
-    """Cap the global worker budget to available work, with a floor of one."""
-    return min(get_worker_count(), max(1, int(work_count)))
+def get_worker_count_for(work_count: int, explicit: int | None = None) -> int:
+    """Cap the global worker budget to available work, with a floor of one.
+
+    ``explicit`` is an optional caller-supplied ceiling, such as a CLI
+    ``--jobs`` value; non-positive values select a single worker.
+    """
+    budget = min(get_worker_count(), max(1, int(work_count)))
+    if explicit is None:
+        return budget
+    return min(budget, max(1, int(explicit)))
+
+
+def split_worker_budget(
+    total_workers: int, module_count: int, max_outer: int = MAX_OUTER_MODULE_WORKERS
+) -> tuple[int, int]:
+    """Split a worker budget between an outer module pool and one inner compiler.
+
+    Returns ``(outer, inner)``: how many modules to build concurrently and the
+    per-module Ninja budget. ``outer`` is bounded by the submitted module count
+    and the historical ``max_outer`` ceiling; ``inner`` is the remaining share
+    of ``total_workers``. Both are always at least one.
+    """
+    outer = max(1, min(int(total_workers), int(module_count), max(1, int(max_outer))))
+    inner = max(1, int(total_workers) // outer)
+    return outer, inner
 
 
 def _configured_worker_ceiling() -> int | None:

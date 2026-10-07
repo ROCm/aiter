@@ -22,6 +22,7 @@ get_cpu_worker_budget = worker_limits.get_cpu_worker_budget
 get_worker_count = worker_limits.get_worker_count
 get_worker_count_for = worker_limits.get_worker_count_for
 get_gpu_worker_count = worker_limits.get_gpu_worker_count
+split_worker_budget = worker_limits.split_worker_budget
 
 
 class WorkerAwarenessTest(unittest.TestCase):
@@ -474,6 +475,36 @@ class WorkerAwarenessTest(unittest.TestCase):
         ):
             self.assertEqual(get_worker_count_for(0), 1)
             self.assertEqual(get_worker_count_for(3), 3)
+
+    def test_worker_count_for_honors_explicit_ceiling(self):
+        with patch.dict(os.environ, {"AITER_MAX_JOBS": "19"}, clear=True), patch.object(
+            worker_limits, "_automatic_worker_snapshot", return_value=(32, 32, None)
+        ):
+            self.assertEqual(get_worker_count_for(100, None), 19)
+            self.assertEqual(get_worker_count_for(100, 4), 4)
+            self.assertEqual(get_worker_count_for(100, 99), 19)
+            self.assertEqual(get_worker_count_for(2, 99), 2)
+
+    def test_worker_count_for_explicit_ceiling_never_returns_zero(self):
+        with patch.dict(os.environ, {"AITER_MAX_JOBS": "19"}, clear=True), patch.object(
+            worker_limits, "_automatic_worker_snapshot", return_value=(32, 32, None)
+        ):
+            for explicit in (0, -7):
+                with self.subTest(explicit=explicit):
+                    self.assertEqual(get_worker_count_for(100, explicit), 1)
+
+    def test_split_worker_budget_caps_outer_pool(self):
+        self.assertEqual(split_worker_budget(32, 40), (5, 6))
+        self.assertEqual(split_worker_budget(32, 3), (3, 10))
+
+    def test_split_worker_budget_divides_the_same_total(self):
+        outer, inner = split_worker_budget(24, 40)
+        self.assertEqual(outer, 5)
+        self.assertEqual(inner, 4)
+
+    def test_split_worker_budget_never_returns_zero(self):
+        self.assertEqual(split_worker_budget(0, 0), (1, 1))
+        self.assertEqual(split_worker_budget(1, 100), (1, 1))
 
     def test_gpu_worker_count_scales_with_visible_devices(self):
         with patch.dict(os.environ, {}, clear=True), patch.object(

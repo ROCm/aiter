@@ -22,6 +22,7 @@ _REPO_CSRC = os.path.normpath(os.path.join(_REPO_ROOT, "csrc", "include"))
 sys.path.insert(0, _REPO_ROOT)
 
 from aiter_worker_limits import (
+    JOBS_CLI_HELP,
     adopt_legacy_max_jobs,
     configure_worker_subprocesses,
     get_worker_count_for,
@@ -172,8 +173,7 @@ def build(verbose=False, jobs=None):
         obj = os.path.join(_THIS_DIR, s.replace(".cu", ".o"))
         extra = ["-mwavefrontsize64"] if s in _W64_SOURCES else []
         tasks.append((src, obj, hipcc, arch, verbose, extra))
-    worker_budget = get_worker_count_for(len(tasks))
-    jobs = worker_budget if jobs is None else min(worker_budget, max(1, int(jobs)))
+    jobs = get_worker_count_for(len(tasks), jobs)
 
     if verbose:
         print(f"[setup] arch={arch}, jobs={jobs}")
@@ -259,8 +259,7 @@ def main():
         "-j",
         type=int,
         default=None,
-        help="Optional worker ceiling, further clamped by AITER CPU/memory limits; "
-        "non-positive values select one worker",
+        help=JOBS_CLI_HELP,
     )
     args = parser.parse_args()
     if args.clean:

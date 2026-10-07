@@ -10,7 +10,12 @@ import sys
 from setuptools import Distribution, setup
 from setuptools.command.build_ext import build_ext
 
-from aiter_worker_limits import adopt_legacy_max_jobs, get_worker_count, worker_ceiling
+from aiter_worker_limits import (
+    adopt_legacy_max_jobs,
+    get_worker_count,
+    split_worker_budget,
+    worker_ceiling,
+)
 
 adopt_legacy_max_jobs()
 
@@ -370,12 +375,12 @@ if PREBUILD_KERNELS != 0:
                 third_party=one_opt_args["third_party"],
             )
 
-        total_workers = get_worker_count()
-        outer_workers = min(total_workers, max(1, len(all_opts_args_build)))
         # Split the budget between the outer module pool and each module's
         # inner Ninja invocation. The inner budget travels through the shared
         # worker-ceiling env var instead of a build_module() argument.
-        inner_workers = max(1, total_workers // outer_workers)
+        outer_workers, inner_workers = split_worker_budget(
+            get_worker_count(), len(all_opts_args_build)
+        )
 
         # --- FlyDSL AOT pre-compilation (MOE + GEMM, before CK) ---
         _prev_aot_import = os.environ.get("AITER_AOT_IMPORT")

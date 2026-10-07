@@ -82,7 +82,11 @@ from codegen.gen_instances_gfx1250 import (
 # kid), and this script exists to create exactly those files.
 from opus_gemm_common import gfx1250_4wave_co_kernels_declared
 
-from aiter_worker_limits import adopt_legacy_max_jobs, get_worker_count_for
+from aiter_worker_limits import (
+    JOBS_CLI_HELP,
+    adopt_legacy_max_jobs,
+    get_worker_count_for,
+)
 
 # Every pre-compiled family and the pipeline header each one's device body
 # lives in. The rest of the stub (traits/kargs/body names) comes from the
@@ -465,8 +469,7 @@ def main():
         "-j",
         type=int,
         default=None,
-        help="Optional worker ceiling, further clamped by AITER CPU/memory limits; "
-        "non-positive values select one worker",
+        help=JOBS_CLI_HELP,
     )
     p.add_argument("--keep-temps", action="store_true")
     args = p.parse_args()
@@ -487,9 +490,7 @@ def main():
         raise SystemExit(
             "build_co: no pre-compiled entries -- check gen_co/co_kernels.json"
         )
-    jobs = get_worker_count_for(len(instances))
-    if args.jobs is not None:
-        jobs = min(jobs, max(1, args.jobs))
+    jobs = get_worker_count_for(len(instances), args.jobs)
 
     workdir = tempfile.mkdtemp(prefix="opus_build_co_")
     try:

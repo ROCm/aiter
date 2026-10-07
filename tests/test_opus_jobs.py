@@ -26,6 +26,14 @@ class PoolReached(Exception):
     pass
 
 
+def _bounded_worker_count(count, explicit=None, cap=6):
+    """Stand-in for the shared policy: cap the work-bound budget, then clamp."""
+    budget = min(cap, max(1, count))
+    if explicit is None:
+        return budget
+    return min(budget, max(1, explicit))
+
+
 @pytest.mark.parametrize(
     "flags,expected",
     [
@@ -43,9 +51,7 @@ def test_cli_reaches_bounded_compilation(
     builder, flags, expected, monkeypatch, tmp_path
 ):
     monkeypatch.setattr(sys, "argv", [builder.__file__, *flags])
-    monkeypatch.setattr(
-        builder, "get_worker_count_for", lambda count: min(6, max(1, count))
-    )
+    monkeypatch.setattr(builder, "get_worker_count_for", _bounded_worker_count)
     observed = []
 
     def pool(*args, **kwargs):
@@ -91,7 +97,11 @@ def test_device_python_api_and_work_count_ceiling(monkeypatch):
     monkeypatch.setattr(module, "_find_hipcc", lambda: "unused")
     monkeypatch.setattr(module, "_detect_arch", lambda: "gfx1250")
     monkeypatch.setattr(module, "_CU_SOURCES", ["test_mfma_f16.cu"])
-    monkeypatch.setattr(module, "get_worker_count_for", lambda count: min(8, count))
+    monkeypatch.setattr(
+        module,
+        "get_worker_count_for",
+        lambda count, explicit=None: _bounded_worker_count(count, explicit, cap=8),
+    )
     with patch(
         "concurrent.futures.ProcessPoolExecutor", side_effect=PoolReached
     ) as pool, pytest.raises(PoolReached):
