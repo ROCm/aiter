@@ -1,24 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Single-process harness: one process driving every TP GPU (no torchrun).
-
-Used by ``test_mega_moe_TP.py --single-process`` and the tuner:
-
-* :class:`PeerArenaGroup`: the in-process group for ``SymmetricArena`` (peer
-  access instead of IPC);
-* :func:`flydsl_multi_device`: lets one compiled flydsl kernel launch on every
-  device of the process (flydsl binds an artifact to the device it loaded on);
-* :class:`P2PGroup`: one-shot collectives for the split baseline's AllGather /
-  ReduceScatter / AllReduce (the multi-process one-shot collectives need one
-  process per rank). Each call is one launch per
-rank: the sender pushes its rows into every peer's staging buffer with
-system-scope stores, raises one epoch flag per (peer, CTA), and the receiver
-reads its staging back with cache-bypassing loads once its flags are up --
-the same design as aiter's one-shot kernels.
-
-Staging is per call site and double-buffered on the epoch parity; epochs live
-on the device, so CUDA-graph replays stay correct.
-"""
+"""Single-process TP harness (peer access, no torchrun) for bench_mega_moe_TP.py
+--single-process and tune_mega_moe_tp.py: the arena group, flydsl multi-device
+patch and one-shot P2P AllGather / ReduceScatter / AllReduce."""
 
 from __future__ import annotations
 
@@ -46,14 +30,11 @@ NCTA = 128
 NCTA_MAX = 512
 AUX_SYS = 1 | 16
 KIND_AG, KIND_RS, KIND_AR = 0, 1, 2
-POLL_LIMIT = 1 << 24  # a peer that never shows up: give up instead of hanging the GPU
+POLL_LIMIT = 1 << 24
 traced = ASTRewriter.transform
 
 
 class PeerArenaGroup:
-    """Every rank of a TP group driven by this one process (peer access, no IPC).
-    Pass it as ``group=``; the rank is the device's index in ``devices``."""
-
     def __init__(self, devices):
         from aiter.ops.flydsl.kernels.symmetric_arena import _hip
 
@@ -68,7 +49,7 @@ class PeerArenaGroup:
             for peer in self.devices:
                 if peer != d:
                     err = hip.hipDeviceEnablePeerAccess(peer.index, 0)
-                    if err not in (0, 704):  # 704: already enabled
+                    if err not in (0, 704):
                         raise RuntimeError(
                             f"hipDeviceEnablePeerAccess({d} -> {peer}) = {err}"
                         )
@@ -100,8 +81,6 @@ class PeerArenaGroup:
 
 
 def flydsl_multi_device() -> None:
-    """Patch flydsl (private API) so one artifact runs on every device: calls
-    are serialized, and each device gets its own loaded copy of the module."""
     from flydsl.compiler import jit_executor, jit_function
 
     art_cls = jit_executor.CompiledArtifact
@@ -468,11 +447,9 @@ SITE_FLAG_INTS = 2 * MAX_TP * NCTA_MAX + NCTA_MAX
 
 
 class _Site:
-
     def __init__(self, group, idx, kind, row_bytes):
         devices, tp, mmax = group.devices, group.tp, group.mmax
         nstage = 4 if kind == KIND_AR else 2
-        self.kind, self.row_bytes, self.mmax = kind, row_bytes, mmax
         self.stage = [
             torch.empty(nstage * MAX_TP * mmax * row_bytes, dtype=torch.uint8, device=d)
             for d in devices
@@ -485,16 +462,12 @@ class _Site:
         ]
         sp = [t.data_ptr() for t in self.stage] + [0] * (MAX_TP - tp)
         fp = [t.data_ptr() for t in self.flags] + [0] * (MAX_TP - tp)
-        # pinned + non_blocking: a pageable copy would wait for the peer's
-        # stream, which may be spinning in a collective this rank has not
-        # joined yet
         self._host = [torch.tensor(v, dtype=torch.int64).pin_memory() for v in (sp, fp)]
         self.stage_tab = [self._host[0].to(d, non_blocking=True) for d in devices]
         self.flag_tab = [self._host[1].to(d, non_blocking=True) for d in devices]
 
 
 class P2PGroup:
-
     def __init__(self, devices, max_local_tokens: int):
         self.devices = [torch.device(d) for d in devices]
         self.tp = len(self.devices)
@@ -528,9 +501,6 @@ class P2PComm:
         self.tp_size = group.tp
         self.device = group.devices[rank]
 
-    def describe(self) -> str:
-        return "p2p-single-process"
-
     def _launch(self, kind, x, out, rows_per_rank):
         row_bytes = x[0].numel() * x.element_size() if x.dim() > 1 else x.element_size()
         key = (kind, row_bytes, x.dtype, tuple(out.shape[1:]))
@@ -552,25 +522,14 @@ class P2PComm:
         )
         return out
 
-    def all_gather(self, x: torch.Tensor, out: torch.Tensor | None = None):
+    def all_gather(self, x: torch.Tensor, out: torch.Tensor):
         x = x.contiguous()
-        m = x.shape[0]
-        if out is None:
-            out = torch.empty(
-                (m * self.tp_size,) + tuple(x.shape[1:]), dtype=x.dtype, device=x.device
-            )
-        return self._launch(KIND_AG, x, out, m)
+        return self._launch(KIND_AG, x, out, x.shape[0])
 
-    def reduce_scatter(self, x: torch.Tensor, out: torch.Tensor | None = None):
+    def reduce_scatter(self, x: torch.Tensor, out: torch.Tensor):
         x = x.contiguous()
-        m = x.shape[0] // self.tp_size
-        if out is None:
-            out = torch.empty((m,) + tuple(x.shape[1:]), dtype=x.dtype, device=x.device)
-        return self._launch(KIND_RS, x, out, m)
+        return self._launch(KIND_RS, x, out, x.shape[0] // self.tp_size)
 
-    def all_reduce(self, x: torch.Tensor, out: torch.Tensor | None = None):
+    def all_reduce(self, x: torch.Tensor, out: torch.Tensor):
         x = x.contiguous()
-        m = x.shape[0] // self.tp_size
-        if out is None:
-            out = torch.empty_like(x)
-        return self._launch(KIND_AR, x, out, m)
+        return self._launch(KIND_AR, x, out, x.shape[0] // self.tp_size)

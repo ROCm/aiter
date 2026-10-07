@@ -1,78 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Tensor-parallel MoE layer as one kernel (MegaMoE TP).
+"""Tensor-parallel MoE layer as one kernel (MegaMoE TP), gfx950.
 
-Experts are replicated over the TP group and ``inter_dim`` is sharded. One
-launch runs the collectives around GEMM1 + activation + GEMM2 of this rank's
-inter slice (the intermediate stays in LDS), dispatched on ``comm_mode``:
-
-* ``"ag_rs"`` (default): tokens enter sequence-parallel (each rank its own
-  ``m`` tokens and their routing); the layer all-gathers them, sums each
-  token's top-k routes and reduce-scatters back to the owner::
-
-    y_local = moe(x_local, topk_weights, topk_ids)   # [m, H] -> [m, H]
-
-* ``"rs"``: every rank holds the same ``M = tp * m`` tokens and routing (all
-  gathered outside); the output is reduce-scattered (rank r gets rows
-  ``r*m : (r+1)*m``)::
-
-    y_local = moe(x, topk_weights, topk_ids)[r*m:(r+1)*m]   # [M, H] -> [m, H]
-
-* ``"ar"``: the standard TP MoE layer: every rank holds the same full hidden
-  state ``x`` and routing of all ``M`` tokens; only the output is
-  all-reduced (identical on every rank)::
-
-    y = moe(x, topk_weights, topk_ids)               # [M, H] -> [M, H]
-
-* ``"ar_ar"``: as ``"ar"``, but each rank holds a bf16 *partial* of ``x``
-  (e.g. the output of a row-parallel projection before its all-reduce); the
-  layer all-reduces the input too. Routing must be the same on every rank.
-
-Weights are MXFP4 (``shuffle_weight(16, 16)`` + ``e8m0_shuffle`` scales), the
-layout the flydsl MoE kernels take. See ``kernels/mega_moe_tp/mega_moe_tp_kernel.py``.
-
-Contract (the kernel synchronizes the ranks through flags in each other's memory):
-
-* ``forward`` is a collective: every rank of the group calls it the same number
-  of times, in the same order, with the same number of local tokens ``m``
-  (ag_rs: pad to a common ``m``); in ``rs`` / ``ar`` / ``ar_ar`` every rank
-  passes the same routing (and, ``rs`` / ``ar``, the same ``x``).
-  ``AITER_MEGAMOE_TP_CHECK=1`` verifies both per call (one collective). ``m == 0`` returns an empty tensor. A rank
-  that falls out of step makes the waits time out (2 s each); ``poll_errors`` /
-  ``check_errors`` (or ``AITER_MEGAMOE_TP_CHECK=1``: check after every eager
-  forward) report it, and ``reset()`` (collective) restarts the layer.
-* ``topk_ids`` outside ``[0, experts)`` are masked (the route adds nothing);
-  a token must not repeat an expert.
-* The result is a view of an internal buffer, valid until the next forward of
-  this layer (ar / ar_ar: peers write into it during that forward); pass
-  ``out=`` to get it in a buffer of your own (ag_rs / rs: written in place).
-* One instance can serve several layers of the same shape (``set_weights``
-  before each forward): they share its scratch and cross-rank state, so their
-  forwards form one collective sequence and a result is valid only until the
-  next forward of any of them.
-* The kernel keeps every CU busy and spins on peers: do not overlap it with
-  another persistent / communication kernel (e.g. another layer's, a custom
-  all-reduce on a side stream).
-* The first forward with a new launch config compiles and synchronizes the
-  ranks; ``prepare(local_token_counts)`` does that ahead of CUDA graph capture.
-* ``comm_dtype="fp8"`` (default): the reduce-scatter / all-reduce partials and
-  the per-route GEMM2 rows are MXFP8 (E4M3 + E8M0 per 32): rel L2 ~0.038
-  against a bf16-math torch reference (glm5 / m3), vs ~0.003 with ``"bf16"``
-  (bf16 partials and route rows, no LL packets: ~3-14% slower, more at large M).
-* ``ar_gather`` (ar / ar_ar, from ~128 tokens up, where the all-reduce runs as
-  reduce-scatter + all-gather): ``"bf16"``, ``"fp8"`` or ``"auto"`` (default:
-  fp8 from ``AITER_MEGAMOE_TP_AG8_MIN`` = 512 global tokens up): the gathered
-  rows travel as MXFP8, half the bytes (e.g. glm5 tp4 2048 tokens 472 -> 430 us)
-  at rel L2 ~0.046 instead of ~0.038 against the torch reference.
-* ``schedule``: ``"tuned"`` (default) takes the tuned launch configs, tuned on
-  balanced routing; ``"dynamic"`` runs every batch of up to 256 tokens on the
-  dynamic schedule, which plans over the experts actually routed and splits hot
-  ones into row chunks (model routing leaves many experts idle and a few hot).
-* ``act_dtype``: ``"fp4"`` (default) quantizes the input and the GEMM2
-  intermediate to MXFP4; ``"fp8"`` (``schedule="dynamic"``, up to 256 tokens)
-  to MXFP8 (E4M3), the GEMMs then run E2M1 weights x E4M3 activations: closer
-  to bf16-activation MoE paths at twice the activation traffic.
-* Launch epochs are int32: ``reset()`` at least every 2**31 forwards per layer.
+Experts are replicated over the TP group and ``inter_dim`` is sharded; one launch
+runs the collectives around GEMM1 + activation + GEMM2 of this rank's inter slice.
+``comm_mode``: ``"ag_rs"`` (sequence-parallel in/out), ``"rs"`` (replicated in,
+reduce-scattered out), ``"ar"`` (replicated in, all-reduced out), ``"ar_ar"``
+(partial in, all-reduced out). Weights are MXFP4 (``shuffle_weight(16, 16)`` +
+``e8m0_shuffle``). ``forward`` is a collective; ``prepare`` before graph capture.
 """
 
 from __future__ import annotations
@@ -120,8 +55,7 @@ class MegaMoeTPConfig:
 
 
 class MegaMoeTP:
-    """Per layer: scratch of about ``max_local_tokens * world_size * topk *
-    model_dim * 2`` bytes plus the symmetric arena."""
+    """One fused TP MoE layer (see the module docstring)."""
 
     def __init__(
         self,
@@ -179,11 +113,7 @@ class MegaMoeTP:
         tail=None,
         bf16: bool = False,
     ):
-        """ag_rs: x_local [m, H] bf16 (this rank's tokens), topk_* [m, topk].
-        rs / ar: x [M, H] bf16 (all tokens, same on every rank), topk_* [M, topk].
-        ar_ar: x [M, H] bf16 (this rank's partial of every token), topk_* [M, topk]
-        (the same routing on every rank). topk_ids int32, topk_weights float32
-        (others are converted per call). tail / bf16: see MegaMoeTPLayer.forward."""
+        """ag_rs: x [m, H] (own tokens); rs / ar: x [M, H] replicated; ar_ar: x [M, H] partial."""
         return self.engine(x_local, topk_weights, topk_ids, out, tail=tail, bf16=bf16)
 
     __call__ = forward
@@ -200,9 +130,7 @@ class MegaMoeTP:
         self.engine.set_weights(w1, w1_scale, w2, w2_scale)
 
     def prepare(self, local_tokens, tail: bool = False, tail_bf16: bool = False) -> None:
-        """Collective: compile + arm the launch configs of these local token
-        counts (tail / tail_bf16: also their fused-tail variants without / with
-        the bf16 rows, ag_rs)."""
+        """Collective: compile and arm the launch configs of these local token counts."""
         self.engine.prepare(local_tokens, tail, tail_bf16)
 
     def poll_errors(self) -> int:

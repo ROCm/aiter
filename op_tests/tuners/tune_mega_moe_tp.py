@@ -1,18 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Tune the fused TP MegaMoE launch config per model / TP / comm mode / tokens.
-
-Per cell: sweep the :class:`LaunchCfg` variants (row tile, dynamic vs static
-schedule, E4M3 vs bf16 route rows, LL packets), time each (CUDA graph, slowest
-rank, best of --rounds), gate on the torch reference (rel L2 < --rtol, no
-watchdog, replay == eager) and merge the fastest of those within --acc-slack of
-the most accurate into the tuned CSV::
+"""Tune the fused TP MegaMoE launch config per model / TP / comm mode / tokens::
 
     python op_tests/tuners/tune_mega_moe_tp.py --models glm5 m3 \\
         --tokens 8 16 32 64 96 128 256 512 1024 2048 --comm-modes ag_rs ar
 
-One process drives all --tp GPUs (like ``bench_mega_moe_TP.py --single-process``);
-each cell runs in its own subprocess. HIP_VISIBLE_DEVICES pins the GPUs.
+Each cell runs in its own subprocess; HIP_VISIBLE_DEVICES pins the GPUs.
 """
 
 from __future__ import annotations
@@ -98,7 +91,6 @@ def schedules(eng, m: int) -> list[LaunchCfg]:
     rpe = (tot * eng.K + eng.E - 1) // eng.E
     out = []
     for dyn in (False, True):
-        # twice the routes per expert the heuristic (default_config) allows
         if dyn and not (
             tot <= eng.dyn_max and eng.I // 128 >= 2 and tot * eng.K <= 4 * eng.E
         ):
@@ -155,8 +147,9 @@ def merge_csv(path: str, rows: list[dict]) -> None:
 
 
 def tune_cell(a, name: str, mode: str, tok: int) -> dict | None:
-    T._flydsl_multi_device()
-    from p2p_collectives import P2PGroup, PeerArenaGroup
+    from p2p_collectives import P2PGroup, PeerArenaGroup, flydsl_multi_device
+
+    flydsl_multi_device()
 
     tp, m = a.tp, tok // a.tp
     devices = [torch.device("cuda", i) for i in range(tp)]
@@ -171,7 +164,7 @@ def tune_cell(a, name: str, mode: str, tok: int) -> dict | None:
         with torch.cuda.device(c.device):
             weights.append(T.build_sharded_weights(shape, c, tp, 0))
     inputs = [T.make_inputs(shape, c, tp, tok, 0, "balanced", mode) for c in ctxs]
-    split_cls = T.SplitTpMoeAR if mode == "ar_ar" else T.SplitTpMoe
+    split_cls = T.SplitTpMoeAR if mode in T.REPLICATED else T.SplitTpMoe
     split = []
     for r, c in enumerate(ctxs):
         with torch.cuda.device(c.device):
@@ -210,11 +203,11 @@ def tune_cell(a, name: str, mode: str, tok: int) -> dict | None:
                 print(f"{tag} {cfg}: rejected errs={errs} rel_l2={err:.4f}", flush=True)
                 return not any(errs)
             us, rep = T._sp_time_graph(devices, lambda r: fused[r](inputs[r]), targs)
-            rerr = T._sp_rel_l2(rep, yf) if rep is not None else float("nan")
+            rerr = T._sp_rel_l2(rep, yf)
             if not rerr < 1e-3:
                 print(f"{tag} {cfg}: rejected replay rel_l2={rerr:.4f}", flush=True)
                 return True
-        except Exception as exc:  # noqa: BLE001 - a variant that fails is skipped
+        except Exception as exc:  # noqa: BLE001
             print(f"{tag} {cfg}: failed {exc}", flush=True)
             return True
         print(f"{tag} {cfg}: {us:.1f} us (rel_l2 vs torch {err:.4f})", flush=True)

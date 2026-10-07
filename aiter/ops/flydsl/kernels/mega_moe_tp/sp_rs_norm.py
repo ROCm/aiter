@@ -1,16 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Sequence-parallel reduce-scatter + residual add + GemmaRMSNorm, one kernel.
-
-Every rank holds its bf16 partial ``part`` [T, H] of every token (e.g. a
-row-parallel output projection); rank r owns rows ``r*m : (r+1)*m``
-(``T = tp * m``). Each rank sends the other ranks' rows of its partial as int8
-with an fp32 scale per 32 columns (or MXFP8; about half the bf16 bytes over the
-links) into their symmetric arena, then every rank sums its own rows -- its own
-partial unquantized, the peers' dequantized -- adds ``res`` and writes
-``res_out = sum`` and ``out = GemmaRMSNorm(sum; w, eps)`` (bf16, its own rows
-only); optionally also the MoE router of its own rows (see compile_sp_rs_norm).
-"""
+"""Sequence-parallel int8 reduce-scatter + residual add + RMSNorm (+ MoE router), one kernel."""
 
 from __future__ import annotations
 
@@ -24,27 +14,25 @@ import torch.distributed as dist
 from flydsl._mlir import ir
 from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import gpu, range_constexpr, rocdl
-
-const_expr = fx.const_expr
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
 from .. import buffer_ops
-from ..mxfp4_gemm_common import _e8m0_from_amax, _fabs_f32
+from ..mxfp4_gemm_common import _fabs_f32
 from ..symmetric_arena import SymmetricArena
 from ..tensor_shim import _preload_compiled, _run_compiled
 
 __all__ = ["SpRsNorm"]
 
 MAX_TP = 8
-NB = 256  # CTAs
-NTH = 256  # threads per CTA
-NALL = NTH
-KS_MAX = 16  # router: K slices per 16-row tile
+NB = 256
+NTH = 256
+KS_MAX = 16
 AUX_SYS = 1 | 16
 DEADLINE = 200_000_000
 
 traced = ASTRewriter.transform
+const_expr = fx.const_expr
 
 
 def _attr(v):
@@ -55,9 +43,9 @@ def _u(v):
     return v.ir_value() if hasattr(v, "ir_value") else v
 
 
-ZT = 16  # router: rows per tile
-NRT_MAX = 128  # router row tiles (m / 16)
-ROWF = NRT_MAX * 16  # router row flags (m)
+ZT = 16
+NRT_MAX = 128
+ROWF = NRT_MAX * 16
 
 
 @functools.cache
@@ -65,7 +53,6 @@ def compile_sp_rs_norm(
     H: int,
     tp: int,
     eps: float,
-    i8: bool = True,
     E: int = 0,
     topk: int = 0,
     scale: float = 1.0,
@@ -73,33 +60,19 @@ def compile_sp_rs_norm(
     gemma: bool = True,
     logit_bf16: bool = True,
 ):
-    """i8: int8 + fp32 scale per 32 columns (~0.5% rel error); else MXFP8
-    (E4M3 + E8M0, ~2%: too coarse for an attention output).
-    gemma: GemmaRMSNorm (scale 1 + w), else RMSNorm (w).
-
-    E > 0: also the router of the own rows: once a 16-row tile of the normed
-    rows is out, K slices of its logits (bf16 MFMA against Wg [E, H], all E
-    experts) on whichever CTAs take them; the last slice of a tile sums them
-    and runs the sigmoid + bias top-k of aiter's topk_gating (renormalized,
-    times ``scale``) plus one shared expert (id E, weight shared_w).
-    logit_bf16: the logits rounded to bf16 first (a bf16 gate GEMM), else
-    fp32 (an fp32-output one)."""
     RT = E > 0
-    EPL = E // 64  # router: experts per lane
+    EPL = E // 64
     assert not RT or (E % 64 == 0 and EPL in (2, 4) and topk <= 64)
     assert H % 256 == 0
-    NP = H // 8  # 8-column pieces of a row
+    NP = H // 8
     KS_DIVS = [d for d in range(KS_MAX, 1, -1) if (H // 128) % d == 0]
-    # router: K steps (32 columns per wave) of a slice prefetched; a slice
-    # has at least H / KS_MAX / 4 / 32 of them
-    # (E > 128: fewer, the accumulators of all E // 16 expert tiles are live)
     NPF = min(3 if E <= 128 else 1, H // KS_MAX // 4 // 32)
     PIT = (NP + NTH - 1) // NTH
     assert NP % NTH == 0
     def fbits(v):
         return f"{struct.unpack('<I', struct.pack('<f', v))[0]:x}"
 
-    name = f"sp_rs_norm_h{H}_tp{tp}_e{fbits(eps)}" + ("_i8" if i8 else "") + (
+    name = f"sp_rs_norm_h{H}_tp{tp}_e{fbits(eps)}_i8" + (
         f"_rt{E}k{topk}s{fbits(scale)}w{fbits(shared_w)}" if RT else ""
     ) + ("" if gemma else "_rms") + ("_lf32" if RT and not logit_bf16 else "")
 
@@ -165,19 +138,6 @@ def compile_sp_rs_norm(
             [bf16_bits(acc[2 * q]) | (bf16_bits(acc[2 * q + 1]) << i32(16)) for q in range(4)], fx.Int32
         )
 
-    def fp8x4_pack(f, qs):
-        zero = fx.Vector.filled(2, 0, fx.Int16)
-        w = rocdl.cvt_scalef32_pk_fp8_f32(T.vec(2, T.i16), _u(zero), _u(f[0]), _u(f[1]), _u(qs), False)
-        w = rocdl.cvt_scalef32_pk_fp8_f32(T.vec(2, T.i16), w, _u(f[2]), _u(f[3]), _u(qs), True)
-        return fx.Int32(fx.Vector(w).bitcast(fx.Int32)[0])
-
-    def fp8x4_unpack(d, sc):
-        out = []
-        for sel in (False, True):
-            v = fx.Vector(rocdl.cvt_scalef32_pk_f32_fp8(T.vec(2, T.f32), _u(i32(d)), _u(sc), sel))
-            out += [fx.Float32(v[0]), fx.Float32(v[1])]
-        return out
-
     def i8x4_pack(f, inv):
         w = i32(0)
         for k in range_constexpr(4):
@@ -189,12 +149,9 @@ def compile_sp_rs_norm(
     def i8x4_unpack(d, sc):
         out = []
         for k in range_constexpr(4):
-            b = (fx.Int32(d) << i32(24 - 8 * k)) >> i32(24)  # sign-extended byte k
+            b = (fx.Int32(d) << i32(24 - 8 * k)) >> i32(24)
             out.append(b.to(fx.Float32) * sc)
         return out
-
-    def e8_scale(e8):
-        return ((fx.Int32(e8) & i32(0xFF)) << i32(23)).bitcast(fx.Float32)
 
     def wave_red(v, lane, op):
         for k in (1, 2, 4, 8, 16, 32):
@@ -204,7 +161,7 @@ def compile_sp_rs_norm(
     def fadd(x, y):
         return (x.bitcast(fx.Float32) + y.bitcast(fx.Float32)).bitcast(fx.Int32)
 
-    LDSB = 128 + (NTH // 64) * 64 * (E // 16 if E else 1) * 16  # (router: the waves' partials)
+    LDSB = 128 + (NTH // 64) * 64 * (E // 16 if E else 1) * 16
     Shared = fx.struct(type("Shared", (), {"__annotations__": {"buf": fx.Array[fx.Int8, LDSB, 16]}}))
 
     def lds_f(L, off):
@@ -218,10 +175,9 @@ def compile_sp_rs_norm(
                      fx.inttoptr(fx.PointerType.get(T.i32, fx.AddressSpace.Shared, 4), L + off))
 
     def zflag(a, rt, ks):
-        return fx.Int64(a["ctrl"]) + fx.Int64((i32(5 * NB + ROWF) + rt * i32(KS_MAX) + ks) * i32(4))
+        return fx.Int64(a["ctrl"]) + fx.Int64((i32(NB + ROWF) + rt * i32(KS_MAX) + ks) * i32(4))
 
     def rt_tiles(m):
-        # the most K slices (a divisor of H / 128) with a CTA per task
         rt = m // i32(ZT)
         cap = i32(NB) // fx.max(rt, i32(1))
         ks = i32(1)
@@ -231,28 +187,21 @@ def compile_sp_rs_norm(
 
     @traced
     def router_tasks(L, a, tid):
-        # task t = (row tile rt, K slice k) on CTA NB - 1 - t % NB: the slice's partial
-        # logits of the 16 rows for every expert (bf16 MFMA, the 4 waves each
-        # a quarter of the slice, summed in LDS) into the scratch; the last
-        # slice of a tile to land sums them all and routes the tile's rows
         m = a["m"]
         bid = i32(gpu.block_id("x"))
         lane = tid % i32(64)
         w = tid // i32(64)
         RT, KS = rt_tiles(m)
-        kw = i32(H) // KS  # columns per slice (a multiple of 128)
+        kw = i32(H) // KS
         ro = rsrc(a["out"])
         rg = rsrc(a["wg"])
         rzp = rsrc(a["zp"])
-        # (tasks from the last CTA down: at small m those only send, if that)
         for t_ in range(i32(NB - 1) - bid, RT * KS, i32(NB)):
             t = i32(t_)
             rt = t // KS
             ks = t - rt * KS
             row = a["rank"] * m + rt * i32(ZT) + lane % i32(16)
             k0 = ks * kw + w * (kw // i32(4))
-            # the slice's first NPF K steps of the gate weight, in flight while
-            # the tile's rows are reduced
             pf = []
             for j in range_constexpr(NPF):
                 kc = k0 + i32(j * 32) + (lane // i32(16)) * i32(8)
@@ -260,10 +209,9 @@ def compile_sp_rs_norm(
                     bld(rg, ((i32(n * 16) + lane % i32(16)) * i32(H) + kc) * i32(2), T.vec(4, T.i32))
                     for n in range(E // 16)
                 ])
-            # the tile's rows are out (row r: flag of its reducing CTA)
             if tid < i32(ZT):
                 r = rt * i32(ZT) + tid
-                addr = fx.Int64(a["ctrl"]) + fx.Int64((i32(5 * NB) + r) * i32(4))
+                addr = fx.Int64(a["ctrl"]) + fx.Int64((i32(NB) + r) * i32(4))
                 t0 = now()
                 cur = g_ld_sys(addr)
                 while (cur < a["epoch"]) & ((now() - t0) < fx.Int64(DEADLINE)):
@@ -299,8 +247,6 @@ def compile_sp_rs_norm(
                 for i in range_constexpr(4):
                     lds_stf(L, i32(128) + (((w * i32(E // 16) + i32(n)) * i32(64) + lane) * i32(4) + i32(i)) * i32(4), fx.Vector(res[n])[i])
             gpu.barrier()
-            # wave 0 sums the waves; lane l, element i: row 4 (l // 16) + i,
-            # expert 16 n + l % 16
             if w == i32(0):
                 for n in range_constexpr(E // 16):
                     for i in range_constexpr(4):
@@ -314,8 +260,6 @@ def compile_sp_rs_norm(
                 asm("s_waitcnt vmcnt(0)")
                 if lane == i32(0):
                     g_st_sys(zflag(a, rt, ks), a["epoch"])
-                # every slice of the tile landed: this slice's CTA routes rows
-                # ks, ks + KS, ... of it
                 if lane < KS:
                     t0 = now()
                     cur = g_ld_sys(zflag(a, rt, lane))
@@ -329,14 +273,12 @@ def compile_sp_rs_norm(
 
     @traced
     def router_row(a, lane, rt, rl, KS):
-        # (one wave) row rl of tile rt: its logits (the slices' sum), top-k
         rzp = rsrc(a["zp"])
         rb = rsrc(a["bias"])
         r = rt * i32(ZT) + rl
         vals, orig, idxs = [], [], []
         for i in range_constexpr(EPL):
             e = lane + i32(i * 64)
-            # every slice's partial in flight at once (slices >= KS: none)
             vs = []
             for k in range_constexpr(KS_MAX):
                 kc = fx.min(i32(k), KS - i32(1))
@@ -346,7 +288,6 @@ def compile_sp_rs_norm(
             for live, v in vs:
                 x = x + live.select(v, fx.Float32(0.0))
             if const_expr(logit_bf16):
-                # (the reference rounds the gate GEMM output to bf16)
                 x = fx.Float32(x).to(fx.BFloat16).to(fx.Float32)
             sc = fx.Float32(1.0) / (fx.Float32(1.0) + fx.Float32(fmath.exp2(_u(x * fx.Float32(-1.4426950408889634)))))
             orig.append(sc)
@@ -354,7 +295,6 @@ def compile_sp_rs_norm(
             vals.append(sc + b)
             idxs.append(e)
         if const_expr(EPL == 2):
-            # thread-local sort, descending (stable: the lower expert first on ties)
             sw = vals[1] > vals[0]
             v0, v1 = sw.select(vals[1], vals[0]), sw.select(vals[0], vals[1])
             o0, o1 = sw.select(orig[1], orig[0]), sw.select(orig[0], orig[1])
@@ -379,8 +319,6 @@ def compile_sp_rs_norm(
                 my_id = (lane == i32(k)).select(wid, my_id)
                 my_w = (lane == i32(k)).select(wgt, my_w)
         else:
-            # per pick: each lane's best remaining expert, the wave's best of
-            # those (the lowest lane on ties); the winner drops it
             tot = fx.Float32(0.0)
             my_id = i32(0)
             my_w = fx.Float32(0.0)
@@ -432,50 +370,36 @@ def compile_sp_rs_norm(
 
     @traced
     def send_rows(a, tid):
-        # items (dest d != rank, row r) = d * m + r, CTA i % NB; a thread takes
-        # pieces tid, tid + NTH, ... (8 columns each); 4 consecutive lanes hold
-        # a 32-column block
         m = a["m"]
         bid = i32(gpu.block_id("x"))
         lane = tid % i32(64)
         rp = rsrc(a["part"])
-        # items it = r * (tp - 1) + k: row r for peer rank + 1 + k; CTA it % NB
-        # (consecutive items go to different peers: every link busy, every
-        # CTA with work)
         for it_ in range(bid, m * i32(tp - 1), i32(NB)):
             it = i32(it_)
             r = it // i32(tp - 1)
             k = it - r * i32(tp - 1)
             d = (a["rank"] + i32(1) + k) % i32(tp)
             i = d * m + r
-            if const_expr(True):
-                peer = a["peer"][0]
-                for j in range_constexpr(1, tp):
-                    peer = (d == i32(j)).select(a["peer"][j], peer)
-                rx = rsrc(fx.Int64(peer) + fx.Int64(a["off_x"]))
-                rsx = rsrc(fx.Int64(peer) + fx.Int64(a["off_s"]))
-                slot = a["rank"] * m + r
-                for k in range_constexpr(PIT):
-                    p = tid + i32(k * NTH)
-                    f = bf16x8(bld(rp, (i * i32(H) + p * i32(8)) * i32(2), T.vec(4, T.i32)))
-                    am = _fabs_f32(f[0])
-                    for x in f[1:]:
-                        am = am.maximumf(_fabs_f32(x))
-                    am = am.maximumf(am.shuffle_xor(i32(1), i32(64)))
-                    am = am.maximumf(am.shuffle_xor(i32(2), i32(64)))
-                    if const_expr(i8):
-                        sc = am.maximumf(fx.Float32(1e-30)) / fx.Float32(127.0)
-                        inv = fx.Float32(1.0) / sc
-                        dv = fx.Vector.from_elements([i8x4_pack(f[0:4], inv), i8x4_pack(f[4:8], inv)], fx.Int32)
-                        bst(dv, rx, slot * i32(H) + p * i32(8), AUX_SYS)
-                        if (lane & i32(3)) == i32(0):
-                            bst(sc.bitcast(fx.Int32), rsx, (slot * i32(H // 32) + p // i32(4)) * i32(4), AUX_SYS)
-                    else:
-                        e8, qs = _e8m0_from_amax(am, max_norm=448.0)
-                        dv = fx.Vector.from_elements([fp8x4_pack(f[0:4], qs), fp8x4_pack(f[4:8], qs)], fx.Int32)
-                        bst(dv, rx, slot * i32(H) + p * i32(8), AUX_SYS)
-                        if (lane & i32(3)) == i32(0):
-                            bst(fx.Int8(fx.Int32(e8) & i32(0xFF)), rsx, slot * i32(H // 32) + p // i32(4), AUX_SYS)
+            peer = a["peer"][0]
+            for j in range_constexpr(1, tp):
+                peer = (d == i32(j)).select(a["peer"][j], peer)
+            rx = rsrc(fx.Int64(peer) + fx.Int64(a["off_x"]))
+            rsx = rsrc(fx.Int64(peer) + fx.Int64(a["off_s"]))
+            slot = a["rank"] * m + r
+            for k in range_constexpr(PIT):
+                p = tid + i32(k * NTH)
+                f = bf16x8(bld(rp, (i * i32(H) + p * i32(8)) * i32(2), T.vec(4, T.i32)))
+                am = _fabs_f32(f[0])
+                for x in f[1:]:
+                    am = am.maximumf(_fabs_f32(x))
+                am = am.maximumf(am.shuffle_xor(i32(1), i32(64)))
+                am = am.maximumf(am.shuffle_xor(i32(2), i32(64)))
+                sc = am.maximumf(fx.Float32(1e-30)) / fx.Float32(127.0)
+                inv = fx.Float32(1.0) / sc
+                dv = fx.Vector.from_elements([i8x4_pack(f[0:4], inv), i8x4_pack(f[4:8], inv)], fx.Int32)
+                bst(dv, rx, slot * i32(H) + p * i32(8), AUX_SYS)
+                if (lane & i32(3)) == i32(0):
+                    bst(sc.bitcast(fx.Int32), rsx, (slot * i32(H // 32) + p // i32(4)) * i32(4), AUX_SYS)
 
     @traced
     def post_flags(L, a, tid):
@@ -491,9 +415,7 @@ def compile_sp_rs_norm(
 
     @traced
     def wait_row(a, tid, r):
-        # the CTA that sent row r to this rank, on every other rank
         if tid < i32(tp):
-            # on rank tid, this rank is peer k = rank - tid - 1 (mod tp)
             k = (a["rank"] - tid - i32(1) + i32(tp)) % i32(tp)
             src_cta = (r * i32(tp - 1) + k) % i32(NB)
             addr = a["mine"] + fx.Int64(a["off_f"]) + fx.Int64((tid * i32(NB) + src_cta) * i32(4))
@@ -504,7 +426,6 @@ def compile_sp_rs_norm(
                     rocdl.s_sleep(1)
                     cur = g_ld_sys(addr)
         gpu.barrier()
-
 
     @traced
     def reduce_rows(L, a, tid):
@@ -523,7 +444,7 @@ def compile_sp_rs_norm(
             g = a["rank"] * m + r
             fs = []
             ss = fx.Float32(0.0)
-            act = tid < i32(NTH)  # (the router waves only join the barriers)
+            act = tid < i32(NTH)
             for k in range_constexpr(PIT):
                 p = fx.min(tid, i32(NTH - 1)) + i32(k * NTH)
                 off = (g * i32(H) + p * i32(8)) * i32(2)
@@ -531,20 +452,15 @@ def compile_sp_rs_norm(
                 rv = bf16x8(bld(rr, off, T.vec(4, T.i32)))
                 f = [x + y for x, y in zip(f, rv)]
                 for s in range_constexpr(tp):
-                    if s != 0 or True:
-                        src = i32(s)
-                        live = src != a["rank"]
-                        slot = src * m + r
-                        d = fx.Vector(bld(rx, slot * i32(H) + p * i32(8), T.vec(2, T.i32), AUX_SYS))
-                        if const_expr(i8):
-                            sc = fx.Int32(
-                                bld(rsx, (slot * i32(H // 32) + p // i32(4)) * i32(4), T.i32, AUX_SYS)
-                            ).bitcast(fx.Float32)
-                            v = i8x4_unpack(d[0], sc) + i8x4_unpack(d[1], sc)
-                        else:
-                            sc = e8_scale(bld(rsx, slot * i32(H // 32) + p // i32(4), T.i8, AUX_SYS))
-                            v = fp8x4_unpack(fx.Int32(d[0]), sc) + fp8x4_unpack(fx.Int32(d[1]), sc)
-                        f = [x + live.select(y, fx.Float32(0.0)) for x, y in zip(f, v)]
+                    src = i32(s)
+                    live = src != a["rank"]
+                    slot = src * m + r
+                    d = fx.Vector(bld(rx, slot * i32(H) + p * i32(8), T.vec(2, T.i32), AUX_SYS))
+                    sc = fx.Int32(
+                        bld(rsx, (slot * i32(H // 32) + p // i32(4)) * i32(4), T.i32, AUX_SYS)
+                    ).bitcast(fx.Float32)
+                    v = i8x4_unpack(d[0], sc) + i8x4_unpack(d[1], sc)
+                    f = [x + live.select(y, fx.Float32(0.0)) for x, y in zip(f, v)]
                 if act:
                     bst(pack_bf16x8(f), ro, off)
                 for x in f:
@@ -564,13 +480,12 @@ def compile_sp_rs_norm(
                         AUX_SYS if RT else 0,
                     )
             if const_expr(RT):
-                # the row is out (written through): the router may take it
                 asm("s_waitcnt vmcnt(0)")
                 gpu.barrier()
                 if tid == i32(0):
-                    g_st_sys(fx.Int64(a["ctrl"]) + fx.Int64((i32(5 * NB) + r) * i32(4)), a["epoch"])
+                    g_st_sys(fx.Int64(a["ctrl"]) + fx.Int64((i32(NB) + r) * i32(4)), a["epoch"])
 
-    @flyc.kernel(name=name, known_block_size=[NALL, 1, 1])
+    @flyc.kernel(name=name, known_block_size=[NTH, 1, 1])
     def sp_rs_norm_kernel(
         part: fx.Int64,
         res: fx.Int64,
@@ -591,7 +506,6 @@ def compile_sp_rs_norm(
         off_f: fx.Int64,
         rank: fx.Int32,
         m: fx.Int32,
-        mmax: fx.Int32,
         wg: fx.Int64,
         bias: fx.Int64,
         ids: fx.Int64,
@@ -612,28 +526,19 @@ def compile_sp_rs_norm(
             "part": part, "res": res, "res_out": res_out, "out": out, "w": w,
             "peer": peers, "mine": fx.Int64(mine), "off_x": off_x, "off_s": off_s,
             "off_f": off_f, "rank": rank, "m": m, "epoch": epoch, "ctrl": ctrl,
-            "mmax": mmax, "wg": wg, "bias": bias, "ids": ids, "tw": tw,
+            "wg": wg, "bias": bias, "ids": ids, "tw": tw,
             "zp": zp,
         }
-        st = fx.Int64(ctrl) + fx.Int64((i32(NB) + bid * i32(4)) * i32(4))
         if tid < i32(4):
-            # the subset barriers' counters
             fx.ptr_store(_u(i32(0)), fx.inttoptr(fx.PointerType.get(T.i32, fx.AddressSpace.Shared, 4), L + tid * i32(4)))
         gpu.barrier()
-        if tid == i32(0):
-            fx.generic_store(gptr(st), fx.Int32(now()))
         send_rows(a, tid)
         post_flags(L, a, tid)
-        if tid == i32(0):
-            fx.generic_store(gptr(st + fx.Int64(4)), fx.Int32(now()))
         reduce_rows(L, a, tid)
-        if tid == i32(0):
-            fx.generic_store(gptr(st + fx.Int64(8)), fx.Int32(now()))
         if const_expr(RT):
             router_tasks(L, a, tid)
         if tid == i32(0):
             fx.generic_store(gptr(ea), epoch)
-            fx.generic_store(gptr(st + fx.Int64(12)), fx.Int32(now()))
 
     @flyc.jit
     def launch(
@@ -641,27 +546,20 @@ def compile_sp_rs_norm(
         ctrl: fx.Int64, p0: fx.Int64, p1: fx.Int64, p2: fx.Int64, p3: fx.Int64,
         p4: fx.Int64, p5: fx.Int64, p6: fx.Int64, p7: fx.Int64,
         off_x: fx.Int64, off_s: fx.Int64, off_f: fx.Int64, rank: fx.Int32, m: fx.Int32,
-        mmax: fx.Int32, wg: fx.Int64, bias: fx.Int64, ids: fx.Int64, tw: fx.Int64,
+        wg: fx.Int64, bias: fx.Int64, ids: fx.Int64, tw: fx.Int64,
         zp: fx.Int64,
         stream: fx.Stream,
     ):
         sp_rs_norm_kernel(
             part, res, res_out, out, w, ctrl, p0, p1, p2, p3, p4, p5, p6, p7,
-            off_x, off_s, off_f, rank, m, mmax, wg, bias, ids, tw, zp,
-        ).launch(grid=(NB, 1, 1), block=(NALL, 1, 1), stream=stream)
+            off_x, off_s, off_f, rank, m, wg, bias, ids, tw, zp,
+        ).launch(grid=(NB, 1, 1), block=(NTH, 1, 1), stream=stream)
 
     return launch
 
 
 class SpRsNorm:
-    """Per TP group and hidden size: ``forward(part, res, w)`` -> (out, res_out)
-    for this rank's rows (bf16 [T, H] each, rows ``rank*m:(rank+1)*m`` valid).
-
-    router = (E, topk, scale, shared_w): ``forward(..., router=(wg, bias, ids,
-    tw))`` also routes the own rows (see compile_sp_rs_norm): wg = the gate
-    weight bf16 [E, H], bias fp32 [E]; ids int32 / tw fp32 [m, topk + 1] (the
-    last column the shared expert). Needs m % 16 == 0.
-    gemma / logit_bf16: see compile_sp_rs_norm."""
+    """forward(part, res, w[, router]) -> (out, res_out) for this rank's rows."""
 
     def __init__(
         self,
@@ -670,7 +568,6 @@ class SpRsNorm:
         eps: float,
         group=None,
         device=None,
-        i8: bool = True,
         router=None,
         gemma: bool = True,
         logit_bf16: bool = True,
@@ -696,16 +593,15 @@ class SpRsNorm:
         self._f = arena.reserve("f", (MAX_TP * NB,), torch.int32)
         arena.commit()
         self.arena = arena
-        # ctrl: per-CTA epochs, [tl] stamps, router row flags, tile counters
-        self.ctrl = torch.zeros(NB * 5 + ROWF + NRT_MAX * KS_MAX, dtype=torch.int32, device=device)
+        self.ctrl = torch.zeros(NB + ROWF + NRT_MAX * KS_MAX, dtype=torch.int32, device=device)
         self._zp = torch.empty(
             (NRT_MAX * KS_MAX * ZT * max(E, 1),) if router else (1,),
             dtype=torch.float32,
             device=device,
         )
-        self._fn = compile_sp_rs_norm(self.H, self.tp, self.eps, bool(i8), gemma=bool(gemma))
+        self._fn = compile_sp_rs_norm(self.H, self.tp, self.eps, gemma=bool(gemma))
         self._fn_rt = (
-            compile_sp_rs_norm(self.H, self.tp, self.eps, bool(i8), *[
+            compile_sp_rs_norm(self.H, self.tp, self.eps, *[
                 int(router[0]), int(router[1]), float(router[2]), float(router[3])
             ], gemma=bool(gemma), logit_bf16=bool(logit_bf16))
             if router
@@ -714,7 +610,6 @@ class SpRsNorm:
         self._armed = set()
 
     def routes(self, tokens: int) -> bool:
-        """forward(router=...) runs for this batch."""
         m = tokens // self.tp
         return self._fn_rt is not None and tokens % self.tp == 0 and m % ZT == 0 and 0 < m <= self.mmax
 
@@ -737,7 +632,7 @@ class SpRsNorm:
         args = (
             part.data_ptr(), res.data_ptr(), res_out.data_ptr(), out.data_ptr(), w.data_ptr(),
             self.ctrl.data_ptr(), *peers, self._x.offset, self._s.offset, self._f.offset,
-            self.rank, m, self.mmax, *rt, self._zp.data_ptr(),
+            self.rank, m, *rt, self._zp.data_ptr(),
         )
         if fn not in self._armed:
             if torch.cuda.is_current_stream_capturing():
@@ -750,7 +645,6 @@ class SpRsNorm:
         return out, res_out
 
     def warm(self) -> None:
-        """Collective: compile and run once (eagerly; graph capture cannot)."""
         tp = self.tp
         rows = tp * ZT if self._fn_rt is not None else tp
         x = torch.zeros((rows, self.H), dtype=torch.bfloat16, device=self.device)

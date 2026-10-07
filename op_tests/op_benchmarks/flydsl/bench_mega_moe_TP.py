@@ -1,21 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Benchmark: tensor-parallel MoE layer (a4w4, MXFP4), split baseline vs the
-fused MegaMoE TP kernel. (Correctness: op_tests/multigpu_tests/test_mega_moe_TP.py.)
-
-Every (model, tokens) cell checks accuracy and times both paths under CUDA
-graph replay:
-
-* split baseline, ``--comm-mode ag_rs``: route AllGather -> sort -> quant ->
-  AllGather -> tuned GEMM1 / GEMM2 (``fused_moe_2stages``) -> ReduceScatter;
-  ``ar``: sort -> quant -> GEMMs -> AllReduce (input replicated);
-  ``ar_ar``: AllReduce of the input partials, then as ``ar``.
-* fused: :class:`aiter.ops.flydsl.mega_moe_tp.MegaMoeTP` (one kernel).
-* torch reference: ``torch_moe_stage1`` / ``torch_moe_stage2`` as in
-  ``test_moe_2stage.py``.
-
-Gates: split vs torch, fused vs split, fused vs torch rel L2 < --rtol, no NaN,
-graph replay == eager. Weights: each rank's inter-dim shard, preshuffled.
+"""Benchmark: TP MoE layer (a4w4, MXFP4), split baseline vs the fused MegaMoE TP kernel.
 
 Usage::
 
@@ -23,9 +8,8 @@ Usage::
         --models glm5 --tokens 256
     python op_tests/op_benchmarks/flydsl/bench_mega_moe_TP.py --single-process \\
         --tp 4 --models m3 --tokens 64 --comm-mode ar
-
-The single-process mode (one process drives every GPU through peer access,
-``p2p_collectives.py``) also checks masked expert ids and empty batches.
+    torchrun --nproc_per_node=4 op_tests/op_benchmarks/flydsl/bench_mega_moe_TP.py \\
+        --e2e --models m3
 """
 
 from __future__ import annotations
@@ -38,34 +22,25 @@ import os
 import sys
 import threading
 from dataclasses import dataclass, replace
-from typing import ClassVar
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 if os.path.isdir(os.path.join(_REPO_ROOT, "aiter")) and _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
-# --e2e: the ATOM server's environment (MiniMax-M3 recipe: INT4 quick-reduce;
-# MegaMoE: the dynamic schedule, large-batch (LB) from 256 tokens). Else the
-# split baseline runs the fused kernel's recipe: MXFP4 activations (SiTUv2
-# too) and FP8 stage-2 route rows at every token count.
-_E2E = "--e2e" in sys.argv
-_ENV = (
-    {
-        "AITER_USE_SYSTEM_TRITON": "1",
-        "AITER_QUICK_REDUCE_QUANTIZATION": "INT4",
-        "AITER_MEGAMOE_TP_SCHEDULE": "dynamic",
-        "AITER_MEGAMOE_TP_LB_MIN": "256",
-        "AITER_MEGAMOE_TP_LB_MT": "5",
-        "AITER_MEGAMOE_TP_LB_NPP": "2",
-        "AITER_MEGAMOE_TP_LB_Q": "3",
-    }
-    if _E2E
-    else {
-        "AITER_USE_SYSTEM_TRITON": "1",
-        "AITER_SITUV2_A4W4": "1",
-        "AITER_FLYDSL_STAGE2_FP8": "1",
-        "AITER_BF16_FP8_MOE_BOUND": "0",
-    }
-)
+_ENV = {"AITER_USE_SYSTEM_TRITON": "1"}
+if "--e2e" in sys.argv:
+    _ENV.update(
+        AITER_QUICK_REDUCE_QUANTIZATION="INT4",
+        AITER_MEGAMOE_TP_LB_MIN="256",
+        AITER_MEGAMOE_TP_LB_MT="5",
+        AITER_MEGAMOE_TP_LB_NPP="2",
+        AITER_MEGAMOE_TP_LB_Q="3",
+    )
+else:
+    _ENV.update(
+        AITER_SITUV2_A4W4="1",
+        AITER_FLYDSL_STAGE2_FP8="1",
+        AITER_BF16_FP8_MOE_BOUND="0",
+    )
 for _key, _value in _ENV.items():
     os.environ.setdefault(_key, _value)
 
@@ -116,7 +91,6 @@ from aiter.utility import fp4_utils
 logger = logging.getLogger("aiter")
 
 SUPPORTED_GFX = ("gfx950",)
-# every rank holds every token (and its routing)
 REPLICATED = ("rs", "ar", "ar_ar")
 QUANT_TYPE = aiter.QuantType.per_1x32
 AQ_DTYPE = dtypes.fp4x2
@@ -189,7 +163,7 @@ def setup_dist() -> DistCtx:
         if rank == 0:
             print("[TP-MOE] bringing up aiter parallel state", flush=True)
         init_dist_env(world, rank, local_rank=local_rank)
-    except Exception as exc:  # noqa: BLE001 - degrade to RCCL
+    except Exception as exc:  # noqa: BLE001
         err = f"{type(exc).__name__}: {exc}"
     if not dist.is_initialized():
         dist.init_process_group("nccl", device_id=device)
@@ -203,7 +177,7 @@ def cleanup_dist() -> None:
         from aiter.ops.communication import destroy_dist_env
 
         destroy_dist_env()
-    except Exception as exc:  # noqa: BLE001 - teardown must not mask a failure
+    except Exception as exc:  # noqa: BLE001
         logger.debug("[TP-MOE] destroy_dist_env: %s", exc)
     if dist.is_initialized():
         dist.destroy_process_group()
@@ -251,7 +225,6 @@ def time_us(fn, *, iters: int, warmup: int, device, rounds: int = 3) -> float:
 
 @dataclass
 class TpMoeWeights:
-
     shape: ModelShape
     tp_size: int
     local_inter_dim: int
@@ -323,7 +296,6 @@ def build_sharded_weights(
 
 @dataclass
 class TpMoeInputs:
-
     x_local: torch.Tensor
     topk_weights_local: torch.Tensor
     topk_ids_local: torch.Tensor
@@ -398,26 +370,19 @@ def make_inputs(
 
 
 class TpCollectives:
-
-    _BYTE_VIEW: ClassVar[dict] = {
-        torch.uint8: torch.bfloat16,
-        torch.int8: torch.bfloat16,
-    }
-
     def __init__(self, ctx: DistCtx, tp_size: int):
         self.tp_size = tp_size
         self.error = ctx.custom_comm_error
         self.enabled = not self.error
         self.fell_back = False
 
-    def _as_float(self, x):
-        want = self._BYTE_VIEW.get(x.dtype)
-        if want is None:
+    @staticmethod
+    def _as_float(x):
+        if x.dtype not in (torch.uint8, torch.int8):
             return x
-        step = torch.finfo(want).bits // 8 // x.element_size()
-        if x.dim() != 2 or x.shape[-1] % step:
+        if x.dim() != 2 or x.shape[-1] % 2:
             return None
-        return x.view(want)
+        return x.view(torch.bfloat16)
 
     def all_gather(self, x, out):
         if (
@@ -427,7 +392,7 @@ class TpCollectives:
         ):
             view = self._as_float(x)
             if view is not None:
-                with contextlib.suppress(Exception):  # shapes the kernel declines
+                with contextlib.suppress(Exception):
                     got = tensor_model_parallel_all_gather(view, use_custom=True, dim=0)
                     return got.view(x.dtype) if view.dtype != x.dtype else got
         self.fell_back |= self.enabled
@@ -443,7 +408,7 @@ class TpCollectives:
             and x.numel() % (self.tp_size * (16 // x.element_size())) == 0
         )
         if ok:
-            with contextlib.suppress(Exception):  # shapes the kernel declines
+            with contextlib.suppress(Exception):
                 return tensor_model_parallel_reduce_scatter(x, use_custom=True, dim=0)
         self.fell_back |= self.enabled
         dist.reduce_scatter_tensor(out, x)
@@ -454,7 +419,7 @@ class TpCollectives:
         if self.enabled and x.dtype in (torch.bfloat16, torch.float16, torch.float32):
             try:
                 return tensor_model_parallel_all_reduce(x, prefill_support=True)
-            except Exception:  # noqa: BLE001 - shape the kernel declines
+            except Exception:  # noqa: BLE001
                 self.fell_back = True
         out.copy_(x)
         dist.all_reduce(out)
@@ -467,7 +432,6 @@ class TpCollectives:
 
 
 class TokenGather:
-
     def __init__(
         self, shape: ModelShape, tp_size: int, max_local_tokens: int, device, comm
     ):
@@ -510,7 +474,6 @@ def _partial_keyword(fn, *keys: str) -> str:
 
 @dataclass(frozen=True)
 class _TunedPlan:
-
     metadata: object
     block_m: int
     accumulate: bool
@@ -540,7 +503,6 @@ def _gemm1_takes_prequantized_fp4(kname: str) -> bool:
 
 
 class TunedPlans:
-
     def __init__(self, weights: TpMoeWeights):
         self.weights = weights
         self._cache: dict[int, _TunedPlan] = {}
@@ -600,7 +562,6 @@ def sort_routes(shape: ModelShape, w_all, i_all, plan: _TunedPlan):
 
 
 class SplitLocalGemms:
-
     def __init__(self, weights: TpMoeWeights):
         shape = weights.shape
         self.weights = weights
@@ -660,7 +621,6 @@ class SplitLocalGemms:
 
 
 class SplitTpMoe:
-
     def __init__(
         self, weights: TpMoeWeights, ctx: DistCtx, max_local_tokens: int, comm
     ):
@@ -686,42 +646,36 @@ class SplitTpMoe:
         plan = self.plans(global_tokens)
         return plan.gemm1_kernel, plan.gemm2_kernel
 
-    def _payload_ag(self, xq, xq_scale, inputs: TpMoeInputs):
+    def __call__(self, inputs: TpMoeInputs) -> torch.Tensor:
         m, g = inputs.local_tokens, inputs.global_tokens
-        payload = xq.view(torch.uint8).view(m, -1)
-        scale = xq_scale.view(torch.uint8).view(m, -1)
-        a1 = self.comm.all_gather(payload, out=self._payload[:g])
-        a1_scale = self.comm.all_gather(scale, out=self._scale[:g])
-        return a1.view(AQ_DTYPE), a1_scale.view(dtypes.fp8_e8m0)
-
-    def steps(self, inputs: TpMoeInputs):
-        plan = self.plans(inputs.global_tokens)
+        plan = self.plans(g)
         w_all, i_all = self.gather.route(inputs)
         sorted_ret = sort_routes(self.shape, w_all, i_all, plan)
         if plan.prequant:
-            a1, a1_scale = self._payload_ag(
-                *self.quant(inputs.x_local, quant_dtype=AQ_DTYPE), inputs
-            )
+            xq, xq_scale = self.quant(inputs.x_local, quant_dtype=AQ_DTYPE)
+            a1 = self.comm.all_gather(
+                xq.view(torch.uint8).view(m, -1), out=self._payload[:g]
+            ).view(AQ_DTYPE)
+            a1_scale = self.comm.all_gather(
+                xq_scale.view(torch.uint8).view(m, -1), out=self._scale[:g]
+            ).view(dtypes.fp8_e8m0)
         else:
             a1, a1_scale = self.gather(inputs)[0], None
-        return plan, w_all, i_all, sorted_ret, a1, a1_scale
-
-    def __call__(self, inputs: TpMoeInputs) -> torch.Tensor:
-        plan, w_all, i_all, sorted_ret, a1, a1_scale = self.steps(inputs)
         partial = self.gemms(a1, a1_scale, w_all, i_all, sorted_ret, plan).contiguous()
-        return self.comm.reduce_scatter(partial, out=self._y[: inputs.local_tokens])
+        return self.comm.reduce_scatter(partial, out=self._y[:m])
 
-    def warmup(self, x, wts, ids) -> None:
-        plan = self.plans(int(x.shape[0]))
+    def local_moe(self, x, wts, ids, plan: _TunedPlan) -> torch.Tensor:
         sorted_ret = sort_routes(self.shape, wts, ids, plan)
         a1, a1_scale = (
             self.quant(x, quant_dtype=AQ_DTYPE) if plan.prequant else (x, None)
         )
-        self.gemms(a1, a1_scale, wts, ids, sorted_ret, plan)
+        return self.gemms(a1, a1_scale, wts, ids, sorted_ret, plan)
+
+    def warmup(self, x, wts, ids) -> None:
+        self.local_moe(x, wts, ids, self.plans(int(x.shape[0])))
 
 
 class SplitTpMoeAR(SplitTpMoe):
-
     def __init__(self, weights, ctx, max_local_tokens, comm):
         super().__init__(weights, ctx, max_local_tokens, comm)
         total = max_local_tokens * weights.tp_size
@@ -729,22 +683,14 @@ class SplitTpMoeAR(SplitTpMoe):
         self._x = torch.empty((total, H), dtype=dtypes.bf16, device=ctx.device)
         self._yall = torch.empty((total, H), dtype=dtypes.bf16, device=ctx.device)
 
-    def steps(self, inputs: TpMoeInputs):
+    def __call__(self, inputs: TpMoeInputs) -> torch.Tensor:
         g = inputs.global_tokens
-        plan = self.plans(g)
         x = inputs.x_local
         if inputs.comm_mode == "ar_ar":
             x = self.comm.all_reduce(x, out=self._x[:g])
-        w_all, i_all = inputs.topk_weights_local, inputs.topk_ids_local
-        sorted_ret = sort_routes(self.shape, w_all, i_all, plan)
-        a1, a1_scale = (
-            self.quant(x, quant_dtype=AQ_DTYPE) if plan.prequant else (x, None)
+        partial = self.local_moe(
+            x, inputs.topk_weights_local, inputs.topk_ids_local, self.plans(g)
         )
-        return plan, w_all, i_all, sorted_ret, a1, a1_scale
-
-    def __call__(self, inputs: TpMoeInputs) -> torch.Tensor:
-        plan, w_all, i_all, sorted_ret, a1, a1_scale = self.steps(inputs)
-        partial = self.gemms(a1, a1_scale, w_all, i_all, sorted_ret, plan)
         if inputs.comm_mode == "rs":
             return self.comm.reduce_scatter(
                 partial.contiguous(), out=self._y[: inputs.local_tokens]
@@ -753,7 +699,6 @@ class SplitTpMoeAR(SplitTpMoe):
 
 
 class MegaMoeTP:
-
     def __init__(
         self,
         weights: TpMoeWeights,
@@ -763,6 +708,7 @@ class MegaMoeTP:
         comm_mode="ag_rs",
         comm_dtype="fp8",
         ar_gather="bf16",
+        schedule="tuned",
     ):
         shape = weights.shape
         situ = _situ(shape)
@@ -780,6 +726,7 @@ class MegaMoeTP:
             comm_mode=comm_mode,
             comm_dtype=comm_dtype,
             ar_gather=ar_gather,
+            schedule=schedule,
         )
         self.engine = MegaMoeTPLayer(
             config,
@@ -874,7 +821,7 @@ def rel_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
 
 
 class SkipCase(Exception):
-    """Every rank agreed to skip the current case."""
+    pass
 
 
 def new_row(
@@ -984,7 +931,7 @@ def jit_warmup(
         try:
             x, ids, wts = _warmup_inputs(shape, global_tokens, ctx.device)
             moe.warmup(x, wts, ids)
-        except Exception as exc:  # noqa: BLE001 - warmup must never be fatal
+        except Exception as exc:  # noqa: BLE001
             logger.warning("[jit-warmup] %s M=%d: %s", shape.name, global_tokens, exc)
             ok = False
         torch.cuda.empty_cache()
@@ -996,7 +943,7 @@ def _graph_capture_ctx():
         from aiter.dist.parallel_state import get_tp_group, graph_capture
 
         get_tp_group()
-    except Exception:  # noqa: BLE001 - no aiter parallel state -> plain capture
+    except Exception:  # noqa: BLE001
         return contextlib.nullcontext()
     return graph_capture()
 
@@ -1032,7 +979,6 @@ def _time_graph(impl, inputs, args, ctx) -> tuple[float, torch.Tensor | None]:
             return us, tuple(t.clone() for t in out)
         return us, out.clone()
     finally:
-        # a live graph while the next capture warms up is fatal
         graph = out = None
         gc.collect()
         torch.cuda.synchronize()
@@ -1040,11 +986,10 @@ def _time_graph(impl, inputs, args, ctx) -> tuple[float, torch.Tensor | None]:
 
 def run_case(shape, weights, ctx, args, global_tokens, max_local_tokens) -> dict:
     tp = args.tp
-    ar = args.comm_mode in REPLICATED
     inputs = make_inputs(
         shape, ctx, tp, global_tokens, args.seed, args.route, args.comm_mode
     )
-    moe = (SplitTpMoeAR if ar else SplitTpMoe)(
+    moe = (SplitTpMoeAR if args.comm_mode in REPLICATED else SplitTpMoe)(
         weights, ctx, max_local_tokens, args.comm_backend
     )
     if not jit_warmup(moe, shape, ctx, global_tokens):
@@ -1114,62 +1059,31 @@ def run_case(shape, weights, ctx, args, global_tokens, max_local_tokens) -> dict
     if not args.no_perf:
         row["ag_wire"] = moe.plans(global_tokens).ag_wire
         row["split_graph_us"], rep = _time_graph(moe, inputs, args, ctx)
-        if rep is not None:
-            gate(
-                row,
-                "split_graph_rel_l2",
-                rel_l2(rep, y),
-                args.rtol,
-                "split graph replay",
-            )
+        gate(row, "split_graph_rel_l2", rel_l2(rep, y), args.rtol, "split graph replay")
         if fused is not None:
             row["fused_graph_us"], rep = _time_graph(fused, inputs, args, ctx)
-            if rep is not None:
-                gate(
-                    row,
-                    "fused_graph_rel_l2",
-                    rel_l2(rep, fused(inputs)),
-                    args.rtol,
-                    "fused graph replay",
-                )
+            gate(
+                row,
+                "fused_graph_rel_l2",
+                rel_l2(rep, fused(inputs)),
+                args.rtol,
+                "fused graph replay",
+            )
             set_speedup(row)
     row["comm"] = args.comm_backend.describe()
     return row
 
 
-# ---------------------------------------------------------------------------
-# --e2e: the MoE region of one ATOM decoder layer, as the two ATOM paths run it
-# ---------------------------------------------------------------------------
-# From the attention output projection's per-rank partial ``part`` [T, H] to
-# the next layer's FP8 attention input (+ the updated residual):
-#
-# * split (ATOM base): all-reduce + residual add + GemmaRMSNorm (one fused
-#   kernel) -> router gate GEMM + topk_gating (sigmoid + bias) into the fused
-#   shared-expert buffers -> sort / quant / GEMM1 / GEMM2 -> all-reduce +
-#   residual add + GemmaRMSNorm + per-token FP8 quant (one fused kernel).
-# * mega (ATOM sequence-parallel path): SpRsNorm (int8 reduce-scatter +
-#   residual add + GemmaRMSNorm + the router, this rank's rows) -> the MegaMoE
-#   kernel (ag_rs) with the fused tail (residual add + GemmaRMSNorm + FP8 quant
-#   + all-gather of the next layer's input).
-
-# model -> (routed experts, routed top-k, routed scale, shared-expert weight, eps)
 @dataclass(frozen=True)
 class E2eModel:
-    """The decoder layer around the MoE, as ATOM runs it."""
-
-    experts: int  # routed (the shared expert: id experts, weight shared_w)
+    experts: int
     topk: int
-    scale: float  # routed scaling factor
+    scale: float
     shared_w: float
     eps: float
-    gemma: bool  # GemmaRMSNorm (scale 1 + w), else RMSNorm (w)
-    logits_fp32: bool  # fp32 gate GEMM output + biased_grouped_topk (else bf16 + topk_gating)
-    # the model's SwiGLU clamp (the MegaMoE engine's default for swiglu; the
-    # split GEMMs need it explicitly)
+    gemma: bool
+    logits_fp32: bool
     swiglu_limit: float | None = None
-    # e_score_correction_bias: N(0, 0.05), or GLM-like: around 7 (fp32 needed:
-    # a bf16 ulp there is 1/32), spread little (a learned bias balances the
-    # experts; a wide one on random gate weights would route to a few)
     bias_glm: bool = False
 
 
@@ -1191,9 +1105,6 @@ class E2eInputs:
     local_tokens: int
 
 
-# residual stream scale: the random expert weights give MoE outputs of about
-# this size for inputs of shape.x_scale (as in a real model, the MoE output is
-# a correction of the residual's order, not 100x it)
 E2E_RESIDUAL_SCALE = 16.0
 
 
@@ -1201,7 +1112,6 @@ def make_e2e_inputs(shape, ctx, tp, global_tokens, seed) -> E2eInputs:
     cfg = E2E_MODELS[shape.name]
     E = cfg.experts
     H = shape.model_dim
-    # every rank: its own partial; the rest is the same on every rank
     gen = torch.Generator(device=ctx.device).manual_seed(seed + 31 * ctx.rank)
     shared = torch.Generator(device=ctx.device).manual_seed(seed + 7)
     part = (
@@ -1212,8 +1122,6 @@ def make_e2e_inputs(shape, ctx, tp, global_tokens, seed) -> E2eInputs:
         E2E_RESIDUAL_SCALE * torch.randn((global_tokens, H), generator=shared, device=ctx.device)
     ).to(dtypes.bf16)
 
-    # norm weights giving normed rows of RMS ~ shape.x_scale, the input range
-    # the random expert weights are built for (Gemma: the scale is 1 + w)
     def norm_weight():
         noise = 0.1 * torch.randn((H,), generator=shared, device=ctx.device)
         return (shape.x_scale * (1.0 + noise) - (1.0 if cfg.gemma else 0.0)).to(dtypes.bf16)
@@ -1233,24 +1141,17 @@ def make_e2e_inputs(shape, ctx, tp, global_tokens, seed) -> E2eInputs:
 
 
 class SplitE2e:
-    """ATOM's base path (every rank holds every token)."""
-
     def __init__(
         self, weights: TpMoeWeights, ctx: DistCtx, max_local_tokens: int, comm, bf16=False
     ):
-        self.shape = weights.shape
-        self.bf16 = bf16  # the next layer's input in bf16 too (GLM-5's indexer layers)
-        self.cfg = cfg = E2E_MODELS[self.shape.name]
+        self.bf16 = bf16
+        self.cfg = cfg = E2E_MODELS[weights.shape.name]
         self.E, self.K, self.scale, self.eps = cfg.experts, cfg.topk, cfg.scale, cfg.eps
         self.moe = SplitTpMoeAR(weights, ctx, max_local_tokens, comm)
         self.moe.gemms.kwargs["swiglu_limit"] = cfg.swiglu_limit
         total = max_local_tokens * weights.tp_size
-        # (ATOM's aiter_topK_meta_data: the shared expert's column preset)
         self.ids = torch.full((total, self.K + 1), self.E, dtype=torch.int32, device=ctx.device)
         self.tw = torch.full((total, self.K + 1), cfg.shared_w, dtype=torch.float32, device=ctx.device)
-
-    def kernel_names(self, global_tokens: int) -> tuple[str, str]:
-        return self.moe.kernel_names(global_tokens)
 
     def __call__(self, inp: E2eInputs):
         T, K = inp.global_tokens, self.K
@@ -1266,14 +1167,8 @@ class SplitE2e:
         else:
             logits = tgemm.mm(normed, inp.wg, None, otype=dtypes.bf16)
             topk_gating(tw_r, ids_r, logits, inp.bias, True, self.scale, score_func="sigmoid")
-        plan = self.moe.plans(T)
-        sorted_ret = sort_routes(self.shape, tw, ids, plan)
-        a1, a1_scale = (
-            self.moe.quant(normed, quant_dtype=AQ_DTYPE) if plan.prequant else (normed, None)
-        )
-        partial = self.moe.gemms(a1, a1_scale, tw, ids, sorted_ret, plan)
         out = tensor_model_parallel_fused_allreduce_rmsnorm_quant(
-            partial.contiguous(),
+            self._moe(normed, T).contiguous(),
             res,
             inp.w_next,
             self.eps,
@@ -1284,23 +1179,16 @@ class SplitE2e:
         q, res_out, s = out[:3]
         return (q, s, res_out) + tuple(out[3:])
 
+    def _moe(self, normed, T):
+        return self.moe.local_moe(normed, self.tw[:T], self.ids[:T], self.moe.plans(T))
+
     @torch.no_grad()
     def reference(self, inp: E2eInputs):
-        """The layer at full precision on the routes of the last call: exact
-        (fp32) sums instead of ATOM's quantized all-reduces, no output quant.
-        Returns (next-layer normed input, residual), every token."""
-        T = inp.global_tokens
         acc = inp.part.float()
         dist.all_reduce(acc)
         res = (acc + inp.residual.float()).to(dtypes.bf16)
         normed = _norm(res, inp.w_post, self.eps, self.cfg.gemma)
-        ids, tw = self.ids[:T], self.tw[:T]
-        plan = self.moe.plans(T)
-        sorted_ret = sort_routes(self.shape, tw, ids, plan)
-        a1, a1_scale = (
-            self.moe.quant(normed, quant_dtype=AQ_DTYPE) if plan.prequant else (normed, None)
-        )
-        y = self.moe.gemms(a1, a1_scale, tw, ids, sorted_ret, plan).float()
+        y = self._moe(normed, inp.global_tokens).float()
         dist.all_reduce(y)
         res_out = (y + res.float()).to(dtypes.bf16)
         return _norm(res_out, inp.w_next, self.eps, self.cfg.gemma).float(), res_out
@@ -1313,8 +1201,6 @@ def _norm(x, w, eps, gemma) -> torch.Tensor:
 
 
 class MegaE2e:
-    """ATOM's sequence-parallel MegaMoE path (this rank's rows)."""
-
     def __init__(
         self, weights: TpMoeWeights, ctx: DistCtx, max_local_tokens: int, tokens, bf16=False
     ):
@@ -1324,7 +1210,12 @@ class MegaE2e:
         cfg = E2E_MODELS[shape.name]
         self.K, self.eps = cfg.topk, cfg.eps
         self.fused = MegaMoeTP(
-            weights, ctx, max_local_tokens, comm_mode="ag_rs", comm_dtype="fp8"
+            weights,
+            ctx,
+            max_local_tokens,
+            comm_mode="ag_rs",
+            comm_dtype="fp8",
+            schedule="dynamic",
         )
         self.fused.engine.engine.tn_eps = self.eps
         self.fused.engine.engine.tn_gemma = cfg.gemma
@@ -1354,7 +1245,6 @@ class MegaE2e:
             out[rows], tw, ids, out=self.y[:m], tail=(res_own, res_own, inp.w_next),
             bf16=self.bf16,
         )
-        # (the gathered rows are the arena's bytes: E4M3, as the split path's)
         return (q.view(dtypes.fp8), s, res_own) + tuple(b)
 
 
@@ -1372,7 +1262,7 @@ def run_case_e2e(shape, weights, ctx, args, global_tokens, max_local_tokens, tok
         raise SkipCase("kernel build failed on rank 0 (see the [jit-warmup] warning above)")
     row = new_row(
         shape, args, global_tokens, inp.local_tokens, weights.local_inter_dim,
-        split.kernel_names(global_tokens), "",
+        split.moe.kernel_names(global_tokens), "",
     )
     row["comm_mode"] = "e2e"
     mega = MegaE2e(weights, ctx, max_local_tokens, tokens, bf16=args.e2e_tail_bf16)
@@ -1381,8 +1271,6 @@ def run_case_e2e(shape, weights, ctx, args, global_tokens, max_local_tokens, tok
     barrier()
     m, K = inp.local_tokens, mega.K
     rows = slice(ctx.rank * m, (ctx.rank + 1) * m)
-    # the routers agree up to near-ties (bf16 logits, different summation
-    # order): compare the tokens both route the same way; gate the agreement
     same = (
         mega.ids[:m, :K].sort(dim=1).values == split.ids[rows][:, :K].sort(dim=1).values
     ).all(dim=1)
@@ -1394,14 +1282,10 @@ def run_case_e2e(shape, weights, ctx, args, global_tokens, max_local_tokens, tok
             f"{shape.tag(tp)} tokens={global_tokens}: routers agree on "
             f"{row['e2e_route_match']:.4f} of the tokens (< {args.e2e_route_match})"
         )
-    # both paths vs the full-precision layer on the split routes (ATOM's base
-    # is itself lossy: int4 quick-reduce all-reduce, fp8 output); compared on
-    # the next layer's input (every token) and this rank's residual rows
     ref_q, ref_r = split.reference(inp)
     keep = same_all.view(-1, 1)
     own = same.view(-1, 1)
     if b1:
-        # the bf16 rows: both paths round the same normed values
         row["e2e_bf16_rel_l2"] = rel_l2(b1[0].float() * keep, ref_q * keep)
         row["e2e_split_bf16_rel_l2"] = rel_l2(b0[0].float(), ref_q)
     row["e2e_split_q_rel_l2"] = rel_l2(_dequant(q0, s0), ref_q)
@@ -1587,7 +1471,7 @@ def _sp_run(devices, fn):
         try:
             torch.cuda.set_device(devices[r])
             out[r] = fn(r)
-        except BaseException as exc:  # noqa: BLE001 - re-raised below
+        except BaseException as exc:  # noqa: BLE001
             err[r] = exc
 
     threads = [threading.Thread(target=work, args=(r,)) for r in range(len(devices))]
@@ -1792,12 +1676,11 @@ def run_case_sp(
         _sp_empty_batch(fused, devices, shape, args.comm_mode)
     if not args.no_perf:
         row["ag_wire"] = split[0].plans(global_tokens).ag_wire
-        row["split_graph_us"], rep = float("nan"), None
+        row["split_graph_us"] = float("nan")
         if args.impl != "fused":
             row["split_graph_us"], rep = _sp_time_graph(
                 devices, lambda r: split[r](inputs[r]), args
             )
-        if rep is not None:
             gate(
                 row,
                 "split_graph_rel_l2",
@@ -1809,21 +1692,18 @@ def run_case_sp(
             row["fused_graph_us"], rep = _sp_time_graph(
                 devices, lambda r: fused[r](inputs[r]), args
             )
-            if rep is not None:
-                gate(
-                    row,
-                    "fused_graph_rel_l2",
-                    _sp_rel_l2(rep, yf),
-                    args.rtol,
-                    "fused graph replay",
-                )
+            gate(
+                row,
+                "fused_graph_rel_l2",
+                _sp_rel_l2(rep, yf),
+                args.rtol,
+                "fused graph replay",
+            )
             set_speedup(row)
     return row
 
 
 def _masked_inputs(inputs, experts):
-    """(ids with ~20% set to -1 / >= experts, the same with those routes as
-    expert 0 at weight 0 for the reference) per rank."""
     out = []
     for i in inputs:
         g = torch.Generator(device=i.topk_ids_local.device).manual_seed(77)
@@ -1862,16 +1742,10 @@ def _sp_empty_batch(fused, devices, shape, comm_mode) -> None:
         raise AssertionError(f"{comm_mode} empty batch: {[y.shape for y in ys]}")
 
 
-def _flydsl_multi_device() -> None:
-    from p2p_collectives import flydsl_multi_device
+def main_single_process(args) -> int:
+    from p2p_collectives import P2PGroup, PeerArenaGroup, flydsl_multi_device
 
     flydsl_multi_device()
-
-
-def main_single_process(args) -> int:
-    from p2p_collectives import P2PGroup, PeerArenaGroup
-
-    _flydsl_multi_device()
 
     args.tp = args.tp or torch.cuda.device_count()
     devices = [torch.device("cuda", i) for i in range(args.tp)]

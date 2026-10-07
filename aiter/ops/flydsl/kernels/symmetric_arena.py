@@ -50,7 +50,6 @@ def _hip():
 
 
 _MORI_RANK_STRIDE = 1 << 32
-# one mori CCO communicator per process group: (group id) -> Communicator
 _MORI_COMMS: dict = {}
 
 
@@ -65,16 +64,12 @@ class _DeviceBytes:
 
 
 def _clear_hip_error() -> None:
-    # mori's allocator probes HIP features and leaves the failure in
-    # hipGetLastError, which the next torch launch check would report
     _hip().hipGetLastError()
 
 
 def _mori_comm(group, rank: int, world_size: int):
     comm = _MORI_COMMS.get(id(group))
     if comm is None:
-        # intra-node only: without these, window allocation probes fabric /
-        # GPU-direct RDMA handles and hipMemCreate fails on hosts lacking them
         os.environ.setdefault("MORI_CCO_FABRIC_DISABLE", "1")
         os.environ.setdefault("CCO_GDR_CAPABLE", "0")
         from mori.cco import Communicator
@@ -123,7 +118,6 @@ def _ipc_handle(ptr: int) -> bytes:
     return bytes(bytearray(h.reserved))
 
 
-# a peer allocation maps once per process (arenas can share one): handle -> [ptr, refs]
 _OPEN: dict[bytes, list] = {}
 
 
@@ -154,7 +148,6 @@ def _ipc_close(handle: bytes) -> None:
 
 @contextlib.contextmanager
 def _no_expandable_segments():
-    """hipIpcGetMemHandle cannot export expandable-segment (VMM) memory."""
     conf = os.environ.get("PYTORCH_HIP_ALLOC_CONF") or os.environ.get(
         "PYTORCH_CUDA_ALLOC_CONF", ""
     )
@@ -170,7 +163,6 @@ def _no_expandable_segments():
 
 @dataclass
 class SymmetricSlice:
-
     offset: int
     nbytes: int
     shape: tuple[int, ...]
@@ -179,13 +171,7 @@ class SymmetricSlice:
 
 
 class SymmetricArena:
-    """A same-layout-on-every-rank device arena, mapped into all peers.
-
-    ``group``: a torch.distributed group (one process per rank, IPC), or an
-    in-process group driving every rank's device from one process, with
-    ``world_size``, ``rank_of(device)``, ``register(rank, ptr)``,
-    ``base_ptrs()`` and ``barrier()`` (e.g. the single-process test harness).
-    """
+    """A same-layout device arena on every rank, mapped into all peers."""
 
     def __init__(self, *, group=None, device: torch.device | None = None):
         self.group = group
@@ -204,7 +190,6 @@ class SymmetricArena:
         self._mori: tuple = ()
 
     def reserve(self, name: str, shape, dtype: torch.dtype) -> SymmetricSlice:
-        """Carve out a named region. Must run in the same order on every rank."""
         if self._storage is not None or name in self._slices:
             raise RuntimeError(f"cannot reserve {name!r}")
         shape = tuple(int(s) for s in shape)
@@ -223,12 +208,7 @@ class SymmetricArena:
         with _no_expandable_segments() if self.ipc else contextlib.nullcontext():
             self._storage = torch.zeros(total, dtype=torch.uint8, device=self.device)
         base_ptr = int(self._storage.data_ptr())
-        for s in self._slices.values():
-            s.local = (
-                self._storage[s.offset : s.offset + s.nbytes]
-                .view(s.dtype)
-                .view(s.shape)
-            )
+        self._bind_slices()
         if not self.ipc:
             self.group.register(self.rank, base_ptr)
             return self
@@ -257,13 +237,15 @@ class SymmetricArena:
         dist.barrier(group=self.group)
         return self
 
-    def _commit_mori(self, total: int) -> bool:
-        """mori CCO window: every rank's arena at flat_base + rank * 4 GiB.
+    def _bind_slices(self) -> None:
+        for s in self._slices.values():
+            s.local = (
+                self._storage[s.offset : s.offset + s.nbytes]
+                .view(s.dtype)
+                .view(s.shape)
+            )
 
-        False (nothing allocated, on every rank) when any rank's window fails:
-        on ROCm 7.1 hipMemCreate of an exportable VMM block of a few hundred
-        MB can fail with "out of memory" while plenty is free.
-        """
+    def _commit_mori(self, total: int) -> bool:
         with torch.cuda.device(self.device):
             comm = _mori_comm(self.group, self.rank, self.world_size)
             mem, err = None, ""
@@ -290,12 +272,7 @@ class SymmetricArena:
                 _DeviceBytes(mem.ptr, total), device=self.device
             )
             self._storage.zero_()
-        for s in self._slices.values():
-            s.local = (
-                self._storage[s.offset : s.offset + s.nbytes]
-                .view(s.dtype)
-                .view(s.shape)
-            )
+        self._bind_slices()
         flat = win.local_ptr - self.rank * _MORI_RANK_STRIDE
         self._base_ptrs = tuple(
             flat + r * _MORI_RANK_STRIDE for r in range(self.world_size)
@@ -305,7 +282,6 @@ class SymmetricArena:
         return True
 
     def close(self) -> None:
-        """Unmap the peers' arenas (no kernel may use them any more)."""
         if self._mori:
             torch.cuda.synchronize(self.device)
             self._storage = None
@@ -332,7 +308,6 @@ class SymmetricArena:
 
     @property
     def ipc(self) -> bool:
-        """Ranks are processes (not one process driving every device)."""
         return not hasattr(self.group, "register")
 
     @property

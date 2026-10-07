@@ -4,24 +4,6 @@
 
     torchrun --nproc_per_node=4 op_tests/multigpu_tests/test_mega_moe_TP.py --models glm5
     torchrun --nproc_per_node=8 op_tests/multigpu_tests/test_mega_moe_TP.py --tokens 8 64
-
-Reference: torch_moe_stage1 / stage2 on each rank's weight shard, combined with
-torch.distributed collectives. Modes (as a transformer layer uses them):
-
-* ``ag_rs``: each rank its own tokens and routing; all-gather, MoE, reduce-scatter.
-* ``rs``: every rank the same tokens and routing; the output is reduce-scattered.
-* ``ar``: every rank the same tokens and routing; the output is all-reduced
-  (identical on every rank).
-* ``ar_ar``: as ``ar`` but the input is each rank's partial (summed in the layer).
-
-Every case starts on a new layer and checks its first call (stale state from
-an earlier layer would show there), the watchdog code on every rank, NaN, and
-the accuracy against the reference. Also: random / skewed routing over several
-seeds, token counts changing on one layer, layers created / freed / recreated,
-output ownership with ``out=``, CUDA graph replay == eager, masked expert ids,
-empty batches, host-side validation, and inputs that must agree across ranks
-(``AITER_MEGAMOE_TP_CHECK=1``). Benchmark vs the split path:
-op_tests/op_benchmarks/flydsl/bench_mega_moe_TP.py.
 """
 
 from __future__ import annotations
@@ -94,7 +76,6 @@ class Ctx:
 
 
 def rel_l2(actual, expected) -> float:
-    """rel L2 over all ranks."""
     d = actual.float() - expected.float()
     t = torch.stack([(d * d).sum(), (expected.float() ** 2).sum()])
     dist.all_reduce(t)
@@ -145,7 +126,6 @@ def _quant_experts(experts, rows, cols, magnitude, seed, device, chunk_bytes=512
 
 
 def build_weights(shape: ModelShape, ctx: Ctx, seed: int) -> Weights:
-    """Each rank its own inter_dim shard."""
     inter = shape.inter_dim // ctx.world
     H, E = shape.model_dim, shape.experts
     base = seed + 1_000_000 * ctx.rank
@@ -165,7 +145,6 @@ def build_weights(shape: ModelShape, ctx: Ctx, seed: int) -> Weights:
 
 
 def route(rows, shape: ModelShape, kind: str, gen: torch.Generator, device):
-    """Router stand-in: scores -> softmax -> topk -> renormalize (int32 / fp32)."""
     E, K = shape.experts, shape.topk
     if kind == "balanced":
         start = int(torch.randint(0, E, (1,), device=device, generator=gen))
@@ -175,7 +154,7 @@ def route(rows, shape: ModelShape, kind: str, gen: torch.Generator, device):
         score += 1e-3 * torch.randn((rows, E), device=device, generator=gen)
     else:
         score = torch.randn((rows, E), device=device, generator=gen)
-        if kind == "hot":  # every token prefers the same K experts
+        if kind == "hot":
             score[:, E - K :] += 100.0
     w, ids = torch.softmax(score, dim=-1).topk(K, dim=-1)
     w = w / w.sum(dim=-1, keepdim=True)
@@ -222,8 +201,6 @@ def torch_partial(shape, wt: Weights, x, w, ids):
 
 @dataclass
 class Case:
-    """One call's inputs and the reference of its output on this rank."""
-
     x: torch.Tensor
     w: torch.Tensor
     ids: torch.Tensor
@@ -231,7 +208,6 @@ class Case:
 
 
 def make_case(shape, wt, ctx, mode, tokens, kind, seed, mask=0.0) -> Case:
-    """tokens: global token count (tp * m). mask: share of routes with ids -1 / >= E."""
     m = tokens // ctx.world
     if mode == "ag_rs":
         gen = torch.Generator(device=ctx.device).manual_seed(seed + 7919 * ctx.rank)
@@ -274,7 +250,6 @@ def make_case(shape, wt, ctx, mode, tokens, kind, seed, mask=0.0) -> Case:
         dist.all_reduce(full)
         ref = full[ctx.rank * m : (ctx.rank + 1) * m] if mode == "rs" else full
     if mode == "ar_ar":
-        # each rank a share of x: x / tp plus noise that sums to 0 over the ranks
         gp = torch.Generator(device=ctx.device).manual_seed(seed + 31)
         noise = torch.randn((ctx.world, *x.shape), device=ctx.device, generator=gp)
         noise -= noise.mean(0, keepdim=True)
@@ -320,7 +295,6 @@ def new_layer(
 
 
 def call(layer, c: Case, out=None):
-    """One collective call; errors are reduced over the ranks so they all fail together."""
     layer.clear_errors()
     y = layer(c.x, c.w, c.ids, out=out)
     torch.cuda.synchronize()
@@ -365,7 +339,6 @@ def case_accuracy(
 
 
 def case_varying_m(shape, wt, ctx, args, mode):
-    """One layer, the token count changing between calls (decode <-> prefill)."""
     layer = new_layer(shape, wt, ctx, mode, args.max_local_tokens)
     worst = 0.0
     for m in (8, 1, 32, 1, min(64, args.max_local_tokens), 8):
@@ -375,8 +348,6 @@ def case_varying_m(shape, wt, ctx, args, mode):
 
 
 def case_layers(shape, wt, ctx, args, mode):
-    """Several live layers called in turn; free some, create new ones and check
-    their first calls (stale state of a freed layer must not leak)."""
     layers = [new_layer(shape, wt, ctx, mode, args.max_local_tokens) for _ in range(3)]
     worst = 0.0
     for rnd in range(2):
@@ -394,7 +365,6 @@ def case_layers(shape, wt, ctx, args, mode):
 
 
 def case_out(shape, wt, ctx, args, mode):
-    """With out=, the result is the caller's tensor: the next call leaves it alone."""
     layer = new_layer(shape, wt, ctx, mode, args.max_local_tokens)
     tokens = 16 * ctx.world
     c1 = make_case(shape, wt, ctx, mode, tokens, "random", 1)
@@ -423,7 +393,7 @@ def case_graph(shape, wt, ctx, args, mode):
     torch.cuda.synchronize()
     dist.barrier()
     g = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g):  # a capture failure fails the case
+    with torch.cuda.graph(g):
         out = layer(c.x, c.w, c.ids)
     for _ in range(20):
         g.replay()
@@ -439,7 +409,6 @@ def case_graph(shape, wt, ctx, args, mode):
 
 
 def case_masked(shape, wt, ctx, args, mode):
-    """topk_ids -1 / >= E are masked (add nothing); the next clean call is unaffected."""
     layer = new_layer(shape, wt, ctx, mode, args.max_local_tokens)
     c = make_case(shape, wt, ctx, mode, 16 * ctx.world, "random", 11, mask=0.2)
     e = check(call(layer, c).clone(), c, args.rtol, "masked ids")
@@ -471,7 +440,6 @@ def expect_raise(fn, what, errors=(ValueError, TypeError)):
 
 
 def case_validation(shape, wt, ctx, args):
-    """Host-side checks that fire before any collective or kernel launch."""
     expect_raise(
         lambda: new_layer(shape, wt, ctx, "ag_rs", 4096), "max_local_tokens=4096"
     )
@@ -493,7 +461,6 @@ def case_validation(shape, wt, ctx, args):
 
 
 def case_checked(shape, wt, ctx, args):
-    """AITER_MEGAMOE_TP_CHECK=1: inputs that must agree across ranks are verified."""
     os.environ["AITER_MEGAMOE_TP_CHECK"] = "1"
     try:
         layer = new_layer(shape, wt, ctx, "ag_rs", args.max_local_tokens)
@@ -520,7 +487,7 @@ def run(name, ctx, results, fn, *fargs):
         info = f"{out:.4f}" if isinstance(out, float) else (out or "")
     except CaseFailure as exc:
         ok, info = False, str(exc)
-    except Exception as exc:  # noqa: BLE001 - any other error fails the case
+    except Exception as exc:  # noqa: BLE001
         ok, info = False, f"{type(exc).__name__}: {exc}"
         if ctx.rank == 0:
             traceback.print_exc()
@@ -538,46 +505,17 @@ def run_model(name, ctx, args, results):
     wt = build_weights(shape, ctx, args.seed)
     common = (shape, wt, ctx, args)
     for mode in args.modes:
+        acc = (ctx, results, case_accuracy, *common, mode)
         for tokens in args.tokens:
             for kind in args.routes:
-                run(
-                    f"{name} {mode} M={tokens} {kind}",
-                    ctx,
-                    results,
-                    case_accuracy,
-                    *common,
-                    mode,
-                    tokens,
-                    kind,
-                )
+                run(f"{name} {mode} M={tokens} {kind}", *acc, tokens, kind)
+        tokens = args.tokens[-1]
+        pre = f"{name} {mode} M={tokens} random"
         for cd in args.comm_dtypes:
             if cd != "fp8":
-                tokens = args.tokens[-1]
-                run(
-                    f"{name} {mode} M={tokens} random comm {cd}",
-                    ctx,
-                    results,
-                    case_accuracy,
-                    *common,
-                    mode,
-                    tokens,
-                    "random",
-                    cd,
-                )
+                run(f"{pre} comm {cd}", *acc, tokens, "random", cd)
         if mode in ("ar", "ar_ar"):
-            tokens = args.tokens[-1]
-            run(
-                f"{name} {mode} M={tokens} random ar_gather fp8",
-                ctx,
-                results,
-                case_accuracy,
-                *common,
-                mode,
-                tokens,
-                "random",
-                "fp8",
-                "fp8",
-            )
+            run(f"{pre} ar_gather fp8", *acc, tokens, "random", "fp8", "fp8")
         for what, fn in (
             ("varying m", case_varying_m),
             ("new / freed layers", case_layers),
