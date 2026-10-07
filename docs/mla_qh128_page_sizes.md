@@ -128,8 +128,21 @@ packaged ELF has a byte-identical `.text` section to its source rebuild.
 | Kernel | SP3 source SHA256 | Packaged CO SHA256 |
 |---|---|---|
 | Page1 | `b6aa335f40938ae440d8d6ab18d8901f90c28eaf75bb1b9da1e1dbfd90a353b7` | `79a74f47093139cbb8745a04a3659a6323a9f878cfc5fc7a78992565c774f8ac` |
-| Shuffled page64 | `e647b4c490465ad03726f73cfc5d9352c3535aa99a787d26ee7416d2f77c31cb` | `afd1b9c61332af2112801dd57d2bbe9f8561a7926e1bfc142774ae635e220972` |
+| Shuffled page64 | `dc6834ead01e6cf485189c954b1ac96c35e0db5aae0ee6a0e32cbf890dd5fac0` | `3314a9dfb7c6a9e0313eed84ca298d01fc66ad1ea1ee6ec99b90e66a7076a067` |
 
-The source filenames are `mla_v3_qh128_ps1.sp3` and
-`mla_v3_qh128_ps64.sp3`. The builds use the existing `--raw-qk-cover`
-profile; page64 also uses `--layout shuffled --early 66 --late 90 --scalar-pk8`.
+Page64 uses the selected B `pv_review` schedule, measured at a minimum of
+711 shader cycles per complete mainloop body (B1536/K4096, SE12/CU1/SIMD0).
+It preserves the quarter-major QK ordering, places the PV19/PV20 FMAs after
+PV18, and separates barrier signal/wait by three WMMAs. The 711-cycle result
+is a mainloop measurement; it does not establish a model-level speedup.
+
+The [frozen page64 source and reproducible builder](https://github.com/junxiaguo/my_agent_skills/tree/57348f3/mla_v3_abc/releases/20261007_b711)
+validate 205 semantically unused source-field patches and reproduce the original
+CO (`dd1167e2627c57438b817670660ce458de6c087a10a3aa186c9b049645bded49`)
+byte for byte. Export packaging preserves its entire 44,032-byte `.text`
+section. Page1 retains its existing source and `--raw-qk-cover` build profile.
+
+The softmax arithmetic is unchanged. Existing extreme-scale corner tests found
+LSE errors at large descales, cancellation that can overflow FP8 probabilities,
+and tail NaNs when the scale product underflows to zero. The scheduling update
+does not extend numerical support to those cases.
