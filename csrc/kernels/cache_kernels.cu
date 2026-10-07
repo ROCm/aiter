@@ -2514,15 +2514,21 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
 #define AITER_MLA_SEG_TDM_HPT_MASK 0x114
 #endif
 
-template <typename scalar_t, typename cache_t, int KV_LORA, int PE_DIM,
-          int PAGE_SIZE, bool IS_NEOX, int VEC, int HPT>
+//
+// PAGE_SIZE == 0 selects the plain per-entry layout of
+// fused_qk_rope_concat_and_cache_mla instead (runtime block_size/entry_stride,
+// entry = [nope | pe], or [pe | nope] when !NOPE_FIRST; q_out rows likewise).
+// An output whose type equals the input's is stored unscaled, as kAuto.
+template <typename scalar_t, typename cache_t, typename query_t, int KV_LORA, int PE_DIM,
+          int PAGE_SIZE, bool IS_NEOX, bool NOPE_FIRST, int VEC, int HPT,
+          bool COMPUTE_ALL_Q_ROPE = false, bool K_EARLY = (HPT <= 2)>
 __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
     const scalar_t* __restrict__ q_nope,    // [T, H, KV_LORA]
     const scalar_t* __restrict__ q_pe,      // [T, H, PE_DIM]
     const scalar_t* __restrict__ kv_c,      // [T, KV_LORA]
     const scalar_t* __restrict__ k_pe,      // [T, PE_DIM]
     cache_t* __restrict__ kv_cache,         // flat [num_blocks, block_stride]
-    cache_t* __restrict__ q_out,            // [T, H, Q_OUT_DIM]
+    query_t* __restrict__ q_out,            // [T, H, Q_OUT_DIM]
     const int64_t* __restrict__ slot_mapping,
     const int64_t* __restrict__ positions,
     const scalar_t* __restrict__ cos_cache, // [max_pos, PE_DIM/2]
@@ -2538,12 +2544,34 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
     const int64_t cos_stride0,
     const int64_t sin_stride0,
     const int64_t block_stride,
-    const int max_position)
+    const int max_position,
+    const int64_t entry_stride = 0,
+    const int block_size = PAGE_SIZE,
+    const int num_tokens = 0,
+    const uint32_t tok_magic = 0, // blockIdx.x / num_tokens, see mla_rope_fast_div
+    const int tok_shift = 0,
+    const uint32_t bs_magic = 0, // slot / block_size
+    const int bs_shift = 0)
 {
     constexpr int HALF    = PE_DIM / 2;
     constexpr int NUM_VEC = KV_LORA / VEC; // nope vectors per row
+    constexpr int NOPE_OFF = NOPE_FIRST ? 0 : PE_DIM;
+    constexpr int PE_OFF   = NOPE_FIRST ? KV_LORA : 0;
+    static_assert(PAGE_SIZE == 0 || NOPE_FIRST, "the segmented layout is nope-first");
     using in_vec_t  = opus::vector_t<scalar_t, VEC>;
     using out_vec_t = opus::vector_t<cache_t, VEC>;
+    using q_vec_t   = opus::vector_t<query_t, VEC>;
+    // A template parameter: tested at run time it cost ~3% at eight heads per
+    // block (H=128 T=1536), even when false.
+    constexpr bool compute_all_q_rope = COMPUTE_ALL_Q_ROPE;
+    static_assert(PAGE_SIZE == 0 || !COMPUTE_ALL_Q_ROPE);
+    auto cvt_vec = [](const in_vec_t& v, float inv_scale, auto* out) {
+        using out_t = std::remove_cv_t<std::remove_pointer_t<decltype(out)>>;
+        if constexpr(std::is_same_v<out_t, scalar_t>)
+            return v;
+        else
+            return aiter::scaled_cast<out_t>(v, inv_scale);
+    };
 
     // Two-dimensional grid so the coordinates arrive directly. A flat grid has
     // to divide and modulo by num_heads, which is a runtime value, and
@@ -2552,8 +2580,29 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
     // x is the head so that consecutive blocks stay within one token and keep
     // sharing its slot, position and cos/sin row, which is the order the flat
     // grid already produced.
-    const int64_t token_idx = blockIdx.y;
-    const int     head_base = blockIdx.x * HPT;
+    //
+    // The per-entry layout (PAGE_SIZE == 0) runs a flat grid, head-group
+    // major: block = group * T + token. Consecutive blocks round-robin over
+    // the XCDs, and token-major put every K-writing (group 0) block on one
+    // XCD whenever H / HPT is a multiple of 8 (H=16 T=1536 7.50 -> 6.62 us,
+    // H=128 T=192 7.14 -> 6.25 us). The grid stays one-dimensional because a
+    // tall grid dispatches slower (T=1 H=16: 3.34 us as 1 x 16, 3.22 as
+    // 16 x 1), and the divide by T is a host-built magic multiply, kept off
+    // the front of every block's address chain.
+    int64_t token_idx;
+    int     head_base;
+    if constexpr(PAGE_SIZE == 0)
+    {
+        const uint32_t bid   = blockIdx.x;
+        const uint32_t group = (__umulhi(bid, tok_magic) + bid) >> tok_shift;
+        token_idx            = bid - group * static_cast<uint32_t>(num_tokens);
+        head_base            = group * HPT;
+    }
+    else
+    {
+        token_idx = blockIdx.y;
+        head_base = blockIdx.x * HPT;
+    }
 
     // The slot only gates the writes. Every Q load is addressed from
     // token/head alone and stays in bounds for a padded token too, so on the
@@ -2563,9 +2612,10 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
     // heads per block the op is bandwidth-bound, and deferring it measured ~1%
     // slower there, so that path returns up front as before.
     const int64_t slot_idx = slot_mapping[token_idx];
+    // compute_all_q_rope (DCP) keeps a padded token's Q; only K is skipped.
     if constexpr(HPT > 1)
     {
-        if(slot_idx < 0)
+        if(slot_idx < 0 && !compute_all_q_rope)
             return; // uniform across the block (same token)
     }
 
@@ -2578,7 +2628,10 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
     // round trip back in front of the cos/sin loads. With more heads per block
     // a padded token has already returned, and a per-row descriptor keeps the
     // row offset scalar (~2% at H=128 T=1536).
-    const int64_t pos = positions[token_idx];
+    int64_t pos = positions[token_idx];
+    // A padded token whose Q is kept may carry a stale position: clamp it.
+    if(compute_all_q_rope)
+        pos = pos < 0 ? 0 : (pos >= max_position ? max_position - 1 : pos);
     const scalar_t* cos_base = cos_cache;
     const scalar_t* sin_base = sin_cache;
     int cos_row = 0, sin_row = 0, cos_end = HALF, sin_end = HALF;
@@ -2668,11 +2721,19 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
     // divergent `if` here put s_and_saveexec right behind the nope store, and
     // EXEC being an operand of that in-flight store it had to drain the whole
     // address queue first -- s_wait_xcnt, 18% of the wave at H=32 T=192 in ATT.
-    auto rope_pe_emit = [&](const PeOperands& o, cache_t* out_ptr, int row_off, int extent,
+    auto rope_pe_emit = [&](const PeOperands& o, auto* out_ptr, int row_off, int extent,
                             float inv_scale, int chunk, bool active) {
+        using o_t = std::remove_pointer_t<decltype(out_ptr)>;
+        using o_vec_t = opus::vector_t<o_t, VEC>;
+        auto cvt = [](float r, float s) -> o_t {
+            if constexpr(std::is_same_v<o_t, opus::fp8_t>)
+                return opus::cast<o_t>(r * s);
+            else
+                return static_cast<o_t>(r);
+        };
         const int d0 = chunk * VEC;
-        auto out_buf = opus::make_gmem<cache_t>(out_ptr, extent * sizeof(cache_t));
-        out_vec_t vout;
+        auto out_buf = opus::make_gmem<o_t>(out_ptr, extent * sizeof(o_t));
+        o_vec_t vout;
         if constexpr(IS_NEOX)
         {
             // The partner chunk is the one lane chunk^HALF/VEC already loaded
@@ -2705,7 +2766,7 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
                 const float cv = static_cast<float>(o.c[i]);
                 const float sv = static_cast<float>(o.s[i]);
                 const float r  = low ? (xv * cv - yv * sv) : (xv * cv + yv * sv);
-                vout[i]        = opus::cast<cache_t>(r * inv_scale);
+                vout[i]        = cvt(r, inv_scale);
             }
         }
         else
@@ -2717,11 +2778,11 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
                 const float b  = static_cast<float>(o.x[2 * k + 1]);
                 const float cv = static_cast<float>(o.c[k]);
                 const float sv = static_cast<float>(o.s[k]);
-                vout[2 * k]     = opus::cast<cache_t>((a * cv - b * sv) * inv_scale);
-                vout[2 * k + 1] = opus::cast<cache_t>((b * cv + a * sv) * inv_scale);
+                vout[2 * k]     = cvt(a * cv - b * sv, inv_scale);
+                vout[2 * k + 1] = cvt(b * cv + a * sv, inv_scale);
             }
         }
-        out_buf.template store<VEC, out_vec_t>(vout, active ? row_off + d0 : extent);
+        out_buf.template store<VEC, o_vec_t>(vout, active ? row_off + d0 : extent);
     };
 
     auto rope_pe_seg = [&](const scalar_t* pe_ptr, cache_t* out_ptr, float inv_scale) {
@@ -2729,6 +2790,22 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
             rope_pe_emit(rope_pe_issue(pe_ptr, 0, PE_DIM, threadIdx.x, true), out_ptr, 0,
                          PE_DIM, inv_scale, threadIdx.x, true);
     };
+
+    // K_EARLY: K's loads go out with Q's, so the K block pays one memory
+    // round trip rather than a second one after its Q stores. That wins while
+    // the op is latency-bound (H=16 T=192 4.24 -> 3.47 us, H=128 T=32 4.15 ->
+    // 3.52 us); once it is bandwidth-bound the registers they hold cost more
+    // (+5..8% at eight heads, +10% at two heads with 64 rows per CU).
+    in_vec_t k_nope_in{};
+    PeOperands k_pe_op{};
+    if(K_EARLY && head_base == 0) // uniform
+    {
+        auto in_buf = opus::make_gmem<scalar_t>(kv_c + token_idx * kv_c_stride,
+                                                KV_LORA * sizeof(scalar_t));
+        k_nope_in   = in_buf.template load<VEC>(threadIdx.x * VEC);
+        k_pe_op     = rope_pe_issue(k_pe + token_idx * k_pe_stride, 0, PE_DIM,
+                                    threadIdx.x % PE_CHUNKS, threadIdx.x < PE_CHUNKS);
+    }
 
     // ================= Q (HPT heads per block) =================
     //
@@ -2807,7 +2884,7 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
         // could retire with a tensor DMA still writing its LDS.
         if constexpr(HPT == 1)
         {
-            if(slot_idx < 0)
+            if(slot_idx < 0 && !compute_all_q_rope)
                 return;
         }
 
@@ -2821,17 +2898,18 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
         // one at a time, each head's store data landed in the registers the
         // next head's was about to use, and the wave sat in s_wait_xcnt behind
         // every store until the memory pipe had read it out.
-        out_vec_t nope_out[HPT];
+        q_vec_t nope_out[HPT];
 #pragma unroll
         for(int k = 0; k < HPT; ++k)
-            nope_out[k] = aiter::scaled_cast<cache_t>(lds_vec(k * COLS + col), inv_qscale);
-        cache_t* q_out_tok = q_out + token_idx * q_out_stride_0;
+            nope_out[k] = cvt_vec(lds_vec(k * COLS + col), inv_qscale, q_out);
+        query_t* q_out_tok = q_out + token_idx * q_out_stride_0;
 #pragma unroll
         for(int k = 0; k < HPT; ++k)
         {
-            auto out_buf = opus::make_gmem<cache_t>(q_out_tok + (head_base + k) * q_out_stride_1,
-                                                    KV_LORA * sizeof(cache_t));
-            out_buf.template store<VEC, out_vec_t>(nope_out[k], wave * COLS + col);
+            auto out_buf = opus::make_gmem<query_t>(
+                q_out_tok + (head_base + k) * q_out_stride_1 + NOPE_OFF,
+                KV_LORA * sizeof(query_t));
+            out_buf.template store<VEC, q_vec_t>(nope_out[k], wave * COLS + col);
         }
         {
             const bool pe_active = wave * PE_ROWS + pe_row < HPT;
@@ -2842,7 +2920,7 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
             if constexpr(IS_NEOX && !PE_EXCHANGE)
                 pe_op.y = lds_vec(HPT * COLS + pe_r * PE_DIM + (d0 ^ HALF));
             rope_pe_emit(pe_op,
-                         q_out_tok + (head_base + wave * PE_ROWS) * q_out_stride_1 + KV_LORA,
+                         q_out_tok + (head_base + wave * PE_ROWS) * q_out_stride_1 + PE_OFF,
                          static_cast<int>(pe_r * q_out_stride_1),
                          static_cast<int>((PE_ROWS - 1) * q_out_stride_1) + PE_DIM,
                          inv_qscale, pe_chunk, pe_active);
@@ -2900,21 +2978,23 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
         // A padded token (HPT > 1 returned up front) is dropped the same way,
         // by an out-of-bounds offset: a return here is a branch the compiler
         // may sink the nope load past, which ATT showed it doing.
-        const bool q_live = HPT > 1 || slot_idx >= 0; // uniform over the block
+        const bool q_live =
+            HPT > 1 || slot_idx >= 0 || compute_all_q_rope; // uniform over the block
 #pragma unroll
         for(int k = 0; k < HPT; ++k)
         {
             const int h        = head_base + k;
-            cache_t* q_out_row = q_out + token_idx * q_out_stride_0 + h * q_out_stride_1;
-            auto out_buf = opus::make_gmem<cache_t>(q_out_row, KV_LORA * sizeof(cache_t));
-            out_buf.template store<VEC, out_vec_t>(
-                aiter::scaled_cast<cache_t>(nope_in[k], inv_qscale),
+            query_t* q_out_row =
+                q_out + token_idx * q_out_stride_0 + h * q_out_stride_1 + NOPE_OFF;
+            auto out_buf = opus::make_gmem<query_t>(q_out_row, KV_LORA * sizeof(query_t));
+            out_buf.template store<VEC, q_vec_t>(
+                cvt_vec(nope_in[k], inv_qscale, q_out),
                 q_live ? static_cast<int>(threadIdx.x) * VEC : KV_LORA);
         }
         if(wave_pe)
             rope_pe_emit(pe_op,
                          q_out + token_idx * q_out_stride_0 + head_base * q_out_stride_1 +
-                             KV_LORA,
+                             PE_OFF,
                          static_cast<int>(pe_h * q_out_stride_1),
                          static_cast<int>((HPT - 1) * q_out_stride_1) + PE_DIM,
                          inv_qscale, pe_chunk, pe_lane && q_live);
@@ -2923,29 +3003,58 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
     // ================= K (only head 0, kv=1) =================
     // A scalar branch (SCC, not EXEC), so no WAR drain: the one-head direct
     // path no longer returns early for a padded token.
-    if(blockIdx.x == 0 && slot_idx >= 0)
+    if(head_base == 0 && slot_idx >= 0)
     {
         const float inv_kscale = 1.0f / (*k_scale);
-        const int64_t block_idx    = slot_idx / PAGE_SIZE;
-        const int64_t block_offset = slot_idx % PAGE_SIZE;
-        const int64_t nope_base    = block_idx * block_stride + block_offset * KV_LORA;
-        const int64_t rope_base    =
-            block_idx * block_stride + (int64_t)PAGE_SIZE * KV_LORA + block_offset * PE_DIM;
-
-        // nope: vectorized static quant.
-        const scalar_t* kv_c_row = kv_c + token_idx * kv_c_stride;
-        auto in_buf  = opus::make_gmem<scalar_t>(kv_c_row, KV_LORA * sizeof(scalar_t));
-        auto out_buf = opus::make_gmem<cache_t>(kv_cache + nope_base, KV_LORA * sizeof(cache_t));
-        for(int v = threadIdx.x; v < NUM_VEC; v += blockDim.x)
+        int64_t nope_base, rope_base;
+        if constexpr(PAGE_SIZE > 0)
         {
-            in_vec_t  vin  = in_buf.template load<VEC>(v * VEC);
-            out_vec_t vout = aiter::scaled_cast<cache_t>(vin, inv_kscale);
-            out_buf.template store<VEC, out_vec_t>(vout, v * VEC);
+            const int64_t block_idx    = slot_idx / PAGE_SIZE;
+            const int64_t block_offset = slot_idx % PAGE_SIZE;
+            nope_base = block_idx * block_stride + block_offset * KV_LORA;
+            rope_base =
+                block_idx * block_stride + (int64_t)PAGE_SIZE * KV_LORA + block_offset * PE_DIM;
         }
+        else
+        {
+            int64_t block_idx, block_offset;
+            if(slot_idx < (int64_t(1) << 31))
+            {
+                const uint32_t s = static_cast<uint32_t>(slot_idx);
+                const uint32_t b = (__umulhi(s, bs_magic) + s) >> bs_shift;
+                block_idx        = b;
+                block_offset     = s - b * static_cast<uint32_t>(block_size);
+            }
+            else
+            {
+                block_idx    = slot_idx / block_size;
+                block_offset = slot_idx % block_size;
+            }
+            const int64_t entry = block_idx * block_stride + block_offset * entry_stride;
+            nope_base = entry + NOPE_OFF;
+            rope_base = entry + PE_OFF;
+        }
+        auto out_buf = opus::make_gmem<cache_t>(kv_cache + nope_base, KV_LORA * sizeof(cache_t));
+        if constexpr(K_EARLY)
+        {
+            out_buf.template store<VEC, out_vec_t>(cvt_vec(k_nope_in, inv_kscale, kv_cache),
+                                                   threadIdx.x * VEC);
+            rope_pe_emit(k_pe_op, kv_cache + rope_base, 0, PE_DIM, inv_kscale,
+                         threadIdx.x % PE_CHUNKS, threadIdx.x < PE_CHUNKS);
+        }
+        else
+        {
+            // nope: vectorized static quant.
+            const scalar_t* kv_c_row = kv_c + token_idx * kv_c_stride;
+            auto in_buf = opus::make_gmem<scalar_t>(kv_c_row, KV_LORA * sizeof(scalar_t));
+            in_vec_t vin = in_buf.template load<VEC>(threadIdx.x * VEC);
+            out_buf.template store<VEC, out_vec_t>(cvt_vec(vin, inv_kscale, kv_cache),
+                                                   threadIdx.x * VEC);
 
-        // pe: RoPE then static quant.
-        const scalar_t* k_pe_row = k_pe + token_idx * k_pe_stride;
-        rope_pe_seg(k_pe_row, kv_cache + rope_base, inv_kscale);
+            // pe: RoPE then static quant.
+            const scalar_t* k_pe_row = k_pe + token_idx * k_pe_stride;
+            rope_pe_seg(k_pe_row, kv_cache + rope_base, inv_kscale);
+        }
     }
 }
 
@@ -5175,6 +5284,144 @@ void cp_gather_indexer_k_quant_cache(
     }
 }
 
+// Heads per block for fused_qk_rope_concat_and_cache_mla_seg_kernel. Only
+// worth it once there is enough work to be bandwidth-bound: below ~32
+// (token, head) rows per CU the op sits on its latency floor, and there the
+// shortest per-block path wins -- H=32 T=192 runs 6.34 us at one head per
+// block and 6.75 us at eight. Above it, take the largest power of two up to 8
+// that divides num_heads, so every block is full; 8 is also the most heads
+// whose pe the block's lanes can hold (8 x PE_CHUNKS). H=128 T=768: 35.3 us at
+// 1, 20.0 us at 8.
+static int mla_rope_heads_per_block(int64_t num_tokens, int num_heads)
+{
+    if(num_tokens * num_heads < 32 * static_cast<int64_t>(get_num_cu_func()))
+        return 1;
+    for(int h = 8; h >= 2; h >>= 1)
+        if(num_heads % h == 0)
+            return h;
+    return 1;
+}
+
+// Dynamic LDS of the gfx1250 TDM Q staging (see the kernel): two waves, each
+// hpt x 256 nope plus min(hpt, 4) x 64 pe elements.
+static size_t mla_rope_tdm_lds_bytes(int hpt, size_t elem_size)
+{
+    static const bool tdm_arch = get_gpu_arch() == "gfx1250";
+    if(!tdm_arch || ((AITER_MLA_SEG_TDM_HPT_MASK >> hpt) & 1) == 0)
+        return 0;
+    return size_t(2) * (hpt * 256 + std::min(hpt, 4) * 64) * elem_size;
+}
+
+// Heads per block and K_EARLY on the flat head-group-major grid of the
+// per-entry layout, fit on gfx1250 (H=16/32/128, T=1..4096) against the
+// (token, head) rows per CU: one head with K early up to 32, two with K
+// early up to 48, two up to 80, four up to 160, eight beyond.
+static int mla_rope_entry_heads_per_block(int64_t num_tokens, int num_heads, bool& k_early)
+{
+    const int64_t per_cu = num_tokens * num_heads / get_num_cu_func();
+    int hpt              = per_cu <= 48 ? (per_cu <= 32 ? 1 : 2) : per_cu <= 80 ? 2
+                         : per_cu <= 160 ? 4 : 8;
+    while(num_heads % hpt != 0)
+        hpt >>= 1;
+    k_early = hpt == 1 || per_cu <= 48;
+    return hpt;
+}
+
+// n / d == (umulhi(n, magic) + n) >> shift for every n < 2^31.
+static void mla_rope_fast_div(uint32_t d, uint32_t& magic, int& shift)
+{
+    shift = 0;
+    while((uint64_t(1) << shift) < d)
+        ++shift;
+    magic = static_cast<uint32_t>(((uint64_t(1) << 32) * ((uint64_t(1) << shift) - d)) / d + 1);
+}
+
+struct MlaRopeHptArgs
+{
+    void *q_nope, *q_pe, *kv_c, *k_pe, *kv_cache, *q_out;
+    const int64_t *slot_mapping, *positions;
+    const void *cos_cache, *sin_cache;
+    const float *q_scale, *k_scale;
+    int num_tokens, num_heads;
+    int64_t q_nope_stride_0, q_nope_stride_1, q_pe_stride_0, q_pe_stride_1;
+    int64_t q_out_stride_0, q_out_stride_1, kv_c_stride, k_pe_stride;
+    int64_t cos_stride0, sin_stride0, block_stride, entry_stride;
+    int max_position, block_size;
+    bool is_neox, is_nope_first, compute_all_q_rope;
+};
+
+// fused_qk_rope_concat_and_cache_mla on the head-grouped kernel, plain
+// per-entry cache layout (PAGE_SIZE = 0).
+template <typename scalar_t, typename cache_t, typename query_t>
+static void launch_mla_rope_hpt(const MlaRopeHptArgs& a, hipStream_t stream)
+{
+    if constexpr(std::is_same_v<scalar_t, float>)
+    {
+        AITER_CHECK(false, "fp32 input is not supported by the head-grouped MLA kernel");
+    }
+    else
+    {
+        constexpr int KV_LORA = 512, PE_DIM = 64, VEC = 8;
+        bool k_early;
+        const int hpt         = mla_rope_entry_heads_per_block(a.num_tokens, a.num_heads, k_early);
+        const size_t lds      = mla_rope_tdm_lds_bytes(hpt, sizeof(scalar_t));
+        uint32_t tok_magic;
+        int tok_shift;
+        mla_rope_fast_div(static_cast<uint32_t>(a.num_tokens), tok_magic, tok_shift);
+        uint32_t bs_magic;
+        int bs_shift;
+        mla_rope_fast_div(static_cast<uint32_t>(a.block_size), bs_magic, bs_shift);
+        const dim3 grid(static_cast<unsigned>(int64_t(a.num_heads / hpt) * a.num_tokens));
+        const dim3 block(KV_LORA / VEC);
+#define LAUNCH_MLA_ROPE_HPT_C(NEOX, NF, HPT_, CAQR, KE)                                        \
+    aiter::fused_qk_rope_concat_and_cache_mla_seg_kernel<scalar_t, cache_t, query_t, KV_LORA,  \
+                                                         PE_DIM, 0, NEOX, NF, VEC, HPT_, CAQR, \
+                                                         KE>                                   \
+        <<<grid, block, lds, stream>>>(                                                        \
+            static_cast<const scalar_t*>(a.q_nope), static_cast<const scalar_t*>(a.q_pe),      \
+            static_cast<const scalar_t*>(a.kv_c), static_cast<const scalar_t*>(a.k_pe),        \
+            static_cast<cache_t*>(a.kv_cache), static_cast<query_t*>(a.q_out),                 \
+            a.slot_mapping, a.positions, static_cast<const scalar_t*>(a.cos_cache),            \
+            static_cast<const scalar_t*>(a.sin_cache), a.q_scale, a.k_scale, a.num_heads,      \
+            a.q_nope_stride_0, a.q_nope_stride_1, a.q_pe_stride_0, a.q_pe_stride_1,            \
+            a.q_out_stride_0, a.q_out_stride_1, a.kv_c_stride, a.k_pe_stride, a.cos_stride0,   \
+            a.sin_stride0, a.block_stride, a.max_position, a.entry_stride, a.block_size,       \
+            a.num_tokens, tok_magic, tok_shift, bs_magic, bs_shift)
+#define LAUNCH_MLA_ROPE_HPT(NEOX, NF, HPT_, KE)                  \
+    do                                                           \
+    {                                                            \
+        if(a.compute_all_q_rope)                                 \
+            LAUNCH_MLA_ROPE_HPT_C(NEOX, NF, HPT_, true, KE);     \
+        else                                                     \
+            LAUNCH_MLA_ROPE_HPT_C(NEOX, NF, HPT_, false, KE);    \
+    } while(0)
+#define LAUNCH_MLA_ROPE_HPT_H(NEOX, NF)                                  \
+    switch(hpt)                                                          \
+    {                                                                    \
+    case 8: LAUNCH_MLA_ROPE_HPT(NEOX, NF, 8, false); break;              \
+    case 4: LAUNCH_MLA_ROPE_HPT(NEOX, NF, 4, false); break;              \
+    case 2:                                                              \
+        if(k_early)                                                      \
+            LAUNCH_MLA_ROPE_HPT(NEOX, NF, 2, true);                      \
+        else                                                             \
+            LAUNCH_MLA_ROPE_HPT(NEOX, NF, 2, false);                     \
+        break;                                                           \
+    default: LAUNCH_MLA_ROPE_HPT(NEOX, NF, 1, true); break;              \
+    }
+        if(a.is_neox && a.is_nope_first)
+            LAUNCH_MLA_ROPE_HPT_H(true, true)
+        else if(a.is_neox)
+            LAUNCH_MLA_ROPE_HPT_H(true, false)
+        else if(a.is_nope_first)
+            LAUNCH_MLA_ROPE_HPT_H(false, true)
+        else
+            LAUNCH_MLA_ROPE_HPT_H(false, false)
+#undef LAUNCH_MLA_ROPE_HPT_H
+#undef LAUNCH_MLA_ROPE_HPT
+#undef LAUNCH_MLA_ROPE_HPT_C
+    }
+}
+
 void fused_qk_rope_concat_and_cache_mla(
     aiter_tensor_t& q_nope,        // [num_tokens, num_heads, qk_lora_rank]
     aiter_tensor_t& q_pe,          // [num_tokens, num_heads, pe_dim]
@@ -5256,6 +5503,66 @@ void fused_qk_rope_concat_and_cache_mla(
   }
   AITER_CHECK(kv_c.stride(-1) == 1, "kv_c stride(-1) must be equal to 1");
   AITER_CHECK(k_pe.stride(-1) == 1, "k_pe stride(-1) must be equal to 1");
+
+  // DeepSeek MLA decode (kv_lora 512, rope 64, one kv head, 16-bit input):
+  // the head-grouped kernel shared with the segmented cache path. It loads
+  // and stores 16 B / VEC-element vectors and addresses Q with int32 offsets
+  // per token.
+  {
+    const bool one_kv_head = (kv_c.dim() == 2 && k_pe.dim() == 2) ||
+                             (kv_c.dim() == 3 && k_pe.dim() == 3 && kv_c.size(1) == 1 &&
+                              k_pe.size(1) == 1);
+    const auto in_dt = kv_c.dtype();
+    auto al16 = [](const aiter_tensor_t& t) {
+      return reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0;
+    };
+    const int64_t vec_strides[] = {q_nope.stride(0), q_nope.stride(1), q_pe.stride(0),
+                                   q_pe.stride(1),   q_out.stride(0),  q_out.stride(1),
+                                   kv_c.stride(0),   k_pe.stride(0),   cos_cache.stride(0),
+                                   sin_cache.stride(0), kv_cache.stride(0), kv_cache.stride(1)};
+    bool strides_ok = true;
+    for (int64_t s : vec_strides)
+      strides_ok = strides_ok && s % 8 == 0;
+    const int64_t cs_span = cos_cache.size(0) * std::max(cos_cache.stride(0), sin_cache.stride(0)) *
+                            cos_cache.element_size();
+    const int64_t q_span = (num_heads - 1) * std::max({q_nope.stride(1), q_pe.stride(1),
+                                                       q_out.stride(1)}) + kv_lora_rank + pe_dim;
+    const bool use_hpt =
+        one_kv_head && kv_lora_rank == 512 &&
+        qk_lora_rank == 512 && pe_dim == 64 && rot_dim == 64 && q_pe.size(-1) == 64 &&
+        (in_dt == AITER_DTYPE_bf16 || in_dt == AITER_DTYPE_fp16) && q_nope.dtype() == in_dt &&
+        q_pe.dtype() == in_dt && k_pe.dtype() == in_dt && cos_cache.dtype() == in_dt &&
+        sin_cache.dtype() == in_dt && q_nope.stride(-1) == 1 && q_pe.stride(-1) == 1 &&
+        q_out.stride(-1) == 1 && sin_cache.size(0) == cos_cache.size(0) &&
+        strides_ok &&
+        al16(q_nope) && al16(q_pe) && al16(kv_c) && al16(k_pe) && al16(q_out) && al16(kv_cache) &&
+        al16(cos_cache) && al16(sin_cache) && num_tokens > 0 &&
+        static_cast<int64_t>(num_tokens) * num_heads < (int64_t(1) << 31) &&
+        max_position > 0 && cs_span <= std::numeric_limits<int32_t>::max() &&
+        q_span * 2 <= std::numeric_limits<int32_t>::max();
+    if (use_hpt) {
+      MlaRopeHptArgs a{q_nope.data_ptr(), q_pe.data_ptr(), kv_c.data_ptr(), k_pe.data_ptr(),
+                       kv_cache.data_ptr(), q_out.data_ptr(),
+                       reinterpret_cast<const int64_t*>(slot_mapping.data_ptr()),
+                       reinterpret_cast<const int64_t*>(positions.data_ptr()),
+                       cos_cache.data_ptr(), sin_cache.data_ptr(),
+                       reinterpret_cast<const float*>(q_scale.data_ptr()),
+                       reinterpret_cast<const float*>(k_scale.data_ptr()),
+                       num_tokens, num_heads,
+                       q_nope.stride(0), q_nope.stride(1), q_pe.stride(0), q_pe.stride(1),
+                       q_out.stride(0), q_out.stride(1), kv_c.stride(0), k_pe.stride(0),
+                       cos_cache.stride(0), sin_cache.stride(0),
+                       kv_cache.stride(0), kv_cache.stride(1),
+                       max_position, block_size,
+                       is_neox, is_nope_first, compute_all_q_rope};
+#define CALL_MLA_ROPE_HPT(KV_T, CACHE_T, QUERY_T, KV_DTYPE, Q_DTYPE) \
+      launch_mla_rope_hpt<KV_T, CACHE_T, QUERY_T>(a, stream);
+      DISPATCH_BY_KV_CACHE_QUERY_DTYPE_OPUS_rmTorch(in_dt, kv_cache_dtype, q_out_type,
+                                                    CALL_MLA_ROPE_HPT);
+#undef CALL_MLA_ROPE_HPT
+      return;
+    }
+  }
   // ============================================================================
   // Kernel Dispatch Logic
   // ============================================================================
@@ -5492,41 +5799,17 @@ void fused_qk_rope_concat_and_cache_mla_seg(
     constexpr int VEC = 8;
     static_assert(KV_LORA % VEC == 0, "KV_LORA must be divisible by VEC");
 
-    // Heads per block (see the kernel). Only worth it once there is enough
-    // work to be bandwidth-bound: below ~32 (token, head) rows per CU the op
-    // sits on its latency floor, and there the shortest per-block path wins --
-    // H=32 T=192 runs 6.34 us at one head per block and 6.75 us at eight.
-    // Above it, take the largest power of two up to 8 that divides num_heads,
-    // so every block is full; 8 is also the most heads whose pe the block's
-    // lanes can hold (8 x PE_CHUNKS). H=128 T=768: 35.3 us at 1, 20.0 us at 8.
-    const int64_t rows = static_cast<int64_t>(num_tokens) * num_heads;
-    int hpt            = 1;
-    if(rows >= 32 * static_cast<int64_t>(get_num_cu_func()))
-    {
-        for(int h = 8; h >= 2; h >>= 1)
-        {
-            if(num_heads % h == 0)
-            {
-                hpt = h;
-                break;
-            }
-        }
-    }
-
-    // The eight-head path stages Q through TDM on gfx1250 (see the kernel):
-    // two waves, each 8 x 256 nope plus 4 x 64 pe elements.
-    static const bool tdm_arch = get_gpu_arch() == "gfx1250";
-    const bool tdm_q = tdm_arch && ((AITER_MLA_SEG_TDM_HPT_MASK >> hpt) & 1) != 0;
-    const size_t tdm_lds_bytes =
-        tdm_q ? size_t(2) * (hpt * 256 + std::min(hpt, 4) * 64) * q_nope.element_size() : 0;
+    const int hpt              = mla_rope_heads_per_block(num_tokens, num_heads);
+    const size_t tdm_lds_bytes = mla_rope_tdm_lds_bytes(hpt, q_nope.element_size());
 
     // The kernel indexes nope vectors by threadIdx.x, one per thread.
     dim3 grid((unsigned)(num_heads / hpt), (unsigned)num_tokens);
     dim3 block(KV_LORA / VEC);
 
 #define LAUNCH_MLA_NORM_ROPE(SCALAR_T, NEOX, HPT_)                                        \
-    aiter::fused_qk_rope_concat_and_cache_mla_seg_kernel<SCALAR_T, opus::fp8_t, KV_LORA,  \
-                                                         PE_DIM, PAGE_SIZE, NEOX, VEC,    \
+    aiter::fused_qk_rope_concat_and_cache_mla_seg_kernel<SCALAR_T, opus::fp8_t,           \
+                                                         opus::fp8_t, KV_LORA, PE_DIM,    \
+                                                         PAGE_SIZE, NEOX, true, VEC,      \
                                                          HPT_>                            \
         <<<grid, block, tdm_lds_bytes, stream>>>(                                         \
             reinterpret_cast<SCALAR_T*>(q_nope.data_ptr()),                               \
