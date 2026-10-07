@@ -143,6 +143,78 @@ def _take_k3_presorted_moe(topk_ids, *, block_m, num_experts, topk):
     return aux
 
 
+# Stage1's intermediate is consumed immediately by stage2, so it can be shared
+# across layers. Keyed by stream so overlapping launches stay correct, and by
+# exact shape so graph-baked pointers stay stable.
+_FLYDSL_STAGE1_OUT_CACHE: dict[
+    tuple[torch.device, int, tuple[int, int]], torch.Tensor
+] = {}
+_FLYDSL_STAGE1_FP4_OUT_CACHE: dict[
+    tuple[torch.device, int, tuple[int, int]], torch.Tensor
+] = {}
+
+# Stage2's reduce epilog scratch is [M, topk, D], ~1.9 GiB per layer at
+# M=16384. Shared across layers on the same stream like the stage1 scratch.
+_FLYDSL_STAGE2_REDUCE_TARGET_CACHE: dict[
+    tuple[torch.device, int, tuple, torch.dtype], torch.Tensor
+] = {}
+
+
+def _get_flydsl_stage1_out(
+    shape: tuple[int, int],
+    device: torch.device,
+) -> torch.Tensor:
+    if os.environ.get("AITER_FLYDSL_STAGE1_SCRATCH_REUSE", "0").lower() not in (
+        "1",
+        "true",
+    ):
+        return torch.empty(shape, dtype=dtypes.fp8, device=device)
+    stream = torch.cuda.current_stream(device=device).cuda_stream
+    key = (device, stream, shape)
+    out = _FLYDSL_STAGE1_OUT_CACHE.get(key)
+    if out is None:
+        out = torch.empty(shape, dtype=dtypes.fp8, device=device)
+        _FLYDSL_STAGE1_OUT_CACHE[key] = out
+    return out
+
+
+def _get_flydsl_stage1_fp4_out(
+    shape: tuple[int, int],
+    device: torch.device,
+) -> torch.Tensor:
+    if os.environ.get("AITER_FLYDSL_STAGE1_SCRATCH_REUSE", "0").lower() not in (
+        "1",
+        "true",
+    ):
+        return torch.empty(shape, dtype=dtypes.fp4x2, device=device)
+    stream = torch.cuda.current_stream(device=device).cuda_stream
+    key = (device, stream, shape)
+    out = _FLYDSL_STAGE1_FP4_OUT_CACHE.get(key)
+    if out is None:
+        out = torch.empty(shape, dtype=dtypes.fp4x2, device=device)
+        _FLYDSL_STAGE1_FP4_OUT_CACHE[key] = out
+    return out
+
+
+def _get_flydsl_stage2_reduce_target(
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    if os.environ.get("AITER_FLYDSL_STAGE2_SCRATCH_REUSE", "0").lower() not in (
+        "1",
+        "true",
+    ):
+        return torch.empty(shape, dtype=dtype, device=device)
+    stream = torch.cuda.current_stream(device=device).cuda_stream
+    key = (device, stream, shape, dtype)
+    out = _FLYDSL_STAGE2_REDUCE_TARGET_CACHE.get(key)
+    if out is None:
+        out = torch.empty(shape, dtype=dtype, device=device)
+        _FLYDSL_STAGE2_REDUCE_TARGET_CACHE[key] = out
+    return out
+
+
 # FLAT 1stage asm kernels (manifest flat=1) ingest raw topk_ids /
 # topk_weights through the sorted_* kernarg slots and accumulate via
 # global_atomic_pk_add_bf16, so moe_sorting is a pass-through for them.
@@ -2172,6 +2244,22 @@ def _flydsl_stage1_wrapper(
         raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
     if out_dtype is not None:
         parsed = {**parsed, "out_dtype": out_dtype}
+    if (
+        out is None
+        and v2_output_layout
+        and parsed.get("k_batch", 1) == 1
+        and not (parsed["a_dtype"] == "bf16" and parsed["b_dtype"] == "fp4")
+    ):
+        device = hidden_states.device
+        inter_dim = w1.shape[1] // 2
+        sorted_rows = max(
+            sorted_token_ids.shape[0],
+            sorted_expert_ids.shape[0] * parsed["tile_m"],
+        )
+        if parsed["out_dtype"] == "fp8":
+            out = _get_flydsl_stage1_out((sorted_rows, inter_dim), device)
+        elif parsed["out_dtype"] == "fp4":
+            out = _get_flydsl_stage1_fp4_out((sorted_rows, inter_dim // 2), device)
     if activation == ActivationType.Swiglu:
         act = "swiglu"
     elif activation == ActivationType.Situv2:
@@ -2927,7 +3015,7 @@ def _flydsl_v2_stage2_wrapper(
             _fp8_scale_blk = fp8out_scale_blk(model_dim_runtime) if _kstatic else 8
             _fp8_pitch_align = FP8OUT_PITCH_ALIGN if _kstatic else 0
 
-            target = torch.empty(
+            target = _get_flydsl_stage2_reduce_target(
                 (
                     token_num * topk,
                     fp8out_row_bytes(
@@ -2936,14 +3024,14 @@ def _flydsl_v2_stage2_wrapper(
                         pitch_align=_fp8_pitch_align,
                     ),
                 ),
-                dtype=torch.uint8,
-                device=out.device,
+                torch.uint8,
+                out.device,
             )
         else:
-            target = torch.empty(
+            target = _get_flydsl_stage2_reduce_target(
                 (token_num, topk, model_dim_runtime),
-                dtype=out.dtype,
-                device=out.device,
+                out.dtype,
+                out.device,
             )
         if expert_mask is not None:
             # EP sorting omits remote and fake routes, so GEMM2 intentionally
