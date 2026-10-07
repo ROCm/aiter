@@ -189,6 +189,10 @@ def fused_qk_norm_rope_gate_fp8_quant(
         raise ValueError("quant_token_start must be within the actual-token range")
     if not 0 <= quant_sequence_start <= num_sequences:
         raise ValueError("quant_sequence_start must be within the sequence range")
+    # The suffix may begin inside its first sequence, and cu_seqlens[-1] may
+    # extend past num_actual_tokens. Reductions clip each sequence to
+    # [max(cu_seqlens[s], quant_token_start), min(cu_seqlens[s + 1],
+    # num_actual_tokens)) on device, so those bounds are not compared here.
     if (num_quant_tokens == 0) != (num_quant_sequences == 0):
         raise ValueError(
             "quantized token and sequence suffixes must both be empty or non-empty"

@@ -94,6 +94,8 @@ def _expected_descales(
     quant_sequence_start: int,
     num_query_heads: int = NUM_QUERY_HEADS,
     num_kv_heads: int = NUM_KV_HEADS,
+    token_lo: int = 0,
+    token_hi: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     query = query.view(-1, num_query_heads, HEAD_DIM).float()
     key = key.view(-1, num_kv_heads, HEAD_DIM).float()
@@ -109,8 +111,14 @@ def _expected_descales(
         for _ in range(3)
     ]
     for sequence in range(quant_sequence_start, num_sequences):
-        start = int(cu_seqlens[sequence].item())
+        start = max(int(cu_seqlens[sequence].item()), token_lo)
         end = int(cu_seqlens[sequence + 1].item())
+        if token_hi is not None:
+            end = min(end, token_hi)
+        if start >= end:
+            for item in output:
+                item[sequence].fill_(1.0e-12)
+            continue
         for kv_head in range(num_kv_heads):
             q_head_start = kv_head * gqa_ratio
             q_head_end = q_head_start + gqa_ratio
@@ -701,8 +709,16 @@ def test_fused_qk_norm_rope_gate_fp8_quant_rejects_noncontiguous_inner_dim():
 
 @requires_gfx950
 def test_fused_qk_norm_rope_gate_fp8_quant_masks_misaligned_suffix():
+    """A suffix that starts inside its sequence must not read the prefix.
+
+    lengths [1, 1, 1, 16] with quant_token_start=4 and quant_sequence_start=3
+    puts the boundary one token after cu_seqlens[3]. V amax is uninitialized
+    for that prefix token, so the sequence scale has to be computed from
+    tokens [4, 19) only.
+    """
     lengths = [1, 1, 1, 16]
     inputs = _make_inputs(lengths)
+    _, _, value, _, _, _, _, cu_seqlens = inputs
     output = fused_qk_norm_rope_gate_fp8_quant(
         *inputs,
         num_actual_tokens=sum(lengths),
@@ -714,13 +730,51 @@ def test_fused_qk_norm_rope_gate_fp8_quant_masks_misaligned_suffix():
         rotary_dim=ROTARY_DIM,
         eps=EPS,
     )
-    reconstructed = output.value_fp8[4:].float() * output.value_descale[3, 0]
-    assert torch.isfinite(reconstructed).all()
+    torch.cuda.synchronize()
+    expected_descales = _expected_descales(
+        output.query,
+        output.key,
+        value,
+        cu_seqlens,
+        quant_sequence_start=3,
+        token_lo=4,
+    )
+    actual_descales = (
+        output.query_descale,
+        output.key_descale,
+        output.value_descale,
+    )
+    for actual, expected in zip(actual_descales, expected_descales):
+        torch.testing.assert_close(
+            actual[3:4],
+            expected[3:4],
+            rtol=2.0e-6,
+            atol=1.0e-8,
+        )
+    references = (
+        output.query.view(-1, NUM_QUERY_HEADS, HEAD_DIM).float(),
+        output.key.view(-1, NUM_KV_HEADS, HEAD_DIM).float(),
+        value.view(-1, NUM_KV_HEADS, HEAD_DIM).float(),
+    )
+    quantized = (output.query_fp8, output.key_fp8, output.value_fp8)
+    for reference, fp8, descale in zip(references, quantized, actual_descales):
+        reconstructed = fp8[4:].float() * descale[3, 0]
+        relative_error = (reconstructed - reference[4:]).abs().amax() / reference[
+            4:
+        ].abs().amax()
+        assert relative_error < 0.04
+        assert torch.isfinite(reconstructed).all()
 
 
 @requires_gfx950
 def test_fused_qk_norm_rope_gate_fp8_quant_bounds_padded_tokens():
+    """cu_seqlens[-1] past num_actual_tokens must not enter the scales.
+
+    Two sequences of 8 with num_actual_tokens=12 leaves V amax uninitialized
+    for tokens 12-15. Sequence 1's scale is tokens [8, 12) only.
+    """
     inputs = _make_inputs([8, 8])
+    _, _, value, _, _, _, _, cu_seqlens = inputs
     output = fused_qk_norm_rope_gate_fp8_quant(
         *inputs,
         num_actual_tokens=12,
@@ -730,9 +784,42 @@ def test_fused_qk_norm_rope_gate_fp8_quant_bounds_padded_tokens():
         rotary_dim=ROTARY_DIM,
         eps=EPS,
     )
-    assert torch.isfinite(output.query_descale[:2]).all()
-    assert torch.isfinite(output.key_descale[:2]).all()
-    assert torch.isfinite(output.value_descale[:2]).all()
+    torch.cuda.synchronize()
+    expected_descales = _expected_descales(
+        output.query,
+        output.key,
+        value,
+        cu_seqlens,
+        quant_sequence_start=0,
+        token_hi=12,
+    )
+    actual_descales = (
+        output.query_descale,
+        output.key_descale,
+        output.value_descale,
+    )
+    for actual, expected in zip(actual_descales, expected_descales):
+        torch.testing.assert_close(
+            actual[:2],
+            expected,
+            rtol=2.0e-6,
+            atol=1.0e-8,
+        )
+    references = (
+        output.query.view(-1, NUM_QUERY_HEADS, HEAD_DIM).float(),
+        output.key.view(-1, NUM_KV_HEADS, HEAD_DIM).float(),
+        value.view(-1, NUM_KV_HEADS, HEAD_DIM).float(),
+    )
+    quantized = (output.query_fp8, output.key_fp8, output.value_fp8)
+    spans = ((0, 0, 8), (1, 8, 12))
+    for sequence, start, end in spans:
+        for reference, fp8, descale in zip(references, quantized, actual_descales):
+            reconstructed = fp8[start:end].float() * descale[sequence, 0]
+            relative_error = (
+                reconstructed - reference[start:end]
+            ).abs().amax() / reference[start:end].abs().amax()
+            assert relative_error < 0.04
+            assert torch.isfinite(reconstructed).all()
 
 
 def test_flash_attn_varlen_rejects_descales_without_ck(monkeypatch):
