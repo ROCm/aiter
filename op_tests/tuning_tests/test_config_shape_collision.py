@@ -55,6 +55,7 @@ FAMILIES = [
     ("AITER_CONFIG_GEMM_A6W6", "a6w6_blockscale_tuned_gemm"),
     ("AITER_CONFIG_GEMM_A6W4_ASM", "a6w4_asm_tuned_gemm"),
     ("AITER_CONFIG_GEMM_A4W6_ASM", "a4w6_asm_tuned_gemm"),
+    ("AITER_CONFIG_GEMM_A16W8_MXFP8_ASM", "a16w8_mxfp8_asm_tuned_gemm"),
     ("AITER_CONFIG_GEMM_A8W8", "a8w8_tuned_gemm"),
     ("AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE", "a8w8_bpreshuffle_tuned_gemm"),
     ("AITER_CONFIG_GEMM_A8W8_BLOCKSCALE", "a8w8_blockscale_tuned_gemm"),
@@ -206,6 +207,11 @@ class TestConfigShapeCollision(unittest.TestCase):
 
     def test_a4w6_asm(self):
         self._check_family("AITER_CONFIG_GEMM_A4W6_ASM", "a4w6_asm_tuned_gemm")
+
+    def test_a16w8_mxfp8_asm(self):
+        self._check_family(
+            "AITER_CONFIG_GEMM_A16W8_MXFP8_ASM", "a16w8_mxfp8_asm_tuned_gemm"
+        )
 
     def test_a8w8(self):
         self._check_family("AITER_CONFIG_GEMM_A8W8", "a8w8_tuned_gemm")

@@ -120,6 +120,11 @@ AITER_CONFIG_GEMM_A4W6_ASM = (
     or f"{AITER_ROOT_DIR}/aiter/configs/a4w6_asm_tuned_gemm.csv"
 )
 
+AITER_CONFIG_GEMM_A16W8_MXFP8_ASM = (
+    os.getenv("AITER_CONFIG_GEMM_A16W8_MXFP8_ASM", "").strip()
+    or f"{AITER_ROOT_DIR}/aiter/configs/a16w8_mxfp8_asm_tuned_gemm.csv"
+)
+
 AITER_CONFIG_GEMM_A8W8 = os.getenv(
     "AITER_CONFIG_GEMM_A8W8",
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_tuned_gemm.csv",
@@ -272,6 +277,14 @@ class AITER_CONFIG:
             "AITER_CONFIG_GEMM_A4W6_ASM",
             AITER_CONFIG_GEMM_A4W6_ASM,
             "a4w6_asm_tuned_gemm",
+        )
+
+    @property
+    def AITER_CONFIG_GEMM_A16W8_MXFP8_ASM_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A16W8_MXFP8_ASM",
+            AITER_CONFIG_GEMM_A16W8_MXFP8_ASM,
+            "a16w8_mxfp8_asm_tuned_gemm",
         )
 
     @property
