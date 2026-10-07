@@ -6,9 +6,58 @@
 import torch
 import triton
 
+from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton._triton_kernels.normalization.fused_rmsnorm_add_rmsnorm import (
     _fused_rmsnorm_add_rmsnorm_kernel,
 )
+
+
+def _fused_rmsnorm_add_rmsnorm_into_fake(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_weight: torch.Tensor,
+    pre_weight: torch.Tensor,
+    post_eps: float,
+    pre_eps: float,
+    residual_out: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    return None
+
+
+# The registered op only mutates buffers: custom ops cannot return an input
+# tensor as an output alias. The public wrapper below owns allocation and return.
+@torch_compile_guard(
+    mutates_args=["residual_out", "out"],
+    gen_fake=_fused_rmsnorm_add_rmsnorm_into_fake,
+)
+def _fused_rmsnorm_add_rmsnorm_into(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_weight: torch.Tensor,
+    pre_weight: torch.Tensor,
+    post_eps: float,
+    pre_eps: float,
+    residual_out: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    M, N = x.shape
+    if M:
+        block = triton.next_power_of_2(N)
+        num_warps = 4 if M <= 128 else 8
+        _fused_rmsnorm_add_rmsnorm_kernel[(M,)](
+            x,
+            residual,
+            post_weight,
+            pre_weight,
+            residual_out,
+            out,
+            N,
+            post_eps,
+            pre_eps,
+            BLOCK_SIZE_N=block,
+            num_warps=num_warps,
+        )
 
 
 def fused_rmsnorm_add_rmsnorm(
@@ -34,21 +83,7 @@ def fused_rmsnorm_add_rmsnorm(
     assert x.dtype == torch.bfloat16
     if out is None:
         out = torch.empty_like(x)
-    M, N = x.shape
-    if M:
-        block = triton.next_power_of_2(N)
-        num_warps = 4 if M <= 128 else 8
-        _fused_rmsnorm_add_rmsnorm_kernel[(M,)](
-            x,
-            residual,
-            post_weight,
-            pre_weight,
-            residual_out,
-            out,
-            N,
-            post_eps,
-            pre_eps,
-            BLOCK_SIZE_N=block,
-            num_warps=num_warps,
-        )
+    _fused_rmsnorm_add_rmsnorm_into(
+        x, residual, post_weight, pre_weight, post_eps, pre_eps, residual_out, out
+    )
     return out
