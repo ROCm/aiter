@@ -7,7 +7,7 @@ import torch
 
 import aiter
 from aiter.jit.utils.chip_info import get_gfx_runtime
-from aiter.ops.topk import _SAMPLED_MIN_STRIDE0
+from aiter.ops.topk import _SAMPLED_MIN_K, _SAMPLED_MIN_STRIDE0
 
 
 def _random_logits(num_rows, width):
@@ -34,12 +34,12 @@ def test_prefill_sampled_dispatch_routing():
         print("[prefill_sampled_dispatch] SKIP: `sampled` does not route on this arch")
         return
     num_rows, top_k = 4, 2048
-    indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
     below = floor // 2
     at_or_above = floor
 
-    def run_prefill(width, stable=False):
+    def run_prefill(width, stable=False, k=top_k):
         logits, row_starts, row_ends = _random_logits(num_rows, width)
+        indices = torch.empty((num_rows, k), dtype=torch.int32, device="cuda")
         aiter.top_k_per_row_prefill(
             logits,
             row_starts,
@@ -49,7 +49,7 @@ def test_prefill_sampled_dispatch_routing():
             num_rows,
             logits.stride(0),
             logits.stride(1),
-            k=top_k,
+            k=k,
             stable=stable,
         )
 
@@ -72,6 +72,12 @@ def test_prefill_sampled_dispatch_routing():
         sampled_fn.reset_mock()
         run_prefill(at_or_above, stable=True)
         assert not sampled_fn.called, "stable=True must not use `sampled`"
+
+        sampled_fn.reset_mock()
+        run_prefill(at_or_above, k=_SAMPLED_MIN_K - 1)
+        assert (
+            not sampled_fn.called
+        ), f"k={_SAMPLED_MIN_K - 1} is below the k floor and must not use `sampled`"
 
         sampled_fn.reset_mock()
         with mock.patch.dict(os.environ, {"AITER_DISABLE_TOPK_SAMPLED": "1"}):

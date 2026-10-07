@@ -456,6 +456,16 @@ _FLYDSL_TOPK_PREFILL_DISABLED = os.environ.get(
 # has not been re-measured.
 _SAMPLED_MIN_STRIDE0 = {"gfx950": 131072}
 
+# Below this k the sampled threshold rests on a handful of sample hits, and
+# enough rows land under k that some fall back to the exact full-row select:
+# still correct, but a call with one such row ran up to 5.3x slower than the
+# path it replaced. Measured on gfx950, bs 1..2048, N 131072..524288,
+# torch.randn: no row fell back at k >= 96 and `sampled` was faster through
+# both top_k_per_row_prefill and topk_select on every shape; at k = 64 two
+# shapes were slower through topk_select, and at k <= 48 most had fallback
+# rows. topk_select applies the same floor.
+_SAMPLED_MIN_K = 96
+
 
 def _should_use_sampled_prefill(
     numRows: int, stride0: int, stride1: int, k: int, stable: bool
@@ -468,7 +478,7 @@ def _should_use_sampled_prefill(
     would turn a working call into an error purely because `sampled` became
     available.
     """
-    if stable or stride1 != 1:
+    if stable or stride1 != 1 or k < _SAMPLED_MIN_K:
         return False
     if os.environ.get("AITER_DISABLE_TOPK_SAMPLED", "0") == "1":
         return False

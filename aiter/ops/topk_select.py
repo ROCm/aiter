@@ -59,6 +59,7 @@ from aiter.ops.flydsl.topk.topk_per_row_small_k import (
     topk_per_row_small_k_serves,
 )
 from aiter.ops.topk import (
+    _SAMPLED_MIN_K,
     top_k_per_row_prefill_sampled,
     topk_sampled_supports,
 )
@@ -684,7 +685,11 @@ def _sampled_takes(
     multi-block (`_plain_k2048_multiblock`), and the few-row band's rows past
     its width, which decode served 1.47x-2.56x slower. See
     `_PLAIN_K2048_MULTIBLOCK_ROWS`.
+
+    Nothing below `_SAMPLED_MIN_K`, whatever the shape: see its definition.
     """
+    if k < _SAMPLED_MIN_K:
+        return False
     if k == 2048 and width < _SAMPLED_MIN_WIDTH and get_gfx_runtime() == "gfx950":
         if _plain_k2048_multiblock(rows, width, ragged) or (
             rows <= _PLAIN_K2048_FEW_ROWS and width > _PLAIN_K2048_FEW_ROWS_MAX_WIDTH
