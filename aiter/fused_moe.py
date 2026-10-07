@@ -2655,6 +2655,7 @@ def _flydsl_v2_stage2_wrapper(
     expert_mask=None,
     topk_ids=None,
     topk_weights=None,
+    inter_dim_pad=0,
     **_kwargs,
 ):
     from aiter.ops.flydsl.kernels.mxmoe_dispatcher import (
@@ -2759,6 +2760,7 @@ def _flydsl_v2_stage2_wrapper(
         out_dtype="fp8" if _s2_fp8_inter else "bf16",
         bias=bias2,
         is_ep=expert_mask is not None,
+        D_INTER_PAD=inter_dim_pad,
     )
     if epilog == "reduce":
         from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
@@ -3507,6 +3509,7 @@ def get_2stage_cfgs(
                 model_dim=model_dim,
                 inter_dim=inter_dim,
                 num_experts=expert,
+                inter_dim_pad=intermediate_pad,
             )
         elif is_flydsl2:
             stage2_func = functools.partial(

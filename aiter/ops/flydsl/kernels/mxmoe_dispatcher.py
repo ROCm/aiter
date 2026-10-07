@@ -134,8 +134,12 @@ def compile_gemm2_a4w4_port(
     _reduce_store_cache_modifier=None,
     _input_row_resolver=None,
     _output_n_range=None,
+    K_REAL=0,
 ):
-    """Compile gemm2 a4w4 down-proj; epilog 'atomic' (weighted atomic-fadd) or 'reduce' (store into out[token_id*topk+slot]). inter_dim runtime; SBM None -> SBM==BM byte-identical."""
+    """Compile gemm2 a4w4 down-proj; epilog 'atomic' (weighted atomic-fadd) or 'reduce' (store into out[token_id*topk+slot]). inter_dim runtime; SBM None -> SBM==BM byte-identical.
+
+    K_REAL > 0 (fp4 B only): B cells at K >= K_REAL (the intermediate pad) read
+    as zero without a memory access; tagged _kr<K_REAL>."""
     SBM = _norm_sbm(SBM, BM)
     if BM not in (16, 32, 64, 128) or epilog not in ("atomic", "reduce"):
         raise AssertionError(
@@ -274,8 +278,13 @@ def compile_gemm2_a4w4_port(
     route_guard_tag = "_routeguard" if use_reduce else ""
     tile_tag = "" if (BN, BK) == (256, 256) else f"_bn{BN}_bk{BK}"
     bias_tag = "_bias" if enable_bias else ""
+    if K_REAL:
+        assert (
+            b_dtype == "fp4" and K_REAL % 32 == 0 and 0 < K_REAL < INTER_MAX
+        ), f"K_REAL={K_REAL} needs fp4 B, a multiple of 32, below INTER_MAX={INTER_MAX}"
+    kreal_tag = f"_kr{K_REAL}" if K_REAL else ""
     g2_epi_lanes = _pick_epi_lanes(BM, BN, route_out_fp8, g2_scale_blk)
-    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{btag}{sbm_tag}{shared_scale_tag}{persist_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{noil_tag}{dw_tag}{kst_tag}{pitch_tag}{sblk_tag}{out_tag}{compact_tag}{bias_tag}{output_range_tag}_v2_biasabi7{route_guard_tag}"
+    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{btag}{sbm_tag}{shared_scale_tag}{persist_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{noil_tag}{dw_tag}{kst_tag}{pitch_tag}{sblk_tag}{out_tag}{compact_tag}{bias_tag}{output_range_tag}{kreal_tag}_v2_biasabi7{route_guard_tag}"
     name = f"gemm2_a4w4_port_{tag}" + ("_idpf" if g2_prefetch_ids else "")
 
     @fx.struct
@@ -396,6 +405,7 @@ def compile_gemm2_a4w4_port(
                 enable_bias=enable_bias,
                 g2_prefetch_ids=g2_prefetch_ids,
                 mn_idx=mn_idx,
+                K_REAL=K_REAL,
                 reduce_store_cache_modifier=_reduce_store_cache_modifier,
                 resolved_input_rows=resolved_input_rows,
                 output_n_base=output_n_base,
@@ -638,6 +648,7 @@ def get_g2(
     g2_kstatic=False,
     enable_bias=False,
     g2_prefetch_ids=False,
+    K_REAL=0,
 ):
     # Cache key uses compile-time buckets; runtime inter_dim/model_dim share a
     # launcher while remaining within their respective caps.
@@ -678,6 +689,7 @@ def get_g2(
         out_dtype,
         enable_bias,
         g2_prefetch_ids,
+        K_REAL,
     )
     launch = G2_CACHE.get(key)
     if launch is None:
@@ -703,6 +715,7 @@ def get_g2(
             out_dtype=out_dtype,
             enable_bias=enable_bias,
             g2_prefetch_ids=g2_prefetch_ids,
+            K_REAL=K_REAL,
         )
         G2_CACHE[key] = launch
     return launch
@@ -744,8 +757,13 @@ def mxfp4_moe_gemm2(
     stream=None,
     bias=None,
     is_ep=False,
+    D_INTER_PAD=0,
 ):
-    """Stage-2 down-proj gemm for unpadded dimensions."""
+    """Stage-2 down-proj gemm for unpadded dimensions.
+
+    D_INTER_PAD: the zero pad at the end of D_INTER. With
+    AITER_MOE_SKIP_INTER_PAD=1 and fp4 B, the pad's B cells read as zero
+    without a memory access (compile_gemm2_a4w4_port's K_REAL)."""
     import torch
 
     _validate_v2_gemm2_dtypes(a_dtype, b_dtype)
@@ -789,6 +807,14 @@ def mxfp4_moe_gemm2(
     _kstatic = os.environ.get("MXFP4_G2_KSTATIC", "1") == "1"
     if _kstatic:
         INTER_MAX = D_INTER
+    k_real = 0
+    if (
+        os.environ.get("AITER_MOE_SKIP_INTER_PAD", "0") == "1"
+        and int(D_INTER_PAD) > 0
+        and b_dtype == "fp4"
+        and (D_INTER - int(D_INTER_PAD)) % 32 == 0
+    ):
+        k_real = D_INTER - int(D_INTER_PAD)
     if bias is not None:
         if bias.dtype != torch.float32:
             bias = bias.to(torch.float32)
@@ -824,6 +850,7 @@ def mxfp4_moe_gemm2(
         g2_spart=g2_spart,
         enable_bias=bias is not None,
         g2_prefetch_ids=g2_prefetch_ids,
+        K_REAL=k_real,
     )
     max_m_blocks = (max_sorted + BM - 1) // BM
     if persist:

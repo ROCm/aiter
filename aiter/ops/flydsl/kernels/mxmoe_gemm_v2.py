@@ -47,8 +47,14 @@ def bq_view(
     KH4,
     K_TILES_TOTAL,
     K_HALVES,
+    num_records_bytes=None,
 ):
-    """Layout view over preshuffled B for one N-row tile."""
+    """Layout view over preshuffled B for one N-row tile.
+
+    num_records_bytes bounds the buffer so cells past it read as zero without
+    a memory access. Within a 16-row group the cells run in K order (tile,
+    half, klane; 128 K per half, 32 per klane), so a bound of K_REAL/32 cells
+    (64 dwords each) keeps K < K_REAL and drops the rest."""
     col_base = rocdl.readfirstlane(T.i32, _raw(row_elems) * fx.Int32(KH4))
     i32_ptr_ty = fx.PointerType.get(
         T.i32, address_space=fx.AddressSpace.Global, alignment=16
@@ -64,6 +70,8 @@ def bq_view(
             fx.make_layout(shape, (64, 4, K_HALVES * 256, 256, 1)),
         )
     )
+    if num_records_bytes is not None:
+        return fx.rocdl.make_buffer_tensor(view, num_records_bytes=num_records_bytes)
     return fx.rocdl.make_buffer_tensor(view, max_size=False)
 
 
@@ -244,6 +252,7 @@ def gemm2_body_v2(
     topk=1,
     SBM=None,
     mn_idx=None,
+    K_REAL=0,
     g2_bhoist=True,
     g2_ascale_pf=True,
     g2_bf16_lds=False,
@@ -452,6 +461,8 @@ def gemm2_body_v2(
             KH4,
             K_TILES_MAX,
             kHalves,
+            # K >= K_REAL (the intermediate pad) reads as zero
+            num_records_bytes=(K_REAL // 32) * 64 * 4 if K_REAL else None,
         )
 
     bq_views = [make_bq_view(j) for j in range_constexpr(numAccN)]
