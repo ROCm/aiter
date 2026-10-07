@@ -81,7 +81,11 @@ from aiter.ops.shuffle import (
 )
 from aiter.utility import fp4_utils
 from aiter.utility.base_tuner import TunerCommon
-from aiter.utility.cos_diff import COS_DIFF_THRESHOLD, combined_cos_diff
+from aiter.utility.cos_diff import (
+    COS_DIFF_THRESHOLD,
+    combined_cos_diff,
+    rowwise_enabled,
+)
 from aiter.utility.dtypes import str2ActivationType, str2Dtype
 from aiter.utility.fp4_utils import moe_mxfp4_sort
 from aiter.utility.mp_tuner import mp_tuner
@@ -306,7 +310,10 @@ def cosine_diff_compare(ref, res, msg="", printLog=True):
     x = _to_f64_flat(ref)
     y = _to_f64_flat(res)
     cos_diff = 1 - 2 * (x * y).sum().item() / max((x * x + y * y).sum().item(), 1e-12)
-    cos_diff = combined_cos_diff(_to_f64_rows(ref), _to_f64_rows(res), cos_diff)
+    if rowwise_enabled():
+        # Decoded only when asked for: these are full float64 copies of both
+        # tensors, on top of the two _to_f64_flat already made.
+        cos_diff = combined_cos_diff(_to_f64_rows(ref), _to_f64_rows(res), cos_diff)
     if printLog:
         if cos_diff < COS_DIFF_THRESHOLD:
             logger.info(f"{msg}[cosine_diff={cos_diff:.6f} \033[32mpassed~\033[0m]")
