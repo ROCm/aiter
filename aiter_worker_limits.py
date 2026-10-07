@@ -489,10 +489,15 @@ def get_worker_count_for(work_count: int, explicit: int | None = None) -> int:
     ``explicit`` is an optional caller-supplied ceiling, such as a CLI
     ``--jobs`` value; non-positive values select a single worker.
     """
-    budget = min(get_worker_count(), max(1, int(work_count)))
+    budget = _cap_worker_count(get_worker_count(), work_count)
     if explicit is None:
         return budget
-    return min(budget, max(1, int(explicit)))
+    return _cap_worker_count(budget, explicit)
+
+
+def _cap_worker_count(budget: int, ceiling: int) -> int:
+    """Cap ``budget`` by ``ceiling``, never dropping below one worker."""
+    return max(1, min(int(budget), max(1, int(ceiling))))
 
 
 def split_worker_budget(
@@ -501,11 +506,14 @@ def split_worker_budget(
     """Split a worker budget between an outer module pool and one inner compiler.
 
     Returns ``(outer, inner)``: how many modules to build concurrently and the
-    per-module Ninja budget. ``outer`` is bounded by the submitted module count
-    and the historical ``max_outer`` ceiling; ``inner`` is the remaining share
-    of ``total_workers``. Both are always at least one.
+    per-module Ninja budget. ``outer`` is the work-capped budget, additionally
+    bounded by the historical ``max_outer`` ceiling; ``inner`` divides the
+    *global* budget across that pool, so a short module list still uses the
+    whole machine. Both are always at least one.
     """
-    outer = max(1, min(int(total_workers), int(module_count), max(1, int(max_outer))))
+    outer = _cap_worker_count(
+        total_workers, min(int(module_count), max(1, int(max_outer)))
+    )
     inner = max(1, int(total_workers) // outer)
     return outer, inner
 

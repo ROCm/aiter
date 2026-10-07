@@ -375,9 +375,12 @@ if PREBUILD_KERNELS != 0:
                 third_party=one_opt_args["third_party"],
             )
 
-        # Split the budget between the outer module pool and each module's
-        # inner Ninja invocation. The inner budget travels through the shared
-        # worker-ceiling env var instead of a build_module() argument.
+        # Split the *global* worker budget between the outer module pool and
+        # each module's inner Ninja invocation. The work-capped budget is not
+        # used here: with a short module list it would collapse the inner
+        # budget to one job and strand most of the machine. The inner budget
+        # travels through the shared worker-ceiling env var instead of a
+        # build_module() argument.
         outer_workers, inner_workers = split_worker_budget(
             get_worker_count(), len(all_opts_args_build)
         )

@@ -498,9 +498,13 @@ class WorkerAwarenessTest(unittest.TestCase):
         self.assertEqual(split_worker_budget(32, 3), (3, 10))
 
     def test_split_worker_budget_divides_the_same_total(self):
+        # The *global* total is divided, so a short module list still uses the
+        # whole machine instead of collapsing to one inner job per module.
         outer, inner = split_worker_budget(24, 40)
         self.assertEqual(outer, 5)
         self.assertEqual(inner, 4)
+        self.assertEqual(split_worker_budget(24, 2), (2, 12))
+        self.assertEqual(split_worker_budget(24, module_count=1), (1, 24))
 
     def test_split_worker_budget_never_returns_zero(self):
         self.assertEqual(split_worker_budget(0, 0), (1, 1))
