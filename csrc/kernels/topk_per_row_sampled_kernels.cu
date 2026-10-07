@@ -1,21 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-// GENERATED FILE -- DO NOT EDIT.
-//
-// Source of truth: the topk-prefill-avo repo. Regenerate with
-//   python3 scripts/export_aiter_op.py --aiter <this aiter checkout>
-// and verify an existing tree with the same command plus --check.
-//
-// This is benchmark_topk.hip.cpp up to its AITER_EXPORT_END marker (the kernels
-// and their dispatch) followed by csrc/topk_aiter_entry.inc.hip (the aiter op
-// entry). The harness half of that file -- CPU/GPU verification oracles, timing,
-// CLI -- is deliberately not here. The source repo indents at 2; what you are
-// reading was reformatted to aiter's .clang-format on the way in, so this file
-// does not line up line-for-line with the source.
-//
-// Formatted by: clang-format version 18.1.8
 
-// benchmark_topk.hip.cpp -- fp32 per-row top-k indices for prefill.
+// Sampled fp32 per-row top-k indices for prefill.
 // Contract: input fp32 [M,N], output int32 indices [M,K].
 //
 // Three kernels per call:
@@ -28,10 +14,6 @@
 //                            candidates in LDS and gathers the winners; a row whose
 //                            candidates are unusable (too few, or over cap) runs
 //                            the streamed radix fallback over the full row instead.
-//
-// Everything above AITER_EXPORT_END ships in aiter (scripts/export_aiter_op.py).
-// The harness below it adds --pipeline direct, which runs phase_d_fallback's
-// exact full-row select over every row as an independent oracle.
 
 #include "topk_sampled/topk_common.hip.hpp"
 #include "topk_sampled/topk_shape.hip.hpp"
@@ -40,12 +22,8 @@
 
 // log2(M * pitch) at which phase_b's row loads, and separately its candidate
 // stores, go non-temporal. Stores only ever go NT when loads do.
-#ifndef NT_LOAD_LOG2
-#define NT_LOAD_LOG2 24
-#endif
-#ifndef NT_STORE_LOG2
-#define NT_STORE_LOG2 27
-#endif
+constexpr int NT_LOAD_LOG2  = 24;
+constexpr int NT_STORE_LOG2 = 27;
 
 // Every radix pass below scans with wave 0 alone and clears each bucket as it
 // reads it, so a pass costs two block barriers. The alternatives (a separate
@@ -131,7 +109,7 @@ __device__ __forceinline__ void block_select_lds(const uint32_t* __restrict__ s_
             // Do NOT add an active-set min/max here to exit early once the pivot is
             // pinned. It was tried: accumulating amn/amx in this loop (the reads are
             // already happening) and breaking when they agree made small_n 21-39%
-            // SLOWER and the anchor 615.5 -> 662.8 us. The two extra barriers per pass
+            // SLOWER and M=4096 N=131072 615.5 -> 662.8 us. The two extra barriers per pass
             // in the reduction, plus the register pressure in this loop, cost far more
             // than the single pass the exit saves.
             for(int i = threadIdx.x; i < c; i += blockDim.x)
@@ -264,9 +242,6 @@ __device__ __forceinline__ void block_select_lds_wide(const uint32_t* __restrict
 // the sample loads, so the select never needs the S*4-byte keys buffer in
 // dynamic LDS -- only the histogram (and the optional wide buffer) stay in LDS.
 // Keys never leave the owning thread: Phase A emits a threshold, not a gather.
-#ifndef PA_REG_MUTANT
-#define PA_REG_MUTANT 0
-#endif
 template <int KPT>
 __device__ __forceinline__ void block_select_reg(const uint32_t keys[KPT],
                                                  int K,
@@ -302,10 +277,6 @@ __device__ __forceinline__ void block_select_reg(const uint32_t keys[KPT],
 #pragma unroll
             for(int t = 0; t < KPT; t++)
             {
-#if PA_REG_MUTANT
-                if(t == 0)
-                    continue; // deliberate drop: threshold-equivalence must go red
-#endif
                 const uint32_t k = keys[t];
                 if(!filter || (k >> hshift) == (pivot >> hshift))
                     atomicAdd(&s_hist[((k >> sh) & 0xFFu) * HIST_REP + rep], 1u);
@@ -345,10 +316,6 @@ __device__ __forceinline__ void block_select_reg_wide(const uint32_t keys[KPT],
 #pragma unroll
         for(int t = 0; t < KPT; t++)
         {
-#if PA_REG_MUTANT
-            if(t == 0)
-                continue;
-#endif
             atomicAdd(&s_hist[(keys[t] >> 24) * HIST_REP + rep], 1u);
         }
     }
@@ -364,10 +331,6 @@ __device__ __forceinline__ void block_select_reg_wide(const uint32_t keys[KPT],
 #pragma unroll
         for(int t = 0; t < KPT; t++)
         {
-#if PA_REG_MUTANT
-            if(t == 0)
-                continue;
-#endif
             const uint32_t k = keys[t];
             if((k >> hshift) == (pivot >> hshift))
                 wide_count(sw, (k >> sh) & (WIDE_FINE - 1), rep);
@@ -380,17 +343,13 @@ __device__ __forceinline__ void block_select_reg_wide(const uint32_t keys[KPT],
     eq_needed = ek;
 }
 
-#ifndef FB_LOADS
-#define FB_LOADS 4
-#endif
+constexpr int FB_LOADS = 4;
 // Loads in flight per thread in the select passes. One fallback row at M=8
 // N=524288 gaussian: 320 / 294 / 284us at 1 / 2 / 4.
 // They cost registers, and the fallback shares phase_c's register allocation,
 // so its VGPRs set phase_c's occupancy on every call, fallback or not; that is
 // what PHASE_C_OCCUPANCY below holds.
-#ifndef FB_SEL_LOADS
-#define FB_SEL_LOADS 4
-#endif
+constexpr int FB_SEL_LOADS = 4;
 // prefix_skip (a min/max pass over the keys) for phase_c's wide select. Under
 // the wide select pass 0 is already counted during the candidate read, so the
 // skip costs a read of every key and two barriers to save one scan: phase_c at
@@ -398,20 +357,15 @@ __device__ __forceinline__ void block_select_reg_wide(const uint32_t keys[KPT],
 // 8.20/9.76/7.68/8.04/10.08 without. Tracking
 // the min/max during the candidate read instead cost ~1us too (9.12us at m=4).
 // What the skip also bought, the exit on a one-value candidate set (m=256
-// n=524288 --dist inf: 6.1us with it, 11.3 without), block_select_lds_wide now
-// gets from its histogram at no cost to other rows.
-// Ablation: force phase_c's wide select to stop after the first 12-bit pass
-// (nwide_c effective = 1). Wrong results; prices the second wide pass. Plan P3
-// builds a Wave0 ballot walk only if that pass costs >= 0.7 us.
+// n=524288, rows with +inf mixed in: 6.1us with it, 11.3 without),
+// block_select_lds_wide now gets from its histogram at no cost to other rows.
 // phase_c inlines the exact fallback, so the fallback's register demand is
 // phase_c's on every call. Unpinned, the fallback below took phase_c from 46-48
 // to 70-82 VGPRs (8 -> 5-7 waves/SIMD) and phase_c from 13.4 to 18.2us at m=512
 // n=131072 and 92 to 149us at m=4096 n=524290 with no row falling back. Pinned to
 // 8 waves/SIMD it compiles to 64 VGPRs + 20-24 B/lane of scratch, and phase_c's
 // no-fallback time is back within 1.4%.
-#ifndef PHASE_C_WAVES
-#define PHASE_C_WAVES 8
-#endif
+constexpr int PHASE_C_WAVES = 8;
 #define PHASE_C_OCCUPANCY __attribute__((amdgpu_waves_per_eu(PHASE_C_WAVES)))
 
 // Whether every key of the row whose bits at and above `sh` match `prefix` is
@@ -544,15 +498,6 @@ constexpr int FB_SCRATCH_WORDS = 4096;
 
 // phase_c's fallback for a row whose sampled threshold missed: the helpers
 // below and radix_fallback_row, which uses them.
-// Gate self-test only: collects nothing from the crossing bucket but still
-// reports it collected. Must turn the gate red.
-#ifndef FB_BAND_MUTANT
-#define FB_BAND_MUTANT 0
-#endif
-// Pricing / census only: prints every fallback row's outcome from phase_c.
-#ifndef FB_BAND_PROBE
-#define FB_BAND_PROBE 0
-#endif
 constexpr int FB_BAND_SH = 32 - WIDE_BITS;
 static_assert(WIDE_FINE <= FB_SCRATCH_WORDS, "the band histogram lives in the fallback scratch");
 
@@ -670,7 +615,7 @@ __device__ __forceinline__ void band_take_vec(uint64_t* __restrict__ cand_w,
     {
         const int col    = i * FP32_EPT + e;
         const uint32_t d = fp32_to_sortable(v[e]) >> csh;
-        if(i < n4 && (!LR || col < len) && (FB_BAND_MUTANT == 1 ? d > cthr : d >= cthr))
+        if(i < n4 && (!LR || col < len) && d >= cthr)
         {
             const unsigned p = atomicAdd(s_cnt, 1u);
             if(p < (unsigned)cap)
@@ -687,9 +632,7 @@ __device__ __forceinline__ void band_take_vec(uint64_t* __restrict__ cand_w,
 // The refine and collect passes re-read a row the histogram pass just read, and
 // load it non-temporal; the histogram pass does not. Non-temporal there too was
 // 5-8% slower at M <= 64, where those re-reads hit what it left in cache.
-#ifndef FB_REFINE_LOADS
-#define FB_REFINE_LOADS 1
-#endif
+constexpr int FB_REFINE_LOADS = 1;
 template <bool LR>
 __device__ __forceinline__ void band_refine_pass(const float* __restrict__ row,
                                                  int n4,
@@ -923,8 +866,6 @@ __device__ __forceinline__ int radix_fallback_row(const float* __restrict__ row,
     }
     if(emit)
     {
-        if(FB_BAND_MUTANT == 2)
-            ngt++;
         if(threadIdx.x == 0)
         {
             *s_wgt = 0u;
@@ -984,8 +925,6 @@ __device__ __forceinline__ int radix_fallback_row(const float* __restrict__ row,
     // here writes back and invalidates the XCD's L2 under every other block.
     __syncthreads();
     const int got = (int)*s_wgt;
-    if(FB_BAND_MUTANT == 1)
-        return got + 1;
     // Every key at or above the collect prefix was taken, and all of them were
     // written when got <= cap, so the records hold the top k_out whatever the
     // histogram counted; outside that the row changed between two reads.
@@ -1007,9 +946,7 @@ __device__ __forceinline__ int radix_fallback_row(const float* __restrict__ row,
 //
 // KPT is keys-per-thread for the register-resident path (4, 8 or 16). KPT==0 is
 // the LDS-keys path.
-#ifndef PHASE_A_WAVES
-#define PHASE_A_WAVES 8
-#endif
+constexpr int PHASE_A_WAVES = 8;
 #define PHASE_A_OCCUPANCY __attribute__((amdgpu_waves_per_eu(PHASE_A_WAVES)))
 template <bool RAGGED, int KPT = 0>
 __global__ __launch_bounds__(1024) PHASE_A_OCCUPANCY
@@ -1024,7 +961,6 @@ __global__ __launch_bounds__(1024) PHASE_A_OCCUPANCY
                            float* __restrict__ threshold_f,
                            unsigned int* __restrict__ cand_reserved,
                            unsigned int* __restrict__ cand_bad,
-                           int* __restrict__ fb_count,
                            int K,
                            int nwide)
 {
@@ -1035,20 +971,10 @@ __global__ __launch_bounds__(1024) PHASE_A_OCCUPANCY
 
     if(threadIdx.x == 0)
     {
-#if CTR_STRIDE_MUTANT
-        // Gate self-test only: clears at the unpadded index. Must turn the gate red.
-        if(cand_reserved)
-            cand_reserved[row] = 0u;
-        if(cand_bad)
-            cand_bad[row] = 0u;
-#else
         if(cand_reserved)
             cand_reserved[(size_t)row * CTR_STRIDE] = 0u;
         if(cand_bad)
             cand_bad[(size_t)row * CTR_STRIDE] = 0u;
-#endif
-        if(row == 0)
-            *fb_count = 0;
     }
 
     // Two separate reasons a row cannot go through the sampler, and they do not
@@ -1058,12 +984,9 @@ __global__ __launch_bounds__(1024) PHASE_A_OCCUPANCY
     // threshold is +inf and Phase C takes it through the exact/identity path.
     if(RAGGED && (len <= K || len < S))
     {
-        // +inf is the whole routing signal: Phase B keeps nothing below it, so
-        // cand_count lands under k_out and Phase C takes it through the
-        // exact/identity path. Deliberately NOT appended to fb_rows here -- Phase C
-        // appends every row it routes, and doing it in both places counted a short
-        // row twice, overflowing the M-entry fb_rows (M=512 triangular reported
-        // fallback_rows=1024 and wrote 512 ints past the end of the buffer).
+        // +inf is the whole routing signal: Phase B keeps nothing below it, so the
+        // row's candidate count lands under k_out and Phase C takes it through the
+        // exact/identity path.
         if(threadIdx.x == 0)
         {
             threshold[row]   = 0u;
@@ -1092,7 +1015,7 @@ __global__ __launch_bounds__(1024) PHASE_A_OCCUPANCY
     if(nwide > 0)
         clear_wide(s_wide, wide_buffer_count(nwide, false));
 
-    // Register-resident keys for KPT>0. Filled in the same strided v4 order the
+    // Register-resident keys for KPT>0. Filled in the same strided float4 order the
     // LDS path uses, so each thread's keys[t] is exactly what s_keys[tid+...] held.
     uint32_t keys[KPT > 0 ? KPT : 1];
     if constexpr(KPT > 0)
@@ -1101,7 +1024,7 @@ __global__ __launch_bounds__(1024) PHASE_A_OCCUPANCY
         for(int t = 0; t < KPT; t++)
             keys[t] = 0u;
     }
-    // Convert one v4 of samples: keys into registers (slot t) or LDS (index u),
+    // Convert one float4 of samples: keys into registers (slot t) or LDS (index u),
     // and pass 0's digits folded into s_hist.
     auto take_v4 = [&](const vfloat4& v, int u, int t) {
         const uint32_t k0 = fp32_to_sortable(v[0]);
@@ -1125,11 +1048,7 @@ __global__ __launch_bounds__(1024) PHASE_A_OCCUPANCY
             s_keys[base + 3] = k3;
         }
         // radix_shift(0) is 24, so pass 0's digit is the top byte.
-        // PA_REG_MUTANT drops keys[0] in the select; drop the matching fold count
-        // here so the prefilled hist stays consistent with the mutant select.
-        const bool drop0 = (PA_REG_MUTANT && KPT > 0 && t == 0);
-        if(!drop0)
-            atomicAdd(&s_hist[(k0 >> 24) * HIST_REP + fold_rep], 1u);
+        atomicAdd(&s_hist[(k0 >> 24) * HIST_REP + fold_rep], 1u);
         atomicAdd(&s_hist[(k1 >> 24) * HIST_REP + fold_rep], 1u);
         atomicAdd(&s_hist[(k2 >> 24) * HIST_REP + fold_rep], 1u);
         atomicAdd(&s_hist[(k3 >> 24) * HIST_REP + fold_rep], 1u);
@@ -1175,15 +1094,6 @@ __global__ __launch_bounds__(1024) PHASE_A_OCCUPANCY
 
     uint32_t pivot;
     int eq_needed;
-#ifndef ABLATE_PA
-#define ABLATE_PA 0
-#endif
-#if ABLATE_PA
-    pivot     = (KPT > 0) ? keys[0] : s_keys[threadIdx.x % S];
-    eq_needed = 1;
-    (void)rank_row;
-    (void)npasses;
-#else
     if constexpr(KPT > 0)
     {
         if(nwide > 0)
@@ -1216,7 +1126,6 @@ __global__ __launch_bounds__(1024) PHASE_A_OCCUPANCY
         block_select_lds(
             s_keys, S, rank_row, s_hist, s_scan, s_mm, pivot, eq_needed, npasses, false, true);
     }
-#endif
     if(threadIdx.x == 0)
     {
         threshold[row]   = pivot;
@@ -1235,11 +1144,8 @@ struct Bufs
     uint32_t* threshold;
     float* threshold_f;
     uint64_t* cand_pack;
-    unsigned int* cand_count;
     unsigned int* cand_reserved;
     unsigned int* cand_bad;
-    int* fb_rows;
-    int* fb_count;
     int C_alloc;
 };
 
@@ -1327,17 +1233,8 @@ static void topk_small_n(const float* d_in,
 // phase_a's radix passes when it selects without the wide buffer. 3 give
 // bit-identical candidate counts to 4 (the 4th byte never moves the bucket at
 // fp32 precision); 2 spread to max=3919 against C_alloc=4096.
-constexpr int PHASE_A_PASSES = 3;
-#ifndef PB_BATCH_MAX_BLOCKS
-#define PB_BATCH_MAX_BLOCKS (2 * CU_COUNT)
-#endif
-
-// Research-harness overrides of the launch policy; the aiter entry passes none.
-struct LaunchOverrides
-{
-    int c_block = 0;  // > 0: phase_c block size
-    int nt      = -1; // -1: the M*pitch gates; 0 / 1 force phase_b's NT loads and stores
-};
+constexpr int PHASE_A_PASSES      = 3;
+constexpr int PB_BATCH_MAX_BLOCKS = 2 * CU_COUNT;
 
 // Every launch decision for one call of the three-kernel pipeline, made in one
 // place. Every shape runs phase_b_filter_coop + phase_c_select_contig; g = 1
@@ -1355,11 +1252,7 @@ struct LaunchPlan
     size_t c_dyn_bytes;
 };
 
-static LaunchPlan plan_launch(int M,
-                              int pitch,
-                              bool ragged,
-                              const ShapeParams& sp,
-                              const LaunchOverrides& ov = LaunchOverrides{})
+static LaunchPlan plan_launch(int M, int pitch, const ShapeParams& sp)
 {
     LaunchPlan lp{};
     const int S     = sp.S;
@@ -1377,20 +1270,11 @@ static LaunchPlan plan_launch(int M,
     const bool resource_compact_c = !sp.keys_only_c && !baseline_wide_c && compact_wide_c;
     lp.keys_only_c                = sp.keys_only_c || resource_compact_c;
     lp.reuse_wide_c               = resource_compact_c;
-#if PCIDX_MUTANT
-    // Gate self-test only: sizes phase_c's LDS for keys alone even when the
-    // kernel also stages indices. Must turn the gate red.
-    const int c_cand_lds = cap * (int)sizeof(uint32_t);
-#else
     const int c_cand_lds =
         cap * (lp.keys_only_c ? (int)sizeof(uint32_t) : (int)(sizeof(uint32_t) + sizeof(int)));
-#endif
     lp.nwide_c                = (resource_compact_c || baseline_wide_c) ? 2 : 0;
     const size_t wide_c_bytes = (size_t)wide_buffer_count(lp.nwide_c, lp.reuse_wide_c) * wide_buf;
-    lp.c_block =
-        ov.c_block > 0
-            ? ov.c_block
-            : occupancy_block_threads(M, PHASE_C_STATIC_LDS + c_cand_lds + (int)wide_c_bytes, 0);
+    lp.c_block = occupancy_block_threads(M, PHASE_C_STATIC_LDS + c_cand_lds + (int)wide_c_bytes, 0);
     lp.c_dyn_bytes = (size_t)c_cand_lds + wide_c_bytes;
 
     // Provisional wide/occupancy with keys in LDS; register-resident keys (KPT in
@@ -1420,28 +1304,21 @@ static LaunchPlan plan_launch(int M,
     //   M*N in [2^26, 2^27)  1.032 .. 1.114   M*N = 2^24  0.987 .. 1.021
     //   M*N in [2^25, 2^26)  1.009 .. 1.068   M*N <= 2^23 0.985 .. 1.002
     //
-    // v8 re-measured the lower edge on the current kernels (standalone, inputs
-    // rotated, NT loads from 2^22 against from 2^25): 1.012-1.034 at nine of ten
-    // [2^24, 2^25) points on both entries, 1.000-1.012 at 2^23, 0.962-0.995 at
-    // 2^22; run_perftest at the accept grid's eight [2^24, 2^25) cells: router
-    // 1.024, plain 1.031. Loads go NT from 2^24.
+    // Re-measured on the current kernels (inputs rotated, NT loads from 2^22
+    // against from 2^25): 1.012-1.034 at nine of ten [2^24, 2^25) points on both
+    // entries, 1.000-1.012 at 2^23, 0.962-0.995 at 2^22; run_perftest at eight
+    // [2^24, 2^25) shapes: router 1.024, plain 1.031. Loads go NT from 2^24.
     //
     // The whole gain is phase_b's (phase_b 1.03-1.15, phase_c 0.97-1.02). Stores
     // stay cached below 2^27: NT loads+stores over NT loads alone is 0.970-0.988
     // at 2^25 and 0.981-1.011 at 2^26. This
     // assumes the input is not already in the MALL when the op starts.
     const size_t mn = (size_t)M * (size_t)pitch;
-    lp.nt           = ov.nt < 0 ? (mn >= ((size_t)1 << NT_LOAD_LOG2)) : (ov.nt != 0);
-    lp.nt_st        = lp.nt && (ov.nt >= 0 || mn >= ((size_t)1 << NT_STORE_LOG2));
+    lp.nt           = mn >= ((size_t)1 << NT_LOAD_LOG2);
+    lp.nt_st        = lp.nt && mn >= ((size_t)1 << NT_STORE_LOG2);
     // One staging slot per wave, and no more: see the declaration in
     // phase_b_filter_coop for why this is not a constant.
-#if WSTAGE_HOST_MUTANT
-    // Gate self-test only: the host sizes the old 320-entry staging while
-    // the kernel indexes WSTAGE_CAP_COOP. Must turn the gate red.
-    lp.wstage_bytes = (size_t)(PB_BLOCK / WAVE_SIZE) * 320 * sizeof(uint64_t);
-#else
     lp.wstage_bytes = (size_t)(PB_BLOCK / WAVE_SIZE) * WSTAGE_CAP_COOP * sizeof(uint64_t);
-#endif
     // Batched filter loads only where at most two blocks share a CU: a
     // prefetch ring cost the bandwidth-bound grids 1-16%.
     // The batch never exceeds a thread's loads: dead slots cost 4-7% at 1-2.
@@ -1509,7 +1386,6 @@ static void topk_fused_impl(const float* d_in,
                                                                              b.threshold_f,
                                                                              b.cand_reserved,
                                                                              b.cand_bad,
-                                                                             b.fb_count,
                                                                              K,
                                                                              lp.nwide_a);
     };
@@ -1546,12 +1422,9 @@ static void topk_fused_impl(const float* d_in,
                                                    b.cand_pack,
                                                    b.cand_reserved,
                                                    b.cand_bad,
-                                                   b.cand_count,
                                                    lp.cap,
                                                    K,
                                                    dst,
-                                                   b.fb_rows,
-                                                   b.fb_count,
                                                    RADIX_PASSES,
                                                    lp.keys_only_c,
                                                    lp.nwide_c,
@@ -1565,13 +1438,8 @@ static void topk_fused_impl(const float* d_in,
 
 // aiter op entry for the sampled fp32 per-row top-k kernels.
 //
-// scripts/export_aiter_op.py appends this file verbatim after the exported
-// kernel region, so the entry and the kernels it calls live in one repo and
-// move in one diff. Do not add anything here that the benchmark harness needs:
-// this side is only reachable from aiter.
-//
 // The contract is mirrored from top_k_per_row_prefill
-// (aiter csrc/kernels/topk_per_row_kernels.cu): host-side shape decisions key
+// (csrc/kernels/topk_per_row_kernels.cu): host-side shape decisions key
 // off `stride0`, the row pitch, because the per-row extents live on the device
 // in rowEnds and the dispatcher has to pick a path, a block size and a grid
 // without reading device memory back.
@@ -1583,14 +1451,13 @@ static void topk_fused_impl(const float* d_in,
 
 namespace sampled {
 
-// One caller-provided buffer, carved the way alloc_bufs() carves its separate
-// hipMallocs. This is the single definition of that layout: workspace_bytes()
-// publishes the total to Python and bind_bufs() reads the offsets, so the size
-// Python allocates and the size the kernels address cannot disagree.
+// One caller-provided buffer, carved into the kernels' scratch arrays. This is
+// the single definition of that layout: topk_sampled_workspace_size() publishes
+// the total to Python and bind_bufs() reads the offsets, so the size Python
+// allocates and the size the kernels address cannot disagree.
 struct WsLayout
 {
-    size_t threshold, threshold_f, cand_pack;
-    size_t cand_count, cand_reserved, cand_bad, fb_rows, fb_count;
+    size_t threshold, threshold_f, cand_pack, cand_reserved, cand_bad;
     size_t total;
 };
 
@@ -1605,35 +1472,21 @@ static inline WsLayout ws_layout(int M, int cap)
         return here;
     };
     WsLayout L{};
-    L.threshold   = take((size_t)M * sizeof(uint32_t));
-    L.threshold_f = take((size_t)M * sizeof(float));
-    L.cand_pack   = take((size_t)M * cap * sizeof(uint64_t));
-    L.cand_count  = take((size_t)M * sizeof(unsigned int));
-#if CTR_ALLOC_MUTANT
-    // Gate self-test only: allocates the counters unpadded while the kernels
-    // index them padded. Must turn the gate red.
-    L.cand_reserved = take((size_t)M * sizeof(unsigned int));
-    L.cand_bad      = take((size_t)M * sizeof(unsigned int));
-#else
+    L.threshold     = take((size_t)M * sizeof(uint32_t));
+    L.threshold_f   = take((size_t)M * sizeof(float));
+    L.cand_pack     = take((size_t)M * cap * sizeof(uint64_t));
     L.cand_reserved = take((size_t)M * CTR_STRIDE * sizeof(unsigned int));
     L.cand_bad      = take((size_t)M * CTR_STRIDE * sizeof(unsigned int));
-#endif
-    L.fb_rows  = take((size_t)M * sizeof(int));
-    L.fb_count = take(sizeof(int));
-    L.total    = o;
+    L.total         = o;
     return L;
 }
 
-// Derived without consulting the harness globals, and in particular without
-// the harness's topk_fused(), which assigns the derived S back into g_sample_s. In a
-// library that write is a bug: the next call on a different shape would be
-// handed the previous shape's S as an override and derive different parameters,
-// making the result depend on call order.
+// A pure function of the shape, so a call never depends on the calls before it.
 // Every call here is ragged, so the geometry is sized by geometry_k_ragged()
 // (topk_shape.hip.hpp) rather than the caller's k.
 static inline ShapeParams params_for(int M, int N, int K)
 {
-    return derive_shape_params(M, N, geometry_k_ragged(K, N), 0.0f, 0, 0, PATH_AUTO);
+    return derive_shape_params(M, N, geometry_k_ragged(K, N));
 }
 
 static inline Bufs bind_bufs(void* ws, const WsLayout& L, int cap)
@@ -1643,11 +1496,8 @@ static inline Bufs bind_bufs(void* ws, const WsLayout& L, int cap)
     b.threshold     = reinterpret_cast<uint32_t*>(base + L.threshold);
     b.threshold_f   = reinterpret_cast<float*>(base + L.threshold_f);
     b.cand_pack     = reinterpret_cast<uint64_t*>(base + L.cand_pack);
-    b.cand_count    = reinterpret_cast<unsigned int*>(base + L.cand_count);
     b.cand_reserved = reinterpret_cast<unsigned int*>(base + L.cand_reserved);
     b.cand_bad      = reinterpret_cast<unsigned int*>(base + L.cand_bad);
-    b.fb_rows       = reinterpret_cast<int*>(base + L.fb_rows);
-    b.fb_count      = reinterpret_cast<int*>(base + L.fb_count);
     b.C_alloc       = cap;
     return b;
 }
@@ -1656,9 +1506,8 @@ static inline Bufs bind_bufs(void* ws, const WsLayout& L, int cap)
 
 // Published to Python so the caller allocates the scratch (aiter's rule: host
 // code here never allocates device memory). Plain scratch, not zeroed: Phase A
-// clears the reservation counters and fb_count before any consumer reads them,
-// Phase B assigns cand_count rather than accumulating into it, and the small_n
-// path touches none of them.
+// clears the reservation counters before any consumer reads them, and the
+// small_n path touches none of them.
 int64_t topk_sampled_workspace_size(int64_t numRows, int64_t stride0, int64_t k)
 {
     if(numRows <= 0)
@@ -1717,8 +1566,8 @@ void top_k_per_row_prefill_sampled(
     // passes no `end`, so the entry cannot tell a genuinely ragged batch
     // from a plain [M, N] one, and it has always assumed the first. The
     // RAGGED=true kernels then bounds-check every element against a limit
-    // that is the row length. Measured through aiter at k=2048 --dist
-    // gaussian, the same instantiation in both builds:
+    // that is the row length. Measured through aiter at k=2048 on
+    // gaussian rows, the same instantiation in both builds:
     //
     //   m=2048 n=131072  phase_b 202.96 -> 193.14us, phase_a 38.31 ->
     //   37.44, phase_c 40.80 -> 41.09; per call 282.07 -> 271.67, -3.7%
@@ -1763,7 +1612,7 @@ void top_k_per_row_prefill_sampled(
     const int K = static_cast<int>(k);
 
     // A plain row whose width is not a multiple of FP32_EPT is safe on the fused
-    // path: phase_b_filter_coop reads the tail, and the gate covers every N % 4
+    // path: phase_b_filter_coop reads the tail, and the tests cover every N % 4
     // residue on both entries. topk_small_n truncates `pitch / FP32_EPT` with no
     // tail handling, so odd widths keep its bounds-checked instantiation.
     HipDeviceGuard device_guard(logits.device_id);
@@ -1809,7 +1658,7 @@ void top_k_per_row_prefill_sampled(
                 workspace.value().numel() * workspace.value().element_size(),
                 L.total);
     Bufs b              = sampled::bind_bufs(workspace.value().data_ptr(), L, sp.cap);
-    const LaunchPlan lp = plan_launch(M, N, ragged, sp);
+    const LaunchPlan lp = plan_launch(M, N, sp);
     if(ragged)
     {
         if(val)

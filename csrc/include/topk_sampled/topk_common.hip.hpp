@@ -1,19 +1,5 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-// GENERATED FILE -- DO NOT EDIT.
-//
-// Source of truth: the topk-prefill-avo repo. Regenerate with
-//   python3 scripts/export_aiter_op.py --aiter <this aiter checkout>
-// and verify an existing tree with the same command plus --check.
-//
-// This is benchmark_topk.hip.cpp up to its AITER_EXPORT_END marker (the kernels
-// and their dispatch) followed by csrc/topk_aiter_entry.inc.hip (the aiter op
-// entry). The harness half of that file -- CPU/GPU verification oracles, timing,
-// CLI -- is deliberately not here. The source repo indents at 2; what you are
-// reading was reformatted to aiter's .clang-format on the way in, so this file
-// does not line up line-for-line with the source.
-//
-// Formatted by: clang-format version 18.1.8
 
 #pragma once
 
@@ -47,10 +33,7 @@ constexpr int RADIX_PASSES = 4; // 4 x 8-bit covers all 32 sortable bits
 // and the per-element LDS atomicAdd serialises hard. Lanes are spread across
 // HIST_REP adjacent counters (adjacent => different LDS banks), summed before
 // the scan. HIST_REP=1 restores the plain histogram.
-#ifndef HIST_REPLICAS
-#define HIST_REPLICAS 4
-#endif
-constexpr int HIST_REP   = HIST_REPLICAS;
+constexpr int HIST_REP   = 4;
 constexpr int HIST_SLOTS = 256 * HIST_REP;
 
 constexpr int MAX_WAVES_PER_BLOCK = 16;
@@ -153,9 +136,8 @@ __device__ __forceinline__ int k_take_dev(int K, int len) { return len < K ? len
 // to the version from before values existed, not merely free of the stores: one
 // extra UNUSED float* kernarg on phase_small_n_topk alone, with no other change
 // at all, moved the small_n geomean from 28.51/28.54 to 28.82/28.85 us (+1.0%,
-// two runs each, interleaved A/B on this box), which is over the scoring gate's
-// 0.5% band. small_n runs one short block per row, so its kernarg prologue is a
-// real share of the kernel rather than noise.
+// two runs each, interleaved A/B). small_n runs one short block per row, so its kernarg prologue is
+// a real share of the kernel rather than noise.
 //
 // TopkOut<false> holds a single pointer, so it is 8 bytes with 8-byte alignment
 // -- exactly the `int* out_idx` it replaces -- and every later argument keeps
@@ -184,7 +166,7 @@ struct TopkOut<true>
 };
 
 // The value padding is -inf, NOT 0, and that is aiter's rule rather than a
-// preference (topk_per_row_kernels.cu:2249 states it): the index slot is -1, so
+// preference (radix_topk_one_block_kernel states it): the index slot is -1, so
 // its score has to sort below every real one. Logits are routinely negative, so
 // a 0.0 pad outranks them, and a consumer that ranks these scores -- DCP merges
 // the exchanged top-k across ranks -- would let padding steal a real
@@ -204,7 +186,8 @@ pad_topk_tail(int* __restrict__ out, float* __restrict__ out_val, int k_take, in
 // A row with row_len <= K has every element selected, so there is nothing to
 // rank: emit the columns in index order and pad the tail with -1. This is
 // aiter's own convention for the case, in both of its kernels
-// (topk_per_row_kernels.cu:398 mb path, :2241 ob path), and matching it is not
+// (radix_kernel_persistent on the multi-block path, radix_topk_one_block_kernel
+// on the one-block path), and matching it is not
 // cosmetic -- which of those kernels runs is a perf heuristic on aiter's side,
 // so the padding and the emit have to agree or the same call would mean
 // different things at a batch-size boundary.
@@ -269,7 +252,7 @@ using vfloat4 = opus::fp32x4_t;
 // consumer predicates on `< len` -- but once nonzero rowStarts make
 // `row_start + len` land within 3 floats of the END OF THE ALLOCATION it is a
 // HIP 700. Measured on the shipped tree: M=256 N=131072 prefix=131072 with
-// --row-starts-stride 65 faults, while the SAME strides at prefix=100000, where
+// row starts 65 elements apart faults, while the SAME strides at prefix=100000, where
 // the slice ends well before the pitch, pass on every distribution. That pair is
 // what isolates the cause to the over-read.
 //
@@ -302,7 +285,7 @@ __device__ __forceinline__ vfloat4 load_row_f4(const float* __restrict__ row, in
         // at again, so a cache line buys the row data nothing and evicts what the
         // other blocks are still reading. Same bytes, same addresses. Whether that
         // helps depends on whether the input could have stayed resident at all --
-        // see the gate at the phase_b launch.
+        // see NT_LOAD_LOG2 in plan_launch.
         if constexpr(NT)
             return __builtin_nontemporal_load(v4 + i);
         else
@@ -395,16 +378,10 @@ __device__ __host__ __forceinline__ int common_prefix_passes(uint32_t mn, uint32
     return start;
 }
 
-#ifndef BCAST_RL_MUTANT
-#define BCAST_RL_MUTANT 0
-#endif
 // v from lane `src`, which must be the same on every lane (a constant or a
 // ballot index): v_readlane instead of a ds_bpermute round trip.
 __device__ __forceinline__ uint32_t wave_bcast(uint32_t v, int src)
 {
-#if BCAST_RL_MUTANT // gate self-test only: reads the neighbouring lane
-    src = (src + 1) & (WAVE_SIZE - 1);
-#endif
     return (uint32_t)__builtin_amdgcn_readlane((int)v, src);
 }
 
@@ -499,15 +476,13 @@ __device__ __forceinline__ uint32_t dpp_add_u32(uint32_t x)
 // the __shfl_down tree it replaces is six ds_bpermute + lgkmcnt(0) round trips.
 __device__ __forceinline__ uint32_t wave_suffix_sum(uint32_t v)
 {
-    uint32_t x = v;
-    x          = dpp_add_u32<0x111, 0xf, 0xf>(x); // row_shr:1
-    x          = dpp_add_u32<0x112, 0xf, 0xf>(x); // row_shr:2
-    x          = dpp_add_u32<0x114, 0xf, 0xe>(x); // row_shr:4
-    x          = dpp_add_u32<0x118, 0xf, 0xc>(x); // row_shr:8
-    x          = dpp_add_u32<0x142, 0xa, 0xf>(x); // row_bcast:15
-#if !SCAN_DPP_MUTANT // gate self-test only: without this step lanes 32..63 miss lanes 0..31
-    x = dpp_add_u32<0x143, 0xc, 0xf>(x); // row_bcast:31
-#endif
+    uint32_t x         = v;
+    x                  = dpp_add_u32<0x111, 0xf, 0xf>(x); // row_shr:1
+    x                  = dpp_add_u32<0x112, 0xf, 0xf>(x); // row_shr:2
+    x                  = dpp_add_u32<0x114, 0xf, 0xe>(x); // row_shr:4
+    x                  = dpp_add_u32<0x118, 0xf, 0xc>(x); // row_shr:8
+    x                  = dpp_add_u32<0x142, 0xa, 0xf>(x); // row_bcast:15
+    x                  = dpp_add_u32<0x143, 0xc, 0xf>(x); // row_bcast:31
     const uint32_t tot = (uint32_t)__builtin_amdgcn_readlane((int)x, WAVE_SIZE - 1);
     return tot - x + v;
 }
@@ -528,8 +503,8 @@ __device__ __forceinline__ uint32_t wave_suffix_sum(uint32_t v)
 //
 // Costs no LDS and reads no slot twice; what it does do is concentrate 1024 slot
 // reads onto 64 lanes (16 per lane, against 4 per lane spread over 4 waves), so
-// it trades block-barrier latency for LDS-read depth on one wave. g_14 showed
-// that trade can go either way by regime, so measure both ends before shipping.
+// it trades block-barrier latency for LDS-read depth on one wave. That trade
+// was measured to go either way by regime, so measure both ends before shipping.
 //
 // Rejected alternative: let EVERY wave scan the whole histogram redundantly,
 // which removes both barriers. It does not help -- with all waves reading all
@@ -537,7 +512,7 @@ __device__ __forceinline__ uint32_t wave_suffix_sum(uint32_t v)
 // its own before-and-after barrier pair and the pass is back to 3, now with 4x
 // the LDS reads. Reaching 2 that way needs a double-buffered histogram (+4 KB),
 // which takes phase_a from 4 to 3 blocks/CU at S=8192 (163840/42008 vs
-// 163840/37912) for a barrier that g_14 measured at -0.35% on the anchor.
+// 163840/37912) for a barrier measured at -0.35% at M=4096 N=131072.
 template <bool CLEAR = false>
 __device__ __forceinline__ void
 block_find_pivot_bucket_wave0(uint32_t* __restrict__ s_hist, uint32_t* __restrict__ s_scan, int ek)

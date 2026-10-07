@@ -1,19 +1,5 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-// GENERATED FILE -- DO NOT EDIT.
-//
-// Source of truth: the topk-prefill-avo repo. Regenerate with
-//   python3 scripts/export_aiter_op.py --aiter <this aiter checkout>
-// and verify an existing tree with the same command plus --check.
-//
-// This is benchmark_topk.hip.cpp up to its AITER_EXPORT_END marker (the kernels
-// and their dispatch) followed by csrc/topk_aiter_entry.inc.hip (the aiter op
-// entry). The harness half of that file -- CPU/GPU verification oracles, timing,
-// CLI -- is deliberately not here. The source repo indents at 2; what you are
-// reading was reformatted to aiter's .clang-format on the way in, so this file
-// does not line up line-for-line with the source.
-//
-// Formatted by: clang-format version 18.1.8
 
 #pragma once
 
@@ -63,10 +49,7 @@ constexpr double CAP_SAFE_FILL = 0.85;
 // apart, in uints. Packed, 32 rows share a line and phase_b's atomicAdds from
 // different rows serialize on it: ATT at M=4 N=131072 puts that atomic at 26.8%
 // of a phase_b block.
-#ifndef CTR_STRIDE_OVERRIDE
-#define CTR_STRIDE_OVERRIDE 32
-#endif
-constexpr int CTR_STRIDE = CTR_STRIDE_OVERRIDE;
+constexpr int CTR_STRIDE = 32;
 // phase_b_filter_coop's per-wave staging entries (dynamic LDS, so only that
 // kernel pays). A wave drains to global once more than CAP - 256 are staged,
 // and each drain waits on a global atomicAdd in the middle of the stream: a
@@ -74,10 +57,7 @@ constexpr int CTR_STRIDE = CTR_STRIDE_OVERRIDE;
 // phase_b at M=512 N=131072 (coop_g=2, ~181 candidates per wave), of which the
 // epilogue copy is 0.7 us.
 // 576 x 8 B x 8 waves = 36.9 KB keeps 4 512-thread blocks per CU inside 160 KB.
-#ifndef WSTAGE_CAP_COOP_OVERRIDE
-#define WSTAGE_CAP_COOP_OVERRIDE 576
-#endif
-constexpr int WSTAGE_CAP_COOP = WSTAGE_CAP_COOP_OVERRIDE;
+constexpr int WSTAGE_CAP_COOP = 576;
 // phase_b's block size, a compile-time constant inside the kernel so its
 // prologue reads neither blockDim nor the hidden workgroup-size argument. The
 // coop_g table was fitted at this size.
@@ -88,11 +68,12 @@ constexpr int PB_BLOCK = 512;
 // of its output with -1, so asking derive_shape_params for a K above the pitch
 // requests a candidate capacity that cannot exist and gets the shape refused.
 // aiter's own top_k_per_row_prefill has no k <= stride0 guard and emits the
-// identity for such rows (topk_per_row_kernels.cu:398, :2241), so refusing here
+// identity for such rows (radix_kernel_persistent, radix_topk_one_block_kernel),
+// so refusing here
 // would be this op declining a shape the one it replaces accepts.
 //
-// One definition, used by both the harness dispatcher and the aiter entry: a
-// second copy is a way for the two to disagree about which shapes are servable.
+// One definition for every caller that sizes or admits a shape: a second copy
+// is a way for two of them to disagree about which shapes are servable.
 __host__ inline int geometry_k_ragged(int K, int N) { return K < N ? K : N; }
 
 // gfx950 occupancy inputs for the small_n launch geometry. SMALL_N_STATIC_LDS is
@@ -117,8 +98,8 @@ static inline int grid_blocks_per_cu(int M) { return std::max(1, (M + CU_COUNT -
 
 // Whether a select kernel can take block_select_lds_wide's buffers (a 12-bit
 // digit on the filtered passes, one pass fewer) without losing residency: the
-// blocks this grid actually stacks on a CU must still fit with them. Standalone
-// A/B, k=2048 gaussian seed 0, with the buffers in STATIC LDS so that every
+// blocks this grid actually stacks on a CU must still fit with them. A/B at
+// k=2048, gaussian rows, seed 0, with the buffers in STATIC LDS so that every
 // launch paid for them, three-kernel device total:
 //   m=128  n=131072  -2.98us   m=256 n=262144  -1.64   m=64 n=1048577 -1.24
 //   m=1024 n=262144 +11.56us   m=4096 n=131072 +30.56  m=4096 n=1048576 +30.38
@@ -268,18 +249,16 @@ static inline int occupancy_block_threads(int M, int lds_per_block, int load_cap
 //
 // Solving the self-consistent fixed point instead
 // (x^2 - (3/sqrt(c))x - 1 = 0 with c = K*S/N, margin = x^2) gives a smaller,
-// statistically "correct" margin -- and it FAILS the gate. Measured with it:
-// M=4096 N=1048576 margin 2.129 -> 1.839 produced under_K=1, a row short of K,
-// where the form below gives under_K=0.
+// statistically "correct" margin -- and rows undershoot with it: M=4096
+// N=1048576 margin 2.129 -> 1.839 produced under_K=1, a row short of K, where
+// the form below gives under_K=0.
 //
-// The reason the 3-sigma constant is not enough: the gate is "no row of M
-// undershoots", i.e. a maximum over M draws, so the sigma that matters grows
+// The reason the 3-sigma constant is not enough: what has to hold is "no row of
+// M undershoots", i.e. a maximum over M draws, so the sigma that matters grows
 // with M. Back-solved from the measured spread at M=4096 the deepest row sits
 // 3.4-3.5 sigma below the mean, not 3.0. The margin-free R0 happens to absorb
 // that M-dependence; a formula that removes the slack has to put the
 // M-dependence back explicitly, and nothing here does.
-//
-// A statistically tighter margin was tried and fails the correctness gate.
 static float auto_margin(int K, int S, int N)
 {
     const double r0 = (double)K * S / (double)N;
@@ -328,8 +307,8 @@ static inline bool sampling_geometry_ok(int N, int S)
         return false;
     // No N % FP32_EPT check. It used to be here because the loads are dwordx4 and
     // the row base is `input + row * pitch`, which an odd pitch misaligns -- but
-    // gfx950 serves a 4-byte-aligned dwordx4 natively (v5 Stage 2 isolated the
-    // HIP 700 to the tail over-read, not the misalignment, and load_row_f4 clamps
+    // gfx950 serves a 4-byte-aligned dwordx4 natively (the HIP 700 was isolated
+    // to the tail over-read, not the misalignment, and load_row_f4 clamps
     // that tail). sample_chunk_stride still masks the spacing to a multiple of 4,
     // so chunk starts stay 4-aligned RELATIVE to the base whatever the base is.
     const int chunks = S / SAMPLE_CHUNK_ELEMS;
@@ -344,7 +323,7 @@ static inline bool sampling_geometry_ok(int N, int S)
 // answering "should we pick this S" with the relaxed rule changed which S the
 // pow2 grid picks: shapes that used to be bumped up to SAMPLE_S_MAX by the
 // repair below kept the smaller S the law asks for instead, and the decode
-// geomean went 30.89 -> 31.15 us (+0.82%, reproduced on 3 consecutive outer-tier
+// geomean went 30.89 -> 31.15 us (+0.82%, reproduced on 3 consecutive
 // runs, per-point sd 0.04-0.08%). The S the old rule forced was simply the
 // better one, so an exact stride still decides the choice and the mask only
 // widens what can be served at all.
@@ -360,10 +339,10 @@ static inline bool sample_stride_exact(int N, int S)
 // How S is chosen: 0 = constant R_TARGET, 1 = derive S from the acceptance
 // window; which one is per region.
 //
-// Rule 1 is FALSIFIED as a GLOBAL replacement and always was: it regresses
-// M=64 N=262144 and M=256 N=262144 hard. But it is right in a region, and the
-// region is larger than the v3-era note claimed ("wins 5-7.5% at M <= 8").
-// Re-measured on g_22, rule 1 against rule 0, warmup 20 / iters 100 / repeats 9:
+// Rule 1 is wrong as a global replacement: it regresses M=64 N=262144 and
+// M=256 N=262144 hard. But it is right in a region, and the region is larger
+// than first measured (5-7.5% at M <= 8). Rule 1 against rule 0, warmup 20 /
+// iters 100 / repeats 9:
 //
 //   M       N=131072   N=262144   N=524288
 //   1         -5.8%      -6.9%      -6.1%
@@ -386,15 +365,11 @@ static inline bool sample_stride_exact(int N, int S)
 // single-block cost dominates and the trade pays; at large M the extra
 // candidates Phase B writes and Phase C selects cost more than phase_a saves.
 //
-// The v3-era note also reported the anchor at +3.9% under rule 1; it measures
-// +1.7% on g_22. Either way the anchor keeps rule 0.
-//
-// v8 re-measured the small-M region on the current kernels (standalone, inputs
-// rotated, rule 1 time / rule 0 time, M = 1 / 8 / 32, plain and ragged alike):
-// equal (0.97-1.01) up to N = 327683, rule 1 better at N = 196611 (0.90-0.95),
-// mixed at N = 393219 (0.98 / 1.03 / 1.03), and rule 0 better from N = 458755
-// up (1.03-1.10): rule 1's margin of 2.46 there costs phase_c more candidates
-// than rule 0's S = 16384 costs phase_a. Rule 1 keeps N below 393216.
+// Re-measured on the current kernels (inputs rotated, rule 1 time / rule 0 time, M = 1 / 8 / 32,
+// plain and ragged alike): equal (0.97-1.01) up to N = 327683, rule 1 better at N = 196611
+// (0.90-0.95), mixed at N = 393219 (0.98 / 1.03 / 1.03), and rule 0 better from N = 458755 up
+// (1.03-1.10): rule 1's margin of 2.46 there costs phase_c more candidates than rule 0's S = 16384
+// costs phase_a. Rule 1 keeps N below 393216.
 constexpr int S_RULE1_M_MAX = 32;
 constexpr int S_RULE1_N_MAX = 393215;
 
@@ -435,8 +410,8 @@ static inline int derive_sample_s_for_n(int M, int N, int K, float margin_unused
     // sampling than rule 0 -- the opposite of its purpose. Measured at M=1 with
     // the doubling form: N=65532 4160 -> 16384 (+21.5%), N=131068 8256 -> 16384
     // (+13.2%), N=32832 4608 -> 8192 (+8.1%), against -4.6% to -7.3% everywhere
-    // it actually reduced S. Same fix as the exact-stride repair in v5 Stage 3;
-    // that one was applied to the repair and this search was left behind.
+    // it actually reduced S. Same fix as the exact-stride repair in
+    // derive_shape_params, which got it first; this search was left behind.
     for(int S = SAMPLE_S_MIN; S <= SAMPLE_S_MAX; S += SAMPLE_CHUNK_ELEMS)
     {
         if(!sample_stride_exact(N, S))
@@ -506,8 +481,8 @@ static inline int snap_coop_g(int g, int max_g)
 }
 
 // Base log2(coop_g) per cell; coop_g_from_table moves a shape to G/2 or 2G when
-// that costs fewer resident rounds. Both were fitted in v8 on the acceptance
-// metric itself -- run_perftest device time, cold inputs, both entries -- from G
+// that costs fewer resident rounds. Both were fitted on the metric
+// the op is judged by -- run_perftest device time, cold inputs, both entries -- from G
 // curves measured at 1270 (M, N) points: per row M = 2^r and 1.25 / 1.5 / 1.75 x
 // 2^r, per column its lower edge and an odd midpoint, every G within two steps
 // of the previous table's timed against it. Per cell,
@@ -521,7 +496,7 @@ static inline int snap_coop_g(int g, int max_g)
 //
 // This is a table and not a formula on purpose. The best G falls roughly as
 // M^-0.3 and saturates differently per N, which no simple closed form
-// reproduces: the best two-parameter fit over the v4 sweep left +27% worst
+// reproduces: the best two-parameter fit over an earlier G sweep left +27% worst
 // case, and the rule it replaced (target 256 total blocks) +77% -- measured at
 // M=128 N=1048576, where it picked G=2 for 225 us against 127 us at G=16. The
 // rounds cost alone leaves 0.7% (p90 3.1%), and 9-11% at M >= 4096, where it
@@ -533,7 +508,7 @@ static inline int snap_coop_g(int g, int max_g)
 // column 2i is [2^k, 1.5 * 2^k) and column 2i+1 is [1.5 * 2^k, 2^(k+1)), with
 // k = 14 + i. N <= 8192 takes the small_n path and never reaches here.
 //
-// A full octave per column is measurably too coarse. Refitting the v4 sweep
+// A full octave per column is measurably too coarse. Refitting that sweep
 // with one column per octave cost up to **+5.42%** (M=64 over [16384, 32768))
 // and more than 1% on 12 of the (M, octave) pairs, worst in
 // [524288, 1048576) at large M -- which is exactly where the octave table put
@@ -605,11 +580,9 @@ static inline int coop_g_from_table(int M, int N, int max_g)
     return g;
 }
 
-static inline int choose_coop_g(int M, int N, int n4_per_row, int block, int override_g)
+static inline int choose_coop_g(int M, int N, int n4_per_row, int block)
 {
     const int max_g = std::max(1, n4_per_row / block);
-    if(override_g > 0)
-        return snap_coop_g(override_g, max_g);
     if(N <= N_LDS_MAX)
         return 1;
     int g;
@@ -631,27 +604,18 @@ static inline int choose_coop_g(int M, int N, int n4_per_row, int block, int ove
     return g;
 }
 
-// A per-region radix scan form (rep vs wave0) was tried and is
-// FALSIFIED: once coop_g > 1 reaches the anchor band, the two forms are
-// indistinguishable.
+// A per-region radix scan form (rep vs wave0) was tried and bought nothing:
+// once coop_g > 1 reaches M=4096 N=131072, the two forms are indistinguishable.
 
-static inline ShapeParams derive_shape_params(int M,
-                                              int N,
-                                              int K,
-                                              float margin_override,
-                                              int sample_s_override,
-                                              int coop_g_override,
-                                              TopkPath path_override)
+static inline ShapeParams derive_shape_params(int M, int N, int K)
 {
     ShapeParams p{};
-    p.path = path_override;
     const bool small_n_fits =
         (N * (int)sizeof(uint32_t)) <= (LDS_BYTES_PER_BLOCK_MAX - SMALL_N_STATIC_LDS);
     const bool small_n_wins =
         N <= N_LDS_MAX || (N <= N_LDS_MAX_ONE_ROUND && M <= N_LDS_ONE_ROUND_M) ||
         (N <= N_LDS_MAX_SMALL_M && M > N_LDS_SMALL_M_FLOOR && M <= N_LDS_SMALL_M_LIMIT);
-    if(small_n_fits && (small_n_wins || path_override == PATH_SMALL_N) &&
-       (path_override == PATH_AUTO || path_override == PATH_SMALL_N))
+    if(small_n_fits && small_n_wins)
     {
         p.path        = PATH_SMALL_N;
         p.S           = 0;
@@ -663,22 +627,8 @@ static inline ShapeParams derive_shape_params(int M,
         p.geom_ok     = (K <= N);
         return p;
     }
-    if(path_override == PATH_SMALL_N && !small_n_fits)
-    {
-        // Refuse rather than launch a kernel that cannot start.
-        p.path    = PATH_SMALL_N;
-        p.geom_ok = false;
-        return p;
-    }
-
-    float margin = margin_override;
-    if(margin <= 0.f)
-    {
-        int s0 = sample_s_override > 0 ? sample_s_override : derive_sample_s_for_n(M, N, K, 1.4f);
-        margin = auto_margin(K, s0, N);
-    }
-    int S = sample_s_override > 0 ? align_sample_s(sample_s_override)
-                                  : derive_sample_s_for_n(M, N, K, margin);
+    float margin = auto_margin(K, derive_sample_s_for_n(M, N, K, 1.4f), N);
+    int S        = derive_sample_s_for_n(M, N, K, margin);
     if(!sample_stride_exact(N, S))
     {
         const int chunks   = std::max(1, N / SAMPLE_CHUNK_ELEMS);
@@ -704,7 +654,7 @@ static inline ShapeParams derive_shape_params(int M,
         //
         // Searching beats capping the growth. A growth cap keeps the law's S with a
         // MASKED stride, and that is not free either: at M=4096 N=65600 it produced
-        // under_K=760 on --dist inf where the uncapped S gives 0, while the
+        // under_K=760 on rows with +inf mixed in where the uncapped S gives 0, while the
         // neighbouring pow2 N=65536 at the SAME S=4096 also gives 0. The difference
         // is the masked stride, not the sample count, so the right move is to keep
         // exactness and pay only the growth that exactness actually costs.
@@ -722,23 +672,17 @@ static inline ShapeParams derive_shape_params(int M,
         else if(sample_stride_exact(N, repaired) || !sampling_geometry_ok(N, S))
             S = repaired;
     }
-    margin = margin_override > 0.f ? margin_override : auto_margin(K, S, N);
+    margin = auto_margin(K, S, N);
     // At the largest row grid, N=524288 seed-0 has one candidate count at 2031
     // with the 1.600 estimator margin. That row takes the exact full-row path
     // inside Phase C. A 1.625 floor moves the expected boundary above K while
     // leaving N=1048576 unchanged (its derived margin is already 2.129).
-    if(margin_override <= 0.f && M >= 4096 && N >= 524288)
+    if(M >= 4096 && N >= 524288)
         margin = std::max(margin, 1.625f);
     const double cap_margin = CAP_SAFE_FILL * (double)PHASE_C_CAP_MAX / (double)K;
     const double eff_margin = std::min((double)margin, cap_margin);
-    // Gate self-test only: a scale below 1 lifts the sampled threshold so gaussian
-    // rows undershoot K and every one of them takes phase_c's fallback.
-#ifndef FB_FORCE_RANK_SCALE
-#define FB_FORCE_RANK_SCALE 1
-#endif
-    const int rank =
-        std::max(1, (int)(eff_margin * FB_FORCE_RANK_SCALE * (double)K * (double)S / (double)N));
-    const int cap = derive_cap(
+    const int rank          = std::max(1, (int)(eff_margin * (double)K * (double)S / (double)N));
+    const int cap           = derive_cap(
         K, margin, S, N, grid_blocks_per_cu(M) > 1 ? CAP_ROOM_SIGMA_KEYS_ONLY : CAP_ROOM_SIGMA);
 
     p.S      = S;
@@ -753,22 +697,7 @@ static inline ShapeParams derive_shape_params(int M,
     p.geom_ok     = sampling_geometry_ok(N, S) && K <= cap;
 
     const int n4 = N / FP32_EPT;
-    p.coop_g     = choose_coop_g(M, N, n4, PB_BLOCK, coop_g_override);
-
-    if(path_override == PATH_AUTO)
-    {
-        if(p.coop_g > 1 && M <= 256)
-            p.path = PATH_DECODE;
-        else
-            p.path = PATH_PREFILL;
-    }
-    else
-    {
-        p.path = path_override;
-        if(p.path == PATH_DECODE && p.coop_g <= 1)
-            p.coop_g = choose_coop_g(M, N, n4, PB_BLOCK, 64);
-        if(p.path == PATH_PREFILL)
-            p.coop_g = 1;
-    }
+    p.coop_g     = choose_coop_g(M, N, n4, PB_BLOCK);
+    p.path       = p.coop_g > 1 && M <= 256 ? PATH_DECODE : PATH_PREFILL;
     return p;
 }

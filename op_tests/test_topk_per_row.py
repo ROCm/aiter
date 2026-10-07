@@ -207,7 +207,7 @@ def run_top_k_per_row_prefill_sampled(
     stride_col: int,
     k: int = 2048,
 ) -> None:
-    """Run the topk-prefill-avo kernels through the same timing harness.
+    """Run the sampled kernels through the same timing path.
 
     Same arguments as run_top_k_per_row_prefill so the two are measured under
     one decorator rather than two, which is the only way the numbers are
@@ -305,7 +305,7 @@ def test_top_k_per_row_prefill(
     Test topk_per_row_prefill.
 
     `backend` picks which selector runs: "aiter" for top_k_per_row_prefill,
-    "sampled" for the topk-prefill-avo kernels. Both go through the same data,
+    "sampled" for top_k_per_row_prefill_sampled. Both go through the same data,
     the same torch.topk reference and the same @perftest timing, so the `us`
     column is comparable across the two rows of the summary table.
 
@@ -576,7 +576,7 @@ parser.add_argument(
     choices=["aiter", "sampled"],
     nargs="+",
     help="""which prefill selector to measure: `aiter` for
-    top_k_per_row_prefill, `sampled` for the topk-prefill-avo kernels. Pass both to
+    top_k_per_row_prefill, `sampled` for top_k_per_row_prefill_sampled. Pass both to
     get one summary table with a row per backend per shape.
     e.g.: --prefill_backend aiter sampled""",
 )

@@ -1,19 +1,5 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-// GENERATED FILE -- DO NOT EDIT.
-//
-// Source of truth: the topk-prefill-avo repo. Regenerate with
-//   python3 scripts/export_aiter_op.py --aiter <this aiter checkout>
-// and verify an existing tree with the same command plus --check.
-//
-// This is benchmark_topk.hip.cpp up to its AITER_EXPORT_END marker (the kernels
-// and their dispatch) followed by csrc/topk_aiter_entry.inc.hip (the aiter op
-// entry). The harness half of that file -- CPU/GPU verification oracles, timing,
-// CLI -- is deliberately not here. The source repo indents at 2; what you are
-// reading was reformatted to aiter's .clang-format on the way in, so this file
-// does not line up line-for-line with the source.
-//
-// Formatted by: clang-format version 18.1.8
 
 #pragma once
 
@@ -157,7 +143,8 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
     const int stride   = PB_BLOCK;
     const int iters    = (i1 > i0) ? ((i1 - i0) + stride - 1) / stride : 0;
 
-    int bcnt = 0;
+    int bcnt                    = 0;
+    constexpr int COOP_DRAIN_AT = WSTAGE_CAP_COOP - 4 * WAVE_SIZE;
 
 // The drain's cost is its reservation atomic, not its data movement: with no
 // candidate passing, phase_b ran 100.35 us faster at m=4096 n=131072, while the
@@ -192,9 +179,6 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
         // With at most two blocks per CU little else hides a filter load, so each
         // thread issues PB_B before filtering any, in the loop's filter order; a
         // slot past i1 loads a live address and is masked by `live`.
-#ifndef COOP_DRAIN_AT
-#define COOP_DRAIN_AT (WSTAGE_CAP_COOP - 4 * WAVE_SIZE)
-#endif
         auto filter_v4 = [&](const vfloat4& v, int i, bool live) {
             const int base_idx = i * FP32_EPT;
             const uint64_t b0  = __ballot(live && !(v[0] < th));
@@ -238,11 +222,7 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
             for(int t = 0; t < PB_B; t++)
             {
                 const int i = i0 + (it0 + t) * stride + threadIdx.x;
-#if PB_BATCH_MUTANT // gate self-test only: never filters a batch's last slot
-                filter_v4(vv[t], i, i < i1 && t != PB_B - 1);
-#else
                 filter_v4(vv[t], i, i < i1);
-#endif
             }
         }
     }
@@ -280,9 +260,6 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
                         ((uint64_t)__float_as_uint(v[3]) << 32) | (uint32_t)(base_idx + 3);
                 bcnt += wtotal;
             }
-#ifndef COOP_DRAIN_AT
-#define COOP_DRAIN_AT (WSTAGE_CAP_COOP - 4 * WAVE_SIZE)
-#endif
             if(bcnt > COOP_DRAIN_AT)
             {
                 __builtin_amdgcn_wave_barrier();
@@ -293,7 +270,7 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
     // The vector loop stops at n4 = len / FP32_EPT, which TRUNCATES when the row
     // width is not a multiple of four, so the last one to three columns would
     // never be looked at. A per-element `< len` predicate on every vector (the
-    // ragged form before v8) costs the whole row to reach three columns.
+    // earlier ragged form) costs the whole row to reach three columns.
     //
     // The block that owns the last chunk picks the tail up instead: at most three
     // columns, one lane each, staged exactly like any other candidate so the
@@ -331,7 +308,6 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
     __shared__ int s_local[MAX_WAVES_PER_BLOCK];
     __shared__ int s_off[MAX_WAVES_PER_BLOCK];
     __shared__ unsigned s_base;
-    __shared__ int s_tot;
     if(lane == 0)
         s_local[wid] = bcnt;
     __syncthreads();
@@ -361,7 +337,6 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
         }
         else
         {
-            s_tot  = total;
             s_base = atomicAdd(&cand_reserved[(size_t)row * CTR_STRIDE], (unsigned)total);
             if(s_base + (unsigned)total > (unsigned)cap)
             {
@@ -377,7 +352,7 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
     // Each wave writes out its own staged run, with a non-temporal store.
     //
     // Both halves were priced against the block-serial walk this replaces, at
-    // m=4096 k=2048 --dist gaussian --seed 0, phase_b device
+    // m=4096 k=2048, gaussian rows, seed 0, phase_b device
     // time, upper three quartiles of 20 launches:
     //
     //                                          N=131072   N=262144
@@ -404,9 +379,9 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
         if(cnt > 0)
         {
             uint64_t* dst = row_base + s_base + s_off[wid];
-            // The store takes the same gate as the load, and for the same reason.
+            // The store takes the same M*pitch threshold as the load, for the same reason.
             // Measured three-kernel total, per-wave with an ordinary store against
-            // per-wave with a non-temporal one, k=2048 --dist gaussian --seed 0:
+            // per-wave with a non-temporal one, k=2048, gaussian rows, seed 0:
             //
             //   m=1    n=131072  (2^17)   18.49us   19.72us
             //   m=16   n=1048576 (2^24)   42.02us   43.45us
@@ -418,7 +393,7 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
             //
             // It crosses at the same 2^27 the loads do. Writing each wave's own run
             // rather than having the block walk all eight is a win at every size, so
-            // only the non-temporal part is gated.
+            // only the non-temporal part is conditional.
             if constexpr(NT_STORE)
             {
                 for(int j = lane; j < cnt; j += WAVE_SIZE)
@@ -428,12 +403,6 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
             {
                 for(int j = lane; j < cnt; j += WAVE_SIZE)
                 {
-#if NT_LOAD_ONLY_MUTANT
-                    // Gate self-test only: drops each wave's first candidate in the
-                    // NT-load / cached-store instantiation. Must turn the gate red.
-                    if(NT && j == 0)
-                        continue;
-#endif
                     dst[j] = buf[j];
                 }
             }
@@ -452,12 +421,9 @@ phase_c_select_contig(const float* __restrict__ input,
                       const uint64_t* __restrict__ cand_pack,
                       const unsigned int* __restrict__ cand_reserved,
                       const unsigned int* __restrict__ cand_bad,
-                      unsigned int* __restrict__ cand_count,
                       int cap,
                       int K,
                       TopkOut<WRITE_VALUES> dst,
-                      int* __restrict__ fb_rows,
-                      int* __restrict__ fb_count,
                       int npasses,
                       bool keys_only,
                       int nwide,
@@ -472,8 +438,6 @@ phase_c_select_contig(const float* __restrict__ input,
     const unsigned int bad_raw = cand_bad[(size_t)row * CTR_STRIDE];
     const unsigned int res_raw = cand_reserved[(size_t)row * CTR_STRIDE];
     const unsigned int c_raw   = bad_raw ? 0xFFFFFFFFu : res_raw;
-    if(threadIdx.x == 0)
-        cand_count[row] = c_raw;
 
     extern __shared__ uint32_t s_dyn[];
     uint32_t* s_keys_ext = s_dyn;
@@ -535,20 +499,15 @@ phase_c_select_contig(const float* __restrict__ input,
             for(int u = 0; u < PC_B; u++)
             {
                 const int i = i0 + u * (int)blockDim.x;
-#if PC_BATCH_MUTANT // gate self-test only: never stores a batch's last candidate
-                if(i < c && u != PC_B - 1)
-                    take_cand(pv[u], i);
-#else
                 if(i < c)
                     take_cand(pv[u], i);
-#endif
             }
         }
         __syncthreads();
     };
 
     // len <= K routes unconditionally so the identity emit cannot be diverted by
-    // a cand_count the +inf threshold let through.
+    // a candidate count the +inf threshold let through.
     int c          = (int)c_raw;
     bool fall_back = (RAGGED && len <= K) || c_raw < (unsigned)k_out || c_raw > (unsigned)cap;
     if(!fall_back)
@@ -574,8 +533,6 @@ phase_c_select_contig(const float* __restrict__ input,
     }
     if(fall_back)
     {
-        if(threadIdx.x == 0)
-            fb_rows[atomicAdd(fb_count, 1)] = row;
         const float* rif0 = input + (size_t)row * pitch + row_start;
         if(RAGGED && len <= K)
         {
@@ -624,10 +581,6 @@ phase_c_select_contig(const float* __restrict__ input,
                                                          s_mm,
                                                          &s_wgt,
                                                          &s_weq);
-#if FB_BAND_PROBE
-        if(threadIdx.x == 0)
-            printf("FBBAND row=%d c_raw=%u got=%d\n", row, c_raw, got);
-#endif
         if(got < 0)
             return; // emitted; len > K here, so k_out == K and nothing to pad
         c = got;
@@ -636,21 +589,6 @@ phase_c_select_contig(const float* __restrict__ input,
 
     uint32_t pivot;
     int eq_needed;
-    // Prices phase_c the way ABLATE_PA prices phase_a: the candidate read, the LDS
-    // fill and the gather all stay, only block_select_lds goes. The gather then
-    // works off a pivot that selects nothing in particular, so the results are
-    // WRONG -- this exists to say how much of phase_c is the select.
-#ifndef ABLATE_PC
-#define ABLATE_PC 0
-#endif
-#if ABLATE_PC
-    // Block-UNIFORM and below every key, so block_gather_topk finds its k_out
-    // immediately instead of spinning: a per-thread pivot made it loop and the
-    // measurement came back at 330-937us, which was the spin, not the select.
-    pivot     = 0u;
-    eq_needed = 0;
-    (void)npasses;
-#else
     if(nwide > 0)
         block_select_lds_wide<REUSE_WIDE>(s_keys_ext,
                                           c,
@@ -667,7 +605,6 @@ phase_c_select_contig(const float* __restrict__ input,
     else
         block_select_lds(
             s_keys_ext, c, k_out, s_hist, s_scan, s_mm, pivot, eq_needed, npasses, true, true);
-#endif
 
     if(threadIdx.x == 0)
     {
