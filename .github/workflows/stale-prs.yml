@@ -5,7 +5,7 @@ name: Stale pull requests
 
 on:
   schedule:
-    - cron: '30 1 * * *'
+    - cron: '0 0 * * *'
   workflow_dispatch:
 
 permissions:
@@ -29,8 +29,8 @@ jobs:
           days-before-issue-close: -1
           stale-pr-label: stale
           exempt-pr-labels: 'do-not-close'
-          exempt-draft-pr: true
-          operations-per-run: 300
+          exempt-draft-pr: false
+          operations-per-run: 99999
           stale-pr-message: >
             No activity for 15 days, so this is now labelled `stale`. A push or
             a comment clears it; `keep-open` exempts it. Nothing is closed
