@@ -204,8 +204,13 @@ def _is_metadata_only():
     return len(sys.argv) < 2 or sys.argv[1] in _skip
 
 
+# pip's PEP 517 flow runs setup.py twice: once for metadata (`dist_info`) and
+# once for the real build. `dist_info` never puts aiter/ on sys.path, so every
+# use of `jit`/`core` below has to be guarded by this, not just the imports.
+METADATA_ONLY = _is_metadata_only()
+
 # Defer heavy imports until build time
-if not _is_metadata_only() and not AITER_TRITON_ONLY:
+if not METADATA_ONLY and not AITER_TRITON_ONLY:
     import json
     from concurrent.futures import ThreadPoolExecutor
 
@@ -280,7 +285,7 @@ def get_exclude_ops():
     return exclude_ops
 
 
-if PREBUILD_KERNELS != 0:
+if PREBUILD_KERNELS != 0 and not METADATA_ONLY:
     has_torch = True
     try:
         import torch as _
