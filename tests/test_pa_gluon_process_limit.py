@@ -16,8 +16,8 @@ from csrc.cpp_itfs.pa_gluon_aot import pa_decode_gluon_aot_prebuild as pa_gluon
 
 
 class PaGluonProcessLimitTest(unittest.TestCase):
-    @patch.object(pa_gluon, "get_worker_count_for", return_value=1)
-    def test_pool_uses_shared_worker_policy(self, worker_count):
+    @patch.object(pa_gluon, "get_gpu_worker_count", return_value=1)
+    def test_pool_uses_gpu_worker_policy(self, worker_count):
         executor = MagicMock()
         executor.__enter__.return_value = executor
         executor.__exit__.return_value = False

@@ -1,8 +1,10 @@
 """Worker limits shared by setup and AITER runtime code."""
 
+import importlib
 import logging
 import os
 import posixpath
+import sys
 import threading
 import time
 import warnings
@@ -11,10 +13,16 @@ from fractions import Fraction
 CPU_CORE_COUNT_UTILIZATION = 0.80
 # Approximate peak RSS observed per AOT worker, rounded up to 1.5 GB.
 EST_WORKER_RSS_BYTES = 1_500_000_000
+# Concurrent GPU-executing workers allowed per visible device. Tasks that run
+# kernels during AITER compilation are bounded by device contexts and device
+# memory rather than by host CPU or RAM.
+EST_WORKERS_PER_GPU = 8
 _WORKER_ENV = "AITER_MAX_JOBS"
 _LEGACY_WORKER_ENV = "MAX_JOBS"
+_GPU_WORKERS_PER_DEVICE_ENV = "AITER_GPU_WORKERS_PER_DEVICE"
 _PROC_SELF_CGROUP_PATH = "/proc/self/cgroup"
 _PROC_SELF_MOUNTINFO_PATH = "/proc/self/mountinfo"
+_ROCM_AMDSMI_PATH = "/opt/rocm/share/amd_smi"
 _logger = logging.getLogger(__name__)
 _memory_diagnostic_lock = threading.Lock()
 _memory_diagnostic_last_time: float | None = None
@@ -448,6 +456,119 @@ def get_compile_worker_count() -> int:
 def get_worker_count_for(work_count: int) -> int:
     """Cap the global worker budget to available work, with a floor of one."""
     return min(get_worker_count(), max(1, int(work_count)))
+
+
+def _configured_worker_ceiling() -> int | None:
+    """Return a positive ``AITER_MAX_JOBS`` ceiling, if one is configured."""
+    raw = os.environ.get(_WORKER_ENV)
+    if raw is None:
+        return None
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return None
+
+
+def _gpu_count_from_env() -> int | None:
+    """Return a visible GPU count from a device mask, or None when unset."""
+    for name in (
+        "HIP_VISIBLE_DEVICES",
+        "ROCR_VISIBLE_DEVICES",
+        "CUDA_VISIBLE_DEVICES",
+    ):
+        raw = os.environ.get(name)
+        if raw is None:
+            continue
+        raw = raw.strip()
+        if not raw:
+            continue
+        if raw == "-1":
+            return 0
+        if raw.lower() == "all":
+            return None
+        entries = [part for part in raw.split(",") if part.strip()]
+        if entries:
+            return len(entries)
+    return None
+
+
+def _amdsmi_gpu_count() -> int | None:
+    """Count AMD GPUs through amdsmi, or return None when it is unavailable."""
+    try:
+        amdsmi = importlib.import_module("amdsmi")
+    except ImportError:
+        if not os.path.isdir(_ROCM_AMDSMI_PATH):
+            return None
+        added_path = _ROCM_AMDSMI_PATH not in sys.path
+        if added_path:
+            sys.path.insert(0, _ROCM_AMDSMI_PATH)
+        try:
+            amdsmi = importlib.import_module("amdsmi")
+        except ImportError:
+            return None
+        finally:
+            if added_path:
+                sys.path.remove(_ROCM_AMDSMI_PATH)
+
+    try:
+        amdsmi.amdsmi_init()
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        return len(amdsmi.amdsmi_get_processor_handles())
+    except Exception:  # noqa: BLE001
+        return None
+    finally:
+        try:
+            amdsmi.amdsmi_shut_down()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _visible_gpu_count() -> int:
+    """Return the number of visible GPUs, preferring amdsmi and masks."""
+    masked = _gpu_count_from_env()
+    if masked is not None:
+        return masked
+    amdsmi_count = _amdsmi_gpu_count()
+    if amdsmi_count is not None:
+        return amdsmi_count
+    try:
+        import torch
+
+        return max(0, int(torch.cuda.device_count()))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _gpu_workers_per_device() -> int:
+    """Return the GPU workers allowed per visible device."""
+    raw = os.environ.get(_GPU_WORKERS_PER_DEVICE_ENV)
+    if raw is not None:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    return EST_WORKERS_PER_GPU
+
+
+def get_gpu_worker_count(work_count: int) -> int:
+    """Worker budget for pools whose tasks execute on the GPU.
+
+    GPU execution is bounded by the visible device count, not by the host CPU
+    or memory budget: each worker holds a device context and allocates device
+    memory. ``AITER_MAX_JOBS`` and the submitted work count still cap the
+    result. When no GPU is visible the shared CPU policy is used instead, so
+    CPU-only hosts keep the previous behaviour.
+    """
+    devices = _visible_gpu_count()
+    if devices <= 0:
+        return get_worker_count_for(work_count)
+    budget = devices * _gpu_workers_per_device()
+    ceiling = _configured_worker_ceiling()
+    if ceiling is not None:
+        budget = min(budget, ceiling)
+    return max(1, min(budget, max(1, int(work_count))))
 
 
 def configure_worker_subprocesses() -> None:

@@ -92,6 +92,14 @@ Environment Variables
        always clamp either ceiling.
      - Minimum of 80% of process-available CPUs and effective host/container
        available-memory capacity
+   * - ``AITER_GPU_WORKERS_PER_DEVICE``
+     - Concurrent GPU-executing workers allowed per visible GPU for build pools
+       that run kernels on the device (for example the PA-Gluon accuracy
+       prebuild). Devices are counted from ``HIP_VISIBLE_DEVICES``,
+       ``ROCR_VISIBLE_DEVICES`` or ``CUDA_VISIBLE_DEVICES`` when one is set,
+       otherwise through ``amdsmi``. ``AITER_MAX_JOBS`` and the submitted job
+       count still cap the pool. Ignored when no GPU is visible.
+     - ``8``
 
 For an AITER-owned compile, worker-ceiling precedence is explicit
 ``AITER_MAX_JOBS`` first, then a valid positive legacy ``MAX_JOBS``, then

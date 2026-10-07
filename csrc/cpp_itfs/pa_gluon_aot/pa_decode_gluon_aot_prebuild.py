@@ -19,7 +19,7 @@ from aiter.test_common import benchmark
 from aiter_worker_limits import (
     adopt_legacy_max_jobs,
     configure_worker_subprocesses,
-    get_worker_count_for,
+    get_gpu_worker_count,
 )
 from csrc.cpp_itfs.pa_gluon_aot.pa_decode_gluon_aot import (
     pa_decode_gluon_aot,
@@ -816,7 +816,9 @@ def run_multi_pa_gluon_test(
     # Prepare arguments for multiprocessing
     test_args = [(config, idx + 1, total) for idx, config in enumerate(test_configs)]
 
-    worker_count = get_worker_count_for(total)
+    # These tasks execute kernels on the GPU, so bound the pool by visible
+    # devices instead of the host CPU/memory compilation budget.
+    worker_count = get_gpu_worker_count(total)
     print(f"Using {worker_count} parallel processes\n")
 
     # Run tests in parallel using spawn context to avoid CUDA reinitialization issues

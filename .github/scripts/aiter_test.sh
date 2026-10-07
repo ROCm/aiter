@@ -90,6 +90,13 @@ for file in "${sharded_files[@]}"; do
     # batch gate so they exercise the persistent kernel at every batch size.
     test_cmd=(timeout 60m python3 "$file")
     case "$file" in
+        tests/test_*.py)
+            # The focused regression suite is pytest-style with no runnable
+            # __main__, so `python3 "$file"` would exit 0 without executing a
+            # case. Dispatch it through pytest, which exits non-zero (5) when
+            # no tests are collected, so an empty run cannot report success.
+            test_cmd=(timeout 60m python3 -m pytest -q "$file")
+            ;;
         op_tests/multigpu_tests/bench_mega_moe.py)
             {
                 echo "Running MegaMoE fused-scatter accuracy on 8 GPUs when supported"
