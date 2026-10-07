@@ -55,27 +55,30 @@ def test_flydsl_stage1_out_is_keyed_by_shape():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
 def test_flydsl_stage1_out_is_shared_across_graph_captures():
-    """Captured graphs must bake in the same pointer.
+    """Captures must share one buffer, rather than retain one each.
 
-    Retaining one buffer per captured graph is the behaviour this cache exists
-    to remove, so a second capture asking for the same shape has to receive the
-    first buffer rather than a fresh one. The buffer is warmed outside capture
-    deliberately: allocating inside a capture would place it in that graph's
-    private memory pool and tie its lifetime to the graph.
+    One buffer per captured graph is the behaviour this cache exists to remove,
+    so every capture asking for the same shape has to land on the same
+    allocation. Capture runs on its own stream, so captures share with each
+    other and not with eager execution: the cache holds one buffer per stream,
+    which is the point, instead of one per graph.
     """
     device = torch.device("cuda:0")
     shape = (512, 768)
 
-    warmed = _get_flydsl_stage1_out(shape, device)
+    eager = _get_flydsl_stage1_out(shape, device)
 
     captured = []
     for _ in range(2):
         graph = torch.cuda.CUDAGraph()
+        # Empty graph on purpose: this probes the allocator, not a kernel, so
+        # torch warns that nothing was captured.
         with torch.cuda.graph(graph):
             captured.append(_get_flydsl_stage1_out(shape, device))
 
-    assert [buf.data_ptr() for buf in captured] == [warmed.data_ptr()] * 2
-    assert len(_FLYDSL_STAGE1_OUT_CACHE) == 1
+    assert captured[0].data_ptr() == captured[1].data_ptr()
+    assert captured[0].data_ptr() != eager.data_ptr()
+    assert len(_FLYDSL_STAGE1_OUT_CACHE) == 2
 
 
 def _pick_kernel(**want):
@@ -95,7 +98,12 @@ def _pick_kernel(**want):
 
 
 def _observe_stage1_out(monkeypatch, kernel_name, params, device):
-    """Drive the wrapper far enough to see which buffer it passed down."""
+    """Drive the wrapper far enough to see which buffer it passed down.
+
+    out_dtype is passed explicitly because no registered kernel declares an
+    fp8 output; the registry only carries bf16 and f16. The gate is therefore
+    reachable only through this override, which is how fused_moe drives it.
+    """
     import aiter.fused_moe as fused_moe
 
     moe_kernels = fused_moe._get_flydsl_moe_kernels()
@@ -123,6 +131,7 @@ def _observe_stage1_out(monkeypatch, kernel_name, params, device):
         topk=topk,
         kernelName=kernel_name,
         activation=fused_moe.ActivationType.Situv2,
+        out_dtype="fp8",
         v2_output_layout=True,
     )
     expected_rows = max(
@@ -139,7 +148,7 @@ def test_flydsl_stage1_wrapper_allocates_from_cache(monkeypatch):
     the gate that decides to call it is unverified.
     """
     device = torch.device("cuda:0")
-    name, params = _pick_kernel(a_dtype="fp8", b_dtype="fp4", out_dtype="fp8")
+    name, params = _pick_kernel(a_dtype="fp8", b_dtype="fp4")
 
     out, expected_shape = _observe_stage1_out(monkeypatch, name, params, device)
 
@@ -157,7 +166,7 @@ def test_flydsl_stage1_wrapper_skips_cache_for_a16w4(monkeypatch):
     carve-out would waste the allocation and produce no error.
     """
     device = torch.device("cuda:0")
-    name, params = _pick_kernel(a_dtype="bf16", b_dtype="fp4", out_dtype="fp8")
+    name, params = _pick_kernel(a_dtype="bf16", b_dtype="fp4")
 
     out, _ = _observe_stage1_out(monkeypatch, name, params, device)
 
