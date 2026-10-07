@@ -4,9 +4,10 @@
 """Skinny bf16 GEMMs of a DiT's AdaLN modulation linear for a 32-row micro-batch (asm kernels, ``hsa/<arch>/adalngemm``):
 
 * ``adaln_fwd(x, w, bias, out)``:  ``out[32, N] = x[32, K] @ w[N, K]^T + bias``
-* ``adaln_dgrad(dy, w, out)``:     ``out[32, K] = dy[32, N] @ w[N, K]`` -- one launch with a deterministic split-K
-  reduce; the fp32 workspace and int32 counters it needs are allocated here per (device, N, K) and reused (the
-  counters stay zero between calls)
+* ``adaln_dgrad(dy, w, out)``:     ``out[32, K] = dy[32, N] @ w[N, K]``
+
+  (both one launch with a deterministic split-K reduce; the fp32 workspace and int32 counters they need are allocated
+  here per (pass, device, N, K) and reused -- the counters stay zero between calls)
 * ``adaln_wgrad(dy, x, out)``:     ``out[N, K] = dy[32, N]^T @ x[32, K]`` (``out`` may be a parameter's main_grad)
 
 Kernels exist for exact (pass, N, K); ``adaln_gemm_supported`` says whether one does (pure Python on ints, safe inside
@@ -54,22 +55,23 @@ def adaln_gemm_supported(pass_: str, N: int, K: int) -> bool:
 _WS: dict = {}
 
 
-def _workspace(device, N: int, K: int):
-    key = (device, N, K)
+def _workspace(pass_: int, device, N: int, K: int):
+    key = (pass_, device, N, K)
     if key not in _WS:
-        ws, cnt = _manifest()[(1, N, K)]
+        ws, cnt = _manifest()[(pass_, N, K)]
         _WS[key] = (torch.empty(ws, dtype=torch.float32, device=device),
                     torch.zeros(cnt, dtype=torch.int32, device=device))
     return _WS[key]
 
 
 def adaln_fwd(x: Tensor, w: Tensor, bias: Tensor, out: Tensor) -> Tensor:
-    _adaln_gemm_asm(0, x, w, bias, out, None, None)
+    ws, cnt = _workspace(0, x.device, w.shape[0], w.shape[1])
+    _adaln_gemm_asm(0, x, w, bias, out, ws, cnt)
     return out
 
 
 def adaln_dgrad(dy: Tensor, w: Tensor, out: Tensor) -> Tensor:
-    ws, cnt = _workspace(dy.device, w.shape[0], w.shape[1])
+    ws, cnt = _workspace(1, dy.device, w.shape[0], w.shape[1])
     _adaln_gemm_asm(1, dy, w, None, out, ws, cnt)
     return out
 

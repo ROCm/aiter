@@ -15,10 +15,10 @@
 
 // Skinny bf16 GEMMs of a DiT's AdaLN modulation linear, one micro-batch of 32 rows (hsa/gfx950/adalngemm):
 //   pass 0  forward  y[32, N]  = x[32, K] @ W[N, K]^T + b
-//   pass 1  dgrad    dx[32, K] = dy[32, N] @ W[N, K]        (one launch; split-K with a deterministic reduce by the
-//                                                             last-arriving workgroup of each column tile: needs an
-//                                                             fp32 workspace and int32 counters that start at zero
-//                                                             and are left at zero)
+//   pass 1  dgrad    dx[32, K] = dy[32, N] @ W[N, K]
+//           (both: one launch, K split across workgroups with a deterministic reduce by the last-arriving
+//            workgroup of each column tile: they need an fp32 workspace and int32 counters that start at zero and
+//            are left at zero)
 //   pass 2  wgrad    dW[N, K]  = dy[32, N]^T @ x[32, K]      (bitwise equal to a single-K-step GEMM: K = 32)
 // Rows are exact (pass, N, K). Kernel arguments are raw buffer resources (V#) over each tensor and N.
 namespace {
@@ -74,8 +74,8 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      aiter_tensor_t* b,    // pass 0: W [N, K]; 1: W [N, K]; 2: x [32, K]
      aiter_tensor_t* bias, // pass 0: bias [N] (required); otherwise nullptr
      aiter_tensor_t* out,  // pass 0: y [32, N]; 1: dx [32, K]; 2: dW [N, K]
-     aiter_tensor_t* ws,   // pass 1: fp32 workspace (manifest `ws` elements); otherwise nullptr
-     aiter_tensor_t* cnt,  // pass 1: int32 counters (manifest `cnt` elements, zero); otherwise nullptr
+     aiter_tensor_t* ws,   // pass 0 / 1: fp32 workspace (manifest `ws` elements); pass 2: nullptr
+     aiter_tensor_t* cnt,  // pass 0 / 1: int32 counters (manifest `cnt` elements, zero); pass 2: nullptr
      hipStream_t stream),
     (pass, a, b, bias, out, ws, cnt, stream))
 {
@@ -98,9 +98,10 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         K = a->size(1);
         N = b->size(0);
         AITER_CHECK(b->size(1) == K && out->size(0) == 32 && out->size(1) == N && bias != nullptr &&
-                        bias->dtype() == AITER_DTYPE_bf16 && bias->numel() == N,
+                        bias->dtype() == AITER_DTYPE_bf16 && bias->numel() == N && ws != nullptr && cnt != nullptr &&
+                        ws->dtype() == AITER_DTYPE_fp32 && cnt->dtype() == AITER_DTYPE_i32,
                     __func__,
-                    " forward shapes: x [32, K], W [N, K], bias [N], y [32, N]");
+                    " forward shapes: x [32, K], W [N, K], bias [N], y [32, N], fp32 workspace, int32 counters");
     }
     else if(pass == 1)
     {
@@ -125,10 +126,10 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                 __func__,
                 " no AdaLN GEMM kernel for pass " + std::to_string(pass) + " N " + std::to_string(N) + " K " +
                     std::to_string(K));
-    if(pass == 1)
+    if(pass != 2)
         AITER_CHECK(ws->numel() >= cfg->ws && cnt->numel() >= cfg->cnt,
                     __func__,
-                    " dgrad workspace / counters smaller than the kernel needs");
+                    " workspace / counters smaller than the kernel needs");
 
     unsigned char args[6 * sizeof(Srd) + 4];
     size_t arg_size = 0;
@@ -139,8 +140,8 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     const Srd s_a = srd(a), s_b = srd(b), s_out = srd(out);
     if(pass == 0)
     {
-        const Srd s_bias = srd(bias);
-        put(&s_a, 16), put(&s_b, 16), put(&s_bias, 16), put(&s_out, 16);
+        const Srd s_bias = srd(bias), s_ws = srd(ws), s_cnt = srd(cnt);
+        put(&s_a, 16), put(&s_b, 16), put(&s_bias, 16), put(&s_out, 16), put(&s_ws, 16), put(&s_cnt, 16);
     }
     else if(pass == 1)
     {

@@ -1,6 +1,5 @@
 op,N,K,gx,gy,block,ws,cnt,knl_name,co_name
 2,18432,3072,24,72,256,0,0,adaln_wgrad_bf16_n18432_k3072,adaln_wgrad_bf16_n18432_k3072.co
 2,9216,3072,24,36,256,0,0,adaln_wgrad_bf16_n9216_k3072,adaln_wgrad_bf16_n9216_k3072.co
-1,18432,3072,48,12,256,1179648,48,adaln_dgrad_bf16_n18432_k3072,adaln_dgrad_bf16_n18432_k3072.co
-1,9216,3072,48,4,256,393216,48,adaln_dgrad_bf16_n9216_k3072,adaln_dgrad_bf16_n9216_k3072.co
-0,18432,3072,576,1,256,0,0,adaln_fwd_bf16_n18432_k3072,adaln_fwd_bf16_n18432_k3072.co
+0,18432,3072,144,4,256,2359296,144,adaln_fwd_bf16_n18432_k3072,adaln_fwd_bf16_n18432_k3072.co
+0,9216,3072,72,3,256,884736,72,adaln_fwd_bf16_n9216_k3072,adaln_fwd_bf16_n9216_k3072.co
