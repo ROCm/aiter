@@ -2,25 +2,6 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Kernel comparison benchmark for aiter's all-reduce implementations.
 
-Every implementation reachable from the plain (unfused) all-reduce path is a
-candidate here, so one sweep answers "which of the things aiter can do to an
-all-reduce is fastest at this shape, and what does it cost in accuracy".
-
-| column     | what runs                              | wire       | exact |
-|------------|----------------------------------------|------------|-------|
-| ``cdr``    | ``aiter::cross_device_reduce_{1,2}stage`` | bf16/fp16  | yes |
-| ``cdr_naive`` | the same call with ``use_new=False`` -> ``*_naive`` kernels | bf16/fp16 | yes |
-| ``cdr_fp8``   | ``CustomAllreduce::runFp8QuantKernel``  | fp8      | no  |
-| ``qr_fp``     | quick-reduce, no quantization           | fp16     | no  |
-| ``qr_fp8``    | quick-reduce, E4M3 codec                | fp8      | no  |
-| ``qr_int6``   | quick-reduce, 6-bit codec               | int6     | no  |
-| ``qr_int4``   | quick-reduce, 4-bit codec               | int4     | no  |
-| ``qr_int3``   | quick-reduce, 3-bit codec (TP2 only)    | int3     | no  |
-| ``fly_int4``  | FlyDSL mesh INT4 (ROCm/aiter#4970)      | int4     | no  |
-| ``fly_int4_ring`` | FlyDSL ring, same two-shot volume   | int4/int6| no  |
-| ``fly_1stage``| FlyDSL exact one-shot                   | bf16     | yes |
-| ``rccl``      | PyNccl ``all_reduce`` (out-of-place)    | bf16/fp16| yes |
-
 The three ``fly_*`` families are the ones with a dispatch question open: which
 of them wins is a function of payload size, and so is which variant wins inside
 each. Every ``fly_*`` key above is joined by pinned tuning rows
@@ -96,28 +77,29 @@ straight on the shipped thresholds. Either way the peer-wait that dominates the
 1-stage kernel is included, and the torch profiler is not usable here -- see
 the note in ``_bench_shape``.
 
-Which ``cross_device_reduce_*`` runs is chosen by the C++ host dispatch in
+Which kernel runs is chosen by the C++ host dispatch in
 ``csrc/include/custom_all_reduce.cuh`` (``CustomAllreduce::allreduce``), keyed on
-world size and message bytes. There is no env override, so the only way to reach
-a given kernel is to pick a shape:
+world size, dtype and message size.
 
-    use_new=true  (``cdr``)          | use_new=false (``cdr_naive``)
+    world == 2: n <= 4*8192 -> ll (ar_ll_gfx9, 256 thr)    (bf16: <= 64 KiB)
+                n <= 16*8192 -> ll128/256 (ar_ll128_unroll2) (bf16: <= 256 KiB)
+                n <= 64*7168 -> ll128/512 (ar_ll128_unroll2) (bf16: <= 896 KiB)
+    world == 4: n <= 4*7168 -> ll;  n <= 4*8192 -> ll128/256
+    world == 8: n <= 4*8192 -> ll
+    world == 6, or larger than the above -> the 1-/2-stage dispatch below
+
+and the remaining payloads fall through to the 1-/2-stage dispatch:
+
+    use_new=true  (``cdr``)          | use_new=false (``cdr_naive``, never LL)
     world == 2            -> 1stage  | world == 2            -> 1stage
     world <= 4, < 160 KiB -> 1stage  | world <= 4, < 512 KiB -> 1stage_naive
     world <= 8, <  80 KiB -> 1stage  | world <= 8, < 256 KiB -> 1stage_naive
     otherwise             -> 2stage  | otherwise             -> 2stage_naive
 
-**TP2 can only reach the 1-stage kernel**; the default shape list straddles both
-TP4 boundaries (M=11/12) and the TP8 one (M=5/6). The ``kernel`` / ``naive``
-columns report the prediction for each row.
-
 The benchmark calls the kernels directly rather than going through
 ``tensor_model_parallel_all_reduce``, so each is measured at every size even
 where production would not select it. The ``prod path`` column reports what
-``CudaCommunicator.all_reduce`` *would* dispatch for that row under the
-environment you launched with -- so a row can read ``prod path = rccl`` while
-still carrying custom-AR timings. That is the point: it shows what the
-production gates leave on the table.
+``CudaCommunicator.all_reduce`` would dispatch.
 
 Examples::
 
@@ -989,9 +971,33 @@ def load_shapes_csv(path: str) -> list[tuple[int, int]]:
 _ONESTAGE_MAX_BYTES = {4: 160 * 1024, 6: 80 * 1024, 8: 80 * 1024}
 _ONESTAGE_MAX_BYTES_NAIVE = {4: 512 * 1024, 6: 256 * 1024, 8: 256 * 1024}
 
+# LL / LL128 small-message window, from the `if constexpr(sizeof(T) == 2)` block
+# at the top of CustomAllreduce::allreduce. Per world size, ordered rungs of
+# (max element count, kernel name); the first rung that fits wins. Element
+# counts, not bytes, because that is what the C++ compares. Worlds absent here
+# (6) have no LL path. `ll` is ar_ll_gfx9 (block 256); `ll128_<B>` is
+# ar_ll128_unroll2 at block size B.
+_LL_THRESHOLDS = {
+    2: ((4 * 8192, "ll"), (16 * 8192, "ll128_256"), (64 * 7168, "ll128_512")),
+    4: ((4 * 7168, "ll"), (4 * 8192, "ll128_256")),
+    8: ((4 * 8192, "ll"),),
+}
 
-def predicted_kernel(world_size: int, nbytes: int, use_new: bool = True) -> str:
-    """Which cross_device_reduce_* the host dispatch will pick."""
+
+def predicted_kernel(
+    world_size: int, nbytes: int, use_new: bool = True, elem_size: int = 2
+) -> str:
+    """Which kernel CustomAllreduce::allreduce will pick.
+
+    One of ``ll`` / ``ll128_<block>`` (the LL kernels, ``use_new`` and 2-byte
+    dtypes only), ``1stage`` / ``2stage`` (``cross_device_reduce_*``) or their
+    ``*_naive`` forms.
+    """
+    if use_new and elem_size == 2:
+        numel = nbytes // elem_size
+        for max_numel, name in _LL_THRESHOLDS.get(world_size, ()):
+            if numel <= max_numel:
+                return name
     if not use_new:
         # The legacy branch keeps the vectorized 1stage kernel at TP2 (only the
         # block count differs from use_new=True) and uses the naive kernels
@@ -1023,14 +1029,17 @@ def collective_bw(nbytes: int, us: float, world_size: int, kernel: str):
     normalizes across world size so numbers are comparable between TPs.
     ``traffic`` is what this particular kernel actually moves per rank:
     one-shot reads the whole buffer from every peer, a two-shot moves a
-    reduce-scatter plus an all-gather.
+    reduce-scatter plus an all-gather. The LL kernels are flat one-shots too
+    (each rank publishes its full buffer to every peer); their flag words
+    inflate the real wire bytes (2x for LL, 16/15 for LL128), which this
+    payload-based figure deliberately leaves out.
     """
     n = world_size
     algbw = nbytes / us / 1e3  # bytes/us -> GB/s
     busbw = algbw * 2 * (n - 1) / n
     traffic = (
         (n - 1) * nbytes
-        if kernel.startswith("1stage")
+        if kernel.startswith(("1stage", "ll"))
         else int(2 * (n - 1) / n * nbytes)
     )
     return algbw, busbw, traffic
@@ -1074,7 +1083,7 @@ def production_path(ca_comm, qr_comm, x, world_size: int, prod_regime: str | Non
             qr_comm.qr_quant_level = saved
     if ca_comm is not None and not ca_comm.disabled and ca_comm.should_custom_ar(x):
         nbytes = x.numel() * x.element_size()
-        return f"cdr:{predicted_kernel(world_size, nbytes)}"
+        return f"cdr:{predicted_kernel(world_size, nbytes, elem_size=x.element_size())}"
     return "rccl"
 
 
@@ -1831,8 +1840,10 @@ def _row(tp_size, tokens, hidden, dtype, rank_rets):
         # than the rounded KiB the tables print. Not in ID_COLUMNS, so it never
         # reaches a printed table.
         "_nbytes": nbytes,
-        "kernel": predicted_kernel(tp_size, nbytes),
-        "naive": predicted_kernel(tp_size, nbytes, use_new=False),
+        "kernel": predicted_kernel(tp_size, nbytes, elem_size=dtype.itemsize),
+        "naive": predicted_kernel(
+            tp_size, nbytes, use_new=False, elem_size=dtype.itemsize
+        ),
         "prod path": rank_rets[0]["prod"],
     }
     for cand in CANDIDATES:
