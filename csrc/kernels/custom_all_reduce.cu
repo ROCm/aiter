@@ -198,7 +198,9 @@ static void _fused_allreduce_rmsnorm(fptr_t _fa,
                                      int m, int input_n, int n, int out_n,
                                      bool use_1stage,
                                      bool gemma_norm,
-                                     void* bf16_out = nullptr)
+                                     void* bf16_out = nullptr,
+                                     int num_norm_rows = -1,
+                                     int skip_residual = 0)
 {
     hipStream_t stream = aiter::getCurrentHIPStream();
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
@@ -220,7 +222,9 @@ static void _fused_allreduce_rmsnorm(fptr_t _fa,
             n,                                                   \
             out_n,                                               \
             use_1stage,                                          \
-            gemma_norm);                                         \
+            gemma_norm,                                          \
+            num_norm_rows,                                       \
+            skip_residual);                                      \
     }                                                            \
     else                                                         \
     {                                                            \
@@ -455,6 +459,80 @@ void all_reduce(fptr_t _fa,
                 use_new, open_fp8_quant, is_broadcast_reg_outptr);
 }
 
+// Residual 1-/2-stage epilogues use exact-coverage launches from the header.
+void all_reduce_residual(fptr_t _fa,
+                         const aiter_tensor_t& inp,
+                         const aiter_tensor_t& out,
+                         const aiter_tensor_t& residual,
+                         bool use_new,
+                         int64_t reg_inp_ptr,
+                         int64_t reg_inp_bytes)
+{
+    HipDeviceGuard device_guard(inp.device_id);
+    hipStream_t stream = aiter::getCurrentHIPStream();
+    auto dtype     = inp.dtype();
+    int64_t numel  = inp.numel();
+    int64_t data_bytes = numel * inp.element_size();
+
+    if(residual.numel() != numel)
+        throw std::runtime_error("all_reduce_residual: residual numel must match input");
+    if(residual.dtype() != dtype)
+        throw std::runtime_error("all_reduce_residual: residual dtype must match input");
+    if(!use_new)
+        throw std::runtime_error("all_reduce_residual requires use_new=true");
+
+    void* actual_inp = inp.data_ptr();
+    void* actual_out = out.data_ptr();
+    const void* residual_ptr = residual.data_ptr();
+
+    bool is_broadcast_reg_outptr = (reg_inp_ptr == 0);
+
+    if(reg_inp_ptr != 0)
+    {
+        if(data_bytes > reg_inp_bytes)
+            throw std::runtime_error("registered buffer is too small to contain the input");
+        HIP_CALL(hipMemcpyAsync((void*)reg_inp_ptr, actual_inp, data_bytes,
+                                hipMemcpyDeviceToDevice, stream));
+        actual_inp = (void*)reg_inp_ptr;
+    }
+
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    switch(dtype)
+    {
+    case AITER_DTYPE_fp32:
+        fa->allreduce_residual<opus::fp32_t>(
+            stream,
+            reinterpret_cast<opus::fp32_t*>(actual_inp),
+            reinterpret_cast<opus::fp32_t*>(actual_out),
+            reinterpret_cast<const opus::fp32_t*>(residual_ptr),
+            numel,
+            is_broadcast_reg_outptr);
+        break;
+    case AITER_DTYPE_fp16:
+        fa->allreduce_residual<opus::fp16_t>(
+            stream,
+            reinterpret_cast<opus::fp16_t*>(actual_inp),
+            reinterpret_cast<opus::fp16_t*>(actual_out),
+            reinterpret_cast<const opus::fp16_t*>(residual_ptr),
+            numel,
+            is_broadcast_reg_outptr);
+        break;
+#if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+    case AITER_DTYPE_bf16:
+        fa->allreduce_residual<opus::bf16_t>(
+            stream,
+            reinterpret_cast<opus::bf16_t*>(actual_inp),
+            reinterpret_cast<opus::bf16_t*>(actual_out),
+            reinterpret_cast<const opus::bf16_t*>(residual_ptr),
+            numel,
+            is_broadcast_reg_outptr);
+        break;
+#endif
+    default:
+        throw std::runtime_error("custom allreduce residual only supports float32, float16 and bfloat16");
+    }
+}
+
 void reduce_scatter(fptr_t _fa,
                     const aiter_tensor_t& inp,
                     const aiter_tensor_t& out,
@@ -526,7 +604,9 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
                              double eps,
                              int64_t reg_ptr, int64_t reg_bytes,
                              bool use_1stage,
-                             bool gemma_norm)
+                             bool gemma_norm,
+                             int64_t num_norm_rows,
+                             bool skip_residual)
 {
     HipDeviceGuard device_guard(inp.device_id);
     hipStream_t stream = aiter::getCurrentHIPStream();
@@ -553,14 +633,16 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
         _fused_allreduce_rmsnorm(_fa,
                                  (void*)reg_ptr, res_inp.data_ptr(), res_out.data_ptr(),
                                  out.data_ptr(), nullptr, w.data_ptr(),
-                                 dtype, (float)eps, m, input_n, n, out_n, use_1stage, gemma_norm);
+                                 dtype, (float)eps, m, input_n, n, out_n, use_1stage, gemma_norm,
+                                 nullptr, (int)num_norm_rows, skip_residual ? 1 : 0);
     }
     else
     {
         _fused_allreduce_rmsnorm(_fa,
                                  inp.data_ptr(), res_inp.data_ptr(), res_out.data_ptr(),
                                  out.data_ptr(), nullptr, w.data_ptr(),
-                                 dtype, (float)eps, m, input_n, n, out_n, use_1stage, gemma_norm);
+                                 dtype, (float)eps, m, input_n, n, out_n, use_1stage, gemma_norm,
+                                 nullptr, (int)num_norm_rows, skip_residual ? 1 : 0);
     }
 }
 
