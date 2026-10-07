@@ -23,6 +23,12 @@ _RADIX_BITS = 11
 _NUM_BUCKETS = 1 << _RADIX_BITS
 _MID_SHIFT = 10
 _LOW_MASK = (1 << _MID_SHIFT) - 1
+# A long row rereads the score buffer for every radix pass. Once the first
+# threshold is known, the entries that can still win fit in a few thousand
+# slots on real indexer scores. Keep those, in column order, and run the
+# remaining passes there. Wider ties fall back to the full-row passes.
+_COMPACT_LIMIT = 4096
+_COMPACT_MIN_ROW = 20_000
 
 _FIRST_ABOVE = 0
 _FIRST_THRESHOLD = 1
@@ -39,21 +45,34 @@ def build_topk_per_row_decode_one_workgroup_module(
     k: int,
     wave_size: int,
     write_values: bool = False,
+    compact: bool = False,
 ):
     if wave_size not in (32, 64):
         raise ValueError("wave size must be 32 or 64")
     num_waves = _BLOCK_THREADS // wave_size
     output_steps = (k + _BLOCK_THREADS - 1) // _BLOCK_THREADS
 
-    @fx.struct
-    class SharedStorage:
-        histogram: fx.Array[fx.Int32, _NUM_BUCKETS, 16]
-        scan: fx.Array[fx.Int32, num_waves * 2, 16]
-        metadata: fx.Array[fx.Int32, 8, 16]
+    if compact:
+
+        @fx.struct
+        class SharedStorage:
+            histogram: fx.Array[fx.Int32, _NUM_BUCKETS, 16]
+            scan: fx.Array[fx.Int32, num_waves * 2, 16]
+            metadata: fx.Array[fx.Int32, 8, 16]
+            cand_bits: fx.Array[fx.Int32, _COMPACT_LIMIT, 16]
+            cand_cols: fx.Array[fx.Int32, _COMPACT_LIMIT, 16]
+
+    else:
+
+        @fx.struct
+        class SharedStorage:
+            histogram: fx.Array[fx.Int32, _NUM_BUCKETS, 16]
+            scan: fx.Array[fx.Int32, num_waves * 2, 16]
+            metadata: fx.Array[fx.Int32, 8, 16]
 
     @flyc.kernel(
         name="topk_per_row_decode_1wg_"
-        + kernel_signature(k=k, wave=wave_size, wv=write_values),
+        + kernel_signature(k=k, wave=wave_size, wv=write_values, compact=compact),
         known_block_size=[_BLOCK_THREADS, 1, 1],
     )
     def topk_per_row_decode_one_workgroup_kernel(
@@ -83,6 +102,9 @@ def build_topk_per_row_decode_one_workgroup_module(
         histogram = storage.histogram.peek().view(fx.make_layout(_NUM_BUCKETS, 1))
         scan = storage.scan.peek().view(fx.make_layout(num_waves * 2, 1))
         metadata = storage.metadata.peek().view(fx.make_layout(8, 1))
+        if const_expr(compact):
+            cand_bits = storage.cand_bits.peek().view(fx.make_layout(_COMPACT_LIMIT, 1))
+            cand_cols = storage.cand_cols.peek().view(fx.make_layout(_COMPACT_LIMIT, 1))
 
         # Slice the row first, then build the descriptor over it. Built over
         # the whole tensor and sliced afterwards, the row offset has to fit the
@@ -350,42 +372,21 @@ def build_topk_per_row_decode_one_workgroup_module(
                     metadata[_RUNNING_EQUAL] = metadata[_RUNNING_EQUAL] + block_equal
                 gpu.barrier()
 
-        if row_len <= top_k:
-            for output_step in range_constexpr(output_steps):
-                out_pos = output_step * _BLOCK_THREADS + tid
-                if out_pos < k:
-                    valid = out_pos < row_len
-                    row_indices[out_pos] = valid.select(out_pos, fx.Int32(-1))
-                    if const_expr(write_values):
-                        row_values[out_pos] = valid.select(
-                            input[row, out_pos],
-                            fx.Float32(float("-inf")),
-                        )
-
-        if row_len > top_k:
-            if tid < 8:
-                metadata[tid] = zero
-            gpu.barrier()
-
-            clear_histogram(histogram)
-            reread_row(histogram_pass1)
-            gpu.barrier()
-            choose_threshold(
-                top_k,
-                _FIRST_ABOVE,
-                _FIRST_THRESHOLD,
-                histogram,
-                scan,
-                metadata,
-            )
-            first_threshold = metadata[_FIRST_THRESHOLD]
-
+        def finish_global(
+            first_threshold,
+            first_above,
+            histogram,
+            scan,
+            metadata,
+            row_indices,
+            row_values,
+        ):
             clear_histogram(histogram)
             reread_row(
                 lambda col, values: histogram_pass2(col, values, first_threshold)
             )
             gpu.barrier()
-            need_after_first = top_k - metadata[_FIRST_ABOVE]
+            need_after_first = top_k - first_above
             choose_threshold(
                 need_after_first,
                 _SECOND_ABOVE,
@@ -417,7 +418,6 @@ def build_topk_per_row_decode_one_workgroup_module(
             )
             third_threshold = metadata[_THIRD_THRESHOLD]
             num_needed = need_after_second - metadata[_THIRD_ABOVE]
-
             stable_scatter(
                 first_threshold,
                 second_threshold,
@@ -428,6 +428,224 @@ def build_topk_per_row_decode_one_workgroup_module(
                 scan,
                 metadata,
             )
+
+        def finish_compact(
+            first_threshold,
+            first_above,
+            candidate_count,
+            cand_bits,
+            cand_cols,
+            histogram,
+            scan,
+            metadata,
+            row_indices,
+            row_values,
+        ):
+            if tid == 0:
+                metadata[_RUNNING_ABOVE] = zero
+            gpu.barrier()
+            num_steps = (row_vectors + block_threads - one) // block_threads
+            for step in range(zero, num_steps, one):
+                vector_idx = step * block_threads + tid
+                active_vector = vector_idx < row_vectors
+                safe_vector_idx = active_vector.select(vector_idx, zero)
+                col_base = safe_vector_idx * vec_width
+                rvals = _load_f32x4(input_resource, safe_vector_idx)
+                flags = fx.make_rmem_tensor(_VEC, fx.Int32)
+                for lane_idx in range_constexpr(_VEC):
+                    col = col_base + lane_idx
+                    bucket = high_bucket(rvals[lane_idx])
+                    keep = (
+                        active_vector
+                        & (col < row_len)
+                        & ((bucket > first_threshold) | (bucket == first_threshold))
+                    )
+                    flags[lane_idx] = keep.select(one, zero)
+                local = flags[0] + flags[1] + flags[2] + flags[3]
+                (
+                    prefix,
+                    _equal_prefix,
+                    block_total,
+                    _block_equal,
+                ) = block_exclusive_scan_pair(local, zero, scan, metadata)
+                cursor = metadata[_RUNNING_ABOVE] + prefix
+                for lane_idx in range_constexpr(_VEC):
+                    if flags[lane_idx] == one:
+                        cand_bits[cursor] = rvals[lane_idx].bitcast(fx.Int32)
+                        cand_cols[cursor] = col_base + lane_idx
+                        cursor = cursor + one
+                if tid == 0:
+                    metadata[_RUNNING_ABOVE] = metadata[_RUNNING_ABOVE] + block_total
+                gpu.barrier()
+
+            clear_histogram(histogram)
+            for index in range(tid, candidate_count, block_threads):
+                value = cand_bits[index].bitcast(fx.Float32)
+                if high_bucket(value) == first_threshold:
+                    atomic_add_i32(
+                        histogram,
+                        one,
+                        radix_bucket(
+                            value,
+                            fx.Int32(_MID_SHIFT),
+                            fx.Int32(_NUM_BUCKETS - 1),
+                        ),
+                        "workgroup",
+                    )
+            gpu.barrier()
+            need_after_first = top_k - first_above
+            choose_threshold(
+                need_after_first,
+                _SECOND_ABOVE,
+                _SECOND_THRESHOLD,
+                histogram,
+                scan,
+                metadata,
+            )
+            second_threshold = metadata[_SECOND_THRESHOLD]
+
+            clear_histogram(histogram)
+            for index in range(tid, candidate_count, block_threads):
+                value = cand_bits[index].bitcast(fx.Float32)
+                mid = radix_bucket(
+                    value,
+                    fx.Int32(_MID_SHIFT),
+                    fx.Int32(_NUM_BUCKETS - 1),
+                )
+                if (high_bucket(value) == first_threshold) & (mid == second_threshold):
+                    atomic_add_i32(
+                        histogram,
+                        one,
+                        radix_bucket(value, zero, fx.Int32(_LOW_MASK)),
+                        "workgroup",
+                    )
+            gpu.barrier()
+            need_after_second = need_after_first - metadata[_SECOND_ABOVE]
+            choose_threshold(
+                need_after_second,
+                _THIRD_ABOVE,
+                _THIRD_THRESHOLD,
+                histogram,
+                scan,
+                metadata,
+            )
+            third_threshold = metadata[_THIRD_THRESHOLD]
+            num_needed = need_after_second - metadata[_THIRD_ABOVE]
+
+            if tid == 0:
+                metadata[_RUNNING_ABOVE] = zero
+                metadata[_RUNNING_EQUAL] = zero
+            gpu.barrier()
+            scatter_steps = (candidate_count + block_threads - one) // block_threads
+            for step in range(zero, scatter_steps, one):
+                index = step * block_threads + tid
+                active = index < candidate_count
+                safe = active.select(index, zero)
+                value = cand_bits[safe].bitcast(fx.Float32)
+                col = cand_cols[safe]
+                above, equal = classify(
+                    value,
+                    first_threshold,
+                    second_threshold,
+                    third_threshold,
+                )
+                above_i32 = (active & above).select(one, zero)
+                equal_i32 = (active & equal).select(one, zero)
+                (
+                    above_prefix,
+                    equal_prefix,
+                    block_above,
+                    block_equal,
+                ) = block_exclusive_scan_pair(above_i32, equal_i32, scan, metadata)
+                my_above = metadata[_RUNNING_ABOVE] + above_prefix
+                my_equal = metadata[_RUNNING_EQUAL] + equal_prefix
+                accepted_equal = (my_equal < num_needed).select(my_equal, num_needed)
+                out_pos = my_above + accepted_equal
+                cls = above_i32 * two + equal_i32
+                if cls == two:
+                    row_indices[out_pos] = col
+                    if const_expr(write_values):
+                        row_values[out_pos] = value
+                elif cls == one:
+                    if my_equal < num_needed:
+                        row_indices[out_pos] = col
+                        if const_expr(write_values):
+                            row_values[out_pos] = value
+                if tid == 0:
+                    metadata[_RUNNING_ABOVE] = metadata[_RUNNING_ABOVE] + block_above
+                    metadata[_RUNNING_EQUAL] = metadata[_RUNNING_EQUAL] + block_equal
+                gpu.barrier()
+
+        if row_len <= top_k:
+            for output_step in range_constexpr(output_steps):
+                out_pos = output_step * _BLOCK_THREADS + tid
+                if out_pos < k:
+                    valid = out_pos < row_len
+                    row_indices[out_pos] = valid.select(out_pos, fx.Int32(-1))
+                    if const_expr(write_values):
+                        row_values[out_pos] = valid.select(
+                            input[row, out_pos],
+                            fx.Float32(float("-inf")),
+                        )
+
+        if row_len > top_k:
+            if tid < 8:
+                metadata[tid] = zero
+            gpu.barrier()
+
+            clear_histogram(histogram)
+            reread_row(histogram_pass1)
+            gpu.barrier()
+            choose_threshold(
+                top_k,
+                _FIRST_ABOVE,
+                _FIRST_THRESHOLD,
+                histogram,
+                scan,
+                metadata,
+            )
+            first_threshold = metadata[_FIRST_THRESHOLD]
+            first_above = metadata[_FIRST_ABOVE]
+            if const_expr(compact):
+                candidate_count = first_above + histogram[first_threshold]
+                use_compact = (
+                    (row_len > fx.Int32(_COMPACT_MIN_ROW))
+                    & (candidate_count > zero)
+                    & (candidate_count <= fx.Int32(_COMPACT_LIMIT))
+                )
+                if use_compact:
+                    finish_compact(
+                        first_threshold,
+                        first_above,
+                        candidate_count,
+                        cand_bits,
+                        cand_cols,
+                        histogram,
+                        scan,
+                        metadata,
+                        row_indices,
+                        row_values,
+                    )
+                else:
+                    finish_global(
+                        first_threshold,
+                        first_above,
+                        histogram,
+                        scan,
+                        metadata,
+                        row_indices,
+                        row_values,
+                    )
+            else:
+                finish_global(
+                    first_threshold,
+                    first_above,
+                    histogram,
+                    scan,
+                    metadata,
+                    row_indices,
+                    row_values,
+                )
 
     @flyc.jit
     def launch_topk_per_row_decode_one_workgroup(

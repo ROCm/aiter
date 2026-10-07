@@ -1008,7 +1008,10 @@ def qsa_k1_score_and_select(
     if row_bounded:
         _run_compiled(
             build_topk_per_row_decode_one_workgroup_module(
-                _K, wave_size=get_warp_size(arch), write_values=False
+                _K,
+                wave_size=get_warp_size(arch),
+                write_values=False,
+                compact=True,
             ),
             scores,
             row_lens,
@@ -1181,9 +1184,9 @@ def qsa_k1_block_ids(
     # does a graph capture: the readback is not allowed there, and the
     # graph would replay the width of the capture batch. Decode under
     # capture selects with the one-workgroup radix on the full width,
-    # which stops at each row's visible length: at 4 rows of 2048 live
-    # columns that is 11 us against 28 for the streaming selector, and it
-    # stays ahead up to about 32768 live columns (131k-token context).
+    # which stops at each row's visible length. A row longer than 20000
+    # columns finishes the later radix passes from the first-pass
+    # candidates when those fit in LDS.
     live_columns = n_columns
     padded_decode = n_columns > _ONE_WORKGROUP_MAX_ROW_WIDTH and m <= _DECODE_MAX_ROWS
     row_bounded = padded_decode and torch.cuda.is_current_stream_capturing()
