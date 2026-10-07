@@ -93,6 +93,10 @@ _GLUON_SEL: str = os.getenv("AITER_FDA_USE_GLUON", "1").lower()
 _GLUON_BOTH: bool = _GLUON_SEL in ("1", "true", "yes", "on", "all")
 AITER_FDA_USE_GLUON_K1: bool = _GLUON_BOTH or _GLUON_SEL == "k1"
 AITER_FDA_USE_GLUON_K2: bool = _GLUON_BOTH or _GLUON_SEL == "k2"
+# Whether a Gluon K2 still leaves small unsegmented shapes to the Triton pass C,
+# which is faster there (see _k2c_gluon_schedule). Tests clear it to pin pass C
+# to Gluon.
+_K2C_ROUTE_BY_SIZE: bool = True
 
 DEVICE_ARCH = arch_info.get_arch()
 _GLUON_ARCH_OK: bool = DEVICE_ARCH == "gfx950"
@@ -801,7 +805,7 @@ def _log_route(k1_gluon: bool, k2_gluon: bool, C: int, K: int, V: int) -> None:
 # allows. The zero floor keeps the pair self-consistent -- a device with no
 # published table takes the wide branch and finds this same schedule there.
 _K2_GLUON_FALLBACK = triton.Config({"BW": 32, "MIN_BLOCKS_PER_CU": 0}, num_warps=2)
-_K2C_GLUON_FALLBACK = triton.Config({"BW": 64}, num_warps=4)
+_K2C_GLUON_FALLBACK = triton.Config({"BW": 64, "MIN_BLOCKS_PER_CU": 0}, num_warps=4)
 
 
 @functools.cache
@@ -833,8 +837,8 @@ def _k2_gluon_schedule(W: int, num_segs: int, H: int) -> tuple[int, int, int]:
 
 
 @functools.cache
-def _k2c_gluon_schedule(segmented: bool) -> tuple[int, int]:
-    """``(BW, num_warps)`` for the Gluon pass C.
+def _k2c_gluon_schedule(segmented: bool) -> tuple[int, int, float]:
+    """``(BW, num_warps, MIN_BLOCKS_PER_CU)`` for the Gluon pass C.
 
     Wider tiles amortize a block's workspace reads over more of V, but the
     widest only pays once segmenting has supplied the blocks.
@@ -844,7 +848,23 @@ def _k2c_gluon_schedule(segmented: bool) -> tuple[int, int]:
         _K2C_GLUON_FALLBACK,
         backend="gluon",
     )
-    return cfg.kwargs["BW"], cfg.num_warps
+    return cfg.kwargs["BW"], cfg.num_warps, cfg.kwargs.get("MIN_BLOCKS_PER_CU", 0)
+
+
+def _k2c_gluon_usable(segmented: bool, W: int, num_segs: int, H: int) -> bool:
+    """Whether the Gluon pass C beats the Triton one on this grid.
+
+    With few (segment, head) pairs the serial walk over a segment's chunks is
+    what sets the time, and there the Triton kernel's lighter iteration at
+    BW=16 wins; the Gluon one cannot go narrower than BW=32. With more pairs
+    the Gluon kernel's prefetch and fewer workspace re-reads take over. The
+    published ``MIN_BLOCKS_PER_CU`` floor marks the crossover: unsegmented on
+    MI355X it lies between 32 and 40 pairs (1.08-1.18x for Triton below it,
+    up to 2.2x for Gluon above).
+    """
+    bw, _, floor = _k2c_gluon_schedule(segmented)
+    blocks = triton.cdiv(W, bw) * num_segs * H
+    return not _K2C_ROUTE_BY_SIZE or blocks >= floor * _num_cus()
 
 
 @functools.cache
@@ -1160,11 +1180,14 @@ def flash_kda_fwd(
     use_gluon_k1 = AITER_FDA_USE_GLUON_K1 and _gluon_k1_usable(C, K)
     use_gluon_k2 = AITER_FDA_USE_GLUON_K2 and _gluon_k2_usable(C, K, V)
     _log_route(use_gluon_k1, use_gluon_k2, C, K, V)
+    # Unsegmented, there is one segment per sequence, so pass C's route is
+    # known here; segmented, pass A runs on Gluon whichever route pass C takes.
+    use_gluon_k2c = use_gluon_k2 and (segmented or _k2c_gluon_usable(False, V, N, H))
     # sigmoid(beta) per tile, which only the Gluon K2 reads; the Triton K2
     # applies the sigmoid to the raw beta itself.
     ws_beta = (
         torch.empty(H * total_tiles, C, dtype=torch.float32, device=dev)
-        if use_gluon_k2
+        if use_gluon_k2c
         else None
     )
 
@@ -1375,8 +1398,10 @@ def flash_kda_fwd(
         h_in = None if paged else h0
 
     # Pass C: re-run each segment from its true incoming state, writing outputs.
-    if use_gluon_k2:
-        bw, nw = _k2c_gluon_schedule(max_segs > 1)
+    if use_gluon_k2c and segmented:
+        use_gluon_k2c = _k2c_gluon_usable(True, V, num_segs, H)
+    if use_gluon_k2c:
+        bw, nw, _ = _k2c_gluon_schedule(segmented)
         _g2.k2_c_fast[(triton.cdiv(V, bw), num_segs * H)](
             ws_kd=ws_kd,
             ws_qd=ws_qd,

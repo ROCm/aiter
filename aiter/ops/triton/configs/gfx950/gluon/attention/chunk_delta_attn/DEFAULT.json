@@ -12,7 +12,8 @@
     },
     "k2_c_gluon": {
         "BW": 64,
-        "num_warps": 4
+        "num_warps": 4,
+        "MIN_BLOCKS_PER_CU": 0.3
     },
     "k2_c_gluon_segmented": {
         "BW": 128,

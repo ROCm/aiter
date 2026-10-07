@@ -76,19 +76,26 @@ def _route(k1: bool | None = None, k2: bool | None = None):
     flags, so a test that wants the other route sets the flags rather than the
     variable. Both default to on wherever the tile shape and the arch allow it,
     which leaves the Triton kernels unreached by every test that does not come
-    through here.
+    through here. ``k2=True`` also pins pass C to Gluon on the small
+    unsegmented shapes the dispatch would otherwise leave to Triton.
     """
-    saved = _flash_kda.AITER_FDA_USE_GLUON_K1, _flash_kda.AITER_FDA_USE_GLUON_K2
+    saved = (
+        _flash_kda.AITER_FDA_USE_GLUON_K1,
+        _flash_kda.AITER_FDA_USE_GLUON_K2,
+        _flash_kda._K2C_ROUTE_BY_SIZE,
+    )
     if k1 is not None:
         _flash_kda.AITER_FDA_USE_GLUON_K1 = k1
     if k2 is not None:
         _flash_kda.AITER_FDA_USE_GLUON_K2 = k2
+        _flash_kda._K2C_ROUTE_BY_SIZE = not k2
     try:
         yield
     finally:
         (
             _flash_kda.AITER_FDA_USE_GLUON_K1,
             _flash_kda.AITER_FDA_USE_GLUON_K2,
+            _flash_kda._K2C_ROUTE_BY_SIZE,
         ) = saved
 
 
@@ -427,7 +434,7 @@ def test_published_k2_schedules_can_split_their_tile():
                 reached.add(_flash_kda._k2_gluon_schedule(W, num_segs, H)[:2])
     assert len(reached) > 1, f"only one schedule reachable: {reached}"
     # Pass C splits its tile the same way.
-    reached |= {_flash_kda._k2c_gluon_schedule(seg) for seg in (False, True)}
+    reached |= {_flash_kda._k2c_gluon_schedule(seg)[:2] for seg in (False, True)}
     for bw, nw in sorted(reached):
         assert bw % 16 == 0, f"BW={bw} is not a whole number of MFMA tiles"
         assert nw <= bw // 16, f"BW={bw} cannot be split {nw} ways"
@@ -582,6 +589,22 @@ def test_cases_reach_the_gluon_k2():
     missing_c = set(_CASES) - reached["k2_c_fast"]
     assert not missing_a, f"never reached the Gluon pass A: {sorted(missing_a)}"
     assert not missing_c, f"never reached the Gluon pass C: {sorted(missing_c)}"
+
+
+def test_small_unsegmented_pass_c_stays_on_triton():
+    """The published floor sends few-pair unsegmented shapes to the Triton pass C.
+
+    Below it the serial walk sets the time and the Triton kernel's narrower tile
+    wins; above it, and whenever segmenting has supplied the blocks, Gluon does.
+    """
+    if not _flash_kda._gluon_k2_usable(FLASH_KDA_CHUNK, K_DIM, K_DIM):
+        pytest.skip("this arch or tile shape never routes K2 to Gluon")
+    if _flash_kda._k2c_gluon_schedule(False)[2] == 0:
+        pytest.skip("this arch publishes no pass C floor")
+    usable = _flash_kda._k2c_gluon_usable
+    assert not usable(False, K_DIM, 1, 12)
+    assert usable(False, K_DIM, 8, 16)
+    assert usable(True, K_DIM, 16, 4)
 
 
 # A weak gate is the only setting that exposes the intra-chunk inverse. At the
