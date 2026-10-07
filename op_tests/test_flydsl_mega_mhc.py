@@ -9,9 +9,9 @@ Four tables:
   test_mega_mhc_config   one row per legal knob set (the tuning sweep), with ISA
                          resources when run under FLYDSL_DUMP_IR=1.
   test_mega_mhc_streams  two seams on two streams at once (per-stream scratch).
-  test_mega_mhc_dist     DIST_FINISH (D2) bit-exact against the classic finisher, also with
+  test_mega_mhc_dist     DIST_FINISH bit-exact against the classic finisher, also with
                          forced hand-off (DIST_SPIN=0) and on two streams at once.
-  test_mega_mhc_late     LATE_DESC (D3) and SHUFFLE_DPP (D3b) bit-exact against the same
+  test_mega_mhc_late     LATE_DESC and SHUFFLE_DPP bit-exact against the same
                          knob set without them, classic and distributed finisher, bf16 and FP8.
 """
 
@@ -317,10 +317,6 @@ def _wgs_per_cu(res, warps_per_wg):
     return min(by_regs, by_lds)
 
 
-def _auto_coherence(T, block_m, ksplit):
-    return "none" if ksplit == 1 else "xcd"
-
-
 @benchmark()
 def test_mega_mhc_config(
     T,
@@ -328,31 +324,20 @@ def test_mega_mhc_config(
     block_m,
     warp_split,
     warps_per_wg,
-    warps_per_simd,
     ksplit,
     tile_k,
-    nt_streams,
-    coherence,
     H=5120,
     mode="post",
 ):
     from aiter.ops.flydsl import flydsl_mega_mhc
     from aiter.ops.flydsl.kernels.mega_mhc import kernel_name
 
-    coh = _auto_coherence(T, block_m, ksplit)
-    if coherence != "auto" and ksplit > 1:
-        coh = coherence
     cfg = {
         "BLOCK_M": block_m,
         "WARP_SPLIT": warp_split,
         "WARPS_PER_WG": warps_per_wg,
-        "WARPS_PER_SIMD": warps_per_simd,
         "NUM_KSPLIT": ksplit,
         "TILE_K": tile_k,
-        "COHERENCE": coh,
-        "NT_STREAMS": bool(nt_streams),
-        "FN_PREPACKED": True,
-        "SINKHORN_RCP": True,
     }
     args, kw, ref = _call_kwargs(mode, T, H)
 
@@ -364,7 +349,6 @@ def test_mega_mhc_config(
     nblk = -(-T // block_m)
     ret = {
         "gfx": get_gfx(),
-        "coh": coh,
         "us": us,
         "TFLOPS": 2 * T * 4 * H * 24 / us / 1e6,
         "TB/s": nbytes / us / 1e6,
@@ -380,10 +364,8 @@ def test_mega_mhc_config(
 
 
 @benchmark()
-def test_mega_mhc_streams(T, H, ksplit, coherence):
-    """Two seams on two streams at once; each must match its own reference.
-    coherence="agent" spreads a token block's splits over all XCDs (cross-XCD
-    finish), "xcd" keeps them on one."""
+def test_mega_mhc_streams(T, H, ksplit):
+    """Two seams on two streams at once; each must match its own reference."""
     from aiter.ops.flydsl import flydsl_mega_mhc
 
     cfg = {
@@ -391,7 +373,6 @@ def test_mega_mhc_streams(T, H, ksplit, coherence):
         "WARPS_PER_WG": 4,
         "TILE_K": 32,
         "NUM_KSPLIT": ksplit,
-        "COHERENCE": "none" if ksplit == 1 else coherence,
     }
     cases = [_call_kwargs("post", T, H, seed=s) for s in (1, 2)]
     streams = [torch.cuda.Stream(), torch.cuda.Stream()]
@@ -410,7 +391,7 @@ def test_mega_mhc_streams(T, H, ksplit, coherence):
 
 
 @benchmark()
-def test_mega_mhc_dist(T, H, ksplit, coherence, mode):
+def test_mega_mhc_dist(T, H, ksplit, mode):
     """DIST_FINISH must give bit-identical outputs to the classic finisher, in a
     normal run, with every split forced to hand off (DIST_SPIN=0), and with two
     streams of DIST launches at once (per-stream scratch and publish words)."""
@@ -422,7 +403,6 @@ def test_mega_mhc_dist(T, H, ksplit, coherence, mode):
         "WARPS_PER_WG": 8,
         "NUM_KSPLIT": ksplit,
         "TILE_K": 64 if H % (ksplit * 8 * 64) == 0 else 32,
-        "COHERENCE": coherence,
     }
     cu = torch.cuda.get_device_properties(0).multi_processor_count
     if dist_residency_error(T, dict(base, DIST_FINISH=True), cu):
@@ -444,7 +424,7 @@ def test_mega_mhc_dist(T, H, ksplit, coherence, mode):
             f"dist {name} T={T}", outs[-1], ref, "bf16", mode
         )
         if bad:
-            _FAILURES.append(f"dist {name} T={T} ks={ksplit} {coherence}: {bad} bad")
+            _FAILURES.append(f"dist {name} T={T} ks={ksplit}: {bad} bad")
     cases = [_call_kwargs(mode, T, H, seed=sd) for sd in (1, 2)]
     streams = [torch.cuda.Stream(), torch.cuda.Stream()]
     cfg = dict(base, DIST_FINISH=True)
@@ -464,12 +444,12 @@ def test_mega_mhc_dist(T, H, ksplit, coherence, mode):
     )
     ret["two-stream != classic"] = sbad
     if sbad:
-        _FAILURES.append(f"dist two-stream T={T} ks={ksplit} {coherence}: {sbad} bad")
+        _FAILURES.append(f"dist two-stream T={T} ks={ksplit}: {sbad} bad")
     return ret
 
 
 @benchmark()
-def test_mega_mhc_late(T, H, ksplit, coherence, mode, out_dtype):
+def test_mega_mhc_late(T, H, ksplit, mode, out_dtype):
     """LATE_DESC (descriptors built after the first loads) only moves instructions and
     SHUFFLE_DPP swaps ``ds_swizzle`` lane exchanges for DPP ones (same values, same order):
     outputs must be bit-identical to the same knob set without them, with the classic
@@ -482,7 +462,6 @@ def test_mega_mhc_late(T, H, ksplit, coherence, mode, out_dtype):
         "WARPS_PER_WG": 8,
         "NUM_KSPLIT": ksplit,
         "TILE_K": 64 if H % (ksplit * 8 * 64) == 0 else 32,
-        "COHERENCE": coherence,
     }
     cu = torch.cuda.get_device_properties(0).multi_processor_count
     args, kw, ref = _call_kwargs(mode, T, H)
@@ -501,7 +480,7 @@ def test_mega_mhc_late(T, H, ksplit, coherence, mode, out_dtype):
         ]
         if out_dtype == "fp8":  # layer_input is a (q, scale) tuple
             plain[3] = tuple(x.clone() for x in plain[3])
-        cfg = dict(base, LATE_DESC=True, SHUFFLE_DPP=1, **extra)
+        cfg = dict(base, LATE_DESC=True, SHUFFLE_DPP=True, **extra)
         outs = [
             flydsl_mega_mhc(*args, out_dtype=out_dtype, config=cfg, **kw)
             for _ in range(10)
@@ -519,9 +498,7 @@ def test_mega_mhc_late(T, H, ksplit, coherence, mode, out_dtype):
             f"late {name} T={T}", outs[-1], ref, out_dtype, mode
         )
         if bad:
-            _FAILURES.append(
-                f"late {name} T={T} ks={ksplit} {coherence} {out_dtype}: {bad} bad"
-            )
+            _FAILURES.append(f"late {name} T={T} ks={ksplit} {out_dtype}: {bad} bad")
     return ret
 
 
@@ -648,21 +625,17 @@ def main():
     parser.add_argument("--block_m", type=int, nargs="*", default=[])
     parser.add_argument("--warp_split", nargs="*", default=["cols", "tokens"])
     parser.add_argument("--warps_per_wg", type=int, nargs="*", default=[2, 4])
-    parser.add_argument("--warps_per_simd", type=int, nargs="*", default=[1, 2])
     parser.add_argument("--ksplit", type=int, nargs="*", default=[1])
     parser.add_argument("--tile_k", type=int, nargs="*", default=[32, 64])
-    parser.add_argument("--nt_streams", type=int, nargs="*", default=[0])
-    parser.add_argument("--coherence", nargs="*", default=["auto"])
     parser.add_argument("--stream_ksplit", type=int, nargs="*", default=[1, 10])
-    parser.add_argument("--stream_coherence", nargs="*", default=["xcd", "agent"])
     parser.add_argument(
         "--dist",
         type=int,
-        nargs=3,
+        nargs=2,
         action="append",
-        metavar=("T", "KSPLIT", "AGENT"),
+        metavar=("T", "KSPLIT"),
         default=None,
-        help="DIST_FINISH bit-exact checks: T NUM_KSPLIT 0=xcd|1=agent (repeatable)",
+        help="DIST_FINISH bit-exact checks: T NUM_KSPLIT (repeatable)",
     )
     parser.add_argument(
         "--capture_tokens",
@@ -685,51 +658,37 @@ def main():
 
     if args.block_m:
         rows = []
-        for T, d, bm, ws, w, wps, ks, tk, nt, coh in itertools.product(
+        for T, d, bm, ws, w, ks, tk in itertools.product(
             [t for t in args.tokens if t > 0],
             args.out_dtype,
             args.block_m,
             args.warp_split,
             args.warps_per_wg,
-            args.warps_per_simd,
             args.ksplit,
             args.tile_k,
-            args.nt_streams,
-            args.coherence,
         ):
-            c = coh if coh != "auto" and ks > 1 else _auto_coherence(T, bm, ks)
             cfg = {
                 "BLOCK_M": bm,
                 "WARP_SPLIT": ws,
                 "WARPS_PER_WG": w,
-                "WARPS_PER_SIMD": wps,
                 "NUM_KSPLIT": ks,
                 "TILE_K": tk,
-                "COHERENCE": c,
             }
             if not _legal(args.hidden[0], cfg):
                 continue
-            if ks == 1 and coh != args.coherence[0]:
-                continue  # coherence only applies to split-K
-            rows.append(
-                test_mega_mhc_config(
-                    T, d, bm, ws, w, wps, ks, tk, nt, coh, H=args.hidden[0]
-                )
-            )
+            rows.append(test_mega_mhc_config(T, d, bm, ws, w, ks, tk, H=args.hidden[0]))
         aiter.logger.info(
             "mega-mhc config sweep (markdown):\n%s",
             pd.DataFrame(rows).to_markdown(index=False),
         )
 
     rows = [
-        test_mega_mhc_streams(T, H, ks, coh)
-        for T, H, ks, coh in itertools.product(
+        test_mega_mhc_streams(T, H, ks)
+        for T, H, ks in itertools.product(
             [t for t in args.tokens if 0 < t <= 4096][-2:],
             args.hidden,
             args.stream_ksplit,
-            args.stream_coherence,
         )
-        if not (ks == 1 and coh != args.stream_coherence[0])
     ]
     aiter.logger.info(
         "mega-mhc two-stream check (markdown):\n%s",
@@ -737,20 +696,18 @@ def main():
     )
 
     dist_cases = args.dist or [
-        [4, 20, 0],
-        [32, 20, 0],
-        [128, 20, 0],
-        [256, 10, 0],
-        [400, 5, 0],
-        [1024, 4, 0],
-        [1536, 2, 0],
-        [64, 10, 1],
+        [4, 20],
+        [32, 20],
+        [128, 20],
+        [256, 10],
+        [400, 5],
+        [1024, 4],
+        [1536, 2],
+        [64, 10],
     ]
     rows = [
-        test_mega_mhc_dist(T, H, ks, "agent" if agent else "xcd", mode)
-        for (T, ks, agent), H, mode in itertools.product(
-            dist_cases, args.hidden, args.mode
-        )
+        test_mega_mhc_dist(T, H, ks, mode)
+        for (T, ks), H, mode in itertools.product(dist_cases, args.hidden, args.mode)
         if "bf16" in args.out_dtype
     ]
     aiter.logger.info(
@@ -759,17 +716,17 @@ def main():
     )
 
     late_cases = [
-        [1, 20, 0],
-        [4, 20, 0],
-        [32, 20, 0],
-        [144, 10, 0],
-        [400, 5, 0],
-        [1024, 4, 0],
-        [64, 10, 1],
+        [1, 20],
+        [4, 20],
+        [32, 20],
+        [144, 10],
+        [400, 5],
+        [1024, 4],
+        [64, 10],
     ]
     rows = [
-        test_mega_mhc_late(T, H, ks, "agent" if agent else "xcd", mode, d)
-        for (T, ks, agent), H, mode, d in itertools.product(
+        test_mega_mhc_late(T, H, ks, mode, d)
+        for (T, ks), H, mode, d in itertools.product(
             late_cases, args.hidden, args.mode, args.out_dtype
         )
     ]

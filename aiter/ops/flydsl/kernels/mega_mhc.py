@@ -35,9 +35,9 @@ each split writes one fp32 partial row per token ``[0:24] mixes, [24] sum R'^2,
 [25] sum x1^2`` and bumps the token block's counter; the last split to arrive sums
 the rows, computes the gates (16 lanes per token, Sinkhorn by row/column shuffles),
 rescales the staged bf16 ``x1`` in place (or only the FP8 scales) and re-arms the
-counter. ``COHERENCE`` makes the other splits' writes visible to it:
-  "xcd"   all splits of a token block run on one XCD (shared L2); L1-bypass reads.
-  "agent" splits anywhere; agent-scope release/acquire, L1+L2-bypass reads.
+counter. All splits of a token block run on one XCD, so they share its L2: the
+finisher reads the other splits' writes with L1 bypass, ordered by workgroup-scope
+release/acquire fences around an agent-scope counter atomic.
 
 x1 stage (``X1_LDS_SLOTS`` = n > 0, bf16, ``NUM_KSPLIT == 1``, ``BLOCK_M == 16``,
 column-split warps). The finish needs the whole row's sum of squares before it can
@@ -53,13 +53,10 @@ k-steps keep the staged remainder on 128 B lines).
 fn load order (``FN_EARLY`` = e, default 4 = all). In the k-loop the first e streams of
 chunk 0's fn B operands are issued before the next k-step's R/y prefetch; the other
 streams (and chunk 1) are loaded just before their MFMAs. Fewer early streams cut the
-live VGPRs (fp8 bm16: 233 -> 197 at e = 1) and, for FP8 only, shorten the loop when one
-workgroup per CU fills the GPU (-5% at T = 3904..4096, -4% at 2544; e = 2 gives -2.3% for
-the bm32 / 10-way split kernel at T >= 16384). bf16 is 1-5% slower with any e < 4
-(``sweep/p5_register_pressure.md``).
+live VGPRs (fp8 bm16: 233 -> 197 at e = 1); only FP8 gains from it.
 
 Distributed finish (``DIST_FINISH``, bf16, ``NUM_KSPLIT > 1``, ``BLOCK_M == 16``, column
-warps; D2, ``sweep/d2_distributed_finish.md``). The split-K finisher normally rescales the
+warps). The split-K finisher normally rescales the
 whole staged bf16 x1 of its token block alone (``BLOCK_M * H`` elements read and written
 by one workgroup, after the last arrival). With the knob every split keeps its own x1
 columns in LDS instead of staging them in HBM; the last arrival only sums the partials,
@@ -80,14 +77,11 @@ generation's tag and rescales the staged columns of every bit it got back.
 
 Persistent walk (``PERSIST_WGS`` = G > 0, ``NUM_KSPLIT == 1``, column-split warps). The
 grid is capped at G workgroups and workgroup w walks the token blocks w, w + G, ...
-(static stride, no counters or scratch). With ``PERSIST_PREFETCH`` the last k-step
-of a block issues the loads of the next block's k-step 0 instead of the dead
-out-of-range loads, and the tile rides through the block's reduce and finish as a
-loop-carried value. Net effect measured in ``sweep/p4_persistent_overlap.md``: FP8
--2.3..-3.1% at two or three full rounds, bf16 (with the x1 LDS stage) 0.4-3.6% slower
-because the carried tile pushes the kernel to 253-256 VGPRs.
+(static stride, no counters or scratch). The last k-step of a block issues the loads
+of the next block's k-step 0 instead of the dead out-of-range loads, and the tile
+rides through the block's reduce and finish as a loop-carried value.
 
-Entry chain (D3, ``sweep/d3_hoist_loads.md``). The kernel's first loads are all independent,
+Entry chain. The kernel's first loads are all independent,
 so the only serial latency in front of them is scalar: the early-exit test needs ``n_tok`` and
 ``n_blk`` and every buffer descriptor needs its pointer. ``n_tok`` / ``n_blk`` sit right after
 ``fn`` in the argument list so they are inside the hardware-preloaded kernarg dwords (no
@@ -95,12 +89,12 @@ so the only serial latency in front of them is scalar: the early-exit test needs
 the pointers that are not preloaded and are used late (R' / x1 / output stores, gate outputs,
 finish scratch) after the first loads are issued, so no scalar wait sits in front of them.
 
-``SHUFFLE_DPP`` (D3b): 1 = the Sinkhorn gates exchange values between the lanes of a 16-lane
-row by DPP instead of ``shuffle_xor`` (``ds_swizzle_b32`` + ``s_waitcnt lgkmcnt(0)``, the
-long pole of the finisher wave); 2 = also the main-pass reductions (FP8 amax, row sums).
-The same values are combined in the same order, so outputs are bit-identical.
+``SHUFFLE_DPP``: the Sinkhorn gates exchange values between the lanes of a 16-lane row by
+DPP instead of ``shuffle_xor`` (``ds_swizzle_b32`` + ``s_waitcnt lgkmcnt(0)``, the long pole
+of the finisher wave). The same values are combined in the same order, so outputs are
+bit-identical.
 
-128 B-line stream layout (``SEG128``, ``TILE_K == 64``; G1, ``sweep/g1_seg128.md``). Lane ``l``
+128 B-line stream layout (``SEG128``, ``TILE_K == 64``). Lane ``l``
 owns token ``l // 8`` (unit 0) and ``8 + l // 8`` (unit 1) and 8 columns ``(l % 8) * 8`` of the
 64-column k-step, so 8 lanes cover a whole 128 B line and a dwordx4 is 8 rows x 128 B; the
 two units replace the two 32-column chunks (same load / store count). Post-mix, collapse and
@@ -113,8 +107,7 @@ both units of the lanes holding that chunk into the usual slots (``token * 4 + g
 other lanes write a shared dummy area (4 KiB), so the transpose takes 4 instead of 2
 ``ds_write_b128`` per stream and k-step and no VALU. The x1 stage keeps its 1 KiB slots, one
 per (k-step, unit), so ``X1_LDS_SLOTS`` must be even. ``NT_LD`` / ``NT_ST`` set the nt hint
-on the stream loads (R, y) / stores (R', FP8 q) separately; ``NT_STREAMS`` keeps its meaning
-(loads and R' stores).
+on the stream loads (R, y) / stores (R', FP8 q) separately.
 """
 
 import functools
@@ -145,12 +138,13 @@ PSLOT = 32  # partial row: [0:24] mixes, [24] sum R'^2, [25] sum x1^2
 FP8_GROUP = 32
 LOG2E = 1.4426950408889634
 
-# buffer cache policy bits (gfx950): sc0 = 1, nt = 2, sc1 = 16
+# buffer cache policy bits (gfx950): sc0 = 1, nt = 2
 CM_NT = 2
 CM_L1_BYPASS = 1  # sc0: miss the CU's L1, hit the XCD's L2
-CM_L2_BYPASS = 17  # sc0 sc1: system scope, past this XCD's L2
 
 WARP_SPLITS = ("cols", "tokens")
+# LDS (51.7 KB per 8-warp WG) and VGPRs already cap residency at 2 waves per SIMD
+WAVES_PER_EU = 2
 
 # DIST_FINISH scratch line (128 B per token block, 32 ints): slot 0 = classic counter,
 # slot 1 = publish word (arrivals | generation << 8), slot 2 = spin time-out count,
@@ -200,7 +194,6 @@ def _st(val, rsrc, voff, soff, cm):
     )
 
 
-COHERENCE_MODES = ("none", "xcd", "agent")
 N_FN_OPS = 3  # 1 KiB B operands per (chunk, stream), see compile_mega_mhc
 LDS_MAX = 163840  # gfx950: LDS bytes per workgroup
 # SEG128: the transpose's dummy area, one 512 B block per (stream, unit) write of a chunk
@@ -216,7 +209,7 @@ def smem_bytes(H: int, cfg: dict) -> int:
     units = bm * PSLOT // 4
     kgroups = max(1, min(WAVE * w // units, cfg["NUM_KSPLIT"]))
     red = max(k_warps * bm * PSLOT, kgroups * units * 4)
-    fn_lds = ws == "tokens" and w > 1 and cfg["FN_PREPACKED"]
+    fn_lds = ws == "tokens" and w > 1
     nops = (cfg["TILE_K"] // 32) * N_STREAMS * N_FN_OPS
     fnbuf = 2 * nops * WAVE * 4 if fn_lds else 4
     xpose = w * N_STREAMS * WAVE * 4 + (XDUMMY_INTS if cfg.get("SEG128") else 0)
@@ -245,19 +238,16 @@ def check_config(H: int, cfg: dict, out_fp8: bool = False) -> None:
     """Raise a ValueError naming the first violated legality rule of a knob set."""
     bm, ws, w = cfg["BLOCK_M"], cfg["WARP_SPLIT"], cfg["WARPS_PER_WG"]
     ks, tk = cfg["NUM_KSPLIT"], cfg["TILE_K"]
-    coh = cfg["COHERENCE"]
     if ws not in WARP_SPLITS:
         raise ValueError(f"WARP_SPLIT must be one of {WARP_SPLITS}, got {ws!r}")
-    if coh not in COHERENCE_MODES:
-        raise ValueError(f"COHERENCE must be one of {COHERENCE_MODES}, got {coh!r}")
+    if ks < 1:
+        raise ValueError(f"NUM_KSPLIT={ks} must be >= 1")
     if bm % 16:
         raise ValueError(f"BLOCK_M={bm} must be a multiple of the MFMA M (16)")
     if tk % 32:
         raise ValueError(f"TILE_K={tk} must be a multiple of the MFMA K (32)")
     if w not in (1, 2, 4, 8, 16):
         raise ValueError(f"WARPS_PER_WG={w} must be a power of two <= 16")
-    if cfg["WARPS_PER_SIMD"] not in (1, 2, 3, 4):
-        raise ValueError(f"WARPS_PER_SIMD={cfg['WARPS_PER_SIMD']} must be in 1..4")
     if ws == "cols":
         if H % (ks * w * tk):
             raise ValueError(
@@ -282,10 +272,6 @@ def check_config(H: int, cfg: dict, out_fp8: bool = False) -> None:
         )
     if (bm * PSLOT) % (WAVE * w):
         raise ValueError(f"BLOCK_M*32={bm * PSLOT} must be a multiple of the WG size")
-    if ks == 1 and coh != "none":
-        raise ValueError("NUM_KSPLIT=1 needs no coherence mode (use 'none')")
-    if ks > 1 and coh == "none":
-        raise ValueError("NUM_KSPLIT>1 needs COHERENCE 'xcd' or 'agent'")
     if cfg.get("PERSIST_WGS", 0):
         if cfg["PERSIST_WGS"] < 0:
             raise ValueError("PERSIST_WGS must be >= 0")
@@ -295,8 +281,6 @@ def check_config(H: int, cfg: dict, out_fp8: bool = False) -> None:
         raise ValueError(f"FN_EARLY must be in 0..{N_STREAMS}")
     if cfg.get("FN_EARLY", N_STREAMS) != N_STREAMS and ws == "tokens" and w > 1:
         raise ValueError("FN_EARLY does not apply to the LDS-shared fn path")
-    if cfg.get("SHUFFLE_DPP", 0) not in (0, 1, 2):
-        raise ValueError("SHUFFLE_DPP must be 0 (off), 1 (finish gates) or 2 (all)")
     if cfg.get("LATE_DESC") and cfg.get("PERSIST_WGS", 0):
         raise ValueError("LATE_DESC does not combine with PERSIST_WGS")
     if cfg.get("SEG128"):
@@ -354,10 +338,9 @@ def dist_residency_error(T: int, cfg: dict, cu_num: int) -> str | None:
     not yet scheduled must never be held back by waiting ones: every split of the grid
     has to be resident at once. Conservatively assume one workgroup per CU (the kernel
     is 8 warps, 2 per SIMD; LDS or VGPRs may allow more, which is not relied on) and
-    8 XCDs of ``cu_num / 8`` CUs, workgroups dealt round-robin to XCDs. ``xcd``
-    coherence pins the splits of a token block to one XCD, so the busiest XCD holds
-    ``ceil(blocks / 8)`` whole blocks; ``agent`` deals the ``blocks * NUM_KSPLIT``
-    workgroups evenly. Does not see CU masks or other kernels (see the doc).
+    8 XCDs of ``cu_num / 8`` CUs, workgroups dealt round-robin to XCDs. The splits
+    of a token block share one XCD, so the busiest XCD holds ``ceil(blocks / 8)``
+    whole blocks. Does not see CU masks or other kernels.
     """
     if not cfg.get("DIST_FINISH"):
         return None
@@ -365,11 +348,11 @@ def dist_residency_error(T: int, cfg: dict, cu_num: int) -> str | None:
         return f"cu_num={cu_num} is not a multiple of the 8 XCDs"
     nblk = -(-T // cfg["BLOCK_M"])
     ks = cfg["NUM_KSPLIT"]
-    per_xcd = (-(-nblk // 8) * ks) if cfg["COHERENCE"] == "xcd" else -(-nblk * ks // 8)
+    per_xcd = -(-nblk // 8) * ks
     if per_xcd > cu_num // 8:
         return (
             f"{per_xcd} workgroups on the busiest XCD exceed its {cu_num // 8} CUs "
-            f"(T={T}, NUM_KSPLIT={ks}, COHERENCE={cfg['COHERENCE']})"
+            f"(T={T}, NUM_KSPLIT={ks})"
         )
     return None
 
@@ -380,9 +363,7 @@ def kernel_name(cfg: dict, has_post: bool, identity_pre: bool, out_fp8: bool) ->
         mode += "_idpre"
     return (
         f"mega_mhc_bm{cfg['BLOCK_M']}_{cfg['WARP_SPLIT']}_w{cfg['WARPS_PER_WG']}"
-        f"_s{cfg['WARPS_PER_SIMD']}_k{cfg['NUM_KSPLIT']}_t{cfg['TILE_K']}"
-        f"_{cfg['COHERENCE']}_nt{int(cfg['NT_STREAMS'])}"
-        f"_pk{int(cfg['FN_PREPACKED'])}_rcp{int(cfg['SINKHORN_RCP'])}"
+        f"_k{cfg['NUM_KSPLIT']}_t{cfg['TILE_K']}"
         f"_{mode}_{'fp8' if out_fp8 else 'bf16'}"
         + (f"_x1l{cfg['X1_LDS_SLOTS']}" if cfg.get("X1_LDS_SLOTS") else "")
         + (
@@ -401,15 +382,11 @@ def kernel_name(cfg: dict, has_post: bool, identity_pre: bool, out_fp8: bool) ->
             else ""
         )
         + ("_late" if cfg.get("LATE_DESC") else "")
-        + (f"_dpp{cfg['SHUFFLE_DPP']}" if cfg.get("SHUFFLE_DPP") else "")
+        + ("_dpp" if cfg.get("SHUFFLE_DPP") else "")
         + ("_s128" if cfg.get("SEG128") else "")
         + ("_ntl" if cfg.get("NT_LD") else "")
         + ("_nts" if cfg.get("NT_ST") else "")
-        + (
-            f"_pw{cfg['PERSIST_WGS']}{'p' if cfg.get('PERSIST_PREFETCH', True) else ''}"
-            if cfg.get("PERSIST_WGS")
-            else ""
-        )
+        + (f"_pw{cfg['PERSIST_WGS']}" if cfg.get("PERSIST_WGS") else "")
     )
 
 
@@ -419,9 +396,9 @@ def grid_size(T: int, cfg: dict) -> tuple[int, int]:
     ks = cfg["NUM_KSPLIT"]
     if cfg.get("PERSIST_WGS"):
         return nblk, min(nblk, cfg["PERSIST_WGS"])
-    if cfg["COHERENCE"] == "xcd":
+    if ks > 1:  # whole groups of 8 token blocks, see the XCD mapping in the kernel
         return nblk, -(-nblk // 8) * 8 * ks
-    return nblk, nblk * ks
+    return nblk, nblk
 
 
 @functools.cache
@@ -431,26 +408,20 @@ def compile_mega_mhc(
     BLOCK_M: int,
     WARP_SPLIT: str,
     WARPS_PER_WG: int,
-    WARPS_PER_SIMD: int,
     NUM_KSPLIT: int,
     TILE_K: int,
-    COHERENCE: str,
-    NT_STREAMS: bool,
-    FN_PREPACKED: bool,
     HAS_POST: bool,
     IDENTITY_PRE: bool,
     OUT_FP8: bool,
-    SINKHORN_RCP: bool,
     SINKHORN_ITERS: int,
     FP8_MAX: float = 448.0,
     X1_LDS_SLOTS: int = 0,
     PERSIST_WGS: int = 0,
-    PERSIST_PREFETCH: bool = True,
     FN_EARLY: int = N_STREAMS,
     DIST_FINISH: bool = False,
     DIST_SPIN: int = DIST_SPIN,
     LATE_DESC: bool = False,
-    SHUFFLE_DPP: int = 0,
+    SHUFFLE_DPP: bool = False,
     SEG128: bool = False,
     NT_LD: bool = False,
     NT_ST: bool = False,
@@ -460,16 +431,10 @@ def compile_mega_mhc(
         "BLOCK_M": BLOCK_M,
         "WARP_SPLIT": WARP_SPLIT,
         "WARPS_PER_WG": WARPS_PER_WG,
-        "WARPS_PER_SIMD": WARPS_PER_SIMD,
         "NUM_KSPLIT": NUM_KSPLIT,
         "TILE_K": TILE_K,
-        "COHERENCE": COHERENCE,
-        "NT_STREAMS": NT_STREAMS,
-        "FN_PREPACKED": FN_PREPACKED,
-        "SINKHORN_RCP": SINKHORN_RCP,
         "X1_LDS_SLOTS": X1_LDS_SLOTS,
         "PERSIST_WGS": PERSIST_WGS,
-        "PERSIST_PREFETCH": PERSIST_PREFETCH,
         "FN_EARLY": FN_EARLY,
         "DIST_FINISH": DIST_FINISH,
         "DIST_SPIN": DIST_SPIN,
@@ -501,11 +466,10 @@ def compile_mega_mhc(
     # instead of being staged in HBM and re-read (the FP8 finish never re-reads).
     DIST = bool(DIST_FINISH)
     X1L = NQ if DIST else (0 if OUT_FP8 else X1_LDS_SLOTS)
-    # P4 persistent walk: the grid is capped at PERSIST_WGS workgroups, each walking
-    # the token blocks w, w + G, ...; PF: the next block's first R/y tile is loaded
-    # during this block's last k-step and carried through its reduce and finish.
+    # Persistent walk: the grid is capped at PERSIST_WGS workgroups, each walking the
+    # token blocks w, w + G, ...; the next block's first R/y tile is loaded during this
+    # block's last k-step and carried through its reduce and finish.
     PERSIST = PERSIST_WGS > 0
-    PF = PERSIST and PERSIST_PREFETCH
     X1_INTS = (WARPS_PER_WG * X1L + 1) * 256 if X1L else 4
     K4 = N_STREAMS * H
     H8 = H // 8
@@ -518,12 +482,10 @@ def compile_mega_mhc(
     assert UNITS % THREADS == 0 or THREADS % UNITS == 0
     FIN_PASSES = max(1, BM // (4 * W))
     FIN_WARPS = min(W, BM // 4)  # warps that hold tokens in the finish
-    cm_ld = CM_NT if (NT_STREAMS or NT_LD) else 0  # R, y loads
-    cm_st = CM_NT if (NT_STREAMS or NT_ST) else 0  # R' stores
-    cm_q = CM_NT if NT_ST else 0  # FP8 q stores (never re-read; staged bf16 x1 is)
+    cm_ld = CM_NT if NT_LD else 0  # R, y loads
+    cm_st = CM_NT if NT_ST else 0  # R' and FP8 q stores (staged bf16 x1 is re-read)
     # SEG128 (TILE_K == 64): the NC = 2 "chunks" of a k-step are its two 8-row units
     NGT = 2 if SEG128 else 1  # tokens per lane and m-tile (gates, row sums)
-    cm_fin = CM_L2_BYPASS if COHERENCE == "agent" else CM_L1_BYPASS
     # Prepacked fn: [H/32 chunk][stream][op][lane][8] bf16, one 1 KiB B operand per
     # (chunk, stream, op): op 0/1 = rows 0..15 hi/lo, op 2 = rows 16..23 hi in
     # columns 0..7 and lo in columns 8..15 of the second N tile, folded by one
@@ -531,10 +493,9 @@ def compile_mega_mhc(
     NOPS = NC * N_STREAMS * N_FN_OPS  # 1 KiB B operands per k-step
     # Token-split warps share their columns, so a k-step's fn tile is loaded once
     # per WG into a double-buffered LDS slot instead of once per warp.
-    FN_LDS = WARP_SPLIT == "tokens" and WARPS_PER_WG > 1 and FN_PREPACKED
+    FN_LDS = WARP_SPLIT == "tokens" and WARPS_PER_WG > 1
     FN_PER_WARP = -(-NOPS // WARPS_PER_WG)
     fn_units = (H // 32) * N_STREAMS * N_FN_OPS * WAVE
-    fn32_units = N_MIX * K4 // 4  # fp32 fn, 16 B units
     name = kernel_name(cfg, HAS_POST, IDENTITY_PRE, OUT_FP8)
 
     @fx.struct
@@ -585,14 +546,8 @@ def compile_mega_mhc(
         return F32(1.0) / (F32(1.0) + exp(F32(0.0) - x))
 
     def xor_gates(x, off):
-        """lane xor inside a 16-lane row: the Sinkhorn gates (SHUFFLE_DPP >= 1)"""
-        if SHUFFLE_DPP >= 1:
-            return dpp_xor_f32(x, off)
-        return x.shuffle_xor(off, WAVE)
-
-    def xor_main(x, off):
-        """lane xor in the main pass (fp8 amax, partial sums; SHUFFLE_DPP == 2)"""
-        if SHUFFLE_DPP >= 2:
+        """lane xor inside a 16-lane row: the Sinkhorn gates"""
+        if SHUFFLE_DPP:
             return dpp_xor_f32(x, off)
         return x.shuffle_xor(off, WAVE)
 
@@ -602,9 +557,7 @@ def compile_mega_mhc(
         return F32(update_dpp_i32(xi, xi, DPP_ROW_SHR4, 0xF, 0xF, True).bitcast(T.f32))
 
     def div(x, y):
-        if fx.const_expr(SINKHORN_RCP):
-            return x * rcp(y)
-        return x / y
+        return x * rcp(y)
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def mega_mhc_kernel(
@@ -613,7 +566,7 @@ def compile_mega_mhc(
         post_mix: fx.Pointer,  # (T, 4) fp32                [HAS_POST]
         comb_mix: fx.Pointer,  # (T, 4, 4) fp32 [h][j]      [HAS_POST]
         pre_mix: fx.Pointer,  # (T, 4) fp32                [not IDENTITY_PRE]
-        fn: fx.Pointer,  # (2, 24, 4H) bf16 hi/lo, or (24, 4H) fp32
+        fn: fx.Pointer,  # pre-packed bf16 hi/lo B operands, see _prepack_fn
         n_tok: fx.Int32,  # n_tok, n_blk sit inside the 14 preloaded kernarg dwords
         n_blk: fx.Int32,
         hc_scale: fx.Pointer,  # (3,) fp32
@@ -645,13 +598,14 @@ def compile_mega_mhc(
             erow = lane // 4  # elementwise layout: token row
             ekg = lane % 4  # elementwise layout: 8-column group (4 lanes = 64 B)
         w_id = I32(fx.block_idx.x)
-        if fx.const_expr(COHERENCE == "xcd"):
+        if fx.const_expr(KS > 1):
+            # all splits of a token block share w_id % 8, i.e. one XCD and its L2
             j = w_id // 8
             blk = (j // KS) * 8 + w_id % 8
             ks = j % KS
         else:
-            blk = w_id // KS
-            ks = w_id % KS
+            blk = w_id
+            ks = I32(0)
         tok0 = blk * BM
 
         nt64 = fx.Int64(n_tok)
@@ -766,7 +720,7 @@ def compile_mega_mhc(
             rs_y = rs_rows(sublayer, H * 2)
             if fx.const_expr(not LATE_DESC):
                 make_rs_x1()
-            rs_fn = rs_flat(fn, fn_units * 16 if FN_PREPACKED else fn32_units * 16)
+            rs_fn = rs_flat(fn, fn_units * 16)
             if fx.const_expr(not LATE_DESC):
                 make_rs_w()
 
@@ -786,12 +740,7 @@ def compile_mega_mhc(
             tokv = erow  # (the descriptors are based at this block's first token)
             v_r = tokv * (K4 * 2) + ekg * 16  # residual / residual_out
             v_y = tokv * (H * 2) + ekg * 16  # sublayer / staged x1
-            if fx.const_expr(FN_PREPACKED):
-                v_fn0 = lane * 16
-                v_fn1 = lane * 16
-            else:
-                v_fn0 = row * (K4 * 4) + kg * 32
-                v_fn1 = (16 + row % 8) * (K4 * 4) + kg * 32
+            v_fn = lane * 16
             v_q = tokv * H + ekg * 8
             if fx.const_expr(SEG128):
                 # two 32-column group scales per row: lanes l % 8 == 0 and 4 store them
@@ -871,7 +820,7 @@ def compile_mega_mhc(
                 """wave-uniform first column of chunk c of k-step iv"""
                 return col_w + iv * TILE_K + c * 32
 
-            if fx.const_expr(PF):
+            if fx.const_expr(PERSIST):
                 # the block this WG walks next: its tokens start G * BM rows later
                 step_rows = I32(fx.grid_dim.x) * BM
                 has_next = (tok0 + step_rows) < n_tok
@@ -886,7 +835,7 @@ def compile_mega_mhc(
                 """
                 vr = dead.select(v_r_nx, v_r)
                 vy = dead.select(v_y_nx, v_y)
-                if fx.const_expr(PF):
+                if fx.const_expr(PERSIST):
                     iv = dead.select(I32(0), iv)
                 vals = []
                 for mt in range_constexpr(MT):
@@ -915,41 +864,12 @@ def compile_mega_mhc(
 
             def load_fn(iv, c, s, dead):
                 """the N_FN_OPS bf16x8 B operands of stream s, chunk c (raw i32x4)"""
-                if fx.const_expr(FN_PREPACKED):
-                    v = dead.select(OOB, v_fn0)
-                    so = ((chunk_col(iv, c) // 32) * N_STREAMS + s) * (
-                        N_FN_OPS * WAVE * 16
-                    )
-                    return [
-                        _ld(rs_fn, v, so + op * WAVE * 16, 4, 0)
-                        for op in range_constexpr(N_FN_OPS)
-                    ]
-                ops = []
-                for nt in range_constexpr(2):
-                    v = dead.select(OOB, v_fn0 if nt == 0 else v_fn1)
-                    so = (chunk_col(iv, c) + s * H) * 4
-                    f0 = Vec(_ld(rs_fn, v, so, 4, 0)).bitcast(F32)
-                    f1 = Vec(_ld(rs_fn, v, so + 16, 4, 0)).bitcast(F32)
-                    f = Vec.from_elements(
-                        [f0[i] for i in range_constexpr(4)]
-                        + [f1[i] for i in range_constexpr(4)],
-                        F32,
-                    )
-                    hi = as_i32x4(f.to(BF16))
-                    lo = as_i32x4((f - f.to(BF16).to(F32)).to(BF16))
-                    if fx.const_expr(nt == 0):
-                        ops += [hi, lo]
-                    else:
-                        ops.append((row < 8).select(hi, lo))
-                return ops
-
-            def load_fn_all(iv, dead, n_chunks=NC):
-                """B operands of the first n_chunks chunks of k-step iv, flat [c][s][op]"""
-                flat = []
-                for c in range_constexpr(n_chunks):
-                    for s in range_constexpr(N_STREAMS):
-                        flat += load_fn(iv, c, s, dead)
-                return flat
+                v = dead.select(OOB, v_fn)
+                so = ((chunk_col(iv, c) // 32) * N_STREAMS + s) * (N_FN_OPS * WAVE * 16)
+                return [
+                    _ld(rs_fn, v, so + op * WAVE * 16, 4, 0)
+                    for op in range_constexpr(N_FN_OPS)
+                ]
 
             def stage_x1(iv, c, mt, unit, cb):
                 """Chunk q = iv * NC + c of x1: LDS slot q of this warp if q < X1L
@@ -1060,8 +980,8 @@ def compile_mega_mhc(
                             amax = F32(0.0)
                             for e in range_constexpr(8):
                                 amax = fx.maximumf(amax, fx.absf(v[e]))
-                            amax = fx.maximumf(amax, xor_main(amax, 1))
-                            amax = fx.maximumf(amax, xor_main(amax, 2))
+                            amax = fx.maximumf(amax, amax.shuffle_xor(1, WAVE))
+                            amax = fx.maximumf(amax, amax.shuffle_xor(2, WAVE))
                             zero = amax == F32(0.0)
                             scale = zero.select(F32(1.0), amax * F32(1.0 / FP8_MAX))
                             inv = zero.select(F32(0.0), F32(FP8_MAX) * rcp(amax))
@@ -1111,7 +1031,7 @@ def compile_mega_mhc(
                             cb = cb0 + c * 32
                         if fx.const_expr(OUT_FP8):
                             qv, scale = st_x[mt][c]
-                            _st(qv, RS.q, v_q, cb + mt * 16 * H, cm_q)
+                            _st(qv, RS.q, v_q, cb + mt * 16 * H, cm_st)
                             if fx.const_expr(SEG128):
                                 so_sc = (cb0 // FP8_GROUP) * 4 + (
                                     mt * 16 + c * 8
@@ -1162,7 +1082,7 @@ def compile_mega_mhc(
             acc0 = [Vec.filled(4, 0.0, F32) for _ in range_constexpr(2 * MT)]
             sq0 = [F32(0.0) for _ in range_constexpr(MT * NGT)]
             never_oob = I32(0) != I32(0)  # a "dead" flag that is always false
-            if fx.const_expr(PF and not pro):
+            if fx.const_expr(PERSIST and not pro):
                 tiles0 = [Vec(t) for t in pre_tiles]
             else:
                 tiles0 = load_tile(I32(0), never_oob)
@@ -1205,7 +1125,7 @@ def compile_mega_mhc(
                     regs = []
                     for j in range_constexpr(FN_PER_WARP):
                         o = wi_u + j * W
-                        v = (dead | (o >= I32(NOPS))).select(OOB, v_fn0)
+                        v = (dead | (o >= I32(NOPS))).select(OOB, v_fn)
                         regs.append(
                             _ld(rs_fn, v, (chunk0 * NOPS // NC + o) * (WAVE * 16), 4, 0)
                         )
@@ -1296,8 +1216,8 @@ def compile_mega_mhc(
                             s_r = sqr[mt * 2 + u]
                             s_x = sqx[mt * 2 + u]
                             for off in (1, 2):
-                                s_r = s_r + xor_main(s_r, off)
-                                s_x = s_x + xor_main(s_x, off)
+                                s_r = s_r + s_r.shuffle_xor(off, WAVE)
+                                s_x = s_x + s_x.shuffle_xor(off, WAVE)
                             s_rx.append((s_r, s_x))
                         s_r = (ekg < 6).select(s_rx[0][0], s_rx[1][0])
                         s_x = (ekg < 6).select(s_rx[0][1], s_rx[1][1])
@@ -1305,8 +1225,8 @@ def compile_mega_mhc(
                         s_r = sqr[mt]
                         s_x = sqx[mt]
                         for off in (1, 2):
-                            s_r = s_r + xor_main(s_r, off)
-                            s_x = s_x + xor_main(s_x, off)
+                            s_r = s_r + s_r.shuffle_xor(off, WAVE)
+                            s_x = s_x + s_x.shuffle_xor(off, WAVE)
                     tl_base = tok_w - tok0 + mt * 16
                     for nt in range_constexpr(2):
                         n = nt * 16 + row
@@ -1315,7 +1235,9 @@ def compile_mega_mhc(
                             v = acc[mt * 2 + nt][i]
                             if fx.const_expr(nt == 1):
                                 # rows 16..23: hi part in columns 0..7 + lo part in 8..15
-                                v = (row < 8).select(v + xor_main(v, 8), F32(0.0))
+                                v = (row < 8).select(
+                                    v + v.shuffle_xor(8, WAVE), F32(0.0)
+                                )
                                 if fx.const_expr(SEG128):
                                     src = ((kg % 2) * 4 + i) * 8 + 4 + (kg // 2) * 2
                                 else:
@@ -1483,7 +1405,9 @@ def compile_mega_mhc(
                     return tl_g, c8, r_live.select((tok0 + tl_g) * H8 + c8, n_tok * H8)
 
                 def hbm_ld(idx):
-                    return buf_copy_load(LT.out_t, idx, I32, 4, cache_modifier=cm_fin)
+                    return buf_copy_load(
+                        LT.out_t, idx, I32, 4, cache_modifier=CM_L1_BYPASS
+                    )
 
                 def hbm_st(tl_g, c8, idx, xv):
                     r_wv = bf16x8(buf_copy_load(LT.w_t, c8, I32, 4)).to(F32)
@@ -1542,7 +1466,7 @@ def compile_mega_mhc(
                                         r_idx[g],
                                         F32,
                                         1,
-                                        cache_modifier=cm_fin,
+                                        cache_modifier=CM_L1_BYPASS,
                                     )
                                 )
                             for g in range_constexpr(RS_G):
@@ -1569,14 +1493,9 @@ def compile_mega_mhc(
                     )
 
                 def fence(ordering):
-                    # the splits share this XCD's L2 (L1 is write-through) unless agent
+                    # the splits share this XCD's L2 (L1 is write-through)
                     fx.llvm.memory_fence(
-                        syncscope=(
-                            rocdl.SyncScope.Agent
-                            if COHERENCE == "agent"
-                            else rocdl.SyncScope.Workgroup
-                        ),
-                        ordering=ordering,
+                        syncscope=rocdl.SyncScope.Workgroup, ordering=ordering
                     )
 
                 def word_ptr(slot):
@@ -1628,7 +1547,11 @@ def compile_mega_mhc(
                                 uidx = ((tok0 + tl) * KS + kk) * (PSLOT // 4) + q4
                                 uidx = live.select(uidx, n_tok * (KS * PSLOT // 4))
                                 acc4 = acc4 + buf_copy_load(
-                                    LT.part4_t, uidx, F32, 4, cache_modifier=cm_fin
+                                    LT.part4_t,
+                                    uidx,
+                                    F32,
+                                    4,
+                                    cache_modifier=CM_L1_BYPASS,
                                 )
                             for i in range_constexpr(4):
                                 _put(red, (g_id * UNITS + u) * 4 + i, acc4[i])
@@ -1651,7 +1574,7 @@ def compile_mega_mhc(
                     gpu.barrier()
                     finish()
                 elif fx.const_expr(DIST):
-                    # D2: the last arrival computes the gates and the x1 rstd, publishes
+                    # the last arrival computes the gates and the x1 rstd, publishes
                     # the rstd row, and rescales its own columns; every other split waits
                     # for the publish and rescales its own columns from LDS.
                     write_partials()
@@ -1802,7 +1725,7 @@ def compile_mega_mhc(
                                         blk * 32 + DIST_RSTD + erow + u * 8,
                                         F32,
                                         1,
-                                        cache_modifier=cm_fin,
+                                        cache_modifier=CM_L1_BYPASS,
                                     )
                                     for u in range_constexpr(2)
                                 ]
@@ -1812,7 +1735,7 @@ def compile_mega_mhc(
                                     blk * 32 + DIST_RSTD + erow,
                                     F32,
                                     1,
-                                    cache_modifier=cm_fin,
+                                    cache_modifier=CM_L1_BYPASS,
                                 )
                             store_x1_lds(xs, wv, r_e)
                 else:
@@ -1840,7 +1763,7 @@ def compile_mega_mhc(
                 tiles_c = [Vec(st_p[i]) for i in range_constexpr(n_t)]
                 t_nx = body(I32(b) * BM, tiles_c, False, views)
                 _ = yield [Vec(t).ir_value() for t in t_nx]
-        elif fx.const_expr(COHERENCE == "xcd"):
+        elif fx.const_expr(KS > 1):
             # the XCD mapping pads the grid to whole groups of 8 token blocks
             if tok0 < n_tok:
                 body(tok0, None)
@@ -1901,11 +1824,11 @@ def compile_mega_mhc(
             hc_sinkhorn_eps,
             hc_post_mult,
             norm_eps,
-            value_attrs={"rocdl.waves_per_eu": int(WARPS_PER_SIMD)},
+            value_attrs={"rocdl.waves_per_eu": WAVES_PER_EU},
         ).launch(grid=(n_wg, 1, 1), block=(THREADS, 1, 1), stream=stream)
 
     launch_mega_mhc.compile_hints = {
-        "waves_per_eu": int(WARPS_PER_SIMD),
+        "waves_per_eu": WAVES_PER_EU,
         "llvm_options": {
             "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
             "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,

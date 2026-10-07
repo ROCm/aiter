@@ -27,24 +27,18 @@ MEGA_MHC_DEFAULTS = {
     "BLOCK_M": 16,
     "WARP_SPLIT": "cols",
     "WARPS_PER_WG": 8,
-    "WARPS_PER_SIMD": 2,
     "NUM_KSPLIT": 1,
     "TILE_K": 64,
-    "COHERENCE": "none",
-    "NT_STREAMS": False,  # opt-in only: no policy range wins in eager and graph
-    "FN_PREPACKED": True,
-    "SINKHORN_RCP": True,
-    "X1_LDS_SLOTS": 0,
-    "PERSIST_WGS": 0,  # P4: >0 caps the grid; each WG walks token blocks w, w + G, ...
-    "PERSIST_PREFETCH": True,  # next block's first R/y tile loads during this block's last k-step
-    "FN_EARLY": 4,  # P5: streams (of 4) of chunk 0's fn loaded ahead of the R/y prefetch
-    "DIST_FINISH": False,  # D2: every split rescales its own x1 columns (bf16, KS > 1)
-    "DIST_SPIN": 1024,  # D2: polls a waiting split spins before it hands its columns off
-    "LATE_DESC": False,  # D3: build late-use descriptors after the first loads are issued
-    "SHUFFLE_DPP": 0,  # D3b: lane xor exchange by DPP: 1 = Sinkhorn gates, 2 = also main pass
-    "SEG128": False,  # G1: 128 B-line stream layout (8 lanes per row line, TILE_K = 64)
-    "NT_LD": False,  # G1: nt hint on the R / y stream loads only
-    "NT_ST": False,  # G1: nt hint on the R' / FP8 q stream stores only
+    "X1_LDS_SLOTS": 0,  # bf16 x1 chunks per warp kept in LDS for the finish
+    "PERSIST_WGS": 0,  # > 0 caps the grid; each WG walks token blocks w, w + G, ...
+    "FN_EARLY": 4,  # streams (of 4) of chunk 0's fn loaded ahead of the R/y prefetch
+    "DIST_FINISH": False,  # every split rescales its own x1 columns (bf16, KS > 1)
+    "DIST_SPIN": 1024,  # polls a waiting split spins before it hands its columns off
+    "LATE_DESC": False,  # build late-use descriptors after the first loads are issued
+    "SHUFFLE_DPP": False,  # Sinkhorn gate lane exchange by DPP instead of ds_swizzle
+    "SEG128": False,  # 128 B-line stream layout (8 lanes per row line, TILE_K = 64)
+    "NT_LD": False,  # nt hint on the R / y stream loads
+    "NT_ST": False,  # nt hint on the R' / FP8 q stream stores
 }
 
 _TOKENS_CFG = {
@@ -53,12 +47,11 @@ _TOKENS_CFG = {
     "WARPS_PER_WG": 4,
     "NUM_KSPLIT": 1,
     "TILE_K": 64,
-    "COHERENCE": "none",
 }
 
 _MAX_SPLIT = 20  # 40/80 splits measured no faster at decode (more partial rows)
 
-# P4 wave quantization (sweep/p4_persistent_overlap.md): a one-WG-per-CU kernel runs
+# Wave quantization: a one-WG-per-CU kernel runs
 # ceil(blocks / CUs) rounds, and a nearly empty last round costs ~65% of a full one
 # (T = 4160: 180 us vs 111 us at T = 4096). A split-K kernel (items = blocks * KS) has
 # a 25% fixed overhead at exact fill but smooth cost, so it wins while the last
@@ -66,21 +59,19 @@ _MAX_SPLIT = 20  # 40/80 splits measured no faster at decode (more partial rows)
 _QUANT_SPLIT_BF16 = (5, 0.73)
 _QUANT_SPLIT_FP8 = (10, 0.95)
 
-# D2 distributed bf16 finish (sweep/d2_distributed_finish.md): at T = 1..3 the publish
-# round trip costs more than the one-to-three-token rescale it replaces (+0.2-0.3 us), from
-# T = 4 it wins (-6%, growing to -30% at T = 16..128).
+# Distributed bf16 finish: at T = 1..3 the publish round trip costs more than the
+# one-to-three-token rescale it replaces (+0.2-0.3 us); from T = 4 it wins.
 _DIST_MIN_T = 4
 
-# D3 LATE_DESC (sweep/d3_hoist_loads.md): it pays only from nine token blocks up (T > 128) and
-# up to ~24 blocks (T <= 384); below and above it measures <= 1%.
+# LATE_DESC pays only from nine token blocks up (T > 128) to ~24 blocks (T <= 384).
 _LATE_DESC_T = (128, 384)
 
-# G1 SEG128 + nt (sweep/g1_seg128.md). nt on the stream loads pays only once the bytes the seam
+# SEG128 + nt: nt on the stream loads pays only once the bytes the seam
 # moves (R, y read + R', out written) no longer fit the 256 MB MALL; below that the eager
 # (MALL-hot) kernel is up to 44% slower with it. Measured boundaries at H = 5120: bf16 loses at
 # T = 2496 (256 MB) and wins from 2560 (262 MB); fp8 loses at 2752 (270 MB), wins at 3072 (301 MB).
 _NT_LD_MIN_BYTES = {False: 262e6, True: 300e6}  # keyed on out_fp8
-_G1_BF16_DECODE_MIN_T = 256  # bf16 10-way decode split: T = 160 / 208 gain < 1%
+_SEG128_BF16_DECODE_MIN_T = 256  # bf16 10-way decode split: T = 160 / 208 gain < 1%
 
 
 def _seam_bytes(T: int, H: int, out_fp8: bool) -> float:
@@ -89,17 +80,17 @@ def _seam_bytes(T: int, H: int, out_fp8: bool) -> float:
 
 
 def _with_seg128(T: int, H: int, cfg: dict, out_fp8: bool, decode_split: bool) -> dict:
-    """``cfg`` with the G1 128 B-line stream layout and nt hints where both the eager and
-    the CUDA-graph time measured > 1% faster (see ``get_mega_mhc_config``)."""
+    """``cfg`` with the 128 B-line stream layout and nt hints where they pay (see
+    ``get_mega_mhc_config``)."""
     if cfg["TILE_K"] != 64:
         return cfg
     ks = cfg["NUM_KSPLIT"]
     nt_ld = _seam_bytes(T, H, out_fp8) >= _NT_LD_MIN_BYTES[out_fp8]
     if decode_split:
-        if ks == 5 or (ks == 10 and not out_fp8 and T < _G1_BF16_DECODE_MIN_T):
+        if ks == 5 or (ks == 10 and not out_fp8 and T < _SEG128_BF16_DECODE_MIN_T):
             return cfg
         return dict(cfg, SEG128=True, NT_ST=True)
-    if ks == 5 and not nt_ld:  # bf16 P4 split at T = 2464..2559: no variant wins
+    if ks == 5 and not nt_ld:  # bf16 wave-quantization split at T = 2464..2559
         return cfg
     return dict(cfg, SEG128=True, NT_ST=True, NT_LD=nt_ld)
 
@@ -107,109 +98,39 @@ def _with_seg128(T: int, H: int, cfg: dict, out_fp8: bool, decode_split: bool) -
 def get_mega_mhc_config(
     T: int, H: int, arch: str, cu_num: int, out_fp8: bool = False
 ) -> dict:
-    """HIP-style launch policy keyed on (arch, cu_num) and T (gfx950 sweep, MI355X).
+    """Launch policy keyed on (arch, cu_num) and T; thresholds tuned on MI355X at H = 5120.
 
-    * Up to ``64 * cu_num`` tokens: 16-token blocks, 8 warps splitting the columns.
-      Column splits fill the GPU: the largest legal ``NUM_KSPLIT <= 20`` with
-      ``blocks * NUM_KSPLIT <= cu_num`` (decode: 20; T=384: 10; T=1024: 4; T >= 4096: 1).
-      Splits finish on one XCD (``COHERENCE="xcd"``), measured faster than the
-      agent-scope path at every size. ``TILE_K=64`` (whole 128 B lines per k-step)
-      wherever H divides, else 32.
-    * Wave quantization (P4, ``sweep/p4_persistent_overlap.md``): with ``NUM_KSPLIT == 1``
-      the grid is ``ceil(blocks / cu_num)`` rounds of one workgroup per CU and a nearly
-      empty last round still costs ~65% of a full one (T = 4160: 179 us vs 111 us at
-      4096). While the last round is less than 73% full (bf16) or 95% full (FP8) the
-      split-K kernel is smoother and wins: bf16 ``NUM_KSPLIT = 5`` (T = 2496..2944,
-      4160..5888, 8256..8704: -1.5% to -23%), FP8 ``NUM_KSPLIT = 10`` (T = 2560..3840,
-      4160..15360 off the exact multiples: -2% to -32%). FP8 grids that are (nearly)
-      exactly full and have two or more rounds (T = 8192, 12288) instead use the
-      persistent walk ``PERSIST_WGS = cu_num``: ``cu_num`` workgroups walk the blocks
-      and load the next block's first tile during the last k-step (-2.3% to -3.1%).
-      bf16 never walks: its 253-256 VGPR persistent kernel is 0.4-3.6% slower.
-    * fn load order (P5, ``sweep/p5_register_pressure.md``): FP8 with ``NUM_KSPLIT == 1``
-      loads only stream 0 of each k-step's first fn chunk ahead of the R/y prefetch
-      (``FN_EARLY = 1``; 233 -> 197 VGPR): -4% at T = 2544, -5% at T = 3904..4096 (one
-      full round of workgroups), neutral below T = 2304. The FP8 token-block kernel
-      (32 tokens, 10-way split, T >= 64 * cu_num) uses ``FN_EARLY = 2`` (-2.3%). bf16
-      keeps all four streams early (any other value is 1-5% slower).
-    * bf16 with ``NUM_KSPLIT == 1`` and more than ~0.6 * cu_num token blocks keeps
-      each warp's first ``X1_LDS_SLOTS`` 32-column chunks of x1 in LDS for the
-      finish instead of staging them in HBM and re-reading them (P3,
-      ``sweep/p3_x1_in_registers.md``): 6-8% faster at T = 2560..12288. Below that
-      size the kernel is latency-bound and the knob is neutral. FP8 never re-reads.
-    * bf16 split-K (``NUM_KSPLIT > 1``, decode up to T ~ 2048) from T = 4 uses the distributed
-      finish ``DIST_FINISH`` (D2, ``sweep/d2_distributed_finish.md``): the last arrival only
-      sums the partials and publishes the x1 ``rstd``; every split rescales its own columns
-      (kept in LDS) instead of one workgroup re-reading and rescaling the whole block's x1.
-      T = 16..128: 15.2 -> 11.2 us eager, 13.9 -> 9.7 us in a graph; T = 256..2048: -13%..-27%.
-      The splits spin on each other, so it needs every split of the grid resident at once
-      (``dist_residency_error``: the busiest XCD must hold ``ceil(blocks / 8) * NUM_KSPLIT``
-      workgroups on its ``cu_num / 8`` CUs, one workgroup per CU assumed): when the
-      fill-the-GPU ``NUM_KSPLIT`` violates that (T = 129..192 with 20 splits, T = 385..400
-      with 10, T ~ 780..830 with 5), the largest smaller legal split count that fits is used
-      (it still beats the classic finisher at the original count: T = 144/192: 21.8 -> 13.9
-      us, T = 400: 26.3 -> 20.3 us). Not used with a CU mask in the environment
-      (``HSA_CU_MASK`` / ``ROC_GLOBAL_CU_MASK``), where residency is unknown; a split that
-      still waits ``DIST_SPIN`` polls without a publish hands its columns to the finisher
-      (``kernels/mega_mhc.py``), so a violated assumption costs time, not correctness.
-    * Beyond ``64 * cu_num`` tokens, fn's L2 traffic (2 MB per token block) dominates:
-      for bf16, 64-token blocks with 4 token-split warps sharing each fn tile through
-      LDS, but only while the last round of ``64 * cu_num``-token workgroup waves is
-      at least 95% full: that kernel steps +46% at T = 16400 (a second round for one
-      workgroup), while the 16-token column-split kernel with the x1 LDS stage scales
-      smoothly and is 22-30% faster for T = 16400..28672 and 9-15% for 36864..40960
-      (1-2% slower at exact multiples). The FP8 output
-      instead keeps column-split warps with 10 column splits (32-token blocks, 8
-      warps; 16-token/4-warp when H does not allow it): its finisher only rescales
-      the group scales, so the split-K tail is cheap there, while the bf16 finisher
-      re-reads and rewrites the whole staged collapse. The 32-token/8-warp point
-      measured 2-4% faster than 16-token/4-warp at T = 16384..32768 (P1 sweep,
-      ``sweep/p1_triton_geometry.md``).
-
-    * Policy configs set ``SHUFFLE_DPP = 1`` (D3b, ``sweep/d3_hoist_loads.md``): the Sinkhorn
-      gates exchange values between the lanes of a 16-lane row with DPP (``v_mov_b32_dpp``)
-      instead of ``shuffle_xor`` (``ds_swizzle_b32`` + ``s_waitcnt lgkmcnt(0)``, ~40% of the
-      finisher wave). It permutes the same values in the same order, so every output is
-      bit-identical. Decode, bf16 and FP8: -13..-17% at T = 1..192, -10% at T = 256..384, -7%
-      at T = 400 (eager and CUDA-graph replay); T = 2048 and the P4 split-K shapes: -2..-4%;
-      FP8 KS = 1 -1%; bf16 token kernel (T >= 16384) -1%. Off for the bf16 column kernel with
-      ``NUM_KSPLIT == 1`` (the unsplit sizes above T = 2048): it is +0.8..1.2% slower there.
-    * Decode split-K with 129 <= T <= 384 (bf16; FP8 only with 20 splits) sets ``LATE_DESC``
-      (D3, ``sweep/d3_hoist_loads.md``): the descriptors of the late-use pointers (R' / x1 /
-      output stores, finish scratch) are built after the first loads are in flight, so no
-      scalar-load round trip sits in front of the first ``buffer_load``. bf16 T = 144..384:
-      -2..-4%; FP8 T = 144..192: -9% (eager and graph). Neutral (<= 1%) at T <= 128 and at
-      T >= 400 and 3-5% slower for FP8 at 10 splits (T = 208..256), so it is off there.
-
-    * G1 (``sweep/g1_seg128.md``): every ``TILE_K == 64`` kernel uses the 128 B-line stream
-      layout ``SEG128`` with the nt hint on the R' / FP8 q stores (``NT_ST``), and from a seam
-      footprint (R, y read + R', out written) of 262 MB (bf16, T >= 2560 at H = 5120) / 300 MB
-      (FP8, T >= 3064) also on the R / y loads (``NT_LD``), except where no variant wins:
-      the 5-way decode split (T = 385..816), the bf16 10-way decode split below T = 256 and
-      the bf16 P4 5-way split below the ``NT_LD`` footprint (T = 2464..2559). Rule: a
-      (dtype, regime) is switched on only if every measured T improves by > 1% in both the
-      eager kernel time (``run_perftest``, inputs MALL-hot) and the CUDA-graph per-launch
-      time (two rotating input sets from T = 2048, HBM-honest; one set below), paired and
-      interleaved, 3 processes x 5 repeats. SEG128 alone measures -9..+5% (mostly within
-      +-3%); the gain is the nt hint, which the 128 B lines make pay (nt loads on the 64 B
-      layout are slower almost everywhere, by up to 55%).
-      Measured (eager / graph): bf16 T = 4096 -7.1% / -6.0%, 8192 -6.4% / -8.1%, 16384
-      (token kernel) -2.6% / -11.2%, 16400 -9.0% / -11.1%; FP8 4096 -8.6% / -9.3%, 8192
-      (persistent walk) -8.6% / -10.0%, 16384 -7.4% / -6.0%; decode T = 384 -7% / -8%,
-      T = 2048 -3% / -27..-29% (NT_ST only; the graph gain is partly the second input set
-      staying MALL-resident). ``SEG128`` / ``NT_LD`` / ``NT_ST`` are bit-identical knobs.
-
-    ``NT_STREAMS`` stays off at every size (D1, ``sweep/d1_nt_streams_decode.md``):
-    paired off/on timing finds no (dtype, T) range where it wins by >= 2% in both
-    the eager kernel time and the CUDA-graph per-launch time. Decode (T <= 192) is
-    neutral to slower in eager; only the ks=10 window (T = 208..384) is faster in
-    graph replay (-4..-8%) but not in eager; it is 8-40% slower from T = 416 on.
+    * Up to ``64 * cu_num`` tokens: 16-token blocks, 8 warps splitting the columns, and
+      the largest legal ``NUM_KSPLIT <= 20`` with ``blocks * NUM_KSPLIT <= cu_num``
+      (decode: 20; T = 384: 10; T = 1024: 4; T >= 4096: 1). ``TILE_K = 64`` wherever H
+      divides, else 32.
+    * Wave quantization: with ``NUM_KSPLIT == 1`` and a last round of workgroups less
+      than 73% (bf16) / 95% (FP8) full, a 5-way (bf16) / 10-way (FP8) split-K kernel
+      is used instead. A (nearly) exactly full FP8 grid with two or more rounds walks
+      its blocks with ``PERSIST_WGS = cu_num``.
+    * FP8 with ``NUM_KSPLIT == 1`` loads one fn stream early (``FN_EARLY = 1``); the
+      FP8 32-token split kernel uses ``FN_EARLY = 2``; bf16 keeps all four.
+    * bf16 with ``NUM_KSPLIT == 1`` and more than ~0.6 * cu_num token blocks keeps the
+      largest fitting ``X1_LDS_SLOTS`` of x1 in LDS for the finish.
+    * bf16 split-K from T = 4 uses ``DIST_FINISH`` at the largest split count whose
+      workgroups are all resident (``dist_residency_error``); never with a CU mask in
+      the environment. A split that waits ``DIST_SPIN`` polls hands its columns to the
+      finisher, so a violated residency assumption costs time, not correctness.
+    * Beyond ``64 * cu_num`` tokens: bf16 uses 64-token blocks with 4 token-split warps
+      sharing each fn tile through LDS, while the last 64-token wave is >= 95% full
+      (else the column kernel above); FP8 uses 32-token blocks, 8 column warps and a
+      10-way split (16 tokens / 4 warps when H does not divide).
+    * ``SHUFFLE_DPP`` everywhere except the bf16 ``NUM_KSPLIT == 1`` column kernel.
+    * ``LATE_DESC`` for the decode split at 129 <= T <= 384 (FP8 only with 20 splits).
+    * ``TILE_K == 64`` kernels use ``SEG128`` + ``NT_ST``, and ``NT_LD`` once the seam's
+      HBM footprint exceeds the 256 MB MALL; not for the 5-way decode split, the bf16
+      10-way split below T = 256, or the bf16 5-way split below the ``NT_LD`` footprint.
     """
     from aiter.ops.flydsl.kernels.mega_mhc import check_config, max_x1_lds_slots
 
     if arch not in _GFX:
         raise RuntimeError(f"[flydsl_mega_mhc] unsupported arch {arch}")
-    cfg = dict(MEGA_MHC_DEFAULTS, SHUFFLE_DPP=1)
+    cfg = dict(MEGA_MHC_DEFAULTS, SHUFFLE_DPP=True)
     tok_round = 64 * cu_num
     tok_fill = T / (-(-T // tok_round) * tok_round)  # fill of the last WG wave
     if T >= tok_round and (out_fp8 or tok_fill >= 0.95):
@@ -219,7 +140,6 @@ def get_mega_mhc_config(
                 WARPS_PER_WG=8,
                 NUM_KSPLIT=10,
                 TILE_K=64,
-                COHERENCE="xcd",
                 FN_EARLY=2,
             )
             try:
@@ -242,7 +162,7 @@ def get_mega_mhc_config(
     rounds = -(-nblk // cu_num)
     fill = nblk / (rounds * cu_num)  # how full the last round of WGs is at KS = 1
     persist = False
-    decode_split = ks > 1  # the fill-the-GPU split (not the P4 wave-quantization one)
+    decode_split = ks > 1  # the fill-the-GPU split, not the wave-quantization one
     if ks == 1:
         want, fill_max = _QUANT_SPLIT_FP8 if out_fp8 else _QUANT_SPLIT_BF16
         # below ~0.6 * CUs blocks one round is latency-bound: a split does not pay
@@ -256,27 +176,23 @@ def get_mega_mhc_config(
         # next block's first tile loads before this one finishes (2.3-3.1% at 8192)
         persist = out_fp8 and rounds > 1 and fill >= fill_max
     tk = 64 if H % (ks * w * 64) == 0 else 32
-    cfg.update(
-        BLOCK_M=16, NUM_KSPLIT=ks, TILE_K=tk, COHERENCE="xcd" if ks > 1 else "none"
-    )
+    cfg.update(BLOCK_M=16, NUM_KSPLIT=ks, TILE_K=tk)
     if ks == 1 and not out_fp8 and 5 * nblk > 3 * cu_num:
         cfg["X1_LDS_SLOTS"] = max_x1_lds_slots(H, cfg)
     if persist:
-        cfg.update(PERSIST_WGS=cu_num, PERSIST_PREFETCH=True)
+        cfg["PERSIST_WGS"] = cu_num
     elif ks == 1 and out_fp8:
-        cfg["FN_EARLY"] = 1  # P5: -4..-5% at T = 2544, 3904..4096
+        cfg["FN_EARLY"] = 1
     if not out_fp8 and ks > 1 and T >= _DIST_MIN_T:
         cfg = _with_dist_finish(T, H, cfg, cu_num)
     if not out_fp8 and ks == 1:
-        cfg["SHUFFLE_DPP"] = (
-            0  # D3b: bf16 column kernel with the x1 stage: +0.8..1.2% with DPP
-        )
+        cfg["SHUFFLE_DPP"] = False  # 0.8-1.2% slower with DPP
     if (
         decode_split
         and _LATE_DESC_T[0] < T <= _LATE_DESC_T[1]
         and (not out_fp8 or ks == _MAX_SPLIT)
     ):
-        cfg["LATE_DESC"] = True  # D3: scalar-load round trip off the critical path
+        cfg["LATE_DESC"] = True
     cfg = _with_seg128(T, H, cfg, out_fp8, decode_split)
     try:
         check_config(H, cfg)
@@ -284,7 +200,7 @@ def get_mega_mhc_config(
         if T < tok_round or out_fp8:
             raise
         cfg = dict(
-            MEGA_MHC_DEFAULTS, SHUFFLE_DPP=1, **_TOKENS_CFG
+            MEGA_MHC_DEFAULTS, SHUFFLE_DPP=True, **_TOKENS_CFG
         )  # H too narrow for 8 col warps
         cfg = _with_seg128(T, H, cfg, out_fp8, False)
         check_config(H, cfg)
@@ -548,15 +464,18 @@ def flydsl_mega_mhc(
         return residual_out, post_out, comb_out, layer_input, next_pre
 
     if config is None:
-        cfg = get_mega_mhc_config(T, H, arch, _cu_num(device), out_dtype == "fp8")
+        cfg = get_mega_mhc_config(T, H, arch, _cu_num(device), out_fp8)
     else:
+        unknown = sorted(set(config) - set(MEGA_MHC_DEFAULTS))
+        if unknown:
+            raise ValueError(f"[flydsl_mega_mhc] unknown config keys: {unknown}")
         cfg = dict(MEGA_MHC_DEFAULTS)
         cfg.update(config)
-        check_config(H, cfg, out_dtype == "fp8")
+        check_config(H, cfg, out_fp8)
         _check_dist_guard(T, cfg, _cu_num(device))
 
     capturing = torch.cuda.is_current_stream_capturing()
-    fn_arg = _prepack_fn(fn, capturing) if cfg["FN_PREPACKED"] else fn
+    fn_arg = _prepack_fn(fn, capturing)
     nblk, n_wg = grid_size(T, cfg)
     ks = cfg["NUM_KSPLIT"]
     stream = torch.cuda.current_stream(device)
