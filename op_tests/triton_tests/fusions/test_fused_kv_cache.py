@@ -260,6 +260,47 @@ def test_fused_qk_rope_cat_and_cache_mla(
     torch.testing.assert_close(torch_k_pe_og_dtype, triton_k_pe, atol=1e-1, rtol=1e-1)
 
 
+def test_fused_qk_rope_cat_and_cache_mla_sanitizes_invalid_q_positions():
+    """CUDA-graph padding may pair slot=-1 with an arbitrary position."""
+    tokens, heads, d_nope, d_pe = 4, 12, 512, 64
+    q_nope = torch.randn(tokens, heads, d_nope, device="cuda", dtype=torch.bfloat16)
+    q_pe = torch.randn(tokens, heads, d_pe, device="cuda", dtype=torch.bfloat16)
+    k_nope = torch.randn(tokens, 1, d_nope, device="cuda", dtype=torch.bfloat16)
+    k_pe = torch.randn(tokens, 1, d_pe, device="cuda", dtype=torch.bfloat16)
+    kv_cache = torch.zeros(tokens, 1, d_nope + d_pe, device="cuda", dtype=e4m3_dtype)
+    slots = torch.tensor([0, 1, -1, -1], device="cuda", dtype=torch.int64)
+    positions = torch.full((tokens,), 2**40, device="cuda", dtype=torch.int64)
+    cos = torch.ones(1, d_pe // 2, device="cuda", dtype=torch.bfloat16)
+    sin = torch.zeros_like(cos)
+    scale = torch.ones(1, device="cuda", dtype=torch.float32)
+    q_scale = torch.full((1,), 1.0 / 16.0, device="cuda", dtype=torch.float32)
+
+    q_out, _, _, _ = fused_qk_rope_cat_and_cache_mla(
+        q_nope,
+        q_pe,
+        k_nope,
+        k_pe,
+        kv_cache,
+        slots,
+        positions,
+        cos,
+        sin,
+        scale,
+        True,
+        q_scale=q_scale,
+        q_out_dtype=e4m3_dtype,
+        compute_all_q_rope=False,
+        identity_rope=True,
+    )
+    torch.cuda.synchronize()
+
+    expected_q = (torch.cat((q_nope, q_pe), dim=-1) / q_scale).to(e4m3_dtype)
+    expected_k = torch.cat((k_nope[:2], k_pe[:2]), dim=-1).to(e4m3_dtype)
+    torch.testing.assert_close(q_out, expected_q)
+    torch.testing.assert_close(kv_cache[:2], expected_k)
+    assert torch.count_nonzero(kv_cache[2:]).item() == 0
+
+
 @pytest.mark.parametrize("T", [1, 8, 2048])
 @pytest.mark.parametrize("QH_per_KH", [16])
 @pytest.mark.parametrize("KH", [8])
