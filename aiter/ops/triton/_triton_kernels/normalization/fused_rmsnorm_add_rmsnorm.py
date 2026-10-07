@@ -22,13 +22,13 @@ def _fused_rmsnorm_add_rmsnorm_kernel(
     pre_weight_ptr,
     residual_out_ptr,
     pre_norm_ptr,
-    width,
-    inv_width,
+    width: tl.constexpr,
     post_eps,
     pre_eps,
     BLOCK_SIZE_N: tl.constexpr,
 ):
     row = tl.program_id(0)
+    inv_width = 1.0 / width
     col = tl.arange(0, BLOCK_SIZE_N)
     valid = col < width
     offset = row * width + col

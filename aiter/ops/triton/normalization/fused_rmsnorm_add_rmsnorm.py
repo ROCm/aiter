@@ -56,7 +56,6 @@ def fused_rmsnorm_add_rmsnorm(
             residual_out,
             pre_norm,
             N,
-            1.0 / N,
             post_eps,
             pre_eps,
             BLOCK_SIZE_N=block,
