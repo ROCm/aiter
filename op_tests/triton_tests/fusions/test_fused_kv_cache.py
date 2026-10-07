@@ -351,10 +351,12 @@ def test_fused_qk_cat_and_cache_mla(
     triton_kv_cache = torch.zeros_like(torch_kv_cache)
 
     num_decode_toks_for_zeros = {"none": 0, "partial": B // 2, "all": B}[output_zeros]
-    # decode_q_pe_out is a view of the first num_decode_toks_for_zeros rows of a
-    # sentinel-filled B-row buffer, so a write to a row past it lands in the tail.
+    # Sentinel-filled outputs catch stray writes: decode_q_pe_out is a view of
+    # the first num_decode_toks_for_zeros rows of a B-row buffer, so a write to
+    # a row past it lands in the tail; k_pe_out rows of padded slots must stay.
     sentinel = -123.0
     decode_q_pe_buf = torch.full((B, QH, D_pe), sentinel, dtype=dtype, device="cuda")
+    k_pe_out = torch.full((T, KH, D_pe), sentinel, dtype=dtype, device="cuda")
     triton_q, triton_decode_q_pe, triton_k_pe, triton_zeros = (
         fused_qk_cat_and_cache_mla(
             q_nope,
@@ -367,6 +369,7 @@ def test_fused_qk_cat_and_cache_mla(
             num_decode_toks_for_zeros=num_decode_toks_for_zeros,
             apply_scale=(k_pe.dtype != triton_kv_cache.dtype),
             decode_q_pe_out=decode_q_pe_buf[:num_decode_toks_for_zeros],
+            k_pe_out=k_pe_out,
             # sglang hands q to the decode kernel in the cache dtype.
             q_out_dtype=cache_dtype,
             shuffled_kv_cache=shuffled_kv_cache,
@@ -396,6 +399,7 @@ def test_fused_qk_cat_and_cache_mla(
         **q_tol,
     )
     torch.testing.assert_close(k_pe[valid], triton_k_pe[valid], atol=0, rtol=0)
+    assert bool((triton_k_pe[~valid] == sentinel).all()), "padded k_pe_out written"
     n = num_decode_toks_for_zeros
     torch.testing.assert_close(q_pe[:n], triton_decode_q_pe, atol=0, rtol=0)
     assert bool((decode_q_pe_buf[n:] == sentinel).all()), "decode_q_pe_out overrun"
