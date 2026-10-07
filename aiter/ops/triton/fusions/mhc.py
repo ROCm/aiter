@@ -526,7 +526,22 @@ _GLUON_BLOCK_M = 32
 _GLUON_KS = 32  # k-step width; also the shuffled-residual block (mhc_res_ks)
 _GLUON_N_PAD = 32
 _GLUON_RA_CHUNK = 256  # reduce/apply column granule (8 bf16 x 32 lanes)
-_GLUON_RA_NORM_WARPS = 8  # reduce/apply warps per row with fused RMSNorm
+_GLUON_RA_NORM_WARPS = 8  # reduce/apply warps per CTA with fused RMSNorm
+
+
+def _gluon_ra_norm_rows(M: int, C: int) -> int:
+    """Rows per CTA of the fused-RMSNorm reduce/apply: 2 (as the HIP kernel:
+    longer shuffled-residual runs, half the per-row overhead) only when it does
+    not add rows to the busiest CU; on a tie, only for <= 2 rows per CU or
+    C >= 7168 (measured on gfx1250: M=512 wins, M=768 and small M lose)."""
+    from aiter.jit.utils.chip_info import get_cu_num
+
+    cu = get_cu_num()
+    per_cu_1 = triton.cdiv(M, cu)
+    per_cu_2 = 2 * triton.cdiv(triton.cdiv(M, 2), cu)
+    if per_cu_2 < per_cu_1 or (per_cu_2 == per_cu_1 and (per_cu_1 <= 2 or C >= 7168)):
+        return 2
+    return 1
 
 
 def _mhc_post_pre_gluon_supported(
@@ -595,12 +610,12 @@ def _gluon_post_pre_layouts(n: int, num_stages: int, w_preshuffled: bool):
 
 
 @functools.lru_cache(maxsize=16)
-def _gluon_reduce_apply_layouts(n: int, rows: int, num_warps: int):
+def _gluon_reduce_apply_layouts(n: int, rows: int, num_warps: int, split_k: int):
     from aiter.ops.triton._gluon_kernels.gfx1250.fusions.mhc_post_pre import (
         create_reduce_apply_layouts,
     )
 
-    return create_reduce_apply_layouts(n, rows, num_warps)
+    return create_reduce_apply_layouts(n, rows, num_warps, split_k)
 
 
 def _mhc_post_pre_gemm_sqrsum_gluon(
@@ -709,9 +724,10 @@ def _mhc_pre_reduce_apply_gluon(
     assert layer_input.is_contiguous() and residual.is_contiguous()
     fuse_norm = norm_weight is not None
     if fuse_norm:
-        # The RMSNorm needs the whole row: one row per CTA over all of C, with
-        # 8 warps; the last TDM chunk runs past C and is zero-filled.
-        rows, num_warps, k_blocks = 1, _GLUON_RA_NORM_WARPS, 1
+        # The RMSNorm needs whole rows: 1 or 2 rows per CTA over all of C, with
+        # 8 apply warps (+ a post/Sinkhorn worker warp); the last TDM chunk
+        # runs past C and is zero-filled.
+        rows, num_warps, k_blocks = _gluon_ra_norm_rows(M, C), _GLUON_RA_NORM_WARPS, 1
     else:
         # 4 rows per CTA; split C across CTAs until the grid fills the GPU.
         rows, num_warps = 4, 4
@@ -727,7 +743,7 @@ def _mhc_pre_reduce_apply_gluon(
             or [1]
         )
     chunk, apply_l, red4, red16, sk, smem_mix, smem_res = _gluon_reduce_apply_layouts(
-        n, rows, num_warps
+        n, rows, num_warps, split_k
     )
     c_cta = C // k_blocks
     grid = (triton.cdiv(M, rows), k_blocks)
