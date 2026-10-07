@@ -314,7 +314,7 @@ def _sparse_attn_prefill_kernel(
     BLOCK_D: tl.constexpr,
     BLOCK_K: tl.constexpr,
     USE_EXP2: tl.constexpr = False,
-    # head_dim == BLOCK_D and num_heads % BLOCK_H == 0: no q/kv/out masks.
+    # head_dim == BLOCK_D and num_heads % BLOCK_H == 0: no head/dim masks.
     EVEN_HD: tl.constexpr = False,
 ):
     # 64-bit before the multiply, same reasoning as `slot_off` below: the
@@ -377,7 +377,7 @@ def _sparse_attn_prefill_kernel(
         # Performance here is finicky. With an int32 index buffer and a pool
         # under 2^31 rows (num_kv passed as i32), LLVM folds this into a single
         # 32-bit unsigned compare and the loop keeps a well-pipelined schedule
-        # (1.49 ms on the DSv4.1 TP4 shape, gfx942, Triton 3.7.1). An int64 index
+        # (1.65 ms on the DSv4.1 TP4 shape, gfx942, Triton 3.7.1). An int64 index
         # buffer takes a real 64-bit compare and runs ~1.5x slower: the gathers'
         # waits move to the top of the next iteration. Why the scheduler picks
         # that pattern is not known; small edits here (e.g. two signed compares)
@@ -385,8 +385,8 @@ def _sparse_attn_prefill_kernel(
         # Realistic index buffers and pools stay within int32 (vLLM passes
         # int32), so the fast path is the one that runs in practice.
         valid = in_range & (slot_off.to(tl.uint64, bitcast=True) < num_kv)
-        # Point invalid lanes at row 0 so the gather stays unmasked (and
-        # vectorized); their scores are masked to -inf below.
+        # Keep invalid lanes' addresses inside the pool; the gather below does
+        # not load them.
         slot_off = tl.where(valid, slot_off, 0)
 
         kv_ptrs = (
@@ -395,7 +395,11 @@ def _sparse_attn_prefill_kernel(
             + dim_offsets[None, :] * kv_stride_d
         )
         if EVEN_HD:
-            kv = tl.load(kv_ptrs)
+            # Invalid rows must not be loaded at all: a zero softmax weight does
+            # not neutralize a non-finite value in the PV dot (0 * NaN = NaN).
+            # Masking whole rows keeps the 16-byte vectorized loads; zeroing the
+            # loaded tile with tl.where instead blows up the loop (~2x slower).
+            kv = tl.load(kv_ptrs, mask=valid[:, None], other=0.0)
         else:
             kv = tl.load(kv_ptrs, mask=valid[:, None] & dim_mask[None, :], other=0.0)
 

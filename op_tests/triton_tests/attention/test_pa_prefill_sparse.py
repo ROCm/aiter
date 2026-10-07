@@ -485,6 +485,7 @@ def _sparse_prefill_single_source_torch(q, kv, indices, indptr, attn_sink, scale
     slots = torch.where(in_row, indices.long()[flat] if indices.numel() else -1, -1)
     valid = (slots >= 0) & (slots < kv.shape[0])
     kv_g = kv.float()[slots.clamp(0, max(kv.shape[0] - 1, 0))]  # [T, K, D]
+    kv_g = kv_g.masked_fill(~valid[..., None], 0.0)  # invalid rows contribute nothing
     scores = torch.einsum("thd,tkd->thk", q.float(), kv_g) * scale
     scores = scores.masked_fill(~valid[:, None, :], float("-inf"))
     if attn_sink is not None:
@@ -743,4 +744,26 @@ def test_pa_prefill_sparse_one_row_pool():
     indices = torch.tensor([0, -1, 1, 0] * T, dtype=torch.int32, device=dev)
     ref = _sparse_prefill_single_source_torch(q, kv, indices, indptr, sink, D**-0.5)
     out = pa_prefill_sparse(q, kv, indices, indptr, None, None, None, sink, D**-0.5)
+    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+# Invalid slots are gathered from row 0 and given zero weight; a non-finite
+# value there must still not reach the output (0 * NaN is NaN in the PV dot).
+@pytest.mark.parametrize("H", [8, 16, 32])
+def test_pa_prefill_sparse_nonfinite_row0_ignored_by_invalid_slots(H):
+    _triton_branch_only()
+    torch.manual_seed(5)
+    T, D, num_kv, dev = 256, 512, 1024, "cuda"
+    q = torch.randn(T, H, D, dtype=torch.bfloat16, device=dev)
+    kv = torch.randn(num_kv, D, dtype=torch.bfloat16, device=dev)
+    kv[0, ::2] = float("nan")
+    kv[0, 1::2] = float("inf")
+    sink = torch.randn(H, dtype=torch.float32, device=dev)
+    indptr = torch.arange(0, (T + 1) * 48, 48, dtype=torch.int32, device=dev)
+    indices = torch.randint(1, num_kv, (T * 48,), dtype=torch.int32, device=dev)
+    indices[0::4] = -1
+    indices[1::9] = num_kv + 3
+    ref = _sparse_prefill_single_source_torch(q, kv, indices, indptr, sink, D**-0.5)
+    out = pa_prefill_sparse(q, kv, indices, indptr, None, None, None, sink, D**-0.5)
+    assert torch.isfinite(out).all()
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)

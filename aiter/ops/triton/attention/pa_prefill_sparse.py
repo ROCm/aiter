@@ -84,7 +84,8 @@ def pa_prefill_sparse(
         unified_kv:        [total_pages, D] — prefix KV source (paged).
         kv_indices_prefix: [total_prefix] int32 (int64 also accepted by the
             Triton branch) — flat per-token slot lists
-            into unified_kv. ``-1`` sentinels skipped.
+            into unified_kv. Invalid-slot handling depends on the branch; see
+            ``has_invalid``.
         kv_indptr_prefix:  [T+1] int32 — true prefix sum.
         kv:                [total_tokens, D] — extend KV source (this fwd's
             input K, not yet in paged buffer). ``None`` for no extend source.
@@ -94,8 +95,9 @@ def pa_prefill_sparse(
         attn_sink:         [H] fp32 — per-head softmax-denom bias.
         softmax_scale:     float.
         has_invalid:       gfx1250 only: whether index lists may hold ``-1``
-            sentinels (``None`` picks a heuristic). The other branches always
-            skip ``-1`` and out-of-pool slots.
+            sentinels (``None`` picks a heuristic). The Triton fallback always
+            skips ``-1`` and out-of-pool slots. gfx950 (``mla_gluon``) does not
+            check slot values: pass only valid slots there.
         out:               optional contiguous [T, H, D] buffer on q's device,
             same dtype as q; written in place and returned.
 
