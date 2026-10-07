@@ -22,6 +22,7 @@ from collections import defaultdict
 
 import torch
 
+from aiter.dist.device_communicators.vmm_allocator import load_hip_runtime
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.fp8_mqa_logits_kernels import (
     KERNEL_VARIANTS,
@@ -37,7 +38,7 @@ from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 _BIN_RE = re.compile(r'bin = "((?:[^"\\]|\\.)*)"')
 _KNAME_RE = re.compile(r'kernel_metadata<"([^"]+)"')
 
-_hip = ctypes.CDLL("libamdhip64.so")
+_hip = load_hip_runtime()
 _hip.hipModuleLoadData.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p]
 _hip.hipModuleGetFunction.argtypes = [
     ctypes.POINTER(ctypes.c_void_p),
@@ -75,7 +76,7 @@ def _unescape(text):
 
 def _hip_occupancy(launcher, threads):
     """``hipModuleOccupancyMaxActiveBlocksPerMultiprocessor`` for the artifact."""
-    ir_text = launcher._cf._keepalive._ir_text
+    ir_text = launcher._cf._keepalive.ir
     blob = _unescape(_BIN_RE.search(ir_text).group(1))
     kernel_name = _KNAME_RE.search(ir_text).group(1)
     module = ctypes.c_void_p()

@@ -93,9 +93,7 @@ class _SplitPolicy:
         instead of targeting a fixed ``cu_oversub``. See ``_auto_num_splits``.
     block_overhead_tiles : int
         Per-block fixed cost in BKV tiles (Q/weight preload, tail effects).
-        Splitting multiplies it by ``num_splits``, so it is what bounds the
-        split count. Fitted on MI325X over 86 shapes from three window
-        regimes weighted equally; dominates when windows are narrow.
+        Paid once per split, so it bounds the split count. Fitted on MI325X.
     """
 
     min_seq_len_kv: int
@@ -117,15 +115,9 @@ _SPLIT_POLICIES = {
         occupancy_aware=True,
         block_overhead_tiles=8,
     ),
-    # Tuned on MI355X (256 CU) against the LDS-pipelined builder.
-    #
-    # Left on the fixed-oversubscription path deliberately. Occupancy is
-    # verified here (308/308 vs HIP), but gfx950 cannot show the effect:
-    # its auto-selected variants span two occupancy values against gfx942's
-    # six, and 32 of 35 measured shapes have four or more split choices
-    # within 3% of optimal. Its optima also sit 8-24x past one effective
-    # wave (4-7x on gfx942), which is window load imbalance -- a term this
-    # model lacks, and a separate change.
+    # Tuned on MI355X (256 CU) against the LDS-pipelined builder. Stays on
+    # the fixed-oversubscription path: its auto-selected variants span too
+    # few occupancy values for the cost model to help.
     "gfx950": _SplitPolicy(
         min_seq_len_kv=0, min_tiles_per_split=2, cu_oversub=4, fallback_cu=256
     ),
@@ -148,39 +140,22 @@ def _device_cu_count(device_index: int) -> int:
         return _split_policy().fallback_cu
 
 
-# ``max_splits`` grows with seq_len_kv (1024 at 1M KV) and the scan runs per
-# launch, so it is capped to keep host cost flat. No measured shape's optimum
-# reached this bound.
+# Caps the per-launch scan; no measured optimum reached it.
 _MAX_SPLIT_SEARCH = 64
 
 
+@lru_cache(maxsize=256)
 def _splits_by_wave_cost(
     grid_x: int, effective_cus: int, window_tiles: int, max_splits: int, overhead: int
 ) -> int:
-    """``num_splits`` minimizing a wave-quantized model of the launch's cost.
-
-    The device runs the grid in ``ceil(total_blocks / effective_cus)``
-    waves and a wave costs what its longest block costs, so::
+    """``num_splits`` minimizing a wave-quantized cost model::
 
         cost(s) = ceil(grid_x * s / effective_cus) * (ceil(W / s) + overhead)
 
-    with ``W`` the KV window in BKV tiles. Raising ``s`` shortens each
-    block's tile loop but eventually buys a whole extra wave and re-pays
-    ``overhead`` per split; minimizing the product is what replaces guessing
-    an oversubscription factor. Ties go to the smaller ``s`` -- same
-    predicted cost, less duplicated KV traffic at split boundaries.
-
-    Not monotone in ``effective_cus``, by design: higher occupancy can
-    lower the split count when a smaller grid now fits one wave instead of
-    spilling into a second. Those boundaries move with occupancy, which is
-    exactly what a fixed factor cannot see.
-
-    Bounded by ``_MAX_SPLIT_SEARCH``. Known limit: when ``grid_x`` is a small
-    fraction of ``effective_cus`` the extra wave this charges is nearly free,
-    since those CUs were idle anyway, and such shapes measure fastest up to
-    ~7% below what this picks. Pricing partial waves fractionally fixes them
-    and is far worse elsewhere (mean 1.19 vs 1.01 of per-shape optimum over
-    86 shapes), so the quantization stays.
+    ``W`` is the KV window in BKV tiles. Ties go to the smaller ``s``. Not
+    monotone in ``effective_cus``: more occupancy can fit a grid in one wave
+    with fewer splits. Partial waves are not priced fractionally; that
+    measured worse overall.
     """
     return min(
         range(1, min(max_splits, _MAX_SPLIT_SEARCH) + 1),
