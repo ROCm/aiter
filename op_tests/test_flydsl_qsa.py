@@ -7,7 +7,9 @@ Two layers:
   * Correctness (pytest gate): ``test_*`` unit cases.
   * Perf sweep (``__main__``): ``bench_qsa_family_a_plumbing``,
     ``bench_qsa_family_a_vllm_amd``,
-    ``bench_qsa_family_a_k1`` (decode ``M<=8`` and a separate prefill table),
+    ``bench_qsa_family_a_k1`` (decode ``M<=8`` and a separate prefill table;
+    HIP-graph select columns for FlyDSL and live AMD when the table is
+    wider than 20000 columns and ``M<=64``),
     ``bench_qsa_family_b_k1`` (emit; long-``L`` uses family A scorer; published point),
     ``bench_qsa_family_a_k2`` (3d decode ``M<=8`` and a separate prefill table),
     ``bench_qsa_family_a_e2e`` / ``bench_qsa_family_b_e2e`` (indexer through GQA),
@@ -2227,6 +2229,17 @@ def bench_qsa_family_a_k1(
     ``pad_pages`` widens the block table every column sees; ``0`` keeps it
     packed to the context. ``cache_layout="wide"`` gives every column the
     serving cache span. The layer bench takes the same layout.
+
+    When ``M`` is at most 64 and the table is wider than 20000 columns, two
+    more columns replay the select under HIP-graph capture. FlyDSL capture
+    selects the one-workgroup radix; the eager FlyDSL column readbacks the
+    live width and streams past 32768 columns. Live AMD is the same
+    ``qsa_select_paged_tokens`` call as the eager column, captured and
+    replayed hot. Both replays use one hot buffer set and do not follow
+    ``rotate``. Shorter tables leave both columns out.
+    ``--batch 4 16 64 --seq 131072 263424 --page-size 392`` is the long
+    decode: 263424 tokens fill 65856 columns, 168 pages of 392. Batches
+    above 8 print in the prefill table.
     """
     idx = FAMILY_A_INDEXER
     device = torch.device("cuda")
@@ -2288,7 +2301,66 @@ def bench_qsa_family_a_k1(
 
     flops = 2 * m * idx.n_heads * idx.head_dim * n_blocks
     nbytes = (m * idx.n_heads * idx.head_dim + n_blocks * idx.head_dim) * dtype.itemsize
-    return {
+    # Capture takes the one-workgroup radix on a padded decode table.
+    # The eager column above readbacks and streams once the live width
+    # crosses 32768 columns, so the two FlyDSL times are the two selectors.
+    n_columns = int(index_table.shape[1]) * int(page_size)
+    graph_select = (
+        m <= k1_kernel._DECODE_MAX_ROWS
+        and n_columns > k1_kernel._ONE_WORKGROUP_MAX_ROW_WIDTH
+    )
+    graph_us = None
+    graph_err = None
+    amd_graph_us = None
+    amd_graph_err = None
+    if graph_select:
+        block_ids_g = torch.empty(m, idx.block_budget, dtype=dtypes.i32, device=device)
+        indices_g = torch.empty(m, idx.index_width, dtype=dtypes.i32, device=device)
+
+        def launch():
+            qsa_k1_block_ids(
+                q_indexer,
+                index_cache,
+                index_table,
+                token_to_req,
+                qpos,
+                slen,
+                out=block_ids_g,
+                heads=(4,),
+            )
+            expand_qsa_block_indices_cuda(
+                block_ids_g,
+                qpos,
+                slen,
+                token_to_req,
+                idx.compress_ratio,
+                idx.token_budget,
+                out=indices_g,
+            )
+
+        graph_us = _capture_replay_us(launch)
+        graph_err = _set_mismatch_ratio(ref_ids, block_ids_g, ref_scores)
+
+        amd_indices = torch.empty(m, idx.index_width, dtype=dtypes.i32, device=device)
+        amd_blocks: dict[str, torch.Tensor] = {}
+
+        def amd_launch():
+            _out, blocks = qsa_select_paged_tokens(
+                q_indexer,
+                index_cache,
+                index_table,
+                token_to_req,
+                qpos,
+                slen,
+                idx.token_budget,
+                idx.compress_ratio,
+                out=amd_indices,
+            )
+            amd_blocks["ids"] = blocks
+
+        amd_graph_us = _capture_replay_us(amd_launch)
+        amd_graph_err = _set_mismatch_ratio(ref_ids, amd_blocks["ids"], ref_scores)
+    ret = {
         "gfx": get_gfx(),
         "n_blocks": n_blocks,
         "n_pages": int(index_table.shape[1]),
@@ -2302,6 +2374,16 @@ def bench_qsa_family_a_k1(
         "vllm_amd_select TB/s": nbytes / vllm_us / 1e6,
         "vllm_amd_select err": vllm_err,
     }
+    if graph_us is not None:
+        ret["flydsl_k1_graph us"] = graph_us
+        ret["flydsl_k1_graph TFLOPS"] = flops / graph_us / 1e6
+        ret["flydsl_k1_graph TB/s"] = nbytes / graph_us / 1e6
+        ret["flydsl_k1_graph err"] = graph_err
+        ret["vllm_amd_select_graph us"] = amd_graph_us
+        ret["vllm_amd_select_graph TFLOPS"] = flops / amd_graph_us / 1e6
+        ret["vllm_amd_select_graph TB/s"] = nbytes / amd_graph_us / 1e6
+        ret["vllm_amd_select_graph err"] = amd_graph_err
+    return ret
 
 
 @benchmark()
@@ -3795,9 +3877,9 @@ def _skip_pad_narrower_than_context(
     return True
 
 
-def _raise_if_k1_mismatch(err, m, seq_len):
+def _raise_if_k1_mismatch(err, m, seq_len, where="FlyDSL K1"):
     if err != 0:
-        raise AssertionError(f"FlyDSL K1 set mismatch at M={m} L={seq_len} (err={err})")
+        raise AssertionError(f"{where} set mismatch at M={m} L={seq_len} (err={err})")
 
 
 def _raise_if_k2_above_tolerance(err, m, seq_len):
@@ -3970,6 +4052,16 @@ def main():
                 cache_layout,
             )
             _raise_if_k1_mismatch(row["flydsl_k1 err"], m, seq_len)
+            if "flydsl_k1_graph err" in row:
+                _raise_if_k1_mismatch(
+                    row["flydsl_k1_graph err"], m, seq_len, where="FlyDSL K1 graph"
+                )
+                _raise_if_k1_mismatch(
+                    row["vllm_amd_select_graph err"],
+                    m,
+                    seq_len,
+                    where="live AMD select graph",
+                )
             rows.append(row)
         if rows:
             df = pd.DataFrame(rows)
@@ -4032,6 +4124,16 @@ def main():
                 cache_layout,
             )
             _raise_if_k1_mismatch(row["flydsl_k1 err"], m, seq_len)
+            if "flydsl_k1_graph err" in row:
+                _raise_if_k1_mismatch(
+                    row["flydsl_k1_graph err"], m, seq_len, where="FlyDSL K1 graph"
+                )
+                _raise_if_k1_mismatch(
+                    row["vllm_amd_select_graph err"],
+                    m,
+                    seq_len,
+                    where="live AMD select graph",
+                )
             rows.append(row)
         if rows:
             df = pd.DataFrame(rows)
