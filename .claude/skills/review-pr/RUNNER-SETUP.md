@@ -43,6 +43,23 @@ Set the repo secret `AITER_BOT_TOKEN` to the bot account's PAT (`public_repo`). 
 uses it only in the claim and publish steps — never in the review step — so the review agent
 cannot read it.
 
-## 5. Verify
+## 5. Keep it running across reboots
+
+Registering a runner does not keep it running. A hand-started runner (`./run.sh`, `nohup`, or a
+keeper loop) dies on the next reboot and never comes back — and nothing reports it: with no
+runner the job stays `queued` instead of failing, so GitHub sends no notification, and
+`_notify.py` cannot help because it only runs *inside* a job that started. This box lost its
+runner to a reboot and sat silently offline for days.
+
+Install it as a service instead — the runner package ships the wrapper:
+
+    cd <runner-dir>
+    sudo ./svc.sh install <user>    # systemd unit: Restart=always, starts at boot
+    sudo ./svc.sh start
+
+Do not hand-roll a unit or a keeper loop: a keeper only restarts what it is pointed at, and it
+cannot restart itself.
+
+## 6. Verify
 
     bash .claude/skills/review-pr/preflight.sh    # all green = @aiter-bot review runs end to end

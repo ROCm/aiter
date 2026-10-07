@@ -121,16 +121,25 @@ run_agent() {  # <label> <prompt-file> <out-file> <cmd...>
     n=$((n + 1)); rm -f "$out"
     (cd "$PROJ" && timeout "${AITER_AGENT_TIMEOUT:-2400}" "$@" "$(cat "$pf")"); rc=$?
     [ "$rc" -eq 0 ] && [ -s "$out" ] && return 0
-    if [ "$rc" -eq 124 ]; then say "$label hit the ${AITER_AGENT_TIMEOUT:-2400}s timeout -- not retrying a timeout"; return 1; fi
+    if [ "$rc" -eq 124 ]; then say "$label hit the ${AITER_AGENT_TIMEOUT:-2400}s timeout -- not retrying a timeout"; return 124; fi
     if [ "$n" -ge "$max" ]; then say "$label failed after $max attempts (GLM error?)"; return 1; fi
     say "$label attempt $n failed (rc=$rc, transient?); retrying in $((n * 10))s"; sleep $((n * 10))
   done
 }
 
-# 2) worker (headless GLM), with retry on GLM timeout
+# Triage an agent failure. A timeout is this pipeline's own budget, not a backend fault, so it
+# routes to flow -- a review that needs longer must never page the model owner.
+agent_fail() {  # <label> <rc> <exit-code>
+  if [ "$2" -eq 124 ]; then
+    fail flow "$3" "the $1 did not finish within AITER_AGENT_TIMEOUT=${AITER_AGENT_TIMEOUT:-2400}s; the backend answered normally -- raise it in the runner .env"
+  fi
+  fail glm "$3" "the GLM $1 failed -- the backend errored or returned nothing"
+}
+
+# 2) worker (headless GLM), with retry on a transient GLM failure
 say "worker (GLM)..."
 bash "$SKILL/render.sh" worker "$W" > "$W/_pw.txt"
-run_agent "worker" "$W/_pw.txt" "$W/card.md" "${WORKER_CMD[@]}" || fail glm 2 "the GLM worker failed after retries -- the backend is timing out or down"
+run_agent "worker" "$W/_pw.txt" "$W/card.md" "${WORKER_CMD[@]}" || agent_fail worker $? 2
 
 # 3) refuter (headless GLM) -- Step 7.7; or the NONE line for a 0-finding card
 say "refuter..."
@@ -138,7 +147,7 @@ if grep -qiE '(NO FINDINGS|✅)' "$W/card.md" && ! grep -qE '^(🔴|⚠️|📝)
   printf 'NONE AVAILABLE -- 0 findings on the card (NO FINDINGS); nothing for an independent reader to refute\n' > "$W/independent.txt"
 else
   bash "$SKILL/render.sh" refuter "$W" "$W/card.md" > "$W/_prf.txt"
-  run_agent "refuter" "$W/_prf.txt" "$W/independent.txt" "${REFUTER_CMD[@]}" || fail glm 3 "the GLM refuter failed after retries -- the backend is timing out or down"
+  run_agent "refuter" "$W/_prf.txt" "$W/independent.txt" "${REFUTER_CMD[@]}" || agent_fail refuter $? 3
 fi
 
 # 3b) apply the refuter's verdicts: drop KILLED findings from the card before the gates, or the

@@ -46,6 +46,11 @@ else
   fi
 fi
 
+echo "[persistence]"
+chk "runner is a systemd service (survives a reboot)" \
+    "systemctl list-unit-files 'actions.runner.*' --no-legend 2>/dev/null | grep -q enabled" \
+    "a hand-started runner dies on the next reboot; the job then sits in 'queued' with no failure and no notification -- sudo ./svc.sh install <user> (RUNNER-SETUP.md section 5)"
+
 echo "[publish identity]"
 tok=""
 [ -n "${AITER_BOT_TOKEN:-}" ] && tok="$AITER_BOT_TOKEN"
