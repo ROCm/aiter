@@ -11,6 +11,7 @@ import math
 
 import torch
 import triton
+from packaging.version import Version
 
 from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_mla import (
     _sparse_mla as _sparse_mla_gfx950,
@@ -45,6 +46,9 @@ try:
     _HAS_SCALED_UPCAST = hasattr(_cdna4, "scaled_upcast")
 except ImportError:
     _HAS_SCALED_UPCAST = False
+
+# Below Triton 3.8 the peeled 64-bit split-K kernel spills ~110 VGPRs to scratch.
+_TRITON_GE_38 = Version(triton.__version__) >= Version("3.8.0")
 
 _LOGGER = AiterTritonLogger()
 
@@ -662,11 +666,15 @@ def _pa_decode_sparse_gfx950_gluon(
     if one_wg_per_cu:
         waves_per_eu = 1
 
-    # Unpeeled is faster at prefill and, on the 64-bit gathers, unless split-K
-    # leaves each program a few tiles. Decode on buffer loads is faster peeled.
+    # Decode on buffer loads is faster peeled; prefill is faster unpeeled.
+    # On the 64-bit gathers unpeeled is faster unless split-K leaves each program
+    # a few tiles, and below Triton 3.8 the peeled kernel spills, so always unpeel.
     row_tiles = max(avg_main, avg_extra) / BLOCK_K
     short_splits = num_splits > 1 and row_tiles <= 4 * num_splits
-    unpeel = num_queries >= _PREFILL_MIN_ROWS if use_buffer_load else not short_splits
+    if use_buffer_load:
+        unpeel = num_queries >= _PREFILL_MIN_ROWS
+    else:
+        unpeel = not (_TRITON_GE_38 and short_splits)
 
     main_splits = num_splits
     if has_extra and avg_main > 0:
