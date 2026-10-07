@@ -59,6 +59,8 @@ void gated_rmsnorm_fp8_group_quant(
  *   z: Gating tensor [num_tokens, num_heads, head_dim] (bf16/fp16)
  *   weight: RMSNorm weight [head_dim] (bf16/fp16)
  *   epsilon: Small value for numerical stability
+ *   sigmoid_gate: Use sigmoid instead of SiLU and round through the input dtype
+ *     before quantization to match KDA's split path.
  */
 void gated_rmsnorm_fp8_per_token_quant(
     aiter_tensor_t& out,           // [num_tokens, num_heads * head_dim]
@@ -66,7 +68,8 @@ void gated_rmsnorm_fp8_per_token_quant(
     const aiter_tensor_t& x,        // [num_tokens, num_heads, head_dim] - input to normalize
     const aiter_tensor_t& z,        // [num_tokens, num_heads, head_dim] - gating tensor
     const aiter_tensor_t& weight,   // [head_dim] - RMSNorm weight
-    double epsilon);
+    double epsilon,
+    bool sigmoid_gate = false);
 
 
 } // namespace aiter
