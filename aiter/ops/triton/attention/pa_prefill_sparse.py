@@ -82,7 +82,8 @@ def pa_prefill_sparse(
     Args:
         q:                 [T, H, D] BF16/FP16 — queries.
         unified_kv:        [total_pages, D] — prefix KV source (paged).
-        kv_indices_prefix: [total_prefix] int32 — flat per-token slot lists
+        kv_indices_prefix: [total_prefix] int32 (int64 also accepted by the
+            Triton branch) — flat per-token slot lists
             into unified_kv. ``-1`` sentinels skipped.
         kv_indptr_prefix:  [T+1] int32 — true prefix sum.
         kv:                [total_tokens, D] — extend KV source (this fwd's
@@ -233,12 +234,15 @@ def pa_prefill_sparse(
 
     else:
         # Portable Triton fallback.
+        # The Triton kernel takes int32 or int64 indices as passed; converting
+        # int64 to int32 would silently wrap slots past 2^31 - 1.
         kv_indices_prefix, kv_indptr_prefix = _prep_single_source(
             kv_indices_prefix,
             kv_indptr_prefix,
             kv,
             kv_indices_extend,
             kv_indptr_extend,
+            index_dtypes=(torch.int32, torch.int64),
         )
         if not softmax_scale > 0:
             # The kernel scales after the row max, which needs a positive scale.
@@ -319,8 +323,12 @@ def _prep_single_source(
     kv: torch.Tensor | None,
     kv_indices_extend: torch.Tensor | None,
     kv_indptr_extend: torch.Tensor | None,
+    index_dtypes: tuple[torch.dtype, ...] = (torch.int32,),
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Normalize the KV pool and indices for the gfx950 / Triton kernels.
+
+    Indices and indptr keep their dtype if it is in ``index_dtypes`` and are
+    converted to int32 otherwise.
 
     Rejects an extend KV source outright: only the gfx1250 gluon kernel reads a
     second pool.
@@ -340,9 +348,17 @@ def _prep_single_source(
         )
 
     return (
-        _as_int32_contiguous_1d(kv_indices_prefix),
-        _as_int32_contiguous_1d(kv_indptr_prefix),
+        _as_index_contiguous_1d(kv_indices_prefix, index_dtypes),
+        _as_index_contiguous_1d(kv_indptr_prefix, index_dtypes),
     )
+
+
+def _as_index_contiguous_1d(
+    x: torch.Tensor, index_dtypes: tuple[torch.dtype, ...]
+) -> torch.Tensor:
+    if x.dtype not in index_dtypes:
+        return _as_int32_contiguous_1d(x)
+    return x.reshape(-1).contiguous()
 
 
 def _as_int32_contiguous_1d(x: torch.Tensor) -> torch.Tensor:

@@ -3,6 +3,7 @@
 
 import pytest
 import torch
+import triton
 
 from aiter.ops.triton.attention.pa_prefill_sparse import pa_prefill_sparse
 from aiter.ops.triton.utils._triton import arch_info
@@ -667,3 +668,79 @@ def test_pa_prefill_sparse_out_buffer_every_branch():
     ret = pa_prefill_sparse(q, ukv, p_idx, p_indptr, *extend, sink, scale, out=out)
     assert ret is out
     assert torch.equal(out, ref)
+
+
+# int64 index buffers stay int64 on the Triton branch: slots past 2^31 - 1 must
+# be rejected as out of pool, not wrapped into range by an int32 cast.
+@pytest.mark.parametrize("H", [8, 16])
+def test_pa_prefill_sparse_int64_indices(H):
+    _triton_branch_only()
+    torch.manual_seed(3)
+    T, D, num_kv, dev = 512, 512, 4096, "cuda"
+    q = torch.randn(T, H, D, dtype=torch.bfloat16, device=dev)
+    kv = torch.randn(num_kv, D, dtype=torch.bfloat16, device=dev)
+    sink = torch.randn(H, dtype=torch.float32, device=dev)
+    lens = torch.randint(1, 640, (T,), device=dev)
+    indptr = torch.zeros(T + 1, dtype=torch.int64, device=dev)
+    indptr[1:] = lens.cumsum(0)
+    indices = torch.randint(
+        0, num_kv, (int(indptr[-1]),), dtype=torch.int64, device=dev
+    )
+    n = indices.numel()
+    perm = torch.randperm(n, device=dev)
+    indices[perm[: n // 8]] = -1
+    # int32 casts of these would wrap to 0, 5 and num_kv - 1: valid-looking rows.
+    indices[perm[n // 8 : n // 8 + n // 16]] = 2**32
+    indices[perm[n // 8 + n // 16 : n // 8 + n // 8]] = 2**32 + 5
+    indices[perm[n // 4 : n // 4 + n // 16]] = 2**32 + num_kv - 1
+    scale = D**-0.5
+    ref = _sparse_prefill_single_source_torch(q, kv, indices, indptr, sink, scale)
+    out = pa_prefill_sparse(q, kv, indices, indptr, None, None, None, sink, scale)
+    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+# The validity check must not rely on num_kv fitting int32. A pool that large
+# cannot be allocated in a test, so launch the kernel with an oversized bound
+# over a small pool: negative slots must still be rejected (accepting one would
+# read before the buffer) while every slot inside the real pool stays valid.
+@pytest.mark.parametrize("bound", [2**31 + 5, 2**33])
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+def test_sparse_attn_prefill_kernel_huge_num_kv(bound, index_dtype):
+    _triton_branch_only()
+    from aiter.ops.triton._triton_kernels.attention.sparse_attention_dsv4 import (
+        _sparse_attn_prefill_kernel,
+    )
+
+    torch.manual_seed(4)
+    T, H, D, num_kv, dev = 256, 16, 512, 2048, "cuda"
+    q = torch.randn(T, H, D, dtype=torch.bfloat16, device=dev)
+    kv = torch.randn(num_kv, D, dtype=torch.bfloat16, device=dev)
+    sink = torch.randn(H, dtype=torch.float32, device=dev)
+    indptr = torch.arange(0, (T + 1) * 64, 64, dtype=index_dtype, device=dev)
+    indices = torch.randint(0, num_kv, (T * 64,), dtype=index_dtype, device=dev)
+    indices[0::3] = -1
+    indices[1::7] = -(2**31)
+    out = torch.empty_like(q)
+    _sparse_attn_prefill_kernel[lambda meta: (T, triton.cdiv(H, meta["BLOCK_H"]))](
+        q, kv, indices, indptr, sink, out,
+        q.stride(0), q.stride(1), q.stride(2), kv.stride(0), kv.stride(1),
+        out.stride(0), out.stride(1), out.stride(2),
+        H, D, bound, D**-0.5,
+        HAS_ATTN_SINK=True, BLOCK_D=D,
+    )  # fmt: skip
+    ref = _sparse_prefill_single_source_torch(q, kv, indices, indptr, sink, D**-0.5)
+    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+# A one-row pool: Triton specializes the integer 1 as a constant.
+def test_pa_prefill_sparse_one_row_pool():
+    _triton_branch_only()
+    T, H, D, dev = 64, 16, 512, "cuda"
+    q = torch.randn(T, H, D, dtype=torch.bfloat16, device=dev)
+    kv = torch.randn(1, D, dtype=torch.bfloat16, device=dev)
+    sink = torch.randn(H, dtype=torch.float32, device=dev)
+    indptr = torch.arange(0, (T + 1) * 4, 4, dtype=torch.int32, device=dev)
+    indices = torch.tensor([0, -1, 1, 0] * T, dtype=torch.int32, device=dev)
+    ref = _sparse_prefill_single_source_torch(q, kv, indices, indptr, sink, D**-0.5)
+    out = pa_prefill_sparse(q, kv, indices, indptr, None, None, None, sink, D**-0.5)
+    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)

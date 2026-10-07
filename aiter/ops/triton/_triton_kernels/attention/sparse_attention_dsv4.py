@@ -364,19 +364,30 @@ def _sparse_attn_prefill_kernel(
     for k_start in tl.range(0, kv_len, BLOCK_K):
         k_pos = k_start + k_offsets
         in_range = k_pos < kv_len
-        # One unsigned compare covers both -1 (wraps to 2^32 - 1) and slots
-        # past the pool; two signed compares cost ~10% of the kernel.
-        valid = in_range & (slot.to(tl.uint32, bitcast=True) < num_kv)
+        # 64-bit before the multiply, same as the decode kernel: a slot index
+        # fits its index dtype (int32 or int64) but `slot * kv_stride_n` may
+        # not once the unified V4 pool runs to ~150M rows. The wrapped offset
+        # would still land inside the same allocation, so the bad read is silent.
+        slot_off = slot.to(tl.int64)
+        # The same widened value gives the validity check without any range
+        # assumption: as unsigned 64-bit, every negative slot (sign-extended)
+        # is >= 2^63, above any pool size, so one compare rejects -1 and slots
+        # past the pool for int32 and int64 indices alike.
+        #
+        # Performance here is finicky. With an int32 index buffer and a pool
+        # under 2^31 rows (num_kv passed as i32), LLVM folds this into a single
+        # 32-bit unsigned compare and the loop keeps a well-pipelined schedule
+        # (1.49 ms on the DSv4.1 TP4 shape, gfx942, Triton 3.7.1). An int64 index
+        # buffer takes a real 64-bit compare and runs ~1.5x slower: the gathers'
+        # waits move to the top of the next iteration. Why the scheduler picks
+        # that pattern is not known; small edits here (e.g. two signed compares)
+        # have triggered it too, so re-measure after touching this block.
+        # Realistic index buffers and pools stay within int32 (vLLM passes
+        # int32), so the fast path is the one that runs in practice.
+        valid = in_range & (slot_off.to(tl.uint64, bitcast=True) < num_kv)
         # Point invalid lanes at row 0 so the gather stays unmasked (and
         # vectorized); their scores are masked to -inf below.
-        slot = tl.where(valid, slot, 0)
-
-        # 64-bit before the multiply, same as the decode kernel: a slot index
-        # fits 32 bits (the index buffer is int32 by ABI) but `slot *
-        # kv_stride_n` does not once the unified V4 pool runs to ~150M rows.
-        # The wrapped offset still lands inside the same allocation, so the
-        # bad read is silent.
-        slot_off = slot.to(tl.int64)
+        slot_off = tl.where(valid, slot_off, 0)
 
         kv_ptrs = (
             kv_ptr
