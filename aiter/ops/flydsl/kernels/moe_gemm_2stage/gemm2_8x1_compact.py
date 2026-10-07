@@ -15,7 +15,7 @@ import flydsl.expr as fx
 import torch
 from flydsl.expr import const_expr, gpu, range_constexpr
 
-from .gemm2_1x4 import _build_moe_gemm2_1x4
+from .gemm2_1x4 import _build_moe_gemm2_1x4_n256
 from .gemm2_8x1 import _build_moe_gemm2_8x1
 
 
@@ -263,7 +263,7 @@ def _build_moe_gemm2_8x1_compact(
         BLOCK_TILE_SIZE_N=128,
         down_path="8x1",
     )
-    tail = _build_moe_gemm2_1x4(
+    tail = _build_moe_gemm2_1x4_n256(
         **{
             **shared_args,
             "tile_k": 128 if K in (192, 320) and tile_k == 192 else tile_k,

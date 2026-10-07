@@ -15,11 +15,11 @@ from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.typing import as_ir_value
 
 from . import common as fxh
-from .common import _f32_to_bf16
-from .gemm2_common import (
+from .common import (
     BufferTensor,
-    DownTileOps,
+    FlyObjCache,
     LdsTensor,
+    _f32_to_bf16,
     eltwise_op,
     get_down_device_config,
 )
@@ -91,7 +91,7 @@ def _build_moe_gemm2_8x1(
     assert _store_cache in (0, 2), "store aux: 0=normal, 2=SLC"
 
     BM = 256
-    ops = DownTileOps()
+    ops = FlyObjCache(cache_ir=False)
     topology, xcc_count = get_down_device_config()
     se_count = xcc_count * 4
 

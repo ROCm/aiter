@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Baseline Down kernels for split-K, batch1, and prefill."""
+"""Down-kernel dispatch and baseline split-K and batch1 implementations."""
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -36,12 +36,12 @@ def compile_moe_gemm2(
     down_output_padding_bytes=0,
 ):
     if down_path != "default":
-        from .gemm2_1x4 import _build_moe_gemm2_1x4
+        from .gemm2_1x4 import _build_moe_gemm2_1x4_n256
         from .gemm2_8x1 import _build_moe_gemm2_8x1
         from .gemm2_8x1_compact import _build_moe_gemm2_8x1_compact
 
         builders = {
-            "1x4_64x256": _build_moe_gemm2_1x4,
+            "1x4_64x256": _build_moe_gemm2_1x4_n256,
             "8x1": _build_moe_gemm2_8x1,
             "8x1_compact": _build_moe_gemm2_8x1_compact,
         }
@@ -78,10 +78,17 @@ def compile_moe_gemm2(
         swiglu_limit,
     )
     if alg == "prefill_1x4":
-        assert K % 64 == 0, f"down prefill requires K to be divisible by 64, got K={K}"
-        assert N % 256 == 0, (
-            f"down prefill requires N to be divisible by 256 for paired "
-            f"128-wide tiles, got N={N}"
+        from .gemm2_1x4 import _build_moe_gemm2_1x4_n64
+
+        return _build_moe_gemm2_1x4_n64(
+            N=N,
+            K=K,
+            weight_dtype=weight_dtype,
+            weight_quant_type=weight_quant_type,
+            TOPK=TOPK,
+            BLOCK_TILE_SIZE_M=BLOCK_TILE_SIZE_M,
+            act_quant_type=act_quant_type,
+            E=E,
         )
 
     if alg == "splitk":
@@ -357,362 +364,6 @@ def compile_moe_gemm2(
                     ptr_base = fx.get_iter(c_dst[None, m, n, 0])
                     fxh.atomic_add_bf16(ptr_base, reg_vec)
 
-    flyobj = fxh.FlyObjCache()
-
-    @flyc.kernel
-    def moe_2stage_down_prefill_1x4(
-        p_input: fx.Pointer,
-        p_weight: fx.Pointer,
-        p_output: fx.Pointer,
-        p_sorted_ids: fx.Pointer,
-        p_sorted_weights: fx.Pointer,
-        p_sorted_expert_ids: fx.Pointer,
-        p_num_valid_ids: fx.Pointer,
-        p_w_scale: fx.Pointer,
-        p_a_scale: fx.Pointer,
-        M: fx.Int32,
-    ):
-        e_idx = fx.gpu.block_idx.y
-
-        flyobj.bid = e_idx
-
-        max_valid_id = fxh.view_as_torch_tensor(p_num_valid_ids, (1,), fx.Int32)[0]
-
-        if e_idx * BLOCK_TILE_SIZE_M < max_valid_id:
-            arg_p_input = fxh.view_as_torch_tensor(p_input, (M, TOPK, K), weight_dtype)
-            arg_p_output = fxh.view_as_torch_tensor(
-                fxh._as_ptr(p_output, fx.BFloat16)
-                + fx.Int64(e_idx) * (BLOCK_TILE_SIZE_M * N),
-                (BLOCK_TILE_SIZE_M, N),
-            )
-            arg_p_sorted_ids = fxh.view_as_torch_tensor(
-                fxh._as_ptr(p_sorted_ids) + e_idx * BLOCK_TILE_SIZE_M,
-                (BLOCK_TILE_SIZE_M,),
-                fx.Int32,
-            )
-            arg_p_sorted_weights = fxh.view_as_torch_tensor(
-                fxh._as_ptr(p_sorted_weights) + e_idx * BLOCK_TILE_SIZE_M,
-                (BLOCK_TILE_SIZE_M,),
-                fx.Float32,
-            )
-            expert_id = fxh.view_as_torch_tensor(p_sorted_expert_ids, (1,), fx.Int32)[
-                e_idx
-            ]
-
-            element_num = 16 // (weight_dtype.width // 8)
-            arg_p_weight = fx.make_view(
-                fxh._as_ptr(p_weight, weight_dtype) + fx.Int64(expert_id * N * K),
-                fx.make_layout(
-                    ((16, N // 16), (element_num, K // element_num)),
-                    ((element_num, 16 * K), (1, 16 * element_num)),
-                ),
-            )
-
-            arg_p_weight = fx.rocdl.make_buffer_tensor(arg_p_weight, max_size=False)
-            arg_p_output = fx.rocdl.make_buffer_tensor(arg_p_output, max_size=False)
-
-            fx.rocdl.make_buffer_tensor(arg_p_sorted_ids, max_size=False)
-
-            BLOCK_M = BLOCK_TILE_SIZE_M
-            BLOCK_N = 64
-            BLOCK_K = 64 // (weight_dtype.width // 8)
-
-            swz_base = ((128 // weight_dtype.width) - 1).bit_length()
-            swz = fx.SwizzleType.get(3, swz_base, 3)
-
-            act_dtype = weight_dtype
-
-            @fx.union
-            class SharedStorage:
-                A: fx.Array[act_dtype, BLOCK_M * K]
-                C: fx.Array[fx.BFloat16, 2 * BLOCK_M * BLOCK_N]
-
-            lds = fx.SharedAllocator().allocate(SharedStorage)
-            ldsA0 = lds.A.peek().view(
-                fx.make_composed_layout(fx.static(swz), fxh.torch_layout(BLOCK_M, K))
-            )
-            layoutC = fx.make_composed_layout(
-                fx.static(swz),
-                fx.make_ordered_layout((BLOCK_M, BLOCK_N, 2), (1, 0, 2)),
-            )
-            layoutCt = fx.make_composed_layout(
-                fx.static(swz), fx.make_ordered_layout((BLOCK_N, BLOCK_M, 2), (0, 1, 2))
-            )
-            ldsC = lds.C.peek().view(layoutC)
-            ldsCt = lds.C.peek().view(layoutCt)
-
-            arg_p_input = fx.rocdl.make_buffer_tensor(
-                arg_p_input,
-                max_size=False,
-                num_records_bytes=fx.Int64(M)
-                * (TOPK * K)
-                * (arg_p_input.dtype.width // 8),
-            )
-            cp_atom = flyobj.get_buffer_copy_atom(arg_p_input.dtype, 128)
-
-            def flatten_A(x):
-                x = fx.select(x, [1, 0])
-                return fx.group(x, 0, -1)
-
-            cp_ldsA0 = flatten_A(ldsA0)
-            cp_rows = flatten_A(
-                fxh.make_1d_coord_tensor(ldsA0, 0, fx.get_iter(arg_p_sorted_ids))
-            )
-            cp_cols = flatten_A(
-                fxh.make_1d_coord_tensor(ldsA0, 1, fx.make_int_tuple(0))
-            )
-            for dst, row, col in fxh.all_copy_atoms(
-                cp_ldsA0, cp_rows, cp_cols, atom_bits=128, num_threads=256
-            ):
-                sorted_id = row[0].bitcast(fx.Uint32)
-                atom_A = fxh.atom_tensor(
-                    arg_p_input, (sorted_id & 0xFFFFFF, sorted_id >> 24, col[0]), 128
-                )
-                fx.copy(cp_atom, atom_A, dst)
-            fx.gpu.barrier()
-
-            weight = fx.flat_divide(arg_p_weight, (BLOCK_N, BLOCK_K))
-            ldsA = fx.flat_divide(ldsA0, (BLOCK_M, BLOCK_K))
-
-            nBN = fxh.div_up(N, BLOCK_N)
-            nBK = fxh.div_up(K, BLOCK_K)
-
-            mm = flyobj.create_thr_mma(weight_dtype, (4, 1, 1))
-
-            c_fake_tensor = fx.make_view(
-                fx.get_iter(arg_p_input),
-                fx.make_ordered_layout((BLOCK_N, BLOCK_M), (0, 1)),
-            )
-            fragC = [
-                mm.make_fragment_C(c_fake_tensor),
-                mm.make_fragment_C(c_fake_tensor),
-            ]
-            fragC_bf16 = fx.make_fragment_like(fragC[0], fx.BFloat16)
-
-            frag_act = flyobj.load_tiled_mma_fragB(mm, ldsA, copy_atom_bits=128)
-            fx.gpu.barrier()  # Finish reading ldsA before ldsC reuses its storage.
-
-            arg_w_scale = None
-            if const_expr(weight_quant_type == "per_tensor"):
-                arg_w_scale = fx.make_view(
-                    fxh._as_ptr(p_w_scale) + expert_id, fx.make_layout((N, 1), (0, 0))
-                )
-                arg_w_scale = fx.flat_divide(arg_w_scale, (BLOCK_N, 1))
-            if const_expr(weight_quant_type == "ptpc"):
-                arg_w_scale = fx.make_view(
-                    fxh._as_ptr(p_w_scale) + expert_id * N,
-                    fx.make_layout((N, 1), (1, 0)),
-                )
-                arg_w_scale = fx.flat_divide(arg_w_scale, (BLOCK_N, 1))
-
-            arg_a_scale = None
-            if const_expr(act_quant_type == "per_tensor"):
-                arg_a_scale = fx.make_view(
-                    fx.recast_iter(fx.Float32, fxh._as_ptr(p_a_scale)),
-                    fx.make_layout((M, TOPK), (0, 0)),
-                )
-                arg_a_scale = fx.rocdl.make_buffer_tensor(
-                    arg_a_scale,
-                    max_size=False,
-                    num_records_bytes=fx.Int64(1) * (arg_a_scale.dtype.width // 8),
-                )
-            if const_expr(act_quant_type == "ptpc"):
-                arg_a_scale = fx.make_view(
-                    fx.recast_iter(fx.Float32, fxh._as_ptr(p_a_scale)),
-                    fx.make_layout((M, TOPK), (TOPK, 1)),
-                )
-                arg_a_scale = fx.rocdl.make_buffer_tensor(
-                    arg_a_scale,
-                    max_size=False,
-                    num_records_bytes=fx.Int64(M)
-                    * TOPK
-                    * (arg_a_scale.dtype.width // 8),
-                )
-
-            sorted_weights = fx.make_view(
-                fx.get_iter(arg_p_sorted_weights),
-                fx.make_layout((BLOCK_N, BLOCK_M), (0, 1)),
-            )
-            frag_sorted_weight = flyobj.load_tiled_mma_fragC(
-                mm, sorted_weights, copy_atom_bits=32
-            )
-
-            if fx.const_expr(arg_a_scale is not None):
-                cp_atom = flyobj.get_buffer_copy_atom(p_a_scale.dtype, 32)
-                coord_tensor = fx.make_view(
-                    fx.get_iter(arg_p_sorted_ids),
-                    fx.make_layout((BLOCK_N, BLOCK_M), (0, 1)),
-                )
-                frag_coord = flyobj.load_tiled_mma_fragC(
-                    mm, coord_tensor, copy_atom_bits=32
-                )
-                frag_pt_scales = mm.make_fragment_C(coord_tensor)
-                frag_pt_scalesr = flyobj.get_tiled_mma_retile(
-                    mm, frag_pt_scales, "C", copy_atom=cp_atom
-                )
-
-                for dst, coord in fxh.all_elements(frag_pt_scalesr, frag_coord):
-                    sorted_id = coord[0].bitcast(fx.Uint32)
-                    atom_A = fxh.atom_tensor(
-                        arg_a_scale,
-                        (sorted_id & 0xFFFFFF, sorted_id >> 24),
-                        32,
-                    )
-                    fx.copy(cp_atom, atom_A, dst)
-
-                for frag_pt, frag_sw in fxh.all_elements(
-                    frag_pt_scales, frag_sorted_weight
-                ):
-                    frag_pt.store(frag_pt.load() * frag_sw.load())
-
-                frag_sorted_weight = frag_pt_scales
-
-            def gemm_compute(fragW, fragPCS, fragC):
-                fragC.fill(0)
-                for k in fx.range_constexpr(nBK):
-                    fx.gemm(
-                        mm,
-                        fragC,
-                        fragW[None, None, None, k],
-                        frag_act[None, None, None, 0, k],
-                        fragC,
-                    )
-                if fx.const_expr(fragPCS is not None):
-                    for fc, fpc in fxh.all_elements(fragC, fragPCS):
-                        fc.store(fc.load() * fpc.load())
-
-            fx.make_view(
-                fx.get_iter(arg_p_sorted_ids),
-                fx.make_layout((BLOCK_M, BLOCK_N), (1, 0)),
-            )
-            col_tensor = fx.make_view(
-                fx.make_int_tuple(0), fx.make_layout((BLOCK_M, N), (0, 1))
-            )
-            col_tensor = fx.flat_divide(col_tensor, (BLOCK_M, BLOCK_N))
-
-            tcopyLDS, cp_ldsc = flyobj.get_tiled_copy_coalesced_mn(
-                ldsC[None, None, 0], copy_atom_bits=128, num_threads=256
-            )
-
-            thrv_ldsC = tcopyLDS.partition_S(ldsC)
-
-            copy_atom_ = flyobj.get_universal_copy_atom(fragC_bf16.dtype, 64)
-            tcopy = flyobj.get_tiled_mma_copy(copy_atom_, mm, "C")
-            fragC_bf16r = flyobj.get_retile(tcopy, fragC_bf16)
-
-            thrv_ldsCt = flyobj.get_partition_D(tcopy, ldsCt)
-
-            def postprocess_store2lds(fragC, ldsc_idx):
-                for fc, fsw in fxh.all_elements(fragC, frag_sorted_weight):
-                    fc.store(fc.load() * fsw.load())
-                vec_f32 = fragC.load()
-                fragC_bf16.store(_f32_to_bf16(vec_f32))
-                fx.copy(copy_atom_, fragC_bf16r, thrv_ldsCt[None, None, None, ldsc_idx])
-
-            arg_p_output = fx.flat_divide(arg_p_output, (BLOCK_M, BLOCK_N))
-            cp_atom_out_128b = flyobj.get_buffer_copy_atom(fx.BFloat16, 128)
-            thrv_out = tcopyLDS.partition_D(arg_p_output)
-            fragOut = fx.make_fragment_like(thrv_ldsC[None, None, None, 0])
-
-            def postprocess_store2vmem(n, ldsc_idx):
-                fx.copy(cp_ldsc, thrv_ldsC[None, None, None, ldsc_idx], fragOut)
-                fx.copy(cp_atom_out_128b, fragOut, thrv_out[None, None, None, 0, n])
-
-            def hot_loop_scheduler():
-                num_mfma_inst = (BLOCK_M // 16) * (
-                    K // (16 if weight_dtype.width == 16 else 32)
-                )
-                num_stores = BLOCK_M // (256 // (BLOCK_N // 8))
-                num_loads = K // ((4 * 8) if weight_dtype.width == 16 else (4 * 16))
-
-                nloads = num_loads
-                nstores = num_stores
-                mfma_step = num_mfma_inst // (nloads + nstores)
-
-                nmfma = num_mfma_inst - mfma_step * (nloads + nstores)
-                if nmfma > 0:
-                    fx.rocdl.sched_mfma(nmfma)
-
-                for _ in fx.range_constexpr(nloads):
-                    fx.rocdl.sched_mfma(mfma_step)
-                    fx.rocdl.sched_group_barrier(0x10, 1, 0)
-
-                for _ in fx.range_constexpr(nstores):
-                    fx.rocdl.sched_mfma(mfma_step)
-                    fx.rocdl.sched_group_barrier(0x10, 1, 0)
-
-                fx.rocdl.sched_barrier(0)
-
-            frag_weights = [None, None]
-            frag_pc_scales = [None, None]
-            frag_weights[0] = flyobj.load_tiled_mma_fragA(
-                mm, weight, [None, None, 0, None]
-            )
-            if fx.const_expr(arg_w_scale is not None):
-                frag_pc_scales[0] = flyobj.load_tiled_mma_fragC(
-                    mm,
-                    arg_w_scale,
-                    [None, None, 0, 0],
-                    copy_atom_bits=32 if weight_quant_type == "per_tensor" else 128,
-                )
-
-            gemm_compute(frag_weights[0], frag_pc_scales[0], fragC[0])
-            frag_weights[1] = flyobj.load_tiled_mma_fragA(
-                mm, weight, [None, None, 1, None]
-            )
-            if fx.const_expr(arg_w_scale is not None):
-                frag_pc_scales[1] = flyobj.load_tiled_mma_fragC(
-                    mm,
-                    arg_w_scale,
-                    [None, None, 1, 0],
-                    copy_atom_bits=32 if weight_quant_type == "per_tensor" else 128,
-                )
-
-            postprocess_store2lds(fragC[0], 0)
-            fx.gpu.barrier()
-            for n, state in range(0, nBN - 2, 2, init=[]):
-                fxh.asm_mark("aaa")
-                postprocess_store2vmem(n, 0)
-                flyobj.load_tiled_mma_fragA(
-                    mm, weight, [None, None, n + 2, None], frag_weights[0]
-                )
-                if fx.const_expr(
-                    arg_w_scale is not None and weight_quant_type != "per_tensor"
-                ):
-                    flyobj.load_tiled_mma_fragC(
-                        mm, arg_w_scale, [None, None, n + 2, 0], frag_pc_scales[0]
-                    )
-                gemm_compute(frag_weights[1], frag_pc_scales[1], fragC[1])
-                postprocess_store2lds(fragC[1], 1)
-
-                hot_loop_scheduler()
-                fx.gpu.barrier()
-
-                fxh.asm_mark("bbb")
-
-                postprocess_store2vmem(n + 1, 1)
-                flyobj.load_tiled_mma_fragA(
-                    mm, weight, [None, None, n + 3, None], frag_weights[1]
-                )
-
-                if fx.const_expr(
-                    arg_w_scale is not None and weight_quant_type != "per_tensor"
-                ):
-                    flyobj.load_tiled_mma_fragC(
-                        mm, arg_w_scale, [None, None, n + 3, 0], frag_pc_scales[1]
-                    )
-                gemm_compute(frag_weights[0], frag_pc_scales[0], fragC[0])
-                postprocess_store2lds(fragC[0], 0)
-
-                hot_loop_scheduler()
-                fx.gpu.barrier()
-
-            postprocess_store2vmem(nBN - 2, 0)
-            gemm_compute(frag_weights[1], frag_pc_scales[1], fragC[1])
-            postprocess_store2lds(fragC[1], 1)
-            fx.gpu.barrier()
-            postprocess_store2vmem(nBN - 1, 1)
-
     @flyc.jit
     def launch_splitk(
         p_input: fx.Pointer,
@@ -768,43 +419,6 @@ def compile_moe_gemm2(
             stream=stream,
         )
 
-    @flyc.jit
-    def launch_prefill_1x4(
-        p_input: fx.Pointer,
-        p_weight: fx.Pointer,
-        p_output: fx.Pointer,
-        p_sorted_ids: fx.Pointer,
-        p_sorted_weights: fx.Pointer,
-        p_sorted_expert_ids: fx.Pointer,
-        p_num_valid_ids: fx.Pointer,
-        p_w_scale: fx.Pointer,
-        p_a_scale: fx.Pointer,
-        M: fx.Int32,
-        task_num: fx.Int32,
-        stream: fx.Stream,
-    ):
-        CompilationContext.get_current()
-        if const_expr(E is not None) and M * TOPK <= E:
-            task_num = M * TOPK
-        moe_2stage_down_prefill_1x4(
-            p_input,
-            p_weight,
-            p_output,
-            p_sorted_ids,
-            p_sorted_weights,
-            p_sorted_expert_ids,
-            p_num_valid_ids,
-            p_w_scale,
-            p_a_scale,
-            M,
-        ).launch(
-            grid=(1, task_num, 1),
-            block=(256, 1, 1),
-            stream=stream,
-        )
-
-    if const_expr(alg == "prefill_1x4"):
-        return launch_prefill_1x4
     if const_expr(alg == "batch1"):
         return launch_batch1
     return launch_splitk
