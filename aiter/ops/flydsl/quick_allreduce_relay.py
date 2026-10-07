@@ -79,27 +79,56 @@ class InGroupRelayProvider:
         nbytes: int,
     ) -> RelayBounce:
         heap = UncachedIpcHeap
-        heap.enable_peer_access(device, relay_in)
-        heap.enable_peer_access(device, relay_out)
-        with torch.cuda.device(relay_in):
-            own = heap.alloc_uncached(nbytes)
-        opened = None
+        err = None
+        own = None
+        handle = None
         try:
+            heap.enable_peer_access(device, relay_in)
+            heap.enable_peer_access(device, relay_out)
+            with torch.cuda.device(relay_in):
+                own = heap.alloc_uncached(nbytes)
             handle = heap.get_mem_handle_bytes(own)
-            metas = heap.gather_object_list_via_broadcast(group, (handle, 0))
-            peer_handle, off = metas[1 - rank]
+        except Exception as exc:  # noqa: BLE001
+            err = f"{type(exc).__name__}: {exc}"
+
+        # Both ranks reach this exchange before either raises. A peer-access
+        # or allocation failure on one rank would otherwise leave the other
+        # waiting in the broadcast.
+        metas = heap.gather_object_list_via_broadcast(group, (err, handle, 0))
+        failures = [item[0] for item in metas if item[0]]
+        if failures:
+            self._release(heap, own, None)
+            raise RuntimeError(failures[0])
+
+        opened = None
+        err = None
+        try:
+            peer_handle, off = metas[1 - rank][1], metas[1 - rank][2]
             with torch.cuda.device(device):
                 opened = int(heap.open_mem_handle(bytes(peer_handle)))
-        except Exception:
-            if opened is not None:
-                heap.close_mem_handle(opened)
-            heap.free_device_mem(own)
-            raise
+        except Exception as exc:  # noqa: BLE001
+            err = f"{type(exc).__name__}: {exc}"
+
+        # Same agreement after the peer mapping. The rank that opened its
+        # handle must close it before the caller moves on to the inbox
+        # exchange, or the successful rank waits there alone.
+        open_failures = [
+            item for item in heap.gather_object_list_via_broadcast(group, err) if item
+        ]
+        if open_failures:
+            self._release(heap, own, opened)
+            raise RuntimeError(open_failures[0])
 
         def close():
-            heap.close_mem_handle(opened)
-            heap.free_device_mem(own)
+            self._release(heap, own, opened)
 
         return RelayBounce(
             out_ptr=opened + off, in_ptr=own, nbytes=int(nbytes), close=close
         )
+
+    @staticmethod
+    def _release(heap, own, opened) -> None:
+        if opened is not None:
+            heap.close_mem_handle(opened)
+        if own is not None:
+            heap.free_device_mem(own)
