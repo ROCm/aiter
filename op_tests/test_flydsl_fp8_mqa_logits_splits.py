@@ -171,12 +171,29 @@ class TestOccupancyLookup:
 
     @pytest.mark.parametrize("head_size", [64, 128])
     def test_gfx950_streaming_swp_variant_is_in_the_table(self, head_size):
-        """The SILOTIGER-1134 streaming path routes H<=32 to the ``_swp``
-        variant; a missing table row would make the first-launch occupancy
-        estimate fall to DEFAULT_OCCUPANCY and under-split. H=32 is the only
-        head count the 32x32-MFMA ``_swp`` family admits (H16 has no atom)."""
-        key = ("mfma32x32x64_bkv64_r2_w4_lds3_swp", 32, head_size)
-        assert key in occ_mod._MEASURED_OCCUPANCY["gfx950"]
+        """The SILOTIGER-1134 streaming path routes H<=32 to the ``_rs``
+        variant (``_swp`` before it); a missing table row would make the
+        occupancy estimate fall to DEFAULT_OCCUPANCY and under-split. H=32 is
+        the only head count the 32x32-MFMA family admits (H16 has no atom)."""
+        for tag in (
+            "mfma32x32x64_bkv64_r2_w4_lds3_swp",
+            "mfma32x32x64_bkv64_r2_w4_lds3_rs",
+        ):
+            assert (tag, 32, head_size) in occ_mod._MEASURED_OCCUPANCY["gfx950"]
+
+    def test_gfx950_auto_routes_are_in_the_table(self):
+        """Every tag ``_auto_variant`` can return on gfx950 needs a row for
+        every (H, D) it serves; a miss silently falls to DEFAULT_OCCUPANCY."""
+        table = occ_mod._MEASURED_OCCUPANCY["gfx950"]
+        for tag in (
+            "mfma32x32x64_bkv64_r1_w2_lds3_swp_rs_ls",
+            "mfma32x32x64_bkv64_r2_w2_lds3_swp_rs_ls",
+            "mfma32x32x64_bkv64_r2_w4_lds3_rs",
+            "mfma32x32x64_bkv64_r2_w4_lds3_swp_rs",
+        ):
+            for num_heads in (32, 64, 128):
+                for head_size in (64, 128):
+                    assert (tag, num_heads, head_size) in table
 
     def test_metadata_defers_to_table_when_shared_mem_per_cu_unavailable(self):
         """Some ROCm torch builds expose shared_memory_per_block but not the

@@ -440,6 +440,9 @@ if _ARCH == "gfx950":
             "mfma32x32x64_bkv64_r2_w4_lds3_rs": _mk_builder(
                 2, 4, mfma=_K64, bkv=64, lds=3, rs_head=True
             ),
+            "mfma32x32x64_bkv64_r2_w4_lds3_rs_ls": _mk_builder(
+                2, 4, mfma=_K64, bkv=64, lds=3, rs_head=True, lds_scales=True
+            ),
             "mfma32x32x64_bkv64_r2_w4_lds3_swp_rs": _mk_builder(
                 2, 4, mfma=_K64, bkv=64, lds=3, sw_pipe=True, rs_head=True
             ),
@@ -454,6 +457,31 @@ if _ARCH == "gfx950":
                 2,
                 4,
                 mfma=_K64,
+                bkv=64,
+                lds=3,
+                sw_pipe=True,
+                rs_head=True,
+                lds_scales=True,
+            ),
+            # H64/H128 routes (r1/r2 x w2) with the _rs/_ls epilogue.
+            **{
+                f"mfma32x32x64_bkv64_r{r}_w2_lds3{swp}_rs_ls": _mk_builder(
+                    r,
+                    2,
+                    mfma=_K64,
+                    bkv=64,
+                    lds=3,
+                    sw_pipe=bool(swp),
+                    rs_head=True,
+                    lds_scales=True,
+                )
+                for r in (1, 2)
+                for swp in ("", "_swp")
+            },
+            "mfma16x16x128_bkv64_r1_w2_lds3_swp_rs_ls": _mk_builder(
+                1,
+                2,
+                mfma=_K128,
                 bkv=64,
                 lds=3,
                 sw_pipe=True,
@@ -553,6 +581,21 @@ def _auto_variant(seq_len, seq_len_kv, num_heads):
 
     gfx950 H in (32, 128): mfma32x32x64 with r=2 for streaming / large-square
         shapes (KV pressure high), r=1 otherwise.
+
+    gfx950 epilogue (graph replay, LLC flush; vs the previous ``_swp`` / plain
+        ``_lds3`` routes):
+        H<=32 streaming takes ``_rs`` (permlane reduce-scatter head reduce, no
+        ``_swp``): with clean_logits it fits 128 VGPRs, i.e. 4 waves/SIMD where
+        ``_swp``/``_swp_rs`` need ~148 (3), and the streaming split count scales
+        with that occupancy. SILOTIGER-1134 shapes: 1.099 geomean with
+        clean_logits, 1.063 without (where it ties ``_swp_rs_ls``).
+        H<=32 non-streaming takes ``_swp_rs``: small grids (~1 block/CU) are
+        latency- not occupancy-bound and keep the pipelined accumulator reads;
+        squares 2048..16384: 1.051 geomean vs ``_swp`` (``_rs`` 1.042, and
+        0.976 at 2048^2). ``_ls`` measured neutral at H32.
+        H64/H128 take ``_swp_rs_ls`` (+ kv_scales staged in LDS): vs the plain
+        ``_lds3`` route, H64 1.045 / H128 1.020 with clean_logits, 1.041 /
+        1.026 without.
     """
     if _ARCH == "gfx942":
         rpb2_min_elems = 2**19
@@ -568,13 +611,15 @@ def _auto_variant(seq_len, seq_len_kv, num_heads):
         return f"mfma_r{rpb}_w{wpb}"
     if _ARCH == "gfx950":
         if num_heads >= 128:
-            return "mfma32x32x64_bkv64_r1_w2_lds3"
+            return "mfma32x32x64_bkv64_r1_w2_lds3_swp_rs_ls"
         streaming = seq_len_kv > 2 * seq_len
         large_square = seq_len >= 8192 and seq_len_kv >= seq_len
         if num_heads <= 32:
-            return "mfma32x32x64_bkv64_r2_w4_lds3_swp"
+            if streaming:
+                return "mfma32x32x64_bkv64_r2_w4_lds3_rs"
+            return "mfma32x32x64_bkv64_r2_w4_lds3_swp_rs"
         r = 2 if streaming or large_square else 1
-        return f"mfma32x32x64_bkv64_r{r}_w2_lds3"
+        return f"mfma32x32x64_bkv64_r{r}_w2_lds3_swp_rs_ls"
     raise NotImplementedError(
         f"fp8_mqa_logits has no FlyDSL variants for arch {_ARCH!r}; "
         "supported: gfx942, gfx950"
