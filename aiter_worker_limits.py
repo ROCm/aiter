@@ -438,30 +438,36 @@ def worker_ceiling(workers: int):
             os.environ[_WORKER_ENV] = previous
 
 
-def _get_legacy_worker_limit() -> int | None:
-    """Return a positive legacy MAX_JOBS ceiling, if one is configured."""
-    raw = os.environ.get(_LEGACY_WORKER_ENV)
+def _env_int(name: str) -> int | None:
+    """Return ``int(os.environ[name])``, or None when unset or unparseable."""
+    raw = os.environ.get(name)
     if raw is None:
         return None
     try:
-        jobs = int(raw)
+        return int(raw)
     except ValueError:
         return None
-    return jobs if jobs > 0 else None
+
+
+def _env_ceiling(name: str) -> int | None:
+    """Return a positive ceiling from env ``name``, or None when unusable."""
+    value = _env_int(name)
+    return None if value is None else max(1, value)
+
+
+def _get_legacy_worker_limit() -> int | None:
+    """Return a positive legacy MAX_JOBS ceiling, if one is configured."""
+    value = _env_int(_LEGACY_WORKER_ENV)
+    return value if value is not None and value > 0 else None
 
 
 def _get_worker_count(*, honor_legacy_max_jobs: bool) -> int:
     """Apply AITER's explicit ceiling to the current automatic worker budget."""
     cpu_budget, memory_budget, observation = _automatic_worker_snapshot()
-    configured_limit = None
-    raw = os.environ.get(_WORKER_ENV)
-    if raw is None and honor_legacy_max_jobs:
+    if os.environ.get(_WORKER_ENV) is None and honor_legacy_max_jobs:
         configured_limit = _get_legacy_worker_limit()
-    elif raw is not None:
-        try:
-            configured_limit = max(1, int(raw))
-        except ValueError:
-            pass
+    else:
+        configured_limit = _env_ceiling(_WORKER_ENV)
     _maybe_log_cgroup_memory_diagnostic(
         cpu_budget, memory_budget, configured_limit, observation
     )
@@ -521,13 +527,7 @@ def split_worker_budget(
 
 def _configured_worker_ceiling() -> int | None:
     """Return a positive ``AITER_MAX_JOBS`` ceiling, if one is configured."""
-    raw = os.environ.get(_WORKER_ENV)
-    if raw is None:
-        return None
-    try:
-        return max(1, int(raw))
-    except ValueError:
-        return None
+    return _env_ceiling(_WORKER_ENV)
 
 
 def _gpu_count_from_env() -> int | None:
@@ -604,13 +604,8 @@ def visible_gpu_count() -> int:
 
 def _gpu_workers_per_device() -> int:
     """Return the GPU workers allowed per visible device."""
-    raw = os.environ.get(_GPU_WORKERS_PER_DEVICE_ENV)
-    if raw is not None:
-        try:
-            return max(1, int(raw))
-        except ValueError:
-            pass
-    return EST_WORKERS_PER_GPU
+    ceiling = _env_ceiling(_GPU_WORKERS_PER_DEVICE_ENV)
+    return EST_WORKERS_PER_GPU if ceiling is None else ceiling
 
 
 def get_gpu_worker_count(work_count: int) -> int:
@@ -629,7 +624,7 @@ def get_gpu_worker_count(work_count: int) -> int:
     ceiling = _configured_worker_ceiling()
     if ceiling is not None:
         budget = min(budget, ceiling)
-    return max(1, min(budget, max(1, int(work_count))))
+    return _cap_worker_count(budget, work_count)
 
 
 def configure_worker_subprocesses() -> None:
