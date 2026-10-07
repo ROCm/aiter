@@ -448,6 +448,20 @@ def get_trace_perf(prof, num_iters):
 
 _CATASTROPHIC_REL_THRESHOLD = 0.5
 
+_STRICT_ALLCLOSE_ENV = "AITER_STRICT_ALLCLOSE"
+
+
+def _strict_allclose_default():
+    """CI switch that turns every ``checkAllclose`` verdict into a test failure.
+
+    ``assertAllclose`` already does this, but only for the call sites that have
+    been converted to it. This switch covers the rest without editing them, so a
+    CI job can run the existing suite as a gate rather than as a log.
+
+    Read at call time rather than import time so a single test can set it.
+    """
+    return os.environ.get(_STRICT_ALLCLOSE_ENV, "0") == "1"
+
 
 def _relmag_catastrophic(actual_max_delta, b):
     """Relative-magnitude catastrophic heuristic.
@@ -527,7 +541,17 @@ def checkAllclose(
     max_abs_delta=None,
     catastrophic_check=False,
     mask=None,
+    strict=None,
 ):
+    """``strict`` raises on the same mismatch this function already reports as
+    ``failed!``, instead of only logging it. ``None`` defers to
+    ``AITER_STRICT_ALLCLOSE``. It has no effect when ``printLog=False``: that is
+    the tuner's ranking path, which needs the ratio back rather than an
+    exception.
+    """
+    if strict is None:
+        strict = printLog and _strict_allclose_default()
+
     isClose = torch.isclose(a, b, rtol=rtol, atol=atol)
     # mask (bool, broadcastable to a/b): True = compare, False = ignore.
     # Error ratio is taken over the checked elements only.
@@ -623,6 +647,11 @@ def checkAllclose(
             raise AssertionError(
                 f"{msg}catastrophic error: max abs delta {actual_max_delta:.4f}, "
                 f"{percent:.1%} ({num} of {denom}) elements mismatch"
+            )
+        if strict and percent > tol_err_ratio:
+            raise AssertionError(
+                f"{msg}{percent:.1%} ({num} of {denom}) elements exceed "
+                f"{atol=} {rtol=}, max abs delta {actual_max_delta:.4f}"
             )
         return percent
 
