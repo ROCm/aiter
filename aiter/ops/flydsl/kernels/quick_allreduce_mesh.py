@@ -194,12 +194,13 @@ def mesh_st_ladder(world_size: int, link: str = "pcie"):
     return MESH_ST_LADDER.get((str(link), int(world_size)), ())
 
 
-# ``(link, world_size, arch) -> (relay_min_bytes, (num, den))``: from which
-# payload relay engines run, and the share of blocks they relay. Measured under
-# CUDA-graph replay on an idle node with the 4-bit wire at hidden size 5120, as
-# the speedup over the direct engine: 3/8 gives 1.33-1.41x from 20 to 120 MiB,
-# 1.18-1.20x over 5-10 MiB, 1.14x at 2.5 MiB, 1.04-1.09x from 0.5 to 1.25 MiB,
-# and loses below that. 1/4 and 1/2 are slower than 3/8 at every size from 5 MiB.
+# ``(link, world_size, arch) -> (relay_min_bytes, (num, den))``. Used only when
+# the caller passes ``relay_devices``; production dispatch does not. From which
+# payload those engines relay, and the share of blocks they relay. Measured
+# under CUDA-graph replay on an idle node with the 4-bit wire at hidden size
+# 5120, as the speedup over the direct engine: 3/8 gives about 1.4x from 20 to
+# 120 MiB, about 1.2x over 5-10 MiB, and loses below about 0.5 MiB. Cross-process
+# spread at 80 MiB is about 5%. 1/4 and 1/2 are slower than 3/8 from 5 MiB up.
 MESH_RELAY_DEFAULTS = {("xgmi", 2, "gfx950"): (480 << 10, (3, 8))}
 
 # Wire formats the mesh can build.
@@ -506,7 +507,23 @@ def make_quick_allreduce_mesh_kernel(
                     )
             return own
 
-        def _fanout_nt(phase, inbox_src, sub):
+        def _fanout(phase, inbox_src, sub):
+            """NT-store one rank-tile, branching on the relay once per fanout.
+
+            A per-store test of ``is_relay`` stops the LDS reads from being
+            issued ahead of the stores, on the direct blocks of a relay engine
+            as well as the relay blocks. ``to_bounce`` is a Python bool, so
+            each side specializes and the store itself does not branch.
+            """
+            if const_expr(relay is not None):
+                if is_relay:
+                    _fanout_nt(phase, inbox_src, sub, True)
+                else:
+                    _fanout_nt(phase, inbox_src, sub, False)
+            else:
+                _fanout_nt(phase, inbox_src, sub, False)
+
+        def _fanout_nt(phase, inbox_src, sub, to_bounce):
             """NT-store one rank-tile from LDS to every destination's inbox.
 
             Lockstep stripes of up to 8 sectors cover the rank-tile: at the
@@ -553,16 +570,13 @@ def make_quick_allreduce_mesh_kernel(
                             result_type=fx.Vector.make_type(4, fx.Int32),
                         )
                         wire_off = _sub_tile_i32(phase, inbox_src, sub) + wire_idx
-                        if const_expr(relay is not None):
-                            if is_relay:
-                                _buffer_store(
-                                    bounce_out,
-                                    wire_off,
-                                    v4,
-                                    cache_modifier=_RELAY_STORE_CM,
-                                )
-                            else:
-                                _store_peer(j, wire_off, v4)
+                        if const_expr(to_bounce):
+                            _buffer_store(
+                                bounce_out,
+                                wire_off,
+                                v4,
+                                cache_modifier=_RELAY_STORE_CM,
+                            )
                         else:
                             _store_peer(j, wire_off, v4)
 
@@ -703,7 +717,7 @@ def make_quick_allreduce_mesh_kernel(
                 atoms = _load_tile_atoms(tile)
                 _pack_reduce_scatter(atoms)
                 gpu.barrier()
-                _fanout_nt(PHASE_REDUCE_SCATTER, rank, fx.Int32(0))
+                _fanout(PHASE_REDUCE_SCATTER, rank, fx.Int32(0))
                 _publish(PHASE_REDUCE_SCATTER, rank, color)
 
                 _wait_release(PHASE_REDUCE_SCATTER, color)
@@ -716,7 +730,7 @@ def make_quick_allreduce_mesh_kernel(
 
                 own_ag = _pack_all_gather(acc)
                 gpu.barrier()
-                _fanout_nt(PHASE_ALL_GATHER, rank, fx.Int32(0))
+                _fanout(PHASE_ALL_GATHER, rank, fx.Int32(0))
                 _publish(PHASE_ALL_GATHER, rank, color)
 
                 _wait_release(PHASE_ALL_GATHER, color)
@@ -737,7 +751,7 @@ def make_quick_allreduce_mesh_kernel(
                     atoms = _load_tile_atoms(tile)
                     _pack_reduce_scatter(atoms)
                     gpu.barrier()
-                    _fanout_nt(PHASE_REDUCE_SCATTER, rank, s)
+                    _fanout(PHASE_REDUCE_SCATTER, rank, s)
                     if (s + fx.Int32(1)) < n_this:
                         # Drain this wave's LDS loads, then join the WG.
                         # world_size<8 leaves waves idle in fanout; without the
@@ -770,7 +784,7 @@ def make_quick_allreduce_mesh_kernel(
                         for k in range_constexpr(rank_atoms):
                             _store_atom(tile, self_rank * rank_atoms + k, own_ag[k])
                     gpu.barrier()
-                    _fanout_nt(PHASE_ALL_GATHER, rank, s)
+                    _fanout(PHASE_ALL_GATHER, rank, s)
                     if (s + fx.Int32(1)) < n_this:
                         rocdl.s_waitcnt(lgkmcnt=0)
                         gpu.barrier()
