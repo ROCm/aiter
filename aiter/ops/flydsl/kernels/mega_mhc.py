@@ -11,7 +11,9 @@ For T tokens, 4 residual streams and hidden size H, one launch computes
     post'  = sigmoid(mixes[4:8]  * rstd * s1 + b) * hc_post_mult
     comb'  = Sinkhorn(mixes[8:24] * rstd * s2 + b)
     x1     = sum_j pre_j * R'_j                             -> bf16
-    out    = x1 * rsqrt(mean(x1^2) + norm_eps) * w          -> bf16, or FP8 e4m3 group-32
+    out    = x1 * rsqrt(mean(x1^2) + norm_eps) * w          -> bf16
+    QUANT  = per-32 ue8m0 fp8 e4m3fn of the bf16 out: "grid" (bf16 on the fp8 grid) or
+             "mx" (fp8 codes + ue8m0 exponent bytes), written next to out by the finish
 
 with the same math and rounding points as the Triton seam
 (``aiter/ops/triton/fusions/mhc_fused_post_pre_delayed_rmsnorm.py``).
@@ -21,11 +23,10 @@ all four streams. Its warps split either those columns (``WARP_SPLIT="cols"``,
 reduced through LDS) or those tokens (``"tokens"``, sharing each k-step's fn tile
 through LDS). A warp walks its columns in k-steps of ``TILE_K`` for 16 tokens.
 
-Layouts. The streams (R, y, R', x1, FP8 out) are read and written in an
+Layouts. The streams (R, y, R', x1) are read and written in an
 elementwise layout: lane ``l`` owns token ``l // 4`` and 8 columns ``(l % 4) * 8`` of
 every 32-column chunk for all four streams, so 4 lanes cover 64 contiguous bytes of
-a row, and the post-mix, the collapse and the FP8 group amax are lane-local (plus
-two shuffles). The bf16 R' tile is moved through LDS into the A layout of
+a row, and the post-mix and the collapse are lane-local. The bf16 R' tile is moved through LDS into the A layout of
 ``mfma_f32_16x16x32_bf16`` (row = ``l % 16``) and multiplied against ``fn`` split into
 bf16 hi + lo, pre-packed by the wrapper in B-register order: 3 B operands per
 (chunk, stream), rows 16..23 hi and lo packed into one N tile (see ``N_FN_OPS``).
@@ -34,7 +35,7 @@ Finish. With ``NUM_KSPLIT == 1`` the workgroup finishes its own tokens. Otherwis
 each split writes one fp32 partial row per token ``[0:24] mixes, [24] sum R'^2,
 [25] sum x1^2`` and bumps the token block's counter; the last split to arrive sums
 the rows, computes the gates (16 lanes per token, Sinkhorn by row/column shuffles),
-rescales the staged bf16 ``x1`` in place (or only the FP8 scales) and re-arms the
+rescales the staged bf16 ``x1`` in place and re-arms the
 counter. All splits of a token block run on one XCD, so they share its L2: the
 finisher reads the other splits' writes with L1 bypass, ordered by workgroup-scope
 release/acquire fences around an agent-scope counter atomic.
@@ -53,7 +54,7 @@ k-steps keep the staged remainder on 128 B lines).
 fn load order (``FN_EARLY`` = e, default 4 = all). In the k-loop the first e streams of
 chunk 0's fn B operands are issued before the next k-step's R/y prefetch; the other
 streams (and chunk 1) are loaded just before their MFMAs. Fewer early streams cut the
-live VGPRs (fp8 bm16: 233 -> 197 at e = 1); only FP8 gains from it.
+live VGPRs.
 
 Distributed finish (``DIST_FINISH``, bf16, ``NUM_KSPLIT > 1``, ``BLOCK_M == 16``, column
 warps). The split-K finisher normally rescales the
@@ -97,9 +98,8 @@ bit-identical.
 128 B-line stream layout (``SEG128``, ``TILE_K == 64``). Lane ``l``
 owns token ``l // 8`` (unit 0) and ``8 + l // 8`` (unit 1) and 8 columns ``(l % 8) * 8`` of the
 64-column k-step, so 8 lanes cover a whole 128 B line and a dwordx4 is 8 rows x 128 B; the
-two units replace the two 32-column chunks (same load / store count). Post-mix, collapse and
-the FP8 group-32 amax (lanes ``l % 8`` in 0..3 or 4..7) stay lane-local plus two shuffles;
-two group scales per row and k-step. Each lane carries the gates of both its tokens. The row
+two units replace the two 32-column chunks (same load / store count). Post-mix and collapse
+stay lane-local; a 32-column group is lanes ``l % 8`` in 0..3 or 4..7. Each lane carries the gates of both its tokens. The row
 sums reproduce the 64 B order exactly: lanes ``l % 8 >= 4`` add the partial of lane ``l - 4``
 (one DPP ``row_shr:4`` per k-step) before their own, then reduce over 4 lanes as before, so
 every output is bit-identical to the 64 B layout. The MFMA A transpose writes, per chunk,
@@ -107,7 +107,7 @@ both units of the lanes holding that chunk into the usual slots (``token * 4 + g
 other lanes write a shared dummy area (4 KiB), so the transpose takes 4 instead of 2
 ``ds_write_b128`` per stream and k-step and no VALU. The x1 stage keeps its 1 KiB slots, one
 per (k-step, unit), so ``X1_LDS_SLOTS`` must be even. ``NT_LD`` / ``NT_ST`` set the nt hint
-on the stream loads (R, y) / stores (R', FP8 q) separately.
+on the stream loads (R, y) / stores (R') separately.
 """
 
 import functools
@@ -136,7 +136,10 @@ N_STREAMS = 4
 N_MIX = 24
 PSLOT = 32  # partial row: [0:24] mixes, [24] sum R'^2, [25] sum x1^2
 FP8_GROUP = 32
-
+FP8_MAX = 448.0
+# layer-input outputs next to the bf16 norm: none, the norm on the per-32 ue8m0 fp8 grid
+# (bf16), or its fp8 e4m3fn codes + ue8m0 exponent bytes (MXFP8)
+QUANTS = ("none", "grid", "mx")
 # buffer cache policy bits (gfx950): sc0 = 1, nt = 2
 CM_NT = 2
 CM_L1_BYPASS = 1  # sc0: miss the CU's L1, hit the XCD's L2
@@ -194,6 +197,125 @@ XDUMMY_INTS = 2 * N_STREAMS * 128
 DPP_ROW_SHR4 = 0x114
 
 
+def ue8m0_quant(y_bf, with_grid: bool, scaled_cvt: bool = True):
+    """Per-32 ue8m0 fp8 e4m3fn quantization of a bf16x8 unit whose group is this lane's
+    DPP quad (``fp8_grid_quant`` of SGLang's mxfp8_amd_gfx95): scale = smallest power of
+    two >= max(amax, 1e-10) / 448. Returns (fp8 codes i32x2, exponent byte, grid i32x4 =
+    codes * scale as bf16, or None).
+
+    No clamp to +-448: scale >= amax * fl(1/448) bounds |y / scale| by 448 * (1 + 2^-23),
+    which rounds to 448. ``scaled_cvt``: gfx950 ``v_cvt_scalef32_pk_fp8_bf16`` divides
+    the bf16 pair by the power-of-two scale and converts in one instruction (and its
+    inverse builds the grid); otherwise y * 2^(127 - e) (finite bf16 keeps e <= 247, so
+    (254 - e) << 23 is a normal float) and ``v_cvt_pk_fp8_f32``."""
+    F32, BF16 = fx.Float32, fx.BFloat16
+    yw = Vec(y_bf).bitcast(I32)
+    # each dword holds 2 bf16: their f32 values are the high half and the low half << 16
+    # (widening the bf16 vector instead re-rounds every element from its f32 source)
+    yf = []
+    for k in range_constexpr(4):
+        yf += [(yw[k] << I32(16)).bitcast(F32), (yw[k] & I32(-65536)).bitcast(F32)]
+    amax = fx.absf(yf[0])
+    for e in range_constexpr(1, 8):
+        amax = fx.max(amax, fx.absf(yf[e]))
+    amax = fx.max(amax, dpp_xor_f32(amax, 1))
+    amax = fx.max(amax, dpp_xor_f32(amax, 2))
+    bits = (fx.max(amax, F32(1e-10)) * F32(1.0 / FP8_MAX)).bitcast(I32)
+    # exponent field rounded up unless the mantissa is 0 (bits > 0: no sign, no carry out)
+    ex = fx.min(fx.max((bits + I32(0x7FFFFF)) >> I32(23), I32(1)), I32(254))
+    scale = (ex << I32(23)).bitcast(F32)
+    if scaled_cvt:
+        dw = []
+        for d in range_constexpr(2):
+            pk = Vec.filled(2, 0, fx.Int16).ir_value()
+            for half in range_constexpr(2):
+                src = Vec.from_elements([yw[2 * d + half]], I32).bitcast(BF16)
+                pk = rocdl.cvt_scalef32_pk_fp8_bf16(
+                    T.vec(2, T.i16), pk, src.ir_value(), scale.ir_value(), half
+                )
+            dw.append(Vec(pk).bitcast(I32)[0])
+    else:
+        inv = ((I32(254) - ex) << I32(23)).bitcast(F32)
+        q = [yf[e] * inv for e in range_constexpr(8)]
+        dw = []
+        for d in range_constexpr(2):
+            pk = rocdl.cvt_pk_fp8_f32(
+                T.i32,
+                q[4 * d].ir_value(),
+                q[4 * d + 1].ir_value(),
+                I32(0).ir_value(),
+                0,
+            )
+            pk = rocdl.cvt_pk_fp8_f32(
+                T.i32, q[4 * d + 2].ir_value(), q[4 * d + 3].ir_value(), pk, 1
+            )
+            dw.append(I32(pk))
+    grid = None
+    if with_grid and scaled_cvt:
+        g = []
+        for d in range_constexpr(2):
+            for half in range_constexpr(2):
+                pr = rocdl.cvt_scalef32_pk_bf16_fp8(
+                    T.vec(2, T.bf16), dw[d].ir_value(), scale.ir_value(), half
+                )
+                g.append(Vec(pr).bitcast(I32)[0])
+        grid = Vec.from_elements(g, I32)
+    elif with_grid:
+        g = []
+        for d in range_constexpr(2):
+            for half in range_constexpr(2):
+                pr = Vec(rocdl.cvt_pk_f32_fp8(T.vec(2, T.f32), dw[d].ir_value(), half))
+                g += [pr[0] * scale, pr[1] * scale]
+        grid = Vec.from_elements(g, F32).to(BF16).bitcast(I32)
+    return Vec.from_elements(dw, I32), ex, grid
+
+
+@functools.cache
+def compile_ue8m0_probe(with_grid: bool, scaled_cvt: bool):
+    """Test hook: ``ue8m0_quant`` over a flat bf16 tensor, one 16 B unit per lane (a
+    32-column group per DPP quad, as in the kernel's finish); returns the launcher
+    ``(x, codes, exps, grid, n_units, stream)``."""
+    from aiter.ops.flydsl.kernels.tensor_shim import buf_copy_load as _ld_u
+    from aiter.ops.flydsl.kernels.tensor_shim import buf_copy_store as _st_u
+
+    @flyc.kernel(name=f"ue8m0_probe_g{int(with_grid)}_s{int(scaled_cvt)}")
+    def probe(
+        x: fx.Pointer,
+        codes: fx.Pointer,
+        exps: fx.Pointer,
+        grid: fx.Pointer,
+        n_u: fx.Int32,
+    ):
+        idx = I32(fx.block_idx.x) * 256 + I32(fx.thread_idx.x)
+        nb = fx.Int64(n_u)
+        x_t = ptr_buf_tensor(x, I32, unit_elems=4, num_records_bytes=nb * 16)
+        c_t = ptr_buf_tensor(codes, I32, unit_elems=2, num_records_bytes=nb * 8)
+        e_t = ptr_buf_tensor(exps, fx.Int8, num_records_bytes=nb // 4)
+        g_t = ptr_buf_tensor(grid, I32, unit_elems=4, num_records_bytes=nb * 16)
+        y = Vec(_ld_u(x_t, idx, I32, 4)).bitcast(fx.BFloat16)
+        dw, ex, gr = ue8m0_quant(y, with_grid, scaled_cvt)
+        _st_u(c_t, idx, dw, I32, 2)
+        _st_u(e_t, (idx % 4 == 0).select(idx // 4, n_u), fx.Int8(ex), fx.Int8, 1)
+        if fx.const_expr(with_grid):
+            _st_u(g_t, idx, gr, I32, 4)
+
+    @flyc.jit
+    def launch(
+        x: fx.Pointer,
+        codes: fx.Pointer,
+        exps: fx.Pointer,
+        grid: fx.Pointer,
+        n_u: fx.Int32,
+        n_wg: fx.Int32,
+        stream: fx.Stream,
+    ):
+        probe(x, codes, exps, grid, n_u).launch(
+            grid=(n_wg, 1, 1), block=(256, 1, 1), stream=stream
+        )
+
+    return launch
+
+
 def smem_bytes(H: int, cfg: dict) -> int:
     """Static LDS bytes of the kernel for a knob set (the ``Smem`` struct plus the
     ``X1_LDS_SLOTS`` x1 stage: W * slots + 1 dummy slot, 1 KiB each)."""
@@ -227,7 +349,7 @@ def max_x1_lds_slots(H: int, cfg: dict) -> int:
     return best
 
 
-def check_config(H: int, cfg: dict, out_fp8: bool = False) -> None:
+def check_config(H: int, cfg: dict) -> None:
     """Raise a ValueError naming the first violated legality rule of a knob set."""
     bm, ws, w = cfg["BLOCK_M"], cfg["WARP_SPLIT"], cfg["WARPS_PER_WG"]
     ks, tk = cfg["NUM_KSPLIT"], cfg["TILE_K"]
@@ -286,8 +408,6 @@ def check_config(H: int, cfg: dict, out_fp8: bool = False) -> None:
                 "SEG128 stages x1 by whole k-steps: X1_LDS_SLOTS must be even"
             )
     if cfg.get("DIST_FINISH"):
-        if out_fp8:
-            raise ValueError("DIST_FINISH is a bf16 finish (FP8 only rescales scales)")
         if ks < 2 or ks > DIST_MAX_KS:
             raise ValueError(
                 f"DIST_FINISH needs 2 <= NUM_KSPLIT <= {DIST_MAX_KS}, got {ks}"
@@ -350,14 +470,14 @@ def dist_residency_error(T: int, cfg: dict, cu_num: int) -> str | None:
     return None
 
 
-def kernel_name(cfg: dict, has_post: bool, identity_pre: bool, out_fp8: bool) -> str:
+def kernel_name(cfg: dict, has_post: bool, identity_pre: bool, quant: str) -> str:
     mode = "post" if has_post else "nopost"
     if identity_pre:
         mode += "_idpre"
     return (
         f"mega_mhc_bm{cfg['BLOCK_M']}_{cfg['WARP_SPLIT']}_w{cfg['WARPS_PER_WG']}"
         f"_k{cfg['NUM_KSPLIT']}_t{cfg['TILE_K']}"
-        f"_{mode}_{'fp8' if out_fp8 else 'bf16'}"
+        f"_{mode}_{'bf16' if quant == 'none' else quant}"
         + (f"_x1l{cfg['X1_LDS_SLOTS']}" if cfg.get("X1_LDS_SLOTS") else "")
         + (
             "_dist"
@@ -405,9 +525,8 @@ def compile_mega_mhc(
     TILE_K: int,
     HAS_POST: bool,
     IDENTITY_PRE: bool,
-    OUT_FP8: bool,
     SINKHORN_ITERS: int,
-    FP8_MAX: float = 448.0,
+    QUANT: str = "none",
     X1_LDS_SLOTS: int = 0,
     PERSIST_WGS: int = 0,
     FN_EARLY: int = N_STREAMS,
@@ -437,7 +556,8 @@ def compile_mega_mhc(
         "NT_LD": NT_LD,
         "NT_ST": NT_ST,
     }
-    check_config(H, cfg, OUT_FP8)
+    check_config(H, cfg)
+    assert QUANT in QUANTS, QUANT
     assert H % FP8_GROUP == 0 and SINKHORN_ITERS >= 1
 
     W = WARPS_PER_WG
@@ -455,10 +575,10 @@ def compile_mega_mhc(
     NK = COLS_W // TILE_K  # k-steps per warp
     NQ = COLS_W // 32  # 32-column chunks per warp
     HO_UNITS = BM * COLS_WG // 8  # 16 B units of one split's x1 (hand-off rescale)
-    # bf16 only: the first X1L chunks of every warp's x1 stay in LDS for the finish
-    # instead of being staged in HBM and re-read (the FP8 finish never re-reads).
+    # the first X1L chunks of every warp's x1 stay in LDS for the finish instead of
+    # being staged in HBM and re-read
     DIST = bool(DIST_FINISH)
-    X1L = NQ if DIST else (0 if OUT_FP8 else X1_LDS_SLOTS)
+    X1L = NQ if DIST else X1_LDS_SLOTS
     # Persistent walk: the grid is capped at PERSIST_WGS workgroups, each walking the
     # token blocks w, w + G, ...; the next block's first R/y tile is loaded during this
     # block's last k-step and carried through its reduce and finish.
@@ -476,7 +596,7 @@ def compile_mega_mhc(
     FIN_PASSES = max(1, BM // (4 * W))
     FIN_WARPS = min(W, BM // 4)  # warps that hold tokens in the finish
     cm_ld = CM_NT if NT_LD else 0  # R, y loads
-    cm_st = CM_NT if NT_ST else 0  # R' and FP8 q stores (staged bf16 x1 is re-read)
+    cm_st = CM_NT if NT_ST else 0  # R' stores (staged bf16 x1 is re-read)
     # SEG128 (TILE_K == 64): the NC = 2 "chunks" of a k-step are its two 8-row units
     NGT = 2 if SEG128 else 1  # tokens per lane and m-tile (gates, row sums)
     # Prepacked fn: [H/32 chunk][stream][op][lane][8] bf16, one 1 KiB B operand per
@@ -489,7 +609,7 @@ def compile_mega_mhc(
     FN_LDS = WARP_SPLIT == "tokens" and WARPS_PER_WG > 1
     FN_PER_WARP = -(-NOPS // WARPS_PER_WG)
     fn_units = (H // 32) * N_STREAMS * N_FN_OPS * WAVE
-    name = kernel_name(cfg, HAS_POST, IDENTITY_PRE, OUT_FP8)
+    name = kernel_name(cfg, HAS_POST, IDENTITY_PRE, QUANT)
 
     @fx.struct
     class Smem:
@@ -570,8 +690,8 @@ def compile_mega_mhc(
         hc_base: fx.Pointer,  # (24,) fp32
         norm_w: fx.Pointer,  # (H,) bf16
         residual_out: fx.Pointer,  # (T, 4, H) bf16            [HAS_POST]
-        out: fx.Pointer,  # (T, H) bf16, or fp8 bytes
-        out_scale: fx.Pointer,  # (T, H/32) fp32              [OUT_FP8]
+        out: fx.Pointer,  # (T, H) bf16 norm
+        out_q: fx.Pointer,  # grid: (T, H) bf16; mx: (T, H) fp8 codes + (T, H/32) e8m0
         post_out: fx.Pointer,  # (T, 4) fp32
         comb_out: fx.Pointer,  # (T, 16) fp32
         pre_out: fx.Pointer,  # (T, 4) fp32
@@ -620,13 +740,22 @@ def compile_mega_mhc(
             LT.scale_t = ptr_buf_tensor(hc_scale, F32, num_records_bytes=12)
             LT.base_t = ptr_buf_tensor(hc_base, F32, num_records_bytes=N_MIX * 4)
             LT.w_t = ptr_buf_tensor(norm_w, I32, unit_elems=4, num_records_bytes=H * 2)
-            if fx.const_expr(OUT_FP8):
-                LT.osc_t = ptr_buf_tensor(
-                    out_scale, F32, num_records_bytes=nt64 * (NG * 4)
+            LT.out_t = ptr_buf_tensor(
+                out, I32, unit_elems=4, num_records_bytes=nt64 * (H * 2)
+            )
+            if fx.const_expr(QUANT == "grid"):
+                LT.qg_t = ptr_buf_tensor(
+                    out_q, I32, unit_elems=4, num_records_bytes=nt64 * (H * 2)
                 )
-            else:
-                LT.out_t = ptr_buf_tensor(
-                    out, I32, unit_elems=4, num_records_bytes=nt64 * (H * 2)
+            if fx.const_expr(QUANT == "mx"):
+                # one 8 B unit of codes per 16 B norm unit; the exponents follow the codes
+                LT.qc_t = ptr_buf_tensor(
+                    out_q, I32, unit_elems=2, num_records_bytes=nt64 * H
+                )
+                LT.qe_t = ptr_buf_tensor(
+                    buf_base_i64(out_q) + nt64 * H,
+                    fx.Int8,
+                    num_records_bytes=nt64 * NG,
                 )
             LT.posto_t = ptr_buf_tensor(post_out, F32, num_records_bytes=nt64 * 16)
             LT.combo_t = ptr_buf_tensor(comb_out, F32, num_records_bytes=nt64 * 64)
@@ -702,11 +831,7 @@ def compile_mega_mhc(
                 RS.rout = rs_rows(residual_out, K4 * 2)
 
             def make_rs_x1():
-                if fx.const_expr(OUT_FP8):
-                    RS.q = rs_rows(out, H)
-                    RS.sc = rs_rows(out_scale, NG * 4)
-                else:
-                    RS.x1 = rs_rows(out, H * 2)
+                RS.x1 = rs_rows(out, H * 2)
 
             def make_rs_w():
                 RS.w = rs_flat(norm_w, H * 2)
@@ -729,7 +854,7 @@ def compile_mega_mhc(
                 make_rs_w()
                 make_late()
 
-            # The streams (R, y, R', x1, fp8 out) use the elementwise layout: 4
+            # The streams (R, y, R', x1) use the elementwise layout: 4
             # consecutive lanes cover 64 contiguous bytes of one token row, so a
             # dwordx4 is 16 coalesced 64 B segments. Only the bf16 R' MFMA A operand
             # is moved to the MFMA layout (row = lane % 16), through LDS.
@@ -738,13 +863,6 @@ def compile_mega_mhc(
             v_r = tokv * (K4 * 2) + ekg * 16  # residual / residual_out
             v_y = tokv * (H * 2) + ekg * 16  # sublayer / staged x1
             v_fn = lane * 16
-            v_q = tokv * H + ekg * 8
-            if fx.const_expr(SEG128):
-                # two 32-column group scales per row: lanes l % 8 == 0 and 4 store them
-                v_sc = (ekg % 4 == 0).select(tokv * (NG * 4) + (ekg // 4) * 4, OOB)
-            else:
-                v_sc = (ekg == 0).select(tokv * (NG * 4), OOB)
-            v_w = ekg * 16
             # LDS transpose: lane e writes slot e, MFMA lane m reads slot (m%16)*4 + m//16
             xp_base = wi * (N_STREAMS * WAVE * 4)
             if fx.const_expr(SEG128):
@@ -901,12 +1019,8 @@ def compile_mega_mhc(
                 sqx = list(sqx)
                 rn_all = {}  # (c, mt) -> 4 bf16x8 R' streams
                 st_r = {}  # (mt, jj) -> [c] R' units to store
-                st_x = {}  # mt -> [c] x1 / fp8 units to store
+                st_x = {}  # mt -> [c] x1 units to store
                 for c in range_constexpr(NC):
-                    cb = chunk_col(iv, c)
-                    # SEG128: both units of a k-step share the lane's 8 columns
-                    if fx.const_expr(OUT_FP8 and (c == 0 or not SEG128)):
-                        wv = bf16x8(_ld(RS.w, v_w, cb * 2, 4, 0)).to(F32)
                     for mt in range_constexpr(MT):
                         gi = mt * NGT + (c if SEG128 else 0)  # gates / sums of the unit
                         g = gates[gi]
@@ -972,40 +1086,7 @@ def compile_mega_mhc(
                             sqx[gi] = (sqx[gi] + from_lane_m4(a_x)) + a_x
                         else:
                             sqx[mt] = sqx[mt] + a_x
-                        if fx.const_expr(OUT_FP8):
-                            v = x1f * wv
-                            amax = F32(0.0)
-                            for e in range_constexpr(8):
-                                amax = fx.max(amax, fx.absf(v[e]))
-                            amax = fx.max(amax, amax.shuffle_xor(1, WAVE))
-                            amax = fx.max(amax, amax.shuffle_xor(2, WAVE))
-                            zero = amax == F32(0.0)
-                            scale = zero.select(F32(1.0), amax * F32(1.0 / FP8_MAX))
-                            inv = zero.select(F32(0.0), F32(FP8_MAX) * rcp(amax))
-                            q = v * inv
-                            dw = []
-                            for d in range_constexpr(2):
-                                pk = I32(0).ir_value()
-                                pk = rocdl.cvt_pk_fp8_f32(
-                                    T.i32,
-                                    q[4 * d].ir_value(),
-                                    q[4 * d + 1].ir_value(),
-                                    pk,
-                                    0,
-                                )
-                                pk = rocdl.cvt_pk_fp8_f32(
-                                    T.i32,
-                                    q[4 * d + 2].ir_value(),
-                                    q[4 * d + 3].ir_value(),
-                                    pk,
-                                    1,
-                                )
-                                dw.append(I32(pk))
-                            st_x.setdefault(mt, []).append(
-                                (Vec.from_elements(dw, I32), scale)
-                            )
-                        else:
-                            st_x.setdefault(mt, []).append(as_i32x4(x1_bf))
+                        st_x.setdefault(mt, []).append(as_i32x4(x1_bf))
                 cb0 = chunk_col(iv, 0)
                 for mt in range_constexpr(MT):
                     if fx.const_expr(HAS_POST):
@@ -1026,27 +1107,10 @@ def compile_mega_mhc(
                             cb = cb0 + c * 8 * H
                         else:
                             cb = cb0 + c * 32
-                        if fx.const_expr(OUT_FP8):
-                            qv, scale = st_x[mt][c]
-                            _st(qv, RS.q, v_q, cb + mt * 16 * H, cm_st)
-                            if fx.const_expr(SEG128):
-                                so_sc = (cb0 // FP8_GROUP) * 4 + (
-                                    mt * 16 + c * 8
-                                ) * NG * 4
-                            else:
-                                so_sc = (cb // FP8_GROUP) * 4 + mt * 16 * NG * 4
-                            _st(scale, RS.sc, v_sc, so_sc, 0)
+                        if fx.const_expr(X1L > 0):
+                            stage_x1(iv, c, mt, st_x[mt][c], cb)
                         else:
-                            if fx.const_expr(X1L > 0):
-                                stage_x1(iv, c, mt, st_x[mt][c], cb)
-                            else:
-                                _st(
-                                    st_x[mt][c],
-                                    RS.x1,
-                                    v_y,
-                                    (cb + mt * 16 * H) * 2,
-                                    0,
-                                )
+                            _st(st_x[mt][c], RS.x1, v_y, (cb + mt * 16 * H) * 2, 0)
                 for c in range_constexpr(NC):
                     if fx.const_expr(FN_LDS):
                         ops_c = fns[
@@ -1297,9 +1361,30 @@ def compile_mega_mhc(
                         if fx.const_expr(with_rstd):
                             _put(rstdn, tl, fx.rsqrt(s_x * F32(1.0 / H) + norm_eps))
 
-                RS_G = 4  # rescale units in flight per thread (16 measured slower)
+                # rescale units in flight per thread (16 measured slower). With QUANT a
+                # split-K finisher (one 16-token block) takes 2: at decode most of 4 are
+                # dead units, and each still runs the dependent ue8m0 chain (T = 1: 0.6 us)
+                RS_G = 2 if QUANT != "none" and KS > 1 else 4
                 # the finish only walks the token rows that exist (decode: T < BLOCK_M)
                 rows_valid = (n_tok - tok0 < I32(BM)).select(n_tok - tok0, I32(BM))
+
+                def store_unit(idx, r_o):
+                    """Store 16 B unit idx of the (T, H / 8) norm output (dead units: an
+                    out-of-range idx) and, with QUANT, its ue8m0 outputs at the same unit;
+                    the 4 lanes of a 32-column group are a DPP quad in every finish path.
+                    """
+                    y_bf = r_o.to(BF16)
+                    buf_copy_store(LT.out_t, idx, as_i32x4(y_bf), I32, 4)
+                    # cached, not nt: the consumer GEMM reads them next (seam + GEMM
+                    # measured faster cached at T = 2048..8192)
+                    if fx.const_expr(QUANT != "none"):
+                        codes, ex, grid = ue8m0_quant(y_bf, QUANT == "grid")
+                        if fx.const_expr(QUANT == "grid"):
+                            buf_copy_store(LT.qg_t, idx, grid, I32, 4)
+                        else:
+                            buf_copy_store(LT.qc_t, idx, codes, I32, 2)
+                            e_idx = (idx % 4 == 0).select(idx // 4, n_tok * NG)
+                            buf_copy_store(LT.qe_t, e_idx, fx.Int8(ex), fx.Int8, 1)
 
                 # bf16 rescale of the x1 chunks this warp kept in LDS: lane-local, in the
                 # layout they were produced in (token erow, 8 columns ekg * 8 of a chunk;
@@ -1357,20 +1442,12 @@ def compile_mega_mhc(
                             r_o = (bf16x8(xs[q]).to(F32) * rs_e[q % 2]) * bf16x8(
                                 wv[q]
                             ).to(F32)
-                            buf_copy_store(
-                                LT.out_t, x1_unit(q), as_i32x4(r_o.to(BF16)), I32, 4
-                            )
+                            store_unit(x1_unit(q), r_o)
                     else:
                         c8_0 = col_w // 8 + ekg
                         for q in range_constexpr(X1L):
                             r_o = (bf16x8(xs[q]).to(F32) * rs_e) * bf16x8(wv[q]).to(F32)
-                            buf_copy_store(
-                                LT.out_t,
-                                (tok0 + erow) * H8 + c8_0 + q * 4,
-                                as_i32x4(r_o.to(BF16)),
-                                I32,
-                                4,
-                            )
+                            store_unit((tok0 + erow) * H8 + c8_0 + q * 4, r_o)
 
                 def rescale_x1_lds():
                     if fx.const_expr(SEG128):
@@ -1404,7 +1481,7 @@ def compile_mega_mhc(
                 def hbm_st(tl_g, c8, idx, xv):
                     r_wv = bf16x8(buf_copy_load(LT.w_t, c8, I32, 4)).to(F32)
                     r_o = (bf16x8(xv).to(F32) * rstdn[tl_g]) * r_wv
-                    buf_copy_store(LT.out_t, idx, as_i32x4(r_o.to(BF16)), I32, 4)
+                    store_unit(idx, r_o)
 
                 def rescale_x1_hbm(rtid, NTHR):
                     n_u = rows_valid * RT
@@ -1436,38 +1513,10 @@ def compile_mega_mhc(
                         hbm_st(units[g][0], units[g][1], units[g][2], r_xv[g])
 
                 def finish_rescale(rtid, NTHR):
-                    if fx.const_expr(OUT_FP8):
-                        n_el = rows_valid * NG
-                        for r_it in range(
-                            I32(0), (n_el + NTHR * RS_G - 1) // (NTHR * RS_G), I32(1)
-                        ):
-                            r_idx, r_tl, r_sv = [], [], []
-                            for g in range_constexpr(RS_G):
-                                r_u = (I32(r_it) * RS_G + g) * NTHR + rtid
-                                r_live = r_u < n_el
-                                tl_g = r_live.select(r_u // NG, I32(0))
-                                r_tl.append(tl_g)
-                                r_idx.append(
-                                    r_live.select(
-                                        (tok0 + tl_g) * NG + r_u % NG, n_tok * NG
-                                    )
-                                )
-                                r_sv.append(
-                                    buf_copy_load(
-                                        LT.osc_t,
-                                        r_idx[g],
-                                        F32,
-                                        1,
-                                        cache_modifier=CM_L1_BYPASS,
-                                    )
-                                )
-                            for g in range_constexpr(RS_G):
-                                _put(LT.osc_t, r_idx[g], r_sv[g] * rstdn[r_tl[g]])
+                    if fx.const_expr(X1L > 0):
+                        rescale_x1_split(rtid, NTHR)
                     else:
-                        if fx.const_expr(X1L > 0):
-                            rescale_x1_split(rtid, NTHR)
-                        else:
-                            rescale_x1_hbm(rtid, NTHR)
+                        rescale_x1_hbm(rtid, NTHR)
 
                 def finish():
                     if fx.const_expr(FIN_WARPS < W):
@@ -1636,13 +1685,7 @@ def compile_mega_mhc(
                                             buf_copy_load(LT.w_t, c8_h, I32, 4)
                                         ).to(F32)
                                         r_h = (x_h * x1_rstd(tl_h)) * w_h
-                                        buf_copy_store(
-                                            LT.out_t,
-                                            idx_h,
-                                            as_i32x4(r_h.to(BF16)),
-                                            I32,
-                                            4,
-                                        )
+                                        store_unit(idx_h, r_h)
                     else:
                         xs, wv = load_x1_lds()
                         gen = old_w >> I32(8)
@@ -1773,7 +1816,7 @@ def compile_mega_mhc(
         norm_w: fx.Pointer,
         residual_out: fx.Pointer,
         out: fx.Pointer,
-        out_scale: fx.Pointer,
+        out_q: fx.Pointer,
         post_out: fx.Pointer,
         comb_out: fx.Pointer,
         pre_out: fx.Pointer,
@@ -1803,7 +1846,7 @@ def compile_mega_mhc(
             norm_w,
             residual_out,
             out,
-            out_scale,
+            out_q,
             post_out,
             comb_out,
             pre_out,

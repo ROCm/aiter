@@ -12,7 +12,11 @@ Four tables:
   test_mega_mhc_dist     DIST_FINISH bit-exact against the classic finisher, also with
                          forced hand-off (DIST_SPIN=0) and on two streams at once.
   test_mega_mhc_late     LATE_DESC and SHUFFLE_DPP bit-exact against the same
-                         knob set without them, classic and distributed finisher, bf16 and FP8.
+                         knob set without them, classic and distributed finisher.
+  test_mega_mhc_capture  CUDA-graph capture safety (cold capture, scratch growth).
+
+Every table runs each out_dtype: bf16, fp8_grid and mxfp8; the ue8m0 outputs must equal
+``ue8m0_quant`` of the kernel's own bf16 norm to the bit.
 """
 
 import argparse
@@ -130,17 +134,39 @@ def _call_kwargs(mode, T, H, seed=0):
     return args, dict(kw, pre_mix=pre), ref
 
 
-def _fp8_parts(li_f32):
-    """Reference group-32 FP8 scale for the normalized layer input."""
-    T, H = li_f32.shape
-    amax = li_f32.view(T, H // 32, 32).abs().amax(-1)
-    fmax = torch.finfo(dtypes.fp8).max
-    return torch.where(amax > 0, amax / fmax, torch.ones_like(amax))
+def ue8m0_quant(y):
+    """SGLang's per-32 ue8m0 fp8 rule (``fp8_grid_quant``) on a (T, H) bf16 tensor:
+    (fp8 e4m3fn codes, uint8 exponents (T, H/32), bf16 grid = codes * scale)."""
+    T, H = y.shape
+    yg = y.float().view(T, H // 32, 32)
+    bits = (yg.abs().amax(-1).clamp_min(1e-10) * (1.0 / 448.0)).view(torch.int32)
+    e = (((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).int()).clamp(1, 254)
+    scale = (e << 23).view(torch.float32).unsqueeze(-1)
+    q = (yg / scale).clamp(-448.0, 448.0).to(dtypes.fp8)
+    grid = (q.float() * scale).to(torch.bfloat16)
+    return q.view(T, H), e.to(torch.uint8), grid.view(T, H)
+
+
+_QUANT_EXTRA_BYTES = {"bf16": 0, "fp8_grid": 2, "mxfp8": 1 + 1 / 32}
+
+
+def _clone(out):
+    return [
+        tuple(t.clone() for t in x) if isinstance(x, tuple) else x.clone() for x in out
+    ]
+
+
+def _same(a, b):
+    if isinstance(a, tuple):
+        return all(torch.equal(x, y) for x, y in zip(a, b))
+    return torch.equal(a, b)
 
 
 def check_outputs(name, out, ref, out_dtype, mode):
-    """All per-output checks; returns the worst mismatch ratio."""
+    """All per-output checks; returns the worst mismatch ratio. The ue8m0 outputs must
+    be the rule applied to the kernel's own bf16 norm, to the bit."""
     R, post_o, comb_o, li, pre_o = out
+    norm = li if out_dtype == "bf16" else li[0]
     errs = []
     if mode != "no_post":
         errs.append(
@@ -168,22 +194,37 @@ def check_outputs(name, out, ref, out_dtype, mode):
                 msg=f"{name}: {tag} ",
             )
         )
-    if out_dtype == "bf16":
-        # a one-ulp rounding difference in R' carries into the collapse
-        errs.append(
-            checkAllclose(
-                ref[3].float(),
-                li.float(),
-                rtol=1e-2,
-                atol=2e-2,
-                tol_err_ratio=0.0,
-                msg=f"{name}: layer_input ",
-            )
+    # a one-ulp rounding difference in R' carries into the collapse
+    errs.append(
+        checkAllclose(
+            ref[3].float(),
+            norm.float(),
+            rtol=1e-2,
+            atol=2e-2,
+            tol_err_ratio=0.0,
+            msg=f"{name}: layer_input ",
         )
-    else:
-        q, s = li
-        T, H = q.shape
-        deq = (q.float().view(T, H // 32, 32) * s.unsqueeze(-1)).view(T, H)
+    )
+    if out_dtype != "bf16":
+        q_r, e_r, grid_r = ue8m0_quant(norm)
+        if out_dtype == "fp8_grid":
+            exact = [(grid_r.float(), li[1].float(), "grid")]
+            deq = li[1].float()
+        else:
+            q, e = li[1], li[2]
+            exact = [
+                (q_r.view(torch.uint8).float(), q.view(torch.uint8).float(), "codes"),
+                (e_r.float(), e.float(), "e8m0"),
+            ]
+            T, H = q.shape
+            scale = (e.int() << 23).view(torch.float32).unsqueeze(-1)
+            deq = (q.float().view(T, H // 32, 32) * scale).view(T, H)
+        for want, got, tag in exact:
+            errs.append(
+                checkAllclose(
+                    want, got, rtol=0, atol=0, tol_err_ratio=0.0, msg=f"{name}: {tag} "
+                )
+            )
         errs.append(
             checkAllclose(
                 ref[5],
@@ -194,16 +235,6 @@ def check_outputs(name, out, ref, out_dtype, mode):
                 msg=f"{name}: fp8 dequant ",
             )
         )
-        errs.append(
-            checkAllclose(
-                _fp8_parts(ref[5]),
-                s,
-                rtol=1e-2,
-                atol=1e-6,
-                tol_err_ratio=0.0,
-                msg=f"{name}: fp8 scale ",
-            )
-        )
     err = max(errs)
     if err > 0:
         _FAILURES.append(name)
@@ -212,7 +243,7 @@ def check_outputs(name, out, ref, out_dtype, mode):
 
 def _traffic(T, H, mode, out_dtype):
     """HBM bytes of one seam at the (2n+2)d floor (+ the fn weight)."""
-    out_b = 1 + 4 / 32 if out_dtype == "fp8" else 2
+    out_b = 2 + _QUANT_EXTRA_BYTES[out_dtype]
     per_tok = 4 * H * 2 + H * out_b
     if mode != "no_post":
         per_tok += H * 2 + 4 * H * 2
@@ -247,7 +278,7 @@ def test_mega_mhc(T, H, mode, out_dtype):
     candidates = {
         "flydsl": lambda: flydsl_mega_mhc(*args, out_dtype=out_dtype, **kw),
     }
-    # the Triton seam has no FP8 output, so it is only a bf16 candidate
+    # the Triton seam has no ue8m0 output, so it is only a bf16 candidate
     if out_dtype == "bf16":
         try:
             from aiter.ops.triton.fusions.mhc_fused_post_pre_delayed_rmsnorm import (
@@ -357,7 +388,12 @@ def test_mega_mhc_config(
         "fn MB": nblk * FN_BYTES * H / 1e6,
     }
     res = _isa_resources(
-        kernel_name(cfg, mode != "no_post", mode == "identity_pre", out_dtype == "fp8")
+        kernel_name(
+            cfg,
+            mode != "no_post",
+            mode == "identity_pre",
+            {"bf16": "none", "fp8_grid": "grid", "mxfp8": "mx"}[out_dtype],
+        )
     )
     ret.update(res)
     ret["wg/cu"] = _wgs_per_cu(res, warps_per_wg)
@@ -365,7 +401,7 @@ def test_mega_mhc_config(
 
 
 @benchmark()
-def test_mega_mhc_streams(T, H, ksplit):
+def test_mega_mhc_streams(T, H, ksplit, out_dtype):
     """Two seams on two streams at once; each must match its own reference."""
     from aiter.ops.flydsl import flydsl_mega_mhc
 
@@ -382,17 +418,17 @@ def test_mega_mhc_streams(T, H, ksplit):
     for _ in range(20):
         for i, (args, kw, _ref) in enumerate(cases):
             with torch.cuda.stream(streams[i]):
-                outs[i] = flydsl_mega_mhc(*args, config=cfg, **kw)
+                outs[i] = flydsl_mega_mhc(*args, out_dtype=out_dtype, config=cfg, **kw)
     torch.cuda.synchronize()
     errs = [
-        check_outputs(f"stream {i}", outs[i], cases[i][2], "bf16", "post")
+        check_outputs(f"stream {i}", outs[i], cases[i][2], out_dtype, "post")
         for i in range(2)
     ]
     return {"gfx": get_gfx(), "err": max(errs)}
 
 
 @benchmark()
-def test_mega_mhc_dist(T, H, ksplit, mode):
+def test_mega_mhc_dist(T, H, ksplit, mode, out_dtype):
     """DIST_FINISH must give bit-identical outputs to the classic finisher, in a
     normal run, with every split forced to hand off (DIST_SPIN=0), and with two
     streams of DIST launches at once (per-stream scratch and publish words)."""
@@ -409,43 +445,45 @@ def test_mega_mhc_dist(T, H, ksplit, mode):
     if dist_residency_error(T, dict(base, DIST_FINISH=True), cu):
         return {"gfx": get_gfx(), "skipped": "not resident"}
     args, kw, ref = _call_kwargs(mode, T, H)
-    classic = [
-        x.clone() for x in flydsl_mega_mhc(*args, config=base, **kw)
-    ]  # residual_out is the shared kw buffer: cloned
+    d = out_dtype
+    # residual_out is the shared kw buffer: cloned
+    classic = _clone(flydsl_mega_mhc(*args, out_dtype=d, config=base, **kw))
     ret = {"gfx": get_gfx()}
     for name, extra in (("dist", {}), ("dist spin0", {"DIST_SPIN": 0})):
         cfg = dict(base, DIST_FINISH=True, **extra)
-        outs = [flydsl_mega_mhc(*args, config=cfg, **kw) for _ in range(20)]
+        outs = [
+            flydsl_mega_mhc(*args, out_dtype=d, config=cfg, **kw) for _ in range(20)
+        ]
         torch.cuda.synchronize()
         bad = sum(
-            any(not torch.equal(a, b) for a, b in zip(o[1:], classic[1:])) for o in outs
+            any(not _same(a, b) for a, b in zip(o[1:], classic[1:])) for o in outs
         )
         ret[f"{name} != classic"] = bad
-        ret[f"{name} err"] = check_outputs(
-            f"dist {name} T={T}", outs[-1], ref, "bf16", mode
-        )
+        ret[f"{name} err"] = check_outputs(f"dist {name} T={T}", outs[-1], ref, d, mode)
         if bad:
-            _FAILURES.append(f"dist {name} T={T} ks={ksplit}: {bad} bad")
+            _FAILURES.append(f"dist {name} T={T} ks={ksplit} {d}: {bad} bad")
     cases = [_call_kwargs(mode, T, H, seed=sd) for sd in (1, 2)]
     streams = [torch.cuda.Stream(), torch.cuda.Stream()]
     cfg = dict(base, DIST_FINISH=True)
     torch.cuda.synchronize()
-    gold = [flydsl_mega_mhc(*a, config=base, **k) for (a, k, _r) in cases]
-    gold = [[x.clone() for x in g] for g in gold]
+    gold = [
+        _clone(flydsl_mega_mhc(*a, out_dtype=d, config=base, **k))
+        for (a, k, _r) in cases
+    ]
     outs = [[], []]
     for _ in range(30):
         for i, (a, k, _r) in enumerate(cases):
             with torch.cuda.stream(streams[i]):
-                outs[i].append(flydsl_mega_mhc(*a, config=cfg, **k))
+                outs[i].append(flydsl_mega_mhc(*a, out_dtype=d, config=cfg, **k))
     torch.cuda.synchronize()
     sbad = sum(
-        any(not torch.equal(x, y) for x, y in zip(o[1:], gold[i][1:]))
+        any(not _same(x, y) for x, y in zip(o[1:], gold[i][1:]))
         for i in range(2)
         for o in outs[i]
     )
     ret["two-stream != classic"] = sbad
     if sbad:
-        _FAILURES.append(f"dist two-stream T={T} ks={ksplit}: {sbad} bad")
+        _FAILURES.append(f"dist two-stream T={T} ks={ksplit} {d}: {sbad} bad")
     return ret
 
 
@@ -454,7 +492,7 @@ def test_mega_mhc_late(T, H, ksplit, mode, out_dtype):
     """LATE_DESC (descriptors built after the first loads) only moves instructions and
     SHUFFLE_DPP swaps ``ds_swizzle`` lane exchanges for DPP ones (same values, same order):
     outputs must be bit-identical to the same knob set without them, with the classic
-    finisher and (bf16, when the grid is resident) the distributed one."""
+    finisher and (when the grid is resident) the distributed one."""
     from aiter.ops.flydsl import flydsl_mega_mhc
     from aiter.ops.flydsl.kernels.mega_mhc import dist_residency_error
 
@@ -468,32 +506,21 @@ def test_mega_mhc_late(T, H, ksplit, mode, out_dtype):
     args, kw, ref = _call_kwargs(mode, T, H)
     ret = {"gfx": get_gfx()}
     variants = [("classic", {})]
-    if out_dtype == "bf16" and not dist_residency_error(
-        T, dict(base, DIST_FINISH=True), cu
-    ):
+    if not dist_residency_error(T, dict(base, DIST_FINISH=True), cu):
         variants.append(("dist", {"DIST_FINISH": True}))
     for name, extra in variants:
-        plain = [
-            x.clone() if torch.is_tensor(x) else x
-            for x in flydsl_mega_mhc(
+        plain = _clone(
+            flydsl_mega_mhc(
                 *args, out_dtype=out_dtype, config=dict(base, **extra), **kw
             )
-        ]
-        if out_dtype == "fp8":  # layer_input is a (q, scale) tuple
-            plain[3] = tuple(x.clone() for x in plain[3])
+        )
         cfg = dict(base, LATE_DESC=True, SHUFFLE_DPP=True, **extra)
         outs = [
             flydsl_mega_mhc(*args, out_dtype=out_dtype, config=cfg, **kw)
             for _ in range(10)
         ]
         torch.cuda.synchronize()
-
-        def same(a, b):
-            if isinstance(a, tuple):
-                return all(torch.equal(x, y) for x, y in zip(a, b))
-            return torch.equal(a, b)
-
-        bad = sum(any(not same(a, b) for a, b in zip(o[1:], plain[1:])) for o in outs)
+        bad = sum(any(not _same(a, b) for a, b in zip(o[1:], plain[1:])) for o in outs)
         ret[f"{name} != plain"] = bad
         ret[f"{name} err"] = check_outputs(
             f"late {name} T={T}", outs[-1], ref, out_dtype, mode
@@ -514,7 +541,7 @@ def _scratch_sizes(T, H, out_dtype):
         H,
         get_gfx(),
         torch.cuda.get_device_properties(dev).multi_processor_count,
-        out_dtype == "fp8",
+        out_dtype,
     )
     _nblk, n_wg = grid_size(T, cfg)
     ks = cfg["NUM_KSPLIT"]
@@ -621,7 +648,9 @@ def main():
     parser.add_argument(
         "--mode", nargs="*", default=["post", "no_post", "identity_pre"]
     )
-    parser.add_argument("-d", "--out_dtype", nargs="*", default=["bf16", "fp8"])
+    parser.add_argument(
+        "-d", "--out_dtype", nargs="*", default=["bf16", "fp8_grid", "mxfp8"]
+    )
     # knob sweep axes (test_mega_mhc_config); empty --block_m skips the sweep
     parser.add_argument("--block_m", type=int, nargs="*", default=[])
     parser.add_argument("--warp_split", nargs="*", default=["cols", "tokens"])
@@ -684,11 +713,12 @@ def main():
         )
 
     rows = [
-        test_mega_mhc_streams(T, H, ks)
-        for T, H, ks in itertools.product(
+        test_mega_mhc_streams(T, H, ks, d)
+        for T, H, ks, d in itertools.product(
             [t for t in args.tokens if 0 < t <= 4096][-2:],
             args.hidden,
             args.stream_ksplit,
+            args.out_dtype,
         )
     ]
     aiter.logger.info(
@@ -707,9 +737,10 @@ def main():
         [64, 10],
     ]
     rows = [
-        test_mega_mhc_dist(T, H, ks, mode)
-        for (T, ks), H, mode in itertools.product(dist_cases, args.hidden, args.mode)
-        if "bf16" in args.out_dtype
+        test_mega_mhc_dist(T, H, ks, mode, d)
+        for (T, ks), H, mode, d in itertools.product(
+            dist_cases, args.hidden, args.mode, args.out_dtype
+        )
     ]
     aiter.logger.info(
         "mega-mhc DIST_FINISH check (markdown):\n%s",
