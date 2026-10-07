@@ -5,9 +5,9 @@
 Fused Gated RMSNorm + FP8 Per-Token Quantization
 
 Operations:
-1. Per-head Gated RMSNorm: norm(x) * silu(z) where:
+1. Per-head Gated RMSNorm: norm(x) * gate(z) where:
    - norm(x) = x * weight / sqrt(variance + eps) (standard RMSNorm over head_dim)
-   - silu(z) = z / (1 + exp(-z))
+   - gate(z) = silu(z) = z / (1 + exp(-z)), or sigmoid(z) (see `sigmoid_gate`)
 2. Flatten: [num_tokens, num_heads, head_dim] -> [num_tokens, num_heads*head_dim]
 3. FP8 per-token quantization: ONE scale per token across the full flattened row.
 
@@ -32,6 +32,7 @@ def gated_rmsnorm_fp8_per_token_quant(
     z: Tensor,
     weight: Tensor,
     epsilon: float,
+    sigmoid_gate: bool = False,
 ) -> None:
     """
     HIP kernel for fused Gated RMSNorm + FP8 per-token quantization.
@@ -43,6 +44,8 @@ def gated_rmsnorm_fp8_per_token_quant(
         z: [num_tokens, num_heads, head_dim] gating tensor (bf16/fp16)
         weight: [head_dim] RMSNorm weight (bf16/fp16)
         epsilon: numerical stability epsilon
+        sigmoid_gate: use sigmoid instead of SiLU and round through x's dtype
+            before quantization to match KDA's split path.
 
     This is a JIT-compiled binding that will be replaced with the actual kernel.
     """

@@ -257,16 +257,7 @@ def test_gated_rmsnorm_fp8_group_quant(
     }
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Test HIP kernel for gated RMSNorm + FP8 group quant"
-    )
-    parser.add_argument("--num_tokens", type=int, default=None, help="Number of tokens")
-    parser.add_argument("--num_heads", type=int, default=None, help="Number of heads")
-    parser.add_argument("--dtype", type=str, default="bf16", choices=["fp16", "bf16"])
-
-    args = parser.parse_args()
-
+def run_group_suite(args):
     dtype_map = {"fp16": torch.float16, "bf16": torch.bfloat16}
     dtype = dtype_map[args.dtype]
     if args.num_tokens is not None and args.num_heads is not None:
@@ -346,6 +337,7 @@ def gated_rmsnorm_fp8_per_token_quant_reference_impl(
     weight: torch.Tensor,
     eps: float,
     quant_dtype,
+    sigmoid_gate: bool = False,
 ):
     """Reference that matches the fused HIP kernel math and per-token quant path."""
     if quant_dtype == torch.float8_e4m3fnuz:
@@ -362,7 +354,11 @@ def gated_rmsnorm_fp8_per_token_quant_reference_impl(
     normed = x.float() * inv_std
     normed = normed * weight.float().view(1, 1, -1)
 
-    gated = normed * silu(z.float())  # [num_tokens, num_heads, head_dim]
+    if sigmoid_gate:
+        # KDA's gate, including the round through x's dtype the kernel keeps.
+        gated = (normed * torch.sigmoid(z.float())).to(x.dtype).float()
+    else:
+        gated = normed * silu(z.float())  # [num_tokens, num_heads, head_dim]
     flat = gated.reshape(num_tokens, -1)  # [num_tokens, num_heads*head_dim]
 
     # One scale per token across the whole row.
@@ -376,14 +372,14 @@ def gated_rmsnorm_fp8_per_token_quant_reference_impl(
 
 
 @perftest()
-def run_reference(x, z, weight, eps, quant_dtype):
+def run_reference(x, z, weight, eps, quant_dtype, sigmoid_gate=False):
     return gated_rmsnorm_fp8_per_token_quant_reference_impl(
-        x, z, weight, eps, quant_dtype
+        x, z, weight, eps, quant_dtype, sigmoid_gate
     )
 
 
 @perftest()
-def run_hip(x, z, weight, eps, quant_dtype):
+def run_hip(x, z, weight, eps, quant_dtype, sigmoid_gate=False):
     from aiter.ops.gated_rmsnorm_fp8_per_token_quant import (
         gated_rmsnorm_fp8_per_token_quant,
     )
@@ -394,7 +390,9 @@ def run_hip(x, z, weight, eps, quant_dtype):
     )
     scales = torch.empty((num_tokens,), dtype=torch.float32, device=x.device)
 
-    gated_rmsnorm_fp8_per_token_quant(out_quant, scales, x, z, weight, eps)
+    gated_rmsnorm_fp8_per_token_quant(
+        out_quant, scales, x, z, weight, eps, sigmoid_gate=sigmoid_gate
+    )
     return out_quant, scales
 
 
@@ -415,6 +413,7 @@ def test_gated_rmsnorm_fp8_per_token_quant(
     dtype: torch.dtype,
     eps: float = 1e-6,
     quant_dtype=dtypes.fp8,
+    sigmoid_gate: bool = False,
 ):
     torch.manual_seed(42)
     device = "cuda"
@@ -430,13 +429,14 @@ def test_gated_rmsnorm_fp8_per_token_quant(
     print("Test Configuration:")
     print(f"  Shape: [{num_tokens}, {num_heads}, {head_dim}]")
     print(f"  dtype: {dtype}, quant_dtype: {quant_dtype}, eps: {eps}")
+    print(f"  gate: {'sigmoid' if sigmoid_gate else 'silu'}")
     print(f"{'='*80}")
 
     (ref_quant, ref_scales), ref_time = run_reference(
-        x.clone(), z.clone(), weight, eps, quant_dtype
+        x.clone(), z.clone(), weight, eps, quant_dtype, sigmoid_gate
     )
     (hip_quant, hip_scales), hip_time = run_hip(
-        x.clone(), z.clone(), weight, eps, quant_dtype
+        x.clone(), z.clone(), weight, eps, quant_dtype, sigmoid_gate
     )
 
     ref_bw = calculate_bandwidth_per_token(num_tokens, num_heads, head_dim, ref_time)
@@ -471,6 +471,7 @@ def test_gated_rmsnorm_fp8_per_token_quant(
     return {
         "num_tokens": num_tokens,
         "num_heads": num_heads,
+        "gate": "sigmoid" if sigmoid_gate else "silu",
         "ref_time_us": ref_time,
         "hip_time_us": hip_time,
         "ref_bw_gbs": ref_bw,
@@ -479,14 +480,8 @@ def test_gated_rmsnorm_fp8_per_token_quant(
     }
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Test HIP kernel for gated RMSNorm + FP8 per-token quant"
-    )
-    parser.add_argument("--num_tokens", type=int, default=None)
-    parser.add_argument("--num_heads", type=int, default=None)
-    parser.add_argument("--dtype", type=str, default="bf16", choices=["fp16", "bf16"])
-    args = parser.parse_args()
+def run_per_token_suite(args):
+    gates = {"silu": [False], "sigmoid": [True], "both": [False, True]}[args.gate]
 
     dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}[args.dtype]
     # Match the rest of aiter's op_tests (test_quant / test_gemm_a8w8 /
@@ -527,19 +522,46 @@ if __name__ == "__main__":
 
     results = []
     for quant_dtype in quant_dtypes:
-        for num_tokens, num_heads, head_dim in test_configs:
-            r = test_gated_rmsnorm_fp8_per_token_quant(
-                num_tokens=num_tokens,
-                num_heads=num_heads,
-                head_dim=head_dim,
-                dtype=dtype,
-                quant_dtype=quant_dtype,
-            )
-            r["quant_dtype"] = str(quant_dtype)
-            results.append(r)
+        for sigmoid_gate in gates:
+            for num_tokens, num_heads, head_dim in test_configs:
+                r = test_gated_rmsnorm_fp8_per_token_quant(
+                    num_tokens=num_tokens,
+                    num_heads=num_heads,
+                    head_dim=head_dim,
+                    dtype=dtype,
+                    quant_dtype=quant_dtype,
+                    sigmoid_gate=sigmoid_gate,
+                )
+                r["quant_dtype"] = str(quant_dtype)
+                results.append(r)
 
     df = pd.DataFrame(results)
     aiter.logger.info(
         "gated_rmsnorm_fp8_per_token_quant summary (markdown):\n%s",
         df.to_markdown(index=False),
     )
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Test HIP kernels for gated RMSNorm + FP8 group/per-token quant"
+    )
+    parser.add_argument("--num_tokens", type=int, default=None, help="Number of tokens")
+    parser.add_argument("--num_heads", type=int, default=None, help="Number of heads")
+    parser.add_argument("--dtype", type=str, default="bf16", choices=["fp16", "bf16"])
+    parser.add_argument(
+        "--suite", type=str, default="both", choices=["group", "per_token", "both"]
+    )
+    parser.add_argument(
+        "--gate",
+        type=str,
+        default="both",
+        choices=["silu", "sigmoid", "both"],
+        help="Gate for the per-token suite (sigmoid is Kimi-K3 KDA's)",
+    )
+    args = parser.parse_args()
+
+    if args.suite in ("group", "both"):
+        run_group_suite(args)
+    if args.suite in ("per_token", "both"):
+        run_per_token_suite(args)
