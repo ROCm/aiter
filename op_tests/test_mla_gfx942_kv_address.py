@@ -78,14 +78,14 @@ def _persistent_metadata(aiter, heads, qo_indptr, kv_indptr, last_page_lens, spl
         dtype_q=torch.bfloat16,
         dtype_kv=torch.bfloat16,
     )
-    return dict(
-        work_meta_data=wmd,
-        work_indptr=wi,
-        work_info_set=wis,
-        reduce_indptr=ri,
-        reduce_final_map=rfm,
-        reduce_partial_map=rpm,
-    )
+    return {
+        "work_meta_data": wmd,
+        "work_indptr": wi,
+        "work_info_set": wis,
+        "reduce_indptr": ri,
+        "reduce_final_map": rfm,
+        "reduce_partial_map": rpm,
+    }
 
 
 @pytest.mark.parametrize("heads", [16, 128])
@@ -120,7 +120,7 @@ def test_mla_kv_address(kv_pool, heads, persistent, first_page, context, splits)
     qo_indptr = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
     kv_indptr = torch.tensor([0, context], dtype=torch.int32, device="cuda")
     last_page_lens = torch.ones(1, dtype=torch.int32, device="cuda")
-    kwargs = dict(num_kv_splits=splits)
+    kwargs = {"num_kv_splits": splits}
     if persistent:
         kwargs.update(
             _persistent_metadata(
