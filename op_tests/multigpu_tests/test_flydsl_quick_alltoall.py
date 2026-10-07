@@ -303,6 +303,117 @@ def _run_rank_dispatch(rank, tp, init_method, engine_kw, cases, window=None):
 dispatch_registry = SpawnRegistry(_run_rank_dispatch)
 
 
+# Host-framework path: ``QuickAllToAll`` built directly on a gloo *subgroup*
+# with ``enable=True, codec="none"`` and no ``AITER_FLY_A2A``, moving a packed
+# ``(N, B, H/N, D + pack)`` buffer of random bits -- the shape vLLM's DCP
+# all-to-all sends, with the fp32 LSE riding in the tail of each row.
+VLLM_TP = 8
+VLLM_PARTITIONS = {
+    "contig4": [[0, 1, 2, 3], [4, 5, 6, 7]],
+    "strided4": [[0, 2, 4, 6], [1, 3, 5, 7]],
+    "pairs": [[0, 1], [2, 3], [4, 5], [6, 7]],
+}
+# (label, B, H/N, D, pack, dtype, routed, mode). Chunk bytes must be a multiple
+# of 16; the "odd" row is 6 * 1028 B and has to fall through.
+VLLM_SHAPES = (
+    ("mla_bf16", 4, 16, 512, 2, "bfloat16", True, "plain"),
+    ("mla_bf16_graph", 4, 16, 512, 2, "bfloat16", True, "graph"),
+    ("gqa_fp32", 8, 8, 128, 1, "float32", True, "plain"),
+    ("tiny", 1, 4, 128, 2, "bfloat16", True, "plain"),
+    ("odd", 3, 2, 512, 2, "bfloat16", False, "plain"),
+)
+
+
+def _run_rank_vllm(rank, tp, init_method, engine_kw, cases, window=None):
+    import torch.distributed as dist
+
+    from aiter.dist.device_communicators.quick_all_to_all import QuickAllToAll
+
+    # The host framework owns the switch; the environment must not matter.
+    os.environ.pop("AITER_FLY_A2A", None)
+    os.environ["AITER_FLY_A2A_CODEC"] = "int4"
+
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        backend="gloo", init_method=init_method, world_size=tp, rank=rank
+    )
+    mine, comms = {}, {}
+    for name, parts in VLLM_PARTITIONS.items():
+        for ranks in parts:
+            g = dist.new_group(ranks, backend="gloo")
+            if rank in ranks:
+                mine[name] = (g, ranks)
+
+    rows = []
+    try:
+        for partition, _label, B, hpr, D, pack, dtype_name, routed, mode in cases:
+            group, ranks = mine[partition]
+            if partition not in comms:
+                comms[partition] = QuickAllToAll(
+                    group, device, enable=True, codec="none"
+                )
+            comm = comms[partition]
+            n, r = len(ranks), dist.get_rank(group)
+            dtype = getattr(torch, dtype_name)
+            int_dtype = torch.int16 if dtype.itemsize == 2 else torch.int32
+            numel = n * B * hpr * (D + pack)
+
+            def bits(global_rank):
+                gen = torch.Generator(device=device).manual_seed(77 + global_rank)
+                info = torch.iinfo(int_dtype)
+                return torch.randint(
+                    info.min,
+                    info.max,
+                    (numel,),
+                    generator=gen,
+                    dtype=int_dtype,
+                    device=device,
+                )
+
+            inp = bits(ranks[r]).view(dtype)
+            ref = torch.cat(
+                [bits(g).view(n, -1)[r] for g in ranks]
+            )  # chunk r of every source, in source order
+            out = torch.zeros_like(inp)
+            got = comm.should_all_to_all(inp, out)
+            dist.barrier(group)
+            n_mismatch = -1
+            if got:
+                if mode == "graph":
+                    g = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(g):
+                        comm.all_to_all(inp, out)
+                    n_mismatch = 0
+                    for _ in range(GRAPH_REPLAYS):
+                        out.zero_()
+                        g.replay()
+                        torch.cuda.synchronize()
+                        n_mismatch += int((out.view(int_dtype) != ref).sum())
+                else:
+                    comm.all_to_all(inp, out)
+                    torch.cuda.synchronize()
+                    n_mismatch = int((out.view(int_dtype) != ref).sum())
+            dist.barrier(group)
+            rows.append(
+                {
+                    "n_mismatch": n_mismatch,
+                    "routed": bool(got),
+                    "codec": comm._policy.codec if not comm.disabled else None,
+                    "disabled": comm.disabled,
+                    "variant": comm.variant(inp.numel() * inp.element_size()),
+                }
+            )
+    finally:
+        for comm in comms.values():
+            comm.close()
+        dist.destroy_process_group()
+    return rows
+
+
+vllm_registry = SpawnRegistry(_run_rank_vllm)
+
+
 def _key(tp, algorithm, codec, order="peer"):
     return registry.key(tp, algorithm=algorithm, codec=codec, order=order)
 
@@ -376,6 +487,23 @@ def test_quick_alltoall_dispatcher(nbytes, tp):
             fails.append(f"rank {r}: ran {row['variant']}, expected {want}*")
     failures.check(f"tp{tp} dispatcher {fmt_bytes(nbytes)}", fails)
     return _summary(rows, nbytes, tp)
+
+
+@benchmark()
+def test_quick_alltoall_vllm(partition, label, B, hpr, D, pack, dtype, routed, mode):
+    key = vllm_registry.key(VLLM_TP)
+    case = (partition, label, B, hpr, D, pack, dtype, routed, mode)
+    rows = vllm_registry.result(key, case)
+    fails = []
+    for r, row in enumerate(rows):
+        if row["disabled"] or row["codec"] != "none":
+            fails.append(f"rank {r}: engine disabled or codec {row['codec']}")
+        if row["routed"] != routed:
+            fails.append(f"rank {r}: routed={row['routed']}, expected {routed}")
+        if routed and row["n_mismatch"]:
+            fails.append(f"rank {r}: {row['n_mismatch']} lanes differ")
+    failures.check(f"vllm {partition} {label} {mode}", fails)
+    return {"variant": rows[0]["variant"], "mismatch": max(r["n_mismatch"] for r in rows)}
 
 
 def main():
@@ -462,6 +590,13 @@ def main():
             for n in DISPATCH_PAYLOADS
         ],
     )
+    if VLLM_TP in tps:
+        vllm_cases = [
+            (p, *shape) for p in VLLM_PARTITIONS for shape in VLLM_SHAPES
+        ]
+        for case in vllm_cases:
+            vllm_registry.register(vllm_registry.key(VLLM_TP), case)
+        summarize("quick_alltoall_vllm", [test_quick_alltoall_vllm(*c) for c in vllm_cases])
     failures.raise_if_failed("quick_alltoall")
 
 

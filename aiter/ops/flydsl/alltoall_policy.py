@@ -112,16 +112,24 @@ def _env_choice(name: str, choices: tuple[str, ...], default: str) -> str:
     return raw
 
 
-def resolve(world_size: int, link: str | None = None) -> AllToAllPolicy:
-    """The policy for a *world_size* group on this host, from the environment."""
+def resolve(
+    world_size: int, link: str | None = None, codec: str | None = None
+) -> AllToAllPolicy:
+    """The policy for a *world_size* group on this host, from the environment.
+
+    *codec*, when given, replaces ``AITER_FLY_A2A_CODEC``: a caller whose payload
+    must arrive bit-exact pins ``"none"`` so the environment cannot quantize it.
+    """
     link = detect_link() if link is None else link
+    if codec is not None and codec not in CODECS:
+        raise ValueError(f"codec must be one of {CODECS}, got {codec!r}")
     min_bytes = _env_int(MIN_BYTES_VAR)
     max_bytes = _env_int(MAX_BYTES_VAR)
     ring_from = _env_int(RING_MIN_BYTES_VAR)
     return AllToAllPolicy(
         link=link,
         algorithm=_env_choice(ALGORITHM_VAR, ALGORITHMS, "auto"),
-        codec=_env_choice(CODEC_VAR, CODECS, "none"),
+        codec=_env_choice(CODEC_VAR, CODECS, "none") if codec is None else codec,
         min_bytes=_DEFAULT_MIN_BYTES if min_bytes is None else min_bytes,
         max_bytes=_DEFAULT_MAX_BYTES if max_bytes is None else max_bytes,
         ring_from=(

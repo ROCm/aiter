@@ -42,13 +42,28 @@ _SUPPORTED_WORLD_SIZES = (2, 4, 8)
 
 
 class QuickAllToAll:
-    def __init__(self, group: ProcessGroup, device: int | str | torch.device) -> None:
+    def __init__(
+        self,
+        group: ProcessGroup,
+        device: int | str | torch.device,
+        *,
+        enable: bool | None = None,
+        codec: str | None = None,
+    ) -> None:
         """*group* must be a non-NCCL group: the engine exchanges HIP IPC
-        handles over it."""
+        handles over it. *group* may be any single-node subgroup.
+
+        *enable* ``None`` follows ``AITER_FLY_A2A``; ``True`` builds the engine
+        whatever the environment says, for a host framework with its own switch.
+        *codec* ``None`` follows ``AITER_FLY_A2A_CODEC``; ``"none"`` pins the
+        lossless wire, which a caller moving packed or non-float payloads needs.
+        """
         self.disabled = True
         self._engines = {}
         self._policy = None
-        if not _FLY_IMPORT_OK or not a2a_policy.enabled():
+        if not _FLY_IMPORT_OK:
+            return
+        if not (a2a_policy.enabled() if enable is None else enable):
             return
 
         from aiter.jit.utils.chip_info import get_gfx_runtime
@@ -86,7 +101,7 @@ class QuickAllToAll:
             device = torch.device(device)
         self.device = device
 
-        policy = a2a_policy.resolve(self.world_size)
+        policy = a2a_policy.resolve(self.world_size, codec=codec)
         ok = True
         try:
             # One engine per schedule the policy can select, built in a fixed
@@ -150,12 +165,17 @@ class QuickAllToAll:
     def _engine_for(self, nbytes: int):
         return self._engines[self._policy.pick(nbytes)]
 
-    def should_all_to_all(self, inp: torch.Tensor) -> bool:
-        """Whether a FlyDSL engine can and should serve *inp*. Never raises."""
+    def should_all_to_all(
+        self, inp: torch.Tensor, out: torch.Tensor | None = None
+    ) -> bool:
+        """Whether a FlyDSL engine can and should serve *inp* (into *out*, when
+        the caller already has it). Never raises."""
         if self.disabled:
             return False
         nbytes = inp.numel() * inp.element_size()
-        return self._policy.routes(nbytes) and self._engine_for(nbytes).supports(inp)
+        return self._policy.routes(nbytes) and self._engine_for(nbytes).supports(
+            inp, out
+        )
 
     def all_to_all(
         self, inp: torch.Tensor, out: torch.Tensor | None = None
