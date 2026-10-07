@@ -83,23 +83,24 @@ def test_mismatch_does_not_fail_the_process():
     """A kernel that is wrong in every element still exits 0.
 
     This is the escape that makes the other two reachable: even when the
-    comparison does print ``failed!``, nothing downstream observes it. Of the
-    ~700 ``checkAllclose`` call sites under ``op_tests/``, the overwhelming
-    majority discard the returned ratio, so the only record of the failure is a
-    line in a log that no CI job reads.
+    comparison does print ``failed!``, nothing downstream observes it. There
+    are 659 ``checkAllclose`` call sites under ``op_tests/``, and the
+    overwhelming majority discard the returned ratio, so the only record of the
+    failure is a line in a log that no CI job reads.
 
-    Spawns two interpreters, so it is the slow test in this file.
+    Only the stock side needs a subprocess: the exit code is the thing being
+    measured and it cannot be observed in-process. That strict mode raises is
+    covered in-process by the next test.
     """
     stock = _run_miniature_op_test(strict=False)
     assert "op test body completed" in stock.stdout, stock.stderr
+    assert (
+        "failed!" in stock.stdout + stock.stderr
+    ), "the comparison is expected to report the mismatch it then discards"
     assert stock.returncode == 0, (
         "the shipped behaviour is expected to exit 0 here; if this now fails, "
         "the escape has been fixed and this test should be retired"
     )
-
-    gated = _run_miniature_op_test(strict=True)
-    assert gated.returncode != 0, gated.stdout + gated.stderr
-    assert "op test body completed" not in gated.stdout
 
 
 def test_strict_flag_raises_without_touching_the_call_site():
@@ -142,6 +143,28 @@ def test_nan_hides_under_the_mismatch_ratio():
         assert "non-finite" in str(exc), exc
     else:
         raise AssertionError("strict mode should reject NaN regardless of the ratio")
+
+
+def test_matching_infs_never_reach_the_mismatch_count():
+    """Inf is invisible to a ratio gate for a different reason than NaN.
+
+    ``torch.isclose(inf, inf)`` is True, so a kernel that returns Inf wherever
+    the reference is Inf produces no mismatching elements at all -- the ratio
+    is 0 and the comparison reports ``passed~``. Nothing a ``tol_err_ratio``
+    does can catch that, which is why strict mode tests finiteness before it
+    looks at the mismatch count.
+    """
+    ref = _moe_like_reference(max_abs=1928.0, rows=64, cols=128)
+    ref.view(-1)[:16] = float("inf")
+
+    assert checkAllclose(ref.clone(), ref, printLog=False) == 0
+
+    try:
+        checkAllclose(ref.clone(), ref, strict=True)
+    except AssertionError as exc:
+        assert "non-finite" in str(exc), exc
+    else:
+        raise AssertionError("strict mode should reject matching Infs")
 
 
 def test_strict_leaves_a_passing_comparison_alone():

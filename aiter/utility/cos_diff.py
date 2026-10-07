@@ -30,6 +30,8 @@ import os
 
 import torch
 
+from aiter import logger
+
 COS_DIFF_THRESHOLD = 1e-1
 
 COS_DIFF_ROW_ENERGY_FLOOR = 1e-3
@@ -80,5 +82,13 @@ def combined_cos_diff(x_rows, y_rows, whole_tensor):
     if not rowwise_enabled():
         return whole_tensor
     if x_rows is None or y_rows is None or x_rows.shape != y_rows.shape:
+        # Says so rather than quietly degrading to the whole-tensor score: a
+        # packed layout compared against an unpacked reference lands here, and
+        # silently falling back would look like row-wise scoring was applied.
+        logger.warning(
+            "cos_diff: row-wise scoring requested but skipped, shapes "
+            f"{None if x_rows is None else tuple(x_rows.shape)} vs "
+            f"{None if y_rows is None else tuple(y_rows.shape)}"
+        )
         return whole_tensor
     return max(whole_tensor, worst_row_cos_diff(x_rows, y_rows))

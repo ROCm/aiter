@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""Four acceptance escapes, measured against UNMODIFIED AITER.
+"""Six acceptance escapes, measured against UNMODIFIED AITER.
 
 This script imports nothing that the PR adds. Point it at a stock checkout and
 it reports what the shipped gates do with deliberately broken results:
@@ -93,18 +93,38 @@ def escape_1b_nan_under_the_ratio():
 
 def escape_2_magic_tolerance():
     rule("2. MoE atol=100 is not tied to the arithmetic")
-    g = torch.Generator().manual_seed(0)
-    ref = torch.randn(512, 128, generator=g, dtype=torch.float32)
-    ref = (ref / ref.abs().max() * 1928.0).to(torch.bfloat16)
+    ref = _moe_output()
     broken = (ref.float() + 99.0).to(torch.bfloat16)
 
     ratio = checkAllclose(broken, ref, rtol=MOE_RTOL, atol=MOE_ATOL, printLog=False)
+    print(f"  output shape                     : {tuple(ref.shape)}")
     print(f"  max|ref|                         : {ref.abs().max().item():.1f}")
     print("  planted bias on every element    : +99.0")
     print(f"  shipped gate rtol={MOE_RTOL} atol={MOE_ATOL}")
     print(f"  mismatching elements             : {ratio:.1%}")
     print(f"  -> accepted: {ratio == 0}")
     return ratio == 0
+
+
+# ---------------------------------------------------------------------------
+# 2b. Whole output rows can be zeroed and stay under the 5% allowance.
+# ---------------------------------------------------------------------------
+
+
+def escape_2b_zeroed_rows():
+    rule("2b. Zeroed token rows hide under the 5% element allowance")
+    ref = _moe_output()
+    rows = 7
+    broken = ref.clone()
+    broken[:rows] = 0.0
+
+    ratio = checkAllclose(broken, ref, rtol=MOE_RTOL, atol=MOE_ATOL, printLog=False)
+    print(f"  token rows zeroed                : {rows}/{ref.shape[0]}")
+    print(f"  that is                          : {rows / ref.shape[0]:.1%} of rows")
+    print(f"  mismatching elements             : {ratio:.1%}")
+    print("  default tol_err_ratio            : 0.05")
+    print(f"  -> accepted: {ratio <= 0.05}")
+    return ratio <= 0.05
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +151,9 @@ def escape_3_cosine_dilution():
     print(f"  closed form f/(2-f)              : {f / (2 - f):.6f}")
     print(f"  tuner cos_diff                   : {cos_diff:.6f}")
     print(f"  acceptance threshold             : {COS_DIFF_THRESHOLD}")
-    print(f"  -> accepted as best kernel: {cos_diff < COS_DIFF_THRESHOLD}")
+    # Under the threshold means the candidate stays in the running, not that
+    # the tuner prefers it -- it still has to be the fastest of those that pass.
+    print(f"  -> still eligible as best candidate: {cos_diff < COS_DIFF_THRESHOLD}")
     return cos_diff < COS_DIFF_THRESHOLD
 
 
@@ -148,16 +170,21 @@ def escape_4_disabled_gate():
 
     # The exact arguments used for shapes that have a tuned config, i.e. the
     # configs that ship.
+    tol_err_ratio = 1.0
     ratio = checkAllclose(
-        garbage, ref, rtol=1e-1, atol=1e-1, tol_err_ratio=1.0, printLog=False
+        garbage, ref, rtol=1e-1, atol=1e-1, tol_err_ratio=tol_err_ratio, printLog=False
     )
     print("  comparing noise against the reference")
-    print("  gate: rtol=1e-1 atol=1e-1 tol_err_ratio=1.0 printLog=False")
-    print(f"  mismatching elements             : {ratio:.1%}")
-    print("  threshold it is judged against   : 100.0%")
+    print(f"  gate: rtol=1e-1 atol=1e-1 {tol_err_ratio=} printLog=False")
+    print(f"  mismatching elements             : {ratio:.4%}")
+    print(f"  threshold it is judged against   : {tol_err_ratio:.4%}")
     print("  nothing is printed (printLog=False), nothing is raised")
-    print(f"  -> cannot fail by construction: {ratio <= 1.0}")
-    return ratio <= 1.0
+    # percent is a fraction of elements, so it cannot exceed 1.0, and the only
+    # thing that triggers a report is percent > tol_err_ratio. With the
+    # threshold set to the ceiling of the quantity it bounds, that test is
+    # unsatisfiable for every possible input, not just this one.
+    print(f"  -> would report a failure        : {ratio > tol_err_ratio}")
+    return ratio > 0.99 and not ratio > tol_err_ratio
 
 
 # ---------------------------------------------------------------------------
@@ -203,18 +230,24 @@ def catches():
         nan_caught = True
     print(f"  1b. strict mode on 5% NaN        -> rejected: {nan_caught}")
 
-    g = torch.Generator().manual_seed(0)
-    ref = torch.randn(512, 128, generator=g, dtype=torch.float32)
-    ref = (ref / ref.abs().max() * 1928.0).to(torch.bfloat16)
-    broken = (ref.float() + 99.0).to(torch.bfloat16)
+    ref = _moe_output()
     rtol, atol = derive_tolerance(
         torch.float8_e4m3fnuz,
         torch.bfloat16,
         num_accumulations=3840,
         max_value=ref.abs().max().item(),
     )
+    broken = (ref.float() + 99.0).to(torch.bfloat16)
     ratio = checkAllclose(broken, ref, rtol=rtol, atol=atol, printLog=False)
     print(f"  2. derived rtol={rtol} atol={atol}  -> {ratio:.1%} of elements flagged")
+
+    zeroed = ref.clone()
+    zeroed[:7] = 0.0
+    ratio_rows = checkAllclose(zeroed, ref, rtol=rtol, atol=atol, printLog=False)
+    print(
+        f"  2b. 7 zeroed rows, same gate     -> {ratio_rows:.1%} flagged, "
+        f"still under 5%: {ratio_rows <= 0.05} (not fixed by this PR)"
+    )
 
     g = torch.Generator().manual_seed(0)
     ref = torch.randn(512, 128, generator=g, dtype=torch.float64)
@@ -240,6 +273,7 @@ if __name__ == "__main__":
         "exit code": escape_1_exit_code(),
         "NaN under the ratio": escape_1b_nan_under_the_ratio(),
         "magic tolerance": escape_2_magic_tolerance(),
+        "zeroed rows": escape_2b_zeroed_rows(),
         "cosine dilution": escape_3_cosine_dilution(),
         "disabled gate": escape_4_disabled_gate(),
     }

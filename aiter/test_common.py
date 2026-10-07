@@ -549,9 +549,11 @@ def checkAllclose(
     the tuner's ranking path, which needs the ratio back rather than an
     exception.
 
-    Strict mode also rejects NaN and Inf regardless of ``tol_err_ratio``. A
-    ratio gate cannot see them: on a 524,288-element MoE output, 5% of the
-    tensor can be NaN and still sit inside the default 0.05 allowance.
+    Strict mode also rejects NaN and Inf regardless of ``tol_err_ratio``.
+    Neither is reliably visible to a ratio gate: on a 524,288-element MoE
+    output, 5% of the tensor can be NaN and still sit inside the default 0.05
+    allowance, and matching Infs compare equal under ``torch.isclose`` so they
+    produce no mismatch to count in the first place.
     """
     if strict is None:
         strict = printLog and _strict_allclose_default()
@@ -574,6 +576,18 @@ def checkAllclose(
             return 0
     else:
         denom = a.numel()
+
+    # Checked before the all-close branch: torch.isclose(inf, inf) is True, so a
+    # tensor of matching Infs never reaches the mismatch path at all.
+    if strict:
+        finite = torch.isfinite(a) & torch.isfinite(b)
+        if mask is not None:
+            finite = finite | ~mask
+        if not finite.all():
+            raise AssertionError(
+                f"{msg}non-finite values in the comparison "
+                f"({int((~finite).sum().item())} of {denom} elements)"
+            )
 
     if isClose.all():
         if printLog:
@@ -652,17 +666,11 @@ def checkAllclose(
                 f"{msg}catastrophic error: max abs delta {actual_max_delta:.4f}, "
                 f"{percent:.1%} ({num} of {denom}) elements mismatch"
             )
-        if strict:
-            if not torch.isfinite(a).all() or not torch.isfinite(b).all():
-                raise AssertionError(
-                    f"{msg}non-finite values in the comparison "
-                    f"({percent:.1%} of elements mismatch)"
-                )
-            if percent > tol_err_ratio:
-                raise AssertionError(
-                    f"{msg}{percent:.1%} ({num} of {denom}) elements exceed "
-                    f"{atol=} {rtol=}, max abs delta {actual_max_delta:.4f}"
-                )
+        if strict and percent > tol_err_ratio:
+            raise AssertionError(
+                f"{msg}{percent:.1%} ({num} of {denom}) elements exceed "
+                f"{atol=} {rtol=}, max abs delta {actual_max_delta:.4f}"
+            )
         return percent
 
 
