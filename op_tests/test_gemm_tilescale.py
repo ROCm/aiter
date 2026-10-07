@@ -31,10 +31,12 @@ def _manifest():
     if not os.path.exists(path):
         return []
     with open(path) as f:
-        return [{k: (v if k in ("knl_name", "co_name") else int(v)) for k, v in r.items()} for r in csv.DictReader(f)]
+        return [{k: (v if k in ("knl_name", "co_name") else int(v or 0)) for k, v in r.items()}
+                for r in csv.DictReader(f)]
 
 
-ROWS = [r for r in _manifest() if r["abi"] not in (2, 3)]  # exact-shape rows
+ROWS = [r for r in _manifest() if r["abi"] not in (2, 3, 4)]  # exact-shape rows
+SOFTMAX_D = [r for r in _manifest() if r["abi"] == 4]  # exact-shape rows emitting attention's softmax_d
 GENERIC_ROWS = [r for r in _manifest() if r["abi"] in (2, 3)]
 A6W4 = [r for r in ROWS if (r["a_fmt"], r["b_fmt"]) == (6, 4)]
 
@@ -243,3 +245,34 @@ def test_a4w4_kouter_bitwise_vs_row(row):
                           4, 4, K, None, bc, ilv)
         outs.append(out)
     assert torch.equal(outs[0].view(torch.int16), outs[1].view(torch.int16))
+
+
+@requires_gfx950
+@pytest.mark.parametrize("row", SOFTMAX_D, ids=lambda r: r["knl_name"])
+def test_a4w4_softmax_d(row):
+    """The softmax_d epilogue: out bitwise equal to the plain row's; softmax_d [B, N/128, S] = per row and head the
+    fp32 sum of out * O (sbhd rows), within fp32 summation error of the fp64 sum. GEMMs covering one sequence in
+    parts (a joint block's text and image rows) add into one softmax_d at their first sequence positions."""
+    M, N, K, bc, ilv, B, S = (row[k] for k in ("M", "N", "K", "b_codes", "b_ilv", "epi_b", "epi_s"))
+    H, parts = N // 128, S * B // M
+    g = torch.Generator(device="cuda").manual_seed(M + N + K)
+    o = torch.randn(S * B, N, dtype=torch.bfloat16, device="cuda", generator=g)
+    d = torch.zeros(B, H, S, dtype=torch.float32, device="cuda")
+    outs = []
+    for i in range(parts):
+        a, b = _codes(4, M, K, g), _codes(4, N, K, g)
+        sa = torch.randint(118, 133, (M, K // 32), dtype=torch.uint8, device="cuda", generator=g)
+        sb = torch.randint(118, 133, (N, K // 32), dtype=torch.uint8, device="cuda", generator=g)
+        A, SA = _pack(4, a), TS.pack_scales_ref(sa, is_b=False)
+        Bp, SB = _pack(4, b, bc), TS.pack_scales_ref(sb, is_b=True, ilv=ilv, kouter=bc == 2)
+        plain = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
+        gemm_mx_tilescale(A, Bp, SA, SB, plain, 4, 4, K, None, bc, ilv)
+        out = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
+        gemm_mx_tilescale(A, Bp, SA, SB, out, 4, 4, K, None, bc, ilv, epi_o=o[i * M : (i + 1) * M], epi_delta=d,
+                          epi_s0=i * M // B)
+        assert torch.equal(out.view(torch.int16), plain.view(torch.int16))
+        outs.append(out)
+    prod = (torch.cat(outs).double() * o.double()).view(S, B, H, 128)
+    ref = prod.sum(-1).permute(1, 2, 0)
+    mag = prod.abs().sum(-1).permute(1, 2, 0)
+    assert ((d.double() - ref).abs() / mag).max().item() < 1e-5

@@ -28,6 +28,11 @@
 //   3  the K-generic A4W4 kernel: the first 112 bytes of abi 0 with K in the dword after N; serves every
 //      M, N (multiples of 256) and every K that is a multiple of 512 and >= kmin (kcls 12: any K-loop
 //      class), B scales at interleave 4; one tile per workgroup.
+//   4  abi 0 plus the attention softmax_d epilogue (148 bytes): C1 carries O ([M, N] bf16, out's layout)
+//      and C2's pointer / first dword δ ([B, N/128, S] fp32, from this GEMM's first sequence position) and
+//      its remaining elements. Rows are sbhd (row = s * B + b); the kernel adds, per row and 128-column
+//      head, the fp32 sum of bf16(out) * O over the head into δ, which the caller zeroes. Selected by the
+//      manifest's epi_b / epi_s (B, S; 0 for every other row).
 namespace {
 constexpr size_t kTensorAlignment = 16;
 
@@ -96,14 +101,17 @@ const tsgemmConfig* find_row(const std::string& arch,
                              bool bias,
                              int64_t M,
                              int64_t N,
-                             int64_t K)
+                             int64_t K,
+                             int64_t epi_b,
+                             int64_t epi_s)
 {
     static std::mutex mu;
     static std::unordered_map<std::string, const tsgemmConfig*> cache;
     const std::string key = arch + ":" + std::to_string(a_fmt) + "," + std::to_string(b_fmt) + "," +
                             std::to_string(b_codes) + "," + std::to_string(b_ilv) + "," +
                             std::to_string(bias) + "," + std::to_string(M) + "x" +
-                            std::to_string(N) + "x" + std::to_string(K);
+                            std::to_string(N) + "x" + std::to_string(K) + ":" +
+                            std::to_string(epi_b) + "x" + std::to_string(epi_s);
     std::lock_guard<std::mutex> lock(mu);
     auto hit = cache.find(key);
     if(hit != cache.end())
@@ -114,7 +122,7 @@ const tsgemmConfig* find_row(const std::string& arch,
         const auto& c = kv.second;
         if(c.arch == arch && c.a_fmt == a_fmt && c.b_fmt == b_fmt && c.b_codes == b_codes &&
            c.b_ilv == b_ilv && c.bias == static_cast<int>(bias) && c.M == M && c.N == N &&
-           c.K == K)
+           c.K == K && c.epi_b == epi_b && c.epi_s == epi_s)
         {
             found = &c;
             break;
@@ -123,7 +131,7 @@ const tsgemmConfig* find_row(const std::string& arch,
     // No exact row: the shape-generic kernel of this K-loop class, if any.
     for(const auto& kv : cfg_tsgemm_bf16_per1x32)
     {
-        if(found != nullptr)
+        if(found != nullptr || epi_b != 0)
             break;
         const auto& c = kv.second;
         if(c.arch == arch && (c.abi == 2 || c.abi == 3) && c.a_fmt == a_fmt &&
@@ -153,8 +161,12 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      int64_t b_codes,
      int64_t b_ilv,
      aiter_tensor_t* B_c1, // optional: an FP6 B's C1 plane in its own buffer (B then holds C0 only)
+     aiter_tensor_t* epi_o,     // optional: O for the softmax_d epilogue ([M, N] bf16, abi 4)
+     aiter_tensor_t* epi_delta, // with epi_o: δ [B, N/128, S] fp32, zeroed by the caller
+     int64_t epi_s0,            // the sequence position of this GEMM's first row
      hipStream_t stream),
-    (A, B, A_scale, B_scale, out, K, bias, a_fmt, b_fmt, b_codes, b_ilv, B_c1, stream))
+    (A, B, A_scale, B_scale, out, K, bias, a_fmt, b_fmt, b_codes, b_ilv, B_c1, epi_o, epi_delta, epi_s0,
+     stream))
 {
     AITER_CHECK(out->dtype() == AITER_DTYPE_bf16, __func__, " only BFloat16 output");
     AITER_CHECK(out->dim() == 2 && out->is_contiguous(),
@@ -202,15 +214,37 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                     __func__,
                     " bias must be a contiguous, 16-byte aligned bf16 [N] on the output's GPU");
 
+    AITER_CHECK((epi_o == nullptr) == (epi_delta == nullptr), __func__, " epi_o and epi_delta go together");
+    int64_t epi_b = 0, epi_s = 0;
+    if(epi_o != nullptr)
+    {
+        AITER_CHECK(epi_o->dtype() == AITER_DTYPE_bf16 && epi_o->is_contiguous() && epi_o->dim() == 2 &&
+                        epi_o->size(0) == M && epi_o->size(1) == N && aligned(epi_o) &&
+                        epi_o->device_id == out->device_id,
+                    __func__,
+                    " epi_o must be a contiguous, 16-byte aligned bf16 [M, N] on the output's GPU");
+        AITER_CHECK(epi_delta->dtype() == AITER_DTYPE_fp32 && epi_delta->is_contiguous() &&
+                        epi_delta->dim() == 3 && epi_delta->size(1) * 128 == N &&
+                        epi_delta->device_id == out->device_id,
+                    __func__,
+                    " epi_delta must be a contiguous fp32 [B, N/128, S] on the output's GPU");
+        epi_b = epi_delta->size(0);
+        epi_s = epi_delta->size(2);
+        AITER_CHECK(M % epi_b == 0 && epi_s0 >= 0 && epi_s0 + M / epi_b <= epi_s,
+                    __func__,
+                    " the rows must be whole sequence positions of epi_delta");
+    }
     const std::string arch = get_gpu_arch();
     const tsgemmConfig* cfg =
-        find_row(arch, a_fmt, b_fmt, b_codes, b_ilv, bias != nullptr, M, N, K);
+        find_row(arch, a_fmt, b_fmt, b_codes, b_ilv, bias != nullptr, M, N, K, epi_b, epi_s);
     const bool generic = cfg != nullptr && (cfg->abi == 2 || cfg->abi == 3);
     AITER_CHECK(cfg != nullptr && (cfg->grid > 0 || generic),
                 __func__,
                 " no tilescale kernel for a" + std::to_string(a_fmt) + "w" +
                     std::to_string(b_fmt) + " " + std::to_string(M) + "x" + std::to_string(N) +
-                    "x" + std::to_string(K) + (bias ? " with bias" : ""));
+                    "x" + std::to_string(K) + (bias ? " with bias" : "") +
+                    (epi_b ? " with softmax_d B " + std::to_string(epi_b) + " S " + std::to_string(epi_s)
+                           : ""));
 
     char* pa = static_cast<char*>(A->ptr);
     char* pb = static_cast<char*>(B->ptr);
@@ -218,11 +252,11 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     KernelArgsFly6 a6;
     void* args      = nullptr;
     size_t arg_size = 0;
-    if(cfg->abi == 0 || cfg->abi == 3)
+    if(cfg->abi == 0 || cfg->abi == 3 || cfg->abi == 4)
     {
         AITER_CHECK(a_fmt == 4 && b_fmt == 4 && bias == nullptr,
                     __func__,
-                    " abi 0 / 3 rows are A4W4 without bias");
+                    " abi 0 / 3 / 4 rows are A4W4 without bias");
         std::memset(&a4, 0, sizeof(a4));
         a4.A         = memref(pa, M, K / 2);
         a4.B         = memref(pb, N, K / 2);
@@ -242,6 +276,17 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         a4.K         = cfg->abi == 3 ? static_cast<uint32_t>(K) : 0u;
         args         = &a4;
         arg_size     = cfg->abi == 3 ? offsetof(KernelArgsFly4, C1) : sizeof(a4);
+        if(cfg->abi == 4)
+        {
+            a4.C1         = Memref{epi_o->ptr,
+                           static_cast<uint32_t>(M),
+                           static_cast<uint32_t>(N),
+                           static_cast<uint32_t>(N),
+                           0};
+            a4.C2.ptr     = static_cast<float*>(epi_delta->ptr) + epi_s0;
+            a4.C2.rows    = static_cast<uint32_t>(epi_delta->numel() - epi_s0);
+            arg_size      = offsetof(KernelArgsFly4, C2) + 12;
+        }
     }
     else
     {

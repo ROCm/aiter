@@ -7,6 +7,12 @@
 operands tilescale FP4 bytes in the ``b_codes`` layout (0 = "row", 1 = "k128", 2 = "kouter" with its K256-outer
 scale slab; A operands are "row"). Scales are tilescale slabs, role B with interleave ``b_ilv``. Kernels are selected from the ``tsgemm`` manifest;
 ``tilescale_supported`` says whether a call has one (pure Python on ints, safe inside compiled regions).
+
+A4W4 rows may also emit attention's softmax_d (the ``fmha_v3_bwd`` ``softmax_d`` input) from the GEMM: with ``out``
+the attention output's gradient dO in sbhd rows (row = s * B + b) and ``epi_o`` the attention output O in the same
+layout, the kernel adds, per row and 128-column head, the fp32 sum of out * O into ``epi_delta`` [B, N/128, S]
+(zeroed by the caller) from sequence position ``epi_s0`` on. The sum order is the kernel's own, not the odo
+kernel's. ``tilescale_softmax_d_supported`` says whether a kernel exists.
 """
 
 import csv
@@ -35,6 +41,9 @@ def _gemm_tilescale_asm(
     b_codes: int,
     b_ilv: int,
     B_c1: Tensor | None,
+    epi_o: Tensor | None,
+    epi_delta: Tensor | None,
+    epi_s0: int,
 ) -> None: ...
 
 
@@ -45,7 +54,7 @@ def _manifest(arch: str = "gfx950"):
         return ()
     with open(path) as f:
         return tuple(
-            {k: (v if k in ("knl_name", "co_name") else int(v)) for k, v in r.items()}
+            {k: (v if k in ("knl_name", "co_name") else int(v or 0)) for k, v in r.items()}
             for r in csv.DictReader(f)
             if int(r["ts_ver"]) == TILESCALE_VERSION
         )
@@ -58,25 +67,20 @@ def _generic(arch: str = "gfx950"):
             for r in _manifest(arch) if r["abi"] in (2, 3)}
 
 
+def _key(r):
+    return tuple(r.get(k, 0) for k in ("a_fmt", "b_fmt", "b_codes", "b_ilv", "bias", "M", "N", "K", "epi_b", "epi_s"))
+
+
 @functools.lru_cache(maxsize=None)
 def _rows(arch: str = "gfx950"):
-    path = os.path.join(AITER_META_DIR, "hsa", arch, "tsgemm", "tsgemm_bf16_per1x32.csv")
-    if not os.path.exists(path):
-        return frozenset()
-    out = set()
-    with open(path) as f:
-        for r in csv.DictReader(f):
-            if int(r["ts_ver"]) != TILESCALE_VERSION:
-                continue
-            out.add(tuple(int(r[k]) for k in ("a_fmt", "b_fmt", "b_codes", "b_ilv", "bias", "M", "N", "K")))
-    return frozenset(out)
+    return frozenset(_key(r) for r in _manifest(arch))
 
 
 def tilescale_supported(M: int, N: int, K: int, a_fmt: int, b_fmt: int, bias: bool = False, b_codes: int = 0,
                         b_ilv: int = 0) -> bool:
     """Whether a kernel exists for the call: an exact-shape row, or the shape-generic row of K's K-loop class
     (M, N multiples of 256, K a multiple of 512 and at least the row's kmin)."""
-    if (a_fmt, b_fmt, b_codes, b_ilv, int(bias), M, N, K) in _rows():
+    if (a_fmt, b_fmt, b_codes, b_ilv, int(bias), M, N, K, 0, 0) in _rows():
         return True
     if M % 256 or N % 256 or K % 512:
         return False
@@ -88,10 +92,15 @@ def tilescale_supported(M: int, N: int, K: int, a_fmt: int, b_fmt: int, bias: bo
     return False
 
 
+def tilescale_softmax_d_supported(M: int, N: int, K: int, B: int, S: int, b_codes: int = 0, b_ilv: int = 0) -> bool:
+    """Whether an A4W4 kernel emitting softmax_d [B, N/128, S] exists for (M, N, K) (exact rows only)."""
+    return (4, 4, b_codes, b_ilv, 0, M, N, K, B, S) in _rows()
+
+
 def a4w4_b_ilv(M: int, N: int, K: int) -> int:
     """Role B's scale interleave of the A4W4 tilescale kernel for (M, N, K), or ``ts_b_ilv(K)`` if none exists."""
     for r in _rows():
-        if r[:2] == (4, 4) and r[5:] == (M, N, K):
+        if r[:2] == (4, 4) and r[5:8] == (M, N, K) and r[8] == 0:
             return r[3]
     from .tilescale import ts_b_ilv
 
@@ -111,12 +120,17 @@ def gemm_mx_tilescale(
     b_codes: int = 0,
     b_ilv: int = 0,
     b_c1: Tensor | None = None,
+    epi_o: Tensor | None = None,
+    epi_delta: Tensor | None = None,
+    epi_s0: int = 0,
 ) -> Tensor:
     """``out[M, N] = A @ B^T (+ bias)``; raises if the manifest has no kernel for the call. ``b_c1``: an FP6 B's
-    C1 plane in its own buffer (``B`` then holds the C0 plane only)."""
+    C1 plane in its own buffer (``B`` then holds the C0 plane only). ``epi_o`` / ``epi_delta`` / ``epi_s0``: the
+    softmax_d epilogue (module docstring)."""
     if out.ndim != 2:
         raise ValueError(f"gemm_mx_tilescale expects a 2D output, got {out.ndim}D")
-    _gemm_tilescale_asm(A, B, A_scale, B_scale, out, K, bias, a_fmt, b_fmt, b_codes, b_ilv, b_c1)
+    _gemm_tilescale_asm(A, B, A_scale, B_scale, out, K, bias, a_fmt, b_fmt, b_codes, b_ilv, b_c1, epi_o, epi_delta,
+                        epi_s0)
     return out
 
 
@@ -128,5 +142,7 @@ def gemm_a6w6_tilescale(A, B, A_scale, B_scale, out, K, bias=None, b_c1=None):
     return gemm_mx_tilescale(A, B, A_scale, B_scale, out, 6, 6, K, bias, 0, 0, b_c1)
 
 
-def gemm_a4w4_tilescale(A, B, A_scale, B_scale, out, K, b_ilv=0, b_codes=FP4_CODES["row"]):
-    return gemm_mx_tilescale(A, B, A_scale, B_scale, out, 4, 4, K, None, b_codes, b_ilv)
+def gemm_a4w4_tilescale(A, B, A_scale, B_scale, out, K, b_ilv=0, b_codes=FP4_CODES["row"], epi_o=None,
+                        epi_delta=None, epi_s0=0):
+    return gemm_mx_tilescale(A, B, A_scale, B_scale, out, 4, 4, K, None, b_codes, b_ilv, None, epi_o, epi_delta,
+                             epi_s0)

@@ -1,4 +1,4 @@
-a_fmt,b_fmt,b_codes,b_ilv,bias,M,N,K,kcls,kmin,grid,abi,ts_ver,knl_name,co_name
+a_fmt,b_fmt,b_codes,b_ilv,bias,M,N,K,kcls,kmin,grid,abi,ts_ver,knl_name,co_name,epi_b,epi_s
 6,4,1,0,1,16384,9216,3072,0,0,2304,1,1,aiter_ts_a6w4_bias_16384x9216x3072,aiter_ts_a6w4_bias_16384x9216x3072.co
 6,4,1,0,0,16384,12288,3072,0,0,3072,1,1,aiter_ts_a6w4_16384x12288x3072,aiter_ts_a6w4_16384x12288x3072.co
 6,4,1,0,0,16384,3072,12288,0,0,768,1,1,aiter_ts_a6w4_16384x3072x12288,aiter_ts_a6w4_16384x3072x12288.co
@@ -78,3 +78,7 @@ a_fmt,b_fmt,b_codes,b_ilv,bias,M,N,K,kcls,kmin,grid,abi,ts_ver,knl_name,co_name
 4,4,2,4,0,8192,3072,12288,0,0,384,0,1,aiter_ts_a4w4_ko_8192x3072x12288,aiter_ts_a4w4_ko_8192x3072x12288.co
 4,4,2,4,0,8192,3072,9216,0,0,384,0,1,aiter_ts_a4w4_ko_8192x3072x9216,aiter_ts_a4w4_ko_8192x3072x9216.co
 4,4,2,4,0,8192,3072,3072,0,0,384,0,1,aiter_ts_a4w4_ko_8192x3072x3072,aiter_ts_a4w4_ko_8192x3072x3072.co
+4,4,0,4,0,16384,3072,3072,0,0,768,4,1,aiter_ts_a4w4_delta32x512_16384x3072x3072,aiter_ts_a4w4_delta32x512_16384x3072x3072.co,32,512
+4,4,2,4,0,16384,3072,3072,0,0,768,4,1,aiter_ts_a4w4_ko_delta32x512_16384x3072x3072,aiter_ts_a4w4_ko_delta32x512_16384x3072x3072.co,32,512
+4,4,0,4,0,8192,3072,3072,0,0,384,4,1,aiter_ts_a4w4_delta32x512_8192x3072x3072,aiter_ts_a4w4_delta32x512_8192x3072x3072.co,32,512
+4,4,2,4,0,8192,3072,3072,0,0,384,4,1,aiter_ts_a4w4_ko_delta32x512_8192x3072x3072,aiter_ts_a4w4_ko_delta32x512_8192x3072x3072.co,32,512
