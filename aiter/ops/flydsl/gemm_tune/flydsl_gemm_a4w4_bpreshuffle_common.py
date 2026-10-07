@@ -214,7 +214,7 @@ def kernel_fits_shape_splitk_mxfp4(
     ``kernel_fits_shape_splitk`` adds for a8w8.
     """
     # shuffle_{weight,scale}_w4_cdna4 require N % 32 == 0; tile_n can be 16.
-    if N % 32 != 0:
+    if N % 32 != 0 or N % ki.tile_n != 0:
         return False
     equiv = _ki(
         ki.tile_m,
@@ -260,7 +260,7 @@ def _build_kernels_list_splitk_mxfp4(
                 for xcd in _XCD_SWIZZLE_VALS:
                     for sk in split_k_vals:
                         for tm, tn, tk in tiles:
-                            if wpe > 0 and wpe > _estimate_max_wpe(tm, tn):
+                            if wpe > 0 and wpe > _estimate_max_wpe(tm, tn, tk):
                                 continue
                             for umbs in (False, True):
                                 kl[idx] = A4W4SplitKKernelInstance(

@@ -40,7 +40,9 @@ Public wrapper modules live in the categorized folders; the kernel bodies live
 in `_triton_kernels/` at the same relative category path, or in
 `_gluon_kernels/<arch>/` at the same relative category path when the Gluon
 implementation is architecture-specific.
-Tests mirror the same categories under `op_tests/triton_tests/<category>/`.
+Tests mirror the wrapper folders under `op_tests/triton_tests/`, including
+nested wrapper subpackages (for example,
+`moe/moe_routing/test_moe_routing.py`).
 Kernel bodies are internal: tests, benchmarks, and external code call the
 public wrappers only — never `_triton_kernels/` / `_gluon_kernels/` directly.
 
@@ -68,7 +70,7 @@ handed to the same `@triton.jit` kernel.
 - A helper both sides need is split, not duplicated: the torch-free part under
   `utils/_triton/`, the torch part in `utils/`. `moe_common.py` exists in both
   places for exactly this reason.
-- `utils/_triton/tunning/` is exempt — those are standalone tuning harnesses
+- `utils/_triton/tuning/` is exempt — those are standalone tuning harnesses
   that run in a PyTorch environment, not part of the importable surface.
 - Non-PyTorch users still write their own wrappers. Their framework creates
   the tensors, so allocation, dtype and layout checks, and the launch belong
@@ -91,7 +93,7 @@ configs/<arch>/<backend>/<op>/<d_type>/<CONFIG_NAME>-<suffix>.json
 #        gfx1250  gluon     moe   a8w4
 ```
 
-`<op>` is one of `gemm`, `moe`, `conv`, `mhc`, `attention`, `gmm`, `fusions`.
+`<op>` is one of `gemm`, `moe`, `conv`, `mhc`, `attention`, `gmm`, `fusions`, `quant`.
 The flat, arch-prefixed directories (`configs/gemm/`, `configs/moe/`,
 `configs/conv/`, the loose files at the top of `configs/`) and the fallback
 code that reached them are gone.
@@ -127,24 +129,35 @@ escaped or wrong directory. `backend` is declared by the caller (gluon kernels
 and gluon dispatch paths pass `"gluon"`; everything else takes the `"triton"`
 default), because the two backends take disjoint config params and borrowing
 across them would be a bug. `arch=` overrides the running architecture only
-where a loader deliberately retries elsewhere — today just MHC's documented
-gfx942 fallback.
+for documented compatibility fallbacks: MHC retries gfx942, and the Triton
+`fused_clamp_act_mul` path retries its legacy gfx950 table.
 
 `config_utils.py` is the shared core; each family keeps its own small loader
 module on top of it, and every function has exactly one home:
 
 | Module | Entry points |
 | ------ | ------------ |
-| `utils/config_utils.py` | `resolve_config_dir`, `load_config_json`, path constants |
+| `utils/config_utils.py` | `resolve_config_dir`, `load_config_json`, `select_leq_config`, path constants |
 | `utils/gemm_config_utils.py` | `get_gemm_config`, `compute_splitk_params`, `add_default_gemm_config_params`, `pick_gemm_num_stages` |
 | `utils/conv_config_utils.py` | `get_conv_config` + the shape-key formatters and table probes |
 | `utils/mhc_config_utils.py` | `get_mhc_config`, `get_mhc_post_config` |
 | `utils/moe_config_utils.py` | `get_moe_dispatch` — the only MOE config fetcher |
 | `utils/tuned_config_utils.py` | `get_tuned_kernel_config` |
+| `utils/quant_config_utils.py` | `get_quant_config` — Gluon quant launch configs |
 
 Attention and GMM kernels read their single `DEFAULT.json` straight off the
 core (`resolve_config_dir()` + `load_config_json()`); a family module earns
 its place once a family grows real selection logic.
+
+GMM's `get_config()` (`_triton_kernels/gmm.py`) supports an optional
+`"dispatch"` list per variant: each rule is
+`{"config": <name>, "min_K": int, "min_N": int, "min_avg_rows_per_group": int}`
+(omitted thresholds are 0), and the first rule with `K >= min_K`,
+`N >= min_N` and `M >= min_avg_rows_per_group * G` returns the named config
+from the same variant section. Rows are averaged (`M / G`) because the actual
+`group_sizes` stay on the device. Rules are skipped when `accumulate=True`;
+with no match, or no `"dispatch"` key, the variant's `"default"` (or
+`"accumulate"`) config is used.
 
 ### How GEMM configs resolve — `get_gemm_config()`
 
@@ -233,11 +246,66 @@ prefer the family loaders over hand-built
 `f"{AITER_TRITON_CONFIGS_PATH}/..."` paths — a hand-built path is a second
 place the layout is encoded, and it goes stale silently.
 
+Flat dispatch tables whose keys mean “value less than or equal to this upper
+bound” use `select_leq_config(configs, value, prefix="N_LEQ_")`. It selects
+the smallest matching numeric bound and falls back to `any`, returning a copy
+that the caller may consume. Tables keyed on several axes use
+`select_leq_config(table, axes=("M", "N"), M=m, N=n)` with keys such as
+`M_LEQ_32.N_LEQ_1024`. Do not duplicate this selection loop in wrappers.
+
 Kernels that carry a Python autotune search space (opt-in tuning) pin their
 single default tile per arch via
 `utils/tuned_config_utils.py::get_tuned_kernel_config(op, config_name,
 kernel_name, fallback, backend)`, which reads the nested-layout
 `DEFAULT.json`. The `fallback` must be launchable on any arch, not fast on one.
+
+### Autotune search spaces — `autotune_configs()`
+
+Every `@triton.autotune` takes its config list from
+`utils/tuned_config_utils.py::autotune_configs(family, configs,
+default_config=None, env=None, default="0")`. Never hand it a raw list:
+
+```python
+@triton.autotune(
+    configs=autotune_configs("MY_FAMILY", _get_autotune_configs()),
+    key=[...],
+)
+```
+
+It returns every candidate while `<FAMILY>_TRITON_AUTOTUNE=1`, and exactly one
+config otherwise, so nothing benchmarks at launch. A raw list searches on every
+new key: it costs compile time, breaks CUDA-graph capture, and leaves a unit
+test's numerics dependent on whichever config the timing happened to pick that
+run. Which one gets pinned is `configs[0]` unless `default_config=` says
+otherwise, and that default should come from `get_tuned_kernel_config` so
+retuning it is a JSON edit rather than a code change.
+
+`env=` names the variable for a family that published its own before this
+convention existed, and `default=` is what an unset variable means for it —
+together they let such a family route through this helper without changing what
+it did before. `flash_attn_triton_amd/` uses both, for
+`FLASH_ATTENTION_TRITON_AMD_AUTOTUNE`, which is on by default where every other
+family is off. This covers the kernel that applies `triton.autotune()` as a call
+rather than a decorator too (`_triton_kernels/fusions/attn_res.py`, behind
+`ATTN_RES_TRITON_AUTOTUNE=1`) — a grep for the decorator misses that one.
+
+A candidate list published in the config JSON is a **search space**, not a
+launch-time list: handed straight to `@triton.autotune` it still benchmarks
+every entry on every new key. It goes to `configs`, and `default_config=` pins
+what launches — `chunk_delta_attn/flash_kda.py` reads its six K2 candidates
+through `chunk_delta_attn_tuned_config_shortlist` and pins
+`_K2_FALLBACK_CONFIG`. There are no exemptions: all 41 `@triton.autotune` sites
+under `aiter/ops/triton/` go through the helper.
+
+One consequence to know when reading the tuner: Triton consults its autotune
+cache only when the config list holds more than one entry (`autotuner.py:235`);
+with one config it takes `configs[0]` and never reads the `key`. A test about
+the `key` therefore has to hand the autotuner a config space first — see
+`test_tuner_keeps_the_two_schedules_apart`.
+
+The unit tests do not rely on any of it: `op_tests/triton_tests/__init__.py`
+pins one config per kernel for the whole suite, so a test's numerics never
+depend on a benchmark.
 
 ### Config naming
 
@@ -262,7 +330,7 @@ kernel_name, fallback, backend)`, which reads the nested-layout
 
 For adding a config, seeding a new arch, and the per-family key schemes, follow
 `configs/CLAUDE.md` (§5 and §6). For the manual tuning flow, see
-`utils/_triton/tunning/README.md`.
+`utils/_triton/tuning/README.md`.
 
 ---
 
@@ -343,10 +411,57 @@ expectations such as "weights must be pre-shuffled", etc.).
 
 ---
 
+## Logging
+
+Use the aiter logger, not `print`, and pass the values rather than formatting
+them into the message:
+
+```python
+from aiter import logger
+
+logger.info("resolved config for M=%d N=%d: %s", M, N, config)   # lazy
+# not: logger.info(f"resolved config for M={M} N={N}: {config}") # built every call
+```
+
+An f-string is evaluated before the level check, so it costs a full format on
+every call even when the record is below the configured level — and for a
+kernel wrapper that can mean formatting a tensor repr per launch. Match the
+placeholder to the value: `%d` for counts and dimensions, `%f` for thresholds
+and real scalars, `%s` for tensors, `torch.Size` shapes, tuples and strings.
+`%d` or `%f` on `None` raises when the record is emitted, which logging
+reports as `--- Logging error ---` on stderr instead of raising, so use `%s`
+for anything optional:
+
+```python
+logger.info("%s", 1.0)    # ok
+logger.info("%s", None)   # ok
+logger.info("%f", 1.0)    # ok
+logger.info("%f", None)   # TypeError: must be real number, not NoneType
+```
+
+The signature is the thing to check: a parameter annotated `float | None` or
+`int | None` takes `%s` even where the call site happens to have resolved it.
+
+An exception is not an argument to format. `logging` renders the traceback
+itself, so pass `exc_info=True` rather than `%s`-ing the caught object.
+`AiterTritonLogger` forwards only `*args`, so reach the stdlib logger for that:
+
+```python
+except Exception:
+    logger.warning("config parse error", exc_info=True)                 # aiter.logger
+    _LOGGER.get_logger().warning("config parse error", exc_info=True)   # AiterTritonLogger
+```
+
+Gate verbose output with `logger.debug(...)`, not with an `if` around the
+call; `AITER_LOG_LEVEL=DEBUG` turns it on, and `aiter/__init__.py` applies
+that to the logger and its handler together. Never lower the level by hand
+after import (`logger.setLevel(...)` leaves the handler where it was) and
+never call `logging.basicConfig(...)` from library code.
+
 ## Tests
 
-Tests live under `op_tests/triton_tests/<category>/`, mirroring this
-directory's categories:
+Tests live under `op_tests/triton_tests/`, mirroring the wrapper folder
+structure in this directory, including nested wrapper subpackages:
 
 ```bash
 pytest op_tests/triton_tests/              # everything

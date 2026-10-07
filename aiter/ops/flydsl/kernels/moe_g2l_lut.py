@@ -31,7 +31,7 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
 MAX_G2L_EXPERTS = 512
 
 
-def build_moe_g2l_lut_module():
+def build_moe_g2l_lut_module(clear_counter: bool = True):
     """JIT launcher: single-block build of the EP global->local expert LUT."""
 
     # Double-buffered LDS for the Hillis-Steele scan (ping-pong between passes).
@@ -63,9 +63,10 @@ def build_moe_g2l_lut_module():
         if tid == c0:
             ptr_buf_tensor(nvr_out)[0] = ptr_buf_tensor(nvt)[0] * topk
 
-        # Route counter zero-init folded in: E <= n <= block size, so tid<E
-        # clears counter[tid] and the host torch.zeros(E) launch goes away.
-        if tid < E:
+        # Generic grouped-MoE owns this reset. MegaMoE's TDM dispatch can
+        # instead fold it into its existing tail and compile these stores
+        # away while keeping this kernel available to other callers.
+        if const_expr(clear_counter) and tid < E:
             ptr_buf_tensor(counter)[tid] = c0
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()

@@ -65,6 +65,18 @@ def shuffle_mxfp8fp4_scale(src: torch.Tensor) -> torch.Tensor:
     return out.view(x_type)
 
 
+def shuffle_blockscale_to_mxfp8_scale(scale: torch.Tensor, n: int) -> torch.Tensor:
+    """128x128 e8m0 block scale [ceil(n/128), K/128] -> shuffled 1x32 [pad32(n), K/32].
+
+    Lossless (each 1x32 block repeats its 128x128 block's exponent): the n32k4
+    B-scale of the 1x32 MXFP8 GEMM, built once at weight load.
+    """
+    s = scale.view(torch.uint8).repeat_interleave(128, dim=0)[:n]
+    return shuffle_mxfp8fp4_scale(s.repeat_interleave(4, dim=1).contiguous()).view(
+        scale.dtype
+    )
+
+
 def shuffle_weight_gfx1250(w: torch.Tensor) -> torch.Tensor:
     """
     Preshuffle weights for gfx1250 WMMA.
@@ -390,7 +402,14 @@ def shuffle_scale(
             dtype=src.dtype,
             device=src.device,
         )
-
+        # Initialise the pad. torch.empty leaves it undefined, and kernels that
+        # read whole 8-group tiles then consume garbage (E8M0 0xFF is NaN), so
+        # the result depends on stale device memory. 0x7F is E8M0 1.0, matching
+        # the is_guinterleave branch below.
+        if scale_padded.element_size() == 1:
+            scale_padded.view(torch.uint8).fill_(0x7F)
+        else:
+            scale_padded.fill_(1.0)
         scale_padded[:m, :n] = src
         scale = scale_padded
         sm, sn = scale.shape
@@ -471,6 +490,55 @@ def shuffle_scale_a16w4(
     """Backward-compatible wrapper around `shuffle_scale(..., is_guinterleave=True)`."""
     return shuffle_scale(
         src, experts_cnt=experts_cnt, is_guinterleave=True, gate_up=gate_up
+    )
+
+
+def _pad_kblocks(s: torch.Tensor, K: int) -> tuple[torch.Tensor, int]:
+    K1 = (K + 255) // 256
+    if s.shape[-1] < 2 * K1:
+        s = F.pad(s, (0, 2 * K1 - s.shape[-1]), value=0x7F)
+    return s, K1
+
+
+def shuffle_scale_blockscale_a(a_scale: torch.Tensor, K: int) -> torch.Tensor:
+    s = a_scale.view(torch.uint8).contiguous()
+    rows = s.shape[0]
+    if s.shape[-1] != K // 128:
+        raise ValueError(
+            f"blockscale a_scale must be (rows, K//128)=(*, {K // 128}); "
+            f"got {tuple(a_scale.shape)}"
+        )
+    if rows % 32:
+        s = F.pad(s, (0, 0, 0, (-rows) % 32), value=0x7F)  # 0x7F = E8M0 1.0
+        rows = s.shape[0]
+    s, K1 = _pad_kblocks(s, K)
+    from aiter.utility import dtypes
+
+    return (
+        s.view(rows // 32, 2, 16, K1, 2)
+        .permute(0, 3, 2, 4, 1)
+        .contiguous()
+        .view(-1)
+        .view(dtypes.fp8_e8m0)
+    )
+
+
+def shuffle_scale_blockscale_b(b_scale: torch.Tensor, N: int, K: int) -> torch.Tensor:
+    s = b_scale.view(torch.uint8).contiguous()
+    if s.shape != (N // 128, K // 128):
+        raise ValueError(
+            f"blockscale b_scale must be (N//128, K//128)=({N // 128}, {K // 128}); "
+            f"got {tuple(b_scale.shape)}"
+        )
+    s, K1 = _pad_kblocks(s, K)
+    from aiter.utility import dtypes
+
+    return (
+        s.view(N // 128, K1, 2, 1)
+        .expand(N // 128, K1, 2, 2)
+        .contiguous()
+        .view(-1)
+        .view(dtypes.fp8_e8m0)
     )
 
 

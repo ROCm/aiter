@@ -39,6 +39,7 @@ from aiter.fused_moe import (
     torch_moe_stage1,
     torch_moe_stage2,
 )
+from aiter.fused_moe_registry import make_fused_moe_impl_kernel_name
 from aiter.int4_utils import (
     convert_int8_to_uint32_int4,
     rearrange_4bit_elements,
@@ -113,6 +114,23 @@ TUNE_MOE_EXPERT_BALANCE = (
 )
 
 COS_DIFF_THRESHOLD = 1e-1
+
+
+_TUNE_EXCLUDE_KERNEL_PATTERNS = [
+    p.strip()
+    for p in os.environ.get("AITER_FMOE_TUNE_EXCLUDE_KERNELS", "").split(",")
+    if p.strip()
+]
+
+
+def _is_tune_excluded_kernel(kernel_name) -> bool:
+    """True if ``kernel_name`` matches any excluded-kernel pattern."""
+    name = str(kernel_name or "")
+    return any(pat in name for pat in _TUNE_EXCLUDE_KERNEL_PATTERNS)
+
+
+def _all_finite(tensor: torch.Tensor) -> bool:
+    return bool(torch.isfinite(tensor).all().item())
 
 
 def _parse_tuning_type(value):
@@ -584,6 +602,7 @@ class FmoeTuner(TunerCommon):
         q_type,
         act_type,
         splitk=0,
+        use_nt=False,
     ):
         inter_dim = w1_qt_shffle_ck.shape[1] // 2
         token_num = a1_qt.shape[0]
@@ -619,6 +638,7 @@ class FmoeTuner(TunerCommon):
             q_type,
             act_type,
             splitk if is_splitk else 0,
+            use_non_temporal_load=use_nt,
             dst_type=dtype if is_splitk else None,
         )
         if is_splitk:
@@ -660,6 +680,7 @@ class FmoeTuner(TunerCommon):
         blockM,
         q_type,
         act_type,
+        use_nt=False,
     ):
         model_dim = w2_qt_shffle_ck.shape[1]
         token_num = a2_qt.shape[0]
@@ -685,6 +706,7 @@ class FmoeTuner(TunerCommon):
             sorted_weights,
             q_type,
             act_type,
+            use_non_temporal_load=use_nt,
         )
 
     @staticmethod
@@ -944,19 +966,22 @@ class FmoeTuner(TunerCommon):
         #   a=a1_qt, w1=w1_qt_shuf, w1_scale=w1_scale_shuf, a1_scale=a1_scale_sort,
         #   v2_output_layout=True, ...). Recipe mirrors
         # mxfp4_v2_tune_utils.populate_baseline_v2_intermediate.
-        d = _v2_gen(
-            token,
-            model_dim,
-            inter_dim,
-            expert,
-            topk,
-            blockM,
-            adtype=adtype,
-            b_dtype=b_dtype,
-            activation=act_type,
-            situ_beta=DEFAULT_SITUV2_BETA,
-            situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
-        )
+        # Generate on the GPU: the CPU fp4 packing of E x 2I x H weights takes
+        # tens of minutes per shape at E=385.
+        with torch.device(device):
+            d = _v2_gen(
+                token,
+                model_dim,
+                inter_dim,
+                expert,
+                topk,
+                blockM,
+                adtype=adtype,
+                b_dtype=b_dtype,
+                activation=act_type,
+                situ_beta=DEFAULT_SITUV2_BETA,
+                situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
+            )
         v = _v2_build_inputs(d, token, model_dim, inter_dim, expert, topk, blockM)
         # Precompute the sorted A-scale here so it is NOT timed in the run func.
         a1_scale_sort = moe_mxfp4_sort(
@@ -2168,6 +2193,7 @@ class FmoeTuner(TunerCommon):
         fuse_fp8=False,
         situ_beta=DEFAULT_SITUV2_BETA,
         situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
+        swiglu_limit=None,
         output_sorted=False,
     ):
         # a16wi4: convert int8 weights to i4x2 so reference function detects the right path
@@ -2194,6 +2220,7 @@ class FmoeTuner(TunerCommon):
             doweight=doweight_stage1,
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
+            swiglu_limit=swiglu_limit,
         )
         token_num = a1_qt.shape[0]
         if fuse_fp4:
@@ -2462,6 +2489,7 @@ class FmoeTuner(TunerCommon):
         activation=ActivationType.Silu,
         quant_type=QuantType.No,
         doweight_stage1=False,
+        swiglu_limit=None,
     ):
         ref1 = torch_moe_stage1(
             hidden_states,
@@ -2477,6 +2505,7 @@ class FmoeTuner(TunerCommon):
             doweight=doweight_stage1,
             situ_beta=DEFAULT_SITUV2_BETA,
             situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
+            swiglu_limit=swiglu_limit,
         )
         AQDType = hidden_states.dtype
 
@@ -2979,6 +3008,8 @@ class FmoeTuner(TunerCommon):
                 and not (q_type == QuantType.per_1x32 and q_dtype_w == dtypes.fp4x2)
             ):
                 for el in asm_kernels.get(blockM, []):
+                    if _is_tune_excluded_kernel(el):
+                        continue
                     tasks.append(
                         (
                             (info, "stage1", el, blockM),  # tag
@@ -3146,14 +3177,19 @@ class FmoeTuner(TunerCommon):
             not doweight_stage1,
             True,  # bpreshuffle
         )
+        # only the blockscale kernels read the hint
+        nt_values = (False, True) if q_type == QuantType.per_1x128 else (False,)
         for blockM in blockMs:
             if blockM in [16, 32, 64, 128] and use_g1u1:
-                for kernel in ck_stage1_kernels.values():
-                    if kernel.MPerBlock != blockM:
-                        continue
+                for kernel, nt in [
+                    (k, n)
+                    for k in ck_stage1_kernels.values()
+                    if k.MPerBlock == blockM
+                    for n in nt_values
+                ]:
                     tasks_ck.append(
                         (
-                            (info, "stage1", kernel.name, blockM),  # tag
+                            (info, "stage1", kernel.name, blockM, 0, 0, nt),  # tag
                             FmoeTuner.generate_data_2stages,
                             (
                                 token,
@@ -3191,7 +3227,7 @@ class FmoeTuner(TunerCommon):
                                 q_type,
                                 act_type,
                             ),
-                            {},
+                            {"use_nt": nt},
                             FmoeTuner.run_torch_moe_stage1,
                             (
                                 [
@@ -3221,9 +3257,12 @@ class FmoeTuner(TunerCommon):
                         )
                     )
 
-                for kernel in ck_stage2_kernels.values():
-                    if kernel.MPerBlock != blockM:
-                        continue
+                for kernel, nt in [
+                    (k, n)
+                    for k in ck_stage2_kernels.values()
+                    if k.MPerBlock == blockM and not _is_tune_excluded_kernel(k.name)
+                    for n in nt_values
+                ]:
                     s2_ref_args = (
                         [
                             "a2_qt",
@@ -3241,7 +3280,7 @@ class FmoeTuner(TunerCommon):
                     )
                     tasks_ck.append(
                         (
-                            (info, "stage2", kernel.name, blockM),  # tag
+                            (info, "stage2", kernel.name, blockM, 0, 0, nt),  # tag
                             FmoeTuner.generate_data_2stages,
                             (
                                 token,
@@ -3279,7 +3318,7 @@ class FmoeTuner(TunerCommon):
                                 q_type,
                                 act_type,
                             ),
-                            {},
+                            {"use_nt": nt},
                             FmoeTuner.run_torch_moe_stage2,
                             s2_ref_args,
                             {},
@@ -4531,10 +4570,12 @@ class FmoeTuner(TunerCommon):
 
         return tasks_flydsl
 
-    def run_config(self, args):
+    def run_config(self, args, target_fused_moe=None, config_string=""):
         from aiter.fused_moe import fused_moe, fused_topk
         from aiter.test_common import checkAllclose, run_perftest
 
+        if target_fused_moe is None:
+            target_fused_moe = fused_moe
         untunedf = self.untunedf
         results = []
         for i in range(len(untunedf)):
@@ -4552,6 +4593,8 @@ class FmoeTuner(TunerCommon):
             q_type = QuantType.per_1x128 if q_type == QuantType.per_128x128 else q_type
             use_g1u1 = bool(row["use_g1u1"])
             doweight_stage1 = bool(row["doweight_stage1"])
+            limit_env = os.environ.get("AITER_MXFP4_TUNE_SWIGLU_LIMIT")
+            swiglu_limit = None if limit_env in (None, "") else float(limit_env)
             # fused_moe overrides the activation quant dtype at runtime for
             # per_1x32 fp4-weight MoE (gate_mode defaults to SEPARATED, which
             # run_config does not override): Silu -> fp4, Swiglu -> bf16/fp4 by M.
@@ -4765,7 +4808,7 @@ class FmoeTuner(TunerCommon):
                     a1_qt, a1_scale = torch_quant(hidden, quant_dtype=eff_q_dtype_a)
 
                 out, us = run_perftest(
-                    fused_moe,
+                    target_fused_moe,
                     hidden,
                     w1_qt_fmoe,
                     w2_qt_fmoe,
@@ -4788,6 +4831,7 @@ class FmoeTuner(TunerCommon):
                         if act_type == ActivationType.Situv2
                         else None
                     ),
+                    swiglu_limit=swiglu_limit,
                     w1_scale=w1_scale_fmoe,
                     w2_scale=w2_scale_fmoe,
                     dtype=dtype,
@@ -4815,8 +4859,13 @@ class FmoeTuner(TunerCommon):
                     activation=act_type,
                     quant_type=q_type,
                     doweight_stage1=doweight_stage1,
+                    swiglu_limit=swiglu_limit,
                 )
-                if out.count_nonzero() == 0 and ref.count_nonzero() > 0:
+                if not _all_finite(out) or not _all_finite(ref):
+                    diag = tensor_compare_diagnostics(ref, out)
+                    status = f"error:nonfinite output or reference; {diag}"
+                    err_ratio = 1.0
+                elif out.count_nonzero() == 0 and ref.count_nonzero() > 0:
                     diag = tensor_compare_diagnostics(ref, out)
                     status = (
                         "error:output is all zeros (kernel produced no output); "
@@ -4847,7 +4896,8 @@ class FmoeTuner(TunerCommon):
                         status = (
                             f"mismatch:err_ratio={err_ratio:.6g}"
                             f"(>{allowed_err_ratio_desc}),"
-                            f"logits_diff={logits_diff:.6g}(>{diag})"
+                            f"logits_diff={logits_diff:.6g}(>{cos_tol}),"
+                            f"diagnostics={diag}"
                         )
                 results.append(
                     {
@@ -4855,6 +4905,7 @@ class FmoeTuner(TunerCommon):
                         "e2e_us": us,
                         "kernel_us": kernel_us,
                         "status": status,
+                        "err_ratio": err_ratio,
                     }
                 )
             except AssertionError as e:
@@ -5097,6 +5148,9 @@ class FmoeTuner(TunerCommon):
         if "flat" not in resultdf.columns:
             resultdf["flat"] = 0
         resultdf["flat"] = resultdf["flat"].fillna(0).astype(int)
+        if "nt" not in resultdf.columns:
+            resultdf["nt"] = 0
+        resultdf["nt"] = resultdf["nt"].fillna(0).astype(int)
         if results is not None:
             resultdf = resultdf.astype(str).drop_duplicates(
                 subset=self.keys,
@@ -5109,6 +5163,20 @@ class FmoeTuner(TunerCommon):
         ordered_cols += [c for c in resultdf.columns if c not in ordered_cols]
         resultdf = resultdf[ordered_cols]
         resultdf.to_csv(file, index=False)
+
+    @staticmethod
+    def _pair_nt_agnostic(profileDF, kernel_col):
+        # Only the CK 2-stage instances read the hint; the rest are measured
+        # once, so give them a copy on the nt=1 side of the merge. With the
+        # sweep off there is no such side and the copy would survive as a tie.
+        if not (profileDF["nt"] == 1).any():
+            return profileDF
+        agnostic = profileDF[
+            ~profileDF[kernel_col].astype(str).str.startswith("moe_ck2stages")
+        ]
+        if agnostic.empty:
+            return profileDF
+        return pd.concat([profileDF, agnostic.assign(nt=1)], ignore_index=True)
 
     def post_process(self, results, args, topk=-1, fast_mode=False):
         profileDF = []
@@ -5149,6 +5217,7 @@ class FmoeTuner(TunerCommon):
                 block_m = tail[2]
                 flat_flag = int(tail[3]) if len(tail) > 3 else 0
                 v2_flag = int(tail[4]) if len(tail) > 4 else 0
+                nt_flag = int(tail[5]) if len(tail) > 5 else 0
                 tflops, bw = self.calculate((key, stage, kernelName, block_m, us, err))
                 row_ksplit = 0
                 sk_match = re.search(r"_sk(\d+)$", str(kernelName))
@@ -5181,6 +5250,7 @@ class FmoeTuner(TunerCommon):
                         bw,
                         flat_flag,
                         v2_flag,
+                        nt_flag,
                     ]
                 )
 
@@ -5199,6 +5269,7 @@ class FmoeTuner(TunerCommon):
                     "bw",
                     "flat",
                     "v2",
+                    "nt",
                 ],
             )
             prorfiles.append(profileDF)
@@ -5248,7 +5319,7 @@ class FmoeTuner(TunerCommon):
             profileDF = (
                 profileDF.sort_values("us")
                 .drop_duplicates(
-                    ["stage", "block_m", "flat", "v2", "_is_fused"], keep="first"
+                    ["stage", "block_m", "flat", "nt", "v2", "_is_fused"], keep="first"
                 )
                 .drop(columns=["_is_fused"])
             )
@@ -5265,6 +5336,7 @@ class FmoeTuner(TunerCommon):
                     "bw": "bw1",
                 }
             )
+            stage1_profileDF = self._pair_nt_agnostic(stage1_profileDF, "kernelName1")
             stage2_profileDF = profileDF[profileDF["stage"] == "stage2"].drop(
                 columns=["stage", "ksplit", "flat"]
             )
@@ -5277,6 +5349,7 @@ class FmoeTuner(TunerCommon):
                     "bw": "bw2",
                 }
             )
+            stage2_profileDF = self._pair_nt_agnostic(stage2_profileDF, "kernelName2")
             if (stage1_profileDF.shape[0] == 0 and stage2_profileDF.shape[0] != 0) or (
                 stage1_profileDF.shape[0] != 0 and stage2_profileDF.shape[0] == 0
             ):
@@ -5334,6 +5407,7 @@ class FmoeTuner(TunerCommon):
                     "use_g1u1",
                     "doweight_stage1",
                     "block_m",
+                    "nt",
                     "v2",
                 ],
                 how="inner",
@@ -5374,6 +5448,7 @@ class FmoeTuner(TunerCommon):
                         self.INVALID_TIME,
                         0,
                         0,
+                        -1,
                         -1,
                         -1,
                         -1,
@@ -5836,6 +5911,234 @@ class FmoeTuner(TunerCommon):
                         .isin(self.tunedf[dedup_cols].apply(tuple, axis=1))
                     )
                     self.untunedf = self.untunedf[~mask]
+
+    def e2e_tune(self, args):
+        """
+        Choosing best kernels based on (stage1_us + stage2_us) or (single_stage_us)
+        may overlook some overheads between stages, and this e2e tune is a complement.
+        """
+        from functools import partial
+
+        from aiter.ops.flydsl.fused_moe_gfx942 import (
+            Config,
+            _Problem,
+            get_tune_space,
+            run_flydsl_moe_gfx942,
+        )
+
+        results_base = self._run_config_for_shapes(
+            args,
+            self.untunedf,
+            config_file=self.get_out_file(args.tune_file),
+        )
+        better_kernels = {}
+
+        for i in range(len(self.untunedf)):
+            e2e_us = results_base[i]["e2e_us"]
+            err_ratio = results_base[i].get("err_ratio", 0)
+            status = results_base[i].get("status", "")
+            row = self.untunedf.iloc[i]
+            row_key = tuple(row[col] for col in self.keys)
+            keyname = " ".join(map(str, row_key))
+            baseline_valid = status == "ok" and e2e_us > 0
+            better_kernels[i] = {
+                "name": keyname,
+                "row": row,
+                "kernel_name": None,
+                "e2e_us": e2e_us if baseline_valid else float("inf"),
+                "err_ratio": err_ratio,
+                "e2e_us_base": e2e_us,
+                "err_ratio_base": err_ratio,
+            }
+            print(keyname, e2e_us, err_ratio)
+
+        def target_fused_moe(
+            hidden_states,
+            w1,
+            w2,
+            topk_weight,
+            topk_ids,
+            expert_mask=None,
+            activation=ActivationType.Silu,
+            quant_type=QuantType.No,
+            doweight_stage1=False,
+            w1_scale=None,
+            w2_scale=None,
+            num_local_tokens=None,
+            moe_sorting_dispatch_policy=0,
+            dtype=None,
+            config_string="",
+            swiglu_limit=None,
+            beta=None,
+            linear_beta=None,
+        ):
+            del beta, linear_beta
+            if doweight_stage1:
+                raise NotImplementedError(
+                    "gfx942 FlyDSL whole-graph tuning does not support "
+                    "doweight_stage1=True"
+                )
+            return run_flydsl_moe_gfx942(
+                hidden_states,
+                w1,
+                w2,
+                topk_weight,
+                topk_ids,
+                activation,
+                quant_type,
+                w1_scale,
+                w2_scale,
+                expert_mask,
+                num_local_tokens,
+                moe_sorting_dispatch_policy,
+                config_string=config_string,
+                swiglu_limit=swiglu_limit,
+            )
+
+        GREEN = "\033[0;32m"
+        YELLOW = "\033[1;33m"
+        RED = "\033[0;31m"
+        END = "\033[0m"
+        for config_string in get_tune_space():
+            config = Config.from_string(config_string)
+            eligible_indices = [
+                position
+                for position, (_, row) in enumerate(self.untunedf.iterrows())
+                if not bool(row["doweight_stage1"])
+                and config.unsupported_reason(
+                    _Problem(
+                        batch=int(row["token"]),
+                        experts=int(row["expert"]),
+                        gateup_dim=int(row["inter_dim"]) * 2,
+                        hidden_dim=int(row["model_dim"]),
+                        model_dim=int(row["model_dim"]),
+                        inter_dim=int(row["inter_dim"]),
+                        topk=int(row["topk"]),
+                        quant_type="",
+                    )
+                )
+                is None
+            ]
+            if not eligible_indices:
+                continue
+            all_untunedf = self.untunedf
+            self.untunedf = all_untunedf.iloc[eligible_indices].reset_index(drop=True)
+            try:
+                results_cur = self.run_config(
+                    args,
+                    target_fused_moe=partial(
+                        target_fused_moe, config_string=config_string
+                    ),
+                    config_string=config_string,
+                )
+            except Exception as e:  # noqa: BLE001
+                print(f"{RED}Error with config {config_string}: {e}{END}")
+                continue
+            finally:
+                self.untunedf = all_untunedf
+            block_m = config.BLOCK_M
+            ksplit = 0
+            run_1stage = 0
+            err1 = "0%"
+            err2 = "0%"
+            kernelName1 = make_fused_moe_impl_kernel_name(
+                "flydsl_gfx942", config_string
+            )
+            kernelName2 = ""
+            xbf16 = 0
+            for result_index, i in enumerate(eligible_indices):
+                k = better_kernels[i]
+                e2e_us = results_cur[result_index]["e2e_us"]
+                status = results_cur[result_index]["status"]
+                err_ratio = results_cur[result_index].get("err_ratio", 0)
+                # skip invalid kernel
+                if e2e_us < 0 or status != "ok":
+                    print(
+                        f"{k['name']} {RED} {e2e_us=:.3f} {status=} {END} {kernelName1}"
+                    )
+                    continue
+                print(
+                    f"{k['name']} {YELLOW} {float(k['e2e_us_base']):.3f}us -> {float(e2e_us):.3f}us (err: {err_ratio*100:.0f}%) {END} {kernelName1}"
+                )
+                if e2e_us < k["e2e_us"]:
+                    k["e2e_us"] = e2e_us
+                    k["err_ratio"] = err_ratio
+                    k["kernel_name"] = kernelName1
+                    row = self.untunedf.iloc[i]
+                    try:
+                        key = tuple(row[self.keys].values)
+                        tflops, bw = self.calculate(
+                            (key, "stage1", kernelName1, block_m, e2e_us, err1)
+                        )
+                    except Exception:  # noqa: BLE001
+                        tflops, bw = 0, 0
+                    k["results"] = (
+                        block_m,
+                        ksplit,
+                        e2e_us,
+                        kernelName1,
+                        f"{err_ratio*100:.2f}%",
+                        0.0,
+                        kernelName2,
+                        err2,
+                        e2e_us,
+                        run_1stage,
+                        xbf16,
+                        0,  # flat
+                        tflops,
+                        bw,
+                        0,  # nt: flydsl rows do not read the hint
+                    )
+
+        tune_results = []
+
+        for i, k in better_kernels.items():
+            if k["kernel_name"] is None:
+                continue
+            tune_results.append([*[k["row"][col] for col in self.keys], *k["results"]])
+            print(
+                f"{k['name']} {GREEN} {float(k['e2e_us_base']):.3f}us -> {float(k['e2e_us']):.3f}us (err: {k['err_ratio_base']*100:.0f}% -> {k['err_ratio']*100:.0f}%) {END} {k['kernel_name']}"
+            )
+
+        if tune_results:
+            new_tunedf = pd.DataFrame(tune_results, columns=self.columns)
+            new_tunedf["_tag"] = ""
+            output_file = self.get_out_file(args.tune_file)
+            # Merge with existing tuned file: keep existing rows that are not
+            # being updated, so repeated runs don't lose entries for shapes
+            # where the new kernel doesn't beat the baseline.
+            key_cols = []
+            if os.path.exists(output_file):
+                existing_df = pd.read_csv(output_file)
+                # Build key for dedup: use the untuned input columns
+                key_cols = [
+                    c
+                    for c in self.keys
+                    if c in new_tunedf.columns and c in existing_df.columns
+                ]
+                if key_cols:
+                    # Remove from existing any rows that will be replaced by new results
+                    new_keys = set(new_tunedf[key_cols].apply(tuple, axis=1))
+                    keep_mask = (
+                        ~existing_df[key_cols].apply(tuple, axis=1).isin(new_keys)
+                    )
+                    merged_df = pd.concat(
+                        [existing_df[keep_mask], new_tunedf], ignore_index=True
+                    )
+                else:
+                    merged_df = new_tunedf
+            else:
+                merged_df = new_tunedf
+            # Sort by key columns before writing
+            sort_cols = (
+                [c for c in key_cols if c in merged_df.columns] if key_cols else []
+            )
+            if sort_cols:
+                merged_df = merged_df.sort_values(sort_cols, ignore_index=True)
+            merged_df.to_csv(output_file, index=False)
+            print(f"{output_file} has been updated with {len(tune_results)} entries!")
+        else:
+            print("No improvements found during e2e tuning.")
 
 
 class GroupedFmoeTuner(FmoeTuner):
@@ -6381,7 +6684,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         return data
 
     @staticmethod
-    def _port_e2e(data, kn1, kn2, topk, ne, h, dtype):
+    def _port_e2e(data, kn1, kn2, topk, ne, h, dtype, swiglu_limit=None):
         # kn2 may name either gemm2 family (path B or native mxmoe).
         _g2 = parse_g2_kname_any(kn2)
         atomic = _g2["atomic"]
@@ -6446,6 +6749,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
             situ_linear_beta=(
                 DEFAULT_SITUV2_LINEAR_BETA if p1["act"] == "situv2" else 1.0
             ),
+            swiglu_limit=swiglu_limit,
         )
         return _mxfp4_a4w4_stage2_fw(
             inter_q,
@@ -6465,7 +6769,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         )
 
     @staticmethod
-    def _torch_ref(data, topk, dtype, activation):
+    def _torch_ref(data, topk, dtype, activation, swiglu_limit=None):
         ref1 = FmoeTuner.run_torch_moe_stage1(
             data["a1_qt"],
             data["w1_qt"],
@@ -6479,6 +6783,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
             quant_type=QuantType.per_1x32,
             doweight_stage1=False,
             topk=topk,
+            swiglu_limit=swiglu_limit,
         )
         return FmoeTuner.run_torch_moe_stage2(
             ref1,
@@ -6505,16 +6810,22 @@ class Mxfp4FlydslTuner(FmoeTuner):
             "swiglu": ActivationType.Swiglu,
             "silu": ActivationType.Silu,
         }[self._row_act(row)]
+        limit_env = os.environ.get("AITER_MXFP4_TUNE_SWIGLU_LIMIT")
+        swiglu_limit = None if limit_env in (None, "") else float(limit_env)
         data = self._prepare_case(token, h, e, ne, topk, dtype)
-        out = self._port_e2e(data, kn1, kn2, topk, ne, h, dtype)
-        ref = self._torch_ref(data, topk, dtype, activation)
+        out = self._port_e2e(
+            data, kn1, kn2, topk, ne, h, dtype, swiglu_limit=swiglu_limit
+        )
+        ref = self._torch_ref(data, topk, dtype, activation, swiglu_limit=swiglu_limit)
         err = cosine_diff_compare(ref, out, msg=f"port[{kn1}+{kn2}]")
         # NaN must reject explicitly: `nan > errRatio` is False, so a candidate
         # producing garbage would otherwise pass the gate and, being fast, win.
         if err is None or not math.isfinite(float(err)) or float(err) > args.errRatio:
             raise RuntimeError(f"cosine err_ratio {err} > {args.errRatio}")
         _, us = run_perftest(
-            lambda: self._port_e2e(data, kn1, kn2, topk, ne, h, dtype),
+            lambda: self._port_e2e(
+                data, kn1, kn2, topk, ne, h, dtype, swiglu_limit=swiglu_limit
+            ),
             num_warmup=int(args.warmup),
             num_iters=int(args.iters),
         )
@@ -6774,7 +7085,10 @@ if __name__ == "__main__":
         "use_g1u1",
         "doweight_stage1",
     ]
-    grouped_key = key + ["gate_mode"]
+    # ep_fused is part of the shape identity (gemm2 doing the EP scatter shifts
+    # the stage2 tile optimum), so it must be in the dedup key or the write-back
+    # collapses an ep_fused row into the generic one for the same shape.
+    grouped_key = key + ["gate_mode", "ep_fused"]
     resultList = [
         "block_m",
         "ksplit",
@@ -6824,7 +7138,11 @@ if __name__ == "__main__":
             "mxfp4FlydslTuner", key, resultList, "mxfp4 a4w4 flydsl port fmoe tuner"
         )
     else:
-        tuner = FmoeTuner("fmoeTuner", key, resultList, "fmoe tuner")
+        tuner = FmoeTuner("fmoeTuner", key, resultList + ["nt"], "fmoe tuner")
     args = tuner.parse_args()
 
-    tuner.run(args, False)
+    if args.e2e_tune:
+        tuner.pre_process(args)
+        tuner.e2e_tune(args)
+    else:
+        tuner.run(args, False)

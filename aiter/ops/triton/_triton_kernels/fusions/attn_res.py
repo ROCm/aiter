@@ -6,7 +6,10 @@ import triton
 import triton.language as tl
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils.tuned_config_utils import autotune_enabled
+from aiter.ops.triton.utils.tuned_config_utils import (
+    autotune_configs,
+    autotune_enabled,
+)
 
 # Dev-time tuning escape hatch (off by default). See the block below the kernel
 # for what this actually does and why it's not the production path.
@@ -365,7 +368,7 @@ def attnres_fwd_kernel(
 #
 # `cache_results=True` still gives in-process caching across repeated calls
 # with the same key within a run of this flag, same as fla's `cache_results`
-# kwarg (see aiter/ops/triton/_triton_kernels/chunk_delta_attn/chunk_delta_attn_utils.py).
+# kwarg (see aiter/ops/triton/_triton_kernels/kimi_delta_attn/chunk_delta_attn_utils.py).
 if ATTN_RES_TRITON_AUTOTUNE:
     _ATTN_RES_AUTOTUNE_CONFIGS = [
         triton.Config({"BL": BL}, num_warps=num_warps, num_stages=num_stages)
@@ -374,7 +377,7 @@ if ATTN_RES_TRITON_AUTOTUNE:
         for num_stages in (1, 2)
     ]
     attnres_fwd_kernel = triton.autotune(
-        configs=_ATTN_RES_AUTOTUNE_CONFIGS,
+        configs=autotune_configs("ATTN_RES", _ATTN_RES_AUTOTUNE_CONFIGS),
         key=[
             "N",
             "L2",

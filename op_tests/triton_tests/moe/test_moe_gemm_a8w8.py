@@ -25,6 +25,7 @@ from aiter.ops.triton.moe.quant_moe import (
 # target-specific utilities
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
+from op_tests.triton_tests.moe.moe_test_utils import assert_close
 from op_tests.triton_tests.utils.mxfp_ref import upcast_from_mxfp
 
 # ---------------
@@ -87,76 +88,6 @@ def init_compute_data(
 
 def dtype_str_to_torch(dtype_str: str) -> torch.dtype:
     return torch.uint8 if dtype_str == "float4_e2m1" else getattr(torch, dtype_str)
-
-
-def assert_close(ref, tri, maxtol=None, rmstol=None, description="--", verbose=True):
-    if tri.dtype.itemsize == 1:
-        ref_as_type = ref.to(tri.dtype)
-        if ref.dtype == tri.dtype:
-            assert torch.all(ref_as_type == tri)
-            return
-        ref = ref_as_type
-
-    if ref.numel() == 0:
-        return
-
-    if maxtol is None:
-        maxtol = 2e-2
-    if rmstol is None:
-        rmstol = 4e-3
-    """
-    Compare reference values against obtained values.
-    """
-
-    # cast to float32:
-    ref = ref.to(torch.float32).detach()
-    tri = tri.to(torch.float32).detach()
-    assert (
-        ref.shape == tri.shape
-    ), f"Tensors must have same size {ref.shape=} {tri.shape=}"
-
-    # deal with infinite elements:
-    inf_mask_ref = torch.isinf(ref)
-    inf_mask_tri = torch.isinf(tri)
-    assert torch.equal(
-        inf_mask_ref, inf_mask_tri
-    ), "Tensor must have same infinite elements"
-    refn = torch.where(inf_mask_ref, 0, ref)
-    trin = torch.where(inf_mask_tri, 0, tri)
-
-    # normalise so that RMS calculation doesn't overflow:
-    eps = 1.0e-30
-    multiplier = 1.0 / (torch.max(torch.abs(refn)) + eps)
-    refn *= multiplier
-    trin *= multiplier
-
-    ref_rms = torch.sqrt(torch.square(refn).mean()) + eps
-
-    rel_err = torch.abs(refn - trin) / torch.maximum(ref_rms, torch.abs(refn))
-    max_err = torch.max(rel_err).item()
-    rms_err = torch.sqrt(torch.square(rel_err).mean()).item()
-
-    if verbose:
-        print(
-            f"{description} maximum relative error = {max_err} (threshold = {maxtol})"
-        )
-        print(f"{description} RMS relative error = {rms_err} (threshold = {rmstol})")
-
-    if max_err > maxtol:
-        bad_idxs = torch.nonzero(rel_err > maxtol)
-        num_nonzero = bad_idxs.size(0)
-        bad_idxs = bad_idxs[:1000]
-        print(
-            f"{num_nonzero} / {rel_err.numel()} mismatched elements "
-            f"(shape = {tuple(rel_err.shape)}) at coords {bad_idxs.tolist()}"
-        )
-
-        bad_idxs = bad_idxs.unbind(-1)
-        print("ref values: ", ref[tuple(bad_idxs)].cpu())
-        print("tri values: ", tri[tuple(bad_idxs)].cpu())
-
-    assert max_err <= maxtol
-    assert rms_err <= rmstol
 
 
 # ---------------
@@ -290,6 +221,7 @@ class Case:
 @pytest.mark.parametrize("has_y_gammas", [False, True])
 @pytest.mark.parametrize("apply_swiglu", [False, True])
 @pytest.mark.parametrize("fused_quant", [False, True])
+@pytest.mark.parametrize("token_expt_scales", [False, True])
 def test_op(
     m,
     n,
@@ -299,6 +231,7 @@ def test_op(
     has_y_gammas,
     apply_swiglu,
     fused_quant,
+    token_expt_scales,
     n_expts_tot,
     n_expts_act,
     act_dtype_str,
@@ -332,6 +265,9 @@ def test_op(
     if act_mxfp8:
         act_dtype_str = act_dtype_str[2:]
 
+    if token_expt_scales and (act_mxfp8 or weight_mxfp8):
+        pytest.skip("token/expert scales are tested on the plain-fp8 path")
+
     weight_dtype = dtype_str_to_torch(weight_dtype_str)
     act_dtype = dtype_str_to_torch(act_dtype_str)
     m, rdata, gindx, sindx = init_routing_data(
@@ -351,6 +287,8 @@ def test_op(
         device=device,
     )
     x_ref, w_ref, bias_ref = x_tri.clone(), w_tri.clone(), bias_tri.clone()
+    x_token_scale = None
+    w_expt_scale = None
 
     if weight_mxfp8:
         w_tri, w_scale_tri = downcast_to_mxfp(w_tri, weight_dtype, axis=1)
@@ -369,9 +307,15 @@ def test_op(
     else:
         w_scale_tri = None
         swizzle_mx_scale = None
-        w_static_scale = w_tri.abs().max().float() / 448.0
-        w_tri = downcast_to_static_fp8_3d(w_tri, w_static_scale)
-        w_ref = (w_tri.float() * w_static_scale).to(torch.bfloat16)
+        if token_expt_scales:
+            w_static_scale = None
+            w_expt_scale = w_tri.abs().amax(dim=(1, 2)).float() / 448.0
+            w_tri = (w_tri / w_expt_scale[:, None, None]).to(weight_dtype)
+            w_ref = (w_tri.float() * w_expt_scale[:, None, None]).to(torch.bfloat16)
+        else:
+            w_static_scale = w_tri.abs().max().float() / 448.0
+            w_tri = downcast_to_static_fp8_3d(w_tri, w_static_scale)
+            w_ref = (w_tri.float() * w_static_scale).to(torch.bfloat16)
 
     if act_mxfp8:
         x_tri, x_mx_scales_tri = downcast_to_mxfp(x_tri, act_dtype, axis=-1)
@@ -380,9 +324,15 @@ def test_op(
         out_dtype = torch.bfloat16
     else:
         x_mx_scales_tri = None
-        x_static_scale = x_tri.abs().max().float() / 448.0
-        x_tri = downcast_to_static_fp8(x_tri, x_static_scale)
-        x_ref = (x_tri.float() * x_static_scale).to(torch.bfloat16)
+        if token_expt_scales:
+            x_static_scale = None
+            x_token_scale = x_tri.abs().amax(dim=-1).float() / 448.0
+            x_tri = (x_tri / x_token_scale[:, None]).to(act_dtype)
+            x_ref = (x_tri.float() * x_token_scale[:, None]).to(torch.bfloat16)
+        else:
+            x_static_scale = x_tri.abs().max().float() / 448.0
+            x_tri = downcast_to_static_fp8(x_tri, x_static_scale)
+            x_ref = (x_tri.float() * x_static_scale).to(torch.bfloat16)
         out_dtype = torch.float8_e4m3fn
 
     ref_y = moe_gemm_torch(
@@ -414,6 +364,8 @@ def test_op(
         swizzle_mx_scale,
         out_dtype,
         apply_swiglu,
+        x_token_scale=x_token_scale,
+        w_expt_scale=w_expt_scale,
     )
     if not act_mxfp8 and fused_quant:
         tri_y = (tri_y.float() * quant_static_scale).to(ref_y.dtype)

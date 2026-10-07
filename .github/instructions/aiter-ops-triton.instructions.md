@@ -15,6 +15,17 @@ relevant rule — reviewers may not know these conventions yet.
   dedicated PR. A new kernel's own PR still carries its wrapper, unit test and
   benchmark (see *Tests and benchmarks*); those belong to the kernel and are
   not separate concerns.
+- **One kernel backend per PR.** Flag a PR whose changed files belong to more
+  than one backend -- Triton/Gluon (`aiter/ops/triton/`, `aiter/aot/triton/`;
+  Triton and Gluon are one backend, so a PR mixing the two is fine), HIP
+  (`csrc/`), ASM (`hsa/`, `*_asm.py`), CK (`csrc/ck_*`, `ck_tile`), OPUS
+  (`aiter/ops/opus/`), FlyDSL (`aiter/ops/flydsl/`, `aiter/aot/flydsl/`) --
+  and list the files of the other backend, so the author knows what to move.
+  Ask for one PR per backend. When the parts depend on each other, suggest
+  stacked pull requests (the second PR based on the first one's branch and
+  targeting it instead of `main`) rather than one combined PR. Tests and
+  benchmarks belong to the backend they exercise; wrappers outside those
+  paths, docs and CI files do not count as a backend.
 - Keep PRs small and easy to review: one concern each, as granular as the
   change allows. Flag a PR that solves two or three independent problems at
   once — a bug fix plus a refactor, a new op plus a cleanup, retuning plus an
@@ -34,9 +45,10 @@ that duplicates functionality already in the tree, even partially — the fix is
 to extend or import the existing implementation, not to add a parallel copy.
 
 `utils/` is layered on purpose: `config_utils.py` holds the shared core
-(`resolve_config_dir`, `load_config_json`, the path constants) and each family
-keeps its own loader module (`gemm_config_utils`, `conv_config_utils`,
-`mhc_config_utils`, `moe_config_utils`, `tuned_config_utils`) on top of it.
+(`resolve_config_dir`, `load_config_json`, `select_leq_config`, the path
+constants) and each family keeps its own loader module (`gemm_config_utils`,
+`conv_config_utils`, `mhc_config_utils`, `moe_config_utils`,
+`quant_config_utils`, `tuned_config_utils`) on top of it.
 Flag a function given a second home — a re-export, a wrapper that only
 forwards to another module, or a copy of a core helper inside a family module.
 
@@ -58,6 +70,19 @@ and tuned JSON in `configs/`. Flag:
   Gluon bodies under `_gluon_kernels/<arch>/`, mirroring the wrapper's
   category path. JIT-decorated device helpers that are called only from
   another kernel may remain with the entry kernel they support.
+- A kernel module or directory whose path under `_triton_kernels/`
+  (`_gluon_kernels/<arch>/`) differs from the folder of the wrapper that
+  launches it. A kernel directory is named after the wrapper folder, never
+  after the kernel family or a topic: `normalization/`, not `norm/`. One
+  existing directory predates this rule and is grandfathered until a
+  dedicated follow-up moves it and all its importers: the vendored
+  `_triton_kernels/flash_attn_triton_amd/` (launched by `attention/mha.py`).
+  Do not flag code in it; flag any new mismatched directory. A kernel that
+  wrappers in several folders reuse lives with the wrapper that owns it, or in
+  `_triton_kernels/common/` when none does (`common/splitk_reduce.py`);
+  importing it across folders is fine. A PR that moves a wrapper into another
+  folder moves its kernels too and updates every importer of the old module
+  path (`grep -rn "_triton_kernels.<old>"`).
 - Generic helpers (config loading, shuffling, arch detection, logging)
   re-implemented inside a kernel file instead of imported from `utils/`.
 - New code importing via the legacy flat paths
@@ -76,7 +101,7 @@ their tuned configs can be imported by a framework that is not PyTorch
 - `import torch`, `from torch import ...` or any `torch.` use added to a
   module under `utils/_triton/`. The torch-using half belongs in `utils/` —
   split the helper rather than duplicating it (`moe_common.py` already lives
-  on both sides). `utils/_triton/tunning/` is exempt: standalone tuning
+  on both sides). `utils/_triton/tuning/` is exempt: standalone tuning
   harnesses, not importable library code.
 - torch newly introduced into config resolution (`utils/config_utils.py` or a
   `*_config_utils.py` family module) — loading a tuned config must not
@@ -93,7 +118,7 @@ their tuned configs can be imported by a framework that is not PyTorch
 Every tuned config lives in one nested layout:
 `configs/<arch>/<backend>/<op>/<d_type>/`, e.g.
 `configs/gfx950/triton/gemm/gemm_afp4wfp4/DEFAULT.json`. `<op>` is `gemm`,
-`moe`, `conv`, `mhc`, `attention`, `gmm` or `fusions`; `<d_type>` is
+`moe`, `conv`, `mhc`, `attention`, `gmm`, `fusions` or `quant`; `<d_type>` is
 `config_name.lower().replace("-", "_")`. The flat arch-prefixed directories
 and every fallback that reached them are gone. Flag:
 
@@ -204,14 +229,45 @@ values for either backend live in JSON, never in Python. Flag:
   family loader or `resolve_config_dir()` would work — a hand-built path is a
   second place the layout is encoded, and it skips the argument validation
   that makes a wrong value fail closed.
+- A hand-written loop selecting the smallest matching `N_LEQ_*` (or another
+  upper-bound prefix) entry, or a hand-written multi-axis bucket walk — use
+  `select_leq_config()` (`axes=` for several axes) so threshold ordering,
+  fallback, and copying semantics have one implementation.
 - A second MOE config reader. `utils/moe_config_utils.py::get_moe_dispatch` is
   the only MOE fetcher; flag any new MOE path built by hand, any direct
   `load_config_json` on a `moe/` file, and any reintroduced per-wrapper MOE
   loader.
 - A new arch- or backend-fallback chain inside a loader (try this arch, then
-  that one; try triton, then gluon). Resolution is deterministic. MHC's gfx942
-  fallback is the one documented exception and it goes through the `arch=`
-  override, not through a probe.
+  that one; try triton, then gluon). Resolution is deterministic. The
+  documented compatibility exceptions are MHC's gfx942 fallback and Triton
+  `fused_clamp_act_mul`'s legacy gfx950 fallback; both use the `arch=` override
+  instead of a probe.
+- A raw config list handed to `@triton.autotune`. Route it through
+  `autotune_configs` from `aiter.ops.triton.utils.tuned_config_utils`:
+
+  ```python
+  @triton.autotune(
+      configs=autotune_configs("MY_FAMILY", _get_autotune_configs()),
+      key=[...],
+  )
+  ```
+
+  That returns every candidate only while `<FAMILY>_TRITON_AUTOTUNE=1`, and a
+  single config otherwise, so nothing benchmarks at launch. A raw list searches
+  on every new key: it costs compile time, breaks CUDA-graph capture, and leaves
+  a unit test's numerics dependent on whichever config the timing happened to
+  pick that run. Pass `default_config=` when the list's first entry is not the
+  one to pin.
+
+  A family that already published its own variable name keeps it by passing
+  `env=` (and `default=` for what unset means), as `flash_attn_triton_amd/` does
+  with `FLASH_ATTENTION_TRITON_AMD_AUTOTUNE` — it still goes through this helper.
+
+  There are no exemptions. A candidate list read from the config JSON is a
+  search space for a tuning build, not a launch-time list — handed to
+  `@triton.autotune` it still benchmarks every entry on every new key. Pass it
+  as `configs` and pin the launch with `default_config=`, as
+  `chunk_delta_attn/flash_kda.py` does with its published K2 candidates.
 
 ## Weight & scale shuffling — must come from `utils/shuffle.py`
 
@@ -312,6 +368,31 @@ All weight/scale pre-shuffle helpers are unified in
   inside the category folder, shared helpers in the existing
   `*_test_utils.py` / `utils/` modules. Flag tests added flat at the
   `op_tests/triton_tests/` root or as one-off scripts.
+- A test's folder is the folder of the wrapper it imports. The path under
+  `op_tests/triton_tests/` mirrors the wrapper's path under
+  `aiter/ops/triton/`: a test of `aiter/ops/triton/attention/mla.py` is
+  `op_tests/triton_tests/attention/test_mla.py`, a test of
+  `gemm/basic/gemm_a8w8.py` is `gemm/basic/test_gemm_a8w8.py`, a test of
+  `gated_delta_net/fused_kda_decode.py` is
+  `gated_delta_net/test_fused_kda_decode.py`. The wrapper's folder decides
+  the test folder, not the kernel directory: `attention/mha.py` keeps its
+  tests in `triton_tests/attention/` even though its kernels sit in the
+  vendored `_triton_kernels/flash_attn_triton_amd/`; a sub-package counts as
+  a folder (`moe/moe_routing/routing.py` → `triton_tests/moe/moe_routing/`).
+  The few wrappers that still sit flat at `aiter/ops/triton/<op>.py`
+  (`activation.py`, `topk.py`, ...) keep their tests flat at the
+  `triton_tests/` root; `utils/` helpers are tested under
+  `triton_tests/utils/`; `torch_compile/` and `triton_metadata_redirect/`
+  are infrastructure suites, not op folders. Flag:
+  - A test whose folder differs from the folder of the wrapper it imports
+    (`from aiter.ops.triton.gated_delta_net...` in a test under
+    `triton_tests/attention/` or at the root).
+  - A test placed by kernel directory or by topic instead of by wrapper
+    folder, and a new test folder that does not match a folder under
+    `aiter/ops/triton/` (every op test folder also carries an `__init__.py`).
+  - A PR that moves a wrapper into another folder without moving its kernels
+    and its test, or that moves a test without updating every importer of the old module
+    path (`grep -rn "triton_tests.<old>"`).
 - No kernel tuning configs in test files: flag test code that hardcodes
   config dicts (`BLOCK_SIZE_*`, `num_warps`, `waves_per_eu`, ...) or passes
   literal `config=` overrides to a wrapper. Tests exercise the wrapper's own
@@ -320,8 +401,38 @@ All weight/scale pre-shuffle helpers are unified in
   or timings and any ad-hoc `if __name__ == "__main__"` reporting block in a
   test file: correctness is checked with asserts
   (`torch.testing.assert_close` and friends) so a regression fails the test
-  instead of needing a human to read the log. Some older tests still print —
-  flag new dumps, not the ones already there.
+  instead of needing a human to read the log. Diagnostic output worth keeping
+  goes through the logger, per the next two rules — not through `print`. A few
+  older tests still print (`gemm/basic/test_gemm_a8wfp4.py`,
+  `quant/test_quant.py`, `conv/_helpers.py`) — flag new dumps, not those.
+- Log messages use lazy `%` placeholders, never f-strings. Flag
+  `logger.info(f"...")` and `logger.info("..." + x)`: an f-string is built
+  before the level check, so the message is formatted and thrown away on every
+  call below the configured level. Pass the values instead —
+  `logger.info("shape=%s", x.shape)` — and match the specifier to the value:
+  `%d` for counts and dimensions, `%f` for thresholds and real scalars, `%s`
+  for tensors, `torch.Size` shapes, tuples and strings. `%d` or `%f` on `None`
+  or on a tuple raises *at log time*, and logging reports that as
+  `--- Logging error ---` on stderr rather than failing the test, so flag a
+  numeric specifier on a value that can be either.
+- Failure diagnostics go at WARNING or ERROR, never INFO. Under pytest
+  `op_tests/triton_tests/__init__.py` pins `AITER_LOG_LEVEL=WARNING`, so an
+  INFO message is invisible in CI. Flag `logger.info(...)` that reports a
+  mismatch, a NaN, a "FAILED", or the detail behind an assertion that is
+  about to fire — converting a `print` of that kind to INFO deletes the only
+  evidence a failing run leaves behind. Detail a reader needs in order to act
+  belongs in the assertion message itself, where pytest always shows it.
+- A test that logs its verdict instead of asserting it is broken, and the
+  level change makes that visible. Flag any `if ok: log("pass") else:
+  log("fail")` with no assert on the same condition: the test cannot fail.
+- Debug output is gated by level, not by an `if` around the call, and not by
+  a module constant. Flag `if DEBUG_MODE: logger.info(...)` and any new
+  `DEBUG_MODE`-style flag: write `logger.debug(...)` and run with
+  `AITER_LOG_LEVEL=DEBUG`, which `aiter/__init__.py` applies to the logger
+  *and* its console handler. Flag code that lowers the level by hand after
+  import (`logger.setLevel(...)`) — it leaves the handler where it was, so
+  the records never come out — and flag `logging.basicConfig(...)` in a test,
+  which reconfigures the root logger for the whole process at import time.
 - No autotuning in unit tests: flag `@triton.autotune`, an autotune config
   sweep, or a loop over tile sizes inside a test. Tests exercise the config
   the wrapper resolves for the shape; tuning belongs in the tuning scripts
