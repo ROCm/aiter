@@ -163,40 +163,6 @@ def get_GEMM_A16W16_config(
                         "falling back to next candidate."
                     )
                     config = None
-            elif config["libtype"] == "flydsl_decode":
-                if padded_M != M:
-                    # Decode kernels are exact-M specializations. Never reuse a
-                    # padded CSV row or introduce a runtime M-tail.
-                    config = None
-                else:
-                    try:
-                        from aiter.ops.flydsl.gemm_kernels import (
-                            parse_gemm_decode_kernel_name,
-                        )
-
-                        name_arch, name_m, name_n, name_k, _, name_has_bias = (
-                            parse_gemm_decode_kernel_name(config["kernelName"])
-                        )
-                        if (
-                            name_arch,
-                            name_m,
-                            name_n,
-                            name_k,
-                            name_has_bias,
-                        ) != (
-                            gfx,
-                            M,
-                            N,
-                            K,
-                            bias,
-                        ):
-                            logger.warning(
-                                "FlyDSL decode tuned row does not match the "
-                                "runtime architecture/exact shape; ignoring it."
-                            )
-                            config = None
-                    except (ImportError, ValueError):
-                        config = None
             if config is None:
                 continue
             if config["libtype"] == "opus":
@@ -612,64 +578,6 @@ def flydsl_gemm(
     return out
 
 
-def flydsl_decode_gemm(
-    inp: Tensor,
-    weights: Tensor,
-    solidx: int,
-    bias: Tensor | None = None,
-    otype: torch.dtype | None = None,
-    scale_a: Tensor | None = None,
-    scale_b: Tensor | None = None,
-    scale_c: Tensor | None = None,
-    bpreshuffle=False,
-    config: dict | None = None,
-):
-    """Launch an exact-M/N/K decode kernel selected by the BF16 CSV."""
-    del solidx
-    if config is None or not config.get("kernelName"):
-        raise ValueError("FlyDSL decode dispatch requires kernelName")
-    if any(scale is not None for scale in (scale_a, scale_b, scale_c)):
-        raise ValueError("FlyDSL decode does not support scaling")
-    if bpreshuffle:
-        raise ValueError("FlyDSL decode does not support preshuffled weights")
-    out_dtype = otype or inp.dtype
-    if inp.dtype != torch.bfloat16 or out_dtype != torch.bfloat16:
-        raise ValueError("FlyDSL decode requires BF16 input and output")
-    from aiter.ops.flydsl.gemm_kernels import (
-        gemm_decode_bf16,
-        parse_gemm_decode_kernel_name,
-    )
-
-    arch, m, n, k, decode_config, has_bias = parse_gemm_decode_kernel_name(
-        config["kernelName"]
-    )
-    expected = (
-        get_gfx_runtime(),
-        int(inp.shape[0]),
-        int(weights.shape[0]),
-        int(inp.shape[1]),
-    )
-    if (arch, m, n, k) != expected:
-        raise ValueError(
-            "FlyDSL decode tuned kernel does not match the runtime "
-            f"exact identity: kernel={(arch, m, n, k)}, runtime={expected}"
-        )
-    if has_bias != (bias is not None):
-        raise ValueError("FlyDSL decode kernel bias identity does not match launch")
-    output = torch.empty(
-        (m, n),
-        dtype=torch.bfloat16,
-        device=inp.device,
-    )
-    return gemm_decode_bf16(
-        inp,
-        weights,
-        output,
-        decode_config,
-        bias=bias,
-    )
-
-
 def opus_gemm(
     inp: Tensor,
     weights: Tensor,
@@ -747,7 +655,6 @@ solMap = {
     "asm": asm_gemm,
     "triton": triton_gemm,
     "flydsl": flydsl_gemm,
-    "flydsl_decode": flydsl_decode_gemm,
     "opus": opus_gemm,
 }
 

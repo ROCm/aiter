@@ -64,8 +64,6 @@ FLYDSL_MX128_PIPELINES = (
     (SPLITK_MX128_PIPELINE,) if SPLITK_MX128_PIPELINE is not None else ()
 )
 
-from aiter.ops.flydsl.utils import is_flydsl_available
-
 BLOCK_SHAPE = (128, 128)  # (block_n, block_k), matches gemm_a8w8_blockscale_tune.py
 FP8_MAX = 448.0  # gfx950 Float8E4M3FN max magnitude; mx128 E8M0 quant clamps to this
 
@@ -157,11 +155,11 @@ def run_gemm_flydsl_splitk_mx128(x, weight_shuffle, x_scale, w_scale, out, kerne
     return out
 
 
-# Pipeline name -> (runner, is-it-usable-right-now), mirroring
+# Pipeline name -> runner, mirroring
 # ``_FLYDSL_PIPELINE_RUNNERS`` in the ptpc bpreshuffle tuner.
 _FLYDSL_PIPELINE_RUNNERS = {
-    "splitk_blockscale": (run_gemm_flydsl_splitk_blockscale, is_flydsl_available),
-    "splitk_mx128": (run_gemm_flydsl_splitk_mx128, is_flydsl_available),
+    "splitk_blockscale": run_gemm_flydsl_splitk_blockscale,
+    "splitk_mx128": run_gemm_flydsl_splitk_mx128,
 }
 
 
@@ -311,7 +309,7 @@ class GemmA8W8BlockScaleBpreShuffleTuner(FlydslSplitKBpreshuffleTuner):
     def get_flydsl_splitk_blockscale_tune_task(self, info_keys, seed):
         _gfx, _cu_num, M, N, K = info_keys
 
-        if not is_flydsl_available() or SPLITK_BLOCKSCALE_PIPELINE is None:
+        if SPLITK_BLOCKSCALE_PIPELINE is None:
             return []
 
         gemm_flydsl_keys = ["x", "weight_shuffle", "x_scale", "w_scale", "out"]
@@ -322,8 +320,8 @@ class GemmA8W8BlockScaleBpreShuffleTuner(FlydslSplitKBpreshuffleTuner):
             if runner_entry is None:
                 print(f"[FlyDSL] no runner registered for pipeline {pipe.name!r}")
                 continue
-            runner, is_available = runner_entry
-            if not pipe.kernels_list or not is_available():
+            runner = runner_entry
+            if not pipe.kernels_list:
                 continue
             for i in sorted(pipe.kernels_list.keys()):
                 ki = pipe.kernels_list[i]
@@ -362,7 +360,7 @@ class GemmA8W8BlockScaleBpreShuffleTuner(FlydslSplitKBpreshuffleTuner):
     def get_flydsl_splitk_mx128_tune_task(self, info_keys, seed):
         _gfx, _cu_num, M, N, K = info_keys
 
-        if not is_flydsl_available() or SPLITK_MX128_PIPELINE is None:
+        if SPLITK_MX128_PIPELINE is None:
             return []
 
         gemm_flydsl_keys = ["x", "weight_shuffle", "x_scale", "w_scale", "out"]
@@ -375,8 +373,8 @@ class GemmA8W8BlockScaleBpreShuffleTuner(FlydslSplitKBpreshuffleTuner):
             if runner_entry is None:
                 print(f"[FlyDSL] no runner registered for pipeline {pipe.name!r}")
                 continue
-            runner, is_available = runner_entry
-            if not pipe.kernels_list or not is_available():
+            runner = runner_entry
+            if not pipe.kernels_list:
                 continue
             for i in sorted(pipe.kernels_list.keys()):
                 ki = pipe.kernels_list[i]

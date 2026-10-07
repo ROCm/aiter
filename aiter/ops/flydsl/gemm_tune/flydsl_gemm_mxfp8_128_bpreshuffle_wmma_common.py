@@ -20,7 +20,7 @@ from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
 )
 
 WMMA = 16  # WMMA M/N tile granularity
-LDS_BYTES = get_lds_capacity_bytes(get_gfx().split(":", 1)[0])
+LDS_BYTES = get_lds_capacity_bytes(get_gfx())
 _MAX_WARP_TILE = 256
 _MAX_TUNE_WARPS = 4
 _MAX_ACC_FRAGMENTS = 64

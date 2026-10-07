@@ -63,7 +63,6 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
         } | LC_ALL=C sort -u
     )
     FLYDSL_GEMM_TESTS=(
-        "op_tests/flydsl_tests/test_flydsl_decode_gemm.py"
         "op_tests/flydsl_tests/test_flydsl_preshuffle_gemm_splitk.py"
     )
     for test_file in "${FLYDSL_GEMM_TESTS[@]}"; do
@@ -165,7 +164,6 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_mhc.py]=50
     FILE_TIMES[op_tests/test_topk_select.py]=47
     FILE_TIMES[op_tests/test_flydsl_topk_per_row_small_k.py]=46
-    FILE_TIMES[op_tests/flydsl_tests/test_flydsl_decode_gemm.py]=45
     FILE_TIMES[op_tests/test_mla_reduce.py]=40
     FILE_TIMES[op_tests/test_pa_sparse_prefill.py]=40
     FILE_TIMES[op_tests/test_msa_block_select.py]=39

@@ -93,9 +93,6 @@ def _install_stubs():
             SPLIT_K_SEMAPHORE_MAX_LEN=1024,
             flydsl_hgemm=lambda *a, **kw: None,
             flydsl_hgemm_kernel_name=lambda *a, **kw: "",
-            gemm_decode_bf16=lambda *a, **kw: None,
-            gemm_decode_kernel_name=lambda *a, **kw: "",
-            iter_gemm_decode_configs=lambda *a, **kw: [],
         ),
         "aiter.ops.gemm_op_a16w16": _make_stub(
             "aiter.ops.gemm_op_a16w16",
