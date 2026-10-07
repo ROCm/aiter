@@ -15,8 +15,6 @@ import weakref
 
 import torch
 
-from aiter import dtypes
-
 __all__ = ["MEGA_MHC_DEFAULTS", "flydsl_mega_mhc", "get_mega_mhc_config"]
 
 _GFX = ("gfx950",)
@@ -30,8 +28,6 @@ MEGA_MHC_DEFAULTS = {
     "NUM_KSPLIT": 1,
     "TILE_K": 64,
     "X1_LDS_SLOTS": 0,  # bf16 x1 chunks per warp kept in LDS for the finish
-    "PERSIST_WGS": 0,  # > 0 caps the grid; each WG walks token blocks w, w + G, ...
-    "FN_EARLY": 4,  # streams (of 4) of chunk 0's fn loaded ahead of the R/y prefetch
     "DIST_FINISH": False,  # every split rescales its own x1 columns (KS > 1)
     "DIST_SPIN": 1024,  # polls a waiting split spins before it hands its columns off
     "LATE_DESC": False,  # build late-use descriptors after the first loads are issued
@@ -69,7 +65,9 @@ _LATE_DESC_T = (128, 384)
 # moves (R, y read + R', out written) no longer fit the 256 MB MALL; below that the eager
 # (MALL-hot) kernel is up to 44% slower with it. Measured boundaries at H = 5120 (bf16): loses at
 # T = 2496 (256 MB) and wins from 2560 (262 MB).
-_NT_LD_MIN_BYTES = 262e6
+# fp8_grid gains from 230 MB (T = 2048: 0.92 isolated, -3.7% with the wqkv_a GEMM after the
+# seam; T = 2304: 0.95 / -0.9%); mxfp8 loses there (1.27 at T = 2048), so it keeps 262 MB.
+_NT_LD_MIN_BYTES = {"bf16": 262e6, "fp8_grid": 230e6, "mxfp8": 262e6}
 # out_dtype -> layer-input outputs: (T, H) tensors returned, extra bytes per element written
 _OUT_DTYPES = ("bf16", "fp8_grid", "mxfp8")
 _QUANT_OF = {"bf16": "none", "fp8_grid": "grid", "mxfp8": "mx"}
@@ -89,7 +87,7 @@ def _with_seg128(T: int, H: int, cfg: dict, out_dtype: str, decode_split: bool) 
     if cfg["TILE_K"] != 64:
         return cfg
     ks = cfg["NUM_KSPLIT"]
-    nt_ld = _seam_bytes(T, H, out_dtype) >= _NT_LD_MIN_BYTES
+    nt_ld = _seam_bytes(T, H, out_dtype) >= _NT_LD_MIN_BYTES[out_dtype]
     if decode_split:
         if ks == 5 or (ks == 10 and T < _SEG128_BF16_DECODE_MIN_T):
             return cfg
@@ -97,6 +95,20 @@ def _with_seg128(T: int, H: int, cfg: dict, out_dtype: str, decode_split: bool) 
     if ks == 5 and not nt_ld:  # wave-quantization split at T = 2464..2559
         return cfg
     return dict(cfg, SEG128=True, NT_ST=True, NT_LD=nt_ld)
+
+
+def _check_out_dtype(out_dtype) -> None:
+    if out_dtype not in _OUT_DTYPES:
+        raise ValueError(
+            f"[flydsl_mega_mhc] out_dtype must be one of {_OUT_DTYPES} (the amax/448 "
+            f'"fp8" output was replaced by the ue8m0 modes), got {out_dtype!r}'
+        )
+
+
+def _require(cond: bool, msg: str, exc: type = ValueError) -> None:
+    """Input validation that survives ``python -O`` (unlike ``assert``)."""
+    if not cond:
+        raise exc(f"[flydsl_mega_mhc] {msg}")
 
 
 def get_mega_mhc_config(
@@ -122,12 +134,14 @@ def get_mega_mhc_config(
     * ``SHUFFLE_DPP`` everywhere except the ``NUM_KSPLIT == 1`` column kernel.
     * ``LATE_DESC`` for the decode split at 129 <= T <= 384.
     * ``TILE_K == 64`` kernels use ``SEG128`` + ``NT_ST``, and ``NT_LD`` once the seam's
-      HBM footprint (``out_dtype`` counts its extra writes) exceeds the 256 MB MALL; not
+      HBM footprint (``out_dtype`` counts its extra writes) reaches ``_NT_LD_MIN_BYTES``
+      (about the 256 MB MALL; 230 MB for ``fp8_grid``); not
       for the 5-way decode split, the 10-way split below T = 256, or the 5-way split
       below the ``NT_LD`` footprint.
     """
     from aiter.ops.flydsl.kernels.mega_mhc import check_config, max_x1_lds_slots
 
+    _check_out_dtype(out_dtype)
     if arch not in _GFX:
         raise RuntimeError(f"[flydsl_mega_mhc] unsupported arch {arch}")
     cfg = dict(MEGA_MHC_DEFAULTS, SHUFFLE_DPP=True)
@@ -344,14 +358,20 @@ def flydsl_mega_mhc(
     """Single-launch delayed mHC seam.
 
     Returns ``(residual_out, post_mix (T, 4, 1), comb_mix (T, 4, 4), layer_input,
-    next_pre_mix (T, 4))``. ``layer_input`` is the (T, H) bf16 RMSNorm output, or with
-    the per-32 ue8m0 fp8 e4m3fn quantization of that bf16 output (SGLang's
+    next_pre_mix (T, 4))``. ``layer_input`` depends on ``out_dtype``; the quantized parts
+    are the per-32 ue8m0 fp8 e4m3fn quantization of the bf16 norm (SGLang's
     ``fake_quant_fp8_activation`` rule: scale = smallest power of two >= amax / 448):
 
-    * ``out_dtype="fp8_grid"``: ``(norm, grid)``, grid = (T, H) bf16 on the fp8 grid
-      (SGLang ``Fp8GridActivation``)
-    * ``out_dtype="mxfp8"``: ``(norm, q, e8m0)``, q = (T, H) fp8 e4m3fn codes, e8m0 =
-      (T, H/32) uint8 exponents (scale = 2^(e8m0 - 127), SGLang ``Mxfp8Activation``)
+    ============  ==================================================================
+    out_dtype     layer_input
+    ============  ==================================================================
+    ``bf16``      norm: (T, H) bf16
+    ``fp8_grid``  (norm, grid): grid (T, H) bf16 on the fp8 grid (``Fp8GridActivation``)
+    ``mxfp8``     (norm, q, e8m0): q (T, H) float8_e4m3fn codes, e8m0 (T, H/32) uint8,
+                  scale = 2^(e8m0 - 127) (``Mxfp8Activation``)
+    ============  ==================================================================
+
+    Invalid inputs raise ``ValueError`` / ``TypeError`` (not ``assert``).
 
     ``residual_out`` must be preallocated when ``sublayer_out`` is given; with no
     post-mix (Engram seam) the residual is returned as is and must not be passed.
@@ -369,51 +389,97 @@ def flydsl_mega_mhc(
     )
     from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, ptr_arg
 
-    if out_dtype not in _OUT_DTYPES:
-        raise ValueError(
-            f"[flydsl_mega_mhc] out_dtype must be one of {_OUT_DTYPES} (the amax/448 "
-            f'"fp8" output was replaced by the ue8m0 modes), got {out_dtype!r}'
-        )
-    assert residual.dim() == 3 and residual.dtype == torch.bfloat16
-    assert residual.is_contiguous(), "residual must be contiguous"
+    _check_out_dtype(out_dtype)
+    _require(residual.dim() == 3, "residual must be (T, 4, H)")
+    _require(residual.dtype == torch.bfloat16, "residual must be bf16", TypeError)
+    _require(residual.is_contiguous(), "residual must be contiguous")
     T, n, H = residual.shape
-    assert n == _N, f"the Mega-mHC kernel is specialised for hc_mult=4, got {n}"
-    assert H % 32 == 0
-    assert fn.shape == (24, _N * H) and fn.dtype == torch.float32 and fn.is_contiguous()
-    assert hc_scale.shape == (3,) and hc_base.shape == (24,)
-    assert hc_scale.dtype == hc_base.dtype == torch.float32
-    assert hc_scale.is_contiguous() and hc_base.is_contiguous()
-    assert norm_weight is not None and norm_weight.shape == (H,)
-    assert norm_weight.dtype == torch.bfloat16 and norm_weight.is_contiguous()
+    _require(n == _N, f"the Mega-mHC kernel is specialised for hc_mult=4, got {n}")
+    _require(H % 32 == 0, f"H must be a multiple of 32, got {H}")
+    _require(
+        fn.shape == (24, _N * H), f"fn must be (24, {_N * H}), got {tuple(fn.shape)}"
+    )
+    _require(fn.dtype == torch.float32, "fn must be fp32", TypeError)
+    _require(fn.is_contiguous(), "fn must be contiguous")
+    _require(
+        hc_scale.shape == (3,) and hc_base.shape == (24,),
+        "hc_scale (3,) and hc_base (24,)",
+    )
+    _require(
+        hc_scale.dtype == hc_base.dtype == torch.float32,
+        "hc_scale and hc_base must be fp32",
+        TypeError,
+    )
+    _require(
+        hc_scale.is_contiguous() and hc_base.is_contiguous(),
+        "hc_scale / hc_base must be contiguous",
+    )
+    _require(
+        norm_weight is not None and norm_weight.shape == (H,),
+        f"norm_weight must be ({H},)",
+    )
+    _require(norm_weight.dtype == torch.bfloat16, "norm_weight must be bf16", TypeError)
+    _require(norm_weight.is_contiguous(), "norm_weight must be contiguous")
     device = residual.device
     arch = _arch(device)
     if arch not in _GFX:
         raise RuntimeError(f"[flydsl_mega_mhc] supports {_GFX}, got {arch}")
-    assert (
-        T * _N * H * 2 < 2**31
-    ), "residual exceeds the 2 GiB a buffer descriptor offset addresses"
+    if out_dtype != "bf16":
+        from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
+            _arch_has_native_scaled_cvt,
+        )
+
+        _require(
+            _arch_has_native_scaled_cvt(arch),
+            f"out_dtype={out_dtype!r} needs v_cvt_scalef32 (gfx950), got {arch}",
+            RuntimeError,
+        )
+    _require(
+        T * _N * H * 2 < 2**31,
+        "residual exceeds the 2 GiB a buffer descriptor offset addresses",
+    )
 
     has_post = sublayer_out is not None
     identity_pre = pre_mix is None
     if has_post:
-        assert post_layer_mix is not None and comb_res_mix is not None
-        assert sublayer_out.shape == (T, H) and sublayer_out.dtype == torch.bfloat16
-        assert sublayer_out.is_contiguous()
-        assert post_layer_mix.numel() == T * _N and post_layer_mix.is_contiguous()
-        assert comb_res_mix.numel() == T * _N * _N and comb_res_mix.is_contiguous()
-        assert post_layer_mix.dtype == comb_res_mix.dtype == torch.float32
-        assert residual_out is not None, "pass the preallocated residual_out"
-        assert (
-            residual_out.shape == residual.shape
-            and residual_out.dtype == torch.bfloat16
+        _require(
+            post_layer_mix is not None and comb_res_mix is not None,
+            "sublayer_out needs post_layer_mix and comb_res_mix",
         )
-        assert residual_out.is_contiguous()
+        _require(sublayer_out.shape == (T, H), f"sublayer_out must be ({T}, {H})")
+        _require(
+            sublayer_out.dtype == torch.bfloat16, "sublayer_out must be bf16", TypeError
+        )
+        _require(sublayer_out.is_contiguous(), "sublayer_out must be contiguous")
+        _require(
+            post_layer_mix.numel() == T * _N and post_layer_mix.is_contiguous(),
+            f"post_layer_mix must be {T * _N} contiguous values",
+        )
+        _require(
+            comb_res_mix.numel() == T * _N * _N and comb_res_mix.is_contiguous(),
+            f"comb_res_mix must be {T * _N * _N} contiguous values",
+        )
+        _require(
+            post_layer_mix.dtype == comb_res_mix.dtype == torch.float32,
+            "post_layer_mix and comb_res_mix must be fp32",
+            TypeError,
+        )
+        _require(residual_out is not None, "pass the preallocated residual_out")
+        _require(
+            residual_out.shape == residual.shape
+            and residual_out.dtype == torch.bfloat16,
+            "residual_out must match residual (shape, bf16)",
+        )
+        _require(residual_out.is_contiguous(), "residual_out must be contiguous")
     else:
-        assert residual_out is None, "no post-mix: the residual is returned as is"
+        _require(residual_out is None, "no post-mix: the residual is returned as is")
         residual_out = residual
     if not identity_pre:
-        assert pre_mix.numel() == T * _N and pre_mix.dtype == torch.float32
-        assert pre_mix.is_contiguous()
+        _require(
+            pre_mix.numel() == T * _N and pre_mix.dtype == torch.float32,
+            f"pre_mix must be {T * _N} fp32 values",
+        )
+        _require(pre_mix.is_contiguous(), "pre_mix must be contiguous")
     for t in (
         fn,
         hc_scale,
@@ -425,7 +491,9 @@ def flydsl_mega_mhc(
         comb_res_mix,
         residual_out,
     ):
-        assert t is None or t.device == device, "all tensors must be on the same device"
+        _require(
+            t is None or t.device == device, "all tensors must be on the same device"
+        )
 
     post_out = torch.empty(T, _N, 1, dtype=torch.float32, device=device)
     comb_out = torch.empty(T, _N, _N, dtype=torch.float32, device=device)
@@ -437,7 +505,7 @@ def flydsl_mega_mhc(
     elif out_dtype == "mxfp8":
         # one buffer: the codes, then the exponents (the kernel addresses both from it)
         out_q = torch.empty(T * (H + H // 32), dtype=torch.uint8, device=device)
-        q = out_q[: T * H].view(T, H).view(dtypes.fp8)
+        q = out_q[: T * H].view(T, H).view(torch.float8_e4m3fn)
         layer_input = (norm, q, out_q[T * H :].view(T, H // 32))
     else:
         out_q = norm

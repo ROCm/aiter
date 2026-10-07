@@ -14,12 +14,17 @@ Four tables:
   test_mega_mhc_late     LATE_DESC and SHUFFLE_DPP bit-exact against the same
                          knob set without them, classic and distributed finisher.
   test_mega_mhc_capture  CUDA-graph capture safety (cold capture, scratch growth).
+  test_mega_mhc_ue8m0_edges  the kernel's ue8m0 quantizer on crafted groups (amax =
+                         448 * 2^k, zero, bf16 subnormals, near-max, fp8-subnormal codes)
+                         and on inf / NaN groups.
 
 Every table runs each out_dtype: bf16, fp8_grid and mxfp8; the ue8m0 outputs must equal
-``ue8m0_quant`` of the kernel's own bf16 norm to the bit.
+``ue8m0_quant`` of the kernel's own bf16 norm to the bit. The streams, dist, late,
+capture and edges tables are correctness-only (``err`` / mismatch counts, no timing).
 """
 
 import argparse
+import functools
 import glob
 import itertools
 import os
@@ -29,7 +34,6 @@ import pandas as pd
 import torch
 
 import aiter
-from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
@@ -142,7 +146,7 @@ def ue8m0_quant(y):
     bits = (yg.abs().amax(-1).clamp_min(1e-10) * (1.0 / 448.0)).view(torch.int32)
     e = (((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).int()).clamp(1, 254)
     scale = (e << 23).view(torch.float32).unsqueeze(-1)
-    q = (yg / scale).clamp(-448.0, 448.0).to(dtypes.fp8)
+    q = (yg / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
     grid = (q.float() * scale).to(torch.bfloat16)
     return q.view(T, H), e.to(torch.uint8), grid.view(T, H)
 
@@ -275,26 +279,30 @@ def test_mega_mhc(T, H, mode, out_dtype):
     from aiter.ops.flydsl import flydsl_mega_mhc
 
     args, kw, ref = _call_kwargs(mode, T, H)
+    # name -> (call, out_dtype it produces)
     candidates = {
-        "flydsl": lambda: flydsl_mega_mhc(*args, out_dtype=out_dtype, **kw),
+        "flydsl": (
+            lambda: flydsl_mega_mhc(*args, out_dtype=out_dtype, **kw),
+            out_dtype,
+        ),
     }
-    # the Triton seam has no ue8m0 output, so it is only a bf16 candidate
-    if out_dtype == "bf16":
-        try:
-            from aiter.ops.triton.fusions.mhc_fused_post_pre_delayed_rmsnorm import (
-                mhc_fused_post_pre_delayed_rmsnorm,
-            )
+    # the Triton seam writes no ue8m0 output: for the ue8m0 dtypes it is the seam-only
+    # baseline, checked and counted as bf16
+    try:
+        from aiter.ops.triton.fusions.mhc_fused_post_pre_delayed_rmsnorm import (
+            mhc_fused_post_pre_delayed_rmsnorm,
+        )
 
-            candidates["triton_seam"] = lambda: mhc_fused_post_pre_delayed_rmsnorm(
-                *args, **kw
-            )
-        except ImportError as e:  # pragma: no cover
-            aiter.logger.warning("triton seam unavailable: %s", e)
+        candidates["triton_seam"] = (
+            lambda: mhc_fused_post_pre_delayed_rmsnorm(*args, **kw),
+            "bf16",
+        )
+    except ImportError as e:  # pragma: no cover
+        aiter.logger.warning("triton seam unavailable: %s", e)
 
     flops = 2 * T * 4 * H * 24
-    nbytes = _traffic(T, H, mode, out_dtype)
     ret = {"gfx": get_gfx()}
-    for name, fn in candidates.items():
+    for name, (fn, d) in candidates.items():
         if not T:  # empty-batch edge case: the call must return, nothing to time
             fn()
             ret[f"{name} err"] = 0.0
@@ -302,10 +310,12 @@ def test_mega_mhc(T, H, mode, out_dtype):
         out, us = run_perftest(fn)
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
-        ret[f"{name} TB/s"] = nbytes / us / 1e6
-        ret[f"{name} err"] = check_outputs(name, out, ref, out_dtype, mode)
+        ret[f"{name} TB/s"] = _traffic(T, H, mode, d) / us / 1e6
+        ret[f"{name} err"] = check_outputs(name, out, ref, d, mode)
     if T:
-        ret["flydsl graph err"] = _graph_err(candidates["flydsl"], ref, out_dtype, mode)
+        ret["flydsl graph err"] = _graph_err(
+            candidates["flydsl"][0], ref, out_dtype, mode
+        )
     return ret
 
 
@@ -619,6 +629,132 @@ def test_mega_mhc_capture(T_small, T_large, H, out_dtype):
     return ret
 
 
+@functools.cache
+def _ue8m0_probe(with_grid):
+    """Launcher running the kernel's ``ue8m0_quant`` over a flat bf16 tensor, one 16 B
+    unit per lane, so a 32-column group is a DPP quad as in the kernel's finish."""
+    import flydsl.compiler as flyc
+    import flydsl.expr as fx
+    from flydsl.expr.typing import Vector as Vec
+
+    from aiter.ops.flydsl.kernels.mega_mhc import ue8m0_quant
+    from aiter.ops.flydsl.kernels.tensor_shim import (
+        buf_copy_load,
+        buf_copy_store,
+        ptr_buf_tensor,
+    )
+
+    I32 = fx.Int32
+
+    @flyc.kernel(name=f"mega_mhc_ue8m0_probe_g{int(with_grid)}")
+    def probe(
+        x: fx.Pointer, codes: fx.Pointer, exps: fx.Pointer, grid: fx.Pointer, n_u: I32
+    ):
+        idx = I32(fx.block_idx.x) * 256 + I32(fx.thread_idx.x)
+        nb = fx.Int64(n_u)
+        x_t = ptr_buf_tensor(x, I32, unit_elems=4, num_records_bytes=nb * 16)
+        c_t = ptr_buf_tensor(codes, I32, unit_elems=2, num_records_bytes=nb * 8)
+        e_t = ptr_buf_tensor(exps, fx.Int8, num_records_bytes=nb // 4)
+        g_t = ptr_buf_tensor(grid, I32, unit_elems=4, num_records_bytes=nb * 16)
+        y = Vec(buf_copy_load(x_t, idx, I32, 4)).bitcast(fx.BFloat16)
+        dw, ex, gr = ue8m0_quant(y, with_grid)
+        buf_copy_store(c_t, idx, dw, I32, 2)
+        e_idx = (idx % 4 == 0).select(idx // 4, n_u)
+        buf_copy_store(e_t, e_idx, fx.Int8(ex), fx.Int8, 1)
+        if fx.const_expr(with_grid):
+            buf_copy_store(g_t, idx, gr, I32, 4)
+
+    @flyc.jit
+    def launch(
+        x: fx.Pointer,
+        codes: fx.Pointer,
+        exps: fx.Pointer,
+        grid: fx.Pointer,
+        n_u: fx.Int32,
+        n_wg: fx.Int32,
+        stream: fx.Stream,
+    ):
+        probe(x, codes, exps, grid, n_u).launch(
+            grid=(n_wg, 1, 1), block=(256, 1, 1), stream=stream
+        )
+
+    return launch
+
+
+def _edge_groups(kind):
+    """(G, 32) bf16 groups: "finite" crafted edge cases, or "nonfinite" inf / NaN."""
+    g = torch.Generator(device="cuda").manual_seed(0)
+    rows = []
+    if kind == "finite":
+        for k in range(-140, 120, 3):  # amax exactly 448 * 2^k: raw is a power of two
+            r = torch.randn(32, generator=g) * 448 * 2.0**k * 0.3
+            r[5] = -448 * 2.0**k
+            rows.append(r)
+        rows += [torch.zeros(32), torch.full((32,), 1e-38), torch.full((32,), 3e38)]
+        rows.append(torch.tensor([9.2e-41, -1e-40] * 16))  # bf16 subnormals
+        for sc in (1e-6, 1.0, 1e3, 1e20):  # wide in-group range: fp8 subnormal codes
+            r = torch.randn(32, generator=g) * sc
+            r[0] = sc * 1e4
+            rows.append(r)
+        rows.append(torch.randn(32 * 1000, generator=g).view(-1, 32) * 3)
+    else:
+        for bad in (float("inf"), float("-inf"), float("nan")):
+            r = torch.randn(32, generator=g)
+            r[7] = bad
+            rows.append(r)
+    x = torch.cat([r.view(-1, 32) for r in rows]).to(torch.bfloat16)
+    pad = (-x.shape[0]) % 32  # whole 1024-column rows
+    return torch.cat([x, torch.zeros(pad, 32, dtype=torch.bfloat16)])
+
+
+@benchmark()
+def test_mega_mhc_ue8m0_edges(kind):
+    """``ue8m0_quant`` against the torch rule, to the bit (finite groups). Non-finite
+    input is unspecified: the counts document how many groups differ from SGLang."""
+    from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, ptr_arg
+
+    y = _edge_groups(kind).view(-1, 1024).contiguous()
+    q_r, e_r, g_r = ue8m0_quant(y)
+    n_u = y.numel() // 8
+    codes = torch.empty(y.numel(), dtype=torch.uint8)
+    exps = torch.empty(y.numel() // 32, dtype=torch.uint8)
+    grid = torch.empty_like(y)
+    _run_compiled(
+        _ue8m0_probe(True),
+        *[ptr_arg(t) for t in (y, codes, exps, grid)],
+        n_u,
+        -(-n_u // 256),
+        torch.cuda.current_stream(),
+    )
+    torch.cuda.synchronize()
+    bad = (
+        (codes.view(-1, 32) != q_r.view(torch.uint8).view(-1, 32)).any(-1)
+        | (exps != e_r.view(-1))
+        | (
+            grid.view(torch.int16).view(-1, 32) != g_r.view(torch.int16).view(-1, 32)
+        ).any(-1)
+    )
+    # a group holding inf / NaN is unspecified (SGLang clamps, the kernel does not), but
+    # it must not change any other group
+    finite = torch.isfinite(y.float()).view(-1, 32).all(-1)
+    ret = {
+        "gfx": get_gfx(),
+        "groups": exps.numel(),
+        "non-finite groups": int((~finite).sum()),
+        "non-finite groups != torch": int((bad & ~finite).sum()),
+    }
+    ret["err"] = checkAllclose(
+        torch.zeros(int(finite.sum()), dtype=torch.float32),
+        bad[finite].float(),
+        rtol=0,
+        atol=0,
+        msg=f"ue8m0 edges {kind}: finite groups differing from the torch rule ",
+    )
+    if ret["err"]:
+        _FAILURES.append(f"ue8m0 edges {kind}: {int(bad[finite].sum())} groups differ")
+    return ret
+
+
 def _legal(H, cfg):
     from aiter.ops.flydsl.kernels.mega_mhc import check_config
 
@@ -651,12 +787,13 @@ def main():
     parser.add_argument(
         "-d", "--out_dtype", nargs="*", default=["bf16", "fp8_grid", "mxfp8"]
     )
-    # knob sweep axes (test_mega_mhc_config); empty --block_m skips the sweep
-    parser.add_argument("--block_m", type=int, nargs="*", default=[])
-    parser.add_argument("--warp_split", nargs="*", default=["cols", "tokens"])
-    parser.add_argument("--warps_per_wg", type=int, nargs="*", default=[2, 4])
+    # knob sweep axes (test_mega_mhc_config); the defaults are one plain config
+    # (no policy knobs); empty --block_m skips the sweep
+    parser.add_argument("--block_m", type=int, nargs="*", default=[16])
+    parser.add_argument("--warp_split", nargs="*", default=["cols"])
+    parser.add_argument("--warps_per_wg", type=int, nargs="*", default=[8])
     parser.add_argument("--ksplit", type=int, nargs="*", default=[1])
-    parser.add_argument("--tile_k", type=int, nargs="*", default=[32, 64])
+    parser.add_argument("--tile_k", type=int, nargs="*", default=[64])
     parser.add_argument("--stream_ksplit", type=int, nargs="*", default=[1, 10])
     parser.add_argument(
         "--dist",
@@ -774,6 +911,12 @@ def main():
     ]
     aiter.logger.info(
         "mega-mhc CUDA-graph capture check (markdown):\n%s",
+        pd.DataFrame(rows).to_markdown(index=False),
+    )
+
+    rows = [test_mega_mhc_ue8m0_edges(k) for k in ("finite", "nonfinite")]
+    aiter.logger.info(
+        "mega-mhc ue8m0 edge check (markdown):\n%s",
         pd.DataFrame(rows).to_markdown(index=False),
     )
 
