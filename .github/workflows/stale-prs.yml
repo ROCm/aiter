@@ -33,5 +33,4 @@ jobs:
           operations-per-run: 99999
           stale-pr-message: >
             No activity for 15 days, so this is now labelled `stale`. A push or
-            a comment clears it; `keep-open` exempts it. Nothing is closed
-            automatically.
+            a comment clears it; `keep-open` exempts it.
