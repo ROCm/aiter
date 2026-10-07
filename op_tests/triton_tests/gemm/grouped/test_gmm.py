@@ -26,6 +26,7 @@ from aiter.ops.triton.gemm.grouped.gmm import (
 from aiter.ops.triton.gemm.grouped.gmm import (
     ptgmm as triton_ptgmm,
 )
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 # AITER: GMM defaults and utility functions
 from aiter.ops.triton.utils.gmm_common import (
@@ -628,7 +629,7 @@ def test_tgmm_alt_trans_lhs_int64_group_sizes_grid_dim_override(
 
 
 def _get_gmm_config_for_arch(monkeypatch, arch, *args, **kwargs):
-    import aiter.ops.triton._triton_kernels.gmm as gmm_kernels
+    import aiter.ops.triton._triton_kernels.gemm.grouped.gmm as gmm_kernels
     from aiter.ops.triton.utils.config_utils import resolve_config_dir
 
     monkeypatch.setattr(
@@ -657,6 +658,9 @@ def test_gmm_get_config_dispatch_gfx950(monkeypatch, M, K, N, G, accumulate, exp
         resolve_config_dir,
     )
 
+    if get_arch() != "gfx950":
+        pytest.skip("Requires gfx950")
+
     cfg = load_config_json(
         f"{resolve_config_dir('gmm', 'GMM', backend='triton', arch='gfx950')}/DEFAULT.json"
     )["gmm"]
@@ -673,6 +677,8 @@ def test_gmm_get_config_dispatch_other_variants_unaffected(monkeypatch, gmm_type
         resolve_config_dir,
     )
 
+    if get_arch() != "gfx950":
+        pytest.skip("Requires gfx950")
     cfg = load_config_json(
         f"{resolve_config_dir('gmm', 'GMM', backend='triton', arch='gfx950')}/DEFAULT.json"
     )[gmm_type]
@@ -688,6 +694,9 @@ def test_gmm_get_config_arch_without_dispatch(monkeypatch):
         load_config_json,
         resolve_config_dir,
     )
+
+    if get_arch() != "gfx942":
+        pytest.skip("Requires gfx942")
 
     cfg = load_config_json(
         f"{resolve_config_dir('gmm', 'GMM', backend='triton', arch='gfx942')}/DEFAULT.json"
