@@ -147,6 +147,52 @@ def test_ck_free_rejects_missing_affine(monkeypatch, triton_recorder, entry, mis
     assert triton_recorder.calls == []
 
 
+@pytest.mark.parametrize(
+    "entry", ["layernorm2d_fwd_with_add", "layernorm2d_fwd_with_add_smoothquant"]
+)
+def test_ck_free_add_rows_share_stride(monkeypatch, entry):
+    # The Triton fused-add kernels use the input row stride for both residuals.
+    monkeypatch.setattr(norm, "ENABLE_CK", False)
+    calls = []
+
+    def fake(*args, **kwargs):
+        calls.append(args)
+        args[3].fill_(MARK)
+
+    monkeypatch.setattr(triton_norm, entry, fake)
+    t = _make_inputs()
+    x = torch.randn(B * S, 2 * N, dtype=torch.bfloat16)[:, :N]
+    residual_in = t["residual"].reshape(-1, N)
+    backing = torch.zeros(B * S, 2 * N, dtype=torch.bfloat16)
+    residual_out = backing[:, N:]
+    if entry == "layernorm2d_fwd_with_add":
+        out = torch.zeros(B * S, N, dtype=torch.bfloat16)
+        norm.layernorm2d_fwd_with_add(
+            out, x, residual_in, residual_out, t["weight"], t["bias"], EPS
+        )
+    else:
+        out = torch.zeros(B * S, N, dtype=torch.int8)
+        norm.layernorm2d_fwd_with_add_smoothquant(
+            out,
+            x,
+            residual_in,
+            residual_out,
+            t["xscale"],
+            t["yscale"],
+            t["weight"],
+            t["bias"],
+            EPS,
+        )
+
+    (args,) = calls
+    rows, res_in, res_out = args[1], args[2], args[3]
+    assert rows.stride() == res_in.stride() == res_out.stride() == (N, 1)
+    torch.testing.assert_close(rows, x, rtol=0, atol=0)
+    torch.testing.assert_close(res_in, residual_in, rtol=0, atol=0)
+    assert bool((residual_out == MARK).all())
+    assert bool((backing[:, :N] == 0).all())
+
+
 @pytest.mark.parametrize("entry", ENTRY_POINTS)
 def test_ck_calls_ck(monkeypatch, entry):
     monkeypatch.setattr(norm, "ENABLE_CK", True)

@@ -100,6 +100,29 @@ def _triton_rows(input: Tensor, x_bias: Tensor | None) -> Tensor:
     return input.reshape(-1, input.shape[-1])
 
 
+# The Triton fused-add kernels index residual_in and residual_out with the input
+# row stride, while CK takes one stride per tensor, so all three are passed as
+# contiguous rows; residual_out goes through a temporary when it is not.
+def _triton_add_rows(
+    input: Tensor, residual_in: Tensor, residual_out: Tensor, x_bias: Tensor | None
+) -> tuple[Tensor, Tensor, Tensor]:
+    n = input.shape[-1]
+    res_out = residual_out.view(-1, n)
+    if not res_out.is_contiguous():
+        res_out = torch.empty(res_out.shape, dtype=res_out.dtype, device=res_out.device)
+    return (
+        _triton_rows(input, x_bias).contiguous(),
+        residual_in.reshape(-1, n).contiguous(),
+        res_out,
+    )
+
+
+def _copy_back(residual_out: Tensor, res_out: Tensor) -> None:
+    dst = residual_out.view(-1, res_out.shape[-1])
+    if res_out.data_ptr() != dst.data_ptr():
+        dst.copy_(res_out)
+
+
 # The CK binding rejects None for weight / bias; reject it the same way here.
 def _check_affine(weight: Tensor | None, bias: Tensor | None) -> None:
     if weight is None or bias is None:
@@ -150,16 +173,17 @@ def layernorm2d_fwd_with_add(
             layernorm2d_fwd_with_add as layernorm2d_fwd_with_add_triton,
         )
 
-        n = input.shape[-1]
+        x, res_in, res_out = _triton_add_rows(input, residual_in, residual_out, x_bias)
         layernorm2d_fwd_with_add_triton(
-            out.view(-1, n),
-            _triton_rows(input, x_bias),
-            residual_in.reshape(-1, n),
-            residual_out.view(-1, n),
+            out.view(-1, input.shape[-1]),
+            x,
+            res_in,
+            res_out,
             weight,
             bias,
             epsilon,
         )
+        _copy_back(residual_out, res_out)
         return
     layernorm2d_fwd_with_add_ck(
         out, input, residual_in, residual_out, weight, bias, epsilon, x_bias
@@ -216,18 +240,19 @@ def layernorm2d_fwd_with_add_smoothquant(
             layernorm2d_fwd_with_add_smoothquant as layernorm2d_fwd_with_add_smoothquant_triton,
         )
 
-        n = input.shape[-1]
+        x, res_in, res_out = _triton_add_rows(input, residual_in, residual_out, x_bias)
         layernorm2d_fwd_with_add_smoothquant_triton(
-            out.view(-1, n),
-            _triton_rows(input, x_bias),
-            residual_in.reshape(-1, n),
-            residual_out.view(-1, n),
+            out.view(-1, input.shape[-1]),
+            x,
+            res_in,
+            res_out,
             xscale,
             yscale,
             weight,
             bias,
             epsilon,
         )
+        _copy_back(residual_out, res_out)
         return
     layernorm2d_fwd_with_add_smoothquant_ck(
         out,
