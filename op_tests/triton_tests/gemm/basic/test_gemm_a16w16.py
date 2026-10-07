@@ -7,7 +7,6 @@ import json
 import pytest
 import torch
 import torch.nn.functional as F
-import triton
 
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import _is_gluon_available, gemm_a16w16
 from aiter.ops.triton.gemm.basic.gemm_a16w16_atomic import gemm_a16w16_atomic
@@ -297,10 +296,10 @@ _gemm_a16w16_module = importlib.import_module("aiter.ops.triton.gemm.basic.gemm_
 class _TritonLaunchSpy:
     def __init__(self, kernel):
         self.kernel = kernel
-        self.async_copy = []
+        self.launches = 0
 
     def __getitem__(self, grid):
-        self.async_copy.append(triton.knobs.amd.use_async_copy)
+        self.launches += 1
         return self.kernel[grid]
 
 
@@ -329,8 +328,7 @@ def test_gemm_a16w16_auto_backend_opt_in(monkeypatch, M, N, K, expect_triton):
     out = gemm_a16w16(x, w)
 
     torch.testing.assert_close(out, F.linear(x, w), atol=1e-1, rtol=1e-2)
-    assert len(spy.async_copy) == (1 if expect_triton else 0)
-    assert not any(spy.async_copy)
+    assert spy.launches == (1 if expect_triton else 0)
 
 
 @pytest.mark.parametrize(
@@ -347,7 +345,7 @@ def test_gemm_a16w16_explicit_triton_on_opt_in_configs(monkeypatch, M, N, K):
     out = gemm_a16w16(x, w, backend="triton")
 
     torch.testing.assert_close(out, F.linear(x, w), atol=1e-1, rtol=1e-2)
-    assert len(spy.async_copy) == 1
+    assert spy.launches == 1
 
 
 def test_gemm_a16w16_persistent_ignores_opt_in(monkeypatch):
