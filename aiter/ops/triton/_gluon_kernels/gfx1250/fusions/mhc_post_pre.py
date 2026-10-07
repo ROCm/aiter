@@ -23,10 +23,11 @@ or (W_PRESHUFFLED) read as the ``mhc_shuffle_fn`` output, which stores that spli
 and once at the end: gemm_out[k, m, n] = sum_h acc, sqrsum[k, m] = sum_{h,c} sq.
 
 Layouts: a batched (rank-3) WMMA layout puts the 4 warps on the head axis,
-which is the HIP "one warp per head" K-split. The post mix is computed
-directly in the WMMA A-operand layout -- x and each residual head are read
-from LDS as a [BLOCK_M, KS] slice of that layout and broadcast over heads --
-so the loop has no layout conversion.
+which is the HIP "one warp per head" K-split. NUM_WARPS in {1, 2, 4}: with
+fewer than 4 warps the remaining heads are register repeats of each warp. The
+post mix is computed directly in the WMMA A-operand layout -- x and each
+residual head are read from LDS as a [BLOCK_M, KS] slice of that layout and
+broadcast over heads -- so the loop has no layout conversion.
 """
 
 from triton.experimental import gluon
@@ -38,6 +39,7 @@ _GLUON_REPR_KEYS = [
     "C",
     "BLOCK_M",
     "K_LOOP",
+    "SPLIT_K",
     "NUM_STAGES",
     "RES_SHUFFLED",
     "W_PRESHUFFLED",
@@ -55,13 +57,17 @@ def create_layouts(
     N_PAD: int,
     NUM_STAGES: int,
     W_PRESHUFFLED: bool = False,
+    NUM_WARPS: int = 4,
 ):
     """Register and shared layouts; all constexpr, built on the host."""
-    assert HC == 4, "one warp per head; 4 warps"
+    assert HC == 4, "warps map onto the 4 heads"
+    # Warp bits go to the head axis; heads beyond NUM_WARPS are register repeats.
+    warp_bases = {1: [], 2: [[1, 0, 0]], 4: [[1, 0, 0], [2, 0, 0]]}
+    assert NUM_WARPS in warp_bases, f"NUM_WARPS={NUM_WARPS} not in (1, 2, 4)"
     wmma = gl.amd.AMDWMMALayout(
         version=3,
         transposed=True,
-        warp_bases=[[1, 0, 0], [2, 0, 0]],
+        warp_bases=warp_bases[NUM_WARPS],
         instr_shape=[16, 16, 32],
         rank=3,
     )
@@ -165,6 +171,7 @@ def _mhc_post_pre_gemm_sqrsum_gfx1250_kernel(
     BLOCK_M: gl.constexpr,
     KS: gl.constexpr,
     K_LOOP: gl.constexpr,
+    SPLIT_K: gl.constexpr,
     NUM_STAGES: gl.constexpr,
     RES_SHUFFLED: gl.constexpr,
     W_PRESHUFFLED: gl.constexpr,
@@ -392,10 +399,11 @@ def _mhc_post_pre_gemm_sqrsum_gfx1250_kernel(
     # (gl.sum over the warp axis lowers to a chain of LDS rounds, ~37 barriers.)
     # (partials deposited and published in the last k-step)
 
+    NUM_WARPS: gl.constexpr = gl.num_warps()
     RED: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[HC, 1, 4],
         threads_per_warp=[1, 4, 8],
-        warps_per_cta=[1, 4, 1],
+        warps_per_cta=[1, NUM_WARPS, 1],
         order=[2, 1, 0],
     )
     out = gl.sum(red_smem.load(RED), axis=0)  # [BLOCK_M, N_PAD], in-thread sum
@@ -413,7 +421,7 @@ def _mhc_post_pre_gemm_sqrsum_gfx1250_kernel(
     RED2: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[HC, 1],
         threads_per_warp=[1, 32],
-        warps_per_cta=[1, 4],
+        warps_per_cta=[1, NUM_WARPS],
         order=[1, 0],
     )
     sq_r = gl.sum(sq_smem.load(RED2), axis=0)  # [BLOCK_M]

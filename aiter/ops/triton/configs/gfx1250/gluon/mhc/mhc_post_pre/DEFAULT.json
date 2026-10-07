@@ -1,0 +1,11 @@
+{
+    "any": {
+        "SPLIT_BLOCK_M": 32,
+        "SPLIT_NUM_WARPS": 4,
+        "SPLIT_NUM_STAGES": 2,
+        "RA_NORM_NUM_WARPS": 8,
+        "RA_ROWS": 4,
+        "RA_NUM_WARPS": 4,
+        "RA_CTAS_PER_CU": 4
+    }
+}
