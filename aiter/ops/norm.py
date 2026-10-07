@@ -100,6 +100,12 @@ def _triton_rows(input: Tensor, x_bias: Tensor | None) -> Tensor:
     return input.reshape(-1, input.shape[-1])
 
 
+# The CK binding rejects None for weight / bias; reject it the same way here.
+def _check_affine(weight: Tensor | None, bias: Tensor | None) -> None:
+    if weight is None or bias is None:
+        raise TypeError("LayerNorm requires weight and bias tensors")
+
+
 def layer_norm(
     input: Tensor,
     weight: Tensor | None = None,
@@ -108,6 +114,7 @@ def layer_norm(
     x_bias: Tensor | None = None,
 ) -> Tensor:
     if not ENABLE_CK:
+        _check_affine(weight, bias)
         from .triton.normalization.norm import layer_norm as layer_norm_triton
 
         out = layer_norm_triton(_triton_rows(input, x_bias), weight, bias, epsilon)
@@ -138,6 +145,7 @@ def layernorm2d_fwd_with_add(
     x_bias: Tensor | None = None,
 ) -> None:
     if not ENABLE_CK:
+        _check_affine(weight, bias)
         from .triton.normalization.norm import (
             layernorm2d_fwd_with_add as layernorm2d_fwd_with_add_triton,
         )
@@ -169,6 +177,7 @@ def layernorm2d_fwd_with_smoothquant(
     x_bias: Tensor | None = None,
 ) -> None:
     if not ENABLE_CK:
+        _check_affine(weight, bias)
         from .triton.normalization.norm import (
             layernorm2d_fwd_with_smoothquant as layernorm2d_fwd_with_smoothquant_triton,
         )
@@ -202,6 +211,7 @@ def layernorm2d_fwd_with_add_smoothquant(
     x_bias: Tensor | None = None,
 ) -> None:
     if not ENABLE_CK:
+        _check_affine(weight, bias)
         from .triton.normalization.norm import (
             layernorm2d_fwd_with_add_smoothquant as layernorm2d_fwd_with_add_smoothquant_triton,
         )

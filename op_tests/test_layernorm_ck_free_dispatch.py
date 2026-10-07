@@ -135,6 +135,18 @@ def test_ck_free_calls_triton(monkeypatch, triton_recorder, entry, use_x_bias):
         assert bool((out == MARK).all())
 
 
+@pytest.mark.parametrize("missing", ["weight", "bias"])
+@pytest.mark.parametrize("entry", ENTRY_POINTS)
+def test_ck_free_rejects_missing_affine(monkeypatch, triton_recorder, entry, missing):
+    monkeypatch.setattr(norm, "ENABLE_CK", False)
+    t = _make_inputs()
+    t[missing] = None
+
+    with pytest.raises(TypeError):
+        _call(entry, t, None)
+    assert triton_recorder.calls == []
+
+
 @pytest.mark.parametrize("entry", ENTRY_POINTS)
 def test_ck_calls_ck(monkeypatch, entry):
     monkeypatch.setattr(norm, "ENABLE_CK", True)
