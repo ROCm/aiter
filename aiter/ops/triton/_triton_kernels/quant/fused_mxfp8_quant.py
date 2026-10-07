@@ -308,23 +308,36 @@ def _fused_deepseek_v4_mxfp8_quant_q_pack_kernel(
     src = q_ptr + row * QK
     dst = packed_ptr + row * QK
 
-    for g in tl.static_range(NUM_TILES):
-        off = g * GROUP + tl.arange(0, GROUP)
-        x = tl.load(src + off).to(tl.float32)
-        # clamp the RATIO, matching the reference packing the kernel's own
-        # tests use -- flooring amax instead would shift the stored exponent
-        # for all-zero groups
-        amax = tl.max(tl.abs(x), axis=0)
-        ratio = tl.maximum(amax / fp8_max, 1e-4)
-        exponent = tl.ceil(tl.log2(ratio))
-        scale = tl.exp2(exponent)
-        f8 = (x / scale).to(tl.float8e4nv)
-        tl.store(dst + off, f8.to(tl.uint8, bitcast=True))
-        # the scaled-MMA blocks are 32 elements wide while the quant group is
-        # 64, so the kernel reads each group's scale twice
-        enc = tl.minimum(tl.maximum(exponent + 127.0, 0.0), 254.0).to(tl.uint8)
-        tl.store(dst + NOPE + 2 * g, enc)
-        tl.store(dst + NOPE + 2 * g + 1, enc)
+    # One (TILES_P2, GROUP) tile rather than a static_range over NUM_TILES.
+    # NUM_TILES is 7 and arange must be a power of two, which is what the loop
+    # was working around; TILES_P2 * GROUP == QK, so the tile covers the whole
+    # row and the trailing rows past NUM_TILES -- the RoPE half -- are masked
+    # out of the stores. Collapses NUM_TILES dependent cross-lane reductions
+    # into one 2-D reduction and the 2*NUM_TILES scale bytes into one store.
+    TILES_P2: tl.constexpr = QK // GROUP
+    t = tl.arange(0, TILES_P2)
+    tile_off = t[:, None] * GROUP + tl.arange(0, GROUP)[None, :]
+    tile_m = t[:, None] < NUM_TILES
+
+    x = tl.load(src + tile_off).to(tl.float32)
+    # clamp the RATIO, matching the reference packing the kernel's own
+    # tests use -- flooring amax instead would shift the stored exponent
+    # for all-zero groups
+    amax = tl.max(tl.abs(x), axis=1)
+    ratio = tl.maximum(amax / fp8_max, 1e-4)
+    exponent = tl.ceil(tl.log2(ratio))
+    scale = tl.exp2(exponent)
+    f8 = (x / scale[:, None]).to(tl.float8e4nv)
+    tl.store(dst + tile_off, f8.to(tl.uint8, bitcast=True), mask=tile_m)
+    # the scaled-MMA blocks are 32 elements wide while the quant group is
+    # 64, so the kernel reads each group's scale twice
+    enc = tl.minimum(tl.maximum(exponent + 127.0, 0.0), 254.0).to(tl.uint8)
+    sc_off = t[:, None] * 2 + tl.arange(0, 2)[None, :]
+    tl.store(
+        dst + NOPE + sc_off,
+        tl.broadcast_to(enc[:, None], (TILES_P2, 2)),
+        mask=tile_m,
+    )
 
     # [462, 512): zero, so no stale byte reaches the MMA
     tail = tl.arange(0, QK)
@@ -368,6 +381,24 @@ def _v4_rope_pair(x_even, x_odd, cos, sin):
 
 
 @triton.jit
+def _v4_rope_full(x, cos, sin, lane, WIDTH: tl.constexpr):
+    """GPT-J RoPE over a full contiguous lane set, not an even/odd pair.
+
+    For a pair (x0, x1) the rotation is ``out = x * cos + rot * sin`` with
+    ``rot = (-x1, x0)``, and rot is a sign flip on the even lane followed by a
+    flip of the minor axis -- so every value stays in its own lane and the
+    loads and stores around this stay contiguous. ``cos``/``sin`` are indexed
+    per lane (``lane // 2``), so a pair shares one entry. Same identity as
+    _fused_kv_compress_norm_rope_insert_sparse_attn.
+    """
+    rot = tl.where(lane % 2 == 0, x, -x)
+    rot = tl.reshape(rot, (WIDTH // 2, 2))
+    rot = tl.flip(rot, 1)
+    rot = tl.reshape(rot, (WIDTH,))
+    return x * cos + rot * sin
+
+
+@triton.jit
 def _fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_kernel(
     q_in_ptr,  # [T, num_heads_q, HEAD] bf16
     q_out_ptr,  # [T, padded_heads, HEAD] bf16
@@ -407,11 +438,32 @@ def _fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_kernel(
     h = tl.program_id(1)
     d = tl.arange(0, HEAD)
     half: tl.constexpr = ROPE // 2
-    p = tl.arange(0, ROPE // 2)
+
+    # NUM_TILES is 7 and arange must be a power of two, which is why the quant
+    # groups used to be walked by a static_range: arange(0, 7) and
+    # arange(0, 448) are both rejected. A (TILES_P2, GROUP) tile is legal and
+    # covers the whole row, since TILES_P2 * GROUP == HEAD. Rows
+    # [0, NUM_TILES) are the NoPE groups; the last row is the RoPE half, which
+    # is loaded along with them and masked out of every store. One load and
+    # one 2-D reduction replace NUM_TILES sequential loads and NUM_TILES
+    # dependent cross-lane reductions.
+    TILES_P2: tl.constexpr = HEAD // GROUP
+    t = tl.arange(0, TILES_P2)
+    tile_off = t[:, None] * GROUP + tl.arange(0, GROUP)[None, :]
+    tile_m = t[:, None] < NUM_TILES
+    # the scale pair for each group, contiguous: 0,1, 2,3, ... 2*NUM_TILES-1
+    sc_off = t[:, None] * 2 + tl.arange(0, 2)[None, :]
+
+    # Full-width RoPE lane set. cos/sin are indexed per LANE (lane // 2) so a
+    # pair shares one entry; that reads each entry twice from cache but keeps
+    # every value in its own lane, so the loads and stores stay contiguous
+    # instead of striding by 2. Same identity as the compressor kernels below.
+    r = tl.arange(0, ROPE)
+    cs_idx = r // 2
 
     pos = tl.load(pos_ptr + tok)
-    cos = tl.load(cs_ptr + pos * ROPE + p)
-    sin = tl.load(cs_ptr + pos * ROPE + half + p)
+    cos = tl.load(cs_ptr + pos * ROPE + cs_idx)
+    sin = tl.load(cs_ptr + pos * ROPE + half + cs_idx)
 
     # ---- KV: RoPE, quantize, write one aligned record ---------------------
     if h == padded_heads:
@@ -424,29 +476,28 @@ def _fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_kernel(
         rec = kv_cache_ptr + blk.to(tl.int64) * kv_block_stride + pos_in_blk * REC
         row = kv_in_ptr + tok * HEAD
 
-        for g in tl.static_range(NUM_TILES):
-            off = g * GROUP + tl.arange(0, GROUP)
-            x = tl.load(row + off).to(tl.float32)
-            amax = tl.maximum(tl.max(tl.abs(x), axis=0), 1e-4)
-            exponent = tl.ceil(tl.log2(amax / fp8_max))
-            scale = tl.exp2(exponent)
-            xs = tl.clamp(x / scale, -fp8_max, fp8_max)
-            if USE_FNUZ:
-                f8 = xs.to(tl.float8e4b8)
-            else:
-                f8 = xs.to(tl.float8e4nv)
-            tl.store(rec + off, f8.to(tl.uint8, bitcast=True))
-            enc = tl.maximum(tl.minimum(exponent + 127.0, 255.0), 0.0).to(tl.uint8)
-            # both copies: one scale per 32 columns, one quant group per 64
-            tl.store(rec + SC_OFF + 2 * g, enc)
-            tl.store(rec + SC_OFF + 2 * g + 1, enc)
+        x = tl.load(row + tile_off).to(tl.float32)
+        amax = tl.maximum(tl.max(tl.abs(x), axis=1), 1e-4)
+        exponent = tl.ceil(tl.log2(amax / fp8_max))
+        scale = tl.exp2(exponent)
+        xs = tl.clamp(x / scale[:, None], -fp8_max, fp8_max)
+        if USE_FNUZ:
+            f8 = xs.to(tl.float8e4b8)
+        else:
+            f8 = xs.to(tl.float8e4nv)
+        tl.store(rec + tile_off, f8.to(tl.uint8, bitcast=True), mask=tile_m)
+        enc = tl.maximum(tl.minimum(exponent + 127.0, 255.0), 0.0).to(tl.uint8)
+        # both copies: one scale per 32 columns, one quant group per 64
+        tl.store(
+            rec + SC_OFF + sc_off,
+            tl.broadcast_to(enc[:, None], (TILES_P2, 2)),
+            mask=tile_m,
+        )
 
-        xe = tl.load(row + NOPE + 2 * p).to(tl.float32)
-        xo = tl.load(row + NOPE + 2 * p + 1).to(tl.float32)
-        ye, yo = _v4_rope_pair(xe, xo, cos, sin)
+        xr = tl.load(row + NOPE + r).to(tl.float32)
+        yr = _v4_rope_full(xr, cos, sin, r, ROPE)
         rope_out = (rec + ROPE_OFF).to(tl.pointer_type(tl.bfloat16))
-        tl.store(rope_out + 2 * p, ye.to(tl.bfloat16))
-        tl.store(rope_out + 2 * p + 1, yo.to(tl.bfloat16))
+        tl.store(rope_out + r, yr.to(tl.bfloat16))
         return
 
     # ---- Q: padding slot --------------------------------------------------
@@ -457,9 +508,8 @@ def _fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_kernel(
         if PACK_Q:
             pdst = q_packed_ptr + (tok * padded_heads + h) * HEAD
             tl.store(pdst + d, tl.zeros((HEAD,), dtype=tl.uint8))
-            r0 = tl.arange(0, ROPE)
             tl.store(
-                q_rope_ptr + (tok * padded_heads + h) * ROPE + r0,
+                q_rope_ptr + (tok * padded_heads + h) * ROPE + r,
                 tl.zeros((ROPE,), dtype=tl.bfloat16),
             )
         return
@@ -472,9 +522,8 @@ def _fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_kernel(
         xf = tl.load(base + d).to(tl.float32)
         inv = tl.rsqrt(tl.sum(xf * xf, axis=0) / HEAD + eps)
 
-    xe = tl.load(base + NOPE + 2 * p).to(tl.float32) * inv
-    xo = tl.load(base + NOPE + 2 * p + 1).to(tl.float32) * inv
-    ye, yo = _v4_rope_pair(xe, xo, cos, sin)
+    xr = tl.load(base + NOPE + r).to(tl.float32) * inv
+    yr = _v4_rope_full(xr, cos, sin, r, ROPE)
 
     # bf16 Q out. arange must be a power of two, so the 512-wide range is
     # masked down to the NoPE half rather than sized to it.
@@ -487,27 +536,27 @@ def _fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_kernel(
             ),
             mask=nope_m,
         )
-        tl.store(dst + NOPE + 2 * p, ye.to(tl.bfloat16))
-        tl.store(dst + NOPE + 2 * p + 1, yo.to(tl.bfloat16))
+        tl.store(dst + NOPE + r, yr.to(tl.bfloat16))
 
     if PACK_Q:
         pdst = q_packed_ptr + (tok * padded_heads + h) * HEAD
-        for g in tl.static_range(NUM_TILES):
-            off = g * GROUP + tl.arange(0, GROUP)
-            # the NoPE half is normed but NOT rotated, so re-read and scale
-            x = tl.load(base + off).to(tl.float32) * inv
-            amax = tl.max(tl.abs(x), axis=0)
-            # clamp the RATIO, which is what the reference packing does
-            exponent = tl.ceil(tl.log2(tl.maximum(amax / fp8_max, 1e-4)))
-            xs = x / tl.exp2(exponent)
-            if USE_FNUZ:
-                f8 = xs.to(tl.float8e4b8)
-            else:
-                f8 = xs.to(tl.float8e4nv)
-            tl.store(pdst + off, f8.to(tl.uint8, bitcast=True))
-            enc = tl.minimum(tl.maximum(exponent + 127.0, 0.0), 254.0).to(tl.uint8)
-            tl.store(pdst + NOPE + 2 * g, enc)
-            tl.store(pdst + NOPE + 2 * g + 1, enc)
+        # the NoPE half is normed but NOT rotated, so re-read and scale
+        xq = tl.load(base + tile_off).to(tl.float32) * inv
+        amax_q = tl.max(tl.abs(xq), axis=1)
+        # clamp the RATIO, which is what the reference packing does
+        exponent_q = tl.ceil(tl.log2(tl.maximum(amax_q / fp8_max, 1e-4)))
+        xsq = xq / tl.exp2(exponent_q)[:, None]
+        if USE_FNUZ:
+            f8q = xsq.to(tl.float8e4b8)
+        else:
+            f8q = xsq.to(tl.float8e4nv)
+        tl.store(pdst + tile_off, f8q.to(tl.uint8, bitcast=True), mask=tile_m)
+        enc_q = tl.minimum(tl.maximum(exponent_q + 127.0, 0.0), 254.0).to(tl.uint8)
+        tl.store(
+            pdst + NOPE + sc_off,
+            tl.broadcast_to(enc_q[:, None], (TILES_P2, 2)),
+            mask=tile_m,
+        )
         tl.store(
             pdst + d,
             tl.zeros((HEAD,), dtype=tl.uint8),
@@ -515,8 +564,7 @@ def _fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_kernel(
         )
         # the RoPE plane is never quantized
         rdst = q_rope_ptr + (tok * padded_heads + h) * ROPE
-        tl.store(rdst + 2 * p, ye.to(tl.bfloat16))
-        tl.store(rdst + 2 * p + 1, yo.to(tl.bfloat16))
+        tl.store(rdst + r, yr.to(tl.bfloat16))
 
 
 # ---------------------------------------------------------------------------
