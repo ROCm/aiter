@@ -1050,7 +1050,7 @@ def _stage2_overlap_rate(kernel_rows, idim):
     return (compute + comm - (fused_gemm2 + fused_comm)) / min(compute, comm)
 
 
-def _emit_table(name, rows, max_col_width=72):
+def _emit_table(name, rows, max_col_width=100):
     """Print the rows twice: an aligned frame for whoever opens the log, then the
     one machine-readable line the benchmark driver consumes.
 
@@ -1061,9 +1061,8 @@ def _emit_table(name, rows, max_col_width=72):
     into a one-line prefix, which is what keeps the 20+ config columns of the
     summary from repeating down the table.
 
-    max_col_width fits a full TDM GEMM name (its tile/warp/buffer recipe plus the
-    _prefetch / _epscatter suffix is the whole point of reading that table) while
-    still cutting torch's 200-char template names down to something scannable."""
+    Columns are capped at 100 characters by default to keep long kernel symbols
+    readable in the aligned table."""
     df = pd.DataFrame([row for row in rows if row is not None])
     print(f"\n# {name}", flush=True)
     if df.empty:
