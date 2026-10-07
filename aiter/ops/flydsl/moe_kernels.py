@@ -3110,9 +3110,8 @@ _ROUTEKS_KSPLIT_GRID_THRESHOLD = 512
 # token cannot fill a grid out of a handful of tokens whatever the split, while
 # one warp per route starts with topk times as many.
 _TOKEN_MULTIDEST_MIN_TOKENS = 64
-# Every destination costs a buffer descriptor held live across the store pass,
-# so the saving stops being free once they crowd the register budget.
-_TOKEN_MULTIDEST_MAX_TOPK = 8
+# Every destination costs a buffer descriptor held live across the store pass.
+_TOKEN_MULTIDEST_MAX_TOPK = 9
 
 
 def token_multidest_eligible(token_num: int, topk: int) -> bool:
@@ -3158,6 +3157,7 @@ def _get_compiled_token_multidest_quant(
     quant_mode: str,
     tdm_hidden_chunks: int = 4,
     ksplit: int = 1,
+    dynamic_routes: bool = False,
 ):
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
         build_moe_token_multidest_quant_module,
@@ -3170,6 +3170,7 @@ def _get_compiled_token_multidest_quant(
         quant_mode=quant_mode,
         tdm_hidden_chunks=tdm_hidden_chunks,
         ksplit=ksplit,
+        dynamic_routes=dynamic_routes,
     )
 
 
@@ -3366,7 +3367,6 @@ def flydsl_moe_fused_quant_preshuffle(
             not prequantized
             and not remap_rows
             and not fuse_ep_psum
-            and num_valid_routes is None
             and 1 < int(source_topk) <= _TOKEN_MULTIDEST_MAX_TOPK
             and token_num >= _TOKEN_MULTIDEST_MIN_TOKENS
             and os.environ.get("AITER_FLYDSL_TOKEN_MULTIDEST_QUANT", "1")
@@ -3405,6 +3405,7 @@ def flydsl_moe_fused_quant_preshuffle(
             md_ksplit = token_multidest_ksplit(
                 feat_dim, wmma_rep, quant_mode, token_num
             )
+            dynamic_routes = num_valid_routes is not None
             launch = _get_compiled_token_multidest_quant(
                 feat_dim=feat_dim,
                 wmma_rep=wmma_rep,
@@ -3414,13 +3415,20 @@ def flydsl_moe_fused_quant_preshuffle(
                     feat_dim, wmma_rep, quant_mode, md_ksplit
                 ),
                 ksplit=md_ksplit,
+                dynamic_routes=dynamic_routes,
             )
             token_grid = (token_num + warps_per_block - 1) // warps_per_block
+            valid_routes_ptr = (
+                num_valid_routes.reshape(-1)[:1].to(device=device, dtype=torch.int32)
+                if dynamic_routes
+                else torch.empty(0, dtype=torch.int32, device=device)
+            )
             launch(
                 ptr_arg(grouped_in.contiguous().view(-1)),
                 ptr_arg(out_payload.view(-1)),
                 ptr_arg(out_scale.view(-1)),
                 ptr_arg(topids_to_rows_i32),
+                ptr_arg(valid_routes_ptr),
                 token_num,
                 token_grid,
                 stream=torch.cuda.current_stream(),
