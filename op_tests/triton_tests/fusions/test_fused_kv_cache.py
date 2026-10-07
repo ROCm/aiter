@@ -277,7 +277,7 @@ def test_fused_qk_rope_cat_and_cache_mla(
     ],
 )
 @pytest.mark.parametrize("mixed_prefill", [False, True])
-@pytest.mark.parametrize("output_zeros", [False, True])
+@pytest.mark.parametrize("output_zeros", ["none", "partial", "all"])
 @pytest.mark.parametrize("padded_slots", [False, True])
 def test_fused_qk_cat_and_cache_mla(
     T: int,
@@ -289,7 +289,7 @@ def test_fused_qk_cat_and_cache_mla(
     shuffled_kv_cache: bool,
     block_size: int,
     mixed_prefill: bool,
-    output_zeros: bool,
+    output_zeros: str,
     padded_slots: bool,
 ):
     # The gluon kernel has no NoPE form. That also rules out the NVFP4 cache,
@@ -350,9 +350,11 @@ def test_fused_qk_cat_and_cache_mla(
         torch_kv_cache = torch_kv_cache.to(cache_dtype)
     triton_kv_cache = torch.zeros_like(torch_kv_cache)
 
-    # Only 0 or B: the kernel picks rows for the zeros / decode q_pe outputs by
-    # its head-major pid, which matches the token index only in those two cases.
-    num_decode_toks_for_zeros = B if output_zeros else 0
+    num_decode_toks_for_zeros = {"none": 0, "partial": B // 2, "all": B}[output_zeros]
+    # decode_q_pe_out is a view of the first num_decode_toks_for_zeros rows of a
+    # sentinel-filled B-row buffer, so a write to a row past it lands in the tail.
+    sentinel = -123.0
+    decode_q_pe_buf = torch.full((B, QH, D_pe), sentinel, dtype=dtype, device="cuda")
     triton_q, triton_decode_q_pe, triton_k_pe, triton_zeros = (
         fused_qk_cat_and_cache_mla(
             q_nope,
@@ -364,6 +366,7 @@ def test_fused_qk_cat_and_cache_mla(
             k_scale,
             num_decode_toks_for_zeros=num_decode_toks_for_zeros,
             apply_scale=(k_pe.dtype != triton_kv_cache.dtype),
+            decode_q_pe_out=decode_q_pe_buf[:num_decode_toks_for_zeros],
             # sglang hands q to the decode kernel in the cache dtype.
             q_out_dtype=cache_dtype,
             shuffled_kv_cache=shuffled_kv_cache,
@@ -393,11 +396,12 @@ def test_fused_qk_cat_and_cache_mla(
         **q_tol,
     )
     torch.testing.assert_close(k_pe[valid], triton_k_pe[valid], atol=0, rtol=0)
-    if num_decode_toks_for_zeros > 0:
-        torch.testing.assert_close(q_pe, triton_decode_q_pe, atol=0, rtol=0)
-        torch.testing.assert_close(
-            torch.zeros_like(q_nope), triton_zeros, atol=0, rtol=0
-        )
+    n = num_decode_toks_for_zeros
+    torch.testing.assert_close(q_pe[:n], triton_decode_q_pe, atol=0, rtol=0)
+    assert bool((decode_q_pe_buf[n:] == sentinel).all()), "decode_q_pe_out overrun"
+    torch.testing.assert_close(
+        torch.zeros_like(q_nope[:n]), triton_zeros, atol=0, rtol=0
+    )
 
 
 @pytest.mark.parametrize("T", [1, 8, 2048])

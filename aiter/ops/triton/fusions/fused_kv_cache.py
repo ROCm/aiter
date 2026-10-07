@@ -357,8 +357,8 @@ def _cat_and_cache_mla(
         d_freq == d_pe
     ), "cos/sin last dim should be the same or half of the qk last dim"
     assert (
-        num_decode_toks_for_zeros >= 0
-    ), "num_decode_toks_for_zeros must be non-negative to avoid invalid tensor creation"
+        0 <= num_decode_toks_for_zeros <= b
+    ), "num_decode_toks_for_zeros must be in [0, B]: only the B decode tokens have q"
     if isinstance(k_scale, torch.Tensor):
         assert k_scale.numel() == 1, "k_scale should be a single-element torch.Tensor"
     reuse_freqs_front_part = d_freq == d_pe // 2
