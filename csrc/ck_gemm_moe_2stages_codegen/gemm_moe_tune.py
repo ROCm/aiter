@@ -81,6 +81,7 @@ from aiter.ops.shuffle import (
 )
 from aiter.utility import fp4_utils
 from aiter.utility.base_tuner import TunerCommon
+from aiter.utility.cos_diff import COS_DIFF_THRESHOLD, combined_cos_diff
 from aiter.utility.dtypes import str2ActivationType, str2Dtype
 from aiter.utility.fp4_utils import moe_mxfp4_sort
 from aiter.utility.mp_tuner import mp_tuner
@@ -113,7 +114,8 @@ TUNE_MOE_EXPERT_BALANCE = (
     os.environ.get("TUNE_MOE_EXPERT_BALANCE", "False").lower() == "true"
 )
 
-COS_DIFF_THRESHOLD = 1e-1
+# COS_DIFF_THRESHOLD is imported from aiter.utility.cos_diff above, so the
+# threshold and the metric judged against it stay defined in one place.
 
 
 _TUNE_EXCLUDE_KERNEL_PATTERNS = [
@@ -168,9 +170,11 @@ def _a16w_sorted_cos(ref, res, msg="", printLog=True):
     valid = (ref.abs().sum(dim=1) > 0).nonzero(as_tuple=True)[0]
     if valid.numel() == 0:
         return 1.0
-    x = ref[valid].double().flatten()
-    y = res[:n][valid].double().flatten()
+    ref_rows = ref[valid].double()
+    res_rows = res[:n][valid].double()
+    x, y = ref_rows.flatten(), res_rows.flatten()
     cos_diff = 1 - 2 * (x * y).sum().item() / max((x * x + y * y).sum().item(), 1e-12)
+    cos_diff = combined_cos_diff(ref_rows, res_rows, cos_diff)
     if printLog:
         tag = "passed~" if cos_diff < COS_DIFF_THRESHOLD else "failed!"
         print(f"{msg}[cosine_diff={cos_diff:.6f} {tag}]")
@@ -278,12 +282,31 @@ def _to_f64_flat(t):
     return t.double().flatten()
 
 
+def _to_f64_rows(t):
+    """Same decode as ``_to_f64_flat`` but keeping the leading row dimension.
+
+    Returns None for anything that is not already row-shaped, so the caller
+    falls back to the whole-tensor score rather than inventing a row axis.
+    """
+    if t.dim() < 2:
+        return None
+    rows = t.shape[0]
+    if t.dtype == dtypes.fp4x2:
+        b = t.reshape(rows, -1).contiguous().view(torch.uint8)
+        lut = torch.tensor(_E2M1_LUT, device=b.device, dtype=torch.float64)
+        return torch.stack(
+            [lut[(b & 0xF).long()], lut[((b >> 4) & 0xF).long()]], dim=-1
+        ).reshape(rows, -1)
+    return t.double().reshape(rows, -1)
+
+
 def cosine_diff_compare(ref, res, msg="", printLog=True):
     from aiter import logger
 
     x = _to_f64_flat(ref)
     y = _to_f64_flat(res)
     cos_diff = 1 - 2 * (x * y).sum().item() / max((x * x + y * y).sum().item(), 1e-12)
+    cos_diff = combined_cos_diff(_to_f64_rows(ref), _to_f64_rows(res), cos_diff)
     if printLog:
         if cos_diff < COS_DIFF_THRESHOLD:
             logger.info(f"{msg}[cosine_diff={cos_diff:.6f} \033[32mpassed~\033[0m]")
