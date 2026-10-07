@@ -161,6 +161,10 @@ specialized file when one matches, and returns `(config, is_tuned)`:
   detect shapes running on untuned defaults (call sites that don't need it
   may ignore it).
 
+The first existing specialized file wins, in this order:
+`B={B}-N={N}-K={K}-CU={cu}`, `B={B}-N={N}-K={K}`, `N={N}-K={K}-CU={cu}`,
+`N={N}-K={K}`. `cu` is the device CU count (`CU_NUM` overrides it).
+
 The per-kernel `_get_config()` must stay a thin wrapper:
 
 ```python

@@ -103,6 +103,9 @@ and every fallback that reached them are gone. Flag:
 - An arch prefix on a filename inside `configs/<arch>/...` (wrong:
   `configs/gfx950/triton/gemm/x/gfx950-GEMM-X.json`), or a default file named
   anything other than exactly `DEFAULT.json`.
+- A CU-specific GEMM file not named `...-N={N}-K={K}-CU={cu}.json` or
+  `...-B={B}-N={N}-K={K}-CU={cu}.json`. It replaces the arch-wide file for
+  that CU count, so it must be a complete table.
 - A specialized file added to a `<d_type>/` directory that contains no
   `DEFAULT.json`, for a family whose loader requires the default — the load
   raises for every shape, not just the unspecialized ones.
