@@ -678,8 +678,11 @@ class FlyQuickAllReduce:
                 fraction,
                 min_bytes,
             )
-        except ValueError as exc:
-            err, mine = str(exc), None
+        except Exception as exc:  # noqa: BLE001
+            # pci bus ids raise RuntimeError, and a bad device id raises
+            # TypeError. Either one has to reach the gather below: the peer
+            # is already waiting there.
+            err, mine = f"{type(exc).__name__}: {exc}", None
         views = UncachedIpcHeap.gather_object_list_via_broadcast(
             self.group, (err, mine)
         )
@@ -836,16 +839,20 @@ class FlyQuickAllReduce:
         return self._by_cfg[cfg], num_tiles
 
     def uses_relay(self, nbytes: int) -> bool:
-        """Whether an *nbytes* payload runs on a relay engine."""
-        return self._pick_engine(int(nbytes))[0].spec["relay"] is not None
+        """Whether an *nbytes* payload runs on a relay engine.
+
+        Ring engines have no ``relay`` field. That is the direct path.
+        """
+        return self._pick_engine(int(nbytes))[0].spec.get("relay") is not None
 
     def relay_tile_fraction(self, nbytes: int) -> float:
         """Share of an *nbytes* payload's tiles carried by relay blocks."""
         eng, num_tiles = self._pick_engine(int(nbytes))
-        if eng.spec["relay"] is None:
+        relay = eng.spec.get("relay")
+        if relay is None:
             return 0.0
         grid_x = self._grid_x(num_tiles, eng.super_tile, eng.grid)
-        return _tile_fraction(num_tiles, grid_x, eng.spec["relay"])
+        return _tile_fraction(num_tiles, grid_x, relay)
 
     def _launch_args(
         self, eng: _StEngine, inp_ptr, out_ptr, stream, *, live_bytes, num_tiles

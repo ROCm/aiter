@@ -262,6 +262,7 @@ RELAY_CASES = (
     (12288, 5120, "int4"),
     (1024, 5120, "fp16"),
     (8191, 5120, "fp16"),
+    (1024, 5120, "int6"),
 )
 # (tokens, hidden, codec, relay_fraction, super_tile), ``--extended`` only.
 EXTENDED_RELAY_CASES = (
@@ -1181,19 +1182,27 @@ def test_quick_allreduce_transport(
 
 
 def _relay_key(
-    tp, relay_devices, relay_fraction, codec, super_tile, grid_cap=None
+    tp,
+    relay_devices,
+    relay_fraction,
+    codec,
+    super_tile,
+    grid_cap=None,
+    min_bytes=0,
 ) -> tuple:
-    """The engine for a relay row: relay from the first byte, on *codec*'s wire.
+    """The engine for a relay row, on *codec*'s wire.
 
-    A pinned super-tile also pins skip_self, which the relay needs on every
-    engine and which a pinned rung does not default to.
+    ``min_bytes`` 0 relays from the first byte. ``None`` keeps the host's
+    per-arch cutoff. A pinned super-tile also pins skip_self, which the relay
+    needs on every engine and which a pinned rung does not default to.
     """
     kw = {
         "algorithm": "mesh",
         "relay_devices": tuple(relay_devices),
         "relay_fraction": tuple(relay_fraction),
-        "relay_min_bytes": 0,
     }
+    if min_bytes is not None:
+        kw["relay_min_bytes"] = min_bytes
     if codec != "int4":
         kw.update(rs_codec=codec, ag_codec=codec)
     if super_tile is not None:
@@ -1203,7 +1212,9 @@ def _relay_key(
     return _key(tp, **kw)
 
 
-def _relay_case(tokens: int, hidden: int, codec: str) -> tuple:
+def _relay_case(
+    tokens: int, hidden: int, codec: str, calls: int = RELAY_CALLS
+) -> tuple:
     exact = codec == "fp16"
     return (
         tokens,
@@ -1211,7 +1222,7 @@ def _relay_case(tokens: int, hidden: int, codec: str) -> tuple:
         "exact" if exact else "normal",
         False,
         not exact,
-        RELAY_CALLS,
+        calls,
     )
 
 
@@ -1225,19 +1236,30 @@ def test_quick_allreduce_relay(
     codec,
     super_tile=None,
     grid_cap=None,
+    expect_relay=True,
+    min_bytes=0,
+    calls=RELAY_CALLS,
 ):
     """TP2 relay against its direct twin on the same inputs.
 
     Gates: SQNR and bit-identity across ranks as for any mesh row, zero lanes
     where the relay's output differs from the direct engine's on any of the
-    back-to-back calls, and the relay engine actually running. The lossless
-    wire must also match the fp32 reference exactly. Latencies are reported,
-    never asserted.
+    back-to-back calls, and the relay engine running exactly when
+    *expect_relay* says so. The lossless wire must also match the fp32
+    reference exactly. Latencies are reported, never asserted.
     """
     exact = codec == "fp16"
     rows = _result(
-        _relay_key(tp, relay_devices, relay_fraction, codec, super_tile, grid_cap),
-        _relay_case(tokens, hidden, codec),
+        _relay_key(
+            tp,
+            relay_devices,
+            relay_fraction,
+            codec,
+            super_tile,
+            grid_cap,
+            min_bytes,
+        ),
+        _relay_case(tokens, hidden, codec, calls),
     )
     nbytes = tokens * hidden * 2
     label = (
@@ -1269,9 +1291,11 @@ def test_quick_allreduce_relay(
             if row["relay_vs_direct_lanes"]
         ]
         + [
-            f"rank {rank}: the relay engine did not run ({row['variant']})"
+            f"rank {rank}: the relay engine "
+            f"{'did not run' if expect_relay else 'ran below its cutoff'} "
+            f"({row['variant']})"
             for rank, row in enumerate(rows)
-            if not row["relay_used"]
+            if bool(row["relay_used"]) != expect_relay
         ],
     )
     ret = {
@@ -1581,6 +1605,7 @@ def main():
         relay_pairs = [DEFAULT_RELAY] if n_gpu >= 4 and has_default else []
     relay_pairs = [tuple(p) for p in relay_pairs if isinstance(p, tuple)]
     relay = []
+    threshold_added = False
     if 2 in tps and "mesh" in algos and dts:
         for pair in relay_pairs:
             if len(pair) != 2 or max(pair) >= n_gpu or {0, 1} & set(pair):
@@ -1600,20 +1625,94 @@ def main():
                 )
             ]
             relay += [
-                (tokens, hidden, 2, pair, tuple(fraction), codec, None, grid_cap)
+                (
+                    tokens,
+                    hidden,
+                    2,
+                    pair,
+                    tuple(fraction),
+                    codec,
+                    None,
+                    grid_cap,
+                    True,
+                    0,
+                    RELAY_CALLS,
+                )
                 for tokens, hidden, codec in cases
                 for fraction in args.relay_fraction
                 for grid_cap in args.grid_cap
             ]
             if args.extended:
                 relay += [
-                    (tokens, hidden, 2, pair, fraction, codec, st, None)
+                    (
+                        tokens,
+                        hidden,
+                        2,
+                        pair,
+                        fraction,
+                        codec,
+                        st,
+                        None,
+                        True,
+                        0,
+                        RELAY_CALLS,
+                    )
                     for tokens, hidden, codec, fraction, st in EXTENDED_RELAY_CASES
                 ]
-    for tokens, hidden, tp, pair, fraction, codec, st, grid_cap in relay:
+            # One engine at the host's cutoff, walked below, onto, above, and
+            # back below it. The four rows share that engine, so the return to
+            # the direct inbox happens after the relay inbox has been used.
+            # The return visit uses one call so it is a different case from the
+            # first visit and actually runs again.
+            default = MESH_RELAY_DEFAULTS.get((link, 2, ARCH))
+            if (
+                not threshold_added
+                and default is not None
+                and args.mnk is None
+                and args.grid_cap == [None]
+            ):
+                hidden = 5120
+                at = default[0] // (hidden * 2)
+                if at > 1 and at * hidden * 2 == default[0]:
+                    fraction = tuple(args.relay_fraction[0])
+                    relay += [
+                        (
+                            tokens,
+                            hidden,
+                            2,
+                            pair,
+                            fraction,
+                            "int4",
+                            None,
+                            None,
+                            used,
+                            None,
+                            calls,
+                        )
+                        for tokens, used, calls in (
+                            (at - 1, False, RELAY_CALLS),
+                            (at, True, RELAY_CALLS),
+                            (at + 16, True, RELAY_CALLS),
+                            (at - 1, False, 1),
+                        )
+                    ]
+                    threshold_added = True
+    for (
+        tokens,
+        hidden,
+        tp,
+        pair,
+        fraction,
+        codec,
+        st,
+        grid_cap,
+        expect,
+        floor,
+        calls,
+    ) in relay:
         _register(
-            _relay_key(tp, pair, fraction, codec, st, grid_cap),
-            _relay_case(tokens, hidden, codec),
+            _relay_key(tp, pair, fraction, codec, st, grid_cap, floor),
+            _relay_case(tokens, hidden, codec, calls),
         )
 
     def _int4_rows(cases):
