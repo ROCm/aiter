@@ -99,7 +99,7 @@ def _aux_uses_opus(output_aux, block_size, routed_rows=None, num_experts=None):
         return True
     if routed_rows is None or num_experts is None:
         return False
-    return routed_rows >= num_experts
+    return 3 * routed_rows >= 4 * num_experts  # crossover ~1.3 rows per expert
 
 
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
@@ -431,6 +431,9 @@ def _moe_sorting_impl(
     if (
         output_aux
         and not _aux_uses_opus(output_aux, block_size, M * topk, num_experts)
+        and _mxfp4_aux_instance_supported(
+            num_experts, topk, model_dim, block_size, accumulate
+        )
         and _MOE_SORT_BACKEND not in ("opus", "ck")
     ):
         # adaptive (fused) sort emits the a4w4 extras (m_indices + reverse_sorted)
