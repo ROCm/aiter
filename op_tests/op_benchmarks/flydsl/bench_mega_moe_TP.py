@@ -1088,8 +1088,12 @@ class E2eModel:
 
 
 E2E_MODELS = {
-    "m3": E2eModel(128, 4, 2.0, 1.0, 1e-6, gemma=True, logits_fp32=False, swiglu_limit=7.0),
-    "glm5": E2eModel(256, 8, 2.5, 1.0, 1e-5, gemma=False, logits_fp32=True, bias_glm=True),
+    "m3": E2eModel(
+        128, 4, 2.0, 1.0, 1e-6, gemma=True, logits_fp32=False, swiglu_limit=7.0
+    ),
+    "glm5": E2eModel(
+        256, 8, 2.5, 1.0, 1e-5, gemma=False, logits_fp32=True, bias_glm=True
+    ),
 }
 
 
@@ -1119,30 +1123,45 @@ def make_e2e_inputs(shape, ctx, tp, global_tokens, seed) -> E2eInputs:
         * (E2E_RESIDUAL_SCALE * tp**-0.5)
     ).to(dtypes.bf16)
     residual = (
-        E2E_RESIDUAL_SCALE * torch.randn((global_tokens, H), generator=shared, device=ctx.device)
+        E2E_RESIDUAL_SCALE
+        * torch.randn((global_tokens, H), generator=shared, device=ctx.device)
     ).to(dtypes.bf16)
 
     def norm_weight():
         noise = 0.1 * torch.randn((H,), generator=shared, device=ctx.device)
-        return (shape.x_scale * (1.0 + noise) - (1.0 if cfg.gemma else 0.0)).to(dtypes.bf16)
+        return (shape.x_scale * (1.0 + noise) - (1.0 if cfg.gemma else 0.0)).to(
+            dtypes.bf16
+        )
 
     w_post = norm_weight()
     w_next = norm_weight()
-    wg = (torch.randn((E, H), generator=shared, device=ctx.device) * (3 * H**-0.5)).to(
-        dtypes.bf16
-    )
+    wg = (
+        torch.randn((E, H), generator=shared, device=ctx.device) * (3 * H**-0.5)
+    ).to(dtypes.bf16)
     if cfg.bias_glm:
         bias = 7.0 + 0.01 * torch.randn((E,), generator=shared, device=ctx.device)
     else:
         bias = 0.05 * torch.randn((E,), generator=shared, device=ctx.device)
     return E2eInputs(
-        part, residual, w_post, w_next, wg, bias.float(), global_tokens, global_tokens // tp
+        part,
+        residual,
+        w_post,
+        w_next,
+        wg,
+        bias.float(),
+        global_tokens,
+        global_tokens // tp,
     )
 
 
 class SplitE2e:
     def __init__(
-        self, weights: TpMoeWeights, ctx: DistCtx, max_local_tokens: int, comm, bf16=False
+        self,
+        weights: TpMoeWeights,
+        ctx: DistCtx,
+        max_local_tokens: int,
+        comm,
+        bf16=False,
     ):
         self.bf16 = bf16
         self.cfg = cfg = E2E_MODELS[weights.shape.name]
@@ -1150,8 +1169,12 @@ class SplitE2e:
         self.moe = SplitTpMoeAR(weights, ctx, max_local_tokens, comm)
         self.moe.gemms.kwargs["swiglu_limit"] = cfg.swiglu_limit
         total = max_local_tokens * weights.tp_size
-        self.ids = torch.full((total, self.K + 1), self.E, dtype=torch.int32, device=ctx.device)
-        self.tw = torch.full((total, self.K + 1), cfg.shared_w, dtype=torch.float32, device=ctx.device)
+        self.ids = torch.full(
+            (total, self.K + 1), self.E, dtype=torch.int32, device=ctx.device
+        )
+        self.tw = torch.full(
+            (total, self.K + 1), cfg.shared_w, dtype=torch.float32, device=ctx.device
+        )
 
     def __call__(self, inp: E2eInputs):
         T, K = inp.global_tokens, self.K
@@ -1160,13 +1183,18 @@ class SplitE2e:
             inp.part, inp.residual, inp.w_post, self.eps, gemma_norm=gemma
         )
         ids, tw = self.ids[:T], self.tw[:T]
-        tw_r, ids_r = torch.split(tw, [K, 1], dim=1)[0], torch.split(ids, [K, 1], dim=1)[0]
+        tw_r, ids_r = (
+            torch.split(tw, [K, 1], dim=1)[0],
+            torch.split(ids, [K, 1], dim=1)[0],
+        )
         if self.cfg.logits_fp32:
             logits = tgemm.mm(normed, inp.wg, None, otype=dtypes.fp32)
             biased_grouped_topk(logits, inp.bias, tw_r, ids_r, 1, 1, True, self.scale)
         else:
             logits = tgemm.mm(normed, inp.wg, None, otype=dtypes.bf16)
-            topk_gating(tw_r, ids_r, logits, inp.bias, True, self.scale, score_func="sigmoid")
+            topk_gating(
+                tw_r, ids_r, logits, inp.bias, True, self.scale, score_func="sigmoid"
+            )
         out = tensor_model_parallel_fused_allreduce_rmsnorm_quant(
             self._moe(normed, T).contiguous(),
             res,
@@ -1202,7 +1230,12 @@ def _norm(x, w, eps, gemma) -> torch.Tensor:
 
 class MegaE2e:
     def __init__(
-        self, weights: TpMoeWeights, ctx: DistCtx, max_local_tokens: int, tokens, bf16=False
+        self,
+        weights: TpMoeWeights,
+        ctx: DistCtx,
+        max_local_tokens: int,
+        tokens,
+        bf16=False,
     ):
         shape = weights.shape
         self.rank = ctx.rank
@@ -1220,7 +1253,9 @@ class MegaE2e:
         self.fused.engine.engine.tn_eps = self.eps
         self.fused.engine.engine.tn_gemma = cfg.gemma
         self.fused.engine.prepare(
-            sorted({t // weights.tp_size for t in tokens}), tail=not bf16, tail_bf16=bf16
+            sorted({t // weights.tp_size for t in tokens}),
+            tail=not bf16,
+            tail_bf16=bf16,
         )
         self.sprs = SpRsNorm(
             shape.model_dim,
@@ -1231,18 +1266,30 @@ class MegaE2e:
             gemma=cfg.gemma,
             logit_bf16=not cfg.logits_fp32,
         )
-        self.ids = torch.empty((max_local_tokens, self.K + 1), dtype=torch.int32, device=ctx.device)
-        self.tw = torch.empty((max_local_tokens, self.K + 1), dtype=torch.float32, device=ctx.device)
-        self.y = torch.empty((max_local_tokens, shape.model_dim), dtype=dtypes.bf16, device=ctx.device)
+        self.ids = torch.empty(
+            (max_local_tokens, self.K + 1), dtype=torch.int32, device=ctx.device
+        )
+        self.tw = torch.empty(
+            (max_local_tokens, self.K + 1), dtype=torch.float32, device=ctx.device
+        )
+        self.y = torch.empty(
+            (max_local_tokens, shape.model_dim), dtype=dtypes.bf16, device=ctx.device
+        )
 
     def __call__(self, inp: E2eInputs):
         m = inp.local_tokens
         rows = slice(self.rank * m, (self.rank + 1) * m)
         ids, tw = self.ids[:m], self.tw[:m]
-        out, res = self.sprs(inp.part, inp.residual, inp.w_post, router=(inp.wg, inp.bias, ids, tw))
+        out, res = self.sprs(
+            inp.part, inp.residual, inp.w_post, router=(inp.wg, inp.bias, ids, tw)
+        )
         res_own = res[rows]
         _, q, s, *b = self.fused.engine.forward(
-            out[rows], tw, ids, out=self.y[:m], tail=(res_own, res_own, inp.w_next),
+            out[rows],
+            tw,
+            ids,
+            out=self.y[:m],
+            tail=(res_own, res_own, inp.w_next),
             bf16=self.bf16,
         )
         return (q.view(dtypes.fp8), s, res_own) + tuple(b)
@@ -1252,17 +1299,28 @@ def _dequant(q, s) -> torch.Tensor:
     return q.float() * s.float().view(-1, 1)
 
 
-def run_case_e2e(shape, weights, ctx, args, global_tokens, max_local_tokens, tokens) -> dict:
+def run_case_e2e(
+    shape, weights, ctx, args, global_tokens, max_local_tokens, tokens
+) -> dict:
     tp = args.tp
     if global_tokens % (16 * tp):
         raise SkipCase("the fused router takes 16-row tiles per rank (tokens % 64)")
     inp = make_e2e_inputs(shape, ctx, tp, global_tokens, args.seed)
-    split = SplitE2e(weights, ctx, max_local_tokens, args.comm_backend, bf16=args.e2e_tail_bf16)
+    split = SplitE2e(
+        weights, ctx, max_local_tokens, args.comm_backend, bf16=args.e2e_tail_bf16
+    )
     if not jit_warmup(split.moe, shape, ctx, global_tokens):
-        raise SkipCase("kernel build failed on rank 0 (see the [jit-warmup] warning above)")
+        raise SkipCase(
+            "kernel build failed on rank 0 (see the [jit-warmup] warning above)"
+        )
     row = new_row(
-        shape, args, global_tokens, inp.local_tokens, weights.local_inter_dim,
-        split.moe.kernel_names(global_tokens), "",
+        shape,
+        args,
+        global_tokens,
+        inp.local_tokens,
+        weights.local_inter_dim,
+        split.moe.kernel_names(global_tokens),
+        "",
     )
     row["comm_mode"] = "e2e"
     mega = MegaE2e(weights, ctx, max_local_tokens, tokens, bf16=args.e2e_tail_bf16)
@@ -1306,7 +1364,9 @@ def run_case_e2e(shape, weights, ctx, args, global_tokens, max_local_tokens, tok
     )
     err = mega.fused.engine.poll_errors()
     if not all_ranks_ok(err == 0, ctx.device):
-        raise AssertionError(f"{shape.tag(tp)} tokens={global_tokens}: fused watchdog fired")
+        raise AssertionError(
+            f"{shape.tag(tp)} tokens={global_tokens}: fused watchdog fired"
+        )
     if not args.no_perf:
         row["split_e2e_us"], _ = _time_graph(split, inp, args, ctx)
         row["mega_e2e_us"], _ = _time_graph(mega, inp, args, ctx)
@@ -1321,7 +1381,9 @@ def main_e2e(args) -> int:
     args.comm_backend = TpCollectives(ctx, args.tp)
     try:
         if ctx.custom_comm_error:
-            raise RuntimeError(f"--e2e needs aiter's parallel state: {ctx.custom_comm_error}")
+            raise RuntimeError(
+                f"--e2e needs aiter's parallel state: {ctx.custom_comm_error}"
+            )
         tokens, max_local = _check_tokens(args)
         models = [m for m in args.models if m in E2E_MODELS]
         if ctx.is_main:
@@ -1338,7 +1400,9 @@ def main_e2e(args) -> int:
             for global_tokens in tokens:
                 row, skip = None, ""
                 try:
-                    row = run_case_e2e(shape, weights, ctx, args, global_tokens, max_local, tokens)
+                    row = run_case_e2e(
+                        shape, weights, ctx, args, global_tokens, max_local, tokens
+                    )
                 except SkipCase as exc:
                     skip = str(exc)
                 torch.cuda.empty_cache()
@@ -1369,13 +1433,28 @@ def main_e2e(args) -> int:
         if ctx.is_main and rows:
             df = pd.DataFrame(rows)
             cols = [
-                "model", "global_tokens", "local_tokens", "split_e2e_us", "mega_e2e_us",
-                "e2e_speedup", "e2e_route_match", "e2e_split_q_rel_l2", "e2e_q_rel_l2",
-                "e2e_split_res_rel_l2", "e2e_res_rel_l2", "e2e_split_bf16_rel_l2",
-                "e2e_bf16_rel_l2", "comm",
+                "model",
+                "global_tokens",
+                "local_tokens",
+                "split_e2e_us",
+                "mega_e2e_us",
+                "e2e_speedup",
+                "e2e_route_match",
+                "e2e_split_q_rel_l2",
+                "e2e_q_rel_l2",
+                "e2e_split_res_rel_l2",
+                "e2e_res_rel_l2",
+                "e2e_split_bf16_rel_l2",
+                "e2e_bf16_rel_l2",
+                "comm",
             ]
             cols = [c for c in cols if c in df.columns]
-            print("\n" + "=" * 100 + "\nATOM decoder-layer MoE region: split vs mega (us)\n" + "=" * 100)
+            print(
+                "\n"
+                + "=" * 100
+                + "\nATOM decoder-layer MoE region: split vs mega (us)\n"
+                + "=" * 100
+            )
             print(df[cols].to_markdown(index=False, floatfmt=".3f"))
             if args.csv:
                 df.to_csv(args.csv, index=False)

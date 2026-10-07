@@ -2,8 +2,8 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Correctness test of the fused TP MegaMoE layer (a4w4, MXFP4, gfx950), torchrun only::
 
-    torchrun --nproc_per_node=4 op_tests/multigpu_tests/test_mega_moe_TP.py --models glm5
-    torchrun --nproc_per_node=8 op_tests/multigpu_tests/test_mega_moe_TP.py --tokens 8 64
+torchrun --nproc_per_node=4 op_tests/multigpu_tests/test_mega_moe_TP.py --models glm5
+torchrun --nproc_per_node=8 op_tests/multigpu_tests/test_mega_moe_TP.py --tokens 8 64
 """
 
 from __future__ import annotations

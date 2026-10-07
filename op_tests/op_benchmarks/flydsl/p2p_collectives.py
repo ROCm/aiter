@@ -13,25 +13,32 @@ import threading
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm as _llvm
-from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
-from aiter.ops.flydsl.kernels import buffer_ops
+from aiter.ops.flydsl.kernels.kernels_common import ceildiv
+from aiter.ops.flydsl.kernels.mega_moe_tp.common import (
+    AUX_SYS,
+    MAX_TP,
+    bf16x8_to_f32,
+    bld,
+    bst,
+    g_ld_sys,
+    g_st_sys,
+    i32,
+    pack_bf16x8,
+    rsrc,
+    traced,
+)
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 __all__ = ["P2PGroup", "PeerArenaGroup", "flydsl_multi_device"]
 
-MAX_TP = 8
 NT = 256
 NCTA = 128
 NCTA_MAX = 512
-AUX_SYS = 1 | 16
 KIND_AG, KIND_RS, KIND_AR = 0, 1, 2
 POLL_LIMIT = 1 << 24
-traced = ASTRewriter.transform
 
 
 class PeerArenaGroup:
@@ -131,14 +138,6 @@ def flydsl_multi_device() -> None:
     art_cls._mega_moe_multi_device = True
 
 
-def _u(v):
-    return v.ir_value() if hasattr(v, "ir_value") else v
-
-
-def _attr(v):
-    return ir.IntegerAttr.get(ir.IntegerType.get_signless(32), int(v))
-
-
 @functools.cache
 def compile_p2p(kind: int, row_bytes: int, tp: int, device: int):
     UB = 16 if row_bytes % 16 == 0 else (8 if row_bytes % 8 == 0 else 4)
@@ -152,113 +151,32 @@ def compile_p2p(kind: int, row_bytes: int, tp: int, device: int):
     def vty():
         return {16: T.vec(4, T.i32), 8: T.vec(2, T.i32), 4: T.i32}[UB]
 
-    def i32(v):
-        return fx.Int32(v)
-
     def i64(v):
         return fx.Int64(v)
 
-    def uni(v):
-        return i32(rocdl.readfirstlane(T.i32, _u(i32(v))))
-
-    def uni64(v):
-        v = i64(v)
-        lo = uni(i32(v & i64(0xFFFFFFFF)))
-        hi = uni(i32(v >> i64(32)))
-        return (i64(hi) << i64(32)) | (i64(lo) & i64(0xFFFFFFFF))
-
-    def rsrc(addr):
-        return buffer_ops.create_buffer_resource_from_addr(_u(uni64(addr)))
-
-    def bld(rs, off, ty, aux=0):
-        return rocdl.raw_ptr_buffer_load(
-            ty, rs, _u(i32(off)), _u(i32(0)), aux=_attr(aux)
-        )
-
-    def bst(v, rs, off, aux=0):
-        rocdl.raw_ptr_buffer_store(_u(v), rs, _u(i32(off)), _u(i32(0)), aux=_attr(aux))
-
-    def gptr(addr):
-        return _llvm.IntToPtrOp(
-            _llvm.PointerType.get(address_space=1), _u(i64(addr))
-        ).result
-
-    def ld_sys(addr):
-        return i32(
-            _llvm.LoadOp(
-                T.i32,
-                gptr(addr),
-                alignment=4,
-                volatile_=True,
-                ordering=_llvm.AtomicOrdering.monotonic,
-                syncscope="one-as",
-            ).res
-        )
-
-    def st_sys(addr, v):
-        _llvm.StoreOp(
-            _u(i32(v)),
-            gptr(addr),
-            alignment=4,
-            ordering=_llvm.AtomicOrdering.monotonic,
-            syncscope="one-as",
-        )
-
-    def wait_vm0():
-        _llvm.inline_asm(None, [], "s_waitcnt vmcnt(0)", "", has_side_effects=True)
-
     def tab(t, p):
-        return i64(bld(rsrc(t), i32(p) * i32(8), T.i64))
-
-    def bf16x8(d):
-        dv = fx.Vector(d)
-        out = []
-        for q in range_constexpr(4):
-            w = i32(dv[q])
-            out += [
-                (w << i32(16)).bitcast(fx.Float32),
-                (w & i32(-65536)).bitcast(fx.Float32),
-            ]
-        return out
-
-    def bits(x):
-        return i32(
-            fx.Vector.from_elements(
-                [fx.Float32(x).to(fx.BFloat16)], fx.BFloat16
-            ).bitcast(fx.Int16)[0]
-        ) & i32(0xFFFF)
-
-    def pack8(f):
-        return fx.Vector.from_elements(
-            [bits(f[2 * q]) | (bits(f[2 * q + 1]) << i32(16)) for q in range(4)],
-            fx.Int32,
-        )
+        return i64(bld(rsrc(t), i32(p) * i32(8), 0, T.i64))
 
     BIG = 0x7FFFFFF0
 
-    def rsrc_n(addr, nbytes):
-        return buffer_ops.create_buffer_resource_from_addr(
-            _u(uni64(addr)), num_records_bytes=_u(i64(uni(nbytes)))
-        )
-
     @traced
     def raise_flags(a, tid, phase, c, ep):
-        wait_vm0()
+        rocdl.s_waitcnt(vmcnt=0)
         gpu.barrier()
         if tid < i32(TP):
             idx = ((i32(phase) * i32(MAX_TP) + a["rank"]) * i32(NCTA_K) + c) * i32(4)
-            st_sys(tab(a["flags"], tid) + i64(idx), ep)
+            g_st_sys(tab(a["flags"], tid) + i64(idx), ep)
 
     @traced
     def wait_flags(a, tid, phase, c, ep):
         if tid < i32(TP):
             idx = ((i32(phase) * i32(MAX_TP) + tid) * i32(NCTA_K) + c) * i32(4)
             addr = tab(a["flags"], a["rank"]) + i64(idx)
-            v = ld_sys(addr)
+            v = g_ld_sys(addr)
             n = i32(0)
             while (v < ep) & (n < i32(POLL_LIMIT)):
                 rocdl.s_sleep(1)
-                v = ld_sys(addr)
+                v = g_ld_sys(addr)
                 n = n + i32(1)
         gpu.barrier()
 
@@ -278,40 +196,40 @@ def compile_p2p(kind: int, row_bytes: int, tp: int, device: int):
     def send(a, tid, c, r0, nu, bank):
         rank, m = a["rank"], a["m"]
         nbytes = m * i32(row_bytes)
-        dsts = [rsrc_n(stage_row0(a, i32(p), bank, rank), nbytes) for p in range(TP)]
+        dsts = [rsrc(stage_row0(a, i32(p), bank, rank), nbytes) for p in range(TP)]
         if const_expr(kind == KIND_AG):
-            rs_in = rsrc_n(a["src"], nbytes)
-            rs_out = rsrc_n(i64(a["out"]) + i64(rank * nbytes), nbytes)
+            rs_in = rsrc(a["src"], nbytes)
+            rs_out = rsrc(i64(a["out"]) + i64(rank * nbytes), nbytes)
             for it_ in range(tid, nu, i32(NT_K * UNR)):
                 o = offs(tid, i32(it_), r0, nu)
-                vs = [bld(rs_in, o[k], vty()) for k in range(UNR)]
+                vs = [bld(rs_in, o[k], 0, vty()) for k in range(UNR)]
                 for k in range_constexpr(UNR):
-                    bst(vs[k], rs_out, o[k])
+                    bst(vs[k], rs_out, o[k], 0)
                     for p in range_constexpr(TP):
                         if rank != i32(p):
-                            bst(vs[k], dsts[p], o[k], push_aux)
+                            bst(vs[k], dsts[p], o[k], 0, push_aux)
         else:
             rs_ins = [
-                rsrc_n(i64(a["src"]) + i64(i32(p) * nbytes), nbytes) for p in range(TP)
+                rsrc(i64(a["src"]) + i64(i32(p) * nbytes), nbytes) for p in range(TP)
             ]
             for it_ in range(tid, nu, i32(NT_K * UNR)):
                 o = offs(tid, i32(it_), r0, nu)
                 for p in range_constexpr(TP):
                     if rank != i32(p):
-                        vs = [bld(rs_ins[p], o[k], vty()) for k in range(UNR)]
+                        vs = [bld(rs_ins[p], o[k], 0, vty()) for k in range(UNR)]
                         for k in range_constexpr(UNR):
-                            bst(vs[k], dsts[p], o[k], push_aux)
+                            bst(vs[k], dsts[p], o[k], 0, push_aux)
 
     @traced
     def pull(a, tid, src0, dst0, r0, nu):
         nbytes = a["m"] * i32(row_bytes)
-        rs_st = rsrc_n(src0, nbytes)
-        rs_out = rsrc_n(dst0, nbytes)
+        rs_st = rsrc(src0, nbytes)
+        rs_out = rsrc(dst0, nbytes)
         for it_ in range(tid, nu, i32(NT_K * UNR)):
             o = offs(tid, i32(it_), r0, nu)
-            vs = [bld(rs_st, o[k], vty(), AUX_SYS) for k in range(UNR)]
+            vs = [bld(rs_st, o[k], 0, vty(), AUX_SYS) for k in range(UNR)]
             for k in range_constexpr(UNR):
-                bst(vs[k], rs_out, o[k])
+                bst(vs[k], rs_out, o[k], 0)
 
     @traced
     def reduce(a, tid, r0, nu, bank):
@@ -319,40 +237,39 @@ def compile_p2p(kind: int, row_bytes: int, tp: int, device: int):
         nbytes = m * i32(row_bytes)
         own0 = i64(a["src"]) + i64(rank * nbytes)
         srcs = [
-            rsrc_n(
+            rsrc(
                 (rank == i32(p)).select(own0, stage_row0(a, rank, bank, i32(p))), nbytes
             )
             for p in range(TP)
         ]
-        rs_out = rsrc_n(
+        rs_out = rsrc(
             i64(a["out"]) + i64((rank * nbytes) if kind == KIND_AR else i32(0)), nbytes
         )
         dsts = [
-            rsrc_n(stage_row0(a, i32(p), bank + i32(2), rank), nbytes)
-            for p in range(TP)
+            rsrc(stage_row0(a, i32(p), bank + i32(2), rank), nbytes) for p in range(TP)
         ]
         for it_ in range(tid, nu, i32(NT_K * UNR)):
             o = offs(tid, i32(it_), r0, nu)
             vs = [
-                [bld(srcs[p], o[k], vty(), AUX_SYS) for p in range(TP)]
+                [bld(srcs[p], o[k], 0, vty(), AUX_SYS) for p in range(TP)]
                 for k in range(UNR)
             ]
             for k in range_constexpr(UNR):
-                acc = bf16x8(vs[k][0])
+                acc = bf16x8_to_f32(vs[k][0])
                 for p in range_constexpr(1, TP):
-                    acc = [x + y for x, y in zip(acc, bf16x8(vs[k][p]))]
-                res = pack8(acc)
-                bst(res, rs_out, o[k])
+                    acc = [x + y for x, y in zip(acc, bf16x8_to_f32(vs[k][p]))]
+                res = pack_bf16x8(acc)
+                bst(res, rs_out, o[k], 0)
                 if const_expr(kind == KIND_AR):
                     for p in range_constexpr(TP):
                         if rank != i32(p):
-                            bst(res, dsts[p], o[k], push_aux)
+                            bst(res, dsts[p], o[k], 0, push_aux)
 
     @traced
     def body(a, tid, c, ep):
         rank, m = a["rank"], a["m"]
         nblk = i32(gpu.grid_dim.x)
-        rpc = (m + nblk - i32(1)) // nblk
+        rpc = ceildiv(m, nblk)
         r0 = c * rpc
         nr = fx.max(fx.min(rpc, m - r0), i32(0))
         nu = nr * i32(UPR)
@@ -391,7 +308,7 @@ def compile_p2p(kind: int, row_bytes: int, tp: int, device: int):
     @traced
     def epoch_store(a, tid, c, ep):
         if tid == i32(0):
-            st_sys(i64(a["eflag"]) + i64(c * i32(4)), ep)
+            g_st_sys(i64(a["eflag"]) + i64(c * i32(4)), ep)
 
     @flyc.kernel(name=name, known_block_size=[NT_K, 1, 1])
     def p2p_kernel(
@@ -417,7 +334,7 @@ def compile_p2p(kind: int, row_bytes: int, tp: int, device: int):
         }
         tid = i32(gpu.thread_id("x"))
         c = i32(gpu.block_id("x"))
-        ep = ld_sys(i64(eflag) + i64(c * i32(4))) + i32(1)
+        ep = g_ld_sys(i64(eflag) + i64(c * i32(4))) + i32(1)
         body(a, tid, c, ep)
         gpu.barrier()
         epoch_store(a, tid, c, ep)

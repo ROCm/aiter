@@ -3,20 +3,79 @@
 from __future__ import annotations
 
 import functools
-import struct
 import math
+import struct
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm
-from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
-from .. import buffer_ops
-from ..mxfp4_gemm_common import _activation_mul_batch, _e8m0_from_amax, _fabs_f32
+from ..kernels_common import ceildiv
+from ..mxfp4_gemm_common import _activation_mul_batch, _e8m0_from_amax
+from .common import (
+    ACQ,
+    ACQ_REL,
+    AUX_SC1,
+    AUX_SYS,
+    DEADLINE,
+    MAX_TP,
+    REL,
+    V2I,
+    V4I,
+    _ctpop,
+    _u,
+    alive,
+    amax,
+    asm,
+    bf16x8_to_f32,
+    bld,
+    bst,
+    cat8,
+    dma4,
+    dma16,
+    e8_scale,
+    fp4_pack,
+    fp8x4_pack,
+    fp8x4_unpack,
+    fp8x8_decode,
+    g_add_agent,
+    g_ld_i32,
+    g_ld_rel,
+    g_ld_sys,
+    g_or_agent,
+    g_st_sys,
+    i32,
+    lds_atomic_add,
+    lds_atomic_or,
+    lds_cas,
+    lds_ld,
+    lds_ld_acq,
+    lds_ld_i32,
+    lds_st,
+    lds_st_rel,
+    mfma,
+    mxfp8x8,
+    now,
+    pack_bf16x2,
+    pack_bf16x8,
+    poll_sys_ge,
+    rsrc,
+    scales4,
+    spin0,
+    spin_lds_ge,
+    sum_live,
+    swap16,
+    swap32,
+    traced,
+    uni,
+    wait_lgkm0,
+    wait_vm,
+    wave_rank,
+    wave_red,
+)
 
 __all__ = [
     "CTRL_ERR",
@@ -39,7 +98,6 @@ __all__ = [
     "mega_moe_tp_shape_supported",
 ]
 
-MAX_TP = 8
 DYN_MAX = 256
 NCK_MAX = 64
 NCHA_MAX = 64
@@ -59,7 +117,6 @@ CTRL_ERR = 20
 CTRL_XF = 32
 CTRL_CNT = 64
 ERR_FLAG, ERR_META, ERR_CHUNK, ERR_COMM, ERR_YAG = 1, 2, 4, 8, 16
-DEADLINE = 200_000_000
 N_XCD = 8
 LRDY_STRIDE = 32
 CTRL_LRDY = CTRL_CNT + 2 * NCK_MAX
@@ -99,8 +156,6 @@ KCS = 2
 ALOAD_DEPTH = 3
 RED_INFLIGHT = 32
 POLL_SLEEP = 16
-AUX_SC1 = 16
-AUX_SYS = 1 | 16
 
 
 def mega_moe_tp_shape_supported(model_dim: int, inter_dim: int, tp: int) -> bool:
@@ -131,17 +186,6 @@ def gemm2_chunk_groups(H: int, I: int) -> int:
     return 2 if (H // 64 // NW) % 2 == 0 else 1
 
 
-def _attr(v):
-    return ir.IntegerAttr.get(ir.IntegerType.get_signless(32), int(v))
-
-
-def _u(v):
-    return v.ir_value() if hasattr(v, "ir_value") else v
-
-
-traced = ASTRewriter.transform
-
-
 @functools.cache
 def mega_moe_tp_consts(
     H: int,
@@ -160,7 +204,7 @@ def mega_moe_tp_consts(
     KS1 = H // 128
     KS2 = I // 128
     G2 = H // 64 // NW
-    NSC_BLK = (RG + 63) // 64
+    NSC_BLK = ceildiv(RG, 64)
     acb = KCS * (128 if a8 else 64)
     NA_ROWOPS = RG * acb // 1024
     GPC = gemm2_chunk_groups(H, I)
@@ -170,8 +214,8 @@ def mega_moe_tp_consts(
         "NCH": KS1 // KCS,
         "KS2": KS2,
         "G2": G2,
-        "CH1": (H // 32 + 7) // 8,
-        "CH2": (I // 32 + 7) // 8,
+        "CH1": ceildiv(H // 32, 8),
+        "CH2": ceildiv(I // 32, 8),
         "ACB": acb,
         "XB": H if a8 else H // 2,
         "SI_STRIDE": (I if a8 else I // 2) + (8 if lb and not a8 else 16),
@@ -182,13 +226,13 @@ def mega_moe_tp_consts(
         "NCK": G2 // GPC,
         "CW": GPC * NW * 64,
         "NAB": nab,
-        "NBW": (dyn_e + 31) // 32,
+        "NBW": ceildiv(dyn_e, 32),
     }
     off = 0
 
     def take(n):
         nonlocal off
-        off = (off + 15) // 16 * 16
+        off = ceildiv(off, 16) * 16
         start, off = off, off + n
         return start
 
@@ -197,7 +241,9 @@ def mega_moe_tp_consts(
     c["L_AS"] = take(nab * KCS * NSC_BLK * 64 * 4)
     c["L_B1"] = c["L_A"]
     c["L_B1S"] = c["L_A"] + RG * c["SI_STRIDE"]
-    c["B1_FITS"] = c["L_B1S"] + RG * (I // 32) <= c["L_AS"] + nab * KCS * NSC_BLK * 64 * 4
+    c["B1_FITS"] = (
+        c["L_B1S"] + RG * (I // 32) <= c["L_AS"] + nab * KCS * NSC_BLK * 64 * 4
+    )
     c["L_INTER"] = take(
         max(RG * c["SI_STRIDE"], agr * (c["XB"] + H // 32) - RG * (I // 32))
     )
@@ -211,8 +257,8 @@ def mega_moe_tp_consts(
     c["L_DCH"] = take((nch + 2 * NW) * 4) if nch else 0
     c["L_EOFF"] = take(dyn_e * 4) if lb else 0
     c["L_DPRE"] = take(dyn_e * 4) if lb else 0
-    c["L_CLS"] = take((TMAX + 31) // 32 * 4)
-    c["LDS_BYTES"] = (off + 127) // 128 * 128
+    c["L_CLS"] = take(ceildiv(TMAX, 32) * 4)
+    c["LDS_BYTES"] = ceildiv(off, 128) * 128
     assert H // 256 <= NCHA_MAX
     assert KS1 % nsk == 0 and nsk % KCS == 0 and nsk >= NSK
     assert (nsk - 1) * OPS <= 63 and c["NA_L"] * (max(ALOAD_DEPTH, nab) - 1) <= 63
@@ -334,9 +380,9 @@ def compile_mega_moe_tp(
     assert npp >= 1 and nsk % (npp * KCS) == 0 and (KS1 * npp) % nsk == 0
     assert 3 <= NAB <= 4
     NE = dyn_e
-    VPL = (CW // 8 + 63) // 64
+    VPL = ceildiv(CW // 8, 64)
     SCAN_TOK = min(TMAX, DYN_MAX) if DYN else TMAX
-    SCAN_IT = (SCAN_TOK * TOPK // 4 + NT - 1) // NT
+    SCAN_IT = ceildiv(SCAN_TOK * TOPK // 4, NT)
     SCAN_G = 16
     NPC = 1 if LB else (KS2 if DYN else max(npieces, 1))
     assert not DYN or xsplit == 0
@@ -362,8 +408,8 @@ def compile_mega_moe_tp(
         return nsk2 * n // math.gcd(nsk2, n) // n
 
     DX_STEP = math.lcm(*[_g2_step(KS2 // q) for q in DYN_PS]) if DYN else G2
-    DX_CG = ((G2 + 1) // 2 + DX_STEP - 1) // DX_STEP * DX_STEP
-    DX_NG = (G2 + DX_CG - 1) // DX_CG
+    DX_CG = ceildiv((G2 + 1) // 2, DX_STEP) * DX_STEP
+    DX_NG = ceildiv(G2, DX_CG)
     DX = bool(dx) and DYN and DLL and KS2 <= XQ_P and G2 % DX_STEP == 0
     ROW_B = 2 * H if DLL else (H + H // 32 if FP8R else 2 * H)
     XSPLIT = xsplit > 0
@@ -392,7 +438,7 @@ def compile_mega_moe_tp(
     CGB = [sum(CGW[:k]) for k in range(NCG + 1)]
     XG_LIST = TMAX * TOPK * (I // 2 + I // 32)
     RBITS = TMAX.bit_length()
-    LB_IT = (TMAX * TOPK // 4 + NT - 1) // NT
+    LB_IT = ceildiv(TMAX * TOPK // 4, NT)
     LB_B = min(LB_IT, 10)
     LB_PS = [p for p in range(1, KS2 + 1) if KS2 % p == 0]
     if lbp and int(lbp) in LB_PS:
@@ -431,7 +477,11 @@ def compile_mega_moe_tp(
         + (f"_q{LBQ}" if LBQ > 1 else "")
         + (("_cg" + "x".join(str(w) for w in CGW)) if _cg else "")
         + (f"_lp{LB_PS[0]}" if LB and len(LB_PS) == 1 else "")
-        + (f"_tn{int(tn)}e{struct.unpack('<I', struct.pack('<f', tn_eps))[0]:x}" if tn else "")
+        + (
+            f"_tn{int(tn)}e{struct.unpack('<I', struct.pack('<f', tn_eps))[0]:x}"
+            if tn
+            else ""
+        )
         + ("_rms" if tn and not tn_gemma else "")
         + ("_zma" if ZMA else "")
         + (f"_mix{LBMIX_DIV}" if LBMIX else "")
@@ -441,175 +491,6 @@ def compile_mega_moe_tp(
     )
     const_expr = fx.const_expr
     layout_tag = f"{CTRL_INTS}/{FLAG_INTS}/{DEADLINE}/{UNIT_REC}/{NCTA_MAX}"
-
-    def i32(v):
-        raw = v if isinstance(v, ir.Value) else getattr(v, "ir_value", lambda: None)()
-        if raw is not None and isinstance(raw.type, ir.IndexType):
-            return fx.Int32(fx.index_cast(T.i32, raw))
-        return fx.Int32(v)
-
-    class _LazyTy:
-        def __init__(self, fn):
-            self.fn = fn
-
-    V4I = _LazyTy(lambda: T.vec(4, T.i32))
-    V4F = _LazyTy(lambda: T.vec(4, T.f32))
-    V2I = _LazyTy(lambda: T.vec(2, T.i32))
-
-    def _ty(t):
-        return t.fn() if isinstance(t, _LazyTy) else t
-
-    def lds_ptr(base, off, ty, align=4):
-        ty = _ty(ty)
-        if isinstance(ty, ir.VectorType):
-            ty = ty.element_type
-        return fx.inttoptr(
-            fx.PointerType.get(ty, fx.AddressSpace.Shared, align), base + i32(off)
-        )
-
-    def lds_ld(base, off, ty=None, align=4):
-        ty = _ty(ty) if ty is not None else T.i32
-        return fx.ptr_load(lds_ptr(base, off, ty, align), result_type=ty)
-
-    def lds_ld_i32(base, off):
-        return i32(lds_ld(base, off))
-
-    def lds_st(base, off, val, align=4):
-        v = _u(val)
-        fx.ptr_store(v, lds_ptr(base, off, v.type, align))
-
-    MONO, ACQ, REL, ACQ_REL = (
-        fx.AtomicOrdering.Monotonic,
-        fx.AtomicOrdering.Acquire,
-        fx.AtomicOrdering.Release,
-        fx.AtomicOrdering.AcqRel,
-    )
-
-    def lds_p(base, off):
-        return fx.inttoptr(
-            fx.PointerType.get(T.i32, fx.AddressSpace.Shared, 4),
-            fx.Int32(base + i32(off)),
-        )
-
-    def gptr(addr):
-        return fx.inttoptr(
-            fx.PointerType.get(T.i32, fx.AddressSpace.Global, 4), fx.Int64(addr)
-        )
-
-    def lds_atomic_add(base, off, v, ordering=MONO):
-        return i32(
-            fx.atomic_add(
-                lds_p(base, off), i32(v), syncscope="workgroup", ordering=ordering
-            )
-        )
-
-    def lds_atomic_or(base, off, v):
-        return i32(fx.atomic_or(lds_p(base, off), i32(v), syncscope="workgroup"))
-
-    def lds_ld_acq(base, off):
-        return i32(
-            fx.generic_load(
-                lds_p(base, off),
-                dtype=fx.Int32,
-                memory_order=MONO,
-                syncscope="workgroup",
-                volatile=True,
-            )
-        )
-
-    def lds_st_rel(base, off, v):
-        fx.generic_store(
-            lds_p(base, off), i32(v), memory_order=REL, syncscope="workgroup"
-        )
-
-    def lds_cas(base, off, cmp, new):
-        return i32(
-            fx.atomic_cas(lds_p(base, off), i32(cmp), i32(new), syncscope="workgroup")[
-                0
-            ]
-        )
-
-    def _ctpop(v):
-        return i32(fx.ctpop(i32(v)))
-
-    def g_ld_rel(addr, scope):
-        return i32(
-            fx.generic_load(
-                gptr(addr),
-                dtype=fx.Int32,
-                memory_order=MONO,
-                syncscope=scope,
-                volatile=True,
-            )
-        )
-
-    def g_ld_sys(addr):
-        return g_ld_rel(addr, "one-as")
-
-    def g_st_sys(addr, v):
-        fx.generic_store(gptr(addr), i32(v), memory_order=MONO, syncscope="one-as")
-
-    def g_add_agent(addr, v):
-        return i32(fx.atomic_add(gptr(addr), i32(v), syncscope="agent"))
-
-    def g_or_agent(addr, v):
-        fx.atomic_or(gptr(addr), i32(v), syncscope="agent")
-
-    def g_ld_i32(addr):
-        return i32(fx.generic_load(gptr(addr), dtype=fx.Int32))
-
-    def uni(v):
-        return i32(rocdl.readfirstlane(T.i32, _u(i32(v))))
-
-    def uni64(v):
-        v = fx.Int64(v)
-        lo = uni(fx.Int32(v & fx.Int64(0xFFFFFFFF)))
-        hi = uni(fx.Int32(v >> fx.Int64(32)))
-        return (fx.Int64(hi) << fx.Int64(32)) | (fx.Int64(lo) & fx.Int64(0xFFFFFFFF))
-
-    def rsrc(addr, nbytes=None):
-        if nbytes is None:
-            return buffer_ops.create_buffer_resource_from_addr(_u(uni64(addr)))
-        return buffer_ops.create_buffer_resource_from_addr(
-            _u(uni64(addr)), num_records_bytes=_u(fx.Int64(uni(nbytes)))
-        )
-
-    def bld(rs, voff, soff, ty, aux):
-        return rocdl.raw_ptr_buffer_load(
-            _ty(ty), rs, _u(i32(voff)), _u(i32(soff)), aux=_attr(aux)
-        )
-
-    def bst(val, rs, voff, soff, aux):
-        rocdl.raw_ptr_buffer_store(
-            _u(val), rs, _u(i32(voff)), _u(i32(soff)), aux=_attr(aux)
-        )
-
-    def asm(text, cons="", args=()):
-        _llvm.inline_asm(None, [_u(a) for a in args], text, cons, has_side_effects=True)
-
-    def dma16(lds_addr, rs, voff, soff, nt=False):
-        asm(
-            "s_mov_b32 m0, $0\n\tbuffer_load_dwordx4 $1, $2, $3 offen"
-            + (" nt" if nt else "")
-            + " lds",
-            "s,v,s,s",
-            (uni(lds_addr), i32(voff), rs, uni(soff)),
-        )
-
-    def dma4(lds_addr, rs, voff, soff, sys=False):
-        asm(
-            "s_mov_b32 m0, $0\n\tbuffer_load_dword $1, $2, $3 offen"
-            + (" sc0 sc1" if sys else "")
-            + " lds",
-            "s,v,s,s",
-            (uni(lds_addr), i32(voff), rs, uni(soff)),
-        )
-
-    def wait_vm(n):
-        asm(f"s_waitcnt vmcnt({min(int(n), 63)})")
-
-    def wait_lgkm0():
-        asm("s_waitcnt lgkmcnt(0)")
 
     def ctrl_at(a, idx):
         return fx.Int64(a["ctrl"]) + fx.Int64(i32(idx) * i32(4))
@@ -632,74 +513,6 @@ def compile_mega_moe_tp(
     def route_region_bytes(ttot):
         return ttot * i32(TOPK * ROW_B)
 
-    def amax(vals):
-        am = _fabs_f32(vals[0])
-        for v in vals[1:]:
-            am = am.maximumf(_fabs_f32(v))
-        return am
-
-    def fp4_pack(vals, qs):
-        pk = _u(i32(0))
-        for k in range(len(vals) // 2):
-            pk = rocdl.cvt_scalef32_pk_fp4_f32(
-                T.i32, pk, _u(vals[2 * k]), _u(vals[2 * k + 1]), _u(qs), k
-            )
-        return fx.Int32(pk)
-
-    def fp8x4_pack(f, qs):
-        zero = fx.Vector.filled(2, 0, fx.Int16)
-        w = rocdl.cvt_scalef32_pk_fp8_f32(
-            T.vec(2, T.i16), _u(zero), _u(f[0]), _u(f[1]), _u(qs), False
-        )
-        w = rocdl.cvt_scalef32_pk_fp8_f32(
-            T.vec(2, T.i16), w, _u(f[2]), _u(f[3]), _u(qs), True
-        )
-        return fx.Int32(fx.Vector(w).bitcast(fx.Int32)[0])
-
-    def fp8x4_unpack(d, sc):
-        out = []
-        for sel in (False, True):
-            v = fx.Vector(
-                rocdl.cvt_scalef32_pk_f32_fp8(T.vec(2, T.f32), _u(i32(d)), _u(sc), sel)
-            )
-            out += [fx.Float32(v[0]), fx.Float32(v[1])]
-        return out
-
-    def e8_scale(e8):
-        return ((fx.Int32(e8) & i32(0xFF)) << i32(23)).bitcast(fx.Float32)
-
-    def fp8x8_decode(ld):
-        dv = fx.Vector(ld[0])
-        sc = e8_scale(ld[1])
-        return fp8x4_unpack(fx.Int32(dv[0]), sc) + fp8x4_unpack(fx.Int32(dv[1]), sc)
-
-    def bf16_bits(f):
-        return fx.Int32(
-            fx.Vector.from_elements(
-                [fx.Float32(f).to(fx.BFloat16)], fx.BFloat16
-            ).bitcast(fx.Int16)[0]
-        ) & i32(0xFFFF)
-
-    def pack_bf16x2(a, b):
-        return bf16_bits(a) | (bf16_bits(b) << i32(16))
-
-    def bf16x8_to_f32(d):
-        dv = fx.Vector(d)
-        out = []
-        for q in range_constexpr(4):
-            w = fx.Int32(dv[q])
-            out.append((w << i32(16)).bitcast(fx.Float32))
-            out.append((w & i32(-65536)).bitcast(fx.Float32))
-        return out
-
-    def pack_bf16x8(acc):
-        return fx.Vector.from_elements(
-            [pack_bf16x2(acc[2 * q], acc[2 * q + 1]) for q in range(4)], fx.Int32
-        )
-
-    def sum_live(acc, vals, live):
-        return [x + live.select(y, fx.Float32(0.0)) for x, y in zip(acc, vals)]
-
     def ll_pkt(a, d0, d1, e8):
         tag = ((a["epoch"] & i32(0xFFFFFF)) << i32(8)) | e8
         return fx.Vector.from_elements([d0, a["epoch"], d1, tag], fx.Int32)
@@ -721,13 +534,6 @@ def compile_mega_moe_tp(
             )
         return wave_red(bad, lane, fx.max)
 
-    def wave_red(v, lane, op):
-        for k in (1, 2, 4, 8, 16, 32):
-            v = op(
-                v, i32(rocdl.ds_bpermute(T.i32, _u((lane ^ i32(k)) * i32(4)), _u(v)))
-            )
-        return uni(v)
-
     def route_load(rs, region, ttot, ridx, col, take=None):
         if FP8R:
             doff = region + ridx * i32(H) + col
@@ -743,36 +549,6 @@ def compile_mega_moe_tp(
 
     def route_decode(ld):
         return fp8x8_decode(ld) if FP8R else bf16x8_to_f32(ld)
-
-    def _swap(fn, x, y):
-        st = _llvm.StructType.get_literal([T.i32, T.i32])
-        r = fn(st, _u(i32(x)), _u(i32(y)), False, False)
-        return (
-            i32(_llvm.ExtractValueOp(T.i32, r, [0]).res),
-            i32(_llvm.ExtractValueOp(T.i32, r, [1]).res),
-        )
-
-    def swap16(x, y):
-        return _swap(rocdl.permlane16_swap, x, y)
-
-    def swap32(x, y):
-        return _swap(rocdl.permlane32_swap, x, y)
-
-    def widen(v4):
-        z = fx.Vector.filled(4, 0, fx.Int32)
-        return _u(fx.Vector(v4).shuffle(z, list(range(8))))
-
-    def mfma(a4, b4, cacc, sa, sb, b8=False):
-        bx = _u(b4) if b8 else widen(b4)
-        return fx.Vector(
-            rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-                _ty(V4F),
-                [widen(a4), bx, _u(cacc), 4, 0 if b8 else 4, 0, _u(i32(sa)), 0, _u(i32(sb))],
-            )
-        )
-
-    def cat8(lo, hi):
-        return _u(fx.Vector(lo).shuffle(fx.Vector(hi), list(range(8))))
 
     def a_frag(abuf, row, k, q4):
         if const_expr(A8):
@@ -811,19 +587,6 @@ def compile_mega_moe_tp(
                     cur = lds_ld_acq(L, L_CTL + C_BARGEN * 4)
         rocdl.sched_barrier(0)
 
-    @traced
-    def spin_lds_ge(L, off, target):
-        cur = lds_ld_acq(L, off)
-        while cur < target:
-            rocdl.s_sleep(0)
-            cur = lds_ld_acq(L, off)
-
-    @traced
-    def spin0(L, lane, off, target):
-        if lane == i32(0):
-            spin_lds_ge(L, off, target)
-        rocdl.sched_barrier(0)
-
     def report(a, code):
         g_or_agent(ctrl_at(a, CTRL_ERR), code)
 
@@ -832,19 +595,11 @@ def compile_mega_moe_tp(
         if bad:
             report(a, code)
 
-    def _now():
-        return fx.Int64(
-            _llvm.call_intrinsic(T.i64, "llvm.amdgcn.s.memrealtime", [], [], [])
-        )
-
-    def _alive(t0):
-        return (_now() - t0) < fx.Int64(DEADLINE)
-
     @traced
     def poll_zero(fn, a=None, lane=None, err=0):
         pend = fn()
-        t0 = _now()
-        while (pend != i32(0)) & _alive(t0):
+        t0 = now()
+        while (pend != i32(0)) & alive(t0):
             rocdl.s_sleep(1)
             pend = fn()
         if const_expr(err != 0):
@@ -852,11 +607,7 @@ def compile_mega_moe_tp(
 
     @traced
     def spin_sys_ge(addr, target, a=None):
-        cur = g_ld_sys(addr)
-        t0 = _now()
-        while (cur < target) & _alive(t0):
-            rocdl.s_sleep(2)
-            cur = g_ld_sys(addr)
+        cur = poll_sys_ge(addr, target)
         if const_expr(a is not None):
             _report_if(a, cur < target, ERR_FLAG)
 
@@ -927,7 +678,7 @@ def compile_mega_moe_tp(
                             & (fx.Int32(vs[x][j]) == expert)
                             & _in_chunk(idx, chunk)
                         )
-                        pos, n = _wave_rank(hit)
+                        pos, n = wave_rank(hit)
                         hits.append((hit, run + pos, idx, ws[x][j]))
                         run = run + n
                 base = _wave_claim(L, tid, run)
@@ -947,7 +698,7 @@ def compile_mega_moe_tp(
     def zero_masked(L, lane, a, w0, nw):
         n = a["ttot"] * i32(TOPK)
         nblk = i32(gpu.grid_dim.x)
-        per = (n + nblk - i32(1)) // nblk
+        per = ceildiv(n, nblk)
         lo = i32(gpu.block_id("x")) * per
         hi = fx.min(lo + per, n)
         rid = rsrc(a["ids"], n * i32(16 if MLL else 4))
@@ -957,7 +708,7 @@ def compile_mega_moe_tp(
             i = i32(b_) + lane
             off = fx.min(i, n - i32(1)) * i32(16 if MLL else 4)
             e = fx.Int32(bld(rid, off, 0, T.i32, 0))
-            bal = fx.Int64(rocdl.ballot(T.i64, _u((i < hi) & masked(e))))
+            bal = fx.Int64(rocdl.ballot(T.i64, (i < hi) & masked(e)))
             if bal != fx.Int64(0):
                 for j_ in range(i32(0), i32(64), i32(1)):
                     j = i32(j_)
@@ -993,14 +744,6 @@ def compile_mega_moe_tp(
                         bst(z, rs, base + soff + q * i32(16), 0, AUX_SC1)
                 else:
                     bst(z, rs, base + (ridx * i32(H) + q * i32(8)) * i32(2), 0, AUX_SC1)
-
-    def _wave_rank(hit):
-        b = fx.Int64(rocdl.ballot(T.i64, _u(hit)))
-        lo = i32(b & fx.Int64(0xFFFFFFFF))
-        hi = i32(b >> fx.Int64(32))
-        below = rocdl.mbcnt_lo(T.i32, _u(lo), _u(i32(0)))
-        below = i32(rocdl.mbcnt_hi(T.i32, _u(hi), below))
-        return below, _ctpop(lo) + _ctpop(hi)
 
     @traced
     def _wave_claim(L, tid, n):
@@ -1065,6 +808,8 @@ def compile_mega_moe_tp(
     @traced
     def wait_a_chunk(L, lane, buf, q):
         if const_expr(VB):
+            # a spin loop the compiler cannot see: one it sees makes it drain
+            # the in-flight weight loads (vmcnt(0)) before every A chunk
             _llvm.inline_asm(
                 T.i32,
                 [_u(L + i32(L_CTL + C_ASEQ * 4) + buf * i32(4)), _u(q + i32(1))],
@@ -1082,6 +827,8 @@ def compile_mega_moe_tp(
     @traced
     def release_a_chunk(L, lane, buf):
         if const_expr(VB):
+            # branch-free: a branch splits the GEMM1 step loop, which also
+            # drains the weight loads
             asm(
                 "ds_add_u32 $0, $1",
                 "v,v,~{memory}",
@@ -1410,8 +1157,7 @@ def compile_mega_moe_tp(
                     col = (lane % i32(8)) ^ (row & i32(7))
                 rr = (row < rows).select(row, i32(0))
                 arow.append(
-                    (lds_ld_i32(L, L_RIX + (r0 + rr) * i32(4)) // i32(TOPK))
-                    * i32(XB)
+                    (lds_ld_i32(L, L_RIX + (r0 + rr) * i32(4)) // i32(TOPK)) * i32(XB)
                     + col * i32(16)
                 )
             ascl = []
@@ -1537,7 +1283,9 @@ def compile_mega_moe_tp(
                 slot + i32(t * 1024),
                 rsrc(a["w2"]),
                 lane * i32(16),
-                e * i32(H * (I // 2)) + (n0 + i32(t * 16)) * i32(I // 2) + k * i32(1024),
+                e * i32(H * (I // 2))
+                + (n0 + i32(t * 16)) * i32(I // 2)
+                + k * i32(1024),
                 nt=True,
             )
         for p in range_constexpr(2):
@@ -1583,7 +1331,7 @@ def compile_mega_moe_tp(
             "nxt": nxt,
         }
         if const_expr(VB and span is not None):
-            if (lds_ld_i32(L, L_CTL + C_VBON * 4) != i32(0)):
+            if lds_ld_i32(L, L_CTL + C_VBON * 4) != i32(0):
                 _gemm2(*args, vb2=True, **kw)
             else:
                 _gemm2(*args, **kw)
@@ -1634,7 +1382,7 @@ def compile_mega_moe_tp(
         GPI = (NSK2 * NKS // math.gcd(NSK2, NKS)) // NKS
         assert G2 % GPI == 0
         WAIT_B2 = (NSK2 - 1) * OPS
-        LAG = max(1, -(-NSK2 // (GPC * NKS)))
+        LAG = max(1, ceildiv(NSK2, GPC * NKS))
         RLAG = GPC * NKS * OPS
         lane = tid % i32(64)
         w = uni(tid // i32(64))
@@ -1662,7 +1410,8 @@ def compile_mega_moe_tp(
             if q == tq:
                 vn = lds_ld_acq(L, L_CTL + C_G2VN * 4)
                 ok = (vn == nxt + i32(2)) & (
-                    lds_ld_i32(L, L_CTL + C_G2V * 4) < lds_ld_i32(L, L_CTL + C_NCH * 4) * i32(NCG)
+                    lds_ld_i32(L, L_CTL + C_G2V * 4)
+                    < lds_ld_i32(L, L_CTL + C_NCH * 4) * i32(NCG)
                 )
                 if lane == i32(0):
                     lds_st(L, L_CTL + (C_PFW + w) * i32(4), ok.select(i32(1), i32(0)))
@@ -1674,7 +1423,15 @@ def compile_mega_moe_tp(
             ee = uni(pf.select(ent_ & i32(0xFFFF), e))
             qc = uni(pf.select(q - tq + cg_lo(cc_) * i32(GPC * NKS), tq - i32(1)))
             gi = qc // i32(NKS)
-            g2_slot_dma(a, lane, w, ring + i32(slot_idx * SLOT), ee, gi, ks0 + qc - gi * i32(NKS))
+            g2_slot_dma(
+                a,
+                lane,
+                w,
+                ring + i32(slot_idx * SLOT),
+                ee,
+                gi,
+                ks0 + qc - gi * i32(NKS),
+            )
 
         def issue(q, slot_idx):
             if const_expr(XPF):
@@ -1772,7 +1529,7 @@ def compile_mega_moe_tp(
                         s1 = fx.Int32(rr[6 * sidx + 5])
                     else:
                         if const_expr(k < NSK2 and NKS >= NSK2):
-                            if const_expr(j > 0):
+                            if const_expr(j > 0):  # noqa: SIM114
                                 wait_vm(WAIT_B2 + 2 * MTE)
                             elif gi > g_lo:
                                 wait_vm(WAIT_B2 + 2 * MTE)
@@ -1814,10 +1571,7 @@ def compile_mega_moe_tp(
                             fx.Int32(
                                 lds_ld(
                                     L,
-                                    is0
-                                    + row * i32(I // 32)
-                                    + i32(k * 4)
-                                    + q4,
+                                    is0 + row * i32(I // 32) + i32(k * 4) + q4,
                                     T.i8,
                                     1,
                                 )
@@ -1889,7 +1643,7 @@ def compile_mega_moe_tp(
                 rr = groups(g_lo + i32(gi0c), rr)
         else:
             for gi0_ in range(g_lo, g_hi, i32(GPI)):
-                if const_expr(progress is not None):
+                if const_expr(progress is not None):  # noqa: SIM102
                     if i32(gi0_) + i32(GPI) >= g_hi:
                         progress()
                 groups(i32(gi0_), rr)
@@ -1942,7 +1696,7 @@ def compile_mega_moe_tp(
     @traced
     def _drop_stale(tid, a):
         if tid < i32(64):
-            asm("buffer_inv sc0")
+            asm("buffer_inv sc0")  # no wrapper
         bid = i32(gpu.block_id("x"))
         if (tid < i32(64)) & (bid < i32(N_XCD)) & (a["epoch"] == i32(1)):
             fx.memory_fence(syncscope="one-as", ordering=ACQ)
@@ -2033,7 +1787,7 @@ def compile_mega_moe_tp(
                     _xcol_empty(a, tid, kind, i0, R)
         if const_expr(XSPLIT):
             nblk = i32(gpu.grid_dim.x)
-            cap = (a["ncol"] + nblk - i32(1)) // nblk * i32(2) + i32(2)
+            cap = ceildiv(a["ncol"], nblk) * i32(2) + i32(2)
             col_claim(L, tid, a)
             for it_ in range(i32(0), cap, i32(1)):
                 _col_unit(L, tid, a, i32(it_) < cap - i32(1))
@@ -2069,7 +1823,7 @@ def compile_mega_moe_tp(
         P = lds_ld_i32(L, L_CTL + C_DYNP * 4)
         ncol = lds_ld_i32(L, L_CTL + C_NACT * 4) * P * i32(DX_NG)
         nblk = i32(gpu.grid_dim.x)
-        cap = (ncol + nblk - i32(1)) // nblk * i32(2) + i32(2)
+        cap = ceildiv(ncol, nblk) * i32(2) + i32(2)
         col_claim(L, tid, a)
         for it_ in range(i32(0), cap, i32(1)):
             _dx_col(L, tid, a, ncol, P, i32(it_) < cap - i32(1))
@@ -2166,7 +1920,7 @@ def compile_mega_moe_tp(
         cbar(L, tid)
         _dyn_prefix(L, tid)
         cbar(L, tid)
-        for it in range_constexpr((NE + NT - 1) // NT):
+        for it in range_constexpr(ceildiv(NE, NT)):
             _dyn_list(L, tid + i32(it * NT))
         cbar(L, tid)
         if const_expr(CHUNK):
@@ -2197,9 +1951,9 @@ def compile_mega_moe_tp(
 
     def _pick_p(nun, C, ps):
         P = i32(ps[0])
-        best = ((nun * i32(ps[0]) + C - i32(1)) // C) * i32(KS2 // ps[0])
+        best = ceildiv(nun * i32(ps[0]), C) * i32(KS2 // ps[0])
         for q in ps[1:]:
-            cost = ((nun * i32(q) + C - i32(1)) // C) * i32(KS2 // q)
+            cost = ceildiv(nun * i32(q), C) * i32(KS2 // q)
             better = (cost < best) & (nun * i32(q) <= C * i32(UL_MAX))
             P = better.select(i32(q), P)
             best = better.select(cost, best)
@@ -2247,9 +2001,7 @@ def compile_mega_moe_tp(
                 if const_expr(CHUNK):
                     lds_st(L, ul, lds_ld_i32(L, L_DCH + j * i32(4)))
                 else:
-                    lds_st(
-                        L, ul, lds_ld_i32(L, L_DYN + (i32(2 * NBW) + j) * i32(4))
-                    )
+                    lds_st(L, ul, lds_ld_i32(L, L_DYN + (i32(2 * NBW) + j) * i32(4)))
                 lds_st(L, ul + i32(4), (u - j * P) * icnt)
                 lds_st(L, ul + i32(8), icnt)
                 kind = i32(UNIT_G1X) | ((u - j * P) << i32(8)) | (j << i32(XQ_SHIFT))
@@ -2260,21 +2012,17 @@ def compile_mega_moe_tp(
             lds_st_rel(L, L_CTL + C_PLAN * 4, i32(1))
 
     def lb_g1c(a, j, bank):
-        return ctrl_at(
-            a, i32(CTRL_G1C) + (bank * i32(NCHLB_MAX) + j) * i32(G1C_STRIDE)
-        )
+        return ctrl_at(a, i32(CTRL_G1C) + (bank * i32(NCHLB_MAX) + j) * i32(G1C_STRIDE))
 
     def lb_colc(a, c, bank):
-        return ctrl_at(
-            a, i32(CTRL_COLC) + (bank * i32(NCK_MAX) + c) * i32(LRDY_STRIDE)
-        )
+        return ctrl_at(a, i32(CTRL_COLC) + (bank * i32(NCK_MAX) + c) * i32(LRDY_STRIDE))
 
     def lb_lbr(a, bank, x):
         return ctrl_at(a, i32(CTRL_LBR) + (bank * i32(N_XCD) + x) * i32(LRDY_STRIDE))
 
     def lb_lbr_wait(a, bank, x):
         nblk = i32(gpu.grid_dim.x)
-        spin_sys_ge(lb_lbr(a, bank, x), (nblk - x + i32(N_XCD - 1)) // i32(N_XCD), a)
+        spin_sys_ge(lb_lbr(a, bank, x), ceildiv(nblk - x, i32(N_XCD)), a)
 
     @traced
     def lb_none(L, tid, a, nun):
@@ -2307,19 +2055,25 @@ def compile_mega_moe_tp(
     def lb_plan(L, tid, a):
         n = a["ttot"] * i32(TOPK)
         nblk = i32(gpu.grid_dim.x)
-        per = (n + nblk - i32(1)) // nblk
+        per = ceildiv(n, nblk)
         lo = fx.min(i32(gpu.block_id("x")) * per, n)
         hi = fx.min(lo + per, n)
         if tid == i32(0):
-            lds_st(
-                L, L_CTL + C_LBB * 4, g_ld_sys(ctrl_at(a, i32(CTRL_LBSEQ))) & i32(1)
-            )
+            lds_st(L, L_CTL + C_LBB * 4, g_ld_sys(ctrl_at(a, i32(CTRL_LBSEQ))) & i32(1))
         rid = rsrc(a["ids"], n * i32(4))
         n4 = n // i32(4)
         for r0_ in range(i32(0), n4, i32(NT * LB_B)):
             r0 = i32(r0_)
             vs = [
-                fx.Vector(bld(rid, fx.min(r0 + tid + i32(it * NT), n4 - i32(1)) * i32(16), 0, V4I, 0))
+                fx.Vector(
+                    bld(
+                        rid,
+                        fx.min(r0 + tid + i32(it * NT), n4 - i32(1)) * i32(16),
+                        0,
+                        V4I,
+                        0,
+                    )
+                )
                 for it in range(LB_B)
             ]
             for it in range_constexpr(LB_B):
@@ -2336,7 +2090,7 @@ def compile_mega_moe_tp(
         cbar(L, tid)
         _dyn_prefix(L, tid)
         cbar(L, tid)
-        for it in range_constexpr((NE + NT - 1) // NT):
+        for it in range_constexpr(ceildiv(NE, NT)):
             _dyn_list(L, tid + i32(it * NT))
         cbar(L, tid)
         _chunk_table(L, tid, True)
@@ -2355,12 +2109,12 @@ def compile_mega_moe_tp(
     def _lb_bitmap(L, tid):
         lane = tid % i32(64)
         w = tid // i32(64)
-        for rnd in range_constexpr((NE + NT - 1) // NT):
+        for rnd in range_constexpr(ceildiv(NE, NT)):
             e = tid + i32(rnd * NT)
             c = (e < i32(NE)).select(
                 lds_ld_i32(L, L_DCNT + fx.min(e, i32(NE - 1)) * i32(4)), i32(0)
             )
-            b = fx.Int64(rocdl.ballot(T.i64, _u(c > i32(0))))
+            b = fx.Int64(rocdl.ballot(T.i64, c > i32(0)))
             for h in range_constexpr(2):
                 wi = i32(rnd * NT // 32 + h) + w * i32(2)
                 if (lane == i32(0)) & (wi < i32(NBW)):
@@ -2387,7 +2141,7 @@ def compile_mega_moe_tp(
     def _wave_prefix(v, bits):
         pre, tot = i32(0), i32(0)
         for b in range_constexpr(bits):
-            below, cnt = _wave_rank(((v >> i32(b)) & i32(1)) == i32(1))
+            below, cnt = wave_rank(((v >> i32(b)) & i32(1)) == i32(1))
             pre = pre + (below << i32(b))
             tot = tot + (cnt << i32(b))
         return pre, tot
@@ -2398,7 +2152,7 @@ def compile_mega_moe_tp(
         w = tid // i32(64)
         lane = tid % i32(64)
         base = [i32(0), i32(0)]
-        for rnd in range_constexpr((NE + NT - 1) // NT):
+        for rnd in range_constexpr(ceildiv(NE, NT)):
             j = tid + i32(rnd * NT)
             live = j < nact
             e = live.select(
@@ -2407,7 +2161,7 @@ def compile_mega_moe_tp(
             )
             r = lds_ld_i32(L, L_DCNT + e * i32(4))
             r = live.select(r, i32(0)) if lb else r
-            ce = fx.min(fx.max((r + i32(RCH - 1)) // i32(RCH), i32(1)), i32(255))
+            ce = fx.min(fx.max(ceildiv(r, i32(RCH)), i32(1)), i32(255))
             ce = live.select(ce, i32(0))
             sums = [_wave_prefix(ce, 8)] + ([_wave_prefix(r, RBITS)] if lb else [])
             if lane == i32(0):
@@ -2423,7 +2177,7 @@ def compile_mega_moe_tp(
                     total = total + sv
                 off.append(o)
                 base[q] = base[q] + total
-            if const_expr(lb):
+            if const_expr(lb):  # noqa: SIM102
                 if live:
                     lds_st(L, L_EOFF + e * i32(4), off[1])
             for c_ in range(i32(0), ce, i32(1)):
@@ -2459,9 +2213,7 @@ def compile_mega_moe_tp(
         if tid == i32(0):
             if const_expr(ZMA):
                 spin_lds_ge(L, L_CTL + C_ZDONE * 4, i32(1))
-            g_add_agent(
-                lb_lbr(a, lb_bank(L), i32(gpu.block_id("x")) % i32(N_XCD)), 1
-            )
+            g_add_agent(lb_lbr(a, lb_bank(L), i32(gpu.block_id("x")) % i32(N_XCD)), 1)
 
     @traced
     def _lb_units(L, tid):
@@ -2476,7 +2228,7 @@ def compile_mega_moe_tp(
             J2 = nun
             if const_expr(LBMIX):
                 X = i32(2) * nun - C
-                K = (X + i32(1)) // i32(2)
+                K = ceildiv(X, i32(2))
                 M = i32(2) * (nun - K)
                 mix = (X > i32(0)) & (X <= C // i32(LBMIX_DIV)) & (i32(3) * X <= M)
                 P = mix.select(i32(2), P)
@@ -2498,7 +2250,7 @@ def compile_mega_moe_tp(
                     ul + i32(12),
                     i32(UNIT_G1X) | (s << i32(8)) | (j << i32(XQ_SHIFT)),
                 )
-            mine = (bid < U).select((U - bid + C - i32(1)) // C, i32(0))
+            mine = (bid < U).select(ceildiv(U - bid, C), i32(0))
             if const_expr(LBMIX):
                 mine = mix.select(lds_ld_i32(L, L_CTL + (C_UNIT + 1) * 4), mine)
             lds_st(L, L_CTL + C_DYNP * 4, P)
@@ -2525,24 +2277,42 @@ def compile_mega_moe_tp(
         if r < M:
             j = r // i32(2)
             s_ = r - j * i32(2)
-            _lb_ul(L, i32(0), lds_ld_i32(L, L_DCH + j * i32(4)), s_ * i32(I // 2), i32(I // 2),
-                   i32(UNIT_G1X) | (s_ << i32(8)) | (j << i32(XQ_SHIFT)))
+            _lb_ul(
+                L,
+                i32(0),
+                lds_ld_i32(L, L_DCH + j * i32(4)),
+                s_ * i32(I // 2),
+                i32(I // 2),
+                i32(UNIT_G1X) | (s_ << i32(8)) | (j << i32(XQ_SHIFT)),
+            )
             lds_st(L, L_CTL + (C_UNIT + 1) * 4, i32(1))
         else:
             for k in range_constexpr(3):
                 f = (r - M) * i32(3) + i32(k)
                 j = J2 + f // i32(KS2)
                 s_ = f - (j - J2) * i32(KS2)
-                _lb_ul(L, i32(k), lds_ld_i32(L, L_DCH + j * i32(4)), s_ * i32(128), i32(128),
-                       i32(UNIT_G1X) | (s_ << i32(8)) | (j << i32(XQ_SHIFT)))
+                _lb_ul(
+                    L,
+                    i32(k),
+                    lds_ld_i32(L, L_DCH + j * i32(4)),
+                    s_ * i32(128),
+                    i32(128),
+                    i32(UNIT_G1X) | (s_ << i32(8)) | (j << i32(XQ_SHIFT)),
+                )
             lds_st(L, L_CTL + (C_UNIT + 1) * 4, i32(3))
         if r < i32(3) * X:
             f = (C - M) * i32(3) + r
             j = J2 + f // i32(KS2)
             s_ = f - (j - J2) * i32(KS2)
             nn = lds_ld_i32(L, L_CTL + (C_UNIT + 1) * 4)
-            _lb_ul(L, nn, lds_ld_i32(L, L_DCH + j * i32(4)), s_ * i32(128), i32(128),
-                   i32(UNIT_G1X) | (s_ << i32(8)) | (j << i32(XQ_SHIFT)))
+            _lb_ul(
+                L,
+                nn,
+                lds_ld_i32(L, L_DCH + j * i32(4)),
+                s_ * i32(128),
+                i32(128),
+                i32(UNIT_G1X) | (s_ << i32(8)) | (j << i32(XQ_SHIFT)),
+            )
             lds_st(L, L_CTL + (C_UNIT + 1) * 4, nn + i32(1))
 
     @traced
@@ -2595,7 +2365,7 @@ def compile_mega_moe_tp(
         return v
 
     def lb_g2_cap(U2, nblk):
-        return (U2 + nblk - i32(1)) // nblk * i32(4) + i32(4)
+        return ceildiv(U2, nblk) * i32(4) + i32(4)
 
     @traced
     def lb_g2_consume(L, tid, a):
@@ -2709,7 +2479,7 @@ def compile_mega_moe_tp(
         is0 = (b == i32(0)).select(i32(L_INTERS), i32(L_B1S))
         rl, rw = lb_lists(a)
         rv = []
-        for k in range_constexpr((RG + 63) // 64):
+        for k in range_constexpr(ceildiv(RG, 64)):
             r = lane + i32(k * 64)
             rc = fx.min(r, R - i32(1))
             rv.append(
@@ -2727,7 +2497,7 @@ def compile_mega_moe_tp(
         rx, rxs = xg_rs(a)
         u16 = I // 2 // 16
         nq = fx.max(R * i32(u16), i32(1))
-        NQ = (RG * u16 + 63) // 64
+        NQ = ceildiv(RG * u16, 64)
         for b0 in range_constexpr(0, NQ, 8):
             dq = []
             for k in range_constexpr(b0, min(b0 + 8, NQ)):
@@ -2735,17 +2505,21 @@ def compile_mega_moe_tp(
                 row = q // i32(u16)
                 c = q - row * i32(u16)
                 rix = lds_ld_i32(L, rix0 + row * i32(4))
-                dq.append((row, c, bld(rx, rix * i32(I // 2) + c * i32(16), 0, V4I, AUX_SYS)))
+                dq.append(
+                    (row, c, bld(rx, rix * i32(I // 2) + c * i32(16), 0, V4I, AUX_SYS))
+                )
             for row, c, dv in dq:
                 lds_st(L, ib0 + row * i32(SI_STRIDE) + c * i32(16), dv, 16)
         ns = fx.max(R * i32(I // 128), i32(1))
         ds = []
-        for k in range_constexpr((RG * (I // 128) + 63) // 64):
+        for k in range_constexpr(ceildiv(RG * (I // 128), 64)):
             q = fx.min(lane + i32(k * 64), ns - i32(1))
             row = q // i32(I // 128)
             c = q - row * i32(I // 128)
             rix = lds_ld_i32(L, rix0 + row * i32(4))
-            ds.append((row, c, bld(rxs, rix * i32(I // 32) + c * i32(4), 0, T.i32, AUX_SYS)))
+            ds.append(
+                (row, c, bld(rxs, rix * i32(I // 32) + c * i32(4), 0, T.i32, AUX_SYS))
+            )
         for row, c, sv in ds:
             lds_st(L, is0 + row * i32(I // 32) + c * i32(4), fx.Int32(sv))
         wait_lgkm0()
@@ -2764,7 +2538,7 @@ def compile_mega_moe_tp(
         U2 = nun * i32(NCG)
         nblk = i32(gpu.grid_dim.x)
         lb_none(L, tid, a, nun)
-        cap = (U2 + nblk - i32(1)) // nblk * i32(2) + i32(2)
+        cap = ceildiv(U2, nblk) * i32(2) + i32(2)
         col_claim(L, tid, a)
         for it_ in range(i32(0), cap, i32(1)):
             _lb_g2_unit(L, tid, a, nun, U2, i32(it_) < cap - i32(1))
@@ -2814,13 +2588,15 @@ def compile_mega_moe_tp(
         nq = fx.max(rows * i32(u16), i32(1))
         ns = fx.max(rows * i32(I // 128), i32(1))
         dq, ds = [], []
-        for k in range_constexpr((RG * u16 + NT - 1) // NT):
+        for k in range_constexpr(ceildiv(RG * u16, NT)):
             q = fx.min(tid + i32(k * NT), nq - i32(1))
             row = q // i32(u16)
             c = q - row * i32(u16)
             rix = lds_ld_i32(L, L_RIX + row * i32(4))
-            dq.append((row, c, bld(rx, rix * i32(I // 2) + c * i32(16), 0, V4I, AUX_SYS)))
-        for k in range_constexpr((RG * (I // 128) + NT - 1) // NT):
+            dq.append(
+                (row, c, bld(rx, rix * i32(I // 2) + c * i32(16), 0, V4I, AUX_SYS))
+            )
+        for k in range_constexpr(ceildiv(RG * (I // 128), NT)):
             q = fx.min(tid + i32(k * NT), ns - i32(1))
             row = q // i32(I // 128)
             c = q - row * i32(I // 128)
@@ -2976,7 +2752,7 @@ def compile_mega_moe_tp(
         if const_expr(XL):
             if const_expr(not RREP):
                 poll_zero(lambda: _meta_pending(a, lane, a["epoch"]))
-            for i_ in range(lane, (a["ttot"] + i32(31)) // i32(32), i32(64)):
+            for i_ in range(lane, ceildiv(a["ttot"], i32(32)), i32(64)):
                 lds_st(L, L_CLS + i32(i_) * i32(4), i32(0))
             wait_lgkm0()
             n4 = a["ttot"] * i32(TOPK // 4) + (
@@ -3012,7 +2788,7 @@ def compile_mega_moe_tp(
 
     def push_units(ttot):
         nblk = i32(gpu.grid_dim.x)
-        return fx.min(i32(2) * nblk, (ttot + i32(TB - 1)) // i32(TB))
+        return fx.min(i32(2) * nblk, ceildiv(ttot, i32(TB)))
 
     def push_first_unit(ns, cidx):
         nblk = i32(gpu.grid_dim.x)
@@ -3038,7 +2814,7 @@ def compile_mega_moe_tp(
         pr_bytes = i32(NPC - 1) * routes_bytes
         r_pr = rsrc(a["proutes"], pr_bytes)
         ids_base = fx.Int64(a["ids"])
-        n = fx.max((ns - u0 + i32(nblk) - i32(1)) // i32(nblk), i32(0))
+        n = fx.max(ceildiv(ns - u0, i32(nblk)), i32(0))
         for u_ in range(u0, ns, i32(nblk)):
             u = i32(u_)
             for t0_ in range(u, ttot, ns * i32(TB)):
@@ -3138,20 +2914,6 @@ def compile_mega_moe_tp(
                 bst(pack_bf16x8(acc), r_dst, (prow * i32(H) + col) * i32(2), 0, AUX_SYS)
         else:
             _push_store_fp8(a, r_dst, prow, col, v, acc, ok)
-
-    def mxfp8x8(acc):
-        am = amax(acc)
-        am = am.maximumf(am.shuffle_xor(i32(1), i32(64)))
-        am = am.maximumf(am.shuffle_xor(i32(2), i32(64)))
-        e8, qs = _e8m0_from_amax(am, max_norm=448.0)
-        return fp8x4_pack(acc[0:4], qs), fp8x4_pack(acc[4:8], qs), fx.Int32(e8) & i32(0xFF)
-
-    def scales4(e8i):
-        e = e8i.bitcast(fx.Float32)
-        sc = e8i
-        for k in range_constexpr(1, 4):
-            sc = sc | (e.shuffle_xor(i32(4 * k), i32(64)).bitcast(fx.Int32) << i32(8 * k))
-        return sc
 
     @traced
     def _push_store_fp8(a, r_dst, prow, col, v, acc, ok):
@@ -3274,8 +3036,8 @@ def compile_mega_moe_tp(
         pk = recv_pkts(a, r_recv, row, a["mmax"], c0, vc)
         live = [(i32(p) < a["tp"]) & (v < i32(CW // 8)) for p in range(MAX_TP)]
         pend = ll_pending(a, lane, zip(pk, live))
-        t0 = _now()
-        while (pend != i32(0)) & _alive(t0):
+        t0 = now()
+        while (pend != i32(0)) & alive(t0):
             rocdl.s_sleep(1)
             pk = recv_pkts(a, r_recv, row, a["mmax"], c0, vc)
             pend = ll_pending(a, lane, zip(pk, live))
@@ -3364,7 +3126,7 @@ def compile_mega_moe_tp(
     def yag_flush(L, tid, a):
         if tid < i32(64):
             mask = lds_ld_i32(L, L_CTL + C_YAGM * 4)
-            for it in range_constexpr((NV * TPC + 63) // 64):
+            for it in range_constexpr(ceildiv(NV * TPC, 64)):
                 e = i32(it * 64) + tid
                 v = e // i32(TPC)
                 p = e - v * i32(TPC)
@@ -3387,7 +3149,7 @@ def compile_mega_moe_tp(
         rf = own_rs(a, "off_flag")
         bid = i32(gpu.block_id("x"))
         pend = i32(0)
-        for it in range_constexpr((NV * MAX_TP + 63) // 64):
+        for it in range_constexpr(ceildiv(NV * MAX_TP, 64)):
             e = i32(it * 64) + lane
             cidx = e // i32(MAX_TP)
             src = e - cidx * i32(MAX_TP)
@@ -3454,11 +3216,9 @@ def compile_mega_moe_tp(
         c = fx.min(lane, i32(NV - 1))
         live = lane < i32(NV)
         v = g_ld_sys(lrdy_at(a, c))
-        pm = i32(
-            fx.Int64(rocdl.ballot(T.i64, _u(live & (v >= epoch)))) & fx.Int64(VMASK)
-        )
+        pm = i32(fx.Int64(rocdl.ballot(T.i64, live & (v >= epoch))) & fx.Int64(VMASK))
         fm = i32(
-            fx.Int64(rocdl.ballot(T.i64, _u(live & _final_ready(a, c, epoch))))
+            fx.Int64(rocdl.ballot(T.i64, live & _final_ready(a, c, epoch)))
             & fx.Int64(VMASK)
         )
         pm = uni(pm)
@@ -3492,15 +3252,15 @@ def compile_mega_moe_tp(
 
     @traced
     def poll_loop(L, tid, a, epoch):
-        t0 = _now()
-        while _comm_pending(L) & _alive(t0):
+        t0 = now()
+        while _comm_pending(L) & alive(t0):
             p1 = comm_signal(L, tid, a, epoch)
             p2 = poll_ready(L, tid % i32(64), a, epoch)
             if (p1 | p2) == i32(0):
                 rocdl.s_sleep(POLL_SLEEP)
         _report_if(
             a,
-            (_now() - t0 >= fx.Int64(DEADLINE)) & ((tid % i32(64)) == i32(0)),
+            (now() - t0 >= fx.Int64(DEADLINE)) & ((tid % i32(64)) == i32(0)),
             ERR_COMM,
         )
 
@@ -3538,7 +3298,7 @@ def compile_mega_moe_tp(
         r_routes = rsrc(a["routes"], routes_bytes)
         r_pr = rsrc(a["proutes"], i32(NPC - 1) * routes_bytes)
         P = uni(lds_ld_i32(L, L_CTL + C_DYNP * 4))
-        n = fx.max((ns - u0 + i32(nblk) - i32(1)) // i32(nblk), i32(0))
+        n = fx.max(ceildiv(ns - u0, i32(nblk)), i32(0))
         for u_ in range(u0, ns, i32(nblk)):
             u = i32(u_)
             for t_ in range(u, ttot, ns):
@@ -3619,7 +3379,7 @@ def compile_mega_moe_tp(
     def _signal_one(a, epoch, cidx):
         nblk = i32(gpu.grid_dim.x)
         x = i32(gpu.block_id("x")) % i32(N_XCD)
-        _signal_part(a, epoch, cidx, x, (nblk - x + i32(N_XCD - 1)) // i32(N_XCD))
+        _signal_part(a, epoch, cidx, x, ceildiv(nblk - x, i32(N_XCD)))
 
     def _signal_col(a, epoch, cidx, j):
         if const_expr(XL):
@@ -3631,7 +3391,7 @@ def compile_mega_moe_tp(
                 epoch,
                 cidx,
                 i32(SC_SHARD) + sh,
-                (i32(XCOL_PER_CHUNK) - sh + i32(N_XCD - 1)) // i32(N_XCD),
+                ceildiv(i32(XCOL_PER_CHUNK) - sh, i32(N_XCD)),
             )
 
     @traced
@@ -3643,7 +3403,7 @@ def compile_mega_moe_tp(
                 epoch,
                 cidx,
                 i32(SC_SHARD) + sh,
-                (i32(xl_s0) - sh + i32(N_XCD - 1)) // i32(N_XCD),
+                ceildiv(i32(xl_s0) - sh, i32(N_XCD)),
             )
         else:
             _signal_part(a, epoch, cidx, i32(SC_LATE), i32(XCOL_PER_CHUNK - xl_s0))
@@ -3683,19 +3443,19 @@ def compile_mega_moe_tp(
 
     @traced
     def signal_loop(L, tid, a, epoch):
-        t0 = _now()
-        while (lds_ld_acq(L, L_CTL + C_NSIG * 4) < i32(NCK)) & _alive(t0):
+        t0 = now()
+        while (lds_ld_acq(L, L_CTL + C_NSIG * 4) < i32(NCK)) & alive(t0):
             if comm_signal(L, tid, a, epoch) == i32(0):
                 rocdl.s_sleep(1)
 
     @traced
     def comm_wave(L, tid, a, epoch):
-        t0 = _now()
+        t0 = now()
         while (
             (lds_ld_acq(L, L_CTL + C_NSIG * 4) < i32(NCK))
             | (lds_ld_acq(L, L_CTL + C_LRED * 4) < i32(NV))
             | (lds_ld_acq(L, L_CTL + C_PULL * 4) < i32(NV))
-        ) & _alive(t0):
+        ) & alive(t0):
             p1 = comm_signal(L, tid, a, epoch)
             if const_expr(not ARLL):
                 p1 = p1 | poll_ready(L, tid % i32(64), a, epoch)
@@ -3704,17 +3464,17 @@ def compile_mega_moe_tp(
                 rocdl.s_sleep(POLL_SLEEP)
         _report_if(
             a,
-            (_now() - t0 >= fx.Int64(DEADLINE)) & ((tid % i32(64)) == i32(0)),
+            (now() - t0 >= fx.Int64(DEADLINE)) & ((tid % i32(64)) == i32(0)),
             ERR_COMM,
         )
 
     @traced
     def comm_help(L, tid, a, epoch):
-        t0 = _now()
+        t0 = now()
         while (
             (lds_ld_acq(L, L_CTL + C_LRED * 4) < i32(NV))
             | (lds_ld_acq(L, L_CTL + C_PULL * 4) < i32(NV))
-        ) & _alive(t0):
+        ) & alive(t0):
             if comm_work(L, tid, a, epoch) == i32(0):
                 rocdl.s_sleep(POLL_SLEEP)
 
@@ -3722,7 +3482,7 @@ def compile_mega_moe_tp(
     AG_SCB = AGR * AG_SROW
     assert AG_SCB + AGR * (H // 32) <= L_INTERS - L_INTER + RG * (I // 32)
     NCHA = H // 256
-    NPRE = (NCHA + PRE_CH - 1) // PRE_CH
+    NPRE = ceildiv(NCHA, PRE_CH)
     assert NPRE <= NPRE_MAX
     NMETA_MAX = 32
     AG_WIN = max(1, 64 // TPC)
@@ -3735,7 +3495,7 @@ def compile_mega_moe_tp(
         bid = i32(gpu.block_id("x"))
         nblk = i32(gpu.grid_dim.x)
         S = ag_split(a)
-        nr = fx.min(fx.max((a["m"] - bid + nblk - i32(1)) // nblk, i32(0)), i32(AGR))
+        nr = fx.min(fx.max(ceildiv(a["m"] - bid, nblk), i32(0)), i32(AGR))
         m = fx.max(a["m"], i32(1))
         s = bid // m
         split = S > i32(1)
@@ -3744,9 +3504,7 @@ def compile_mega_moe_tp(
         nrows = split.select(live.select(i32(1), i32(0)), nr)
         qb = split.select(s, i32(0))
         qs = split.select(S, i32(1))
-        cnt = split.select(
-            live.select((i32(NCHA) - s + S - i32(1)) // S, i32(0)), i32(NCHA)
-        )
+        cnt = split.select(live.select(ceildiv(i32(NCHA) - s, S), i32(0)), i32(NCHA))
         return row0, nblk, nrows, qb, qs, cnt
 
     def ag_group(a):
@@ -3787,7 +3545,7 @@ def compile_mega_moe_tp(
         rxl = rsrc(a["x"], x_bytes)
         pc = ag_group(a)
         pre_bytes = a["tp"] * a["mmax"] * i32(H * 2)
-        for g_ in range(i32(0), (cnt + pc - i32(1)) // pc, i32(1)):
+        for g_ in range(i32(0), ceildiv(cnt, pc), i32(1)):
             g = i32(g_)
             _pre_throttle(L, lane, a, g, pc)
             lo = (qb + g * pc * qs) * i32(256)
@@ -3856,9 +3614,13 @@ def compile_mega_moe_tp(
         live = (lane < i32(TPC)) & (lane != a["rank"])
         poll_zero(
             lambda: wave_red(
-                (live & (g_ld_sys(addr) < a["epoch"])).select(i32(1), i32(0)), lane, fx.max
+                (live & (g_ld_sys(addr) < a["epoch"])).select(i32(1), i32(0)),
+                lane,
+                fx.max,
             ),
-            a, lane, ERR_FLAG,
+            a,
+            lane,
+            ERR_FLAG,
         )
 
     @traced
@@ -3896,8 +3658,8 @@ def compile_mega_moe_tp(
             mp = (ag_split(a) > i32(1)).select(
                 i32(0), _meta_pending(a, lane, a["epoch"], own=True)
             )
-            t0 = _now()
-            while (mp != i32(0)) & _alive(t0):
+            t0 = now()
+            while (mp != i32(0)) & alive(t0):
                 rocdl.s_sleep(1)
                 mp = _meta_pending(a, lane, a["epoch"], own=True)
         r = lane // i32(XLPR)
@@ -3981,9 +3743,7 @@ def compile_mega_moe_tp(
         S = ag_split(a)
         lo = (S > i32(1)).select((q % S) * m, i32(0))
         hi = (S > i32(1)).select(lo + m, i32(gpu.grid_dim.x))
-        return (hi - x + i32(N_XCD - 1)) // i32(N_XCD) - (
-            lo - x + i32(N_XCD - 1)
-        ) // i32(N_XCD)
+        return ceildiv(hi - x, i32(N_XCD)) - ceildiv(lo - x, i32(N_XCD))
 
     @traced
     def _ag_bump(a, lane, q):
@@ -4006,7 +3766,7 @@ def compile_mega_moe_tp(
                 bst(a["epoch"], peer_rs(a, p, "off_flag"), idx * i32(4), 0, AUX_SYS)
 
     def _ag_nmeta(a):
-        return fx.max((a["m"] * i32(TOPK) // i32(4) + i32(63)) // i32(64), i32(1))
+        return fx.max(ceildiv(a["m"] * i32(TOPK) // i32(4), i32(64)), i32(1))
 
     @traced
     def _ag_send_meta(lane, a):
@@ -4065,8 +3825,8 @@ def compile_mega_moe_tp(
         for i_ in range(tid, n, i32(NT)):
             i = i32(i_)
             t = fx.Int32(fx.Vector(bld(rid, i * i32(16), 0, V4I, AUX_SYS))[1])
-            t0 = _now()
-            while (t != a["epoch"]) & _alive(t0):
+            t0 = now()
+            while (t != a["epoch"]) & alive(t0):
                 rocdl.s_sleep(1)
                 t = fx.Int32(fx.Vector(bld(rid, i * i32(16), 0, V4I, AUX_SYS))[1])
             _report_if(a, t != a["epoch"], ERR_META)
@@ -4096,7 +3856,7 @@ def compile_mega_moe_tp(
         rf = own_rs(a, "off_flag")
         end = fx.min(c_lo + i32(nwin), i32(NCH))
         first = end
-        for it in range_constexpr((TPC * nwin + 63) // 64):
+        for it in range_constexpr(ceildiv(TPC * nwin, 64)):
             e = i32(it * 64) + lane
             cc = c_lo + e // i32(TPC)
             src = e % i32(TPC)
@@ -4110,8 +3870,8 @@ def compile_mega_moe_tp(
         rdy = _ag_first_pending(lane, a, epoch, cc, AG_WIN)
         if cc == i32(0):
             rdy = _ag_first_pending(lane, a, epoch, i32(0), NCH)
-        t0 = _now()
-        while (rdy <= cc) & _alive(t0):
+        t0 = now()
+        while (rdy <= cc) & alive(t0):
             rocdl.s_sleep(1)
             rdy = _ag_first_pending(lane, a, epoch, cc, AG_WIN)
         _report_if(a, (rdy <= cc) & (lane == i32(0)), ERR_CHUNK)
@@ -4125,7 +3885,7 @@ def compile_mega_moe_tp(
             bid = i32(gpu.block_id("x"))
             g_st_sys(ctrl_at(a, i32(CTRL_EPB) + bid), epoch)
             x = bid % i32(N_XCD)
-            nx = (i32(gpu.grid_dim.x) - x + i32(N_XCD - 1)) // i32(N_XCD)
+            nx = ceildiv(i32(gpu.grid_dim.x) - x, i32(N_XCD))
             xc = ctrl_at(a, i32(CTRL_XES) + x * i32(LRDY_STRIDE))
             if g_add_agent(xc, 1) == nx - i32(1):
                 g_st_sys(xc, i32(0))
@@ -4213,15 +3973,15 @@ def compile_mega_moe_tp(
                 if const_expr(TOPK * NPC <= DLL_CARRY):
                     pk = _dll_rows(a, t, c0, vc, P)
                     pend = ll_pending(a, lane, zip(pk, live))
-                    t0 = _now()
-                    while (pend != i32(0)) & _alive(t0):
+                    t0 = now()
+                    while (pend != i32(0)) & alive(t0):
                         rocdl.s_sleep(8)
                         pk = _dll_rows(a, t, c0, vc, P)
                         pend = ll_pending(a, lane, zip(pk, live))
                 else:
                     pend = ll_pending(a, lane, zip(_dll_rows(a, t, c0, vc, P), live))
-                    t0 = _now()
-                    while (pend != i32(0)) & _alive(t0):
+                    t0 = now()
+                    while (pend != i32(0)) & alive(t0):
                         rocdl.s_sleep(8)
                         pend = ll_pending(
                             a, lane, zip(_dll_rows(a, t, c0, vc, P), live)
@@ -4267,8 +4027,8 @@ def compile_mega_moe_tp(
                 live = [(i32(p) < a["tp"]) & (v < i32(CW // 8)) for p in range(MAX_TP)]
                 pk = recv_pkts(a, r_recv, t, trows, c0, vc)
                 pend = ll_pending(a, lane, zip(pk, live))
-                t0 = _now()
-                while (pend != i32(0)) & _alive(t0):
+                t0 = now()
+                while (pend != i32(0)) & alive(t0):
                     rocdl.s_sleep(1)
                     pk = recv_pkts(a, r_recv, t, trows, c0, vc)
                     pend = ll_pending(a, lane, zip(pk, live))
@@ -4286,13 +4046,15 @@ def compile_mega_moe_tp(
                     )
 
     TN_V = H // 8
-    TN_IT = (TN_V + NTT - 1) // NTT
+    TN_IT = ceildiv(TN_V, NTT)
 
     @traced
     def blk_red(L, tid, v, op, slot):
         r = wave_red(v, tid % i32(64), op)
         if (tid % i32(64)) == i32(0):
-            lds_st(L, i32(L_RING) + (i32(slot * (NTT // 64)) + tid // i32(64)) * i32(4), r)
+            lds_st(
+                L, i32(L_RING) + (i32(slot * (NTT // 64)) + tid // i32(64)) * i32(4), r
+            )
         gpu.barrier()
         t = lds_ld_i32(L, i32(L_RING) + i32(slot * (NTT // 64) * 4))
         for k in range_constexpr(1, NTT // 64):
@@ -4344,10 +4106,19 @@ def compile_mega_moe_tp(
             for x in fk:
                 ss = ss + x * x
             f.append(fk)
-        tot = blk_red(L, tid, ss.bitcast(fx.Int32), lambda x, y: (x.bitcast(fx.Float32) + y.bitcast(fx.Float32)).bitcast(fx.Int32), 0)
+        tot = blk_red(
+            L,
+            tid,
+            ss.bitcast(fx.Int32),
+            lambda x, y: (x.bitcast(fx.Float32) + y.bitcast(fx.Float32)).bitcast(
+                fx.Int32
+            ),
+            0,
+        )
         rcp = fx.Float32(
             fmath.rsqrt(
-                _u(tot.bitcast(fx.Float32) / fx.Float32(float(H)) + fx.Float32(float(tn_eps)))
+                tot.bitcast(fx.Float32) / fx.Float32(float(H))
+                + fx.Float32(float(tn_eps))
             )
         )
         xs, am = [], fx.Float32(0.0)
@@ -4364,7 +4135,15 @@ def compile_mega_moe_tp(
             ]
             am = am.maximumf(amax(xk))
             xs.append(xk)
-        amx = blk_red(L, tid, am.bitcast(fx.Int32), lambda x, y: x.bitcast(fx.Float32).maximumf(y.bitcast(fx.Float32)).bitcast(fx.Int32), 1)
+        amx = blk_red(
+            L,
+            tid,
+            am.bitcast(fx.Int32),
+            lambda x, y: x.bitcast(fx.Float32)
+            .maximumf(y.bitcast(fx.Float32))
+            .bitcast(fx.Int32),
+            1,
+        )
         scale = amx.bitcast(fx.Float32).maximumf(fx.Float32(1e-10)) / fx.Float32(448.0)
         inv = fx.Float32(1.0) / scale
         one = fx.Float32(1.0)
@@ -4372,20 +4151,40 @@ def compile_mega_moe_tp(
         for k in range_constexpr(TN_IT):
             q = tid + i32(k * NTT)
             qv = [x * inv for x in xs[k]]
-            d = fx.Vector.from_elements([fp8x4_pack(qv[0:4], one), fp8x4_pack(qv[4:8], one)], fx.Int32)
+            d = fx.Vector.from_elements(
+                [fp8x4_pack(qv[0:4], one), fp8x4_pack(qv[4:8], one)], fx.Int32
+            )
             if q < H8:
                 for p in range_constexpr(TPC):
-                    bst(d, peer_rs(a, p, "off_qall"), grow * i32(H) + q * i32(8), 0, AUX_SYS)
+                    bst(
+                        d,
+                        peer_rs(a, p, "off_qall"),
+                        grow * i32(H) + q * i32(8),
+                        0,
+                        AUX_SYS,
+                    )
         b0 = a["mmax"] * i32(TPC * H)
         for k in range_constexpr(TN_IT if TNB else 0):
             q = tid + i32(k * NTT)
             d = pack_bf16x8(xs[k])
             if q < H8:
                 for p in range_constexpr(TPC):
-                    bst(d, peer_rs(a, p, "off_qall"), b0 + (grow * i32(H) + q * i32(8)) * i32(2), 0, AUX_SYS)
+                    bst(
+                        d,
+                        peer_rs(a, p, "off_qall"),
+                        b0 + (grow * i32(H) + q * i32(8)) * i32(2),
+                        0,
+                        AUX_SYS,
+                    )
         if tid == i32(0):
             for p in range_constexpr(TPC):
-                bst(scale.bitcast(fx.Int32), peer_rs(a, p, "off_sall"), grow * i32(4), 0, AUX_SYS)
+                bst(
+                    scale.bitcast(fx.Int32),
+                    peer_rs(a, p, "off_sall"),
+                    grow * i32(4),
+                    0,
+                    AUX_SYS,
+                )
         wait_vm(0)
         gpu.barrier()
         if tid < i32(TPC):
@@ -4401,10 +4200,20 @@ def compile_mega_moe_tp(
             tc = fx.min(t, a["ttot"] - i32(1))
             src = tc // a["m"]
             row = tc - src * a["m"]
-            addr = a["mine"] + fx.Int64(a["off_flag"]) + fx.Int64((i32(FLAG_TN) + src * i32(TN_MAX) + row) * i32(4))
+            addr = (
+                a["mine"]
+                + fx.Int64(a["off_flag"])
+                + fx.Int64((i32(FLAG_TN) + src * i32(TN_MAX) + row) * i32(4))
+            )
             poll_zero(
-                lambda: wave_red((live & (g_ld_sys(addr) < a["epoch"])).select(i32(1), i32(0)), tid, fx.max),
-                a, tid, ERR_YAG,
+                lambda: wave_red(
+                    (live & (g_ld_sys(addr) < a["epoch"])).select(i32(1), i32(0)),
+                    tid,
+                    fx.max,
+                ),
+                a,
+                tid,
+                ERR_YAG,
             )
 
     @traced
@@ -4442,7 +4251,7 @@ def compile_mega_moe_tp(
                         push_dll(L, tid, a, 2)
                     else:
                         push_dll(L, tid, a, 3)
-                if const_expr(ZMA):
+                if const_expr(ZMA):  # noqa: SIM102
                     if tid < i32(NT + 192):
                         zma_run(L, tid % i32(64), a)
                 comm_help(L, tid, a, epoch)

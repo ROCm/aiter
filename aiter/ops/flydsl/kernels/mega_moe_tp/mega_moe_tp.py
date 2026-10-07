@@ -15,6 +15,7 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 
+from ..kernels_common import ceildiv
 from ..symmetric_arena import SymmetricArena
 from ..tensor_shim import _preload_compiled, _run_compiled
 from .mega_moe_tp_kernel import (
@@ -225,7 +226,9 @@ class MegaMoeTPEngine:
             if schedule == "dynamic" and not self.a8
             else 0
         )
-        self.lb_mt, self.lb_mt_table = _mt_table(os.environ.get("AITER_MEGAMOE_TP_LB_MT", "3"))
+        self.lb_mt, self.lb_mt_table = _mt_table(
+            os.environ.get("AITER_MEGAMOE_TP_LB_MT", "3")
+        )
         self.lb_mt_small = int(os.environ.get("AITER_MEGAMOE_TP_LB_MT_SMALL", "3"))
         self.lb_small_max = int(os.environ.get("AITER_MEGAMOE_TP_LB_SMALL_MAX", "512"))
         self.lb_npp = int(os.environ.get("AITER_MEGAMOE_TP_LB_NPP", "1"))
@@ -259,8 +262,10 @@ class MegaMoeTPEngine:
         self.gfx = getattr(props, "gcnArchName", "").split(":")[0]
         if self.gfx != "gfx950":
             raise ValueError(f"fused TP MegaMoE needs gfx950, not {self.gfx}")
-        self.agr = max(1, -(-self.mmax // self.n_cta))
-        static = not (self.schedule == "dynamic" and self.lb_min and self.lb_min <= DYN_MAX + 1)
+        self.agr = max(1, ceildiv(self.mmax, self.n_cta))
+        static = not (
+            self.schedule == "dynamic" and self.lb_min and self.lb_min <= DYN_MAX + 1
+        )
         if static and self._lds(1, False) > LDS_LIMIT:
             ok = self.mmax
             while ok > 1 and self._lds(1, False, mmax=ok) > LDS_LIMIT:
@@ -290,7 +295,9 @@ class MegaMoeTPEngine:
             "yall", (tot, H) if self.ar else (1,), torch.bfloat16
         )
         tn_ok = comm_mode == "ag_rs"
-        self._qall = arena.reserve("qall", (tot * H * 3,) if tn_ok else (1,), torch.uint8)
+        self._qall = arena.reserve(
+            "qall", (tot * H * 3,) if tn_ok else (1,), torch.uint8
+        )
         self._sall = arena.reserve("sall", (tot,) if tn_ok else (1,), torch.float32)
         self.tn_eps = 1e-6
         self.tn_gemma = True
@@ -539,7 +546,7 @@ class MegaMoeTPEngine:
         tot = (mmax or self.mmax) * self.tp
         if not lb:
             tot = min(tot, DYN_MAX)
-        return rch, self.E + -(-tot * self.K // rch) + 1
+        return rch, self.E + ceildiv(tot * self.K, rch) + 1
 
     def _consts(
         self,
@@ -556,7 +563,7 @@ class MegaMoeTPEngine:
             self.I,
             mt,
             mmax * self.tp,
-            max(1, -(-mmax // self.n_cta)),
+            max(1, ceildiv(mmax, self.n_cta)),
             self.E if dyn else 0,
             nab,
             nsk,
@@ -598,9 +605,9 @@ class MegaMoeTPEngine:
     def default_config(self, m: int) -> LaunchCfg:
         tot = m * self.tp
         dyn = tot <= self.dyn_max and self.I // 128 >= 2 and tot * self.K <= 2 * self.E
-        rpe = (tot * self.K + self.E - 1) // self.E
+        rpe = ceildiv(tot * self.K, self.E)
         return LaunchCfg(
-            mt=self._fit_mt((rpe + 15) // 16, dyn),
+            mt=self._fit_mt(ceildiv(rpe, 16), dyn),
             dyn=dyn,
             route_fp8=not dyn,
             ll=tot <= 256,
@@ -796,17 +803,25 @@ class MegaMoeTPEngine:
                 "rank (replicated input)"
             )
 
-    def prepare(self, local_tokens, tail: bool = False, tail_bf16: bool = False) -> None:
+    def prepare(
+        self, local_tokens, tail: bool = False, tail_bf16: bool = False
+    ) -> None:
         for m in local_tokens:
             if 0 < m <= self.mmax:
                 self._arm(self.config(int(m)), int(m))
                 if self.tail_ok(int(m)):
                     for on, tn in ((tail, 1), (tail_bf16, 2)):
                         if on:
-                            self._arm(dataclasses.replace(self.config(int(m)), tn=tn), int(m))
+                            self._arm(
+                                dataclasses.replace(self.config(int(m)), tn=tn), int(m)
+                            )
 
     def tail_ok(self, m: int) -> bool:
-        return self.mode == "ag_rs" and 0 < m <= min(TN_MAX, self.mmax) and self.config(m).lb
+        return (
+            self.mode == "ag_rs"
+            and 0 < m <= min(TN_MAX, self.mmax)
+            and self.config(m).lb
+        )
 
     def _arm(self, cfg: LaunchCfg, m: int = 0) -> None:
         if cfg in self._armed:
@@ -894,10 +909,20 @@ class MegaMoeTPEngine:
         cfg = self.config(m)
         if tail is not None:
             if not self.tail_ok(m):
-                raise ValueError("tail: ag_rs, the LB schedule, at most TN_MAX local tokens")
+                raise ValueError(
+                    "tail: ag_rs, the LB schedule, at most TN_MAX local tokens"
+                )
             res_in, res_out, nw = tail
-            for t, shp in ((res_in, (m, self.H)), (res_out, (m, self.H)), (nw, (self.H,))):
-                if tuple(t.shape) != shp or t.dtype != torch.bfloat16 or not t.is_contiguous():
+            for t, shp in (
+                (res_in, (m, self.H)),
+                (res_out, (m, self.H)),
+                (nw, (self.H,)),
+            ):
+                if (
+                    tuple(t.shape) != shp
+                    or t.dtype != torch.bfloat16
+                    or not t.is_contiguous()
+                ):
                     raise ValueError(f"tail: need contiguous bf16 {shp}")
             cfg = dataclasses.replace(cfg, tn=2 if bf16 else 1)
         local_y = not self.ar or self._arll(cfg) or self._ag8(cfg)
@@ -923,7 +948,11 @@ class MegaMoeTPEngine:
             q = qall[: T_ * self.H].view(T_, self.H)
             if bf16:
                 b0 = self.mmax * self.tp * self.H
-                b = qall[b0 : b0 + 2 * T_ * self.H].view(torch.bfloat16).view(T_, self.H)
+                b = (
+                    qall[b0 : b0 + 2 * T_ * self.H]
+                    .view(torch.bfloat16)
+                    .view(T_, self.H)
+                )
                 return y, q, self._sall.local[:T_], b
             return y, q, self._sall.local[:T_]
         return y

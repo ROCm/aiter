@@ -129,7 +129,9 @@ class MegaMoeTP:
         """Run the next forwards on another layer's weights of the same shape."""
         self.engine.set_weights(w1, w1_scale, w2, w2_scale)
 
-    def prepare(self, local_tokens, tail: bool = False, tail_bf16: bool = False) -> None:
+    def prepare(
+        self, local_tokens, tail: bool = False, tail_bf16: bool = False
+    ) -> None:
         """Collective: compile and arm the launch configs of these local token counts."""
         self.engine.prepare(local_tokens, tail, tail_bf16)
 
