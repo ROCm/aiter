@@ -116,6 +116,31 @@ def _emit_col_sum(mfma, mma, gemm_kw, a_row, b_pack, w_row, kv_scale, f32_0):
     return col_sum
 
 
+def _emit_acc_issue(mfma, mma, gemm_kw, a_row, b_pack):
+    """Phase 1 of a software-pipelined ``_emit_col_sum``: issue the MFMAs only."""
+    c_frags = [None] * len(a_row)
+    for mi in range_constexpr(len(a_row)):
+        c_frag = fx.make_rmem_tensor(mfma.ACC_ELEMS, fx.Float32)
+        c_frag.store(Vec.filled(mfma.ACC_ELEMS, 0.0, fx.Float32))
+        for kk in range_constexpr(len(a_row[mi])):
+            fx.gemm(mma, c_frag, a_row[mi][kk], b_pack[kk], c_frag, **gemm_kw)
+        c_frags[mi] = c_frag
+    return c_frags
+
+
+def _emit_acc_reduce(mfma, c_frags, w_row, kv_scale, f32_0):
+    """Phase 2 of a software-pipelined ``_emit_col_sum``: consume the accumulators."""
+    col_sum = f32_0
+    for mi in range_constexpr(len(c_frags)):
+        acc = c_frags[mi].load()
+        for ii in range_constexpr(mfma.ACC_ELEMS):
+            col_sum = col_sum + Vec(acc)[ii].maximumf(f32_0) * w_row[mi][ii]
+    col_sum = col_sum * kv_scale
+    for sh in mfma.shuffle_offsets:
+        col_sum = col_sum + col_sum.shuffle_xor(sh, 64)
+    return col_sum
+
+
 def _emit_row_neg_inf_fill(
     *,
     logits,  # the output kernel arg
@@ -703,6 +728,7 @@ def _build_kernel_mfma_lds_pipe(
     swizzle: bool = False,
     num_buffers: int = 2,
     prefetch_depth: int = 2,
+    sw_pipe: bool = False,
 ):
     """LDS multi-buffered variant for gfx950 MfmaAtoms (scaled CDNA4 atoms).
 
@@ -810,10 +836,11 @@ def _build_kernel_mfma_lds_pipe(
 
     # As in the direct-load builder: only the non-default clean_logits is tagged.
     _cl_tag = "" if clean_logits else "_nocl"
+    _pd_tag = "" if PREFETCH_DEPTH == 2 else f"_pd{PREFETCH_DEPTH}"
     _kname = (
         f"fp8_mqa_logits_H{H}_D{D}_mfma{mfma.name}"
-        f"_bkv{BKV}_r{RPW}_w{WPB}_lds{NUM_BUFFERS}"
-        f"{'_swizzled' if swizzle else ''}{_cl_tag}_flydsl"
+        f"_bkv{BKV}_r{RPW}_w{WPB}_lds{NUM_BUFFERS}{_pd_tag}"
+        f"{'_swizzled' if swizzle else ''}{'_swp' if sw_pipe else ''}{_cl_tag}_flydsl"
     )
 
     @flyc.kernel(name=_kname, known_block_size=[MR_BLOCK_THREADS, 1, 1])
@@ -1078,32 +1105,76 @@ def _build_kernel_mfma_lds_pipe(
             _dma_kv_tile_to_lds(next_slot_byte, col0_next)
 
             # ---- Per-row MFMA + epilogue (this wave's RPW rows, all columns) ----
-            for j in range_constexpr(RPW):
-                row = wave_row0 + fx.Int32(j)
-                out_row_t = _make_out_row_t(logits, _stride_i64, row)
-                for ni in range_constexpr(N_TILES):
+            out_row_ts = [
+                _make_out_row_t(logits, _stride_i64, wave_row0 + fx.Int32(j))
+                for j in range_constexpr(RPW)
+            ]
+
+            if const_expr(not sw_pipe):
+                for j in range_constexpr(RPW):
+                    out_row_t = out_row_ts[j]
+                    for ni in range_constexpr(N_TILES):
+                        col = cols[ni]
+                        col_sum = _emit_col_sum(
+                            mfma,
+                            mma,
+                            gemm_kw,
+                            a_packs[j],
+                            b_packs[ni],
+                            w_frag[j],
+                            kv_scales_tile[ni],
+                            f32_0,
+                        )
+
+                        in_window = (col >= starts[j]) & (col < ends[j])
+                        is_writer = (lane_div_N == fx.Int32(0)) & in_window
+
+                        # Closure, not a bare subscript store -- see the
+                        # direct-load builder's epilogue for why.
+                        def _store():
+                            out_row_t[col] = col_sum  # noqa: B023
+
+                        if is_writer:
+                            _store()
+            else:
+                # Depth-2 software pipeline over the flattened (j, ni) items:
+                # issue item k+1's MFMAs before consuming item k's accumulators,
+                # so the next GEMMs overlap this item's exposed accumulator-read
+                # latency.
+                items = [
+                    (j, ni)
+                    for j in range_constexpr(RPW)
+                    for ni in range_constexpr(N_TILES)
+                ]
+                cf = _emit_acc_issue(
+                    mfma, mma, gemm_kw, a_packs[items[0][0]], b_packs[items[0][1]]
+                )
+                for k in range_constexpr(len(items)):
+                    j, ni = items[k]
+                    out_row_t = out_row_ts[j]
                     col = cols[ni]
-                    col_sum = _emit_col_sum(
-                        mfma,
-                        mma,
-                        gemm_kw,
-                        a_packs[j],
-                        b_packs[ni],
-                        w_frag[j],
-                        kv_scales_tile[ni],
-                        f32_0,
+                    # Issue the NEXT item's MFMAs before reading THIS item's
+                    # accumulators, so those GEMMs cover the exposed acc-read nop.
+                    if const_expr(k + 1 < len(items)):
+                        jn, nin = items[k + 1]
+                        cf_next = _emit_acc_issue(
+                            mfma, mma, gemm_kw, a_packs[jn], b_packs[nin]
+                        )
+                    col_sum = _emit_acc_reduce(
+                        mfma, cf, w_frag[j], kv_scales_tile[ni], f32_0
                     )
 
                     in_window = (col >= starts[j]) & (col < ends[j])
                     is_writer = (lane_div_N == fx.Int32(0)) & in_window
 
-                    # Closure, not a bare subscript store -- see the direct-load
-                    # builder's epilogue for why.
                     def _store():
                         out_row_t[col] = col_sum  # noqa: B023
 
                     if is_writer:
                         _store()
+
+                    if const_expr(k + 1 < len(items)):
+                        cf = cf_next
 
         # ---- Fused clean_logits prefill: per-wave, over this wave's own rows.
         # A wave holds starts[]/ends[] only for its RPW rows; making all waves

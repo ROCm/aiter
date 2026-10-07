@@ -306,6 +306,12 @@ _MEASURED_OCCUPANCY = {
         ("mfma32x32x64_bkv64_r2_w4_lds3", 64, 128): 2,
         ("mfma32x32x64_bkv64_r2_w4_lds3", 128, 64): 2,
         ("mfma32x32x64_bkv64_r2_w4_lds3", 128, 128): 2,
+        ("mfma32x32x64_bkv64_r2_w4_lds3_swp", 32, 64): 4,
+        ("mfma32x32x64_bkv64_r2_w4_lds3_swp", 32, 128): 3,
+        ("mfma32x32x64_bkv64_r2_w4_lds3_swp", 64, 64): 2,
+        ("mfma32x32x64_bkv64_r2_w4_lds3_swp", 64, 128): 2,
+        ("mfma32x32x64_bkv64_r2_w4_lds3_swp", 128, 64): 2,
+        ("mfma32x32x64_bkv64_r2_w4_lds3_swp", 128, 128): 2,
     },
 }
 
@@ -365,11 +371,13 @@ def _occupancy_from_metadata(fields: dict, arch: str, device_index: int) -> int 
     by_registers = (waves_per_simd * limits.simds_per_cu) // waves_per_block
     by_wave_slots = props.max_threads_per_multi_processor // threads
     lds_bytes = fields.get("group_segment_fixed_size", 0)
-    by_lds = (
-        props.shared_memory_per_multiprocessor // lds_bytes
-        if lds_bytes
-        else by_wave_slots
-    )
+    if lds_bytes:
+        shared_per_cu = getattr(props, "shared_memory_per_multiprocessor", None)
+        if shared_per_cu is None:
+            return None
+        by_lds = shared_per_cu // lds_bytes
+    else:
+        by_lds = by_wave_slots
     return max(1, min(by_registers, by_wave_slots, by_lds))
 
 
@@ -392,10 +400,13 @@ def kernel_occupancy(
     Never raises: a launch heuristic must not fail because a resource query
     did.
     """
-    fields = _artifact_metadata(launcher)
-    if fields is not None:
-        occupancy = _occupancy_from_metadata(fields, arch, device_index)
-        if occupancy is not None:
-            return occupancy
+    try:
+        fields = _artifact_metadata(launcher)
+        if fields is not None:
+            occupancy = _occupancy_from_metadata(fields, arch, device_index)
+            if occupancy is not None:
+                return occupancy
+    except Exception:  # noqa: BLE001 -- a launch heuristic must never fail here
+        pass
     measured = _measured_occupancy(arch, variant, num_heads, head_size)
     return measured if measured is not None else DEFAULT_OCCUPANCY

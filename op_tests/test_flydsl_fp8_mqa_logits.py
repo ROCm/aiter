@@ -657,6 +657,61 @@ def _model_set(args):
     return cases
 
 
+def _csv_set(args):
+    """Cases from a CSV of (M, N) shapes -- one measurement row per CSV row.
+
+    The CSV must have a header. Required columns are ``M`` (seq_q) and ``N``
+    (seq_kv). Optional per-row columns, each falling back to a global default
+    when absent or blank:
+
+      ``num_heads``  (default --csv-num-heads, itself default 32, GLM-5.2)
+      ``head_dim``   (default 128)
+      ``window``     (default --csv-window, itself default "causal")
+      ``batch``      (default 1)
+
+    Any other columns (e.g. a per-shape call ``count``/``weight`` from a
+    production shape dump) are ignored here; they are provenance, not axes.
+    The dtype pair and clean_logits come from the usual CLI axes, so a CSV
+    sweep still honours --q-dtype/--kv-dtype/--clean-logits.
+    """
+    df = pd.read_csv(args.shapes_csv)
+    cols = {c.lower().strip(): c for c in df.columns}
+    if "m" not in cols or "n" not in cols:
+        raise ValueError(
+            f"{args.shapes_csv}: need 'M' and 'N' columns; got {list(df.columns)}"
+        )
+
+    def _col(row, key, default):
+        src = cols.get(key)
+        if src is None:
+            return default
+        val = row[src]
+        if pd.isna(val) or (isinstance(val, str) and not val.strip()):
+            return default
+        return val
+
+    cases = []
+    for cl in args.clean_logits:
+        for _, row in df.iterrows():
+            s_q = int(_col(row, "m", None))
+            s_k = int(_col(row, "n", None))
+            batch = int(_col(row, "batch", 1))
+            cases.append(
+                Case(
+                    s_q=s_q,
+                    s_k=s_k,
+                    num_heads=int(_col(row, "num_heads", args.csv_num_heads)),
+                    head_dim=int(_col(row, "head_dim", 128)),
+                    q_dtype=args.q_dtype[0],
+                    kv_dtype=args.kv_dtype[0],
+                    clean_logits=bool(cl),
+                    window=str(_col(row, "window", args.csv_window)),
+                    batch=batch,
+                )
+            )
+    return cases
+
+
 def _full_set(args):
     """The cartesian product of every axis -- ~500 cases on the defaults."""
     cases = []
@@ -759,6 +814,29 @@ def main():
         "--num-heads, --head-dim and --window; pairs with --scenario bench.",
     )
     parser.add_argument(
+        "--shapes-csv",
+        type=str,
+        default=None,
+        help="Path to a CSV of (M, N) shapes, one bench row per CSV row.\n"
+        "Required columns M (seq_q) and N (seq_kv); optional per-row\n"
+        "num_heads/head_dim/window/batch columns (else the --csv-* defaults).\n"
+        "Overrides --shapes/--num-heads/--head-dim/--window; the dtype and\n"
+        "clean_logits axes still apply. Pairs with --scenario bench.",
+    )
+    parser.add_argument(
+        "--csv-num-heads",
+        type=int,
+        default=32,
+        help="num_heads for CSV rows lacking a num_heads column (default 32).",
+    )
+    parser.add_argument(
+        "--csv-window",
+        type=str,
+        default="causal",
+        choices=["causal", "cp", "misaligned", "empty", "past_end", "batch_causal"],
+        help="window mode for CSV rows lacking a window column (default causal).",
+    )
+    parser.add_argument(
         "-s",
         "--shapes",
         type=dtypes.str2tuple,
@@ -823,7 +901,9 @@ def main():
     )
     args = parser.parse_args()
 
-    if args.model_shapes:
+    if args.shapes_csv:
+        cases = _csv_set(args)
+    elif args.model_shapes:
         cases = _model_set(args)
     elif args.full:
         cases = _full_set(args)

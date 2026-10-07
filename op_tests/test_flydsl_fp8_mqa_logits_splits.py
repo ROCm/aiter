@@ -7,14 +7,17 @@ Pure-function tests: the cost model and the lookup's resolution order need no
 GPU, and arch-dependent inputs are supplied explicitly.
 """
 
+import dataclasses
 import math
 
 import pytest
 
+from aiter.ops.flydsl import fp8_mqa_logits_kernels as knl
 from aiter.ops.flydsl import kernel_occupancy as occ_mod
 from aiter.ops.flydsl.fp8_mqa_logits_kernels import (
     _MAX_SPLIT_SEARCH,
     _SPLIT_POLICIES,
+    _auto_num_splits,
     _splits_by_wave_cost,
 )
 from aiter.ops.flydsl.kernel_occupancy import DEFAULT_OCCUPANCY, kernel_occupancy
@@ -166,6 +169,41 @@ class TestOccupancyLookup:
         """A table-less arch would silently degrade to DEFAULT_OCCUPANCY."""
         assert set(occ_mod._ARCH_LIMITS) <= set(occ_mod._MEASURED_OCCUPANCY)
 
+    @pytest.mark.parametrize("head_size", [64, 128])
+    def test_gfx950_streaming_swp_variant_is_in_the_table(self, head_size):
+        """The SILOTIGER-1134 streaming path routes H<=32 to the ``_swp``
+        variant; a missing table row would make the first-launch occupancy
+        estimate fall to DEFAULT_OCCUPANCY and under-split. H=32 is the only
+        head count the 32x32-MFMA ``_swp`` family admits (H16 has no atom)."""
+        key = ("mfma32x32x64_bkv64_r2_w4_lds3_swp", 32, head_size)
+        assert key in occ_mod._MEASURED_OCCUPANCY["gfx950"]
+
+    def test_metadata_defers_to_table_when_shared_mem_per_cu_unavailable(self):
+        """Some ROCm torch builds expose shared_memory_per_block but not the
+        per-CU figure. For an LDS kernel that means the binding LDS limit can't
+        be evaluated, so the model must return None (defer to the measured
+        table) rather than overestimate by dropping the constraint."""
+
+        class _Props:
+            warp_size = 64
+            max_threads_per_multi_processor = 2048
+            # deliberately no shared_memory_per_multiprocessor
+
+        import torch as _torch
+
+        orig = _torch.cuda.get_device_properties
+        _torch.cuda.get_device_properties = lambda _i: _Props()
+        try:
+            fields = {
+                "threads_per_block": 256,
+                "vgpr_count": 146,
+                "agpr_count": 0,
+                "group_segment_fixed_size": 24576,
+            }
+            assert occ_mod._occupancy_from_metadata(fields, "gfx950", 0) is None
+        finally:
+            _torch.cuda.get_device_properties = orig
+
 
 class TestArchRegisterFileRules:
     """CDNA3 and CDNA4 allocate AGPRs differently; the model must not blur it."""
@@ -227,3 +265,101 @@ class TestSplitPolicy:
         # The gates the occupancy path still honours.
         assert policy.min_seq_len_kv == 4096
         assert policy.min_tiles_per_split == 8
+
+    def test_gfx950_streaming_is_occupancy_derived(self):
+        """The streaming target is grounded in measured occupancy, not a magic
+        constant; the fixed fallback is retained for rollback."""
+        policy = _SPLIT_POLICIES["gfx950"]
+        assert policy.streaming_lowh_residency == 4
+        assert policy.streaming_lowh_cu_oversub == 12
+
+
+class TestStreamingSplitTarget:
+    """``_auto_num_splits`` on the gfx950 fixed-oversubscription path.
+
+    The streaming (aggressive) target is ``residency * occupancy * cu_count``;
+    the common non-streaming launch keeps ``cu_oversub * cu_count`` and never
+    queries occupancy.
+    """
+
+    # A streaming small-M / large-N shape: grid_x = 32768 // (8*2) ... we set
+    # rows_per_block and seq_len_padded so grid_x is a small, exact number, and
+    # seq_len_kv large enough that max_splits never binds.
+    SEQ_LEN_PADDED = 16  # grid_x = 16 // 8 = 2
+    RPB = 8
+    BKV = 64
+    SEQ_LEN_KV = 1 << 20  # max_splits = (2**20//64)//2 = 8192, non-binding
+    CU = 256
+
+    def _call(self, monkeypatch, *, policy, occ, aggressive, occ_calls=None):
+        monkeypatch.setattr(knl, "_split_policy", lambda: policy)
+        monkeypatch.setattr(knl, "_device_cu_count", lambda _idx: self.CU)
+
+        def _occ(*_a, **_k):
+            if occ_calls is not None:
+                occ_calls.append(1)
+            return occ
+
+        monkeypatch.setattr(knl, "kernel_occupancy", _occ)
+        return _auto_num_splits(
+            self.SEQ_LEN_PADDED,
+            self.SEQ_LEN_KV,
+            self.RPB,
+            self.BKV,
+            device_index=0,
+            variant="mfma32x32x64_bkv64_r2_w4_lds3_swp",
+            num_heads=32,
+            head_size=128,
+            aggressive=aggressive,
+        )
+
+    def test_aggressive_target_is_residency_times_occ_times_cu(self, monkeypatch):
+        policy = _SPLIT_POLICIES["gfx950"]  # residency=4
+        grid_x = self.SEQ_LEN_PADDED // self.RPB  # 2
+        splits = self._call(monkeypatch, policy=policy, occ=3, aggressive=True)
+        assert splits == math.ceil(4 * 3 * self.CU / grid_x)
+
+    def test_residency_at_occ3_reproduces_the_legacy_twelve(self, monkeypatch):
+        """Behaviour-preserving on the ticket: residency=4 * occ=3 == 12x."""
+        grid_x = self.SEQ_LEN_PADDED // self.RPB
+        legacy = dataclasses.replace(
+            _SPLIT_POLICIES["gfx950"], streaming_lowh_residency=0
+        )  # falls back to streaming_lowh_cu_oversub=12
+        occ_derived = self._call(
+            monkeypatch, policy=_SPLIT_POLICIES["gfx950"], occ=3, aggressive=True
+        )
+        fixed = self._call(monkeypatch, policy=legacy, occ=99, aggressive=True)
+        assert occ_derived == fixed == math.ceil(12 * self.CU / grid_x)
+
+    def test_residency_zero_does_not_query_occupancy(self, monkeypatch):
+        """Legacy fallback path must not pay for the occupancy query."""
+        legacy = dataclasses.replace(
+            _SPLIT_POLICIES["gfx950"], streaming_lowh_residency=0
+        )
+        calls = []
+        self._call(
+            monkeypatch, policy=legacy, occ=3, aggressive=True, occ_calls=calls
+        )
+        assert calls == []
+
+    def test_non_aggressive_keeps_cu_oversub_and_skips_occupancy(self, monkeypatch):
+        grid_x = self.SEQ_LEN_PADDED // self.RPB
+        calls = []
+        splits = self._call(
+            monkeypatch,
+            policy=_SPLIT_POLICIES["gfx950"],
+            occ=3,
+            aggressive=False,
+            occ_calls=calls,
+        )
+        assert splits == math.ceil(4 * self.CU / grid_x)
+        assert calls == []
+
+    def test_streaming_target_never_below_the_conservative_target(self, monkeypatch):
+        """A tiny residency*occ must not undercut cu_oversub*cu_count."""
+        grid_x = self.SEQ_LEN_PADDED // self.RPB
+        thin = dataclasses.replace(
+            _SPLIT_POLICIES["gfx950"], streaming_lowh_residency=1
+        )  # 1 * occ(1) * cu = 256 < cu_oversub(4)*cu = 1024
+        splits = self._call(monkeypatch, policy=thin, occ=1, aggressive=True)
+        assert splits == math.ceil(4 * self.CU / grid_x)

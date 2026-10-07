@@ -96,6 +96,19 @@ class _SplitPolicy:
         Splitting multiplies it by ``num_splits``, so it is what bounds the
         split count. Fitted on MI325X over 86 shapes from three window
         regimes weighted equally; dominates when windows are narrow.
+    streaming_lowh_cu_oversub : int
+        Oversub target for the streaming, ``num_heads<=32`` regime specifically, 
+        used only on the fixed-oversubscription path
+        (``occupancy_aware=False``). That regime is MFMA-latency / occupancy-
+        bound, not bandwidth-bound, so it wants an *aggressive* oversub to keep
+        every CU pinned through ramp/tail and hide the dependent ReLU/head-
+        reduce behind resident waves.
+    streaming_lowh_residency : int
+        Occupancy-derived replacement for ``streaming_lowh_cu_oversub`` on the
+        streaming ``num_heads<=32`` regime: the streaming block target is
+        ``streaming_lowh_residency * kernel_occupancy(variant) * cu_count``
+        instead of a fixed blocks/CU constant. It expresses "how many full
+        waves-per-SIMD residencies of grid depth to queue".
     """
 
     min_seq_len_kv: int
@@ -104,6 +117,8 @@ class _SplitPolicy:
     fallback_cu: int
     occupancy_aware: bool = False
     block_overhead_tiles: int = 0
+    streaming_lowh_cu_oversub: int = 0
+    streaming_lowh_residency: int = 0
 
 
 _SPLIT_POLICIES = {
@@ -118,16 +133,13 @@ _SPLIT_POLICIES = {
         block_overhead_tiles=8,
     ),
     # Tuned on MI355X (256 CU) against the LDS-pipelined builder.
-    #
-    # Left on the fixed-oversubscription path deliberately. Occupancy is
-    # verified here (308/308 vs HIP), but gfx950 cannot show the effect:
-    # its auto-selected variants span two occupancy values against gfx942's
-    # six, and 32 of 35 measured shapes have four or more split choices
-    # within 3% of optimal. Its optima also sit 8-24x past one effective
-    # wave (4-7x on gfx942), which is window load imbalance -- a term this
-    # model lacks, and a separate change.
     "gfx950": _SplitPolicy(
-        min_seq_len_kv=0, min_tiles_per_split=2, cu_oversub=4, fallback_cu=256
+        min_seq_len_kv=0,
+        min_tiles_per_split=2,
+        cu_oversub=4,
+        fallback_cu=256,
+        streaming_lowh_cu_oversub=12,
+        streaming_lowh_residency=4,
     ),
 }
 
@@ -191,6 +203,10 @@ def _splits_by_wave_cost(
     )
 
 
+def _is_streaming_lowh(seq_len: int, seq_len_kv: int, num_heads: int) -> bool:
+    return num_heads <= 32 and seq_len_kv > 2 * seq_len
+
+
 def _auto_num_splits(
     seq_len_padded: int,
     seq_len_kv: int,
@@ -201,6 +217,7 @@ def _auto_num_splits(
     variant: str | None = None,
     num_heads: int = 0,
     head_size: int = 0,
+    aggressive: bool = False,
 ) -> int:
     """KV-column splits (grid.y) to fill the device when the row grid is small.
 
@@ -208,12 +225,17 @@ def _auto_num_splits(
     device block-starved; splitting each row's window across ``grid.y`` recovers
     occupancy at no correctness cost (logits[m,n] are independent across n).
 
-    How full the device is depends on the kernel instance, not just the
-    shape: gfx942's ``mfma_r2_w4`` holds 8 blocks/CU at num_heads=16 and 2
-    at 128, so one ``cu_oversub`` constant cannot suit both. The
-    occupancy-aware path forms ``cu_count * kernel_occupancy`` effective CUs
-    and minimizes ``_splits_by_wave_cost`` over them; other arches keep the
-    original behaviour exactly.
+    Two paths, chosen per-arch by ``_SplitPolicy.occupancy_aware``:
+
+    - Occupancy-aware (gfx942): how full the device is depends on the kernel
+      instance, not just the shape -- gfx942's ``mfma_r2_w4`` holds 8 blocks/CU
+      at num_heads=16 and 2 at 128, so one ``cu_oversub`` constant cannot suit
+      both. This path forms ``cu_count * kernel_occupancy`` effective CUs and
+      minimizes ``_splits_by_wave_cost`` over them.
+    - Fixed oversubscription (gfx950): target ``cu_oversub * cu_count`` blocks
+      and return 1 once the row grid alone reaches that. ``aggressive`` raises
+      the target for the streaming H<=32 regime (``_is_streaming_lowh``), which
+      is latency/occupancy-bound and benefits from a much deeper block queue.
     """
     pol = _split_policy()
     grid_x = seq_len_padded // rows_per_block
@@ -224,6 +246,22 @@ def _auto_num_splits(
 
     if not pol.occupancy_aware:
         target_blocks = pol.cu_oversub * cu_count
+        if aggressive:
+            streaming_target = 0
+            if pol.streaming_lowh_residency:
+                occ = kernel_occupancy(
+                    launcher,
+                    arch=_ARCH,
+                    variant=variant,
+                    num_heads=num_heads,
+                    head_size=head_size,
+                    device_index=device_index,
+                )
+                streaming_target = pol.streaming_lowh_residency * occ * cu_count
+            elif pol.streaming_lowh_cu_oversub:
+                streaming_target = pol.streaming_lowh_cu_oversub * cu_count
+            # never below the conservative non-streaming target
+            target_blocks = max(target_blocks, streaming_target)
         if grid_x >= target_blocks:
             return 1
         return max(1, min(math.ceil(target_blocks / grid_x), max_splits))
@@ -263,7 +301,15 @@ def _auto_num_splits(
 
 
 def _mk_builder(
-    rpb, wpb, *, mfma=_MFMA16, bkv=None, lds=None, swizzle=True, prefetch_depth=2
+    rpb,
+    wpb,
+    *,
+    mfma=_MFMA16,
+    bkv=None,
+    lds=None,
+    swizzle=True,
+    prefetch_depth=2,
+    sw_pipe=False,
 ):
     """Registry entry factory.
 
@@ -294,6 +340,7 @@ def _mk_builder(
             swizzle=swizzle,
             num_buffers=lds,
             prefetch_depth=prefetch_depth,
+            sw_pipe=sw_pipe,
         )
     return builder, mfma.MFMA_M
 
@@ -380,6 +427,9 @@ if _ARCH == "gfx950":
             "mfma32x32x64_bkv64_r2_w4_lds3": _mk_builder(
                 2, 4, mfma=_K64, bkv=64, lds=3
             ),
+            "mfma32x32x64_bkv64_r2_w4_lds3_swp": _mk_builder(
+                2, 4, mfma=_K64, bkv=64, lds=3, sw_pipe=True
+            ),
             "mfma32x32x64_bkv128_r1_w2_lds3": _mk_builder(
                 1, 2, mfma=_K64, bkv=128, lds=3
             ),
@@ -425,7 +475,7 @@ DEFAULT_VARIANT = (
 # then block_kv (None -> _BLOCK_KV), RPB, WPB, and the LDS buffer count.
 _TAG_RE = re.compile(
     r"^mfma(?P<shape>\d+x\d+x\d+)?(?:_bkv(?P<bkv>\d+))?"
-    r"_r(?P<rpb>\d+)_w(?P<wpb>\d+)(?:_lds(?P<lds>\d+))?$"
+    r"_r(?P<rpb>\d+)_w(?P<wpb>\d+)(?:_lds(?P<lds>\d+))?(?:_swp)?$"
 )
 
 
@@ -482,9 +532,7 @@ def _auto_variant(seq_len, seq_len_kv, num_heads):
         streaming = seq_len_kv > 2 * seq_len
         large_square = seq_len >= 8192 and seq_len_kv >= seq_len
         if num_heads <= 32:
-            if streaming:
-                return "mfma32x32x64_bkv64_r2_w2_lds3"
-            return "mfma32x32x64_bkv64_r2_w4_lds3"
+            return "mfma32x32x64_bkv64_r2_w4_lds3_swp"
         r = 2 if streaming or large_square else 1
         return f"mfma32x32x64_bkv64_r{r}_w2_lds3"
     raise NotImplementedError(
@@ -696,6 +744,7 @@ def flydsl_fp8_mqa_logits(
         variant=variant,
         num_heads=num_heads,
         head_size=head_size,
+        aggressive=_is_streaming_lowh(seq_len, seq_len_kv, num_heads),
     )
 
     if stream is None:
