@@ -605,13 +605,21 @@ def test_mla(
     asm_supports_mtp = decode_qlen <= 4
     # --no-causal needs a non-masked (msk0) kernel. decode_qlen==1 always works:
     # a single query token makes the mask a no-op, so the dispatch reuses the
-    # masked kernel. Beyond that the non-persistent side only ships fp8/fp8 msk0
-    # builds for nhead=128 (any qlen) and nhead=16 qlen 3/4 -- see the ps=0,
-    # causal=0 rows of hsa/gfx950/mla/mla_asm.csv. Everything else would abort in
+    # masked kernel. For longer queries, gfx950 ships a non-causal BF16 kernel
+    # for nhead=8 qlen=2, plus fp8/fp8 msk0 builds for nhead=128 (any qlen) and
+    # nhead=16 qlen 3/4 -- see the ps=0, causal=0 rows of
+    # hsa/gfx950/mla/mla_asm.csv. Everything else would abort in
     # get_heuristic_kernel_mla, so skip it instead of killing the sweep.
     asm_supports_non_causal = (
         is_causal
         or decode_qlen == 1
+        or (
+            get_gfx() == "gfx950"
+            and dtype == dtypes.bf16
+            and kvtype == dtypes.bf16
+            and nhead == 8
+            and decode_qlen == 2
+        )
         or (
             dtype == dtypes.fp8
             and kvtype == dtypes.fp8
