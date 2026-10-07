@@ -486,6 +486,7 @@ def _gluon_flash_attn_forward(
         RETURN_SCORES=return_softmax,
         HEAD_STRIDE_ALIGN=head_stride_align,
         **config,
+        enable_fp_fusion=True,
     )
 
     return o, softmax_lse, s_dmask
