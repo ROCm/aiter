@@ -370,7 +370,7 @@ constexpr int PHASE_C_WAVES = 8;
 
 // Whether every key of the row whose bits at and above `sh` match `prefix` is
 // one value (returned in `value`). A full-row read; all threads must call.
-template <bool RAGGED>
+template <bool RAGGED, bool NAN_HIGH>
 __device__ __forceinline__ bool row_prefix_single_value(const float* __restrict__ row,
                                                         int n4,
                                                         int len,
@@ -386,7 +386,7 @@ __device__ __forceinline__ bool row_prefix_single_value(const float* __restrict_
 #pragma unroll
         for(int e = 0; e < FP32_EPT; e++)
         {
-            const uint32_t k = fp32_to_sortable(v[e]);
+            const uint32_t k = sortable_key<NAN_HIGH>(v[e]);
             const bool act   = (!RAGGED || j * FP32_EPT + e < len) && (k >> sh) == (prefix >> sh);
             amn              = min(amn, act ? k : 0xFFFFFFFFu);
             amx              = max(amx, act ? k : 0u);
@@ -404,7 +404,7 @@ __device__ __forceinline__ bool row_prefix_single_value(const float* __restrict_
 // and the same one atomic per wave per stream; only the load shape differs.
 // Always the bounds-checked loader and `col < len`, so it reads every column of
 // a plain row whatever len % FP32_EPT is.
-template <bool WRITE_VALUES>
+template <bool WRITE_VALUES, bool NAN_HIGH>
 __device__ __forceinline__ void block_gather_stream(const float* __restrict__ row,
                                                     int len,
                                                     int idx_base,
@@ -450,7 +450,7 @@ __device__ __forceinline__ void block_gather_stream(const float* __restrict__ ro
             {
                 const int col     = i * FP32_EPT + e;
                 const bool has    = live && col < len;
-                const uint32_t k  = fp32_to_sortable(v[u][e]);
+                const uint32_t k  = sortable_key<NAN_HIGH>(v[u][e]);
                 const bool gt     = has && (k > pivot);
                 const bool eq     = has && (k == pivot);
                 const uint64_t bg = __ballot(gt);
@@ -475,7 +475,7 @@ __device__ __forceinline__ void block_gather_stream(const float* __restrict__ ro
                     {
                         out[p] = idx_base + col;
                         if(WRITE_VALUES)
-                            out_val[p] = sortable_to_fp32(k);
+                            out_val[p] = key_to_fp32<NAN_HIGH>(k);
                     }
                 }
                 if(eq)
@@ -485,7 +485,7 @@ __device__ __forceinline__ void block_gather_stream(const float* __restrict__ ro
                     {
                         out[ngt + p] = idx_base + col;
                         if(WRITE_VALUES)
-                            out_val[ngt + p] = sortable_to_fp32(k);
+                            out_val[ngt + p] = key_to_fp32<NAN_HIGH>(k);
                     }
                 }
             }
@@ -512,7 +512,7 @@ static_assert(WIDE_FINE <= FB_SCRATCH_WORDS, "the band histogram lives in the fa
 // SINK (an overflowed row): every bucket below sink + 1, phase_a's threshold
 // bucket, is counted as bucket sink, so the background keys that cannot win
 // form one long run per lane instead of an atomic each.
-template <bool LR, bool SINK>
+template <bool LR, bool SINK, bool NAN_HIGH>
 __device__ __forceinline__ void band_hist_vec(uint32_t* __restrict__ s_fine,
                                               const vfloat4& v,
                                               int i,
@@ -527,7 +527,7 @@ __device__ __forceinline__ void band_hist_vec(uint32_t* __restrict__ s_fine,
     {
         if(i < n4 && (!LR || i * FP32_EPT + e < len))
         {
-            uint32_t d = fp32_to_sortable(v[e]) >> FB_BAND_SH;
+            uint32_t d = sortable_key<NAN_HIGH>(v[e]) >> FB_BAND_SH;
             if(SINK)
                 d = max(d, sink);
             if(d != run_d)
@@ -545,7 +545,7 @@ __device__ __forceinline__ void band_hist_vec(uint32_t* __restrict__ s_fine,
 // One histogram pass over the row: main trips while every lane of this wave has
 // a vector in every slot, so the loads go out unpredicated; the rest of the row
 // in live-predicated trips.
-template <bool LR, bool SINK>
+template <bool LR, bool SINK, bool NAN_HIGH>
 __device__ __forceinline__ void band_hist_pass(const float* __restrict__ row,
                                                int n4,
                                                int len,
@@ -565,14 +565,14 @@ __device__ __forceinline__ void band_hist_pass(const float* __restrict__ row,
             v[u] = load_row_f4<LR>(row, i0 + u * (int)blockDim.x + (int)threadIdx.x, len);
 #pragma unroll
         for(int u = 0; u < FB_SEL_LOADS; u++)
-            band_hist_vec<LR, SINK>(s_fine,
-                                    v[u],
-                                    i0 + u * (int)blockDim.x + (int)threadIdx.x,
-                                    n4,
-                                    len,
-                                    sink,
-                                    run_d,
-                                    run_n);
+            band_hist_vec<LR, SINK, NAN_HIGH>(s_fine,
+                                              v[u],
+                                              i0 + u * (int)blockDim.x + (int)threadIdx.x,
+                                              n4,
+                                              len,
+                                              sink,
+                                              run_d,
+                                              run_n);
     }
     for(; i0 < n4; i0 += step)
     {
@@ -585,21 +585,21 @@ __device__ __forceinline__ void band_hist_pass(const float* __restrict__ row,
         }
 #pragma unroll
         for(int u = 0; u < FB_SEL_LOADS; u++)
-            band_hist_vec<LR, SINK>(s_fine,
-                                    v[u],
-                                    i0 + u * (int)blockDim.x + (int)threadIdx.x,
-                                    n4,
-                                    len,
-                                    sink,
-                                    run_d,
-                                    run_n);
+            band_hist_vec<LR, SINK, NAN_HIGH>(s_fine,
+                                              v[u],
+                                              i0 + u * (int)blockDim.x + (int)threadIdx.x,
+                                              n4,
+                                              len,
+                                              sink,
+                                              run_d,
+                                              run_n);
     }
 }
 
 // Appends the keys of one vector whose prefix key >> csh is at least cthr to the
 // candidate records. A few thousand keys of the row qualify, so each reserves its
 // own slot.
-template <bool LR>
+template <bool LR, bool NAN_HIGH>
 __device__ __forceinline__ void band_take_vec(uint64_t* __restrict__ cand_w,
                                               unsigned* __restrict__ s_cnt,
                                               const vfloat4& v,
@@ -614,7 +614,7 @@ __device__ __forceinline__ void band_take_vec(uint64_t* __restrict__ cand_w,
     for(int e = 0; e < FP32_EPT; e++)
     {
         const int col    = i * FP32_EPT + e;
-        const uint32_t d = fp32_to_sortable(v[e]) >> csh;
+        const uint32_t d = sortable_key<NAN_HIGH>(v[e]) >> csh;
         if(i < n4 && (!LR || col < len) && d >= cthr)
         {
             const unsigned p = atomicAdd(s_cnt, 1u);
@@ -633,7 +633,7 @@ __device__ __forceinline__ void band_take_vec(uint64_t* __restrict__ cand_w,
 // load it non-temporal; the histogram pass does not. Non-temporal there too was
 // 5-8% slower at M <= 64, where those re-reads hit what it left in cache.
 constexpr int FB_REFINE_LOADS = 1;
-template <bool LR>
+template <bool LR, bool NAN_HIGH>
 __device__ __forceinline__ void band_refine_pass(const float* __restrict__ row,
                                                  int n4,
                                                  int len,
@@ -663,7 +663,7 @@ __device__ __forceinline__ void band_refine_pass(const float* __restrict__ row,
 #pragma unroll
             for(int e = 0; e < FP32_EPT; e++)
             {
-                const uint32_t key = fp32_to_sortable(v[u][e]);
+                const uint32_t key = sortable_key<NAN_HIGH>(v[u][e]);
                 if(i < n4 && (!LR || i * FP32_EPT + e < len) && (key >> fsh) == fpfx)
                 {
                     const uint32_t d = (key >> dsh) & dmask;
@@ -746,7 +746,7 @@ band_clear(uint32_t* __restrict__ s_hist, uint32_t* __restrict__ s_x, uint32_t* 
 // or level 3 has pinned the k-th key, block_gather_stream emits the row
 // (returns -1). Every level drops only keys that cannot be among the top k_out,
 // so the row is exact on every exit; at most four reads of the row.
-template <bool LR, bool WRITE_VALUES>
+template <bool LR, bool WRITE_VALUES, bool NAN_HIGH>
 __device__ __forceinline__ int radix_fallback_row(const float* __restrict__ row,
                                                   int n4,
                                                   int len,
@@ -781,7 +781,7 @@ __device__ __forceinline__ int radix_fallback_row(const float* __restrict__ row,
     {
         band_clear(s_hist, s_x, s_scan);
         uint32_t run_d = 0xFFFFFFFFu, run_n = 0u;
-        band_hist_pass<LR, true>(row, n4, len, tb - 1u, s_x, run_d, run_n);
+        band_hist_pass<LR, true, NAN_HIGH>(row, n4, len, tb - 1u, s_x, run_d, run_n);
         if(run_n)
             atomicAdd(&s_x[run_d], run_n);
         __syncthreads();
@@ -800,7 +800,7 @@ __device__ __forceinline__ int radix_fallback_row(const float* __restrict__ row,
     {
         band_clear(s_hist, s_x, s_scan);
         uint32_t run_d = 0xFFFFFFFFu, run_n = 0u;
-        band_hist_pass<LR, false>(row, n4, len, 0u, s_x, run_d, run_n);
+        band_hist_pass<LR, false, NAN_HIGH>(row, n4, len, 0u, s_x, run_d, run_n);
         if(run_n)
             atomicAdd(&s_x[run_d], run_n);
         __syncthreads();
@@ -824,7 +824,7 @@ __device__ __forceinline__ int radix_fallback_row(const float* __restrict__ row,
         // The whole row in one bucket: a min/max read settles one value for less
         // than a refine pass, whose prefix test every key of such a row passes.
         emit = above == 0 && in_b == len &&
-               row_prefix_single_value<LR>(
+               row_prefix_single_value<LR, NAN_HIGH>(
                    row, n4, len, bstar << FB_BAND_SH, FB_BAND_SH, s_amm, pivot);
         uint32_t fsh = FB_BAND_SH, pfx = bstar; // keys with key >> fsh == pfx are refined
 #pragma unroll 1
@@ -834,7 +834,7 @@ __device__ __forceinline__ int radix_fallback_row(const float* __restrict__ row,
             const uint32_t dmask = lvl == 0 ? 0xFFFu : 0xFFu;
             band_clear(s_hist, s_x, s_scan);
             uint32_t kmin = 0xFFFFFFFFu, kmax = 0u;
-            band_refine_pass<LR>(row, n4, len, fsh, pfx, dsh, dmask, s_x, kmin, kmax);
+            band_refine_pass<LR, NAN_HIGH>(row, n4, len, fsh, pfx, dsh, dmask, s_x, kmin, kmax);
             block_minmax(kmin, kmax, s_amm);
             if(kmin == kmax)
             {
@@ -872,7 +872,7 @@ __device__ __forceinline__ int radix_fallback_row(const float* __restrict__ row,
             *s_weq = 0u;
         }
         __syncthreads();
-        block_gather_stream<WRITE_VALUES>(
+        block_gather_stream<WRITE_VALUES, NAN_HIGH>(
             row, len, row_start, pivot, ngt, k_out - ngt, out, out_val, s_wgt, s_weq);
         return -1;
     }
@@ -889,15 +889,15 @@ __device__ __forceinline__ int radix_fallback_row(const float* __restrict__ row,
             v[u] = load_row_f4<LR, true>(row, i0 + u * (int)blockDim.x + (int)threadIdx.x, len);
 #pragma unroll
         for(int u = 0; u < FB_SEL_LOADS; u++)
-            band_take_vec<LR>(cand_w,
-                              s_wgt,
-                              v[u],
-                              i0 + u * (int)blockDim.x + (int)threadIdx.x,
-                              n4,
-                              len,
-                              csh,
-                              cthr,
-                              cap);
+            band_take_vec<LR, NAN_HIGH>(cand_w,
+                                        s_wgt,
+                                        v[u],
+                                        i0 + u * (int)blockDim.x + (int)threadIdx.x,
+                                        n4,
+                                        len,
+                                        csh,
+                                        cthr,
+                                        cap);
     }
     for(; i0 < n4; i0 += step)
     {
@@ -910,15 +910,15 @@ __device__ __forceinline__ int radix_fallback_row(const float* __restrict__ row,
         }
 #pragma unroll
         for(int u = 0; u < FB_SEL_LOADS; u++)
-            band_take_vec<LR>(cand_w,
-                              s_wgt,
-                              v[u],
-                              i0 + u * (int)blockDim.x + (int)threadIdx.x,
-                              n4,
-                              len,
-                              csh,
-                              cthr,
-                              cap);
+            band_take_vec<LR, NAN_HIGH>(cand_w,
+                                        s_wgt,
+                                        v[u],
+                                        i0 + u * (int)blockDim.x + (int)threadIdx.x,
+                                        n4,
+                                        len,
+                                        csh,
+                                        cthr,
+                                        cap);
     }
     // phase_c reads these records back in this workgroup, on this CU, so the
     // barrier's workgroup-scope fence is enough. An agent-scope __threadfence()
@@ -948,7 +948,7 @@ __device__ __forceinline__ int radix_fallback_row(const float* __restrict__ row,
 // the LDS-keys path.
 constexpr int PHASE_A_WAVES = 8;
 #define PHASE_A_OCCUPANCY __attribute__((amdgpu_waves_per_eu(PHASE_A_WAVES)))
-template <bool RAGGED, int KPT = 0>
+template <bool RAGGED, int KPT = 0, bool NAN_HIGH = false>
 __global__ __launch_bounds__(1024) PHASE_A_OCCUPANCY
     void phase_a_threshold(const float* __restrict__ input,
                            int pitch,
@@ -1027,10 +1027,10 @@ __global__ __launch_bounds__(1024) PHASE_A_OCCUPANCY
     // Convert one float4 of samples: keys into registers (slot t) or LDS (index u),
     // and pass 0's digits folded into s_hist.
     auto take_v4 = [&](const vfloat4& v, int u, int t) {
-        const uint32_t k0 = fp32_to_sortable(v[0]);
-        const uint32_t k1 = fp32_to_sortable(v[1]);
-        const uint32_t k2 = fp32_to_sortable(v[2]);
-        const uint32_t k3 = fp32_to_sortable(v[3]);
+        const uint32_t k0 = sortable_key<NAN_HIGH>(v[0]);
+        const uint32_t k1 = sortable_key<NAN_HIGH>(v[1]);
+        const uint32_t k2 = sortable_key<NAN_HIGH>(v[2]);
+        const uint32_t k3 = sortable_key<NAN_HIGH>(v[3]);
         if constexpr(KPT > 0)
         {
             keys[t * FP32_EPT + 0] = k0;
@@ -1129,7 +1129,7 @@ __global__ __launch_bounds__(1024) PHASE_A_OCCUPANCY
     if(threadIdx.x == 0)
     {
         threshold[row]   = pivot;
-        threshold_f[row] = sortable_to_fp32(pivot);
+        threshold_f[row] = key_to_fp32<NAN_HIGH>(pivot);
     }
 #else
     __builtin_trap();
@@ -1209,7 +1209,7 @@ RowExtents<true> make_row_extents<true>(const int* d_starts, const int* d_ends)
     return RowExtents<true>{d_starts, d_ends};
 }
 
-template <bool RAGGED, bool WRITE_VALUES>
+template <bool RAGGED, bool WRITE_VALUES, bool NAN_HIGH = false>
 static void topk_small_n(const float* d_in,
                          int M,
                          int pitch,
@@ -1220,7 +1220,7 @@ static void topk_small_n(const float* d_in,
                          float* d_val,
                          hipStream_t s)
 {
-    phase_small_n_topk<RAGGED, WRITE_VALUES>
+    phase_small_n_topk<RAGGED, WRITE_VALUES, NAN_HIGH>
         <<<M, small_n_block(M, pitch), (size_t)pitch * sizeof(uint32_t), s>>>(
             d_in,
             pitch,
@@ -1357,7 +1357,7 @@ static void launch_phase_b(const float* d_in,
                                                           lp.cap);
 }
 
-template <bool RAGGED, bool WRITE_VALUES>
+template <bool RAGGED, bool WRITE_VALUES, bool NAN_HIGH = false>
 static void topk_fused_impl(const float* d_in,
                             int M,
                             int pitch,
@@ -1375,19 +1375,20 @@ static void topk_fused_impl(const float* d_in,
 
     auto launch_pa = [&](auto kpt_tag) {
         constexpr int KP = decltype(kpt_tag)::value;
-        phase_a_threshold<RAGGED, KP><<<M, lp.a_block, lp.pa_dyn_bytes, s>>>(d_in,
-                                                                             pitch,
-                                                                             ext,
-                                                                             lp.rank,
-                                                                             lp.S,
-                                                                             PHASE_A_PASSES,
-                                                                             lp.chunk_stride,
-                                                                             b.threshold,
-                                                                             b.threshold_f,
-                                                                             b.cand_reserved,
-                                                                             b.cand_bad,
-                                                                             K,
-                                                                             lp.nwide_a);
+        phase_a_threshold<RAGGED, KP, NAN_HIGH>
+            <<<M, lp.a_block, lp.pa_dyn_bytes, s>>>(d_in,
+                                                    pitch,
+                                                    ext,
+                                                    lp.rank,
+                                                    lp.S,
+                                                    PHASE_A_PASSES,
+                                                    lp.chunk_stride,
+                                                    b.threshold,
+                                                    b.threshold_f,
+                                                    b.cand_reserved,
+                                                    b.cand_bad,
+                                                    K,
+                                                    lp.nwide_a);
     };
     if(lp.pa_kpt == 4)
         launch_pa(std::integral_constant<int, 4>{});
@@ -1415,7 +1416,7 @@ static void topk_fused_impl(const float* d_in,
 
     auto launch_phase_c = [&](auto reuse_tag) {
         constexpr bool REUSE = decltype(reuse_tag)::value;
-        phase_c_select_contig<RAGGED, WRITE_VALUES, REUSE>
+        phase_c_select_contig<RAGGED, WRITE_VALUES, REUSE, NAN_HIGH>
             <<<M, lp.c_block, lp.c_dyn_bytes, s>>>(d_in,
                                                    pitch,
                                                    ext,
@@ -1575,7 +1576,12 @@ void top_k_per_row_prefill_sampled(
     // The shape plan is deliberately left alone -- params_for still sizes
     // by geometry_k_ragged -- so this changes which kernel runs and
     // nothing else.
-    bool ragged = true)
+    bool ragged = true,
+    // NaN order. false ranks NaN by sign, a negative NaN below -inf, as
+    // top_k_per_row_prefill's radix paths do; true ranks every NaN above
+    // +inf, topk_select's contract. Indices only: those keys do not
+    // invert to the input value.
+    bool nan_high = false)
 {
     if(numRows <= 0)
         return;
@@ -1594,6 +1600,8 @@ void top_k_per_row_prefill_sampled(
         AITER_CHECK(values.value().numel() >= static_cast<size_t>(numRows) * static_cast<size_t>(k),
                     "top_k_per_row_prefill_sampled: values must hold numRows*k entries");
     }
+    AITER_CHECK(!(nan_high && values.has_value()),
+                "top_k_per_row_prefill_sampled: nan_high selects indices only");
     AITER_CHECK(rowStarts.numel() >= static_cast<size_t>(numRows) &&
                     rowEnds.numel() >= static_cast<size_t>(numRows),
                 "top_k_per_row_prefill_sampled: rowStarts/rowEnds must have numRows entries");
@@ -1634,7 +1642,16 @@ void top_k_per_row_prefill_sampled(
 
     if(sp.path == PATH_SMALL_N)
     {
-        if(ragged_small)
+        if(nan_high)
+        {
+            if(ragged_small)
+                topk_small_n<true, false, true>(
+                    in, M, N, row_starts, row_ends, K, idx, nullptr, stream);
+            else
+                topk_small_n<false, false, true>(
+                    in, M, N, row_starts, row_ends, K, idx, nullptr, stream);
+        }
+        else if(ragged_small)
         {
             if(val)
                 topk_small_n<true, true>(in, M, N, row_starts, row_ends, K, idx, val, stream);
@@ -1659,7 +1676,16 @@ void top_k_per_row_prefill_sampled(
                 L.total);
     Bufs b              = sampled::bind_bufs(workspace.value().data_ptr(), L, sp.cap);
     const LaunchPlan lp = plan_launch(M, N, sp);
-    if(ragged)
+    if(nan_high)
+    {
+        if(ragged)
+            topk_fused_impl<true, false, true>(
+                in, M, N, row_starts, row_ends, K, idx, nullptr, b, lp, stream);
+        else
+            topk_fused_impl<false, false, true>(
+                in, M, N, row_starts, row_ends, K, idx, nullptr, b, lp, stream);
+    }
+    else if(ragged)
     {
         if(val)
             topk_fused_impl<true, true>(in, M, N, row_starts, row_ends, K, idx, val, b, lp, stream);

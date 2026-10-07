@@ -518,8 +518,14 @@ def top_k_per_row_prefill(
     below."""
     # Ahead of the FlyDSL check: behind it this was unreachable, since FlyDSL
     # served every shape tested, M=4096 N=65536 included.
-    if _should_use_sampled_prefill(numRows, stride0, stride1, k, stable):
-        return top_k_per_row_prefill_sampled(
+    # A layout the sampled kernels cannot address stays on the paths below,
+    # which take it exactly as they did before `sampled` existed.
+    if _should_use_sampled_prefill(numRows, stride0, stride1, k, stable) and (
+        _sampled_layout_error(logits, rowStarts, rowEnds, indices, values, numRows, k)
+        is None
+    ):
+        # Reached with the caller's own bounds, so the ragged kernels stay.
+        return _sampled_run(
             logits,
             rowStarts,
             rowEnds,
@@ -529,8 +535,9 @@ def top_k_per_row_prefill(
             stride0,
             stride1,
             k,
-            # Reached with the caller's own bounds, so the ragged kernels stay.
-            ragged=True,
+            None,
+            True,
+            False,
         )
 
     use_mulblocks = not stable and _use_mulblocks(numRows, stride0)
@@ -600,6 +607,7 @@ def _top_k_per_row_prefill_sampled(
     k: int = 2048,
     workspace: torch.Tensor | None = None,
     ragged: bool = True,
+    nan_high: bool = False,
 ) -> None: ...
 
 
@@ -650,6 +658,87 @@ def _sampled_workspace_size_cached(numRows: int, stride0: int, k: int) -> int:
     return int(topk_sampled_workspace_size(numRows, stride0, k))
 
 
+def _sampled_layout_error(
+    logits: torch.Tensor,
+    rowStarts: torch.Tensor,
+    rowEnds: torch.Tensor,
+    indices: torch.Tensor,
+    values: torch.Tensor | None,
+    numRows: int,
+    k: int,
+) -> str | None:
+    """Why the sampled kernels cannot take these tensors as given, or None.
+
+    The kernels address indices and values as dense rows of k from the data
+    pointer and read both row bounds as dense int32 arrays, so a strided view or
+    another dtype would be read or written in the wrong place: a row-strided
+    [rows, k] slice of a wider buffer gets its guard columns overwritten and its
+    last slots left unwritten. Metadata only, so nothing here synchronises.
+    """
+    dev = logits.device
+    if dev.type != "cuda":
+        return f"logits must be on a GPU, got {dev}"
+    if logits.dtype is not torch.float32:
+        return f"logits must be fp32, got {logits.dtype}"
+    for name, t, dtype, need in (
+        ("indices", indices, torch.int32, numRows * k),
+        ("values", values, torch.float32, numRows * k),
+        ("rowStarts", rowStarts, torch.int32, numRows),
+        ("rowEnds", rowEnds, torch.int32, numRows),
+    ):
+        if t is None:
+            continue
+        if t.dtype is not dtype:
+            return f"{name} must be {dtype}, got {t.dtype}"
+        if t.device != dev:
+            return f"{name} must be on {dev} like logits, got {t.device}"
+        if not t.is_contiguous():
+            return f"{name} must be contiguous, got strides {tuple(t.stride())}"
+        if t.numel() < need:
+            return f"{name} holds {t.numel()} entries, needs {need}"
+    return None
+
+
+def _sampled_run(
+    logits: torch.Tensor,
+    rowStarts: torch.Tensor,
+    rowEnds: torch.Tensor,
+    indices: torch.Tensor,
+    values: torch.Tensor | None,
+    numRows: int,
+    stride0: int,
+    stride1: int,
+    k: int,
+    workspace: torch.Tensor | None,
+    ragged: bool,
+    nan_high: bool,
+) -> None:
+    """The sampled launch on arguments already validated."""
+    if workspace is None:
+        workspace = get_topk_scratch_workspace(
+            logits.device, _sampled_workspace_size_cached(numRows, stride0, k)
+        )
+    # The non-ragged kernels take every row to be stride0 wide. A row-strided
+    # view -- a column slice of a wider tensor -- is narrower than its pitch, so
+    # they would select from the columns past it; bound the rows instead.
+    if not ragged and logits.dim() == 2 and logits.size(1) != stride0:
+        ragged = True
+    return _top_k_per_row_prefill_sampled(
+        logits,
+        rowStarts,
+        rowEnds,
+        indices,
+        values,
+        numRows,
+        stride0,
+        stride1,
+        k,
+        workspace,
+        ragged,
+        nan_high,
+    )
+
+
 def top_k_per_row_prefill_sampled(
     logits: torch.Tensor,
     rowStarts: torch.Tensor,
@@ -668,6 +757,10 @@ def top_k_per_row_prefill_sampled(
     # on gaussian rows, m=2048 n=131072, phase_b 202.96 -> 193.14 us, phase_a
     # 38.31 -> 37.44, phase_c 40.80 -> 41.09, the whole call 282.07 -> 271.67.
     ragged: bool = True,
+    # NaN order. False ranks a NaN by its sign -- a negative NaN below -inf --
+    # as top_k_per_row_prefill's other paths do. True ranks every NaN above
+    # +inf, topk_select's contract. Indices only: values must be None.
+    nan_high: bool = False,
 ) -> None:
     """Per-row top-k (prefill) via the sampled kernels.
 
@@ -722,48 +815,27 @@ def top_k_per_row_prefill_sampled(
             f"top_k_per_row_prefill_sampled: unsupported shape (numRows={numRows} "
             f"stride0={stride0} k={k}); ask topk_sampled_supports() first"
         )
-    if logits.dtype is not torch.float32:
+    err = _sampled_layout_error(logits, rowStarts, rowEnds, indices, values, numRows, k)
+    if err is not None:
+        raise ValueError(f"top_k_per_row_prefill_sampled: {err}")
+    if nan_high and values is not None:
         raise ValueError(
-            f"top_k_per_row_prefill_sampled: logits must be fp32, got {logits.dtype}"
+            "top_k_per_row_prefill_sampled: nan_high selects indices only; "
+            "pass values=None"
         )
-    if indices.dtype is not torch.int32:
-        raise ValueError(
-            f"top_k_per_row_prefill_sampled: indices must be int32, got {indices.dtype}"
-        )
-    if indices.numel() < numRows * k:
-        raise ValueError(
-            f"top_k_per_row_prefill_sampled: indices holds {indices.numel()} entries, "
-            f"needs numRows*k = {numRows * k}"
-        )
-    if values is not None:
-        if values.dtype is not torch.float32:
+    if workspace is not None:
+        size = _sampled_workspace_size_cached(numRows, stride0, k)
+        if workspace.device != logits.device or not workspace.is_contiguous():
             raise ValueError(
-                f"top_k_per_row_prefill_sampled: values must be fp32, got {values.dtype}"
+                "top_k_per_row_prefill_sampled: workspace must be a contiguous "
+                f"tensor on {logits.device}"
             )
-        if values.numel() < numRows * k:
+        if workspace.numel() * workspace.element_size() < size:
             raise ValueError(
-                f"top_k_per_row_prefill_sampled: values holds {values.numel()} entries, "
-                f"needs numRows*k = {numRows * k}"
+                f"top_k_per_row_prefill_sampled: workspace is "
+                f"{workspace.numel() * workspace.element_size()} B, needs {size} B"
             )
-    if rowStarts.numel() < numRows or rowEnds.numel() < numRows:
-        raise ValueError(
-            f"top_k_per_row_prefill_sampled: rowStarts/rowEnds hold "
-            f"{rowStarts.numel()}/{rowEnds.numel()} entries, need {numRows}"
-        )
-    size = _sampled_workspace_size_cached(numRows, stride0, k)
-    if workspace is None:
-        workspace = get_topk_scratch_workspace(logits.device, size)
-    elif workspace.numel() * workspace.element_size() < size:
-        raise ValueError(
-            f"top_k_per_row_prefill_sampled: workspace is "
-            f"{workspace.numel() * workspace.element_size()} B, needs {size} B"
-        )
-    # The non-ragged kernels take every row to be stride0 wide. A row-strided
-    # view -- a column slice of a wider tensor -- is narrower than its pitch, so
-    # they would select from the columns past it; bound the rows instead.
-    if not ragged and logits.dim() == 2 and logits.size(1) != stride0:
-        ragged = True
-    return _top_k_per_row_prefill_sampled(
+    return _sampled_run(
         logits,
         rowStarts,
         rowEnds,
@@ -775,6 +847,7 @@ def top_k_per_row_prefill_sampled(
         k,
         workspace,
         ragged,
+        nan_high,
     )
 
 

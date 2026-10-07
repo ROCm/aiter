@@ -1183,6 +1183,8 @@ def _dispatch(
             # every row, and saying so lets the entry run the kernels that do not
             # bounds-check every element.
             ragged=ragged,
+            # NaN of either sign outranks +inf here, as in stream and decode.
+            nan_high=True,
         )
     elif backend == "small_k":
         topk_per_row_small_k(input, row_lens, idx, topk)

@@ -6,7 +6,7 @@
 // GPU kernels for generalized top-k paths. Include AFTER block_select_lds / block_gather_topk
 // are visible in the translation unit.
 
-template <bool RAGGED, bool WRITE_VALUES>
+template <bool RAGGED, bool WRITE_VALUES, bool NAN_HIGH = false>
 __global__ void phase_small_n_topk(const float* __restrict__ input,
                                    int pitch,
                                    RowExtents<RAGGED> extents,
@@ -14,6 +14,8 @@ __global__ void phase_small_n_topk(const float* __restrict__ input,
                                    TopkOut<WRITE_VALUES> dst,
                                    int npasses)
 {
+    // topk_select, the one NAN_HIGH caller, gathers its values itself.
+    static_assert(!(NAN_HIGH && WRITE_VALUES), "NAN_HIGH is instantiated for indices only");
 #if TOPK_SAMPLED_DEVICE
     const int row       = blockIdx.x;
     const int row_start = RAGGED ? extents.row_start(row, pitch) : 0;
@@ -40,10 +42,10 @@ __global__ void phase_small_n_topk(const float* __restrict__ input,
     {
         vfloat4 v        = load_row_f4<RAGGED>(ri, u, len);
         const int base   = u * FP32_EPT;
-        s_keys[base + 0] = fp32_to_sortable(v[0]);
-        s_keys[base + 1] = fp32_to_sortable(v[1]);
-        s_keys[base + 2] = fp32_to_sortable(v[2]);
-        s_keys[base + 3] = fp32_to_sortable(v[3]);
+        s_keys[base + 0] = sortable_key<NAN_HIGH>(v[0]);
+        s_keys[base + 1] = sortable_key<NAN_HIGH>(v[1]);
+        s_keys[base + 2] = sortable_key<NAN_HIGH>(v[2]);
+        s_keys[base + 3] = sortable_key<NAN_HIGH>(v[3]);
     }
     __syncthreads();
 
@@ -145,6 +147,12 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
 
     int bcnt                    = 0;
     constexpr int COOP_DRAIN_AT = WSTAGE_CAP_COOP - 4 * WAVE_SIZE;
+    // Sticky per wave. Once a drain finds the row's candidate area full the row is
+    // marked bad and phase_c falls back for it, so nothing this wave stages after
+    // that is ever read. Staging still runs -- bcnt restarts from 0, so every
+    // slot it writes stays inside the wave's buffer -- but drains only reset it,
+    // and the epilogue reports the wave as overflowed.
+    bool wave_bad = false;
 
 // The drain's cost is its reservation atomic, not its data movement: with no
 // candidate passing, phase_b ran 100.35 us faster at m=4096 n=131072, while the
@@ -156,22 +164,27 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
     for(int _j = lane; _j < bcnt; _j += WAVE_SIZE) \
     row_base[(off) + _j] = buf[_j]
 
-#define COOP_DRAIN_WAVE()                                            \
-    do                                                               \
-    {                                                                \
-        unsigned _off = 0;                                           \
-        if(lane == 0)                                                \
-            _off = COOP_RESERVE(row, bcnt);                          \
-        _off = (unsigned)__shfl((int)_off, 0);                       \
-        if(_off + (unsigned)bcnt > (unsigned)cap)                    \
-        {                                                            \
-            if(lane == 0)                                            \
-                atomicExch(&cand_bad[(size_t)row * CTR_STRIDE], 1u); \
-            bcnt = -1;                                               \
-            break;                                                   \
-        }                                                            \
-        COOP_DRAIN_BODY(_off);                                       \
-        bcnt = 0;                                                    \
+#define COOP_DRAIN_WAVE()                                                \
+    do                                                                   \
+    {                                                                    \
+        if(!wave_bad)                                                    \
+        {                                                                \
+            unsigned _off = 0;                                           \
+            if(lane == 0)                                                \
+                _off = COOP_RESERVE(row, bcnt);                          \
+            _off = (unsigned)__shfl((int)_off, 0);                       \
+            if(_off + (unsigned)bcnt > (unsigned)cap)                    \
+            {                                                            \
+                if(lane == 0)                                            \
+                    atomicExch(&cand_bad[(size_t)row * CTR_STRIDE], 1u); \
+                wave_bad = true;                                         \
+            }                                                            \
+            else                                                         \
+            {                                                            \
+                COOP_DRAIN_BODY(_off);                                   \
+            }                                                            \
+        }                                                                \
+        bcnt = 0;                                                        \
     } while(0)
 
     if constexpr(PB_B > 0)
@@ -284,7 +297,7 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
     {
         const int tail0 = n4 * FP32_EPT;
         const int ncols = len - tail0;
-        if(ncols > 0 && bid == G - 1 && bcnt >= 0)
+        if(ncols > 0 && bid == G - 1 && !wave_bad)
         {
             const bool mine   = (int)threadIdx.x < ncols;
             const float vv    = mine ? ri[tail0 + (int)threadIdx.x] : 0.f;
@@ -309,7 +322,7 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
     __shared__ int s_off[MAX_WAVES_PER_BLOCK];
     __shared__ unsigned s_base;
     if(lane == 0)
-        s_local[wid] = bcnt;
+        s_local[wid] = wave_bad ? -1 : bcnt;
     __syncthreads();
     if(threadIdx.x == 0)
     {
@@ -413,7 +426,7 @@ __global__ void phase_b_filter_coop(const float* __restrict__ input,
 #endif
 }
 
-template <bool RAGGED, bool WRITE_VALUES, bool REUSE_WIDE = false>
+template <bool RAGGED, bool WRITE_VALUES, bool REUSE_WIDE = false, bool NAN_HIGH = false>
 __global__ PHASE_C_OCCUPANCY void
 phase_c_select_contig(const float* __restrict__ input,
                       int pitch,
@@ -429,6 +442,8 @@ phase_c_select_contig(const float* __restrict__ input,
                       int nwide,
                       const uint32_t* __restrict__ threshold)
 {
+    // topk_select, the one NAN_HIGH caller, gathers its values itself.
+    static_assert(!(NAN_HIGH && WRITE_VALUES), "NAN_HIGH is instantiated for indices only");
 #if TOPK_SAMPLED_DEVICE
     const int row       = blockIdx.x;
     const int row_start = RAGGED ? extents.row_start(row, pitch) : 0;
@@ -467,7 +482,7 @@ phase_c_select_contig(const float* __restrict__ input,
     // already in registers here.
     const int fold_rep = threadIdx.x & (HIST_REP - 1);
     auto take_cand     = [&](uint64_t p, int i) {
-        const uint32_t kk = fp32_to_sortable_bits((uint32_t)(p >> 32));
+        const uint32_t kk = sortable_key_bits<NAN_HIGH>((uint32_t)(p >> 32));
         s_keys_ext[i]     = kk;
         if(!keys_only)
             s_idx[i] = (int)(uint32_t)p;
@@ -547,40 +562,40 @@ phase_c_select_contig(const float* __restrict__ input,
         // multiple of FP32_EPT is read bounds-checked, or its last columns are lost.
         int got;
         if(!RAGGED && (len % FP32_EPT) != 0)
-            got = radix_fallback_row<true, WRITE_VALUES>(rif0,
-                                                         n4_cover(len),
-                                                         len,
-                                                         row_start,
-                                                         k_out,
-                                                         cap,
-                                                         tmin,
-                                                         cand_w,
-                                                         out,
-                                                         val,
-                                                         s_hist,
-                                                         s_dyn,
-                                                         s_scan,
-                                                         s_mm,
-                                                         &s_wgt,
-                                                         &s_weq);
+            got = radix_fallback_row<true, WRITE_VALUES, NAN_HIGH>(rif0,
+                                                                   n4_cover(len),
+                                                                   len,
+                                                                   row_start,
+                                                                   k_out,
+                                                                   cap,
+                                                                   tmin,
+                                                                   cand_w,
+                                                                   out,
+                                                                   val,
+                                                                   s_hist,
+                                                                   s_dyn,
+                                                                   s_scan,
+                                                                   s_mm,
+                                                                   &s_wgt,
+                                                                   &s_weq);
         else
-            got =
-                radix_fallback_row<RAGGED, WRITE_VALUES>(rif0,
-                                                         RAGGED ? n4_cover(len) : pitch / FP32_EPT,
-                                                         len,
-                                                         row_start,
-                                                         k_out,
-                                                         cap,
-                                                         tmin,
-                                                         cand_w,
-                                                         out,
-                                                         val,
-                                                         s_hist,
-                                                         s_dyn,
-                                                         s_scan,
-                                                         s_mm,
-                                                         &s_wgt,
-                                                         &s_weq);
+            got = radix_fallback_row<RAGGED, WRITE_VALUES, NAN_HIGH>(rif0,
+                                                                     RAGGED ? n4_cover(len)
+                                                                            : pitch / FP32_EPT,
+                                                                     len,
+                                                                     row_start,
+                                                                     k_out,
+                                                                     cap,
+                                                                     tmin,
+                                                                     cand_w,
+                                                                     out,
+                                                                     val,
+                                                                     s_hist,
+                                                                     s_dyn,
+                                                                     s_scan,
+                                                                     s_mm,
+                                                                     &s_wgt,
+                                                                     &s_weq);
         if(got < 0)
             return; // emitted; len > K here, so k_out == K and nothing to pad
         c = got;

@@ -45,7 +45,11 @@ void top_k_per_row_prefill_sampled(const aiter_tensor_t& logits,
                                    // Whether the caller actually supplied per-row bounds.
                                    // False picks the kernels that do not bounds-check
                                    // every element; true keeps them.
-                                   bool ragged = true);
+                                   bool ragged = true,
+                                   // NaN order: false ranks a negative NaN below -inf, as
+                                   // top_k_per_row_prefill does; true ranks every NaN above
+                                   // +inf, as topk_select does. Indices only.
+                                   bool nan_high = false);
 
 int64_t topk_sampled_workspace_size(int64_t numRows, int64_t stride0, int64_t k);
 bool topk_sampled_supports(int64_t numRows, int64_t stride0, int64_t k);
