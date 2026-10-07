@@ -39,12 +39,15 @@ from flydsl.expr import (
     range_constexpr,
 )
 
-from aiter.ops.flydsl.kernels.kernels_common import kernel_signature
+from aiter.ops.flydsl.kernels.kernels_common import get_warp_size, kernel_signature
 from aiter.ops.flydsl.kernels.qsa.arch import qsa_device_arch
 from aiter.ops.flydsl.kernels.tensor_shim import (
     _run_compiled,
     buf_base_i64,
     buf_copy_atom,
+)
+from aiter.ops.flydsl.kernels.topk.topk_per_row_decode_persistent import (
+    build_topk_per_row_decode_one_workgroup_module,
 )
 from aiter.ops.flydsl.topk.topk_per_row import (
     _ONE_WORKGROUP_MAX_ROW_WIDTH,
@@ -930,6 +933,7 @@ def qsa_k1_score_and_select(
     score_scale: float,
     n_heads: int,
     live_columns: int | None = None,
+    row_bounded: bool = False,
 ) -> torch.Tensor:
     """Score long rows into ``[M, n_columns]`` and write top-512 ids into ``out``.
 
@@ -941,7 +945,9 @@ def qsa_k1_score_and_select(
     live columns uses the one-workgroup decode radix. More rows keep the
     streaming selector. A packed table keeps the old split: stable decode
     radix below 32768 columns, streaming radix (``tie='low'``) at or
-    above that.
+    above that. ``row_bounded`` runs the one-workgroup decode radix on
+    the full width instead: it stops at each row's ``row_lens``, so it
+    needs no readback of the widest row.
     """
     if n_heads not in _SCORE_HEADS:
         raise ValueError(f"score heads must be {_SCORE_HEADS}, got {n_heads}")
@@ -999,6 +1005,22 @@ def qsa_k1_score_and_select(
             score_tiles,
             torch.cuda.current_stream(q.device),
         )
+    if row_bounded:
+        _run_compiled(
+            build_topk_per_row_decode_one_workgroup_module(
+                _K, wave_size=get_warp_size(arch), write_values=False
+            ),
+            scores,
+            row_lens,
+            out,
+            scores,
+            int(n_columns),
+            1,
+            scores.stride(0),
+            m,
+            torch.cuda.current_stream(q.device),
+        )
+        return out
     select_columns = n_columns if live_columns is None else int(live_columns)
     if select_columns < 1 or select_columns > n_columns:
         raise ValueError(
@@ -1157,13 +1179,15 @@ def qsa_k1_block_ids(
     # prefill has too many rows for that readback to pay, and its selector
     # is already the streaming one, so it keeps the allocation width. So
     # does a graph capture: the readback is not allowed there, and the
-    # graph would replay the width of the capture batch.
+    # graph would replay the width of the capture batch. Decode under
+    # capture selects with the one-workgroup radix on the full width,
+    # which stops at each row's visible length: at 4 rows of 2048 live
+    # columns that is 11 us against 28 for the streaming selector, and it
+    # stays ahead up to about 32768 live columns (131k-token context).
     live_columns = n_columns
-    if (
-        n_columns > _ONE_WORKGROUP_MAX_ROW_WIDTH
-        and m <= _DECODE_MAX_ROWS
-        and not torch.cuda.is_current_stream_capturing()
-    ):
+    padded_decode = n_columns > _ONE_WORKGROUP_MAX_ROW_WIDTH and m <= _DECODE_MAX_ROWS
+    row_bounded = padded_decode and torch.cuda.is_current_stream_capturing()
+    if padded_decode and not row_bounded:
         live_columns = _k1_max_visible_columns(
             token_to_req, query_positions, context_lens, n_columns
         )
@@ -1192,5 +1216,6 @@ def qsa_k1_block_ids(
             float(score_scale),
             int(q.shape[1]),
             live_columns=live_columns,
+            row_bounded=row_bounded,
         )
     return out
