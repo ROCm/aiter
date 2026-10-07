@@ -52,6 +52,7 @@ from aiter.ops.flydsl.kernels.dsv41_mono.common.device.mx import (
     FP4,
     FP8,
     FP8_MAX,
+    UNIT_SCALE,
     clamp_fp8,
     code_ceil,
     fp4_tile_load,
@@ -1162,9 +1163,11 @@ def mid_operands(c, first, count):
     # the step's constant after an opaque lane word folds into the immediate
     # offset; summed with j * 4 it was a hoisted VGPR a step (spill)
     lane_word = fresh(row * d.mid_words + j * 4)
-    bvs = [
-        fp8_operand(
-            [
+    bvs = []
+    for st in range_constexpr(steps):
+        halves = []
+        for h in range_constexpr(2):
+            v = fx.Vector(
                 bo.buffer_load(
                     rsrc(c["mid"].value),
                     lane_word + (st * 32 + 16 * h),
@@ -1172,11 +1175,17 @@ def mid_operands(c, first, count):
                     dtype=T.i32,
                     cache_modifier=CM_DEV,
                 )
-                for h in range(2)
-            ]
-        )
-        for st in range(steps)
-    ]
+            )
+            if const_expr(st * 128 + 64 * h + 48 >= d.inter_real):
+                # columns past the rank's real intermediate (the loader pads
+                # it with zero weights) are never written: stale bytes, which
+                # a NaN pattern would carry through the zero weights
+                past = st * 128 + 64 * h + 16 * j >= d.inter_real
+                v = fx.Vector.from_elements(
+                    [past.select(fx.Int32(0), v[q]) for q in range(4)], fx.Int32
+                )
+            halves.append(v)
+        bvs.append(fp8_operand(halves))
     # this lane's codes, one a K step: contiguous in MIDS (``mid_code_index``),
     # 4 a load -- a load a step was 5 of a slot's 16 load instructions, and the
     # stage is load-issue bound (probe ``harness/down_probe.py``: -8 %)
@@ -1196,6 +1205,11 @@ def mid_operands(c, first, count):
         else:
             v = fx.Vector(v)
             sbs += [fx.Int32(v[k]) for k in range(n)]
+    for st in range_constexpr(steps):
+        if const_expr((st + 1) * 128 > d.inter_real):
+            # a group past the real intermediate has no code written either
+            past = (4 * st + j) * 32 >= d.inter_real
+            sbs[st] = past.select(fx.Int32(UNIT_SCALE), sbs[st])
     return bvs, sbs
 
 
