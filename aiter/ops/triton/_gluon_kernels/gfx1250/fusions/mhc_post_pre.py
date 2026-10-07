@@ -82,10 +82,11 @@ def create_layouts(
         [[KS, 8]], [HC, BLOCK_M, KS], [2, 1, 0]
     )
     if W_PRESHUFFLED:
-        # One bf16 hi or lo plane per buffer, [HC, N_PAD, KS/16, 16]: TDM writes the
-        # 16-element runs of the packed layout; physically 64 B rows + 16 B pad.
+        # bf16 hi and lo interleaved as stored ([16 hi][16 lo] per 16 k), one
+        # 2*KS-element (128 B) row per (head, n) + 16 B pad; read per plane through
+        # _fn_read_layout.
         smem_fn = gl.PaddedSharedLayout.with_identity_for(
-            [[KS, 8]], [HC, N_PAD, KS // 16, 16], [3, 2, 1, 0]
+            [[2 * KS, 8]], [HC, N_PAD, 2 * KS], [2, 1, 0]
         )
     else:
         # fp32 weights: 128 B rows padded by 16 B.
@@ -100,12 +101,56 @@ def create_layouts(
 
 
 @gluon.constexpr_function
-def _tdm_ops_after_load(i, num_stages, k_loop, w_preshuffled):
+def _tdm_ops_after_load(i, num_stages, k_loop):
     """TDM ops a wave issues after the loads of step i and before step i's wait:
     the stores of the previous num_stages-1 steps and the loads of each later
-    stage already in flight (x, res, fn; fn is two loads, hi and lo, when packed)."""
-    loads = 4 if w_preshuffled else 3
-    return min(i, num_stages - 1) + loads * min(num_stages - 1, k_loop - 1 - i)
+    stage already in flight (x, res, fn: 3 per stage)."""
+    return min(i, num_stages - 1) + 3 * min(num_stages - 1, k_loop - 1 - i)
+
+
+@gluon.constexpr_function
+def _fn_read_layout(HC, N_PAD, KS):
+    """[HC, N_PAD, KS/16, 32] view of the packed fn tile (the same bytes as the
+    [HC, N_PAD, 2*KS] TDM tile): dim 3 holds [16 hi][16 lo]."""
+    return gl.PaddedSharedLayout.with_identity_for(
+        [[2 * KS, 8]], [HC, N_PAD, KS // 16, 32], [3, 2, 1, 0]
+    )
+
+
+@gluon.constexpr_function
+def _split_k_axis(ll):
+    """[HC, KS, N] linear layout -> [HC, KS/16, 16, N] (k = 16 * kj + ke)."""
+
+    def f(b):
+        return [b[0], b[1] >> 4, b[1] & 15, b[2]]
+
+    return gl.DistributedLinearLayout(
+        reg_bases=[f(b) for b in ll.reg_bases],
+        lane_bases=[f(b) for b in ll.lane_bases],
+        warp_bases=[f(b) for b in ll.warp_bases],
+        block_bases=[f(b) for b in ll.block_bases],
+        shape=[ll.shape[0], ll.shape[1] // 16, 16, ll.shape[2]],
+    )
+
+
+@gluon.jit
+def _load_fn_plane(
+    fn_rd,
+    slot,
+    p: gl.constexpr,
+    HC: gl.constexpr,
+    N_PAD: gl.constexpr,
+    KS: gl.constexpr,
+    OP_B: gl.constexpr,
+):
+    """B operand [HC, KS, N_PAD] of plane p (0 = hi, 1 = lo) of the packed fn tile.
+    A last-dim slice cannot be reshaped in shared memory (memdesc_reshape of a
+    subslice is NYI), so the (KS/16, 16) -> KS merge is a register reshape from
+    OP_B with its K axis split (no data movement)."""
+    L4: gl.constexpr = _split_k_axis(gl.to_linear_layout(OP_B, [HC, KS, N_PAD]))
+    v = fn_rd.index(slot).slice(16 * p, 16, dim=3).permute([0, 2, 3, 1])
+    b4 = gl.amd.cdna4.async_copy.load_shared_relaxed(v, L4)
+    return gl.convert_layout(gl.reshape(b4, [HC, KS, N_PAD]), OP_B)
 
 
 @gluon.jit
@@ -125,7 +170,6 @@ def _issue_loads(
     x_desc,
     res_desc,
     fn_desc,
-    fnl_desc,
     x_smem,
     res_smem,
     fn_smem,
@@ -142,10 +186,10 @@ def _issue_loads(
         res_desc, _res_offsets(row0, kb, HC, KS, RES_SHUFFLED), res_smem.index(slot)
     )
     if W_PRESHUFFLED:
-        # hi plane into buffer 2*slot, lo plane into 2*slot + 1.
-        off = [0, 0, kb * (KS // 16), 0]
-        gl.amd.gfx1250.tdm.async_load(fn_desc, off, fn_smem.index(2 * slot))
-        gl.amd.gfx1250.tdm.async_load(fnl_desc, off, fn_smem.index(2 * slot + 1))
+        # hi and lo together: 2*KS packed bf16 columns per KS block of k.
+        gl.amd.gfx1250.tdm.async_load(
+            fn_desc, [0, 0, kb * 2 * KS], fn_smem.index(slot)
+        )
     else:
         gl.amd.gfx1250.tdm.async_load(fn_desc, [0, 0, kb * KS], fn_smem.index(slot))
 
@@ -215,9 +259,10 @@ def _mhc_post_pre_gemm_sqrsum_gfx1250_kernel(
     #   shuffled [C/KS][HC][M][KS]  -> [C/KS*HC, M, KS],  strides (M*KS, KS, 1)
     # fp32 fn (N_OUT, HC*C) is viewed the same way as the plain residual,
     # [HC, N_OUT, C]. Packed fn holds hi(k) at bf16 column (k // 16) * 32 + k % 16
-    # and lo(k) 16 later, so each plane is [HC, N_OUT, C/16, 16] with strides
-    # (2C, 2*HC*C, 32, 1), the lo plane offset by 16. Rows N_OUT..N_PAD of each
-    # tile are zero-filled.
+    # and lo(k) 16 later, so both planes of a KS block are one contiguous run of
+    # 2*KS columns: [HC, N_OUT, 2C] with strides (2C, 2*HC*C, 1), loaded as one
+    # TDM op of 128 B rows (two 32 B-row loads, one per plane, were slower).
+    # Rows N_OUT..N_PAD of each tile are zero-filled.
     x_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=x_ptr,
         shape=(M, C),
@@ -248,16 +293,9 @@ def _mhc_post_pre_gemm_sqrsum_gfx1250_kernel(
     if W_PRESHUFFLED:
         fn_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=fn_ptr,
-            shape=(HC, N_OUT, C // 16, 16),
-            strides=(2 * C, 2 * HC * C, 32, 1),
-            block_shape=(HC, N_PAD, KS // 16, 16),
-            layout=SMEM_FN,
-        )
-        fnl_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-            base=fn_ptr + 16,
-            shape=(HC, N_OUT, C // 16, 16),
-            strides=(2 * C, 2 * HC * C, 32, 1),
-            block_shape=(HC, N_PAD, KS // 16, 16),
+            shape=(HC, N_OUT, 2 * C),
+            strides=(2 * C, 2 * HC * C, 1),
+            block_shape=(HC, N_PAD, 2 * KS),
             layout=SMEM_FN,
         )
     else:
@@ -268,7 +306,6 @@ def _mhc_post_pre_gemm_sqrsum_gfx1250_kernel(
             block_shape=(HC, N_PAD, KS),
             layout=SMEM_FN,
         )
-        fnl_desc = fn_desc
 
     dt: gl.constexpr = x_ptr.type.element_ty
     x_smem = gl.allocate_shared_memory(dt, [NUM_STAGES, BLOCK_M, KS], SMEM_X)
@@ -278,9 +315,14 @@ def _mhc_post_pre_gemm_sqrsum_gfx1250_kernel(
     # epilogue can then run while the last next_residual TDM stores drain.
     red_smem = gl.allocate_shared_memory(gl.float32, [HC, BLOCK_M, N_PAD], SMEM_RED)
     sq_smem = gl.allocate_shared_memory(gl.float32, [HC, BLOCK_M], SMEM_RED2)
-    if W_PRESHUFFLED:  # [hi, lo] planes per ring slot
+    if W_PRESHUFFLED:  # packed [hi, lo] tile per ring slot; fn_rd: per-plane view
         fn_smem = gl.allocate_shared_memory(
-            fn_ptr.type.element_ty, [2 * NUM_STAGES, HC, N_PAD, KS // 16, 16], SMEM_FN
+            fn_ptr.type.element_ty, [NUM_STAGES, HC, N_PAD, 2 * KS], SMEM_FN
+        )
+        fn_rd = fn_smem.reinterpret(
+            fn_ptr.type.element_ty,
+            [NUM_STAGES, HC, N_PAD, KS // 16, 32],
+            _fn_read_layout(HC, N_PAD, KS),
         )
     else:
         fn_smem = gl.allocate_shared_memory(
@@ -295,7 +337,6 @@ def _mhc_post_pre_gemm_sqrsum_gfx1250_kernel(
                 x_desc,
                 res_desc,
                 fn_desc,
-                fnl_desc,
                 x_smem,
                 res_smem,
                 fn_smem,
@@ -315,7 +356,7 @@ def _mhc_post_pre_gemm_sqrsum_gfx1250_kernel(
     # ---- main loop, fully unrolled so every ring slot and wait count is static ----
     for i in gl.static_range(K_LOOP):
         gl.amd.gfx1250.tdm.async_wait(
-            _tdm_ops_after_load(i, NUM_STAGES, K_LOOP, W_PRESHUFFLED)
+            _tdm_ops_after_load(i, NUM_STAGES, K_LOOP)
         )
         gl.barrier()
 
@@ -343,14 +384,8 @@ def _mhc_post_pre_gemm_sqrsum_gfx1250_kernel(
         a_bf = a.to(nres_ptr.type.element_ty)
 
         if W_PRESHUFFLED:
-            b_hi = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                fn_smem.index(2 * slot).reshape([HC, N_PAD, KS]).permute([0, 2, 1]),
-                OP_B,
-            )
-            b_lo = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                fn_smem.index(2 * slot + 1).reshape([HC, N_PAD, KS]).permute([0, 2, 1]),
-                OP_B,
-            )
+            b_hi = _load_fn_plane(fn_rd, slot, 0, HC, N_PAD, KS, OP_B)
+            b_lo = _load_fn_plane(fn_rd, slot, 1, HC, N_PAD, KS, OP_B)
         else:
             # Same split as mhc_shuffle_fn: hi = bf16(fn), lo = bf16(fn - hi).
             f = gl.amd.cdna4.async_copy.load_shared_relaxed(
@@ -382,7 +417,6 @@ def _mhc_post_pre_gemm_sqrsum_gfx1250_kernel(
                 x_desc,
                 res_desc,
                 fn_desc,
-                fnl_desc,
                 x_smem,
                 res_smem,
                 fn_smem,
