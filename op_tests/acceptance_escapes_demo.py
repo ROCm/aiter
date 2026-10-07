@@ -240,6 +240,8 @@ def catches():
     broken = (ref.float() + 99.0).to(torch.bfloat16)
     ratio = checkAllclose(broken, ref, rtol=rtol, atol=atol, printLog=False)
     print(f"  2. derived rtol={rtol} atol={atol}  -> {ratio:.1%} of elements flagged")
+    print("      (library only: tolerance.py is NOT wired into the MoE tests,")
+    print("       its atol is keyed to max|ref| and measures too loose there)")
 
     zeroed = ref.clone()
     zeroed[:7] = 0.0
