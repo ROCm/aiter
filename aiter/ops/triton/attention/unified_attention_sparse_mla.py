@@ -71,12 +71,12 @@ def unified_attention_sparse_mla(
 
     cfg = _launch_config()
     BLOCK_M = cfg.kwargs["BLOCK_M"]
-    # The grid has num_query_heads // BLOCK_M programs per token, so BLOCK_M must
-    # divide the head count; halve a larger tuned value until it does.
+    # A program covers BLOCK_M heads and masks those past the head count; halve a
+    # larger tuned value while it does not divide the head count, to mask fewer rows.
     while BLOCK_M > _FALLBACK.kwargs["BLOCK_M"] and num_query_heads % BLOCK_M:
         BLOCK_M //= 2
 
-    total_num_q_blocks = q.shape[0] * (num_query_heads // BLOCK_M)
+    total_num_q_blocks = q.shape[0] * triton.cdiv(num_query_heads, BLOCK_M)
     ALL_DECODE = max_seqlen_q == 1
 
     ROPE_RANK = head_size - kv_lora_rank
