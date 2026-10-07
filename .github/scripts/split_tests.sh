@@ -8,20 +8,23 @@
 # Parameters:
 #   --shards N     number of shards (required)
 #   --test-type TYPE test type, default aiter
+#   --select-file F  only shard test files listed in F (one per line)
 #   --dry-run      only output allocation plan, do not execute
 #   -v             Pytest's -v option, no effect
-# Exit code: always 0
+# Exit code: 0 on success, 1 for invalid arguments or selected paths
 
 set -euo pipefail
 
 SHARDS=0
 TEST_TYPE="aiter"
 DRY_RUN=0
+SELECT_FILE=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --shards) SHARDS="$2"; shift 2 ;;
         --test-type) TEST_TYPE="$2"; shift 2 ;;
+        --select-file) SELECT_FILE="$2"; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
         -v|--verbose) shift ;; # compatibility, ignore
         *)
@@ -50,13 +53,57 @@ TEST_DIR="${TEST_DIR%/}"
 # scan test files in TEST_DIR
 # ------------------------------
 if [[ "$TEST_TYPE" == "aiter" ]]; then
-    mapfile -t ALL_FILES < <(find "$TEST_DIR" -maxdepth 1 -name 'test_*.py' -type f | LC_ALL=C sort)
+    mapfile -t ALL_FILES < <(
+        {
+            find "$TEST_DIR" -maxdepth 1 -name 'test_*.py' -type f
+            printf '%s\n' \
+                "$TEST_DIR/tuning_tests/test_csv_validation.py" \
+                "$TEST_DIR/tuning_tests/test_config_shape_collision.py" \
+                "$TEST_DIR/tuning_tests/test_mixed_mxfp_tuning.py"
+        } | LC_ALL=C sort -u
+    )
 elif [[ "$TEST_TYPE" == "triton" ]]; then
     mapfile -t ALL_FILES < <(find "$TEST_DIR" -name 'test_*.py' -type f | LC_ALL=C sort)
 fi
 if [[ ${#ALL_FILES[@]} -eq 0 ]]; then
     echo "No test files found: $TEST_DIR/test_*.py" >&2
     exit 1
+fi
+
+# Apply the optional selection before sharding.
+if [[ -n "$SELECT_FILE" ]]; then
+    if [[ ! -f "$SELECT_FILE" ]]; then
+        echo "Selection file not found: $SELECT_FILE" >&2
+        exit 1
+    fi
+    declare -A SELECTED=()
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -n "$line" ]] && SELECTED["$line"]=1
+    done < "$SELECT_FILE"
+    FILTERED=()
+    for f in "${ALL_FILES[@]}"; do
+        if [[ -n "${SELECTED[$f]:-}" ]]; then
+            FILTERED+=("$f")
+            unset "SELECTED[$f]"
+        fi
+    done
+    # Never silently drop a path the selector asked to run.
+    if [[ ${#SELECTED[@]} -gt 0 ]]; then
+        echo "Selection lists paths that are not test files under ${TEST_DIR}:" >&2
+        for f in "${!SELECTED[@]}"; do echo "  ${f}" >&2; done
+        exit 1
+    fi
+    echo "Test selection: ${#FILTERED[@]} of ${#ALL_FILES[@]} test files selected."
+    if [[ ${#FILTERED[@]} -eq 0 ]]; then
+        echo "Selection is empty — writing ${SHARDS} empty shard lists."
+        if [[ $DRY_RUN -eq 0 ]]; then
+            for ((s=0; s < SHARDS; s++)); do
+                : > "${TEST_TYPE}_shard_${s}.list"
+            done
+        fi
+        exit 0
+    fi
+    ALL_FILES=("${FILTERED[@]}")
 fi
 
 # ------------------------------
@@ -120,6 +167,8 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_aiter_addInp.py]=31
     FILE_TIMES[op_tests/test_sampling.py]=31
     FILE_TIMES[op_tests/test_gemm_a4w4.py]=30
+    FILE_TIMES[op_tests/test_gemm_a4w6.py]=12
+    FILE_TIMES[op_tests/test_gemm_a6w4.py]=12
     FILE_TIMES[op_tests/test_flydsl_linear_attention.py]=29
     FILE_TIMES[op_tests/test_gated_rmsnorm_fp8_quant.py]=29
     FILE_TIMES[op_tests/test_aiter_add.py]=28
@@ -170,6 +219,9 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_opus_a8w8_bmm.py]=6
     FILE_TIMES[op_tests/test_pa_mqa_logits_offset.py]=6
     FILE_TIMES[op_tests/test_quant_mxfp6_gemm.py]=6
+    FILE_TIMES[op_tests/tuning_tests/test_config_shape_collision.py]=4
+    FILE_TIMES[op_tests/tuning_tests/test_csv_validation.py]=4
+    FILE_TIMES[op_tests/tuning_tests/test_mixed_mxfp_tuning.py]=4
     FILE_TIMES[op_tests/test_fused_qk_rmsnorm_per_token_quant.py]=5
     FILE_TIMES[op_tests/test_groupnorm.py]=5
     FILE_TIMES[op_tests/test_indexer_k_quant_and_cache.py]=5
@@ -282,6 +334,7 @@ elif [[ "$TEST_TYPE" == "triton" ]]; then
     FILE_TIMES[op_tests/triton_tests/moe/test_moe_routing_herd.py]=14
     FILE_TIMES[op_tests/triton_tests/test_fused_rearrange_sigmoid_gdr.py]=14
     FILE_TIMES[op_tests/triton_tests/attention/test_pa_prefill_sparse.py]=12
+    FILE_TIMES[op_tests/triton_tests/gated_delta_net/test_fused_kda_decode.py]=12
     FILE_TIMES[op_tests/triton_tests/gemm/basic/test_gemm_a16wfp4.py]=12
     FILE_TIMES[op_tests/triton_tests/gemm/basic/test_gemm_a8wfp4.py]=12
     FILE_TIMES[op_tests/triton_tests/chunk_delta_attn/test_fast_launch.py]=10
@@ -305,7 +358,6 @@ elif [[ "$TEST_TYPE" == "triton" ]]; then
     FILE_TIMES[op_tests/triton_tests/torch_compile/test_compile_activation.py]=5
     FILE_TIMES[op_tests/triton_tests/attention/test_sparse_attention_dsv4_bwd.py]=4
     FILE_TIMES[op_tests/triton_tests/fusions/test_fused_rmsnorm_indexed_adaln.py]=4
-    FILE_TIMES[op_tests/triton_tests/test_fused_kda_decode.py]=4
     FILE_TIMES[op_tests/triton_tests/test_softmax.py]=4
     FILE_TIMES[op_tests/triton_tests/torch_compile/test_compile_fused_mul_add.py]=4
     FILE_TIMES[op_tests/triton_tests/torch_compile/test_compile_quant_per_token.py]=4

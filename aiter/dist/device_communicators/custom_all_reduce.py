@@ -454,10 +454,16 @@ class IPCBuffer:
     def uncached(self) -> bool:
         return self._uncached
 
-    def __del__(self):
+    def close(self):
         if (self._uncached or self._raw_cached) and self._raw_ptr:
             self._free_fn(self._raw_ptr)
             self._raw_ptr = 0
+        # Drop the torch.empty backing (default pool) so the caching allocator
+        # can reclaim it without waiting for GC of this object.
+        self._buffer = None
+
+    def __del__(self):
+        self.close()
 
 
 class IPCBufferPool:
@@ -557,6 +563,12 @@ class IPCBufferPool:
         self._buffers[key] = buf
         return buf
 
+    def close(self):
+        """Free all buffers this pool owns (meta + input)."""
+        for buf in self._buffers.values():
+            buf.close()
+        self._buffers = {}
+
     def __getitem__(self, key: str) -> IPCBuffer:
         return self._buffers[key]
 
@@ -587,8 +599,11 @@ class IPCBufferPool:
         if count == 0:
             return
         handle_sz = 64  # sizeof(hipIpcMemHandle_t)
-        handle = torch.empty(count * handle_sz, dtype=torch.uint8)
-        offset = torch.empty(count, dtype=torch.int64)
+        # Host memory regardless of torch's default device: the C side writes
+        # these through plain pointers, and a GPU tensor pickled to a peer is
+        # rebuilt there on this rank's GPU, opening a HIP context on it.
+        handle = torch.empty(count * handle_sz, dtype=torch.uint8, device="cpu")
+        offset = torch.empty(count, dtype=torch.int64, device="cpu")
         self._graph_ipc_meta_fn(ar_ptr, handle.data_ptr(), offset.data_ptr())
         handles, offsets = self._gather_ipc_meta((handle, offset))
         logger.info("Registering %d cuda graph addresses", count)
@@ -602,7 +617,8 @@ class IPCBufferPool:
 
     def _broadcast_ipc(self, data_ptr: int) -> tuple[list, list]:
         """Get IPC handle for *data_ptr* and broadcast across all ranks."""
-        handle = torch.empty(64, dtype=torch.uint8)  # sizeof(hipIpcMemHandle_t)
+        # sizeof(hipIpcMemHandle_t); host memory, as in flush_graph_buffers
+        handle = torch.empty(64, dtype=torch.uint8, device="cpu")
         self._ipc_handle_fn(data_ptr, handle.data_ptr())
         return self._gather_ipc_meta((handle, 0))
 
@@ -2152,6 +2168,11 @@ class CustomAllreduce:
             except (AttributeError, RuntimeError):
                 pass
             self._ptr = 0
+        # Free the meta + input (max_size, up to 1 GB) buffers deterministically
+        # instead of leaving them for GC to reclaim via IPCBuffer.__del__.
+        pool = getattr(self, "_pool", None)
+        if pool is not None and hasattr(pool, "close"):
+            pool.close()
 
     def __del__(self):
         self.close()

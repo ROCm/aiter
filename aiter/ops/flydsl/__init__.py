@@ -40,6 +40,7 @@ _LAZY_IMPORTS = {
         ".kernels.mqa_logits.pa_mqa_logits_fp4_prefill",
         "compute_varqlen_windows",
     ),
+    "flydsl_conv_implicit": (".conv_kernels", "flydsl_conv_implicit"),
     "flydsl_flash_attn_fp8_func": (
         ".kernels.flash_attn_func_fp8_gfx950",
         "flydsl_flash_attn_fp8_func",
@@ -52,6 +53,14 @@ _LAZY_IMPORTS = {
     "flydsl_fp8_mqa_logits": (
         ".fp8_mqa_logits_kernels",
         "flydsl_fp8_mqa_logits",
+    ),
+    "flydsl_fp8_paged_mqa_logits": (
+        ".kernels.mqa_logits.fp8_paged_mqa_logits_gfx950",
+        "flydsl_fp8_paged_mqa_logits",
+    ),
+    "flydsl_fp8_paged_mqa_logits_gfx950": (
+        ".kernels.mqa_logits.fp8_paged_mqa_logits_gfx950",
+        "flydsl_fp8_paged_mqa_logits_gfx950",
     ),
     "flydsl_hgemm": (".gemm_kernels", "flydsl_hgemm"),
     "flydsl_hstu_attention": (
@@ -72,6 +81,15 @@ _LAZY_IMPORTS = {
     "flydsl_pa_mqa_logits_fp4": (
         ".kernels.mqa_logits.pa_mqa_logits_fp4",
         "flydsl_pa_mqa_logits_fp4",
+    ),
+    "flydsl_pa_mqa_logits_fp4_rowgroup": (
+        ".kernels.mqa_logits.pa_mqa_logits_fp4_rowgroup",
+        "flydsl_pa_mqa_logits_fp4_rowgroup",
+    ),
+    "Fp4MqaPlan": (".kernels.mqa_logits.pa_mqa_logits_fp4_rowgroup", "Fp4MqaPlan"),
+    "make_fp4_mqa_plan": (
+        ".kernels.mqa_logits.pa_mqa_logits_fp4_rowgroup",
+        "make_fp4_mqa_plan",
     ),
     "flydsl_pa_mqa_logits_fp4_prefill": (
         ".kernels.mqa_logits.pa_mqa_logits_fp4_prefill",
@@ -107,13 +125,17 @@ _LAZY_IMPORTS = {
 __all__ = [
     "FP8_MQA_LOGITS_DEFAULT_VARIANT",
     "FP8_MQA_LOGITS_VARIANTS",
+    "Fp4MqaPlan",
     "GateMode",
     "QuickAllReduceInt4",
     "compute_varqlen_windows",
+    "flydsl_conv_implicit",
     "flydsl_flash_attn_fp8_func",
     "flydsl_flash_attn_fp8_supported",
     "flydsl_flash_attn_func",
     "flydsl_fp8_mqa_logits",
+    "flydsl_fp8_paged_mqa_logits",
+    "flydsl_fp8_paged_mqa_logits_gfx950",
     "flydsl_hgemm",
     "flydsl_hstu_attention",
     "flydsl_hstu_attention_bwd",
@@ -123,12 +145,14 @@ __all__ = [
     "flydsl_moe_stage2",
     "flydsl_pa_mqa_logits_fp4",
     "flydsl_pa_mqa_logits_fp4_prefill",
+    "flydsl_pa_mqa_logits_fp4_rowgroup",
     "flydsl_pa_mqa_logits_fp4_varqlen",
     "flydsl_preshuffle_gemm_a8",
     "flydsl_qk_norm_rope_quant",
     "gather_kv_b_proj_flydsl",
     "gather_kv_b_proj_flydsl_fp8_supported",
     "gather_kv_b_proj_flydsl_supported",
+    "make_fp4_mqa_plan",
     "pa_decode",
 ]
 

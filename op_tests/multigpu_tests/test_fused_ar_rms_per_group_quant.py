@@ -62,7 +62,6 @@ from aiter.dist.parallel_state import (
 )
 from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
 from aiter.test_common import (
-    benchmark,
     checkAllclose,
     perftest,
 )
@@ -72,6 +71,21 @@ logger = logging.getLogger("aiter")
 set_start_method("spawn", force=True)
 
 FP8_MAX = torch.finfo(torch.float8_e4m3fnuz).max
+
+
+def barrier_before_teardown():
+    """Align all ranks before tearing down the distributed groups.
+
+    Drain this rank's GPU work, then join a barrier so no rank starts freeing
+    IPC buffers / destroying process groups while a peer is still inside a
+    NCCL / custom-all-reduce collective -- that race intermittently hangs when
+    these comm UTs run back-to-back in CI. No-op if dist is uninitialized.
+    """
+    if not dist.is_initialized():
+        return
+    torch.cuda.synchronize()
+    get_tp_group().barrier()
+    torch.cuda.synchronize()
 
 
 def test_group_size_validation_python_check():
@@ -192,20 +206,23 @@ def _per_group_quant_ref(x_bf16: torch.Tensor, group_size: int = 128):
     return x_fp8, scale  # (M, K) fp8, (M, num_groups) f32
 
 
-def fused_ar_rmsnorm_per_group_quant(
-    tp_size,
-    pp_size,
+def _run_per_group_quant_case(
     rankID,
-    x,
-    weight,
+    tp_size,
+    case_idx,
+    shape,
+    dtype,
     eps,
-    group_size=128,
-    withGraph=False,
-    distributed_init_method: str | None = None,
-    emit_bf16: bool = False,
-    transpose_scale: bool = False,
+    group_size,
+    emit_bf16,
+    transpose_scale,
 ):
-    """Run fused AR+RMSNorm+per-group-quant on a single rank.
+    """Run one fused AR+RMSNorm+per-group-quant case on an initialized rank.
+
+    Every rank feeds the same ``x`` (seeded by ``case_idx``), so the reduced
+    sum is ``x * tp_size`` and the reference is ``rms_norm(x * tp_size + x)``
+    (``x`` doubles as the residual). The comparison runs here on the device;
+    only scalars and shape/stride tuples go back to the parent.
 
     When ``emit_bf16=True`` the kernel ALSO writes the pre-quantization
     bf16/fp16 normed output; we cross-check that bf16 output against the
@@ -218,24 +235,18 @@ def fused_ar_rmsnorm_per_group_quant(
     the dequant must still reproduce the reference -- proving the kernel wrote
     each group's scale to the correct transposed slot.
     """
-    device = torch.device(f"cuda:{rankID}")
-    torch.cuda.set_device(device)
-    set_custom_all_reduce(True)
-    init_distributed_environment(
-        world_size=tp_size,
-        rank=rankID,
-        distributed_init_method=distributed_init_method,
-    )
-    ensure_model_parallel_initialized(tp_size, pp_size)
-    x = x.to(device)
-    weight = weight.to(device)
-
-    group = get_tp_group().device_group
-    dist.all_reduce(torch.zeros(1).cuda(), group=group)
-    torch.cuda.synchronize()
-
     from aiter.dist.communication_op import (
         tensor_model_parallel_fused_allreduce_rmsnorm_quant,
+    )
+
+    gen = torch.Generator(device="cuda").manual_seed(case_idx)
+    x = torch.randn(shape, dtype=dtype, device="cuda", generator=gen)
+    weight = torch.randn((shape[1],), dtype=dtype, device="cuda", generator=gen)
+    ref = F.rms_norm(
+        input=x * tp_size + x,
+        normalized_shape=(shape[1],),
+        weight=weight,
+        eps=eps,
     )
 
     @perftest()
@@ -294,78 +305,86 @@ def fused_ar_rmsnorm_per_group_quant(
     if bf16_out is not None:
         bf16_vs_fp8_diff = (bf16_out.float() - dequant).abs().max().item()
 
-    # Capture shape/stride as plain Python tuples before teardown frees the
-    # device tensors.
-    scale_shape = tuple(scale_out.shape)
-    scale_stride = scale_out.stride()
+    msg = (
+        f"test_fused_ar_rmsnorm_per_group_quant: rank={rankID} "
+        f"{shape=} {dtype=} {group_size=} "
+        f"{emit_bf16=} {transpose_scale=} {us:>8.2f}"
+    )
+    err = checkAllclose(ref, dequant.to(dtype), msg=msg, atol=5e-2, rtol=5e-2)
+    return {
+        "us": us,
+        "err": err,
+        "scale_shape": tuple(scale_out.shape),
+        "scale_stride": scale_out.stride(),
+        "bf16_vs_fp8": bf16_vs_fp8_diff,
+    }
+
+
+def fused_ar_rmsnorm_per_group_quant_sweep(
+    tp_size,
+    pp_size,
+    rankID,
+    cases,
+    dtype,
+    eps,
+    distributed_init_method: str | None = None,
+):
+    """Run every case on one rank inside a single distributed init.
+
+    Setting up the TP group dominates a single case (~30 s at TP8 vs.
+    milliseconds of kernel time), so the group is created once and torn down
+    once. Results are returned rather than asserted here: every rank must
+    walk the full case list so the collectives stay aligned across ranks.
+    """
+    device = torch.device(f"cuda:{rankID}")
+    torch.cuda.set_device(device)
+    set_custom_all_reduce(True)
+    init_distributed_environment(
+        world_size=tp_size,
+        rank=rankID,
+        distributed_init_method=distributed_init_method,
+    )
+    ensure_model_parallel_initialized(tp_size, pp_size)
+
+    group = get_tp_group().device_group
+    dist.all_reduce(torch.zeros(1).cuda(), group=group)
+    torch.cuda.synchronize()
+
+    results = [
+        _run_per_group_quant_case(
+            rankID,
+            tp_size,
+            case_idx,
+            case["shape"],
+            dtype,
+            eps,
+            case["group_size"],
+            case["emit_bf16"],
+            case["transpose_scale"],
+        )
+        for case_idx, case in enumerate(cases)
+    ]
 
     if dist.is_initialized():
+        barrier_before_teardown()
         destroy_model_parallel()
         destroy_distributed_environment()
         torch.cuda.empty_cache()
+    return results
 
-    return dequant.to(x.dtype), us, scale_shape, bf16_vs_fp8_diff, scale_stride
 
-
-@benchmark()
-def test_fused_ar_rmsnorm_per_group_quant(
-    tp_size,
-    pp_size,
-    shape,
-    dtype,
-    group_size=128,
-    withGraph=False,
-    distributed_init_method: str | None = None,
-    emit_bf16: bool = False,
-    transpose_scale: bool = False,
-):
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = "49373"
-    pool = Pool(processes=tp_size)
-    n = shape[1]
-    eps = 1e-6
-    weight = torch.randn((n,), dtype=dtype)
-    x = torch.randn(shape, dtype=dtype)
-    ref = x * tp_size
-
-    rets = []
-    cpu_rslt = []
-    for i in range(tp_size):
-        rets.append(
-            pool.apply_async(
-                fused_ar_rmsnorm_per_group_quant,
-                args=(
-                    tp_size,
-                    pp_size,
-                    i,
-                    x,
-                    weight,
-                    eps,
-                    group_size,
-                    withGraph,
-                    distributed_init_method,
-                    emit_bf16,
-                    transpose_scale,
-                ),
-            )
-        )
-    pool.close()
-    pool.join()
-
-    for i in range(tp_size):
-        host_normed = F.rms_norm(
-            input=(ref + x),
-            normalized_shape=(ref.shape[-1],),
-            weight=weight,
-            eps=eps,
-        )
-        cpu_rslt.append(host_normed)
-
-    rets = [el.get() for el in rets]
-    all_us = [us for _, us, _, _, _ in rets]
-    scale_shapes = [ss for _, _, ss, _, _ in rets]
-    bf16_diffs = [bd for _, _, _, bd, _ in rets if bd is not None]
-    scale_strides = [st for _, _, _, _, st in rets]
+def check_per_group_quant_case(tp_size, dtype, case, rank_results):
+    """Assert one case's per-rank results and build its summary row."""
+    shape = case["shape"]
+    group_size = case["group_size"]
+    transpose_scale = case["transpose_scale"]
+    emit_bf16 = case["emit_bf16"]
+    all_us = [r["us"] for r in rank_results]
+    scale_shapes = [r["scale_shape"] for r in rank_results]
+    scale_strides = [r["scale_stride"] for r in rank_results]
+    bf16_diffs = [
+        r["bf16_vs_fp8"] for r in rank_results if r["bf16_vs_fp8"] is not None
+    ]
 
     M, K = shape
     expected_scale_shape = (M, K // group_size)
@@ -377,8 +396,8 @@ def test_fused_ar_rmsnorm_per_group_quant(
     # The fused kernel's scale layout must match what the downstream GEMM (and
     # inductor's re-layout of the op output) expects: column-major stride (1, M)
     # when transpose_scale=True, else row-major stride (num_groups, 1). Combined
-    # with the value-level checkAllclose below, this guarantees each group's
-    # scale landed in the correct slot.
+    # with the value-level checkAllclose on each rank, this guarantees each
+    # group's scale landed in the correct slot.
     num_groups = K // group_size
     expected_stride = (1, M) if transpose_scale else (num_groups, 1)
     for st in scale_strides:
@@ -387,23 +406,7 @@ def test_fused_ar_rmsnorm_per_group_quant(
             f"got {st}, expected {expected_stride}"
         )
 
-    atol = 5e-2
-    rtol = 5e-2
-    max_err = 0.0
-    for dequant_out, us, _, _, _ in rets:
-        msg = (
-            f"test_fused_ar_rmsnorm_per_group_quant: "
-            f"{shape=} {dtype=} {group_size=} {withGraph=} "
-            f"{emit_bf16=} {transpose_scale=} {us:>8.2f}"
-        )
-        err = checkAllclose(
-            cpu_rslt[dequant_out.device.index],
-            dequant_out.to(ref),
-            msg=msg,
-            atol=atol,
-            rtol=rtol,
-        )
-        max_err = max(max_err, err)
+    max_err = max(r["err"] for r in rank_results)
 
     # bf16 side-output correctness: should agree with fp8+scale dequant to
     # within at most one FP8 quantization step (~3% relative).
@@ -415,6 +418,11 @@ def test_fused_ar_rmsnorm_per_group_quant(
         )
 
     return {
+        "tp_size": tp_size,
+        "shape": shape,
+        "dtype": dtype,
+        "group_size": group_size,
+        "withGraph": case["withGraph"],
         "emit_bf16": emit_bf16,
         "transpose_scale": transpose_scale,
         "per_group_min_us": min(all_us),
@@ -422,6 +430,29 @@ def test_fused_ar_rmsnorm_per_group_quant(
         "per_group_err": max_err,
         "bf16_vs_fp8": max_bf16_vs_fp8,
     }
+
+
+def test_fused_ar_rmsnorm_per_group_quant(tp_size, pp_size, dtype, cases):
+    """Run ``cases`` on one TP group and return one summary row per case."""
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = "49373"
+    eps = 1e-6
+    init_method = get_distributed_init_method(get_ip(), get_open_port())
+    with Pool(processes=tp_size) as pool:
+        rets = [
+            pool.apply_async(
+                fused_ar_rmsnorm_per_group_quant_sweep,
+                args=(tp_size, pp_size, rank, cases, dtype, eps, init_method),
+            )
+            for rank in range(tp_size)
+        ]
+        per_rank = [el.get() for el in rets]
+    return [
+        check_per_group_quant_case(
+            tp_size, dtype, case, [results[i] for results in per_rank]
+        )
+        for i, case in enumerate(cases)
+    ]
 
 
 l_dtype = ["bf16"]
@@ -591,40 +622,22 @@ if __name__ == "__main__":
         # but no need to resweep on every shape size
         l_emit_bf16 = [False, True]
 
-    df = []
-    for (
-        dtype,
-        shape,
-        tp,
-        pp,
-        graph_on,
-        gs,
-        emit_bf16,
-        transpose_scale,
-    ) in itertools.product(
-        l_dtype,
-        l_shape,
-        l_tp,
-        l_pp,
-        l_graph,
-        l_group_size,
-        l_emit_bf16,
-        l_transpose_scale,
-    ):
-        ret = test_fused_ar_rmsnorm_per_group_quant(
-            tp,
-            pp,
-            shape,
-            dtype,
-            group_size=gs,
-            withGraph=graph_on,
-            distributed_init_method=get_distributed_init_method(
-                get_ip(), get_open_port()
-            ),
-            emit_bf16=emit_bf16,
-            transpose_scale=transpose_scale,
+    # One TP group per (dtype, tp, pp); every other axis is swept inside it.
+    cases = [
+        {
+            "shape": shape,
+            "withGraph": graph_on,
+            "group_size": gs,
+            "emit_bf16": emit_bf16,
+            "transpose_scale": transpose_scale,
+        }
+        for shape, graph_on, gs, emit_bf16, transpose_scale in itertools.product(
+            l_shape, l_graph, l_group_size, l_emit_bf16, l_transpose_scale
         )
-        df.append(ret)
+    ]
+    df = []
+    for dtype, tp, pp in itertools.product(l_dtype, l_tp, l_pp):
+        df.extend(test_fused_ar_rmsnorm_per_group_quant(tp, pp, dtype, cases))
 
     df = pd.DataFrame(df)
     show_cols = [
