@@ -1293,10 +1293,9 @@ def gemm_a8w8_blockscale_bpreshuffle(
             )
 
     # gfx950 e8m0 has two implementations; the scale layout tells them apart.
-    #   1-D flat -> the caller pre-shuffled with shuffle_scale_blockscale_a/_b
-    #               (128x128) or shuffle_scale_a16w4(., 1, False).flatten()
-    #               (1x32, A rows padded to 32 first), layouts only the mxpsh
-    #               2D GEMM reads. Which of the two is read off their size.
+    #   1-D flat -> the caller pre-shuffled into a 128x128, 1x32 or 32x32 layout
+    #               (see mxscale_preshuffle_kernels' docstring), which only the
+    #               mxpsh 2D GEMM reads. Which one is read off their size.
     #   2-D raw  -> the batched-B=1 path, which also covers group32 (1x32).
     if (
         get_gfx() == "gfx950"
@@ -1331,7 +1330,8 @@ def gemm_a8w8_blockscale_bpreshuffle(
                 raise RuntimeError(
                     f"gemm_a8w8_blockscale_bpreshuffle: no legal gfx950 MX tile "
                     f"for M={m}, N={n}, K={k} at w_scale_block {w_scale_block} "
-                    f"(needs N%{b_rows}==0 and K%128==0)"
+                    f"(needs N%{b_rows}==0 and K%128==0, or K%128==64 with a "
+                    f"32-wide w_scale_block)"
                 )
             _warn_untuned_flydsl_fallback(
                 "gfx950", "gemm_a8w8_blockscale_bpreshuffle", n, k

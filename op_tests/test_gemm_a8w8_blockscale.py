@@ -31,9 +31,10 @@ from aiter.test_common import benchmark, checkAllclose, perftest
 from aiter.utility import fp4_utils
 
 block_shape = (128, 128)
-# The gfx950 FlyDSL mxpsh GEMM reads either block; --w_scale_block switches
-# block_shape, which every scale shape and the reference dequant follow.
-W_SCALE_BLOCKS = {"128x128": (128, 128), "1x32": (1, 32)}
+# The gfx950 FlyDSL mxpsh GEMM reads any of these blocks; --w_scale_block switches
+# block_shape, which every scale shape and the reference dequant follow. Both
+# non-128x128 blocks quantize A per 1x32 (x_scale (M, K//32)).
+W_SCALE_BLOCKS = {"128x128": (128, 128), "1x32": (1, 32), "32x32": (32, 32)}
 TEST_NUM_ITERS = 100
 
 
@@ -162,14 +163,19 @@ def test_gemm(
     x_scale_t = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
     gemm_weight = shuffle_weight(weight, layout=(16, 16)) if ck_preshuffle else weight
     if use_flydsl_fp8_scale and get_gfx() == "gfx950":
-        if block_shape == W_SCALE_BLOCKS["1x32"]:
+        if block_shape in (W_SCALE_BLOCKS["1x32"], W_SCALE_BLOCKS["32x32"]):
             x_scale_mx = x_scale
             if m % 32:  # pad to a whole 32-row super-block (0x7F = E8M0 1.0)
                 x_scale_mx = F.pad(
                     x_scale.view(torch.uint8), (0, 0, 0, -m % 32), value=0x7F
                 ).view(dtypes.fp8_e8m0)
             gemm_x_scale = shuffle_scale_a16w4(x_scale_mx, 1, False).flatten()
-            gemm_w_scale = shuffle_scale_a16w4(w_scale, 1, False).flatten()
+            if block_shape == W_SCALE_BLOCKS["32x32"]:
+                gemm_w_scale = shuffle_scale_blockscale_b(
+                    w_scale, n, k, block_n=32, block_k=32
+                )
+            else:
+                gemm_w_scale = shuffle_scale_a16w4(w_scale, 1, False).flatten()
         else:
             gemm_x_scale = shuffle_scale_blockscale_a(x_scale, k)
             gemm_w_scale = shuffle_scale_blockscale_b(w_scale, n, k)
@@ -441,7 +447,8 @@ parser.add_argument(
     default="128x128",
     help="""e8m0 weight-scale block of the FlyDSL mxpsh path (gfx950).
     "1x32" is the MX microscale format (x_scale (M, K//32), w_scale (N, K//32));
-    requires --flydsl --ck_preshuffle True.""",
+    "32x32" keeps that x_scale with w_scale (N//32, K//32) (DeepSeek-V4.1).
+    Both require --flydsl --ck_preshuffle True.""",
 )
 parser.add_argument(
     "--apre",

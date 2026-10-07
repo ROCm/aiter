@@ -28,15 +28,18 @@ _SHORT_DTYPE = {v: k for k, v in _DTYPE_SHORT.items()}
 class WScaleBlock(NamedTuple):
     """What one e8m0 w_scale block means to this kernel.
 
-    ``bs_a`` / ``bs_b``: the scale broadcasts over A's K lanes / over B's N
-    block, i.e. the kernel's ``_bs_a`` / ``_bs_b``. ``dw_a`` / ``dw_b``: the
-    A / B scale dwords it then reads per 32-row super-block and 256-K chunk
-    (``_sc_k0_a`` / ``_sc_k0_b``). ``b_rows``: the N one B scale super-row spans
-    (``_b_sc_rows``), which is also the N granularity a shape must meet.
+    ``bs_a``: the A scale broadcasts over A's K lanes (one per 128 K).
+    ``bs_b`` / ``bs_bk``: the B scale broadcasts over B's N lanes (one per
+    ``b_rows`` N) / also over its K lanes (one per 128 K), i.e. the kernel's
+    ``_bs_b`` / ``_bs_bk``. ``dw_a`` / ``dw_b``: the A / B scale dwords it then
+    reads per 32-row super-block and 256-K chunk (``_sc_k0_a`` / ``_sc_k0_b``).
+    ``b_rows``: the N one B scale super-row spans (``_b_sc_rows``), which is
+    also the N granularity a shape must meet.
     """
 
     bs_a: bool
     bs_b: bool
+    bs_bk: bool
     dw_a: int
     dw_b: int
     b_rows: int
@@ -44,10 +47,17 @@ class WScaleBlock(NamedTuple):
 
 # The blocks the kernel reads, and the one string that names each of them all the
 # way down: the tuned table's column, the op's argument, the kernel's Constexpr
-# and the GPU symbol suffix. Supporting a new block (32x32 is next) is one row.
+# and the GPU symbol suffix. Supporting a new block is one row.
 W_SCALE_BLOCKS = {
-    "128x128": WScaleBlock(bs_a=True, bs_b=True, dw_a=16, dw_b=1, b_rows=128),
-    "1x32": WScaleBlock(bs_a=False, bs_b=False, dw_a=64, dw_b=64, b_rows=32),
+    "128x128": WScaleBlock(
+        bs_a=True, bs_b=True, bs_bk=True, dw_a=16, dw_b=1, b_rows=128
+    ),
+    "1x32": WScaleBlock(
+        bs_a=False, bs_b=False, bs_bk=False, dw_a=64, dw_b=64, b_rows=32
+    ),
+    "32x32": WScaleBlock(
+        bs_a=False, bs_b=True, bs_bk=False, dw_a=64, dw_b=4, b_rows=32
+    ),
 }
 DEFAULT_W_SCALE_BLOCK = "128x128"
 
@@ -225,13 +235,32 @@ def instance_valid(ki: kernelInstance) -> bool:
     return not estimated_lds_bytes(ki) > _max_lds_bytes()
 
 
+def half_step_k_ok(
+    K: int, a_dtype: str, b_dtype: str, tile_k: int, split_k: int, w_scale_block: str
+) -> bool:
+    """Whether a K of 64 mod 128 can run: it ends in a half MFMA step whose
+    upper 64 K the kernel zeroes in A. That needs 32-wide scales (a 128-wide
+    one cannot divide K), fp8 A/B (fp4/fp6 A has no 64-K halves to drop), and
+    one tile_k=128 split, so the half step is the last tile of the only split
+    and every split still covers whole 256-K scale chunks."""
+    return (
+        K % 128 == 64
+        and not W_SCALE_BLOCKS[w_scale_block].bs_a
+        and (a_dtype, b_dtype) == ("fp8", "fp8")
+        and tile_k == 128
+        and split_k == 1
+    )
+
+
 def fits_shape(ki: kernelInstance, M: int, N: int, K: int, w_scale_block: str) -> bool:
     blk = W_SCALE_BLOCKS.get(w_scale_block)
     if blk is None:
         raise ValueError(
             f"w_scale_block {w_scale_block!r} is not one of {sorted(W_SCALE_BLOCKS)}"
         )
-    if K % 128 != 0:
+    if K % 128 != 0 and not half_step_k_ok(
+        K, ki.a_dtype, ki.b_dtype, ki.tile_k, ki.split_k, w_scale_block
+    ):
         return False
     if ki.tile_m == 16 and M > 16:
         return False
@@ -239,7 +268,7 @@ def fits_shape(ki: kernelInstance, M: int, N: int, K: int, w_scale_block: str) -
         return False
     if N % blk.b_rows != 0:
         return False
-    if (N % ki.tile_n != 0) or (K % ki.tile_k != 0):
+    if (N % ki.tile_n != 0) or (K % 128 == 0 and K % ki.tile_k != 0):
         return False
     if ki.split_k > 1:
         k_per_split = K // ki.split_k

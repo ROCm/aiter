@@ -7,9 +7,11 @@ Operand convention (all preshuffling is caller-side, as for the weight itself):
     A       : [M, K]   row-major, NOT preshuffled  (fp8/fp6 = 1 byte/code, fp4 = 2 codes/byte)
     B       : preshuffled via aiter.ops.shuffle.shuffle_weight(., (16, 16))  (fp4 or fp8 weight)
     a_scale : blockscale -> aiter.ops.shuffle.shuffle_scale_blockscale_a(a_1x128, K)
-              MX 1x32    -> aiter.ops.shuffle.shuffle_scale_a16w4(a_1x32, 1, False)
+              1x32/32x32 -> aiter.ops.shuffle.shuffle_scale_a16w4(a_1x32, 1, False)
     b_scale : blockscale -> aiter.ops.shuffle.shuffle_scale_blockscale_b(b_128x128, N, K)
               MX 1x32    -> aiter.ops.shuffle.shuffle_scale_a16w4(b_1x32, 1, False)
+              32x32      -> aiter.ops.shuffle.shuffle_scale_blockscale_b(
+                                b_32x32, N, K, block_n=32, block_k=32)
     Out     : [M, N]   bf16 / fp16
 
 ``shuffle_scale_blockscale_a`` takes the LOGICAL ``(M, K//128)`` scale, not the
@@ -33,6 +35,7 @@ import torch
 from .gemm_tune.flydsl_gemm_mxscale_preshuffle_common import (
     DEFAULT_W_SCALE_BLOCK,
     W_SCALE_BLOCKS,
+    half_step_k_ok,
 )
 
 _OUT_DTYPE_STR = {torch.bfloat16: "bf16", torch.float16: "fp16"}
@@ -55,8 +58,8 @@ def mxpsh_scale_elems(M: int, N: int, K: int, w_scale_block: str) -> tuple[int, 
 def mxpsh_w_scale_block(M: int, N: int, K: int, x_scale, w_scale) -> str:
     """Which scale contract a pair of flat buffers spells, by element count.
 
-    Returns the tuned table's ``w_scale_block`` ("128x128" or "1x32"). Raises
-    when neither matches -- a mis-sized buffer must not pick the other layout
+    Returns the tuned table's ``w_scale_block`` (a :data:`W_SCALE_BLOCKS` key).
+    Raises when none matches -- a mis-sized buffer must not pick another layout
     and read garbage.
     """
     got = (int(x_scale.numel()), int(w_scale.numel()))
@@ -68,8 +71,7 @@ def mxpsh_w_scale_block(M: int, N: int, K: int, x_scale, w_scale) -> str:
         f"[FlyDSL gfx950 mxpsh] (x_scale, w_scale) of {got} elements at "
         f"M={M} N={N} K={K} is neither "
         + " nor ".join(f"{block} {elems}" for block, elems in want.items())
-        + ". Prepare them with aiter.ops.shuffle.shuffle_scale_blockscale_a/_b "
-        "(128x128) or shuffle_scale_a16w4 (1x32)."
+        + ". This module's docstring spells the shuffle for each block."
     )
 
 
@@ -148,6 +150,9 @@ def flydsl_mxscale_preshuffle_gemm(
       and flattened. This is the MX format the scaled MFMA consumes natively, so
       the shuffle is the MoE weight-scale one; N only needs %32. fp4/fp6 operands
       (a4w4 / a6w4) always take this block.
+    * "32x32": a_scale is the per-1x32 one above; b_scale is 32x32 E8M0
+      [N//32, K//32] through aiter.ops.shuffle.shuffle_scale_blockscale_b(.,
+      block_n=32, block_k=32). a8w8-only, N%32==0.
 
     Either way the op does NOT repack -- the caller pre-shuffles. For blockscale the
     kernel broadcasts to the 1x32 scaled-MFMA via the scale load address. Prepare the
@@ -170,12 +175,6 @@ def flydsl_mxscale_preshuffle_gemm(
     N = int(Out.shape[-1])
     if N % int(tile_n) != 0:
         raise ValueError(f"N ({N}) is not a multiple of tile_n ({tile_n})")
-    if K % int(tile_k) != 0:
-        raise ValueError(f"K ({K}) is not a multiple of tile_k ({tile_k})")
-    if K % 128 != 0:
-        raise ValueError(
-            f"K ({K}) must be a multiple of 128 for MXFP microscale; got {K}"
-        )
     out_dtype = _OUT_DTYPE_STR.get(Out.dtype)
     if out_dtype is None:
         raise ValueError(
@@ -200,6 +199,17 @@ def flydsl_mxscale_preshuffle_gemm(
             f"w_scale_block {w_scale_block} indexes B scales by {blk.b_rows}-N "
             f"super-row; N ({N}) must be a multiple of {blk.b_rows}"
         )
+    if K % 128 != 0:
+        if not half_step_k_ok(
+            K, a_dtype, b_dtype, int(tile_k), int(split_k), w_scale_block
+        ):
+            raise ValueError(
+                f"K ({K}) must be a multiple of 128, or 64 mod 128 with fp8 A/B, a "
+                f"32-wide scale block, tile_k=128 and split_k=1; got "
+                f"w_scale_block={w_scale_block} tile_k={tile_k} split_k={split_k}"
+            )
+    elif K % int(tile_k) != 0:
+        raise ValueError(f"K ({K}) is not a multiple of tile_k ({tile_k})")
     # a_scale/b_scale are already compact-shuffled by the caller. No repack here.
     split_k = int(split_k)
     # For the latency-sensitive M<=16 path, keep the split partials in BF16 and
@@ -398,12 +408,11 @@ def run_gemm_a8w8_mxscale_preshuffle_gfx950(
     ``x_scale`` / ``w_scale`` must ALREADY be shuffled -- caller-side prep,
     exactly like ``shuffle_weight`` for B. B's scale is a weight, so it is shuffled
     once at weight-prep time; A's is an activation, so it is shuffled per call
-    alongside quantization. Both are flat fp8_e8m0 buffers, either
-    ``shuffle_scale_blockscale_a`` / ``_b`` (coarse 1x128 / 128x128) or
-    ``shuffle_scale_a16w4(., 1, False)`` (per-1x32 MX, see the module docstring).
+    alongside quantization. Both are flat fp8_e8m0 buffers in one of the
+    :data:`W_SCALE_BLOCKS` layouts; the module docstring spells each shuffle.
 
-    ``w_scale_block`` names which of the two, as the tuned table spells it;
-    None reads it off the buffer sizes, which the two layouts never share.
+    ``w_scale_block`` names which one, as the tuned table spells it; None reads
+    it off the buffer sizes, which no two layouts share.
     """
     from .gemm_tune.flydsl_gemm_mxscale_preshuffle_common import parse_kernel_name
 

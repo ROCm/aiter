@@ -239,11 +239,17 @@ def _mxpsh_shuffle_mx_b(b_scale, N, K):
     return shuffle_scale_a16w4(b_scale, 1, False).flatten()
 
 
+def _mxpsh_shuffle_32x32_b(b_scale, N, K):
+    """32x32 B scale -> the flat mxpsh buffer (A takes the 1x32 one)."""
+    return shuffle_scale_blockscale_b(b_scale, N, K, block_n=32, block_k=32)
+
+
 # Per w_scale_block: how this op's caller shuffles the A / B scale. One row per
 # block the kernel supports, same keys as W_SCALE_BLOCKS.
 _SCALE_SHUFFLE = {
     "128x128": (shuffle_scale_blockscale_a, shuffle_scale_blockscale_b),
     "1x32": (_mxpsh_shuffle_mx_a, _mxpsh_shuffle_mx_b),
+    "32x32": (_mxpsh_shuffle_mx_a, _mxpsh_shuffle_32x32_b),
 }
 
 
