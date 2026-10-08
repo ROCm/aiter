@@ -80,6 +80,24 @@ class TestMxfp4MoeAuxCatalog(unittest.TestCase):
             lookup_names = re.findall(r'\{"([^"]+)", &[^}]+\}', lookup)
             self.assertEqual(len(lookup_names), len(names))
             self.assertEqual(set(lookup_names), names)
+            aux = load_aux_module()
+            generated_scatter_keys = {
+                (int(match[1]), int(match[2]))
+                for name in names
+                if (match := re.fullmatch(r"aux_scatter_H(\d+)_TOPK(\d+)_NT1", name))
+            }
+            hidden_axes = {
+                1024,
+                *(shape[1] for shape in aux.MXFP4_MOE_SUPPORTED_SHAPES),
+            }
+            topk_axes = {2, *(shape[3] for shape in aux.MXFP4_MOE_SUPPORTED_SHAPES)}
+            supported_scatter_keys = {
+                (hidden, topk)
+                for hidden in hidden_axes
+                for topk in topk_axes
+                if aux.is_mxfp4_moe_scatter_supported(hidden, topk)
+            }
+            self.assertEqual(supported_scatter_keys, generated_scatter_keys)
             for expert, hidden, _inter, topk in MODEL_SHAPES:
                 for operation in ("sortonly", "sortzi"):
                     key = f"aux_{operation}_NE{expert}_TOPK{topk}_MB16_H{hidden}"
