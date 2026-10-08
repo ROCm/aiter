@@ -161,10 +161,19 @@ def use_2d_kernel(params: _UAParams, backend: str = "triton"):
     if params.head_size >= 512 and not get_arch().is_rdna and not params.all_decode:
         return True
 
+    gate = params.target_num_prgms
+    if DEVICE_ARCH == "gfx1100":
+        # On gfx1100 the 3D split-KV kernel only pays off while the 2D launch
+        # is too small to fill the machine; past that the extra segment traffic
+        # and the reduce pass cost more than the added parallelism. The
+        # measured crossover is cu_count / 4, and target_num_prgms is
+        # cu_count * 4, hence the // 16.
+        gate = params.target_num_prgms // 16
+
     return (
         (params.sliding_window > 0)
         or (params.max_seqlen_k <= 512)
-        or (params.num_2d_prgms > params.target_num_prgms)
+        or (params.num_2d_prgms > gate)
     )
 
 
