@@ -193,7 +193,7 @@ class TestJitCacheTransaction(unittest.TestCase):
             command = (
                 r'"C:\Work Tree\generator.py" --extra_kids 7 9 '
                 r'--filter=" @ " --config "C:\Program Files\Aiter\config.json" '
-                r'--output_dir {}'
+                r"--output_dir {}"
             )
 
             def run(args, check):
@@ -1531,7 +1531,6 @@ class TestCppExtensionControl(unittest.TestCase):
         ):
             self.assertEqual(self.namespace["_get_num_workers"](verbose=False), 25)
 
-
     def compile(self, **options):
         self.namespace["_jit_compile"](
             name="module",
@@ -1647,7 +1646,6 @@ class TestNinjaWorkerLimit(unittest.TestCase):
                 ), mock.patch.object(os, "cpu_count", return_value=32):
                     self.namespace["check_and_set_ninja_worker"]()
                     self.assertEqual(os.environ["MAX_JOBS"], "8")
-
 
 
 @unittest.skipUnless(importlib.util.find_spec("pandas"), "Opus codegen requires pandas")

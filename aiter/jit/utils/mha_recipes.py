@@ -44,7 +44,11 @@ def _apply_ck_mha_prebuild_target_policy(build_args: list[dict], gfxs: list[str]
                 continue
             if mode == "batch_prefill" and not batch_prefill_supported:
                 continue
-            if mode in ("fwd", "fwd_splitkv") and targets_flag and "--targets" not in parts:
+            if (
+                mode in ("fwd", "fwd_splitkv")
+                and targets_flag
+                and "--targets" not in parts
+            ):
                 command += targets_flag
             filtered.append(command)
 
@@ -54,9 +58,9 @@ def _apply_ck_mha_prebuild_target_policy(build_args: list[dict], gfxs: list[str]
             adjusted_build["srcs"] = [
                 source
                 for source in build.get("srcs", [])
-                if not source.replace("\\", "/").rstrip("'\"").endswith(
-                    "/cpp_itfs/mha_fwd_batch_prefill.cu"
-                )
+                if not source.replace("\\", "/")
+                .rstrip("'\"")
+                .endswith("/cpp_itfs/mha_fwd_batch_prefill.cu")
             ]
         adjusted.append(adjusted_build)
 

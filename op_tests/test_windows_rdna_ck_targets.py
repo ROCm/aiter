@@ -21,7 +21,6 @@ from aiter.jit.utils.mha_recipes import (
     _require_ck_batch_prefill_targets,
 )
 
-
 WINDOWS_RDNA_TARGETS = {
     "gfx1100": 96,
     "gfx1101": 60,
@@ -45,7 +44,9 @@ class TestWindowsRDNACKTargets(unittest.TestCase):
     def test_ck_codegen_receives_rdna_target(self):
         for gfx in WINDOWS_RDNA_TARGETS:
             with self.subTest(gfx=gfx):
-                self.assertEqual(_ck_targets_flag_for_arches([gfx]), f" --targets {gfx}")
+                self.assertEqual(
+                    _ck_targets_flag_for_arches([gfx]), f" --targets {gfx}"
+                )
 
     def test_ck_codegen_receives_every_build_arch(self):
         self.assertEqual(
@@ -63,7 +64,9 @@ class TestWindowsRDNACKTargets(unittest.TestCase):
             _require_ck_batch_prefill_targets(["gfx942", "gfx1100", "gfx1151"])
 
     def test_static_prebuild_recipes_use_targets_and_skip_rdna_batch_prefill(self):
-        config_path = Path(__file__).parents[1] / "aiter" / "jit" / "optCompilerConfig.json"
+        config_path = (
+            Path(__file__).parents[1] / "aiter" / "jit" / "optCompilerConfig.json"
+        )
         with config_path.open(encoding="utf-8") as config_file:
             config = json.load(config_file)
         names = (
@@ -97,9 +100,9 @@ class TestWindowsRDNACKTargets(unittest.TestCase):
                 )
                 self.assertFalse(
                     any(
-                        source.replace("\\", "/").rstrip("'\"").endswith(
-                            "/cpp_itfs/mha_fwd_batch_prefill.cu"
-                        )
+                        source.replace("\\", "/")
+                        .rstrip("'\"")
+                        .endswith("/cpp_itfs/mha_fwd_batch_prefill.cu")
                         for source in by_name["libmha_fwd"]["srcs"]
                     )
                 )
@@ -116,9 +119,7 @@ class TestWindowsRDNACKTargets(unittest.TestCase):
                 gfx9_recipes[name]["blob_gen_cmd"],
                 static_by_name[name]["blob_gen_cmd"],
             )
-            self.assertEqual(
-                gfx9_recipes[name]["srcs"], static_by_name[name]["srcs"]
-            )
+            self.assertEqual(gfx9_recipes[name]["srcs"], static_by_name[name]["srcs"])
 
     def test_cdna_and_gfx1250_processor_counts_are_not_doubled(self):
         for gfx, processor_count in (

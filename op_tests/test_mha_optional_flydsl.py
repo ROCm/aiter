@@ -9,7 +9,6 @@ from typing import Any
 
 import pytest
 
-
 MHA_PATH = Path(__file__).resolve().parents[1] / "aiter" / "ops" / "mha.py"
 
 
@@ -196,18 +195,21 @@ def test_varlen_descales_bypass_flydsl_and_reach_ck(available):
         flydsl=unavailable,
         ck=result,
     )
-    assert function(
-        q,
-        k,
-        v,
-        object(),
-        object(),
-        2,
-        2,
-        q_descale=scales[0],
-        k_descale=scales[1],
-        v_descale=scales[2],
-    ) is result
+    assert (
+        function(
+            q,
+            k,
+            v,
+            object(),
+            object(),
+            2,
+            2,
+            q_descale=scales[0],
+            k_descale=scales[1],
+            v_descale=scales[2],
+        )
+        is result
+    )
     assert all(module != "flydsl.fmha_kernels" for module, _level in imports)
     assert function.__globals__["_ck_calls"][0][-3:] == scales
 

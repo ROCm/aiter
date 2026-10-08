@@ -3859,7 +3859,11 @@ def flash_attn_varlen_func(
     # the path so a sink-token request is never silently dropped.
     # FlyDSL also does not consume precomputed Q/K/V descales, so keep
     # prequantized FP8 attention on the CK path.
-    if _FLYDSL_AVAILABLE and not has_all_descales and (len(window_size) < 3 or window_size[2] == 0):
+    if (
+        _FLYDSL_AVAILABLE
+        and not has_all_descales
+        and (len(window_size) < 3 or window_size[2] == 0)
+    ):
         from .flydsl.fmha_kernels import flydsl_flash_attn_varlen_func
 
         _flydsl_result = flydsl_flash_attn_varlen_func(

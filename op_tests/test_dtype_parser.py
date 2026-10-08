@@ -8,8 +8,7 @@ import textwrap
 
 
 def test_str2dtype_base_types_do_not_import_native_enum():
-    script = textwrap.dedent(
-        """
+    script = textwrap.dedent("""
         import builtins
         import torch
 
@@ -27,8 +26,7 @@ def test_str2dtype_base_types_do_not_import_native_enum():
         assert str2Dtype("none") is None
         assert str2Dtype("fp16,bf16,") == (torch.float16, torch.bfloat16)
         assert str2Dtype("fp16,") == (torch.float16,)
-        """
-    )
+        """)
     env = os.environ.copy()
     env["AITER_TRITON_ONLY"] = "1"
     subprocess.run([sys.executable, "-c", script], check=True, env=env)
