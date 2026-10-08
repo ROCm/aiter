@@ -115,12 +115,14 @@ class PaGluonProcessLimitTest(unittest.TestCase):
         self.assertEqual(tensor.call_args.kwargs["device"], "cuda:2")
 
     @patch.object(cpp_itfs_utils, "get_worker_count_for", return_value=1)
-    def test_nested_make_uses_one_job(self, worker_count):
-        self.assertEqual(
-            cpp_itfs_utils._make_build_command(3),
-            ["make", "build", "-j1"],
-        )
-        worker_count.assert_called_once_with(3)
+    def test_nested_build_uses_one_job_on_both_platforms(self, worker_count):
+        for windows, command in ((False, ["make", "build"]), (True, ["ninja"])):
+            with (
+                self.subTest(windows=windows),
+                patch.object(cpp_itfs_utils, "IS_WINDOWS", windows),
+            ):
+                self.assertEqual(cpp_itfs_utils._build_command(3), [*command, "-j1"])
+        self.assertEqual(worker_count.call_args_list, [call(3), call(3)])
 
 
 if __name__ == "__main__":
