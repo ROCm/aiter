@@ -5,7 +5,6 @@
 
 Replaces ATOM's `_decode_index_score_tiled_kernel`. For each request b, each
 128-token page p, and each (query row, index head) pair, produce
-
     score[head, row, p] = max over t in [0,128) of
                               dot(K[page, t, :], Q[row, head, :]) * scale
 
@@ -16,40 +15,30 @@ Layout
 The MFMA tile is 16x16xK with A = K (M = token) and B = Q (N = feature), which
 is what makes the page reduction cheap: with lane = tid % 64, g = lane // 16
 and u = lane % 16,
-
     A operand[v] = A[u, 8*g + v]     v = 0..7     A = K, M = token
     B operand[v] = B[u, 8*g + v]     v = 0..7     B = Q, N = feature
     C accum[r]   = C[4*g + r, u]     r = 0..3
 
 so a lane holds tokens {4g+r} at feature u. The 128-token max is therefore a
 register-local elementwise max, and only the final fold across g needs two
-shuffle_xor steps. In the default config there is no LDS and no barrier at all.
+shuffle_xor steps; in the default config there is no LDS and no barrier at all.
 A 32x32 tile would spread the reduced axis across lanes instead and need DPP,
-permlane and LDS to close it.
-
-Tunables are `IndexScoreConfig`; `resolve_config` fills in the automatic ones
-and is the only place that decides between them.
+permlane and LDS to close it. Tunables are `IndexScoreConfig`, resolved in
+`resolve_config` and nowhere else.
 
 gfx942 (CDNA3) alongside gfx950 (CDNA4)
 ---------------------------------------
-Three things differ between the generations, and ArchTraits carries all of
-them as compile-time constants:
-
-  1. `mfma_f32_16x16x32_bf16` is gfx950+. gfx942's widest 16x16 bf16 tile is
-     `mfma_f32_16x16x16bf16_1k`, so `ksteps` doubles to 8 and each lane's
-     MFMA fragment halves to 4 bf16.
-  2. The fp8 path widens K to bf16 with `v_cvt_scalef32_pk_bf16_fp8`, which is
-     CDNA4. gfx942 goes through `v_cvt_pk_f32_fp8` and then to bf16. The
-     detour is exact -- e4m3's 3 mantissa and 4 exponent bits both fit bf16 --
-     so it costs instructions, not accuracy.
-  3. gfx942's fp8 is `e4m3fnuz` (bias 8, no inf) against gfx950's OCP
-     `e4m3fn` (bias 7). Each chip's conversion instruction speaks its own
-     chip's format, and `dtypes.fp8` names which that is, so nothing here
-     reinterprets one as the other.
-
-The invariant that makes this one kernel rather than two is in `ArchTraits`.
-A gfx942 binary has never been run on gfx942 silicon; see the module's tests
-for what is and is not covered.
+Three things differ, and ArchTraits carries all of them as compile-time
+constants. `mfma_f32_16x16x32_bf16` is gfx950+, so gfx942 takes
+`mfma_f32_16x16x16bf16_1k`, `ksteps` doubles to 8 and the MFMA fragment halves
+to 4 bf16. The fp8 path widens K with CDNA4's `v_cvt_scalef32_pk_bf16_fp8`,
+where gfx942 goes through `v_cvt_pk_f32_fp8` -- exact, since e4m3's 3 mantissa
+and 4 exponent bits both fit bf16, so it costs instructions and not accuracy.
+And gfx942's fp8 is `e4m3fnuz` (bias 8, no inf) against gfx950's OCP `e4m3fn`
+(bias 7): each chip's conversion instruction speaks its own chip's format and
+`dtypes.fp8` names which that is, so nothing here reinterprets one as the
+other. A gfx942 binary has never been run on gfx942 silicon; see the tests for
+what is and is not covered.
 """
 
 import math
@@ -61,9 +50,9 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
 
-# The 8-bit float this chip speaks: OCP e4m3fn on gfx950, e4m3fnuz on gfx942.
-# They are not relabelings of each other, so the dtype, the widening
-# instruction and the MFMA all have to agree on which one it is.
+# The 8-bit float this chip speaks. gfx950's e4m3fn and gfx942's e4m3fnuz are
+# not relabelings of each other, so the dtype, the widening instruction and the
+# MFMA all have to agree on which one it is.
 from aiter import dtypes
 from aiter.ops.flydsl.kernels.tensor_shim import (
     _run_compiled,
@@ -83,18 +72,15 @@ TOK_TILES = PAGE // MFMA_M  # 8 token tiles per page
 LOG2E = 1.4426950409
 NEG_INF = float("-inf")
 
-# The widest 16x16 bf16 MFMA each supported generation has. This single number
-# is the whole ISA difference the kernel body sees; ArchTraits derives the
-# rest, and `k_loads`, `chunk_elems` and the shuffled layout come out the same
-# on both -- see ArchTraits for why that is not a coincidence.
+# The widest 16x16 bf16 MFMA each supported generation has -- the whole ISA
+# difference the kernel body sees. ArchTraits derives the rest.
 _MFMA_K_BY_ARCH = {"gfx950": 32, "gfx942": 16}
 SUPPORTED_ARCHS = tuple(_MFMA_K_BY_ARCH)
 DEFAULT_ARCH = "gfx950"
 
 # Every K and Q access is one 16 B dwordx4; the element counts below follow.
 ACCESS_BYTES = 16
-# The four lane groups g = lane // 16 tile the k axis of one access block, so a
-# lane holds mfma_k // LANE_GROUPS of the k axis per k-step.
+# The four lane groups g = lane // 16 tile the k axis of one access block.
 LANE_GROUPS = 4
 
 
@@ -102,29 +88,21 @@ LANE_GROUPS = 4
 class ArchTraits:
     """Compile-time constants for one (architecture, cache dtype) pair.
 
-    All of it is derived from `mfma_k`, the k of this generation's 16x16 bf16
-    MFMA: 32 on gfx950 (CDNA4's `mfma_f32_16x16x32_bf16`) and 16 on gfx942
-    (CDNA3's `mfma_f32_16x16x16bf16_1k`).
-
-    A lane holds `lane_k = mfma_k // 4` of the k axis per k-step, so one k-step
-    is `lane_k * elem_bytes` bytes of cache and a 16 B access covers
-    `k_per_load` whole k-steps. Those are packed contiguously per lane by the
-    k-axis permutation below, which is why this stays one dwordx4 everywhere:
-
+    All derived from `mfma_k`, the k of this generation's 16x16 bf16 MFMA: 32
+    on gfx950, 16 on gfx942. A lane holds `lane_k = mfma_k // 4` of the k axis
+    per k-step, and a 16 B access covers `k_per_load` whole k-steps, packed
+    contiguously per lane by the k-axis permutation
         k_offset(ks, g) = (ks // k_per_load) * block_k     # which access block
                         + g * lane_block                   # which lane group
                         + (ks % k_per_load) * lane_k       # which k-step in it
-
-    This permutes the k axis, and A and B are both indexed through it, so the
-    dot product's sum is reordered and not otherwise changed. Q's layout is
-    ours to choose and K's is the shuffled layout's contract, so both follow it.
-
-    The consequence worth stating, because it is what makes gfx942 a small
-    change: `block_k` and `lane_block` depend on `mfma_k * k_per_load` and
-    `lane_k * k_per_load`, and both products are invariant -- halving mfma_k
-    doubles k_per_load. So K's addressing, `k_loads`, `chunk_elems`, `q_loads`
-    and the entire shuffled layout are *identical* across the two generations.
-    Only `ksteps` (the MFMA loop count) and `lane_k` (the fragment width) move.
+    which is why this stays one dwordx4 everywhere. A and B are both indexed
+    through it, so the dot's sum is reordered and not otherwise changed; Q's
+    layout is ours to choose and K's is the shuffled layout's contract.
+    `block_k` and `lane_block` depend on the products `mfma_k * k_per_load` and
+    `lane_k * k_per_load`, and halving mfma_k doubles k_per_load, so K's
+    addressing, `k_loads`, `chunk_elems`, `q_loads` and the whole shuffled
+    layout are *identical* across the generations -- only `ksteps` and `lane_k`
+    move.
     """
 
     arch: str
@@ -139,17 +117,15 @@ class ArchTraits:
     q_loads: int  # 16 B Q accesses per feature tile
     block_k: int  # k positions one access block spans, over all four lane groups
     lane_block: int  # k positions one lane group takes inside that block
-    # CDNA4 widens fp8 straight to bf16 (`v_cvt_scalef32_pk_bf16_fp8`); CDNA3
-    # has to go via f32 (`v_cvt_pk_f32_fp8`). The detour is exact, so this
-    # costs instructions and not accuracy -- see convert_k.
+    # CDNA4 widens fp8 straight to bf16; CDNA3 goes via f32, exactly. See
+    # convert_k.
     fp8_to_bf16_direct: bool
 
     def k_offset(self, ks, g):
         """Host-side twin of the kernel's k-axis map; see the class docstring.
 
-        Kept here so `shuffle_cache` and the tests invert the same arithmetic
-        the kernel emits instead of a second copy of it -- a disagreement here
-        is silent wrong numbers, not a crash.
+        Here so `shuffle_cache` and the tests invert the same arithmetic the
+        kernel emits: a disagreement is silent wrong numbers, not a crash.
         """
         return (
             (ks // self.k_per_load) * self.block_k
@@ -160,10 +136,8 @@ class ArchTraits:
 
 @cache
 def arch_traits(arch: str = DEFAULT_ARCH, fp8: bool = False) -> ArchTraits:
-    """Resolve one (arch, dtype) pair to its compile-time constants.
-
-    Memoised: pure, and the host path asks for it on every launch.
-    """
+    """Resolve one (arch, dtype) pair to its constants. Memoised: pure, and
+    the host path asks for it on every launch."""
     if arch not in _MFMA_K_BY_ARCH:
         raise ValueError(f"unsupported arch {arch!r}; expected {SUPPORTED_ARCHS}")
     mfma_k = _MFMA_K_BY_ARCH[arch]
@@ -188,8 +162,6 @@ def arch_traits(arch: str = DEFAULT_ARCH, fp8: bool = False) -> ArchTraits:
         lane_block=lane_k * k_per_load,
         fp8_to_bf16_direct=arch == "gfx950",
     )
-    # The invariants the kernel body relies on, asserted once rather than
-    # re-derived at each use.
     assert tr.lane_block * LANE_GROUPS == tr.block_k  # lane groups tile a block
     assert tr.k_loads * tr.k_per_load == tr.ksteps  # no partial K access
     assert tr.q_loads * tr.q_per_load == tr.ksteps  # no partial Q access
@@ -200,8 +172,8 @@ def arch_traits(arch: str = DEFAULT_ARCH, fp8: bool = False) -> ArchTraits:
 def _fp8_t(arch: str):
     """The FlyDSL fp8 element type this architecture's `dtypes.fp8` names.
 
-    gfx942 is e4m3FNUZ and gfx950 is e4m3fn; the two differ in exponent bias, so
-    binding one as the other silently reads every value at the wrong scale.
+    gfx942 is e4m3FNUZ and gfx950 e4m3fn; they differ in exponent bias, so
+    binding one as the other reads every value at the wrong scale.
     """
     return fx.Float8E4M3FN if arch == "gfx950" else fx.Float8E4M3FNUZ
 
@@ -209,28 +181,21 @@ def _fp8_t(arch: str):
 def fragment_helpers(tr: ArchTraits, g):
     """Per-lane-group MFMA fragment builders, shared by both index scorers.
 
-    `g` is the caller's lane-group expression. Returns
-    (q_load_offset, as_bf16_frag, convert_k); see each for its contract and
-    ArchTraits for the map they implement.
-
-    Shared rather than copied because the decode and prefill kernels read the
-    same cache through the same k-axis permutation: a divergence between two
+    `g` is the caller's lane-group expression; see ArchTraits for the map these
+    implement. Shared rather than copied because both scorers read the same
+    cache through the same k-axis permutation, and a divergence between two
     copies would be silent wrong numbers, not a crash.
     """
-    # Q accesses per K access block: 1 when a Q access spans a whole block, 2
-    # when two Q accesses share one. Folding the floor division into this lets
-    # both branches stay a single multiply-add.
+    # Q accesses per K access block; folding the floor division in keeps both
+    # branches a single multiply-add.
     q_split = tr.k_per_load // tr.q_per_load
     q_block = tr.block_k // q_split
     q_half = tr.lane_block // q_split
 
     def q_load_offset(j):
-        """k position of this lane group's 16 B Q access `j`.
-
-        Equal to `tr.k_offset(j * q_per_load, g)`. `j` is a Python int on the
-        register path, where it folds to a constant, and an Int32 on an LDS
-        fill path, where the access index is the wave id.
-        """
+        """k position of this lane group's 16 B Q access `j`, i.e.
+        `tr.k_offset(j * q_per_load, g)`. `j` is a Python int on the register
+        path and an Int32 on an LDS fill path."""
         if const_expr(q_split == 1):
             if const_expr(isinstance(j, int)):
                 return fx.Int32(j * q_block) + g * fx.Int32(tr.lane_block)
@@ -248,13 +213,9 @@ def fragment_helpers(tr: ArchTraits, g):
         )
 
     def as_bf16_frag(raw16, sub=0):
-        """MFMA B-fragment `sub` of a 16 B Q access.
-
-        One access holds q_per_load k-steps of lane_k bf16 each, laid out back
-        to back by q_load_offset, so k-step `sub` is the slice
-        [sub*lane_k, +lane_k). On gfx950 q_per_load is 1 and this is the whole
-        16 B; on gfx942 it is one of two halves.
-        """
+        """MFMA B-fragment `sub` of a 16 B Q access: k-step `sub` is
+        [sub*lane_k, +lane_k) of it, the whole 16 B on gfx950 and one of two
+        halves on gfx942."""
         t = fx.make_rmem_tensor(fx.make_layout(tr.lane_k, 1), fx.BFloat16)
         wide = raw16.bitcast(fx.BFloat16)
         if const_expr(tr.q_per_load == 1):
@@ -274,14 +235,10 @@ def fragment_helpers(tr: ArchTraits, g):
     def convert_k(raws, ks):
         """Widen the raw access holding k-step ks into a bf16 A-fragment.
 
-        fp8 is widened here rather than fed to a native fp8 MFMA, because the
+        fp8 is widened here rather than fed to a native fp8 MFMA because the
         operator this replaces lifts K to Q's precision instead of rounding Q
-        down. That is a numerics contract, not a performance choice.
-
-        One access holds k_per_load k-steps of lane_k elements each, laid out
-        back to back by the k_offset map, so this takes slice
-        `ks % k_per_load`. On gfx950 bf16 that slice is the whole access and
-        this is a bitcast.
+        down -- a numerics contract, not a performance choice. The slice is
+        `ks % k_per_load` of the access, per the k_offset map.
         """
         raw = raws[ks // tr.k_per_load]
         sub = ks % tr.k_per_load
@@ -315,12 +272,8 @@ def fragment_helpers(tr: ArchTraits, g):
 def fp8_dwords_to_bf16(tr: ArchTraits, raw, lo, dwords):
     """`dwords` packed-fp8 dwords of `raw` from index `lo`, as 4*dwords bf16.
 
-    Split out of `convert_k` so an fp8 Q can be widened by exactly the
-    conversion K is widened by. Two copies would be silent wrong numbers rather
-    than a crash -- the same reason `fragment_helpers` is shared between the two
-    scorers at all. Module level rather than another `fragment_helpers` return
-    value so no existing caller has to change its unpacking.
-    """
+    Split out of `convert_k` so an fp8 Q is widened by exactly the conversion K
+    is widened by; two copies would be silent wrong numbers, not a crash."""
     one = _to_raw(fx.Float32(1.0))
     elems = []
     for d in range_constexpr(dwords):
@@ -335,10 +288,9 @@ def fp8_dwords_to_bf16(tr: ArchTraits, raw, lo, dwords):
                 )
                 elems += [fx.BFloat16(pair[0]), fx.BFloat16(pair[1])]
             else:
-                # CDNA3 has no fp8->bf16, so go through f32. The detour is
-                # exact and the rounding mode is irrelevant: e4m3 carries 3
-                # mantissa bits and 4 exponent bits, both of which fit bf16's
-                # 7 and 8, so nothing is rounded.
+                # CDNA3 has no fp8->bf16, so go through f32. Exact, and the
+                # rounding mode is irrelevant: e4m3's 3 mantissa and 4 exponent
+                # bits fit bf16's 7 and 8, so nothing is rounded.
                 pair = fx.Vector(
                     fx.rocdl.cvt_pk_f32_fp8(T.vec(2, T.f32), word, bool(half))
                 )
@@ -352,10 +304,9 @@ def fp8_dwords_to_bf16(tr: ArchTraits, raw, lo, dwords):
 def bf16_dwords_to_fp8(raw, dwords):
     """`dwords` dwords of bf16 in `raw` as dwords//2 packed-fp8 dwords.
 
-    The exact inverse direction of `fp8_dwords_to_bf16`, and the same rounding
-    the prefill scorer applies to Q. Rounding Q down rather than lifting K up
-    is a DIFFERENT numerics contract from this kernel's default -- see
-    `IndexScoreConfig.precision`.
+    The rounding the prefill scorer applies to Q, shared with it. Rounding Q
+    down rather than lifting K up is a DIFFERENT numerics contract from this
+    kernel's default -- see `IndexScoreConfig.precision`.
     """
     wide = raw.bitcast(fx.BFloat16)
     words = []
@@ -382,89 +333,65 @@ _SCHED_VMEM_RD = 32
 class IndexScoreConfig:
     """Tunables, in the shape aiter/ops/flydsl/gemm_kernels.py uses.
 
-    A note on axis names, because they are easy to get backwards here. This
-    kernel puts A=K (MFMA M = token) and B=Q (MFMA N = feature = tok*H+head),
-    so the *query* axis -- what you would call M in a plain GEMM, and what
-    `spec_decode * num_kv_head` sizes -- is N in this kernel. Every wave owns
-    the whole of that axis; the CTA's waves divide the BLOCK axis instead.
+    Axis names are easy to get backwards here: this kernel puts A=K (MFMA M =
+    token) and B=Q (MFMA N = feature = tok*H+head), so the *query* axis -- M in
+    a plain GEMM, sized by `spec_decode * num_kv_head` -- is N. Every wave owns
+    the whole of it; the CTA's waves divide the BLOCK axis instead.
 
     waves_per_tok  waves of the CTA that split a page's 8 token tiles. They
-                   each load a different slice of the page, so unlike splitting
-                   the FEATURE axis this duplicates no reads -- it is paid for
-                   with one LDS round trip and one barrier per page to combine
-                   the partial maxes. waves_per_tok waves cover one page; the
-                   remaining WAVES // waves_per_tok cover distinct pages. 0
-                   selects the narrow automatic split in resolve_config;
-                   explicit 1/2/4 always win.
-
-                   There used to be a `waves_per_feat` beside this, splitting
-                   the feature axis (F = S*H columns) the same way. It is gone:
-                   every wave re-read the whole page under it, so it bought
-                   parallelism with duplicate K traffic, and this kernel runs
-                   at ~97% of HBM peak with a 4-8% L2 hit rate -- doubling K
-                   traffic is the worst trade available here. It also had
-                   almost no room to act: F is 4-32 columns for MiniMax-M3, so
-                   feature_tiles is 1 except at S=8, and `resolve_config` never
-                   raised it above 1 on any shape.
+                   each load a different slice, so unlike splitting the FEATURE
+                   axis this duplicates no reads -- it costs one LDS round trip
+                   and one barrier per page. 0 selects the narrow automatic
+                   split in resolve_config; explicit 1/2/4 always win. Do not
+                   add a `waves_per_feat` beside it: one existed and was
+                   removed, because every wave re-read the whole page under it
+                   and this kernel runs at ~97% of HBM peak with a 4-8% L2 hit
+                   rate.
     pages_per_wave pages one wave walks back to back, pipelined across the
-                   boundary. 0 means pick it from the launch bounds; see
-                   resolve_config, which every entry point calls first.
+                   boundary. 0 means pick it from the launch bounds.
     shuffled       K cache is pre-shuffled into the kernel's load order.
     waves_per_eu   occupancy floor passed to the backend; 0 leaves it unset,
                    which is what every shape measured here wants.
     nt_k           CDNA cache policy for the K loads, as the raw aux field:
                    0 = default (allocate in L1), 2 = NT, 3 = SC0|NT (the
                    `GROUP_NT` the rest of aiter uses for streamed reads, see
-                   csrc/include/aiter_opus_plus.h). Bit 0 is sc0, bit 1 is nt.
-                   -1 resolves per layout; see resolve_config.
+                   csrc/include/aiter_opus_plus.h). -1 resolves per layout.
     sched          instruction-scheduling hint for the page loop. -1 picks it
-                   from the query shape (see resolve_config); 0 leaves the
-                   backend alone. 1/2/3 emit `rocdl.iglp_opt(0/1/2)` at the top
-                   of the loop body -- LLVM's canned MFMA/VMEM interleavings,
-                   written for FA-shaped loops. 4 spells the interleave out with
+                   from the query shape, 0 leaves the backend alone. 1/2/3 emit
+                   `rocdl.iglp_opt(0/1/2)` at the top of the loop body --
+                   LLVM's canned MFMA/VMEM interleavings, written for FA-shaped
+                   loops. 4 spells the interleave out with
                    `sched_group_barrier`, one VMEM group per MFMA group.
     spread         work-map layout. 0 hands out fixed chunks of `work_chunk`
                    pages; 1 spreads each step's live pages evenly over the CUs,
                    1..4 pages per CTA and at most one per wave (see
-                   make_spread_work_map). Needs one page per wave and no
+                   make_spread_work_map), which needs one page per wave and no
                    intra-page split. -1 resolves to 1 on the served decode path
                    when pages_per_wave resolves to 1, else 0.
     cp_world       ranks a context-parallel indexer splits the blocks over, and
-    cp_rank        which one this launch is; 1/0 is the whole context on one
-                   rank and folds every CP expression away. Each rank owns the
-                   round-robin subset `block % cp_world == cp_rank`, so logical
-                   block p here is global block `p * cp_world + cp_rank`. The
-                   global id addresses the block table and positions the causal
-                   mask; the score is stored at the local p, giving the
-                   compacted [H, tokens, ceil(blocks/world)] shard the CP
-                   selector reads. Both are constexpr, so there is one compiled
-                   kernel per rank and `kernel_name` carries them.
-
-    precision     which dtype the dot is computed in. THIS CHANGES RESULTS.
-
-                  "bf16" (default) keeps the contract this kernel has always
-                  had: an fp8 cache is widened up to Q's bf16 and the MFMA is
-                  bf16, matching the operator being replaced (see `convert_k`).
-
-                  "fp8" instead rounds Q down to the cache's fp8 and uses the
-                  fp8 MFMA -- what the prefill scorer does, and what Triton's
-                  `tl.dot(q.to(k.dtype), k)` does. Same 16x16 tile and the same
-                  k=32, so it buys no arithmetic; what it removes is the
-                  widening in the inner loop, which runs per (page, tok_tile,
-                  k-step).
-
-                  Scores differ between the two. The selector consumes them as
-                  a top-k ranking, so a tie reordered near the cut can change
-                  which blocks are chosen; that is a decision for the caller,
-                  which is why this is opt-in and never resolved automatically.
-
-                  gfx950 only. There the fp8 MFMA's k is 32, the same as the
-                  bf16 one, so `lane_k` and the whole k-axis map -- and
-                  therefore the shuffled cache layout -- are unchanged. On
-                  gfx942 the bf16 MFMA is k=16 and the fp8 one k=32, so the map
-                  would have to differ and the shuffled cache would no longer
-                  be the same bytes. Rejected there rather than silently
-                  reshaping a layout two kernels share.
+    cp_rank        which one this launch is; 1/0 folds every CP expression
+                   away. Each rank owns the round-robin subset
+                   `block % cp_world == cp_rank`, so logical block p here is
+                   global block `p * cp_world + cp_rank`. The global id
+                   addresses the block table and positions the causal mask; the
+                   score is stored at the local p, giving the compacted
+                   [H, tokens, ceil(blocks/world)] shard the CP selector reads.
+                   Both are constexpr, so there is one compiled kernel per rank
+                   and `kernel_name` carries them.
+    precision      which dtype the dot is computed in. THIS CHANGES RESULTS, so
+                   it is opt-in and never resolved automatically: the selector
+                   consumes the scores as a top-k ranking, and a tie reordered
+                   near the cut changes which blocks are chosen. "bf16"
+                   (default) widens an fp8 cache up to Q's bf16, matching the
+                   operator being replaced (see `convert_k`); "fp8" rounds Q
+                   down to the cache's fp8 instead, what the prefill scorer and
+                   Triton's `tl.dot(q.to(k.dtype), k)` do. Same tile and the
+                   same k=32, so it buys no arithmetic -- what it removes is
+                   the widening in the inner loop. gfx950 only, because there
+                   the fp8 MFMA's k matches the bf16 one and the k-axis map,
+                   hence the shuffled cache layout, is unchanged; on gfx942
+                   they are 16 and 32, so the shuffled cache would no longer be
+                   the same bytes.
     """
 
     waves_per_tok: int = 0  # 0 = auto; explicit 1/2/4 are never overridden
@@ -481,18 +408,12 @@ class IndexScoreConfig:
 
 
 def _cp_blocks(pages, world: int, rank: int, zero):
-    """This rank's share of `pages` blocks, as an fx expression.
+    """This rank's share of `pages` blocks: ceil(max(pages - r, 0) / world).
 
-    Round-robin: rank r owns global blocks r, r+world, r+2*world, ..., i.e.
-    ceil(max(pages - r, 0) / world) of them. `zero` is the caller's Int32 zero,
-    which all three kernels using this already have in scope. The clamp is
-    cmp+select, never maximumf -- that is a float op and would compare these
-    indices as bit patterns.
-
-    The kernel and both work-map builders each need this number and must agree
-    on it: a divergence is not a crash, it is a shard whose chunks are numbered
-    against a different length. Hence one copy, with `_cp_blocks_torch` as the
-    host twin.
+    The clamp is cmp+select, never maximumf -- a float op would compare these
+    indices as bit patterns. The kernel and both work-map builders must agree
+    on this number, or the shard's chunks are numbered against a different
+    length, so there is one copy with `_cp_blocks_torch` as the host twin.
     """
     if world == 1:
         return pages
@@ -515,29 +436,19 @@ def feature_tiles(S: int, H: int) -> int:
     return (S * H + MFMA_N - 1) // MFMA_N
 
 
-def _tiles_per_wave(S: int, H: int, cfg: "IndexScoreConfig") -> int:
-    """Feature tiles one wave owns -- all of them; the axis is not split."""
-    return feature_tiles(S, H)
-
-
 def reduce_lds_bytes(S: int, H: int, cfg: "IndexScoreConfig") -> int:
-    """LDS held by the cross-wave partial-max exchange, 0 when waves_per_tok == 1.
+    """LDS held by the cross-wave partial-max exchange, 0 at waves_per_tok 1.
 
-    One fp32 per (wave, wave-local feature tile, lane). Keeping all 64 lanes
-    rather than just the g == 0 writers makes the write contiguous and the read
-    lane-local, and it is only WAVES*FEAT_TILES_PER_WAVE*64*4 B -- 2 KB at S=8 H=4.
-    """
+    One fp32 per (wave, tile, lane): keeping all 64 lanes rather than the g == 0
+    writers makes the write contiguous and the read lane-local, for 2 KB at
+    S=8 H=4."""
     if cfg.waves_per_tok <= 1:
         return 0
-    return WAVES * _tiles_per_wave(S, H, cfg) * WAVE * 4
+    return WAVES * feature_tiles(S, H) * WAVE * 4
 
 
 def work_chunk(cfg: IndexScoreConfig) -> int:
-    """Pages one CTA covers -- the granularity make_work_map hands out.
-
-    Waves not spent on a page's feature or token axis each take their own page,
-    and each of those loops `pages_per_wave` times.
-    """
+    """Pages one CTA covers -- the granularity make_work_map hands out."""
     if not cfg.pages_per_wave:
         raise ValueError("pages_per_wave is unresolved; call resolve_config first")
     # An explicit page depth disables auto token splitting.
@@ -547,7 +458,7 @@ def work_chunk(cfg: IndexScoreConfig) -> int:
 def _grid_chunks(max_block: int, cfg: IndexScoreConfig) -> int:
     """Grid columns per request. A spread map needs one spare row per request:
     it may cut up to one CTA per request boundary, and the spare column keeps
-    four pages per CTA enough even at full capacity."""
+    four pages per CTA enough at full capacity."""
     chunk = work_chunk(cfg)
     return (max_block + chunk - 1) // chunk + (1 if cfg.spread > 0 else 0)
 
@@ -574,21 +485,18 @@ MAP_THREADS = 256
 _MAX_CHUNKS = 0x10000
 
 
-# Oversubscription the page loop is allowed to spend. Below this many CTAs the
-# machine is short of waves and a longer per-wave loop only makes it shorter;
-# above it, the loop is free and buys memory-level parallelism. 4x mirrors
-# _auto_num_splits in mqa_logits/fp8_mqa_logits.py, which tuned the same
-# trade-off on the same class of kernel.
+# Oversubscription the page loop may spend: below this the machine is short of
+# waves and a longer per-wave loop only makes it shorter. 4x mirrors
+# _auto_num_splits in mqa_logits/fp8_mqa_logits.py.
 _CTA_OVERSUBSCRIBE = 4
 
 
 def _auto_tok_split(cfg: IndexScoreConfig) -> bool:
     """Only tune the untouched decode path; CP does not alter the gate.
 
-    `shuffled` is deliberately in scope: it changes the *order* K is read in,
-    not how much work there is, so the depth tables and the spread map -- both
-    about filling CUs -- carry over. The cache policy is the one thing that
-    does not; see `nt_k` at the resolve site.
+    Deliberately does not test `shuffled`: it changes the *order* K is read in,
+    not how much work there is, so the depth tables and the spread map carry
+    over. The cache policy does not; see `nt_k` at the resolve site.
     """
     return (
         cfg.waves_per_tok == 0
@@ -606,9 +514,8 @@ _SERVED_DECODE_DEPTH = {
     (4, 1): ((4, 1), (16, 2)),  # TP4 MTP: Q4, one index head
     (8, 4): ((2, 1), (4, 2), (16, 3)),  # Q8, four index heads
 }
-# Every other one-feature-tile shape (S*H <= 16) was swept too -- S1H1, S4H4,
-# S1H4 behave within a few percent of S4H1 at every batch -- so they share its
-# table.
+# Every other one-feature-tile shape (S*H <= 16) was swept and behaves within
+# a few percent of S4H1 at every batch, so they share its table.
 _ONE_TILE_DECODE_DEPTH = _SERVED_DECODE_DEPTH[(4, 1)]
 
 
@@ -622,7 +529,6 @@ def _decode_depth_table(S: int, H: int):
 
 def _cu_count(device=None) -> int:
     import torch
-
     from aiter.jit.utils.chip_info import get_cu_num
 
     if device is None:
@@ -640,36 +546,30 @@ def resolve_config(
 ):
     """Fill in `cfg`'s shape-dependent fields. Idempotent; explicit wins.
 
-    batch, max_block  launch bounds; never seq_lens contents, because the grid
-                      has to stay valid across a cudagraph replay
-    cfg               config whose sentinel fields are to be resolved
-    S, H              query shape; `sched` needs them and stays off without
-    device            for the CU count; None asks the current device
+    `batch` and `max_block` are launch bounds, never seq_lens contents, because
+    the grid has to stay valid across a cudagraph replay. Five fields are auto,
+    each only at its sentinel.
 
-    Five fields are auto, each only at its sentinel. An explicit value is kept
-    as given.
-
-    nt_k            (-1) follows the K layout; the two are one fact seen from
-                    two sides, argued at the assignment below.
+    nt_k            (-1) follows the K layout; argued at the assignment below.
     pages_per_wave  (0) deeper keeps loads in flight across the page seam but
-                    divides the CTA count, so it is chosen from how much work
-                    a launch has. A *served* decode launch takes it from the
+                    divides the CTA count, so it is chosen from how much work a
+                    launch has. A *served* decode launch takes it from the
                     graph batch, since the grid must stay graph-stable and the
                     real lengths sit far below the capacity `max_block`
                     reports; everything else estimates CTA supply from
                     `batch * max_block`, which over-counts a ragged batch and
                     so errs towards the longer loop.
-    waves_per_tok     (0) splitting a page's token axis only helps where there
-                    are too few pages to fill the machine. Gated to
+    waves_per_tok   (0) splitting a page's token axis only helps where there
+                    are too few pages to fill the machine; gated to
                     native-layout Q1 with one feature tile.
-    sched           (-1) iglp_opt(0) pays exactly when a wave has more than
-                    one feature tile, so that is the gate.
+    sched           (-1) iglp_opt(0) pays exactly when a wave has more than one
+                    feature tile, so that is the gate.
     spread          (-1) resolved by `_resolve_spread`.
     """
     auto_tokens = _auto_tok_split(cfg)
-    # A decode launch with a measured depth table and no CP. The tables were
-    # measured at max_block 8192; past 0xFFFF blocks their shallow depths would
-    # not even pack, so those capacities fall through to the estimate.
+    # A decode launch with a measured depth table and no CP. Past 0xFFFF
+    # blocks those shallow depths would not pack, so those capacities fall
+    # through to the estimate.
     served = (
         auto_tokens
         and _decode_depth_table(S, H) is not None
@@ -681,24 +581,18 @@ def resolve_config(
         # regime was measured separately and the depth tables were not.
         served = False
     if cfg.nt_k < 0:
-        # The policy follows the layout, because the two are one fact seen from
-        # two sides. Natively one K instruction takes 64 B from each of 16 rows,
-        # so every 128 B line is requested twice and L1 turns the second into a
-        # hit -- NT would send it back to L2. Shuffled, one instruction is 1024
-        # contiguous bytes and each line is requested exactly once, so there is
-        # no second access to lose and the L1 fill buys nothing.
+        # The policy follows the layout: natively one K instruction takes 64 B
+        # from each of 16 rows, so every 128 B line is requested twice and L1
+        # turns the second into a hit, where NT would send it back to L2.
+        # Shuffled, each line is requested exactly once.
         cfg = replace(cfg, nt_k=0 if served and not cfg.shuffled else 2)
     if cfg.waves_per_tok == 0:
         cfg = replace(cfg, waves_per_tok=1)
     if not cfg.pages_per_wave and served:
         # The tabled depth, capped at the deepest that still hands every CU a
-        # CTA. The table is keyed on batch alone, but depth only pays when
-        # there are enough pages to fill the machine at that depth, and a full
-        # batch of *short* requests has a large batch and very little work.
-        # `batch * max_block` is the graph's page capacity and so an upper
-        # bound on live pages, which makes the cap safe in the direction that
-        # matters: a genuinely long batch keeps its tabled depth and only a
-        # launch that provably cannot fill one CU round is trimmed.
+        # CTA: the table is keyed on batch alone, but a full batch of *short*
+        # requests has very little work. `batch * max_block` bounds live pages
+        # from above, so only a launch that cannot fill a CU round is trimmed.
         depth = 4
         for limit, tabled in _decode_depth_table(S, H):
             if batch <= limit:
@@ -726,9 +620,8 @@ def resolve_config(
             if ctas >= target:
                 best = ppw
         cfg = replace(cfg, pages_per_wave=best)
-
     if cfg.sched < 0 and S and H:
-        cfg = replace(cfg, sched=1 if _tiles_per_wave(S, H, cfg) > 1 else 0)
+        cfg = replace(cfg, sched=1 if feature_tiles(S, H) > 1 else 0)
     return _resolve_spread(cfg, served, batch, max_block)
 
 
@@ -752,17 +645,15 @@ def selection_filter(S: int, H: int, cfg: IndexScoreConfig, arch=None) -> bool:
         cfg = replace(cfg, waves_per_tok=1)
     if cfg.pages_per_wave < 0 or cfg.waves_per_tok < 1:
         return False
-    # The two intra-page splits have to partition the CTA's waves between them,
-    # and there is no point handing a wave fewer than one tile or one tok_tile.
+    # The intra-page splits have to partition the CTA's waves.
     if WAVES % cfg.waves_per_tok:
         return False
     if TOK_TILES % cfg.waves_per_tok:
         return False
     if cfg.waves_per_eu and not 1 <= cfg.waves_per_eu <= 10:
         return False
-    # `precision` reaches an MFMA whose fp8 form is CDNA4-only. Checked here as
-    # well as in `build_index_score` so `index_score_supported` cannot report a
-    # config as dispatchable and then have `score_flydsl` raise on it.
+    # Checked here as well as in `build_index_score`, so `index_score_supported`
+    # cannot call a config dispatchable and then have `score_flydsl` raise.
     if cfg.precision not in ("bf16", "fp8"):
         return False
     if cfg.precision == "fp8" and arch is not None and arch != "gfx950":
@@ -789,8 +680,8 @@ def selection_filter(S: int, H: int, cfg: IndexScoreConfig, arch=None) -> bool:
 def kernel_name(
     S: int, H: int, fp8: bool, cfg: IndexScoreConfig, arch: str = DEFAULT_ARCH
 ) -> str:
-    """Config -> kernel name. Non-default knobs append a suffix, so the default
-    config keeps the name it had before the knobs existed."""
+    """Config -> kernel name. Non-default knobs append a suffix, so the
+    default config keeps the name it had before the knobs existed."""
     name = f"m3_index_score_S{S}_H{H}_{'fp8' if fp8 else 'bf16'}_L{cfg.pages_per_wave}"
     if arch != DEFAULT_ARCH:
         # A different MFMA generation is a different binary from the same
@@ -825,23 +716,16 @@ def build_index_score(
 ):
     """Compile a score kernel specialised on (S, H, cache dtype, config, arch).
 
-    S = max query tokens per request (num_spec + 1), H = index heads.
-    F = S*H is the feature count, laid out as column n = tok*H + head.
-
-    `arch` selects the MFMA generation through ArchTraits. It is a parameter
-    rather than a lookup of the running device so the gfx942 shapes can be
-    built and numerically checked on a gfx950 box -- CDNA4 kept both the
-    16x16x16 MFMA and `v_cvt_pk_f32_fp8`, so the only part of the gfx942 path
-    that genuinely needs gfx942 silicon is whether the binary loads there.
+    S = max query tokens per request (num_spec + 1), H = index heads, and
+    F = S*H is the feature count, laid out as column n = tok*H + head. `arch`
+    is a parameter rather than a lookup of the running device so the gfx942
+    shapes can be built and numerically checked on a gfx950 box.
     """
     if not selection_filter(S, H, cfg, arch=arch):
         raise ValueError(f"illegal config for S={S} H={H}: {cfg}")
     tr = arch_traits(arch, fp8)
-    # gfx942's fp8 is e4m3FNUZ (see aiter.utility.dtypes.defaultDtypes) and
-    # gfx950's is e4m3fn. They differ in exponent bias, so binding one as the
-    # other does not fail -- it reads every value at the wrong scale. The host
-    # already hands over whichever `dtypes.fp8` names, so only the FlyDSL-side
-    # element type has to follow. Same selection as pa_decode_kernel.py:220.
+    # The host hands over whichever flavour `dtypes.fp8` names, so only the
+    # FlyDSL-side element type has to follow; see `_fp8_t` for the hazard.
     FP8_T = _fp8_t(arch)
     # Compute the dot in fp8 instead of widening K to bf16. Changes results;
     # see IndexScoreConfig.precision.
@@ -855,9 +739,8 @@ def build_index_score(
             "precision='fp8' is gfx950 only: there the fp8 MFMA's k matches the "
             "bf16 one, so the k-axis map and the shuffled layout are unchanged"
         )
-    # Q is fp8 in memory. On the bf16 path it is widened back on load (fewer Q
-    # bytes, one more conversion); on the fp8 path it is already what the MFMA
-    # wants and the conversion disappears entirely. See `load_q_frag`.
+    # Q is fp8 in memory: widened back on load on the bf16 path, already what
+    # the MFMA wants on the fp8 one. See `load_q_frag`.
     FP8_Q = cfg.fp8_q > 0
     pages_per_wave = cfg.pages_per_wave
     shuffled = cfg.shuffled
@@ -868,31 +751,26 @@ def build_index_score(
     CP_WORLD = cfg.cp_world
     CP_RANK = cfg.cp_rank
     SPREAD = cfg.spread > 0
-
     F = S * H
-    # FEAT_TILES feature tiles in total, and every wave owns all of them --
-    # the feature axis is not divided between waves. The CTA's waves divide the
-    # block axis: WAVES_PER_TOK of them share one page by splitting its token
-    # tiles, and PAGE_SLOTS groups of those cover distinct pages.
-    FEAT_TILES_PER_WAVE = _tiles_per_wave(S, H, cfg)
+    # Every wave owns every feature tile; the CTA's waves divide the block
+    # axis instead -- WAVES_PER_TOK of them share one page by splitting its
+    # token tiles, and PAGE_SLOTS groups of those cover distinct pages.
+    FEAT_TILES_PER_WAVE = feature_tiles(S, H)
     WAVES_PER_TOK = cfg.waves_per_tok
     PAGE_SLOTS = WAVES // WAVES_PER_TOK
     TOK_TILES_PER_WAVE = TOK_TILES // WAVES_PER_TOK  # token tiles one wave walks
     CHUNK = PAGE_SLOTS * pages_per_wave
-    # One lane's K access for a given (tok_tile, load) is 16 elements for fp8 or 8
-    # for bf16 -- 16 B either way, so a shuffled page is WAVE*16 = 1024 B per
-    # load slot. How many k-steps that covers is the arch's business, not this
-    # layout's, which is why the shuffled cache is the same on both.
+    # One lane's K access is 16 B either way, so a shuffled page is
+    # WAVE*16 = 1024 B per load slot on both architectures.
     CHUNK_ELEMS = tr.chunk_elems
     # K load instructions per tok_tile: 4 for bf16, 2 for fp8, on both
-    # architectures. gfx942 halves mfma_k and doubles the k-steps one access
-    # covers, and the two cancel -- see ArchTraits.
+    # architectures -- gfx942 halves mfma_k and doubles the k-steps an access
+    # covers, and the two cancel. See ArchTraits.
     K_LOADS = tr.k_loads
     KSTEPS = tr.ksteps  # MFMA k-steps per dot: 4 on gfx950, 8 on gfx942
     # The kernel's only LDS: the cross-wave partial-max exchange, one fp32 per
     # (wave, tile, lane). Zero unless the token axis is split.
     RED_SLOTS = WAVES * FEAT_TILES_PER_WAVE * WAVE if WAVES_PER_TOK > 1 else 0
-
     # Built from only the arrays this config uses, so the default config still
     # reports group_segment_fixed_size = 0 -- no LDS and no barrier at all.
     SharedStorage = (
@@ -932,37 +810,24 @@ def build_index_score(
 
         arg_q       [batch*S, H, 128] bf16 query
         arg_k       [pages, 128, 128] bf16 or fp8 index key cache
-        arg_score   [H, batch*S, max_block] fp32, written one value per
-                    (feature, page)
+        arg_score   [H, batch*S, max_block] fp32, one value per (feature, page)
         arg_bt      [batch, >= max_block] int32 block table
         arg_work    [rows, 2] int32 work map; see make_work_map
-        i32_batch   requests, i.e. the grid's x extent
         i32_stride_*  element strides of the tensor named by the suffix
         f32_scale   score multiplier, already folded with LOG2E by the host
 
-        The three stages below are:
-
-            prologue   ids and strides, Q staged in registers, and every
-                       page id this wave will touch, fetched in one batch
-            main loop  per page, per 16-token tile: load K, MFMA against Q,
-                       causal-mask, fold into a per-feature running max
-            epilogue   per page, fold that max across g and across the token
-                       waves, scale, store one value per feature
-
         Everything is constexpr-unrolled, so "loop" means the shape of the
-        emitted code, not a branch.
-
-        Wave decomposition: wave w takes tw (which slice of the page's token
-        axis) and pw (which page slot). At WAVES_PER_TOK == 1 a wave owns whole pages, the
-        token reduction stays register-local, and the kernel has no LDS and no
-        barrier at all; above it the per-page epilogue exchanges partial maxes
-        and is the only place a barrier appears.
+        emitted code, not a branch. Wave w takes tw (which slice of the page's
+        token axis) and pw (which page slot); at WAVES_PER_TOK == 1 a wave owns
+        whole pages, the token reduction stays register-local, and the kernel
+        has no LDS and no barrier at all. Above it the per-page epilogue
+        exchanges partial maxes and is the only place a barrier appears.
         """
         # ==================== PROLOGUE ====================
         # The CTA looks up which (b, c) the n-th *dispatched* block owns rather
-        # than taking (block.x, block.y) directly, so that a ragged batch's
-        # holes all land past the end of the work; see make_work_map. block.x
-        # is the fast dispatch axis, so n is monotonic in launch order.
+        # than taking (block.x, block.y), so a ragged batch's holes all land
+        # past the end of the work; see make_work_map. block.x is the fast
+        # dispatch axis, so n is monotonic in launch order.
         n = fx.Int32(gpu.block_id("y")) * i32_batch + fx.Int32(gpu.block_id("x"))
         tid = fx.Int32(gpu.thread_id("x"))
         wave = tid // fx.Int32(WAVE)
@@ -983,20 +848,15 @@ def build_index_score(
         tw_slot = tw * fx.Int32(
             TOK_TILES_PER_WAVE * K_LOADS * WAVE
         )  # shuffled load slot
-
-        # Q is read as i32 and bitcast: one 8-element fragment is 16 B (bf16) or
-        # 8 B (fp8), so it lands as a single dwordx4 / dwordx2 instead of 8
-        # scalar loads. Every fragment base is 8-element aligned, which those
-        # widths require.
+        # Q is read as i32 and bitcast so a fragment lands as one dwordx4 or
+        # dwordx2, not 8 scalar loads; every base is 8-element aligned.
         q_buf = ptr_buf_tensor(arg_q, fx.Int32)
         s_buf = ptr_buf_tensor(arg_score, fx.Float32)
         bt_buf = ptr_buf_tensor(arg_bt, fx.Int32)
         wm_buf = ptr_buf_tensor(arg_work, fx.Int32)
-
-        # Work-map entry n is two adjacent dwords, (packed, seq_len), so it is
-        # one cache line and one round trip. A hole reads as (0, 0), which makes
-        # num_pages zero and lets the tail guard retire the CTA with no extra
-        # branch; the clamp on the page id keeps every address legal.
+        # Work-map entry n is two adjacent dwords, (packed, seq_len): one cache
+        # line, one round trip. A hole reads as (0, 0), so num_pages is zero and
+        # the tail guard retires the CTA with no extra branch.
         wm = fx.add_offset(fx.get_iter(wm_buf), n * fx.Int32(2))
         packed = fx.Int32(wm.load(T.i32))
         seq_len = fx.Int32(fx.add_offset(wm, fx.Int32(1)).load(T.i32))
@@ -1007,29 +867,21 @@ def build_index_score(
             # carries its page count (1..4) in the length word's top byte.
             span = (seq_len >> fx.Int32(24)) & fx.Int32(0xFF)
             seq_len = seq_len & fx.Int32(0xFFFFFF)
-        # Pages this request actually owns. Grid is sized from max_seq_len, so
-        # trailing waves find nothing to do.
+        # Pages this request owns; the grid is sized from max_seq_len.
         num_pages = (seq_len + fx.Int32(PAGE - 1)) // fx.Int32(PAGE)
         if const_expr(CP_WORLD > 1):
             # ...and of those, the ones this rank owns; see `_cp_blocks`.
             num_pages = _cp_blocks(num_pages, CP_WORLD, CP_RANK, fx.Int32(0))
 
         def global_block(p):
-            """Global block id of this rank's logical block `p`.
-
-            The block table is indexed globally and the causal cutoff is a
-            global token position, so both go through here; the score store
-            does not, because the shard is stored compacted at local `p`.
-            """
+            """Global block id of this rank's logical block `p`."""
             if const_expr(CP_WORLD == 1 and CP_RANK == 0):
                 return p
             return p * fx.Int32(CP_WORLD) + fx.Int32(CP_RANK)
 
         # -- feature decode: which (tok, head) does this lane's column carry? --
-        # Column f = 16*ft + u, and f = tok*H + head. H is constexpr so these
-        # fold to shifts. causal_len depends on tok, hence on u, so it is a
-        # per-lane value and must not be hoisted.
-        #
+        # Column f = 16*ft + u and f = tok*H + head, with H constexpr. Note
+        # causal_len depends on tok, hence on u: it must not be hoisted.
         def feature_of(i):
             return fx.Int32(MFMA_N * i) + u
 
@@ -1038,12 +890,10 @@ def build_index_score(
             tok = f // fx.Int32(H)
             return tok, f - tok * fx.Int32(H)
 
-        # -- where in Q does one fragment live? -------------------------------
-        # Any bijection (g, ks, v) -> k works provided Q and K use the same
-        # one; the one picked has access j of lane g start at byte 64*j + 16*g,
-        # so the four g-lanes tile one full 64 B cache line. In elements that
-        # is ArchTraits.k_offset. Q is addressed by *access* index rather than
-        # k-step: one 16 B access holds q_per_load whole k-steps.
+        # Any bijection (g, ks, v) -> k works provided Q and K use the SAME
+        # one; this one is ArchTraits.k_offset, which starts access j of lane
+        # group g at byte 64*j + 16*g so the four g-lanes tile one 64 B line.
+        # Q is addressed by access index, not k-step.
         q_load_offset, as_bf16_frag, convert_k = fragment_helpers(tr, g)
 
         def load_q_frag(i, j):
@@ -1057,13 +907,9 @@ def build_index_score(
             row = in_range.select(row, fx.Int32(0))
             head = in_range.select(head, fx.Int32(0))
             off = row * i32_stride_q_n + head * i32_stride_q_h + q_load_offset(j)
-            # Returns this access in the COMPUTE dtype: 4 dwords of bf16, or
-            # 2 dwords of fp8. Four combinations, and only one of them needs a
-            # conversion in each direction -- matching input to compute costs
-            # nothing, crossing costs one convert on a value that is hoisted
-            # out of the page loop anyway.
+            # Returned in the COMPUTE dtype. Matching input to compute costs
+            # nothing; crossing costs one convert, on a hoisted value.
             if const_expr(FP8_Q):
-                # 8 fp8 = 8 B = one dwordx2.
                 raw8 = fx.Vector(
                     fx.add_offset(fx.get_iter(q_buf), off >> fx.Int32(2)).load(
                         T.vec(2, T.i32)
@@ -1072,13 +918,11 @@ def build_index_score(
                 if const_expr(FP8_COMPUTE):
                     return raw8  # already exactly what the fp8 MFMA wants
                 # Widen back up: this scorer's default MFMA is bf16 and lifts K
-                # to Q's precision rather than rounding Q down (see
-                # `convert_k`). So on the bf16 path an fp8 Q saves read bytes
-                # and ADDS a conversion; it does not remove one.
+                # to Q's precision rather than rounding Q down (`convert_k`),
+                # so an fp8 Q saves read bytes and ADDS a conversion here.
                 return fx.Vector.from_elements(
                     fp8_dwords_to_bf16(tr, raw8, 0, 2), fx.BFloat16
                 ).bitcast(fx.Int32)
-            # 8 bf16 = 16 B = one dwordx4.
             raw16 = fx.Vector(
                 fx.add_offset(fx.get_iter(q_buf), off >> fx.Int32(1)).load(
                     T.vec(4, T.i32)
@@ -1089,30 +933,24 @@ def build_index_score(
                 return fx.Vector.from_elements(bf16_dwords_to_fp8(raw16, 4), fx.Int32)
             return raw16
 
-        # Only the token-wave partial-max exchange needs LDS, and only when
-        # there is more than one token wave; otherwise the kernel has none and
-        # reports group_segment_fixed_size = 0.
+        # Only the token-wave partial-max exchange needs LDS; otherwise the
+        # kernel has none and reports group_segment_fixed_size = 0.
         lds = (
             fx.SharedAllocator().allocate(SharedStorage).peek()
             if const_expr(SharedStorage is not None)
             else None
         )
-
         # -- stage Q in registers, held for the whole page loop ---------------
         # One 16 B gmem access per (tile, Q access), hoisted so the extra
-        # k-steps gfx942 needs cost register slicing and not extra loads.
+        # k-steps gfx942 needs cost register slicing, not loads.
         q_raw = [
             [load_q_frag(i, j) for j in range_constexpr(tr.q_loads)]
             for i in range_constexpr(FEAT_TILES_PER_WAVE)
         ]
 
         def as_q_frag(raw, sub):
-            """One MFMA B-fragment in the compute dtype.
-
-            On the fp8 path a Q access is 8 fp8 = exactly one k-step (q_per_load
-            is 1 for an fp8 cache on gfx950), so the slice is the whole access
-            and this is a bitcast.
-            """
+            """One MFMA B-fragment in the compute dtype. On the fp8 path a Q
+            access is 8 fp8 = exactly one k-step, so this is a bitcast."""
             if const_expr(not FP8_COMPUTE):
                 return as_bf16_frag(raw, sub)
             t = fx.make_rmem_tensor(fx.make_layout(tr.lane_k, 1), FP8_T)
@@ -1126,7 +964,6 @@ def build_index_score(
             ]
             for i in range_constexpr(FEAT_TILES_PER_WAVE)
         ]
-
         mma_atom = fx.make_mma_atom(
             fx.rocdl.MFMA(MFMA_M, MFMA_N, tr.mfma_k, FP8_T)
             if const_expr(FP8_COMPUTE)
@@ -1137,18 +974,14 @@ def build_index_score(
         )
         zero4 = fx.Vector.filled(4, 0.0, fx.Float32)
         neg_inf = fx.Float32(NEG_INF)
-
         # -- page ids and their buffer descriptors, one batch up front --------
-        # All of this wave's page ids, issued with no dependant between them so
-        # they pipeline rather than costing a serial round trip per page. Pages
-        # are strided by PAGE_SLOTS so consecutive slots cover consecutive
-        # pages, keeping a wavefront's loads inside one span of block_table.
-        #
-        # `limit` is where this CTA's pages end: the request's end, or for a
-        # spread row the end of its own span. Out-of-range entries are clamped
-        # rather than predicated -- the value only forms an address and the
-        # store it would feed is masked off in the epilogue. The clamp is
-        # cmp+select, never maximumf/minimumf, which are float ops and would
+        # Issued with no dependant between them so they pipeline instead of
+        # costing a serial round trip per page, and strided by PAGE_SLOTS so a
+        # wavefront's loads stay inside one span of block_table. `limit` is
+        # where this CTA's pages end: the request's end, or a spread row's own
+        # span. Out-of-range entries are clamped rather than predicated -- the
+        # value only forms an address and the store it feeds is masked off --
+        # and the clamp is cmp+select, never maximumf/minimumf, which would
         # compare these indices as bit patterns.
         if const_expr(SPREAD):
             first = c
@@ -1164,7 +997,6 @@ def build_index_score(
         zero = fx.Int32(0)
         nm1 = limit - fx.Int32(1)
         last = (nm1 < zero).select(zero, nm1)
-
         # Widen BEFORE multiplication: a pool can exceed the descriptor's
         # 4 GiB range, and only within-page offsets belong in the index.
         page_bytes = fx.Int64(i32_stride_k_blk) * fx.Int64(1 if fp8 else 2)
@@ -1172,11 +1004,10 @@ def build_index_score(
         page_buffers = []
         for pp in pages:
             p_clamped = (pp < last).select(pp, last)
-            # The block table is not sharded -- every rank sees all of it -- so
-            # it is indexed with the global block id. An empty CP shard may have
-            # no column for CP_RANK at all, yet still forms descriptors (and its
-            # token-split waves execute barriers), so clamp that speculative
-            # load to the always-present column 0.
+            # The block table is not sharded, so it is indexed with the global
+            # block id. An empty CP shard may have no column for CP_RANK at
+            # all, yet still forms descriptors (and its token-split waves
+            # execute barriers), so clamp that speculative load to column 0.
             column = (num_pages > zero).select(global_block(p_clamped), zero)
             page = fx.Int32(
                 fx.add_offset(fx.get_iter(bt_buf), b * i32_stride_bt_b + column).load(
@@ -1192,69 +1023,56 @@ def build_index_score(
                     num_records_bytes=fx.Int32(page_bytes),
                 )
             )
-
-        # -- K fragment access ------------------------------------------------
-        # K is streamed: every byte is read once per launch and never revisited,
-        # so `nt_k` keeps it from allocating in L1 and paying a line fill per
-        # access for no reuse. Q, the block table and the work map keep the
-        # default policy -- they are small and genuinely re-read.
+        # K is streamed -- every byte read once per launch -- so `nt_k` keeps it
+        # from allocating in L1 for no reuse. Q, the block table and the work
+        # map keep the default policy.
         k_atom = buf_copy_atom(16, fx.Int32, cache_modifier=nt_k)
 
         def load_k16(page_buf, unit):
             """One 16 B K access at 16 B-unit index `unit`.
 
-            Goes through a copy atom rather than a plain `.load()` because the
-            cache-policy field lives on the atom. Issue and consume stay split:
-            the fragment is registers, so the compiler sinks the s_waitcnt to
-            first use and a whole tok_tile's loads remain in flight.
-            """
+            A copy atom rather than a plain `.load()` because the cache-policy
+            field lives on the atom. Issue and consume stay split: the compiler
+            sinks the s_waitcnt to first use, so a whole tok_tile's loads
+            remain in flight."""
             src = fx.slice(page_buf, (unit, None))
             frag = fx.make_fragment_like(src)
             fx.copy(k_atom, src, frag)
             return fx.Vector(fx.memref_load_vec(frag))
 
         def issue_k(page, tok_tile, i):
-            """Start load i of K[page, 16*tok_tile + u, :], per the k_offset map.
-
-            `tok_tile` is this wave's *local* tok_tile index; tw_slot / tw_tok shift
-            it onto the wave's own slice of the page's token axis.
-            """
+            """Start load i of K[page, 16*tok_tile + u, :], per the k_offset
+            map. `tok_tile` is this wave's *local* index; tw_slot / tw_tok
+            shift it onto the wave's own slice of the token axis."""
             if const_expr(shuffled):
-                # Pre-shuffled cache: the 16 B chunk each lane wants for
-                # (tok_tile, i) already sits at lane index, so one instruction
-                # reads WAVE*16 = 1024 contiguous bytes instead of 16 chunks a
-                # row-stride apart. Addressing involves neither u, the row
-                # stride, nor k_offset.
+                # Pre-shuffled: the 16 B chunk each lane wants already sits at
+                # lane index, so one instruction reads 1024 contiguous bytes
+                # instead of 16 chunks a row-stride apart.
                 base = (
                     fx.Int32((tok_tile * K_LOADS + i) * WAVE) + tw_slot + lane
                 ) * fx.Int32(CHUNK_ELEMS)
             else:
                 # Access block i starts at k = i*block_k and lane group g takes
-                # lane_block of it, so the block is one dwordx4 per lane and the
-                # four g-lanes tile exactly one 64 B line. Both constants are
-                # arch-independent; see ArchTraits.
+                # lane_block of it, so the four g-lanes tile one 64 B line.
+                # Both constants are arch-independent; see ArchTraits.
                 tok_row = fx.Int32(MFMA_M * tok_tile) + tw_tok + u
                 base = (
                     tok_row * i32_stride_k_pos
                     + fx.Int32(i * tr.block_k)
                     + g * fx.Int32(tr.lane_block)
                 )
-            # `base` is in cache elements; the shift turns it into a 16 B unit
-            # index, exactly -- CHUNK_ELEMS is one 16 B chunk by construction
-            # and every stride above it is a multiple.
+            # `base` is in cache elements; the shift is exact, since
+            # CHUNK_ELEMS is one 16 B chunk and every stride above it a
+            # multiple.
             shift = fx.Int32(4) if const_expr(fp8) else fx.Int32(3)
             return load_k16(page, base >> shift)
 
         def k_operand(raws, ks):
-            """One MFMA A-fragment of K in the compute dtype.
-
-            The bf16 path widens (`convert_k`). The fp8 path does not: a lane's
-            k-step is lane_k fp8, an access holds k_per_load of them back to
-            back by the k_offset map, so the fragment is already in the raw and
-            this is a slice. That deleted widening is the whole point of
-            `precision='fp8'` -- it runs per (page, tok_tile, k-step), unlike
-            anything on the Q side.
-            """
+            """One MFMA A-fragment of K in the compute dtype: the bf16 path
+            widens (`convert_k`), the fp8 path slices, because an access
+            already holds the k-steps back to back by the k_offset map. That
+            deleted widening is the whole point of `precision='fp8'` -- it runs
+            per (page, tok_tile, k-step)."""
             if const_expr(not FP8_COMPUTE):
                 return convert_k(raws, ks)
             raw = raws[ks // tr.k_per_load]
@@ -1271,16 +1089,10 @@ def build_index_score(
 
         # ==================== MAIN LOOP ====================
         def score_tok_tile(p, tok_tile, raws, run_max):
-            """MFMA one 16-token tile against this wave's feature tiles.
-
-            p        logical block index of the page being scored
-            tok_tile    the wave's local tok_tile index within that page
-            raws     K loads issued earlier, K_LOADS of them
-            run_max  per-feature running max, updated in place
-
-            This is the whole arithmetic body of the kernel; everything else is
-            address math and plumbing.
-            """
+            """MFMA one 16-token tile against this wave's feature tiles, into
+            the per-feature running max. `p` is the logical block index and
+            `tok_tile` the wave's local index within that page. The whole
+            arithmetic body of the kernel; the rest is addressing."""
             accs = []
             for i in range_constexpr(FEAT_TILES_PER_WAVE):
                 acc = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32)
@@ -1290,15 +1102,10 @@ def build_index_score(
                 kf = k_operand(raws, ks)
                 for i in range_constexpr(FEAT_TILES_PER_WAVE):
                     fx.gemm(mma_atom, accs[i], kf, q_frag[i][ks], accs[i])
-
-            # This lane holds tokens 16*tok_tile + 4*g + r of the wave's slice,
-            # i.e. tw_tok further along the page's token axis. The page's base
-            # token is a *global* position: the cutoff it is compared against
-            # counts the whole context, not this rank's share of it.
-            #
-            # The scale is not applied here. It is positive, so it commutes
-            # with max, and folding it in once in the epilogue turns
-            # TOK_TILES*FEAT_TILES*4 multiplies per page into FEAT_TILES.
+            # This lane holds tokens 16*tok_tile + 4*g + r of the wave's slice.
+            # The page's base token is a *global* position: the cutoff counts
+            # the whole context, not this rank's share. The scale is applied in
+            # the epilogue instead; being positive, it commutes with max.
             tok_base = (
                 global_block(p) * fx.Int32(PAGE)
                 + fx.Int32(MFMA_M * tok_tile)
@@ -1315,119 +1122,77 @@ def build_index_score(
                         ok.select(fx.Float32(v[r]), neg_inf)
                     )
 
-        # A wave whose first page is out of range skips everything: a short
-        # request in a ragged batch would otherwise stream whole chunks of K it
-        # can never use. At WAVES_PER_TOK > 1 there is no guard, because it is
-        # wave-divergent and the epilogue's barrier has to be reached by every
-        # wave in the CTA; those waves run on a clamped page and drop the
-        # result at the store. A Python `True` folds at trace time, so that
-        # case emits no branch at all.
+        # A wave whose first page is out of range skips everything, or a short
+        # request streams chunks of K it can never use. At WAVES_PER_TOK > 1
+        # there is no guard -- it is wave-divergent and every wave must reach
+        # the epilogue's barrier -- so those waves run on a clamped page and
+        # drop the result at the store.
         _live = True if const_expr(WAVES_PER_TOK > 1) else (pages[0] < limit)
-
         if _live:
             carry = None
             for j in range_constexpr(pages_per_wave):
                 p = pages[j]
                 page = page_buffers[j]
                 nxt_page = page_buffers[j + 1] if j + 1 < pages_per_wave else None
-
                 # ---------- MAIN LOOP: K pipeline + MFMA over one page --------
-                # At WAVES_PER_TOK > 1 a wave walks only TOK_TILES_PER_WAVE of the page's
-                # tok_tiles; the rest belong to other waves and the partial maxes
-                # meet in LDS in the epilogue.
                 if const_expr(1 <= sched <= 3):
                     fx.rocdl.iglp_opt(sched - 1)
                 run_max = [neg_inf for _ in range_constexpr(FEAT_TILES_PER_WAVE)]
-                if const_expr(fp8):
-                    # Three tok_tiles in flight, capped by the wave's token slice,
-                    # carried across pages. The scheduling boundaries are what
-                    # keep the window from collapsing back to one tok_tile.
-                    depth = min(3, TOK_TILES_PER_WAVE)
-                    queue = list(carry) if carry is not None else []
-                    for tok_tile in range_constexpr(len(queue), depth):
+                # fp8 keeps three tok_tiles in flight, capped by the wave's
+                # token slice and carried across pages, and consumes before it
+                # refills; bf16 is one deep and issues tok_tile n+1 BEFORE
+                # consuming n, so it is in flight during the MFMAs rather than
+                # waited on. The scheduling boundaries on the fp8 path are what
+                # keep its window from collapsing back to one tok_tile.
+                depth = min(3, TOK_TILES_PER_WAVE) if fp8 else 1
+                queue = list(carry) if carry is not None else []
+                for tok_tile in range_constexpr(len(queue), depth):
+                    queue.append(
+                        [issue_k(page, tok_tile, i) for i in range_constexpr(K_LOADS)]
+                    )
+                carry = []
+                for tok_tile in range_constexpr(TOK_TILES_PER_WAVE):
+                    raws = queue.pop(0)
+                    future = tok_tile + depth
+                    if const_expr(fp8):
+                        fx.rocdl.sched_barrier(0)
+                        score_tok_tile(p, tok_tile, raws, run_max)
+                        fx.rocdl.sched_barrier(0)
+                    if const_expr(future < TOK_TILES_PER_WAVE):
                         queue.append(
+                            [issue_k(page, future, i) for i in range_constexpr(K_LOADS)]
+                        )
+                    elif nxt_page is not None:
+                        carry.append(
                             [
-                                issue_k(page, tok_tile, i)
+                                issue_k(nxt_page, future - TOK_TILES_PER_WAVE, i)
                                 for i in range_constexpr(K_LOADS)
                             ]
                         )
-                    carry = []
-                    for tok_tile in range_constexpr(TOK_TILES_PER_WAVE):
-                        raws = queue.pop(0)
-                        fx.rocdl.sched_barrier(0)
+                    if const_expr(not fp8):
                         score_tok_tile(p, tok_tile, raws, run_max)
-                        fx.rocdl.sched_barrier(0)
-                        future = tok_tile + depth
-                        if const_expr(future < TOK_TILES_PER_WAVE):
-                            queue.append(
-                                [
-                                    issue_k(page, future, i)
-                                    for i in range_constexpr(K_LOADS)
-                                ]
-                            )
-                        elif nxt_page is not None:
-                            carry.append(
-                                [
-                                    issue_k(nxt_page, future - TOK_TILES_PER_WAVE, i)
-                                    for i in range_constexpr(K_LOADS)
-                                ]
-                            )
-                else:
-                    # One tok_tile deep.
-                    queue = (
-                        list(carry)
-                        if carry is not None
-                        else [[issue_k(page, 0, i) for i in range_constexpr(K_LOADS)]]
-                    )
-                    carry = []
-                    for tok_tile in range_constexpr(TOK_TILES_PER_WAVE):
-                        raws = queue.pop(0)
-                        # Issue tok_tile n+1 before consuming tok_tile n, so it is in
-                        # flight during the MFMAs rather than waited on.
-                        if const_expr(tok_tile + 1 < TOK_TILES_PER_WAVE):
-                            queue.append(
-                                [
-                                    issue_k(page, tok_tile + 1, i)
-                                    for i in range_constexpr(K_LOADS)
-                                ]
-                            )
-                        elif nxt_page is not None:
-                            carry.append(
-                                [
-                                    issue_k(nxt_page, 0, i)
-                                    for i in range_constexpr(K_LOADS)
-                                ]
-                            )
-                        score_tok_tile(p, tok_tile, raws, run_max)
-
                 if const_expr(sched == 4):
-                    # Ask for the order the source already has: one tok_tile's
-                    # loads, then one tok_tile's MFMAs. Group id 0 throughout --
-                    # these are one pipeline and the calls are read in order.
+                    # Ask for the order the source already has. Group id 0
+                    # throughout: one pipeline, read in order.
                     for _ in range_constexpr(TOK_TILES_PER_WAVE):
                         fx.rocdl.sched_group_barrier(_SCHED_VMEM_RD, K_LOADS, 0)
                         fx.rocdl.sched_group_barrier(
                             _SCHED_MFMA, FEAT_TILES_PER_WAVE * KSTEPS, 0
                         )
-
                 # ---------- EPILOGUE: fold, scale, store one value/feature ----
-                # Fold each feature's max across g, i.e. lanes {u, u+16, u+32,
-                # u+48}. XOR 1/2/4/8 would mix features rather than tokens.
-                # Afterwards every lane holds the tile's max for feature u,
-                # replicated over g.
+                # Fold across g, i.e. lanes {u, u+16, u+32, u+48}; XOR 1/2/4/8
+                # would mix features rather than tokens.
                 folded = []
                 for i in range_constexpr(FEAT_TILES_PER_WAVE):
                     m = run_max[i]
                     for sh in (16, 32):
                         m = m.maximumf(m.shuffle_xor(sh, WAVE))
                     folded.append(m)
-
                 if const_expr(WAVES_PER_TOK > 1):
-                    # The waves splitting the page's token axis each hold a max
-                    # over their own tok_tiles only, and LDS is the only place
-                    # waves meet. Once per page on FEAT_TILES_PER_WAVE values, not per tok_tile.
-                    # Every lane writes, so the write is one contiguous 256 B
-                    # run per (wave, tile) and the read is lane-local.
+                    # The token waves each hold a max over their own tok_tiles
+                    # and LDS is the only place waves meet. Every lane writes,
+                    # so the write is one contiguous 256 B run per (wave, tile)
+                    # and the read is lane-local.
                     red = lds.red.ptr
                     if const_expr(pages_per_wave > 1):
                         # Slots are reused every page: do not overwrite them
@@ -1455,12 +1220,10 @@ def build_index_score(
                             )
                         reduced.append(m)
                     folded = reduced
-
-                # Whether page p really exists. This gates the store, not the
-                # work: page ids are clamped in the prologue, so an out-of-range
-                # page reads real memory and computes a value nobody keeps. At
-                # one page per wave the branch below has already proved the page
-                # in range and the mask would be dead.
+                # Whether page p really exists. Gates the store, not the work:
+                # ids are clamped in the prologue, so an out-of-range page
+                # computes a value nobody keeps. At one page per wave the
+                # branch above proved it and the mask would be dead.
                 valid = (
                     None
                     if const_expr(pages_per_wave == 1 and WAVES_PER_TOK == 1)
@@ -1468,8 +1231,8 @@ def build_index_score(
                 )
                 for i in range_constexpr(FEAT_TILES_PER_WAVE):
                     # Scale folded in here rather than per accumulator: it is
-                    # positive so max(s*x) == s*max(x), and -inf * s is still
-                    # -inf, so a fully masked page still stores -inf.
+                    # positive so max(s*x) == s*max(x), and -inf * s is -inf,
+                    # so a fully masked page still stores -inf.
                     m = folded[i] * f32_scale
                     tok, head = tok_head_of(i)
                     row = b * fx.Int32(S) + tok
@@ -1478,16 +1241,14 @@ def build_index_score(
                         + row * i32_stride_s_b
                         + p * i32_stride_s_k
                     )
-                    # One writer per feature. Padding columns write nothing --
-                    # which also covers the tiles a ragged feature split hands
-                    # the last wave -- and neither do pages past this request.
+                    # One writer per feature; padding columns and pages past
+                    # this request write nothing.
                     is_writer = (g == fx.Int32(0)) & (feature_of(i) < fx.Int32(F))
                     if const_expr(WAVES_PER_TOK > 1):
                         # All WAVES_PER_TOK waves hold the same value; pick one.
                         is_writer = is_writer & (tw == fx.Int32(0))
                     if valid is not None:
                         is_writer = is_writer & valid
-
                     if is_writer:
                         fx.add_offset(fx.get_iter(s_buf), addr).store(m)
 
@@ -1534,11 +1295,10 @@ def build_index_score(
         )
 
     # Freeing VGPRs is not the same as spending them on occupancy: the
-    # scheduler reinvests them in more load hoisting. This is the channel that
-    # actually forces the issue.
+    # scheduler reinvests them in load hoisting, so this is the only channel
+    # that forces the issue.
     if cfg.waves_per_eu:
         launch.compile_hints["waves_per_eu"] = cfg.waves_per_eu
-
     return launch, CHUNK
 
 
@@ -1557,19 +1317,13 @@ def _get(S, H, fp8, cfg, device, arch=DEFAULT_ARCH):
 def shuffle_cache(cache):
     """Reorder a [pages, 128, 128] K cache into the kernel's shuffled layout.
 
-    Element (row, k) moves to the slot the lane that wants it will read:
-
-        load slot j = tok_tile * K_LOADS + i   (tok_tile = row // 16)
-        lane        = 16 * g + u            (u = row % 16)
-        position    = (j * WAVE + lane) * CHUNK_ELEMS + v
-
-    where (g, v) come from inverting the kernel's k_offset map. Derived from
-    that map rather than written independently, because the two must agree
-    exactly -- a mismatch here is silent wrong numbers, not a crash.
-
-    The layout is the same on gfx950 and gfx942 (see ArchTraits for why), so
-    the producer -- which lives in another component -- does not have to know
-    which chip will read it. Paid once when the cache is written.
+    Element (row, k) moves to the slot the lane that wants it will read,
+    (j * WAVE + 16*g + u) * CHUNK_ELEMS + v for load slot
+    j = (row // 16) * K_LOADS + i and u = row % 16, with (g, v) from inverting
+    the kernel's k_offset map. Derived from that map rather than written
+    independently: the two must agree exactly, and a mismatch is silent wrong
+    numbers, not a crash. The layout is the same on both architectures, so the
+    producer need not know which chip will read it.
     """
     import torch
 
@@ -1580,23 +1334,19 @@ def shuffle_cache(cache):
     tr = arch_traits(DEFAULT_ARCH, fp8)
     chunk_elems = tr.chunk_elems
     k_loads = tr.k_loads
-
     dev = cache.device
     row = torch.arange(PAGE, device=dev)
     kk = torch.arange(HEAD_DIM, device=dev)
-    # For each (row, k), which lane/slot/offset does it belong to?
     tok_tile, u = row // MFMA_M, row % MFMA_M
     # Invert k_offset: an access block is block_k wide and lane group g owns
-    # lane_block of it, so k = i*block_k + g*lane_block + v with v in
-    # [0, chunk_elems). That is k = 64*i + 16*g + v for fp8 and
-    # k = 32*i + 8*g + v for bf16, on either architecture.
+    # lane_block of it, so k = i*block_k + g*lane_block + v -- 64/16 for fp8,
+    # 32/8 for bf16, on either architecture.
     i = kk // tr.block_k
     g = (kk % tr.block_k) // tr.lane_block
     v = kk % tr.lane_block
     slot = tok_tile[:, None] * k_loads + i[None, :]
     fx_lane = 16 * g[None, :] + u[:, None]
     dst = (slot * WAVE + fx_lane) * chunk_elems + v[None, :]
-
     flat = cache.reshape(npages, PAGE * HEAD_DIM)
     out = torch.empty_like(flat)
     out.scatter_(1, dst.reshape(1, -1).expand(npages, -1), flat)
@@ -1606,33 +1356,19 @@ def shuffle_cache(cache):
 def make_work_map(seq_lens, max_block, chunk, out=None, world: int = 1, rank: int = 0):
     """Dispatch order -> work item, packed so the holes all land at the end.
 
-    seq_lens    [batch] int32 context lengths
-    max_block   launch bound on blocks per request; LOCAL bound under CP
-    chunk       pages one CTA covers, i.e. `work_chunk` for this config
-    out         optional destination, sliced down if larger than needed
-    world/rank  context-parallel shard, 1/0 for none
-
     The grid is `batch x ceil(max_block/chunk)`, sized by the longest request,
-    so a ragged batch leaves holes in that rectangle, and where they sit is
-    what they cost: each takes a launch slot and retires before the machine can
-    build up K loads in flight. So number the real work 0..total-1 and give
-    item n to the n-th dispatched CTA. Row n is
+    so a ragged batch leaves holes in that rectangle and each costs a launch
+    slot that retires before the machine can build up K loads in flight. So
+    number the real work 0..total-1 and give item n to the n-th dispatched CTA:
+    row n is [0] = (b << 16) | c and [1] = seq_lens[b], which the kernel needs
+    anyway and which keeps the lookup to one cache line. A hole reads as
+    (0, 0), so the kernel's tail guard retires it with no extra branch.
 
-        [0] = (b << 16) | c    request, and which chunk of it; 0 for a hole
-        [1] = seq_lens[b]      the kernel needs the length anyway, and keeping
-                               it here holds the lookup to one cache line
-
-    A hole reads as (0, 0), i.e. seq_len 0, so the kernel's existing tail guard
-    retires it -- no extra branch, and page ids clamp to a legal address.
-
-    Every step is a device op on `seq_lens`, so this is cudagraph-capturable
-    and stays correct for whatever lengths a replay supplies. Call it once per
-    decode step; the lengths do not change between layers.
-
-    Under CP only the per-request chunk count changes -- a rank is given chunks
-    for `_cp_blocks` of the blocks. Row [1] stays the *global* `seq_lens[b]`,
-    because the kernel needs it for the causal cutoff and re-derives its own
-    local count from it.
+    Device ops only, so this is cudagraph-capturable; call it once per decode
+    step. `max_block` and `chunk` are the LOCAL bound and `work_chunk` for this
+    config. Under CP only the per-request chunk count changes -- row [1] stays
+    the *global* `seq_lens[b]`, which the kernel needs for the causal cutoff
+    and from which it re-derives its own local count.
     """
     import torch
 
@@ -1651,15 +1387,14 @@ def make_work_map(seq_lens, max_block, chunk, out=None, world: int = 1, rank: in
         out = torch.empty(
             (batch * chunks, 2), dtype=torch.int32, device=seq_lens.device
         )
-
     lens = seq_lens.to(torch.int32)
     nblk = (lens + (PAGE - 1)) // PAGE
     nblk = _cp_blocks_torch(nblk, world, rank)
     nch = (nblk + (chunk - 1)) // chunk  # work items this request owns
     cum = torch.cumsum(nch, 0, dtype=torch.int32)  # inclusive
     n = torch.arange(batch * chunks, dtype=torch.int32, device=seq_lens.device)
-    # First i with cum[i] > n owns item n; it is `batch` once n runs past the
-    # end. Requests of length zero have cum[i] == cum[i-1] and are skipped.
+    # First i with cum[i] > n owns item n, and `batch` once n runs past the
+    # end. Zero-length requests have cum[i] == cum[i-1] and are skipped.
     b = torch.searchsorted(cum, n, right=True).to(torch.int32)
     live = b < batch
     bc = torch.where(live, b, torch.zeros_like(b)).long()
@@ -1673,31 +1408,20 @@ def make_work_map(seq_lens, max_block, chunk, out=None, world: int = 1, rank: in
 def make_spread_work_map(seq_lens, rows, cu, out=None, world: int = 1, rank: int = 0):
     """The one-page-per-wave map, with the last CU round spread thin.
 
-    seq_lens    [batch] int32 context lengths
-    rows        grid rows to fill; see _grid_chunks
-    cu          CU count the spread is balanced against
-    out         optional destination, sliced down if larger than needed
-    world/rank  context-parallel shard, 1/0 for none
+    make_work_map gives every CTA a full chunk of four pages, which spills as a
+    second full CTA onto a few CUs once the live CTAs pass a multiple of the CU
+    count. What costs is the pages piling onto one CU, not the CTA count -- an
+    extra CTA holding a single page is free. So a step needing r CU rounds
+    keeps r - 1 rounds of full four-page CTAs and spreads what is left over the
+    last round, 1..4 pages each and the larger ones first, so no CU holds more
+    than ceil(pages / cu) plus rounding. Spreading every round evenly balances
+    as well but pays a CTA prologue per page or two.
 
-    make_work_map gives every CTA a full chunk of four pages, which spills as
-    a second full CTA onto a few CUs once the live CTAs pass a multiple of the
-    CU count. What costs is the pages piling onto one CU, not the CTA count --
-    an extra CTA holding a single page is free.
-
-    So a step needing r CU rounds keeps r - 1 rounds of full four-page CTAs
-    and spreads what is left over the last round's CTAs, 1..4 pages each and
-    the larger ones first, so no CU holds more than ceil(pages / cu) plus
-    rounding. Spreading every round evenly balances as well but pays a CTA
-    prologue per page or two.
-
-    Row n is [0] = (b << 16) | first page, [1] = seq_len | (pages << 24); holes
-    are (0, 0) and packed at the tail as before. The full CTAs come first in
-    dispatch order, taken from the front of the batch; then each request's
-    remainder, over a share of the last round proportional to its size. Each
-    request can round its share up by one CTA, so one slot per live request
-    is held back. `rows` is the grid, with one spare row per request (see
-    _grid_chunks), which is what keeps four pages per CTA enough at full
-    capacity. Device ops only: cudagraph-capturable.
+    Row n is [0] = (b << 16) | first page, [1] = seq_len | (pages << 24), holes
+    (0, 0) packed at the tail. Each request can round its share of the last
+    round up by one CTA, so one slot per live request is held back: `rows`
+    carries one spare row per request (see _grid_chunks), which is what keeps
+    four pages per CTA enough at full capacity. Device ops only.
     """
     import torch
 
@@ -1727,7 +1451,6 @@ def make_spread_work_map(seq_lens, rows, cu, out=None, world: int = 1, rank: int
     k = (rest * thin + rest_total.clamp(min=1) - 1) // rest_total.clamp(min=1)
     a_cum = torch.cumsum(a, 0)
     k_cum = torch.cumsum(k, 0)
-
     n = torch.arange(rows, dtype=torch.int64, device=dev)
     in_full = n < full
     bf = torch.searchsorted(a_cum, n, right=True).clamp(max=batch - 1)
@@ -1753,11 +1476,8 @@ def make_spread_work_map(seq_lens, rows, cu, out=None, world: int = 1, rank: int
 def build_spread_map(batch: int, world: int = 1, rank: int = 0):
     """make_spread_work_map as one kernel: one thread per row, batch unrolled.
 
-    The torch version is ~40 small ops, whose launch cost dwarfs the scorer it
-    prepares for. Every thread redoes the O(batch) per-request prefix
-    arithmetic for its own row; at batch <= SPREAD_MAX_BATCH that is cheaper
-    than a second pass or a barrier. Bit-identical to `make_spread_work_map`;
-    the tests hold the two together.
+    The torch version is ~40 small ops whose launch cost dwarfs the scorer it
+    prepares for. Bit-identical to it, which the tests pin.
     """
     if not 1 <= batch <= SPREAD_MAX_BATCH:
         raise ValueError(f"spread map batch must be in [1, {SPREAD_MAX_BATCH}]")
@@ -1792,7 +1512,6 @@ def build_spread_map(batch: int, world: int = 1, rank: int = 0):
             if const_expr(world > 1):
                 pages = _cp_blocks(pages, world, rank, zero)
             nblk.append(pages)
-
         total, live, fits_total = zero, zero, zero
         for b in range_constexpr(batch):
             total = total + nblk[b]
@@ -1805,7 +1524,6 @@ def build_spread_map(batch: int, world: int = 1, rank: int = 0):
         thin = lo(lo(rounds * cu - full - live, rest_total), i32_rows - full - live)
         thin = hi(thin, one)
         denom = hi(rest_total, one)
-
         nt = n - full
         fits_before, a_before, k_before = zero, zero, zero
         hit, hit_b, hit_first, hit_span, hit_len = zero, zero, zero, zero, zero
@@ -1837,11 +1555,9 @@ def build_spread_map(batch: int, world: int = 1, rank: int = 0):
             hit_len = take.select(lens[b], hit_len)
             a_before = a_before + a
             k_before = k_before + k
-
         live_row = hit > zero
         row0 = live_row.select((hit_b << fx.Int32(16)) | hit_first, zero)
         row1 = live_row.select(hit_len | (hit_span << fx.Int32(24)), zero)
-
         if n < i32_rows:
             base = fx.get_iter(out_buf)
             fx.add_offset(base, n * fx.Int32(2)).store(row0)
@@ -1868,10 +1584,8 @@ def build_spread_map(batch: int, world: int = 1, rank: int = 0):
 def build_chunk_map(batch: int, chunk: int, world: int = 1, rank: int = 0):
     """make_work_map as one kernel: one thread per row, batch unrolled.
 
-    The torch version is a dozen small ops whose cost is launch floor, which a
-    scorer this short cannot absorb. Each thread redoes the O(batch) prefix sum
-    for its own row rather than sharing it. Bit-identical to `make_work_map`;
-    the tests hold the two together.
+    The torch version is a dozen small ops whose launch floor a scorer this
+    short cannot absorb. Bit-identical to it, which the tests pin.
     """
     if not 1 <= batch <= SPREAD_MAX_BATCH:
         raise ValueError(f"chunk map batch must be in [1, {SPREAD_MAX_BATCH}]")
@@ -1887,7 +1601,6 @@ def build_chunk_map(batch: int, chunk: int, world: int = 1, rank: int = 0):
         lens_buf = ptr_buf_tensor(arg_lens, fx.Int32)
         out_buf = ptr_buf_tensor(arg_out, fx.Int32)
         zero, one = fx.Int32(0), fx.Int32(1)
-
         hit, hit_b, hit_c, hit_len = zero, zero, zero, zero
         before = zero
         for b in range_constexpr(batch):
@@ -1904,11 +1617,9 @@ def build_chunk_map(batch: int, chunk: int, world: int = 1, rank: int = 0):
             hit_c = take.select(n - before, hit_c)
             hit_len = take.select(length, hit_len)
             before = before + nch
-
         live = hit > zero
         row0 = live.select((hit_b << fx.Int32(16)) | hit_c, zero)
         row1 = live.select(hit_len, zero)
-
         if n < i32_rows:
             base = fx.get_iter(out_buf)
             fx.add_offset(base, n * fx.Int32(2)).store(row0)
@@ -1976,21 +1687,15 @@ def _run_spread_map(seq_lens, rows, cu, out, world, rank):
 def work_map_size(
     batch: int, max_block: int, S: int = 0, H: int = 0, cfg=None, *, device=None
 ) -> int:
-    """Rows `make_work_map` will produce -- i.e. the grid, one row per CTA.
+    """Rows `make_work_map` will produce -- the grid, one row per CTA.
 
-    The buffer is `[rows, 2]` int32. A caller sizing a persistent one for a
-    cudagraph must use `work_map_capacity` instead, because the exact grid size
-    is non-monotonic in the bounds, and hand `make_work_map` a `buf[:rows]`
-    slice -- still packed, so still a legal kernel argument.
-
-    Exists so a caller does not re-derive the chunk size: it depends on the
-    resolved `pages_per_wave`, which depends on the CU count, so a second copy
-    would go wrong the first time this runs on a different chip.
-
-    Under context parallelism `max_block` is the local bound, so this is the
-    shard's grid. Pass S/H to enable automatic token splitting; omitting them
-    keeps the legacy unsplit map, which `score_flydsl` accepts with the
-    matching fallback geometry.
+    A caller sizing a persistent `[rows, 2]` int32 buffer for a cudagraph must
+    use `work_map_capacity` instead, because the exact grid size is
+    non-monotonic in the bounds, and hand `make_work_map` a `buf[:rows]` slice
+    -- still packed, so still a legal kernel argument. Exists so a caller does
+    not re-derive the chunk size, which depends on the resolved
+    `pages_per_wave` and hence on the CU count. Omitting S/H keeps the legacy
+    unsplit map, which `score_flydsl` accepts with the matching geometry.
     """
     cfg = cfg or IndexScoreConfig()
     _validate_bounds(batch, max_block, cfg, resolved=False)
@@ -2004,16 +1709,11 @@ def work_map_capacity(
     """Persistent rows covering every batch/block bound within the envelope.
 
     Sizes for the smallest CTA chunk automatic depth/token splitting can reach,
-    independent of CU count, so the buffer stays valid on any chip. An explicit
-    configuration keeps its own tighter geometry.
-
-    The envelope deliberately includes Q1 even when S is a larger query bound:
-    a serving caller may reuse a maximum-query allocation for decode replays,
-    and asking with the largest S then launching Q1 is the natural mistake.
-    It is not widened where `max_block` cannot pack at one page per chunk --
-    there the block count is what hits the packing limit, and the token split
-    that would need it cannot fire anyway, so widening would only reject
-    bounds this accepts today for a geometry no launch can reach.
+    independent of CU count, so the buffer stays valid on any chip. The
+    envelope deliberately includes Q1 even when S is a larger query bound,
+    since a serving caller may reuse a maximum-query allocation for decode
+    replays; it is not widened where `max_block` cannot pack at one page per
+    chunk, because there the token split that would need it cannot fire.
     """
     cfg = cfg or IndexScoreConfig()
     _validate_bounds(max_batch, max_block, cfg, resolved=False)
@@ -2039,15 +1739,11 @@ def work_map_capacity(
 def build_work_map(seq_lens, max_block, S: int = 0, H: int = 0, cfg=None, out=None):
     """`make_work_map` with the chunk size resolved for you.
 
-    The entry point a serving caller wants: `make_work_map` takes the chunk
-    size as a number, so a caller that builds the map in one place and launches
-    in another would have to resolve the config twice and keep the two
-    agreeing. A disagreement there is not a crash, it is a map the kernel
-    indexes with the wrong stride.
-
-    `out` may be larger than needed -- a persistent worst-case buffer from
-    `work_map_capacity` -- and is sliced down here; a short one is an error
-    rather than a silently truncated grid.
+    Building the map in one place and launching in another would otherwise
+    mean resolving the config twice and keeping the two agreeing -- and a
+    disagreement is not a crash, it is a map the kernel indexes with the wrong
+    stride. `out` may be a larger persistent buffer and is sliced down here; a
+    short one is an error rather than a silently truncated grid.
     """
     import torch
 
@@ -2208,11 +1904,11 @@ def _validate_metadata(
 ):
     """Metadata only: no device reads, synchronization, or per-layer allocations.
 
-    Contents are a caller contract: 0 <= seq_lens <= INT32_MAX-127,
-    each length fits max_block's local CP bound and the global block table,
-    and every referenced physical page ID is in [0, cache.shape[0]). Even
-    zero-length requests need a valid clamped table entry at column zero.
-    A supplied map must be rebuilt when lengths change, with the same config.
+    Contents are a caller contract: 0 <= seq_lens <= INT32_MAX-127, each length
+    fits max_block's local CP bound and the global block table, and every
+    referenced physical page ID is in [0, cache.shape[0]). Even zero-length
+    requests need a valid clamped table entry at column zero. A supplied map
+    must be rebuilt when lengths change, with the same config.
     """
     import torch
 
@@ -2224,9 +1920,7 @@ def _validate_metadata(
     arch = torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
     if arch not in SUPPORTED_ARCHS:
         raise ValueError(f"index score requires one of {SUPPORTED_ARCHS}, got {arch}")
-    # Q may arrive bf16 or already fp8 -- this used to accept bf16 only while
-    # the pointer was bound as bf16 unconditionally, so an fp8 Q was a silent
-    # misread. 16 B alignment covers both widths.
+    # Q may arrive bf16 or already fp8; 16 B alignment covers both widths.
     _validate_tensor(idx_q, "idx_q", (torch.bfloat16, dtypes.fp8), 3, device, 16)
     _validate_tensor(cache, "cache", (torch.bfloat16, dtypes.fp8), 3, device, 16, False)
     if idx_q.shape[1:] != (H, HEAD_DIM) or idx_q.shape[0] % S:
@@ -2278,19 +1972,17 @@ def _validate_metadata(
             or block_table.stride(0) < block_table.shape[1]
         ):
             raise ValueError("block_table: invalid shape or layout")
-        # Under context parallelism the table is indexed by the GLOBAL block
+        # Under CP the table is indexed by the GLOBAL block
         # `p * cp_world + cp_rank`, so a rank with a non-empty shard needs
-        # columns well past `max_block` -- which is its LOCAL page count. The
-        # width that needs is a function of seq_lens, and this path is
-        # deliberately metadata-only (reading seq_lens means a device sync on
-        # every call), so the table width stays a caller contract; see `cp_world`.
-        #
-        # The worst case `(max_block - 1) * cp_world + cp_rank` is NOT usable as
-        # a check here. A caller whose shard is empty has no local page to state
-        # and passes the global count instead, and the kernel clamps its
-        # speculative block-table load to column 0 -- legal at any width, and
-        # pinned by `test_empty_cp_shard_narrow_table`. Rejecting on the worst
-        # case would turn that supported call into an argument error.
+        # columns well past `max_block`, its LOCAL page count. That width is a
+        # function of seq_lens and this path is deliberately metadata-only, so
+        # it stays a caller contract; see `cp_world`. The worst case
+        # `(max_block - 1) * cp_world + cp_rank` is NOT usable as a check here:
+        # a caller whose shard is empty has no local page to state and passes
+        # the global count instead, and the kernel clamps its speculative
+        # block-table load to column 0 -- legal at any width, and pinned by
+        # `test_empty_cp_shard_narrow_table`. Rejecting on the worst case would
+        # turn that supported call into an argument error.
     if seq_lens is not None:
         _validate_tensor(seq_lens, "seq_lens", (torch.int32,), 1, device)
         if seq_lens.shape != (batch,) or seq_lens.stride() != (1,):
@@ -2350,22 +2042,16 @@ def alloc_score(batch, S, H, max_block, device):
     """Allocate the score output in whichever layout the kernel writes fastest.
 
     Returns [H, batch*S, max_block] fp32 either way; only the strides differ,
-    so this is invisible to every consumer -- both selectors take the three
-    score strides as arguments -- except in the time it takes.
-
-    Why it matters: the epilogue stores one fp32 per feature per page, so with
-    F = S*H features the contiguous layout puts those F lanes on F different
-    cache lines `max_block` floats apart. Making the feature axis contiguous
-    instead packs the same values into one full 128 B line per store.
-
-    The consumer pays a little for it -- its page axis goes from contiguous to
-    total_q*H*4 strided -- and it loses eligibility for the aiter selector,
-    which needs `score.view(rows, max_block)`. At the shapes where this layout
-    wins, that selector already declines on its LDS budget, but a caller with a
-    small max_block should check rather than assume.
-
-    Below F = 16 the store is at most 16 bytes, so there is no scatter left to
-    fix and those shapes stay contiguous.
+    which is invisible to every consumer -- both selectors take the three score
+    strides as arguments -- except in the time it takes. The epilogue stores
+    one fp32 per feature per page, so the contiguous layout puts those F = S*H
+    lanes on F different cache lines `max_block` floats apart, where a
+    contiguous feature axis packs them into one 128 B line per store. The
+    consumer pays a strided page axis and loses eligibility for the aiter
+    selector, which needs `score.view(rows, max_block)`; at the shapes where
+    this wins that selector already declines on its LDS budget, but a caller
+    with a small max_block should check rather than assume. Below F = 16 the
+    store is at most 16 bytes, so those shapes stay contiguous.
     """
     import torch
 
@@ -2393,19 +2079,15 @@ def score_flydsl(
     work_map=None,
     **cfg_kwargs,
 ):
-    """Host entry point. Mirrors the signature the op_test drives.
-
-    Tunables come in as an IndexScoreConfig, or as loose keyword arguments
-    naming its fields (`shuffled=True`, `waves_per_tok=2`, ...) for callers that
-    only want to flip one.
-    """
+    """Host entry point. Mirrors the signature the op_test drives; tunables
+    come in as an IndexScoreConfig or as loose keyword arguments naming its
+    fields (`shuffled=True`, `waves_per_tok=2`, ...)."""
     import torch
 
     if cfg is None:
         cfg = IndexScoreConfig(**cfg_kwargs)
     elif cfg_kwargs:
         raise TypeError("pass either cfg or its fields as keywords, not both")
-
     batch, cfg, arch = _validate_metadata(
         idx_q, cache, S, H, max_block, block_table, cfg, seq_lens, out, work_map
     )
@@ -2419,10 +2101,8 @@ def score_flydsl(
     # already rejected anything that is neither.
     fp8_q = idx_q.dtype == dtypes.fp8
     cfg = replace(cfg, fp8_q=int(fp8_q))
-
     if out is None:
         out = alloc_score(batch, S, H, max_block, idx_q.device)
-
     launch, _chunk = _get(S, H, fp8, cfg, idx_q.device.index, arch)
     # Grid depends only on launch-time bounds, never on seq_lens contents, so
     # it stays valid across a cudagraph replay with different lengths.
@@ -2431,16 +2111,13 @@ def score_flydsl(
     # pass it in, since every layer of a step sees the same lengths.
     if work_map is None:
         work_map = _make_map(seq_lens, max_block, cfg, batch * chunks)
-
     with torch.cuda.device(idx_q.device):
         _run_compiled(
             launch,
             ptr_arg(idx_q, _fp8_t(arch) if fp8_q else fx.BFloat16),
-            # `dtypes.fp8` has already matched both tensors against the flavour
-            # this chip speaks, so the FlyDSL element type has to name the same
-            # one: e4m3fn on gfx950, e4m3fnuz on gfx942. See `_fp8_t` -- the two
-            # biases differ, and binding the wrong one is silently wrong values,
-            # not a failure.
+            # `dtypes.fp8` has matched both tensors against the flavour this
+            # chip speaks, so the FlyDSL element type has to name the same one;
+            # see `_fp8_t`. Binding the wrong one is silently wrong values.
             ptr_arg(cache, _fp8_t(arch) if fp8 else fx.BFloat16),
             ptr_arg(out, fx.Float32),
             ptr_arg(block_table, fx.Int32),
