@@ -66,6 +66,57 @@ def topk_softmax(
     )
 
 
+@compile_ops("module_moe_asm", fc_name="topk_softmax_fused_shared_gate", develop=True)
+def _topk_softmax_fused_shared_gate(
+    topk_weights: Tensor,
+    topk_indices: Tensor,
+    token_expert_indices: Tensor,
+    gating_output: Tensor,
+    need_renorm: bool,
+    num_shared_experts: int,
+    shared_expert_scoring_func: str,
+    hidden_states: Tensor,
+    gate_weight: Tensor,
+    shared_expert_scale: float,
+    shared_expert_base: int,
+) -> None: ...
+
+
+def topk_softmax_fused_shared_gate(
+    topk_weights: Tensor,
+    topk_indices: Tensor,
+    token_expert_indices: Tensor,
+    gating_output: Tensor,
+    need_renorm: bool,
+    num_shared_experts: int,
+    shared_expert_scoring_func: str,
+    hidden_states: Tensor,
+    gate_weight: Tensor,
+    shared_expert_scale: float = 1.0,
+    shared_expert_base: int = -1,
+) -> None:
+    # Option A ("fuse-gate"): gating_output holds ONLY routed experts; the shared
+    # logit is computed in-kernel as
+    #   sigmoid(hidden_states @ gate_weight.T) * shared_expert_scale
+    # (scale applied AFTER sigmoid) and the shared id (shared_expert_base + s) is
+    # written by the kernel. Output buffers are width topk + num_shared_experts.
+    # No softmax_workspace: the fused op supports only power-of-2 num_experts <= 512
+    # (non-power-of-2 is rejected), so the two-pass path that needed it never runs.
+    _topk_softmax_fused_shared_gate(
+        topk_weights,
+        topk_indices,
+        token_expert_indices,
+        gating_output,
+        need_renorm,
+        num_shared_experts,
+        shared_expert_scoring_func,
+        hidden_states,
+        gate_weight,
+        shared_expert_scale,
+        shared_expert_base,
+    )
+
+
 @compile_ops(
     "module_moe_topksoftmax_asm", fc_name="topk_softmax_asm", ffi_type="ctypes"
 )

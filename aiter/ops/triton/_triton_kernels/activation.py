@@ -1,8 +1,9 @@
 import triton
 import triton.language as tl
 
-from .quant.fused_fp8_quant import _fp8_quant_op
-from .quant.quant import _mxfp4_quant_op
+from aiter.ops.triton._triton_kernels.quant.fused_fp8_quant import _fp8_quant_op
+from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 
 @triton.jit
@@ -13,6 +14,16 @@ def _silu_exp2(x):
 @triton.jit
 def _silu(x):
     return _silu_exp2(x)
+
+
+@triton.jit
+def _sigmoid_exp2(x):
+    return 1.0 / (1.0 + tl.exp2(-(x * 1.44269504089)))
+
+
+@triton.jit
+def _sigmoid(x):
+    return _sigmoid_exp2(x)
 
 
 @triton.jit
@@ -57,6 +68,76 @@ def fused_silu_mul_kernel(
     tl.store(out_ptrs, o, mask=mask)
 
 
+_silu_and_mul_backward_kernel_repr = make_kernel_repr(
+    "_silu_and_mul_backward_kernel",
+    ["BLOCK_M", "BLOCK_N"],
+)
+
+
+@triton.jit(repr=_silu_and_mul_backward_kernel_repr)
+def _silu_and_mul_backward_kernel(
+    grad_output_ptr,
+    input_ptr,
+    grad_input_ptr,
+    n_rows,
+    n_cols,
+    grad_output_row_stride,
+    grad_output_col_stride,
+    input_row_stride,
+    input_col_stride,
+    grad_input_row_stride,
+    grad_input_col_stride,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Backward for ``silu(gate) * up`` with concatenated gate/up inputs."""
+    rows = tl.program_id(0).to(tl.int64) * BLOCK_M + tl.arange(0, BLOCK_M)
+    cols = tl.program_id(1).to(tl.int64) * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = (rows[:, None] < n_rows) & (cols[None, :] < n_cols)
+
+    grad_output_row_stride = tl.cast(grad_output_row_stride, tl.int64)
+    grad_output_col_stride = tl.cast(grad_output_col_stride, tl.int64)
+    input_row_stride = tl.cast(input_row_stride, tl.int64)
+    input_col_stride = tl.cast(input_col_stride, tl.int64)
+    grad_input_row_stride = tl.cast(grad_input_row_stride, tl.int64)
+    grad_input_col_stride = tl.cast(grad_input_col_stride, tl.int64)
+
+    input_offsets = rows[:, None] * input_row_stride + cols[None, :] * input_col_stride
+    grad_output_offsets = (
+        rows[:, None] * grad_output_row_stride + cols[None, :] * grad_output_col_stride
+    )
+    grad_input_offsets = (
+        rows[:, None] * grad_input_row_stride + cols[None, :] * grad_input_col_stride
+    )
+    n_cols_i64 = tl.cast(n_cols, tl.int64)
+
+    gate = tl.load(input_ptr + input_offsets, mask=mask, other=0.0).to(tl.float32)
+    up = tl.load(
+        input_ptr + input_offsets + n_cols_i64 * input_col_stride,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    grad_output = tl.load(
+        grad_output_ptr + grad_output_offsets, mask=mask, other=0.0
+    ).to(tl.float32)
+
+    sigmoid_gate = _sigmoid_exp2(gate)
+    silu_gate = gate * sigmoid_gate
+    grad_gate = grad_output * up * sigmoid_gate * (1.0 + gate * (1.0 - sigmoid_gate))
+    grad_up = grad_output * silu_gate
+
+    tl.store(
+        grad_input_ptr + grad_input_offsets,
+        grad_gate.to(grad_input_ptr.dtype.element_ty),
+        mask=mask,
+    )
+    tl.store(
+        grad_input_ptr + grad_input_offsets + n_cols_i64 * grad_input_col_stride,
+        grad_up.to(grad_input_ptr.dtype.element_ty),
+        mask=mask,
+    )
+
+
 @triton.jit
 def _tanh(x):
     return 2 * tl.sigmoid(2 * x) - 1
@@ -94,6 +175,8 @@ def _get_activation_from_str(activation: str):
     mapping = {
         "gelu": _gelu,
         "gelu_tanh": _gelu_tanh,
+        "sigmoid": _sigmoid,
+        "sigmoid_exp2": _sigmoid_exp2,
         "silu": _silu,
         "silu_exp2": _silu_exp2,
         "relu": _relu,
@@ -108,6 +191,10 @@ def _apply_activation_from_str(x, activation: tl.constexpr):
         return _gelu(x)
     elif activation == "gelu_tanh":
         return _gelu_tanh(x)
+    elif activation == "sigmoid":
+        return _sigmoid(x)
+    elif activation == "sigmoid_exp2":
+        return _sigmoid_exp2(x)
     elif activation == "silu":
         return _silu(x)
     elif activation == "silu_exp2":
@@ -148,7 +235,7 @@ def _act_mul_and_dynamic_mxfp4_quant_kernel(
     SCALING_MODE: tl.constexpr,
     ACTIVATION: tl.constexpr,
     scaleN: tl.constexpr,
-    scaleM_pad: tl.constexpr,
+    scaleM_pad,
     scaleN_pad: tl.constexpr,
     SHUFFLE: tl.constexpr,
 ):

@@ -223,7 +223,7 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
         PRELOAD_SFA_LDS ? (SFA_ROWS * SFA_K_TILES_MAX * (int)sizeof(D_SF)) : 1;
     // 16B-aligned so the panel fill below can land ds_write_b128; a bare char
     // array is only byte-aligned as far as the language is concerned.
-    __shared__ alignas(16) char smem_sfa[SFA_LDS_BYTES];
+    __shared__ __align__(16) char smem_sfa[SFA_LDS_BYTES];
     D_SF* s_sfa_ptr = reinterpret_cast<D_SF*>(smem_sfa);
     // Runtime packed K-tile count (== loops); used as the compact LDS M-row
     // stride so the read layout reuses make_layout_sfa with stride_sfa replaced.
@@ -701,7 +701,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_scale_splitk_
     // overflows int32 for large-M batch-in-the-middle layouts.
     auto g_a = make_gmem(reinterpret_cast<const D_A*>(kargs.ptr_a) + (size_t)batch_id*kargs.stride_a_batch + (size_t)row*kargs.stride_a + k_start);
     auto g_b = make_gmem(reinterpret_cast<const D_B*>(kargs.ptr_b) + (size_t)batch_id*kargs.stride_b_batch + (size_t)col*kargs.stride_b + k_start);
-    auto g_c = make_gmem(reinterpret_cast<D_C*>(kargs.ws_handle->ptr) + (size_t)split_id * kargs.batch * kargs.stride_ws_batch + (size_t)batch_id * kargs.stride_ws_batch + (size_t)row * kargs.stride_ws + col);
+    auto g_c = make_gmem(reinterpret_cast<D_C*>(kargs.ptr_ws) + (size_t)split_id * kargs.batch * kargs.stride_ws_batch + (size_t)batch_id * kargs.stride_ws_batch + (size_t)row * kargs.stride_ws + col);
 
     auto g_sfa = make_gmem(reinterpret_cast<const D_SF*>(kargs.ptr_sfa) + (size_t)batch_id*kargs.stride_sfa_batch + (size_t)(row/T::GROUP_M)*kargs.stride_sfa + sf_start);
     auto g_sfb = make_gmem(reinterpret_cast<const D_SF*>(kargs.ptr_sfb) + (size_t)batch_id*kargs.stride_sfb_batch + (size_t)(col/T::GROUP_N)*kargs.stride_sfb + sf_start);

@@ -28,8 +28,6 @@ def compile_flydsl_fhmoe_stage1(
     b_dtype: str,
     out_dtype: str,
     act: str = "silu",
-    situ_beta: float = 1.0,
-    situ_linear_beta: float = 1.0,
     persist_m: int = 1,
     use_async_copy: bool = False,
     k_batch: int = 1,
@@ -64,8 +62,6 @@ def compile_flydsl_fhmoe_stage1(
         b_dtype=b_dtype,
         out_dtype=out_dtype,
         act=act,
-        situ_beta=situ_beta,
-        situ_linear_beta=situ_linear_beta,
         persist_m=persist_m,
         use_async_copy=use_async_copy,
         k_batch=k_batch,
@@ -107,6 +103,7 @@ def compile_flydsl_fhmoe_stage2(
     enable_bias: bool = False,
     xcd_swizzle: int = 0,
     shared_expert_id: int = -1,
+    use_global_a: bool = True,
 ):
     """Compile the heterogeneous stage2 kernel."""
     from .kernels.fhmoe import compile_mixed_fhmoe_gemm2
@@ -130,6 +127,7 @@ def compile_flydsl_fhmoe_stage2(
         sort_block_m=sort_block_m,
         waves_per_eu=waves_per_eu,
         use_async_copy=use_async_copy,
+        use_global_a=use_global_a,
         cu_num_mul=cu_num_mul,
         b_nt=b_nt,
         model_dim_pad=model_dim_pad,
@@ -159,6 +157,8 @@ def _s1_args_fhmoe(
     bias=None,
     stream=None,
     swiglu_limit=float("inf"),
+    situ_beta=1.0,
+    situ_linear_beta=1.0,
     pass_swiglu_limit: bool = True,
     *,
     shared_w,
@@ -189,7 +189,16 @@ def _s1_args_fhmoe(
         size_expert_ids_in,
     )
     if pass_swiglu_limit:
-        return args + (float(swiglu_limit), stream)
+        beta = float(situ_beta)
+        linear_beta = float(situ_linear_beta)
+        return args + (
+            beta,
+            1.0 / beta,
+            linear_beta,
+            1.0 / linear_beta,
+            float(swiglu_limit),
+            stream,
+        )
     return args + (stream,)
 
 
@@ -204,6 +213,7 @@ def _s2_args_fhmoe(
     sorted_weights,
     num_valid_ids,
     token_num,
+    x_rows,
     n_in,
     k_in,
     blocks,
@@ -236,6 +246,7 @@ def _s2_args_fhmoe(
         ptr_arg(num_valid_ids),
         ptr_arg(kernel_bias),
         token_num,
+        x_rows,
         n_in,
         k_in,
         blocks,

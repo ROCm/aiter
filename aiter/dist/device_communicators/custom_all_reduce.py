@@ -29,19 +29,16 @@ from torch.distributed import ProcessGroup
 import aiter as ops
 from aiter import logger
 from aiter.dist.parallel_state import in_the_same_node_as
+from aiter.dist.utils import env_flag
 from aiter.utility.dtypes import fp8
 
 from .rocm_version import get_rocm_version
 
 
-def _env_flag(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
-
-
 def _detect_gfx1250() -> bool:
     # Escape hatch for validating the old-arch (IPC + old kernel) path on gfx1250
     # hardware: forces the non-gfx1250 code path end to end.
-    if _env_flag("AITER_CUSTOM_AR_DISABLE_GFX1250"):
+    if env_flag("AITER_CUSTOM_AR_DISABLE_GFX1250"):
         return False
     try:
         import torch
@@ -248,9 +245,9 @@ def _should_use_vmm(is_gfx1250: bool) -> bool:
     """
     if not is_gfx1250:
         return False
-    if _env_flag("AITER_CUSTOM_AR_FORCE_IPC"):
+    if env_flag("AITER_CUSTOM_AR_FORCE_IPC"):
         return False
-    if _env_flag("AITER_CUSTOM_AR_FORCE_VMM"):
+    if env_flag("AITER_CUSTOM_AR_FORCE_VMM"):
         return True
     v = get_rocm_version()
     if v is None:
@@ -457,10 +454,16 @@ class IPCBuffer:
     def uncached(self) -> bool:
         return self._uncached
 
-    def __del__(self):
+    def close(self):
         if (self._uncached or self._raw_cached) and self._raw_ptr:
             self._free_fn(self._raw_ptr)
             self._raw_ptr = 0
+        # Drop the torch.empty backing (default pool) so the caching allocator
+        # can reclaim it without waiting for GC of this object.
+        self._buffer = None
+
+    def __del__(self):
+        self.close()
 
 
 class IPCBufferPool:
@@ -560,6 +563,12 @@ class IPCBufferPool:
         self._buffers[key] = buf
         return buf
 
+    def close(self):
+        """Free all buffers this pool owns (meta + input)."""
+        for buf in self._buffers.values():
+            buf.close()
+        self._buffers = {}
+
     def __getitem__(self, key: str) -> IPCBuffer:
         return self._buffers[key]
 
@@ -590,8 +599,11 @@ class IPCBufferPool:
         if count == 0:
             return
         handle_sz = 64  # sizeof(hipIpcMemHandle_t)
-        handle = torch.empty(count * handle_sz, dtype=torch.uint8)
-        offset = torch.empty(count, dtype=torch.int64)
+        # Host memory regardless of torch's default device: the C side writes
+        # these through plain pointers, and a GPU tensor pickled to a peer is
+        # rebuilt there on this rank's GPU, opening a HIP context on it.
+        handle = torch.empty(count * handle_sz, dtype=torch.uint8, device="cpu")
+        offset = torch.empty(count, dtype=torch.int64, device="cpu")
         self._graph_ipc_meta_fn(ar_ptr, handle.data_ptr(), offset.data_ptr())
         handles, offsets = self._gather_ipc_meta((handle, offset))
         logger.info("Registering %d cuda graph addresses", count)
@@ -605,7 +617,8 @@ class IPCBufferPool:
 
     def _broadcast_ipc(self, data_ptr: int) -> tuple[list, list]:
         """Get IPC handle for *data_ptr* and broadcast across all ranks."""
-        handle = torch.empty(64, dtype=torch.uint8)  # sizeof(hipIpcMemHandle_t)
+        # sizeof(hipIpcMemHandle_t); host memory, as in flush_graph_buffers
+        handle = torch.empty(64, dtype=torch.uint8, device="cpu")
         self._ipc_handle_fn(data_ptr, handle.data_ptr())
         return self._gather_ipc_meta((handle, 0))
 
@@ -1059,8 +1072,27 @@ class CustomAllreduce:
         # PyTorch caching allocator (its memory accounting is what downstream
         # consumers profile against). Gated on the same condition as the
         # capture copy-in path above; _init_ipc only runs for non-VMM.
-        raw_cached = _expandable_segments_enabled()
+        # AITER_CUSTOM_AR_RAW_INPUT_POOL forces the raw pool without
+        # expandable segments. Its use case is co-resident engines on one node
+        # (#4921): a second engine's torch.empty input pool can fail
+        # hipIpcGetMemHandle outright, and the raw pool sidesteps that while
+        # everything else (meta pool, capture-time outputs) stays exportable
+        # under the default allocator.
+        raw_cached = _expandable_segments_enabled() or env_flag(
+            "AITER_CUSTOM_AR_RAW_INPUT_POOL"
+        )
         self._pool.create("input", max_size, raw_cached=raw_cached)
+        # One line per rank so every run self-documents which pool it actually
+        # got: a silently-inert trigger is indistinguishable from a working one
+        # by behaviour alone (both serve fine single-engine), and this class of
+        # bug (#4921) was reachable only in specific pool modes.
+        logger.info(
+            "CustomAllreduce input pool: %s (expandable_segments=%s, "
+            "AITER_CUSTOM_AR_RAW_INPUT_POOL=%s)",
+            "raw_cached/hipMalloc" if raw_cached else "torch.empty",
+            _expandable_segments_enabled(),
+            env_flag("AITER_CUSTOM_AR_RAW_INPUT_POOL"),
+        )
 
         handles, offsets = self._pool.get_ipc_meta("meta")
         self._ptr = self._ops_init_custom_ar(
@@ -1565,7 +1597,7 @@ class CustomAllreduce:
                     residual_inp,
                     w=weight,
                     eps=eps,
-                    registered=True,
+                    registered=self.enable_register_for_capturing,
                     use_1stage=use_1stage,
                     out_hidden_dim=out_hidden_dim,
                     gemma_norm=gemma_norm,
@@ -1669,7 +1701,7 @@ class CustomAllreduce:
                     residual_inp,
                     w=weight,
                     eps=eps,
-                    registered=True,
+                    registered=self.enable_register_for_capturing,
                     use_1stage=use_1stage,
                     post_per_token_quant=True,
                     gemma_norm=gemma_norm,
@@ -1867,7 +1899,7 @@ class CustomAllreduce:
                     q_w,
                     k_w,
                     eps,
-                    registered=True,
+                    registered=self.enable_register_for_capturing,
                 )
             else:
                 return (
@@ -1936,7 +1968,7 @@ class CustomAllreduce:
                     head_dim,
                     rotary_dim,
                     eps,
-                    registered=True,
+                    registered=self.enable_register_for_capturing,
                 )
             else:
                 return (
@@ -2038,7 +2070,7 @@ class CustomAllreduce:
                     w=weight,
                     eps=eps,
                     group_size=group_size,
-                    registered=True,
+                    registered=self.enable_register_for_capturing,
                     use_1stage=use_1stage,
                     emit_bf16=emit_bf16,
                     transpose_scale=transpose_scale,
@@ -2097,7 +2129,7 @@ class CustomAllreduce:
                     residual_inp,
                     w=weight,
                     eps=eps,
-                    registered=True,
+                    registered=self.enable_register_for_capturing,
                     use_1stage=use_1stage,
                     emit_bf16=emit_bf16,
                 )
@@ -2136,6 +2168,11 @@ class CustomAllreduce:
             except (AttributeError, RuntimeError):
                 pass
             self._ptr = 0
+        # Free the meta + input (max_size, up to 1 GB) buffers deterministically
+        # instead of leaving them for GC to reclaim via IPCBuffer.__del__.
+        pool = getattr(self, "_pool", None)
+        if pool is not None and hasattr(pool, "close"):
+            pool.close()
 
     def __del__(self):
         self.close()

@@ -28,7 +28,7 @@ from aiter.ops.triton.comms.all_gather import _all_gather_impl
 from aiter.ops.triton.comms.reduce_scatter import _reduce_scatter_impl
 
 if TYPE_CHECKING:
-    from ..iris import IrisCommContext
+    from aiter.ops.triton.comms.iris import IrisCommContext
 
 
 # If we got here, iris is available
@@ -300,7 +300,12 @@ def reduce_scatter_rmsnorm_quant_all_gather(
         raise ValueError(f"M ({M}) must be divisible by world_size ({world_size})")
 
     logger.info(
-        f"Rank {cur_rank}/{world_size}: Fused pipeline M={M}, N={N} -> M_shard={M_shard}"
+        "Rank %d/%d: Fused pipeline M=%d, N=%d -> M_shard=%d",
+        cur_rank,
+        world_size,
+        M,
+        N,
+        M_shard,
     )
 
     # Allocate or reuse buffers
@@ -405,7 +410,7 @@ def reduce_scatter_rmsnorm_quant_all_gather(
     # Synchronize
     ctx.iris_ctx.barrier()
 
-    logger.info(f"Rank {cur_rank}: Fused pipeline complete")
+    logger.info("Rank %d: Fused pipeline complete", cur_rank)
 
     # Return results based on configuration
     # Note: norm_buffer is in float32 for numerical accuracy during RMSNorm

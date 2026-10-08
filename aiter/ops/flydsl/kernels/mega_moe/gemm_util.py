@@ -8,44 +8,26 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
+from ..tensor_shim import buf_copy_load, buf_copy_store, ptr_buf_tensor
+
 _PACK = 2  # fp4 micro-scale pack (per-32 E8M0): pack_M = pack_N = pack_K = 2
 
 
-def _make_buffer(tensor, elem_ty, width=1, *, max_size=True, num_records_bytes=None):
-    alignment = max(1, elem_ty.width * width // 8)
-    ptr_ty = fx.PointerType.get(elem_ty.ir_type, fx.AddressSpace.Global, alignment)
-    base = fx.inttoptr(ptr_ty, fx.Int64(fx.ptrtoint(fx.get_iter(tensor))))
-    view = fx.Tensor(fx.make_view(base, fx.make_layout((width, 1), (1, width))))
-    return fx.rocdl.make_buffer_tensor(
-        view, max_size=max_size, num_records_bytes=num_records_bytes
+@flyc.jit
+def _load_row_map_subgroup(row_map_rsrc, row_index, lane):
+    """Load one source row per 16-lane K-slice group and broadcast it."""
+    subgroup_lane = lane & fx.Int32(15)
+    packed = fx.Int32(0)
+    if subgroup_lane == fx.Int32(0):
+        packed = row_map_rsrc[row_index]
+    source_lane = lane - subgroup_lane
+    return fx.Int32(
+        fx.rocdl.ds_bpermute(
+            T.i32,
+            source_lane * fx.Int32(4),
+            packed,
+        )
     )
-
-
-def _make_buffer_from_addr(addr, elem_ty, width=1, *, num_records_bytes=None):
-    alignment = max(1, elem_ty.width * width // 8)
-    ptr_ty = fx.PointerType.get(elem_ty.ir_type, fx.AddressSpace.Global, alignment)
-    base = fx.inttoptr(ptr_ty, fx.Int64(addr))
-    view = fx.Tensor(fx.make_view(base, fx.make_layout((width, 1), (1, width))))
-    return fx.rocdl.make_buffer_tensor(view, num_records_bytes=num_records_bytes)
-
-
-def _buffer_load(buffer, group_index, elem_ty, width=1, cache_modifier=0):
-    atom = fx.make_copy_atom(
-        fx.rocdl.BufferCopy(elem_ty.width * width, cache_modifier), elem_ty
-    )
-    fragment = fx.make_rmem_tensor(width, elem_ty)
-    fx.copy(atom, fx.slice(buffer, (None, group_index)), fragment)
-    value = Vec(fragment.load())
-    return value[0] if width == 1 else value
-
-
-def _buffer_store(buffer, group_index, value, elem_ty, width=1, cache_modifier=0):
-    atom = fx.make_copy_atom(
-        fx.rocdl.BufferCopy(elem_ty.width * width, cache_modifier), elem_ty
-    )
-    fragment = fx.make_rmem_tensor(width, elem_ty)
-    fragment.store(Vec.from_elements([value], elem_ty) if width == 1 else Vec(value))
-    fx.copy(atom, fragment, fx.slice(buffer, (None, group_index)))
 
 
 def wait_lds_barrier(vmcnt=63):
@@ -65,7 +47,7 @@ class TileScheduler:
         self._expert_offset = int(expert_offset)
 
     def expert_of(self, m_tile_i32):
-        g = _buffer_load(self._expert_rsrc, m_tile_i32, fx.Int32)
+        g = self._expert_rsrc[m_tile_i32]
         if const_expr(self._expert_offset != 0):
             return g - fx.Int32(self._expert_offset)
         return g
@@ -75,7 +57,7 @@ class TileScheduler:
 
 
 class ATileLoader:
-    """Expert-major A rows (row slot == sorted row) read contiguously gmem->reg (load_regs) then reg->LDS (store)."""
+    """Load expert-major A rows from contiguous or source-key storage."""
 
     def __init__(
         self,
@@ -87,6 +69,9 @@ class ATileLoader:
         swizzle=False,
         x_tensor=None,
         async_copy=False,
+        indexed_input=False,
+        row_map_rsrc=None,
+        source_rows=0,
     ):
         self._sort_block_m = sort_block_m
         self._k_step_bytes = k_step_bytes
@@ -97,7 +82,12 @@ class ATileLoader:
         self._wave = self._tx // 64
         self._x_tensor = x_tensor
         self._async_copy = bool(async_copy)
+        self._indexed_input = bool(indexed_input)
+        self._row_map_rsrc = row_map_rsrc
+        self._source_rows = int(source_rows)
         assert x_tensor is not None
+        if self._indexed_input:
+            assert row_map_rsrc is not None and self._source_rows > 0
         if const_expr(self._async_copy):
             assert total_threads % 64 == 0
             assert (sort_block_m * 16) % total_threads == 0
@@ -109,27 +99,32 @@ class ATileLoader:
 
     def for_tile(self, tile_row_base_i32):
         """Precompute LDS and tile-local global offsets for one M tile."""
-        tile_iter = fx.add_offset(
-            fx.get_iter(self._x_tensor),
-            fx.Int64(tile_row_base_i32) * fx.Int64(self._row_bytes),
-        )
-        tile_view = fx.Tensor(
-            fx.make_view(
-                tile_iter, fx.make_layout(self._sort_block_m * self._row_bytes, 1)
+        if const_expr(self._indexed_input):
+            input_iter = fx.get_iter(self._x_tensor)
+            input_bytes = self._source_rows * self._row_bytes
+            input_view = fx.Tensor(
+                fx.make_view(input_iter, fx.make_layout(input_bytes, 1))
             )
-        )
-        self._tile_rsrc = _make_buffer(
-            tile_view,
+        else:
+            tile_iter = fx.add_offset(
+                fx.get_iter(self._x_tensor),
+                fx.Int64(tile_row_base_i32) * fx.Int64(self._row_bytes),
+            )
+            input_bytes = self._sort_block_m * self._row_bytes
+            input_view = fx.Tensor(
+                fx.make_view(tile_iter, fx.make_layout(input_bytes, 1))
+            )
+        self._tile_rsrc = ptr_buf_tensor(
+            fx.get_iter(input_view),
             fx.Int32,
-            4,
-            max_size=False,
-            num_records_bytes=self._sort_block_m * self._row_bytes,
+            unit_elems=4,
+            num_records_bytes=input_bytes,
         )
         if const_expr(self._async_copy):
             tile_buffer = fx.rocdl.make_buffer_tensor(
-                tile_view,
+                input_view,
                 max_size=False,
-                num_records_bytes=self._sort_block_m * self._row_bytes,
+                num_records_bytes=input_bytes,
             )
             self._tile_dma = fx.logical_divide(
                 tile_buffer,
@@ -143,7 +138,18 @@ class ATileLoader:
             lin = fx.Int32(c) + fx.Int32(self._tx)
             row = lin // fx.Int32(chunks_per_row)
             chunk = lin % fx.Int32(chunks_per_row)
-            row_byte = row * fx.Int32(self._row_bytes)
+            source_row = row
+            if const_expr(self._indexed_input):
+                # One 16-lane subgroup copies one 256-byte K slice of a row.
+                # Load its source key once and broadcast it within the wave.
+                lane = self._tx & fx.Int32(63)
+                packed = _load_row_map_subgroup(
+                    self._row_map_rsrc,
+                    tile_row_base_i32 + row,
+                    lane,
+                )
+                source_row = packed & fx.Int32(0xFFFFFF)
+            row_byte = source_row * fx.Int32(self._row_bytes)
             if const_expr(self._swizzle):
                 col_i32 = chunk * fx.Int32(4)
                 swz = row * fx.Int32(row_stride_i32) + (
@@ -160,7 +166,12 @@ class ATileLoader:
         regs = []
         for lds_byte, chunk_base in self._chunks:
             group = (chunk_base + koff) // fx.Int32(16)
-            regs.append((lds_byte, _buffer_load(self._tile_rsrc, group, fx.Int32, 4)))
+            regs.append(
+                (
+                    lds_byte,
+                    buf_copy_load(self._tile_rsrc, group, fx.Int32, unit_elems=4),
+                )
+            )
         return regs
 
     def store(self, lds_dst, regs, base_i32=0):
@@ -199,8 +210,15 @@ class ATileLoader:
                 logical_chunk = physical_chunk ^ (row & fx.Int32(15))
             else:
                 logical_chunk = physical_chunk
+            source_row = row
+            if const_expr(self._indexed_input):
+                source_index = round_base // self._total_threads
+                source_byte = self._chunks[source_index][1]
+                source_row = source_byte // fx.Int32(self._row_bytes)
             src_byte = (
-                row * fx.Int32(self._row_bytes) + koff + logical_chunk * fx.Int32(16)
+                source_row * fx.Int32(self._row_bytes)
+                + koff
+                + logical_chunk * fx.Int32(16)
             )
             src = fx.slice(
                 self._tile_dma,
@@ -275,12 +293,12 @@ class BWeightLoader:
             + lane_k * fx.Int32(self._stride_klane)
             + lane_row * fx.Int32(self._stride_nlane)
         )
-        return _buffer_load(
+        return buf_copy_load(
             self._w_rsrc,
             byte // fx.Int32(16),
             fx.Int32,
-            4,
-            self._cache_modifier,
+            unit_elems=4,
+            cache_modifier=self._cache_modifier,
         )
 
     def load_step(self, row_base_i32, kstep_i32):
@@ -316,14 +334,24 @@ class BScaleLoader:
         out = []
         for g in range_constexpr(self._n_groups):
             off = (base_group + fx.Int32(g)) * fx.Int32(self._row_stride) + kterm + lane
-            out.append(_buffer_load(self._rsrc, off, fx.Int32))
+            out.append(self._rsrc[off])
         return out
 
 
 class AScaleLoader:
     """Per-1x32 E8M0 A scales STAGED to LDS once per tile (stage), read via ds_read in K-loop (kills VMEM flood)."""
 
-    def __init__(self, *, scale_rsrc, m_repeat, model_dim, sort_block_m, total_threads):
+    def __init__(
+        self,
+        *,
+        scale_rsrc,
+        m_repeat,
+        model_dim,
+        sort_block_m,
+        total_threads,
+        indexed_input=False,
+        row_map_rsrc=None,
+    ):
         self._rsrc = scale_rsrc
         self._n_scale = model_dim // 32
         self._lane = fx.thread_idx.x % 64
@@ -331,6 +359,10 @@ class AScaleLoader:
         self._sort_block_m = sort_block_m
         self._total_threads = total_threads
         self._tx = fx.thread_idx.x
+        self._indexed_input = bool(indexed_input)
+        self._row_map_rsrc = row_map_rsrc
+        if self._indexed_input:
+            assert row_map_rsrc is not None
 
     def stage(self, lds_ascale, tile_row_base_i32):
         """Coalesced gmem->LDS copy of this tile's e8m0 A-scale block [sort_block_m, n_scale]. Call before K-loop."""
@@ -340,30 +372,64 @@ class AScaleLoader:
         n16 = total // 16
 
         @flyc.jit
-        def copy_chunk(lin: fx.Int32):
-            if lin < fx.Int32(n16):
-                v = _buffer_load(
-                    self._rsrc,
-                    (base + lin * fx.Int32(16)) // fx.Int32(16),
-                    fx.Int32,
-                    4,
-                )
-                dst = fx.make_view(
-                    fx.add_offset(
-                        fx.recast_iter(fx.Int32, lds_ascale.ptr), lin * fx.Int32(4)
-                    ),
-                    fx.make_layout(4, 1),
-                )
-                fragment = fx.make_rmem_tensor(4, fx.Int32)
-                fragment.store(v)
-                fx.copy(
-                    fx.make_copy_atom(fx.UniversalCopy128b(), fx.Int32), fragment, dst
-                )
+        def copy_group(lin: fx.Int32, source_group: fx.Int32):
+            v = buf_copy_load(
+                self._rsrc,
+                source_group,
+                fx.Int32,
+                unit_elems=4,
+            )
+            dst = fx.make_view(
+                fx.add_offset(
+                    fx.recast_iter(fx.Int32, lds_ascale.ptr), lin * fx.Int32(4)
+                ),
+                fx.make_layout(4, 1),
+            )
+            fragment = fx.make_rmem_tensor(4, fx.Int32)
+            fragment.store(v)
+            fx.copy(fx.make_copy_atom(fx.UniversalCopy128b(), fx.Int32), fragment, dst)
 
-        for c in range_constexpr(0, n16, self._total_threads):
-            lin = fx.Int32(c) + fx.Int32(self._tx)
-            # M32 has 448 chunks, which is not divisible by a 256/512-thread CTA.
-            copy_chunk(lin)
+        if const_expr(self._indexed_input and self._sort_block_m >= 128):
+            groups_per_row = self._n_scale // 16
+            # Preserve the tuned 16-slot geometry for current models while
+            # covering every 16-byte scale group for model_dim > 8192.
+            padded_groups_per_row = max(16, groups_per_row)
+            indexed_slots = self._sort_block_m * padded_groups_per_row
+
+            @flyc.jit
+            def copy_indexed_slot(slot: fx.Int32):
+                if slot < fx.Int32(indexed_slots):
+                    row = slot // fx.Int32(padded_groups_per_row)
+                    group = slot % fx.Int32(padded_groups_per_row)
+                    if group < fx.Int32(groups_per_row):
+                        lane = self._tx & fx.Int32(63)
+                        packed = _load_row_map_subgroup(
+                            self._row_map_rsrc,
+                            tile_row_base_i32 + row,
+                            lane,
+                        )
+                        source_row = packed & fx.Int32(0xFFFFFF)
+                        lin = row * fx.Int32(groups_per_row) + group
+                        copy_group(
+                            lin,
+                            source_row * fx.Int32(groups_per_row) + group,
+                        )
+
+            for c in range_constexpr(0, indexed_slots, self._total_threads):
+                copy_indexed_slot(fx.Int32(c) + fx.Int32(self._tx))
+        else:
+
+            @flyc.jit
+            def copy_chunk(lin: fx.Int32):
+                if lin < fx.Int32(n16):
+                    source_group = (base + lin * fx.Int32(16)) // fx.Int32(16)
+                    copy_group(lin, source_group)
+
+            for c in range_constexpr(0, n16, self._total_threads):
+                lin = fx.Int32(c) + fx.Int32(self._tx)
+                # M32 has 448 chunks, which is not divisible by a
+                # 256/512-thread CTA.
+                copy_chunk(lin)
 
     def load_step(self, lds_ascale, kstep_i32):
         """One packed i32 per pack-group, read from the LDS-staged A-scale (ds_read)."""
@@ -547,12 +613,32 @@ class MfmaScaleGU:
         return acc
 
 
+def _group_absmax(vals, shuffle_offs, c64):
+    """|max| over ``vals`` and over the lanes ``lane ^ off`` for each offset."""
+    m = vals[0].maximumf(fx.Float32(0.0) - vals[0])
+    for v in vals[1:]:
+        m = m.maximumf(v.maximumf(fx.Float32(0.0) - v))
+    for off in shuffle_offs:
+        m = m.maximumf(m.shuffle_xor(fx.Int32(off), c64))
+    return m
+
+
+def _e8m0_scale(amax):
+    """E8M0 exponent of a 1x32 group's |max| and the matching FP8 quant multiplier."""
+    max_rounded = (amax.bitcast(fx.Int32) + fx.Int32(0x400000)) & fx.Int32(0xFF800000)
+    e = (max_rounded >> fx.Int32(23)) - fx.Int32(8)
+    e8m0 = (e > fx.Int32(0)).select(e, fx.Int32(0))
+    quant_scale = ((fx.Int32(254) - e8m0) << fx.Int32(23)).bitcast(fx.Float32)
+    return e8m0, quant_scale
+
+
 class SiluQuantEpilogue:
     """SwiGLU followed by FP8 quantization and per-32 E8M0 output scales."""
 
     # fmt: off
     def __init__(self, *, out_rsrc, out_scale_rsrc, sorted_rsrc, tokens, inter_dim, m_repeat, num_acc_n,
-        sort_block_m, tile_n, num_waves, lds_out, swiglu_limit=0.0, always_valid=False, out_tensor=None):
+        sort_block_m, tile_n, num_waves, lds_out, swiglu_limit=0.0, always_valid=False, out_tensor=None,
+        evec):
     # fmt: on
         self._out_rsrc = out_rsrc
         self._out_scale_rsrc = out_scale_rsrc
@@ -568,6 +654,12 @@ class SiluQuantEpilogue:
         self._swiglu_limit = float(swiglu_limit)
         self._always_valid = always_valid
         self._out_tensor = out_tensor
+        # Columns quantized per lane in the store pass. 2: one 16-bit store and a
+        # 16-lane max per pair; 8: one 8-byte store and a 4-lane max per 8 values.
+        # Without out_tensor, out_rsrc is the whole output in that store's width:
+        # Int16 elements for 2, Int32 x2 units for 8.
+        assert evec in (2, 8)
+        self._evec = evec
         self._lane = fx.thread_idx.x % 64
         self._sorted_scale_cols_i32 = (inter_dim // 32 + 7) // 8 * 8
 
@@ -597,21 +689,42 @@ class SiluQuantEpilogue:
         ]
         return Vec.from_elements(elems, fx.Float32)
 
+    def _tile_out(self, tile_i32, elem, unit_elems=1):
+        """Buffer view of this tile's rows of ``out_tensor``."""
+        tile_iter = fx.add_offset(
+            fx.get_iter(self._out_tensor),
+            fx.Int64(tile_i32) * fx.Int64(self._sort_block_m * self._inter_dim),
+        )
+        tile_view = fx.Tensor(fx.make_view(tile_iter, fx.make_layout(1, 1)))
+        return ptr_buf_tensor(
+            fx.get_iter(tile_view),
+            elem,
+            unit_elems=unit_elems,
+            num_records_bytes=self._sort_block_m * self._inter_dim,
+        )
+
+    def _row_target(self, tile_i32, tile_row_base_i32, row):
+        """Global row, validity and output byte base of tile row ``row``."""
+        slot = tile_row_base_i32 + row
+        row_g = tile_i32 * fx.Int32(self._sort_block_m) + row
+        if const_expr(self._always_valid):
+            valid = fx.Boolean(True)
+            out_row_base = (
+                row * fx.Int32(self._inter_dim)
+                if self._out_tensor is not None
+                else row_g * fx.Int32(self._inter_dim)
+            )
+        else:
+            tok = self._sorted_rsrc[slot]
+            valid = tok < fx.Int32(self._tokens)
+            out_row_base = slot * fx.Int32(self._inter_dim)
+        return row_g, valid, out_row_base
+
     def store(self, acc, tile_i32, tile_row_base_i32, n_tile_base_i32):
         combined = self._combine(acc)
         n_per = len(combined) // self._m_repeat
         if self._out_tensor is not None:
-            tile_iter = fx.add_offset(
-                fx.get_iter(self._out_tensor),
-                fx.Int64(tile_i32) * fx.Int64(self._sort_block_m * self._inter_dim),
-            )
-            tile_view = fx.Tensor(fx.make_view(tile_iter, fx.make_layout(1, 1)))
-            out_rsrc = _make_buffer(
-                tile_view,
-                fx.Int16,
-                max_size=False,
-                num_records_bytes=self._sort_block_m * self._inter_dim,
-            )
+            out_rsrc = self._tile_out(tile_i32, fx.Int16)
         else:
             out_rsrc = self._out_rsrc
 
@@ -636,6 +749,10 @@ class SiluQuantEpilogue:
                     fx.ptr_store(Vec.from_elements([v4[ii]], fx.Float32), ptr)
         gpu.barrier()
 
+        if const_expr(self._evec == 8):
+            self._store_quant_vec8(tile_i32, tile_row_base_i32, n_tile_base_i32, cbase, cptr, cs_tile_n)
+            return
+
         c64 = fx.Int32(64)
         n32 = fx.Int32(self._sorted_scale_cols_i32 * 32)
         NLANE = 32
@@ -649,19 +766,7 @@ class SiluQuantEpilogue:
 
         for mr in range_constexpr(m_reps):
             row = fx.Int32(mr * rows_per_iter) + mlane
-            slot = tile_row_base_i32 + row
-            row_g = tile_i32 * fx.Int32(self._sort_block_m) + row
-            if const_expr(self._always_valid):
-                valid = fx.Boolean(True)
-                out_row_base = (
-                    row * fx.Int32(self._inter_dim)
-                    if self._out_tensor is not None
-                    else row_g * fx.Int32(self._inter_dim)
-                )
-            else:
-                tok = _buffer_load(self._sorted_rsrc, slot, fx.Int32)
-                valid = tok < fx.Int32(self._tokens)
-                out_row_base = slot * fx.Int32(self._inter_dim)
+            row_g, valid, out_row_base = self._row_target(tile_i32, tile_row_base_i32, row)
             for nr in range_constexpr(n_reps):
                 col0 = fx.Int32(nr * NLANE * EVEC) + nlane * fx.Int32(EVEC)
                 idx = row * fx.Int32(cs_tile_n) + col0
@@ -669,15 +774,8 @@ class SiluQuantEpilogue:
                 frag = fx.make_view(f32_iter, fx.make_layout(EVEC, 1)).load()
                 v0 = frag[0]
                 v1 = frag[1]
-                a0 = v0.maximumf(fx.Float32(0.0) - v0)
-                a1 = v1.maximumf(fx.Float32(0.0) - v1)
-                m = a0.maximumf(a1)
-                for off in (1, 2, 4, 8):
-                    m = m.maximumf(m.shuffle_xor(fx.Int32(off), c64))
-                max_rounded = (m.bitcast(fx.Int32) + fx.Int32(0x400000)) & fx.Int32(0xFF800000)
-                _e = (max_rounded >> fx.Int32(23)) - fx.Int32(8)
-                e8m0_v = (_e > fx.Int32(0)).select(_e, fx.Int32(0))
-                quant_scale = ((fx.Int32(254) - e8m0_v) << fx.Int32(23)).bitcast(fx.Float32)
+                m = _group_absmax((v0, v1), (1, 2, 4, 8), c64)
+                e8m0_v, quant_scale = _e8m0_scale(m)
                 gcol = out_tile_base + col0
 
                 scaled0 = v0 * quant_scale
@@ -686,7 +784,7 @@ class SiluQuantEpilogue:
                 short_raw = fx.Int32(packed).to(fx.Int16)
                 out_byte = out_row_base + gcol
                 out_byte = valid.select(out_byte, fx.Int32(0x40000000))
-                _buffer_store(out_rsrc, out_byte // fx.Int32(2), short_raw, fx.Int16)
+                out_rsrc[out_byte // fx.Int32(2)] = short_raw
 
                 col_s = gcol >> fx.Int32(5)
                 is_writer = (gcol & fx.Int32(31)) == fx.Int32(0)
@@ -699,5 +797,63 @@ class SiluQuantEpilogue:
                 byte_off = d0 * n32 + d3 * fx.Int32(256) + d5 * fx.Int32(64) + d2 * fx.Int32(4) + d4 * fx.Int32(2) + d1
                 byte_off = is_writer.select(byte_off, fx.Int32(0x40000000))
                 e8m0_i8 = e8m0_v.to(fx.Int8)
-                _buffer_store(self._out_scale_rsrc, byte_off, e8m0_i8, fx.Int8)
+                self._out_scale_rsrc[byte_off] = e8m0_i8
+        wait_lds_barrier()
+
+    def _store_quant_vec8(self, tile_i32, tile_row_base_i32, n_tile_base_i32, cbase, cptr, cs_tile_n):
+        """Store pass with 8 columns per lane: a 1x32 group spans 4 lanes (two
+        xor shuffles for its max) and each lane writes its 8 FP8 values at once."""
+        EVEC = 8
+        NLANE = cs_tile_n // EVEC
+        assert 64 % NLANE == 0 and NLANE * EVEC == cs_tile_n
+        tx = fx.thread_idx.x
+        c64 = fx.Int32(64)
+        n32 = fx.Int32(self._sorted_scale_cols_i32 * 32)
+        rows_per_iter = self._num_waves * 64 // NLANE
+        mlane = tx // fx.Int32(NLANE)
+        nlane = tx % fx.Int32(NLANE)
+        m_reps = self._sort_block_m // rows_per_iter
+        assert m_reps * rows_per_iter == self._sort_block_m
+        out_tile_base = n_tile_base_i32 // fx.Int32(2) - cbase
+        if self._out_tensor is not None:
+            out_vec = self._tile_out(tile_i32, fx.Int32, unit_elems=2)
+        else:
+            out_vec = self._out_rsrc
+        col0 = nlane * fx.Int32(EVEC)
+        gcol = out_tile_base + col0
+        is_writer = (nlane & fx.Int32(3)) == fx.Int32(0)
+        col_s = gcol >> fx.Int32(5)
+        d3 = col_s >> fx.Int32(3)
+        d4 = (col_s >> fx.Int32(2)) & fx.Int32(1)
+        d5 = col_s & fx.Int32(3)
+        for mr in range_constexpr(m_reps):
+            row = fx.Int32(mr * rows_per_iter) + mlane
+            row_g, valid, out_row_base = self._row_target(tile_i32, tile_row_base_i32, row)
+            idx = row * fx.Int32(cs_tile_n) + col0
+            f32_iter = fx.recast_iter(fx.Float32, fx.add_offset(cptr, fx.make_int_tuple(idx)))
+            frag = fx.make_view(f32_iter, fx.make_layout(EVEC, 1)).load()
+            vals = [frag[i] for i in range_constexpr(EVEC)]
+            m = _group_absmax(vals, (1, 2), c64)
+            e8m0_v, quant_scale = _e8m0_scale(m)
+            words = []
+            for w in range_constexpr(2):
+                sc = [vals[w * 4 + i] * quant_scale for i in range_constexpr(4)]
+                packed = rocdl.cvt_pk_fp8_f32(T.i32, sc[0], sc[1], fx.Int32(0), 0)
+                packed = rocdl.cvt_pk_fp8_f32(T.i32, sc[2], sc[3], packed, 1)
+                words.append(fx.Int32(packed))
+            out_byte = out_row_base + gcol
+            out_byte = valid.select(out_byte, fx.Int32(0x40000000))
+            buf_copy_store(
+                out_vec,
+                out_byte // fx.Int32(8),
+                Vec.from_elements(words, fx.Int32),
+                fx.Int32,
+                unit_elems=2,
+            )
+            d0 = row_g >> fx.Int32(5)
+            d1 = (row_g >> fx.Int32(4)) & fx.Int32(1)
+            d2 = row_g & fx.Int32(15)
+            byte_off = d0 * n32 + d3 * fx.Int32(256) + d5 * fx.Int32(64) + d2 * fx.Int32(4) + d4 * fx.Int32(2) + d1
+            byte_off = is_writer.select(byte_off, fx.Int32(0x40000000))
+            self._out_scale_rsrc[byte_off] = e8m0_v.to(fx.Int8)
         wait_lds_barrier()

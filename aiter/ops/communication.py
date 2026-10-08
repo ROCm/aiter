@@ -11,7 +11,7 @@ from ..dist.parallel_state import (
     destroy_distributed_environment,
     destroy_model_parallel,
     ensure_model_parallel_initialized,
-    get_tp_group,
+    get_tp_group,  # noqa: F401 -- re-exported; downstreams import via this module
     init_distributed_environment,
     set_custom_all_reduce,
 )
@@ -57,25 +57,24 @@ def init_dist_env(
         prefill_context_model_parallel_size=prefill_context_model_parallel_size,
     )
 
-    if tensor_model_parallel_size > 1:
-        # hack custom_allreduce
-        tp_grp = get_tp_group()
-        ca_comm = tp_grp.device_communicator.ca_comm
-        # gfx1250 (MI450) uses a VMM-based custom allreduce whose input buffer
-        # is already registered in CustomAllreduce._init_gfx1250(). The extra
-        # register_input_buffer(signal) below routes through get_external_ipc_meta,
-        # whose vmm_exchange rendezvous key is process-local (id(self)+data_ptr),
-        # so it can never align across TP ranks and deadlocks at startup. The
-        # `signal`/`buffer` attributes set here are never read anywhere, so skip
-        # the whole block on gfx1250.
-        if ca_comm is not None and not getattr(ca_comm, "_is_gfx1250", False):
-            # signal
-            signal = torch.zeros(
-                tensor_model_parallel_size * 64, dtype=torch.int64, device=rankID
-            )
-            ca_comm.signal = signal
-            ca_comm.register_input_buffer(signal)
-            ca_comm.buffer = ca_comm._pool["input"].tensor
+    # No per-rank signal/input-buffer registration here. An earlier version
+    # registered a torch.zeros "signal" tensor with CustomAllreduce and mirrored
+    # the input pool as `ca_comm.buffer`. All of it was vestigial:
+    #   * `ca_comm.signal` / `ca_comm.buffer` are never read anywhere;
+    #   * register_input_buffer only inserts a pointer-translation entry keyed
+    #     by the registered tensor's own address, consulted when an allreduce
+    #     is invoked with that exact tensor as input -- which never happens for
+    #     the signal tensor;
+    #   * gfx1250 has skipped the whole block (deadlock in its vmm_exchange
+    #     rendezvous) and works without it.
+    # It was also what made raw IPC input pools unusable (#4921):
+    #   * under PYTORCH_HIP_ALLOC_CONF=expandable_segments:True the torch.zeros
+    #     signal is VMM-backed, so registering it dies in hipIpcGetMemHandle
+    #     (custom_all_reduce.cu:417, "invalid argument");
+    #   * the raw_cached input pool has no backing torch.Tensor, so
+    #     `ca_comm.buffer = ca_comm._pool["input"].tensor` raised by design.
+    # CustomAllreduce.__init__ already sets up its own meta/input pools and the
+    # copy-in path for expandable segments (#4174); nothing further is needed.
     logger.debug(f"RANK: {rankID}/{tensor_model_parallel_size} init_dist_env...")
 
 

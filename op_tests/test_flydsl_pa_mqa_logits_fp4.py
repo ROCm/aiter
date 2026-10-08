@@ -13,7 +13,11 @@ import random
 
 import torch
 
-from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4, is_flydsl_available
+from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4
+from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_rowgroup import (
+    pack_kv_cache,
+    pack_q_scales,
+)
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.test_common import checkAllclose, run_perftest
 
@@ -620,6 +624,95 @@ def test_pa_mqa_logits_fp4_qfp4_kvfp4(
     )
 
 
+def test_pa_mqa_logits_fp4_page8(
+    batch, max_ctx, next_n=1, heads=32, head_dim=DEFAULT_HEAD_DIM, num_iters=20
+):
+    """kv_block_size=8: the row-group kernel (pa_mqa_logits_fp4_rowgroup) in
+    its 8-row-page cache layout, pages in a random order, a sequence's next_n
+    rows as its ragged rows (row n seeing context - next_n + n + 1 keys)."""
+
+    setup_seed(SEED)
+    page = 8
+    ctx_list = _make_varctx(batch, max_ctx, page)
+    context_lens = torch.tensor(ctx_list, dtype=torch.int32, device=dev)
+    max_blocks = -(-max_ctx // page)
+    t_max = max_blocks * page
+    num_blocks = batch * max_blocks
+    kv_bf16 = torch.randn(batch, t_max, head_dim, dtype=torch.bfloat16, device=dev)
+    kv_fp4, kv_e8m0 = fp4_quant_e2m1_with_e8m0(kv_bf16.reshape(-1, head_dim))
+    block_tables = (
+        torch.randperm(num_blocks, device=dev).to(torch.int32).view(batch, max_blocks)
+    )
+    pages_kv, pages_ks = pack_kv_cache(kv_fp4, kv_e8m0, page)
+    kv_cache = torch.empty_like(pages_kv)
+    kv_scale = torch.empty_like(pages_ks)
+    kv_cache[block_tables.reshape(-1).long()] = pages_kv
+    kv_scale[block_tables.reshape(-1).long()] = pages_ks
+
+    q_bf16 = torch.randn(
+        batch, next_n, heads, head_dim, dtype=torch.bfloat16, device=dev
+    )
+    q_packed, q_e8m0 = fp4_quant_e2m1_with_e8m0(q_bf16.reshape(-1, head_dim))
+    q_packed = q_packed.view(batch, next_n, heads, head_dim // 2)
+    q_e8m0 = q_e8m0.view(batch, next_n, heads, head_dim // 32)
+    weights = (
+        torch.randn(batch * next_n, heads, dtype=torch.float32, device=dev) * 0.1
+    ).to(torch.bfloat16)
+    weight_scale = 1.5
+
+    ref = ref_mqa_logits_mixed(
+        q_packed,
+        q_e8m0,
+        kv_fp4.view(batch, t_max, head_dim // 2),
+        kv_e8m0.view(batch, t_max, head_dim // 32),
+        weights,
+        context_lens,
+        next_n=next_n,
+        weight_scale=weight_scale,
+    )
+    out = torch.full((batch * next_n, t_max), float("-inf"), device=dev)
+    query_start_loc = torch.arange(
+        0, (batch + 1) * next_n, next_n, dtype=torch.int32, device=dev
+    )
+    lag = torch.arange(next_n - 1, -1, -1, dtype=torch.int32, device=dev)
+    row_ends = (context_lens[:, None] - lag).reshape(-1)
+
+    def launch():
+        flydsl_pa_mqa_logits_fp4(
+            q_packed,
+            pack_q_scales(q_e8m0),
+            kv_cache,
+            kv_scale,
+            block_tables,
+            weights,
+            None,
+            t_max,
+            weight_scale=weight_scale,
+            kv_block_size=page,
+            row_ends=row_ends,
+            query_start_loc=query_start_loc,
+            max_query_len=next_n,
+            out=out,
+        )
+
+    launch()
+    torch.cuda.synchronize()
+    mask = ~torch.isneginf(ref)
+    got, want = out[mask].double(), ref[mask].double()
+    cos = ((got * want).sum() / (got.norm() * want.norm() + 1e-12)).item()
+    max_err = (got - want).abs().max().item()
+    tail_ok = bool(torch.isneginf(out[~mask]).all())
+    _, us = run_perftest(launch, num_iters=num_iters, num_warmup=3)
+    print(
+        f"page8 batch={batch} ctx<= {max_ctx} next_n={next_n} heads={heads} "
+        f"head_dim={head_dim}: cos={cos:.6f} max_abs_err={max_err:.2e} "
+        f"past_ctx_neginf={tail_ok} {us:.1f} us"
+    )
+    # same fp4 operands, fp32 accumulation: only the summation order differs
+    assert max_err < 1e-3 * want.abs().max().item(), max_err
+    assert tail_ok, "columns past a row's context were written"
+
+
 def _print_perf_summary():
     print("\n" + "=" * 96)
     print("Perf summary (flydsl-qfp4/kvfp4 across shapes)")
@@ -700,10 +793,6 @@ def main():
         print(f"[skip] this kernel only supports gfx950 (current: {get_arch()}).")
         return
 
-    if not is_flydsl_available():
-        print("[skip] flydsl is not available in this environment.")
-        return
-
     print(
         "[test] using pa_mqa_logits_fp4_qfp4_kvfp4 kernel "
         "(Q FP4, KV FP4, MFMA(Q_fp4, KV_fp4))"
@@ -722,6 +811,15 @@ def main():
             (2, 768, 1, 128),
             (4, 2048, 1, 64),
         ]
+
+    if args.kv_block_size == 8:
+        for b, c, nn, h in configs:
+            test_pa_mqa_logits_fp4_page8(
+                b, c, next_n=nn, heads=h, head_dim=args.head_dim,
+                num_iters=args.num_iters,
+            )  # fmt: skip
+        print("  PASS")
+        return
 
     for b, c, nn, h in configs:
         try:

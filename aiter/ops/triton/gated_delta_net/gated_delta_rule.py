@@ -21,13 +21,13 @@ from collections.abc import Sequence
 import torch
 import triton
 
-from aiter.ops.triton._triton_kernels.gated_delta_rule import (
+from aiter.ops.triton._triton_kernels.gated_delta_net import (
     _fused_recurrent_gated_delta_rule_fwd_kernel,
     chunk_gated_delta_rule_fwd,
     chunk_gated_delta_rule_fwd_opt,
     chunk_gated_delta_rule_fwd_opt_vk,
 )
-from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import (
+from aiter.ops.triton._triton_kernels.gated_delta_net.utils import (
     GatedDeltaRulePrefillMetadata,
     l2norm_fwd,
 )
@@ -155,8 +155,14 @@ def fused_recurrent_gated_delta_rule(
 
     # Log operation
     _LOGGER.info(
-        f"GATED_DELTA_RULE: q={tuple(q.shape)}, k={tuple(k.shape)}, v={tuple(v.shape)}, "
-        f"scale={scale}, use_g={g is not None}, use_gk={gk is not None}, use_gv={gv is not None}"
+        "GATED_DELTA_RULE: q=%s, k=%s, v=%s, scale=%s, use_g=%s, use_gk=%s, use_gv=%s",
+        tuple(q.shape),
+        tuple(k.shape),
+        tuple(v.shape),
+        scale,
+        g is not None,
+        gk is not None,
+        gv is not None,
     )
 
     # Calculate block sizes
@@ -314,8 +320,12 @@ def chunk_gated_delta_rule(
 
     # Log operation
     _LOGGER.info(
-        f"CHUNK_GATED_DELTA_RULE: q={tuple(q.shape)}, k={tuple(k.shape)}, v={tuple(v.shape)}, "
-        f"scale={scale}, use_qk_l2norm={use_qk_l2norm_in_kernel}"
+        "CHUNK_GATED_DELTA_RULE: q=%s, k=%s, v=%s, scale=%s, use_qk_l2norm=%s",
+        tuple(q.shape),
+        tuple(k.shape),
+        tuple(v.shape),
+        scale,
+        use_qk_l2norm_in_kernel,
     )
 
     # Apply L2 normalization if requested. ``need_rstd`` defaults to
@@ -418,8 +428,12 @@ def chunk_gated_delta_rule_opt(
 
     # Log operation
     _LOGGER.info(
-        f"CHUNK_GATED_DELTA_RULE_OPT: q={tuple(q.shape)}, k={tuple(k.shape)}, v={tuple(v.shape)}, "
-        f"scale={scale}, use_qk_l2norm={use_qk_l2norm_in_kernel}"
+        "CHUNK_GATED_DELTA_RULE_OPT: q=%s, k=%s, v=%s, scale=%s, use_qk_l2norm=%s",
+        tuple(q.shape),
+        tuple(k.shape),
+        tuple(v.shape),
+        scale,
+        use_qk_l2norm_in_kernel,
     )
 
     # Apply L2 normalization if requested
@@ -515,7 +529,7 @@ def chunk_gated_delta_rule_opt_vk(
             ``seq_lens_cpu`` when several GDR layers process the same batch.
         initial_state_indices: Optional ``[N]`` indices into a larger
             ``initial_state`` pool. K5 reads and writes those slots in place.
-            This is unsupported with ``use_chunk_flydsl=True``.
+            Supported by every K5 path (HIP, FlyDSL, Triton VK).
         inplace_final_state: Controls K5 in-place state write-back. It defaults
             to ``True`` when ``initial_state_indices`` is provided.
         snapshot_dtype (torch.dtype, optional): Temporary chunk snapshot dtype
@@ -544,6 +558,11 @@ def chunk_gated_delta_rule_opt_vk(
                 f"prefill sequences, i.e. {n_prefill} rather than "
                 f"{initial_state_indices.numel()}."
             )
+        if not output_final_state:
+            raise ValueError(
+                "`initial_state_indices` requires `output_final_state=True` "
+                "(the indexed path writes the final state back into the pool)."
+            )
     elif initial_state is not None and initial_state.shape[0] != n_prefill:
         raise ValueError(
             f"The number of initial states is expected to be equal to the number of input sequences, "
@@ -554,8 +573,12 @@ def chunk_gated_delta_rule_opt_vk(
         scale = k.shape[-1] ** -0.5
 
     _LOGGER.info(
-        f"CHUNK_GATED_DELTA_RULE_OPT_VK: q={tuple(q.shape)}, k={tuple(k.shape)}, v={tuple(v.shape)}, "
-        f"scale={scale}, use_qk_l2norm={use_qk_l2norm_in_kernel}"
+        "CHUNK_GATED_DELTA_RULE_OPT_VK: q=%s, k=%s, v=%s, scale=%s, use_qk_l2norm=%s",
+        tuple(q.shape),
+        tuple(k.shape),
+        tuple(v.shape),
+        scale,
+        use_qk_l2norm_in_kernel,
     )
 
     if use_qk_l2norm_in_kernel:

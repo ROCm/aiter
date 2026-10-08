@@ -1,93 +1,180 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""FlyDSL -- high-performance GPU kernels implemented using FlyDSL.
+"""FlyDSL -- high-performance GPU kernels implemented using FlyDSL."""
 
-Kernel compilation and public APIs are only available when a compatible
-``flydsl`` package is installed. Use ``is_flydsl_available()`` to check
-whether the optional dependency exists before relying on FlyDSL kernels.
-"""
+from importlib import import_module
 
+import flydsl as _flydsl
 from packaging.version import Version
 
+from aiter.fused_moe_registry import register_fused_moe_impl
+
 from .moe_common import GateMode
-from .utils import is_flydsl_available
 
 _MIN_FLYDSL_VERSION = Version("0.2.4")
 
+installed_flydsl_version = getattr(_flydsl, "__version__", None)
+if installed_flydsl_version is None:
+    raise ImportError("`flydsl` is importable but its version cannot be determined.")
+
+_base_version = Version(installed_flydsl_version.split("+")[0])
+if _base_version < _MIN_FLYDSL_VERSION:
+    raise ImportError(
+        "Unsupported `flydsl` version: "
+        f"expected >=`{_MIN_FLYDSL_VERSION}`, "
+        f"got `{installed_flydsl_version}`."
+    )
+
+_LAZY_IMPORTS = {
+    "DenseGemmConfig": (".gemm_a16wfp4", "DenseGemmConfig"),
+    "FP8_MQA_LOGITS_DEFAULT_VARIANT": (
+        ".fp8_mqa_logits_kernels",
+        "DEFAULT_VARIANT",
+    ),
+    "FP8_MQA_LOGITS_VARIANTS": (
+        ".fp8_mqa_logits_kernels",
+        "KERNEL_VARIANTS",
+    ),
+    "PreshuffledA16WFP4Weight": (".gemm_a16wfp4", "PreshuffledA16WFP4Weight"),
+    "QuickAllReduceInt4": (".quick_allreduce_int4", "QuickAllReduceInt4"),
+    "a16wfp4_shape_supported": (".gemm_a16wfp4", "a16wfp4_shape_supported"),
+    "compute_varqlen_windows": (
+        ".kernels.mqa_logits.pa_mqa_logits_fp4_prefill",
+        "compute_varqlen_windows",
+    ),
+    "flydsl_conv_implicit": (".conv_kernels", "flydsl_conv_implicit"),
+    "flydsl_flash_attn_fp8_func": (
+        ".kernels.flash_attn_func_fp8_gfx950",
+        "flydsl_flash_attn_fp8_func",
+    ),
+    "flydsl_flash_attn_fp8_supported": (
+        ".kernels.flash_attn_func_fp8_gfx950",
+        "flydsl_flash_attn_fp8_supported",
+    ),
+    "flydsl_flash_attn_func": (".fmha_kernels", "flydsl_flash_attn_func"),
+    "flydsl_fp8_mqa_logits": (
+        ".fp8_mqa_logits_kernels",
+        "flydsl_fp8_mqa_logits",
+    ),
+    "flydsl_fp8_paged_mqa_logits": (
+        ".kernels.mqa_logits.fp8_paged_mqa_logits_gfx950",
+        "flydsl_fp8_paged_mqa_logits",
+    ),
+    "flydsl_fp8_paged_mqa_logits_gfx950": (
+        ".kernels.mqa_logits.fp8_paged_mqa_logits_gfx950",
+        "flydsl_fp8_paged_mqa_logits_gfx950",
+    ),
+    "flydsl_gemm_a16wfp4": (".gemm_a16wfp4", "flydsl_gemm_a16wfp4"),
+    "flydsl_hgemm": (".gemm_kernels", "flydsl_hgemm"),
+    "flydsl_hstu_attention": (
+        ".hstu_attention",
+        "flydsl_hstu_attention",
+    ),
+    "flydsl_hstu_attention_bwd": (
+        ".hstu_attention",
+        "flydsl_hstu_attention_bwd",
+    ),
+    "flydsl_hstu_attention_fwd": (
+        ".hstu_attention",
+        "flydsl_hstu_attention_fwd",
+    ),
+    "flydsl_mla_reduce_v1": (".mla_reduce_kernels", "flydsl_mla_reduce_v1"),
+    "flydsl_moe_stage1": (".moe_kernels", "flydsl_moe_stage1"),
+    "flydsl_moe_stage2": (".moe_kernels", "flydsl_moe_stage2"),
+    "flydsl_pa_mqa_logits_fp4": (
+        ".kernels.mqa_logits.pa_mqa_logits_fp4",
+        "flydsl_pa_mqa_logits_fp4",
+    ),
+    "flydsl_pa_mqa_logits_fp4_rowgroup": (
+        ".kernels.mqa_logits.pa_mqa_logits_fp4_rowgroup",
+        "flydsl_pa_mqa_logits_fp4_rowgroup",
+    ),
+    "Fp4MqaPlan": (".kernels.mqa_logits.pa_mqa_logits_fp4_rowgroup", "Fp4MqaPlan"),
+    "make_fp4_mqa_plan": (
+        ".kernels.mqa_logits.pa_mqa_logits_fp4_rowgroup",
+        "make_fp4_mqa_plan",
+    ),
+    "flydsl_pa_mqa_logits_fp4_prefill": (
+        ".kernels.mqa_logits.pa_mqa_logits_fp4_prefill",
+        "flydsl_pa_mqa_logits_fp4_prefill",
+    ),
+    "flydsl_pa_mqa_logits_fp4_varqlen": (
+        ".kernels.mqa_logits.pa_mqa_logits_fp4_prefill",
+        "flydsl_pa_mqa_logits_fp4_varqlen",
+    ),
+    "flydsl_preshuffle_gemm_a8": (
+        ".gemm_kernels",
+        "flydsl_preshuffle_gemm_a8",
+    ),
+    "flydsl_qk_norm_rope_quant": (
+        ".kernels.qk_norm_rope_quant",
+        "flydsl_qk_norm_rope_quant",
+    ),
+    "gather_kv_b_proj_flydsl": (
+        ".gather_kv_b_proj",
+        "gather_kv_b_proj_flydsl",
+    ),
+    "gather_kv_b_proj_flydsl_supported": (
+        ".gather_kv_b_proj",
+        "gather_kv_b_proj_flydsl_supported",
+    ),
+    "pa_decode": (".pa_decode", "pa_decode"),
+    "gather_kv_b_proj_flydsl_fp8_supported": (
+        ".gather_kv_b_proj",
+        "gather_kv_b_proj_flydsl_fp8_supported",
+    ),
+    "prepare_gemm_a16wfp4_weight": (".gemm_a16wfp4", "prepare_gemm_a16wfp4_weight"),
+}
+
 __all__ = [
+    "DenseGemmConfig",
+    "FP8_MQA_LOGITS_DEFAULT_VARIANT",
+    "FP8_MQA_LOGITS_VARIANTS",
+    "Fp4MqaPlan",
     "GateMode",
-    "is_flydsl_available",
+    "PreshuffledA16WFP4Weight",
+    "QuickAllReduceInt4",
+    "a16wfp4_shape_supported",
+    "compute_varqlen_windows",
+    "flydsl_conv_implicit",
+    "flydsl_flash_attn_fp8_func",
+    "flydsl_flash_attn_fp8_supported",
+    "flydsl_flash_attn_func",
+    "flydsl_fp8_mqa_logits",
+    "flydsl_fp8_paged_mqa_logits",
+    "flydsl_fp8_paged_mqa_logits_gfx950",
+    "flydsl_gemm_a16wfp4",
+    "flydsl_hgemm",
+    "flydsl_hstu_attention",
+    "flydsl_hstu_attention_bwd",
+    "flydsl_hstu_attention_fwd",
+    "flydsl_mla_reduce_v1",
+    "flydsl_moe_stage1",
+    "flydsl_moe_stage2",
+    "flydsl_pa_mqa_logits_fp4",
+    "flydsl_pa_mqa_logits_fp4_prefill",
+    "flydsl_pa_mqa_logits_fp4_rowgroup",
+    "flydsl_pa_mqa_logits_fp4_varqlen",
+    "flydsl_preshuffle_gemm_a8",
+    "flydsl_qk_norm_rope_quant",
+    "gather_kv_b_proj_flydsl",
+    "gather_kv_b_proj_flydsl_fp8_supported",
+    "gather_kv_b_proj_flydsl_supported",
+    "make_fp4_mqa_plan",
+    "pa_decode",
+    "prepare_gemm_a16wfp4_weight",
 ]
 
-if is_flydsl_available():
-    import flydsl as _flydsl
+_fused_moe_impl_path = "aiter.ops.flydsl.fused_moe_gfx942:run_flydsl_moe_gfx942_impl"
+register_fused_moe_impl("flydsl_gfx942", _fused_moe_impl_path)
 
-    installed_flydsl_version = getattr(_flydsl, "__version__", None)
-    if installed_flydsl_version is None:
-        raise ImportError(
-            "`flydsl` is importable but its version cannot be determined."
-        )
 
-    _base_version = Version(installed_flydsl_version.split("+")[0])
-    if _base_version < _MIN_FLYDSL_VERSION:
-        raise ImportError(
-            "Unsupported `flydsl` version: "
-            f"expected >=`{_MIN_FLYDSL_VERSION}`, "
-            f"got `{installed_flydsl_version}`."
-        )
-
-    from .fmha_kernels import flydsl_flash_attn_func
-    from .gemm_a16wfp4 import (
-        DenseGemmConfig,
-        PreshuffledA16WFP4Weight,
-        a16wfp4_shape_supported,
-        flydsl_gemm_a16wfp4,
-        prepare_gemm_a16wfp4_weight,
-    )
-    from .gemm_kernels import flydsl_hgemm, flydsl_preshuffle_gemm_a8
-    from .kernels.mqa_logits.fp8_mqa_logits import (
-        DEFAULT_VARIANT as FP8_MQA_LOGITS_DEFAULT_VARIANT,
-    )
-    from .kernels.mqa_logits.fp8_mqa_logits import (
-        KERNEL_VARIANTS as FP8_MQA_LOGITS_VARIANTS,
-    )
-    from .kernels.mqa_logits.fp8_mqa_logits import (
-        flydsl_fp8_mqa_logits,
-    )
-    from .kernels.mqa_logits.pa_mqa_logits_fp4 import (
-        flydsl_pa_mqa_logits_fp4,
-    )
-    from .kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
-        compute_varqlen_windows,
-        flydsl_pa_mqa_logits_fp4_prefill,
-        flydsl_pa_mqa_logits_fp4_varqlen,
-    )
-    from .kernels.qk_norm_rope_quant import flydsl_qk_norm_rope_quant
-    from .mla_reduce_kernels import flydsl_mla_reduce_v1
-    from .moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
-
-    # from .linear_attention_kernels import flydsl_gdr_decode
-
-    __all__ += [
-        "FP8_MQA_LOGITS_DEFAULT_VARIANT",
-        "FP8_MQA_LOGITS_VARIANTS",
-        "DenseGemmConfig",
-        "PreshuffledA16WFP4Weight",
-        "a16wfp4_shape_supported",
-        "compute_varqlen_windows",
-        "flydsl_flash_attn_func",
-        "flydsl_fp8_mqa_logits",
-        "flydsl_gemm_a16wfp4",
-        "flydsl_hgemm",
-        "flydsl_mla_reduce_v1",
-        "flydsl_moe_stage1",
-        "flydsl_moe_stage2",
-        "flydsl_pa_mqa_logits_fp4",
-        "flydsl_pa_mqa_logits_fp4_prefill",
-        "flydsl_pa_mqa_logits_fp4_varqlen",
-        "flydsl_preshuffle_gemm_a8",
-        "flydsl_qk_norm_rope_quant",
-        "prepare_gemm_a16wfp4_weight",
-        # "flydsl_gdr_decode",
-    ]
+def __getattr__(name: str):
+    try:
+        module_name, attr_name = _LAZY_IMPORTS[name]
+    except KeyError as exc:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc
+    value = getattr(import_module(module_name, __name__), attr_name)
+    globals()[name] = value
+    return value

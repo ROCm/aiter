@@ -2,6 +2,7 @@ import triton
 import triton.language as tl
 
 from aiter.ops.triton.rope.rope import _get_gptj_rotated_x, _get_neox_rotated_x
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 
 # GAMMA rms norm
@@ -125,7 +126,29 @@ def _partial_gptj_rotated(
     return rotated
 
 
-@triton.jit
+_fused_qkv_split_qk_norm_rope_cache_kernel_repr = make_kernel_repr(
+    "_fused_qkv_split_qk_norm_rope_cache_kernel",
+    [
+        "REUSE_FREQS_FRONT_PART",
+        "IS_NEOX",
+        "HAVE_POS",
+        "HAVE_OFFS",
+        "ENABLE_GATED_Q",
+        "QH",
+        "KVH",
+        "BLOCK_T",
+        "BLOCK_D",
+        "BLOCK_D_HALF",
+        "BLOCK_SIZE",
+        "ROTARY_DIM_EFFECTIVE",
+        "BLOCKED_GATED_LAYOUT",
+        "HAVE_K_SCALE",
+        "HAVE_V_SCALE",
+    ],
+)
+
+
+@triton.jit(repr=_fused_qkv_split_qk_norm_rope_cache_kernel_repr)
 def _fused_qkv_split_qk_norm_rope_cache_kernel(
     qkv_ptr,
     q_weight_ptr,

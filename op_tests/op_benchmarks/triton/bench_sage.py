@@ -5,6 +5,7 @@ import csv
 import glob
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -17,7 +18,39 @@ import torch
 import triton
 
 import aiter
-from aiter.ops.mha import flash_attn_fp8_pertensor_func, flash_attn_func
+from aiter.ops.mha import (
+    flash_attn_func,
+)
+from aiter.ops.mha_v4 import (
+    AttentionFormat,
+    AttentionPack,
+    AttentionScaleMode,
+    mha_v4,
+    mha_v4_kv_tile,
+    mha_v4_packed,
+    native_fp8_format,
+    scale_modes_for_formats,
+)
+from aiter.ops.mha_v4_quant import (
+    mha_v4_q_multiplier,
+    mxfp4_k_view,
+    mxfp4_v_view,
+    mxfp6_k_view,
+    quantize_fp8,
+    quantize_fp8_rotated,
+    quantize_int8,
+    quantize_mxfp4_k,
+    quantize_mxfp4_q,
+    quantize_mxfp6_k,
+    quantize_mxfp6_q,
+    quantize_mxfp8_k,
+    quantize_mxfp8_q,
+    quantize_v_fp8,
+    quantize_v_mxfp4_fp6_p,
+    quantize_v_mxfp6,
+    quantize_v_mxfp6_fp6_p,
+    rotate_activation_hd128,
+)
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
 from aiter.ops.triton.attention.fav3_sage import (
     fav3_sage_func,
@@ -49,6 +82,52 @@ logging.getLogger().setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+def _production_quantize_mxfp4(query, key, value, softmax_scale):
+    q_fp4, q_scale = quantize_mxfp4_q(query, mha_v4_q_multiplier(softmax_scale))
+    k_raw, k_scale = quantize_mxfp4_k(key)
+    k_fp4 = mxfp4_k_view(k_raw, k_scale)
+    v_raw, v_scale = quantize_v_mxfp4_fp6_p(value)
+    v_fp4 = mxfp4_v_view(v_raw, v_scale, value.shape[1])
+    return q_fp4, q_scale, k_fp4, k_scale, v_fp4, v_scale
+
+
+def _production_quantize_mxfp8(query, key, value, softmax_scale):
+    q_fp8, q_scale = quantize_mxfp8_q(query, mha_v4_q_multiplier(softmax_scale))
+    k_fp8, k_scale = quantize_mxfp8_k(key)
+    v_fp8, v_scale = quantize_fp8(value)
+    return q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale
+
+
+def _production_quantize_f4f4(query, key, value, softmax_scale):
+    q_fp4, q_scale = quantize_mxfp4_q(query, mha_v4_q_multiplier(softmax_scale))
+    k_raw, k_scale = quantize_mxfp4_k(key)
+    k_fp4 = mxfp4_k_view(k_raw, k_scale)
+    v_raw, v_scale = quantize_v_mxfp4_fp6_p(value)
+    v_fp4 = mxfp4_v_view(v_raw, v_scale, value.shape[1])
+    return q_fp4, q_scale, k_fp4, k_scale, v_fp4, v_scale
+
+
+def _production_quantize_mxfp6(
+    query, key, value, softmax_scale, v_format=None, fp6_p=False
+):
+    q_fp6, q_scale = quantize_mxfp6_q(query, mha_v4_q_multiplier(softmax_scale))
+    k_raw, k_scale_raw = quantize_mxfp6_k(key)
+    batch, sequence, heads, _ = key.shape
+    k_fp6, k_scale = mxfp6_k_view(k_raw, k_scale_raw, batch, sequence, heads)
+    if v_format is None:
+        v_quantized, v_scale = quantize_v_fp8(value)
+        return q_fp6, q_scale, k_fp6, k_scale, v_quantized, v_scale
+
+    if v_format == AttentionFormat.MXFP6:
+        quantize_v = quantize_v_mxfp6_fp6_p if fp6_p else quantize_v_mxfp6
+        return q_fp6, q_scale, k_fp6, k_scale, *quantize_v(value)
+    if v_format != AttentionFormat.MXFP4:
+        raise ValueError(f"unsupported MXFP6 Q/K V format: {v_format!r}")
+    v_raw, v_scale = quantize_v_mxfp4_fp6_p(value)
+    v_quantized = mxfp4_v_view(v_raw, v_scale, value.shape[1])
+    return q_fp6, q_scale, k_fp6, k_scale, v_quantized, v_scale
+
+
 arg_to_torch_dtype = {
     "fp16": torch.float16,
     "bf16": torch.bfloat16,
@@ -56,21 +135,99 @@ arg_to_torch_dtype = {
 }
 
 
-KernelName = Literal[
-    "sage_fp8",
-    "sage_mxfp4",
-    "fav3_fp8",
-    "aiter_fp8",
-    "aiter_bf16",
-]
+@dataclass(frozen=True)
+class KernelSpec:
+    # Logical Q/K/V payload bytes. Scale metadata and tile padding are excluded.
+    payload_bytes: tuple[float, float, float]
+    quantized: bool = False
+    supports_block_sparse: bool = False
+    uses_hadamard: bool = False
+    supports_causal: bool = True
+    include_in_all: bool = False
 
-ALL_KERNELS: list[str] = [
-    "sage_fp8",
-    "sage_mxfp4",
-    "fav3_fp8",
-    "aiter_fp8",
-    "aiter_bf16",
-]
+
+def _mha_v4_spec(
+    payload_bytes: tuple[float, float, float],
+    *,
+    quantized: bool = True,
+    supports_block_sparse: bool = False,
+    uses_hadamard: bool = False,
+) -> KernelSpec:
+    return KernelSpec(
+        payload_bytes,
+        quantized=quantized,
+        supports_block_sparse=supports_block_sparse,
+        uses_hadamard=uses_hadamard,
+        supports_causal=False,
+        include_in_all=True,
+    )
+
+
+KERNEL_SPECS = {
+    "sage_fp8": KernelSpec(
+        (1.0, 1.0, 1.0),
+        quantized=True,
+        supports_block_sparse=True,
+        uses_hadamard=True,
+    ),
+    "sage_mxfp4": KernelSpec(
+        (0.5, 0.5, 1.0),
+        quantized=True,
+        supports_block_sparse=True,
+        uses_hadamard=True,
+    ),
+    "fav3_fp8": KernelSpec((1.0, 1.0, 1.0), quantized=True, uses_hadamard=True),
+    "aiter_bf16": KernelSpec((2.0, 2.0, 2.0), include_in_all=True),
+    "mha4_bf16": _mha_v4_spec(
+        (2.0, 2.0, 2.0), quantized=False, supports_block_sparse=True
+    ),
+    "mha4_bf16fp8": _mha_v4_spec((2.0, 2.0, 1.0), supports_block_sparse=True),
+    "mha4_i8fp8": _mha_v4_spec((1.0, 1.0, 1.0), supports_block_sparse=True),
+    "mha4_mxfp8": _mha_v4_spec(
+        (1.0, 1.0, 1.0),
+        supports_block_sparse=True,
+        uses_hadamard=True,
+    ),
+    "mha4_fp8": _mha_v4_spec(
+        (1.0, 1.0, 1.0),
+        supports_block_sparse=True,
+        uses_hadamard=True,
+    ),
+    "mha4_f8f6": _mha_v4_spec(
+        (1.0, 1.0, 0.75),
+        supports_block_sparse=True,
+        uses_hadamard=True,
+    ),
+    "mha4_f6f8": _mha_v4_spec(
+        (0.75, 0.75, 1.0),
+        supports_block_sparse=True,
+        uses_hadamard=True,
+    ),
+    "mha4_mxfp6": _mha_v4_spec(
+        (0.75, 0.75, 0.75),
+        supports_block_sparse=True,
+        uses_hadamard=True,
+    ),
+    "mha4_f6f4": _mha_v4_spec(
+        (0.75, 0.75, 0.5),
+        supports_block_sparse=True,
+        uses_hadamard=True,
+    ),
+    "mha4_mxfp4": _mha_v4_spec(
+        (0.5, 0.5, 0.5),
+        supports_block_sparse=True,
+        uses_hadamard=True,
+    ),
+    "mha4_f4f4": _mha_v4_spec(
+        (0.5, 0.5, 0.5),
+        supports_block_sparse=True,
+        uses_hadamard=True,
+    ),
+}
+
+ALL_KERNELS = tuple(
+    kernel for kernel, spec in KERNEL_SPECS.items() if spec.include_in_all
+)
 
 
 @dataclass
@@ -90,6 +247,21 @@ class LoadedMask:
     batch: int
     num_q_blocks: int
     num_kv_blocks: int
+
+
+@dataclass
+class AccuracyMetrics:
+    mae: float
+    maxe: float
+    cosine: float
+
+
+@dataclass
+class AllKernelRow:
+    kernel: str
+    ms: float
+    tflops: float
+    accuracy: AccuracyMetrics | None = None
 
 
 def layout_preprocess(
@@ -112,6 +284,407 @@ def primary_output(result: Any) -> Any:
     if isinstance(result, (tuple, list)) and len(result) > 0:
         return result[0]
     return result
+
+
+def _generate_transformer_qkv(
+    batch: int,
+    hq: int,
+    hk: int,
+    sq: int,
+    sk: int,
+    d_head: int,
+    d_head_v: int,
+    device: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # Realistic LLM activations: RMS-norm, per-channel log-normal scales, a per-token shared Q/K
+    # term, and V outlier dims/tokens. The shared term gives self-affinity, not a token-common
+    # mode: that stays near 0.02 here, against 0.13-0.42 on dumped video models. Returns fp32.
+    q = torch.randn((batch, hq, sq, d_head), device=device, dtype=torch.float32)
+    k = torch.randn((batch, hk, sk, d_head), device=device, dtype=torch.float32)
+    v = torch.randn((batch, hk, sk, d_head_v), device=device, dtype=torch.float32)
+
+    q = q / q.pow(2).mean(dim=-1, keepdim=True).add(1e-6).sqrt()
+    k = k / k.pow(2).mean(dim=-1, keepdim=True).add(1e-6).sqrt()
+    v = v / v.pow(2).mean(dim=-1, keepdim=True).add(1e-6).sqrt()
+
+    q_channel_scale = torch.exp(
+        0.35 * torch.randn((1, hq, 1, d_head), device=device)
+    ).clamp(0.35, 2.5)
+    k_channel_scale = torch.exp(
+        0.35 * torch.randn((1, hk, 1, d_head), device=device)
+    ).clamp(0.35, 2.5)
+    v_channel_scale = torch.exp(
+        0.45 * torch.randn((1, hk, 1, d_head_v), device=device)
+    ).clamp(0.25, 3.5)
+    q = q * q_channel_scale
+    k = k * k_channel_scale
+    v = v * v_channel_scale
+
+    shared_heads = min(hq, hk)
+    shared_seq = min(sq, sk)
+    shared_d = min(d_head, d_head_v)
+    if shared_heads > 0 and shared_seq > 0:
+        shared = torch.randn(
+            (batch, shared_heads, shared_seq, shared_d),
+            device=device,
+            dtype=torch.float32,
+        )
+        q[:, :shared_heads, :shared_seq, :shared_d] += 0.35 * shared
+        k[:, :shared_heads, :shared_seq, :shared_d] += 0.35 * shared
+
+    num_v_outlier_dims = max(1, d_head_v // 16)
+    v_outlier_dims = torch.randperm(d_head_v, device=device)[:num_v_outlier_dims]
+    v[..., v_outlier_dims] *= 4.0
+    num_v_outlier_tokens = max(1, sk // 128)
+    v_outlier_tokens = torch.randperm(sk, device=device)[:num_v_outlier_tokens]
+    v[:, :, v_outlier_tokens, :] *= 2.5
+
+    return q, k, v
+
+
+# Calibrated against dumped Wan, HunyuanVideo 1.5 and Flux2 attention, which agree closely despite
+# differing architectures: shared components 0.37-0.57 (Q), 0.37-0.47 (K), 0.31-0.36 (V),
+# cancellation 2.4-2.8, logit spread 2.0-2.6, amax/RMS near 7 on Q/K and 8.8-25.2 on V.
+_DIFFUSION_RHO_Q = 0.45
+_DIFFUSION_RHO_K = 0.40
+_DIFFUSION_RHO_V = 0.34
+_DIFFUSION_CHANNEL_SIGMA = 0.16
+_DIFFUSION_LOGIT_STD = 2.2
+_DIFFUSION_V_OUTLIER_DIM_GAIN = 2.0
+_DIFFUSION_V_OUTLIER_TOKEN_GAIN = 4.0
+
+
+def _coherent_rows(batch, heads, seq, dim, rho, sigma, device):
+    """Rows sharing a per-head direction, so the token-common mode is `rho` by construction.
+
+    The per-channel scale then spreads channel magnitudes, which is what lifts amax above the RMS
+    even though each channel on its own stays near-Gaussian, as the dumps do.
+    """
+    shared = torch.randn((1, heads, 1, dim), device=device, dtype=torch.float32)
+    shared *= math.sqrt(dim) / shared.norm(dim=-1, keepdim=True)
+    noise = torch.randn((batch, heads, seq, dim), device=device, dtype=torch.float32)
+    rows = rho * shared + math.sqrt(1.0 - rho * rho) * noise
+    channel_scale = (
+        torch.randn((1, heads, 1, dim), device=device, dtype=torch.float32)
+        .mul(sigma)
+        .exp()
+    )
+    return rows * channel_scale
+
+
+def _generate_diffusion_qkv(
+    batch: int,
+    hq: int,
+    hk: int,
+    sq: int,
+    sk: int,
+    d_head: int,
+    d_head_v: int,
+    device: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Diffusion-transformer activations. Returns fp32 q/k/v.
+
+    The defining difference from LLM activations is that Q, K and V all carry a large component
+    shared across tokens. For V that is what holds cancellation near 2.6 rather than the 8-40 that
+    iid V produces, because averaging many keys cancels the noise and leaves the shared part.
+    """
+    q = _coherent_rows(
+        batch, hq, sq, d_head, _DIFFUSION_RHO_Q, _DIFFUSION_CHANNEL_SIGMA, device
+    )
+    k = _coherent_rows(
+        batch, hk, sk, d_head, _DIFFUSION_RHO_K, _DIFFUSION_CHANNEL_SIGMA, device
+    )
+    v = _coherent_rows(
+        batch, hk, sk, d_head_v, _DIFFUSION_RHO_V, _DIFFUSION_CHANNEL_SIGMA, device
+    )
+
+    outlier_dims = torch.randperm(d_head_v, device=device)[: max(1, d_head_v // 16)]
+    v[..., outlier_dims] *= _DIFFUSION_V_OUTLIER_DIM_GAIN
+    outlier_tokens = torch.randperm(sk, device=device)[: max(1, sk // 256)]
+    v[:, :, outlier_tokens, :] *= _DIFFUSION_V_OUTLIER_TOKEN_GAIN
+
+    # Scaling Q moves the logit spread, and so the diffuseness, without touching any of the
+    # common modes, which are ratios.
+    probe = torch.arange(0, sq, max(1, sq // 64), device=device)[:64]
+    measured = ((q[0, 0, probe] @ k[0, 0].T) * (d_head**-0.5)).std(-1).median()
+    q *= _DIFFUSION_LOGIT_STD / measured.clamp_min(1e-9)
+    return q, k, v
+
+
+_NAMED_DISTRIBUTIONS = (
+    "zero",
+    "normal",
+    "diffusion",
+    "padded",
+    "transformer",
+    "sink",
+    "underflow",
+    "latepeak",
+    "maxstair",
+    "kcommon",
+)
+
+
+def _input_distribution(value: str) -> str:
+    if value in _NAMED_DISTRIBUTIONS or value.startswith("dump:"):
+        return value
+    raise argparse.ArgumentTypeError(
+        f"invalid choice: {value!r} (choose from {', '.join(_NAMED_DISTRIBUTIONS)}, or dump:PATH)"
+    )
+
+
+def generate_test_tensors(
+    batch: int,
+    hq: int,
+    hk: int,
+    sq: int,
+    sk: int,
+    d_head: int,
+    d_head_v: int,
+    dtype: torch.dtype,
+    device: str,
+    distribution: str,
+    hadamard_rotate: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # "dump:<path>": replay Q/K/V captured from a real model. Every synthetic distribution here is
+    # ~10x too optimistic even when matched on common mode, diffuseness, cancellation, logit
+    # spread and amax/RMS, so replaying sidesteps having to know what actually drives real error.
+    if distribution.startswith("dump:"):
+        sample = torch.load(
+            distribution[len("dump:") :], map_location=device, weights_only=False
+        )
+        # Captures are BSHD; the bench works in BHSD.
+        q, k, v = (
+            sample[name].transpose(1, 2)
+            for name in ("query_bshd", "key_bshd", "value_bshd")
+        )
+        have = (
+            q.shape[0],
+            q.shape[1],
+            k.shape[1],
+            q.shape[2],
+            k.shape[2],
+            q.shape[3],
+            v.shape[3],
+        )
+        want = (batch, hq, hk, sq, sk, d_head, d_head_v)
+        if any(h < w for h, w in zip(have, want)):
+            raise ValueError(
+                f"dump is {have} (batch, hq, hk, sq, sk, d, dv) and cannot cover the "
+                f"requested {want}; ask for a shape it contains"
+            )
+        q = q[:batch, :hq, :sq, :d_head]
+        k = k[:batch, :hk, :sk, :d_head]
+        v = v[:batch, :hk, :sk, :d_head_v]
+        return tuple(t.contiguous().to(dtype) for t in (q, k, v))
+
+    # "zero": all-zero Q/K/V for degenerate-input and quantization smoke tests.
+    if distribution == "zero":
+        q = torch.zeros((batch, hq, sq, d_head), device=device, dtype=dtype)
+        k = torch.zeros((batch, hk, sk, d_head), device=device, dtype=dtype)
+        v = torch.zeros((batch, hk, sk, d_head_v), device=device, dtype=dtype)
+        return q, k, v
+
+    # "normal": plain iid Gaussian Q/K/V -- the simplest smoke-test inputs.
+    if distribution == "normal":
+        q = torch.randn((batch, hq, sq, d_head), device=device, dtype=dtype)
+        k = torch.randn((batch, hk, sk, d_head), device=device, dtype=dtype)
+        v = torch.randn((batch, hk, sk, d_head_v), device=device, dtype=dtype)
+        return q, k, v
+
+    # "sink": realistic StreamingLLM-style pattern where a few leading "sink" tokens attract most attention mass -- peaked yet in-distribution for long context.
+    if distribution == "sink":
+        q, k, v = _generate_transformer_qkv(
+            batch, hq, hk, sq, sk, d_head, d_head_v, device
+        )
+        g = torch.nn.functional.normalize(
+            torch.randn((batch, 1, 1, d_head), device=device, dtype=torch.float32),
+            dim=-1,
+        )
+        num_sinks = min(sk, 4)
+        k[:, :, :num_sinks, :] += 12.0 * g
+        q = q + 3.0 * g
+        return q.to(dtype), k.to(dtype), v.to(dtype)
+
+    if distribution == "underflow":
+        # Reproduces the fp8 underflow tile-skip regression: a hotspot in the first KV tile sets a
+        # high frozen max, so later tiles fall below the e4m3 round-to-zero floor and the skip path
+        # fires. Per-row jitter makes partner waves disagree on which tiles to skip, eating it.
+        gap = float(os.environ.get("AITER_UNDERFLOW_GAP", "16.0"))
+        jitter = float(os.environ.get("AITER_UNDERFLOW_JITTER", "0.4"))
+        jitter = min(max(jitter, 0.0), 1.0)
+        scale = float(d_head) ** -0.5  # kernel softmax scale (1/sqrt(d_head))
+        hot_keys = min(128, sk)  # one KV tile
+
+        # Single shared hotspot direction (unit vector), broadcast over heads.
+        u = torch.randn((1, 1, 1, d_head), device=device, dtype=torch.float32)
+        u = u / u.pow(2).sum(dim=-1, keepdim=True).add(1e-12).sqrt()
+
+        # Amplitude so a fully-aligned Q/K pair (row_factor=1) yields a hotspot
+        # logit == gap after the 1/sqrt(d_head) softmax scaling.
+        amp = (gap / scale) ** 0.5
+
+        # Per-query-row hotspot factor in [jitter, 1]; the hotspot logit for a
+        # row is gap * row_factor, so rows with row_factor < ~7.62/gap will NOT
+        # fully underflow the later tiles -> partner-wave disagreement.
+        row_factor = jitter + (1.0 - jitter) * torch.rand(
+            (batch, hq, sq, 1), device=device, dtype=torch.float32
+        )
+        q = amp * row_factor * u + 0.35 * torch.randn(
+            (batch, hq, sq, d_head), device=device, dtype=torch.float32
+        )
+
+        # Remaining keys: small, near-orthogonal -> low logits. Hotspot keys
+        # (first tile) aligned with u at amplitude `amp`.
+        k = 0.30 * torch.randn(
+            (batch, hk, sk, d_head), device=device, dtype=torch.float32
+        )
+        k[:, :, :hot_keys, :] = amp * u + 0.10 * torch.randn(
+            (batch, hk, hot_keys, d_head), device=device, dtype=torch.float32
+        )
+
+        v = 0.5 * torch.randn(
+            (batch, hk, sk, d_head_v), device=device, dtype=torch.float32
+        )
+        return q.to(dtype), k.to(dtype), v.to(dtype)
+
+    if distribution == "latepeak":
+        # Tripwire for the frozen-max rollback: the sink sits in the LAST KV tile, so a seed taken
+        # from tile 0 is low and the late logit saturates the Schraudolph u32 cvt to NaN bits.
+        # Random distributions never produce a late-tile outlier, so cosine-on-random missed it.
+        gap = float(
+            os.environ.get(
+                "AITER_LATEPEAK_GAP", os.environ.get("AITER_LATESINK_GAP", "40.0")
+            )
+        )
+        scale = float(d_head) ** -0.5
+        hot_keys = min(128, sk)  # one KV tile
+        u = torch.randn((1, 1, 1, d_head), device=device, dtype=torch.float32)
+        u = u / u.pow(2).sum(dim=-1, keepdim=True).add(1e-12).sqrt()
+        amp = (gap / scale) ** 0.5
+        # Q fully aligned with the sink direction so the late tile dominates.
+        q = amp * u + 0.35 * torch.randn(
+            (batch, hq, sq, d_head), device=device, dtype=torch.float32
+        )
+        # All keys small/near-orthogonal EXCEPT the LAST tile, which holds the sink.
+        k = 0.30 * torch.randn(
+            (batch, hk, sk, d_head), device=device, dtype=torch.float32
+        )
+        k[:, :, sk - hot_keys :, :] = amp * u + 0.10 * torch.randn(
+            (batch, hk, hot_keys, d_head), device=device, dtype=torch.float32
+        )
+        v = 0.5 * torch.randn(
+            (batch, hk, sk, d_head_v), device=device, dtype=torch.float32
+        )
+        return q.to(dtype), k.to(dtype), v.to(dtype)
+
+    if distribution == "maxstair":
+        # Frozen-max rollback stress: every 128-token KV tile sets a new row max, with alternating
+        # query-row groups above and below the rollback threshold (about 8.87 in kernel log2
+        # units). Built post-Hadamard so MXFP6 quantization preserves each tile step.
+        step = float(os.environ.get("AITER_MAXSTAIR_STEP", "12.0"))
+        low_factor = float(os.environ.get("AITER_MAXSTAIR_LOW_FACTOR", "0.5"))
+        if step <= 0:
+            raise ValueError(f"AITER_MAXSTAIR_STEP must be positive, got {step}")
+        if not 0 < low_factor <= 1:
+            raise ValueError(
+                f"AITER_MAXSTAIR_LOW_FACTOR must be in (0, 1], got {low_factor}"
+            )
+        tile_size = 128
+        num_tiles = (sk + tile_size - 1) // tile_size
+        if sk % tile_size != 0:
+            raise ValueError(f"maxstair requires sk divisible by {tile_size}, got {sk}")
+
+        anchor_mask = torch.arange(d_head, device=device) % 32 == 31
+        score_dims = (~anchor_mask).nonzero().flatten()
+        max_tiles = score_dims.numel() * 5 + 1
+        if num_tiles > max_tiles:
+            raise ValueError(
+                f"maxstair supports at most {max_tiles} KV tiles, got {num_tiles}"
+            )
+
+        tile_index = torch.arange(sk, device=device) // tile_size
+        state = torch.clamp(
+            (
+                tile_index[:, None]
+                + score_dims.numel()
+                - 1
+                - torch.arange(score_dims.numel(), device=device)[None, :]
+            )
+            // score_dims.numel(),
+            min=0,
+        ).to(torch.float32)
+        k_rotated = torch.zeros((sk, d_head), device=device, dtype=torch.float32)
+        k_rotated[:, score_dims] = state
+        k_rotated[:, anchor_mask] = 7.0
+        token_sign = 1.0 - 2.0 * (torch.arange(sk, device=device) & 1).float()
+        k_rotated = k_rotated * token_sign[:, None]
+
+        query_group = torch.arange(sq, device=device) // tile_size
+        query_factor = torch.where(
+            (query_group & 1) == 0,
+            torch.ones_like(query_group, dtype=torch.float32),
+            torch.full_like(query_group, low_factor, dtype=torch.float32),
+        )
+        q_rotated = torch.zeros((sq, d_head), device=device, dtype=torch.float32)
+        q_rotated[:, score_dims] = step * query_factor[:, None]
+
+        q_scale_log2 = mha_v4_q_multiplier(d_head**-0.5)
+        if hadamard_rotate:
+            rotation = create_hadamard_matrix(
+                d_head, device=device, dtype=torch.float32
+            ) / (d_head**0.5)
+            q_base = torch.matmul(q_rotated, rotation) / q_scale_log2
+            k_base = torch.matmul(k_rotated, rotation)
+        else:
+            q_base = q_rotated / q_scale_log2
+            k_base = k_rotated
+        q = q_base.view(1, 1, sq, d_head).expand(batch, hq, -1, -1).clone()
+        k = k_base.view(1, 1, sk, d_head).expand(batch, hk, -1, -1).clone()
+        v = 0.5 * torch.randn(
+            (batch, hk, sk, d_head_v), device=device, dtype=torch.float32
+        )
+        return q.to(dtype), k.to(dtype), v.to(dtype)
+
+    if distribution == "kcommon":
+        # Diffusion activations plus a large shared-K direction. Softmax is shift-invariant in it
+        # so output is unchanged, but per-tensor Q/K quantization noise scales with |q.k| rather
+        # than its spread. Real models reach 0.47; this goes further to stress the K-smoothing gate.
+        q, k, v = _generate_diffusion_qkv(
+            batch, hq, hk, sq, sk, d_head, d_head_v, device
+        )
+        direction = torch.randn((hk, d_head), device=device, dtype=torch.float32)
+        direction /= direction.norm(dim=-1, keepdim=True)
+        k += 16.0 * k.norm(dim=-1).mean() * direction[None, :, None, :]
+        return q.to(dtype), k.to(dtype), v.to(dtype)
+
+    if distribution == "padded":
+        # Ulysses head padding: a shard can hold (batch, head) slices entirely zero in Q, K and V.
+        # Z-Image rank 7 has 4 of 8 heads empty. Found a NaN in the per-channel FP8 V quantizer,
+        # which divides by a zero amax.
+        q, k, v = _generate_diffusion_qkv(
+            batch, hq, hk, sq, sk, d_head, d_head_v, device
+        )
+        q[:, hq - max(1, hq // 4) :] = 0
+        empty_kv = max(1, hk // 4)
+        k[:, hk - empty_kv :] = 0
+        v[:, hk - empty_kv :] = 0
+        return q.to(dtype), k.to(dtype), v.to(dtype)
+
+    if distribution == "transformer":
+        # LLM activations. Kept as its own distribution rather than folded into "diffusion":
+        # MHA v4 runs LLM workloads too, and the two look nothing alike, the token-common mode
+        # staying near 0.02 here against 0.31-0.57 measured on diffusion models.
+        q, k, v = _generate_transformer_qkv(
+            batch, hq, hk, sq, sk, d_head, d_head_v, device
+        )
+        return q.to(dtype), k.to(dtype), v.to(dtype)
+
+    if distribution != "diffusion":
+        raise ValueError(f"Unsupported input distribution: {distribution}")
+
+    q, k, v = _generate_diffusion_qkv(batch, hq, hk, sq, sk, d_head, d_head_v, device)
+    return q.to(dtype), k.to(dtype), v.to(dtype)
 
 
 def infer_shape_spec(
@@ -215,7 +788,11 @@ def load_block_mask_from_json(
     return None
 
 
-def kernel_block_sizes(kernel: KernelName) -> tuple[int, int]:
+def kernel_block_sizes(kernel: str) -> tuple[int, int]:
+    # MHA v4's sparse tile is set by its manifest row, not by the Triton configs
+    # below: 256x128 on gfx950 but 256x64 on gfx942.
+    if kernel.startswith("mha4_"):
+        return 256, mha_v4_kv_tile()
     if kernel == "sage_mxfp4":
         cfg = get_sage_fwd_configs_mxfp4()
     else:
@@ -284,7 +861,7 @@ def build_block_mask(
 
 
 def sparse_flops_from_lut(
-    kernel: KernelName,
+    kernel: str,
     block_lut: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     shape: ShapeSpec,
 ) -> tuple[float, float]:
@@ -316,30 +893,59 @@ def fp8_quantize(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    scale: torch.Tensor | None = None,
+    rotate_qk: bool = True,
 ) -> tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ]:
-    quant_dtype = aiter.dtypes.fp8
-    q_quant, q_descale = aiter.per_tensor_quant(
-        q,
-        scale=torch.abs(q).max() if scale is None else scale,
-        quant_dtype=quant_dtype,
-        dtypeMax=torch.finfo(quant_dtype).max,
-    )
-    k_quant, k_descale = aiter.per_tensor_quant(
-        k,
-        scale=torch.abs(k).max() if scale is None else scale,
-        quant_dtype=quant_dtype,
-        dtypeMax=torch.finfo(quant_dtype).max,
-    )
-    v_quant, v_descale = aiter.per_tensor_quant(
-        v,
-        scale=torch.abs(v).max() if scale is None else scale,
-        quant_dtype=quant_dtype,
-        dtypeMax=torch.finfo(quant_dtype).max,
-    )
+    quantize_qk = quantize_fp8_rotated if rotate_qk else quantize_fp8
+    q_quant, q_descale = quantize_qk(q)
+    k_quant, k_descale = quantize_qk(k)
+    v_quant, v_descale = quantize_fp8(v)
     return q_quant, k_quant, v_quant, q_descale, k_descale, v_descale
+
+
+def cancel_internal_qk_rotation(
+    q: torch.Tensor, k: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pre-rotate Q/K so a fused production Hadamard quantizer emits raw-domain Q/K."""
+    q_rotated = torch.empty_like(q)
+    k_rotated = torch.empty_like(k)
+    rotate_activation_hd128(q_rotated, q)
+    rotate_activation_hd128(k_rotated, k)
+    return q_rotated, k_rotated
+
+
+def rotate_qk_blocks(
+    q: torch.Tensor, k: torch.Tensor, block_r: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    head_dim = q.shape[-1]
+    if block_r > head_dim or head_dim % block_r != 0:
+        raise ValueError(
+            f"head dim ({head_dim}) must be divisible by block_r ({block_r})"
+        )
+    rotation = create_hadamard_matrix(block_r, device=q.device, dtype=q.dtype) / (
+        block_r**0.5
+    )
+    blocks = head_dim // block_r
+    q_rotated = torch.matmul(q.unflatten(-1, (blocks, block_r)), rotation).flatten(-2)
+    k_rotated = torch.matmul(k.unflatten(-1, (blocks, block_r)), rotation).flatten(-2)
+    return q_rotated, k_rotated
+
+
+def i8fp8_quantize(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_clip: float = 1.0,
+    k_clip: float = 1.0,
+) -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
+    """Quantize Q/K to INT8 and V to FP8 with production MHA v4 operators."""
+    q_int8, q_descale = quantize_int8(q, q_clip)
+    k_int8, k_descale = quantize_int8(k, k_clip)
+    v_quant, v_descale = quantize_fp8(v)
+    return q_int8, k_int8, v_quant, q_descale, k_descale, v_descale
 
 
 def _unpack_block_lut(
@@ -408,6 +1014,8 @@ def make_fav3_fp8_runner(
     softmax_scale: float | None,
     causal: bool,
     e2e: bool = False,
+    hadamard_rotate: bool = True,
+    block_r: int = 128,
 ) -> Any:
     batch, _, num_q_heads, head_dim = q.shape
     _, _, num_kv_heads, _ = k.shape
@@ -419,8 +1027,11 @@ def make_fav3_fp8_runner(
         softmax_scale = head_dim**-0.5
 
     def _quantize():
-        q_fp8, q_ds = _quantize_bshd(q, fp8_dtype, group_size=group_size)
-        k_fp8, k_ds = _quantize_bshd(k, fp8_dtype)
+        quant_q, quant_k = q, k
+        if hadamard_rotate:
+            quant_q, quant_k = rotate_qk_blocks(q, k, block_r)
+        q_fp8, q_ds = _quantize_bshd(quant_q, fp8_dtype, group_size=group_size)
+        k_fp8, k_ds = _quantize_bshd(quant_k, fp8_dtype)
         v_fp8, v_ds = _quantize_bshd(v, fp8_dtype)
         return q_fp8, k_fp8, v_fp8, q_ds, k_ds, v_ds
 
@@ -445,15 +1056,17 @@ def make_fav3_fp8_runner(
     )
 
 
-def make_torch_ref_runner(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    causal: bool,
-) -> Any:
-    return lambda: attention_ref(
-        q, k, v, dropout_p=0.0, dropout_mask=None, causal=causal
-    )
+def _mha_v4_packed_sparse_kwargs(
+    block_lut: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
+) -> dict[str, torch.Tensor]:
+    if block_lut is None:
+        return {}
+    kv_block_indices, lut_start, lut_count = block_lut
+    return {
+        "kv_block_indices": kv_block_indices,
+        "lut_start": lut_start,
+        "lut_count": lut_count,
+    }
 
 
 def make_kernel_runner(
@@ -462,12 +1075,33 @@ def make_kernel_runner(
     k: torch.Tensor,
     v: torch.Tensor,
     block_lut: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
+    block_mask: torch.Tensor | None = None,
 ) -> Any:
     q_bshd, k_bshd, v_bshd = layout_preprocess(
         q, k, v, layout=args.layout, target_layout="bshd"
     )
     head_dim = q_bshd.shape[-1]
     softmax_scale = head_dim**-0.5
+    fp8_format = native_fp8_format()
+    fp8_scale_modes = scale_modes_for_formats(fp8_format, fp8_format, fp8_format)
+    f8f6_scale_modes = scale_modes_for_formats(
+        fp8_format, fp8_format, AttentionFormat.MXFP6
+    )
+    i8fp8_scale_modes = scale_modes_for_formats(
+        AttentionFormat.INT8, AttentionFormat.INT8, fp8_format
+    )
+    packed_sparse = _mha_v4_packed_sparse_kwargs(block_lut)
+    raw_sparse = (
+        {"block_mask": block_mask}
+        if block_lut is not None and block_mask is not None
+        else {}
+    )
+
+    def launch_mha_v4_packed(*tensors, **kwargs):
+        return mha_v4_packed(*tensors, **packed_sparse, **kwargs)
+
+    def launch_mha_v4(*tensors, **kwargs):
+        return mha_v4(*tensors, **raw_sparse, **kwargs)
 
     if args.kernel == "sage_fp8":
         block_r = args.block_r
@@ -564,6 +1198,10 @@ def make_kernel_runner(
         fp8_type = aiter.dtypes.fp8
         fp8_max = torch.finfo(fp8_type).max
 
+        quant_q, quant_k = q, k
+        if not args.hadamard_rotate:
+            quant_q, quant_k = rotate_qk_blocks(quant_q, quant_k, block_r)
+
         (
             q_quant,
             q_descale,
@@ -573,8 +1211,8 @@ def make_kernel_runner(
             v_descale,
             delta_s,
         ) = sage_quant_mxfp4(
-            q,
-            k,
+            quant_q,
+            quant_k,
             v,
             fp8_type,
             fp8_max,
@@ -614,33 +1252,317 @@ def make_kernel_runner(
             return_attn_probs=False,
         )
 
-    if args.kernel == "aiter_fp8":
+    if args.kernel == "mha4_bf16":
+        return lambda: launch_mha_v4(
+            q_bshd,
+            k_bshd,
+            v_bshd,
+            AttentionFormat.BF16,
+            AttentionFormat.BF16,
+            AttentionFormat.BF16,
+            softmax_scale=softmax_scale,
+        )
 
-        def _run_aiter_fp8():
-            q_fp8, k_fp8, v_fp8, q_ds, k_ds, v_ds = fp8_quantize(q_bshd, k_bshd, v_bshd)
-            return flash_attn_fp8_pertensor_func(
-                q_fp8,
-                k_fp8,
-                v_fp8,
-                q_descale=q_ds,
-                k_descale=k_ds,
-                v_descale=v_ds,
+    if args.kernel == "mha4_bf16fp8":
+        if args.e2e:
+            return lambda: launch_mha_v4(
+                q_bshd,
+                k_bshd,
+                v_bshd,
+                AttentionFormat.BF16,
+                AttentionFormat.BF16,
+                fp8_format,
+                softmax_scale=softmax_scale,
+            )
+
+        v_quantized, v_descale = quantize_fp8(v_bshd)
+        bf16fp8_scale_modes = scale_modes_for_formats(
+            AttentionFormat.BF16, AttentionFormat.BF16, fp8_format
+        )
+        return lambda: launch_mha_v4_packed(
+            q_bshd,
+            k_bshd,
+            v_quantized,
+            q_bshd,
+            k_bshd,
+            v_descale,
+            AttentionFormat.BF16,
+            AttentionFormat.BF16,
+            fp8_format,
+            *bf16fp8_scale_modes,
+            softmax_scale=softmax_scale,
+        )
+
+    if args.kernel == "mha4_fp8":
+        if args.hadamard_rotate and args.block_r != 128:
+            raise ValueError("mha4_fp8 Hadamard preprocessing requires block_r=128")
+        if args.e2e and args.hadamard_rotate:
+            return lambda: launch_mha_v4(
+                q_bshd,
+                k_bshd,
+                v_bshd,
+                fp8_format,
+                fp8_format,
+                fp8_format,
+                softmax_scale=softmax_scale,
             )
 
         if args.e2e:
-            return _run_aiter_fp8
+            return lambda: launch_mha_v4_packed(
+                *fp8_quantize(
+                    q_bshd,
+                    k_bshd,
+                    v_bshd,
+                    rotate_qk=args.hadamard_rotate,
+                ),
+                fp8_format,
+                fp8_format,
+                fp8_format,
+                *fp8_scale_modes,
+                softmax_scale=softmax_scale,
+            )
 
-        q_fp8, k_fp8, v_fp8, q_descale, k_descale, v_descale = fp8_quantize(
-            q_bshd, k_bshd, v_bshd
+        packed = fp8_quantize(q_bshd, k_bshd, v_bshd, rotate_qk=args.hadamard_rotate)
+        return lambda: launch_mha_v4_packed(
+            *packed,
+            fp8_format,
+            fp8_format,
+            fp8_format,
+            *fp8_scale_modes,
+            softmax_scale=softmax_scale,
         )
-        return lambda: flash_attn_fp8_pertensor_func(
-            q_fp8,
-            k_fp8,
+
+    if args.kernel == "mha4_mxfp8":
+        if not args.hadamard_rotate or args.block_r != 128 or args.qsmooth:
+            raise ValueError("mha4_mxfp8 requires block_r=128 Hadamard rotation")
+        mxfp8_scale_modes = (
+            AttentionScaleMode.E8M0_PER_1X32,
+            AttentionScaleMode.E8M0_PER_1X32,
+            AttentionScaleMode.F32_PER_TENSOR,
+        )
+
+        if args.e2e:
+            return lambda: launch_mha_v4_packed(
+                *_production_quantize_mxfp8(q_bshd, k_bshd, v_bshd, softmax_scale),
+                fp8_format,
+                fp8_format,
+                fp8_format,
+                *mxfp8_scale_modes,
+                softmax_scale=softmax_scale,
+            )
+
+        packed = _production_quantize_mxfp8(q_bshd, k_bshd, v_bshd, softmax_scale)
+        return lambda: launch_mha_v4_packed(
+            *packed,
+            fp8_format,
+            fp8_format,
+            fp8_format,
+            *mxfp8_scale_modes,
+            softmax_scale=softmax_scale,
+        )
+
+    if args.kernel == "mha4_f8f6":
+        if args.qsmooth or not args.hadamard_rotate or args.block_r != 128:
+            raise ValueError(
+                "mha4_f8f6 requires block_r=128 Hadamard preprocessing "
+                "and does not support --qsmooth"
+            )
+        if args.e2e:
+            return lambda: launch_mha_v4(
+                q_bshd,
+                k_bshd,
+                v_bshd,
+                fp8_format,
+                fp8_format,
+                AttentionFormat.MXFP6,
+                softmax_scale=softmax_scale,
+            )
+
+        q_quantized, q_descale = quantize_fp8_rotated(q_bshd)
+        k_quantized, k_descale = quantize_fp8_rotated(k_bshd)
+        # Both modes run the FP6 P pack, so both need V staged in the matching layout.
+        v_quantized, v_descale = quantize_v_mxfp6_fp6_p(v_bshd)
+        v_pack = AttentionPack.V_FOR_FP6_P
+        return lambda: launch_mha_v4_packed(
+            q_quantized,
+            k_quantized,
+            v_quantized,
+            q_descale,
+            k_descale,
+            v_descale,
+            fp8_format,
+            fp8_format,
+            AttentionFormat.MXFP6,
+            *f8f6_scale_modes,
+            softmax_scale=softmax_scale,
+            v_pack=v_pack,
+        )
+
+    if args.kernel == "mha4_i8fp8":
+        q_clip = args.q_clip if args.q_clip is not None else args.qk_clip
+        k_clip = args.k_clip if args.k_clip is not None else args.qk_clip
+
+        if args.e2e:
+            return lambda: launch_mha_v4(
+                q_bshd,
+                k_bshd,
+                v_bshd,
+                AttentionFormat.INT8,
+                AttentionFormat.INT8,
+                fp8_format,
+                softmax_scale=softmax_scale,
+            )
+
+        q_i8, k_i8, v_fp8, q_descale, k_descale, v_descale = i8fp8_quantize(
+            q_bshd,
+            k_bshd,
+            v_bshd,
+            q_clip=q_clip,
+            k_clip=k_clip,
+        )
+        return lambda: launch_mha_v4_packed(
+            q_i8,
+            k_i8,
             v_fp8,
-            q_descale=q_descale,
-            k_descale=k_descale,
-            v_descale=v_descale,
+            q_descale,
+            k_descale,
+            v_descale,
+            AttentionFormat.INT8,
+            AttentionFormat.INT8,
+            fp8_format,
+            *i8fp8_scale_modes,
+            softmax_scale=softmax_scale,
         )
+
+    if args.kernel in ("mha4_mxfp4", "mha4_f4f4"):
+        block_r = args.block_r
+        if block_r != 128:
+            raise ValueError(f"{args.kernel} requires block_r=128, got {block_r}")
+        if args.qsmooth:
+            raise ValueError(f"{args.kernel} does not support --qsmooth")
+
+        is_f4f4 = args.kernel == "mha4_f4f4"
+        v_format = AttentionFormat.MXFP4
+        scale_modes = scale_modes_for_formats(
+            AttentionFormat.MXFP4, AttentionFormat.MXFP4, v_format
+        )
+        # Both all-MXFP4 kernels consume an FP6 P operand, so both need the FP6-P V order.
+        v_pack = AttentionPack.V_FOR_FP6_P
+
+        def _quantize_mxfp4():
+            quant_q, quant_k = q_bshd, k_bshd
+            if not args.hadamard_rotate:
+                quant_q, quant_k = cancel_internal_qk_rotation(quant_q, quant_k)
+            if is_f4f4:
+                return _production_quantize_f4f4(
+                    quant_q, quant_k, v_bshd, softmax_scale
+                )
+            return _production_quantize_mxfp4(quant_q, quant_k, v_bshd, softmax_scale)
+
+        def _kernel_mxfp4(q_fp4, q_descale, k_fp4, k_descale, v_quantized, v_descale):
+            return launch_mha_v4_packed(
+                q_fp4,
+                k_fp4,
+                v_quantized,
+                q_descale,
+                k_descale,
+                v_descale,
+                AttentionFormat.MXFP4,
+                AttentionFormat.MXFP4,
+                v_format,
+                *scale_modes,
+                softmax_scale=softmax_scale,
+                v_pack=v_pack,
+            )
+
+        if args.e2e:
+            if args.hadamard_rotate:
+                return lambda: launch_mha_v4(
+                    q_bshd,
+                    k_bshd,
+                    v_bshd,
+                    AttentionFormat.MXFP4,
+                    AttentionFormat.MXFP4,
+                    v_format,
+                    softmax_scale=softmax_scale,
+                )
+            return lambda: _kernel_mxfp4(*_quantize_mxfp4())
+
+        packed = _quantize_mxfp4()
+        return lambda: _kernel_mxfp4(*packed)
+
+    if args.kernel in ("mha4_f6f8", "mha4_mxfp6", "mha4_f6f4"):
+        is_f6f4 = args.kernel == "mha4_f6f4"
+        is_mxfp6 = args.kernel == "mha4_mxfp6"
+        block_r = args.block_r
+        if args.qsmooth or (args.hadamard_rotate and block_r != 128):
+            raise ValueError(
+                "MXFP6 Hadamard preprocessing requires block_r=128 "
+                "and does not support --qsmooth"
+            )
+        # Every MXFP6-Q row ships an FP6-P object in both modes. The quantizer and the launcher
+        # must agree on this.
+        uses_fp6_p = is_mxfp6 or is_f6f4
+
+        def _quantize_mxfp6():
+            quant_q, quant_k = q_bshd, k_bshd
+            if not args.hadamard_rotate:
+                quant_q, quant_k = cancel_internal_qk_rotation(quant_q, quant_k)
+            return _production_quantize_mxfp6(
+                quant_q,
+                quant_k,
+                v_bshd,
+                softmax_scale,
+                v_format=(
+                    AttentionFormat.MXFP4
+                    if is_f6f4
+                    else AttentionFormat.MXFP6 if is_mxfp6 else None
+                ),
+                fp6_p=uses_fp6_p,
+            )
+
+        v_format = (
+            AttentionFormat.MXFP4
+            if is_f6f4
+            else AttentionFormat.MXFP6 if is_mxfp6 else fp8_format
+        )
+        scale_modes = scale_modes_for_formats(
+            AttentionFormat.MXFP6, AttentionFormat.MXFP6, v_format
+        )
+
+        def _kernel_mxfp6(q_fp6, q_descale, k_fp6, k_descale, v_quantized, v_descale):
+            return launch_mha_v4_packed(
+                q_fp6,
+                k_fp6,
+                v_quantized,
+                q_descale,
+                k_descale,
+                v_descale,
+                AttentionFormat.MXFP6,
+                AttentionFormat.MXFP6,
+                v_format,
+                *scale_modes,
+                v_pack=(
+                    AttentionPack.V_FOR_FP6_P if uses_fp6_p else AttentionPack.DEFAULT
+                ),
+                softmax_scale=softmax_scale,
+            )
+
+        if args.e2e:
+            if args.hadamard_rotate:
+                return lambda: launch_mha_v4(
+                    q_bshd,
+                    k_bshd,
+                    v_bshd,
+                    AttentionFormat.MXFP6_E2M3,
+                    AttentionFormat.MXFP6_E2M3,
+                    v_format,
+                    softmax_scale=softmax_scale,
+                )
+            return lambda: _kernel_mxfp6(*_quantize_mxfp6())
+
+        packed = _quantize_mxfp6()
+        return lambda: _kernel_mxfp6(*packed)
 
     if args.kernel == "fav3_fp8":
         return make_fav3_fp8_runner(
@@ -650,6 +1572,8 @@ def make_kernel_runner(
             softmax_scale=softmax_scale,
             causal=args.causal,
             e2e=args.e2e,
+            hadamard_rotate=args.hadamard_rotate,
+            block_r=args.block_r,
         )
 
     raise ValueError(f"Unsupported kernel: {args.kernel}")
@@ -664,6 +1588,68 @@ def to_bshd_output_if_needed(
     return out
 
 
+def compute_accuracy_metrics(
+    current: torch.Tensor,
+    reference: torch.Tensor,
+) -> AccuracyMetrics:
+    current_f = current.float()
+    reference_f = reference.float()
+    abs_diff = (current_f - reference_f).abs()
+    cosine = torch.nn.functional.cosine_similarity(
+        current_f.flatten(), reference_f.flatten(), dim=0
+    ).item()
+    return AccuracyMetrics(
+        mae=abs_diff.mean().item(),
+        maxe=abs_diff.max().item(),
+        cosine=cosine,
+    )
+
+
+def fp8_max_diff_percentage(args: argparse.Namespace) -> float:
+    # The coherent distributions and the LLM one are both harder on FP8 than iid inputs.
+    if args.input_distribution in (
+        "transformer",
+        "sink",
+        "diffusion",
+        "kcommon",
+    ) or str(args.input_distribution).startswith("dump:"):
+        return 2.0
+    return 0.5
+
+
+def check_output_against_reference(
+    args: argparse.Namespace,
+    current: torch.Tensor,
+    reference: torch.Tensor,
+) -> None:
+    if os.environ.get("DUMP_PROBE"):
+        torch.save(
+            {
+                "current": current.detach().float().cpu(),
+                "reference": reference.detach().float().cpu(),
+            },
+            os.environ["DUMP_PROBE"],
+        )
+        print(f"[DUMP_PROBE] saved to {os.environ['DUMP_PROBE']}")
+    n_nan = int(torch.isnan(current).sum().item())
+    n_inf = int(torch.isinf(current).sum().item())
+    if n_nan or n_inf:
+        raise AssertionError(
+            f"non-finite output from {args.kernel}: nan={n_nan}, inf={n_inf}"
+        )
+    print(f"[NAN-CHECK] PASS kernel={args.kernel} (output finite)")
+    compare_accuracy(current, reference)
+    if KERNEL_SPECS[args.kernel].quantized:
+        check_attention_outputs(
+            current,
+            reference,
+            fp8=True,
+            max_diff_percentage=fp8_max_diff_percentage(args),
+        )
+    else:
+        check_attention_outputs(current, reference, fp8=False)
+
+
 def make_reference_output(
     args: argparse.Namespace,
     q: torch.Tensor,
@@ -674,7 +1660,27 @@ def make_reference_output(
     q_bshd, k_bshd, v_bshd = layout_preprocess(
         q, k, v, layout=args.layout, target_layout="bshd"
     )
-    ref = args.ref or "torch"
+    ref = args.ref
+
+    # attention_ref materializes a full [b, hq, sq, sk] fp32 scores tensor; past ~32 GiB it becomes
+    # numerically unreliable and cosine collapses even for a correct kernel (~0.45 at sq=sk=75520,
+    # while 32768 is fine). Point the user at --ref aiter_bf16, which streams the scores instead.
+    if ref == "torch":
+        b_, sq_, hq_, _ = q_bshd.shape
+        sk_ = k_bshd.shape[1]
+        scores_gib = b_ * hq_ * sq_ * sk_ * 4 / (1024**3)
+        if scores_gib > 32.0:
+            logger.warning(
+                "torch reference builds a %.0f GiB fp32 [b=%d, hq=%d, sq=%d, sk=%d] scores tensor "
+                "at this shape and is numerically UNRELIABLE at long sequence (its cosine collapses "
+                "even for a bit-correct kernel -- e.g. ~0.45 at sq=sk=75520). Use "
+                "--ref aiter_bf16 for correctness checks at this size.",
+                scores_gib,
+                b_,
+                hq_,
+                sq_,
+                sk_,
+            )
 
     if block_attn_mask is not None:
         if ref != "torch":
@@ -707,23 +1713,43 @@ def make_reference_output(
             )
         )
 
-    return primary_output(make_torch_ref_runner(q_bshd, k_bshd, v_bshd, args.causal)())
+    return primary_output(
+        attention_ref(
+            q_bshd,
+            k_bshd,
+            v_bshd,
+            dropout_p=0.0,
+            dropout_mask=None,
+            causal=args.causal,
+        )
+    )
 
 
 def compute_memory_bytes(
     shape: ShapeSpec,
-    q_element_size: int,
-    k_element_size: int,
-    v_element_size: int,
+    q_bytes_per_value: float,
+    k_bytes_per_value: float,
+    v_bytes_per_value: float,
 ) -> float:
     total_num_tokens_q = shape.batch * shape.n_ctx_q
     total_num_tokens_k = shape.batch * shape.n_ctx_k
 
-    q_size = total_num_tokens_q * shape.hq * shape.d_head * q_element_size
-    k_size = total_num_tokens_k * shape.hk * shape.d_head * k_element_size
-    v_size = total_num_tokens_k * shape.hk * shape.d_head_v * v_element_size
-    o_size = total_num_tokens_q * shape.hq * shape.d_head_v * q_element_size
+    q_size = total_num_tokens_q * shape.hq * shape.d_head * q_bytes_per_value
+    k_size = total_num_tokens_k * shape.hk * shape.d_head * k_bytes_per_value
+    v_size = total_num_tokens_k * shape.hk * shape.d_head_v * v_bytes_per_value
+    o_size = total_num_tokens_q * shape.hq * shape.d_head_v * 2.0
     return q_size + k_size + v_size + o_size
+
+
+def benchmark_payload_bytes(
+    args: argparse.Namespace,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+) -> tuple[float, float, float]:
+    if args.e2e:
+        return float(q.element_size()), float(k.element_size()), float(v.element_size())
+    return KERNEL_SPECS[args.kernel].payload_bytes
 
 
 def benchmark_single_case(
@@ -735,6 +1761,21 @@ def benchmark_single_case(
     loaded_single_mask: LoadedMask | None,
     explicit_block_attn_mask: torch.Tensor | None = None,
 ) -> float:
+    if os.environ.get("AITER_PROBE_VIDENTITY"):
+        # LAYOUT PROBE (not accuracy): V := identity so O[q,d] = sum_kv P[q,kv] d(kv==d) = P[q,d].
+        # The output's d-axis then IS the kv axis, so any kv scramble in the PV contraction shows up
+        # as a column permutation of O vs the reference (both use this same V). Use sq=sk=d=dv=128.
+        _b, _d0 = v.shape[0], v.shape[-1]
+        _sk = v.shape[1] if args.layout == "bshd" else v.shape[2]
+        _h = v.shape[2] if args.layout == "bshd" else v.shape[1]
+        _n = min(_sk, _d0)
+        eye = torch.zeros(_sk, _d0, device=v.device, dtype=v.dtype)
+        eye[:_n, :_n] = torch.eye(_n, device=v.device, dtype=v.dtype) * 6.0
+        if args.layout == "bshd":  # [b, s, h, d]
+            v = eye[None, :, None, :].expand(_b, _sk, _h, _d0).contiguous()
+        else:  # [b, h, s, d]
+            v = eye[None, None, :, :].expand(_b, _h, _sk, _d0).contiguous()
+
     shape = infer_shape_spec(q, v, args.layout)
     block_attn_mask = (
         explicit_block_attn_mask
@@ -747,21 +1788,16 @@ def benchmark_single_case(
         else None
     )
 
-    fn = make_kernel_runner(args, q, k, v, block_lut=block_lut)
+    fn = make_kernel_runner(
+        args, q, k, v, block_lut=block_lut, block_mask=block_attn_mask
+    )
     ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
 
     if args.compare_to_ref:
         current_primary = primary_output(fn())
         current_primary = to_bshd_output_if_needed(current_primary, args.layout)
         ref_primary = make_reference_output(args, q, k, v, block_attn_mask)
-        compare_accuracy(current_primary, ref_primary)
-        if args.kernel == "sage_mxfp4":
-            # MXFP4 is numerically noisier than BF16/FP32 and needs looser checks.
-            check_attention_outputs(
-                current_primary, ref_primary, fp8=True, atol=3.0e-1, rtol=2.0e-1
-            )
-        else:
-            check_attention_outputs(current_primary, ref_primary, fp8=False)
+        check_output_against_reference(args, current_primary, ref_primary)
 
     total_flops = (
         2.0
@@ -772,32 +1808,27 @@ def benchmark_single_case(
         * (shape.d_head + shape.d_head_v)
     )
 
-    if args.kernel in ("fav3_fp8", "aiter_fp8", "sage_fp8", "sage_mxfp4"):
-        q_elem_size = 1
-        k_elem_size = 1
-    else:
-        q_elem_size = q.element_size()
-        k_elem_size = k.element_size()
-
-    v_elem_size = 1 if args.kernel in ("fav3_fp8", "aiter_fp8") else v.element_size()
-    mem = compute_memory_bytes(shape, q_elem_size, k_elem_size, v_elem_size)
+    mem = compute_memory_bytes(
+        shape,
+        *benchmark_payload_bytes(args, q, k, v),
+    )
 
     sparse_flops = None
     if block_lut is not None:
         sparse_flops, _ = sparse_flops_from_lut(args.kernel, block_lut, shape)
 
-    if "time(ms)" in provider:
+    if provider == "time(ms)":
         return ms
-    if "sparse_throughput(TFLOPS)" in provider:
+    if provider == "sparse_throughput(TFLOPS)":
         flops = sparse_flops if sparse_flops is not None else total_flops
         return flops / ms * 1e-9
-    if "throughput(TFLOPS)" in provider:
+    if provider == "throughput(TFLOPS)":
         return total_flops / ms * 1e-9
-    if "bandwidth(GB/s)" in provider:
+    if provider == "bandwidth(GB/s)":
         return mem / ms * 1e-6
-    if "arithmetic_intensity(FLOP/byte)" in provider:
+    if provider == "arithmetic_intensity(FLOP/byte)":
         return total_flops / mem
-    return ms
+    raise ValueError(f"Unknown benchmark provider: {provider}")
 
 
 def metric_lines(args: argparse.Namespace, include_sparse_metric: bool) -> list[str]:
@@ -861,7 +1892,6 @@ def create_single_shape_config(args: argparse.Namespace) -> list[Any]:
                 "D_HEAD_V": d_head_v,
                 "dtype": arg_to_torch_dtype[args.dtype],
                 "layout": args.layout,
-                "causal": args.causal,
             },
         )
     ]
@@ -914,7 +1944,6 @@ def create_mask_list_config(
                 "D_HEAD_V": args.dv,
                 "dtype": arg_to_torch_dtype[args.dtype],
                 "layout": args.layout,
-                "causal": args.causal,
                 "args": args,
                 "HQ": args.hq,
                 "HK": hk,
@@ -957,30 +1986,48 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.block_sparsity is not None and args.block_mask_file:
         logger.info("Using --block-mask-file; ignoring --block-sparsity")
 
-    if args.compare_to_ref and args.ref not in ("torch", "aiter_bf16"):
+    spec = None if args.kernel == "all" else KERNEL_SPECS[args.kernel]
+    sparse_requested = args.block_sparsity is not None or bool(args.block_mask_file)
+    if sparse_requested and (spec is None or not spec.supports_block_sparse):
+        raise ValueError(f"{args.kernel} does not support block-sparse mode")
+
+    if sparse_requested and args.causal:
+        raise ValueError("block-sparse mode supports non-causal attention only")
+
+    if args.n_repetitions is not None and (
+        args.block_sparsity is None or args.block_mask_file
+    ):
+        raise ValueError(
+            "--n-repetitions requires random --block-sparsity without "
+            "--block-mask-file"
+        )
+
+    if args.ref not in ("torch", "aiter_bf16"):
         raise ValueError("--ref must be one of: torch, aiter_bf16")
 
     if args.kernel == "all":
-        if args.block_sparsity is not None or args.block_mask_file:
-            raise ValueError("--kernel=all does not support block-sparse mode")
-        if args.compare_to_ref:
-            raise ValueError("--kernel=all does not support --compare-to-ref")
         if args.load_captured:
             raise ValueError("--kernel=all does not support --load-captured")
+        if not args.hadamard_rotate:
+            raise ValueError(
+                "--kernel=all compares production preprocessing and requires "
+                "--hadamard-rotate=1"
+            )
 
-    _quantized_kernels = ("sage_fp8", "sage_mxfp4", "fav3_fp8", "aiter_fp8")
+    if args.causal and (spec is None or not spec.supports_causal):
+        raise ValueError(f"{args.kernel} supports non-causal attention only")
 
-    if args.e2e and args.kernel not in _quantized_kernels and args.kernel != "all":
+    if args.qsmooth and args.kernel != "sage_mxfp4":
+        raise ValueError("--qsmooth is supported only by sage_mxfp4")
+
+    if args.n_repetitions is not None and args.n_repetitions <= 0:
+        raise ValueError("--n-repetitions must be positive")
+
+    if args.e2e and spec is not None and not spec.quantized:
         logger.warning("--e2e has no effect for kernel %s", args.kernel)
 
-    _hadamard_kernels = ("sage_fp8", "sage_mxfp4", "all")
-
-    if args.kernel not in _hadamard_kernels and (
-        args.qsmooth or args.hadamard_rotate is False
-    ):
-        logger.warning(
-            "Hadamard/qsmooth flags are ignored unless --kernel is sage_fp8, sage_mxfp4, or all"
-        )
+    if spec is not None and not spec.uses_hadamard and not args.hadamard_rotate:
+        logger.warning("--hadamard-rotate is ignored for kernel %s", args.kernel)
 
 
 def run_benchmark_generated(
@@ -998,13 +2045,22 @@ def run_benchmark_generated(
         D_HEAD_V,
         dtype,
         layout,
-        causal,
         provider,
         device="cuda",
     ):
-        q = torch.randn((BATCH, HQ, N_CTX_Q, D_HEAD), device=device, dtype=dtype)
-        k = torch.randn((BATCH, HK, N_CTX_K, D_HEAD), device=device, dtype=dtype)
-        v = torch.randn((BATCH, HK, N_CTX_K, D_HEAD_V), device=device, dtype=dtype)
+        q, k, v = generate_test_tensors(
+            BATCH,
+            HQ,
+            HK,
+            N_CTX_Q,
+            N_CTX_K,
+            D_HEAD,
+            D_HEAD_V,
+            dtype,
+            device,
+            args.input_distribution,
+            hadamard_rotate=args.hadamard_rotate,
+        )
 
         q.requires_grad = False
         k.requires_grad = False
@@ -1060,7 +2116,6 @@ def run_benchmark_mask_list(args: argparse.Namespace, masks: list[LoadedMask]) -
         D_HEAD_V,
         dtype,
         layout,
-        causal,
         args,
         HQ,
         HK,
@@ -1073,10 +2128,18 @@ def run_benchmark_mask_list(args: argparse.Namespace, masks: list[LoadedMask]) -
         n_ctx_q = loaded.num_q_blocks * block_m
         n_ctx_k = loaded.num_kv_blocks * block_n
 
-        q = torch.randn((loaded.batch, HQ, n_ctx_q, D_HEAD), device=device, dtype=dtype)
-        k = torch.randn((loaded.batch, HK, n_ctx_k, D_HEAD), device=device, dtype=dtype)
-        v = torch.randn(
-            (loaded.batch, HK, n_ctx_k, D_HEAD_V), device=device, dtype=dtype
+        q, k, v = generate_test_tensors(
+            loaded.batch,
+            HQ,
+            HK,
+            n_ctx_q,
+            n_ctx_k,
+            D_HEAD,
+            D_HEAD_V,
+            dtype,
+            device,
+            args.input_distribution,
+            hadamard_rotate=args.hadamard_rotate,
         )
         q.requires_grad = False
         k.requires_grad = False
@@ -1113,9 +2176,19 @@ def run_block_sparse_repetitions(
     dtype = arg_to_torch_dtype[args.dtype]
     device = "cuda"
 
-    q = torch.randn((args.b, args.hq, args.sq, args.d), device=device, dtype=dtype)
-    k = torch.randn((args.b, args.hk, args.sk, args.d), device=device, dtype=dtype)
-    v = torch.randn((args.b, args.hk, args.sk, args.dv), device=device, dtype=dtype)
+    q, k, v = generate_test_tensors(
+        args.b,
+        args.hq,
+        args.hk,
+        args.sq,
+        args.sk,
+        args.d,
+        args.dv,
+        dtype,
+        device,
+        args.input_distribution,
+        hadamard_rotate=args.hadamard_rotate,
+    )
     q.requires_grad = False
     k.requires_grad = False
     v.requires_grad = False
@@ -1131,7 +2204,9 @@ def run_block_sparse_repetitions(
         > args.block_sparsity
     ).to(torch.bool)
     warmup_lut = block_attn_mask_to_ragged_lut(warmup_mask, return_none_if_dense=True)
-    fn_warmup = make_kernel_runner(args, q, k, v, block_lut=warmup_lut)
+    fn_warmup = make_kernel_runner(
+        args, q, k, v, block_lut=warmup_lut, block_mask=warmup_mask
+    )
     triton.testing.do_bench(fn_warmup, warmup=args.warmup, rep=args.rep)
 
     total_flops = (
@@ -1156,7 +2231,7 @@ def run_block_sparse_repetitions(
         ).to(torch.bool)
         lut = block_attn_mask_to_ragged_lut(mask, return_none_if_dense=True)
 
-        fn = make_kernel_runner(args, q, k, v, block_lut=lut)
+        fn = make_kernel_runner(args, q, k, v, block_lut=lut, block_mask=mask)
         ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
         latencies_ms.append(ms)
 
@@ -1267,15 +2342,11 @@ def parse_args() -> argparse.Namespace:
         "--kernel",
         type=str,
         default="sage_fp8",
-        choices=[
-            "sage_fp8",
-            "sage_mxfp4",
-            "fav3_fp8",
-            "aiter_fp8",
-            "aiter_bf16",
-            "all",
-        ],
-        help="Kernel implementation to benchmark. Use 'all' to compare all backends.",
+        choices=[*KERNEL_SPECS, "all"],
+        help=(
+            "Kernel implementation to benchmark. Use 'all' to compare the "
+            "configured production MHA variants"
+        ),
     )
 
     parser.add_argument("--b", type=int, default=0, help="Batch size")
@@ -1291,7 +2362,44 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--layout", type=str, default="bshd", choices=["bshd", "bhsd"])
     parser.add_argument("--causal", action="store_true", help="Enable causal attention")
-
+    parser.add_argument(
+        "--input-distribution",
+        type=_input_distribution,
+        default="diffusion",
+        metavar="{zero,normal,diffusion,padded,transformer,sink,underflow,latepeak,maxstair,kcommon,dump:PATH}",
+        help=(
+            "Distribution used for generated Q/K/V tensors. 'diffusion' (default) is calibrated "
+            "to dumped Wan, HunyuanVideo 1.5 and Flux2 attention; 'transformer' is the LLM "
+            "activation model, which differs mainly in carrying almost no token-common "
+            "component; 'padded' is diffusion with empty Ulysses-padding heads, which real "
+            "sharded models produce and which no other distribution covers; 'zero' "
+            "sets all Q/K/V values to zero; 'sink' is a realistic StreamingLLM attention sink "
+            "pattern; 'underflow'/'latepeak' are adversarial fp8 tile-skip / frozen-max rollback "
+            "regression tripwires; 'maxstair' raises the max every KV tile and triggers rollback "
+            "for alternating query-row groups; 'kcommon' adds a shared K direction far past what "
+            "real models reach, which inflates quantization noise without changing any softmax "
+            "statistic; 'dump:PATH' replays Q/K/V captured from a real model, which no synthetic "
+            "distribution here reproduces the quantization error of."
+        ),
+    )
+    parser.add_argument(
+        "--qk-clip",
+        type=float,
+        default=1.0,
+        help="Clip factor applied to Q and K absmax before int8 quantization for mha4_i8fp8",
+    )
+    parser.add_argument(
+        "--q-clip",
+        type=float,
+        default=None,
+        help="Optional Q-only absmax clip factor for mha4_i8fp8; overrides --qk-clip for Q",
+    )
+    parser.add_argument(
+        "--k-clip",
+        type=float,
+        default=None,
+        help="Optional K-only absmax clip factor for mha4_i8fp8; overrides --qk-clip for K",
+    )
     parser.add_argument(
         "--metric",
         type=str,
@@ -1304,7 +2412,10 @@ def parse_args() -> argparse.Namespace:
             "arithint",
             "sparseput",
         ],
-        help="Metric(s) to report (default: time+throughput only; 'all' does not include bandwidth/arithint)",
+        help=(
+            "Metric to report. 'all' reports dense throughput and, in sparse mode, "
+            "effective sparse throughput"
+        ),
     )
 
     parser.add_argument("-o", action="store_true", help="Write Triton output CSV")
@@ -1313,14 +2424,16 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--compare-to-ref", action="store_true", help="Compare against reference"
-    )
-    parser.add_argument(
         "--ref",
         type=str,
-        default="torch",
+        default="aiter_bf16",
         choices=["torch", "aiter_bf16"],
-        help="Reference kernel for --compare-to-ref",
+        help="Reference kernel for accuracy metrics/checks. --kernel=all reports MAE/MaxE/Cosine against this reference.",
+    )
+    parser.add_argument(
+        "--compare-to-ref",
+        action="store_true",
+        help="Run correctness checks against the selected --ref",
     )
 
     parser.add_argument(
@@ -1363,13 +2476,16 @@ def parse_args() -> argparse.Namespace:
         "--hadamard-rotate",
         type=lambda v: bool(int(v)),
         default=True,
-        help="Apply Hadamard rotation before Q/K quant: 1/0 (sage_fp8, sage_mxfp4)",
+        help=(
+            "Use production AITER Q/K Hadamard preprocessing. Set to 0 only for "
+            "raw kernel-domain diagnostics; ignored by BF16 and i8fp8"
+        ),
     )
     parser.add_argument(
         "--block-r",
         type=int,
         default=128,
-        help="Hadamard block size; must divide head dim (sage_fp8, sage_mxfp4)",
+        help="Hadamard block size; production AITER MX/FP8 paths require 128",
     )
     parser.add_argument(
         "--qsmooth",
@@ -1390,7 +2506,24 @@ def parse_args() -> argparse.Namespace:
         help="do_bench warmup time in ms",
     )
 
-    return parser.parse_args()
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Seed torch RNG before generating Q/K/V so runs are reproducible "
+        "(use the same --seed across kernels to compare on identical inputs)",
+    )
+
+    args = parser.parse_args()
+    for name in (
+        "qk_clip",
+        "q_clip",
+        "k_clip",
+    ):
+        value = getattr(args, name)
+        if value is not None and value <= 0.0:
+            parser.error(f"--{name.replace('_', '-')} must be > 0")
+    return args
 
 
 def print_vgpr_from_bench(runner: Any) -> None:
@@ -1456,8 +2589,53 @@ def print_vgpr_from_bench(runner: Any) -> None:
         print("No VGPR metadata found in Triton dump output.")
 
 
+def benchmark_all_kernel_row(
+    args: argparse.Namespace,
+    kernel_name: str,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    total_flops: float,
+    ref_primary: torch.Tensor,
+) -> AllKernelRow:
+    saved_kernel = args.kernel
+    args.kernel = kernel_name
+    try:
+        fn = make_kernel_runner(args, q, k, v, block_lut=None)
+        ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
+        tflops = total_flops / ms * 1e-9
+        current_primary = primary_output(fn())
+        current_primary = to_bshd_output_if_needed(current_primary, args.layout)
+        accuracy = compute_accuracy_metrics(current_primary, ref_primary)
+        return AllKernelRow(kernel_name, ms, tflops, accuracy)
+    finally:
+        args.kernel = saved_kernel
+
+
+def skipped_all_kernel_row(kernel_name: str) -> AllKernelRow:
+    return AllKernelRow(kernel_name, float("nan"), float("nan"), None)
+
+
+def print_all_kernel_table(rows: list[AllKernelRow]) -> None:
+    print(
+        f"{'kernel':<16} {'time(ms)':>10} {'TFLOPS':>10} {'MAE':>12} {'MaxE':>12} {'Cosine':>12}"
+    )
+    print("-" * 78)
+    for row in rows:
+        if row.ms != row.ms or row.accuracy is None:  # nan or failed accuracy run
+            print(
+                f"{row.kernel:<16} {'SKIP':>10} {'SKIP':>10} {'SKIP':>12} {'SKIP':>12} {'SKIP':>12}"
+            )
+        else:
+            print(
+                f"{row.kernel:<16} {row.ms:>10.4f} {row.tflops:>10.2f} "
+                f"{row.accuracy.mae:>12.3e} {row.accuracy.maxe:>12.3e} "
+                f"{row.accuracy.cosine:>12.6f}"
+            )
+
+
 def run_all_kernels(args: argparse.Namespace) -> None:
-    """Run all backends on the same QKV inputs and print a comparison table."""
+    """Run the configured production MHA variants on shared QKV inputs."""
     dtype = arg_to_torch_dtype[args.dtype]
     device = "cuda"
     hk = args.hk if args.hk else args.hq
@@ -1465,15 +2643,26 @@ def run_all_kernels(args: argparse.Namespace) -> None:
     d_head = args.d if args.d else 128
     d_head_v = args.dv if args.dv else d_head
 
-    q = torch.randn((args.b, args.hq, args.sq, d_head), device=device, dtype=dtype)
-    k = torch.randn((args.b, hk, sk, d_head), device=device, dtype=dtype)
-    v = torch.randn((args.b, hk, sk, d_head_v), device=device, dtype=dtype)
+    q, k, v = generate_test_tensors(
+        args.b,
+        args.hq,
+        hk,
+        args.sq,
+        sk,
+        d_head,
+        d_head_v,
+        dtype,
+        device,
+        args.input_distribution,
+        hadamard_rotate=args.hadamard_rotate,
+    )
     q.requires_grad = False
     k.requires_grad = False
     v.requires_grad = False
     q, k, v = layout_preprocess(q, k, v, layout="bhsd", target_layout=args.layout)
 
     shape = infer_shape_spec(q, v, args.layout)
+    ref_primary = make_reference_output(args, q, k, v, block_attn_mask=None).float()
     total_flops = (
         2.0
         * shape.batch
@@ -1483,32 +2672,29 @@ def run_all_kernels(args: argparse.Namespace) -> None:
         * (shape.d_head + shape.d_head_v)
     )
 
-    saved_kernel = args.kernel
-    rows: list[tuple[str, float, float]] = []
+    rows: list[AllKernelRow] = []
 
     for kernel_name in ALL_KERNELS:
-        args.kernel = kernel_name
         try:
-            fn = make_kernel_runner(args, q, k, v, block_lut=None)
-            ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
-            tflops = total_flops / ms * 1e-9
-            rows.append((kernel_name, ms, tflops))
+            rows.append(
+                benchmark_all_kernel_row(
+                    args,
+                    kernel_name,
+                    q,
+                    k,
+                    v,
+                    total_flops,
+                    ref_primary,
+                )
+            )
         except Exception as e:  # noqa: BLE001
             logger.warning("Skipping %s: %s", kernel_name, e)
-            rows.append((kernel_name, float("nan"), float("nan")))
-
-    args.kernel = saved_kernel
+            rows.append(skipped_all_kernel_row(kernel_name))
 
     print(
-        f"\nbench_sage --kernel=all  (b={args.b} hq={args.hq} sq={args.sq} sk={sk} d={d_head}):"
+        f"\nbench_sage --kernel=all  (b={args.b} hq={args.hq} sq={args.sq} sk={sk} d={d_head} input={args.input_distribution}):"
     )
-    print(f"{'kernel':<16} {'time(ms)':>10} {'TFLOPS':>10}")
-    print("-" * 38)
-    for name, ms, tflops in rows:
-        if ms != ms:  # nan  # noqa: PLR0124
-            print(f"{name:<16} {'SKIP':>10} {'SKIP':>10}")
-        else:
-            print(f"{name:<16} {ms:>10.4f} {tflops:>10.2f}")
+    print_all_kernel_table(rows)
 
 
 def run_with_optional_vgpr(args: argparse.Namespace, runner: Any) -> int:
@@ -1522,6 +2708,10 @@ def run_with_optional_vgpr(args: argparse.Namespace, runner: Any) -> int:
 def main() -> int:
     args = parse_args()
     validate_args(args)
+
+    if args.seed is not None:
+        torch.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
 
     loaded_masks = load_block_mask_from_json(args.block_mask_file, torch.device("cuda"))
     loaded_single_mask: LoadedMask | None = None

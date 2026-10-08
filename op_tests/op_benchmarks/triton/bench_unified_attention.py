@@ -298,6 +298,7 @@ def run_benchmark(custom, args):
                 k_descale=inputs["k_descale"],
                 v_descale=inputs["v_descale"],
                 output_scale=inputs["out_scale"],
+                backend=args.backend,
             )
 
         ms = triton.testing.do_bench_cudagraph(fn)
@@ -305,9 +306,17 @@ def run_benchmark(custom, args):
         if args.test:
             fn()
             ref_output = ref_paged_attn(
-                query=inputs["query"],
-                key_cache=inputs["key_cache"],
-                value_cache=inputs["value_cache"],
+                query=inputs["q_fp8"] if args.fp8 else inputs["query"],
+                key_cache=(
+                    inputs["k_fp8"]
+                    if (args.fp8 or args.fp8_kv)
+                    else inputs["key_cache"]
+                ),
+                value_cache=(
+                    inputs["v_fp8"]
+                    if (args.fp8 or args.fp8_kv)
+                    else inputs["value_cache"]
+                ),
                 query_lens=inputs["query_lens"],
                 kv_lens=inputs["kv_lens"],
                 block_tables=inputs["block_tables"],
@@ -337,15 +346,33 @@ def run_benchmark(custom, args):
 
         cu_query_lens = inputs["cu_query_lens"]
         num_contexts = len(cu_query_lens) - 1
+        # Kernel disables windowing for non-positive values (SLIDING_WINDOW > 0).
+        window = (
+            args.sliding_window
+            if args.sliding_window is not None and args.sliding_window > 0
+            else None
+        )
         total_flops = 0.0
+        total_k = 0
         for i in range(num_contexts):
             sq = (cu_query_lens[i + 1] - cu_query_lens[i]).item()
             sk = seqlens_k[i].item()
-            valid = sq * sk - ((sq**2 - sq) / 2)
+            if window is None:
+                valid = sq * sk - ((sq**2 - sq) / 2)
+                kv_read = sk
+            else:
+                # With a sliding window each of the sq (causal) queries attends to
+                # at most `window` keys, so count windowed causal pairs instead of
+                # the full triangle. Query i (0-indexed within the block) attends
+                # to min(sk - sq + i + 1, window) keys.
+                idx = torch.arange(sq, device=seqlens_k.device)
+                valid = torch.clamp(sk - sq + 1 + idx, max=window).sum().item()
+                # Keys streamed from HBM = union of all query windows.
+                kv_read = min(sk, sq - 1 + window)
             total_flops += valid * HQ * (D_HEAD + D_HEAD_V) * 2.0
+            total_k += kv_read
 
         total_q = cu_query_lens[-1].item()
-        total_k = seqlens_k.sum().item()
         q_bytes = total_q * HQ * D_HEAD * q_tensor.element_size()
         k_bytes = total_k * HK * D_HEAD * k_tensor.element_size()
         v_bytes = total_k * HK * D_HEAD_V * v_tensor.element_size()
@@ -444,6 +471,13 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=None,
         help="Sliding window size (default: disabled)",
+    )
+    parser.add_argument(
+        "-backend",
+        type=str,
+        default=None,
+        choices=["triton", "gluon"],
+        help="Kernel backend",
     )
 
     return parser.parse_args(args=args)

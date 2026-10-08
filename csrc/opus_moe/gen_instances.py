@@ -59,7 +59,7 @@ A8W4_META_HEADER = """#pragma once
 // Auto-generated. Do not edit. See csrc/opus_moe/gen_instances.py.
 //
 // A8W4 stage2 decode metadata generated from
-// aiter/ops/opus/moe_stage2_a8w4_meta.py.
+// csrc/opus_moe/opus_moe_common.py.
 
 namespace opus_moe
 {

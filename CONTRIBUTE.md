@@ -398,29 +398,64 @@ Ensure your PR:
 * [ ] Updates documentation if needed
 * [ ] Includes performance benchmarks (for kernel changes)
 * [ ] Has a clear, descriptive title
+* [ ] Changes one kernel backend (see below)
+
+### One Backend Per PR
+
+A PR changes kernels of one backend only: Triton/Gluon, HIP, ASM, CK, OPUS or
+FlyDSL. Triton and Gluon count as one backend. Each backend has its own owners,
+tests and CI jobs, and a PR that mixes two waits on both. If the title
+automation puts two backend tags on your PR, split it.
+
+Work that spans backends becomes one PR per backend. When one part cannot
+merge without the other -- a kernel in one backend and the dispatch change in
+another, say -- open them as
+[stacked pull requests](https://docs.github.com/en/pull-requests/get-started/about-stacked-prs):
+the second PR's branch starts from the first one's and targets it instead of
+`main`, so each is reviewed on its own and they merge in order. `gh stack`
+does the bookkeeping; from a fork, set the base branch by hand.
 
 ### PR Title Format
 
-Use one of these prefixes:
+PR titles carry two kinds of bracket tags.
+
+**Component tags — applied automatically.** A GitHub Action
+(`.github/workflows/pr-title-tags.yaml`) derives these from the files the PR
+changes and keeps them in sync on every push, so you don't need to add them
+yourself. The same components are also applied as PR labels (the title shows
+at most three; the labels carry the full set). Hand-written variants
+(`[TRITON]`, `[Gluon]`, `[CK_TILE]`, `[Doc]`, ...) are normalized to the
+canonical forms:
+
+* `[Triton/Gluon]` - Triton/Gluon kernels (`aiter/ops/triton/`, `aiter/aot/triton/`, triton tests and benchmarks)
+* `[ASM]` - assembly kernels (`hsa/`, `*_asm.py`)
+* `[HIP]` - HIP/C++ sources (`csrc/`, HIP benchmarks)
+* `[CK]` - Composable Kernel (`csrc/ck_*`, `csrc/include/ck_tile/`, the `composable_kernel` submodule)
+* `[OPUS]` - OPUS kernels (`aiter/ops/opus/`, `csrc/opus_*`, `csrc/include/opus/`, OPUS tests)
+* `[FlyDSL]` - FlyDSL kernels (`aiter/ops/flydsl/`, `aiter/aot/flydsl/`, FlyDSL tests)
+* `[CI]` - `.github/` workflows and scripts
+* `[JIT]` - JIT compilation system (`aiter/jit/`)
+* `[Build]` - `setup.py`, `pyproject.toml`, requirements, `MANIFEST.in`
+* `[Config]` - tuned-config-only changes
+* `[Docs]` - documentation-only changes
+
+Add the `no-auto-title` label to opt a PR out of automatic title tagging.
+
+**Type prefixes — added by you.** These are never touched by the automation;
+add whichever applies:
 
 * `[Bugfix]` - Bug fixes
 * `[Feature]` - New features or operators
 * `[Kernel]` - Kernel optimizations or new kernels
-* `[HIP]` - HIP-specific changes
-* `[CK]` - Composable Kernel integration
-* `[Triton]` - Triton kernel changes
-* `[JIT]` - JIT compilation system changes
 * `[Perf]` - Performance optimizations
-* `[Doc]` - Documentation improvements
 * `[Test]` - Test additions or fixes
-* `[CI]` - CI/CD improvements
 * `[Hardware]` - Hardware-specific changes (e.g., `[Hardware][MI300X]`)
 * `[Misc]` - Miscellaneous changes
 
 Examples:
-* `[Kernel][Perf] Optimize RMSNorm for MI300X using vec16 loads`
-* `[Feature] Add PagedAttention operator with CK backend`
-* `[Bugfix] Fix numerical instability in FP16 softmax`
+* `[Triton/Gluon] [Perf] Optimize RMSNorm for MI300X using vec16 loads`
+* `[CK] [Feature] Add PagedAttention operator with CK backend`
+* `[HIP] [Bugfix] Fix numerical instability in FP16 softmax`
 
 ### PR Description Template
 

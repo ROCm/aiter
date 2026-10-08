@@ -436,6 +436,13 @@ def per_token_quant_hip(
     return y, scale
 
 
+# Capability marker: per_group_quant_hip / dynamic_per_group_scaled_quant and
+# aiter.ops.rmsnorm.rmsnorm_quant / add_rmsnorm_quant accept
+# `scale_layout_m32k4` (MXFP8 1x32 scale written in the gfx1250 ASM GEMM A-scale
+# layout). The entry points are wrapped, so callers cannot inspect signatures.
+SCALE_LAYOUT_M32K4_SUPPORTED = True
+
+
 @torch_compile_guard()
 def per_group_quant_hip(
     x: Tensor,
@@ -446,9 +453,28 @@ def per_group_quant_hip(
     num_rows: "torch.Tensor | None" = None,
     num_rows_factor: int = 1,
     scale_type: torch.dtype = dtypes.fp32,
+    scale_layout_m32k4: bool = False,
 ) -> "tuple[Tensor, Tensor]":
     shape = x.shape
     device = x.device
+    if scale_layout_m32k4:
+        # MXFP8 1x32 with the scale written in the gfx1250 ASM GEMM A-scale layout
+        # (shuffle_mxfp8fp4_scale bytes). Rows are padded to 32; the kernel fills the pad.
+        assert (
+            quant_dtype == dtypes.fp8
+            and group_size == 32
+            and scale_type == dtypes.fp8_e8m0
+            and scale is None
+        ), "scale_layout_m32k4 needs fp8 output, group_size 32 and an e8m0 scale"
+        m = x.numel() // shape[-1]
+        scale = torch.empty(
+            ((m + 31) // 32 * 32, shape[-1] // 32), dtype=scale_type, device=device
+        )
+        y = torch.empty(shape, dtype=quant_dtype, device=device)
+        dynamic_per_group_scaled_quant(
+            y, x, scale, group_size, num_rows=num_rows, scale_layout_m32k4=True
+        )
+        return y, scale
     if scale is None:
         scale = torch.empty(
             (*shape[:-1], shape[-1] // group_size), dtype=scale_type, device=device
@@ -682,6 +708,7 @@ def get_torch_act(aType):
         ActivationType.No: lambda *a, **k: a[0],
         ActivationType.Silu: F.silu,
         ActivationType.Gelu: F.gelu,
+        ActivationType.GeluTanh: lambda x: F.gelu(x, approximate="tanh"),
     }
     return tmp.get(aType, NotImplementedError)
 
@@ -772,6 +799,7 @@ def dynamic_per_group_scaled_quant(
     shuffle_scale: bool = True,
     num_rows: torch.Tensor | None = None,
     num_rows_factor: int = 1,
+    scale_layout_m32k4: bool = False,
 ) -> None:
     """Dtype-aware per-group dynamic quant.
 
@@ -788,6 +816,12 @@ def dynamic_per_group_scaled_quant(
     sizes.
 
     Only ``group_size`` in {32, 64, 128} is supported.
+
+    ``scale_layout_m32k4=True`` (fp8 output, e8m0 scale, ``group_size == 32``)
+    writes the scale directly in the gfx1250 MXFP8 ASM GEMM A-scale layout,
+    i.e. the bytes of :func:`aiter.ops.shuffle.shuffle_mxfp8fp4_scale`:
+    ``scales`` must hold ``(pad32(M), K // 32)`` bytes, the pad rows are written
+    as 0x7F, and ``shuffle_scale`` is ignored.
     """
 
 
@@ -908,6 +942,23 @@ def fused_dynamic_mx_quant_moe_sort_hip(
     sorting. The output dtype of ``out`` selects the quant target: fp4x2/uint8
     for MXFP4, fp8 for MXFP8.
     """
+
+
+@compile_ops("module_quant", develop=True)
+def fused_dynamic_mx_quant_moe_sort_hip_bounded(
+    out: torch.Tensor,
+    scales: torch.Tensor,
+    input: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    token_num: int,
+    block_m: int,
+    total_routes: int,
+    num_experts_upper_bound: int,
+    group_size: int = 32,
+    sorted_weights: torch.Tensor | None = None,
+) -> None:
+    """Launch using a distribution-independent padded-row upper bound."""
 
 
 @compile_ops("module_quant", develop=True)
@@ -1044,6 +1095,7 @@ def fused_dynamic_mx_quant_moe_sort(
     num_rows: torch.Tensor | None = None,
     group_size: int = 32,
     sorted_weights: torch.Tensor | None = None,
+    num_experts_upper_bound: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Unified fused dynamic MX quant + MoE-sort entry (MXFP4 / MXFP8).
 
@@ -1075,6 +1127,9 @@ def fused_dynamic_mx_quant_moe_sort(
     ``M = 8*1024/topk * topk = 8*1024``. The previous ``fused_dynamic_mxfp4_*``
     /``fused_dynamic_mxfp8_*`` entries are retained as thin wrappers for
     backward compatibility.
+
+    ``num_experts_upper_bound`` caps the grid at a safe host-side bound without
+    exceeding the legacy extent or reading a device count.
     """
     if quant_dtype not in (dtypes.fp4x2, dtypes.fp8):
         raise ValueError(
@@ -1116,17 +1171,19 @@ def fused_dynamic_mx_quant_moe_sort(
     )
     if use_fused:
         out = torch.empty(M, out_cols, dtype=quant_dtype, device=input.device)
-        fused_dynamic_mx_quant_moe_sort_hip(
-            out,
-            scale,
-            input,
-            sorted_ids,
-            num_valid_ids,
-            token_num,
-            block_size,
-            group_size,
-            sorted_weights,
-        )
+        common = (out, scale, input, sorted_ids, num_valid_ids, token_num, block_size)
+        if num_experts_upper_bound is None:
+            fused_dynamic_mx_quant_moe_sort_hip(*common, group_size, sorted_weights)
+        else:
+            # Pass the routing top-k explicitly: at stage1 ``input`` has only M
+            # rows, from which the HIP kernel would infer a top-k of 1.
+            fused_dynamic_mx_quant_moe_sort_hip_bounded(
+                *common,
+                token_num * topk,
+                num_experts_upper_bound,
+                group_size,
+                sorted_weights,
+            )
     else:
         # Split path: per-token quant produces unswizzled e8m0 byte scale,
         # then `mxfp4_moe_sort_hip` (dtype-agnostic byte shuffle) sorts +
@@ -1159,6 +1216,7 @@ def fused_dynamic_mxfp4_quant_moe_sort(
     num_rows: torch.Tensor | None = None,
     group_size: int = 32,
     sorted_weights: torch.Tensor | None = None,
+    num_experts_upper_bound: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Backward-compat wrapper around :func:`fused_dynamic_mx_quant_moe_sort`.
 
@@ -1177,6 +1235,7 @@ def fused_dynamic_mxfp4_quant_moe_sort(
         num_rows=num_rows,
         group_size=group_size,
         sorted_weights=sorted_weights,
+        num_experts_upper_bound=num_experts_upper_bound,
     )
 
 
@@ -1190,6 +1249,7 @@ def fused_dynamic_mxfp8_quant_moe_sort(
     num_rows: torch.Tensor | None = None,
     group_size: int = 32,
     sorted_weights: torch.Tensor | None = None,
+    num_experts_upper_bound: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Backward-compat wrapper around :func:`fused_dynamic_mx_quant_moe_sort`.
 
@@ -1218,6 +1278,7 @@ def fused_dynamic_mxfp8_quant_moe_sort(
         num_rows=num_rows,
         group_size=group_size,
         sorted_weights=sorted_weights,
+        num_experts_upper_bound=num_experts_upper_bound,
     )
 
 
@@ -1292,6 +1353,7 @@ def _rope_rotate_activation_fp4quant(
     group_size: int = 32,
     shuffle_scale: bool = True,
     do_rotate_act: bool = True,
+    round_rope: bool = False,
 ) -> None:
     """Apply GPT-J style (interleaved) RoPE to trailing ``rope_dim``,
     Hadamard-rotate, then FP4-quantize into packed ``out`` + e8m0 ``scale``."""
@@ -1341,6 +1403,7 @@ def rope_rotate_activation(
     group_size: int | None = None,
     shuffle_scale: bool = True,
     do_rotate_act: bool = True,
+    round_rope: bool = False,
 ) -> None:
     """Apply GPT-J style (interleaved) RoPE to trailing ``rope_dim``, then
     Hadamard-rotate, dispatching on ``out.dtype``:
@@ -1353,7 +1416,9 @@ def rope_rotate_activation(
       ``scale`` (``scale`` required; ``group_size`` defaults to 128).
 
     When ``do_rotate_act`` is False, the Hadamard rotate is skipped and only
-    RoPE (plus any quantization) is applied.
+    RoPE (plus any quantization) is applied. ``round_rope`` (fp4 only) rounds
+    the rotated values to ``input``'s dtype before quantizing them, as a model
+    whose RoPE writes its output back in that dtype has them.
     """
     if out.dtype == dtypes.fp4x2:
         assert out_scale is not None, "fp4 rope_rotate_activation requires `out_scale`"
@@ -1368,6 +1433,7 @@ def rope_rotate_activation(
             group_size=32 if group_size is None else group_size,
             shuffle_scale=shuffle_scale,
             do_rotate_act=do_rotate_act,
+            round_rope=round_rope,
         )
     elif out.dtype == dtypes.fp8:
         assert out_scale is not None, "fp8 rope_rotate_activation requires `out_scale`"
