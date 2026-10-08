@@ -43,7 +43,7 @@ jobs:
           PR_DRAFT: ${{ github.event.pull_request.draft }}
           EVENT_ACTION: ${{ github.event.action }}
           LABEL_NAME: ${{ github.event.label.name }}
-          HAS_MULTIGPU_LABEL: ${{ github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'multigpu') && 'true' || 'false' }}
+          HAS_MULTIGPU_LABEL: ${{ github.event_name == 'pull_request' && (contains(github.event.pull_request.labels.*.name, 'ci:multigpu') || contains(github.event.pull_request.labels.*.name, 'multigpu')) && 'true' || 'false' }}
         run: |
           set -euo pipefail
 
@@ -69,10 +69,10 @@ jobs:
 
           if [ "${EVENT_ACTION}" = "labeled" ]; then
             echo "run_tests=false" >> "$GITHUB_OUTPUT"
-            if [ "${LABEL_NAME}" = "multigpu" ]; then
+            if [ "${LABEL_NAME}" = "ci:multigpu" ] || [ "${LABEL_NAME}" = "multigpu" ]; then
               echo "run_multigpu_tests=true" >> "$GITHUB_OUTPUT"
               echo "reason=multigpu_label" >> "$GITHUB_OUTPUT"
-              echo "Aiter multi-GPU tests are required because the multigpu label was added." >> "$GITHUB_STEP_SUMMARY"
+              echo "Aiter multi-GPU tests are required because a multi-GPU CI label was added." >> "$GITHUB_STEP_SUMMARY"
             else
               echo "run_multigpu_tests=false" >> "$GITHUB_OUTPUT"
               echo "reason=non_multigpu_label" >> "$GITHUB_OUTPUT"
@@ -120,7 +120,7 @@ jobs:
             if [ "${run_tests}" = "true" ]; then
               echo "Aiter tests are required because at least one changed file matches the Aiter test scope."
             elif [ "${HAS_MULTIGPU_LABEL}" = "true" ]; then
-              echo "Aiter multi-GPU tests are required because the multigpu label is present."
+              echo "Aiter multi-GPU tests are required because a multi-GPU CI label is present."
             else
               echo "Aiter tests are not required for this pull request."
             fi
@@ -562,7 +562,7 @@ jobs:
             exit 0
           fi
 
-          if [ "${EVENT_ACTION}" = "labeled" ] && [ "${LABEL_NAME}" != "multigpu" ]; then
+          if [ "${EVENT_ACTION}" = "labeled" ] && [ "${LABEL_NAME}" != "ci:multigpu" ] && [ "${LABEL_NAME}" != "multigpu" ]; then
             echo "run_multigpu_tests=false" >> "$GITHUB_OUTPUT"
             echo "reason=non_multigpu_label" >> "$GITHUB_OUTPUT"
             echo "Aiter multi-GPU tests are skipped for label '${LABEL_NAME}'." >> "$GITHUB_STEP_SUMMARY"
@@ -574,14 +574,14 @@ jobs:
             --json labels \
             --jq '.labels[].name')"
 
-          if printf '%s\n' "${labels}" | grep -Fxq "multigpu"; then
+          if printf '%s\n' "${labels}" | grep -Fxq "ci:multigpu" || printf '%s\n' "${labels}" | grep -Fxq "multigpu"; then
             echo "run_multigpu_tests=true" >> "$GITHUB_OUTPUT"
             echo "reason=multigpu_label_present_after_build" >> "$GITHUB_OUTPUT"
-            echo "Aiter multi-GPU tests are required because the multigpu label is present after build." >> "$GITHUB_STEP_SUMMARY"
+            echo "Aiter multi-GPU tests are required because a multi-GPU CI label is present after build." >> "$GITHUB_STEP_SUMMARY"
           else
             echo "run_multigpu_tests=false" >> "$GITHUB_OUTPUT"
             echo "reason=no_multigpu_label_after_build" >> "$GITHUB_OUTPUT"
-            echo "Aiter multi-GPU tests are not required because the multigpu label is not present after build." >> "$GITHUB_STEP_SUMMARY"
+            echo "Aiter multi-GPU tests are not required because no multi-GPU CI label is present after build." >> "$GITHUB_STEP_SUMMARY"
           fi
 
   standard:
