@@ -421,6 +421,8 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
         )
 
     def test_warmup_outputs_are_accuracy_checks_outside_timing(self):
+        import torch
+
         from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
 
         # _run_candidate finishes by building the tuned row through calculate(),
@@ -474,7 +476,7 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
 
         with (
             mock.patch.object(
-                tuner, "_port_e2e", side_effect=["warm", "timed"]
+                tuner, "_port_e2e", side_effect=[torch.zeros(1), torch.zeros(1)]
             ) as port,
             mock.patch.object(
                 gemm_moe_tune,
