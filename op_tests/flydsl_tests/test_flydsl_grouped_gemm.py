@@ -524,7 +524,7 @@ def _run_grouped_via_fused_moe(
         from aiter.test_common import run_perftest
 
         out, us = run_perftest(
-            _call, num_warmup=warmup, num_iters=iters, testGraph=False
+            _call, num_warmup=warmup, num_iters=iters, testGraph=True
         )
     else:
         # Verify: validate the eager (graph-off) path; no timing.
