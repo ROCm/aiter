@@ -143,27 +143,48 @@ def _find_rocm_home() -> str | None:
     # Guess #1
     rocm_home = os.environ.get("ROCM_HOME") or os.environ.get("ROCM_PATH")
     if rocm_home is None:
-        # Guess #2: rocm-sdk-devel pip package ships a self-contained ROCm
-        # tree under site-packages/_rocm_sdk_devel/. Prefer this over a
+        # Guess #2: rocm-sdk pip packages ship a self-contained ROCm tree
+        # under site-packages/.  The devel package (_rocm_sdk_devel) is the
+        # preferred source, but the core package (_rocm_sdk_core) also
+        # contains bin/hipconfig and version info.  Prefer this over a
         # hipcc-on-PATH lookup because the venv's bin/hipcc is a python
         # wrapper, not a real binary — realpath() can't recover the SDK
         # root from it.
-        try:
-            spec = importlib.util.find_spec("_rocm_sdk_devel")
-        except (ImportError, ValueError):
-            spec = None
-        if spec is not None and spec.submodule_search_locations:
-            candidate = spec.submodule_search_locations[0]
-            if os.path.exists(os.path.join(candidate, "bin", "hipconfig")):
-                rocm_home = candidate
+        for _pkg in ("_rocm_sdk_devel", "_rocm_sdk_core"):
+            try:
+                spec = importlib.util.find_spec(_pkg)
+            except (ImportError, ValueError):
+                spec = None
+            if spec is not None and spec.submodule_search_locations:
+                candidate = spec.submodule_search_locations[0]
+                if os.path.exists(os.path.join(candidate, "bin", "hipconfig")):
+                    rocm_home = candidate
+                    break
     if rocm_home is None:
         # Guess #3
         hipcc_path = shutil.which("hipcc")
         if hipcc_path is not None:
-            rocm_home = os.path.dirname(os.path.dirname(os.path.realpath(hipcc_path)))
+            hipcc_real = os.path.realpath(hipcc_path)
+            candidate = os.path.dirname(os.path.dirname(hipcc_real))
             # can be either <ROCM_HOME>/hip/bin/hipcc or <ROCM_HOME>/bin/hipcc
-            if os.path.basename(rocm_home) == "hip":
-                rocm_home = os.path.dirname(rocm_home)
+            if os.path.basename(candidate) == "hip":
+                candidate = os.path.dirname(candidate)
+            # When hipcc is a pip console-script wrapper (e.g. in a venv),
+            # realpath points at the venv bin/ itself — the parent is the
+            # venv prefix, not a ROCm root.  Detect this by checking for
+            # the _rocm_sdk_core package in site-packages under that prefix.
+            if not os.path.isfile(os.path.join(candidate, ".info", "version")):
+                import glob
+
+                for sdk_dir in glob.glob(
+                    os.path.join(candidate, "lib", "python*", "site-packages", "_rocm_sdk_core")
+                ) + glob.glob(
+                    os.path.join(candidate, "lib", "python*", "site-packages", "_rocm_sdk_devel")
+                ):
+                    if os.path.isfile(os.path.join(sdk_dir, "bin", "hipconfig")):
+                        candidate = sdk_dir
+                        break
+            rocm_home = candidate
         else:
             # Guess #4
             fallback_path = "/opt/rocm"
