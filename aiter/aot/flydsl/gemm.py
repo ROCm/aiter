@@ -14,7 +14,6 @@ Supported kernel families:
   - ``flydsl_hgemm_*``                        gfx950 A16W16 GEMM kernels
   - ``flydsl_hgemm_*_gfx1250``                gfx1250 A16W16 GEMM kernels
   - ``flydsl_bpreshuflle_*``                  a8w8 preshuffle GEMM kernels (``_smbs`` suffix: gfx950 blockscale)
-  - ``flydsl_bpreshuffle_splitk_*``           gfx950 split-K a8w8 preshuffle GEMM (two-pass)
   - ``flydsl_bpreshuffle_8w_*``               gfx950 8-wave a8w8 ptpc GEMM kernels
   - ``flydsl_bpreshuffle_wmma_*``             gfx1250 a8w8 ptpc GEMM kernels
   - ``flydsl_mxfp8_128_bpreshuffle_wmma_*``   gfx1250 mxfp8_128 GEMM kernels
@@ -90,12 +89,6 @@ from aiter.ops.flydsl.kernels.gemm_a16w16_kernel_gfx1250 import (
 )
 from aiter.ops.flydsl.kernels.kernels_common import run_cached
 from aiter.ops.flydsl.kernels.preshuffle_gemm import compile_preshuffle_gemm
-from aiter.ops.flydsl.kernels.preshuffle_gemm_splitk import (
-    compile_preshuffle_gemm_splitk,
-)
-from aiter.ops.flydsl.kernels.preshuffle_gemm_splitk_reduce import (
-    compile_preshuffle_gemm_splitk_reduce,
-)
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg, unused_tensor_arg
 from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
     BLOCK_K as SCALE_BLOCK_SIZE,
@@ -147,16 +140,6 @@ _PRESHUFFLE_RE = re.compile(
     # match. Without it they fail fullmatch and drop out of the AOT build.
     r"(?:_ks(?P<k_split>\d+))?(?P<blockscale>_smbs)?$"
 )
-_SPLITK_RE = re.compile(
-    r"^flydsl_bpreshuffle_splitk_"
-    r"(?P<tile_m>\d+)x(?P<tile_n>\d+)x(?P<tile_k>\d+)_"
-    r"sk(?P<split_k>\d+)_"
-    r"(?P<qa>[A-Z0-9]+)_(?P<qw>[A-Z0-9]+)_(?P<out>[A-Z0-9]+)_"
-    r"(?P<async_copy>\d+)x(?P<waves_per_eu>\d+)x(?P<xcd_swizzle>\d+)x(?P<lds_stage>\d+)_"
-    r"(?P<scheduler>[A-Za-z][A-Za-z0-9]*)"
-    r"(?:_sm(?P<scale_mode>ep|bs))?(?:_mb(?P<use_m_bounded_store>[01]))?$"
-)
-_SPLITK_SCALE_MODE_FROM_CODE = {"bs": "blockscale"}
 _SHORT_DTYPE = {
     "F8": "fp8",
     "I8": "int8",
@@ -207,45 +190,6 @@ def _parse_preshuffle_kernel_name(name: str) -> dict | None:
         "scheduler": m.group("scheduler"),
         "k_split": int(m.group("k_split")) if m.group("k_split") else 1,
         "scale_mode": "blockscale" if m.group("blockscale") else "epilogue",
-    }
-
-
-def _parse_splitk_kernel_name(name: str) -> dict | None:
-    m = _SPLITK_RE.fullmatch(name)
-    if m is None:
-        return None
-
-    qa = _SHORT_DTYPE.get(m.group("qa"))
-    qw = _SHORT_DTYPE.get(m.group("qw"))
-    out = _SHORT_DTYPE.get(m.group("out"))
-    if qa is None or qw is None or out is None:
-        return None
-    if qa != qw:
-        raise ValueError(
-            f"Unsupported mixed split-K input dtypes in {name!r}: {qa} vs {qw}"
-        )
-
-    return {
-        "kind": "splitk",
-        "tile_m": int(m.group("tile_m")),
-        "tile_n": int(m.group("tile_n")),
-        "tile_k": int(m.group("tile_k")),
-        "split_k": int(m.group("split_k")),
-        "in_dtype": qa,
-        "out_dtype": out,
-        "use_async_copy": int(m.group("async_copy")),
-        "waves_per_eu": int(m.group("waves_per_eu")),
-        "xcd_swizzle": int(m.group("xcd_swizzle")),
-        "lds_stage": int(m.group("lds_stage")),
-        "scheduler": m.group("scheduler"),
-        "scale_mode": _SPLITK_SCALE_MODE_FROM_CODE.get(
-            m.group("scale_mode"), "epilogue"
-        ),
-        "use_m_bounded_store": (
-            bool(int(m.group("use_m_bounded_store")))
-            if m.group("use_m_bounded_store")
-            else False
-        ),
     }
 
 
@@ -328,9 +272,7 @@ def parse_csv(csv_path: str):
                         jobs.append(job)
                 continue
 
-            if kernel_name.startswith("flydsl_bpreshuffle_splitk_"):
-                params = _parse_splitk_kernel_name(kernel_name)
-            elif kernel_name.startswith("flydsl_bpreshuflle_"):
+            if kernel_name.startswith("flydsl_bpreshuflle_"):
                 params = _parse_preshuffle_kernel_name(kernel_name)
             elif kernel_name.startswith("flydsl_mxpsh_"):
                 params = parse_mxscale_preshuffle_kernel_name(kernel_name)
@@ -755,102 +697,6 @@ def _compile_preshuffle_to_cache(
     )
 
 
-def _compile_splitk_to_cache(
-    *,
-    m: int,
-    n: int,
-    k: int,
-    in_dtype: str,
-    out_dtype: str,
-    tile_m: int,
-    tile_n: int,
-    tile_k: int,
-    split_k: int,
-    use_async_copy: int,
-    waves_per_eu: int,
-    xcd_swizzle: int = 0,
-    lds_stage: int = 2,
-    scheduler: str = "Default",
-    scale_mode: str = "epilogue",
-    use_m_bounded_store: bool = False,
-    **kwargs,
-):
-    del kwargs
-    enable_scheduler = str(scheduler).lower() != "off"
-
-    import torch
-
-    dev = torch.device("cpu")
-    out_torch_dtype = _torch_dtype_for_kernel(out_dtype)
-
-    # FlyDSL preshuffle kernels consume raw quantized bytes for fp8/int8 paths.
-    a = torch.empty((m * k,), device=dev, dtype=torch.int8)
-    b = torch.empty((n * k,), device=dev, dtype=torch.int8)
-    out = torch.empty((m * n,), device=dev, dtype=out_torch_dtype)
-    if scale_mode == "blockscale":
-        scale_a = torch.empty((k // 128, m), device=dev, dtype=torch.float32)
-        scale_b = torch.empty((n // 128, k // 128), device=dev, dtype=torch.float32)
-    else:
-        scale_a = torch.empty((max(m, 1),), device=dev, dtype=torch.float32)
-        scale_b = torch.empty((max(n, 1),), device=dev, dtype=torch.float32)
-    bias = unused_tensor_arg(None, torch.empty(0, device=dev, dtype=out_torch_dtype))
-    stream = fx.Stream(0)
-
-    # Workspace: (split_k, m_pad, N) fp32 partials, flat for the launcher. Unused at
-    # split_k=1, where the GEMM writes the final output itself and there is no reduce.
-    m_pad = ((m + tile_m - 1) // tile_m) * tile_m
-    workspace = torch.empty((split_k * m_pad * n,), device=dev, dtype=torch.float32)
-    direct_out = split_k == 1
-
-    gemm_exe = compile_preshuffle_gemm_splitk(
-        N=n,
-        K=k,
-        tile_m=tile_m,
-        tile_n=tile_n,
-        tile_k=tile_k,
-        split_k=split_k,
-        in_dtype=in_dtype,
-        out_dtype="bf16" if out_torch_dtype == torch.bfloat16 else "fp16",
-        use_async_copy=bool(use_async_copy),
-        waves_per_eu=None if waves_per_eu <= 0 else waves_per_eu,
-        enable_scheduler=enable_scheduler,
-        xcd_swizzle=xcd_swizzle,
-        lds_stage=lds_stage,
-        scale_mode=scale_mode,
-        use_m_bounded_store=use_m_bounded_store,
-        direct_out=direct_out,
-    )
-    # Same layout-API launcher convention as the non-split preshuffle path:
-    # pass flat torch tensors directly, not raw pointers.
-    _compile_executable_to_cache(
-        gemm_exe,
-        out if direct_out else workspace,
-        a,
-        b,
-        scale_a,
-        scale_b,
-        bias,
-        m,
-        n,
-        stream,
-    )
-
-    if not direct_out:
-        reduce_exe = compile_preshuffle_gemm_splitk_reduce(
-            N=n,
-            split_k=split_k,
-            out_dtype="bf16" if out_torch_dtype == torch.bfloat16 else "fp16",
-        )
-        _compile_executable_to_cache(
-            reduce_exe,
-            out,
-            workspace,
-            m,
-            m_pad,
-            fx.Stream(0),
-        )
-
-
 def _compile_mxscale_preshuffle_to_cache(
     *,
     m: int,
@@ -1215,8 +1061,6 @@ def compile_one_config(
                 _compile_a16w16_gfx1250_to_cache(m=m, n=n, k=k, **a16w16_kwargs)
             elif kind == "preshuffle":
                 _compile_preshuffle_to_cache(m=m, n=n, k=k, **kwargs)
-            elif kind == "splitk":
-                _compile_splitk_to_cache(m=m, n=n, k=k, **kwargs)
             elif kind == "mxscale_preshuffle":
                 _compile_mxscale_preshuffle_to_cache(m=m, n=n, k=k, **kwargs)
             elif kind == "8wave":

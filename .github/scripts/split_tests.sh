@@ -62,14 +62,6 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
                 "$TEST_DIR/tuning_tests/test_mixed_mxfp_tuning.py"
         } | LC_ALL=C sort -u
     )
-    FLYDSL_GEMM_TESTS=(
-        "op_tests/flydsl_tests/test_flydsl_preshuffle_gemm_splitk.py"
-    )
-    for test_file in "${FLYDSL_GEMM_TESTS[@]}"; do
-        if [[ -f "$test_file" ]]; then
-            ALL_FILES+=("$test_file")
-        fi
-    done
 elif [[ "$TEST_TYPE" == "triton" ]]; then
     mapfile -t ALL_FILES < <(find "$TEST_DIR" -name 'test_*.py' -type f | LC_ALL=C sort)
 fi
@@ -154,7 +146,6 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_topk_plain.py]=64
     FILE_TIMES[op_tests/test_pa_ps.py]=63
     FILE_TIMES[op_tests/test_gdn_prepare.py]=62
-    FILE_TIMES[op_tests/flydsl_tests/test_flydsl_preshuffle_gemm_splitk.py]=60
     FILE_TIMES[op_tests/test_flydsl_compress_attn.py]=58
     FILE_TIMES[op_tests/test_moe_sorting.py]=56
     FILE_TIMES[op_tests/test_quant.py]=56
