@@ -19,9 +19,9 @@
 // planes in one buffer; FP4 codes are row-major (b_codes 0) or K128-blocked (b_codes 1); b_ilv is
 // role B's scale interleave. Rows are selected by (formats, b_codes, b_ilv, bias, M, N, K); `abi`
 // selects the kernarg marshalling:
-//   0  the FlyDSL MXFP4 GEMM's 160-byte kernarg (A4W4)
-//   1  the FlyDSL MXFP6 GEMM's 156-byte kernarg, 172 with bias (A6W6, and A6W4 with B's C1 slot
-//      aliasing B: the kernel never reads it)
+//   0  the A4W4 160-byte kernarg (KernelArgsTs4)
+//   1  the A6W6 156-byte kernarg, 172 with bias (KernelArgsTs6): A6W6, and A6W4 with B's C1 slot
+//      aliasing B: the kernel never reads it
 //   2  abi 1 with K in the dword after N: the shape-generic kernels (M = N = K = 0 in the manifest), which
 //      serve every M, N (multiples of 256) and every K in their K-loop class -- K/128 = kcls (mod 12) and
 //      K >= kmin -- one tile per workgroup (grid = tiles).
@@ -49,7 +49,7 @@ struct Memref
 };
 static_assert(sizeof(Memref) == 24, "memref must be 24 bytes");
 
-struct __attribute__((packed)) KernelArgsFly4
+struct __attribute__((packed)) KernelArgsTs4
 {
     Memref A, B, C0;
     void* ptr_SA;
@@ -61,12 +61,12 @@ struct __attribute__((packed)) KernelArgsFly4
     uint32_t K; // abi 3 only (0 for abi 0)
     Memref C1, C2;
 };
-static_assert(sizeof(KernelArgsFly4) == 160, "fly4 kernarg must be 160 bytes");
-static_assert(offsetof(KernelArgsFly4, ptr_SA) == 72 && offsetof(KernelArgsFly4, M) == 100 &&
-                  offsetof(KernelArgsFly4, C1) == 112,
-              "fly4 kernarg ABI mismatch");
+static_assert(sizeof(KernelArgsTs4) == 160, "ts4 kernarg must be 160 bytes");
+static_assert(offsetof(KernelArgsTs4, ptr_SA) == 72 && offsetof(KernelArgsTs4, M) == 100 &&
+                  offsetof(KernelArgsTs4, C1) == 112,
+              "ts4 kernarg ABI mismatch");
 
-struct __attribute__((packed)) KernelArgsFly6
+struct __attribute__((packed)) KernelArgsTs6
 {
     Memref A0, A1, B0, B1, C;
     void* ptr_SA;
@@ -79,11 +79,11 @@ struct __attribute__((packed)) KernelArgsFly6
     void* ptr_bias;
     uint32_t bias_elems;
 };
-static_assert(sizeof(KernelArgsFly6) == 172, "fly6 kernarg must be 172 bytes");
-static_assert(offsetof(KernelArgsFly6, ptr_SA) == 120 && offsetof(KernelArgsFly6, M) == 148 &&
-                  offsetof(KernelArgsFly6, ptr_bias) == 160,
-              "fly6 kernarg ABI mismatch");
-constexpr size_t kFly6NoBias = 156;
+static_assert(sizeof(KernelArgsTs6) == 172, "ts6 kernarg must be 172 bytes");
+static_assert(offsetof(KernelArgsTs6, ptr_SA) == 120 && offsetof(KernelArgsTs6, M) == 148 &&
+                  offsetof(KernelArgsTs6, ptr_bias) == 160,
+              "ts6 kernarg ABI mismatch");
+constexpr size_t kTs6NoBias = 156;
 
 struct __attribute__((packed)) Ptr1d
 {
@@ -282,8 +282,8 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
 
     char* pa = static_cast<char*>(A->ptr);
     char* pb = static_cast<char*>(B->ptr);
-    KernelArgsFly4 a4;
-    KernelArgsFly6 a6;
+    KernelArgsTs4 a4;
+    KernelArgsTs6 a6;
     void* args      = nullptr;
     size_t arg_size = 0;
     if(cfg->abi == 0 || cfg->abi == 3 || cfg->abi == 4)
@@ -309,7 +309,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         a4.N         = static_cast<uint32_t>(N);
         a4.K         = cfg->abi == 3 ? static_cast<uint32_t>(K) : 0u;
         args         = &a4;
-        arg_size     = cfg->abi == 3 ? offsetof(KernelArgsFly4, C1) : sizeof(a4);
+        arg_size     = cfg->abi == 3 ? offsetof(KernelArgsTs4, C1) : sizeof(a4);
         if(cfg->abi == 4)
         {
             a4.C1         = Memref{epi_o->ptr,
@@ -319,7 +319,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                            0};
             a4.C2.ptr     = static_cast<float*>(epi_delta->ptr) + epi_s0;
             a4.C2.rows    = static_cast<uint32_t>(epi_delta->numel() - epi_s0);
-            arg_size      = offsetof(KernelArgsFly4, C2) + 12;
+            arg_size      = offsetof(KernelArgsTs4, C2) + 12;
         }
     }
     else
@@ -352,7 +352,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         a6.M         = static_cast<uint32_t>(M);
         a6.N         = static_cast<uint32_t>(N);
         a6.K         = cfg->abi == 2 ? static_cast<uint32_t>(K) : 0u;
-        arg_size     = kFly6NoBias + (cfg->abi == 2 ? 4 : 0);
+        arg_size     = kTs6NoBias + (cfg->abi == 2 ? 4 : 0);
         if(bias != nullptr)
         {
             a6.ptr_bias   = bias->ptr;

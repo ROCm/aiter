@@ -42,10 +42,11 @@ _BIAS_CAPABLE_KERNELS = frozenset(
         "aiter_a6w6_m256n256_persistent_prefetch10_bias",
         "aiter_a6w6_m256n512_persistent_bias",
         "aiter_a6w6_m256n512_persistent_row_stage_bias",
-        # Assembly ports of FlyDSL's MXFP6 GEMM, one code object per shape (f6gemm_fly_<M>x<N>x<K>); each has a
-        # _nobias sibling the launcher swaps in on an unbiased call. Shape-locked: each traps on any other shape.
+        # Per-shape persistent MXFP6 kernels on the mxfp6_c0c1_256_padk2 operands, one code object per shape
+        # (f6gemm_ts_<M>x<N>x<K>); each has a _nobias sibling the launcher swaps in on an unbiased call.
+        # Shape-locked: each traps on any other shape.
         *(
-            f"f6gemm_fly_{shape}_kernel_func"
+            f"f6gemm_ts_{shape}_kernel_func"
             for shape in (
                 "16384x12288x3072",
                 "8192x12288x3072",

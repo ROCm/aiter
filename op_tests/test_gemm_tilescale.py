@@ -88,10 +88,6 @@ def test_a6w4_vs_fp64(row):
 def test_a6w4_bitwise_vs_a6w6(row):
     M, N, K, bias = row["M"], row["N"], row["K"], bool(row["bias"])
     a6w6 = [r for r in ROWS if (r["a_fmt"], r["b_fmt"], r["bias"], r["M"], r["N"], r["K"]) == (6, 6, row["bias"], M, N, K)]
-    try:
-        from aiter.ops.gemm_op_a6w6_fly import gemm_a6w6_fly_asm
-    except ImportError:
-        gemm_a6w6_fly_asm = None
     a6, b4, sa, sb, bv = _operands(M, N, K, 7 + M + K, bias)
     A = TS.pack_fp6_codes_ref(a6)
     SA = TS.pack_scales_ref(sa, is_b=False)
@@ -100,13 +96,11 @@ def test_a6w4_bitwise_vs_a6w6(row):
     ref = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
     if a6w6:
         gemm_mx_tilescale(A, B6, SA, SB, ref, 6, 6, K, bv)
-    elif gemm_a6w6_fly_asm is not None:
-        try:
-            gemm_a6w6_fly_asm(A, B6, SA, SB, ref, K, bv)
+    else:
+        try:  # no exact-shape A6W6 row: a shape-generic A6W6 kernel, if one serves this shape
+            gemm_mx_tilescale(A, B6, SA, SB, ref, 6, 6, K, bv)
         except Exception as e:  # noqa: BLE001 -- no A6W6 object for this shape
             pytest.skip(f"no A6W6 tilescale kernel for {M}x{N}x{K}: {e}")
-    else:
-        pytest.skip("no A6W6 tilescale kernels")
     out = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
     gemm_a6w4_tilescale(A, TS.pack_fp4_codes_ref(b4, "k128"), SA, SB, out, K, bv)
     assert torch.equal(out.view(torch.int16), ref.view(torch.int16))

@@ -46,11 +46,11 @@ class F6GemmCandidate(TypedDict):
     swizzle_max_m: int
     swizzle_max_n: int
     swizzle_max_k: int
-    # (M, N, K) for a shape-locked kernel (f6gemm_fly_<M>x<N>x<K>), which traps on any other shape
+    # (M, N, K) for a shape-locked kernel (f6gemm_ts_<M>x<N>x<K>), which traps on any other shape
     exact_shape: tuple[int, int, int] | None
 
 
-_EXACT_SHAPE_RE = re.compile(r"^f6gemm_fly_(\d+)x(\d+)x(\d+)(?:_nobias)?_kernel_func$")
+_EXACT_SHAPE_RE = re.compile(r"^f6gemm_ts_(\d+)x(\d+)x(\d+)(?:_nobias)?_kernel_func$")
 
 
 def _disable_core_dumps() -> None:
