@@ -185,6 +185,7 @@ from aiter.ops.flydsl.kernels.minimax_m3_index_score import (
     TOK_TILES,
     WAVE,
     WAVES,
+    _fp8_t,
     _validate_tensor,
     arch_traits,
     fragment_helpers,
@@ -647,6 +648,10 @@ def resolve_config(
     if cfg.swizzle < 0:
         cfg = replace(cfg, swizzle=1)
     if cfg.nt_k < 0:
+        # -1 is the only auto value; anything else negative is a typo that the
+        # fill below would turn into a legal policy and hide.
+        if cfg.nt_k != -1:
+            raise ValueError(f"nt_k auto sentinel is -1, got {cfg.nt_k}")
         cfg = replace(cfg, nt_k=0)
     if cfg.sched < 0:
         cfg = replace(cfg, sched=0)
@@ -865,6 +870,10 @@ def build_prefill_score(fp8: bool, cfg: PrefillScoreConfig, arch: str = DEFAULT_
     # MFMA takes k=128, the whole head_dim, so the k-step loop disappears and
     # with it every dependency chain inside an accumulator. Needs the fp8
     # operand path; see `score_page`.
+    # gfx942's fp8 is e4m3FNUZ, gfx950's is e4m3fn, and they differ in exponent
+    # bias -- binding one as the other reads every value at the wrong scale.
+    # See `_fp8_t` in the decode scorer, which this shares.
+    FP8_T = _fp8_t(arch)
     K128 = FP8_MFMA and cfg.k128 > 0
     if (K128 or cfg.m32 > 0) and arch != _CDNA4:
         raise ValueError(f"k128/m32 need {_CDNA4}'s MFMA_Scale, not {arch}")
@@ -882,7 +891,13 @@ def build_prefill_score(fp8: bool, cfg: PrefillScoreConfig, arch: str = DEFAULT_
     # caller's score tensor to be contiguous along the block axis, which the
     # production layout is, and a power-of-two run so the address divides.
     CONTIG_K = cfg.contig_k and PPW in (2, 4)
+    # Goes straight into the copy atom's `cache_modifier` as the raw aux field,
+    # so an out-of-range value is not a wrong policy but a wrong instruction
+    # encoding. Two bits (sc0, nt); -1 is the auto sentinel `resolve_config`
+    # fills in, and reaching here still negative means the config skipped it.
     nt_k = cfg.nt_k
+    if not 0 <= nt_k <= 3:
+        raise ValueError(f"nt_k must be a 2-bit cache policy in [0, 3], got {nt_k}")
     shuffled = cfg.shuffled
     # Depth, in tok_tiles, of the K queue carried across the block loop's back
     # edge. Only the k128 path consumes K tok_tile by tok_tile; the k=32 path holds
@@ -1365,22 +1380,20 @@ def build_prefill_score(fp8: bool, cfg: PrefillScoreConfig, arch: str = DEFAULT_
                 )
             )
             if const_expr(FP8_MFMA):
-                t = fx.make_rmem_tensor(fx.make_layout(8, 1), fx.Float8E4M3FN)
-                t.store(fx.Vector(src.load()).bitcast(fx.Float8E4M3FN))
+                t = fx.make_rmem_tensor(fx.make_layout(8, 1), FP8_T)
+                t.store(fx.Vector(src.load()).bitcast(FP8_T))
                 return t
             return as_bf16_frag(src.load(), ks % tr.q_per_load)
 
         if const_expr(M32):
             # 32x32 output tile, k=64 per instruction. See M32 above.
-            mma_atom = fx.make_mma_atom(
-                fx.rocdl.cdna4.MFMA_Scale(32, 32, 64, fx.Float8E4M3FN)
-            )
+            mma_atom = fx.make_mma_atom(fx.rocdl.cdna4.MFMA_Scale(32, 32, 64, FP8_T))
         elif const_expr(K128):
             # k=128 in one instruction, so a (tok_tile, tile) product is a single
             # MFMA with no accumulator chain at all. Same instruction the
             # production fp8 GEMM in this tree uses.
             mma_atom = fx.make_mma_atom(
-                fx.rocdl.cdna4.MFMA_Scale(MFMA_M, MFMA_N, 128, fx.Float8E4M3FN)
+                fx.rocdl.cdna4.MFMA_Scale(MFMA_M, MFMA_N, 128, FP8_T)
             )
         elif const_expr(FP8_MFMA):
             # Same 16x16 tile and the same k=32 per instruction as the bf16
@@ -1389,9 +1402,7 @@ def build_prefill_score(fp8: bool, cfg: PrefillScoreConfig, arch: str = DEFAULT_
             # v_cvt per page disappear, and with them the ~128 VGPRs of
             # converted bf16 fragments the compiler holds live across the
             # feature-tile loop.
-            mma_atom = fx.make_mma_atom(
-                fx.rocdl.MFMA(MFMA_M, MFMA_N, 32, fx.Float8E4M3FN)
-            )
+            mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(MFMA_M, MFMA_N, 32, FP8_T))
         else:
             mma_atom = fx.make_mma_atom(
                 fx.rocdl.MFMA(MFMA_M, MFMA_N, tr.mfma_k, fx.BFloat16)
@@ -1410,11 +1421,11 @@ def build_prefill_score(fp8: bool, cfg: PrefillScoreConfig, arch: str = DEFAULT_
                 return convert_k(raws, ks)
             raw = raws[ks // 2]
             lo = 2 * (ks % 2)
-            t = fx.make_rmem_tensor(fx.make_layout(8, 1), fx.Float8E4M3FN)
+            t = fx.make_rmem_tensor(fx.make_layout(8, 1), FP8_T)
             t.store(
                 fx.Vector.from_elements(
                     [fx.Int32(raw[lo]), fx.Int32(raw[lo + 1])], fx.Int32
-                ).bitcast(fx.Float8E4M3FN)
+                ).bitcast(FP8_T)
             )
             return t
 
@@ -3023,8 +3034,8 @@ def score_prefill_flydsl(
     with torch.cuda.device(idx_q.device):
         _run_compiled(
             launch,
-            ptr_arg(idx_q, fx.Float8E4M3FN if fp8_q else fx.BFloat16),
-            ptr_arg(cache, fx.Float8E4M3FN if fp8 else fx.BFloat16),
+            ptr_arg(idx_q, _fp8_t(arch) if fp8_q else fx.BFloat16),
+            ptr_arg(cache, _fp8_t(arch) if fp8 else fx.BFloat16),
             ptr_arg(out, fx.Float32),
             ptr_arg(block_table, fx.Int32),
             ptr_arg(cu_seqlens_q, fx.Int32),
