@@ -31,11 +31,77 @@ QK_HEAD_DIM = 576
 V_HEAD_DIM = 512
 
 
-def run_torch(batch, context_len, split_output, split_lse):
-    """Return dummy references until the full torch reference is implemented."""
-    ref_output = torch.zeros_like(split_output)
-    ref_lse = torch.full_like(split_lse, math.log(context_len))
-    return ref_output, ref_lse
+# Pytorch reference, from FlyDSL tests/kernels/test_mla_decode.py
+
+def ref_masked_attention(query, key, value, scale, dtype, q_scale=None, kv_scale=None):
+    """Single-sequence MLA attention (no causal mask needed for decode_qlen=1)."""
+    s = scale
+    if q_scale is not None:
+        s *= q_scale
+    if kv_scale is not None:
+        s *= kv_scale
+
+    attn_weights = torch.einsum("qhd,khd->hqk", query.float(), key.float()) * s
+    lse = attn_weights.logsumexp(dim=-1)
+    m = attn_weights.max(-1).values
+    attn_weights_exp = torch.exp(attn_weights - m.unsqueeze(-1))
+    denom = attn_weights_exp.sum(-1)
+    out = torch.einsum("hqk,khd->qhd", attn_weights_exp.float(), value.float())
+    out = out / denom.transpose(0, 1).unsqueeze(-1)
+    if kv_scale is not None:
+        out *= kv_scale
+    return out.to(dtype), lse
+
+
+def torch_mla_extend(q, kvc_cache, qo_indptr, kv_indptr, kv_indices, kv_last_page_lens, sm_scale, dtype):
+    """Pure-PyTorch paged MLA attention reference."""
+    is_fp8_q = q.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+    is_fp8_kvc = kvc_cache.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+
+    if is_fp8_q:
+        q = q.to(torch.float)
+    if is_fp8_kvc:
+        kvc_cache = kvc_cache.to(torch.float)
+
+    num_page, page_size, nhead_kv, _ = kvc_cache.shape
+    qs = torch.tensor_split(q, qo_indptr.tolist()[1:])
+    kvc = torch.index_select(kvc_cache, 0, kv_indices)
+    kvs = torch.tensor_split(kvc, kv_indptr.tolist()[1:])
+    bs = qo_indptr.shape[0] - 1
+
+    os_list = []
+    lses = []
+    for i in range(bs):
+        cur_num_page = kvs[i].shape[0]
+        real_kv_seq_len = (cur_num_page - 1) * page_size + kv_last_page_lens.tolist()[i]
+        kvc_i = kvs[i].flatten(0, 1)[:real_kv_seq_len]
+        q_i = qs[i]
+        k_i = kvc_i
+        v_i = kvc_i[:, :, :KV_LORA_RANK]
+        o_i, lse_i = ref_masked_attention(q_i, k_i, v_i, sm_scale, dtype)
+        os_list.append(o_i)
+        lses.append(lse_i)
+
+    o = torch.concat(os_list)
+    lse = torch.concat(lses, dim=1).transpose(0, 1)
+    return o, lse
+
+def run_torch(
+        query,
+        kv_buffer,
+        kv_page_indices,
+        work_indptr,
+        work_info_set,
+        final_output,
+        split_output,
+        split_lse
+        ):
+    """Torch reference for MLA forward decode"""
+
+
+
+    pass
+    # return ref_output, ref_lse
 
 
 def _make_inputs(batch, context_len):
