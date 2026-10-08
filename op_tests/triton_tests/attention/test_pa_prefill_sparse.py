@@ -752,3 +752,16 @@ def test_pa_prefill_sparse_nonfinite_row0_ignored_by_invalid_slots(H):
     out = pa_prefill_sparse(q, kv, indices, indptr, None, None, None, sink, D**-0.5)
     assert torch.isfinite(out).all()
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+# An fp8 KV pool is rejected up front with a clear error instead of failing to
+# compile inside tl.dot.
+def test_pa_prefill_sparse_rejects_kv_dtype_mismatch():
+    _triton_branch_only()
+    T, H, D = 4, 16, 512
+    q = torch.randn(T, H, D, dtype=torch.bfloat16, device="cuda")
+    kv = torch.randn(8, D, device="cuda").to(torch.float8_e4m3fnuz)
+    indptr = torch.arange(0, T + 1, dtype=torch.int32, device="cuda")
+    indices = torch.zeros(T, dtype=torch.int32, device="cuda")
+    with pytest.raises(RuntimeError, match="dtype mismatch"):
+        pa_prefill_sparse(q, kv, indices, indptr, None, None, None, None, D**-0.5)

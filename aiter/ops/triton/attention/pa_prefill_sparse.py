@@ -79,6 +79,10 @@ def pa_prefill_sparse(
     otherwise the Triton kernel. Only gfx1250 reads a second KV source; the
     other two serve the prefix source alone and reject a non-empty extend.
 
+    Meant for prefill-sized calls. The grid is one program per query token with
+    no split over the KV slots, so a call with only a few query rows (a decode
+    step) leaves most of the GPU idle; use a split-KV decode kernel for those.
+
     Args:
         q:                 [T, H, D] BF16/FP16 — queries.
         unified_kv:        [total_pages, D] — prefix KV source (paged).
@@ -236,6 +240,14 @@ def pa_prefill_sparse(
 
     else:
         # Portable Triton fallback.
+        # Same up-front checks as gfx1250: an fp8 KV pool would otherwise fail
+        # inside tl.dot at compile time with an opaque CompilationError.
+        if q.dtype not in (torch.bfloat16, torch.float16):
+            raise RuntimeError(f"pa_prefill_sparse expects fp16/bf16 q, got {q.dtype}")
+        if unified_kv.dtype != q.dtype:
+            raise RuntimeError(
+                f"unified_kv dtype mismatch: kv={unified_kv.dtype}, q={q.dtype}"
+            )
         # The Triton kernel takes int32 or int64 indices as passed; converting
         # int64 to int32 would silently wrap slots past 2^31 - 1.
         kv_indices_prefix, kv_indptr_prefix = _prep_single_source(
