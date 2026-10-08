@@ -207,9 +207,11 @@ def compile_preshuffle_gemm(
     if scale_mode not in ("epilogue", "blockscale"):
         raise ValueError(f"scale_mode must be epilogue/blockscale, got {scale_mode!r}")
     is_blockscale = scale_mode == "blockscale"
-    if is_blockscale and (not is_fp8 or not is_gfx950 or tile_k % 128 != 0):
+    if is_blockscale and (
+        not is_fp8 or not (is_gfx942 or is_gfx950) or tile_k % 128 != 0
+    ):
         raise ValueError(
-            "blockscale requires FP8 inputs, gfx950 (gfx942 is not supported yet), "
+            "blockscale requires FP8 inputs, gfx942 or gfx950, "
             "and tile_k divisible by 128"
         )
     scale_k = K // 128
@@ -253,6 +255,11 @@ def compile_preshuffle_gemm(
             f"{total_threads * a_load_bytes} (threads*{a_load_bytes}B); got "
             f"tile_m={tile_m}, tile_n={tile_n}, tile_k={tile_k}, "
             f"A bytes={tile_m * tile_k * elem_bytes}. Use use_async_copy=0."
+        )
+    if use_async_copy and is_gfx942:
+        raise ValueError(
+            "use_async_copy=1 requires 128-bit LDS-direct loads unavailable on gfx942; "
+            "use use_async_copy=0."
         )
     num_ds_load = (tile_m * tile_k * elem_bytes) // 64 // 16  # A LDS reads per wave
     num_gmem_loads = num_a_loads + num_b_loads
@@ -676,7 +683,23 @@ def compile_preshuffle_gemm(
                     frag_A_retile[None, None, ki],
                 )
                 k_coord = ki if (use_mfma_scale_128 or use_mfma_k32) else (None, ki)
-                if const_expr(is_blockscale):
+                if const_expr(is_blockscale and is_gfx942):
+                    # Two K64 steps share one per-128-K scale block.
+                    if const_expr(ki % 2 == 0):
+                        frag_blk.store(acc_zero)
+                    fx.gemm(
+                        tiled_mma,
+                        frag_blk,
+                        frag_A[None, None, k_coord],
+                        cur_frag_B[None, None, k_coord],
+                        frag_blk,
+                    )
+                    if const_expr(ki % 2 == 1):
+                        sc = block_scale_vec(
+                            k_tile * Int32(blocks_per_tile) + Int32(ki // 2)
+                        )
+                        frag_C.store(math.fma(frag_blk.load(), sc, frag_C.load()))
+                elif const_expr(is_blockscale):
                     sc = block_scale_vec(k_tile * Int32(blocks_per_tile) + Int32(ki))
                     frag_blk.store(acc_zero)
                     fx.gemm(

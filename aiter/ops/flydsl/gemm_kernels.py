@@ -307,7 +307,7 @@ def flydsl_preshuffle_gemm_a8(
     """Run preshuffle GEMM with per-row/column or per-128-K FP32 scales.
 
     Blockscale expects x_scale [K/128, M] (transposed) and
-    w_scale [ceil(N/128), K/128], with FP8 inputs on gfx950.
+    w_scale [ceil(N/128), K/128], with FP8 inputs on gfx942 or gfx950.
     """
     compile_fn = _get_compile_fn()
     from aiter.utility import dtypes
@@ -351,11 +351,11 @@ def flydsl_preshuffle_gemm_a8(
         if (
             in_dtype != "fp8"
             or WQ.dtype != XQ.dtype
-            or arch != "gfx950"
+            or arch not in ("gfx942", "gfx950")
             or tile_k % 128
         ):
             raise ValueError(
-                "blockscale requires FP8 inputs, gfx950 (gfx942 is not supported yet), "
+                "blockscale requires FP8 inputs, gfx942 or gfx950, "
                 "and tile_k divisible by 128"
             )
         for name, scale, shape in (
