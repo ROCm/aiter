@@ -161,6 +161,13 @@ class TestCoupledTuningResults(unittest.TestCase):
         self.stack.enter_context(
             patch.object(self.module, "get_gfx_runtime", return_value="gfx950")
         )
+        # CPU infrastructure tests replace the HIP capability boundary as
+        # well as candidate execution; real aux build/dispatch has GPU coverage.
+        from aiter.ops import moe_mxfp4_aux
+
+        self.stack.enter_context(
+            patch.object(moe_mxfp4_aux, "prepare_mxfp4_moe_aux", return_value=None)
+        )
 
     def run_csv(
         self,

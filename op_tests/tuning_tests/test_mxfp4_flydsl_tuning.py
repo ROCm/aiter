@@ -71,6 +71,67 @@ class TestMxfp4FlydslInputsAndCandidates(unittest.TestCase):
         pd.DataFrame(rows).to_csv(path, index=False)
         return self.tuner.get_untuned_gemm_list(str(path))
 
+    def test_parent_prepares_only_generated_sort_rows_before_shape_workers(self):
+        from aiter.ops import moe_mxfp4_aux
+        from csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune import FmoeTuner
+
+        rows = pd.DataFrame(
+            [
+                shape_row(
+                    token=1,
+                    expert=128,
+                    model_dim=3072,
+                    inter_dim=512,
+                    topk=4,
+                    q_dtype_a="torch.float8_e4m3fn",
+                ),
+                shape_row(
+                    token=1,
+                    expert=128,
+                    model_dim=3072,
+                    inter_dim=1536,
+                    topk=4,
+                    q_dtype_a="torch.float8_e4m3fn",
+                ),
+                shape_row(
+                    token=64,
+                    expert=128,
+                    model_dim=3072,
+                    inter_dim=512,
+                    topk=4,
+                    q_dtype_a="torch.float8_e4m3fn",
+                ),
+            ]
+        )
+        args = SimpleNamespace(
+            run_config=False, compare=False, mxfp4_search_mode="full"
+        )
+        observed = []
+
+        def prepare(_self, _args):
+            _self.untunedf = rows
+
+        with mock.patch.object(FmoeTuner, "pre_process", prepare), mock.patch.object(
+            moe_mxfp4_aux,
+            "prepare_mxfp4_moe_aux",
+            lambda shapes: observed.extend(shapes),
+        ):
+            self.tuner.pre_process(args)
+        self.assertEqual(observed, [(128, 3072, 512, 4), (128, 3072, 1536, 4)])
+
+    def test_run_config_leaves_auxiliary_preparation_to_production(self):
+        from aiter.ops import moe_mxfp4_aux
+        from csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune import FmoeTuner
+
+        with mock.patch.object(
+            FmoeTuner, "pre_process", lambda *_: None
+        ), mock.patch.object(
+            moe_mxfp4_aux,
+            "prepare_mxfp4_moe_aux",
+            side_effect=AssertionError("run_config must not prepare tune workers"),
+        ):
+            self.tuner.pre_process(SimpleNamespace(run_config=True, compare=False))
+
     def test_mixed_rows_use_their_own_precision_and_default_search(self):
         rows = self.read_rows([shape_row(), shape_row(q_dtype_a="torch.float8_e4m3fn")])
         a4, a8 = [row.to_dict() for _, row in rows.iterrows()]
