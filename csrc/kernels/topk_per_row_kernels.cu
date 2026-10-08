@@ -3676,12 +3676,15 @@ __device__ __forceinline__ bool lds_tail_sampled_stage_n(T const* in,
 
     // Keys above the crossing bin are compacted into a per-wave list, which
     // half the waves flush after the barrier while the other half rank the
-    // bin; the bin's keys go to the candidate arrays.  One returning LDS
+    // bin; the bin's keys go to the sample histogram.  One returning LDS
     // atomic per wave reserves the wave's output range and its candidate
     // slots.  The staging array is free once every lane holds its keys: each
     // wave's list takes 2 * StageCapacity / Waves slots, more than it holds.
     IdxT* const winner_list  = reinterpret_cast<IdxT*>(stage_val) + wave * (2 * Region);
     uint32_t* const wave_out = per_wave + Waves;
+    // Not the candidate arrays: they hold the pool until every wave has read it.
+    Bits* const bin_val = fine;
+    IdxT* const bin_idx = reinterpret_cast<IdxT*>(fine + kSampledBinCapacity);
     static_assert(2 * Region >= Held * WARP_SIZE);
     int winners = 0;
     IdxT out_base = 0;
@@ -3720,8 +3723,8 @@ __device__ __forceinline__ bool lds_tail_sampled_stage_n(T const* in,
             {
                 if(cand_at[j] >= 0)
                 {
-                    candidate_values[cpos + cand_at[j]]  = __builtin_bit_cast(T, key[j]);
-                    candidate_indices[cpos + cand_at[j]] = key_index[j];
+                    bin_val[cpos + cand_at[j]] = key[j];
+                    bin_idx[cpos + cand_at[j]] = key_index[j];
                 }
             }
         }
@@ -3730,7 +3733,7 @@ __device__ __forceinline__ bool lds_tail_sampled_stage_n(T const* in,
                              (static_cast<uint32_t>(winners) << 16);
         // Keys past the bin's count sort after every key in it.
         if(tid >= cross_count && tid < kSampledBinCapacity)
-            candidate_values[tid] = __builtin_bit_cast(T, ~0u);
+            bin_val[tid] = ~0u;
     }
     __syncthreads();
 
@@ -3745,7 +3748,7 @@ __device__ __forceinline__ bool lds_tail_sampled_stage_n(T const* in,
         using U4v           = __attribute__((__ext_vector_type__(4))) uint32_t;
         int const i         = tid / RankParts;
         int const part      = tid % RankParts;
-        Bits const key_i    = __builtin_bit_cast(Bits, candidate_values[i]);
+        Bits const key_i    = bin_val[i];
         int below           = 0;
         // A part whose slice starts past the bin compares nothing.
         if(part * Slice < cross_count)
@@ -3753,7 +3756,7 @@ __device__ __forceinline__ bool lds_tail_sampled_stage_n(T const* in,
             U4v slice[Slice / 4];
 #pragma unroll
             for(int v = 0; v < Slice / 4; ++v)
-                slice[v] = reinterpret_cast<U4v const*>(candidate_values)[part * (Slice / 4) + v];
+                slice[v] = reinterpret_cast<U4v const*>(bin_val)[part * (Slice / 4) + v];
 #pragma unroll
             for(int v = 0; v < Slice / 4; ++v)
             {
@@ -3769,7 +3772,7 @@ __device__ __forceinline__ bool lds_tail_sampled_stage_n(T const* in,
         below = dpp_add<0xb1, 0xf, 0xf>(below); // quad_perm:[1,0,3,2]
         below = dpp_add<0x4e, 0xf, 0xf>(below); // quad_perm:[2,3,0,1]
         if(part == 0 && i < cross_count && below < k - before)
-            __builtin_nontemporal_store(candidate_indices[i], out_idx + before + below);
+            __builtin_nontemporal_store(bin_idx[i], out_idx + before + below);
     }
     else
     {
@@ -3816,9 +3819,9 @@ __device__ __forceinline__ bool lds_tail_sampled_stage_n(T const* in,
  * the caller runs its unchanged full-row form from the start.
  *
  * LDS: the caller's 4096-entry staging array, its 4096-bin histogram (the
- * 13-bit sample counts, two 16-bit bins per dword), its 2048-entry winner
- * array (the digit window) and its candidate arrays (the pool, then the
- * crossing bin's keys), plus 96 bytes here.
+ * 13-bit sample counts, two 16-bit bins per dword, then the crossing bin's
+ * keys), its 2048-entry winner array (the digit window) and its candidate
+ * arrays (the pool), plus 96 bytes here.
  */
 template <typename T, typename IdxT, int BlockSize, int StageCapacity, int PoolCapacity>
 __device__ __forceinline__ bool lds_tail_sampled_stage(T const* in,
