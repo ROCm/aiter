@@ -1074,7 +1074,6 @@ def reduce_segments(
         segm_output *= tl.math.exp2(segm_max - overall_max)[:, None]
         acc_sum = tl.sum(segm_output, axis=0)
     else:
-        # one big tile spills at large head sizes; this also reads only written segments
         segm_base = (
             query_token_idx.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
             + query_head_idx * NUM_SEGMENTS_PER_SEQ
