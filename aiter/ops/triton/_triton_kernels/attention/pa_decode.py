@@ -5,9 +5,18 @@ import triton
 import triton.language as tl
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 
 # This code is derived from sglang and FLASHNN projects
 # https://github.com/AlibabaPAI/FLASHNN/blob/main/flashnn/triton_kernels/paged_attn.py
+
+
+def _get_dispatch_config(kv_dtype: str) -> dict | None:
+    """v1/v2 dispatch rule for a KV-cache dtype ("bf16", "fp16", ...), or None
+    when this arch has no PA-DECODE config for it."""
+    cfg_dir = resolve_config_dir("attention", "PA-DECODE", backend="triton")
+    config = load_config_json(f"{cfg_dir}/DEFAULT.json", required=False) or {}
+    return config.get("dispatch", {}).get(kv_dtype)
 
 
 _paged_attn_decode_v1_wo_dot_repr = make_kernel_repr(

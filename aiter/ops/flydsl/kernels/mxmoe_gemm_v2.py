@@ -19,8 +19,8 @@ from flydsl.expr.typing import (
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.typing import as_ir_value as _raw
 
-from .mxfp4_gemm_common import _fabs_f32 as fabs_f32
 from .mxfp4_gemm_common import (
+    _e8m0_from_amax,
     _inline_dpp_pair_amax,
     _inline_dpp_quad_amax,
     _udiv,
@@ -34,6 +34,7 @@ from .mxfp4_gemm_common import (
     lds_typed_ptr,
     lds_vec_load,
 )
+from .mxfp4_gemm_common import _fabs_f32 as fabs_f32
 from .mxfp4_gemm_common import _lds_swizzle_mask as lds_swizzle_mask
 
 _FP8_E8M0_SHIFT = 7
@@ -235,7 +236,6 @@ def gemm2_body_v2(
     BK=256,
     use_nt,
     INTER_MAX,
-    g2_kstatic=False,
     aStages,
     a_slot_alias=False,
     a_dtype,
@@ -254,6 +254,9 @@ def gemm2_body_v2(
     g2_epi_lanes=None,
     g2_apre=False,
     enable_bias=False,
+    nonatomic=False,
+    scatter_out_fp4=False,
+    arg_out_scale=None,
     g2_prefetch_ids=False,
     reduce_store_cache_modifier=None,
     resolved_input_rows=(),
@@ -279,11 +282,10 @@ def gemm2_body_v2(
     a_pack = 1 if is_f8_a else 2
     KH_TILE_A = BK // a_pack
     slot_bytes = BM * KH_TILE_A
-    # Contraction K = inter_dim runtime (i32_inter); INTER_MAX caps compile-time view/fragment bounds.
+    # Contraction K = inter_dim (i32_inter); the K-loop is unrolled over INTER_MAX // BK tiles, so i32_inter must equal INTER_MAX.
     K_rt = fx.Int32(i32_inter)
     K_BYTES = _udiv(K_rt, fx.Int32(a_pack))
     kc_rt = _udiv(K_rt + fx.Int32(255), fx.Int32(256))
-    K_TILES_RT = _udiv(K_rt, fx.Int32(BK))
     kAS_per_chunk_dw = kc_rt * fx.Int32(64)
     kBS_stride_n0_dw = kc_rt * fx.Int32(64)
     # N_OUT = model_dim/hidden is the gemm2 output N dim; runtime via i32_hidden (no K-loop dependency).
@@ -578,7 +580,7 @@ def gemm2_body_v2(
         if const_expr(interleave is not None):
             interleave[numAccN - 1]()
 
-    # C accumulator: register fragments, zeroed then accumulated in place; (un)packed to K-loop carry.
+    # C accumulator: register fragments, zeroed then accumulated in place.
     zero4 = Vec.filled(4, 0.0, Float32)
     c_frags = [
         [fx.make_rmem_tensor(4, Float32) for _ in range_constexpr(numAccN)]
@@ -587,20 +589,6 @@ def gemm2_body_v2(
     for i in range_constexpr(kMChunks):
         for J in range_constexpr(numAccN):
             c_frags[i][J].store(zero4)
-
-    def load_c_carry():
-        return [c_frags[i][J].load() for i in range(kMChunks) for J in range(numAccN)]
-
-    def init_c_carry():
-        return load_c_carry()
-
-    def store_c_carry(state):
-        n = 0
-        for i in range_constexpr(kMChunks):
-            for J in range_constexpr(numAccN):
-                c_frags[i][J].store(state[n])
-                n += 1
-        return n
 
     def _epilog(accm, **kw):
         atomic_bf16_epilog(
@@ -652,7 +640,7 @@ def gemm2_body_v2(
             packed.append(Vec(frag.load())[0])
         return packed
 
-    g2_interleave = const_expr(g2_kstatic and g2_bf16_lds and output_width is None)
+    g2_interleave = const_expr(g2_bf16_lds and not nonatomic and output_width is None)
     g2_prefetch_ids = const_expr(
         g2_prefetch_ids
         and g2_interleave
@@ -665,7 +653,98 @@ def gemm2_body_v2(
     if const_expr(g2_interleave):
         _epilog(c_frags, emit_thunks=epi_thunks)
 
-    if const_expr(g2_kstatic):
+    if const_expr(nonatomic):
+        KT = K_TILES_MAX
+        a_all_resident = const_expr((aStages if g2_apre else kStages) >= KT)
+
+        if const_expr(a_all_resident):
+            sa = [load_a_scale_tile(fx.Int32(S)) for S in range_constexpr(KT)]
+            b = [make_bq_fragments() for _ in range_constexpr(KT)]
+            bs = []
+            for S in range_constexpr(KT):
+                bsf = make_scale_fragments(nPairs)
+                issue_bscale_into(bsf, scale_chunk_tile(fx.Int32(S)))
+                bs.append(bsf)
+            issue_b_load_into(b[0], None, fx.Int32(0))
+            gpu.barrier()
+            nDsPerTile = kMChunks * kHalves
+            nBPerTile = numAccN * kHalves
+            nMfmaPerTile = numAccN * kScaleSubBlocks * 2 * kHalves
+            nNextB = (KT - 1) * nBPerTile
+            for n in range_constexpr(nDsPerTile):
+                rocdl.sched_dsrd(2)
+                if const_expr(n < nNextB):
+                    rocdl.sched_vmem(1)
+            for _ in range_constexpr(KT * nMfmaPerTile):
+                rocdl.sched_dsrd(2)
+                rocdl.sched_mfma(1)
+            for S in range_constexpr(KT):
+                issue_a_ds_read(fx.Int32(S % aStages))
+                if const_expr(S + 1 < KT):
+                    issue_b_load_into(b[S + 1], None, fx.Int32(S + 1))
+                mfma_cluster(b[S], bs[S], sa[S], fx.Int32(S))
+        else:
+            sa = [load_a_scale_tile(fx.Int32(S)) for S in range_constexpr(KT)]
+            bs = []
+            for S in range_constexpr(KT):
+                bsf = make_scale_fragments(nPairs)
+                issue_bscale_into(bsf, scale_chunk_tile(fx.Int32(S)))
+                bs.append(bsf)
+            cur_bqf = make_bq_fragments()
+            nxt_bqf = make_bq_fragments()
+            issue_b_load_into(cur_bqf, None, fx.Int32(0))
+            nDsPerTile = kMChunks * kHalves
+            nBPerTile = numAccN * kHalves
+            nMfmaPerJ = kHalves if is_bm16 else kScaleSubBlocks * 2 * kHalves
+            nMfmaPerTile = numAccN * nMfmaPerJ
+            rows_per_call = 64 // (KH_TILE_A // 16)
+            rows_per_wave = BM // 4
+            nA = 1 if rows_per_wave < rows_per_call else rows_per_wave // rows_per_call
+            nDsPerGroup = max(1, (nDsPerTile + numAccN - 1) // numAccN)
+            nDsGroups = (nDsPerTile + nDsPerGroup - 1) // nDsPerGroup
+            nMfmaPerVmem = 4
+            nPrologueVmem = kStages * nA + KT * (kScaleSubBlocks + nPairs) + nBPerTile
+            nVmem0 = nPrologueVmem + (nBPerTile if const_expr(KT > 1) else 0)
+            nVmemPerDs0 = max(1, (nVmem0 + nDsPerTile - 1) // nDsPerTile)
+            fenced = -1
+            issued = kStages - 1
+            for kt in range_constexpr(KT):
+                prefetch_a = const_expr(kt + kStages < KT)
+                if const_expr(kt > fenced):
+                    gpu.barrier()
+                    fenced = issued
+                if const_expr(kt == 0):
+                    for _ in range_constexpr(nDsPerTile):
+                        rocdl.sched_vmem(nVmemPerDs0)
+                        rocdl.sched_dsrd(1)
+                else:
+                    nAVmem = nA if const_expr(kt - 1 + kStages < KT) else 0
+                    nBVmem = nBPerTile if const_expr(kt + 1 < KT) else 0
+                    for _ in range_constexpr(nAVmem + nBVmem):
+                        rocdl.sched_mfma(nMfmaPerVmem)
+                        rocdl.sched_vmem(1)
+                    nMfmaLeft = max(
+                        1,
+                        (nMfmaPerTile - nMfmaPerVmem * (nAVmem + nBVmem)) // nDsGroups,
+                    )
+                    for _ in range_constexpr(nDsGroups):
+                        rocdl.sched_mfma(nMfmaLeft)
+                        rocdl.sched_dsrd(nDsPerGroup)
+                if const_expr(kt + 1 < KT):
+                    issue_b_load_into(nxt_bqf, None, fx.Int32(kt + 1))
+                issue_a_ds_read(fx.Int32(kt % aStages))
+                if prefetch_a:
+                    if const_expr(a_slot_alias):
+                        gpu.barrier()
+                        fenced = issued
+                    issue_a_load_lds(
+                        fx.Int32((kt + kStages) % aStages),
+                        fx.Int32(kt + kStages),
+                    )
+                    issued = kt + kStages
+                mfma_cluster(cur_bqf, bs[kt], sa[kt], fx.Int32(kt))
+                cur_bqf, nxt_bqf = nxt_bqf, cur_bqf
+    else:
         KT = K_TILES_MAX
         for i in range_constexpr(kMChunks):
             for J in range_constexpr(numAccN):
@@ -742,118 +821,36 @@ def gemm2_body_v2(
             rocdl.s_setprio(0)
             rocdl.sched_barrier(0)
             cur_bqf, nxt_bqf = nxt_bqf, cur_bqf
-    else:
-        # 2-stage B pipeline: consume carried "current" B, prefetch next tile into the same fragments via scf.for state.
-        cur_bqf = make_bq_fragments()
-        cur_bsf = make_scale_fragments(nPairs)
-        nxt_bqf = make_bq_fragments()
-        nxt_bsf = make_scale_fragments(nPairs)
-        # g2_ascale_pf: carry the A-scale through scf.for state, same rotating-buffer model as B.
-        cur_saf = nxt_saf = None
-        if const_expr(g2_ascale_pf):
-            cur_saf = make_scale_fragments(kScaleSubBlocks)
-            nxt_saf = make_scale_fragments(kScaleSubBlocks)
-
-        def load_b_fragments(bqf, bsf, saf):
-            out = []
-            for j in range_constexpr(numAccN):
-                for half in range_constexpr(kHalves):
-                    out.append(bqf[j][half].load())
-            for mw in range_constexpr(nPairs):
-                out.append(bsf[mw].load())
-            if const_expr(g2_ascale_pf):
-                for sub in range_constexpr(kScaleSubBlocks):
-                    out.append(saf[sub].load())
-            return out
-
-        def store_b_carry(state, base):
-            n = base
-            for j in range_constexpr(numAccN):
-                for half in range_constexpr(kHalves):
-                    cur_bqf[j][half].store(state[n])
-                    n += 1
-            for mw in range_constexpr(nPairs):
-                cur_bsf[mw].store(state[n])
-                n += 1
-            if const_expr(g2_ascale_pf):
-                for sub in range_constexpr(kScaleSubBlocks):
-                    cur_saf[sub].store(state[n])
-                    n += 1
-            return n
-
-        def issue_a_scale_load_into(saf, kt_rt):
-            sa = load_a_scale_tile(kt_rt)
-            for sub in range_constexpr(kScaleSubBlocks):
-                saf[sub].store(Vec.from_elements([sa[sub]], Int32))
-
-        def load_carry():
-            return init_c_carry() + load_b_fragments(cur_bqf, cur_bsf, cur_saf)
-
-        def store_carry(state):
-            base = store_c_carry(state)
-            store_b_carry(state, base)
-
-        def yield_carry():
-            return load_c_carry() + load_b_fragments(nxt_bqf, nxt_bsf, nxt_saf)
-
-        # Prologue: prefetch tile 0's B/B-scale into "current" (VALUES enter via init=load_carry()).
-        issue_b_load_into(cur_bqf, cur_bsf, fx.Int32(0))
-        if const_expr(g2_ascale_pf):
-            issue_a_scale_load_into(cur_saf, fx.Int32(0))
-        rocdl.sched_barrier(0)
-
-        def prefetch_next_b(kt_rt):
-            # Prefetch NEXT tile's B; if none, copy current through (rotate_b_carry state, unused after loop).
-            nxt_b = kt_rt + fx.Int32(1)
-            if nxt_b < K_TILES_RT:
-                issue_b_load_into(nxt_bqf, nxt_bsf, nxt_b)
-                if const_expr(g2_ascale_pf):
-                    issue_a_scale_load_into(nxt_saf, nxt_b)
-            else:
-                for j in range_constexpr(numAccN):
-                    for half in range_constexpr(kHalves):
-                        nxt_bqf[j][half].store(cur_bqf[j][half].load())
-                for mw in range_constexpr(nPairs):
-                    nxt_bsf[mw].store(cur_bsf[mw].load())
-                if const_expr(g2_ascale_pf):
-                    for sub in range_constexpr(kScaleSubBlocks):
-                        nxt_saf[sub].store(cur_saf[sub].load())
-
-        for kt_iv, state in range(
-            fx.Int32(0),
-            K_TILES_RT,
-            fx.Int32(1),
-            init=load_carry(),
-        ):
-            store_carry(state)
-            kt_rt = fx.Int32(kt_iv)
-            if const_expr(g2_bhoist):
-                prefetch_next_b(kt_rt)
-            gpu.barrier()
-            issue_a_ds_read(kt_rt % fx.Int32(aStages))
-            nxt_a = kt_rt + fx.Int32(kStages)
-            if const_expr(a_slot_alias):
-                gpu.barrier()  # outside the runtime if: barriers must be uniform
-            if nxt_a < K_TILES_RT:
-                issue_a_load_lds(nxt_a % fx.Int32(aStages), nxt_a)
-            if const_expr(g2_ascale_pf):
-                sa = [
-                    Vec(cur_saf[sub].load())[0]
-                    for sub in range_constexpr(kScaleSubBlocks)
-                ]
-            else:
-                sa = load_a_scale_tile(kt_rt)
-            if const_expr(not g2_bhoist):
-                prefetch_next_b(kt_rt)
-            rocdl.sched_barrier(0)
-            rocdl.s_setprio(1)
-            mfma_cluster(cur_bqf, cur_bsf, sa, kt_rt)
-            rocdl.s_setprio(0)
-            rocdl.sched_barrier(0)
-            results = yield yield_carry()
-        store_carry(results)
-
-    if const_expr(g2_interleave):
+    if const_expr(nonatomic and scatter_out_fp4):
+        nonatomic_mxfp4_epilog(
+            lds_acc_base,
+            [[c_frags[i][J].load() for J in range(numAccN)] for i in range(kMChunks)],
+            arg_out,
+            arg_out_scale,
+            m_row,
+            n_block_idx,
+            wave,
+            lane,
+            N_OUT_rt,
+            BN,
+            kMChunks,
+        )
+    elif const_expr(nonatomic):
+        nonatomic_bf16_epilog(
+            [[c_frags[i][J].load() for J in range(numAccN)] for i in range(kMChunks)],
+            arg_out,
+            m_row,
+            n_block_idx,
+            wave,
+            lane,
+            N_OUT_rt,
+            BN,
+            kMChunks,
+            arg_bias=arg_bias,
+            expert_id=e,
+            enable_bias=enable_bias,
+        )
+    elif const_expr(g2_interleave):
         rocdl.s_waitcnt(lgkmcnt=0)
         gpu.barrier()
         _epilog(None, lds_ready=True, prefetched_ids=prefetched_ids)
@@ -1309,3 +1306,142 @@ def atomic_bf16_epilog(
                 store_one_mr(mr)
 
         store_if_valid(token_id, route_slot, mr)
+
+
+def nonatomic_bf16_epilog(
+    accm,
+    arg_out,
+    m_row,
+    n_block_idx,
+    wave,
+    lane,
+    N_OUT,
+    BN,
+    kMChunks,
+    arg_bias=None,
+    expert_id=None,
+    enable_bias=False,
+):
+    numAccN = (BN // 4) // 16
+    row_base = m_row + (lane // 16) * 4
+    gn_base = n_block_idx * BN + wave * (BN // 4) + (lane % 16)
+    out_ptr = global_typed_ptr(arg_out, T.bf16, align=2) + (
+        fx.Int64(row_base) * fx.Int64(N_OUT) + fx.Int64(gn_base)
+    )
+    bias = None
+    if const_expr(enable_bias):
+        bias_ptr = global_typed_ptr(arg_bias, T.f32) + (
+            fx.Int64(expert_id) * fx.Int64(N_OUT) + fx.Int64(gn_base)
+        )
+        bias = [
+            fx.Float32(bias_ptr[fx.Int32(J * 16)]) for J in range_constexpr(numAccN)
+        ]
+    for i in range_constexpr(kMChunks):
+        for J in range_constexpr(numAccN):
+            vec = Vec(accm[i][J])
+            for v in range_constexpr(4):
+                val = vec[v]
+                if const_expr(enable_bias):
+                    val = fx.Float32(val) + bias[J]
+                bf = Vec.from_elements([val], Float32).to(BFloat16)
+                out_ptr[fx.Int32(i * 16 + v) * N_OUT + J * 16] = bf[0]
+
+
+def nonatomic_mxfp4_epilog(
+    lds_acc_base,
+    accm,
+    arg_out_q,
+    arg_out_scale,
+    m_row,
+    n_block_idx,
+    wave,
+    lane,
+    N_OUT,
+    BN,
+    kMChunks,
+):
+    """Scatter epilog with MXFP4 output: q [max_sorted, N/2] + e8m0 [max_sorted, N/32], unweighted.
+
+    fp32 C is staged through LDS (aliases the A slots) so each lane reads 8 contiguous
+    columns; a lane quad owns one 32-column scale block.
+    """
+    assert BN % 128 == 0, f"mxfp4 scatter epilog needs BN % 128 == 0, got {BN}"
+    numAccN = (BN // 4) // 16
+    wave_n = BN // 4
+    lds_base_fptr = lds_typed_ptr(lds_acc_base, T.f32)
+    # C aliases the A slots: every wave must be done ds_reading A before C lands.
+    gpu.barrier()
+    for i in range_constexpr(kMChunks):
+        row_base = fx.Int32(i * 16) + (lane // 16) * 4
+        for J in range_constexpr(numAccN):
+            col = wave * wave_n + J * 16 + lane % 16
+            vec = Vec(accm[i][J])
+            for v in range_constexpr(4):
+                lds_base_fptr[(row_base + v) * BN + col] = fx.Float32(vec[v])
+    gpu.barrier()
+
+    NBLK = BN // 32
+    tx_i32 = fx.Int32(gpu.thread_id("x"))
+    m_lane = tx_i32 // 16
+    n_lane = tx_i32 % 16
+    wave_grp = n_lane // 4
+    kk = n_lane % 4
+    out_q = flat_buffer_view(arg_out_q, None, T.i32, align=4, elem_bytes=4, fold=False)
+    store_q_nt = fx.make_copy_atom(fx.rocdl.BufferCopy32b(2), Int32)
+    out_scale_ptr = global_typed_ptr(arg_out_scale, T.i8, align=1)
+    q_row0 = fx.Int64(m_row + m_lane) * fx.Int64(_udiv(N_OUT, fx.Int32(8)))
+    s_row0 = fx.Int64(m_row + m_lane) * fx.Int64(_udiv(N_OUT, fx.Int32(32)))
+    blocks = [(mr, half) for mr in range(kMChunks) for half in range(NBLK // 4)]
+
+    def issue_load(mr, half):
+        group = wave_grp + half * 4
+        col0 = group * 32 + kk * 8
+        idx = (fx.Int32(mr * 16) + m_lane) * BN + col0
+        v0 = Vec(lds_vec_load(lds_acc_base, idx * 4, T.vec(4, T.f32), T.f32, align=16))
+        v1 = Vec(
+            lds_vec_load(lds_acc_base, (idx + 4) * 4, T.vec(4, T.f32), T.f32, align=16)
+        )
+        return (
+            [fx.Float32(v0[e]) for e in range(4)]
+            + [fx.Float32(v1[e]) for e in range(4)],
+            group,
+            col0,
+        )
+
+    r_next = issue_load(*blocks[0])
+    for bi in range_constexpr(len(blocks)):
+        mr, _half = blocks[bi]
+        r, group, col0 = r_next
+        if const_expr(bi + 1 < len(blocks)):
+            r_next = issue_load(*blocks[bi + 1])
+        local_max = fabs_f32(r[0])
+        for e in range_constexpr(1, 8):
+            local_max = local_max.maximumf(fabs_f32(r[e]))
+        amax_bits = _inline_dpp_quad_amax(fx.Int32(_raw(local_max).bitcast(T.i32)))
+        e8m0, qscale = _e8m0_from_amax(amax_bits.bitcast(Float32))
+        packed = _raw(fx.Int32(0))
+        for h in range_constexpr(4):
+            packed = rocdl.cvt_scalef32_pk_fp4_f32(
+                T.i32, packed, _raw(r[2 * h]), _raw(r[2 * h + 1]), _raw(qscale), h
+            )
+        global_col = n_block_idx * BN + col0
+        q_idx = (
+            q_row0
+            + fx.Int64(mr * 16) * fx.Int64(_udiv(N_OUT, fx.Int32(8)))
+            + fx.Int64(global_col // 8)
+        )
+        q_frag = fx.make_rmem_tensor(1, Int32)
+        q_frag.store(Vec.from_elements([fx.Int32(packed)], Int32))
+        fx.copy(store_q_nt, q_frag, out_q[None, q_idx])
+        s_off = (
+            s_row0
+            + fx.Int64(mr * 16) * fx.Int64(_udiv(N_OUT, fx.Int32(32)))
+            + fx.Int64(n_block_idx * NBLK + group)
+        )
+
+        @flyc.jit
+        def store_scale_if_leader(kk, e8m0, s_off):
+            if kk == fx.Int32(0):
+                fx.ptr_store(e8m0.to(Int8), out_scale_ptr + s_off)
+
+        store_scale_if_leader(kk, e8m0, s_off)
