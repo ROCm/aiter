@@ -44,7 +44,11 @@ GPU IDs above are examples. Use freshly verified physical HIP IDs and unset
 inherited `HIP_VISIBLE_DEVICES`/`ROCR_VISIBLE_DEVICES` for physical selection.
 Do not nest the scheduler inside another process holding the same locks.
 It holds `/tmp/aiter-independent-tune.lock` plus `/tmp/gpu-<HIP>.lock`, maps
-HIP IDs to SMI BDFs and requires three idle samples before each model.
+HIP IDs to SMI BDFs and requires three idle samples before each model. Raw
+process records remain in the log; only entries whose memory, engines and CU
+occupancy are all known finite zero values count as idle contexts. Unknown or
+nonzero resources block launch. Samples also require gfx activity within
+0–2% and VRAM below 1 GiB with a valid reported capacity.
 Other executed Python tuning scripts block launch; formatter file arguments
 do not. Each model has its own process group, and all live group members must
 end before the next fixed-order model starts. No watchdog, reset, kill or

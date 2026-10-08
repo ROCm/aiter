@@ -299,19 +299,55 @@ class LaunchSystem:
                     total = smi.amdsmi_get_gpu_memory_total(
                         handle, smi.AmdSmiMemoryType.VRAM
                     )
+                    idle_contexts, busy_jobs = [], []
+                    for job in jobs:
+                        engine = job.get("engine_usage") or {}
+                        memory = job.get("memory_usage") or {}
+                        resources = [
+                            job.get("mem"),
+                            job.get("cu_occupancy"),
+                            engine.get("gfx"),
+                            engine.get("enc"),
+                            memory.get("gtt_mem"),
+                            memory.get("cpu_mem"),
+                            memory.get("vram_mem"),
+                        ]
+                        if all(
+                            isinstance(value, (int, float))
+                            and math.isfinite(value)
+                            and value == 0
+                            for value in resources
+                        ):
+                            idle_contexts.append(job["pid"])
+                        else:
+                            busy_jobs.append(job)
+                    gfx_activity = activity.get("gfx_activity")
+                    quiet = (
+                        isinstance(gfx_activity, (int, float))
+                        and math.isfinite(gfx_activity)
+                        and 0 <= gfx_activity <= 2
+                    )
                     idle = (
-                        activity["gfx_activity"] == 0
-                        and not jobs
+                        quiet
+                        and not busy_jobs
                         and isinstance(used, int)
-                        and used < 1024**3
+                        and 0 <= used < 1024**3
+                        and isinstance(total, int)
+                        and total > used
                     )
                     reasons = []
-                    if activity["gfx_activity"] != 0:
-                        reasons.append(f"gfx activity {activity['gfx_activity']}")
-                    if jobs:
-                        reasons.append(f"GPU processes {[job['pid'] for job in jobs]}")
-                    if not isinstance(used, int) or used >= 1024**3:
+                    if not quiet:
+                        reasons.append(
+                            f"gfx activity exceeds idle range or is unknown: {gfx_activity}"
+                        )
+                    if busy_jobs:
+                        reasons.append(
+                            f"GPU processes with nonzero/unknown resources {[job['pid'] for job in busy_jobs]}"
+                        )
+                    if not isinstance(used, int) or not 0 <= used < 1024**3:
                         reasons.append(f"VRAM exceeds idle ceiling: {used} bytes")
+                    if not isinstance(total, int) or total <= used:
+                        reasons.append(f"VRAM capacity is unknown/invalid: {total}")
                     if device["target_graphics_version"] != "gfx950":
                         idle = False
                         reasons.append(
@@ -326,11 +362,13 @@ class LaunchSystem:
                             "device": device,
                             "activity": activity,
                             "processes": jobs,
+                            "idle_context_pids": idle_contexts,
+                            "busy_processes": busy_jobs,
                             "vram_used_bytes": used,
                             "vram_total_bytes": total,
                             "idle": idle,
                             "idle_reason": "; ".join(reasons)
-                            or "no GPU processes, zero gfx activity, VRAM below 1 GiB",
+                            or "only zero-resource HIP contexts, gfx activity at most 2%, VRAM below 1 GiB",
                         }
                     )
                 if sample < 2:
