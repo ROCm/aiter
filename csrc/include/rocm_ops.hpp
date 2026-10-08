@@ -2437,6 +2437,12 @@ namespace py = pybind11;
           py::arg("stride0")   = -1,              \
           py::arg("stride1")   = 1,               \
           py::arg("workspace") = std::nullopt);   \
+    m.def("topk_plain_use_mulblocks",             \
+          &topk_plain_use_mulblocks,              \
+          py::arg("numRows"),                     \
+          py::arg("stride0"),                     \
+          py::arg("k"),                           \
+          py::arg("ragged"));                     \
     m.def("topk_plain_workspace_size",            \
           &topk_plain_workspace_size,             \
           py::arg("numRows"),                     \

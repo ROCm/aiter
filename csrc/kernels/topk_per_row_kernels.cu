@@ -5372,10 +5372,12 @@ inline bool should_use_mulblocks(int batch_size, int64_t seq_len)
 // outgrow them before plain goes multi-block.  At one and two rows of 65536 to
 // 65538 columns the sampled-stage LDS tail ran 10.7-11.2us against 25.6-26.4us
 // for the multi-block kernel (MI355X, randn, method B).  The overrides above
-// still win.
-inline bool plain_should_use_mulblocks(int batch_size, int64_t seq_len, bool tuned_oneblock)
+// still win.  topk_plain_use_mulblocks gives topk_select this same answer.
+inline bool plain_should_use_mulblocks(int batch_size, int64_t seq_len, int k, bool ranged,
+                                       bool write_values, bool select_min)
 {
-    if(tuned_oneblock && !std::getenv("TOPK_FORCE_PATH") && !std::getenv("TOPK_DISPATCH_FACTOR"))
+    if(ob::topk_oneblock_plain_gfx950_serves(seq_len, k, ranged, write_values, select_min) &&
+       !std::getenv("TOPK_FORCE_PATH") && !std::getenv("TOPK_DISPATCH_FACTOR"))
         return false;
     return should_use_mulblocks(batch_size, seq_len);
 }
@@ -5480,6 +5482,20 @@ invokeComputeTopkLastDimWorkspaceSize<float, aiter::Phase::Prefill>(int32_t, int
 template int64_t
 invokeComputeTopkLastDimWorkspaceSize<float, aiter::Phase::Decode>(int32_t, int32_t, int);
 
+// radix_topk_dispatch's choice for the call topk_select makes (indices only,
+// largest first), for topk_select's router to ask rather than restate.
+// `stride0` is the row length the launcher is handed: the width of uniform
+// rows, the row pitch of ranged ones.
+bool topk_plain_use_mulblocks(int64_t numRows, int64_t stride0, int64_t k, bool ragged)
+{
+    return aiter::plain_should_use_mulblocks(static_cast<int>(numRows),
+                                             stride0,
+                                             static_cast<int>(k),
+                                             ragged,
+                                             /*write_values=*/false,
+                                             /*select_min=*/false);
+}
+
 // Raw-pointer entry called by topk_plain_kernels.cu via topk_per_row_kernel_launcher.
 void radix_topk_dispatch(void* buf,
                          size_t& buf_size,
@@ -5495,10 +5511,9 @@ void radix_topk_dispatch(void* buf,
                          hipStream_t stream)
 {
     const bool select_min = !greater;
-    const bool tuned_oneblock = aiter::ob::topk_oneblock_plain_gfx950_serves(
-        len, k, rowStarts != nullptr || rowEnds != nullptr, out != nullptr, select_min);
+    const bool ranged     = rowStarts != nullptr || rowEnds != nullptr;
 
-    if (aiter::plain_should_use_mulblocks(batch_size, len, tuned_oneblock)) {
+    if (aiter::plain_should_use_mulblocks(batch_size, len, k, ranged, out != nullptr, select_min)) {
         if (out) {
             aiter::mb::standalone_stable_radix_topk<float, int, true, true,
                 aiter::mb::Phase::Prefill>(

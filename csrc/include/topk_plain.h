@@ -21,6 +21,13 @@ void topk_plain(aiter_tensor_t& values,
                 int64_t stride1                         = 1,
                 std::optional<aiter_tensor_t> workspace = std::nullopt);
 
+// Whether the fp32 radix path takes its multi-block kernel for an indices-only,
+// largest-first call over `numRows` rows of `stride0` columns (the row pitch when
+// `ragged`). Answered by the launcher's own predicate, CU count and the
+// TOPK_FORCE_PATH / TOPK_DISPATCH_FACTOR overrides included, so topk_select can
+// route on it without restating it.
+bool topk_plain_use_mulblocks(int64_t numRows, int64_t stride0, int64_t k, bool ragged);
+
 // Workspace sizing for the fp32 radix path, exposed to Python so the scratch can
 // be allocated + cached on the Python side and passed into topk_plain.
 int64_t topk_plain_workspace_size(int64_t numRows, int64_t stride0, int64_t k);

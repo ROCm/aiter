@@ -68,6 +68,7 @@ from aiter.ops.topk import (
 from aiter.ops.topk_plain import (
     topk_plain,
     topk_plain_batches_ragged_rows,
+    topk_plain_use_mulblocks,
     topk_plain_values_optional,
 )
 
@@ -204,15 +205,15 @@ _PLAIN_K2048_MAX_WIDTH = 131071
 # against 268us -- so for uniform rows that door yields to plain's band there.
 # Ragged rows run plain's ranged form, which has none of these kernels and
 # measured 0.96x--1.50x of `sampled` on those cells, so they keep the work door.
-# The exception is plain's own dispatch: from 65536 columns it hands at most
-# two rows to its multi-block kernel (`should_use_mulblocks`), 1.7x--2.8x
-# slower than `sampled` through the few-row band, so `sampled` takes those --
-# but on gfx950 only ragged rows, or rows past the few-row band's width. A
-# uniform row its one-block kernels serve at any row count stays one-block
-# (`plain_should_use_mulblocks`), and there plain is the fastest backend: at
-# one and two rows of 65536..65538 columns 10.7-11.2us against 16.2-17.3us for
-# `sampled` and 25.6-26.4us for the multi-block kernel. See
-# `_plain_k2048_multiblock`.
+# The exception is a row in plain's band that its own dispatch hands to its
+# multi-block kernel, 1.7x--2.8x slower than `sampled` through the few-row
+# band, so `sampled` takes those rows. Which rows those are is the launcher's
+# answer, asked by `_plain_multiblock`. On the 256-CU MI355X these were
+# measured on, without overrides, they are at most two ragged rows from 65536
+# columns: a uniform row its one-block kernels serve at any row count stays
+# one-block (`plain_should_use_mulblocks`), and there plain is the fastest
+# backend -- at one and two rows of 65536..65538 columns 10.7-11.2us against
+# 16.2-17.3us for `sampled` and 25.6-26.4us for the multi-block kernel.
 #
 # Past the few-row band plain declines and decode took those rows, which
 # `sampled` serves 1.47x--2.56x faster on every measured cell of 1..128 rows
@@ -221,10 +222,7 @@ _PLAIN_K2048_MAX_WIDTH = 131071
 # fallback, 25-31us flat, up to 1.32x decode's time. That follows the values,
 # not the shape: 3 of 480 seeded runs over the band (30 cells x 16 seeds), all
 # seed 0 at 106496 columns, which the other 15 seeds ran in 15-18us.
-_PLAIN_K2048_MULTIBLOCK_ROWS = 2
-_PLAIN_K2048_MULTIBLOCK_MIN_WIDTH = 65536
-# Mirrors `kTopkPlainGfx950AnyRowsMaxLen` in csrc/kernels/topk_per_row_kernels.cu.
-_PLAIN_K2048_ONEBLOCK_MAX_WIDTH = 80 * 1024
+#
 # Just past sampled's width door, plain's LDS-tail kernel still serves uniform
 # rows on gfx950 (one row per CU or more), and from 3000 rows on it beat
 # `sampled` at every measured cell of 3000..32768 rows and 131072..131840
@@ -582,6 +580,7 @@ def _available(
 def _choose(
     rows: int,
     width: int,
+    stride0: int,
     k: int,
     wave_size: int,
     ragged: bool,
@@ -607,23 +606,28 @@ def _choose(
             f"no backend serves rows={rows} width={width} topk={k} "
             f"tie={tie!r} deterministic={deterministic} fp32={fp32}"
         )
-    return topk_select_backend(rows, width, k, available, ragged=ragged, device=device)
-
-
-def _plain_k2048_multiblock(rows: int, width: int, ragged: bool) -> bool:
-    """Whether plain's gfx950 k=2048 dispatch takes its multi-block kernel here.
-
-    `plain_should_use_mulblocks` in csrc/kernels/topk_per_row_kernels.cu, for
-    the row counts this file can still route to plain (`_plain_takes` leaves
-    more than two rows to others before `should_use_mulblocks` turns to them).
-    Ragged rows reach the generic one-block kernel, so the one-block range does
-    not keep them.
-    """
-    return (
-        rows <= _PLAIN_K2048_MULTIBLOCK_ROWS
-        and width >= _PLAIN_K2048_MULTIBLOCK_MIN_WIDTH
-        and (ragged or width > _PLAIN_K2048_ONEBLOCK_MAX_WIDTH)
+    return topk_select_backend(
+        rows, width, k, available, ragged=ragged, device=device, stride0=stride0
     )
+
+
+@lru_cache(maxsize=1024)
+def _plain_multiblock(
+    rows: int, stride0: int, k: int, ragged: bool, device: int
+) -> bool:
+    """Whether plain's launcher takes its multi-block kernel for this call.
+
+    The launcher answers (`topk_plain_use_mulblocks`), through the predicate
+    its dispatch runs -- the reach of the gfx950 one-block kernels, the CU
+    count and the `TOPK_FORCE_PATH` / `TOPK_DISPATCH_FACTOR` overrides
+    included -- so the answer cannot drift from the kernel that runs.
+    `stride0` is the row length the launcher is handed: the width for uniform
+    rows, the row pitch for ragged ones. Asked only while a shape is being
+    routed, never per call, so the overrides are read once per shape.
+    `device` keys the memo per GPU, like `_sampled_supports_cached`; the
+    launcher itself reads the CU count and architecture once per process.
+    """
+    return bool(topk_plain_use_mulblocks(rows, stride0, k, ragged))
 
 
 def _plain_k2048_lds_tail_takes(rows: int, width: int, k: int) -> bool:
@@ -647,6 +651,7 @@ def _sampled_takes(
     yield_to_plain: bool = False,
     ragged: bool = False,
     device: int | None = None,
+    stride0: int | None = None,
 ) -> bool:
     """Total work past which `sampled` measured fastest of every backend here.
 
@@ -694,10 +699,11 @@ def _sampled_takes(
     kernels beat it there and on every other cell the work door took below the
     width door (200 against 268us at 4096x64K), so there the work door yields
     to plain's band when `yield_to_plain` -- uniform rows, plain available. The
-    doors added for that k point the other way: where plain's own dispatch goes
-    multi-block (`_plain_k2048_multiblock`), and the few-row band's rows past
-    its width, which decode served 1.47x-2.56x slower. See
-    `_PLAIN_K2048_MULTIBLOCK_ROWS`.
+    doors added for that k point the other way: rows in plain's band that its
+    own dispatch hands to its multi-block kernel (`_plain_multiblock`, asked at
+    `stride0`, the row pitch plain reads ragged rows at, which defaults to the
+    width), and the few-row band's rows past its width, which decode served
+    1.47x-2.56x slower. See `_PLAIN_K2048_LDS_TAIL_MIN_ROWS`.
 
     Nothing below `_SAMPLED_MIN_K`, whatever the shape: see its definition.
     """
@@ -706,11 +712,13 @@ def _sampled_takes(
     if device is None:
         device = torch.cuda.current_device()
     if k == 2048 and width < _SAMPLED_MIN_WIDTH and _device_arch(device) == "gfx950":
-        if _plain_k2048_multiblock(rows, width, ragged) or (
+        plain_band = _plain_takes(rows, width, k)
+        pitch = width if stride0 is None else stride0
+        if (plain_band and _plain_multiblock(rows, pitch, k, ragged, device)) or (
             rows <= _PLAIN_K2048_FEW_ROWS and width > _PLAIN_K2048_FEW_ROWS_MAX_WIDTH
         ):
             return _sampled_supports_cached(rows, width, k, device)
-        if yield_to_plain and _plain_takes(rows, width, k):
+        if yield_to_plain and plain_band:
             return False
     if not (rows * width >= _SAMPLED_MIN_WORK or width >= _SAMPLED_MIN_WIDTH):
         return False
@@ -769,12 +777,16 @@ def topk_select_backend(
     available: frozenset[str],
     ragged: bool = False,
     device: int | None = None,
+    stride0: int | None = None,
 ) -> str:
     """Name the backend to use for this shape among those that can serve it.
 
     `ragged` is whether the caller gave row ends. Ragged rows run plain's ranged
     form, so `sampled`'s work door does not yield to plain's gfx950 k=2048 band
-    for them; see `_PLAIN_K2048_MULTIBLOCK_ROWS`.
+    for them; see `_PLAIN_K2048_LDS_TAIL_MIN_ROWS`. That form reads a row-strided
+    view of more than one row in place, and `stride0` is then its row pitch,
+    which plain's launcher sizes its multi-block choice by; it defaults to the
+    width, the pitch every other call is read at.
 
     The shape of the answer: `plain` takes the many-row middle, where it is the
     only one that scales with rows rather than against them; the small-k selector
@@ -825,6 +837,7 @@ def topk_select_backend(
         yield_to_plain="plain" in available and not ragged,
         ragged=ragged,
         device=device,
+        stride0=stride0,
     ):
         return "sampled"
     if "plain" in available and _plain_takes(rows, width, k):
@@ -855,7 +868,11 @@ def _reject_unsupported(
     sorted,
     sorted_index,
 ):
-    """Refuse what this cannot do, rather than quietly doing something else."""
+    """Refuse what this cannot do, rather than quietly doing something else.
+
+    Returns `input.stride()`, which the entry also routes on: read once, as the
+    tuple measured 70ns a call and `input.stride(dim)` 143ns each.
+    """
     if begin is not None:
         raise NotImplementedError("`begin` is not supported (nor is it in DeepSelect)")
     if hint is not None:
@@ -876,7 +893,8 @@ def _reject_unsupported(
             f"{input.dtype} is served only at topk=1, the reduction; got "
             f"topk={topk}. Cast to float32 for a wider selection."
         )
-    if input.stride(1) != 1:
+    strides = input.stride()
+    if strides[1] != 1:
         raise ValueError("input must have inner stride 1")
     if indices_type is not torch.int32:
         raise NotImplementedError(
@@ -904,6 +922,7 @@ def _reject_unsupported(
             "sorted=True and sorted_index=True ask for two different orderings "
             "of the same (value, index) pairs; pick one"
         )
+    return strides
 
 
 def topk_select(
@@ -1015,7 +1034,7 @@ def topk_select(
     Returns:
         ``(values, indices)``; ``values`` is None when ``return_value`` is False.
     """
-    _reject_unsupported(
+    strides = _reject_unsupported(
         input=input,
         topk=topk,
         indices_type=indices_type,
@@ -1053,9 +1072,15 @@ def topk_select(
         # caller's buffer at the end, like a reordered one.
         idx = torch.empty((rows, topk), dtype=torch.int32, device=input.device)
 
+    # The row pitch plain reads at: `topk_plain` reads ragged rows of a
+    # row-strided view in place, and every other call width apart.
+    stride0 = width
+    if end is not None and rows > 1 and strides[0] > width:
+        stride0 = strides[0]
     backend = _choose(
         rows,
         width,
+        stride0,
         topk,
         wave_size_of(input.device.index),
         end is not None,

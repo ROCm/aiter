@@ -30,6 +30,12 @@ def _topk_plain(
 
 
 @compile_ops("module_topk_plain")
+def topk_plain_use_mulblocks(
+    numRows: int, stride0: int, k: int, ragged: bool
+) -> bool: ...
+
+
+@compile_ops("module_topk_plain")
 def topk_plain_workspace_size(numRows: int, stride0: int, k: int) -> int: ...
 
 
