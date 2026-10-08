@@ -174,6 +174,8 @@ def main():
     cache_value = os.getenv("FLYDSL_RUNTIME_CACHE_DIR")
     cache_dir = Path(cache_value) if cache_value else None
     cache_existed = cache_dir.is_dir() if cache_dir is not None else False
+    aiter_cache_value = os.getenv("AITER_JIT_DIR")
+    aiter_cache_dir = Path(aiter_cache_value) if aiter_cache_value else None
     report = {
         "environment": {
             "python": sys.executable,
@@ -189,6 +191,10 @@ def main():
             "triton_gemm_module": importlib.import_module(
                 "aiter.ops.triton.gemm.basic.gemm_a8w8"
             ).__file__,
+            "aiter_jit_dir": aiter_cache_value,
+            "aiter_jit_dir_existed_before_run": (
+                aiter_cache_dir.is_dir() if aiter_cache_dir is not None else False
+            ),
             "flydsl_runtime_cache_dir": cache_value,
             "flydsl_runtime_cache_dir_existed_before_run": cache_existed,
             "input_seed": 4340,
