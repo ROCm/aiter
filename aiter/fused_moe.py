@@ -56,7 +56,7 @@ from aiter.ops.opus import moe_stage2_a8w4 as _opus_a8w4
 from aiter.ops.opus.moe_stage1_a8w4 import (
     opus_a8w4_stage1_wrapper as _opus_a8w4_stage1_wrapper,
 )
-from aiter.utility.graph_alloc import persistent_alloc
+from aiter.utility.graph_alloc import ROUTES_INSIDE_CAPTURE, persistent_alloc
 
 
 @functools.lru_cache(maxsize=1)
@@ -121,11 +121,15 @@ _FLYDSL_STAGE1_OUT_CACHE: dict[
 def _get_flydsl_stage1_out(
     shape: tuple[int, int],
     device: torch.device,
-) -> torch.Tensor:
+) -> torch.Tensor | None:
     stream = torch.cuda.current_stream(device=device).cuda_stream
     key = (device, stream, shape)
     out = _FLYDSL_STAGE1_OUT_CACHE.get(key)
     if out is None:
+        # Before torch 2.10 a capture cannot allocate outside its graph pool, so a
+        # miss there returns None and stage1 allocates per call as it did before.
+        if not ROUTES_INSIDE_CAPTURE and torch.cuda.is_current_stream_capturing():
+            return None
         with persistent_alloc(device):
             out = torch.empty(shape, dtype=dtypes.fp8, device=device)
         _FLYDSL_STAGE1_OUT_CACHE[key] = out
