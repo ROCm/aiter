@@ -1230,3 +1230,214 @@ def _fused_qk_rope_cosine_cache_llama_kernel(
                     + pid_b * value_cache_stride_b
                 )
                 tl.store(v_out_ptrs, v.to(value_cache_ptr.dtype.element_ty))
+
+
+@triton.jit
+def _rope_pe_tile(
+    x,
+    cos,
+    sin,
+    d_pe_offs,
+    IS_NEOX: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_D_pe: tl.constexpr,
+    BLOCK_D_HALF_pe: tl.constexpr,
+):
+    """RoPE on a loaded [BLOCK_H, BLOCK_D_pe] tile with per-token 1D cos/sin."""
+    if IS_NEOX:
+        x_rotated = _get_neox_rotated_x(
+            x,
+            (d_pe_offs < BLOCK_D_HALF_pe)[None, :],
+            BLOCK_H,
+            BLOCK_D_pe,
+            BLOCK_D_HALF_pe,
+        )
+    else:
+        x_rotated = _get_gptj_rotated_x(
+            x, (d_pe_offs % 2 == 0)[None, :], BLOCK_H, BLOCK_D_pe, BLOCK_D_HALF_pe
+        )
+    return x * cos[None, :] + x_rotated * sin[None, :]
+
+
+_fused_qpe_rope_and_cache_mla_kernel_repr = make_kernel_repr(
+    "_fused_qpe_rope_and_cache_mla_kernel",
+    [
+        "QH",
+        "BLOCK_H",
+        "BLOCK_D_nope",
+        "BLOCK_D_pe",
+        "BLOCK_SIZE",
+        "REUSE_FREQS_FRONT_PART",
+        "IS_NEOX",
+        "SHUFFLED_KV_CACHE",
+        "HAVE_K_SCALE",
+    ],
+)
+
+
+@triton.jit(repr=_fused_qpe_rope_and_cache_mla_kernel_repr)
+def _fused_qpe_rope_and_cache_mla_kernel(
+    q_pe_ptr,
+    k_nope_ptr,
+    k_pe_ptr,
+    pos_ptr,
+    cos_ptr,
+    sin_ptr,
+    q_out_ptr,
+    k_pe_out_ptr,
+    kv_cache_ptr,
+    slot_mapping_ptr,
+    B,
+    q_pe_stride_b,
+    q_pe_stride_h,
+    q_pe_stride_d,
+    k_nope_stride_b,
+    k_nope_stride_d,
+    k_pe_stride_b,
+    k_pe_stride_d,
+    pos_stride_b,
+    cos_stride_b,
+    cos_stride_d,
+    q_out_stride_b,
+    q_out_stride_h,
+    q_out_stride_d,
+    k_pe_out_stride_b,
+    k_pe_out_stride_d,
+    kv_cache_stride_b,
+    kv_cache_stride_h,
+    kv_cache_stride_d,
+    k_scale_ptr,
+    QH: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    REUSE_FREQS_FRONT_PART: tl.constexpr,
+    IS_NEOX: tl.constexpr,
+    BLOCK_D_nope: tl.constexpr,
+    BLOCK_D_pe: tl.constexpr,
+    BLOCK_D_HALF_pe: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr = 1,
+    SHUFFLED_KV_CACHE: tl.constexpr = False,
+    SCALE_K_WIDTH_NOPE: tl.constexpr = 4,
+    SCALE_K_WIDTH_ROPE: tl.constexpr = 4,
+    HAVE_K_SCALE: tl.constexpr = False,
+    UPCAST_OPERAND: tl.constexpr = False,
+):
+    """q_nope-prestored variant of _fused_qk_rope_cat_and_cache_mla_kernel (KH == 1).
+
+    q_out[..., :BLOCK_D_nope] was already written by the q_nope producer, so a
+    program only ropes a BLOCK_H-head tile of q_pe into q_out[..., BLOCK_D_nope:]
+    for one token; head block 0 also writes k into the KV cache (roping k_pe
+    for tokens < B). Grid: (B_slot, cdiv(QH, BLOCK_H)). Tokens >= B carry k only.
+    """
+    pid_b = tl.program_id(0)
+    pid_h = tl.program_id(1)
+
+    if pid_b >= B and pid_h > 0:
+        return
+
+    d_pe_offs = tl.arange(0, BLOCK_D_pe).to(tl.int64)
+    if REUSE_FREQS_FRONT_PART:
+        if IS_NEOX:
+            d_cos_offs = tl.where(
+                d_pe_offs >= BLOCK_D_HALF_pe, d_pe_offs - BLOCK_D_HALF_pe, d_pe_offs
+            ).to(d_pe_offs.dtype)
+        else:
+            d_cos_offs = d_pe_offs // 2
+    else:
+        d_cos_offs = d_pe_offs
+
+    pos = tl.load(pos_ptr + pid_b * pos_stride_b)
+    cos_offs = pos * cos_stride_b + d_cos_offs * cos_stride_d
+    cos = tl.load(cos_ptr + cos_offs)
+    sin = tl.load(sin_ptr + cos_offs)
+    if UPCAST_OPERAND:
+        cos = cos.to(tl.float32)
+        sin = sin.to(tl.float32)
+
+    if pid_b < B:
+        h_offs = (pid_h * BLOCK_H + tl.arange(0, BLOCK_H)).to(tl.int64)
+        h_mask = h_offs < QH
+        q_pe = tl.load(
+            q_pe_ptr
+            + pid_b * q_pe_stride_b
+            + h_offs[:, None] * q_pe_stride_h
+            + d_pe_offs[None, :] * q_pe_stride_d,
+            mask=h_mask[:, None],
+            other=0.0,
+        )
+        q_pe = _rope_pe_tile(
+            q_pe, cos, sin, d_pe_offs, IS_NEOX, BLOCK_H, BLOCK_D_pe, BLOCK_D_HALF_pe
+        )
+        tl.store(
+            q_out_ptr
+            + pid_b * q_out_stride_b
+            + h_offs[:, None] * q_out_stride_h
+            + (d_pe_offs[None, :] + BLOCK_D_nope) * q_out_stride_d,
+            q_pe.to(q_out_ptr.dtype.element_ty),
+            mask=h_mask[:, None],
+        )
+
+    if pid_h == 0:
+        pid_slot = tl.load(slot_mapping_ptr + pid_b).to(tl.int64)
+        if pid_slot >= 0:
+            if BLOCK_SIZE > 1:
+                pid_t_slot = pid_slot // BLOCK_SIZE
+                pid_blk = pid_slot % BLOCK_SIZE
+            else:
+                pid_t_slot = pid_slot
+                pid_blk = 0
+            d_nope_offs = tl.arange(0, BLOCK_D_nope).to(tl.int64)
+            k_nope = tl.load(
+                k_nope_ptr + pid_b * k_nope_stride_b + d_nope_offs * k_nope_stride_d
+            )
+            k_pe = tl.load(k_pe_ptr + pid_b * k_pe_stride_b + d_pe_offs * k_pe_stride_d)
+            if pid_b < B:
+                # Rope k_pe in fp32 (then round to its dtype) to keep the KV
+                # cache at least as accurate as the 1-warp kernel's rope. Tokens
+                # >= B (k-only) are cached as given, like the 1-warp kernel.
+                k_pe_f32 = k_pe.to(tl.float32)
+                if IS_NEOX:
+                    k_pe_rotated = _get_neox_rotated_x_1D(
+                        k_pe_f32,
+                        d_pe_offs < BLOCK_D_HALF_pe,
+                        BLOCK_D_pe,
+                        BLOCK_D_HALF_pe,
+                    )
+                else:
+                    k_pe_rotated = _get_gptj_rotated_x_1D(
+                        k_pe_f32, d_pe_offs % 2 == 0, BLOCK_D_pe, BLOCK_D_HALF_pe
+                    )
+                k_pe = (
+                    k_pe_f32 * cos.to(tl.float32) + k_pe_rotated * sin.to(tl.float32)
+                ).to(k_pe_ptr.dtype.element_ty)
+            tl.store(
+                k_pe_out_ptr
+                + pid_b * k_pe_out_stride_b
+                + d_pe_offs * k_pe_out_stride_d,
+                k_pe.to(k_pe_out_ptr.dtype.element_ty),
+            )
+            if HAVE_K_SCALE:
+                k_scale = tl.load(k_scale_ptr)
+            else:
+                k_scale = 1.0
+            k_scale_rcprl = (1 / k_scale).to(tl.float32)
+            k_nope = k_nope.to(tl.float32) * k_scale_rcprl
+            k_pe = k_pe.to(tl.float32) * k_scale_rcprl
+            _store_mla_kv_cache(
+                kv_cache_ptr,
+                pid_t_slot,
+                0,
+                pid_blk,
+                d_nope_offs,
+                d_pe_offs,
+                kv_cache_stride_b,
+                kv_cache_stride_h,
+                kv_cache_stride_d,
+                k_nope,
+                k_pe,
+                BLOCK_D_nope,
+                BLOCK_D_pe,
+                BLOCK_SIZE,
+                SHUFFLED_KV_CACHE,
+                SCALE_K_WIDTH_NOPE,
+                SCALE_K_WIDTH_ROPE,
+            )
