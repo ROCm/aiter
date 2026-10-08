@@ -28,10 +28,24 @@ If you have built gemm_a8w8 kernels before tuning new GEMM shapes, please add `A
 
 ### FlyDSL FP8 blockscale (gfx950)
 
-The existing tuner also accepts `--libtype flydsl`. Use `--libtype all` to race
-FlyDSL against the existing supported CK, CKTile, ASM and Opus candidates;
-`--libtype both` retains its original CK/CKTile-only meaning. Add `--preshuffle`
-for the B-preshuffled operator and select its output CSV with `-o`.
+Select `--libtype flydsl --scale-dtype fp32` for the FP32-scale 8-wave kernels.
+Use `--libtype all --scale-dtype fp32` to race them against the existing
+supported CK, CKTile, ASM and Opus candidates; `--libtype both` retains its
+FP32 CK/CKTile-only meaning. Add `--preshuffle` for B-preshuffled weights.
+
+Scale format selects the existing config family; it is not a new CSV column:
+
+| Scale dtype | B layout | Default output |
+|---|---|---|
+| `fp32` | plain | [a8w8_blockscale_tuned_gemm.csv](../../aiter/configs/a8w8_blockscale_tuned_gemm.csv) |
+| `fp32` | `--preshuffle` | [a8w8_blockscale_bpreshuffle_tuned_gemm.csv](../../aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv) |
+| `e8m0` | `--preshuffle` required | [a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm.csv](../../aiter/configs/a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm.csv) |
+
+For compatibility, omitting `--scale-dtype` keeps the upstream default: `flydsl`
+means E8M0 MXScale, while other backend groups mean FP32. The E8M0 mode accepts
+`--libtype flydsl` or `all`, uses the upstream shuffled-scale MXScale kernels,
+and preserves the table's existing `bmm` rows. `all` never mixes FP32 and E8M0
+candidates. Custom `-o` paths are retained; use a separate output per contract.
 
 - The public `gemm_a8w8_blockscale` and `gemm_a8w8_blockscale_bpreshuffle` APIs
   keep their signatures and default backends. A winning row with
@@ -75,7 +89,8 @@ for the B-preshuffled operator and select its output CSV with `-o`.
   table remain separate. The existing gfx1250 MXFP8_128 path is unaffected.
 
 Use `-o2` to retain every candidate result, and `--run_config` with the resulting
-CSV (plus `--preshuffle` for that layout) to validate the production dispatch.
+CSV, the same `--scale-dtype`, and `--preshuffle` for that layout to validate
+the production dispatch.
 Prefer scratch output CSVs for experiments rather than overwriting existing
 model configurations. Before promoting winners, check for duplicate shape keys
 across the canonical and model-specific config files.

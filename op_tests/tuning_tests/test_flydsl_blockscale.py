@@ -134,7 +134,7 @@ def test_gfx1250_mxfp8_route_unchanged():
     config = {"libtype": "flydsl", "kernelName": "existing_mxfp8_128"}
     with (
         patch.object(ops, "get_gfx", return_value="gfx1250"),
-        patch.object(ops, "get_CKGEMM_config", return_value=config),
+        patch.object(ops, "get_mxscale_bpreshuffle_config", return_value=config),
         patch.object(
             ops, "gemm_a8w8_mxfp8_128_bpreshuffle_flydsl", return_value=out
         ) as existing,
@@ -398,6 +398,7 @@ def test_adapter_preserves_matrix_rank_for_large_address_abi(
 def test_tuner_tasks_and_result_roundtrip(tuner_module, catalog, preshuffle):
     cls = tuner_module.GemmA8W8BlockScaleTuner
     tuner = cls.__new__(cls)
+    tuner._mxscale = False
     tuner.keys = ["gfx", "cu_num", "M", "N", "K"]
     tuner.columns = tuner.keys + [
         "libtype",
@@ -411,7 +412,9 @@ def test_tuner_tasks_and_result_roundtrip(tuner_module, catalog, preshuffle):
     ]
     tuner.topk = 1
     shape = ("gfx950", 256, 33, 384, 512)
-    tasks = tuner.get_gemm_a8w8_blockscale_flydsl_tune_task(shape, 0, preshuffle, {})
+    tasks = tuner.get_gemm_a8w8_blockscale_fp32_flydsl_tune_task(
+        shape, 0, preshuffle, {}
+    )
     assert len(tasks) == 1
     assert tasks[0][0][1] == int(preshuffle)
     for old_id in (2, 6):
@@ -422,7 +425,7 @@ def test_tuner_tasks_and_result_roundtrip(tuner_module, catalog, preshuffle):
         assert libtype == "flydsl" and split_k == 0 and ps == preshuffle
         assert catalog.kernels_list[kernel_id].name == name
         assert tuner.getKernelName(kernel_id, libtype, preshuffle) == name
-        assert task[3] is tuner_module.run_gemm_a8w8_blockscale_flydsl
+        assert task[3] is tuner_module.run_gemm_a8w8_blockscale_fp32_flydsl
         assert task[4][0][1:3] == (
             ["weight_shuffle", "x_scale_t"] if preshuffle else ["weight", "x_scale"]
         )
@@ -432,7 +435,7 @@ def test_tuner_tasks_and_result_roundtrip(tuner_module, catalog, preshuffle):
     assert df.iloc[0]["kernelName"] == tasks[0][0][3]
     assert df.iloc[0]["libtype"] == "flydsl"
     assert (
-        tuner.get_gemm_a8w8_blockscale_flydsl_tune_task(
+        tuner.get_gemm_a8w8_blockscale_fp32_flydsl_tune_task(
             ("gfx942", *shape[1:]), 0, preshuffle, {}
         )
         == []
@@ -448,6 +451,7 @@ def test_tuner_includes_backend_without_changing_both(
     tuner = tuner_module.GemmA8W8BlockScaleTuner.__new__(
         tuner_module.GemmA8W8BlockScaleTuner
     )
+    tuner._mxscale = False
     args = SimpleNamespace(
         splitK=False,
         mp=1,
@@ -458,6 +462,7 @@ def test_tuner_includes_backend_without_changing_both(
         warmup=1,
         iters=3,
         libtype=libtype,
+        scale_dtype="fp32",
         timeout=30,
         verbose=False,
     )
@@ -472,7 +477,7 @@ def test_tuner_includes_backend_without_changing_both(
         patch.object(tuner, "get_gemm_a8w8_blockscale_asm_tune_task", return_value=[]),
         patch.object(tuner, "get_gemm_a8w8_blockscale_opus_tune_task", return_value=[]),
         patch.object(
-            tuner, "get_gemm_a8w8_blockscale_flydsl_tune_task", return_value=[]
+            tuner, "get_gemm_a8w8_blockscale_fp32_flydsl_tune_task", return_value=[]
         ) as flydsl,
     ):
         assert tuner.tune(shapes, pd.DataFrame(), args) == []
@@ -550,7 +555,7 @@ def test_missing_flydsl_tuner_skips_candidates(tuner_module):
         {"aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_common": None},
     ):
         assert (
-            tuner.get_gemm_a8w8_blockscale_flydsl_tune_task(
+            tuner.get_gemm_a8w8_blockscale_fp32_flydsl_tune_task(
                 ("gfx950", 256, 256, 256, 512), 0, False, {}
             )
             == []
