@@ -316,7 +316,11 @@ e8m0_shapes = (
     if args.m or args.n
     else E8M0_SHAPES
 )
+_skip_fp4_e8m0 = get_gfx() == "gfx942"
 for key in [k for k in args.quant if k in d_quant_e8m0]:
+    if _skip_fp4_e8m0 and d_quant_e8m0[key] == dtypes.fp4x2:
+        aiter.logger.info("Skipping %s on gfx942 (no HW fp4 convert)", key)
+        continue
     df = []
     for h_dtype, (m, n), shuffle, strided in itertools.product(
         args.dtype, e8m0_shapes, [True, False], [False, True]
