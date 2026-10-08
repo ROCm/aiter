@@ -361,8 +361,20 @@ class KVLoader:
                 + self.kv_head_idx * self.stride_k_cache_1
                 + self.offs_shfl
             )
+        elif cfg.NUM_SLOTS > 1:
+            # whole pages, flattened in the one-page [HEAD_SIZE // W, TILE, W] order
+            W: tl.constexpr = cfg.K_WIDTH
+            offset = (
+                (
+                    block_idx * self.stride_k_cache_0
+                    + self.kv_head_idx * self.stride_k_cache_1
+                )[None, :, None]
+                + tl.arange(0, cfg.HEAD_SIZE_PADDED // W)[:, None, None]
+                * (cfg.BLOCK_SIZE * W)
+                + tl.arange(0, cfg.BLOCK_SIZE * W)[None, None, :]
+            ).reshape(cfg.TILE_SIZE * cfg.HEAD_SIZE_PADDED)
         else:
-            # per slot, HEAD_SIZE // W runs of SLOT_SIZE * W elements
+            # part of one page: HEAD_SIZE // W runs of TILE_SIZE * W elements
             W: tl.constexpr = cfg.K_WIDTH
             in_page = self.slot_start(j) % cfg.BLOCK_SIZE
             offset = (
@@ -392,24 +404,18 @@ class KVLoader:
                 + self.kv_head_idx * self.stride_v_cache_1
                 + self.offs_shfl
             )
-        elif cfg.NUM_SLOTS > 1 and cfg.BLOCK_SIZE > cfg.K_WIDTH:
-            # whole pages of several [HEAD_SIZE, W] rows: keeping the rows axis
-            # lets the un-shuffle merge pages instead of splitting a page-long
-            # axis, so every lane still reads a contiguous W-run
-            W: tl.constexpr = cfg.K_WIDTH
+        elif cfg.NUM_SLOTS > 1:
+            # whole pages, flattened: concatenated pages are the one-page
+            # [TILE // W, HEAD_SIZE, W] order
             offset = (
-                block_idx * self.stride_v_cache_0
-                + self.kv_head_idx * self.stride_v_cache_1
-            )[:, None, None, None] + (
-                tl.arange(0, cfg.BLOCK_SIZE // W)[None, :, None, None]
-                * self.stride_v_cache_2
-                + tl.arange(0, cfg.HEAD_SIZE_PADDED)[None, None, :, None]
-                * cfg.stride_v_cache_3
-                + tl.arange(0, W)[None, None, None, :]
-            )
+                (
+                    block_idx * self.stride_v_cache_0
+                    + self.kv_head_idx * self.stride_v_cache_1
+                )[:, None]
+                + tl.arange(0, cfg.BLOCK_SIZE * cfg.HEAD_SIZE_PADDED)[None, :]
+            ).reshape(cfg.TILE_SIZE * cfg.HEAD_SIZE_PADDED)
         else:
-            # part of one page, or whole pages of a single [HEAD_SIZE, W] row:
-            # one run of SLOT_SIZE * HEAD_SIZE_PADDED elements per slot
+            # part of one page: a single run of TILE_SIZE * HEAD_SIZE_PADDED elements
             in_page = self.slot_start(j) % cfg.BLOCK_SIZE
             offset = (
                 block_idx * self.stride_v_cache_0
@@ -429,7 +435,14 @@ class KVLoader:
             else:
                 mask = self.dim_mask[:, None] & tile_mask[None, :]
         elif cfg.NUM_SLOTS > 1:
-            mask = self.slot_mask(j)[:, None, None]
+            mask = tl.broadcast_to(
+                self.slot_mask(j)[None, :, None],
+                (
+                    cfg.HEAD_SIZE_PADDED // cfg.K_WIDTH,
+                    cfg.NUM_SLOTS,
+                    cfg.BLOCK_SIZE * cfg.K_WIDTH,
+                ),
+            ).reshape(cfg.TILE_SIZE * cfg.HEAD_SIZE_PADDED)
         return mask
 
     @triton.jit
@@ -442,10 +455,11 @@ class KVLoader:
                 mask = self.v_dim_mask[None, :]
             else:
                 mask = self.v_dim_mask[None, :] & tile_mask[:, None]
-        elif cfg.NUM_SLOTS > 1 and cfg.BLOCK_SIZE > cfg.K_WIDTH:
-            mask = self.slot_mask(j)[:, None, None, None]
         elif cfg.NUM_SLOTS > 1:
-            mask = self.slot_mask(j)[:, None]
+            mask = tl.broadcast_to(
+                self.slot_mask(j)[:, None],
+                (cfg.NUM_SLOTS, cfg.BLOCK_SIZE * cfg.HEAD_SIZE_PADDED),
+            ).reshape(cfg.TILE_SIZE * cfg.HEAD_SIZE_PADDED)
         return mask
 
     @triton.jit
@@ -461,7 +475,7 @@ class KVLoader:
             )
         K = K.to(target_dtype)
 
-        if cfg.SHUFFLED_KV_CACHE and cfg.NUM_SLOTS == 1:
+        if cfg.SHUFFLED_KV_CACHE:
             K = (
                 K.reshape(
                     cfg.HEAD_SIZE_PADDED // cfg.K_WIDTH,
@@ -469,18 +483,6 @@ class KVLoader:
                     cfg.K_WIDTH,
                 )
                 .permute(1, 0, 2)
-                .reshape(cfg.TILE_SIZE, cfg.HEAD_SIZE_PADDED)
-                .trans(1, 0)
-            )
-        elif cfg.SHUFFLED_KV_CACHE:
-            K = (
-                K.reshape(
-                    cfg.NUM_SLOTS,
-                    cfg.HEAD_SIZE_PADDED // cfg.K_WIDTH,
-                    cfg.SLOT_SIZE,
-                    cfg.K_WIDTH,
-                )
-                .permute(0, 2, 1, 3)
                 .reshape(cfg.TILE_SIZE, cfg.HEAD_SIZE_PADDED)
                 .trans(1, 0)
             )
