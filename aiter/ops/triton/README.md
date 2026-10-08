@@ -18,7 +18,7 @@ both that file and this README in the same PR, so the two stay current.
 ```text
 aiter/ops/triton/
 ├── __init__.py            # public API + _BACKWARD_COMPAT_MAP (legacy flat imports)
-├── gemm/                  # GEMM wrappers: basic/, batched/, feed_forward/, fused/
+├── gemm/                  # GEMM wrappers: basic/, batched/, feed_forward/, fused/, grouped/
 ├── attention/             # MHA, MLA, lean attention, unified attention, ...
 ├── moe/                   # Mixture-of-experts ops
 ├── normalization/         # RMSNorm / LayerNorm and fused add+norm variants
@@ -110,11 +110,11 @@ Rules that follow from the layout:
   instead of silently resolving somewhere else.
 - Moves and renames go in a pure `git mv` commit (100% rename similarity),
   with content changes in a follow-up.
-- `kpack` is deprecated on CDNA4: the Triton AMD backend warns and
-  force-overrides `kpack = 1` on gfx950, and the parameter is slated for
-  removal. No gfx950 config carries it and none should; gfx942 configs still
-  may. Existing `kpack` entries in the RDNA trees predate the rule — do not
-  add new ones.
+- `kpack` belongs in gfx942 configs only. The Triton AMD backend deprecates it
+  on CDNA4 — it warns and force-overrides `kpack = 1` on gfx950, and the
+  parameter is slated for removal — gfx1250 does not support it, and on the
+  RDNA targets (gfx11xx, gfx120x) it is a no-op. No other arch's tree carries
+  it; do not add it to one.
 
 All of it is built by one function in `utils/config_utils.py`:
 

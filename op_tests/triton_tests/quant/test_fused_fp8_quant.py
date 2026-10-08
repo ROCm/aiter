@@ -582,7 +582,17 @@ def generate_fused_reduce_rms_quant_data(M, N1, N2, N3, SPK, dtype=torch.bfloat1
 
 @pytest.mark.parametrize("M", [1, 32, 256, 8192])
 @pytest.mark.parametrize(
-    "N1, N2, N3", [(128, 128, 128), (1536, 512, 64), (7168, 7168, 7168)]
+    "N1, N2, N3",
+    [
+        (128, 128, 128),
+        (1536, 512, 64),
+        (7168, 7168, 7168),
+        # N2 != N1 with non-power-of-2 N2 (inp2 needs its own column mask)
+        (128, 192, 64),
+        (256, 192, 64),
+        (1536, 576, 64),
+        (1536, 7168, 64),
+    ],
 )
 @pytest.mark.parametrize("SPK", [1, 4, 14])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
