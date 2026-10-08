@@ -1,0 +1,3 @@
+qn,ts_qo,knl_name,co_name
+1,256,_ZN5aiter30fmha_fwd_qnorm_rope_hd128_bf16E,fwd_qnorm_rope_hd128_bf16.co
+0,256,_ZN5aiter35fmha_fwd_qnorm_rope_noqn_hd128_bf16E,fwd_qnorm_rope_noqn_hd128_bf16.co

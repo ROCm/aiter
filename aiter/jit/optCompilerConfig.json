@@ -453,6 +453,18 @@
         "torch_exclude": "True",
         "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py -m f6f4gemm --output_dir {{}}'"
     },
+    "module_fmha_v3_fwd_qnorm_rope_asm": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_fmha_fwd_qnorm_rope.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_fwd_qnorm_rope --output_dir {{}}'"
+    },
     "module_adaln_gemm_asm": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_adaln_gemm.cu'"
