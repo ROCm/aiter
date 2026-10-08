@@ -392,8 +392,24 @@ class KVLoader:
                 + self.kv_head_idx * self.stride_v_cache_1
                 + self.offs_shfl
             )
+        elif cfg.NUM_SLOTS > 1 and cfg.BLOCK_SIZE > cfg.K_WIDTH:
+            # whole pages of several [HEAD_SIZE, W] rows: keeping the rows axis
+            # lets the un-shuffle merge pages instead of splitting a page-long
+            # axis, so every lane still reads a contiguous W-run
+            W: tl.constexpr = cfg.K_WIDTH
+            offset = (
+                block_idx * self.stride_v_cache_0
+                + self.kv_head_idx * self.stride_v_cache_1
+            )[:, None, None, None] + (
+                tl.arange(0, cfg.BLOCK_SIZE // W)[None, :, None, None]
+                * self.stride_v_cache_2
+                + tl.arange(0, cfg.HEAD_SIZE_PADDED)[None, None, :, None]
+                * cfg.stride_v_cache_3
+                + tl.arange(0, W)[None, None, None, :]
+            )
         else:
-            # per slot, one run of SLOT_SIZE * HEAD_SIZE_PADDED elements
+            # part of one page, or whole pages of a single [HEAD_SIZE, W] row:
+            # one run of SLOT_SIZE * HEAD_SIZE_PADDED elements per slot
             in_page = self.slot_start(j) % cfg.BLOCK_SIZE
             offset = (
                 block_idx * self.stride_v_cache_0
@@ -426,6 +442,8 @@ class KVLoader:
                 mask = self.v_dim_mask[None, :]
             else:
                 mask = self.v_dim_mask[None, :] & tile_mask[:, None]
+        elif cfg.NUM_SLOTS > 1 and cfg.BLOCK_SIZE > cfg.K_WIDTH:
+            mask = self.slot_mask(j)[:, None, None, None]
         elif cfg.NUM_SLOTS > 1:
             mask = self.slot_mask(j)[:, None]
         return mask
