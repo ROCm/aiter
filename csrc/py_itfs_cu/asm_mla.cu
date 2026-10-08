@@ -826,6 +826,11 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
 
     if (kv_dtype != AITER_DTYPE_i8 && kv_dtype != AITER_DTYPE_u8) {
         AITER_CHECK(head_size == KV->size(3), __func__, ":only support head_size == KV.size(3) for now");
+    } else {
+        AITER_CHECK(KV->dim() == 2 && KV->size(1) == int64_t(page_size) * 656, __func__,
+                    ": byte KV must be [num_page, page_size * 656] (512 fp8 latent + 4 fp32 scales + "
+                    "64 bf16 RoPE per token), got a ", KV->dim(), "-D KV with size(1) ", KV->size(1),
+                    " for page_size ", page_size);
     }
     // The decode kernels are built for DeepSeek's MLA row (512 latent + 64 RoPE) and take
     // no head size, so a narrower row is read past its end instead of being rejected.
