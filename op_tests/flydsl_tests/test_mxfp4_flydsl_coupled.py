@@ -72,12 +72,17 @@ def check_mxfp8_input(data, token, model_dim, expert, topk, block_m, dtype):
     error = checkAllclose(
         data["input"].float(),
         reconstructed,
-        rtol=0.05,
+        # E4M3 rounds by up to half one 3-bit mantissa step (1/16).
+        rtol=0.0625,
         atol=0.01,
         tol_err_ratio=0,
         msg="MXFP8 A payload + E8M0 scales",
     )
     assert error == 0
+    input_error = cosine_diff_compare(
+        data["input"], reconstructed, msg="MXFP8 input quantization"
+    )
+    assert math.isfinite(input_error) and input_error < 0.005
     assert torch.unique(scale.view(torch.uint8)).numel() > 1
 
     sti, sw, _, nvi, _, _, _ = moe_sorting(
