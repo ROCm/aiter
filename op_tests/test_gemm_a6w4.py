@@ -333,6 +333,16 @@ def test_a6w4_asm_rejects_malformed_or_misaligned_buffers():
     misaligned_x.copy_(x_packed)
     with pytest.raises(RuntimeError, match="aligned to 16 bytes"):
         gemm_a6w4_asm(misaligned_x, w_packed, x_scales, w_scales, out, K)
+    with pytest.raises(RuntimeError, match="requested physical shape"):
+        gemm_a6w4_asm(
+            x_packed,
+            w_packed,
+            x_scales,
+            w_scales,
+            out,
+            K,
+            SPECIALIZED_SQUARE_KERNEL,
+        )
 
 
 def test_mxfp4_compile_launch_avoids_device_context(

@@ -327,6 +327,16 @@ def test_a4w6_asm_rejects_malformed_or_misaligned_buffers():
     misaligned_x.copy_(x_packed)
     with pytest.raises(RuntimeError, match="aligned to 16 bytes"):
         gemm_a4w6_asm(misaligned_x, w_packed, x_scales, w_scales, out, K)
+    with pytest.raises(RuntimeError, match="requested physical shape"):
+        gemm_a4w6_asm(
+            x_packed,
+            w_packed,
+            x_scales,
+            w_scales,
+            out,
+            K,
+            SPECIALIZED_UP_KERNEL,
+        )
 
 
 @torch.no_grad()
