@@ -174,9 +174,17 @@ class TestCoupledTuningResults(unittest.TestCase):
     ):
         pd.DataFrame(rows, columns=KEYS).to_csv(self.input_file, index=False)
         if existing_rows is not None:
-            pd.DataFrame(existing_rows, columns=KEYS + RESULT_COLUMNS).to_csv(
-                self.output_file, index=False
+            old_results = pd.DataFrame(existing_rows)
+            columns = (
+                KEYS
+                + RESULT_COLUMNS
+                + [
+                    column
+                    for column in old_results
+                    if column not in KEYS + RESULT_COLUMNS
+                ]
             )
+            old_results.reindex(columns=columns).to_csv(self.output_file, index=False)
         tuner_class = tuner_class or _controlled_tuner_class(self.module)
         tuner = tuner_class("test", KEYS, RESULT_COLUMNS)
         args = tuner.parser.parse_args(
@@ -458,6 +466,174 @@ class TestCoupledTuningResults(unittest.TestCase):
         failures = pd.read_csv(self.output_file.with_suffix(".failed_shapes.csv"))
         self.assertTrue(failures.empty)
         self.assertEqual(failures.columns.tolist(), KEYS + ["status", "failure_reason"])
+        self.assertEqual(pd.read_csv(self.output_file)["us"].tolist(), [7.0])
+
+    def test_accepted_aliases_save_canonical_runtime_keys_and_deduplicate(self):
+        aliases = _input_row()
+        aliases.update(
+            dtype="bf16",
+            q_dtype_a="fp4x2",
+            q_dtype_w="fp4x2",
+            q_type="per_1x32",
+            act_type="silu",
+            use_g1u1="true",
+            doweight_stage1="false",
+        )
+        self.run_csv([_input_row(), aliases])
+
+        tuned = pd.read_csv(self.output_file)
+        self.assertEqual(len(tuned), 1)
+        self.assertEqual(tuned[KEYS].to_dict("records"), [_input_row()])
+        profile = pd.read_csv(self.profile_file)
+        self.assertEqual(len(profile), 8)
+        self.assertEqual(
+            profile[KEYS].drop_duplicates().to_dict("records"), [_input_row()]
+        )
+
+    def test_resume_rechecks_recorded_accuracy_failures_and_keeps_valid_legacy_rows(
+        self,
+    ):
+        existing = []
+        for token, error in ((1, "90.0%"), (2, "nan%"), (3, "inf"), (4, "1.0%")):
+            row = _input_row(token)
+            row.update(dict.fromkeys(RESULT_COLUMNS, 0))
+            row.update(
+                us=11.0,
+                us1=11.0,
+                block_m=16,
+                kernelName1=G1,
+                kernelName2=G2_PREFIX + "_reduce_nt_sbm16",
+                err1=error,
+                err2=error,
+            )
+            existing.append(row)
+        self.run_csv(
+            [_input_row(token) for token in (1, 2, 3, 4)],
+            existing_rows=existing,
+        )
+
+        tuned = pd.read_csv(self.output_file).sort_values("token")
+        self.assertEqual(tuned["us"].tolist(), [7.0, 7.0, 7.0, 11.0])
+        profile = pd.read_csv(self.profile_file)
+        self.assertEqual(set(profile["token"]), {1, 2, 3})
+        self.assertEqual(len(profile), 24)
+
+    def test_failed_retune_removes_old_failed_status_even_with_good_metrics(self):
+        class EmptyCandidates(_controlled_tuner_class(self.module)):
+            def _candidate_rows(self, row, full_search=False):
+                return []
+
+        failed = _input_row()
+        failed.update(dict.fromkeys(RESULT_COLUMNS, 0))
+        failed.update(
+            us=7.0,
+            us1=7.0,
+            block_m=16,
+            kernelName1=G1,
+            kernelName2=G2_PREFIX + "_reduce_sbm16",
+            err1="1.0%",
+            err2="1.0%",
+            status="execution_failed",
+        )
+        with self.assertRaises(SystemExit) as stopped:
+            self.run_csv([_input_row()], EmptyCandidates, existing_rows=[failed])
+        self.assertEqual(stopped.exception.code, 1)
+        self.assertTrue(pd.read_csv(self.output_file).empty)
+        failures = pd.read_csv(self.output_file.with_suffix(".failed_shapes.csv"))
+        self.assertEqual(failures["token"].tolist(), [1])
+
+    def test_nonfinite_timed_output_is_failed_with_raw_error_and_no_winner(self):
+        class RealCandidate(_controlled_tuner_class(self.module)):
+            _run_candidate = self.module.Mxfp4FlydslTuner._run_candidate
+
+        reference = torch.ones((1, 512), device="cpu")
+        timed_output = torch.full((1, 512), float("nan"), device="cpu")
+        test_common = importlib.import_module("aiter.test_common")
+        with (
+            patch.object(RealCandidate, "_prepare_case", return_value={}),
+            patch.object(RealCandidate, "_port_e2e", return_value=reference),
+            patch.object(RealCandidate, "_torch_ref", return_value=reference),
+            patch.object(test_common, "run_perftest", return_value=(timed_output, 7.0)),
+            self.assertRaises(SystemExit) as stopped,
+        ):
+            self.run_csv([_input_row()], RealCandidate)
+        self.assertEqual(stopped.exception.code, 1)
+        self.assertTrue(pd.read_csv(self.output_file).empty)
+        profile = pd.read_csv(self.profile_file)
+        self.assertEqual(len(profile), 8)
+        self.assertTrue(profile["pipeline_us"].eq(7.0).all())
+        self.assertTrue(profile["error"].isna().all())
+        self.assertTrue(profile["status"].eq("accuracy_failed").all())
+        self.assertTrue(profile["failure_reason"].str.len().gt(0).all())
+
+    def test_finite_wrong_timed_output_saves_amplitude_error_and_rejects_pair(self):
+        class RealCandidate(_controlled_tuner_class(self.module)):
+            _run_candidate = self.module.Mxfp4FlydslTuner._run_candidate
+
+        reference = torch.ones((1, 512), device="cpu")
+        test_common = importlib.import_module("aiter.test_common")
+        with (
+            patch.object(RealCandidate, "_prepare_case", return_value={}),
+            patch.object(RealCandidate, "_port_e2e", return_value=reference),
+            patch.object(RealCandidate, "_torch_ref", return_value=reference),
+            patch.object(
+                test_common, "run_perftest", return_value=(reference * 2, 7.0)
+            ),
+            self.assertRaises(SystemExit) as stopped,
+        ):
+            self.run_csv([_input_row()], RealCandidate)
+        self.assertEqual(stopped.exception.code, 1)
+        self.assertTrue(pd.read_csv(self.output_file).empty)
+        profile = pd.read_csv(self.profile_file)
+        self.assertEqual(len(profile), 8)
+        for error in profile["error"]:
+            self.assertAlmostEqual(error, 0.2)
+        self.assertTrue(profile["status"].eq("accuracy_failed").all())
+
+    def test_explicit_run_config_selects_tuned_shapes_before_coupled_validation(self):
+        unrelated = _input_row()
+        unrelated.update(
+            q_dtype_a="torch.bfloat16",
+            q_dtype_w="torch.bfloat16",
+            q_type="QuantType.No",
+        )
+        pd.DataFrame([unrelated], columns=KEYS).to_csv(self.input_file, index=False)
+        winner = _input_row(2)
+        winner.update(dict.fromkeys(RESULT_COLUMNS, 0))
+        winner.update(
+            us=7.0,
+            us1=7.0,
+            block_m=16,
+            kernelName1=G1,
+            kernelName2=G2_PREFIX + "_reduce_sbm16",
+            err1="1.0%",
+            err2="1.0%",
+        )
+        pd.DataFrame([winner]).to_csv(self.output_file, index=False)
+
+        class BenchmarkBoundary(self.module.Mxfp4FlydslTuner):
+            def run_config(self, args):
+                return [
+                    {"shape": str(row["token"]), "us": 1.0, "status": "ok"}
+                    for _, row in self.untunedf.iterrows()
+                ]
+
+        tuner = BenchmarkBoundary("test", KEYS, RESULT_COLUMNS)
+        args = tuner.parser.parse_args(
+            [
+                "--mxfp4-flydsl",
+                "-i",
+                str(self.input_file),
+                "-o",
+                str(self.output_file),
+                "--run_config",
+                str(self.output_file),
+            ]
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            tuner.run(args)
+        self.assertEqual(tuner.untunedf["token"].tolist(), [2])
+        self.assertFalse(self.output_file.with_suffix(".failed_shapes.csv").exists())
         self.assertEqual(pd.read_csv(self.output_file)["us"].tolist(), [7.0])
 
 
