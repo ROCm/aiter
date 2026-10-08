@@ -312,9 +312,9 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         self._hide_bmm = False
 
     def run(self, args, fast_mode=False):
-        # Preserve the upstream CLI default; explicit FP32 also permits FlyDSL.
+        # Default to FP32 for every backend; E8M0 must be selected explicitly.
         if getattr(args, "scale_dtype", None) is None:
-            args.scale_dtype = "e8m0" if args.libtype == "flydsl" else "fp32"
+            args.scale_dtype = "fp32"
         self._mxscale = args.scale_dtype == "e8m0"
         if self._mxscale:
             if args.libtype not in ("flydsl", "all"):
@@ -453,10 +453,9 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         self.parser.add_argument(
             "--scale-dtype",
             choices=["fp32", "e8m0"],
-            default=None,
-            help="Scale contract and config family. If omitted, preserve the "
-            "default: e8m0 for --libtype flydsl, fp32 otherwise. "
-            "Use fp32 for the 8-wave legacy blockscale gemm; e8m0 requires "
+            default="fp32",
+            help="Scale contract and config family (default: fp32 for every backend). "
+            "Use fp32 for the 8-wave legacy blockscale gemm; explicit e8m0 requires "
             "--preshuffle and --libtype flydsl/all and writes the mxscale table.",
         )
 

@@ -41,11 +41,12 @@ Scale format selects the existing config family; it is not a new CSV column:
 | `fp32` | `--preshuffle` | [a8w8_blockscale_bpreshuffle_tuned_gemm.csv](../../aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv) |
 | `e8m0` | `--preshuffle` required | [a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm.csv](../../aiter/configs/a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm.csv) |
 
-For compatibility, omitting `--scale-dtype` keeps the upstream default: `flydsl`
-means E8M0 MXScale, while other backend groups mean FP32. The E8M0 mode accepts
-`--libtype flydsl` or `all`, uses the upstream shuffled-scale MXScale kernels,
-and preserves the table's existing `bmm` rows. `all` never mixes FP32 and E8M0
-candidates. Custom `-o` paths are retained; use a separate output per contract.
+Omitting `--scale-dtype` always selects FP32, including `--libtype flydsl`.
+E8M0 must be selected explicitly with `--scale-dtype e8m0 --preshuffle`, for
+both tuning and `--run_config`. It accepts `--libtype flydsl` or `all`, uses
+the upstream shuffled-scale MXScale kernels, and preserves the table's existing
+`bmm` rows. `all` never mixes FP32 and E8M0 candidates. Custom `-o` paths are
+retained; use a separate output per contract.
 
 - The public `gemm_a8w8_blockscale` and `gemm_a8w8_blockscale_bpreshuffle` APIs
   keep their signatures and default backends. A winning row with

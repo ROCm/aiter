@@ -108,11 +108,11 @@ class TestBlockscaleScaleDtype(unittest.TestCase):
             "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE",
         )
 
-    def test_legacy_flydsl_remains_e8m0(self):
-        for scale in ([], ["--scale-dtype", "e8m0"]):
-            with self.subTest(scale=scale):
+    def test_explicit_e8m0_uses_mxscale_family(self):
+        for lib in ("flydsl", "all"):
+            with self.subTest(lib=lib):
                 tuner, args = self.prepare(
-                    ["--libtype", "flydsl", "--preshuffle", *scale]
+                    ["--libtype", lib, "--scale-dtype", "e8m0", "--preshuffle"]
                 )
                 self.assertTrue(tuner._mxscale)
                 self.assertEqual(args.scale_dtype, "e8m0")
@@ -126,20 +126,58 @@ class TestBlockscaleScaleDtype(unittest.TestCase):
                     "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE",
                 )
 
-    def test_legacy_other_backends_remain_fp32(self):
-        for lib in ("all", "both", "ck", "cktile", "asm", "opus"):
-            with self.subTest(lib=lib):
-                tuner, args = self.prepare(["--libtype", lib])
-                self.assertFalse(tuner._mxscale)
+    def test_default_scale_is_fp32_for_all_backends(self):
+        for lib in (None, "all", "both", "ck", "cktile", "asm", "opus", "flydsl"):
+            for preshuffle in (False, True):
+                with self.subTest(lib=lib, preshuffle=preshuffle):
+                    tuner = self.make_tuner()
+                    cli = ["--libtype", lib] if lib is not None else []
+                    args = tuner.parser.parse_args(
+                        cli + (["--preshuffle"] if preshuffle else [])
+                    )
+                    self.assertEqual(args.scale_dtype, "fp32")
+                    with mock.patch.object(self.module.GemmCommonTuner, "run") as base:
+                        tuner.run(args)
+                    base.assert_called_once_with(args, False)
+                    self.assertFalse(tuner._mxscale)
+                    self.assertEqual(tuner.keys, KEYS)
+                    self.assertEqual(
+                        args.tune_file,
+                        (
+                            self.module.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE
+                            if preshuffle
+                            else self.module.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE
+                        ),
+                    )
+                    self.assertEqual(
+                        tuner.ARG_DEFAULTS["config_env_name"],
+                        (
+                            "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE"
+                            if preshuffle
+                            else "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE"
+                        ),
+                    )
+
+    def test_missing_or_none_scale_defaults_to_fp32(self):
+        for missing in (False, True):
+            with self.subTest(missing=missing):
+                tuner = self.make_tuner()
+                args = tuner.parser.parse_args(["--libtype", "flydsl"])
+                if missing:
+                    del args.scale_dtype
+                else:
+                    args.scale_dtype = None
+                with mock.patch.object(self.module.GemmCommonTuner, "run") as base:
+                    tuner.run(args)
+                base.assert_called_once_with(args, False)
                 self.assertEqual(args.scale_dtype, "fp32")
-                self.assertEqual(
-                    args.tune_file, self.module.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE
-                )
+                self.assertFalse(tuner._mxscale)
+                self.assertEqual(tuner.keys, KEYS)
 
     def test_invalid_e8m0_modes_fail_before_base_run(self):
         for cli in (
-            ["--libtype", "flydsl"],
             ["--libtype", "flydsl", "--scale-dtype", "e8m0"],
+            ["--libtype", "all", "--scale-dtype", "e8m0"],
             ["--libtype", "ck", "--scale-dtype", "e8m0", "--preshuffle"],
             ["--libtype", "both", "--scale-dtype", "e8m0", "--preshuffle"],
         ):
@@ -243,7 +281,9 @@ class TestBlockscaleScaleDtype(unittest.TestCase):
         runner.run_gemm_a8w8_blockscale.assert_called_once_with(*args)
 
     def test_e8m0_task_contract_is_unchanged(self):
-        tuner, _ = self.prepare(["--libtype", "flydsl", "--preshuffle"])
+        tuner, _ = self.prepare(
+            ["--libtype", "flydsl", "--scale-dtype", "e8m0", "--preshuffle"]
+        )
         ki = SimpleNamespace(
             a_dtype="fp8", b_dtype="fp8", split_k=4, name="flydsl_mxpsh_test_sk4"
         )
@@ -274,6 +314,9 @@ class TestBlockscaleScaleDtype(unittest.TestCase):
             "get_gemm_a8w8_blockscale_fp32_flydsl_tune_task": "fp32",
         }
         for lib, scale, expected in (
+            ("all", None, ["ck", "cktile", "asm", "opus", "fp32"]),
+            ("flydsl", None, ["fp32"]),
+            ("both", None, ["ck", "cktile"]),
             ("all", "fp32", ["ck", "cktile", "asm", "opus", "fp32"]),
             ("all", "e8m0", ["mxscale"]),
             ("flydsl", "fp32", ["fp32"]),
@@ -281,9 +324,10 @@ class TestBlockscaleScaleDtype(unittest.TestCase):
             ("both", "fp32", ["ck", "cktile"]),
         ):
             with self.subTest(lib=lib, scale=scale), ExitStack() as stack:
-                tuner, args = self.prepare(
-                    ["--libtype", lib, "--scale-dtype", scale, "--preshuffle"]
-                )
+                cli = ["--libtype", lib, "--preshuffle"]
+                if scale is not None:
+                    cli += ["--scale-dtype", scale]
+                tuner, args = self.prepare(cli)
                 for name, value in builders.items():
                     stack.enter_context(
                         mock.patch.object(tuner, name, return_value=[value])
@@ -380,9 +424,17 @@ class TestBlockscaleScaleDtype(unittest.TestCase):
                 "w_deq",
             )
         }
-        for scale, preshuffle in (("fp32", False), ("fp32", True), ("e8m0", True)):
+        for scale, preshuffle in (
+            (None, False),
+            (None, True),
+            ("fp32", False),
+            ("fp32", True),
+            ("e8m0", True),
+        ):
             with self.subTest(scale=scale, preshuffle=preshuffle), ExitStack() as stack:
-                cli = ["--libtype", "flydsl", "--scale-dtype", scale]
+                cli = ["--libtype", "flydsl"]
+                if scale is not None:
+                    cli += ["--scale-dtype", scale]
                 tuner, args = self.prepare(
                     cli + (["--preshuffle"] if preshuffle else [])
                 )
