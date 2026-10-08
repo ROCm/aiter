@@ -20,6 +20,7 @@ MXFP4_MOE_SUPPORTED_SHAPES = frozenset(
         (256, 3072, 768, 8),
         (512, 4096, 256, 10),
         (48, 7168, 3072, 6),
+        (24, 7168, 3072, 6),
         (384, 7168, 1536, 6),
         (384, 7168, 768, 6),
         (384, 7168, 512, 6),
@@ -31,6 +32,7 @@ MXFP4_MOE_SUPPORTED_SHAPES = frozenset(
         (32, 5120, 2304, 2),
         (32, 5120, 2304, 3),
         (256, 4096, 256, 6),
+        (256, 4096, 2048, 6),
         (385, 7168, 1536, 7),
         (385, 7168, 768, 7),
         (385, 7168, 512, 7),
@@ -39,6 +41,7 @@ MXFP4_MOE_SUPPORTED_SHAPES = frozenset(
         (257, 6144, 512, 9),
         (257, 6144, 256, 9),
         (896, 3584, 512, 16),
+        (896, 3584, 3072, 16),
         (56, 3584, 3072, 16),
         (64, 7168, 2048, 8),
         (128, 3072, 512, 4),
@@ -79,6 +82,33 @@ def _mxfp4_moe_sort_internal_is_supported(
     zero_init: bool,
 ) -> bool:
     """Private dispatch probe; not exported through ``aiter.ops`` or ``aiter``."""
+
+
+def prepare_mxfp4_moe_aux(shapes) -> None:
+    """Load/build and verify the BM16 sort instances before tuning workers start.
+
+    ``shapes`` contains (expert, model_dim, inter_dim, topk) tuples. Instances
+    depend on the auxiliary key, so a new inter_dim can reuse compiled support
+    without adding a model whitelist to the tuner. An existing stale module
+    must be regenerated and rebuilt in a fresh process before workers launch.
+    """
+    keys = {(int(ne), int(h), int(topk)) for ne, h, _inter, topk in shapes}
+    missing = []
+    for expert, hidden, topk in sorted(keys):
+        for zero_init in (False, True):
+            if not _mxfp4_moe_sort_internal_is_supported(
+                expert, topk, hidden, 16, zero_init
+            ):
+                operation = "sortzi" if zero_init else "sortonly"
+                missing.append(f"aux_{operation}_NE{expert}_TOPK{topk}_MB16_H{hidden}")
+    if missing:
+        raise RuntimeError(
+            "module_moe_mxfp4_aux is missing generated instances: "
+            + ", ".join(missing)
+            + ". Add support in moe_aux/codegen/gen_instances.py if needed, "
+            "then rerun this preparation in a fresh process with AITER_REBUILD=1 "
+            "before launching tuning workers."
+        )
 
 
 @compile_ops("module_moe_mxfp4_aux", develop=True)
