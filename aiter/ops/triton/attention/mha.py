@@ -994,6 +994,11 @@ def flash_attn_func(
     v_descale=None,
     config: dict[str, any] | None = None,
     backend: Literal["triton", "gluon"] | None = "triton",
+    *,
+    q_block_descale: torch.Tensor | None = None,
+    k_block_descale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+    p_scale: float = 1.0,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
@@ -1048,6 +1053,18 @@ def flash_attn_func(
             with q_descale/k_descale/v_descale. Note that the Gluon backend fills
             in S_dmask even at dropout_p == 0, where the Triton backend leaves it
             zeroed.
+        q_block_descale, k_block_descale, v_scale: keyword-only. When all three
+            are set, this call runs the block-scale FP8 Triton kernel and does
+            not enter the default Triton or Gluon path. q_block_descale is
+            (batch, num_q_heads, cdiv(seqlen_q, 64)) and k_block_descale is
+            (batch, num_k_heads, cdiv(seqlen_k, 64)), one fp32 descale per 64
+            tokens. v_scale is a single fp32 tensor scale. q/k/v are
+            pre-quantized fp8 in the usual (batch, seqlen, nheads, headdim)
+            layout, and the output is bf16. This mode is forward-only and rejects
+            dropout, bias, alibi, sink, sliding window, return_attn_probs, and
+            backend="gluon". Leaving these arguments unset keeps the existing behavior.
+        p_scale: keyword-only softmax-probability scale for the block-scale
+            path. Defaults to 1.0. It is only used when the block scales are set.
     Return:
         out: (batch_size, seqlen, nheads, headdim).
         softmax_lse [optional, if return_lse=True]: (batch_size, nheads, seqlen). The
@@ -1057,6 +1074,37 @@ def flash_attn_func(
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
+    if (
+        q_block_descale is not None
+        or k_block_descale is not None
+        or v_scale is not None
+        or p_scale != 1.0
+    ):
+        if _resolve_backend(backend) == "gluon":
+            raise ValueError(
+                "Block-scale FP8 attention is supported on the triton backend only."
+            )
+        from aiter.ops.triton.attention.fp8_attention import flash_attn_block_scale
+
+        return flash_attn_block_scale(
+            q,
+            k,
+            v,
+            q_block_descale,
+            k_block_descale,
+            v_scale,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            bias=bias,
+            alibi_slopes=alibi_slopes,
+            return_lse=return_lse,
+            return_attn_probs=return_attn_probs,
+            sink=sink,
+            p_scale=p_scale,
+        )
+
     backend = _resolve_backend(backend)
     _LOGGER.info(
         "FLASH_ATTN [%s]:  q=%s  k=%s  v=%s",
