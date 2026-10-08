@@ -146,12 +146,17 @@ class _DispatchWire:
     # fp4 is viewed as raw bytes: the gather addresses a row in BYTES, and a
     # packed dtype would make shape[-1] read as a feature count.
     recv_dtype: torch.dtype
+    # mori's tuning-table key for this wire, its op layer's dtype_str: an fp4
+    # dispatch pairs with a bf16-dtype combine, so it is "fp4_disp_bf16_comb".
+    mori_tuning_dtype: str
 
 
 _DISPATCH_WIRE_SPECS = {
-    "bf16": _DispatchWire(2, torch.bfloat16, None, torch.bfloat16),
-    "fp8": _DispatchWire(1, dtypes.fp8, dtypes.fp8, dtypes.fp8),
-    "fp4": _DispatchWire(0.5, dtypes.fp4x2, dtypes.fp4x2, torch.uint8),
+    "bf16": _DispatchWire(2, torch.bfloat16, None, torch.bfloat16, "bf16"),
+    "fp8": _DispatchWire(1, dtypes.fp8, dtypes.fp8, dtypes.fp8, "fp8"),
+    "fp4": _DispatchWire(
+        0.5, dtypes.fp4x2, dtypes.fp4x2, torch.uint8, "fp4_disp_bf16_comb"
+    ),
 }
 _DISPATCH_WIRES = tuple(_DISPATCH_WIRE_SPECS)
 
@@ -239,7 +244,7 @@ def _mori_tuning(config, quant_type: str = "none") -> dict:
         config.world_size,
         config.hidden_dim,
         config.topk,
-        dtype="bf16",
+        dtype=config.dispatch_wire_spec.mori_tuning_dtype,
         experts_per_rank=config.experts_per_rank,
         **quant_kw,
     )
@@ -894,6 +899,11 @@ class MegaMoEGfx1250:
             # still reads psum/masked_m of this slot; the next plan writes the
             # other slot and overlaps the expert GEMM (and later combine/RMS).
             self._prefetch_next_compact_plan(next_topk_ids, next_recv_token_bound)
+        # Without the fused combine, fused_moe writes straight into mori's staging
+        # rows: the combine reads them in place instead of copying them in.
+        moe_output = (
+            None if self._config.stage2_fused else self._mori_stage[: recv_x.shape[0]]
+        )
         try:
             expert_out = fused_moe(
                 recv_x,
@@ -917,6 +927,7 @@ class MegaMoEGfx1250:
                 num_local_tokens=None if self._compact_plan else total_recv,
                 swiglu_limit=self.swiglu_limit,
                 stage2_scatter=scatter,
+                output=moe_output,
                 **extra,
             )
         finally:
@@ -1233,12 +1244,15 @@ class MegaMoEGfx1250:
             )
         else:
             # mori's outTok: one bf16 staging row per recv slot, then, for the
-            # fp4 push combine, one landing row per (source peer, recv slot).
+            # fp4 push combine, one landing row per (source peer, recv slot) and,
+            # from four ranks up, a u64 flag per landing row for the overlapped
+            # combine (EpFp4Ovl) -- the same three parts mori's own out_tok sizes.
             comb_inp_nbytes = max_recv * config.hidden_dim * 2
             if config.combine_quant_bits:
-                comb_inp_nbytes += (
-                    config.world_size * max_recv * _mori_fp4_push_wire_nbytes(config)
-                )
+                landing_rows = config.world_size * max_recv
+                comb_inp_nbytes += landing_rows * _mori_fp4_push_wire_nbytes(config)
+                if config.world_size >= 4:
+                    comb_inp_nbytes += landing_rows * 8
         arena_regions.append(("comb_inp", comb_inp_nbytes))
         self._arena = SymmetricArena(communicator, arena_regions)
         self._compact_scale_row = (
@@ -1593,20 +1607,25 @@ class MegaMoEGfx1250:
         # (EpDispatchCombineOpHip), so take its decisions from mori rather than
         # keep a copy that drifts: whether the slot allocator word moves out of
         # the cco window into tokoff-ext memory, and selfFirst, which follows
-        # from where the word lives. A mori from before selfFirst has neither
-        # helper and rejects the kwarg; its op layer kept tokoff-ext on unless
-        # MORI_EP_TOKOFF_EXT=0/false/no/off.
+        # from where the word lives. Since ROCm/mori#726 the plan takes where the
+        # word lives (tok_off_ext) and derives selfFirst itself. A mori from before
+        # selfFirst has neither helper and rejects the kwarg; its op layer kept
+        # tokoff-ext on unless MORI_EP_TOKOFF_EXT=0/false/no/off.
+        from mori.ops.dispatch_combine_v2 import ep_plans
         from mori.ops.dispatch_combine_v2.hip_backend import TokOffExt
 
         if hasattr(TokOffExt, "wanted"):
-            from mori.ops.dispatch_combine_v2.ep_plans import self_first_enabled
-
             tokoff_ext = TokOffExt.wanted(config.world_size)
-            self_first_kw = {"self_first": int(self_first_enabled(not tokoff_ext))}
+            if hasattr(ep_plans, "self_first_enabled"):
+                slot_word_kw = {
+                    "self_first": int(ep_plans.self_first_enabled(not tokoff_ext))
+                }
+            else:
+                slot_word_kw = {"tok_off_ext": int(tokoff_ext)}
         else:
             env = os.environ.get("MORI_EP_TOKOFF_EXT", "1").strip().lower()
             tokoff_ext = env not in ("0", "false", "no", "off")
-            self_first_kw = {}
+            slot_word_kw = {}
         plans = {}
         for spec in self._dispatch_specs:
             plan = EpDispatchPlan(
@@ -1621,7 +1640,7 @@ class MegaMoEGfx1250:
                 dtype=config.dispatch_wire_spec.mori_dtype,
                 use_weights=True,
                 **scale_kw,
-                **self_first_kw,
+                **slot_word_kw,
                 block_num=spec[0],
                 warp_per_block=spec[1],
                 arena=self._arena,
@@ -1751,21 +1770,18 @@ class MegaMoEGfx1250:
             "xdb_flag": self._cross_device_flag.data_ptr(),
             "combine_barrier_fan": self._combine_barrier_fan.data_ptr(),
         }
-        # The bf16 staging rows at the front of comb_inp. The fp4 send reads
-        # ahead as far as row max_recv-1 of its input, so a step whose recv
-        # bound gave fused_moe fewer rows is routed through these.
-        stage = _from_gpu_ptr(
+        # The bf16 staging rows at the front of comb_inp. forward() has fused_moe
+        # write its rows straight into them, so the bf16 combine finds its input
+        # already staged and skips its copy, and the fp4 send, which reads ahead
+        # as far as row max_recv-1, stays inside the arena.
+        self._mori_stage = _from_gpu_ptr(
             self._arena.local_ptr("comb_inp"),
             (config.max_recv, config.hidden_dim),
             torch.bfloat16,
         )
 
-        def make_variant(plan, bits):
+        def make_variant(plan):
             def launch(expert_out: torch.Tensor, token_count: int):
-                rows = expert_out.shape[0]
-                if bits and rows < config.max_recv:
-                    stage[:rows].copy_(expert_out)
-                    expert_out = stage
                 plan.launch(
                     stream=torch.cuda.current_stream().cuda_stream,
                     inp_token_buf=expert_out,
@@ -1777,7 +1793,7 @@ class MegaMoEGfx1250:
 
         variants = {bits: {} for bits in specs}
         for (bits, spec), plan in plans.items():
-            variants[bits][spec] = make_variant(plan, bits)
+            variants[bits][spec] = make_variant(plan)
         return variants
 
     def _select_mori_combine(self, quant_bits: int, token_count: int) -> tuple:
@@ -1977,7 +1993,8 @@ class MegaMoEGfx1250:
         caller gets unless it asked forward() for another. With
         ``stage2_fused`` the gemm2 epilogue has already scattered the results
         into the peers' slots, packed as that wire. Without it, ``expert_out``
-        is fused_moe's per-recv-slot output and mori moves it.
+        is fused_moe's per-recv-slot output, already in mori's staging rows
+        (``_mori_stage``), and mori moves it from there.
         """
         count = routing.token_count
         if not self._config.stage2_fused:
@@ -2009,6 +2026,9 @@ class MegaMoEGfx1250:
         if self._closed:
             return
         self._closed = True
+        # A launch still in flight (a graph replay, say) reads the window: let it
+        # finish before anything it reads is freed.
+        torch.cuda.synchronize(self._total_recv.device)
         # The plans hold the window and their kernels dereference it, so they
         # go before the arena does.
         for plan in (*self._mori_plans.values(), *self._mori_combine_plans.values()):

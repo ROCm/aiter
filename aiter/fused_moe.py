@@ -1228,6 +1228,7 @@ def _fused_moe_impl(
             situ_beta=1.0 if beta is None else float(beta),
             situ_linear_beta=1.0 if linear_beta is None else float(linear_beta),
             stage2_scatter=stage2_scatter,
+            output=output,
         )
 
     if grouped_a8w4_out is not None:
