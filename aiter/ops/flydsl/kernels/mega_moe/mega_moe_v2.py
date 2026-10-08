@@ -112,18 +112,39 @@ class MegaMoEV2:
         if envs.AITER_MEGA_MOE_PRELOAD:
             self.preload_aot_bundles()
 
+    def new_moonep_slot_state(self):
+        """Slot tables for one weight window, e.g. one layer.
+
+        Callers sharing this instance across windows bind each window's state
+        with ``bind_moonep_slot_state`` before its forward, the same way they
+        rebind weights; the tables live behind the dispatch table, so binding
+        only swaps which table prepare reads.
+        """
+        size = self.world_size * self.moonep_slots
+        tables = {
+            name: torch.full((size,), -1, dtype=torch.int32, device=self.dev)
+            for name in ("held", "prev", "placed")
+        }
+        host = list(self._s1_disp_host)
+        host[DispatchSlot.MOONEP_SLOT_HELD] = tables["held"].data_ptr()
+        host[DispatchSlot.MOONEP_SLOT_PREV] = tables["prev"].data_ptr()
+        host[DispatchSlot.MOONEP_SLOT_PLACED] = tables["placed"].data_ptr()
+        tables["disp"] = torch.tensor(host, dtype=torch.int64, device=self.dev)
+        return tables
+
+    def bind_moonep_slot_state(self, state):
+        self._moonep_state = state
+        self._s1_disp = state["disp"]
+
     def moonep_slot_tables(self):
-        """``(placed, prev)`` int32 ``[world_size, B]`` views written by prepare.
+        """``(placed, prev)`` int32 ``[world_size, B]`` of the bound state.
 
         ``placed[d, s]`` is the expert slot ``s`` of rank ``d`` must receive
         this launch (-1: keep), ``prev`` what it held before.
         """
-        workspace = self._s1_dispatch_workspace
         shape = (self.world_size, self.moonep_slots)
-        return (
-            workspace["moonep_slot_placed"].view(shape),
-            workspace["moonep_slot_prev"].view(shape),
-        )
+        state = self._moonep_state
+        return state["placed"].view(shape), state["prev"].view(shape)
 
     def preload_aot_bundles(self):
         """Load the paired Stage1 and Stage2 production bundles."""
@@ -309,7 +330,6 @@ class MegaMoEV2:
         workspace["payload_ready_rows"] = op._sym((1,), torch.int32)
         p2p_names = []
         if self.moonep_slots:
-            slots = self.world_size * self.moonep_slots
             route_experts = self.world_size * (self.epr - self.moonep_slots)
             logical_segments = route_experts + self.world_size
 
@@ -320,9 +340,6 @@ class MegaMoEV2:
             workspace["logical_pair_base"] = i32(logical_segments)
             workspace["moonep_alloc_cumsum"] = i32(route_experts * self.world_size)
             workspace["moonep_expert_to_slot"] = i32(route_experts * self.world_size)
-            workspace["moonep_slot_held"] = i32(slots, -1)
-            workspace["moonep_slot_prev"] = i32(slots, -1)
-            workspace["moonep_slot_placed"] = i32(slots, -1)
             workspace["logical_bigcnt"] = op._sym(
                 (self.world_size * logical_segments,), torch.int32
             )
@@ -412,9 +429,6 @@ class MegaMoEV2:
             DispatchSlot.P2P_LOGICAL_COUNT_MATRIX: "p2p_logical_bigcnt",
             DispatchSlot.MOONEP_ALLOC_CUMSUM: "moonep_alloc_cumsum",
             DispatchSlot.MOONEP_EXPERT_TO_SLOT: "moonep_expert_to_slot",
-            DispatchSlot.MOONEP_SLOT_HELD: "moonep_slot_held",
-            DispatchSlot.MOONEP_SLOT_PREV: "moonep_slot_prev",
-            DispatchSlot.MOONEP_SLOT_PLACED: "moonep_slot_placed",
         }
         for slot, name in op_slots.items():
             table[slot] = getattr(op, name).data_ptr()
@@ -423,10 +437,20 @@ class MegaMoEV2:
         for slot, name in moonep_slots.items():
             # Unused without MoonEP; any valid pointer keeps the table complete.
             table[slot] = workspace.get(name, workspace["local_hist"]).data_ptr()
+        for slot in (
+            DispatchSlot.MOONEP_SLOT_HELD,
+            DispatchSlot.MOONEP_SLOT_PREV,
+            DispatchSlot.MOONEP_SLOT_PLACED,
+        ):
+            # Replaced by each bound slot state (see new_moonep_slot_state).
+            table[slot] = workspace["local_hist"].data_ptr()
         table[DispatchSlot.TILE_INPUT_BASE] = self._s1_tile_input_base.data_ptr()
         if any(pointer == 0 for pointer in table):
             raise RuntimeError("incomplete MegaMoE dispatch table")
+        self._s1_disp_host = table
         self._s1_disp = torch.tensor(table, dtype=torch.int64, device=self.dev)
+        if self.moonep_slots:
+            self.bind_moonep_slot_state(self.new_moonep_slot_state())
 
     def preload_stage1_bundle(self):
         """Load every production Stage1/prepare variant without GPU dispatch."""

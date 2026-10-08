@@ -46,73 +46,112 @@ def main():
     parser.add_argument("--tokens", type=int, default=4096)
     parser.add_argument("--slots", type=int, default=8)
     parser.add_argument("--steps", type=int, default=4)
+    parser.add_argument("--layers", type=int, default=2,
+                        help="weight windows sharing one instance, like model layers")
     parser.add_argument("--skip-prefetch", action="store_true",
                         help="negative control: leave the slots stale")
+    parser.add_argument("--shared-state", action="store_true",
+                        help="negative control: all layers share one slot state")
     args = parser.parse_args()
     rank, world, device = _setup_dist()
     epr = EXPERTS // world
     B = args.slots
     try:
-        everyone = [_quantize_weights(MODEL_DIM, INTER_DIM, epr, r, 7, device)[:4] for r in range(world)]
-        w1, w1s, w2, w2s = everyone[rank]
-        plain = MegaMoEV2(
-            rank=rank, world_size=world, model_dim=MODEL_DIM, inter_dim=INTER_DIM,
-            experts=EXPERTS, topk=TOPK, quant="a8w4", w1=w1, w1_scale=w1s, w2=w2,
-            w2_scale=w2s, max_tok_per_rank=args.tokens, swiglu_limit=SWIGLU,
-        )
 
         def per_expert(t):
             return t.contiguous().view(torch.uint8).view(epr, -1)
 
-        # All experts, flattened per expert, in global order.
-        bank = [torch.cat([per_expert(e[i]) for e in everyone]) for i in range(4)]
-        windows = [
-            torch.cat([per_expert(t), torch.zeros_like(per_expert(t)[:B])]).contiguous()
-            for t in (w1, w1s, w2, w2s)
-        ]
-        views = [win.view(t.dtype) for win, t in zip(windows, (w1, w1s, w2, w2s))]
+        layers = []
+        for layer in range(args.layers):
+            everyone = [
+                _quantize_weights(MODEL_DIM, INTER_DIM, epr, r, 7 + 31 * layer, device)[:4]
+                for r in range(world)
+            ]
+            home = everyone[rank]
+            # All experts, flattened per expert, in global order.
+            bank = [torch.cat([per_expert(e[i]) for e in everyone]) for i in range(4)]
+            windows = [
+                torch.cat([per_expert(t), torch.zeros_like(per_expert(t)[:B])]).contiguous()
+                for t in home
+            ]
+            views = [win.view(t.dtype) for win, t in zip(windows, home)]
+            layers.append(dict(home=home, bank=bank, windows=windows, views=views))
+            del everyone
+
+        def bind_plain(moe, layer):
+            w1, w1s, w2, w2s = layer["home"]
+            moe._s1_w1, moe._s1_w1_scale = w1.view(torch.uint8), w1s.view(torch.uint8)
+            moe.w2, moe.w2_scale = w2, w2s
+
+        def bind_fused(moe, layer):
+            w1, w1s, w2, w2s = layer["views"]
+            moe._s1_w1, moe._s1_w1_scale = w1.view(torch.uint8), w1s.view(torch.uint8)
+            moe.w2, moe.w2_scale = w2, w2s
+            moe.bind_moonep_slot_state(layer["state"])
+
+        first = layers[0]
+        plain = MegaMoEV2(
+            rank=rank, world_size=world, model_dim=MODEL_DIM, inter_dim=INTER_DIM,
+            experts=EXPERTS, topk=TOPK, quant="a8w4", w1=first["home"][0],
+            w1_scale=first["home"][1], w2=first["home"][2], w2_scale=first["home"][3],
+            max_tok_per_rank=args.tokens, swiglu_limit=SWIGLU,
+        )
         fused = MegaMoEV2(
             rank=rank, world_size=world, model_dim=MODEL_DIM, inter_dim=INTER_DIM,
             experts=world * (epr + B), topk=TOPK, quant="a8w4",
-            w1=views[0], w1_scale=views[1], w2=views[2], w2_scale=views[3],
-            max_tok_per_rank=args.tokens, swiglu_limit=SWIGLU, moonep_slots=B,
+            w1=first["views"][0], w1_scale=first["views"][1], w2=first["views"][2],
+            w2_scale=first["views"][3], max_tok_per_rank=args.tokens,
+            swiglu_limit=SWIGLU, moonep_slots=B,
         )
-        placed, prev = fused.moonep_slot_tables()
+        shared = fused.new_moonep_slot_state()
+        for layer in layers:
+            layer["state"] = shared if args.shared_state else fused.new_moonep_slot_state()
 
-        def prefetch():
+        def prefetch(layer):
             if args.skip_prefetch:
                 return
+            placed, prev = fused.moonep_slot_tables()
             want = placed[rank].long()
             copy = (want >= 0) & (want != prev[rank].long())
             src = want.clamp(min=0)
-            for win, all_experts in zip(windows, bank):
+            for win, all_experts in zip(layer["windows"], layer["bank"]):
                 rows = win[epr:]
                 rows.copy_(torch.where(copy[:, None], all_experts.index_select(0, src), rows))
 
         ok = True
         for step in range(args.steps):
-            for balance in ((True, False) if step == 0 else (True,)):
-                x, wts, ids = _routing(args.tokens, rank, step, device, hot=step % 2 == 0)
-                ref = plain.forward(x, wts, ids).clone()
-                _barrier()
-                out = fused.forward(x, wts, ids, moonep_balance=balance, after_prepare=prefetch).clone()
-                _barrier()
-                diff = (out.float() - ref.float()).abs()
-                scale = ref.float().abs().max().clamp(min=1e-6)
-                max_rel = float(diff.max() / scale)
-                exact = bool(torch.equal(out, ref))
-                prefetched = int((placed >= 0).sum())
-                stats = torch.tensor([max_rel, float(exact), prefetched], device=device)
-                gathered = [torch.zeros_like(stats) for _ in range(world)]
-                dist.all_gather(gathered, stats)
-                if rank == 0:
-                    rels = [float(g[0]) for g in gathered]
-                    exacts = sum(int(g[1]) for g in gathered)
-                    step_ok = max(rels) < 2e-2
-                    ok &= step_ok
-                    print(f"step={step} balance={balance} hot={step % 2 == 0} "
-                          f"placed={int(gathered[0][2])} exact_ranks={exacts}/{world} "
-                          f"max_rel={max(rels):.3e} -> {'OK' if step_ok else 'FAIL'}", flush=True)
+            for index, layer in enumerate(layers):
+                for balance in ((True, False) if step == 0 else (True,)):
+                    # Layers see different hot experts, so their slots diverge.
+                    x, wts, ids = _routing(args.tokens, rank, step + 5 * index, device, hot=step % 2 == 0)
+                    bind_plain(plain, layer)
+                    ref = plain.forward(x, wts, ids).clone()
+                    _barrier()
+                    bind_fused(fused, layer)
+                    out = fused.forward(
+                        x, wts, ids, moonep_balance=balance,
+                        after_prepare=lambda layer=layer: prefetch(layer),
+                    ).clone()
+                    _barrier()
+                    diff = (out.float() - ref.float()).abs()
+                    scale = ref.float().abs().max().clamp(min=1e-6)
+                    max_rel = float(diff.max() / scale)
+                    exact = bool(torch.equal(out, ref))
+                    placed, prev = fused.moonep_slot_tables()
+                    prefetched = int((placed >= 0).sum())
+                    kept = int(((placed >= 0) & (placed == prev)).sum())
+                    stats = torch.tensor([max_rel, float(exact), prefetched, kept], device=device)
+                    gathered = [torch.zeros_like(stats) for _ in range(world)]
+                    dist.all_gather(gathered, stats)
+                    if rank == 0:
+                        rels = [float(g[0]) for g in gathered]
+                        exacts = sum(int(g[1]) for g in gathered)
+                        step_ok = max(rels) < 2e-2
+                        ok &= step_ok
+                        print(f"step={step} layer={index} balance={balance} hot={step % 2 == 0} "
+                              f"placed={int(gathered[0][2])} kept={int(gathered[0][3])} "
+                              f"exact_ranks={exacts}/{world} max_rel={max(rels):.3e} "
+                              f"-> {'OK' if step_ok else 'FAIL'}", flush=True)
         if rank == 0:
             print("ALL_OK" if ok else "SOME_FAILED", flush=True)
     finally:
