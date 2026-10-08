@@ -226,7 +226,11 @@ def kernel_fits_shape(ki: kernelInstance, M: int, N: int, K: int) -> bool:
         return False
     if N % ki.tile_n != 0 and ki.k_split > 1:
         return False
-    if ki.k_split > 1 and (K // ki.tile_k) % ki.k_split != 0:
+    if ki.k_split < 1:
+        return False
+    n_tiles = K // ki.tile_k
+    tiles_per_split = (n_tiles + ki.k_split - 1) // ki.k_split
+    if (ki.k_split - 1) * tiles_per_split >= n_tiles:
         return False
     # Preserve the bounded decode search space. Ragged-M candidates target the
     # large-M wave-quantization cliffs where tile-row waste is small.
@@ -358,8 +362,7 @@ def _estimate_max_wpe(
     return int(total_vgpr / max(est_per_wave, 1))
 
 
-# Legal values are the divisors of K//tile_k, which is shape-dependent, so they
-# are enumerated rather than hardcoded.
+# Enumerate bounded split counts, including ragged slices, without empty splits.
 K_SPLIT_MIN_TILES_PER_SLICE = 2  # keep the ping-pong loop fed
 K_SPLIT_MAX_CTA_OVERSUBSCRIBE = 4  # no point going far past one CU each
 # Mirrors gemm_kernels.PRESHUFFLE_SPLIT_K_WORKSPACE_ELEMS without importing
@@ -391,7 +394,11 @@ def k_split_candidates(ki, M: int, N: int, K: int, cu_num: int = 256) -> list[in
     )
     if max_split < 2:
         return []
-    return [d for d in range(2, max_split + 1) if n_tiles % d == 0]
+    return [
+        d
+        for d in range(2, max_split + 1)
+        if (d - 1) * ((n_tiles + d - 1) // d) < n_tiles
+    ]
 
 
 def _build_kernels_list(tiles, total_vgpr=512, start_idx=0):

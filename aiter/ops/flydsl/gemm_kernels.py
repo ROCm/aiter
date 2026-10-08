@@ -322,13 +322,11 @@ def flydsl_preshuffle_gemm_a8(
         raise RuntimeError(
             f"[FlyDSL] ragged N ({n}) does not support split_k ({split_k})."
         )
-    if split_k < 1 or k % split_k != 0:
+    if split_k < 1:
+        raise RuntimeError(f"[FlyDSL] split_k ({split_k}) must be positive.")
+    if tile_k <= 0 or k % tile_k != 0:
         raise RuntimeError(
-            f"[FlyDSL] K ({k}) must be divisible by split_k ({split_k})."
-        )
-    if (k // split_k) % tile_k != 0:
-        raise RuntimeError(
-            f"[FlyDSL] K/split_k ({k // split_k}) is not a multiple of "
+            f"[FlyDSL] K ({k}) is not a multiple of "
             f"tile_k ({tile_k}). "
             f"Arguments not supported! Skipping gemm!"
         )
