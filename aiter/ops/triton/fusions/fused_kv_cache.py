@@ -23,9 +23,13 @@ try:
     from aiter.ops.triton._gluon_kernels.gfx1250.fusions.fused_kv_cache import (
         _fused_qk_rope_reshape_and_cache_kernel as gluon_fused_qk_rope_reshape_and_cache_kernel,
     )
+    from aiter.ops.triton._gluon_kernels.gfx1250.fusions.fused_kv_cache import (
+        _qpe_htile_kernel as gluon_qpe_htile_kernel,
+    )
 except:  # noqa: E722
     gluon_fused_qk_rope_cat_and_cache_mla_kernel = None
     gluon_fused_qk_rope_reshape_and_cache_kernel = None
+    gluon_qpe_htile_kernel = None
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton.utils._triton import arch_info
@@ -59,6 +63,7 @@ def fused_qk_rope_cat_and_cache_mla_fake_tensor(
     q_out_dtype: torch.dtype = None,
     shuffled_kv_cache: bool = False,
     upcast_operand: bool = False,
+    q_nope_prestored: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     b, qh, d_nope = q_nope.shape
     _, _, d_pe = q_pe.shape
@@ -118,6 +123,7 @@ def fused_qk_rope_cat_and_cache_mla(
     q_out_dtype: torch.dtype = None,
     shuffled_kv_cache: bool = False,
     upcast_operand: bool = False,
+    q_nope_prestored: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Perform RoPE on q_pe and k_pe and concat q_nope with q_pe and k_nope with k_pe along the last dimension
@@ -214,6 +220,10 @@ def fused_qk_rope_cat_and_cache_mla(
     if isinstance(k_scale, torch.Tensor):
         assert k_scale.numel() == 1, "k_scale should be a single-element torch.Tensor"
     reuse_freqs_front_part = d_freq == d_pe // 2
+    assert not (q_nope_prestored and q_out is None), (
+        "q_nope_prestored requires a q_out that already holds q_nope in "
+        "q_out[..., :d_nope]"
+    )
 
     if q_out is None:
         q_out = torch.empty(
@@ -267,6 +277,65 @@ def fused_qk_rope_cat_and_cache_mla(
     assert (
         kv_cache_stride_d == 1
     ), "The stride of the last dimension of KV cache must be 1"
+
+    if q_nope_prestored:
+        # q_nope already lives in q_out[..., :d_nope] (written there in the q_out
+        # dtype by its producer, e.g. a bf16-absorb GEMM with an fp8 epilogue).
+        # gfx1250 pure-decode MLA ropes only q_pe (head-tiled) and writes the KV
+        # cache, reusing the full-rope kernel's gluon rope + _store_mla_kv_cache so
+        # q_pe and the KV cache are bit-identical to the full-rope path.
+        assert kh == 1, "q_nope_prestored supports a single KV head (MLA) only"
+        assert (
+            DEVICE_ARCH == "gfx1250"
+            and gluon_qpe_htile_kernel is not None
+            and b_slot == b
+            and num_decode_toks_for_zeros == 0
+        ), "q_nope_prestored is currently supported on gfx1250 pure-decode MLA only"
+        BLOCK_H_HT = 16
+        H_TILES_HT = triton.cdiv(qh, BLOCK_H_HT)
+        gluon_qpe_htile_kernel[(b * H_TILES_HT,)](
+            q_pe,
+            k_nope,
+            k_pe,
+            pos,
+            cos,
+            sin,
+            q_out,
+            k_pe_out,
+            kv_cache,
+            slot_mapping,
+            b,
+            b_slot,
+            *q_pe.stride(),
+            *k_nope.stride(),
+            *k_pe.stride(),
+            pos.stride(0),
+            cos.stride(0),
+            cos.stride(-1),
+            *q_out.stride(),
+            *k_pe_out.stride(),
+            kv_cache_stride_b,
+            kv_cache_stride_h,
+            kv_cache_stride_d,
+            k_scale_ptr=k_scale,
+            QH=qh,
+            KH=kh,
+            H_TILES=H_TILES_HT,
+            BLOCK_H=BLOCK_H_HT,
+            REUSE_FREQS_FRONT_PART=reuse_freqs_front_part,
+            IS_NEOX=is_neox,
+            BLOCK_D_nope=d_nope,
+            BLOCK_D_pe=d_pe,
+            BLOCK_D_HALF_pe=d_pe // 2,
+            BLOCK_SIZE=block_size,
+            SHUFFLED_KV_CACHE=shuffled_kv_cache,
+            SCALE_K_WIDTH_NOPE=SCALE_K_WIDTH_NOPE,
+            SCALE_K_WIDTH_ROPE=SCALE_K_WIDTH_ROPE,
+            HAVE_K_SCALE=(k_scale is not None and apply_scale),
+            UPCAST_OPERAND=upcast_operand,
+            num_warps=1,
+        )
+        return q_out, decode_q_pe_out, k_pe_out, q_nope_zeros_out
 
     n_pid = b * qh + (b_slot - b) * kh
     grid = (n_pid, 1, 1)
