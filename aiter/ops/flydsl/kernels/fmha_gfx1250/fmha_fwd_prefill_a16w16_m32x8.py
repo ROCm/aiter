@@ -2343,10 +2343,6 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
     MASK_LEFT = bool(mask_left)
     MASK_RIGHT = bool(mask_right)
     ONE_KV_TILE = bool(one_kv_tile)
-    # thd cannot bound a WG's tile count at compile time -- max_seqlen_k is a batch max,
-    # not a per-sequence one -- so when the gate is off it emits BOTH cores and each WG
-    # dispatches on its own count. bshd's seq_len_k is exact, so the gate settles it.
-    EMIT_BOTH_CORES = layout == "thd" and not ONE_KV_TILE
     RET_LSE = bool(return_lse)
     HAS_SINK = bool(has_sink)
     GQA_RATIO = int(gqa_ratio)
@@ -2440,19 +2436,16 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
                     "window_right": window_right,
                     "elem_dtype": ELEM_DTYPE,
                 }
-                # Which core(s) this build emits. ONE_KV_TILE means the host proved every WG
-                # sees a single tile. Otherwise bshd knows seq_len_k exactly and needs only the
-                # pipelined core, while thd does not: a ragged batch mixes short sequences with
-                # long ones, so it carries both and each WG picks its own at runtime.
+                # Exactly one core reaches the binary: the host decides from the shape (bshd) or
+                # from max_seqlen_k (thd) whether every WG sees a single KV tile.
                 lds_base = _alloc_lds()
                 warp_idx = _warp_id()
 
-                def _run_one_kv_tile():
+                if ONE_KV_TILE:
                     _core_attention_one_kv_tile(
                         warp_idx=warp_idx, lds_base=lds_base, **_ca_kw
                     )
-
-                def _run_multi_kv_tiles():
+                else:
                     # Warp specialization: LO (waves 0..N/2-1) vs HI (N/2..N-1).
                     if warp_idx // fx.Int32(NUM_WAVES // 2) == fx.Int32(0):
                         _core_attention_multi_kv_tiles(
@@ -2468,26 +2461,6 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
                             lds_base=lds_base,
                             **_ca_kw,
                         )
-
-                if ONE_KV_TILE:
-                    _run_one_kv_tile()
-                elif not EMIT_BOTH_CORES:
-                    _run_multi_kv_tiles()
-                else:
-                    _, _, _, _num_tiles = _wg_kv_span(
-                        n_block=N_BLOCK,
-                        mask_right=MASK_RIGHT,
-                        gqa_ratio=GQA_RATIO,
-                        num_q_tiles_per_wave=NUM_Q_TILES,
-                        q_len=q_len,
-                        kv_len=kv_len,
-                        window_right=window_right,
-                    )
-                    # Multi first so the pipelined bodies keep the low code offsets.
-                    if _num_tiles > fx.Int32(1):
-                        _run_multi_kv_tiles()
-                    else:
-                        _run_one_kv_tile()
             elif q_len > fx.Int32(0):
                 # Cross-attention tail: q_len>0 but kv_len==0 -> O=0, LSE=-inf (or sink).
                 _zero_fill_attention(
@@ -2585,19 +2558,16 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
             "window_right": window_right,
             "elem_dtype": ELEM_DTYPE,
         }
-        # Which core(s) this build emits. ONE_KV_TILE means the host proved every WG
-        # sees a single tile. Otherwise bshd knows seq_len_k exactly and needs only the
-        # pipelined core, while thd does not: a ragged batch mixes short sequences with
-        # long ones, so it carries both and each WG picks its own at runtime.
+        # Exactly one core reaches the binary: the host decides from the shape (bshd) or
+        # from max_seqlen_k (thd) whether every WG sees a single KV tile.
         lds_base = _alloc_lds()
         warp_idx = _warp_id()
 
-        def _run_one_kv_tile():
+        if ONE_KV_TILE:
             _core_attention_one_kv_tile(
                 warp_idx=warp_idx, lds_base=lds_base, **_ca_kw
             )
-
-        def _run_multi_kv_tiles():
+        else:
             # Warp specialization: LO (waves 0..N/2-1) vs HI (N/2..N-1).
             if warp_idx // fx.Int32(NUM_WAVES // 2) == fx.Int32(0):
                 _core_attention_multi_kv_tiles(
@@ -2613,26 +2583,6 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
                     lds_base=lds_base,
                     **_ca_kw,
                 )
-
-        if ONE_KV_TILE:
-            _run_one_kv_tile()
-        elif not EMIT_BOTH_CORES:
-            _run_multi_kv_tiles()
-        else:
-            _, _, _, _num_tiles = _wg_kv_span(
-                n_block=N_BLOCK,
-                mask_right=MASK_RIGHT,
-                gqa_ratio=GQA_RATIO,
-                num_q_tiles_per_wave=NUM_Q_TILES,
-                q_len=q_len,
-                kv_len=kv_len,
-                window_right=window_right,
-            )
-            # Multi first so the pipelined bodies keep the low code offsets.
-            if _num_tiles > fx.Int32(1):
-                _run_multi_kv_tiles()
-            else:
-                _run_one_kv_tile()
 
     return kn_fmha_fwd_prefill_a16w16_m32x8_bshd
 
