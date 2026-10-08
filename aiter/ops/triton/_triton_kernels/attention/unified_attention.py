@@ -130,6 +130,8 @@ class AttentionConfig:
     SHUFFLED_KV_CACHE: tl.constexpr
     SPLIT_UNMASKED_LOOP: tl.constexpr
     K_WIDTH: tl.constexpr
+    SLOT_SIZE: tl.constexpr
+    NUM_SLOTS: tl.constexpr
     NUM_SEGMENTS_PER_SEQ: tl.constexpr
     RCP_LN2: tl.constexpr
     KV_CACHE_MODIFIER: tl.constexpr
@@ -177,6 +179,9 @@ class AttentionConfig:
         self.SHUFFLED_KV_CACHE = tl.constexpr(SHUFFLED_KV_CACHE)
         self.SPLIT_UNMASKED_LOOP = tl.constexpr(SPLIT_UNMASKED_LOOP)
         self.K_WIDTH = tl.constexpr(K_WIDTH)
+        # a shuffled tile is NUM_SLOTS slots of SLOT_SIZE keys, each inside one page
+        self.SLOT_SIZE = tl.constexpr(min(TILE_SIZE, BLOCK_SIZE))
+        self.NUM_SLOTS = tl.constexpr(TILE_SIZE // min(TILE_SIZE, BLOCK_SIZE))
         self.NUM_SEGMENTS_PER_SEQ = tl.constexpr(NUM_SEGMENTS_PER_SEQ)
         # needed to use exp2 (exp2 -> exp conversion)
         self.RCP_LN2 = tl.constexpr(1.4426950408889634)
@@ -185,18 +190,28 @@ class AttentionConfig:
         self.stride_v_cache_3 = tl.constexpr(stride_v_cache_3)
 
 
+@triton.constexpr_function
+def _as_field(x):
+    # an aggregate field may be a tensor or a compile-time value (an int argument
+    # of 1, an absent pointer, a folded scale); __init__ sees the latter unwrapped
+    return x if isinstance(x, tl.tensor) else tl.constexpr(x)
+
+
 @aggregate
 @strip_annotate
 class KVLoader:
-    """Loads one TILE_SIZE wide K/V tile of a sequence from the paged KV cache.
+    """Loads TILE_SIZE wide K/V tiles of a sequence from the paged KV cache.
 
-    Plain layout: K/V = [num_blks, blk_size, num_kv_heads, head_size], the block
-    table is indexed per token, so a tile may straddle pages.
+    Plain layout: K/V = [num_blks, blk_size, num_kv_heads, head_size]; the block
+    table is read per key, so a tile may straddle pages.
     Shuffled layout: K = [num_blks, num_kv_heads, head_size // W, blk_size, W],
-    V = [num_blks, num_kv_heads, blk_size // W, head_size, W]. A tile of exactly
-    one page is read as TILE_SIZE * HEAD_SIZE_PADDED contiguous elements, any other
-    tile is read page by page (or as part of one page); all are un-shuffled in
-    registers.
+    V = [num_blks, num_kv_heads, blk_size // W, head_size, W]. A one-page tile is
+    one contiguous run; any other tile is read as NUM_SLOTS slots of SLOT_SIZE
+    keys, each inside one page. Both are un-shuffled in registers.
+
+    block_ids() looks the tile up once; k_offset() / k_mask() and v_offset() /
+    v_mask() build the addresses, load_k() / load_v() issue the loads, so either
+    load can move.
     """
 
     cfg: AttentionConfig
@@ -249,225 +264,186 @@ class KVLoader:
         self.block_tables_ptr = block_tables_ptr
         self.block_table_offset = block_table_offset
         self.kv_head_idx = kv_head_idx
-        # an int stride of 1 arrives as a constexpr
-        self.stride_k_cache_0 = (
-            stride_k_cache_0
-            if isinstance(stride_k_cache_0, tl.tensor)
-            else tl.constexpr(stride_k_cache_0)
-        )
-        self.stride_k_cache_1 = (
-            stride_k_cache_1
-            if isinstance(stride_k_cache_1, tl.tensor)
-            else tl.constexpr(stride_k_cache_1)
-        )
-        self.stride_k_cache_2 = (
-            stride_k_cache_2
-            if isinstance(stride_k_cache_2, tl.tensor)
-            else tl.constexpr(stride_k_cache_2)
-        )
-        self.stride_v_cache_0 = (
-            stride_v_cache_0
-            if isinstance(stride_v_cache_0, tl.tensor)
-            else tl.constexpr(stride_v_cache_0)
-        )
-        self.stride_v_cache_1 = (
-            stride_v_cache_1
-            if isinstance(stride_v_cache_1, tl.tensor)
-            else tl.constexpr(stride_v_cache_1)
-        )
-        self.stride_v_cache_2 = (
-            stride_v_cache_2
-            if isinstance(stride_v_cache_2, tl.tensor)
-            else tl.constexpr(stride_v_cache_2)
-        )
+        self.stride_k_cache_0 = _as_field(stride_k_cache_0)
+        self.stride_k_cache_1 = _as_field(stride_k_cache_1)
+        self.stride_k_cache_2 = _as_field(stride_k_cache_2)
+        self.stride_v_cache_0 = _as_field(stride_v_cache_0)
+        self.stride_v_cache_1 = _as_field(stride_v_cache_1)
+        self.stride_v_cache_2 = _as_field(stride_v_cache_2)
         self.offs_t = offs_t
         self.offs_d = offs_d
         self.offs_vd = offs_vd
-        self.offs_shfl = (
-            offs_shfl if isinstance(offs_shfl, tl.tensor) else tl.constexpr(offs_shfl)
-        )
+        self.offs_shfl = _as_field(offs_shfl)
         self.dim_mask = dim_mask
         self.v_dim_mask = v_dim_mask
         self.max_seq_prefix_len = max_seq_prefix_len
-
-    @triton.jit
-    def initialize(
-        cfg,
-        key_cache_ptr,
-        value_cache_ptr,
-        block_tables_ptr,
-        block_table_offset,
-        kv_head_idx,
-        stride_k_cache_0,
-        stride_k_cache_1,
-        stride_k_cache_2,
-        stride_v_cache_0,
-        stride_v_cache_1,
-        stride_v_cache_2,
-        offs_t,
-        offs_d,
-        offs_vd,
-        offs_shfl,
-        dim_mask,
-        v_dim_mask,
-        max_seq_prefix_len,
-    ):
-        return KVLoader(
-            cfg,
-            key_cache_ptr,
-            value_cache_ptr,
-            block_tables_ptr,
-            block_table_offset,
-            kv_head_idx,
-            stride_k_cache_0,
-            stride_k_cache_1,
-            stride_k_cache_2,
-            stride_v_cache_0,
-            stride_v_cache_1,
-            stride_v_cache_2,
-            offs_t,
-            offs_d,
-            offs_vd,
-            offs_shfl,
-            dim_mask,
-            v_dim_mask,
-            max_seq_prefix_len,
-        )
 
     @triton.jit
     def load_tile(self, j, target_dtype: tl.constexpr, MASKED: tl.constexpr):
         """Returns K (HEAD_SIZE_PADDED, TILE_SIZE), V (TILE_SIZE, V_HEAD_SIZE_PADDED)
         and the tile's key positions. Without MASKED every key of the tile is
         assumed to be in range."""
-        cfg = self.cfg
-        seq_offset = j * cfg.TILE_SIZE + self.offs_t
-        if MASKED:
+        seq_offset = j * self.cfg.TILE_SIZE + self.offs_t
+        tile_mask = self.tile_mask(seq_offset, MASKED)
+        block_idx = self.block_ids(j, seq_offset)
+        # address math ahead of both loads, in the order the kernels are tuned with
+        if self.cfg.SHUFFLED_KV_CACHE:
+            k_offset = self.k_offset(j, seq_offset, block_idx)
+            v_offset = self.v_offset(j, seq_offset, block_idx)
+            k_mask = self.k_mask(j, tile_mask)
+            v_mask = self.v_mask(j, tile_mask)
+        else:
+            v_offset = self.v_offset(j, seq_offset, block_idx)
+            v_mask = self.v_mask(j, tile_mask)
+            k_offset = self.k_offset(j, seq_offset, block_idx)
+            k_mask = self.k_mask(j, tile_mask)
+        K = self.load_k(k_offset, k_mask, target_dtype)
+        V = self.load_v(v_offset, v_mask, target_dtype)
+        return K, V, seq_offset
+
+    @triton.jit
+    def tile_mask(self, seq_offset, MASKED: tl.constexpr):
+        # keys of the plain layout past the prefix; None when all are in range
+        mask = None
+        if MASKED and not self.cfg.SHUFFLED_KV_CACHE:
             # to reduce the masking effect when not needed
-            if cfg.TILE_SIZE == cfg.BLOCK_SIZE:
-                tile_mask = tl.full((1,), 1, dtype=tl.int1)
+            if self.cfg.TILE_SIZE == self.cfg.BLOCK_SIZE:
+                mask = tl.full((1,), 1, dtype=tl.int1)
             else:
-                tile_mask = seq_offset < self.max_seq_prefix_len
+                mask = seq_offset < self.max_seq_prefix_len
+        return mask
 
-        k_mask = None
-        v_mask = None
-        other = None
-        if cfg.SHUFFLED_KV_CACHE and cfg.TILE_SIZE < cfg.BLOCK_SIZE:
-            # Part of one page: K is HEAD_SIZE // W runs of TILE_SIZE * W
-            # elements, V a single run of TILE_SIZE * HEAD_SIZE_PADDED.
-            W: tl.constexpr = cfg.K_WIDTH
-            in_page = (j * cfg.TILE_SIZE) % cfg.BLOCK_SIZE
-            physical_block_idx_shfl = tl.load(
-                self.block_tables_ptr
-                + self.block_table_offset
-                + (j * cfg.TILE_SIZE) // cfg.BLOCK_SIZE
-            ).to(tl.int64)
-            offs_k_runs = (
-                tl.arange(0, cfg.HEAD_SIZE_PADDED // W)[:, None] * (cfg.BLOCK_SIZE * W)
-                + tl.arange(0, cfg.TILE_SIZE * W)[None, :]
-            )
-            k_offset = (
-                physical_block_idx_shfl * self.stride_k_cache_0
-                + self.kv_head_idx * self.stride_k_cache_1
-                + in_page * W
-                + offs_k_runs
-            )
-            v_offset = (
-                physical_block_idx_shfl * self.stride_v_cache_0
-                + self.kv_head_idx * self.stride_v_cache_1
-                + (in_page // W) * self.stride_v_cache_2
-                + self.offs_shfl
-            )
-        elif cfg.SHUFFLED_KV_CACHE and cfg.TILE_SIZE > cfg.BLOCK_SIZE:
-            # Several pages, each read as BLOCK_SIZE * HEAD_SIZE_PADDED contiguous
-            # elements. Pages past the prefix are masked, which also keeps the
-            # block table read inside this sequence.
-            NUM_PAGES: tl.constexpr = cfg.TILE_SIZE // cfg.BLOCK_SIZE
-            pages = j * NUM_PAGES + tl.arange(0, NUM_PAGES)
-            page_mask = pages * cfg.BLOCK_SIZE < self.max_seq_prefix_len
-            physical_block_idx_shfl = tl.load(
-                self.block_tables_ptr + self.block_table_offset + pages,
-                mask=page_mask,
+    @triton.jit
+    def slot_start(self, j):
+        # first key of each slot of a shuffled tile that is not one page
+        cfg = self.cfg
+        return j * cfg.TILE_SIZE + tl.arange(0, cfg.NUM_SLOTS) * cfg.SLOT_SIZE
+
+    @triton.jit
+    def slot_mask(self, j):
+        # with several slots, those past the prefix are skipped, which also keeps
+        # the block table read inside this sequence; a single slot is in range
+        return self.slot_start(j) < self.max_seq_prefix_len
+
+    @triton.jit
+    def block_ids(self, j, seq_offset):
+        """Physical page of every key (plain), of the tile (one-page shuffled) or
+        of every slot (other shuffled tiles)."""
+        cfg = self.cfg
+        row_ptr = self.block_tables_ptr + self.block_table_offset
+        if not cfg.SHUFFLED_KV_CACHE:
+            block_idx = tl.load(row_ptr + seq_offset // cfg.BLOCK_SIZE)
+        elif cfg.TILE_SIZE == cfg.BLOCK_SIZE:
+            block_idx = tl.load(row_ptr + j)
+        elif cfg.NUM_SLOTS > 1:
+            block_idx = tl.load(
+                row_ptr + self.slot_start(j) // cfg.BLOCK_SIZE,
+                mask=self.slot_mask(j),
                 other=0,
-            ).to(tl.int64)
-            offs_page = tl.arange(0, cfg.BLOCK_SIZE * cfg.HEAD_SIZE_PADDED)
-            k_offset = (
-                physical_block_idx_shfl * self.stride_k_cache_0
-                + self.kv_head_idx * self.stride_k_cache_1
-            )[:, None] + offs_page[None, :]
-            v_offset = (
-                physical_block_idx_shfl * self.stride_v_cache_0
-                + self.kv_head_idx * self.stride_v_cache_1
-            )[:, None] + offs_page[None, :]
-            k_mask = page_mask[:, None]
-            v_mask = page_mask[:, None]
-            other = 0.0
-        elif cfg.SHUFFLED_KV_CACHE:
-            physical_block_idx_shfl = tl.load(
-                self.block_tables_ptr + self.block_table_offset + j
-            ).to(tl.int64)
-            k_offset = (
-                physical_block_idx_shfl * self.stride_k_cache_0
-                + self.kv_head_idx * self.stride_k_cache_1
-                + self.offs_shfl
-            )
-
-            v_offset = (
-                physical_block_idx_shfl * self.stride_v_cache_0
-                + self.kv_head_idx * self.stride_v_cache_1
-                + self.offs_shfl
             )
         else:
-            physical_block_idx = tl.load(
-                self.block_tables_ptr
-                + self.block_table_offset
-                + seq_offset // cfg.BLOCK_SIZE
-            ).to(tl.int64)
+            block_idx = tl.load(row_ptr + self.slot_start(j) // cfg.BLOCK_SIZE)
+        return block_idx.to(tl.int64)
 
-            v_offset = (
-                physical_block_idx[:, None] * self.stride_v_cache_0
-                + self.kv_head_idx * self.stride_v_cache_2
-                + self.offs_vd[None, :] * cfg.stride_v_cache_3
-                + (seq_offset % cfg.BLOCK_SIZE)[:, None] * self.stride_v_cache_1
-            )
-            if MASKED:
-                v_mask = self.v_dim_mask[None, :] & tile_mask[:, None]
-            else:
-                v_mask = self.v_dim_mask[None, :]
-
-            k_offset = (
-                physical_block_idx[None, :] * self.stride_k_cache_0
+    @triton.jit
+    def k_offset(self, j, seq_offset, block_idx):
+        cfg = self.cfg
+        if not cfg.SHUFFLED_KV_CACHE:
+            offset = (
+                block_idx[None, :] * self.stride_k_cache_0
                 + self.kv_head_idx * self.stride_k_cache_2
                 + self.offs_d[:, None] * cfg.stride_k_cache_3
                 + (seq_offset % cfg.BLOCK_SIZE)[None, :] * self.stride_k_cache_1
             )
-            if MASKED:
-                k_mask = self.dim_mask[:, None] & tile_mask[None, :]
-            else:
-                k_mask = self.dim_mask[:, None]
-            other = 0.0
-
-        # K : (HEAD_SIZE, TILE_SIZE)
-        K_load = tl.load(
-            self.key_cache_ptr + k_offset,
-            mask=k_mask,
-            other=other,
-            cache_modifier=cfg.KV_CACHE_MODIFIER,
-        )
-
-        K = K_load.to(target_dtype)
-        if cfg.SHUFFLED_KV_CACHE and cfg.TILE_SIZE > cfg.BLOCK_SIZE:
-            K = (
-                K.reshape(
-                    cfg.TILE_SIZE // cfg.BLOCK_SIZE,
-                    cfg.HEAD_SIZE_PADDED // cfg.K_WIDTH,
-                    cfg.BLOCK_SIZE,
-                    cfg.K_WIDTH,
-                )
-                .permute(0, 2, 1, 3)
-                .reshape(cfg.TILE_SIZE, cfg.HEAD_SIZE_PADDED)
-                .trans(1, 0)
+        elif cfg.TILE_SIZE == cfg.BLOCK_SIZE:
+            offset = (
+                block_idx * self.stride_k_cache_0
+                + self.kv_head_idx * self.stride_k_cache_1
+                + self.offs_shfl
             )
-        elif cfg.SHUFFLED_KV_CACHE:
+        else:
+            # per slot, HEAD_SIZE // W runs of SLOT_SIZE * W elements
+            W: tl.constexpr = cfg.K_WIDTH
+            in_page = self.slot_start(j) % cfg.BLOCK_SIZE
+            offset = (
+                block_idx * self.stride_k_cache_0
+                + self.kv_head_idx * self.stride_k_cache_1
+                + in_page * W
+            )[:, None, None] + (
+                tl.arange(0, cfg.HEAD_SIZE_PADDED // W)[None, :, None]
+                * (cfg.BLOCK_SIZE * W)
+                + tl.arange(0, cfg.SLOT_SIZE * W)[None, None, :]
+            )
+        return offset
+
+    @triton.jit
+    def v_offset(self, j, seq_offset, block_idx):
+        cfg = self.cfg
+        if not cfg.SHUFFLED_KV_CACHE:
+            offset = (
+                block_idx[:, None] * self.stride_v_cache_0
+                + self.kv_head_idx * self.stride_v_cache_2
+                + self.offs_vd[None, :] * cfg.stride_v_cache_3
+                + (seq_offset % cfg.BLOCK_SIZE)[:, None] * self.stride_v_cache_1
+            )
+        elif cfg.TILE_SIZE == cfg.BLOCK_SIZE:
+            offset = (
+                block_idx * self.stride_v_cache_0
+                + self.kv_head_idx * self.stride_v_cache_1
+                + self.offs_shfl
+            )
+        else:
+            # per slot, one run of SLOT_SIZE * HEAD_SIZE_PADDED elements
+            in_page = self.slot_start(j) % cfg.BLOCK_SIZE
+            offset = (
+                block_idx * self.stride_v_cache_0
+                + self.kv_head_idx * self.stride_v_cache_1
+                + (in_page // cfg.K_WIDTH) * self.stride_v_cache_2
+            )[:, None] + tl.arange(0, cfg.SLOT_SIZE * cfg.HEAD_SIZE_PADDED)[None, :]
+        return offset
+
+    @triton.jit
+    def k_mask(self, j, tile_mask):
+        # None when every element of the K tile is in range
+        cfg = self.cfg
+        mask = None
+        if not cfg.SHUFFLED_KV_CACHE:
+            if tile_mask is None:
+                mask = self.dim_mask[:, None]
+            else:
+                mask = self.dim_mask[:, None] & tile_mask[None, :]
+        elif cfg.NUM_SLOTS > 1:
+            mask = self.slot_mask(j)[:, None, None]
+        return mask
+
+    @triton.jit
+    def v_mask(self, j, tile_mask):
+        # None when every element of the V tile is in range
+        cfg = self.cfg
+        mask = None
+        if not cfg.SHUFFLED_KV_CACHE:
+            if tile_mask is None:
+                mask = self.v_dim_mask[None, :]
+            else:
+                mask = self.v_dim_mask[None, :] & tile_mask[:, None]
+        elif cfg.NUM_SLOTS > 1:
+            mask = self.slot_mask(j)[:, None]
+        return mask
+
+    @triton.jit
+    def load_k(self, k_offset, k_mask, target_dtype: tl.constexpr):
+        """K : (HEAD_SIZE_PADDED, TILE_SIZE)"""
+        cfg = self.cfg
+        ptrs = self.key_cache_ptr + k_offset
+        if k_mask is None:
+            K = tl.load(ptrs, cache_modifier=cfg.KV_CACHE_MODIFIER)
+        else:
+            K = tl.load(
+                ptrs, mask=k_mask, other=0.0, cache_modifier=cfg.KV_CACHE_MODIFIER
+            )
+        K = K.to(target_dtype)
+
+        if cfg.SHUFFLED_KV_CACHE and cfg.NUM_SLOTS == 1:
             K = (
                 K.reshape(
                     cfg.HEAD_SIZE_PADDED // cfg.K_WIDTH,
@@ -478,16 +454,33 @@ class KVLoader:
                 .reshape(cfg.TILE_SIZE, cfg.HEAD_SIZE_PADDED)
                 .trans(1, 0)
             )
+        elif cfg.SHUFFLED_KV_CACHE:
+            K = (
+                K.reshape(
+                    cfg.NUM_SLOTS,
+                    cfg.HEAD_SIZE_PADDED // cfg.K_WIDTH,
+                    cfg.SLOT_SIZE,
+                    cfg.K_WIDTH,
+                )
+                .permute(0, 2, 1, 3)
+                .reshape(cfg.TILE_SIZE, cfg.HEAD_SIZE_PADDED)
+                .trans(1, 0)
+            )
+        return K
 
-        # V : (TILE_SIZE, HEAD_SIZE)
-        V_load = tl.load(
-            self.value_cache_ptr + v_offset,
-            mask=v_mask,
-            other=other,
-            cache_modifier=cfg.KV_CACHE_MODIFIER,
-        )
+    @triton.jit
+    def load_v(self, v_offset, v_mask, target_dtype: tl.constexpr):
+        """V : (TILE_SIZE, V_HEAD_SIZE_PADDED)"""
+        cfg = self.cfg
+        ptrs = self.value_cache_ptr + v_offset
+        if v_mask is None:
+            V = tl.load(ptrs, cache_modifier=cfg.KV_CACHE_MODIFIER)
+        else:
+            V = tl.load(
+                ptrs, mask=v_mask, other=0.0, cache_modifier=cfg.KV_CACHE_MODIFIER
+            )
+        V = V.to(target_dtype)
 
-        V = V_load.to(target_dtype)
         if cfg.SHUFFLED_KV_CACHE:
             V = (
                 V.reshape(
@@ -498,7 +491,7 @@ class KVLoader:
                 .permute(0, 2, 1)
                 .reshape(cfg.TILE_SIZE, cfg.HEAD_SIZE_PADDED)
             )
-        return K, V, seq_offset
+        return V
 
 
 @aggregate
@@ -565,42 +558,15 @@ class AttentionProgram:
         self.v_dim_mask = v_dim_mask
         self.context_len = context_len
         self.max_seq_prefix_len = max_seq_prefix_len
-        # optional or possibly compile-time values arrive as python values
-        self.tile_start = (
-            tile_start
-            if isinstance(tile_start, tl.tensor)
-            else tl.constexpr(tile_start)
-        )
+        self.tile_start = _as_field(tile_start)
         self.tile_end = tile_end
-        self.unmasked_tile_end = (
-            unmasked_tile_end
-            if isinstance(unmasked_tile_end, tl.tensor)
-            else tl.constexpr(unmasked_tile_end)
-        )
-        self.qk_scale = (
-            qk_scale if isinstance(qk_scale, tl.tensor) else tl.constexpr(qk_scale)
-        )
-        self.softcap = (
-            softcap if isinstance(softcap, tl.tensor) else tl.constexpr(softcap)
-        )
-        self.v_descale = (
-            v_descale if isinstance(v_descale, tl.tensor) else tl.constexpr(v_descale)
-        )
-        self.alibi_slope = (
-            alibi_slope
-            if isinstance(alibi_slope, tl.tensor)
-            else tl.constexpr(alibi_slope)
-        )
-        self.qq_bias_row_ptrs = (
-            qq_bias_row_ptrs
-            if isinstance(qq_bias_row_ptrs, tl.tensor)
-            else tl.constexpr(qq_bias_row_ptrs)
-        )
-        self.qq_bias_stride_0 = (
-            qq_bias_stride_0
-            if isinstance(qq_bias_stride_0, tl.tensor)
-            else tl.constexpr(qq_bias_stride_0)
-        )
+        self.unmasked_tile_end = _as_field(unmasked_tile_end)
+        self.qk_scale = _as_field(qk_scale)
+        self.softcap = _as_field(softcap)
+        self.v_descale = _as_field(v_descale)
+        self.alibi_slope = _as_field(alibi_slope)
+        self.qq_bias_row_ptrs = _as_field(qq_bias_row_ptrs)
+        self.qq_bias_stride_0 = _as_field(qq_bias_stride_0)
 
     @triton.jit
     def initialize(
@@ -1190,7 +1156,7 @@ def kernel_unified_attention(
         qq_bias_stride_0,
     )
 
-    kv_loader = KVLoader.initialize(
+    kv_loader = KVLoader(
         cfg,
         key_cache_ptr,
         value_cache_ptr,
