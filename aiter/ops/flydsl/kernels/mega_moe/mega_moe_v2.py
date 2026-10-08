@@ -38,8 +38,12 @@ class MegaMoEV2:
     def __init__(self, *, rank: int, world_size: int, model_dim: int, inter_dim: int, experts: int, topk: int,
         quant: str, w1: torch.Tensor, w1_scale: torch.Tensor, w2: torch.Tensor, w2_scale: torch.Tensor,
         max_tok_per_rank: int, mega_scheme: str = "fixedslot", swiglu_limit: float = 0.0,
-        fanout_masks: tuple[int, ...] = ()):
+        fanout_masks: tuple[int, ...] = (), moonep_slots: int = 0):
     # fmt: on
+        """``moonep_slots`` (B) > 0 makes ``experts`` the virtual ``R * (EPR + B)``
+        window: ``topk_ids`` stay logical and prepare places them with MoonEP,
+        executing remote work from the last B local weight slots.
+        """
         if quant != "a8w4":
             raise ValueError("MegaMoEV2 currently supports quant='a8w4' only")
         if experts % world_size != 0:
@@ -52,6 +56,13 @@ class MegaMoEV2:
         self.inter_dim = int(inter_dim)
         self.experts = int(experts)
         self.epr = int(experts // world_size)
+        self.moonep_slots = int(moonep_slots)
+        self.moonep_balance = True
+        if self.moonep_slots:
+            if fanout_masks:
+                raise ValueError("MoonEP placement requires fanout pairs disabled")
+            if not 0 < self.moonep_slots < self.epr:
+                raise ValueError(f"moonep_slots={moonep_slots} out of range")
         self.topk = int(topk)
         if not 0 < self.topk <= 16:
             raise ValueError(f"MegaMoEV2 topk must be in [1, 16], got {self.topk}")
@@ -73,6 +84,8 @@ class MegaMoEV2:
         self.dev = torch.device("cuda", rank)
         self.max_recv = self.world_size * self.mtpr
         compact = not self._bundle_plan.fixed_slot_dispatch
+        if self.moonep_slots and not compact:
+            raise ValueError("MoonEP placement needs the compact dispatch path")
         # Compact Stage1 always uses the deterministic runtime fanout protocol.
         # Keeping this wire format identical for every MAX-MTPR bucket is what
         # makes uneven-rank dynamic prefill safe.
@@ -98,6 +111,19 @@ class MegaMoEV2:
         self._build_fused_stage2()
         if envs.AITER_MEGA_MOE_PRELOAD:
             self.preload_aot_bundles()
+
+    def moonep_slot_tables(self):
+        """``(placed, prev)`` int32 ``[world_size, B]`` views written by prepare.
+
+        ``placed[d, s]`` is the expert slot ``s`` of rank ``d`` must receive
+        this launch (-1: keep), ``prev`` what it held before.
+        """
+        workspace = self._s1_dispatch_workspace
+        shape = (self.world_size, self.moonep_slots)
+        return (
+            workspace["moonep_slot_placed"].view(shape),
+            workspace["moonep_slot_prev"].view(shape),
+        )
 
     def preload_aot_bundles(self):
         """Load the paired Stage1 and Stage2 production bundles."""
@@ -281,7 +307,29 @@ class MegaMoEV2:
         workspace["ready_tile_epoch"] = op._sym((tile_state_blocks,), torch.int32)
         workspace["ready_tile_tail"] = op._sym((2,), torch.int32)
         workspace["payload_ready_rows"] = op._sym((1,), torch.int32)
+        p2p_names = []
+        if self.moonep_slots:
+            slots = self.world_size * self.moonep_slots
+            route_experts = self.world_size * (self.epr - self.moonep_slots)
+            logical_segments = route_experts + self.world_size
+
+            def i32(size, fill=0):
+                return torch.full((size,), fill, dtype=torch.int32, device=self.dev)
+
+            workspace["logical_hist"] = i32(logical_segments)
+            workspace["logical_pair_base"] = i32(logical_segments)
+            workspace["moonep_alloc_cumsum"] = i32(route_experts * self.world_size)
+            workspace["moonep_expert_to_slot"] = i32(route_experts * self.world_size)
+            workspace["moonep_slot_held"] = i32(slots, -1)
+            workspace["moonep_slot_prev"] = i32(slots, -1)
+            workspace["moonep_slot_placed"] = i32(slots, -1)
+            workspace["logical_bigcnt"] = op._sym(
+                (self.world_size * logical_segments,), torch.int32
+            )
+            p2p_names.append("logical_bigcnt")
         ms.shmem_barrier_all()
+        for name in p2p_names:
+            workspace[f"p2p_{name}"] = op._p2p_table(workspace[name])
         for name in (
             "bigcnt",
             "count_done",
@@ -357,10 +405,24 @@ class MegaMoEV2:
             DispatchSlot.PAYLOAD_BLOCKS_PER_DESTINATION: "payload_blocks_per_destination",
             DispatchSlot.PAYLOAD_CHUNKS_PER_DESTINATION: "payload_chunks_per_destination",
         }
+        moonep_slots = {
+            DispatchSlot.LOGICAL_HIST: "logical_hist",
+            DispatchSlot.LOGICAL_PAIR_BASE: "logical_pair_base",
+            DispatchSlot.LOGICAL_COUNT_MATRIX: "logical_bigcnt",
+            DispatchSlot.P2P_LOGICAL_COUNT_MATRIX: "p2p_logical_bigcnt",
+            DispatchSlot.MOONEP_ALLOC_CUMSUM: "moonep_alloc_cumsum",
+            DispatchSlot.MOONEP_EXPERT_TO_SLOT: "moonep_expert_to_slot",
+            DispatchSlot.MOONEP_SLOT_HELD: "moonep_slot_held",
+            DispatchSlot.MOONEP_SLOT_PREV: "moonep_slot_prev",
+            DispatchSlot.MOONEP_SLOT_PLACED: "moonep_slot_placed",
+        }
         for slot, name in op_slots.items():
             table[slot] = getattr(op, name).data_ptr()
         for slot, name in workspace_slots.items():
             table[slot] = workspace[name].data_ptr()
+        for slot, name in moonep_slots.items():
+            # Unused without MoonEP; any valid pointer keeps the table complete.
+            table[slot] = workspace.get(name, workspace["local_hist"]).data_ptr()
         table[DispatchSlot.TILE_INPUT_BASE] = self._s1_tile_input_base.data_ptr()
         if any(pointer == 0 for pointer in table):
             raise RuntimeError("incomplete MegaMoE dispatch table")
@@ -409,6 +471,8 @@ class MegaMoEV2:
                     model_dim=self.model_dim,
                     payload_chunk_rows=config.payload_chunk_rows,
                     tile_state_stride=self._s1_tile_state_stride,
+                    moonep_slots=self.moonep_slots,
+                    moonep_balance=self.moonep_balance,
                 )
 
         op = self._s1_op
@@ -452,6 +516,9 @@ class MegaMoEV2:
     def _select_config(self, tokens: int) -> MegaMoEConfig:
         entry = self._bundle_plan.entry_for_tokens(tokens)
         config = entry.config
+        if self.moonep_slots and config.stage2.aligned_pair:
+            # The aligned-pair Stage2 serves a fanout pair, which MoonEP keeps off.
+            config = replace(config, stage2=replace(config.stage2, aligned_pair=False))
         self._active_bundle_entry = entry
         self._active_config = config
         return config
@@ -516,6 +583,8 @@ class MegaMoEV2:
             model_dim=self.model_dim,
             payload_chunk_rows=config.payload_chunk_rows,
             tile_state_stride=self._s1_tile_state_stride,
+            moonep_slots=self.moonep_slots,
+            moonep_balance=self.moonep_balance,
         )
     def _run_fused_stage1(
         self,
@@ -697,10 +766,23 @@ class MegaMoEV2:
         return out_tok[:run_tokens] if slice_output else out_tok
 
     def forward(
-        self, x_bf16, wts, topk_ids, *, stream=None, slice_output=True, mask_invalid_slots=None
+        self,
+        x_bf16,
+        wts,
+        topk_ids,
+        *,
+        stream=None,
+        slice_output=True,
+        mask_invalid_slots=None,
+        moonep_balance=True,
+        after_prepare=None,
     ):
         """``mask_invalid_slots``: ids may contain -1 (skipped, contributing zero).
-        None defers to AITER_MEGA_COMBINE_MASK (default off)."""
+        None defers to AITER_MEGA_COMBINE_MASK (default off).
+
+        ``after_prepare`` runs on the host right after prepare is enqueued;
+        MoonEP uses it to enqueue the slot weight copy before Stage1."""
+        self.moonep_balance = bool(moonep_balance)
         run_tokens = int(x_bf16.shape[0])
         if run_tokens > self.mtpr:
             raise ValueError(f"run_tokens={run_tokens} > max_tok_per_rank={self.mtpr}")
@@ -730,6 +812,8 @@ class MegaMoEV2:
             prepare_stream,
             quant_input=x_bf16,
         )
+        if after_prepare is not None:
+            after_prepare()
         x_q = self._s1_quant_x[:run_tokens]
         scales = self._s1_quant_scale[:run_tokens]
         return self._run_joint(
