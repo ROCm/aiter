@@ -1391,9 +1391,11 @@ def _fused_qpe_rope_and_cache_mla_kernel(
             )
             k_pe = tl.load(k_pe_ptr + pid_b * k_pe_stride_b + d_pe_offs * k_pe_stride_d)
             if pid_b < B:
-                # Rope k_pe in fp32 (then round to its dtype) to keep the KV
-                # cache at least as accurate as the 1-warp kernel's rope. Tokens
-                # >= B (k-only) are cached as given, like the 1-warp kernel.
+                # Rope k_pe with the 1-warp kernel's rounding,
+                # bf16(fma(x, cos, bf16(rot * sin))), so the KV cache is
+                # bit-identical to the full-rope path (fp32 throughout with
+                # UPCAST_OPERAND). Tokens >= B (k-only) are cached as given,
+                # like the 1-warp kernel.
                 k_pe_f32 = k_pe.to(tl.float32)
                 if IS_NEOX:
                     k_pe_rotated = _get_neox_rotated_x_1D(
@@ -1406,9 +1408,20 @@ def _fused_qpe_rope_and_cache_mla_kernel(
                     k_pe_rotated = _get_gptj_rotated_x_1D(
                         k_pe_f32, d_pe_offs % 2 == 0, BLOCK_D_pe, BLOCK_D_HALF_pe
                     )
-                k_pe = (
-                    k_pe_f32 * cos.to(tl.float32) + k_pe_rotated * sin.to(tl.float32)
-                ).to(k_pe_ptr.dtype.element_ty)
+                if UPCAST_OPERAND:
+                    k_pe = (
+                        k_pe_f32 * cos.to(tl.float32)
+                        + k_pe_rotated * sin.to(tl.float32)
+                    ).to(k_pe_ptr.dtype.element_ty)
+                else:
+                    k_rs = (
+                        (k_pe_rotated * sin.to(tl.float32))
+                        .to(k_pe_ptr.dtype.element_ty)
+                        .to(tl.float32)
+                    )
+                    k_pe = tl.fma(k_pe_f32, cos.to(tl.float32), k_rs).to(
+                        k_pe_ptr.dtype.element_ty
+                    )
             tl.store(
                 k_pe_out_ptr
                 + pid_b * k_pe_out_stride_b
