@@ -6131,9 +6131,8 @@ class FmoeTuner(TunerCommon):
                     and not args.run_config
                     and not args.compare
                 ):
-                    times = pd.to_numeric(self.tunedf["us"], errors="coerce")
                     self.tunedf = self.tunedf[
-                        times.map(math.isfinite) & times.gt(0)
+                        self._valid_tuned_mask(self.tunedf, args.errRatio)
                     ].copy()
             else:
                 self.tunedf = None
@@ -6883,6 +6882,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
     def pre_process(self, args: "argparse.Namespace | SimpleNamespace") -> "None":
         self._require_distinct_input_output(args)
         self._invocation_configuration(args)
+        self._mxfp4_run_config = bool(args.run_config)
         return super().pre_process(args)
 
     def _unsupported_row_reason(
@@ -7073,6 +7073,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
 
     def run(self, args, fast_mode=False):
         self._mxfp4_output_file = self.get_out_file(args.tune_file)
+        self._mxfp4_err_ratio = args.errRatio
         result = super().run(args, fast_mode)
         if not args.run_config and not args.compare and self.untunedf.empty:
             pd.DataFrame(columns=self.keys + ["status", "failure_reason"]).to_csv(
@@ -7080,6 +7081,21 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 index=False,
             )
         return result
+
+    @staticmethod
+    def _valid_tuned_mask(tunedf, err_ratio):
+        times = pd.to_numeric(tunedf["us"], errors="coerce")
+        valid = times.map(math.isfinite) & times.gt(0)
+        for column in ("err1", "err2"):
+            if column not in tunedf:
+                return valid & False
+            encoded = tunedf[column].astype(str).str.strip()
+            errors = pd.to_numeric(encoded.str.rstrip("%"), errors="coerce")
+            errors = errors.where(~encoded.str.endswith("%"), errors / 100.0)
+            valid &= errors.map(math.isfinite) & errors.ge(0) & errors.le(err_ratio)
+        if "status" in tunedf:
+            valid &= tunedf["status"].fillna("").astype(str).isin(("", "ok"))
+        return valid
 
     @staticmethod
     def _row_precision(row):
@@ -7312,6 +7328,8 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 raise ValueError(f"{col} must be {expected}, got {row[col]!r}")
 
     def get_untuned_gemm_list(self, untuned_gemm_file):
+        if getattr(self, "_mxfp4_run_config", False):
+            return super().get_untuned_gemm_list(untuned_gemm_file)
         untunedf = _read_csv(untuned_gemm_file)
         required = [k for k in self.keys if k not in ("gfx", "cu_num")]
         missing = [col for col in required if col not in untunedf.columns]
@@ -7326,6 +7344,21 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 raise ValueError(
                     f"{untuned_gemm_file}: row {index + 2}: {exc}"
                 ) from exc
+        for column in self.DTYPE_KEYS | {"q_type"}:
+            untunedf[column] = untunedf[column].map(
+                lambda value: str(_parse_tuning_type(value))
+            )
+        untunedf["act_type"] = untunedf["act_type"].map(
+            lambda value: str(
+                str2ActivationType(value)
+                if isinstance(value, str) and "." not in value
+                else _parse_tuning_type(value)
+            )
+        )
+        for column in ("token", "model_dim", "inter_dim", "expert", "topk"):
+            untunedf[column] = untunedf[column].astype(int)
+        untunedf["use_g1u1"] = 1
+        untunedf["doweight_stage1"] = 0
         return untunedf.drop_duplicates().reset_index(drop=True)
 
     @staticmethod
@@ -7686,6 +7719,8 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 raise Mxfp4AccuracyError(
                     f"{phase} cosine err_ratio {accuracy_error} > {args.errRatio}"
                 )
+            if not _all_finite(out):
+                raise RuntimeError(f"non-finite {phase} pipeline output")
             return float(accuracy_error)
 
         if reference is not None:
@@ -7757,17 +7792,36 @@ class Mxfp4FlydslTuner(FmoeTuner):
             profile_warm_iters=0 if fast_scan else 1,
             num_rotate_args=1 if fast_scan else 0,
         )
+        us = round(float(us), 4)
+        candidate["pipeline_us"] = us
         if reference is not None:
             # run_perftest synchronizes before returning. Validate its last
             # output now, outside the profiler interval, to catch result
             # instability without changing reported kernel-active latency.
             accuracy_errors.append(validate_output(timed_out, "measured output"))
             err = max(accuracy_errors)
+        elif not fast_scan:
+            # The ordinary search gates the timed output against its own
+            # reference too, so a pair that drifts after the first launch
+            # cannot publish the latency measured on bad results.
+            timed_err = cosine_diff_compare(
+                ref, timed_out, msg=f"timed port[{kn1}+{kn2}]"
+            )
+            candidate["error"] = float("nan") if timed_err is None else float(timed_err)
+            if not _all_finite(timed_out):
+                raise RuntimeError("non-finite timed pipeline output")
+            if (
+                timed_err is None
+                or not math.isfinite(float(timed_err))
+                or timed_err > args.errRatio
+            ):
+                raise Mxfp4AccuracyError(
+                    f"timed cosine err_ratio {timed_err} > {args.errRatio}"
+                )
+            err = max(float(err), float(timed_err))
         if previously_observed_errors:
             err = max(float(err), *previously_observed_errors)
         candidate["error"] = float(err)
-        us = round(float(us), 4)
-        candidate["pipeline_us"] = us
         if not math.isfinite(us) or us <= 0:
             return us
         # The pair is timed as one unit, so the fused-MoE estimate in calculate()
@@ -8865,8 +8919,12 @@ class Mxfp4FlydslTuner(FmoeTuner):
     def result_to_csv(self, results, file, concat=False):
         del concat
         old_tunedf = self.get_tuned_gemm_list(file, self.columns)
-        old_times = pd.to_numeric(old_tunedf["us"], errors="coerce")
-        old_tunedf = old_tunedf[old_times.map(math.isfinite) & old_times.gt(0)].copy()
+        old_tunedf = old_tunedf[
+            self._valid_tuned_mask(
+                old_tunedf,
+                getattr(self, "_mxfp4_err_ratio", self.ARG_DEFAULTS["errRatio"]),
+            )
+        ].copy()
         times = pd.to_numeric(results["us"], errors="coerce")
         valid_mask = times.map(math.isfinite) & times.gt(0) & results["status"].eq("ok")
         valid = results.loc[valid_mask, self.columns].copy()
