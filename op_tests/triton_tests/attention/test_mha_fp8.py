@@ -7,6 +7,7 @@ import torch
 from aiter import logger
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import FP8_ARCHS
 from aiter.ops.triton.attention.mha import (
+    flash_attn_varlen_func,
     mha_set_use_fused_bwd_kernel,
 )
 from aiter.ops.triton.attention.mha_v3 import (
@@ -14,17 +15,25 @@ from aiter.ops.triton.attention.mha_v3 import (
     flash_attn_varlen_fp8_func,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from aiter.test_mha_common import (
     attention_ref,
     attention_ref_with_tol,
     generate_qkv,
     generate_random_padding_mask,
+    quantize_fp8_per_bh,
 )
+from op_tests.triton_tests.attention.mha_test_utils import skip_if_gluon_unsupported
 
 arch = get_arch()
 
-pytestmark = pytest.mark.skipif(
-    arch not in FP8_ARCHS, reason=f"FP8 not supported on {arch}"
+# The mha_v3 FP8 API (high-precision inputs, quantized inside) runs on
+# FP8_ARCHS; gfx1250 FP8 goes through the Gluon backend tests below.
+requires_mha_v3_fp8 = pytest.mark.skipif(
+    arch not in FP8_ARCHS, reason=f"mha_v3 FP8 not supported on {arch}"
+)
+requires_gfx1250 = pytest.mark.skipif(
+    arch != "gfx1250", reason="covers the gfx1250 Gluon MHA kernel"
 )
 
 
@@ -51,6 +60,7 @@ def fp8_assert_close(tensor_a, tensor_b, atol=1.0, cos_sim_threshold=0.96):
     assert_cosine_similarity(tensor_a, tensor_b, cos_sim_threshold)
 
 
+@requires_mha_v3_fp8
 @pytest.mark.parametrize("BATCH", [1, 4])
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K",
@@ -102,6 +112,7 @@ def test_mha(
     fp8_assert_close(triton_out, torch_out.to(triton_out.dtype))
 
 
+@requires_mha_v3_fp8
 @pytest.mark.parametrize("BATCH", [1, 4])
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K",
@@ -205,10 +216,132 @@ def test_mha_varlen(
     fp8_assert_close(triton_out, torch_out.to(triton_out.dtype))
 
 
+def _assert_lse_close(lse, lse_ref):
+    # Rows with no visible key (causal with SEQLEN_Q > SEQLEN_K) are -inf.
+    finite = torch.isfinite(lse_ref)
+    assert torch.equal(torch.isfinite(lse), finite)
+    torch.testing.assert_close(lse[finite], lse_ref[finite], atol=1e-2, rtol=1e-2)
+
+
+def _dequantize_fp8_per_bh(x_fp8, descale, cu_seqlens):
+    """Inverse of quantize_fp8_per_bh for thd input: the values the kernel sees."""
+    seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).long()
+    batch_idx = torch.repeat_interleave(
+        torch.arange(seqlens.numel(), device=x_fp8.device), seqlens
+    )
+    return x_fp8.float() * descale[batch_idx].unsqueeze(-1)
+
+
+# FP8 with sinks, sliding windows (including a zero-left window) and LSE, which
+# the other FP8 Gluon tests don't cover. The reference runs on the dequantized
+# inputs, so the tolerances only cover the kernel itself (mostly P rounded to
+# FP8).
+@requires_gfx1250
+@pytest.mark.parametrize("BATCH", [1, 4])
+@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(128, 128), (100, 300), (300, 100)])
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(8, 8), (16, 4)])
+@pytest.mark.parametrize("HEAD_SZ", [64, 128])
+@pytest.mark.parametrize(
+    "CAUSAL, WINDOW_SIZE_LEFT, SINK",
+    [
+        (False, -1, False),
+        (True, -1, False),
+        (True, -1, True),
+        (True, 32, True),
+        (False, 0, False),
+        (True, 0, True),
+    ],
+)
+def test_mha_varlen_fp8_sink_window_gluon(
+    BATCH: int,
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    HEAD_SZ: int,
+    CAUSAL: bool,
+    WINDOW_SIZE_LEFT: int,
+    SINK: bool,
+):
+    skip_if_gluon_unsupported("gluon", head_dim=HEAD_SZ, v_head_dim=HEAD_SZ)
+
+    torch.manual_seed(20)
+    torch.cuda.empty_cache()
+    q = torch.randn((BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ), device="cuda")
+    k = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda")
+    v = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda")
+    sink = torch.randn((NUM_Q_HEADS,), device="cuda") if SINK else None
+    query_padding_mask = generate_random_padding_mask(
+        SEQLEN_Q, BATCH, "cuda", mode="random"
+    )
+    key_padding_mask = generate_random_padding_mask(
+        SEQLEN_K, BATCH, "cuda", mode="random"
+    )
+    (
+        q_unpad,
+        k_unpad,
+        v_unpad,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        _,
+        _,
+        _,
+        output_pad_fn,
+        dq_pad_fn,
+        dk_pad_fn,
+    ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
+
+    fp8_dtype = get_fp8_e4m3_dtype()
+    q_fp8, q_descale = quantize_fp8_per_bh(q_unpad.detach(), fp8_dtype, cu_seqlens_q)
+    k_fp8, k_descale = quantize_fp8_per_bh(k_unpad.detach(), fp8_dtype, cu_seqlens_k)
+    v_fp8, v_descale = quantize_fp8_per_bh(v_unpad.detach(), fp8_dtype, cu_seqlens_k)
+
+    gluon_out, gluon_lse = flash_attn_varlen_func(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        causal=CAUSAL,
+        window_size=(WINDOW_SIZE_LEFT, -1),
+        return_lse=True,
+        sink=sink,
+        backend="gluon",
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+    torch_out, _, torch_lse = attention_ref(
+        dq_pad_fn(_dequantize_fp8_per_bh(q_fp8, q_descale, cu_seqlens_q)),
+        dk_pad_fn(_dequantize_fp8_per_bh(k_fp8, k_descale, cu_seqlens_k)),
+        dk_pad_fn(_dequantize_fp8_per_bh(v_fp8, v_descale, cu_seqlens_k)),
+        query_padding_mask=query_padding_mask,
+        key_padding_mask=key_padding_mask,
+        causal=CAUSAL,
+        window_size=(WINDOW_SIZE_LEFT, -1),
+        sink=sink,
+    )
+    seqlens_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).tolist()
+    torch_lse = torch.cat(
+        [torch_lse[b, :, :n].transpose(0, 1) for b, n in enumerate(seqlens_q)]
+    )
+
+    assert gluon_out.dtype == torch.bfloat16
+    fp8_assert_close(
+        output_pad_fn(gluon_out), torch_out, atol=0.25, cos_sim_threshold=0.999
+    )
+    _assert_lse_close(gluon_lse, torch_lse)
+
+
 # Production shapes based on real models:
 #   HQ=32, HK=8:  Llama 3 8B (GQA 4:1)
 #   HQ=64, HK=8:  Llama 3 70B (GQA 8:1)
 #   HQ=32, HK=32: Llama 2 7B (MHA)
+@requires_mha_v3_fp8
 @pytest.mark.parametrize("BATCH", [1, 4])
 @pytest.mark.parametrize("SEQLEN_Q", [512, 2048])
 @pytest.mark.parametrize("SEQLEN_K", [512, 2048])
@@ -272,6 +405,7 @@ def test_mha_backward(
         assert_cosine_similarity(tri, ref)
 
 
+@requires_mha_v3_fp8
 @pytest.mark.parametrize("BATCH", [1, 4])
 @pytest.mark.parametrize("SEQLEN_Q", [512, 2048])
 @pytest.mark.parametrize("SEQLEN_K", [512, 2048])
