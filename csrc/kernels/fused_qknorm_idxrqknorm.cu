@@ -20,12 +20,6 @@ namespace aiter {
 namespace fused_qknorm_idxrqknorm_ops {
 
 constexpr int kHeadDim = 128;
-// Tokens per index-cache page. Numerically kHeadDim, but a different quantity:
-// the index cache is [pages, 128, 128] and the shuffled layout is defined on
-// that 128x128 page, so this is the LAYOUT's constant. In particular it is not
-// the `block_size` argument, which describes the main K/V cache -- 16 under
-// asm_layout -- and which the row-major index write never needed.
-constexpr int kIndexPage = kHeadDim;
 constexpr int kNumLanes = 32;
 constexpr int kElemsPerLane = kHeadDim / kNumLanes;
 
@@ -106,40 +100,6 @@ __device__ __forceinline__ void storeCacheElems(cache_t* __restrict__ dst,
             dst[i] = opus::cast<cache_t>(static_cast<float>(rounded) / scale);
         }
     }
-}
-
-// Destination of head-dim element `dim` of token `row` inside a SHUFFLED index
-// page, in elements from the page base.
-//
-// This must match `minimax_m3_index_score.shuffle_cache` exactly -- the FlyDSL
-// index scorers read the cache through this permutation, and a disagreement is
-// silent wrong scores, not a crash. Derived the same way it is there, by
-// inverting the k-axis map: an access block is block_k wide, lane group g owns
-// lane_block of it, and the reader wants element (row, k) at
-//
-//     slot = (row / 16) * k_loads + k / block_k
-//     lane = 16 * ((k % block_k) / lane_block) + row % 16
-//     dst  = (slot * 64 + lane) * chunk_elems + k % lane_block
-//
-// Everything follows from `chunk_elems` = 16 B in cache elements, because
-// lane_block == chunk_elems and block_k == 4 * chunk_elems on both supported
-// architectures (see ArchTraits: halving mfma_k doubles k_per_load, leaving
-// this layout invariant). So one permutation serves gfx942 and gfx950, and the
-// producer does not need to know which chip will read it.
-//
-// Note `dim % lane_block` is the only term that moves within a run of
-// `lane_block` consecutive dims: consecutive head-dim elements stay contiguous
-// in the shuffled page, which is why the stores below keep their width.
-template <int kChunkElems>
-__device__ __forceinline__ int shuffledIndexOffset(int row, int dim)
-{
-    constexpr int kBlockK = kChunkElems * 4;
-    constexpr int kLoads  = kHeadDim / kBlockK;
-    const int panel = row >> 4; // MFMA_M = 16
-    const int u     = row & 15;
-    const int slot  = panel * kLoads + dim / kBlockK;
-    const int lane  = 16 * ((dim % kBlockK) / kChunkElems) + u;
-    return (slot * 64 + lane) * kChunkElems + dim % kChunkElems;
 }
 
 // index_q gather: qkv dtype, or unit-scale e4m3 (4787's q_idx contract; no scale tensor).
@@ -310,11 +270,6 @@ __global__ void fusedQKNormIdxrQKNormKernel(
     int nkv,
     int niq,
     int block_size,
-    // Write the index cache in the FlyDSL scorers' shuffled page layout
-    // instead of row major. Runtime rather than a template parameter: the
-    // branch is block-uniform and paid once per token, where another
-    // instantiation of this already heavily specialised kernel is not.
-    bool index_shuffled,
     int x,
     int max_kv_tokens,
     // page-128 (asm_layout=false) strides for the separate K/V caches
@@ -523,22 +478,8 @@ __global__ void fusedQKNormIdxrQKNormKernel(
             {
                 if(is_ik)
                 {
-                    // Row major: slot * 128 + dim. Shuffled: the page base plus
-                    // the permuted offset the scorer will read this element
-                    // from. kElemsPerLane divides chunk_elems either way, so
-                    // the lane's run stays contiguous in both and the store
-                    // keeps its width -- see `shuffledIndexOffset`.
-                    int64_t index_off = mapped_slot * kHeadDim + dim_base;
-                    if(index_shuffled)
-                    {
-                        constexpr int kChunkElems = 16 / sizeof(index_cache_t);
-                        const int64_t page = mapped_slot / kIndexPage;
-                        const int row      = static_cast<int>(mapped_slot % kIndexPage);
-                        index_off          = page * (kIndexPage * kHeadDim) +
-                                    shuffledIndexOffset<kChunkElems>(row, dim_base);
-                    }
                     storeCacheElems<scalar_t, index_cache_t, index_dt>(
-                        index_cache + index_off, elems, 1.0f);
+                        index_cache + mapped_slot * kHeadDim + dim_base, elems, 1.0f);
                 }
             }
             if(is_k)
@@ -654,7 +595,6 @@ void launchFusedQKNormIdxrQKNorm(
     int nkv,
     int niq,
     int block_size,
-    bool index_shuffled,
     int x,
     int max_kv_tokens,
     int64_t k_s_block,
@@ -719,7 +659,6 @@ void launchFusedQKNormIdxrQKNorm(
                                           nkv,                                               \
                                           niq,                                               \
                                           block_size,                                        \
-                                          index_shuffled,                                    \
                                           x,                                                 \
                                           max_kv_tokens,                                     \
                                           k_s_block,                                         \
@@ -828,8 +767,7 @@ static void fused_qknorm_idxrqknorm_impl(
     std::optional<aiter_tensor_t> k_scale,
     std::optional<aiter_tensor_t> v_scale,
     bool asm_layout,
-    bool skip_index_branch,
-    bool index_shuffled)
+    bool skip_index_branch)
 {
     using namespace fused_qknorm_idxrqknorm_ops;
 
@@ -937,19 +875,6 @@ static void fused_qknorm_idxrqknorm_impl(
             AITER_CHECK(index_cache_dtype == "auto" ||
                             index_cache_dtype.rfind("fp8", 0) == 0,
                         "sparse insert mode expects index_cache_dtype='auto' or fp8");
-            // The shuffled layout permutes WITHIN a 128x128 page, so it only
-            // exists for that page shape. The page size is the layout's own
-            // constant, NOT the `block_size` argument -- that one describes the
-            // main K/V cache and is 16 under asm_layout, so requiring it to be
-            // 128 here would reject every caller that writes both caches in one
-            // launch. Checked here rather than inside either layout branch:
-            // `index_shuffled` changes the index-cache addressing in both, and
-            // sitting in the asm_layout arm left the page-128 arm able to write
-            // past the buffer (slot 191 of a 3x64 cache lands on page 1 and
-            // reaches element 32767 of a 24576-element tensor).
-            AITER_CHECK(!index_shuffled ||
-                            index_cache->numel() % (kHeadDim * kHeadDim) == 0,
-                        "index_shuffled requires whole 128x128 index pages");
             if(fp8_index_cache)
             {
                 AITER_CHECK(index_cache->dtype() == AITER_DTYPE_fp8 ||
@@ -1095,23 +1020,8 @@ static void fused_qknorm_idxrqknorm_impl(
                         "num_kv_heads, 128] with contiguous head_dim");
             if(process_index)
             {
-                if(index_shuffled)
-                {
-                    // slot s is written at page (s / 128) * 128 * 128, so the
-                    // buffer has to hold whole pages for the HIGHEST slot, not
-                    // just `slots * 128` elements. They differ whenever
-                    // block_size is not 128.
-                    const int64_t slots = kv_cache_k->size(0) * block_size;
-                    const int64_t pages = (slots + kHeadDim - 1) / kHeadDim;
-                    AITER_CHECK(index_cache->numel() >= pages * kHeadDim * kHeadDim,
-                                "index_shuffled index_cache must hold whole 128x128 "
-                                "pages for every slot");
-                }
-                else
-                {
-                    AITER_CHECK(index_cache->numel() >= kv_cache_k->size(0) * block_size * kHeadDim,
-                                "index_cache must contain at least num_blocks * block_size * 128 elements");
-                }
+                AITER_CHECK(index_cache->numel() >= kv_cache_k->size(0) * block_size * kHeadDim,
+                            "index_cache must contain at least num_blocks * block_size * 128 elements");
             }
             k_s_block = kv_cache_k->stride(0);
             k_s_token = kv_cache_k->stride(1);
@@ -1216,7 +1126,6 @@ static void fused_qknorm_idxrqknorm_impl(
                 nkv,
                 niq,
                 static_cast<int>(block_size),
-                index_shuffled,
                 x,
                 max_kv_tokens,
                 k_s_block,
@@ -1274,7 +1183,6 @@ static void fused_qknorm_idxrqknorm_impl(
                 nkv,
                 niq,
                 static_cast<int>(block_size),
-                index_shuffled,
                 x,
                 max_kv_tokens,
                 k_s_block,
@@ -1331,7 +1239,6 @@ static void fused_qknorm_idxrqknorm_impl(
                 nkv,
                 niq,
                 static_cast<int>(block_size),
-                index_shuffled,
                 x,
                 max_kv_tokens,
                 k_s_block,
@@ -1385,7 +1292,6 @@ static void fused_qknorm_idxrqknorm_impl(
                 nkv,
                 niq,
                 static_cast<int>(block_size),
-                index_shuffled,
                 x,
                 max_kv_tokens,
                 k_s_block,
@@ -1432,8 +1338,7 @@ void fused_qknorm_idxrqknorm(
     std::optional<aiter_tensor_t> k_scale,
     std::optional<aiter_tensor_t> v_scale,
     bool asm_layout,
-    bool skip_index_branch,
-    bool index_shuffled)
+    bool skip_index_branch)
 {
     fused_qknorm_idxrqknorm_impl(qkv,
                                                 q_norm_weight,
@@ -1460,8 +1365,7 @@ void fused_qknorm_idxrqknorm(
                                                 k_scale,
                                                 v_scale,
                                                 asm_layout,
-                                                skip_index_branch,
-                                                index_shuffled);
+                                                skip_index_branch);
 }
 
 } // namespace aiter
