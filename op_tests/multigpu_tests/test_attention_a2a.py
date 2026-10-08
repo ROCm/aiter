@@ -141,8 +141,8 @@ def _supported(recipe, world_size, sequence, heads, gfx, first_sequence):
     if recipe.startswith(("packed-", "fp6p-", "v4-consumer")) and sequence % 32:
         return False
     if recipe.startswith("v4-consumer"):
-        # The dense MHA V4 consumer requires world_size * sequence % 128 == 0.
-        return world_size * sequence % 128 == 0
+        # Explicit compact lengths exercise nonaligned K/V; keep the legacy padded sweep.
+        return _CTX.valid_kv_len is not None or world_size * sequence % 128 == 0
     return True
 
 
@@ -725,6 +725,7 @@ def _check_v4_consumer(rank, world_size, heads, sequence, device, op_cls, codec)
     softmax_scale = 0.125
     seq_full = sequence * world_size
     hl = heads // world_size
+    valid_kv_len = seq_full if _CTX.valid_kv_len is None else _CTX.valid_kv_len
 
     def t(x):
         return x.transpose(1, 2).float()
@@ -734,9 +735,17 @@ def _check_v4_consumer(rank, world_size, heads, sequence, device, op_cls, codec)
         for role in range(3)
     )
     full = [_full_bshd(value, rank, world_size) for value in inputs]
-    ref = F.scaled_dot_product_attention(
-        t(full[0]), t(full[1]), t(full[2]), scale=softmax_scale
-    ).transpose(1, 2)
+    full[1:] = [value[:, :valid_kv_len].contiguous() for value in full[1:]]
+    # Bound the FP32 reference's score matrix for Wan-length CLI cases.
+    ref = torch.cat(
+        [
+            F.scaled_dot_product_attention(
+                t(query), t(full[1]), t(full[2]), scale=softmax_scale
+            ).transpose(1, 2)
+            for query in full[0].split(128, dim=1)
+        ],
+        dim=1,
+    )
     op = op_cls(
         rank=rank,
         world_size=world_size,
@@ -746,22 +755,23 @@ def _check_v4_consumer(rank, world_size, heads, sequence, device, op_cls, codec)
         v_pack=AttentionPack.V_FOR_FP6_P,
         softmax_scale=softmax_scale,
         hadamard=True,
+        valid_kv_len=valid_kv_len,
     )
     payloads, scales = _submit_roles(op, inputs)
     torch.cuda.synchronize()
     q = payloads[0].view(1, seq_full, hl, 96)
     q_scale = scales[0].view(1, seq_full, hl, 4)
-    k, k_scale = mxfp6_k_view(payloads[1], scales[1], 1, seq_full, hl)
+    k, k_scale = mxfp6_k_view(payloads[1], scales[1], 1, valid_kv_len, hl)
     if codec == "mxfp6_p":
-        tiles = mxfp6_v_tiles(seq_full)
+        tiles = mxfp6_v_tiles(valid_kv_len)
         v = payloads[2].as_strided(
-            (1, seq_full, hl, 128), (hl * tiles * 12288, 96, tiles * 12288, 1)
+            (1, valid_kv_len, hl, 128), (hl * tiles * 12288, 96, tiles * 12288, 1)
         )
         v_scale = scales[2].view(1, hl, tiles * 512)
         v_format = AttentionFormat.MXFP6
     else:
         v_scale = scales[2].view(1, hl, -1)
-        v = mxfp4_v_view(payloads[2], v_scale, seq_full)
+        v = mxfp4_v_view(payloads[2], v_scale, valid_kv_len)
         v_format = AttentionFormat.MXFP4
     # Transport check: the fused A2A output, consumed through the packed views,
     # must equal canonical quantize + MHA on this rank's own gathered inputs.
@@ -1121,7 +1131,8 @@ def test_a2a(world_size, recipe, sequence, heads, blocks):
     }
 
 
-def _run_rank(rank, world_size, port, recipes, sequences, heads_list):
+def _run_rank(rank, world_size, port, recipes, sequences, heads_list, valid_kv_len):
+    _CTX.valid_kv_len = valid_kv_len
     os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "12G")
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
@@ -1189,7 +1200,7 @@ def _run_rank(rank, world_size, port, recipes, sequences, heads_list):
             dist.destroy_process_group()
 
 
-def _run_world(world_size, recipes, sequences, heads_list):
+def _run_world(world_size, recipes, sequences, heads_list, valid_kv_len):
     visible = torch.cuda.device_count()
     if visible < world_size:
         aiter.logger.warning(
@@ -1201,7 +1212,7 @@ def _run_world(world_size, recipes, sequences, heads_list):
         results = pool.starmap(
             _run_rank,
             [
-                (rank, world_size, port, recipes, sequences, heads_list)
+                (rank, world_size, port, recipes, sequences, heads_list, valid_kv_len)
                 for rank in range(world_size)
             ],
         )
@@ -1246,14 +1257,24 @@ def main():
         default=[8],
         help="total head counts (Wan2.2 deploys 40)",
     )
+    parser.add_argument(
+        "--valid-kv-len",
+        type=int,
+        default=None,
+        help="compact K/V length for v4-consumer recipes; Q retains the padded length",
+    )
     args = parser.parse_args()
+    if args.valid_kv_len is not None and any(
+        not recipe.startswith("v4-consumer-") for recipe in args.recipes
+    ):
+        parser.error("--valid-kv-len requires only v4-consumer recipes")
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning("attention A2A needs gfx942 or gfx950; skipping")
         return 0
     rows, checks = [], 0
     for world_size in args.world_sizes:
         world_rows, world_checks = _run_world(
-            world_size, args.recipes, args.sequences, args.heads
+            world_size, args.recipes, args.sequences, args.heads, args.valid_kv_len
         )
         rows += world_rows
         checks += world_checks
