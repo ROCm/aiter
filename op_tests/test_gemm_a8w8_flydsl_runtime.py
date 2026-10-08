@@ -165,6 +165,7 @@ def main():
         return
 
     # Keep Aiter imports after the device check so CPU runners skip before JIT bootstrap.
+    os.environ["AITER_GEMM_A8W8_BACKEND"] = "flydsl"
     from aiter.ops import gemm_op_a8w8
     from aiter.ops.triton.gemm.basic.gemm_a8w8 import (
         gemm_a8w8 as gemm_a8w8_triton,
@@ -197,6 +198,7 @@ def main():
             ),
             "flydsl_runtime_cache_dir": cache_value,
             "flydsl_runtime_cache_dir_existed_before_run": cache_existed,
+            "a8w8_backend": os.environ["AITER_GEMM_A8W8_BACKEND"],
             "input_seed": 4340,
         },
         "reference": "float32 torch.mm(x, w.T) * row_scale * column_scale, cast to output dtype",

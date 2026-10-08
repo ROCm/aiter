@@ -163,7 +163,7 @@ def test_flydsl_rdna3_a8w8_import_failure_uses_fallback(monkeypatch, error):
     )
 
 
-def test_gemm_a8w8_public_dispatch_uses_triton_when_flydsl_is_unavailable(
+def test_gemm_a8w8_public_dispatch_uses_triton_by_default(
     monkeypatch,
 ):
     x = torch.empty((2, 128), dtype=torch.int8)
@@ -172,8 +172,11 @@ def test_gemm_a8w8_public_dispatch_uses_triton_when_flydsl_is_unavailable(
     w_scale = torch.ones((64, 1), dtype=torch.float32)
     calls = []
 
+    monkeypatch.setattr(gemm_op_a8w8, "AITER_GEMM_A8W8_BACKEND", "default")
     monkeypatch.setattr(
-        gemm_op_a8w8, "_try_flydsl_rdna3_a8w8", lambda *args: None
+        gemm_op_a8w8,
+        "_try_flydsl_rdna3_a8w8",
+        lambda *args: pytest.fail("default backend must not attempt FlyDSL"),
     )
     monkeypatch.setattr(gemm_op_a8w8, "_ck_a8w8_supported", lambda: False)
 
@@ -207,6 +210,8 @@ def test_gemm_a8w8_public_dispatch_returns_flydsl_result(monkeypatch):
     output = torch.empty((2, 64), dtype=torch.bfloat16)
     calls = []
 
+    monkeypatch.setattr(gemm_op_a8w8, "AITER_GEMM_A8W8_BACKEND", "flydsl")
+
     def flydsl_gemm(*args):
         calls.append(args)
         return output
@@ -224,6 +229,35 @@ def test_gemm_a8w8_public_dispatch_returns_flydsl_result(monkeypatch):
 
     assert result is output
     assert calls == [(x, w, x_scale, w_scale, None, torch.bfloat16, None)]
+
+
+def test_gemm_a8w8_flydsl_opt_in_uses_triton_when_shape_is_unsupported(monkeypatch):
+    x = torch.empty((2, 128), dtype=torch.int8)
+    w = torch.empty((64, 128), dtype=torch.int8)
+    x_scale = torch.ones((2, 1), dtype=torch.float32)
+    w_scale = torch.ones((64, 1), dtype=torch.float32)
+    calls = []
+
+    monkeypatch.setattr(gemm_op_a8w8, "AITER_GEMM_A8W8_BACKEND", "flydsl")
+    monkeypatch.setattr(gemm_op_a8w8, "_try_flydsl_rdna3_a8w8", lambda *args: None)
+    monkeypatch.setattr(gemm_op_a8w8, "_ck_a8w8_supported", lambda: False)
+    module_name = "aiter.ops.triton.gemm.basic.gemm_a8w8"
+
+    def triton_gemm(*args, **kwargs):
+        calls.append((args, kwargs))
+        return torch.empty((2, 64), dtype=kwargs["dtype"])
+
+    monkeypatch.setitem(
+        sys.modules, module_name, SimpleNamespace(gemm_a8w8=triton_gemm)
+    )
+
+    result = gemm_op_a8w8.gemm_a8w8(
+        x, w, x_scale, w_scale, dtype=torch.float16, splitK=3
+    )
+
+    assert result.shape == (2, 64)
+    assert result.dtype == torch.float16
+    assert calls == [((x, w, x_scale, w_scale, None), {"dtype": torch.float16})]
 
 
 @pytest.mark.parametrize(

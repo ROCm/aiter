@@ -4,6 +4,7 @@
 import functools
 import importlib
 import math
+import os
 import operator
 from pathlib import Path
 
@@ -39,6 +40,13 @@ from .mxfp8fp4gemm_common import (
 )
 
 aiter_lib = Library("aiter", "FRAGMENT")
+
+AITER_GEMM_A8W8_BACKEND = os.environ.get("AITER_GEMM_A8W8_BACKEND", "default").lower()
+if AITER_GEMM_A8W8_BACKEND not in ("default", "flydsl"):
+    raise ValueError(
+        "AITER_GEMM_A8W8_BACKEND must be 'default' or 'flydsl', "
+        f"got {AITER_GEMM_A8W8_BACKEND!r}"
+    )
 
 
 # Arches whose prebuilt HIP CK blockscale modules ship matching code objects.
@@ -754,11 +762,12 @@ def gemm_a8w8(
     #     dtypes.bf16,
     #     dtypes.fp16,
     # ], f"Output {dtype=} is currently not supported in gemm_a8w8"
-    flydsl_result = _try_flydsl_rdna3_a8w8(
-        XQ, WQ, x_scale, w_scale, bias, dtype, splitK
-    )
-    if flydsl_result is not None:
-        return flydsl_result
+    if AITER_GEMM_A8W8_BACKEND == "flydsl":
+        flydsl_result = _try_flydsl_rdna3_a8w8(
+            XQ, WQ, x_scale, w_scale, bias, dtype, splitK
+        )
+        if flydsl_result is not None:
+            return flydsl_result
 
     if not _ck_a8w8_supported():
         # RDNA (gfx11/gfx12): the CK/asm a8w8 kernel is unavailable; route to the
