@@ -775,7 +775,6 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
             "check_LLVM_MAIN_REVISION": lambda: 0,
             "validate_and_update_archs": lambda: ["gfx942"],
             "hip_flag_checker": lambda _flag: True,
-            "check_and_set_ninja_worker": lambda: None,
             "stage_blob_sources": jit_cache.stage_blob_sources,
             "publish_blob_sources": jit_cache.publish_blob_sources,
             "publish_compiled_kids": jit_cache.publish_compiled_kids,
