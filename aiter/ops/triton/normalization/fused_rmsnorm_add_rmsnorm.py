@@ -12,7 +12,7 @@ from aiter.ops.triton._triton_kernels.normalization.fused_rmsnorm_add_rmsnorm im
 )
 
 
-def _fused_rmsnorm_add_rmsnorm_into_fake(
+def _fused_rmsnorm_add_rmsnorm_fake(
     x: torch.Tensor,
     residual: torch.Tensor,
     post_weight: torch.Tensor,
@@ -20,18 +20,15 @@ def _fused_rmsnorm_add_rmsnorm_into_fake(
     post_eps: float,
     pre_eps: float,
     residual_out: torch.Tensor,
-    out: torch.Tensor,
-) -> None:
-    return None
+) -> torch.Tensor:
+    return torch.empty_like(x)
 
 
-# The registered op only mutates buffers: custom ops cannot return an input
-# tensor as an output alias. The public wrapper below owns allocation and return.
 @torch_compile_guard(
-    mutates_args=["residual_out", "out"],
-    gen_fake=_fused_rmsnorm_add_rmsnorm_into_fake,
+    mutates_args=["residual_out"],
+    gen_fake=_fused_rmsnorm_add_rmsnorm_fake,
 )
-def _fused_rmsnorm_add_rmsnorm_into(
+def fused_rmsnorm_add_rmsnorm(
     x: torch.Tensor,
     residual: torch.Tensor,
     post_weight: torch.Tensor,
@@ -39,9 +36,20 @@ def _fused_rmsnorm_add_rmsnorm_into(
     post_eps: float,
     pre_eps: float,
     residual_out: torch.Tensor,
-    out: torch.Tensor,
-) -> None:
+) -> torch.Tensor:
+    """Write BF16 residual sum to ``residual_out`` and return BF16 pre-norm.
+
+    The norm and residual inputs are BF16 ``(M, N)`` and both weights are
+    ``(N,)``. Weights use the Muse/Gemma ``1 + weight`` convention. The first
+    norm and residual add remain FP32 in the kernel; both outputs are
+    rounded to BF16 at their stores. ``residual_out`` is a caller-owned BF16
+    ``(M, N)`` tensor. Inputs and buffers are expected to be contiguous on the
+    same GPU.
+    """
+    assert x.ndim == 2
+    assert x.dtype == torch.bfloat16
     M, N = x.shape
+    out = torch.empty_like(x)
     if M:
         block = triton.next_power_of_2(N)
         num_warps = 4 if M <= 128 else 8
@@ -58,32 +66,4 @@ def _fused_rmsnorm_add_rmsnorm_into(
             BLOCK_SIZE_N=block,
             num_warps=num_warps,
         )
-
-
-def fused_rmsnorm_add_rmsnorm(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    post_weight: torch.Tensor,
-    pre_weight: torch.Tensor,
-    post_eps: float,
-    pre_eps: float,
-    residual_out: torch.Tensor,
-    out: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Write BF16 residual sum to ``residual_out`` and return BF16 pre-norm.
-
-    The norm and residual inputs are BF16 ``(M, N)`` and both weights are
-    ``(N,)``. Weights use the Muse/Gemma ``1 + weight`` convention. The first
-    norm and residual add remain FP32 in the kernel; both outputs are
-    rounded to BF16 at their stores. ``residual_out`` is a caller-owned BF16
-    ``(M, N)`` tensor. ``out`` is an optional BF16 destination for the returned
-    pre-norm. Inputs and buffers are expected to be contiguous on the same GPU.
-    """
-    assert x.ndim == 2
-    assert x.dtype == torch.bfloat16
-    if out is None:
-        out = torch.empty_like(x)
-    _fused_rmsnorm_add_rmsnorm_into(
-        x, residual, post_weight, pre_weight, post_eps, pre_eps, residual_out, out
-    )
     return out
