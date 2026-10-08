@@ -28,6 +28,13 @@ from .quant import per_1x32_mx_quant
 __all__ = ["MegaMoEV2"]
 
 
+def _torch_stream(stream: fx.Stream) -> torch.cuda.Stream:
+    """The torch stream behind a FlyDSL stream handle."""
+    if not stream.value:
+        return torch.cuda.default_stream()
+    return torch.cuda.ExternalStream(stream.value)
+
+
 class MegaMoEV2:
     """Fused dispatch, GEMM1, GEMM2, and combine with one in-flight launch per instance."""
 
@@ -61,8 +68,12 @@ class MegaMoEV2:
         if self.moonep_slots:
             if fanout_masks:
                 raise ValueError("MoonEP placement requires fanout pairs disabled")
-            if not 0 < self.moonep_slots < self.epr:
-                raise ValueError(f"moonep_slots={moonep_slots} out of range")
+            # The placement settles one destination's slots per 64-lane wave.
+            if not 0 < self.moonep_slots < self.epr or self.moonep_slots > 64:
+                raise ValueError(
+                    f"moonep_slots={moonep_slots} must be in [1, 64] and below "
+                    f"experts per rank ({self.epr})"
+                )
         self.topk = int(topk)
         if not 0 < self.topk <= 16:
             raise ValueError(f"MegaMoEV2 topk must be in [1, 16], got {self.topk}")
@@ -837,7 +848,10 @@ class MegaMoEV2:
             quant_input=x_bf16,
         )
         if after_prepare is not None:
-            after_prepare()
+            # The slot copy must land between prepare and Stage1, so it runs on
+            # the stream they share.
+            with torch.cuda.stream(_torch_stream(prepare_stream)):
+                after_prepare()
         x_q = self._s1_quant_x[:run_tokens]
         scales = self._s1_quant_scale[:run_tokens]
         return self._run_joint(

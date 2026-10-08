@@ -55,6 +55,8 @@ def main():
     parser.add_argument("--mtpr", type=int, default=0,
                         help="instance capacity (default: --tokens), e.g. decode batches "
                              "far below a prefill-sized instance")
+    parser.add_argument("--stream", action="store_true",
+                        help="pass an explicit side stream to forward()")
     parser.add_argument("--graph", action="store_true",
                         help="run the fused instance from one CUDA graph per layer")
     args = parser.parse_args()
@@ -124,6 +126,7 @@ def main():
                 rows.copy_(torch.where(copy[:, None], all_experts.index_select(0, src), rows))
 
         graphs = {}
+        side = torch.cuda.Stream()
 
         def replay(index, layer, x, wts, ids):
             """Capture this layer once (prepare, slot fill and all), then replay."""
@@ -161,6 +164,15 @@ def main():
                     bind_fused(fused, layer)
                     if args.graph:
                         out = replay(index, layer, x, wts, ids)
+                    elif args.stream:
+                        # The slot fill must follow prepare onto this stream.
+                        side.wait_stream(torch.cuda.current_stream())
+                        out = fused.forward(
+                            x, wts, ids, stream=side, moonep_balance=balance,
+                            after_prepare=lambda layer=layer: prefetch(layer),
+                        )
+                        torch.cuda.current_stream().wait_stream(side)
+                        out = out.clone()
                     else:
                         out = fused.forward(
                             x, wts, ids, moonep_balance=balance,

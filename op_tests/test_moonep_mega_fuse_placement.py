@@ -32,7 +32,7 @@ _LAUNCHERS = {}
 
 
 def _launcher(rank: int, balance: bool):
-    key = (rank, balance)
+    key = (rank, balance, B)
     if key in _LAUNCHERS:
         return _LAUNCHERS[key]
 
@@ -48,7 +48,7 @@ def _launcher(rank: int, balance: bool):
         target: fx.Array[fx.Int32, R * B, 16]
 
     @flyc.kernel(
-        name=f"test_moonep_fuse_r{rank}_b{int(balance)}",
+        name=f"test_moonep_fuse_r{rank}_b{int(balance)}_s{B}",
         known_block_size=[WAVES * 64, 1, 1],
     )
     def kernel(
@@ -96,7 +96,12 @@ def _launcher(rank: int, balance: bool):
 
 def _routing(tokens: int, skew: float, seed: int) -> torch.Tensor:
     gen = torch.Generator().manual_seed(seed)
-    if skew < 0:
+    if skew <= -100:
+        # Six evenly hot ranks, two idle: each idle rank takes ~36 remote
+        # experts, so more than 32 slots are settled at once.
+        popularity = torch.full((E,), 1e-9, dtype=torch.float64)
+        popularity[: 6 * EPN] = 1.0
+    elif skew < 0:
         # Hot home: many similar experts on two ranks, so every destination
         # wants several remote experts and the top-B cut and rollback run.
         popularity = torch.ones(E, dtype=torch.float64)
@@ -284,21 +289,37 @@ def run_case(rank: int, skew: float, seed: int, *, sticky_held: bool, balance=Tr
     if os.environ.get("MOONEP_TEST_DUMP"):
         print("placed", g_placed.view(R, B).cpu().tolist()[:2])
         print("ref   ", ref_placed.tolist()[:2])
-    print(f"rank={rank} skew={skew} seed={seed} sticky={sticky_held} balance={balance} "
+    print(f"B={B} rank={rank} skew={skew} seed={seed} sticky={sticky_held} balance={balance} "
           f"moved={moved} prefetch={int((ref_etc >= 0).sum())} -> {'OK' if not bad else 'FAIL ' + ','.join(bad)}")
     return not bad
+
+
+def _set_slots(slots: int) -> None:
+    global B, VS, VIRTUAL_STRIDE
+    B, VS = slots, EPN + slots
+    VIRTUAL_STRIDE = R * VS + R
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--quick", action="store_true")
+    # 48 > 32 exercises a slot bitmap wider than 32 bits.
+    parser.add_argument("--slots", default="8,48")
     args = parser.parse_args()
     cases = [(0, 1.2, 1, False, True), (3, 1.2, 2, True, True), (7, 0.0, 3, False, True),
              (5, 0.8, 4, True, True), (2, 1.2, 5, True, False),
-             (1, -6.0, 6, False, True), (4, -6.0, 7, True, True), (6, -3.0, 8, True, True)]
+             (1, -6.0, 6, False, True), (4, -6.0, 7, True, True), (6, -3.0, 8, True, True),
+             (0, -100.0, 9, False, True), (7, -100.0, 10, True, True)]
     if args.quick:
         cases = cases[:1]
-    ok = all([run_case(r, s, seed, sticky_held=st, balance=bal) for r, s, seed, st, bal in cases])
+    results = []
+    for slots in (int(v) for v in args.slots.split(",")):
+        _set_slots(slots)
+        results += [
+            run_case(r, s, seed, sticky_held=st, balance=bal)
+            for r, s, seed, st, bal in cases
+        ]
+    ok = all(results)
     print("ALL_OK" if ok else "SOME_FAILED")
     return 0 if ok else 1
 

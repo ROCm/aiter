@@ -417,7 +417,8 @@ def _emit_balanced_placement(
         want.append(_lds_load(p_etc, row + fx.Int32(s)))
         held.append(slot_held[row + fx.Int32(s)])
     target = []
-    taken = fx.Int32(0)
+    # One bit per slot; B may reach a full wave (64).
+    taken = fx.Int64(0)
     for s in range_constexpr(B):
         hit = fx.Int32(-1)
         for t in range_constexpr(B):
@@ -427,17 +428,19 @@ def _emit_balanced_placement(
             )
         target.append(hit)
         safe_hit = (hit >= fx.Int32(0)).select(hit, fx.Int32(0))
-        taken = (hit >= fx.Int32(0)).select(taken | (fx.Int32(1) << safe_hit), taken)
+        taken = (hit >= fx.Int32(0)).select(
+            taken | (fx.Int64(1) << fx.Int64(safe_hit)), taken
+        )
     for s in range_constexpr(B):
         free = fx.Int32(0)
         for t in range_constexpr(B):
             t_rev = B - 1 - t
-            free = (((taken >> fx.Int32(t_rev)) & fx.Int32(1)) == fx.Int32(0)).select(
+            free = (((taken >> fx.Int64(t_rev)) & fx.Int64(1)) == fx.Int64(0)).select(
                 fx.Int32(t_rev), free
             )
         mover = (want[s] >= fx.Int32(0)) & (target[s] < fx.Int32(0))
         target[s] = mover.select(free, target[s])
-        taken = mover.select(taken | (fx.Int32(1) << free), taken)
+        taken = mover.select(taken | (fx.Int64(1) << fx.Int64(free)), taken)
     placed = []
     for t in range_constexpr(B):
         chosen = fx.Int32(-1)

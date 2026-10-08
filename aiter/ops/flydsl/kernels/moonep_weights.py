@@ -54,7 +54,10 @@ class MoonEPWeightPool:
         dtype: torch.dtype = torch.bfloat16,
         block_num: int = 1024,
         block_threads: int = 256,
+        group=None,
     ) -> None:
+        """``rank``/``world_size`` are positions in ``group``, the EP process group
+        whose ranks map each other's segments (None: the default group)."""
         numel = 1
         for d in weight_shape:
             numel *= d
@@ -86,6 +89,7 @@ class MoonEPWeightPool:
             rank=rank,
             world_size=world_size,
             device=self.device,
+            group=group,
         )
         self.stride = self._vmm.stride
         self.rows = self._vmm.rows

@@ -218,7 +218,6 @@ class MoonEPVmmPool:
         self.tensor_bytes = self.total_bytes
 
         self._handles: list[ctypes.c_void_p] = []
-        self._peer_fds: list[int] = []
         self._base = _P(0)
         _check(
             _hip.hipMemAddressReserve(
@@ -273,35 +272,49 @@ class MoonEPVmmPool:
             ),
             "hipMemExportToShareableHandle",
         )
-        self._peer_fds = _exchange_fds(
-            self.rank, self.world_size, fd.value, self._group
-        )
-        devs = [0] * self.world_size
-        dist.all_gather_object(devs, dev, group=self._group)
-        for pe in range(self.world_size):
-            if pe == self.rank:
-                continue
-            _enable_peer(devs[pe], dev)
-            h = _P(0)
-            err = _hip.hipMemImportFromShareableHandle(
-                ctypes.byref(h), _P(self._peer_fds[pe]), _HANDLE_TYPE_POSIX_FD
+        # The fds only carry the allocations across processes: once a peer's is
+        # imported the HIP handle owns it, and every peer holds its own copy of
+        # ours after the exchange.  Close them all now; a deep model keeps
+        # several pools per layer alive for its whole lifetime.
+        try:
+            peer_fds = _exchange_fds(
+                self.rank, self.world_size, fd.value, self._group
             )
-            if err != 0:
-                # ROCm 7.0.x wants &fd where 7.1.0+ wants (void*)(uintptr_t)fd;
-                # mori carries the same shim in utils/hip_compat.hpp.
-                cfd = _I(self._peer_fds[pe])
+        finally:
+            os.close(fd.value)
+        try:
+            devs = [0] * self.world_size
+            dist.all_gather_object(devs, dev, group=self._group)
+            for pe in range(self.world_size):
+                if pe == self.rank:
+                    continue
+                _enable_peer(devs[pe], dev)
+                h = _P(0)
                 err = _hip.hipMemImportFromShareableHandle(
-                    ctypes.byref(h), ctypes.byref(cfd), _HANDLE_TYPE_POSIX_FD
+                    ctypes.byref(h), _P(peer_fds[pe]), _HANDLE_TYPE_POSIX_FD
                 )
-            _check(err, f"hipMemImportFromShareableHandle (peer {pe})")
-            self._handles.append(h)
-            _check(
-                _hip.hipMemMap(
-                    _P(self._base.value + pe * self.segment_bytes),
-                    self.segment_bytes, 0, h, 0,
-                ),
-                f"hipMemMap (peer {pe})",
-            )
+                if err != 0:
+                    # ROCm 7.0.x wants &fd where 7.1.0+ wants (void*)(uintptr_t)fd;
+                    # mori carries the same shim in utils/hip_compat.hpp.
+                    cfd = _I(peer_fds[pe])
+                    err = _hip.hipMemImportFromShareableHandle(
+                        ctypes.byref(h), ctypes.byref(cfd), _HANDLE_TYPE_POSIX_FD
+                    )
+                _check(err, f"hipMemImportFromShareableHandle (peer {pe})")
+                os.close(peer_fds[pe])
+                peer_fds[pe] = -1
+                self._handles.append(h)
+                _check(
+                    _hip.hipMemMap(
+                        _P(self._base.value + pe * self.segment_bytes),
+                        self.segment_bytes, 0, h, 0,
+                    ),
+                    f"hipMemMap (peer {pe})",
+                )
+        finally:
+            for pe, peer_fd in enumerate(peer_fds):
+                if pe != self.rank and peer_fd >= 0:
+                    os.close(peer_fd)
 
     # ------------------------------------------------------------ row indices
 
@@ -357,13 +370,6 @@ class MoonEPVmmPool:
         for h in self._handles:
             _hip.hipMemRelease(h)
         self._handles.clear()
-        for i, fd in enumerate(self._peer_fds):
-            if fd >= 0 and i != self.rank:
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
-        self._peer_fds = []
         if self._base.value:
             _hip.hipMemAddressFree(self._base, self.total_bytes)
             self._base = _P(0)
@@ -403,12 +409,16 @@ def _exchange_fds(rank, world, fd, group) -> list[int]:
     before anyone blocks in accept().  accept-then-connect deadlocks.
     """
 
+    # ``rank``/``world`` are positions inside ``group``.  The leader's global
+    # rank sources the broadcast and names the socket directory, so several
+    # EP groups in one world bootstrap side by side.
+    leader = 0 if group is None else dist.get_global_rank(group, 0)
     token = next(_instance_counter)
     base = os.environ.get("MOONEP_VMM_SOCKDIR") or tempfile.gettempdir()
     seed = [None]
     if rank == 0:
-        seed[0] = os.path.join(base, f"moonep_vmm_{os.getpid()}_{token}")
-    dist.broadcast_object_list(seed, src=0, group=group)
+        seed[0] = os.path.join(base, f"moonep_vmm_g{leader}_{os.getpid()}_{token}")
+    dist.broadcast_object_list(seed, src=leader, group=group)
     sockdir = seed[0]
     os.makedirs(sockdir, exist_ok=True)
 
