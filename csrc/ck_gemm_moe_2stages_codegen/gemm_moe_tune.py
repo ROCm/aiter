@@ -6484,6 +6484,36 @@ class Mxfp4FlydslTuner(FmoeTuner):
     def pre_process(self, args):
         self._mxfp4_run_config = bool(args.run_config)
         super().pre_process(args)
+        if args.run_config:
+            return
+        import importlib
+
+        from aiter.ops.moe_mxfp4_aux import prepare_mxfp4_moe_aux
+
+        sorting = importlib.import_module("aiter.fused_moe")
+        shapes = []
+        if sorting._MOE_SORT_BACKEND not in ("opus", "ck"):
+            for _, row in self.untunedf.iterrows():
+                expert, topk = int(row["expert"]), int(row["topk"])
+                if sorting._aux_uses_opus("opus", 16, int(row["token"]) * topk, expert):
+                    continue
+                mode = self._effective_search_mode(row, args)
+                try:
+                    candidates = self._candidate_rows(row, full_search=mode == "full")
+                except (NotImplementedError, RuntimeError, ValueError):
+                    # The per-shape loop persists candidate-catalog failures
+                    # and continues other shapes. Preflight must retain that.
+                    continue
+                if any(candidate["block_m"] == 16 for candidate in candidates):
+                    shapes.append(
+                        (expert, int(row["model_dim"]), int(row["inter_dim"]), topk)
+                    )
+        prepare_mxfp4_moe_aux(shapes)
+        if shapes and os.environ.get("AITER_REBUILD", "0") != "0":
+            # Spawned workers import the JIT layer again. The parent prepared
+            # this module; workers reuse it rather than force a shared rebuild.
+            self._mxfp4_aux_rebuild_requested = os.environ["AITER_REBUILD"]
+            os.environ["AITER_REBUILD"] = "0"
 
     @staticmethod
     def _valid_tuned_mask(tunedf, err_ratio):
