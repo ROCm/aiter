@@ -49,6 +49,61 @@ def csv_rows(path):
         ]
 
 
+def select_csv_lookup(rows, requested, lookup_token):
+    """Identify the primary CSV row for the public token key; never override it."""
+    fields = (
+        "gfx",
+        "cu_num",
+        "model_dim",
+        "inter_dim",
+        "expert",
+        "topk",
+        "act_type",
+        "dtype",
+        "q_dtype_a",
+        "q_dtype_w",
+        "q_type",
+        "use_g1u1",
+        "doweight_stage1",
+    )
+
+    def key(row):
+        values = []
+        for field in fields:
+            value = str(row.get(field, "")).strip()
+            if field in ("cu_num", "model_dim", "inter_dim", "expert", "topk"):
+                value = str(int(float(value)))
+            elif field in ("use_g1u1", "doweight_stage1"):
+                value = {"true": "1", "false": "0"}.get(value.lower(), value)
+            values.append(value)
+        return tuple(values)
+
+    tiers = [lookup_token]
+    if lookup_token > fm._PADDED_M_TIERS[0]:
+        index = (
+            fm._PADDED_M_TIERS.index(lookup_token)
+            if lookup_token in fm._PADDED_M_TIERS
+            else -1
+        )
+        tiers.extend(reversed(fm._PADDED_M_TIERS[:index]))
+    requested_key = key(requested)
+    for token in tiers:
+        for index, row in enumerate(rows):
+            if (
+                row.get("_tag") != "flydsl_fallback"
+                and int(float(row["token"])) == token
+                and key(row) == requested_key
+            ):
+                return {
+                    "csv_row": index,
+                    "token": token,
+                    "kernelName1": row["kernelName1"],
+                    "kernelName2": row["kernelName2"],
+                    "source_tag": row.get("_tag", ""),
+                }
+    return None
+
+
 def decode_valid_scales(
     payload, scales, inter_dim, block_m, sorted_ids, valid_ids, token
 ):
@@ -89,8 +144,18 @@ def decode_valid_scales(
 
 @benchmark()
 def test_public_a8w4_csv(
-    token, model_dim, inter_dim, expert, topk, activation, kernel1, kernel2
+    token,
+    model_dim,
+    inter_dim,
+    expert,
+    topk,
+    activation,
+    kernel1,
+    kernel2,
+    expected_pair=None,
+    lookup_csv_token=None,
 ):
+    expected_pair = (kernel1, kernel2) if expected_pair is None else expected_pair
     g1 = _parse_mxfp4_g1_kname(kernel1)
     g2 = parse_flydsl_v2_gemm2_kernel(kernel2)
     if (g1["a_dtype"], g1["out_dtype"]) != ("fp8", "fp8") or g2 is None:
@@ -168,7 +233,11 @@ def test_public_a8w4_csv(
             output=output,
         )
 
-    ret = {"gfx": get_gfx(), "lookup_token": fm.get_padded_M(token)}
+    ret = {
+        "gfx": get_gfx(),
+        "lookup_token": fm.get_padded_M(token),
+        "lookup_csv_token": lookup_csv_token,
+    }
     with patch.object(fm, "_mxfp4_a4w4_stage1_fw", observe1), patch.object(
         fm, "_mxfp4_a4w4_stage2_fw", observe2
     ):
@@ -178,12 +247,19 @@ def test_public_a8w4_csv(
             result = public()
             assert result.data_ptr() == output.data_ptr()
             assert torch.isfinite(result).all()
-        expected = [("g1", kernel1), ("g2", kernel2)]
-        if calls[-2:] != expected:
+        actual1 = next((name for stage, name in reversed(calls) if stage == "g1"), "")
+        actual2 = next((name for stage, name in reversed(calls) if stage == "g2"), "")
+        ret.update(actual_G1=actual1, actual_G2=actual2)
+        expected = (
+            [("g1", expected_pair[0]), ("g2", expected_pair[1])]
+            if expected_pair
+            else []
+        )
+        if not expected_pair or calls[-2:] != expected:
             ret.update(
                 status="fallback",
                 actual_calls=json.dumps(calls),
-                failure_reason="public call did not execute the input row's pair",
+                failure_reason="public call did not execute the primary row selected by the token lookup",
             )
             return ret
         assert (
@@ -216,7 +292,19 @@ def test_public_a8w4_csv(
     # intermediate inspection or reference/poison operations in its interval.
     candidates = {"public_fused_moe": public}
     flops = token * topk * model_dim * inter_dim * 6
-    nbytes = token * model_dim * 4 + topk * expert * model_dim * inter_dim * 1.5
+    nbytes = sum(
+        tensor.numel() * tensor.element_size()
+        for tensor in (
+            data["input"],
+            data["w1_a16"],
+            data["w2_a16"],
+            data["w1s_a16"],
+            data["w2s_a16"],
+            data["topk_ids"],
+            data["topk_weights"],
+            output,
+        )
+    )
     for name, fn in candidates.items():
         result, us = run_perftest(fn)
         assert torch.isfinite(result).all()
@@ -229,11 +317,9 @@ def test_public_a8w4_csv(
     ret.update(
         status=(
             "padded_token_pair_hit"
-            if token != fm.get_padded_M(token)
+            if token != (lookup_csv_token or fm.get_padded_M(token))
             else "exact_pair_hit"
         ),
-        actual_G1=kernel1,
-        actual_G2=kernel2,
         failure_reason="",
     )
     return ret
@@ -262,7 +348,20 @@ def main():
     records = []
     for (index,) in itertools.product(indices):
         row = rows[index]
-        base = {"csv_row": index, "source_tag": row.get("_tag", ""), "shape": row}
+        lookup = select_csv_lookup(rows, row, fm.get_padded_M(int(row["token"])))
+        base = {
+            "csv_row": index,
+            "source_tag": row.get("_tag", ""),
+            "shape": row,
+            "requested_pair": {"G1": row["kernelName1"], "G2": row["kernelName2"]},
+            "lookup_csv_row": lookup["csv_row"] if lookup else None,
+            "lookup_csv_token": lookup["token"] if lookup else None,
+            "lookup_pair": (
+                {"G1": lookup["kernelName1"], "G2": lookup["kernelName2"]}
+                if lookup
+                else None
+            ),
+        }
         try:
             if row.get("_tag") == "flydsl_fallback" or row["q_dtype_a"] != str(
                 dtypes.fp8
@@ -289,6 +388,12 @@ def main():
                             activation,
                             row["kernelName1"],
                             row["kernelName2"],
+                            expected_pair=(
+                                (lookup["kernelName1"], lookup["kernelName2"])
+                                if lookup
+                                else ()
+                            ),
+                            lookup_csv_token=lookup["token"] if lookup else None,
                         )
                     )
         except Exception as exc:  # noqa: BLE001
