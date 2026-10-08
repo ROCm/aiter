@@ -39,8 +39,8 @@ def _make_inputs(m, n, k, *, padded=False):
     ldb = k + 16 if padded else k
     x = torch.empty_strided((m, k), (lda, 1), dtype=torch.int8, device=device)
     w = torch.empty_strided((n, k), (ldb, 1), dtype=torch.int8, device=device)
-    x.random_(from_=-17, to=18)
-    w.random_(from_=-17, to=18)
+    x.random_(-17, 18)
+    w.random_(-17, 18)
     x_scale = torch.linspace(0.007, 0.19, m, dtype=torch.float32, device=device)
     w_scale = torch.linspace(0.011, 0.13, n, dtype=torch.float32, device=device)
     return x, w, x_scale, w_scale
