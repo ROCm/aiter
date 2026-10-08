@@ -530,9 +530,8 @@ pytest op_tests/triton_tests/gemm/basic/   # one subset
   else. Reviewer time is precious in the age of agentic coding tools.
 - Sometimes, as the PR evolves, its title and description get outdated. Please double check if the
   PR information is up to date before merging.
-- If you have write access to the [AITER ROCm fork](https://github.com/ROCm/aiter), open the PR from
-  there instead of your own fork. When opening a PR from a fork, Docker access is unauthenticated,
-  which may cause CI issues due to rate limiting.
+- Open the PR from [AITER ROCm fork](https://github.com/ROCm/aiter). Open the PR from your own fork
+  only if you don't have access to AITER ROCm fork.
 - Strip the **Co-authored-by: AI agent** part of your commits before merging.
 
 **Warning:** PRs that don't comply with the checklist won't be reviewed or merged. Please be a good
