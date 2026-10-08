@@ -3,7 +3,7 @@
 
 """FP8 paged-attention tile kernel.
 
-K/V use e4m3 (FNUZ on gfx942, OCP on gfx950); BF16/FP16 Q and probabilities P
+K/V use e4m3 (FNUZ on gfx942, OCP on gfx950/gfx1250); BF16/FP16 Q and probabilities P
 are quantized to FP8. Q/key scales fold into QK, value scale and 1/FP8_MAX into
 the epilogue; softmax max/sum stay f32. Tuned gfx950 BF16 per-token MTP3/MTP4
 uses K128 MFMA instead of K32, preserving normalized Q/P and operand layouts.
@@ -23,8 +23,9 @@ Logical layouts (not preshuffled):
                    same dtype as query; normalized partition output
 * K/V scales      [1] per-tensor or [num_blocks, num_kv_heads, block_size] per-token
 
-Four-wave CTAs process 256-token blocks: QK splits tokens, PV splits head dim,
-and P passes through LDS to transpose ownership between the MMAs.
+Four-wave CTAs process 256-token plan tiles: QK splits tokens, PV splits head
+dim, and P passes through LDS to transpose ownership between the MMAs.
+gfx1250 uses wave32 WMMA and 64-token subtiles with async K/V LDS staging.
 
 The ``pa_decode`` package separates schedule/layout traits, CTA context, Q/K/V
 and LDS movement, MFMA, softmax and output operations. ``PaDecodePipeline``
@@ -36,6 +37,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, gpu
+from flydsl.runtime.device import get_rocm_arch
 
 from .pa_decode import implementation_cache_tag
 from .pa_decode.context import PaDecodeContext
@@ -67,6 +69,7 @@ _PA_DECODE_TILE_CACHE = {}
 
 def compile_pa_decode_tile(
     *,
+    architecture: str | None = None,
     head_dim: int,
     query_group_size: int,
     block_size: int,
@@ -115,7 +118,27 @@ def compile_pa_decode_tile(
     offsets at 2 GiB; ``kv_buffer_u32`` proves both FP8 caches are below 4 GiB
     and permits unsigned buffer offsets instead of i64.
     """
+    architecture = (architecture or get_rocm_arch()).split(":")[0]
+    if architecture == "gfx1250":
+        from .pa_decode.gfx1250 import compile_gfx1250_pa_decode
+
+        if query_splits not in (None, 1):
+            raise NotImplementedError(
+                "gfx1250 PA decode currently uses fused query rows"
+            )
+        return compile_gfx1250_pa_decode(
+            head_dim=head_dim,
+            query_group_size=query_group_size,
+            block_size=block_size,
+            softmax_scale=softmax_scale,
+            query_dtype=query_dtype,
+            per_token_kv=per_token_kv,
+            query_length=query_length,
+            trans_v=trans_v,
+            sliding_window=sliding_window,
+        )
     schedule = PaDecodeSchedule.select(
+        architecture=architecture,
         head_dim=head_dim,
         query_group_size=query_group_size,
         block_size=block_size,

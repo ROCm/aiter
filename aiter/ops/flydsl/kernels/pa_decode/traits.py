@@ -32,6 +32,7 @@ class PaDecodeSchedule:
     def select(
         cls,
         *,
+        architecture: str | None = None,
         head_dim: int,
         query_group_size: int,
         block_size: int,
@@ -56,7 +57,10 @@ class PaDecodeSchedule:
             raise TypeError("work_capacity must be a positive int")
         if work_capacity < 1:
             raise ValueError("work_capacity must be positive")
-        is_gfx950 = "gfx95" in get_rocm_arch()
+        architecture = (architecture or get_rocm_arch()).split(":")[0]
+        if architecture not in ("gfx942", "gfx950"):
+            raise NotImplementedError(f"CDNA PA decode does not support {architecture}")
+        is_gfx950 = architecture == "gfx950"
         IS_BF16 = query_dtype == "bf16"
         TUNED_SHAPE = is_gfx950 and head_dim == 128 and block_size in (16, 128)
         TUNED_PER_TOKEN = TUNED_SHAPE and IS_BF16 and per_token_kv
@@ -184,6 +188,7 @@ class PaDecodeSchedule:
             single_tile_plan,
             batch_first_plan_grid,
             sliding_window,
+            architecture,
         )
         return cls(
             cache_key=cache_key,
@@ -311,6 +316,7 @@ class PaDecodeTraits:
             single_tile_plan,
             batch_first_plan_grid,
             sliding_window,
+            _architecture,
         ) = cache_key
         is_gfx950 = schedule.is_gfx950
         IS_BF16 = query_dtype == "bf16"

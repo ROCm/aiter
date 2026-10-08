@@ -1,18 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 
-"""FP8 paged-attention decode with BF16/FP16 queries on gfx942/gfx950.
+"""FP8 paged-attention decode with BF16/FP16 queries on gfx942/gfx950/gfx1250.
 
 Cache layouts are logical, not preshuffled. K/V use E4M3 FNUZ on gfx942 and
-OCP on gfx950. See ``kernels.pa_decode_kernel`` for Q/P quantization and
-MFMA specialization details.
+OCP on gfx950/gfx1250. See ``kernels.pa_decode_kernel`` for Q/P quantization,
+MFMA and wave32 WMMA specialization details.
 """
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-
-from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from .kernels.pa_decode_kernel import KV_COMPUTE_BLOCK, compile_pa_decode_tile
 from .kernels.pa_decode_plan import PADecodePlan
@@ -87,6 +85,9 @@ def launch_pa_decode_ps_reduce(
         and stride_logits_group % 2 == 0
     )
     compiled = compile_pa_decode_ps_reduce(
+        architecture=torch.cuda.get_device_properties(output.device).gcnArchName.split(
+            ":"
+        )[0],
         max_context_partition_num=context_partition_num,
         head_size=head_size,
         output_dtype_str=get_dtype_str(output.dtype),
@@ -336,14 +337,15 @@ def pa_decode(
             f"num_kv_heads ({num_kv_heads})"
         )
 
-    arch = get_gfx_runtime()
+    arch = torch.cuda.get_device_properties(query.device).gcnArchName.split(":")[0]
     expected_fp8_dtype = {
         "gfx942": torch.float8_e4m3fnuz,
         "gfx950": torch.float8_e4m3fn,
+        "gfx1250": torch.float8_e4m3fn,
     }.get(arch)
     if expected_fp8_dtype is None:
         raise NotImplementedError(
-            f"pa_decode only supports gfx942 and gfx950, got {arch}"
+            f"pa_decode only supports gfx942, gfx950 and gfx1250, got {arch}"
         )
     if compute_type != expected_fp8_dtype:
         raise NotImplementedError(
@@ -524,6 +526,7 @@ def pa_decode(
 
     with torch.cuda.device(dev):
         compiled = compile_pa_decode_tile(
+            architecture=arch,
             head_dim=head_dim,
             query_group_size=query_group_size,
             block_size=int(block_size),

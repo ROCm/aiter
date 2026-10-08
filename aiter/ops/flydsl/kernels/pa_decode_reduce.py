@@ -67,6 +67,7 @@ def is_pa_decode_ps_reduce_supported(
 @lru_cache(maxsize=256)
 def compile_pa_decode_ps_reduce(
     *,
+    architecture: str = "gfx950",
     max_context_partition_num: int,
     head_size: int,
     output_dtype_str: str,
@@ -120,15 +121,14 @@ def compile_pa_decode_ps_reduce(
     logits_dtype = _DTYPE_MAP[logits_dtype_str]
     sink_dtype = _DTYPE_MAP[sink_dtype_str]
 
-    warp_size = 64
+    if architecture not in ("gfx942", "gfx950", "gfx1250"):
+        raise NotImplementedError(f"PA decode reducer does not support {architecture}")
+    warp_size = 32 if architecture == "gfx1250" else 64
     log2e = 1.4426950408889634
-    reduce_width = (
-        1
-        if max_context_partition_num == 1
-        else 1 << ((max_context_partition_num - 1).bit_length())
-    )
+    # Statistics must reach every output lane, including lanes that own no
+    # partition. Subgroup reductions leave those lanes with -inf/zero.
     reduce_shuffle_offsets = [
-        offset for offset in (32, 16, 8, 4, 2, 1) if offset < reduce_width
+        offset for offset in (32, 16, 8, 4, 2, 1) if offset < warp_size
     ]
 
     use_parallel_lds = (
@@ -584,9 +584,9 @@ def compile_pa_decode_ps_reduce(
             if fx.const_expr(max_context_partition_num > 8):
                 # Count is CTA-uniform; keep short-path loads and math inside it.
                 if c_part_num <= c_four:
-                    acc = _reduce_planned_wave(4, (2, 1))
+                    acc = _reduce_planned_wave(4, reduce_shuffle_offsets)
                 elif c_part_num <= fx.Int32(8):
-                    acc = _reduce_planned_wave(8, (4, 2, 1))
+                    acc = _reduce_planned_wave(8, reduce_shuffle_offsets)
                 else:
                     acc = _reduce_planned_wave(
                         max_context_partition_num, reduce_shuffle_offsets
@@ -599,11 +599,11 @@ def compile_pa_decode_ps_reduce(
             acc = zero_f
             if fx.const_expr(compact_plan) and c_part_num <= fx.Int32(32):
                 if c_part_num <= c_four:
-                    acc = _reduce_planned_wave(4, (2, 1))
+                    acc = _reduce_planned_wave(4, reduce_shuffle_offsets)
                 elif c_part_num <= fx.Int32(8):
-                    acc = _reduce_planned_wave(8, (4, 2, 1))
+                    acc = _reduce_planned_wave(8, reduce_shuffle_offsets)
                 else:
-                    acc = _reduce_planned_wave(32, (16, 8, 4, 2, 1))
+                    acc = _reduce_planned_wave(32, reduce_shuffle_offsets)
             else:
                 acc = _reduce_striped()
 

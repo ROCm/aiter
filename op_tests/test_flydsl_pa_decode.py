@@ -19,7 +19,7 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 def device(monkeypatch):
     if not torch.cuda.is_available():
         pytest.skip("ROCm is not available")
-    if get_gfx_runtime() not in ("gfx942", "gfx950"):
+    if get_gfx_runtime() not in ("gfx942", "gfx950", "gfx1250"):
         pytest.skip(f"pa_decode is unsupported on {get_gfx_runtime()}")
     if importlib.util.find_spec("flydsl") is None:
         pytest.skip("FlyDSL is not installed")
@@ -163,7 +163,9 @@ def test_pa_decode(
         query_length, kv_heads, group_size, head_dim, block_size, dtype, pattern, device
     )
     fp8 = (
-        torch.float8_e4m3fn if get_gfx_runtime() == "gfx950" else torch.float8_e4m3fnuz
+        torch.float8_e4m3fn
+        if get_gfx_runtime() in ("gfx950", "gfx1250")
+        else torch.float8_e4m3fnuz
     )
     quantize = pertoken_quant if per_token else per_tensor_quant
     key, key_scale = quantize(key, quant_dtype=fp8)

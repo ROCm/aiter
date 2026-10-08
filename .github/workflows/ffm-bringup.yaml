@@ -204,6 +204,14 @@ jobs:
               python3 -m pip show torch triton amd-triton triton-kernels amd-aiter aiter || true
               python3 -m pip uninstall -y pylama || true
 
+              if [ "${FFM_SHARD_INDEX}" -eq 0 ]; then
+                echo "==== Run gfx1250 FlyDSL PA decode tests ===="
+                python3 -c 'import flydsl.expr.rocdl as r; assert hasattr(r, "wmma_f32_16x16x128_fp8_fp8"); assert hasattr(r, "cvt_scalef32_pk8_fp8_f32"); import torch; assert torch.cuda.get_device_properties(0).gcnArchName.startswith("gfx1250")'
+                python3 -m pytest -q --tb=short \
+                  op_tests/test_flydsl_pa_decode.py \
+                  op_tests/test_flydsl_pa_decode_gfx1250.py
+              fi
+
               echo "==== Build FFM Triton shard ===="
               : > ffm_all_items.list
               mapfile -t FFM_TEST_FILES < <(
