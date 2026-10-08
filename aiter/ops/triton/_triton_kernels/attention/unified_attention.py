@@ -1028,6 +1028,13 @@ def reduce_segments(
 
     # create masks for subsequent loads
     act_num_segments = cdiv_fn(seq_len, tiles_per_segment * TILE_SIZE)
+    single_tile: tl.constexpr = (
+        SEGMENT_BLOCK == 0 or SEGMENT_BLOCK >= NUM_SEGMENTS_PER_SEQ
+    )
+    if single_tile:
+        segm_mask = tl.arange(0, NUM_SEGMENTS_PER_SEQ) < tl.full(
+            [NUM_SEGMENTS_PER_SEQ], act_num_segments, dtype=tl.int32
+        )
 
     offs_vd = tl.arange(0, V_HEAD_SIZE_PADDED)
     if V_HEAD_SIZE_PADDED != V_HEAD_SIZE:
@@ -1035,21 +1042,13 @@ def reduce_segments(
     else:
         v_dim_mask = tl.full((1,), 1, dtype=tl.int1)
 
-    segm_base = (
-        query_token_idx.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
-        + query_head_idx * NUM_SEGMENTS_PER_SEQ
-    )
-    segm_output_base = query_token_idx.to(tl.int64) * (
-        num_query_heads * NUM_SEGMENTS_PER_SEQ * V_HEAD_SIZE_PADDED
-    ) + query_head_idx * (NUM_SEGMENTS_PER_SEQ * V_HEAD_SIZE_PADDED)
-
-    if SEGMENT_BLOCK == 0 or SEGMENT_BLOCK >= NUM_SEGMENTS_PER_SEQ:
-        segm_mask = tl.arange(0, NUM_SEGMENTS_PER_SEQ) < tl.full(
-            [NUM_SEGMENTS_PER_SEQ], act_num_segments, dtype=tl.int32
-        )
-
+    if single_tile:
         # load segment maxima
-        segm_offset = segm_base + tl.arange(0, NUM_SEGMENTS_PER_SEQ)
+        segm_offset = (
+            query_token_idx.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
+            + query_head_idx * NUM_SEGMENTS_PER_SEQ
+            + tl.arange(0, NUM_SEGMENTS_PER_SEQ)
+        )
         segm_max = tl.load(
             segm_max_ptr + segm_offset, mask=segm_mask, other=float("-inf")
         )
@@ -1062,7 +1061,9 @@ def reduce_segments(
 
         # load, rescale, and add segment attention outputs
         segm_output_offset = (
-            segm_output_base
+            query_token_idx.to(tl.int64)
+            * (num_query_heads * NUM_SEGMENTS_PER_SEQ * V_HEAD_SIZE_PADDED)
+            + query_head_idx * (NUM_SEGMENTS_PER_SEQ * V_HEAD_SIZE_PADDED)
             + tl.arange(0, NUM_SEGMENTS_PER_SEQ)[:, None] * V_HEAD_SIZE_PADDED
             + offs_vd[None, :]
         )
@@ -1076,6 +1077,13 @@ def reduce_segments(
     else:
         # online merge over the written segments only, so the cost follows the
         # context rather than NUM_SEGMENTS_PER_SEQ
+        segm_base = (
+            query_token_idx.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
+            + query_head_idx * NUM_SEGMENTS_PER_SEQ
+        )
+        segm_output_base = query_token_idx.to(tl.int64) * (
+            num_query_heads * NUM_SEGMENTS_PER_SEQ * V_HEAD_SIZE_PADDED
+        ) + query_head_idx * (NUM_SEGMENTS_PER_SEQ * V_HEAD_SIZE_PADDED)
         offs_s = tl.arange(0, SEGMENT_BLOCK)
         overall_max = tl.full([], float("-inf"), dtype=tl.float32)
         overall_expsum = tl.zeros([], dtype=tl.float32)
