@@ -14,6 +14,7 @@ import math
 import pytest
 import torch
 
+from aiter.ops.triton.attention.mha import flash_attn_func
 from aiter.ops.triton.attention.mxfp8_attention import (
     mxfp8_attention_backward,
     mxfp8_attention_forward,
@@ -244,3 +245,83 @@ def test_mxfp8_attn_bwd(B, HQ, HK, S, D, causal):
     torch.testing.assert_close(
         dv.float(), dv_ref.float(), atol=atol, rtol=rtol, msg=f"dv mismatch {tag}"
     )
+
+
+def test_flash_attn_func_mxfp8_matches_reference():
+    """flash_attn_func MXFP8 path uses the public bshd layout."""
+    torch.manual_seed(0)
+    b, hq, hk, s, d = 1, 4, 2, 64, 64
+    sm_scale = 1.0 / math.sqrt(d)
+    q_hp = torch.randn(b, s, hq, d, dtype=torch.bfloat16, device="cuda") * 0.1
+    k_hp = torch.randn(b, s, hk, d, dtype=torch.bfloat16, device="cuda") * 0.1
+    v_hp = torch.randn(b, s, hk, d, dtype=torch.bfloat16, device="cuda") * 0.1
+    q, q_scale = _quantize_bshd(q_hp)
+    k, k_scale = _quantize_bshd(k_hp)
+    v, v_scale = _quantize_bshd(v_hp)
+
+    out, lse = flash_attn_func(
+        q,
+        k,
+        v,
+        causal=True,
+        softmax_scale=sm_scale,
+        return_lse=True,
+        q_mx_scale=q_scale,
+        k_mx_scale=k_scale,
+        v_mx_scale=v_scale,
+    )
+    ref = _ref_attention(
+        _bshd_to_bhsd(_dequantize_bshd(q, q_scale, torch.bfloat16)),
+        _bshd_to_bhsd(_dequantize_bshd(k, k_scale, torch.bfloat16)),
+        _bshd_to_bhsd(_dequantize_bshd(v, v_scale, torch.bfloat16)),
+        causal=True,
+        sm_scale=sm_scale,
+    )
+    assert out.shape == (b, s, hq, d)
+    assert out.dtype == torch.bfloat16
+    assert lse.shape == (b, hq, s)
+    torch.testing.assert_close(
+        _bshd_to_bhsd(out).float(), ref.float(), atol=2e-1, rtol=2e-1
+    )
+
+
+def test_flash_attn_func_mxfp8_rejects_partial_and_gluon():
+    q = torch.zeros(1, 64, 4, 64, dtype=_FP8, device="cuda")
+    k = torch.zeros(1, 64, 4, 64, dtype=_FP8, device="cuda")
+    v = torch.zeros(1, 64, 4, 64, dtype=_FP8, device="cuda")
+    scale = torch.ones(1, 2, 4, 2, dtype=torch.uint8, device="cuda")
+    with pytest.raises(ValueError, match="requires q_mx_scale"):
+        flash_attn_func(q, k, v, q_mx_scale=scale)
+    q.requires_grad_(True)
+    with pytest.raises(RuntimeError, match="forward-only"):
+        flash_attn_func(
+            q,
+            k,
+            v,
+            q_mx_scale=scale,
+            k_mx_scale=scale,
+            v_mx_scale=scale,
+        )
+    q.requires_grad_(False)
+    with pytest.raises(ValueError, match="triton backend only"):
+        flash_attn_func(
+            q,
+            k,
+            v,
+            backend="gluon",
+            q_mx_scale=scale,
+            k_mx_scale=scale,
+            v_mx_scale=scale,
+        )
+
+
+def test_flash_attn_func_default_path_still_runs():
+    """Callers that omit MXFP8 scales stay on the existing Triton path."""
+    torch.manual_seed(0)
+    q = torch.randn(1, 64, 4, 64, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(1, 64, 4, 64, dtype=torch.bfloat16, device="cuda")
+    v = torch.randn(1, 64, 4, 64, dtype=torch.bfloat16, device="cuda")
+    out = flash_attn_func(q, k, v, causal=True)
+    assert out.shape == q.shape
+    assert out.dtype == q.dtype
+    assert torch.isfinite(out).all()
