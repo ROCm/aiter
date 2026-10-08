@@ -400,9 +400,11 @@ if PREBUILD_KERNELS != 0:
                 os.environ["AITER_AOT_IMPORT"] = _prev_aot_import
 
         # --- CK kernel builds ---
-        with worker_ceiling(inner_workers):
-            with ThreadPoolExecutor(max_workers=outer_workers) as executor:
-                list(executor.map(build_one_module, all_opts_args_build))
+        with (
+            worker_ceiling(inner_workers),
+            ThreadPoolExecutor(max_workers=outer_workers) as executor,
+        ):
+            list(executor.map(build_one_module, all_opts_args_build))
 
         # Retune GEMM shapes on the live GPU after the main build phase.
         if PRETUNE_MODULES:

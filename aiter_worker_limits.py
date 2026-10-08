@@ -582,10 +582,8 @@ def _amdsmi_gpu_count() -> int | None:
     except Exception:  # noqa: BLE001
         return None
     finally:
-        try:
+        with contextlib.suppress(Exception):
             amdsmi.amdsmi_shut_down()
-        except Exception:  # noqa: BLE001
-            pass
 
 
 def visible_gpu_count() -> int:

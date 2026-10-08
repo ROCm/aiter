@@ -410,10 +410,9 @@ class WorkerAwarenessTest(unittest.TestCase):
 
     def test_worker_ceiling_restores_previous_ceiling_on_error(self):
         with patch.dict(os.environ, {"AITER_MAX_JOBS": "5"}, clear=True):
-            with self.assertRaises(RuntimeError):
-                with worker_limits.worker_ceiling(2):
-                    self.assertEqual(os.environ["AITER_MAX_JOBS"], "2")
-                    raise RuntimeError("boom")
+            with self.assertRaises(RuntimeError), worker_limits.worker_ceiling(2):
+                self.assertEqual(os.environ["AITER_MAX_JOBS"], "2")
+                raise RuntimeError("boom")
             self.assertEqual(os.environ["AITER_MAX_JOBS"], "5")
 
     def test_nonpositive_aiter_max_jobs_is_clamped_without_mutating_environment(self):
