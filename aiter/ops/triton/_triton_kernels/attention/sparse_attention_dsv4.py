@@ -355,75 +355,102 @@ def _sparse_attn_prefill_kernel(
 
     k_offsets = tl.arange(0, BLOCK_K)
     # Prefetch first tile's slot indices so the indirect index load can overlap
-    # the next iteration's QK MFMA latency. Lanes past the row's end get slot 0
-    # only as a placeholder; the validity check below masks them out of both
-    # the gather and the scores.
-    slot = tl.load(
-        kv_indices_ptr + kv_start + k_offsets, mask=k_offsets < kv_len, other=0
-    )
+    # the next iteration's QK MFMA latency. Lanes past the row's end are masked
+    # by `in_range` below; their padding value is only a placeholder.
+    if EVEN_HD:
+        slot = tl.load(
+            kv_indices_ptr + kv_start + k_offsets, mask=k_offsets < kv_len, other=0
+        )
+    else:
+        slot = tl.load(
+            kv_indices_ptr + kv_start + k_offsets, mask=k_offsets < kv_len, other=-1
+        )
     for k_start in tl.range(0, kv_len, BLOCK_K):
         k_pos = k_start + k_offsets
         in_range = k_pos < kv_len
-        # 64-bit before the multiply, same as the decode kernel: a slot index
-        # fits its index dtype (int32 or int64) but `slot * kv_stride_n` may
-        # not once the unified V4 pool runs to ~150M rows. The wrapped offset
-        # would still land inside the same allocation, so the bad read is silent.
-        slot_off = slot.to(tl.int64)
-        # The same widened value gives the validity check without any range
-        # assumption: as unsigned 64-bit, every negative slot (sign-extended)
-        # is >= 2^63, above any pool size, so one compare rejects -1 and slots
-        # past the pool for int32 and int64 indices alike.
-        #
-        # Performance here is finicky. With an int32 index buffer and a pool
-        # under 2^31 rows (num_kv passed as i32), LLVM folds this into a single
-        # 32-bit unsigned compare and the loop keeps a well-pipelined schedule
-        # (1.65 ms on the DSv4.1 TP4 shape, gfx942, Triton 3.7.1). An int64 index
-        # buffer takes a real 64-bit compare and runs ~1.5x slower: the gathers'
-        # waits move to the top of the next iteration. Why the scheduler picks
-        # that pattern is not known; small edits here (e.g. two signed compares)
-        # have triggered it too, so re-measure after touching this block.
-        # Realistic index buffers and pools stay within int32 (vLLM passes
-        # int32), so the fast path is the one that runs in practice.
-        valid = in_range & (slot_off.to(tl.uint64, bitcast=True) < num_kv)
-        # Keep invalid lanes' addresses inside the pool; the gather below does
-        # not load them.
-        slot_off = tl.where(valid, slot_off, 0)
-
-        kv_ptrs = (
-            kv_ptr
-            + slot_off[:, None] * kv_stride_n
-            + dim_offsets[None, :] * kv_stride_d
-        )
+        # EVEN_HD is set only by the gfx942 pinned-tile launch. Every other caller
+        # takes the `else` branches in this loop, which are the original kernel's
+        # code unchanged: on its autotuned schedule the pinned path's validity
+        # compare / redirect / scale placement measured ~30% slower at D=512.
         if EVEN_HD:
+            # 64-bit before the multiply, same as the decode kernel: a slot index
+            # fits its index dtype (int32 or int64) but `slot * kv_stride_n` may
+            # not once the unified V4 pool runs to ~150M rows. The wrapped offset
+            # would still land inside the same allocation, so the bad read is silent.
+            slot_off = slot.to(tl.int64)
+            # The same widened value gives the validity check without any range
+            # assumption: as unsigned 64-bit, every negative slot (sign-extended)
+            # is >= 2^63, above any pool size, so one compare rejects -1 and slots
+            # past the pool for int32 and int64 indices alike.
+            #
+            # Performance here is finicky. With an int32 index buffer and a pool
+            # under 2^31 rows (num_kv passed as i32), LLVM folds this into a single
+            # 32-bit unsigned compare and the loop keeps a well-pipelined schedule
+            # (1.65 ms on the DSv4.1 TP4 shape, gfx942, Triton 3.7.1). An int64 index
+            # buffer takes a real 64-bit compare and runs ~1.5x slower: the gathers'
+            # waits move to the top of the next iteration. Why the scheduler picks
+            # that pattern is not known; small edits here (e.g. two signed compares)
+            # have triggered it too, so re-measure after touching this block.
+            # Realistic index buffers and pools stay within int32 (vLLM passes
+            # int32), so the fast path is the one that runs in practice.
+            valid = in_range & (slot_off.to(tl.uint64, bitcast=True) < num_kv)
+            # Keep invalid lanes' addresses inside the pool; the gather below does
+            # not load them.
+            slot_off = tl.where(valid, slot_off, 0)
+
+            kv_ptrs = (
+                kv_ptr
+                + slot_off[:, None] * kv_stride_n
+                + dim_offsets[None, :] * kv_stride_d
+            )
             # Invalid rows must not be loaded at all: a zero softmax weight does
             # not neutralize a non-finite value in the PV dot (0 * NaN = NaN).
             # Masking whole rows keeps the 16-byte vectorized loads; zeroing the
             # loaded tile with tl.where instead blows up the loop (~2x slower).
             kv = tl.load(kv_ptrs, mask=valid[:, None], other=0.0)
         else:
-            kv = tl.load(kv_ptrs, mask=valid[:, None] & dim_mask[None, :], other=0.0)
+            valid = in_range & (slot >= 0) & (slot < num_kv)
+            slot_off = slot.to(tl.int64)
+            kv = tl.load(
+                kv_ptr
+                + slot_off[:, None] * kv_stride_n
+                + dim_offsets[None, :] * kv_stride_d,
+                mask=valid[:, None] & dim_mask[None, :],
+                other=0.0,
+            )
 
         # Prefetch next tile's indices before heavy compute on current tile.
         next_k_pos = k_start + BLOCK_K + k_offsets
-        slot = tl.load(
-            kv_indices_ptr + kv_start + next_k_pos,
-            mask=next_k_pos < kv_len,
-            other=0,
-        )
+        if EVEN_HD:
+            slot = tl.load(
+                kv_indices_ptr + kv_start + next_k_pos,
+                mask=next_k_pos < kv_len,
+                other=0,
+            )
+        else:
+            slot = tl.load(
+                kv_indices_ptr + kv_start + next_k_pos,
+                mask=next_k_pos < kv_len,
+                other=-1,
+            )
 
-        # Scale after the row max (valid since scale > 0) so that
-        # `scores * scale - m_new` below fuses into one v_fma_f32 per score.
         scores = tl.dot(q, tl.trans(kv))
+        if not EVEN_HD:
+            scores = scores * scale
         scores = tl.where(head_mask[:, None] & valid[None, :], scores, float("-inf"))
 
-        m_block = tl.max(scores, axis=1) * scale
+        m_block = tl.max(scores, axis=1)
+        if EVEN_HD:
+            # Pinned path: scale after the row max (valid since scale > 0) so
+            # that `scores * scale - m_new` below is one v_fma_f32 per score.
+            m_block = m_block * scale
         m_new = tl.maximum(m_i, m_block)
+        if EVEN_HD:
+            shifted = scores * scale - m_new[:, None]
+        else:
+            shifted = scores - m_new[:, None]
         alpha = tl.where(m_new == float("-inf"), 0.0, _exp(m_i - m_new, USE_EXP2))
-        p = tl.where(
-            m_new[:, None] == float("-inf"),
-            0.0,
-            _exp(scores * scale - m_new[:, None], USE_EXP2),
-        )
+        p = tl.where(m_new[:, None] == float("-inf"), 0.0, _exp(shifted, USE_EXP2))
         p = tl.where(head_mask[:, None] & valid[None, :], p, 0.0)
         l_new = l_i * alpha + tl.sum(p, axis=1)
 
