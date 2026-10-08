@@ -1583,10 +1583,11 @@ def grouped_gemm_gfx1250_a8w4(
             _tdm_kw["lds_soa_load_interleave"] = _as_int(
                 cfg_row.get("lds_soa_load_interleave"), 0
             )
-            if stage2_scatter is None:
-                _tdm_kw["persistent_workers"] = _as_int(
-                    cfg_row.get("tdm_persistent_workers"), 0
-                )
+            # GEMM1 always has a local epilogue; stage2_scatter only changes
+            # GEMM2, so it does not restrict GEMM1's persistent scheduler.
+            _tdm_kw["persistent_workers"] = _as_int(
+                cfg_row.get("tdm_persistent_workers"), 0
+            )
             # Scatter needs its own measured worker count; generic rows were
             # tuned with a local GEMM2 store. Quantized scatter stays nonpersistent.
             if stage2_scatter is None or (

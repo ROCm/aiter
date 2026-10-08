@@ -1551,6 +1551,15 @@ class MegaMoEGfx1250:
                 config.rank, config.world_size, self._total_recv.device
             )
 
+        # Older mori plans reject unknown launch arguments, including ones set
+        # to None. Leave their bound offTokOff arena offset untouched when the
+        # optional external allocator is disabled.
+        tok_off_kwargs = (
+            {"tok_off_peers": self._tokoff_ext.peers}
+            if self._tokoff_ext is not None
+            else {}
+        )
+
         def make_variant(plan):
             def launch(
                 arena_handle,
@@ -1577,9 +1586,7 @@ class MegaMoEGfx1250:
                     dest_pe_token_counter=addr_dest_ctr,
                     total_recv_token_num=addr_total_recv,
                     grid_barrier=addr_disp_bar,
-                    tok_off_peers=(
-                        None if self._tokoff_ext is None else self._tokoff_ext.peers
-                    ),
+                    **tok_off_kwargs,
                     num_tokens=inp_cur_tok,
                     # Read off self rather than through the variant's argument
                     # list: the list is shared with the FlyDSL dispatch, whose
