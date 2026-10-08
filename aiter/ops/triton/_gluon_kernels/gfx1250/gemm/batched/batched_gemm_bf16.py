@@ -63,6 +63,7 @@ def _batched_gemm_bf16_bandwidth_bound_kernel(
     num_warps: gl.constexpr,
     waves_per_eu: gl.constexpr,
     cache_modifier: gl.constexpr,
+    TDM_STORE: gl.constexpr = False,
 ):
     batch_id = gl.program_id(axis=0)
     pid_unified = gl.program_id(axis=1)
@@ -337,26 +338,56 @@ def _batched_gemm_bf16_bandwidth_bound_kernel(
         )
         accumulator = accumulator + bias_vals[None, :]
 
-    # Store
-    offs_cm = pid_m * BLOCK_M + gl.arange(
-        0, BLOCK_M, layout=gl.SliceLayout(1, WMMA_LAYOUT)
-    )
-    offs_cn = pid_n * BLOCK_N + gl.arange(
-        0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
-    )
+    if TDM_STORE:
+        # TDM store: accumulator -> LDS -> global. The WMMA-layout buffer_store
+        # issues narrow per-lane stores and caps write bandwidth well below HBM
+        # for wide-N outputs; staging through LDS lets TDM write full rows.
+        # Requires NUM_KSPLIT == 1 and a unit-stride output N dim.
+        # Pad one 16-byte bank group per row regardless of element width.
+        C_PAD: gl.constexpr = 16 // c_ptr.type.element_ty.primitive_bitwidth * 8
+        SHARED_LAYOUT_C: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+            [[BLOCK_N, C_PAD]], [BLOCK_M, BLOCK_N], [1, 0]
+        )
+        c_buffer = gl.allocate_shared_memory(
+            c_ptr.type.element_ty,
+            shape=[BLOCK_M, BLOCK_N],
+            layout=SHARED_LAYOUT_C,
+        )
+        c_buffer.store(accumulator.to(c_ptr.type.element_ty))
+        # All waves must finish their LDS writes before TDM reads the tile.
+        gl.barrier()
+        c_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=c_ptr + batch_id * stride_cb,
+            shape=(M, N),
+            strides=(stride_cm, stride_cn),
+            block_shape=(BLOCK_M, BLOCK_N),
+            layout=SHARED_LAYOUT_C,
+        )
+        gl.amd.gfx1250.tdm.async_store(
+            c_desc, [pid_m * BLOCK_M, pid_n * BLOCK_N], c_buffer
+        )
+        gl.amd.gfx1250.tdm.async_wait(0)
+    else:
+        # Store
+        offs_cm = pid_m * BLOCK_M + gl.arange(
+            0, BLOCK_M, layout=gl.SliceLayout(1, WMMA_LAYOUT)
+        )
+        offs_cn = pid_n * BLOCK_N + gl.arange(
+            0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
+        )
 
-    offs_c = (
-        pid_k * stride_ck
-        + batch_id * stride_cb
-        + stride_cm * offs_cm[:, None]
-        + stride_cn * offs_cn[None, :]
-    )
+        offs_c = (
+            pid_k * stride_ck
+            + batch_id * stride_cb
+            + stride_cm * offs_cm[:, None]
+            + stride_cn * offs_cn[None, :]
+        )
 
-    mask_c = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+        mask_c = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
 
-    gl.amd.gfx1250.buffer_store(
-        accumulator.to(c_ptr.type.element_ty), c_ptr, offs_c, mask=mask_c
-    )
+        gl.amd.gfx1250.buffer_store(
+            accumulator.to(c_ptr.type.element_ty), c_ptr, offs_c, mask=mask_c
+        )
 
 
 @gluon.jit(repr=_batched_gemm_bf16_compute_bound_repr)
