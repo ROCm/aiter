@@ -236,7 +236,11 @@ def test_coupled_mxmoe(
             msg=f"{precision} {name} repeat",
             catastrophic_check=True,
         )
-        assert repeat_error == 0
+        # Atomic BF16 sums vary with expert arrival order, especially near
+        # cancellation. Their repeat gate is the amplitude metric above plus
+        # finite/catastrophic checks; deterministic reduce/scatter stay strict.
+        if name != "atomic":
+            assert repeat_error == 0
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
