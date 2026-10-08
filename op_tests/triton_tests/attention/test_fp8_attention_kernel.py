@@ -25,6 +25,7 @@ from aiter.ops.triton.attention.fp8_attention import (
     attn_fwd,
     get_padded_headsize,
 )
+from aiter.ops.triton.attention.mha import flash_attn_func
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 pytestmark = pytest.mark.skipif(
@@ -565,3 +566,84 @@ def test_fp8_attn_bwd(B, HQ, HK, S, D, causal, use_fp8):
     torch.testing.assert_close(
         dv.float(), v_t.grad.float(), atol=atol, rtol=rtol, msg=f"dv mismatch {tag}"
     )
+
+
+def test_flash_attn_func_block_scale_matches_reference():
+    """flash_attn_func block-scale path uses the public bshd layout."""
+    torch.manual_seed(0)
+    fp8_dtype = _fp8_dtype()
+    b, hq, hk, s, d = 1, 4, 2, 64, 64
+    sm_scale = 1.0 / math.sqrt(d)
+    q_hp = torch.randn(b, hq, s, d, dtype=torch.bfloat16, device="cuda") * 0.1
+    k_hp = torch.randn(b, hk, s, d, dtype=torch.bfloat16, device="cuda") * 0.1
+    v_hp = torch.randn(b, hk, s, d, dtype=torch.bfloat16, device="cuda") * 0.1
+    q, q_descale = _quantize_per_block(q_hp, BLOCK_M, fp8_dtype)
+    k, k_descale = _quantize_per_block(k_hp, BLOCK_N, fp8_dtype)
+    v, v_scale = _quantize_v_tensor(v_hp, fp8_dtype)
+
+    out, lse = flash_attn_func(
+        q.transpose(1, 2).contiguous(),
+        k.transpose(1, 2).contiguous(),
+        v.transpose(1, 2).contiguous(),
+        causal=True,
+        softmax_scale=sm_scale,
+        return_lse=True,
+        q_block_descale=q_descale,
+        k_block_descale=k_descale,
+        v_scale=v_scale,
+    )
+    ref = _ref_attention(
+        _dequant_per_block(q, q_descale, BLOCK_M),
+        _dequant_per_block(k, k_descale, BLOCK_N),
+        v.float() / v_scale,
+        causal=True,
+        sm_scale=sm_scale,
+    )
+    assert out.shape == (b, s, hq, d)
+    assert out.dtype == torch.bfloat16
+    assert lse.shape == (b, hq, s)
+    torch.testing.assert_close(
+        out.transpose(1, 2).float(), ref.float(), atol=2e-1, rtol=2e-1
+    )
+
+
+def test_flash_attn_func_block_scale_rejects_partial_and_gluon():
+    q = torch.zeros(1, 64, 4, 64, dtype=_fp8_dtype(), device="cuda")
+    k = torch.zeros(1, 64, 4, 64, dtype=_fp8_dtype(), device="cuda")
+    v = torch.zeros(1, 64, 4, 64, dtype=_fp8_dtype(), device="cuda")
+    scale = torch.ones(1, 4, 1, device="cuda")
+    with pytest.raises(ValueError, match="requires q_block_descale"):
+        flash_attn_func(q, k, v, q_block_descale=scale)
+    q.requires_grad_(True)
+    with pytest.raises(RuntimeError, match="forward-only"):
+        flash_attn_func(
+            q,
+            k,
+            v,
+            q_block_descale=scale,
+            k_block_descale=scale,
+            v_scale=torch.ones(1, device="cuda"),
+        )
+    q.requires_grad_(False)
+    with pytest.raises(ValueError, match="triton backend only"):
+        flash_attn_func(
+            q,
+            k,
+            v,
+            backend="gluon",
+            q_block_descale=scale,
+            k_block_descale=scale,
+            v_scale=torch.ones(1, device="cuda"),
+        )
+
+
+def test_flash_attn_func_default_path_still_runs():
+    """Callers that omit block scales stay on the existing Triton path."""
+    torch.manual_seed(0)
+    q = torch.randn(1, 64, 4, 64, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(1, 64, 4, 64, dtype=torch.bfloat16, device="cuda")
+    v = torch.randn(1, 64, 4, 64, dtype=torch.bfloat16, device="cuda")
+    out = flash_attn_func(q, k, v, causal=True)
+    assert out.shape == q.shape
+    assert out.dtype == q.dtype
+    assert torch.isfinite(out).all()
