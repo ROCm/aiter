@@ -973,6 +973,14 @@ def topk_select(
     selection under 74.3us of call, so the gather and the buffers around it were
     most of the time spent. Pass ``return_value=True`` to get them.
 
+    NaN: +nan ranks above +inf, as in ``torch.topk``. A NaN with the sign bit
+    set does too on ``argmax``, ``small_k``, ``stream``, ``decode`` and
+    ``sampled``, but ``plain`` (on its radix path) ranks it below -inf, so
+    there it is selected only when a row has fewer than ``topk`` other live
+    values.
+    Which of the two a row gets depends on its shape. Where ``plain`` falls
+    back to its block sort, NaN has no defined rank.
+
     Args:
         input: ``[rows, width]``, inner stride 1, any row stride. float32 at
             any ``topk``; bfloat16 and float16 at ``topk=1`` only.

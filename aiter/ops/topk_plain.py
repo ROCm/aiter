@@ -113,6 +113,13 @@ def topk_plain(
 
     `x` may have any layout. With `stride0 < 0` the row pitch is taken from `x`
     itself, not assumed to be the width.
+
+    NaN: on the radix path (fp32, `largest=True`, where
+    `topk_plain_values_optional` holds) +nan ranks above +inf, as in
+    `torch.topk`, and a NaN with the sign bit set ranks below -inf, so it is
+    selected only when fewer than `topk` other values exist. The block-sort
+    fallback, which serves every other call, compares scores as floats and
+    gives NaN no defined rank.
     """
     if topk > _MAX_CAPACITY:
         # `AdaptiveTopK` asserts this at its entry, ahead of any dtype branch,
