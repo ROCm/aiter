@@ -30,6 +30,11 @@ output, Situv2 4/25 and the resolved Swiglu limit. It observes and delegates
 real stage calls, checks live FP8 payload plus E8M0 scales, output identity,
 finite values and amplitude-sensitive error. A skipped/fallback pair is
 reported separately and returns nonzero. `--rows` uses zero-based data rows.
+Each report preserves the requested row/pair, the same CSV's primary lookup
+row/token/pair and actual observed G1/G2. For M=3 the public key is M=4; a
+correct row4 execution is counted as padded token coverage and does not claim
+that an unused standalone row3 winner was executed. Large-token tiers follow
+the same runtime mapping, including smaller-tier lookup when applicable.
 For broader modes, a validation CSV may contain selected actual evaluated
 profile observations; record that selection and keep final winner CSVs intact.
 
