@@ -1,21 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 
-"""FP8 paged-attention tile kernel.
+"""FP8 and BF16 paged-attention tile kernel.
 
 K/V use e4m3 (FNUZ on gfx942, OCP on gfx950); BF16/FP16 Q and probabilities P
 are quantized to FP8. Q/key scales fold into QK, value scale and 1/FP8_MAX into
 the epilogue; softmax max/sum stay f32. Tuned gfx950 BF16 per-token MTP3/MTP4
 uses K128 MFMA instead of K32, preserving normalized Q/P and operand layouts.
-Every Q row uses absmax normalization; per-tensor and per-token K/V scales
+Every FP8-path Q row uses absmax normalization; per-tensor and per-token K/V scales
 retain range normalization for P.
+BF16 K/V use vector-8 caches and native BF16 Q/K/P/V MFMA operands, with
+f32 softmax state and accumulation. BF16 KV does not use quantization scales.
 
 Logical layouts (not preshuffled):
 
 * ``query``        [num_seqs * query_length, num_q_heads, head_dim]  f16/bf16
-* ``key_cache``    [num_blocks, num_kv_heads, head_dim//16, block_size, 16]  fp8
-* ``value_cache``  [num_blocks, num_kv_heads, block_size//16, head_dim, 16] (trans_v)
-                   or [num_blocks, num_kv_heads, head_dim, block_size] (plain), by rank
+* ``key_cache``    [num_blocks, num_kv_heads, head_dim//x, block_size, x]
+* ``value_cache``  [num_blocks, num_kv_heads, block_size//x, head_dim, x] (trans_v)
+                   or [num_blocks, num_kv_heads, head_dim, block_size] (FP8 plain)
+                   where x=16 for FP8 and x=8 for BF16
 * ``block_tables`` [num_seqs, max_blocks_per_seq]  int32
 * ``work_info``    [capacity, 4]  int32 sequence/tile bounds/context length
 * ``pmax``, ``psum`` [num_kv_heads, capacity, query_length * query_group_size] f32
@@ -77,6 +80,7 @@ def compile_pa_decode_tile(
     num_partitions: int = 1,
     softmax_scale: float | None = None,
     query_dtype: str = "f16",
+    kv_dtype: str = "fp8",
     per_token_kv: bool = False,
     query_length: int = 1,
     trans_v: bool = True,
@@ -90,6 +94,9 @@ def compile_pa_decode_tile(
 
     ``query_splits=None`` selects from host-known grid bounds; an explicit
     count overrides splitting and selects the matching prefetch policy.
+    BF16 also selects the smallest query-length divisor that fits 64 KiB LDS;
+    for example D512/MTP4/GQA16 splits twice and D1024/MTP3/GQA16 splits three
+    ways. Explicit BF16 splits must fit that limit as well.
     ``max_context_length`` bounds dense planned work for scheduling only; it does not
     change the launch capacity, scratch layout, or single-tile guarantee.
     CTAs receive equal groups of MTP positions, flattened with GQA into 16-row
@@ -125,6 +132,7 @@ def compile_pa_decode_tile(
         num_partitions=num_partitions,
         softmax_scale=softmax_scale,
         query_dtype=query_dtype,
+        kv_dtype=kv_dtype,
         per_token_kv=per_token_kv,
         query_length=query_length,
         trans_v=trans_v,

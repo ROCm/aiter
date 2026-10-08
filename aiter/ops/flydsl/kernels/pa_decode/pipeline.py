@@ -142,7 +142,7 @@ class PaDecodePipeline:
                 ]
 
             q_scale_vec = None
-            if const_expr(self.traits.M_TILES > 1):
+            if const_expr(self.traits.M_TILES > 1 and not self.traits.is_bf16_kv):
                 q_scale_vec = self.lds.load(
                     self.traits.sQscale_off
                     + self.ctx.lane16 * (self.traits.M_TILES * self.traits.f32),
@@ -217,7 +217,11 @@ class PaDecodePipeline:
         for m in range_constexpr(self.traits.M_TILES):
             frag_Ss = self.gemm.qk(k_cur, q_ops_all, m)
 
-            scale = self.ctx.scale_qk * fx.Float32(q_scale_vec[m])
+            scale = (
+                self.ctx.scale_qk
+                if const_expr(self.traits.is_bf16_kv)
+                else self.ctx.scale_qk * fx.Float32(q_scale_vec[m])
+            )
             masked_chunks = self.softmax.multi_scores(
                 frag_Ss, scale, k_scale_shared, tile_valid, window_left, m
             )
@@ -319,7 +323,7 @@ class PaDecodePipeline:
                 p_ops = self.lds.load(
                     p_base
                     + self.ctx.lane16 * self.traits.SP_ROW_BYTES
-                    + self.ctx.rgroup * 64,
+                    + self.ctx.rgroup * 64 * self.traits.QP_ELEM_BYTES,
                     fx.Int64,
                     self.traits.NVOPS,
                 )
@@ -421,7 +425,7 @@ class PaDecodePipeline:
                 p_ops = self.lds.load(
                     p_base
                     + self.ctx.lane16 * self.traits.SP_ROW_BYTES
-                    + self.ctx.rgroup * 64,
+                    + self.ctx.rgroup * 64 * self.traits.QP_ELEM_BYTES,
                     fx.Int64,
                     self.traits.NVOPS,
                 )
@@ -497,9 +501,12 @@ class PaDecodePipeline:
                 self.kv.load_v(v_page_cur, vh)
                 for vh in range_constexpr(self.traits.VHE_CHUNKS)
             ]
-        scale = self.ctx.scale_qk * self.lds.load_scalar(
-            self.traits.sQscale_off, self.ctx.lane16
-        )  # per-qhead positive score scale
+        scale = (
+            self.ctx.scale_qk
+            if const_expr(self.traits.is_bf16_kv)
+            else self.ctx.scale_qk
+            * self.lds.load_scalar(self.traits.sQscale_off, self.ctx.lane16)
+        )
         masked_chunks, v_scale_vecs = self.softmax.single_scores(
             frag_Ss, scale, tile_valid, window_left, cur_kv_buf, scale_bounds
         )
@@ -532,7 +539,7 @@ class PaDecodePipeline:
         p_ops = self.lds.load(
             self.traits.sP_off
             + self.ctx.lane16 * self.traits.SP_ROW_BYTES
-            + self.ctx.rgroup * 64,
+            + self.ctx.rgroup * 64 * self.traits.QP_ELEM_BYTES,
             fx.Int64,
             self.traits.NVOPS,
         )

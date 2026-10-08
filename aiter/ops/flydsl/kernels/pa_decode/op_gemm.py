@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 
-"""FP8 operand conversion and QK/PV MFMA operations."""
+"""FP8/BF16 operand conversion and QK/PV MFMA operations."""
 
 import flydsl.expr as fx
 from flydsl.expr import const_expr, range_constexpr
@@ -15,7 +15,20 @@ class PaDecodeGemm:
         self.traits = traits
 
     def mfma(self, a_ops, b_ops, a_base, b_base, k_packs, acc):
-        if const_expr(self.traits.WIDE_FP8_MFMA):
+        if const_expr(self.traits.is_bf16_kv):
+            for pack in range_constexpr(k_packs):
+                # Keep four BF16 values packed in i64 through the pipeline,
+                # exposing the instruction's i16x4 operands only here.
+                a_pack = fx.Vector.from_elements(
+                    [a_ops[a_base + pack]], dtype=fx.Int64
+                ).bitcast(fx.Int16)
+                b_pack = fx.Vector.from_elements(
+                    [b_ops[b_base + pack]], dtype=fx.Int64
+                ).bitcast(fx.Int16)
+                acc = fx.rocdl.mfma_f32_16x16x16bf16_1k(
+                    T.f32x4, [a_pack, b_pack, acc, 0, 0, 0]
+                )
+        elif const_expr(self.traits.WIDE_FP8_MFMA):
             for inst in range_constexpr(k_packs // self.traits.PACKS_PER_MFMA):
                 a_pack = fx.Vector.from_elements(
                     [

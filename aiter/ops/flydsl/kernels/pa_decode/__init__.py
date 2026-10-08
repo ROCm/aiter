@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 
-"""Object-oriented building blocks for the FP8 paged-attention kernel."""
+"""Object-oriented building blocks for FP8/BF16 paged-attention kernels."""
 
 from functools import cache
 from hashlib import sha256

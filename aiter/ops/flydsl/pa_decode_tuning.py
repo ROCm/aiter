@@ -12,6 +12,10 @@ FlyDSL validates candidates, measures them, and caches the smallest budget
 within 97% of the fastest measured performance. Runtime lookup never benchmarks.
 Budgets are shared across context bounds, sample lengths and KV pool sizes.
 Pass lengths to benchmark shorter sequences within a large context bound.
+
+For native BF16 KV, pass --kv-dtypes bfloat16 (BF16 queries and vectorized V).
+For example, --shape 16,1,192 --page-sizes 64 --query-lengths 1,4
+--kv-dtypes bfloat16 tunes unscaled vector8 caches with matching Q/K/V dimensions.
 """
 
 from __future__ import annotations
@@ -46,6 +50,7 @@ STATIC_SHAPE_FIELDS = (
     "head_dim",
     "page_size",
     "query_dtype",
+    "kv_dtype",
     "per_token_kv",
     "trans_v",
     "sliding_window",
@@ -83,6 +88,7 @@ def make_shape(
     head_dim,
     page_size=128,
     dtype="bfloat16",
+    kv_dtype="fp8",
     per_token=True,
     trans_v=True,
     window=0,
@@ -97,13 +103,23 @@ def make_shape(
     One supplied length broadcasts to every sequence. Otherwise supply B lengths.
     Pass query.stride() for Q layout and key_cache.shape[0] for a fixed KV pool.
     Synthetic sequences use distinct pages, which must fit in the supplied pool.
+    BF16 KV requires BF16 queries, per_token=False, and vectorized V (trans_v=True).
     """
     num_query_heads = positive_int(num_query_heads, "num_query_heads")
     num_kv_heads = positive_int(num_kv_heads, "num_kv_heads")
     head_dim = positive_int(head_dim, "head_dim")
+    if kv_dtype == "bf16":
+        kv_dtype = "bfloat16"
+    if kv_dtype not in ("fp8", "bfloat16"):
+        raise ValueError("kv_dtype must be fp8 or bfloat16 (bf16)")
     if num_query_heads % num_kv_heads:
         raise ValueError("num_query_heads must be divisible by num_kv_heads")
-    if head_dim != 64 and (head_dim % 128 or not 128 <= head_dim <= 1024):
+    if kv_dtype == "bfloat16":
+        if head_dim % 64 or not 64 <= head_dim <= 1024:
+            raise ValueError(
+                "BF16 head dimensions must be multiples of 64 through 1024"
+            )
+    elif head_dim != 64 and (head_dim % 128 or not 128 <= head_dim <= 1024):
         raise ValueError(
             "Supported head dimensions: 64 or multiples of 128 through 1024"
         )
@@ -143,6 +159,13 @@ def make_shape(
         raise ValueError("query_strides exceed PA's signed int32 addressing range")
     if type(per_token) is not bool or type(trans_v) is not bool:
         raise TypeError("per_token and trans_v must be bool")
+    if kv_dtype == "bfloat16":
+        if dtype != "bfloat16":
+            raise ValueError("BF16 KV requires bfloat16 queries")
+        if per_token:
+            raise ValueError("BF16 KV is unscaled; set per_token=False")
+        if not trans_v:
+            raise ValueError("BF16 KV requires vectorized 5D V (trans_v=True)")
     positive_int(window, "window", 0)
     if length_mode not in ("uniform", "varlen", "explicit"):
         raise ValueError("length_mode must be uniform, varlen or explicit")
@@ -188,6 +211,7 @@ def make_shape(
         query_length=query_length,
         page_size=page_size,
         query_dtype=dtype,
+        kv_dtype=kv_dtype,
         per_token_kv=per_token,
         trans_v=trans_v,
         sliding_window=window,
@@ -212,6 +236,7 @@ def _validate_shape(shape, *, benchmark=False):
         head_dim=shape["head_dim"],
         page_size=shape["page_size"],
         dtype=shape["query_dtype"],
+        kv_dtype=shape["kv_dtype"],
         per_token=shape["per_token_kv"],
         trans_v=shape["trans_v"],
         window=shape["sliding_window"],
@@ -237,10 +262,14 @@ def make_key(shape, architecture, num_cu):
         raise ValueError(f"Supported architectures are {', '.join(KV_DTYPES)}")
     positive_int(num_cu, "num_cu")
     _validate_shape(shape)
+    if shape["kv_dtype"] == "bfloat16" and architecture not in ("gfx942", "gfx950"):
+        raise ValueError("BF16 KV is supported on gfx942 and gfx950")
     return {
         "architecture": architecture,
         "num_cu": num_cu,
-        "kv_dtype": KV_DTYPES[architecture],
+        "kv_dtype": (
+            "bfloat16" if shape["kv_dtype"] == "bfloat16" else KV_DTYPES[architecture]
+        ),
         "shape": {k: shape[k] for k in STATIC_SHAPE_FIELDS},
     }
 
@@ -291,7 +320,8 @@ def _finite_positive(value):
 def unique_kv_bytes(shape):
     window, ql = shape["sliding_window"], shape["query_length"]
     tokens = sum(min(n, window + ql - 1) if window else n for n in shape["lengths"])
-    return 2 * shape["num_kv_heads"] * shape["head_dim"] * tokens
+    element_size = 2 if shape["kv_dtype"] == "bfloat16" else 1
+    return 2 * element_size * shape["num_kv_heads"] * shape["head_dim"] * tokens
 
 
 def _contiguous_strides(shape):
@@ -301,11 +331,20 @@ def _contiguous_strides(shape):
 def _synthetic_storage_key(shape):
     h, d, page = (shape[k] for k in ("num_kv_heads", "head_dim", "page_size"))
     pages = shape["kv_pool_pages"]
-    vshape = (pages, h, page // 16, d, 16) if shape["trans_v"] else (pages, h, d, page)
-    scales = _contiguous_strides((pages, h, page)) if shape["per_token_kv"] else ()
+    vector = 8 if shape["kv_dtype"] == "bfloat16" else 16
+    vshape = (
+        (pages, h, page // vector, d, vector)
+        if shape["trans_v"]
+        else (pages, h, d, page)
+    )
+    scales = (
+        None
+        if shape["kv_dtype"] == "bfloat16"
+        else _contiguous_strides((pages, h, page)) if shape["per_token_kv"] else ()
+    )
     return (
         shape["query_strides"],
-        _contiguous_strides((pages, h, d // 16, page, 16)),
+        _contiguous_strides((pages, h, d // vector, page, vector)),
         _contiguous_strides(vshape),
         scales,
         scales,
@@ -316,6 +355,8 @@ def storage_key(query, key, value, key_scale, value_scale):
     """Host-only layout specialization shared by search and lookup."""
 
     def scale_strides(scale):
+        if scale is None:
+            return None
         if scale.numel() == 1:
             return ()
         strides = tuple(scale.stride())
@@ -476,7 +517,7 @@ def get_cached_budget(shape, architecture, num_cu, *, storage_key=None):
         return 2 * num_cu
 
 
-def _make_inputs(torch, shape, device, fp8):
+def _make_inputs(torch, shape, device, kv_dtype):
     """Chunked random initialization avoids a second whole-cache FP32 allocation."""
     b, ql, hq, h, d, page = (
         shape[k]
@@ -502,16 +543,27 @@ def _make_inputs(torch, shape, device, fp8):
     # Initialize the backing storage once, including padding and aliased rows.
     query_storage.uniform_(-0.5, 0.5, generator=generator)
     query = query_storage.as_strided(query_shape, query_strides)
-    keys = torch.empty((pages, h, d // 16, page, 16), dtype=fp8, device=device)
-    vshape = (pages, h, page // 16, d, 16) if shape["trans_v"] else (pages, h, d, page)
-    values = torch.empty(vshape, dtype=fp8, device=device)
-    scale_shape = (pages, h, page, 1) if shape["per_token_kv"] else (1,)
-    ks = torch.empty(scale_shape, dtype=torch.float32, device=device)
-    vs = torch.empty_like(ks)
-    limit = torch.finfo(fp8).max
-    if not shape["per_token_kv"]:
-        ks.fill_(0.5 / limit)
-        vs.fill_(0.5 / limit)
+    bf16 = shape["kv_dtype"] == "bfloat16"
+    vector = 8 if bf16 else 16
+    keys = torch.empty(
+        (pages, h, d // vector, page, vector), dtype=kv_dtype, device=device
+    )
+    vshape = (
+        (pages, h, page // vector, d, vector)
+        if shape["trans_v"]
+        else (pages, h, d, page)
+    )
+    values = torch.empty(vshape, dtype=kv_dtype, device=device)
+    if bf16:
+        ks = vs = None
+    else:
+        scale_shape = (pages, h, page, 1) if shape["per_token_kv"] else (1,)
+        ks = torch.empty(scale_shape, dtype=torch.float32, device=device)
+        vs = torch.empty_like(ks)
+        limit = torch.finfo(kv_dtype).max
+        if not shape["per_token_kv"]:
+            ks.fill_(0.5 / limit)
+            vs.fill_(0.5 / limit)
     for begin in range(0, pages, 64):
         end = min(begin + 64, pages)
         for kind, cache, scales in (("key", keys, ks), ("value", values, vs)):
@@ -519,19 +571,24 @@ def _make_inputs(torch, shape, device, fp8):
                 (end - begin, h, page, d), dtype=torch.float32, device=device
             )
             raw.uniform_(-0.5, 0.5, generator=generator)
-            scale = (
-                raw.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12) / limit
-                if shape["per_token_kv"]
-                else scales
-            )
-            quant = (raw / scale).clamp(-limit, limit).to(fp8)
-            if shape["per_token_kv"]:
-                scales[begin:end].copy_(scale)
+            if bf16:
+                quant = raw.to(kv_dtype)
+            else:
+                scale = (
+                    raw.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12) / limit
+                    if shape["per_token_kv"]
+                    else scales
+                )
+                quant = (raw / scale).clamp(-limit, limit).to(kv_dtype)
+                if shape["per_token_kv"]:
+                    scales[begin:end].copy_(scale)
             packed = (
-                quant.reshape(end - begin, h, page, d // 16, 16).permute(0, 1, 3, 2, 4)
+                quant.reshape(end - begin, h, page, d // vector, vector).permute(
+                    0, 1, 3, 2, 4
+                )
                 if kind == "key"
                 else (
-                    quant.reshape(end - begin, h, page // 16, 16, d).permute(
+                    quant.reshape(end - begin, h, page // vector, vector, d).permute(
                         0, 1, 2, 4, 3
                     )
                     if shape["trans_v"]
@@ -560,7 +617,7 @@ def _make_inputs(torch, shape, device, fp8):
 
 
 def _reference(torch, inputs, shape, chunk_size=4096):
-    """Full FP32 dequantized attention, streamed over all visible keys."""
+    """Full FP32 attention, dequantizing FP8 and streaming all visible keys."""
     ql, h, g, d, page = (
         shape[k]
         for k in (
@@ -574,6 +631,8 @@ def _reference(torch, inputs, shape, chunk_size=4096):
     query = inputs["query"].reshape(shape["batch_size"], ql, h, g, d).float()
     output = torch.empty_like(query)
     device, window = query.device, shape["sliding_window"]
+    bf16 = shape["kv_dtype"] == "bfloat16"
+    vector = 8 if bf16 else 16
     for seq, length in enumerate(shape["lengths"]):
         right = length - ql + 1 + torch.arange(ql, device=device)
         maximum = torch.full((ql, h, g), -math.inf, dtype=torch.float32, device=device)
@@ -583,22 +642,29 @@ def _reference(torch, inputs, shape, chunk_size=4096):
         for begin in range(first, length, chunk_size):
             tokens = torch.arange(begin, min(length, begin + chunk_size), device=device)
             pages, offsets = inputs["table"][seq, tokens // page].long(), tokens % page
-            # Byte gathers also work on Torch builds without FP8 index kernels.
-            keys = inputs["key"].view(torch.uint8)[pages, :, :, offsets, :]
-            keys = keys.contiguous().view(inputs["key"].dtype).float().reshape(-1, h, d)
-            cache = inputs["value"].view(torch.uint8)
+            # Byte gathers work on Torch builds without FP8 index kernels. BF16
+            # indices are in elements, so keep its two-byte elements intact.
+            key_cache = inputs["key"] if bf16 else inputs["key"].view(torch.uint8)
+            keys = key_cache[pages, :, :, offsets, :]
+            if not bf16:
+                keys = keys.contiguous().view(inputs["key"].dtype)
+            keys = keys.float().reshape(-1, h, d)
+            cache = inputs["value"] if bf16 else inputs["value"].view(torch.uint8)
             values = (
-                cache[pages, :, offsets // 16, :, offsets % 16]
+                cache[pages, :, offsets // vector, :, offsets % vector]
                 if shape["trans_v"]
                 else cache[pages, :, :, offsets]
             )
-            values = values.contiguous().view(inputs["value"].dtype).float()
-            if shape["per_token_kv"]:
-                keys *= inputs["key_scale"][pages, :, offsets, 0].unsqueeze(-1)
-                values *= inputs["value_scale"][pages, :, offsets, 0].unsqueeze(-1)
-            else:
-                keys *= inputs["key_scale"]
-                values *= inputs["value_scale"]
+            if not bf16:
+                values = values.contiguous().view(inputs["value"].dtype)
+            values = values.float()
+            if not bf16:
+                if shape["per_token_kv"]:
+                    keys *= inputs["key_scale"][pages, :, offsets, 0].unsqueeze(-1)
+                    values *= inputs["value_scale"][pages, :, offsets, 0].unsqueeze(-1)
+                else:
+                    keys *= inputs["key_scale"]
+                    values *= inputs["value_scale"]
             scores = (
                 torch.einsum("qhgd,thd->qhgt", query[seq], keys)
                 * shape["softmax_scale"]
@@ -798,8 +864,15 @@ class _TuningSession:
 
         torch = self.torch
         device = torch.device("cuda", self.info["device"])
-        fp8 = getattr(torch, KV_DTYPES[self.info["architecture"]])
-        self.inputs = _make_inputs(torch, self.problem, device, fp8)
+        kv_dtype = getattr(
+            torch,
+            (
+                "bfloat16"
+                if self.problem["kv_dtype"] == "bfloat16"
+                else KV_DTYPES[self.info["architecture"]]
+            ),
+        )
+        self.inputs = _make_inputs(torch, self.problem, device, kv_dtype)
         actual = storage_key(
             *(
                 self.inputs[name]
@@ -1024,12 +1097,29 @@ def main(argv=None):
     ):
         parser.add_argument("--" + name, type=_list_arg, default=default)
     parser.add_argument(
-        "--dtypes", type=lambda s: _list_arg(s, str), default=["bfloat16"]
+        "--dtypes",
+        type=lambda s: _list_arg(s, str),
+        default=["bfloat16"],
+        help="Query dtypes: bfloat16 and/or float16; BF16 KV requires bfloat16",
     )
     parser.add_argument(
-        "--quant-modes", type=lambda s: _list_arg(s, str), default=["per_token"]
+        "--kv-dtypes",
+        type=lambda s: _list_arg(s, str),
+        default=["fp8"],
+        help="KV dtypes: fp8 and/or bfloat16 (bf16); BF16 is unscaled vector8 5D K/V",
     )
-    parser.add_argument("--trans-v", choices=("yes", "no", "both"), default="yes")
+    parser.add_argument(
+        "--quant-modes",
+        type=lambda s: _list_arg(s, str),
+        default=["per_token"],
+        help="FP8 modes: per_token and/or per_tensor; BF16 always uses no scales",
+    )
+    parser.add_argument(
+        "--trans-v",
+        choices=("yes", "no", "both"),
+        default="yes",
+        help="Vectorized V layout; BF16 requires yes (both sweeps vectorized BF16 only)",
+    )
     parser.add_argument(
         "--length-mode", choices=("uniform", "varlen"), default="uniform"
     )
@@ -1074,6 +1164,17 @@ def main(argv=None):
         hq, hkv, dim = args.shape
         if any(mode not in ("per_token", "per_tensor") for mode in args.quant_modes):
             raise ValueError("quant-modes must be per_token and/or per_tensor")
+        kv_dtypes = [
+            "bfloat16" if dtype == "bf16" else dtype for dtype in args.kv_dtypes
+        ]
+        if len(kv_dtypes) != len(set(kv_dtypes)) or any(
+            dtype not in ("fp8", "bfloat16") for dtype in kv_dtypes
+        ):
+            raise ValueError(
+                "kv-dtypes must contain fp8 and/or bfloat16 without duplicates"
+            )
+        if "bfloat16" in kv_dtypes and args.trans_v == "no":
+            raise ValueError("BF16 KV requires vectorized 5D V (--trans-v yes)")
         layouts = [True, False] if args.trans_v == "both" else [args.trans_v == "yes"]
         shapes = [
             make_shape(
@@ -1085,6 +1186,7 @@ def main(argv=None):
                 head_dim=dim,
                 page_size=page,
                 dtype=dtype,
+                kv_dtype=kv_dtype,
                 per_token=quant == "per_token",
                 trans_v=layout,
                 window=window,
@@ -1094,16 +1196,17 @@ def main(argv=None):
                 lengths=args.lengths,
                 kv_pool_pages=args.kv_pool_pages,
             )
-            for b, ctx, ql, window, page, dtype, quant, layout in itertools.product(
+            for b, ctx, ql, window, page, dtype, kv_dtype in itertools.product(
                 args.batch_sizes,
                 args.context_lengths,
                 args.query_lengths,
                 args.windows,
                 args.page_sizes,
                 args.dtypes,
-                args.quant_modes,
-                layouts,
+                kv_dtypes,
             )
+            for quant in (args.quant_modes if kv_dtype == "fp8" else ["unscaled"])
+            for layout in (layouts if kv_dtype == "fp8" else [True])
         ]
         for value, name, minimum in (
             (args.rounds, "rounds", 1),
@@ -1160,6 +1263,7 @@ def main(argv=None):
             )
             kv_bytes = (
                 2
+                * (2 if shape["kv_dtype"] == "bfloat16" else 1)
                 * shape["kv_pool_pages"]
                 * shape["num_kv_heads"]
                 * shape["head_dim"]
@@ -1186,7 +1290,8 @@ def main(argv=None):
     all_passed = True
     for index, shape in enumerate(shapes, 1):
         print(
-            f"TUNE {index}/{len(shapes)} B={shape['batch_size']} L={shape['context_length']} QL={shape['query_length']}",
+            f"TUNE {index}/{len(shapes)} B={shape['batch_size']} L={shape['context_length']} "
+            f"QL={shape['query_length']} kv_dtype={shape['kv_dtype']}",
             flush=True,
         )
         result = tune_shape(

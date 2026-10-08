@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 
-"""FP8 paged-attention decode with BF16/FP16 queries on gfx942/gfx950.
+"""FP8 or BF16 paged-attention decode on gfx942/gfx950.
 
 Cache layouts are logical, not preshuffled. K/V use E4M3 FNUZ on gfx942 and
 OCP on gfx950. See ``kernels.pa_decode_kernel`` for Q/P quantization and
-MFMA specialization details.
+MFMA specialization details. Native BF16 uses unscaled, 8-element vectorized
+K/V caches and BF16 queries.
 """
 
 import flydsl.compiler as flyc
@@ -159,10 +160,17 @@ def pa_decode(
     work_plan: PADecodePlan,
     max_context_length: int | None = None,
 ) -> None:
-    """Decode FP8 K/V with BF16/FP16 queries using 256-token compute tiles.
+    """Decode FP8 or BF16 K/V using 256-token compute tiles.
 
-    Supports page sizes 16/64/128 and head_dim 64 or multiples of 128 up to 1024.
+    Supports page sizes 16/64/128. BF16 head dimensions are multiples of 64
+    up to 1024; FP8 supports 64 and multiples of 128 up to 1024.
     K/V scales are [1] or [num_blocks, num_kv_heads, block_size, 1].
+    BF16 K/V requires BF16 queries, compute_type=torch.bfloat16, no K/V scales,
+    and vectorized 5D caches with x=8; FP8 uses x=16. BF16 Q/P operands stay
+    in BF16 and softmax statistics and MFMA accumulation stay in FP32.
+    BF16 automatically splits query positions to keep each CTA within 64 KiB
+    of LDS; a single query's GQA rows must fit that limit. Q/K and V/output
+    head dimensions must match.
     ALiBi and externally quantized queries are unsupported.
 
     MTP lengths include the query tokens and use dense causal masking.
@@ -277,21 +285,45 @@ def pa_decode(
             f"key_cache must contain at least one KV head, got {num_kv_heads}"
         )
 
+    arch = get_gfx_runtime()
+    expected_fp8_dtype = {
+        "gfx942": torch.float8_e4m3fnuz,
+        "gfx950": torch.float8_e4m3fn,
+    }.get(arch)
+    if expected_fp8_dtype is None:
+        raise NotImplementedError(
+            f"pa_decode only supports gfx942 and gfx950, got {arch}"
+        )
+    is_bf16_kv = key_cache.dtype == torch.bfloat16
+    kv_dtype = "bf16" if is_bf16_kv else "fp8"
+    expected_kv_dtype = torch.bfloat16 if is_bf16_kv else expected_fp8_dtype
+    if compute_type != expected_kv_dtype:
+        raise NotImplementedError(
+            f"pa_decode requires compute_type={expected_kv_dtype} for the KV cache "
+            f"on {arch}, got {compute_type}"
+        )
+    vector_width = 8 if is_bf16_kv else 16
+
     # Enforce tile Q-load constraints and the reducer's 1024-thread limit.
     q_chunk = head_dim // 16
     if not (
         64 <= head_dim <= 1024
         and head_dim % 64 == 0
-        and (q_chunk <= 8 or q_chunk % 8 == 0)
+        and (is_bf16_kv or q_chunk <= 8 or q_chunk % 8 == 0)
     ):
         raise NotImplementedError(
             f"pa_decode does not support head_dim={head_dim}; supported values "
-            "are 64 and multiples of 128 in [128, 1024]"
+            + (
+                "are multiples of 64 in [64, 1024] for BF16 KV"
+                if is_bf16_kv
+                else "are 64 and multiples of 128 in [128, 1024] for FP8 KV"
+            )
         )
-    if num_hgroups != head_dim // 16 or hgroup_width != 16:
+    if num_hgroups != head_dim // vector_width or hgroup_width != vector_width:
         raise ValueError(
             "key_cache shape must be "
-            "[num_blocks, num_kv_heads, head_dim // 16, block_size, 16], "
+            f"[num_blocks, num_kv_heads, head_dim // {vector_width}, "
+            f"block_size, {vector_width}], "
             f"got {tuple(key_cache.shape)} for head_dim={head_dim}"
         )
     if block_size not in (16, 64, 128):
@@ -300,13 +332,16 @@ def pa_decode(
         )
 
     trans_v = value_cache.dim() == 5
+    if is_bf16_kv and not trans_v:
+        raise ValueError("BF16 KV requires the vectorized 5D value_cache layout")
     if trans_v:
         v_num_blocks, v_num_kv_heads = value_cache.shape[:2]
-        expected_v_tail = (block_size // 16, head_dim, 16)
+        expected_v_tail = (block_size // vector_width, head_dim, vector_width)
         if tuple(value_cache.shape[2:]) != expected_v_tail:
             raise ValueError(
                 "transposed value_cache shape must be "
-                "[num_blocks, num_kv_heads, block_size // 16, head_dim, 16], "
+                f"[num_blocks, num_kv_heads, block_size // {vector_width}, "
+                f"head_dim, {vector_width}], "
                 f"got {tuple(value_cache.shape)} for block_size={block_size}, "
                 f"head_dim={head_dim}"
             )
@@ -336,21 +371,6 @@ def pa_decode(
             f"num_kv_heads ({num_kv_heads})"
         )
 
-    arch = get_gfx_runtime()
-    expected_fp8_dtype = {
-        "gfx942": torch.float8_e4m3fnuz,
-        "gfx950": torch.float8_e4m3fn,
-    }.get(arch)
-    if expected_fp8_dtype is None:
-        raise NotImplementedError(
-            f"pa_decode only supports gfx942 and gfx950, got {arch}"
-        )
-    if compute_type != expected_fp8_dtype:
-        raise NotImplementedError(
-            f"pa_decode only supports FP8 compute ({expected_fp8_dtype}) on {arch}, "
-            f"got {compute_type}"
-        )
-
     if block_tables.dtype != torch.int32:
         raise TypeError(f"block_tables must be int32, got {block_tables.dtype}")
     if context_lengths.dtype != torch.int32:
@@ -363,20 +383,22 @@ def pa_decode(
         query_dtype = "f16"
     else:
         raise TypeError(f"pa_decode only supports f16/bf16 query, got {query.dtype}")
+    if is_bf16_kv and query.dtype != torch.bfloat16:
+        raise NotImplementedError("BF16 KV requires bfloat16 queries")
     if output.dtype != query.dtype:
         raise TypeError(
             "pa_decode requires output.dtype == query.dtype, "
             f"got {output.dtype} vs {query.dtype}"
         )
 
-    if key_cache.dtype != expected_fp8_dtype:
+    if key_cache.dtype != expected_kv_dtype:
         raise TypeError(
-            f"pa_decode requires {expected_fp8_dtype} key cache on {arch}, "
+            f"pa_decode requires {expected_kv_dtype} key cache on {arch}, "
             f"got {key_cache.dtype}"
         )
-    if value_cache.dtype != expected_fp8_dtype:
+    if value_cache.dtype != expected_kv_dtype:
         raise TypeError(
-            f"pa_decode requires {expected_fp8_dtype} value cache on {arch}, "
+            f"pa_decode requires {expected_kv_dtype} value cache on {arch}, "
             f"got {value_cache.dtype}"
         )
 
@@ -445,53 +467,64 @@ def pa_decode(
             )
         return scale
 
-    if (key_scale is None) != (value_scale is None):
-        raise ValueError(
-            "key_scale and value_scale must either both be provided or both be None"
-        )
-    key_scale_t = normalize_scale(key_scale, "key_scale")
-    value_scale_t = normalize_scale(value_scale, "value_scale")
-    per_token_kv = key_scale_t.numel() > 1
-    if per_token_kv != (value_scale_t.numel() > 1):
-        raise ValueError(
-            "key_scale and value_scale must both be per-tensor or both be per-token"
-        )
-    if per_token_kv:
-        if key_scale_t.shape != value_scale_t.shape:
+    if is_bf16_kv:
+        if key_scale is not None or value_scale is not None:
             raise ValueError(
-                "key_scale/value_scale shape mismatch: "
-                f"{tuple(key_scale_t.shape)} vs {tuple(value_scale_t.shape)}"
+                "BF16 KV is unscaled; key_scale and value_scale must be None"
             )
-        expected_scale_shape = (num_blocks, num_kv_heads, block_size)
-        if key_scale_t.shape != expected_scale_shape:
-            raise ValueError(
-                "per-token key_scale/value_scale must be "
-                "[num_blocks, num_kv_heads, block_size] matching the KV cache, "
-                f"got {tuple(key_scale_t.shape)}"
-            )
-        stride_ks_block = int(key_scale_t.stride(0))
-        stride_ks_head = int(key_scale_t.stride(1))
-        if key_scale_t.stride(2) != 1:
-            raise ValueError(
-                "per-token key_scale token dimension must be contiguous, "
-                f"got strides {key_scale_t.stride()}"
-            )
-        if value_scale_t.stride() != key_scale_t.stride():
-            raise ValueError(
-                "per-token key_scale and value_scale must have matching strides, "
-                f"got {key_scale_t.stride()} vs {value_scale_t.stride()}"
-            )
+        # The native BF16 specialization never dereferences scale pointers.
+        # Null pointers avoid allocating dummy scales during graph capture.
+        key_scale_t = value_scale_t = None
+        per_token_kv = False
+        stride_ks_block = stride_ks_head = 0
     else:
-        stride_ks_block = 0
-        stride_ks_head = 0
-    for name, scale in (("key_scale", key_scale_t), ("value_scale", value_scale_t)):
-        if scale.dtype != torch.float32:
-            raise TypeError(f"{name} tensor must be float32, got {scale.dtype}")
-        if scale.device != dev:
+        if (key_scale is None) != (value_scale is None):
             raise ValueError(
-                f"{name} tensor must be on the same device as query ({dev}), "
-                f"got {scale.device}"
+                "key_scale and value_scale must either both be provided or both be None"
             )
+        key_scale_t = normalize_scale(key_scale, "key_scale")
+        value_scale_t = normalize_scale(value_scale, "value_scale")
+        per_token_kv = key_scale_t.numel() > 1
+        if per_token_kv != (value_scale_t.numel() > 1):
+            raise ValueError(
+                "key_scale and value_scale must both be per-tensor or both be per-token"
+            )
+        if per_token_kv:
+            if key_scale_t.shape != value_scale_t.shape:
+                raise ValueError(
+                    "key_scale/value_scale shape mismatch: "
+                    f"{tuple(key_scale_t.shape)} vs {tuple(value_scale_t.shape)}"
+                )
+            expected_scale_shape = (num_blocks, num_kv_heads, block_size)
+            if key_scale_t.shape != expected_scale_shape:
+                raise ValueError(
+                    "per-token key_scale/value_scale must be "
+                    "[num_blocks, num_kv_heads, block_size] matching the KV cache, "
+                    f"got {tuple(key_scale_t.shape)}"
+                )
+            stride_ks_block = int(key_scale_t.stride(0))
+            stride_ks_head = int(key_scale_t.stride(1))
+            if key_scale_t.stride(2) != 1:
+                raise ValueError(
+                    "per-token key_scale token dimension must be contiguous, "
+                    f"got strides {key_scale_t.stride()}"
+                )
+            if value_scale_t.stride() != key_scale_t.stride():
+                raise ValueError(
+                    "per-token key_scale and value_scale must have matching strides, "
+                    f"got {key_scale_t.stride()} vs {value_scale_t.stride()}"
+                )
+        else:
+            stride_ks_block = 0
+            stride_ks_head = 0
+        for name, scale in (("key_scale", key_scale_t), ("value_scale", value_scale_t)):
+            if scale.dtype != torch.float32:
+                raise TypeError(f"{name} tensor must be float32, got {scale.dtype}")
+            if scale.device != dev:
+                raise ValueError(
+                    f"{name} tensor must be on the same device as query ({dev}), "
+                    f"got {scale.device}"
+                )
 
     schedule_context_length = int(max_blocks_per_seq) * int(block_size)
     if max_context_length is not None:
@@ -517,8 +550,11 @@ def pa_decode(
     psum = exp_sums
     pout = temporary_output
 
-    # FP8 element offsets are bytes; 4 GiB caches require i64 addressing.
-    cache_extent = max(key_cache.numel(), value_cache.numel())
+    # Bound byte offsets as well as element indices for 16-bit BF16 caches.
+    cache_extent = max(
+        key_cache.numel() * key_cache.element_size(),
+        value_cache.numel() * value_cache.element_size(),
+    )
     wide_kv_addressing = cache_extent >= 2**31
     kv_buffer_u32 = cache_extent < 2**32
 
@@ -535,6 +571,7 @@ def pa_decode(
             num_partitions=num_partitions,
             softmax_scale=softmax_scale,
             query_dtype=query_dtype,
+            kv_dtype=kv_dtype,
             per_token_kv=per_token_kv,
             query_length=query_length,
             trans_v=trans_v,
@@ -609,8 +646,16 @@ def pa_decode(
             ptr_arg(key_cache, _flydsl_pointer_dtype(key_cache.dtype)),
             ptr_arg(value_cache, _flydsl_pointer_dtype(value_cache.dtype)),
             ptr_arg(block_tables, fx.Int32),
-            ptr_arg(key_scale_t, fx.Float32),
-            ptr_arg(value_scale_t, fx.Float32),
+            (
+                flyc.from_c_void_p(fx.Float32, 0)
+                if is_bf16_kv
+                else ptr_arg(key_scale_t, fx.Float32)
+            ),
+            (
+                flyc.from_c_void_p(fx.Float32, 0)
+                if is_bf16_kv
+                else ptr_arg(value_scale_t, fx.Float32)
+            ),
             int(max_blocks_per_seq),
             int(num_seqs),
             int(num_kv_heads),

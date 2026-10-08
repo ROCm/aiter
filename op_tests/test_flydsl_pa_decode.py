@@ -28,7 +28,7 @@ def device(monkeypatch):
 
 
 def _reference(query, key, value, table, lengths, query_length, window, sinks):
-    """FP32 attention over dequantized KV, independent of kernel Q/P rounding."""
+    """FP32 attention over logical KV, independent of kernel Q/P rounding."""
     batch = lengths.numel()
     heads, dim = query.shape[1:]
     kv_heads, page_size = key.shape[1:3]
@@ -81,7 +81,7 @@ def _make_inputs(
     value = torch.empty_like(key).uniform_(-0.5, 0.5)
 
     if pattern == "small_query":
-        # Q must be normalized per row before FP8 conversion in either KV mode.
+        # Tiny Q values must survive FP8 normalization or native BF16 loads.
         query.fill_(2**-12)
         key.fill_(14)
         key[:, :, 1::2] = -14
@@ -223,3 +223,250 @@ def test_pa_decode(
     )
     assert torch.isfinite(output).all()
     torch.testing.assert_close(output.float(), reference, atol=5e-3, rtol=5e-3)
+
+
+@pytest.mark.parametrize(
+    "query_length,kv_heads,group_size,head_dim,block_size,"
+    "max_partitions,window,sink_dtype,pattern,capture",
+    [
+        pytest.param(1, 1, 8, 128, 16, 1, 0, None, "random", False, id="decode"),
+        pytest.param(4, 2, 4, 64, 64, 3, 0, torch.float16, "random", False, id="mtp"),
+        pytest.param(
+            4, 1, 16, 128, 128, 7, 257, torch.float32, "random", False, id="window"
+        ),
+        pytest.param(
+            1, 1, 16, 192, 64, 4, 0, None, "random", False, id="head192-decode"
+        ),
+        pytest.param(4, 1, 16, 192, 64, 4, 0, None, "random", False, id="head192-mtp"),
+        pytest.param(1, 2, 8, 256, 16, 7, 0, None, "random", False, id="head256"),
+        pytest.param(
+            1, 1, 4, 1024, 128, 1, 0, torch.bfloat16, "random", False, id="head1024"
+        ),
+        # Large BF16 Q/P operands must split MTP rows to fit the LDS budget.
+        pytest.param(
+            4, 1, 16, 512, 64, 4, 0, None, "random", False, id="head512-mtp-split2"
+        ),
+        pytest.param(
+            4, 1, 16, 1024, 64, 4, 0, None, "random", False, id="head1024-mtp-split4"
+        ),
+        pytest.param(
+            3, 1, 16, 1024, 64, 4, 0, None, "random", False, id="head1024-mtp-split3"
+        ),
+        pytest.param(
+            4, 1, 8, 128, 64, 7, 0, None, "random", True, id="graph-workspace"
+        ),
+        *[
+            pytest.param(
+                1,
+                1,
+                group,
+                128,
+                page,
+                1,
+                0,
+                None,
+                pattern,
+                False,
+                id=f"{pattern}-page{page}-g{group}",
+            )
+            for page, group in ((16, 8), (128, 16))
+            for pattern in ("small_query", "probability_tail")
+        ],
+    ],
+)
+def test_pa_decode_bf16_kv(
+    query_length,
+    kv_heads,
+    group_size,
+    head_dim,
+    block_size,
+    max_partitions,
+    window,
+    sink_dtype,
+    pattern,
+    capture,
+    device,
+):
+    from aiter.ops.flydsl.pa_decode import pa_decode, plan_pa_decode
+
+    torch.manual_seed(0)
+    query, key, value, table, context = _make_inputs(
+        query_length,
+        kv_heads,
+        group_size,
+        head_dim,
+        block_size,
+        torch.bfloat16,
+        pattern,
+        device,
+    )
+    # Native BF16 operands use vector-8 K and transposed V, without KV scales.
+    pages = key.shape[0]
+    key_cache = (
+        key.reshape(pages, kv_heads, block_size, head_dim // 8, 8)
+        .permute(0, 1, 3, 2, 4)
+        .contiguous()
+    )
+    value_cache = (
+        value.reshape(pages, kv_heads, block_size // 8, 8, head_dim)
+        .permute(0, 1, 2, 4, 3)
+        .contiguous()
+    )
+    sinks = None
+    if sink_dtype is not None:
+        sinks = torch.linspace(-2, 2, query.shape[1], dtype=sink_dtype, device=device)
+        sinks[0], sinks[-1] = float("-inf"), float("inf")
+    plan = plan_pa_decode(
+        context,
+        kv_heads,
+        max_partitions=max_partitions,
+        query_length=query_length,
+        sliding_window=window,
+    )
+    output = torch.full_like(query, float("nan"))
+    workspace = {}
+    if capture:
+        scalar_shape = (kv_heads, plan.capacity, query_length * group_size)
+        workspace = {
+            "exp_sums": torch.empty(scalar_shape, dtype=torch.float32, device=device),
+            "max_logits": torch.empty(scalar_shape, dtype=torch.float32, device=device),
+            "temporary_output": torch.empty(
+                (*scalar_shape, head_dim), dtype=query.dtype, device=device
+            ),
+        }
+
+    def launch():
+        pa_decode(
+            output,
+            query,
+            key_cache,
+            value_cache,
+            context,
+            table,
+            softmax_scale=head_dim**-0.5,
+            query_length=query_length,
+            sinks=sinks,
+            sliding_window=window,
+            work_plan=plan,
+            max_context_length=1027 if pattern == "random" else 1024,
+            **workspace,
+        )
+
+    launch()
+    if capture:
+        # Compile and allocate the plan/workspace before capture. Reusing the
+        # captured query pointer must also observe new data on every replay.
+        capture_stream = torch.cuda.Stream()
+        capture_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(capture_stream):
+            launch()
+        torch.cuda.current_stream().wait_stream(capture_stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=capture_stream):
+            launch()
+        for _ in range(2):
+            query.neg_()
+            output.fill_(float("nan"))
+            graph.replay()
+            reference = _reference(
+                query,
+                key.float(),
+                value.float(),
+                table,
+                context,
+                query_length,
+                window,
+                sinks,
+            )
+            assert torch.isfinite(output).all()
+            torch.testing.assert_close(output.float(), reference, atol=5e-3, rtol=5e-3)
+    else:
+        reference = _reference(
+            query,
+            key.float(),
+            value.float(),
+            table,
+            context,
+            query_length,
+            window,
+            sinks,
+        )
+        assert torch.isfinite(output).all()
+        torch.testing.assert_close(output.float(), reference, atol=5e-3, rtol=5e-3)
+
+
+@pytest.mark.parametrize(
+    "invalid_input,error,match",
+    [
+        pytest.param(
+            "fp16-query",
+            NotImplementedError,
+            "BF16 KV requires bfloat16 queries",
+            id="fp16-query",
+        ),
+        pytest.param(
+            "plain-v",
+            ValueError,
+            "BF16 KV requires the vectorized 5D value_cache layout",
+            id="plain-v",
+        ),
+        pytest.param(
+            "scaled-kv",
+            ValueError,
+            "BF16 KV is unscaled; key_scale and value_scale must be None",
+            id="scaled-kv",
+        ),
+        pytest.param(
+            "vector16-k", ValueError, "key_cache shape must be", id="vector16-k"
+        ),
+        pytest.param(
+            "vector16-v",
+            ValueError,
+            "transposed value_cache shape must be",
+            id="vector16-v",
+        ),
+    ],
+)
+def test_pa_decode_bf16_kv_rejects_unsupported_inputs(
+    invalid_input, error, match, device, monkeypatch
+):
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+
+    query = torch.empty((1, 8, 128), dtype=torch.bfloat16, device=device)
+    key_cache = torch.empty((1, 1, 16, 64, 8), dtype=query.dtype, device=device)
+    value_cache = torch.empty((1, 1, 8, 128, 8), dtype=query.dtype, device=device)
+    context = torch.ones(1, dtype=torch.int32, device=device)
+    table = torch.zeros((1, 1), dtype=torch.int32, device=device)
+    kwargs = {}
+    if invalid_input == "fp16-query":
+        query = query.to(torch.float16)
+    elif invalid_input == "plain-v":
+        value_cache = torch.empty((1, 1, 128, 64), dtype=query.dtype, device=device)
+    elif invalid_input == "scaled-kv":
+        kwargs = {
+            "key_scale": torch.ones(1, dtype=torch.float32, device=device),
+            "value_scale": torch.ones(1, dtype=torch.float32, device=device),
+        }
+    elif invalid_input == "vector16-k":
+        key_cache = torch.empty((1, 1, 8, 64, 16), dtype=query.dtype, device=device)
+    elif invalid_input == "vector16-v":
+        value_cache = torch.empty((1, 1, 4, 128, 16), dtype=query.dtype, device=device)
+
+    def unexpected_compile(**_):
+        pytest.fail("invalid BF16 inputs reached kernel compilation")
+
+    monkeypatch.setattr(pa, "compile_pa_decode_tile", unexpected_compile)
+    plan = pa.plan_pa_decode(context, 1, max_partitions=1)
+    with pytest.raises(error, match=match):
+        pa.pa_decode(
+            torch.empty_like(query),
+            query,
+            key_cache,
+            value_cache,
+            context,
+            table,
+            softmax_scale=128**-0.5,
+            query_length=1,
+            work_plan=plan,
+            **kwargs,
+        )
