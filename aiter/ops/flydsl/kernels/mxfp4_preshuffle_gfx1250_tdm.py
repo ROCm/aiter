@@ -62,6 +62,7 @@ EXPLICIT_VGPR_PARTITION = int(
 )
 PLANAR_LDS = int(os.environ.get("AITER_FLYDSL_PLANAR_LDS", "0"))
 INTERLEAVED_LDS_LOAD = int(os.environ.get("AITER_FLYDSL_INTERLEAVED_LDS_LOAD", "0"))
+ROLLED_DRAIN = int(os.environ.get("AITER_FLYDSL_ROLLED_DRAIN", "1"))
 LDS_SOA_LOAD_INTERLEAVE = os.environ.get("LDS_SOA_LOAD_INTERLEAVE")
 if LDS_SOA_LOAD_INTERLEAVE is not None:
     LDS_SOA_LOAD_INTERLEAVE = int(LDS_SOA_LOAD_INTERLEAVE)
@@ -77,6 +78,8 @@ if PLANAR_LDS not in (0, 1):
     raise ValueError("AITER_FLYDSL_PLANAR_LDS must be 0 or 1")
 if INTERLEAVED_LDS_LOAD not in (0, 1):
     raise ValueError("AITER_FLYDSL_INTERLEAVED_LDS_LOAD must be 0 or 1")
+if ROLLED_DRAIN not in (0, 1):
+    raise ValueError("AITER_FLYDSL_ROLLED_DRAIN must be 0 or 1")
 if LDS_SOA_LOAD_INTERLEAVE not in (None, 0, 1):
     raise ValueError("LDS_SOA_LOAD_INTERLEAVE must be 0 or 1")
 if FORCE_1X4_CLUSTER not in (0, 1):
@@ -226,29 +229,7 @@ def launch_gemm_a8w4_tdm(
     # Double buffering is sufficient: the carry reads the other LDS buffer
     # before the post-compute barrier permits reusing the current buffer.
     next_stage_on = 1 if (next_stage_prefetch and num_buffers >= 2) else 0
-    # All inputs are constexpr; avoid a long DSL-rewritten boolean chain.
-    rolled_drain = True or all(
-        (
-            persistent_workers,
-            not stage1_act,
-            a_is_fp4,
-            num_buffers == 4,
-            K == 2048,
-            tile_m == 256,
-            tile_n == 256,
-            tile_k == 256,
-            m_warp == 2,
-            n_warp == 2,
-            num_waves_per_tensor_tdm == 2,
-            cluster_m == 1,
-            cluster_n == 1,
-            planar_lds_on,
-            interleaved_lds_load_on,
-            not next_stage_on,
-            not tdm_as_in_prologue,
-            not enable_ep_scatter,
-        )
-    )
+    rolled_drain = bool(ROLLED_DRAIN)
     # Keep the experiment switch as an override while normal dispatch obtains
     # both cluster dimensions from the tuned configuration.
     cluster_m = 1 if FORCE_1X4_CLUSTER else cluster_m
