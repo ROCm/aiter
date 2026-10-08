@@ -23,6 +23,7 @@
 #include "moe_op.h"
 #include "warp_sort.h"
 #include <cfloat>
+#include <climits>
 #include <cstdint>
 #include <hip/hip_runtime.h>
 
@@ -311,7 +312,7 @@ __inline__ __device__ void warpReduceMax(float& val_o, int& idx)
 constexpr int kLegacyTopKLocalBits      = 5;
 constexpr int kTopKRegMaxExpertsPerLane = 1 << kLegacyTopKLocalBits;
 
-// Only the wave64 register path calls this helper; LAUNCHER_TOPK_REG gates it.
+// Wave64 rank; its low five bits are the wave32 rank (permlanex16 for row_bcast).
 __device__ __forceinline__ int legacy_topk_lane_rank(int lane)
 {
     const int low2 = (lane & 3) ^ ((lane & 4) ? 3 : 0);
@@ -1510,6 +1511,250 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
 #endif
     }
 }
+
+// Biased sigmoid grouped top-k for wave32, one token per wave (blockDim.x / 32
+// tokens a block), everything in VGPRs. Lane l holds experts
+// [l * EPL, (l + 1) * EPL), so a group spans 32 / num_groups lanes and its
+// score (top-2 sum) reduces over DPP alone.
+// Output matches grouped_topk_kernel bit for bit, tie order included, except
+// that picks with no finite score left weigh zero and two groups get their
+// full top-2 score (that kernel reduces over a 16-lane group only partly).
+template <typename DTYPE_I, int EPL>
+__global__ __launch_bounds__(256) void
+biased_grouped_topk_w32_kernel(const DTYPE_I* __restrict__ gating_output, // [num_tokens, E]
+                               const DTYPE_I* __restrict__ correction_bias, // [E]
+                               float* __restrict__ topk_weights,            // [num_tokens, topk]
+                               int* __restrict__ topk_ids,                  // [num_tokens, topk]
+                               const size_t stride_gating,
+                               const size_t stride_tk,
+                               const int num_groups,
+                               const int topk,
+                               const int topk_group,
+                               const bool need_renorm,
+                               const float routed_scaling_factor,
+                               const int num_tokens)
+{
+#if !defined(__GFX9__) // wave64 there; the host launches this only at wave32
+    constexpr int W = 32;
+    using in_t      = typename aiter::hip2opus<DTYPE_I>::type;
+    using in_vec_t  = opus::vector_t<in_t, EPL>;
+    const int lane  = threadIdx.x % W;
+    const int64_t token =
+        static_cast<int64_t>(blockIdx.x) * (blockDim.x / W) +
+        __builtin_amdgcn_readfirstlane(threadIdx.x / W);
+    if(token >= num_tokens)
+        return;
+
+    // Ties follow grouped_topk_kernel at wave32. Its float4 layout puts expert
+    // e in lane (e / 4) % 32 at local slot (e / 128) * 4 + e % 4, and its DPP
+    // arg-max ranks lanes as legacy_topk_lane_rank without the wave64 bit.
+    // Within this lane that is index order on each half of its experts, the
+    // upper half first when lane & 2, so the halves are swapped on load and a
+    // slot index is the in-lane tie order.
+    // A select between the halves became a dynamic index the compiler moved to
+    // LDS; an integer blend stays in registers.
+    const uint32_t swap_mask = -static_cast<uint32_t>((lane >> 1) & 1);
+    auto load = [&](const DTYPE_I* p) {
+        constexpr int N = sizeof(in_vec_t) / sizeof(uint32_t);
+        struct D
+        {
+            uint32_t w[N];
+        };
+        const D d = __builtin_bit_cast(D, reinterpret_cast<const in_vec_t*>(p)[lane]);
+        D s;
+#pragma unroll
+        for(int k = 0; k < N; ++k)
+            s.w[k] = d.w[k] ^ ((d.w[k] ^ d.w[k ^ (N / 2)]) & swap_mask);
+        return __builtin_bit_cast(in_vec_t, s);
+    };
+    const in_vec_t x = load(gating_output + token * stride_gating);
+    const in_vec_t b = load(correction_bias);
+    auto slot_expert = [](int l, int j) { return l * EPL + (j ^ ((l & 2) << 1)); };
+    auto slot_rank   = [&](int j) {
+        const int e = slot_expert(lane, j);
+        const int v = e >> 2;
+        return ((legacy_topk_lane_rank(v & 31) & 31) << kLegacyTopKLocalBits) |
+               ((v >> 5) << 2) | (e & 3);
+    };
+    // grouped_topk_kernel rounds the f64 product -C_LOG2E * x to float. For
+    // 16-bit inputs a hi/lo split fma gives the same float (checked over every
+    // bf16 and fp16 value) without the f64 multiply.
+    constexpr float kNegLog2eHi = -static_cast<float>(C_LOG2E);
+    constexpr float kNegLog2eLo = static_cast<float>(-C_LOG2E - static_cast<double>(kNegLog2eHi));
+    // Scores are compared as order-preserving integers: integer max/min skip
+    // the NaN canonicalization every float max carried. kDead sits below
+    // every score, -inf (what a NaN maps to) included.
+    constexpr int kDead = INT_MIN;
+    auto to_key         = [](float f) {
+        const int u = __builtin_bit_cast(int, f);
+        return u ^ ((u >> 31) & 0x7fffffff);
+    };
+    auto to_float = [](int k) { return __builtin_bit_cast(float, k ^ ((k >> 31) & 0x7fffffff)); };
+    const int kNegInf = to_key(-INFINITY);
+    float sig[EPL];
+    int key[EPL], id[EPL];
+#pragma unroll
+    for(int i = 0; i < EPL; ++i)
+    {
+        const float xf = static_cast<float>(x[i]);
+        float t;
+        if constexpr(std::is_same_v<DTYPE_I, float>)
+            t = static_cast<float>(-C_LOG2E * xf);
+        else
+            t = __builtin_fmaf(kNegLog2eHi, xf, kNegLog2eLo * xf);
+        sig[i]        = __builtin_amdgcn_rcpf(1.0f + exp2f(t));
+        const float s = sig[i] + static_cast<float>(b[i]);
+        key[i]        = to_key(::isnan(s) ? -INFINITY : s);
+        id[i]         = i;
+    }
+
+    if(topk_group < num_groups)
+    {
+        // Lane top-2 as a tree, then across the group's lanes.
+        auto merge = [](int& a1, int& a2, int b1, int b2) {
+            a2 = max(min(a1, b1), max(a2, b2));
+            a1 = max(a1, b1);
+        };
+        int t1[EPL / 2], t2[EPL / 2];
+#pragma unroll
+        for(int i = 0; i < EPL / 2; ++i)
+        {
+            t1[i] = max(key[2 * i], key[2 * i + 1]);
+            t2[i] = min(key[2 * i], key[2 * i + 1]);
+        }
+#pragma unroll
+        for(int w = EPL / 4; w >= 1; w /= 2)
+        {
+#pragma unroll
+            for(int i = 0; i < w; ++i)
+                merge(t1[i], t2[i], t1[i + w], t2[i + w]);
+        }
+        int m1 = t1[0], m2 = t2[0];
+        // num_groups divides W and is at most 8: a group is 4, 8, 16 or 32 lanes.
+        const int lane_shift = __builtin_ctz(W) - __builtin_ctz(num_groups);
+        merge(m1, m2, aiter_dpp::move_dpp<int, 0xb1>(m1), aiter_dpp::move_dpp<int, 0xb1>(m2));
+        merge(m1, m2, aiter_dpp::move_dpp<int, 0x4e>(m1), aiter_dpp::move_dpp<int, 0x4e>(m2));
+        if(lane_shift > 2) // row_xmask:4
+            merge(m1, m2, aiter_dpp::move_dpp<int, 0x164>(m1), aiter_dpp::move_dpp<int, 0x164>(m2));
+        if(lane_shift > 3) // row_xmask:8
+            merge(m1, m2, aiter_dpp::move_dpp<int, 0x168>(m1), aiter_dpp::move_dpp<int, 0x168>(m2));
+        if(lane_shift > 4)
+            merge(m1, m2, warp_permlanex16(m1), warp_permlanex16(m2));
+        const float gs = to_float(m1) + to_float(m2);
+        const int g    = lane >> lane_shift;
+        // Rank among the groups, ties to the lower group: all eight readlanes
+        // independent, past num_groups masked off rather than branched around.
+        int rank = 0;
+#pragma unroll
+        for(int h = 0; h < 8; ++h)
+        {
+            const float o = __builtin_bit_cast(
+                float,
+                __builtin_amdgcn_readlane(__builtin_bit_cast(int, gs), (h << lane_shift) & (W - 1)));
+            rank += (h < num_groups) & ((o > gs) | ((o == gs) & (h < g)));
+        }
+        const bool drop = rank >= topk_group;
+#pragma unroll
+        for(int i = 0; i < EPL; ++i)
+            key[i] = drop ? kDead : key[i];
+    }
+
+    // Sort each lane's experts once (descending, ties to the lower slot), so a pick
+    // only has to compare lane heads and the winner shifts its list up.
+    // Taking the lane maximum every pick instead ran two seven-deep select
+    // chains per pick.
+    static_assert(EPL == 8, "sorting network is for eight experts per lane");
+    constexpr int kNet[19][2] = {{0, 1}, {2, 3}, {4, 5}, {6, 7}, {0, 2}, {1, 3}, {4, 6},
+                                 {5, 7}, {1, 2}, {5, 6}, {0, 4}, {3, 7}, {1, 5}, {2, 6},
+                                 {1, 4}, {3, 6}, {2, 4}, {3, 5}, {3, 4}};
+#pragma unroll
+    for(int c = 0; c < 19; ++c)
+    {
+        const int p = kNet[c][0], q = kNet[c][1];
+        // Selects here were turned into exec-masked branches; the keys take
+        // max/min (equal on a tie) and the payload an integer blend instead.
+        const int swap = -static_cast<int>((key[q] > key[p]) | ((key[q] == key[p]) & (id[q] < id[p])));
+        const int kp   = key[p];
+        key[p]         = max(kp, key[q]);
+        key[q]         = min(kp, key[q]);
+        const int ds   = (__builtin_bit_cast(int, sig[p]) ^ __builtin_bit_cast(int, sig[q])) & swap;
+        sig[p]         = __builtin_bit_cast(float, __builtin_bit_cast(int, sig[p]) ^ ds);
+        sig[q]         = __builtin_bit_cast(float, __builtin_bit_cast(int, sig[q]) ^ ds);
+        const int di   = (id[p] ^ id[q]) & swap;
+        id[p] ^= di;
+        id[q] ^= di;
+    }
+
+    auto max_op = [](int a, int c) { return max(a, c); };
+    auto min_op = [](int a, int c) { return min(a, c); };
+    float sum = 0.0f, out_w = 0.0f;
+    int out_id = 0;
+    // Lane heads tie across lanes only on exactly equal scores. The first pass
+    // takes the lowest tied lane and just records whether that ever happened;
+    // a second pass then settles ties by the legacy rank. A per-pick tie
+    // branch cost 0.2 us at T=1536.
+    auto select = [&](auto by_rank) {
+        int k_[EPL], d_[EPL];
+        float s_[EPL];
+#pragma unroll
+        for(int i = 0; i < EPL; ++i)
+        {
+            k_[i] = key[i];
+            s_[i] = sig[i];
+            d_[i] = id[i];
+        }
+        sum           = 0.0f;
+        uint32_t ties = 0;
+        for(int k = 0; k < topk; ++k)
+        {
+            const int wm        = wave_reduce<int, decltype(max_op), W>(k_[0], max_op);
+            const bool match    = k_[0] == wm;
+            const uint32_t tied = __builtin_amdgcn_ballot_w32(match);
+            int wl              = __builtin_ctz(tied);
+            if constexpr(by_rank)
+            {
+                if(tied & (tied - 1))
+                {
+                    const int hr = match ? slot_rank(d_[0]) : INT_MAX;
+                    const int r  = wave_reduce<int, decltype(min_op), W>(hr, min_op);
+                    wl           = __builtin_ctz(__builtin_amdgcn_ballot_w32(hr == r));
+                }
+            }
+            else
+                ties |= tied & (tied - 1);
+            const int wid  = slot_expert(wl, __builtin_amdgcn_readlane(d_[0], wl));
+            const float ws = __builtin_bit_cast(
+                float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, s_[0]), wl));
+            // A select on wm (a VGPR) became a branch around the readlane.
+            const float wk = __builtin_bit_cast(
+                float, __builtin_bit_cast(int, ws) & -static_cast<int>(wm > kNegInf));
+            const bool hit = lane == wl;
+#pragma unroll
+            for(int i = 0; i < EPL - 1; ++i)
+            {
+                k_[i] = hit ? k_[i + 1] : k_[i];
+                s_[i] = hit ? s_[i + 1] : s_[i];
+                d_[i] = hit ? d_[i + 1] : d_[i];
+            }
+            k_[EPL - 1] = hit ? kDead : k_[EPL - 1];
+            out_id      = lane == k ? wid : out_id;
+            out_w       = lane == k ? wk : out_w;
+            sum += wk;
+        }
+        return ties;
+    };
+    if(select(std::false_type{}))
+        select(std::true_type{});
+
+    const float scale =
+        need_renorm ? (sum > 0.0f ? routed_scaling_factor / sum : 0.0f) : routed_scaling_factor;
+    if(lane < topk)
+    {
+        topk_weights[token * stride_tk + lane] = out_w * scale;
+        topk_ids[token * stride_tk + lane]     = out_id;
+    }
+#endif
+}
 } // namespace aiter
 
 #define LAUNCH_KERNEL()                                                        \
@@ -1747,6 +1992,48 @@ void biased_grouped_topk(const aiter_tensor_t& gating_output,   // [num_tokens, 
                 ", num_expert_group=",
                 num_expert_group);
 
+    HipDeviceGuard device_guard(gating_output.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
+
+    // wave32: one token per wave, eight experts per lane in registers. A group
+    // must cover whole lanes, and the rows are read as 16 B-aligned vectors.
+    constexpr int W32_EPL = 8;
+    const int elem_bytes  = gating_output.element_size();
+    if(get_warp_size_func() == 32 && num_experts == 32 * W32_EPL &&
+       num_expert_group <= 8 && 32 % num_expert_group == 0 && topk >= 1 && topk <= 32 &&
+       topk <= topk_grp * (num_experts / num_expert_group) &&
+       (stride_gating * elem_bytes) % 16 == 0 &&
+       reinterpret_cast<uintptr_t>(gating_output.data_ptr()) % 16 == 0 &&
+       reinterpret_cast<uintptr_t>(correction_bias.data_ptr()) % 16 == 0 &&
+       correction_bias.dtype() == gating_output.dtype())
+    {
+        if(num_tokens == 0)
+            return;
+        // Eight tokens a block once that still fills every CU (T=16384:
+        // 10.1 -> 8.9 us); fewer tokens spread one a block.
+        const int tpb = num_tokens >= 8 * static_cast<int>(get_num_cu_func()) ? 8 : 1;
+        VLLM_DISPATCH_FLOATING_TYPES_rmTorch(gating_output.dtype(), "biased_grouped_topk_w32", [&] {
+            hipLaunchKernelGGL((aiter::biased_grouped_topk_w32_kernel<scalar_t, W32_EPL>),
+                               dim3((num_tokens + tpb - 1) / tpb),
+                               dim3(32 * tpb),
+                               0,
+                               stream,
+                               reinterpret_cast<const scalar_t*>(gating_output.data_ptr()),
+                               reinterpret_cast<const scalar_t*>(correction_bias.data_ptr()),
+                               reinterpret_cast<float*>(topk_weights.data_ptr()),
+                               reinterpret_cast<int*>(topk_ids.data_ptr()),
+                               stride_gating,
+                               stride_tk,
+                               num_expert_group,
+                               topk,
+                               topk_grp,
+                               need_renorm,
+                               routed_scaling_factor,
+                               num_tokens);
+        });
+        return;
+    }
+
     // TODO: expand usage in the future
     // bool use_opt_sort = false;
     bool use_opt_sort = (topk == 8) && (num_expert_group == 8) && (num_experts == 256) &&
@@ -1766,9 +2053,6 @@ void biased_grouped_topk(const aiter_tensor_t& gating_output,   // [num_tokens, 
                               + (topk > topk_grp ? topk : topk_grp) * sizeof(float) /* sort_v*/
                               //    + 64 / num_expert_group * sizeof(float) /* for sorting */
                              );
-
-    HipDeviceGuard device_guard(gating_output.device_id);
-    const hipStream_t stream = aiter::getCurrentHIPStream();
 
     LAUNCH_KERNEL()
 }
