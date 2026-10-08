@@ -168,7 +168,7 @@ def run_pa_gluon_test(
     data_type = compute_type
     if compute_type == aiter.dtypes.fp8:
         data_type = torch.bfloat16
-    device = "cuda:0"
+    device = f"cuda:{torch.cuda.current_device()}"
     torch.set_default_device(device)
     num_query_heads, num_kv_heads = num_heads
     assert (
@@ -579,6 +579,15 @@ def process_arguments(args: argparse.Namespace) -> tuple:
     )
 
 
+def _init_gpu_worker(device_counter, device_count):
+    """Pin each spawned worker to one device and bound nested compilation."""
+    configure_worker_subprocesses()
+    with device_counter.get_lock():
+        device = device_counter.value % device_count
+        device_counter.value += 1
+    torch.cuda.set_device(device)
+
+
 def _run_single_test(args):
     """
     Helper function to run a single test case.
@@ -647,11 +656,11 @@ def run_multi_pa_gluon_test(
 ) -> pd.DataFrame:
     """Run all tests using bounded multiprocessing parallelism.
 
-    The process pool is controlled exclusively by the shared AITER worker
-    policy. Set ``AITER_MAX_JOBS`` for an explicit CLI/CI ceiling. When this
-    file is invoked as a standalone entrypoint, a valid positive legacy
-    ``MAX_JOBS`` is adopted only if ``AITER_MAX_JOBS`` is unset; live CPU and
-    memory budgets still clamp the adopted ceiling.
+    Workers are assigned round-robin to visible GPUs, with at most
+    ``AITER_GPU_WORKERS_PER_DEVICE`` workers per device (default 8).
+    ``AITER_MAX_JOBS`` and submitted work additionally cap the pool; host
+    CPU/memory budgets apply only to nested compilation. Standalone execution
+    adopts a positive legacy ``MAX_JOBS`` when ``AITER_MAX_JOBS`` is unset.
     """
     if sliding_window_options is None:
         sliding_window_options = [0]
@@ -818,15 +827,20 @@ def run_multi_pa_gluon_test(
 
     # These tasks execute kernels on the GPU, so bound the pool by visible
     # devices instead of the host CPU/memory compilation budget.
-    worker_count = get_gpu_worker_count(total)
+    device_count = torch.cuda.device_count()
+    if device_count == 0:
+        raise RuntimeError("PA-Gluon prebuild requires at least one visible GPU")
+    worker_count = get_gpu_worker_count(total, device_count)
     print(f"Using {worker_count} parallel processes\n")
 
     # Run tests in parallel using spawn context to avoid CUDA reinitialization issues
     mp_context = multiprocessing.get_context("spawn")
+    device_counter = mp_context.Value("i", 0)
     with concurrent.futures.ProcessPoolExecutor(
         max_workers=worker_count,
         mp_context=mp_context,
-        initializer=configure_worker_subprocesses,
+        initializer=_init_gpu_worker,
+        initargs=(device_counter, device_count),
     ) as executor:
         results = list(executor.map(_run_single_test, test_args))
 

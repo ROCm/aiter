@@ -88,24 +88,26 @@ Environment Variables
        non-mutating legacy ceiling when ``AITER_MAX_JOBS`` is unset. For
        backward compatibility, AITER-owned standalone build entrypoints adopt
        a valid positive ``MAX_JOBS`` in that case and emit a ``FutureWarning``.
-       Live CPU and memory limits are recalculated on every policy call and
-       always clamp either ceiling.
+       For CPU compilation, live CPU and memory limits are recalculated on
+       every policy call and clamp either ceiling. GPU-executing pools use
+       the separate device allowance below.
      - Minimum of 80% of process-available CPUs and effective host/container
        available-memory capacity
    * - ``AITER_GPU_WORKERS_PER_DEVICE``
      - Concurrent GPU-executing workers allowed per visible GPU for build pools
        that run kernels on the device (for example the PA-Gluon accuracy
-       prebuild). Devices are counted from ``HIP_VISIBLE_DEVICES``,
-       ``ROCR_VISIBLE_DEVICES`` or ``CUDA_VISIBLE_DEVICES`` when one is set,
-       otherwise through ``amdsmi``. ``AITER_MAX_JOBS`` and the submitted job
-       count still cap the pool. Ignored when no GPU is visible.
+       prebuild). PA-Gluon binds workers to devices round-robin. Device
+       discovery uses ``torch.cuda.device_count()``, which handles visibility
+       masks and uses amdsmi with HIP-runtime fallback on ROCm.
+       ``AITER_MAX_JOBS`` and the submitted job count still cap the pool.
+       PA-Gluon requires a visible GPU; CPU-only compilation ignores this knob.
      - ``8``
 
 For an AITER-owned compile, worker-ceiling precedence is explicit
 ``AITER_MAX_JOBS`` first, then a valid positive legacy ``MAX_JOBS``, then
-automatic sizing. The automatic budget is the smaller of 80% of the CPUs
-available to the process and effective available memory divided by a 1.5 GB
-per-worker estimate, further clamped by readable cgroup CPU quotas and
+automatic sizing. The automatic CPU-compilation budget is the smaller of 80%
+of the CPUs available to the process and effective available memory divided
+by a 1.5 GB per-worker estimate, further clamped by readable cgroup CPU quotas and
 cgroup memory headroom. Standalone package/setup builds, AOT CLIs, and
 standalone PA-Gluon or OPUS builders adopt a valid positive legacy
 ``MAX_JOBS`` into ``AITER_MAX_JOBS`` and emit a ``FutureWarning``. See the

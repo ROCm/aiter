@@ -29,22 +29,18 @@ TopKTopPSamplingConfig = namedtuple(
 )
 
 
-def process_top_k_renorm_config(config) -> None:
-    # The compiled ctypes function is process-local; only success/failure
-    # should cross the ProcessPoolExecutor boundary.
-    top_k_renorm_probs_compile(config.vec_size)
+def process_top_k_renorm_config(config):
+    return top_k_renorm_probs_compile(config.vec_size)
 
 
-def process_top_p_sampling_config(config) -> None:
-    # The compiled ctypes function is process-local; only success/failure
-    # should cross the ProcessPoolExecutor boundary.
-    top_p_sampling_from_probs_compile(config.vec_size, config.deterministic)
+def process_top_p_sampling_config(config):
+    return top_p_sampling_from_probs_compile(config.vec_size, config.deterministic)
 
 
-def process_top_k_top_p_sampling_config(config) -> None:
-    # The compiled ctypes function is process-local; only success/failure
-    # should cross the ProcessPoolExecutor boundary.
-    top_k_top_p_sampling_from_probs_compile(config.vec_size, config.deterministic)
+def process_top_k_top_p_sampling_config(config):
+    return top_k_top_p_sampling_from_probs_compile(
+        config.vec_size, config.deterministic
+    )
 
 
 def main():

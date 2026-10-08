@@ -16,10 +16,8 @@ MLAConfig = namedtuple(
 )
 
 
-def process_config(config) -> None:
-    # The compiled ctypes function is process-local; only success/failure
-    # should cross the ProcessPoolExecutor boundary.
-    compile(
+def process_config(config):
+    return compile(
         config.gqa_ratio,
         config.page_size,
         config.q_dtype,

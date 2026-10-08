@@ -26,8 +26,6 @@ from hipify.hipify_python import GeneratedFileCleaner
 from packaging.version import Version
 from setuptools.command.build_ext import build_ext
 
-from aiter_worker_limits import get_compile_worker_count
-
 IS_WINDOWS = sys.platform == "win32"
 IS_LINUX = sys.platform.startswith("linux")
 LIB_EXT = ".so"
@@ -1544,6 +1542,8 @@ def _get_rocm_arch_flags(cflags: list[str] | None = None) -> list[str]:
 
 
 def _get_num_workers(verbose: bool) -> int:
+    from aiter_worker_limits import get_compile_worker_count
+
     max_jobs = get_compile_worker_count()
     if verbose:
         print(

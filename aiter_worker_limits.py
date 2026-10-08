@@ -1,11 +1,9 @@
 """Worker limits shared by setup and AITER runtime code."""
 
 import contextlib
-import importlib
 import logging
 import os
 import posixpath
-import sys
 import threading
 import time
 import warnings
@@ -33,7 +31,6 @@ _LEGACY_WORKER_ENV = "MAX_JOBS"
 _GPU_WORKERS_PER_DEVICE_ENV = "AITER_GPU_WORKERS_PER_DEVICE"
 _PROC_SELF_CGROUP_PATH = "/proc/self/cgroup"
 _PROC_SELF_MOUNTINFO_PATH = "/proc/self/mountinfo"
-_ROCM_AMDSMI_PATH = "/opt/rocm/share/amd_smi"
 _logger = logging.getLogger(__name__)
 _memory_diagnostic_lock = threading.Lock()
 _memory_diagnostic_last_time: float | None = None
@@ -269,10 +266,6 @@ def _cgroup_memory_bound() -> tuple[int | None, dict[str, object] | None]:
     return remaining, best_observation
 
 
-def _cgroup_memory_remaining_bytes() -> int | None:
-    return _cgroup_memory_bound()[0]
-
-
 def _read_cgroup_memory_stat(observation: dict[str, object]) -> dict[str, int]:
     """Read diagnostic memory.stat fields for the selected cgroup bound."""
     directory = str(observation["directory"])
@@ -387,12 +380,6 @@ def _automatic_worker_snapshot() -> tuple[int, int, dict[str, object] | None]:
     if cgroup_remaining is None or cgroup_remaining > host_available:
         observation = None
     return cpu_budget, memory_budget, observation
-
-
-def get_automatic_worker_budgets() -> tuple[int, int]:
-    """Return CPU and memory budgets; diagnostics occur after ceiling resolution."""
-    cpu_budget, memory_budget, _ = _automatic_worker_snapshot()
-    return cpu_budget, memory_budget
 
 
 def adopt_legacy_max_jobs() -> None:
@@ -527,101 +514,25 @@ def split_worker_budget(
     return outer, inner
 
 
-def _configured_worker_ceiling() -> int | None:
-    """Return a positive ``AITER_MAX_JOBS`` ceiling, if one is configured."""
-    return _env_ceiling(_WORKER_ENV)
-
-
-def _gpu_count_from_env() -> int | None:
-    """Return a visible GPU count from a device mask, or None when unset."""
-    for name in (
-        "HIP_VISIBLE_DEVICES",
-        "ROCR_VISIBLE_DEVICES",
-        "CUDA_VISIBLE_DEVICES",
-    ):
-        raw = os.environ.get(name)
-        if raw is None:
-            continue
-        raw = raw.strip()
-        if not raw:
-            continue
-        if raw == "-1":
-            return 0
-        if raw.lower() == "all":
-            return None
-        entries = [part for part in raw.split(",") if part.strip()]
-        if entries:
-            return len(entries)
-    return None
-
-
-def _amdsmi_gpu_count() -> int | None:
-    """Count AMD GPUs through amdsmi, or return None when it is unavailable."""
-    try:
-        amdsmi = importlib.import_module("amdsmi")
-    except ImportError:
-        if not os.path.isdir(_ROCM_AMDSMI_PATH):
-            return None
-        added_path = _ROCM_AMDSMI_PATH not in sys.path
-        if added_path:
-            sys.path.insert(0, _ROCM_AMDSMI_PATH)
-        try:
-            amdsmi = importlib.import_module("amdsmi")
-        except ImportError:
-            return None
-        finally:
-            if added_path:
-                sys.path.remove(_ROCM_AMDSMI_PATH)
-
-    try:
-        amdsmi.amdsmi_init()
-    except Exception:  # noqa: BLE001
-        return None
-    try:
-        return len(amdsmi.amdsmi_get_processor_handles())
-    except Exception:  # noqa: BLE001
-        return None
-    finally:
-        with contextlib.suppress(Exception):
-            amdsmi.amdsmi_shut_down()
-
-
-def visible_gpu_count() -> int:
-    """Return the number of visible GPUs, preferring masks and amdsmi."""
-    masked = _gpu_count_from_env()
-    if masked is not None:
-        return masked
-    amdsmi_count = _amdsmi_gpu_count()
-    if amdsmi_count is not None:
-        return amdsmi_count
-    try:
-        import torch
-
-        return max(0, int(torch.cuda.device_count()))
-    except Exception:  # noqa: BLE001
-        return 0
-
-
 def _gpu_workers_per_device() -> int:
     """Return the GPU workers allowed per visible device."""
     ceiling = _env_ceiling(_GPU_WORKERS_PER_DEVICE_ENV)
     return EST_WORKERS_PER_GPU if ceiling is None else ceiling
 
 
-def get_gpu_worker_count(work_count: int) -> int:
+def get_gpu_worker_count(work_count: int, device_count: int) -> int:
     """Worker budget for pools whose tasks execute on the GPU.
 
-    GPU execution is bounded by the visible device count, not by the host CPU
-    or memory budget: each worker holds a device context and allocates device
-    memory. ``AITER_MAX_JOBS`` and the submitted work count still cap the
-    result. When no GPU is visible the shared CPU policy is used instead, so
-    CPU-only hosts keep the previous behaviour.
+    Callers supply the number of devices they distribute workers across,
+    using ``torch.cuda.device_count()`` for all visible GPUs. GPU execution
+    uses a per-device allowance instead of the host CPU or memory budget.
+    ``AITER_MAX_JOBS`` and submitted work still cap the result. A zero-device
+    count retains the CPU policy for callers that support CPU-only work.
     """
-    devices = visible_gpu_count()
-    if devices <= 0:
+    if device_count <= 0:
         return get_worker_count_for(work_count)
-    budget = devices * _gpu_workers_per_device()
-    ceiling = _configured_worker_ceiling()
+    budget = device_count * _gpu_workers_per_device()
+    ceiling = _env_ceiling(_WORKER_ENV)
     if ceiling is not None:
         budget = min(budget, ceiling)
     return _cap_worker_count(budget, work_count)
@@ -646,25 +557,29 @@ def configure_worker_subprocesses() -> None:
     )
 
 
+def _run_compile_job(job) -> None:
+    """Keep compiler return values, including ctypes pointers, in the child."""
+    process_config, config = job
+    process_config(config)
+
+
 def run_compile_jobs(jobs) -> None:
     """Run AOT config compilers in a worker-bounded process pool.
 
     ``jobs`` is a sequence of ``(process_config, configs)`` pairs, one per
-    kernel family. Every family is submitted before any results are consumed so
-    all variants may compile concurrently; consuming the iterators still
-    propagates worker failures to the caller.
+    kernel family. All families are submitted in one map before results are
+    consumed. Return values stay in the child; failures propagate to the caller.
     """
-    jobs = [(process_config, list(configs)) for process_config, configs in jobs]
-    total = sum(len(configs) for _, configs in jobs)
+    jobs = [
+        (process_config, config)
+        for process_config, configs in jobs
+        for config in configs
+    ]
     with ProcessPoolExecutor(
-        max_workers=get_worker_count_for(total),
+        max_workers=get_worker_count_for(len(jobs)),
         initializer=configure_worker_subprocesses,
     ) as executor:
-        result_iterators = [
-            executor.map(process_config, configs) for process_config, configs in jobs
-        ]
-        for results in result_iterators:
-            list(results)
+        list(executor.map(_run_compile_job, jobs))
 
 
 def run_configs(configs, process_config) -> None:

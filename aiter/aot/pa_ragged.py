@@ -3,10 +3,8 @@ from aiter_worker_limits import adopt_legacy_max_jobs, run_configs
 from csrc.cpp_itfs.pa.pa_ragged import compile
 
 
-def process_config(config) -> None:
-    # The compiled ctypes function is process-local; only success/failure
-    # should cross the ProcessPoolExecutor boundary.
-    compile(
+def process_config(config):
+    return compile(
         config.gqa_ratio,
         config.head_size,
         config.npar_loops,

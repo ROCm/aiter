@@ -13,7 +13,7 @@ from aiter.aot import sampling as driver
 
 
 class SamplingAotTest(unittest.TestCase):
-    def test_workers_return_none_after_compilation(self):
+    def test_callbacks_call_the_expected_compilers(self):
         with (
             patch.object(driver, "top_k_renorm_probs_compile") as top_k_renorm,
             patch.object(driver, "top_p_sampling_from_probs_compile") as top_p,
@@ -21,28 +21,31 @@ class SamplingAotTest(unittest.TestCase):
                 driver, "top_k_top_p_sampling_from_probs_compile"
             ) as top_k_top_p,
         ):
-            self.assertIsNone(
+            self.assertIs(
                 driver.process_top_k_renorm_config(
                     driver.TopKRenormConfig(vec_size=4, func_name="top_k_renorm_probs")
-                )
+                ),
+                top_k_renorm.return_value,
             )
-            self.assertIsNone(
+            self.assertIs(
                 driver.process_top_p_sampling_config(
                     driver.TopPSamplingConfig(
                         vec_size=4,
                         deterministic=True,
                         func_name="top_p_sampling_from_probs",
                     )
-                )
+                ),
+                top_p.return_value,
             )
-            self.assertIsNone(
+            self.assertIs(
                 driver.process_top_k_top_p_sampling_config(
                     driver.TopKTopPSamplingConfig(
                         vec_size=4,
                         deterministic=False,
                         func_name="top_k_top_p_sampling_from_probs",
                     )
-                )
+                ),
+                top_k_top_p.return_value,
             )
 
         top_k_renorm.assert_called_once_with(4)
