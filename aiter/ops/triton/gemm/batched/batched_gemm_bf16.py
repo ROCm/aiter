@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
+
 import torch
 import triton
 
@@ -193,6 +195,16 @@ def batched_gemm_bf16(
         num_ksplit = NUM_KSPLIT
         splitk_block_size = SPLITK_BLOCK_SIZE
 
+        # TDM-store epilogue (bandwidth_bound only): needs a single K split and a
+        # unit-stride output N dim. AITER_BATCHED_BF16_TDM_STORE=0 disables it.
+        extra_kwargs = {}
+        if kernel_type == "bandwidth_bound":
+            extra_kwargs["TDM_STORE"] = (
+                num_ksplit == 1
+                and YQ.stride(2) == 1
+                and os.environ.get("AITER_BATCHED_BF16_TDM_STORE", "1") == "1"
+            )
+
         _KERNEL_MAP[kernel_type][grid](
             XQ,
             WQ,
@@ -228,6 +240,7 @@ def batched_gemm_bf16(
             num_warps=num_warps,
             waves_per_eu=waves_per_eu,
             cache_modifier=cache_modifier,
+            **extra_kwargs,
         )
 
     else:
