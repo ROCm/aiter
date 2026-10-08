@@ -6572,9 +6572,6 @@ class Mxfp4FlydslTuner(FmoeTuner):
             full_search = precision == "A8W4"
         out = []
         for bm, use_nt, inline_quant in sorted(MXFP4_G1_VARIANTS[a_dtype]):
-            # BM16 FP8 scale producer/consumer support is a separate slice.
-            if a_dtype == "fp8" and bm == 16:
-                continue
             for bn in self._G1_BN:
                 for num_waves in self._G1_NUM_WAVES:
                     for k_wave in self._G1_K_WAVE:

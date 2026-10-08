@@ -45,12 +45,11 @@ MXFP4_G1_VARIANTS = {
 def native_scale_layout_for(BM: int, out_dtype: str) -> bool:
     """The A-scale layout GEMM1 must emit for a block_m and output dtype.
 
-    This is a GEMM1/GEMM2 contract, not a tuning knob: BM16 FP4 output writes
-    the native scale layout and the matching GEMM2 reads it back. FP8 output
-    uses the regular scale layout. Every caller must agree, so the rule lives
-    here.
+    BM16 FP4/FP8 output writes one padded native scale chunk per block to
+    match the SBM16 GEMM2 reader. Larger blocks use 32-row regular chunks.
+    Runtime, tuner and AOT must all select the same layout.
     """
-    return int(BM) == 16 and str(out_dtype).lower() == "fp4"
+    return int(BM) == 16 and str(out_dtype).lower() in ("fp4", "fp8")
 
 
 _FLYDSL_V2_GEMM2_RE = re.compile(
