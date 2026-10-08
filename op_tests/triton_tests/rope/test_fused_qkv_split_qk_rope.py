@@ -1,5 +1,6 @@
 import pytest
 import torch
+import triton
 
 from aiter.ops.triton.rope.fused_qkv_split_qk_norm_rope_cache import (
     fused_qkv_split_qk_norm_rope_cache,
@@ -504,3 +505,95 @@ def test_fused_qkv_split_qk_rope_with_cache(
     # Verify Paged Cache
     torch.testing.assert_close(k_cache, k_cache_ref, atol=atol, rtol=rtol)
     torch.testing.assert_close(v_cache, v_cache_ref, atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize("tokens", [1, 64])
+@pytest.mark.parametrize("preallocated_outputs", [False, True])
+def test_muse_weightless_qk_norm_query_scale_and_cache(tokens, preallocated_outputs):
+    """Muse applies its query scale after BF16 weightless QK RMSNorm."""
+    torch.manual_seed(1064)
+    qh, kvh, head_dim = 32, 2, 128
+    eps, q_scale, block_size = 1e-5, 3.87, 16
+    qkv = torch.randn(
+        tokens, (qh + 2 * kvh) * head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    weights = torch.zeros(head_dim, device="cuda", dtype=qkv.dtype)
+    positions = torch.arange(tokens, device="cuda") % 256
+    freqs = torch.arange(256, device="cuda", dtype=torch.float32)[:, None] * (
+        1 / (10000 ** (torch.arange(head_dim // 2, device="cuda") / (head_dim // 2)))
+    )[None, :]
+    cos, sin = freqs.cos().to(qkv.dtype), freqs.sin().to(qkv.dtype)
+    blocks = triton.cdiv(tokens, block_size) + 1
+    slots = torch.randperm(blocks * block_size, device="cuda")[:tokens]
+    key_cache = torch.zeros(
+        blocks, block_size, kvh, head_dim, device="cuda", dtype=qkv.dtype
+    )
+    value_cache = torch.zeros_like(key_cache)
+    q_out = (
+        torch.empty(tokens, qh, head_dim, device="cuda", dtype=qkv.dtype)
+        if preallocated_outputs
+        else None
+    )
+    k_out = (
+        torch.empty(tokens, kvh, head_dim, device="cuda", dtype=qkv.dtype)
+        if preallocated_outputs
+        else None
+    )
+    v_out = (
+        torch.empty(tokens, kvh, head_dim, device="cuda", dtype=qkv.dtype)
+        if preallocated_outputs
+        else None
+    )
+
+    q, k, v = fused_qkv_split_qk_norm_rope_cache(
+        qkv,
+        weights,
+        weights,
+        cos,
+        sin,
+        positions,
+        key_cache,
+        value_cache,
+        slots,
+        qh,
+        kvh,
+        head_dim,
+        is_neox=True,
+        reuse_freqs_front_part=True,
+        eps=eps,
+        q_scale=q_scale,
+        kv_cache_layout="NHD",
+        q_out=q_out,
+        k_out=k_out,
+        v_out=v_out,
+    )
+    if preallocated_outputs:
+        assert q is q_out and k is k_out and v is v_out
+
+    rq, rk, rv = qkv.split((qh * head_dim, kvh * head_dim, kvh * head_dim), -1)
+    rq = rq.view(tokens, qh, head_dim)
+    rk = rk.view(tokens, kvh, head_dim)
+    rv = rv.view(tokens, kvh, head_dim)
+    rq32, rk32 = rq.float(), rk.float()
+    rq = (rq32 * torch.rsqrt(rq32.square().mean(-1, keepdim=True) + eps)).to(
+        qkv.dtype
+    )
+    rk = (rk32 * torch.rsqrt(rk32.square().mean(-1, keepdim=True) + eps)).to(
+        qkv.dtype
+    )
+    rq = (rq * q_scale).to(qkv.dtype)
+    c, s = cos[positions][:, None], sin[positions][:, None]
+    q1, q2 = rq.chunk(2, -1)
+    k1, k2 = rk.chunk(2, -1)
+    rq = torch.cat((q1 * c - q2 * s, q2 * c + q1 * s), -1)
+    rk = torch.cat((k1 * c - k2 * s, k2 * c + k1 * s), -1)
+    expected_k_cache = torch.zeros_like(key_cache)
+    expected_v_cache = torch.zeros_like(value_cache)
+    expected_k_cache.view(-1, kvh, head_dim)[slots] = rk
+    expected_v_cache.view(-1, kvh, head_dim)[slots] = rv
+
+    torch.testing.assert_close(q, rq, atol=0.15, rtol=0.05)
+    torch.testing.assert_close(k, rk, atol=0.05, rtol=0.05)
+    torch.testing.assert_close(v, rv, atol=0, rtol=0)
+    torch.testing.assert_close(key_cache, expected_k_cache, atol=0.05, rtol=0.05)
+    torch.testing.assert_close(value_cache, expected_v_cache, atol=0, rtol=0)

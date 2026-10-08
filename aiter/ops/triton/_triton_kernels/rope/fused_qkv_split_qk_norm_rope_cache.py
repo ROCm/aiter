@@ -203,6 +203,7 @@ def _fused_qkv_split_qk_norm_rope_cache_kernel(
     BLOCKED_GATED_LAYOUT: tl.constexpr = False,
     HAVE_K_SCALE: tl.constexpr = False,
     HAVE_V_SCALE: tl.constexpr = False,
+    Q_SCALE: tl.constexpr = 1.0,
 ):
     tl.assume(stride_qkv_t > 0)
     tl.assume(stride_qkv_d > 0)
@@ -305,6 +306,11 @@ def _fused_qkv_split_qk_norm_rope_cache_kernel(
     else:
         q = _rms_norm(q, q_weight, BLOCK_D, eps)
 
+    # Muse scales the bf16-normalized query, rounds it to bf16 again, and only
+    # then applies RoPE. Keep the existing path unchanged when no scale is used.
+    if Q_SCALE != 1.0:
+        q = (q.to(tl.float32) * Q_SCALE).to(q.dtype)
+
     if ENABLE_GATED_Q:
         d_gate_offs = tl.arange(0, BLOCK_D)
         x_gate_mask = t_mask[:, None] & (d_gate_offs < BLOCK_D)[None, :]
@@ -359,7 +365,12 @@ def _fused_qkv_split_qk_norm_rope_cache_kernel(
     q_out_offs = (
         t_offs[:, None] * stride_q_t + d_offs[None, :] * stride_q_d + hq * stride_q_h
     )
-    q = q * cos + q_rotated * sin
+    if Q_SCALE != 1.0:
+        q_cos = (q.to(tl.float32) * cos.to(tl.float32)).to(q.dtype)
+        q_sin = (q_rotated.to(tl.float32) * sin.to(tl.float32)).to(q.dtype)
+        q = q_cos.to(tl.float32) + q_sin.to(tl.float32)
+    else:
+        q = q * cos + q_rotated * sin
     q = q.to(q_ptr.dtype.element_ty)
     tl.store(q_ptr + q_out_offs, q, mask=x_mask)
 
@@ -429,7 +440,12 @@ def _fused_qkv_split_qk_norm_rope_cache_kernel(
                     k, qk_rotated_mask, BLOCK_T, BLOCK_D, BLOCK_D_HALF
                 )
 
-        k = k * cos + k_rotated * sin
+        if Q_SCALE != 1.0:
+            k_cos = (k.to(tl.float32) * cos.to(tl.float32)).to(k.dtype)
+            k_sin = (k_rotated.to(tl.float32) * sin.to(tl.float32)).to(k.dtype)
+            k = k_cos.to(tl.float32) + k_sin.to(tl.float32)
+        else:
+            k = k * cos + k_rotated * sin
 
         # Store to contiguous K/V buffers
         kv_out_offs = (
