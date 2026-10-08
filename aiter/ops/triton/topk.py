@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 # The kernel in this file is adapted from FlagGems' topk:
 # https://github.com/FlagOpen/FlagGems/blob/master/src/flag_gems/ops/topk.py
@@ -190,7 +190,9 @@ def topk(
     Returns:
         tuple: (values, indices) both with shape (B, k), sorted in descending order.
     """
-    _LOGGER.info(f"TOPK: x={tuple(x.shape)}, k={k}, largest={largest}, sorted={sorted}")
+    _LOGGER.info(
+        "TOPK: x=%s, k=%d, largest=%s, sorted=%s", tuple(x.shape), k, largest, sorted
+    )
     if dim < 0:
         dim += x.ndim
     if dim != x.ndim - 1:

@@ -147,7 +147,11 @@ def gemm_afp4wfp4_(
         y (torch.Tensor): Output with shape (M, N) or (SPK, M, N).
     """
     _LOGGER.info(
-        f"GEMM_AFPWFP4: x.shape={tuple(x.shape)} w.shape={tuple(w.shape)} x_scale={tuple(x_scales.shape)} w_scale={tuple(w_scales.shape)} "
+        "GEMM_AFP4WFP4: x.shape=%s w.shape=%s x_scale=%s w_scale=%s ",
+        tuple(x.shape),
+        tuple(w.shape),
+        tuple(x_scales.shape),
+        tuple(w_scales.shape),
     )
 
     assert backend in (
@@ -155,7 +159,12 @@ def gemm_afp4wfp4_(
         "gluon",
     ), f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
 
-    assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
+    # gfx1151 can lower this Triton dot_scaled kernel without native FP4
+    # instructions. Keep the exception local: other FP4 entry points need
+    # their own configs and validation before they can run on this target.
+    assert arch_info.is_fp4_avail() or (
+        backend == "triton" and arch_info.get_arch() == "gfx1151"
+    ), "MXFP4 is not available on your device"
 
     if backend == "gluon":
         arch = arch_info.get_arch()
@@ -319,8 +328,8 @@ def gemm_afp4wfp4(
         # This entry point takes w as (N, K//2) row-major. gfx1250's gluon MXFP4
         # kernel takes preshuffled weights, so it cannot serve it.
         _LOGGER.info(
-            f"GEMM_AFP4WFP4: no gluon kernel for unshuffled weights on {arch}, "
-            "using triton"
+            "GEMM_AFP4WFP4: no gluon kernel for unshuffled weights on %s, using triton",
+            arch,
         )
         backend = "triton"
 
@@ -495,7 +504,7 @@ def gemm_afp4wfp4_preshuffle(
         w (torch.Tensor): FP4 E2M1 weight matrix with shape (N//16, K*16),
             preshuffled via aiter.ops.shuffle.shuffle_weight_gfx1250 (or
             equivalently shuffle_weight(layout=(16, 16)) reshaped to
-            (N//16, K*16) — both produce the same bytes). Internally transposed.
+            (N//16, K*16) -- both produce the same bytes). Internally transposed.
         x_scales (torch.Tensor): E8M0 per-group scale for x, one scale per 32
             elements in K. For M >= 32: preshuffled via
             aiter.ops.shuffle.shuffle_scale (identical layout on gfx950 and
@@ -528,7 +537,7 @@ def gemm_afp4wfp4_preshuffle(
     K_elems = 2 * K_bytes
 
     if config is None:
-        # _get_config doubles K itself (logical K = 2 * K_bytes) — pass bytes,
+        # _get_config doubles K itself (logical K = 2 * K_bytes) -- pass bytes,
         # matching the non-preshuffled path. The two backends take disjoint
         # params (gluon: NUM_BUFFERS, triton: NUM_KSPLIT/GROUP_SIZE_M/...), so
         # the config must come from the dir of the backend we actually launch.
@@ -561,10 +570,11 @@ def gemm_afp4wfp4_preshuffle(
 
     if use_gluon:
         from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_mxfp4 import (
-            gemm_mxfp4_preshuffle_gfx1250 as _gluon_gemm_mxfp4_preshuffle_gfx1250,
+            cluster_shape,
+            get_gemm_afp4wfp4_preshuffle_layouts,
         )
         from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_mxfp4 import (
-            get_gemm_afp4wfp4_preshuffle_layouts,
+            gemm_mxfp4_preshuffle_gfx1250 as _gluon_gemm_mxfp4_preshuffle_gfx1250,
         )
 
         grid = lambda META: (
@@ -582,11 +592,22 @@ def gemm_afp4wfp4_preshuffle(
         k_tiles = triton.cdiv(K_bytes, BLOCK_K_BYTES)
         config["NUM_BUFFERS"] = min(config["NUM_BUFFERS"], k_tiles)
 
+        num_ctas = config["num_ctas"]
+        ctas_m, _ = cluster_shape(
+            num_ctas, config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"]
+        )
+        # The kernel takes a CTA's A scales as preshuffled iff it has 32+ rows.
+        assert M < 32 or config["BLOCK_SIZE_M"] // ctas_m >= 32, (
+            f"for M >= 32, each CTA needs 32 or more rows of BLOCK_SIZE_M="
+            f"{config['BLOCK_SIZE_M']}, which num_ctas={num_ctas} splits {ctas_m} ways"
+        )
+
         layouts = get_gemm_afp4wfp4_preshuffle_layouts(
             config["num_warps"],
             config["BLOCK_SIZE_M"],
             config["BLOCK_SIZE_N"],
             config["BLOCK_SIZE_K"],
+            num_ctas,
         )
 
         _gluon_gemm_mxfp4_preshuffle_gfx1250[grid](

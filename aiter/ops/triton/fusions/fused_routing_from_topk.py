@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-# Fused replacement for the multi-kernel "topk → routing data" chain that
+# Fused replacement for the multi-kernel "topk -> routing data" chain that
 # bridges FusedMoE.select_experts to triton_kernels.matmul_ogs. See the
 # accompanying _triton_kernels/fused_routing_from_topk.py for the kernel.
 
@@ -19,9 +19,9 @@ _LOGGER = AiterTritonLogger()
 
 
 # Maximum NK supported by the single-CTA fused kernel is 4096. Above this the
-# wrapper raises rather than degrading silently — callers should fall
+# wrapper raises rather than degrading silently -- callers should fall
 # back to a multi-kernel reference path for prefill-shaped inputs (NK in
-# the tens of thousands). Decode (num_tokens × top_k) at typical batch
+# the tens of thousands). Decode (num_tokens x top_k) at typical batch
 # sizes is well within this budget.
 
 
@@ -45,7 +45,7 @@ def fused_routing_from_topk(
         topk_ids: ``[n_tokens, n_expts_act]`` selected expert ids; values
             in ``[0, n_expts_tot)``. Must be contiguous int32.
         n_expts_tot: Total number of routed experts (= ``E``).
-        expert_map: Optional global→local expert map. When provided,
+        expert_map: Optional global->local expert map. When provided,
             ``topk_ids`` are treated as global ids and remapped inside fused
             kernels. Entries mapped to ``< 0`` are masked to zero weight and
             redirected to local expert ``0`` for routing safety. Must be
@@ -57,10 +57,10 @@ def fused_routing_from_topk(
           - ``hist[E] int32``: tokens-per-expert histogram. Sums to
             ``n_tokens * n_expts_act``.
           - ``topk_indx[n_tokens * n_expts_act] int32``: the
-            ``GatherIndx.src_indx`` — for each expert-sorted position, the
+            ``GatherIndx.src_indx`` -- for each expert-sorted position, the
             original flat index ``token * K + slot`` it came from.
           - ``gate_indx[n_tokens * n_expts_act] int32``: the
-            ``GatherIndx.dst_indx`` — inverse permutation of
+            ``GatherIndx.dst_indx`` -- inverse permutation of
             ``topk_indx``. Use as ``ScatterIndx.src_indx``.
           - ``gate_scal[n_tokens * n_expts_act]``: routing weights in
             expert-sorted order. Same dtype as ``topk_weights``.
@@ -88,8 +88,11 @@ def fused_routing_from_topk(
     )
 
     _LOGGER.info(
-        f"FUSED_ROUTING_FROM_TOPK: n_tokens={n_tokens} K={n_expts_act} "
-        f"E={n_expts_tot} NK={n_gates_pad}"
+        "FUSED_ROUTING_FROM_TOPK: n_tokens=%d K=%d E=%d NK=%d",
+        n_tokens,
+        n_expts_act,
+        n_expts_tot,
+        n_gates_pad,
     )
 
     device = topk_weights.device
@@ -136,7 +139,7 @@ def fused_routing_from_topk(
         num_warps=1,
     )
 
-    # Kernel 2 (Phase B): exclusive prefix-sum hist → offset. The kernel
+    # Kernel 2 (Phase B): exclusive prefix-sum hist -> offset. The kernel
     # boundary above publishes hist without an explicit barrier.
     _fused_routing_from_topk_offset_kernel[(1,)](
         hist,

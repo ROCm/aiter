@@ -5,7 +5,7 @@
 
 Each manager owns the ``global -> LDS (async) -> VGPR (WMMA fragment)`` path for
 one 16-bit-element operand (Q, K or V): the LDS swizzle, the async copy schedule
-and the fragment read. They are self-contained — the only things a caller passes
+and the fragment read. They are self-contained -- the only things a caller passes
 in are the *configuration* it already maintains (hdim, gqa_ratio, kv block width,
 number of waves) via the constructor, and the runtime ``warp_idx`` / ``lane_idx``
 into the specific member functions that need them. Nothing here reads a shared
@@ -17,35 +17,32 @@ The ``16b`` suffix names the element width (16-bit): every swizzle here assumes 
 its own manager family (different chunk arithmetic), hence the explicit width tag.
 
 Contents:
-  - ``QManager16bV1`` — Q loader (ring-buffered async stage, natural ``ds_load_b128``).
-  - ``QManager16bV2`` — Q loader (per-warp TDM into private padded LDS, no ring).
-  - ``KManager16bV1`` — K loader (one-block stage, natural ``ds_load_b128`` B-fragment).
-  - ``KManager16bV2`` — K loader (per-warp TDM into row-major padded LDS, HW OOB).
-  - ``VManager16bV1`` — V loader (V-specific swizzle, transpose ``ds_load_tr16_b128``).
-  - ``VManager16bV2`` — V loader (per-warp TDM into padded LDS, transpose ``ds_load_tr16_b128``).
-  - ``OManager16bV1`` — O writer (WMMA accumulator -> swizzled LDS -> coalesced buffer_store).
-  - ``OManager16bV2`` — O writer (accumulator -> row-major CONTIGUOUS LDS -> per-warp TDM store; TDM store ignores LDS pad).
-  - ``OManager16bV3`` — O writer (padded LDS ``ds_store`` -> async ``global_store_from_lds_b128``).
+  - ``QManager16bV1`` -- Q loader (ring-buffered async stage, natural ``ds_load_b128``).
+  - ``QManager16bV2`` -- Q loader (per-warp TDM into private padded LDS, no ring).
+  - ``KManager16bV1`` -- K loader (one-block stage, natural ``ds_load_b128`` B-fragment).
+  - ``KManager16bV2`` -- K loader (per-warp TDM into row-major padded LDS, HW OOB).
+  - ``VManager16bV1`` -- V loader (V-specific swizzle, transpose ``ds_load_tr16_b128``).
+  - ``VManager16bV2`` -- V loader (per-warp TDM into padded LDS, transpose ``ds_load_tr16_b128``).
+  - ``OManager16bV1`` -- O writer (WMMA accumulator -> swizzled LDS -> coalesced buffer_store).
+  - ``OManager16bV2`` -- O writer (accumulator -> row-major CONTIGUOUS LDS -> per-warp TDM store; TDM store ignores LDS pad).
+  - ``OManager16bV3`` -- O writer (padded LDS ``ds_store`` -> async ``global_store_from_lds_b128``).
 
 Target: gfx1250 (MI400 / mi450), wave32, 8 waves per threadgroup (256 threads).
 """
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as llvm_dialect
-from flydsl._mlir.dialects import rocdl as rocdl_dialect
-from flydsl.compiler.ast_rewriter import ReplaceIfWithDispatch
-from flydsl.expr import arith, rocdl
+from flydsl.expr import rocdl
 from flydsl.expr.rocdl import tdm_ops
 
 from aiter.ops.flydsl.kernels import buffer_ops
 
 from ..kernels_common import create_llvm_ptr
-
-_scf_if_dispatch = ReplaceIfWithDispatch.scf_if_dispatch
-
+from ..tensor_shim import _to_raw as _ir
 
 # ============================================================================
-# Manager-intrinsic tiling constants (private — not the caller's config).
+# Manager-intrinsic tiling constants (private -- not the caller's config).
 #
 # These are fixed by the WMMA instruction + the swizzles implemented here, so
 # they are NOT parameters. Anything the caller genuinely chooses (hdim, gqa_ratio,
@@ -130,14 +127,14 @@ def _assert_multiple(name, val, mult):
 # HISTORY (why this used to be ~400 lines of inline asm): an earlier port hand-wrote
 # every memory op as an opaque `has_side_effects` inline-asm block with manual depctr
 # covers, on the belief that LLVM could not cover mode-2 hazards. That was both wrong
-# and self-defeating — the opacity HID the async-store -> ds-load LDS RAW from LLVM
+# and self-defeating -- the opacity HID the async-store -> ds-load LDS RAW from LLVM
 # (two opaque blocks, no SSA edge, LDS unmodeled), which mis-scheduled under DEP_MODE=2
 # and produced SILENT NaN at scale (55% @16384 causal). Making the ops plain intrinsics
 # exposed the dependency and let LLVM order+cover it; the whole asm+cover apparatus was
 # then deleted. See memory fmha-flydsl-0-3-x-migration / fmha-m16x8-sched-mode2-unsafe.
 #
 # This flag is imported by the kernel module, which flips the LLVM hint in lockstep.
-# It no longer changes codegen in this file — it only drives the hint. False -> mode 0.
+# It no longer changes codegen in this file -- it only drives the hint. False -> mode 0.
 ENABLE_SCHED_MODE2 = True
 
 
@@ -148,22 +145,17 @@ ENABLE_SCHED_MODE2 = True
 # wrapper helpers: under mode 2 the ``amdgpu-expert-scheduling-mode`` LLVM hint
 # makes LLVM insert all DEP_MODE=2 depctr covers itself for these SSA-visible ops,
 # so the same code is correct in both modes. NOTE: LDS reads (``ds_load``) MUST be
-# these plain intrinsics — never opaque inline asm — or LLVM cannot see the RAW
+# these plain intrinsics -- never opaque inline asm -- or LLVM cannot see the RAW
 # against the opaque async global->LDS store and mis-orders it under DEP_MODE=2
 # (the historical 55% NaN @16384 causal bug). See memory fmha-flydsl-0-3-x-migration.
 # ===========================================================================
-
-
-def _ir(x):
-    """Unwrap an fx value to its raw MLIR ir.Value (pass-through if already raw)."""
-    return x.ir_value() if hasattr(x, "ir_value") else x
 
 
 def _async_load_to_lds(gptrs, lds_ptrs, *, cluster, imm_offs=None):
     """Issue a BATCH of async 16B (b128) global->LDS loads. Pure issue, no address
     math: the managers' ``global_load_ptrs`` already built the pointers.
 
-    ``gptrs`` / ``lds_ptrs`` are equal-length lists — one entry per load:
+    ``gptrs`` / ``lds_ptrs`` are equal-length lists -- one entry per load:
       gptrs[i]   global (address-space 1) source pointer (fx.Int32, divergent)
       lds_ptrs[i] LDS (address-space 3) destination pointer
     A scalar (non-list) pointer is accepted and treated as a 1-load batch.
@@ -175,7 +167,7 @@ def _async_load_to_lds(gptrs, lds_ptrs, *, cluster, imm_offs=None):
     stride must pre-subtract it from ``lds_ptrs`` (see ``global_load_ptrs``); here it is
     passed straight to the op's ``offset`` attribute. Must be b128 (16B) aligned.
 
-    Each load is the plain rocdl intrinsic — under mode 2 the LLVM expert-scheduling
+    Each load is the plain rocdl intrinsic -- under mode 2 the LLVM expert-scheduling
     hint inserts the RAW/WAR covers itself; under mode 0 the HW issue interlocks do."""
     if not isinstance(gptrs, (list, tuple)):
         gptrs = [gptrs]
@@ -191,13 +183,12 @@ def _async_load_to_lds(gptrs, lds_ptrs, *, cluster, imm_offs=None):
 
     for gptr, lds_ptr, imm in zip(gptrs, lds_ptrs, imm_offs):
         if cluster:
-            # FlyDSL 0.3.x b128 op takes (gptr, lds_ptr, offset, mask); its
-            # expr.rocdl.cluster_load_async_to_lds wrapper still passes the old
-            # positional order, so call the dialect op directly with a 0 mask.
+            # The generic wrapper in FlyDSL 0.3.2 uses an older argument order.
+            # The public b128 overload preserves (gptr, lds_ptr, offset, mask).
             mask0 = _ir(fx.Int32(0))
-            rocdl_dialect.cluster_load_async_to_lds_b128(gptr, lds_ptr, imm, mask0)
+            rocdl.cluster_load_async_to_lds_b128(gptr, lds_ptr, imm, mask0)
         else:
-            rocdl_dialect.global_load_async_to_lds_b128(gptr, lds_ptr, imm)
+            rocdl.global_load_async_to_lds_b128(gptr, lds_ptr, imm)
 
 
 # ============================================================================
@@ -210,7 +201,7 @@ class QManager16bV1:
 
     Keeping this behind one object means the compute core just asks the manager
     how much LDS to reserve (``get_lds_size_in_byte``) and then hands the raw
-    allocation base to ``load_q_to_vgpr`` — the per-warp sub-offset and the
+    allocation base to ``load_q_to_vgpr`` -- the per-warp sub-offset and the
     swizzled staging layout are entirely the manager's business. A future Q
     strategy (different tiling / dtype) is a drop-in replacement.
 
@@ -280,7 +271,7 @@ class QManager16bV1:
         )
 
     def _async_load_vram_to_lds(self, gptrs, lds_ptrs):
-        """gfx1250 async 16B global->LDS copy — accepts a batch (equal-length pointer
+        """gfx1250 async 16B global->LDS copy -- accepts a batch (equal-length pointer
         lists, or scalars for one load). Q uses the plain (non-MCAST) global form."""
         _async_load_to_lds(gptrs, lds_ptrs, cluster=False)
 
@@ -300,7 +291,7 @@ class QManager16bV1:
         """Pointers for EVERY ``global_load_async_to_lds_b128`` of this warp's Q tile,
         ready to hand to ``_async_load_to_lds`` with no further address math.
 
-        Returns ``(gptrs, lds_ptrs)`` — two equal-length lists, one entry per async
+        Returns ``(gptrs, lds_ptrs)`` -- two equal-length lists, one entry per async
         b128 group: ``k_tiles`` tiles x 2 half-loads = 8 / 12 / 16 groups for qk_hdim
         128 / 192 / 256. Pure index arithmetic (no memory op) so the caller can hoist
         ALL address VALU ahead of the load burst. ``gptrs`` are global (address-space
@@ -451,7 +442,7 @@ class QManager16bV1:
                     q_frags_list[qt].append(lo.shuffle(hi, list(range(16))))
             return q_frags_list
 
-        # Non-fully-resident ring drain — R==1 only (guarded in __init__).
+        # Non-fully-resident ring drain -- R==1 only (guarded in __init__).
         ds_ptrs = self._q_ds_ptrs[0]
         gptrs = self._q_gptrs[0]
         lds_wr_ptrs = self._q_lds_wr_ptrs[0]
@@ -491,13 +482,13 @@ class KManager16bV1:
     Unlike QManager16b there is no ring buffer here: KManager16bV1 only reports the
     byte size of ONE ``n_block x qk_hdim`` K block (``get_lds_size_in_byte``). The
     caller reserves however many ping-pong buffers it wants and passes the chosen
-    buffer base (``ptr_lds``) into every method — the manager is not bound to a
+    buffer base (``ptr_lds``) into every method -- the manager is not bound to a
     buffer. The K block is shared by all waves (each computes S[16, n_block]).
 
     LDS layout mirrors QManager16b: ``(n_block/16)`` kv-subtiles x ``(qk_hdim/32)``
     hdim-units, each a 16x32 bf16 tile (1024 B) with the 4x4 XOR swizzle
     (``sw = chunk ^ row//4``). The global->LDS write API streams 8(kv)x32(hdim)
-    tiles (``row_idx`` = kv, mult of 8; ``col_idx`` = hdim, mult of 32) — one b128
+    tiles (``row_idx`` = kv, mult of 8; ``col_idx`` = hdim, mult of 32) -- one b128
     per lane, each an 8-row half of a unit. The VGPR read API pulls 16x16 tiles
     (``col_idx`` mult of 16); a ``col_idx``/``col_idx+16`` pair combines into one
     16x32 WMMA B operand. Loads use ``cluster_load_async_to_lds_b128``
@@ -569,7 +560,7 @@ class KManager16bV1:
         ``_async_load_to_lds`` with no further address math. Pure index arithmetic (no
         memory op) so the caller can hoist all address VALU ahead of the load burst.
 
-        Returns ``(gptrs, lds_ptrs, imm_offs)`` — equal-length lists, one 8(kv)x32(hdim)
+        Returns ``(gptrs, lds_ptrs, imm_offs)`` -- equal-length lists, one 8(kv)x32(hdim)
         b128 per entry (length = ``n_wr_tile_rows*n_wr_tile_cols // num_waves``);
         ``gptrs`` global (address-space 1) sources, ``lds_ptrs`` LDS (address-space 3)
         destinations, ``imm_offs`` per-load COMPILE-TIME byte immediates for the async
@@ -611,7 +602,7 @@ class KManager16bV1:
                 kv_row = (kv_row < kv_valid).select(kv_row, fx.Int32(0))  # clamp OOB
             token = kv_row0 + kv_row
             # Row base at hdim column 0 (col term lives in the immediate); computed once.
-            # stride_k_seq/head are ELEMENT strides -> ×_BF16_BYTES to a byte offset.
+            # stride_k_seq/head are ELEMENT strides -> x_BF16_BYTES to a byte offset.
             g_base = (
                 token * stride_k_seq + kv_head * stride_k_head + chunk * _CHUNK_ELEMS
             ) * _BF16_BYTES
@@ -662,7 +653,7 @@ class KManager16bV1:
         half) plus the lane; every other tile ``(kv, dt)`` in the block sits at the SAME
         in-tile position shifted by the lane-independent tile stride ``(kv*hd_units +
         dt)*1024`` bytes. So the whole block's ds_load addresses collapse to just 2 base
-        pointers — the ``(kv=0, dt=0)`` tile for ``half=0`` and ``half=1`` — and 16
+        pointers -- the ``(kv=0, dt=0)`` tile for ``half=0`` and ``half=1`` -- and 16
         compile-time immediates applied in ``load_k_to_reg``. Returns
         ``[base_half0, base_half1]``. This replaces the former 32-pointer list, saving
         ~15 address VGPRs/lane and the per-pointer swizzle VALU. Pure index math."""
@@ -792,7 +783,7 @@ class VManager16bV1:
         with no further address math. Pure index arithmetic (no memory op) so the caller
         can hoist all address VALU ahead of the load burst.
 
-        Returns ``(gptrs, lds_ptrs, imm_offs)`` — equal-length lists, one 8(kv)x32(d)
+        Returns ``(gptrs, lds_ptrs, imm_offs)`` -- equal-length lists, one 8(kv)x32(d)
         b128 per entry (length = ``n_wr_tile_rows*n_wr_tile_cols // num_waves``);
         ``gptrs`` global (address-space 1) sources, ``lds_ptrs`` LDS (address-space 3)
         destinations (new V swizzle), ``imm_offs`` per-load compile-time byte immediates.
@@ -825,7 +816,7 @@ class VManager16bV1:
                 safe_kv = (kv_row < kv_valid).select(kv_row, fx.Int32(0))  # clamp OOB
             token = kv_row0 + safe_kv
             # Row base at d column 0 (col term lives in the immediate); computed once.
-            # stride_v_seq/head are ELEMENT strides -> ×_BF16_BYTES to a byte offset.
+            # stride_v_seq/head are ELEMENT strides -> x_BF16_BYTES to a byte offset.
             g_base = (
                 token * stride_v_seq + kv_head * stride_v_head + chunk * _CHUNK_ELEMS
             ) * _BF16_BYTES
@@ -875,8 +866,8 @@ class VManager16bV1:
         PARITY: keys with even ``dt`` share one lane-relative position and odd ``dt``
         another, while ``kt``, ``half`` and even/odd-``dt`` steps are all lane-independent
         byte shifts (verified exact for all 32 lanes x all keys). So the block's transpose
-        addresses collapse to 2 base pointers — the ``(kt=0, half=0)`` tile for ``dt=0``
-        (even) and ``dt=1`` (odd) — plus 16 compile-time immediates applied in
+        addresses collapse to 2 base pointers -- the ``(kt=0, half=0)`` tile for ``dt=0``
+        (even) and ``dt=1`` (odd) -- plus 16 compile-time immediates applied in
         ``load_v_to_reg``. Returns ``[base_dt_even, base_dt_odd]``. This replaces the
         former 32-pointer list, saving ~15 address VGPRs/lane. Per-lane b128 fetch
         (fixed 8x8 crossbar): ``V[kv_idx + (l//16)*8 + l%8, d_idx + ((l//8)%2)*8]``."""
@@ -913,12 +904,12 @@ class VManager16bV1:
 
 
 # ============================================================================
-# V2 K/V loaders — TDM (Tensor DMA) global->LDS + row-major PADDED LDS.
+# V2 K/V loaders -- TDM (Tensor DMA) global->LDS + row-major PADDED LDS.
 #
 # vs V1 (cluster/global_load_async + swizzled LDS): the whole n_block x hdim tile
 # is copied by ONE TDM atom whose descriptor carries base/extent/stride as state, so
 # there is NO per-lane address VALU (saves address VGPRs) and the per-dim extent gives
-# HARDWARE OOB (zero-fill) — no software kv_valid `.select` clamps. The LDS is plain
+# HARDWARE OOB (zero-fill) -- no software kv_valid `.select` clamps. The LDS is plain
 # row-major with per-row padding (TDM pad_interval/pad_amount, in bf16 elements) so the
 # WMMA ds_load fetch stays bank-conflict-free: K pads 8 elems (4 DW / 16 B), V pads 16
 # elems (8 DW / 32 B). Element (row, col) lives at ``row*ROW_ELEMS + col`` (elements).
@@ -961,7 +952,7 @@ def _tdm_load_views(
 ):
     """Build a LIST of ``(atom, g_view, lds_view)`` TDM global->LDS copies for one
     ``[n_rows, hdim]`` tile into a row-major padded (``hdim + pad_elems`` element row stride) LDS
-    block — PURE (no memory op), issue each with ``fx.copy_atom_call(*view)`` then drain with
+    block -- PURE (no memory op), issue each with ``fx.copy_atom_call(*view)`` then drain with
     ``tensor_wait(0)``. hdim is split into power-of-two column segments (pad_interval must be pow2):
     segment ``(c0, w)`` copies global cols ``[c0, c0+w)`` -> LDS cols ``[c0, c0+w)`` with
     ``pad_interval=w``, ``pad_amount=(hdim+pad_elems - w)`` so the LDS row still advances by the
@@ -998,7 +989,7 @@ def _tdm_load_views(
 
 class QManager16bV2:
     """Q loader (per-warp TDM + row-major padded LDS). No ring buffer: each wave TDM-copies
-    ALL of its Q rows — a ``(WMMA_M * q_tiles_per_wave) x qk_hdim`` tile — into its own private
+    ALL of its Q rows -- a ``(WMMA_M * q_tiles_per_wave) x qk_hdim`` tile -- into its own private
     LDS region in one shot (``num_warps=1``, so the wave copies the whole tile; the regions are
     disjoint so no cross-wave sync), then reads them into WMMA B-fragments. Same fragment output
     as ``QManager16bV1`` (scale folded), so the kernel switches V1<->V2 by swapping the class.
@@ -1187,7 +1178,7 @@ class KManager16bV2:
         self, *, ptr_lds, ptr_K, stride_k_seq, stride_k_head, kv_head, kv_row0, kv_valid
     ):
         """Return a LIST of ``(atom, g_view, lds_view)`` TDM copies for this block's K tile into the
-        padded LDS at ``ptr_lds`` (fx.Int32 byte base) — one per pow2 hdim segment (1 for 128/256, 2
+        padded LDS at ``ptr_lds`` (fx.Int32 byte base) -- one per pow2 hdim segment (1 for 128/256, 2
         for 192). Pure (hoistable); issue each with ``fx.copy_atom_call(*view)``, drain with
         ``tdm_ops.tensor_wait(0)``."""
         return _tdm_load_views(
@@ -1467,7 +1458,7 @@ class OManager16bV1:
             fx.Int64(q_start + q_len) * fx.Int64(stride_o_seq) * fx.Int64(_BF16_BYTES)
         )
         o_rsrc = buffer_ops.create_buffer_resource(
-            ptr_O, num_records_bytes=arith.unwrap(o_num_records_bytes)
+            ptr_O, num_records_bytes=_ir(o_num_records_bytes)
         )
         lds_warp = ptr_lds + warp_idx * self._warp_stride
         q_st = lane_idx % _WMMA_M
@@ -1570,7 +1561,7 @@ class OManager16bV2:
 
     PV leaves each wave's 16 x v_hdim tile in the accumulator layout: for d-tile ``k`` lane ``l``
     holds ``O[q = l%16, d = 16*k + (l//16)*8 + {0..7}]``. That maps straight to a row-major
-    ``[16, v_hdim]`` LDS tile (row = q, col = d) — lane ``l`` ds_stores 8 bf16 at row ``l%16``,
+    ``[16, v_hdim]`` LDS tile (row = q, col = d) -- lane ``l`` ds_stores 8 bf16 at row ``l%16``,
     col ``16*k + (l//16)*8``. The global side is the GQA-packed 3-D ``[n_seq, gqa, v_hdim]``
     descriptor (packed row pr -> seq pr//gqa, head kv_head*gqa + pr%gqa), degenerating to
     ``[rows,1,v_hdim]`` at gqa==1; ``num_warps=1`` so each wave stores only its own rows into a
@@ -1738,8 +1729,8 @@ class OManager16bV3:
     Accumulator (d-tile k, lane l = ``O[q=l%16, d=16k+(l//16)*8+{0..7}]``) -> row-major PADDED LDS
     ``[16, v_hdim]`` (row stride v_hdim+_O_PAD_ELEMS). Then the 16 x (v_hdim/8) b128 chunks are stored
     LDS->global over ``n_rounds`` waves of 32 lanes: round r lane l -> chunk c=r*32+l, row=c//cpr,
-    d_chunk=c%cpr (cpr = v_hdim/8) -> coalesced (consecutive lanes = consecutive global). Rows with
-    seq>=q_len are EXEC-masked off (async store has no bounds; ``scf_if_dispatch`` per lane).
+    d_chunk=c%cpr (cpr = v_hdim/8) -> coalesced (consecutive lanes = consecutive global).
+    Rows at seq>=q_len are masked off because async stores have no bounds check.
     """
 
     def __init__(
@@ -1851,11 +1842,13 @@ class OManager16bV3:
             0
         )  # all ds_stores landed (every async row reads a full padded row)
 
-        def _burst(*_a):
-            for gdst, lsrc in addrs:
-                rocdl_dialect.global_store_async_from_lds_b128(_ir(gdst), _ir(lsrc), 0)
+        @flyc.jit
+        def _burst():
+            if valid_rows > fx.Int32(0):
+                for gdst, lsrc in addrs:
+                    rocdl.global_store_async_from_lds_b128(_ir(gdst), _ir(lsrc), 0)
 
-        _scf_if_dispatch(valid_rows > fx.Int32(0), _burst)  # skip a fully-OOB warp
+        _burst()
         # No s_wait_asynccnt: HW drains the async stores' LDS reads at workgroup retire.
         self._pending = []
 

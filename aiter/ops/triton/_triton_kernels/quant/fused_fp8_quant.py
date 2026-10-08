@@ -455,7 +455,7 @@ def _fused_flatten_fp8_group_quant_kernel(
 
     NUM_QUANT_BLOCKS: tl.constexpr = BLOCK_SIZE_N2 // QUANT_BLOCK_SIZE
     # In the flattened (M, N1 * N2) output, each n1 segment is exactly N2 wide
-    # (not BLOCK_SIZE_N2), so stride between n1 segments must use N2 — otherwise
+    # (not BLOCK_SIZE_N2), so stride between n1 segments must use N2 -- otherwise
     # non-power-of-2 N2 (e.g. 7168) over-strides the output (and at the last n1
     # walks past the row boundary, causing OOB writes).
     n2_groups = tl.cdiv(N2, QUANT_BLOCK_SIZE)
@@ -832,7 +832,7 @@ def _fused_reduce_rms_fp8_group_quant_kernel(
         if HAVE_SECOND_INPUT:
             n2_offs = tl.arange(0, BLOCK_SIZE_N2)
             if N_MASK2:
-                mask2 = n2_offs < inp1_n_cols
+                mask2 = n2_offs < inp2_n_cols
                 other2 = 0.0
             else:
                 mask2 = None

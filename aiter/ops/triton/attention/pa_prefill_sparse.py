@@ -2,16 +2,16 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """Sparse paged-prefill attention over two KV sources (prefix + extend) with
-per-head sink bias — gfx1250 (gluon) only.
+per-head sink bias -- gfx1250 (gluon) only.
 
-Exposes ``pa_prefill_sparse`` — grid ``(T, cdiv(H, BLOCK_H))``, one token
+Exposes ``pa_prefill_sparse`` -- grid ``(T, cdiv(H, BLOCK_H))``, one token
 and BLOCK_H heads per CTA. Same grid as the decode kernel. No split-K:
 prefill fills the GPU via the token dimension.
 
 Gfx950(`mla_gluon`) and others(Triton `_sparse_attn_prefill_kernel`, they
 take a 1-D ``(kv_indices, kv_indptr)`` pair over one pool.
 
-``pa_prefill_sparse`` — a single entry that dispatches on arch:
+``pa_prefill_sparse`` -- a single entry that dispatches on arch:
 
     gfx1250 -> gluon ``_pa_prefill_sparse``           (two sources, native)
     gfx950  -> gluon wrapper ``mla_gluon``            (single source)
@@ -57,17 +57,17 @@ def pa_prefill_sparse(
     other two serve the prefix source alone and reject a non-empty extend.
 
     Args:
-        q:                 [T, H, D] BF16/FP16 — queries.
-        unified_kv:        [total_pages, D] — prefix KV source (paged).
-        kv_indices_prefix: [total_prefix] int32 — flat per-token slot lists
+        q:                 [T, H, D] BF16/FP16 -- queries.
+        unified_kv:        [total_pages, D] -- prefix KV source (paged).
+        kv_indices_prefix: [total_prefix] int32 -- flat per-token slot lists
             into unified_kv. ``-1`` sentinels skipped.
-        kv_indptr_prefix:  [T+1] int32 — true prefix sum.
-        kv:                [total_tokens, D] — extend KV source (this fwd's
+        kv_indptr_prefix:  [T+1] int32 -- true prefix sum.
+        kv:                [total_tokens, D] -- extend KV source (this fwd's
             input K, not yet in paged buffer). ``None`` for no extend source.
-        kv_indices_extend: [total_extend] int32 — flat per-token row idx lists
+        kv_indices_extend: [total_extend] int32 -- flat per-token row idx lists
             into kv. ``-1`` sentinels skipped. ``None`` for no extend source.
-        kv_indptr_extend:  [T+1] int32 — true prefix sum. ``None`` for none.
-        attn_sink:         [H] fp32 — per-head softmax-denom bias.
+        kv_indptr_extend:  [T+1] int32 -- true prefix sum. ``None`` for none.
+        attn_sink:         [H] fp32 -- per-head softmax-denom bias.
         softmax_scale:     float.
 
     Returns:
@@ -90,9 +90,12 @@ def pa_prefill_sparse(
             avg_prefix_len = kv_indices_prefix.numel() / max(T, 1)
             has_invalid = not (0 < avg_prefix_len <= 16)
         _LOGGER.info(
-            f"PA_PREFILL_SPARSE T={T} H={H} D={D} "
-            f"prefix_indices={kv_indices_prefix.shape[0]} "
-            f"extend_indices={kv_indices_extend.shape[0]}"
+            "PA_PREFILL_SPARSE T=%d H=%d D=%d prefix_indices=%d extend_indices=%d",
+            T,
+            H,
+            D,
+            kv_indices_prefix.shape[0],
+            kv_indices_extend.shape[0],
         )
 
         out = torch.empty_like(q)

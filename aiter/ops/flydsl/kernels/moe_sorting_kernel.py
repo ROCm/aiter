@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 FlyDSL Project Contributors
+# Copyright (C) 2025-2026 FlyDSL Project Contributors
 
 """MoE token sorting kernel (FlyDSL).
 
@@ -7,12 +7,12 @@ Implements the MoE sorting operation used in DeepSeek R1 and similar MoE models.
 Given router top-k selections (topk_ids, topk_weights), reorganizes tokens by expert
 for efficient batched expert GEMM execution.
 
-Algorithm: counting sort in LDS (histogram → prefix-sum → scatter).
+Algorithm: counting sort in LDS (histogram -> prefix-sum -> scatter).
 
 Three paths (selected by T vs ONESHOT_MAX_T = min(sub_tokens, max(16, BLOCK_SIZE // max(topk, E//8)))):
   - Oneshot (T <= ONESHOT_MAX_T): single kernel, all phases in LDS.
   - Multiphase/2k (ONESHOT_MAX_T < T <= 2048): 2 kernels (fused P0v2 + P23) via HBM workspace.
-  - Multiphase/4k (T > 2048): 4 kernels (ClearWS → P0 scatter → P1 count → P23) via HBM workspace.
+  - Multiphase/4k (T > 2048): 4 kernels (ClearWS -> P0 scatter -> P1 count -> P23) via HBM workspace.
 
 Packed token ID format: (topk_position << 24) | token_id
   - Upper 8 bits: topk slot (0..topk-1)
@@ -64,7 +64,7 @@ def _dpp_intra_wave_prefix_sum(val, lane, WARP_SIZE):
     2 ds_bpermute steps (16, 32) for cross-row accumulation within the wave.
     Returns the inclusive prefix sum value for each lane.
 
-    Call inside @flyc.kernel only — emits MLIR ops during tracing.
+    Call inside @flyc.kernel only -- emits MLIR ops during tracing.
     """
     val_raw = _unwrap_val(val)
     zero_raw = _unwrap_val(fx.Int32(0))
@@ -218,7 +218,7 @@ _dummy_local_tokens_cache = {}  #  dummy placeholder when has_local_tokens=False
 
 
 # ---------------------------------------------------------------------------
-# FlyDSL GPU kernel — oneshot path (single kernel, all phases in LDS)
+# FlyDSL GPU kernel -- oneshot path (single kernel, all phases in LDS)
 # ---------------------------------------------------------------------------
 @functools.lru_cache(maxsize=256)
 def _compile_moe_sorting_oneshot(
@@ -260,7 +260,7 @@ def _compile_moe_sorting_oneshot(
     NUM_WAVES = ONESHOT_BLOCK // WARP_SIZE
     smem_cols = E + 1
 
-    # LDS sizing: sub_tokens rows for the token×expert histogram
+    # LDS sizing: sub_tokens rows for the tokenxexpert histogram
     # Match CK's sizing: total LDS / occupancy / smem_cols, rounded to 8
     if arch in ("gfx942",) or str(arch).startswith("gfx94"):
         lds_capacity_bytes = 65536
@@ -333,7 +333,7 @@ def _compile_moe_sorting_oneshot(
         nvalid_it = _buf_iter(num_valid_ids)
         mask_it = _buf_iter(expert_mask_tensor)
 
-        # LDS: capture field pointers ONCE — dominates all child scf.for/scf.if.
+        # LDS: capture field pointers ONCE -- dominates all child scf.for/scf.if.
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         cumsum_mr = lds.cumsum.ptr
         cumdup_mr = lds.cumdup.ptr
@@ -363,7 +363,7 @@ def _compile_moe_sorting_oneshot(
         # =================== SORTING (block 0 only) ==========================
         if bid == c_zero_i32:
             # ========================= PHASE 1: Histogram =========================
-            # Clear mesh region — unconditional store to safe index when out of bounds
+            # Clear mesh region -- unconditional store to safe index when out of bounds
             for i_clear in range_constexpr(0, sub_tokens * smem_cols, ONESHOT_BLOCK):
                 idx = fx.Int32(i_clear) + tid
                 is_valid = idx < fx.Int32(sub_tokens * smem_cols)
@@ -384,14 +384,15 @@ def _compile_moe_sorting_oneshot(
 
                 global_idx = token_id * c_topk + topk_slot
                 eid = _gld(topk_ids_it, global_idx)
+                should_store = is_valid & (eid >= c_zero_i32) & (eid < c_E)
 
                 # mesh[token_id, eid] = topk_slot + 1 (valid threads only).
-                # Invalid threads must NOT write to mesh[0] — that would race
+                # Invalid threads must NOT write to mesh[0] -- that would race
                 # with a valid write to (token=0, expert=0).
                 mesh_addr = token_id * c_smem_cols + eid
                 last_mesh_idx = fx.Int32(sub_tokens * smem_cols - 1)
-                safe_mesh_addr = is_valid.select(mesh_addr, last_mesh_idx)
-                val = is_valid.select(topk_slot + c_one_i32, c_zero_i32)
+                safe_mesh_addr = should_store.select(mesh_addr, last_mesh_idx)
+                val = should_store.select(topk_slot + c_one_i32, c_zero_i32)
                 _lds_store_raw(mesh_mr, val, safe_mesh_addr)
             gpu.barrier()
 
@@ -446,11 +447,11 @@ def _compile_moe_sorting_oneshot(
             gpu.barrier()
 
             # Phase 2b: Prefix sum over expert counts.
-            # Step 1: Each thread converts its expert's raw count → padded block size.
+            # Step 1: Each thread converts its expert's raw count -> padded block size.
             for i_cvt in range_constexpr(0, E, ONESHOT_BLOCK):
                 cvt_eid = fx.Int32(i_cvt) + tid
                 cvt_valid = cvt_eid < c_E
-                # Safe index: valid → cumsum[eid+1], invalid → cumsum[0] (write 0, harmless)
+                # Safe index: valid -> cumsum[eid+1], invalid -> cumsum[0] (write 0, harmless)
                 safe_cvt_idx = cvt_valid.select(cvt_eid + c_one_i32, c_zero_i32)
                 raw_cnt_cvt = _lds_load_raw(cumsum_mr, safe_cvt_idx)
                 blocks_cvt = (raw_cnt_cvt + c_unit - c_one_i32) // c_unit
@@ -483,7 +484,7 @@ def _compile_moe_sorting_oneshot(
                     )
                 gpu.barrier()
 
-            # Step 2: All-wave parallel prefix sum (cumsum → cumdup).
+            # Step 2: All-wave parallel prefix sum (cumsum -> cumdup).
             # All threads read cumsum[tid+1] (in chunks for E > ONESHOT_BLOCK)
             for _ps_chunk in range_constexpr(0, E, ONESHOT_BLOCK):
                 ps_eid = fx.Int32(_ps_chunk) + tid
@@ -496,7 +497,7 @@ def _compile_moe_sorting_oneshot(
             _lds_store_raw(cumdup_mr, c_zero_i32, c_zero_i32)
             gpu.barrier()
 
-            # DPP prefix sum — all NUM_WAVES waves active
+            # DPP prefix sum -- all NUM_WAVES waves active
             ps_tid_valid = tid < c_E
             val = ps_tid_valid.select(
                 _lds_load_raw(cumdup_mr, tid + c_one_i32), c_zero_i32
@@ -529,7 +530,7 @@ def _compile_moe_sorting_oneshot(
             _gst(nvalid_it, tokens, c_one_i32)
             gpu.barrier()
 
-            # Copy cumdup → cumsum (all threads, one expert per thread)
+            # Copy cumdup -> cumsum (all threads, one expert per thread)
             for i_cp in range_constexpr(0, E + 1, ONESHOT_BLOCK):
                 cp_idx = fx.Int32(i_cp) + tid
                 cp_valid = cp_idx <= c_E
@@ -587,7 +588,7 @@ def _compile_moe_sorting_oneshot(
                     )
                 gpu.barrier()
 
-            # Write sorted_expert_ids — predicated stores to buffer (safe: buffer_store ignores OOB)
+            # Write sorted_expert_ids -- predicated stores to buffer (safe: buffer_store ignores OOB)
             # EP: use cumdup[eid] as local expert index instead of global eid
             for i_eid in range_constexpr(0, E, ONESHOT_BLOCK):
                 eid_wr = fx.Int32(i_eid) + tid
@@ -656,7 +657,7 @@ def _compile_moe_sorting_oneshot(
                     my_has_token = my_sub_valid & (my_x != c_zero_i32)
                     local_cnt = my_has_token.select(c_one_i32, c_zero_i32)
 
-                    # 8-lane group prefix sum (NOT full-wave — uses lane_group_os,
+                    # 8-lane group prefix sum (NOT full-wave -- uses lane_group_os,
                     # only shifts 1,2,4, no cross-row bpermute needed).
                     cnt_raw = _unwrap_val(local_cnt)
                     zero_raw = _unwrap_val(c_zero_i32)
@@ -778,7 +779,7 @@ def _compile_moe_sorting_oneshot(
 
 
 # ---------------------------------------------------------------------------
-# FlyDSL GPU kernels — multiphase path (2 or 4 kernels, large T via HBM workspace)
+# FlyDSL GPU kernels -- multiphase path (2 or 4 kernels, large T via HBM workspace)
 # ---------------------------------------------------------------------------
 @functools.lru_cache(maxsize=64)
 def _p23_block_size(num_experts: int, tokens: int) -> int:
@@ -805,12 +806,12 @@ def _compile_moe_sorting_multiphase(
     """Compile the multiphase MoE sorting kernels (2 or 4 kernels via HBM workspace).
 
     For token counts exceeding LDS capacity, uses HBM workspace:
-      K1: ClearWorkspace — zero the workspace buffer
-      K2: P0 scatter     — scatter topk_ids into expert mesh in HBM
-      K3: P1 count       — one block per expert, count non-zero mesh cells
-      K4: P23 prefix-sum + scatter — prefix-sum on counts, scatter tokens,
+      K1: ClearWorkspace -- zero the workspace buffer
+      K2: P0 scatter     -- scatter topk_ids into expert mesh in HBM
+      K3: P1 count       -- one block per expert, count non-zero mesh cells
+      K4: P23 prefix-sum + scatter -- prefix-sum on counts, scatter tokens,
           fill sorted_expert_ids, zero moe_buf
-      P0_v2: Fused clear+scatter+count — replaces K1+K2+K3 for T <= 2048
+      P0_v2: Fused clear+scatter+count -- replaces K1+K2+K3 for T <= 2048
 
     Workspace layout (i32 elements):
       [0 .. ws_mesh_i32)                : uint8 expert mesh (E rows x mesh_stride bytes, packed into i32)
@@ -1030,6 +1031,7 @@ def _compile_moe_sorting_multiphase(
             token_id = safe_flat // c_topk
             topk_slot = safe_flat % c_topk
             eid = _gld(topk_it, safe_flat)
+            valid = valid & (eid >= c_zero) & (eid < fx.Int32(E))
             byte_offset = eid * i32_mesh_stride + token_id
             val_i8 = fx.Int32(topk_slot + c_one).to(fx.Int8)
             if valid:
@@ -1395,7 +1397,7 @@ def _compile_moe_sorting_multiphase(
     # --- K4: P23 prefix-sum + scatter + moe_buf zeroing ---------------------
     # Parallel design (matching CK P23): each block [0, E) independently
     # computes the SAME prefix sum, then scatters ONLY for expert blockIdx.x.
-    # No inter-block barrier needed — redundant prefix sums are deterministic.
+    # No inter-block barrier needed -- redundant prefix sums are deterministic.
     # P23 thread-block width (256 or 512). See _p23_block_size().
     K4_BLOCK = k4_block
 
@@ -1791,7 +1793,7 @@ def _compute_sub_tokens(num_experts, arch=None):
     sub_unroll = 8
     cumsum_bufs = 2
     if r < (cumsum_bufs + sub_unroll):
-        return 0  # LDS too small — always use multiphase
+        return 0  # LDS too small -- always use multiphase
     r_for_sub = ((r - cumsum_bufs) // sub_unroll) * sub_unroll
     return r_for_sub
 

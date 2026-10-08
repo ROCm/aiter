@@ -27,28 +27,44 @@ _gemm_a16w16_compute_bound_repr = make_kernel_repr(
 )
 
 
+# TDM encodes log2(pad interval in dwords) - 1 in a 3-bit field, so the
+# interval cannot exceed 2^8 = 256 dwords (TDMUtility.cpp createTDMDescriptor
+# asserts log2PadIntervalDwords <= 8).
+_MAX_PAD_INTERVAL_DWORDS = 256
+
+
+def _pad_interval(extent, elem_bits):
+    """Largest encodable pad interval, in elements, not exceeding `extent`."""
+    return min(extent, _MAX_PAD_INTERVAL_DWORDS * 32 // elem_bits)
+
+
 def create_shared_layouts(
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
     LAYOUT: gl.constexpr,
+    elem_bits: int = 16,
+    elem_bits_b: int | None = None,
 ):
+    """elem_bits sizes A's pad interval; elem_bits_b sizes B's (defaults to elem_bits)."""
+    if elem_bits_b is None:
+        elem_bits_b = elem_bits
     if LAYOUT[0] == "T":
         SHARED_LAYOUT_A: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-            [[BLOCK_K, 8]], [BLOCK_M, BLOCK_K], [1, 0]
+            [[_pad_interval(BLOCK_K, elem_bits), 8]], [BLOCK_M, BLOCK_K], [1, 0]
         )
     else:
         SHARED_LAYOUT_A: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-            [[BLOCK_M, 8]], [BLOCK_K, BLOCK_M], [1, 0]
+            [[_pad_interval(BLOCK_M, elem_bits), 8]], [BLOCK_K, BLOCK_M], [1, 0]
         )
 
     if LAYOUT[1] == "T":
         SHARED_LAYOUT_B: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-            [[BLOCK_N, 16]], [BLOCK_K, BLOCK_N], [1, 0]
+            [[_pad_interval(BLOCK_N, elem_bits_b), 16]], [BLOCK_K, BLOCK_N], [1, 0]
         )
     else:
         SHARED_LAYOUT_B: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-            [[BLOCK_K, 8]], [BLOCK_N, BLOCK_K], [1, 0]
+            [[_pad_interval(BLOCK_K, elem_bits_b), 8]], [BLOCK_N, BLOCK_K], [1, 0]
         )
 
     return (SHARED_LAYOUT_A, SHARED_LAYOUT_B)
@@ -106,7 +122,7 @@ def _gemm_a16w16_bandwidth_bound_kernel(
     pid_n = pid // num_pid_m
 
     # Descriptors start at this block's (M, N) offset by biasing the base
-    # pointer — subsequent async_loads use [0, 0] and step only along K.
+    # pointer -- subsequent async_loads use [0, 0] and step only along K.
     a_base = a_ptr + pid_m * BLOCK_M * stride_am
     b_base = b_ptr + pid_n * BLOCK_N * stride_bn
 
@@ -430,7 +446,7 @@ def _gemm_a16w16_compute_bound_kernel(
     pid_n = pid // num_pid_m
 
     # Descriptors start at this block's (M, N) offset by biasing the base
-    # pointer — subsequent async_loads use [0, 0] and step only along K.
+    # pointer -- subsequent async_loads use [0, 0] and step only along K.
     a_base = a_ptr + pid_m * BLOCK_M * stride_am
     b_base = b_ptr + pid_n * BLOCK_N * stride_bn
 
@@ -556,11 +572,11 @@ def _gemm_a16w16_compute_bound_kernel(
             OPERAND_LAYOUT_B,
         )
 
-    # Main pipeline loop — first iteration peeled out below, then loop runs
+    # Main pipeline loop -- first iteration peeled out below, then loop runs
     # for (num_k_tiles - (NUM_BUFFERS - 1) - 1) remaining iterations.
 
     # ---- Peeled first iteration ----
-    # WMMA for the current tile — uses operands pre-loaded in the
+    # WMMA for the current tile -- uses operands pre-loaded in the
     # *previous* iteration so no ds_read stall before the matrix op.
     accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
 
@@ -631,7 +647,7 @@ def _gemm_a16w16_compute_bound_kernel(
     # use the fast add_offsets path that leaves the OOB bound untouched.
     for _ in range(num_k_tiles - NUM_BUFFERS - 1):
 
-        # WMMA for the current tile — uses operands pre-loaded in the
+        # WMMA for the current tile -- uses operands pre-loaded in the
         # *previous* iteration so no ds_read stall before the matrix op.
         accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
 
@@ -805,7 +821,7 @@ def _gemm_a16w16_compute_bound_kernel(
     if USE_ACTIVATION:
         accumulator = activation(accumulator)
 
-    # TDM Store: accumulator → shared memory → global memory
+    # TDM Store: accumulator -> shared memory -> global memory
     SHARED_LAYOUT_C: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[BLOCK_N, 8]], [BLOCK_M, BLOCK_N], [1, 0]
     )

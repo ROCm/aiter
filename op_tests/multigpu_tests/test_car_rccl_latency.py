@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import os
 from multiprocessing import Pool, freeze_support, set_start_method
@@ -28,6 +28,21 @@ DTYPE = torch.bfloat16
 ELEM_BYTES = 2  # bf16
 
 SIZES_MB = [128, 256, 512, 1024]
+
+
+def barrier_before_teardown():
+    """Align all ranks before tearing down the distributed groups.
+
+    Drain this rank's GPU work, then join a barrier so no rank starts freeing
+    IPC buffers / destroying process groups while a peer is still inside a
+    NCCL / custom-all-reduce collective -- that race intermittently hangs when
+    these comm UTs run back-to-back in CI. No-op if dist is uninitialized.
+    """
+    if not dist.is_initialized():
+        return
+    torch.cuda.synchronize()
+    get_tp_group().barrier()
+    torch.cuda.synchronize()
 
 
 def _measure_per_iter_us(fn, num_warmup=NUM_WARMUP, num_iters=NUM_ITERS):
@@ -94,6 +109,7 @@ def bench_worker(rank_id, tp_size, distributed_init_method):
         results[size_mb] = (aiter_lats, rccl_lats)
 
     if dist.is_initialized():
+        barrier_before_teardown()
         destroy_model_parallel()
         destroy_distributed_environment()
         torch.cuda.empty_cache()

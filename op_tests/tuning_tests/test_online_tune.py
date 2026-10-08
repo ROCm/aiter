@@ -13,10 +13,12 @@ Tests the online tuning decision path in fused_moe.py / fused_moe_dp_shared_expe
   - MainFunc writes correct shape row to untuned CSV
 """
 
+import importlib
 import logging
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 SAMPLE_KEYS = (
     256,
@@ -42,6 +44,10 @@ SAMPLE_CFG = {
     "run_1stage": False,
     "us": 42.0,
 }
+
+
+def _whole_graph_test_impl(request, config):
+    return request.hidden_states
 
 
 def simulate_online_tune_path(
@@ -432,6 +438,69 @@ class TestGetCfg2stages(unittest.TestCase):
             self.assertEqual(cfg["kernelName1"], "ck_k1")
         finally:
             os.unlink(path)
+
+    def test_whole_graph_kernel_name_is_stripped(self):
+        from aiter import ActivationType, QuantType, dtypes
+        from aiter.fused_moe_registry import (
+            make_fused_moe_impl_kernel_name,
+            register_fused_moe_impl,
+        )
+
+        fused_moe = importlib.import_module("aiter.fused_moe")
+        implementation_name = "test_whitespace"
+        register_fused_moe_impl(
+            implementation_name, f"{__name__}:_whole_graph_test_impl"
+        )
+        key = (
+            "gfx942",
+            80,
+            1,
+            4,
+            8,
+            2,
+            1,
+            str(ActivationType.Silu),
+            str(dtypes.bf16),
+            str(dtypes.fp8),
+            str(dtypes.fp8),
+            str(QuantType.per_Token),
+            True,
+            False,
+        )
+        kernel_name = make_fused_moe_impl_kernel_name(implementation_name, "16")
+        previous_configs = fused_moe.cfg_2stages
+        fused_moe.cfg_2stages = (
+            {key: {"kernelName1": f"  {kernel_name}  ", "block_m": 64}},
+            {},
+        )
+        fused_moe.get_2stage_cfgs.cache_clear()
+        try:
+            with (
+                patch.object(fused_moe, "get_cu_num", return_value=80),
+                patch.object(fused_moe, "get_gfx_runtime", return_value="gfx942"),
+            ):
+                metadata = fused_moe.get_2stage_cfgs(
+                    1,
+                    4,
+                    8,
+                    2,
+                    1,
+                    dtypes.bf16,
+                    dtypes.fp8,
+                    dtypes.fp8,
+                    QuantType.per_Token,
+                    True,
+                    ActivationType.Silu,
+                    False,
+                    0,
+                    0,
+                )
+        finally:
+            fused_moe.cfg_2stages = previous_configs
+            fused_moe.get_2stage_cfgs.cache_clear()
+
+        self.assertIsNotNone(metadata.full_impl)
+        self.assertEqual(metadata.block_m, 64)
 
 
 if __name__ == "__main__":

@@ -213,7 +213,7 @@ void gemm_a16w16_flatmm_splitk_kernel(opus_gemm_flatmm_splitk_kargs_gfx950 kargs
     using T = opus::remove_cvref_t<Traits>;
     using D_A = typename T::D_A;
     using D_B = typename T::D_B;
-    using D_C = typename T::D_C;
+    using D_WS = typename T::D_WS;
     using D_ACC = typename T::D_ACC;
 
     // grid.x = split_k * num_tiles_m * num_tiles_n (S splits fused to inner axis,
@@ -230,7 +230,7 @@ void gemm_a16w16_flatmm_splitk_kernel(opus_gemm_flatmm_splitk_kargs_gfx950 kargs
 
     // Edge tile: partial-M or partial-N. OOB-zero buffer_loads on edge tiles
     // make the counted `s_waitcnt_vmcnt(number<...>{})` producer drains
-    // unsafe — vmem completion is not FIFO and the count may not include
+    // unsafe -- vmem completion is not FIFO and the count may not include
     // slot 0 when the consumer crosses the barrier. Force full drain on
     // edge tiles only; aligned tiles keep the counted fast path.
     const bool tile_edge = (row + T::B_M > kargs.m) || (col + T::B_N > kargs.n);
@@ -262,8 +262,7 @@ void gemm_a16w16_flatmm_splitk_kernel(opus_gemm_flatmm_splitk_kargs_gfx950 kargs
     auto g_b = make_gmem(reinterpret_cast<const D_B*>(kargs.ptr_b)
                          + batch_id * kargs.stride_b_batch + col * kargs.stride_b + k_start,
                          ((kargs.n - col) * kargs.stride_b - k_start) * sizeof(D_B));
-    // Deref the handle slot at entry; survives a post-capture grow.
-    D_C* ws_ptr = reinterpret_cast<D_C*>(kargs.ws_handle->ptr);
+    D_WS* ws_ptr = reinterpret_cast<D_WS*>(kargs.ptr_ws);
     auto g_c = make_gmem(ws_ptr
                          + (size_t)split_id  * kargs.batch * kargs.stride_ws_batch
                          + (size_t)batch_id  * kargs.stride_ws_batch

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
 import itertools
@@ -579,9 +579,14 @@ def test_flash_attn_varlen_func(
         reorder_ops=True,
     )
 
-    out_diff = (out - out_ref).abs().max().item()
+    abs_diff = (out - out_ref).abs()
+    out_diff = abs_diff.max().item()
     ref_diff = (out_pt - out_ref).abs().max().item()
+    max_val = max(out.abs().max().item(), out_ref.abs().max().item(), 1e-7)
+    nrms = (abs_diff / max_val).pow(2).mean().sqrt().item()
     print(f"Output max diff: {out_diff}")
+    print(f"Output mean diff: {abs_diff.mean().item()}")
+    print(f"Output NRMS: {nrms}")
     print(f"Output Pytorch max diff: {ref_diff}")
     out_tol = max(4 * ref_diff, 0.01)
     assert out_diff <= out_tol, f"forward diff {out_diff} exceeds tolerance {out_tol}"
@@ -1027,7 +1032,7 @@ if __name__ == "__main__":
         "-i",
         "--input_layout",
         type=str,
-        choices=["BSHD", "KVPACKED"],
+        choices=["BSHD", "KVPACKED", "QKVPACKED"],
         default="BSHD",
         help="""input_layout.
         e.g.: -i BSHD""",
@@ -1138,7 +1143,7 @@ def _vsink_reference_d_sink_varlen(dout, out, lse_group, sink, seqlens_q):
 
     dout       : [total_q, H, Dv]
     out        : [total_q, H, Dv]
-    lse_group  : [H, total_q]   – group-mode LSE (flattened across batches)
+    lse_group  : [H, total_q]   - group-mode LSE (flattened across batches)
     sink       : [B, H]
     seqlens_q  : list of per-batch sequence lengths
     returns d_sink : [H]

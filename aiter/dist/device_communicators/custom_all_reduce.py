@@ -79,7 +79,7 @@ def _expandable_segments_enabled() -> bool:
     an IPC handle, so it would fail; detecting this lets us force the copy-in
     path instead, which stages into the plain-hipMalloc input pool.
 
-    The allocator snapshot is authoritative — it reflects programmatic changes
+    The allocator snapshot is authoritative -- it reflects programmatic changes
     (e.g. torch.cuda.memory._set_allocator_settings) and, importantly, whether
     the platform actually honors the setting. Environment parsing is only a
     fallback for PyTorch builds whose snapshot lacks the field.
@@ -120,7 +120,7 @@ _CAR_MAX_SIZE_ENV = "AITER_CUSTOM_AR_MAX_SIZE"
 
 # Custom-AR lower size bound (bytes). Inputs at or below this run on RCCL
 # instead of the custom kernels; only inputs strictly above it are routed to
-# custom AR. Default 0 (no lower bound) — unchanged behavior. Together with
+# custom AR. Default 0 (no lower bound) -- unchanged behavior. Together with
 # _CAR_MAX_SIZE_ENV this forms the (min, max] window in which custom AR runs.
 _DEFAULT_CAR_MIN_SIZE = 0
 
@@ -239,7 +239,7 @@ def _resolve_car_min_size() -> int:
 def _should_use_vmm(is_gfx1250: bool) -> bool:
     """Decide the cross-device buffer transport for gfx1250.
 
-    VMM (fd-based) is used on gfx1250 only while hipIpc is unusable — i.e. on
+    VMM (fd-based) is used on gfx1250 only while hipIpc is unusable -- i.e. on
     ROCm older than ``_IPC_MIN_ROCM`` (or when the version can't be determined).
     On old archs hipIpc always works, so VMM is never used there.
     """
@@ -251,7 +251,7 @@ def _should_use_vmm(is_gfx1250: bool) -> bool:
         return True
     v = get_rocm_version()
     if v is None:
-        # Unknown version — keep the conservative VMM path (prior behavior).
+        # Unknown version -- keep the conservative VMM path (prior behavior).
         logger.warning(
             "Custom allreduce: ROCm version undetectable on gfx1250; "
             "using VMM transport. Set AITER_CUSTOM_AR_FORCE_IPC=1 to override."
@@ -392,7 +392,7 @@ def _validate_mxfp4_hidden_dim(n: int, element_size: int) -> None:
 class IPCBuffer:
     """A single IPC-accessible device buffer.
 
-    Pure data container — owns a pre-allocated GPU allocation with a fixed
+    Pure data container -- owns a pre-allocated GPU allocation with a fixed
     device address.  All IPC handle / broadcast / registration logic lives
     in IPCBufferPool.
 
@@ -403,7 +403,7 @@ class IPCBuffer:
       * raw_cached=True: raw *cached* device memory via a plain hipMalloc. Like
         uncached it is a raw allocation (no torch tensor view), but it keeps the
         cache. Used for the IPC input pool, which must be exportable via
-        hipIpcGetMemHandle even under PyTorch expandable segments — where
+        hipIpcGetMemHandle even under PyTorch expandable segments -- where
         torch.empty pointers live in a hipMallocAsync pool and cannot be
         exported (see issue #4174).
       * neither (default): PyTorch's caching allocator (torch.empty).
@@ -454,10 +454,16 @@ class IPCBuffer:
     def uncached(self) -> bool:
         return self._uncached
 
-    def __del__(self):
+    def close(self):
         if (self._uncached or self._raw_cached) and self._raw_ptr:
             self._free_fn(self._raw_ptr)
             self._raw_ptr = 0
+        # Drop the torch.empty backing (default pool) so the caching allocator
+        # can reclaim it without waiting for GC of this object.
+        self._buffer = None
+
+    def __del__(self):
+        self.close()
 
 
 class IPCBufferPool:
@@ -522,7 +528,7 @@ class IPCBufferPool:
         assert isinstance(s, dist.TCPStore), (
             f"IPC metadata exchange requires a pure-TCP KV store "
             f"(torch.distributed.TCPStore), got {type(s).__name__}. "
-            f"This ensures the exchange is backend-free — no RCCL, "
+            f"This ensures the exchange is backend-free -- no RCCL, "
             f"gloo, or MPI collective is involved."
         )
 
@@ -557,6 +563,12 @@ class IPCBufferPool:
         self._buffers[key] = buf
         return buf
 
+    def close(self):
+        """Free all buffers this pool owns (meta + input)."""
+        for buf in self._buffers.values():
+            buf.close()
+        self._buffers = {}
+
     def __getitem__(self, key: str) -> IPCBuffer:
         return self._buffers[key]
 
@@ -587,8 +599,11 @@ class IPCBufferPool:
         if count == 0:
             return
         handle_sz = 64  # sizeof(hipIpcMemHandle_t)
-        handle = torch.empty(count * handle_sz, dtype=torch.uint8)
-        offset = torch.empty(count, dtype=torch.int64)
+        # Host memory regardless of torch's default device: the C side writes
+        # these through plain pointers, and a GPU tensor pickled to a peer is
+        # rebuilt there on this rank's GPU, opening a HIP context on it.
+        handle = torch.empty(count * handle_sz, dtype=torch.uint8, device="cpu")
+        offset = torch.empty(count, dtype=torch.int64, device="cpu")
         self._graph_ipc_meta_fn(ar_ptr, handle.data_ptr(), offset.data_ptr())
         handles, offsets = self._gather_ipc_meta((handle, offset))
         logger.info("Registering %d cuda graph addresses", count)
@@ -602,7 +617,8 @@ class IPCBufferPool:
 
     def _broadcast_ipc(self, data_ptr: int) -> tuple[list, list]:
         """Get IPC handle for *data_ptr* and broadcast across all ranks."""
-        handle = torch.empty(64, dtype=torch.uint8)  # sizeof(hipIpcMemHandle_t)
+        # sizeof(hipIpcMemHandle_t); host memory, as in flush_graph_buffers
+        handle = torch.empty(64, dtype=torch.uint8, device="cpu")
         self._ipc_handle_fn(data_ptr, handle.data_ptr())
         return self._gather_ipc_meta((handle, 0))
 
@@ -661,7 +677,7 @@ class _GFX1250BufferProxy:
     def flush_graph_buffers(self, ar_ptr):
         # TODO: full CUDA graph support on gfx1250 requires VMM-based
         # exchange for graph-captured buffers. For now, graph capture
-        # is not supported on gfx1250 — log a warning.
+        # is not supported on gfx1250 -- log a warning.
         count = self._ca._ops_get_graph_buffer_count(ar_ptr)
         if count > 0:
             logger.warning(
@@ -716,10 +732,10 @@ class CustomAllreduce:
         """Select the ops backend.
 
         Two orthogonal dimensions:
-          * kernel — gfx1250 vs old, keyed on ``self._is_gfx1250`` (arch).
+          * kernel -- gfx1250 vs old, keyed on ``self._is_gfx1250`` (arch).
             Covers meta_size / all_reduce / all_gather / reduce_scatter / dispose
             and the graph-ptr helpers.
-          * transport — how peer pointers are shared, keyed on ``self._use_vmm``.
+          * transport -- how peer pointers are shared, keyed on ``self._use_vmm``.
             Covers init_custom_ar and register_input/output_buffer, whose
             argument shape differs (VMM: raw ptr list; IPC: handles + offsets).
 
@@ -876,7 +892,7 @@ class CustomAllreduce:
         # ranks yet: cross-rank graph-buffer exchange is unimplemented for both
         # gfx1250 transports (VMM fd exchange, and IPC graph-meta ops). The
         # "registered" capture path bakes raw input pointers that peers would
-        # dereference at replay without ever being registered → GPU page fault
+        # dereference at replay without ever being registered -> GPU page fault
         # on the first graph replay (e.g. V4 TP=2 decode). Force the copy-in
         # "unreg" path during capture, which routes through the pre-registered
         # pool (exchanged at init, address-stable across replays). Keyed on the
@@ -933,7 +949,7 @@ class CustomAllreduce:
         from .vmm_allocator import VMMBuffer, load_hip_runtime, vmm_exchange
 
         meta_sz = self._ops_meta_size()
-        # gfx1250 is 1-stage only — no tmp buffer after Signal needed
+        # gfx1250 is 1-stage only -- no tmp buffer after Signal needed
         total_meta = meta_sz
         device_id = self.device.index
 
@@ -1002,7 +1018,7 @@ class CustomAllreduce:
 
         Shared by the old-arch kernel and the gfx1250 kernel (ROCm >= 7.15):
         both consume handle+offset init/register ops. Only the meta buffer
-        layout differs — the gfx1250 kernel is 1-stage (no trailing 2x tmp
+        layout differs -- the gfx1250 kernel is 1-stage (no trailing 2x tmp
         region), but its meta_size() now also carries the LL fast-path staging
         scratch appended after the Signal struct (see meta_size() in
         custom_all_reduce_gfx1250.cu).
@@ -1041,7 +1057,7 @@ class CustomAllreduce:
         # Wire the pool's graph helpers to the kernel-matching ops so that
         # flush_graph_buffers() during capture never reinterpret_casts a gfx1250
         # `fa` through the old-arch graph ops. Graph-buffer registration itself
-        # stays disabled on gfx1250 (copy-in path → count is always 0).
+        # stays disabled on gfx1250 (copy-in path -> count is always 0).
         pool_kwargs = {}
         if self._is_gfx1250:
             pool_kwargs["graph_count_fn"] = self._ops_get_graph_buffer_count
@@ -1255,7 +1271,7 @@ class CustomAllreduce:
                 registered_input=False,
             )
 
-    # reduce_scatter split_dim enum — must match `aiter::ReduceScatterSplitDim`
+    # reduce_scatter split_dim enum -- must match `aiter::ReduceScatterSplitDim`
     # in csrc/include/custom_all_reduce.cuh.
     _RS_SPLIT_FIRST = 0
     _RS_SPLIT_LAST = 1
@@ -1356,7 +1372,7 @@ class CustomAllreduce:
                 # Warmup forward (pre-capture): run the REAL reduce_scatter via
                 # the copy-in path. Unlike custom_all_reduce, returning zeros
                 # here corrupts DeepSeek-V4 hash-routed MoE accuracy (~5pp GSM8K
-                # drop) — the warmup result feeds downstream state baked into the
+                # drop) -- the warmup result feeds downstream state baked into the
                 # captured graph. Out-of-place collective, so allocation pattern
                 # still matches the captured all_gather_reg path.
                 return self.reduce_scatter(input, output, dim, registered=False)
@@ -1456,7 +1472,7 @@ class CustomAllreduce:
             else:
                 # Warmup forward (pre-capture): run the REAL all_gather via the
                 # copy-in (unreg) path. Returning zeros here corrupts V4 MoE
-                # accuracy — see custom_reduce_scatter for the rationale.
+                # accuracy -- see custom_reduce_scatter for the rationale.
                 out = self.all_gather_unreg(inp.view(view_dtype), dim=dim)
         else:
             out = self.all_gather_unreg(inp.view(view_dtype), dim=dim)
@@ -2152,6 +2168,11 @@ class CustomAllreduce:
             except (AttributeError, RuntimeError):
                 pass
             self._ptr = 0
+        # Free the meta + input (max_size, up to 1 GB) buffers deterministically
+        # instead of leaving them for GC to reclaim via IPCBuffer.__del__.
+        pool = getattr(self, "_pool", None)
+        if pool is not None and hasattr(pool, "close"):
+            pool.close()
 
     def __del__(self):
         self.close()

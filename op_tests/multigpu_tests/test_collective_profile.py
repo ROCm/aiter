@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """
 Test script to verify RECORD_PARAM_COMMS instrumentation works for all collective ops.
 
@@ -45,6 +45,22 @@ from aiter.dist.parallel_state import (
     init_distributed_environment,
     set_custom_all_reduce,
 )
+from aiter.dist.utils import get_open_port
+
+
+def barrier_before_teardown():
+    """Align all ranks before tearing down the distributed groups.
+
+    Drain this rank's GPU work, then join a barrier so no rank starts freeing
+    IPC buffers / destroying process groups while a peer is still inside a
+    NCCL / custom-all-reduce collective -- that race intermittently hangs when
+    these comm UTs run back-to-back in CI. No-op if dist is uninitialized.
+    """
+    if not dist.is_initialized():
+        return
+    torch.cuda.synchronize()
+    get_tp_group().barrier()
+    torch.cuda.synchronize()
 
 
 def run_worker(local_rank, world_size):
@@ -126,7 +142,7 @@ def run_worker(local_rank, world_size):
 
         if record_param_comms_events:
             print(
-                f"\n✓ SUCCESS: Found {len(record_param_comms_events)} 'record_param_comms' events!"
+                f"\n? SUCCESS: Found {len(record_param_comms_events)} 'record_param_comms' events!"
             )
 
             # Count events by operation type
@@ -144,11 +160,12 @@ def run_worker(local_rank, world_size):
             sample = record_param_comms_events[0]
             print(json.dumps(sample, indent=2))
         else:
-            print("\n✗ WARNING: No 'record_param_comms' events found in trace.")
+            print("\n? WARNING: No 'record_param_comms' events found in trace.")
             print("  This may indicate the instrumentation is not working.")
 
     # Cleanup
     if dist.is_initialized():
+        barrier_before_teardown()
         destroy_model_parallel()
         destroy_distributed_environment()
 
@@ -168,6 +185,9 @@ def main():
             return
 
         print(f"Spawning {world_size} processes for {world_size} GPUs...")
+        # A free port instead of the fixed 29500 fallback in run_worker, which
+        # fails with EADDRINUSE whenever anything else on the host holds it.
+        os.environ.setdefault("MASTER_PORT", str(get_open_port()))
         mp.spawn(run_worker, args=(world_size,), nprocs=world_size, join=True)
 
 

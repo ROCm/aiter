@@ -73,7 +73,7 @@ def fused_reduce_qk_norm_rope_swa_write(
     """Fused split-K reduce + per-head weighted RMSNorm + RoPE tail on Q,
     weighted RMSNorm + RoPE tail on KV (+ optional SWA).
 
-    Replaces the (split-K reduce → q-norm → q-rope → kv-norm → kv-rope → swa-write)
+    Replaces the (split-K reduce -> q-norm -> q-rope -> kv-norm -> kv-rope -> swa-write)
     post-GEMM chain.
 
     Shapes:
@@ -87,7 +87,7 @@ def fused_reduce_qk_norm_rope_swa_write(
         ``positions``: ``[M]`` int32/int64 indices into cos/sin rows.
 
     Optional SWA: pass ``swa_kv``, ``win``, ``write_indices`` (``[M]`` int32), ``batch_id_per_token``,
-    ``state_slot_mapping`` — same semantics as ``state_writes.swa_write``.
+    ``state_slot_mapping`` -- same semantics as ``state_writes.swa_write``.
     """
     assert q.is_cuda and kv.is_cuda
     head_dim = kv.shape[1]
@@ -138,9 +138,13 @@ def fused_reduce_qk_norm_rope_swa_write(
         assert state_slot_mapping.dim() == 1
 
     _LOGGER.info(
-        "FUSED_REDUCE_QK_NORM_ROPE_SWA_WRITE "
-        f"M={M} num_splitk={num_splitk} heads={num_local_heads} "
-        f"D={head_dim} rd={rope_head_dim} HAS_SWA={HAS_SWA}"
+        "FUSED_REDUCE_QK_NORM_ROPE_SWA_WRITE M=%d num_splitk=%d heads=%d D=%d rd=%d HAS_SWA=%s",
+        M,
+        num_splitk,
+        num_local_heads,
+        head_dim,
+        rope_head_dim,
+        HAS_SWA,
     )
 
     BLOCK_SIZE_M, num_warps, waves_per_eu = _pick_block_size_m(

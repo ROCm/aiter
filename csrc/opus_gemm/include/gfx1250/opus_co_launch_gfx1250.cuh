@@ -67,8 +67,11 @@ struct CoModule
     std::vector<char> image;
     AiterAsmKernelFast kernel;
 
+    // SkipGfx1250Gate: OPUS compiler output, not shipped asm, so it is not
+    // subject to the gfx1250 B0-only gate.
     explicit CoModule(const std::string& symbol)
-        : image(read_co(symbol)), kernel(symbol.c_str(), image.data())
+        : image(read_co(symbol)),
+          kernel(symbol.c_str(), image.data(), AiterAsmKernelFast::SkipGfx1250Gate{})
     {
     }
 

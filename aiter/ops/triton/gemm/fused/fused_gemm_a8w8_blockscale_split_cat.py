@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import triton
@@ -54,7 +54,12 @@ def fused_gemm_a8w8_blockscale_split_cat(
     NOTE: N must be D * (S1 + S2)
     """
     _LOGGER.info(
-        f"FUSED_GEMM_A8W8_BLOCKSCALE_SPLIT_CAT: x={tuple(x.shape)} w={tuple(w.shape)} y={tuple(y.shape)} x_scale={tuple(x_scale.shape)} w_scale={tuple(w_scale.shape)}"
+        "FUSED_GEMM_A8W8_BLOCKSCALE_SPLIT_CAT: x=%s w=%s y=%s x_scale=%s w_scale=%s",
+        tuple(x.shape),
+        tuple(w.shape),
+        tuple(y.shape),
+        tuple(x_scale.shape),
+        tuple(w_scale.shape),
     )
 
     M, K = x.shape
@@ -243,7 +248,12 @@ def fused_gemm_a8w8_blockscale_preshuffle_split_cat(
     NOTE: N must be D * (S1 + S2)
     """
     _LOGGER.info(
-        f"FUSED_GEMM_A8W8_BLOCKSCALE_PRESHUFFLE_SPLIT_CAT: x={tuple(x.shape)} w={tuple(w.shape)} y={tuple(y.shape)} x_scale={tuple(x_scale.shape)} w_scale={tuple(w_scale.shape)}"
+        "FUSED_GEMM_A8W8_BLOCKSCALE_PRESHUFFLE_SPLIT_CAT: x=%s w=%s y=%s x_scale=%s w_scale=%s",
+        tuple(x.shape),
+        tuple(w.shape),
+        tuple(y.shape),
+        tuple(x_scale.shape),
+        tuple(w_scale.shape),
     )
 
     M, K = x.shape

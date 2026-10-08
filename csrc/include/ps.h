@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 #pragma once
 #define PRINT_DBG 0
@@ -106,7 +106,8 @@ void get_ps_metadata_v1(const aiter_tensor_t& seqlens_qo_indptr,     // [batch s
                         const int32_t        qlen_granularity,
                         const int32_t        kvlen_granlarity,
                         const int32_t        block_size,
-                        const bool           is_causal);
+                        const bool           is_causal,
+                        const bool           need_lse);
 
 
 // DEBUG

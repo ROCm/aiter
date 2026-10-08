@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// gfx1250 bf16 TDM a16w16 GEMM, 4-wave split-K via fp32 workspace + separate
-// reduce kernel -- CLUSTER-LAUNCH variant.  C[M,N] = A[M,K] @ B[N,K]^T (+ bias).
+// gfx1250 bf16 TDM a16w16 GEMM, 4-wave split-K via a per-kid bf16/fp32
+// workspace + separate reduce kernel -- CLUSTER-LAUNCH variant.
+// C[M,N] = A[M,K] @ B[N,K]^T (+ bias).
 //
 // CLUSTER (kClusterWgM x kClusterWgN x 1) = a CWGM x CWGN grid of workgroups that
 // co-reside and share TDM loads via CLUSTER_LOAD_ASYNC multicast (MI400 SPG
-// §4.10.3). __cluster_dims__(4,4,1): 16 WG cover one (4*B_M) x (4*B_N) C super-tile.
+// ?4.10.3). __cluster_dims__(4,4,1): 16 WG cover one (4*B_M) x (4*B_N) C super-tile.
 //   cluster_id_{x,y}        -> which super-tile;   cluster_id_z -> split-K slice.
 //   cluster_workgroup_id_{x,y} (local_x 0..3 / local_y 0..3) -> the B_M x B_N tile.
 //   tile_row = (cluster_x*CWGM + local_x)*B_M ;  tile_col = (cluster_y*CWGN + local_y)*B_N.
@@ -89,6 +90,7 @@ void gemm_a16w16_clusterlaunch_tdm_splitk_ws_kernel_gfx1250(opus_gemm_cluster_td
     using T = remove_cvref_t<UserTraits>;
     using DataA = typename T::DataA;
     using DataB = typename T::DataB;
+    using DataWS = typename T::DataWS;
     using DataAcc = typename T::DataAcc;
     DECLARE_NAMED_BARRIERS();   // __nbar_1..__nbar_15 (we use 1..2*kNumSlots <= 6)
 
@@ -171,7 +173,7 @@ void gemm_a16w16_clusterlaunch_tdm_splitk_ws_kernel_gfx1250(opus_gemm_cluster_td
     // vary local_y); B by the CWGM peers that fix N (same local_y, vary local_x) --
     // which is exactly what peers_along_y/peers_along_x name. Writing the mask into
     // the TDM window selects CLUSTER_LOAD_ASYNC so one load fans out to the whole
-    // group (MI400 SPG §4.10.3 / Tbl 80); a degenerate cluster dim folds to mask 0
+    // group (MI400 SPG ?4.10.3 / Tbl 80); a degenerate cluster dim folds to mask 0
     // (multicast off) inside the helper rather than here.
     // The mask names every WG of the group including any that left at `tile_oob`,
     // which neither hangs nor writes into their dead LDS: GL1 returns only to the
@@ -486,17 +488,16 @@ void gemm_a16w16_clusterlaunch_tdm_splitk_ws_kernel_gfx1250(opus_gemm_cluster_td
 
     // ---- Store the partial into ws[split_idx][padded_m][padded_n]. ----
     // bias is folded once by the reduce kernel (not here).
-    // The partial type is the traits' D_C -- per kid (splitk_workspace_dtype), and
-    // the reduce is instantiated with the same D_C so the two cannot diverge.
-    using DataWs          = typename T::DataC;
-    constexpr int kCVec   = T::kCVec; // 4 (fp32 dwordx4 / bf16 dwordx2)
-    DataWs* ws_ptr        = reinterpret_cast<DataWs*>(kargs.ptr_ws);
+    // The exact kid declares the physical workspace type in its traits. Keep
+    // this in lockstep with the Torch workspace dtype and reducer D_WS.
+    constexpr int kCVec   = T::kCVec;
+    DataWS* ws_ptr        = reinterpret_cast<DataWS*>(kargs.ptr_ws);
     const size_t ws_split = (size_t)split_idx * (size_t)kargs.stride_ws_batch;
     const size_t ws_base  = ws_split + (size_t)tile_row * (size_t)kargs.stride_ws + (size_t)tile_col;
     const unsigned int ws_bytes = (unsigned int)(((size_t)kargs.stride_ws_batch -
                                                   ((size_t)tile_row * kargs.stride_ws + tile_col)) *
-                                                 sizeof(DataWs));
-    auto g_ws                   = make_gmem<DataWs>(ws_ptr + ws_base, ws_bytes);
+                                                 sizeof(DataWS));
+    auto g_ws                   = make_gmem<DataWS>(ws_ptr + ws_base, ws_bytes);
     auto u_gc = partition_layout_c<kCVec>(mma, opus::make_tuple((int)kargs.stride_ws, 1_I),
                     opus::make_tuple(wave_m, lane_id % mma.grpn_c, wave_n, lane_id / mma.grpn_c));
     // Consumer epilogue: rendezvous with the producers (all 4 waves) BEFORE the
@@ -505,7 +506,7 @@ void gemm_a16w16_clusterlaunch_tdm_splitk_ws_kernel_gfx1250(opus_gemm_cluster_td
     // Unguarded: the tiles the cluster round-up pushed past the padded workspace
     // (padded_M = ceil(M/B_M)*B_M, and tile_row >= padded_M is the same test as
     // tile_row >= M) left at tile_oob, so every WG still here owns a real tile.
-    auto reg_c_ws = opus::cast<DataWs>(reg_c);
+    auto reg_c_ws = opus::cast<DataWS>(reg_c);
     store<kCVec>(g_ws, reg_c_ws, u_gc, 0);
 
     // Consumer epilogue: rendezvous with the producers (matches the producer's

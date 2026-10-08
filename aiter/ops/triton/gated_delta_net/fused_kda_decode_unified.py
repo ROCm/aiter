@@ -4,10 +4,10 @@
 """Unified fused KDA decode: conv1d + recurrence + gated RMSNorm.
 
 Python wrapper for the unified kernel. Mode is auto-selected from args:
-  - state_indices only             → normal decode
-  - state_indices + num_accepted   → DSpark spec decode
-  - slot_idx + buf_k/u/g           → ReplaySSM
-  - slot_idx + buf_k/u/g + conv_state_indices → DSpark + ReplaySSM
+  - state_indices only             -> normal decode
+  - state_indices + num_accepted   -> DSpark spec decode
+  - slot_idx + buf_k/u/g           -> ReplaySSM
+  - slot_idx + buf_k/u/g + conv_state_indices -> DSpark + ReplaySSM
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from __future__ import annotations
 import torch
 import triton
 
-from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.fused_conv_recurrent_norm_unified import (
+from aiter.ops.triton._triton_kernels.gated_delta_net.decode.fused_conv_recurrent_norm_unified import (
     _fused_kda_decode_unified_kernel,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch

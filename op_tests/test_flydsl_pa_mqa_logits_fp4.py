@@ -14,6 +14,10 @@ import random
 import torch
 
 from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4
+from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_rowgroup import (
+    pack_kv_cache,
+    pack_q_scales,
+)
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.test_common import checkAllclose, run_perftest
 
@@ -32,7 +36,7 @@ def setup_seed(seed):
     torch.cuda.manual_seed_all(seed)
 
 
-# ── FP4 quant / dequant utilities ─────────────────────────────────────
+# -- FP4 quant / dequant utilities -------------------------------------
 
 # FP4 e2m1 representable values (ordered by magnitude)
 _FP4_GRID_VALUES = [
@@ -52,9 +56,9 @@ _FP4_GRID_VALUES = [
     4.0,
     6.0,
 ]
-# LUT: grid index → fp4 e2m1 4-bit encoding
+# LUT: grid index -> fp4 e2m1 4-bit encoding
 _E2M1_LUT = [0xF, 0xE, 0xD, 0xC, 0xB, 0xA, 0x9, 0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7]
-# Inverse LUT: fp4 e2m1 4-bit encoding → grid index
+# Inverse LUT: fp4 e2m1 4-bit encoding -> grid index
 _E2M1_INV_LUT = [7, 8, 9, 10, 11, 12, 13, 14, 7, 6, 5, 4, 3, 2, 1, 0]
 
 
@@ -93,14 +97,14 @@ def fp4_dequant_e2m1_with_e8m0(packed, e8m0, block_size=SCALE_BLOCK):
     ).reshape(*prefix, d)
 
 
-# ── Preshuffle layout helpers (kernel ABI) ────────────────────────────
+# -- Preshuffle layout helpers (kernel ABI) ----------------------------
 
 
 def create_paged_preshuffle_kv_fp4(kv_bf16, kv_block_size, num_blocks, block_tables):
     """Create paged preshuffle FP4 E2M1 KV cache from dense bf16 KV.
 
-    Supports head_dim as any multiple of 128 — splits K dim into k_tiles
-    outer × 4 inner K_chunks (each = 32 K elements / 16 packed bytes).
+    Supports head_dim as any multiple of 128 -- splits K dim into k_tiles
+    outer x 4 inner K_chunks (each = 32 K elements / 16 packed bytes).
 
     Returns:
         kv_cache: [num_blocks, K_TILES, 4 (K_chunks), kv_block_size, 16] uint8
@@ -123,7 +127,7 @@ def create_paged_preshuffle_kv_fp4(kv_bf16, kv_block_size, num_blocks, block_tab
 
     # FP4 (cbsz=4) per-thread K layout is CONTIGUOUS: 16 bytes of one K_chunk
     # = 32 K elements at K[k*32..k*32+31]. For head_dim > 128, K splits into
-    # k_tiles outer × 4 inner K_chunks. Preshuffle: split K into (k_tiles,
+    # k_tiles outer x 4 inner K_chunks. Preshuffle: split K into (k_tiles,
     # 4 K_chunks, 16 bytes), then permute K-axes ahead of token within a page.
     kv_chunks_perm = (
         kv_fp4.view(batch, t_blocks, kv_block_size, k_tiles, 4, 16)
@@ -132,7 +136,7 @@ def create_paged_preshuffle_kv_fp4(kv_bf16, kv_block_size, num_blocks, block_tab
         .view(batch * t_blocks, k_tiles, 4, kv_block_size, 16)
     )
     # KVS_NTPW: nt-bytes packed together for the kernel's packed dword load
-    # (4 ubyte → 1 dword). Per (D=lane_div_16, T=lane_mod_16), bytes for nts
+    # (4 ubyte -> 1 dword). Per (D=lane_div_16, T=lane_mod_16), bytes for nts
     # 0..KVS_NTPW-1 are adjacent so one thread dword-loads all 4 nts.
     assert kv_block_size % KVS_NTPW == 0
     kv_e8m0_perm = (
@@ -142,7 +146,7 @@ def create_paged_preshuffle_kv_fp4(kv_bf16, kv_block_size, num_blocks, block_tab
         .view(batch * t_blocks, k_tiles, 4, kv_block_size)
         # Interleave 4 nts per token group: split [kv_block_size] into
         # (NTPW=4, T_per_nt), transpose to (T, NTPW) so 4 consecutive bytes
-        # per T cover nts 0..3 → 1 dword load.
+        # per T cover nts 0..3 -> 1 dword load.
         .view(batch * t_blocks, k_tiles, 4, KVS_NTPW, kv_block_size // KVS_NTPW)
         .transpose(-1, -2)
         .contiguous()
@@ -162,7 +166,7 @@ def create_paged_preshuffle_kv_fp4(kv_bf16, kv_block_size, num_blocks, block_tab
     return kv_cache, kv_scale, kv_fp4, kv_e8m0
 
 
-# ── Reference implementation ─────────────────────────────────────────
+# -- Reference implementation -----------------------------------------
 
 
 def ref_mqa_logits_mixed(
@@ -175,7 +179,7 @@ def ref_mqa_logits_mixed(
     next_n=1,
     weight_scale=1.0,
 ):
-    """Reference: Q (FP4) + KV (FP4) dequant → einsum → relu → weight → sum.
+    """Reference: Q (FP4) + KV (FP4) dequant -> einsum -> relu -> weight -> sum.
 
     Shapes:
       q_packed: [B, NEXT_N, H, D/2] uint8
@@ -236,7 +240,7 @@ def _make_varctx(batch, max_ctx, kv_block_size, var_ratio=0.5, seed=0):
     ]
 
 
-# ── Gluon FP8 baseline (E2E decode calling convention) ───────────────
+# -- Gluon FP8 baseline (E2E decode calling convention) ---------------
 
 
 def _bench_gluon_fp8(
@@ -351,7 +355,7 @@ def _bench_gluon_fp8(
         return None, None
 
 
-# ── Test + Benchmark ─────────────────────────────────────────────────
+# -- Test + Benchmark -------------------------------------------------
 
 _PERF_SUMMARY = []
 
@@ -436,7 +440,7 @@ def test_pa_mqa_logits_fp4_qfp4_kvfp4(
         kv_bf16, kv_block_size, num_blocks, block_tables
     )
 
-    # ---- Reference (Q FP4 + KV FP4 dequant + matmul) — per-batch ctx_lens ----
+    # ---- Reference (Q FP4 + KV FP4 dequant + matmul) -- per-batch ctx_lens ----
     ref_logits = ref_mqa_logits_mixed(
         q_packed,
         q_e8m0,
@@ -448,9 +452,9 @@ def test_pa_mqa_logits_fp4_qfp4_kvfp4(
         weight_scale=weight_scale,
     )
 
-    # ── Pre-shuffle Q scales for kernel layout (avoids runtime v_bfe_u32) ──
-    # [B, NEXT_N, H, K_TILES*4] → [B, NEXT_N, K_TILES, 4, 16, qs_pad], H
-    # decomposed as (m_tiles, 16); inner mi_idx padded to qs_pad = ⌈m_tiles/4⌉×4.
+    # -- Pre-shuffle Q scales for kernel layout (avoids runtime v_bfe_u32) --
+    # [B, NEXT_N, H, K_TILES*4] -> [B, NEXT_N, K_TILES, 4, 16, qs_pad], H
+    # decomposed as (m_tiles, 16); inner mi_idx padded to qs_pad = ?m_tiles/4?x4.
     qs_pad = ((m_tiles + 3) // 4) * 4
     qe_real = (
         q_e8m0.view(torch.uint8)
@@ -542,7 +546,7 @@ def test_pa_mqa_logits_fp4_qfp4_kvfp4(
     )
     cos_val = cos.item()
     assert cos_val > 0.99, f"FlyDSL qfp4/kvfp4 vs ref cosine_sim={cos_val:.4f} < 0.99"
-    assert neg_inf_ok, "OOB tokens were not NEG_INF — early-exit / pre-init broken"
+    assert neg_inf_ok, "OOB tokens were not NEG_INF -- early-exit / pre-init broken"
 
     if not bench:
         return
@@ -570,7 +574,7 @@ def test_pa_mqa_logits_fp4_qfp4_kvfp4(
         num_warmup,
     )
 
-    # ---- USEFUL FLOPs / bytes (varctx — based on real ctx_lens, not max) ----
+    # ---- USEFUL FLOPs / bytes (varctx -- based on real ctx_lens, not max) ----
     flops = total_tokens * next_n * heads * (2 * head_dim + 3)
     bytes_q = batch_size * next_n * heads * (head_dim_packed + head_dim_scales)
     bytes_kv = total_tokens * (head_dim_packed + head_dim_scales)
@@ -618,6 +622,95 @@ def test_pa_mqa_logits_fp4_qfp4_kvfp4(
             us_fp8,
         )
     )
+
+
+def test_pa_mqa_logits_fp4_page8(
+    batch, max_ctx, next_n=1, heads=32, head_dim=DEFAULT_HEAD_DIM, num_iters=20
+):
+    """kv_block_size=8: the row-group kernel (pa_mqa_logits_fp4_rowgroup) in
+    its 8-row-page cache layout, pages in a random order, a sequence's next_n
+    rows as its ragged rows (row n seeing context - next_n + n + 1 keys)."""
+
+    setup_seed(SEED)
+    page = 8
+    ctx_list = _make_varctx(batch, max_ctx, page)
+    context_lens = torch.tensor(ctx_list, dtype=torch.int32, device=dev)
+    max_blocks = -(-max_ctx // page)
+    t_max = max_blocks * page
+    num_blocks = batch * max_blocks
+    kv_bf16 = torch.randn(batch, t_max, head_dim, dtype=torch.bfloat16, device=dev)
+    kv_fp4, kv_e8m0 = fp4_quant_e2m1_with_e8m0(kv_bf16.reshape(-1, head_dim))
+    block_tables = (
+        torch.randperm(num_blocks, device=dev).to(torch.int32).view(batch, max_blocks)
+    )
+    pages_kv, pages_ks = pack_kv_cache(kv_fp4, kv_e8m0, page)
+    kv_cache = torch.empty_like(pages_kv)
+    kv_scale = torch.empty_like(pages_ks)
+    kv_cache[block_tables.reshape(-1).long()] = pages_kv
+    kv_scale[block_tables.reshape(-1).long()] = pages_ks
+
+    q_bf16 = torch.randn(
+        batch, next_n, heads, head_dim, dtype=torch.bfloat16, device=dev
+    )
+    q_packed, q_e8m0 = fp4_quant_e2m1_with_e8m0(q_bf16.reshape(-1, head_dim))
+    q_packed = q_packed.view(batch, next_n, heads, head_dim // 2)
+    q_e8m0 = q_e8m0.view(batch, next_n, heads, head_dim // 32)
+    weights = (
+        torch.randn(batch * next_n, heads, dtype=torch.float32, device=dev) * 0.1
+    ).to(torch.bfloat16)
+    weight_scale = 1.5
+
+    ref = ref_mqa_logits_mixed(
+        q_packed,
+        q_e8m0,
+        kv_fp4.view(batch, t_max, head_dim // 2),
+        kv_e8m0.view(batch, t_max, head_dim // 32),
+        weights,
+        context_lens,
+        next_n=next_n,
+        weight_scale=weight_scale,
+    )
+    out = torch.full((batch * next_n, t_max), float("-inf"), device=dev)
+    query_start_loc = torch.arange(
+        0, (batch + 1) * next_n, next_n, dtype=torch.int32, device=dev
+    )
+    lag = torch.arange(next_n - 1, -1, -1, dtype=torch.int32, device=dev)
+    row_ends = (context_lens[:, None] - lag).reshape(-1)
+
+    def launch():
+        flydsl_pa_mqa_logits_fp4(
+            q_packed,
+            pack_q_scales(q_e8m0),
+            kv_cache,
+            kv_scale,
+            block_tables,
+            weights,
+            None,
+            t_max,
+            weight_scale=weight_scale,
+            kv_block_size=page,
+            row_ends=row_ends,
+            query_start_loc=query_start_loc,
+            max_query_len=next_n,
+            out=out,
+        )
+
+    launch()
+    torch.cuda.synchronize()
+    mask = ~torch.isneginf(ref)
+    got, want = out[mask].double(), ref[mask].double()
+    cos = ((got * want).sum() / (got.norm() * want.norm() + 1e-12)).item()
+    max_err = (got - want).abs().max().item()
+    tail_ok = bool(torch.isneginf(out[~mask]).all())
+    _, us = run_perftest(launch, num_iters=num_iters, num_warmup=3)
+    print(
+        f"page8 batch={batch} ctx<= {max_ctx} next_n={next_n} heads={heads} "
+        f"head_dim={head_dim}: cos={cos:.6f} max_abs_err={max_err:.2e} "
+        f"past_ctx_neginf={tail_ok} {us:.1f} us"
+    )
+    # same fp4 operands, fp32 accumulation: only the summation order differs
+    assert max_err < 1e-3 * want.abs().max().item(), max_err
+    assert tail_ok, "columns past a row's context were written"
 
 
 def _print_perf_summary():
@@ -718,6 +811,15 @@ def main():
             (2, 768, 1, 128),
             (4, 2048, 1, 64),
         ]
+
+    if args.kv_block_size == 8:
+        for b, c, nn, h in configs:
+            test_pa_mqa_logits_fp4_page8(
+                b, c, next_n=nn, heads=h, head_dim=args.head_dim,
+                num_iters=args.num_iters,
+            )  # fmt: skip
+        print("  PASS")
+        return
 
     for b, c, nn, h in configs:
         try:

@@ -50,10 +50,10 @@ def cross_entropy_forward(
     """Compute vocab-parallel cross-entropy loss (forward).
 
     Args:
-        _input:  Logits shard for this TP rank — ``[B, SQ, V_local]``.
-        target:  Label indices — ``[B, SQ]``  (global vocab ids).
+        _input:  Logits shard for this TP rank -- ``[B, SQ, V_local]``.
+        target:  Label indices -- ``[B, SQ]``  (global vocab ids).
         label_smoothing:  Label-smoothing factor (0 = standard CE). Must be 0
-            when ``world_size > 1`` — the smoothing term only sums the local
+            when ``world_size > 1`` -- the smoothing term only sums the local
             vocab shard, so it is asserted against under tensor parallelism.
         reduce_loss:  If ``True``, return a scalar loss and gradient averaged
             over the *non-ignored* rows (matching ``F.cross_entropy`` mean),
@@ -72,7 +72,7 @@ def cross_entropy_forward(
         ``_input`` and already contains the gradient (to be scaled by
         ``grad_output`` in the backward pass).
     """
-    _LOGGER.info(f"CROSS_ENTROPY_FORWARD: input={tuple(_input.shape)}")
+    _LOGGER.info("CROSS_ENTROPY_FORWARD: input=%s", tuple(_input.shape))
     B, SQ, V = _input.shape
     n_rows = B * SQ
     if target.numel() != n_rows:
@@ -189,20 +189,20 @@ def cross_entropy_forward_chunked(
     """Chunked vocab-parallel cross-entropy forward.
 
     Splits the row dimension (B*SQ) into chunks of ``chunk_rows`` and
-    processes each independently: online_softmax → allgather → ce_kernel.
+    processes each independently: online_softmax -> allgather -> ce_kernel.
 
     This does *not* shrink the ``B*SQ*V_local`` logits activation (the caller
     still materializes it in full and it is updated in-place). What it bounds
     is the per-step online-softmax scratch and, under tensor parallelism, the
     all-gather/communication buffer, which drop from ``B*SQ * 3`` to
-    ``chunk_rows * 3`` floats per rank — at the cost of repeated launches and
+    ``chunk_rows * 3`` floats per rank -- at the cost of repeated launches and
     collectives.
 
     The gradient is written in-place into ``_input`` exactly as in the
     non-chunked path.
 
     Args:
-        _input:    Logit shard ``[B, SQ, V_local]`` — modified in-place.
+        _input:    Logit shard ``[B, SQ, V_local]`` -- modified in-place.
         target:    Label indices ``[B, SQ]`` (global vocab ids).
         chunk_rows: Number of rows per chunk.  Must be >= 1.
         validate_targets:  Same as in :func:`cross_entropy_forward`.
@@ -211,7 +211,7 @@ def cross_entropy_forward_chunked(
     Returns:
         ``(loss, _input)`` where *loss* is ``[B, SQ]`` or a scalar.
     """
-    _LOGGER.info(f"CROSS_ENTROPY_FORWARD_CHUNKED: input={tuple(_input.shape)}")
+    _LOGGER.info("CROSS_ENTROPY_FORWARD_CHUNKED: input=%s", tuple(_input.shape))
     if chunk_rows < 1:
         raise ValueError(f"chunk_rows must be >= 1, got {chunk_rows}")
 
@@ -254,7 +254,7 @@ def cross_entropy_forward_chunked(
                 f"ignore_idx ({ignore_idx})"
             )
 
-    # Global non-ignored row count — every chunk normalizes its gradient by the
+    # Global non-ignored row count -- every chunk normalizes its gradient by the
     # same denominator so the result matches the non-chunked reduce path.
     # clamp_min(1): avoid divide-by-zero for an all-ignored batch (see forward).
     if reduce_loss:
@@ -354,7 +354,7 @@ def cross_entropy_backward(
     Returns:
         Gradient w.r.t. the logits, same shape as ``_input``.
     """
-    _LOGGER.info(f"CROSS_ENTROPY_BACKWARD: input={tuple(_input.shape)}")
+    _LOGGER.info("CROSS_ENTROPY_BACKWARD: input=%s", tuple(_input.shape))
     B, SQ, V = _input.shape
     n_rows = B * SQ
 

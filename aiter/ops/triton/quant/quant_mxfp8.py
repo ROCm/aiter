@@ -57,9 +57,9 @@ def convert_to_mxfp8(
         Scale rounding uses torchao round-to-nearest-even, which differs from
         ``_downcast_to_mxfp`` in ``quant_moe.py`` (round-up / round-down, fnuz,
         arbitrary shapes).  Quantising the same tensor through both will produce
-        different bits — see the kernel file header for the rationale.
+        different bits -- see the kernel file header for the rationale.
     """
-    _LOGGER.info(f"CONVERT_TO_MXFP8: x={tuple(x.shape)}")
+    _LOGGER.info("CONVERT_TO_MXFP8: x=%s", tuple(x.shape))
     if fp8_dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
         raise ValueError(
             f"fp8_dtype must be torch.float8_e4m3fn or torch.float8_e5m2, got {fp8_dtype}"
@@ -98,8 +98,8 @@ def convert_to_mxfp8(
 
     grid = (triton.cdiv(M, block_m), triton.cdiv(N, block_n))
     # num_warps scales with tile area so it remains valid when block_m/block_n
-    # differ from the default 64×64 (MI308X benchmark: nw=1/2/4 differ < 1%
-    # at default tile, nw≥8 regresses).
+    # differ from the default 64x64 (MI308X benchmark: nw=1/2/4 differ < 1%
+    # at default tile, nw>=8 regresses).
     num_warps = min(16, max(1, block_m * block_n // 1024))
     _convert_to_mxfp8_kernel[grid](
         x,
@@ -154,7 +154,7 @@ def convert_from_mxfp8(
     Returns:
         Dequantized tensor with output_dtype.
     """
-    _LOGGER.info(f"CONVERT_FROM_MXFP8: x={tuple(x.shape)}")
+    _LOGGER.info("CONVERT_FROM_MXFP8: x=%s", tuple(x.shape))
     # The ASM path (v_cvt_scalef32_*) is gfx950-only and _unpack_fp8 only accepts
     # e4m3fn input; anything else must take the portable path.
     asm_supported = arch_info.get_arch() == "gfx950" and x.dtype == torch.float8_e4m3fn

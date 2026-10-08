@@ -11,15 +11,15 @@ Notation (from mHC paper arXiv:2512.24880v2):
     - M: Batch/sequence dimension
     - n: Stream parameter controlling manifold dimension
     - C: Hidden dimension per stream
-    - nC: Total flattened input dimension (K in kernel, K = n × C)
-    - N: Total output dimension (n² + 2n)
-    - x_l ∈ ℝ^(M×nC): Flattened n-stream residual (input)
-    - φ ∈ ℝ^(nC×N): Projection matrix for transformation to 3 streams
-    - H ∈ ℝ^(M×N): Output containing [H^pre, H^post, H^res]
-      - H^pre: [0:n] manifold projection with sigmoid activation (n elements, H^{pre} ∈ ℝ^{1×n})
-      - H^post: [n:2n] post-processing with 2*sigmoid activation (n elements, H^{post} ∈ ℝ^{1×n})
-      - H^res: [2n:2n+n²] residual connection (identity activation) (n² elements, H^{res} ∈ ℝ^{n×n})
-    - layer_input: (M, C)    - Σᵢ (σ(H^pre_i) + hc_pre_eps) · x_i
+    - nC: Total flattened input dimension (K in kernel, K = n x C)
+    - N: Total output dimension (n? + 2n)
+    - x_l ? R^(MxnC): Flattened n-stream residual (input)
+    - f ? R^(nCxN): Projection matrix for transformation to 3 streams
+    - H ? R^(MxN): Output containing [H^pre, H^post, H^res]
+      - H^pre: [0:n] manifold projection with sigmoid activation (n elements, H^{pre} ? R^{1xn})
+      - H^post: [n:2n] post-processing with 2*sigmoid activation (n elements, H^{post} ? R^{1xn})
+      - H^res: [2n:2n+n?] residual connection (identity activation) (n? elements, H^{res} ? R^{nxn})
+    - layer_input: (M, C)    - S? (s(H^pre_i) + hc_pre_eps) ? x_i
 """
 
 import pytest
@@ -58,7 +58,7 @@ except ImportError:
 
 def _alphas(alpha_pre, alpha_post, alpha_res, device="cuda"):
     """Pack the three per-stream scale floats into the (3,) fp32 tensor that
-    ``mhc()`` / ``mhc_post_pre()`` now consume — the kernels ``tl.load`` the
+    ``mhc()`` / ``mhc_post_pre()`` now consume -- the kernels ``tl.load`` the
     individual alphas at offsets 0/1/2.
     """
     return torch.tensor(
@@ -80,7 +80,7 @@ def _assert_mhc_close(
     """Compare Triton's ``(post_mix, comb_mix, layer_input)`` 3-tuple against
     the merged ``mhc_torch`` 4-tuple ``(hpost, hres, hpre, layer_input)``.
 
-    ``hpre`` is ignored here — Triton consumes H^pre inline and only exposes
+    ``hpre`` is ignored here -- Triton consumes H^pre inline and only exposes
     its downstream effect via ``layer_input``. All comparisons run in fp32;
     both sides are cast via ``.float()``.
     """
@@ -201,7 +201,7 @@ def test_mhc_different_epsilon(eps, M, n, C):
 
 @pytest.mark.parametrize("alpha_scale", [0.1, 0.5, 1.0, 2.0, 10.0])
 def test_mhc_different_alpha(alpha_scale):
-    """Test mhc() with different scaling factors α (Eq 16)."""
+    """Test mhc() with different scaling factors a (Eq 16)."""
     torch.cuda.empty_cache()
     torch.manual_seed(0)
 
@@ -271,7 +271,7 @@ def test_mhc_large_values():
     triton_tuple = mhc(x, phi, alpha_pre, alpha_post, alpha_res, bias, n)
 
     # Layer_input scales linearly with x, so loosen its absolute tolerance for
-    # x ~ N(0, 100²).
+    # x ~ N(0, 100?).
     _assert_mhc_close(triton_tuple, out_torch, layer_atol=2.0, layer_rtol=1e-2)
 
 
@@ -586,7 +586,7 @@ def _triton_to_hip_pre_inputs(x, phi, alpha_pre, alpha_post, alpha_res, bias, n)
     Mapping:
       M <-> m                 n <-> hc_mult              C <-> hidden_size
       x (M, n*C)              <-> residual (m, hc_mult, hidden_size) bf16
-      phi (n*C, 2n+n²)        <-> fn.T (hc_mult3, hc_hidden_size)    fp32
+      phi (n*C, 2n+n?)        <-> fn.T (hc_mult3, hc_hidden_size)    fp32
       (alpha_pre/post/res)    <-> hc_scale (3,)                      fp32
       bias                    <-> hc_base (hc_mult3,)                fp32
     """
@@ -777,7 +777,7 @@ def test_mhc_post_preallocated_output():
 
 
 def test_mhc_post_squeeze_post_mix():
-    """Pass post_mix as (M, n, 1) — as mhc() emits it."""
+    """Pass post_mix as (M, n, 1) -- as mhc() emits it."""
     from aiter.ops.triton.fusions.mhc import mhc_post
     from op_tests.triton_tests.utils.mhc_ref import (
         generate_mhc_post_inputs,
@@ -899,7 +899,7 @@ def test_triton_mhc_pre_post(M, n, C, dtype, use_asymmetric_exp_domain):
     GEMM + RMS-norm + Sinkhorn on the just-updated residual.
 
     Both modes compare against the **torch** chain
-    (``mhc_post_torch → mhc_torch``); the Sinkhorn variant inside ``mhc_torch``
+    (``mhc_post_torch -> mhc_torch``); the Sinkhorn variant inside ``mhc_torch``
     is selected by ``use_asymmetric_exp_domain``:
 
     - ``False``: canonical log-domain Sinkhorn-Knopp.
@@ -922,7 +922,7 @@ def test_triton_mhc_pre_post(M, n, C, dtype, use_asymmetric_exp_domain):
 
     # Reuse the existing mHC input generators: `generate_mhc_post_inputs`
     # for the post-step operands and `generate_mhc_inputs` for phi/bias/alphas.
-    # The two generators produce independent random data — same convention
+    # The two generators produce independent random data -- same convention
     # as test_mhc_e2e_correctness.
     layer_input, residual_in, post_mix, comb_mix = generate_mhc_post_inputs(
         M, n, C, dtype
@@ -937,7 +937,7 @@ def test_triton_mhc_pre_post(M, n, C, dtype, use_asymmetric_exp_domain):
     #   - False: canonical log-domain Sinkhorn-Knopp.
     #   - True : HIP-compatible asymmetric exp-domain Sinkhorn
     #            (softmax(row) + eps first iter, then symmetric div iters).
-    # Both compare against the **torch** chain (``mhc_post_torch → mhc_torch``);
+    # Both compare against the **torch** chain (``mhc_post_torch -> mhc_torch``);
     # no HIP kernel is involved.
     residual_out_ref = mhc_post_torch(layer_input, residual_in, post_mix, comb_mix)
     h_post_ref, h_res_ref, _h_pre_ref, layer_input_out_ref = mhc_torch(
@@ -956,7 +956,7 @@ def test_triton_mhc_pre_post(M, n, C, dtype, use_asymmetric_exp_domain):
     # internally; the Triton kernel consumes the same values).
     phi_triton = phi.T.contiguous().T
 
-    # Triton fused — mhc_post_pre selects log-domain (default) or
+    # Triton fused -- mhc_post_pre selects log-domain (default) or
     # HIP-compatible exp-domain Sinkhorn via the flag.
     h_post_t, h_res_t, layer_input_out_t, residual_out_t = mhc_post_pre(
         layer_input,
@@ -1015,7 +1015,7 @@ def mhc_e2e_triton(
     Triton implementation of full pipeline
 
     Pipeline:
-    x_l_flat (M, n*C) → mhc → (h_post, h_res, layer_input) → mhc_post → x_l+1 (M, n, C)
+    x_l_flat (M, n*C) -> mhc -> (h_post, h_res, layer_input) -> mhc_post -> x_l+1 (M, n, C)
     """
     sinkhorn_iters = int(sinkhorn_iters)
     M = x_l_flat.shape[0]
@@ -1066,9 +1066,9 @@ def mhc_e2e_triton(
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_mhc_e2e_correctness(M, n, C, dtype):
     """
-    Test correctness of Triton mhc → mhc_post pipeline
+    Test correctness of Triton mhc -> mhc_post pipeline
 
-    Tests the full round-trip: x_l → mhc() → layer_input → mhc_post() → x_l+1
+    Tests the full round-trip: x_l -> mhc() -> layer_input -> mhc_post() -> x_l+1
 
     Validates:
     1. layer_input matches reference
@@ -1082,7 +1082,7 @@ def test_mhc_e2e_correctness(M, n, C, dtype):
     )
     x_l = x_l_flat.view(M, n, C)
 
-    # Reference implementation — mhc_e2e_ref is the torch ref and takes
+    # Reference implementation -- mhc_e2e_ref is the torch ref and takes
     # three floats directly.
     layer_input_ref, x_l_plus_1_ref, h_post_ref, h_res_ref = mhc_e2e_ref(
         x_l,
@@ -1095,7 +1095,7 @@ def test_mhc_e2e_correctness(M, n, C, dtype):
         sinkhorn_iters=int(sinkhorn_iters),
     )
 
-    # Triton implementation — wrapper takes three floats and converts to
+    # Triton implementation -- wrapper takes three floats and converts to
     # an alphas tensor internally before invoking mhc().
     layer_input_triton, x_l_plus_1_triton, h_post_triton, h_res_triton = mhc_e2e_triton(
         x_l_flat,
@@ -1123,3 +1123,181 @@ def test_mhc_e2e_correctness(M, n, C, dtype):
             rtol=common_rtol,
             msg=f"{name} mismatch at (M={M}, n={n}, C={C}, dtype={dtype})",
         )
+
+
+# =============================================================================
+# DSV4 kernel tests
+# =============================================================================
+
+
+def _make_pre_dsv4_inputs(M, n, C, dtype, device="cuda"):
+    """Generate inputs for mhc_pre_dsv4 / mhc_post_dsv4."""
+    torch.manual_seed(42)
+    rows = 2 * n + n * n
+    residual = torch.randn(M, n, C, dtype=dtype, device=device) * 0.1
+    fn = torch.randn(rows, n * C, dtype=torch.float32, device=device) * 0.02
+    scale = torch.ones(3, dtype=torch.float32, device=device)
+    base = torch.zeros(rows, dtype=torch.float32, device=device)
+    return residual, fn, scale, base
+
+
+def _make_head_dsv4_inputs(M, n, C, dtype, device="cuda"):
+    """Generate inputs for mhc_head_dsv4."""
+    torch.manual_seed(42)
+    residual = torch.randn(M, n, C, dtype=dtype, device=device) * 0.1
+    fn = torch.randn(n, n * C, dtype=torch.float32, device=device) * 0.02
+    scale = torch.ones(1, dtype=torch.float32, device=device)
+    base = torch.zeros(n, dtype=torch.float32, device=device)
+    return residual, fn, scale, base
+
+
+@pytest.mark.parametrize(
+    "M, n, C",
+    [
+        (64, 4, 128),
+        (128, 4, 256),
+        (256, 4, 64),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_mhc_pre_dsv4_correctness(M, n, C, dtype):
+    """mhc_pre_dsv4 Triton forward matches the PyTorch reference."""
+    from aiter.ops.triton.fusions.mhc import (
+        _mhc_pre_dsv4_torch,
+        mhc_pre_dsv4,
+    )
+
+    residual, fn, scale, base = _make_pre_dsv4_inputs(M, n, C, dtype)
+    eps, pre_eps, sink_eps = 1e-6, 1e-6, 1e-6
+    post_mult, sink_iters = 2.0, 4
+
+    post_t, comb_t, layer_t = mhc_pre_dsv4(
+        residual,
+        fn,
+        scale,
+        base,
+        rms_eps=eps,
+        hc_pre_eps=pre_eps,
+        hc_sinkhorn_eps=sink_eps,
+        hc_post_mult_value=post_mult,
+        sinkhorn_repeat=sink_iters,
+    )
+    post_ref, comb_ref, layer_ref = _mhc_pre_dsv4_torch(
+        residual, fn, scale, base, eps, pre_eps, sink_eps, post_mult, sink_iters
+    )
+
+    atol, rtol = 2e-2, 2e-2
+    for name, t, ref in (
+        ("post_mix", post_t, post_ref),
+        ("comb_mix", comb_t, comb_ref),
+        ("layer_input", layer_t, layer_ref),
+    ):
+        torch.testing.assert_close(
+            t.float(),
+            ref.float(),
+            atol=atol,
+            rtol=rtol,
+            msg=f"{name} mismatch at (M={M}, n={n}, C={C}, dtype={dtype})",
+        )
+
+
+@pytest.mark.parametrize(
+    "M, n, C",
+    [
+        (64, 4, 128),
+        (128, 4, 256),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_mhc_post_dsv4_correctness(M, n, C, dtype):
+    """mhc_post_dsv4 Triton forward matches the PyTorch reference."""
+    from aiter.ops.triton.fusions.mhc import (
+        mhc_post_dsv4,
+        mhc_pre_dsv4,
+    )
+
+    residual, fn, scale, base = _make_pre_dsv4_inputs(M, n, C, dtype)
+    eps, pre_eps, sink_eps = 1e-6, 1e-6, 1e-6
+    post_mult, sink_iters = 2.0, 4
+
+    # Use the Triton pre to get mixes, then check post matches reference e2e
+    post_mix, comb_mix, layer_input = mhc_pre_dsv4(
+        residual,
+        fn,
+        scale,
+        base,
+        rms_eps=eps,
+        hc_pre_eps=pre_eps,
+        hc_sinkhorn_eps=sink_eps,
+        hc_post_mult_value=post_mult,
+        sinkhorn_repeat=sink_iters,
+    )
+
+    out_t = mhc_post_dsv4(layer_input, residual, post_mix, comb_mix)
+
+    # Reference: post_2d * layer_input + sum_j(comb_ij * residual_j)
+    post_2d = post_mix.squeeze(-1).float()
+    out_ref = post_2d[:, :, None] * layer_input.float()[:, None, :]
+    out_ref = out_ref + torch.einsum("mhc,mhj->mjc", residual.float(), comb_mix.float())
+    out_ref = out_ref.to(dtype)
+
+    torch.testing.assert_close(
+        out_t.float(),
+        out_ref.float(),
+        atol=2e-2,
+        rtol=2e-2,
+        msg=f"mhc_post_dsv4 mismatch at (M={M}, n={n}, C={C}, dtype={dtype})",
+    )
+
+
+@pytest.mark.parametrize(
+    "M, n, C",
+    [
+        (64, 4, 128),
+        (128, 4, 256),
+        (256, 4, 64),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_mhc_head_dsv4_correctness(M, n, C, dtype):
+    """mhc_head_dsv4 Triton forward matches the PyTorch reference."""
+    from aiter.ops.triton.fusions.mhc import (
+        _mhc_head_dsv4_torch,
+        mhc_head_dsv4,
+    )
+
+    residual, fn, scale, base = _make_head_dsv4_inputs(M, n, C, dtype)
+    eps, pre_eps = 1e-6, 1e-6
+
+    out_t = mhc_head_dsv4(residual, fn, scale, base, rms_eps=eps, hc_pre_eps=pre_eps)
+    out_ref = _mhc_head_dsv4_torch(residual, fn, scale, base, eps, pre_eps)
+
+    torch.testing.assert_close(
+        out_t.float(),
+        out_ref.float(),
+        atol=2e-2,
+        rtol=2e-2,
+        msg=f"mhc_head_dsv4 mismatch at (M={M}, n={n}, C={C}, dtype={dtype})",
+    )
+
+
+def test_mhc_pre_dsv4_empty_batch():
+    """mhc_pre_dsv4 returns zero-sized outputs for M=0 without error."""
+    from aiter.ops.triton.fusions.mhc import mhc_pre_dsv4
+
+    n, C = 4, 64
+    residual, fn, scale, base = _make_pre_dsv4_inputs(0, n, C, torch.bfloat16)
+    post, comb, layer = mhc_pre_dsv4(residual, fn, scale, base)
+    assert post.shape == (0, n, 1)
+    assert comb.shape == (0, n, n)
+    assert layer.shape == (0, C)
+
+
+def test_mhc_head_dsv4_empty_batch():
+    """mhc_head_dsv4 returns zero-sized output for M=0 without error."""
+    from aiter.ops.triton.fusions.mhc import mhc_head_dsv4
+
+    n, C = 4, 64
+    residual, fn, scale, base = _make_head_dsv4_inputs(0, n, C, torch.bfloat16)
+    out = mhc_head_dsv4(residual, fn, scale, base)
+    assert out.shape == (0, C)

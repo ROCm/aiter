@@ -109,7 +109,7 @@ def _mla_gluon(
     HAS_ATTN_SINK: gl.constexpr,
 ):
     # Grid mapping: bh64 uses 3-D XCD-aware multi-batch; bh16bn64 and bh16bn128
-    # use 2-D (batch, split) — for batch_size=1 this is (1, NUM_KV_SPLITS).
+    # use 2-D (batch, split) -- for batch_size=1 this is (1, NUM_KV_SPLITS).
     # MTP: an extra q_pos axis carries the query position within QLEN. bh64 packs
     # it into grid axis 1 (after the head-block index); bh16 uses grid axis 2.
     # When QLEN==1, q_pos is always 0 and the layout below is identical to before.
@@ -141,7 +141,7 @@ def _mla_gluon(
         batch_page_start = gl.load(B_seq_len + cur_batch)
         cur_batch_seq_len = gl.load(B_seq_len + cur_batch + 1) - batch_page_start
 
-    # NUM_KV_SPLITS is a launch-time budget only. 
+    # NUM_KV_SPLITS is a launch-time budget only.
     # the partition is derived here from the runtime per-batch KV length.
     # kv_len_per_split = max(BLOCK_N, floor(seq / NUM_KV_SPLITS)):
     #   - the BLOCK_N floor keeps every split at >= 1 full block, so a short seq
@@ -440,7 +440,7 @@ def _mla_gluon(
     if WITHIN_2GB:
         gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_kv0, Kv_c_cache, offs_k_c0, mask=offs_n_nope0[None, :] < split_kv_end)
     else:
-        gl.amd.cdna4.async_copy.global_load_to_shared(bufs_kv0, Kv_c_cache + offs_k_c0)
+        gl.amd.cdna4.async_copy.global_load_to_shared(bufs_kv0, Kv_c_cache + offs_k_c0, mask=offs_n_nope0[None, :] < split_kv_end, other=0.0)
     gl.amd.cdna4.async_copy.commit_group()
 
     # global load K_pe
@@ -451,7 +451,7 @@ def _mla_gluon(
         if WITHIN_2GB:
             gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_kpe.index(0), K_pe_cache, offs_k_pe, mask=offs_n_pe0[None, :] < split_kv_end)
         else:
-            gl.amd.cdna4.async_copy.global_load_to_shared(bufs_kpe.index(0), K_pe_cache + offs_k_pe)
+            gl.amd.cdna4.async_copy.global_load_to_shared(bufs_kpe.index(0), K_pe_cache + offs_k_pe, mask=offs_n_pe0[None, :] < split_kv_end, other=0.0)
         gl.amd.cdna4.async_copy.commit_group()
 
     # local load page number for slice 1
@@ -466,7 +466,7 @@ def _mla_gluon(
     if WITHIN_2GB:
         gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_kv1, Kv_c_cache, offs_k_c1, mask=offs_n_nope1[None, :] < split_kv_end)
     else:
-        gl.amd.cdna4.async_copy.global_load_to_shared(bufs_kv1, Kv_c_cache + offs_k_c1)
+        gl.amd.cdna4.async_copy.global_load_to_shared(bufs_kv1, Kv_c_cache + offs_k_c1, mask=offs_n_nope1[None, :] < split_kv_end, other=0.0)
     gl.amd.cdna4.async_copy.commit_group()
 
     if REGIME == 'bh64':
@@ -499,11 +499,8 @@ def _mla_gluon(
         if WITHIN_2GB:
             gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_kv0, Kv_c_cache, offs_k_c0, mask=offs_n_nope0[None, :] < split_kv_end)
         else:
-            # No mask needed on global_load path in the loop body: all
-            # iterations are guaranteed in-bounds by num_iter arithmetic.
-            # Only the epilogue uses mask + other=0 for the last
-            # potentially-partial block.
-            gl.amd.cdna4.async_copy.global_load_to_shared(bufs_kv0, Kv_c_cache + offs_k_c0)
+            # >2GB path needs the same bounds mask + other=0.0 as buffer_load.
+            gl.amd.cdna4.async_copy.global_load_to_shared(bufs_kv0, Kv_c_cache + offs_k_c0, mask=offs_n_nope0[None, :] < split_kv_end, other=0.0)
         gl.amd.cdna4.async_copy.commit_group()
 
         # local load page_number_pe
@@ -517,8 +514,8 @@ def _mla_gluon(
             if WITHIN_2GB:
                 gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_kpe.index(async_idx), K_pe_cache, offs_k_pe, mask=offs_n_pe[None, :] < split_kv_end)
             else:
-                # No mask needed: loop iterations are in-bounds (see KV slice 0 comment).
-                gl.amd.cdna4.async_copy.global_load_to_shared(bufs_kpe.index(async_idx), K_pe_cache + offs_k_pe)
+                # >2GB path needs the same bounds mask + other=0.0 as buffer_load.
+                gl.amd.cdna4.async_copy.global_load_to_shared(bufs_kpe.index(async_idx), K_pe_cache + offs_k_pe, mask=offs_n_pe[None, :] < split_kv_end, other=0.0)
             gl.amd.cdna4.async_copy.commit_group()
 
         #### dot, softmax, dot (part0)
@@ -539,8 +536,8 @@ def _mla_gluon(
         if WITHIN_2GB:
             gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_kv1, Kv_c_cache, offs_k_c1, mask=offs_n1[None, :] < split_kv_end)
         else:
-            # No mask needed: loop iterations are in-bounds (see KV slice 0 comment).
-            gl.amd.cdna4.async_copy.global_load_to_shared(bufs_kv1, Kv_c_cache + offs_k_c1)
+            # >2GB path needs the same bounds mask + other=0.0 as buffer_load.
+            gl.amd.cdna4.async_copy.global_load_to_shared(bufs_kv1, Kv_c_cache + offs_k_c1, mask=offs_n1[None, :] < split_kv_end, other=0.0)
         gl.amd.cdna4.async_copy.commit_group()
 
         #### dot, softmax, dot (part1)
@@ -595,8 +592,8 @@ def _mla_gluon(
         if WITHIN_2GB:
             gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_kv.index(async_idx), Kv_c_cache, offs_k_c, mask=offs_n_nope[None, :] < split_kv_end)
         else:
-            # No mask needed: out-of-range positions are discarded by the qk score mask
-            gl.amd.cdna4.async_copy.global_load_to_shared(bufs_kv.index(async_idx), Kv_c_cache + offs_k_c)
+            # >2GB path needs the same bounds mask + other=0.0 as buffer_load.
+            gl.amd.cdna4.async_copy.global_load_to_shared(bufs_kv.index(async_idx), Kv_c_cache + offs_k_c, mask=offs_n_nope[None, :] < split_kv_end, other=0.0)
         gl.amd.cdna4.async_copy.commit_group()
         # global load K_pe
         if HAS_PE:
@@ -606,7 +603,7 @@ def _mla_gluon(
             if WITHIN_2GB:
                 gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_kpe.index(async_idx), K_pe_cache, offs_k_pe, mask=offs_n_pe[None, :] < split_kv_end)
             else:
-                gl.amd.cdna4.async_copy.global_load_to_shared(bufs_kpe.index(async_idx), K_pe_cache + offs_k_pe)
+                gl.amd.cdna4.async_copy.global_load_to_shared(bufs_kpe.index(async_idx), K_pe_cache + offs_k_pe, mask=offs_n_pe[None, :] < split_kv_end, other=0.0)
             gl.amd.cdna4.async_copy.commit_group()
 
         # dot, softmax, dot
@@ -840,7 +837,7 @@ def mla_gluon(
     has_pe=True,
     attn_sink=None,  # [nhead] fp32 per-head sink bias, None means no sink
 ):
-    """Unified Gluon MLA entry (gfx950 / CDNA4) — decode and DeepSeek V4 sparse prefill.
+    """Unified Gluon MLA entry (gfx950 / CDNA4) -- decode and DeepSeek V4 sparse prefill.
 
     `mla_gluon` supports the full decode (stage-1 + stage-2 reduce, or the stage-1-only
     fast path when NUM_KV_SPLITS==1) and writes the final attention into the

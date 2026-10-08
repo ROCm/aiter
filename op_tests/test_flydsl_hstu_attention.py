@@ -12,10 +12,10 @@ import pytest
 import torch
 
 import aiter
-import aiter.ops.flydsl.hstu_attention_kernels as hstu_kernels
+import aiter.ops.flydsl.hstu_attention as hstu_kernels
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.hstu_attention_kernels import (
+from aiter.ops.flydsl.hstu_attention import (
     _validate_inputs,
     flydsl_hstu_attention_fwd,
 )
@@ -30,8 +30,21 @@ def _load_torch_hstu_reference():
     try:
         from triton_tests.utils.hstu_attention_ref import torch_hstu_attention
     except ModuleNotFoundError as exc:
-        if exc.name != "triton_tests":
+        missing = exc.name or ""
+        if not (
+            missing == "triton_tests"
+            or missing.startswith(("triton_tests.", "op_tests."))
+            or missing == "op_tests"
+        ):
             raise
+
+        import sys
+        from pathlib import Path
+
+        repo_root = Path(__file__).resolve().parents[1]
+        if str(repo_root) not in sys.path:
+            sys.path.insert(0, str(repo_root))
+
         from op_tests.triton_tests.utils.hstu_attention_ref import torch_hstu_attention
 
     return torch_hstu_attention
@@ -280,7 +293,7 @@ def test_flydsl_hstu_attention_perf(
         # non-causal
         # full bidirectional attention
         (4, 512, 0.5, 0, 0, 0, 128, 128, False),
-        # non-causal + targets (abs(dist) over target-clamped ids — interaction untested elsewhere)
+        # non-causal + targets (abs(dist) over target-clamped ids -- interaction untested elsewhere)
         (4, 512, 0.5, 0, 0, 20, 128, 128, False),
         # non-causal symmetric window (|q - col| <= max_attn_len)
         (4, 512, 0.5, 64, 0, 0, 128, 128, False),

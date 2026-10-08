@@ -26,10 +26,10 @@ fixed startup cost).
 For NCHW non-1x1 shapes, two Triton numbers are reported: kernel-only (the
 cblocked input pack is done once up front and handed to the kernel via
 x_blocked=) and kernel+repack (the public call, which packs the input on the
-host every time — the real inference cost when the input layout changes per
+host every time -- the real inference cost when the input layout changes per
 call).
 
-No model loading at runtime — model shapes come from the pre-extracted
+No model loading at runtime -- model shapes come from the pre-extracted
 conv_shapes.json: each conv layer's (N,C,H,W,K,R,S,stride,pad,dilation) was
 captured offline once per model via forward hooks, deduped, and frozen here.
 """
@@ -46,7 +46,10 @@ import torch
 import torch.nn.functional as F
 import triton
 
-from aiter.ops.triton.conv._prepack import prepack_nchw_to_cblocked
+from aiter.ops.triton.conv._prepack import (
+    clear_conv2d_weight_pack_caches,
+    prepack_nchw_to_cblocked,
+)
 from aiter.ops.triton.conv._utils import (
     BLOCK_K,
     _is_1x1_conv,
@@ -112,7 +115,7 @@ METHODS = {
 }
 
 
-# Edge-case smoke set — same shapes as the unit-test edge cases (see
+# Edge-case smoke set -- same shapes as the unit-test edge cases (see
 # _helpers.get_edge_case_shapes). These exercise degenerate paths (C=1,
 # dilation>1, asymmetric dims, stride>1, etc.) that real production
 # models don't hit. Used only when --smoke is passed; otherwise the sweep
@@ -134,7 +137,7 @@ EDGE_CASE_SHAPES = [
 ]
 
 
-# MIOpen solver names → human-readable algorithm types (matches old suite.py).
+# MIOpen solver names -> human-readable algorithm types (matches old suite.py).
 MIOPEN_ALGO_MAP = {
     "ConvWinoFuryRxS<2-3>": "Winograd Fury F(2,3)",
     "ConvBinWinogradRxSf3x2": "Winograd F(3x3,2x2) binary",
@@ -178,7 +181,7 @@ def _kernel_type_tag(R: int, S: int, dilation: tuple) -> str:
 
 
 def _shape_str(N, C, H, W, K, R, S) -> str:
-    return f"({N},{C},{H},{W})→{K}/{R}x{S}"
+    return f"({N},{C},{H},{W})->{K}/{R}x{S}"
 
 
 # ----------------------------------------------------------------------------
@@ -506,24 +509,29 @@ def run_single_shape(args) -> None:
     dilation = (args.dilation_h, args.dilation_w)
     # Single-shape mode (bench_models.py consumer): skip kernel+repack timing
     # to keep per-call cost predictable for the framework.
-    result = bench_one_shape(
-        args.N,
-        args.C,
-        args.H,
-        args.W,
-        args.K,
-        args.R,
-        args.S,
-        stride,
-        padding,
-        dilation,
-        dtype,
-        args.method,
-        args.layout,
-        bias=not args.no_bias,
-        measure_repack=False,
-    )
-    print(_format_single_shape_line(args, result))
+    try:
+        result = bench_one_shape(
+            args.N,
+            args.C,
+            args.H,
+            args.W,
+            args.K,
+            args.R,
+            args.S,
+            stride,
+            padding,
+            dilation,
+            dtype,
+            args.method,
+            args.layout,
+            bias=not args.no_bias,
+            measure_repack=False,
+        )
+        print(_format_single_shape_line(args, result))
+    finally:
+        clear_conv2d_weight_pack_caches()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 # ----------------------------------------------------------------------------
@@ -552,11 +560,11 @@ def _box_table(headers, rows, align: list | None = None) -> str:
                 cells.append(f" {s:>{widths[j]}} ")
             else:
                 cells.append(f" {s:<{widths[j]}} ")
-        return "│" + "│".join(cells) + "│"
+        return "|" + "|".join(cells) + "|"
 
-    sep_top = "┌" + "┬".join("─" * (w + 2) for w in widths) + "┐"
-    sep_mid = "├" + "┼".join("─" * (w + 2) for w in widths) + "┤"
-    sep_bot = "└" + "┴".join("─" * (w + 2) for w in widths) + "┘"
+    sep_top = "+" + "+".join("-" * (w + 2) for w in widths) + "+"
+    sep_mid = "+" + "+".join("-" * (w + 2) for w in widths) + "+"
+    sep_bot = "+" + "+".join("-" * (w + 2) for w in widths) + "+"
 
     lines = [sep_top, fmt_row(headers), sep_mid]
     for i, row in enumerate(rows):
@@ -587,14 +595,14 @@ def _print_layer_table(
     for i, lr in enumerate(layers):
         row = [str(i), lr["name"], lr["type"], lr["shape"]]
         if miopen_enabled:
-            row.append(lr["miopen_solver"] or "—")
-        row.append(lr["kernel_name"] or "—")
+            row.append(lr["miopen_solver"] or "--")
+        row.append(lr["kernel_name"] or "--")
         row.append(f"{lr['tflops_tri']:.2f}")
         if has_any_repack:
             row.append(
                 f"{lr['tflops_tri_e2e']:.2f}"
                 if lr["tflops_tri_e2e"] is not None
-                else "—"
+                else "--"
             )
         row.append(f"{lr['tflops_torch']:.2f}")
         # Winner uses kernel TF/s (not kernel+repack) for consistency with old code.
@@ -712,7 +720,7 @@ def _print_overall_perf_table(layers: list, has_any_repack: bool) -> None:
             ["Layer wins (kernel+repack)", f"{e2e_wins}/{n}", f"{n - e2e_wins}/{n}"]
         )
     rows.append(
-        ["Correctness", f"{sum(1 for lr in layers if lr['correct'])}/{n} passed", "—"]
+        ["Correctness", f"{sum(1 for lr in layers if lr['correct'])}/{n} passed", "--"]
     )
 
     print(_box_table(("Metric", "Triton", "PyTorch (MIOpen)"), rows))
@@ -734,7 +742,7 @@ def _load_model_shapes(model_pattern: str) -> tuple[str, list]:
 
     model_pattern: case-insensitive substring matched against model keys.
     Returns (matched_model_name, list of shape tuples in the same form as
-    EDGE_CASE_SHAPES — desc is "<model> L<i>").
+    EDGE_CASE_SHAPES -- desc is "<model> L<i>").
     """
     with open(_MODEL_SHAPES_PATH) as f:
         data = json.load(f)
@@ -782,17 +790,17 @@ def run_sweep(args) -> None:
     if args.smoke:
         shapes = EDGE_CASE_SHAPES
         print(
-            f"# Sweep source: EDGE_CASE_SHAPES ({len(shapes)} shapes) — smoke / "
+            f"# Sweep source: EDGE_CASE_SHAPES ({len(shapes)} shapes) -- smoke / "
             "degenerate-path coverage, NOT representative of production workloads"
         )
     else:
-        # Default: real-model sweep. --model picks one; absent → resnet50.
+        # Default: real-model sweep. --model picks one; absent -> resnet50.
         model_name = args.model if args.model else "resnet50"
         try:
             model, shapes = _load_model_shapes(model_name)
             label = f":: {model} ({len(shapes)} layers)"
             if not args.model:
-                label += "  (default — pass --model X or --smoke to change)"
+                label += "  (default -- pass --model X or --smoke to change)"
             print(f"# Sweep source: conv_shapes.json {label}")
         except (FileNotFoundError, ValueError) as e:
             print(f"ERROR: {e}", file=sys.stderr)
@@ -841,6 +849,10 @@ def run_sweep(args) -> None:
         except Exception as e:  # noqa: BLE001
             print(f"  {name:<24} ERROR: {type(e).__name__}: {e}", file=sys.stderr)
             continue
+        finally:
+            clear_conv2d_weight_pack_caches()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         miopen = (
             _get_miopen_solver(N, C, H, W, K, R, S, stride, padding, dilation)
             if args.miopen_solvers

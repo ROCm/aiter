@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """
 All-Gather communication primitive using Iris.
@@ -50,7 +50,7 @@ def _all_gather_impl(
     """
     Shared all-gather implementation using push-based approach with iris.put. 1D persistent-style PID mapping
 
-    Each rank sends its (M_shard)×N to all other ranks at the appropriate offset.
+    Each rank sends its (M_shard)xN to all other ranks at the appropriate offset.
 
     Args:
         pid: Program ID,  1D persistent-style PID mapping
@@ -210,7 +210,12 @@ def all_gather(
     M = M_shard * world_size
 
     logger.info(
-        f"Rank {cur_rank}/{world_size}: All-gather M_shard={M_shard}, N={N} -> M={M}"
+        "Rank %d/%d: All-gather M_shard=%d, N=%d -> M=%d",
+        cur_rank,
+        world_size,
+        M_shard,
+        N,
+        M,
     )
 
     # Allocate output buffer in IRIS shared memory
@@ -245,7 +250,7 @@ def all_gather(
     iris_ctx.barrier()
 
     logger.info(
-        f"Rank {cur_rank}: All-gather complete, output shape: {full_output.shape}"
+        "Rank %d: All-gather complete, output shape: %s", cur_rank, full_output.shape
     )
 
     return full_output
