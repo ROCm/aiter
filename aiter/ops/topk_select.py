@@ -32,6 +32,7 @@ mode costs up to 20%; `tie='low'` is the request. `tie=` also narrows the
 backend set to those that can promise a direction, which costs speed.
 """
 
+import builtins
 import os
 from functools import lru_cache
 
@@ -912,7 +913,7 @@ def _reject_unsupported(
     if input.dim() != 2 or input.dtype not in ARGMAX_DTYPES:
         raise ValueError(
             f"input must be 2-D and one of "
-            f"{sorted(str(d) for d in ARGMAX_DTYPES)}; got "
+            f"{builtins.sorted(str(d) for d in ARGMAX_DTYPES)}; got "
             f"{tuple(input.shape)} {input.dtype}"
         )
     if input.dtype is not torch.float32 and topk != 1:

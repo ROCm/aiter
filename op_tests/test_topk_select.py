@@ -323,6 +323,33 @@ def test_strided_layouts():
     return failures
 
 
+def test_rejections():
+    """A wrong rank or dtype is refused with the ValueError that names the rule.
+
+    The entry's `sorted` flag keeps DeepSelect's name, so the message has to
+    reach the builtin some other way.
+    """
+    failures = []
+    for shape, dtype in (
+        ((4096,), dtypes.fp32),
+        ((2, 8, 4096), dtypes.fp32),
+        ((8, 4096), dtypes.i32),
+    ):
+        label = f"{shape} {dtype}"
+        try:
+            topk_select(torch.zeros(shape, dtype=dtype), 16)
+        except ValueError as e:
+            if "2-D" not in str(e):
+                failures.append(f"{label}: unexpected message: {e}")
+        except Exception as e:  # noqa: BLE001
+            failures.append(f"{label}: {type(e).__name__}: {e}")
+        else:
+            failures.append(f"{label}: accepted")
+    for label in failures:
+        aiter.logger.error("REJECTION FAILED: %s", label)
+    return failures
+
+
 def test_lds_sizing():
     """The streaming selector's LDS sizing, on cards this box does not have.
 
@@ -576,6 +603,11 @@ def main():
         "strided layouts: %s", "all hold" if not bad else f"{len(bad)} FAILED: {bad}"
     )
     assert not bad, f"strided layouts: {len(bad)} failed"
+    bad = test_rejections()
+    aiter.logger.info(
+        "rejections: %s", "all hold" if not bad else f"{len(bad)} FAILED: {bad}"
+    )
+    assert not bad, f"rejections: {len(bad)} failed"
 
     df = [
         test_topk_argmax_half(m, n, dtype)
