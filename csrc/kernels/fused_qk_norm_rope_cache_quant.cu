@@ -3345,9 +3345,8 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
     // Optional fp8 Q output (static per-tensor scale). When q_out_fp8 is absent the
     // kernel writes only bf16 q_out; the scale is unused in that case.
     const bool quant_q = has_q_out_fp8;
-    float per_tensor_q_scale_ = quant_q
-                                    ? *reinterpret_cast<float*>(per_tensor_q_scale->data_ptr())
-                                    : 1.0f;
+    const float* per_tensor_q_scale_ptr =
+        quant_q ? reinterpret_cast<const float*>(per_tensor_q_scale->data_ptr()) : nullptr;
     // K/V cache indexing is stride-aware in block/token/head (innermost head_size
     // assumed contiguous), so most future KV layout changes need no change here.
     int64_t k_cache_block_stride = k_cache.stride(0);
@@ -3459,7 +3458,7 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                             v_cache_head_stride,
                             v_norm,
                             q_out_fp8_ptr,
-                            per_tensor_q_scale_);
+                            per_tensor_q_scale_ptr);
                     }
                     else
                     {
@@ -3513,7 +3512,7 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                             v_cache_head_stride,
                             v_norm,
                             q_out_fp8_ptr,
-                            per_tensor_q_scale_);
+                            per_tensor_q_scale_ptr);
                     }
                 }
                 else

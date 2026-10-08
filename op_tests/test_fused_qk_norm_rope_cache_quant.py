@@ -3123,6 +3123,94 @@ def test_fused_qk_norm_rope_cache_pts_q_fp8(head_size, q_scale_val, eps=1e-6):
     }
 
 
+def test_fused_qk_norm_rope_cache_pts_q_fp8_scale_ordering(head_size=128, eps=1e-6):
+    """The FP8 Q scale is read on-device in stream order and on every graph replay."""
+    dev = "cuda"
+    dtype = torch.bfloat16
+    fp8 = get_dtype_fp8()
+    nt, hq, hk, hv = 1, 4, 1, 1
+
+    torch.manual_seed(0)
+    qkv = torch.randn(nt, (hq + hk + hv) * head_size, dtype=dtype, device=dev)
+    qw = torch.randn(head_size, dtype=dtype, device=dev)
+    kw = torch.randn(head_size, dtype=dtype, device=dev)
+    cos_sin = torch.randn(8, head_size, dtype=dtype, device=dev)
+    positions = torch.zeros(nt, dtype=torch.int64, device=dev)
+    slot_mapping = torch.zeros(nt, dtype=torch.int64, device=dev)
+    q_out = torch.empty(nt, hq * head_size, dtype=dtype, device=dev)
+    q_out_fp8 = torch.empty(nt, hq * head_size, dtype=fp8, device=dev)
+    k_cache = torch.zeros(1, 1, hk, head_size, dtype=fp8, device=dev)
+    v_cache = torch.zeros(1, 1, hv, head_size, dtype=fp8, device=dev)
+    k_scale = torch.ones(1, dtype=torch.float32, device=dev)
+    v_scale = torch.ones(1, dtype=torch.float32, device=dev)
+    q_scale = torch.ones(1, dtype=torch.float32, device=dev)
+
+    def launch():
+        aiter.fused_qk_norm_rope_cache_pts_quant_shuffle(
+            qkv,
+            qw,
+            kw,
+            cos_sin,
+            positions,
+            nt,
+            hq,
+            hk,
+            hv,
+            head_size,
+            True,
+            eps,
+            q_out,
+            k_cache,
+            v_cache,
+            slot_mapping,
+            k_scale,
+            v_scale,
+            None,
+            None,
+            False,
+            False,
+            1,
+            16 // k_cache.element_size(),
+            0,
+            False,
+            q_out_fp8,
+            q_scale,
+        )
+
+    def assert_scale(scale, mode):
+        expected = (q_out.float() / scale).to(fp8)
+        assert torch.equal(
+            q_out_fp8.view(torch.uint8), expected.view(torch.uint8)
+        ), f"FP8 Q bytes mismatch after {mode}: D={head_size}, q_scale={scale}"
+
+    # Preserve stream ordering for a device-side scale update.
+    eager_scale = 0.5
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        q_scale.fill_(eager_scale)
+        launch()
+    stream.synchronize()
+    assert_scale(eager_scale, "same-stream update")
+
+    # Replay must read the current device value, not the capture-time value.
+    q_scale.fill_(1.0)
+    launch()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+    replay_scale = 0.25
+    q_scale.fill_(replay_scale)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert_scale(replay_scale, "graph replay")
+    print(
+        f"[PASS] q_fp8 scale ordering D={head_size}, eager={eager_scale}, "
+        f"replay={replay_scale}",
+        flush=True,
+    )
+
+
 def test_fused_qk_norm_rope_cache_pts_q_fp8_validation(case=None):
     """Reject invalid optional FP8 Q output contracts before kernel launch."""
     dev = "cuda"
@@ -3813,6 +3901,7 @@ if __name__ == "__main__":
         "fused_qk_norm_rope_cache_pts_q_fp8 summary (markdown):\n%s",
         df.to_markdown(index=False),
     )
+    test_fused_qk_norm_rope_cache_pts_q_fp8_scale_ordering()
     test_fused_qk_norm_rope_cache_pts_q_fp8_validation()
     # Weightless V-norm (Gemma4): head_dim 256 (sliding) + 512 (full attention),
     # v_norm on/off. (cache_dtype, v_scale) pairs: a same-dtype cache (scale is a
