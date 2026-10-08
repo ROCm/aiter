@@ -176,6 +176,13 @@ _PLAIN_K2048_TINY_BAND = (8192, 32770)
 _PLAIN_K2048_TINY_MAX_ROWS = 8
 _PLAIN_K2048_SHORT_BANDS = ((8192, 8194), (16384, 16386), (20000, 32770))
 _PLAIN_K2048_SHORT_MAX_ROWS = 128
+# gfx942 below 128 CUs (MI308X, k=2048, randn, device time): plain also beat
+# decode on the 4K triplet at every row count, at 129..255 rows on the short
+# bands, and from 128 rows below 8192 columns -- 25% less total time over 732
+# cells, none slower.  gfx942 with 128+ CUs is unmeasured and keeps the bands.
+_PLAIN_K2048_SMALL_CU = 128
+_PLAIN_K2048_SMALL_CU_SHORT_MAX_ROWS = 255
+_PLAIN_K2048_SMALL_CU_NARROW_MIN_ROWS = 128
 # On gfx950 the plain dispatch serves every k=2048 row length up to 80 * 1024
 # columns with a register or LDS-tail variant picked from continuous ranges,
 # so the bands above apply only off gfx950.  There plain beat the backend
@@ -712,7 +719,7 @@ def _sampled_takes(
     if device is None:
         device = torch.cuda.current_device()
     if k == 2048 and width < _SAMPLED_MIN_WIDTH and _device_arch(device) == "gfx950":
-        plain_band = _plain_takes(rows, width, k)
+        plain_band = _plain_takes(rows, width, k, device)
         pitch = width if stride0 is None else stride0
         if (plain_band and _plain_multiblock(rows, pitch, k, ragged, device)) or (
             rows <= _PLAIN_K2048_FEW_ROWS and width > _PLAIN_K2048_FEW_ROWS_MAX_WIDTH
@@ -734,9 +741,17 @@ def _stream_small_reject(rows: int, rejects: int) -> bool:
     )
 
 
-def _plain_takes(rows: int, width: int, k: int) -> bool:
+@lru_cache(maxsize=64)
+def _device_cu_num(device: int) -> int:
+    """The CU count of one GPU. Per device, like `_device_arch`."""
+    return torch.cuda.get_device_properties(device).multi_processor_count
+
+
+def _plain_takes(rows: int, width: int, k: int, device: int | None = None) -> bool:
     """Enough rows for the row-scaling selector, on a width it is tuned for."""
-    if k == 2048 and get_gfx_runtime() == "gfx950":
+    if k == 2048 and device is None:
+        device = torch.cuda.current_device()
+    if k == 2048 and _device_arch(device) == "gfx950":
         if width < _PLAIN_K2048_NARROW_WIDTH:
             rejects = width - k
             return rejects > 0 and not (
@@ -747,13 +762,30 @@ def _plain_takes(rows: int, width: int, k: int) -> bool:
             return width <= _PLAIN_K2048_FEW_ROWS_MAX_WIDTH
         return width <= _PLAIN_K2048_MAX_WIDTH
     if k == 2048:
+        small_cu = (
+            _device_arch(device) == "gfx942"
+            and _device_cu_num(device) < _PLAIN_K2048_SMALL_CU
+        )
+        if (
+            small_cu
+            and rows >= _PLAIN_K2048_SMALL_CU_NARROW_MIN_ROWS
+            and width < _PLAIN_K2048_NARROW_WIDTH
+        ):
+            return True
         four_k_lo, four_k_hi = _PLAIN_K2048_4K_BAND
-        if rows <= _PLAIN_K2048_4K_MAX_ROWS and four_k_lo <= width <= four_k_hi:
+        if (small_cu or rows <= _PLAIN_K2048_4K_MAX_ROWS) and (
+            four_k_lo <= width <= four_k_hi
+        ):
             return True
         tiny_lo, tiny_hi = _PLAIN_K2048_TINY_BAND
         if rows <= _PLAIN_K2048_TINY_MAX_ROWS and tiny_lo <= width <= tiny_hi:
             return True
-        if rows <= _PLAIN_K2048_SHORT_MAX_ROWS:
+        short_max_rows = (
+            _PLAIN_K2048_SMALL_CU_SHORT_MAX_ROWS
+            if small_cu
+            else _PLAIN_K2048_SHORT_MAX_ROWS
+        )
+        if rows <= short_max_rows:
             for short_lo, short_hi in _PLAIN_K2048_SHORT_BANDS:
                 if short_lo <= width <= short_hi:
                     return True
@@ -840,7 +872,7 @@ def topk_select_backend(
         stride0=stride0,
     ):
         return "sampled"
-    if "plain" in available and _plain_takes(rows, width, k):
+    if "plain" in available and _plain_takes(rows, width, k, device):
         return "plain"
     if "small_k" in available and k <= _SMALL_K_MAX_K:
         return "small_k"
