@@ -42,7 +42,7 @@ Once prerequisites and public integration pass, recheck external tune jobs
 and idle GPUs and invoke the scheduler directly:
 
 ```bash
-python docs/a8w4_work/run_serial_retune.py --run --gpus 4 5 6 7
+python docs/a8w4_work/run_serial_retune.py --run --gpus 4 5 6 7 --batch 4
 ```
 
 GPU IDs above are examples. Use freshly verified physical HIP IDs and unset
@@ -60,9 +60,12 @@ end before the next fixed-order model starts. No watchdog, reset, kill or
 automatic candidate/shape retry is added.
 
 The fixed order is DeepSeek-V4 → Kimi-K3 → GPT-OSS. Each invokes full search
-with `--timeout 300 --errRatio 0.1 --batch 6`, `--mp` equal to selected GPU
+with `--timeout 300 --errRatio 0.1 --batch 4`, `--mp` equal to selected GPU
 count, and default warmup 5/iters 101. Inputs/reference still prepare per
 candidate. Large sweeps can take a long time; timeout is per candidate.
+The scheduler's `--batch` defaults to 4, following the user's latest request;
+this supersedes the earlier batch 6 specification. Actual batch is recorded
+in every model's startup/completion JSON.
 
 Every model writes tuned/profile/failed_shapes/log and startup/completion
 JSON. Startup JSON exists before the blocking wait and records source hashes,
