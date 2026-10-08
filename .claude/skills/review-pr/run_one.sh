@@ -110,6 +110,11 @@ if [ -d "$W/merge-target" ]; then
 fi
 say "WORK=$W"
 
+# The workflow's timeout-minutes is the real ceiling: AGENT_TIMEOUT x RETRIES x (worker+refuter)
+# can exceed it, and a run killed at the job cap dies mid-agent with no classified status. Cap the
+# retries against a deadline that sits inside it instead.
+DEADLINE=$(( $(date +%s) + ${AITER_RUN_BUDGET:-6000} ))   # 100 min, under the job's 120
+
 # The GLM backend can be slow or time out on a shared box. Give each agent AITER_AGENT_TIMEOUT
 # (default 2400s / 40min). A *timeout* is never retried -- a slow generation is slow on retry too;
 # only a transient failure (dropped connection / 5xx) is retried, up to AITER_REVIEW_RETRIES
@@ -118,6 +123,13 @@ run_agent() {  # <label> <prompt-file> <out-file> <cmd...>
   local label="$1" pf="$2" out="$3"; shift 3
   local n=0 max="${AITER_REVIEW_RETRIES:-2}" rc
   while :; do
+    # Never start an attempt that cannot finish inside the run budget. The job cap would kill it
+    # mid-flight, and a run killed there dies with no classified status at all -- worse than the
+    # timeout it would have reported. Out of budget is a timeout, so say 124 and let the caller
+    # treat it like one.
+    if [ $(( $(date +%s) + ${AITER_AGENT_TIMEOUT:-2400} )) -gt "$DEADLINE" ]; then
+      say "$label: not enough run budget left to start an attempt"; return 124
+    fi
     n=$((n + 1)); rm -f "$out"
     (cd "$PROJ" && timeout "${AITER_AGENT_TIMEOUT:-2400}" "$@" "$(cat "$pf")"); rc=$?
     [ "$rc" -eq 0 ] && [ -s "$out" ] && return 0
@@ -129,9 +141,9 @@ run_agent() {  # <label> <prompt-file> <out-file> <cmd...>
 
 # Triage an agent failure. A timeout is this pipeline's own budget, not a backend fault, so it
 # routes to flow -- a review that needs longer must never page the model owner.
-agent_fail() {  # <label> <rc> <exit-code>
+agent_fail() {  # <label> <rc> <exit-code-for-a-backend-fault>
   if [ "$2" -eq 124 ]; then
-    fail flow "$3" "the $1 did not finish within AITER_AGENT_TIMEOUT=${AITER_AGENT_TIMEOUT:-2400}s; the backend answered normally -- raise it in the runner .env"
+    fail flow 6 "the $1 did not finish within AITER_AGENT_TIMEOUT=${AITER_AGENT_TIMEOUT:-2400}s; the backend answered normally -- raise it in the runner .env"
   fi
   fail glm "$3" "the GLM $1 failed -- the backend errored or returned nothing"
 }
@@ -147,7 +159,17 @@ if grep -qiE '(NO FINDINGS|✅)' "$W/card.md" && ! grep -qE '^(🔴|⚠️|📝)
   printf 'NONE AVAILABLE -- 0 findings on the card (NO FINDINGS); nothing for an independent reader to refute\n' > "$W/independent.txt"
 else
   bash "$SKILL/render.sh" refuter "$W" "$W/card.md" > "$W/_prf.txt"
-  run_agent "refuter" "$W/_prf.txt" "$W/independent.txt" "${REFUTER_CMD[@]}" || agent_fail refuter $? 3
+  run_agent "refuter" "$W/_prf.txt" "$W/independent.txt" "${REFUTER_CMD[@]}"; rc=$?
+  if [ "$rc" -eq 124 ]; then
+    # card.md is already written and the findings are real work; a refuter timeout must not throw
+    # it away. Degrade onto the gate's own "no independent reader" path, which only passes if the
+    # card admits it -- so the downgrade reaches the reader instead of hiding in the log.
+    say "refuter hit the ${AITER_AGENT_TIMEOUT:-2400}s timeout -- publishing the card unrefuted"
+    printf 'NONE AVAILABLE -- the refuter did not finish within %ss on this box\n' "${AITER_AGENT_TIMEOUT:-2400}" > "$W/independent.txt"
+    sed -i '0,/^Review (advisory):/s//Review (advisory, not independently refuted):/' "$W/card.md"
+  elif [ "$rc" -ne 0 ]; then
+    agent_fail refuter "$rc" 3
+  fi
 fi
 
 # 3b) apply the refuter's verdicts: drop KILLED findings from the card before the gates, or the

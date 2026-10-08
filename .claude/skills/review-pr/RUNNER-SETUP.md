@@ -71,3 +71,9 @@ cannot restart itself.
 ## 6. Verify
 
     bash .claude/skills/review-pr/preflight.sh    # all green = @aiter-bot review runs end to end
+
+A change to `run_one.sh` should also pass its own guard, which checks that a timeout still routes
+to `flow` rather than paging the model owner, and that a refuter timeout still publishes the card
+only by admitting it:
+
+    bash .claude/skills/review-pr/selftest.sh
