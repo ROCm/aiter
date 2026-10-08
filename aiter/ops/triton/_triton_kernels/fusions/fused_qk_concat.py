@@ -6,6 +6,29 @@ from aiter.ops.triton._triton_kernels.rope.rope import (
     _get_neox_rotated_x_1D,
 )
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.config_utils import (
+    load_config_json,
+    resolve_config_dir,
+    select_leq_config,
+)
+
+# One config family per kernel, read once at import: torch.compile traces _get_config
+# at every launch and cannot trace the file read. 'None' on arches that ship no table.
+_CONFIG_TABLES = {
+    name: load_config_json(
+        resolve_config_dir("fusions", name) + "/DEFAULT.json", required=False
+    )
+    for name in ("FUSED_QK_CAT", "FUSED_QK_ROPE_CAT")
+}
+
+
+def _get_config(config_name: str, M: int) -> dict:
+    """Launch options from ``config_name`` over ``M`` = B * QH rows: the smallest
+    ``M_LEQ_<x> >= M``, else ``any``. Arches without a table keep Triton's defaults."""
+    table = _CONFIG_TABLES[config_name]
+    if table is None:
+        return {}
+    return select_leq_config(table, M, prefix="M_LEQ_")
 
 
 @triton.jit
