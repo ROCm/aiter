@@ -1602,18 +1602,16 @@ def _flydsl_moe_stage1_impl(
                 (token_num, topk, inter_dim), dtype=torch_out_dtype, device=dev
             )
     elif _v2_output_layout:
-        # Nothing downstream re-checks a caller-provided buffer -- the kernel
-        # takes out.view(-1) -- so an undersized one is an out-of-bounds write
-        # rather than an error. Callers that size their own buffer duplicate
-        # the padding rule above; fail loudly if the two ever diverge.
+        # The kernel writes through out.view(-1), so a wrong-size buffer is an
+        # out-of-bounds write. uint8 is accepted as raw byte storage.
         _expected_shape = (
             max(sorted_token_ids.shape[0], sorted_expert_ids.shape[0] * tile_m),
             inter_dim // 2 if _need_fp4 else inter_dim,
         )
-        if out.dtype != torch_out_dtype:
+        if out.dtype not in (torch_out_dtype, torch.uint8):
             raise ValueError(
                 f"stage1 out has dtype {out.dtype}, "
-                f"but the v2 output layout requires {torch_out_dtype}"
+                f"but the v2 output layout requires {torch_out_dtype} or uint8"
             )
         if tuple(out.shape) != _expected_shape:
             raise ValueError(

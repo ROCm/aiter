@@ -109,11 +109,9 @@ _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "
 # Optional hook for collecting per-stage benchmark callables.
 kernel_bench_callable = None
 
-# FlyDSL v2 stage1 produces an intermediate consumed immediately by stage2.
-# Reuse it across layers and CUDA graphs on the same stream instead of retaining
-# one allocation per layer and captured shape. Separate stream keys preserve
-# correctness for overlapping launches, while exact shape keys keep graph-baked
-# pointers stable.
+# One FlyDSL v2 stage1 intermediate per (device, stream, shape), shared by all MoE
+# layers and graph captures. Graphs captured on one stream share it, so they must
+# not replay concurrently, which a shared graph memory pool already requires.
 _FLYDSL_STAGE1_OUT_CACHE: dict[
     tuple[torch.device, int, tuple[int, int]], torch.Tensor
 ] = {}
