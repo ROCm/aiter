@@ -2721,9 +2721,11 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
     // divergent `if` here put s_and_saveexec right behind the nope store, and
     // EXEC being an operand of that in-flight store it had to drain the whole
     // address queue first -- s_wait_xcnt, 18% of the wave at H=32 T=192 in ATT.
-    auto rope_pe_emit = [&](const PeOperands& o, auto* out_ptr, int row_off, int extent,
-                            float inv_scale, int chunk, bool active) {
-        using o_t = std::remove_pointer_t<decltype(out_ptr)>;
+    // The rotated, converted chunk. `exchange` (a constant at every call)
+    // takes the NEOX partner across lanes rather than from o.y.
+    auto rope_pe_calc = [&](const PeOperands& o, auto* out_tag, float inv_scale, int chunk,
+                            bool exchange) {
+        using o_t = std::remove_pointer_t<decltype(out_tag)>;
         using o_vec_t = opus::vector_t<o_t, VEC>;
         auto cvt = [](float r, float s) -> o_t {
             if constexpr(std::is_same_v<o_t, opus::fp8_t>)
@@ -2732,7 +2734,6 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
                 return static_cast<o_t>(r);
         };
         const int d0 = chunk * VEC;
-        auto out_buf = opus::make_gmem<o_t>(out_ptr, extent * sizeof(o_t));
         o_vec_t vout;
         if constexpr(IS_NEOX)
         {
@@ -2744,7 +2745,7 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
             // the exchange does not force a wait on x before the nope loads go
             // out. Partners share a PE_CHUNKS-lane group on every caller.
             in_vec_t y = o.y;
-            if constexpr(PE_EXCHANGE)
+            if(PE_EXCHANGE && exchange)
             {
                 constexpr int PARTNER = HALF / VEC;
                 using u32x4 = uint32_t __attribute__((ext_vector_type(4)));
@@ -2782,7 +2783,15 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
                 vout[2 * k + 1] = cvt(b * cv + a * sv, inv_scale);
             }
         }
-        out_buf.template store<VEC, o_vec_t>(vout, active ? row_off + d0 : extent);
+        return vout;
+    };
+    auto rope_pe_emit = [&](const PeOperands& o, auto* out_ptr, int row_off, int extent,
+                            float inv_scale, int chunk, bool active) {
+        using o_t     = std::remove_pointer_t<decltype(out_ptr)>;
+        using o_vec_t = opus::vector_t<o_t, VEC>;
+        auto out_buf  = opus::make_gmem<o_t>(out_ptr, extent * sizeof(o_t));
+        out_buf.template store<VEC, o_vec_t>(rope_pe_calc(o, out_ptr, inv_scale, chunk, true),
+                                             active ? row_off + chunk * VEC : extent);
     };
 
     auto rope_pe_seg = [&](const scalar_t* pe_ptr, cache_t* out_ptr, float inv_scale) {
@@ -2820,110 +2829,218 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
     // with more threads instead made it thread-derived, pushed the address
     // chain into VGPRs and measured slower at every width.
 #if defined(__gfx1250__)
-    // gfx1250, eight heads: stage Q through the tensor engine. Each wave owns
-    // half the nope columns of all eight heads plus four heads' pe rows, and
-    // issues them as two tiles (256 x 8 and 64 x 4) -- within the three tensor
-    // ops a wave can hold in flight. A wave consumes only what it staged, so
-    // there is no block barrier, just the tensor wait. The host sizes the
-    // dynamic LDS to match (two waves x WAVE_ELEMS).
+    // gfx1250: stage Q through the tensor engine, within the three tensor ops
+    // a wave can hold in flight. A wave consumes only what it staged, so there
+    // is no block barrier, just the tensor wait. The host sizes the dynamic
+    // LDS to match (two waves x WAVE_ELEMS, the same for both layouts at
+    // eight heads).
+    //
+    // Per-entry layout, eight heads, contiguous q_out rows: each wave owns
+    // four whole heads -- a nope tile (512 x 4) and a pe tile (64 x 4) --
+    // converts them in place into q_out's row layout, and stores from there
+    // in address order, nine contiguous 256 B runs. Stored per head (nope by
+    // column, pe by chunk), the 576-element rows split their 128 B lines
+    // across stores and waves, and GL2 sent 3.6x the write requests and 1.8x
+    // the reads to memory (H=128 T=4096 68.3 -> 59.8 us, T=1536 26.4 -> 24.7
+    // us).
     if constexpr(((AITER_MLA_SEG_TDM_HPT_MASK >> HPT) & 1) != 0)
     {
-        constexpr int W          = 32;
-        constexpr int COLS       = KV_LORA / 2;
-        // pe lanes are threadIdx.x / PE_CHUNKS, so a wave's 32 lanes carry at
-        // most four heads' pe: all of them in wave 0 for HPT <= 4, four each
-        // for HPT == 8.
-        constexpr int PE_ROWS    = HPT < 4 ? HPT : 4;
-        constexpr int WAVE_ELEMS = HPT * COLS + PE_ROWS * PE_DIM;
-        static_assert(NUM_VEC == 2 * W && COLS == W * VEC && 4 * PE_CHUNKS == W);
-        extern __shared__ char mla_seg_lds[];
-        using NopeWin = opus::tdm<scalar_t, opus::seq<COLS, HPT>>;
-        using PeWin   = opus::tdm<scalar_t, opus::seq<PE_DIM, PE_ROWS>>;
+        if(PAGE_SIZE == 0 && HPT == 8 && q_out_stride_1 == KV_LORA + PE_DIM)
+        {
+            if constexpr(PAGE_SIZE == 0 && HPT == 8)
+            {
+                static_assert(sizeof(query_t) <= sizeof(scalar_t));
+                constexpr int W          = 32;
+                constexpr int ROWS       = HPT / 2;
+                constexpr int ROW        = KV_LORA + PE_DIM;
+                constexpr int WAVE_ELEMS = ROWS * ROW;
+                constexpr int ROW_CH     = ROW / VEC; // output chunks per head
+                static_assert(NUM_VEC == 2 * W && ROWS * PE_CHUNKS == W &&
+                              ROWS * ROW_CH % W == 0);
+                extern __shared__ char mla_seg_lds[];
+                using NopeWin = opus::tdm<scalar_t, opus::seq<KV_LORA, ROWS>>;
+                using PeWin   = opus::tdm<scalar_t, opus::seq<PE_DIM, ROWS>>;
 #if defined(__HIP_DEVICE_COMPILE__)
-        const int wave = __builtin_amdgcn_readfirstlane(threadIdx.x / W);
+                const int wave = __builtin_amdgcn_readfirstlane(threadIdx.x / W);
 #else
-        const int wave = threadIdx.x / W;
+                const int wave = threadIdx.x / W;
 #endif
-        const opus::u32_t lds_base =
-            static_cast<opus::u32_t>(reinterpret_cast<__UINTPTR_TYPE__>(mla_seg_lds));
-        const opus::u32_t wave_off = static_cast<opus::u32_t>(wave * WAVE_ELEMS);
+                const int wave_head = head_base + wave * ROWS;
+                const opus::u32_t lds_base =
+                    static_cast<opus::u32_t>(reinterpret_cast<__UINTPTR_TYPE__>(mla_seg_lds));
+                const opus::u32_t wave_off = static_cast<opus::u32_t>(wave * WAVE_ELEMS);
 
-        auto wn = opus::make_tdm<NopeWin>(lds_base, q_nope + token_idx * q_nope_stride_0,
-                                          KV_LORA, num_heads, q_nope_stride_1,
-                                          wave * COLS, head_base);
-        wn.async_load(wave_off);
-        const bool wave_has_pe = wave * PE_ROWS < HPT;
-        if(wave_has_pe)
-        {
-            auto wp = opus::make_tdm<PeWin>(lds_base, q_pe + token_idx * q_pe_stride_0,
-                                            PE_DIM, num_heads, q_pe_stride_1,
-                                            0, head_base + wave * PE_ROWS);
-            wp.async_load(wave_off + HPT * COLS);
-        }
+                auto wn =
+                    opus::make_tdm<NopeWin>(lds_base, q_nope + token_idx * q_nope_stride_0,
+                                            KV_LORA, num_heads, q_nope_stride_1, 0, wave_head);
+                wn.async_load(wave_off);
+                auto wp = opus::make_tdm<PeWin>(lds_base, q_pe + token_idx * q_pe_stride_0, PE_DIM,
+                                                num_heads, q_pe_stride_1, 0, wave_head);
+                wp.async_load(wave_off + ROWS * KV_LORA);
 
-        // cos/sin go the ordinary way, issued while the tiles are in flight.
-        const int pe_row   = (threadIdx.x % W) / PE_CHUNKS;
-        const int pe_chunk = threadIdx.x % PE_CHUNKS;
-        const int d0       = pe_chunk * VEC;
-        PeOperands pe_op{};
-        if constexpr(IS_NEOX)
-        {
-            const int cidx = d0 < HALF ? d0 : d0 - HALF;
-            pe_op.c        = cos_buf.template load<VEC>(cos_row + cidx);
-            pe_op.s        = sin_buf.template load<VEC>(sin_row + cidx);
+                // cos/sin go the ordinary way, issued while the tiles are in flight.
+                const int lane     = threadIdx.x % W;
+                const int pe_r     = lane / PE_CHUNKS;
+                const int pe_chunk = lane % PE_CHUNKS;
+                const int d0       = pe_chunk * VEC;
+                PeOperands pe_op{};
+                if constexpr(IS_NEOX)
+                {
+                    const int cidx = d0 < HALF ? d0 : d0 - HALF;
+                    pe_op.c        = cos_buf.template load<VEC>(cos_row + cidx);
+                    pe_op.s        = sin_buf.template load<VEC>(sin_row + cidx);
+                }
+                else
+                {
+                    pe_op.c = cos_buf.template load<VEC / 2>(cos_row + d0 / 2);
+                    pe_op.s = sin_buf.template load<VEC / 2>(sin_row + d0 / 2);
+                }
+                const float inv_qscale = 1.0f / (*q_scale);
+                opus::s_wait_tensorcnt<0>();
+
+                const __UINTPTR_TYPE__ lds =
+                    reinterpret_cast<__UINTPTR_TYPE__>(mla_seg_lds) + wave_off * sizeof(scalar_t);
+                auto lds_in = [&](int elem) -> in_vec_t {
+                    return *reinterpret_cast<const OPUS_LDS_ADDR in_vec_t*>(
+                        lds + elem * sizeof(scalar_t));
+                };
+                auto lds_out = [&](int elem) -> OPUS_LDS_ADDR q_vec_t* {
+                    return reinterpret_cast<OPUS_LDS_ADDR q_vec_t*>(lds + elem * sizeof(query_t));
+                };
+                // Lane chunk i * W + lane of the nope tile: head i / 2, a whole row
+                // per two chunks since NUM_VEC == 2 * W.
+                in_vec_t nope_in[2 * ROWS];
+#pragma unroll
+                for(int i = 0; i < 2 * ROWS; ++i)
+                    nope_in[i] = lds_in((i / 2) * KV_LORA + ((i % 2) * W + lane) * VEC);
+                pe_op.x = lds_in(ROWS * KV_LORA + pe_r * PE_DIM + d0);
+                if constexpr(IS_NEOX)
+                    pe_op.y = lds_in(ROWS * KV_LORA + pe_r * PE_DIM + (d0 ^ HALF));
+                // Every staged read precedes the first in-place write.
+#pragma unroll
+                for(int i = 0; i < 2 * ROWS; ++i)
+                    *lds_out((i / 2) * ROW + NOPE_OFF + ((i % 2) * W + lane) * VEC) =
+                        cvt_vec(nope_in[i], inv_qscale, q_out);
+                *lds_out(pe_r * ROW + PE_OFF + d0) =
+                    rope_pe_calc(pe_op, q_out, inv_qscale, pe_chunk, false);
+
+                // The rows are contiguous, so chunk j of the wave's heads, at LDS
+                // element j * VEC, goes to the same offset in q_out.
+                auto out_buf =
+                    opus::make_gmem<query_t>(q_out + token_idx * q_out_stride_0 + wave_head * ROW,
+                                             ROWS * ROW * sizeof(query_t));
+#pragma unroll
+                for(int i = 0; i < ROWS * ROW_CH / W; ++i)
+                    out_buf.template store<VEC, q_vec_t>(*lds_out((i * W + lane) * VEC),
+                                                         (i * W + lane) * VEC);
+            }
         }
+        // Otherwise each wave owns half the nope columns of every head plus up
+        // to four heads' pe rows, as two tiles (256 x HPT and 64 x PE_ROWS).
+        // Two heads a wave are too few for the in-order store to pay (H=16
+        // T=1536, H=128 T=192: +4..5%), and padded rows break the address
+        // order, leaving the staging pure latency (768-wide rows, H=128
+        // T=4096: 72.1 us against 68.9 per head). The segmented layout's
+        // q_out is padded, and even the untaken branch cost it 1.5..3%.
         else
         {
-            pe_op.c = cos_buf.template load<VEC / 2>(cos_row + d0 / 2);
-            pe_op.s = sin_buf.template load<VEC / 2>(sin_row + d0 / 2);
-        }
-        const float inv_qscale = 1.0f / (*q_scale);
-        opus::s_wait_tensorcnt<0>();
-        // One head per block defers the padded-token return until the loads
-        // are out (see slot_idx); it must also wait for them, or the block
-        // could retire with a tensor DMA still writing its LDS.
-        if constexpr(HPT == 1)
-        {
-            if(slot_idx < 0 && !compute_all_q_rope)
-                return;
-        }
+            constexpr int W          = 32;
+            constexpr int COLS       = KV_LORA / 2;
+            // pe lanes are threadIdx.x / PE_CHUNKS, so a wave's 32 lanes carry at
+            // most four heads' pe: all of them in wave 0 for HPT <= 4, four each
+            // for HPT == 8.
+            constexpr int PE_ROWS    = HPT < 4 ? HPT : 4;
+            constexpr int WAVE_ELEMS = HPT * COLS + PE_ROWS * PE_DIM;
+            static_assert(NUM_VEC == 2 * W && COLS == W * VEC && 4 * PE_CHUNKS == W);
+            extern __shared__ char mla_seg_lds[];
+            using NopeWin = opus::tdm<scalar_t, opus::seq<COLS, HPT>>;
+            using PeWin   = opus::tdm<scalar_t, opus::seq<PE_DIM, PE_ROWS>>;
+#if defined(__HIP_DEVICE_COMPILE__)
+            const int wave = __builtin_amdgcn_readfirstlane(threadIdx.x / W);
+#else
+            const int wave = threadIdx.x / W;
+#endif
+            const opus::u32_t lds_base =
+                static_cast<opus::u32_t>(reinterpret_cast<__UINTPTR_TYPE__>(mla_seg_lds));
+            const opus::u32_t wave_off = static_cast<opus::u32_t>(wave * WAVE_ELEMS);
 
-        const __UINTPTR_TYPE__ lds = reinterpret_cast<__UINTPTR_TYPE__>(mla_seg_lds);
-        auto lds_vec = [&](int elem) -> in_vec_t {
-            return *reinterpret_cast<const OPUS_LDS_ADDR in_vec_t*>(
-                lds + static_cast<__UINTPTR_TYPE__>(wave_off + elem) * sizeof(scalar_t));
-        };
-        const int col = (threadIdx.x % W) * VEC;
-        // Every head is converted before any is stored. Converted and stored
-        // one at a time, each head's store data landed in the registers the
-        // next head's was about to use, and the wave sat in s_wait_xcnt behind
-        // every store until the memory pipe had read it out.
-        q_vec_t nope_out[HPT];
+            auto wn = opus::make_tdm<NopeWin>(lds_base, q_nope + token_idx * q_nope_stride_0,
+                                              KV_LORA, num_heads, q_nope_stride_1,
+                                              wave * COLS, head_base);
+            wn.async_load(wave_off);
+            const bool wave_has_pe = wave * PE_ROWS < HPT;
+            if(wave_has_pe)
+            {
+                auto wp = opus::make_tdm<PeWin>(lds_base, q_pe + token_idx * q_pe_stride_0,
+                                                PE_DIM, num_heads, q_pe_stride_1,
+                                                0, head_base + wave * PE_ROWS);
+                wp.async_load(wave_off + HPT * COLS);
+            }
+
+            // cos/sin go the ordinary way, issued while the tiles are in flight.
+            const int pe_row   = (threadIdx.x % W) / PE_CHUNKS;
+            const int pe_chunk = threadIdx.x % PE_CHUNKS;
+            const int d0       = pe_chunk * VEC;
+            PeOperands pe_op{};
+            if constexpr(IS_NEOX)
+            {
+                const int cidx = d0 < HALF ? d0 : d0 - HALF;
+                pe_op.c        = cos_buf.template load<VEC>(cos_row + cidx);
+                pe_op.s        = sin_buf.template load<VEC>(sin_row + cidx);
+            }
+            else
+            {
+                pe_op.c = cos_buf.template load<VEC / 2>(cos_row + d0 / 2);
+                pe_op.s = sin_buf.template load<VEC / 2>(sin_row + d0 / 2);
+            }
+            const float inv_qscale = 1.0f / (*q_scale);
+            opus::s_wait_tensorcnt<0>();
+            // One head per block defers the padded-token return until the loads
+            // are out (see slot_idx); it must also wait for them, or the block
+            // could retire with a tensor DMA still writing its LDS.
+            if constexpr(HPT == 1)
+            {
+                if(slot_idx < 0 && !compute_all_q_rope)
+                    return;
+            }
+
+            const __UINTPTR_TYPE__ lds = reinterpret_cast<__UINTPTR_TYPE__>(mla_seg_lds);
+            auto lds_vec = [&](int elem) -> in_vec_t {
+                return *reinterpret_cast<const OPUS_LDS_ADDR in_vec_t*>(
+                    lds + static_cast<__UINTPTR_TYPE__>(wave_off + elem) * sizeof(scalar_t));
+            };
+            const int col = (threadIdx.x % W) * VEC;
+            // Every head is converted before any is stored. Converted and stored
+            // one at a time, each head's store data landed in the registers the
+            // next head's was about to use, and the wave sat in s_wait_xcnt behind
+            // every store until the memory pipe had read it out.
+            q_vec_t nope_out[HPT];
 #pragma unroll
-        for(int k = 0; k < HPT; ++k)
-            nope_out[k] = cvt_vec(lds_vec(k * COLS + col), inv_qscale, q_out);
-        query_t* q_out_tok = q_out + token_idx * q_out_stride_0;
+            for(int k = 0; k < HPT; ++k)
+                nope_out[k] = cvt_vec(lds_vec(k * COLS + col), inv_qscale, q_out);
+            query_t* q_out_tok = q_out + token_idx * q_out_stride_0;
 #pragma unroll
-        for(int k = 0; k < HPT; ++k)
-        {
-            auto out_buf = opus::make_gmem<query_t>(
-                q_out_tok + (head_base + k) * q_out_stride_1 + NOPE_OFF,
-                KV_LORA * sizeof(query_t));
-            out_buf.template store<VEC, q_vec_t>(nope_out[k], wave * COLS + col);
-        }
-        {
-            const bool pe_active = wave * PE_ROWS + pe_row < HPT;
-            const int  pe_r      = pe_active ? pe_row : 0; // keep the LDS read in range
-            pe_op.x = lds_vec(HPT * COLS + pe_r * PE_DIM + d0);
-            // Without the lane exchange rope_pe_emit reads the NEOX partner
-            // from o.y; here it is the same staged row, HALF elements over.
-            if constexpr(IS_NEOX && !PE_EXCHANGE)
-                pe_op.y = lds_vec(HPT * COLS + pe_r * PE_DIM + (d0 ^ HALF));
-            rope_pe_emit(pe_op,
-                         q_out_tok + (head_base + wave * PE_ROWS) * q_out_stride_1 + PE_OFF,
-                         static_cast<int>(pe_r * q_out_stride_1),
-                         static_cast<int>((PE_ROWS - 1) * q_out_stride_1) + PE_DIM,
-                         inv_qscale, pe_chunk, pe_active);
+            for(int k = 0; k < HPT; ++k)
+            {
+                auto out_buf = opus::make_gmem<query_t>(
+                    q_out_tok + (head_base + k) * q_out_stride_1 + NOPE_OFF,
+                    KV_LORA * sizeof(query_t));
+                out_buf.template store<VEC, q_vec_t>(nope_out[k], wave * COLS + col);
+            }
+            {
+                const bool pe_active = wave * PE_ROWS + pe_row < HPT;
+                const int  pe_r      = pe_active ? pe_row : 0; // keep the LDS read in range
+                pe_op.x = lds_vec(HPT * COLS + pe_r * PE_DIM + d0);
+                // Without the lane exchange rope_pe_emit reads the NEOX partner
+                // from o.y; here it is the same staged row, HALF elements over.
+                if constexpr(IS_NEOX && !PE_EXCHANGE)
+                    pe_op.y = lds_vec(HPT * COLS + pe_r * PE_DIM + (d0 ^ HALF));
+                rope_pe_emit(pe_op,
+                             q_out_tok + (head_base + wave * PE_ROWS) * q_out_stride_1 + PE_OFF,
+                             static_cast<int>(pe_r * q_out_stride_1),
+                             static_cast<int>((PE_ROWS - 1) * q_out_stride_1) + PE_DIM,
+                             inv_qscale, pe_chunk, pe_active);
+            }
         }
     }
     else
