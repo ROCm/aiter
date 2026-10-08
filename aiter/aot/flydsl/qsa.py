@@ -12,11 +12,15 @@ by the AOT collector.
 
 from __future__ import annotations
 
+import os
 import time
+from contextlib import contextmanager
 
 import torch
 
-from aiter.aot.flydsl.common import compile_only_env
+from aiter.aot.flydsl.common import compile_only_env, override_env
+
+_QSA_ARCHS = ("gfx942", "gfx950")
 
 # (kernel_name, op, m, seq_len). K2 width and head counts are family A.
 _FAMILY_A_LAUNCHES = (
@@ -66,6 +70,81 @@ def default_jobs(launches=_FAMILY_A_LAUNCHES):
     return jobs
 
 
+def _qsa_aot_targets() -> list[tuple[str, int]]:
+    """Archs this job compiles, with the CU count that selects the tile.
+
+    ``GPU_ARCHS`` is the wheel list. CI sets ``gfx942;gfx950`` and the
+    container has no device, so that list is the whole answer. Without
+    it, a visible GPU compiles its own arch and CU count. With neither,
+    both supported archs use the full-chip counts.
+    """
+    from aiter.jit.utils.build_targets import GFX_CU_NUM_MAP
+
+    raw = os.environ.get("GPU_ARCHS", "").strip()
+    if raw and raw.lower() != "native":
+        archs = [part.strip() for part in raw.split(";") if part.strip() in _QSA_ARCHS]
+        if not archs:
+            raise RuntimeError(
+                f"GPU_ARCHS={raw!r} names no QSA arch ({', '.join(_QSA_ARCHS)})"
+            )
+        if len(archs) == 1 and os.environ.get("CU_NUM"):
+            return [(archs[0], int(os.environ["CU_NUM"]))]
+        return [(arch, GFX_CU_NUM_MAP[arch]) for arch in archs]
+    if torch.cuda.is_available():
+        from aiter.jit.utils.chip_info import get_cu_num
+        from aiter.ops.flydsl.kernels.qsa.arch import qsa_device_arch
+
+        arch = qsa_device_arch(torch.cuda.get_device_properties(0).gcnArchName)
+        return [(arch, int(get_cu_num()))]
+    return [(arch, GFX_CU_NUM_MAP[arch]) for arch in _QSA_ARCHS]
+
+
+@contextmanager
+def _qsa_compile_device(arch: str, cu_num: int):
+    """Present ``arch`` to the QSA wrappers without allocating a device buffer.
+
+    The wrappers read ``gcnArchName`` and, on gfx942, the CU count. Fake
+    tensors satisfy the CUDA checks. ``COMPILE_ONLY`` never launches, so
+    the stream is only a value the launcher records.
+    """
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    from aiter.jit.utils.chip_info import get_cu_num
+
+    class _Props:
+        gcnArchName = arch
+
+    class _Stream:
+        cuda_stream = 0
+
+    saved = (
+        torch.cuda.get_device_properties,
+        torch.cuda.current_stream,
+        torch.cuda.is_current_stream_capturing,
+    )
+    torch.cuda.get_device_properties = lambda device=None: _Props()
+    torch.cuda.current_stream = lambda device=None: _Stream()
+    torch.cuda.is_current_stream_capturing = lambda: False
+    try:
+        with (
+            FakeTensorMode(),
+            override_env("ARCH", arch),
+            override_env("FLYDSL_GPU_ARCH", arch),
+            override_env("CU_NUM", str(cu_num)),
+        ):
+            get_cu_num.cache_clear()
+            try:
+                yield
+            finally:
+                get_cu_num.cache_clear()
+    finally:
+        (
+            torch.cuda.get_device_properties,
+            torch.cuda.current_stream,
+            torch.cuda.is_current_stream_capturing,
+        ) = saved
+
+
 def _compile_k1(job):
     from aiter import dtypes
     from aiter.ops.flydsl.qsa import qsa_k1_block_ids
@@ -78,15 +157,24 @@ def _compile_k1(job):
     head_dim = job["head_dim"]
     n_blocks = seq_len // job["compress_ratio"]
     n_pages = n_blocks // page
-    q = torch.empty(rows, heads, head_dim, dtype=dtypes.bf16, device=device)
-    k_cache = torch.empty(
-        n_pages, page, job["kv_heads"], head_dim, dtype=dtypes.bf16, device=device
-    )
-    table = torch.zeros(1, n_pages, dtype=dtypes.i32, device=device)
-    qpos = torch.zeros(rows, dtype=dtypes.i32, device=device)
-    slen = torch.full((1,), seq_len, dtype=dtypes.i32, device=device)
-    token_to_req = torch.zeros(rows, dtype=dtypes.i32, device=device)
-    qsa_k1_block_ids(q, k_cache, table, token_to_req, qpos, slen, heads=(heads,))
+    for arch, cu_num in _qsa_aot_targets():
+        with _qsa_compile_device(arch, cu_num):
+            q = torch.empty(rows, heads, head_dim, dtype=dtypes.bf16, device=device)
+            k_cache = torch.empty(
+                n_pages,
+                page,
+                job["kv_heads"],
+                head_dim,
+                dtype=dtypes.bf16,
+                device=device,
+            )
+            table = torch.zeros(1, n_pages, dtype=dtypes.i32, device=device)
+            qpos = torch.zeros(rows, dtype=dtypes.i32, device=device)
+            slen = torch.full((1,), seq_len, dtype=dtypes.i32, device=device)
+            token_to_req = torch.zeros(rows, dtype=dtypes.i32, device=device)
+            qsa_k1_block_ids(
+                q, k_cache, table, token_to_req, qpos, slen, heads=(heads,)
+            )
 
 
 def _compile_k2(job):
@@ -100,16 +188,18 @@ def _compile_k2(job):
     hq, hkv, head_dim = job["hq"], job["hkv"], job["head_dim"]
     width = job["width"]
     n_pages = (seq_len + page - 1) // page
-    q = torch.empty(rows, hq, head_dim, dtype=dtypes.bf16, device=device)
-    k_cache = torch.empty(
-        n_pages, page, hkv, head_dim, dtype=dtypes.bf16, device=device
-    )
-    v_cache = torch.empty_like(k_cache)
-    table = torch.zeros(1, n_pages, dtype=dtypes.i32, device=device)
-    indices = torch.zeros(rows, width, dtype=dtypes.i32, device=device)
-    indices[:, -1] = -1
-    token_to_req = torch.zeros(rows, dtype=dtypes.i32, device=device)
-    qsa_k2(q, k_cache, v_cache, indices, table, token_to_req)
+    for arch, cu_num in _qsa_aot_targets():
+        with _qsa_compile_device(arch, cu_num):
+            q = torch.empty(rows, hq, head_dim, dtype=dtypes.bf16, device=device)
+            k_cache = torch.empty(
+                n_pages, page, hkv, head_dim, dtype=dtypes.bf16, device=device
+            )
+            v_cache = torch.empty_like(k_cache)
+            table = torch.zeros(1, n_pages, dtype=dtypes.i32, device=device)
+            indices = torch.zeros(rows, width, dtype=dtypes.i32, device=device)
+            indices[:, -1] = -1
+            token_to_req = torch.zeros(rows, dtype=dtypes.i32, device=device)
+            qsa_k2(q, k_cache, v_cache, indices, table, token_to_req)
 
 
 def compile_one_config(**job) -> dict:
