@@ -389,13 +389,6 @@ def get_pid():
     return mp.current_process().pid
 
 
-def _resolve_tuner_process_count(gpu_count, requested_processes):
-    """Use one tuner process per selected GPU."""
-    if requested_processes < 1 or requested_processes > gpu_count:
-        return gpu_count
-    return requested_processes
-
-
 def mp_tuner(
     tasks,
     in_datas,
@@ -426,7 +419,8 @@ def mp_tuner(
     """
     gpu_num = torch.cuda.device_count()
     mp.set_start_method("spawn", force=True)
-    mp_num = _resolve_tuner_process_count(gpu_num, mp_num)
+    mp_num = gpu_num if mp_num < 1 or mp_num > gpu_num else mp_num
+    parallel_num = mp_num
     start_idx = 0
     if not tasks:
         return []
@@ -495,7 +489,7 @@ def mp_tuner(
     task_start_times = mp.RawArray("d", len(task_group))
     task_pids = mp.RawArray("i", len(task_group))
     pool = mp.Pool(
-        processes=mp_num,
+        processes=parallel_num,
         initializer=_init_task_start_times,
         initargs=(task_start_times, task_pids),
     )
@@ -687,7 +681,7 @@ def mp_tuner(
                 print(f"Warning: Error during pool termination: {e}", flush=True)
             # Create new pool
             pool = mp.Pool(
-                processes=mp_num,
+                processes=parallel_num,
                 initializer=_init_task_start_times,
                 initargs=(task_start_times, task_pids),
             )

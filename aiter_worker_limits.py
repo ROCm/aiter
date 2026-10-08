@@ -187,10 +187,6 @@ def _cgroup_directories(controller: str) -> list[tuple[str, str]]:
     return directories
 
 
-def _cgroup_memory_directories() -> list[tuple[str, str]]:
-    return _cgroup_directories("memory")
-
-
 def _cgroup_cpu_quota() -> Fraction | None:
     """Return the tightest readable quota/period across visible CPU ancestors.
 
@@ -226,7 +222,7 @@ def _cgroup_memory_bound() -> tuple[int | None, dict[str, object] | None]:
     """Return the tightest finite remaining-memory bound across cgroup ancestors."""
     remaining = None
     best_observation = None
-    for version, directory in _cgroup_memory_directories():
+    for version, directory in _cgroup_directories("memory"):
         if version == "v2":
             limit_path = os.path.join(directory, "memory.max")
             usage_path = os.path.join(directory, "memory.current")
@@ -361,16 +357,10 @@ def _maybe_log_cgroup_memory_diagnostic(
     )
 
 
-def _available_memory_bounds() -> tuple[int, int | None, dict[str, object] | None]:
-    """Return memory bounds and the observation used to calculate the cgroup bound."""
-    host_available = _host_available_memory_bytes()
-    cgroup_remaining, observation = _cgroup_memory_bound()
-    return host_available, cgroup_remaining, observation
-
-
 def _automatic_worker_snapshot() -> tuple[int, int, dict[str, object] | None]:
     cpu_budget = get_cpu_worker_budget()
-    host_available, cgroup_remaining, observation = _available_memory_bounds()
+    host_available = _host_available_memory_bytes()
+    cgroup_remaining, observation = _cgroup_memory_bound()
     available_memory = (
         host_available
         if cgroup_remaining is None
@@ -526,11 +516,11 @@ def get_gpu_worker_count(work_count: int, device_count: int) -> int:
     Callers supply the number of devices they distribute workers across,
     using ``torch.cuda.device_count()`` for all visible GPUs. GPU execution
     uses a per-device allowance instead of the host CPU or memory budget.
-    ``AITER_MAX_JOBS`` and submitted work still cap the result. A zero-device
-    count retains the CPU policy for callers that support CPU-only work.
+    ``AITER_MAX_JOBS`` and submitted work still cap the result. At least one
+    visible GPU is required.
     """
     if device_count <= 0:
-        return get_worker_count_for(work_count)
+        raise RuntimeError("GPU execution requires at least one visible GPU")
     budget = device_count * _gpu_workers_per_device()
     ceiling = _env_ceiling(_WORKER_ENV)
     if ceiling is not None:

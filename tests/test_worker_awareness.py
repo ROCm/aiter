@@ -31,6 +31,23 @@ class WorkerAwarenessTest(unittest.TestCase):
         quota.start()
         self.addCleanup(quota.stop)
 
+    def cgroup_files(self, files):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = pathlib.Path(temporary.name)
+        for name, contents in files.items():
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(contents.format(root=root))
+        for attribute, filename in (
+            ("_PROC_SELF_CGROUP_PATH", "membership"),
+            ("_PROC_SELF_MOUNTINFO_PATH", "mountinfo"),
+        ):
+            mocked = patch.object(worker_limits, attribute, str(root / filename))
+            mocked.start()
+            self.addCleanup(mocked.stop)
+        return root
+
     def test_worker_count_accepts_no_per_caller_default(self):
         self.assertEqual(tuple(inspect.signature(get_worker_count).parameters), ())
 
@@ -60,31 +77,23 @@ class WorkerAwarenessTest(unittest.TestCase):
             worker_limits, "get_cpu_worker_budget", return_value=6
         ), patch.object(
             worker_limits,
-            "_available_memory_bounds",
-            return_value=(3 * worker_limits.EST_WORKER_RSS_BYTES, None, None),
+            "_host_available_memory_bytes",
+            return_value=3 * worker_limits.EST_WORKER_RSS_BYTES,
+        ), patch.object(
+            worker_limits, "_cgroup_memory_bound", return_value=(None, None)
         ):
             self.assertEqual(worker_limits._automatic_worker_snapshot(), (6, 3, None))
 
     def test_v2_cgroup_membership_maps_to_current_and_parent_directories(self):
-        with tempfile.TemporaryDirectory() as tempdir:
-            root = pathlib.Path(tempdir)
-            mount_point = root / "cgroup"
-            mount_point.mkdir()
-            cgroup_file = root / "cgroup.txt"
-            mountinfo_file = root / "mountinfo.txt"
-            cgroup_file.write_text("0::/jobs/worker\n")
-            mountinfo_file.write_text(
-                f"36 25 0:32 / {mount_point} rw - cgroup2 none rw\n"
-            )
-            with patch.object(
-                worker_limits, "_PROC_SELF_CGROUP_PATH", str(cgroup_file)
-            ), patch.object(
-                worker_limits, "_PROC_SELF_MOUNTINFO_PATH", str(mountinfo_file)
-            ):
-                directories = worker_limits._cgroup_memory_directories()
-
+        root = self.cgroup_files(
+            {
+                "membership": "0::/jobs/worker\n",
+                "mountinfo": "36 25 0:32 / {root}/cgroup rw - cgroup2 none rw\n",
+            }
+        )
+        mount_point = root / "cgroup"
         self.assertEqual(
-            directories,
+            worker_limits._cgroup_directories("memory"),
             [
                 ("v2", str(mount_point / "jobs/worker")),
                 ("v2", str(mount_point / "jobs")),
@@ -93,25 +102,15 @@ class WorkerAwarenessTest(unittest.TestCase):
         )
 
     def test_v1_memory_controller_membership_respects_mount_root(self):
-        with tempfile.TemporaryDirectory() as tempdir:
-            root = pathlib.Path(tempdir)
-            mount_point = root / "memory"
-            mount_point.mkdir()
-            cgroup_file = root / "cgroup.txt"
-            mountinfo_file = root / "mountinfo.txt"
-            cgroup_file.write_text("5:cpu,memory:/docker/worker\n")
-            mountinfo_file.write_text(
-                f"29 23 0:26 /docker {mount_point} rw - cgroup cgroup rw,memory\n"
-            )
-            with patch.object(
-                worker_limits, "_PROC_SELF_CGROUP_PATH", str(cgroup_file)
-            ), patch.object(
-                worker_limits, "_PROC_SELF_MOUNTINFO_PATH", str(mountinfo_file)
-            ):
-                directories = worker_limits._cgroup_memory_directories()
-
+        root = self.cgroup_files(
+            {
+                "membership": "5:cpu,memory:/docker/worker\n",
+                "mountinfo": "29 23 0:26 /docker {root}/memory rw - cgroup cgroup rw,memory\n",
+            }
+        )
+        mount_point = root / "memory"
         self.assertEqual(
-            directories,
+            worker_limits._cgroup_directories("memory"),
             [
                 ("v1", str(mount_point / "worker")),
                 ("v1", str(mount_point)),
@@ -119,37 +118,21 @@ class WorkerAwarenessTest(unittest.TestCase):
         )
 
     def test_hybrid_cgroup_mounts_all_contribute_memory_directories(self):
-        with tempfile.TemporaryDirectory() as tempdir:
-            root = pathlib.Path(tempdir)
-            v2_mount = root / "unified"
-            v1_mount = root / "memory"
-            v2_mount.mkdir()
-            v1_mount.mkdir()
-            v2_current = v2_mount / "container"
-            v1_current = v1_mount / "container"
-            v2_current.mkdir()
-            v1_current.mkdir()
-            (v2_current / "memory.max").write_text(str(16 * 1024**3))
-            (v2_current / "memory.current").write_text(str(1 * 1024**3))
-            (v1_current / "memory.limit_in_bytes").write_text(str(8 * 1024**3))
-            (v1_current / "memory.usage_in_bytes").write_text(str(7 * 1024**3))
-            cgroup_file = root / "cgroup.txt"
-            mountinfo_file = root / "mountinfo.txt"
-            cgroup_file.write_text("0::/container\n5:memory:/container\n")
-            mountinfo_file.write_text(
-                f"36 25 0:32 / {v2_mount} rw - cgroup2 none rw\n"
-                f"29 23 0:26 / {v1_mount} rw - cgroup cgroup rw,memory\n"
-            )
-            with patch.object(
-                worker_limits, "_PROC_SELF_CGROUP_PATH", str(cgroup_file)
-            ), patch.object(
-                worker_limits, "_PROC_SELF_MOUNTINFO_PATH", str(mountinfo_file)
-            ):
-                directories = worker_limits._cgroup_memory_directories()
-                remaining, _ = worker_limits._cgroup_memory_bound()
-
+        root = self.cgroup_files(
+            {
+                "membership": "0::/container\n5:memory:/container\n",
+                "mountinfo": "36 25 0:32 / {root}/unified rw - cgroup2 none rw\n"
+                "29 23 0:26 / {root}/memory rw - cgroup cgroup rw,memory\n",
+                "unified/container/memory.max": str(16 * 1024**3),
+                "unified/container/memory.current": str(1 * 1024**3),
+                "memory/container/memory.limit_in_bytes": str(8 * 1024**3),
+                "memory/container/memory.usage_in_bytes": str(7 * 1024**3),
+            }
+        )
+        v2_mount = root / "unified"
+        v1_mount = root / "memory"
         self.assertEqual(
-            directories,
+            worker_limits._cgroup_directories("memory"),
             [
                 ("v2", str(v2_mount / "container")),
                 ("v2", str(v2_mount)),
@@ -157,6 +140,7 @@ class WorkerAwarenessTest(unittest.TestCase):
                 ("v1", str(v1_mount)),
             ],
         )
+        remaining, _ = worker_limits._cgroup_memory_bound()
         self.assertEqual(remaining, 1 * 1024**3)
 
     def test_cgroup_remaining_memory_uses_tightest_finite_ancestor(self):
@@ -170,7 +154,7 @@ class WorkerAwarenessTest(unittest.TestCase):
             (root / "memory.current").write_text(str(2 * 1024**3))
             with patch.object(
                 worker_limits,
-                "_cgroup_memory_directories",
+                "_cgroup_directories",
                 return_value=[("v2", str(child)), ("v2", str(root))],
             ):
                 remaining, _ = worker_limits._cgroup_memory_bound()
@@ -184,7 +168,7 @@ class WorkerAwarenessTest(unittest.TestCase):
             (directory / "memory.usage_in_bytes").write_text(str(3 * 1024**3))
             with patch.object(
                 worker_limits,
-                "_cgroup_memory_directories",
+                "_cgroup_directories",
                 return_value=[("v1", str(directory))],
             ):
                 remaining, _ = worker_limits._cgroup_memory_bound()
@@ -197,7 +181,7 @@ class WorkerAwarenessTest(unittest.TestCase):
             (directory / "memory.max").write_text(str(8 * 1024**3))
             with patch.object(
                 worker_limits,
-                "_cgroup_memory_directories",
+                "_cgroup_directories",
                 return_value=[("v2", str(directory))],
             ):
                 remaining, _ = worker_limits._cgroup_memory_bound()
@@ -222,18 +206,49 @@ class WorkerAwarenessTest(unittest.TestCase):
     def test_four_cpu_worker_count_uses_eighty_percent(self):
         with patch.dict(os.environ, {}, clear=True), patch.object(
             worker_limits,
-            "_available_memory_bounds",
-            return_value=(10 * 1024**3, None, None),
-        ), patch.object(worker_limits, "_process_cpu_count", return_value=4):
+            "_host_available_memory_bytes",
+            return_value=10 * 1024**3,
+        ), patch.object(
+            worker_limits, "_cgroup_memory_bound", return_value=(None, None)
+        ), patch.object(
+            worker_limits, "_process_cpu_count", return_value=4
+        ):
             self.assertEqual(get_worker_count(), 3)
             self.assertNotIn("AITER_MAX_JOBS", os.environ)
 
-    def test_explicit_aiter_max_jobs_is_clamped_to_automatic_caps(self):
-        with patch.dict(os.environ, {"AITER_MAX_JOBS": "99"}, clear=True), patch.object(
-            worker_limits, "_automatic_worker_snapshot", return_value=(4, 3, None)
-        ) as automatic_budgets:
-            self.assertEqual(get_worker_count(), 3)
-            automatic_budgets.assert_called_once_with()
+    def test_worker_ceiling_precedence_without_environment_mutation(self):
+        cases = (
+            (None, None, 6, 6),
+            (None, "2", 6, 2),
+            (None, "99", 6, 6),
+            (None, "not-an-integer", 6, 6),
+            (None, "0", 6, 6),
+            (None, "-7", 6, 6),
+            ("5", "2", 5, 5),
+            ("99", None, 6, 6),
+            ("99", "2", 6, 6),
+            ("1", None, 1, 1),
+            ("0", "2", 1, 1),
+            ("-7", "2", 1, 1),
+            ("", "2", 6, 6),
+            ("auto", "2", 6, 6),
+            ("not-an-integer", "2", 6, 6),
+        )
+        for canonical, legacy, generic_expected, compile_expected in cases:
+            environment = {
+                name: value
+                for name, value in (("AITER_MAX_JOBS", canonical), ("MAX_JOBS", legacy))
+                if value is not None
+            }
+            with self.subTest(environment=environment), patch.dict(
+                os.environ, environment, clear=True
+            ), patch.object(
+                worker_limits, "_automatic_worker_snapshot", return_value=(8, 6, None)
+            ) as snapshot:
+                self.assertEqual(get_worker_count(), generic_expected)
+                self.assertEqual(get_compile_worker_count(), compile_expected)
+                self.assertEqual(snapshot.call_count, 2)
+                self.assertEqual(dict(os.environ), environment)
 
     def test_automatic_worker_budget_is_recomputed_on_every_call(self):
         with patch.dict(os.environ, {}, clear=True), patch.object(
@@ -245,53 +260,6 @@ class WorkerAwarenessTest(unittest.TestCase):
             self.assertEqual(get_worker_count(), 1)
             self.assertEqual(automatic_budgets.call_count, 2)
             self.assertNotIn("AITER_MAX_JOBS", os.environ)
-
-    def test_framework_max_jobs_is_ignored(self):
-        with patch.dict(os.environ, {"MAX_JOBS": "99"}, clear=True), patch.object(
-            worker_limits,
-            "_available_memory_bounds",
-            return_value=(10 * 1024**3, None, None),
-        ), patch.object(worker_limits, "_process_cpu_count", return_value=4):
-            self.assertEqual(get_worker_count(), 3)
-            self.assertEqual(os.environ["MAX_JOBS"], "99")
-            self.assertNotIn("AITER_MAX_JOBS", os.environ)
-
-    def test_runtime_compile_honors_legacy_max_jobs_without_mutating_environment(
-        self,
-    ):
-        with patch.dict(os.environ, {"MAX_JOBS": "2"}, clear=True), patch.object(
-            worker_limits,
-            "_automatic_worker_snapshot",
-            return_value=(8, 8, None),
-        ):
-            self.assertEqual(get_compile_worker_count(), 2)
-            self.assertEqual(os.environ["MAX_JOBS"], "2")
-            self.assertNotIn("AITER_MAX_JOBS", os.environ)
-
-    def test_runtime_compile_prefers_aiter_max_jobs_over_legacy(self):
-        with patch.dict(
-            os.environ,
-            {"AITER_MAX_JOBS": "5", "MAX_JOBS": "2"},
-            clear=True,
-        ), patch.object(
-            worker_limits, "_automatic_worker_snapshot", return_value=(8, 8, None)
-        ):
-            self.assertEqual(get_compile_worker_count(), 5)
-
-    def test_runtime_compile_invalid_legacy_max_jobs_falls_back_to_automatic(
-        self,
-    ):
-        for raw_value in ("not-an-integer", "0", "-7"):
-            with self.subTest(raw_value=raw_value), patch.dict(
-                os.environ, {"MAX_JOBS": raw_value}, clear=True
-            ), patch.object(
-                worker_limits,
-                "_automatic_worker_snapshot",
-                return_value=(8, 3, None),
-            ):
-                self.assertEqual(get_compile_worker_count(), 3)
-                self.assertEqual(os.environ["MAX_JOBS"], raw_value)
-                self.assertNotIn("AITER_MAX_JOBS", os.environ)
 
     def test_runtime_jit_uses_legacy_aware_compile_helper(self):
         tree = ast.parse((_REPO_ROOT / "aiter/jit/utils/cpp_extension.py").read_text())
@@ -394,10 +362,6 @@ class WorkerAwarenessTest(unittest.TestCase):
         ]
         self.assertIn("adopt_legacy_max_jobs", top_level_calls)
 
-    def test_explicit_lower_aiter_max_jobs_is_honored(self):
-        with patch.dict(os.environ, {"AITER_MAX_JOBS": "1"}, clear=True):
-            self.assertEqual(get_worker_count(), 1)
-
     def test_worker_ceiling_scopes_nested_compiler_budget(self):
         with patch.dict(os.environ, {}, clear=True), patch.object(
             worker_limits, "_automatic_worker_snapshot", return_value=(8, 8, None)
@@ -414,39 +378,29 @@ class WorkerAwarenessTest(unittest.TestCase):
                 raise RuntimeError("boom")
             self.assertEqual(os.environ["AITER_MAX_JOBS"], "5")
 
-    def test_nonpositive_aiter_max_jobs_is_clamped_without_mutating_environment(self):
-        for raw_value in ("0", "-7"):
-            with self.subTest(raw_value=raw_value), patch.dict(
-                os.environ, {"AITER_MAX_JOBS": raw_value}, clear=True
-            ):
-                self.assertEqual(get_worker_count(), 1)
-                self.assertEqual(os.environ["AITER_MAX_JOBS"], raw_value)
-
-    def test_invalid_aiter_max_jobs_falls_back_to_automatic_sizing(self):
-        for raw_value in ("", "auto", "not-an-integer"):
-            with self.subTest(raw_value=raw_value), patch.dict(
-                os.environ, {"AITER_MAX_JOBS": raw_value}, clear=True
-            ), patch.object(
-                worker_limits, "_automatic_worker_snapshot", return_value=(6, 4, None)
-            ):
-                self.assertEqual(get_worker_count(), 4)
-                self.assertEqual(os.environ["AITER_MAX_JOBS"], raw_value)
-
     def test_zero_memory_capacity_still_returns_one_worker(self):
         with patch.dict(os.environ, {}, clear=True), patch.object(
             worker_limits,
-            "_available_memory_bounds",
-            return_value=(0, None, None),
-        ), patch.object(worker_limits, "_process_cpu_count", return_value=1):
+            "_host_available_memory_bytes",
+            return_value=0,
+        ), patch.object(
+            worker_limits, "_cgroup_memory_bound", return_value=(None, None)
+        ), patch.object(
+            worker_limits, "_process_cpu_count", return_value=1
+        ):
             self.assertEqual(get_worker_count(), 1)
             self.assertNotIn("AITER_MAX_JOBS", os.environ)
 
     def test_available_memory_caps_default_workers(self):
         with patch.dict(os.environ, {}, clear=True), patch.object(
             worker_limits,
-            "_available_memory_bounds",
-            return_value=(4 * worker_limits.EST_WORKER_RSS_BYTES, None, None),
-        ), patch.object(worker_limits, "_process_cpu_count", return_value=64):
+            "_host_available_memory_bytes",
+            return_value=4 * worker_limits.EST_WORKER_RSS_BYTES,
+        ), patch.object(
+            worker_limits, "_cgroup_memory_bound", return_value=(None, None)
+        ), patch.object(
+            worker_limits, "_process_cpu_count", return_value=64
+        ):
             self.assertEqual(get_worker_count(), 4)
             self.assertNotIn("AITER_MAX_JOBS", os.environ)
 
@@ -527,12 +481,12 @@ class WorkerAwarenessTest(unittest.TestCase):
             self.assertEqual(get_gpu_worker_count(3, 4), 3)
             self.assertEqual(get_gpu_worker_count(0, 4), 1)
 
-    def test_gpu_worker_count_falls_back_to_cpu_policy_without_gpu(self):
-        with patch.dict(os.environ, {"AITER_MAX_JOBS": "19"}, clear=True), patch.object(
-            worker_limits, "_automatic_worker_snapshot", return_value=(32, 32, None)
-        ):
-            self.assertEqual(get_gpu_worker_count(1000, 0), get_worker_count_for(1000))
-            self.assertEqual(get_gpu_worker_count(3, 0), 3)
+    def test_gpu_worker_count_requires_a_visible_gpu(self):
+        for device_count in (0, -1):
+            with self.subTest(device_count=device_count), self.assertRaisesRegex(
+                RuntimeError, "requires at least one visible GPU"
+            ):
+                get_gpu_worker_count(3, device_count)
 
     def test_gpu_worker_count_uses_runtime_count_without_reparsing_masks(self):
         with patch.dict(os.environ, {"HIP_VISIBLE_DEVICES": "0,99"}, clear=True):

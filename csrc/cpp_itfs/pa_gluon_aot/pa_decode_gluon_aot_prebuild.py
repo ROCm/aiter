@@ -828,8 +828,6 @@ def run_multi_pa_gluon_test(
     # These tasks execute kernels on the GPU, so bound the pool by visible
     # devices instead of the host CPU/memory compilation budget.
     device_count = torch.cuda.device_count()
-    if device_count == 0:
-        raise RuntimeError("PA-Gluon prebuild requires at least one visible GPU")
     worker_count = get_gpu_worker_count(total, device_count)
     print(f"Using {worker_count} parallel processes\n")
 

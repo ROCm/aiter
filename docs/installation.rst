@@ -82,37 +82,18 @@ Environment Variables
      - ``0`` = JIT only, ``1`` = core kernels, ``2`` = inference kernels, ``3`` = MHA only
      - ``0``
    * - ``AITER_MAX_JOBS``
-     - Optional AITER-local parallel compilation ceiling. Plain AITER imports
-       ignore generic ``MAX_JOBS`` from parent frameworks. At the AITER-owned
-       runtime JIT compile boundary, a valid ``MAX_JOBS`` is used as a
-       non-mutating legacy ceiling when ``AITER_MAX_JOBS`` is unset. For
-       backward compatibility, AITER-owned standalone build entrypoints adopt
-       a valid positive ``MAX_JOBS`` in that case and emit a ``FutureWarning``.
-       For CPU compilation, live CPU and memory limits are recalculated on
-       every policy call and clamp either ceiling. GPU-executing pools use
-       the separate device allowance below.
-     - Minimum of 80% of process-available CPUs and effective host/container
-       available-memory capacity
+     - Optional worker ceiling, bounded by live CPU/memory limits for
+       compilation or the device allowance for GPU-executing pools.
+     - Automatic
    * - ``AITER_GPU_WORKERS_PER_DEVICE``
-     - Concurrent GPU-executing workers allowed per visible GPU for build pools
-       that run kernels on the device (for example the PA-Gluon accuracy
-       prebuild). PA-Gluon binds workers to devices round-robin. Device
-       discovery uses ``torch.cuda.device_count()``, which handles visibility
-       masks and uses amdsmi with HIP-runtime fallback on ROCm.
-       ``AITER_MAX_JOBS`` and the submitted job count still cap the pool.
-       PA-Gluon requires a visible GPU; CPU-only compilation ignores this knob.
+     - Concurrent GPU-executing workers per visible device in the PA-Gluon
+       prebuild, further capped by ``AITER_MAX_JOBS`` and submitted work.
+       CPU-only compilation ignores this knob.
      - ``8``
 
-For an AITER-owned compile, worker-ceiling precedence is explicit
-``AITER_MAX_JOBS`` first, then a valid positive legacy ``MAX_JOBS``, then
-automatic sizing. The automatic CPU-compilation budget is the smaller of 80%
-of the CPUs available to the process and effective available memory divided
-by a 1.5 GB per-worker estimate, further clamped by readable cgroup CPU quotas and
-cgroup memory headroom. Standalone package/setup builds, AOT CLIs, and
-standalone PA-Gluon or OPUS builders adopt a valid positive legacy
-``MAX_JOBS`` into ``AITER_MAX_JOBS`` and emit a ``FutureWarning``. See the
-*Build parallelism* section of the repository README for the full policy:
-https://github.com/ROCm/aiter#build-parallelism
+For sizing, legacy ``MAX_JOBS`` compatibility, nested builds, and GPU assignment,
+see `Build parallelism <https://github.com/ROCm/aiter#build-parallelism>`_
+in the repository README.
 
 Example Configurations
 """"""""""""""""""""""

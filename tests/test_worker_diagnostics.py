@@ -24,7 +24,7 @@ def cgroup(tmp_path):
     (tmp_path / "memory.current").write_text(str(52 * 1024**3))
     (tmp_path / "memory.stat").write_text("anon 1073741824\ninactive_file 2147483648\n")
     with patch.object(
-        limits, "_cgroup_memory_directories", return_value=[("v2", str(tmp_path))]
+        limits, "_cgroup_directories", return_value=[("v2", str(tmp_path))]
     ), patch.object(
         limits, "_host_available_memory_bytes", return_value=1024**4
     ), patch.object(
@@ -158,7 +158,8 @@ def test_concurrent_calls_keep_observations_local(tmp_path, caplog):
 
     thread = local()
 
-    def directories():
+    def directories(controller):
+        assert controller == "memory"
         return [("v2", str(tmp_path / str(thread.index)))]
 
     original = limits._cgroup_memory_bound
@@ -173,7 +174,7 @@ def test_concurrent_calls_keep_observations_local(tmp_path, caplog):
         return limits.get_worker_count()
 
     with patch.object(
-        limits, "_cgroup_memory_directories", side_effect=directories
+        limits, "_cgroup_directories", side_effect=directories
     ), patch.object(
         limits, "_cgroup_memory_bound", side_effect=synchronized_bound
     ), patch.object(
