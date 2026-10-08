@@ -21,6 +21,10 @@ from flydsl.expr.typing import (
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
 
+from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import (
+    async_a_copy_is_partial,
+)
+
 from .mfma_preshuffle_pipeline import xcd_remap_bx_by
 from .splitk_epilogue import CPOL_COHERENT, splitk_reduce_epilogue
 
@@ -230,6 +234,14 @@ def compile_preshuffle_gemm(
     bytes_per_thread_a = (tile_m * tile_k * elem_bytes) // total_threads
     num_a_loads = bytes_per_thread_a // a_load_bytes
     num_b_loads = (tile_n * tile_k * elem_bytes) // total_threads // 16
+    # Async copy issues only whole 16-byte-per-thread rounds; a remainder leaves A unwritten.
+    if use_async_copy and async_a_copy_is_partial(tile_m, tile_n, tile_k, elem_bytes):
+        raise ValueError(
+            f"use_async_copy requires tile_m*tile_k*elem_bytes to be a multiple of "
+            f"{total_threads * a_load_bytes} (threads*{a_load_bytes}B); got "
+            f"tile_m={tile_m}, tile_n={tile_n}, tile_k={tile_k}, "
+            f"A bytes={tile_m * tile_k * elem_bytes}. Use use_async_copy=0."
+        )
     num_ds_load = (tile_m * tile_k * elem_bytes) // 64 // 16  # A LDS reads per wave
     num_gmem_loads = num_a_loads + num_b_loads
     if is_8bit and is_gfx950:

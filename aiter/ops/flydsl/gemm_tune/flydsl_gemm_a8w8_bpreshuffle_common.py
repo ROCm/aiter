@@ -116,6 +116,20 @@ def _ki(
     )
 
 
+def async_a_copy_is_partial(
+    tile_m: int, tile_n: int, tile_k: int, elem_bytes: int = 1
+) -> bool:
+    """True when preshuffle_gemm's async A copy would leave part of A unwritten.
+
+    Single source of truth shared by the kernel's compile-time check and the
+    tuner filter. The async path issues only whole 16-byte-per-thread rounds
+    (``num_a_loads = A_bytes // (threads * 16)``), so any remainder is dropped.
+    Thread count mirrors the kernel: 4 waves, or ``tile_n // 16`` when tile_n < 64.
+    """
+    total_threads = (4 if tile_n >= 64 else tile_n // 16) * 64
+    return (tile_m * tile_k * elem_bytes) % (total_threads * 16) != 0
+
+
 def _smem_align(ptr: int, align: int = 16) -> int:
     if ptr % align == 0:
         return ptr
@@ -207,6 +221,8 @@ def kernel_fits_shape(ki: kernelInstance, M: int, N: int, K: int) -> bool:
     if kernel_instance_estimated_lds_bytes(ki) > max_lds_bytes_for_tune():
         return False
     if N % 16 != 0 or K % ki.tile_k != 0:
+        return False
+    if ki.use_async_copy and async_a_copy_is_partial(ki.tile_m, ki.tile_n, ki.tile_k):
         return False
     if N % ki.tile_n != 0 and ki.k_split > 1:
         return False
