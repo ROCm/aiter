@@ -1648,6 +1648,7 @@ def make_attention_a2a_kernel(
                 seqs = []
                 tiles = []
                 # Preload the batch before compute to overlap load latency.
+                # sched_barrier(0) keeps the compiler from sinking loads into compute.
                 for load in range_constexpr(loads):
                     seq = seq0 + pair_rows[load] * peer_warps
                     valid = seq < seq_len
@@ -1679,6 +1680,7 @@ def make_attention_a2a_kernel(
                             )
                         ).to(fx.Float32)
                     )
+                fx.rocdl.sched_barrier(0)
                 current = state[0]
                 for load in range_constexpr(loads):
                     seq, valid = seqs[load]
