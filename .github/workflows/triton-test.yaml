@@ -6,6 +6,8 @@ name: Triton Test
 #     step): the selection is printed, and CI runs what it ran before test
 #     selection existed. DRY_RUN: 'false' applies the selection; setting it
 #     back to 'true' is the revert for every PR.
+#   - A PR that only changes kernel configs runs just the tests of the kernels
+#     that load them and of their callers, even in the dry run.
 #   - PR label ci:triton-355: that PR runs the full suite.
 # Pushes to main always run the full suite, on MI35X and MI300X.
 

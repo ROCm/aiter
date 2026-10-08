@@ -3,8 +3,10 @@
 
 .github/workflows/triton-test.yaml runs this as a dry run (--dry-run) while its
 DRY_RUN switch is 'true': the selection is printed, and CI runs what it ran
-before test selection existed. The ci:triton-355 PR label runs the full suite
-(--all). Any error falls back to the full suite.
+before test selection existed. A PR that only changes kernel configs runs its
+selection even then: the tests of the kernels that load those configs and of
+their callers. The ci:triton-355 PR label runs the full suite (--all). Any
+error falls back to the full suite.
 """
 
 import argparse
@@ -53,7 +55,7 @@ NON_CATEGORY_DIRS = {"utils", "configs", "_triton_kernels", "_gluon_kernels"}
 
 # Config categories whose source/test folders use a different layout.
 CONFIG_CATEGORIES = {
-    "attention": {"attention", "chunk_delta_attn"},
+    "attention": {"attention", "kimi_delta_attn"},
     "mhc": {"fusions"},
 }
 
@@ -111,6 +113,63 @@ def legacy_trigger(diff):
 
 def list_files(base, pattern):
     return sorted(p.relative_to(ROOT).as_posix() for p in (ROOT / base).rglob(pattern))
+
+
+def non_triton_config(path):
+    """CK/ASM tuning tables, which no Triton kernel reads."""
+    return path.startswith("aiter/configs/") and path.endswith(".csv")
+
+
+def config_only(diff):
+    """Whether a diff only retunes kernels: it changes configs and docs."""
+    changed = [p for p in diff or () if not p.endswith(".md")]
+    return bool(changed) and all(
+        (p.startswith(CONFIGS) and p.endswith(".json")) or non_triton_config(p)
+        for p in changed
+    )
+
+
+@cache
+def config_names(path):
+    """A source's string constants, spelled as config family directories:
+    resolve_config_dir() turns GEMM-A16W16 into gemm_a16w16."""
+    tree = ast.parse((ROOT / path).read_text(encoding="utf-8"))
+    return frozenset(
+        node.value.lower().replace("-", "_")
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", node.value)
+    )
+
+
+def config_loaders(family, categories, sources):
+    """Sources that load a config family: they name it, or, in the config's op
+    folders, name its prefix and add a suffix at runtime
+    (f"GEMM-A8W8_BLOCKSCALE{suffix}"). Shared utils count only when no kernel
+    module names the family."""
+    utils = SRC + "utils/"
+    for pool in (
+        [s for s in sources if not s.startswith(utils)],
+        [s for s in sources if s.startswith(utils)],
+    ):
+        pool = [s for s in pool if Path(s).name != "__init__.py"]
+        exact = {s for s in pool if family in config_names(s) | {Path(s).stem}}
+        if exact:
+            return exact
+        # The longest specific prefix wins; a bare word like "gemm" never does.
+        prefix = {}
+        for source in pool:
+            names = [
+                name
+                for name in config_names(source)
+                if family.startswith(name + "_") and re.search(r"[0-9_]", name)
+            ]
+            if names and category_of(source) in categories:
+                prefix[source] = max(map(len, names))
+        if prefix:
+            return {s for s, n in prefix.items() if n == max(prefix.values())}
+    return set()
 
 
 def category_of(path):
@@ -233,15 +292,17 @@ def scan_imports(path, gone, dynamic):
     return found
 
 
-def dependents(paths, importers):
-    """Follow imports backwards from changed files to their consumers."""
+def dependents(paths, importers, leaves=frozenset()):
+    """Follow imports backwards from changed files to their consumers, without
+    following imports of `leaves`."""
     seen = set(paths)
     frontier = list(seen)
     while frontier:
         for path in importers.get(frontier.pop(), ()):
             if path not in seen:
                 seen.add(path)
-                frontier.append(path)
+                if path not in leaves:
+                    frontier.append(path)
     return seen
 
 
@@ -255,7 +316,13 @@ def changed_files(merge_ref):
 
 def select(diff):
     """Select affected test files, raising when a subset cannot be determined."""
-    diff = [p for p in diff if not p.endswith(".md") and Path(p).name != ".gitkeep"]
+    diff = [
+        p
+        for p in diff
+        if not p.endswith(".md")
+        and Path(p).name != ".gitkeep"
+        and not non_triton_config(p)
+    ]
     if not any(
         p.startswith((SRC, TESTS, "aiter/aot/triton/", "aiter/utility/triton/"))
         or p in CI_FILES
@@ -323,6 +390,17 @@ def select(diff):
                 raise RuntimeError(f"{path}: unknown config layout")
             op, family = parts[2:4]
             categories = CONFIG_CATEGORIES.get(op, {op})
+            # A config retunes the kernels that load it and every kernel that
+            # calls them. Imports between tests are not followed: a test that
+            # borrows another test's input helpers does not run its kernel.
+            loaders = config_loaders(family, categories, sources)
+            hits = tests & dependents(loaders, importers, leaves=tests)
+            if hits:
+                selected.update(hits)
+                reasons.append(
+                    f"{path}: '{family}' kernels and callers ({len(hits)} tests)"
+                )
+                continue
             hits = {test for test in tests if category_of(test) in categories}
             if not hits and not any(
                 category_of(source) in categories or Path(source).stem == op
@@ -381,7 +459,8 @@ def main():
     ap.add_argument(
         "--dry-run",
         action="store_true",
-        help="print the selection, but run what CI ran before test selection",
+        help="print the selection, but run what CI ran before test selection; "
+        "a config-only diff still runs its selection",
     )
     ap.add_argument("--output", default="selected_triton_tests.list")
     args = ap.parse_args()
@@ -402,11 +481,13 @@ def main():
         tests, reasons = everything, [f"FULL SUITE: {why}"]
     report = f"Triton tests: {len(tests)} files\n"
     report += "".join(f"- {reason}\n" for reason in reasons)
-    if args.dry_run and not args.all:
+    if len(tests) < len(everything):
+        report += "".join(f"  {test}\n" for test in tests)
+    if args.dry_run and not args.all and config_only(diff):
+        report = "Config-only change: selection applied.\n" + report
+    elif args.dry_run and not args.all:
         # Print the selection, but keep the tests CI ran before selection.
         report = "DRY RUN, selection not applied.\n" + report
-        if len(tests) < len(everything):
-            report += "".join(f"  {test}\n" for test in tests)
         tests = everything if diff is None or legacy_trigger(diff) else []
         report += f"Running {len(tests)} files, as CI did before test selection.\n"
     Path(args.output).write_text("".join(t + "\n" for t in tests), encoding="utf-8")
