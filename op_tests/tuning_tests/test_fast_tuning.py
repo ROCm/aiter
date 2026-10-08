@@ -86,7 +86,15 @@ class TestFastScanCliSafety(unittest.TestCase):
 class TestMxfp4AccuracyFunnel(unittest.TestCase):
     @staticmethod
     def _candidate(name):
-        return {"kernelName1": f"g1_{name}", "kernelName2": f"g2_{name}", "us": 0}
+        # Real candidates carry block_m, and _run_candidate records the numeric
+        # error the coupled tuner gates on. Mocked evaluations start accurate.
+        return {
+            "kernelName1": f"g1_{name}",
+            "kernelName2": f"g2_{name}",
+            "block_m": 32,
+            "us": 0,
+            "error": 0.0,
+        }
 
     @staticmethod
     def _pipeline_data():
@@ -210,6 +218,7 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
         from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
 
         tuner = gemm_moe_tune.Mxfp4FlydslTuner.__new__(gemm_moe_tune.Mxfp4FlydslTuner)
+        tuner.keys = ["token", "model_dim", "inter_dim", "expert", "topk"]
         fast = self._candidate("fast_bad")
         accurate = self._candidate("accurate")
         args = SimpleNamespace(
@@ -272,6 +281,7 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
         from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
 
         tuner = gemm_moe_tune.Mxfp4FlydslTuner.__new__(gemm_moe_tune.Mxfp4FlydslTuner)
+        tuner.keys = ["token", "model_dim", "inter_dim", "expert", "topk"]
         candidates = [self._candidate(f"candidate_{i}") for i in range(1, 5)]
         args = SimpleNamespace(
             fast_scan=True,
@@ -342,6 +352,7 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
         from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
 
         tuner = gemm_moe_tune.Mxfp4FlydslTuner.__new__(gemm_moe_tune.Mxfp4FlydslTuner)
+        tuner.keys = ["token", "model_dim", "inter_dim", "expert", "topk"]
         candidates = [self._candidate(f"candidate_{i}") for i in range(10)]
         args = SimpleNamespace(
             fast_scan=True,
@@ -496,6 +507,7 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
         from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
 
         tuner = gemm_moe_tune.Mxfp4FlydslTuner.__new__(gemm_moe_tune.Mxfp4FlydslTuner)
+        tuner.keys = ["token", "model_dim", "inter_dim", "expert", "topk"]
         args = SimpleNamespace(
             fast_scan=True,
             fast_scan_warmup_accuracy_checks=1,
@@ -661,6 +673,7 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
         from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
 
         tuner = gemm_moe_tune.Mxfp4FlydslTuner.__new__(gemm_moe_tune.Mxfp4FlydslTuner)
+        tuner.keys = ["token", "model_dim", "inter_dim", "expert", "topk"]
         candidates = [self._candidate("bad"), self._candidate("good")]
         args = SimpleNamespace(
             fast_scan=True,
@@ -756,7 +769,10 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
 
         self.assertEqual(run_candidate.call_count, 2)
         self.assertEqual(result["us"], tuner.INVALID_TIME)
-        self.assertTrue(result["kernelName1"].startswith("FAILED:"))
+        self.assertEqual(result["status"], "failed")
+        self.assertTrue(
+            result["failure_reason"].startswith("no valid coupled candidate")
+        )
 
 
 class TestGlm53TunedArtifact(unittest.TestCase):
