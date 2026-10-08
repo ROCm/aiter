@@ -247,9 +247,7 @@ def lookup_mxscale_bmm_config(
 
         return lookup_raw(b, m, n, k, w_scale_block=w_scale_block, libtype=libtype)
     if w_scale_block != "128x128":
-        raise ValueError(
-            "preshuffled MXFP8 BMM only supports w_scale_block=128x128"
-        )
+        raise ValueError("preshuffled MXFP8 BMM only supports w_scale_block=128x128")
     gfx = get_gfx()
     path = _mxscale_bmm_tuned_path(bpreshuffle)
     tuned = _load_mxscale_bmm_tuned(libtype, bpreshuffle)

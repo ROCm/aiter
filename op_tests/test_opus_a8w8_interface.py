@@ -322,7 +322,10 @@ def test_mxscale_legacy_csv_defaults_to_128x128(mxscale_csv, caplog):
     )
     assert policy.resolve_a8w8_mxscale_bmm_plan(2, 128, 1024, 4096) == (8653, 1)
     assert "w_scale_block" in caplog.text
-    assert policy.lookup_mxscale_bmm_config(2, 128, 1024, 4096, w_scale_block="32x32") is None
+    assert (
+        policy.lookup_mxscale_bmm_config(2, 128, 1024, 4096, w_scale_block="32x32")
+        is None
+    )
 
 
 @pytest.mark.parametrize(
@@ -352,7 +355,9 @@ def test_mxscale_wrong_group_kid_is_skipped(mxscale_csv, caplog):
         "gfx,b,m,n,k,w_scale_block,libtype,kernelId,splitK\n"
         "gfx950,2,128,1024,4096,32x32,opus,8653,1\n"
     )
-    assert policy.resolve_a8w8_mxscale_bmm_plan(2, 128, 1024, 4096, w_scale_block="32x32") == (
+    assert policy.resolve_a8w8_mxscale_bmm_plan(
+        2, 128, 1024, 4096, w_scale_block="32x32"
+    ) == (
         9653,
         1,
     )

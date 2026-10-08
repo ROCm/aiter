@@ -280,7 +280,9 @@ class TestConfigShapeCollision(unittest.TestCase):
                 merged = core.AITER_CONFIGS.update_config_files(f"{old}:{new}", name)
                 with open(merged, newline="") as f:
                     rows = list(csv.DictReader(f))
-                self.assertEqual({r["w_scale_block"] for r in rows}, {"32x32", "128x128"})
+                self.assertEqual(
+                    {r["w_scale_block"] for r in rows}, {"32x32", "128x128"}
+                )
                 self.assertEqual(len(rows), 2)
                 self.assertEqual(before, [p.read_bytes() for p in (old, new)])
             finally:
