@@ -8,6 +8,7 @@ from functools import lru_cache
 import torch
 
 from aiter.ops.flydsl.kernels.rdna3_int8_gemm import create_wmma_int8_gemm_module
+from flydsl.runtime.device import get_rocm_arch
 
 
 @lru_cache(maxsize=64)
@@ -39,7 +40,14 @@ def gemm_a8w8_rdna3(x, w, x_scale, w_scale, out):
         torch.float16: "f16",
     }[out.dtype]
     with torch.cuda.device(x.device):
-        arch = str(torch.cuda.get_device_properties(x.device).gcnArchName).split(":")[0]
+        arch = (
+            str(torch.cuda.get_device_properties(x.device).gcnArchName)
+            .split(":")[0]
+            .lower()
+        )
+        target_arch = str(get_rocm_arch() or "").split(":", 1)[0].lower()
+        if arch != target_arch:
+            return None
         kernel = _get_kernel(
             arch,
             x.shape[0],

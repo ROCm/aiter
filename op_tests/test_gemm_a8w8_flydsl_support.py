@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import contextlib
+import importlib.util
 import sys
-from types import SimpleNamespace
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -77,6 +80,90 @@ def test_flydsl_rdna3_a8w8_rejects_unsupported_output_and_buffer_span():
     )
 
 
+@pytest.mark.parametrize("target_arch", ["gfx942", "gfx1201", "gfx1100"])
+def test_flydsl_rdna3_a8w8_target_arch_mismatch_falls_back_without_factory(
+    monkeypatch, target_arch
+):
+    for name in (
+        "flydsl",
+        "flydsl.runtime",
+        "aiter.ops.flydsl",
+        "aiter.ops.flydsl.kernels",
+        "aiter.ops.triton",
+        "aiter.ops.triton.gemm",
+        "aiter.ops.triton.gemm.basic",
+    ):
+        package = ModuleType(name)
+        package.__path__ = []
+        monkeypatch.setitem(sys.modules, name, package)
+
+    device_module = ModuleType("flydsl.runtime.device")
+    device_module.get_rocm_arch = lambda: target_arch
+    monkeypatch.setitem(sys.modules, "flydsl.runtime.device", device_module)
+    factory_calls = []
+    kernel_module = ModuleType("aiter.ops.flydsl.kernels.rdna3_int8_gemm")
+
+    def create_kernel(*args, **kwargs):
+        factory_calls.append((args, kwargs))
+        pytest.fail("mismatched target called the FlyDSL kernel factory")
+
+    kernel_module.create_wmma_int8_gemm_module = create_kernel
+    monkeypatch.setitem(
+        sys.modules, "aiter.ops.flydsl.kernels.rdna3_int8_gemm", kernel_module
+    )
+    launcher_path = (
+        Path(__file__).resolve().parents[1]
+        / "aiter"
+        / "ops"
+        / "flydsl"
+        / "rdna3_int8_gemm.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "rdna3_int8_gemm_test_launcher", launcher_path
+    )
+    launcher = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(launcher)
+
+    monkeypatch.setattr(
+        gemm_op_a8w8.torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(gcnArchName="GFX1151:sramecc+"),
+    )
+    monkeypatch.setattr(
+        gemm_op_a8w8.torch.cuda, "device", lambda device: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(gemm_op_a8w8, "AITER_GEMM_A8W8_BACKEND", "flydsl")
+    monkeypatch.setattr(gemm_op_a8w8, "_ck_a8w8_supported", lambda: False)
+    monkeypatch.setattr(
+        gemm_op_a8w8, "_flydsl_rdna3_a8w8_supported", lambda *args: True
+    )
+    triton_output = torch.empty((8, 64), dtype=torch.float32)
+    triton_module = ModuleType("aiter.ops.triton.gemm.basic.gemm_a8w8")
+    triton_module.gemm_a8w8 = lambda *args, **kwargs: triton_output
+    monkeypatch.setitem(
+        sys.modules, "aiter.ops.triton.gemm.basic.gemm_a8w8", triton_module
+    )
+    imports = []
+
+    def import_module(name, package=None):
+        imports.append((name, package))
+        if name == ".flydsl.rdna3_int8_gemm":
+            return SimpleNamespace(gemm_a8w8_rdna3=launcher.gemm_a8w8_rdna3)
+        pytest.fail(f"unexpected module import: {name}")
+
+    monkeypatch.setattr(gemm_op_a8w8.importlib, "import_module", import_module)
+    x = torch.empty((8, 128), dtype=torch.int8)
+    w = torch.empty((64, 128), dtype=torch.int8)
+    x_scale = torch.empty((8, 1), dtype=torch.float32)
+    w_scale = torch.empty((64, 1), dtype=torch.float32)
+
+    result = gemm_op_a8w8.gemm_a8w8(x, w, x_scale, w_scale, dtype=torch.float32)
+
+    assert result is triton_output
+    assert factory_calls == []
+    assert imports == [(".flydsl.rdna3_int8_gemm", "aiter.ops")]
+
+
 def test_flydsl_rdna3_a8w8_dispatches_supported_call(monkeypatch):
     monkeypatch.setattr(
         gemm_op_a8w8.torch.cuda,
@@ -99,9 +186,7 @@ def test_flydsl_rdna3_a8w8_dispatches_supported_call(monkeypatch):
     )
     monkeypatch.setattr(gemm_op_a8w8.torch, "empty", lambda *args, **kwargs: output)
 
-    result = _try_flydsl_rdna3_a8w8(
-        x, w, x_scale, w_scale, None, torch.bfloat16, None
-    )
+    result = _try_flydsl_rdna3_a8w8(x, w, x_scale, w_scale, None, torch.bfloat16, None)
     assert result is expected
     assert called == [(x, w, x_scale, w_scale, output)]
 
@@ -142,7 +227,9 @@ def test_flydsl_rdna3_a8w8_keeps_bias_and_explicit_splitk_on_fallback(
     )
 
 
-@pytest.mark.parametrize("error", [ModuleNotFoundError("flydsl"), OSError("missing HIP DLL")])
+@pytest.mark.parametrize(
+    "error", [ModuleNotFoundError("flydsl"), OSError("missing HIP DLL")]
+)
 def test_flydsl_rdna3_a8w8_import_failure_uses_fallback(monkeypatch, error):
     monkeypatch.setattr(
         gemm_op_a8w8.torch.cuda,
@@ -156,9 +243,7 @@ def test_flydsl_rdna3_a8w8_import_failure_uses_fallback(monkeypatch, error):
 
     monkeypatch.setattr(gemm_op_a8w8.importlib, "import_module", unavailable)
     assert (
-        _try_flydsl_rdna3_a8w8(
-            x, w, x_scale, w_scale, None, torch.bfloat16, None
-        )
+        _try_flydsl_rdna3_a8w8(x, w, x_scale, w_scale, None, torch.bfloat16, None)
         is None
     )
 
@@ -197,9 +282,7 @@ def test_gemm_a8w8_public_dispatch_uses_triton_by_default(
 
     assert result.shape == (2, 64)
     assert result.dtype == torch.float16
-    assert calls == [
-        ((x, w, x_scale, w_scale, None), {"dtype": torch.float16})
-    ]
+    assert calls == [((x, w, x_scale, w_scale, None), {"dtype": torch.float16})]
 
 
 def test_gemm_a8w8_public_dispatch_returns_flydsl_result(monkeypatch):
@@ -216,9 +299,7 @@ def test_gemm_a8w8_public_dispatch_returns_flydsl_result(monkeypatch):
         calls.append(args)
         return output
 
-    monkeypatch.setattr(
-        gemm_op_a8w8, "_try_flydsl_rdna3_a8w8", flydsl_gemm
-    )
+    monkeypatch.setattr(gemm_op_a8w8, "_try_flydsl_rdna3_a8w8", flydsl_gemm)
     monkeypatch.setattr(
         gemm_op_a8w8,
         "_ck_a8w8_supported",
@@ -287,12 +368,7 @@ def test_flydsl_rdna3_a8w8_unsupported_call_uses_fallback(
         lambda *args, **kwargs: pytest.fail("unsupported call attempted FlyDSL import"),
     )
 
-    assert (
-        _try_flydsl_rdna3_a8w8(
-            *tensors, None, torch.bfloat16, None
-        )
-        is None
-    )
+    assert _try_flydsl_rdna3_a8w8(*tensors, None, torch.bfloat16, None) is None
 
 
 @pytest.mark.parametrize("tensor_index", [0, 1])

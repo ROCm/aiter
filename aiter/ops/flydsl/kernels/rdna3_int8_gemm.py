@@ -33,7 +33,12 @@ LDS_BYTES = 64 * 1024
 
 
 IN_DTYPES = {"int8": (fx.Int8, True), "uint8": (fx.Uint8, False)}
-OUT_DTYPES = {"i32": fx.Int32, "f32": fx.Float32, "bf16": fx.BFloat16, "f16": fx.Float16}
+OUT_DTYPES = {
+    "i32": fx.Int32,
+    "f32": fx.Float32,
+    "bf16": fx.BFloat16,
+    "f16": fx.Float16,
+}
 
 
 def _sched_plan(reg_m, reg_n, reg_k, g2s_chunks):
@@ -77,7 +82,10 @@ def _swizzle_tile_id(pid, grid_n, group_width):
     num_pid_in_group = group_width * grid_n
     group_id = pid // num_pid_in_group
     pid_in_group = pid % num_pid_in_group
-    return group_id * group_width + (pid_in_group % group_width), pid_in_group // group_width
+    return (
+        group_id * group_width + (pid_in_group % group_width),
+        pid_in_group // group_width,
+    )
 
 
 def _zero_output(tensor, stream):
@@ -127,13 +135,19 @@ def create_wmma_int8_gemm_module(
     ldc=None,
 ):
     if in_dtype not in IN_DTYPES:
-        raise ValueError(f"in_dtype must be one of {sorted(IN_DTYPES)}, got {in_dtype!r}")
+        raise ValueError(
+            f"in_dtype must be one of {sorted(IN_DTYPES)}, got {in_dtype!r}"
+        )
     if out_dtype not in OUT_DTYPES:
-        raise ValueError(f"out_dtype must be one of {sorted(OUT_DTYPES)}, got {out_dtype!r}")
+        raise ValueError(
+            f"out_dtype must be one of {sorted(OUT_DTYPES)}, got {out_dtype!r}"
+        )
     if scale_mode not in ("none", "row_col"):
         raise ValueError(f"scale_mode must be 'none' or 'row_col', got {scale_mode!r}")
     if scale_mode == "row_col" and out_dtype == "i32":
-        raise ValueError("scale_mode='row_col' dequantises to a float; out_dtype cannot be 'i32'")
+        raise ValueError(
+            "scale_mode='row_col' dequantises to a float; out_dtype cannot be 'i32'"
+        )
 
     elem_dtype, elem_signed = IN_DTYPES[in_dtype]
     out_elem_cls = OUT_DTYPES[out_dtype]
@@ -143,7 +157,8 @@ def create_wmma_int8_gemm_module(
     ld_c = N if ldc is None else int(ldc)
     if ld_a < K or ld_b < K or ld_c < N:
         raise ValueError(
-            f"leading dimensions must cover the operands: lda={ld_a}, ldb={ld_b} " f"need K={K}, ldc={ld_c} needs N={N}"
+            f"leading dimensions must cover the operands: lda={ld_a}, ldb={ld_b} "
+            f"need K={K}, ldc={ld_c} needs N={N}"
         )
 
     if ld_a % LOAD_VEC or ld_b % LOAD_VEC:
@@ -201,7 +216,9 @@ def create_wmma_int8_gemm_module(
 
     num_k_tiles = K // BLOCK_K
     if num_k_tiles < 2:
-        raise ValueError(f"Need at least 2 K-tiles for prefetch pipeline; got K={K}, BLOCK_K={BLOCK_K}")
+        raise ValueError(
+            f"Need at least 2 K-tiles for prefetch pipeline; got K={K}, BLOCK_K={BLOCK_K}"
+        )
 
     grid_m = -(-M // BLOCK_M)
     grid_n = N // BLOCK_N
@@ -234,7 +251,9 @@ def create_wmma_int8_gemm_module(
     num_tiles = grid_m * grid_n
     persist_wgs = int(persistent_wgs)
     if persist_wgs < 0 or persist_wgs > num_tiles:
-        raise ValueError(f"persistent_wgs must be between 0 (plain grid) and num_tiles={num_tiles}, got {persist_wgs}")
+        raise ValueError(
+            f"persistent_wgs must be between 0 (plain grid) and num_tiles={num_tiles}, got {persist_wgs}"
+        )
 
     persist_rot_step = int(stagger) if persist_wgs else 0
     if persist_wgs:
@@ -247,13 +266,21 @@ def create_wmma_int8_gemm_module(
         # Slices accumulate atomically into one output tile. Integer adds stay
         # exact under any order; a scaled epilogue would need the full sum first.
         if out_dtype != "i32" or scale_mode != "none":
-            raise ValueError("split_k > 1 accumulates atomically and needs out_dtype='i32' with scale_mode='none'")
+            raise ValueError(
+                "split_k > 1 accumulates atomically and needs out_dtype='i32' with scale_mode='none'"
+            )
         if persist_wgs:
-            raise ValueError("split_k and a persistent grid both remap the grid; use one or the other")
+            raise ValueError(
+                "split_k and a persistent grid both remap the grid; use one or the other"
+            )
         if num_k_tiles % splits:
-            raise ValueError(f"split_k={splits} must divide the {num_k_tiles} K-tiles of K={K}, BLOCK_K={BLOCK_K}")
+            raise ValueError(
+                f"split_k={splits} must divide the {num_k_tiles} K-tiles of K={K}, BLOCK_K={BLOCK_K}"
+            )
         if num_k_tiles // splits < 2:
-            raise ValueError(f"split_k={splits} leaves under 2 K-tiles per slice for the prefetch pipeline")
+            raise ValueError(
+                f"split_k={splits} leaves under 2 K-tiles per slice for the prefetch pipeline"
+            )
 
     K_STEPS = num_k_tiles // splits
     if splits > 1:
@@ -348,7 +375,9 @@ def create_wmma_int8_gemm_module(
 
         thr_g2s = tiled_copy_g2s.get_slice(tid)
         thr_mma = tiled_mma.thr_slice(tid)
-        copy_out = fx.make_copy_atom(fx.rocdl.BufferCopy(out_elem_cls.width), out_elem_cls)
+        copy_out = fx.make_copy_atom(
+            fx.rocdl.BufferCopy(out_elem_cls.width), out_elem_cls
+        )
         thr_r2g_C = fx.make_tiled_copy_C(copy_out, tiled_mma).get_slice(tid)
 
         def _tile_operands(bid_m, bid_n):
@@ -356,9 +385,9 @@ def create_wmma_int8_gemm_module(
                 fx.rocdl.make_buffer_tensor(arg_a, max_size=not partial_m),
                 fx.make_tile(BLOCK_M, BLOCK_K),
             )[None, None, bid_m, None]
-            tB = fx.flat_divide(fx.rocdl.make_buffer_tensor(arg_bt), fx.make_tile(BLOCK_N, BLOCK_K))[
-                None, None, bid_n, None
-            ]
+            tB = fx.flat_divide(
+                fx.rocdl.make_buffer_tensor(arg_bt), fx.make_tile(BLOCK_N, BLOCK_K)
+            )[None, None, bid_n, None]
             return thr_g2s.partition_S(tA), thr_g2s.partition_S(tB)
 
         buf_copy = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_dtype)
@@ -403,7 +432,13 @@ def create_wmma_int8_gemm_module(
             col = LOAD_VEC * rk
             for rn in range_constexpr(reg_n):
                 row = wave_n * (reg_n * WMMA_N) + WMMA_N * rn + lane16
-                vecs.append(_v16_load(buf_offset + LDS_A_SIZE + _lds_elem(BLOCK_N, ROW_STRIDE_B, row, col)))
+                vecs.append(
+                    _v16_load(
+                        buf_offset
+                        + LDS_A_SIZE
+                        + _lds_elem(BLOCK_N, ROW_STRIDE_B, row, col)
+                    )
+                )
             return vecs
 
         def _load_a_single_from_lds(rk, rm_val, buf_offset):
@@ -430,7 +465,9 @@ def create_wmma_int8_gemm_module(
         def _compute_k_tile(accs_in, buf_offset):
             new_accs = list(accs_in)
             for rk in range_constexpr(reg_k):
-                new_accs = _do_compute_rk(new_accs, rk, buf_offset, _load_b_from_lds(rk, buf_offset))
+                new_accs = _do_compute_rk(
+                    new_accs, rk, buf_offset, _load_b_from_lds(rk, buf_offset)
+                )
             return new_accs
 
         def _sched_k_tile():
@@ -478,7 +515,9 @@ def create_wmma_int8_gemm_module(
                 )
                 results = yield list(s_accs)
 
-            return _compute_k_tile(list(results[:n_acc]), ((K_STEPS - 1) % 2) * c_lds_buf_stride)
+            return _compute_k_tile(
+                list(results[:n_acc]), ((K_STEPS - 1) % 2) * c_lds_buf_stride
+            )
 
         if const_expr(scaled):
             sa_view = fx.make_view(fx.get_iter(arg_sa), fx.make_layout((M, 1), (1, 1)))
@@ -503,8 +542,16 @@ def create_wmma_int8_gemm_module(
             ``2 * si + lane // 16`` and column ``lane % 16`` of its 16x16 WMMA
             tile, the same mapping the scaled epilogue reads its scales with.
             """
-            row_base = fx.Int32(bid_m) * BLOCK_M + fx.Int32(wave_m) * (reg_m * WMMA_M) + fx.Int32(lane_half)
-            col_base = fx.Int32(bid_n) * BLOCK_N + fx.Int32(wave_n) * (reg_n * WMMA_N) + fx.Int32(lane16)
+            row_base = (
+                fx.Int32(bid_m) * BLOCK_M
+                + fx.Int32(wave_m) * (reg_m * WMMA_M)
+                + fx.Int32(lane_half)
+            )
+            col_base = (
+                fx.Int32(bid_n) * BLOCK_N
+                + fx.Int32(wave_n) * (reg_n * WMMA_N)
+                + fx.Int32(lane16)
+            )
             for rm in range_constexpr(reg_m):
                 for si in range_constexpr(8):
                     row = row_base + fx.Int32(WMMA_M * rm + 2 * si)
@@ -532,25 +579,50 @@ def create_wmma_int8_gemm_module(
             frag_C_retile = thr_r2g_C.retile(frag_C_out)
 
             if const_expr(scaled):
-                row_base = fx.Int32(bid_m) * BLOCK_M + fx.Int32(wave_m) * (reg_m * WMMA_M) + fx.Int32(lane_half)
-                col_base = fx.Int32(bid_n) * BLOCK_N + fx.Int32(wave_n) * (reg_n * WMMA_N) + fx.Int32(lane16)
-                sb = [sb_view[col_base + WMMA_N * rn, 0] for rn in range_constexpr(reg_n)]
+                row_base = (
+                    fx.Int32(bid_m) * BLOCK_M
+                    + fx.Int32(wave_m) * (reg_m * WMMA_M)
+                    + fx.Int32(lane_half)
+                )
+                col_base = (
+                    fx.Int32(bid_n) * BLOCK_N
+                    + fx.Int32(wave_n) * (reg_n * WMMA_N)
+                    + fx.Int32(lane16)
+                )
+                sb = [
+                    sb_view[col_base + WMMA_N * rn, 0] for rn in range_constexpr(reg_n)
+                ]
                 sa = [
-                    [_load_scale_a(row_base + WMMA_M * rm + 2 * si) for si in range_constexpr(8)]
+                    [
+                        _load_scale_a(row_base + WMMA_M * rm + 2 * si)
+                        for si in range_constexpr(8)
+                    ]
                     for rm in range_constexpr(reg_m)
                 ]
                 out_elems = [
-                    (accs[rm * reg_n + rn][si].to(fx.Float32) * sa[rm][si] * sb[rn]).to(out_elem_cls)
+                    (
+                        accs[rm * reg_n + rn][si].to(fx.Float32) * (sa[rm][si] * sb[rn])
+                    ).to(out_elem_cls)
                     for rn in range_constexpr(reg_n)
                     for rm in range_constexpr(reg_m)
                     for si in range_constexpr(8)
                 ]
             else:
-                ordered_accs = [accs[rm * reg_n + rn] for rn in range_constexpr(reg_n) for rm in range_constexpr(reg_m)]
+                ordered_accs = [
+                    accs[rm * reg_n + rn]
+                    for rn in range_constexpr(reg_n)
+                    for rm in range_constexpr(reg_m)
+                ]
                 if const_expr(out_elem_cls is fx.Int32):
-                    out_elems = [acc[si] for acc in ordered_accs for si in range_constexpr(8)]
+                    out_elems = [
+                        acc[si] for acc in ordered_accs for si in range_constexpr(8)
+                    ]
                 else:
-                    out_elems = [acc[si].to(out_elem_cls) for acc in ordered_accs for si in range_constexpr(8)]
+                    out_elems = [
+                        acc[si].to(out_elem_cls)
+                        for acc in ordered_accs
+                        for si in range_constexpr(8)
+                    ]
 
             frag_C_out.store(fx.Vector.from_elements(out_elems, out_elem_cls))
             fx.copy(copy_out, frag_C_retile, pC_g)
@@ -609,7 +681,9 @@ def create_wmma_int8_gemm_module(
         arg_c_2d = fx.make_view(fx.get_iter(arg_c), fx.make_layout((M, N), (ld_c, 1)))
 
         total_blocks = persist_wgs if persist_wgs else grid_m * grid_n * splits
-        launcher = wmma_gemm_kernel(arg_c_2d, arg_a_2d, arg_bt_2d, arg_sa, arg_sb, tiled_mma, tiled_copy_g2s)
+        launcher = wmma_gemm_kernel(
+            arg_c_2d, arg_a_2d, arg_bt_2d, arg_sa, arg_sb, tiled_mma, tiled_copy_g2s
+        )
         launcher.launch(
             grid=(total_blocks, 1, 1),
             block=(THREADS_PER_BLOCK, 1, 1),

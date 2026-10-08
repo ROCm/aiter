@@ -61,9 +61,7 @@ def _check_correctness(dtype, gemm_op_a8w8, gemm_a8w8_triton):
     try:
         torch.cuda.synchronize()
         start = time.perf_counter()
-        actual = gemm_op_a8w8.gemm_a8w8(
-            x, w, x_scale, w_scale, dtype=dtype
-        )
+        actual = gemm_op_a8w8.gemm_a8w8(x, w, x_scale, w_scale, dtype=dtype)
         torch.cuda.synchronize()
         first_call_ms = (time.perf_counter() - start) * 1000
     finally:
@@ -71,7 +69,7 @@ def _check_correctness(dtype, gemm_op_a8w8, gemm_a8w8_triton):
 
     assert dispatch == [True], f"public A8W8 call did not take FlyDSL: {dispatch}"
     triton = gemm_a8w8_triton(x, w, x_scale, w_scale, dtype=dtype)
-    reference = (x.float() @ w.float().T) * x_scale[:, None] * w_scale[None, :]
+    reference = (x.float() @ w.float().T) * (x_scale[:, None] * w_scale[None, :])
     reference = reference.to(dtype)
     if dtype == torch.float32:
         rtol, atol = 1e-5, 1e-4
@@ -101,6 +99,52 @@ def _check_correctness(dtype, gemm_op_a8w8, gemm_a8w8_triton):
     }
 
 
+def _check_extreme_scale_correctness(gemm_op_a8w8, gemm_a8w8_triton):
+    m, n, k = 1, 64, 128
+    device = torch.device("cuda")
+    x = torch.full((m, k), 127, dtype=torch.int8, device=device)
+    w = torch.full((n, k), 127, dtype=torch.int8, device=device)
+    x_scale = torch.full((m,), 1e33, dtype=torch.float32, device=device)
+    w_scale = torch.full((n,), 1e-33, dtype=torch.float32, device=device)
+    dispatch = []
+    original = gemm_op_a8w8._try_flydsl_rdna3_a8w8
+
+    def track_real_dispatch(*args):
+        result = original(*args)
+        dispatch.append(result is not None)
+        return result
+
+    gemm_op_a8w8._try_flydsl_rdna3_a8w8 = track_real_dispatch
+    try:
+        actual = gemm_op_a8w8.gemm_a8w8(x, w, x_scale, w_scale, dtype=torch.float32)
+        torch.cuda.synchronize()
+    finally:
+        gemm_op_a8w8._try_flydsl_rdna3_a8w8 = original
+
+    assert dispatch == [True], f"public A8W8 call did not take FlyDSL: {dispatch}"
+    triton = gemm_a8w8_triton(x, w, x_scale, w_scale, dtype=torch.float32)
+    accumulator = x.float() @ w.float().T
+    reference = accumulator * (x_scale[:, None] * w_scale[None, :])
+    old_grouping = accumulator * x_scale[:, None] * w_scale[None, :]
+    expected = torch.full((m, n), 2064512.0, dtype=torch.float32, device=device)
+    assert not torch.isfinite(old_grouping).all()
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(triton, expected, rtol=0, atol=0)
+    torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+    return {
+        "dtype": str(torch.float32),
+        "shape_mnk": [m, n, k],
+        "x_scale": 1e33,
+        "w_scale": 1e-33,
+        "expected": 2064512.0,
+        "old_left_associated_grouping_is_finite": bool(
+            torch.isfinite(old_grouping).all().item()
+        ),
+        "real_flydsl_dispatch_proven": dispatch == [True],
+    }
+
+
 def _benchmark_shape(m, n, k, gemm_op_a8w8, gemm_a8w8_triton):
     x, w, x_scale, w_scale = _make_inputs(m, n, k)
     flydsl_dispatches = []
@@ -120,18 +164,14 @@ def _benchmark_shape(m, n, k, gemm_op_a8w8, gemm_a8w8_triton):
         torch.cuda.synchronize()
         first_call_ms = (time.perf_counter() - start) * 1000
         flydsl_ms = _measure_ms(
-            lambda: gemm_op_a8w8.gemm_a8w8(
-                x, w, x_scale, w_scale, dtype=torch.bfloat16
-            )
+            lambda: gemm_op_a8w8.gemm_a8w8(x, w, x_scale, w_scale, dtype=torch.bfloat16)
         )
     finally:
         gemm_op_a8w8._try_flydsl_rdna3_a8w8 = original
 
     assert all(flydsl_dispatches), "a timed public call fell back from FlyDSL"
     triton_ms = _measure_ms(
-        lambda: gemm_a8w8_triton(
-            x, w, x_scale, w_scale, dtype=torch.bfloat16
-        )
+        lambda: gemm_a8w8_triton(x, w, x_scale, w_scale, dtype=torch.bfloat16)
     )
     return {
         "dtype": str(torch.bfloat16),
@@ -201,7 +241,7 @@ def main():
             "a8w8_backend": os.environ["AITER_GEMM_A8W8_BACKEND"],
             "input_seed": 4340,
         },
-        "reference": "float32 torch.mm(x, w.T) * row_scale * column_scale, cast to output dtype",
+        "reference": "float32 torch.mm(x, w.T) * (row_scale * column_scale), cast to output dtype",
         "comparison_backend": "Triton; Aiter CK/asm A8W8 is gated to gfx9, so it is unavailable on gfx11",
         "first_call_note": (
             "Includes JIT compilation or persistent-cache restore; this number alone "
@@ -216,6 +256,10 @@ def main():
         result = _check_correctness(dtype, gemm_op_a8w8, gemm_a8w8_triton)
         report["correctness"].append(result)
         print(f"correctness {dtype}: passed")
+
+    result = _check_extreme_scale_correctness(gemm_op_a8w8, gemm_a8w8_triton)
+    report["correctness"].append(result)
+    print("correctness extreme scales: passed")
 
     for shape in ((1, 1024, 1024), (32, 1024, 1024), (256, 2048, 1024)):
         result = _benchmark_shape(*shape, gemm_op_a8w8, gemm_a8w8_triton)
