@@ -783,7 +783,7 @@ for _base, _ca, _cb in _PERSISTENT_CPOL_GROUPS:
             bm, bn, bk, cachectl_a=_ca, cachectl_b=_cb
         )
 
-# Nooob mirrors at +1000 for both legacy (1300..1305) and cpol (1306..1323).
+# Nooob mirrors at +1000 for both legacy (1300..1303) and cpol (1304..1315).
 # Explicit cachectl inheritance keeps name() consistent with parents.
 a16w16_persistent_kernels_list_nooob = {
     kid + 1000: _a16w16_persistent(

@@ -2,6 +2,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """CPU-only coverage for OPUS split-barrier cache-policy registrations."""
 
+import ast
 from dataclasses import replace
 from pathlib import Path
 import sys
@@ -14,6 +15,37 @@ from csrc.opus_gemm import opus_gemm_common as registry
 
 
 class TestA16W16CachePolicyRegistry(unittest.TestCase):
+    def test_all_registry_families_have_distinct_ids(self):
+        # Read the actual merge inputs so a newly added family is covered without
+        # keeping a second, manually maintained list of family names in this test.
+        module = ast.parse(Path(registry.__file__).read_text(encoding="utf-8"))
+        merges = [
+            node.value
+            for node in module.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "kernels_list"
+                for target in node.targets
+            )
+        ]
+        self.assertEqual(len(merges), 1)
+        merge = merges[0]
+        self.assertIsInstance(merge, ast.Dict)
+        self.assertTrue(merge.values)
+        owners = {}
+        for key, value in zip(merge.keys, merge.values):
+            self.assertIsNone(key, "Expected named registry family unpacking")
+            self.assertIsInstance(value, ast.Name)
+            for kid, instance in getattr(registry, value.id).items():
+                self.assertNotIn(
+                    kid,
+                    owners,
+                    f"kid {kid} is shared by {owners.get(kid)} and {value.id}",
+                )
+                owners[kid] = value.id
+                self.assertIs(registry.kernels_list[kid], instance)
+        self.assertEqual(set(owners), set(registry.kernels_list))
+
     def test_each_cache_policy_survives_registry_merge(self):
         families = (
             registry.a16w16_kernels_list_cpol,
