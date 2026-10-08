@@ -9,7 +9,8 @@
 #include "aiter_tensor.h"
 #include <optional>
 
-int moe_sorting_opus_get_workspace_size(int tokens, int num_experts, int topk, int dispatch_policy);
+int moe_sorting_opus_get_workspace_size(
+    int tokens, int num_experts, int topk, int dispatch_policy, int device_id = -1);
 
 void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
                           aiter_tensor_t& topk_weights,
@@ -54,9 +55,11 @@ void mxfp4_moe_sort_quant_fwd(aiter_tensor_t& hidden_states,
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <hip/hip_runtime.h>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "opus/opus.hpp"
 
@@ -1405,6 +1408,42 @@ OPUS_H bool moe_sorting_is_oneshot(int tokens_, int num_experts_)
     return is_sub_token_onshot;
 }
 
+OPUS_H bool moe_sorting_device_is_gfx950(int device_id_ = -1)
+{
+    static const std::vector<unsigned char> gfx950_by_device = [] {
+        int device_count = 0;
+        OPUS_HIP_CHECK_ERROR(hipGetDeviceCount(&device_count));
+        std::vector<unsigned char> result(device_count, 0);
+        for(int device_id = 0; device_id < device_count; ++device_id)
+        {
+            hipDeviceProp_t dev_prop;
+            OPUS_HIP_CHECK_ERROR(hipGetDeviceProperties(&dev_prop, device_id));
+            result[device_id] =
+                std::strncmp(dev_prop.gcnArchName, "gfx950", 6) == 0;
+        }
+        return result;
+    }();
+
+    hipDevice_t dev = device_id_;
+    if(dev < 0)
+        OPUS_HIP_CHECK_ERROR(hipGetDevice(&dev));
+    if(dev >= static_cast<hipDevice_t>(gfx950_by_device.size()))
+        throw std::out_of_range("invalid HIP device id");
+    return gfx950_by_device[dev] != 0;
+}
+
+OPUS_H bool
+moe_sorting_auto_is_oneshot(int tokens_, int num_experts_, int device_id_ = -1)
+{
+    bool is_oneshot = moe_sorting_is_oneshot(tokens_, num_experts_);
+    if(!is_oneshot)
+        return false;
+
+    // gfx950 crossover measured with E=256/257 at M>=8 and E=385 at all M.
+    bool prefer_mp = num_experts_ >= 385 || (num_experts_ >= 256 && tokens_ >= 8);
+    return !(moe_sorting_device_is_gfx950(device_id_) && prefer_mp);
+}
+
 // return size in byte
 OPUS_H opus::index_t moe_sorting_mp_get_workspace_size(int tokens_, int num_experts_, int topk_)
 {
@@ -1422,13 +1461,14 @@ OPUS_H opus::index_t moe_sorting_mp_get_workspace_size(int tokens_, int num_expe
 // dispatch_policy: 0-automatically pick up kerel. 1-always use single kernel, 2-always use mp
 // kernel
 OPUS_H opus::index_t
-moe_sorting_get_workspace_size(int tokens_, int num_experts_, int topk_, int dispatch_policy_)
+moe_sorting_get_workspace_size(
+    int tokens_, int num_experts_, int topk_, int dispatch_policy_, int device_id_ = -1)
 {
 #if 1
     // return 0;
     if(dispatch_policy_ == 0)
     {
-        if(moe_sorting_is_oneshot(tokens_, num_experts_))
+        if(moe_sorting_auto_is_oneshot(tokens_, num_experts_, device_id_))
         {
             return 0;
         }
@@ -3313,9 +3353,11 @@ struct moe_sorting_opus_args : public aiter::MoeSortingHostArgs
 };
 
 int
-moe_sorting_opus_get_workspace_size(int tokens, int num_experts, int topk, int dispatch_policy)
+moe_sorting_opus_get_workspace_size(
+    int tokens, int num_experts, int topk, int dispatch_policy, int device_id)
 {
-    return aiter::moe_sorting_get_workspace_size(tokens, num_experts, topk, dispatch_policy);
+    return aiter::moe_sorting_get_workspace_size(
+        tokens, num_experts, topk, dispatch_policy, device_id);
 }
 
 // Forward declaration
