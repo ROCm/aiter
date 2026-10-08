@@ -1,0 +1,34 @@
+# The GPU suite deliberately skips `.claude/` (see detect_aiter_test_scope in aiter-test.yaml):
+# the review bot's tooling never enters the wheel or the runtime, so building it proves nothing.
+# That would leave the tooling with no check at all, so run its own guards here instead —
+# seconds on a hosted runner, no GPU, no wheel.
+name: review-bot selftest
+
+on:
+  pull_request:
+    branches: [main]
+    paths: ['.claude/skills/review-pr/**']
+  push:
+    branches: [main]
+    paths: ['.claude/skills/review-pr/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shell syntax
+        run: |
+          for f in .claude/skills/review-pr/*.sh; do bash -n "$f"; done
+
+      - name: Prompts match SKILL.md, and fail classes match _notify.py
+        run: python3 .claude/skills/review-pr/check_prompts.py
+
+      - name: Guards — failure triage, run budget, refuter downgrade
+        run: bash .claude/skills/review-pr/selftest.sh
