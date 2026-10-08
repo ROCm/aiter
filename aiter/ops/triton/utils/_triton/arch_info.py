@@ -1,11 +1,27 @@
-import triton
-
 try:
-    _CACHED_ARCH = triton.runtime.driver.active.get_current_target().arch
-except RuntimeError:
-    from jax._src.lib import gpu_triton as triton_kernel_call_lib
+    import triton
+except ImportError:
+    triton = None
 
-    _CACHED_ARCH = triton_kernel_call_lib.get_arch_details("0").split(":")[0]
+
+def _detect_arch():
+    if triton is not None:
+        try:
+            return triton.runtime.driver.active.get_current_target().arch
+        except Exception:
+            pass
+
+    try:
+        from jax._src.lib import gpu_triton as triton_kernel_call_lib
+
+        return triton_kernel_call_lib.get_arch_details("0").split(":")[0]
+    except Exception:
+        pass
+
+    return None
+
+
+_CACHED_ARCH = _detect_arch()
 
 
 def get_arch():
