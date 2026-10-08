@@ -19,20 +19,54 @@ placement and slot tables are identical on all ranks without communication.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, ptrtoint, range_constexpr
+from flydsl.expr import rocdl as fly_rocdl
+from flydsl.expr.typing import T
 
-from ..moonep_planning import (
-    _INT_MAX,
-    _INT_MIN,
-    _KEY_NOT_CANDIDATE,
-    _KEY_SELECTED,
-    WAVE_SIZE,
-    _lds_atomic_add,
-    _lds_load,
-    _lds_store,
-    _wave_argmax,
-)
+from ..kernels_common import create_llvm_ptr
 from ..tensor_shim import buf_copy_load, ptr_buf_tensor
+
+WAVE_SIZE = 64
+_INT_MIN = -(2**31)
+_INT_MAX = 2**31 - 1
+# Top-B candidate keys: -1 = not a candidate, -2 = already selected.
+_KEY_NOT_CANDIDATE = -1
+_KEY_SELECTED = -2
+
+
+def _lds_load(ptr, idx):
+    return fx.ptr_load(ptr + fx.Int64(idx))
+
+
+def _lds_store(ptr, val, idx):
+    fx.ptr_store(val, ptr + fx.Int64(idx))
+
+
+def _lds_atomic_add(base_i64, idx, val):
+    """Workgroup-scope ``atomicrmw add`` on an i32 LDS slot."""
+    ptr = create_llvm_ptr(base_i64 + fx.Int64(idx) * 4, address_space=3)
+    raw = val.ir_value() if hasattr(val, "ir_value") else val
+    return llvm.AtomicRMWOp(
+        llvm.AtomicBinOp.add,
+        ptr,
+        raw,
+        llvm.AtomicOrdering.monotonic,
+        syncscope="workgroup",
+        alignment=4,
+    ).result
+
+
+def _wave_argmax(val, idx, lane):
+    """All-lanes argmax over one wave; ties go to the lower index."""
+    for stride in (1, 2, 4, 8, 16, 32):
+        peer = ((lane + fx.Int32(stride)) & fx.Int32(WAVE_SIZE - 1)) * 4
+        o_val = fx.Int32(fly_rocdl.ds_bpermute(T.i32, peer, val))
+        o_idx = fx.Int32(fly_rocdl.ds_bpermute(T.i32, peer, idx))
+        take = (o_val > val) | ((o_val == val) & (o_idx < idx))
+        val = take.select(o_val, val)
+        idx = take.select(o_idx, idx)
+    return val, idx
 
 
 def moonep_lds_fields(*, npes: int, experts: int, slots: int) -> dict:
@@ -286,7 +320,7 @@ def _emit_balanced_placement(
             fx.Int32(_INT_MIN),
         )
         q_idx = q_in_range.select(lane, fx.Int32(1 << 30))
-        quota, dest = _wave_argmax(q_val, q_idx, lane, prefer_low_index=True)
+        quota, dest = _wave_argmax(q_val, q_idx, lane)
         best_v = fx.Int32(_INT_MIN)
         best_i = fx.Int32(1 << 30)
         for c in range_constexpr(lpl):
@@ -295,7 +329,7 @@ def _emit_balanced_placement(
             take = (v > best_v) | ((v == best_v) & (slot < best_i))
             best_v = take.select(v, best_v)
             best_i = take.select(slot, best_i)
-        remaining, local_e = _wave_argmax(best_v, best_i, lane, prefer_low_index=True)
+        remaining, local_e = _wave_argmax(best_v, best_i, lane)
         active = quota > fx.Int32(0)
         move = (remaining < quota).select(remaining, quota)
         move = active.select(move, fx.Int32(0))

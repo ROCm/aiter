@@ -4,7 +4,7 @@
 
 Runs ``emit_moonep_placement`` + ``emit_moonep_virtual_counts`` in one
 standalone CTA on a synthetic gathered histogram and compares against
-``build_prefill_reference_plan`` and a Python virtual-count split.
+a CPU reference of the MoonEP placement and a Python virtual-count split.
 """
 
 import argparse
@@ -20,7 +20,6 @@ from aiter.ops.flydsl.kernels.mega_moe.moonep_fuse import (
     emit_moonep_virtual_counts,
 )
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
-from aiter.ops.flydsl.moonep import MoonEPPlanConfig, build_prefill_reference_plan
 
 R, E, B, K = 8, 384, 8, 6
 EPN = E // R
@@ -112,6 +111,53 @@ def _routing(tokens: int, skew: float, seed: int) -> torch.Tensor:
     return ids.view(R, tokens, K).to(torch.int32)
 
 
+def _placement_reference(tpe):
+    """MoonEP prefill placement on CPU: ``(alloc[dest, E], expert_to_slot, experts_to_copy)``.
+
+    Balance towards the all-rank average (most overloaded home to the roomiest
+    destination, largest local expert first), keep each destination's top-B
+    remote experts by (alloc, expert) descending, return the rest to owners.
+    """
+    count = tpe.sum(0).long()
+    total = int(count.sum())
+    target = torch.full((R,), total // R, dtype=torch.int64)
+    target[: total % R] += 1
+    balance = count.view(R, EPN).sum(1) - target
+    alloc = torch.zeros(E, R, dtype=torch.int64)
+    for e in range(E):
+        alloc[e, e // EPN] = count[e]
+    quotas = torch.zeros(R, R, dtype=torch.int64)
+    while int(balance.max()) > 0:
+        home, dest = int(balance.argmax()), int(balance.argmin())
+        quotas[home, dest] = -int(balance[dest])
+        balance[home] += balance[dest]
+        balance[dest] = 0
+    for home in range(R):
+        remaining = count[home * EPN:(home + 1) * EPN].clone()
+        while int(quotas[home].max()) > 0:
+            dest = int(quotas[home].argmax())
+            local = int(remaining.argmax())
+            take = min(int(remaining[local]), int(quotas[home, dest]))
+            alloc[home * EPN + local, dest] += take
+            alloc[home * EPN + local, home] -= take
+            remaining[local] -= take
+            quotas[home, dest] -= take
+    experts_to_copy = torch.full((R, B), -1, dtype=torch.int64)
+    expert_to_slot = torch.full((R, E), -1, dtype=torch.int64)
+    for dest in range(R):
+        expert_to_slot[dest, dest * EPN:(dest + 1) * EPN] = torch.arange(EPN)
+        remote = [e for e in range(E) if alloc[e, dest] > 0 and e // EPN != dest]
+        remote.sort(key=lambda e: (int(alloc[e, dest]), e), reverse=True)
+        for slot, e in enumerate(remote[:B]):
+            experts_to_copy[dest, slot] = e
+            expert_to_slot[dest, e] = EPN + slot
+        for e in remote[B:]:
+            alloc[e, e // EPN] += alloc[e, dest]
+            alloc[e, dest] = 0
+    assert torch.equal(alloc.sum(1), count)
+    return alloc.t().contiguous(), expert_to_slot, experts_to_copy
+
+
 def _settle_reference(want, held):
     target = torch.full_like(want, -1)
     for r in range(R):
@@ -166,14 +212,7 @@ def run_case(rank: int, skew: float, seed: int, *, sticky_held: bool, balance=Tr
     logical_pair_base = torch.zeros(COUNT_STRIDE, dtype=torch.int32)
     logical_pair_base[1:] = count[rank].cumsum(0)[:-1].to(torch.int32)
 
-    config = MoonEPPlanConfig(
-        rank=rank, world_size=R, num_tokens=tokens, top_k=K, num_experts=E,
-        prefetch_slots=B,
-    )
-    ref = build_prefill_reference_plan(config, ids[rank].to(dev), tpe.to(dev))
-    ref_alloc = ref.alloc.cpu().long()  # [dest, E]
-    ref_slot = ref.expert_to_slot.cpu().long()
-    ref_etc = ref.experts_to_copy.cpu().long()
+    ref_alloc, ref_slot, ref_etc = _placement_reference(tpe)
     if not balance:
         ref_alloc = torch.zeros(R, E, dtype=torch.int64)
         for e in range(E):
