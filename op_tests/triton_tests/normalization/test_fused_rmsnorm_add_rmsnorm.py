@@ -29,7 +29,18 @@ def reference(x, residual, post_weight, pre_weight):
     return added.to(torch.bfloat16), pre
 
 
-@pytest.mark.parametrize("rows, width", [(1, 6656), (64, 6656), (4096, 6656), (7, 257)])
+@pytest.mark.parametrize(
+    "rows, width",
+    [
+        (1, 6656),
+        (64, 6656),
+        (1024, 6656),
+        (1025, 6656),
+        (4096, 6656),
+        (4097, 257),
+        (7, 257),
+    ],
+)
 def test_fused_rmsnorm_add_rmsnorm(rows, width):
     torch.manual_seed(1064)
     x = torch.randn((rows, width), device="cuda", dtype=torch.bfloat16)
@@ -51,7 +62,7 @@ def test_fused_rmsnorm_add_rmsnorm(rows, width):
     torch.testing.assert_close(pre_norm, expected_norm, atol=0.02, rtol=0.02)
 
 
-@pytest.mark.parametrize("rows, width", [(64, 6656), (256, 257)])
+@pytest.mark.parametrize("rows, width", [(64, 6656), (256, 257), (1025, 257)])
 def test_fused_rmsnorm_add_rmsnorm_torch_compile(rows, width):
     x = torch.randn((rows, width), device="cuda", dtype=torch.bfloat16)
     residual = torch.randn_like(x)
