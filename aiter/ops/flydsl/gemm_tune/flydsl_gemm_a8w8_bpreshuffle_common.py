@@ -22,7 +22,7 @@ The gfx1250 WMMA pipeline has its own file and is not part of PIPELINES yet.
 import math
 import os
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import cache
 from typing import Any
 
@@ -50,6 +50,9 @@ class kernelInstance:
     lds_stage: int = 2  # 2=double-buffer ping-pong, 1=single A-LDS buffer (half LDS)
     sScheduler: str = "Default"  # scheduler hints on; "Off" = compiler default
     k_split: int = 1  # >1 splits the K loop over gridDim.z (fp32 workspace + reduce)
+    # "blockscale" (per-128-K fp32 scales) is a different compiled kernel from the
+    # per-token "epilogue" one, so it carries a trailing ``_smbs`` name token.
+    scale_mode: str = "epilogue"
 
     @property
     def enable_scheduler(self) -> bool:
@@ -83,6 +86,7 @@ class kernelInstance:
                 self.sScheduler.lower(),
             ]
             + ([f"ks{self.k_split}"] if self.k_split > 1 else [])
+            + (["smbs"] if self.scale_mode == "blockscale" else [])
         )
 
 
@@ -227,6 +231,13 @@ def kernel_fits_shape(ki: kernelInstance, M: int, N: int, K: int) -> bool:
     if N % ki.tile_n != 0 and ki.k_split > 1:
         return False
     if ki.k_split < 1:
+        return False
+    if ki.scale_mode == "blockscale" and (
+        ki.q_dtype_a != "fp8"
+        or ki.q_dtype_w != "fp8"
+        or ki.tile_k % 128 != 0
+        or not get_gfx().startswith("gfx950")
+    ):
         return False
     n_tiles = K // ki.tile_k
     tiles_per_split = (n_tiles + ki.k_split - 1) // ki.k_split
@@ -433,6 +444,22 @@ kernels_list_950.update(
     )
 )
 # fmt: on
+
+# Blockscale candidates: the gfx950 per-token tiles with tile_k % 128 == 0 plus
+# narrow tile_k=128 decode tiles (the per-token set only has tile_k >= 256 for
+# M=16, which cannot divide K such as 2176 = 17 * 128). gfx942 has no blockscale
+# support in kernel 1 yet. kernel_fits_shape (incl. the async-copy gate) applies
+# via ki.scale_mode.
+_base_tiles_blockscale = [
+    t for t in _base_tiles_common + _base_tiles_950_extra if t[2] % 128 == 0
+] + [(16, 32, 128), (16, 64, 128), (16, 128, 128), (16, 192, 128), (16, 256, 128)]
+kernels_list_blockscale = {
+    i: replace(ki, scale_mode="blockscale")
+    for i, ki in _build_kernels_list(
+        list(dict.fromkeys(_base_tiles_blockscale)),
+        total_vgpr=_vgpr_per_simd("gfx950"),
+    ).items()
+}
 
 default_kernels_dict_942 = {
     (-1): _ki(128, 128, 128, 0, 2, 0, 2, scheduler="Default"),

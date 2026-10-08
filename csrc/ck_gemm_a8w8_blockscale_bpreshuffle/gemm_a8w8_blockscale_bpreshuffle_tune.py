@@ -1,60 +1,47 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Tune the FlyDSL blockscale split-K bpreshuffle pipelines.
+"""Tune the FlyDSL single-launch blockscale bpreshuffle kernel (kernel 1).
 
-Adapted from ``gemm_a8w8_bpreshuffle_tune.py`` (the ptpc bpreshuffle tuner),
-narrowed to the single-pipeline blockscale mode of the a8w8 split-K family:
-``SPLITK_BLOCKSCALE_PIPELINE`` (fp32 in-loop dequant). Unlike ptpc
-bpreshuffle, it has one quant dtype (fp8) and one scale layout, so there is
-no ``--libtype``/``q_dtype_w`` sweep here -- every candidate is
-``libtype=flydsl``.
+Candidates come from the same tile/option space as the per-token kernel-1 tuner
+(``flydsl_gemm_a8w8_bpreshuffle_common``), restricted to blockscale-legal ones
+(fp8, tile_k % 128 == 0, gfx950), including split-K values, and are benchmarked
+through ``flydsl_preshuffle_gemm_a8(scale_mode="blockscale")``. Candidate names
+carry the ``_smbs`` token, which the runtime dispatch and AOT parse back out.
+Every candidate is ``libtype=flydsl``.
 
-This is bounded plumbing, not a tuning run: it writes winner rows to
-``aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv`` (via
-``AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE``, shared by both scale
-modes -- the runtime dispatch parses the scale mode back out of the
-kernelName) for whatever shapes are in its untuned CSV / built-in smoke list.
-No tuned rows are shipped from this file; a real sweep is a separate
-follow-up.
+Winner rows go to ``aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv``
+(via ``AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE``). No tuned rows are
+shipped from this file; a real sweep is a separate follow-up.
 """
 
+from dataclasses import replace
 from typing import Any, ClassVar
 
+import pandas as pd
 import torch
 from einops import rearrange
 
 from aiter import dtypes
 from aiter.jit.core import AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE
-from aiter.ops.flydsl.gemm_tune.flydsl_splitk_bpreshuffle_tuner_common import (
-    FlydslSplitKBpreshuffleTuner,
-)
 from aiter.ops.shuffle import shuffle_weight
+from aiter.utility.base_tuner import GemmCommonTuner
+from aiter.utility.mp_tuner import mp_tuner
 
-# Reuses the same common module as the ptpc bpreshuffle tuner: the pipeline
-# and its kernel table are committed there (d0c7422c) precisely so a separate
-# blockscale tuner script can import and drive them without duplicating the
-# candidate-generation logic. Same import guard as the ptpc tuner: this module
-# must stay importable (to name candidates) even where flydsl cannot compile.
+# Same import guard as the per-token tuner: stay importable where flydsl cannot
+# compile.
 try:
     from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import (
-        SPLITK_BLOCKSCALE_PIPELINE,
-        kernels_list_splitk_blockscale,
+        k_split_candidates,
+        kernel_fits_shape,
+        kernels_list_blockscale,
     )
 except ImportError:
     print(
         "[FlyDSL] flydsl_gemm_a8w8_bpreshuffle_common.py not found, "
-        "flydsl blockscale split-K tuning disabled"
+        "flydsl blockscale tuning disabled"
     )
-    SPLITK_BLOCKSCALE_PIPELINE = None
-    kernels_list_splitk_blockscale = {}
-
-# Sweep exactly one pipeline each -- kept as tuples (not a bare Pipeline) so
-# the tune-task loops below stay shaped like the multi-pipeline ptpc template,
-# in case a second pipeline is added to either scale mode later.
-FLYDSL_BLOCKSCALE_PIPELINES = (
-    (SPLITK_BLOCKSCALE_PIPELINE,) if SPLITK_BLOCKSCALE_PIPELINE is not None else ()
-)
+    kernels_list_blockscale = {}
 
 BLOCK_SHAPE = (128, 128)  # (block_n, block_k), matches gemm_a8w8_blockscale_tune.py
 
@@ -90,15 +77,13 @@ def run_torch_blockscale(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
     return out.to(dtype)
 
 
-def run_gemm_flydsl_splitk_blockscale(
-    x, weight_shuffle, x_scale, w_scale, out, kernel_id
+def run_gemm_flydsl_blockscale(
+    x, weight_shuffle, x_scale, w_scale, out, kernel_id, k_split=1
 ):
-    from aiter.ops.flydsl.kernels.preshuffle_gemm_splitk_op import (
-        flydsl_preshuffle_gemm_splitk_a8,
-    )
+    from aiter.ops.flydsl.gemm_kernels import flydsl_preshuffle_gemm_a8
 
-    ki = kernels_list_splitk_blockscale[kernel_id]
-    flydsl_preshuffle_gemm_splitk_a8(
+    ki = kernels_list_blockscale[kernel_id]
+    flydsl_preshuffle_gemm_a8(
         x,
         weight_shuffle,
         x_scale,
@@ -107,32 +92,24 @@ def run_gemm_flydsl_splitk_blockscale(
         ki.tile_m,
         ki.tile_n,
         ki.tile_k,
-        ki.split_k,
-        use_async_copy=ki.use_async_copy,
-        waves_per_eu=ki.waves_per_eu,
-        xcd_swizzle=ki.xcd_swizzle,
+        ki.use_async_copy,
+        ki.waves_per_eu,
+        ki.xcd_swizzle,
         lds_stage=ki.lds_stage,
         enable_scheduler=ki.enable_scheduler,
-        scale_mode=ki.scale_mode,
-        use_m_bounded_store=ki.use_m_bounded_store,
+        split_k=k_split,
+        scale_mode="blockscale",
     )
     return out
 
 
-# Pipeline name -> runner, mirroring
-# ``_FLYDSL_PIPELINE_RUNNERS`` in the ptpc bpreshuffle tuner.
-_FLYDSL_PIPELINE_RUNNERS = {
-    "splitk_blockscale": run_gemm_flydsl_splitk_blockscale,
-}
-
-
 def generate_data_blockscale(m, n, k, seed, dtype=dtypes.bf16, device="cuda"):
-    """Random blockscale-quantized inputs, scales in the FlyDSL split-K layout.
+    """Random blockscale-quantized inputs, scales in the kernel-1 blockscale layout.
 
     ``x_scale`` is generated ``[M, K//128]`` (the layout
     ``gemm_a8w8_blockscale_tune.py`` uses for its torch-reference dequant) and
     then transposed to ``[K//128, M]`` -- the layout
-    ``flydsl_preshuffle_gemm_splitk_a8(..., scale_mode="blockscale")`` requires.
+    ``flydsl_preshuffle_gemm_a8(..., scale_mode="blockscale")`` requires.
     ``w_scale`` needs no transform: ``[N//128, K//128]`` is already what both
     sides expect.
     """
@@ -170,13 +147,16 @@ SMOKE_SHAPES = [
 ]
 
 
-class GemmA8W8BlockScaleBpreShuffleTuner(FlydslSplitKBpreshuffleTuner):
+class GemmA8W8BlockScaleBpreShuffleTuner(GemmCommonTuner):
     ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
-        **FlydslSplitKBpreshuffleTuner.ARG_DEFAULTS,
+        **GemmCommonTuner.ARG_DEFAULTS,
         "tune_file": f"{AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE}",
         "untune_file": "aiter/configs/a8w8_blockscale_bpreshuffle_untuned_gemm.csv",
         "config_env_name": "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE",
     }
+
+    def _setup_specific_arguments(self):
+        """No extra flags: single pipeline/libtype."""
 
     def _clear_op_caches(self):
         from aiter.ops import gemm_op_a8w8 as _op
@@ -185,58 +165,40 @@ class GemmA8W8BlockScaleBpreShuffleTuner(FlydslSplitKBpreshuffleTuner):
         _op._CKGEMM_CONFIG_CACHE.clear()
         _op._CKGEMM_HAS_GFX.clear()
 
-    def _tune_task_getter_names(self) -> tuple[str, ...]:
-        return ("get_flydsl_splitk_blockscale_tune_task",)
-
     def calculate(self, results, bpes=(1, 1, 2)):
         ## bpes = (inbpe, w_bpe, outbpe)
         return super().calculate(results, bpes=bpes)
 
     def getKernelName(self, kernelId, libtype="flydsl"):
-        if kernelId in kernels_list_splitk_blockscale:
-            return kernels_list_splitk_blockscale[kernelId].name
+        if kernelId in kernels_list_blockscale:
+            return kernels_list_blockscale[kernelId].name
         return None
 
-    def get_flydsl_splitk_blockscale_tune_task(self, info_keys, seed):
-        _gfx, _cu_num, M, N, K = info_keys
-
-        if SPLITK_BLOCKSCALE_PIPELINE is None:
-            return []
+    def get_flydsl_blockscale_tune_task(self, info_keys, seed):
+        _gfx, cu_num, M, N, K = info_keys
 
         gemm_flydsl_keys = ["x", "weight_shuffle", "x_scale", "w_scale", "out"]
         ref_keys = ["x", "weight", "x_scale_ref", "w_scale"]
         tasks = []
-        for pipe in FLYDSL_BLOCKSCALE_PIPELINES:
-            runner_entry = _FLYDSL_PIPELINE_RUNNERS.get(pipe.name)
-            if runner_entry is None:
-                print(f"[FlyDSL] no runner registered for pipeline {pipe.name!r}")
+        for i in sorted(kernels_list_blockscale):
+            ki = kernels_list_blockscale[i]
+            if not kernel_fits_shape(ki, M, N, K):
                 continue
-            runner = runner_entry
-            if not pipe.kernels_list:
-                continue
-            for i in sorted(pipe.kernels_list.keys()):
-                ki = pipe.kernels_list[i]
-                if not pipe.fits(ki, M, N, K):
-                    continue
+            for ks in [1] + k_split_candidates(ki, M, N, K, cu_num=cu_num):
+                name = replace(ki, k_split=ks).name
                 tasks.append(
                     (
-                        (info_keys, i, 0, ki.name, "flydsl"),
+                        (info_keys, i, 0 if ks == 1 else ks, name, "flydsl"),
                         generate_data_blockscale,
                         (M, N, K, seed, dtypes.bf16),
-                        runner,
-                        (
-                            gemm_flydsl_keys,
-                            i,
-                        ),
+                        run_gemm_flydsl_blockscale,
+                        (gemm_flydsl_keys, i, ks),
                         {
                             "num_warmup": args.warmup,
                             "num_iters": args.iters,
                         },
                         run_torch_blockscale,
-                        (
-                            ref_keys,
-                            dtypes.bf16,
-                        ),
+                        (ref_keys, dtypes.bf16),
                         {},
                         None,
                         1e-2,
@@ -247,6 +209,66 @@ class GemmA8W8BlockScaleBpreShuffleTuner(FlydslSplitKBpreshuffleTuner):
                     )
                 )
         return tasks
+
+    def tune(self, untunedf, tunedf, args):
+        cu_num = self.get_cu_num()
+        gfx = self.get_gfx()
+        task = []
+        tasks_data = []  # [(kernel_nums, datas)]
+        for i in range(len(untunedf)):
+            M = untunedf.loc[i, "M"]
+            N = untunedf.loc[i, "N"]
+            K = untunedf.loc[i, "K"]
+            prev_task_count = len(task)
+            task.extend(
+                self.get_flydsl_blockscale_tune_task((gfx, cu_num, M, N, K), i + 1)
+            )
+            tasks_data.append((len(task) - prev_task_count, ()))
+        ret = []
+        if task:
+            ret = mp_tuner(
+                task,
+                tasks_data,
+                args.mp,
+                False,
+                args.shape_grouped,
+                args.errRatio,
+                timeout=args.timeout,
+                verbose=args.verbose,
+            )
+        return ret
+
+    def result_to_df(self, results):
+        resultdf = pd.DataFrame(columns=self.columns)
+        for el in results:
+            info, time, err_ratio = el
+            keys, kernelId, splitK, kernelName, libtype = info
+            kernelName = (
+                "None"
+                if time == self.INVALID_TIME
+                else (self.getKernelName(kernelId) if kernelName == "" else kernelName)
+            )
+            tflops, bw = self.calculate(el)
+            key_dict = dict(zip(self.keys, keys))
+            key_dict.update(
+                {
+                    "libtype": [libtype],
+                    "kernelId": [kernelId],
+                    "splitK": [splitK],
+                    "us": [time],
+                    "kernelName": [kernelName],
+                    "errRatio": [err_ratio],
+                    "tflops": [tflops],
+                    "bw": [bw],
+                }
+            )
+            temp = pd.DataFrame(key_dict)
+            resultdf = (
+                temp
+                if resultdf.empty
+                else pd.concat([resultdf, temp], ignore_index=True)
+            )
+        return resultdf
 
 
 if __name__ == "__main__":
@@ -267,7 +289,7 @@ if __name__ == "__main__":
         "GemmA8W8BlockScaleBpreShuffleTuner",
         key=key,
         resultList=resultList,
-        description="gen API for gemm a8w8 blockscale bpreshuffle flydsl split-K kernel",
+        description="gen API for gemm a8w8 blockscale bpreshuffle flydsl kernel",
     )
 
     args = tuner.parse_args()

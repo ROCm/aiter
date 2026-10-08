@@ -13,7 +13,7 @@ way as runtime JIT config lookup.
 Supported kernel families:
   - ``flydsl_hgemm_*``                        gfx950 A16W16 GEMM kernels
   - ``flydsl_hgemm_*_gfx1250``                gfx1250 A16W16 GEMM kernels
-  - ``flydsl_bpreshuflle_*``                  a8w8 preshuffle GEMM kernels
+  - ``flydsl_bpreshuflle_*``                  a8w8 preshuffle GEMM kernels (``_smbs`` suffix: gfx950 blockscale)
   - ``flydsl_bpreshuffle_splitk_*``           gfx950 split-K a8w8 preshuffle GEMM (two-pass)
   - ``flydsl_bpreshuffle_8w_*``               gfx950 8-wave a8w8 ptpc GEMM kernels
   - ``flydsl_bpreshuffle_wmma_*``             gfx1250 a8w8 ptpc GEMM kernels
@@ -142,10 +142,10 @@ _PRESHUFFLE_RE = re.compile(
     r"(?P<tile_m>\d+)x(?P<tile_n>\d+)x(?P<tile_k>\d+)_"
     r"(?P<qa>[A-Z0-9]+)_(?P<qw>[A-Z0-9]+)_(?P<out>[A-Z0-9]+)_"
     r"(?P<async_copy>\d+)x(?P<waves_per_eu>\d+)(?:x(?P<xcd_swizzle>\d+))?(?:x(?P<lds_stage>\d+))?_"
-    r"(?!ks\d+$)(?P<scheduler>[A-Za-z][A-Za-z0-9]*)"
+    r"(?!ks\d+(?:_smbs)?$|smbs$)(?P<scheduler>[A-Za-z][A-Za-z0-9]*)"
     # Trailing _ksN, emitted only for k_split > 1, so pre-split-K names still
     # match. Without it they fail fullmatch and drop out of the AOT build.
-    r"(?:_ks(?P<k_split>\d+))?$"
+    r"(?:_ks(?P<k_split>\d+))?(?P<blockscale>_smbs)?$"
 )
 _SPLITK_RE = re.compile(
     r"^flydsl_bpreshuffle_splitk_"
@@ -206,6 +206,7 @@ def _parse_preshuffle_kernel_name(name: str) -> dict | None:
         "lds_stage": int(m.group("lds_stage")) if m.group("lds_stage") else 2,
         "scheduler": m.group("scheduler"),
         "k_split": int(m.group("k_split")) if m.group("k_split") else 1,
+        "scale_mode": "blockscale" if m.group("blockscale") else "epilogue",
     }
 
 
@@ -676,6 +677,7 @@ def _compile_preshuffle_to_cache(
     lds_stage: int = 2,
     scheduler: str = "Default",
     k_split: int = 1,
+    scale_mode: str = "epilogue",
     **kwargs,
 ):
     del kwargs
@@ -707,8 +709,14 @@ def _compile_preshuffle_to_cache(
         device=dev,
         dtype=torch.int32,
     )
-    scale_a = torch.empty((max(m, 1),), device=dev, dtype=torch.float32)
-    scale_b = torch.empty((max(n, 1),), device=dev, dtype=torch.float32)
+    if scale_mode == "blockscale":
+        scale_a = torch.empty((k // 128) * max(m, 1), device=dev, dtype=torch.float32)
+        scale_b = torch.empty(
+            ((n + 127) // 128) * (k // 128), device=dev, dtype=torch.float32
+        )
+    else:
+        scale_a = torch.empty((max(m, 1),), device=dev, dtype=torch.float32)
+        scale_b = torch.empty((max(n, 1),), device=dev, dtype=torch.float32)
     bias = unused_tensor_arg(None, torch.empty(0, device=dev, dtype=out_torch_dtype))
     stream = fx.Stream(0)
 
@@ -726,6 +734,7 @@ def _compile_preshuffle_to_cache(
         xcd_swizzle=xcd_swizzle,
         lds_stage=lds_stage,
         split_k=k_split,
+        scale_mode=scale_mode,
     )
     # The layout-API launcher uses fx.Tensor args (it builds views via
     # fx.get_iter/make_view), so pass flat torch tensors directly rather
