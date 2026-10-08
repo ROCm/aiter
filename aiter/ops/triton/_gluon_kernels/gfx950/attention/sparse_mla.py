@@ -386,6 +386,7 @@ class Cfg:
         DSV4_WALK=False,
         SCL_DWORD=False,
         STAGED_K32=False,
+        BF16_GATHER=False,
     ):
         self.BLOCK_M = gl.constexpr(BLOCK_M)
         self.BLOCK_K = gl.constexpr(BLOCK_K)
@@ -397,7 +398,9 @@ class Cfg:
         # Lanes per gathered 512 B row: 32 x 16 B, or 16 x 32 B on the dsv4 walk.
         GATHER_TW1 = 16 if DSV4_WALK else 32
         self.GATHER_TW1 = gl.constexpr(GATHER_TW1)
-        GSPT = 16 * (32 // GATHER_TW1)
+        # 16 elements is 16 B per lane only for 1-byte rows. bf16 rows at 16 put
+        # lanes 32 B apart, a two-way bank conflict on every 128-bit KV-tile store.
+        GSPT = (8 if BF16_GATHER else 16) * (32 // GATHER_TW1)
         self.GSPT = gl.constexpr(GSPT)
         self.SCL_DWORD = gl.constexpr(SCL_DWORD)
         LDS_PAD = 16 if FP8_MFMA else 8
@@ -2294,6 +2297,7 @@ def _sparse_mla(
             and ((not HAS_EXTRA) or EXTRA_FMT == "bf16")
         )
     )
+    BF16_GATHER: gl.constexpr = STAGED_K32 and MAIN_FMT == "bf16"
     gl.static_assert(
         UNI_TILE or (MAIN_FMT != "fp8_scalar" and MAIN_FMT != "fp8_dsv32_mla"),
         "tensor/dsmla formats require UNI_TILE=1",
@@ -2397,6 +2401,7 @@ def _sparse_mla(
         DSV4_WALK,
         CS0_ALIGN >= 4,
         STAGED_K32,
+        BF16_GATHER,
     )
     main_fmt = Fmt(
         cfg,
