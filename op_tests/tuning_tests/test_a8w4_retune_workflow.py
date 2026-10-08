@@ -248,6 +248,7 @@ class TestSerialScheduler(unittest.TestCase):
                 ]
 
             def launch(self, command, **kwargs):
+                assert command[command.index("--batch") + 1] == "4"
                 name = Path(command[command.index("-i") + 1]).stem
                 events.append(f"launch {name}")
                 model = name.removesuffix("_input")
@@ -264,6 +265,7 @@ class TestSerialScheduler(unittest.TestCase):
                         assert record["pid"] == 100
                         assert record["status"] == "running"
                         assert "source" in record
+                        assert record["batch"] == 4
                         events.append(f"leader ended {name}")
                         return 1
 

@@ -520,8 +520,10 @@ def check_coverage(input_path, tuned_path, failure_path, profile_path):
     }
 
 
-def run_models(records, repo, output_dir, gpus, system=None):
+def run_models(records, repo, output_dir, gpus, system=None, batch=4):
     """Run the fixed model sequence, with one leader and drained workers."""
+    if batch <= 0:
+        raise ValueError("batch must be positive")
     system = system or LaunchSystem()
     repo, output_dir = Path(repo).resolve(), Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -583,7 +585,7 @@ def run_models(records, repo, output_dir, gpus, system=None):
                 "--errRatio",
                 "0.1",
                 "--batch",
-                "6",
+                str(batch),
                 "--mp",
                 str(len(gpus)),
                 "--all",
@@ -616,6 +618,7 @@ def run_models(records, repo, output_dir, gpus, system=None):
                 "command": command,
                 "gpus": gpus,
                 "mp": len(gpus),
+                "batch": batch,
                 "idle_samples": samples,
                 "warmup": 5,
                 "iters": 101,
@@ -694,7 +697,12 @@ def main():
         nargs="+",
         help="physical HIP GPU IDs, rechecked before each launch",
     )
+    parser.add_argument(
+        "--batch", type=int, default=4, help="shapes per tuning batch (default: 4)"
+    )
     args = parser.parse_args()
+    if args.batch <= 0:
+        parser.error("--batch must be positive")
     output_dir = args.output_dir or args.repo / "docs/a8w4_work"
     if not args.prepare and not args.run:
         parser.error("specify --prepare and/or --run")
@@ -721,7 +729,7 @@ def main():
             parser.error(
                 "unset inherited HIP_VISIBLE_DEVICES/ROCR_VISIBLE_DEVICES before selecting physical GPUs"
             )
-        report = run_models(records, args.repo, output_dir, args.gpus)
+        report = run_models(records, args.repo, output_dir, args.gpus, batch=args.batch)
         raise SystemExit(0 if report["status"] == "passed" else 1)
 
 
