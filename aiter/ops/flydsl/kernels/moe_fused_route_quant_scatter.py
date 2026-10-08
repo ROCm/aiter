@@ -626,7 +626,6 @@ def _emit_interleaved_scale_dwords(c, scale_dword, e8m0_scale):
                 packed,
                 c.scale_rsrc,
                 dst.scale_row_dword_base + scale_dword * c.c_wmma_rep * 16,
-                mask=getattr(dst, "store_mask", None),
             )
 
     group_lead = arith.andi(
@@ -688,13 +687,11 @@ def _emit_payload_stores(c, dst_payload, payload_val, mx_block):
         + c.lane_in_block * c.c_payload_bytes_per_lane
     )
     payload_cache = getattr(c, "payload_cache_modifier", 0)
-    payload_dests = getattr(c, "payload_dests", c.dests)
-    for dst, rsrc in zip(payload_dests, dst_payload):
+    for rsrc in dst_payload:
         buffer_ops.buffer_store(
             payload_val,
             rsrc,
             payload_byte_off,
-            mask=getattr(dst, "store_mask", None),
             cache_modifier=payload_cache,
             offset_is_bytes=True,
         )
@@ -2068,7 +2065,6 @@ def build_moe_token_multidest_quant_module(
     quant_mode: str = "fp4",
     tdm_hidden_chunks: int = _TOKEN_MULTIDEST_TDM_CHUNKS,
     ksplit: int = 1,
-    dynamic_routes: bool = False,
 ):
     """Quantize each token once and scatter the result to its ``topk`` routed rows.
 
@@ -2076,8 +2072,7 @@ def build_moe_token_multidest_quant_module(
     one uses a warp per token, computes the MX payload/e8m0 row once, then emits
     every destination. What it saves therefore grows with ``topk``, while what
     it costs -- one buffer descriptor per destination held live across the store
-    pass -- grows with it too. Dynamic routes mask dead-tail and dropped routes
-    independently, without splitting a wave across source tokens.
+    pass -- grows with it too.
     """
     L = _quant_layout(feat_dim, quant_mode, wmma_rep)
     if not L.use_pk8:
@@ -2128,7 +2123,6 @@ def build_moe_token_multidest_quant_module(
         f"{'_scpk' if scale_pack_dwords else ''}"
         f"{f'_hidtdm{tdm_hidden_chunks}' if tdm_hidden_chunks else ''}"
         f"{f'_ks{ksplit}' if ksplit > 1 else ''}"
-        f"{'_dynroutes' if dynamic_routes else ''}"
     )
 
     @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
@@ -2137,7 +2131,6 @@ def build_moe_token_multidest_quant_module(
         grouped_payload: fx.Pointer,
         grouped_scale: fx.Pointer,
         topids_to_rows: fx.Pointer,
-        num_valid_routes: fx.Pointer,
         token_num: Int32,
     ):
         i32 = T.i32
@@ -2166,12 +2159,6 @@ def build_moe_token_multidest_quant_module(
         lane = tid - warp_in_block * c_wave
         token0 = bid * arith.constant(warps_per_block, type=i32)
         token = token0 + warp_in_block
-        valid_token_count = fx.Uint32(token_num)
-        if const_expr(dynamic_routes):
-            valid_route_count = fx.Uint32(ptr_buf_tensor(num_valid_routes)[c0_i32])
-            valid_token_count = (
-                valid_route_count + arith.constant(topk - 1, type=i32)
-            ) // arith.constant(topk, type=i32)
 
         # Double-buffered hidden staging: [chunk slot 0 | chunk slot 1].
         hslot = warps_per_block * hidden_chunk_bytes if tdm_hidden_chunks else 0
@@ -2186,7 +2173,7 @@ def build_moe_token_multidest_quant_module(
             hidden_lds_row_off = warp_in_block * arith.constant(
                 hidden_chunk_bytes, type=i32
             )
-            valid_rows = fx.Int32(valid_token_count) - fx.Int32(token0)
+            valid_rows = fx.Int32(token_num) - fx.Int32(token0)
             hg_base = fx.recast_iter(fx.Int8, hidden) + fx.Int64(token0) * (
                 feat_dim * 2
             )
@@ -2241,7 +2228,7 @@ def build_moe_token_multidest_quant_module(
         # token is past the end reads token 0 instead and has its destination
         # descriptors zero-sized, so its stores are dropped by the hardware
         # bounds check rather than by a branch.
-        valid = token < valid_token_count
+        valid = token < fx.Uint32(token_num)
         token_eff = valid.select(token, fx.Uint32(c0_i32))
         pay_records = valid.select(
             arith.constant(payload_bytes_per_row, type=i32), c0_i32
@@ -2250,39 +2237,15 @@ def build_moe_token_multidest_quant_module(
         scale_records = valid.select(
             arith.constant(_SCALE_RSRC_MAX_BYTES, type=i32), c0_i32
         )
-        if token0 < valid_token_count:
+        if token0 < fx.Uint32(token_num):
             rows_t = ptr_buf_tensor(topids_to_rows)
             route0 = token_eff * arith.constant(topk, type=i32)
             # Scalar loads: the route is wave-uniform, and landing each row in
             # an SGPR is what keeps its destination descriptor uniform too.
-            if const_expr(dynamic_routes):
-                raw_rows = [
-                    fx.Int32(
-                        buf_scalar_load(rows_t, route0 + arith.constant(k, type=i32))
-                    )
-                    for k in range_constexpr(topk)
-                ]
-                # A negative row marks a route dropped by EP; a partial final
-                # token may also have routes beyond the device-side route count.
-                mapped = [
-                    arith.andi(
-                        arith.andi(valid, raw_row >= fx.Int32(0)),
-                        route0 + arith.constant(k, type=i32) < valid_route_count,
-                    )
-                    for k, raw_row in enumerate(raw_rows)
-                ]
-                rows = [
-                    is_mapped.select(fx.Uint32(raw_row), fx.Uint32(c0_i32))
-                    for raw_row, is_mapped in zip(raw_rows, mapped)
-                ]
-            else:
-                rows = [
-                    fx.Uint32(
-                        buf_scalar_load(rows_t, route0 + arith.constant(k, type=i32))
-                    )
-                    for k in range_constexpr(topk)
-                ]
-                mapped = [None for _ in range_constexpr(topk)]
+            rows = [
+                fx.Uint32(buf_scalar_load(rows_t, route0 + arith.constant(k, type=i32)))
+                for k in range_constexpr(topk)
+            ]
             scales = [
                 _token_multidest_scale_base(
                     row, c_rows_per_tile, c_dst_scale_dwords_per_row, c16_i32
@@ -2327,18 +2290,11 @@ def build_moe_token_multidest_quant_module(
                 block_in_wave=block_in_wave,
                 lane_in_block=lane_in_block,
                 is_block_lead=lane_in_block == c0_i32,
-                payload_dests=[
-                    SimpleNamespace(payload_row_i32=row, store_mask=is_mapped)
-                    for row, is_mapped in zip(rows, mapped)
-                ],
+                payload_dests=[SimpleNamespace(payload_row_i32=row) for row in rows],
                 # Scale destinations; the payload keeps its own list above.
                 dests=[
-                    SimpleNamespace(
-                        payload_row_i32=row,
-                        scale_row_dword_base=sc,
-                        store_mask=is_mapped,
-                    )
-                    for row, sc, is_mapped in zip(rows, scales, mapped)
+                    SimpleNamespace(payload_row_i32=row, scale_row_dword_base=sc)
+                    for row, sc in zip(rows, scales)
                 ],
                 # Zero-on-invalid bound: a dead token takes a zero-length
                 # descriptor rather than a branch.
@@ -2372,18 +2328,12 @@ def build_moe_token_multidest_quant_module(
         grouped_payload: fx.Pointer,
         grouped_scale: fx.Pointer,
         topids_to_rows: fx.Pointer,
-        num_valid_routes: fx.Pointer,
         token_num: fx.Int32,
         grid_blocks: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         token_multidest_kernel(
-            hidden,
-            grouped_payload,
-            grouped_scale,
-            topids_to_rows,
-            num_valid_routes,
-            token_num,
+            hidden, grouped_payload, grouped_scale, topids_to_rows, token_num
         ).launch(
             grid=(
                 arith.index_cast(T.index, grid_blocks),
