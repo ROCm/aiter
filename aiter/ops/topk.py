@@ -9,7 +9,7 @@ import os
 import torch
 
 from ..jit.core import compile_ops
-from ..jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
+from ..jit.utils.chip_info import get_cu_num, get_gfx
 from ..utility import dtypes
 
 
@@ -456,6 +456,20 @@ _FLYDSL_TOPK_PREFILL_DISABLED = os.environ.get(
 # has not been re-measured.
 _SAMPLED_MIN_STRIDE0 = {"gfx950": 131072}
 
+
+@functools.lru_cache(maxsize=64)
+def _device_arch(device: int) -> str:
+    """The architecture of one GPU, e.g. "gfx950". Per device, not per process:
+    a process can drive gfx942 and gfx950 GPUs side by side."""
+    return torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
+
+
+def _sampled_on_device(device: int) -> bool:
+    """Whether `sampled` may route on this GPU at all: its architecture has a
+    measured floor above. topk_sampled_supports() stays the capability check."""
+    return device >= 0 and _device_arch(device) in _SAMPLED_MIN_STRIDE0
+
+
 # Below this k the sampled threshold rests on a handful of sample hits, and
 # enough rows land under k that some fall back to the exact full-row select:
 # still correct, but a call with one such row ran up to 5.3x slower than the
@@ -468,7 +482,7 @@ _SAMPLED_MIN_K = 96
 
 
 def _should_use_sampled_prefill(
-    numRows: int, stride0: int, stride1: int, k: int, stable: bool
+    numRows: int, stride0: int, stride1: int, k: int, stable: bool, device: int
 ) -> bool:
     """Whether top_k_per_row_prefill hands this call to `sampled`.
 
@@ -482,11 +496,10 @@ def _should_use_sampled_prefill(
         return False
     if os.environ.get("AITER_DISABLE_TOPK_SAMPLED", "0") == "1":
         return False
-    floor = _SAMPLED_MIN_STRIDE0.get(get_gfx_runtime())
-    return (
-        floor is not None
-        and stride0 >= floor
-        and _sampled_supports_cached(numRows, stride0, k)
+    if not _sampled_on_device(device):
+        return False
+    return stride0 >= _SAMPLED_MIN_STRIDE0[_device_arch(device)] and (
+        _sampled_supports_cached(numRows, stride0, k, device)
     )
 
 
@@ -520,7 +533,9 @@ def top_k_per_row_prefill(
     # served every shape tested, M=4096 N=65536 included.
     # A layout the sampled kernels cannot address stays on the paths below,
     # which take it exactly as they did before `sampled` existed.
-    if _should_use_sampled_prefill(numRows, stride0, stride1, k, stable) and (
+    if _should_use_sampled_prefill(
+        numRows, stride0, stride1, k, stable, logits.get_device()
+    ) and (
         _sampled_layout_error(logits, rowStarts, rowEnds, indices, values, numRows, k)
         is None
     ):
@@ -616,12 +631,15 @@ def topk_sampled_workspace_size(numRows: int, stride0: int, k: int) -> int: ...
 
 
 @compile_ops("module_top_k_per_row")
-def topk_sampled_supports(numRows: int, stride0: int, k: int) -> bool: ...
+def topk_sampled_supports(
+    numRows: int, stride0: int, k: int, device_id: int = -1
+) -> bool: ...
 
 
 @functools.lru_cache(maxsize=1024)
-def _sampled_supports_cached(numRows: int, stride0: int, k: int) -> bool:
-    """topk_sampled_supports() memoised, because the binding call is not cheap.
+def _sampled_supports_cached(numRows: int, stride0: int, k: int, device: int) -> bool:
+    """topk_sampled_supports() for one GPU, memoised, because the binding call is
+    not cheap.
 
     Measured: 4.86 us per call, against a kernel that is 43 us at numRows=64
     stride0=65537. Adding one unmemoised call to the validation below cost
@@ -629,13 +647,13 @@ def _sampled_supports_cached(numRows: int, stride0: int, k: int) -> bool:
     constant ~5 us offset that did not grow with the work, which is what host
     overhead looks like.
 
-    Safe to cache: past the target check, topk_sampled_supports is a pure function
-    of these three ints. It computes sampled::params_for -> derive_shape_params,
-    which reads no device state (CU_COUNT is a constexpr in topk_shape.hip.hpp).
-    The target check reads the GPU architecture once per process and declines
-    everything off gfx950.
+    Safe to cache: topk_sampled_supports is a pure function of the shape and of
+    the device's architecture, and the device is in the key. The shape half
+    computes sampled::params_for -> derive_shape_params, which reads no device
+    state (CU_COUNT is a constexpr in topk_shape.hip.hpp); the architecture half
+    declines every GPU that is not gfx950.
     """
-    return bool(topk_sampled_supports(numRows, stride0, k))
+    return bool(topk_sampled_supports(numRows, stride0, k, device))
 
 
 @functools.lru_cache(maxsize=1024)
@@ -810,14 +828,15 @@ def top_k_per_row_prefill_sampled(
         raise ValueError(
             f"top_k_per_row_prefill_sampled: logits inner stride must be 1, got {stride1}"
         )
-    if not _sampled_supports_cached(numRows, stride0, k):
-        raise ValueError(
-            f"top_k_per_row_prefill_sampled: unsupported shape (numRows={numRows} "
-            f"stride0={stride0} k={k}); ask topk_sampled_supports() first"
-        )
     err = _sampled_layout_error(logits, rowStarts, rowEnds, indices, values, numRows, k)
     if err is not None:
         raise ValueError(f"top_k_per_row_prefill_sampled: {err}")
+    if not _sampled_supports_cached(numRows, stride0, k, logits.get_device()):
+        raise ValueError(
+            f"top_k_per_row_prefill_sampled: unsupported shape (numRows={numRows} "
+            f"stride0={stride0} k={k}) on {logits.device}; ask "
+            "topk_sampled_supports() first"
+        )
     if nan_high and values is not None:
         raise ValueError(
             "top_k_per_row_prefill_sampled: nan_high selects indices only; "

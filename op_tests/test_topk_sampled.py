@@ -3,6 +3,7 @@ row whose candidates overflow. `sampled` only offers a faster algorithm, so each
 test holds it to what the entry it serves already does."""
 
 import os
+from unittest import mock
 
 import torch
 
@@ -122,8 +123,9 @@ def test_sampled_nan_order():
     nan_cols = torch.tensor([1000 * j + 7 for j in range(len(payloads))], device="cuda")
 
     _use_sampled(True)
-    assert S.topk_select_backend(rows, N, k, S._available(N, k, 64, False, True)) == (
-        "sampled"
+    avail = S._available(N, k, 64, False, True, T._sampled_on_device(0))
+    assert (
+        S.topk_select_backend(rows, N, k, avail, device=0) == "sampled"
     ), "this shape must exercise `sampled`"
     vals, idx = aiter.topk_select(x, k, return_value=True)
     torch.cuda.synchronize()
@@ -166,7 +168,67 @@ def test_sampled_overflow_all_equal():
     print("[sampled_overflow] PASS")
 
 
+def test_sampled_eligibility_per_device():
+    """Eligibility belongs to the GPU a call runs on, whichever GPU was asked
+    about first. One process can drive gfx942 and gfx950 side by side; on a host
+    with one kind, device 1 is made to read as gfx942 so both orders can run."""
+    if torch.cuda.device_count() < 2 or not all(
+        T._device_arch(d) == "gfx950" for d in (0, 1)
+    ):
+        print("[sampled_per_device] SKIP: needs two gfx950 GPUs")
+        return
+    rows = 4
+    real_arch = T._device_arch
+
+    def fake_arch(d):
+        return "gfx942" if d == 1 else real_arch(d)
+
+    def reset():
+        T._sampled_supports_cached.cache_clear()
+        S._available.cache_clear()
+        S._choose.cache_clear()
+
+    def routes_to_sampled(dev):
+        x = torch.randn(rows, N, device=f"cuda:{dev}")
+        rs = torch.zeros(rows, dtype=torch.int32, device=x.device)
+        re = torch.full((rows,), N, dtype=torch.int32, device=x.device)
+        idx = torch.empty(rows, K, dtype=torch.int32, device=x.device)
+        with mock.patch.object(T, "_top_k_per_row_prefill_sampled") as fn:
+            T.top_k_per_row_prefill(x, rs, re, idx, None, rows, N, 1, K)
+            prefill = fn.called
+        select = S._choose(rows, N, K, 64, False, None, False, True, dev)
+        return prefill, select == "sampled"
+
+    _use_sampled(True)
+    for order in ((0, 1), (1, 0)):
+        reset()
+        T._device_arch = S._device_arch = fake_arch
+        try:
+            got = {dev: routes_to_sampled(dev) for dev in order}
+        finally:
+            T._device_arch = S._device_arch = real_arch
+            reset()
+        assert got[0] == (True, True), f"order {order}: gfx950 must route to sampled"
+        assert got[1] == (False, False), f"order {order}: gfx942 must not"
+
+    # The capability check answers for the device it is given, not the current one.
+    for current, asked in ((0, 1), (1, 0)):
+        with torch.cuda.device(current):
+            assert aiter.topk_sampled_supports(rows, N, K, asked)
+
+    # A tensor on a GPU that is not the current one is served on its own GPU.
+    with torch.cuda.device(0):
+        x = torch.randn(rows, N, device="cuda:1")
+        rs, re = (t.to("cuda:1") for t in _bounds(rows, N))
+        idx = torch.empty(rows, K, dtype=torch.int32, device="cuda:1")
+        aiter.top_k_per_row_prefill_sampled(x, rs, re, idx, None, rows, N, 1, K)
+        torch.cuda.synchronize(1)
+    assert _selected_keys_match(x, idx, K, _sign_key), "cross-device call"
+    print("[sampled_per_device] PASS")
+
+
 if __name__ == "__main__":
     test_sampled_layout_contract()
     test_sampled_nan_order()
     test_sampled_overflow_all_equal()
+    test_sampled_eligibility_per_device()

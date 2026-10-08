@@ -60,8 +60,10 @@ from aiter.ops.flydsl.topk.topk_per_row_small_k import (
 )
 from aiter.ops.topk import (
     _SAMPLED_MIN_K,
+    _device_arch,
+    _sampled_on_device,
+    _sampled_supports_cached,
     top_k_per_row_prefill_sampled,
-    topk_sampled_supports,
 )
 from aiter.ops.topk_plain import (
     topk_plain,
@@ -506,7 +508,7 @@ def _stream_small_reject_kernel(
 
 @lru_cache(maxsize=256)
 def _available(
-    width: int, k: int, wave_size: int, ragged: bool, fp32: bool = True
+    width: int, k: int, wave_size: int, ragged: bool, fp32: bool, sampled_ok: bool
 ) -> frozenset:
     """Backends that can serve this geometry at all.
 
@@ -567,7 +569,9 @@ def _available(
     # the row count; `topk_select_backend` asks `topk_sampled_supports` with the
     # rows it has. Admitting it here and refusing there is the same shape as the
     # streaming selector's two-block-width case above.
-    if fp32 and os.environ.get("AITER_DISABLE_TOPK_SAMPLED", "0") != "1":
+    # `sampled_ok` is whether the input's own GPU may run it (`_sampled_on_device`):
+    # the kernels are traps off gfx950, and one process can hold both kinds.
+    if fp32 and sampled_ok and os.environ.get("AITER_DISABLE_TOPK_SAMPLED", "0") != "1":
         out.add("sampled")
     return frozenset(out)
 
@@ -582,8 +586,9 @@ def _choose(
     tie: str | None,
     deterministic: bool,
     fp32: bool,
+    device: int,
 ) -> str:
-    """The backend for one call shape, resolved once.
+    """The backend for one call shape on one GPU, resolved once.
 
     Every input is a scalar the caller varies rarely, and the whole decision --
     which backends can serve, which the promises leave, which the shape rules
@@ -593,13 +598,16 @@ def _choose(
     allowed = frozenset(_BACKENDS_BY_TIE[tie])
     if deterministic:
         allowed -= _NONDETERMINISTIC
-    available = _available(width, k, wave_size, ragged, fp32) & allowed
+    available = (
+        _available(width, k, wave_size, ragged, fp32, _sampled_on_device(device))
+        & allowed
+    )
     if not available:
         raise RuntimeError(
             f"no backend serves rows={rows} width={width} topk={k} "
             f"tie={tie!r} deterministic={deterministic} fp32={fp32}"
         )
-    return topk_select_backend(rows, width, k, available, ragged=ragged)
+    return topk_select_backend(rows, width, k, available, ragged=ragged, device=device)
 
 
 def _plain_k2048_multiblock(rows: int, width: int, ragged: bool) -> bool:
@@ -633,7 +641,12 @@ def _plain_k2048_lds_tail_takes(rows: int, width: int, k: int) -> bool:
 
 
 def _sampled_takes(
-    rows: int, width: int, k: int, yield_to_plain: bool = False, ragged: bool = False
+    rows: int,
+    width: int,
+    k: int,
+    yield_to_plain: bool = False,
+    ragged: bool = False,
+    device: int | None = None,
 ) -> bool:
     """Total work past which `sampled` measured fastest of every backend here.
 
@@ -690,16 +703,18 @@ def _sampled_takes(
     """
     if k < _SAMPLED_MIN_K:
         return False
-    if k == 2048 and width < _SAMPLED_MIN_WIDTH and get_gfx_runtime() == "gfx950":
+    if device is None:
+        device = torch.cuda.current_device()
+    if k == 2048 and width < _SAMPLED_MIN_WIDTH and _device_arch(device) == "gfx950":
         if _plain_k2048_multiblock(rows, width, ragged) or (
             rows <= _PLAIN_K2048_FEW_ROWS and width > _PLAIN_K2048_FEW_ROWS_MAX_WIDTH
         ):
-            return bool(topk_sampled_supports(rows, width, k))
+            return _sampled_supports_cached(rows, width, k, device)
         if yield_to_plain and _plain_takes(rows, width, k):
             return False
     if not (rows * width >= _SAMPLED_MIN_WORK or width >= _SAMPLED_MIN_WIDTH):
         return False
-    return bool(topk_sampled_supports(rows, width, k))
+    return _sampled_supports_cached(rows, width, k, device)
 
 
 def _stream_small_reject(rows: int, rejects: int) -> bool:
@@ -748,7 +763,12 @@ def _decode_takes(rows: int, width: int, k: int) -> bool:
 
 
 def topk_select_backend(
-    rows: int, width: int, k: int, available: frozenset[str], ragged: bool = False
+    rows: int,
+    width: int,
+    k: int,
+    available: frozenset[str],
+    ragged: bool = False,
+    device: int | None = None,
 ) -> str:
     """Name the backend to use for this shape among those that can serve it.
 
@@ -804,6 +824,7 @@ def topk_select_backend(
         k,
         yield_to_plain="plain" in available and not ragged,
         ragged=ragged,
+        device=device,
     ):
         return "sampled"
     if "plain" in available and _plain_takes(rows, width, k):
@@ -1033,6 +1054,7 @@ def topk_select(
         tie,
         deterministic,
         input.dtype is torch.float32,
+        input.device.index,
     )
     gathered = None
     if _whole_row_takes(

@@ -1448,6 +1448,8 @@ static void topk_fused_impl(const float* d_in,
 #include "aiter_hip_common.h"
 #include "aiter_stream.h"
 #include "aiter_tensor.h"
+#include <atomic>
+#include <cstring>
 #include <optional>
 
 namespace sampled {
@@ -1521,19 +1523,42 @@ int64_t topk_sampled_workspace_size(int64_t numRows, int64_t stride0, int64_t k)
     return static_cast<int64_t>(sampled::ws_layout(M, cap).total);
 }
 
+// gfx950 only: elsewhere the kernels are traps (TOPK_SAMPLED_DEVICE), and the
+// launch plan's LDS would not fit -- at N=262144 k=2048 phase_c asks for
+// 100,352 B of dynamic LDS at M=1 and 67,584 B at M=64, against gfx942's
+// 65,536 B. Answered per device: one process can drive gfx942 and gfx950 GPUs
+// side by side, so a single process-wide answer would let one GPU's verdict
+// stand for another's. Cached, because the property query costs far more than
+// the rest of topk_sampled_supports, which the entry repeats on every call.
+static bool sampled_device_ok(int device)
+{
+    if(device < 0)
+        HIP_CALL(hipGetDevice(&device));
+    constexpr int kCached = 64;
+    static std::atomic<signed char> verdict[kCached]; // 0 unknown, 1 no, 2 yes
+    if(device < kCached)
+    {
+        const signed char v = verdict[device].load(std::memory_order_relaxed);
+        if(v != 0)
+            return v == 2;
+    }
+    hipDeviceProp_t prop;
+    HIP_CALL(hipGetDeviceProperties(&prop, device));
+    const bool ok = std::strncmp(prop.gcnArchName, "gfx950", 6) == 0 &&
+                    (prop.gcnArchName[6] == '\0' || prop.gcnArchName[6] == ':');
+    if(device < kCached)
+        verdict[device].store(ok ? 2 : 1, std::memory_order_relaxed);
+    return ok;
+}
+
 // Reports whether this op can serve the shape at all, so Python can route
 // around it instead of taking an AITER_CHECK abort. Kept in C++ because every
 // term it tests (the target, LDS residency, dwordx4 geometry, the Phase C LDS
-// cap) is a property of these kernels, not of the caller.
-bool topk_sampled_supports(int64_t numRows, int64_t stride0, int64_t k)
+// cap) is a property of these kernels, not of the caller. device_id < 0 asks
+// about the current device.
+bool topk_sampled_supports(int64_t numRows, int64_t stride0, int64_t k, int64_t device_id = -1)
 {
-    // gfx950 only: elsewhere the kernels are traps (TOPK_SAMPLED_DEVICE), and
-    // the launch plan's LDS would not fit -- at N=262144 k=2048 phase_c asks
-    // for 100,352 B of dynamic LDS at M=1 and 67,584 B at M=64, against
-    // gfx942's 65,536 B. Read once per process: the device query costs far more
-    // than the rest of this test, which the entry repeats on every call.
-    static const bool arch_ok = get_gpu_arch() == "gfx950";
-    if(!arch_ok)
+    if(!sampled_device_ok(static_cast<int>(device_id)))
         return false;
     if(numRows <= 0 || stride0 <= 0 || k <= 0)
         return false;
@@ -1579,12 +1604,16 @@ void top_k_per_row_prefill_sampled(
     bool ragged = true,
     // NaN order. false ranks NaN by sign, a negative NaN below -inf, as
     // top_k_per_row_prefill's radix paths do; true ranks every NaN above
-    // +inf, topk_select's contract. Indices only: those keys do not
-    // invert to the input value.
+    // +inf, topk_select's contract. Indices only: topk_select gathers its
+    // values itself.
     bool nan_high = false)
 {
     if(numRows <= 0)
         return;
+
+    // Before anything that asks the device: the checks below, and every launch,
+    // are about logits' GPU, not whichever one the calling thread had current.
+    HipDeviceGuard device_guard(logits.device_id);
 
     AITER_CHECK(logits.dtype() == AITER_DTYPE_fp32,
                 "top_k_per_row_prefill_sampled: logits must be fp32");
@@ -1605,7 +1634,7 @@ void top_k_per_row_prefill_sampled(
     AITER_CHECK(rowStarts.numel() >= static_cast<size_t>(numRows) &&
                     rowEnds.numel() >= static_cast<size_t>(numRows),
                 "top_k_per_row_prefill_sampled: rowStarts/rowEnds must have numRows entries");
-    AITER_CHECK(topk_sampled_supports(numRows, stride0, k),
+    AITER_CHECK(topk_sampled_supports(numRows, stride0, k, logits.device_id),
                 "top_k_per_row_prefill_sampled: unsupported shape (numRows=%ld stride0=%ld k=%ld); "
                 "ask topk_sampled_supports() first",
                 (long)numRows,
@@ -1623,7 +1652,6 @@ void top_k_per_row_prefill_sampled(
     // path: phase_b_filter_coop reads the tail, and the tests cover every N % 4
     // residue on both entries. topk_small_n truncates `pitch / FP32_EPT` with no
     // tail handling, so odd widths keep its bounds-checked instantiation.
-    HipDeviceGuard device_guard(logits.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
     const ShapeParams sp = sampled::params_for(M, N, K);

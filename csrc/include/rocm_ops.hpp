@@ -2326,7 +2326,8 @@ namespace py = pybind11;
           &topk_sampled_supports,                    \
           py::arg("numRows"),                    \
           py::arg("stride0"),                    \
-          py::arg("k"));
+          py::arg("k"),                          \
+          py::arg("device_id") = -1);
 
 #define MLA_METADATA_PYBIND                              \
     AITER_SET_STREAM_PYBIND;                             \

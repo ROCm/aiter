@@ -28,7 +28,7 @@ from aiter import dtypes
 from aiter.jit.utils.chip_info import _LDS_CAPACITY_BYTES as LDS_CAPACITY
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.tensor_shim import wave_size_of
-from aiter.ops.topk import topk_sampled_supports
+from aiter.ops.topk import _sampled_on_device, _sampled_supports_cached
 from aiter.ops.topk_select import (
     _available,
     topk_select,
@@ -67,7 +67,7 @@ def test_topk_select(m, n, k, tie, deterministic):
     x = torch.randn(m, n, dtype=dtypes.fp32)
     row_lens = torch.full((m,), n, dtype=dtypes.i32)
     ref = run_torch(x, row_lens, k)
-    serving = _serving(m, n, k, wave_size_of(x.device.index), False)
+    serving = _serving(m, n, k, wave_size_of(x.device.index), False, x.device.index)
 
     candidates = {
         "topk_select": lambda: topk_select(x, k, tie=tie, deterministic=deterministic)[
@@ -192,14 +192,14 @@ def test_half_invariants(m, n):
     return failures
 
 
-def _serving(rows, width, k, wave, ragged):
+def _serving(rows, width, k, wave, ragged, device):
     """The backends that serve this shape on this device.
 
     `_available` plus the row-count half of sampled's predicate, which it cannot
     ask; off gfx950 that half declines every shape.
     """
-    served = set(_available(width, k, wave, ragged))
-    if "sampled" in served and not topk_sampled_supports(rows, width, k):
+    served = set(_available(width, k, wave, ragged, True, _sampled_on_device(device)))
+    if "sampled" in served and not _sampled_supports_cached(rows, width, k, device):
         served.discard("sampled")
     return frozenset(served)
 
@@ -229,12 +229,13 @@ def _run_single_backend(x, row_lens, k, backend, end=None, output_idx=None):
     try:
         rows, width = x.shape
         wave = wave_size_of(x.device.index)
-        served = _serving(rows, width, k, wave, end is not None) & {backend}
+        dev = x.device.index
+        served = _serving(rows, width, k, wave, end is not None, dev) & {backend}
         if not served:
             raise _NotServed(
                 f"{backend} does not serve {rows}x{width} k={k} on {get_gfx()}"
             )
-        picked = ts.topk_select_backend(rows, width, k, served)
+        picked = ts.topk_select_backend(rows, width, k, served, device=dev)
         if picked != backend:
             raise AssertionError(f"asked for {backend}, the dispatch chose {picked}")
         return topk_select(x, k, end=end, output_idx=output_idx)[1]
