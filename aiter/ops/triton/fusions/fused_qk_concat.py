@@ -1,6 +1,7 @@
 import torch
 
 from aiter.ops.triton._triton_kernels.fusions.fused_qk_concat import (
+    _get_config,
     _qk_cat_kernel,
     _qk_rope_cat_kernel,
 )
@@ -71,6 +72,7 @@ def fused_qk_cat(
         QH_PER_KH=qh // kh,
         BLOCK_D1=d1,
         BLOCK_D2=d2,
+        **_get_config("FUSED_QK_CAT", b * qh),
     )
 
     return q_out, k_out
@@ -164,6 +166,7 @@ def fused_qk_rope_cat(
         BLOCK_D_nope=d_nope,
         BLOCK_D_pe=d_pe,
         BLOCK_D_HALF_pe=d_pe // 2,
+        **_get_config("FUSED_QK_ROPE_CAT", b * qh),
     )
 
     return q_out, k_out
