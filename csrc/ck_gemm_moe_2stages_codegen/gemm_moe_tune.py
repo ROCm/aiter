@@ -6473,7 +6473,13 @@ class Mxfp4FlydslTuner(FmoeTuner):
 
     def run(self, args, fast_mode=False):
         self._mxfp4_output_file = self.get_out_file(args.tune_file)
-        return super().run(args, fast_mode)
+        result = super().run(args, fast_mode)
+        if not args.run_config and not args.compare and self.untunedf.empty:
+            pd.DataFrame(columns=self.keys + ["status", "failure_reason"]).to_csv(
+                Path(self._mxfp4_output_file).with_suffix(".failed_shapes.csv"),
+                index=False,
+            )
+        return result
 
     @staticmethod
     def _g1_kname(
