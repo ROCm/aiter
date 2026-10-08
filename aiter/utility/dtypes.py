@@ -159,14 +159,14 @@ def str2tuple(v):
 
 
 def str2Dtype(v):
-    from ..ops.enum import QuantType
-
     def _convert(s):
         if s.lower() == "none":
             return None
         elif s in d_dtypes:
             return d_dtypes[s]
         else:
+            from ..ops.enum import QuantType
+
             # Case-insensitive lookup for QuantType
             s_lower = s.lower()
             for name in dir(QuantType):
