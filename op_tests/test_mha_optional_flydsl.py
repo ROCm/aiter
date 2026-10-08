@@ -44,6 +44,7 @@ def _flydsl_available(find_spec):
 
 def _dispatcher(name, *, available, enable_ck, flydsl=None, triton=None, ck=None):
     imports = []
+    ck_calls = []
     flydsl_module = SimpleNamespace(
         flydsl_flash_attn_batch_func=flydsl,
         flydsl_flash_attn_varlen_func=flydsl,
@@ -61,7 +62,8 @@ def _dispatcher(name, *, available, enable_ck, flydsl=None, triton=None, ck=None
             return triton_module
         return builtins.__import__(module_name, globals, locals, fromlist, level)
 
-    def ck_apply(*_args):
+    def ck_apply(*args):
+        ck_calls.append(args)
         return ck
 
     namespace = {
@@ -69,6 +71,7 @@ def _dispatcher(name, *, available, enable_ck, flydsl=None, triton=None, ck=None
         "__package__": "aiter.ops",
         "_FLYDSL_AVAILABLE": available,
         "ENABLE_CK": enable_ck,
+        "_ck_calls": ck_calls,
         "torch": SimpleNamespace(Tensor=Any, is_grad_enabled=lambda: False),
         "Tensor": Any,
         "Generator": Any,
@@ -175,6 +178,38 @@ def test_installed_flydsl_runtime_error_propagates():
     with pytest.raises(RuntimeError, match="FlyDSL runtime failure") as exc:
         function(q, k, v)
     assert exc.value is expected
+
+
+@pytest.mark.parametrize("available", [False, True])
+def test_varlen_descales_bypass_flydsl_and_reach_ck(available):
+    q, k, v = _inputs()
+    scales = (object(), object(), object())
+    result = object()
+
+    def unavailable(*_args, **_kwargs):
+        pytest.fail("FlyDSL should not be imported for prequantized attention")
+
+    function, imports = _dispatcher(
+        "flash_attn_varlen_func",
+        available=available,
+        enable_ck=True,
+        flydsl=unavailable,
+        ck=result,
+    )
+    assert function(
+        q,
+        k,
+        v,
+        object(),
+        object(),
+        2,
+        2,
+        q_descale=scales[0],
+        k_descale=scales[1],
+        v_descale=scales[2],
+    ) is result
+    assert all(module != "flydsl.fmha_kernels" for module, _level in imports)
+    assert function.__globals__["_ck_calls"][0][-3:] == scales
 
 
 def test_absent_flydsl_short_circuits_backward_eligibility():
