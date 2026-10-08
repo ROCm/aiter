@@ -2,6 +2,8 @@
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
+import triton
+from packaging.version import Version
 
 from aiter.ops.triton._triton_kernels.gather_kv_b_proj import (
     _next_pow2,
@@ -10,6 +12,13 @@ from aiter.ops.triton._triton_kernels.gather_kv_b_proj import (
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.device_info import get_num_sms
+
+_TRITON_VERSION = Version(Version(triton.__version__).base_version)
+_TRITON_GRID_STRIDE_FIX_VERSION = Version("3.9")
+
+
+def _needs_gfx1250_grid_stride_workaround(arch: str, triton_version: Version) -> bool:
+    return arch == "gfx1250" and triton_version < _TRITON_GRID_STRIDE_FIX_VERSION
 
 
 def gather_kv_b_proj(
@@ -122,10 +131,9 @@ def gather_kv_b_proj(
     max_kv_chunks = max(1, (total_kv_k + ChunkK - 1) // ChunkK)
     flat_token_grid = block_size == 1 and not is_fp4_weight
     if flat_token_grid:
-        if arch_info.get_arch() == "gfx1250":
-            # The gfx1250 compiler rejects the runtime grid-stride loop in the
-            # flat kernel with an LLVM PHI type assertion. One chunk per
-            # workgroup removes that loop while retaining the fused operation.
+        if _needs_gfx1250_grid_stride_workaround(arch_info.get_arch(), _TRITON_VERSION):
+            # Triton < 3.9 hits an LLVM PHI type assertion for this gfx1250
+            # grid-stride loop. Triton 3.9 fixed the compiler issue.
             chunk_workers = max_kv_chunks
         else:
             chunk_workers = min(
