@@ -1,8 +1,5 @@
 name: Stale pull requests
 
-# Labels a pull request `stale` after 15 days without activity. Nothing is
-# closed. Issues are out of scope.
-
 on:
   schedule:
     - cron: '0 1 * * *'
