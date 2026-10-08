@@ -1696,15 +1696,6 @@ def _core_attention_multi_kv_tiles(
         # wave 0 is still reading K out of it.
         _bare_barrier()
 
-    # ========================================================================
-    # Epilogue. The R q-tiles serialize through the same O ring.
-    # ========================================================================
-    o_mgr = _o_manager(
-        v_hdim=v_hdim,
-        gqa_ratio=gqa_ratio,
-        num_q_tiles_per_wave=R,
-        elem_dtype=elem_dtype,
-    )
     _o_free = [
         fx.Int32(final[_SLOT_BASE + 2]),
         fx.Int32(final[_SLOT_BASE + 0]),
@@ -1716,38 +1707,18 @@ def _core_attention_multi_kv_tiles(
     )
     # The trailing body's dead clamped tile copies are still in flight. HI's targets
     # final[1], a V chunk O never touches; LO's two K copies land in final[2] and final[1],
-    # and final[2] IS an O chunk -- so the drain needs a rendezvous behind it, since a wave
-    # only retires its own copies and O's chunk halves are shared by wave pairs.
+    # and final[2] IS an O chunk -- so the drain needs a rendezvous behind it, which
+    # ``_epilogue_attention`` supplies, since a wave only retires its own copies and O's
+    # chunk halves are shared by wave pairs.
     _kv_wait(*_kv_drain)
-    _bare_barrier()
-    _store_o_lse(
-        o_mgr=o_mgr,
+    return _epi_state(
         m_list=[fx.Float32(final[qt * _QS + 0]) for qt in range(R)],
         d_list=[fx.Float32(final[qt * _QS + 1]) for qt in range(R)],
         o_list=[
             [fx.Vector(final[qt * _QS + 2 + dt]) for dt in range(d_tiles)]
             for qt in range(R)
         ],
-        d_tiles=d_tiles,
-        R=R,
-        ptr_O=ptr_O,
-        stride_o_seq=stride_o_seq,
-        stride_o_head=stride_o_head,
-        q_start=q_start,
-        q_len=q_len,
-        kv_head=kv_head,
-        block_x=block_x,
-        warp_idx=warp_idx,
-        lane_idx=lane_idx,
         o_lds_warp=o_lds_warp,
-        seq_idx=seq_idx,
-        q_head_idx=q_head_idx,
-        return_lse=return_lse,
-        ptr_LSE=ptr_LSE,
-        lse_base_elems=lse_base_elems,
-        lse_num_records_bytes=lse_num_records_bytes,
-        stride_lse_seq=stride_lse_seq,
-        stride_lse_head=stride_lse_head,
     )
 
 
@@ -2038,36 +2009,8 @@ def _core_attention_one_kv_tile(
         + ((warp_idx >> fx.Int32(1)) & fx.Int32(1)) * fx.Int32(LDS_QO_BYTES)
         + (warp_idx >> fx.Int32(2)) * fx.Int32(_SPLIT_STRIDE)
     )
-    _store_o_lse(
-        o_mgr=_o_manager(
-            v_hdim=v_hdim,
-            gqa_ratio=gqa_ratio,
-            num_q_tiles_per_wave=R,
-            elem_dtype=elem_dtype,
-        ),
-        m_list=m_new_list,
-        d_list=d_new_list,
-        o_list=o_list,
-        d_tiles=d_tiles,
-        R=R,
-        ptr_O=ptr_O,
-        stride_o_seq=stride_o_seq,
-        stride_o_head=stride_o_head,
-        q_start=q_start,
-        q_len=q_len,
-        kv_head=kv_head,
-        block_x=block_x,
-        warp_idx=warp_idx,
-        lane_idx=lane_idx,
-        o_lds_warp=o_lds_warp,
-        seq_idx=seq_idx,
-        q_head_idx=q_head_idx,
-        return_lse=return_lse,
-        ptr_LSE=ptr_LSE,
-        lse_base_elems=lse_base_elems,
-        lse_num_records_bytes=lse_num_records_bytes,
-        stride_lse_seq=stride_lse_seq,
-        stride_lse_head=stride_lse_head,
+    return _epi_state(
+        m_list=m_new_list, d_list=d_new_list, o_list=o_list, o_lds_warp=o_lds_warp
     )
 
 
@@ -2183,6 +2126,123 @@ def _store_o_lse(
             buffer_ops.buffer_store(
                 lse_val, lse_rsrc, lse_off_masked, mask=None, offset_is_bytes=True
             )
+
+
+# Keys ``_epilogue_attention`` shares with the compute cores' kwarg dict.
+_EPI_KEYS = (
+    "v_hdim",
+    "gqa_ratio",
+    "num_q_tiles_per_wave",
+    "return_lse",
+    "elem_dtype",
+    "ptr_O",
+    "ptr_LSE",
+    "stride_o_seq",
+    "stride_o_head",
+    "stride_lse_seq",
+    "stride_lse_head",
+    "lse_base_elems",
+    "lse_num_records_bytes",
+    "q_start",
+    "q_len",
+)
+
+
+def _epi_state(*, m_list, d_list, o_list, o_lds_warp):
+    """Flatten a core's finished softmax/O state into scf.if-yieldable raw values."""
+    out = []
+    for qt in range(len(m_list)):
+        out += [_raw(m_list[qt]), _raw(d_list[qt])] + [_raw(v) for v in o_list[qt]]
+    return out + [_raw(o_lds_warp)]
+
+
+def _epi_state_zeros(*, num_q_tiles_per_wave, v_hdim):
+    """Type exemplar for the warp-type scf.if. Both branches overwrite it, so the
+    constants are dead; the rewriter needs the names bound before the branch."""
+    d_tiles = v_hdim // WMMA_M
+    R = num_q_tiles_per_wave
+    return _epi_state(
+        m_list=[fx.Float32(0.0) for _ in range(R)],
+        d_list=[fx.Float32(0.0) for _ in range(R)],
+        o_list=[
+            [fx.Vector.filled(8, 0.0, fx.Float32) for _ in range(d_tiles)]
+            for _ in range(R)
+        ],
+        o_lds_warp=fx.Int32(0),
+    )
+
+
+def _epilogue_attention(
+    *,
+    epi_state,
+    rendezvous,  # compile-time: the multi core leaves KV copies in O's chunk
+    warp_idx,
+    v_hdim,
+    gqa_ratio,
+    num_q_tiles_per_wave,
+    return_lse,
+    elem_dtype,
+    ptr_O,
+    ptr_LSE,
+    stride_o_seq,
+    stride_o_head,
+    stride_lse_seq,
+    stride_lse_head,
+    lse_base_elems,
+    lse_num_records_bytes,
+    q_start,
+    q_len,
+):
+    """The O/LSE tail, traced once per build instead of once per warp type.
+
+    Every core hands back the same flat state -- [m, d, O_0..O_{d_tiles-1}] per q-tile
+    plus the LDS chunk this wave stages O through -- and everything else here is a pure
+    function of the launch, so the warp-type scf.if can close before it."""
+    d_tiles = v_hdim // WMMA_M
+    R = num_q_tiles_per_wave
+    _QE = 2 + d_tiles
+    lane_idx = _lane_id()
+    kv_head, q_head_idx, seq_idx = _packed_tile_indices(
+        gqa_ratio, warp_idx, lane_idx, R
+    )
+    if rendezvous:
+        # O's chunk halves are shared by wave pairs and still hold the trailing dead KV
+        # copies; each half drained only its own, so the pair meets before the ds_writes.
+        _bare_barrier()
+    _store_o_lse(
+        o_mgr=_o_manager(
+            v_hdim=v_hdim,
+            gqa_ratio=gqa_ratio,
+            num_q_tiles_per_wave=R,
+            elem_dtype=elem_dtype,
+        ),
+        m_list=[fx.Float32(epi_state[qt * _QE + 0]) for qt in range(R)],
+        d_list=[fx.Float32(epi_state[qt * _QE + 1]) for qt in range(R)],
+        o_list=[
+            [fx.Vector(epi_state[qt * _QE + 2 + dt]) for dt in range(d_tiles)]
+            for qt in range(R)
+        ],
+        d_tiles=d_tiles,
+        R=R,
+        ptr_O=ptr_O,
+        stride_o_seq=stride_o_seq,
+        stride_o_head=stride_o_head,
+        q_start=q_start,
+        q_len=q_len,
+        kv_head=kv_head,
+        block_x=_m_tile_idx(),
+        warp_idx=warp_idx,
+        lane_idx=lane_idx,
+        o_lds_warp=fx.Int32(epi_state[R * _QE]),
+        seq_idx=seq_idx,
+        q_head_idx=q_head_idx,
+        return_lse=return_lse,
+        ptr_LSE=ptr_LSE,
+        lse_base_elems=lse_base_elems,
+        lse_num_records_bytes=lse_num_records_bytes,
+        stride_lse_seq=stride_lse_seq,
+        stride_lse_head=stride_lse_head,
+    )
 
 
 def _zero_fill_attention(
@@ -2441,26 +2501,36 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
                 lds_base = _alloc_lds()
                 warp_idx = _warp_id()
 
+                _epi = _epi_state_zeros(
+                    num_q_tiles_per_wave=NUM_Q_TILES, v_hdim=V_HDIM
+                )
                 if ONE_KV_TILE:
-                    _core_attention_one_kv_tile(
+                    _epi = _core_attention_one_kv_tile(
                         warp_idx=warp_idx, lds_base=lds_base, **_ca_kw
                     )
                 else:
                     # Warp specialization: LO (waves 0..N/2-1) vs HI (N/2..N-1).
                     if warp_idx // fx.Int32(NUM_WAVES // 2) == fx.Int32(0):
-                        _core_attention_multi_kv_tiles(
+                        _epi = _core_attention_multi_kv_tiles(
                             warp_idx=warp_idx,
                             warp_type=WarpType.LO,
                             lds_base=lds_base,
                             **_ca_kw,
                         )
                     else:
-                        _core_attention_multi_kv_tiles(
+                        _epi = _core_attention_multi_kv_tiles(
                             warp_idx=warp_idx,
                             warp_type=WarpType.HI,
                             lds_base=lds_base,
                             **_ca_kw,
                         )
+                # One traced copy of the O/LSE tail, outside the warp-type branch.
+                _epilogue_attention(
+                    epi_state=_epi,
+                    rendezvous=not ONE_KV_TILE,
+                    warp_idx=warp_idx,
+                    **{k: _ca_kw[k] for k in _EPI_KEYS},
+                )
             elif q_len > fx.Int32(0):
                 # Cross-attention tail: q_len>0 but kv_len==0 -> O=0, LSE=-inf (or sink).
                 _zero_fill_attention(
@@ -2563,26 +2633,36 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
         lds_base = _alloc_lds()
         warp_idx = _warp_id()
 
+        _epi = _epi_state_zeros(
+            num_q_tiles_per_wave=NUM_Q_TILES, v_hdim=V_HDIM
+        )
         if ONE_KV_TILE:
-            _core_attention_one_kv_tile(
+            _epi = _core_attention_one_kv_tile(
                 warp_idx=warp_idx, lds_base=lds_base, **_ca_kw
             )
         else:
             # Warp specialization: LO (waves 0..N/2-1) vs HI (N/2..N-1).
             if warp_idx // fx.Int32(NUM_WAVES // 2) == fx.Int32(0):
-                _core_attention_multi_kv_tiles(
+                _epi = _core_attention_multi_kv_tiles(
                     warp_idx=warp_idx,
                     warp_type=WarpType.LO,
                     lds_base=lds_base,
                     **_ca_kw,
                 )
             else:
-                _core_attention_multi_kv_tiles(
+                _epi = _core_attention_multi_kv_tiles(
                     warp_idx=warp_idx,
                     warp_type=WarpType.HI,
                     lds_base=lds_base,
                     **_ca_kw,
                 )
+        # One traced copy of the O/LSE tail, outside the warp-type branch.
+        _epilogue_attention(
+            epi_state=_epi,
+            rendezvous=not ONE_KV_TILE,
+            warp_idx=warp_idx,
+            **{k: _ca_kw[k] for k in _EPI_KEYS},
+        )
 
     return kn_fmha_fwd_prefill_a16w16_m32x8_bshd
 
