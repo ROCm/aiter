@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import math
+import operator
 from typing import NamedTuple
 
 import flydsl.expr as fx
@@ -28,6 +29,7 @@ from .kernels.attention_a2a_intranode_kernel import (
     make_attention_a2a_jit,
     make_attention_a2a_reuse_jit,
     needs_split_v_exchange,
+    supports_kv_seq_len,
     v_pc_partial_elems,
 )
 from .kernels.tensor_shim import _run_compiled
@@ -88,6 +90,11 @@ class AttentionA2AIntraNodeOp:
     and requires seq_local divisible by 32; DEFAULT retains the standard ordering.
     Odd multiples of 32 publish partial maxima before the V packing launch.
     Packed INT8 does not apply Hadamard rotation. MX Q folds softmax_scale * log2(e).
+    valid_kv_len defaults to the full padded sequence. With packed output and
+    token-local K/V scales, it keeps Q untrimmed and returns K/V for valid_kv_len
+    tokens in ceil(valid_kv_len / 128) tiles. Tokens at or past that length are
+    ignored; FP6-P V repeats the last valid token through its final tile.
+    Padding must be confined to the last rank's input slice.
     All ranks must use the same mode and serialize calls on one stream.
     Consumers must finish on that stream before the next call reusing their
     parity (two calls later); cross-stream consumers require an explicit join.
@@ -106,6 +113,7 @@ class AttentionA2AIntraNodeOp:
         v_pack: AttentionPack = AttentionPack.DEFAULT,
         softmax_scale=None,
         hadamard=None,
+        valid_kv_len=None,
     ):
         self.quant = quant is not None
         if self.quant:
@@ -256,24 +264,57 @@ class AttentionA2AIntraNodeOp:
         self.dtype = torch.bfloat16
         heads_local = shape[2] // world_size
         seq_full = shape[1] * world_size
-        mxfp4_k_size = heads_local * ((seq_full + 127) // 128) * 8192
-        mxfp4_v_size = heads_local * ((seq_full + 127) // 128) * 128 * 64 + 64
-        fp6_k_payload_size = heads_local * ((seq_full + 127) // 128) * 17408 + 256
-        fp6_v_payload_size = mxfp6_v_raw_buffer_size(1, seq_full, heads_local)
-        fp6_k_scale_size = seq_full * heads_local * 4 + 64
+        if valid_kv_len is None:
+            valid_kv_len = seq_full
+        try:
+            if isinstance(valid_kv_len, bool):
+                raise TypeError
+            valid_kv_len = operator.index(valid_kv_len)
+        except TypeError as exc:
+            raise ValueError("valid_kv_len must be an integer, not bool") from exc
+        lower_bound = seq_full - shape[1]
+        if not lower_bound < valid_kv_len <= seq_full:
+            raise ValueError(
+                f"valid_kv_len must be in ({lower_bound}, {seq_full}], "
+                f"with padding confined to the last rank; got {valid_kv_len}"
+            )
+        if valid_kv_len != seq_full:
+            unsupported = [
+                f"{'qkv'[role]}={self.codecs[role]}"
+                for role in (1, 2)
+                if not supports_kv_seq_len("qkv"[role], self.codecs[role])
+            ]
+            if not self.return_packed or unsupported:
+                raise ValueError(
+                    f"valid_kv_len < {seq_full} requires packed output with "
+                    f"token-local K/V scales; codecs={self.codecs}, "
+                    f"pack={self.v_pack.name}; unsupported: "
+                    f"{unsupported or 'BF16 return'}"
+                )
+        self.valid_kv_len = valid_kv_len
+        role_sequences = (seq_full, valid_kv_len, valid_kv_len)
+        role_numels = tuple(
+            sequence * heads_local * shape[3] for sequence in role_sequences
+        )
+        kv_tiles = (valid_kv_len + 127) // 128
+        mxfp4_k_size = heads_local * kv_tiles * 8192
+        mxfp4_v_size = heads_local * kv_tiles * 128 * 64 + 64
+        fp6_k_payload_size = heads_local * kv_tiles * 17408 + 256
+        fp6_v_payload_size = mxfp6_v_raw_buffer_size(1, valid_kv_len, heads_local)
+        fp6_k_scale_size = valid_kv_len * heads_local * 4 + 64
         if self.return_packed and any(codec == "mxfp4" for codec in self.codecs):
             from aiter.ops.mha_v4_quant import (
                 mxfp4_k_raw_buffer_size,
                 mxfp4_v_raw_buffer_size,
             )
 
-            mxfp4_k_size = mxfp4_k_raw_buffer_size(1, seq_full, heads_local)
-            mxfp4_v_size = mxfp4_v_raw_buffer_size(1, seq_full, heads_local)
+            mxfp4_k_size = mxfp4_k_raw_buffer_size(1, valid_kv_len, heads_local)
+            mxfp4_v_size = mxfp4_v_raw_buffer_size(1, valid_kv_len, heads_local)
         if self.return_packed and any(codec == "mxfp6" for codec in self.codecs):
             from aiter.ops.triton.quant.mxfp6_fmha_pack import fp6_k_raw_buffer_sizes
 
             fp6_k_payload_size, fp6_k_scale_size = fp6_k_raw_buffer_sizes(
-                1, seq_full, heads_local
+                1, valid_kv_len, heads_local
             )
         payload_sizes = tuple(
             (
@@ -289,7 +330,11 @@ class AttentionA2AIntraNodeOp:
                             fp6_v_payload_size
                             if self.return_packed and role == 2 and codec == "mxfp6_p"
                             else (
-                                _transport_bytes(numel, codec) if self.quant else numel
+                                (
+                                    _transport_bytes(role_numels[role], codec)
+                                    if self.quant
+                                    else role_numels[role]
+                                )
                             )
                         )
                     )
@@ -307,13 +352,13 @@ class AttentionA2AIntraNodeOp:
                 if per_tensor
                 else (
                     heads_local
-                    * mxfp6_v_tiles(seq_full)
+                    * mxfp6_v_tiles(valid_kv_len)
                     * MHA_V4_MXFP6_V_SCALE_TILE_BYTES
                     if self.return_packed and role == 2
                     else (
                         fp6_k_scale_size
                         if self.return_packed and role == 1 and codec == "mxfp6"
-                        else numel // 32
+                        else role_numels[role] // 32
                     )
                 )
             )
@@ -336,11 +381,11 @@ class AttentionA2AIntraNodeOp:
                 (
                     (
                         (
-                            (seq_full + MHA_V4_QUERY_TILE_ROWS - 1)
+                            (role_sequences[role] + MHA_V4_QUERY_TILE_ROWS - 1)
                             // MHA_V4_QUERY_TILE_ROWS
                         )
                         * MHA_V4_QUERY_TILE_ROWS
-                        - seq_full
+                        - role_sequences[role]
                     )
                     * heads_local
                     * 4
@@ -348,12 +393,12 @@ class AttentionA2AIntraNodeOp:
                     else (
                         (
                             (
-                                (seq_full + MHA_V4_KV_TILE_ROWS - 1)
+                                (valid_kv_len + MHA_V4_KV_TILE_ROWS - 1)
                                 // MHA_V4_KV_TILE_ROWS
                             )
                             * MHA_V4_KV_TILE_ROWS
                             + MHA_V4_KV_SCALE_LOOKAHEAD_ROWS
-                            - seq_full
+                            - valid_kv_len
                         )
                         * heads_local
                         * 4
@@ -532,6 +577,7 @@ class AttentionA2AIntraNodeOp:
                 "codec": self.codecs[i],
                 "hadamard": self.hadamard and i < 2,
                 "v4_output": _role_format(self.return_packed, i),
+                "valid_kv_len": role_sequences[i],
                 **({"v_pack": self.v_pack} if i == 2 else {}),
                 "q_multiplier": q_multiplier,
                 "fp8_fnuz": self.fp8_fnuz,

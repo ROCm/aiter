@@ -197,6 +197,24 @@ def _field_view(buffer, base, fields):
     )
 
 
+def _transport_kind(v4_output, codec):
+    if v4_output in ("q", "k") and codec in ("int8", "e4m3"):
+        return "per_tensor_qk"
+    if v4_output == "v":
+        return {"e4m3_pc": "fp8_pc_v", "e4m3": "fp8_v", "mxfp6_p": "fp6_p_v"}.get(
+            codec, "mx_v"
+        )
+    return "fp6_native" if codec == "mxfp6" else "generic"
+
+
+# These transports mask both payload and token-local amax at valid_kv_len.
+_KV_TRIM_TRANSPORTS = frozenset({"generic", "fp6_native", "mx_v", "fp6_p_v"})
+
+
+def supports_kv_seq_len(v4_output, codec):
+    return _transport_kind(v4_output, codec) in _KV_TRIM_TRANSPORTS
+
+
 def _transport_bytes(numel, codec):
     return numel * {"mxfp4": 4, "mxfp6": 6}.get(codec, 8) // 8
 
@@ -548,6 +566,7 @@ def make_attention_a2a_kernel(
     codec="e4m3",
     hadamard=False,
     v4_output="",
+    valid_kv_len=None,
     v_pack=AttentionPack.DEFAULT,
     q_multiplier=1.0,
     v4_amax=False,
@@ -562,13 +581,15 @@ def make_attention_a2a_kernel(
     )
     heads_local = heads // npes
     seq_full = seq_len * npes
-    k_tiles = (seq_full + 127) // 128
+    valid_kv_len = seq_full if valid_kv_len is None else valid_kv_len
+    transport_kind = _transport_kind(v4_output, codec)
+    k_tiles = (valid_kv_len + 127) // 128
     split_v_exchange = needs_split_v_exchange(v_pack, seq_len)
     split_frame = ((rank // 2 * 2 + 1) * seq_len) // 64
     # Tiles wholly inside this sender's sequence range are emitted by one wave so
     # their scale tail images can be staged in LDS.
     k_first_tile = (rank * seq_len + 127) // 128
-    k_last_tile = ((rank + 1) * seq_len) // 128
+    k_last_tile = min(((rank + 1) * seq_len) // 128, valid_kv_len // 128)
     k_own_tiles = max(0, k_last_tile - k_first_tile)
 
     def input_offset(seq, head, channel, elems_per_unit=1):
@@ -581,8 +602,8 @@ def make_attention_a2a_kernel(
 
     def row_offset(seq, head, channel, channels, head_major=False):
         layout = fx.make_layout(
-            (seq_full, heads_local),
-            (1, seq_full) if head_major else (heads_local, 1),
+            (valid_kv_len, heads_local),
+            (1, valid_kv_len) if head_major else (heads_local, 1),
         )
         row = fx.Int32(fx.get_scalar(fx.crd2idx((seq, head), layout)))
         return _row_field_offset(row, channel, channels)
@@ -882,6 +903,9 @@ def make_attention_a2a_kernel(
                     local_head = fx.Int32(fx.get_scalar(fx.get(work_coord, 0)))
                     seq = fx.Int32(fx.get_scalar(fx.get(work_coord, 1)))
                     row_chunk = fx.Int32(fx.get_scalar(fx.get(work_coord, 2)))
+                    output_valid = valid
+                    if const_expr(valid_kv_len < seq_full):
+                        output_valid = output_valid & (global_token(seq) < valid_kv_len)
                     head = global_head(dest_pe, local_head)
                     src_chunk = input_offset(seq, head, row_chunk, elements_per_chunk)
                     raw = buf_copy_load(
@@ -905,7 +929,7 @@ def make_attention_a2a_kernel(
                         for i in range_constexpr(elements_per_chunk):
                             amax = amax.maximumf(fmath.absf(decoded[i]))
                         # Tail lanes load a safe row, but must not contribute its max.
-                        amax = fx.Float32(valid.select(amax, fx.Float32(0.0)))
+                        amax = fx.Float32(output_valid.select(amax, fx.Float32(0.0)))
                         # Each aligned four-lane group owns 32 contiguous head values.
                         for shift in (1, 2):
                             amax = amax.maximumf(amax.shuffle_xor(shift, 64))
@@ -960,7 +984,7 @@ def make_attention_a2a_kernel(
                         if mode
                         else dst_chunk // 4
                     )
-                    valid_values.append(valid)
+                    valid_values.append(output_valid)
                 for batch_idx in range_constexpr(_PUSH_PIPELINE_DEPTH):
                     if valid_values[batch_idx]:
                         if const_expr(mode == "k" and codec == "mxfp6"):
@@ -1449,6 +1473,8 @@ def make_attention_a2a_kernel(
                     head = fx.Int32(fx.get_scalar(fx.get(native_k_coord, 0)))
                     seq = fx.Int32(fx.get_scalar(fx.get(native_k_coord, 1)))
                     channel = fx.Int32(fx.get_scalar(fx.get(native_k_coord, 2)))
+                if const_expr(valid_kv_len < seq_full):
+                    valid = valid & (global_token(seq) < valid_kv_len)
                 if const_expr(v4_output == "k" and k_own_tiles > 0):
                     own_lo = k_first_tile * 128 - rank * seq_len
                     own_hi = k_last_tile * 128 - rank * seq_len
@@ -1502,6 +1528,9 @@ def make_attention_a2a_kernel(
                             (heads_local * groups_per_row, groups_per_row, 1),
                         ),
                     )
+                    scale_seq = fx.Int32(fx.get_scalar(fx.get(scale_coord, 0)))
+                    if const_expr(valid_kv_len < seq_full):
+                        valid = valid & (global_token(scale_seq) < valid_kv_len)
                     emit_fp6_group(
                         shared,
                         output,
@@ -1510,7 +1539,7 @@ def make_attention_a2a_kernel(
                         peer_groups,
                         dest_pe,
                         fx.Int32(fx.get_scalar(fx.get(scale_coord, 1))),
-                        fx.Int32(fx.get_scalar(fx.get(scale_coord, 0))),
+                        scale_seq,
                         fx.Int32(fx.get_scalar(fx.get(scale_coord, 2))),
                         valid,
                         False,
@@ -2049,6 +2078,8 @@ def make_attention_a2a_kernel(
                 if const_expr(v_pack == AttentionPack.V_FOR_FP6_P):
                     token = fp6p_source_token(token)
                 valid = (token >= rank * seq_len) & (token < (rank + 1) * seq_len)
+                if const_expr(valid_kv_len < seq_full):
+                    valid = valid & (token < valid_kv_len)
                 seq = valid.select(token - rank * seq_len, 0)
                 raw = fx.Vector(
                     buf_copy_load(
@@ -2160,7 +2191,10 @@ def make_attention_a2a_kernel(
         def transport_v4_v(shared):
             # FP6-P groups share an amax across a 32-mod-64 sender boundary.
             first_tile = rank * seq_len // 128
-            rank_tiles = ((rank + 1) * seq_len + 127) // 128 - first_tile
+            rank_tiles = max(
+                0,
+                min(((rank + 1) * seq_len + 127) // 128, k_tiles) - first_tile,
+            )
             scale_table = ptr_buf_tensor(addr_p2p_scale, fx.Int64)
             v_transport_thread_coord = fx.idx2crd(
                 fx.Int32(tid), fx.make_layout((warp_num_per_block * 4, 16), (16, 1))
@@ -2170,7 +2204,7 @@ def make_attention_a2a_kernel(
             for phase in range_constexpr(2 if split_v_exchange else 1):
                 if const_expr(split_v_exchange and phase == 1):
                     first_tile = split_frame // 2
-                    rank_tiles = 1
+                    rank_tiles = int(split_frame // 2 < k_tiles)
                 for work in range(
                     bid, fx.Int32(heads * rank_tiles), fx.Int32(block_num)
                 ):
@@ -2411,7 +2445,10 @@ def make_attention_a2a_kernel(
         @flyc.jit
         def transport_v4_fp6_p_v(shared):
             first_tile = rank * seq_len // 128
-            rank_tiles = ((rank + 1) * seq_len + 127) // 128 - first_tile
+            rank_tiles = max(
+                0,
+                min(((rank + 1) * seq_len + 127) // 128, k_tiles) - first_tile,
+            )
             staging = shared.fp6_words.view(fx.make_layout(warp_num_per_block * 384, 1))
             tiles = shared.fp6_words.view(
                 fx.make_layout((4, warp_num_per_block, 96), (1, 384, 4))
@@ -2434,7 +2471,7 @@ def make_attention_a2a_kernel(
             for phase in range_constexpr(2 if split_v_exchange else 1):
                 if const_expr(split_v_exchange and phase == 1):
                     first_tile = split_frame // 2
-                    rank_tiles = 1
+                    rank_tiles = int(split_frame // 2 < k_tiles)
                 for work in range(
                     bid, fx.Int32(heads * rank_tiles), fx.Int32(block_num)
                 ):
@@ -2511,8 +2548,8 @@ def make_attention_a2a_kernel(
                                 )
                                 token = frame_start + token
                                 # FP6-P padding repeats the final token through the packed tile.
-                                token = (token < seq_full).select(
-                                    token, fx.Int32(seq_full - 1)
+                                token = (token < valid_kv_len).select(
+                                    token, fx.Int32(valid_kv_len - 1)
                                 )
                                 valid = (token >= rank * seq_len) & (
                                     token < (rank + 1) * seq_len
@@ -2690,17 +2727,17 @@ def make_attention_a2a_kernel(
             # Publication must finish before any block starts packing split frames.
             publish_v_partial(shared)
         else:
-            if const_expr(v4_output in ("q", "k") and codec in ("int8", "e4m3")):
+            if const_expr(transport_kind == "per_tensor_qk"):
                 transport_v4_per_tensor_qk()
-            elif const_expr(v4_output == "v" and codec == "e4m3_pc"):
+            elif const_expr(transport_kind == "fp8_pc_v"):
                 transport_v4_fp8_pc_v()
-            elif const_expr(v4_output == "v" and codec == "e4m3"):
+            elif const_expr(transport_kind == "fp8_v"):
                 transport_v4_fp8_v()
-            elif const_expr(v4_output == "v" and codec == "mxfp6_p"):
+            elif const_expr(transport_kind == "fp6_p_v"):
                 transport_v4_fp6_p_v(shared)
-            elif const_expr(v4_output == "v"):
+            elif const_expr(transport_kind == "mx_v"):
                 transport_v4_v(shared)
-            elif const_expr(quant and codec == "mxfp6" and native_fp6):
+            elif const_expr(quant and transport_kind == "fp6_native" and native_fp6):
                 transport_fp6_native(shared)
             else:
                 transport(
@@ -2796,6 +2833,7 @@ def make_attention_a2a_jit(
     codec="e4m3",
     hadamard=False,
     v4_output="",
+    valid_kv_len=None,
     v_pack=AttentionPack.DEFAULT,
     q_multiplier=1.0,
     v4_amax=False,
@@ -2815,6 +2853,7 @@ def make_attention_a2a_jit(
         "codec": codec,
         "hadamard": hadamard,
         "v4_output": v4_output,
+        "valid_kv_len": valid_kv_len,
         "v_pack": v_pack,
         "q_multiplier": q_multiplier,
         "v4_amax": v4_amax,
@@ -2841,6 +2880,7 @@ def make_attention_a2a_jit(
         codec,
         hadamard,
         v4_output,
+        valid_kv_len,
         v_pack,
         q_multiplier,
         v4_amax,

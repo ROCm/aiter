@@ -38,6 +38,7 @@ class _PackedCase(NamedTuple):
     qk_codec: str
     v_codec: str
     v_pack: AttentionPack = AttentionPack.DEFAULT
+    valid_trim: int = 0
 
 
 _NATIVE_CASES = (
@@ -54,7 +55,17 @@ _PACKED_CASES = (
     _PackedCase("mxfp4-mxfp4", "mxfp4", "mxfp4"),
     _PackedCase("mxfp6-mxfp4", "mxfp6", "mxfp4"),
     _PackedCase("mxfp6-mxfp4-fp6p", "mxfp6", "mxfp4", AttentionPack.V_FOR_FP6_P),
+    _PackedCase(
+        "mxfp6-mxfp4-fp6p-valid",
+        "mxfp6",
+        "mxfp4",
+        AttentionPack.V_FOR_FP6_P,
+        176,
+    ),
     _PackedCase("e4m3-mxfp6_p", "e4m3", "mxfp6_p", AttentionPack.V_FOR_FP6_P),
+    _PackedCase(
+        "mxfp4-mxfp6_p-valid", "mxfp4", "mxfp6_p", AttentionPack.V_FOR_FP6_P, 176
+    ),
 )
 RECIPES = (
     "bf16",
@@ -70,6 +81,8 @@ RECIPES = (
 )
 _SEQUENCE_DEPENDENT = (
     "packed-mxfp6-mxfp4-fp6p",
+    "packed-mxfp6-mxfp4-fp6p-valid",
+    "packed-mxfp4-mxfp6_p-valid",
     "packed-e4m3-mxfp6_p",
     "fp6p-mxfp4",
     "fp6p-mxfp6_p",
@@ -424,13 +437,14 @@ def _check_packed(rank, world_size, heads, sequence, device, op_cls, name):
     )
 
     case = next(c for c in _PACKED_CASES if c.name == name)
-    _, qk_codec, v_codec, v_pack = case
+    _, qk_codec, v_codec, v_pack, _ = case
     inputs = tuple(
         _input(rank + 47 * role, heads, sequence, device) for role in range(3)
     )
     softmax_scale = 0.125
     heads_local = heads // world_size
     seq_full = sequence * world_size
+    valid_kv_len = seq_full - case.valid_trim
 
     def _quantize_v_mxfp4_default(value):
         # Main removed the public DEFAULT-layout MXFP4 V packer; the private HIP
@@ -455,6 +469,8 @@ def _check_packed(rank, world_size, heads, sequence, device, op_cls, name):
     references = []
     for role, (codec, value) in enumerate(zip(codecs, inputs, strict=True)):
         full = _full_bshd(value, rank, world_size)
+        if role:
+            full = full[:, :valid_kv_len]
         references.append(
             (
                 quantize_v_mxfp6_fp6_p(full)
@@ -473,6 +489,7 @@ def _check_packed(rank, world_size, heads, sequence, device, op_cls, name):
         return_packed=True,
         softmax_scale=softmax_scale,
         hadamard=True,
+        valid_kv_len=valid_kv_len,
     )
     payloads, scales = _submit_roles(op, inputs)
     torch.cuda.synchronize()
@@ -492,7 +509,11 @@ def _check_packed(rank, world_size, heads, sequence, device, op_cls, name):
             )
         if role == 1 and codec == "mxfp6":
             _, logical_scales = mxfp6_k_view(
-                expected_payload, expected_scales, 1, seq_full, heads_local
+                expected_payload,
+                expected_scales,
+                1,
+                valid_kv_len,
+                heads_local,
             )
             _exact(
                 scales[role][: logical_scales.numel()].view_as(logical_scales),
@@ -509,10 +530,10 @@ def _check_packed(rank, world_size, heads, sequence, device, op_cls, name):
             )
         elif role == 1 and codec == "mxfp4":
             padded_rows = (
-                ((seq_full + MHA_V4_KV_TILE_ROWS - 1) // MHA_V4_KV_TILE_ROWS)
+                ((valid_kv_len + MHA_V4_KV_TILE_ROWS - 1) // MHA_V4_KV_TILE_ROWS)
                 * MHA_V4_KV_TILE_ROWS
                 + MHA_V4_KV_SCALE_LOOKAHEAD_ROWS
-                - seq_full
+                - valid_kv_len
             )
             _assert_scale_backing(
                 scales[role],
@@ -556,14 +577,18 @@ def _check_packed(rank, world_size, heads, sequence, device, op_cls, name):
             expected_payload.as_strided(payloads[2].shape, (1,)),
             f"{name} V payload and slack",
         )
-        _exact(scales[2].view_as(expected_scales), expected_scales, f"{name} V scales")
+        _exact(
+            scales[2].view_as(expected_scales),
+            expected_scales,
+            f"{name} V scales",
+        )
     else:
         _assert_scale_backing(
             scales[2],
             expected_scales.numel() + MHA_V4_MXFP4_V_SCALE_SLACK_BYTES,
             f"{name} V",
         )
-        padded = ((seq_full + 127) // 128) * 128
+        padded = ((valid_kv_len + 127) // 128) * 128
         payload_bytes = heads_local * padded * 64
         # V tokens are permuted across the full tile; invalid tokens are zero.
         _exact(
@@ -571,13 +596,17 @@ def _check_packed(rank, world_size, heads, sequence, device, op_cls, name):
             expected_payload[:payload_bytes],
             f"{name} V payload",
         )
-        _exact(scales[2].view_as(expected_scales), expected_scales, f"{name} V scales")
+        _exact(
+            scales[2].view_as(expected_scales),
+            expected_scales,
+            f"{name} V scales",
+        )
         _exact(
             payloads[2][payload_bytes:],
             torch.zeros_like(payloads[2][payload_bytes:]),
             f"{name} V slack",
         )
-    if qk_codec == "e4m3":
+    if qk_codec == "e4m3" and not case.valid_trim:
         _check_e4m3_scale_rounding(
             op,
             rank,
@@ -589,6 +618,46 @@ def _check_packed(rank, world_size, heads, sequence, device, op_cls, name):
             quantize_fp8_rotated,
         )
     return op, lambda: _submit_roles(op, inputs)
+
+
+def _check_valid_kv_rejections(rank, world_size, op_cls):
+    if get_gfx() != "gfx950":
+        return
+    sequence = 1184
+    seq_full = sequence * world_size
+    kwargs = {
+        "rank": rank,
+        "world_size": world_size,
+        "shape": (1, sequence, 8, 128),
+        "quant": ("mxfp6", "mxfp4"),
+        "return_packed": True,
+        "v_pack": AttentionPack.V_FOR_FP6_P,
+        "softmax_scale": 0.125,
+    }
+    cases = [
+        ({"quant": ("e4m3", "mxfp6_p"), "valid_kv_len": seq_full - 176}, "k=e4m3"),
+        ({"valid_kv_len": seq_full - sequence}, "padding confined to the last rank"),
+        ({"valid_kv_len": 0}, "valid_kv_len must be in"),
+        ({"valid_kv_len": seq_full + 1}, "valid_kv_len must be in"),
+        ({"valid_kv_len": 1.5}, "must be an integer"),
+        ({"valid_kv_len": True}, "must be an integer"),
+        (
+            {
+                "quant": ("mxfp6", "e4m3"),
+                "v_pack": AttentionPack.DEFAULT,
+                "valid_kv_len": seq_full - 176,
+            },
+            "v=e4m3",
+        ),
+    ]
+    for overrides, message in cases:
+        try:
+            op_cls(**(kwargs | overrides))
+        except ValueError as exc:
+            assert message in str(exc), str(exc)
+            _STATS.checks += 1
+        else:
+            raise AssertionError(f"accepted invalid valid_kv_len: {overrides}")
 
 
 def _check_e4m3_scale_rounding(
@@ -1081,6 +1150,7 @@ def _run_rank(rank, world_size, port, recipes, sequences, heads_list):
         )
         rows = []
         _CTX.op_cls = AttentionA2AIntraNodeOp
+        _check_valid_kv_rejections(rank, world_size, AttentionA2AIntraNodeOp)
         for recipe, sequence, heads in itertools.product(
             recipes, sequences, heads_list
         ):
