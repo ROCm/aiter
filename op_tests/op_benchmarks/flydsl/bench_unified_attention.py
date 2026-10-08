@@ -10,11 +10,12 @@ this tree's tuned table, or any other ``DEFAULT.json`` given with
 ``--triton-config`` (ROCm/aiter #5650's, say), so a run compares with one fixed
 bar.
 
-``--suite acceptance`` (the default) is a chat workload, ISL 0-32K with OSL 1K:
-fresh prompts, prefix-cached chunks (multi-turn follow-ups, chunked prefill),
-decode batches of 1-128 at contexts through 32K, and mixed steps of a prompt or
-chunk plus decodes, with random and sink-like data.
-``--suite quick`` is a smaller grid on random data. --isl, --prefix-query,
+``--suite acceptance`` (the default) is the focused PR performance evidence:
+prefill at 1K/4K/16K/32K and decode at context 32K with batch 1/16/64/128,
+one prefix chunk (q256/context 16K), and two mixed prompt-or-prefix plus decode
+steps, using random and sink-like data. ``--suite stress`` retains the broad
+matrix; exhaustive correctness belongs to ``op_tests/test_unified_attention.py``.
+``--suite quick`` is a short random-data check. --isl, --prefix-query,
 --prefix-ctx, --batch and --ctx replace a suite's lists. Physical pages default
 to the ticket's 32 and 64 for both layer shapes. K/V are views of one vLLM
 cache; softmax scale is 1.0. ``--block-size`` is an optional runtime-layout
@@ -105,6 +106,20 @@ for _tp, _shapes in TARGET_SHAPES_BY_TP.items():
 # fresh prompt, decodes, their context), and the default data patterns.
 SUITES = {
     "acceptance": {
+        "cases": ["prefill", "prefix", "decode", "mixed"],
+        "isl": [1024, 4096, 16384, 32768],
+        "prefix_query": [256],
+        "prefix_ctx": [16384],
+        "batch": [1, 16, 64, 128],
+        "ctx": [32768],
+        "mixed": [
+            (1024, None, 32, 16384),
+            (256, 16384, 32, 16384),
+        ],
+        "data": ["random", "sink"],
+    },
+    "stress": {
+        "cases": ["prefill", "prefix", "decode", "mixed"],
         "isl": [32, 256, 384, 512, 1024, 4096, 8192, 16384, 32768],
         "prefix_query": [16, 64, 256, 512, 2048],
         "prefix_ctx": [4096, 16384, 32768],
@@ -123,17 +138,13 @@ SUITES = {
         "data": ["random", "sink"],
     },
     "quick": {
+        "cases": ["prefill", "decode"],
         "isl": [1024, 4096, 8192, 16384, 32768],
-        "prefix_query": [16, 64, 256, 512],
-        "prefix_ctx": [4096, 16384],
+        "prefix_query": [],
+        "prefix_ctx": [],
         "batch": [1, 4, 16, 64],
         "ctx": [1024, 4096, 32768],
-        "mixed": [
-            (p, None, n, c)
-            for p in (1024, 4096)
-            for n in (7, 32, 64)
-            for c in (4096, 16384)
-        ],
+        "mixed": [],
         "data": ["random"],
     },
 }
@@ -431,22 +442,27 @@ def kind_geomeans(rows, name):
 
 
 def md_geomean(groups, name):
-    """One table: geomean speedup per physical page and kind."""
+    """One row per kind and one speedup column per physical page."""
+    by_page = [(label, dict(kind_geomeans(rows, name))) for label, rows in groups]
+    kinds = [kind for kind in KINDS if all(kind in means for _, means in by_page)]
+    if not kinds:
+        return None
     lines = [
         (
             "Gemma-4 5:1 step: 10 full layers + 50 sliding layers, "
             "geomean speedup per physical page and kind."
         ),
         "",
-        _md_line(["Page", "Kind", f"FlyDSL vs {name}"]),
-        "|:---|:---|---:|",
+        _md_line(
+            ["Kind"] + [f"FlyDSL vs {name} (Page={label})" for label, _ in by_page]
+        ),
+        "|:---|" + "---:|" * len(by_page),
     ]
     means = [
-        _md_line([label, kind, f"{mean:.2f}"])
-        for label, rows in groups
-        for kind, mean in kind_geomeans(rows, name)
+        _md_line([kind] + [f"{page_means[kind]:.2f}" for _, page_means in by_page])
+        for kind in kinds
     ]
-    return "\n".join(lines + means) if means else None
+    return "\n".join(lines + means)
 
 
 def gate_failures(rows, name, args):
@@ -538,12 +554,17 @@ def parse_args():
         help="K/V as views of one vLLM cache, or two contiguous caches",
     )
     parser.add_argument("--suite", choices=list(SUITES), default="acceptance")
-    parser.add_argument("--cases", choices=KINDS, nargs="+", default=list(KINDS))
+    parser.add_argument(
+        "--cases",
+        choices=KINDS,
+        nargs="+",
+        help="replace the suite's workload phases",
+    )
     parser.add_argument(
         "--data",
         choices=["random", "sink"],
         nargs="+",
-        help="default: random and sink for --suite acceptance, else random",
+        help="replace the suite's data patterns",
     )
     for name in GRID_LISTS:
         parser.add_argument(
@@ -594,7 +615,13 @@ def main():
         )
         return
     suite = SUITES[args.suite]
-    custom = any(getattr(args, key) is not None for key in GRID_LISTS)
+    custom = (
+        args.cases is not None
+        or args.data is not None
+        or any(getattr(args, key) is not None for key in GRID_LISTS)
+    )
+    if args.cases is None:
+        args.cases = suite["cases"]
     for key in GRID_LISTS:
         if getattr(args, key) is None:
             setattr(args, key, suite[key])
@@ -610,6 +637,8 @@ def main():
     )
     layers = SHAPES_BY_TP[args.tp]
     cells = grid(args)
+    if not cells:
+        raise ValueError("selected suite and --cases produce no benchmark cells")
 
     device = torch.cuda.current_device()
     props = torch.cuda.get_device_properties(device)
@@ -635,6 +664,13 @@ def main():
         "Speedup is Triton time / FlyDSL time; above 1 is faster. "
         f"Max diff is over Triton's ({name}) max |out|.\n"
     )
+    if args.suite == "acceptance" and not custom:
+        print(
+            "- Scope: focused PR performance across prefill, prefix, decode and "
+            "mixed phases. Exhaustive correctness is in "
+            "op_tests/test_unified_attention.py; OSL 1K belongs to model E2E. "
+            "'sink' is a sharp-softmax data pattern, not the attention-sinks API.\n"
+        )
     groups = []
     for label, page, block in runs:
         heading = label if block is not None else f"Page {label}"
