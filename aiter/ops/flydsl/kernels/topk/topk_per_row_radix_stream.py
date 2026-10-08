@@ -176,11 +176,13 @@ _LDS_SOLO_SLACK = 12 * 1024
 
 
 @cache
-def _lds_budgets() -> tuple[int, int]:
-    """(two-resident, solo) LDS bytes one workgroup may claim on this device."""
+def _lds_budgets(arch: str | None = None) -> tuple[int, int]:
+    """(two-resident, solo) LDS bytes one workgroup may claim on `arch`, by
+    default the live device's. A caller that knows the tensor's GPU passes its
+    arch: one process can drive GPUs with different LDS sizes."""
     # Runtime arch, not `get_gfx()`: that honours `GPU_ARCHS` while FlyDSL
     # compiles for the live device, so the two would size for different cards.
-    cap = get_lds_capacity_bytes(get_gfx_runtime())
+    cap = get_lds_capacity_bytes(arch or get_gfx_runtime())
     return cap // 2 - _LDS_RESIDENT_SLACK, cap - _LDS_SOLO_SLACK
 
 

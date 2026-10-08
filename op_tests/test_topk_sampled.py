@@ -144,7 +144,9 @@ def test_sampled_nan_order():
     nan_cols = torch.tensor([1000 * j + 7 for j in range(len(payloads))], device="cuda")
 
     _use_sampled(True)
-    avail = S._available(N, k, 64, False, True, T._sampled_on_device(0))
+    avail = S._available(
+        N, k, 64, False, True, T._sampled_on_device(0), T._device_arch(0)
+    )
     assert (
         S.topk_select_backend(rows, N, k, avail, device=0) == "sampled"
     ), "this shape must exercise `sampled`"
@@ -217,9 +219,7 @@ def test_sampled_eligibility_per_device():
         with mock.patch.object(T, "_top_k_per_row_prefill_sampled") as fn:
             T.top_k_per_row_prefill(x, rs, re, idx, None, rows, N, 1, K)
             prefill = fn.called
-        select = S._choose(
-            rows, N, K, 64, False, None, False, True, dev, S._sampled_on_device(dev)
-        )
+        select = S._choose(rows, N, N, K, 64, False, None, False, True, dev, True)
         return prefill, select == "sampled"
 
     _use_sampled(True)
@@ -250,8 +250,28 @@ def test_sampled_eligibility_per_device():
     print("[sampled_per_device] PASS")
 
 
+def test_select_decisions_follow_device_arch():
+    """topk_select's arch-specific choices take the arch they are given, which
+    the dispatch derives from the input's GPU: at k=2048 the streaming selector
+    fits gfx950's LDS and not gfx942's, and the whole-row shortcut is gfx950's."""
+    if T._device_arch(0) != "gfx950":
+        print("[select_arch_per_device] SKIP: device 0 is not gfx950")
+        return
+    assert "stream" in S._available(N, K, 64, False, True, False, "gfx950")
+    assert "stream" not in S._available(N, K, 64, False, True, False, "gfx942")
+    real_arch = S._device_arch
+    S._device_arch = lambda d: "gfx942" if d == 1 else real_arch(d)
+    try:
+        assert S._whole_row_takes("stream", 4096, K, K, False, False, 0)
+        assert not S._whole_row_takes("stream", 4096, K, K, False, False, 1)
+    finally:
+        S._device_arch = real_arch
+    print("[select_arch_per_device] PASS")
+
+
 if __name__ == "__main__":
     test_sampled_layout_contract()
     test_sampled_nan_order()
     test_sampled_overflow_all_equal()
     test_sampled_eligibility_per_device()
+    test_select_decisions_follow_device_arch()

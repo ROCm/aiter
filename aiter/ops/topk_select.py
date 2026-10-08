@@ -40,9 +40,10 @@ import torch
 import triton
 import triton.language as tl
 
-from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, wave_size_of
 from aiter.ops.flydsl.kernels.topk.topk_per_row_radix_stream import (
+    _lds_budgets,
     build_topk_per_row_radix_stream_module,
     topk_per_row_radix_stream_block_threads,
     topk_per_row_radix_stream_lds_plan,
@@ -63,6 +64,7 @@ from aiter.ops.topk import (
     _SAMPLED_MIN_K,
     _device_arch,
     _sampled_on_device,
+    _sampled_run,
     _sampled_supports_cached,
     top_k_per_row_prefill_sampled,
 )
@@ -394,7 +396,13 @@ def _whole_row_kernel(
 
 
 def _whole_row_takes(
-    backend: str, rows: int, width: int, k: int, ragged: bool, with_values: bool
+    backend: str,
+    rows: int,
+    width: int,
+    k: int,
+    ragged: bool,
+    with_values: bool,
+    device: int,
 ) -> bool:
     """Whether the call selects every column of uniform rows that stream would serve.
 
@@ -410,7 +418,7 @@ def _whole_row_takes(
         and width == k
         and k == 2048
         and (with_values or rows >= _WHOLE_ROW_MIN_ROWS)
-        and get_gfx_runtime() == "gfx950"
+        and _device_arch(device) == "gfx950"
     )
 
 
@@ -514,7 +522,13 @@ def _stream_small_reject_kernel(
 
 @lru_cache(maxsize=256)
 def _available(
-    width: int, k: int, wave_size: int, ragged: bool, fp32: bool, sampled_ok: bool
+    width: int,
+    k: int,
+    wave_size: int,
+    ragged: bool,
+    fp32: bool,
+    sampled_ok: bool,
+    arch: str,
 ) -> frozenset:
     """Backends that can serve this geometry at all.
 
@@ -566,7 +580,10 @@ def _available(
     # without the row count, so it cannot know which width will be asked for --
     # and it is a decline the router can act on rather than a launch failure.
     if all(
-        topk_per_row_radix_stream_serves(k, wave_size, block_threads=bt) is None
+        topk_per_row_radix_stream_serves(
+            k, wave_size, block_threads=bt, lds_budgets=_lds_budgets(arch)
+        )
+        is None
         for bt in (_STREAM_BLOCK_WIDTHS)
     ):
         out.add("stream")
@@ -577,8 +594,7 @@ def _available(
     # streaming selector's two-block-width case above.
     # `sampled_ok` is whether this call may use it at all: the input's own GPU
     # can run it (`_sampled_on_device`: the kernels are traps off gfx950, and
-    # one process can hold both kinds) and AITER_DISABLE_TOPK_SAMPLED is unset.
-    # Both are read per call and arrive here as part of the memo key.
+    # one process can hold both kinds) and the caller has not withdrawn it.
     if fp32 and sampled_ok:
         out.add("sampled")
     return frozenset(out)
@@ -596,7 +612,7 @@ def _choose(
     deterministic: bool,
     fp32: bool,
     device: int,
-    sampled_ok: bool,
+    allow_sampled: bool,
 ) -> str:
     """The backend for one call shape on one GPU, resolved once.
 
@@ -608,7 +624,11 @@ def _choose(
     allowed = frozenset(_BACKENDS_BY_TIE[tie])
     if deterministic:
         allowed -= _NONDETERMINISTIC
-    available = _available(width, k, wave_size, ragged, fp32, sampled_ok) & allowed
+    sampled_ok = allow_sampled and _sampled_on_device(device)
+    arch = _device_arch(device)
+    available = (
+        _available(width, k, wave_size, ragged, fp32, sampled_ok, arch) & allowed
+    )
     if not available:
         raise RuntimeError(
             f"no backend serves rows={rows} width={width} topk={k} "
@@ -638,7 +658,7 @@ def _plain_multiblock(
     return bool(topk_plain_use_mulblocks(rows, stride0, k, ragged))
 
 
-def _plain_k2048_lds_tail_takes(rows: int, width: int, k: int) -> bool:
+def _plain_k2048_lds_tail_takes(rows: int, width: int, k: int, device: int) -> bool:
     """Whether uniform rows past sampled's width door go to plain's LDS tail.
 
     Only asked where `sampled` could serve, which is what it was measured
@@ -646,7 +666,7 @@ def _plain_k2048_lds_tail_takes(rows: int, width: int, k: int) -> bool:
     """
     return (
         k == 2048
-        and get_gfx_runtime() == "gfx950"
+        and _device_arch(device) == "gfx950"
         and rows >= _PLAIN_K2048_LDS_TAIL_MIN_ROWS
         and _SAMPLED_MIN_WIDTH <= width <= _PLAIN_K2048_LDS_TAIL_MAX_WIDTH
     )
@@ -852,6 +872,8 @@ def topk_select_backend(
     """
     if not available:
         raise ValueError("topk_select_backend needs at least one backend")
+    if device is None:
+        device = torch.cuda.current_device()
     # k=1 first and unconditionally: the others answer it by building machinery
     # the answer does not need, and lose 1.3x to 12x doing so.
     if "argmax" in available:
@@ -860,7 +882,7 @@ def topk_select_backend(
         "sampled" in available
         and "plain" in available
         and not ragged
-        and _plain_k2048_lds_tail_takes(rows, width, k)
+        and _plain_k2048_lds_tail_takes(rows, width, k, device)
     ):
         return "plain"
     if "sampled" in available and _sampled_takes(
@@ -1121,12 +1143,36 @@ def topk_select(
         deterministic,
         input.dtype is torch.float32,
         input.device.index,
-        _sampled_on_device(input.device.index)
-        and os.environ.get("AITER_DISABLE_TOPK_SAMPLED", "0") != "1",
+        True,
     )
+    # Read only when `sampled` won: the lookup costs more than the memo hit, and
+    # every other call has no use for it.
+    if (
+        backend == "sampled"
+        and os.environ.get("AITER_DISABLE_TOPK_SAMPLED", "0") == "1"
+    ):
+        backend = _choose(
+            rows,
+            width,
+            stride0,
+            topk,
+            wave_size_of(input.device.index),
+            end is not None,
+            tie,
+            deterministic,
+            input.dtype is torch.float32,
+            input.device.index,
+            False,
+        )
     gathered = None
     if _whole_row_takes(
-        backend, rows, width, topk, end is not None, return_value or sorted
+        backend,
+        rows,
+        width,
+        topk,
+        end is not None,
+        return_value or sorted,
+        input.device.index,
     ):
         gathered = _select_whole_rows(input, idx, return_value or sorted)
     else:
@@ -1258,24 +1304,47 @@ def _dispatch(
         # the other end of the range.
         starts = _zero_rows(rows, input.device)
         ends = row_lens
-        top_k_per_row_prefill_sampled(
-            input,
-            starts,
-            ends,
-            idx,
-            None,
-            rows,
-            input.stride(0),
-            input.stride(1),
-            k=topk,
-            # `ragged` is `end is not None` -- whether the CALLER gave row
-            # bounds. When it did not, the pair above is 0 and the full width for
-            # every row, and saying so lets the entry run the kernels that do not
-            # bounds-check every element.
-            ragged=ragged,
-            # NaN of either sign outranks +inf here, as in stream and decode.
-            nan_high=True,
-        )
+        # `ragged` is `end is not None` -- whether the CALLER gave row bounds.
+        # When it did not, the pair above is 0 and the full width for every row,
+        # and saying so lets the entry run the kernels that do not bounds-check
+        # every element. nan_high: NaN of either sign outranks +inf here, as in
+        # stream and decode.
+        #
+        # topk_select built or checked every tensor here -- fp32 input with
+        # inner stride 1, dense int32 [rows] bounds, a dense [rows, topk] output
+        # -- and `_choose` asked topk_sampled_supports for this device, so the
+        # entry's validation would only repeat it. The one thing not checked is
+        # the device of a caller's `end` (the default one is built on input's);
+        # the entry reports that one.
+        if not ragged or ends.get_device() == input.get_device():
+            _sampled_run(
+                input,
+                starts,
+                ends,
+                idx,
+                None,
+                rows,
+                input.stride(0),
+                input.stride(1),
+                topk,
+                None,
+                ragged,
+                True,
+            )
+        else:
+            top_k_per_row_prefill_sampled(
+                input,
+                starts,
+                ends,
+                idx,
+                None,
+                rows,
+                input.stride(0),
+                input.stride(1),
+                k=topk,
+                ragged=ragged,
+                nan_high=True,
+            )
     elif backend == "small_k":
         topk_per_row_small_k(input, row_lens, idx, topk)
     elif backend == "plain":
@@ -1329,14 +1398,11 @@ def _dispatch(
         )
     elif backend == "stream":
         wave = wave_size_of(input.device.index)
+        arch = _device_arch(input.device.index)
+        budgets = _lds_budgets(arch)
         rejects = input.shape[1] - topk
         small_reject = _stream_small_reject(rows, rejects)
-        if (
-            not ragged
-            and get_gfx_runtime() == "gfx950"
-            and topk == 2048
-            and small_reject
-        ):
+        if not ragged and arch == "gfx950" and topk == 2048 and small_reject:
             # A dense row with a small N-K tail is a reject-r problem, not a
             # general selection problem.  Reduce the bottom tail and emit its
             # complement directly; this preserves the stream backend's
@@ -1379,6 +1445,7 @@ def _dispatch(
                     ),
                     # A slice, not the row: this stage runs one block per
                     # slice over a slice's width, and the plan reads both.
+                    lds_budgets=budgets,
                     lds_plan=topk_per_row_radix_stream_lds_plan(
                         rows * parts, -(-input.shape[1] // parts), topk
                     ),
@@ -1403,6 +1470,7 @@ def _dispatch(
                     labelled=True,
                     block_threads=topk_per_row_radix_stream_block_threads(rows, topk),
                     # The merge's rows are `parts * topk` wide, not the input's.
+                    lds_budgets=budgets,
                     lds_plan=topk_per_row_radix_stream_lds_plan(
                         rows, parts * topk, topk
                     ),
@@ -1431,7 +1499,10 @@ def _dispatch(
             and input.shape[1] > topk
             and input.shape[1]
             <= topk_per_row_radix_stream_window_cap(
-                topk, block_threads=block_threads, lds_plan=lds_plan
+                topk,
+                block_threads=block_threads,
+                lds_budgets=budgets,
+                lds_plan=lds_plan,
             )
         )
         _run_compiled(
@@ -1446,6 +1517,7 @@ def _dispatch(
                 block_threads=block_threads,
                 # The deepest prefetch the budget allows is not the one that
                 # wins, and the budget has no term for the row count.
+                lds_budgets=budgets,
                 lds_plan=lds_plan,
             ),
             input,

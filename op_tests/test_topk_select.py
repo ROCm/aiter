@@ -28,7 +28,7 @@ from aiter import dtypes
 from aiter.jit.utils.chip_info import _LDS_CAPACITY_BYTES as LDS_CAPACITY
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.tensor_shim import wave_size_of
-from aiter.ops.topk import _sampled_on_device, _sampled_supports_cached
+from aiter.ops.topk import _device_arch, _sampled_on_device, _sampled_supports_cached
 from aiter.ops.topk_select import (
     _available,
     topk_select,
@@ -198,7 +198,17 @@ def _serving(rows, width, k, wave, ragged, device):
     `_available` plus the row-count half of sampled's predicate, which it cannot
     ask; off gfx950 that half declines every shape.
     """
-    served = set(_available(width, k, wave, ragged, True, _sampled_on_device(device)))
+    served = set(
+        _available(
+            width,
+            k,
+            wave,
+            ragged,
+            True,
+            _sampled_on_device(device),
+            _device_arch(device),
+        )
+    )
     if "sampled" in served and not _sampled_supports_cached(rows, width, k, device):
         served.discard("sampled")
     return frozenset(served)

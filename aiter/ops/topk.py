@@ -492,15 +492,15 @@ def _should_use_sampled_prefill(
     would turn a working call into an error purely because `sampled` became
     available.
     """
-    if stable or stride1 != 1 or k < _SAMPLED_MIN_K:
+    if stable or stride1 != 1 or k < _SAMPLED_MIN_K or device < 0:
         return False
+    floor = _SAMPLED_MIN_STRIDE0.get(_device_arch(device))
+    if floor is None or stride0 < floor:
+        return False
+    # Last: the environment lookup costs more than every test above together.
     if os.environ.get("AITER_DISABLE_TOPK_SAMPLED", "0") == "1":
         return False
-    if not _sampled_on_device(device):
-        return False
-    return stride0 >= _SAMPLED_MIN_STRIDE0[_device_arch(device)] and (
-        _sampled_supports_cached(numRows, stride0, k, device)
-    )
+    return _sampled_supports_cached(numRows, stride0, k, device)
 
 
 def top_k_per_row_prefill(
@@ -531,15 +531,11 @@ def top_k_per_row_prefill(
     below."""
     # Ahead of the FlyDSL check: behind it this was unreachable, since FlyDSL
     # served every shape tested, M=4096 N=65536 included.
-    # A layout the sampled kernels cannot address stays on the paths below,
-    # which take it exactly as they did before `sampled` existed.
+    # No layout check on this path: the paths below take the same raw data
+    # pointers, rows of k and dense int32 bounds, so a malformed tensor reaches
+    # the same memory either way. top_k_per_row_prefill_sampled validates.
     if _should_use_sampled_prefill(
         numRows, stride0, stride1, k, stable, logits.get_device()
-    ) and (
-        _sampled_layout_error(
-            logits, rowStarts, rowEnds, indices, values, numRows, stride0, k
-        )
-        is None
     ):
         # Reached with the caller's own bounds, so the ragged kernels stay.
         return _sampled_run(
@@ -697,19 +693,20 @@ def _sampled_layout_error(
     buffer gets its guard columns overwritten and its last slots left unwritten
     -- or read past its end. Metadata only, so nothing here synchronises.
     """
-    dev = logits.device
-    if dev.type != "cuda":
-        return f"logits must be on a GPU, got {dev}"
+    dev = logits.get_device()
+    if dev < 0:
+        return f"logits must be on a GPU, got {logits.device}"
     if logits.dtype is not torch.float32:
         return f"logits must be fp32, got {logits.dtype}"
     if logits.dim() == 2:
         rows, width = logits.shape
+        s0, s1 = logits.stride()
         if rows < numRows:
             return f"logits has {rows} rows, numRows is {numRows}"
-        if width > 1 and logits.stride(1) != 1:
-            return f"logits inner stride must be 1, got {logits.stride(1)}"
-        if rows > 1 and logits.stride(0) != stride0:
-            return f"logits row stride is {logits.stride(0)}, stride0 is {stride0}"
+        if width > 1 and s1 != 1:
+            return f"logits inner stride must be 1, got {s1}"
+        if rows > 1 and s0 != stride0:
+            return f"logits row stride is {s0}, stride0 is {stride0}"
         if width > stride0:
             return f"logits rows are {width} wide, wider than stride0 {stride0}"
     elif not logits.is_contiguous() or logits.numel() < numRows * stride0:
@@ -727,8 +724,8 @@ def _sampled_layout_error(
             continue
         if t.dtype is not dtype:
             return f"{name} must be {dtype}, got {t.dtype}"
-        if t.device != dev:
-            return f"{name} must be on {dev} like logits, got {t.device}"
+        if t.get_device() != dev:
+            return f"{name} must be on {logits.device} like logits, got {t.device}"
         if not t.is_contiguous():
             return f"{name} must be contiguous, got strides {tuple(t.stride())}"
         if t.numel() < need:
