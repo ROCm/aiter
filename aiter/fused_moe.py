@@ -56,6 +56,7 @@ from aiter.ops.opus import moe_stage2_a8w4 as _opus_a8w4
 from aiter.ops.opus.moe_stage1_a8w4 import (
     opus_a8w4_stage1_wrapper as _opus_a8w4_stage1_wrapper,
 )
+from aiter.utility.graph_alloc import persistent_alloc
 
 
 @functools.lru_cache(maxsize=1)
@@ -111,7 +112,7 @@ kernel_bench_callable = None
 
 # One FlyDSL v2 stage1 intermediate per (device, stream, shape), shared by all MoE
 # layers and graph captures. Graphs captured on one stream share it, so they must
-# not replay concurrently, which a shared graph memory pool already requires.
+# not replay concurrently; persistent_alloc keeps it off graph-freed addresses.
 _FLYDSL_STAGE1_OUT_CACHE: dict[
     tuple[torch.device, int, tuple[int, int]], torch.Tensor
 ] = {}
@@ -125,7 +126,8 @@ def _get_flydsl_stage1_out(
     key = (device, stream, shape)
     out = _FLYDSL_STAGE1_OUT_CACHE.get(key)
     if out is None:
-        out = torch.empty(shape, dtype=dtypes.fp8, device=device)
+        with persistent_alloc(device):
+            out = torch.empty(shape, dtype=dtypes.fp8, device=device)
         _FLYDSL_STAGE1_OUT_CACHE[key] = out
     return out
 

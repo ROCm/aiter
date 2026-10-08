@@ -12,6 +12,7 @@ from aiter.fused_moe import (
     _get_flydsl_stage1_out,
 )
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.utility.graph_alloc import ROUTES_INSIDE_CAPTURE
 
 _NEED_GPU = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA device required"
@@ -114,6 +115,43 @@ def test_flydsl_stage1_out_outlives_the_graph_that_allocated_it():
 
     assert torch.all(buf.view(torch.uint8) == 7)
     assert torch.all(filler == 3)
+
+
+@_NEED_GPU
+@pytest.mark.skipif(
+    not ROUTES_INSIDE_CAPTURE,
+    reason=f"torch {torch.__version__} ignores use_mem_pool inside a capture",
+)
+def test_flydsl_stage1_out_is_not_overwritten_by_replay():
+    """A buffer first allocated in a capture must not take an address that capture freed."""
+    device = torch.device("cuda:0")
+    shape = (512, 768)
+    pool = torch.cuda.graph_pool_handle()
+    stream = torch.cuda.Stream(device=device)
+    src = torch.full((shape[0] * shape[1],), 3, dtype=torch.uint8, device=device)
+
+    graphs, intermediates = [], []
+    with torch.cuda.stream(stream):
+        for i in range(4):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, pool=pool, stream=stream):
+                scratch = src * (i + 2)
+                intermediates.append(scratch.data_ptr())
+                scratch.sum()
+                del scratch
+                buf = _get_flydsl_stage1_out(shape, device)
+            graphs.append(graph)
+    torch.cuda.synchronize()
+
+    assert buf.data_ptr() not in intermediates
+    buf.view(torch.uint8).fill_(0x77)
+    torch.cuda.synchronize()
+    for _ in range(5):
+        for graph in graphs:
+            graph.replay()
+    torch.cuda.synchronize()
+
+    assert torch.all(buf.view(torch.uint8) == 0x77)
 
 
 def _pick_kernel(**want):
