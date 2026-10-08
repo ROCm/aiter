@@ -793,7 +793,7 @@ def launch_gemm_a8w4_tdm(
                 num_warps=nw,
                 # Descriptor bit 21: release to the peers already present and
                 # re-broadcast later, so early arrivals are not held for a merge.
-                early_timeout=bool(wg_mask is not None),
+                early_timeout=bool(wg_mask is not None and False),
                 cache_modifier=cache_modifier,
                 **pad_kw,
             )
