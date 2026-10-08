@@ -619,6 +619,26 @@ def _gluon_reduce_apply_layouts(n: int, rows: int, num_warps: int, split_k: int)
     return create_reduce_apply_layouts(n, rows, num_warps, split_k)
 
 
+def _gluon_split_num_stages(
+    config: dict, grid: int, k_loop: int, w_preshuffled: bool, cu_num: int
+) -> int:
+    """Ring depth of the gfx1250 Gluon split kernel.
+
+    A deeper ring hides more of the per-stage TDM wait, but each stage adds ~40 KB of
+    LDS (BLOCK_M=32: 97 KB at 2 stages, 138 KB at 3, of 320 KB per CU), so 3 stages
+    fit 2 workgroups per CU instead of 3. Use it only when the grid still runs in one
+    round at that residency and the loop has a stage to fill: M=512/C=7168 split
+    kernel 12.72 -> 12.13 us; at M=768 (768 workgroups) it would cost a second round
+    (+0.8 / +1.4 us at C=4096 / 7168). Measured with packed (bf16 hi/lo) weights only.
+    """
+    base = config["SPLIT_NUM_STAGES"]
+    deep = config.get("SPLIT_DEEP_NUM_STAGES", base)
+    max_ctas = config.get("SPLIT_DEEP_MAX_CTAS_PER_CU", 0)
+    if w_preshuffled and k_loop >= deep and grid <= max_ctas * cu_num:
+        return deep
+    return base
+
+
 def _mhc_post_pre_gluon_split_k(M: int, C: int, res_shuffled: bool, ks: int) -> int:
     """K-splits for the Gluon split kernel: the tuned HIP decode policy (same
     workgroup grid as the HIP kernel), reduced until C splits into ks-wide
@@ -740,7 +760,10 @@ def _mhc_post_pre_gluon_gfx1250(
     fn = phi.T
     w_preshuffled = fn.dtype == torch.int32
     block_m = config["SPLIT_BLOCK_M"]
-    num_stages = config["SPLIT_NUM_STAGES"]
+    k_loop = C // (split_k * KS)
+    num_stages = _gluon_split_num_stages(
+        config, triton.cdiv(M, block_m) * split_k, k_loop, w_preshuffled, get_cu_num()
+    )
     split_warps = config["SPLIT_NUM_WARPS"]
     wmma, op_a, op_b, smem_x, smem_res, smem_fn, smem_nres, smem_red, smem_red2 = (
         _gluon_post_pre_layouts(
@@ -766,7 +789,7 @@ def _mhc_post_pre_gluon_gfx1250(
         N_PAD=N_PAD,
         BLOCK_M=block_m,
         KS=KS,
-        K_LOOP=C // (split_k * KS),
+        K_LOOP=k_loop,
         SPLIT_K=split_k,
         NUM_STAGES=num_stages,
         RES_SHUFFLED=res_shuffled,
