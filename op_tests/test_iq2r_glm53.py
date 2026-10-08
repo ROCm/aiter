@@ -197,6 +197,21 @@ def test_glm53_moe_chunks_long_prefill(glm53_layer):
     assert relative_rmse < 1e-6
 
 
+def test_glm53_moe_rejects_other_archs(glm53_layer, monkeypatch):
+    import aiter.iq2r_glm53 as glm53
+
+    layer = glm53_layer
+    hidden, topk_weights, topk_ids = _routing(8, 0x53A0)
+    output = torch.zeros_like(hidden)
+    workspace = IQ2RGlm53Workspace.allocate(8, layer.intermediate, device="cuda")
+    monkeypatch.setattr(glm53, "get_gfx", lambda: "gfx942")
+    with pytest.raises(RuntimeError, match="requires gfx950"):
+        iq2r_glm53_moe_out(
+            hidden, *layer.packed, topk_weights, topk_ids, output, workspace
+        )
+    assert not output.any()
+
+
 @pytest.mark.parametrize("tp", [4, 8])
 def test_glm53_pack_commutes_with_tp_slicing(tp):
     """Packing the full checkpoint then slicing equals slicing then packing."""

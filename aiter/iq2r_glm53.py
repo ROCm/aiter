@@ -366,6 +366,11 @@ def iq2r_glm53_moe_out(
     expert 256); the weights come from :func:`iq2r_glm53_pack`. ``config``
     overrides the tuned launch choice (used by the tuner).
     """
+    # The gate and down kernel bodies are built for gfx950 only and are empty
+    # on other targets, which would leave ``output`` unwritten.
+    gfx = get_gfx()
+    if gfx != "gfx950":
+        raise RuntimeError(f"GLM-5.3 IQ2R MoE requires gfx950, not {gfx}")
     tokens = hidden_states.shape[0]
     if tokens > workspace.max_tokens:
         for begin in range(0, tokens, workspace.max_tokens):

@@ -2385,6 +2385,9 @@ int glm53_tp4_from_gate(const aiter_tensor_t& data, const aiter_tensor_t& auxili
 
 void glm53_check_device(std::initializer_list<const aiter_tensor_t*> tensors, const aiter_tensor_t& data)
 {
+    // The GLM-5.3 kernel bodies are compiled for gfx950 only; elsewhere they are empty.
+    static const std::string arch = get_gpu_arch();
+    AITER_CHECK(arch == "gfx950", "GLM-5.3 IQ2R kernels require gfx950, not ", arch);
     for(const auto* tensor : tensors)
         AITER_CHECK(tensor->is_gpu() && tensor->device_id == data.device_id && tensor->is_contiguous(),
                     "GLM-5.3 IQ2R tensors must be contiguous on the weight GPU");
