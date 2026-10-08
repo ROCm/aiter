@@ -152,9 +152,9 @@ def _assert_supported(
         raise NotImplementedError(
             "flydsl mxfp4 GEMM1 two-wave specialization requires effective BN64"
         )
-    if native_scale_layout and not (BM == 16 and out_dtype == "fp4"):
+    if native_scale_layout and BM != 16:
         raise NotImplementedError(
-            "flydsl mxfp4 GEMM1 native scale layout requires BM16 FP4 output"
+            "flydsl mxfp4 GEMM1 native scale layout requires BM16 output"
         )
     if k_wave not in (1, 2, 4):
         raise NotImplementedError(

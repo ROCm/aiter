@@ -79,7 +79,7 @@ class TestMxfp4FlydslInputsAndCandidates(unittest.TestCase):
         self.assertTrue(a4_default)
         self.assertTrue(a8_default)
         self.assertEqual({c["block_m"] for c in a4_default}, {16})
-        self.assertEqual({c["block_m"] for c in a8_default}, {32, 64, 128})
+        self.assertEqual({c["block_m"] for c in a8_default}, {16, 32, 64, 128})
         self.assertLess(
             len(a4_default), len(self.tuner._candidate_rows(a4, full_search=True))
         )
@@ -94,7 +94,7 @@ class TestMxfp4FlydslInputsAndCandidates(unittest.TestCase):
             )
             self.assertEqual(g1["BM"], g2["tile_m"])
             self.assertEqual(g1["BM"], g2["sort_block_m"])
-            self.assertFalse(g1["inline_quant"])
+            self.assertEqual(g1["inline_quant"], g1["BM"] == 16)
             self.assertNotEqual(g1["BN"], 64)
             self.assertEqual(g1["num_waves"], 4)
             self.assertFalse(g2["persist"])
@@ -217,6 +217,81 @@ class TestMxfp4FlydslInputsAndCandidates(unittest.TestCase):
                 if c["block_m"] == 128
             }
             self.assertEqual(epilogs, expected)
+
+    def test_bm16_aot_jobs_use_the_same_native_scale_contract_for_both_precisions(self):
+        from aiter.aot.flydsl.mxfp4_moe import parse_csv
+
+        rows = []
+        for precision, q_dtype_a in (
+            ("fp4", "torch.float4_e2m1fn_x2"),
+            ("fp8", "torch.float8_e4m3fn"),
+        ):
+            row = shape_row(q_dtype_a=q_dtype_a)
+            row.update(
+                kernelName1=f"flydsl_mxmoe_g1_a{'4' if precision == 'fp4' else '8'}w4_"
+                f"16x128x256_f16in_nt{'_fp8out' if precision == 'fp8' else ''}",
+                kernelName2=f"flydsl_moe2_layout_a{precision}_wfp4_bf16_"
+                "t16x128x128_atomic_sbm16",
+            )
+            rows.append(row)
+        path = Path(self.directory.name) / "tuned.csv"
+        pd.DataFrame(rows).to_csv(path, index=False)
+        jobs = parse_csv(str(path))
+        stage1 = [job for job in jobs if job["stage"] == 1]
+        self.assertEqual({job["out_dtype"] for job in stage1}, {"fp4", "fp8"})
+        self.assertTrue(all(job["native_scale_layout"] for job in stage1))
+        self.assertEqual({job["D_INTER"] for job in stage1}, {384})
+        self.assertEqual({job["interleave"] for job in stage1}, {False, True})
+
+    def test_bm16_a8_candidates_reach_the_persisted_winner_and_profile(self):
+        row = self.read_rows([shape_row(token=64, q_dtype_a="torch.float8_e4m3fn")])
+        result_columns = [
+            "block_m",
+            "ksplit",
+            "us1",
+            "kernelName1",
+            "err1",
+            "us2",
+            "kernelName2",
+            "err2",
+            "us",
+            "run_1stage",
+            "xbf16",
+            "flat",
+            "tflops",
+            "bw",
+        ]
+        tuner = Mxfp4FlydslTuner("test", KEYS, result_columns)
+        args = SimpleNamespace(
+            mxfp4_search_mode="full",
+            timeout=0,
+            mp=1,
+            errRatio=0.1,
+            profile_file=str(Path(self.directory.name) / "profile.csv"),
+        )
+
+        def evaluate(_self, _row, candidate, _args):
+            candidate["error"] = 0.01
+            candidate["us"] = float(candidate["block_m"])
+            return candidate["us"]
+
+        with mock.patch.object(
+            Mxfp4FlydslTuner, "_run_candidate", evaluate
+        ), mock.patch.object(torch.cuda, "device_count", return_value=0):
+            results = tuner.tune(row, pd.DataFrame(), args)
+        processed = tuner.post_process(results, args)
+        path = Path(self.directory.name) / "winner.csv"
+        tuner.result_to_csv(processed, str(path))
+        saved = pd.read_csv(path)
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved.iloc[0]["block_m"], 16)
+        g1 = _parse_mxfp4_g1_kname(saved.iloc[0]["kernelName1"])
+        self.assertEqual(
+            (g1["a_dtype"], g1["out_dtype"], g1["inline_quant"]), ("fp8", "fp8", True)
+        )
+        profile = pd.read_csv(args.profile_file)
+        self.assertTrue((profile["block_m"] == 16).any())
+        self.assertEqual(set(profile["precision"]), {"A8W4"})
 
 
 if __name__ == "__main__":
