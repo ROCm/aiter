@@ -3362,6 +3362,7 @@ def test_qsa_aot_collector_lists_family_a_launches():
     second K1 job. K2 is the three bar launches. The JIT wrappers do
     not import this collector.
     """
+    import os
     import sys
 
     if "aiter.aot.flydsl.qsa" in sys.modules:
@@ -3372,7 +3373,19 @@ def test_qsa_aot_collector_lists_family_a_launches():
         raise AssertionError("QSA is not an AOT module")
     from aiter.aot.flydsl.qsa import collect_jobs, replay
 
-    jobs = collect_jobs([], None)
+    saved = {name: os.environ.get(name) for name in ("GPU_ARCHS", "CU_NUM")}
+    os.environ.pop("CU_NUM", None)
+    try:
+        os.environ["GPU_ARCHS"] = "gfx950"
+        jobs = collect_jobs([], None)
+        os.environ["GPU_ARCHS"] = "gfx942;gfx950"
+        both = collect_jobs([], None)
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
     if any(job is None for job in jobs):
         raise AssertionError("QSA AOT job list contains None")
     by_name = {job["kernel_name"]: job for job in jobs}
@@ -3400,8 +3413,45 @@ def test_qsa_aot_collector_lists_family_a_launches():
     prefill_k2 = by_name["qsa_k2_family_a_m512_l8192"]
     if (prefill_k2["hq"], prefill_k2["hkv"], prefill_k2["width"]) != (24, 2, 2051):
         raise AssertionError(f"K2 prefill job is not a bar launch: {prefill_k2}")
+    if (decode.get("gfx"), decode.get("cu_num")) != ("gfx950", 256):
+        raise AssertionError(
+            f"gfx950 collector target is {decode.get('gfx')} cu {decode.get('cu_num')}"
+        )
+    covered = {(job["kernel_name"], job["gfx"], job["cu_num"]) for job in both}
+    expect_archs = {(name, "gfx942", 304) for name in expect} | {
+        (name, "gfx950", 256) for name in expect
+    }
+    if covered != expect_archs:
+        raise AssertionError(f"QSA AOT archs {sorted(covered)} != {sorted(expect_archs)}")
     if not callable(replay):
         raise TypeError("QSA AOT has no replay")
+
+
+def test_qsa_aot_targets_follow_gpu_archs_without_a_device(monkeypatch):
+    """The wheel build lists gfx942 and gfx950 and has no GPU visible.
+
+    Those two archs are the compile targets. A GPU_ARCHS value with no
+    QSA arch is an error. With the variable unset and no device, both
+    supported archs are still compiled.
+    """
+    import torch
+
+    from aiter.aot.flydsl.qsa import _qsa_aot_targets
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setenv("GPU_ARCHS", "gfx942;gfx950")
+    monkeypatch.delenv("CU_NUM", raising=False)
+    assert _qsa_aot_targets() == [("gfx942", 304), ("gfx950", 256)]
+    monkeypatch.setenv("GPU_ARCHS", "gfx1250")
+    try:
+        _qsa_aot_targets()
+    except RuntimeError as error:
+        if "gfx1250" not in str(error):
+            raise AssertionError(str(error)) from error
+    else:
+        raise AssertionError("GPU_ARCHS with no QSA arch was accepted")
+    monkeypatch.delenv("GPU_ARCHS")
+    assert _qsa_aot_targets() == [("gfx942", 304), ("gfx950", 256)]
 
 
 def test_qsa_aot_empty_launch_list_has_no_jobs():
