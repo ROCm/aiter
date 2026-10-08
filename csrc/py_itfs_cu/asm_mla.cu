@@ -839,6 +839,8 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                 head_size);
     AITER_CHECK(output->size(2) == 512, __func__,
                 ": only support v_head_dim 512, got ", output->size(2));
+    AITER_CHECK(splitData->size(3) == 512, __func__,
+                ": only support splitData with v_head_dim 512, got ", splitData->size(3));
     
     if(q_dtype == AITER_DTYPE_fp8)
     {
