@@ -8,7 +8,10 @@ import triton
 from aiter.ops.triton.attention.unified_attention import unified_attention
 from aiter.ops.triton.utils.types import e4m3_dtype
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
-from op_tests.triton_tests.attention.test_unified_attention import ref_paged_attn
+from op_tests.triton_tests.attention.test_unified_attention import (
+    ref_paged_attn,
+    shuffle_kv_cache,
+)
 
 FP8_TYPE = e4m3_dtype
 FP8_MAX = torch.finfo(FP8_TYPE).max
@@ -148,6 +151,8 @@ def _mode_label(args):
         parts.append("bf16")
     if args.fp8_output:
         parts.append("fp8out")
+    if args.shuffled_kv_cache:
+        parts.append("shuffled")
     return "_".join(parts) + "_fwd"
 
 
@@ -272,6 +277,16 @@ def run_benchmark(custom, args):
         v_tensor = (
             inputs["v_fp8"] if (args.fp8 or args.fp8_kv) else inputs["value_cache"]
         )
+        # The kernel reads the shuffled layout; the reference below still uses
+        # the unshuffled caches held in `inputs`.
+        if args.shuffled_kv_cache:
+            assert (
+                D_HEAD == D_HEAD_V
+            ), "Shuffled KV cache requires equal Q/K and V head sizes"
+            assert (
+                block_size >= 16 and block_size & (block_size - 1) == 0
+            ), "Shuffled KV cache requires a power-of-2 block size >= 16"
+            k_tensor, v_tensor = shuffle_kv_cache(k_tensor, v_tensor)
 
         window_size = (
             (args.sliding_window - 1, 0)
@@ -298,6 +313,7 @@ def run_benchmark(custom, args):
                 k_descale=inputs["k_descale"],
                 v_descale=inputs["v_descale"],
                 output_scale=inputs["out_scale"],
+                shuffled_kv_cache=args.shuffled_kv_cache,
                 backend=args.backend,
             )
 
@@ -478,6 +494,13 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         default=None,
         choices=["triton", "gluon"],
         help="Kernel backend",
+    )
+    parser.add_argument(
+        "--shuffled_kv_cache",
+        "-shuffled_kv_cache",
+        action="store_true",
+        default=True,
+        help="Pre-shuffle the KV cache into the layout the gluon kernels expect",
     )
 
     return parser.parse_args(args=args)
