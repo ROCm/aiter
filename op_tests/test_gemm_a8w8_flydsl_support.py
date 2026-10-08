@@ -15,7 +15,7 @@ from aiter.ops.gemm_op_a8w8 import (
 
 
 class _Tensor:
-    def __init__(self, shape, dtype, *, stride=None, contiguous=True):
+    def __init__(self, shape, dtype, *, stride=None, contiguous=True, pointer=0x1000):
         self.shape = shape
         self.ndim = len(shape)
         self.dtype = dtype
@@ -23,12 +23,16 @@ class _Tensor:
         self.is_cuda = True
         self._stride = stride or (shape[1], 1)
         self._contiguous = contiguous
+        self._pointer = pointer
 
     def stride(self, dim):
         return self._stride[dim]
 
     def is_contiguous(self):
         return self._contiguous
+
+    def data_ptr(self):
+        return self._pointer
 
 
 def _valid_tensors():
@@ -255,3 +259,24 @@ def test_flydsl_rdna3_a8w8_unsupported_call_uses_fallback(
         )
         is None
     )
+
+
+@pytest.mark.parametrize("tensor_index", [0, 1])
+def test_flydsl_rdna3_a8w8_rejects_unaligned_input_base(monkeypatch, tensor_index):
+    monkeypatch.setattr(
+        gemm_op_a8w8.torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(gcnArchName="gfx1151"),
+    )
+    tensors = list(_valid_tensors())
+    tensor = tensors[tensor_index]
+    tensors[tensor_index] = _Tensor(
+        tensor.shape, tensor.dtype, stride=tensor._stride, pointer=0x1001
+    )
+    monkeypatch.setattr(
+        gemm_op_a8w8.importlib,
+        "import_module",
+        lambda *args, **kwargs: pytest.fail("unaligned input attempted FlyDSL import"),
+    )
+
+    assert _try_flydsl_rdna3_a8w8(*tensors, None, torch.bfloat16, None) is None

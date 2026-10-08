@@ -145,6 +145,8 @@ def _flydsl_rdna3_a8w8_supported(
         or XQ.device != WQ.device
         or XQ.device != x_scale.device
         or XQ.device != w_scale.device
+        or XQ.data_ptr() % 16 != 0
+        or WQ.data_ptr() % 16 != 0
         or not XQ.is_cuda
         or not WQ.is_cuda
         or not x_scale.is_cuda
