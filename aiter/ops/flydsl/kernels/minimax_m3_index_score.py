@@ -197,6 +197,15 @@ def arch_traits(arch: str = DEFAULT_ARCH, fp8: bool = False) -> ArchTraits:
     return tr
 
 
+def _fp8_t(arch: str):
+    """The FlyDSL fp8 element type this architecture's `dtypes.fp8` names.
+
+    gfx942 is e4m3FNUZ and gfx950 is e4m3fn; the two differ in exponent bias, so
+    binding one as the other silently reads every value at the wrong scale.
+    """
+    return fx.Float8E4M3FN if arch == "gfx950" else fx.Float8E4M3FNUZ
+
+
 def fragment_helpers(tr: ArchTraits, g):
     """Per-lane-group MFMA fragment builders, shared by both index scorers.
 
@@ -751,6 +760,13 @@ def selection_filter(S: int, H: int, cfg: IndexScoreConfig, arch=None) -> bool:
         return False
     if cfg.waves_per_eu and not 1 <= cfg.waves_per_eu <= 10:
         return False
+    # `precision` reaches an MFMA whose fp8 form is CDNA4-only. Checked here as
+    # well as in `build_index_score` so `index_score_supported` cannot report a
+    # config as dispatchable and then have `score_flydsl` raise on it.
+    if cfg.precision not in ("bf16", "fp8"):
+        return False
+    if cfg.precision == "fp8" and arch is not None and arch != "gfx950":
+        return False
     if not -1 <= cfg.nt_k <= 3:  # -1 is the auto sentinel, see resolve_config
         return False
     if not -1 <= cfg.sched <= 4:  # -1 is the auto sentinel, see resolve_config
@@ -821,6 +837,12 @@ def build_index_score(
     if not selection_filter(S, H, cfg, arch=arch):
         raise ValueError(f"illegal config for S={S} H={H}: {cfg}")
     tr = arch_traits(arch, fp8)
+    # gfx942's fp8 is e4m3FNUZ (see aiter.utility.dtypes.defaultDtypes) and
+    # gfx950's is e4m3fn. They differ in exponent bias, so binding one as the
+    # other does not fail -- it reads every value at the wrong scale. The host
+    # already hands over whichever `dtypes.fp8` names, so only the FlyDSL-side
+    # element type has to follow. Same selection as pa_decode_kernel.py:220.
+    FP8_T = _fp8_t(arch)
     # Compute the dot in fp8 instead of widening K to bf16. Changes results;
     # see IndexScoreConfig.precision.
     if cfg.precision not in ("bf16", "fp8"):
@@ -1093,8 +1115,8 @@ def build_index_score(
             """
             if const_expr(not FP8_COMPUTE):
                 return as_bf16_frag(raw, sub)
-            t = fx.make_rmem_tensor(fx.make_layout(tr.lane_k, 1), fx.Float8E4M3FN)
-            t.store(raw.bitcast(fx.Float8E4M3FN))
+            t = fx.make_rmem_tensor(fx.make_layout(tr.lane_k, 1), FP8_T)
+            t.store(raw.bitcast(FP8_T))
             return t
 
         q_frag = [
@@ -1106,7 +1128,7 @@ def build_index_score(
         ]
 
         mma_atom = fx.make_mma_atom(
-            fx.rocdl.MFMA(MFMA_M, MFMA_N, tr.mfma_k, fx.Float8E4M3FN)
+            fx.rocdl.MFMA(MFMA_M, MFMA_N, tr.mfma_k, FP8_T)
             if const_expr(FP8_COMPUTE)
             # Same 16x16 tile and the same k on gfx950, so the fp8 form buys no
             # arithmetic. What it buys is deleting `convert_k` from the inner
@@ -1238,12 +1260,12 @@ def build_index_score(
             raw = raws[ks // tr.k_per_load]
             dwords = tr.lane_k // 4
             lo = (ks % tr.k_per_load) * dwords
-            t = fx.make_rmem_tensor(fx.make_layout(tr.lane_k, 1), fx.Float8E4M3FN)
+            t = fx.make_rmem_tensor(fx.make_layout(tr.lane_k, 1), FP8_T)
             t.store(
                 fx.Vector.from_elements(
                     [fx.Int32(raw[lo + d]) for d in range_constexpr(dwords)],
                     fx.Int32,
-                ).bitcast(fx.Float8E4M3FN)
+                ).bitcast(FP8_T)
             )
             return t
 
@@ -2243,6 +2265,10 @@ def _validate_metadata(
         raise ValueError("shuffled cache must be packed within each page")
     if not selection_filter(S, H, cfg, arch=arch):
         raise ValueError(f"illegal config for S={S} H={H}: {cfg}")
+    # The other half of the precision check: `selection_filter` never sees the
+    # cache, so the dtype half has to live where the tensor does.
+    if cfg.precision == "fp8" and cache.dtype == torch.bfloat16:
+        raise ValueError("precision='fp8' needs an fp8 cache")
     if block_table is not None:
         _validate_tensor(block_table, "block_table", (torch.int32,), 2, device)
         if (
@@ -2252,13 +2278,19 @@ def _validate_metadata(
             or block_table.stride(0) < block_table.shape[1]
         ):
             raise ValueError("block_table: invalid shape or layout")
-        # Necessary, not sufficient, under context parallelism: the table is
-        # indexed by the GLOBAL block `p * cp_world + cp_rank`, so a rank whose
-        # shard is non-empty needs columns past its own local bound. How far
-        # past depends on seq_lens, which this metadata-only check never reads,
-        # so the width of a CP table stays the caller contract documented
-        # above. The one case that is decidable here is the empty shard, and
-        # the kernel handles it by clamping its speculative load to column 0.
+        # Under context parallelism the table is indexed by the GLOBAL block
+        # `p * cp_world + cp_rank`, so a rank with a non-empty shard needs
+        # columns well past `max_block` -- which is its LOCAL page count. The
+        # width that needs is a function of seq_lens, and this path is
+        # deliberately metadata-only (reading seq_lens means a device sync on
+        # every call), so the table width stays a caller contract; see `cp_world`.
+        #
+        # The worst case `(max_block - 1) * cp_world + cp_rank` is NOT usable as
+        # a check here. A caller whose shard is empty has no local page to state
+        # and passes the global count instead, and the kernel clamps its
+        # speculative block-table load to column 0 -- legal at any width, and
+        # pinned by `test_empty_cp_shard_narrow_table`. Rejecting on the worst
+        # case would turn that supported call into an argument error.
     if seq_lens is not None:
         _validate_tensor(seq_lens, "seq_lens", (torch.int32,), 1, device)
         if seq_lens.shape != (batch,) or seq_lens.stride() != (1,):
@@ -2403,11 +2435,13 @@ def score_flydsl(
     with torch.cuda.device(idx_q.device):
         _run_compiled(
             launch,
-            ptr_arg(idx_q, fx.Float8E4M3FN if fp8_q else fx.BFloat16),
-            # gfx950's fp8 is OCP e4m3fn, which `dtypes.fp8` has already
-            # matched the cache against; e4m3fnuz reaches neither this line
-            # nor the widening it feeds. See the module docstring.
-            ptr_arg(cache, fx.Float8E4M3FN if fp8 else fx.BFloat16),
+            ptr_arg(idx_q, _fp8_t(arch) if fp8_q else fx.BFloat16),
+            # `dtypes.fp8` has already matched both tensors against the flavour
+            # this chip speaks, so the FlyDSL element type has to name the same
+            # one: e4m3fn on gfx950, e4m3fnuz on gfx942. See `_fp8_t` -- the two
+            # biases differ, and binding the wrong one is silently wrong values,
+            # not a failure.
+            ptr_arg(cache, _fp8_t(arch) if fp8 else fx.BFloat16),
             ptr_arg(out, fx.Float32),
             ptr_arg(block_table, fx.Int32),
             ptr_arg(work_map, fx.Int32),
