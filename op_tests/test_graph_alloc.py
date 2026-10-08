@@ -84,11 +84,16 @@ def test_every_cached_scratch_comes_from_the_private_pool():
     from aiter.ops.gemm_op_a8w8 import get_zero_bias_buf_keyed
     from aiter.ops.gemm_op_a16w16 import _get_semaphore_workspace_keyed
     from aiter.ops.topk import _get_topk_mb_workspace_keyed
+    from aiter.fused_moe import _FLYDSL_STAGE1_OUT_CACHE, _get_flydsl_stage1_out
 
     dev = torch.device("cuda:0")
     s = torch.cuda.Stream(device=dev)
     sid = s.cuda_stream
+    with torch.cuda.stream(s):
+        stage1_out = _get_flydsl_stage1_out((256, 512), dev)
+    _FLYDSL_STAGE1_OUT_CACHE.clear()
     sites = {
+        "flydsl_moe_stage1_out": stage1_out,
         "preshuffle_split_k": _get_preshuffle_split_buffers(dev, s),
         "a16w16_gfx950": get_split_k_buffers(s, dev),
         "a16w16_gfx1250": _split_k_counters(dev, s),
