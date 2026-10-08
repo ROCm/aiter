@@ -370,6 +370,22 @@ def flydsl_preshuffle_gemm_a8(
             ):
                 raise ValueError(f"blockscale {name} buffer must be smaller than 4 GiB")
 
+    if scale_mode == "epilogue":
+        # The epilogue indexes scales per row/column, so a per-tensor scalar
+        # would be read out of extent; broadcast it to [M,1] / [N,1].
+        def _norm_scale(name, scale, rows):
+            if scale.numel() == 1:
+                return scale.reshape(1, 1).expand(rows, 1).contiguous()
+            if scale.numel() != rows:
+                raise ValueError(
+                    f"[FlyDSL] {name} shape {tuple(scale.shape)} must have 1 "
+                    f"(per-tensor) or {rows} elements"
+                )
+            return scale
+
+        x_scale = _norm_scale("x_scale", x_scale, m)
+        w_scale = _norm_scale("w_scale", w_scale, n)
+
     wpe = None if waves_per_eu <= 0 else waves_per_eu
 
     if Out.dtype == torch.bfloat16:
