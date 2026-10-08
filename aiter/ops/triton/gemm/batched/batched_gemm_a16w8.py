@@ -149,5 +149,6 @@ def batched_gemm_a16w8(
         OPERAND_LAYOUT_B=operand_b,
         num_warps=num_warps,
         waves_per_eu=config.get("waves_per_eu", 1),
+        enable_fp_fusion=True,
     )
     return YQ

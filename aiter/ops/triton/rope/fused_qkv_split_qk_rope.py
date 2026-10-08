@@ -85,6 +85,7 @@ def fused_qkv_split_qk_rope(
         BLOCK_D_HALF=BLOCK_D_HALF,
         num_warps=num_warps,
         waves_per_eu=waves_per_eu,
+        enable_fp_fusion=True
     )
 
     return q, k, v

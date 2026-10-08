@@ -100,6 +100,7 @@ def scatter_grouped(
         BLOCK_N=BLOCK_N,
         EVEN_N=(x.shape[-1] % BLOCK_N == 0),
         num_warps=2,
+        enable_fp_fusion=True,
     )
     return out
 
@@ -228,6 +229,7 @@ def reduce_grouped(
             NUM_WARPS=gluon_num_warps,
             HAS_EXT_RESIDUAL=has_ext_residual,
             num_warps=gluon_num_warps,
+            enable_fp_fusion=True,
         )
         return out
 
@@ -275,5 +277,6 @@ def reduce_grouped(
         stride_extres_n=res_stride_n,
         HAS_EXT_RESIDUAL=has_ext_residual,
         num_warps=2,
+        enable_fp_fusion=True,
     )
     return out

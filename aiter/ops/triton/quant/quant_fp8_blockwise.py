@@ -107,6 +107,7 @@ def quant_fp8_blockwise(
         AXIS=axis,
         DUAL=False,
         **_launch_params(block_size),
+        enable_fp_fusion=True,
     )
     return x_fp8, scales
 
@@ -168,6 +169,7 @@ def quant_fp8_blockwise_segment_m(
         BLOCK_SIZE=block_size,
         FP8_MAX=fp8_max,
         **_launch_params(block_size),
+        enable_fp_fusion=True,
     )
     return x_fp8, scales
 
@@ -217,6 +219,7 @@ def quant_fp8_blockwise_for_weight(
         BLOCK_SIZE=block_size,
         FP8_MAX=fp8_max,
         **_launch_params(block_size),
+        enable_fp_fusion=True,
     )
     return w_fp8, scales
 
@@ -271,6 +274,7 @@ def quant_fp8_blockwise_for_act_grad(
         AXIS=1,
         DUAL=True,
         **_launch_params(block_size),
+        enable_fp_fusion=True,
     )
     return x_fp8_row, scales_row, x_fp8_col, scales_col
 
@@ -328,5 +332,6 @@ def requant_fp8_row_to_col(
         BLOCK_SIZE=block_size,
         FP8_MAX=fp8_max,
         **_launch_params(block_size),
+        enable_fp_fusion=True,
     )
     return y_fp8, y_scales

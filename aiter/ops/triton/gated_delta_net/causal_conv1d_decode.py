@@ -146,6 +146,7 @@ def causal_conv1d_update_split_qkv(
         USE_PAD_SLOT=pad_slot_id is not None,
         BLOCK_N=BLOCK_N,
         num_warps=2 if use_gluon else 4,
+        enable_fp_fusion=True,
     )
 
     if unsqueeze:

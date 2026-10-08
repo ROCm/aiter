@@ -280,6 +280,7 @@ def pod_attention(
         prefill_ratio=prefill_ratio,
         decode_ratio=decode_ratio,
         max_output_tile_cnt=max_output_tile_cnt,
+        enable_fp_fusion=True,
     )
     # torch.cuda.synchronize()
     print(

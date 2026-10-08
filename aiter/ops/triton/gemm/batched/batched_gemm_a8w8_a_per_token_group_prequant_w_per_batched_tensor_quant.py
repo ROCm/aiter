@@ -184,6 +184,7 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
         DTYPE_MAX=DTYPE_MAX,
         DTYPE_MIN=-DTYPE_MAX,
         **config,
+        enable_fp_fusion=True,
     )
 
     return YQ

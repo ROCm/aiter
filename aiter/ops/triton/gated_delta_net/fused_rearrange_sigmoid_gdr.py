@@ -348,6 +348,7 @@ def fused_rearrange_sigmoid_gated_delta_rule(
         IS_KDA=is_kda,
         num_warps=num_warps,
         num_stages=num_stages,
+        enable_fp_fusion=True,
     )
     o = o.squeeze(0)
     return o, final_state

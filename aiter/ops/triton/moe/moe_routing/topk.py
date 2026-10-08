@@ -153,6 +153,7 @@ def grouped_topk(
         APPLY_RENORM=renorm,
         ROUTED_SCALING=routed_scaling_factor,
         num_warps=4,
+        enable_fp_fusion=True,
     )
 
     bitmatrix = Bitmatrix(
@@ -286,6 +287,7 @@ def topk(
         ROUTED_SCALING=routed_scaling_factor,
         Pop=pop_out,
         WRITE_POP=pop_out is not None,
+        enable_fp_fusion=True,
     )
     bitmatrix_shape = [n_rows, n_cols_words * 32]
     bitmatrix = Bitmatrix(
@@ -394,6 +396,7 @@ def hash_routing(
         APPLY_RENORM=renorm,
         ROUTED_SCALING=routed_scaling_factor,
         num_warps=8,
+        enable_fp_fusion=True,
     )
 
     bitmatrix_shape = [n_rows, n_cols_words * 32]

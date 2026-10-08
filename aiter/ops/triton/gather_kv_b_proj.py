@@ -148,6 +148,7 @@ def gather_kv_b_proj(
             NO_SCALE=no_scale,
             GRID_STRIDE=chunk_workers < max_kv_chunks,
             num_stages=num_stages,
+            enable_fp_fusion=True,
         )
         return
 
@@ -180,6 +181,7 @@ def gather_kv_b_proj(
             WEIGHT_PRESHUFFLE=weight_preshuffle,
             SHUFFLED_KV_CACHE=shuffled_kv_cache,
             num_stages=num_stages,
+            enable_fp_fusion=True,
         )
         return
 
@@ -210,4 +212,5 @@ def gather_kv_b_proj(
         NO_SCALE=no_scale,
         SHUFFLED_KV_CACHE=shuffled_kv_cache,
         num_stages=num_stages,
+        enable_fp_fusion=True,
     )

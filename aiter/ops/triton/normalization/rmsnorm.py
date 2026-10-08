@@ -93,6 +93,7 @@ def _rmsnorm_forward(x: torch.Tensor, weight: torch.Tensor, epsilon: float):
         blk_size,
         USE_BLOCKED,
         NUM_PRGMS,
+        enable_fp_fusion=True,
     )
 
     return y, rsigma
@@ -130,6 +131,7 @@ def _rmsnorm_forward_with_add(
         blk_size,
         USE_BLOCKED,
         NUM_PRGMS,
+        enable_fp_fusion=True,
     )
 
 
@@ -169,6 +171,7 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
             NUM_STAGES=_cfg["num_stages"],
             num_warps=_cfg["num_warps"],
             num_stages=_cfg["num_stages"],
+            enable_fp_fusion=True,
         )
         grid_reduce = lambda meta: [triton.cdiv(N, meta["BLOCK_SIZE_N"])]
         _rmsnorm_bwd_dg_reduce_triton[grid_reduce](
@@ -179,6 +182,7 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
             dg_tmp.shape[1],
             BLOCK_SIZE_M=128,
             BLOCK_SIZE_N=64,
+            enable_fp_fusion=True,
         )
         return dx, dgamma
 
@@ -215,6 +219,7 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
         USE_BLOCKED,
         NUM_PRGMS,
         num_warps=8,
+        enable_fp_fusion=True,
     )
 
     if need_reduction:
@@ -230,6 +235,7 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
             BLOCK_SIZE_M=128,
             BLOCK_SIZE_N=64,
             **dg_reduce_kwargs,
+            enable_fp_fusion=True
         )
 
     return dx, dgamma
@@ -453,6 +459,7 @@ def rmsnorm2d_fwd_with_smoothquant(
         blk_size,
         USE_BLOCKED,
         NUM_PRGMS,
+        enable_fp_fusion=True,
     )
 
 
@@ -526,6 +533,7 @@ def rmsnorm2d_fwd_with_dynamicquant(
         blk_size,
         USE_BLOCKED,
         NUM_PRGMS,
+        enable_fp_fusion=True,
     )
 
     return out_rms_norm
@@ -598,6 +606,7 @@ def rmsnorm2d_fwd_with_add_smoothquant(
         blk_size,
         USE_BLOCKED,
         NUM_PRGMS,
+        enable_fp_fusion=True,
     )
 
 
@@ -666,6 +675,7 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
         blk_size,
         USE_BLOCKED,
         NUM_PRGMS,
+        enable_fp_fusion=True,
     )
 
 
@@ -707,5 +717,6 @@ def _rmsnorm_forward_large_m_small_n(
         NUM_STAGES=_cfg["num_stages"],
         num_warps=_cfg["num_warps"],
         num_stages=_cfg["num_stages"],
+        enable_fp_fusion=True,
     )
     return (y, rsigma) if return_rsigma else y

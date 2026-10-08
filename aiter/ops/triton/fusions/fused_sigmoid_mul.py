@@ -83,5 +83,6 @@ def fused_sigmoid_mul(
         BLOCK_SIZE_N=BLOCK_SIZE_N,
         NEED_MASK=(M % BLOCK_SIZE_M != 0) or (N % BLOCK_SIZE_N != 0),
         **config,
+        enable_fp_fusion=True,
     )
     return out

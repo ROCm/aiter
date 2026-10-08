@@ -56,6 +56,7 @@ def keepk_sort0(
         APPLY_RENORM=apply_renorm,
         ROUTED_SCALING=routed_scaling_factor,
         num_warps=1,
+        enable_fp_fusion=True,
     )
     return Vout, Iout
 
@@ -133,6 +134,7 @@ def _minunique_common(
         EQUAL_A=(hist.shape[0] == BLOCK_A),
         USE_TDM=is_tdm_avail(),
         num_warps=1,
+        enable_fp_fusion=True,
     )
     expt_data = ExptData(hist, token_offs_raw, token_offs_pad, block_pid_map)
     routing_data = RoutingData(

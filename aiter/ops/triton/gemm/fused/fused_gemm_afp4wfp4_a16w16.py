@@ -205,6 +205,7 @@ def fused_gemm_afp4wfp4_a16w16(
             ADD_BIAS_BF16=(bias_bf16 is not None),
             SKIP_REDUCE=skip_reduce,
             **config,
+            enable_fp_fusion=True,
         )
 
     M_POW2 = triton.next_power_of_2(M)
@@ -258,6 +259,7 @@ def fused_gemm_afp4wfp4_a16w16(
             triton.next_power_of_2(config["NUM_KSPLIT"]),
             ADD_BIAS_FP4=(bias_fp4 is not None),
             ADD_BIAS_BF16=(bias_bf16 is not None),
+            enable_fp_fusion=True,
         )
 
     return y_fp4, y_bf16

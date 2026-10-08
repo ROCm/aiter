@@ -909,6 +909,7 @@ def sparse_mla_fwd(
         HAS_LSE=return_lse,
         num_warps=num_warps,
         waves_per_eu=waves_per_eu,
+        enable_fp_fusion=True,
     )
 
     if num_splits == 1:
@@ -942,5 +943,6 @@ def sparse_mla_fwd(
         HAS_LSE=return_lse,
         # A 2-split tile spans two warps; more warps would hold duplicate lanes.
         num_warps=min(4, grid_splits),
+        enable_fp_fusion=True,
     )
     return out, (lse if return_lse else None)

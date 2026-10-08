@@ -143,6 +143,7 @@ def gemm_a16wfp4_(
         w_scales.stride(1),
         ATOMIC_ADD=atomic_add,
         **config,
+        enable_fp_fusion=True
     )
 
     if config["NUM_KSPLIT"] > 1 and not atomic_add:
@@ -176,6 +177,7 @@ def gemm_a16wfp4_(
             activation="",
             use_activation=False,
             KERNEL_NAME="_gemm_afp4wfp4_reduce_kernel",
+            enable_fp_fusion=True,
         )
 
     return y
@@ -328,6 +330,7 @@ def gemm_a16wfp4_preshuffle_(
         w_scales.stride(1),
         PREQUANT=prequant,
         **config,
+        enable_fp_fusion=True
     )
 
     if return_y_pp:
@@ -363,6 +366,7 @@ def gemm_a16wfp4_preshuffle_(
             activation="",
             use_activation=False,
             KERNEL_NAME="_gemm_afp4wfp4_reduce_kernel",
+            enable_fp_fusion=True,
         )
 
     return y

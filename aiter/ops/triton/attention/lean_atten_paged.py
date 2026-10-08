@@ -130,6 +130,7 @@ def persistent_lean_attention_paged(
         num_splits=num_splits,
         waves_per_eu=waves_per_eu,
         num_warps=waves_per_eu,
+        enable_fp_fusion=True,
     )
 
     return o

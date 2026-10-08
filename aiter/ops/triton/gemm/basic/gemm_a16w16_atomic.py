@@ -109,6 +109,7 @@ def gemm_a16w16_atomic_(
         y.stride(1),
         ACCUMULATE=accumulate,
         **config,
+        enable_fp_fusion=True
     )
 
     return y

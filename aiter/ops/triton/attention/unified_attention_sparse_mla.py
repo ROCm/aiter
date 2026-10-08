@@ -92,4 +92,5 @@ def unified_attention_sparse_mla(
         ALL_DECODE=ALL_DECODE,
         num_warps=num_warps,
         num_stages=num_stages_2d,
+        enable_fp_fusion=True,
     )

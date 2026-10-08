@@ -57,6 +57,7 @@ def beta_sigmoid_fwd(x: torch.Tensor) -> torch.Tensor:
         n,
         BLOCK_SIZE=_BETA_SIGMOID_BLOCK_SIZE,
         num_warps=_BETA_SIGMOID_NUM_WARPS,
+        enable_fp_fusion=True,
     )
     return y
 
@@ -160,5 +161,6 @@ def chunk_delta_attn_gate_fwd(
         H=H,
         D=D,
         BD=triton.next_power_of_2(D),
+        enable_fp_fusion=True,
     )
     return yg

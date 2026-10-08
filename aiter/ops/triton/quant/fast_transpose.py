@@ -53,6 +53,7 @@ def fast_transpose_2d(x: torch.Tensor) -> torch.Tensor:
         num_warps=1,
         waves_per_eu=2,
         num_stages=2,
+        enable_fp_fusion=True,
     )
     return out
 
@@ -109,5 +110,6 @@ def transpose_packed_fp4(data_fp4: torch.Tensor) -> torch.Tensor:
         output.stride(1),
         BLOCK_M=BLOCK_M,
         BLOCK_N_PACKED=BLOCK_N_PACKED,
+        enable_fp_fusion=True,
     )
     return output.view(data_fp4.dtype)

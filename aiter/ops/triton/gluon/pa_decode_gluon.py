@@ -4417,6 +4417,7 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
             SLIDING_WINDOW=SLIDING_WINDOW,
             CDNA_VERSION=CDNA_VERSION,
             ONE_SHOT=ONE_SHOT,
+            enable_fp_fusion=True,
         )
         return
 
@@ -4484,6 +4485,7 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
         IS_CAUSAL=IS_CAUSAL,
         CDNA_VERSION=CDNA_VERSION,
         SLIDING_WINDOW=SLIDING_WINDOW,
+        enable_fp_fusion=True,
     )
 
 
@@ -4617,6 +4619,7 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
             HEAD_SIZE_POW2=triton.next_power_of_2(head_size),
             USE_SINKS=sink_token_ptr is not None,
             MAX_CONTEXT_PARTITION_NUM=triton.next_power_of_2(context_partition_num),
+            enable_fp_fusion=True,
         )
     else:
         paged_attention_decode_v2_reduce_kernel[grid](
@@ -4645,6 +4648,7 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
             HEAD_SIZE_POW2=triton.next_power_of_2(head_size),
             CONTEXT_PARTITION_SIZE=CONTEXT_PARTITION_SIZE,
             USE_SINKS=sink_token_ptr is not None,
+            enable_fp_fusion=True,
         )
 
 

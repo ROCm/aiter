@@ -97,6 +97,7 @@ def gemm_a8w8_per_token_scale(
         w_scale.stride(0),
         w_scale.stride(1),
         **config,
+        enable_fp_fusion=True
     )
 
     if config["NUM_KSPLIT"] > 1:
@@ -127,6 +128,7 @@ def gemm_a8w8_per_token_scale(
             activation="",
             use_activation=False,
             KERNEL_NAME="_gemm_a8w8_per_token_scale_reduce_kernel",
+            enable_fp_fusion=True,
         )
 
     return y

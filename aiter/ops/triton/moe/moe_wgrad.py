@@ -82,5 +82,6 @@ def moe_wgrad(
         top_k=top_k,
         BLOCK_SIZE_M=block_size_m,
         NUM_XCDS=get_num_xcds(),
+        enable_fp_fusion=True,
     )
     return dW

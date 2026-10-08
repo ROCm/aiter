@@ -644,6 +644,7 @@ def chunk_gated_delta_rule_fwd_h(
         BT=BT,
         TRANSPOSE_STATE=transpose_state,
         USE_EXP2=use_exp2,
+        enable_fp_fusion=True,
     )
     return h, v_new, final_state
 
@@ -951,6 +952,7 @@ def chunk_gated_delta_rule_fwd_h_opt(
         K=K,
         V=V,
         BT=BT,
+        enable_fp_fusion=True,
     )
     return h, v_new, final_state
 
@@ -1414,6 +1416,7 @@ def chunk_gated_delta_rule_fwd_h_opt_vk(
         V=V,
         BT=BT,
         USE_EXP2=use_exp2,
+        enable_fp_fusion=True,
     )
     return h, v_new, final_state
 
@@ -1478,5 +1481,6 @@ def chunk_gated_delta_rule_bwd_dhu(
         K=K,
         V=V,
         BT=BT,
+        enable_fp_fusion=True,
     )
     return dh, dh0, dv2

@@ -380,6 +380,7 @@ def fav3_sage_mxfp4_func(
         USE_BLOCK_SPARSE=use_block_sparse,
         RETURN_LSE=return_lse,
         **config,
+        enable_fp_fusion=True,
     )
 
     if return_lse:

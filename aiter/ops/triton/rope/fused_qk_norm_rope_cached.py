@@ -88,5 +88,6 @@ def fused_qk_norm_rope_cached(
         BLOCK_H=triton.next_power_of_2(H),
         BLOCK_D=triton.next_power_of_2(D),
         num_warps=4,
+        enable_fp_fusion=True,
     )
     return q, k

@@ -273,6 +273,7 @@ def gemm_afp8wfp8(
             stride_ck=stride_ck,
             **scales,
             **launch_options,
+            enable_fp_fusion=True,
         )
     else:
         _gemm_afp8wfp8_kernel[grid](
@@ -308,6 +309,7 @@ def gemm_afp8wfp8(
             cache_modifier=launch["cache_modifier"],
             **scales,
             **launch_options,
+            enable_fp_fusion=True,
         )
     if workspace is None and num_splits > 1:
         if skip_reduce:
@@ -337,6 +339,7 @@ def gemm_afp8wfp8(
             activation=None,
             use_activation=False,
             KERNEL_NAME="_gemm_afp8wfp8_reduce_kernel",
+            enable_fp_fusion=True,
         )
     return y
 
@@ -553,6 +556,7 @@ def gemm_afp8wfp8_preshuffle(
             # Reserved launch option (sets the cluster dim) that the kernel also
             # declares, so it is bound both ways -- like waves_per_eu above.
             num_ctas=num_ctas,
+            enable_fp_fusion=True,
         )
     else:
         _gemm_afp8wfp8_preshuffle_kernel[grid](
@@ -577,6 +581,7 @@ def gemm_afp8wfp8_preshuffle(
             w_scales.stride(1),
             A_SCALE_K_GROUP=x_scale_group_size,
             **config,
+            enable_fp_fusion=True,
         )
 
     if config["NUM_KSPLIT"] > 1:
@@ -610,6 +615,7 @@ def gemm_afp8wfp8_preshuffle(
             activation=None,
             use_activation=False,
             KERNEL_NAME="_gemm_afp8wfp8_preshuffle_reduce_kernel",
+            enable_fp_fusion=True,
         )
 
     return y

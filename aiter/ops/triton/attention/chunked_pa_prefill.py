@@ -145,4 +145,5 @@ def chunked_prefill_paged_decode(
         # num_warps=1 measured strictly faster on all
         # 34 decode shapes swept on gfx950/Triton 3.8
         **decode_launch,
+        enable_fp_fusion=True
     )

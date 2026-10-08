@@ -454,7 +454,9 @@ def _launch_attn_res(key, grid_n: int, argv: tuple, tune_kwargs: dict) -> None:
     kwargs = dict(zip(_KERNEL_ARG_ORDER, argv))
     if ATTN_RES_TRITON_AUTOTUNE:
         del kwargs["BL"]  # supplied by the autotuner's config search
-    kernel = attnres_fwd_kernel[(grid_n,)](**kwargs, **tune_kwargs)
+    kernel = attnres_fwd_kernel[(grid_n,)](
+        **kwargs, **tune_kwargs, enable_fp_fusion=True
+    )
     if key is not None:
         if device is None:
             device = driver.active.get_current_device()
@@ -581,6 +583,7 @@ def _run_sequence(q_flat, residuals, w_flat, ow_flat, rms_eps, scale, has_onorm)
         QUANT_FP8=False,
         FP8_MAX=1.0,
         **_launch_tune_kwargs(num_warps, num_stages, L2),
+        enable_fp_fusion=True,
     )
     return o.view(output_shape)
 
@@ -649,6 +652,7 @@ def _run_packed(q_flat, residuals, w_flat, ow_flat, rms_eps, scale, has_onorm):
         QUANT_FP8=False,
         FP8_MAX=1.0,
         **_launch_tune_kwargs(num_warps, num_stages, bl),
+        enable_fp_fusion=True,
     )
     return o.view(output_shape)
 

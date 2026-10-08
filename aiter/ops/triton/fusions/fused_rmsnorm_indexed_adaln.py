@@ -101,5 +101,6 @@ def fused_rmsnorm_indexed_adaln(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         num_warps=4,
+        enable_fp_fusion=True,
     )
     return out

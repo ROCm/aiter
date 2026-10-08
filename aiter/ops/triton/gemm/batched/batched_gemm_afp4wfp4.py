@@ -117,6 +117,7 @@ def batched_gemm_afp4wfp4(
         w_scales.stride(1),
         w_scales.stride(2),
         **config,
+        enable_fp_fusion=True
     )
 
     if config["NUM_KSPLIT"] > 1:
@@ -148,4 +149,5 @@ def batched_gemm_afp4wfp4(
             REDUCE_BLOCK_SIZE_N,
             ACTUAL_KSPLIT,
             config["NUM_KSPLIT"],
+            enable_fp_fusion=True,
         )

@@ -86,6 +86,7 @@ def fused_mul_add(
         IS_B_TENSOR=IS_B_TENSOR,
         num_warps=4,
         waves_per_eu=0,
+        enable_fp_fusion=True,
     )
 
     return out

@@ -112,6 +112,7 @@ def downcast_to_mxfp(
         DEQUANT_SCALE_ROUNDING_MODE.value,
         pow2_scale,
         num_warps=8,
+        enable_fp_fusion=True,
     )
 
     out_quant_tensor = out_quant_tensor.transpose(axis, src_tensor.ndim - 1)
@@ -234,6 +235,7 @@ def smoothquant_quantize(
             BLOCK_M,
             BLOCK_K,
             num_warps=4,
+            enable_fp_fusion=True,
         )
     else:
         BLOCK_K = 256
@@ -253,6 +255,7 @@ def smoothquant_quantize(
             BLOCK_M,
             BLOCK_K,
             num_warps=4,
+            enable_fp_fusion=True,
         )
 
     return x_int8, x_scale

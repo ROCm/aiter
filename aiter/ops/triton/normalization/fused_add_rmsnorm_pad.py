@@ -101,6 +101,7 @@ def fused_add_rmsnorm_pad(
                 HAS_RES=(res is not None),
                 BLOCK_SIZE_N=BLOCK_SIZE_N,
                 num_warps=NUM_WARPS,
+                enable_fp_fusion=True,
             )
 
             if res is not None:
@@ -146,6 +147,7 @@ def fused_add_rmsnorm_pad(
         res_out.stride(1) if res is not None else 0,
         HAS_RES=(res is not None),
         BLOCK_SIZE_N=BLOCK_SIZE_N,
+        enable_fp_fusion=True,
     )
 
     if res is not None:

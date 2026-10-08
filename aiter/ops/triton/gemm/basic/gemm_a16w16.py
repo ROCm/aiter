@@ -270,6 +270,7 @@ def gemm_a16w16_(
                 num_warps=num_warps,
                 num_stages=num_stages,
                 waves_per_eu=waves_per_eu,
+                enable_fp_fusion=True,
             )
 
             if NUM_KSPLIT > 1:
@@ -305,6 +306,7 @@ def gemm_a16w16_(
                     ),
                     use_activation=activation is not None,
                     KERNEL_NAME="_gemm_a16w16_persistent_reduce_kernel",
+                    enable_fp_fusion=True,
                 )
 
             return y
@@ -346,6 +348,7 @@ def gemm_a16w16_(
             SKIP_REDUCE=False,
             NUM_WGS=NUM_WGS,
             **config,
+            enable_fp_fusion=True,
         )
 
         return y
@@ -477,6 +480,7 @@ def gemm_a16w16_(
             ADD_BIAS=(bias is not None),
             num_warps=num_warps,
             waves_per_eu=waves_per_eu,
+            enable_fp_fusion=True,
         )
 
         return y
@@ -529,6 +533,7 @@ def gemm_a16w16_(
         ADD_BIAS=(bias is not None),
         SKIP_REDUCE=skip_reduce,
         **config,
+        enable_fp_fusion=True,
     )
 
     if config["NUM_KSPLIT"] > 1:
@@ -562,6 +567,7 @@ def gemm_a16w16_(
             activation=_get_activation_from_str(activation) if activation else "",
             use_activation=activation is not None,
             KERNEL_NAME="_gemm_a16w16_reduce_kernel",
+            enable_fp_fusion=True,
         )
 
     return y

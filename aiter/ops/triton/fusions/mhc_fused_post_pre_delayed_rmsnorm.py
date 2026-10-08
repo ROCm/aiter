@@ -135,6 +135,7 @@ def mhc_fused_post_pre_delayed_rmsnorm(
         HAS_POST=has_post,
         num_warps=config["num_warps"],
         num_stages=config["num_stages"],
+        enable_fp_fusion=True,
     )
 
     _mhc_fused_post_pre_delayed_rmsnorm_reduce_kernel[(T,)](
@@ -156,5 +157,6 @@ def mhc_fused_post_pre_delayed_rmsnorm(
         NUM_SINKHORN_ITERS=int(sinkhorn_repeat),
         BLOCK_C=config["BLOCK_C"],
         num_warps=config["reduce_num_warps"],
+        enable_fp_fusion=True,
     )
     return residual_out, post_out, comb_out, layer_input, next_pre

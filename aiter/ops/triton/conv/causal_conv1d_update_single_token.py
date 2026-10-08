@@ -144,6 +144,7 @@ def causal_conv1d_update_single_token(
         NP2_STATELEN=np2_statelen,
         USE_PAD_SLOT=pad_slot_id is not None,
         BLOCK_N=256,
+        enable_fp_fusion=True,
     )
     if unsqueeze:
         out = out.squeeze(-1)
@@ -341,6 +342,7 @@ def fused_reshape_causal_conv1d_update_single_token(
         USE_PAD_SLOT=pad_slot_id is not None,
         BLOCK_N=256,
         INTERLEAVED_QKVZ=interleaved,
+        enable_fp_fusion=True,
     )
     if unsqueeze:
         out = out.squeeze(-1)

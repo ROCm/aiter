@@ -343,6 +343,7 @@ def fused_clamp_act_mul(
             waves_per_eu=waves_per_eu,
             ROWS_PER_PROG=ROWS_PER_PROG,
             cache_modifier=".cg",
+            enable_fp_fusion=True,
         )
     else:
         # only for triton
@@ -380,6 +381,7 @@ def fused_clamp_act_mul(
             SCALE_N_PAD=scale_n_pad,
             num_warps=num_warps,
             waves_per_eu=waves_per_eu,
+            enable_fp_fusion=True,
         )
 
     if HAS_QUANT:

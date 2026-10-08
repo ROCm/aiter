@@ -108,6 +108,7 @@ def sparse_mla_bwd_dq(
         IS_FIRST_CHUNK=is_first_chunk,
         num_warps=4,
         waves_per_eu=1,
+        enable_fp_fusion=True,
     )
 
 
@@ -159,6 +160,7 @@ def sparse_mla_bwd_dkv_interm_v4(
         MFMA_K=MFMA_K,
         DUAL_STAGE=DUAL_STAGE,
         num_warps=num_warps,
+        enable_fp_fusion=True,
     )
     return interm
 
@@ -183,6 +185,7 @@ def delta_v4(o, do, out=None, BLOCK_R=8, num_warps=8):
         D=D,
         BLOCK_R=BLOCK_R,
         num_warps=num_warps,
+        enable_fp_fusion=True,
     )
     return out
 
@@ -237,6 +240,7 @@ def dkv_gather_acc(
         BLOCK_E=BLOCK_E,
         ACCUMULATE=accumulate,
         num_warps=num_warps,
+        enable_fp_fusion=True,
     )
 
 

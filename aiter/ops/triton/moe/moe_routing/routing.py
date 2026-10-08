@@ -145,6 +145,7 @@ def sort_tokens(expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOC
         EQUAL_A=(hist.shape[0] == BLOCK_A),  # optimization parameters
         USE_TDM=is_tdm_avail(),
         num_warps=1,
+        enable_fp_fusion=True,
     )
 
     return (
@@ -217,6 +218,7 @@ def sort_tokens_fused(
         EQUAL_A=(hist.shape[0] == BLOCK_A),  # optimization parameters
         USE_TDM=is_tdm_avail(),
         num_warps=1,
+        enable_fp_fusion=True,
     )
 
     return (
@@ -656,6 +658,7 @@ def ep_sort_routing(
         EQUAL_A=(num_local_experts == BLOCK_A),
         N_CTAS=n_ctas,
         HAS_DST_ROW=dst_row is not None,
+        enable_fp_fusion=True,
     )
 
     topk_indx = torch.empty(n_gates, dtype=torch.int32, device=device)
@@ -686,6 +689,7 @@ def ep_sort_routing(
             else ep_scatter_geometry.max_tokens_per_rank
         ),
         PEER_ROWS=(0 if ep_scatter_geometry is None else ep_scatter_geometry.peer_rows),
+        enable_fp_fusion=True,
     )
     return hist, topk_indx, gate_indx, gate_scal, gate_valid, dst_row
 

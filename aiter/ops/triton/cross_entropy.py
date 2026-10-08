@@ -139,6 +139,7 @@ def cross_entropy_forward(
         num_warps=num_warps,
         waves_per_eu=_WAVES_PER_EU,
         num_stages=_NUM_STAGES,
+        enable_fp_fusion=True,
     )
 
     if world_size > 1:
@@ -170,6 +171,7 @@ def cross_entropy_forward(
         num_warps=num_warps,
         waves_per_eu=_WAVES_PER_EU,
         num_stages=_NUM_STAGES,
+        enable_fp_fusion=True,
     )
 
     loss = loss_1d.reshape(B, SQ) if not reduce_loss else (loss_1d.sum() / n_valid)
@@ -293,6 +295,7 @@ def cross_entropy_forward_chunked(
             num_warps=num_warps,
             waves_per_eu=_WAVES_PER_EU,
             num_stages=_NUM_STAGES,
+            enable_fp_fusion=True,
         )
 
         if world_size > 1:
@@ -322,6 +325,7 @@ def cross_entropy_forward_chunked(
             num_warps=num_warps,
             waves_per_eu=_WAVES_PER_EU,
             num_stages=_NUM_STAGES,
+            enable_fp_fusion=True,
         )
 
         row += rows_this
@@ -380,5 +384,6 @@ def cross_entropy_backward(
         num_warps=num_warps,
         waves_per_eu=_WAVES_PER_EU,
         num_stages=_NUM_STAGES,
+        enable_fp_fusion=True,
     )
     return _input

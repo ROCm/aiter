@@ -43,7 +43,7 @@ def clear_sums(n_cols, device, MEMSET_BLOCK=512):
     cdiv = triton.cdiv
     blocks = cdiv(n_cols, MEMSET_BLOCK)
     out_ret = torch.empty((blocks * MEMSET_BLOCK,), device=device, dtype=torch.int32)
-    _sum_bitmatrix_memset[(blocks,)](out_ret, MEMSET_BLOCK)
+    _sum_bitmatrix_memset[(blocks,)](out_ret, MEMSET_BLOCK, enable_fp_fusion=True)
     return out_ret
 
 
@@ -76,6 +76,7 @@ def sum_bitmatrix_rows(x, out_ret, partials_block_size=None):
         BLOCK_M=PARTIALS_BLOCK_M,
         BLOCK_MM=BLOCK_MM,  # constants
         num_warps=8,
+        enable_fp_fusion=True,
     )
 
     out_partials = out_partials[: cdiv(n_rows, PARTIALS_BLOCK_M), :]

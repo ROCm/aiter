@@ -36,7 +36,19 @@ def _layernorm_forward(
     BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(N))
 
     _layernorm_kernel[(M,)](
-        x, y, weight, bias, mean, rstd, x.stride(0), y.stride(0), M, N, eps, BLOCK_SIZE
+        x,
+        y,
+        weight,
+        bias,
+        mean,
+        rstd,
+        x.stride(0),
+        y.stride(0),
+        M,
+        N,
+        eps,
+        BLOCK_SIZE,
+        enable_fp_fusion=True,
     )
 
 
@@ -73,6 +85,7 @@ def _layernorm_forward_with_add(
         N,
         epsilon,
         BLOCK_SIZE,
+        enable_fp_fusion=True,
     )
 
 
@@ -131,6 +144,7 @@ def _layernorm_backward(
         USE_BLOCKED=USE_BLOCKED,
         num_warps=num_warps,
         IGNORE_DW_DB=IGNORE_DW_DB_IN_FUSED,
+        enable_fp_fusion=True,
     )
     grid_reduce = lambda meta: (triton.cdiv(N, meta["BLOCK_SIZE_N"]),)
     if not IGNORE_DW_DB_IN_FUSED:
@@ -147,6 +161,7 @@ def _layernorm_backward(
             N,
             BLOCK_SIZE_M=dwdb_block_m,
             BLOCK_SIZE_N=dwdb_block_n,
+            enable_fp_fusion=True,
         )
     else:
         dwdb_block_n = max(16, N // 256)
@@ -165,6 +180,7 @@ def _layernorm_backward(
             N,
             BLOCK_SIZE_M=dwdb_block_m,
             BLOCK_SIZE_N=dwdb_block_n,
+            enable_fp_fusion=True,
         )
 
     return dx, dw, db
@@ -370,6 +386,7 @@ def layernorm2d_fwd_with_dynamicquant(
         DTYPE_MAX,
         IS_SMOOTH,
         BLOCK_SIZE,
+        enable_fp_fusion=True,
     )
 
     return
@@ -435,6 +452,7 @@ def layernorm2d_fwd_with_smoothquant(
         DTYPE_MAX,
         IS_SMOOTH,
         BLOCK_SIZE,
+        enable_fp_fusion=True,
     )
 
     return
@@ -507,6 +525,7 @@ def layernorm2d_fwd_with_add_dynamicquant(
         DTYPE_MAX,
         IS_SMOOTH,
         BLOCK_SIZE,
+        enable_fp_fusion=True,
     )
 
     return
@@ -581,6 +600,7 @@ def layernorm2d_fwd_with_add_smoothquant(
         DTYPE_MAX,
         IS_SMOOTH,
         BLOCK_SIZE,
+        enable_fp_fusion=True,
     )
 
     return

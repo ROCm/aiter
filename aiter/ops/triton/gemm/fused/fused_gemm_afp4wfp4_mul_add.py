@@ -200,6 +200,7 @@ def fused_gemm_afp4wfp4_mul_add(
         IS_B_TENSOR=IS_B_TENSOR,
         FUSE_TYPE=fuse_type,
         **config,
+        enable_fp_fusion=True,
     )
 
     if config["NUM_KSPLIT"] > 1:
@@ -239,6 +240,7 @@ def fused_gemm_afp4wfp4_mul_add(
             IS_A_TENSOR=IS_A_TENSOR,
             IS_B_TENSOR=IS_B_TENSOR,
             FUSE_TYPE=fuse_type,
+            enable_fp_fusion=True,
         )
 
     return y
@@ -391,6 +393,7 @@ def fused_gemm_afp4wfp4_preshuffle_add_mul(
             IS_B_TENSOR=IS_B_TENSOR,
             FUSE_TYPE=fuse_type,
             **config,
+            enable_fp_fusion=True,
         )
 
     M_POW2 = triton.next_power_of_2(M)
@@ -443,6 +446,7 @@ def fused_gemm_afp4wfp4_preshuffle_add_mul(
             IS_A_TENSOR=IS_A_TENSOR,
             IS_B_TENSOR=IS_B_TENSOR,
             FUSE_TYPE=fuse_type,
+            enable_fp_fusion=True,
         )
 
     return y

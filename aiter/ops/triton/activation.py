@@ -137,6 +137,7 @@ def act_mul_and_mxfp4_quant(
         num_warps=NUM_WARPS,
         waves_per_eu=0,
         num_stages=1,
+        enable_fp_fusion=True,
     )
 
     return x_fp4, blockscale_e8m0
@@ -211,6 +212,7 @@ def act_mul_and_fp8_group_quant(
         # num_warps=NUM_WARPS,
         # waves_per_eu=0,
         # num_stages=1,
+        enable_fp_fusion=True,
     )
 
     return x_fp8, out_bs
@@ -321,6 +323,7 @@ def fused_silu_mul(
         BLOCK_N=block_n,
         num_warps=num_warps,
         waves_per_eu=0,
+        enable_fp_fusion=True,
     )
     return out
 
@@ -403,5 +406,6 @@ def silu_and_mul_backward(
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             **config,
+            enable_fp_fusion=True,
         )
     return out

@@ -292,6 +292,7 @@ def _decode_att_m_fwd(
         num_stages=2,
         Lk=Lk,
         Lv=Lv,
+        enable_fp_fusion=True,
     )
 
 
@@ -576,6 +577,7 @@ def _decode_grouped_att_m_fwd(
         Lk=Lk,
         Lv=Lv,
         **extra_kargs,
+        enable_fp_fusion=True
     )
 
 
@@ -689,6 +691,7 @@ def _decode_softmax_reducev_fwd(
         num_warps=4,
         num_stages=2,
         **extra_kargs,
+        enable_fp_fusion=True
     )
 
 
@@ -737,6 +740,7 @@ def csr_to_dense_block_table(kv_indices, kv_indptr, dense_table, max_ctx, bs):
         dense_table,
         dense_table.stride(0),
         BLOCK_N=BLOCK_N,
+        enable_fp_fusion=True,
     )
 
 

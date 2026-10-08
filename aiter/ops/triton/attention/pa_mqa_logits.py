@@ -587,6 +587,7 @@ def deepgemm_fp8_paged_mqa_logits(
                 hidden_dim,
                 cdna_version,
                 get_gfx(),
+                enable_fp_fusion=True,
             )
         else:  #  load AOT compiled gluon kernel
             assert triton_version < Version(
@@ -623,6 +624,7 @@ def deepgemm_fp8_paged_mqa_logits(
                 ChunkK,
                 KVBlockSize,
                 hidden_dim,
+                enable_fp_fusion=True,
             )
     else:
         assert not Preshuffle, "Preshuffle mode is only supported on gluon kernel."
@@ -656,5 +658,6 @@ def deepgemm_fp8_paged_mqa_logits(
             SplitKV=SplitKV,
             HiddenDim=hidden_dim,
             KVBlockSize=KVBlockSize,
+            enable_fp_fusion=True,
         )
     return triton.runtime.cache.get_cache_manager(kernel.hash).key

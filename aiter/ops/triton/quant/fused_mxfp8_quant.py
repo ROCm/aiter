@@ -71,6 +71,7 @@ def fused_rms_mxfp8_quant(
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         QUANT_BLOCK_SIZE=_QUANT_BLOCK_SIZE,
         NUM_PRGMS=NUM_PRGMS,
+        enable_fp_fusion=True,
     )
     return y, scale
 
@@ -161,6 +162,7 @@ def fused_dual_rmsnorm_mxfp8_quant(
         BLOCK_SIZE_KK=BLOCK_SIZE_KK,
         QUANT_BLOCK_SIZE=_QUANT_BLOCK_SIZE,
         NUM_PRGMS=NUM_PRGMS,
+        enable_fp_fusion=True,
     )
     return yq, sq, yk
 
@@ -212,6 +214,7 @@ def fused_flatten_mxfp8_quant(
         N2,
         BLOCK_SIZE_N2=BLOCK_SIZE_N2,
         QUANT_BLOCK_SIZE=_QUANT_BLOCK_SIZE,
+        enable_fp_fusion=True,
     )
 
     return out, out_scales

@@ -627,6 +627,7 @@ def moe_gemm_a8w4(
             stride_y_mx_m=stride_y_mx_m,
             stride_y_mx_n=stride_y_mx_n,
             HAS_MX_OUT=out_mx_quant,
+            enable_fp_fusion=True,
         )
     elif use_gluon and block_m == 16:
         _moe_gemm_a8w4_decode_gluon[(grid,)](
@@ -687,6 +688,7 @@ def moe_gemm_a8w4(
             DstRow=dst_row,
             EP_SCATTER=fused_ep_scatter,
             Y_ROWS=(ep_scatter.out.shape[0] if fused_ep_scatter else 0),
+            enable_fp_fusion=True,
         )
     elif use_gluon:
         layouts = get_moe_a8w4_layouts(
@@ -766,6 +768,7 @@ def moe_gemm_a8w4(
             EP_SCATTER=fused_ep_scatter,
             Y_ROWS=(ep_scatter.out.shape[0] if fused_ep_scatter else 0),
             **layouts,
+            enable_fp_fusion=True,
         )
     else:
         _moe_gemm_a8w4_triton[(grid,)](
@@ -827,6 +830,7 @@ def moe_gemm_a8w4(
             stride_y_mx_m=stride_y_mx_m,
             stride_y_mx_n=stride_y_mx_n,
             HAS_MX_OUT=out_mx_quant,
+            enable_fp_fusion=True,
         )
 
     # MXFP8 emit path: scatter_indx is None and split_k==1, so we bypass

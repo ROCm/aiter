@@ -236,7 +236,13 @@ def _run_chunked_delta(
     )
     g = torch.empty((chunks, 8, C * C + C), device=device, dtype=torch.float32)
     _chunk_offsets[(batch + 1,)](
-        starts, offsets, batch, triton.next_power_of_2(batch), C, num_warps=1
+        starts,
+        offsets,
+        batch,
+        triton.next_power_of_2(batch),
+        C,
+        num_warps=1,
+        enable_fp_fusion=True,
     )
     _prepare_chunk_factors[(chunks, 8)](
         prepared,
@@ -270,6 +276,7 @@ def _run_chunked_delta(
             triton.next_power_of_2(batch),
             C * S,
             num_warps=1,
+            enable_fp_fusion=True,
         )
         _prepare_segment_maps[(segments, 8, 4)](
             prepared,
@@ -416,6 +423,7 @@ def gdn_prefill_group_fp8_quant_m1024_3071(
         cu_seqlens,
         has_initial_state,
         num_warps=4,
+        enable_fp_fusion=True,
     )
     # Target about 16 or 32 independent temporal segments, rounded to an even
     # number of chunks. This balances parallel maps against the segment carry.
@@ -927,6 +935,7 @@ def gdn_prefill_group_fp8_quant_m12289_16384_b6_15(
         cu_seqlens,
         has_initial_state,
         num_warps=1,
+        enable_fp_fusion=True,
     )
     core = torch.empty((m, 8, 128), device=device, dtype=torch.bfloat16)
     use_groups = batch == 1 or (batch <= 4 and m // batch >= 4096)
@@ -969,6 +978,7 @@ def gdn_prefill_group_fp8_quant_m12289_16384_b6_15(
             BATCH=batch,
             BT=token_block,
             num_warps=prep_warps,
+            enable_fp_fusion=True,
         )
         if use_groups:
             group_tokens = (
@@ -995,6 +1005,7 @@ def gdn_prefill_group_fp8_quant_m12289_16384_b6_15(
                 GROUP=group_tokens,
                 ROW_WARPS=group_row_warps,
                 num_warps=recur_warps,
+                enable_fp_fusion=True,
             )
             _propagate_group_maps[(batch, 8, 8)](
                 maps,
@@ -1005,6 +1016,7 @@ def gdn_prefill_group_fp8_quant_m12289_16384_b6_15(
                 GROUP=group_tokens,
                 BV=16,
                 num_warps=4,
+                enable_fp_fusion=True,
             )
             _evaluate_groups[(128 // value_block, 8, num_groups)](
                 chunk_w,
@@ -1023,6 +1035,7 @@ def gdn_prefill_group_fp8_quant_m12289_16384_b6_15(
                 GROUP=group_tokens,
                 ROW_WARPS=group_row_warps,
                 num_warps=recur_warps,
+                enable_fp_fusion=True,
             )
         else:
             _recurrence_full[(batch, 8, 128 // value_block)](
@@ -1040,6 +1053,7 @@ def gdn_prefill_group_fp8_quant_m12289_16384_b6_15(
                 BT=token_block,
                 BV=value_block,
                 num_warps=recur_warps,
+                enable_fp_fusion=True,
             )
     else:
         chunk_inverse = torch.empty_like(chunk_c)
@@ -1059,6 +1073,7 @@ def gdn_prefill_group_fp8_quant_m12289_16384_b6_15(
             BATCH=batch,
             BT=token_block,
             num_warps=prep_warps,
+            enable_fp_fusion=True,
         )
         _recurrence_compact[(batch, 8, 128 // value_block)](
             prepared,
@@ -1077,6 +1092,7 @@ def gdn_prefill_group_fp8_quant_m12289_16384_b6_15(
             num_warps=recur_warps,
             ROW_WARPS=2 if batch > 8 else 1,
             TRANSPOSED=batch <= 8,
+            enable_fp_fusion=True,
         )
     normalized = torch.empty_like(core)
     values = torch.empty((m, 1024), device=device, dtype=precision_config.dtype)
@@ -1097,6 +1113,7 @@ def gdn_prefill_group_fp8_quant_m12289_16384_b6_15(
         LANES=epi_lanes,
         PACK=epi_pack,
         num_warps=1,
+        enable_fp_fusion=True,
     )
     return normalized, conv_state, delta_state, values, scales
 
@@ -1277,6 +1294,7 @@ def gdn_prefill_group_fp8_quant_m3072_16384(
             batch.bit_length(),
             bt,
             num_warps=4,
+            enable_fp_fusion=True,
         )
     elif hierarchical:
         direct_first = m < 32768
@@ -1405,6 +1423,7 @@ def gdn_prefill_group_fp8_quant_m3072_16384(
             16,
             batch,
             num_warps=4,
+            enable_fp_fusion=True,
         )
     return normalized, conv_state, delta_state, quantized, scales
 

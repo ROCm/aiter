@@ -158,6 +158,7 @@ def extend_attention_fwd(
         NUM_BLOCKS=num_blocks,
         NUM_XCDS=get_num_xcds(),
         **config,
+        enable_fp_fusion=True
     )
 
 

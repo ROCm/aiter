@@ -212,7 +212,9 @@ def _grouped_gemm_triton(
         N, K_dim, E, A_idx is not None, _use_qwen3_tuned_configs()
     )
     constexprs, launch = split_launch_config(fwd_cfg)
-    _grouped_gemm_kernel[grid](*launch_args, **launch_meta, **constexprs, **launch)
+    _grouped_gemm_kernel[grid](
+        *launch_args, **launch_meta, **constexprs, **launch, enable_fp_fusion=True
+    )
     return out
 
 
@@ -312,7 +314,9 @@ def _grouped_gemm_dw(
         N, K_dim, E, A_idx is not None, _use_qwen3_tuned_configs()
     )
     constexprs, launch = split_launch_config(dw_cfg)
-    _grouped_gemm_dw_kernel[grid](*launch_args, **launch_meta, **constexprs, **launch)
+    _grouped_gemm_dw_kernel[grid](
+        *launch_args, **launch_meta, **constexprs, **launch, enable_fp_fusion=True
+    )
     return out
 
 
@@ -341,7 +345,9 @@ def token_gather_and_sum_varlen_K_triton(
         "is_varlen_K": is_varlen_K,
     }
     constexprs, launch = split_launch_config(get_token_gather_config(H))
-    token_gather_sum_kernel[(T,)](*common, **kwargs, **constexprs, **launch)
+    token_gather_sum_kernel[(T,)](
+        *common, **kwargs, **constexprs, **launch, enable_fp_fusion=True
+    )
 
 
 _GLU_ACT_MAP = {"swiglu": 0, "geglu": 1, "reglu": 2}
@@ -379,6 +385,7 @@ def activation_fwd(
             ACT_TYPE=_GLU_ACT_MAP[activation_type],
             **constexprs,
             **launch,
+            enable_fp_fusion=True,
         )
         return a
     elif activation_type in _POINTWISE_ACT_MAP:
@@ -396,6 +403,7 @@ def activation_fwd(
             ACT_TYPE=_POINTWISE_ACT_MAP[activation_type],
             **constexprs,
             **launch,
+            enable_fp_fusion=True,
         )
         return a
     else:
@@ -430,6 +438,7 @@ def activation_bwd(
             ACT_TYPE=_GLU_ACT_MAP[activation_type],
             **constexprs,
             **launch,
+            enable_fp_fusion=True,
         )
         return dh
     elif activation_type in _POINTWISE_ACT_MAP:
@@ -450,6 +459,7 @@ def activation_bwd(
             ACT_TYPE=_POINTWISE_ACT_MAP[activation_type],
             **constexprs,
             **launch,
+            enable_fp_fusion=True,
         )
         return dh
     else:
@@ -496,6 +506,7 @@ def TC_topk_router_metadata_triton(
         K_POW2=K_POW2,
         K=K,
         E_POW2=E_POW2,
+        enable_fp_fusion=True,
     )
 
     expert_frequency.copy_(col_partial_sum_trans.sum(dim=1, dtype=torch.int32))
@@ -510,6 +521,7 @@ def TC_topk_router_metadata_triton(
         TK,
         BLOCK_M=config["PREFIX_BLOCK_M"],
         BLOCK_N=E_POW2,
+        enable_fp_fusion=True,
     )
 
     _sonicmoe_bitmatrix_metadata_compute_stage2[(n_tiles,)](
@@ -524,6 +536,7 @@ def TC_topk_router_metadata_triton(
         K_POW2=K_POW2,
         TOKENS_PER_BLOCK=TOKENS_PER_BLOCK,
         K=K,
+        enable_fp_fusion=True,
     )
 
 
@@ -566,6 +579,7 @@ def general_routing_router_metadata_triton(
         n_tiles,
         BLOCK_SIZE=BLOCK_SIZE,
         E_POW2=E_POW2,
+        enable_fp_fusion=True,
     )
 
     expert_frequency.copy_(col_partial_sum_trans.sum(dim=1, dtype=torch.int32))
@@ -580,6 +594,7 @@ def general_routing_router_metadata_triton(
         TK,
         BLOCK_M=config["PREFIX_BLOCK_M"],
         BLOCK_N=E_POW2,
+        enable_fp_fusion=True,
     )
 
     _sonicmoe_general_metadata_compute_stage2[(n_tiles,)](
@@ -593,6 +608,7 @@ def general_routing_router_metadata_triton(
         n_tiles,
         expert_frequency_offset[:E],
         BLOCK_SIZE=BLOCK_SIZE,
+        enable_fp_fusion=True,
     )
 
     N_ITERS = max(1, math.ceil(math.log2(TK + 1)))
@@ -605,6 +621,7 @@ def general_routing_router_metadata_triton(
         TK,
         BLOCK_SIZE=TOKEN_BLOCK,
         N_ITERS=N_ITERS,
+        enable_fp_fusion=True,
     )
 
 
@@ -695,6 +712,7 @@ def _topk_softmax_bwd(
             K,
             triton.next_power_of_2(K),
             (dlogits is None),
+            enable_fp_fusion=True,
         )
     else:
         _topk_over_softmax_bwd_kernel[T,](
@@ -718,6 +736,7 @@ def _topk_softmax_bwd(
             triton.next_power_of_2(E),
             triton.next_power_of_2(K),
             norm_topk_probs,
+            enable_fp_fusion=True,
         )
 
 
@@ -763,6 +782,7 @@ def _up_projection_backward_act(
             CONCAT_LAYOUT=concat_layout and is_glu_activation,
             **constexprs,
             **launch,
+            enable_fp_fusion=True,
         )
 
 
@@ -849,6 +869,7 @@ def _down_projection_backward_act(
             BLOCK_H=BLOCK_H,
             **constexprs,
             **launch,
+            enable_fp_fusion=True,
         )
 
         if NUM_H_BLOCKS == 1:

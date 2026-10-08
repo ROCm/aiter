@@ -168,6 +168,7 @@ def fused_gemm_a8w8_blockscale_a16w16(
         ADD_BIAS_BF16=(bias_bf16 is not None),
         SKIP_REDUCE=skip_reduce,
         **config,
+        enable_fp_fusion=True
     )
 
     if config["NUM_KSPLIT"] > 1:
@@ -208,6 +209,7 @@ def fused_gemm_a8w8_blockscale_a16w16(
             triton.next_power_of_2(config["NUM_KSPLIT"]),
             ADD_BIAS_FP8=(bias_fp8 is not None),
             ADD_BIAS_BF16=(bias_bf16 is not None),
+            enable_fp_fusion=True,
         )
 
     return y_fp8, y_bf16

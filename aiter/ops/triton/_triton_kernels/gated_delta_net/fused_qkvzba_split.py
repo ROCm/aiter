@@ -136,6 +136,7 @@ def fused_qkvzba_split_reshape_cat_decode(
         head_v,
         num_warps=1,
         num_stages=3,
+        enable_fp_fusion=True,
     )
     return mixed_qkv, z, b, a
 
@@ -513,6 +514,7 @@ def fused_qkvzba_split_reshape_cat_prefill(
             head_v,
             num_warps=1,
             num_stages=3,
+            enable_fp_fusion=True,
         )
     elif num_heads_qk == 2:
         grid = (seq_len,)
@@ -528,6 +530,7 @@ def fused_qkvzba_split_reshape_cat_prefill(
             head_v,
             num_warps=1,
             num_stages=3,
+            enable_fp_fusion=True,
         )
     elif num_heads_qk == 4:
         grid = (seq_len,)
@@ -543,6 +546,7 @@ def fused_qkvzba_split_reshape_cat_prefill(
             head_v,
             num_warps=1,
             num_stages=3,
+            enable_fp_fusion=True,
         )
     elif num_heads_qk == 8:
         grid = (seq_len,)
@@ -558,6 +562,7 @@ def fused_qkvzba_split_reshape_cat_prefill(
             head_v,
             num_warps=1,
             num_stages=3,
+            enable_fp_fusion=True,
         )
     else:
         # Fallback to generic 2D-grid kernel
@@ -575,6 +580,7 @@ def fused_qkvzba_split_reshape_cat_prefill(
             head_v,
             num_warps=1,
             num_stages=3,
+            enable_fp_fusion=True,
         )
 
     return mixed_qkv, z, b, a

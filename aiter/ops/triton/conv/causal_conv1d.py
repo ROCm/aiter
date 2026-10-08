@@ -213,6 +213,7 @@ def causal_conv1d_fn(
         BLOCK_M=8,
         BLOCK_N=256,
         num_stages=2,
+        enable_fp_fusion=True,
     )
     return out
 
@@ -413,6 +414,7 @@ def causal_conv1d_update(
         USE_PAD_SLOT=pad_slot_id is not None,
         BLOCK_N=256,
         SAVE_INTERMEDIATE=intermediate_conv_window is not None,
+        enable_fp_fusion=True,
     )
     if unsqueeze:
         out = out.squeeze(-1)

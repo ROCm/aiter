@@ -347,6 +347,7 @@ def fused_fp4_bmm_rope_cat_and_cache_mla(
         waves_per_eu=config["waves_per_eu"],
         matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
         cache_modifier=config["cache_modifier"],
+        enable_fp_fusion=True,
     )
 
     if NUM_KSPLIT > 1:
@@ -378,6 +379,7 @@ def fused_fp4_bmm_rope_cat_and_cache_mla(
             ACTUAL_KSPLIT,
             NUM_KSPLIT,
             transpose_bm,
+            enable_fp_fusion=True,
         )
 
     return q_out, decode_q_pe_out, k_pe_out, q_nope_zeros_out
@@ -660,6 +662,7 @@ def fused_fp8_bmm_rope_cat_and_cache_mla(
         waves_per_eu=config["waves_per_eu"],
         matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
         cache_modifier=config["cache_modifier"],
+        enable_fp_fusion=True,
     )
 
     return q_out, decode_q_pe_out, k_pe_out, q_nope_zeros_out

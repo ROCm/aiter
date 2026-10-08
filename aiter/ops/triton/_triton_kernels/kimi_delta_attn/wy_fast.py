@@ -236,5 +236,6 @@ def recompute_w_u_fwd(
         BT=BT,
         BK=_BK_DEFAULT,
         BV=_BV_DEFAULT,
+        enable_fp_fusion=True,
     )
     return w, u, qg, kg

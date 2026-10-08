@@ -226,6 +226,7 @@ def mla_prefill_fwd(
             KV_CACHE_DTYPE=KV_CACHE_DTYPE,
             K_WIDTH=K_WIDTH,
             **attn_config,
+            enable_fp_fusion=True
         )
     else:
         triton_mla_prefill_fwd_kernel[(num_kv_heads, total_num_q_blocks)](
@@ -257,6 +258,7 @@ def mla_prefill_fwd(
             BLOCK_M=BLOCK_M,
             NUM_HEAD_BLOCKS=NUM_HEAD_BLOCKS,
             **attn_config,
+            enable_fp_fusion=True
         )
     return out
 
@@ -509,6 +511,7 @@ def mla_decode_fwd(
             BLOCK_SCALES_SIZE=BLOCK_SCALES_SIZE,
             NUM_HEAD_BLOCKS=NUM_HEAD_BLOCKS,
             **attn_config,
+            enable_fp_fusion=True
         )
     else:
         triton_mla_decode_fwd_kernel[(total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)](
@@ -546,6 +549,7 @@ def mla_decode_fwd(
             IS_Q_FP8=(q_dtype == e4m3_dtype),
             IS_KV_FP8=(kv_buffer_dtype == e4m3_dtype),
             **attn_config,
+            enable_fp_fusion=True
         )
 
     if NUM_SEGMENTS == 1:
@@ -580,5 +584,6 @@ def mla_decode_fwd(
         BLOCK_Q=BLOCK_Q,
         ALL_DECODE=ALL_DECODE,
         **reduce_config,
+        enable_fp_fusion=True
     )
     return out

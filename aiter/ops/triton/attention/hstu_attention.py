@@ -138,6 +138,7 @@ def triton_hstu_attention_fwd(
         HAS_MAX_ATTN_LEN=has_max_attn_len,
         HAS_SORT_BY_LENGTH_INDICES=has_sort_by_length_indices,
         **config,
+        enable_fp_fusion=True
     )
 
     return out
@@ -268,6 +269,7 @@ def triton_hstu_attention_bwd(
         BLOCK_D_V=DimV,
         HAS_SORT_BY_LENGTH_INDICES=sort_by_length_indices is not None,
         **config,
+        enable_fp_fusion=True
     )
 
     return dq, dk, dv

@@ -119,6 +119,7 @@ def static_per_tensor_quant_fp8_i8(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         num_warps=4,
+        enable_fp_fusion=True,
     )
     return qx
 
@@ -153,6 +154,7 @@ def dynamic_per_tensor_quant_fp8_i8(
             if torch.is_floating_point(qx)
             else torch.iinfo(qx.dtype).max
         ),
+        enable_fp_fusion=True,
     )
 
     static_per_tensor_quant_fp8_i8(qx, x_in, scale_out)
@@ -195,6 +197,7 @@ def dynamic_per_token_quant_fp8_i8(
             if torch.is_floating_point(qx)
             else torch.iinfo(qx.dtype).max
         ),
+        enable_fp_fusion=True,
     )
 
     return qx, scale_out
@@ -348,6 +351,7 @@ def dynamic_mxfp4_quant(
             BLOCK_SIZE_M=BLOCK_SIZE_M,
             BLOCK_SIZE_N=BLOCK_SIZE_N,
             num_warps=NUM_WARPS,
+            enable_fp_fusion=True,
         )
     # The gfx950 Gluon kernel only supports bf16 (hw-cvt) and no use_sr;
     # everything else uses the Triton path below.
@@ -392,6 +396,7 @@ def dynamic_mxfp4_quant(
             BLOCK_SIZE_N=BLOCK_SIZE_N,
             NUM_STAGES=NUM_STAGES,
             num_warps=NUM_WARPS,
+            enable_fp_fusion=True,
         )
 
     else:
@@ -450,6 +455,7 @@ def dynamic_mxfp4_quant(
             NUM_STAGES=NUM_STAGES,
             num_warps=NUM_WARPS,
             waves_per_eu=0,
+            enable_fp_fusion=True,
         )
     return (x_fp4, blockscale_e8m0)
 
@@ -510,6 +516,7 @@ def dynamic_mxfp4_quant_blockscale(
         *x_fp4.stride(),
         *blockscale_e8m0.stride(),
         BLOCK_SIZE=block_size,
+        enable_fp_fusion=True,
     )
 
     return x_fp4, blockscale_e8m0
@@ -602,6 +609,7 @@ def dynamic_mxfp8_quant(
             NUM_BUFFERS=NUM_BUFFERS,
             num_warps=NUM_WARPS,
             waves_per_eu=cfg["waves_per_eu"],
+            enable_fp_fusion=True,
         )
     elif _use_gluon(
         backend,
@@ -642,6 +650,7 @@ def dynamic_mxfp8_quant(
             NUM_ITER=NUM_ITER,
             MXFP8_QUANT_BLOCK_SIZE=_MXFP8_QUANT_BLOCK_SIZE,
             num_warps=NUM_WARPS,
+            enable_fp_fusion=True,
         )
     else:
         BLOCK_SIZE_N = triton.next_power_of_2(K)
@@ -664,6 +673,7 @@ def dynamic_mxfp8_quant(
             BLOCK_SIZE_N=BLOCK_SIZE_N,
             QUANT_BLOCK_SIZE=_MXFP8_QUANT_BLOCK_SIZE,
             NUM_PRGMS=NUM_PRGMS,
+            enable_fp_fusion=True,
         )
 
     y = y.view(*orig_shape[:-1], K)
@@ -725,6 +735,7 @@ def dynamic_mxfp8_quant_n32k4_mbn(
         BLOCK_SIZE_N=BLOCK_SIZE_N,
         QUANT_BLOCK_SIZE=_MXFP8_QUANT_BLOCK_SIZE,
         NUM_PRGMS=R,
+        enable_fp_fusion=True,
     )
 
     return y.view(M, B, K), scale
@@ -786,6 +797,7 @@ def fp8_legacy_to_mxfp8(
         BLOCK_SIZE_M=BLOCK_SIZE_M,
         QUANT_BLOCK_SIZE=_MXFP8_QUANT_BLOCK_SIZE,
         LEGACY_BLOCK_SIZE=_MXFP8_LEGACY_BLOCK_SIZE,
+        enable_fp_fusion=True,
     )
 
     return y_fn, y_scale
@@ -867,6 +879,7 @@ def dynamic_nvfp4_quant(
         NUM_STAGES=NUM_STAGES,
         num_warps=NUM_WARPS,
         waves_per_eu=0,
+        enable_fp_fusion=True,
     )
 
     return x_fp4, blockscale_e4m3

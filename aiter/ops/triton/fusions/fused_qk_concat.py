@@ -71,6 +71,7 @@ def fused_qk_cat(
         QH_PER_KH=qh // kh,
         BLOCK_D1=d1,
         BLOCK_D2=d2,
+        enable_fp_fusion=True
     )
 
     return q_out, k_out
@@ -164,6 +165,7 @@ def fused_qk_rope_cat(
         BLOCK_D_nope=d_nope,
         BLOCK_D_pe=d_pe,
         BLOCK_D_HALF_pe=d_pe // 2,
+        enable_fp_fusion=True
     )
 
     return q_out, k_out

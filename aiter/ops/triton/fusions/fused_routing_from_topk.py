@@ -137,6 +137,7 @@ def fused_routing_from_topk(
         BLOCK_NK=BLOCK_NK,
         BLOCK_E=BLOCK_E,
         num_warps=1,
+        enable_fp_fusion=True,
     )
 
     # Kernel 2 (Phase B): exclusive prefix-sum hist → offset. The kernel
@@ -147,6 +148,7 @@ def fused_routing_from_topk(
         E=n_expts_tot,
         BLOCK_E=BLOCK_E,
         num_warps=1,
+        enable_fp_fusion=True,
     )
 
     # Kernel 3 (Phase C): placement. The kernel boundary publishes the
@@ -164,6 +166,7 @@ def fused_routing_from_topk(
         HAS_EXPERT_MAP=has_expert_map,
         BLOCK_NK=BLOCK_NK,
         num_warps=1,
+        enable_fp_fusion=True,
     )
 
     return hist, topk_indx, gate_indx, gate_scal

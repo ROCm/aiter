@@ -120,5 +120,6 @@ def fused_mla_prefill_qkv_fp8(
         BLOCK_T=BLOCK_T,
         NEED_MASK=(T % BLOCK_T != 0) or (heads_out_pow2 != num_heads_out),
         **config,
+        enable_fp_fusion=True,
     )
     return q_out, k_out, v_out

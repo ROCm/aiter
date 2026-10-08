@@ -178,12 +178,12 @@ def fused_rms_mxfp4_quant(
             *_common_args,
             **_common_kwargs,
             ROWS_PER_CTA=ROWS_PER_CTA,
+            enable_fp_fusion=True,
         )
     else:
         grid = (M * (1 if x2 is None else 2),)
         _fused_rms_mxfp4_quant_kernel[grid](
-            *_common_args,
-            **_common_kwargs,
+            *_common_args, **_common_kwargs, enable_fp_fusion=True
         )
 
     return (out1_fp4, out1_bs), out1, out2, out_res1
@@ -229,6 +229,7 @@ def fused_flatten_mxfp4_quant(
         N2,
         BLOCK_SIZE_N2,
         MXFP4_QUANT_BLOCK_SIZE,
+        enable_fp_fusion=True,
     )
 
     return out, out_block_scales
@@ -408,6 +409,7 @@ def fused_reduce_act_mul_and_mxfp4_quant(
         num_warps=NUM_WARPS,
         waves_per_eu=0,
         num_stages=1,
+        enable_fp_fusion=True,
     )
 
     return (y, y_scale), y2
@@ -614,6 +616,7 @@ def fused_reduce_rms_mxfp4_quant(
         SCALE_N_PAD=SCALE_N,
         SHUFFLE=shuffle,
         SHUFFLE_PAD=use_scale_shuffle_padding,
+        enable_fp_fusion=True,
     )
 
     return (out1_fp4, out1_bs), out1, out2, out_res1, out3
@@ -719,6 +722,7 @@ def fused_dynamic_mxfp4_quant_moe_sort(
         BLOCK_SIZE_M=BLOCK_SIZE_M // 2,
         BLOCK_SIZE_N=BLOCK_SIZE_N // 2,
         TOPK=topk,
+        enable_fp_fusion=True,
     )
 
     # The blockscale buffer is allocated with padded N (rounded up to
@@ -929,6 +933,7 @@ def fused_quant_fp8_sort(
         TOPK=M // token_num,
         DTYPE_MAX=DTYPE_MAX,
         DTYPE_MIN=DTYPE_MIN,
+        enable_fp_fusion=True,
     )
 
     return x_fp8, scale_e8m0_packed.view(dtypes.fp8_e8m0).view(-1, N_o)

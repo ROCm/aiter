@@ -121,16 +121,11 @@ def l2norm_fwd(
             BT,
             STORE_RSTD=need_rstd,
             num_warps=_L2NORM_FWD_NUM_WARPS,
+            enable_fp_fusion=True,
         )
     else:
         l2norm_fwd_kernel1[(T,)](
-            x,
-            y,
-            rstd,
-            eps,
-            D,
-            BD,
-            STORE_RSTD=need_rstd,
+            x, y, rstd, eps, D, BD, STORE_RSTD=need_rstd, enable_fp_fusion=True
         )
 
     if need_rstd:

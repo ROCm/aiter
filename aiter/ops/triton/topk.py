@@ -56,6 +56,7 @@ def one_stage_topk(
         USE_TDM=is_tdm_avail(),
         num_warps=4,
         num_stages=2,
+        enable_fp_fusion=True,
     )
     return out_v, out_i
 
@@ -104,6 +105,7 @@ def two_stage_topk(x, k, dim=-1, largest=True):
             else torch.finfo(torch.float32).max
         ),
         USE_TDM=is_tdm_avail(),
+        enable_fp_fusion=True,
     )
     stage2_elem_cnt = chunk_num * k
     BLOCK_SIZE = triton.next_power_of_2(stage2_elem_cnt)
@@ -125,6 +127,7 @@ def two_stage_topk(x, k, dim=-1, largest=True):
             ),
             torch.iinfo(torch.int32).min,
             USE_TDM=is_tdm_avail(),
+            enable_fp_fusion=True,
         )
         if descending
         else tl.constexpr(torch.iinfo(torch.int32).max)

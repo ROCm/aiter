@@ -286,6 +286,7 @@ def mhc(
             BLOCK_K=BLOCK_K,
             SPLITK_BLOCK_SIZE=splitk_block_size,
             **config,
+            enable_fp_fusion=True,
         )
 
         grid_reduce_apply = (triton.cdiv(M, BLOCK_M), triton.cdiv(C, BLOCK_C))
@@ -328,6 +329,7 @@ def mhc(
             RES_PID_C=RES_PID_C,
             ALPHAS_ARE_POINTER=alphas is not None,
             **config,
+            enable_fp_fusion=True,
         )
     else:
         grid = (triton.cdiv(M, BLOCK_M), total_n_blocks)
@@ -366,6 +368,7 @@ def mhc(
             NUM_SINKHORN_ITERS=sinkhorn_iters,
             ALPHAS_ARE_POINTER=alphas is not None,
             **config,
+            enable_fp_fusion=True,
         )
 
     # `out` layout is [post + res]: out[:, :n] is H^post, out[:, n:] is H^res
@@ -503,6 +506,7 @@ def mhc_post(
         BLOCK_M=BLOCK_M,
         BLOCK_C=BLOCK_C,
         **config,
+        enable_fp_fusion=True,
     )
 
     return out
@@ -794,6 +798,7 @@ def mhc_post_pre(
         BLOCK_C=BLOCK_C_SPLIT,
         N_TOTAL_POW2=N_TOTAL_POW2,
         **config,
+        enable_fp_fusion=True,
     )
 
     # --- Launch 2: reduce-apply kernel writes h_post and h_res directly.
@@ -885,6 +890,7 @@ def mhc_post_pre(
         ASYMMETRIC_EXP_DOMAIN=asymmetric_exp_domain,
         hc_sinkhorn_eps=hc_sinkhorn_eps,
         **config,
+        enable_fp_fusion=True,
     )
 
     # Reshape h_post to (M, n, 1) on return for compatibility with downstream
@@ -1057,6 +1063,7 @@ def _mhc_pre_dsv4_forward(
         NUM_SINKHORN_ITERS=sinkhorn_iters,
         eps=sinkhorn_eps,
         num_warps=sink_cfg.num_warps,
+        enable_fp_fusion=True,
     )
     return post, comb, layer_input
 
@@ -1238,6 +1245,7 @@ def _mhc_head_dsv4_forward(
         num_warps=head_cfg.num_warps,
         num_stages=head_cfg.num_stages,
         **extra,
+        enable_fp_fusion=True,
     )
     return out
 

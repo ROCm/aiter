@@ -228,6 +228,7 @@ def paged_attn_decode_v1(
             HEAD_SZ=head_sz,
             HEAD_SZ_POW2=head_sz_pow2,
             QUERY_GRP_SZ=query_grp_sz,
+            enable_fp_fusion=True,
         )
     # GQA - Grouped Query Attention
     else:
@@ -266,6 +267,7 @@ def paged_attn_decode_v1(
             KV_BLK_SZ_POW2=kv_blk_sz,
             waves_per_eu=3 if query_grp_sz > 1 else 0,
             num_stages=1,
+            enable_fp_fusion=True,
         )
 
 
@@ -357,6 +359,7 @@ def paged_attn_decode_v2(
             HEAD_SZ_POW2=head_sz_pow2,
             QUERY_GRP_SZ=query_grp_sz,
             SEQ_PARTITION_SZ=_SEQ_PARTITION_SIZE,
+            enable_fp_fusion=True,
         )
         grid = (num_q_heads, num_seqs, 1)
         _paged_attn_decode_v2_wo_dot_reduce_kernel[grid](
@@ -376,6 +379,7 @@ def paged_attn_decode_v2(
             HEAD_SZ_POW2=head_sz_pow2,
             SEQ_PARTITION_SZ=_SEQ_PARTITION_SIZE,
             MAX_NUM_SEQ_PARTITIONS_POW2=int(max_num_partitions_pow2),
+            enable_fp_fusion=True,
         )
     # GQA
     else:
@@ -424,6 +428,7 @@ def paged_attn_decode_v2(
             KV_BLK_SZ=kv_blk_sz,
             KV_BLK_SZ_POW2=kv_blk_sz_pow2,
             SEQ_PARTITION_SZ=_SEQ_PARTITION_SIZE,
+            enable_fp_fusion=True,
         )
         grid = (num_seqs, num_kv_heads, 1)
         _paged_attn_decode_v2_w_dot_reduce_kernel[grid](
@@ -447,6 +452,7 @@ def paged_attn_decode_v2(
             QUERY_GRP_SZ_POW2=query_grp_sz_pow2,
             SEQ_PARTITION_SZ=_SEQ_PARTITION_SIZE,
             MAX_NUM_SEQ_PARTITIONS_POW2=int(triton.next_power_of_2(max_num_partitions)),
+            enable_fp_fusion=True,
         )
 
 
@@ -514,6 +520,7 @@ def paged_attn_decode_v1_per_token_quant(
             HEAD_SZ=head_sz,
             HEAD_SZ_POW2=head_sz_pow2,
             QUERY_GRP_SZ=query_grp_sz,
+            enable_fp_fusion=True,
         )
     # GQA - Grouped Query Attention
     else:
@@ -555,6 +562,7 @@ def paged_attn_decode_v1_per_token_quant(
             KV_BLK_SZ_POW2=kv_blk_sz,
             waves_per_eu=3 if query_grp_sz > 1 else 0,
             num_stages=1,
+            enable_fp_fusion=True,
         )
 
 
@@ -649,6 +657,7 @@ def paged_attn_decode_v2_per_token_quant(
             HEAD_SZ_POW2=head_sz_pow2,
             QUERY_GRP_SZ=query_grp_sz,
             SEQ_PARTITION_SZ=_SEQ_PARTITION_SIZE,
+            enable_fp_fusion=True,
         )
         grid = (num_q_heads, num_seqs, 1)
         _paged_attn_decode_v2_wo_dot_reduce_kernel_per_token_quant[grid](
@@ -668,6 +677,7 @@ def paged_attn_decode_v2_per_token_quant(
             HEAD_SZ_POW2=head_sz_pow2,
             SEQ_PARTITION_SZ=_SEQ_PARTITION_SIZE,
             MAX_NUM_SEQ_PARTITIONS_POW2=int(max_num_partitions_pow2),
+            enable_fp_fusion=True,
         )
     # GQA
     else:
@@ -719,6 +729,7 @@ def paged_attn_decode_v2_per_token_quant(
             KV_BLK_SZ=kv_blk_sz,
             KV_BLK_SZ_POW2=kv_blk_sz_pow2,
             SEQ_PARTITION_SZ=_SEQ_PARTITION_SIZE,
+            enable_fp_fusion=True,
         )
         grid = (num_seqs, num_kv_heads, 1)
         _paged_attn_decode_v2_w_dot_reduce_kernel_per_token_quant[grid](
@@ -742,4 +753,5 @@ def paged_attn_decode_v2_per_token_quant(
             QUERY_GRP_SZ_POW2=query_grp_sz_pow2,
             SEQ_PARTITION_SZ=_SEQ_PARTITION_SIZE,
             MAX_NUM_SEQ_PARTITIONS_POW2=int(triton.next_power_of_2(max_num_partitions)),
+            enable_fp_fusion=True,
         )

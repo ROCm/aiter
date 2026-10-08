@@ -234,6 +234,7 @@ def fused_qkv_split_qk_norm_rope_cache(
         HAVE_V_SCALE=v_scale is not None,
         total_num_kv_cache_tokens=total_num_kv_cache_tokens,
         num_warps=num_warps,
+        enable_fp_fusion=True,
     )
 
     if attn_output_gate:

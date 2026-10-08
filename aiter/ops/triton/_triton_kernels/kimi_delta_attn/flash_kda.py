@@ -1175,6 +1175,7 @@ def flash_kda_fwd(
             NUM_MERGE=(C // inv_block).bit_length() - 1,
             CM_QKG=CM_LOAD,
             CM_WS=CM_STORE,
+            enable_fp_fusion=True,
         )
 
     desc, seq_seg_off, num_segs, max_segs = _build_segments(
@@ -1244,7 +1245,7 @@ def flash_kda_fwd(
         }
         return _segment_fast[
             lambda meta, _w=W: (triton.cdiv(_w, meta["BW"]), num_segs * H)
-        ](W=W, **launch_args)
+        ](W=W, **launch_args, enable_fp_fusion=True)
 
     if max_segs > 1:
         # Pass A: b_seg (affine part) and A_seg (linear part), both fully
@@ -1278,6 +1279,7 @@ def flash_kda_fwd(
                 BW=bw,
                 **_g2.build_layouts(nw),
                 num_warps=nw,
+                enable_fp_fusion=True,
             )
         else:
             for buf, width, identity, has_v in (
@@ -1314,6 +1316,7 @@ def flash_kda_fwd(
             BV=BV_SCAN,
             **paged_args,
             num_warps=SCAN_WARPS,
+            enable_fp_fusion=True,
         )
     else:
         h_in = None if paged else h0

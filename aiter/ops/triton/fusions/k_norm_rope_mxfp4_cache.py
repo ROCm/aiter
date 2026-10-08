@@ -129,4 +129,5 @@ def k_norm_rope_mxfp4_cache(
         D_PER_TILE=d_per_tile,
         SCALE_LANES=scale_lanes,
         num_warps=1,
+        enable_fp_fusion=True,
     )

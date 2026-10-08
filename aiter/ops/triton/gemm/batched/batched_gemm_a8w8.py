@@ -108,6 +108,7 @@ def batched_gemm_a8w8(
         bias.stride(0) if has_bias else 0,
         has_bias,
         **config,
+        enable_fp_fusion=True,
     )
 
     return YQ

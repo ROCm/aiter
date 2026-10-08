@@ -90,4 +90,5 @@ def context_attention_fwd(
         num_warps=num_warps,
         num_stages=1,
         Lk=Lk,
+        enable_fp_fusion=True,
     )

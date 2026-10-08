@@ -205,6 +205,7 @@ def fused_gemm_a8w8_blockscale_mul_add(
         IS_B_TENSOR=IS_B_TENSOR,
         FUSE_TYPE=fuse_type,
         **config,
+        enable_fp_fusion=True
     )
 
     if config["NUM_KSPLIT"] > 1:
@@ -241,6 +242,7 @@ def fused_gemm_a8w8_blockscale_mul_add(
             IS_A_TENSOR=IS_A_TENSOR,
             IS_B_TENSOR=IS_B_TENSOR,
             FUSE_TYPE=fuse_type,
+            enable_fp_fusion=True,
         )
 
     return y

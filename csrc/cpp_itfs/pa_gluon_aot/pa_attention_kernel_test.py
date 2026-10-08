@@ -645,6 +645,7 @@ def run_direct_attention_kernel(
         CDNA_VERSION=cdna_version,
         waves_per_eu=waves_per_eu,
         num_stages=1,
+        enable_fp_fusion=True,
     )
 
 

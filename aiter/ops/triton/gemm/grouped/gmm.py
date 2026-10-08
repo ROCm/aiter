@@ -269,7 +269,7 @@ def gmm(
         USE_BIAS=use_bias,
         WORK_STEALING=work_stealing,
         **config,
-    )
+    enable_fp_fusion=True)
     # fmt: on
 
     return out
@@ -487,7 +487,7 @@ def ptgmm(
         COMPUTE_BIAS_GRAD=compute_bias_grad,
         ACCUMULATE=accumulate,
         **config,
-    )
+    enable_fp_fusion=True)
     # fmt: on
 
     return out
@@ -682,7 +682,7 @@ def nptgmm(
         COMPUTE_BIAS_GRAD=compute_bias_grad,
         ACCUMULATE=accumulate,
         **config,
-    )
+    enable_fp_fusion=True)
     # fmt: on
 
     return out

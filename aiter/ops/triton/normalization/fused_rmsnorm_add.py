@@ -77,6 +77,7 @@ def _fused_rmsnorm_add_core(x, weight, epsilon, res1):
             BLOCK_SIZE_M=BLOCK_SIZE_M,
             BLOCK_SIZE_N=BLOCK_SIZE_N,
             FIRST_INPUT_RES=(res1 is not None),
+            enable_fp_fusion=True,
         )
     else:
 
@@ -96,6 +97,7 @@ def _fused_rmsnorm_add_core(x, weight, epsilon, res1):
             out_res1_stride_m,
             BLOCK_SIZE_N=BLOCK_SIZE_N,
             FIRST_INPUT_RES=(res1 is not None),
+            enable_fp_fusion=True,
         )
 
     return out1, out_res1

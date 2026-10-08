@@ -305,6 +305,7 @@ def fused_kda_decode(
             stride_cidx=stride_cidx,
             num_warps=parallel_cfg.num_warps,
             num_stages=parallel_cfg.num_stages,
+            enable_fp_fusion=True,
         )
         fused_kda_spec_finalize_kernel[(batch, H, spec_tokens)](
             mixed_qkv,
@@ -333,6 +334,7 @@ def fused_kda_decode(
             stride_cidx=stride_cidx,
             num_warps=finalize_cfg.num_warps,
             num_stages=finalize_cfg.num_stages,
+            enable_fp_fusion=True,
         )
         return out
 
@@ -378,5 +380,6 @@ def fused_kda_decode(
         stride_indices_tok=stride_indices_tok,
         stride_cidx=stride_cidx,
         num_warps=2 if get_arch() == "gfx942" else 4,
+        enable_fp_fusion=True,
     )
     return out

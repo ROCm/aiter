@@ -201,6 +201,7 @@ def gemm_a8w8_blockscale(
         w_scale.stride(1),
         **config,
         **extra_constexpr,
+        enable_fp_fusion=True,
     )
 
     if config["NUM_KSPLIT"] > 1:
@@ -234,6 +235,7 @@ def gemm_a8w8_blockscale(
             activation="",
             use_activation=False,
             KERNEL_NAME="_gemm_a8w8_blockscale_reduce_kernel",
+            enable_fp_fusion=True,
         )
 
     return y
@@ -422,6 +424,7 @@ def gemm_a8w8_blockscale_preshuffle(
         w_scale.stride(1),
         **config,
         **extra_constexpr,
+        enable_fp_fusion=True,
     )
 
     if config["NUM_KSPLIT"] > 1:
@@ -455,6 +458,7 @@ def gemm_a8w8_blockscale_preshuffle(
             activation="",
             use_activation=False,
             KERNEL_NAME="_gemm_a8w8_blockscale_reduce_kernel",
+            enable_fp_fusion=True,
         )
 
     return y

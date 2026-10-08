@@ -157,13 +157,7 @@ def _launch_nchw_to_cblocked(x, x_blocked, N, C, H, W, C_pad, block_c):
         )
 
     _ncx_to_cblocked_kernel[grid](
-        x,
-        x_blocked,
-        C,
-        HW,
-        C_PAD=C_pad,
-        CB=block_c,
-        **config,
+        x, x_blocked, C, HW, C_PAD=C_pad, CB=block_c, **config, enable_fp_fusion=True
     )
 
 
@@ -236,6 +230,7 @@ def _launch_1x1(
         ACTIVATION=_kernel_activation(activation),
         LAYOUT=layout,
         **config,
+        enable_fp_fusion=True
     )
 
 
@@ -307,6 +302,7 @@ def _launch_3x3_nhwc(
         HAS_BIAS=bias_fp32 is not None,
         ACTIVATION=_kernel_activation(activation),
         **config,
+        enable_fp_fusion=True
     )
 
 
@@ -380,6 +376,7 @@ def _launch_3x3_cblocked(
         HAS_BIAS=bias_fp32 is not None,
         ACTIVATION=_kernel_activation(activation),
         **config,
+        enable_fp_fusion=True
     )
 
 
@@ -448,6 +445,7 @@ def _launch_3x3_nchw(
         ACTIVATION=_kernel_activation(activation),
         ROW_ALIGNED=row_aligned,
         **config,
+        enable_fp_fusion=True
     )
 
 
@@ -529,6 +527,7 @@ def _launch_general(
         ACTIVATION=_kernel_activation(activation),
         LAYOUT=layout,
         **config,
+        enable_fp_fusion=True
     )
 
 
@@ -597,6 +596,7 @@ def _launch_winograd_f4x3(
             pw,
             block_k,
             **input_config,
+            enable_fp_fusion=True
         )
     else:
         _winograd_f4x3_input_transform_kernel[_make_wino_input_grid(T, C_pad)](
@@ -614,17 +614,12 @@ def _launch_winograd_f4x3(
             pw,
             LAYOUT=layout,
             **input_config,
+            enable_fp_fusion=True
         )
 
     # 2. Batched GEMM
     _winograd_f4x3_batched_gemm_kernel[_make_wino_gemm_grid(T, K_out)](
-        V,
-        U,
-        M,
-        T,
-        K_out,
-        C_pad,
-        **gemm_config,
+        V, U, M, T, K_out, C_pad, **gemm_config, enable_fp_fusion=True
     )
 
     # 3. Output transform
@@ -643,6 +638,7 @@ def _launch_winograd_f4x3(
         ACTIVATION=_kernel_activation(activation),
         LAYOUT="nchw" if cblocked else layout,
         **output_config,
+        enable_fp_fusion=True
     )
 
 
@@ -672,6 +668,7 @@ def _launch_ncdhw_to_cblocked(x, x_blocked, N, C, D, H, W, C_pad, block_c):
         C_PAD=C_pad,
         CB=block_c,
         **config,
+        enable_fp_fusion=True
     )
 
 
@@ -760,6 +757,7 @@ def _launch_general_3d(
         ACTIVATION=_kernel_activation(activation),
         LAYOUT=layout,
         **config,
+        enable_fp_fusion=True
     )
 
 
@@ -835,6 +833,7 @@ def _launch_1x1x1_3d(
         ACTIVATION=_kernel_activation(activation),
         LAYOUT=layout,
         **config,
+        enable_fp_fusion=True
     )
 
 
@@ -914,6 +913,7 @@ def _launch_3x3x3_ndhwc(
         HAS_BIAS=bias_fp32 is not None,
         ACTIVATION=_kernel_activation(activation),
         **config,
+        enable_fp_fusion=True
     )
 
 
@@ -995,6 +995,7 @@ def _launch_3x3x3_cblocked(
         HAS_BIAS=bias_fp32 is not None,
         ACTIVATION=_kernel_activation(activation),
         **config,
+        enable_fp_fusion=True
     )
 
 
@@ -1076,6 +1077,7 @@ def _launch_winograd_hw_f4x3(
         Cb=block_k,
         CBLOCKED=cblocked,
         **input_config,
+        enable_fp_fusion=True
     )
 
     _winograd_hw_f4x3_batched_gemm_kernel[_make_wino_gemm_grid(T_out, K_out)](
@@ -1092,6 +1094,7 @@ def _launch_winograd_hw_f4x3(
         C_pad,
         pd,
         **gemm_config,
+        enable_fp_fusion=True
     )
 
     _winograd_hw_f4x3_output_transform_kernel[_make_wino_output_grid(T_out, K_out)](
@@ -1109,4 +1112,5 @@ def _launch_winograd_hw_f4x3(
         HAS_BIAS=bias_fp32 is not None,
         ACTIVATION=_kernel_activation(activation),
         **output_config,
+        enable_fp_fusion=True
     )

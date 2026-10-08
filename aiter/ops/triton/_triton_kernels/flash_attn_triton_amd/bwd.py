@@ -4765,6 +4765,7 @@ def attention_backward_triton_impl(
         ACTUAL_HEAD_DIM_V=ACTUAL_HEAD_DIM_V,
         IS_VARLEN=IS_VARLEN,
         IS_FP8=IS_FP8,
+        enable_fp_fusion=True,
     )
 
     if DEBUG:
@@ -4892,6 +4893,7 @@ def attention_backward_triton_impl(
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
                 NUM_XCD=num_xcd,
+                enable_fp_fusion=True,
             )
         else:
             bwd_kernel_fused_noncausal[grid](
@@ -4983,6 +4985,7 @@ def attention_backward_triton_impl(
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
                 NUM_XCD=num_xcd,
+                enable_fp_fusion=True,
             )
     elif mode == "fused_atomic":
         NUM_WARPS, NUM_STAGES = 4, 1
@@ -5074,6 +5077,7 @@ def attention_backward_triton_impl(
                 IS_FP8=IS_FP8,
                 FP8_MAX=FP8_MAX,
                 **config,
+                enable_fp_fusion=True,
             )
         else:
             _bwd_kernel_fused_atomic_noncausal[grid_dkdvdq](
@@ -5139,6 +5143,7 @@ def attention_backward_triton_impl(
                 IS_FP8=IS_FP8,
                 FP8_MAX=FP8_MAX,
                 **config,
+                enable_fp_fusion=True,
             )
     elif mode == "split":
         NUM_WARPS, NUM_STAGES = 4, 1
@@ -5216,6 +5221,7 @@ def attention_backward_triton_impl(
                 num_warps=NUM_WARPS,
                 num_stages=NUM_STAGES,
                 waves_per_eu=WAVES_PER_EU,
+                enable_fp_fusion=True,
             )
             _bwd_kernel_split_dq_causal[grid_dq](
                 q,
@@ -5281,6 +5287,7 @@ def attention_backward_triton_impl(
                 num_warps=NUM_WARPS,
                 num_stages=NUM_STAGES,
                 waves_per_eu=WAVES_PER_EU,
+                enable_fp_fusion=True,
             )
         else:
             _bwd_kernel_split_dkdv_noncausal[grid_dkdv](
@@ -5348,6 +5355,7 @@ def attention_backward_triton_impl(
                 num_warps=NUM_WARPS,
                 num_stages=NUM_STAGES,
                 waves_per_eu=WAVES_PER_EU,
+                enable_fp_fusion=True,
             )
 
             _bwd_kernel_split_dq_noncausal[grid_dq](
@@ -5414,6 +5422,7 @@ def attention_backward_triton_impl(
                 num_warps=NUM_WARPS,
                 num_stages=NUM_STAGES,
                 waves_per_eu=WAVES_PER_EU,
+                enable_fp_fusion=True,
             )
     else:
         raise ValueError(

@@ -710,5 +710,6 @@ def solve_tril(
         BT=BT,
         INDEX_STRIDE=index_stride,
         USE_TMA=IS_TMA_SUPPORTED,
+        enable_fp_fusion=True,
     )
     return Ai

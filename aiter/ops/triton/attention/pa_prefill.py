@@ -157,6 +157,7 @@ def context_attention_fwd(
             num_warps=NUM_WARPS,
             waves_per_eu=1,
             num_stages=1,
+            enable_fp_fusion=True,
         )
         return
 
@@ -209,5 +210,6 @@ def context_attention_fwd(
         num_warps=NUM_WARPS,
         waves_per_eu=1,
         num_stages=1,
+        enable_fp_fusion=True,
     )
     return

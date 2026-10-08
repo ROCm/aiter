@@ -343,6 +343,7 @@ def cast_to_fp8(
         HEAD_DIM=padded_head_dim,
         ACTUAL_HEAD_DIM=head_dim,
         IS_VARLEN=is_varlen,
+        enable_fp_fusion=True,
     )
 
     return x_fp8, descale_factors
@@ -424,6 +425,7 @@ def _apply_rotary_kernel(
             conjugate,
             BLOCK_M=BLOCK_M,
             BLOCK_H=2,
+            enable_fp_fusion=True,
         )
     return out
 

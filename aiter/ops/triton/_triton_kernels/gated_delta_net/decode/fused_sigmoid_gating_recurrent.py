@@ -254,6 +254,7 @@ def fused_sigmoid_gating_delta_rule_update(
         V=V,
         BK=BK,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+        enable_fp_fusion=True,
     )
     o = o.squeeze(0)
     return o

@@ -170,6 +170,7 @@ def na3d_flash_attn(
         BLOCK_KV=cfg["BLOCK_KV"],
         num_warps=cfg["num_warps"],
         num_stages=cfg["num_stages"],
+        enable_fp_fusion=True,
     )
 
     return out

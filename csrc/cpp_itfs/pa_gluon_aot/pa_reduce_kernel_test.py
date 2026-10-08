@@ -294,6 +294,7 @@ def run_direct_kernel(
         HEAD_SIZE_POW2=triton.next_power_of_2(head_size),
         CONTEXT_PARTITION_SIZE=context_partition_size,
         USE_SINKS=sinks is not None,
+        enable_fp_fusion=True,
     )
 
 

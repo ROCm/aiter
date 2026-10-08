@@ -205,6 +205,7 @@ def batched_gemm_a16wfp4_(
         PRE_QUANT=prequant,
         HAVE_Y_SCALE=(y_scale is not None),
         **config,
+        enable_fp_fusion=True,
     )
 
     if config["NUM_KSPLIT"] > 1:
@@ -236,6 +237,7 @@ def batched_gemm_a16wfp4_(
             REDUCE_BLOCK_SIZE_N,
             ACTUAL_KSPLIT,
             config["NUM_KSPLIT"],
+            enable_fp_fusion=True,
         )
     return y
 

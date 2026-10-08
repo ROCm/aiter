@@ -402,6 +402,7 @@ def pa_decode_sparse(
         num_warps=attn_num_warps,
         num_stages=num_stages,
         waves_per_eu=waves_per_eu,
+        enable_fp_fusion=True,
     )
 
     if kv_splits == 1:
@@ -448,6 +449,7 @@ def pa_decode_sparse(
         USE_EXP2=USE_EXP2,
         num_warps=reduce_num_warps,
         waves_per_eu=reduce_waves_per_eu,
+        enable_fp_fusion=True,
     )
     return out
 
@@ -900,6 +902,7 @@ def _pa_decode_sparse_gfx950_gluon(
         **prefill_kw,
         # The epilogue runs where the output is written.
         **(epilogue if num_splits == 1 else {}),
+        enable_fp_fusion=True,
     )
 
     if num_splits == 1:
@@ -933,5 +936,6 @@ def _pa_decode_sparse_gfx950_gluon(
         **epilogue,
         # A 2-split tile spans two warps; more warps would hold duplicate lanes.
         num_warps=min(4, grid_splits),
+        enable_fp_fusion=True,
     )
     return out

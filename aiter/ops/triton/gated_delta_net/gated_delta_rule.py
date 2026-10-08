@@ -203,6 +203,7 @@ def fused_recurrent_gated_delta_rule(
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         num_warps=1,
         num_stages=3,
+        enable_fp_fusion=True,
     )
 
     return o, final_state

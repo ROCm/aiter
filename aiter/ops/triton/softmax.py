@@ -41,6 +41,7 @@ def softmax(x):
         waves_per_eu=waves_per_eu,
         num_warps=num_warps,
         num_stages=num_stages,
+        enable_fp_fusion=True,
     )
 
     return y

@@ -131,6 +131,7 @@ def causal_conv1d_split_qkv_triton_fn(
         BLOCK_M=8,
         BLOCK_N=256,
         num_stages=2,
+        enable_fp_fusion=True,
     )
 
     return q_out, k_out, v_out
@@ -315,6 +316,7 @@ def causal_conv1d_split_qkv_triton_tile_fn(
         BLOCK_N=BLOCK_N,
         num_warps=num_warps,
         num_stages=1,
+        enable_fp_fusion=True,
     )
     return (
         query.to(out_dtype),

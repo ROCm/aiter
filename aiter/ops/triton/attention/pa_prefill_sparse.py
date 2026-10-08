@@ -167,6 +167,7 @@ def pa_prefill_sparse(
             USE_EXP2=USE_EXP2,
             num_warps=num_warps,
             waves_per_eu=waves_per_eu,
+            enable_fp_fusion=True,
         )
         return out
 
@@ -233,6 +234,7 @@ def pa_prefill_sparse(
             float(softmax_scale),
             HAS_ATTN_SINK=has_attn_sink,
             BLOCK_D=block_d,
+            enable_fp_fusion=True,
         )
         return out
 

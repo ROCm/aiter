@@ -156,5 +156,6 @@ def moe_situ_epilogue(
         TOTAL_TILES=total_tiles,
         NUM_WARPS=num_warps,
         num_warps=num_warps,
+        enable_fp_fusion=True,
     )
     return shared_out, router_out, routed_out

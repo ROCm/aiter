@@ -99,6 +99,7 @@ def sage_quant_mxfp4(
         BLK_K=BLKK,
         num_stages=3,
         num_warps=8,
+        enable_fp_fusion=True,
     )
 
     downcast_func = downcast_to_mxfp
@@ -179,6 +180,7 @@ def _apply_int8_q_smoothing(q, k, BLKQ, layout, sm_scale):
         d,
         BLOCK_M=BLKQ,
         BLOCK_D=32,
+        enable_fp_fusion=True,
     )
 
     grid_delta = (b * h_q, Q_NUM_BLKS, K_NUM_BLKS)
@@ -203,6 +205,7 @@ def _apply_int8_q_smoothing(q, k, BLKQ, layout, sm_scale):
         s_k,
         d,
         BLOCK_N=BLKQ,
+        enable_fp_fusion=True,
     )
     return q_out, delta_s
 
@@ -287,6 +290,7 @@ def sage_quant_v_f4f4(v, layout="bshd"):
         h_kv,
         nT,
         kv_len,
+        enable_fp_fusion=True,
     )
     v_fp4_view = torch.as_strided(
         buf,
@@ -344,6 +348,7 @@ def pack_v_mxfp4_colmajor_raw(
         sequence,
         num_warps=1,
         num_stages=1,
+        enable_fp_fusion=True,
     )
     return raw, scale
 
@@ -467,6 +472,7 @@ def sage_quant_mxfp6(
             BLK_K=BLKK,
             num_stages=3,
             num_warps=8,
+            enable_fp_fusion=True,
         )
 
     # Q -> base fp6 pack; K -> coalesced LDS-order pack (E8M0 K-scale in the tile tail).
@@ -641,6 +647,7 @@ def sage_quant(
         BLK_K=BLKK,
         num_stages=3,
         num_warps=8,
+        enable_fp_fusion=True,
     )
 
     out = [q_int8, q_scale, k_int8, k_scale, v_fp8, v_scale]
@@ -748,6 +755,7 @@ def rotation_smooth_qk(
         q_smoothing=q_smoothing,
         BLOCK_M=BLOCK_SIZE_M,
         BLOCK_D=BLOCK_R,
+        enable_fp_fusion=True,
     )
 
     # rotate k
@@ -771,6 +779,7 @@ def rotation_smooth_qk(
         d,
         BLOCK_M=BLOCK_SIZE_M,
         BLOCK_D=BLOCK_R,
+        enable_fp_fusion=True,
     )
 
     # smooth k
@@ -805,6 +814,7 @@ def rotation_smooth_qk(
             s_k,
             d,
             BLOCK_N=BLOCK_SIZE_M,
+            enable_fp_fusion=True,
         )
 
     return Q_rot, K_rot, delta_s
@@ -905,6 +915,7 @@ def smooth_rotate_downcast_qk(
         D=d,
         num_warps=4,
         num_stages=5,
+        enable_fp_fusion=True,
     )
 
     grid_k = (b * h_k * K_NUM_BLKS,)
@@ -959,6 +970,7 @@ def smooth_rotate_downcast_qk(
         D=d,
         num_warps=4,
         num_stages=5,
+        enable_fp_fusion=True,
     )
 
     if q_smoothing:
@@ -984,6 +996,7 @@ def smooth_rotate_downcast_qk(
             s_k,
             d,
             BLOCK_N=BLOCK_SIZE_M,
+            enable_fp_fusion=True,
         )
 
     return Q_q, Q_descale, K_q, K_descale, delta_s

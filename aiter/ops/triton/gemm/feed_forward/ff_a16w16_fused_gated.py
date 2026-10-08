@@ -99,6 +99,7 @@ def ff_a16w16_fused_gated(
         activation=_get_activation_from_str(activation) if activation else "",
         use_activation=activation is not None,
         **config,
+        enable_fp_fusion=True,
     )
 
     return y

@@ -139,4 +139,5 @@ def cat_and_cache_mla(
         SCALE_K_WIDTH_ROPE=SCALE_K_WIDTH_ROPE,
         HAVE_K_SCALE=(k_scale is not None and apply_scale),
         num_warps=1,
+        enable_fp_fusion=True
     )

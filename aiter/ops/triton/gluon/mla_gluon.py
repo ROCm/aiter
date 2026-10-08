@@ -1089,6 +1089,7 @@ def mla_gluon(
         QLEN=qlen,
         HAS_PE=has_pe,
         HAS_ATTN_SINK=has_attn_sink,
+        enable_fp_fusion=True,
     )
 
     if NUM_KV_SPLITS == 1:
@@ -1126,6 +1127,7 @@ def mla_gluon(
         BLOCK_S=min(64, triton.next_power_of_2(NUM_KV_SPLITS)),
         BLOCK_N=BLOCK_N,
         num_warps=8,
+        enable_fp_fusion=True,
     )
 
     return o, final_lse

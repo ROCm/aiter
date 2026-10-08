@@ -201,6 +201,7 @@ def chunk_local_cumsum_scalar(
         BT=BT,
         HEAD_FIRST=head_first,
         REVERSE=reverse,
+        enable_fp_fusion=True,
     )
     return g
 
@@ -248,6 +249,7 @@ def chunk_local_cumsum_vector(
         BT=BT,
         HEAD_FIRST=head_first,
         REVERSE=reverse,
+        enable_fp_fusion=True,
     )
     return g
 

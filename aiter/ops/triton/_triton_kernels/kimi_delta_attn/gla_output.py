@@ -229,5 +229,6 @@ def chunk_gla_fwd_o(
         BT=BT,
         USE_EXP2=use_exp2,
         TRANSPOSE_STATE=transpose_state,
+        enable_fp_fusion=True,
     )
     return o

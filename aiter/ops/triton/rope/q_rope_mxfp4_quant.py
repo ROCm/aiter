@@ -121,5 +121,6 @@ def q_rope_mxfp4_quant(
         BLOCK_H=block_h,
         HAS_WEIGHTS=weights is not None,
         num_warps=num_warps,
+        enable_fp_fusion=True,
     )
     return q_fp4, q_scale, weights_out

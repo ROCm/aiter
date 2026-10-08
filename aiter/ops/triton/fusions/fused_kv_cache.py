@@ -323,6 +323,7 @@ def fused_qk_rope_cat_and_cache_mla(
         HAVE_K_SCALE=(k_scale is not None and apply_scale),
         UPCAST_OPERAND=upcast_operand,
         num_warps=1,
+        enable_fp_fusion=True,
     )
 
     return q_out, decode_q_pe_out, k_pe_out, q_nope_zeros_out
@@ -633,6 +634,7 @@ def fused_qk_rope_reshape_and_cache(
         UPCAST_OPERAND=upcast_operand,
         num_warps=1,
         **_extra_args,
+        enable_fp_fusion=True,
     )
 
     if zeros_out is not None:
@@ -784,5 +786,6 @@ def fused_qk_rope_cosine_cache_llama(
         HAVE_K_SCALE=(k_scale is not None and apply_scale),
         HAVE_V_SCALE=(v_scale is not None and apply_scale),
         num_warps=1,
+        enable_fp_fusion=True,
     )
     return q_out, key_cache, value_cache

@@ -141,6 +141,7 @@ def chunk_kda_prepare(
         NC=config["nc"],
         num_warps=config["num_warps"],
         waves_per_eu=config["waves_per_eu"],
+        enable_fp_fusion=True,
     )
     return ws
 
@@ -286,6 +287,7 @@ def chunk_kda_walk(
         STORE_FINAL_STATE=state_out is not None,
         num_warps=config["num_warps"],
         waves_per_eu=config["waves_per_eu"],
+        enable_fp_fusion=True,
     )
     return out, final_state
 
@@ -321,6 +323,7 @@ def _walk_gfx950(args: dict, config: dict, N: int) -> None:
             STORE_FINAL_STATE=store_final,
             num_warps=nw,
             waves_per_eu=config["waves_per_eu" + s],
+            enable_fp_fusion=True,
         )
 
     if G == 1:
@@ -349,6 +352,7 @@ def _walk_gfx950(args: dict, config: dict, N: int) -> None:
             NUM_STAGES=config["num_stages_scan"],
             num_warps=config["num_warps_scan"],
             waves_per_eu=config["waves_per_eu_scan"],
+            enable_fp_fusion=True,
         )
     launch(2, bufs, False, state_out is not None)
 

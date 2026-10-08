@@ -75,6 +75,7 @@ def fused_gdn_gating_and_sigmoid(
         softplus_threshold,
         BLK_HEADS,
         num_warps=2,
+        enable_fp_fusion=True,
     )
 
     return g, beta

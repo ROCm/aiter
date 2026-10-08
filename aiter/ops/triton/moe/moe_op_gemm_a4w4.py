@@ -545,6 +545,7 @@ def moe_gemm_a4w4(
             EP_SCATTER=fused_ep_scatter,
             Y_ROWS=(ep_scatter.out.shape[0] if fused_ep_scatter else 0),
             num_warps=config["num_warps"],
+            enable_fp_fusion=True,
         )
     elif use_gluon:
         # layouts
@@ -660,6 +661,7 @@ def moe_gemm_a4w4(
             Y_ROWS=(ep_scatter.out.shape[0] if fused_ep_scatter else 0),
             num_ctas=config["num_ctas"],
             num_warps=config["num_warps"],
+            enable_fp_fusion=True,
         )
     else:
         # launch triton kernel
@@ -716,6 +718,7 @@ def moe_gemm_a4w4(
             waves_per_eu=config["waves_per_eu"],
             matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
             kpack=config["kpack"],
+            enable_fp_fusion=True,
         )
 
     # Build grouped reduction inputs in a uniform way

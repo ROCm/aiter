@@ -190,5 +190,6 @@ def fused_reduce_qk_norm_rope_swa_write(
         BLOCK_SIZE_M=BLOCK_SIZE_M,
         num_warps=num_warps,
         waves_per_eu=waves_per_eu,
+        enable_fp_fusion=True,
     )
     return q_out

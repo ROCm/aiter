@@ -228,6 +228,7 @@ def batched_gemm_bf16(
             num_warps=num_warps,
             waves_per_eu=waves_per_eu,
             cache_modifier=cache_modifier,
+            enable_fp_fusion=True,
         )
 
     else:
@@ -278,6 +279,7 @@ def batched_gemm_bf16(
             bias.stride(0) if has_bias else 0,
             has_bias,
             **config,
+            enable_fp_fusion=True,
         )
 
     # ---- Shared split-K reduction ----
@@ -313,6 +315,7 @@ def batched_gemm_bf16(
             activation="",
             use_activation=False,
             KERNEL_NAME="_batched_gemm_bf16_reduce_kernel",
+            enable_fp_fusion=True,
         )
 
     return YQ

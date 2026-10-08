@@ -216,6 +216,7 @@ def _chunk_delta_attn_fwd_intra_token_parallel(
         K=K,
         BT=BT,
         BC=BC,
+        enable_fp_fusion=True,
     )
     return Aqk, Akk
 
@@ -737,6 +738,7 @@ def chunk_delta_attn_fwd_intra(
             BC=BC,
             BK=BK,
             USE_GATHER=IS_GATHER_SUPPORTED,
+            enable_fp_fusion=True,
         )
     else:
         _chunk_delta_attn_fwd_intra_token_parallel(
@@ -772,6 +774,7 @@ def chunk_delta_attn_fwd_intra(
         BC=BC,
         NC=NC,
         USE_SAFE_GATE=safe_gate,
+        enable_fp_fusion=True,
     )
 
     w, u, qg, kg = recompute_w_u_fwd(

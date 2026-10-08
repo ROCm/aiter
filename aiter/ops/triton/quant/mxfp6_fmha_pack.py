@@ -172,6 +172,7 @@ def quantize_fp6_v_clean_triton(
         FIXED_E8M0=fixed_e8m0,
         SEPARATE_OUTPUT=False,
         BLOCK_N=BLOCK_N,
+        enable_fp_fusion=True,
     )
     return out.view(b, h_kv, nT * 12800)
 
@@ -209,6 +210,7 @@ def quantize_fp6_v_data_scale_triton(
         FIXED_E8M0=fixed_e8m0,
         SEPARATE_OUTPUT=True,
         BLOCK_N=BLOCK_N,
+        enable_fp_fusion=True,
     )
     return data, scale
 
@@ -567,6 +569,7 @@ def quantize_fp6_lastdim_triton(x: "torch.Tensor"):
         n_blocks,
         BLOCK_N=16,
         num_warps=1,
+        enable_fp_fusion=True,
     )
     return (
         packed.reshape(*lead, NB * 24),
@@ -683,6 +686,7 @@ def reorder_fp6_k_lds_order_triton(
         DATA_TILE_BYTES=_K_COMPACT_DATA_BYTES,
         BLOCK=BLOCK,
         num_warps=4,
+        enable_fp_fusion=True,
     )
     # Fill the per-tile 1024B scale tail: Region A (unshifted) + Region B (pre-shifted +1 byte, so
     # the kernel MFMA op_sel picks dblk1/dblk3 with no runtime shift). The B pre-shift reads 1 byte
@@ -697,6 +701,7 @@ def reorder_fp6_k_lds_order_triton(
         SCALE_TAIL_OFFSET=_K_SCALE_TAIL_OFFSET,
         BLOCK=1024,
         num_warps=4,
+        enable_fp_fusion=True,
     )
     k_view = buf.as_strided(
         (b, sk, h, _K_PACKED_ROW_BYTES),

@@ -151,6 +151,7 @@ def chunk_scaled_dot_kkt_fwd(
         H=H,
         K=K,
         BT=BT,
+        enable_fp_fusion=True,
     )
     return A
 
@@ -315,5 +316,6 @@ def recompute_w_u_fwd(
         BT=BT,
         BK=BK,
         BV=BV,
+        enable_fp_fusion=True,
     )
     return w, u

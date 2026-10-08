@@ -99,6 +99,7 @@ def _rope_fwd(
         BLOCK_D_HALF=BLOCK_D_HALF,
         num_warps=num_warps,
         waves_per_eu=waves_per_eu,
+        enable_fp_fusion=True,
     )
 
     return out
@@ -206,6 +207,7 @@ def _rope_bwd(
         BLOCK_D_HALF=BLOCK_D_HALF,
         num_warps=num_warps,
         waves_per_eu=waves_per_eu,
+        enable_fp_fusion=True,
     )
 
     return out
@@ -291,6 +293,7 @@ def _rope_thd_fwd(
         BLOCK_D_HALF=BLOCK_D_HALF,
         num_warps=num_warps,
         waves_per_eu=waves_per_eu,
+        enable_fp_fusion=True,
     )
 
     return out
@@ -404,6 +407,7 @@ def _rope_thd_bwd(
         BLOCK_D_HALF=BLOCK_D_HALF,
         num_warps=num_warps,
         waves_per_eu=waves_per_eu,
+        enable_fp_fusion=True,
     )
 
     return out
@@ -500,6 +504,7 @@ def _rope_cached_fwd(
         BLOCK_D_HALF=BLOCK_D_HALF,
         num_warps=num_warps,
         waves_per_eu=waves_per_eu,
+        enable_fp_fusion=True,
     )
 
     return out
@@ -785,6 +790,7 @@ def _rope_cached_bwd(
         BLOCK_D_HALF=BLOCK_D_HALF,
         num_warps=num_warps,
         waves_per_eu=waves_per_eu,
+        enable_fp_fusion=True,
     )
 
     return out
@@ -979,6 +985,7 @@ def _rope_cached_thd_2c_fwd(
             num_warps=num_warps,
             waves_per_eu=waves_per_eu,
             num_stages=num_stages,
+            enable_fp_fusion=True,
         )
     else:
         # TODO check boundary
@@ -1021,6 +1028,7 @@ def _rope_cached_thd_2c_fwd(
                 num_warps=num_warps,
                 waves_per_eu=waves_per_eu,
                 num_stages=num_stages,
+                enable_fp_fusion=True,
             )
         else:
             BLOCK_T = min(max(triton.next_power_of_2(t), 16), 32)
@@ -1057,6 +1065,7 @@ def _rope_cached_thd_2c_fwd(
                 BLOCK_D_HALF=BLOCK_D_HALF,
                 num_warps=num_warps,
                 waves_per_eu=waves_per_eu,
+                enable_fp_fusion=True,
             )
 
     return out_x, out_y
@@ -1295,6 +1304,7 @@ def _rope_cached_thd_positions_offsets_2c_bwd(
             num_warps=num_warps,
             waves_per_eu=waves_per_eu,
             num_stages=num_stages,
+            enable_fp_fusion=True,
         )
     else:
         # TODO check boundary
@@ -1337,6 +1347,7 @@ def _rope_cached_thd_positions_offsets_2c_bwd(
                 num_warps=num_warps,
                 waves_per_eu=waves_per_eu,
                 num_stages=num_stages,
+                enable_fp_fusion=True,
             )
         else:
             BLOCK_T = min(max(triton.next_power_of_2(t), 16), 32)
@@ -1373,6 +1384,7 @@ def _rope_cached_thd_positions_offsets_2c_bwd(
                 BLOCK_D_HALF=BLOCK_D_HALF,
                 num_warps=num_warps,
                 waves_per_eu=waves_per_eu,
+                enable_fp_fusion=True,
             )
 
     return out_x, out_y
@@ -1477,6 +1489,7 @@ def _rope_fwd_2d(
         img_height,
         img_width,
         BLOCK_D=d,
+        enable_fp_fusion=True,
     )
 
     return out
@@ -1608,6 +1621,7 @@ def rope_fwd_3d(
         C2=c2,
         num_warps=num_warps,
         waves_per_eu=waves_per_eu,
+        enable_fp_fusion=True,
     )
 
     return out

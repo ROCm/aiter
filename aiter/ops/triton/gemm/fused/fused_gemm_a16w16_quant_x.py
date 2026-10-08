@@ -141,6 +141,7 @@ def fused_gemm_a16w16_quant_x(
         SKIP_REDUCE=skip_reduce,
         QUANT_BLOCK_SIZE=_QUANT_BLOCK_SIZE,
         **config,
+        enable_fp_fusion=True,
     )
 
     if config["NUM_KSPLIT"] > 1:
@@ -174,6 +175,7 @@ def fused_gemm_a16w16_quant_x(
             activation=_get_activation_from_str(activation) if activation else "",
             use_activation=activation is not None,
             KERNEL_NAME="_fused_gemm_a16w16_quant_x_reduce_kernel",
+            enable_fp_fusion=True,
         )
 
     return y, x_quant, x_scales

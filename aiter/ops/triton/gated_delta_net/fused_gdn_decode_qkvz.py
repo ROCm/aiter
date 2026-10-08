@@ -372,6 +372,7 @@ def fused_gdn_decode_qkvz(
             PAD_SLOT_ID=pad_slot_id,
             HAS_FP8=has_fp8,
             num_warps=4 if tokens <= 128 else 8,
+            enable_fp_fusion=True,
         )
     elif tokens == 32 or tokens > 64:
         from aiter.ops.triton._gluon_kernels.gfx950.gated_delta_net.fused_gdn_decode_qkvz import (
@@ -386,6 +387,7 @@ def fused_gdn_decode_qkvz(
             PAD_SLOT_ID=pad_slot_id,
             HAS_FP8=has_fp8,
             num_warps=8,
+            enable_fp_fusion=True,
         )
     else:
         from aiter.ops.triton._gluon_kernels.gfx950.gated_delta_net.fused_gdn_decode_qkvz import (
@@ -400,6 +402,7 @@ def fused_gdn_decode_qkvz(
             PAD_SLOT_ID=pad_slot_id,
             HAS_FP8=has_fp8,
             num_warps=8,
+            enable_fp_fusion=True,
         )
     if not has_fp8:
         return out, None, None

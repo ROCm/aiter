@@ -387,6 +387,7 @@ def fused_recurrent_kda(
             if sched_strategy
             else {}
         ),
+        enable_fp_fusion=True,
     )
     return out, final_state
 

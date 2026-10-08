@@ -641,6 +641,7 @@ def _run_split_path(
         BT=BT,
         INDEX_STRIDE=index_stride,
         USE_EXP2=use_exp2,
+        enable_fp_fusion=True,
     )
     return w_out, u_out
 
@@ -775,5 +776,6 @@ def fused_solve_tril_recompute_w_u(
         DOT_PRECISION=FLA_TRIL_PRECISION,
         USE_EXP2=use_exp2,
         LOWP_DTYPE_IS_BF16=k.dtype == torch.bfloat16,
+        enable_fp_fusion=True,
     )
     return w_out, u_out

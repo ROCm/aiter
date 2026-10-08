@@ -156,6 +156,7 @@ def fused_rms_fp8_per_tensor_static_quant(
         FIRST_INPUT_OUT=output_unquantized_inp1,
         RMSNORM_CONVERT_TO_INP1_TYPE=rmsnorm_convert_to_inp1_type,
         num_warps=num_warps,
+        enable_fp_fusion=True,
     )
 
     return out1_fp8, out1, out2, out_res1
@@ -348,6 +349,7 @@ def fused_rms_fp8_group_quant(
         FP8_MIN_SCALING_FACTOR=1.0,
         ACTIVATION="silu",
         num_warps=num_warps,
+        enable_fp_fusion=True,
     )
     # When transpose_scale=True, re-present the [num_bs_cols, M] column-major
     # buffer the kernel wrote as (M, num_bs_cols). Both branches return the same
@@ -526,6 +528,7 @@ def fused_rms_gated_fp8_group_quant(
         FP8_MIN_SCALING_FACTOR=fp8_min_scaling_factor,
         ACTIVATION=activation,
         num_warps=num_warps,
+        enable_fp_fusion=True,
     )
     return x_quant, scales
 
@@ -598,6 +601,7 @@ def fused_flatten_fp8_group_quant(
         QUANT_BLOCK_SIZE=group_size,
         DTYPE_MAX=DTYPE_MAX,
         DTYPE_MIN=-DTYPE_MAX,
+        enable_fp_fusion=True,
     )
 
     return out, out_block_scales
@@ -726,6 +730,7 @@ def fused_reduce_act_mul_fp8_group_quant(
         X_NUM_KSPLIT_POW2=triton.next_power_of_2(x_num_splitk),
         X_MASK=X_MASK,
         num_warps=1 if max(BLOCK_SIZE_N1, BLOCK_SIZE_N2) <= 512 else 4,
+        enable_fp_fusion=True,
     )
 
     return (y, y_scale), y2
@@ -973,6 +978,7 @@ def fused_reduce_rms_fp8_group_quant(
         NUM_SPLITK=SPK,
         NUM_SPLITK_POW2=triton.next_power_of_2(SPK),
         num_warps=num_warps,
+        enable_fp_fusion=True,
     )
     # When transpose_scale=True, re-present the [num_bs_cols, M] column-major
     # buffer the kernel wrote as (M, num_bs_cols). Both branches return the same
@@ -1043,6 +1049,7 @@ def fused_silu_mul_fp8_per_tensor_static_quant(
         DTYPE_MIN=-DTYPE_MAX,
         SILU_CONVERT_TO_INP_TYPE=silu_convert_to_inp_type,
         num_warps=num_warps,
+        enable_fp_fusion=True,
     )
 
     return out_fp8

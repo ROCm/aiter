@@ -184,5 +184,6 @@ def fused_kda_decode_unified(
         stride_bufg_hv=s_bg_hv,
         stride_bufg_pos=s_bg_pos,
         num_warps=2 if get_arch() == "gfx942" else 4,
+        enable_fp_fusion=True,
     )
     return out

@@ -149,5 +149,6 @@ def chunk_gate_cumsum(
         H=H,
         S=S,
         BT=BT,
+        enable_fp_fusion=True,
     )
     return g_out

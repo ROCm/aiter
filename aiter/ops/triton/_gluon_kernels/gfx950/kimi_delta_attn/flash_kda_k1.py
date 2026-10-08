@@ -345,4 +345,5 @@ def gluon_k1_prepare(
         CM_WS=CM_WS,
         CM_LOAD=CM_LOAD,
         num_warps=_NUM_WARPS,
+        enable_fp_fusion=True,
     )

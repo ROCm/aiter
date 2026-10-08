@@ -623,6 +623,7 @@ def chunk_fwd_o(
         K=K,
         V=V,
         BT=BT,
+        enable_fp_fusion=True,
     )
     return o
 
@@ -790,6 +791,7 @@ def chunk_fwd_o_opt(
         K=K,
         V=V,
         BT=BT,
+        enable_fp_fusion=True,
     )
     return o
 
@@ -1025,6 +1027,7 @@ def chunk_fwd_o_opt_vk(
         INDEX_STRIDE=index_stride,
         H_IS_FP32=h.dtype == torch.float32,
         USE_EXP2=use_exp2,
+        enable_fp_fusion=True,
     )
     return o
 
@@ -1079,6 +1082,7 @@ def chunk_bwd_dv(
         BT=BT,
         BK=BK,
         BV=BV,
+        enable_fp_fusion=True,
     )
     return dv
 
@@ -1130,6 +1134,7 @@ def chunk_bwd_dv_local(
         BT=BT,
         BK=BK,
         BV=BV,
+        enable_fp_fusion=True,
     )
     return dv
 
@@ -1196,6 +1201,7 @@ def chunk_bwd_dqkwg(
         BT=BT,
         BK=BK,
         BV=BV,
+        enable_fp_fusion=True,
     )
 
     if dg is not None:

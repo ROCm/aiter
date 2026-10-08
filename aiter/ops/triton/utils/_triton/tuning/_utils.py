@@ -26,7 +26,7 @@ def run_profile(fn: Callable, n_run: int = 250):
     d = torch.empty(128, dtype=torch.float32, device="cuda")
     cache.zero_()
     di.synchronize()
-    split_dummy[(128,)](d)
+    split_dummy[(128,)](d, enable_fp_fusion=True)
     di.synchronize()
 
 

@@ -122,6 +122,7 @@ def convert_to_mxfp8(
         num_warps=num_warps,
         waves_per_eu=2,
         num_stages=2,
+        enable_fp_fusion=True,
     )
     return y, s
 
@@ -203,5 +204,6 @@ def convert_from_mxfp8(
         num_warps=num_warps,
         waves_per_eu=2,
         num_stages=2,
+        enable_fp_fusion=True,
     )
     return y

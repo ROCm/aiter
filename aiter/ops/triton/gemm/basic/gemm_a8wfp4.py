@@ -142,6 +142,7 @@ def gemm_a8wfp4(
         stride_bsk,
         RAW_MASKED_LOADS=True,
         **config,
+        enable_fp_fusion=True,
     )
 
     if config["NUM_KSPLIT"] > 1:
@@ -175,4 +176,5 @@ def gemm_a8wfp4(
             activation="",
             use_activation=False,
             KERNEL_NAME="_gemm_afp4_wfp4_reduce_kernel",
+            enable_fp_fusion=True,
         )

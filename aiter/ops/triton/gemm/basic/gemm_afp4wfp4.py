@@ -269,6 +269,7 @@ def gemm_afp4wfp4_(
         w_scales.stride(0),
         w_scales.stride(1),
         **config,
+        enable_fp_fusion=True,
     )
 
     if return_y_pp:
@@ -304,6 +305,7 @@ def gemm_afp4wfp4_(
             activation="",
             use_activation=False,
             KERNEL_NAME="_gemm_afp4wfp4_reduce_kernel",
+            enable_fp_fusion=True,
         )
 
     return y
@@ -447,6 +449,7 @@ def gemm_afp4wfp4_preshuffled_scales(
         w_scales.stride(0),
         w_scales.stride(1),
         **config,
+        enable_fp_fusion=True,
     )
 
     if config["NUM_KSPLIT"] > 1:
@@ -480,6 +483,7 @@ def gemm_afp4wfp4_preshuffled_scales(
             activation="",
             use_activation=False,
             KERNEL_NAME="_gemm_afp4wfp4_reduce_kernel",
+            enable_fp_fusion=True,
         )
 
     return y
@@ -632,6 +636,7 @@ def gemm_afp4wfp4_preshuffle(
             w_scales.stride(1),
             **config,
             **layouts,
+            enable_fp_fusion=True,
         )
         return y
 
@@ -699,6 +704,7 @@ def gemm_afp4wfp4_preshuffle(
         w_scales.stride(0),
         w_scales.stride(1),
         **config,
+        enable_fp_fusion=True,
     )
 
     if return_y_pp:
@@ -734,6 +740,7 @@ def gemm_afp4wfp4_preshuffle(
             activation="",
             use_activation=False,
             KERNEL_NAME="_gemm_afp4wfp4_reduce_kernel",
+            enable_fp_fusion=True,
         )
 
     return y

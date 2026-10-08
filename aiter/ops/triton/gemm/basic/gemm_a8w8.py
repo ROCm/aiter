@@ -136,6 +136,7 @@ def gemm_a8w8(
             NUM_WARPS=config["num_warps"],
             **config,
             FP8_FORMAT=fp8_format,
+            enable_fp_fusion=True,
         )
         return y
 
@@ -174,6 +175,7 @@ def gemm_a8w8(
         y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
         (bias is not None) and (config["NUM_KSPLIT"] == 1),
         **config,
+        enable_fp_fusion=True,
     )
 
     if config["NUM_KSPLIT"] > 1:
@@ -207,6 +209,7 @@ def gemm_a8w8(
             activation="",
             use_activation=False,
             KERNEL_NAME="_gemm_a8w8_reduce_kernel",
+            enable_fp_fusion=True,
         )
 
     return y
@@ -299,6 +302,7 @@ def gemm_a8w8_preshuffle(
         NUM_WARPS=config["num_warps"],
         **config,
         FP8_FORMAT=fp8_format,
+        enable_fp_fusion=True,
     )
 
     return y

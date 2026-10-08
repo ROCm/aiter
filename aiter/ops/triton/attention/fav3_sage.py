@@ -621,6 +621,7 @@ def fav3_sage_func(
         USE_SEQUSED=False,
         USE_BLOCK_SPARSE=use_block_sparse,
         **config,
+        enable_fp_fusion=True,
     )
 
     if return_lse:

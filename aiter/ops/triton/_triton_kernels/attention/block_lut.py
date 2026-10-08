@@ -110,4 +110,5 @@ def block_attn_mask_to_lut_kernel(
         num_q_blocks=num_q_blocks,
         num_kv_blocks=num_kv_blocks,
         BLOCK_KB=BLOCK_KB,
+        enable_fp_fusion=True,
     )

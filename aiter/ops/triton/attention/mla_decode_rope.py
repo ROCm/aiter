@@ -108,6 +108,7 @@ def _decode_grouped_att_m_fwd_rope(
         USE_ROPE=use_rope,
         IS_NEOX_STYLE=is_neox_style,
         **config,
+        enable_fp_fusion=True,
     )
 
 
@@ -140,6 +141,7 @@ def _decode_softmax_reducev_fwd(
         head_num=head_num,
         batch=batch,
         **config,
+        enable_fp_fusion=True,
     )
 
 

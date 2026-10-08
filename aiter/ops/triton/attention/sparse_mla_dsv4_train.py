@@ -111,6 +111,7 @@ def sparse_mla_fwd(q, kv, attn_sink, indices, scale=None):
         BLOCK_K=BLOCK_K_fwd,
         num_warps=fwd_cfg.num_warps,
         num_stages=fwd_cfg.num_stages,
+        enable_fp_fusion=True,
     )
 
     return out, lse
@@ -191,6 +192,7 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, attn_sink, scale=None):
         BLOCK_D=BLOCK_D,
         BLOCK_K=BLOCK_K,
         num_warps=num_warps,
+        enable_fp_fusion=True,
     )
 
     # Kernel 2: dKV intermediate — grid (N,)
@@ -217,6 +219,7 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, attn_sink, scale=None):
         BLOCK_K=BLOCK_K,
         NUM_HG=num_hg,
         num_warps=num_warps,
+        enable_fp_fusion=True,
     )
 
     # CSR gather into dkv
@@ -238,6 +241,7 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, attn_sink, scale=None):
         BLOCK_D=BLOCK_D,
         BLOCK_G=BLOCK_G,
         num_warps=num_warps,
+        enable_fp_fusion=True,
     )
 
     return dq, dkv, d_sink

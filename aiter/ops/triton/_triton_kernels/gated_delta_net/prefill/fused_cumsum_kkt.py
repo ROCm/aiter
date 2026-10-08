@@ -137,6 +137,7 @@ def fused_cumsum_kkt(
         chunk_size,
         num_warps=4,
         num_stages=3,
+        enable_fp_fusion=True,
     )
     return g_cumsum, A
 
@@ -362,5 +363,6 @@ def fused_chunk_local_cumsum_scaled_dot_kkt_fwd(
         INDEX_STRIDE=index_stride,
         USE_EXP2=use_exp2,
         G_SCALE=RCP_LN2 if use_exp2 else 1.0,
+        enable_fp_fusion=True,
     )
     return g_cumsum_out, A_out

@@ -243,6 +243,7 @@ def all_gather(
         num_warps=16,
         num_stages=4,
         waves_per_eu=4,
+        enable_fp_fusion=True,
     )
 
     # Synchronize

@@ -115,6 +115,7 @@ def gemm_a16w8_blockscale(
         DTYPE_MAX=DTYPE_MAX,
         DTYPE_MIN=-DTYPE_MAX,
         **config,
+        enable_fp_fusion=True
     )
 
     if return_y_pp:
@@ -147,6 +148,7 @@ def gemm_a16w8_blockscale(
             activation="",
             use_activation=False,
             KERNEL_NAME="_gemm_a8w8_blockscale_reduce_kernel",
+            enable_fp_fusion=True,
         )
 
     return y
@@ -255,6 +257,7 @@ def gemm_a16w8_blockscale_preshuffle(
         DTYPE_MAX=DTYPE_MAX,
         DTYPE_MIN=-DTYPE_MAX,
         **config,
+        enable_fp_fusion=True
     )
 
     if return_y_pp:
@@ -287,6 +290,7 @@ def gemm_a16w8_blockscale_preshuffle(
             activation="",
             use_activation=False,
             KERNEL_NAME="_gemm_a8w8_blockscale_reduce_kernel",
+            enable_fp_fusion=True,
         )
 
     return y
