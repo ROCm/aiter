@@ -9,8 +9,8 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.shuffle import shuffle_weight
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or get_gfx_runtime() != "gfx950",
-    reason="gfx950 required",
+    not torch.cuda.is_available() or get_gfx_runtime() not in ("gfx942", "gfx950"),
+    reason="gfx942 or gfx950 required",
 )
 
 K = 2176
