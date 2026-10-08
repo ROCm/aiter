@@ -2944,13 +2944,27 @@ def score_prefill_flydsl(
     # same bytes when the page itself is contiguous. A shuffled cache always is
     # (`shuffle_cache` returns a fresh contiguous tensor); a caller's own cache
     # need not be, so check rather than assume -- a strided page would read in
-    # bounds and score the wrong features. Decided before resolve_config, so
+    # bounds and score the wrong features.
+    #
+    # Auto is demoted, explicit is refused. `k_lds=-1` means "you decide", so
+    # answering "not here" is the whole point of it; `k_lds=1` is a caller
+    # asserting something this cache cannot satisfy, and silently handing back
+    # a different kernel than the one asked for would contradict this module's
+    # "explicit values are kept" rule -- the kind of override that is only
+    # noticed as a performance mystery. Decided before resolve_config, so
     # tile_q and the wave count are chosen for the path actually taken.
     if (
         cfg.k_lds != 0
         and not cfg.shuffled
         and (cache.stride(1) != HEAD_DIM or cache.stride(2) != 1)
     ):
+        if cfg.k_lds > 0:
+            raise ValueError(
+                "k_lds needs a contiguous page: cache.stride(1) must be "
+                f"{HEAD_DIM} and stride(2) 1, got {cache.stride(1)} and "
+                f"{cache.stride(2)}. Pass a contiguous cache, a shuffled one, "
+                "or leave k_lds on auto."
+            )
         cfg = replace(cfg, k_lds=0)
     cfg = resolve_config(
         max_query_len, batch, heads, max_block, cfg, idx_q.device, fp8, arch
