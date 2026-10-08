@@ -51,15 +51,24 @@ opus_bmm_a8w8_mxscale_exact_dispatch(int kid)
 }
 #endif  // OPUS_BUILD_HAS_GFX950
 
-// (GROUP_N, GROUP_K) for a kid: 128 for the DSv4 block, 32 for the MX one.
-// Built from the same generated table as the dispatch, so a kid cannot be
-// dispatched with a scale shape nobody checked against its own blocks.
-static std::pair<int, int> opus_bmm_mxscale_kid_groups(int kid)
+// A kid's scale blocks (GROUP_N, GROUP_K: 128 for the DSv4 block, 32 for the MX
+// one) and its tile alignment. Built from the same generated table as the
+// dispatch, so a kid cannot be dispatched with a scale shape or a shape nobody
+// checked against its own geometry.
+struct OpusBmmMxscaleKidShape {
+  int group_n;
+  int group_k;
+  int m_align;
+  int n_align;
+  int k_align;
+};
+
+static OpusBmmMxscaleKidShape opus_bmm_mxscale_kid_shape(int kid)
 {
   // This lookup precedes common tensor checks. On a thread's first raw call,
   // enable catchable exceptions before an unknown kid can reach AITER_CHECK.
   aiter_detail::g_aiter_can_throw = true;
-  static const std::unordered_map<int, std::pair<int, int>> kGroups = {
+  static const std::unordered_map<int, OpusBmmMxscaleKidShape> kGroups = {
       GENERATE_BMM_MXSCALE_KID_GROUPS
   };
   auto it = kGroups.find(kid);
@@ -84,10 +93,11 @@ void opus_gemm_a8w8_mxscale_bmm_launch(
   // The kid's scale blocks, so the check knows which shape to demand. Looked up
   // before the arch gate because a wrong-shaped scale is worth reporting on any
   // device, and the table is compile-time data rather than a kernel.
-  const auto groups = opus_bmm_mxscale_kid_groups(kid);
+  const auto shape = opus_bmm_mxscale_kid_shape(kid);
   opus_bmm_a8w8_common_checks(O, wo_a, Y, x_scale, w_scale,
                               "opus_gemm_a8w8_mxscale_bmm_launch",
-                              groups.first, groups.second);
+                              shape.group_n, shape.group_k,
+                              shape.m_align, shape.n_align, shape.k_align);
 #ifndef OPUS_BUILD_HAS_GFX950
   AITER_CHECK(false,
               "opus_gemm_a8w8_mxscale_bmm_launch requires "

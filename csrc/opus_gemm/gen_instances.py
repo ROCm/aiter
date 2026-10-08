@@ -714,12 +714,36 @@ class opus_gemm_codegen:
         # is correct depends on the kid: GROUP_N and GROUP_K are 128 or 32. So
         # the table below travels with the dispatch table rather than the check
         # hardcoding 128, which is what rejected the first GROUP_K=32 launch.
+        #
+        # It carries the kid's tile alignment for the same reason. The scale
+        # blocks say nothing about the tiles -- a GROUP_K=32 kid can have
+        # B_K=128, 256 or 512 -- and a kid handed a K that its B_K does not
+        # divide does not fail. The K loop is ceil_div(k, B_K), so the partial
+        # tail tile is iterated as a whole one, and A/B carry unbounded buffer
+        # descriptors, so that tail reads the next row's bytes and accumulates
+        # them: a plausible wrong answer. The preload-SF kids instead return
+        # without writing Y at all. Python's launch plan rejects both, but the
+        # split_k <= 1 path enters this C++ entry directly without building one,
+        # so the constraint has to live here too.
         group_entry = """\
-    {{ {kid}, {{ {group_n}, {group_k} }} }},  \\
+    {{ {kid}, {{ {group_n}, {group_k}, {m_align}, {n_align}, {k_align} }} }},  \\
 """
 
+        def _n_align(instance):
+            # Mirrors _build_a8w8_mxscale_bmm_plan: wave8n2 spans two B_N tiles.
+            doubled = instance.kernel_tag == "a8w8_mxscale_bmm_wave8n2"
+            return instance.B_N * (2 if doubled else 1)
+
         rows = sorted(
-            (kid, instance.name, instance.GROUP_N, instance.GROUP_K)
+            (
+                kid,
+                instance.name,
+                instance.GROUP_N,
+                instance.GROUP_K,
+                instance.m_align,
+                _n_align(instance),
+                instance.B_K,
+            )
             for family in a8w8_mxscale_bmm_kernel_lists
             for kid, instance in family.items()
             if "fp32_t" in instance.output_dtypes
@@ -750,7 +774,14 @@ class opus_gemm_codegen:
                 f,
                 "GENERATE_BMM_MXSCALE_KID_GROUPS",
                 group_entry,
-                lambda r: {"kid": r[0], "group_n": r[2], "group_k": r[3]},
+                lambda r: {
+                    "kid": r[0],
+                    "group_n": r[2],
+                    "group_k": r[3],
+                    "m_align": r[4],
+                    "n_align": r[5],
+                    "k_align": r[6],
+                },
             )
 
     def gen_manifest_head(self, kernels_dict):

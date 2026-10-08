@@ -465,8 +465,10 @@ def _launch_a8w8_mxscale_bmm(
 
     if instance is not None and (workspace is not None or split_k <= 1):
         # The checked C++ entry validates tensors and caller-owned workspace,
-        # including device, dtype, layout, capacity and alignment. Planning is
-        # only needed below when Python must allocate the workspace itself.
+        # including device, dtype, layout, capacity and alignment, and the
+        # kid's M/N/K tile alignment, which no plan is built here to check.
+        # Planning is only needed below when Python must allocate the
+        # workspace itself.
         if workspace is not None and not isinstance(workspace, Tensor):
             raise TypeError(
                 "opus_gemm_a8w8_mxscale_bmm_launch: workspace must be a Tensor"
