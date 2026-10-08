@@ -58,6 +58,18 @@ MXFP4_MOE_SUPPORTED_SHAPES = frozenset(
         (513, 4096, 512, 11),
     }
 )
+_MXFP4_MOE_SCATTER_KEYS = frozenset(
+    (hidden, topk) for _expert, hidden, _inter, topk in MXFP4_MOE_SUPPORTED_SHAPES
+)
+
+
+def is_mxfp4_moe_scatter_supported(model_dim: int, topk: int) -> bool:
+    """Static generated scatter/scatterq support, independent of expert/inter_dim.
+
+    The generator emits both NT variants for each catalog (model_dim, topk)
+    key. This does not probe or build the extension during candidate enumeration.
+    """
+    return (int(model_dim), int(topk)) in _MXFP4_MOE_SCATTER_KEYS
 
 
 def is_mxfp4_moe_shape_supported(
