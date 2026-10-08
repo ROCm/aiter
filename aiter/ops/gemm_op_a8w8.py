@@ -1477,15 +1477,11 @@ def gemm_a8w8_blockscale_bpreshuffle(
                 x_scale=x_scale,
                 w_scale=w_scale,
             )
-        elif libtype == "flydsl":
-            if kernelName.startswith("flydsl_blockscale_8w_"):
-                return gemm_a8w8_blockscale_flydsl(
-                    XQ, WQ, x_scale, w_scale, Y, config, isBpreshuffled=True
-                )
+        elif libtype == "flydsl" and kernelName.startswith("flydsl_blockscale_8w_"):
+            return gemm_a8w8_blockscale_flydsl(
+                XQ, WQ, x_scale, w_scale, Y, config, isBpreshuffled=True
+            )
             # x_scale, w_scale is fp32 now, so the mxfp8_128 bpreshuffle kernels are not a direct fit.
-            # return gemm_a8w8_mxfp8_128_bpreshuffle_flydsl(
-            #     XQ, WQ, x_scale, w_scale, Y, config
-            # )
     try:
         return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
     except RuntimeError as e:
