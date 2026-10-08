@@ -529,6 +529,7 @@ def _decode_depth_table(S: int, H: int):
 
 def _cu_count(device=None) -> int:
     import torch
+
     from aiter.jit.utils.chip_info import get_cu_num
 
     if device is None:
@@ -639,6 +640,13 @@ def _resolve_spread(cfg: IndexScoreConfig, served: bool, batch: int, max_block: 
 
 def selection_filter(S: int, H: int, cfg: IndexScoreConfig, arch=None) -> bool:
     """Is this config legal for this shape? Mirrors gemm_kernels.selection_filter."""
+    # Callers hand us whatever `gcnArchName` reports, which carries target-id
+    # features ("gfx950:sramecc+:xnack-"). Normalised once here rather than at
+    # each caller: `build_work_map` passed the raw string while the execution
+    # path stripped it, so an fp8-precision config was dispatchable and then
+    # rejected when its work map was built.
+    if arch is not None:
+        arch = arch.split(":", 1)[0]
     # Check the auto token split as its fallback geometry; its Q1 branch is
     # also legal (one feature tile, four token waves).
     if cfg.waves_per_tok == 0:
@@ -672,7 +680,7 @@ def selection_filter(S: int, H: int, cfg: IndexScoreConfig, arch=None) -> bool:
         from aiter.jit.utils.chip_info import get_gfx, get_lds_capacity_bytes
 
         need = reduce_lds_bytes(S, H, cfg)
-        if need > get_lds_capacity_bytes((arch or get_gfx()).split(":", 1)[0]):
+        if need > get_lds_capacity_bytes(arch or get_gfx().split(":", 1)[0]):
             return False
     return True
 

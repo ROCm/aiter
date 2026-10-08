@@ -1209,6 +1209,13 @@ def test_gfx942_path_matches_oracle(monkeypatch, dtype, cfg):
     The shuffled layout is in the list because it is where the two
     generations could diverge silently: the shuffled reader bypasses k_offset
     entirely, so nothing else would catch a disagreement about it.
+
+    What the fp8 arm does NOT check is the e4m3fnuz numerics. The cache is
+    built, and the oracle reads it, as this chip's `dtypes.fp8` -- e4m3fn on
+    gfx950 -- and the conversion instruction executes with gfx950's semantics
+    whatever element type the forced arch binds. So this validates the gfx942
+    fragment shape, k-axis map and loop counts on fp8 data; the bias
+    difference needs the part. See `_fp8_t`.
     """
     # S=8 H=4 is two feature tiles, the widest this axis gets.
     S, H = 8, 4
@@ -1220,6 +1227,18 @@ def test_gfx942_path_matches_oracle(monkeypatch, dtype, cfg):
     got = score_flydsl(q, k, bt, lens, S, H, D**-0.5, mb, cfg=cfg)
     ok, reason = compare(got, ref)
     assert ok, reason
+
+
+def test_target_id_suffix_does_not_change_the_verdict():
+    """`gcnArchName` carries target-id features. `build_work_map` passed the
+    raw string to `selection_filter` while the execution path stripped it, so
+    an fp8-precision config was dispatchable and then rejected at map time."""
+    cfg = IndexScoreConfig(precision="fp8")
+    for suffix in ("", ":sramecc+", ":sramecc+:xnack-"):
+        assert kernel.selection_filter(1, 4, cfg, arch="gfx950" + suffix), suffix
+    # A real mismatch must still be rejected, suffix or not.
+    assert not kernel.selection_filter(1, 4, cfg, arch="gfx942")
+    assert not kernel.selection_filter(1, 4, cfg, arch="gfx942:sramecc+")
 
 
 def test_arch_separates_the_kernel_name():
