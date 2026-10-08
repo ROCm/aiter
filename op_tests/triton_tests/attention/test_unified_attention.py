@@ -738,6 +738,171 @@ def test_triton_unified_attn(
         )
 
 
+# Decode split wide enough that reduce_segments merges the segments in chunks
+# (reduce config SEGMENT_BLOCK < NUM_SEGMENTS).
+@pytest.mark.parametrize(
+    "backend, head_size", [("triton", 512), ("triton", 256), ("gluon", 256)]
+)
+@torch.inference_mode()
+def test_unified_attn_chunked_reduce(backend: str, head_size: int) -> None:
+    if DEVICE_ARCH != "gfx950":
+        pytest.skip("gfx950 reduce config")
+    seq_lens = [(1, 8192), (1, 1025), (1, 3000), (1, 37)]
+    (
+        query,
+        key_cache_orig,
+        value_cache_orig,
+        key_cache,
+        value_cache,
+        sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        *_,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=1024,
+        block_size=64,
+        head_size=head_size,
+        num_heads=(16, 1),
+        device="cuda",
+    )
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        sinks=sinks,
+        backend=backend,
+    )
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache_orig,
+        value_cache=value_cache_orig,
+        query_lens=[x[0] for x in seq_lens],
+        kv_lens=[x[1] for x in seq_lens],
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+        sinks=sinks,
+    )
+    torch.testing.assert_close(
+        output.float(), ref_output.float(), atol=1.5e-2, rtol=1e-2
+    )
+
+
+# Speculative-decode verify batches: short queries over a long context take the
+# split-KV grid. kv_len 1025 puts the last key alone in a split that the first
+# query of its sequence cannot see.
+@pytest.mark.parametrize("num_heads", [(32, 2), (8, 1)])
+@pytest.mark.parametrize("head_size", [128, 256])
+@pytest.mark.parametrize(
+    "q_dtype, kv_dtype",
+    [(torch.bfloat16, torch.bfloat16), (e4m3_dtype, e4m3_dtype)],
+)
+@torch.inference_mode()
+def test_gluon_unified_attn_spec_verify(
+    num_heads: tuple[int, int],
+    head_size: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+) -> None:
+    if DEVICE_ARCH != "gfx950":
+        pytest.skip("gfx950 gluon split-KV grid")
+    seq_lens = [(2, 1025), (4, 8192), (3, 3000), (1, 523)]
+    query_lens = [x[0] for x in seq_lens]
+    (
+        query,
+        key_cache_orig,
+        value_cache_orig,
+        key_cache,
+        value_cache,
+        sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        _maybe_quant_query,
+        _query_scales,
+        q_descale,
+        k_descale,
+        v_descale,
+        output_scale,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=2048,
+        block_size=64,
+        head_size=head_size,
+        num_heads=num_heads,
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
+        device="cuda",
+    )
+    for use_sinks in (False, True):
+        unified_attention(
+            q=query,
+            k=key_cache,
+            v=value_cache,
+            out=output,
+            cu_seqlens_q=cu_query_lens,
+            seqused_k=kv_lens,
+            max_seqlen_q=max_query_len,
+            max_seqlen_k=max_kv_len,
+            softmax_scale=scale,
+            causal=True,
+            window_size=window_size,
+            block_table=block_tables,
+            softcap=0,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            sinks=sinks if use_sinks else None,
+            backend="gluon",
+        )
+        ref_output = ref_paged_attn(
+            query=query,
+            key_cache=key_cache_orig,
+            value_cache=value_cache_orig,
+            query_lens=query_lens,
+            kv_lens=[x[1] for x in seq_lens],
+            block_tables=block_tables,
+            scale=scale,
+            out_dtype=torch.bfloat16,
+            sliding_window=None,
+            soft_cap=None,
+            sinks=sinks if use_sinks else None,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            output_scale=output_scale,
+        )
+        atol, rtol = (1.5e-1, 1.5e-1) if q_dtype == e4m3_dtype else (1.5e-2, 1e-2)
+        torch.testing.assert_close(
+            output.float(), ref_output.float(), atol=atol, rtol=rtol
+        )
+
+
 @pytest.mark.parametrize(
     "seq_lens",
     [

@@ -1005,6 +1005,8 @@ def reduce_segments(
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
+    # segments merged per loop step; 0 merges all NUM_SEGMENTS_PER_SEQ in one tile
+    SEGMENT_BLOCK: tl.constexpr = 0,
 ):
     query_token_idx = tl.program_id(0)
     query_head_idx = tl.program_id(1)
@@ -1026,9 +1028,6 @@ def reduce_segments(
 
     # create masks for subsequent loads
     act_num_segments = cdiv_fn(seq_len, tiles_per_segment * TILE_SIZE)
-    segm_mask = tl.arange(0, NUM_SEGMENTS_PER_SEQ) < tl.full(
-        [NUM_SEGMENTS_PER_SEQ], act_num_segments, dtype=tl.int32
-    )
 
     offs_vd = tl.arange(0, V_HEAD_SIZE_PADDED)
     if V_HEAD_SIZE_PADDED != V_HEAD_SIZE:
@@ -1036,35 +1035,74 @@ def reduce_segments(
     else:
         v_dim_mask = tl.full((1,), 1, dtype=tl.int1)
 
-    # load segment maxima
-    segm_offset = (
+    segm_base = (
         query_token_idx.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
         + query_head_idx * NUM_SEGMENTS_PER_SEQ
-        + tl.arange(0, NUM_SEGMENTS_PER_SEQ)
     )
-    segm_max = tl.load(segm_max_ptr + segm_offset, mask=segm_mask, other=float("-inf"))
-    overall_max = tl.max(segm_max)
+    segm_output_base = query_token_idx.to(tl.int64) * (
+        num_query_heads * NUM_SEGMENTS_PER_SEQ * V_HEAD_SIZE_PADDED
+    ) + query_head_idx * (NUM_SEGMENTS_PER_SEQ * V_HEAD_SIZE_PADDED)
 
-    # load and rescale segment exp sums
-    segm_expsum = tl.load(segm_expsum_ptr + segm_offset, mask=segm_mask, other=0.0)
-    segm_expsum = segm_expsum * tl.math.exp2(segm_max - overall_max)
-    overall_expsum = tl.sum(segm_expsum)
+    if SEGMENT_BLOCK == 0 or SEGMENT_BLOCK >= NUM_SEGMENTS_PER_SEQ:
+        segm_mask = tl.arange(0, NUM_SEGMENTS_PER_SEQ) < tl.full(
+            [NUM_SEGMENTS_PER_SEQ], act_num_segments, dtype=tl.int32
+        )
 
-    # load, rescale, and add segment attention outputs
-    segm_output_offset = (
-        query_token_idx.to(tl.int64)
-        * (num_query_heads * NUM_SEGMENTS_PER_SEQ * V_HEAD_SIZE_PADDED)
-        + query_head_idx * (NUM_SEGMENTS_PER_SEQ * V_HEAD_SIZE_PADDED)
-        + tl.arange(0, NUM_SEGMENTS_PER_SEQ)[:, None] * V_HEAD_SIZE_PADDED
-        + offs_vd[None, :]
-    )
-    segm_output = tl.load(
-        segm_output_ptr + segm_output_offset,
-        mask=segm_mask[:, None] & v_dim_mask[None, :],
-        other=0.0,
-    )
-    segm_output *= tl.math.exp2(segm_max - overall_max)[:, None]
-    acc_sum = tl.sum(segm_output, axis=0)
+        # load segment maxima
+        segm_offset = segm_base + tl.arange(0, NUM_SEGMENTS_PER_SEQ)
+        segm_max = tl.load(
+            segm_max_ptr + segm_offset, mask=segm_mask, other=float("-inf")
+        )
+        overall_max = tl.max(segm_max)
+
+        # load and rescale segment exp sums
+        segm_expsum = tl.load(segm_expsum_ptr + segm_offset, mask=segm_mask, other=0.0)
+        segm_expsum = segm_expsum * tl.math.exp2(segm_max - overall_max)
+        overall_expsum = tl.sum(segm_expsum)
+
+        # load, rescale, and add segment attention outputs
+        segm_output_offset = (
+            segm_output_base
+            + tl.arange(0, NUM_SEGMENTS_PER_SEQ)[:, None] * V_HEAD_SIZE_PADDED
+            + offs_vd[None, :]
+        )
+        segm_output = tl.load(
+            segm_output_ptr + segm_output_offset,
+            mask=segm_mask[:, None] & v_dim_mask[None, :],
+            other=0.0,
+        )
+        segm_output *= tl.math.exp2(segm_max - overall_max)[:, None]
+        acc_sum = tl.sum(segm_output, axis=0)
+    else:
+        # online merge over the written segments only, so the cost follows the
+        # context rather than NUM_SEGMENTS_PER_SEQ
+        offs_s = tl.arange(0, SEGMENT_BLOCK)
+        overall_max = tl.full([], float("-inf"), dtype=tl.float32)
+        overall_expsum = tl.zeros([], dtype=tl.float32)
+        acc_sum = tl.zeros([V_HEAD_SIZE_PADDED], dtype=tl.float32)
+        for s0 in range(0, act_num_segments, SEGMENT_BLOCK):
+            segs = s0 + offs_s
+            segm_mask = segs < act_num_segments
+            segm_max = tl.load(
+                segm_max_ptr + segm_base + segs, mask=segm_mask, other=float("-inf")
+            )
+            new_max = tl.maximum(overall_max, tl.max(segm_max))
+            alpha = tl.math.exp2(overall_max - new_max)
+            weight = tl.math.exp2(segm_max - new_max)
+            segm_expsum = tl.load(
+                segm_expsum_ptr + segm_base + segs, mask=segm_mask, other=0.0
+            )
+            overall_expsum = overall_expsum * alpha + tl.sum(segm_expsum * weight)
+            segm_output = tl.load(
+                segm_output_ptr
+                + segm_output_base
+                + segs[:, None] * V_HEAD_SIZE_PADDED
+                + offs_vd[None, :],
+                mask=segm_mask[:, None] & v_dim_mask[None, :],
+                other=0.0,
+            )
+            acc_sum = acc_sum * alpha + tl.sum(segm_output * weight[:, None], axis=0)
+            overall_max = new_max
     # safely divide by overall_expsum, returning 0.0 if overall_expsum is 0
     acc = tl.where(overall_expsum == 0.0, 0.0, acc_sum / overall_expsum)
 
