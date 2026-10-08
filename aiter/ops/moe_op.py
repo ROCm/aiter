@@ -8,7 +8,6 @@ from torch import Tensor
 
 from ..jit.core import AITER_CSRC_DIR, compile_ops
 from ..utility import dtypes
-from ..utility.graph_alloc import persistent_alloc
 from .enum import ActivationType, QuantType
 
 torch.int4 = getattr(torch, "int4", torch.uint32)
@@ -152,27 +151,35 @@ def _router_gemm_topk_softmax_asm(
 _ROUTER_TOPK_WORKSPACE_BYTES = 8 * 520 * 4 + 128
 
 
-@functools.lru_cache(maxsize=64)
-def _get_router_topk_workspace_keyed(device: torch.device, stream_id: int) -> Tensor:
-    with persistent_alloc(device):
-        return torch.zeros(
-            _ROUTER_TOPK_WORKSPACE_BYTES // 4, dtype=dtypes.i32, device=device
-        )
+def get_router_topk_workspace(device="cuda") -> Tensor:
+    """Allocate a zero-initialized workspace for router_gemm_topk_softmax_asm.
 
-
-def get_router_topk_workspace(device: torch.device) -> Tensor:
-    """Return the zero-initialized workspace of router_gemm_topk_softmax_asm for
-    the current stream of this device.
-
-    The kernel finds its last workgroup with an atomic counter in this
-    workspace. Two launches that run at the same time on different streams
-    would count into the same counter and both get wrong results, so every
-    stream gets its own workspace. Launches on the same stream run one after
-    the other, and the kernel sets the counter back to zero at the end of
-    every launch, so they can share one workspace.
+    The kernel finds its last workgroup with an atomic counter in the
+    workspace, and that workgroup sets the counter back to zero. So one
+    workspace can serve any number of launches that run one after the other:
+    launches on one stream, or launches in CUDA graphs that never replay at the
+    same time. Launches that can run at the same time need one workspace each.
+    Otherwise they count into the same counter and get wrong results.
+    Allocate the workspace outside CUDA graph capture. A CUDA graph does not
+    keep the workspace alive, so keep a reference to it for as long as the
+    graphs that use it replay.
     """
-    stream = torch.cuda.current_stream(device)
-    return _get_router_topk_workspace_keyed(device, stream.cuda_stream)
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "get_router_topk_workspace: allocate the workspace before CUDA graph "
+            "capture"
+        )
+    return torch.zeros(
+        _ROUTER_TOPK_WORKSPACE_BYTES // 4, dtype=dtypes.i32, device=device
+    )
+
+
+@functools.lru_cache(maxsize=64)
+def _get_stream_workspace(device: torch.device, stream_id: int) -> Tensor:
+    # Eager launches on one stream run one after the other, so they can share
+    # the workspace of their stream. Launches on two streams get two
+    # workspaces, because they can run at the same time.
+    return get_router_topk_workspace(device)
 
 
 def router_gemm_topk_softmax_asm(
@@ -181,6 +188,7 @@ def router_gemm_topk_softmax_asm(
     topk_weights: Tensor,
     topk_ids: Tensor,
     token_expert_indices: Tensor,
+    workspace: Tensor | None = None,
 ) -> None:
     """Router GEMM, softmax top-k and the shared expert gate in one gfx950 kernel.
 
@@ -201,10 +209,27 @@ def router_gemm_topk_softmax_asm(
         tie goes to the lower id. Column 10 is not written, so the caller can
         fill it with the shared expert id once.
     token_expert_indices: [M, 10] int32, contiguous. Entry [i, k] gets k * M + i.
+    workspace: a workspace from get_router_topk_workspace(). A call that is
+        captured in a CUDA graph needs one. A graph replays on the stream that
+        is current at replay time, not on the stream it was captured on, so
+        this function cannot know which captured launches may run at the same
+        time. The caller gives every graph that can replay at the same time as
+        another one its own workspace. A call outside a capture can leave it
+        out and then uses a workspace that is cached for the current stream.
 
     Other shapes, other GPUs and M above 8 raise a RuntimeError.
     """
-    workspace = get_router_topk_workspace(hidden_states.device)
+    if workspace is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "router_gemm_topk_softmax_asm: pass a workspace from "
+                "get_router_topk_workspace() when capturing a CUDA graph. A graph "
+                "replays on the stream that is current at replay time, so a "
+                "workspace cached for the capture stream could be shared by two "
+                "graphs that replay at the same time."
+            )
+        stream = torch.cuda.current_stream(hidden_states.device)
+        workspace = _get_stream_workspace(hidden_states.device, stream.cuda_stream)
     _router_gemm_topk_softmax_asm(
         hidden_states,
         gate_weight,

@@ -28,7 +28,11 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.moe_op import router_gemm_topk_softmax_asm, topk_softmax
+from aiter.ops.moe_op import (
+    get_router_topk_workspace,
+    router_gemm_topk_softmax_asm,
+    topk_softmax,
+)
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -178,8 +182,8 @@ def run_unfused(x, w, weights, ids, tei, logits):
     topk_softmax(weights, ids[:, :TOPK], tei, logits, True, 1, "sigmoid")
 
 
-def run_fused(x, w, weights, ids, tei):
-    router_gemm_topk_softmax_asm(x, w, weights, ids[:, :TOPK], tei)
+def run_fused(x, w, weights, ids, tei, workspace=None):
+    router_gemm_topk_softmax_asm(x, w, weights, ids[:, :TOPK], tei, workspace)
 
 
 @benchmark()
@@ -227,26 +231,28 @@ def _expect_raises(fn, needle, desc):
 def _graph_replay_check():
     """Capture eight launches in a CUDA graph and replay it with new inputs.
 
-    The kernel keeps a counter in a workspace that is cached per stream, so
-    this checks that replays and back-to-back launches inside one replay all
-    start from a zero counter.
+    The kernel keeps a counter in the workspace, and the last workgroup of
+    every launch sets it back to zero. All eight launches share one workspace,
+    so this checks that back-to-back launches inside one replay and repeated
+    replays all start from a zero counter.
     """
     tokens = 4
     x, w = make_inputs(tokens, "randn", seed=1)
     weights, ids, tei = output_buffers(tokens)
+    workspace = get_router_topk_workspace()
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        # The first call on this stream allocates its workspace, which must
-        # happen before the capture starts.
-        run_fused(x, w, weights, ids, tei)
+        # The first call loads the kernel, which must happen before the
+        # capture starts.
+        run_fused(x, w, weights, ids, tei, workspace)
     torch.cuda.current_stream().wait_stream(stream)
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
         for _ in range(8):
-            run_fused(x, w, weights, ids, tei)
+            run_fused(x, w, weights, ids, tei, workspace)
     errs = []
     for seed in (2, 3, 4):
         x_new, _ = make_inputs(tokens, "randn", seed=seed)
@@ -267,6 +273,119 @@ def _graph_replay_check():
         )
     assert max(errs) == 0, f"graph replay results differ from the reference: {errs}"
     aiter.logger.info("graph replay check passed")
+
+
+def _concurrent_graph_check(launches=8, wanted=100, max_tries=1000):
+    """Capture two graphs on one stream, each with its own workspace, and
+    replay them at the same time on two other streams.
+
+    A CUDA graph replays on the stream that is current at replay time, not on
+    the stream it was captured on. Two graphs that share one workspace count
+    into one counter and read each other's logits, and on MI355X about half of
+    their launches then give wrong results. Both replay streams wait for one
+    event behind a GPU sleep, so that the two replays start together. A busy
+    host can still queue the second replay after the first one has finished,
+    and on MI355X some pairs of PyTorch pool streams never ran at the same
+    time. So GPU timestamps around every replay show whether the two
+    overlapped, only pairs of replays that overlapped count toward `wanted`,
+    and after ten tries without overlap the check takes new streams. Every
+    launch writes its own outputs, which must match the same launch outside a
+    graph bit for bit.
+    """
+    tokens = 8
+    capture_stream = torch.cuda.Stream()
+    graphs, cases = [], []
+    for seed in (5, 6):
+        x, w = make_inputs(tokens, "randn", seed=seed)
+        expected = output_buffers(tokens)
+        run_fused(x, w, *expected)
+        workspace = get_router_topk_workspace()
+        outs = [output_buffers(tokens) for _ in range(launches)]
+        capture_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(capture_stream):
+            # The first call loads the kernel, which must happen before the
+            # capture starts.
+            run_fused(x, w, *outs[0], workspace)
+        torch.cuda.current_stream().wait_stream(capture_stream)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=capture_stream):
+            for out in outs:
+                run_fused(x, w, *out, workspace)
+        graphs.append(graph)
+        # The workspace must stay allocated for as long as its graph replays.
+        cases.append((outs, expected, workspace))
+    torch.cuda.synchronize()
+
+    bad = overlapped = tries = misses = pairs = 0
+    while overlapped < wanted and tries < max_tries:
+        if tries == 0 or misses == 10:
+            replay_streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+            gate_stream = torch.cuda.Stream()
+            pairs += 1
+            misses = 0
+        tries += 1
+        for (outs, _, _), stream in zip(cases, replay_streams):
+            with torch.cuda.stream(stream):
+                # Garbage in the outputs shows a launch that wrote nothing.
+                for weights, ids, tei in outs:
+                    weights.fill_(float("nan"))
+                    ids[:, :TOPK].fill_(-1)
+                    tei.fill_(-1)
+        start = torch.cuda.Event(enable_timing=True)
+        with torch.cuda.stream(gate_stream):
+            torch.cuda._sleep(2_000_000)
+            start.record()
+        spans = []
+        for graph, stream in zip(graphs, replay_streams):
+            with torch.cuda.stream(stream):
+                stream.wait_event(start)
+                begin = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                begin.record()
+                graph.replay()
+                end.record()
+                spans.append((begin, end))
+        torch.cuda.synchronize()
+        (a0, a1), (b0, b1) = [
+            (start.elapsed_time(begin), start.elapsed_time(end)) for begin, end in spans
+        ]
+        hit = min(a1, b1) > max(a0, b0)
+        overlapped += hit
+        misses = 0 if hit else misses + 1
+        for outs, (exp_w, exp_ids, exp_tei), _ in cases:
+            for weights, ids, tei in outs:
+                same = (
+                    torch.equal(weights, exp_w)
+                    and torch.equal(ids, exp_ids)
+                    and torch.equal(tei, exp_tei)
+                )
+                bad += not same
+    total = tries * len(graphs) * launches
+    streams_used = f"{pairs} pair{'s' if pairs > 1 else ''} of streams"
+    assert overlapped >= wanted, (
+        f"the two graph replays overlapped in only {overlapped} of {tries} tries "
+        f"on {streams_used}, so this check could not run them at the same time"
+    )
+    assert bad == 0, (
+        f"{bad} of {total} launches in two graphs that replayed at the same time "
+        "differ from the same launch outside a graph"
+    )
+    aiter.logger.info(
+        "concurrent graph replay check passed: %d launches, the replays overlapped "
+        "in %d of %d tries on %s",
+        total,
+        overlapped,
+        tries,
+        streams_used,
+    )
+
+
+def _capture(fn):
+    """Call fn while a CUDA graph captures on a new stream."""
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=torch.cuda.Stream()):
+        fn()
 
 
 def _run_guard_checks():
@@ -295,13 +414,28 @@ def _run_guard_checks():
         "fp16 hidden_states",
     )
 
+    # A captured call must get its workspace from the caller, and the caller
+    # must allocate it before the capture.
+    weights, ids, tei = output_buffers(2)
+    _expect_raises(
+        lambda: _capture(lambda: run_fused(x, w, weights, ids, tei)),
+        "pass a workspace",
+        "a captured call without a workspace",
+    )
+    _expect_raises(
+        lambda: _capture(get_router_topk_workspace),
+        "before CUDA graph capture",
+        "get_router_topk_workspace() during a capture",
+    )
+
     x, w = make_inputs(0, "randn")
     weights, ids, tei = output_buffers(0)
     run_fused(x, w, weights, ids, tei)
 
     aiter.logger.info(
-        "guard checks passed: 9 tokens, dim 4096, a contiguous [M, 10] topk_ids and "
-        "fp16 input raise, and 0 tokens is a no-op"
+        "guard checks passed: 9 tokens, dim 4096, a contiguous [M, 10] topk_ids, "
+        "fp16 input, a captured call without a workspace and a workspace allocated "
+        "during a capture raise, and 0 tokens is a no-op"
     )
 
 
@@ -346,6 +480,7 @@ def main():
     )
 
     _graph_replay_check()
+    _concurrent_graph_check()
     _run_guard_checks()
 
     err_cols = [c for c in df.columns if c.endswith(" err")]
