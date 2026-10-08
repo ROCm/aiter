@@ -26,6 +26,7 @@ Logical layouts (not preshuffled):
 Four-wave CTAs process 256-token plan tiles: QK splits tokens, PV splits head
 dim, and P passes through LDS to transpose ownership between the MMAs.
 gfx1250 uses wave32 WMMA and 64-token subtiles with async K/V LDS staging.
+Per-token scales with power-of-two D128+ use TDM; other cases use vector DMA.
 
 The ``pa_decode`` package separates schedule/layout traits, CTA context, Q/K/V
 and LDS movement, MFMA, softmax and output operations. ``PaDecodePipeline``

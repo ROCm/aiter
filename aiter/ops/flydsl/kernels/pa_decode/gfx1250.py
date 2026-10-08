@@ -4,7 +4,8 @@
 """Wave32 FP8 WMMA backend for planned paged decode on gfx1250.
 
 Four waves split a 64-token compute tile within each 256-token plan tile.
-K and V move directly from the logical paged cache to alternating LDS buffers.
+K and V move from the packed paged cache to alternating LDS buffers via TDM
+for per-token scales and power-of-two D128+, with vector DMA for other cases.
 Q and P use native eight-element FP8 conversion; softmax statistics stay FP32.
 """
 
@@ -15,6 +16,7 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr import math as fmath
+from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import ReductionOp, T
 
 from ..kernels_common import create_llvm_ptr
@@ -98,6 +100,17 @@ class Gfx1250Traits:
         return self.stats_offset + 576
 
     @property
+    def use_tdm(self):
+        # Per-token D128+ benefits from TDM's scalar address generation. D64
+        # and scalar scales measured faster with vector DMA. Hardware row
+        # padding requires a power-of-two interval.
+        return (
+            self.per_token_kv
+            and self.head_dim >= 128
+            and self.head_dim & (self.head_dim - 1) == 0
+        )
+
+    @property
     def q_dtype(self):
         return fx.BFloat16 if self.query_dtype == "bf16" else fx.Float16
 
@@ -151,10 +164,118 @@ class Gfx1250Memory:
         )
         fx.rocdl.global_load_async_to_lds_b128(src, dst, 0)
 
+    def tdm_copy(
+        self, ptr, offset, shared_offset, shape, strides, extents, width, row_stride
+    ):
+        """Gather a packed cache slice into padded LDS using one wave."""
+        packed_strides = []
+        stride = 1
+        for size in reversed(shape):
+            packed_strides.insert(0, stride)
+            stride *= size
+        layout = fx.make_layout(shape, tuple(packed_strides))
+        lds_strides = tuple(
+            s // width * row_stride if s >= width else s for s in packed_strides
+        )
+        src = fx.Tensor(
+            fx.make_view(
+                fx.add_offset(fx.recast_iter(fx.Uint8, ptr), offset),
+                layout,
+            )
+        )
+        atom = fx.rocdl.make_tdm_atom(
+            src,
+            extents,
+            strides=strides,
+            num_warps=1,
+            pad_interval=width,
+            pad_amount=row_stride - width,
+            early_timeout=True,
+        )
+        dst = fx.Tensor(
+            fx.make_view(
+                fx.add_offset(self.base, shared_offset),
+                fx.make_layout(shape, lds_strides),
+            )
+        )
+        fx.copy_atom_call(atom, src, dst)
+
     @flyc.jit
-    def stage_kv(self, token_base, buffer):
+    def stage_tdm(self, token_base, kv_off):
         ctx, t = self.ctx, self.t
-        kv_off = t.q_bytes + buffer * t.kv_stride
+        table = fx.recast_iter(fx.Int32, ctx.block_tables_ptr)
+        # Explicit wave slices keep the hardware padding local to each copy.
+        # Collective rank-3 atoms cannot apply row padding to their wave offset
+        # with the installed lowering, so each wave owns a single-wave atom.
+        absolute = token_base + ctx.warp * 16
+        safe_token = (absolute < ctx.planned_context).select(absolute, fx.Int32(0))
+        page = fx.Int32(
+            table[ctx.planned_seq * ctx.max_blocks_per_seq + safe_token // t.block_size]
+        )
+        off = (fx.Int64(page) * ctx.n_kv + ctx.kv_h) * t.head_dim * t.block_size
+        page_token = safe_token % t.block_size
+        valid = fx.max(
+            fx.Int32(0), fx.min(fx.Int32(16), ctx.planned_context - absolute)
+        )
+        self.tdm_copy(
+            ctx.key_cache_ptr,
+            off + page_token * 16,
+            kv_off + ctx.warp * 16 * t.q_stride,
+            (16, t.head_dim // 16, 16),
+            (16, t.block_size * 16, 1),
+            (valid, None, None),
+            t.head_dim,
+            t.q_stride,
+        )
+        if const_expr(t.block_size == 16):
+            v_tokens, v_rows = 16, t.head_dim
+            v_dst = ctx.warp * 16
+            v_d = fx.Int32(0)
+        else:
+            v_tokens, v_rows = t.TOKENS, t.head_dim // t.NWARP
+            v_d = ctx.warp * v_rows
+            v_dst = v_d * t.v_stride
+            safe_token = (token_base < ctx.planned_context).select(
+                token_base, fx.Int32(0)
+            )
+            page = fx.Int32(
+                table[
+                    ctx.planned_seq * ctx.max_blocks_per_seq
+                    + safe_token // t.block_size
+                ]
+            )
+            off = (fx.Int64(page) * ctx.n_kv + ctx.kv_h) * t.head_dim * t.block_size
+            page_token = safe_token % t.block_size
+            valid = fx.max(
+                fx.Int32(0),
+                fx.min(fx.Int32(v_tokens), ctx.planned_context - token_base),
+            )
+        if const_expr(t.trans_v):
+            self.tdm_copy(
+                ctx.value_cache_ptr,
+                off + (page_token // 16) * t.head_dim * 16 + v_d * 16,
+                kv_off + t.k_bytes + v_dst,
+                (v_rows, v_tokens // 16, 16),
+                (16, t.head_dim * 16, 1),
+                (None, (valid + 15) // 16, None),
+                v_tokens,
+                t.v_stride,
+            )
+        else:
+            self.tdm_copy(
+                ctx.value_cache_ptr,
+                off + v_d * t.block_size + page_token,
+                kv_off + t.k_bytes + v_dst,
+                (v_rows, v_tokens),
+                (t.block_size, 1),
+                (None, valid),
+                v_tokens,
+                t.v_stride,
+            )
+
+    @flyc.jit
+    def stage_vector_dma(self, token_base, kv_off):
+        ctx, t = self.ctx, self.t
         table = fx.recast_iter(fx.Int32, ctx.block_tables_ptr)
         key_base = buf_base_i64(ctx.key_cache_ptr)
         value_base = buf_base_i64(ctx.value_cache_ptr)
@@ -200,6 +321,16 @@ class Gfx1250Memory:
             self.async_copy(
                 value_base, off, kv_off + t.k_bytes + d * t.v_stride + token
             )
+
+    @flyc.jit
+    def stage_kv(self, token_base, buffer):
+        ctx, t = self.ctx, self.t
+        kv_off = t.q_bytes + buffer * t.kv_stride
+        table = fx.recast_iter(fx.Int32, ctx.block_tables_ptr)
+        if const_expr(t.use_tdm):
+            self.stage_tdm(token_base, kv_off)
+        else:
+            self.stage_vector_dma(token_base, kv_off)
 
         if const_expr(t.per_token_kv):
             ks = fx.recast_iter(fx.Float32, ctx.key_scale_ptr)
@@ -352,7 +483,10 @@ class Gfx1250Pipeline:
         for token_i, state in range(begin, end, t.TOKENS, init=initial):
             token_base = fx.Int32(token_i)
             buffer = ((token_base - begin) // t.TOKENS) % t.buffers
-            fx.rocdl.s_wait_asynccnt(0)
+            if const_expr(t.use_tdm):
+                tdm_ops.tensor_wait(0)
+            else:
+                fx.rocdl.s_wait_asynccnt(0)
             gpu.barrier()
             kv_off = t.q_bytes + buffer * t.kv_stride
             if const_expr(t.buffers == 2):  # noqa: SIM102
