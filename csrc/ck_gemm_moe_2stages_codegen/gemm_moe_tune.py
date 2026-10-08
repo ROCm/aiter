@@ -966,19 +966,22 @@ class FmoeTuner(TunerCommon):
         #   a=a1_qt, w1=w1_qt_shuf, w1_scale=w1_scale_shuf, a1_scale=a1_scale_sort,
         #   v2_output_layout=True, ...). Recipe mirrors
         # mxfp4_v2_tune_utils.populate_baseline_v2_intermediate.
-        d = _v2_gen(
-            token,
-            model_dim,
-            inter_dim,
-            expert,
-            topk,
-            blockM,
-            adtype=adtype,
-            b_dtype=b_dtype,
-            activation=act_type,
-            situ_beta=DEFAULT_SITUV2_BETA,
-            situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
-        )
+        # Generate on the GPU: the CPU fp4 packing of E x 2I x H weights takes
+        # tens of minutes per shape at E=385.
+        with torch.device(device):
+            d = _v2_gen(
+                token,
+                model_dim,
+                inter_dim,
+                expert,
+                topk,
+                blockM,
+                adtype=adtype,
+                b_dtype=b_dtype,
+                activation=act_type,
+                situ_beta=DEFAULT_SITUV2_BETA,
+                situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
+            )
         v = _v2_build_inputs(d, token, model_dim, inter_dim, expert, topk, blockM)
         # Precompute the sorted A-scale here so it is NOT timed in the run func.
         a1_scale_sort = moe_mxfp4_sort(
@@ -1128,6 +1131,10 @@ class FmoeTuner(TunerCommon):
         token = ref2.shape[0]
         epilog = kparams["epilog"]
         bm_s2 = kparams["tile_m"]
+        if epilog == "scatter" and bm_s2 != 128:
+            raise AssertionError(
+                f"epilog='scatter' supports only tile_m=128, got {bm_s2}"
+            )
         sbm = kparams["sort_block_m"]
         out = torch.empty((token, model_dim), dtype=dtypes.bf16, device=isq.device)
         inter = (
@@ -1135,7 +1142,14 @@ class FmoeTuner(TunerCommon):
             if epilog == "reduce"
             else None
         )
-        gemm2_out = inter if epilog == "reduce" else out
+        flat = (
+            torch.empty((max_sorted, model_dim), dtype=dtypes.bf16, device=isq.device)
+            if epilog == "scatter"
+            else None
+        )
+        gemm2_out = (
+            inter if epilog == "reduce" else (flat if epilog == "scatter" else out)
+        )
         if epilog != "reduce":
             out.zero_()
         mxfp4_moe_gemm2(
@@ -1165,6 +1179,28 @@ class FmoeTuner(TunerCommon):
             persist=kparams["persist"],
             n_sorted_padded=n,
         )
+        if epilog == "scatter":
+            n_valid = int(n)
+            packed = sti[:n_valid]
+            token_id = packed & 0x00FFFFFF
+            slot = packed >> 24
+            ok = (token_id < token) & (slot < topk)
+            reverse_sorted = torch.full(
+                (token * topk,), -1, dtype=torch.int32, device=sti.device
+            )
+            reverse_sorted[(token_id[ok] * topk + slot[ok]).long()] = torch.arange(
+                n_valid, device=sti.device, dtype=torch.int32
+            )[ok]
+            aiter.mxfp4_moe_scatter_reduce(
+                flat_out=flat,
+                reverse_sorted=reverse_sorted,
+                sorted_weights=swt,
+                out=out,
+                NE=expert,
+                TOPK=topk,
+                D_HIDDEN=model_dim,
+                MB=bm_s2,
+            )
         if epilog == "reduce":
             from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
 

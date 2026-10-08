@@ -1,0 +1,92 @@
+{
+  "N_LEQ_64.M_LEQ_1": {
+    "NUM_ITER": 2, "BLOCK_SIZE_M": 2, "BLOCK_SIZE_N": 64, "NUM_WARPS": 2
+  },
+  "N_LEQ_64.M_LEQ_8": {
+    "NUM_ITER": 4, "BLOCK_SIZE_M": 4, "BLOCK_SIZE_N": 64, "NUM_WARPS": 1
+  },
+  "N_LEQ_64.M_LEQ_32": {
+    "NUM_ITER": 2, "BLOCK_SIZE_M": 8, "BLOCK_SIZE_N": 64, "NUM_WARPS": 4
+  },
+  "N_LEQ_64.M_LEQ_64": {
+    "NUM_ITER": 1, "BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "NUM_WARPS": 1
+  },
+  "N_LEQ_64.M_LEQ_1024": {
+    "NUM_ITER": 4, "BLOCK_SIZE_M": 2, "BLOCK_SIZE_N": 64, "NUM_WARPS": 4
+  },
+  "N_LEQ_64.M_LEQ_8192": {
+    "NUM_ITER": 1, "BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "NUM_WARPS": 1
+  },
+  "N_LEQ_64": {
+    "NUM_ITER": 1, "BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 64, "NUM_WARPS": 1
+  },
+  "N_LEQ_128.M_LEQ_1": {
+    "NUM_ITER": 1, "BLOCK_SIZE_M": 1, "BLOCK_SIZE_N": 128, "NUM_WARPS": 1
+  },
+  "N_LEQ_128.M_LEQ_16": {
+    "NUM_ITER": 2, "BLOCK_SIZE_M": 4, "BLOCK_SIZE_N": 128, "NUM_WARPS": 4
+  },
+  "N_LEQ_128.M_LEQ_32": {
+    "NUM_ITER": 1, "BLOCK_SIZE_M": 8, "BLOCK_SIZE_N": 128, "NUM_WARPS": 1
+  },
+  "N_LEQ_128.M_LEQ_1024": {
+    "NUM_ITER": 2, "BLOCK_SIZE_M": 2, "BLOCK_SIZE_N": 128, "NUM_WARPS": 4
+  },
+  "N_LEQ_128.M_LEQ_2048": {
+    "NUM_ITER": 1, "BLOCK_SIZE_M": 2, "BLOCK_SIZE_N": 64, "NUM_WARPS": 1
+  },
+  "N_LEQ_128": {
+    "NUM_ITER": 1, "BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 128, "NUM_WARPS": 2
+  },
+  "N_LEQ_1024.M_LEQ_2": {
+    "NUM_ITER": 1, "BLOCK_SIZE_M": 1, "BLOCK_SIZE_N": 128, "NUM_WARPS": 1
+  },
+  "N_LEQ_1024.M_LEQ_32": {
+    "NUM_ITER": 1, "BLOCK_SIZE_M": 1, "BLOCK_SIZE_N": 256, "NUM_WARPS": 4
+  },
+  "N_LEQ_1024.M_LEQ_1024": {
+    "NUM_ITER": 1, "BLOCK_SIZE_M": 2, "BLOCK_SIZE_N": 256, "NUM_WARPS": 2
+  },
+  "N_LEQ_1024.M_LEQ_2048": {
+    "NUM_ITER": 1, "BLOCK_SIZE_M": 8, "BLOCK_SIZE_N": 256, "NUM_WARPS": 2
+  },
+  "N_LEQ_1024.M_LEQ_8192": {
+    "NUM_ITER": 1, "BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 256, "NUM_WARPS": 4
+  },
+  "N_LEQ_1024": {
+    "NUM_ITER": 2, "BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 256, "NUM_WARPS": 4
+  },
+  "N_LEQ_3072.M_LEQ_32": {
+    "NUM_ITER": 1, "BLOCK_SIZE_M": 1, "BLOCK_SIZE_N": 256, "NUM_WARPS": 4
+  },
+  "N_LEQ_3072.M_LEQ_256": {
+    "NUM_ITER": 1, "BLOCK_SIZE_M": 2, "BLOCK_SIZE_N": 256, "NUM_WARPS": 1
+  },
+  "N_LEQ_3072.M_LEQ_2048": {
+    "NUM_ITER": 1, "BLOCK_SIZE_M": 8, "BLOCK_SIZE_N": 256, "NUM_WARPS": 1
+  },
+  "N_LEQ_3072": {
+    "NUM_ITER": 1, "BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 256, "NUM_WARPS": 4
+  },
+  "N_LEQ_7168.M_LEQ_32": {
+    "NUM_ITER": 1, "BLOCK_SIZE_M": 1, "BLOCK_SIZE_N": 256, "NUM_WARPS": 4
+  },
+  "N_LEQ_7168.M_LEQ_256": {
+    "NUM_ITER": 1, "BLOCK_SIZE_M": 8, "BLOCK_SIZE_N": 256, "NUM_WARPS": 4
+  },
+  "N_LEQ_7168": {
+    "NUM_ITER": 1, "BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 256, "NUM_WARPS": 4
+  },
+  "M_LEQ_4": {
+    "NUM_ITER": 1, "BLOCK_SIZE_M": 1, "BLOCK_SIZE_N": 256, "NUM_WARPS": 4
+  },
+  "M_LEQ_32": {
+    "NUM_ITER": 1, "BLOCK_SIZE_M": 2, "BLOCK_SIZE_N": 256, "NUM_WARPS": 4
+  },
+  "M_LEQ_64": {
+    "NUM_ITER": 1, "BLOCK_SIZE_M": 2, "BLOCK_SIZE_N": 256, "NUM_WARPS": 2
+  },
+  "any": {
+    "NUM_ITER": 1, "BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 256, "NUM_WARPS": 4
+  }
+}
