@@ -148,17 +148,7 @@
       "SEGMENT_TILE_MAX": 64,
       "SEGMENT_BLOCK": 32
     },
-    "D_LEQ_128": {
-      "num_stages": 1,
-      "waves_per_eu": 2,
-      "num_warps": 2,
-      "SMALL_SPLIT_MAX": 8,
-      "MIN_SEGMENTS": 8,
-      "SEGMENTS_PER_CU": 16,
-      "MAX_SEGMENTS": 128,
-      "SEGMENT_TILE_MAX": 64
-    },
-    "any": {
+    "D_GEQ_256": {
       "num_stages": 1,
       "waves_per_eu": 2,
       "num_warps": 2,
@@ -168,6 +158,16 @@
       "MAX_SEGMENTS": 128,
       "SEGMENT_TILE_MAX": 64,
       "SEGMENT_BLOCK": 32
+    },
+    "any": {
+      "num_stages": 1,
+      "waves_per_eu": 2,
+      "num_warps": 2,
+      "SMALL_SPLIT_MAX": 8,
+      "MIN_SEGMENTS": 8,
+      "SEGMENTS_PER_CU": 16,
+      "MAX_SEGMENTS": 128,
+      "SEGMENT_TILE_MAX": 64
     }
   },
   "kv_split": {
