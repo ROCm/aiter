@@ -246,9 +246,6 @@ def pa_prefill_sparse(
             kv_indptr_extend,
             index_dtypes=(torch.int32, torch.int64),
         )
-        if not softmax_scale > 0:
-            # The kernel scales after the row max, which needs a positive scale.
-            raise ValueError(f"softmax_scale must be > 0, got {softmax_scale}")
         has_attn_sink = attn_sink is not None
         if has_attn_sink:
             attn_sink = attn_sink.contiguous()

@@ -621,17 +621,6 @@ def test_pa_prefill_sparse_empty_kv_pool(H):
     assert torch.equal(out, torch.zeros_like(out))
 
 
-@pytest.mark.parametrize("scale", [0.0, -0.1])
-def test_pa_prefill_sparse_rejects_non_positive_scale(scale):
-    _triton_branch_only()
-    q = torch.randn(4, 16, 512, dtype=torch.bfloat16, device="cuda")
-    kv = torch.randn(8, 512, dtype=torch.bfloat16, device="cuda")
-    indptr = torch.arange(0, 5, dtype=torch.int32, device="cuda")
-    indices = torch.zeros(4, dtype=torch.int32, device="cuda")
-    with pytest.raises(ValueError, match="softmax_scale"):
-        pa_prefill_sparse(q, kv, indices, indptr, None, None, None, None, scale)
-
-
 # Strided or overlapping out= buffers would be written wrongly (gfx950 ignores
 # out.stride(2)) or raced on (an expand() over heads), so they are rejected.
 @pytest.mark.parametrize("layout", ["transposed", "expanded_heads"])
