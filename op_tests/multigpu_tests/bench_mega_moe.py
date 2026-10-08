@@ -33,6 +33,12 @@ Launch (4x gfx1250; every env knob below is already the script's default):
     # --stage2_fused both adds the mori-combine baseline row that
     # speedup_vs_base and stage2_overlap_rate are measured against.
     # Set MORI_CCO_BC to a prebuilt libmori_cco_device.bc to skip CCO JIT.
+    # The per-kernel table needs HIP's classic graph path: on the default one
+    # the ROCm torch profiler (roctracer) pins the names on the wrong kernels
+    # once the graph has a parallel branch (stage1_fused=true), and loses more
+    # kernel records. --profile_table 1 (the default) therefore restarts each
+    # rank with DEBUG_HIP_GRAPH_CLASSIC_PATH=1 unless that is already set. It
+    # costs ~1% end to end; --profile_table 0 times the default path.
 
 Env / CLI: --layers --logits_tol --acc_verify --stage1_fused --stage2_fused
            --dispatch_wire --combine_quant
@@ -51,6 +57,7 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import sys
 import time
 
 import pandas as pd
@@ -825,6 +832,16 @@ def _aggregate_prof_table(prof, dist_ctx, per_layer_denom=1.0, row_limit=200):
         rows.append((avg_self, name, per_call, pc_avg, avg_count))
     rows.sort(key=lambda r: (-r[0], r[1]))
     dev_per_layer = total_self / per_layer_denom if per_layer_denom else 0.0
+    # Every kernel runs a whole number of times per layer, so a count off that
+    # grid means the profiler lost records: avg_us is per recorded call and
+    # holds, the totals undercount.
+    complete = True
+    for avg_self, _name, _per_call, _pc_avg, avg_count in rows:
+        per_layer = avg_count / per_layer_denom if per_layer_denom else 1.0
+        if avg_self > 0 and (
+            round(per_layer) < 1 or abs(per_layer - round(per_layer)) > 0.05
+        ):
+            complete = False
     table_rows = []
     for _avg_self, name, per_call, pc_avg, avg_count in rows[:row_limit]:
         row = {
@@ -842,6 +859,7 @@ def _aggregate_prof_table(prof, dist_ctx, per_layer_denom=1.0, row_limit=200):
                 "profiled_kernels": len(rows),
                 "total_self_device_us": total_self,
                 "device_us_per_layer": dev_per_layer,
+                "events_complete": complete,
             }
         ],
     }
@@ -959,6 +977,12 @@ def _device_shared_ffn(tokens, sw1, sw2):
 # Driver
 def main():
     args = _parse_args()
+    # HIP reads its debug flags once, when the runtime starts, and importing
+    # aiter has already started it -- so the flag only takes in a fresh
+    # interpreter. Same pid, so torchrun keeps tracking the rank.
+    if args.profile_table and "DEBUG_HIP_GRAPH_CLASSIC_PATH" not in os.environ:
+        os.environ["DEBUG_HIP_GRAPH_CLASSIC_PATH"] = "1"
+        os.execv(sys.executable, [sys.executable, *sys.orig_argv[1:]])
     dist_ctx = Dist()
     dev = torch.device("cuda", dist_ctx.local_rank)
     # Set, not setdefault: the wire has to match this, so a stale environment
@@ -987,6 +1011,7 @@ def main():
 
     data_dist = resolve_data_init(args.data_init)
 
+    classic_graph = os.environ.get("DEBUG_HIP_GRAPH_CLASSIC_PATH") == "1"
     if dist_ctx.rank == 0:
         print(
             f"[cfg] world={dist_ctx.world} layers={n_layers} tokens/rank={ct} hidden={hdim} "
@@ -997,9 +1022,17 @@ def main():
             f"force_a8w4={os.environ['AITER_FORCE_A8W4']} "
             f"gate={spec['gate_mode'].name} shared_E={args.shared_experts} "
             f"expert_balance={expert_balance} data_init={data_dist} "
-            f"seed={args.seed} gfx={get_gfx()}",
+            f"seed={args.seed} gfx={get_gfx()} "
+            f"hip_graph={'classic' if classic_graph else 'default'}",
             flush=True,
         )
+        if classic_graph:
+            print(
+                "# note: HIP classic graph path (DEBUG_HIP_GRAPH_CLASSIC_PATH=1) "
+                "labels the kernel table right but times ~1% slower than the "
+                "default path -- --profile_table 0 times that one",
+                flush=True,
+            )
         if list(args.scale_init) != [_DEFAULT_SCALE_INIT]:
             print(
                 f"# note: --scale-init {' '.join(args.scale_init)} is ignored -- "
@@ -1129,6 +1162,23 @@ def main():
             # kernel mix, so merging them into a single table would compare rows
             # that never ran in the same pipeline.
             if dist_ctx.rank == 0 and tbl is not None:
+                if (
+                    stage1_fused
+                    and os.environ.get("DEBUG_HIP_GRAPH_CLASSIC_PATH") != "1"
+                ):
+                    print(
+                        f"# note: {label} kernel names are unreliable -- the "
+                        "compact plan's side stream makes the profiler mislabel "
+                        "graph kernels; rerun with DEBUG_HIP_GRAPH_CLASSIC_PATH=1",
+                        flush=True,
+                    )
+                if not tbl["summary"][0]["events_complete"]:
+                    print(
+                        f"# note: {label} profiler lost kernel records -- avg_us "
+                        "holds, total_self_device_us and device_us_per_layer "
+                        "undercount",
+                        flush=True,
+                    )
                 _emit_table(f"mega_moe kernel profile [{label}]", tbl["rows"])
                 _emit_table(
                     f"mega_moe kernel profile summary [{label}]", tbl["summary"]
