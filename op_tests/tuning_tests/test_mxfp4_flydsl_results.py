@@ -417,6 +417,49 @@ class TestCoupledTuningResults(unittest.TestCase):
         failures = pd.read_csv(self.output_file.with_suffix(".failed_shapes.csv"))
         self.assertEqual(failures["token"].tolist(), [1])
 
+    def test_fully_covered_resume_refreshes_stale_failure_manifest(self):
+        failure_file = self.output_file.with_suffix(".failed_shapes.csv")
+        failed = _input_row()
+        failed.update(status="failed", failure_reason="previous tuning failure")
+        pd.DataFrame([failed]).to_csv(failure_file, index=False)
+        successful = _input_row()
+        successful.update(dict.fromkeys(RESULT_COLUMNS, 0))
+        successful.update(
+            us=7.0,
+            us1=7.0,
+            block_m=16,
+            kernelName1=G1,
+            kernelName2=G2_PREFIX + "_reduce_sbm16",
+            err1="1.0%",
+            err2="1.0%",
+        )
+        self.run_csv([_input_row()], existing_rows=[successful])
+
+        failures = pd.read_csv(failure_file)
+        self.assertTrue(failures.empty)
+        self.assertEqual(failures.columns.tolist(), KEYS + ["status", "failure_reason"])
+        self.assertEqual(pd.read_csv(self.output_file)["us"].tolist(), [7.0])
+        self.assertFalse(self.profile_file.exists())
+
+    def test_fully_covered_resume_creates_empty_failure_manifest(self):
+        successful = _input_row()
+        successful.update(dict.fromkeys(RESULT_COLUMNS, 0))
+        successful.update(
+            us=7.0,
+            us1=7.0,
+            block_m=16,
+            kernelName1=G1,
+            kernelName2=G2_PREFIX + "_reduce_sbm16",
+            err1="1.0%",
+            err2="1.0%",
+        )
+        self.run_csv([_input_row()], existing_rows=[successful])
+
+        failures = pd.read_csv(self.output_file.with_suffix(".failed_shapes.csv"))
+        self.assertTrue(failures.empty)
+        self.assertEqual(failures.columns.tolist(), KEYS + ["status", "failure_reason"])
+        self.assertEqual(pd.read_csv(self.output_file)["us"].tolist(), [7.0])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
