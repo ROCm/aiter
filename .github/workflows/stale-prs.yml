@@ -32,7 +32,7 @@ jobs:
           operations-per-run: 99999
           stale-pr-message: >
             No activity for 15 days, so this is now labelled `stale`. A push or
-            a comment clears it; `keep-open` exempts it.
+            a comment clears it; `do-not-close` exempts it.
           close-pr-message: 'Closing this PR due to continued inactivity. Please reopen as and when required'
           stale-issue-message: 'This issue is stale because it has been open 30 days with no activity. Remove the stale label or comment, or this will be closed in 7 days.'
           close-issue-message: 'Closing this issue after 7 days of inactivity since it was marked stale.'
