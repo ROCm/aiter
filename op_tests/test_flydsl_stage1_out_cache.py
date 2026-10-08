@@ -21,6 +21,10 @@ _NEED_GFX950 = pytest.mark.skipif(
     not torch.cuda.is_available() or get_gfx() != "gfx950",
     reason="gfx950 FlyDSL required",
 )
+_NEED_CAPTURE_ALLOC = pytest.mark.skipif(
+    not ROUTES_INSIDE_CAPTURE,
+    reason=f"torch {torch.__version__} cannot allocate outside a capture's pool",
+)
 
 
 @pytest.fixture(autouse=True)
@@ -62,6 +66,7 @@ def test_flydsl_stage1_out_is_keyed_by_shape():
 
 
 @_NEED_GPU
+@_NEED_CAPTURE_ALLOC
 def test_flydsl_stage1_out_is_shared_across_graph_captures():
     """Captures on one stream share one buffer, separate from eager execution."""
     device = torch.device("cuda:0")
@@ -87,6 +92,7 @@ def test_flydsl_stage1_out_is_shared_across_graph_captures():
 
 
 @_NEED_GPU
+@_NEED_CAPTURE_ALLOC
 def test_flydsl_stage1_out_outlives_the_graph_that_allocated_it():
     """A buffer allocated during capture stays valid after that graph is freed."""
     device = torch.device("cuda:0")
@@ -118,10 +124,7 @@ def test_flydsl_stage1_out_outlives_the_graph_that_allocated_it():
 
 
 @_NEED_GPU
-@pytest.mark.skipif(
-    not ROUTES_INSIDE_CAPTURE,
-    reason=f"torch {torch.__version__} ignores use_mem_pool inside a capture",
-)
+@_NEED_CAPTURE_ALLOC
 def test_flydsl_stage1_out_is_not_overwritten_by_replay():
     """A buffer first allocated in a capture must not take an address that capture freed."""
     device = torch.device("cuda:0")
@@ -152,6 +155,28 @@ def test_flydsl_stage1_out_is_not_overwritten_by_replay():
     torch.cuda.synchronize()
 
     assert torch.all(buf.view(torch.uint8) == 0x77)
+
+
+@_NEED_GPU
+def test_flydsl_stage1_out_falls_back_inside_capture_before_torch_2_10(monkeypatch):
+    """Before torch 2.10 a miss during capture returns None; a cached buffer is still used."""
+    from aiter import fused_moe
+
+    monkeypatch.setattr(fused_moe, "ROUTES_INSIDE_CAPTURE", False)
+    device = torch.device("cuda:0")
+    stream = torch.cuda.Stream(device=device)
+    with torch.cuda.stream(stream):
+        warmed = _get_flydsl_stage1_out((256, 512), device)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        missed = _get_flydsl_stage1_out((512, 768), device)
+        hit = _get_flydsl_stage1_out((256, 512), device)
+        hit.view(torch.uint8).zero_()
+
+    assert missed is None
+    assert hit.data_ptr() == warmed.data_ptr()
+    assert len(_FLYDSL_STAGE1_OUT_CACHE) == 1
 
 
 def _pick_kernel(**want):
