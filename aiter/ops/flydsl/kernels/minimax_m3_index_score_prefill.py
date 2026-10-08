@@ -483,6 +483,7 @@ def _cu_count(device=None) -> int:
     """CU count, memoised: the tile_q search asks for it once per candidate,
     and at a 22 us kernel that host-side query measured 1.7x the kernel."""
     import torch
+
     from aiter.jit.utils.chip_info import get_cu_num
 
     if device is None:
@@ -1001,14 +1002,22 @@ def build_prefill_score(fp8: bool, cfg: PrefillScoreConfig, arch: str = DEFAULT_
         def k_operand(raws, ks):
             """A-fragment for k-step ks: 8 fp8 straight out of the raw access.
 
-            The 16 B access holds k-steps 2n and 2n+1 in dwords [0:2] and
-            [2:4], the packing `fragment_helpers.convert_k` widens, so this
-            just picks the pair. The k-axis map is untouched, which is why the
-            shuffled layout is shared with the bf16 path and with decode."""
+            One 16 B access holds `tr.k_per_load` k-steps, the packing
+            `fragment_helpers.convert_k` widens, so this just picks one of
+            them. The k-axis map is untouched, which is why the shuffled
+            layout is shared with the bf16 path and with decode.
+
+            The per-load count comes from the traits rather than gfx950's 2:
+            gfx942's fp8 traits are 8 k-steps over 2 loads, so a hardcoded 2
+            would index `raws[3]` of a 2-entry list. Unreachable today -- fp8
+            here always resolves to k128 on CDNA4, and gfx942 takes the
+            register driver -- but it is one config away from being wrong, and
+            the traits are already the authority for this map."""
             if const_expr(not FP8_MFMA):
                 return convert_k(raws, ks)
-            raw = raws[ks // 2]
-            lo = 2 * (ks % 2)
+            per_load = tr.k_per_load
+            raw = raws[ks // per_load]
+            lo = 2 * (ks % per_load)
             t = fx.make_rmem_tensor(fx.make_layout(8, 1), FP8_T)
             t.store(
                 fx.Vector.from_elements(
@@ -2204,6 +2213,17 @@ def score_prefill_flydsl(
                 "or leave k_lds on auto."
             )
         cfg = replace(cfg, k_lds=0)
+    # The shuffled reader walks a page as a flat run of 16 B units, so it needs
+    # a packed page for the same reason the LDS staging path does -- the guard
+    # above excludes `shuffled`, which left this case accepted and silently
+    # scoring the wrong rows (measured 1.83 max abs error on a 2x-strided view).
+    # Demotion is not an option here: the layout is the caller's, not a knob.
+    if cfg.shuffled and (cache.stride(1) != HEAD_DIM or cache.stride(2) != 1):
+        raise ValueError(
+            "a shuffled cache must be packed within each page: cache.stride(1) "
+            f"must be {HEAD_DIM} and stride(2) 1, got {cache.stride(1)} and "
+            f"{cache.stride(2)}"
+        )
     cfg = resolve_config(
         max_query_len, batch, heads, max_block, cfg, idx_q.device, fp8, arch
     )

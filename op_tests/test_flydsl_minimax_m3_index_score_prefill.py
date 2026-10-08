@@ -337,6 +337,75 @@ def test_rejects_malformed_tensors():
         )
 
 
+def test_shuffled_cache_must_be_packed():
+    """A shuffled page is read as a flat run of 16 B units, so a strided view
+    describes the wrong bytes. The strided guard used to exclude `shuffled`,
+    which left this accepted and scoring 1.83 off instead of raising."""
+    c = make_case(1, 256, 2048)
+    shuf = shuffle_cache(c["cache"])
+    wide = torch.zeros(
+        shuf.shape[0], PAGE, 2 * HEAD_DIM, dtype=shuf.dtype, device="cuda"
+    )
+    wide[..., :HEAD_DIM] = shuf
+    strided = wide[..., :HEAD_DIM]
+    assert strided.stride(1) == 2 * HEAD_DIM
+
+    with pytest.raises(ValueError, match="packed within each page"):
+        run(c, strided, shuffled=True)
+    # The packed cache is still accepted and still right.
+    ref, live = reference(c)
+    assert_matches(run(c, shuf, shuffled=True), ref, live, "packed shuffled")
+
+
+def test_bf16_cache_path():
+    """A bf16 cache takes a different arithmetic path, and nothing else here
+    builds one -- `make_case` is fp8 only, so `score_page`'s non-k128 tail and
+    `k_operand`'s `convert_k` arm had no coverage at all. Judged against torch
+    rather than aiter, whose prefill scorer takes an fp8 cache."""
+    torch.manual_seed(0)
+    dev = "cuda"
+    batch, q_len, ctx = 1, 256, 2048
+    mb = ctx // PAGE
+    seq = torch.full((batch,), ctx, dtype=torch.int32, device=dev)
+    prefix = torch.full((batch,), ctx - q_len, dtype=torch.int32, device=dev)
+    cu = torch.arange(0, (batch + 1) * q_len, q_len, dtype=torch.int32, device=dev)
+    q = (torch.randn(batch * q_len, 1, HEAD_DIM, device=dev) / 4).bfloat16()
+    cache = (torch.randn(batch * mb, PAGE, HEAD_DIM, device=dev) / 4).bfloat16()
+    bt = torch.arange(batch * mb, device=dev, dtype=torch.int32).view(batch, mb)
+    bt = bt.contiguous()
+
+    out = alloc_score(batch * q_len, 1, mb, dev)
+    out.fill_(SENTINEL)
+    score_prefill_flydsl(
+        q, cache, bt, cu, seq, prefix, q_len, ctx, 1.0 / LOG2E, out=out
+    )
+    got = out.reshape(1, batch * q_len, mb).float()
+
+    pos = torch.arange(PAGE, device=dev)
+    unwritten = torch.tensor(SENTINEL, dtype=torch.float32).item()
+    for row in (0, 1, q_len // 2, q_len - 1):
+        cut = ctx - q_len + row + 1
+        for blk in (0, 1, mb // 2, mb - 1):
+            k = cache[int(bt[0, blk])].float()
+            z = k @ q[row, 0].float()
+            z = z.masked_fill(blk * PAGE + pos >= cut, -float("inf"))
+            ref, mine = z.max().item(), got[0, row, blk].item()
+            if ref == -float("inf"):
+                # SENTINEL is a python double; the buffer holds its fp32
+                # rounding, so compare against what was actually stored.
+                # Past the causal window the kernel may leave the slot alone;
+                # see this module's docstring. Either answer is in contract.
+                assert mine in (
+                    unwritten,
+                    -float("inf"),
+                ), f"row {row} blk {blk} is fully masked but holds {mine}"
+                continue
+            assert mine != unwritten, f"row {row} blk {blk} left unwritten"
+            assert abs(ref - mine) <= 3e-2 * max(
+                1.0, abs(ref)
+            ), f"row {row} blk {blk}: got {mine}, torch {ref}"
+
+
 def test_resolve_config_is_idempotent():
     dev = torch.device("cuda")
     for kw in ({}, {"shuffled": True}, {"shuffled": True, "tile_q": 128}):
