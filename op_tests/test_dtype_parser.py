@@ -6,6 +6,8 @@ import subprocess
 import sys
 import textwrap
 
+import pytest
+
 
 def test_str2dtype_base_types_do_not_import_native_enum():
     script = textwrap.dedent(
@@ -32,3 +34,7 @@ def test_str2dtype_base_types_do_not_import_native_enum():
     env = os.environ.copy()
     env["AITER_TRITON_ONLY"] = "1"
     subprocess.run([sys.executable, "-c", script], check=True, env=env)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

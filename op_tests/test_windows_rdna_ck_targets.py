@@ -93,6 +93,14 @@ class TestWindowsRDNACKTargets(unittest.TestCase):
                         for command in by_name["libmha_fwd"]["blob_gen_cmd"]
                     )
                 )
+                self.assertFalse(
+                    any(
+                        source.replace("\\", "/").rstrip("'\"").endswith(
+                            "/cpp_itfs/mha_fwd_batch_prefill.cu"
+                        )
+                        for source in by_name["libmha_fwd"]["srcs"]
+                    )
+                )
 
         static_by_name = dict(zip(names, static_build_args))
         gfx9_recipes = {
@@ -105,6 +113,9 @@ class TestWindowsRDNACKTargets(unittest.TestCase):
             self.assertEqual(
                 gfx9_recipes[name]["blob_gen_cmd"],
                 static_by_name[name]["blob_gen_cmd"],
+            )
+            self.assertEqual(
+                gfx9_recipes[name]["srcs"], static_by_name[name]["srcs"]
             )
 
     def test_cdna_and_gfx1250_processor_counts_are_not_doubled(self):

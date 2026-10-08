@@ -50,6 +50,14 @@ def _apply_ck_mha_prebuild_target_policy(build_args: list[dict], gfxs: list[str]
 
         adjusted_build = dict(build)
         adjusted_build["blob_gen_cmd"] = filtered
+        if md_name == "libmha_fwd" and not batch_prefill_supported:
+            adjusted_build["srcs"] = [
+                source
+                for source in build.get("srcs", [])
+                if not source.replace("\\", "/").rstrip("'\"").endswith(
+                    "/cpp_itfs/mha_fwd_batch_prefill.cu"
+                )
+            ]
         adjusted.append(adjusted_build)
 
     return adjusted
