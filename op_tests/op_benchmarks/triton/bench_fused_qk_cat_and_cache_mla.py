@@ -114,7 +114,7 @@ def bench_cat_and_cache_mla_fn(
         q_out_dtype = CACHE_DTYPES[args.q_out_dtype]
 
     if provider == "nope":
-        fn = lambda: fused_qk_cat_and_cache_mla(  # noqa: E731
+        fn = lambda: fused_qk_cat_and_cache_mla(
             q_nope,
             q_pe,
             k_nope,
@@ -131,7 +131,7 @@ def bench_cat_and_cache_mla_fn(
         cos = torch.cos(freqs)
         sin = torch.sin(freqs)
         positions = torch.randint(0, max_pos, (M,), device="cuda")
-        fn = lambda: fused_qk_rope_cat_and_cache_mla(  # noqa: E731
+        fn = lambda: fused_qk_rope_cat_and_cache_mla(
             q_nope,
             q_pe,
             k_nope,

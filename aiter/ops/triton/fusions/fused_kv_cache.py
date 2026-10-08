@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import os
-from typing import Optional
 
 import torch
 import triton
@@ -290,17 +289,17 @@ def _cat_and_cache_mla(
     k_pe: torch.Tensor,
     kv_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
-    pos: Optional[torch.Tensor],
-    cos: Optional[torch.Tensor],
-    sin: Optional[torch.Tensor],
+    pos: torch.Tensor | None,
+    cos: torch.Tensor | None,
+    sin: torch.Tensor | None,
     k_scale: torch.Tensor,
     is_neox: bool,
     num_decode_toks_for_zeros: int,
     apply_scale: bool,
-    q_out: Optional[torch.Tensor],
-    decode_q_pe_out: Optional[torch.Tensor],
-    k_pe_out: Optional[torch.Tensor],
-    q_out_dtype: Optional[torch.dtype],
+    q_out: torch.Tensor | None,
+    decode_q_pe_out: torch.Tensor | None,
+    k_pe_out: torch.Tensor | None,
+    q_out_dtype: torch.dtype | None,
     shuffled_kv_cache: bool,
     upcast_operand: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:

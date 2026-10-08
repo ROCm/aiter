@@ -392,9 +392,9 @@ def test_fused_qk_cat_and_cache_mla(
     # Everything outside the cache is a pure copy, so bf16 outputs must match
     # bit for bit; an fp8 q_out may differ by one e4m3 ulp in the cast.
     if q_out_dtype == torch.bfloat16:
-        q_tol = dict(atol=0, rtol=0)
+        q_tol = {"atol": 0, "rtol": 0}
     else:
-        q_tol = dict(atol=2**-9, rtol=0.125)
+        q_tol = {"atol": 2**-9, "rtol": 0.125}
     torch.testing.assert_close(
         torch_q.to(q_out_dtype).to(torch.float32),
         triton_q.to(torch.float32),
