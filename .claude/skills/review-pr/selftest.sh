@@ -32,6 +32,24 @@ route() {  # <rc> -> the failure class agent_fail picked
 t "a timeout routes to flow" "$(route 124)" "flow"
 t "a backend fault routes to glm" "$(route 1)" "glm"
 
+# The line above only proves agent_fail routes a 124 correctly. It says nothing about whether
+# run_agent still PRODUCES a 124 on a timeout -- and if that regresses to a plain 1, every
+# timeout silently becomes a backend fault again while these checks stay green. Drive a real
+# timeout through run_agent instead of trusting its return path.
+real_timeout() {
+  local out; out=$(mktemp)
+  { echo 'set -uo pipefail'
+    echo 'say() { :; }'
+    echo 'PROJ=/tmp'
+    echo 'DEADLINE=$(( $(date +%s) + 3600 ))'    # plenty of budget; the agent itself times out
+    echo 'AITER_AGENT_TIMEOUT=1'
+    sed -n '/^run_agent()/,/^}/p' "$S/run_one.sh"
+    printf 'run_agent probe /dev/null %s sh -c "sleep 5"; echo $?\n' "$out"
+  } | bash
+  rm -f "$out"
+}
+t "run_agent itself reports 124 on a real timeout" "$(real_timeout)" "124"
+
 echo "[run budget]"
 # AGENT_TIMEOUT x RETRIES x (worker+refuter) can exceed the workflow's timeout-minutes, and a run
 # killed at the job cap dies with no classified status at all. run_agent must refuse to start an

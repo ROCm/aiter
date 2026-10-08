@@ -19,6 +19,9 @@ done
 echo "[prompt drift]"
 if python3 "$S/check_prompts.py" >/dev/null 2>&1; then echo "  ✅ prompts match SKILL.md verbatim"; ok=$((ok+1)); else echo "  ❌ prompts drifted from SKILL.md — re-copy the quoted sections"; bad=$((bad+1)); fi
 
+echo "[tooling guards]"
+if bash "$S/selftest.sh" >/dev/null 2>&1; then echo "  ✅ run_one.sh guards hold (timeout triage, run budget, refuter downgrade)"; ok=$((ok+1)); else echo "  ❌ selftest.sh failed — run it directly to see which guard broke"; bad=$((bad+1)); fi
+
 echo "[runtime]"
 chk "python3 available" "command -v python3" "install python3"
 chk "git available" "command -v git" "install git"

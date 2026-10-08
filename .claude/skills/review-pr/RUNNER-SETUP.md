@@ -72,8 +72,9 @@ cannot restart itself.
 
     bash .claude/skills/review-pr/preflight.sh    # all green = @aiter-bot review runs end to end
 
-A change to `run_one.sh` should also pass its own guard, which checks that a timeout still routes
-to `flow` rather than paging the model owner, and that a refuter timeout still publishes the card
-only by admitting it:
+That includes `selftest.sh`, which holds `run_one.sh` to its guards: a timeout still routes to
+`flow` rather than paging the model owner, an attempt that cannot fit the run budget is refused,
+and a refuter timeout still publishes the card only by admitting it. Run it directly to see which
+guard broke:
 
     bash .claude/skills/review-pr/selftest.sh
