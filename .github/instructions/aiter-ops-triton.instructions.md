@@ -143,11 +143,11 @@ and every fallback that reached them are gone. Flag:
   byte-identical and called out in the commit message. The one seeding rule in
   force is gfx950 → gfx1250, triton only — never into a gluon directory, never
   backwards into gfx950.
-- `kpack` newly added to a gfx950 config. Triton's AMD backend deprecates
-  `kpack` on CDNA4 — it warns and force-overrides `kpack = 1` there, and the
-  parameter is slated for removal. The gfx950 tree is clean of it; gfx942 may
-  still carry it, and existing RDNA (gfx1151/gfx1201/gfx1250) entries predate
-  the rule, so flag additions rather than the entries already there.
+- `kpack` in any config outside gfx942, whether added or already there.
+  Triton's AMD backend deprecates `kpack` on CDNA4 — it warns and
+  force-overrides `kpack = 1` on gfx950, and the parameter is slated for
+  removal — gfx1250 does not support it, and on the RDNA targets (gfx11xx,
+  gfx120x) it is a no-op. Only gfx942 configs may carry it.
 - Checked-in files under `configs/gemm/aot/` or `configs/paged_mqa_logits/aot/`
   — these are runtime AOT caches, never committed.
 
