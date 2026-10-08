@@ -109,283 +109,29 @@ fi
 # ------------------------------
 # FILE_TIMES (seconds), unknown files default 15
 # ------------------------------
+DEFAULT_TEST_TIME=15
 declare -A FILE_TIMES
+TIMES_FILE=".github/split-test-times/${TEST_TYPE}.tsv"
+
 if [[ "$TEST_TYPE" == "aiter" ]]; then
     echo "Aiter test files:"
-    FILE_TIMES[op_tests/test_topk_per_row.py]=1187
-    FILE_TIMES[op_tests/test_mla_persistent.py]=1084
-    FILE_TIMES[op_tests/test_fused_qk_norm_rope_cache_quant.py]=1046
-    FILE_TIMES[op_tests/test_fused_qk_norm_mrope_cache_quant.py]=1036
-    FILE_TIMES[op_tests/test_mla_v4_nm.py]=988
-    FILE_TIMES[op_tests/test_mha.py]=858
-    FILE_TIMES[op_tests/test_batch_prefill.py]=854
-    FILE_TIMES[op_tests/test_mla.py]=830
-    FILE_TIMES[op_tests/test_moe_2stage.py]=758
-    FILE_TIMES[op_tests/test_mha_varlen.py]=716
-    FILE_TIMES[op_tests/test_pa.py]=690
-    FILE_TIMES[op_tests/test_mla_persistent_round_robin.py]=591
-    FILE_TIMES[op_tests/test_gemm_a8w8.py]=589
-    FILE_TIMES[op_tests/test_mla_sparse.py]=584
-    FILE_TIMES[op_tests/test_rope.py]=401
-    FILE_TIMES[op_tests/test_concat_cache_mla.py]=262
-    FILE_TIMES[op_tests/test_moe_topk_gating.py]=260
-    FILE_TIMES[op_tests/test_gated_delta_rule.py]=198
-    FILE_TIMES[op_tests/test_mha_native_splitkv.py]=186
-    FILE_TIMES[op_tests/test_pa_mtp.py]=164
-    FILE_TIMES[op_tests/test_flydsl_moe_a16wfp4.py]=75
-    FILE_TIMES[op_tests/test_moe_dp_share_expert.py]=131
-    FILE_TIMES[op_tests/test_batched_gemm_bf16.py]=124
-    FILE_TIMES[op_tests/test_gemm_a8w8_blockscale.py]=108
-    FILE_TIMES[op_tests/test_flydsl_qk_norm_rope_quant.py]=92
-    FILE_TIMES[op_tests/test_gemm_a8w8_blockscale_cktile_aq_rowmajor.py]=86
-    FILE_TIMES[op_tests/test_flydsl_causal_conv1d_update.py]=84
-    FILE_TIMES[op_tests/test_flydsl_moe_aux.py]=84
-    FILE_TIMES[op_tests/test_activation.py]=80
-    FILE_TIMES[op_tests/test_kvcache.py]=76
-    FILE_TIMES[op_tests/test_jit_dir_with_enum.py]=66
-    FILE_TIMES[op_tests/test_topk_plain.py]=64
-    FILE_TIMES[op_tests/test_pa_ps.py]=63
-    FILE_TIMES[op_tests/test_gdn_prepare.py]=62
-    FILE_TIMES[op_tests/test_flydsl_compress_attn.py]=58
-    FILE_TIMES[op_tests/test_moe_sorting.py]=56
-    FILE_TIMES[op_tests/test_quant.py]=56
-    FILE_TIMES[op_tests/test_flydsl_gdr_mtp.py]=54
-    FILE_TIMES[op_tests/test_rmsnorm2d.py]=52
-    FILE_TIMES[op_tests/test_batched_gemm_a8w8.py]=50
-    FILE_TIMES[op_tests/test_mhc.py]=50
-    FILE_TIMES[op_tests/test_topk_select.py]=47
-    FILE_TIMES[op_tests/test_flydsl_topk_per_row_small_k.py]=46
-    FILE_TIMES[op_tests/test_mla_reduce.py]=40
-    FILE_TIMES[op_tests/test_pa_sparse_prefill.py]=40
-    FILE_TIMES[op_tests/test_msa_block_select.py]=39
-    FILE_TIMES[op_tests/test_causal_conv1d_update.py]=38
-    FILE_TIMES[op_tests/test_mla_prefill_ps.py]=36
-    FILE_TIMES[op_tests/test_moeTopkSoftmax.py]=36
-    FILE_TIMES[op_tests/test_moe_sorting_mxfp4.py]=36
-    FILE_TIMES[op_tests/test_pa_ragged.py]=36
-    FILE_TIMES[op_tests/test_flydsl_linear_attention_prefill.py]=35
-    FILE_TIMES[op_tests/test_aiter_addInp.py]=31
-    FILE_TIMES[op_tests/test_sampling.py]=31
-    FILE_TIMES[op_tests/test_gemm_a4w4.py]=30
-    FILE_TIMES[op_tests/test_gemm_a4w6.py]=12
-    FILE_TIMES[op_tests/test_gemm_a6w4.py]=12
-    FILE_TIMES[op_tests/test_flydsl_linear_attention.py]=29
-    FILE_TIMES[op_tests/test_gated_rmsnorm_fp8_quant.py]=29
-    FILE_TIMES[op_tests/test_aiter_add.py]=28
-    FILE_TIMES[op_tests/test_pa_ragged_experimental.py]=28
-    FILE_TIMES[op_tests/test_mha_varlen_large_kv.py]=27
-    FILE_TIMES[op_tests/test_pa_v1.py]=27
-    FILE_TIMES[op_tests/test_hipblaslt_lifecycle.py]=26
-    FILE_TIMES[op_tests/test_flydsl_mla_reduce.py]=25
-    FILE_TIMES[op_tests/test_kvcache_blockscale.py]=25
-    FILE_TIMES[op_tests/test_moe_blockscale.py]=25
-    FILE_TIMES[op_tests/test_sample.py]=24
-    FILE_TIMES[op_tests/test_mla_ltx.py]=22
-    FILE_TIMES[op_tests/test_causal_conv1d_prefill_split_qkv.py]=20
-    FILE_TIMES[op_tests/test_fused_qk_norm_rope_group_quant.py]=18
-    FILE_TIMES[op_tests/test_gemm_a16w16.py]=18
-    FILE_TIMES[op_tests/test_mla_stage2_merge.py]=18
-    FILE_TIMES[op_tests/test_moe_tkw1.py]=18
-    FILE_TIMES[op_tests/test_flydsl_dcp_topk_merge.py]=16
-    FILE_TIMES[op_tests/test_layernorm2dFusedAddQuant.py]=16
-    FILE_TIMES[op_tests/test_mha_v4.py]=16
-    FILE_TIMES[op_tests/test_fused_qk_norm.py]=15
-    FILE_TIMES[op_tests/test_moe_mxfp4_inter_dim_dispatch.py]=15
-    FILE_TIMES[op_tests/test_topk_per_row_stable.py]=15
-    FILE_TIMES[op_tests/test_gemm_a6w6.py]=12
-    FILE_TIMES[op_tests/test_mha_flydsl_varlen_bwd.py]=12
-    FILE_TIMES[op_tests/test_moe.py]=12
-    FILE_TIMES[op_tests/test_moe_ep.py]=12
-    FILE_TIMES[op_tests/test_quant_mxfp4.py]=11
-    FILE_TIMES[op_tests/test_deepgemm.py]=10
-    FILE_TIMES[op_tests/test_flydsl_hstu_attention.py]=10
-    FILE_TIMES[op_tests/test_inverse_rope_group_quant.py]=10
-    FILE_TIMES[op_tests/test_flydsl_hgemm.py]=9
-    FILE_TIMES[op_tests/test_rmsnorm2dFusedAddQuant.py]=9
-    FILE_TIMES[op_tests/test_smoothquant.py]=8
-    FILE_TIMES[op_tests/test_fused_qk_norm_rope_2way_perhead.py]=7
-    FILE_TIMES[op_tests/test_fused_qk_rmsnorm_group_quant.py]=7
-    FILE_TIMES[op_tests/test_fused_qknorm_idxrqknorm.py]=7
-    FILE_TIMES[op_tests/test_indexer_qk_rope_quant_and_cache.py]=7
-    FILE_TIMES[op_tests/test_metadata.py]=7
-    FILE_TIMES[op_tests/test_opus_a16w16_gemm.py]=7
-    FILE_TIMES[op_tests/test_flydsl_gather_kv_b_proj.py]=6
-    FILE_TIMES[op_tests/test_flydsl_pa_mqa_logits_fp4.py]=6
-    FILE_TIMES[op_tests/test_flydsl_pa_mqa_logits_fp4_prefill.py]=6
-    FILE_TIMES[op_tests/test_fused_kv_norm_rope_group_quant.py]=6
-    FILE_TIMES[op_tests/test_fused_qk_norm_rope_1way_perhead.py]=6
-    FILE_TIMES[op_tests/test_jit_cache_transaction.py]=6
-    FILE_TIMES[op_tests/test_opus_a16w16_policy_parity.py]=6
-    FILE_TIMES[op_tests/test_opus_a8w8_bmm.py]=6
-    FILE_TIMES[op_tests/test_pa_mqa_logits_offset.py]=6
-    FILE_TIMES[op_tests/test_quant_mxfp6_gemm.py]=6
-    FILE_TIMES[op_tests/tuning_tests/test_config_shape_collision.py]=4
-    FILE_TIMES[op_tests/tuning_tests/test_csv_validation.py]=4
-    FILE_TIMES[op_tests/tuning_tests/test_mixed_mxfp_tuning.py]=4
-    FILE_TIMES[op_tests/test_fused_qk_rmsnorm_per_token_quant.py]=5
-    FILE_TIMES[op_tests/test_groupnorm.py]=5
-    FILE_TIMES[op_tests/test_indexer_k_quant_and_cache.py]=5
-    FILE_TIMES[op_tests/test_mha_fp8.py]=5
-    FILE_TIMES[op_tests/test_mha_varlen_fp8.py]=5
-    FILE_TIMES[op_tests/test_opus_a8w8_interface.py]=5
-    FILE_TIMES[op_tests/test_opus_co_integration.py]=5
-    FILE_TIMES[op_tests/test_situv2_and_mul_quant.py]=5
-    FILE_TIMES[op_tests/test_topk_row_prefill.py]=5
-    FILE_TIMES[op_tests/test_aiter_sigmoid.py]=4
-    FILE_TIMES[op_tests/test_asm_guard.py]=4
-    FILE_TIMES[op_tests/test_dsv4_rotate_quant.py]=4
-    FILE_TIMES[op_tests/test_f4gemm.py]=4
-    FILE_TIMES[op_tests/test_fhmoe.py]=4
-    FILE_TIMES[op_tests/test_flydsl_batched_gemm.py]=4
-    FILE_TIMES[op_tests/test_flydsl_fmha.py]=4
-    FILE_TIMES[op_tests/test_fmha_fwd_mxfp8_asm.py]=4
-    FILE_TIMES[op_tests/test_fmha_fwd_with_sink_asm.py]=4
-    FILE_TIMES[op_tests/test_fmha_fwd_with_sink_varlen_asm.py]=4
-    FILE_TIMES[op_tests/test_gdr_decode_packed_bf16.py]=4
-    FILE_TIMES[op_tests/test_gemm_a8w8_blockscale_fallback.py]=4
-    FILE_TIMES[op_tests/test_gemm_a8w8_bpreshuffle_pad_k.py]=4
-    FILE_TIMES[op_tests/test_gemm_codegen.py]=4
-    FILE_TIMES[op_tests/test_jit_arch_guard.py]=4
-    FILE_TIMES[op_tests/test_layernorm2d.py]=4
-    FILE_TIMES[op_tests/test_mha_flydsl.py]=4
-    FILE_TIMES[op_tests/test_mla_decode_gate.py]=4
-    FILE_TIMES[op_tests/test_mla_decode_pagesize64.py]=4
-    FILE_TIMES[op_tests/test_mla_flydsl.py]=4
-    FILE_TIMES[op_tests/test_mla_v40_persistent.py]=4
-    FILE_TIMES[op_tests/test_mla_v4_kargpreld.py]=4
-    FILE_TIMES[op_tests/test_moe_local_expert_ids.py]=4
-    FILE_TIMES[op_tests/test_moe_mxfp8_passthrough.py]=4
-    FILE_TIMES[op_tests/test_mxfp8fp4gemm.py]=4
-    FILE_TIMES[op_tests/test_pa_block_id_truncation.py]=4
-    FILE_TIMES[op_tests/test_pa_decode_bf16_asm.py]=4
-    FILE_TIMES[op_tests/test_split_gdr_update.py]=4
-    FILE_TIMES[op_tests/test_topk_softmax.py]=4
-    FILE_TIMES[op_tests/test_vsa_sparse_attention.py]=4
-    FILE_TIMES[op_tests/test_pretune.py]=1
-elif [[ "$TEST_TYPE" == "triton" ]]; then
+else
     echo "Triton test files:"
-    FILE_TIMES[op_tests/triton_tests/conv/test_causal_conv1d.py]=789
-    FILE_TIMES[op_tests/triton_tests/attention/test_mha.py]=424
-    FILE_TIMES[op_tests/triton_tests/test_pa_decode_gluon.py]=408
-    FILE_TIMES[op_tests/triton_tests/gemm/batched/test_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant.py]=368
-    FILE_TIMES[op_tests/triton_tests/attention/test_fav3_sage.py]=367
-    FILE_TIMES[op_tests/triton_tests/attention/test_unified_attention.py]=356
-    FILE_TIMES[op_tests/triton_tests/gemm/fused/test_fused_gemm_afp4wfp4_a16w16.py]=284
-    FILE_TIMES[op_tests/triton_tests/attention/test_mha_with_pe.py]=282
-    FILE_TIMES[op_tests/triton_tests/gemm/basic/test_gemm_a8w8.py]=250
-    FILE_TIMES[op_tests/triton_tests/rope/test_fused_qkv_split_qk_rope.py]=234
-    FILE_TIMES[op_tests/triton_tests/attention/test_mha_v3.py]=220
-    FILE_TIMES[op_tests/triton_tests/moe/test_moe_gemm_a8w4.py]=207
-    FILE_TIMES[op_tests/triton_tests/attention/test_mla.py]=190
-    FILE_TIMES[op_tests/triton_tests/fusions/test_mhc.py]=188
-    FILE_TIMES[op_tests/triton_tests/gemm/batched/test_batched_gemm_afp4wfp4.py]=187
-    FILE_TIMES[op_tests/triton_tests/attention/test_mha_with_sink.py]=175
-    FILE_TIMES[op_tests/triton_tests/gemm/feed_forward/test_ff_a16w16_fused.py]=162
-    FILE_TIMES[op_tests/triton_tests/rope/test_rope.py]=150
-    FILE_TIMES[op_tests/triton_tests/attention/test_pa_decode.py]=144
-    FILE_TIMES[op_tests/triton_tests/gemm/feed_forward/test_ff_a16w16.py]=138
-    FILE_TIMES[op_tests/triton_tests/gemm/fused/test_fused_gemm_afp4wfp4_mul_add.py]=127
-    FILE_TIMES[op_tests/triton_tests/moe/test_moe_gemm_a8w8_blockscale.py]=124
-    FILE_TIMES[op_tests/triton_tests/moe/test_moe_gemm_a16w4.py]=119
-    FILE_TIMES[op_tests/triton_tests/moe/test_moe_gemm_a4w4.py]=117
-    FILE_TIMES[op_tests/triton_tests/moe/test_moe_gemm_a8w8.py]=116
-    FILE_TIMES[op_tests/triton_tests/quant/test_fused_mxfp4_quant.py]=116
-    FILE_TIMES[op_tests/triton_tests/moe/test_moe_routing.py]=112
-    FILE_TIMES[op_tests/triton_tests/gemm/basic/test_gemm_a8w8_blockscale.py]=109
-    FILE_TIMES[op_tests/triton_tests/gemm/basic/test_gemm_afp4wfp4.py]=106
-    FILE_TIMES[op_tests/triton_tests/gemm/basic/test_gemm_a16w16_gated.py]=104
-    FILE_TIMES[op_tests/triton_tests/gemm/fused/test_fused_gemm_a8w8_blockscale_a16w16.py]=100
-    FILE_TIMES[op_tests/triton_tests/conv/test_conv2d.py]=99
-    FILE_TIMES[op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py]=95
-    FILE_TIMES[op_tests/triton_tests/test_gmm.py]=86
-    FILE_TIMES[op_tests/triton_tests/fusions/test_fused_kv_cache.py]=84
-    FILE_TIMES[op_tests/triton_tests/normalization/test_layernorm.py]=82
-    FILE_TIMES[op_tests/triton_tests/normalization/test_rmsnorm.py]=78
-    FILE_TIMES[op_tests/triton_tests/fusions/test_fused_bmm_rope_kv_cache.py]=75
-    FILE_TIMES[op_tests/triton_tests/test_activation.py]=66
-    FILE_TIMES[op_tests/triton_tests/attention/test_mha_fp8.py]=58
-    FILE_TIMES[op_tests/triton_tests/gemm/fused/test_fused_gemm_afp4wfp4_split_cat.py]=58
-    FILE_TIMES[op_tests/triton_tests/moe/test_moe_gemm_int8_smoothquant.py]=57
-    FILE_TIMES[op_tests/triton_tests/attention/test_chunked_pa_prefill.py]=56
-    FILE_TIMES[op_tests/triton_tests/attention/test_fp8_mqa_logits.py]=54
-    FILE_TIMES[op_tests/triton_tests/attention/test_pa_prefill.py]=54
-    FILE_TIMES[op_tests/triton_tests/quant/test_fused_fp8_quant.py]=54
-    FILE_TIMES[op_tests/triton_tests/attention/test_sparse_mla.py]=52
-    FILE_TIMES[op_tests/triton_tests/chunk_delta_attn/test_flash_kda.py]=46
-    FILE_TIMES[op_tests/triton_tests/attention/test_mha_dao_ai.py]=44
-    FILE_TIMES[op_tests/triton_tests/fusions/test_attn_res.py]=40
-    FILE_TIMES[op_tests/triton_tests/attention/test_la_paged.py]=38
-    FILE_TIMES[op_tests/triton_tests/gemm/fused/test_fused_gemm_a8w8_blockscale_mul_add.py]=38
-    FILE_TIMES[op_tests/triton_tests/attention/test_mla_decode_rope.py]=37
-    FILE_TIMES[op_tests/triton_tests/test_gather_kv_b_proj.py]=37
-    FILE_TIMES[op_tests/triton_tests/attention/test_mla_v4_triton.py]=32
-    FILE_TIMES[op_tests/triton_tests/attention/test_pa_decode_sparse.py]=30
-    FILE_TIMES[op_tests/triton_tests/attention/test_mha_spatial_swizzle.py]=28
-    FILE_TIMES[op_tests/triton_tests/gemm/batched/test_batched_gemm_a8w8.py]=27
-    FILE_TIMES[op_tests/triton_tests/gemm/basic/test_gemm_a8w8_per_token_scale.py]=24
-    FILE_TIMES[op_tests/triton_tests/gemm/batched/test_batched_gemm_a16wfp4.py]=23
-    FILE_TIMES[op_tests/triton_tests/fusions/test_fused_reduce_qk_norm_rope_swa_write.py]=22
-    FILE_TIMES[op_tests/triton_tests/attention/test_unified_attention_sparse_mla.py]=20
-    FILE_TIMES[op_tests/triton_tests/gemm/fused/test_fused_gemm_a16w16_quant_x.py]=20
-    FILE_TIMES[op_tests/triton_tests/attention/test_fav3_sage_compile.py]=18
-    FILE_TIMES[op_tests/triton_tests/gemm/basic/test_gemm_a16w8_blockscale.py]=16
-    FILE_TIMES[op_tests/triton_tests/chunk_delta_attn/test_chunk_delta_attn_fwd.py]=15
-    FILE_TIMES[op_tests/triton_tests/fusions/test_fused_clamp_act_mul.py]=14
-    FILE_TIMES[op_tests/triton_tests/moe/test_moe_routing_herd.py]=14
-    FILE_TIMES[op_tests/triton_tests/test_fused_rearrange_sigmoid_gdr.py]=14
-    FILE_TIMES[op_tests/triton_tests/attention/test_pa_prefill_sparse.py]=12
-    FILE_TIMES[op_tests/triton_tests/gated_delta_net/test_fused_kda_decode.py]=12
-    FILE_TIMES[op_tests/triton_tests/gemm/basic/test_gemm_a16wfp4.py]=12
-    FILE_TIMES[op_tests/triton_tests/gemm/basic/test_gemm_a8wfp4.py]=12
-    FILE_TIMES[op_tests/triton_tests/chunk_delta_attn/test_fast_launch.py]=10
-    FILE_TIMES[op_tests/triton_tests/gemm/batched/test_batched_gemm_bf16.py]=10
-    FILE_TIMES[op_tests/triton_tests/quant/test_fused_rms_gated_fp8_group_quant.py]=10
-    FILE_TIMES[op_tests/triton_tests/quant/test_quant_fp8_blockwise.py]=10
-    FILE_TIMES[op_tests/triton_tests/quant/test_quant_mxfp8.py]=10
-    FILE_TIMES[op_tests/triton_tests/test_fused_kda_decode_unified.py]=10
-    FILE_TIMES[op_tests/triton_tests/torch_compile/test_compile_gemm_a16w16.py]=10
-    FILE_TIMES[op_tests/triton_tests/gemm/fused/test_fused_gemm_a8w8_blockscale_split_cat.py]=9
-    FILE_TIMES[op_tests/triton_tests/attention/test_sparse_mla_dsv4_train.py]=8
-    FILE_TIMES[op_tests/triton_tests/fusions/test_fused_qk_concat.py]=8
-    FILE_TIMES[op_tests/triton_tests/attention/test_extend_attention.py]=7
-    FILE_TIMES[op_tests/triton_tests/attention/test_prefill_attention.py]=7
-    FILE_TIMES[op_tests/triton_tests/conv/test_causal_conv1d_update_single_token.py]=7
-    FILE_TIMES[op_tests/triton_tests/normalization/test_fused_add_rmsnorm_pad.py]=7
-    FILE_TIMES[op_tests/triton_tests/fusions/test_fused_mul_add.py]=6
-    FILE_TIMES[op_tests/triton_tests/quant/test_quant.py]=6
-    FILE_TIMES[op_tests/triton_tests/torch_compile/test_compile_moe_routing.py]=6
-    FILE_TIMES[op_tests/triton_tests/test_topk.py]=5
-    FILE_TIMES[op_tests/triton_tests/torch_compile/test_compile_activation.py]=5
-    FILE_TIMES[op_tests/triton_tests/attention/test_sparse_attention_dsv4_bwd.py]=4
-    FILE_TIMES[op_tests/triton_tests/fusions/test_fused_rmsnorm_indexed_adaln.py]=4
-    FILE_TIMES[op_tests/triton_tests/test_softmax.py]=4
-    FILE_TIMES[op_tests/triton_tests/torch_compile/test_compile_fused_mul_add.py]=4
-    FILE_TIMES[op_tests/triton_tests/torch_compile/test_compile_quant_per_token.py]=4
-    FILE_TIMES[op_tests/triton_tests/torch_compile/test_compile_rope.py]=4
-    FILE_TIMES[op_tests/triton_tests/torch_compile/test_compile_softmax.py]=4
-    FILE_TIMES[op_tests/triton_tests/moe/test_quant_moe.py]=3
-    FILE_TIMES[op_tests/triton_tests/quant/test_convert_mxfp8.py]=3
-    FILE_TIMES[op_tests/triton_tests/quant/test_quant_mxfp4.py]=3
-    FILE_TIMES[op_tests/triton_tests/test_cross_entropy.py]=3
-    FILE_TIMES[op_tests/triton_tests/torch_compile/test_compile_quant_per_tensor.py]=3
-    FILE_TIMES[op_tests/triton_tests/gemm/basic/test_gemm_afp8wfp8.py]=2
-    FILE_TIMES[op_tests/triton_tests/normalization/test_fused_rmsnorm_add.py]=2
-    FILE_TIMES[op_tests/triton_tests/quant/test_fast_transpose.py]=2
-    FILE_TIMES[op_tests/triton_tests/torch_compile/test_compile_rmsnorm.py]=2
-    FILE_TIMES[op_tests/triton_tests/attention/test_dsv4_indexer.py]=1
-    FILE_TIMES[op_tests/triton_tests/attention/test_hstu_attn.py]=1
-    FILE_TIMES[op_tests/triton_tests/fusions/test_fused_sigmoid_mul.py]=1
-    FILE_TIMES[op_tests/triton_tests/fusions/test_fused_silu_mul.py]=1
-    FILE_TIMES[op_tests/triton_tests/moe/test_moe_gemm_mxfp8.py]=1
-    FILE_TIMES[op_tests/triton_tests/moe/test_moe_gemm_per_token.py]=1
-    FILE_TIMES[op_tests/triton_tests/moe/test_moe_wgrad.py]=1
-    FILE_TIMES[op_tests/triton_tests/rope/test_fused_qk_norm_rope_cached.py]=1
-    FILE_TIMES[op_tests/triton_tests/test_common_utils.py]=1
-    FILE_TIMES[op_tests/triton_tests/test_kv_cache.py]=1
-    FILE_TIMES[op_tests/triton_tests/torch_compile/test_compile_constexpr_mutation.py]=1
-    FILE_TIMES[op_tests/triton_tests/torch_compile/test_compile_topk.py]=1
-    FILE_TIMES[op_tests/triton_tests/triton_metadata_redirect/test_metadata_redirect.py]=1
 fi
+
+if [[ ! -f "$TIMES_FILE" ]]; then
+    echo "Split test times file not found: $TIMES_FILE" >&2
+    exit 1
+fi
+
+while IFS=$'	' read -r file_path seconds || [[ -n "$file_path" ]]; do
+    [[ -z "$file_path" || "$file_path" == \#* ]] && continue
+    if [[ ! "$seconds" =~ ^[1-9][0-9]*$ ]]; then
+        echo "Invalid split test time in $TIMES_FILE: ${file_path}<TAB>${seconds}" >&2
+        exit 1
+    fi
+    FILE_TIMES["$file_path"]="$seconds"
+done < "$TIMES_FILE"
 
 get_time() {
     local abs="$1"
@@ -394,7 +140,7 @@ get_time() {
     if [[ -n "${FILE_TIMES[$abs]+x}" ]]; then
         seconds="${FILE_TIMES[$abs]}"
     else
-        seconds=15
+        seconds="${DEFAULT_TEST_TIME}"
     fi
 
     if [[ -n "${MEMORY_WEIGHT_FLOOR[$abs]+x}" && "$seconds" -lt "${MEMORY_WEIGHT_FLOOR[$abs]}" ]]; then
