@@ -27,7 +27,9 @@ WINDOWS_RDNA_TARGETS = {
     "gfx1101": 60,
     "gfx1102": 32,
     "gfx1103": 12,
+    "gfx1150": 16,
     "gfx1151": 40,
+    "gfx1200": 32,
     "gfx1201": 64,
 }
 
@@ -133,6 +135,8 @@ class TestWindowsRDNACKTargets(unittest.TestCase):
         for gfx, wgp_count, cu_count in (
             ("gfx1101", 30, 60),
             ("gfx1151", 20, 40),
+            ("gfx1150", 8, 16),
+            ("gfx1200", 16, 32),
             ("gfx1201", 32, 64),
         ):
             with self.subTest(gfx=gfx):

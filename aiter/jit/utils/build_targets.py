@@ -43,7 +43,9 @@ GFX_CU_NUM_MAP = {
     "gfx1101": 60,  # Radeon RX 7800 XT
     "gfx1102": 32,  # Radeon RX 7600
     "gfx1103": 12,  # Radeon 780M
+    "gfx1150": 16,  # Radeon 890M; set CU_NUM=12 for Radeon 880M
     "gfx1151": 40,  # Strix Halo / Radeon 8060S
+    "gfx1200": 32,  # Radeon RX 9060 XT; set CU_NUM=28 for Radeon RX 9060
     "gfx1201": 64,  # Radeon RX 9070 XT / Radeon AI PRO R9700
     "gfx1250": 256,  # Gfx1250
 }
