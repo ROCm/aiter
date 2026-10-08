@@ -50,12 +50,17 @@ def _inputs(q_dtype, kv_dtype, head_size):
     return q, kv
 
 
-def _mla_decode(q, kv_buffer, v_head_dim=KV_LORA_RANK):
+def _paging():
     """One query token per sequence over CTX_LEN cached tokens, page_size 1."""
     qo_indptr = torch.arange(BATCH + 1, dtype=torch.int, device="cuda")
     kv_indptr = qo_indptr * CTX_LEN
     kv_indices = torch.randperm(NUM_PAGE, device="cuda")[: BATCH * CTX_LEN].int()
     kv_last_page_lens = torch.ones(BATCH, dtype=torch.int, device="cuda")
+    return qo_indptr, kv_indptr, kv_indices, kv_last_page_lens
+
+
+def _mla_decode(q, kv_buffer, v_head_dim=KV_LORA_RANK):
+    qo_indptr, kv_indptr, kv_indices, kv_last_page_lens = _paging()
     one = torch.ones(1, dtype=torch.float, device="cuda")
     out = torch.empty(BATCH, NHEAD, v_head_dim, dtype=bf16, device="cuda")
     aiter.mla.mla_decode_fwd(
@@ -99,6 +104,43 @@ def test_rejects_v_head_dim_other_than_512():
     q, kv = _inputs(bf16, bf16, KV_LORA_RANK + QK_ROPE_HEAD_DIM)
     with pytest.raises(RuntimeError, match="v_head_dim 512"):
         _mla_decode(q, kv, v_head_dim=256)
+
+
+def test_rejects_split_buffer_other_than_512():
+    # mla_decode_fwd sizes splitData from the output, so only a direct call can
+    # pair a 512-wide output with a narrower splitData.
+    q, kv = _inputs(bf16, bf16, KV_LORA_RANK + QK_ROPE_HEAD_DIM)
+    qo_indptr, kv_indptr, kv_indices, kv_last_page_lens = _paging()
+    num_kv_splits, num_kv_splits_indptr = aiter.mla.get_meta_param(
+        None, BATCH, BATCH * CTX_LEN, NHEAD, 1, bf16
+    )
+    split_data = torch.empty(
+        BATCH, num_kv_splits, NHEAD, 256, dtype=torch.float, device="cuda"
+    )
+    split_lse = torch.empty(
+        BATCH, num_kv_splits, NHEAD, 1, dtype=torch.float, device="cuda"
+    )
+    out = torch.empty(BATCH, NHEAD, KV_LORA_RANK, dtype=bf16, device="cuda")
+    with pytest.raises(RuntimeError, match="splitData with v_head_dim 512"):
+        aiter.mla_decode_stage1_asm_fwd(
+            q,
+            kv,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_lens,
+            num_kv_splits_indptr=num_kv_splits_indptr,
+            work_meta_data=None,
+            work_indptr=None,
+            work_info_set=None,
+            max_seqlen_q=1,
+            page_size=1,
+            nhead_kv=1,
+            softmax_scale=SM_SCALE,
+            splitData=split_data,
+            splitLse=split_lse,
+            output=out,
+        )
 
 
 def test_rejects_byte_kv_without_rope():
