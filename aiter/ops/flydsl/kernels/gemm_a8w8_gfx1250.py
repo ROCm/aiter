@@ -111,6 +111,15 @@ def launch_gemm_a8w8(
     A_PAD_SPLIT = max(1, -(-A_TDM_ROW // _TDM_MAX_PAD_INTERVAL_BYTES))
     A_PAD_INTERVAL = A_TDM_ROW // A_PAD_SPLIT
     A_LDS_ROW = A_TDM_ROW + A_PAD_SPLIT * LDS_PAD_A
+    if A_PAD_SPLIT != 1:
+        # The tiled TDM atom spells padding as row slack in the LDS box layout, which is one
+        # pad per row. A_PAD_SPLIT > 1 (A_TDM_ROW over _TDM_MAX_PAD_INTERVAL_BYTES) would need
+        # several, so fail loudly rather than emit a box that disagrees with the MMA-side
+        # addressing at A_PAD_INTERVAL.
+        raise NotImplementedError(
+            f"[FlyDSL gfx1250] a8w8 tiled TDM needs A_PAD_SPLIT == 1, got {A_PAD_SPLIT} "
+            f"(A_TDM_ROW={A_TDM_ROW} > {_TDM_MAX_PAD_INTERVAL_BYTES})"
+        )
     B_LDS_ROW = tile_k * 16
     STAGE_A = ((A_LDS_ROWS * A_LDS_ROW + 15) // 16) * 16
     STAGE_B = (((tile_n // 16) * B_LDS_ROW + 15) // 16) * 16
@@ -193,6 +202,8 @@ def launch_gemm_a8w8(
         tid = fx.Int32(fx.thread_idx.x)
         bid_x, bid_y, bid_z = fx.block_idx
         kt_base = fx.Int64(bid_z) * fx.Int64(K_TILES) if split_k > 1 else None
+        # 新 tiled-TDM 的坐标索引是 tile 序号且必须是 i32(老接口的 imm_offset 是 i64 字节偏移)
+        kt_base_i32 = fx.Int32(bid_z) * fx.Int32(K_TILES) if split_k > 1 else None
         bz64 = fx.Int64(bid_z) if const_expr(batched) else None
         wave = rocdl.readfirstlane(T.i32, tid // WAVE)
         lane = tid % WAVE
@@ -210,7 +221,6 @@ def launch_gemm_a8w8(
         blk_m64 = fx.Int64(blk_m)
         blk_n64 = fx.Int64(blk_n)
         mn_oob = i32_m - blk_m  # valid M rows (A / C, and mx128's per-row A-scale)
-        a_oob = (mn_oob + 1) >> 1 if const_expr(a_preshuffle) else mn_oob
         nb_oob = stride_ask64 = sa_oob = None
         if const_expr(mx32):
             sa_oob = (i32_m + 31) // 32 - blk_m // 32  # valid M super-rows (scale-A)
@@ -244,39 +254,66 @@ def launch_gemm_a8w8(
         gC_base = fx.recast_iter(
             fx.PointerType.get(out_cls.ir_type, arg_c.address_space), arg_c
         )
-        a_off0 = blk_m64 * lda64
-        b_off0 = blk_n64 // 16 * (k64 * 16)
-        if const_expr(batched):
-            a_off0 = a_off0 + bz64 * k64
-            b_off0 = b_off0 + bz64 * fx.Int64(i32_n) * k64
-
         W_A, W_B = 0, 1
-        gA = _gv(gA_base, a_off0, (A_LDS_ROWS, A_TDM_ROW), (A_TDM_ROW, 1))
-        atomA = fx.atom_set_value(
-            fx.rocdl.make_tdm_atom(
-                gA,
-                [a_oob, None],
-                strides=[lda64 * A_PAIR, None],
-                num_warps=1,
-                pad_interval=A_PAD_INTERVAL,
-                pad_amount=LDS_PAD_A,
-                early_timeout=True,
-            ),
-            "workgroup_mask",
-            a_mask,
+        WARP1 = fx.make_layout(1, 1)  # single-warp TDM partition for the per-wave loads
+
+        # A: tiled-TDM atom over the FULL A tensor. The coordinate tensor picks this block's
+        # M-tile (bid_x) and keeps the K-tiles as its rest (replaces imm_offset); the LDS box
+        # carries an independent PIPE rest (num_buffers). Row slack in sA_box
+        # (A_LDS_ROW = A_TDM_ROW + LDS_PAD_A) encodes the old pad_interval/pad_amount, and
+        # M-OOB comes from the tensor extent + boundary_check. Batch stays in the base offset.
+        #
+        # A-preshuffle pairs two M rows into one TDM row (A_PAIR == 2), so the tiled view is
+        # over (ceil(M / A_PAIR), K * A_PAIR) with a matching row stride -- the same reshape the
+        # old atom spelled as extents=[a_oob, None] + strides=[lda64 * A_PAIR, None].
+        a_base_off = bz64 * k64 if const_expr(batched) else fx.Int64(0)
+        a_rows = i32_m if const_expr(A_PAIR == 1) else (i32_m + (A_PAIR - 1)) // A_PAIR
+        gA_full = _gv(
+            gA_base, a_base_off, (a_rows, i32_k * A_PAIR), (lda64 * A_PAIR, 1)
         )
-        gB = _gv(gB_base, b_off0, (tile_n // 16, tile_k * 16), (tile_k * 16, 1))
-        atomB = fx.atom_set_value(
-            fx.rocdl.make_tdm_atom(
-                gB,
-                [None, None],
-                strides=[k64 * 16, None],
-                num_warps=1,
-                early_timeout=True,
-            ),
-            "workgroup_mask",
-            b_mask,
+        sA_box = fx.make_layout((A_LDS_ROWS, A_TDM_ROW), (A_LDS_ROW, 1))
+        atomA, coordA = fx.rocdl.cdna5.make_tiled_tdm_atom(
+            fx.rocdl.TensorLoad(), gA_full, sA_box, (A_LDS_ROWS, A_TDM_ROW), num_warps=1
         )
+        atomA = fx.atom_set_value(atomA, "workgroup_mask", a_mask)
+        blkA = fx.zipped_divide(coordA, (A_LDS_ROWS, A_TDM_ROW))[None, (bid_x, None)]
+        sA_lds = fx.Tensor(
+            fx.make_view(
+                base_ptr,
+                fx.make_layout(
+                    ((A_LDS_ROWS, A_TDM_ROW), num_buffers), ((A_LDS_ROW, 1), PITCH)
+                ),
+            )
+        )
+        tAsA, tAgA = fx.rocdl.cdna5.tdm_partition(atomA, 0, WARP1, sA_lds, blkA)
+
+        # B: full (N//16, K*16) preshuffled tensor; block picks the N-tile (bid_y), K advances
+        # through the coordinate rest.
+        b_base_off = (
+            bz64 * fx.Int64(i32_n) * k64 if const_expr(batched) else fx.Int64(0)
+        )
+        gB_full = _gv(gB_base, b_base_off, (i32_n // 16, i32_k * 16), (k64 * 16, 1))
+        sB_box = fx.make_layout((tile_n // 16, tile_k * 16), (B_LDS_ROW, 1))
+        atomB, coordB = fx.rocdl.cdna5.make_tiled_tdm_atom(
+            fx.rocdl.TensorLoad(),
+            gB_full,
+            sB_box,
+            (tile_n // 16, tile_k * 16),
+            num_warps=1,
+        )
+        atomB = fx.atom_set_value(atomB, "workgroup_mask", b_mask)
+        blkB = fx.zipped_divide(coordB, (tile_n // 16, tile_k * 16))[
+            None, (bid_y, None)
+        ]
+        sB_lds = fx.Tensor(
+            fx.make_view(
+                fx.add_offset(base_ptr, STAGE_A),
+                fx.make_layout(
+                    ((tile_n // 16, tile_k * 16), num_buffers), ((B_LDS_ROW, 1), PITCH)
+                ),
+            )
+        )
+        tBsB, tBgB = fx.rocdl.cdna5.tdm_partition(atomB, 0, WARP1, sB_lds, blkB)
         W_SA = W_SB = gSA = atomSA = gSB = atomSB = sa_imm = sb_imm = None
         if const_expr(is_mxscale):
 
@@ -340,24 +377,11 @@ def launch_gemm_a8w8(
         def issue(s, kt):
             pa = _buf_ptr(s)
             ktg = fx.Int64(kt) if kt_base is None else fx.Int64(kt) + kt_base
-            _wcopy(
-                W_A,
-                atomA,
-                gA,
-                _lv(pa, (A_LDS_ROWS, A_TDM_ROW), (A_LDS_ROW, 1)),
-                ktg * A_TDM_ROW,
-            )
-            _wcopy(
-                W_B,
-                atomB,
-                gB,
-                _lv(
-                    fx.add_offset(pa, STAGE_A),
-                    (tile_n // 16, tile_k * 16),
-                    (B_LDS_ROW, 1),
-                ),
-                ktg * (tile_k * 16),
-            )
+            kti = fx.Int32(kt) if kt_base_i32 is None else fx.Int32(kt) + kt_base_i32
+            if wave == W_A:
+                fx.copy(atomA, tAgA[None, kti], tAsA[None, s])
+            if wave == W_B:
+                fx.copy(atomB, tBgB[None, kti], tBsB[None, s])
             if const_expr(is_mxscale and not preload):
                 _wcopy(
                     W_SA,
