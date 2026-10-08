@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Correctness test of the fused TP MegaMoE layer (a4w4, MXFP4, gfx950), torchrun only::
+"""Correctness test of the fused TP MegaMoE layer (a4w4, MXFP4, gfx950)::
 
-torchrun --nproc_per_node=4 op_tests/multigpu_tests/test_mega_moe_TP.py --models glm5
-torchrun --nproc_per_node=8 op_tests/multigpu_tests/test_mega_moe_TP.py --tokens 8 64
+    torchrun --nproc_per_node=4 op_tests/multigpu_tests/test_mega_moe_TP.py --models glm5
+    torchrun --nproc_per_node=8 op_tests/multigpu_tests/test_mega_moe_TP.py --tokens 8 64
+
+Run with plain ``python3`` (as CI does) it relaunches itself under torchrun on up to 8
+GPUs, or skips without >= 2 gfx950 GPUs.
 """
 
 from __future__ import annotations
@@ -11,6 +14,7 @@ from __future__ import annotations
 import argparse
 import gc
 import os
+import subprocess
 import sys
 import traceback
 from dataclasses import dataclass
@@ -21,6 +25,7 @@ import torch.distributed as dist
 import aiter
 from aiter import dtypes
 from aiter.fused_moe import torch_moe_stage1, torch_moe_stage2
+from aiter.ops.flydsl.kernels.mega_moe_tp.sp_rs_norm import SpRsNorm
 from aiter.ops.flydsl.mega_moe_tp import MegaMoeTP, MegaMoeTPConfig
 from aiter.ops.flydsl.moe_common import DEFAULT_SITUV2_BETA, DEFAULT_SITUV2_LINEAR_BETA
 from aiter.ops.shuffle import shuffle_weight
@@ -156,6 +161,9 @@ def route(rows, shape: ModelShape, kind: str, gen: torch.Generator, device):
         score = torch.randn((rows, E), device=device, generator=gen)
         if kind == "hot":
             score[:, E - K :] += 100.0
+        elif kind == "subset":
+            # ~55% of the experts: the LB row-block count lands in its mixed split
+            score[:, E * 35 // 64 :] = -1e4
     w, ids = torch.softmax(score, dim=-1).topk(K, dim=-1)
     w = w / w.sum(dim=-1, keepdim=True)
     return w.float().contiguous(), ids.to(torch.int32).contiguous()
@@ -266,7 +274,7 @@ class CaseFailure(AssertionError):
 
 
 def new_layer(
-    shape, wt, ctx, mode, max_local_tokens, comm_dtype="fp8", ar_gather="bf16"
+    shape, wt, ctx, mode, max_local_tokens, comm_dtype="fp8", ar_gather="bf16", **kw
 ):
     beta = situ(shape)
     cfg = MegaMoeTPConfig(
@@ -283,6 +291,7 @@ def new_layer(
         comm_mode=mode,
         comm_dtype=comm_dtype,
         ar_gather=ar_gather,
+        **kw,
     )
     return MegaMoeTP(
         cfg,
@@ -382,8 +391,11 @@ def case_out(shape, wt, ctx, args, mode):
 
 def case_graph(shape, wt, ctx, args, mode):
     layer = new_layer(shape, wt, ctx, mode, args.max_local_tokens)
-    c = make_case(shape, wt, ctx, mode, 16 * ctx.world, "random", 3)
-    eager = call(layer, c).clone()
+    cases = [
+        make_case(shape, wt, ctx, mode, 16 * ctx.world, "random", s) for s in (3, 4, 5)
+    ]
+    eager = [call(layer, c).clone() for c in cases]
+    c = Case(cases[0].x.clone(), cases[0].w.clone(), cases[0].ids.clone(), None)
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
@@ -395,17 +407,151 @@ def case_graph(shape, wt, ctx, args, mode):
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
         out = layer(c.x, c.w, c.ids)
-    for _ in range(20):
+    same = True
+    for i in range(12):
+        # every replay on new inputs: stale peer data would show
+        k = i % len(cases)
+        for dst, src in ((c.x, cases[k].x), (c.w, cases[k].w), (c.ids, cases[k].ids)):
+            dst.copy_(src)
         g.replay()
+        same = same and torch.equal(out, eager[k])
     torch.cuda.synchronize()
-    flags = torch.tensor(
-        [layer.poll_errors(), int(not torch.equal(out, eager))], device=out.device
-    )
+    flags = torch.tensor([layer.poll_errors(), int(not same)], device=out.device)
     dist.all_reduce(flags, op=dist.ReduceOp.MAX)
     if flags[0]:
         raise CaseFailure(f"watchdog error during graph replay: {int(flags[0])}")
     if flags[1]:
         raise CaseFailure("graph replay != eager")
+
+
+def case_dynamic(shape, wt, ctx, args, mode, lb):
+    # dynamic schedule (lb: the large-batch one at its smallest row tile, which takes
+    # the mixed GEMM2 split); odd local token counts and a narrow routing
+    kw = {"lb_min": 1, "lb_mt": 3, "lb_mt_small": 3, "lb_npp": 2, "lb_q": 3}
+    kw = kw if lb else {}
+    layer = new_layer(
+        shape, wt, ctx, mode, args.max_local_tokens, schedule="dynamic", **kw
+    )
+    worst = 0.0
+    tokens = sorted({ctx.world, 3 * ctx.world, 33 * ctx.world, args.tokens[-1]})
+    for t in (t for t in tokens if t <= args.max_local_tokens * ctx.world):
+        for kind in ("random", "subset"):
+            c = make_case(shape, wt, ctx, mode, t, kind, args.seed + 3 * t)
+            y = call(layer, c).clone()
+            worst = max(worst, check(y, c, args.rtol, f"M={t} {kind}"))
+    return worst
+
+
+def ref_tail(y, res, nw, eps):
+    # res_out = y + res; this rank's FP8 rows + per-row scales of GemmaRMSNorm(res_out)
+    r = y.float() + res.float()
+    xn = r * torch.rsqrt(r.pow(2).mean(-1, keepdim=True) + eps) * (nw.float() + 1.0)
+    scale = xn.to(dtypes.bf16).float().abs().amax(-1).clamp_min(1e-10) / 448.0
+    return r.to(dtypes.bf16), xn, scale
+
+
+def case_tail(shape, wt, ctx, args):
+    # fused tail, in place as ATOM calls it: tail=(res, res, w)
+    layer = new_layer(
+        shape, wt, ctx, "ag_rs", args.max_local_tokens, schedule="dynamic", lb_min=1
+    )
+    eng = layer.engine
+    t = args.tokens[-1]
+    if not layer.tail_ok(t // ctx.world):
+        return "skipped (no tail at this size)"
+    c = make_case(shape, wt, ctx, "ag_rs", t, "random", 21)
+    gen = torch.Generator(device=ctx.device).manual_seed(77 + ctx.rank)
+    res = torch.randn(c.x.shape, generator=gen, device=ctx.device).to(dtypes.bf16)
+    nw = (0.1 * torch.randn((shape.model_dim,), device=ctx.device)).to(dtypes.bf16)
+    dist.broadcast(nw, src=0)
+    y0 = call(layer, c).clone()
+    r_ref, xn, s_ref = ref_tail(y0, res, nw, eng.tn_eps)
+    gather = []
+    for t_ in (xn, s_ref):
+        g = [torch.empty_like(t_) for _ in range(ctx.world)]
+        dist.all_gather(g, t_)
+        gather.append(torch.cat(g))
+    xn, s_ref = gather
+    fp8 = torch.float8_e4m3fn
+    q_ref = (xn.to(dtypes.bf16).float() / s_ref[:, None]).clamp(-448, 448).to(fp8)
+    e_ref = float((q_ref.float() * s_ref[:, None] - xn).norm() / xn.norm())
+    for bf16 in (False, True):
+        r = res.clone()
+        outs = layer(c.x, c.w, c.ids, tail=(r, r, nw), bf16=bf16)
+        torch.cuda.synchronize()
+        y, q, s = outs[:3]
+        e_q = float((q.view(fp8).float() * s[:, None] - xn).norm() / xn.norm())
+        bad = [
+            what
+            for what, ok in (
+                ("watchdog", not layer.poll_errors()),
+                ("y", torch.equal(y, y0)),
+                ("res_out", torch.equal(r, r_ref)),
+                (f"q rel {e_q:.4f} (fp8 {e_ref:.4f})", e_q < 1.05 * e_ref),
+                ("scale", float(((s - s_ref).abs() / s_ref).max()) < 1e-2),
+                ("bf16 rows", not bf16 or rel_l2(outs[3], xn) < 0.01),
+            )
+            if not ok
+        ]
+        if not ctx.all_ok(not bad):
+            raise CaseFailure(f"tail bf16={bf16}: {bad or 'other rank'}")
+    return e_q
+
+
+def case_sp_rs_norm(ctx, args):
+    """SpRsNorm (+ the fused router) vs torch, twice back to back on new inputs."""
+    H, eps = 6144, 1e-6
+    E, K, scale, shared_w = 128, 4, 2.0, 0.5
+    op = SpRsNorm(
+        H, args.tokens[-1], eps, device=ctx.device, router=(E, K, scale, shared_w)
+    )
+    gen = torch.Generator(device=ctx.device).manual_seed(7)
+    wg = (torch.randn((E, H), generator=gen, device=ctx.device) * H**-0.5 * 3).to(
+        dtypes.bf16
+    )
+    bias = (0.05 * torch.randn((E,), generator=gen, device=ctx.device)).float()
+    w = (0.1 * torch.randn((H,), generator=gen, device=ctx.device)).to(dtypes.bf16)
+    worst = 0.0
+    routed = args.tokens[-1] // (16 * ctx.world) * 16 * ctx.world
+    for tokens, rt in ((routed, True), (args.tokens[-1], False)) * 2:
+        m = tokens // ctx.world
+        g = torch.Generator(device=ctx.device).manual_seed(1000 + ctx.rank + tokens)
+        part = torch.randn((tokens, H), generator=g, device=ctx.device).to(dtypes.bf16)
+        res = torch.randn((tokens, H), generator=g, device=ctx.device).to(dtypes.bf16)
+        ids = torch.empty((m, K + 1), dtype=torch.int32, device=ctx.device)
+        tw = torch.empty((m, K + 1), dtype=torch.float32, device=ctx.device)
+        rt = (wg, bias, ids, tw) if rt and op.routes(tokens) else None
+        out, res_out = op(part, res, w, router=rt)
+        torch.cuda.synchronize()
+        tot = part.float()
+        dist.all_reduce(tot)
+        rows = slice(ctx.rank * m, (ctx.rank + 1) * m)
+        h = tot[rows] + res[rows].float()
+        ref = h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + eps) * (w.float() + 1)
+        e = max(rel_l2(res_out[rows], h), rel_l2(out[rows], ref))
+        worst = max(worst, e)
+        bad, info = op.poll_errors() or not e < 0.01, f"rel_l2={e:.4f}"
+        if rt is not None:
+            logits = (ref.to(dtypes.bf16).float() @ wg.float().t()).to(dtypes.bf16)
+            rid = torch.empty((m, K), dtype=torch.int32, device=ctx.device)
+            rtw = torch.empty((m, K), dtype=torch.float32, device=ctx.device)
+            aiter.topk_gating(rtw, rid, logits, bias, True, scale, score_func="sigmoid")
+            same = (ids[:, :K].sort(1).values == rid.sort(1).values).all(1)
+            mine = torch.gather(tw[:, :K], 1, ids[:, :K].argsort(1))
+            want = torch.gather(rtw, 1, rid.argsort(1))
+            e_w = ((mine - want).abs() / want.abs().clamp_min(1e-6))[same]
+            # bf16 logits: near-ties may pick another expert
+            st = torch.tensor([float(same.sum()), m], device=ctx.device)
+            dist.all_reduce(st)
+            e_w = float(e_w.max()) if e_w.numel() else 0.0
+            info += f" same experts {float(st[0] / st[1]):.3f} weight err {e_w:.1e}"
+            bad = bad or float(st[0] / st[1]) < 0.9 or e_w > 0.02
+            bad = bad or not bool(
+                (ids[:, K] == E).all() and (tw[:, K] == shared_w).all()
+            )
+        if not ctx.all_ok(not bad):
+            raise CaseFailure(f"M={tokens} router={rt is not None}: {info}")
+    return worst
 
 
 def case_masked(shape, wt, ctx, args, mode):
@@ -521,10 +667,14 @@ def run_model(name, ctx, args, results):
             ("new / freed layers", case_layers),
             ("out=", case_out),
             ("cuda graph", case_graph),
+            ("dynamic", lambda *a: case_dynamic(*a, lb=False)),
+            ("dynamic LB", lambda *a: case_dynamic(*a, lb=True)),
             ("masked ids", case_masked),
             ("m=0", case_empty),
         ):
             run(f"{name} {mode} {what}", ctx, results, fn, *common, mode)
+    if "ag_rs" in args.modes:
+        run(f"{name} ag_rs fused tail", ctx, results, case_tail, *common)
     run(f"{name} host validation", ctx, results, case_validation, *common)
     run(f"{name} cross-rank checks", ctx, results, case_checked, *common)
 
@@ -574,6 +724,7 @@ def main(argv=None) -> int:
         run_model(name, ctx, args, results)
         gc.collect()
         torch.cuda.empty_cache()
+    run("SpRsNorm (+ router)", ctx, results, case_sp_rs_norm, ctx, args)
 
     failed = [r for r in results if not r[1]]
     ctx.log(f"\n{len(results) - len(failed)}/{len(results)} passed")
@@ -584,5 +735,20 @@ def main(argv=None) -> int:
     return 1 if failed else 0
 
 
+def _relaunch() -> int:
+    """Plain ``python3`` run (CI): torchrun on up to 8 GPUs, or skip."""
+    from aiter.ops.flydsl.mega_moe_tp import mega_moe_tp_supported
+
+    n = torch.cuda.device_count()
+    if n < 2 or not mega_moe_tp_supported():
+        print("test_mega_moe_TP: skipped (needs >= 2 gfx950 GPUs)", flush=True)
+        return 0
+    n = 8 if n >= 8 else 4 if n >= 4 else 2
+    argv = sys.argv[1:] or ["--seeds", "2"]
+    cmd = [sys.executable, "-m", "torch.distributed.run", "--standalone"]
+    cmd += [f"--nproc_per_node={n}", os.path.abspath(__file__), *argv]
+    return subprocess.call(cmd)
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main() if "RANK" in os.environ else _relaunch())

@@ -387,6 +387,12 @@ def now():
     )
 
 
+def before(cur, target):
+    """cur has not reached target. Wrap-safe for int32 launch epochs (serial-number
+    order: correct while every compared flag is within 2**31 launches of target)."""
+    return (cur - target) < i32(0)
+
+
 def alive(t0):
     return (now() - t0) < fx.Int64(DEADLINE)
 
@@ -410,7 +416,7 @@ def spin0(L, lane, off, target):
 def poll_sys_ge(addr, target, nap=2):
     cur = g_ld_sys(addr)
     t0 = now()
-    while (cur < target) & alive(t0):
+    while before(cur, target) & alive(t0):
         rocdl.s_sleep(nap)
         cur = g_ld_sys(addr)
     return cur

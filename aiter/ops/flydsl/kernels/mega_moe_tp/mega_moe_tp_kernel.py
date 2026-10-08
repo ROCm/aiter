@@ -31,6 +31,7 @@ from .common import (
     alive,
     amax,
     asm,
+    before,
     bf16x8_to_f32,
     bld,
     bst,
@@ -99,10 +100,23 @@ __all__ = [
     "mega_moe_tp_shape_supported",
 ]
 
+# tokens per launch (all ranks) up to which the host may pick the dynamic schedule
 DYN_MAX, NCTA_MAX, NCK_MAX, NCHA_MAX = 256, 256, 64, 64
+# routing-meta flags per rank (one per sending CTA: m * topk <= 64 * NMETA_CAP)
+NMETA_CAP = 256
+# Flag arena (ints, written by peers, one writer each, values = launch epoch, compared
+# wrap-safe: see common.before):
+#   FLAG_RDY + c*MAX_TP + r              rank r pushed RS chunk c
+#   FLAG_AGM + r*NMETA + b               rank r's routing, CTA b's part
+#   FLAG_PRE + (g*MAX_TP + r)*NCTA + b   AR: rank r sent input group g of CTA b's rows
+#   FLAG_YAG + (c*MAX_TP + r)*NCTA + b   AR: rank r sent output chunk c of CTA b's rows
+#   FLAG_AGQ + q*MAX_TP + r              every CTA of rank r landed K-chunk q
+#                                        (per rank, not per row: per-row polls by
+#                                        every CTA flood the lines peers write)
+#   FLAG_TN + r*TN_MAX + i               tail (tn): rank r sent its output row i
 FLAG_RDY = 0
 FLAG_AGM = FLAG_RDY + MAX_TP * NCK_MAX
-FLAG_PRE = FLAG_AGM + MAX_TP * 32
+FLAG_PRE = FLAG_AGM + MAX_TP * NMETA_CAP
 PRE_CH = 4
 NPRE_MAX = 16
 FLAG_YAG = FLAG_PRE + NPRE_MAX * MAX_TP * NCTA_MAX
@@ -111,6 +125,9 @@ TN_MAX = 2048
 FLAG_TN = FLAG_AGQ + NCHA_MAX * MAX_TP
 FLAG_INTS = FLAG_TN + MAX_TP * TN_MAX
 
+# Local control ints. Polled/atomic counters sit on their own 128 B lines (stride
+# LRDY_STRIDE): same-line device atomics from every CTA serialize. Counters are reset
+# by their last arriver (a timed-out launch leaves residue: reset()).
 CTRL_ERR = 20
 CTRL_XF = 32
 ERR_FLAG, ERR_META, ERR_CHUNK, ERR_COMM, ERR_YAG = 1, 2, 4, 8, 16
@@ -130,6 +147,13 @@ CTRL_XES = CTRL_EPB + NCTA_MAX
 CTRL_AGX = CTRL_XES + N_XCD * LRDY_STRIDE
 CTRL_AGG = CTRL_AGX + NCHA_MAX * N_XCD * LRDY_STRIDE
 CTRL_CLM = CTRL_AGG + NCHA_MAX * LRDY_STRIDE
+# LB schedule: launches counted by CTRL_LBSEQ (bumped by CTA 0 once every CTA read it);
+# its parity picks the bank of the counters below, and every LB launch zeroes the other
+# bank for the next one.
+#   CTRL_LBR + (bank*N_XCD + x)*LRDY_STRIDE      CTAs of XCD x whose route list slice landed
+#   CTRL_COLC + (bank*NCK_MAX + c)*LRDY_STRIDE   GEMM2 units done of column group c
+#   CTRL_G1C + (bank*NCHLB_MAX + j)*G1C_STRIDE   GEMM1 pieces done of row chunk j
+#   CTRL_TNC + i                                 tail (tn): CTAs done with row i
 NCHLB_MAX = 2048
 G1C_STRIDE = 16
 CTRL_LBSEQ = CTRL_CLM + 2 * LRDY_STRIDE
@@ -138,6 +162,10 @@ CTRL_COLC = CTRL_LBR + 2 * N_XCD * LRDY_STRIDE
 CTRL_G1C = CTRL_COLC + 2 * NCK_MAX * LRDY_STRIDE
 CTRL_TNC = CTRL_G1C + 2 * NCHLB_MAX * G1C_STRIDE
 CTRL_INTS = CTRL_TNC + TN_MAX
+# units[u] = (expert, i0, icnt, kind); kind = type | groups << 8 | SIGNAL | slot << XQ_SHIFT
+#   UNIT_G1X: GEMM1 inter slice exporting its intermediate
+#   UNIT_G2COL: GEMM2 column slice (i0 = first group) importing it
+#   SIGNAL: the unit after which the CTA signals every chunk
 UNIT_REC = 8
 UNIT_FULL, UNIT_G2COL, UNIT_G1X = 0, 2, 3
 UNIT_SIGNAL = 1 << 16
@@ -264,24 +292,26 @@ def mega_moe_tp_consts(
     return c
 
 
+# LDS control slots (ints at L_CTL); NW-wide ones: C_DONE, C_ASEQ, C_AFREE, C_QBASE (one
+# per compute wave), C_MBOX (one per wave), C_UNIT (6: unit range + first record), C_CLAIM.
+# C_GEXP: routes key (expert + 1, plus the row chunk) held by L_RIX / L_WT / C_CNT.
 C_CNT, C_BARCNT, C_BARGEN, C_LRED, C_PULL, C_EPOCH, C_USEQ, C_UROWS = range(8)
 C_NSIG, C_LQ, C_LPUB, C_GEXP, C_DONE = range(8, 13)
 C_ASEQ, C_AFREE, C_QBASE, C_MBOX = 16, 20, 24, 28
 C_FBITS, C_AGK, C_CLS, C_YAGM, C_NCH, C_AGFREE, C_PLAN, C_NACT = range(36, 44)
 C_ARDY, C_DYNP, C_CDONE, C_COLJ, C_UNIT = range(44, 49)
 C_DXON, C_VBON, C_CLAIM, C_PRDY, C_FRDY, C_PBITS, C_RLAND = 54, 55, 56, 60, 61, 62, 63
+# C_XC..C_XC+C_XC_N: per-column-chunk counters of the static column-split schedule. The
+# LB schedule never runs column splits and reuses those slots (asserted in compile):
+#   C_LBB bank of this launch's LB counters, C_LBN route lists seen, C_G1FIN no more
+#   GEMM1 units, C_TNL tail row taken, C_G2*: GEMM2 prefetch ring (C_G2U: 2 x 4 ints),
+#   C_PFW: per compute wave, ring holds the next unit's first slots, C_LBJ2: first row
+#   chunk run as single-block pieces (LB mix), C_ZDONE: masked route rows zeroed.
 C_XC, C_XC_N, C_LBB, C_LBN, C_G1FIN, C_TNL = 64, 32, 64, 65, 67, 69
-C_G2RDY, C_G2FREE, C_G2END, C_G2V, C_G2U, C_G2LAST, C_G2VN, C_PFW = (
-    76,
-    77,
-    78,
-    79,
-    80,
-    88,
-    89,
-    90,
-)
-C_LBJ2, C_ZDONE, C_UL = 94, 95, 96
+C_G2RDY, C_G2FREE, C_G2END, C_G2V, C_G2U = 76, 77, 78, 79, 80
+C_G2LAST, C_G2VN, C_PFW, C_LBJ2, C_ZDONE = 88, 89, 90, 94, 95
+# per-CTA unit list (dynamic / LB): UL_MAX records of 4 ints
+C_UL = 96
 UL_MAX = (128 - C_UL) // 4
 
 
@@ -330,6 +360,41 @@ def compile_mega_moe_tp(
     lbpf: bool = False,
     lbp: int = 0,
 ):
+    """Build the launcher of one (shape, variant) instance; LaunchCfg (host) picks them.
+
+    ar: all-reduced output (every rank gets every token's sum); with xrep the input is
+        replicated (standard TP layer), without it each rank holds a bf16 partial of every
+        token (ar_ar: the input is reduce-scattered, then all-gathered as MXFP4).
+    xrep: every rank holds the same full input and routing of all tokens (each rank
+        quantizes and all-gathers its 1/tp of the rows); without ar the output is
+        reduce-scattered (rs).
+    dyn_e: dynamic schedule over the active experts (E = dyn_e), P equal inter pieces
+        each; piece k writes its GEMM2 partial into route region k.
+    npieces: static pieces per leftover expert (partials summed by the push).
+    xsplit / xrem / xw: static column split of leftover experts (GEMM1 slices per
+        expert, column-split experts, column-slice width in groups); xl / xl_s0: late
+        tokens (those routed to split experts) pushed in a second pass.
+    ll_rs: LL ReduceScatter packets; ll_route: LL route rows too.
+    comm_bf16: bf16 (not MXFP8) ReduceScatter / all-reduce partials (no LL).
+    ag8: all-reduce whose second hop carries MXFP8 rows (else bf16).
+    dx: (dynamic, LL route rows) when the units overflow the CTAs by at most half a
+        round, every unit only runs GEMM1 and exports its quantized intermediate; the
+        GEMM2 column halves are then claimed by whichever CTAs are free.
+    rch / nch: (dynamic) an expert routed by R tokens runs as ceil(R / rch) row chunks
+        (chunk c takes its tokens t with t % chunks == c); nch bounds the chunk table.
+    vb: (dynamic) weights of single-block units into VGPRs when the units are few.
+    a8: activations as MXFP8 (E4M3 + E8M0 per 32) instead of MXFP4.
+    lb: (dynamic, rch = 16 * MT) large batches in two phases without partial sums:
+        GEMM1 units (row chunk x inter piece) export their quantized intermediate; GEMM2
+        units (column group x row chunk) take the full inter dim and are claimed by
+        whichever CTA is free; a column chunk is pushed once all its units are done.
+        lbq: output column chunks per GEMM2 unit; lbpf: the A loader wave prefetches the
+        GEMM2 units; lbp: forced GEMM1 inter pieces (0: picked per batch).
+    tn: (ag_rs, lb) the next layer's input fused in: each output row r of this rank,
+        once final, becomes res_out[r] = y[r] + res_in[r] and the per-token FP8 quant of
+        GemmaRMSNorm(res_out[r]; w, tn_eps) (RMSNorm unless tn_gemma), gathered by every
+        rank into qall / sall; tn 2: the bf16 normed rows too (qall after the FP8 rows).
+    """
     DYN = dyn_e > 0
     CHUNK = DYN and rch > 0 and nch > 0
     if swiglu_limit is None:
@@ -362,15 +427,15 @@ def compile_mega_moe_tp(
     assert not (comm_bf16 and ll_rs)
     TB = 1 if DYN else max(1, (RED_INFLIGHT // 2 if NPC > 2 else RED_INFLIGHT) // TOPK)
     DYN_PS = [p for p in range(1, KS2 + 1) if KS2 % p == 0]
-    DLL = ll_rs and ll_route and (DYN or NPC == 1)
+    DLL = bool(ll_rs and ll_route and (DYN or NPC == 1))
     assert not DLL or route_fp8
     RREP = ar or xrep
     ZMA = lb and not RREP and not DLL
     AIN = ar and not xrep
     MLL = DLL and not RREP
     ARLL = DLL and ar
-    AG8 = ag8 and ar and not ARLL
-    VB = DYN and vb
+    AG8 = bool(ag8 and ar and not ARLL)
+    VB = bool(DYN and vb)
 
     def _g2_step(n):
         nsk2 = _nsk2_for(n, G2)
@@ -379,7 +444,7 @@ def compile_mega_moe_tp(
     DX_STEP = math.lcm(*[_g2_step(KS2 // q) for q in DYN_PS]) if DYN else G2
     DX_CG = ceildiv((G2 + 1) // 2, DX_STEP) * DX_STEP
     DX_NG = ceildiv(G2, DX_CG)
-    DX = dx and DYN and DLL and KS2 <= XQ_P and G2 % DX_STEP == 0
+    DX = bool(dx and DYN and DLL and KS2 <= XQ_P and G2 % DX_STEP == 0)
     XSPLIT = xsplit > 0
     assert not XSPLIT or (xw % gemm2_group_step(H, I) == 0 and xw % GPC == 0)
     assert xsplit <= XQ_P
@@ -388,6 +453,11 @@ def compile_mega_moe_tp(
     NV = 2 * NCK if xl else NCK
     assert NV <= 31
     TPC = tp
+    # routing-meta flag slots per rank: one per sending CTA (64 lanes x 4 routes each)
+    NMETA = max(32, 1 << (ceildiv(TMAX // tp * TOPK, 256) - 1).bit_length())
+    assert NMETA <= NMETA_CAP, "m * topk > 64 * NMETA_CAP"
+    # the LB schedule reuses the column-split counters C_XC.. for its own slots
+    assert not (lb and xsplit)
     assert not a8 or (DYN and not DX and not XSPLIT)
     assert not lb or (CHUNK and not ll_rs and not XSPLIT and not a8 and rch == RG)
     assert not lb or nch <= NCHLB_MAX
@@ -404,13 +474,24 @@ def compile_mega_moe_tp(
     LB_PS = [p for p in range(1, KS2 + 1) if KS2 % p == 0]
     if lbp and lbp in LB_PS:
         LB_PS = [lbp]
-    LBMIX = lb and MT <= 3 and len(LB_PS) > 1 and 2 in LB_PS and KS2 % 2 == 0
+    # LB mix: one round of 2-piece GEMM1 units; the chunks past it run as KS2 single-block
+    # pieces, H2 = KS2 // 2 (one 2-piece unit's work) on each CTA without a unit, one more
+    # on the first H2 * X CTAs
+    H2 = KS2 // 2
+    LBMIX = (
+        lb
+        and MT <= 3
+        and len(LB_PS) > 1
+        and 2 in LB_PS
+        and KS2 % 2 == 0
+        and H2 < UL_MAX
+    )
     LBMIX_DIV = 4
     XLPR = (256 if a8 else 128) // 16
     assert agr <= 64 // XLPR
     AUX_RT = AUX_SYS if lb else AUX_SC1
     ADEPTH = min(ALOAD_DEPTH, NAB - 1) if lb and NAB > 3 else ALOAD_DEPTH
-    LBPF = lb and c["B1_FITS"] and lbpf
+    LBPF = bool(lb and c["B1_FITS"] and lbpf)
     MTSKIP = lb and MT >= 4 and not VB
     name = (
         f"mega_moe_tp_fused_h{H}_i{I}_e{E}_k{TOPK}_mt{MT}_t{TMAX}_{act}"
@@ -570,7 +651,7 @@ def compile_mega_moe_tp(
     def spin_sys_ge(addr, target, a=None):
         cur = poll_sys_ge(addr, target)
         if const_expr(a is not None):
-            _report_if(a, cur < target, ERR_FLAG)
+            _report_if(a, before(cur, target), ERR_FLAG)
 
     def masked(e):
         return fx.Int32(e).bitcast(fx.Uint32) >= fx.Uint32(E)
@@ -636,9 +717,9 @@ def compile_mega_moe_tp(
                             & (fx.Int32(vs[x][j]) == expert)
                             & _in_chunk(idx, chunk)
                         )
-                        pos, n = wave_rank(hit)
+                        pos, cnt = wave_rank(hit)
                         hits.append((hit, run + pos, idx, ws[x][j]))
-                        run = run + n
+                        run = run + cnt
                 base = _wave_claim(L, tid, run)
                 for hit, pos, idx, wv in hits:
                     slot = base + pos
@@ -1222,10 +1303,27 @@ def compile_mega_moe_tp(
             )
 
     @traced
-    def gemm2(L, tid, a, expert, ks0, r0, rows, *args, **kw):
-        kw.setdefault("span", G2 if len(args) == 3 else None)
-        g = functools.partial(_gemm2, L, tid, a, expert, ks0, r0, rows, *args, **kw)
-        if const_expr(VB and kw["span"] is not None):
+    def gemm2(
+        L, tid, a, expert, ks0, r0, rows, signal, NKS, pidx, gi_lo=None, *args, **kw
+    ):
+        kw.update({"span": G2} if gi_lo is None else {})  # whole column range
+        g = functools.partial(
+            _gemm2,
+            L,
+            tid,
+            a,
+            expert,
+            ks0,
+            r0,
+            rows,
+            signal,
+            NKS,
+            pidx,
+            gi_lo,
+            *args,
+            **kw,
+        )
+        if const_expr(VB and kw.get("span") is not None):
             if lds_ld_i32(L, L_CTL + C_VBON * 4) != i32(0):
                 g(vb2=True)
             else:
@@ -2110,7 +2208,7 @@ def compile_mega_moe_tp(
                 X = i32(2) * nun - C
                 K = ceildiv(X, i32(2))
                 M = i32(2) * (nun - K)
-                mix = (X > i32(0)) & (X <= C // i32(LBMIX_DIV)) & (i32(3) * X <= M)
+                mix = (X > i32(0)) & (X <= C // i32(LBMIX_DIV)) & (i32(H2) * X <= M)
                 P = mix.select(i32(2), P)
                 U = mix.select(i32(0), U)
                 J2 = mix.select(nun - K, nun)
@@ -2167,8 +2265,8 @@ def compile_mega_moe_tp(
             )
             lds_st(L, L_CTL + (C_UNIT + 1) * 4, i32(1))
         else:
-            for k in range_constexpr(3):
-                f = (r - M) * i32(3) + i32(k)
+            for k in range_constexpr(H2):
+                f = (r - M) * i32(H2) + i32(k)
                 j = J2 + f // i32(KS2)
                 s_ = f - (j - J2) * i32(KS2)
                 _lb_ul(
@@ -2179,9 +2277,9 @@ def compile_mega_moe_tp(
                     i32(128),
                     i32(UNIT_G1X) | (s_ << i32(8)) | (j << i32(XQ_SHIFT)),
                 )
-            lds_st(L, L_CTL + (C_UNIT + 1) * 4, i32(3))
-        if r < i32(3) * X:
-            f = (C - M) * i32(3) + r
+            lds_st(L, L_CTL + (C_UNIT + 1) * 4, i32(H2))
+        if r < i32(H2) * X:
+            f = (C - M) * i32(H2) + r
             j = J2 + f // i32(KS2)
             s_ = f - (j - J2) * i32(KS2)
             nn = lds_ld_i32(L, L_CTL + (C_UNIT + 1) * 4)
@@ -3014,7 +3112,7 @@ def compile_mega_moe_tp(
                 + bid
             )
             f = fx.Int32(bld(rf, idx * i32(4), 0, T.i32, AUX_SYS))
-            pend = fx.max(pend, (ok & (f < epoch)).select(i32(1), i32(0)))
+            pend = fx.max(pend, (ok & before(f, epoch)).select(i32(1), i32(0)))
         return wave_red(pend, lane, fx.max)
 
     @traced
@@ -3070,7 +3168,12 @@ def compile_mega_moe_tp(
         c = fx.min(lane, i32(NV - 1))
         live = lane < i32(NV)
         v = g_ld_sys(lrdy_at(a, c))
-        pm = i32(fx.Int64(rocdl.ballot(T.i64, live & (v >= epoch))) & fx.Int64(VMASK))
+        pm = i32(
+            fx.Int64(
+                rocdl.ballot(T.i64, live & (before(v, epoch) == fx.Boolean(False)))
+            )
+            & fx.Int64(VMASK)
+        )
         fm = i32(
             fx.Int64(rocdl.ballot(T.i64, live & _final_ready(a, c, epoch)))
             & fx.Int64(VMASK)
@@ -3133,7 +3236,7 @@ def compile_mega_moe_tp(
         r1 = fx.Boolean(True)
         for p in range_constexpr(MAX_TP):
             f = fx.Int32((fl if p < 4 else fh)[p % 4])
-            r1 = r1 & ((i32(p) >= a["tp"]) | (f >= epoch))
+            r1 = r1 & ((i32(p) >= a["tp"]) | (before(f, epoch) == fx.Boolean(False)))
         return r1
 
     @traced
@@ -3336,7 +3439,6 @@ def compile_mega_moe_tp(
     assert AG_SCB + agr * (H // 32) <= L_INTERS - L_INTER + RG * (I // 32)
     NCHA = H // 256
     assert ceildiv(NCHA, PRE_CH) <= NPRE_MAX
-    NMETA_MAX = 32
     AG_WIN = max(1, 64 // TPC)
 
     def ag_split(a):
@@ -3466,7 +3568,7 @@ def compile_mega_moe_tp(
         live = (lane < i32(TPC)) & (lane != a["rank"])
         poll_zero(
             lambda: wave_red(
-                (live & (g_ld_sys(addr) < a["epoch"])).select(i32(1), i32(0)),
+                (live & before(g_ld_sys(addr), a["epoch"])).select(i32(1), i32(0)),
                 lane,
                 fx.max,
             ),
@@ -3639,7 +3741,7 @@ def compile_mega_moe_tp(
                 bst(wte, rw, eo, 0, AUX_SYS)
             wait_vm(0)
             if lane == i32(0):
-                fo = (i32(FLAG_AGM) + a["rank"] * i32(32) + bid) * i32(4)
+                fo = (i32(FLAG_AGM) + a["rank"] * i32(NMETA) + bid) * i32(4)
                 bst(a["epoch"], own_rs(a, "off_flag"), fo, 0, AUX_SYS)
                 for p in range_constexpr(TPC):
                     if i32(p) != a["rank"]:
@@ -3679,15 +3781,17 @@ def compile_mega_moe_tp(
         rf = own_rs(a, "off_flag")
         nmeta = _ag_nmeta(a)
         pend = i32(0)
-        for it in range_constexpr(MAX_TP * NMETA_MAX // 64):
+        for it in range_constexpr(MAX_TP * NMETA // 64):
             e = i32(it * 64) + lane
-            p = e // i32(NMETA_MAX)
-            j = e - p * i32(NMETA_MAX)
+            p = e // i32(NMETA)
+            j = e - p * i32(NMETA)
             ok = ((p == a["rank"]) if own else (p < a["tp"])) & (j < nmeta)
             f = fx.Int32(
-                bld(rf, (i32(FLAG_AGM) + p * i32(32) + j) * i32(4), 0, T.i32, AUX_SYS)
+                bld(
+                    rf, (i32(FLAG_AGM) + p * i32(NMETA) + j) * i32(4), 0, T.i32, AUX_SYS
+                )
             )
-            pend = fx.max(pend, (ok & (f < epoch)).select(i32(1), i32(0)))
+            pend = fx.max(pend, (ok & before(f, epoch)).select(i32(1), i32(0)))
         return wave_red(pend, lane, fx.max)
 
     @traced
@@ -3706,7 +3810,7 @@ def compile_mega_moe_tp(
             src = e % i32(TPC)
             idx = i32(FLAG_AGQ) + fx.min(cc, i32(NCH - 1)) * i32(MAX_TP) + src
             f = fx.Int32(bld(rf, idx * i32(4), 0, T.i32, AUX_SYS))
-            first = fx.min(first, ((cc < end) & (f < epoch)).select(cc, end))
+            first = fx.min(first, ((cc < end) & before(f, epoch)).select(cc, end))
         return wave_red(first, lane, fx.min)
 
     @traced
@@ -4048,7 +4152,7 @@ def compile_mega_moe_tp(
             )
             poll_zero(
                 lambda: wave_red(
-                    (live & (g_ld_sys(addr) < a["epoch"])).select(i32(1), i32(0)),
+                    (live & before(g_ld_sys(addr), a["epoch"])).select(i32(1), i32(0)),
                     tid,
                     fx.max,
                 ),
@@ -4209,7 +4313,6 @@ def compile_mega_moe_tp(
         mega_moe_tp_kernel
     )
 
-    @flyc.jit
     def launch(
         w1: fx.Int64,
         w1s: fx.Int64,
@@ -4261,4 +4364,7 @@ def compile_mega_moe_tp(
             grid=(fx.Int64(i32_grid), 1, 1), block=(NTT, 1, 1), stream=stream
         )
 
-    return launch
+    # launch forwards its arguments to the kernel by name
+    if list(inspect.signature(launch).parameters) != kargs + ["i32_grid", "stream"]:
+        raise ValueError("compile_mega_moe_tp: kernel and launch signatures differ")
+    return flyc.jit(launch)

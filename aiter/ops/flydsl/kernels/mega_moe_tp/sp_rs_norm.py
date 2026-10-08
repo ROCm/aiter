@@ -16,15 +16,17 @@ from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
 from ..kernels_common import LOG2E, ceildiv
-from ..mxfp4_gemm_common import _fabs_f32
 from ..symmetric_arena import SymmetricArena
 from ..tensor_shim import _preload_compiled, _run_compiled
 from .common import (
     AUX_SYS,
     MAX_TP,
+    amax,
+    before,
     bf16x8_to_f32,
     bld,
     bst,
+    g_or_agent,
     g_st_sys,
     gptr,
     i32,
@@ -33,6 +35,7 @@ from .common import (
     pack_bf16x8,
     poll_sys_ge,
     rsrc,
+    sum_live,
     traced,
     uni,
     wave_red,
@@ -40,7 +43,6 @@ from .common import (
 
 __all__ = ["SpRsNorm"]
 
-NB = 256
 NTH = 256
 KS_MAX = 16
 const_expr = fx.const_expr
@@ -62,7 +64,10 @@ def compile_sp_rs_norm(
     shared_w: float = 0.0,
     gemma: bool = True,
     logit_bf16: bool = True,
+    nb: int = 256,
 ):
+    NB = nb  # CTAs: one per CU
+    ERR = NB + ROWF + NRT_MAX * KS_MAX  # ctrl: sticky watchdog bit
     RT = E > 0
     EPL = E // 64
     assert not RT or (E % 64 == 0 and EPL in (2, 4) and topk <= 64)
@@ -81,6 +86,7 @@ def compile_sp_rs_norm(
         + (f"_rt{E}k{topk}s{fbits(scale)}w{fbits(shared_w)}" if RT else "")
         + ("" if gemma else "_rms")
         + ("_lf32" if RT and not logit_bf16 else "")
+        + (f"_nb{NB}" if NB != 256 else "")
     )
 
     def i8x4_pack(f, inv):
@@ -111,6 +117,12 @@ def compile_sp_rs_norm(
 
     def lds_stf(L, off, v):
         lds_st(L, off, fx.Float32(v).bitcast(fx.Int32))
+
+    @traced
+    def wait_epoch(a, addr):
+        cur = poll_sys_ge(addr, a["epoch"], 1)
+        if before(cur, a["epoch"]):
+            g_or_agent(fx.Int64(a["ctrl"]) + fx.Int64(i32(ERR * 4)), i32(1))
 
     def zflag(a, rt, ks):
         return fx.Int64(a["ctrl"]) + fx.Int64(
@@ -159,7 +171,7 @@ def compile_sp_rs_norm(
             if tid < i32(ZT):
                 r = rt * i32(ZT) + tid
                 addr = fx.Int64(a["ctrl"]) + fx.Int64((i32(NB) + r) * i32(4))
-                poll_sys_ge(addr, a["epoch"], 1)
+                wait_epoch(a, addr)
             gpu.barrier()
 
             def step(acc, kc, bvs, row):
@@ -232,7 +244,7 @@ def compile_sp_rs_norm(
                 if lane == i32(0):
                     g_st_sys(zflag(a, rt, ks), a["epoch"])
                 if lane < KS:
-                    poll_sys_ge(zflag(a, rt, lane), a["epoch"], 1)
+                    wait_epoch(a, zflag(a, rt, lane))
             gpu.barrier()
             for rl_ in range(ks + w * KS, i32(ZT), KS * i32(NTH // 64)):
                 router_row(a, lane, rt, i32(rl_), KS)
@@ -384,9 +396,7 @@ def compile_sp_rs_norm(
                 f = bf16x8_to_f32(
                     bld(rp, (i * i32(H) + p * i32(8)) * i32(2), 0, T.vec(4, T.i32))
                 )
-                am = _fabs_f32(f[0])
-                for x in f[1:]:
-                    am = am.maximumf(_fabs_f32(x))
+                am = amax(f)
                 am = am.maximumf(am.shuffle_xor(i32(1), i32(64)))
                 am = am.maximumf(am.shuffle_xor(i32(2), i32(64)))
                 sc = am.maximumf(fx.Float32(1e-30)) / fx.Float32(127.0)
@@ -427,7 +437,7 @@ def compile_sp_rs_norm(
                 + fx.Int64((tid * i32(NB) + src_cta) * i32(4))
             )
             if tid != a["rank"]:
-                poll_sys_ge(addr, a["epoch"], 1)
+                wait_epoch(a, addr)
         gpu.barrier()
 
     @traced
@@ -447,9 +457,8 @@ def compile_sp_rs_norm(
             g = a["rank"] * m + r
             fs = []
             ss = fx.Float32(0.0)
-            act = tid < i32(NTH)
             for k in range_constexpr(PIT):
-                p = fx.min(tid, i32(NTH - 1)) + i32(k * NTH)
+                p = tid + i32(k * NTH)
                 off = (g * i32(H) + p * i32(8)) * i32(2)
                 f = bf16x8_to_f32(bld(rp, off, 0, T.vec(4, T.i32)))
                 rv = bf16x8_to_f32(bld(rr, off, 0, T.vec(4, T.i32)))
@@ -471,33 +480,31 @@ def compile_sp_rs_norm(
                         )
                     ).bitcast(fx.Float32)
                     v = i8x4_unpack(d[0], sc) + i8x4_unpack(d[1], sc)
-                    f = [x + live.select(y, fx.Float32(0.0)) for x, y in zip(f, v)]
-                if act:
-                    bst(pack_bf16x8(f), ro, off, 0)
+                    f = sum_live(f, v, live)
+                bst(pack_bf16x8(f), ro, off, 0)
                 for x in f:
-                    ss = ss + act.select(x * x, fx.Float32(0.0))
+                    ss = ss + x * x
                 fs.append(f)
             tot = blk_sum(L, tid, ss)
             rcp = fx.Float32(
                 fmath.rsqrt(tot / fx.Float32(float(H)) + fx.Float32(float(eps)))
             )
             for k in range_constexpr(PIT):
-                p = fx.min(tid, i32(NTH - 1)) + i32(k * NTH)
+                p = tid + i32(k * NTH)
                 off = (g * i32(H) + p * i32(8)) * i32(2)
                 wv = bf16x8_to_f32(bld(rw, p * i32(16), 0, T.vec(4, T.i32)))
-                if act:
-                    bst(
-                        pack_bf16x8(
-                            [
-                                x * rcp * ((w + fx.Float32(1.0)) if gemma else w)
-                                for x, w in zip(fs[k], wv)
-                            ]
-                        ),
-                        rout,
-                        off,
-                        0,
-                        AUX_SYS if RT else 0,
-                    )
+                bst(
+                    pack_bf16x8(
+                        [
+                            x * rcp * ((w + fx.Float32(1.0)) if gemma else w)
+                            for x, w in zip(fs[k], wv)
+                        ]
+                    ),
+                    rout,
+                    off,
+                    0,
+                    AUX_SYS if RT else 0,
+                )
             if const_expr(RT):
                 rocdl.s_waitcnt(vmcnt=0)
                 gpu.barrier()
@@ -526,6 +533,7 @@ def compile_sp_rs_norm(
         off_x: fx.Int64,
         off_s: fx.Int64,
         off_f: fx.Int64,
+        xbank: fx.Int64,
         rank: fx.Int32,
         m: fx.Int32,
         wg: fx.Int64,
@@ -552,8 +560,10 @@ def compile_sp_rs_norm(
             "w": w,
             "peer": peers,
             "mine": fx.Int64(mine),
-            "off_x": off_x,
-            "off_s": off_s,
+            # receive buffers double-buffered by launch parity: a peer's next launch
+            # never overwrites the rows this one still reads
+            "off_x": off_x + fx.Int64(epoch & i32(1)) * xbank,
+            "off_s": off_s + fx.Int64(epoch & i32(1)) * (xbank // fx.Int64(8)),
             "off_f": off_f,
             "rank": rank,
             "m": m,
@@ -595,6 +605,7 @@ def compile_sp_rs_norm(
         off_x: fx.Int64,
         off_s: fx.Int64,
         off_f: fx.Int64,
+        xbank: fx.Int64,
         rank: fx.Int32,
         m: fx.Int32,
         wg: fx.Int64,
@@ -622,6 +633,7 @@ def compile_sp_rs_norm(
             off_x,
             off_s,
             off_f,
+            xbank,
             rank,
             m,
             wg,
@@ -635,7 +647,15 @@ def compile_sp_rs_norm(
 
 
 class SpRsNorm:
-    """forward(part, res, w[, router]) -> (out, res_out) for this rank's rows."""
+    """forward(part, res, w[, router]) -> (out, res_out) for this rank's rows.
+
+    part / res: bf16 [T, H] (T = tp * m; this rank's partial of every token and the
+    residual), w: bf16 [H]; out / res_out: bf16 [T, H], rows rank*m:(rank+1)*m written.
+    router = (E, topk, scale, shared_w) at construction; forward(router=(wg, bias, ids,
+    tw)): wg bf16 [E, H], bias fp32 [E], ids int32 / tw fp32 [>= m, topk + 1] (the last
+    column is the shared expert E). A collective like MegaMoeTP (see its contract): a wait
+    that times out sets error_flag(); reset() (collective) restarts the state.
+    """
 
     def __init__(
         self,
@@ -657,35 +677,52 @@ class SpRsNorm:
         self.group = group
         self.tp = dist.get_world_size(group)
         self.rank = dist.get_rank(group)
-        assert self.tp <= MAX_TP
         mmax = ceildiv(int(max_tokens), self.tp)
         self.mmax = mmax
         self.router = router
         E = int(router[0]) if router else 0
-        assert not router or mmax // ZT <= NRT_MAX
+        topk = int(router[1]) if router else 0
+        self.nb = int(torch.cuda.get_device_properties(device).multi_processor_count)
+        bad = []
+        if self.tp > MAX_TP:
+            bad.append(f"tp <= {MAX_TP}")
+        if self.H % (8 * NTH):
+            bad.append(f"hidden % {8 * NTH} == 0")
+        if router and (E not in (128, 256) or not 0 < topk < 64):
+            bad.append("router experts in (128, 256) and 0 < topk < 64")
+        if router and mmax // ZT > NRT_MAX:
+            bad.append(f"router: max_tokens / tp <= {NRT_MAX * ZT}")
+        if bad:
+            raise ValueError(f"SpRsNorm h{self.H} tp{self.tp}: need " + ", ".join(bad))
+        self._xbank = self.tp * mmax * self.H
         arena = SymmetricArena(group=group, device=device)
-        self._x = arena.reserve("x", (self.tp * mmax * self.H,), torch.uint8)
-        self._s = arena.reserve("s", (self.tp * mmax * self.H // 32 * 4,), torch.uint8)
-        self._f = arena.reserve("f", (MAX_TP * NB,), torch.int32)
+        self._x = arena.reserve("x", (2 * self._xbank,), torch.uint8)
+        self._s = arena.reserve("s", (2 * self._xbank // 8,), torch.uint8)
+        self._f = arena.reserve("f", (MAX_TP * self.nb,), torch.int32)
         arena.commit()
         self.arena = arena
-        self.ctrl = torch.zeros(
-            NB + ROWF + NRT_MAX * KS_MAX, dtype=torch.int32, device=device
-        )
+        self._err = self.nb + ROWF + NRT_MAX * KS_MAX
+        self.ctrl = torch.zeros(self._err + 1, dtype=torch.int32, device=device)
         self._zp = torch.empty(
             (NRT_MAX * KS_MAX * ZT * max(E, 1),) if router else (1,),
             dtype=torch.float32,
             device=device,
         )
-        self._fn = compile_sp_rs_norm(self.H, self.tp, self.eps, gemma=bool(gemma))
+        self._fn = compile_sp_rs_norm(
+            self.H, self.tp, self.eps, gemma=bool(gemma), nb=self.nb
+        )
         self._fn_rt = (
             compile_sp_rs_norm(
                 self.H,
                 self.tp,
                 self.eps,
-                *[int(router[0]), int(router[1]), float(router[2]), float(router[3])],
+                E,
+                topk,
+                float(router[2]),
+                float(router[3]),
                 gemma=bool(gemma),
                 logit_bf16=bool(logit_bf16),
+                nb=self.nb,
             )
             if router
             else None
@@ -693,6 +730,7 @@ class SpRsNorm:
         self._armed = set()
 
     def routes(self, tokens: int) -> bool:
+        """forward(router=...) runs for this batch."""
         m = tokens // self.tp
         return (
             self._fn_rt is not None
@@ -701,20 +739,48 @@ class SpRsNorm:
             and 0 < m <= self.mmax
         )
 
+    def _check_args(self, part, res, w, out, res_out, router):
+        T, H = part.shape[0], self.H
+        if T % self.tp or not 0 < T // self.tp <= self.mmax:
+            raise ValueError(
+                f"SpRsNorm: {T} tokens: need tp | T and T / tp <= {self.mmax}"
+            )
+        for name, t, shp in (
+            ("part", part, (T, H)),
+            ("res", res, (T, H)),
+            ("out", out, (T, H)),
+            ("res_out", res_out, (T, H)),
+            ("w", w, (H,)),
+        ):
+            if (
+                tuple(t.shape) != shp
+                or t.dtype != torch.bfloat16
+                or not t.is_contiguous()
+            ):
+                raise ValueError(f"SpRsNorm: {name} needs contiguous bf16 {list(shp)}")
+        if router is not None:
+            if not self.routes(T):
+                raise ValueError(f"SpRsNorm: {T} tokens cannot route (tp * 16 | T)")
+            E, k1 = int(self.router[0]), int(self.router[1]) + 1
+            wg, bias, ids, tw = router
+            for name, t, dt, ok in (
+                ("wg", wg, torch.bfloat16, tuple(wg.shape) == (E, H)),
+                ("bias", bias, torch.float32, tuple(bias.shape) == (E,)),
+                ("ids", ids, torch.int32, ids.dim() == 2 and ids.shape[1] == k1),
+                ("tw", tw, torch.float32, tw.dim() == 2 and tw.shape[1] == k1),
+            ):
+                if not ok or t.dtype != dt or not t.is_contiguous():
+                    raise ValueError(f"SpRsNorm: router {name}: wrong shape / dtype")
+            if ids.shape[0] < T // self.tp or tw.shape[0] < T // self.tp:
+                raise ValueError("SpRsNorm: router ids / tw need >= tokens / tp rows")
+
     def forward(self, part, res, w, out=None, res_out=None, router=None):
-        Tt = part.shape[0]
-        assert Tt % self.tp == 0 and Tt // self.tp <= self.mmax
-        assert (
-            part.dtype == torch.bfloat16
-            and part.is_contiguous()
-            and res.is_contiguous()
-        )
-        m = Tt // self.tp
+        m = part.shape[0] // self.tp
         out = torch.empty_like(part) if out is None else out
         res_out = torch.empty_like(res) if res_out is None else res_out
+        self._check_args(part, res, w, out, res_out, router)
         peers = [int(b) for b in self.arena.base_ptrs] + [0] * (MAX_TP - self.tp)
         if router is not None:
-            assert self.routes(Tt)
             wg, bias, ids, tw = router
             rt = (wg.data_ptr(), bias.data_ptr(), ids.data_ptr(), tw.data_ptr())
             fn = self._fn_rt
@@ -732,6 +798,7 @@ class SpRsNorm:
             self._x.offset,
             self._s.offset,
             self._f.offset,
+            self._xbank,
             self.rank,
             m,
             *rt,
@@ -748,18 +815,52 @@ class SpRsNorm:
         return out, res_out
 
     def warm(self) -> None:
+        """Collective: compile and run once (eagerly; graph capture cannot), then
+        check every rank's watchdog (reset + retry once on a timeout)."""
         tp = self.tp
         rows = tp * ZT if self._fn_rt is not None else tp
         x = torch.zeros((rows, self.H), dtype=torch.bfloat16, device=self.device)
         w = torch.zeros((self.H,), dtype=torch.bfloat16, device=self.device)
-        self.forward(x, x.clone(), w)
-        if self._fn_rt is not None:
-            E, k = int(self.router[0]), int(self.router[1])
-            wg = torch.zeros((E, self.H), dtype=torch.bfloat16, device=self.device)
-            bias = torch.zeros((E,), dtype=torch.float32, device=self.device)
-            ids = torch.empty((ZT, k + 1), dtype=torch.int32, device=self.device)
-            tw = torch.empty((ZT, k + 1), dtype=torch.float32, device=self.device)
-            self.forward(x, x.clone(), w, router=(wg, bias, ids, tw))
+        for _ in range(2):
+            self.forward(x, x.clone(), w)
+            if self._fn_rt is not None:
+                E, k = int(self.router[0]), int(self.router[1])
+                dev = self.device
+                wg = torch.zeros((E, self.H), dtype=torch.bfloat16, device=dev)
+                bias = torch.zeros((E,), dtype=torch.float32, device=dev)
+                ids = torch.empty((ZT, k + 1), dtype=torch.int32, device=dev)
+                tw = torch.empty((ZT, k + 1), dtype=torch.float32, device=dev)
+                self.forward(x, x.clone(), w, router=(wg, bias, ids, tw))
+            torch.cuda.synchronize(self.device)
+            errs = [None] * tp
+            dist.all_gather_object(errs, self.poll_errors(), group=self.group)
+            if not any(errs):
+                return
+            self.reset()
+        raise RuntimeError(f"SpRsNorm.warm: launches timed out ({errs})")
+
+    def error_flag(self) -> torch.Tensor:
+        """Sticky watchdog bit (nonzero: a launch timed out) as a device tensor."""
+        return self.ctrl[self._err : self._err + 1]
+
+    def poll_errors(self) -> int:
+        return int(self.ctrl[self._err].item())
+
+    def check_errors(self) -> None:
+        if self.poll_errors():
+            self.ctrl[self._err] = 0
+            raise RuntimeError(
+                f"SpRsNorm rank {self.rank}: a wait timed out; the output is invalid "
+                "(ranks out of step need reset())"
+            )
+
+    def reset(self) -> None:
+        """Collective: drop the cross-rank state and restart the launch epochs."""
         torch.cuda.synchronize(self.device)
+        self.arena.barrier()
+        self.arena.storage.zero_()
+        self.ctrl.zero_()
+        torch.cuda.synchronize(self.device)
+        self.arena.barrier()
 
     __call__ = forward
