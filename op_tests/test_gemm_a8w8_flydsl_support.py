@@ -314,3 +314,7 @@ def test_flydsl_rdna3_a8w8_rejects_unaligned_input_base(monkeypatch, tensor_inde
     )
 
     assert _try_flydsl_rdna3_a8w8(*tensors, None, torch.bfloat16, None) is None
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-q"]))

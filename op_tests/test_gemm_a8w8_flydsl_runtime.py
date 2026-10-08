@@ -146,7 +146,7 @@ def _benchmark_shape(m, n, k, gemm_op_a8w8, gemm_a8w8_triton):
         "flydsl_warm_event_ms": flydsl_ms,
         "triton_warm_event_ms": triton_ms,
         "flydsl_over_triton_ratio": flydsl_ms / triton_ms,
-        "timed_calls_proven_flydsl": len(flydsl_dispatches),
+        "public_calls_proven_flydsl": len(flydsl_dispatches),
     }
 
 
