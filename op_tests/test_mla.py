@@ -121,6 +121,113 @@ def torch_mla_extend(
     return o, lse
 
 
+def test_mla_kv_address(metadata_fn=None):
+    """ROCm/aiter#5826: check BF16 KV rows around the 4 GiB boundary."""
+    mode = "persistent" if metadata_fn is not None else "stage1"
+    if not torch.cuda.is_available() or torch.version.hip is None:
+        print(f"SKIP {mode} KV addressing: requires a ROCm GPU")
+        return
+    if get_gfx() != "gfx942":
+        print(f"SKIP {mode} KV addressing: requires gfx942")
+        return
+
+    head_dim, value_dim = 576, 512
+    row_bytes = head_dim * 2
+    boundary_row = (1 << 32) // row_bytes
+    low_row, max_context = 1024, 256
+    rows = boundary_row + 1 + max_context
+    free_bytes, _ = torch.cuda.mem_get_info()
+    if free_bytes < rows * row_bytes + (1 << 30):
+        print(f"SKIP {mode} KV addressing: requires at least 5 GiB free")
+        return
+    # Wrapped addresses land in initialized storage, giving deterministic
+    # wrong values instead of depending on allocator contents or a fault.
+    kv_pool = torch.zeros(rows, 1, 1, head_dim, dtype=torch.bfloat16, device="cuda")
+    cases = [
+        ("below4g", boundary_row - 1, 1, 1),
+        ("straddling4g", boundary_row, 1, 1),
+        ("above4g", boundary_row + 1, 1, 1),
+        ("above4g-splitkv", boundary_row + 1, max_context, 4),
+    ]
+    failures = []
+    for (case, first_page, context, splits), heads in itertools.product(
+        cases, (16, 128)
+    ):
+        name = f"{case}-{mode}-{heads}"
+        generator = torch.Generator(device="cpu").manual_seed(42)
+        q_cpu = torch.randn(1, heads, head_dim, generator=generator, device="cpu").to(
+            torch.bfloat16
+        )
+        kv_cpu = torch.randn(context, head_dim, generator=generator, device="cpu").to(
+            torch.bfloat16
+        )
+        # Compute the golden result on CPU, independently of GPU page addressing.
+        scores = (q_cpu[0].float() @ kv_cpu.float().T) * (head_dim**-0.5)
+        reference = (torch.softmax(scores, dim=-1) @ kv_cpu[:, :value_dim].float())[
+            None
+        ]
+        q = q_cpu.cuda()
+        source = kv_cpu.cuda().view(context, 1, 1, head_dim)
+        kv_pool[low_row : low_row + context].copy_(source)
+        placed = kv_pool[first_page : first_page + context]
+        placed.copy_(source)
+        torch.testing.assert_close(placed.cpu().view_as(kv_cpu), kv_cpu, rtol=0, atol=0)
+
+        qo_indptr = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+        kv_indptr = torch.tensor([0, context], dtype=torch.int32, device="cuda")
+        last_page_lens = torch.ones(1, dtype=torch.int32, device="cuda")
+        kwargs = {"num_kv_splits": splits}
+        if metadata_fn is not None:
+            kwargs.update(
+                metadata_fn(heads, qo_indptr, kv_indptr, last_page_lens, splits)
+            )
+        else:
+            # Supply both values so the stage-1 heuristic cannot reduce the
+            # requested split count for the short regression sequence.
+            kwargs["num_kv_splits_indptr"] = torch.tensor(
+                [0, splits], dtype=torch.int32, device="cuda"
+            )
+
+        try:
+            for label, pool_view, page in (
+                ("low-offset control", kv_pool, low_row),
+                ("same-byte rebased control", placed, 0),
+                ("pool-global page indices", kv_pool, first_page),
+            ):
+                indices = torch.arange(
+                    page, page + context, dtype=torch.int32, device="cuda"
+                )
+                output = torch.full(
+                    (1, heads, value_dim),
+                    float("nan"),
+                    dtype=torch.bfloat16,
+                    device="cuda",
+                )
+                aiter.mla.mla_decode_fwd(
+                    q,
+                    pool_view,
+                    output,
+                    qo_indptr,
+                    kv_indptr,
+                    indices,
+                    last_page_lens,
+                    1,
+                    sm_scale=head_dim**-0.5,
+                    **kwargs,
+                )
+                torch.testing.assert_close(
+                    output.float().cpu(), reference, atol=2e-2, rtol=2e-2, msg=label
+                )
+        except AssertionError as exc:
+            failures.append(name)
+            print(f"FAIL {name}: {exc}", flush=True)
+        else:
+            print(f"PASS {name}", flush=True)
+    print(f"{mode} KV addressing: {8 - len(failures)} passed, {len(failures)} failed")
+    if failures:
+        raise AssertionError(f"KV addressing failed: {', '.join(failures)}")
+
+
 @benchmark()
 def test_mla(
     ctx_lens,
@@ -877,34 +984,54 @@ parser.add_argument(
 )
 
 
-args = parser.parse_args()
+parser.add_argument(
+    "--kv-address-only",
+    action="store_true",
+    help="Run only the eight gfx942 BF16 KV-address boundary cases (requires 5 GiB free).",
+)
 
-for nhead, decode_qlen in args.nhead:
-    df = []
-    for dtype, kvtype, ctx_len, batch_size, split_per_batch in itertools.product(
-        args.dtype, args.kv_dtype, args.ctxLen, args.batchSize, args.split_per_batch
-    ):
-        if check_support(dtype, kvtype, nhead):
-            ret = test_mla(
-                ctx_len,
-                batch_size,
-                nhead,
-                args.kv_lora_rank,
-                args.qk_nope_head_dim,
-                args.qk_rope_head_dim,
-                args.v_head_dim,
+
+if __name__ == "__main__":
+    args = parser.parse_args()
+    if not args.kv_address_only:
+        for nhead, decode_qlen in args.nhead:
+            df = []
+            for (
                 dtype,
                 kvtype,
-                args.block_size,
-                varlen=args.varlen,
-                decode_qlen=decode_qlen,
-                split_per_batch=split_per_batch,
-                return_lse=args.return_lse,
-                is_causal=args.causal,
-                sequential_page_indices=args.sequential_page_indices,
-            )
-            df.append(ret)
-    df = pd.DataFrame(df)
-    # df.to_csv(f"mla_nhead{nhead}decode_qlen{decode_qlen}.csv")
-    df_md = df.to_markdown(index=False)
-    aiter.logger.info("mla summary (markdown):\n%s", df_md)
+                ctx_len,
+                batch_size,
+                split_per_batch,
+            ) in itertools.product(
+                args.dtype,
+                args.kv_dtype,
+                args.ctxLen,
+                args.batchSize,
+                args.split_per_batch,
+            ):
+                if check_support(dtype, kvtype, nhead):
+                    ret = test_mla(
+                        ctx_len,
+                        batch_size,
+                        nhead,
+                        args.kv_lora_rank,
+                        args.qk_nope_head_dim,
+                        args.qk_rope_head_dim,
+                        args.v_head_dim,
+                        dtype,
+                        kvtype,
+                        args.block_size,
+                        varlen=args.varlen,
+                        decode_qlen=decode_qlen,
+                        split_per_batch=split_per_batch,
+                        return_lse=args.return_lse,
+                        is_causal=args.causal,
+                        sequential_page_indices=args.sequential_page_indices,
+                    )
+                    df.append(ret)
+            df = pd.DataFrame(df)
+            # df.to_csv(f"mla_nhead{nhead}decode_qlen{decode_qlen}.csv")
+            df_md = df.to_markdown(index=False)
+            aiter.logger.info("mla summary (markdown):\n%s", df_md)
+
+    test_mla_kv_address()

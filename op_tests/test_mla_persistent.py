@@ -93,6 +93,53 @@ def check_support(dtype, kv_dtype, nhead):
     return not (dtype == dtypes.bf16 and nhead == 32 and get_gfx() == "gfx942")
 
 
+def _kv_address_metadata(heads, qo_indptr, kv_indptr, last_page_lens, splits):
+    sizes = aiter.get_mla_metadata_info_v1(
+        1,
+        1,
+        heads,
+        torch.bfloat16,
+        torch.bfloat16,
+        is_sparse=False,
+        fast_mode=True,
+        num_kv_splits=splits,
+        max_split_per_batch=splits,
+    )
+    wmd, wi, wis, ri, rfm, rpm = (
+        torch.empty(shape, dtype=dtype, device="cuda") for shape, dtype in sizes
+    )
+    aiter.get_mla_metadata_v1(
+        qo_indptr,
+        kv_indptr,
+        last_page_lens,
+        heads,
+        1,
+        True,
+        wmd,
+        wis,
+        wi,
+        ri,
+        rfm,
+        rpm,
+        page_size=1,
+        kv_granularity=16,
+        max_seqlen_qo=1,
+        uni_seqlen_qo=1,
+        fast_mode=True,
+        max_split_per_batch=splits,
+        dtype_q=torch.bfloat16,
+        dtype_kv=torch.bfloat16,
+    )
+    return {
+        "work_meta_data": wmd,
+        "work_indptr": wi,
+        "work_info_set": wis,
+        "reduce_indptr": ri,
+        "reduce_final_map": rfm,
+        "reduce_partial_map": rpm,
+    }
+
+
 def check_fold_seqlen_indptr_cuda_graph_capture():
     """_fold_seqlen_indptr must be capturable into a CUDA graph (see PR desc)."""
     indptr = torch.zeros(9, dtype=torch.int32, device="cuda")
@@ -2065,39 +2112,64 @@ parser.add_argument(
     kernel, which today exists for gfx950 bf16/bf16 persistent only.
     e.g.: --no-causal""",
 )
-args = parser.parse_args()
-for nhead, decode_qlen in args.nhead:
-    df = []
-    for dtype, kvtype, ctx_len, batch_size, max_split_per_batch in itertools.product(
-        args.dtype, args.kv_dtype, args.ctxLen, args.batchSize, args.max_split_per_batch
-    ):
-        if check_support(dtype, kvtype, nhead):
-            ret = test_mla(
-                ctx_len,
-                batch_size,
-                nhead,
-                args.kv_lora_rank,
-                args.qk_nope_head_dim,
-                args.qk_rope_head_dim,
-                args.v_head_dim,
-                dtype,
-                kvtype,
-                args.block_size,
-                varlen=args.varlen,
-                decode_qlen=decode_qlen,
-                max_split_per_batch=max_split_per_batch,
-                non_persistent_mode=args.non_persistent_mode,
-                paged_layout=args.paged_layout,
-                scale_dim=args.scale_dim,
-                return_lse=args.return_lse,
-                causal=args.causal,
-            )
-            df.append(ret)
-    df = pd.DataFrame(df)
-    # df.to_csv(f"mla_nhead{nhead}decode_qlen{decode_qlen}.csv")
-    df_md = df.to_markdown(index=False)
-    aiter.logger.info("mla_persistent summary (markdown):\n%s", df_md)
+parser.add_argument(
+    "--kv-address-only",
+    action="store_true",
+    help="Run only the eight gfx942 BF16 KV-address boundary cases (requires 5 GiB free).",
+)
+
 
 if __name__ == "__main__":
-    check_fold_seqlen_indptr_cuda_graph_capture()
-    aiter.logger.info("_fold_seqlen_indptr cuda-graph capture: passed")
+    if __package__:
+        from .test_mla import test_mla_kv_address
+    else:
+        from test_mla import test_mla_kv_address
+
+    args = parser.parse_args()
+    if not args.kv_address_only:
+        for nhead, decode_qlen in args.nhead:
+            df = []
+            for (
+                dtype,
+                kvtype,
+                ctx_len,
+                batch_size,
+                max_split_per_batch,
+            ) in itertools.product(
+                args.dtype,
+                args.kv_dtype,
+                args.ctxLen,
+                args.batchSize,
+                args.max_split_per_batch,
+            ):
+                if check_support(dtype, kvtype, nhead):
+                    ret = test_mla(
+                        ctx_len,
+                        batch_size,
+                        nhead,
+                        args.kv_lora_rank,
+                        args.qk_nope_head_dim,
+                        args.qk_rope_head_dim,
+                        args.v_head_dim,
+                        dtype,
+                        kvtype,
+                        args.block_size,
+                        varlen=args.varlen,
+                        decode_qlen=decode_qlen,
+                        max_split_per_batch=max_split_per_batch,
+                        non_persistent_mode=args.non_persistent_mode,
+                        paged_layout=args.paged_layout,
+                        scale_dim=args.scale_dim,
+                        return_lse=args.return_lse,
+                        causal=args.causal,
+                    )
+                    df.append(ret)
+            df = pd.DataFrame(df)
+            # df.to_csv(f"mla_nhead{nhead}decode_qlen{decode_qlen}.csv")
+            df_md = df.to_markdown(index=False)
+            aiter.logger.info("mla_persistent summary (markdown):\n%s", df_md)
+
+        check_fold_seqlen_indptr_cuda_graph_capture()
+        aiter.logger.info("_fold_seqlen_indptr cuda-graph capture: passed")
+
+    test_mla_kv_address(_kv_address_metadata)
