@@ -984,10 +984,16 @@ def test_unmatched_targets():
 
 
 def test_flydsl_aot_target_filter():
-    import aiter.aot.flydsl.common as aot_common
-    from aiter.aot.flydsl.common import OpKind
-    from aiter.aot.flydsl.gemm import filter_jobs_for_build_targets
-    from aiter.jit.utils import chip_info
+    try:
+        import aiter.aot.flydsl.common as aot_common
+        from aiter.aot.flydsl.common import OpKind
+        from aiter.aot.flydsl.gemm import filter_jobs_for_build_targets
+        from aiter.jit.utils import chip_info
+    except ModuleNotFoundError as e:
+        if e.name not in ("torch", "flydsl"):
+            raise
+        print(f"  SKIP  FlyDSL AOT tests require torch and FlyDSL ({e})")
+        return
 
     jobs = [
         {"kernel_name": "k128", "gfx": "gfx950", "cu_num": 128},
@@ -1022,7 +1028,13 @@ def test_flydsl_aot_target_filter():
 
 
 def test_flydsl_aot_legacy_rows():
-    from aiter.aot.flydsl.gemm import filter_jobs_for_build_targets
+    try:
+        from aiter.aot.flydsl.gemm import filter_jobs_for_build_targets
+    except ModuleNotFoundError as e:
+        if e.name not in ("torch", "flydsl"):
+            raise
+        print(f"  SKIP  FlyDSL AOT tests require torch and FlyDSL ({e})")
+        return
 
     jobs = [
         {"kernel_name": "legacy", "gfx": "", "cu_num": 128},
@@ -1040,7 +1052,13 @@ def test_flydsl_aot_legacy_rows():
 
 
 def test_flydsl_aot_invalid_archs():
-    from aiter.aot.flydsl.gemm import filter_jobs_for_build_targets
+    try:
+        from aiter.aot.flydsl.gemm import filter_jobs_for_build_targets
+    except ModuleNotFoundError as e:
+        if e.name not in ("torch", "flydsl"):
+            raise
+        print(f"  SKIP  FlyDSL AOT tests require torch and FlyDSL ({e})")
+        return
 
     for spec in (" ; ", "gfx9999", "native;gfx942"):
         with _target_env(GPU_ARCHS=spec):
