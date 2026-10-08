@@ -9,10 +9,12 @@
     "attn_3d": [
       "D",
       "SW",
+      "Q",
       "DT"
     ],
     "kv_split": [
       "SW",
+      "D",
       "Q",
       "DT"
     ]
@@ -46,20 +48,20 @@
       "TILE_SIZE_MAX": 64
     },
     "D_GEQ_256.SKLT.DT_fp8_fp8": {
-      "BLOCK_M": 128,
-      "num_warps": 4,
+      "BLOCK_M": 64,
+      "num_warps": 2,
       "MFMA_DIM": 32,
-      "NUM_BUFFERS": 1,
-      "waves_per_eu": 1,
+      "NUM_BUFFERS": 2,
+      "waves_per_eu": 0,
       "TILE_SIZE_MIN": 64,
       "TILE_SIZE_MAX": 64
     },
     "D_GEQ_256.DT_fp8_fp8": {
-      "BLOCK_M": 128,
-      "num_warps": 4,
+      "BLOCK_M": 64,
+      "num_warps": 2,
       "MFMA_DIM": 32,
-      "NUM_BUFFERS": 1,
-      "waves_per_eu": 2,
+      "NUM_BUFFERS": 2,
+      "waves_per_eu": 0,
       "TILE_SIZE_MIN": 64,
       "TILE_SIZE_MAX": 64
     },
@@ -123,11 +125,23 @@
       "waves_per_eu": 1,
       "WIDE_BLOCK_M_MULT": 2
     },
+    "Q_GEQ_2.DT_fp8_fp8": {
+      "BLOCK_M": 32,
+      "MFMA_DIM": 32,
+      "NUM_BUFFERS": 2,
+      "waves_per_eu": 1
+    },
     "DT_fp8_fp8": {
       "BLOCK_M": 32,
       "MFMA_DIM": 32,
       "NUM_BUFFERS": 2,
       "waves_per_eu": 2
+    },
+    "Q_GEQ_2": {
+      "BLOCK_M": 32,
+      "MFMA_DIM": 32,
+      "NUM_BUFFERS": 2,
+      "waves_per_eu": 1
     },
     "any": {
       "BLOCK_M": 16,
@@ -150,8 +164,20 @@
       "SEGMENTS_PER_CU": 4,
       "MFMA_DIM": 32,
       "MIN_SEGMENTS": 1,
-      "SPLIT_MIN_TILES": 16,
+      "SPLIT_MIN_TILES": 4,
       "SPLIT_MIN_SHARE": 3,
+      "SEGMENT_TILE_MIN": 64,
+      "SEGMENT_TILE_MAX": 64,
+      "TILE_SIZE_MIN": 64,
+      "TILE_SIZE_MAX": 64,
+      "MAX_SEGMENTS": 128
+    },
+    "D_LEQ_128.Q_GEQ_2.DT_fp8_fp8": {
+      "SEGMENTS_PER_CU": 4,
+      "MFMA_DIM": 32,
+      "MIN_SEGMENTS": 1,
+      "SPLIT_MIN_TILES": 4,
+      "SPLIT_MIN_SHARE": 2,
       "SEGMENT_TILE_MIN": 64,
       "SEGMENT_TILE_MAX": 64,
       "TILE_SIZE_MIN": 64,
@@ -162,8 +188,8 @@
       "SEGMENTS_PER_CU": 4,
       "MFMA_DIM": 32,
       "MIN_SEGMENTS": 1,
-      "SPLIT_MIN_TILES": 16,
-      "SPLIT_MIN_SHARE": 3,
+      "SPLIT_MIN_TILES": 4,
+      "SPLIT_MIN_SHARE": 2,
       "SEGMENT_TILE_MIN": 64,
       "SEGMENT_TILE_MAX": 64,
       "TILE_SIZE_MIN": 64,
@@ -174,8 +200,20 @@
       "SEGMENTS_PER_CU": 2,
       "MFMA_DIM": 16,
       "MIN_SEGMENTS": 1,
-      "SPLIT_MIN_TILES": 16,
+      "SPLIT_MIN_TILES": 4,
       "SPLIT_MIN_SHARE": 3,
+      "SEGMENT_TILE_MIN": 64,
+      "SEGMENT_TILE_MAX": 64,
+      "TILE_SIZE_MIN": 64,
+      "TILE_SIZE_MAX": 64,
+      "MAX_SEGMENTS": 128
+    },
+    "D_LEQ_128.Q_GEQ_2": {
+      "SEGMENTS_PER_CU": 2,
+      "MFMA_DIM": 16,
+      "MIN_SEGMENTS": 1,
+      "SPLIT_MIN_TILES": 4,
+      "SPLIT_MIN_SHARE": 2,
       "SEGMENT_TILE_MIN": 64,
       "SEGMENT_TILE_MAX": 64,
       "TILE_SIZE_MIN": 64,
@@ -186,8 +224,8 @@
       "SEGMENTS_PER_CU": 2,
       "MFMA_DIM": 16,
       "MIN_SEGMENTS": 1,
-      "SPLIT_MIN_TILES": 16,
-      "SPLIT_MIN_SHARE": 3,
+      "SPLIT_MIN_TILES": 4,
+      "SPLIT_MIN_SHARE": 2,
       "SEGMENT_TILE_MIN": 64,
       "SEGMENT_TILE_MAX": 64,
       "TILE_SIZE_MIN": 64,
