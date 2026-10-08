@@ -186,6 +186,7 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
             "token": 1,
             "topk": 2,
             "act_type": "ActivationType.Silu",
+            "q_dtype_a": "torch.float4_e2m1fn_x2",
         }
         args = SimpleNamespace(fast_scan=True, errRatio=0.1, warmup=1, iters=1)
         with (
@@ -549,6 +550,8 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
         self.assertEqual(limits, [3.5])
 
     def test_candidate_kernel_and_reference_share_the_tuned_swiglu_limit(self):
+        import torch
+
         from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
 
         tuner = gemm_moe_tune.Mxfp4FlydslTuner.__new__(gemm_moe_tune.Mxfp4FlydslTuner)
@@ -568,12 +571,14 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
             "expert": 8,
             "topk": 2,
             "act_type": "ActivationType.Silu",
+            "q_dtype_a": "torch.float4_e2m1fn_x2",
         }
         limits = []
 
         def port_e2e(*_args, **kwargs):
             limits.append(kwargs.get("swiglu_limit"))
-            return "out"
+            # Ordinary-path outputs are checked for non-finite values.
+            return torch.zeros(1)
 
         with (
             mock.patch.dict(os.environ, {"AITER_MXFP4_TUNE_SWIGLU_LIMIT": "3.5"}),
@@ -599,6 +604,8 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
         self.assertEqual(torch_ref.call_args.kwargs["swiglu_limit"], 3.5)
 
     def test_finalist_retime_preserves_unrounded_coarse_error(self):
+        import torch
+
         from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
 
         tuner = gemm_moe_tune.Mxfp4FlydslTuner.__new__(gemm_moe_tune.Mxfp4FlydslTuner)
@@ -618,6 +625,7 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
             "expert": 8,
             "topk": 2,
             "act_type": "ActivationType.Silu",
+            "q_dtype_a": "torch.float4_e2m1fn_x2",
         }
         candidate = self._candidate("fastest")
         candidate.update(
@@ -628,7 +636,7 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
         )
         with (
             mock.patch.dict(os.environ, {"AITER_MXFP4_TUNE_SWIGLU_LIMIT": "3.5"}),
-            mock.patch.object(tuner, "_port_e2e", return_value="out"),
+            mock.patch.object(tuner, "_port_e2e", return_value=torch.zeros(1)),
             mock.patch.object(tuner, "_torch_ref", return_value="ref"),
             mock.patch.object(gemm_moe_tune, "cosine_diff_compare", return_value=0.010),
             mock.patch.object(tuner, "calculate", return_value=(0.0, 0.0)),
