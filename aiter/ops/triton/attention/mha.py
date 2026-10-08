@@ -994,6 +994,11 @@ def flash_attn_func(
     v_descale=None,
     config: dict[str, any] | None = None,
     backend: Literal["triton", "gluon"] | None = "triton",
+    *,
+    q_mx_scale: torch.Tensor | None = None,
+    k_mx_scale: torch.Tensor | None = None,
+    v_mx_scale: torch.Tensor | None = None,
+    mx_p_scale: int = 127,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
@@ -1048,6 +1053,16 @@ def flash_attn_func(
             with q_descale/k_descale/v_descale. Note that the Gluon backend fills
             in S_dmask even at dropout_p == 0, where the Triton backend leaves it
             zeroed.
+        q_mx_scale, k_mx_scale, v_mx_scale: keyword-only e8m0 scales for MXFP8
+            q/k/v. When all three are set, this call runs the gfx950 MXFP8 Triton
+            kernel and does not enter the default Triton or Gluon path. Each scale
+            is shaped (batch, seqlen/32, nheads, headdim/32). q/k/v stay in
+            (batch, seqlen, nheads, headdim) and are pre-quantized e4m3. The
+            output is bf16. This mode is forward-only and rejects dropout, bias,
+            sink, sliding window, and backend="gluon". Leaving these arguments
+            unset keeps the existing behavior.
+        mx_p_scale: keyword-only softmax-probability scale for the MXFP8 path.
+            Defaults to 127. It is only used when the MXFP8 scales are set.
     Return:
         out: (batch_size, seqlen, nheads, headdim).
         softmax_lse [optional, if return_lse=True]: (batch_size, nheads, seqlen). The
@@ -1057,6 +1072,60 @@ def flash_attn_func(
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
+    if (
+        q_mx_scale is not None
+        or k_mx_scale is not None
+        or v_mx_scale is not None
+        or mx_p_scale != 127
+    ):
+        if _resolve_backend(backend) == "gluon":
+            raise ValueError("MXFP8 attention is supported on the triton backend only.")
+        if q_mx_scale is None or k_mx_scale is None or v_mx_scale is None:
+            raise ValueError(
+                "MXFP8 attention requires q_mx_scale, k_mx_scale, and v_mx_scale."
+            )
+        if any(
+            tensor is not None and getattr(tensor, "requires_grad", False)
+            for tensor in (q, k, v, q_mx_scale, k_mx_scale, v_mx_scale)
+        ):
+            raise RuntimeError(
+                "MXFP8 attention on flash_attn_func is forward-only. "
+                "dq/dk/dv cannot be attached to fp8 q/k/v."
+            )
+        if dropout_p:
+            raise ValueError("MXFP8 attention does not support dropout.")
+        if bias is not None:
+            raise ValueError("MXFP8 attention does not support bias.")
+        if sink is not None:
+            raise ValueError("MXFP8 attention does not support sink.")
+        if int(window_size[0]) != -1 or int(window_size[1]) != -1:
+            raise ValueError("MXFP8 attention does not support sliding window.")
+        from aiter.ops.triton.attention.mxfp8_attention import (
+            mxfp8_attention_forward,
+        )
+
+        out, softmax_lse, exp_scores = mxfp8_attention_forward(
+            q,
+            k,
+            v,
+            q_scale=q_mx_scale,
+            k_scale=k_mx_scale,
+            v_scale=v_mx_scale,
+            p_scale=mx_p_scale,
+            sm_scale=_get_softmax_scale(q, softmax_scale),
+            alibi_slopes=alibi_slopes,
+            causal=causal,
+            return_softmax=return_attn_probs,
+            layout="bshd",
+        )
+        return _pack_attn_returns(
+            out.detach(),
+            softmax_lse,
+            exp_scores,
+            return_lse,
+            return_attn_probs,
+        )
+
     backend = _resolve_backend(backend)
     _LOGGER.info(
         "FLASH_ATTN [%s]:  q=%s  k=%s  v=%s",
