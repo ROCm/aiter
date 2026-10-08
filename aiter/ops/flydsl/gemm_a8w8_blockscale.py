@@ -51,29 +51,16 @@ def _prepare_scales(
         raise ValueError("FlyDSL blockscale requires FP32 scales")
     if tuple(w_scale.shape) != ((N + 127) // 128, KB):
         raise ValueError("w_scale must have shape (ceil(N / 128), K / 128)")
-    if preshuffle_b:
-        if tuple(x_scale.shape) == (M, KB):
-            if x_scale.is_contiguous():
-                # per_group_quant_hip and the tuner return column-major bytes
-                # in a tensor reshaped back to (M, KB). Do not transpose twice.
-                sa = x_scale.view(-1)
-            elif x_scale.stride(0) == 1:
-                sa = x_scale.transpose(0, 1).contiguous().view(-1)
-            else:
-                raise ValueError("preshuffled x_scale must use column-major storage")
-        elif tuple(x_scale.shape) == (KB, M):
-            sa = x_scale.contiguous().view(-1)
-        else:
-            raise ValueError("preshuffled x_scale must have shape (M, KB) or (KB, M)")
-    else:
-        if tuple(x_scale.shape) != (M, KB):
-            raise ValueError("x_scale must have shape (M, K / 128)")
-        if getattr(x_scale, "is_transposed", False):
-            # The producer's flag guarantees the layout expected by this kernel.
-            sa = x_scale.view(-1)
-        else:
-            # Unprepared plain-layout scales still pay this cost in the timed call.
-            sa = x_scale.transpose(0, 1).contiguous().view(-1)
+
+    if not x_scale.is_contiguous() or x_scale.nelement() != M * KB:
+        raise ValueError(
+            "x_scale tensor must be contiguous and have the correct number of elements"
+        )
+    # kernel expected x_scale layout is [KB, M], so need to tranposed if not.
+    if not getattr(x_scale, "is_transposed", False):
+        x_scale = x_scale.view(M, KB)
+        x_scale = x_scale.transpose(0, 1).contiguous()
+    sa = x_scale.view(-1)
     return sa, w_scale.contiguous().view(-1)
 
 

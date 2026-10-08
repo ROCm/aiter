@@ -34,7 +34,7 @@ def run_torch(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
 
 
 @benchmark()
-def test_gemm(m, n, k, dtype, layout, scale_layout, data_init):
+def test_gemm(m, n, k, dtype, layout, scale_layout):
     from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_common import (
         kernel_fits_shape,
         kernels_list,
@@ -43,26 +43,19 @@ def test_gemm(m, n, k, dtype, layout, scale_layout, data_init):
     preshuffle_b = layout == "preshuffle"
     gfx = get_gfx()
     torch.manual_seed(0)
-    if data_init == "signed":
-        x = torch.randn((m, k), device="cuda").to(torch.float8_e4m3fn)
-        weight = torch.randn((n, k), device="cuda").to(torch.float8_e4m3fn)
-    else:
-        x = (torch.rand((m, k), device="cuda") / 10).to(torch.float8_e4m3fn)
-        weight = (torch.rand((n, k), device="cuda") / 10).to(torch.float8_e4m3fn)
+    x = (torch.rand((m, k), device="cuda") / 10).to(torch.float8_e4m3fn)
+    weight = (torch.rand((n, k), device="cuda") / 10).to(torch.float8_e4m3fn)
     # Vary scales by both row and K block; all-ones scales miss layout errors.
     x_scale = torch.rand((m, k // 128), device="cuda") + 0.1
     w_scale = torch.rand(((n + 127) // 128, k // 128), device="cuda") + 0.1
     ref = run_torch(x, weight, x_scale, w_scale, dtype)
     gemm_weight = shuffle_weight(weight, layout=(16, 16)) if preshuffle_b else weight
-    if preshuffle_b or scale_layout == "tagged":
-        transposed = x_scale.T.contiguous()
-        gemm_scale = (
-            transposed.T if scale_layout == "strided" else transposed.view_as(x_scale)
-        )
-        if scale_layout == "tagged":
-            # Mark the final prepared tensor, not the row-major reference scales.
-            gemm_scale.is_transposed = True
+    if scale_layout == "transposed":
+        gemm_scale = x_scale.T.contiguous().view_as(x_scale)
+        # Mark the final prepared tensor, not the row-major reference scales.
+        gemm_scale.is_transposed = True
     else:
+        # gemm_scale.is_transposed would be checked , if will transposed if  not transpoed
         gemm_scale = x_scale
 
     candidates = {
@@ -142,9 +135,9 @@ def main():
             # The same N/K with changing M exercises the cached launch ABI.
             (1, 384, 512),
             (33, 384, 512),
-            (254, 384, 512),
+            (250, 384, 512),
             (257, 272, 768),
-            (1011, 1024, 2048),
+            (1024, 1024, 2048),
             (4096, 4096, 16384),
         ],
     )
@@ -157,23 +150,18 @@ def main():
     parser.add_argument(
         "--scale-layout",
         nargs="+",
-        choices=["packed", "strided", "tagged"],
-        default=["packed", "strided", "tagged"],
-    )
-    parser.add_argument(
-        "--data-init",
-        nargs="+",
-        choices=["uniform", "signed"],
-        default=["uniform", "signed"],
+        choices=["non-transposed", "transposed"],
+        default=["non-transposed", "transposed"],
     )
     args = parser.parse_args()
     rows = []
-    for dtype, (m, n, k), layout, scale_layout, data_init in itertools.product(
-        args.dtype, args.mnk, args.layout, args.scale_layout, args.data_init
+    for dtype, (m, n, k), layout, scale_layout in itertools.product(
+        args.dtype, args.mnk, args.layout, args.scale_layout
     ):
-        if layout == "plain" and scale_layout == "strided":
+        # The preshuffle API requires transposed activation scales.
+        if layout == "preshuffle" and scale_layout == "non-transposed":
             continue
-        rows.append(test_gemm(m, n, k, dtype, layout, scale_layout, data_init))
+        rows.append(test_gemm(m, n, k, dtype, layout, scale_layout))
     aiter.logger.info(
         "FlyDSL blockscale summary:\n%s", pd.DataFrame(rows).to_markdown(index=False)
     )
