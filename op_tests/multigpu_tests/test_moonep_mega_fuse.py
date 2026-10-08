@@ -52,6 +52,11 @@ def main():
                         help="negative control: leave the slots stale")
     parser.add_argument("--shared-state", action="store_true",
                         help="negative control: all layers share one slot state")
+    parser.add_argument("--mtpr", type=int, default=0,
+                        help="instance capacity (default: --tokens), e.g. decode batches "
+                             "far below a prefill-sized instance")
+    parser.add_argument("--graph", action="store_true",
+                        help="run the fused instance from one CUDA graph per layer")
     args = parser.parse_args()
     rank, world, device = _setup_dist()
     epr = EXPERTS // world
@@ -94,13 +99,13 @@ def main():
             rank=rank, world_size=world, model_dim=MODEL_DIM, inter_dim=INTER_DIM,
             experts=EXPERTS, topk=TOPK, quant="a8w4", w1=first["home"][0],
             w1_scale=first["home"][1], w2=first["home"][2], w2_scale=first["home"][3],
-            max_tok_per_rank=args.tokens, swiglu_limit=SWIGLU,
+            max_tok_per_rank=args.mtpr or args.tokens, swiglu_limit=SWIGLU,
         )
         fused = MegaMoEV2(
             rank=rank, world_size=world, model_dim=MODEL_DIM, inter_dim=INTER_DIM,
             experts=world * (epr + B), topk=TOPK, quant="a8w4",
             w1=first["views"][0], w1_scale=first["views"][1], w2=first["views"][2],
-            w2_scale=first["views"][3], max_tok_per_rank=args.tokens,
+            w2_scale=first["views"][3], max_tok_per_rank=args.mtpr or args.tokens,
             swiglu_limit=SWIGLU, moonep_slots=B,
         )
         shared = fused.new_moonep_slot_state()
@@ -118,20 +123,49 @@ def main():
                 rows = win[epr:]
                 rows.copy_(torch.where(copy[:, None], all_experts.index_select(0, src), rows))
 
+        graphs = {}
+
+        def replay(index, layer, x, wts, ids):
+            """Capture this layer once (prepare, slot fill and all), then replay."""
+            if index not in graphs:
+                static = {"x": x.clone(), "wts": wts.clone(), "ids": ids.clone()}
+
+                def run():
+                    return fused.forward(
+                        static["x"], static["wts"], static["ids"],
+                        after_prepare=lambda: prefetch(layer),
+                    )
+
+                run()
+                _barrier()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=torch.cuda.Stream()):
+                    static["out"] = run()
+                graphs[index] = (graph, static)
+            graph, static = graphs[index]
+            static["x"].copy_(x)
+            static["wts"].copy_(wts)
+            static["ids"].copy_(ids)
+            graph.replay()
+            return static["out"].clone()
+
         ok = True
         for step in range(args.steps):
             for index, layer in enumerate(layers):
-                for balance in ((True, False) if step == 0 else (True,)):
+                for balance in ((True, False) if step == 0 and not args.graph else (True,)):
                     # Layers see different hot experts, so their slots diverge.
                     x, wts, ids = _routing(args.tokens, rank, step + 5 * index, device, hot=step % 2 == 0)
                     bind_plain(plain, layer)
                     ref = plain.forward(x, wts, ids).clone()
                     _barrier()
                     bind_fused(fused, layer)
-                    out = fused.forward(
-                        x, wts, ids, moonep_balance=balance,
-                        after_prepare=lambda layer=layer: prefetch(layer),
-                    ).clone()
+                    if args.graph:
+                        out = replay(index, layer, x, wts, ids)
+                    else:
+                        out = fused.forward(
+                            x, wts, ids, moonep_balance=balance,
+                            after_prepare=lambda layer=layer: prefetch(layer),
+                        ).clone()
                     _barrier()
                     diff = (out.float() - ref.float()).abs()
                     scale = ref.float().abs().max().clamp(min=1e-6)
