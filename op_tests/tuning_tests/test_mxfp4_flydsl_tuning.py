@@ -132,7 +132,13 @@ class TestMxfp4FlydslInputsAndCandidates(unittest.TestCase):
     def test_explicit_search_mode_is_used_in_serial_and_spawned_workers(self):
         a8 = self.read_rows([shape_row(token=64, q_dtype_a="torch.float8_e4m3fn")])
         for mode in (None, "prune", "full"):
-            args = SimpleNamespace(mxfp4_search_mode=mode, timeout=0, mp=1)
+            args = SimpleNamespace(
+                mxfp4_search_mode=mode,
+                timeout=0,
+                mp=1,
+                errRatio=0.1,
+                profile_file="",
+            )
 
             # Substitute only the GPU evaluation boundary. Real candidate
             # generation and the shape worker still run in both paths.
