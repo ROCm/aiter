@@ -606,6 +606,7 @@ def _unified_attention_2d_triton(params: _UAParams):
         SHUFFLED_KV_CACHE=params.shuffled_kv_cache,
         K_WIDTH=params.k_width,
         **config,
+        enable_fp_fusion=True,
     )
 
 
@@ -687,6 +688,7 @@ def _unified_attention_3d_triton(
         NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
         TILE_SIZE=TILE_SIZE,
         **config,
+        enable_fp_fusion=True,
     )
 
 
@@ -722,6 +724,7 @@ def _reduce_segments_triton(
         TILE_SIZE=TILE_SIZE,
         BLOCK_Q=None,
         **config,
+        enable_fp_fusion=True,
     )
 
 
@@ -846,6 +849,7 @@ def _unified_attention_2d_gfx1250(params: _UAParams):
         REMOVE_INDIRECT_ACCESS=False,
         NUM_BUFFERS=config["NUM_BUFFERS"],
         LOOP_VARIANT=loop_variant,
+        enable_fp_fusion=True,
     )
 
 
@@ -940,6 +944,7 @@ def _unified_attention_3d_gfx1250(
         NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
         TILE_SIZE=TILE_SIZE,
         **config,
+        enable_fp_fusion=True,
     )
 
 
@@ -976,6 +981,7 @@ def _reduce_segments_gfx1250(
         NUM_WARPS=gluon_num_warps,
         num_warps=gluon_num_warps,
         **config,
+        enable_fp_fusion=True,
     )
 
 
@@ -1089,6 +1095,7 @@ def _unified_attention_gfx950(
         partial_m_ptr=partial_m,
         partial_l_ptr=partial_l,
         partial_acc_ptr=partial_acc,
+        enable_fp_fusion=True,
     )
 
 
