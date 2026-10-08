@@ -500,19 +500,84 @@ def _gemm1_body_a8w4(
                 )
 
 
+def _mxfp8_exponent(amax):
+    """Shared-exponent rule: the smallest e with amax / 2**e <= 240 (E4M3FNUZ max).
+
+    With amax = (1 + f) * 2**E this is E - 7, or E - 6 when 1 + f > 1.875, i.e.
+    ceil(log2(amax / 240)) computed on the float bits, so torch, Triton and the vLLM
+    accuracy plugin agree bit for bit. Clamped to the E8M0 range.
+    """
+    bits = amax.float().view(torch.int32)
+    e = ((bits >> 23) & 0xFF) - 127 - 7 + ((bits & 0x7FFFFF) > 0x700000).to(torch.int32)
+    return e.clamp(-127, 127)
+
+
+def mxfp8_quant_a8w4_gfx942_ref(x):
+    """Torch reference of :func:`mxfp8_quant_a8w4_gfx942` (same bits)."""
+    M, K = x.shape
+    xb = x.float().view(M, K // 32, 32)
+    e = _mxfp8_exponent(xb.abs().amax(-1, keepdim=True))
+    q = (xb * torch.exp2(-e.float())).to(torch.float8_e4m3fnuz).view(M, K // 8, 8)
+    q = q[..., list(A8W4_K8_ORDER)].reshape(M, K).contiguous()
+    return q, (e + 127).to(torch.uint8).view(M, K // 32).contiguous()
+
+
+try:
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _mxfp8_quant_a8w4_kernel(x_ptr, y_ptr, s_ptr, K, BLOCK_K: tl.constexpr):
+        # One program per row: the decode M is small and a row (K <= BLOCK_K) fits in
+        # registers. Output byte c of each 8 holds input element A8W4_K8_ORDER[c % 8].
+        row = tl.program_id(0)
+        c = tl.arange(0, BLOCK_K)
+        src = (c // 8) * 8 + (c % 4) * 2 + (c % 8) // 4
+        mask = c < K
+        x = tl.load(x_ptr + row * K + src, mask=mask, other=0.0).to(tl.float32)
+        xg = tl.reshape(x, (BLOCK_K // 32, 32))
+        amax = tl.max(tl.abs(xg), axis=1, keep_dims=True)
+        bits = amax.to(tl.int32, bitcast=True)
+        e = (
+            ((bits >> 23) & 0xFF)
+            - 127
+            - 7
+            + ((bits & 0x7FFFFF) > 0x700000).to(tl.int32)
+        )
+        e = tl.minimum(tl.maximum(e, -127), 127)
+        # 2**-e built from its exponent bits (exact; e in [-127, 127] -> 2**-e normal
+        # except at the clamp edges, where the block is ~0 anyway)
+        inv = ((127 - e).to(tl.int32) << 23).to(tl.float32, bitcast=True)
+        q = tl.reshape(xg * inv, (BLOCK_K,)).to(y_ptr.dtype.element_ty)
+        tl.store(y_ptr + row * K + c, q, mask=mask)
+        g = tl.arange(0, BLOCK_K // 32)
+        tl.store(
+            s_ptr + row * (K // 32) + g,
+            tl.reshape(e + 127, (BLOCK_K // 32,)).to(tl.uint8),
+            mask=g < K // 32,
+        )
+
+except ImportError:  # pragma: no cover - triton is an aiter dependency
+    _mxfp8_quant_a8w4_kernel = None
+
+
 def mxfp8_quant_a8w4_gfx942(x):
     """bf16 ``[M, K]`` -> (E4M3FNUZ ``[M, K]`` in ``A8W4_K8_ORDER``, E8M0 ``[M, K/32]``).
 
-    Per-1x32 power-of-two scale with ``amax / scale <= 240`` (FNUZ max). Reference
-    implementation in torch; the order permutation is free inside a fused quant kernel.
+    Per-1x32 power-of-two scale with ``amax / scale <= 240`` (:func:`_mxfp8_exponent`).
+    One Triton launch on CUDA tensors; the torch reference elsewhere. Not aiter's
+    ``dynamic_mxfp8_quant``: that derives the scale for E4M3FN (max 448) and clips
+    ~12 % of the values when asked for E4M3FNUZ.
     """
     M, K = x.shape
-    xb = x.float().view(M, K // 32, 32)
-    amax = xb.abs().amax(-1, keepdim=True).clamp_min(1e-30)
-    ex = torch.ceil(torch.log2(amax / 240.0)).clamp(-127, 127)
-    q = (xb / torch.exp2(ex)).to(torch.float8_e4m3fnuz).view(M, K // 8, 8)
-    q = q[..., list(A8W4_K8_ORDER)].reshape(M, K).contiguous()
-    return q, (ex + 127).to(torch.uint8).view(M, K // 32).contiguous()
+    assert K % 32 == 0, f"K must be a multiple of 32, got {K}"
+    if not x.is_cuda or _mxfp8_quant_a8w4_kernel is None:
+        return mxfp8_quant_a8w4_gfx942_ref(x)
+    x = x.contiguous()
+    y = torch.empty((M, K), dtype=torch.float8_e4m3fnuz, device=x.device)
+    s = torch.empty((M, K // 32), dtype=torch.uint8, device=x.device)
+    _mxfp8_quant_a8w4_kernel[(M,)](x, y, s, K, BLOCK_K=triton.next_power_of_2(K))
+    return y, s
 
 
 def shuffle_weight_a8w4_gfx942(w_a16w4_u8):
@@ -560,7 +625,7 @@ def compile_gemm1_a8w4_gfx942(
     waves_per_eu=None,
     x_scale="mx",
     k_wave=1,
-    rev="r6",  # bump on kernel changes: the FlyDSL cache key hashes this factory only
+    rev="r9",  # bump on kernel changes: the FlyDSL cache key hashes this factory only
     rocm_arch,
 ):
     """Build the gfx942 a8w4 (MXFP8 A x MXFP4 W) fused stage1 (gate+up + act)."""
