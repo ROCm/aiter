@@ -106,6 +106,27 @@ def get_recommended_splits(num_sequences, num_kv_heads, split_kv_blocks=1):
     return min(max_context_partition_num, 8)
 
 
+def _uses_ps_kernel(ps, sliding_window, kv_block_size):
+    # PS runs the sliding-window kernels, except for 1024-token blocks under a
+    # sliding window, which go to the non-PS large-block kernel.
+    return ps and not (sliding_window > 0 and kv_block_size == 1024)
+
+
+def _ps_query_split(query_seq_len, query_group_size):
+    """Spread a single-KV-head PS launch's query tokens over the grid.
+
+    Returns (query tokens per program, programs per sequence). A group of 16 or
+    more fills the tile with one token; a narrower group packs tokens up to 16
+    rows. Either way the tile does not grow with query_seq_len, and the token
+    count stays a power of two, which the kernel's layouts require.
+    """
+    group_size_pow2 = triton.next_power_of_2(query_group_size)
+    tokens_per_program = min(
+        triton.next_power_of_2(query_seq_len), max(1, 16 // group_size_pow2)
+    )
+    return tokens_per_program, triton.cdiv(query_seq_len, tokens_per_program)
+
+
 DS_WRITE = gl.constexpr(0x200)
 DS_READ = gl.constexpr(0x100)
 VMEM_LOAD = gl.constexpr(0x020)
@@ -4344,20 +4365,14 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
 
     # PS path uses the sliding-window kernel for all KV_BLOCK_SIZE values.
     # This is required for KV_BLOCK_SIZE==1024 support in PS mode.
-    if PS and not (SLIDING_WINDOW > 0 and KV_BLOCK_SIZE == 1024):
+    if _uses_ps_kernel(PS, SLIDING_WINDOW, KV_BLOCK_SIZE):
         ONE_SHOT = num_splits <= 1
         if num_kv_heads == 1:
             paged_attention_kernel = paged_attention_decode_sliding_window_head_1
-            if ONE_QUERY_GROUP_SIZE_POW2 >= 16:
-                grid = (num_sequences, query_seq_len * num_kv_heads, num_splits)
-                QUERY_SEQ_LEN_POW2 = 1
-            else:
-                mtp_splits = triton.cdiv(
-                    query_seq_len * num_kv_heads,
-                    triton.cdiv(16, ONE_QUERY_GROUP_SIZE_POW2),
-                )
-                grid = (num_sequences, mtp_splits, num_splits)
-                QUERY_SEQ_LEN_POW2 = triton.cdiv(QUERY_SEQ_LEN_POW2, mtp_splits)
+            QUERY_SEQ_LEN_POW2, mtp_splits = _ps_query_split(
+                query_seq_len, query_group_size
+            )
+            grid = (num_sequences, mtp_splits, num_splits)
         else:
             paged_attention_kernel = paged_attention_decode_sliding_window
         paged_attention_kernel[grid](
@@ -4718,7 +4733,8 @@ def pa_decode_gluon(
         Scaling factor for attention scores, typically 1/sqrt(head_size).
 
     query_length : int
-        Length of query sequences. Must be <= 4.
+        Length of query sequences. Must be <= 4, except on the PS kernel with a
+        single KV head, which spreads the query tokens over the launch grid.
 
     max_context_partition_num : int
         Maximum number of context partitions.
@@ -4777,7 +4793,8 @@ def pa_decode_gluon(
 
     Notes
     -----
-    - query_length * query_group_size must be <= 64
+    - query_length * query_group_size must be <= 64; on the PS kernel with a
+      single KV head only query_group_size must be <= 64
     - kv_block_size must be one of [16, 64, 1024]
     - When query_length > 1, automatic transpose operations are performed
       between standard and gluon layouts
@@ -4813,8 +4830,21 @@ def pa_decode_gluon(
     # if sliding_window > 0 and kv_block_size != 1024:
     #     max_context_partition_num = 1
     grid = (batch_size, num_kv_heads, max_context_partition_num)
+    one_shot = max_context_partition_num <= 1
+    ps = ps or one_shot
 
-    assert query_length <= 4, f"query_length == {query_length} exceeds maximum of 4"
+    # A single-KV-head PS launch spreads the query tokens over the grid (see
+    # _ps_query_split), so only the group bounds its query tile. The other
+    # kernels hold every query token of a sequence in one tile.
+    if num_kv_heads == 1 and _uses_ps_kernel(ps, sliding_window, kv_block_size):
+        assert (
+            query_group_size <= 64
+        ), f"query_group_size={query_group_size} exceeds maximum of 64"
+    else:
+        assert query_length <= 4, f"query_length == {query_length} exceeds maximum of 4"
+        assert (
+            equivalent_query_group_size <= 64
+        ), f"equivalent_query_group_size={equivalent_query_group_size} exceeds maximum of 64"
     # Validate input params constraint
     assert query.dtype in [
         aiter.dtypes.fp8,
@@ -4835,9 +4865,6 @@ def pa_decode_gluon(
         aiter.dtypes.bf16,
         aiter.dtypes.fp16,
     ], f"output tensor only support dtype in [{aiter.dtypes.bf16, aiter.dtypes.fp16}], but got output.dtype == {output.dtype}"
-    assert (
-        equivalent_query_group_size <= 64
-    ), f"equivalent_query_group_size={equivalent_query_group_size} exceeds maximum of 64"
 
     assert (
         len(output.shape) == 3
@@ -4848,8 +4875,6 @@ def pa_decode_gluon(
     assert (
         len(key_cache.shape) == 5
     ), f"Expected 5D key_cache tensor, but got shape {key_cache.shape}"
-
-    one_shot = max_context_partition_num <= 1
 
     if exp_sums is None:
         exp_sums = torch.empty(
@@ -4977,7 +5002,6 @@ def pa_decode_gluon(
     # ==================== ATTENTION DECODE KERNEL EXECUTION ====================
     # Determine output tensor and strides based on one_shot mode
     output_for_kernel = output_5d if one_shot else temporary_output
-    ps = ps or one_shot
     _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
         grid,
         exp_sums,
