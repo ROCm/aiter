@@ -455,8 +455,8 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             choices=["fp32", "e8m0"],
             default=None,
             help="Scale contract and config family. If omitted, preserve the "
-            "legacy default: e8m0 for --libtype flydsl, fp32 otherwise. "
-            "Use fp32 for the 8-wave blockscale kernels; e8m0 requires "
+            "default: e8m0 for --libtype flydsl, fp32 otherwise. "
+            "Use fp32 for the 8-wave legacy blockscale gemm; e8m0 requires "
             "--preshuffle and --libtype flydsl/all and writes the mxscale table.",
         )
 
