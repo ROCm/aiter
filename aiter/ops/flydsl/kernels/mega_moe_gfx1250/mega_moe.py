@@ -899,6 +899,11 @@ class MegaMoEGfx1250:
             # still reads psum/masked_m of this slot; the next plan writes the
             # other slot and overlaps the expert GEMM (and later combine/RMS).
             self._prefetch_next_compact_plan(next_topk_ids, next_recv_token_bound)
+        # Without the fused combine, fused_moe writes straight into mori's staging
+        # rows: the combine reads them in place instead of copying them in.
+        moe_output = (
+            None if self._config.stage2_fused else self._mori_stage[: recv_x.shape[0]]
+        )
         try:
             expert_out = fused_moe(
                 recv_x,
@@ -922,6 +927,7 @@ class MegaMoEGfx1250:
                 num_local_tokens=None if self._compact_plan else total_recv,
                 swiglu_limit=self.swiglu_limit,
                 stage2_scatter=scatter,
+                output=moe_output,
                 **extra,
             )
         finally:
@@ -1764,21 +1770,18 @@ class MegaMoEGfx1250:
             "xdb_flag": self._cross_device_flag.data_ptr(),
             "combine_barrier_fan": self._combine_barrier_fan.data_ptr(),
         }
-        # The bf16 staging rows at the front of comb_inp. The fp4 send reads
-        # ahead as far as row max_recv-1 of its input, so a step whose recv
-        # bound gave fused_moe fewer rows is routed through these.
-        stage = _from_gpu_ptr(
+        # The bf16 staging rows at the front of comb_inp. forward() has fused_moe
+        # write its rows straight into them, so the bf16 combine finds its input
+        # already staged and skips its copy, and the fp4 send, which reads ahead
+        # as far as row max_recv-1, stays inside the arena.
+        self._mori_stage = _from_gpu_ptr(
             self._arena.local_ptr("comb_inp"),
             (config.max_recv, config.hidden_dim),
             torch.bfloat16,
         )
 
-        def make_variant(plan, bits):
+        def make_variant(plan):
             def launch(expert_out: torch.Tensor, token_count: int):
-                rows = expert_out.shape[0]
-                if bits and rows < config.max_recv:
-                    stage[:rows].copy_(expert_out)
-                    expert_out = stage
                 plan.launch(
                     stream=torch.cuda.current_stream().cuda_stream,
                     inp_token_buf=expert_out,
@@ -1790,7 +1793,7 @@ class MegaMoEGfx1250:
 
         variants = {bits: {} for bits in specs}
         for (bits, spec), plan in plans.items():
-            variants[bits][spec] = make_variant(plan, bits)
+            variants[bits][spec] = make_variant(plan)
         return variants
 
     def _select_mori_combine(self, quant_bits: int, token_count: int) -> tuple:
@@ -1990,7 +1993,8 @@ class MegaMoEGfx1250:
         caller gets unless it asked forward() for another. With
         ``stage2_fused`` the gemm2 epilogue has already scattered the results
         into the peers' slots, packed as that wire. Without it, ``expert_out``
-        is fused_moe's per-recv-slot output and mori moves it.
+        is fused_moe's per-recv-slot output, already in mori's staging rows
+        (``_mori_stage``), and mori moves it from there.
         """
         count = routing.token_count
         if not self._config.stage2_fused:
