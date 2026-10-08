@@ -103,8 +103,9 @@ def compile_moe_gemm2(
                 scale = arg_p_scale[0]
                 c_frag.store(c_frag.load() * scale)
 
-    def _cvt_f32_to_bf16(c_frag):
-        c_frag_bf16 = fx.make_fragment_like(c_frag, dtype=fx.BFloat16)
+    def _cvt_f32_to_bf16(c_frag, c_frag_bf16=None):
+        if c_frag_bf16 is None:
+            c_frag_bf16 = fx.make_fragment_like(c_frag, dtype=fx.BFloat16)
         c_frag_bf16.store(_f32_to_bf16(c_frag.load()))
         return c_frag_bf16
 
@@ -571,8 +572,8 @@ def compile_moe_gemm2(
             def postprocess_store2lds(fragC, ldsc_idx):
                 for fc, fsw in fxh.all_elements(fragC, frag_sorted_weight):
                     fc.store(fc.load() * fsw.load())
-                vec_f32 = fragC.load()
-                fragC_bf16.store(_f32_to_bf16(vec_f32))
+                # A closure helper keeps BF16 rounding in this kernel's JIT cache key.
+                _cvt_f32_to_bf16(fragC, fragC_bf16)
                 fx.copy(copy_atom_, fragC_bf16r, thrv_ldsCt[None, None, None, ldsc_idx])
 
             arg_p_output = fx.flat_divide(arg_p_output, (BLOCK_M, BLOCK_N))

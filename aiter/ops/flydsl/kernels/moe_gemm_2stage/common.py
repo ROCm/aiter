@@ -32,8 +32,8 @@ _SIMPLIFIED_BF16_RTE = os.environ.get(
 def _f32_to_bf16_rta(value):
     # Matches standard RTA for finite values and Inf, but does not preserve all NaNs.
     # Versus RTE, even-LSB halfway cases produce adjacent BF16 encodings.
-    # e.g.: 0x3f808000: RTE=0x3f80，RTA=0x3f81
-    #       0xbf808000: RTE=0xbf80，RTA=0xbf81
+    # e.g.: 0x3f808000: RTE=0x3f80, RTA=0x3f81
+    #       0xbf808000: RTE=0xbf80, RTA=0xbf81
     return (
         ((value.bitcast(fx.Uint32) + fx.Uint32(0x8000)) >> 16)
         .to(fx.Uint16)
