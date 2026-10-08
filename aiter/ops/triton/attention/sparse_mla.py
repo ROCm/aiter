@@ -280,8 +280,11 @@ def _classify_flat(kv, width, slots, kv_scale, what):
         raise ValueError(
             f"{what}: {kv.dtype} is not {arch}'s fp8; the kernel reads {native}"
         )
-    if kv.element_size() != 1:
-        raise ValueError(f"{what}: unsupported cache dtype {kv.dtype}")
+    if kv.dtype not in (native, torch.uint8):
+        raise ValueError(
+            f"{what}: unsupported cache dtype {kv.dtype}; a flat fp8 cache is "
+            f"{native} or a uint8 view of it"
+        )
     if kv_scale is None:
         raise ValueError(
             f"{what}: a flat fp8 cache needs kv_scale, [1] f32 (fp8_scalar) or "
