@@ -49,12 +49,25 @@ def check_mxfp8_input(data, token, model_dim, expert, topk, block_m, dtype):
     assert scale.dtype == dtypes.fp8_e8m0
     assert q.shape == (token, model_dim)
     assert torch.equal(ref_q.view(torch.uint8), q.view(torch.uint8))
-    assert torch.equal(ref_s.view(torch.uint8), scale.view(torch.uint8))
-    reconstructed = q.float() * fp4_utils.e8m0_to_f32(scale).repeat_interleave(32, 1)
+    nonzero_group = data["input"].reshape(token, -1, 32).abs().amax(-1) > 0
+    # HIP floors amax at 1e-10; the torch helper keeps exponent 0 for zero
+    # groups. Require exact positive-group scales and joint decoded values.
+    assert torch.equal(
+        ref_s.view(torch.uint8)[nonzero_group],
+        scale.view(torch.uint8)[nonzero_group],
+    )
+    scale_f32 = fp4_utils.e8m0_to_f32(scale)
+    assert torch.isfinite(scale_f32).all()
+    assert (scale_f32 > 0).all()
+    reconstructed = q.float() * scale_f32.repeat_interleave(32, 1)
+    ref_reconstructed = ref_q.float() * fp4_utils.e8m0_to_f32(ref_s).repeat_interleave(
+        32, 1
+    )
+    assert torch.equal(reconstructed, ref_reconstructed)
     assert torch.isfinite(reconstructed).all()
     assert torch.equal(
-        reconstructed[: token // 2, :32],
-        torch.zeros_like(reconstructed[: token // 2, :32]),
+        reconstructed.reshape(token, -1, 32)[~nonzero_group],
+        torch.zeros_like(reconstructed.reshape(token, -1, 32)[~nonzero_group]),
     )
     error = checkAllclose(
         data["input"].float(),
