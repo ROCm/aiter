@@ -162,7 +162,7 @@ def get_kernel_config_triton(m, n, k, routing_data):
         "split_k": split_k,
         "waves_per_eu": 0,
         "matrix_instr_nonkdim": 16,
-        "kpack": 1,
+        "kpack": 2 if block_m <= 32 else 1,
     }
     return ret
 
