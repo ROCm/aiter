@@ -13,6 +13,9 @@ from aiter.ops.triton._triton_kernels.fusions.fused_kv_cache import (
     _fused_qk_rope_cosine_cache_llama_kernel,
 )
 from aiter.ops.triton._triton_kernels.fusions.fused_kv_cache import (
+    _fused_qpe_rope_and_cache_mla_kernel as triton_fused_qpe_rope_and_cache_mla_kernel,
+)
+from aiter.ops.triton._triton_kernels.fusions.fused_kv_cache import (
     _fused_qk_rope_reshape_and_cache_kernel as triton_fused_qk_rope_reshape_and_cache_kernel,
 )
 
@@ -37,6 +40,9 @@ _LOGGER = AiterTritonLogger()
 DEVICE_ARCH = arch_info.get_arch()
 
 _BLOCK_H_MIN_TOKENS = int(os.environ.get("AITER_FUSED_KV_CACHE_MIN_TOKENS", "128"))
+# Head tile / warps of the q_nope-prestored MLA rope kernel.
+_QPE_ROPE_BLOCK_H = int(os.environ.get("AITER_QPE_ROPE_BLOCK_H", "32"))
+_QPE_ROPE_NUM_WARPS = int(os.environ.get("AITER_QPE_ROPE_NUM_WARPS", "4"))
 
 
 def fused_qk_rope_cat_and_cache_mla_fake_tensor(
@@ -118,6 +124,7 @@ def fused_qk_rope_cat_and_cache_mla(
     q_out_dtype: torch.dtype = None,
     shuffled_kv_cache: bool = False,
     upcast_operand: bool = False,
+    q_nope_prestored: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Perform RoPE on q_pe and k_pe and concat q_nope with q_pe and k_nope with k_pe along the last dimension
@@ -133,6 +140,10 @@ def fused_qk_rope_cat_and_cache_mla(
 
     B is the number of decode tokens, B_slot is the number of prefill + decode tokens, B_cache is the max number of tokens of kv_cache
     QH must be multiple of KH
+
+    - q_nope_prestored: q_nope already lives in q_out[..., :D1] (written there
+      by its producer); q_nope is then only used for shape checks, and a
+      head-blocked kernel ropes just q_pe and writes k. Needs q_out and KH == 1.
 
     Returns:
     - q_out: The output matrix with shape (B, QH, D1+D2).
@@ -214,6 +225,9 @@ def fused_qk_rope_cat_and_cache_mla(
     if isinstance(k_scale, torch.Tensor):
         assert k_scale.numel() == 1, "k_scale should be a single-element torch.Tensor"
     reuse_freqs_front_part = d_freq == d_pe // 2
+    assert not (
+        q_nope_prestored and q_out is None
+    ), "q_nope_prestored requires the q_out that already holds q_nope"
 
     if q_out is None:
         q_out = torch.empty(
@@ -267,6 +281,53 @@ def fused_qk_rope_cat_and_cache_mla(
     assert (
         kv_cache_stride_d == 1
     ), "The stride of the last dimension of KV cache must be 1"
+
+    if q_nope_prestored:
+        assert kh == 1, "q_nope_prestored supports a single KV head (MLA) only"
+        block_h = min(triton.next_power_of_2(qh), _QPE_ROPE_BLOCK_H)
+        triton_fused_qpe_rope_and_cache_mla_kernel[(b_slot, triton.cdiv(qh, block_h))](
+            q_pe,
+            k_nope,
+            k_pe,
+            pos,
+            cos,
+            sin,
+            q_out,
+            k_pe_out,
+            kv_cache,
+            slot_mapping,
+            b,
+            *q_pe.stride(),
+            k_nope.stride(0),
+            k_nope.stride(2),
+            k_pe.stride(0),
+            k_pe.stride(2),
+            pos.stride(0),
+            cos.stride(0),
+            cos.stride(-1),
+            *q_out.stride(),
+            k_pe_out.stride(0),
+            k_pe_out.stride(2),
+            kv_cache_stride_b,
+            kv_cache_stride_h,
+            kv_cache_stride_d,
+            k_scale_ptr=k_scale,
+            QH=qh,
+            BLOCK_H=block_h,
+            REUSE_FREQS_FRONT_PART=reuse_freqs_front_part,
+            IS_NEOX=is_neox,
+            BLOCK_D_nope=d_nope,
+            BLOCK_D_pe=d_pe,
+            BLOCK_D_HALF_pe=d_pe // 2,
+            BLOCK_SIZE=block_size,
+            SHUFFLED_KV_CACHE=shuffled_kv_cache,
+            SCALE_K_WIDTH_NOPE=SCALE_K_WIDTH_NOPE,
+            SCALE_K_WIDTH_ROPE=SCALE_K_WIDTH_ROPE,
+            HAVE_K_SCALE=(k_scale is not None and apply_scale),
+            UPCAST_OPERAND=upcast_operand,
+            num_warps=_QPE_ROPE_NUM_WARPS,
+        )
+        return q_out, decode_q_pe_out, k_pe_out, q_nope_zeros_out
 
     n_pid = b * qh + (b_slot - b) * kh
     grid = (n_pid, 1, 1)
