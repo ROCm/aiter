@@ -1610,50 +1610,56 @@ def launch_gemm_a8w4_tdm(
 
                     dispatch_wave_job(steady_mid)
 
-                    if const_expr(rolled_drain):
-                        # Keep LDS stage addresses dynamic to avoid expanding
-                        # the last drain tile into per-load address arithmetic.
-                        for j in range(PRE):
-                            kt = n_steady + j
-                            # Tensor wait counts must be compile-time immediates.
+                    def drain_fence(j):
+                        # Select only the immediate wait count. Both loop forms
+                        # call this at the same point in the tile's pipeline.
+                        if const_expr(rolled_drain):
                             for wait_stage in range_constexpr(PRE):
                                 if j == wait_stage:
                                     pipeline_fence(
                                         outstanding=TDM_PER
                                         * max(0, num_buffers - 2 - wait_stage)
                                     )
-                            compute_ktile(
-                                kt % num_buffers,
-                                kt,
-                                None,
-                                interleaved_lds_load=interleaved_lds_load,
+                        else:
+                            pipeline_fence(
+                                outstanding=TDM_PER * max(0, num_buffers - 2 - j)
                             )
+
+                    def compute_drain_tile(j, has_next):
+                        kt = n_steady + j
+                        if const_expr(not next_stage_on):
+                            drain_fence(j)
+                        next_stage_buf = (
+                            (kt + 1) % num_buffers if const_expr(has_next) else None
+                        )
+                        compute_ktile(
+                            kt % num_buffers,
+                            kt,
+                            None,
+                            next_stage_on,
+                            next_stage_buf,
+                            next_stage_fence_fn=(
+                                (lambda: drain_fence(j))
+                                if const_expr(has_next)
+                                else None
+                            ),
+                            interleaved_lds_load=interleaved_lds_load,
+                        )
+
+                    # Keep carry and fence placement identical in both loop
+                    # forms. With prefetch, the last tile consumes the carry
+                    # but must neither fence nor load a nonexistent next tile.
+                    # Peel it to avoid a runtime branch around the full compute
+                    # body, which causes VGPR spills with the carried rmem state.
+                    drain_tiles = PRE - 1 if next_stage_on else PRE
+                    if const_expr(rolled_drain):
+                        for j in range(drain_tiles):
+                            compute_drain_tile(j, bool(next_stage_on))
                     else:
-                        for j in range_constexpr(PRE):
-                            kt = n_steady + j
-                            buf = kt % num_buffers
-                            has_next = next_stage_on and j + 1 < PRE
-                            if const_expr(not next_stage_on):
-                                pipeline_fence(
-                                    outstanding=TDM_PER * max(0, num_buffers - 2 - j)
-                                )
-                            next_stage_buf = (
-                                (kt + 1) % num_buffers if const_expr(has_next) else None
-                            )
-                            compute_ktile(
-                                buf,
-                                kt,
-                                None,
-                                next_stage_on,
-                                next_stage_buf,
-                                None,
-                                (
-                                    TDM_PER * max(0, num_buffers - 2 - j)
-                                    if const_expr(has_next)
-                                    else None
-                                ),
-                                interleaved_lds_load=interleaved_lds_load,
-                            )
+                        for j in range_constexpr(drain_tiles):
+                            compute_drain_tile(j, bool(next_stage_on))
+                    if const_expr(next_stage_on):
+                        compute_drain_tile(PRE - 1, False)
 
             # This is a compile-time selection. The interleaved version has one
             # mainloop body and no wave-parity branch.
