@@ -131,7 +131,6 @@ class AttentionConfig:
     SPLIT_UNMASKED_LOOP: tl.constexpr
     K_WIDTH: tl.constexpr
     NUM_SEGMENTS_PER_SEQ: tl.constexpr
-    GRID_3D: tl.constexpr
     RCP_LN2: tl.constexpr
     KV_CACHE_MODIFIER: tl.constexpr
     stride_k_cache_3: tl.constexpr
@@ -158,7 +157,6 @@ class AttentionConfig:
         SPLIT_UNMASKED_LOOP,
         K_WIDTH,
         NUM_SEGMENTS_PER_SEQ,
-        GRID_3D,
         stride_k_cache_3,
         stride_v_cache_3,
     ):
@@ -180,7 +178,6 @@ class AttentionConfig:
         self.SPLIT_UNMASKED_LOOP = tl.constexpr(SPLIT_UNMASKED_LOOP)
         self.K_WIDTH = tl.constexpr(K_WIDTH)
         self.NUM_SEGMENTS_PER_SEQ = tl.constexpr(NUM_SEGMENTS_PER_SEQ)
-        self.GRID_3D = tl.constexpr(GRID_3D)
         # needed to use exp2 (exp2 -> exp conversion)
         self.RCP_LN2 = tl.constexpr(1.4426950408889634)
         self.KV_CACHE_MODIFIER = tl.constexpr(".cg" if ALL_DECODE else "")
@@ -945,14 +942,12 @@ def attention_loop(
     """
     for j in range(tile_start, tile_end):
         K, V, seq_offset = kv_loader.load_tile(j, pgm.q.dtype, MASKED)
-        # the 3d grid builds the causal mask before the dot, the 2d grid after
-        # it; each keeps the instruction order its configs are tuned with
-        if MASKED and pgm.cfg.GRID_3D:
+        # the mask only depends on positions; built ahead of the dot it can
+        # overlap the matrix instructions
+        if MASKED:
             seq_mask = pgm.causal_mask(seq_offset)
         S = pgm.compute_qk(K)
         if MASKED:
-            if not pgm.cfg.GRID_3D:
-                seq_mask = pgm.causal_mask(seq_offset)
             S = pgm.apply_mask_qk(S, seq_offset, seq_mask)
         S = pgm.apply_score_bias(S, seq_offset)
         P, M, L, acc = pgm.softmax_update(S, M, L, acc)
@@ -1082,7 +1077,6 @@ def kernel_unified_attention(
         SPLIT_UNMASKED_LOOP,
         K_WIDTH,
         NUM_SEGMENTS_PER_SEQ,
-        GRID_3D,
         stride_k_cache_3,
         stride_v_cache_3,
     )
