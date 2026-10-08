@@ -36,6 +36,13 @@ MFMA32_SMALL_KERNEL = "_ZN5aiter40f6f4gemm_bf16_per1x32Fp6Fp4_m32_s0_a4_ntE"
 MFMA32_SWZ0_KERNEL = "_ZN5aiter39f6f4gemm_bf16_per1x32Fp6Fp4_m32_s0_a4_tE"
 MFMA32_GROUPED_KERNEL = "_ZN5aiter39f6f4gemm_bf16_per1x32Fp6Fp4_m32_s3_a4_tE"
 MFMA32_LONG_K_KERNEL = "_ZN5aiter39f6f4gemm_bf16_per1x32Fp6Fp4_m32_s3_a5_tE"
+SPECIALIZED_SQUARE_KERNEL = (
+    "_ZN5aiter49f6f4gemm_bf16_per1x32Fp6Fp4_m9472_n5120_k5120_m82E"
+)
+SPECIALIZED_UP_KERNEL = "_ZN5aiter50f6f4gemm_bf16_per1x32Fp6Fp4_m9472_n13824_k5120_m82E"
+SPECIALIZED_DOWN_KERNEL = (
+    "_ZN5aiter50f6f4gemm_bf16_per1x32Fp6Fp4_m9472_n5120_k13824_m82E"
+)
 
 
 def _is_gfx950() -> bool:
@@ -286,13 +293,16 @@ def test_a6w4_long_k_path_matches_swizzle0_bitwise():
     assert torch.equal(actual, baseline)
 
 
-def test_a6w4_dispatch_respects_grouped_kernel_bounds():
+def test_a6w4_dispatch_uses_specialized_kernels_and_respects_default_bounds():
     assert _select_gemm_a6w4_kernel(512, 5120, 5120, None) == MFMA32_SMALL_KERNEL
-    # Equality is intentionally format-specific: A6W4's tuned square default
-    # is grouped, while A4W6's is natural order.
-    assert _select_gemm_a6w4_kernel(9450, 5120, 5120, None) == MFMA32_GROUPED_KERNEL
-    assert _select_gemm_a6w4_kernel(9450, 13824, 5120, None) == MFMA32_GROUPED_KERNEL
-    assert _select_gemm_a6w4_kernel(9450, 5120, 13824, None) == MFMA32_LONG_K_KERNEL
+    assert a6w4_ops._default_gemm_a6w4_kernel(9450, 5120, 5120) == MFMA32_GROUPED_KERNEL
+    assert (
+        a6w4_ops._default_gemm_a6w4_kernel(9450, 13824, 5120) == MFMA32_GROUPED_KERNEL
+    )
+    assert a6w4_ops._default_gemm_a6w4_kernel(9450, 5120, 13824) == MFMA32_LONG_K_KERNEL
+    assert _select_gemm_a6w4_kernel(9450, 5120, 5120, None) == SPECIALIZED_SQUARE_KERNEL
+    assert _select_gemm_a6w4_kernel(9450, 13824, 5120, None) == SPECIALIZED_UP_KERNEL
+    assert _select_gemm_a6w4_kernel(9450, 5120, 13824, None) == SPECIALIZED_DOWN_KERNEL
     assert _select_gemm_a6w4_kernel(9450, 27648, 5120, None) == MFMA32_SWZ0_KERNEL
     assert _select_gemm_a6w4_kernel(131073, 13824, 5120, None) == MFMA32_SWZ0_KERNEL
 
