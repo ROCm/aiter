@@ -32,6 +32,11 @@ from pathlib import Path
 ATOL = RTOL = 0.005
 NEAR_BEST = 0.97
 DEFAULT_BUDGETS = (128, 256, 512, 1024, 2048, 4096)
+KV_DTYPES = {
+    "gfx942": "float8_e4m3fnuz",
+    "gfx950": "float8_e4m3fn",
+    "gfx1250": "float8_e4m3fn",
+}
 STATIC_SHAPE_FIELDS = (
     "batch_size",
     "query_length",
@@ -228,14 +233,14 @@ def _validate_shape(shape, *, benchmark=False):
 
 def make_key(shape, architecture, num_cu):
     """Build a lookup key from the device and static attention geometry."""
-    if architecture not in ("gfx942", "gfx950"):
-        raise ValueError("Supported architectures are gfx942 and gfx950")
+    if architecture not in KV_DTYPES:
+        raise ValueError(f"Supported architectures are {', '.join(KV_DTYPES)}")
     positive_int(num_cu, "num_cu")
     _validate_shape(shape)
     return {
         "architecture": architecture,
         "num_cu": num_cu,
-        "kv_dtype": "float8_e4m3fn" if architecture == "gfx950" else "float8_e4m3fnuz",
+        "kv_dtype": KV_DTYPES[architecture],
         "shape": {k: shape[k] for k in STATIC_SHAPE_FIELDS},
     }
 
@@ -793,11 +798,7 @@ class _TuningSession:
 
         torch = self.torch
         device = torch.device("cuda", self.info["device"])
-        fp8 = (
-            torch.float8_e4m3fn
-            if self.info["architecture"] == "gfx950"
-            else torch.float8_e4m3fnuz
-        )
+        fp8 = getattr(torch, KV_DTYPES[self.info["architecture"]])
         self.inputs = _make_inputs(torch, self.problem, device, fp8)
         actual = storage_key(
             *(
@@ -1061,7 +1062,7 @@ def main(argv=None):
     )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--architecture", choices=("gfx942", "gfx950"))
+    parser.add_argument("--architecture", choices=tuple(KV_DTYPES))
     parser.add_argument("--num-cu", type=int)
     parser.add_argument(
         "--dry-run", action="store_true", help="Preview shapes and candidate budgets"
