@@ -423,6 +423,9 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
 ):
     # Accepted only to keep the signature aligned with the Triton kernel; the
     # TDM cos/sin staging below has no NoPE variant.
+    # TODO: Support APPLY_ROPE=False (NoPE layers) on gfx1250. Skip the cos/sin
+    # TDM loads and rotation and pass q_pe/k_pe through unchanged, as the
+    # Triton kernel does.
     tl.static_assert(APPLY_ROPE, "gluon MLA cat+cache kernel requires rope")
 
     # 1-warp (wave32) blocked layouts matching the Triton-generated ttgir.
