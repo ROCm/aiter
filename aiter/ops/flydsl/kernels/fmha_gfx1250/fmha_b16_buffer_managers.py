@@ -1054,8 +1054,6 @@ class QManager16bV2:
     ``[rows, 1, hdim]`` at gqa==1. LDS row stride matches K's (``hdim + _Q_PAD_ELEMS``).
     """
 
-    _PART1_COUNTERS = ("tensorcnt",)  # part1 issues TDM copies only
-
     def __init__(
         self,
         *,
@@ -1168,27 +1166,15 @@ class QManager16bV2:
         self._warp_region = warp_region
         self._lane_idx = lane_idx
 
-    def load_q_to_vgpr_part2(self, *, scale, skip_tensorcnt=-1, skip_asynccnt=-1):
-        """Drain this wave's Q TDM and read its tile into WMMA B-fragments, ``scale`` folded
-        (None leaves Q raw). Returns one list of ``k_tiles`` fragments per q-tile, like
-        ``QManager16bV1``.
+    def load_q_to_vgpr_part2(self, *, scale):
+        """Read this wave's Q tile into WMMA B-fragments, ``scale`` folded (None leaves Q
+        raw). Returns one list of ``k_tiles`` fragments per q-tile, like ``QManager16bV1``.
+
+        Part1 issues TDM copies only; the caller drains them, since only it knows what it
+        issued in between and the wait immediate may have to sit under a runtime branch.
 
         The read collapses to 1 per-lane base + compile-time immediates (like K): lane ``l``
-        reads row ``l%16``, d-byte ``(l//16)*16``.
-
-        Each ``skip_*`` is how many copies the caller issued AFTER part1 that may stay in
-        flight on that counter: the counters retire in issue order, so waiting down to that
-        count drains Q alone. The default -1 means the caller named nothing, and the wait is
-        then emitted at 0 for the counters part1 itself uses (``_PART1_COUNTERS``) and
-        omitted for the rest."""
-        for _cnt, _skip, _wait in (
-            ("tensorcnt", skip_tensorcnt, tdm_ops.tensor_wait),
-            ("asynccnt", skip_asynccnt, rocdl.s_wait_asynccnt),
-        ):
-            if _skip >= 0:
-                _wait(_skip)
-            elif _cnt in self._PART1_COUNTERS:
-                _wait(0)
+        reads row ``l%16``, d-byte ``(l//16)*16``."""
         v8_ty = fx.Vector.make_type(_CHUNK_ELEMS, self.elem_dtype)
         scale_bf16 = None if scale is None else scale.to(self.elem_dtype)
         lane = self._lane_idx

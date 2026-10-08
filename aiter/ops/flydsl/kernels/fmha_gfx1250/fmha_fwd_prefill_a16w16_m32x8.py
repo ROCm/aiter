@@ -897,59 +897,71 @@ def _alloc_lds():
     return fx.Int32(fx.ptrtoint(smem.peek().ptr))
 
 
-def _core_attention_multi_kv_tiles(
+# Keys ``_prologue_attention`` shares with the compute cores' kwarg dict.
+_PRO_KEYS = (
+    "qk_hdim",
+    "v_hdim",
+    "n_block",
+    "mask_left",
+    "mask_right",
+    "gqa_ratio",
+    "num_q_tiles_per_wave",
+    "ptr_Q",
+    "ptr_K",
+    "ptr_V",
+    "softmax_scale",
+    "stride_q_seq",
+    "stride_k_seq",
+    "stride_v_seq",
+    "stride_q_head",
+    "stride_k_head",
+    "stride_v_head",
+    "q_start",
+    "q_len",
+    "kv_start",
+    "kv_len",
+    "window_left",
+    "window_right",
+    "elem_dtype",
+)
+
+
+def _prologue_attention(
     *,
     qk_hdim,
     v_hdim,
-    n_block,  # compile-time KV block width (columns of one QK GEMM tile)
-    mask_left,  # compile-time: bound the left band edge (finite window_left)
-    mask_right,  # compile-time: bound the right band edge (causal or finite window_right)
-    return_lse,
-    has_sink,  # compile-time: fold a per-head sink logit into the softmax denom
-    gqa_ratio,  # compile-time GQA group size = nheads_q // nheads_kv
-    num_q_tiles_per_wave,  # compile-time q-WMMA tiles per wave; BLOCK_M = 16*this*8
-    ptr_O,
+    n_block,
+    mask_left,
+    mask_right,
+    gqa_ratio,
+    num_q_tiles_per_wave,
     ptr_Q,
     ptr_K,
     ptr_V,
-    ptr_LSE,
-    ptr_sink,  # [nheads_q] fp32 per-head sink logits; read only when has_sink
     softmax_scale,
     stride_q_seq,
     stride_k_seq,
     stride_v_seq,
-    stride_o_seq,
     stride_q_head,
     stride_k_head,
     stride_v_head,
-    stride_o_head,
-    # LSE addressing (element strides + per-batch bound), resolved by the caller.
-    # Only consumed when return_lse; the caller may pass anything otherwise.
-    stride_lse_seq,
-    stride_lse_head,
-    lse_base_elems,  # first element offset of this batch's LSE slab
-    lse_num_records_bytes,  # buffer-resource bound (below the 0x7FFFFFFF drop)
-    # Per-batch token ranges (fx.Int32), resolved by the caller:
-    q_start,  # first Q token index of this batch in the global tensor
-    q_len,  # valid Q tokens in this batch
-    kv_start,  # first K/V token index of this batch
-    kv_len,  # valid K/V tokens in this batch
-    # Sliding-window bounds (runtime fx.Int32, >= 0). window_left read only when
-    # mask_left, window_right only when mask_right. Causal == mask_right, window_right=0.
+    q_start,
+    q_len,
+    kv_start,
+    kv_len,
     window_left,
     window_right,
+    elem_dtype,
     warp_idx,  # runtime fx.Int32 wave index
-    warp_type,  # compile-time WarpType (LO/HI x SIMD parity)
     lds_base,  # LDS base (fx.Int32), allocated once by the caller (_alloc_lds)
-    elem_dtype,  # compile-time fx.BFloat16 / fx.Float16 for Q/K/V/P/O fragments
 ):
-    """Layout-agnostic m32x8 compute, shared by the THD and BSHD kernel entries.
+    """Everything both halves do before the first body, traced once per build.
 
-    The caller resolves the per-batch token ranges (``q_start``/``q_len`` and
-    ``kv_start``/``kv_len``) — the only part that differs between varlen and batched —
-    and passes them here. It also dispatches on runtime ``warp_type``, tracing this body
-    once per compile-time value; the two instantiations differ only in their main-loop
-    phase ordering (LO drives the K load, HI shadows it).
+    The halves differ in four things only: which band they copy (LO K, HI V), which
+    slot their second copy fills, how many copies fit in Q's global-load shadow, and
+    HI's resting priority. All four ride two runtime warp-type branches here, both
+    inside Q's global load; everything else -- the managers, the LDS map, Q's own
+    load, and this WG's KV span -- is identical and reaches the binary once.
     """
     BLOCK_M = _block_m(num_q_tiles_per_wave)
     lane_idx = _lane_id()
@@ -1142,6 +1154,227 @@ def _core_attention_multi_kv_tiles(
         num_producer_warps=KV_PRODUCER_WARPS,
         lane_idx=lane_idx,
     )
+    def _k_desc(slot, row0, valid):
+        """K descriptor for one tile, addressed off the slot's low-half base. Pure until
+        ``.async_load()``; which transport it carries (async vs TDM) is the manager's
+        business, not this call site's."""
+        return k_mgr.load_descriptor(
+            ptr_lds=_k_bufs_at(slot),
+            ptr_src=ptr_K,
+            stride_seq=stride_k_seq,
+            stride_head=stride_k_head,
+            head=kv_head,
+            row0=kv_start + row0,
+            valid=valid,
+            ctx=_kv_ctx,
+        )
+
+    def _v_desc(slot, row0, valid):
+        return v_mgr.load_descriptor(
+            ptr_lds=_v_bufs_at(slot),
+            ptr_src=ptr_V,
+            stride_seq=stride_v_seq,
+            stride_head=stride_v_head,
+            head=kv_head,
+            row0=kv_start + row0,
+            valid=valid,
+            ctx=_kv_ctx,
+        )
+
+    # LO copies the K band, HI the V band. Each half's second copy differs too: LO's is
+    # K(start+1) into slot 2, the tile the body no longer issues once K runs ahead; HI's
+    # is V(start) into slot 0, read by body start's dead PV. All four are built here --
+    # the address math is pure and sits in Q's global-load shadow either way; only the
+    # ``.async_load()``s go under the warp-type branch.
+    _start_valid = _kv_valid(start_tile)
+    fill_tile = start_tile + fx.Int32(1)
+    k0 = _k_desc(_k_lds_buf(_PSLOT[1]), start_row0, _start_valid)
+    k_fill = _k_desc(_k_lds_buf(_PSLOT[2]), _tile_row0(fill_tile), _kv_valid(fill_tile))
+    v0 = _v_desc(_k_lds_buf(_PSLOT[1]), start_row0, _start_valid)
+    v_fill = _v_desc(_k_lds_buf(_PSLOT[0]), start_row0, _start_valid)
+
+    # Per-half counter usage, straight off the descriptors' declared counts. A counter a
+    # half's copies never touch gets -1 ("do not wait on it at all"), NOT 0. The one it
+    # does touch gets that half's per-tile copy count -- the depth LO's partial
+    # steady-state fence names to leave the newest tile in flight. The two bands differ
+    # whenever qk_hdim != v_hdim, so the core takes the pair and picks its own.
+    kv_counts = {
+        WarpType.LO: (k0.tensorcnt or -1, k0.asynccnt or -1),
+        WarpType.HI: (v0.tensorcnt or -1, v0.asynccnt or -1),
+    }
+    _drains = {w: _kv_drain_depths(*c) for w, c in kv_counts.items()}
+    # Fully-drained depths name only WHICH counters are live, and both bands live on the
+    # same one, so one prologue fence serves both halves.
+    assert _drains[WarpType.LO] == _drains[WarpType.HI], "prologue fence is per-WG"
+    _kv_drain = _drains[WarpType.LO]
+
+    # When each copy goes out is NOT transport-independent. Under V2, copies whose
+    # destination misses Q go out BEFORE Q is read, so their global latency overlaps Q's
+    # and the wait drops tensorcnt down to them instead of to 0; only LO's K-ahead fill
+    # (logical slot 2) lands on Q, so that one waits for the barrier. Under V1 there is no
+    # such overlap to have: Q's own stage is on asynccnt too and its part2 waits that
+    # counter to a depth counted over Q's loads ALONE, so a tile copy issued first would
+    # corrupt the count. Everything goes after the barrier, and after part2, which ends at
+    # depth 0.
+    if USE_TDM_LOADER:
+        _early = {WarpType.LO: [k0], WarpType.HI: [v0, v_fill]}
+        _late = {WarpType.LO: [k_fill], WarpType.HI: []}
+    else:
+        _early = {WarpType.LO: [], WarpType.HI: []}
+        _late = {WarpType.LO: [k0, k_fill], WarpType.HI: [v0, v_fill]}
+
+    _is_lo = warp_idx < fx.Int32(NUM_WAVES // 2)
+    if USE_TDM_LOADER:
+        # The halves issue different numbers of copies here, so the drain immediate is
+        # per-half and rides the same branch. Both sit inside Q's global load.
+        @flyc.jit
+        def _issue_early(is_lo):
+            if is_lo:
+                for _d in _early[WarpType.LO]:
+                    _d.async_load()
+                tdm_ops.tensor_wait(sum(d.tensorcnt for d in _early[WarpType.LO]))
+            else:
+                for _d in _early[WarpType.HI]:
+                    _d.async_load()
+                tdm_ops.tensor_wait(sum(d.tensorcnt for d in _early[WarpType.HI]))
+
+        _issue_early(_is_lo)
+    q_frags = q_mgr.load_q_to_vgpr_part2(scale=_q_scale)
+    # Q's ds_loads must be RETIRED, not just issued, before the barrier that releases
+    # the late copies onto Q's chunks: gpu.barrier() does not retire LDS reads, and Q's
+    # atom is per-wave while a tile's is per-producer (wave A's Q region is written by
+    # wave B's share of the tile).
+    rocdl.s_wait_dscnt(0)
+    gpu.barrier()
+
+    @flyc.jit
+    def _issue_late(is_lo):
+        if is_lo:
+            for _d in _late[WarpType.LO]:
+                _d.async_load()
+        else:
+            # HI enters its resting priority at the first point both halves have reached:
+            # from here on the lagging half must not lose arbitration to its SIMD-mate,
+            # and _pv_qk_gemm's exit restores this same level after every gemm.
+            rocdl.s_setprio(1)
+            for _d in _late[WarpType.HI]:
+                _d.async_load()
+
+    _issue_late(_is_lo)
+    _kv_fence(*_kv_drain)
+
+    return {
+        "lane_idx": lane_idx,
+        "kv_head": kv_head,
+        "q_head_idx": q_head_idx,
+        "seq_idx": seq_idx,
+        "k_mgr": k_mgr,
+        "v_mgr": v_mgr,
+        "kv_ctx": _kv_ctx,
+        "k_lds_buf": _k_lds_buf,
+        "k_bufs_at": _k_bufs_at,
+        "v_bufs_at": _v_bufs_at,
+        "k_lds_bufs": _k_lds_bufs,
+        "v_lds_bufs": _v_lds_bufs,
+        "kv_swap_delta": _kv_swap_delta,
+        "split_stride": _SPLIT_STRIDE,
+        "pslot": _PSLOT,
+        "block_x": block_x,
+        "causal_off": causal_off,
+        "num_tiles": num_tiles,
+        "last_tile": last_tile,
+        "start_tile": start_tile,
+        "tile_row0": _tile_row0,
+        "kv_valid": _kv_valid,
+        "kv_counts": kv_counts,
+        "kv_drain": _kv_drain,
+        "q_frags": q_frags,
+    }
+
+
+def _core_attention_multi_kv_tiles(
+    *,
+    qk_hdim,
+    v_hdim,
+    n_block,  # compile-time KV block width (columns of one QK GEMM tile)
+    mask_left,  # compile-time: bound the left band edge (finite window_left)
+    mask_right,  # compile-time: bound the right band edge (causal or finite window_right)
+    return_lse,
+    has_sink,  # compile-time: fold a per-head sink logit into the softmax denom
+    gqa_ratio,  # compile-time GQA group size = nheads_q // nheads_kv
+    num_q_tiles_per_wave,  # compile-time q-WMMA tiles per wave; BLOCK_M = 16*this*8
+    ptr_O,
+    ptr_Q,
+    ptr_K,
+    ptr_V,
+    ptr_LSE,
+    ptr_sink,  # [nheads_q] fp32 per-head sink logits; read only when has_sink
+    softmax_scale,
+    stride_q_seq,
+    stride_k_seq,
+    stride_v_seq,
+    stride_o_seq,
+    stride_q_head,
+    stride_k_head,
+    stride_v_head,
+    stride_o_head,
+    # LSE addressing (element strides + per-batch bound), resolved by the caller.
+    # Only consumed when return_lse; the caller may pass anything otherwise.
+    stride_lse_seq,
+    stride_lse_head,
+    lse_base_elems,  # first element offset of this batch's LSE slab
+    lse_num_records_bytes,  # buffer-resource bound (below the 0x7FFFFFFF drop)
+    # Per-batch token ranges (fx.Int32), resolved by the caller:
+    q_start,  # first Q token index of this batch in the global tensor
+    q_len,  # valid Q tokens in this batch
+    kv_start,  # first K/V token index of this batch
+    kv_len,  # valid K/V tokens in this batch
+    # Sliding-window bounds (runtime fx.Int32, >= 0). window_left read only when
+    # mask_left, window_right only when mask_right. Causal == mask_right, window_right=0.
+    window_left,
+    window_right,
+    warp_idx,  # runtime fx.Int32 wave index
+    warp_type,  # compile-time WarpType (LO/HI x SIMD parity)
+    lds_base,  # LDS base (fx.Int32), allocated once by the caller (_alloc_lds)
+    pro,  # dict from _prologue_attention: managers, LDS map, KV span, Q fragments
+    elem_dtype,  # compile-time fx.BFloat16 / fx.Float16 for Q/K/V/P/O fragments
+):
+    """Layout-agnostic m32x8 compute, shared by the THD and BSHD kernel entries.
+
+    Takes over from ``_prologue_attention`` (Q already in VGPR, the first tiles already
+    in flight) and hands ``_epilogue_attention`` the finished softmax/O state. The caller
+    dispatches on runtime ``warp_type``, tracing this body once per compile-time value;
+    the two instantiations differ only in their main-loop phase ordering (LO drives the
+    K load, HI shadows it), which is why only this middle part is duplicated.
+    """
+    BLOCK_M = _block_m(num_q_tiles_per_wave)
+    lane_idx = pro["lane_idx"]
+    kv_head = pro["kv_head"]
+    q_head_idx = pro["q_head_idx"]
+    seq_idx = pro["seq_idx"]
+    k_mgr = pro["k_mgr"]
+    v_mgr = pro["v_mgr"]
+    _kv_ctx = pro["kv_ctx"]
+    _k_lds_buf = pro["k_lds_buf"]
+    _k_bufs_at = pro["k_bufs_at"]
+    _v_bufs_at = pro["v_bufs_at"]
+    _k_lds_bufs = pro["k_lds_bufs"]
+    _v_lds_bufs = pro["v_lds_bufs"]
+    _kv_swap_delta = pro["kv_swap_delta"]
+    _SPLIT_STRIDE = pro["split_stride"]
+    _PSLOT = pro["pslot"]
+    block_x = pro["block_x"]
+    causal_off = pro["causal_off"]
+    num_tiles = pro["num_tiles"]
+    last_tile = pro["last_tile"]
+    start_tile = pro["start_tile"]
+    _tile_row0 = pro["tile_row0"]
+    _kv_valid = pro["kv_valid"]
+    _kv_drain = pro["kv_drain"]
+    q_frags = pro["q_frags"]
+    # This half's per-tile copy count: the depth LO's partial steady-state fence names to
+    # leave the newest tile in flight. The K and V bands differ whenever qk_hdim != v_hdim.
+    num_tdm_copies, num_async_copies = pro["kv_counts"][warp_type]
 
     def _get_kv_desc(slot, row0, valid):
         """This half's BufferOpDescriptor for one tile: LO issues every K copy, HI every
@@ -1168,63 +1401,6 @@ def _core_attention_multi_kv_tiles(
             valid=valid,
             ctx=_kv_ctx,
         )
-
-    kv0 = _get_kv_desc(_k_lds_buf(_PSLOT[1]), start_row0, _kv_valid(start_tile))
-    # LO's second copy is K(start+1) into slot 2, the tile the body no longer issues once
-    # K runs ahead; HI's is V(start) into slot 0, read by body start's dead PV.
-    if warp_type.is_lo:
-        fill_tile = start_tile + fx.Int32(1)
-        kv_fill = _get_kv_desc(
-            _k_lds_buf(_PSLOT[2]), _tile_row0(fill_tile), _kv_valid(fill_tile)
-        )
-    else:
-        kv_fill = _get_kv_desc(_k_lds_buf(_PSLOT[0]), start_row0, _kv_valid(start_tile))
-    # Fence depths, straight off the descriptor's declared counter usage. A counter this
-    # half's copies never touch gets -1 ("do not wait on it at all"), NOT 0. The one it
-    # does touch gets this half's per-tile copy count -- the depth LO's partial
-    # steady-state fence names to leave the newest tile in flight. Both counters take a
-    # depth and retire in issue order, so it means the same on either transport. Per-HALF:
-    # LO's K band and HI's V band differ whenever qk_hdim != v_hdim.
-    num_tdm_copies = kv0.tensorcnt if kv0.tensorcnt else -1
-    num_async_copies = kv0.asynccnt if kv0.asynccnt else -1
-    _kv_drain = _kv_drain_depths(num_tdm_copies, num_async_copies)
-    # What this half copies in the prologue, transport-independent: its tile plus the fill.
-    _tiles = [kv0, kv_fill]
-    # When each goes out is NOT transport-independent. Under V2, copies whose destination
-    # misses Q go out BEFORE Q is read, so their global latency overlaps Q's and part2
-    # waits tensorcnt down to them instead of to 0; only LO's K-ahead fill (logical slot
-    # 2) lands on Q, so that one waits for the barrier. Under V1 there is no such overlap
-    # to have: Q's own stage is on asynccnt too and its part2 waits that counter to a
-    # depth counted over Q's loads ALONE, so a tile copy issued first would corrupt the
-    # count. Everything goes after the barrier, and after part2, which ends at depth 0.
-    if not USE_TDM_LOADER:
-        _early, _late = [], _tiles
-    elif warp_type.is_lo:
-        _early, _late = _tiles[:1], _tiles[1:]
-    else:
-        _early, _late = _tiles, []
-    for _d in _early:
-        _d.async_load()
-    if USE_TDM_LOADER:
-        q_frags = q_mgr.load_q_to_vgpr_part2(
-            scale=_q_scale, skip_tensorcnt=sum(_d.tensorcnt for _d in _early)
-        )
-    else:
-        q_frags = q_mgr.load_q_to_vgpr_part2(scale=_q_scale)
-    # Q's ds_loads must be RETIRED, not just issued, before the barrier that releases
-    # the late copies onto Q's chunks: gpu.barrier() does not retire LDS reads, and Q's
-    # atom is per-wave while a tile's is per-producer (wave A's Q region is written by
-    # wave B's share of the tile).
-    rocdl.s_wait_dscnt(0)
-    gpu.barrier()
-    # HI enters its resting priority at the first point both halves have reached: from
-    # here on the lagging half must not lose arbitration to its SIMD-mate, and
-    # _pv_qk_gemm's exit restores this same level after every gemm.
-    if not warp_type.is_lo:
-        rocdl.s_setprio(1)
-    for _d in _late:
-        _d.async_load()
-    _kv_fence(*_kv_drain)
 
     # ---- Loop init: the online-softmax seed and the O accumulators, all iter_args.
     #
@@ -1911,10 +2087,8 @@ def _core_attention_one_kv_tile(
         # global latency overlaps Q's. Waves differ in how many copies they issued, so
         # part2 drains only down to the count EVERY wave has in flight.
         _issue_kv(_is_lo)
-        q_frags = q_mgr.load_q_to_vgpr_part2(
-            scale=_q_scale,
-            skip_tensorcnt=min(k_desc.tensorcnt, v_desc.tensorcnt),
-        )
+        tdm_ops.tensor_wait(min(k_desc.tensorcnt, v_desc.tensorcnt))
+        q_frags = q_mgr.load_q_to_vgpr_part2(scale=_q_scale)
     else:
         # V1 puts Q's own stage on asynccnt and part2 waits a depth counted over Q alone.
         q_frags = q_mgr.load_q_to_vgpr_part2(scale=_q_scale)
@@ -2509,12 +2683,20 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
                         warp_idx=warp_idx, lds_base=lds_base, **_ca_kw
                     )
                 else:
+                    # One traced copy of Q's load and the first KV tiles, outside the
+                    # warp-type branch; the two halves differ only under its own branches.
+                    _pro = _prologue_attention(
+                        warp_idx=warp_idx,
+                        lds_base=lds_base,
+                        **{k: _ca_kw[k] for k in _PRO_KEYS},
+                    )
                     # Warp specialization: LO (waves 0..N/2-1) vs HI (N/2..N-1).
                     if warp_idx // fx.Int32(NUM_WAVES // 2) == fx.Int32(0):
                         _epi = _core_attention_multi_kv_tiles(
                             warp_idx=warp_idx,
                             warp_type=WarpType.LO,
                             lds_base=lds_base,
+                            pro=_pro,
                             **_ca_kw,
                         )
                     else:
@@ -2522,6 +2704,7 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
                             warp_idx=warp_idx,
                             warp_type=WarpType.HI,
                             lds_base=lds_base,
+                            pro=_pro,
                             **_ca_kw,
                         )
                 # One traced copy of the O/LSE tail, outside the warp-type branch.
@@ -2641,12 +2824,20 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
                 warp_idx=warp_idx, lds_base=lds_base, **_ca_kw
             )
         else:
+            # One traced copy of Q's load and the first KV tiles, outside the
+            # warp-type branch; the two halves differ only under its own branches.
+            _pro = _prologue_attention(
+                warp_idx=warp_idx,
+                lds_base=lds_base,
+                **{k: _ca_kw[k] for k in _PRO_KEYS},
+            )
             # Warp specialization: LO (waves 0..N/2-1) vs HI (N/2..N-1).
             if warp_idx // fx.Int32(NUM_WAVES // 2) == fx.Int32(0):
                 _epi = _core_attention_multi_kv_tiles(
                     warp_idx=warp_idx,
                     warp_type=WarpType.LO,
                     lds_base=lds_base,
+                    pro=_pro,
                     **_ca_kw,
                 )
             else:
@@ -2654,6 +2845,7 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
                     warp_idx=warp_idx,
                     warp_type=WarpType.HI,
                     lds_base=lds_base,
+                    pro=_pro,
                     **_ca_kw,
                 )
         # One traced copy of the O/LSE tail, outside the warp-type branch.
