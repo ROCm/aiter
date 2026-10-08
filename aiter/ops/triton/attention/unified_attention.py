@@ -59,9 +59,6 @@ _GLUON_SUPPORTED_ARCHS = ("gfx1250", "gfx950")
 # LDS the gfx950 KV double buffer may occupy; a wider tile falls back to one buffer.
 _GFX950_LDS_BUDGET = 160 * 1024
 
-# Widest query block the gfx950 split-KV grid takes for a multi-token batch.
-_GFX950_SPLIT_MAX_BLOCK_M = 128
-
 
 def _is_gluon_available():
     return any(supported in DEVICE_ARCH for supported in _GLUON_SUPPORTED_ARCHS)
@@ -161,9 +158,11 @@ def _gfx950_split_grid(params: _UAParams):
     """
     if params.all_decode:
         return True
+    # widest query block the split grid takes, the 2d grid's
+    max_block_m = 128
     if (
         params.sliding_window > 0
-        or params.max_seqlen_q * params.num_queries_per_kv > _GFX950_SPLIT_MAX_BLOCK_M
+        or params.max_seqlen_q * params.num_queries_per_kv > max_block_m
     ):
         return False
     config = get_unified_attention_config("kv_split", params, backend="gluon")
