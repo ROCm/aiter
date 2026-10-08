@@ -216,7 +216,7 @@ def benchmark(args):
             out = mla_prefill_fwd(
                 query,
                 kv_buffer,
-                out,
+                output,
                 cu_seqlens_q=cu_seqlens_q,
                 seqused_k=seq_lens_kv,
                 max_seqlen_kv=max_seqlen_kv,
@@ -278,7 +278,7 @@ def benchmark(args):
                 out = mla_prefill_fwd(
                     query,
                     kv_buffer,
-                    out,
+                    output,
                     cu_seqlens_q=cu_seqlens_q,
                     seqused_k=seq_lens_kv,
                     max_seqlen_kv=max_seqlen_kv,
