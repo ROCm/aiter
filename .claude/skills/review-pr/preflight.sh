@@ -20,7 +20,16 @@ echo "[prompt drift]"
 if python3 "$S/check_prompts.py" >/dev/null 2>&1; then echo "  ✅ prompts match SKILL.md verbatim"; ok=$((ok+1)); else echo "  ❌ prompts drifted from SKILL.md — re-copy the quoted sections"; bad=$((bad+1)); fi
 
 echo "[tooling guards]"
-if bash "$S/selftest.sh" >/dev/null 2>&1; then echo "  ✅ run_one.sh guards hold (timeout triage, run budget, refuter downgrade)"; ok=$((ok+1)); else echo "  ❌ selftest.sh failed — run it directly to see which guard broke"; bad=$((bad+1)); fi
+st=$(bash "$S/selftest.sh" 2>&1); st_rc=$?
+if [ "$st_rc" -eq 0 ]; then
+  echo "  ✅ guards hold -- $(printf '%s\n' "$st" | tail -1 | tr -d '=' | sed 's/^ *//')"; ok=$((ok+1))
+else
+  echo "  ❌ selftest.sh failed — run it directly to see which guard broke"; bad=$((bad+1))
+fi
+# A check that did not run is not a check that passed. selftest says out loud when it has to skip
+# one (no node on this box, for instance); suppressing its output here would turn that back into
+# the silent green this whole exercise exists to remove.
+printf '%s\n' "$st" | grep '⚠' | sed 's/^[[:space:]]*/     /'
 
 echo "[runtime]"
 chk "python3 available" "command -v python3" "install python3"
@@ -50,9 +59,19 @@ else
 fi
 
 echo "[persistence]"
-svc=$(systemctl list-unit-files 'actions.runner.*' --no-legend 2>/dev/null | awk '{print $1; exit}')
+# Match the runner registered for THIS repo. A box registered for several repos lists several
+# units, and checking whichever sorts first can report green for someone else's runner -- or red
+# for a correctly installed one. Fall back to the user scope, where svc.sh puts it without sudo.
+# `show -p Restart` is parsed rather than `--value`, which needs systemd >= 230.
+scope=""
+svc=$(systemctl list-unit-files 'actions.runner.*aiter*' --no-legend 2>/dev/null | awk '{print $1; exit}')
+if [ -z "$svc" ]; then
+  svc=$(systemctl --user list-unit-files 'actions.runner.*aiter*' --no-legend 2>/dev/null | awk '{print $1; exit}')
+  [ -n "$svc" ] && scope="--user"
+fi
+[ -n "$svc" ] && echo "     unit: $svc${scope:+ (user scope)}"
 chk "runner is a systemd service (survives reboot and crash)" \
-    "[ -n \"$svc\" ] && systemctl is-enabled \"$svc\" >/dev/null 2>&1 && [ \"\$(systemctl show -p Restart --value \"$svc\" 2>/dev/null)\" = always ]" \
+    "[ -n \"$svc\" ] && systemctl $scope is-enabled \"$svc\" >/dev/null 2>&1 && [ \"\$(systemctl $scope show -p Restart \"$svc\" 2>/dev/null | cut -d= -f2)\" = always ]" \
     "a hand-started runner dies on the next reboot; the job then sits in 'queued' with no failure and no notification -- install it (sudo ./svc.sh install <user>) and add the Restart=always drop-in (RUNNER-SETUP.md section 5)"
 
 echo "[publish identity]"

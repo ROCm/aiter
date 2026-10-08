@@ -29,6 +29,23 @@ The workflow's review step sets no environment on purpose, so the box-specific c
     PATH=<data-volume>/bin:/usr/local/bin:/usr/bin:/bin   # a gh >= 2.24 must be first (fetch needs baseRefOid)
     GH_CONFIG_DIR=<data-volume>/gh-config      # gh auth stored here, NOT as GH_TOKEN in the env
 
+Optional, and worth knowing before you change one: the review's time budget. A failure message
+names whichever of these is the one that actually helps, so follow the message rather than
+guessing.
+
+    AITER_AGENT_TIMEOUT=2400   # per agent attempt (40 min). Raising it past the budget below
+                               #   makes the budget refuse to start attempts SOONER, not later.
+    AITER_RUN_BUDGET=6000      # whole run (100 min), counted from the start of run_one.sh and
+                               #   shared by fetch, worker and refuter. Must stay under the
+                               #   review job's `timeout-minutes` (120) -- check_prompts.py
+                               #   asserts this, because a run killed at the job cap dies with
+                               #   no classified status at all.
+    AITER_REVIEW_RETRIES=2     # attempts per agent. A timeout is never retried.
+
+Anything set here silently overrides the defaults in `run_one.sh`, and `.env` is not in version
+control -- so a value left here outlives the reason it was added. Remove it once the default
+covers the case.
+
 ## 3. gh auth off the job environment
 
 `fetch.sh` calls `gh` to read the PR. Authenticate it under `GH_CONFIG_DIR` (from a token with
@@ -60,7 +77,9 @@ Install it as a service instead — the runner package ships the wrapper:
 The unit `svc.sh` writes carries no `Restart=`, so it survives a reboot but not a crash. Add a
 drop-in for the other half:
 
-    U=$(systemctl list-unit-files 'actions.runner.*' --no-legend | awk '{print $1; exit}')
+    U=$(systemctl list-unit-files 'actions.runner.*aiter*' --no-legend | awk '{print $1; exit}')
+    [ -n "$U" ] || echo 'no runner unit yet -- run svc.sh install first'   # else the paths below
+                                                                          # become /etc/.../.d
     sudo mkdir -p "/etc/systemd/system/$U.d"
     printf '[Service]\nRestart=always\nRestartSec=10\n' | sudo tee "/etc/systemd/system/$U.d/restart.conf"
     sudo systemctl daemon-reload

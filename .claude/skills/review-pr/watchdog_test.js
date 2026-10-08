@@ -63,10 +63,27 @@ async function drive(src, scn) {
     return { data: { jobs: (scn.otherJobs || {})[run_id] || [] } };
   };
 
+  // Model what the real endpoint does, not what is convenient: runs come back newest-first and
+  // capped at per_page. A fake that always returns everything would hide a paging bug entirely.
+  const listRuns = async ({ per_page = 30, page = 1 }) => {
+    const src = typeof scn.liveRuns === 'function' ? scn.liveRuns(rec.selfPolls)
+                                                  : (scn.liveRuns || []);
+    const all = [...src].sort((a, b) => b.id - a.id);
+    return { data: { workflow_runs: all.slice((page - 1) * per_page, page * per_page) } };
+  };
   const github = { rest: { actions: {
     listJobsForWorkflowRun: jobsFor,
-    listWorkflowRuns: async () => ({ data: { workflow_runs: scn.liveRuns || [] } }),
-  } } };
+    listWorkflowRuns: listRuns,
+  } },
+    paginate: async (fn, params) => {
+      const out = []; const per = params.per_page || 30;
+      for (let page = 1; page <= 50; page++) {
+        const r = await fn({ ...params, page });
+        out.push(...r.data.workflow_runs);
+        if (r.data.workflow_runs.length < per) break;
+      }
+      return out;
+    } };
 
   const core = {
     notice: m => rec.notices.push(String(m)),
@@ -128,7 +145,43 @@ const CASES = [
       [r.posts.length === 0, 'paged someone for normal queueing behind the single runner'],
       [r.failed.length === 0, 'failed the job for normal queueing behind the single runner'],
       [r.notices.some(m => /busy/.test(m)), 'left no trace of why it went quiet'],
-      [r.selfPolls === 1, `kept holding a hosted runner (${r.selfPolls} polls)`],
+      [r.selfPolls > 1, 'stopped watching the moment it saw the box busy'],
+    ] },
+
+  // The single runner serialises reviews, so a batch of them piles up as a long list of
+  // in_progress runs -- and the one actually running a review is the OLDEST, which the API
+  // returns last. Looking at only the first page finds every run except the one that matters.
+  { name: 'finds the busy runner under a large backlog',
+    scn: { selfStatus: QUEUED_FOREVER,
+           liveRuns: Array.from({ length: 120 }, (_, i) => ({ id: 1000 + i })),
+           otherJobs: { 1000: [{ name: 'review', status: 'in_progress' }] } },
+    check: r => [
+      [r.posts.length === 0, 'paged someone although a review was running the whole time'],
+      [r.notices.some(m => /busy/.test(m)), 'did not recognise the box as busy'],
+    ] },
+
+  // Seeing another review run is not a reason to stop watching: the runner can die one minute
+  // later, and then this PR's job sits `queued` with nobody left alive to notice -- the exact
+  // days-long silence this job exists to break.
+  { name: 'alarms when the busy runner dies mid-wait',
+    scn: { selfStatus: QUEUED_FOREVER,
+           liveRuns: n => (n <= 2 ? [{ id: 222 }] : []),
+           otherJobs: { 222: [{ name: 'review', status: 'in_progress' }] } },
+    check: r => [
+      [r.posts.length === 1, 'went quiet for a runner that died while it was watching'],
+      [r.failed.length === 1, 'did not fail the run after the runner disappeared'],
+    ] },
+
+  // The watchdog finds its subject by job name. If the name no longer matches, `!review` reads
+  // as "ours started" and it returns success forever -- a monitor that reports green precisely
+  // because it can no longer see anything.
+  { name: 'fails loudly when its own run has no review job',
+    scn: { selfStatus: () => null },
+    check: r => [
+      [r.posts.length === 0, 'paged the runner owner about a workflow-structure problem'],
+      [r.failed.length === 1, 'reported success while watching nothing at all'],
+      [r.failed.length === 1 && /review/.test(r.failed[0]),
+        `did not say what it could not find: ${r.failed[0]}`],
     ] },
 
   { name: 'pages the override owner when the repo sets one',
@@ -136,6 +189,18 @@ const CASES = [
     check: r => [
       [r.posts.length === 1 && /@gyohuangxin\b/.test(r.posts[0].body), 'ignored the override'],
       [r.posts.length === 1 && !/@zufayu\b/.test(r.posts[0].body), 'paged the default owner too'],
+    ] },
+
+  // A misconfigured STUCK_MINUTES makes `deadline` NaN, and `Date.now() < NaN` is false, so the
+  // loop never runs and the alarm fires on the spot. That is the false page this job exists to
+  // avoid, triggered by a typo in the workflow rather than by anything on the box.
+  { name: 'does not page anyone when STUCK_MINUTES is unusable',
+    scn: { selfStatus: QUEUED_FOREVER, env: { STUCK_MINUTES: '' } },
+    check: r => [
+      [r.posts.length === 0, 'paged someone because of a workflow typo, not a dead runner'],
+      [r.failed.length === 1, 'a watchdog that cannot run must not pass for a healthy one'],
+      [r.failed.length === 1 && /STUCK_MINUTES/.test(r.failed[0]),
+        `blamed the runner for a workflow typo: ${r.failed[0]}`],
     ] },
 
   { name: 'still fails the job when the notice cannot be posted',
@@ -150,8 +215,22 @@ const CASES = [
 // guard -- unless each is shown to go red when its path is broken. Break them on purpose.
 const MUTANTS = [
   { why: 'the early return for a review that started',
-    find: 'return;   // ours started', with: ';',
+    find: 'return;            // ours started', with: ';',
     breaks: 'stays silent once our own review starts' },
+  { why: 'the guard on an unusable STUCK_MINUTES',
+    find: 'if (!Number.isFinite(mins) || mins <= 0) {', with: 'if (false) {',
+    breaks: 'does not page anyone when STUCK_MINUTES is unusable' },
+  { why: 'the guard on a run with no review job',
+    find: 'if (!sawReview) {', with: 'if (false) {',
+    breaks: 'fails loudly when its own run has no review job' },
+  // Proves the final busy check reflects the box as it is at the end, not as it was mid-wait.
+  { why: 'the box-busy answer at the end of the window',
+    find: 'if (await boxBusy()) {', with: 'if (true) {',
+    breaks: 'alarms when the busy runner dies mid-wait' },
+  { why: 'paging through every in_progress run',
+    find: 'await github.paginate(github.rest.actions.listWorkflowRuns, {',
+    with: 'await ((f, p) => f(p).then(r => r.data.workflow_runs))(github.rest.actions.listWorkflowRuns, {',
+    breaks: 'finds the busy runner under a large backlog' },
   { why: 'the busy-runner check',
     find: 'if (await boxBusy()) {', with: 'if (false) {',
     breaks: 'stays silent while the box is busy with another review' },

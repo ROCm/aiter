@@ -74,6 +74,75 @@ def check_fail_classes():
     return 0
 
 
+WORKFLOW = HERE.parents[2] / ".github" / "workflows" / "aiter-review-bot.yml"
+
+
+def _notify_mod():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("_notify", HERE / "_notify.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def check_budget_fits():
+    """The run budget and the job's timeout-minutes live in different files, and a budget that
+    does not fit is silently useless: the job is killed mid-agent with no classified status --
+    the exact failure the budget was added to prevent. Keep the two in step."""
+    run_one = (HERE / "run_one.sh").read_text(encoding="utf-8")
+    wf = WORKFLOW.read_text(encoding="utf-8")
+    m = re.search(r'^: "\$\{AITER_RUN_BUDGET:=(\d+)\}"', run_one, re.M)
+    j = re.search(r"^  review:.*?^    timeout-minutes: (\d+)", wf, re.M | re.S)
+    if not m or not j:
+        print("\u274c cannot read AITER_RUN_BUDGET or the review job's timeout-minutes")
+        return 1
+    budget, cap = int(m.group(1)), int(j.group(1)) * 60
+    if budget >= cap:
+        print(f"\u274c AITER_RUN_BUDGET={budget}s does not fit the review job's {cap}s cap")
+        return 1
+    print(f"\u2705 run budget fits the job cap: {budget}s < {cap}s")
+    return 0
+
+
+def check_watchdog_owner():
+    """Every message but one routes through _notify.py's class->owner map. The watchdog posts its
+    stuck-runner page itself and carries its own copy of the handle, so the two drift apart in
+    silence: the next owner updates _notify.py and still never hears that the runner is down."""
+    wf = WORKFLOW.read_text(encoding="utf-8")
+    m = re.search(r"OWNER_OVERRIDE \|\| ''\)\.trim\(\) \|\| '([A-Za-z0-9-]+)'", wf)
+    v = re.search(r"OWNER_OVERRIDE: \$\{\{ vars\.([A-Z_]+) \}\}", wf)
+    if not m or not v:
+        print("\u274c cannot read the watchdog's owner fallback from the workflow")
+        return 1
+    var, default = _notify_mod().CLASSES["env"][:2]
+    if (m.group(1), v.group(1)) != (default, var):
+        print(f"\u274c watchdog pages '{m.group(1)}' via {v.group(1)}, but _notify.py's env class "
+              f"is '{default}' via {var}")
+        return 1
+    print(f"\u2705 watchdog owner matches _notify.py's env class: {default} via {var}")
+    return 0
+
+
+def check_runner_label_exclusive():
+    """boxBusy() decides 'is the box busy' by looking only at this workflow's runs. That holds
+    only while nothing else targets the same runner label -- otherwise a healthy box doing other
+    work reads as idle, and the watchdog pages the owner about it."""
+    wf = WORKFLOW.read_text(encoding="utf-8")
+    m = re.search(r"runs-on: \[self-hosted, ([A-Za-z0-9_-]+)\]", wf)
+    if not m:
+        print("\u274c cannot read the review job's runner label")
+        return 1
+    label = m.group(1)
+    others = sorted(q.name for q in WORKFLOW.parent.glob("*.y*ml")
+                    if q != WORKFLOW and label in q.read_text(encoding="utf-8"))
+    if others:
+        print(f"\u274c runner label '{label}' is also targeted by {others}; the watchdog's busy "
+              "check only sees aiter-review-bot runs and would page about a busy, healthy box")
+        return 1
+    print(f"\u2705 runner label '{label}' is exclusive to aiter-review-bot.yml")
+    return 0
+
+
 def main():
     skill = _skill_md()
     bad = 0
@@ -89,6 +158,9 @@ def main():
             print(f"❌ {prompt}: quoted block DRIFTED from SKILL.md — re-copy the section verbatim")
             bad += 1
     bad += check_fail_classes()
+    bad += check_budget_fits()
+    bad += check_watchdog_owner()
+    bad += check_runner_label_exclusive()
     print(f"{'OK' if bad == 0 else 'DRIFT'}: {bad} drift(s)")
     return bad
 

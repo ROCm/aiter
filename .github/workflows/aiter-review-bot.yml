@@ -101,6 +101,15 @@ jobs:
         with:
           script: |
             const mins = Number(process.env.STUCK_MINUTES);
+            // A typo here makes the deadline expire before the first poll, so the loop never runs
+            // and the alarm fires at once -- paging the runner owner about a box that is fine.
+            // That is the false page this job exists to prevent, so fail as the config error it is.
+            if (!Number.isFinite(mins) || mins <= 0) {
+              core.setFailed(
+                `STUCK_MINUTES is not a usable number of minutes: `
+                + `${JSON.stringify(process.env.STUCK_MINUTES)}`);
+              return;
+            }
             const repo = { owner: context.repo.owner, repo: context.repo.repo };
             const deadline = Date.now() + mins * 60_000;
 
@@ -108,10 +117,13 @@ jobs:
             // waiting behind one is normal and must not page anyone: a false alarm here would
             // cost exactly what the mis-triaged GLM pages did.
             const boxBusy = async () => {
-              const live = await github.rest.actions.listWorkflowRuns({
+              // Page through all of them. A batch of reviews queues up as a long list of
+              // in_progress runs, and the API returns the newest first -- so the one actually
+              // running a review is last, and a single page of 20 would miss exactly it.
+              const live = await github.paginate(github.rest.actions.listWorkflowRuns, {
                 ...repo, workflow_id: 'aiter-review-bot.yml',
-                status: 'in_progress', per_page: 20 });
-              for (const run of live.data.workflow_runs) {
+                status: 'in_progress', per_page: 100 });
+              for (const run of live) {
                 if (run.id === context.runId) continue;
                 const j = await github.rest.actions.listJobsForWorkflowRun(
                   { ...repo, run_id: run.id });
@@ -124,16 +136,34 @@ jobs:
             // Poll rather than sleep the whole window: a watchdog that returns as soon as the
             // box is accounted for does not hold a hosted runner, which matters when a batch of
             // reviews queues up and each one carries its own watchdog.
+            let sawReview = false;
             while (Date.now() < deadline) {
               await new Promise(r => setTimeout(r, 120_000));
               const self = await github.rest.actions.listJobsForWorkflowRun(
                 { ...repo, run_id: context.runId });
               const review = self.data.jobs.find(j => j.name === 'review');
-              if (!review || review.status !== 'queued') return;   // ours started
-              if (await boxBusy()) {
-                core.notice('the runner is busy with another review; queueing is expected');
-                return;
+              if (review) {
+                sawReview = true;
+                if (review.status !== 'queued') return;            // ours started
               }
+            }
+
+            // The job this watchdog exists to watch was never in its own run's job list -- a
+            // rename, or a matrix that suffixes job names. Treating that as "ours started" would
+            // report success forever while watching nothing, so name the problem instead; it is
+            // a workflow-structure fault, not a reason to page anyone about the box.
+            if (!sawReview) {
+              core.setFailed(
+                `this run has no job named 'review', so the watchdog is watching nothing`);
+              return;
+            }
+
+            // Ask about the box only now. Asking inside the loop and returning on the first yes
+            // abandons the PR: the runner can die a minute later with nobody left watching, and
+            // a queued job never fails on its own.
+            if (await boxBusy()) {
+              core.notice('the runner is busy with another review; queueing is expected');
+              return;
             }
 
             // Still queued, with no review running anywhere: nothing is listening for this label.
