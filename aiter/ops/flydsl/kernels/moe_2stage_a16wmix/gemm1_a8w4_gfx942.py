@@ -564,7 +564,12 @@ def compile_gemm1_a8w4_gfx942(
     rocm_arch,
 ):
     """Build the gfx942 a8w4 (MXFP8 A x MXFP4 W) fused stage1 (gate+up + act)."""
-    assert str(rocm_arch).startswith("gfx942"), f"gfx942 only, got {rocm_arch}"
+    if not str(rocm_arch).startswith("gfx942"):
+        # Not an assert: it must survive python -O. The FP4 -> FP8 table is E4M3FNUZ,
+        # so on any other arch the kernel would build and return wrong numbers.
+        raise NotImplementedError(
+            f"a8w4 stage1 is gfx942-only (FP8 E4M3FNUZ), got {rocm_arch}"
+        )
     _K, _INTER = D_HIDDEN, D_INTER
     assert TILE_K % 128 == 0, f"TILE_K must be a multiple of 128, got {TILE_K}"
     assert _K % TILE_K == 0, f"D_HIDDEN must be a multiple of TILE_K, got {_K}"
