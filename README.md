@@ -125,9 +125,9 @@ git submodule sync && git submodule update --init --recursive
 
 ### FlyDSL
 
-AITER uses [FlyDSL](https://github.com/ROCm/FlyDSL)-based kernels across a range of operators (e.g., GEMM and MoE). FlyDSL is a required dependency and is installed automatically when you run `python3 setup.py develop`.
+On Linux, AITER uses [FlyDSL](https://github.com/ROCm/FlyDSL)-based kernels across a range of operators (e.g., GEMM and MoE), and `python3 setup.py develop` installs the pinned FlyDSL dependency automatically. FlyDSL publishes Linux-only wheels, so Windows setup skips this dependency; FlyDSL-backed paths are enabled only when FlyDSL is available.
 
-To install it manually:
+On Linux, to install dependencies manually:
 
 ```bash
 pip install -r requirements.txt
