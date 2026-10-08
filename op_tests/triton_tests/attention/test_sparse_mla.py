@@ -12,6 +12,7 @@ import torch
 
 import aiter.ops.triton.attention.sparse_mla as smd
 from aiter.ops.triton.attention.sparse_mla import (
+    FNUZ_ARCHS,
     FP8_ARCHS,
     FP8_SCALAR_ARCHS,
     SUPPORTED_ARCHS,
@@ -234,6 +235,19 @@ def test_foreign_fp8_cache_dtype_rejected():
         sparse_mla_fwd(q, cache.view(foreign), ptr, idx, D_QK**-0.5, kv_scale=ks)
 
 
+@pytest.mark.parametrize(
+    "dtype", [torch.float8_e5m2, torch.float8_e5m2fnuz, torch.int8, torch.bool]
+)
+def test_non_e4m3_byte_cache_dtype_rejected(dtype):
+    """Other one-byte dtypes are refused rather than decoded as e4m3."""
+    arch = arch_info.get_arch()
+    if arch not in FP8_SCALAR_ARCHS:
+        pytest.skip(f"no fp8 cache runs on {arch}")
+    q, cache, ks, idx, ptr, _ = _build("tensor", 1, 16, 64, 1024, ragged=False)
+    with pytest.raises(ValueError, match="unsupported cache dtype"):
+        sparse_mla_fwd(q, cache.view(dtype), ptr, idx, D_QK**-0.5, kv_scale=ks)
+
+
 @pytest.mark.parametrize("arch", SUPPORTED_ARCHS)
 def test_launch_config_published(arch):
     """Every supported arch ships its launch config, checked from any machine."""
@@ -389,3 +403,53 @@ def test_sparse_mla_rope_free(fmt, dots, tol, H, C, topk, ragged, pool):
         rope=0,
         dot_precision=dots,
     )
+
+
+def test_fp8_dots_keep_the_softmax_tail():
+    """Each query's first key scores 9 above the other 2047, which carry a fifth
+    of the output at p ~ 1e-4 each. That is below fnuz's smallest subnormal
+    unless P_SCALE lifts p before the PV dot, and with split-K off a single
+    program quantizes every tail p after the max.
+    """
+    arch = arch_info.get_arch()
+    if arch not in FNUZ_ARCHS:
+        pytest.skip(f"P_SCALE is 1 on {arch}")
+    C, H, topk, pool = 4, 16, 2048, 1 << 13
+    sm = KV_LORA**-0.5
+    g = torch.Generator().manual_seed(0)
+    # Head h reads axis h alone, where the dominant key is 1 (score 9) and the
+    # tail keys are 0 (score 0). Elsewhere the tail keys share one direction.
+    q = torch.zeros(C, H, KV_LORA)
+    q[:, range(H), range(H)] = 9.0 / sm
+    u = torch.randn(KV_LORA, generator=g)
+    kv = torch.nn.functional.normalize(
+        u + 0.3 * torch.randn(pool, KV_LORA, generator=g), dim=-1
+    )
+    kv = kv * KV_LORA**0.5
+    kv[:, :H] = 0
+    kv[-1] = 0
+    kv[-1, :H] = 1
+    idx = torch.stack(
+        [
+            torch.cat([torch.tensor([pool - 1]), torch.randperm(pool - 1, generator=g)])
+            for _ in range(C)
+        ]
+    )[:, :topk]
+    idx = idx.flatten().to(torch.int32).cuda()
+    ptr = torch.arange(0, (C + 1) * topk, topk, dtype=torch.int32, device="cuda")
+    q = q.to(torch.bfloat16).cuda()
+    cache, ks = quantize_flat_fp8(kv.cuda())
+    ref = reference(q, dequant_flat_fp8(cache, ks).to(torch.bfloat16), idx, ptr, sm)
+    out, _ = sparse_mla_fwd(
+        q,
+        cache,
+        ptr,
+        idx,
+        sm,
+        kv_scale=ks,
+        qk_rope_head_dim=0,
+        dot_precision="fp8",
+        kv_splits=1,
+    )
+    e = rel_err(out, ref)
+    assert e < 5e-2, f"softmax tail: rel-err {e:.3e}"
