@@ -2498,11 +2498,12 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
 //     nope: block_idx*block_stride + block_offset*KV_LORA + d
 //     rope: block_idx*block_stride + PAGE_SIZE*KV_LORA + block_offset*PE_DIM + d
 //
-// Launch: grid = T*H, block = KV_LORA/VEC threads. One block per (token, head)
-// handles that head's q; when head_idx==0 the same block also handles the
-// token's k (kv=1). The nope segment is written with VEC-wide vectorized
-// loads/stores (128-bit for 16-bit inputs); the pe segment is RoPE'd per
-// element (PE_DIM threads).
+// Launch: block = KV_LORA/VEC threads, each block one token and HPT heads
+// (1/2/4/8, picked by rows per CU); the block holding the first head group
+// also writes the token's k (kv=1). The segmented layout runs a 2-D grid
+// (H/HPT, T), the per-entry layout a flat head-group-major one (see the
+// kernel). nope and pe both move VEC elements per thread (128-bit for 16-bit
+// inputs); pe is RoPE'd a chunk at a time.
 // ============================================================================
 // Which heads-per-block instantiations stage Q through TDM on gfx1250: bit HPT
 // set means that HPT does. Read by the kernel and by the host's dynamic-LDS
