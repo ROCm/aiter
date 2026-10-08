@@ -156,7 +156,7 @@ def run_preshuffle_gemm_a8_gfx1250(
     lda = XQ.stride(0)
     ldc = Out.stride(0)
     partials = (
-        torch.empty((split_k, M, ldc), dtype=Out.dtype, device=Out.device)
+        torch.empty((split_k, M, ldc), dtype=torch.float32, device=Out.device)
         if split_k > 1
         else None
     )
@@ -199,7 +199,7 @@ def run_preshuffle_gemm_a8_gfx1250(
             M * N if dense else N,
             1 if dense else M,
             ldc,
-            M * ldc * Out.element_size(),
+            M * ldc * partials.element_size(),
             stream,
         )
     return Out

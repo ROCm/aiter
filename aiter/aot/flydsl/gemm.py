@@ -912,7 +912,7 @@ def _compile_mxfp8_wmma_to_cache(
                 m * n,
                 1,
                 n,
-                m * n * 2,
+                m * n * 4,
                 stream,
             )
 
@@ -984,7 +984,7 @@ def _compile_ptpc_wmma_to_cache(
                 m * n,
                 1,
                 n,
-                m * n * 2,
+                m * n * 4,
                 stream,
             )
 
