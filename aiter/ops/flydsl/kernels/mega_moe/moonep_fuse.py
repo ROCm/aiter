@@ -53,6 +53,59 @@ def moonep_lds_fields(*, npes: int, experts: int, slots: int) -> dict:
 
 
 @flyc.jit
+def _emit_home_placement(
+    addr_count,
+    addr_alloc_cumsum,
+    addr_expert_to_slot,
+    addr_slot_held,
+    addr_slot_prev,
+    addr_slot_placed,
+    *,
+    num_waves,
+    npes,
+    experts,
+    slots,
+    count_stride,
+):
+    """Every expert stays on its owner; the slots keep what they hold."""
+
+    R = npes
+    E = experts
+    epn = E // R
+    block = num_waves * WAVE_SIZE
+    count = ptr_buf_tensor(addr_count, fx.Int32)
+    alloc_cumsum = ptr_buf_tensor(addr_alloc_cumsum, fx.Int32)
+    expert_to_slot = ptr_buf_tensor(addr_expert_to_slot, fx.Int32)
+    slot_held = ptr_buf_tensor(addr_slot_held, fx.Int32)
+    slot_prev = ptr_buf_tensor(addr_slot_prev, fx.Int32)
+    slot_placed = ptr_buf_tensor(addr_slot_placed, fx.Int32)
+    tid = fx.Int32(fx.thread_idx.x)
+
+    for e in range(tid, fx.Int32(E), block):
+        total = fx.Int32(0)
+        for r in range_constexpr(R):
+            total = total + buf_copy_load(
+                count, fx.Int32(r * count_stride) + e, fx.Int32, cache_modifier=2
+            )
+        home = e // fx.Int32(epn)
+        for d in range_constexpr(R):
+            alloc_cumsum[e * fx.Int32(R) + fx.Int32(d)] = (
+                fx.Int32(d) >= home
+            ).select(total, fx.Int32(0))
+    for i in range(tid, fx.Int32(R * E), block):
+        dest = i // fx.Int32(E)
+        expert = i - dest * fx.Int32(E)
+        expert_to_slot[i] = ((expert // fx.Int32(epn)) == dest).select(
+            expert - dest * fx.Int32(epn), fx.Int32(-1)
+        )
+    for i in range(tid, fx.Int32(R * slots), block):
+        slot_prev[i] = slot_held[i]
+        slot_placed[i] = fx.Int32(-1)
+    fx.rocdl.s_waitcnt(0)
+    fx.barrier()
+
+
+@flyc.jit
 def emit_moonep_placement(
     addr_count,
     addr_alloc_cumsum,
@@ -87,6 +140,48 @@ def emit_moonep_placement(
 
     ``balance=False`` keeps every expert on its owner and the slots untouched.
     """
+
+    tables = (
+        addr_count, addr_alloc_cumsum, addr_expert_to_slot,
+        addr_slot_held, addr_slot_prev, addr_slot_placed,
+    )
+    shape = dict(
+        num_waves=num_waves, npes=npes, experts=experts, slots=slots,
+        count_stride=count_stride,
+    )
+    if const_expr(balance):
+        _emit_balanced_placement(
+            *tables, p_alloc, p_key, p_ecount, p_rem, p_quota, p_bal, p_etc,
+            p_target, **shape,
+        )
+    else:
+        _emit_home_placement(*tables, **shape)
+
+
+@flyc.jit
+def _emit_balanced_placement(
+    addr_count,
+    addr_alloc_cumsum,
+    addr_expert_to_slot,
+    addr_slot_held,
+    addr_slot_prev,
+    addr_slot_placed,
+    p_alloc,
+    p_key,
+    p_ecount,
+    p_rem,
+    p_quota,
+    p_bal,
+    p_etc,
+    p_target,
+    *,
+    num_waves,
+    npes,
+    experts,
+    slots,
+    count_stride,
+):
+    """Balance, keep the top-B remote experts per destination, settle slots."""
 
     R = npes
     E = experts
@@ -133,7 +228,7 @@ def emit_moonep_placement(
             tid < routes_total % fx.Int32(R)
         ).select(fx.Int32(1), fx.Int32(0))
         _lds_store(
-            p_bal, fx.Int32(0) if not balance else group_total - rank_target, tid
+            p_bal, group_total - rank_target, tid
         )
     for i in range(tid, fx.Int32(E * R), block):
         e = i // fx.Int32(R)
