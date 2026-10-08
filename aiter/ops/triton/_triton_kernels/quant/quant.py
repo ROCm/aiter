@@ -707,8 +707,8 @@ def _dynamic_mxfp4_quant_blockscale_kernel(
 
 # MXFP8 (1x32 e8m0) quant: derives a per-block uint8 e8m0 scale + FP8 e4m3
 # values. The bit-trick (bitcast amax to int32, add 0x200000, mask 0xFF800000,
-# bitcast back to fp32) rounds amax up to a power of 2; log2(amax).floor() - 8
-# is the unbiased e8m0 exponent (dtypeMax = 2**8).
+# bitcast back to fp32) rounds amax up to a power of 2; log2(amax).floor() -
+# LOG2_DTYPE_MAX is the unbiased e8m0 exponent (8 for OCP e4m3fn, 7 for fnuz).
 
 
 @triton.jit

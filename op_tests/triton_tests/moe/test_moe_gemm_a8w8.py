@@ -381,6 +381,7 @@ def test_op(
         (16, 6144, 256, 256, 8, True),
         (4096, 512, 6144, 256, 8, True),
         (300, 400, 416, 8, 2, True),
+        (1024, 512, 6144, 256, 8, True),
     ],
 )
 def test_op_gfx942(m, n, k, n_expts_tot, n_expts_act, mx):
