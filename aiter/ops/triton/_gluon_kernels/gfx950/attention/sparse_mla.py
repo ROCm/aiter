@@ -2163,7 +2163,16 @@ def _xcd_work(GRID_ORDER: gl.constexpr, NUM_XCDS: gl.constexpr, SPLIT_K: gl.cons
 
 _sparse_mla_repr = make_kernel_repr(
     "_sparse_mla",
-    ["BLOCK_M", "BLOCK_K", "HEAD_SIZE", "SPLIT_K", "MAIN_FMT", "ROPE_SEPARATE"],
+    [
+        "BLOCK_M",
+        "BLOCK_K",
+        "HEAD_SIZE",
+        "SPLIT_K",
+        "MAIN_FMT",
+        "ROPE_SEPARATE",
+        "FP8_MFMA",
+        "FP8_FNUZ",
+    ],
 )
 
 
