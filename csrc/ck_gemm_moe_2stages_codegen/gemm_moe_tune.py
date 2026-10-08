@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
+import csv
 import functools
 import math
 import os
@@ -6125,6 +6126,15 @@ class FmoeTuner(TunerCommon):
                 self.tunedf = self.get_tuned_gemm_list(
                     self.get_out_file(args.tune_file)
                 )
+                if (
+                    isinstance(self, Mxfp4FlydslTuner)
+                    and not args.run_config
+                    and not args.compare
+                ):
+                    times = pd.to_numeric(self.tunedf["us"], errors="coerce")
+                    self.tunedf = self.tunedf[
+                        times.map(math.isfinite) & times.gt(0)
+                    ].copy()
             else:
                 self.tunedf = None
             self.untunedf["gfx"] = self.get_gfx()
@@ -7061,6 +7071,26 @@ class Mxfp4FlydslTuner(FmoeTuner):
         {"dtype", "q_dtype_a", "q_dtype_w"}
     )
 
+    def run(self, args, fast_mode=False):
+        self._mxfp4_output_file = self.get_out_file(args.tune_file)
+        return super().run(args, fast_mode)
+
+    @staticmethod
+    def _row_precision(row):
+        a_dtype = _parse_tuning_type(row["q_dtype_a"])
+        if a_dtype == dtypes.fp4x2:
+            return "A4W4"
+        if a_dtype == torch.float8_e4m3fn:
+            return "A8W4"
+        raise ValueError(f"unsupported MXMOE activation dtype {row['q_dtype_a']!r}")
+
+    def _effective_search_mode(self, row, args):
+        if getattr(args, "mxfp4_search_mode", None) is None and (
+            self._row_precision(row) == "A8W4"
+        ):
+            return "full"
+        return _mxfp4_search_mode(args)
+
     @staticmethod
     def _g1_kname(
         bm,
@@ -7641,6 +7671,9 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 or not math.isfinite(float(accuracy_error))
                 or float(accuracy_error) > args.errRatio
             ):
+                candidate["error"] = (
+                    float("nan") if accuracy_error is None else float(accuracy_error)
+                )
                 raise Mxfp4AccuracyError(
                     f"{phase} cosine err_ratio {accuracy_error} > {args.errRatio}"
                 )
@@ -7684,7 +7717,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 or not math.isfinite(float(err))
                 or float(err) > args.errRatio
             ):
-                raise RuntimeError(f"cosine err_ratio {err} > {args.errRatio}")
+                raise Mxfp4AccuracyError(f"cosine err_ratio {err} > {args.errRatio}")
             if not _all_finite(out):
                 raise RuntimeError("non-finite pipeline output")
             timed_warmup = requested_warmup
@@ -7723,10 +7756,11 @@ class Mxfp4FlydslTuner(FmoeTuner):
             err = max(accuracy_errors)
         if previously_observed_errors:
             err = max(float(err), *previously_observed_errors)
+        candidate["error"] = float(err)
         us = round(float(us), 4)
         candidate["pipeline_us"] = us
         if not math.isfinite(us) or us <= 0:
-            raise RuntimeError(f"invalid MXFP4 validation time {us}")
+            return us
         # The pair is timed as one unit, so the fused-MoE estimate in calculate()
         # is the right roofline for it. Untuned rows keep dtypes as strings, while
         # calculate() looks bpe up by torch dtype.
@@ -8391,6 +8425,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 best = group_best
         if best is None:
             return _mxfp4_failed_row(self.keys, row, "FAILED: no valid staged pair")
+        best.update(status="ok", failure_reason="")
         return best
 
     def _tune_one_shape(self, row, args):
@@ -8426,11 +8461,11 @@ class Mxfp4FlydslTuner(FmoeTuner):
             except ValueError:
                 timeout = 0  # not on the main thread; cannot arm SIGALRM
 
-        candidates = self._candidate_rows(
-            row, full_search=self._effective_search_mode(row, args) == "full"
-        )
+        search_mode = self._effective_search_mode(row, args)
+        precision = self._row_precision(row)
+        candidates = self._candidate_rows(row, full_search=search_mode == "full")
         fast_scan = bool(getattr(args, "fast_scan", False))
-        best, failures, successful = None, [], []
+        best, profiles, failures, successful = None, [], [], []
 
         # Candidate kernels for one shape consume the same immutable inputs and
         # shuffled weights. In scan mode, prepare that fixture once instead of
@@ -8469,44 +8504,104 @@ class Mxfp4FlydslTuner(FmoeTuner):
             0, int(getattr(args, "fast_scan_warmup_accuracy_checks", 1))
         )
         scan_iters = _parse_fast_scan_iters(getattr(args, "fast_scan_iters", 10))
-        for candidate in candidates:
+
+        def evaluate(candidate, phase, **measure_kwargs):
+            """Measure one candidate once and journal the observation.
+
+            ``phase`` is ``single`` for the ordinary search, or ``coarse`` and
+            ``final`` for the two fast-scan passes. A retimed finalist therefore
+            has its own profile row whose pipeline_us is the latency it publishes.
+            """
+            status, reason = "ok", ""
             if timeout > 0:
                 signal.alarm(timeout)
             try:
-                us = self._run_candidate(
-                    row,
-                    candidate,
-                    args,
-                    data=scan_data,
-                    reference=scan_reference,
-                    num_warmup=accuracy_checks if fast_scan else None,
-                    num_iters=scan_iters if fast_scan else None,
-                )
-                if not math.isfinite(float(us)) or us <= 0:
-                    raise RuntimeError(f"invalid MXFP4 validation time {us}")
-                print(
-                    f"[mxfp4-port] token={row['token']} inter={row['inter_dim']} "
-                    f"{candidate['kernelName1']} + {candidate['kernelName2']} us={us}",
-                    flush=True,
-                )
-                if best is None or us < float(best["us"]):
-                    best = candidate
-                if fast_scan:
-                    successful.append(candidate)
+                us = float(self._run_candidate(row, candidate, args, **measure_kwargs))
+                candidate["pipeline_us"] = us
+                error = float(candidate.get("error", float("nan")))
+                if not math.isfinite(us) or us <= 0:
+                    status = "invalid_time"
+                    reason = f"pipeline_us must be finite and positive, got {us}"
+                elif not math.isfinite(error) or error > args.errRatio:
+                    status = "accuracy_failed"
+                    reason = f"numeric error {error} exceeds errRatio {args.errRatio}"
+                else:
+                    candidate["us"] = candidate["us1"] = us
             except Mxfp4AccuracyError as exc:
-                failures.append(
-                    f"{candidate['kernelName1']}/{candidate['kernelName2']}: "
-                    f"accuracy {exc}"
-                )
-                print(f"[mxfp4-port] candidate rejected: {failures[-1]}", flush=True)
+                status, reason = "accuracy_failed", f"{type(exc).__name__}: {exc}"
             except Exception as exc:  # noqa: BLE001
-                failures.append(
-                    f"{candidate['kernelName1']}/{candidate['kernelName2']}: {exc}"
+                status = (
+                    "timeout"
+                    if isinstance(exc, _CandidateTimeout)
+                    else "execution_failed"
                 )
-                print(f"[mxfp4-port] candidate failed: {failures[-1]}", flush=True)
+                reason = f"{type(exc).__name__}: {exc}"
+                if "error" in candidate:
+                    error = float(candidate["error"])
+                    if not math.isfinite(error) or error > args.errRatio:
+                        status = "accuracy_failed"
             finally:
                 if timeout > 0:
                     signal.alarm(0)
+            profile = {k: row[k] for k in self.keys}
+            profile.update(
+                precision=precision,
+                search_mode=search_mode,
+                phase=phase,
+                kernelName1=candidate["kernelName1"],
+                kernelName2=candidate["kernelName2"],
+                block_m=candidate["block_m"],
+                pipeline_us=candidate.get("pipeline_us", float("nan")),
+                error=candidate.get("error", float("nan")),
+                status=status,
+                failure_reason=reason,
+            )
+            profiles.append(profile)
+            profile_journal = getattr(args, "_mxfp4_profile_journal", None)
+            if profile_journal:
+                with open(profile_journal, "a", newline="") as journal:
+                    writer = csv.DictWriter(journal, fieldnames=profile)
+                    if journal.tell() == 0:
+                        writer.writeheader()
+                    writer.writerow(profile)
+            print(
+                f"[mxfp4-port] {phase} token={row['token']} "
+                f"inter={row['inter_dim']} "
+                f"{candidate['kernelName1']} + {candidate['kernelName2']} "
+                f"us={profile['pipeline_us']} error={profile['error']} "
+                f"status={status} {reason}",
+                flush=True,
+            )
+            if status != "ok":
+                prefix = "finalist " if phase == "final" else ""
+                failures.append(
+                    f"{prefix}{candidate['kernelName1']}/"
+                    f"{candidate['kernelName2']}: {reason}"
+                )
+            return status
+
+        # Only fast scan shares a fixture/reference and owns warm-up counts; the
+        # ordinary search keeps the per-candidate _run_candidate defaults.
+        scan_kwargs = (
+            {
+                "data": scan_data,
+                "reference": scan_reference,
+                "num_warmup": accuracy_checks,
+                "num_iters": scan_iters,
+            }
+            if fast_scan
+            else {}
+        )
+        for candidate in candidates:
+            status = evaluate(
+                candidate, "coarse" if fast_scan else "single", **scan_kwargs
+            )
+            if status != "ok":
+                continue
+            if fast_scan:
+                successful.append(candidate)
+            elif best is None or float(candidate["us"]) < float(best["us"]):
+                best = candidate
         if fast_scan and successful:
             finalist_count = max(1, int(getattr(args, "fast_scan_finalists", 5)))
             finalist_iters = _parse_fast_scan_iters(
@@ -8551,50 +8646,20 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 f"backfilling to {finalist_target} successful retimes",
                 flush=True,
             )
-            best = None
             retimed = []
             for candidate in finalist_queue:
                 if len(retimed) >= finalist_target:
                     break
-                if timeout > 0:
-                    signal.alarm(timeout)
-                try:
-                    us = self._run_candidate(
-                        row,
-                        candidate,
-                        args,
-                        data=scan_data,
-                        reference=scan_reference,
-                        num_warmup=0,
-                        num_iters=finalist_iters,
-                    )
-                    if not math.isfinite(float(us)) or us <= 0:
-                        raise RuntimeError(f"invalid MXFP4 validation time {us}")
-                    print(
-                        f"[mxfp4-port] finalist token={row['token']} "
-                        f"{candidate['kernelName1']} + "
-                        f"{candidate['kernelName2']} us={us}",
-                        flush=True,
-                    )
+                status = evaluate(
+                    candidate,
+                    "final",
+                    data=scan_data,
+                    reference=scan_reference,
+                    num_warmup=0,
+                    num_iters=finalist_iters,
+                )
+                if status == "ok":
                     retimed.append(candidate)
-                except Mxfp4AccuracyError as exc:
-                    failures.append(
-                        f"finalist {candidate['kernelName1']}/"
-                        f"{candidate['kernelName2']}: accuracy {exc}"
-                    )
-                    print(
-                        f"[mxfp4-port] finalist rejected: {failures[-1]}",
-                        flush=True,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    failures.append(
-                        f"finalist {candidate['kernelName1']}/"
-                        f"{candidate['kernelName2']}: {exc}"
-                    )
-                    print(f"[mxfp4-port] candidate failed: {failures[-1]}", flush=True)
-                finally:
-                    if timeout > 0:
-                        signal.alarm(0)
             if retimed:
                 fastest_us = min(float(candidate["us"]) for candidate in retimed)
                 best = _select_mxfp4_finalist(retimed)
@@ -8622,14 +8687,22 @@ class Mxfp4FlydslTuner(FmoeTuner):
                         flush=True,
                     )
         if best is None:
-            best = candidates[0] if candidates else self._candidate_row(row, 0, "", "")
-            best["us"] = self.INVALID_TIME
-            best["kernelName1"] = ("FAILED: " + "; ".join(failures))[:240]
+            reason = (
+                "no valid coupled candidate"
+                if candidates
+                else "no legal coupled candidates"
+            )
+            if failures:
+                reason += ": " + "; ".join(failures)
+            best = _mxfp4_failed_row(self.keys, row, reason)
             print(
                 f"[mxfp4-port] all candidates failed for "
                 f"{tuple(row[k] for k in self.keys)}",
                 flush=True,
             )
+        else:
+            best.update(status="ok", failure_reason="")
+        best["_profile"] = profiles
         return best
 
     def tune(self, untunedf, tunedf, args):
@@ -8669,7 +8742,15 @@ class Mxfp4FlydslTuner(FmoeTuner):
         if mp_num <= 1 and not staged:
             for row in rows:
                 row["gfx"], row["cu_num"] = identities[0]
-            return [self._tune_one_shape(row, args) for row in rows]
+            results = []
+            for row in rows:
+                try:
+                    results.append(self._tune_one_shape(row, args))
+                except Exception as exc:  # noqa: BLE001
+                    reason = f"{type(exc).__name__}: {exc}"
+                    print(f"[mxfp4-port] shape failed: {reason}", flush=True)
+                    results.append(_mxfp4_failed_row(self.keys, row, reason))
+            return results
 
         # One fresh process per shape (memory fully released between shapes),
         # spread across mp_num GPUs, each on a distinct device.
@@ -8679,40 +8760,117 @@ class Mxfp4FlydslTuner(FmoeTuner):
             f"[mxfp4-port] tuning {len(rows)} shapes across {mp_num} GPUs", flush=True
         )
         ctx = _mp.get_context("spawn")
-        payloads = [(self.keys, row, args, None) for row in rows]
-        results = (
-            _run_staged_shapes_isolated(payloads, mp_num, ctx)
-            if staged
-            else _run_shapes_isolated(payloads, mp_num, ctx)
-        )
-        # A None means the shape's process died mid-shape (e.g. a C++ abort()).
-        # Report it as a failed shape rather than dropping it, so the run
-        # finishes and the failure shows up in the summary.
-        return [
-            (
-                res
-                if res is not None
-                else _mxfp4_failed_row(self.keys, row, "FAILED: worker died mid-shape")
+        # Each worker appends only to its own journal after an evaluation
+        # returns. A hard exit keeps completed observations without inventing a
+        # time for the candidate that killed the process. Only this parent
+        # writes the user-facing profile CSV.
+        with tempfile.TemporaryDirectory(prefix="mxfp4-profile-") as journal_dir:
+            payloads = []
+            for index, row in enumerate(rows):
+                worker_args = argparse.Namespace(**vars(args))
+                if getattr(args, "profile_file", ""):
+                    worker_args._mxfp4_profile_journal = str(
+                        Path(journal_dir) / f"{index}.csv"
+                    )
+                payloads.append((self.keys, row, worker_args, None))
+            results = (
+                _run_staged_shapes_isolated(payloads, mp_num, ctx)
+                if staged
+                else _run_shapes_isolated(payloads, mp_num, ctx)
             )
-            for row, res in zip(rows, results)
-        ]
+            for index, (row, result) in enumerate(zip(rows, results)):
+                if result is None:
+                    result = _mxfp4_failed_row(
+                        self.keys, row, "worker died mid-shape without a result"
+                    )
+                journal = Path(journal_dir) / f"{index}.csv"
+                if journal.exists():
+                    result["_profile"] = pd.read_csv(journal).to_dict("records")
+                results[index] = result
+            return results
 
     def post_process(self, results, args, topk=-1, fast_mode=False):
-        del args, topk, fast_mode
-        return pd.DataFrame(results, columns=self.columns)
+        del topk, fast_mode
+        if args.profile_file:
+            profile_columns = self.keys + [
+                "precision",
+                "search_mode",
+                "phase",
+                "kernelName1",
+                "kernelName2",
+                "block_m",
+                "pipeline_us",
+                "error",
+                "status",
+                "failure_reason",
+            ]
+            profiles = pd.DataFrame(
+                [
+                    profile
+                    for result in results
+                    for profile in result.get("_profile", [])
+                ],
+                columns=profile_columns,
+            )
+            if os.path.exists(args.profile_file):
+                profiles = pd.concat(
+                    [pd.read_csv(args.profile_file), profiles], ignore_index=True
+                )
+            profiles.to_csv(args.profile_file, index=False)
+        return pd.DataFrame(
+            results, columns=self.columns + ["status", "failure_reason"]
+        )
+
+    def tune_summary(self, status):
+        observed = pd.concat([self.success, self.failed], ignore_index=True)
+        observed_keys = set(observed[self.keys].astype(str).apply(tuple, axis=1))
+        missing = self.untunedf[
+            ~self.untunedf[self.keys]
+            .astype(str)
+            .apply(tuple, axis=1)
+            .isin(observed_keys)
+        ]
+        if not missing.empty:
+            self.failed = pd.concat(
+                [
+                    self.failed,
+                    pd.DataFrame(
+                        [
+                            _mxfp4_failed_row(
+                                self.keys,
+                                row.to_dict(),
+                                f"shape unfinished: tuning {status.lower()}",
+                            )
+                            for _, row in missing.iterrows()
+                        ]
+                    ),
+                ],
+                ignore_index=True,
+            )
+        failure_file = Path(self._mxfp4_output_file).with_suffix(".failed_shapes.csv")
+        self.failed.reindex(columns=self.keys + ["status", "failure_reason"]).to_csv(
+            failure_file, index=False
+        )
+        super().tune_summary(status)
 
     def result_to_csv(self, results, file, concat=False):
         del concat
         old_tunedf = self.get_tuned_gemm_list(file, self.columns)
+        old_times = pd.to_numeric(old_tunedf["us"], errors="coerce")
+        old_tunedf = old_tunedf[old_times.map(math.isfinite) & old_times.gt(0)].copy()
         times = pd.to_numeric(results["us"], errors="coerce")
-        valid = results[(times > 0) & (times < self.INF_TIME)]
-        invalid = results[~results.index.isin(valid.index)]
+        valid_mask = times.map(math.isfinite) & times.gt(0) & results["status"].eq("ok")
+        valid = results.loc[valid_mask, self.columns].copy()
+        invalid = results.loc[~valid_mask].copy()
         self.failed = pd.concat([self.failed, invalid], ignore_index=True)
         resultdf = self._normalize_tuned_csv(self.update_tunedf(old_tunedf, valid))
         # The updated row is the first per key; drop rows it made unreachable.
         self._drop_superseded_rows(resultdf, self.keys).to_csv(file, index=False)
         # Count winners only once saved; unsaved shapes report as untuned.
         self.success = pd.concat([self.success, valid], ignore_index=True)
+        self.failed[self.keys + ["status", "failure_reason"]].to_csv(
+            Path(file).with_suffix(".failed_shapes.csv"), index=False
+        )
 
 
 def _mxfp4_tune_shape_worker(payload):
@@ -8744,6 +8902,7 @@ def _mxfp4_failed_row(keys, row, reason):
     tuner.keys = keys
     cand = tuner._candidate_row(row, 0, reason[:240], "")
     cand["us"] = Mxfp4FlydslTuner.INVALID_TIME
+    cand.update(status="failed", failure_reason=reason)
     return cand
 
 
