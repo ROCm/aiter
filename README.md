@@ -78,6 +78,8 @@ AITER is the **default kernel backend for LLM inference on AMD GPUs**, integrate
 
 On Windows, CK FMHA compilation also requires replacing `std::memcpy` with `__builtin_memcpy` at CK's two device descriptor casts, as proposed in the [closed, unmerged CK PR 10067](https://github.com/ROCm/rocm-libraries/pull/10067). Select a checkout with that fix through `CK_DIR`, and use a short JIT cache path such as `$env:AITER_JIT_DIR = "C:\aiter_jit"` to avoid Ninja's Windows path-length limit.
 
+Windows native HIP operations are enabled automatically when a ROCm toolchain is detected. Set `AITER_TRITON_ONLY=1` to force Triton-only operation and skip native HIP/CK imports and JIT builds.
+
 ## Operators
 
 AITER provides optimized kernels for attention, MoE, GEMM, normalization, quantization, communication, and more. Each operator has unit tests under [`op_tests/`](op_tests/) that you can run directly:

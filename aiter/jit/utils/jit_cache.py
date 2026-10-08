@@ -59,41 +59,12 @@ def _windows_blob_gen_argv(
     if not raw_args:
         return argv
 
-    lexer = shlex.shlex(raw_args, posix=False)
+    lexer = shlex.shlex(raw_args, posix=True)
     lexer.whitespace_split = True
     lexer.commenters = ""
-
-    option = None
-    values = []
-
-    def value_token(token):
-        if len(token) >= 2 and token[0] == token[-1] and token[0] in "\"'":
-            token = token[1:-1]
-        return token.replace(blob_dir_placeholder, blob_dir)
-
-    def append_option():
-        nonlocal option, values
-        if option is None:
-            return
-        argv.append(option)
-        if values:
-            argv.append(value_token(" ".join(values)))
-        option = None
-        values = []
-
+    lexer.escape = ""
     for token in lexer:
-        if re.match(r"^-{1,2}[A-Za-z]", token):
-            append_option()
-            if "=" in token:
-                option, first_value = token.split("=", 1)
-                values.append(first_value)
-            else:
-                option = token
-        elif option is None:
-            argv.append(value_token(token))
-        else:
-            values.append(token)
-    append_option()
+        argv.append(token.replace(blob_dir_placeholder, blob_dir))
     return argv
 
 

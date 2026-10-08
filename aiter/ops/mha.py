@@ -15,9 +15,10 @@ from ..jit.core import (
     is_experimental_enabled,
 )
 from ..jit.utils.asm_guard import is_gfx1250_asm_supported, require_gfx1250_asm
-from ..jit.utils.chip_info import get_cu_num, get_gfx
+from ..jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_list
 from ..jit.utils.mha_recipes import (
     _ck_targets_flag,
+    _require_ck_batch_prefill_targets,
     compose_mha_fwd_variant_suffix_and_filter,
     get_mha_varlen_prebuild_variants_by_names,
 )
@@ -1547,6 +1548,7 @@ def cmdGenFunc_mha_batch_prefill(
     sink_ptr: Tensor | None = None,
     gen: Generator | None = None,
 ):
+    _require_ck_batch_prefill_targets(get_gfx_list())
     # causal=true is the same as causal=false in this case
     causal = is_causal
     if max_seqlen_q == 1 and alibi_slopes is None:

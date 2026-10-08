@@ -187,6 +187,39 @@ class TestJitCacheTransaction(unittest.TestCase):
                         command, op_dir, r"C:\Program Files\Python\python.exe"
                     )
 
+    def test_windows_codegen_preserves_multi_value_and_equals_tokens(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            op_dir = os.path.join(tmp, "work tree", "module")
+            command = (
+                r'"C:\Work Tree\generator.py" --extra_kids 7 9 '
+                r'--filter=" @ " --config "C:\Program Files\Aiter\config.json" '
+                r'--output_dir {}'
+            )
+
+            def run(args, check):
+                self.assertTrue(check)
+                output_dir = args[args.index("--output_dir") + 1]
+                _write(os.path.join(output_dir, "generated.cpp"), "// generated\n")
+
+            with mock.patch.object(jit_cache, "IS_WINDOWS", True), mock.patch.object(
+                jit_cache.subprocess, "run", side_effect=run
+            ) as run_process:
+                staging_dir = jit_cache.stage_blob_sources(
+                    command, op_dir, r"C:\Program Files\Python\python.exe"
+                )
+
+            args = run_process.call_args.args[0]
+            kids_index = args.index("--extra_kids")
+            self.assertEqual(args[kids_index + 1 : kids_index + 3], ["7", "9"])
+            self.assertEqual(args[args.index("--filter= @ ")], "--filter= @ ")
+            self.assertEqual(
+                args[args.index("--config") + 1],
+                r"C:\Program Files\Aiter\config.json",
+            )
+            self.assertEqual(
+                args[args.index("--output_dir") + 1], os.path.join(staging_dir, "")
+            )
+
     def test_failed_codegen_restores_last_complete_sources(self):
         with tempfile.TemporaryDirectory() as tmp:
             op_dir = os.path.join(tmp, "module")

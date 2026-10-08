@@ -1,22 +1,33 @@
-def _ck_targets_flag_for_arch(gfx: str) -> str:
-    if gfx.startswith("gfx9"):
+def _ck_targets_flag_for_arches(gfxs: list[str]) -> str:
+    gfxs = [gfx for gfx in gfxs if gfx != "cpu"]
+    if not gfxs or all(gfx.startswith("gfx9") for gfx in gfxs):
         return ""
-    return f" --targets {gfx}"
+    return f" --targets {','.join(gfxs)}"
+
+
+def _require_ck_batch_prefill_targets(gfxs: list[str]) -> None:
+    unsupported = [gfx for gfx in gfxs if gfx != "cpu" and not gfx.startswith("gfx9")]
+    if unsupported:
+        raise RuntimeError(
+            "CK batch-prefill code generation only supports gfx9 targets; "
+            f"unsupported targets: {', '.join(unsupported)}"
+        )
 
 
 def _ck_targets_flag() -> str:
-    """Select the runtime architecture for CK FMHA code generation.
+    """Select every build architecture for CK FMHA code generation.
 
     CK's default covers gfx9 and gfx950. gfx10 targets have no FMHA factory in
-    the pinned CK generator; gfx11 and gfx12 need an explicit target.
+    the pinned CK generator; other targets need explicit targets. GPU_ARCHS may
+    name several architectures, which CK expects as a comma-separated list.
     """
     try:
-        from chip_info import get_gfx
+        from chip_info import get_gfx_list
 
-        gfx = get_gfx()
+        gfxs = get_gfx_list()
     except Exception:  # noqa: BLE001
         return ""
-    return _ck_targets_flag_for_arch(gfx)
+    return _ck_targets_flag_for_arches(gfxs)
 
 
 def compose_mha_fwd_variant_suffix_and_filter(
