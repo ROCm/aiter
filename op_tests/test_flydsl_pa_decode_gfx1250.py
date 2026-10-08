@@ -36,6 +36,7 @@ def _inputs(
     pool_pages=None,
     page=128,
     divisor=8,
+    cache_dtype=torch.float8_e4m3fn,
 ):
     pages = (length + page - 1) // page
     if page_ids is None:
@@ -57,22 +58,25 @@ def _inputs(
         )
         query_view.copy_(query)
         query = query_view
+    chunk = 16 // torch.empty((), dtype=cache_dtype).element_size()
     cache_key = torch.empty(
-        (pool_pages, 1, dim // 16, page, 16), dtype=torch.float8_e4m3fn, device=device
+        (pool_pages, 1, dim // chunk, page, chunk), dtype=cache_dtype, device=device
     )
     vshape = (
-        (pool_pages, 1, page // 16, dim, 16) if trans_v else (pool_pages, 1, dim, page)
+        (pool_pages, 1, page // chunk, dim, chunk)
+        if trans_v
+        else (pool_pages, 1, dim, page)
     )
-    cache_value = torch.empty(vshape, dtype=torch.float8_e4m3fn, device=device)
+    cache_value = torch.empty(vshape, dtype=cache_dtype, device=device)
     packed_key = (
-        key.reshape(pages, 1, page, dim // 16, 16)
+        key.reshape(pages, 1, page, dim // chunk, chunk)
         .permute(0, 1, 3, 2, 4)
         .contiguous()
         .to(cache_key.dtype)
     )
     packed_value = (
         (
-            value.reshape(pages, 1, page // 16, 16, dim).permute(0, 1, 2, 4, 3)
+            value.reshape(pages, 1, page // chunk, chunk, dim).permute(0, 1, 2, 4, 3)
             if trans_v
             else value.permute(0, 1, 3, 2)
         )

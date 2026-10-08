@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 
-"""FP8 paged-attention decode with BF16/FP16 queries on gfx942/gfx950/gfx1250.
+"""Paged-attention decode with BF16/FP16 queries on gfx942/gfx950/gfx1250.
 
 Cache layouts are logical, not preshuffled. K/V use E4M3 FNUZ on gfx942 and
-OCP on gfx950/gfx1250. See ``kernels.pa_decode_kernel`` for Q/P quantization,
-MFMA and wave32 WMMA specialization details.
+OCP on gfx950/gfx1250; gfx1250 also supports native BF16 caches/compute.
+See ``kernels.pa_decode_kernel`` for Q/P quantization, MFMA and wave32 WMMA
+specialization details.
 """
 
 import flydsl.compiler as flyc
@@ -147,7 +148,7 @@ def pa_decode(
     query_length: int,
     *,
     context_partition_size: int = 256,
-    compute_type: torch.dtype = torch.bfloat16,
+    compute_type: torch.dtype | None = None,
     query_scale: torch.Tensor = None,
     key_scale: torch.Tensor = None,  # [num_blocks, num_kv_heads, kv_block_size, 1]
     value_scale: torch.Tensor = None,  # [num_blocks, num_kv_heads, kv_block_size, 1]
@@ -160,10 +161,12 @@ def pa_decode(
     work_plan: PADecodePlan,
     max_context_length: int | None = None,
 ) -> None:
-    """Decode FP8 K/V with BF16/FP16 queries using 256-token compute tiles.
+    """Decode FP8 K/V, or BF16 K/V on gfx1250, with BF16/FP16 queries.
 
     Supports page sizes 16/64/128 and head_dim 64 or multiples of 128 up to 1024.
-    K/V scales are [1] or [num_blocks, num_kv_heads, block_size, 1].
+    ``compute_type=None`` infers compute from the cache dtype. BF16 K/V use
+    8-element packing in the innermost dimension and no quantization scales.
+    FP8 K/V scales are [1] or [num_blocks, num_kv_heads, block_size, 1].
     ALiBi and externally quantized queries are unsupported.
 
     MTP lengths include the query tokens and use dense causal masking.
@@ -172,11 +175,12 @@ def pa_decode(
     position; 0 and -1 disable it.
 
     ``work_plan`` is required and must be built with ``plan_pa_decode`` before
-    calling decode. Use ``pa_decode_tuning.get_cached_budget`` to read an
-    offline-tuned budget from FlyDSL's cache when creating a plan. Cache lookup
-    returns twice the device CU count on a miss and never benchmarks. Build the
-    plan before graph capture; decode does not access the tuning cache. Set its
-    partition cap with ``plan_pa_decode(max_partitions=...)``; even a cap of one
+    calling decode. For FP8 caches, ``pa_decode_tuning.get_cached_budget`` reads
+    an offline-tuned budget from FlyDSL's cache when creating a plan. Cache lookup
+    returns twice the device CU count on a miss and never benchmarks. BF16 plans
+    use the default budget or an explicitly measured ``workgroup_budget``.
+    Build the plan before graph capture; decode does not access the tuning cache.
+    Set its partition cap with ``plan_pa_decode(max_partitions=...)``; even a cap of one
     uses packed scratch and reduction.
 
     ``sinks`` is a contiguous [num_query_heads] BF16/FP16/FP32 tensor on the
@@ -273,6 +277,9 @@ def pa_decode(
         )
 
     num_blocks, num_kv_heads, num_hgroups, block_size, hgroup_width = key_cache.shape
+    compute_type = key_cache.dtype if compute_type is None else compute_type
+    bf16_compute = compute_type == torch.bfloat16
+    cache_chunk = 8 if bf16_compute else 16
     if num_kv_heads < 1:
         raise ValueError(
             f"key_cache must contain at least one KV head, got {num_kv_heads}"
@@ -289,10 +296,10 @@ def pa_decode(
             f"pa_decode does not support head_dim={head_dim}; supported values "
             "are 64 and multiples of 128 in [128, 1024]"
         )
-    if num_hgroups != head_dim // 16 or hgroup_width != 16:
+    if num_hgroups != head_dim // cache_chunk or hgroup_width != cache_chunk:
         raise ValueError(
             "key_cache shape must be "
-            "[num_blocks, num_kv_heads, head_dim // 16, block_size, 16], "
+            f"[num_blocks, num_kv_heads, head_dim // {cache_chunk}, block_size, {cache_chunk}], "
             f"got {tuple(key_cache.shape)} for head_dim={head_dim}"
         )
     if block_size not in (16, 64, 128):
@@ -303,11 +310,11 @@ def pa_decode(
     trans_v = value_cache.dim() == 5
     if trans_v:
         v_num_blocks, v_num_kv_heads = value_cache.shape[:2]
-        expected_v_tail = (block_size // 16, head_dim, 16)
+        expected_v_tail = (block_size // cache_chunk, head_dim, cache_chunk)
         if tuple(value_cache.shape[2:]) != expected_v_tail:
             raise ValueError(
                 "transposed value_cache shape must be "
-                "[num_blocks, num_kv_heads, block_size // 16, head_dim, 16], "
+                f"[num_blocks, num_kv_heads, block_size // {cache_chunk}, head_dim, {cache_chunk}], "
                 f"got {tuple(value_cache.shape)} for block_size={block_size}, "
                 f"head_dim={head_dim}"
             )
@@ -347,10 +354,14 @@ def pa_decode(
         raise NotImplementedError(
             f"pa_decode only supports gfx942, gfx950 and gfx1250, got {arch}"
         )
-    if compute_type != expected_fp8_dtype:
+    if compute_type != expected_fp8_dtype and not (arch == "gfx1250" and bf16_compute):
+        supported_compute = (
+            f"{expected_fp8_dtype} or torch.bfloat16"
+            if arch == "gfx1250"
+            else str(expected_fp8_dtype)
+        )
         raise NotImplementedError(
-            f"pa_decode only supports FP8 compute ({expected_fp8_dtype}) on {arch}, "
-            f"got {compute_type}"
+            f"pa_decode supports {supported_compute} compute on {arch}, got {compute_type}"
         )
 
     if block_tables.dtype != torch.int32:
@@ -371,14 +382,14 @@ def pa_decode(
             f"got {output.dtype} vs {query.dtype}"
         )
 
-    if key_cache.dtype != expected_fp8_dtype:
+    if key_cache.dtype != compute_type:
         raise TypeError(
-            f"pa_decode requires {expected_fp8_dtype} key cache on {arch}, "
+            f"pa_decode requires {compute_type} key cache on {arch}, "
             f"got {key_cache.dtype}"
         )
-    if value_cache.dtype != expected_fp8_dtype:
+    if value_cache.dtype != compute_type:
         raise TypeError(
-            f"pa_decode requires {expected_fp8_dtype} value cache on {arch}, "
+            f"pa_decode requires {compute_type} value cache on {arch}, "
             f"got {value_cache.dtype}"
         )
 
@@ -447,14 +458,18 @@ def pa_decode(
             )
         return scale
 
+    if bf16_compute and (key_scale is not None or value_scale is not None):
+        raise ValueError("BF16 PA decode does not use key_scale or value_scale")
     if (key_scale is None) != (value_scale is None):
         raise ValueError(
             "key_scale and value_scale must either both be provided or both be None"
         )
-    key_scale_t = normalize_scale(key_scale, "key_scale")
-    value_scale_t = normalize_scale(value_scale, "value_scale")
-    per_token_kv = key_scale_t.numel() > 1
-    if per_token_kv != (value_scale_t.numel() > 1):
+    key_scale_t = None if bf16_compute else normalize_scale(key_scale, "key_scale")
+    value_scale_t = (
+        None if bf16_compute else normalize_scale(value_scale, "value_scale")
+    )
+    per_token_kv = not bf16_compute and key_scale_t.numel() > 1
+    if not bf16_compute and per_token_kv != (value_scale_t.numel() > 1):
         raise ValueError(
             "key_scale and value_scale must both be per-tensor or both be per-token"
         )
@@ -487,6 +502,8 @@ def pa_decode(
         stride_ks_block = 0
         stride_ks_head = 0
     for name, scale in (("key_scale", key_scale_t), ("value_scale", value_scale_t)):
+        if scale is None:
+            continue
         if scale.dtype != torch.float32:
             raise TypeError(f"{name} tensor must be float32, got {scale.dtype}")
         if scale.device != dev:
@@ -519,8 +536,7 @@ def pa_decode(
     psum = exp_sums
     pout = temporary_output
 
-    # FP8 element offsets are bytes; 4 GiB caches require i64 addressing.
-    cache_extent = max(key_cache.numel(), value_cache.numel())
+    cache_extent = max(key_cache.nbytes, value_cache.nbytes)
     wide_kv_addressing = cache_extent >= 2**31
     kv_buffer_u32 = cache_extent < 2**32
 
@@ -546,6 +562,7 @@ def pa_decode(
             work_capacity=work_plan.capacity,
             max_context_length=schedule_context_length,
             sliding_window=sliding_window,
+            compute_dtype="bf16" if bf16_compute else "fp8",
         )
 
     total_rows = query_length * query_group_size
@@ -612,8 +629,16 @@ def pa_decode(
             ptr_arg(key_cache, _flydsl_pointer_dtype(key_cache.dtype)),
             ptr_arg(value_cache, _flydsl_pointer_dtype(value_cache.dtype)),
             ptr_arg(block_tables, fx.Int32),
-            ptr_arg(key_scale_t, fx.Float32),
-            ptr_arg(value_scale_t, fx.Float32),
+            (
+                flyc.from_c_void_p(fx.Float32, 0)
+                if bf16_compute
+                else ptr_arg(key_scale_t, fx.Float32)
+            ),
+            (
+                flyc.from_c_void_p(fx.Float32, 0)
+                if bf16_compute
+                else ptr_arg(value_scale_t, fx.Float32)
+            ),
             int(max_blocks_per_seq),
             int(num_seqs),
             int(num_kv_heads),

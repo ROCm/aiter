@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 
-"""FP8 paged-attention tile kernel.
+"""Paged-attention tile kernel with FP8 and gfx1250 native BF16 compute.
 
-K/V use e4m3 (FNUZ on gfx942, OCP on gfx950/gfx1250); BF16/FP16 Q and probabilities P
-are quantized to FP8. Q/key scales fold into QK, value scale and 1/FP8_MAX into
+For FP8 compute, K/V use e4m3 (FNUZ on gfx942, OCP on gfx950/gfx1250);
+BF16/FP16 Q and probabilities P are quantized to FP8.
+Q/key scales fold into QK, value scale and 1/FP8_MAX into
 the epilogue; softmax max/sum stay f32. Tuned gfx950 BF16 per-token MTP3/MTP4
 uses K128 MFMA instead of K32, preserving normalized Q/P and operand layouts.
 Every Q row uses absmax normalization; per-tensor and per-token K/V scales
@@ -26,7 +27,9 @@ Logical layouts (not preshuffled):
 Four-wave CTAs process 256-token plan tiles: QK splits tokens, PV splits head
 dim, and P passes through LDS to transpose ownership between the MMAs.
 gfx1250 uses wave32 WMMA and 64-token subtiles with async K/V LDS staging.
-Per-token scales with power-of-two D128+ use TDM; other cases use vector DMA.
+FP8 per-token scales with power-of-two D128+ use TDM; other cases use vector DMA.
+Native BF16 uses eight-element cache packing, unquantized Q/P, no K/V scales,
+and K32 WMMA with FP32 accumulation. BF16 TDM supports power-of-two D64–512.
 
 The ``pa_decode`` package separates schedule/layout traits, CTA context, Q/K/V
 and LDS movement, MFMA, softmax and output operations. ``PaDecodePipeline``
@@ -89,6 +92,7 @@ def compile_pa_decode_tile(
     query_splits: int | None = None,
     max_context_length: int | None = None,
     sliding_window: int = 0,
+    compute_dtype: str = "fp8",
 ):
     """Select and cache a PA-decode kernel and launch wrapper.
 
@@ -108,6 +112,8 @@ def compile_pa_decode_tile(
     slot's byte span fits signed i32, retaining the dtype's 2-byte alignment.
 
     ``work_capacity`` is a positive host integer matching the work plan.
+    ``compute_dtype`` is ``fp8`` by default; ``bf16`` requires native BF16
+    K/V on gfx1250 and disables quantization scales.
     Positive ``sliding_window`` includes the query token.
     Plans cover the MTP window union; scores are masked per query row.
     All tasks write packed partials; the reducer applies sinks once and writes
@@ -137,6 +143,11 @@ def compile_pa_decode_tile(
             query_length=query_length,
             trans_v=trans_v,
             sliding_window=sliding_window,
+            compute_dtype=compute_dtype,
+        )
+    if compute_dtype != "fp8":
+        raise NotImplementedError(
+            f"{compute_dtype} PA decode is only supported on gfx1250"
         )
     schedule = PaDecodeSchedule.select(
         architecture=architecture,
