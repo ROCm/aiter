@@ -604,6 +604,29 @@ def compile_preshuffle_gemm(
             fx.copy(buf_copy, pA_g[None, None, None, safe_k], frag_copy_A)
             zero_padding(frag_copy_A, k_global)
 
+        @flyc.jit
+        def copy_A_round(src, dst, row):
+            if row < Int32(tile_m):
+                fx.copy(uni_copy, src, dst)
+
+        def store_A(stage):
+            if const_expr(
+                (tile_m * tile_k * elem_bytes) % (total_threads * a_load_bytes) == 0
+            ):
+                fx.copy(uni_copy, frag_copy_A, pA_s_stages[stage][None, None, None])
+            else:
+                # Partial copy rounds must not overwrite the neighbouring LDS stage.
+                thrs_k = tile_k * elem_bytes // a_load_bytes
+                thrs_m = total_threads // thrs_k
+                for i in range_constexpr((tile_m + thrs_m - 1) // thrs_m):
+                    src = frag_copy_A[None, i, None]
+                    dst = pA_s_stages[stage][None, i, None]
+                    if const_expr((i + 1) * thrs_m <= tile_m):
+                        fx.copy(uni_copy, src, dst)
+                    else:
+                        row = Int32(tid) // Int32(thrs_k) + Int32(i * thrs_m)
+                        copy_A_round(src, dst, row)
+
         def load_B(stage, k_global):
             safe_k = k_global
             if const_expr(is_ragged):
@@ -743,7 +766,7 @@ def compile_preshuffle_gemm(
                 load_B(write_stage, global_k_next)
             mma_kloop(a_read, cur_frag_B, k_tile)
             if const_expr(do_next):
-                fx.copy(uni_copy, frag_copy_A, pA_s_stages[a_write][None, None, None])
+                store_A(a_write)
             if const_expr(enable_scheduler):
                 hot_loop_scheduler()
             if const_expr(do_next):
@@ -765,7 +788,7 @@ def compile_preshuffle_gemm(
             load_A(k_off)
             load_B(0, k_off)
             frag_C.store(acc_zero)
-            fx.copy(uni_copy, frag_copy_A, pA_s_stages[0][None, None, None])
+            store_A(0)
             gpu.barrier()
         rocdl.sched_barrier(0)
 
@@ -783,7 +806,7 @@ def compile_preshuffle_gemm(
                 if const_expr(use_async_copy):
                     dma_a_to_lds(k_next, 0)
                 else:
-                    fx.copy(uni_copy, frag_copy_A, pA_s_stages[0][None, None, None])
+                    store_A(0)
                 if const_expr(enable_scheduler):
                     hot_loop_scheduler()
                 if const_expr(use_async_copy):

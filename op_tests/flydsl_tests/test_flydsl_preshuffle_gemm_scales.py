@@ -86,6 +86,7 @@ BLOCKSCALE_CONFIGS = [
     (4, 2048, 7168, 32, 256, 1),
     (1, 2048, 2176, 16, 128, 1),
     (16, 4096, 7168, 32, 128, 1),
+    (4, 6144, 2176, 16, 128, 6),
 ]
 
 
@@ -106,30 +107,33 @@ def test_blockscale(m, n, k, tm, tk, sk):
     b = bq.float() * ws.repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)
     ref = a @ b.T
     out = torch.full((m, n), float("nan"), device="cuda", dtype=dtypes.bf16)
-    flydsl_preshuffle_gemm_a8(
-        aq,
-        shuffle_weight(bq, layout=(16, 16)),
-        xs,
-        ws,
-        out,
-        tm,
-        64,
-        tk,
-        0,
-        0,
-        0,
-        lds_stage=2,
-        enable_scheduler=True,
-        split_k=sk,
-        scale_mode="blockscale",
-    )
-    torch.cuda.synchronize()
-    o = out.float()
+    wq = shuffle_weight(bq, layout=(16, 16))
     tol = 5e-3 * ref.abs().max() + 1e-2 * ref.abs()
-    nonfinite = (~torch.isfinite(o)).sum().item()
-    bad = ((o - ref).abs() > tol).sum().item()
-    assert nonfinite == 0, f"nonfinite={nonfinite}"
-    assert bad == 0, f"bad={bad}"
+    for _ in range(5):
+        out.fill_(float("nan"))
+        flydsl_preshuffle_gemm_a8(
+            aq,
+            wq,
+            xs,
+            ws,
+            out,
+            tm,
+            64,
+            tk,
+            0,
+            0,
+            0,
+            lds_stage=2,
+            enable_scheduler=True,
+            split_k=sk,
+            scale_mode="blockscale",
+        )
+        torch.cuda.synchronize()
+        o = out.float()
+        nonfinite = (~torch.isfinite(o)).sum().item()
+        bad = ((o - ref).abs() > tol).sum().item()
+        assert nonfinite == 0, f"nonfinite={nonfinite}"
+        assert bad == 0, f"bad={bad}"
 
 
 @pytest.mark.skipif(
@@ -147,8 +151,16 @@ def test_gfx942_async_copy_raises():
         )
 
 
-@pytest.mark.parametrize("m,k,sk", [(1, 2176, 6), (4, 7168, 1), (16, 2176, 1)])
-def test_per_row_scales(m, k, sk):
+@pytest.mark.parametrize(
+    "m,k,tm,tn,sk",
+    [
+        (1, 2176, 32, 64, 6),
+        (4, 7168, 32, 64, 1),
+        (16, 2176, 32, 64, 1),
+        (4, 2176, 16, 128, 3),
+    ],
+)
+def test_per_row_scales(m, k, tm, tn, sk):
     from aiter.ops.flydsl.gemm_kernels import flydsl_preshuffle_gemm_a8
 
     g = torch.Generator(device="cuda").manual_seed(1)
@@ -159,11 +171,13 @@ def test_per_row_scales(m, k, sk):
     ws = torch.linspace(0.75, 1.25, N, device="cuda").reshape(N, 1)
     ref = (aq.float() * xs) @ (bq.float() * ws).T
     out = torch.full((m, N), float("nan"), device="cuda", dtype=dtypes.bf16)
-    flydsl_preshuffle_gemm_a8(
-        aq, wq, xs, ws, out, 32, 64, 128, 0, 0, 0, split_k=sk
-    )
-    torch.cuda.synchronize()
-    o = out.float()
     tol = 5e-3 * ref.abs().max() + 1e-2 * ref.abs()
-    assert torch.isfinite(o).all()
-    assert (o - ref).abs().le(tol).all()
+    for _ in range(5):
+        out.fill_(float("nan"))
+        flydsl_preshuffle_gemm_a8(
+            aq, wq, xs, ws, out, tm, tn, 128, 0, 0, 0, lds_stage=2, split_k=sk
+        )
+        torch.cuda.synchronize()
+        o = out.float()
+        assert torch.isfinite(o).all()
+        assert (o - ref).abs().le(tol).all()
