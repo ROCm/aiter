@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -178,7 +179,7 @@ def test_gemm_a8w8_public_dispatch_uses_triton_when_flydsl_is_unavailable(
 
     module_name = "aiter.ops.triton.gemm.basic.gemm_a8w8"
     monkeypatch.setitem(
-        __import__("sys").modules,
+        sys.modules,
         module_name,
         SimpleNamespace(gemm_a8w8=triton_gemm),
     )
