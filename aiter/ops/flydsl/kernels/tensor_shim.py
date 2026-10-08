@@ -144,7 +144,23 @@ def ptr_buf_tensor(
 
 
 def buf_copy_atom(unit_bytes, elem=fx.Int32, cache_modifier=0):
-    """Copy atom for a ``unit_bytes``-wide buffer access (0=cached, 2=nt)."""
+    """Copy atom for a ``unit_bytes``-wide buffer access (0=cached, 2=nt).
+
+    ``cache_modifier`` is the instruction's raw 2-bit aux field (sc0, nt), not
+    an enum: every ``BufferCopy*`` accepts whatever it is handed, so an
+    out-of-range value is not a wrong policy but a wrong encoding, and it would
+    surface as a performance mystery rather than an error. Bounded here so the
+    check covers every caller instead of each kernel repeating it.
+    """
+    if unit_bytes not in _BUF_COPY_ATOM:
+        raise ValueError(
+            f"unit_bytes {unit_bytes} is not a buffer access width; "
+            f"expected one of {sorted(_BUF_COPY_ATOM)}"
+        )
+    if not isinstance(cache_modifier, int) or not 0 <= cache_modifier <= 3:
+        raise ValueError(
+            f"cache_modifier must be a 2-bit aux field in [0, 3], got {cache_modifier}"
+        )
     return fx.make_copy_atom(_BUF_COPY_ATOM[unit_bytes](cache_modifier), elem)
 
 
