@@ -519,9 +519,13 @@ def test_muse_weightless_qk_norm_query_scale_and_cache(tokens, preallocated_outp
     )
     weights = torch.zeros(head_dim, device="cuda", dtype=qkv.dtype)
     positions = torch.arange(tokens, device="cuda") % 256
-    freqs = torch.arange(256, device="cuda", dtype=torch.float32)[:, None] * (
-        1 / (10000 ** (torch.arange(head_dim // 2, device="cuda") / (head_dim // 2)))
-    )[None, :]
+    freqs = (
+        torch.arange(256, device="cuda", dtype=torch.float32)[:, None]
+        * (
+            1
+            / (10000 ** (torch.arange(head_dim // 2, device="cuda") / (head_dim // 2)))
+        )[None, :]
+    )
     cos, sin = freqs.cos().to(qkv.dtype), freqs.sin().to(qkv.dtype)
     blocks = triton.cdiv(tokens, block_size) + 1
     slots = torch.randperm(blocks * block_size, device="cuda")[:tokens]
@@ -575,12 +579,8 @@ def test_muse_weightless_qk_norm_query_scale_and_cache(tokens, preallocated_outp
     rk = rk.view(tokens, kvh, head_dim)
     rv = rv.view(tokens, kvh, head_dim)
     rq32, rk32 = rq.float(), rk.float()
-    rq = (rq32 * torch.rsqrt(rq32.square().mean(-1, keepdim=True) + eps)).to(
-        qkv.dtype
-    )
-    rk = (rk32 * torch.rsqrt(rk32.square().mean(-1, keepdim=True) + eps)).to(
-        qkv.dtype
-    )
+    rq = (rq32 * torch.rsqrt(rq32.square().mean(-1, keepdim=True) + eps)).to(qkv.dtype)
+    rk = (rk32 * torch.rsqrt(rk32.square().mean(-1, keepdim=True) + eps)).to(qkv.dtype)
     rq = (rq * q_scale).to(qkv.dtype)
     c, s = cos[positions][:, None], sin[positions][:, None]
     q1, q2 = rq.chunk(2, -1)

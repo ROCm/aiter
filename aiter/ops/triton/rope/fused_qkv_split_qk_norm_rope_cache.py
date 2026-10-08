@@ -158,14 +158,20 @@ def fused_qkv_split_qk_norm_rope_cache(
     total_num_kv_cache_tokens = num_blocks * block_size
 
     assert qh >= kvh and qh % kvh == 0, "qh must be multiple of kvh"
-    q = q_out if q_out is not None else torch.empty(
-        (T, qh, head_dim), dtype=qkv.dtype, device=qkv.device
+    q = (
+        q_out
+        if q_out is not None
+        else torch.empty((T, qh, head_dim), dtype=qkv.dtype, device=qkv.device)
     )
-    k = k_out if k_out is not None else torch.empty(
-        (T, kvh, head_dim), dtype=qkv.dtype, device=qkv.device
+    k = (
+        k_out
+        if k_out is not None
+        else torch.empty((T, kvh, head_dim), dtype=qkv.dtype, device=qkv.device)
     )
-    v = v_out if v_out is not None else torch.empty(
-        (T, kvh, head_dim), dtype=qkv.dtype, device=qkv.device
+    v = (
+        v_out
+        if v_out is not None
+        else torch.empty((T, kvh, head_dim), dtype=qkv.dtype, device=qkv.device)
     )
 
     if attn_output_gate:
