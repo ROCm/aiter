@@ -35,7 +35,7 @@ def _manifest():
                 for r in csv.DictReader(f)]
 
 
-ROWS = [r for r in _manifest() if r["abi"] not in (2, 3, 4)]  # exact-shape rows
+ROWS = [r for r in _manifest() if r["abi"] not in (2, 3, 4, 5)]  # exact-shape rows
 SOFTMAX_D = [r for r in _manifest() if r["abi"] == 4]  # exact-shape rows emitting attention's softmax_d
 GENERIC_ROWS = [r for r in _manifest() if r["abi"] in (2, 3)]
 A6W4 = [r for r in ROWS if (r["a_fmt"], r["b_fmt"]) == (6, 4)]

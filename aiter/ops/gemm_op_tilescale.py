@@ -13,6 +13,15 @@ the attention output's gradient dO in sbhd rows (row = s * B + b) and ``epi_o`` 
 layout, the kernel adds, per row and 128-column head, the fp32 sum of out * O into ``epi_delta`` [B, N/128, S]
 (zeroed by the caller) from sequence position ``epi_s0`` on. The sum order is the kernel's own, not the odo
 kernel's. ``tilescale_softmax_d_supported`` says whether a kernel exists.
+
+``gemm_a6w6_tilescale_cat`` runs two A6W6 GEMMs that share an output as one kernel -- one fp32 accumulator over
+``A @ B^T`` (K) then ``A2 @ B2^T`` (K2), each pair in the layout ``gemm_a6w6_tilescale`` takes -- with a gated
+residual epilogue for sbhd rows (row = s * Bt + b) and a gate table ``gate`` [Bt, N]::
+
+    a = bf16(acc);  h32 = float(a) + float(bias);  h = bf16(h32);  out = bf16(fma(gate[row % Bt], h32, x))
+
+(fp32 math, one rounding per stored value; ``h32`` is not rounded before the fma). ``a6w6_tilescale_cat_table``
+lists the shapes with a kernel.
 """
 
 import csv
@@ -47,6 +56,28 @@ def _gemm_tilescale_asm(
 ) -> None: ...
 
 
+@compile_ops("module_gemm_tilescale_asm", fc_name="gemm_tilescale_cat_asm", ffi_type="ctypes")
+def _gemm_tilescale_cat_asm(
+    A: Tensor,
+    B: Tensor,
+    A_scale: Tensor,
+    B_scale: Tensor,
+    A2: Tensor,
+    B2: Tensor,
+    A2_scale: Tensor,
+    B2_scale: Tensor,
+    out: Tensor,
+    h: Tensor,
+    K: int,
+    K2: int,
+    bias: Tensor,
+    x: Tensor,
+    gate: Tensor,
+    B_c1: Tensor | None,
+    B2_c1: Tensor | None,
+) -> None: ...
+
+
 @functools.lru_cache(maxsize=None)
 def _manifest(arch: str = "gfx950"):
     path = os.path.join(AITER_META_DIR, "hsa", arch, "tsgemm", "tsgemm_bf16_per1x32.csv")
@@ -73,7 +104,15 @@ def _key(r):
 
 @functools.lru_cache(maxsize=None)
 def _rows(arch: str = "gfx950"):
-    return frozenset(_key(r) for r in _manifest(arch))
+    return frozenset(_key(r) for r in _manifest(arch) if not r.get("k2"))
+
+
+@functools.lru_cache(maxsize=None)
+def a6w6_tilescale_cat_table(arch: str = "gfx950") -> frozenset:
+    """Shapes ``(M, N, K, K2, Bt)`` that ``gemm_a6w6_tilescale_cat`` has a kernel for (plain data, safe to consult
+    inside compiled regions)."""
+    return frozenset((r["M"], r["N"], r["K"], r["k2"], r["epi_b"]) for r in _manifest(arch)
+                     if r["abi"] == 5 and r["a_fmt"] == 6 and r["b_fmt"] == 6 and r.get("k2"))
 
 
 def tilescale_supported(M: int, N: int, K: int, a_fmt: int, b_fmt: int, bias: bool = False, b_codes: int = 0,
@@ -146,3 +185,17 @@ def gemm_a4w4_tilescale(A, B, A_scale, B_scale, out, K, b_ilv=0, b_codes=FP4_COD
                         epi_delta=None, epi_s0=0):
     return gemm_mx_tilescale(A, B, A_scale, B_scale, out, 4, 4, K, None, b_codes, b_ilv, None, epi_o, epi_delta,
                              epi_s0)
+
+
+def gemm_a6w6_tilescale_cat(A, B, A_scale, B_scale, A2, B2, A2_scale, B2_scale, out, h, K, K2, bias, x, gate,
+                            b_c1=None, b2_c1=None):
+    """``h, out = epilogue(A @ B^T + A2 @ B2^T)`` (module docstring): A..B_scale over K and A2..B2_scale over K2 are
+    flat uint8 tilescale buffers as ``gemm_a6w6_tilescale`` takes them (``b_c1`` / ``b2_c1``: a B's C1 plane in its
+    own buffer). bias bf16 [N]; x, h, out bf16 [M, N] contiguous (h and out written, not overlapping x); gate bf16
+    [Bt, N] with unit column stride and any row stride (a multiple of 8, 16-byte aligned). Raises if no kernel
+    exists (``a6w6_tilescale_cat_table``)."""
+    if out.ndim != 2:
+        raise ValueError(f"gemm_a6w6_tilescale_cat expects a 2D output, got {out.ndim}D")
+    _gemm_tilescale_cat_asm(A, B, A_scale, B_scale, A2, B2, A2_scale, B2_scale, out, h, K, K2, bias, x, gate, b_c1,
+                            b2_c1)
+    return out

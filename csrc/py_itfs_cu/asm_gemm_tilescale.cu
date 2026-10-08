@@ -33,6 +33,12 @@
 //      its remaining elements. Rows are sbhd (row = s * B + b); the kernel adds, per row and 128-column
 //      head, the fp32 sum of bf16(out) * O over the head into δ, which the caller zeroes. Selected by the
 //      manifest's epi_b / epi_s (B, S; 0 for every other row).
+//   5  two-segment A6W6 with a gated-residual epilogue (gemm_tilescale_cat_asm, 304 bytes): abi 1 without
+//      bias (segment 0: A x B over K) + 4 bytes of padding, then segment 1's operands (A2's codes, B2's C0
+//      and C1 planes, A2's and B2's scale slabs), X, G, bias and H as (pointer, element count, pad), and the
+//      gate's row stride in elements. One fp32 accumulator runs over segment 0's K, then segment 1's K2
+//      (manifest column k2); then a = bf16(acc), h32 = a + bias (fp32), H = bf16(h32) and
+//      out = bf16(fma(G[row % epi_b], h32, X)). epi_b is the gate's row count (rows are sbhd, row = s * B + b).
 namespace {
 constexpr size_t kTensorAlignment = 16;
 
@@ -79,6 +85,34 @@ static_assert(offsetof(KernelArgsFly6, ptr_SA) == 120 && offsetof(KernelArgsFly6
               "fly6 kernarg ABI mismatch");
 constexpr size_t kFly6NoBias = 156;
 
+struct __attribute__((packed)) Ptr1d
+{
+    void* ptr;
+    uint32_t elems, pad;
+};
+static_assert(sizeof(Ptr1d) == 16, "1-d tensor slot must be 16 bytes");
+
+struct __attribute__((packed)) KernelArgsCat6
+{
+    Memref A0, A1, B0, B1, C;
+    void* ptr_SA;
+    uint32_t sa_dwords, sa_pad;
+    void* ptr_SB;
+    uint32_t sb_dwords;
+    uint32_t M;
+    uint32_t N;
+    uint32_t pad0;
+    Ptr1d A2, B20, B21, SA2, SB2, X, G, Bias;
+    void* ptr_H;
+    uint32_t h_elems;
+    int32_t ldg;
+};
+static_assert(sizeof(KernelArgsCat6) == 304, "cat6 kernarg must be 304 bytes");
+static_assert(offsetof(KernelArgsCat6, M) == 148 && offsetof(KernelArgsCat6, A2) == 160 &&
+                  offsetof(KernelArgsCat6, X) == 240 && offsetof(KernelArgsCat6, ptr_H) == 288 &&
+                  offsetof(KernelArgsCat6, ldg) == 300,
+              "cat6 kernarg ABI mismatch");
+
 Memref memref(void* p, int64_t rows, int64_t row_bytes)
 {
     return Memref{p,
@@ -122,7 +156,7 @@ const tsgemmConfig* find_row(const std::string& arch,
         const auto& c = kv.second;
         if(c.arch == arch && c.a_fmt == a_fmt && c.b_fmt == b_fmt && c.b_codes == b_codes &&
            c.b_ilv == b_ilv && c.bias == static_cast<int>(bias) && c.M == M && c.N == N &&
-           c.K == K && c.epi_b == epi_b && c.epi_s == epi_s)
+           c.K == K && c.epi_b == epi_b && c.epi_s == epi_s && c.k2 == 0)
         {
             found = &c;
             break;
@@ -336,4 +370,150 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         &impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name, co); });
     const int grid = generic ? static_cast<int>((M / 256) * (N / 256)) : cfg->grid;
     impl->launch_kernel({args, &arg_size, grid, 1, 1, 256, 1, 1, stream});
+}
+
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
+    gemm_tilescale_cat_asm,
+    (aiter_tensor_t * A,       // segment 0: A6 tilescale codes of [M, K] (C0 then C1)
+     aiter_tensor_t* B,        // segment 0: A6 tilescale codes of [N, K], or its C0 plane with B_c1
+     aiter_tensor_t* A_scale,  // segment 0: tilescale slab, role A, M*K/32 bytes
+     aiter_tensor_t* B_scale,  // segment 0: tilescale slab, role B (interleave 0), N*K/32 bytes
+     aiter_tensor_t* A2,       // segment 1: the same over K2
+     aiter_tensor_t* B2,
+     aiter_tensor_t* A2_scale,
+     aiter_tensor_t* B2_scale,
+     aiter_tensor_t* out,      // [M, N] bf16 contiguous
+     aiter_tensor_t* h,        // [M, N] bf16 contiguous
+     int64_t K,
+     int64_t K2,
+     aiter_tensor_t* bias,     // bf16 [N] contiguous
+     aiter_tensor_t* x,        // bf16 [M, N] contiguous
+     aiter_tensor_t* gate,     // bf16 [Bt, N], unit column stride, any row stride
+     aiter_tensor_t* B_c1,     // optional: B's C1 plane in its own buffer
+     aiter_tensor_t* B2_c1,    // optional: B2's C1 plane in its own buffer
+     hipStream_t stream),
+    (A, B, A_scale, B_scale, A2, B2, A2_scale, B2_scale, out, h, K, K2, bias, x, gate, B_c1, B2_c1, stream))
+{
+    const auto bytes = [](const aiter_tensor_t* t) {
+        return static_cast<int64_t>(t->numel()) * t->element_size();
+    };
+    const auto aligned = [](const aiter_tensor_t* t) {
+        return reinterpret_cast<uintptr_t>(t->ptr) % kTensorAlignment == 0;
+    };
+    AITER_CHECK(out->dtype() == AITER_DTYPE_bf16 && out->dim() == 2 && out->is_contiguous(),
+                __func__,
+                " out must be a contiguous 2D bf16 tensor");
+    const int64_t M = out->size(0), N = out->size(1);
+    AITER_CHECK(K > 0 && K2 > 0 && K % 256 == 0 && K2 % 256 == 0 && M % 256 == 0 && N % 256 == 0,
+                __func__,
+                " M, N, K, K2 must be multiples of 256");
+    const int dev = out->device_id;
+    for(const aiter_tensor_t* t : {h, x})
+        AITER_CHECK(t->dtype() == AITER_DTYPE_bf16 && t->dim() == 2 && t->size(0) == M &&
+                        t->size(1) == N && t->is_contiguous() && aligned(t) && t->device_id == dev,
+                    __func__,
+                    " h and x must be contiguous, 16-byte aligned bf16 [M, N] on the output's GPU");
+    AITER_CHECK(bias->dtype() == AITER_DTYPE_bf16 && bias->is_contiguous() && bias->numel() == N &&
+                    aligned(bias) && bias->device_id == dev,
+                __func__,
+                " bias must be a contiguous, 16-byte aligned bf16 [N] on the output's GPU");
+    AITER_CHECK(gate->dtype() == AITER_DTYPE_bf16 && gate->dim() == 2 && gate->size(1) == N &&
+                    gate->stride(1) == 1 && gate->stride(0) >= N && gate->stride(0) % 8 == 0 &&
+                    aligned(gate) && gate->device_id == dev,
+                __func__,
+                " gate must be bf16 [B, N] with unit column stride, a row stride >= N and a multiple of 8, "
+                "16-byte aligned, on the output's GPU");
+    const int64_t Bt = gate->size(0), ldg = gate->stride(0);
+    AITER_CHECK(Bt > 0 && M % Bt == 0 && ldg < (int64_t{1} << 26), __func__, " gate rows must divide M");
+
+    // per segment: codes, optional separate C1 plane, scale slabs
+    char* pb[2];
+    char* pb1[2];
+    const aiter_tensor_t* seg[2][5] = {{A, B, A_scale, B_scale, B_c1}, {A2, B2, A2_scale, B2_scale, B2_c1}};
+    const int64_t ks[2] = {K, K2};
+    for(int s = 0; s < 2; ++s)
+    {
+        const aiter_tensor_t *a = seg[s][0], *b = seg[s][1], *sa = seg[s][2], *sb = seg[s][3],
+                             *c1 = seg[s][4];
+        const int64_t k = ks[s];
+        for(const aiter_tensor_t* t : {a, b, sa, sb})
+            AITER_CHECK(t->is_contiguous() && aligned(t) && t->device_id == dev,
+                        __func__,
+                        " operands and scales must be contiguous, 16-byte aligned, on the output's GPU");
+        AITER_CHECK(bytes(a) == M * k * 3 / 4 && bytes(sa) == M * k / 32 && bytes(sb) == N * k / 32,
+                    __func__,
+                    " A / scale byte sizes do not match M, N, K (segment " + std::to_string(s) + ")");
+        pb[s] = static_cast<char*>(b->ptr);
+        if(c1 != nullptr)
+        {
+            AITER_CHECK(c1->is_contiguous() && aligned(c1) && c1->device_id == dev &&
+                            bytes(b) == N * k / 2 && bytes(c1) == N * k / 4,
+                        __func__,
+                        " B_c1: B's C1 plane (N*K/4 bytes) with B its C0 plane (N*K/2 bytes)");
+            pb1[s] = static_cast<char*>(c1->ptr);
+        }
+        else
+        {
+            AITER_CHECK(bytes(b) == N * k * 3 / 4, __func__, " B byte size does not match N, K");
+            pb1[s] = pb[s] + N * k / 2;
+        }
+    }
+
+    const std::string arch = get_gpu_arch();
+    const tsgemmConfig* cfg = nullptr;
+    for(const auto& kv : cfg_tsgemm_bf16_per1x32)
+    {
+        const auto& c = kv.second;
+        if(c.arch == arch && c.abi == 5 && c.a_fmt == 6 && c.b_fmt == 6 && c.M == M && c.N == N &&
+           c.K == K && c.k2 == K2 && c.epi_b == Bt)
+        {
+            cfg = &c;
+            break;
+        }
+    }
+    AITER_CHECK(cfg != nullptr,
+                __func__,
+                " no two-segment tilescale kernel for " + std::to_string(M) + "x" + std::to_string(N) +
+                    "x(" + std::to_string(K) + "+" + std::to_string(K2) + ") with " +
+                    std::to_string(Bt) + " gate rows");
+
+    KernelArgsCat6 a;
+    std::memset(&a, 0, sizeof(a));
+    char* pa = static_cast<char*>(A->ptr);
+    a.A0         = memref(pa, M, K / 2);
+    a.A1         = memref(pa + M * K / 2, M, K / 4);
+    a.B0         = memref(pb[0], N, K / 2);
+    a.B1         = memref(pb1[0], N, K / 4);
+    a.C          = Memref{out->ptr,
+                 static_cast<uint32_t>(M),
+                 static_cast<uint32_t>(N),
+                 static_cast<uint32_t>(N),
+                 0};
+    a.ptr_SA     = A_scale->ptr;
+    a.sa_dwords  = static_cast<uint32_t>(bytes(A_scale) / 4);
+    a.ptr_SB     = B_scale->ptr;
+    a.sb_dwords  = static_cast<uint32_t>(bytes(B_scale) / 4);
+    a.M          = static_cast<uint32_t>(M);
+    a.N          = static_cast<uint32_t>(N);
+    const auto p1 = [](void* p, int64_t n) { return Ptr1d{p, static_cast<uint32_t>(n), 0}; };
+    a.A2         = p1(A2->ptr, bytes(A2));
+    a.B20        = p1(pb[1], N * K2 / 2);
+    a.B21        = p1(pb1[1], N * K2 / 4);
+    a.SA2        = p1(A2_scale->ptr, bytes(A2_scale) / 4);
+    a.SB2        = p1(B2_scale->ptr, bytes(B2_scale) / 4);
+    a.X          = p1(x->ptr, M * N);
+    a.G          = p1(gate->ptr, (Bt - 1) * ldg + N);
+    a.Bias       = p1(bias->ptr, N);
+    a.ptr_H      = h->ptr;
+    a.h_elems    = static_cast<uint32_t>(M * N);
+    a.ldg        = static_cast<int32_t>(ldg);
+    size_t arg_size = sizeof(a);
+
+    const HipDeviceGuard device_guard(dev);
+    static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
+    const char* name = cfg->knl_name.c_str();
+    const char* co   = cfg->co_name.c_str();
+    AiterAsmKernel* impl =
+        &impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name, co); });
+    impl->launch_kernel({&a, &arg_size, cfg->grid, 1, 1, 256, 1, 1, stream});
 }
