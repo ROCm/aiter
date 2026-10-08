@@ -3186,6 +3186,7 @@ def test_fused_qk_norm_rope_cache_pts_q_fp8_scale_ordering(head_size=128, eps=1e
     # Preserve stream ordering for a device-side scale update.
     eager_scale = 0.5
     stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         q_scale.fill_(eager_scale)
         launch()
