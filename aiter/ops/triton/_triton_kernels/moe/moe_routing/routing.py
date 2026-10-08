@@ -9,19 +9,8 @@ from aiter.ops.triton._triton_kernels.moe.moe_routing.expt_data import (
     _expt_data_compute_stage2,
     _expt_data_compute_stage2_fused,
 )
+from aiter.ops.triton._triton_kernels.moe.moe_routing.utils import keyed_add
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-
-
-@triton.jit
-def _keyed_add(x, y):
-
-    # we keep the key in the upper 16 bits of a uint32:
-    key_mask: tl.constexpr = 0xFFFF0000
-
-    kx = x & key_mask
-    ky = y & key_mask
-    z = tl.where(kx == ky, x + y - kx, y)
-    return z
 
 
 @triton.jit
@@ -56,11 +45,11 @@ def _routing_compute_indx(
     if USE_TDM and EVEN_M and N_EXPTS_ACT == N_EXPTS_ACT_PAD and LOAD_SIZE >= 8:
         expt_desc = tl.make_tensor_descriptor(
             base=ExptIndx + pid_m * BLOCK_M * N_EXPTS_ACT,
-            shape=(1, LOAD_SIZE),
-            strides=(LOAD_SIZE, 1),
-            block_shape=(1, LOAD_SIZE),
+            shape=(LOAD_SIZE,),
+            strides=(1,),
+            block_shape=(LOAD_SIZE,),
         )
-        expert = tl.reshape(expt_desc.load([0, 0]), (LOAD_SIZE,))
+        expert = expt_desc.load([0])
         expert = tl.where(offs < n_gates, expert, -1).to(tl.uint32)
     elif EVEN_M and N_EXPTS_ACT == N_EXPTS_ACT_PAD:
         expert = tl.load(ExptIndx + offs).to(tl.uint32)
@@ -78,7 +67,7 @@ def _routing_compute_indx(
 
         # compute run lengths in expert-sorted order:
         x = kv_pairs & 0xFFFF0000 | 0x00000001
-        expts_and_inclusive_run_lengths = tl.associative_scan(x, 0, _keyed_add)
+        expts_and_inclusive_run_lengths = tl.associative_scan(x, 0, keyed_add)
         exclusive_run_lengths = (expts_and_inclusive_run_lengths - 1) & 0xFFFF
 
         gates = tl.load(PartialOffs + pid_m * stride_pm + expert * stride_pn)
@@ -94,7 +83,7 @@ def _routing_compute_indx(
 
         # compute run lengths in expert-sorted order:
         x = kv_pairs & 0xFFFF0000 | 0x00000001
-        expts_and_inclusive_run_lengths = tl.associative_scan(x, 0, _keyed_add)
+        expts_and_inclusive_run_lengths = tl.associative_scan(x, 0, keyed_add)
         exclusive_run_lengths = (expts_and_inclusive_run_lengths - 1) & 0xFFFF
 
         gates = tl.load(PartialOffs + pid_m * stride_pm + expert * stride_pn, mask=mask)
@@ -134,11 +123,11 @@ def _routing_compute_indx_fused(
     if USE_TDM and EVEN_M and N_EXPTS_ACT == N_EXPTS_ACT_PAD and LOAD_SIZE >= 8:
         expt_desc = tl.make_tensor_descriptor(
             base=ExptIndx,
-            shape=(1, LOAD_SIZE),
-            strides=(LOAD_SIZE, 1),
-            block_shape=(1, LOAD_SIZE),
+            shape=(LOAD_SIZE,),
+            strides=(1,),
+            block_shape=(LOAD_SIZE,),
         )
-        expert = tl.reshape(expt_desc.load([0, 0]), (LOAD_SIZE,))
+        expert = expt_desc.load([0])
         expert = tl.where(offs < n_gates, expert, -1).to(tl.uint32)
     elif EVEN_M and N_EXPTS_ACT == N_EXPTS_ACT_PAD:
         expert = tl.load(ExptIndx + offs).to(tl.uint32)
@@ -156,7 +145,7 @@ def _routing_compute_indx_fused(
 
         # compute run lengths in expert-sorted order:
         x = kv_pairs & 0xFFFF0000 | 0x00000001
-        expts_and_inclusive_run_lengths = tl.associative_scan(x, 0, _keyed_add)
+        expts_and_inclusive_run_lengths = tl.associative_scan(x, 0, keyed_add)
         exclusive_run_lengths = (expts_and_inclusive_run_lengths - 1) & 0xFFFF
 
         gates = tl.load(TokensStart + expert)
@@ -171,7 +160,7 @@ def _routing_compute_indx_fused(
 
         # compute run lengths in expert-sorted order:
         x = kv_pairs & 0xFFFF0000 | 0x00000001
-        expts_and_inclusive_run_lengths = tl.associative_scan(x, 0, _keyed_add)
+        expts_and_inclusive_run_lengths = tl.associative_scan(x, 0, keyed_add)
         exclusive_run_lengths = (expts_and_inclusive_run_lengths - 1) & 0xFFFF
 
         gates = tl.load(TokensStart + expert, mask=mask)
@@ -232,7 +221,7 @@ def _combined_routing(
         if tl.load(ExpertHist + pid) == 0:
             return
 
-    _expt_data_compute_stage1(
+    tile_start = _expt_data_compute_stage1(
         pid,
         ExpertHist,
         n_expts_tot,
@@ -247,7 +236,9 @@ def _combined_routing(
     )
 
     if pid < blocks1a:
-        _expt_data_compute_stage2(pid, ExpertHist, TileStart, MDTileInfo, tile_dim_log2)
+        _expt_data_compute_stage2(
+            pid, ExpertHist, tile_start, MDTileInfo, tile_dim_log2
+        )
     else:
         pid -= blocks1a
         _routing_compute_indx(
@@ -337,7 +328,7 @@ def _combined_routing_fused(
         if n_tokens == 0:
             return
 
-    _expt_data_compute_stage1(
+    tile_start = _expt_data_compute_stage1(
         pid,
         ExpertHist,
         N_EXPTS_TOT,
@@ -352,7 +343,7 @@ def _combined_routing_fused(
     )
 
     if pid < blocks1a:
-        _expt_data_compute_stage2_fused(pid, ExpertHist, TileStart, MDTileInfo)
+        _expt_data_compute_stage2_fused(pid, ExpertHist, tile_start, MDTileInfo)
     else:
         _routing_compute_indx_fused(
             GatherIndx,
@@ -482,7 +473,9 @@ def _ep_gate_prep_scan_kernel(
         tl.store(Hist + bins, h)
         # Exclusive prefix over bins == where each expert's run starts. The
         # scatter takes this as its initial cursor and bumps it per gate.
-        tl.store(Cursor + bins, tl.cumsum(h, 0) - h)
+        bin_base = tl.cumsum(h, 0) - h
+        tl.store(Cursor + bins, bin_base)
+        tl.store(TokenStart + bins, bin_base, mask=bins < N_EXPTS)
         # Re-arm the scratch for the next call. Safe here and only here: drawing
         # the last ticket means every other CTA is done with both buffers.
         tl.store(HistAtomic + bins, 0)
@@ -494,6 +487,7 @@ def _ep_gate_prep_scan_kernel(
         # writes and the 0xFFFFFFFF tail memset, which are exactly what the
         # `pid == 0` guard inside it selects. One CTA is enough -- letting all
         # N_EXPTS of them recompute the identical prefix sums buys nothing.
+        n_rows = tl.sum(tl.where(bins < N_EXPTS, h, 0), 0)
         _expt_data_compute_stage1(
             0,
             Hist,
@@ -502,7 +496,7 @@ def _ep_gate_prep_scan_kernel(
             TileStart,
             MDTileInfo,
             max_num_tiles,
-            n_gates,
+            n_rows,
             tile_dim_log2,
             BLOCK_A,
             EQUAL_A,
@@ -588,6 +582,7 @@ def _ep_scatter_atomic_expt_data_kernel(
             dst = origin_pe * PEER_ROWS + origin_lid * TOPK + k
             tl.store(DstRow + pos, dst.to(tl.int32), mask=live)
     else:
+        tile_start = tl.load(TileStart + pid)
         # Last statement in the branch on purpose: stage2 early-returns for empty
         # experts, so nothing may follow it.
-        _expt_data_compute_stage2(pid, Hist, TileStart, MDTileInfo, tile_dim_log2)
+        _expt_data_compute_stage2(pid, Hist, tile_start, MDTileInfo, tile_dim_log2)

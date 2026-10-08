@@ -165,10 +165,12 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     AITER_CHECK((int)v->size(0) == total_k,     "fmha_fwd_with_sink_varlen_asm: v total_k mismatch with k");
     AITER_CHECK((int)v->size(1) == kv_head_num, "fmha_fwd_with_sink_varlen_asm: v head_num mismatch with k");
     AITER_CHECK(q_head_num % kv_head_num == 0,  "fmha_fwd_with_sink_varlen_asm: q_head_num must be a multiple of kv_head_num");
-    AITER_CHECK(qk_head_dim == 64 || qk_head_dim == 128,
-                "fmha_fwd_with_sink_varlen_asm: only head_dim 64 or 128 supported, got ", qk_head_dim);
-    AITER_CHECK(v_head_dim == qk_head_dim,
-                "fmha_fwd_with_sink_varlen_asm: v_head_dim must equal qk_head_dim");
+    const bool hd_supported =
+        (v_head_dim == qk_head_dim && (qk_head_dim == 64 || qk_head_dim == 128)) ||
+        (qk_head_dim == 192 && v_head_dim == 128);
+    AITER_CHECK(hd_supported,
+                "fmha_fwd_with_sink_varlen_asm: supported (qk_head_dim, v_head_dim) are "
+                "(64,64), (128,128), (192,128); got (", qk_head_dim, ",", v_head_dim, ")");
 
     AITER_CHECK(out->dim() == 3 &&
                 (int)out->size(0) == total_q && (int)out->size(1) == q_head_num &&
@@ -215,9 +217,10 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     args.gqa        = gqa;
     args.q_head_num = q_head_num;
     // s_opt: bit0 reverse_kv | bit1 double_q | bit2 remap_xy.
-    // 6 = 0b110 -> reverse_kv=0, double_q=1, remap_xy=1.  Must match how the
-    // shipped VARLEN .co was built.
-    args.opt        = 7;
+    // 7 = 0b111 -> all three on.  Must match how the shipped VARLEN .co was
+    // built (REMAP_XY=1 in particular, since we swap gdx/gdy at launch).
+    const bool hd192_non_causal = (qk_head_dim == 192 && mask_flag == 0);
+    args.opt        = hd192_non_causal ? 0x4 : 0x7;
     args.lse        = return_lse ? 1 : 0;
     args.max_q_len  = max_seqlen_q;
     args.sink_addr  = sink ? sink->data_ptr() : nullptr;
@@ -241,10 +244,11 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         name, [&]() { return AiterAsmKernel(name, co_name); });
 
     // ---- launch ------------------------------------------------------------
-    // Dispatch along max_q_len (DOUBLE_Q halves via tg_div); z = batch index.
-    // The kernel early-exits q-tiles that fall beyond a batch's actual seqlen
-    // using cu_seqlens_q.  Shipped VARLEN kernels: ts_qo=128, double_q=1
-    // (tg_div=2), wv_tg=4 (block=128), remap_xy=1.
+    // Dispatch along max_q_len (double_q halves the tile count via tg_div); z is
+    // the batch index.  The kernel early-exits q-tiles that fall beyond a batch's
+    // actual seqlen using cu_seqlens_q.  All shipped VARLEN kernels use ts_qo=128,
+    // wv_tg=4 (block=128) and remap_xy=1; tg_div follows the double_q bit set
+    // above, so D192x128 non-causal launches the full tile count.
     const int sub_Q        = 128;   // ts_qo
     const int wv_tg        = 4;
     const int bdx          = (wv_tg == 4) ? 128 : 256;

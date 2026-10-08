@@ -2063,4 +2063,29 @@ void gelu_fast(const aiter_tensor_t& out,   // [..., d]
     LAUNCH_ACTIVATION_KERNEL_VEC(aiter::gelu_fast_kernel);
 }
 
+// Float-returning plain ReLU^2 (no gating multiply): relu(x)^2.
+template <typename T>
+__device__ __forceinline__ float relu2_kernel(const T& x)
+{
+    const float f = opus::cast<float>(x);
+    const float r = fmaxf(f, 0.0f);
+    return r * r;
+}
+
+void relu2(const aiter_tensor_t& out,   // [..., d]
+           const aiter_tensor_t& input) // [..., d]
+{
+    AITER_CHECK(out.is_gpu() && input.is_gpu(),
+                "relu2: input and out must be GPU tensors");
+    AITER_CHECK(out.is_contiguous() && input.is_contiguous(),
+                "relu2: input and out must be contiguous");
+    AITER_CHECK(out.numel() == input.numel(),
+                "relu2: out.numel must match input.numel");
+    AITER_CHECK(out.dtype() == input.dtype(),
+                "relu2: out dtype must match input dtype");
+    AITER_CHECK(out.device_id == input.device_id,
+                "relu2: input and out must be on the same device");
+    LAUNCH_ACTIVATION_KERNEL_VEC(aiter::relu2_kernel);
+}
+
 } // namespace aiter

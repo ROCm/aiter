@@ -4,5 +4,43 @@
         "BV": 128,
         "num_warps": 8,
         "num_stages": 3
+    },
+    "flash_kda_prepare_kernel": {
+        "num_warps": 2,
+        "num_stages": 1
+    },
+    "flash_kda_segment_kernel": {
+        "candidates": [
+            {
+                "BW": 16,
+                "num_warps": 2,
+                "num_stages": 2
+            },
+            {
+                "BW": 32,
+                "num_warps": 2,
+                "num_stages": 2
+            },
+            {
+                "BW": 64,
+                "num_warps": 2,
+                "num_stages": 2
+            },
+            {
+                "BW": 64,
+                "num_warps": 2,
+                "num_stages": 3
+            },
+            {
+                "BW": 128,
+                "num_warps": 2,
+                "num_stages": 2
+            },
+            {
+                "BW": 128,
+                "num_warps": 4,
+                "num_stages": 2
+            }
+        ]
     }
 }

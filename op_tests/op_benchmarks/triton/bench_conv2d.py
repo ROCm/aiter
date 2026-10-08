@@ -46,7 +46,10 @@ import torch
 import torch.nn.functional as F
 import triton
 
-from aiter.ops.triton.conv._prepack import prepack_nchw_to_cblocked
+from aiter.ops.triton.conv._prepack import (
+    clear_conv2d_weight_pack_caches,
+    prepack_nchw_to_cblocked,
+)
 from aiter.ops.triton.conv._utils import (
     BLOCK_K,
     _is_1x1_conv,
@@ -506,24 +509,29 @@ def run_single_shape(args) -> None:
     dilation = (args.dilation_h, args.dilation_w)
     # Single-shape mode (bench_models.py consumer): skip kernel+repack timing
     # to keep per-call cost predictable for the framework.
-    result = bench_one_shape(
-        args.N,
-        args.C,
-        args.H,
-        args.W,
-        args.K,
-        args.R,
-        args.S,
-        stride,
-        padding,
-        dilation,
-        dtype,
-        args.method,
-        args.layout,
-        bias=not args.no_bias,
-        measure_repack=False,
-    )
-    print(_format_single_shape_line(args, result))
+    try:
+        result = bench_one_shape(
+            args.N,
+            args.C,
+            args.H,
+            args.W,
+            args.K,
+            args.R,
+            args.S,
+            stride,
+            padding,
+            dilation,
+            dtype,
+            args.method,
+            args.layout,
+            bias=not args.no_bias,
+            measure_repack=False,
+        )
+        print(_format_single_shape_line(args, result))
+    finally:
+        clear_conv2d_weight_pack_caches()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 # ----------------------------------------------------------------------------
@@ -841,6 +849,10 @@ def run_sweep(args) -> None:
         except Exception as e:  # noqa: BLE001
             print(f"  {name:<24} ERROR: {type(e).__name__}: {e}", file=sys.stderr)
             continue
+        finally:
+            clear_conv2d_weight_pack_caches()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         miopen = (
             _get_miopen_solver(N, C, H, W, K, R, S, stride, padding, dilation)
             if args.miopen_solvers

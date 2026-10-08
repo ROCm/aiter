@@ -8,16 +8,16 @@ from types import SimpleNamespace
 
 # Try to import quant module
 try:
-    from . import quant
+    from aiter.ops.triton import quant
 except (ImportError, AttributeError):
     quant = None
 
 # Try to import comms module (requires iris)
 try:
-    from . import comms
+    from aiter.ops.triton import comms
 
     # Re-export communication primitives at this level for convenience
-    from .comms import (  # noqa: F401  deliberate re-export for convenience
+    from aiter.ops.triton.comms import (  # noqa: F401  deliberate re-export for convenience
         IRIS_COMM_AVAILABLE,
         IrisCommContext,
         all_gather,
@@ -107,8 +107,6 @@ _BACKWARD_COMPAT_MAP = {
     "fused_gemm_afp4wfp4_mul_add": "gemm.fused.fused_gemm_afp4wfp4_mul_add",
     "fused_gemm_afp4wfp4_split_cat": "gemm.fused.fused_gemm_afp4wfp4_split_cat",
     "fused_gemm_a8w8_blockscale_split_cat": "gemm.fused.fused_gemm_a8w8_blockscale_split_cat",
-    # Conv modules (conv/)
-    "conv2d": "conv.conv2d",
     # Attention modules (attention/)
     "chunked_pa_prefill": "attention.chunked_pa_prefill",
     "extend_attention": "attention.extend_attention",

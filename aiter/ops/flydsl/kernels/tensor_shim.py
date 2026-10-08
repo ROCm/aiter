@@ -4,6 +4,7 @@
 import os
 import threading
 from abc import ABC, abstractmethod
+from functools import lru_cache
 from itertools import product
 
 import flydsl.compiler as flyc
@@ -16,6 +17,8 @@ from flydsl.compiler.protocol import extract_to_ir_values
 from flydsl.expr import ptrtoint, range_constexpr
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
+
+from aiter.ops.flydsl.kernels.kernels_common import get_warp_size
 
 # Global toggle for the amdgpu-kernarg-preload compile hint used by the flydsl
 # kernels. Enabled by default; set AITER_FLYDSL_KERNARG_PRELOAD=0 to disable it
@@ -38,6 +41,26 @@ AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE = bool(
 _PRELOAD_COMPILE_LOCK = threading.RLock()
 
 
+def ptr_rsrc(ptr, num_records_bytes=None):
+    """Convert an fx.Pointer kernel arg to a buffer resource for buffer_load/store.
+
+    ``num_records_bytes`` may be a runtime value, for a hardware OOB check that
+    zero-fills rather than reading stale bytes.
+    """
+    from aiter.ops.flydsl.kernels import buffer_ops
+
+    return buffer_ops.create_buffer_resource_from_addr(
+        fx.Int64(ptrtoint(ptr)), num_records_bytes=num_records_bytes
+    )
+
+
+def buf_load_scalar(rsrc, dword_index, dwords=4):
+    """Uniform load of ``dwords`` dwords from *rsrc*, landing directly in SGPRs."""
+    from aiter.ops.flydsl.kernels import buffer_ops
+
+    return buffer_ops.buffer_load(rsrc, dword_index, vec_width=dwords, is_scalar=True)
+
+
 _BUF_COPY_ATOM = {
     16: fx.rocdl.BufferCopy128b,
     8: fx.rocdl.BufferCopy64b,
@@ -51,17 +74,6 @@ _BUF_COPY_ATOM = {
 # bytes, so this only has to be large enough not to constrain any caller's
 # indices.
 BUF_VIEW_MAX_ELEMS = 0xFFFFFFFF
-
-
-def ptr_rsrc(ptr):
-    """Convert an fx.Pointer kernel arg to a buffer resource for buffer_load/store.
-
-    Kept for kernels still on the raw `buffer_ops` path; migrated kernels should
-    use `ptr_buf_tensor` instead.
-    """
-    from aiter.ops.flydsl.kernels import buffer_ops
-
-    return buffer_ops.create_buffer_resource_from_addr(fx.Int64(ptrtoint(ptr)))
 
 
 def buf_base_i64(base):
@@ -228,6 +240,35 @@ def buf_copy_store(buffer, index, value, elem=fx.Int32, unit_elems=1, cache_modi
     )
 
 
+@lru_cache(maxsize=8)
+def wave_size_of(device_index: int | None = None) -> int:
+    """Wave width of the GPU a kernel will dispatch on.
+
+    Not ``get_warp_size(get_gfx())``: ``get_gfx()`` honours ``GPU_ARCHS``, so a
+    build cross-targeting another arch answers for that arch while the kernel
+    still dispatches here. A caller that picks a backend by one and builds it by
+    the other picks for a machine it is not running on.
+    """
+    return get_warp_size(torch.cuda.get_device_properties(device_index).gcnArchName)
+
+
+def check_e8m0(
+    scale: torch.Tensor, name: str, owner: str, shape: tuple[int, ...] | None = None
+) -> None:
+    """Validate an e8m0 scale operand: e8m0/uint8 storage, contiguous, and
+    ``shape`` when given. ``owner`` prefixes the error, e.g. "FlyDSL gfx950 bmm"."""
+    from aiter.utility import dtypes
+
+    if shape is not None and tuple(scale.shape) != shape:
+        raise RuntimeError(
+            f"[{owner}] {name} must have shape {shape}, got {tuple(scale.shape)}"
+        )
+    if scale.dtype not in (dtypes.fp8_e8m0, torch.uint8):
+        raise RuntimeError(f"[{owner}] {name} must be e8m0/uint8, got {scale.dtype}")
+    if not scale.is_contiguous():
+        raise RuntimeError(f"[{owner}] {name} must be contiguous")
+
+
 def ptr_arg(t: torch.Tensor, dtype=None):
     """Wrap a torch.Tensor as an fx.Pointer (PointerJitArg) for kernel launch."""
     if dtype is None:
@@ -239,17 +280,11 @@ def ptr_arg(t: torch.Tensor, dtype=None):
     return flyc.from_c_void_p(dtype, t.data_ptr())
 
 
-def _run_compiled(exe, *args):
-    """First call: ``flyc.compile(exe, *args)`` compiles **and** executes the kernel.
-    Subsequent calls: fast dispatch via the cached ``CompiledFunction``.
-    """
-    cf = getattr(exe, "_cf", None)
-    if cf is not None:
-        cf(*args)
-        return
+def _compile_and_run(exe, *args):
+    """``flyc.compile(exe, *args)``: compiles **and** executes the kernel, and
+    returns its ``CompiledFunction`` (None under compile-only)."""
     try:
-        cf = flyc.compile(exe, *args)
-        exe._cf = cf
+        return flyc.compile(exe, *args)
     except Exception:
         # flyc.compile leaks ir.Context on failure; pop it so a retry takes the right path.
         try:
@@ -258,6 +293,30 @@ def _run_compiled(exe, *args):
         except Exception:  # noqa: BLE001, S110
             pass
         raise
+
+
+def _run_compiled(exe, *args, specialization_key=None):
+    """First call: ``flyc.compile(exe, *args)`` compiles **and** executes the kernel.
+    Subsequent calls: fast dispatch via the cached ``CompiledFunction``.
+
+    A specialization key gives a multi-constexpr JitFunction one compiled
+    callable per configuration. Factory-style launchers should leave it unset.
+    """
+    if specialization_key is None:
+        cf = getattr(exe, "_cf", None)
+    else:
+        cache = getattr(exe, "_cf_by_specialization", None)
+        cf = cache.get(specialization_key) if cache is not None else None
+    if cf is not None:
+        cf(*args)
+        return
+    cf = _compile_and_run(exe, *args)
+    if specialization_key is None:
+        exe._cf = cf
+    else:
+        if not hasattr(exe, "_cf_by_specialization"):
+            exe._cf_by_specialization = {}
+        exe._cf_by_specialization[specialization_key] = cf
 
 
 def _preload_compiled(exe, *args):
@@ -301,29 +360,6 @@ def get_dtype_str(dtype):
         return "f16"
     elif dtype == torch.bfloat16:
         return "bf16"
-
-
-def get_dtype_in_kernel(dtype: str):
-    if dtype == "f32":
-        return T.f32
-    elif dtype == "f16":
-        return T.f16
-    elif dtype == "bf16":
-        return T.bf16
-
-
-def get_dtype_vec_size(dtype: str):
-    if dtype == "f32":
-        return 4
-    elif dtype == "f16" or dtype == "bf16":
-        return 8
-
-
-def get_dtype_bytes(dtype: str):
-    if dtype == "f32":
-        return 4
-    elif dtype == "f16" or dtype == "bf16":
-        return 2
 
 
 class TensorView:
@@ -497,7 +533,7 @@ class GTensor(TensorBase):
         static_bytes_offset_i64=None,
     ):
         super().__init__(dtype, shape, stride, base_offset)
-        base = self.base_addr_i64(memref)
+        base = buf_base_i64(memref)
         if static_bytes_offset_i64 is not None:
             base = base + fx.Int64(static_bytes_offset_i64)
         self.base_i64 = base
@@ -544,16 +580,3 @@ class GTensor(TensorBase):
         return fx.rocdl.get_buffer_rsrc(
             fx.get_iter(self._view(_fx_elem(self.dtype), 1))
         )
-
-    @staticmethod
-    def base_addr_i64(ptr, ptr_type="!llvm.ptr<1>"):
-        """i64 base address of an fx pointer or a fly/memref value."""
-        return buf_base_i64(ptr)
-
-    def get_llvm_ptr(self, ptr, bytes_offset_i64, ptr_type="!llvm.ptr<1>"):
-        # fx.Int64 coerces index / i32 / i64 byte offsets to i64.
-        return llvm.AddOp(
-            _to_raw(self.base_addr_i64(ptr, ptr_type)),
-            _to_raw(fx.Int64(bytes_offset_i64)),
-            llvm.IntegerOverflowFlags(0),
-        ).result
