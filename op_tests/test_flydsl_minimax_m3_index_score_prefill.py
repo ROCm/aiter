@@ -229,8 +229,17 @@ def test_strided_cache_is_handled_on_every_entry_form():
     )  # cfg omitted entirely: the form that used to bypass the guard
     assert_matches(out.reshape(ref.shape), ref, live, "strided, cfg=None")
 
-    for kw in ({}, {"k_lds": 1}, {"k_lds": 0}):
+    # Auto demotes; explicit off is already off. Both must be correct.
+    for kw in ({}, {"k_lds": 0}):
         assert_matches(run(c, strided, **kw), ref, live, f"strided {kw}")
+
+    # Explicit k_lds=1 asks for something this cache cannot satisfy. Refusing
+    # is the contract: quietly building a different kernel would contradict
+    # "explicit values are kept" and show up only as a performance mystery.
+    with pytest.raises(ValueError, match="contiguous page"):
+        run(c, strided, k_lds=1)
+    # ...and the same request on a contiguous page still works.
+    assert_matches(run(c, c["cache"], k_lds=1), ref, live, "contiguous k_lds=1")
 
 
 @pytest.mark.parametrize("shape", [(1, 128, 384), (1, 256, 256), (2, 128, 512)])
