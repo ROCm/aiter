@@ -593,9 +593,14 @@ Legacy raw intrinsics (`buffer_ops.create_buffer_resource` / `buffer_load` /
 | `fx.UniversalCopy(64)` | 64 | 2x f32 elements |
 | `fx.UniversalCopy(128)` | 128 | 4x f32 elements |
 | `fx.rocdl.BufferCopy128b()` | 128 | AMD buffer load 4xf32 (CDNA) |
-| `fx.rocdl.make_tdm_atom(...)` | whole tile | gfx1250 TDM async Global↔LDS DMA (1–5D) — see below |
+| `fx.rocdl.cdna5.make_tiled_tdm_atom(...)` | whole tile | gfx1250 TDM async Global↔LDS DMA (1–5D) — see below |
 
-**gfx1250 TDM async copy** (`fx.rocdl.make_tdm_atom`): a whole-tile DMA whose
+**gfx1250 TDM async copy** — prefer `fx.rocdl.cdna5.make_tiled_tdm_atom` +
+`fx.rocdl.cdna5.tdm_partition` for new kernels: the atom is built over the whole
+tensor, `zipped_divide` picks the block's tile, `tdm_partition` cuts one warp's
+share, the coordinate index is an **i32 tile number** (not a byte offset), and
+padding is row slack in the LDS box. The older form below
+(`fx.rocdl.make_tdm_atom`) is a whole-tile DMA whose
 descriptor (base pointer, per-dim extent for HW OOB handling, per-dim stride) is
 carried as **atom state**. The global operand of `copy_atom_call` is a
 shape/direction token only — its layout gives the compile-time N-D tile shape and
@@ -606,7 +611,7 @@ state). Needs a **raw VA** (not `make_buffer_tensor`).
 lds = fx.SharedAllocator().allocate(fx.Array[fx.Float16, M * N]).peek()
 lds2d = fx.make_view(lds.ptr, fx.make_layout((M, N), (N, 1)))       # note: lds.ptr
 g2d = fx.make_view(fx.get_iter(A), fx.make_layout((M, N), (N, 1)))
-atom = fx.rocdl.make_tdm_atom(g2d, [M, N], num_warps=4)            # rank = len(extents), 1–5D
+atom = fx.rocdl.make_tdm_atom(g2d, [M, N], num_warps=4)            # older form; prefer make_tiled_tdm_atom
 fx.copy_atom_call(atom, g2d, lds2d)                               # Global → LDS
 fx.rocdl.tdm_ops.tensor_wait(0)                                  # await async DMA
 atom = fx.rocdl.advance_tdm_atom(atom, k_tile * k_stride_bytes)  # K-loop tile bump (imm_offset)
