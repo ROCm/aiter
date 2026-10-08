@@ -1432,9 +1432,7 @@ class AttentionProgram:
         # row-max, so it needs whatever scale the softmax used.
         if not cfg.USE_SINKS:
             M = M * self.SM_scale
-        # A row with no causally visible key in this split (a short multi-token
-        # query whose split ends past the row's position) keeps the guarded 0
-        # max; keep it out of the reduce's max.
+        # no visible key in this split: keep the guarded 0 out of the reduce max
         M = gl.where(L > 0.0, M, float("-inf"))
         layout: gl.constexpr = cfg.pv_layout
         offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, layout))

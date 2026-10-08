@@ -1005,8 +1005,7 @@ def reduce_segments(
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
-    # segments merged per loop step; 0 merges all NUM_SEGMENTS_PER_SEQ in one tile
-    SEGMENT_BLOCK: tl.constexpr = 0,
+    SEGMENT_BLOCK: tl.constexpr = 0,  # segments per merge step, 0 = all at once
 ):
     query_token_idx = tl.program_id(0)
     query_head_idx = tl.program_id(1)
@@ -1075,8 +1074,7 @@ def reduce_segments(
         segm_output *= tl.math.exp2(segm_max - overall_max)[:, None]
         acc_sum = tl.sum(segm_output, axis=0)
     else:
-        # online merge over the written segments only, so the cost follows the
-        # context rather than NUM_SEGMENTS_PER_SEQ
+        # one big tile spills at large head sizes; this also reads only written segments
         segm_base = (
             query_token_idx.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
             + query_head_idx * NUM_SEGMENTS_PER_SEQ

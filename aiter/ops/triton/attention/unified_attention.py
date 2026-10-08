@@ -148,23 +148,17 @@ def _gfx950_gluon_supported(params: _UAParams):
 
 
 def _gfx950_split_grid(params: _UAParams):
-    """Whether the gfx950 Gluon launch takes the split-capable (decode) grid.
-
-    Decode does. So does a batch of short queries such as a speculative decoding
-    verify step, when one query block can hold every query of a sequence and the
-    launch is small enough to split: each block then walks the whole context, and
-    the KV split keeps a small batch from leaving most CUs idle. Unsplit, the 2d
-    grid's wider query block is faster.
-    """
+    """Decode and short-query batches (e.g. spec-decode verify) take the split grid."""
     if params.all_decode:
         return True
-    # widest query block the split grid takes, the 2d grid's
+    # one query block has to cover a sequence's queries; 128 is the 2d BLOCK_M
     max_block_m = 128
     if (
         params.sliding_window > 0
         or params.max_seqlen_q * params.num_queries_per_kv > max_block_m
     ):
         return False
+    # unsplit, the 2d grid is faster
     config = get_unified_attention_config("kv_split", params, backend="gluon")
     return config["NUM_SEGMENTS"] > 1
 
@@ -1153,8 +1147,7 @@ def _unified_attention_3d_gfx950(
     MFMA_DIM = config["MFMA_DIM"]
     BLOCK_M = max(config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv))
     if not params.all_decode:
-        # one query block per sequence: the split carves the KV range from
-        # seq_len, which is what reduce_segments assumes
+        # one query block per sequence, so the split ranges match reduce_segments
         BLOCK_M = max(
             BLOCK_M,
             triton.next_power_of_2(params.max_seqlen_q * params.num_queries_per_kv),
