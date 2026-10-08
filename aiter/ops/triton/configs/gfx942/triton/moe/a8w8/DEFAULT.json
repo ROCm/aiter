@@ -1,0 +1,44 @@
+{
+    "bm16_n512_k6144": {
+        "BLOCK_SIZE_N": 32,
+        "BLOCK_SIZE_K": 32,
+        "num_warps": 2,
+        "num_stages": 2,
+        "NUM_KSPLIT": 8
+    },
+    "bm16_n6144_k256": {
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 32,
+        "num_warps": 2,
+        "num_stages": 1,
+        "NUM_KSPLIT": 1
+    },
+    "bm32_n512_k6144": {
+        "BLOCK_SIZE_N": 256,
+        "BLOCK_SIZE_K": 32,
+        "num_warps": 4,
+        "num_stages": 1,
+        "NUM_KSPLIT": 8
+    },
+    "bm32_n6144_k256": {
+        "BLOCK_SIZE_N": 256,
+        "BLOCK_SIZE_K": 32,
+        "num_warps": 4,
+        "num_stages": 1,
+        "NUM_KSPLIT": 1
+    },
+    "bm128_n512_k6144": {
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 32,
+        "num_warps": 2,
+        "num_stages": 2,
+        "NUM_KSPLIT": 2
+    },
+    "bm128_n6144_k256": {
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 32,
+        "num_warps": 2,
+        "num_stages": 1,
+        "NUM_KSPLIT": 1
+    }
+}

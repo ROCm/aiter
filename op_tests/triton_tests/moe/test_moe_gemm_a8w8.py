@@ -21,6 +21,7 @@ from aiter.ops.triton.moe.quant_moe import (
     downcast_to_static_fp8,
     downcast_to_static_fp8_3d,
 )
+from aiter.ops.triton.quant.quant import dynamic_mxfp8_quant
 
 # target-specific utilities
 from aiter.ops.triton.utils._triton.arch_info import get_arch
@@ -370,3 +371,51 @@ def test_op(
     if not act_mxfp8 and fused_quant:
         tri_y = (tri_y.float() * quant_static_scale).to(ref_y.dtype)
     assert_close(ref_y, tri_y, maxtol=maxtol, rmstol=rmstol)
+
+
+@pytest.mark.parametrize(
+    "m, n, k, n_expts_tot, n_expts_act, mx",
+    [
+        (300, 400, 400, 8, 2, False),
+        (1, 512, 6144, 256, 8, True),
+        (16, 6144, 256, 256, 8, True),
+        (4096, 512, 6144, 256, 8, True),
+        (300, 400, 416, 8, 2, True),
+    ],
+)
+def test_op_gfx942(m, n, k, n_expts_tot, n_expts_act, mx):
+    if get_arch() != "gfx942":
+        pytest.skip("float8_e4m3fnuz is the gfx942 FP8 encoding")
+    fp8 = torch.float8_e4m3fnuz
+    torch.manual_seed(0)
+    m, rdata, gindx, sindx = init_routing_data(m, n_expts_tot, n_expts_act, True, True)
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(n_expts_tot, n, k, device="cuda", dtype=torch.bfloat16)
+    if mx:
+        xq, xs = dynamic_mxfp8_quant(x, quant_dtype=fp8)
+        wq, ws = dynamic_mxfp8_quant(w, quant_dtype=fp8)
+        ws = ws.view(*w.shape[:-1], -1)
+        x_ref = xq.float() * torch.exp2(xs.float() - 127).repeat_interleave(32, -1)
+        w_ref = wq.float() * torch.exp2(ws.float() - 127).repeat_interleave(32, -1)
+        scales = (xs, ws.transpose(1, 2), None, None)
+        cos = torch.nn.functional.cosine_similarity(
+            x_ref.flatten(), x.float().flatten(), dim=0
+        )
+        assert cos > 0.999, f"fnuz MXFP8 roundtrip cosine {cos:.5f}"
+    else:
+        x_scale = x.abs().max().float() / torch.finfo(fp8).max
+        w_scale = w.abs().max().float() / torch.finfo(fp8).max
+        xq, wq = (x / x_scale).to(fp8), (w / w_scale).to(fp8)
+        x_ref, w_ref = xq.float() * x_scale, wq.float() * w_scale
+        scales = (None, None, x_scale.reshape(1), w_scale.reshape(1))
+    ref_y = moe_gemm_torch(x_ref, w_ref.transpose(1, 2), None, rdata, gindx, sindx)
+    tri_y = moe_gemm_a8w8(
+        xq,
+        wq.transpose(1, 2),
+        *scales,
+        routing_data=rdata,
+        gather_indx=gindx,
+        scatter_indx=sindx,
+        out_dtype=torch.bfloat16,
+    )
+    assert_close(ref_y.to(torch.bfloat16), tri_y, maxtol=4e-2, rmstol=None)
