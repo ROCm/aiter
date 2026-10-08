@@ -55,7 +55,6 @@ def kernel_fits_shape(ki: kernelInstance, M: int, N: int, K: int, gfx: str) -> b
     # spans must fit signed i32, including the two speculative K prefetches.
     padded_m = (M + TILE_M - 1) // TILE_M * TILE_M
     padded_n = (N + TILE_N - 1) // TILE_N * TILE_N
-    b_prefetch_bytes = 2 * TILE_K * (16 if ki.preshuffle_b else 1)
     # Scale bases were not rebased. Keep their full extents/prefetch offsets
     # and the launch-grid arithmetic in range; do not restore a matrix-size cap.
     kb = K // 128
