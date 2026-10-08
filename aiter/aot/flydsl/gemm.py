@@ -15,6 +15,7 @@ Supported kernel families:
   - ``flydsl_hgemm_*_gfx1250``                gfx1250 A16W16 GEMM kernels
   - ``flydsl_bpreshuflle_*``                  a8w8 preshuffle GEMM kernels
   - ``flydsl_bpreshuffle_8w_*``               gfx950 8-wave a8w8 ptpc GEMM kernels
+    - ``flydsl_blockscale_8w_*``                gfx950 8-wave FP32-scale GEMM kernels
   - ``flydsl_bpreshuffle_wmma_*``             gfx1250 a8w8 ptpc GEMM kernels
   - ``flydsl_mxfp8_128_bpreshuffle_wmma_*``   gfx1250 mxfp8_128 GEMM kernels
   - ``flydsl_mxfp8_128_bpreshuffle_compute_wmma_*`` gfx1250 compute-bound mxfp8_128 kernels
@@ -72,6 +73,15 @@ from aiter.ops.flydsl.gemm_a8w8_bpreshuffle_8wave import (
 from aiter.ops.flydsl.gemm_kernels import (
     SPLIT_K_SEMAPHORE_MAX_LEN,
     get_flydsl_hgemm_kernel_params,
+)
+from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_common import (
+    KERNEL_PREFIX as BLOCKSCALE_8W_PREFIX,
+)
+from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_common import (
+    kernel_fits_shape as blockscale_kernel_fits_shape,
+)
+from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_common import (
+    kernels_by_name as blockscale_kernels_by_name,
 )
 from aiter.ops.flydsl.gemm_tune.flydsl_gemm_mxscale_preshuffle_common import (
     parse_kernel_name as parse_mxscale_preshuffle_kernel_name,
@@ -284,6 +294,14 @@ def parse_csv(csv_path: str):
                 if params is not None:
                     params = dict(params)
                     params["kind"] = "8wave"
+            elif kernel_name.startswith(BLOCKSCALE_8W_PREFIX):
+                # Runtime accepts only these exact names, not retired tile/dtype
+                # or full-M/tiled-DMA variants that share the prefix.
+                params = (
+                    {"kind": "blockscale_8wave"}
+                    if kernel_name in blockscale_kernels_by_name
+                    else None
+                )
             elif kernel_name.startswith(
                 (
                     f"{MXFP8_128_WMMA_PREFIX}_",
@@ -777,6 +795,45 @@ def _compile_8wave_to_cache(
     _compile_executable_to_cache(exe, a, b, out, scale_a, scale_b, m, n, fx.Stream(0))
 
 
+def _compile_blockscale_8wave_to_cache(
+    *,
+    kernel_name: str,
+    m: int,
+    n: int,
+    k: int,
+    target_gfx: str,
+    **kwargs,
+):
+    del kwargs
+
+    import torch
+
+    from aiter.ops.flydsl.gemm_a8w8_blockscale import _compile_gemm
+
+    ki = blockscale_kernels_by_name.get(kernel_name)
+    if ki is None or not blockscale_kernel_fits_shape(ki, m, n, k, target_gfx):
+        raise ValueError(
+            f"Unsupported FlyDSL blockscale config: {kernel_name} "
+            f"M={m}, N={n}, K={k}, gfx={target_gfx}"
+        )
+
+    # compile_one_config supplies FakeTensorMode: retain the runtime ranks and
+    # block-scale lengths without allocating model-sized buffers. Flattening
+    # A/B/C would produce a different cache key and a wrong large-matrix ABI.
+    dev = torch.device("cpu")
+    a = torch.empty((m, k), device=dev, dtype=torch.int8)
+    b = torch.empty((n, k), device=dev, dtype=torch.int8)
+    out = torch.empty((m, n), device=dev, dtype=torch.bfloat16)
+    scale_a = torch.empty((m * (k // 128),), device=dev, dtype=torch.float32)
+    scale_b = torch.empty(
+        (((n + 127) // 128) * (k // 128),), device=dev, dtype=torch.float32
+    )
+    # Share the runtime factory, including opt_level=2 and the fixed pipeline
+    # flags. The -1 host-cache slot cannot collide with a live device index.
+    exe = _compile_gemm(n, k, kernel_name, -1)
+    _compile_executable_to_cache(exe, a, b, out, scale_a, scale_b, m, fx.Stream(0))
+
+
 def _compile_bmm_mfma_to_cache(
     *,
     kernel_name: str,
@@ -1040,6 +1097,15 @@ def compile_one_config(
                 _compile_mxscale_preshuffle_to_cache(m=m, n=n, k=k, **kwargs)
             elif kind == "8wave":
                 _compile_8wave_to_cache(m=m, n=n, k=k, **kwargs)
+            elif kind == "blockscale_8wave":
+                _compile_blockscale_8wave_to_cache(
+                    kernel_name=kernel_name,
+                    m=m,
+                    n=n,
+                    k=k,
+                    target_gfx=aot_arch,
+                    **kwargs,
+                )
             elif kind == "mxfp8_wmma":
                 _compile_mxfp8_wmma_to_cache(
                     kernel_name=kernel_name,
