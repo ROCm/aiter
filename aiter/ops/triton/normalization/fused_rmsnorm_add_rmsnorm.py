@@ -50,20 +50,19 @@ def fused_rmsnorm_add_rmsnorm(
     assert x.dtype == torch.bfloat16
     M, N = x.shape
     out = torch.empty_like(x)
-    if M:
-        block = triton.next_power_of_2(N)
-        num_warps = 4 if M <= 128 else 8
-        _fused_rmsnorm_add_rmsnorm_kernel[(M,)](
-            x,
-            residual,
-            post_weight,
-            pre_weight,
-            residual_out,
-            out,
-            N,
-            post_eps,
-            pre_eps,
-            BLOCK_SIZE_N=block,
-            num_warps=num_warps,
-        )
+    block = triton.next_power_of_2(N)
+    num_warps = 4 if M <= 128 else 8
+    _fused_rmsnorm_add_rmsnorm_kernel[(M,)](
+        x,
+        residual,
+        post_weight,
+        pre_weight,
+        residual_out,
+        out,
+        N,
+        post_eps,
+        pre_eps,
+        BLOCK_SIZE_N=block,
+        num_warps=num_warps,
+    )
     return out
