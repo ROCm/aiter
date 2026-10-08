@@ -146,9 +146,9 @@ def _qsa_compile_device(arch: str, cu_num: int):
 
 
 def _compile_k1(job):
-    from aiter import dtypes
     from aiter.ops.flydsl.qsa import qsa_k1_block_ids
 
+    bf16, i32 = torch.bfloat16, torch.int32
     device = torch.device("cuda")
     rows = job["m"]
     seq_len = job["seq_len"]
@@ -159,28 +159,28 @@ def _compile_k1(job):
     n_pages = n_blocks // page
     for arch, cu_num in _qsa_aot_targets():
         with _qsa_compile_device(arch, cu_num):
-            q = torch.empty(rows, heads, head_dim, dtype=dtypes.bf16, device=device)
+            q = torch.empty(rows, heads, head_dim, dtype=bf16, device=device)
             k_cache = torch.empty(
                 n_pages,
                 page,
                 job["kv_heads"],
                 head_dim,
-                dtype=dtypes.bf16,
+                dtype=bf16,
                 device=device,
             )
-            table = torch.zeros(1, n_pages, dtype=dtypes.i32, device=device)
-            qpos = torch.zeros(rows, dtype=dtypes.i32, device=device)
-            slen = torch.full((1,), seq_len, dtype=dtypes.i32, device=device)
-            token_to_req = torch.zeros(rows, dtype=dtypes.i32, device=device)
+            table = torch.zeros(1, n_pages, dtype=i32, device=device)
+            qpos = torch.zeros(rows, dtype=i32, device=device)
+            slen = torch.full((1,), seq_len, dtype=i32, device=device)
+            token_to_req = torch.zeros(rows, dtype=i32, device=device)
             qsa_k1_block_ids(
                 q, k_cache, table, token_to_req, qpos, slen, heads=(heads,)
             )
 
 
 def _compile_k2(job):
-    from aiter import dtypes
     from aiter.ops.flydsl.qsa import qsa_k2
 
+    bf16, i32 = torch.bfloat16, torch.int32
     device = torch.device("cuda")
     rows = job["m"]
     seq_len = job["seq_len"]
@@ -190,15 +190,15 @@ def _compile_k2(job):
     n_pages = (seq_len + page - 1) // page
     for arch, cu_num in _qsa_aot_targets():
         with _qsa_compile_device(arch, cu_num):
-            q = torch.empty(rows, hq, head_dim, dtype=dtypes.bf16, device=device)
+            q = torch.empty(rows, hq, head_dim, dtype=bf16, device=device)
             k_cache = torch.empty(
-                n_pages, page, hkv, head_dim, dtype=dtypes.bf16, device=device
+                n_pages, page, hkv, head_dim, dtype=bf16, device=device
             )
             v_cache = torch.empty_like(k_cache)
-            table = torch.zeros(1, n_pages, dtype=dtypes.i32, device=device)
-            indices = torch.zeros(rows, width, dtype=dtypes.i32, device=device)
+            table = torch.zeros(1, n_pages, dtype=i32, device=device)
+            indices = torch.zeros(rows, width, dtype=i32, device=device)
             indices[:, -1] = -1
-            token_to_req = torch.zeros(rows, dtype=dtypes.i32, device=device)
+            token_to_req = torch.zeros(rows, dtype=i32, device=device)
             qsa_k2(q, k_cache, v_cache, indices, table, token_to_req)
 
 
