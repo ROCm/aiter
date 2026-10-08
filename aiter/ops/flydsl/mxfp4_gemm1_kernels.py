@@ -113,6 +113,8 @@ def _assert_supported(
         raise NotImplementedError(
             "flydsl mxfp4 GEMM1 hidden prefetch requires inline quantization"
         )
+    if BK != 256:
+        raise NotImplementedError(f"flydsl mxfp4 GEMM1 requires BK==256, got BK={BK}")
     if D_HIDDEN % BK != 0:
         raise NotImplementedError(
             f"flydsl mxfp4 gemm1 requires D_HIDDEN (K) % {BK} == 0, got H={D_HIDDEN}"
@@ -172,10 +174,11 @@ def _assert_supported(
             raise NotImplementedError(
                 f"D_HIDDEN/BK={k_tiles} must be divisible by k_wave={k_wave}"
             )
-        if k_tiles // k_wave < 2:
-            raise NotImplementedError(
-                f"k_wave leaves fewer than 2 K tiles per wave: {k_tiles // k_wave}"
-            )
+    if D_HIDDEN // BK // k_wave < 2:
+        raise NotImplementedError(
+            "flydsl mxfp4 GEMM1 requires at least 2 K tiles per wave, "
+            f"got D_HIDDEN/BK/k_wave={D_HIDDEN // BK // k_wave}"
+        )
     if (BM, use_nt, inline_quant) not in MXFP4_G1_VARIANTS[a_dtype]:
         raise NotImplementedError(
             f"flydsl mxfp4 gemm1 unsupported variant "
