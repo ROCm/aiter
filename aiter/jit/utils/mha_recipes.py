@@ -14,6 +14,47 @@ def _require_ck_batch_prefill_targets(gfxs: list[str]) -> None:
         )
 
 
+def _apply_ck_mha_prebuild_target_policy(build_args: list[dict], gfxs: list[str]):
+    targets_flag = _ck_targets_flag_for_arches(gfxs)
+    batch_prefill_supported = not any(
+        gfx != "cpu" and not gfx.startswith("gfx9") for gfx in gfxs
+    )
+    target_modules = {"module_mha_fwd", "module_mha_varlen_fwd", "libmha_fwd"}
+    adjusted = []
+
+    for build in build_args:
+        md_name = build["md_name"]
+        if md_name == "module_mha_batch_prefill" and not batch_prefill_supported:
+            continue
+        if md_name not in target_modules:
+            adjusted.append(build)
+            continue
+
+        commands = build.get("blob_gen_cmd", [])
+        if isinstance(commands, str):
+            commands = [commands]
+        commands = list(commands)
+        filtered = []
+        for command in commands:
+            parts = command.split()
+            try:
+                mode = parts[parts.index("-d") + 1]
+            except (ValueError, IndexError):
+                filtered.append(command)
+                continue
+            if mode == "batch_prefill" and not batch_prefill_supported:
+                continue
+            if mode in ("fwd", "fwd_splitkv") and targets_flag and "--targets" not in parts:
+                command += targets_flag
+            filtered.append(command)
+
+        adjusted_build = dict(build)
+        adjusted_build["blob_gen_cmd"] = filtered
+        adjusted.append(adjusted_build)
+
+    return adjusted
+
+
 def _ck_targets_flag() -> str:
     """Select every build architecture for CK FMHA code generation.
 
