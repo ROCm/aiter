@@ -10,6 +10,8 @@ a fresh search. FLYDSL_AUTOTUNE_CACHE_DIR controls FlyDSL's cache directory.
 Each candidate uses a fixed plan and a graph containing decode plus reduction.
 FlyDSL validates candidates, measures them, and caches the smallest budget
 within 97% of the fastest measured performance. Runtime lookup never benchmarks.
+Budgets are shared across context bounds, sample lengths and KV pool sizes.
+Pass lengths to benchmark shorter sequences within a large context bound.
 """
 
 from __future__ import annotations
@@ -32,7 +34,6 @@ NEAR_BEST = 0.97
 DEFAULT_BUDGETS = (128, 256, 512, 1024, 2048, 4096)
 STATIC_SHAPE_FIELDS = (
     "batch_size",
-    "context_length",
     "query_length",
     "num_query_heads",
     "num_kv_heads",
@@ -44,10 +45,13 @@ STATIC_SHAPE_FIELDS = (
     "trans_v",
     "sliding_window",
 )
+LAYOUT_FIELDS = ("query_strides",)
 BENCHMARK_FIELDS = (
+    "context_length",
     "length_mode",
     "seed",
     "lengths",
+    "kv_pool_pages",
     "softmax_scale",
 )
 
@@ -58,6 +62,10 @@ def positive_int(value, name, minimum=1):
     if value < minimum:
         raise ValueError(f"{name} must be >= {minimum}")
     return value
+
+
+def _strided_storage_size(shape, strides):
+    return 1 + sum((size - 1) * stride for size, stride in zip(shape, strides))
 
 
 def make_shape(
@@ -75,8 +83,16 @@ def make_shape(
     window=0,
     length_mode="uniform",
     seed=0,
+    query_strides=None,
+    lengths=None,
+    kv_pool_pages=None,
 ):
-    """Build a tuning shape from explicit device-local attention geometry."""
+    """Build a tuning shape with an upper bound and optional actual lengths.
+
+    One supplied length broadcasts to every sequence. Otherwise supply B lengths.
+    Pass query.stride() for Q layout and key_cache.shape[0] for a fixed KV pool.
+    Synthetic sequences use distinct pages, which must fit in the supplied pool.
+    """
     num_query_heads = positive_int(num_query_heads, "num_query_heads")
     num_kv_heads = positive_int(num_kv_heads, "num_kv_heads")
     head_dim = positive_int(head_dim, "head_dim")
@@ -97,16 +113,64 @@ def make_shape(
         raise ValueError("Context lengths must include every query token")
     if page_size not in (16, 64, 128) or dtype not in ("bfloat16", "float16"):
         raise ValueError("Use page16/64/128 and bfloat16/float16 queries")
+    if query_strides is None:
+        query_strides = (num_query_heads * head_dim, head_dim, 1)
+    if not isinstance(query_strides, (tuple, list)):
+        raise TypeError("query_strides must be a tuple or list of three integers")
+    if len(query_strides) != 3:
+        raise ValueError("query_strides must contain row, head and head_dim strides")
+    query_strides = tuple(
+        positive_int(stride, f"query_strides[{axis}]", 0)
+        for axis, stride in enumerate(query_strides)
+    )
+    if query_strides[2] != 1:
+        raise ValueError("query_strides must keep the head_dim axis contiguous")
+    query_shape = (batch_size * query_length, num_query_heads, head_dim)
+    # Q buffer loads use dwords, so each accessed FP16/BF16 row starts at 4B.
+    if any(
+        size > 1 and stride % 2
+        for size, stride in zip(query_shape[:2], query_strides[:2])
+    ):
+        raise ValueError("query row/head strides must preserve 4-byte alignment")
+    if any(stride >= 2**31 for stride in query_strides) or (
+        2 * _strided_storage_size(query_shape, query_strides) > 2**31
+    ):
+        raise ValueError("query_strides exceed PA's signed int32 addressing range")
     if type(per_token) is not bool or type(trans_v) is not bool:
         raise TypeError("per_token and trans_v must be bool")
     positive_int(window, "window", 0)
-    if length_mode not in ("uniform", "varlen"):
-        raise ValueError("length_mode must be uniform or varlen")
-    lengths = [context_length] * batch_size
-    if length_mode == "varlen" and batch_size > 1:
-        rng = random.Random(seed)
-        lengths = [rng.randint(query_length, context_length) for _ in lengths]
-        lengths[0], lengths[-1] = query_length, context_length
+    if length_mode not in ("uniform", "varlen", "explicit"):
+        raise ValueError("length_mode must be uniform, varlen or explicit")
+    if lengths is None:
+        if length_mode == "explicit":
+            raise ValueError("Explicit length mode requires lengths")
+        lengths = [context_length] * batch_size
+        if length_mode == "varlen" and batch_size > 1:
+            rng = random.Random(seed)
+            lengths = [rng.randint(query_length, context_length) for _ in lengths]
+            lengths[0], lengths[-1] = query_length, context_length
+    else:
+        if not isinstance(lengths, (list, tuple)):
+            raise TypeError("lengths must be a list or tuple of integers")
+        if len(lengths) not in (1, batch_size):
+            raise ValueError("Supply one length or exactly batch_size lengths")
+        lengths = [positive_int(n, "lengths entry", query_length) for n in lengths]
+        if any(n > context_length for n in lengths):
+            raise ValueError("Actual lengths must not exceed context_length")
+        if len(lengths) == 1:
+            lengths *= batch_size
+        length_mode = "explicit"
+    required_pages = sum((n + page_size - 1) // page_size for n in lengths)
+    if kv_pool_pages is None:
+        kv_pool_pages = required_pages
+    kv_pool_pages = positive_int(kv_pool_pages, "kv_pool_pages")
+    if kv_pool_pages > 2**31:
+        raise ValueError("KV pool page IDs must fit signed int32")
+    if kv_pool_pages < required_pages:
+        raise ValueError(
+            f"kv_pool_pages={kv_pool_pages} cannot hold {required_pages} distinct "
+            "pages; supply sample lengths that fit the pool"
+        )
     shape = {
         "num_query_heads": num_query_heads,
         "num_kv_heads": num_kv_heads,
@@ -122,9 +186,11 @@ def make_shape(
         per_token_kv=per_token,
         trans_v=trans_v,
         sliding_window=window,
+        query_strides=query_strides,
         length_mode=length_mode,
         seed=seed,
         lengths=lengths,
+        kv_pool_pages=kv_pool_pages,
         softmax_scale=head_dim**-0.5,
     )
     return shape
@@ -144,12 +210,15 @@ def _validate_shape(shape, *, benchmark=False):
         per_token=shape["per_token_kv"],
         trans_v=shape["trans_v"],
         window=shape["sliding_window"],
-        length_mode=shape["length_mode"] if benchmark else "uniform",
-        seed=shape["seed"] if benchmark else 0,
+        length_mode=shape["length_mode"],
+        seed=shape["seed"],
+        query_strides=shape["query_strides"],
+        lengths=shape["lengths"] if shape["length_mode"] == "explicit" else None,
+        kv_pool_pages=shape["kv_pool_pages"],
     )
-    fields = (
-        STATIC_SHAPE_FIELDS + BENCHMARK_FIELDS if benchmark else STATIC_SHAPE_FIELDS
-    )
+    fields = STATIC_SHAPE_FIELDS + LAYOUT_FIELDS
+    if benchmark:
+        fields += BENCHMARK_FIELDS
     if any(
         type(shape[k]) is not type(expected[k]) or shape[k] != expected[k]
         for k in fields
@@ -226,23 +295,20 @@ def _contiguous_strides(shape):
 
 def _synthetic_storage_key(shape):
     h, d, page = (shape[k] for k in ("num_kv_heads", "head_dim", "page_size"))
-    pages = sum((n + page - 1) // page for n in shape["lengths"])
-    extent = pages * h * d * page
+    pages = shape["kv_pool_pages"]
     vshape = (pages, h, page // 16, d, 16) if shape["trans_v"] else (pages, h, d, page)
     scales = _contiguous_strides((pages, h, page)) if shape["per_token_kv"] else ()
     return (
-        (shape["num_query_heads"] * d, d, 1),
+        shape["query_strides"],
         _contiguous_strides((pages, h, d // 16, page, 16)),
         _contiguous_strides(vshape),
         scales,
         scales,
-        extent >= 2**31,
-        extent < 2**32,
     )
 
 
 def storage_key(query, key, value, key_scale, value_scale):
-    """Host-only layout/address specialization shared by search and lookup."""
+    """Host-only layout specialization shared by search and lookup."""
 
     def scale_strides(scale):
         if scale.numel() == 1:
@@ -251,15 +317,12 @@ def storage_key(query, key, value, key_scale, value_scale):
         # pa_decode normalizes (..., page, 1) per-token scales with squeeze(-1).
         return strides[:-1] if scale.ndim == 4 and scale.shape[-1] == 1 else strides
 
-    extent = max(key.numel(), value.numel())
     return (
         tuple(query.stride()),
         tuple(key.stride()),
         tuple(value.stride()),
         scale_strides(key_scale),
         scale_strides(value_scale),
-        extent >= 2**31,
-        extent < 2**32,
     )
 
 
@@ -397,8 +460,8 @@ def get_cached_budget(shape, architecture, num_cu, *, storage_key=None):
     """Read FlyDSL's config cache, or use 2*CU; never compile or benchmark.
 
     Call before graph capture when preparing an explicit work plan. Pass the
-    actual tensor storage key to distinguish packed or padded caches from the
-    tuner's synthetic contiguous inputs. Use the current CUDA device's metadata.
+    actual tensor storage key to match its layout. Otherwise use the shape's
+    query strides and contiguous KV/scale layouts. Use the current CUDA device.
     """
     try:
         return _resolve_config(
@@ -422,12 +485,18 @@ def _make_inputs(torch, shape, device, fp8):
         )
     )
     counts = [(n + page - 1) // page for n in shape["lengths"]]
-    pages = sum(counts)
+    pages = shape["kv_pool_pages"]
     generator = torch.Generator(device=device).manual_seed(shape["seed"])
-    query = torch.empty(
-        (b * ql, hq, d), dtype=getattr(torch, shape["query_dtype"]), device=device
+    query_shape = (b * ql, hq, d)
+    query_strides = shape["query_strides"]
+    query_storage = torch.empty(
+        _strided_storage_size(query_shape, query_strides),
+        dtype=getattr(torch, shape["query_dtype"]),
+        device=device,
     )
-    query.uniform_(-0.5, 0.5, generator=generator)
+    # Initialize the backing storage once, including padding and aliased rows.
+    query_storage.uniform_(-0.5, 0.5, generator=generator)
+    query = query_storage.as_strided(query_shape, query_strides)
     keys = torch.empty((pages, h, d // 16, page, 16), dtype=fp8, device=device)
     vshape = (pages, h, page // 16, d, 16) if shape["trans_v"] else (pages, h, d, page)
     values = torch.empty(vshape, dtype=fp8, device=device)
@@ -465,7 +534,9 @@ def _make_inputs(torch, shape, device, fp8):
                 )
             )
             cache[begin:end].copy_(packed)
-    table = torch.zeros((b, max(counts)), dtype=torch.int32, device=device)
+    # Preserve the scheduler's upper bound without allocating KV for padding.
+    table_pages = (shape["context_length"] + page - 1) // page
+    table = torch.zeros((b, table_pages), dtype=torch.int32, device=device)
     start = 0
     for seq, count in enumerate(counts):
         table[seq, :count] = torch.arange(
@@ -585,7 +656,9 @@ def _prepare_candidate(
         plan.capacity,
         shape["query_length"] * shape["query_group_size"],
     )
-    output = torch.full_like(inputs["query"], math.nan)
+    output = torch.full_like(
+        inputs["query"], math.nan, memory_format=torch.contiguous_format
+    )
     sums = torch.full(
         scratch_shape, math.nan, dtype=torch.float32, device=output.device
     )
@@ -615,6 +688,7 @@ def _prepare_candidate(
             temporary_output=partials,
             sliding_window=shape["sliding_window"],
             work_plan=plan,
+            max_context_length=shape["context_length"],
         )
 
     launch()
@@ -934,6 +1008,12 @@ def main(argv=None):
         metavar="Hq,Hkv,D",
         help="Device-local query heads, KV heads, and head dimension",
     )
+    parser.add_argument(
+        "--query-strides",
+        type=lambda s: _list_arg(s, unique=False),
+        metavar="ROW,HEAD,DIM",
+        help="Strides of the actual 3D query tensor in elements; default: contiguous",
+    )
     for name, default in (
         ("batch-sizes", [1]),
         ("context-lengths", [4096]),
@@ -951,6 +1031,17 @@ def main(argv=None):
     parser.add_argument("--trans-v", choices=("yes", "no", "both"), default="yes")
     parser.add_argument(
         "--length-mode", choices=("uniform", "varlen"), default="uniform"
+    )
+    parser.add_argument(
+        "--lengths",
+        type=lambda s: _list_arg(s, unique=False),
+        metavar="L[,L...]",
+        help="Actual sample lengths; one value broadcasts to B, overriding length-mode",
+    )
+    parser.add_argument(
+        "--kv-pool-pages",
+        type=int,
+        help="Physical KV pool pages; default: enough distinct pages for the sample",
     )
     parser.add_argument("--seed", type=int, default=0)
     budgets = parser.add_mutually_exclusive_group()
@@ -998,6 +1089,9 @@ def main(argv=None):
                 window=window,
                 length_mode=args.length_mode,
                 seed=args.seed,
+                query_strides=args.query_strides,
+                lengths=args.lengths,
+                kv_pool_pages=args.kv_pool_pages,
             )
             for b, ctx, ql, window, page, dtype, quant, layout in itertools.product(
                 args.batch_sizes,
@@ -1054,11 +1148,33 @@ def main(argv=None):
     except (OSError, ValueError, TypeError, RuntimeError, ImportError) as exc:
         parser.error(str(exc))
     if args.dry_run:
-        for index, (key, groups) in enumerate(preview, 1):
+        for index, ((key, groups), shape) in enumerate(zip(preview, shapes), 1):
             print(
                 f"SHAPE {index}/{len(preview)} architecture={key['architecture']} num_cu={key['num_cu']}"
             )
             print("  " + " ".join(f"{k}={v}" for k, v in key["shape"].items()))
+            print(
+                f"  context_length={shape['context_length']} "
+                f"query_strides={shape['query_strides']}"
+            )
+            kv_bytes = (
+                2
+                * shape["kv_pool_pages"]
+                * shape["num_kv_heads"]
+                * shape["head_dim"]
+                * shape["page_size"]
+            )
+            required_pages = sum(
+                (n + shape["page_size"] - 1) // shape["page_size"]
+                for n in shape["lengths"]
+            )
+            print(
+                f"  lengths_min={min(shape['lengths'])} "
+                f"lengths_max={max(shape['lengths'])} "
+                f"total_tokens={sum(shape['lengths'])} "
+                f"required_pages={required_pages} "
+                f"kv_pool_pages={shape['kv_pool_pages']} kv_bytes={kv_bytes}"
+            )
             for candidate in groups:
                 print(
                     f"  budget={candidate['workgroup_budget']} capacity={candidate['capacity']} "
