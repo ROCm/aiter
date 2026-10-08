@@ -16,6 +16,7 @@ from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import (
     get_stride_from_layout,
     is_fp8,
 )
+from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 FWD_DECODE_AUTOTUNE_KEYS = [
     "N_CTX_Q",
@@ -117,7 +118,19 @@ def get_fwd_decode_configs(mode: AutotuneMode):
         return splitk_configs, reduce_configs
 
 
-fwd_decode_splitk_configs, fwd_decode_reduce_configs = get_fwd_decode_configs(AUTOTUNE)
+_fwd_decode_splitk, _fwd_decode_reduce = get_fwd_decode_configs(AUTOTUNE)
+fwd_decode_splitk_configs = autotune_configs(
+    "FLASH_ATTN",
+    _fwd_decode_splitk,
+    env="FLASH_ATTENTION_TRITON_AMD_AUTOTUNE",
+    default="1",
+)
+fwd_decode_reduce_configs = autotune_configs(
+    "FLASH_ATTN",
+    _fwd_decode_reduce,
+    env="FLASH_ATTENTION_TRITON_AMD_AUTOTUNE",
+    default="1",
+)
 
 
 @triton.jit

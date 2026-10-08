@@ -66,7 +66,11 @@ def gemm_a8w8_blockscale(
         torch.Tensor: Output with shape (M, N).
     """
     _LOGGER.info(
-        f"GEMM_A8W8_BLOCKSCALE: x={tuple(x.shape)} w={tuple(w.shape)} x_scale={tuple(x_scale.shape)} w_scale={tuple(w_scale.shape)}"
+        "GEMM_A8W8_BLOCKSCALE: x=%s w=%s x_scale=%s w_scale=%s",
+        tuple(x.shape),
+        tuple(w.shape),
+        tuple(x_scale.shape),
+        tuple(w_scale.shape),
     )
 
     M, K = x.shape
@@ -166,8 +170,11 @@ def gemm_a8w8_blockscale(
             )
 
         _LOGGER.info(
-            f"GEMM_A8W8 BLOCKSCALE [gluon/{arch}]: x={tuple(x.shape)} "
-            f"w={tuple(w.shape)} kernel={kernel_type}"
+            "GEMM_A8W8 BLOCKSCALE [gluon/%s]: x=%s w=%s kernel=%s",
+            arch,
+            tuple(x.shape),
+            tuple(w.shape),
+            kernel_type,
         )
     else:
         impl = triton_gemm_a8w8_blockscale_kernel
@@ -265,7 +272,11 @@ def gemm_a8w8_blockscale_preshuffle(
         torch.Tensor: Output with shape (M, N).
     """
     _LOGGER.info(
-        f"GEMM_A8W8_BLOCKSCALE: x={tuple(x.shape)} w={tuple(w.shape)} x_scale={tuple(x_scale.shape)} w_scale={tuple(w_scale.shape)}"
+        "GEMM_A8W8_BLOCKSCALE: x=%s w=%s x_scale=%s w_scale=%s",
+        tuple(x.shape),
+        tuple(w.shape),
+        tuple(x_scale.shape),
+        tuple(w_scale.shape),
     )
 
     M, K = x.shape
@@ -370,8 +381,10 @@ def gemm_a8w8_blockscale_preshuffle(
             kernel_type in _PRESHUFFLE_KERNEL_MAP
         ), f"Unknown kernel_type '{kernel_type}', must be one of {list(_PRESHUFFLE_KERNEL_MAP.keys())}"
         _LOGGER.info(
-            f"GEMM_A8W8 BLOCKSCALE PRESHUFFLE [gluon/gfx1250]: x={tuple(x.shape)} w={tuple(w.shape)} "
-            f"kernel={kernel_type}"
+            "GEMM_A8W8 BLOCKSCALE PRESHUFFLE [gluon/gfx1250]: x=%s w=%s kernel=%s",
+            tuple(x.shape),
+            tuple(w.shape),
+            kernel_type,
         )
 
         impl = _PRESHUFFLE_KERNEL_MAP[kernel_type]

@@ -29,6 +29,7 @@ __all__ = [
     "atomic_add_agent",
     "atomic_add_agent_one_as",
     "atomic_add_global_at",
+    "atomic_add_lds",
     "atomic_add_system",
     "atomic_add_workgroup",
     "fence_acquire",
@@ -40,6 +41,7 @@ __all__ = [
     "load_i32_acquire",
     "load_i32_global_agent",
     "load_i32_global_system",
+    "load_i32_lds",
     "load_i32_nt",
     "load_i32_system",
     "load_i64_acquire",
@@ -53,6 +55,7 @@ __all__ = [
     "store_i32_global_agent_release",
     "store_i32_global_system_monotonic",
     "store_i32_global_system_release",
+    "store_i32_lds",
     "store_i32_system",
     "store_i64_global_system",
     "traced",
@@ -60,6 +63,7 @@ __all__ = [
     "wait_i32_until_greater_than",
     "wait_i64_until_equals",
     "waitcnt_all",
+    "waitcnt_stores",
 ]
 
 
@@ -75,6 +79,9 @@ def _to_ptr_shared(v):
     return _llvm_d.IntToPtrOp(
         _llvm_d.PointerType.get(address_space=3), arith.unwrap(v)
     ).result
+
+
+_to_ptr_lds = _to_ptr_shared
 
 
 def _ptr_plus(base_i64, offset, elem_bytes):
@@ -100,6 +107,44 @@ def waitcnt_all():
     """Drain outstanding gfx12 load/store counters before a grid barrier."""
     _rocdl_d.s_wait_storecnt(0)
     _rocdl_d.s_wait_loadcnt(0)
+
+
+def waitcnt_stores():
+    """Drain outstanding stores only -- the narrow half of :func:`waitcnt_all`.
+
+    Store completion alone is what makes those writes visible to a peer released
+    by a grid barrier; in-flight loads need no wait, because their results are
+    already ordered by the register dependencies that consume them.
+    """
+    _rocdl_d.s_wait_storecnt(0)
+
+
+def atomic_add_lds(addr_i64, val):
+    """Workgroup-scope LDS fetch-and-add at ``addr_i64``; returns the old value.
+
+    ``addr_i64`` is a raw LDS byte address (``ptrtoint`` of a SharedAllocator
+    pointer), not a global one: the block-local counters this serves are hit by
+    every lane of every warp in the block, which in global memory would cost a
+    device-scope atomic per route.
+    """
+    return _llvm_d.AtomicRMWOp(
+        _llvm_d.AtomicBinOp.add,
+        _to_ptr_lds(addr_i64),
+        arith.unwrap(val),
+        _llvm_d.AtomicOrdering.monotonic,
+        syncscope="workgroup",
+        alignment=4,
+    ).res
+
+
+def load_i32_lds(addr_i64):
+    """Plain i32 load from a raw LDS byte address."""
+    return _llvm_d.LoadOp(T.i32, _to_ptr_lds(addr_i64), alignment=4).res
+
+
+def store_i32_lds(addr_i64, val):
+    """Plain i32 store to a raw LDS byte address."""
+    _llvm_d.StoreOp(arith.unwrap(val), _to_ptr_lds(addr_i64), alignment=4)
 
 
 def load_i32_acquire(addr_i64):

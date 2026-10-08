@@ -327,7 +327,7 @@ def build_moe_topids_to_rows_g2l_module(weight_dtype="bf16"):
     return launch_topids_to_rows_g2l
 
 
-def build_moe_route_g2l_lds_module(weight_dtype="bf16"):
+def build_moe_route_g2l_lds_module(weight_dtype="bf16", direct_mask: bool = False):
     """Multi-block EP route with a two-level (LDS -> global) atomic reduction.
 
     The plain ``moe_route_g2l`` kernel does one device-scope ``atomicAdd`` per
@@ -364,9 +364,13 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16"):
         weight_in: fx.Pointer,  # (numel,) f32 route weights in
         gather_w: fx.Pointer,  # (numel,) weight_dtype out; kept->cast, drops->0
         num_valid_routes: fx.Pointer,  # (1,) int32; routes >= this are the EP dead-tail
+        num_local_tokens: fx.Pointer,  # direct-mask mode: (1,) int32
         numel: Int32,
         max_m: Int32,
         n_buckets: Int32,  # local bucket count / sentinel value; <= MAX_ROUTE_BUCKETS
+        topk: Int32,
+        ep_rowmap: fx.Pointer,  # (cap,2) i32 or null; sentinel-filled here
+        ep_rowmap_cap: Int32,  # cap_rows_plus1; 0 when ep_rowmap is null
     ):
         i32 = T.i32
         w_fx = fx.BFloat16 if weight_dtype == "bf16" else fx.Float16
@@ -388,7 +392,12 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16"):
         out_p = ptr_buf_tensor(topids_to_rows)
 
         nvr_p = ptr_buf_tensor(num_valid_routes)
-        nvr = nvr_p[c0]
+        if const_expr(direct_mask):
+            nvr = ptr_buf_tensor(num_local_tokens)[c0] * topk
+            if (fx.block_idx.x == 0) & (tid == 0):
+                nvr_p[c0] = nvr
+        else:
+            nvr = nvr_p[c0]
 
         n_buckets_i32 = fx.Uint32(n_buckets)
         nvr_i32 = fx.Uint32(nvr)
@@ -396,6 +405,25 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16"):
         # Phase 0: zero the per-block LDS bucket counter ([0, n_buckets)).
         for b in range(tid, n_buckets_i32, BLOCK_THREADS):
             lds_cnt[fx.Uint32(b)] = fx.Int32(0)
+
+        # Fused ep_rowmap sentinel fill: write (-1, 0) as one i64 per row.
+        # Fire-and-forget global stores interleaved with Phase-0 LDS zeroing;
+        # no read of ep_rowmap in this kernel, so no barrier is needed -- the
+        # stores are globally visible to the next kernel on the same stream.
+        # When ep_rowmap is null (non-scatter path) the loop body is skipped.
+        has_ep = fx.Int64(ptrtoint(ep_rowmap)) != 0
+        if has_ep:
+            ep_i64 = ptr_buf_tensor(ep_rowmap, fx.Int64)
+            sentinel = fx.Int64(0xFFFFFFFF)
+            n_fill = fx.Uint32(ep_rowmap_cap)
+            grid_threads = (
+                (fx.Uint32(numel) + fx.Uint32(BLOCK_THREADS - 1))
+                // fx.Uint32(BLOCK_THREADS)
+                * fx.Uint32(BLOCK_THREADS)
+            )
+            for i in range(route, n_fill, grid_threads):
+                ep_i64[i] = sentinel
+
         gpu.barrier()
 
         # Phase 1: classify each route, cast/mask its weight, and take an
@@ -413,8 +441,13 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16"):
         if in_range:
             ge = fx.Uint32(tk_p[route])
 
-        le = fx.Uint32(g2l_p[ge])
-        is_drop = (le == n_buckets_i32) | oob
+        if const_expr(direct_mask):
+            is_local = fx.Int32(g2l_p[ge]) != c0
+            le = ge % n_buckets_i32
+            is_drop = (~is_local) | oob
+        else:
+            le = fx.Uint32(g2l_p[ge])
+            is_drop = (le == n_buckets_i32) | oob
         is_kept = ~is_drop
         eff_e = is_drop.select(fx.Uint32(0), le)
 
@@ -474,20 +507,23 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16"):
             row_out = is_drop.select(dropped_row, row)
             out_p[route] = row_out
 
-    @flyc.jit
-    def launch_route_g2l_lds(
-        topk_ids: fx.Pointer,
-        g2l_lut: fx.Pointer,
-        atomic_buffer: fx.Pointer,
-        topids_to_rows: fx.Pointer,
-        weight_in: fx.Pointer,
-        gather_w: fx.Pointer,
-        num_valid_routes: fx.Pointer,
-        numel: fx.Int32,
-        max_m: fx.Int32,
-        n_buckets: fx.Int32,
-        grid_blocks: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    def _launch(
+        topk_ids,
+        g2l_lut,
+        atomic_buffer,
+        topids_to_rows,
+        weight_in,
+        gather_w,
+        num_valid_routes,
+        num_local_tokens,
+        numel,
+        max_m,
+        n_buckets,
+        topk,
+        grid_blocks,
+        ep_rowmap,
+        ep_rowmap_cap,
+        stream,
     ):
         route_kernel(
             topk_ids,
@@ -497,14 +533,99 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16"):
             weight_in,
             gather_w,
             num_valid_routes,
+            num_local_tokens,
             numel,
             max_m,
             n_buckets,
+            topk,
+            ep_rowmap,
+            ep_rowmap_cap,
         ).launch(
             grid=(fx.Int64(grid_blocks), 1, 1),
             block=(BLOCK_THREADS, 1, 1),
             stream=stream,
         )
+
+    if direct_mask:
+
+        @flyc.jit
+        def launch_route_g2l_lds(
+            topk_ids: fx.Pointer,
+            expert_mask: fx.Pointer,
+            atomic_buffer: fx.Pointer,
+            topids_to_rows: fx.Pointer,
+            weight_in: fx.Pointer,
+            gather_w: fx.Pointer,
+            num_valid_routes: fx.Pointer,
+            num_local_tokens: fx.Pointer,
+            numel: fx.Int32,
+            max_m: fx.Int32,
+            n_buckets: fx.Int32,
+            topk: fx.Int32,
+            grid_blocks: fx.Int32,
+            ep_rowmap: fx.Pointer,
+            ep_rowmap_cap: fx.Int32,
+            stream: fx.Stream = fx.Stream(None),  # noqa: B008
+        ):
+            _launch(
+                topk_ids,
+                expert_mask,
+                atomic_buffer,
+                topids_to_rows,
+                weight_in,
+                gather_w,
+                num_valid_routes,
+                num_local_tokens,
+                numel,
+                max_m,
+                n_buckets,
+                topk,
+                grid_blocks,
+                ep_rowmap,
+                ep_rowmap_cap,
+                stream,
+            )
+
+    else:
+
+        @flyc.jit
+        def launch_route_g2l_lds(
+            topk_ids: fx.Pointer,
+            g2l_lut: fx.Pointer,
+            atomic_buffer: fx.Pointer,
+            topids_to_rows: fx.Pointer,
+            weight_in: fx.Pointer,
+            gather_w: fx.Pointer,
+            num_valid_routes: fx.Pointer,
+            numel: fx.Int32,
+            max_m: fx.Int32,
+            n_buckets: fx.Int32,
+            grid_blocks: fx.Int32,
+            ep_rowmap: fx.Pointer,
+            ep_rowmap_cap: fx.Int32,
+            stream: fx.Stream = fx.Stream(None),  # noqa: B008
+        ):
+            # These two operands compile away when direct_mask=False. Reusing an
+            # existing valid pointer avoids changing the established launcher
+            # signature used by external callers and auxiliary tests.
+            _launch(
+                topk_ids,
+                g2l_lut,
+                atomic_buffer,
+                topids_to_rows,
+                weight_in,
+                gather_w,
+                num_valid_routes,
+                num_valid_routes,
+                numel,
+                max_m,
+                n_buckets,
+                fx.Int32(0),
+                grid_blocks,
+                ep_rowmap,
+                ep_rowmap_cap,
+                stream,
+            )
 
     launch_route_g2l_lds.compile_hints = {
         "llvm_options": {

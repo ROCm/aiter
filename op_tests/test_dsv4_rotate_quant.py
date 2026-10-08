@@ -262,6 +262,60 @@ def test_rotate_fp4quant(M, head_num, N, dtype=torch.bfloat16, shuffle_scale=Fal
 
 
 @benchmark()
+def test_rope_fp4quant_round_rope(
+    M, head_num, N, dtype=torch.bfloat16, shuffle_scale=True
+):
+    """RoPE alone (no Hadamard) with round_rope: the rotated values rounded to
+    the input dtype before the FP4 quant, as a model whose RoPE writes its
+    output back in that dtype (DeepSeek-V4.1's index query) quantizes them."""
+    if get_gfx() == "gfx942":
+        aiter.logger.info("gfx942 is not supported")
+        return {}
+    rope_dim = 64
+    max_pos = 2048
+    x = torch.randn((M, head_num, N), dtype=dtype, device="cuda")
+    positions = torch.randint(0, max_pos, (M,), dtype=torch.int64, device="cuda")
+    freqs = torch.randn((max_pos, rope_dim // 2), dtype=torch.float32, device="cuda")
+    cos = torch.cos(freqs).to(dtype)
+    sin = torch.sin(freqs).to(dtype)
+    rotated = rope_torch(x.clone(), cos, sin, positions, rope_dim).to(dtype)
+    y_ref, scale_ref = fp4_act_quant(rotated.float(), 32)
+    if shuffle_scale:
+        scale_ref = dsv4_shuffle_scale(scale_ref)
+    y = torch.empty((*x.shape[:-1], N // 2), dtype=dtypes.fp4x2, device="cuda")
+    scale = torch.empty_like(scale_ref)
+    _, us = run_perftest(
+        aiter.rope_rotate_activation,
+        y,
+        x,
+        cos,
+        sin,
+        positions,
+        rope_dim,
+        out_scale=scale,
+        group_size=32,
+        shuffle_scale=shuffle_scale,
+        do_rotate_act=False,
+        round_rope=True,
+    )
+    err = checkAllclose(mxfp4_to_f32(y_ref), mxfp4_to_f32(y), atol=0, rtol=0, msg="y")
+    checkAllclose(
+        scale_ref.view(torch.uint8).to(torch.int16),
+        scale.view(torch.uint8).to(torch.int16),
+        atol=0,
+        rtol=0,
+        msg="scale",
+    )
+    return {
+        "op": "rope_round_fp4quant",
+        "head_num": head_num,
+        "shuffle_scale": shuffle_scale,
+        "err": err,
+        "us": us,
+    }
+
+
+@benchmark()
 def test_rope_rotate_fp4quant(
     M, head_num, N, dtype=torch.bfloat16, shuffle_scale=False
 ):
@@ -574,6 +628,13 @@ parser.add_argument(
     --rope # True""",
 )
 parser.add_argument(
+    "--round-rope",
+    dest="round_rope",
+    action="store_true",
+    help="""rope alone, its output rounded to the input dtype, then fp4 quant
+    (round_rope; no Hadamard). Default: False.""",
+)
+parser.add_argument(
     "--norm_cache",
     action="store_true",
     help="""rmsnorm + rope + fp4 kvcache. Default: False.""",
@@ -608,6 +669,10 @@ for dtype in args.dtype:
             for m in args.m:
                 if args.fp8:
                     ret = test_rope_rotate_fp8quant(m, head_num, dim, dtype=dtype)
+                elif args.round_rope:
+                    ret = test_rope_fp4quant_round_rope(
+                        m, head_num, dim, dtype=dtype, shuffle_scale=args.shuffle_scale
+                    )
                 elif args.norm_cache:
                     ret = test_rmsnorm_rope_rotate_fp4quant_kvcache(
                         m,

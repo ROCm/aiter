@@ -387,7 +387,8 @@ def xcd_remap_bx_by(
 
     _c1 = fx.Index(1)
     _c_tm = fx.Index(tile_m)
-    _gx = fx.Index(N // tile_n)
+    grid_n = (N + tile_n - 1) // tile_n if N % tile_n else N // tile_n
+    _gx = fx.Index(grid_n)
     _gy = (c_m + _c_tm - _c1) // _c_tm
 
     _linear_id = bx * _gx + by

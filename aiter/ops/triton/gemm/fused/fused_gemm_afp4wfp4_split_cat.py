@@ -55,7 +55,12 @@ def fused_gemm_afp4wfp4_split_cat(
     NOTE: N must be D * (S1 + S2)
     """
     _LOGGER.info(
-        f"FUSED_GEMM_AFP4WFP4_SPLIT_CAT: x={tuple(x.shape)} w={tuple(w.shape)} y={tuple(y.shape)} x_scale={tuple(x_scale.shape)} w_scale={tuple(w_scale.shape)}"
+        "FUSED_GEMM_AFP4WFP4_SPLIT_CAT: x=%s w=%s y=%s x_scale=%s w_scale=%s",
+        tuple(x.shape),
+        tuple(w.shape),
+        tuple(y.shape),
+        tuple(x_scale.shape),
+        tuple(w_scale.shape),
     )
 
     M, K = x.shape
@@ -235,7 +240,12 @@ def fused_gemm_afp4wfp4_preshuffle_split_cat(
     NOTE: N must be D * (S1 + S2)
     """
     _LOGGER.info(
-        f"FUSED_GEMM_AFP4WFP4_PRESHUFFLE_SPLIT_CAT: x={tuple(x.shape)} w={tuple(w.shape)} y={tuple(y.shape)} x_scale={tuple(x_scale.shape)} w_scale={tuple(w_scale.shape)}"
+        "FUSED_GEMM_AFP4WFP4_PRESHUFFLE_SPLIT_CAT: x=%s w=%s y=%s x_scale=%s w_scale=%s",
+        tuple(x.shape),
+        tuple(w.shape),
+        tuple(y.shape),
+        tuple(x_scale.shape),
+        tuple(w_scale.shape),
     )
 
     M, K = x.shape
