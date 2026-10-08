@@ -9,7 +9,6 @@ import triton
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton._triton_kernels.normalization.fused_rmsnorm_add_rmsnorm import (
     _fused_rmsnorm_add_rmsnorm_kernel,
-    _fused_rmsnorm_add_rmsnorm_large_m_kernel,
 )
 
 
@@ -52,25 +51,6 @@ def fused_rmsnorm_add_rmsnorm(
     M, N = x.shape
     out = torch.empty_like(x)
     block = triton.next_power_of_2(N)
-    if M > 1024:
-        block_m = 16
-        # Norm spans every column, so the second grid axis has one tile.
-        _fused_rmsnorm_add_rmsnorm_large_m_kernel[(triton.cdiv(M, block_m), 1)](
-            x,
-            residual,
-            post_weight,
-            pre_weight,
-            residual_out,
-            out,
-            M,
-            N,
-            post_eps,
-            pre_eps,
-            BLOCK_M=block_m,
-            BLOCK_SIZE_N=block,
-            num_warps=4,
-        )
-        return out
     num_warps = 4 if M <= 128 else 8
     _fused_rmsnorm_add_rmsnorm_kernel[(M,)](
         x,
