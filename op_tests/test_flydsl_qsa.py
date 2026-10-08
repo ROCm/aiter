@@ -3409,6 +3409,33 @@ def test_qsa_aot_collector_lists_family_a_launches():
         raise TypeError("QSA AOT has no compile_one_config")
 
 
+def test_qsa_aot_targets_follow_gpu_archs_without_a_device(monkeypatch):
+    """The wheel build lists gfx942 and gfx950 and has no GPU visible.
+
+    Those two archs are the compile targets. A GPU_ARCHS value with no
+    QSA arch is an error. With the variable unset and no device, both
+    supported archs are still compiled.
+    """
+    import torch
+
+    from aiter.aot.flydsl.qsa import _qsa_aot_targets
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setenv("GPU_ARCHS", "gfx942;gfx950")
+    monkeypatch.delenv("CU_NUM", raising=False)
+    assert _qsa_aot_targets() == [("gfx942", 304), ("gfx950", 256)]
+    monkeypatch.setenv("GPU_ARCHS", "gfx1250")
+    try:
+        _qsa_aot_targets()
+    except RuntimeError as error:
+        if "gfx1250" not in str(error):
+            raise AssertionError(str(error)) from error
+    else:
+        raise AssertionError("GPU_ARCHS with no QSA arch was accepted")
+    monkeypatch.delenv("GPU_ARCHS")
+    assert _qsa_aot_targets() == [("gfx942", 304), ("gfx950", 256)]
+
+
 def test_qsa_aot_empty_launch_list_has_no_jobs():
     """An empty QSA launch list collects no jobs.
 
