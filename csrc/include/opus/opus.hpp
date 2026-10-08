@@ -2233,8 +2233,9 @@ struct smem {
     }
 
     // bulk load API, give me a Shape of this tile, will issue multiple load instruction based on the y-shape space
+    // A compile-time c_os element offset folds LDS slot displacements into ds_read immediates, avoiding per-load address arithmetic.
     template<index_t vec = 1, typename Layout, std::enable_if_t<is_layout_v<Layout>, bool> = true>
-    OPUS_D auto load(const Layout& u)
+    OPUS_D auto load(const Layout& u, int c_os = 0)
     {
         using LT = layout_load_traits<Layout, vec>;
         constexpr auto r_elem = LT::r_elem;
@@ -2243,13 +2244,13 @@ struct smem {
 #if OPUS_TILE_CONTAINER == 0
         vector_t<scalar_type, vec * vector_size * r_elem.value> r;
         for (index_t i = 0; i < r_elem.value; i++) {
-            auto tmp = load<vec>(offsets[i]);
+            auto tmp = load<vec>(offsets[i] + c_os);
             for (index_t j = 0; j < vec * vector_size; j++) r[i * vec * vector_size + j] = tmp[j];
         }
         return r;
 #elif OPUS_TILE_CONTAINER == 1
         array<vector_type<vec>, r_elem.value> r;
-        for (index_t i = 0; i < r_elem.value; i++) r[i] = load<vec>(offsets[i]);
+        for (index_t i = 0; i < r_elem.value; i++) r[i] = load<vec>(offsets[i] + c_os);
         return r;
 #endif
     }

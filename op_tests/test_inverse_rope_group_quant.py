@@ -161,8 +161,8 @@ def _unshuffle_scale(scale, s, g, ks, scale_layout, group_size):
 # The gate closes that by round-tripping a plain scale through opus's own
 # forward and this file's inverse. It has to run opus in a **subprocess**: both
 # trees ship a package named `aiter`, so a path insert here would resolve
-# `aiter.ops.shuffle` out of whichever one is already in sys.modules -- this
-# one, which has no shuffle_scale_a.
+# Opus layout modules out of whichever tree is already in sys.modules. The
+# subprocess imports the private helper directly from the requested Opus tree.
 #
 # `sub` is read from the opus traits header via its own single-source-of-truth
 # accessor rather than hardcoded. Hardcoding it would make this gate a third
@@ -174,7 +174,7 @@ import json, sys, torch
 tree = sys.argv[1]
 sys.path.insert(0, tree)
 sys.path.insert(0, tree + "/csrc/opus_gemm")
-from aiter.ops.shuffle import shuffle_scale_a
+from _scale_layouts import shuffle_scale_a
 try:
     from opus_gemm_common import _opus_sf_shuf_sub
     sub = _opus_sf_shuf_sub()

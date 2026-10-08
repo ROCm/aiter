@@ -576,7 +576,12 @@ def resolve_a16w16_caller_candidate(
 # ---- gfx950 MXFP8 BMM tuned-row and heuristic policy ---------------------
 
 _MXSCALE_BMM_KID_OFFSET = 8000
-_MXSCALE_BMM_LOCAL_KID_MAX = 653
+# Upper end of the pre-globalisation id space a tuned CSV may still be written
+# in. Raised past 653 for the GROUP_N=GROUP_K=32 twins, which sit at their
+# mirror's id plus 1000. Still unambiguous: every local id stays below the 8000
+# offset, so widening the window only admits ids that would otherwise have been
+# rejected outright.
+_MXSCALE_BMM_LOCAL_KID_MAX = 1713
 _TUNED_PERF_COLUMNS = ("us", "tflops", "bw", "errRatio")
 _C_INT_MAX = (1 << 31) - 1
 
@@ -600,8 +605,21 @@ def _parse_mxscale_bmm_tuned_split_k(value: object) -> int:
 
 
 @cache
-def _load_mxscale_bmm_tuned(libtype: str | None = None) -> dict:
-    path = AITER_CONFIGS.AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_FILE
+def _load_mxscale_bmm_tuned(
+    libtype: str | None = None, bpreshuffle: bool = False
+) -> dict:
+    # One table per B layout, never merged, and never one table plus an env var:
+    # a row's kernelId is only meaningful for the layout it was tuned on, and a
+    # process-wide switch would make a preshuffled table shadow the row-major one
+    # for every caller. Letting the layout the caller declares pick the file also
+    # makes the failure mode benign -- a caller that forgets `bpreshuffle` gets a
+    # missing row and the heuristic, not a kid that reads the right bytes in the
+    # wrong order and returns a plausible wrong answer.
+    path = (
+        AITER_CONFIGS.AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE_FILE
+        if bpreshuffle
+        else AITER_CONFIGS.AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_FILE
+    )
     try:
         df = pd.read_csv(path).drop_duplicates()
     except FileNotFoundError:
@@ -635,6 +653,8 @@ def _load_mxscale_bmm_tuned(libtype: str | None = None) -> dict:
         kid = int(opus_kids.at[index])
         arch = str(df.at[index, "gfx"]).lower().split(":", 1)[0]
         try:
+            if mxscale_bmm_kid_block(kid) != df.at[index, "w_scale_block"]:
+                raise ValueError("kid and weight-scale block disagree")
             split_k = _parse_mxscale_bmm_tuned_split_k(df.at[index, "splitK"])
             batch, m, n, k = (
                 int(df.at[index, column]) for column in ("b", "m", "n", "k")
@@ -668,6 +688,12 @@ def _load_mxscale_bmm_tuned(libtype: str | None = None) -> dict:
         )
         df = df.loc[~invalid_opus_rows].copy()
 
+    # w_scale_block is part of the key, not a note on the row: the same shape
+    # has a best 128x128 kid and a best 32x32 kid, and they are different
+    # kernels. Without it the two collide as duplicate shapes, and a lookup
+    # could hand a 128 kid a scale buffer with sixteen times the entries -- not
+    # a shape error downstream, just the wrong stride, so a plausible wrong
+    # answer at full speed.
     shape_keys = ["gfx", "b", "m", "n", "k", "w_scale_block"]
     duplicate_shapes = df.duplicated(subset=shape_keys, keep=False)
     if duplicate_shapes.any():
@@ -685,11 +711,19 @@ def lookup_mxscale_bmm_config(
     *,
     w_scale_block: str = "128x128",
     libtype: str | None = None,
+    bpreshuffle: bool = False,
 ):
-    """Return the exact or existing padded-M tuned row for one shape and
-    weight-scale block (OPUS kernels read 128x128)."""
+    """Return the exact or existing padded-M tuned row for one shape.
+
+    ``bpreshuffle`` picks the table, and therefore B's layout; see
+    _load_mxscale_bmm_tuned for why the two are separate files.
+
+    ``w_scale_block`` is the caller's weight-scale block ("128x128" or "32x32"
+    for OPUS), and it selects among rows rather than describing them: a row
+    tuned for one block is meaningless for the other.
+    """
     gfx = get_gfx()
-    tuned = _load_mxscale_bmm_tuned(libtype)
+    tuned = _load_mxscale_bmm_tuned(libtype, bpreshuffle)
     row, padded_m = None, m
     for gl in (None, 0, 1):
         padded_m = m if gl is None else get_padded_m(m, n, k, gl)
@@ -723,25 +757,197 @@ def lookup_mxscale_bmm_config(
     return row
 
 
-def _heuristic_mxscale_bmm_kid(g: int, m: int, n: int, k: int) -> int:
-    """Choose a final global kid only when the tuned table has no usable row."""
+def _validate_mxscale_bmm_group_size(group_size: int) -> None:
+    if group_size not in (32, 128):
+        raise ValueError(f"group_size must be 32 or 128, got {group_size!r}")
+
+
+def mxscale_bmm_group_of_block(w_scale_block: str) -> int:
+    """Return K grouping; use groups_of_block for weight-scale addressing."""
+    return mxscale_bmm_groups_of_block(w_scale_block)[1]
+
+
+def mxscale_bmm_groups_of_block(w_scale_block: str) -> tuple[int, int]:
+    groups = {"1x32": (1, 32), "32x32": (32, 32), "128x128": (128, 128)}
+    if w_scale_block not in groups:
+        raise ValueError(f"unsupported OPUS MXFP8 BMM scale block {w_scale_block!r}")
+    return groups[w_scale_block]
+
+
+def _heuristic_mxscale_bmm_kid(
+    g: int, m: int, n: int, k: int, *, group_size: int = 128
+) -> int:
+    """Choose a final global row-major kid when the tuned table has no usable row.
+
+    GROUP_K=32 takes each pick's twin (kid + 1000). The 256x256 pipeline tile
+    has none, so large M at 32 falls through to the 64x64 flatmm tile.
+    """
+    _validate_mxscale_bmm_group_size(group_size)
+    offset = 1000 if group_size == 32 else 0
 
     def divisible(value: int, divisor: int) -> bool:
         return value % divisor == 0
 
     if (
-        divisible(n, 256)
+        group_size == 128
+        and divisible(n, 256)
         and divisible(k, 128)
         and (m >= 2048 or (m >= 1024 and g >= 8))
     ):
         return 8158 if 4096 <= k <= 8192 else 8150
     if m < 64:
-        return 8640 if divisible(n, 64) and divisible(k, 256) else 8653
+        return offset + (8640 if divisible(n, 64) and divisible(k, 256) else 8653)
     if m <= 256 and k <= 1024 and divisible(n, 32) and divisible(k, 256):
-        return 8320
+        return offset + 8320
     if divisible(n, 64) and divisible(k, 128):
-        return 8653
-    return 8000
+        return offset + 8653
+    return offset + 8000
+
+
+# Preshuffled-B fallback candidates by M band, in local ids (GROUP_K=128 adds
+# 8000, GROUP_K=32 9000). The first of each band is what the tuned table picks
+# there most often at K=4096; the later ones only have to run where it cannot,
+# which is why each band ends in the 32-wide, 128-deep tiles that divide any N
+# and K the family accepts at all.
+# The launch plan does not model every family's prefetch depth (only flatmm's),
+# so the launcher can still reject a candidate for too few K tiles. The deepest
+# candidate prefetches 4 (the blds tile; the direct-B ones cap at 3), so a
+# candidate needs at least that many.
+_BPRESHUFFLE_FALLBACK_MIN_K_TILES = 4
+_BPRESHUFFLE_FALLBACK_BANDS = (
+    (64, (179, 398, 171, 338)),
+    (512, (171, 175, 338, 398)),
+    (None, (205, 348, 175, 338, 398)),
+)
+
+
+def _heuristic_mxscale_bmm_bpreshuffle_kid(
+    g: int,
+    m: int,
+    n: int,
+    k: int,
+    *,
+    group_size: int = 128,
+    group_n: int | None = None,
+    output_dtype="bf16",
+) -> int | None:
+    """A preshuffled-B kid that runs this shape, for a shape the table lacks.
+
+    Per-row K32 scales prefer larger tiles for sufficiently large output grids.
+    Every candidate is checked for admissibility; None when no candidate runs.
+    """
+    from csrc.opus_gemm.opus_gemm_common import a8w8_mxscale_bmm_kernels_list
+
+    _validate_mxscale_bmm_group_size(group_size)
+    group_n = group_size if group_n is None else group_n
+    block = f"{group_n}x{group_size}"
+    mxscale_bmm_groups_of_block(block)
+    if block == "1x32":
+        # The 64x64 tile amortizes operand/scale loads once there are enough
+        # output tiles. Smaller grids retain the decode tiles; tuned rows can
+        # additionally choose split-K. Keep K128/N16 alignment fallbacks.
+        wide_tiles = g * ((m + 63) // 64) * (n // 64)
+        preferred = (9713,) if m >= 64 and wide_tiles >= 256 else ()
+        if m >= 256:
+            preferred += (9703,)
+        for kid in (*preferred, 9700, 9704, 9708, 9710):
+            try:
+                _get_cached_a8w8_mxscale_bmm_plan(
+                    get_gfx(), kid, output_dtype, m, g, n, k, 1
+                )
+            except (TypeError, ValueError, OverflowError):
+                continue
+            return kid
+        return None
+    base = 9000 if group_size == 32 else 8000
+    candidates = next(
+        c for bound, c in _BPRESHUFFLE_FALLBACK_BANDS if bound is None or m <= bound
+    )
+    for local in candidates:
+        kid = base + local
+        if not (
+            mxscale_bmm_kid_group(kid) == group_size
+            and mxscale_bmm_kid_takes_b_layout(kid, True)
+            and mxscale_bmm_kid_takes_plain_scales(kid)
+            and mxscale_bmm_kid_runs_m(kid, m)
+            and k // a8w8_mxscale_bmm_kernels_list[kid].B_K
+            >= _BPRESHUFFLE_FALLBACK_MIN_K_TILES
+        ):
+            continue
+        try:
+            _get_cached_a8w8_mxscale_bmm_plan(
+                get_gfx(), kid, output_dtype, m, g, n, k, 1
+            )
+        except (TypeError, ValueError, OverflowError):
+            continue
+        return kid
+    return None
+
+
+# ---- kid admissibility -----------------------------------------------------
+#
+# Three properties of a kid that a caller cannot infer from the tensors it
+# holds, and that therefore have to be checked against the catalog before a kid
+# is dispatched. Two of them fail silently if they are not:
+#
+#   * B layout. A (16,16) preshuffled weight has the same shape, dtype and
+#     strides as a row-major one, so a mismatched kid reads the right bytes in
+#     the wrong order and returns a plausible wrong answer.
+#   * Scale layout. Same hazard: an M-packed or shuffle_scale panel holds the
+#     same bytes in another order.
+#   * M alignment. This one throws in the launcher, so it is the benign case.
+#
+# All three read the codegen catalog, which is also what the tuner filters on --
+# a hand-kept list here disagreed with the tuner's once and cost ~9% at the wo_a
+# decode shapes, so there is one source of truth on purpose.
+
+
+@cache
+def _mxscale_bmm_kid_table() -> dict[int, tuple[int, bool, bool, int, int]]:
+    """kid -> (m_align, needs_preshuffled_b, needs_host_rearranged_scales, GROUP_K)."""
+    from csrc.opus_gemm.opus_gemm_common import a8w8_mxscale_bmm_kernel_lists
+
+    return {
+        int(kid): (
+            int(inst.m_align),
+            bool(inst.needs_preshuffled_b),
+            bool(inst.needs_mpacked_sfa or inst.needs_shuffle_scale),
+            int(inst.GROUP_K),
+            int(inst.GROUP_N),
+        )
+        for fam in a8w8_mxscale_bmm_kernel_lists
+        for kid, inst in fam.items()
+    }
+
+
+def mxscale_bmm_kid_runs_m(kid: int, m: int) -> bool:
+    """True iff kid's launcher accepts this M. Unknown kid -> False."""
+    entry = _mxscale_bmm_kid_table().get(int(kid))
+    return entry is not None and m % entry[0] == 0
+
+
+def mxscale_bmm_kid_takes_b_layout(kid: int, b_preshuffled: bool) -> bool:
+    """True iff kid wants B in the layout the caller says it has."""
+    entry = _mxscale_bmm_kid_table().get(int(kid))
+    return entry is not None and entry[1] == bool(b_preshuffled)
+
+
+def mxscale_bmm_kid_takes_plain_scales(kid: int) -> bool:
+    """True iff kid reads x_scale / w_scale as the public entry passes them."""
+    entry = _mxscale_bmm_kid_table().get(int(kid))
+    return entry is not None and not entry[2]
+
+
+def mxscale_bmm_kid_group(kid: int) -> int | None:
+    """The kid's quantisation block (GROUP_K), or None for an unknown kid."""
+    entry = _mxscale_bmm_kid_table().get(int(kid))
+    return None if entry is None else entry[3]
+
+
+def mxscale_bmm_kid_block(kid: int) -> str | None:
+    """Complete weight-scale block, including independent N grouping."""
+    entry = _mxscale_bmm_kid_table().get(int(kid))
+    return None if entry is None else f"{entry[4]}x{entry[3]}"
 
 
 def resolve_a8w8_mxscale_bmm_plan(
@@ -749,9 +955,14 @@ def resolve_a8w8_mxscale_bmm_plan(
     m: int,
     n: int,
     k: int,
+    *,
+    w_scale_block: str = "128x128",
 ) -> tuple[int, int]:
-    """Resolve one final global kid/split pair for the high-level caller."""
-    config = lookup_mxscale_bmm_config(g, m, n, k)
+    """Resolve one final global kid/split pair for the caller's scale blocks."""
+    group_size = mxscale_bmm_group_of_block(w_scale_block)
+    if w_scale_block == "1x32":
+        raise ValueError("1x32 OPUS BMM requires the preshuffled-weight entry")
+    config = lookup_mxscale_bmm_config(g, m, n, k, w_scale_block=w_scale_block)
     libtype = config.get("libtype", "opus") if config is not None else "opus"
     if libtype != "opus":
         raise NotImplementedError(
@@ -761,6 +972,15 @@ def resolve_a8w8_mxscale_bmm_plan(
     if config is not None:
         try:
             kid = int(config["kernelId"])
+            if not (
+                mxscale_bmm_kid_takes_b_layout(kid, False)
+                and mxscale_bmm_kid_takes_plain_scales(kid)
+            ):
+                raise ValueError(
+                    f"kid {kid} wants a preshuffled B or host-rearranged scales"
+                )
+            if mxscale_bmm_kid_group(kid) != group_size:
+                raise ValueError(f"kid {kid} does not take group_size={group_size}")
             split_k = _parse_mxscale_bmm_tuned_split_k(config["splitK"])
             plan = _get_cached_a8w8_mxscale_bmm_plan(
                 get_gfx(),
@@ -788,13 +1008,20 @@ def resolve_a8w8_mxscale_bmm_plan(
         else:
             return plan.resolved_kid, plan.abi_split_k
 
-    kid = _heuristic_mxscale_bmm_kid(g, m, n, k)
+    kid = _heuristic_mxscale_bmm_kid(g, m, n, k, group_size=group_size)
     return kid, 1
 
 
 __all__ = [
     "lookup_a16w16_opus_config",
     "lookup_mxscale_bmm_config",
+    "mxscale_bmm_group_of_block",
+    "mxscale_bmm_groups_of_block",
+    "mxscale_bmm_kid_block",
+    "mxscale_bmm_kid_group",
+    "mxscale_bmm_kid_runs_m",
+    "mxscale_bmm_kid_takes_b_layout",
+    "mxscale_bmm_kid_takes_plain_scales",
     "resolve_a8w8_mxscale_bmm_plan",
     "resolve_a16w16_caller_candidate",
     "resolve_a16w16_heuristic_candidate",

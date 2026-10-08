@@ -114,6 +114,18 @@ def perftest(
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
                     data = run_iters_rotate(num_iters, func, rotate_args)
+                # Warm the replay and, above all, join it before the profiler
+                # closes. The eager path above synchronizes inside its own
+                # profile block; this one did not, so the profiler stopped
+                # collecting while the replay's kernels were still in flight and
+                # get_trace_perf divided whatever fraction had landed by the full
+                # num_iters. It does not fail, it returns a small number: a tuner
+                # sweep of the mxscale BMM table had 70 of its 80 graph-timed
+                # shapes report a sub-microsecond candidate against a 12-16 us
+                # truth, and since the fastest candidate wins a cell, those bogus
+                # times took 28 of 680 rows -- handing m=1 to a 128-row tile.
+                run_iters(1, graph.replay)
+                torch.cuda.synchronize()
                 with tpf.profile(
                     activities=[tpf.ProfilerActivity.CPU, tpf.ProfilerActivity.CUDA],
                     profile_memory=True,
@@ -121,8 +133,22 @@ def perftest(
                     with_modules=True,
                 ) as prof:
                     run_iters(1, graph.replay)
-                avg = get_trace_perf(prof, num_iters)
-                logger.info(f"avg: {avg} us/iter with hipgraph")
+                    torch.cuda.synchronize()
+                graph_avg = get_trace_perf(prof, num_iters)
+                # Even joined, roctracer does not reliably account a replay's
+                # kernels: the larger shapes still come back at 0.0 or 0.036 us
+                # with post_process_data printing "data missed". Capturing a
+                # graph only removes launch overhead, so it cannot halve a
+                # kernel -- anything that says it did is a lost trace, and the
+                # eager number already in hand is the honest one.
+                if 0.5 * avg <= graph_avg <= 1.5 * avg:
+                    avg = graph_avg
+                    logger.info(f"avg: {avg} us/iter with hipgraph")
+                else:
+                    logger.warning(
+                        f"hipgraph trace gave {graph_avg} us/iter against eager's "
+                        f"{avg}; keeping eager"
+                    )
 
             if os.environ.get("AITER_SMI_MONITOR", "0") == "1":
                 # Import lazily: normal library/test use has no amdsmi dependency.

@@ -15,6 +15,7 @@ from csrc.opus_gemm.opus_gemm_common import (
     GFX942_EVEN_LOOP_SPLITK_TAGS,
     GFX942_MAX_AUTO_SPLIT_K,
     GFX942_MIN_ITERS_PER_SPLIT,
+    OPUS_KERNEL_TAGS_BY_ARCH_FAMILY,
     SPLITK_KIDS,
     OpusGemmInstance,
     a8w8_mxscale_flatmm_prefetch_k_iter,
@@ -454,22 +455,30 @@ _A8W8_BLOCKSCALE_FAMILY = "a8w8_blockscale"
 _A8W8_BPRESHUFFLE_FAMILY = "a8w8_blockscale_bpreshuffle"
 _A8W8_MXSCALE_BMM_FAMILY = "a8w8_mxscale_bmm"
 
+# Derived, not restated. This used to be a second hand-kept copy of the tag list
+# in OPUS_KERNEL_TAGS_BY_ARCH_FAMILY, and the two drifted the moment the
+# preshuffled-B families were added: get_kernel_instance consults the catalog's
+# copy first and rejected every preshuffled kid as "no registered OPUS kernel",
+# so adding the tags here alone changed nothing and the failure pointed at a
+# missing kernel rather than a missing list entry.
+#
+# Union across arches: this set is only used to answer "is this kid an MXFP8
+# BMM kernel at all", and the arch check has already happened in
+# get_kernel_instance by the time it is consulted.
 _A8W8_MXSCALE_BMM_TAGS = frozenset(
-    {
-        "a8w8_mxscale_bmm_flatmm_splitk",
-        "a8w8_mxscale_bmm_fused",
-        "a8w8_mxscale_bmm_minterleave",
-        "a8w8_mxscale_bmm_mouter",
-        "a8w8_mxscale_bmm_mouter_tunable",
-        "a8w8_mxscale_bmm_pipeline",
-        "a8w8_mxscale_bmm_wave8n2",
-        "a8w8_mxscale_bmm_wave4m2_selfload",
-    }
+    tag
+    for arch_families in OPUS_KERNEL_TAGS_BY_ARCH_FAMILY.values()
+    for tag in arch_families.get(_A8W8_MXSCALE_BMM_FAMILY, ())
 )
+# The preshuffled-B bdirect/blds kids run the same flatmm split-K kernel and
+# launcher as flatmm_splitk, so they take its FP32 partials workspace too.
 _A8W8_MXSCALE_BMM_WORKSPACE_TAGS = frozenset(
     {
         "a8w8_mxscale_bmm_flatmm_splitk",
         "a8w8_mxscale_bmm_fused",
+        "a8w8_mxscale_bmm_bpreshuffle_bdirect",
+        "a8w8_mxscale_bmm_bpreshuffle_blds",
+        "a8w8_mxscale_bmm_bpreshuffle_wave1",
     }
 )
 _A8W8_MXSCALE_BMM_PREFETCH_TAGS = _A8W8_MXSCALE_BMM_WORKSPACE_TAGS | frozenset(
@@ -658,6 +667,25 @@ def _build_a8w8_mxscale_bmm_plan(
             f"got {requested_split_k}"
         )
     abi_split_k = max(1, requested_split_k)
+    if tag == "a8w8_mxscale_bmm_bpreshuffle_compact":
+        if not (
+            0 < M < 2048
+            and 0 < batch <= 16
+            and 0 < N <= (1 << 31) - 1
+            and 0 < K <= (1 << 31) - 1
+        ):
+            raise ValueError(
+                f"OPUS compact kid {resolved_kid} requires M in [1,2047], "
+                "batch in [1,16], positive int32 N and K"
+            )
+        if N % 128:
+            raise ValueError(f"OPUS compact kid {resolved_kid} requires N % 128 == 0")
+        output_bytes = 2 if output_dtype == torch.bfloat16 else 4
+        if max(M * batch * K, N * K, M * batch * N * output_bytes) > (1 << 31) - 1:
+            raise ValueError(
+                f"OPUS compact kid {resolved_kid} requires byte spans to fit signed int32"
+            )
+
     if min(M, batch, N, K) <= 0:
         raise ValueError(
             "OPUS BMM requires positive M, batch, N and K; "

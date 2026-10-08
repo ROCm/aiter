@@ -1813,9 +1813,15 @@ def _write_ninja_file(
     if with_cuda:
         cuda_compile_rule = ["rule cuda_compile"]
         nvcc_gendeps = ""
+        # Track HIP header dependencies so Ninja rebuilds affected objects.
+        if IS_HIP_EXTENSION:
+            nvcc_gendeps = "-MMD -MF $out.d"
         cuda_compile_rule.append(
             f"  command = $nvcc {nvcc_gendeps} $cuda_cflags -c $in -o $out $cuda_post_cflags"
         )
+        if IS_HIP_EXTENSION:
+            cuda_compile_rule.append("  depfile = $out.d")
+            cuda_compile_rule.append("  deps = gcc")
 
     # Emit one build rule per source to enable incremental build.
     # Optional per-source override: ninja allows variable bindings under a
