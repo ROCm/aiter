@@ -90,9 +90,7 @@ def _gfx1250_exact_sigmoid_topk(
     need_renorm: bool,
     routed_scaling_factor: float,
 ) -> None:
-    from .triton.moe.moe_routing.exact_sigmoid_topk import (
-        exact_sigmoid_biased_topk,
-    )
+    from .triton.moe.moe_routing.topk import exact_sigmoid_biased_topk
 
     exact_sigmoid_biased_topk(
         gating_output,
