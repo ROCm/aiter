@@ -2,12 +2,15 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """CPU behavior at the retune input/artifact and OS scheduling boundaries."""
 
+import copy
 import csv
 import importlib.util
 import tempfile
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 SCRIPT = Path(__file__).resolve().parents[2] / "docs/a8w4_work/run_serial_retune.py"
 
@@ -133,6 +136,62 @@ class TestRetuneInputs(unittest.TestCase):
 
 
 class TestSerialScheduler(unittest.TestCase):
+    def test_idle_hip_context_does_not_hide_active_or_unknown_gpu_resources(self):
+        workflow = load_workflow()
+        zero_context = {
+            "pid": 21,
+            "name": "python3",
+            "mem": 0,
+            "engine_usage": {"gfx": 0, "enc": 0},
+            "memory_usage": {"gtt_mem": 0, "cpu_mem": 0, "vram_mem": 0},
+            "cu_occupancy": 0,
+        }
+        jobs = [zero_context]
+        smi = SimpleNamespace(
+            amdsmi_init=lambda: None,
+            amdsmi_shut_down=lambda: None,
+            amdsmi_get_processor_handles=lambda: ["gpu"],
+            amdsmi_get_gpu_device_bdf=lambda handle: "0000:05:00.0",
+            amdsmi_get_gpu_asic_info=lambda handle: {
+                "target_graphics_version": "gfx950"
+            },
+            amdsmi_get_gpu_activity=lambda handle: {"gfx_activity": 1},
+            amdsmi_get_gpu_process_list=lambda handle: copy.deepcopy(jobs),
+            amdsmi_get_gpu_memory_usage=lambda *args: 298 * 1024**2,
+            amdsmi_get_gpu_memory_total=lambda *args: 192 * 1024**3,
+            AmdSmiMemoryType=SimpleNamespace(VRAM=1),
+        )
+
+        def bdf_probe(buffer, _size, _gpu):
+            buffer.value = b"0000:05:00.0"
+            return 0
+
+        hip = SimpleNamespace(hipDeviceGetPCIBusId=bdf_probe)
+        with patch.object(
+            workflow.importlib, "import_module", return_value=smi
+        ), patch.object(workflow.ctypes, "CDLL", return_value=hip), patch.object(
+            workflow.time, "sleep", return_value=None
+        ):
+            samples = workflow.LaunchSystem().gpu_snapshot([2])
+            self.assertTrue(all(row["idle"] for row in samples))
+            self.assertEqual(samples[0]["processes"], [zero_context])
+            self.assertEqual(samples[0]["idle_context_pids"], [21])
+            jobs[0] = dict(
+                zero_context,
+                memory_usage=dict(zero_context["memory_usage"], vram_mem=4096),
+            )
+            self.assertTrue(
+                all(
+                    not row["idle"] for row in workflow.LaunchSystem().gpu_snapshot([2])
+                )
+            )
+            jobs[0] = dict(zero_context, cu_occupancy=None)
+            self.assertTrue(
+                all(
+                    not row["idle"] for row in workflow.LaunchSystem().gpu_snapshot([2])
+                )
+            )
+
     def test_executed_python_entry_excludes_formatter_input_files(self):
         workflow = load_workflow()
         self.assertEqual(
