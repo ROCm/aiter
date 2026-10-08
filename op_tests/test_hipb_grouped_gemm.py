@@ -4,15 +4,18 @@
 import pytest
 import torch
 
+import aiter.ops.sonicmoe as sonicmoe_dispatch
 import aiter.ops.triton.moe.sonicmoe as grouped_gemm_module
 from aiter.ops.gradlib import hipb_grouped_mm, hipb_multistream_mm
-from aiter.ops.triton.moe.sonicmoe import (
-    ActivationType,
+from aiter.ops.sonicmoe import (
     _registered_host_cu_seqlens,
     clear_registered_host_cu_seqlens,
     grouped_gemm,
-    moe_pre_routed_inputs,
     register_host_cu_seqlens,
+)
+from aiter.ops.triton.moe.sonicmoe import (
+    ActivationType,
+    moe_pre_routed_inputs,
 )
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
@@ -348,7 +351,6 @@ def test_triton_dispatch_unwraps_local_tensors(monkeypatch):
         assert out is local_out
         return out
 
-    monkeypatch.setenv("SONIC_MOE_GROUPED_GEMM_BACKEND", "triton")
     monkeypatch.setattr(grouped_gemm_module, "_grouped_gemm_triton", fake_triton)
     result = grouped_gemm_module.grouped_gemm(
         LocalTensorWrapper(local_a),
@@ -452,7 +454,7 @@ def test_auto_backend_falls_back_to_triton(monkeypatch):
     def unavailable(*_args, **_kwargs):
         raise RuntimeError("hipblaslt unavailable")
 
-    monkeypatch.setattr(grouped_gemm_module, "_grouped_gemm_hipblaslt", unavailable)
+    monkeypatch.setattr(sonicmoe_dispatch, "_grouped_gemm_hipblaslt", unavailable)
     monkeypatch.setenv("SONIC_MOE_GROUPED_GEMM_BACKEND", "auto")
     actual = grouped_gemm(a, b, offsets)
     torch.testing.assert_close(actual, expected)
@@ -484,14 +486,14 @@ def test_pre_routed_backend_matches_triton(monkeypatch, backend):
         monkeypatch.setenv("SONIC_MOE_GROUPED_GEMM_BACKEND", selected)
         seen_host = {}
         if selected == "multistream":
-            real_lookup = grouped_gemm_module._registered_host_cu_seqlens
+            real_lookup = sonicmoe_dispatch._registered_host_cu_seqlens
 
             def spy(cu_seqlens):
                 host = real_lookup(cu_seqlens)
                 seen_host["value"] = host
                 return host
 
-            monkeypatch.setattr(grouped_gemm_module, "_registered_host_cu_seqlens", spy)
+            monkeypatch.setattr(sonicmoe_dispatch, "_registered_host_cu_seqlens", spy)
         out, _ = moe_pre_routed_inputs(
             cloned[0],
             cloned[1],
