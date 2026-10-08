@@ -3052,8 +3052,8 @@ def test_fused_qk_norm_rope_cache_pts_q_fp8(head_size, q_scale_val, eps=1e-6):
     cos_sin = torch.randn(8, head_size, dtype=dtype, device=dev)
     positions = torch.zeros(nt, dtype=torch.int64, device=dev)
     slot_mapping = torch.zeros(nt, dtype=torch.int64, device=dev)
-    k_scale = torch.ones(1, dtype=torch.float32, device=dev)
-    v_scale = torch.ones(1, dtype=torch.float32, device=dev)
+    k_scale = torch.ones(1, dtype=torch.float32, device="cpu")
+    v_scale = torch.ones(1, dtype=torch.float32, device="cpu")
     q_scale = torch.full((1,), q_scale_val, dtype=torch.float32, device=dev)
     x = 16 // torch.empty(0, dtype=cache_dtype).element_size()
 
@@ -3141,8 +3141,8 @@ def test_fused_qk_norm_rope_cache_pts_q_fp8_scale_ordering(head_size=128, eps=1e
     q_out_fp8 = torch.empty(nt, hq * head_size, dtype=fp8, device=dev)
     k_cache = torch.zeros(1, 1, hk, head_size, dtype=fp8, device=dev)
     v_cache = torch.zeros(1, 1, hv, head_size, dtype=fp8, device=dev)
-    k_scale = torch.ones(1, dtype=torch.float32, device=dev)
-    v_scale = torch.ones(1, dtype=torch.float32, device=dev)
+    k_scale = torch.ones(1, dtype=torch.float32, device="cpu")
+    v_scale = torch.ones(1, dtype=torch.float32, device="cpu")
     q_scale = torch.ones(1, dtype=torch.float32, device=dev)
 
     def launch():
