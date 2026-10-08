@@ -195,8 +195,11 @@ class KVLoader:
 
     Plain layout: K/V = [num_blks, blk_size, num_kv_heads, head_size], the block
     table is indexed per token, so a tile may straddle pages.
-    Shuffled layout: a tile is exactly one page, read as TILE_SIZE * HEAD_SIZE_PADDED
-    contiguous elements and un-shuffled in registers.
+    Shuffled layout: K = [num_blks, num_kv_heads, head_size // W, blk_size, W],
+    V = [num_blks, num_kv_heads, blk_size // W, head_size, W]. A tile of exactly
+    one page is read as TILE_SIZE * HEAD_SIZE_PADDED contiguous elements, any other
+    tile is read page by page (or as part of one page); all are un-shuffled in
+    registers.
     """
 
     cfg: AttentionConfig
@@ -351,7 +354,57 @@ class KVLoader:
         k_mask = None
         v_mask = None
         other = None
-        if cfg.SHUFFLED_KV_CACHE:
+        if cfg.SHUFFLED_KV_CACHE and cfg.TILE_SIZE < cfg.BLOCK_SIZE:
+            # Part of one page: K is HEAD_SIZE // W runs of TILE_SIZE * W
+            # elements, V a single run of TILE_SIZE * HEAD_SIZE_PADDED.
+            W: tl.constexpr = cfg.K_WIDTH
+            in_page = (j * cfg.TILE_SIZE) % cfg.BLOCK_SIZE
+            physical_block_idx_shfl = tl.load(
+                self.block_tables_ptr
+                + self.block_table_offset
+                + (j * cfg.TILE_SIZE) // cfg.BLOCK_SIZE
+            ).to(tl.int64)
+            offs_k_runs = (
+                tl.arange(0, cfg.HEAD_SIZE_PADDED // W)[:, None] * (cfg.BLOCK_SIZE * W)
+                + tl.arange(0, cfg.TILE_SIZE * W)[None, :]
+            )
+            k_offset = (
+                physical_block_idx_shfl * self.stride_k_cache_0
+                + self.kv_head_idx * self.stride_k_cache_1
+                + in_page * W
+                + offs_k_runs
+            )
+            v_offset = (
+                physical_block_idx_shfl * self.stride_v_cache_0
+                + self.kv_head_idx * self.stride_v_cache_1
+                + (in_page // W) * self.stride_v_cache_2
+                + self.offs_shfl
+            )
+        elif cfg.SHUFFLED_KV_CACHE and cfg.TILE_SIZE > cfg.BLOCK_SIZE:
+            # Several pages, each read as BLOCK_SIZE * HEAD_SIZE_PADDED contiguous
+            # elements. Pages past the prefix are masked, which also keeps the
+            # block table read inside this sequence.
+            NUM_PAGES: tl.constexpr = cfg.TILE_SIZE // cfg.BLOCK_SIZE
+            pages = j * NUM_PAGES + tl.arange(0, NUM_PAGES)
+            page_mask = pages * cfg.BLOCK_SIZE < self.max_seq_prefix_len
+            physical_block_idx_shfl = tl.load(
+                self.block_tables_ptr + self.block_table_offset + pages,
+                mask=page_mask,
+                other=0,
+            ).to(tl.int64)
+            offs_page = tl.arange(0, cfg.BLOCK_SIZE * cfg.HEAD_SIZE_PADDED)
+            k_offset = (
+                physical_block_idx_shfl * self.stride_k_cache_0
+                + self.kv_head_idx * self.stride_k_cache_1
+            )[:, None] + offs_page[None, :]
+            v_offset = (
+                physical_block_idx_shfl * self.stride_v_cache_0
+                + self.kv_head_idx * self.stride_v_cache_1
+            )[:, None] + offs_page[None, :]
+            k_mask = page_mask[:, None]
+            v_mask = page_mask[:, None]
+            other = 0.0
+        elif cfg.SHUFFLED_KV_CACHE:
             physical_block_idx_shfl = tl.load(
                 self.block_tables_ptr + self.block_table_offset + j
             ).to(tl.int64)
@@ -405,7 +458,19 @@ class KVLoader:
         )
 
         K = K_load.to(target_dtype)
-        if cfg.SHUFFLED_KV_CACHE:
+        if cfg.SHUFFLED_KV_CACHE and cfg.TILE_SIZE > cfg.BLOCK_SIZE:
+            K = (
+                K.reshape(
+                    cfg.TILE_SIZE // cfg.BLOCK_SIZE,
+                    cfg.HEAD_SIZE_PADDED // cfg.K_WIDTH,
+                    cfg.BLOCK_SIZE,
+                    cfg.K_WIDTH,
+                )
+                .permute(0, 2, 1, 3)
+                .reshape(cfg.TILE_SIZE, cfg.HEAD_SIZE_PADDED)
+                .trans(1, 0)
+            )
+        elif cfg.SHUFFLED_KV_CACHE:
             K = (
                 K.reshape(
                     cfg.HEAD_SIZE_PADDED // cfg.K_WIDTH,
@@ -982,6 +1047,11 @@ def kernel_unified_attention(
     tl.static_assert(
         GRID_3D or NUM_SEGMENTS_PER_SEQ == 1,
         "NUM_SEGMENTS_PER_SEQ > 1 needs the 3d grid",
+    )
+    tl.static_assert(
+        not SHUFFLED_KV_CACHE
+        or (TILE_SIZE % K_WIDTH == 0 and BLOCK_SIZE % K_WIDTH == 0),
+        "SHUFFLED_KV_CACHE needs TILE_SIZE and BLOCK_SIZE to be multiples of K_WIDTH",
     )
 
     if GRID_3D:

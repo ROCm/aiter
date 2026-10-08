@@ -549,6 +549,96 @@ def test_triton_unified_attn_3d(
     )
 
 
+@pytest.mark.parametrize(
+    "seq_lens, block_size, dtype",
+    [
+        # prefill (2d) and decode (3d), tile wider than a page and inside one
+        ([(1, 1328), (300, 800), (37, 37)], 16, torch.bfloat16),
+        ([(1, 1328), (300, 800), (37, 37)], 128, torch.bfloat16),
+        ([(1, 8192)] * 4, 16, torch.bfloat16),
+        ([(1, 8192)] * 4, 128, torch.bfloat16),
+        ([(1, 1328), (300, 800), (37, 37)], 16, e4m3_dtype),
+    ],
+)
+@torch.inference_mode()
+def test_triton_unified_attn_shuffled_tile(
+    seq_lens: list[tuple[int, int]], block_size: int, dtype: torch.dtype
+) -> None:
+    # the triton kernels gather a shuffled tile per token when it is not one page
+    num_heads = (16, 2)
+    (
+        query,
+        key_cache,
+        value_cache,
+        shuffled_key_cache,
+        shuffled_value_cache,
+        sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        _,
+        _,
+        q_descale,
+        k_descale,
+        v_descale,
+        output_scale,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=4096,
+        block_size=block_size,
+        head_size=128,
+        num_heads=num_heads,
+        q_dtype=dtype,
+        kv_dtype=dtype,
+        shuffled_kv_cache=True,
+        device="cuda",
+    )
+
+    unified_attention(
+        q=query,
+        k=shuffled_key_cache,
+        v=shuffled_value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        sinks=sinks,
+        shuffled_kv_cache=True,
+        backend="triton",
+    )
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        query_lens=[x[0] for x in seq_lens],
+        kv_lens=kv_lens,
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        sinks=sinks,
+    )
+    atol, rtol = (1.5e-2, 1e-2) if dtype == torch.bfloat16 else (1.5e-1, 1.5e-1)
+    torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol)
+
+
 @torch.inference_mode()
 def test_triton_unified_attn_3d_one_segment() -> None:
     # a decode batch of exactly target_num_prgms programs stays on the 3d grid

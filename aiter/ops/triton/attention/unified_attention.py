@@ -254,11 +254,9 @@ def unified_attention(
         SCALE_K_WIDTH = 4
 
     if shuffled_kv_cache:
-        # A shuffled tile is exactly one page (the kernels index the block table
-        # per tile and read TILE_SIZE * HEAD_SIZE_PADDED contiguous elements), so
-        # TILE_SIZE is pinned to block_size and has to be a power of 2 for the
-        # tl.arange over the tile. Non-shuffled pages have no such constraint:
-        # there the block table is indexed per token, so a tile may straddle pages.
+        # The kernels read a one-page shuffled tile as TILE_SIZE * HEAD_SIZE_PADDED
+        # contiguous elements and gather any other tile per token. Shuffled pages
+        # are kept to powers of 2; non-shuffled pages have no such constraint.
         assert block_size & (block_size - 1) == 0, (
             "Unified Attention with pre-shuffled KV cache requires a power-of-2 "
             f"page, got block_size={block_size}"
@@ -371,13 +369,7 @@ def unified_attention(
             "kv_split", params, backend="gluon" if use_gluon_3d else "triton"
         )
         NUM_SEGMENTS = config["NUM_SEGMENTS"]
-        # The triton kernels read a shuffled tile as one contiguous page, so
-        # there the tile is the page. The gfx950 gluon loader gathers per token
-        # and keeps its tuned tile.
-        if shuffled_kv_cache and not use_gluon_3d:
-            TILE_SIZE = block_size
-        else:
-            TILE_SIZE = config["TILE_SIZE"]
+        TILE_SIZE = config["TILE_SIZE"]
 
         if NUM_SEGMENTS > 1:
             segm_output = torch.empty(
@@ -532,21 +524,18 @@ def is_reduce_gluon_available(params: _UAParams, NUM_SEGMENTS, backend: str):
 
 
 def _unified_attention_2d_triton(params: _UAParams):
-    if params.shuffled_kv_cache and (
-        params.q_dtype == e4m3_dtype and params.kv_cache_dtype == e4m3_dtype
-    ):
-        assert (
-            params.block_size >= 32
-        ), "For A8W8 Unified Attention with pre-shuffled KV cache, only block_size >= 32 is supported"
-
     config = get_unified_attention_config("attn_2d", params, backend="triton")
     config["BLOCK_M"] = max(
         config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv)
     )
     config["BLOCK_Q"] = config["BLOCK_M"] // params.num_queries_per_kv
     assert config["BLOCK_Q"] >= 1
-    if params.shuffled_kv_cache:
-        config["TILE_SIZE"] = params.block_size
+    if params.shuffled_kv_cache and (
+        params.q_dtype == e4m3_dtype and params.kv_cache_dtype == e4m3_dtype
+    ):
+        assert (
+            config["TILE_SIZE"] >= 32
+        ), "For A8W8 Unified Attention with pre-shuffled KV cache, only TILE_SIZE >= 32 is supported"
     if params.all_decode:
         total_num_q_blocks = params.num_seqs
     else:
