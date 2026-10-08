@@ -3,6 +3,7 @@
 
 # user interface
 
+import functools
 import math
 
 import torch
@@ -30,6 +31,14 @@ def _topk_plain(
 
 @compile_ops("module_topk_plain")
 def topk_plain_workspace_size(numRows: int, stride0: int, k: int) -> int: ...
+
+
+@functools.lru_cache(maxsize=1024)
+def _workspace_size(device, rows: int, stride0: int, topk: int) -> int:
+    # A size query costs a call several microseconds. The size depends on
+    # nothing but these; the device is in the key because the radix plan reads
+    # its CU count.
+    return topk_plain_workspace_size(rows, stride0, topk)
 
 
 # Mirrors buffer_load_helpers::MAX_CAPACITY in csrc/kernels/topk_plain_kernels.cu.
@@ -135,7 +144,7 @@ def topk_plain(
     if x.dtype == torch.float32:
         # Mirror the C++ default: stride0 < 0 means a contiguous last dim.
         s0 = stride0 if stride0 >= 0 else x.shape[-1]
-        size = topk_plain_workspace_size(x.shape[0], s0, topk)
+        size = _workspace_size(x.device, x.shape[0], s0, topk)
         workspace = get_topk_scratch_workspace(x.device, size)
     return _topk_plain(
         x,
