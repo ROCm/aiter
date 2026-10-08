@@ -6,8 +6,6 @@ import subprocess
 import sys
 import textwrap
 
-import pytest
-
 
 def test_str2dtype_base_types_do_not_import_native_enum():
     script = textwrap.dedent(
@@ -37,4 +35,4 @@ def test_str2dtype_base_types_do_not_import_native_enum():
 
 
 if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__]))
+    test_str2dtype_base_types_do_not_import_native_enum()
