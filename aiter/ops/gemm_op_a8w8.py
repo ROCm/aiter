@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
+import importlib
 import math
 import operator
 from pathlib import Path
@@ -63,6 +64,127 @@ def _ck_a8w8_supported() -> bool:
         return get_gfx().startswith("gfx9")
     except Exception:  # noqa: BLE001
         return True
+
+
+def _flydsl_rdna3_a8w8_shape_supported(
+    m: int,
+    n: int,
+    k: int,
+    lda: int,
+    ldb: int,
+    dtype: torch.dtype,
+) -> bool:
+    if (
+        m == 0
+        or n < 64
+        or n % 64
+        or k < 128
+        or k > 131071
+        or k % 64
+        or lda < k
+        or ldb < k
+        or lda % 16
+        or ldb % 16
+        or dtype not in (torch.float32, torch.bfloat16, torch.float16)
+    ):
+        return False
+
+    block_m = 64
+    padded_m = ((m + block_m - 1) // block_m) * block_m
+    element_size = {torch.float32: 4, torch.bfloat16: 2, torch.float16: 2}[dtype]
+    return all(
+        span < 2**32
+        for span in (
+            ((padded_m - 1) * lda + k),
+            ((n - 1) * ldb + k),
+            ((padded_m - 1) * n + n) * element_size,
+        )
+    )
+
+
+def _flydsl_rdna3_a8w8_supported(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    bias: Tensor | None,
+    dtype: torch.dtype,
+    splitK: int | None,
+) -> bool:
+    """Whether the RDNA3 FlyDSL WMMA kernel covers this A8W8 call."""
+    try:
+        arch = str(torch.cuda.get_device_properties(XQ.device).gcnArchName).split(":")[0]
+    except Exception:  # noqa: BLE001
+        return False
+    if not arch.startswith("gfx11"):
+        return False
+
+    if (
+        bias is not None
+        or splitK is not None
+        or XQ.ndim != 2
+        or WQ.ndim != 2
+        or XQ.dtype != torch.int8
+        or WQ.dtype != torch.int8
+        or dtype not in (torch.float32, torch.bfloat16, torch.float16)
+    ):
+        return False
+
+    m, k = XQ.shape
+    n, w_k = WQ.shape
+    if k != w_k or XQ.stride(1) != 1 or WQ.stride(1) != 1:
+        return False
+
+    if (
+        x_scale.dtype != torch.float32
+        or w_scale.dtype != torch.float32
+        or tuple(x_scale.shape) not in ((m,), (m, 1))
+        or tuple(w_scale.shape) not in ((n,), (n, 1), (1, n))
+        or not x_scale.is_contiguous()
+        or not w_scale.is_contiguous()
+        or XQ.device != WQ.device
+        or XQ.device != x_scale.device
+        or XQ.device != w_scale.device
+        or not XQ.is_cuda
+        or not WQ.is_cuda
+        or not x_scale.is_cuda
+        or not w_scale.is_cuda
+    ):
+        return False
+
+    return _flydsl_rdna3_a8w8_shape_supported(
+        m,
+        n,
+        k,
+        XQ.stride(0),
+        WQ.stride(0),
+        dtype,
+    )
+
+
+def _try_flydsl_rdna3_a8w8(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    bias: Tensor | None,
+    dtype: torch.dtype,
+    splitK: int | None,
+) -> Tensor | None:
+    if not _flydsl_rdna3_a8w8_supported(
+        XQ, WQ, x_scale, w_scale, bias, dtype, splitK
+    ):
+        return None
+
+    try:
+        flydsl_gemm = importlib.import_module(
+            ".flydsl.rdna3_int8_gemm", package="aiter.ops"
+        ).gemm_a8w8_rdna3
+    except (ImportError, OSError):
+        return None
+
+    out = torch.empty((XQ.shape[0], WQ.shape[0]), dtype=dtype, device=XQ.device)
+    return flydsl_gemm(XQ, WQ, x_scale, w_scale, out)
 
 
 def gen_gemm_a8w8_ck_fake_tensors(
@@ -630,6 +752,12 @@ def gemm_a8w8(
     #     dtypes.bf16,
     #     dtypes.fp16,
     # ], f"Output {dtype=} is currently not supported in gemm_a8w8"
+    flydsl_result = _try_flydsl_rdna3_a8w8(
+        XQ, WQ, x_scale, w_scale, bias, dtype, splitK
+    )
+    if flydsl_result is not None:
+        return flydsl_result
+
     if not _ck_a8w8_supported():
         # RDNA (gfx11/gfx12): the CK/asm a8w8 kernel is unavailable; route to the
         # portable Triton kernel. Registered/faked via @torch_compile_guard above,

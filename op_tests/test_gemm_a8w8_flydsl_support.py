@@ -1,0 +1,256 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from aiter.ops import gemm_op_a8w8
+from aiter.ops.gemm_op_a8w8 import (
+    _flydsl_rdna3_a8w8_shape_supported,
+    _try_flydsl_rdna3_a8w8,
+)
+
+
+class _Tensor:
+    def __init__(self, shape, dtype, *, stride=None, contiguous=True):
+        self.shape = shape
+        self.ndim = len(shape)
+        self.dtype = dtype
+        self.device = "cuda:0"
+        self.is_cuda = True
+        self._stride = stride or (shape[1], 1)
+        self._contiguous = contiguous
+
+    def stride(self, dim):
+        return self._stride[dim]
+
+    def is_contiguous(self):
+        return self._contiguous
+
+
+def _valid_tensors():
+    return (
+        _Tensor((8, 128), torch.int8),
+        _Tensor((64, 128), torch.int8),
+        _Tensor((8, 1), torch.float32),
+        _Tensor((64, 1), torch.float32),
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_flydsl_rdna3_a8w8_supported_tile_shapes(dtype):
+    assert _flydsl_rdna3_a8w8_shape_supported(32, 64, 128, 128, 128, dtype)
+    assert _flydsl_rdna3_a8w8_shape_supported(256, 128, 256, 256, 256, dtype)
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (32, 63, 128, 128, 128),
+        (32, 64, 127, 128, 128),
+        (32, 64, 64, 64, 64),
+        (32, 64, 128, 136, 128),
+        (32, 64, 128, 128, 136),
+    ],
+)
+def test_flydsl_rdna3_a8w8_rejects_unsupported_geometry(shape):
+    assert not _flydsl_rdna3_a8w8_shape_supported(*shape, torch.bfloat16)
+
+
+def test_flydsl_rdna3_a8w8_rejects_unsupported_output_and_buffer_span():
+    assert not _flydsl_rdna3_a8w8_shape_supported(32, 64, 128, 128, 128, torch.int32)
+    assert not _flydsl_rdna3_a8w8_shape_supported(
+        1, 1 << 25, 128, 128, 1 << 25, torch.float32
+    )
+    assert _flydsl_rdna3_a8w8_shape_supported(
+        1, 64, 131008, 131008, 131008, torch.float32
+    )
+    assert not _flydsl_rdna3_a8w8_shape_supported(
+        1, 64, 131072, 131072, 131072, torch.float32
+    )
+
+
+def test_flydsl_rdna3_a8w8_dispatches_supported_call(monkeypatch):
+    monkeypatch.setattr(
+        gemm_op_a8w8.torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(gcnArchName="gfx1151"),
+    )
+    x, w, x_scale, w_scale = _valid_tensors()
+    expected = object()
+    output = object()
+    called = []
+
+    def flydsl_gemm(*args):
+        called.append(args)
+        return expected
+
+    monkeypatch.setattr(
+        gemm_op_a8w8.importlib,
+        "import_module",
+        lambda name, package: SimpleNamespace(gemm_a8w8_rdna3=flydsl_gemm),
+    )
+    monkeypatch.setattr(gemm_op_a8w8.torch, "empty", lambda *args, **kwargs: output)
+
+    result = _try_flydsl_rdna3_a8w8(
+        x, w, x_scale, w_scale, None, torch.bfloat16, None
+    )
+    assert result is expected
+    assert called == [(x, w, x_scale, w_scale, output)]
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"bias": object(), "splitK": None},
+        {"bias": None, "splitK": 1},
+    ],
+)
+def test_flydsl_rdna3_a8w8_keeps_bias_and_explicit_splitk_on_fallback(
+    monkeypatch, kwargs
+):
+    monkeypatch.setattr(
+        gemm_op_a8w8.torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(gcnArchName="gfx1151"),
+    )
+    x, w, x_scale, w_scale = _valid_tensors()
+    monkeypatch.setattr(
+        gemm_op_a8w8.importlib,
+        "import_module",
+        lambda *args, **kwargs: pytest.fail("unsupported call attempted FlyDSL import"),
+    )
+
+    assert (
+        _try_flydsl_rdna3_a8w8(
+            x,
+            w,
+            x_scale,
+            w_scale,
+            kwargs["bias"],
+            torch.bfloat16,
+            kwargs["splitK"],
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("error", [ModuleNotFoundError("flydsl"), OSError("missing HIP DLL")])
+def test_flydsl_rdna3_a8w8_import_failure_uses_fallback(monkeypatch, error):
+    monkeypatch.setattr(
+        gemm_op_a8w8.torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(gcnArchName="gfx1151"),
+    )
+    x, w, x_scale, w_scale = _valid_tensors()
+
+    def unavailable(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(gemm_op_a8w8.importlib, "import_module", unavailable)
+    assert (
+        _try_flydsl_rdna3_a8w8(
+            x, w, x_scale, w_scale, None, torch.bfloat16, None
+        )
+        is None
+    )
+
+
+def test_gemm_a8w8_public_dispatch_uses_triton_when_flydsl_is_unavailable(
+    monkeypatch,
+):
+    x = torch.empty((2, 128), dtype=torch.int8)
+    w = torch.empty((64, 128), dtype=torch.int8)
+    x_scale = torch.ones((2, 1), dtype=torch.float32)
+    w_scale = torch.ones((64, 1), dtype=torch.float32)
+    calls = []
+
+    monkeypatch.setattr(
+        gemm_op_a8w8, "_try_flydsl_rdna3_a8w8", lambda *args: None
+    )
+    monkeypatch.setattr(gemm_op_a8w8, "_ck_a8w8_supported", lambda: False)
+
+    def triton_gemm(*args, **kwargs):
+        calls.append((args, kwargs))
+        return torch.empty((2, 64), dtype=kwargs["dtype"])
+
+    module_name = "aiter.ops.triton.gemm.basic.gemm_a8w8"
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        module_name,
+        SimpleNamespace(gemm_a8w8=triton_gemm),
+    )
+
+    result = gemm_op_a8w8.gemm_a8w8(
+        x, w, x_scale, w_scale, dtype=torch.float16, splitK=3
+    )
+
+    assert result.shape == (2, 64)
+    assert result.dtype == torch.float16
+    assert calls == [
+        ((x, w, x_scale, w_scale, None), {"dtype": torch.float16})
+    ]
+
+
+def test_gemm_a8w8_public_dispatch_returns_flydsl_result(monkeypatch):
+    x = torch.empty((2, 128), dtype=torch.int8)
+    w = torch.empty((64, 128), dtype=torch.int8)
+    x_scale = torch.ones((2, 1), dtype=torch.float32)
+    w_scale = torch.ones((64, 1), dtype=torch.float32)
+    output = torch.empty((2, 64), dtype=torch.bfloat16)
+    calls = []
+
+    def flydsl_gemm(*args):
+        calls.append(args)
+        return output
+
+    monkeypatch.setattr(
+        gemm_op_a8w8, "_try_flydsl_rdna3_a8w8", flydsl_gemm
+    )
+    monkeypatch.setattr(
+        gemm_op_a8w8,
+        "_ck_a8w8_supported",
+        lambda: pytest.fail("FlyDSL result should return before CK/Triton"),
+    )
+
+    result = gemm_op_a8w8.gemm_a8w8(x, w, x_scale, w_scale)
+
+    assert result is output
+    assert calls == [(x, w, x_scale, w_scale, None, torch.bfloat16, None)]
+
+
+@pytest.mark.parametrize(
+    "arch,tensor_index,replacement",
+    [
+        ("gfx1201", None, None),
+        ("gfx1151", 0, _Tensor((8, 128), torch.float16)),
+        ("gfx1151", 1, _Tensor((64, 128), torch.int8, stride=(129, 1))),
+        ("gfx1151", 2, _Tensor((8, 1), torch.float32, contiguous=False)),
+        ("gfx1151", 3, _Tensor((64, 1), torch.float16)),
+    ],
+)
+def test_flydsl_rdna3_a8w8_unsupported_call_uses_fallback(
+    monkeypatch, arch, tensor_index, replacement
+):
+    monkeypatch.setattr(
+        gemm_op_a8w8.torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(gcnArchName=arch),
+    )
+    tensors = list(_valid_tensors())
+    if tensor_index is not None:
+        tensors[tensor_index] = replacement
+    monkeypatch.setattr(
+        gemm_op_a8w8.importlib,
+        "import_module",
+        lambda *args, **kwargs: pytest.fail("unsupported call attempted FlyDSL import"),
+    )
+
+    assert (
+        _try_flydsl_rdna3_a8w8(
+            *tensors, None, torch.bfloat16, None
+        )
+        is None
+    )

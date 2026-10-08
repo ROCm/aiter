@@ -505,6 +505,7 @@ else:
 setup(
     name=PACKAGE_NAME,
     use_scm_version=True,
+    license_files=["LICENSE", "3rdparty/FlyDSL-LICENSE"],
     packages=packages,
     include_package_data=True,
     package_data={
