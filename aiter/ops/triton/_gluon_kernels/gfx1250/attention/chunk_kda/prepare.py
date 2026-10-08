@@ -237,7 +237,7 @@ def chunk_kda_prepare_kernel(
     ws_a = tok * (H * BT) + i_h * BT
     SA: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
     aqk_s = gl.allocate_shared_memory(aqk_ptr.dtype.element_ty, [BT, BT], SA)
-    aqk_3 = aqk_s._reinterpret(
+    aqk_3 = aqk_s.reinterpret(
         aqk_ptr.dtype.element_ty,
         [NB, BC, BT],
         gl.SwizzledSharedLayout(1, 1, 1, [2, 1, 0]),
