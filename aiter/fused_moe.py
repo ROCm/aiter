@@ -51,7 +51,10 @@ from aiter.ops.flydsl.mxfp4_kname import (
     parse_flydsl_v2_gemm2_kernel,
     parse_g2_kname_any,
 )
-from aiter.ops.moe_mxfp4_aux import _mxfp4_moe_sort_internal_is_supported
+from aiter.ops.moe_mxfp4_aux import (
+    _mxfp4_moe_sort_internal_is_supported,
+    is_mxfp4_moe_scatter_supported,
+)
 from aiter.ops.opus import moe_stage2_a8w4 as _opus_a8w4
 from aiter.ops.opus.moe_stage1_a8w4 import (
     opus_a8w4_stage1_wrapper as _opus_a8w4_stage1_wrapper,
@@ -2702,6 +2705,13 @@ def _flydsl_v2_stage2_wrapper(
 
     token_num = out.shape[0]
     model_dim_runtime = out.shape[1]
+    if epilog == "scatter" and not is_mxfp4_moe_scatter_supported(
+        model_dim_runtime, topk
+    ):
+        raise NotImplementedError(
+            "Generated MXMOE scatter auxiliary kernels do not cover "
+            f"(model_dim={model_dim_runtime}, topk={topk})"
+        )
     target = out
     _s2_fp8_inter = epilog == "reduce" and _flydsl_stage2_fp8_enabled()
     if _s2_fp8_inter:

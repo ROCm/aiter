@@ -6766,6 +6766,8 @@ class Mxfp4FlydslTuner(FmoeTuner):
     def _candidate_rows(
         self, row: dict[str, Any], full_search: bool | None = None
     ) -> list[dict[str, Any]]:
+        from aiter.ops.moe_mxfp4_aux import is_mxfp4_moe_scatter_supported
+
         self._validate_row(row)
         cands = []
         for g1 in self._g1_variants(row, full_search=full_search):
@@ -6787,6 +6789,10 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 inter_dim=int(row["inter_dim"]),
             ).items():
                 if kp["tile_m"] != bm:
+                    continue
+                if kp["epilog"] == "scatter" and not is_mxfp4_moe_scatter_supported(
+                    row["model_dim"], row["topk"]
+                ):
                     continue
                 cands.append(self._candidate_row(row, bm, kn1, kn2v))
         return cands

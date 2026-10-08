@@ -201,6 +201,23 @@ class TestMxfp4FlydslInputsAndCandidates(unittest.TestCase):
             else:
                 self.assertFalse(candidates, changes)
 
+    def test_scatter_candidates_require_the_matching_generated_auxiliary_key(self):
+        for hidden, topk, expected in (
+            (1024, 2, {"atomic", "reduce"}),
+            (3072, 4, {"atomic", "reduce", "scatter"}),
+        ):
+            # Expert/inter_dim do not participate in the scatter aux key.
+            row = shape_row(
+                model_dim=hidden, topk=topk, q_dtype_a="torch.float8_e4m3fn"
+            )
+            candidates = self.tuner._candidate_rows(row, full_search=True)
+            epilogs = {
+                parse_flydsl_v2_gemm2_kernel(c["kernelName2"])["epilog"]
+                for c in candidates
+                if c["block_m"] == 128
+            }
+            self.assertEqual(epilogs, expected)
+
 
 if __name__ == "__main__":
     unittest.main()
