@@ -926,7 +926,10 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     } else if (gqa_ratio == 32){
         if (q_type == "bf16" && kv_type == "bf16"){
             if(!persistent){
-                config_max_seqlen_q = 0;
+                // qSeqLen 1: the one-token kernel (every request has at most one query
+                // token); 0: the causal kernel for any qlen. Both: 2 tokens x 32 heads
+                // per workgroup (sub_Q 64), the same grid and kernargs.
+                config_max_seqlen_q = (max_seqlen_q == 1) ? 1 : 0;
                 sub_Q = 64;
             }
         }else if (q_type == "fp8" && kv_type == "fp8"){
