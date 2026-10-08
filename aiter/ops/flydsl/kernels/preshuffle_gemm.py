@@ -149,6 +149,7 @@ def compile_preshuffle_gemm(
     xcd_swizzle: int = 0,
     lds_stage: int = 2,
     split_k: int = 1,
+    scale_mode: str = "epilogue",
 ):
     """Compile preshuffle GEMM (fp8/int8/fp16/bf16).
     Signature: fn(C, out, semaphore, A, B, scale_a, scale_b, bias, M, N, stream).
@@ -203,6 +204,16 @@ def compile_preshuffle_gemm(
     gpu_arch = get_rocm_arch()
     is_gfx942 = str(gpu_arch).startswith("gfx942")
     is_gfx950 = str(gpu_arch).startswith("gfx950")
+    if scale_mode not in ("epilogue", "blockscale"):
+        raise ValueError(f"scale_mode must be epilogue/blockscale, got {scale_mode!r}")
+    is_blockscale = scale_mode == "blockscale"
+    if is_blockscale and (not is_fp8 or not is_gfx950 or tile_k % 128 != 0):
+        raise ValueError(
+            "blockscale requires FP8 inputs, gfx950 (gfx942 is not supported yet), "
+            "and tile_k divisible by 128"
+        )
+    scale_k = K // 128
+    blocks_per_tile = tile_k // 128
     use_mfma_scale_128 = is_fp8 and is_gfx950 and (tile_k % 128 == 0)
     use_mfma_k32 = is_f16_or_bf16 and is_gfx950
 
@@ -597,8 +608,67 @@ def compile_preshuffle_gemm(
             )
             zero_padding(frag_B_stages[stage], k_global)
 
+        if const_expr(is_blockscale):
+            frag_blk = thr_mma.make_fragment_C(tC)
+            bs_bx_m = bid_x * tile_m
+            bs_by_n = bid_y * tile_n
+            bs_wave = tid // 64
+            bs_lane_div_16 = (tid % 64) // 16
+            bs_a_elems = fx.Int32(i32_m) * scale_k
+            bs_b_elems = ((N + 127) // 128) * scale_k
+            bs_a = fx.logical_divide(
+                fx.rocdl.make_buffer_tensor(
+                    arg_scale_a,
+                    max_size=False,
+                    num_records_bytes=fx.Int64(i32_m) * fx.Int64(scale_k * 4),
+                ),
+                fx.make_layout(1, 1),
+            )
+            bs_b = fx.logical_divide(
+                fx.rocdl.make_buffer_tensor(
+                    arg_scale_b, max_size=False, num_records_bytes=bs_b_elems * 4
+                ),
+                fx.make_layout(1, 1),
+            )
+            bs_copy = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), Float32)
+
+            def bs_read(tiles, idx):
+                r = fx.make_rmem_tensor(fx.make_layout(1, 1), Float32)
+                fx.copy(bs_copy, fx.slice(tiles, (None, fx.Int32(idx))), r)
+                return fx.Float32(Vec(fx.memref_load_vec(r))[0])
+
+            def block_scale_vec(kb):
+                safe_kb = kb
+                if const_expr(is_ragged):
+                    safe_kb = (kb < scale_k).select(kb, Int32(0))
+                s_b = []
+                for ni in range_constexpr(num_acc_n):
+                    col = bs_by_n + (ni * num_waves + bs_wave) * 16
+                    idx = fx.Int32(col // 128) * scale_k + safe_kb
+                    idx = (col < N).select(idx, Int32(bs_b_elems))
+                    s_b.append(bs_read(bs_b, idx))
+                s_a = []
+                for mi in range_constexpr(m_repeat):
+                    rows = []
+                    # M need not be divisible by four: each K block starts at kb*M.
+                    for ii in range_constexpr(4):
+                        row = bs_bx_m + mi * 16 + bs_lane_div_16 * 4 + ii
+                        idx = safe_kb * Int32(i32_m) + fx.Int32(row)
+                        idx = (row < i32_m).select(idx, bs_a_elems)
+                        rows.append(bs_read(bs_a, idx))
+                    s_a.append(Vec.from_elements(rows, Float32))
+                elems = []
+                for p in range_constexpr(acc_size):
+                    ni = p // (m_repeat * 4)
+                    mi = (p // 4) % m_repeat
+                    scale = s_a[mi][p % 4] * s_b[ni]
+                    if const_expr(is_ragged):
+                        scale = (kb < scale_k).select(scale, Float32(0.0))
+                    elems.append(scale)
+                return Vec.from_elements(elems, Float32)
+
         # ── Pipeline stage (double-buffered B via split fragments) ─
-        def mma_kloop(a_stage, cur_frag_B):
+        def mma_kloop(a_stage, cur_frag_B, k_tile=None):
             for ki in range_constexpr(k_iters):
                 fx.copy(
                     uni_copy,
@@ -606,15 +676,27 @@ def compile_preshuffle_gemm(
                     frag_A_retile[None, None, ki],
                 )
                 k_coord = ki if (use_mfma_scale_128 or use_mfma_k32) else (None, ki)
-                fx.gemm(
-                    tiled_mma,
-                    frag_C,
-                    frag_A[None, None, k_coord],
-                    cur_frag_B[None, None, k_coord],
-                    frag_C,
-                )
+                if const_expr(is_blockscale):
+                    sc = block_scale_vec(k_tile * Int32(blocks_per_tile) + Int32(ki))
+                    frag_blk.store(acc_zero)
+                    fx.gemm(
+                        tiled_mma,
+                        frag_blk,
+                        frag_A[None, None, k_coord],
+                        cur_frag_B[None, None, k_coord],
+                        frag_blk,
+                    )
+                    frag_C.store(math.fma(frag_blk.load(), sc, frag_C.load()))
+                else:
+                    fx.gemm(
+                        tiled_mma,
+                        frag_C,
+                        frag_A[None, None, k_coord],
+                        cur_frag_B[None, None, k_coord],
+                        frag_C,
+                    )
 
-        def pipeline_2stage(read_stage, next_k_val=None, read_next=True):
+        def pipeline_2stage(read_stage, next_k_val=None, read_next=True, k_tile=None):
             write_stage = read_stage ^ 1
             a_read = read_stage
             a_write = write_stage
@@ -624,7 +706,7 @@ def compile_preshuffle_gemm(
                 if const_expr(do_next):
                     dma_a_to_lds(next_k_val, a_write)
                     load_B(write_stage, k_off + next_k_val)
-                mma_kloop(a_read, cur_frag_B)
+                mma_kloop(a_read, cur_frag_B, k_tile)
                 if const_expr(enable_scheduler):
                     hot_loop_scheduler()
                 if const_expr(do_next):
@@ -635,7 +717,7 @@ def compile_preshuffle_gemm(
                 global_k_next = k_off + next_k_val
                 load_A(global_k_next)
                 load_B(write_stage, global_k_next)
-            mma_kloop(a_read, cur_frag_B)
+            mma_kloop(a_read, cur_frag_B, k_tile)
             if const_expr(do_next):
                 fx.copy(uni_copy, frag_copy_A, pA_s_stages[a_write][None, None, None])
             if const_expr(enable_scheduler):
@@ -669,7 +751,7 @@ def compile_preshuffle_gemm(
             for iv, state in range(0, num_tiles - 1, 1, init=[frag_C.load()]):
                 frag_C.store(state[0])
                 k_next = fx.Int32(iv + 1)
-                mma_kloop(0, frag_Bc)
+                mma_kloop(0, frag_Bc, k_off + fx.Int32(iv))
                 if const_expr(not use_async_copy):
                     load_A(k_off + k_next)
                 load_B(0, k_off + k_next)
@@ -692,8 +774,14 @@ def compile_preshuffle_gemm(
             loop_end = (num_tiles - tail) // 2
 
             def two_tiles(k_base):
-                pipeline_2stage(read_stage=0, next_k_val=k_base + fx.Int32(1))
-                pipeline_2stage(read_stage=1, next_k_val=k_base + fx.Int32(2))
+                pipeline_2stage(
+                    read_stage=0, next_k_val=k_base + fx.Int32(1), k_tile=k_off + k_base
+                )
+                pipeline_2stage(
+                    read_stage=1,
+                    next_k_val=k_base + fx.Int32(2),
+                    k_tile=k_off + k_base + fx.Int32(1),
+                )
 
             if const_expr(loop_end > 0 and use_async_copy):
                 for iv in range_constexpr(loop_end):
@@ -707,7 +795,9 @@ def compile_preshuffle_gemm(
             k_tail0 = num_tiles - tail  # first tile handled by the peeled tail
             for j in range_constexpr(tail - 1):
                 pipeline_2stage(
-                    read_stage=(k_tail0 + j) % 2, next_k_val=fx.Int32(k_tail0 + j + 1)
+                    read_stage=(k_tail0 + j) % 2,
+                    next_k_val=fx.Int32(k_tail0 + j + 1),
+                    k_tile=k_off + fx.Int32(k_tail0 + j),
                 )
 
         # ── Epilogue-operand preloads (scale_a / scale_b / bias) ─────────
@@ -734,7 +824,7 @@ def compile_preshuffle_gemm(
 
         def load_epi_operands():
             s_a = s_b = bias = None
-            if const_expr(is_8bit):
+            if const_expr(is_8bit and not is_blockscale):
                 # Per-row(scale_a) × per-col(scale_b) scaling, applied in the epilogue.
                 if const_expr(n_ragged):
                     sb_tiles = _epi_tiles(
@@ -817,12 +907,16 @@ def compile_preshuffle_gemm(
 
         # Final MMA stage — overlaps the epilogue-operand loads when issued above.
         if const_expr(lds_stage == 1):
-            mma_kloop(0, frag_B_stages[0])
+            mma_kloop(0, frag_B_stages[0], k_off + Int32(num_tiles - 1))
         else:
-            pipeline_2stage(read_stage=(num_tiles - 1) % 2, read_next=False)
+            pipeline_2stage(
+                read_stage=(num_tiles - 1) % 2,
+                read_next=False,
+                k_tile=k_off + Int32(num_tiles - 1),
+            )
 
         # ── Epilogue ─────────────────────────────────────────────
-        if const_expr(not is_8bit and not _has_epilogue):
+        if const_expr((not is_8bit or is_blockscale) and not _has_epilogue):
             frag_C_out.store(Vec(frag_C.load()).to(out_elem_cls))
         else:
             if const_expr(not overlap_epi_load):
@@ -859,7 +953,7 @@ def compile_preshuffle_gemm(
                 val = acc_vec[p]
                 if const_expr(is_int8):
                     val = val.to(Float32)
-                if const_expr(is_8bit):
+                if const_expr(is_8bit and not is_blockscale):
                     val_s = (val * s_a_vals[mi][ii]) * s_b_vals[ni]
                 else:
                     val_s = val

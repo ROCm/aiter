@@ -301,8 +301,14 @@ def flydsl_preshuffle_gemm_a8(
     lds_stage: int = 2,
     enable_scheduler: bool = True,
     split_k: int = 1,
+    *,
+    scale_mode: str = "epilogue",
 ) -> Tensor:
-    """Compile and run FlyDSL preshuffle GEMM, optionally with fp32 split-K."""
+    """Run preshuffle GEMM with per-row/column or per-128-K FP32 scales.
+
+    Blockscale expects x_scale [K/128, M] (transposed) and
+    w_scale [ceil(N/128), K/128], with FP8 inputs on gfx950.
+    """
     compile_fn = _get_compile_fn()
     from aiter.utility import dtypes
 
@@ -338,6 +344,32 @@ def flydsl_preshuffle_gemm_a8(
     else:
         raise ValueError(f"[FlyDSL] unsupported input dtype {XQ.dtype}")
 
+    if scale_mode not in ("epilogue", "blockscale"):
+        raise ValueError(f"scale_mode must be epilogue/blockscale, got {scale_mode!r}")
+    if scale_mode == "blockscale":
+        arch = torch.cuda.get_device_properties(XQ.device).gcnArchName.split(":")[0]
+        if (
+            in_dtype != "fp8"
+            or WQ.dtype != XQ.dtype
+            or arch != "gfx950"
+            or tile_k % 128
+        ):
+            raise ValueError(
+                "blockscale requires FP8 inputs, gfx950 (gfx942 is not supported yet), "
+                "and tile_k divisible by 128"
+            )
+        for name, scale, shape in (
+            ("x_scale", x_scale, (k // 128, m)),
+            ("w_scale", w_scale, ((n + 127) // 128, k // 128)),
+        ):
+            if scale.dtype != torch.float32 or tuple(scale.shape) != shape:
+                raise ValueError(f"blockscale {name} must be FP32 {shape}")
+            if (
+                scale.numel() * scale.element_size()
+                >= PRESHUFFLE_FLAT_BUFFER_LIMIT_BYTES
+            ):
+                raise ValueError(f"blockscale {name} buffer must be smaller than 4 GiB")
+
     wpe = None if waves_per_eu <= 0 else waves_per_eu
 
     if Out.dtype == torch.bfloat16:
@@ -372,6 +404,7 @@ def flydsl_preshuffle_gemm_a8(
         xcd_swizzle=int(xcd_swizzle),
         lds_stage=int(lds_stage),
         split_k=int(split_k),
+        scale_mode=scale_mode,
     )
 
     def _as_i8(t):
