@@ -3337,8 +3337,9 @@ __device__ __forceinline__ bool lds_tail_sampled_stage_n(T const* in,
     int const region_base     = wave * Region;
 
     auto fall_back = [&]() {
-        if(tid == 0) *staged_count = 0;
+        // Other waves may still read *staged_count until the barrier.
         __syncthreads();
+        if(tid == 0) *staged_count = 0;
         return false;
     };
 
