@@ -814,18 +814,7 @@ def check_and_set_ninja_worker():
 
     # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
     max_jobs = int(max(1, min(max_num_jobs_cores, max_num_jobs_memory)))
-    if max_jobs_env is not None:
-        try:
-            max_processes = int(max_jobs_env)
-            # too large value
-            if max_processes > max_jobs:
-                os.environ["MAX_JOBS"] = str(max_jobs)
-        # error value
-        except ValueError:
-            os.environ["MAX_JOBS"] = str(max_jobs)
-    # none value
-    else:
-        os.environ["MAX_JOBS"] = str(max_jobs)
+    os.environ["MAX_JOBS"] = str(max_jobs)
 
 
 def rename_cpp_to_cu(els, dst, hipify, recursive=False):

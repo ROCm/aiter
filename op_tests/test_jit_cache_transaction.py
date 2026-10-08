@@ -1639,7 +1639,7 @@ class TestNinjaWorkerLimit(unittest.TestCase):
             self.assertEqual(os.environ["MAX_JOBS"], "32")
             cpu_count.assert_not_called()
 
-        for initial in (None, "invalid"):
+        for initial in (None, "invalid", "0", "-1", "-32"):
             with self.subTest(initial=initial):
                 env = {} if initial is None else {"MAX_JOBS": initial}
                 with mock.patch.dict(os.environ, env, clear=True), mock.patch.dict(
@@ -1648,11 +1648,6 @@ class TestNinjaWorkerLimit(unittest.TestCase):
                     self.namespace["check_and_set_ninja_worker"]()
                     self.assertEqual(os.environ["MAX_JOBS"], "8")
 
-        with mock.patch.dict(os.environ, {"MAX_JOBS": "0"}), mock.patch.dict(
-            sys.modules, {"psutil": self.psutil}
-        ), mock.patch.object(os, "cpu_count", return_value=32):
-            self.namespace["check_and_set_ninja_worker"]()
-            self.assertEqual(os.environ["MAX_JOBS"], "0")
 
 
 @unittest.skipUnless(importlib.util.find_spec("pandas"), "Opus codegen requires pandas")
