@@ -5921,9 +5921,8 @@ class FmoeTuner(TunerCommon):
                     and not args.run_config
                     and not args.compare
                 ):
-                    times = pd.to_numeric(self.tunedf["us"], errors="coerce")
                     self.tunedf = self.tunedf[
-                        times.map(math.isfinite) & times.gt(0)
+                        self._valid_tuned_mask(self.tunedf, args.errRatio)
                     ].copy()
             else:
                 self.tunedf = None
@@ -6473,6 +6472,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
 
     def run(self, args, fast_mode=False):
         self._mxfp4_output_file = self.get_out_file(args.tune_file)
+        self._mxfp4_err_ratio = args.errRatio
         result = super().run(args, fast_mode)
         if not args.run_config and not args.compare and self.untunedf.empty:
             pd.DataFrame(columns=self.keys + ["status", "failure_reason"]).to_csv(
@@ -6480,6 +6480,25 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 index=False,
             )
         return result
+
+    def pre_process(self, args):
+        self._mxfp4_run_config = bool(args.run_config)
+        super().pre_process(args)
+
+    @staticmethod
+    def _valid_tuned_mask(tunedf, err_ratio):
+        times = pd.to_numeric(tunedf["us"], errors="coerce")
+        valid = times.map(math.isfinite) & times.gt(0)
+        for column in ("err1", "err2"):
+            if column not in tunedf:
+                return valid & False
+            encoded = tunedf[column].astype(str).str.strip()
+            errors = pd.to_numeric(encoded.str.rstrip("%"), errors="coerce")
+            errors = errors.where(~encoded.str.endswith("%"), errors / 100.0)
+            valid &= errors.map(math.isfinite) & errors.ge(0) & errors.le(err_ratio)
+        if "status" in tunedf:
+            valid &= tunedf["status"].fillna("").astype(str).isin(("", "ok"))
+        return valid
 
     @staticmethod
     def _g1_kname(
@@ -6685,6 +6704,8 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 raise ValueError(f"{col} must be {expected}, got {row[col]!r}")
 
     def get_untuned_gemm_list(self, untuned_gemm_file):
+        if getattr(self, "_mxfp4_run_config", False):
+            return super().get_untuned_gemm_list(untuned_gemm_file)
         untunedf = _read_csv(untuned_gemm_file)
         required = [k for k in self.keys if k not in ("gfx", "cu_num")]
         missing = [col for col in required if col not in untunedf.columns]
@@ -6699,6 +6720,21 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 raise ValueError(
                     f"{untuned_gemm_file}: row {index + 2}: {exc}"
                 ) from exc
+        for column in self.DTYPE_KEYS | {"q_type"}:
+            untunedf[column] = untunedf[column].map(
+                lambda value: str(_parse_tuning_type(value))
+            )
+        untunedf["act_type"] = untunedf["act_type"].map(
+            lambda value: str(
+                str2ActivationType(value)
+                if isinstance(value, str) and "." not in value
+                else _parse_tuning_type(value)
+            )
+        )
+        for column in ("token", "model_dim", "inter_dim", "expert", "topk"):
+            untunedf[column] = untunedf[column].astype(int)
+        untunedf["use_g1u1"] = 1
+        untunedf["doweight_stage1"] = 0
         return untunedf.drop_duplicates().reset_index(drop=True)
 
     @staticmethod
@@ -6995,7 +7031,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
             raise RuntimeError(f"cosine err_ratio {err} > {args.errRatio}")
         if not _all_finite(out):
             raise RuntimeError("non-finite pipeline output")
-        _, us = run_perftest(
+        timed_out, us = run_perftest(
             lambda: self._port_e2e(
                 data, kn1, kn2, topk, ne, h, dtype, swiglu_limit=swiglu_limit
             ),
@@ -7004,6 +7040,18 @@ class Mxfp4FlydslTuner(FmoeTuner):
         )
         us = round(float(us), 4)
         candidate["pipeline_us"] = us
+        timed_err = cosine_diff_compare(ref, timed_out, msg=f"timed port[{kn1}+{kn2}]")
+        candidate["error"] = float("nan") if timed_err is None else float(timed_err)
+        if not _all_finite(timed_out):
+            raise RuntimeError("non-finite timed pipeline output")
+        if (
+            timed_err is None
+            or not math.isfinite(float(timed_err))
+            or timed_err > args.errRatio
+        ):
+            raise RuntimeError(f"timed cosine err_ratio {timed_err} > {args.errRatio}")
+        err = max(float(err), float(timed_err))
+        candidate["error"] = err
         if not math.isfinite(us) or us <= 0:
             return us
         # The pair is timed as one unit, so the fused-MoE estimate in calculate()
@@ -7262,8 +7310,12 @@ class Mxfp4FlydslTuner(FmoeTuner):
     def result_to_csv(self, results, file, concat=False):
         del concat
         old_tunedf = self.get_tuned_gemm_list(file, self.columns)
-        old_times = pd.to_numeric(old_tunedf["us"], errors="coerce")
-        old_tunedf = old_tunedf[old_times.map(math.isfinite) & old_times.gt(0)].copy()
+        old_tunedf = old_tunedf[
+            self._valid_tuned_mask(
+                old_tunedf,
+                getattr(self, "_mxfp4_err_ratio", self.ARG_DEFAULTS["errRatio"]),
+            )
+        ].copy()
         for col in self.columns:
             if col not in old_tunedf.columns:
                 if col == "gfx" and "cu_num" in old_tunedf.columns:
