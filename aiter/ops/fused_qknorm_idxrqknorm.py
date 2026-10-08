@@ -9,6 +9,9 @@ from ..jit.core import compile_ops
 
 FUSED_QKNORM_IDXRQKNORM_SUPPORTS_PACKED_SHUFFLE = True
 FUSED_QKNORM_IDXRQKNORM_SUPPORTS_FP8_INDEX_Q = True
+# The index cache can be written directly in the FlyDSL index scorers' shuffled
+# page layout, so a deployment using them does not have to permute it afterwards.
+FUSED_QKNORM_IDXRQKNORM_SUPPORTS_SHUFFLED_INDEX_CACHE = True
 
 _FP8_E4M3_DTYPES = tuple(
     dt
@@ -56,6 +59,7 @@ def _fused_qknorm_idxrqknorm_hip(
     v_scale: Tensor | None = None,
     asm_layout: bool = False,
     skip_index_branch: bool = False,
+    index_shuffled: bool = False,
 ) -> None:
     pass
 
@@ -87,12 +91,23 @@ def fused_qknorm_idxrqknorm(
     v_scale: Tensor | None = None,
     asm_layout: bool = False,
     skip_index_branch: bool = False,
+    index_shuffled: bool = False,
 ) -> None:
     # The main K/V caches are always passed as separate kv_cache_k / kv_cache_v
     # tensors. asm_layout selects the in-cache addressing: page-16 SHUFFLE
     # (asm_layout=True) vs plain page-128 (asm_layout=False, where kv_cache_k /
     # kv_cache_v are typically the key/value slices of a fused
     # [num_blocks, 2, block_size, num_kv_heads, head_dim] cache).
+    # index_shuffled writes the index cache in the layout the FlyDSL index
+    # scorers read (minimax_m3_index_score.shuffle_cache), so a deployment on
+    # those kernels does not permute the cache after the fact. It changes the
+    # bytes, so a consumer expecting row-major index rows must not set it.
+    if index_shuffled:
+        assert not skip_index_branch, "index_shuffled with no index branch to write"
+        assert index_cache is not None, "index_shuffled needs an index_cache"
+        # No block_size constraint: the index page is the shuffled layout's own
+        # 128, not the main K/V cache's block_size (16 under asm_layout).
+
     if index_cache_dtype is None:
         index_cache_dtype = (
             "fp8"
@@ -154,4 +169,5 @@ def fused_qknorm_idxrqknorm(
         v_scale,
         asm_layout,
         skip_index_branch,
+        index_shuffled,
     )
