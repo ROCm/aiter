@@ -143,19 +143,40 @@ def _find_rocm_home() -> str | None:
     # Guess #1
     rocm_home = os.environ.get("ROCM_HOME") or os.environ.get("ROCM_PATH")
     if rocm_home is None:
-        # Guess #2: rocm-sdk-devel pip package ships a self-contained ROCm
-        # tree under site-packages/_rocm_sdk_devel/. Prefer this over a
-        # hipcc-on-PATH lookup because the venv's bin/hipcc is a python
-        # wrapper, not a real binary — realpath() can't recover the SDK
-        # root from it.
-        try:
-            spec = importlib.util.find_spec("_rocm_sdk_devel")
-        except (ImportError, ValueError):
-            spec = None
-        if spec is not None and spec.submodule_search_locations:
-            candidate = spec.submodule_search_locations[0]
-            if os.path.exists(os.path.join(candidate, "bin", "hipconfig")):
-                rocm_home = candidate
+        # Guess #2: rocm-sdk pip packages ship a self-contained ROCm tree
+        # under site-packages/.  _rocm_sdk_devel has headers + tools;
+        # _rocm_sdk_core has the runtime tree (hipconfig, version files).
+        # Prefer this over a hipcc-on-PATH lookup because the venv's
+        # bin/hipcc is a python wrapper, not a real binary — realpath()
+        # can't recover the SDK root from it.
+        #
+        # Try importlib first, then fall back to a direct filesystem probe
+        # (pip's isolated build environments hide the real venv's packages
+        # from importlib but the files still exist on disk).
+        for pkg in ("_rocm_sdk_devel", "_rocm_sdk_core"):
+            try:
+                spec = importlib.util.find_spec(pkg)
+            except (ImportError, ValueError):
+                spec = None
+            if spec is not None and spec.submodule_search_locations:
+                candidate = spec.submodule_search_locations[0]
+                if os.path.exists(os.path.join(candidate, "bin", "hipconfig")):
+                    rocm_home = candidate
+                    break
+        else:
+            import glob
+
+            exe_prefix = os.path.dirname(os.path.dirname(sys.executable))
+            for site_dir in glob.glob(
+                os.path.join(exe_prefix, "lib", "python*", "site-packages")
+            ):
+                for pkg in ("_rocm_sdk_devel", "_rocm_sdk_core"):
+                    candidate = os.path.join(site_dir, pkg)
+                    if os.path.exists(os.path.join(candidate, "bin", "hipconfig")):
+                        rocm_home = candidate
+                        break
+                if rocm_home is not None:
+                    break
     if rocm_home is None:
         # Guess #3
         hipcc_path = shutil.which("hipcc")
