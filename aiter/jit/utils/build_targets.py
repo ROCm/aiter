@@ -5,6 +5,7 @@
 # No torch dependency — safe to import in build scripts, gen_instances, and tests
 # that run without a GPU or a full PyTorch install.
 import os
+import re
 
 GFX_MAP = {
     0: "native",
@@ -52,10 +53,17 @@ GFX_CU_NUM_MAP = {
 
 
 def torch_processor_count_to_cu(gfx: str, processor_count: int) -> int:
-    """Convert Windows RDNA WGP counts to physical compute units."""
+    """Return physical CUs from HIP's mode-dependent processor count."""
     gfx = gfx.split(":", 1)[0].lower()
-    if gfx.startswith("gfx11") or gfx in ("gfx1200", "gfx1201"):
-        return processor_count * 2
+    rdna = gfx.startswith("gfx11") or gfx in ("gfx1200", "gfx1201")
+    if rdna:
+        wgp_mode = os.getenv("GPU_ENABLE_WGP_MODE", "1")
+        numeric_mode = re.match(r"\s*([+-]?[0-9]+)", wgp_mode)
+        wgp_enabled = wgp_mode == "true" or (
+            numeric_mode is not None and int(numeric_mode.group(1)) != 0
+        )
+        if wgp_enabled:
+            return processor_count * 2
     return processor_count
 
 

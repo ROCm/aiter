@@ -132,16 +132,39 @@ class TestWindowsRDNACKTargets(unittest.TestCase):
                     torch_processor_count_to_cu(gfx, processor_count), processor_count
                 )
 
-    def test_rdna_wgp_counts_are_normalized_to_physical_cus(self):
-        for gfx, wgp_count, cu_count in (
+    def test_rdna_counts_follow_hip_wgp_mode(self):
+        modes = (
+            (None, True),
+            ("1", True),
+            ("true", True),
+            ("2", True),
+            ("1 trailing", True),
+            (" -1", True),
+            ("0", False),
+            ("false", False),
+            ("", False),
+            ("nonnumeric", False),
+            ("-0", False),
+        )
+        counts = (
             ("gfx1101", 30, 60),
             ("gfx1151", 20, 40),
             ("gfx1150", 8, 16),
             ("gfx1200", 16, 32),
             ("gfx1201", 32, 64),
-        ):
-            with self.subTest(gfx=gfx):
-                self.assertEqual(torch_processor_count_to_cu(gfx, wgp_count), cu_count)
+        )
+        for mode, wgp_enabled in modes:
+            with self.subTest(wgp_mode=mode), mock.patch.dict(
+                os.environ,
+                {} if mode is None else {"GPU_ENABLE_WGP_MODE": mode},
+                clear=mode is None,
+            ):
+                for gfx, wgp_count, cu_count in counts:
+                    with self.subTest(gfx=gfx):
+                        count = wgp_count if wgp_enabled else cu_count
+                        self.assertEqual(
+                            torch_processor_count_to_cu(gfx, count), cu_count
+                        )
 
 
 if __name__ == "__main__":
