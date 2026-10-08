@@ -1791,7 +1791,7 @@ def _reduce_mxfp8_partials(partials: Tensor, out: Tensor | None = None) -> Tenso
     if out is None:
         out = torch.empty((M, N), dtype=partials.dtype, device=partials.device)
     _run_compiled(
-        compile_gemm_a8w8_splitk_reduce(split_k=splitk, partial_dtype_str="bf16"),
+        compile_gemm_a8w8_splitk_reduce(split_k=splitk, out_dtype_str="bf16"),
         ptr_arg(partials),
         ptr_arg(out),
         M * N,

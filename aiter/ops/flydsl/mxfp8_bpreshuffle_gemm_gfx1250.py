@@ -415,7 +415,9 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
     if partials is not None and not fused:
         dense = ldc == N
         _run_compiled(
-            _compile_splitk_reduce(split_k=split_k, out_dtype_str=out_dtype),
+            _compile_splitk_reduce(
+                split_k=split_k, out_dtype_str=out_dtype, partial_dtype_str="f32"
+            ),
             _ptr_arg(partials),
             _ptr_arg(Out),
             M * N if dense else N,

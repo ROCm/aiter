@@ -26,13 +26,8 @@ def compile_gemm_a8w8_splitk_reduce(
     split_k: int,
     out_dtype_str: str = "bf16",
     unroll: int = 0,
-    partial_dtype_str: str = "f32",
+    partial_dtype_str: str = "bf16",
 ):
-    """Sum partials in FP32 and round once to the output dtype.
-
-    FlyDSL GEMMs always write FP32 partials. The fixed BF16 ASM output ABI
-    requires explicit partial_dtype_str="bf16" at its reduction call site.
-    """
     if partial_dtype_str not in ("bf16", "f32") or out_dtype_str not in (
         "bf16",
         "f16",
