@@ -1030,8 +1030,16 @@ def _build_kernel_mfma_lds_pipe(
             in_rows = row < seq_len
             ss = fx.max(fx.Int32(cs_t[row_ld]), fx.Int32(0))
             ee = fx.min(fx.Int32(ce_t[row_ld]), seq_len_kv)
-            starts[j] = in_rows.select(ss, seq_len_kv)
-            ends[j] = in_rows.select(ee, fx.Int32(0))
+            starts[j] = fx.Int32(
+                rocdl.readfirstlane(
+                    fx.Int32.ir_type, in_rows.select(ss, seq_len_kv).ir_value()
+                )
+            )
+            ends[j] = fx.Int32(
+                rocdl.readfirstlane(
+                    fx.Int32.ir_type, in_rows.select(ee, fx.Int32(0)).ir_value()
+                )
+            )
 
             # Load A-frags:
             # Q[
