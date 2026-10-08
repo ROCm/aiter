@@ -247,10 +247,10 @@ def test_coupled_candidate_numerics(precision, activation, block_m, inter_dim, t
     with torch.device("cuda"):
         result = test_coupled_mxmoe(
             64,
-            1024,
+            3072,
             inter_dim,
             4,
-            2,
+            4,
             dtypes.bf16,
             precision,
             activation,
@@ -272,13 +272,13 @@ def main():
         "-d", "--dtype", type=str2Dtype, nargs="*", default=[dtypes.bf16]
     )
     parser.add_argument("-b", "--batch", type=int, nargs="*", default=[64])
-    # This Opus-routed workload exercises multiple experts and scale-N padding;
-    # it does not require adding a test-only generated auxiliary model key.
+    # This Opus-routed workload exercises scale-N padding and reuses the
+    # generated GPT-OSS H3072/topk4 scatter key without a test-only aux shape.
     parser.add_argument(
-        "-s", "--mnk", type=dtypes.str2tuple, nargs="*", default=[(1024, 384)]
+        "-s", "--mnk", type=dtypes.str2tuple, nargs="*", default=[(3072, 384)]
     )
     parser.add_argument("--expert", type=int, nargs="*", default=[4])
-    parser.add_argument("--topk", type=int, nargs="*", default=[2])
+    parser.add_argument("--topk", type=int, nargs="*", default=[4])
     parser.add_argument(
         "--precision", choices=("A4W4", "A8W4"), nargs="*", default=["A4W4", "A8W4"]
     )
