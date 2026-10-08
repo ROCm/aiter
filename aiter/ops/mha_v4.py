@@ -452,6 +452,8 @@ def _resolve_raw_recipe(
             kind == _RawRecipeKind.MXFP6
             and v_format in (AttentionFormat.MXFP6, AttentionFormat.MXFP4)
         )
+        # The dense f4f4 kernel also carries an FP6 P, so its manifest row is v_pack=1.
+        or (kind == _RawRecipeKind.MXFP4 and v_format == AttentionFormat.MXFP4)
     )
     v_pack = AttentionPack.V_FOR_FP6_P if uses_dense_p_pack else AttentionPack.DEFAULT
     return _RawRecipePlan(kind, scale_modes, v_pack)
@@ -1143,6 +1145,8 @@ def mha_v4(
         k_quantized, k_descale = quantize_mxfp4_k(k)
         if _is_fp8_format(v_format):
             v_quantized, v_descale = quantize_v_fp8(v)
+        elif recipe.v_pack == AttentionPack.V_FOR_FP6_P:
+            v_quantized, v_descale = quantize_v_mxfp4_fp6_p(v)
         else:
             v_quantized, v_descale = quantize_v_mxfp4(v)
         if lut_indices is None:
