@@ -6,8 +6,7 @@ import torch
 import triton
 
 from aiter.ops.triton._triton_kernels.attention.unified_attention import (
-    kernel_unified_attention_2d,
-    kernel_unified_attention_3d,
+    kernel_unified_attention,
     reduce_segments,
 )
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
@@ -553,13 +552,16 @@ def _unified_attention_2d_triton(params: _UAParams):
     else:
         total_num_q_blocks = params.num_tokens // config["BLOCK_Q"] + params.num_seqs
 
-    kernel_unified_attention_2d[
+    kernel_unified_attention[
         (
             params.num_kv_heads,
             total_num_q_blocks,
         )
     ](
         output_ptr=params.out,
+        segm_output_ptr=None,
+        segm_max_ptr=None,
+        segm_expsum_ptr=None,
         query_ptr=params.q,
         key_cache_ptr=params.k,
         value_cache_ptr=params.v,
@@ -630,12 +632,14 @@ def _unified_attention_3d_triton(
     else:
         total_num_q_blocks = params.num_tokens // config["BLOCK_Q"] + params.num_seqs
 
-    kernel_unified_attention_3d[
-        (total_num_q_blocks, params.num_kv_heads, NUM_SEGMENTS)
-    ](
-        segm_output_ptr=segm_output,
-        segm_max_ptr=segm_max,
-        segm_expsum_ptr=segm_expsum,
+    # A single segment writes the output directly; a split writes fp32 partials
+    # for reduce_segments, which then applies output_scale.
+    split = NUM_SEGMENTS > 1
+    kernel_unified_attention[(total_num_q_blocks, params.num_kv_heads, NUM_SEGMENTS)](
+        output_ptr=None if split else params.out,
+        segm_output_ptr=segm_output if split else None,
+        segm_max_ptr=segm_max if split else None,
+        segm_expsum_ptr=segm_expsum if split else None,
         query_ptr=params.q,
         key_cache_ptr=params.k,
         value_cache_ptr=params.v,
@@ -648,17 +652,15 @@ def _unified_attention_3d_triton(
         q_descale_ptr=params.q_descale,
         k_descale_ptr=params.k_descale,
         v_descale_ptr=params.v_descale,
-        out_scale_ptr=(
-            params.output_scale
-            if (params.output_scale is not None and NUM_SEGMENTS == 1)
-            else None
-        ),
+        out_scale_ptr=None if split else params.output_scale,
         softcap=params.softcap,
         num_query_heads=params.num_query_heads,
         num_queries_per_kv=params.num_queries_per_kv,
         block_table_stride=params.block_table.stride(0),
         query_stride_0=params.q.stride(0),
         query_stride_1=params.q.stride(1),
+        output_stride_0=params.out.stride(0),
+        output_stride_1=params.out.stride(1),
         qq_bias_stride_0=params.qq_bias.stride(0) if params.use_qq_bias else 0,
         BLOCK_SIZE=params.block_size,
         HEAD_SIZE=params.head_size,
@@ -683,9 +685,10 @@ def _unified_attention_3d_triton(
         ALL_DECODE=params.all_decode,
         SHUFFLED_KV_CACHE=params.shuffled_kv_cache,
         K_WIDTH=params.k_width,
+        GRID_3D=True,
+        NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
         IS_Q_FP8=(params.q_dtype == e4m3_dtype),
         IS_KV_FP8=(params.kv_cache_dtype == e4m3_dtype),
-        NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
         TILE_SIZE=TILE_SIZE,
         **config,
         enable_fp_fusion=True,

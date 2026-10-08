@@ -13,6 +13,7 @@ from aiter.ops.triton.attention.unified_attention import (
     unified_attention,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton.utils.shuffle import shuffle_scale_batched, shuffle_weight
 from aiter.ops.triton.utils.types import e4m3_dtype
 from aiter.test_common import checkAllclose
@@ -546,6 +547,80 @@ def test_triton_unified_attn_3d(
         )
         <= tol_err_ratio
     )
+
+
+@torch.inference_mode()
+def test_triton_unified_attn_3d_one_segment() -> None:
+    # a decode batch of exactly target_num_prgms programs stays on the 3d grid
+    # but leaves no room for a KV split, so the kernel writes out directly;
+    # head 80 checks the store with the unpadded output strides
+    num_heads = (64, 8)
+    num_seqs = get_num_sms() * 4 // num_heads[1]
+    seq_lens = [(1, 2048)] * num_seqs
+    block_size = 16
+    (
+        query,
+        key_cache,
+        value_cache,
+        _,
+        _,
+        sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        _,
+        _,
+        q_descale,
+        k_descale,
+        v_descale,
+        output_scale,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=num_seqs * 2048 // block_size,
+        block_size=block_size,
+        head_size=80,
+        num_heads=num_heads,
+        device="cuda",
+    )
+
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        sinks=sinks,
+        backend="triton",
+    )
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        query_lens=[x[0] for x in seq_lens],
+        kv_lens=kv_lens,
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+        sinks=sinks,
+    )
+    torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
 
 
 @pytest.mark.parametrize(
