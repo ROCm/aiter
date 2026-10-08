@@ -101,11 +101,16 @@ Environment Variables
        count still cap the pool. Ignored when no GPU is visible.
      - ``8``
 
-For an AITER-owned compile, worker-ceiling precedence and the sizing formula
-are documented in the *Build parallelism* section of the top-level README.
-Standalone package/setup builds, AOT CLIs, and standalone PA-Gluon or OPUS
-builders adopt a valid positive legacy ``MAX_JOBS`` into ``AITER_MAX_JOBS``
-and emit a ``FutureWarning``.
+For an AITER-owned compile, worker-ceiling precedence is explicit
+``AITER_MAX_JOBS`` first, then a valid positive legacy ``MAX_JOBS``, then
+automatic sizing. The automatic budget is the smaller of 80% of the CPUs
+available to the process and effective available memory divided by a 1.5 GB
+per-worker estimate, further clamped by readable cgroup CPU quotas and
+cgroup memory headroom. Standalone package/setup builds, AOT CLIs, and
+standalone PA-Gluon or OPUS builders adopt a valid positive legacy
+``MAX_JOBS`` into ``AITER_MAX_JOBS`` and emit a ``FutureWarning``. See the
+*Build parallelism* section of the repository README for the full policy:
+https://github.com/ROCm/aiter#build-parallelism
 
 Example Configurations
 """"""""""""""""""""""
