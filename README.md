@@ -74,7 +74,9 @@ AITER is the **default kernel backend for LLM inference on AMD GPUs**, integrate
 | AMD AI Max and Max Pro 400/300 Series | gfx1151 (RDNA3.5) | Experimental<sup>1</sup> |
 | AMD Radeon AI PRO R9700 | gfx1201 (RDNA4) | Experimental<sup>1</sup> |
 
-<sup>1</sup> On RDNA, Triton and most FlyDSL kernels run, as do most HIP kernels (norm, RoPE, quant, activation, plus some GEMM/attention). Most CK and ASM kernels are CDNA-only. Experimental does not mean suboptimal: AITER often ships faster kernels than the defaults in upstream frameworks such as vLLM, so installing it is **strongly recommended** on these parts. Ongoing RDNA optimization work — attention, MoE, GEMM and beyond — lands here first.
+<sup>1</sup> On RDNA, Triton and most FlyDSL kernels run, as do most HIP kernels (norm, RoPE, quant, activation, plus some GEMM/attention). The pinned CK FMHA forward and split-KV generator covers gfx11, gfx12, and gfx125 target families; it has no gfx10 FMHA factory, and batch-prefill remains gfx9-only. Experimental does not mean suboptimal: AITER often ships faster kernels than the defaults in upstream frameworks such as vLLM, so installing it is **strongly recommended** on these parts. Ongoing RDNA optimization work — attention, MoE, GEMM and beyond — lands here first.
+
+On Windows, CK FMHA compilation also requires replacing `std::memcpy` with `__builtin_memcpy` at CK's two device descriptor casts, as proposed in the [closed, unmerged CK PR 10067](https://github.com/ROCm/rocm-libraries/pull/10067). Select a checkout with that fix through `CK_DIR`, and use a short JIT cache path such as `$env:AITER_JIT_DIR = "C:\aiter_jit"` to avoid Ninja's Windows path-length limit.
 
 ## Operators
 

@@ -797,6 +797,14 @@ def check_LLVM_MAIN_REVISION():
 
 
 def check_and_set_ninja_worker():
+    max_jobs_env = os.environ.get("MAX_JOBS")
+    if max_jobs_env is not None:
+        try:
+            if int(max_jobs_env) > 0:
+                return
+        except ValueError:
+            pass
+
     max_num_jobs_cores = max(1, os.cpu_count() * 0.8)
     import psutil
 
@@ -806,7 +814,6 @@ def check_and_set_ninja_worker():
 
     # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
     max_jobs = int(max(1, min(max_num_jobs_cores, max_num_jobs_memory)))
-    max_jobs_env = os.environ.get("MAX_JOBS")
     if max_jobs_env is not None:
         try:
             max_processes = int(max_jobs_env)

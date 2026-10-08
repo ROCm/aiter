@@ -29,6 +29,7 @@ from unittest import mock
 JIT_CACHE_PATH = (
     Path(__file__).resolve().parents[1] / "aiter" / "jit" / "utils" / "jit_cache.py"
 )
+CORE_PATH = JIT_CACHE_PATH.parents[1] / "core.py"
 
 
 def _load_module(path, name):
@@ -98,6 +99,94 @@ def _load_functions(path, names, namespace):
 
 
 class TestJitCacheTransaction(unittest.TestCase):
+    def test_windows_codegen_keeps_paths_with_spaces_as_single_arguments(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            op_dir = os.path.join(tmp, "work tree", "module")
+            command = (
+                r'"C:\Work Tree\aiter\3rdparty\composable_kernel'
+                r'\example\ck_tile\01_fmha\generate.py" '
+                '-d fwd --receipt 100 --filter " @ " --output_dir {}'
+            )
+
+            def run(args, check):
+                self.assertTrue(check)
+                output_dir = args[args.index("--output_dir") + 1]
+                _write(os.path.join(output_dir, "generated.cpp"), "// generated\n")
+
+            with mock.patch.object(jit_cache, "IS_WINDOWS", True), mock.patch.object(
+                jit_cache.subprocess, "run", side_effect=run
+            ) as run_process:
+                staging_dir = jit_cache.stage_blob_sources(
+                    command,
+                    op_dir,
+                    r"C:\Program Files\Python\python.exe",
+                )
+
+            args = run_process.call_args.args[0]
+            self.assertEqual(args[0], r"C:\Program Files\Python\python.exe")
+            self.assertEqual(
+                args[1],
+                r"C:\Work Tree\aiter\3rdparty\composable_kernel"
+                r"\example\ck_tile\01_fmha\generate.py",
+            )
+            self.assertEqual(args[args.index("--filter") + 1], " @ ")
+            self.assertEqual(
+                args[args.index("--output_dir") + 1],
+                os.path.join(staging_dir, ""),
+            )
+            self.assertTrue(os.path.isfile(os.path.join(staging_dir, "generated.cpp")))
+
+    def test_windows_codegen_keeps_positional_output_paths_with_spaces(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            op_dir = os.path.join(tmp, "work tree", "module")
+            command = r'"C:\Work Tree\generator.py" {}'
+
+            def run(args, check):
+                self.assertTrue(check)
+                _write(os.path.join(args[2], "generated.cpp"), "// generated\n")
+
+            with mock.patch.object(jit_cache, "IS_WINDOWS", True), mock.patch.object(
+                jit_cache.subprocess, "run", side_effect=run
+            ) as run_process:
+                staging_dir = jit_cache.stage_blob_sources(
+                    command, op_dir, r"C:\Program Files\Python\python.exe"
+                )
+
+            args = run_process.call_args.args[0]
+            self.assertEqual(args[1], r"C:\Work Tree\generator.py")
+            self.assertEqual(args[2], os.path.join(staging_dir, ""))
+            self.assertTrue(os.path.isfile(os.path.join(staging_dir, "generated.cpp")))
+
+    def test_windows_codegen_preserves_format_placeholders_and_escaped_braces(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            op_dir = os.path.join(tmp, "work tree", "module")
+            command = r'"C:\Work Tree\generator.py" {0} --again {0} --literal {{}}'
+
+            def run(args, check):
+                self.assertTrue(check)
+                _write(os.path.join(args[2], "generated.cpp"), "// generated\n")
+
+            with mock.patch.object(jit_cache, "IS_WINDOWS", True), mock.patch.object(
+                jit_cache.subprocess, "run", side_effect=run
+            ) as run_process:
+                staging_dir = jit_cache.stage_blob_sources(
+                    command, op_dir, r"C:\Program Files\Python\python.exe"
+                )
+
+            args = run_process.call_args.args[0]
+            self.assertEqual(args[2], os.path.join(staging_dir, ""))
+            self.assertEqual(args[3], "--again")
+            self.assertEqual(args[4], os.path.join(staging_dir, ""))
+            self.assertEqual(args[5], "--literal")
+            self.assertEqual(args[6], "{}")
+
+            with self.assertRaises(IndexError):
+                command = r'"C:\Work Tree\generator.py" {} {}'
+                with mock.patch.object(jit_cache, "IS_WINDOWS", True):
+                    jit_cache.stage_blob_sources(
+                        command, op_dir, r"C:\Program Files\Python\python.exe"
+                    )
+
     def test_failed_codegen_restores_last_complete_sources(self):
         with tempfile.TemporaryDirectory() as tmp:
             op_dir = os.path.join(tmp, "module")
@@ -1375,7 +1464,7 @@ class TestCppExtensionControl(unittest.TestCase):
 
         self.namespace = _load_functions(
             JIT_CACHE_PATH.with_name("cpp_extension.py"),
-            ["_jit_compile"],
+            ["_get_num_workers", "_jit_compile"],
             {
                 "os": os,
                 "sys": sys,
@@ -1387,6 +1476,28 @@ class TestCppExtensionControl(unittest.TestCase):
                 "_import_module_from_library": lambda *args: None,
             },
         )
+
+    def test_explicit_ninja_worker_count_is_preserved(self):
+        with mock.patch.dict(os.environ, {"MAX_JOBS": "32"}), mock.patch.object(
+            os, "cpu_count", return_value=32
+        ):
+            self.assertEqual(self.namespace["_get_num_workers"](verbose=False), 32)
+
+        with mock.patch.dict(os.environ, {"MAX_JOBS": "0"}), mock.patch.object(
+            os, "cpu_count", return_value=32
+        ):
+            self.assertEqual(self.namespace["_get_num_workers"](verbose=False), 0)
+
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            os, "cpu_count", return_value=32
+        ):
+            self.assertEqual(self.namespace["_get_num_workers"](verbose=False), 25)
+
+        with mock.patch.dict(os.environ, {"MAX_JOBS": "invalid"}), mock.patch.object(
+            os, "cpu_count", return_value=32
+        ):
+            self.assertEqual(self.namespace["_get_num_workers"](verbose=False), 25)
+
 
     def compile(self, **options):
         self.namespace["_jit_compile"](
@@ -1476,6 +1587,39 @@ class TestCppExtensionControl(unittest.TestCase):
         self.compile(use_versioner=False)
         self.assertNotIn("no work to do", outputs[-1])
         self.assertNotEqual(os.stat(artifact).st_mtime_ns, unchanged_mtime)
+
+
+class TestNinjaWorkerLimit(unittest.TestCase):
+    def setUp(self):
+        self.namespace = _load_functions(
+            CORE_PATH, ["check_and_set_ninja_worker"], {"os": os}
+        )
+        self.psutil = types.SimpleNamespace(
+            virtual_memory=lambda: types.SimpleNamespace(available=4 * 1024**3)
+        )
+
+    def test_core_preserves_explicit_positive_override_and_bounds_defaults(self):
+        with mock.patch.dict(os.environ, {"MAX_JOBS": "32"}), mock.patch.dict(
+            sys.modules, {"psutil": self.psutil}
+        ), mock.patch.object(os, "cpu_count", return_value=32) as cpu_count:
+            self.namespace["check_and_set_ninja_worker"]()
+            self.assertEqual(os.environ["MAX_JOBS"], "32")
+            cpu_count.assert_not_called()
+
+        for initial in (None, "invalid"):
+            with self.subTest(initial=initial):
+                env = {} if initial is None else {"MAX_JOBS": initial}
+                with mock.patch.dict(os.environ, env, clear=True), mock.patch.dict(
+                    sys.modules, {"psutil": self.psutil}
+                ), mock.patch.object(os, "cpu_count", return_value=32):
+                    self.namespace["check_and_set_ninja_worker"]()
+                    self.assertEqual(os.environ["MAX_JOBS"], "8")
+
+        with mock.patch.dict(os.environ, {"MAX_JOBS": "0"}), mock.patch.dict(
+            sys.modules, {"psutil": self.psutil}
+        ), mock.patch.object(os, "cpu_count", return_value=32):
+            self.namespace["check_and_set_ninja_worker"]()
+            self.assertEqual(os.environ["MAX_JOBS"], "0")
 
 
 @unittest.skipUnless(importlib.util.find_spec("pandas"), "Opus codegen requires pandas")

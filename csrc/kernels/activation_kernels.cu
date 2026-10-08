@@ -6,6 +6,12 @@
 // headers. The kernels use aiter::hip2opus + the _rmTorch dispatch macros, never
 // the t2opus<c10::*> specializations, so nothing here needs torch/ATen/c10.
 #define AITER_NO_TORCH_TYPES
+#if defined(_WIN32)
+#ifndef _USE_MATH_DEFINES
+#define _USE_MATH_DEFINES
+#endif
+#include <math.h>
+#endif
 #include <cmath>
 #include <limits>
 

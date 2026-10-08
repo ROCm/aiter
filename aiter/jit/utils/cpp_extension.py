@@ -1638,8 +1638,7 @@ def _get_rocm_arch_flags(cflags: list[str] | None = None) -> list[str]:
 def _get_num_workers(verbose: bool) -> int | None:
     max_jobs = os.environ.get("MAX_JOBS")
     if max_jobs is not None and max_jobs.isdigit():
-        if int(max_jobs) > int(max(1, os.cpu_count() * 0.8)):
-            max_jobs = int(max(1, os.cpu_count() * 0.8))
+        max_jobs = int(max_jobs)
         if verbose:
             print(
                 f"Using envvar MAX_JOBS ({max_jobs}) as the number of workers...",
