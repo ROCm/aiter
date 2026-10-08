@@ -549,15 +549,21 @@ def test_triton_unified_attn_3d(
     )
 
 
+_SHUFFLED_PREFILL = [(1, 1328), (1500, 1500), (37, 61)]  # enough tokens for the 2d grid
+_SHUFFLED_DECODE = [(1, 8191), (1, 5003), (1, 77), (1, 4096)]  # 3d grid
+
+
 @pytest.mark.parametrize(
     "seq_lens, block_size, dtype",
     [
-        # prefill (2d) and decode (3d), tile wider than a page and inside one
-        ([(1, 1328), (300, 800), (37, 37)], 16, torch.bfloat16),
-        ([(1, 1328), (300, 800), (37, 37)], 128, torch.bfloat16),
-        ([(1, 8192)] * 4, 16, torch.bfloat16),
-        ([(1, 8192)] * 4, 128, torch.bfloat16),
-        ([(1, 1328), (300, 800), (37, 37)], 16, e4m3_dtype),
+        # tiles wider than a page (16) and inside one (128), lengths off the page
+        (_SHUFFLED_PREFILL, 16, torch.bfloat16),
+        (_SHUFFLED_PREFILL, 128, torch.bfloat16),
+        (_SHUFFLED_PREFILL, 16, e4m3_dtype),
+        (_SHUFFLED_PREFILL, 128, e4m3_dtype),
+        (_SHUFFLED_DECODE, 16, torch.bfloat16),
+        (_SHUFFLED_DECODE, 128, torch.bfloat16),
+        (_SHUFFLED_DECODE, 16, e4m3_dtype),
     ],
 )
 @torch.inference_mode()
@@ -596,6 +602,9 @@ def test_triton_unified_attn_shuffled_tile(
         q_dtype=dtype,
         kv_dtype=dtype,
         shuffled_kv_cache=True,
+        # random descales can flatten the softmax until K hardly matters
+        use_q_descale=False,
+        use_kv_descale=False,
         device="cuda",
     )
 
