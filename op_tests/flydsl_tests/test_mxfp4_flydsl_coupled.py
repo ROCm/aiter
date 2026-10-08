@@ -221,12 +221,20 @@ def test_coupled_mxmoe(
         )
         first = output.clone()
         repeated = candidate()
+        assert torch.isfinite(repeated).all()
+        repeat_metric = cosine_diff_compare(
+            first, repeated, msg=f"{precision} {name} repeat"
+        )
+        assert math.isfinite(repeat_metric) and repeat_metric < 1e-5
         repeat_error = checkAllclose(
             first.float(),
             repeated.float(),
             rtol=0.02,
-            atol=0.02,
+            # BF16 atomic sums can round differently as expert writes arrive;
+            # reduce/scatter sum routes without that atomic ordering variation.
+            atol=0.0625 if name == "atomic" else 0.02,
             msg=f"{precision} {name} repeat",
+            catastrophic_check=True,
         )
         assert repeat_error == 0
         ret[f"{name} us"] = us
