@@ -53,7 +53,6 @@ from aiter.ops.flydsl.topk.topk_per_row import (
     _ONE_WORKGROUP_MAX_ROW_WIDTH,
     flydsl_top_k_per_row_decode,
 )
-from aiter.ops.topk_select import topk_select
 
 # The indexer contract this module implements, rather than any one model's
 # numbers: a budget of _K compressed blocks, _KV_HEADS head of _D elements,
@@ -1056,6 +1055,11 @@ def qsa_k1_score_and_select(
             stable=True,
         )
     else:
+        # Import here so loading this module does not pull aiter.ops.enum.
+        # That import calls get_module("module_aiter_core") and fails the
+        # wheel's forked FlyDSL AOT workers.
+        from aiter.ops.topk_select import topk_select
+
         topk_select(
             scored,
             _K,
