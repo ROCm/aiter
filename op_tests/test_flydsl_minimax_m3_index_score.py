@@ -97,28 +97,13 @@ for _tag, _cfg in [
     ("flydsl", {}),
     ("fly_shuf", {"shuffled": True}),
     ("fly_l2", {"pages_per_wave": 2}),
-    ("fly_qlds", {"q_to_lds": True}),
-    ("fly_fw2", {"feat_waves": 2}),
-    ("fly_fw4", {"feat_waves": 4}),
-    ("fly_fw2q", {"feat_waves": 2, "q_to_lds": True}),
-    ("fly_tw2", {"token_waves": 2}),
-    ("fly_tw4", {"token_waves": 4}),
-    ("fly_tw2s", {"token_waves": 2, "shuffled": True}),
-    ("fly_tw2l2", {"token_waves": 2, "pages_per_wave": 2}),
-    ("fly_fw2tw2", {"feat_waves": 2, "token_waves": 2}),
+    ("fly_tw2", {"waves_per_tok": 2}),
+    ("fly_tw4", {"waves_per_tok": 4}),
+    ("fly_tw2s", {"waves_per_tok": 2, "shuffled": True}),
+    ("fly_tw2l2", {"waves_per_tok": 2, "pages_per_wave": 2}),
     (
         "fly_allon",
-        {"feat_waves": 2, "q_to_lds": True, "shuffled": True, "pages_per_wave": 2},
-    ),
-    (
-        "fly_allon_tw",
-        {
-            "feat_waves": 2,
-            "token_waves": 2,
-            "q_to_lds": True,
-            "shuffled": True,
-            "pages_per_wave": 2,
-        },
+        {"waves_per_tok": 2, "shuffled": True, "pages_per_wave": 2},
     ),
 ]:
     CANDIDATES[_tag] = IndexScoreConfig(**_cfg)
@@ -313,7 +298,7 @@ def test_graph_buffers(world, rank, S, H, dtype, layout, map_in_graph):
     if (S, H) == (1, 4):
         cu = torch.cuda.get_device_properties("cuda").multi_processor_count
         mb = 2 * (cu // B)  # Exercise the two-token-wave automatic branch.
-        assert kernel.resolve_config(B, mb, IndexScoreConfig(), S, H).token_waves == 2
+        assert kernel.resolve_config(B, mb, IndexScoreConfig(), S, H).waves_per_tok == 2
     q, cache, _, seq, _ = make_case(B, S, H, [0, 513, 1], dtype)
     bt = torch.zeros((B, mb * world), dtype=torch.int32, device="cuda")
     bt[:, :5] = torch.arange(5, device="cuda", dtype=torch.int32)
@@ -456,8 +441,8 @@ def test_capacity_envelope(monkeypatch, cu):
     from aiter.jit.utils import chip_info
 
     monkeypatch.setattr(chip_info, "get_cu_num", lambda: cu)
-    for fw, tw, ppw in itertools.product([1, 2], [1, 2], [0, 1, 2, 4]):
-        cfg = IndexScoreConfig(feat_waves=fw, token_waves=tw, pages_per_wave=ppw)
+    for tw, ppw in itertools.product([1, 2], [0, 1, 2, 4]):
+        cfg = IndexScoreConfig(waves_per_tok=tw, pages_per_wave=ppw)
         cap = kernel.work_map_capacity(64, 33, 8, 4, cfg)
         for batch, mb in itertools.product(range(1, 65), [1, 4, 8, 16, 17, 32, 33]):
             assert kernel.work_map_size(batch, mb, 8, 4, cfg) <= cap
@@ -470,7 +455,7 @@ def test_auto_token_threshold(monkeypatch, cu):
     monkeypatch.setattr(chip_info, "get_cu_num", lambda: cu)
     cfg = IndexScoreConfig(cp_world=4, cp_rank=3)
     # Tail pages count as whole CTAs, not half pages in the split estimate.
-    assert kernel.resolve_config(cu + 1, 1, cfg, 1, 4).token_waves == 1
+    assert kernel.resolve_config(cu + 1, 1, cfg, 1, 4).waves_per_tok == 1
     for batch, mb, expected in [
         (1, cu - 1, 4),
         (2, cu // 2, 4),
@@ -479,7 +464,7 @@ def test_auto_token_threshold(monkeypatch, cu):
         (1, 2 * cu + 1, 1),
     ]:
         resolved = kernel.resolve_config(batch, mb, cfg, 1, 4)
-        assert resolved.token_waves == expected
+        assert resolved.waves_per_tok == expected
         assert resolved.pages_per_wave == 1
         assert resolved.nt_k == 2
         assert kernel.resolve_config(batch, mb, resolved, 1, 4) == resolved
@@ -487,18 +472,17 @@ def test_auto_token_threshold(monkeypatch, cu):
             (mb + kernel.work_chunk(resolved) - 1) // kernel.work_chunk(resolved)
         )
     for S, H in [(2, 4), (4, 4), (8, 4), (1, 17), (0, 0)]:
-        assert kernel.resolve_config(1, 1, cfg, S, H).token_waves == 1
+        assert kernel.resolve_config(1, 1, cfg, S, H).waves_per_tok == 1
 
 
 @pytest.mark.parametrize(
     "overrides",
     [
-        {"token_waves": 1},
-        {"token_waves": 2},
-        {"token_waves": 4},
+        {"waves_per_tok": 1},
+        {"waves_per_tok": 2},
+        {"waves_per_tok": 4},
         {"pages_per_wave": 1},
         {"pages_per_wave": 2},
-        {"q_to_lds": True},
         {"waves_per_eu": 1},
         {"nt_k": 0},
         {"sched": 0},
@@ -511,7 +495,7 @@ def test_auto_token_preserves_overrides(monkeypatch, overrides, mb):
     monkeypatch.setattr(chip_info, "get_cu_num", lambda: 256)
     cfg = IndexScoreConfig(**overrides)
     resolved = kernel.resolve_config(1, mb, cfg, 1, 4)
-    assert resolved.token_waves == overrides.get("token_waves", 1)
+    assert resolved.waves_per_tok == overrides.get("waves_per_tok", 1)
     for key, value in overrides.items():
         assert getattr(resolved, key) == value
 
@@ -527,8 +511,7 @@ def test_auto_token_preserves_overrides(monkeypatch, overrides, mb):
         (IndexScoreConfig(pages_per_wave=1), None),
         (IndexScoreConfig(pages_per_wave=1, spread=1), "_sp"),
         (IndexScoreConfig(pages_per_wave=1, shuffled=True), "_shuf"),
-        (IndexScoreConfig(pages_per_wave=1, token_waves=2), "_tw2"),
-        (IndexScoreConfig(pages_per_wave=1, feat_waves=2), "_fw2"),
+        (IndexScoreConfig(pages_per_wave=1, waves_per_tok=2), "_tw2"),
         (IndexScoreConfig(pages_per_wave=1, nt_k=0), "_kc0"),
         (IndexScoreConfig(pages_per_wave=1, sched=1), "_sc1"),
         (IndexScoreConfig(pages_per_wave=1, cp_world=4, cp_rank=2), "_cp4r2"),
@@ -554,9 +537,7 @@ def test_kernel_names_are_pairwise_distinct():
         "pages_per_wave": 2,
         "spread": 1,
         "shuffled": True,
-        "token_waves": 2,
-        "feat_waves": 2,
-        "q_to_lds": True,
+        "waves_per_tok": 2,
         "waves_per_eu": 1,
         "nt_k": 0,
         "sched": 1,
@@ -603,10 +584,9 @@ def test_shuffled_shares_dispatch_but_not_cache_policy(
     shuf = kernel.resolve_config(
         batch, max_block, IndexScoreConfig(shuffled=True), S, H
     )
-    assert (shuf.pages_per_wave, shuf.token_waves, shuf.feat_waves, shuf.spread) == (
+    assert (shuf.pages_per_wave, shuf.waves_per_tok, shuf.spread) == (
         native.pages_per_wave,
-        native.token_waves,
-        native.feat_waves,
+        native.waves_per_tok,
         native.spread,
     )
     assert shuf.nt_k == 2
@@ -647,7 +627,7 @@ def test_shuffled_shares_dispatch_but_not_cache_policy(
 )
 def test_served_decode_dispatch(S, H, batch, ppw):
     resolved = kernel.resolve_config(batch, 8192, IndexScoreConfig(), S, H)
-    assert (resolved.pages_per_wave, resolved.nt_k, resolved.token_waves) == (
+    assert (resolved.pages_per_wave, resolved.nt_k, resolved.waves_per_tok) == (
         ppw,
         0,
         1,
@@ -700,7 +680,7 @@ def test_q1_token_split_regime_kept(monkeypatch, batch, max_block, tw):
     resolved = kernel.resolve_config(batch, max_block, IndexScoreConfig(), 1, 4)
     # Small enough for the token split: it keeps its own measured regime.
     # One block past it, the S1 launch joins the one-tile depth table.
-    assert resolved.token_waves == tw
+    assert resolved.waves_per_tok == tw
     assert resolved.spread == (1 if tw == 1 else 0)
 
 
@@ -761,8 +741,7 @@ def test_spread_dispatch(S, H, batch, max_block, spread):
     "cfg",
     [
         IndexScoreConfig(spread=1, pages_per_wave=2),
-        IndexScoreConfig(spread=1, token_waves=2),
-        IndexScoreConfig(spread=1, feat_waves=2),
+        IndexScoreConfig(spread=1, waves_per_tok=2),
         IndexScoreConfig(spread=2),
     ],
 )
@@ -803,7 +782,7 @@ def test_spread_map_coverage(cu):
         world, rank = gen.choice([(1, 0), (1, 0), (4, 1), (2, 1)])
         lens = [gen.choice([0, gen.randint(1, mb * world * P)]) for _ in range(B)]
         cfg = IndexScoreConfig(
-            spread=1, pages_per_wave=1, token_waves=1, cp_world=world, cp_rank=rank
+            spread=1, pages_per_wave=1, waves_per_tok=1, cp_world=world, cp_rank=rank
         )
         rows = B * kernel._grid_chunks(mb, cfg)
         seq = torch.tensor(lens, dtype=torch.int32)
@@ -838,7 +817,7 @@ def test_chunk_map_kernel_matches_reference(ppw):
         lens = [min(gen.choice([0, 1, P, cap, gen.randint(1, cap)]), cap)
                 for _ in range(B)]  # fmt: skip
         cfg = IndexScoreConfig(
-            spread=0, pages_per_wave=ppw, token_waves=1,
+            spread=0, pages_per_wave=ppw, waves_per_tok=1,
             cp_world=world, cp_rank=rank,
         )  # fmt: skip
         chunk = kernel.work_chunk(cfg)
@@ -863,7 +842,7 @@ def test_spread_map_kernel_matches_reference(cu):
         lens = [gen.choice([0, 1, 4 * P, cap, gen.randint(1, cap)]) for _ in range(B)]
         lens = [min(x, cap) for x in lens]
         cfg = IndexScoreConfig(
-            spread=1, pages_per_wave=1, token_waves=1, cp_world=world, cp_rank=rank
+            spread=1, pages_per_wave=1, waves_per_tok=1, cp_world=world, cp_rank=rank
         )
         rows = B * kernel._grid_chunks(mb, cfg)
         seq = torch.tensor(lens, dtype=torch.int32, device="cuda")
@@ -948,7 +927,7 @@ def test_auto_token_capacity_envelope(monkeypatch, cu):
     for batch, mb, S in itertools.product(range(1, 65), [1, 4, 16, 17, 32, 33], [1, 8]):
         assert kernel.work_map_size(batch, mb, S, 4) <= cap
         assert kernel.work_map_capacity(batch, mb, S, 4) <= cap
-    explicit = IndexScoreConfig(token_waves=1)
+    explicit = IndexScoreConfig(waves_per_tok=1)
     assert kernel.work_map_capacity(64, 33, 1, 4, explicit) == 64 * 9
     # ...but not past the width where one page per chunk stops packing: the
     # token split cannot fire there either, and widening for it rejected bounds
@@ -969,11 +948,11 @@ def test_auto_token_explicit_device(monkeypatch):
         "get_device_properties",
         lambda device: SimpleNamespace(multi_processor_count=256),
     )
-    assert kernel.resolve_config(1, 257, IndexScoreConfig(), 1, 4).token_waves == 4
+    assert kernel.resolve_config(1, 257, IndexScoreConfig(), 1, 4).waves_per_tok == 4
     assert (
         kernel.resolve_config(
             1, 257, IndexScoreConfig(), 1, 4, device=torch.device("cuda", 0)
-        ).token_waves
+        ).waves_per_tok
         == 2
     )
 
@@ -988,7 +967,7 @@ def test_auto_token_legacy_map(world, rank, dtype, split):
         mb = 2 * (cu // B)
     q, k, bt, seq, _ = make_case(B, S, H, [0, 129, mb * world * P], dtype)
     cfg = IndexScoreConfig(cp_world=world, cp_rank=rank)
-    assert kernel.resolve_config(B, mb, cfg, S, H).token_waves == split
+    assert kernel.resolve_config(B, mb, cfg, S, H).waves_per_tok == split
     # The pre-existing public map helpers allow omitted S/H. Their map remains
     # usable without guessing its contents or copying/synchronizing it on host.
     wm = kernel.build_work_map(seq, mb, cfg=cfg)
@@ -1006,7 +985,7 @@ def test_auto_token_legacy_map(world, rank, dtype, split):
             D**-0.5,
             mb,
             work_map=wm,
-            token_waves=4,
+            waves_per_tok=4,
             cp_world=world,
             cp_rank=rank,
         )
@@ -1021,12 +1000,19 @@ def test_cli_default_matrix():
     assert len(cases) == 38
     assert args.impl == list(CANDIDATES)
     assert args.layout == ["contiguous", "feature"]
+    # 8 candidates x 38 cases x 2 layouts = 608, and every candidate now clears
+    # the filter on every row. It used to be 576 with 13 candidates: the five
+    # that set `waves_per_feat` were rejected wherever feature_tiles was 1,
+    # which is every shape except S=8. That knob is gone, so nothing is
+    # shape-gated here any more -- a candidate that stops clearing all 608 is a
+    # real regression in `selection_filter`, not a config that never applied.
     assert (
         sum(
             selection_filter(c[2], c[3], CANDIDATES[name], arch="gfx950")
             for c, name, _ in itertools.product(cases, args.impl, args.layout)
         )
-        == 652
+        == len(cases) * len(args.impl) * len(args.layout)
+        == 608
     )
 
 
@@ -1188,11 +1174,11 @@ def test_shuffle_layout_is_arch_independent(fp8):
     def destination(tr):
         row = torch.arange(P)
         kk = torch.arange(D)
-        panel, u = row // 16, row % 16
+        tok_tile, u = row // 16, row % 16
         i = kk // tr.block_k
         g = (kk % tr.block_k) // tr.lane_block
         v = kk % tr.lane_block
-        slot = panel[:, None] * tr.k_loads + i[None, :]
+        slot = tok_tile[:, None] * tr.k_loads + i[None, :]
         return (slot * 64 + (16 * g[None, :] + u[:, None])) * tr.chunk_elems + v[
             None, :
         ]
@@ -1208,9 +1194,7 @@ def test_shuffle_layout_is_arch_independent(fp8):
     "cfg",
     [
         IndexScoreConfig(pages_per_wave=1),
-        IndexScoreConfig(pages_per_wave=2, feat_waves=2),
-        IndexScoreConfig(pages_per_wave=2, token_waves=2),
-        IndexScoreConfig(pages_per_wave=2, q_to_lds=True),
+        IndexScoreConfig(pages_per_wave=2, waves_per_tok=2),
         IndexScoreConfig(pages_per_wave=2, shuffled=True),
     ],
 )
@@ -1222,13 +1206,11 @@ def test_gfx942_path_matches_oracle(monkeypatch, dtype, cfg):
     lane, and four elements fed through a k=32 MFMA cannot come out right. So
     a pass here means the shape, the k-axis map and the widening all agree.
 
-    q_to_lds and the shuffled layout are in the list because they are where
-    the two generations could diverge silently: the LDS fill indexes by Q
-    access rather than k-step, and the shuffled reader bypasses k_offset
-    entirely.
+    The shuffled layout is in the list because it is where the two
+    generations could diverge silently: the shuffled reader bypasses k_offset
+    entirely, so nothing else would catch a disagreement about it.
     """
-    # S=8 H=4 is two feature tiles, so feat_waves=2 is actually exercised
-    # rather than skipped.
+    # S=8 H=4 is two feature tiles, the widest this axis gets.
     S, H = 8, 4
     assert not selection_filter(S, H, cfg) or kernel.feature_tiles(S, H) > 1
     q, cache, bt, lens, mb = make_case(3, S, H, [0, 129, 2305], dtype)
@@ -1257,10 +1239,10 @@ def test_fp8_dtype_comes_from_aiter():
     """The accepted fp8 flavour is the arch's, not a literal in the kernel.
 
     e4m3fn and e4m3fnuz differ in exponent bias, so a kernel that names one
-    and runs on the other is silently off by a factor of two. Pinning this to
-    `aiter.dtypes` means the chip decides.
+    and runs on the other is silently off by a factor of two. The kernel takes
+    it from `aiter.dtypes`, which means the chip decides.
     """
-    assert kernel._fp8_dtype() is dtypes.fp8
+    assert kernel.dtypes.fp8 is dtypes.fp8
     # gfx950 is the only arch this kernel accepts, and its fp8 is OCP e4m3fn.
     assert dtypes.fp8 is torch.float8_e4m3fn
 
@@ -1287,7 +1269,7 @@ def test_empty_selection(caplog):
     caplog.handler.setLevel(0)
     aiter.logger.addHandler(caplog.handler)
     main(["--case", "not-a-case"])
-    main(["--case", "F1_s4096_bf16", "--impl", "fly_fw4"])
+    main(["--case", "F1_s4096_bf16", "--impl", "fly_tw4"])
     aiter.logger.removeHandler(caplog.handler)
     assert "no score tests executed" in caplog.text
     with pytest.raises(SystemExit) as exc:
@@ -1295,11 +1277,11 @@ def test_empty_selection(caplog):
     assert exc.value.code == 2
 
 
-@pytest.mark.parametrize("token_waves", [1, 2, 4])
-def test_empty_cp_shard_narrow_table(token_waves):
+@pytest.mark.parametrize("waves_per_tok", [1, 2, 4])
+def test_empty_cp_shard_narrow_table(waves_per_tok):
     q, k, bt, lens, mb = make_case(2, 4, 4, [0, 128], torch.bfloat16)
     cfg = IndexScoreConfig(
-        cp_world=4, cp_rank=3, token_waves=token_waves, pages_per_wave=2
+        cp_world=4, cp_rank=3, waves_per_tok=waves_per_tok, pages_per_wave=2
     )
     out = score_flydsl(q, k, bt, lens, 4, 4, D**-0.5, mb, cfg=cfg)
     check_scores(out, score_oracle(q, k, bt, lens, 4, 4, D**-0.5, mb, 4, 3))
@@ -1312,29 +1294,27 @@ def test_empty_cp_shard_narrow_table(token_waves):
         IndexScoreConfig(pages_per_wave=1),
         IndexScoreConfig(pages_per_wave=2),
         IndexScoreConfig(pages_per_wave=4),
-        IndexScoreConfig(pages_per_wave=2, token_waves=2),
-        IndexScoreConfig(pages_per_wave=2, token_waves=4),
-        IndexScoreConfig(pages_per_wave=2, feat_waves=2),
+        IndexScoreConfig(pages_per_wave=2, waves_per_tok=2),
+        IndexScoreConfig(pages_per_wave=2, waves_per_tok=4),
         IndexScoreConfig(pages_per_wave=2, shuffled=True),
         # The token split is newly reachable with the shuffled layout: it used
         # to be excluded from the auto tuner, so no launch resolved to both.
         # Shuffled addressing shifts by tw_slot rather than by the row stride,
         # and that shift is the part a token split moves.
-        IndexScoreConfig(pages_per_wave=2, token_waves=2, shuffled=True),
-        IndexScoreConfig(pages_per_wave=2, token_waves=4, shuffled=True),
-        IndexScoreConfig(pages_per_wave=2, feat_waves=2, shuffled=True),
+        IndexScoreConfig(pages_per_wave=2, waves_per_tok=2, shuffled=True),
+        IndexScoreConfig(pages_per_wave=2, waves_per_tok=4, shuffled=True),
         IndexScoreConfig(pages_per_wave=2, sched=1),
         IndexScoreConfig(pages_per_wave=2, sched=2),
         IndexScoreConfig(pages_per_wave=2, sched=3),
         IndexScoreConfig(pages_per_wave=2, sched=4),
     ],
 )
-def test_fp8_panel_pipeline(S, cfg):
+def test_fp8_tok_tile_pipeline(S, cfg):
     if not selection_filter(S, 4, cfg):
         pytest.skip("feature split needs multiple feature tiles")
-    # Negative scores expose accidental zero-initialized panel maxima. The
+    # Negative scores expose accidental zero-initialized tok_tile maxima. The
     # short requests cover empty/fully masked pages while the last request
-    # exercises multiple page carries and a partial final panel.
+    # exercises multiple page carries and a partial final tok_tile.
     q, cache, bt, lens, mb = make_case(4, S, 4, [0, 1, 130, 2305], torch.float8_e4m3fn)
     q.copy_(q.abs() + 0.25)
     cache.copy_(-(cache.float().abs() + 0.25))
@@ -1430,8 +1410,7 @@ def test_noncurrent_device():
 @pytest.mark.parametrize(
     "cfg",
     [
-        IndexScoreConfig(feat_waves=0),
-        IndexScoreConfig(token_waves=3),
+        IndexScoreConfig(waves_per_tok=3),
         IndexScoreConfig(pages_per_wave=-1),
         IndexScoreConfig(cp_world=0),
         IndexScoreConfig(nt_k=9),
@@ -1486,8 +1465,14 @@ def test_lds_uses_explicit_arch(monkeypatch):
     from aiter.jit.utils import chip_info
 
     monkeypatch.setattr(chip_info, "get_gfx", lambda: "gfx942")
-    cfg = IndexScoreConfig(q_to_lds=True, token_waves=2, pages_per_wave=1, sched=0)
-    assert kernel.selection_filter(64, 4, cfg, arch="gfx950")
+    cfg = IndexScoreConfig(waves_per_tok=2, pages_per_wave=1, sched=0)
+    # S=160 H=8 needs 80 KB of reduction LDS: over gfx942's 64 KB, under
+    # gfx950's 160 KB. The pair has to straddle the two capacities or the
+    # assertion passes even when `selection_filter` ignores `arch` entirely --
+    # which is what the old S=64 H=4 shape did at 16 KB.
+    assert kernel.reduce_lds_bytes(160, 8, cfg) == 80 * 1024
+    assert kernel.selection_filter(160, 8, cfg, arch="gfx950")
+    assert not kernel.selection_filter(160, 8, cfg, arch="gfx942")
 
 
 def check_scores(got, ref):
@@ -1690,7 +1675,7 @@ _GPU_TESTS = (
     test_invalid_metadata,
     test_aligned_padding,
     test_empty_cp_shard_narrow_table,
-    test_fp8_panel_pipeline,
+    test_fp8_tok_tile_pipeline,
     test_arch_rejected,
     test_shuffled_padding_rejected,
     test_scale_fp32_range,
