@@ -23,6 +23,7 @@ from flydsl.runtime.device import get_rocm_arch
 
 from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import (
     async_a_copy_is_partial,
+    async_copy_supported_on_arch,
 )
 
 from .mfma_preshuffle_pipeline import xcd_remap_bx_by
@@ -256,7 +257,7 @@ def compile_preshuffle_gemm(
             f"tile_m={tile_m}, tile_n={tile_n}, tile_k={tile_k}, "
             f"A bytes={tile_m * tile_k * elem_bytes}. Use use_async_copy=0."
         )
-    if use_async_copy and is_gfx942:
+    if use_async_copy and not async_copy_supported_on_arch(gpu_arch):
         raise ValueError(
             "use_async_copy=1 requires 128-bit LDS-direct loads unavailable on gfx942; "
             "use use_async_copy=0."
