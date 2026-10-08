@@ -7,7 +7,7 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T, as_ir_value
 
-from ..mxfp4_kname import MXFP4_G1_VARIANTS
+from ..mxfp4_gemm1_kernels import _assert_supported
 from . import dpp_utils
 from .mxfp4_gemm_common import (
     _activation_mul_batch,
@@ -1519,54 +1519,28 @@ def compile_gemm1_a4w4_port(
     k_wave=1,
 ):
     """Compile GEMM1 with expert-sorted output."""
-    if a_dtype not in ("fp4", "fp8"):
-        raise AssertionError(f"a_dtype must be 'fp4' or 'fp8', got {a_dtype!r}")
-    if (BM, use_nt, inline_quant) not in MXFP4_G1_VARIANTS[a_dtype]:
-        raise AssertionError(
-            f"unsupported gemm1 variant (a_dtype={a_dtype}, BM={BM}, use_nt={use_nt}, inline_quant={inline_quant})"
+    try:
+        _assert_supported(
+            D_HIDDEN=D_HIDDEN,
+            D_INTER=D_INTER,
+            BM=BM,
+            use_nt=use_nt,
+            inline_quant=inline_quant,
+            prefetch_hidden=prefetch_hidden,
+            BN=BN,
+            BK=BK,
+            a_dtype=a_dtype,
+            out_dtype=out_dtype,
+            act=act,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+            swiglu_limit=swiglu_limit,
+            num_waves=num_waves,
+            native_scale_layout=native_scale_layout,
+            k_wave=k_wave,
         )
-    if out_dtype not in ("fp4", "fp8"):
-        raise AssertionError(f"out_dtype must be 'fp4' or 'fp8', got {out_dtype!r}")
-    if act not in ("silu", "swiglu", "situv2"):
-        raise AssertionError(f"act must be 'silu', 'swiglu', or 'situv2', got {act!r}")
-    if act == "situv2" and (situ_beta <= 0.0 or situ_linear_beta <= 0.0):
-        raise AssertionError("SiTUv2 beta values must be positive")
-    if act == "swiglu" and swiglu_limit <= 0.0:
-        raise AssertionError("Swiglu limit must be positive")
-    if prefetch_hidden and not inline_quant:
-        raise AssertionError("hidden prefetch requires inline quantization")
-    assert num_waves in (2, 4), f"num_waves must be 2 or 4, got {num_waves}"
-    assert k_wave in (1, 2, 4), f"k_wave must be 1, 2, or 4, got {k_wave}"
-
-    assert (
-        BN in (64, 128, 256) and BK == 256
-    ), f"only BN in (64, 128, 256) and BK==256 supported, got BN={BN} BK={BK}"
-    if BN == 64:
-        # Activation is not part of the BN64 specialization: BN_INT = BN // 2 is
-        # the gate (and up) column count, and both the epilogue column mapping
-        # and the scale-group layout above are written against BN_INT, so BN64
-        # is one complete 32-column MX group for any activation. Only the tile
-        # shape and data layout are constrained.
-        assert (
-            BM == 32 and a_dtype == "fp4" and out_dtype == "fp4" and not inline_quant
-        ), "BN64 is restricted to BM32 A4W4 non-inline"
-    if num_waves == 2:
-        assert BN == 64, "the two-wave specialization requires effective BN64"
-    if native_scale_layout:
-        assert (
-            BM == 16 and out_dtype == "fp4"
-        ), "native scale layout is restricted to BM16 FP4 output"
-    if k_wave > 1:
-        assert BM == 32, "k_wave > 1 is currently restricted to BM32"
-        assert not inline_quant, "k_wave > 1 does not support inline quantization"
-        # Fused bias is k_wave-safe: every K-wave writes its partial accumulator
-        # to its own acc_idx(wave_k, ...) LDS group, the cross-wave reduction
-        # happens once inside acc_load_sum(), and run_epilogue() -- the only
-        # place the bias is added -- runs under `wave_k == 0`. So the bias lands
-        # exactly once, after the reduction, as it does for k_wave == 1.
-        assert (
-            num_waves * k_wave <= 8
-        ), f"k_wave creates too many waves: {num_waves} * {k_wave} > 8"
+    except NotImplementedError as exc:
+        raise AssertionError(str(exc)) from exc
     KH_TILE = BK if a_dtype == "fp8" else BK // 2
     assert (
         D_HIDDEN % BK == 0
