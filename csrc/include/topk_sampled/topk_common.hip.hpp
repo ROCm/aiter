@@ -545,7 +545,7 @@ __device__ __forceinline__ uint32_t wave_suffix_sum(uint32_t v)
 // the LDS reads. Reaching 2 that way needs a double-buffered histogram (+4 KB),
 // which takes phase_a from 4 to 3 blocks/CU at S=8192 (163840/42008 vs
 // 163840/37912) for a barrier measured at -0.35% at M=4096 N=131072.
-template <bool CLEAR = false>
+template <bool CLEAR>
 __device__ __forceinline__ void
 block_find_pivot_bucket_wave0(uint32_t* __restrict__ s_hist, uint32_t* __restrict__ s_scan, int ek)
 {

@@ -140,7 +140,7 @@ __device__ __forceinline__ void block_select_lds(const uint32_t* __restrict__ s_
 //
 // Where it runs is decided on the host (wide_select_for): the buffers live in
 // dynamic LDS so a launch that does not ask for them pays no occupancy for them.
-template <bool REUSE_WIDE = false>
+template <bool REUSE_WIDE>
 __device__ __forceinline__ void block_select_lds_wide(const uint32_t* __restrict__ s_keys,
                                                       int c,
                                                       int K,
@@ -1561,6 +1561,10 @@ bool topk_sampled_supports(int64_t numRows, int64_t stride0, int64_t k, int64_t 
     if(!sampled_device_ok(static_cast<int>(device_id)))
         return false;
     if(numRows <= 0 || stride0 <= 0 || k <= 0)
+        return false;
+    // The launch plan and the kernels index rows and columns as int: refuse what
+    // would not survive the narrowing below rather than serve a truncated shape.
+    if(numRows > INT32_MAX || stride0 > INT32_MAX)
         return false;
     if(k > PHASE_C_CAP_MAX)
         return false;

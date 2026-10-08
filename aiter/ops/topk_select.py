@@ -569,9 +569,11 @@ def _available(
     # the row count; `topk_select_backend` asks `topk_sampled_supports` with the
     # rows it has. Admitting it here and refusing there is the same shape as the
     # streaming selector's two-block-width case above.
-    # `sampled_ok` is whether the input's own GPU may run it (`_sampled_on_device`):
-    # the kernels are traps off gfx950, and one process can hold both kinds.
-    if fp32 and sampled_ok and os.environ.get("AITER_DISABLE_TOPK_SAMPLED", "0") != "1":
+    # `sampled_ok` is whether this call may use it at all: the input's own GPU
+    # can run it (`_sampled_on_device`: the kernels are traps off gfx950, and
+    # one process can hold both kinds) and AITER_DISABLE_TOPK_SAMPLED is unset.
+    # Both are read per call and arrive here as part of the memo key.
+    if fp32 and sampled_ok:
         out.add("sampled")
     return frozenset(out)
 
@@ -587,6 +589,7 @@ def _choose(
     deterministic: bool,
     fp32: bool,
     device: int,
+    sampled_ok: bool,
 ) -> str:
     """The backend for one call shape on one GPU, resolved once.
 
@@ -598,10 +601,7 @@ def _choose(
     allowed = frozenset(_BACKENDS_BY_TIE[tie])
     if deterministic:
         allowed -= _NONDETERMINISTIC
-    available = (
-        _available(width, k, wave_size, ragged, fp32, _sampled_on_device(device))
-        & allowed
-    )
+    available = _available(width, k, wave_size, ragged, fp32, sampled_ok) & allowed
     if not available:
         raise RuntimeError(
             f"no backend serves rows={rows} width={width} topk={k} "
@@ -1055,6 +1055,8 @@ def topk_select(
         deterministic,
         input.dtype is torch.float32,
         input.device.index,
+        _sampled_on_device(input.device.index)
+        and os.environ.get("AITER_DISABLE_TOPK_SAMPLED", "0") != "1",
     )
     gathered = None
     if _whole_row_takes(

@@ -536,7 +536,9 @@ def top_k_per_row_prefill(
     if _should_use_sampled_prefill(
         numRows, stride0, stride1, k, stable, logits.get_device()
     ) and (
-        _sampled_layout_error(logits, rowStarts, rowEnds, indices, values, numRows, k)
+        _sampled_layout_error(
+            logits, rowStarts, rowEnds, indices, values, numRows, stride0, k
+        )
         is None
     ):
         # Reached with the caller's own bounds, so the ragged kernels stay.
@@ -683,21 +685,38 @@ def _sampled_layout_error(
     indices: torch.Tensor,
     values: torch.Tensor | None,
     numRows: int,
+    stride0: int,
     k: int,
 ) -> str | None:
     """Why the sampled kernels cannot take these tensors as given, or None.
 
-    The kernels address indices and values as dense rows of k from the data
-    pointer and read both row bounds as dense int32 arrays, so a strided view or
-    another dtype would be read or written in the wrong place: a row-strided
-    [rows, k] slice of a wider buffer gets its guard columns overwritten and its
-    last slots left unwritten. Metadata only, so nothing here synchronises.
+    The kernels read row r of logits at data_ptr + r * stride0, address indices
+    and values as dense rows of k from the data pointer, and read both row
+    bounds as dense int32 arrays. A tensor laid out otherwise would be read or
+    written in the wrong place -- a row-strided [rows, k] slice of a wider
+    buffer gets its guard columns overwritten and its last slots left unwritten
+    -- or read past its end. Metadata only, so nothing here synchronises.
     """
     dev = logits.device
     if dev.type != "cuda":
         return f"logits must be on a GPU, got {dev}"
     if logits.dtype is not torch.float32:
         return f"logits must be fp32, got {logits.dtype}"
+    if logits.dim() == 2:
+        rows, width = logits.shape
+        if rows < numRows:
+            return f"logits has {rows} rows, numRows is {numRows}"
+        if width > 1 and logits.stride(1) != 1:
+            return f"logits inner stride must be 1, got {logits.stride(1)}"
+        if rows > 1 and logits.stride(0) != stride0:
+            return f"logits row stride is {logits.stride(0)}, stride0 is {stride0}"
+        if width > stride0:
+            return f"logits rows are {width} wide, wider than stride0 {stride0}"
+    elif not logits.is_contiguous() or logits.numel() < numRows * stride0:
+        return (
+            f"logits must be [numRows, width] or a contiguous buffer of "
+            f"numRows * stride0 = {numRows * stride0} entries"
+        )
     for name, t, dtype, need in (
         ("indices", indices, torch.int32, numRows * k),
         ("values", values, torch.float32, numRows * k),
@@ -714,6 +733,8 @@ def _sampled_layout_error(
             return f"{name} must be contiguous, got strides {tuple(t.stride())}"
         if t.numel() < need:
             return f"{name} holds {t.numel()} entries, needs {need}"
+        if name in ("indices", "values") and t.dim() >= 2 and t.size(-1) != k:
+            return f"{name} rows are {t.size(-1)} wide; the kernels write rows of k={k}"
     return None
 
 
@@ -828,7 +849,9 @@ def top_k_per_row_prefill_sampled(
         raise ValueError(
             f"top_k_per_row_prefill_sampled: logits inner stride must be 1, got {stride1}"
         )
-    err = _sampled_layout_error(logits, rowStarts, rowEnds, indices, values, numRows, k)
+    err = _sampled_layout_error(
+        logits, rowStarts, rowEnds, indices, values, numRows, stride0, k
+    )
     if err is not None:
         raise ValueError(f"top_k_per_row_prefill_sampled: {err}")
     if not _sampled_supports_cached(numRows, stride0, k, logits.get_device()):
@@ -848,6 +871,13 @@ def top_k_per_row_prefill_sampled(
             raise ValueError(
                 "top_k_per_row_prefill_sampled: workspace must be a contiguous "
                 f"tensor on {logits.device}"
+            )
+        # Every region inside is laid out 256-byte aligned from the base, and the
+        # candidate records are 8-byte words: a base off that grid misaligns them.
+        if workspace.data_ptr() % 256 != 0:
+            raise ValueError(
+                "top_k_per_row_prefill_sampled: workspace must start 256-byte "
+                f"aligned, got data_ptr % 256 = {workspace.data_ptr() % 256}"
             )
         if workspace.numel() * workspace.element_size() < size:
             raise ValueError(

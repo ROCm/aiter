@@ -64,6 +64,8 @@ def test_sampled_layout_contract():
             "rowEnds": re,
             "indices": torch.empty(rows, K, dtype=torch.int32, device="cuda"),
             "values": None,
+            "stride0": N,
+            "workspace": None,
         }
         a.update(over)
         try:
@@ -74,9 +76,10 @@ def test_sampled_layout_contract():
                 a["indices"],
                 a["values"],
                 rows,
-                N,
+                a["stride0"],
                 1,
                 K,
+                workspace=a["workspace"],
             )
         except ValueError:
             return True
@@ -92,6 +95,15 @@ def test_sampled_layout_contract():
         rowEnds=torch.full((rows, 2), N, dtype=torch.int32, device="cuda")[:, 0]
     )
     assert refused(indices=torch.empty(rows, K, dtype=torch.int32)), "a CPU output"
+    assert refused(logits=x[:1]), "fewer logits rows than numRows"
+    assert refused(logits=x.t().contiguous().t()), "logits with an inner stride"
+    wide = torch.zeros(rows, N + 64, device="cuda")[:, :N]
+    assert refused(logits=wide), "a row stride other than stride0"
+    two_k = torch.empty(rows, 2 * K, dtype=torch.int32, device="cuda")
+    assert refused(indices=two_k), "indices rows wider than k"
+    size = T._sampled_workspace_size_cached(rows, N, K)
+    ws = torch.empty(size + 512, dtype=torch.uint8, device="cuda")[1 : 1 + size]
+    assert refused(workspace=ws), "a workspace off the 256-byte grid"
 
     # Through the router a strided output is what the pre-`sampled` path makes of
     # it: same writes, same untouched slots.
@@ -104,6 +116,15 @@ def test_sampled_layout_contract():
         out[on] = g.view(-1).sort().values
     _use_sampled(True)
     assert torch.equal(out[True], out[False]), "the router changed a strided call"
+    out = {}
+    for on in (True, False):
+        _use_sampled(on)
+        g = torch.full((rows, 2 * K), -7, dtype=torch.int32, device="cuda")
+        T.top_k_per_row_prefill(x, rs, re, g, None, rows, N, 1, K)
+        torch.cuda.synchronize()
+        out[on] = g.view(-1).sort().values
+    _use_sampled(True)
+    assert torch.equal(out[True], out[False]), "the router changed a [rows, 2k] call"
     print("[sampled_layout] PASS")
 
 
@@ -196,7 +217,9 @@ def test_sampled_eligibility_per_device():
         with mock.patch.object(T, "_top_k_per_row_prefill_sampled") as fn:
             T.top_k_per_row_prefill(x, rs, re, idx, None, rows, N, 1, K)
             prefill = fn.called
-        select = S._choose(rows, N, K, 64, False, None, False, True, dev)
+        select = S._choose(
+            rows, N, K, 64, False, None, False, True, dev, S._sampled_on_device(dev)
+        )
         return prefill, select == "sampled"
 
     _use_sampled(True)
