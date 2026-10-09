@@ -8,14 +8,33 @@ explicit PyTorch reference (and the in-tree Triton split-qkv kernel) on varlen /
 continuous-batching shapes, including the conv_state (initial-state) path.
 """
 
+import argparse
+import itertools
+
+import pandas as pd
 import pytest
 import torch
+
+import aiter
+from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 CONV_DIM = 8192
 K_DIM = 2048
 V_DIM = 4096
 WIDTH = 4
 STATE_LEN = WIDTH - 1
+SUPPORTED_GFX = ("gfx942", "gfx950")
+_MAX_PERF_ROTATIONS = 32
+_PERF_ROTATION_BUDGET = 256 * 1024 * 1024
+
+
+def _perf_rotation_count(state: torch.Tensor) -> int:
+    return max(
+        1,
+        min(_MAX_PERF_ROTATIONS, _PERF_ROTATION_BUDGET // max(1, state.nbytes)),
+    )
 
 
 def _silu(t):
@@ -460,46 +479,231 @@ def test_hip_cache_mapping_and_padding(channel_last, with_is):
     assert absd < 5e-2, f"hip mapped state: max_abs={absd:.4f} rel={rel:.4f}"
 
 
+@benchmark()
+def test_prefill_split_qkv_benchmark(
+    batch: int = 1,
+    seqlen: int = 8,
+    k_dim: int = K_DIM,
+    v_dim: int = V_DIM,
+    dtype: torch.dtype = torch.bfloat16,
+    layout: str = "channel_first",
+    with_initial_state: bool = True,
+):
+    """Benchmark public prefill backends with model layouts and metadata."""
+    conv_dim = 2 * k_dim + v_dim
+    if conv_dim != CONV_DIM:
+        raise ValueError(
+            f"benchmark requires 2*k_dim + v_dim == {CONV_DIM}, got {conv_dim}"
+        )
+    if layout not in {"channel_first", "channel_last"}:
+        raise ValueError(f"unsupported layout {layout!r}")
+
+    cu = [i * seqlen for i in range(batch + 1)]
+    x, weight, bias, conv_states, cache_indices, has_initial_state, qsl = make_inputs(
+        cu,
+        with_initial_state=with_initial_state,
+        channel_last=layout == "channel_last",
+        dtype=dtype,
+        seed=batch * 31 + seqlen,
+    )
+    seq_lens_cpu = [seqlen] * batch
+    from aiter.ops.prefill_batch_metadata import build_causal_conv_prefill_metadata
+
+    metadata = build_causal_conv_prefill_metadata(
+        seq_lens_cpu,
+        query_start_loc=qsl,
+        block_sizes=(8, 16, 32, 64),
+    )
+    ref_q, ref_k, ref_v, ref_state = torch_reference(
+        x,
+        weight,
+        bias,
+        conv_states.clone(),
+        qsl,
+        cache_indices,
+        has_initial_state,
+        k_dim,
+        v_dim,
+    )
+
+    def run_backend(backend, state):
+        return _call_backend(
+            backend,
+            x=x,
+            weight=weight,
+            bias=bias,
+            conv_states=state,
+            query_start_loc=qsl,
+            cache_indices=cache_indices,
+            has_initial_state=has_initial_state,
+            k_dim=k_dim,
+            v_dim=v_dim,
+            seq_lens_cpu=seq_lens_cpu,
+            activation="silu",
+            metadata=metadata,
+        )
+
+    candidates = {
+        "hip": lambda state: run_backend("hip", state),
+    }
+    if layout == "channel_first":
+        # Only HIP's public contract is validated for the transposed
+        # channel-last view; the other public backends consume channel-first x.
+        candidates.update(
+            {
+                "flydsl": lambda state: run_backend("flydsl", state),
+                "triton2d": lambda state: run_backend("triton2d", state),
+                "triton": lambda state: run_backend("triton", state),
+            }
+        )
+
+    tokens = batch * seqlen
+    flops = 2 * tokens * conv_dim * WIDTH
+    nbytes = (
+        x.numel()
+        + weight.numel()
+        + bias.numel()
+        + ref_q.numel()
+        + ref_k.numel()
+        + ref_v.numel()
+        + 2 * conv_states.numel()
+    ) * x.element_size()
+
+    ret = {"gfx": get_gfx()}
+    references = (ref_q, ref_k, ref_v, ref_state)
+    for name, fn in candidates.items():
+        checked_state = conv_states.clone()
+
+        def checked_call(state, fn=fn):
+            return fn(state)
+
+        checked, _ = run_perftest(
+            checked_call,
+            checked_state,
+            num_iters=1,
+            num_warmup=0,
+            num_rotate_args=1,
+            use_cuda_event=True,
+        )
+        checked = (*checked, checked_state)
+        errs = [
+            checkAllclose(
+                ref.to(dtypes.fp32),
+                got.to(dtypes.fp32),
+                rtol=1e-2,
+                atol=5e-2,
+                msg=f"{name}: {label}",
+            )
+            for label, got, ref in zip(
+                ("q", "k", "v", "in-place conv_state"), checked, references
+            )
+        ]
+
+        timing_state = conv_states.clone()
+        _, us = run_perftest(
+            fn,
+            timing_state,
+            num_rotate_args=_perf_rotation_count(timing_state),
+        )
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = max(errs)
+    return ret
+
+
+# The benchmark is driven by main(); the pytest correctness cases remain
+# independently collectible without duplicating the perf sweep.
+test_prefill_split_qkv_benchmark.__test__ = False
+
+
 def qsl_to(qsl):
     if torch.is_tensor(qsl):
         return qsl
     return torch.tensor(qsl, dtype=torch.int32, device="cuda")
 
 
+def main():
+    gfx = get_gfx()
+    if gfx not in SUPPORTED_GFX:
+        aiter.logger.warning(
+            "causal conv1d prefill split-qkv unsupported on %s; skipping", gfx
+        )
+        return
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="Benchmark causal conv1d prefill split-qkv public backends",
+    )
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        type=dtypes.str2Dtype,
+        nargs="*",
+        default=[torch.bfloat16],
+        choices=[torch.bfloat16],
+    )
+    parser.add_argument("-b", "--batch", type=int, nargs="*", default=[1, 4])
+    parser.add_argument(
+        "-s",
+        "--mnk",
+        type=dtypes.str2tuple,
+        nargs="*",
+        default=[(8, K_DIM, V_DIM), (64, K_DIM, V_DIM)],
+        help="seqlen,k_dim,v_dim",
+    )
+    parser.add_argument(
+        "-l",
+        "--layout",
+        type=str,
+        nargs="*",
+        choices=["channel_first", "channel_last"],
+        default=["channel_first", "channel_last"],
+    )
+    parser.add_argument(
+        "--initial-state",
+        type=int,
+        nargs="*",
+        choices=[0, 1],
+        default=[0, 1],
+    )
+    args = parser.parse_args()
+
+    rows = []
+    for dtype, batch, shape, layout, with_initial_state in itertools.product(
+        args.dtype,
+        args.batch,
+        args.mnk,
+        args.layout,
+        args.initial_state,
+    ):
+        seqlen, k_dim, v_dim = shape
+        rows.append(
+            test_prefill_split_qkv_benchmark(
+                batch,
+                seqlen,
+                k_dim,
+                v_dim,
+                dtype,
+                layout,
+                bool(with_initial_state),
+            )
+        )
+    aiter.logger.info(
+        "causal conv1d prefill split-qkv summary (markdown):\n%s",
+        pd.DataFrame(rows).to_markdown(index=False),
+    )
+
+    # Preserve the mixed-varlen script coverage that existed before the
+    # benchmark entrypoint was added. These direct calls retain the assertions
+    # in the pytest correctness test and cover lengths up to 5063 tokens.
+    for backend, cu, with_initial_state in itertools.product(
+        ("hip", "flydsl", "triton2d", "triton"),
+        SHAPES,
+        (False, True),
+    ):
+        test_backend_matches_reference(cu, with_initial_state, backend)
+
+
 if __name__ == "__main__":
-    torch.manual_seed(0)
-    backends = ["hip", "triton2d", "triton", "flydsl"]
-    for backend in backends:
-        print(f"\n=== backend={backend} ===")
-        for cu in SHAPES:
-            for with_is in (False, True):
-                x, w, b, cs, ci, hi, qsl = make_inputs(cu, with_initial_state=with_is)
-                ref_q, ref_k, ref_v, ref_cs = torch_reference(
-                    x, w, b, cs.clone(), qsl, ci, hi, K_DIM, V_DIM
-                )
-                cs_work = cs.clone()
-                q, k, v = _call_backend(
-                    backend,
-                    x=x,
-                    weight=w,
-                    bias=b,
-                    conv_states=cs_work,
-                    query_start_loc=qsl,
-                    cache_indices=ci,
-                    has_initial_state=hi,
-                    k_dim=K_DIM,
-                    v_dim=V_DIM,
-                    seq_lens_cpu=qsl.diff().tolist(),
-                    activation="silu",
-                )
-                rq = _max_abs_rel(q, ref_q)[1]
-                rk = _max_abs_rel(k, ref_k)[1]
-                rv = _max_abs_rel(v, ref_v)[1]
-                rc = _max_abs_rel(cs_work, ref_cs)[1]
-                ok = max(rq, rk, rv, rc) < 5e-2
-                print(
-                    f"  cu={cu} is={int(with_is)}  "
-                    f"q={rq:.4f} k={rk:.4f} v={rv:.4f} cs={rc:.4f}  "
-                    f"{'OK' if ok else 'FAIL'}"
-                )
-    print("\ndone")
+    main()

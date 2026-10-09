@@ -18,7 +18,6 @@ _batched_gemm_afp4_wfp4_repr = make_kernel_repr(
         "NUM_KSPLIT",
         "SPLITK_BLOCK_SIZE",
         "EVEN_K",
-        "GRID_MN",
         "cache_modifier",
     ],
 )
@@ -39,8 +38,6 @@ _batched_gemm_afp4_wfp4_reduce_repr = make_kernel_repr(
         "EVEN_K": lambda args: (args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0)
         and (args["SPLITK_BLOCK_SIZE"] % args["BLOCK_SIZE_K"] == 0)
         and (args["K"] % (args["SPLITK_BLOCK_SIZE"] // 2) == 0),
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
 @triton.jit(repr=_batched_gemm_afp4_wfp4_repr)
@@ -77,7 +74,6 @@ def _batched_gemm_afp4_wfp4_kernel(
     NUM_KSPLIT: tl.constexpr,
     SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
-    GRID_MN: tl.constexpr,
     cache_modifier: tl.constexpr,
 ):
     """Kernel for computing the matmul C = A x B.
@@ -138,7 +134,11 @@ def _batched_gemm_afp4_wfp4_kernel(
     stride_bsn = tl.cast(stride_in_bsn, tl.int64)
 
     if NUM_KSPLIT == 1:
-        remap_xcd(pid, GRID_MN)
+        # Sourced in-body rather than as a constexpr so M and N stay out of the
+        # specialisation key: under serving, M is the scheduler-formed batch size,
+        # so a constexpr here mints a new binary per batch shape. Same form as
+        # gemm/basic/gemm_afp4wfp4.py.
+        remap_xcd(pid, num_pid_m * num_pid_n)
 
         pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
     else:

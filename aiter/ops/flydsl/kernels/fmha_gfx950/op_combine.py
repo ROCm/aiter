@@ -6,7 +6,6 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
@@ -197,8 +196,7 @@ class DualwaveSplitKCombineHelper(DualwaveSplitKCombineContext):
                     vec_width=2,
                     dtype=T.i32,
                 )
-                o2_i32 = ir.Value(o2_raw)
-                o4 = Vec(o2_i32, (2,), fx.Int32).bitcast(self.elem_dtype).to(fx.Float32)
+                o4 = Vec(o2_raw, (2,), fx.Int32).bitcast(self.elem_dtype).to(fx.Float32)
                 w4 = Vec.from_elements([fx.Float32(wl)], fx.Float32).broadcast_to(4)
                 acc = acc + w4 * o4
             return acc, den

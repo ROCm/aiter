@@ -1021,7 +1021,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
                     (unsigned int)rows_avail * (unsigned int)kargs.stride_c * sizeof(D_OUT));
                 store_c(g_out);
             } else {
-                D_C* ws_c_ptr = reinterpret_cast<D_C*>(kargs.ws_handle->ptr)
+                D_C* ws_c_ptr = reinterpret_cast<D_C*>(kargs.ptr_ws)
                               + (size_t)split_id * kargs.batch * kargs.stride_ws_batch
                               + (size_t)batch_id * kargs.stride_ws_batch
                               + (size_t)row * kargs.stride_ws
@@ -1030,7 +1030,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
                 store_c(g_c);
             }
         } else {
-            D_C* ws_c_ptr = reinterpret_cast<D_C*>(kargs.ws_handle->ptr)
+            D_C* ws_c_ptr = reinterpret_cast<D_C*>(kargs.ptr_ws)
                           + (size_t)split_id * kargs.batch * kargs.stride_ws_batch
                           + (size_t)batch_id * kargs.stride_ws_batch
                           + (size_t)row * kargs.stride_ws
@@ -1053,7 +1053,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
         __builtin_amdgcn_s_barrier();
 
         int* counters = reinterpret_cast<int*>(
-            reinterpret_cast<char*>(kargs.ws_handle->ptr) + kargs.counter_offset_bytes);
+            reinterpret_cast<char*>(kargs.ptr_ws) + kargs.counter_offset_bytes);
         const int num_tiles = num_tiles_m * ceil_div(kargs.n, T::B_N);
         const int tile_id = batch_id * num_tiles + wgid;
         if (opus::thread_id_x() == 0) {
@@ -1066,7 +1066,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
         __builtin_amdgcn_s_barrier();
 
         if (fused_do_reduce) {
-            const D_C* ws_base = reinterpret_cast<const D_C*>(kargs.ws_handle->ptr);
+            const D_C* ws_base = reinterpret_cast<const D_C*>(kargs.ptr_ws);
             D_OUT* out = reinterpret_cast<D_OUT*>(kargs.ptr_c);
             const size_t split_stride = (size_t)kargs.batch * (size_t)kargs.stride_ws_batch;
             for (int i = int(opus::thread_id_x()); i < T::B_M * T::B_N; i += T::BLOCK_SIZE) {

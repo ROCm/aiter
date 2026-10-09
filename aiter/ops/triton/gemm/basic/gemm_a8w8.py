@@ -60,7 +60,11 @@ def gemm_a8w8(
     """
 
     _LOGGER.info(
-        f"GEMM_A8W8: x={tuple(x.shape)} w={tuple(w.shape)} x_scale={tuple(x_scale.shape)} w_scale={tuple(w_scale.shape)}"
+        "GEMM_A8W8: x=%s w=%s x_scale=%s w_scale=%s",
+        tuple(x.shape),
+        tuple(w.shape),
+        tuple(x_scale.shape),
+        tuple(w_scale.shape),
     )
 
     assert x.shape[1] == w.shape[1], "Incompatible dimensions!!!"
@@ -96,7 +100,10 @@ def gemm_a8w8(
         )
 
         _LOGGER.info(
-            f"GEMM_A8W8 [gluon/{get_arch()}]: x={tuple(x.shape)} w={tuple(w.shape)}"
+            "GEMM_A8W8 [gluon/%s]: x=%s w=%s",
+            get_arch(),
+            tuple(x.shape),
+            tuple(w.shape),
         )
 
         fp8_format = (
@@ -242,7 +249,10 @@ def gemm_a8w8_preshuffle(
     )
 
     _LOGGER.info(
-        f"GEMM_A8W8 PRESHUFFLE [gluon/{get_arch()}]: x={tuple(x.shape)} w={tuple(w.shape)}"
+        "GEMM_A8W8 PRESHUFFLE [gluon/%s]: x=%s w=%s",
+        get_arch(),
+        tuple(x.shape),
+        tuple(w.shape),
     )
 
     M, K = x.shape

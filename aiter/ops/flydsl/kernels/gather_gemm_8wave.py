@@ -5,7 +5,17 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import T, const_expr, range_constexpr, rocdl
+
+# Raw dialect, and the only one here. There IS an fx atom for global -> LDS,
+# `cdna4.GlobalLoadAsyncLDS128b`, but only the async one: it completes through
+# asyncmark / wait_asyncmark, while this pipeline's `wait_barrier` is a
+# hand-counted `s_waitcnt vmcnt(N)` covering A and B together. Tracking A one
+# way and B the other is how the MFMAs come to read stale LDS -- see BlockScale
+# below. `rocdl.global.load.lds` is the synchronous form and counts in vmcnt,
+# so the existing barrier keeps covering it. Pointers still go through
+# `fx.to_llvm_ptr`, so no address space is hardcoded.
+from flydsl._mlir.dialects import rocdl as _rocdl_d
+from flydsl.expr import T, arith, const_expr, range_constexpr, rocdl
 from flydsl.expr.rocdl import cvt_pk_f32_fp8
 from flydsl.expr.typing import Vector as Vec
 
@@ -30,15 +40,40 @@ N_WAVES = 8  # 512 threads
 BLOCK_K = 128  # fixed by MFMA_Scale(16, 16, 128)
 
 
-def _load_row_bases(kvi_div, m_base, lane_id, wave_id, n_rounds, half_row_off):
-    """Gathered kv_cache row bases (in fp8 elements) for the rows this lane DMAs.
+def _raw(v):
+    return v.ir_value() if hasattr(v, "ir_value") else v
+
+
+def lds_block_n(nope: int, v_dim: int) -> int:
+    """Width of one k/v part in the padded per-head output ``[k|pad|v|pad]``.
+
+    The epilogue routes a whole B LDS half to one output, so the k/v split has to
+    land on a half boundary and both parts pad to the same width; the narrower
+    one's dead columns are dropped by StoreKV.
+    """
+    return ceildiv(max(nope, v_dim), 64) * 64
+
+
+def _gather_a_offsets(
+    kvi_div, m_base, lane_id, wave_id, n_rounds, half_row_off, wide=False
+):
+    """Per-lane A sources: gathered kv_cache row + the stock XOR-swizzled column.
 
     The row map is exactly ``compute_global_swizzle``'s non-preshuffled A map:
-    ``row = lane//8 + wave*8 + round*(N_WAVES*8) (+ LDS_BLOCK_M)``.
+    ``row = lane//8 + wave*8 + round*(N_WAVES*8) (+ LDS_BLOCK_M)``. Every index
+    load is issued before any is consumed so they coalesce into one
+    ``s_waitcnt`` instead of ``n_rounds`` serialized round trips; eight lanes
+    share a row, so their requests fold into one L1 access.
 
-    All loads are issued before any result is consumed so they coalesce into one
-    ``s_waitcnt`` instead of ``n_rounds`` serialized round trips.  Eight lanes
-    share each row, so the eight requests fold into one L1 access.
+    ``mask`` depends only on ``row % 16``, and both the round step (64) and the
+    half step (LDS_BLOCK_M, a multiple of 128) are multiples of 16, so it is
+    invariant across rounds and halves -- one VGPR for the whole tile rather
+    than re-emitting ``swizzle_128``'s divide chain per step.
+
+    Offsets are in fp8 elements; ``wide`` makes them 64-bit, for a cache the
+    32-bit form can no longer reach. Row and column widen together here because
+    they are added here: split across two functions the widths could disagree,
+    and an i32 sum against a 64-bit row is not an error, just a wrong row.
     """
     atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
     regs = []
@@ -47,20 +82,52 @@ def _load_row_bases(kvi_div, m_base, lane_id, wave_id, n_rounds, half_row_off):
         reg = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Int32)
         fx.copy(atom, fx.slice(kvi_div, (None, m_base + row)), reg)
         regs.append(reg)
-    return [Vec(fx.memref_load_vec(reg))[0] * KV_ROW_ELEMS for reg in regs]
 
-
-def _gather_a_offsets(lane_id, wave_id, n_rounds, row_bases):
-    """Per-lane A offsets: gathered row base + the stock XOR-swizzled column.
-
-    ``mask`` depends only on ``row % 16``, and both the round step (64) and the
-    half step (LDS_BLOCK_M, a multiple of 128) are multiples of 16, so it is
-    invariant across rounds and halves -- one VGPR for the whole tile rather
-    than re-emitting ``swizzle_128``'s divide chain per step.
-    """
     mask = ((lane_id // 8 + (wave_id % 2) * 8) // 2) * 16
-    col_swz = ((lane_id % 8) * 16) ^ mask
-    return [row_bases[r] + col_swz for r in range_constexpr(n_rounds)]
+    col = ((lane_id % 8) * 16) ^ mask
+    idxs = [Vec(fx.memref_load_vec(reg))[0] for reg in regs]
+    if not wide:
+        return [i * KV_ROW_ELEMS + col for i in idxs]
+    return [fx.Int64(i) * fx.Int64(KV_ROW_ELEMS) + fx.Int64(col) for i in idxs]
+
+
+class _WideG2SLoader:
+    """``G2SLoader``'s A path without the buffer descriptor.
+
+    ``buffer_load ... lds`` stops at 4 GiB: its SRsrc base must stay uniform
+    across the wave, so a gather's per-lane row can never ride in it -- the
+    per-tile rebase of ROCm/aiter#4473 works only for a scan. ``global_load_lds``
+    is the same DMA on a per-lane 64-bit pointer.
+
+    Three things the copy atom did implicitly and this does by hand: lane ``i``
+    lands at ``lds_base + i*16``; the K offset rides in the address, there being
+    no ``soffset`` -- safe only because nothing range-checks an origin here; and
+    nothing bounds the read, so a kv_indices entry outside the cache faults
+    instead of returning zeros.
+    """
+
+    # 64 lanes x 16 B. Both sides count fp8 elements, which are 1 B, so this is
+    # an element step too.
+    LDS_ELEMS_PER_WAVE_STEP = 1024
+
+    def __init__(self, kv_ptr, gl_offsets, n_load_steps, wave_id, lane_id):
+        self.kv_ptr = kv_ptr
+        self.gl_offsets = gl_offsets
+        self.n_load_steps = n_load_steps
+        self.wave_id = wave_id
+        self.lane_id = lane_id
+        self.n_waves = fx.block_dim.x // 64
+
+    def load(self, lds_dst, k_offset):
+        for step in range_constexpr(self.n_load_steps):
+            step_off = self.wave_id * self.LDS_ELEMS_PER_WAVE_STEP + step * (
+                self.n_waves * self.LDS_ELEMS_PER_WAVE_STEP
+            )
+            src = fx.add_offset(self.kv_ptr, self.gl_offsets[step] + fx.Int64(k_offset))
+            dst = fx.add_offset(lds_dst.ptr, fx.Int32(step_off) + self.lane_id * 16)
+            _rocdl_d.global_load_lds(
+                _raw(fx.to_llvm_ptr(src)), _raw(fx.to_llvm_ptr(dst)), 16, 0
+            )
 
 
 class BlockScale:
@@ -119,8 +186,20 @@ class BlockScale:
         return out
 
 
+def _pack_fp8(v):
+    """Saturating round-to-nearest e4m3, four fp32 values packed in one i32."""
+    clipped = [
+        (v[i] > 448.0).select(
+            fx.Float32(448.0), (v[i] < -448.0).select(fx.Float32(-448.0), v[i])
+        )
+        for i in range_constexpr(4)
+    ]
+    lo = rocdl.cvt_pk_fp8_f32(T.i32, clipped[0], clipped[1], fx.Int32(0), False)
+    return rocdl.cvt_pk_fp8_f32(T.i32, clipped[2], clipped[3], lo, True)
+
+
 class StoreKV:
-    """Split k_prefix / v_prefix epilogue for BLOCK_N == one head."""
+    """Split k_prefix / v_prefix epilogue: B LDS half 0 -> k, half 1 -> v."""
 
     def __init__(
         self,
@@ -132,14 +211,25 @@ class StoreKV:
         n_heads,
         nope,
         v_dim,
+        lds_half,
+        tile_col,
         n_tiles_a,
         n_tiles_b,
         idx_fn,
         per_row_scale=True,
+        output_fp8=False,
+        K_out_scale=None,
+        V_out_scale=None,
     ):
+        self.output_fp8 = output_fp8
+        out_bytes = 1 if output_fp8 else 2
         self.lane_id = fx.thread_idx.x % 64
         self.idx_fn = idx_fn
         self.per_row_scale = bool(per_row_scale)
+        self.m_rows = m_rows
+        self.lds_half = lds_half
+        # Column origin of this head tile in each output; None for a whole head.
+        self.tile_col = tile_col
         # Set by the kernel in block-scale mode: the single trailing K-tile scale
         # for each half, already multiplied by k_scale.
         self.block_scale_k = None
@@ -155,12 +245,12 @@ class StoreKV:
         gKP = fx.rocdl.make_buffer_tensor(
             K_prefix,
             max_size=False,
-            num_records_bytes=fx.Int64(m_rows) * fx.Int64(self.kp_stride * 2),
+            num_records_bytes=fx.Int64(m_rows) * fx.Int64(self.kp_stride * out_bytes),
         )
         gVP = fx.rocdl.make_buffer_tensor(
             V_prefix,
             max_size=False,
-            num_records_bytes=fx.Int64(m_rows) * fx.Int64(self.vp_stride * 2),
+            num_records_bytes=fx.Int64(m_rows) * fx.Int64(self.vp_stride * out_bytes),
         )
         gSB = fx.rocdl.make_buffer_tensor(
             W_scale, max_size=False, num_records_bytes=n_heads * self.n_per_head * 4
@@ -171,10 +261,14 @@ class StoreKV:
         self.sb_div = fx.logical_divide(gSB, fx.make_layout(1, 1))
 
         self.scale_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
-        self.out_atom = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), fx.BFloat16)
+        self.out_dtype = fx.Int8 if output_fp8 else fx.BFloat16
+        self.out_atom = fx.make_copy_atom(
+            fx.rocdl.BufferCopy8b() if output_fp8 else fx.rocdl.BufferCopy16b(),
+            self.out_dtype,
+        )
         self._scale_cache = {}
         self._scale_regs = {}
-        self.reg_bf16 = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.BFloat16)
+        self.reg_out = fx.make_rmem_tensor(fx.make_layout(1, 1), self.out_dtype)
 
         # k_scale is per-tensor (and 1.0 in the current deployment) but the
         # reference applies it to both the GEMM and the rope, so read it rather
@@ -183,6 +277,26 @@ class StoreKV:
         r1 = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Float32)
         fx.copy(self.scale_atom, fx.slice(ks_div, (None, 0)), r1)
         self.k_scale = Vec(fx.memref_load_vec(r1))[0]
+        self.inv_k_out_scale = fx.Float32(1.0)
+        self.inv_v_out_scale = fx.Float32(1.0)
+        if output_fp8:
+            inv_scales = []
+            for tensor in (K_out_scale, V_out_scale):
+                buf = fx.rocdl.make_buffer_tensor(
+                    tensor, max_size=False, num_records_bytes=4
+                )
+                reg = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Float32)
+                fx.copy(
+                    self.scale_atom,
+                    fx.slice(fx.logical_divide(buf, fx.make_layout(1, 1)), (None, 0)),
+                    reg,
+                )
+                inv_scales.append(fx.Float32(1.0) / Vec(fx.memref_load_vec(reg))[0])
+            self.inv_k_out_scale, self.inv_v_out_scale = inv_scales
+
+    def out_col(self, col):
+        """``col`` -- a column of this workgroup's tile -- in whole-output terms."""
+        return col if self.tile_col is None else self.tile_col + col
 
     def _scale_issue(self, tag, scale_base, col_base):
         """Issue the two scale loads for one half without consuming them."""
@@ -197,7 +311,12 @@ class StoreKV:
                 self.scale_atom,
                 fx.slice(
                     self.sb_div,
-                    (None, scale_base + col_base + tj * 16 + self.lane_id % 16),
+                    (
+                        None,
+                        scale_base
+                        + self.out_col(col_base + tj * 16)
+                        + self.lane_id % 16,
+                    ),
                 ),
                 regs[tj],
             )
@@ -220,9 +339,9 @@ class StoreKV:
         self._scale_cache[tag] = out
         return out
 
-    def _store_bf16(self, value, div, index):
-        fx.memref_store_vec(Vec.filled(1, value, fx.BFloat16), self.reg_bf16)
-        fx.copy(self.out_atom, self.reg_bf16, fx.slice(div, (None, index)))
+    def _store(self, value, div, index):
+        fx.memref_store_vec(Vec.filled(1, value, self.out_dtype), self.reg_out)
+        fx.copy(self.out_atom, self.reg_out, fx.slice(div, (None, index)))
 
     def _emit(
         self,
@@ -234,6 +353,7 @@ class StoreKV:
         scale_base,
         col_base,
         tag,
+        n_valid,
         block_scale=None,
     ):
         if self.per_row_scale:
@@ -243,11 +363,26 @@ class StoreKV:
         for ti in range_constexpr(self.n_tiles_a):
             row = base_row + ti * 16 + (self.lane_id // 16) * 4
             for tj in range_constexpr(self.n_tiles_b):
-                col = col_base + tj * 16 + self.lane_id % 16
+                col = self.out_col(col_base + tj * 16) + self.lane_id % 16
                 vec_f32 = Vec(c_frag[self.idx_fn(ti, tj)])
+                scaled = vec_f32 * Vec.filled(4, b_scales[tj], fx.Float32)
+                if self.output_fp8:
+                    inv_scale = (
+                        self.inv_k_out_scale if tag == "k" else self.inv_v_out_scale
+                    )
+                    packed = _pack_fp8(scaled * Vec.filled(4, inv_scale, fx.Float32))
+                    vals = Vec.filled(1, fx.Int32(packed), fx.Int32).bitcast(fx.Int8)
+                else:
+                    vals = scaled.to(fx.BFloat16)
                 for i in range_constexpr(4):
-                    val = (vec_f32[i] * b_scales[tj]).to(fx.BFloat16)
-                    self._store_bf16(val, div, (row + i) * row_stride + head_off + col)
+                    index = (row + i) * row_stride + head_off + col
+                    if const_expr(n_valid < self.lds_half):
+                        # Dead columns of the widened part: an index past the
+                        # descriptor's last record discards the store.
+                        index = arith.select(
+                            col < n_valid, index, self.m_rows * row_stride
+                        )
+                    self._store(vals[i], div, index)
 
     def store_k(self, c_frag, base_row, head, col_base):
         """c00 / c10 -> k_prefix[row, head, 0:nope]."""
@@ -260,6 +395,7 @@ class StoreKV:
             head * self.n_per_head,
             col_base,
             "k",
+            self.nope,
             block_scale=self.block_scale_k,
         )
 
@@ -274,6 +410,7 @@ class StoreKV:
             head * self.n_per_head + self.nope,
             col_base,
             "v",
+            self.v_dim,
             block_scale=self.block_scale_v,
         )
 
@@ -286,9 +423,29 @@ class _RopeCopy:
     ROWS_PER_PASS = 256  # 512 threads / 2 threads-per-row
 
     def __init__(
-        self, a_div, kvi_div, kp_div, m_base, head, tid, k_scale, block_m, nope, n_heads
+        self,
+        a_div,
+        kvi_div,
+        kp_div,
+        m_base,
+        head,
+        tid,
+        k_scale,
+        block_m,
+        nope,
+        n_heads,
+        kv_ptr=None,
+        dead_off=None,
+        output_fp8=False,
+        inv_k_out_scale=None,
     ):
+        # kv_ptr set: the cache outgrew a descriptor, so `a_div` is None and each
+        # rope row is reached by a 64-bit offset off the cache pointer instead.
+        self.output_fp8 = output_fp8
         self.a_div = a_div
+        self.kv_ptr = kv_ptr
+        # Steers a duplicate head tile's copy off the output; see the caller.
+        self.dead_off = dead_off
         self.kvi_div = kvi_div
         self.kp_div = kp_div
         self.m_base = m_base
@@ -298,10 +455,21 @@ class _RopeCopy:
         self.kp_row = n_heads * (nope + KV_PE_DIM)
         self.col_base = head * (nope + KV_PE_DIM) + nope
         self.atom32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
-        self.ld = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float8E4M3FN)
-        self.st = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
-        self.dst_reg = fx.make_rmem_tensor(fx.make_layout(8, 1), fx.BFloat16)
-        self.ks4 = Vec.filled(4, k_scale, fx.Float32)
+        # Wide form has no descriptor to load through, so a plain global load.
+        self.ld = fx.make_copy_atom(
+            fx.rocdl.BufferCopy128b() if kv_ptr is None else fx.UniversalCopy128b(),
+            fx.Float8E4M3FN,
+        )
+        self.st = fx.make_copy_atom(
+            fx.rocdl.BufferCopy128b(), fx.Int8 if output_fp8 else fx.BFloat16
+        )
+        self.dst_reg = fx.make_rmem_tensor(
+            fx.make_layout(16 if output_fp8 else 8, 1),
+            fx.Int8 if output_fp8 else fx.BFloat16,
+        )
+        self.ks4 = Vec.filled(
+            4, k_scale * inv_k_out_scale if output_fp8 else k_scale, fx.Float32
+        )
 
     def load_idx(self):
         self.iregs = [
@@ -321,14 +489,18 @@ class _RopeCopy:
         for _p in range_constexpr(self.n_passes):
             row_local = self.tid // 2 + _p * self.ROWS_PER_PASS
             idx = Vec(fx.memref_load_vec(self.iregs[_p]))[0]
-            self.bases.append(
-                (
-                    idx * KV_ROW_ELEMS + KV_C_DIM + self.half * 32,
-                    (self.m_base + row_local) * self.kp_row
-                    + self.col_base
-                    + self.half * 32,
-                )
+            rope_src = (
+                idx * KV_ROW_ELEMS + KV_C_DIM + self.half * 32
+                if self.kv_ptr is None
+                else fx.Int64(idx) * fx.Int64(KV_ROW_ELEMS)
+                + fx.Int64(KV_C_DIM + self.half * 32)
             )
+            dst = (
+                (self.m_base + row_local) * self.kp_row + self.col_base + self.half * 32
+            )
+            if self.dead_off is not None:
+                dst = dst + self.dead_off
+            self.bases.append((rope_src, dst))
         self.src_regs = [
             [
                 fx.make_rmem_tensor(fx.make_layout(16, 1), fx.Float8E4M3FN)
@@ -340,11 +512,17 @@ class _RopeCopy:
             for sub in range_constexpr(
                 2
             ):  # 2 x 16 fp8 = the 32 elements this lane owns
-                fx.copy(
-                    self.ld,
-                    fx.slice(self.a_div, (None, self.bases[_p][0] + sub * 16)),
-                    self.src_regs[_p][sub],
+                src = (
+                    fx.slice(self.a_div, (None, self.bases[_p][0] + sub * 16))
+                    if self.kv_ptr is None
+                    else fx.make_view(
+                        fx.add_offset(
+                            self.kv_ptr, self.bases[_p][0] + fx.Int64(sub * 16)
+                        ),
+                        fx.make_layout(16, 1),
+                    )
                 )
+                fx.copy(self.ld, src, self.src_regs[_p][sub])
 
     def commit(self):
         v2f32 = T.vec(2, T.f32)
@@ -357,21 +535,34 @@ class _RopeCopy:
                 for w in range_constexpr(4):  # each i32 packs 4 fp8
                     lo = cvt_pk_f32_fp8(res=v2f32, src=words[w], word_sel=False)
                     hi = cvt_pk_f32_fp8(res=v2f32, src=words[w], word_sel=True)
+                    scaled = Vec(lo.shuffle(hi, [0, 1, 2, 3])) * self.ks4
                     outs.append(
-                        (Vec(lo.shuffle(hi, [0, 1, 2, 3])) * self.ks4).to(fx.BFloat16)
+                        _pack_fp8(scaled) if self.output_fp8 else scaled.to(fx.BFloat16)
                     )
-                for p in range_constexpr(2):  # 2 x 8 bf16 = 2 x 16 B stores
-                    fx.memref_store_vec(
-                        outs[2 * p].shuffle(outs[2 * p + 1], list(range(8))),
-                        self.dst_reg,
-                    )
+                if self.output_fp8:
+                    packed = fx.Vector.from_elements(
+                        [fx.Int32(x) for x in outs], dtype=fx.Int32
+                    ).bitcast(fx.Int8)
+                    fx.memref_store_vec(packed, self.dst_reg)
                     fx.copy(
                         self.st,
                         self.dst_reg,
-                        fx.slice(
-                            self.kp_div, (None, self.bases[_p][1] + sub * 16 + p * 8)
-                        ),
+                        fx.slice(self.kp_div, (None, self.bases[_p][1] + sub * 16)),
                     )
+                else:
+                    self._commit_bf16(outs, _p, sub)
+
+    def _commit_bf16(self, outs, _p, sub):
+        for p in range_constexpr(2):  # 2 x 8 bf16 = 2 x 16 B stores
+            fx.memref_store_vec(
+                outs[2 * p].shuffle(outs[2 * p + 1], list(range(8))),
+                self.dst_reg,
+            )
+            fx.copy(
+                self.st,
+                self.dst_reg,
+                fx.slice(self.kp_div, (None, self.bases[_p][1] + sub * 16 + p * 8)),
+            )
 
 
 def compile_gather_kv_b_proj_8w(
@@ -380,17 +571,36 @@ def compile_gather_kv_b_proj_8w(
     nope: int = 128,
     v_dim: int = 128,
     BLOCK_M: int = 256,
+    head_tiles: int = 1,
     waves_per_eu: int = 2,
     xcd_swizzle: int = 1,
     weight_preshuffle: bool = True,
     per_row_scale: bool = True,
+    wide_index: bool = False,
+    output_fp8: bool = False,
 ):
-    """Build the fused gather + kv_b_proj kernel for one fixed MLA configuration."""
+    """Build the fused gather + kv_b_proj kernel for one fixed MLA configuration.
+
+    ``wide_index`` swaps the KV cache's descriptor-addressed DMA for
+    ``global_load_lds`` over 64-bit per-lane addresses, which is what a cache
+    spanning more than 4 GiB needs. The host sets it from the cache extent.
+
+    ``head_tiles`` is how many workgroups split one head's output columns, which
+    is how a head too wide for a 256-row M tile still gets one.
+    """
     K = KV_C_DIM
-    BLOCK_N = nope + v_dim
+    HEAD_N = nope + v_dim
+    LDS_HALF = lds_block_n(nope, v_dim)
+    BLOCK_N = 2 * LDS_HALF // head_tiles  # per-workgroup slice of the padded output
 
     assert BLOCK_M >= 128 and BLOCK_M % 128 == 0
-    assert BLOCK_N == 256, "BLOCK_N is one head; the k/v split assumes 128+128"
+    assert (
+        nope % 16 == 0 and v_dim % 16 == 0
+    ), "the k/v split is the MFMA accumulator-group boundary, not a runtime offset"
+    assert head_tiles in (1, 2) and BLOCK_N >= 128, (
+        f"head_tiles={head_tiles} leaves a {BLOCK_N}-wide tile; a workgroup needs "
+        "two B LDS halves of at least the 64-column step each"
+    )
     assert K % BLOCK_K == 0
 
     K_ITERS = K // BLOCK_K  # 4 -- satisfies the pipeline's K_ITERS >= 2
@@ -412,10 +622,12 @@ def compile_gather_kv_b_proj_8w(
     b_lds_size = LDS_BLOCK_N * BLOCK_K
 
     _kname = (
-        f"flydsl_gather_kv_b_proj_8w_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_"
-        f"h{n_heads}_{waves_per_eu}x{xcd_swizzle}"
+        f"flydsl_gather_kv_b_proj_8w_{BLOCK_M}x{nope}v{v_dim}x{BLOCK_K}_"
+        f"h{n_heads}t{head_tiles}_{waves_per_eu}x{xcd_swizzle}"
         f"{'_ps' if weight_preshuffle else '_rm'}"
         f"{'_row' if per_row_scale else '_blk'}"
+        f"{'_wide' if wide_index else ''}"
+        f"{'_fp8' if output_fp8 else '_bf16'}"
     )
 
     @fx.struct
@@ -429,15 +641,21 @@ def compile_gather_kv_b_proj_8w(
         B_lds_next_0: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
         B_lds_next_1: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
 
+    # BF16 output scales are compile-time constants, absent from the device ABI.
+    OutputScaleArg = fx.Tensor if output_fp8 else fx.Constexpr[float]
+
     @flyc.kernel(name=_kname, known_block_size=[512, 1, 1])
     def kernel_gather(
-        KV_cache: fx.Tensor,
+        KV_cache: fx.Pointer,
+        kv_num_blocks: fx.Int32,
         KV_indices: fx.Tensor,
         W: fx.Tensor,
         W_scale: fx.Tensor,
         K_scale: fx.Tensor,
         K_prefix: fx.Tensor,
         V_prefix: fx.Tensor,
+        K_out_scale: OutputScaleArg,
+        V_out_scale: OutputScaleArg,
         m_rows: fx.Int32,
     ):
         F8_IR_t = fx.Float8E4M3FN.ir_type
@@ -458,29 +676,63 @@ def compile_gather_kv_b_proj_8w(
         wave_m = wave_id // 4
         wave_n = wave_id % 4
 
-        # One N-tile per head, so num_pid_n is just n_heads. The XCD remap is the
-        # single biggest lever here: without it the n_heads tiles of one M-tile
-        # scatter across 8 XCDs and each re-reads the same gathered A tile from
-        # HBM; with it they share one XCD's L2.
+        # head_tiles N-tiles per head. The XCD remap is the single biggest lever
+        # here: without it the tiles of one M-tile scatter across 8 XCDs and each
+        # re-reads the same gathered A tile from HBM; with it they share one
+        # XCD's L2.
         if const_expr(xcd_swizzle > 0):
             block_m, block_n = _xcd_swizzle_any(
-                ceildiv(m_rows, BLOCK_M), n_heads, wgm=xcd_swizzle
+                ceildiv(m_rows, BLOCK_M), n_heads * head_tiles, wgm=xcd_swizzle
             )
         else:
-            block_m, block_n = split_row_major_2d(fx.block_idx.x, n_heads)
+            block_m, block_n = split_row_major_2d(fx.block_idx.x, n_heads * head_tiles)
 
-        head = block_n
+        # A head tile keeps the half 0 -> k, half 1 -> v routing and takes
+        # LDS_BLOCK_N columns of each, starting at tile_col.
+        if const_expr(head_tiles == 1):
+            head, tile_col, rope_dead = block_n, None, None
+        else:
+            head = block_n // head_tiles
+            tile = block_n % head_tiles
+            tile_col = tile * LDS_BLOCK_N
+            # Every tile of a head writes the same rope columns; all but the
+            # first are pushed past k_prefix's last record so one survives.
+            rope_dead = tile * (m_rows * (n_heads * (nope + KV_PE_DIM)))
+
         m_base = block_m * BLOCK_M
 
         # Preshuffled B advances 2 KB per K-tile (the 16-row x 64-K group), a
         # row-major one advances BLOCK_K elements.
         B_K_STEP = (2 * 1024) if weight_preshuffle else BLOCK_K
-        B0_gl_offset = (block_n * BLOCK_N) * K
-        B1_gl_offset = (block_n * BLOCK_N + LDS_BLOCK_N) * K
+        b_row_k, b_row_v = head * HEAD_N, head * HEAD_N + nope
+        if const_expr(head_tiles > 1):
+            b_row_k, b_row_v = b_row_k + tile_col, b_row_v + tile_col
+        B0_gl_offset = b_row_k * K
+        B1_gl_offset = b_row_v * K
 
-        gA = make_fp8_buffer_tensor(KV_cache, F8_IR_t)
+        # The cache arrives as a pointer, not a memref: FlyDSL packs memref
+        # shapes as i32, and this one passes 2**31 elements (2 GiB of fp8) while
+        # the descriptor still reaches 4 GiB. The extent comes alongside, as
+        # `kv_num_blocks`, and only ever widens in 64-bit.
+        # fp8 view of it, so every A offset below counts elements whichever form
+        # runs.
+        kv_f8 = fx.recast_iter(
+            fx.PointerType.get(F8_IR_t, KV_cache.address_space), KV_cache
+        )
+        # Python-level branch: only one of the two forms is traced.
+        a_div = (
+            None
+            if const_expr(wide_index)
+            else rocdl.make_buffer_tensor(
+                # Flat-index carrier, as in causal_conv1d's `_view`: 16 is the
+                # widest unit A copies, and the unit strides let a flat element
+                # index reach anywhere. num_records, not the layout, bounds it.
+                fx.Tensor(fx.make_view(kv_f8, fx.make_layout((16, 1), (1, 1)))),
+                max_size=False,
+                num_records_bytes=fx.Int64(kv_num_blocks) * fx.Int64(KV_ROW_ELEMS),
+            )
+        )
         gB = make_fp8_buffer_tensor(W, F8_IR_t)
-        a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
         b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
 
         gKVI = fx.rocdl.make_buffer_tensor(
@@ -489,14 +741,12 @@ def compile_gather_kv_b_proj_8w(
         kvi_div = fx.logical_divide(gKVI, fx.make_layout(1, 1))
 
         # Index loads must precede the first G2S load -- see wait_barrier.
-        row_bases_0 = _load_row_bases(
-            kvi_div, m_base, lane_id, wave_id, N_LDS_ROUNDS, 0
+        gl_off_a0 = _gather_a_offsets(
+            kvi_div, m_base, lane_id, wave_id, N_LDS_ROUNDS, 0, wide_index
         )
-        row_bases_1 = _load_row_bases(
-            kvi_div, m_base, lane_id, wave_id, N_LDS_ROUNDS, LDS_BLOCK_M
+        gl_off_a1 = _gather_a_offsets(
+            kvi_div, m_base, lane_id, wave_id, N_LDS_ROUNDS, LDS_BLOCK_M, wide_index
         )
-        gl_off_a0 = _gather_a_offsets(lane_id, wave_id, N_LDS_ROUNDS, row_bases_0)
-        gl_off_a1 = _gather_a_offsets(lane_id, wave_id, N_LDS_ROUNDS, row_bases_1)
         gl_off_b = compute_global_swizzle(
             lane_id, wave_id, K, N_LDS_ROUNDS, preshuffled=weight_preshuffle
         )
@@ -507,8 +757,16 @@ def compile_gather_kv_b_proj_8w(
 
         # Two A loaders: the stock kernel separates the halves via soffset, but
         # with a gather the half offset lives in the row index instead.
-        a0_g2s = G2SLoader(a_div, gl_off_a0, N_LDS_STEPS_A, F8_IR_t, wave_id)
-        a1_g2s = G2SLoader(a_div, gl_off_a1, N_LDS_STEPS_A, F8_IR_t, wave_id)
+        a0_g2s = (
+            _WideG2SLoader(kv_f8, gl_off_a0, N_LDS_STEPS_A, wave_id, lane_id)
+            if const_expr(wide_index)
+            else G2SLoader(a_div, gl_off_a0, N_LDS_STEPS_A, F8_IR_t, wave_id)
+        )
+        a1_g2s = (
+            _WideG2SLoader(kv_f8, gl_off_a1, N_LDS_STEPS_A, wave_id, lane_id)
+            if const_expr(wide_index)
+            else G2SLoader(a_div, gl_off_a1, N_LDS_STEPS_A, F8_IR_t, wave_id)
+        )
         b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
         a_s2r = S2RLoader(wave_m, N_TILES_A)
         b_s2r = S2RLoader(wave_n, N_TILES_B)
@@ -521,10 +779,15 @@ def compile_gather_kv_b_proj_8w(
             n_heads,
             nope,
             v_dim,
+            LDS_HALF,
+            tile_col,
             N_TILES_A,
             N_TILES_B,
             mfma.idx,
             per_row_scale=per_row_scale,
+            output_fp8=output_fp8,
+            K_out_scale=K_out_scale,
+            V_out_scale=V_out_scale,
         )
         if const_expr(not per_row_scale):
             store.block_scale_k = blk.fk * store.k_scale
@@ -639,6 +902,10 @@ def compile_gather_kv_b_proj_8w(
             BLOCK_M,
             nope,
             n_heads,
+            kv_f8 if const_expr(wide_index) else None,
+            rope_dead,
+            output_fp8=output_fp8,
+            inv_k_out_scale=store.inv_k_out_scale,
         )
         rope.load_idx()
         store.prefetch_scales(head, wave_n * (N_TILES_B * 16))
@@ -682,25 +949,31 @@ def compile_gather_kv_b_proj_8w(
 
     @flyc.jit
     def launch_gather_kv_b_proj(
-        KV_cache: fx.Tensor,
+        KV_cache: fx.Pointer,
+        kv_num_blocks: fx.Int32,
         KV_indices: fx.Tensor,
         W: fx.Tensor,
         W_scale: fx.Tensor,
         K_scale: fx.Tensor,
         K_prefix: fx.Tensor,
         V_prefix: fx.Tensor,
+        K_out_scale: OutputScaleArg,
+        V_out_scale: OutputScaleArg,
         m_rows: fx.Int32,
         stream: fx.Stream,
     ):
-        grid_x = ceildiv(m_rows, BLOCK_M) * n_heads
+        grid_x = ceildiv(m_rows, BLOCK_M) * n_heads * head_tiles
         kernel_gather(
             KV_cache,
+            kv_num_blocks,
             KV_indices,
             W,
             W_scale,
             K_scale,
             K_prefix,
             V_prefix,
+            K_out_scale,
+            V_out_scale,
             m_rows,
             value_attrs={
                 "rocdl.waves_per_eu": waves_per_eu,
