@@ -3,12 +3,12 @@
 
 """Wave32 FP8/BF16 WMMA backend for planned paged decode on gfx1250.
 
-Four waves split a 64-token compute tile within each 256-token plan tile.
-K and V move from the packed paged cache to alternating LDS buffers via TDM
-for per-token scales and power-of-two D128+, with vector DMA for other cases.
-FP8 D128/page64+ transposed caches with one query tile retain their packed LDS
-layout, avoiding
-TDM transposition and padding; WMMA operands assemble directly from chunks.
+Four waves split 64-token compute tiles within each 256-token plan tile.
+FP8 D256/page128+ full attention uses 128-token tiles and K128 QK/PV WMMA.
+Per-token FP8 D128/D256 transposed caches with one query tile keep their packed
+layout in a single LDS buffer, avoiding TDM transposition and row padding.
+WMMA accumulates into a rescaled running output; empty tiles retain its scale.
+Other TDM/vector DMA paths alternate LDS buffers where capacity permits.
 FP8 Q and P use native eight-element conversion; BF16 uses K32 WMMA.
 BF16 TDM is enabled for power-of-two D64–512, with vector DMA otherwise.
 Softmax statistics and accumulation stay FP32.
@@ -48,8 +48,20 @@ class Gfx1250Traits:
 
     WAVE = 32
     NWARP = 4
-    TOKENS = 64
     FP8_MAX = 448.0
+
+    @property
+    def TOKENS(self):
+        # Page-sized D256 transfers amortize softmax exchange and PV WMMA.
+        # Windowed rows retain 64-token normalization for FP8 accuracy.
+        return (
+            128
+            if self.packed_lds
+            and self.head_dim == 256
+            and self.block_size >= 128
+            and self.sliding_window == 0
+            else 64
+        )
 
     @property
     def bf16(self):
@@ -96,7 +108,7 @@ class Gfx1250Traits:
         return (
             not self.bf16
             and self.per_token_kv
-            and self.head_dim == 128
+            and self.head_dim in (128, 256)
             and self.block_size >= 64
             and self.trans_v
             and self.m_tiles == 1
@@ -124,6 +136,9 @@ class Gfx1250Traits:
 
     @property
     def buffers(self):
+        if self.packed_lds:
+            # A single packed buffer measured faster than double-buffering.
+            return 1
         return (
             2 if self.q_bytes + 2 * self.kv_stride + self.p_bytes + 576 <= 327680 else 1
         )
@@ -263,6 +278,9 @@ class Gfx1250Memory:
     @flyc.jit
     def stage_packed_tdm(self, token_base, kv_off, full_tile):
         ctx, t = self.ctx, self.t
+        if const_expr(t.TOKENS == 128):
+            self.stage_page_tdm(token_base, kv_off, full_tile)
+            return
         table = fx.recast_iter(fx.Int32, ctx.block_tables_ptr)
         # Keep the cache's contiguous 16-byte chunks in LDS. TDM then gathers
         # whole spans without transposing them or inserting row padding.
@@ -286,23 +304,95 @@ class Gfx1250Memory:
         self.tdm_copy(
             ctx.key_cache_ptr,
             off + (pt + ctx.warp * 16) * 16,
-            kv_off + ctx.warp * 2048,
-            (8, 16, 16),
-            (t.block_size * 16, 16, 1),
-            (None, None if full_tile else valid, None),
+            kv_off + ctx.warp * t.head_dim * 16,
+            (t.head_dim // 16, 256) if full_tile else (t.head_dim // 16, 16, 16),
+            (t.block_size * 16, 1) if full_tile else (t.block_size * 16, 16, 1),
+            (None, None) if full_tile else (None, valid, None),
             16,
             16,
         )
         self.tdm_copy(
             ctx.value_cache_ptr,
-            off + (pt // 16 + ctx.warp) * 128 * 16,
-            kv_off + t.k_bytes + ctx.warp * 2048,
-            (128, 16),
-            (16, 1),
-            (None, None if full_tile else valid),
+            off + (pt // 16 + ctx.warp) * t.head_dim * 16,
+            kv_off + t.k_bytes + ctx.warp * t.head_dim * 16,
+            (t.head_dim * 16,) if full_tile else (t.head_dim, 16),
+            (1,) if full_tile else (16, 1),
+            (None,) if full_tile else (None, valid),
             16,
             16,
         )
+
+    @flyc.jit
+    def stage_page_tdm(self, token_base, kv_off, full_tile):
+        """Stage a packed 128-token slice, splitting K by dimension and V by token."""
+        ctx, t = self.ctx, self.t
+        table = fx.recast_iter(fx.Int32, ctx.block_tables_ptr)
+        safe = (
+            token_base
+            if full_tile
+            else (token_base < ctx.planned_context).select(token_base, fx.Int32(0))
+        )
+        page = fx.Int32(
+            table[
+                ctx.planned_seq * ctx.max_blocks_per_seq
+                + fx.Uint32(safe) // t.block_size
+            ]
+        )
+        off = (fx.Int64(page) * ctx.n_kv + ctx.kv_h) * t.head_dim * t.block_size
+        pt = fx.Uint32(safe) % t.block_size
+        valid = fx.max(
+            fx.Int32(0), fx.min(fx.Int32(128), ctx.planned_context - token_base)
+        )
+        self.tdm_copy(
+            ctx.key_cache_ptr,
+            off + ctx.warp * (t.head_dim // 64) * t.block_size * 16 + pt * 16,
+            kv_off + ctx.warp * (t.head_dim // 64) * 2048,
+            (t.head_dim // 64, 2048) if full_tile else (t.head_dim // 64, 128, 16),
+            (t.block_size * 16, 1) if full_tile else (t.block_size * 16, 16, 1),
+            (None, None) if full_tile else (None, valid, None),
+            16,
+            16,
+        )
+        if const_expr(full_tile):
+            self.tdm_copy(
+                ctx.value_cache_ptr,
+                off + (pt // 16 + ctx.warp * 2) * t.head_dim * 16,
+                kv_off + t.k_bytes + ctx.warp * t.head_dim * 32,
+                (t.head_dim * 32,),
+                (1,),
+                (None,),
+                16,
+                16,
+            )
+        else:
+            # Exact token extents zero-fill invalid V bytes, including NaNs.
+            for chunk in range_constexpr(2):
+                count = fx.max(
+                    fx.Int32(0),
+                    fx.min(fx.Int32(16), valid - ctx.warp * 32 - chunk * 16),
+                )
+                self.tdm_copy(
+                    ctx.value_cache_ptr,
+                    off + (pt // 16 + ctx.warp * 2 + chunk) * t.head_dim * 16,
+                    kv_off
+                    + t.k_bytes
+                    + ctx.warp * t.head_dim * 32
+                    + chunk * t.head_dim * 16,
+                    (t.head_dim, 16),
+                    (16, 1),
+                    (None, count),
+                    16,
+                    16,
+                )
+
+    def page_k_operand(self, offset, token, lane16, half):
+        words = []
+        for j in range_constexpr(4):
+            frag = self.load(
+                offset + (half + 2 * j) * 128 * 16 + (token + lane16) * 16, fx.Int32, 4
+            )
+            words.extend([frag[i] for i in range_constexpr(4)])
+        return fx.Vector.from_elements(words, dtype=fx.Int32)
 
     @flyc.jit
     def stage_padded_tdm(self, token_base, kv_off, full_tile):
@@ -646,10 +736,17 @@ class Gfx1250Pipeline:
                 ]
             )
         state_stride = 2 + vh_count
-        resident_q = not t.bf16 and t.head_dim == 128 and t.m_tiles == 1
+        if const_expr(t.packed_lds):
+            initial.append(fx.Float32(1.0))
+        resident_q = (
+            not t.bf16 and (t.head_dim == 128 or t.packed_lds) and t.m_tiles == 1
+        )
         if const_expr(resident_q):
             gpu.barrier()
-            q_operand = self.mem.operand(0, t.q_stride, 128, ctx.lane16, ctx.half)
+            q_operands = [
+                self.mem.operand(d * 128, t.q_stride, 128, ctx.lane16, ctx.half)
+                for d in range_constexpr(t.head_dim // 128)
+            ]
             q_scale = fx.Float32(
                 self.mem.load(ctx.lane16 * t.q_stride + t.head_dim, fx.Float32)[0]
             )
@@ -668,7 +765,7 @@ class Gfx1250Pipeline:
             vnorm = fx.Float32(1.0)
             vfactor = fx.Float32(1.0 if t.bf16 else 1.0 / t.FP8_MAX)
             if const_expr(t.per_token_kv):
-                # Every wave reduces the same 64 scales, avoiding a CTA barrier.
+                # Every wave reduces the tile's scales, avoiding a CTA barrier.
                 scale_base = kv_off + t.k_bytes + t.v_bytes + t.TOKENS * 4
                 vmax = fx.maxnumf(
                     fx.Float32(self.mem.load(scale_base + ctx.lane * 4, fx.Float32)[0]),
@@ -676,9 +773,30 @@ class Gfx1250Pipeline:
                         self.mem.load(scale_base + (ctx.lane + 32) * 4, fx.Float32)[0]
                     ),
                 )
+                if const_expr(t.TOKENS == 128):
+                    vmax = fx.maxnumf(
+                        vmax,
+                        fx.Float32(
+                            self.mem.load(scale_base + (ctx.lane + 64) * 4, fx.Float32)[
+                                0
+                            ]
+                        ),
+                    )
+                    vmax = fx.maxnumf(
+                        vmax,
+                        fx.Float32(
+                            self.mem.load(scale_base + (ctx.lane + 96) * 4, fx.Float32)[
+                                0
+                            ]
+                        ),
+                    )
                 for shift in (16, 8, 4, 2, 1):
                     vmax = fx.maxnumf(vmax, vmax.shuffle_xor(shift, t.WAVE))
                 vfactor = vmax * fx.Float32(1.0 / t.FP8_MAX)
+                if const_expr(t.packed_lds):
+                    # Empty planned tails carry no new mass. Keep the prior
+                    # scale so their zero V contribution preserves the output.
+                    vfactor = (vfactor > 0.0).select(vfactor, fx.Float32(state[-1]))
                 vnorm = fx.Float32(rcp_f32(fx.maxnumf(vfactor, fx.Float32(1e-20))))
             elif const_expr(not t.bf16):
                 vs = fx.recast_iter(fx.Float32, ctx.value_scale_ptr)
@@ -704,62 +822,81 @@ class Gfx1250Pipeline:
                 if const_expr(not t.per_token_kv and not t.bf16):
                     ks = fx.recast_iter(fx.Float32, ctx.key_scale_ptr)
                     scale = scale * fx.Float32(ks[0])
-                scores = fx.Vector.filled(8, 0.0, fx.Float32)
-                qk_k = 32 if t.bf16 else (128 if t.head_dim % 128 == 0 else 64)
-                for d in range_constexpr(t.head_dim // qk_k):
-                    if const_expr(t.packed_lds):
-                        a = self.mem.packed_operand(
-                            kv_off + ctx.warp * 2048, 16, qk_k, ctx.lane16, ctx.half
-                        )
-                    else:
-                        a = self.mem.operand(
-                            kv_off
-                            + ctx.warp * 16 * t.q_stride
-                            + d * qk_k * t.elem_bytes,
-                            t.q_stride,
-                            qk_k,
-                            ctx.lane16,
-                            ctx.half,
-                        )
-                    if const_expr(resident_q):
-                        b = q_operand
-                    else:
-                        b = self.mem.operand(
-                            q_tile * 16 * t.q_stride + d * qk_k * t.elem_bytes,
-                            t.q_stride,
-                            qk_k,
-                            ctx.lane16,
-                            ctx.half,
-                        )
-                    scores = Gfx1250Gemm.mma(a, b, scores, qk_k, t.bf16)
                 upper = (
                     ctx.planned_context - t.query_length + row // t.query_group_size + 1
                 )
-                if const_expr(t.per_token_kv):
-                    scale_token = ctx.warp * 16 + ctx.half * 8
-                    kscales = self.mem.load(
-                        kv_off + t.k_bytes + t.v_bytes + scale_token * 4,
-                        fx.Float32,
-                        8,
-                    )
-                    vscales = self.mem.load(
-                        kv_off + t.k_bytes + t.v_bytes + (t.TOKENS + scale_token) * 4,
-                        fx.Float32,
-                        8,
-                    )
-                masked = []
-                for r in range_constexpr(8):
-                    token = ctx.warp * 16 + ctx.half * 8 + r
-                    value = scores[r] * scale
+                units, values = [], []
+                qk_k = 32 if t.bf16 else (128 if t.head_dim % 128 == 0 else 64)
+                for n in range_constexpr(t.TOKENS // 64):
+                    scores = fx.Vector.filled(8, 0.0, fx.Float32)
+                    for d in range_constexpr(t.head_dim // qk_k):
+                        if const_expr(t.packed_lds):
+                            if const_expr(t.TOKENS == 128):
+                                a = self.mem.page_k_operand(
+                                    kv_off + d * 128 * 128,
+                                    ctx.warp * 32 + n * 16,
+                                    ctx.lane16,
+                                    ctx.half,
+                                )
+                            else:
+                                a = self.mem.packed_operand(
+                                    kv_off + ctx.warp * t.head_dim * 16 + d * qk_k * 16,
+                                    16,
+                                    qk_k,
+                                    ctx.lane16,
+                                    ctx.half,
+                                )
+                        else:
+                            a = self.mem.operand(
+                                kv_off
+                                + ctx.warp * 16 * t.q_stride
+                                + d * qk_k * t.elem_bytes,
+                                t.q_stride,
+                                qk_k,
+                                ctx.lane16,
+                                ctx.half,
+                            )
+                        if const_expr(resident_q):
+                            b = q_operands[d]
+                        else:
+                            b = self.mem.operand(
+                                q_tile * 16 * t.q_stride + d * qk_k * t.elem_bytes,
+                                t.q_stride,
+                                qk_k,
+                                ctx.lane16,
+                                ctx.half,
+                            )
+                        scores = Gfx1250Gemm.mma(a, b, scores, qk_k, t.bf16)
                     if const_expr(t.per_token_kv):
-                        value = value * fx.Float32(kscales[r])
-                    visible = (token_base + token < upper) & (row < t.rows)
-                    if const_expr(t.sliding_window > 0):
-                        visible = visible & (
-                            token_base + token >= upper - t.sliding_window
+                        scale_token = ctx.warp * (t.TOKENS // 4) + n * 16 + ctx.half * 8
+                        ks = self.mem.load(
+                            kv_off + t.k_bytes + t.v_bytes + scale_token * 4,
+                            fx.Float32,
+                            8,
                         )
-                    masked.append(visible.select(value, fx.Float32(float("-inf"))))
-                scores = fx.Vector.from_elements(masked, dtype=fx.Float32)
+                        vs = self.mem.load(
+                            kv_off
+                            + t.k_bytes
+                            + t.v_bytes
+                            + (t.TOKENS + scale_token) * 4,
+                            fx.Float32,
+                            8,
+                        )
+                        values.extend([vs[r] for r in range_constexpr(8)])
+                    for r in range_constexpr(8):
+                        token = ctx.warp * (t.TOKENS // 4) + n * 16 + ctx.half * 8 + r
+                        value = scores[r] * scale
+                        if const_expr(t.per_token_kv):
+                            value = value * fx.Float32(ks[r])
+                        visible = (token_base + token < upper) & (row < t.rows)
+                        if const_expr(t.sliding_window > 0):
+                            visible = visible & (
+                                token_base + token >= upper - t.sliding_window
+                            )
+                        units.append(visible.select(value, fx.Float32(float("-inf"))))
+                scores = fx.Vector.from_elements(units, dtype=fx.Float32)
+                if const_expr(t.per_token_kv):
+                    vscales = fx.Vector.from_elements(values, dtype=fx.Float32)
                 local_max = scores.reduce(ReductionOp.MAX)
                 local_max = fx.maxnumf(local_max, local_max.shuffle_xor(16, t.WAVE))
                 if ctx.half == 0:
@@ -785,14 +922,14 @@ class Gfx1250Pipeline:
                         scores
                         - fx.Vector.from_elements(
                             [fx.Float32(safe_max)], dtype=fx.Float32
-                        ).broadcast_to(8),
+                        ).broadcast_to(t.TOKENS // 8),
                         fastmath="afn",
                     )
                 )
                 local_sum = probs.reduce(ReductionOp.ADD)
                 local_sum = local_sum + local_sum.shuffle_xor(16, t.WAVE)
                 pscale = []
-                for r in range_constexpr(8):
+                for r in range_constexpr(t.TOKENS // 8):
                     if const_expr(t.per_token_kv):
                         vs = fx.Float32(vscales[r])
                         pscale.append(probs[r] * vs * vnorm)
@@ -800,15 +937,20 @@ class Gfx1250Pipeline:
                         pscale.append(
                             probs[r] * fx.Float32(1.0 if t.bf16 else t.FP8_MAX)
                         )
-                pvalues = fx.Vector.from_elements(pscale, dtype=fx.Float32)
-                p = pvalues.to(fx.BFloat16) if t.bf16 else self.mem.fp8(pvalues)
-                self.mem.store(
-                    t.p_offset
-                    + ctx.lane16 * t.v_stride
-                    + (ctx.warp * 16 + ctx.half * 8) * t.elem_bytes,
-                    p,
-                    fx.BFloat16 if t.bf16 else fx.Int32,
-                )
+                for n in range_constexpr(t.TOKENS // 64):
+                    pvalues = fx.Vector.from_elements(
+                        [pscale[n * 8 + r] for r in range_constexpr(8)],
+                        dtype=fx.Float32,
+                    )
+                    p = pvalues.to(fx.BFloat16) if t.bf16 else self.mem.fp8(pvalues)
+                    self.mem.store(
+                        t.p_offset
+                        + ctx.lane16 * t.v_stride
+                        + (ctx.warp * (t.TOKENS // 4) + n * 16 + ctx.half * 8)
+                        * t.elem_bytes,
+                        p,
+                        fx.BFloat16 if t.bf16 else fx.Int32,
+                    )
                 if ctx.half == 0:
                     self.mem.store(
                         t.stats_offset + 256 + (ctx.lane16 * t.NWARP + ctx.warp) * 4,
@@ -816,14 +958,14 @@ class Gfx1250Pipeline:
                         fx.Float32,
                     )
                 # Prefetch V operands before waiting for cross-wave P stores.
-                pv_k = 32 if t.bf16 else 64
+                pv_k = 32 if t.bf16 else t.TOKENS
                 if const_expr(t.packed_lds):
                     v_operands = [
                         [
                             self.mem.packed_operand(
                                 kv_off + t.k_bytes + (vh * 64 + ctx.warp * 16) * 16,
-                                128,
-                                64,
+                                t.head_dim,
+                                t.TOKENS,
                                 ctx.lane16,
                                 ctx.half,
                             )
@@ -863,21 +1005,33 @@ class Gfx1250Pipeline:
                     for d in range_constexpr(t.TOKENS // pv_k)
                 ]
                 for vh in range_constexpr(vh_count):
-                    out = fx.Vector.filled(8, 0.0, fx.Float32)
+                    # Packed outputs remain normalized by the previous V
+                    # factor. Rescale before WMMA to fuse its accumulation.
+                    out = (
+                        state[m * state_stride + 2 + vh]
+                        * fx.Vector.from_elements(
+                            [corr * state[-1] * vnorm], dtype=fx.Float32
+                        ).broadcast_to(8)
+                        if t.packed_lds
+                        else fx.Vector.filled(8, 0.0, fx.Float32)
+                    )
                     for d in range_constexpr(t.TOKENS // pv_k):
                         out = Gfx1250Gemm.mma(
                             v_operands[vh][d], p_operands[d], out, pv_k, t.bf16
                         )
-                    next_state.append(
-                        state[m * state_stride + 2 + vh]
-                        * fx.Vector.from_elements(
-                            [fx.Float32(corr)], dtype=fx.Float32
-                        ).broadcast_to(8)
-                        + out
-                        * fx.Vector.from_elements(
-                            [fx.Float32(vfactor)], dtype=fx.Float32
-                        ).broadcast_to(8)
-                    )
+                    if const_expr(t.packed_lds):
+                        next_state.append(out)
+                    else:
+                        next_state.append(
+                            state[m * state_stride + 2 + vh]
+                            * fx.Vector.from_elements(
+                                [fx.Float32(corr)], dtype=fx.Float32
+                            ).broadcast_to(8)
+                            + out
+                            * fx.Vector.from_elements(
+                                [fx.Float32(vfactor)], dtype=fx.Float32
+                            ).broadcast_to(8)
+                        )
                 # The next iteration's barrier retires the final M-tile reads
                 # before a double buffer is reused. Intra-iteration reuse and
                 # the single-buffer staging path still need an explicit barrier.
@@ -886,6 +1040,8 @@ class Gfx1250Pipeline:
             if const_expr(t.buffers == 1):  # noqa: SIM102
                 if token_base + t.TOKENS < end:
                     self.mem.stage_kv(token_base + t.TOKENS, fx.Int32(0))
+            if const_expr(t.packed_lds):
+                next_state.append(vfactor)
             final = yield next_state
         pout = fx.recast_iter(t.q_dtype, ctx.pout_ptr)
         pmax = fx.recast_iter(fx.Float32, ctx.pmax_ptr)
@@ -903,7 +1059,8 @@ class Gfx1250Pipeline:
                     value = (
                         final[m * state_stride + 2 + vh]
                         * fx.Vector.from_elements(
-                            [fx.Float32(inv)], dtype=fx.Float32
+                            [fx.Float32(inv * final[-1] if t.packed_lds else inv)],
+                            dtype=fx.Float32,
                         ).broadcast_to(8)
                     ).to(t.q_dtype)
                     fx.ptr_store(

@@ -138,16 +138,30 @@ def test_dma_partial_pages(page, dim, trans_v, device):
 
 @pytest.mark.parametrize("page", [64, 128])
 @pytest.mark.parametrize("query_length,group", [(1, 8), (4, 4)])
-def test_packed_page_scale_tails(page, query_length, group, device):
+@pytest.mark.parametrize("dim", [128, 256])
+@pytest.mark.parametrize("query_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("window", [0, 129])
+def test_packed_page_scale_tails(
+    page, query_length, group, dim, query_dtype, window, device
+):
     from aiter.ops.flydsl.pa_decode import pa_decode, plan_pa_decode
 
     # The final 16-token cache chunk contains NaNs outside the context. V scales
     # span 256x and use a different pattern from K scales, exposing scale/chunk
-    # mismatches when a wave reads contraction chunks from packed LDS.
+    # mismatches when a wave reads contraction chunks from packed LDS. D256
+    # uses a 128-token compute tile on page128. Its empty trailing tile must
+    # preserve the accumulator's prior scale.
     length = 2 * page + 17
     q, k, v, kc, vc, table, lengths = _inputs(
-        device, length, query_length=query_length, group=group, page=page, divisor=16
+        device,
+        length,
+        query_length=query_length,
+        group=group,
+        dim=dim,
+        page=page,
+        divisor=16,
     )
+    q = q.to(query_dtype)
     count = kc.shape[0] * page
     index = torch.arange(count, device=device).reshape(kc.shape[0], 1, page, 1)
     ks = torch.exp2((index % 7 - 3).float())
@@ -156,7 +170,9 @@ def test_packed_page_scale_tails(page, query_length, group, device):
     kc[last_page, :, :, length % page :, :] = float("nan")
     vc[last_page, :, length % page // 16, :, length % 16 :] = float("nan")
     output = torch.full_like(q, float("nan"))
-    plan = plan_pa_decode(lengths, 1, max_partitions=1, query_length=query_length)
+    plan = plan_pa_decode(
+        lengths, 1, max_partitions=1, query_length=query_length, sliding_window=window
+    )
     pa_decode(
         output,
         q,
@@ -164,14 +180,15 @@ def test_packed_page_scale_tails(page, query_length, group, device):
         vc,
         lengths,
         table,
-        128**-0.5,
+        dim**-0.5,
         query_length,
         compute_type=kc.dtype,
         key_scale=ks,
         value_scale=vs,
         work_plan=plan,
+        sliding_window=window,
     )
-    expected = _reference(q, k * ks, v * vs, table, lengths, query_length, 0, None)
+    expected = _reference(q, k * ks, v * vs, table, lengths, query_length, window, None)
     torch.testing.assert_close(output.float(), expected, atol=0.005, rtol=0.005)
 
 
