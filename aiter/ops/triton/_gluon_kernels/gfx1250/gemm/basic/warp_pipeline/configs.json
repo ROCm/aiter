@@ -1,0 +1,134 @@
+{
+  "512,2048,7168": {
+    "tile": "64x64x1024",
+    "cluster": "4x4",
+    "flat_pipeline": false,
+    "output_buffers": 2,
+    "native_scale128": true,
+    "scale_mode": "mcontiguous",
+    "register_split_output": true,
+    "output_padding": false,
+    "num_warps": 8
+  },
+  "512,6144,7168": {
+    "tile": "128x128x512",
+    "cluster": "4x4",
+    "flat_pipeline": false,
+    "output_buffers": 2,
+    "native_scale128": true,
+    "scale_mode": "mcontiguous",
+    "register_split_output": true,
+    "output_padding": true,
+    "num_warps": 8
+  },
+  "512,7168,3072": {
+    "tile": "128x128x512",
+    "cluster": "4x4",
+    "flat_pipeline": true,
+    "output_buffers": 2,
+    "native_scale128": true,
+    "scale_mode": "mcontiguous",
+    "register_split_output": true,
+    "output_padding": true,
+    "num_warps": 8
+  },
+  "512,7168,16384": {
+    "tile": "128x128x512",
+    "cluster": "4x4",
+    "flat_pipeline": false,
+    "output_buffers": 2,
+    "native_scale128": true,
+    "scale_mode": "mcontiguous",
+    "register_split_output": true,
+    "output_padding": false,
+    "num_warps": 8
+  },
+  "512,8192,1536": {
+    "tile": "128x128x512",
+    "cluster": "4x4",
+    "flat_pipeline": true,
+    "output_buffers": 1,
+    "native_scale128": true,
+    "scale_mode": "mcontiguous",
+    "register_split_output": false,
+    "output_padding": false,
+    "num_warps": 8
+  },
+  "512,65536,1536": {
+    "tile": "256x256x256",
+    "cluster": "2x2",
+    "flat_pipeline": false,
+    "output_buffers": 2,
+    "native_scale128": true,
+    "scale_mode": "mcontiguous",
+    "register_split_output": false,
+    "output_padding": false,
+    "num_warps": 8
+  },
+  "16384,2048,7168": {
+    "tile": "256x256x256",
+    "cluster": "4x4",
+    "flat_pipeline": false,
+    "output_buffers": 2,
+    "native_scale128": true,
+    "scale_mode": "mcontiguous",
+    "register_split_output": true,
+    "output_padding": true,
+    "num_warps": 8
+  },
+  "16384,6144,7168": {
+    "tile": "256x256x256",
+    "cluster": "4x4",
+    "flat_pipeline": false,
+    "output_buffers": 2,
+    "native_scale128": true,
+    "scale_mode": "mcontiguous",
+    "register_split_output": false,
+    "output_padding": false,
+    "num_warps": 8
+  },
+  "16384,7168,3072": {
+    "tile": "256x256x256",
+    "cluster": "4x4",
+    "flat_pipeline": false,
+    "output_buffers": 2,
+    "native_scale128": true,
+    "scale_mode": "mcontiguous",
+    "register_split_output": true,
+    "output_padding": true,
+    "num_warps": 8
+  },
+  "16384,7168,16384": {
+    "tile": "256x256x256",
+    "cluster": "4x4",
+    "flat_pipeline": false,
+    "output_buffers": 2,
+    "native_scale128": true,
+    "scale_mode": "mcontiguous",
+    "register_split_output": true,
+    "output_padding": true,
+    "num_warps": 8
+  },
+  "16384,8192,1536": {
+    "tile": "256x256x256",
+    "cluster": "4x4",
+    "flat_pipeline": true,
+    "output_buffers": 2,
+    "native_scale128": true,
+    "scale_mode": "mcontiguous",
+    "register_split_output": true,
+    "output_padding": true,
+    "num_warps": 8
+  },
+  "16384,65536,1536": {
+    "tile": "256x256x256",
+    "cluster": "4x4",
+    "flat_pipeline": true,
+    "output_buffers": 2,
+    "native_scale128": true,
+    "scale_mode": "mcontiguous",
+    "register_split_output": true,
+    "output_padding": true,
+    "num_warps": 8
+  }
+}
