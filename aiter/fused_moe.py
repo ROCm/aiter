@@ -1653,7 +1653,30 @@ def fused_moe_router_arch_supported() -> bool:
     Widening this list needs the LDS note on FUSED_MOE_ROUTER_MAX_TOKENS
     re-checked: it assumes gfx950's 160 KB.
     """
-    return get_gfx() == "gfx950"
+    return get_gfx_runtime() == "gfx950"
+
+
+def _fused_moe_router_tuned_cfg_supported(
+    metadata: "MOEMetadata", is_shuffled: bool
+) -> bool:
+    """Whether the tuned stage1/stage2 can take the router's prequantized A.
+
+    ``fused_moe_router`` passes ``_metadata`` and ``a1_prequant``, which bypasses
+    ``fused_moe_2stages``' own A-preparation, so admit only stage1 kernels that
+    consume sorted MXFP4 A with the swizzled e8m0 scale layout: no 1-stage or
+    FLAT path, no output_aux sort (needs m_indices / reverse_sorted), no
+    inline-quant a4w4 GEMM1 (block_m 16 reads bf16 A), and no shuffled ksplit
+    path (stock feeds it bf16 A).
+    """
+    stage1 = getattr(metadata.stage1, "func", metadata.stage1)
+    return (
+        not metadata.run_1stage
+        and not metadata.flat
+        and not metadata.output_aux
+        and metadata.prequant
+        and not (metadata.ksplit > 1 and is_shuffled)
+        and not (stage1 is _mxfp4_a4w4_stage1_fw and int(metadata.block_m) == 16)
+    )
 
 
 def fused_moe_router_config_supported(
@@ -1789,7 +1812,9 @@ def fused_moe_router_supported(
         opus_weights_shuffled=getattr(w1, "is_shuffled", False)
         and getattr(w2, "is_shuffled", False),
     )
-    return not metadata.run_1stage and not metadata.flat
+    return _fused_moe_router_tuned_cfg_supported(
+        metadata, getattr(w1, "is_shuffled", False) or getattr(w2, "is_shuffled", False)
+    )
 
 
 def fused_moe_router(
@@ -1882,6 +1907,13 @@ def fused_moe_router(
     # global_E is the gating row stride in the kernel (gating + token * E), so
     # taking it from the mask would read past the end of every row.
     global_E = gating_output.shape[1]
+    # Stage 2 writes hidden_states.shape[0] rows; any it has no routing for
+    # would silently get no MoE contribution.
+    assert gating_output.shape[0] == M, (
+        f"fused_moe_router: gating_output has {gating_output.shape[0]} tokens, "
+        f"hidden_states has {M}"
+    )
+    assert correction_bias is not None, "fused_moe_router: correction_bias is required"
     # Every expert id the router can emit: routed, then the fused shared slots,
     # then -- under EP -- the always-masked sentinel non-owner ranks park their
     # shared row on. This is what sizes the sorted buffers and the histogram.
@@ -1919,8 +1951,11 @@ def fused_moe_router(
     # The fused kernel hardcodes what it fuses: biased sigmoid topk over a
     # single expert group, and an MXFP4 stage1 quant. Every other path needs
     # the unfused preamble, so refuse instead of producing wrong numbers.
-    assert not metadata.run_1stage and not metadata.flat, (
-        "fused_moe_router: only the 2-stage non-FLAT path is fused; "
+    assert _fused_moe_router_tuned_cfg_supported(metadata, isShuffled), (
+        "fused_moe_router: the tuned config cannot take prequantized MXFP4 A "
+        f"(run_1stage={metadata.run_1stage}, flat={metadata.flat}, "
+        f"output_aux={metadata.output_aux}, prequant={metadata.prequant}, "
+        f"ksplit={metadata.ksplit}, block_m={metadata.block_m}); "
         "gate on fused_moe_router_supported and call fused_moe_ otherwise"
     )
     assert q_dtype_a == dtypes.fp4x2 and quant_type == QuantType.per_1x32, (
@@ -1963,7 +1998,7 @@ def fused_moe_router(
         f"fused_moe_router: expert_mask has {expert_mask.numel()} entries, "
         f"need at least {E_tot}"
     )
-    assert correction_bias is None or correction_bias.numel() >= global_E, (
+    assert correction_bias.numel() >= global_E, (
         f"fused_moe_router: correction_bias has {correction_bias.numel()} "
         f"entries, need at least {global_E}"
     )
