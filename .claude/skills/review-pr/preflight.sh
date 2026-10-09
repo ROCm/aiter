@@ -26,9 +26,9 @@ if [ "$st_rc" -eq 0 ]; then
 else
   echo "  ❌ selftest.sh failed — run it directly to see which guard broke"; bad=$((bad+1))
 fi
-# A check that did not run is not a check that passed. selftest says out loud when it has to skip
-# one (no node on this box, for instance); suppressing its output here would turn that back into
-# the silent green this whole exercise exists to remove.
+# A check that did not run is not a check that passed. selftest says out loud when it has to
+# skip one; suppressing its output here would turn that back into the silent green this whole
+# exercise exists to remove.
 printf '%s\n' "$st" | grep '⚠' | sed 's/^[[:space:]]*/     /'
 
 echo "[runtime]"

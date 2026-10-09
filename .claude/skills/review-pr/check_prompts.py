@@ -109,10 +109,11 @@ def check_watchdog_owner():
     stuck-runner page itself and carries its own copy of the handle, so the two drift apart in
     silence: the next owner updates _notify.py and still never hears that the runner is down."""
     wf = WORKFLOW.read_text(encoding="utf-8")
-    m = re.search(r"OWNER_OVERRIDE \|\| ''\)\.trim\(\) \|\| '([A-Za-z0-9-]+)'", wf)
+    wd = (HERE / "watchdog.py").read_text(encoding="utf-8")
+    m = re.search(r'OWNER_OVERRIDE"\) or ""\)\.strip\(\) or "([A-Za-z0-9-]+)"', wd)
     v = re.search(r"OWNER_OVERRIDE: \$\{\{ vars\.([A-Z_]+) \}\}", wf)
     if not m or not v:
-        print("\u274c cannot read the watchdog's owner fallback from the workflow")
+        print("\u274c cannot read the watchdog's owner fallback from watchdog.py")
         return 1
     var, default = _notify_mod().CLASSES["env"][:2]
     if (m.group(1), v.group(1)) != (default, var):

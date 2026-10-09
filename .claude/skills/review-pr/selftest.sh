@@ -144,22 +144,20 @@ t "a silent downgrade is rejected" "$rc" "1"
 
 echo "[watchdog]"
 # The watchdog is the one guard that cannot be tested by running it: `issue_comment` workflows
-# only ever run from the default branch, so GitHub will not execute it until this merges. Drive
-# the shipping script against a faked API and clock instead. It needs node, which the hosted
-# runner it actually runs on has and the self-hosted box does not -- so say so out loud rather
-# than counting an absent check as a passing one.
-if command -v node >/dev/null 2>&1; then
-  wd=$(node "$S/watchdog_test.js" 2>&1); wd_rc=$?
-  printf '%s\n' "$wd" | grep -E '^  (✅|❌|⚠️)' || true
-  wok=$(printf '%s\n' "$wd" | grep -c '✅' || true)
-  wbad=$(printf '%s\n' "$wd" | grep -c '❌' || true)
-  ok=$((ok + wok)); bad=$((bad + wbad))
-  if [ "$wd_rc" -ne 0 ] && [ "$wbad" -eq 0 ]; then
-    why=$(printf '%s\n' "$wd" | grep -m1 -E 'Error|MODULE_NOT_FOUND|No such file' | sed 's/^ *//' | cut -c1-110)
-    echo "  ❌ watchdog_test.js did not run — ${why:-exit $wd_rc}"; bad=$((bad + 1))
-  fi
-else
-  echo "  ⚠️  node not installed here — watchdog checks did NOT run"
+# only ever run from the default branch, so GitHub will not execute that job until this merges.
+# Drive the shipping script against a fake API and a fake clock instead.
+wd=$(python3 "$S/watchdog_test.py" 2>&1); wd_rc=$?
+printf '%s
+' "$wd" | grep -E '^  (✅|❌)' || true
+wok=$(printf '%s
+' "$wd" | grep -c '✅' || true)
+wbad=$(printf '%s
+' "$wd" | grep -c '❌' || true)
+ok=$((ok + wok)); bad=$((bad + wbad))
+if [ "$wd_rc" -ne 0 ] && [ "$wbad" -eq 0 ]; then
+  why=$(printf '%s
+' "$wd" | grep -m1 -E 'Error|Traceback|No such file' | sed 's/^ *//' | cut -c1-110)
+  echo "  ❌ watchdog_test.py did not run — ${why:-exit $wd_rc}"; bad=$((bad + 1))
 fi
 
 echo "=== $ok green / $bad red ==="
