@@ -738,7 +738,6 @@ def _build_kernel_mfma_lds_pipe(
     convert_q_fn: bool = False,
     convert_kv_fn: bool = False,
     clean_logits: bool = True,
-    swizzle: bool = False,
     num_buffers: int = 2,
     prefetch_depth: int = 2,
     sw_pipe: bool = False,
@@ -865,10 +864,9 @@ def _build_kernel_mfma_lds_pipe(
     DW_PER_COL = D // 4  # i32 dwords per KV column (head dim)
     CHUNK_DW = mfma.frag_bytes // 4  # dwords per B-frag read (=8)
     NC = DW_PER_COL // CHUNK_DW  # chunks per column (D/frag_bytes)
-    if swizzle:
-        assert (
-            NC >= 2
-        ), f"swizzle needs D/frag_bytes>=2 (D={D}, frag_bytes={mfma.frag_bytes})"
+    assert (
+        NC >= 2
+    ), f"swizzle needs D/frag_bytes>=2 (D={D}, frag_bytes={mfma.frag_bytes})"
 
     # raw_ptr_buffer_load_lds requires its destination LDS address to be at
     # least 128-byte aligned; the third fx.Array parameter is that alignment and
@@ -884,7 +882,7 @@ def _build_kernel_mfma_lds_pipe(
     _kname = (
         f"fp8_mqa_logits_H{H}_D{D}_mfma{mfma.name}"
         f"_bkv{BKV}_r{RPW}_w{WPB}_lds{NUM_BUFFERS}{_pd_tag}"
-        f"{'_swizzled' if swizzle else ''}{'_swp' if sw_pipe else ''}"
+        f"{'_swp' if sw_pipe else ''}"
         f"{'_rs' if rs_head else ''}{'_ls' if lds_scales else ''}{_cl_tag}_flydsl"
     )
 
@@ -987,14 +985,12 @@ def _build_kernel_mfma_lds_pipe(
                 lin_bytes = (tid + fx.Int32(i * MR_BLOCK_THREADS)) * dma_bytes
                 row_local = lin_bytes // d
                 d_off = lin_bytes - row_local * d
-
-                if const_expr(swizzle):
-                    # The DMA writes lane-contiguously to physical byte lin_bytes,
-                    # so to store the swizzled tile we fetch the logical element
-                    # that maps to this physical slot: invert the within-column
-                    # XOR (mask in bytes = (n & (NC-1)) * frag_bytes).
-                    _mask_b = (row_local & fx.Int32(NC - 1)) * fx.Int32(mfma.frag_bytes)
-                    d_off = d_off ^ _mask_b
+                # The DMA writes lane-contiguously to physical byte lin_bytes,
+                # so to store the swizzled tile we fetch the logical element
+                # that maps to this physical slot: invert the within-column
+                # XOR (mask in bytes = (n & (NC-1)) * frag_bytes).
+                _mask_b = (row_local & fx.Int32(NC - 1)) * fx.Int32(mfma.frag_bytes)
+                d_off = d_off ^ _mask_b
 
                 voffset = row_local * d + d_off
                 if const_expr(i > 0):
@@ -1198,23 +1194,13 @@ def _build_kernel_mfma_lds_pipe(
                         slot_dword + fx.Int32(SCALE_DW) + col_local
                     )
                 for kk in range_constexpr(K_STEPS):
-                    if const_expr(swizzle):
-                        # phys_dword = n*DW_PER_COL
-                        #            + ((c_bytes/4) XOR ((n & (NC-1)) * CHUNK_DW))
-                        c_dword = (
-                            fx.Int32(kk * mfma.MFMA_K) + lane_frag_off
-                        ) // fx.Int32(4)
-                        _mask_dw = (col_local & fx.Int32(NC - 1)) * fx.Int32(CHUNK_DW)
-                        frag_dword = col_local * fx.Int32(DW_PER_COL) + (
-                            c_dword ^ _mask_dw
-                        )
-                    else:
-                        frag_byte = (
-                            col_local * fx.Int32(D)
-                            + fx.Int32(kk * mfma.MFMA_K)
-                            + lane_frag_off
-                        )
-                        frag_dword = frag_byte // fx.Int32(4)
+                    # phys_dword = n*DW_PER_COL
+                    #            + ((c_bytes/4) XOR ((n & (NC-1)) * CHUNK_DW))
+                    c_dword = (
+                        fx.Int32(kk * mfma.MFMA_K) + lane_frag_off
+                    ) // fx.Int32(4)
+                    _mask_dw = (col_local & fx.Int32(NC - 1)) * fx.Int32(CHUNK_DW)
+                    frag_dword = col_local * fx.Int32(DW_PER_COL) + (c_dword ^ _mask_dw)
 
                     b_packs[ni][kk] = mfma.make_frag(
                         _lds_read_frag(slot_dword + frag_dword)
