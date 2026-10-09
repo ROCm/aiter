@@ -776,6 +776,34 @@ class TestCoupledTuningResults(unittest.TestCase):
                 self.assertEqual(stopped.exception.code, 1)
                 self.assertTrue(pd.read_csv(self.output_file).empty)
 
+    def test_retune_discards_saved_g1_that_shared_shape_support_rejects(self) -> None:
+        class NoCandidates(self.module.Mxfp4FlydslTuner):
+            def _candidate_rows(
+                self, row: dict[str, Any], full_search: bool | None = None
+            ) -> list[dict[str, Any]]:
+                return []
+
+        requested = _input_row()
+        requested.update(q_dtype_a="torch.float8_e4m3fn", inter_dim=384)
+        saved = requested.copy()
+        saved.update(dict.fromkeys(RESULT_COLUMNS, 0))
+        saved.update(
+            us=11.0,
+            us1=11.0,
+            block_m=16,
+            kernelName1="flydsl_mxmoe_g1_a8w4_16x128x256_nt_fp8out",
+            kernelName2="flydsl_moe2_layout_afp8_wfp4_bf16_t16x128x128_atomic_nt_sbm16",
+            err1="1.0%",
+            err2="1.0%",
+        )
+        with self.assertRaises(SystemExit) as stopped:
+            self.run_csv([requested], NoCandidates, existing_rows=[saved])
+        self.assertEqual(stopped.exception.code, 1)
+        self.assertTrue(pd.read_csv(self.output_file).empty)
+        failures = pd.read_csv(self.output_file.with_suffix(".failed_shapes.csv"))
+        self.assertEqual(failures["inter_dim"].tolist(), [384])
+        self.assertTrue(failures["failure_reason"].str.contains("no legal").all())
+
     def test_resume_keeps_compatible_legacy_native_a4_pair(self) -> None:
         saved = _input_row()
         saved.update(dict.fromkeys(RESULT_COLUMNS, 0))
@@ -797,6 +825,102 @@ class TestCoupledTuningResults(unittest.TestCase):
         self.assertTrue(
             pd.read_csv(self.output_file.with_suffix(".failed_shapes.csv")).empty
         )
+
+    def test_resume_retunes_saved_g2_with_unsupported_contraction_tile(self) -> None:
+        class A8CandidateBoundary(self.module.Mxfp4FlydslTuner):
+            def _run_candidate(
+                self,
+                row: dict[str, Any],
+                candidate: dict[str, Any],
+                args: argparse.Namespace,
+            ) -> float:
+                candidate.update(us=7.0, us1=7.0, error=0.01, err1="1.0%", err2="1.0%")
+                return 7.0
+
+        requested = _input_row()
+        requested.update(q_dtype_a="torch.float8_e4m3fn", inter_dim=384)
+        saved = requested.copy()
+        saved.update(dict.fromkeys(RESULT_COLUMNS, 0))
+        saved.update(
+            us=11.0,
+            us1=11.0,
+            block_m=16,
+            kernelName1="flydsl_mxmoe_g1_a8w4_16x128x256_f16in_nt_fp8out",
+            kernelName2="flydsl_moe2_layout_afp8_wfp4_bf16_t16x128x256_atomic_nt_sbm16",
+            err1="1.0%",
+            err2="1.0%",
+        )
+        self.run_csv([requested], A8CandidateBoundary, existing_rows=[saved])
+        tuned = pd.read_csv(self.output_file)
+        self.assertEqual(tuned["us"].tolist(), [7.0])
+        self.assertIn("x128_", tuned.iloc[0]["kernelName2"])
+        profile = pd.read_csv(self.profile_file)
+        self.assertFalse(profile.empty)
+        self.assertTrue(profile["kernelName2"].str.contains("x128_").all())
+        self.assertEqual(set(profile["precision"]), {"A8W4"})
+
+    def test_retune_discards_native_a4_saved_g2_with_unsupported_contraction(
+        self,
+    ) -> None:
+        class NoCandidates(self.module.Mxfp4FlydslTuner):
+            def _candidate_rows(
+                self, row: dict[str, Any], full_search: bool | None = None
+            ) -> list[dict[str, Any]]:
+                return []
+
+        requested = _input_row()
+        requested["inter_dim"] = 384
+        saved = requested.copy()
+        saved.update(dict.fromkeys(RESULT_COLUMNS, 0))
+        saved.update(
+            us=11.0,
+            us1=11.0,
+            block_m=16,
+            kernelName1=G1,
+            kernelName2="flydsl_mxmoe_g2_a4w4_16x256x256_atomic_nt",
+            err1="1.0%",
+            err2="1.0%",
+        )
+        with self.assertRaises(SystemExit) as stopped:
+            self.run_csv([requested], NoCandidates, existing_rows=[saved])
+        self.assertEqual(stopped.exception.code, 1)
+        self.assertTrue(pd.read_csv(self.output_file).empty)
+        failures = pd.read_csv(self.output_file.with_suffix(".failed_shapes.csv"))
+        self.assertEqual(failures["inter_dim"].tolist(), [384])
+
+    def test_retune_discards_saved_name_flags_outside_the_coupled_catalog(self) -> None:
+        class NoCandidates(self.module.Mxfp4FlydslTuner):
+            def _candidate_rows(
+                self, row: dict[str, Any], full_search: bool | None = None
+            ) -> list[dict[str, Any]]:
+                return []
+
+        requested = _input_row()
+        requested["q_dtype_a"] = "torch.float8_e4m3fn"
+        g1 = "flydsl_mxmoe_g1_a8w4_16x128x256_f16in_nt_fp8out"
+        g2 = "flydsl_moe2_layout_afp8_wfp4_bf16_t16x128x128_atomic_nt_sbm16"
+        for kernel1, kernel2 in (
+            (g1 + "_sk2", g2),
+            (g1 + "_bias", g2),
+            (g1, g2 + "_sp1"),
+            (g1, g2 + "_bf16lds"),
+        ):
+            saved = requested.copy()
+            saved.update(dict.fromkeys(RESULT_COLUMNS, 0))
+            saved.update(
+                us=11.0,
+                us1=11.0,
+                block_m=16,
+                kernelName1=kernel1,
+                kernelName2=kernel2,
+                err1="1.0%",
+                err2="1.0%",
+            )
+            with self.subTest(kernel1=kernel1, kernel2=kernel2):
+                with self.assertRaises(SystemExit) as stopped:
+                    self.run_csv([requested], NoCandidates, existing_rows=[saved])
+                self.assertEqual(stopped.exception.code, 1)
+                self.assertTrue(pd.read_csv(self.output_file).empty)
 
 
 if __name__ == "__main__":

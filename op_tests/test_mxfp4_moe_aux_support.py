@@ -111,7 +111,7 @@ def test_mxfp4_moe_aux(
             prologue=0,
         )
 
-    def check_outputs(name: str, zero_init: bool) -> None:
+    def check_outputs(name: str, zero_init: bool) -> int:
         def compare(expected: torch.Tensor, actual: torch.Tensor, label: str) -> float:
             if not expected.is_floating_point():
                 # FP32 cannot represent the low token bits of every encoded
