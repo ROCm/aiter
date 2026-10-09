@@ -116,9 +116,14 @@ class TestMxfp4MoeAuxCatalog(unittest.TestCase):
 
         aux = load_aux_module(capability_probe)
         with self.assertRaisesRegex(
-            RuntimeError, "aux_sortzi_NE24_TOPK6_MB16_H7168.*AITER_REBUILD=1"
-        ):
+            aux._MissingMxfp4MoeAuxInstances,
+            "aux_sortzi_NE24_TOPK6_MB16_H7168.*AITER_REBUILD=1",
+        ) as raised:
             aux.prepare_mxfp4_moe_aux(MODEL_SHAPES)
+        self.assertEqual(
+            raised.exception.missing_keys, ("aux_sortzi_NE24_TOPK6_MB16_H7168",)
+        )
+        self.assertEqual(raised.exception.missing_instances, ((24, 6, 7168, True),))
 
     def test_preflight_accepts_new_inter_dim_when_compiled_aux_keys_cover_it(
         self,
