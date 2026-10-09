@@ -719,20 +719,28 @@ def _build_kv_kernel(
 
         if can_coalesce:
             block_id = slot_mapping[tok0] // block_size
-            # Use one logical ((D/x, token), x-run) domain for both sides.
+            # Use one logical ((D/x, token), x-run) domain for both LDS and cache
             # Only the strides differ: LDS is row-major [token, D], while the
             # shuffle cache is [D/x, token, x]. This lets the tiled copy own
             # the complete page without per-run slicing or coordinate walks.
             k_copy_shape = ((D // x, block_size), x)
             k_src_layout = fx.make_layout(k_copy_shape, stride=((x, D), 1))
-            k_dst_layout = fx.make_layout(k_copy_shape, stride=((block_size * x, x), 1))
             k_src = fx.Tensor(fx.make_view(fx.get_iter(k_lds_view), k_src_layout))
-            k_dst_base = (
-                fx.get_iter(k_cache_view)
-                + block_id * k_cache_block_stride
-                + head * fx.cosize(layout_k_head).unpack()
+            k_cache_copy_view = fx.Tensor(
+                fx.make_view(
+                    fx.get_iter(k_cache),
+                    fx.make_layout(
+                        (k_cache.shape[0], H_KV, *k_copy_shape),
+                        stride=(
+                            k_cache_block_stride,
+                            fx.cosize(layout_k_head),
+                            (block_size * x, x),
+                            1,
+                        ),
+                    ),
+                )
             )
-            k_dst = fx.Tensor(fx.make_view(k_dst_base, k_dst_layout))
+            k_dst = fx.slice(k_cache_copy_view, (block_id, head, None, None))
 
             k_thread_chunks = min(D // x, KV_THREADS // block_size)
             k_value_chunks = (D // x) // k_thread_chunks
@@ -757,14 +765,23 @@ def _build_kv_kernel(
             # the destination tiled copy emits one contiguous 16-byte store.
             v_copy_shape = ((block_size // x, D), x)
             v_src_layout = fx.make_layout(v_copy_shape, stride=((x * D, 1), D))
-            v_dst_layout = fx.make_layout(v_copy_shape, stride=((D * x, x), 1))
             v_src = fx.Tensor(fx.make_view(fx.get_iter(v_lds_view), v_src_layout))
-            v_dst_base = (
-                fx.get_iter(v_cache_view)
-                + block_id * v_cache_block_stride
-                + head * fx.cosize(layout_v_head).unpack()
+
+            v_cache_copy_view = fx.Tensor(
+                fx.make_view(
+                    fx.get_iter(v_cache),
+                    fx.make_layout(
+                        (v_cache.shape[0], H_KV, *v_copy_shape),
+                        stride=(
+                            v_cache_block_stride,
+                            fx.cosize(layout_v_head),
+                            (D * x, x),
+                            1,
+                        ),
+                    ),
+                )
             )
-            v_dst = fx.Tensor(fx.make_view(v_dst_base, v_dst_layout))
+            v_dst = fx.slice(v_cache_copy_view, (block_id, head, None, None))
 
             v_thread_tiles = min(block_size // x, KV_THREADS // D)
             v_value_tiles = (block_size // x) // v_thread_tiles
