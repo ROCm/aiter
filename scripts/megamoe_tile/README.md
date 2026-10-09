@@ -81,6 +81,15 @@ profiler 偶尔丢事件，所以它不进总耗时。跨 harness 比较**必须
 
 ## 环境前提
 
+不占用 GPU 的 host 回归可单独运行：
+
+```bash
+python op_tests/test_megamoe_tile_host.py -v
+```
+
+检查计时统计及 162 组 arena 配置的区域边界和 RDMA 注册前缀；布局检查需要
+PyTorch，不需要初始化分布式通信或分配 GPU 内存。
+
 本仓的 `aiter/ops/flydsl/kernels/act.py` 调 `fx.max`,那是 **flydsl 0.3.2**
 才有的符号。容器里若装的是 0.3.1,任何走 a4w4 fused-moe 的路径都会报
 `AttributeError: module 'flydsl.expr' has no attribute 'max'`,与 megamoe_tile

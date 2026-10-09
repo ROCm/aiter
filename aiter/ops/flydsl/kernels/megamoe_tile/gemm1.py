@@ -150,9 +150,9 @@ def _gate_up_batch(
     pairs = list(zip(gs, us))
     if act in ("silu", "swiglu"):
         limit = (
-            7.0 if act == "swiglu" and swiglu_limit is None
-            else float("inf") if swiglu_limit is None
-            else float(swiglu_limit)
+            7.0
+            if act == "swiglu" and swiglu_limit is None
+            else float("inf") if swiglu_limit is None else float(swiglu_limit)
         )
         return batched_silu_swiglu(
             pairs,
@@ -166,9 +166,7 @@ def _gate_up_batch(
             fx.Float32(float(situ_beta)),
             fx.Float32(float(situ_linear_beta)),
         )
-        return batched_situv2(
-            pairs, consts=consts, range_constexpr=range_constexpr
-        )
+        return batched_situv2(pairs, consts=consts, range_constexpr=range_constexpr)
     raise ValueError(f"unsupported A4W4 GMM1 activation {act!r}")
 
 
@@ -264,7 +262,9 @@ def _gemm1_body_sc2(
     # 与小算子 t128 同为每 wave 32 列)。BN=128 只支持生产路径(非 interleave、非 inline_quant)。
     NJ = BN // 64
     assert BN in (128, 256), f"GMM1 BN must be 128 or 256, got {BN}"
-    assert BN == 256 or not (interleave or inline_quant), "BN=128 needs the non-interleave, non-inline path"
+    assert BN == 256 or not (
+        interleave or inline_quant
+    ), "BN=128 needs the non-interleave, non-inline path"
 
     # next_claim(stage1 early_local_gmm 专用):在本 job 的第
     # K_TILES_TOTAL-lead 步开头由 tx0 发下一个 job 的领位原子(arg_nc_head),结果留在 VGPR
@@ -275,9 +275,13 @@ def _gemm1_body_sc2(
     # 原子是 monotonic、只在 wave0 发:它排在已计数的 vmem 之后,_wait_lds_barrier 的 vmcnt
     # 只会变松不会变错(in-order 返回,A(kt+1) 之后的条数只多不少)。
     if const_expr(next_claim):
-        assert not inline_quant, "next_claim only on the production (non-inline) pipeline"
+        assert (
+            not inline_quant
+        ), "next_claim only on the production (non-inline) pipeline"
         _nc_lds_min = _bm_constants(BM, BN, KH_TILE, K_TILES_TOTAL)[3]
-        assert next_claim_lds_dw * 4 >= _nc_lds_min, "next_claim mailbox aliases the GMM1 LDS"
+        assert (
+            next_claim_lds_dw * 4 >= _nc_lds_min
+        ), "next_claim mailbox aliases the GMM1 LDS"
         assert next_claim_lead >= 1
         _NC_STEP = max(0, K_TILES_TOTAL - int(next_claim_lead))
 
@@ -295,9 +299,7 @@ def _gemm1_body_sc2(
     # reads its source tile but stores the result at the expert-major
     # slot, so Stage2 sees contiguous runs with no data movement.
     m_block_out = (
-        rocdl.readfirstlane(
-            T.i32, _raw(_global_i32_at(arg_tile_perm, m_block_idx))
-        )
+        rocdl.readfirstlane(T.i32, _raw(_global_i32_at(arg_tile_perm, m_block_idx)))
         if const_expr(expert_major)
         else m_block_idx
     )
@@ -349,7 +351,7 @@ def _gemm1_body_sc2(
     if const_expr(_lds_scoped):
         from flydsl._mlir import ir as _ir
 
-        _dom = "#llvm.alias_scope_domain<id = distinct[0]<>, description = \"gmm1_lds\">"
+        _dom = '#llvm.alias_scope_domain<id = distinct[0]<>, description = "gmm1_lds">'
         _sc = _ir.ArrayAttr(
             _ir.Attribute.parse(
                 "["
@@ -414,7 +416,9 @@ def _gemm1_body_sc2(
                 n_block_idx * fx.Int32(BN) + wave * fx.Int32(BN // 4) + fx.Int32(j * 16)
             )
         else:
-            tile_il = n_block_idx * fx.Int32(BN // 16) + wave * fx.Int32(NJ) + fx.Int32(j)
+            tile_il = (
+                n_block_idx * fx.Int32(BN // 16) + wave * fx.Int32(NJ) + fx.Int32(j)
+            )
             g = tile_il & fx.Int32(1)
             n0 = tile_il >> fx.Int32(1)
             col = (g * fx.Int32(N0_HALF) + n0) * fx.Int32(16)
@@ -608,7 +612,9 @@ def _gemm1_body_sc2(
             db = rb * fx.Int32(_GS_ROW_DW) + ku * fx.Int32(2)
             loads.append(
                 (
-                    sub, n_lane, ku,
+                    sub,
+                    n_lane,
+                    ku,
                     _global_i32_at(arg_ascale, da),
                     _global_i32_at(arg_ascale, da + fx.Int32(1)),
                     _global_i32_at(arg_ascale, db),
@@ -889,9 +895,7 @@ def _gemm1_body_sc2(
             if const_expr(next_claim and kt == _NC_STEP):
                 rocdl.sched_barrier(0)
                 if nc_tx0:
-                    nc_raw = fx.Int32(
-                        _nc_atomic_add_agent(arg_nc_head, fx.Int32(1))
-                    )
+                    nc_raw = fx.Int32(_nc_atomic_add_agent(arg_nc_head, fx.Int32(1)))
                 rocdl.sched_barrier(0)
             if const_expr(refill):
                 rocdl.sched_barrier(0)
@@ -1001,7 +1005,12 @@ def _gemm1_body_sc2(
                 asc_cur = issue_a_scale_ds_read(kt)
             for J in range_constexpr(4):
                 mfma_cluster(
-                    b[kt % kStages], a_cur, asc_cur, b_scale_v[kt % kStages], J, init=False
+                    b[kt % kStages],
+                    a_cur,
+                    asc_cur,
+                    b_scale_v[kt % kStages],
+                    J,
+                    init=False,
                 )
 
     gpu.barrier()
@@ -1083,7 +1092,9 @@ def _gemm1_body_sc2(
             gate_vs_b = [None] * 8
             up_vs_b = [None] * 8
             for ee in range_constexpr(8):
-                gate_col_b = wave_grp_b * fx.Int32(32) + fx.Int32(8) * kk_b + fx.Int32(ee)
+                gate_col_b = (
+                    wave_grp_b * fx.Int32(32) + fx.Int32(8) * kk_b + fx.Int32(ee)
+                )
                 gate_vs_b[ee] = acc_load(acc_idx(row_local_b, gate_col_b))
                 up_vs_b[ee] = acc_load(acc_idx(row_local_b, fx.Int32(64) + gate_col_b))
             result_b = _gate_up_batch(
@@ -1116,8 +1127,15 @@ def _gemm1_body_sc2(
                 + wave_grp_b * fx.Int32(16)
                 + kk_b * fx.Int32(4)
             )
-            store_off_b = _layout_idx(aqout_layout_b, m_row_out + row_local_b, byte_pos_b)
-            _scalar_store(aqout_tiles_b, store_off_b // fx.Int32(4), fx.Int32(packed_i32_b), fx.Int32)
+            store_off_b = _layout_idx(
+                aqout_layout_b, m_row_out + row_local_b, byte_pos_b
+            )
+            _scalar_store(
+                aqout_tiles_b,
+                store_off_b // fx.Int32(4),
+                fx.Int32(packed_i32_b),
+                fx.Int32,
+            )
             if kk_b == fx.Int32(0):
                 chunk_b = m_block_out * fx.Int32(kSubBlocks) + fx.Int32(mr)
                 dword_off_b = _layout_idx(
@@ -1209,7 +1227,9 @@ def _gemm1_body_sc2(
             else:
                 for sub in range_constexpr(kSubBlocks):
                     chunk = m_block_out * fx.Int32(kSubBlocks) + fx.Int32(sub)
-                    dword_off = _layout_idx(ascaleout_layout, chunk, ku, wave_grp, m_lane)
+                    dword_off = _layout_idx(
+                        ascaleout_layout, chunk, ku, wave_grp, m_lane
+                    )
                     pair_i32 = scales_per_mr[sub * 2 + 0] | (
                         scales_per_mr[sub * 2 + 1] << fx.Int32(8)
                     )
@@ -1287,9 +1307,9 @@ def _epi_swz_selfcheck(BM, BN):
         worst = 1
         for g in groups:
             cnt = {}
-            for l in g:
+            for lane in g:
                 for d in range(width):
-                    a = addrs[l] + d
+                    a = addrs[lane] + d
                     cnt.setdefault(a % banks, set()).add(a)
             worst = max(worst, max(len(v) for v in cnt.values()))
         return worst
@@ -1299,11 +1319,17 @@ def _epi_swz_selfcheck(BM, BN):
             up = BN // 2 if J % 2 == 1 else 0
             for v in range(4):
                 addrs = [
-                    ((lane // 16) * 4 + v) * stride + wave * (BN // 8) + (J // 2) * 16 + lane % 16 + up
+                    ((lane // 16) * 4 + v) * stride
+                    + wave * (BN // 8)
+                    + (J // 2) * 16
+                    + lane % 16
+                    + up
                     for lane in range(64)
                 ]
                 assert _ways(addrs, 1, 64, (range(64),)) == 1, "epi store conflict 64"
-                assert _ways(addrs, 1, 32, (range(32), range(32, 64))) == 1, "epi store conflict 32"
+                assert (
+                    _ways(addrs, 1, 32, (range(32), range(32, 64))) == 1
+                ), "epi store conflict 32"
         for up in (0, 128):
             for h in (0, 1):
                 addrs = []
@@ -1314,8 +1340,12 @@ def _epi_swz_selfcheck(BM, BN):
                     a = m * stride + up + wg * 32 + kk * 8 + 4 * h
                     assert a % 4 == 0
                     addrs.append(a)
-                assert _ways(addrs, 4, 64, _B128_PHASES_CDNA4) == 1, "epi load conflict cdna4"
-                assert _ways(addrs, 4, 32, _B128_PHASES_CDNA3) == 1, "epi load conflict cdna3"
+                assert (
+                    _ways(addrs, 4, 64, _B128_PHASES_CDNA4) == 1
+                ), "epi load conflict cdna4"
+                assert (
+                    _ways(addrs, 4, 32, _B128_PHASES_CDNA3) == 1
+                ), "epi load conflict cdna3"
     _EPI_SWZ_CHECKED.add(key)
 
 
@@ -1366,9 +1396,7 @@ def compile_gemm1_a4w4_port(
             f"unsupported gemm1 variant (BM={BM}, use_nt={use_nt}, inline_quant={inline_quant})"
         )
     if act not in ("silu", "swiglu", "situv2"):
-        raise ValueError(
-            f"activation must be silu, swiglu or situv2, got {act!r}"
-        )
+        raise ValueError(f"activation must be silu, swiglu or situv2, got {act!r}")
     if (
         not math.isfinite(float(situ_beta))
         or float(situ_beta) <= 0.0
@@ -1408,12 +1436,7 @@ def compile_gemm1_a4w4_port(
     )
 
     def _float_tag(value):
-        return (
-            str(float(value))
-            .replace("-", "m")
-            .replace("+", "p")
-            .replace(".", "p")
-        )
+        return str(float(value)).replace("-", "m").replace("+", "p").replace(".", "p")
 
     if act == "swiglu":
         limit = 7.0 if swiglu_limit is None else float(swiglu_limit)

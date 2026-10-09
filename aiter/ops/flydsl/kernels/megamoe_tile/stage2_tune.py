@@ -19,6 +19,7 @@ the table.
 persistent grid (0 = the operator's worker_blocks).  BM stays 32: kernel1
 requires ``SBM % BM == 0`` and the arena tile (SBM) is 32 rows.
 """
+
 from __future__ import annotations
 
 import csv
@@ -80,15 +81,16 @@ def _load(path: str) -> dict:
         return table
     with open(path, newline="") as handle:
         reader = csv.DictReader(handle)
-        missing = [f for f in _KEY_FIELDS + _VALUE_FIELDS if f not in (reader.fieldnames or ())]
+        missing = [
+            f for f in _KEY_FIELDS + _VALUE_FIELDS if f not in (reader.fieldnames or ())
+        ]
         if missing:
             raise ValueError(f"{path}: tune table is missing columns {missing}")
         for lineno, raw in enumerate(reader, start=2):
             if not raw.get("gfx") or raw["gfx"].lstrip().startswith("#"):
                 continue
             key = tuple(
-                raw["gfx"].strip() if f == "gfx" else int(raw[f])
-                for f in _KEY_FIELDS
+                raw["gfx"].strip() if f == "gfx" else int(raw[f]) for f in _KEY_FIELDS
             )
             row = {f: int(raw[f]) for f in _VALUE_FIELDS}
             _validate(row, path, lineno)
@@ -152,7 +154,9 @@ def resolve_gemm2_bn(tuned: dict | None) -> tuple[int, str]:
     else:
         bn, source = DEFAULT_GEMM2_BN, "default"
     if bn not in GEMM2_BNS:
-        raise ValueError(f"gemm2_bn must be one of {GEMM2_BNS} (got {bn}, from {source})")
+        raise ValueError(
+            f"gemm2_bn must be one of {GEMM2_BNS} (got {bn}, from {source})"
+        )
     return bn, source
 
 
@@ -166,5 +170,7 @@ def resolve_gemm2_cu(tuned: dict | None) -> tuple[int, str]:
     else:
         cu, source = DEFAULT_GEMM2_CU, "default"
     if not 0 <= cu <= GEMM2_CU_MAX:
-        raise ValueError(f"gemm2_cu must be in [0, {GEMM2_CU_MAX}] (got {cu}, from {source})")
+        raise ValueError(
+            f"gemm2_cu must be in [0, {GEMM2_CU_MAX}] (got {cu}, from {source})"
+        )
     return cu, source

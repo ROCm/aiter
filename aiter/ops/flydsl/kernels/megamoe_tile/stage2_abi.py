@@ -32,7 +32,6 @@ import torch
 
 from .stage1_abi import MAX_FUSED_TOKENS_PER_RANK, MAX_PACKED_SOURCE_CAPACITY
 
-
 STAGE2_TIMELINE_FIELDS = (
     "stage1_entry",
     "stage1_dispatch_flush_pre",
@@ -213,7 +212,9 @@ class Stage2ArenaLayout:
 
     @property
     def ready_group_count(self) -> int:
-        return (self.hidden_tiles + self.ready_group_tiles - 1) // self.ready_group_tiles
+        return (
+            self.hidden_tiles + self.ready_group_tiles - 1
+        ) // self.ready_group_tiles
 
     @classmethod
     def create(
@@ -264,7 +265,9 @@ class Stage2ArenaLayout:
             or timeline_history_depth > 1024
             or timeline_history_depth & (timeline_history_depth - 1)
         ):
-            raise ValueError("timeline_history_depth must be 0 or a power of two in [2, 1024]")
+            raise ValueError(
+                "timeline_history_depth must be 0 or a power of two in [2, 1024]"
+            )
         if not 1 <= int(max_tokens) <= MAX_FUSED_TOKENS_PER_RANK:
             raise ValueError(
                 "max_tokens must be in [1, 4096] for the fused Stage-2 ABI"
@@ -301,11 +304,11 @@ class Stage2ArenaLayout:
             else int(rail_scale_dim)
         )
         if rail_quant_type == "none" and rail_scale_dim != 0:
-            raise ValueError("rail_scale_dim must be zero when rail quantization is disabled")
-        if rail_quant_type == "fp8_blockwise" and rail_scale_dim != expected_scale_dim:
             raise ValueError(
-                "fp8_blockwise rail_scale_dim must equal hidden // 128"
+                "rail_scale_dim must be zero when rail quantization is disabled"
             )
+        if rail_quant_type == "fp8_blockwise" and rail_scale_dim != expected_scale_dim:
+            raise ValueError("fp8_blockwise rail_scale_dim must equal hidden // 128")
         if ready_granularity == "group" and not include_rank_partials:
             raise ValueError("group ready granularity requires include_rank_partials")
         if include_staged_reduce and not include_rank_partials:
@@ -313,17 +316,23 @@ class Stage2ArenaLayout:
         if include_staged_ring and not include_rank_partials:
             raise ValueError("include_staged_ring requires include_rank_partials")
         if include_staged_ring and include_staged_reduce:
-            raise ValueError("include_staged_ring and include_staged_reduce are mutually exclusive")
+            raise ValueError(
+                "include_staged_ring and include_staged_reduce are mutually exclusive"
+            )
         if int(max_tokens) > 128 and include_staged_reduce:
             raise ValueError("staged_reduce currently supports max_tokens <= 128")
         if int(max_tokens) > 128 and include_staged_ring:
             raise ValueError("staged_ring currently supports max_tokens <= 128")
         if include_rank_push and not (
-            include_rank_partials and ready_granularity == "group"
-            and ready_group_tiles == 2 and not include_staged_reduce
+            include_rank_partials
+            and ready_granularity == "group"
+            and ready_group_tiles == 2
+            and not include_staged_reduce
             and not include_staged_ring
         ):
-            raise ValueError("rank push requires rank partials, group readiness and no staged legacy mode")
+            raise ValueError(
+                "rank push requires rank partials, group readiness and no staged legacy mode"
+            )
         wire = Stage2NodePartialWire(int(hidden), int(records_per_group))
         groups = wire.group_count(max_tokens)
         ntiles = int(hidden) // int(tile_n)
@@ -607,7 +616,11 @@ class Stage2ArenaLayout:
                         ),
                         (
                             "rank_stage_group_pending",
-                            (parity_depth, world_size * max_tokens, hidden // (2 * tile_n)),
+                            (
+                                parity_depth,
+                                world_size * max_tokens,
+                                hidden // (2 * tile_n),
+                            ),
                             torch.int32,
                             64,
                         ),
@@ -892,23 +905,55 @@ class Stage2ArenaLayout:
         # offsets stay identical. Unlike the two payload parities, these slots
         # retain many ordered generations until one post-profile host read.
         if timeline_history_depth:
-            specs.extend((
-                ("timeline_history", (timeline_history_depth, len(STAGE2_TIMELINE_FIELDS)), torch.int64, 64),
-                ("timeline_history_gmm_worker_done", (timeline_history_depth, timeline_cta_capacity), torch.int64, 64),
-                ("timeline_history_generation", (timeline_history_depth,), torch.int64, 64),
-            ))
+            specs.extend(
+                (
+                    (
+                        "timeline_history",
+                        (timeline_history_depth, len(STAGE2_TIMELINE_FIELDS)),
+                        torch.int64,
+                        64,
+                    ),
+                    (
+                        "timeline_history_gmm_worker_done",
+                        (timeline_history_depth, timeline_cta_capacity),
+                        torch.int64,
+                        64,
+                    ),
+                    (
+                        "timeline_history_generation",
+                        (timeline_history_depth,),
+                        torch.int64,
+                        64,
+                    ),
+                )
+            )
 
         if include_rank_push:
             # Each rank writes a disjoint contributor slot on the source proxy.
             # Payload stays uninitialized until arrival publication; a missing
             # rank is masked at the local reader, never interpreted as stale zero.
-            specs.extend((
-                ("rank_push_inbox", (parity_depth, source_nodes * max_tokens,
-                                     ready_groups, gpus_per_node,
-                                     ready_group_tiles * tile_n), torch.bfloat16, 256),
-                ("rank_push_arrived", (parity_depth, source_nodes * max_tokens,
-                                       ready_groups), torch.int32, 64),
-            ))
+            specs.extend(
+                (
+                    (
+                        "rank_push_inbox",
+                        (
+                            parity_depth,
+                            source_nodes * max_tokens,
+                            ready_groups,
+                            gpus_per_node,
+                            ready_group_tiles * tile_n,
+                        ),
+                        torch.bfloat16,
+                        256,
+                    ),
+                    (
+                        "rank_push_arrived",
+                        (parity_depth, source_nodes * max_tokens, ready_groups),
+                        torch.int32,
+                        64,
+                    ),
+                )
+            )
 
         if include_plane_slots and not include_rank_push:
             raise ValueError("plane slots reuse the rank-push readiness arena")
@@ -953,8 +998,13 @@ class Stage2ArenaLayout:
             specs.append(
                 (
                     "plane_slot_inbox",
-                    (parity_depth, source_nodes * max_tokens, ready_groups,
-                     topk, ready_group_tiles * tile_n),
+                    (
+                        parity_depth,
+                        source_nodes * max_tokens,
+                        ready_groups,
+                        topk,
+                        ready_group_tiles * tile_n,
+                    ),
                     torch.bfloat16,
                     256,
                 )
@@ -962,9 +1012,15 @@ class Stage2ArenaLayout:
 
         # rail(RDMA)读写的 region 排在 stage2 最前(源 node_accumulator、目标 remote_partial_rx/
         # return_group_ready/return_consumed),原因见 Stage1ArenaLayout.create 的说明。
-        _rdma_first = ("node_accumulator", "remote_partial_rx", "return_group_ready", "return_consumed")
-        specs = ([sp for sp in specs if sp[0] in _rdma_first]
-                 + [sp for sp in specs if sp[0] not in _rdma_first])
+        _rdma_first = (
+            "node_accumulator",
+            "remote_partial_rx",
+            "return_group_ready",
+            "return_consumed",
+        )
+        specs = [sp for sp in specs if sp[0] in _rdma_first] + [
+            sp for sp in specs if sp[0] not in _rdma_first
+        ]
 
         offset = 0
         regions: list[Stage2ArenaRegion] = []

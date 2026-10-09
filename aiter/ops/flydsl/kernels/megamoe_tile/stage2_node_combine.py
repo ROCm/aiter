@@ -33,9 +33,11 @@ from flydsl.expr.typing import BFloat16, Float32, T
 from aiter.ops.flydsl.kernels import buffer_ops
 from ..mxfp4_gemm_common import _fabs_f32 as fabs_f32
 from . import comm_ops
+
 # e8m0 的取整规则必须和 push 端**同一份代码**:两端各写一遍迟早会飘,
 # 而飘掉的表现是数值慢慢不对,不是崩 —— 最难查的那一类。
 from .stage2_gemm_push import _fp8_scale_for_leader
+
 # 跨节点 rail 段用的三个 GDA 原语。MORI 公开绑定给不了(team 写死 WORLD、
 # GDA 不透传 optFlags),见 gda_rail.py 顶部;其余 CCO 用法都是直连公开 API。
 from .gda_rail import release as _rail, ccqe_enabled as _rail_ccqe
@@ -44,33 +46,33 @@ TEAM_RAIL = "rail"
 
 
 # scratch 布局(i32 槽位),避免第一版就改 ABI。
-SCRATCH_WQE_POSTED = 0          # [num_qp]   已写入 WQE 的 chunk 数
-SCRATCH_FINAL_HEAD = 64         # 阶段 3 的取活游标
-SCRATCH_FINAL_DONE = 65         # 阶段 3 的完成计数
-SCRATCH_REQUEST = 128           # [num_qp] i64,flush_async 的 request(按 8 字节寻址)
-SCRATCH_ARRIVAL_SEEN = 66       # arrival_probe: 检查过的标志字总数
-SCRATCH_ARRIVAL_LATE = 67       # arrival_probe: 第一眼还没就绪的个数
-SCRATCH_CHUNK_DONE = 256        # [2][max_chunks] 每个 (plane,chunk) 的完成计数
-SCRATCH_P3_DONE = 512           # [max_chunks] 阶段3 每个 chunk 的 CTA 完成计数
-SCRATCH_WQE_CHUNK = 144         # [max_chunks] 每个 chunk 的载荷 WQE 是否已入队
-SCRATCH_STAMP = 768             # [4] i64 墙钟戳:入口 / 阶段1 后 / 阶段2 后 / 结束
-SCRATCH_WORDS = 1024            # 宿主侧 _k2_scratch 的长度,编译期据此校验越界
+SCRATCH_WQE_POSTED = 0  # [num_qp]   已写入 WQE 的 chunk 数
+SCRATCH_FINAL_HEAD = 64  # 阶段 3 的取活游标
+SCRATCH_FINAL_DONE = 65  # 阶段 3 的完成计数
+SCRATCH_REQUEST = 128  # [num_qp] i64,flush_async 的 request(按 8 字节寻址)
+SCRATCH_ARRIVAL_SEEN = 66  # arrival_probe: 检查过的标志字总数
+SCRATCH_ARRIVAL_LATE = 67  # arrival_probe: 第一眼还没就绪的个数
+SCRATCH_CHUNK_DONE = 256  # [2][max_chunks] 每个 (plane,chunk) 的完成计数
+SCRATCH_P3_DONE = 512  # [max_chunks] 阶段3 每个 chunk 的 CTA 完成计数
+SCRATCH_WQE_CHUNK = 144  # [max_chunks] 每个 chunk 的载荷 WQE 是否已入队
+SCRATCH_STAMP = 768  # [4] i64 墙钟戳:入口 / 阶段1 后 / 阶段2 后 / 结束
+SCRATCH_WORDS = 1024  # 宿主侧 _k2_scratch 的长度,编译期据此校验越界
 
 # cta_stamp 的时间线:**单独一块 GM**(arg_timeline),不占 scratch。
 # s_memrealtime 是全局共享的恒频计数器(不是每 CU 的 shader clock),所以不同
 # CU 上的戳可以直接相减,不需要标定。
-CTA_STAMP_ENTRY = 0             # 入口
-CTA_STAMP_P1_END = 1            # 本 CTA 的阶段1 做完
-CTA_STAMP_WQE = 2               # 本 CTA 最后一次 post 数据 WQE(aggregate,不敲门铃)
-CTA_STAMP_DB_WAIT = 3           # 阶段2:开始自旋等本 QP 的 WQE_POSTED
-CTA_STAMP_DB_DONE = 4           # 阶段2:flush_async + wait_request 返回(门铃已确认)
-CTA_STAMP_P3_RDY = 5            # 阶段3:第一次等待被满足(远端数据到齐)
-CTA_STAMP_P3_END = 6            # 阶段3 做完
-CTA_STAMP_HWID = 7              # HW_ID(CU/SH/SE 等),不含 XCC_ID
-CTA_STAMP_SPUN = 8              # 阶段2:WQE_POSTED 自旋满足,put_value 之前
+CTA_STAMP_ENTRY = 0  # 入口
+CTA_STAMP_P1_END = 1  # 本 CTA 的阶段1 做完
+CTA_STAMP_WQE = 2  # 本 CTA 最后一次 post 数据 WQE(aggregate,不敲门铃)
+CTA_STAMP_DB_WAIT = 3  # 阶段2:开始自旋等本 QP 的 WQE_POSTED
+CTA_STAMP_DB_DONE = 4  # 阶段2:flush_async + wait_request 返回(门铃已确认)
+CTA_STAMP_P3_RDY = 5  # 阶段3:第一次等待被满足(远端数据到齐)
+CTA_STAMP_P3_END = 6  # 阶段3 做完
+CTA_STAMP_HWID = 7  # HW_ID(CU/SH/SE 等),不含 XCC_ID
+CTA_STAMP_SPUN = 8  # 阶段2:WQE_POSTED 自旋满足,put_value 之前
 CTA_STAMP_SLOTS = 9
-CTA_STAMP_MAX_CTAS = 256        # grid 上限;超过的 CTA 不记(宿主侧 _two_kernel_prepare 里校验)
-TIMELINE_WORDS = CTA_STAMP_MAX_CTAS * CTA_STAMP_SLOTS   # i64,宿主侧 _k2_timeline 的长度
+CTA_STAMP_MAX_CTAS = 256  # grid 上限;超过的 CTA 不记(宿主侧 _two_kernel_prepare 里校验)
+TIMELINE_WORDS = CTA_STAMP_MAX_CTAS * CTA_STAMP_SLOTS  # i64,宿主侧 _k2_timeline 的长度
 
 
 def _ceil_div(a, b):
@@ -93,8 +95,7 @@ def _max_rt(a, b):
 def _chunks_for_qp(total_chunks, qp, num_qp):
     """qp 认领的是 chunk == qp (mod num_qp),所以它的 chunk 数要按余数算。"""
     base = total_chunks // fx.Int32(num_qp)
-    extra = (qp < (total_chunks % fx.Int32(num_qp))).select(
-        fx.Int32(1), fx.Int32(0))
+    extra = (qp < (total_chunks % fx.Int32(num_qp))).select(fx.Int32(1), fx.Int32(0))
     return base + extra
 
 
@@ -112,15 +113,14 @@ def _fp8_encode8(vals, lane, *, VEC):
     for xor_lane in (1, 2):
         if xor_lane < group_lanes:
             remote_bits = rocdl.ds_bpermute(
-                T.i32, (lane ^ fx.Int32(xor_lane)) * fx.Int32(4), max_bits)
-            local_max = local_max.maximumf(
-                fx.Int32(remote_bits).bitcast(Float32))
+                T.i32, (lane ^ fx.Int32(xor_lane)) * fx.Int32(4), max_bits
+            )
+            local_max = local_max.maximumf(fx.Int32(remote_bits).bitcast(Float32))
             max_bits = local_max.bitcast(fx.Int32)
     leader_lane = lane & fx.Int32(~(group_lanes - 1))
     is_leader = (lane & fx.Int32(group_lanes - 1)) == fx.Int32(0)
     leader_e8m0 = _fp8_scale_for_leader(is_leader, local_max)
-    e8m0 = fx.Int32(
-        rocdl.ds_bpermute(T.i32, leader_lane * fx.Int32(4), leader_e8m0))
+    e8m0 = fx.Int32(rocdl.ds_bpermute(T.i32, leader_lane * fx.Int32(4), leader_e8m0))
     block_scale = (e8m0 << fx.Int32(23)).bitcast(Float32)
     pk_ty = T.vec(2, T.i16)
     words = []
@@ -129,9 +129,13 @@ def _fp8_encode8(vals, lane, *, VEC):
         for pair in range_constexpr(2):
             v = word * 4 + pair * 2
             packed_word = rocdl.cvt_scalef32_pk_fp8_f32(
-                pk_ty, packed_word,
-                vals[v].ir_value(), vals[v + 1].ir_value(),
-                block_scale.ir_value(), pair)
+                pk_ty,
+                packed_word,
+                vals[v].ir_value(),
+                vals[v + 1].ir_value(),
+                block_scale.ir_value(),
+                pair,
+            )
         words.append(fx.Vector(packed_word).bitcast(fx.Int32)[0])
     return words, e8m0, is_leader
 
@@ -157,8 +161,20 @@ def _fp8_decode8(packed2, scale_f32):
 
 @flyc.jit
 def _reduce_one_token(
-    plane, token, lane, wave, inbox_rsrc, accum_rsrc, mask_ptr,
-    *, HIDDEN, TOPK, MAX_TOKENS, WAVES, VEC, CHUNK_ITERS,
+    plane,
+    token,
+    lane,
+    wave,
+    inbox_rsrc,
+    accum_rsrc,
+    mask_ptr,
+    *,
+    HIDDEN,
+    TOPK,
+    MAX_TOKENS,
+    WAVES,
+    VEC,
+    CHUNK_ITERS,
 ):
     """把一个 token 的 topk 贡献按 slot mask 归约进 node_accumulator。
 
@@ -169,8 +185,11 @@ def _reduce_one_token(
     fan-in 而非 TOPK),就退到"预先压实贡献者列表 + 按 count 循环"。
     """
     token_index = fx.Int32(plane * MAX_TOKENS) + token
-    slot_mask = fx.Int32(comm_ops.load_i32_global_system_relaxed(
-        mask_ptr + fx.Int64(token_index) * fx.Int64(4)))
+    slot_mask = fx.Int32(
+        comm_ops.load_i32_global_system_relaxed(
+            mask_ptr + fx.Int64(token_index) * fx.Int64(4)
+        )
+    )
 
     CHUNKS_PER_WAVE = HIDDEN // (64 * VEC)
     for chunk_iter in range_constexpr(CHUNK_ITERS):
@@ -181,19 +200,25 @@ def _reduce_one_token(
         for slot in range(fx.Int32(0), fx.Int32(TOPK), fx.Int32(1)):
             if ((slot_mask >> slot) & fx.Int32(1)) != fx.Int32(0):
                 # arena 是 [plane][bsid][topk_slot][hidden],hidden 连续。
-                src = ((token_index * fx.Int32(TOPK) + slot)
-                       * fx.Int32(HIDDEN) + col)
+                src = (token_index * fx.Int32(TOPK) + slot) * fx.Int32(HIDDEN) + col
                 packed = buffer_ops.buffer_load(
-                    inbox_rsrc, src // fx.Int32(2),
-                    vec_width=4, dtype=T.i32, mask=active)
+                    inbox_rsrc,
+                    src // fx.Int32(2),
+                    vec_width=4,
+                    dtype=T.i32,
+                    mask=active,
+                )
                 totals = totals + fx.Vector(packed).bitcast(BFloat16).to(Float32)
-        out = fx.Vector.from_elements(
-            [fx.Float32(totals[i]) for i in range_constexpr(VEC)],
-            Float32,
-        ).to(BFloat16).bitcast(fx.Int32)
+        out = (
+            fx.Vector.from_elements(
+                [fx.Float32(totals[i]) for i in range_constexpr(VEC)],
+                Float32,
+            )
+            .to(BFloat16)
+            .bitcast(fx.Int32)
+        )
         dst = token_index * fx.Int32(HIDDEN) + col
-        buffer_ops.buffer_store(
-            out, accum_rsrc, dst // fx.Int32(2), mask=active)
+        buffer_ops.buffer_store(out, accum_rsrc, dst // fx.Int32(2), mask=active)
 
 
 def compile_stage2_node_combine(
@@ -252,12 +277,19 @@ def compile_stage2_node_combine(
         raise ValueError("max_tokens must be positive")
     # 每个 *_off 都必须是 window 相对(已含 stage2_offset)。传成 region 相对
     # 不会崩也不会报错,只会把跨节点写落到别处 —— 一定要在编译期挡掉。
-    for _name in ("inbox_off", "slot_mask_off", "accumulator_off", "rx_off",
-                  "partial_ready_off", "group_ready_off"):
+    for _name in (
+        "inbox_off",
+        "slot_mask_off",
+        "accumulator_off",
+        "rx_off",
+        "partial_ready_off",
+        "group_ready_off",
+    ):
         if int(locals()[_name]) < int(s2_window_off):
             raise ValueError(
                 f"{_name} 小于 s2_window_off,看起来是 region 相对偏移;"
-                "kernel2 要的是相对 window local_ptr 的偏移")
+                "kernel2 要的是相对 window local_ptr 的偏移"
+            )
     if int(num_qp) not in (1, 2, 4, 8):
         raise ValueError("num_qp must be one of 1,2,4,8")
     if enable_rail:
@@ -266,16 +298,15 @@ def compile_stage2_node_combine(
         _waves = int(threads) // 64
         if int(num_qp) < _waves or int(num_qp) % _waves:
             raise ValueError(
-                f"enable_rail 时 num_qp({num_qp}) 必须是 wave 数({_waves}) 的整数倍")
+                f"enable_rail 时 num_qp({num_qp}) 必须是 wave 数({_waves}) 的整数倍"
+            )
         if int(consumed_off) < int(s2_window_off):
-            raise ValueError(
-                "consumed_off 小于 s2_window_off,看起来是 region 相对偏移")
+            raise ValueError("consumed_off 小于 s2_window_off,看起来是 region 相对偏移")
     if arrival_probe and not arrival_wait:
         raise ValueError("arrival_probe requires arrival_wait")
     if arrival_wait:
         if int(arrival_off) < int(s2_window_off):
-            raise ValueError(
-                "arrival_off 小于 s2_window_off,看起来是 region 相对偏移")
+            raise ValueError("arrival_off 小于 s2_window_off,看起来是 region 相对偏移")
     if return_chunk_tokens < 4:
         # return_group_ready 只有 max_tokens/4 个槽位,粒度不能比 4 更细。
         raise ValueError("return_chunk_tokens must be >= 4")
@@ -296,14 +327,15 @@ def compile_stage2_node_combine(
     NUM_QP = int(num_qp)
     QP_PER_WAVE = max(1, NUM_QP // max(1, int(threads) // 64))
     WAVES = threads // 64
-    RECORD_BYTES = HIDDEN * 2               # 一个 token 的 BF16 partial,无 header
+    RECORD_BYTES = HIDDEN * 2  # 一个 token 的 BF16 partial,无 header
     # inbox 的记录宽度和 RECORD_BYTES 是两回事:RECORD_BYTES 只用于 rail 的
     # put/get(每 token 一条 accumulator),inbox 是每 (token, topk slot) 一条,
     # 由 kernel1 的 token_nbytes 定宽。两者可以独立量化。
     if inbox_quant not in ("none", "fp8_blockwise_1x32"):
         raise ValueError(
             f"inbox_quant must be 'none' or 'fp8_blockwise_1x32' "
-            f"(got {inbox_quant!r})")
+            f"(got {inbox_quant!r})"
+        )
     INBOX_FP8 = inbox_quant == "fp8_blockwise_1x32"
     if INBOX_FP8:
         if HIDDEN % 32:
@@ -312,7 +344,8 @@ def compile_stage2_node_combine(
     if rail_quant not in ("none", "fp8_blockwise_1x32"):
         raise ValueError(
             f"rail_quant must be 'none' or 'fp8_blockwise_1x32' "
-            f"(got {rail_quant!r})")
+            f"(got {rail_quant!r})"
+        )
     RAIL_FP8 = rail_quant == "fp8_blockwise_1x32"
     if RAIL_FP8:
         if HIDDEN % 32:
@@ -321,15 +354,15 @@ def compile_stage2_node_combine(
         # rail 上 78us 的线速载荷就是被这一行砍掉的。
         RECORD_BYTES = HIDDEN + HIDDEN // 32
         if RECORD_BYTES % 8:
-            raise ValueError(
-                f"rail 行宽 {RECORD_BYTES} 不是 8 的倍数,put 源地址会错位")
+            raise ValueError(f"rail 行宽 {RECORD_BYTES} 不是 8 的倍数,put 源地址会错位")
     INBOX_ROW_BYTES = (HIDDEN + HIDDEN // 32) if INBOX_FP8 else HIDDEN * 2
     ACC_ROW_BYTES = RECORD_BYTES
     if INBOX_ROW_BYTES % 8:
         # 每 lane 取 VEC 个值要落成一次 dwordx2/x4,行首必须 8 字节对齐。
         raise ValueError(
-            f"inbox 行宽 {INBOX_ROW_BYTES} 不是 8 的倍数,向量化 load 会错位")
-    VEC = 8                                 # 每 lane 8 个 bf16 = 16 B
+            f"inbox 行宽 {INBOX_ROW_BYTES} 不是 8 的倍数,向量化 load 会错位"
+        )
+    VEC = 8  # 每 lane 8 个 bf16 = 16 B
     CHUNKS_PER_WAVE = HIDDEN // (64 * VEC)  # 一个 wave 覆盖 512 列
     CHUNK_ITERS = _ceil_div(CHUNKS_PER_WAVE, WAVES)
     # 阶段1 的工作单元:一个 (plane, token, hidden 分片) 由**一个 wave** 做完。
@@ -338,10 +371,13 @@ def compile_stage2_node_combine(
     HPARTS = CHUNKS_PER_WAVE
     # chunk 完成计数:[plane][chunk],给 rail 的 put 找"最后一个写完的 wave"。
     MAX_CHUNKS = _ceil_div(MAX_TOKENS, CHUNK)
-    if (SCRATCH_CHUNK_DONE + 2 * MAX_CHUNKS > SCRATCH_P3_DONE
-            or SCRATCH_P3_DONE + MAX_CHUNKS > SCRATCH_STAMP):
+    if (
+        SCRATCH_CHUNK_DONE + 2 * MAX_CHUNKS > SCRATCH_P3_DONE
+        or SCRATCH_P3_DONE + MAX_CHUNKS > SCRATCH_STAMP
+    ):
         raise ValueError(
-            f"scratch 不够:需要 {SCRATCH_CHUNK_DONE + 2 * MAX_CHUNKS} 个 i32")
+            f"scratch 不够:需要 {SCRATCH_CHUNK_DONE + 2 * MAX_CHUNKS} 个 i32"
+        )
 
     node = int(rank) // int(gpus_per_node)
     remote_node = 1 - node
@@ -350,8 +386,7 @@ def compile_stage2_node_combine(
 
     kernel_name = (
         f"megamoe_k2_h{HIDDEN}_t{MAX_TOKENS}_k{TOPK}"
-        f"_qp{NUM_QP}_c{CHUNK}_w{WAVES}"
-        + ("" if enable_rail else "_norail")
+        f"_qp{NUM_QP}_c{CHUNK}_w{WAVES}" + ("" if enable_rail else "_norail")
         # rail 的 CQ 轮询按 CCQE 模式编译,模式必须进 kernel 名(= flydsl 缓存键)
         + ("_ccqe" if enable_rail and _rail_ccqe() else "")
         + ("" if wait_remote else "_nowait")
@@ -363,7 +398,8 @@ def compile_stage2_node_combine(
         + ("_ap1" if arrival_probe else "")
         + (
             f"_de{epoch_off}_" + "_".join(str(v) for v in parity_planes)
-            if epoch_off > 0 else ""
+            if epoch_off > 0
+            else ""
         )
     )
 
@@ -385,17 +421,29 @@ def compile_stage2_node_combine(
         lane = tx % fx.Int32(64)
         if const_expr(epoch_off > 0):
             # 同 kernel1:relaxed 读(不带 buffer_inv),readfirstlane 留在 SGPR。
-            generation = fx.Int64(rocdl.readfirstlane(
-                T.i64,
-                fx.Int64(comm_ops.load_i64_global_agent_relaxed(
-                    arena_ptr + fx.Int64(epoch_off))).ir_value()))
+            generation = fx.Int64(
+                rocdl.readfirstlane(
+                    T.i64,
+                    fx.Int64(
+                        comm_ops.load_i64_global_agent_relaxed(
+                            arena_ptr + fx.Int64(epoch_off)
+                        )
+                    ).ir_value(),
+                )
+            )
             _par = generation & fx.Int64(1)
             _inbox_off = fx.Int64(inbox_off) + _par * fx.Int64(parity_planes[0])
             _slot_mask_off = fx.Int64(slot_mask_off) + _par * fx.Int64(parity_planes[1])
-            _accumulator_off = fx.Int64(accumulator_off) + _par * fx.Int64(parity_planes[2])
+            _accumulator_off = fx.Int64(accumulator_off) + _par * fx.Int64(
+                parity_planes[2]
+            )
             _rx_off = fx.Int64(rx_off) + _par * fx.Int64(parity_planes[3])
-            _partial_ready_off = fx.Int64(partial_ready_off) + _par * fx.Int64(parity_planes[4])
-            _group_ready_off = fx.Int64(group_ready_off) + _par * fx.Int64(parity_planes[5])
+            _partial_ready_off = fx.Int64(partial_ready_off) + _par * fx.Int64(
+                parity_planes[4]
+            )
+            _group_ready_off = fx.Int64(group_ready_off) + _par * fx.Int64(
+                parity_planes[5]
+            )
             _consumed_off = fx.Int64(consumed_off) + _par * fx.Int64(parity_planes[6])
             _arrival_off = fx.Int64(arrival_off) + _par * fx.Int64(parity_planes[7])
         else:
@@ -423,15 +471,20 @@ def compile_stage2_node_combine(
         # (同一个 token 重复 16 次),归约循环里每个工作单元读一次,加起来近
         # 10 万次不可缓存的读。
         mask_rsrc = buffer_ops.create_buffer_resource_from_addr(
-            mask_ptr, num_records_bytes=fx.Int32(2 * MAX_TOKENS * 4))
+            mask_ptr, num_records_bytes=fx.Int32(2 * MAX_TOKENS * 4)
+        )
         inbox_rsrc = buffer_ops.create_buffer_resource_from_addr(
-            inbox_ptr, num_records_bytes=fx.Int32(inbox_bytes))
+            inbox_ptr, num_records_bytes=fx.Int32(inbox_bytes)
+        )
         accum_rsrc = buffer_ops.create_buffer_resource_from_addr(
-            accum_ptr, num_records_bytes=fx.Int32(accumulator_bytes))
+            accum_ptr, num_records_bytes=fx.Int32(accumulator_bytes)
+        )
         rx_rsrc = buffer_ops.create_buffer_resource_from_addr(
-            rx_ptr, num_records_bytes=fx.Int32(rx_bytes))
+            rx_ptr, num_records_bytes=fx.Int32(rx_bytes)
+        )
         out_rsrc = buffer_ops.create_buffer_resource_from_addr(
-            arg_output_bf16, num_records_bytes=fx.Int32(MAX_TOKENS * HIDDEN * 2))
+            arg_output_bf16, num_records_bytes=fx.Int32(MAX_TOKENS * HIDDEN * 2)
+        )
 
         total_chunks = _ceil_div_rt(local_tokens, fx.Int32(CHUNK))
 
@@ -454,7 +507,8 @@ def compile_stage2_node_combine(
             if (bx == fx.Int32(0)) & (tx == fx.Int32(0)):
                 comm_ops.store_i64_global_relaxed(
                     arg_scratch + fx.Int64((SCRATCH_STAMP + 2 * which) * 4),
-                    fx.Int64(comm_ops.read_wall_clock()))
+                    fx.Int64(comm_ops.read_wall_clock()),
+                )
 
         @flyc.jit
         def _cta_stamp(which):
@@ -465,9 +519,13 @@ def compile_stage2_node_combine(
                     if bx < fx.Int32(CTA_STAMP_MAX_CTAS):
                         comm_ops.store_i64_global_relaxed(
                             arg_timeline
-                            + (fx.Int64(bx) * fx.Int64(CTA_STAMP_SLOTS)
-                               + fx.Int64(which)) * fx.Int64(8),
-                            fx.Int64(comm_ops.read_wall_clock()))
+                            + (
+                                fx.Int64(bx) * fx.Int64(CTA_STAMP_SLOTS)
+                                + fx.Int64(which)
+                            )
+                            * fx.Int64(8),
+                            fx.Int64(comm_ops.read_wall_clock()),
+                        )
 
         @flyc.jit
         def _cta_hwid():
@@ -476,9 +534,13 @@ def compile_stage2_node_combine(
                     if bx < fx.Int32(CTA_STAMP_MAX_CTAS):
                         comm_ops.store_i64_global_relaxed(
                             arg_timeline
-                            + (fx.Int64(bx) * fx.Int64(CTA_STAMP_SLOTS)
-                               + fx.Int64(CTA_STAMP_HWID)) * fx.Int64(8),
-                            fx.Int64(comm_ops.read_hw_id()))
+                            + (
+                                fx.Int64(bx) * fx.Int64(CTA_STAMP_SLOTS)
+                                + fx.Int64(CTA_STAMP_HWID)
+                            )
+                            * fx.Int64(8),
+                            fx.Int64(comm_ops.read_hw_id()),
+                        )
 
         _cta_hwid()
         _cta_stamp(CTA_STAMP_ENTRY)
@@ -521,193 +583,228 @@ def compile_stage2_node_combine(
         # range 不被改写,编译期报 "dynamic 'ArithValue' has no Python
         # integer representation"。
         for _pi in range_constexpr(2):
-          plane = _PLANES[_pi]
-          # 运行期 range:ck_local, +total_chunks, ...
-          # 用它而不是 `for _st in constexpr: if ck < total_chunks:` —— 动态
-          # range 落在 scf.if 生成的分支函数里不会被 AST 改写(和
-          # p2p_scatter_epilog 同一个坑),编译期就炸。
-          # 和分级前逐字等价。
-          for ck in range(ck_local, total_chunks, total_chunks):
-              ck_first = ck * fx.Int32(CHUNK)
-              ck_tok = _min_rt(fx.Int32(CHUNK), local_tokens - ck_first)
-              # 认领同一个 chunk 的 CTA 数(各 chunk 最多差 1)。
-              # 本 CTA 在这个 chunk 里负责的连续 token 段。tile 交织时一个
-              # CTA 会碰到 chunk 里几乎所有 token,于是 10 个 CTA 各把这个
-              # chunk 的 512 个标志重等一遍(10x 冗余),而且它写的字节不连续、
-              # 没法自己发 put。连续段同时解决这两件事。
-              t_lo = ck_tok * sub // n_cta
-              t_hi = ck_tok * (sub + fx.Int32(1)) // n_cta
-              my_tok = t_hi - t_lo
-              if const_expr(arrival_wait):
-                  # 每 CTA 每 chunk 一次,和老的 chunk 路径同粒度(实测只要
-                  # +2.7us)。按工作单元等会把 acquire fence 乘 7 倍 —— 那
-                  # 一版实测 +86.8us。认领同一 chunk 的 G 个 CTA 会重复等,
-                  # 第一个之后都是已就绪的缓存命中。
-                  for _wi in range_constexpr(WAIT_ITERS):
-                    w_flat = tx + fx.Int32(_wi * THREADS)
-                    w_token = ck_first + w_flat // fx.Int32(TOPK)
-                    w_slot = w_flat % fx.Int32(TOPK)
-                    if (w_token < local_tokens) & (
-                            w_flat < fx.Int32(WAIT_SPAN)):
-                        w_index = fx.Int32(plane * MAX_TOKENS) + w_token
-                        w_mask = fx.Int32(buffer_ops.buffer_load(
-                            mask_rsrc, w_index, vec_width=1, dtype=T.i32))
-                        if ((w_mask >> w_slot) & fx.Int32(1)) != fx.Int32(0):
-                            # 标志值就是 generation,wait_ready 是单调 u64 的
-                            # ">= expected",上一代留下的字更小,所以这块区域
-                            # 一次都不用清零。
-                            _wait_ready_relaxed(
-                                arrival_ptr
-                                + fx.Int64(w_index * fx.Int32(TOPK) + w_slot)
-                                * fx.Int64(8), generation)
-                  gpu.barrier()
-                  comm_ops.fence_system_acquire()
-              unit0 = sub * fx.Int32(WAVES) + wave
-              ustep = n_cta * fx.Int32(WAVES)
-              ulo = fx.Int32(0)
-              uhi = ck_tok * fx.Int32(HPARTS)
-              for u in range(ulo + unit0, uhi, ustep):
-                  token = ck_first + u // fx.Int32(HPARTS)
-                  hpart = u - (u // fx.Int32(HPARTS)) * fx.Int32(HPARTS)
-                  token_index = fx.Int32(plane * MAX_TOKENS) + token
-                  slot_mask = fx.Int32(buffer_ops.buffer_load(
-                      mask_rsrc, token_index, vec_width=1, dtype=T.i32))
-                  col = (hpart * fx.Int32(64) + lane) * fx.Int32(VEC)
-                  totals = fx.Vector.filled(VEC, 0.0, Float32)
-                  # MegaMoEv2 的流水(intranode_kernel.py:1010-1085):K 个
-                  # load 先全部攒进 list,一个都不当场消费,发完才累加。
-                  # 有效性走掩码不走分支 —— buffer_load(mask=) 把越界偏移
-                  # 设成 0x7FFFFFFF,硬件边界检查返回 0。
-                  vals = []
-                  scale_raw = []
-                  for slot in range_constexpr(TOPK):
-                      ok = ((slot_mask >> fx.Int32(slot))
-                            & fx.Int32(1)) != fx.Int32(0)
-                      rec = (token_index * fx.Int32(TOPK)
-                             + fx.Int32(slot))
-                      if const_expr(INBOX_FP8):
-                          # 值区 1 字节/元素,尺度区紧跟其后。
-                          vbyte = rec * fx.Int32(INBOX_ROW_BYTES) + col
-                          vals.append(buffer_ops.buffer_load(
-                              inbox_rsrc, vbyte // fx.Int32(4),
-                              vec_width=2, dtype=T.i32, mask=ok))
-                          # 掩码也必须盖住尺度:e8m0=0xFF 解出来是 +Inf,
-                          # 缺席 slot 的值虽然是 0,0*Inf 会变成 NaN。
-                          sbyte = (rec * fx.Int32(INBOX_ROW_BYTES)
-                                   + fx.Int32(HIDDEN)
-                                   + col // fx.Int32(32))
-                          scale_raw.append(buffer_ops.buffer_load(
-                              inbox_rsrc, sbyte,
-                              vec_width=1, dtype=T.i8, mask=ok))
-                      else:
-                          src = rec * fx.Int32(HIDDEN) + col
-                          vals.append(buffer_ops.buffer_load(
-                              inbox_rsrc, src // fx.Int32(2),
-                              vec_width=4, dtype=T.i32, mask=ok))
-                  for slot in range_constexpr(TOPK):
-                      if const_expr(INBOX_FP8):
-                          e8m0 = (fx.Uint8(scale_raw[slot])
-                                  .to(fx.Uint32).bitcast(fx.Int32))
-                          bscale = (e8m0 << fx.Int32(23)).bitcast(Float32)
-                          totals = totals + _fp8_decode8(vals[slot], bscale)
-                      else:
-                          totals = totals + fx.Vector(vals[slot]).bitcast(
-                              BFloat16).to(Float32)
-                  # 【设计点:accumulator 不写穿】ACCUM_WT=1(sc0|sc1 写穿,
-                  # 省掉每 chunk 那次 fence_system_release 的整 L2 写回)实测
-                  # 194.5 vs 195.6 —— 零收益,开关已删,这里恒用默认策略。
-                  _acm = 0
-                  if const_expr(RAIL_FP8):
-                      _vals = [fx.Float32(totals[i])
-                               for i in range_constexpr(VEC)]
-                      _w, _e8m0, _is_ldr = _fp8_encode8(_vals, lane, VEC=VEC)
-                      _abyte = (token_index * fx.Int32(ACC_ROW_BYTES) + col)
-                      buffer_ops.buffer_store(
-                          fx.Vector.from_elements(_w, fx.Int32),
-                          accum_rsrc, _abyte // fx.Int32(4),
-                          cache_modifier=_acm)
-                      # 尺度字节用 mask 而不是 if:分支里做 store 没问题,
-                      # 但掩码版不产生分歧,省一次 exec mask 往返。
-                      buffer_ops.buffer_store(
-                          _e8m0.to(fx.Int8), accum_rsrc,
-                          token_index * fx.Int32(ACC_ROW_BYTES)
-                          + fx.Int32(HIDDEN) + col // fx.Int32(32),
-                          mask=_is_ldr, cache_modifier=_acm)
-                  # 17 = sc0|sc1(SIDefines.h:593 的 pre-gfx12 编码,GLC=SC0=1、
-                  # SCC=SC1=16):写穿到系统一致点。NIC 要读 node_accumulator,
-                  # 默认策略下这些写是脏在本 rank 的 L2 里,得靠下面那次
-                  # fence_system_release 的 buffer_wbl2(整 L2 写回)刷出去 ——
-                  # 每 chunk 一次。写穿之后那次 fence 就不需要了。
-                  # 和 kernel1 payload 用 pay_cm=19 是同一条路子。
-                  if const_expr(not RAIL_FP8):
-                      out = fx.Vector.from_elements(
-                          [fx.Float32(totals[i])
-                           for i in range_constexpr(VEC)],
-                          Float32,
-                      ).to(BFloat16).bitcast(fx.Int32)
-                      buffer_ops.buffer_store(
-                          out, accum_rsrc,
-                          (token_index * fx.Int32(HIDDEN) + col)
-                          // fx.Int32(2),
-                          cache_modifier=_acm)
-              # token 段模式:本 CTA 的字节范围是连续的,自己发自己的 put,
-              # 不等本 chunk 最慢的那个 CTA。WQE 只是写进发送队列
-              # (aggregate 不敲门铃),所以 10 个 CTA 并发写没有问题;
-              # 门铃仍由最后一个到达者通过 wqe_posted[qp] 触发 —— 它的
-              # acq_rel 能看见其它 9 个 CTA 在各自 s_waitcnt(0) 之后的 release,
-              # 也就保证了那 10 份 WQE 都已经写好。
-              # --- 每 CTA 每 chunk 一次:这里才是排空点 ---
-              rocdl.s_waitcnt(0)
-              gpu.barrier()
-              cnt_idx = fx.Int32(SCRATCH_CHUNK_DONE + plane * MAX_CHUNKS) + ck
-              if wave == fx.Int32(0):
-                  prev = fx.Int32(0)
-                  if lane == fx.Int32(0):
-                      prev = fx.Int32(comm_ops.atomic_add_agent_acq_rel(
-                          arg_scratch + fx.Int64(cnt_idx) * fx.Int64(4),
-                          fx.Int32(1)))
-                  # prev 只在 lane0 有效;广播成 wave uniform,下面那个 if 才
-                  # 能整 wave 一起进(put 是 warp 级 collective)。
-                  prev = fx.Int32(rocdl.readfirstlane(T.i32, prev.ir_value()))
-                  if (prev + fx.Int32(1)) == n_cta:
-                      # 系统可见性(NIC 要读 node_accumulator)由这**一次**
-                      # fence 负责,每 chunk 一次,不是每个 wave 一次。
-                      # 写穿模式下 accumulator 的写本来就落到系统一致点了,
-                      # 这次整 L2 写回纯属多余。
-                      comm_ops.fence_system_release()
-                      if lane == fx.Int32(0):
-                          comm_ops.store_i32_system(
-                              arg_scratch, cnt_idx, fx.Int32(0))
-                          for _t in range_constexpr(CHUNK):
-                              tk = ck_first + fx.Int32(_t)
-                              if tk < local_tokens:
-                                  # relaxed:上面那次 fence 已经把 writeback
-                                  # 做了,release store 会再来一遍 buffer_wbl2。
-                                  comm_ops.store_i64_global_system_relaxed(
-                                      ready_ptr
-                                      + fx.Int64(fx.Int32(plane * MAX_TOKENS) + tk)
-                                      * fx.Int64(8), generation)
-                      if const_expr(enable_rail
-                                    and plane == remote_plane):
-                          _qp = ck % fx.Int32(NUM_QP)
-                          _rail.put(dev_comm, _qp, fx.Int32(remote_node),
-                              arena_win,
-                              _rx_off
-                              + fx.Int64(ck_first) * fx.Int64(RECORD_BYTES),
-                              arena_win,
-                              _accumulator_off
-                              + fx.Int64(remote_plane * MAX_TOKENS)
-                              * fx.Int64(RECORD_BYTES)
-                              + fx.Int64(ck_first) * fx.Int64(RECORD_BYTES),
-                              fx.Int64(ck_tok) * fx.Int64(RECORD_BYTES),
-                              aggregate=True)
-                          rocdl.s_waitcnt(0)
-                          if lane == fx.Int32(0):
-                              comm_ops.atomic_add_agent(
-                                  arg_scratch
-                                  + fx.Int64(SCRATCH_WQE_POSTED) * fx.Int64(4)
-                                  + fx.Int64(_qp) * fx.Int64(4),
-                                  fx.Int32(1))
+            plane = _PLANES[_pi]
+            # 运行期 range:ck_local, +total_chunks, ...
+            # 用它而不是 `for _st in constexpr: if ck < total_chunks:` —— 动态
+            # range 落在 scf.if 生成的分支函数里不会被 AST 改写(和
+            # p2p_scatter_epilog 同一个坑),编译期就炸。
+            # 和分级前逐字等价。
+            for ck in range(ck_local, total_chunks, total_chunks):
+                ck_first = ck * fx.Int32(CHUNK)
+                ck_tok = _min_rt(fx.Int32(CHUNK), local_tokens - ck_first)
+                if const_expr(arrival_wait):
+                    # 每 CTA 每 chunk 一次,和老的 chunk 路径同粒度(实测只要
+                    # +2.7us)。按工作单元等会把 acquire fence 乘 7 倍 —— 那
+                    # 一版实测 +86.8us。认领同一 chunk 的 G 个 CTA 会重复等,
+                    # 第一个之后都是已就绪的缓存命中。
+                    for _wi in range_constexpr(WAIT_ITERS):
+                        w_flat = tx + fx.Int32(_wi * THREADS)
+                        w_token = ck_first + w_flat // fx.Int32(TOPK)
+                        w_slot = w_flat % fx.Int32(TOPK)
+                        if (w_token < local_tokens) & (w_flat < fx.Int32(WAIT_SPAN)):
+                            w_index = fx.Int32(plane * MAX_TOKENS) + w_token
+                            w_mask = fx.Int32(
+                                buffer_ops.buffer_load(
+                                    mask_rsrc, w_index, vec_width=1, dtype=T.i32
+                                )
+                            )
+                            if ((w_mask >> w_slot) & fx.Int32(1)) != fx.Int32(0):
+                                # 标志值就是 generation,wait_ready 是单调 u64 的
+                                # ">= expected",上一代留下的字更小,所以这块区域
+                                # 一次都不用清零。
+                                _wait_ready_relaxed(
+                                    arrival_ptr
+                                    + fx.Int64(w_index * fx.Int32(TOPK) + w_slot)
+                                    * fx.Int64(8),
+                                    generation,
+                                )
+                    gpu.barrier()
+                    comm_ops.fence_system_acquire()
+                unit0 = sub * fx.Int32(WAVES) + wave
+                ustep = n_cta * fx.Int32(WAVES)
+                ulo = fx.Int32(0)
+                uhi = ck_tok * fx.Int32(HPARTS)
+                for u in range(ulo + unit0, uhi, ustep):
+                    token = ck_first + u // fx.Int32(HPARTS)
+                    hpart = u - (u // fx.Int32(HPARTS)) * fx.Int32(HPARTS)
+                    token_index = fx.Int32(plane * MAX_TOKENS) + token
+                    slot_mask = fx.Int32(
+                        buffer_ops.buffer_load(
+                            mask_rsrc, token_index, vec_width=1, dtype=T.i32
+                        )
+                    )
+                    col = (hpart * fx.Int32(64) + lane) * fx.Int32(VEC)
+                    totals = fx.Vector.filled(VEC, 0.0, Float32)
+                    # MegaMoEv2 的流水(intranode_kernel.py:1010-1085):K 个
+                    # load 先全部攒进 list,一个都不当场消费,发完才累加。
+                    # 有效性走掩码不走分支 —— buffer_load(mask=) 把越界偏移
+                    # 设成 0x7FFFFFFF,硬件边界检查返回 0。
+                    vals = []
+                    scale_raw = []
+                    for slot in range_constexpr(TOPK):
+                        ok = ((slot_mask >> fx.Int32(slot)) & fx.Int32(1)) != fx.Int32(
+                            0
+                        )
+                        rec = token_index * fx.Int32(TOPK) + fx.Int32(slot)
+                        if const_expr(INBOX_FP8):
+                            # 值区 1 字节/元素,尺度区紧跟其后。
+                            vbyte = rec * fx.Int32(INBOX_ROW_BYTES) + col
+                            vals.append(
+                                buffer_ops.buffer_load(
+                                    inbox_rsrc,
+                                    vbyte // fx.Int32(4),
+                                    vec_width=2,
+                                    dtype=T.i32,
+                                    mask=ok,
+                                )
+                            )
+                            # 掩码也必须盖住尺度:e8m0=0xFF 解出来是 +Inf,
+                            # 缺席 slot 的值虽然是 0,0*Inf 会变成 NaN。
+                            sbyte = (
+                                rec * fx.Int32(INBOX_ROW_BYTES)
+                                + fx.Int32(HIDDEN)
+                                + col // fx.Int32(32)
+                            )
+                            scale_raw.append(
+                                buffer_ops.buffer_load(
+                                    inbox_rsrc, sbyte, vec_width=1, dtype=T.i8, mask=ok
+                                )
+                            )
+                        else:
+                            src = rec * fx.Int32(HIDDEN) + col
+                            vals.append(
+                                buffer_ops.buffer_load(
+                                    inbox_rsrc,
+                                    src // fx.Int32(2),
+                                    vec_width=4,
+                                    dtype=T.i32,
+                                    mask=ok,
+                                )
+                            )
+                    for slot in range_constexpr(TOPK):
+                        if const_expr(INBOX_FP8):
+                            e8m0 = (
+                                fx.Uint8(scale_raw[slot])
+                                .to(fx.Uint32)
+                                .bitcast(fx.Int32)
+                            )
+                            bscale = (e8m0 << fx.Int32(23)).bitcast(Float32)
+                            totals = totals + _fp8_decode8(vals[slot], bscale)
+                        else:
+                            totals = totals + fx.Vector(vals[slot]).bitcast(
+                                BFloat16
+                            ).to(Float32)
+                    # 【设计点:accumulator 不写穿】ACCUM_WT=1(sc0|sc1 写穿,
+                    # 省掉每 chunk 那次 fence_system_release 的整 L2 写回)实测
+                    # 194.5 vs 195.6 —— 零收益,开关已删,这里恒用默认策略。
+                    _acm = 0
+                    if const_expr(RAIL_FP8):
+                        _vals = [fx.Float32(totals[i]) for i in range_constexpr(VEC)]
+                        _w, _e8m0, _is_ldr = _fp8_encode8(_vals, lane, VEC=VEC)
+                        _abyte = token_index * fx.Int32(ACC_ROW_BYTES) + col
+                        buffer_ops.buffer_store(
+                            fx.Vector.from_elements(_w, fx.Int32),
+                            accum_rsrc,
+                            _abyte // fx.Int32(4),
+                            cache_modifier=_acm,
+                        )
+                        # 尺度字节用 mask 而不是 if:分支里做 store 没问题,
+                        # 但掩码版不产生分歧,省一次 exec mask 往返。
+                        buffer_ops.buffer_store(
+                            _e8m0.to(fx.Int8),
+                            accum_rsrc,
+                            token_index * fx.Int32(ACC_ROW_BYTES)
+                            + fx.Int32(HIDDEN)
+                            + col // fx.Int32(32),
+                            mask=_is_ldr,
+                            cache_modifier=_acm,
+                        )
+                    # 17 = sc0|sc1(SIDefines.h:593 的 pre-gfx12 编码,GLC=SC0=1、
+                    # SCC=SC1=16):写穿到系统一致点。NIC 要读 node_accumulator,
+                    # 默认策略下这些写是脏在本 rank 的 L2 里,得靠下面那次
+                    # fence_system_release 的 buffer_wbl2(整 L2 写回)刷出去 ——
+                    # 每 chunk 一次。写穿之后那次 fence 就不需要了。
+                    # 和 kernel1 payload 用 pay_cm=19 是同一条路子。
+                    if const_expr(not RAIL_FP8):
+                        out = (
+                            fx.Vector.from_elements(
+                                [fx.Float32(totals[i]) for i in range_constexpr(VEC)],
+                                Float32,
+                            )
+                            .to(BFloat16)
+                            .bitcast(fx.Int32)
+                        )
+                        buffer_ops.buffer_store(
+                            out,
+                            accum_rsrc,
+                            (token_index * fx.Int32(HIDDEN) + col) // fx.Int32(2),
+                            cache_modifier=_acm,
+                        )
+                # token 段模式:本 CTA 的字节范围是连续的,自己发自己的 put,
+                # 不等本 chunk 最慢的那个 CTA。WQE 只是写进发送队列
+                # (aggregate 不敲门铃),所以 10 个 CTA 并发写没有问题;
+                # 门铃仍由最后一个到达者通过 wqe_posted[qp] 触发 —— 它的
+                # acq_rel 能看见其它 9 个 CTA 在各自 s_waitcnt(0) 之后的 release,
+                # 也就保证了那 10 份 WQE 都已经写好。
+                # --- 每 CTA 每 chunk 一次:这里才是排空点 ---
+                rocdl.s_waitcnt(0)
+                gpu.barrier()
+                cnt_idx = fx.Int32(SCRATCH_CHUNK_DONE + plane * MAX_CHUNKS) + ck
+                if wave == fx.Int32(0):
+                    prev = fx.Int32(0)
+                    if lane == fx.Int32(0):
+                        prev = fx.Int32(
+                            comm_ops.atomic_add_agent_acq_rel(
+                                arg_scratch + fx.Int64(cnt_idx) * fx.Int64(4),
+                                fx.Int32(1),
+                            )
+                        )
+                    # prev 只在 lane0 有效;广播成 wave uniform,下面那个 if 才
+                    # 能整 wave 一起进(put 是 warp 级 collective)。
+                    prev = fx.Int32(rocdl.readfirstlane(T.i32, prev.ir_value()))
+                    if (prev + fx.Int32(1)) == n_cta:
+                        # 系统可见性(NIC 要读 node_accumulator)由这**一次**
+                        # fence 负责,每 chunk 一次,不是每个 wave 一次。
+                        # 写穿模式下 accumulator 的写本来就落到系统一致点了,
+                        # 这次整 L2 写回纯属多余。
+                        comm_ops.fence_system_release()
+                        if lane == fx.Int32(0):
+                            comm_ops.store_i32_system(arg_scratch, cnt_idx, fx.Int32(0))
+                            for _t in range_constexpr(CHUNK):
+                                tk = ck_first + fx.Int32(_t)
+                                if tk < local_tokens:
+                                    # relaxed:上面那次 fence 已经把 writeback
+                                    # 做了,release store 会再来一遍 buffer_wbl2。
+                                    comm_ops.store_i64_global_system_relaxed(
+                                        ready_ptr
+                                        + fx.Int64(fx.Int32(plane * MAX_TOKENS) + tk)
+                                        * fx.Int64(8),
+                                        generation,
+                                    )
+                        if const_expr(enable_rail and plane == remote_plane):
+                            _qp = ck % fx.Int32(NUM_QP)
+                            _rail.put(
+                                dev_comm,
+                                _qp,
+                                fx.Int32(remote_node),
+                                arena_win,
+                                _rx_off + fx.Int64(ck_first) * fx.Int64(RECORD_BYTES),
+                                arena_win,
+                                _accumulator_off
+                                + fx.Int64(remote_plane * MAX_TOKENS)
+                                * fx.Int64(RECORD_BYTES)
+                                + fx.Int64(ck_first) * fx.Int64(RECORD_BYTES),
+                                fx.Int64(ck_tok) * fx.Int64(RECORD_BYTES),
+                                aggregate=True,
+                            )
+                            rocdl.s_waitcnt(0)
+                            if lane == fx.Int32(0):
+                                comm_ops.atomic_add_agent(
+                                    arg_scratch
+                                    + fx.Int64(SCRATCH_WQE_POSTED) * fx.Int64(4)
+                                    + fx.Int64(_qp) * fx.Int64(4),
+                                    fx.Int32(1),
+                                )
         _cta_stamp(CTA_STAMP_P1_END)
 
         if const_expr(stamp):
@@ -721,38 +818,52 @@ def compile_stage2_node_combine(
         # 每个 wave 都会走到),"本批 WQE 已全部写入"就是一次 barrier,不需要
         # 任何跨 CTA 计数器。NUM_QP 多于 wave 数时,一个 wave 顺序带几个 QP。
         if const_expr(enable_rail):
-          # 一个 CTA 带一个 QP。当初整段收在 CTA0 里是因为"本批 WQE 已全部
-          # 写入"想用一次 gpu.barrier() 表达;但阶段1 各 CTA 写的
-          # SCRATCH_WQE_POSTED[qp] 已经是跨 CTA 计数器,而 QP 之间没有顺序
-          # 要求 —— 那个理由不成立了。这里不用任何 barrier。
-          if bx < fx.Int32(NUM_QP):
-            if wave == fx.Int32(0):
-             _cta_stamp(CTA_STAMP_DB_WAIT)
-             _want = _max_rt(
-                 (total_chunks - bx + fx.Int32(NUM_QP - 1))
-                 // fx.Int32(NUM_QP), fx.Int32(0))
-             _posted = fx.Int32(comm_ops.load_i32_global_system_relaxed(
-                 arg_scratch + fx.Int64(SCRATCH_WQE_POSTED) * fx.Int64(4)
-                 + fx.Int64(bx) * fx.Int64(4)))
-             while _posted < _want:
-                 _posted = fx.Int32(comm_ops.load_i32_global_system_relaxed(
-                     arg_scratch + fx.Int64(SCRATCH_WQE_POSTED) * fx.Int64(4)
-                     + fx.Int64(bx) * fx.Int64(4)))
-             _cta_stamp(CTA_STAMP_SPUN)
-             comm_ops.fence_system_acquire()
-             for chunk in range(bx, total_chunks, fx.Int32(NUM_QP)):
-                 _rail.put_value(
-                     dev_comm, bx, fx.Int32(remote_node), arena_win,
-                     _group_ready_off + fx.Int64(chunk) * fx.Int64(8),
-                     generation, aggregate=True)
-             # 原来是 flush_async 拿 request、下一行立刻 wait_request —— 中间
-             # 什么都没做,拆成两步没有收益。同步 flush 就是它。
-             _rail.flush_peer(dev_comm, bx, fx.Int32(remote_node))
-             _cta_stamp(CTA_STAMP_DB_DONE)
-             if lane == fx.Int32(0):
-                 comm_ops.store_i32_system(
-                     arg_scratch, fx.Int32(SCRATCH_WQE_POSTED) + bx,
-                     fx.Int32(0))
+            # 一个 CTA 带一个 QP。当初整段收在 CTA0 里是因为"本批 WQE 已全部
+            # 写入"想用一次 gpu.barrier() 表达;但阶段1 各 CTA 写的
+            # SCRATCH_WQE_POSTED[qp] 已经是跨 CTA 计数器,而 QP 之间没有顺序
+            # 要求 —— 那个理由不成立了。这里不用任何 barrier。
+            if bx < fx.Int32(NUM_QP):
+                if wave == fx.Int32(0):
+                    _cta_stamp(CTA_STAMP_DB_WAIT)
+                    _want = _max_rt(
+                        (total_chunks - bx + fx.Int32(NUM_QP - 1)) // fx.Int32(NUM_QP),
+                        fx.Int32(0),
+                    )
+                    _posted = fx.Int32(
+                        comm_ops.load_i32_global_system_relaxed(
+                            arg_scratch
+                            + fx.Int64(SCRATCH_WQE_POSTED) * fx.Int64(4)
+                            + fx.Int64(bx) * fx.Int64(4)
+                        )
+                    )
+                    while _posted < _want:
+                        _posted = fx.Int32(
+                            comm_ops.load_i32_global_system_relaxed(
+                                arg_scratch
+                                + fx.Int64(SCRATCH_WQE_POSTED) * fx.Int64(4)
+                                + fx.Int64(bx) * fx.Int64(4)
+                            )
+                        )
+                    _cta_stamp(CTA_STAMP_SPUN)
+                    comm_ops.fence_system_acquire()
+                    for chunk in range(bx, total_chunks, fx.Int32(NUM_QP)):
+                        _rail.put_value(
+                            dev_comm,
+                            bx,
+                            fx.Int32(remote_node),
+                            arena_win,
+                            _group_ready_off + fx.Int64(chunk) * fx.Int64(8),
+                            generation,
+                            aggregate=True,
+                        )
+                    # 原来是 flush_async 拿 request、下一行立刻 wait_request —— 中间
+                    # 什么都没做,拆成两步没有收益。同步 flush 就是它。
+                    _rail.flush_peer(dev_comm, bx, fx.Int32(remote_node))
+                    _cta_stamp(CTA_STAMP_DB_DONE)
+                    if lane == fx.Int32(0):
+                        comm_ops.store_i32_system(
+                            arg_scratch, fx.Int32(SCRATCH_WQE_POSTED) + bx, fx.Int32(0)
+                        )
         if const_expr(stamp):
             _stamp(2)
 
@@ -771,91 +882,120 @@ def compile_stage2_node_combine(
         # 现在:CTA 认领 chunk,同步降到每 CTA 每 chunk 一次;chunk 内的
         # (token, hidden tile) 按 wave 铺开(HPARTS=7 整除,没有掩码空转)。
         for ck in range(bx % total_chunks, total_chunks, grid):
-          ck_first = ck * fx.Int32(CHUNK)
-          ck_tok = _min_rt(fx.Int32(CHUNK), local_tokens - ck_first)
-          if tx == fx.Int32(0):
-              # ready 位是阶段1 按整个 chunk 一起发布的,所以等首 token 即可,
-              # 不用逐个等 32 次。
-              _wait_ready_relaxed(
-                  ready_ptr
-                  + fx.Int64(fx.Int32(local_plane * MAX_TOKENS) + ck_first)
-                  * fx.Int64(8), generation)
-              if const_expr(enable_rail and wait_remote):
-                  _wait_ready_relaxed(
-                      group_ready_ptr + fx.Int64(ck) * fx.Int64(8), generation)
-              _cta_stamp(CTA_STAMP_P3_RDY)
-          gpu.barrier()
-          comm_ops.fence_system_acquire()
-          n_cta = (grid - ck + total_chunks - fx.Int32(1)) // total_chunks
-          sub = bx // total_chunks
-          for u in range(sub * fx.Int32(WAVES) + wave,
-                         ck_tok * fx.Int32(HPARTS),
-                         n_cta * fx.Int32(WAVES)):
-              token = ck_first + u // fx.Int32(HPARTS)
-              hpart = u - (u // fx.Int32(HPARTS)) * fx.Int32(HPARTS)
-              col = (hpart * fx.Int32(64) + lane) * fx.Int32(VEC)
-              local_index = ((fx.Int32(local_plane * MAX_TOKENS) + token)
-                             * fx.Int32(HIDDEN) + col)
-              out_index = token * fx.Int32(HIDDEN) + col
-              if const_expr(RAIL_FP8):
-                  _lrow = ((fx.Int32(local_plane * MAX_TOKENS) + token)
-                           * fx.Int32(ACC_ROW_BYTES))
-                  _rrow = token * fx.Int32(ACC_ROW_BYTES)
-                  local_packed = buffer_ops.buffer_load(
-                      accum_rsrc, (_lrow + col) // fx.Int32(4),
-                      vec_width=2, dtype=T.i32)
-                  remote_packed = buffer_ops.buffer_load(
-                      rx_rsrc, (_rrow + col) // fx.Int32(4),
-                      vec_width=2, dtype=T.i32)
-                  _lsc = buffer_ops.buffer_load(
-                      accum_rsrc,
-                      _lrow + fx.Int32(HIDDEN) + col // fx.Int32(32),
-                      vec_width=1, dtype=T.i8)
-                  _rsc = buffer_ops.buffer_load(
-                      rx_rsrc,
-                      _rrow + fx.Int32(HIDDEN) + col // fx.Int32(32),
-                      vec_width=1, dtype=T.i8)
-                  local_values = _fp8_decode8(
-                      local_packed,
-                      ((fx.Uint8(_lsc).to(fx.Uint32).bitcast(fx.Int32))
-                       << fx.Int32(23)).bitcast(Float32))
-                  remote_values = _fp8_decode8(
-                      remote_packed,
-                      ((fx.Uint8(_rsc).to(fx.Uint32).bitcast(fx.Int32))
-                       << fx.Int32(23)).bitcast(Float32))
-              else:
-                  local_packed = buffer_ops.buffer_load(
-                      accum_rsrc, local_index // fx.Int32(2),
-                      vec_width=4, dtype=T.i32)
-                  remote_packed = buffer_ops.buffer_load(
-                      rx_rsrc, out_index // fx.Int32(2),
-                      vec_width=4, dtype=T.i32)
-                  local_values = fx.Vector(local_packed).bitcast(
-                      BFloat16).to(Float32)
-                  remote_values = fx.Vector(remote_packed).bitcast(
-                      BFloat16).to(Float32)
-              result = fx.Vector.from_elements(
-                  [fx.Float32(local_values[i]) + fx.Float32(remote_values[i])
-                   for i in range_constexpr(VEC)],
-                  Float32,
-              ).to(BFloat16).bitcast(fx.Int32)
-              buffer_ops.buffer_store(
-                  result, out_rsrc, out_index // fx.Int32(2))
-          # 每 CTA 每 chunk 一次。FINAL_DONE 是**本 GPU 内**的计数(CTA0 在
-          # 收尾里读它),所以增量走 agent scope 就够 —— 系统可见性只在把信用
-          # 发给对端那一刻才需要,那里本来就有一次 release。
-          rocdl.s_waitcnt(0)
-          gpu.barrier()
-          if tx == fx.Int32(0):
-              prev = fx.Int32(comm_ops.atomic_add_agent_acq_rel(
-                  arg_scratch + fx.Int64(SCRATCH_P3_DONE + ck) * fx.Int64(4),
-                  fx.Int32(1)))
-              if (prev + fx.Int32(1)) == n_cta:
-                  comm_ops.store_i32_system(
-                      arg_scratch, fx.Int32(SCRATCH_P3_DONE) + ck, fx.Int32(0))
-                  comm_ops.atomic_add_system_acq_rel(
-                      arg_scratch + fx.Int64(SCRATCH_FINAL_DONE) * fx.Int64(4),
-                      ck_tok)
+            ck_first = ck * fx.Int32(CHUNK)
+            ck_tok = _min_rt(fx.Int32(CHUNK), local_tokens - ck_first)
+            if tx == fx.Int32(0):
+                # ready 位是阶段1 按整个 chunk 一起发布的,所以等首 token 即可,
+                # 不用逐个等 32 次。
+                _wait_ready_relaxed(
+                    ready_ptr
+                    + fx.Int64(fx.Int32(local_plane * MAX_TOKENS) + ck_first)
+                    * fx.Int64(8),
+                    generation,
+                )
+                if const_expr(enable_rail and wait_remote):
+                    _wait_ready_relaxed(
+                        group_ready_ptr + fx.Int64(ck) * fx.Int64(8), generation
+                    )
+                _cta_stamp(CTA_STAMP_P3_RDY)
+            gpu.barrier()
+            comm_ops.fence_system_acquire()
+            n_cta = (grid - ck + total_chunks - fx.Int32(1)) // total_chunks
+            sub = bx // total_chunks
+            for u in range(
+                sub * fx.Int32(WAVES) + wave,
+                ck_tok * fx.Int32(HPARTS),
+                n_cta * fx.Int32(WAVES),
+            ):
+                token = ck_first + u // fx.Int32(HPARTS)
+                hpart = u - (u // fx.Int32(HPARTS)) * fx.Int32(HPARTS)
+                col = (hpart * fx.Int32(64) + lane) * fx.Int32(VEC)
+                local_index = (fx.Int32(local_plane * MAX_TOKENS) + token) * fx.Int32(
+                    HIDDEN
+                ) + col
+                out_index = token * fx.Int32(HIDDEN) + col
+                if const_expr(RAIL_FP8):
+                    _lrow = (fx.Int32(local_plane * MAX_TOKENS) + token) * fx.Int32(
+                        ACC_ROW_BYTES
+                    )
+                    _rrow = token * fx.Int32(ACC_ROW_BYTES)
+                    local_packed = buffer_ops.buffer_load(
+                        accum_rsrc,
+                        (_lrow + col) // fx.Int32(4),
+                        vec_width=2,
+                        dtype=T.i32,
+                    )
+                    remote_packed = buffer_ops.buffer_load(
+                        rx_rsrc, (_rrow + col) // fx.Int32(4), vec_width=2, dtype=T.i32
+                    )
+                    _lsc = buffer_ops.buffer_load(
+                        accum_rsrc,
+                        _lrow + fx.Int32(HIDDEN) + col // fx.Int32(32),
+                        vec_width=1,
+                        dtype=T.i8,
+                    )
+                    _rsc = buffer_ops.buffer_load(
+                        rx_rsrc,
+                        _rrow + fx.Int32(HIDDEN) + col // fx.Int32(32),
+                        vec_width=1,
+                        dtype=T.i8,
+                    )
+                    local_values = _fp8_decode8(
+                        local_packed,
+                        (
+                            (fx.Uint8(_lsc).to(fx.Uint32).bitcast(fx.Int32))
+                            << fx.Int32(23)
+                        ).bitcast(Float32),
+                    )
+                    remote_values = _fp8_decode8(
+                        remote_packed,
+                        (
+                            (fx.Uint8(_rsc).to(fx.Uint32).bitcast(fx.Int32))
+                            << fx.Int32(23)
+                        ).bitcast(Float32),
+                    )
+                else:
+                    local_packed = buffer_ops.buffer_load(
+                        accum_rsrc, local_index // fx.Int32(2), vec_width=4, dtype=T.i32
+                    )
+                    remote_packed = buffer_ops.buffer_load(
+                        rx_rsrc, out_index // fx.Int32(2), vec_width=4, dtype=T.i32
+                    )
+                    local_values = fx.Vector(local_packed).bitcast(BFloat16).to(Float32)
+                    remote_values = (
+                        fx.Vector(remote_packed).bitcast(BFloat16).to(Float32)
+                    )
+                result = (
+                    fx.Vector.from_elements(
+                        [
+                            fx.Float32(local_values[i]) + fx.Float32(remote_values[i])
+                            for i in range_constexpr(VEC)
+                        ],
+                        Float32,
+                    )
+                    .to(BFloat16)
+                    .bitcast(fx.Int32)
+                )
+                buffer_ops.buffer_store(result, out_rsrc, out_index // fx.Int32(2))
+            # 每 CTA 每 chunk 一次。FINAL_DONE 是**本 GPU 内**的计数(CTA0 在
+            # 收尾里读它),所以增量走 agent scope 就够 —— 系统可见性只在把信用
+            # 发给对端那一刻才需要,那里本来就有一次 release。
+            rocdl.s_waitcnt(0)
+            gpu.barrier()
+            if tx == fx.Int32(0):
+                prev = fx.Int32(
+                    comm_ops.atomic_add_agent_acq_rel(
+                        arg_scratch + fx.Int64(SCRATCH_P3_DONE + ck) * fx.Int64(4),
+                        fx.Int32(1),
+                    )
+                )
+                if (prev + fx.Int32(1)) == n_cta:
+                    comm_ops.store_i32_system(
+                        arg_scratch, fx.Int32(SCRATCH_P3_DONE) + ck, fx.Int32(0)
+                    )
+                    comm_ops.atomic_add_system_acq_rel(
+                        arg_scratch + fx.Int64(SCRATCH_FINAL_DONE) * fx.Int64(4), ck_tok
+                    )
         rocdl.s_waitcnt(0)
         gpu.barrier()
         _cta_stamp(CTA_STAMP_P3_END)
@@ -871,32 +1011,39 @@ def compile_stage2_node_combine(
         # 两代时它写的新 ready 会同时满足我们对旧代的等待 —— 不挂死,直接读到
         # 写了一半的 buffer。所以这一步不是可选的优化。
         if const_expr(enable_rail and wait_remote):
-          if bx == fx.Int32(0):
-            done_ptr = arg_scratch + fx.Int64(SCRATCH_FINAL_DONE) * fx.Int64(4)
-            if tx == fx.Int32(0):
-                done = fx.Int32(comm_ops.load_i32_global_system(done_ptr))
-                while done < local_tokens:
+            if bx == fx.Int32(0):
+                done_ptr = arg_scratch + fx.Int64(SCRATCH_FINAL_DONE) * fx.Int64(4)
+                if tx == fx.Int32(0):
                     done = fx.Int32(comm_ops.load_i32_global_system(done_ptr))
-                # 本代计数已满,减回去,下一代重新从 0 开始。
-                comm_ops.atomic_add_system_acq_rel(
-                    done_ptr, fx.Int32(0) - local_tokens)
-            gpu.barrier()
-            if wave == fx.Int32(0):
-                # "你发给我的那块我读完了" -> 对端可以复用它的发送源。
-                _rail.put_value(dev_comm, fx.Int32(0), fx.Int32(remote_node),
-                                arena_win, _consumed_off, generation,
-                                aggregate=True)
-                _rail.flush_peer(dev_comm, fx.Int32(0), fx.Int32(remote_node))
-                if lane == fx.Int32(0):
-                    # 反过来等对端的信用:确认我们写进它 rx 的那块已被读完,
-                    # 下一代才可以再往同一个 parity 槽写。system-acquire 是
-                    # 必须的:这个字是对端 NIC 写的。
-                    _credit_ptr = arena_ptr + _consumed_off
-                    _credit = fx.Int64(
-                        comm_ops.load_i64_global_system(_credit_ptr))
-                    while _credit < generation:
-                        _credit = fx.Int64(
-                            comm_ops.load_i64_global_system(_credit_ptr))
+                    while done < local_tokens:
+                        done = fx.Int32(comm_ops.load_i32_global_system(done_ptr))
+                    # 本代计数已满,减回去,下一代重新从 0 开始。
+                    comm_ops.atomic_add_system_acq_rel(
+                        done_ptr, fx.Int32(0) - local_tokens
+                    )
+                gpu.barrier()
+                if wave == fx.Int32(0):
+                    # "你发给我的那块我读完了" -> 对端可以复用它的发送源。
+                    _rail.put_value(
+                        dev_comm,
+                        fx.Int32(0),
+                        fx.Int32(remote_node),
+                        arena_win,
+                        _consumed_off,
+                        generation,
+                        aggregate=True,
+                    )
+                    _rail.flush_peer(dev_comm, fx.Int32(0), fx.Int32(remote_node))
+                    if lane == fx.Int32(0):
+                        # 反过来等对端的信用:确认我们写进它 rx 的那块已被读完,
+                        # 下一代才可以再往同一个 parity 槽写。system-acquire 是
+                        # 必须的:这个字是对端 NIC 写的。
+                        _credit_ptr = arena_ptr + _consumed_off
+                        _credit = fx.Int64(comm_ops.load_i64_global_system(_credit_ptr))
+                        while _credit < generation:
+                            _credit = fx.Int64(
+                                comm_ops.load_i64_global_system(_credit_ptr)
+                            )
 
     @flyc.jit
     def launch(
@@ -912,12 +1059,18 @@ def compile_stage2_node_combine(
         stream: fx.Stream,
     ):
         kernel(
-            dev_comm, arena_win, arena_ptr, arg_output_bf16, arg_scratch,
-            generation, local_tokens, arg_timeline,
+            dev_comm,
+            arena_win,
+            arena_ptr,
+            arg_output_bf16,
+            arg_scratch,
+            generation,
+            local_tokens,
+            arg_timeline,
             value_attrs={"rocdl.flat_work_group_size": f"{threads},{threads}"},
         ).launch(grid=(blocks, 1, 1), block=(threads, 1, 1), stream=stream)
 
-    launch.kernel = kernel          # ISA dump / 资源统计用
+    launch.kernel = kernel  # ISA dump / 资源统计用
     launch.kernel_name = kernel_name
     launch.num_qp = NUM_QP
     launch.return_chunk_tokens = CHUNK
@@ -936,15 +1089,29 @@ def get_stage2_node_combine(**kw):
 
 
 def run_stage2_node_combine(
-    dev_comm, arena_win, arena_ptr, arg_output_bf16, arg_scratch,
-    generation, local_tokens, blocks, stream, arg_timeline=0, **compile_kw,
+    dev_comm,
+    arena_win,
+    arena_ptr,
+    arg_output_bf16,
+    arg_scratch,
+    generation,
+    local_tokens,
+    blocks,
+    stream,
+    arg_timeline=0,
+    **compile_kw,
 ):
     launch = get_stage2_node_combine(**compile_kw)
     launch(
-        fx.Int64(int(dev_comm)), fx.Int64(int(arena_win)),
-        fx.Int64(int(arena_ptr)), fx.Int64(int(arg_output_bf16)),
-        fx.Int64(int(arg_scratch)), fx.Int64(int(generation)),
-        fx.Int32(int(local_tokens)), fx.Int64(int(arg_timeline)),
-        fx.Int32(int(blocks)), stream,
+        fx.Int64(int(dev_comm)),
+        fx.Int64(int(arena_win)),
+        fx.Int64(int(arena_ptr)),
+        fx.Int64(int(arg_output_bf16)),
+        fx.Int64(int(arg_scratch)),
+        fx.Int64(int(generation)),
+        fx.Int32(int(local_tokens)),
+        fx.Int64(int(arg_timeline)),
+        fx.Int32(int(blocks)),
+        stream,
     )
     return launch

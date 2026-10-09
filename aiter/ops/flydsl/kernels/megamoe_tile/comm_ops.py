@@ -6,7 +6,6 @@ The acquire polling and last-arriver operations required by this operator live
 here so MegaMoE Tile does not alter shared kernels merely for its own protocol.
 """
 
-
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm_d
 from flydsl._mlir.dialects import rocdl as _mlir_rocdl
@@ -149,17 +148,6 @@ def load_i64_global_agent_relaxed(addr_i64):
         alignment=8,
         ordering=_llvm_d.AtomicOrdering.monotonic,
         syncscope=fx.rocdl.SyncScope.AgentOneAs,
-    ).result
-
-
-def load_i64_global_system(addr_i64):
-    """System-scope acquire i64 load for NIC/peer-written generations."""
-    return _llvm_d.LoadOp(
-        ir.IntegerType.get_signless(64),
-        _to_ptr_global(addr_i64),
-        alignment=8,
-        ordering=_llvm_d.AtomicOrdering.acquire,
-        syncscope="one-as",
     ).result
 
 

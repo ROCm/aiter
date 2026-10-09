@@ -1,19 +1,16 @@
 # SPDX-License-Identifier: MIT
-"""Public strict-two-kernel EP16 A4W4 MegaMoE operator.
+"""Public EP16 A4W4 MegaMoE operator with a two-kernel Stage2.
 
 This class intentionally mirrors :class:`MegaMoEV2` at its public boundary,
 but specializes the K3 two-node deployment and accepts only ``quant='a4w4'``.
-All allocation, CCO setup, window initialization and FlyDSL compilation happen
-in the constructor.  A hot ``forward`` performs exactly two launcher calls:
+The constructor allocates the CCO window and compiles Stage1. Stage2 prepares
+its workspace and kernels on the first forward; warm up before graph capture.
+A BF16 forward launches:
 
-1. fused BF16 quant + InterNodeV1 direct-to-expert-tile dispatch + GMM1 +
-   SiLU + A4 requant;
-2. fused weighted GMM2 + packed-BF16 direct LSA node-accumulator epilogue +
-   InterNodeV1 combine.
-
-There is no fallback to the former record-fanout cascade.  If either strict
-kernel backend is unavailable, construction fails rather than silently
-running a multi-kernel implementation.
+1. MXFP4 input quantization and dispatch-record packing;
+2. InterNodeV1 dispatch + GMM1 + activation + A4 requant;
+3. weighted GMM2 + node-local push;
+4. node reduction + cross-node rail transfer + combine.
 """
 
 from __future__ import annotations
@@ -34,11 +31,11 @@ from .stage1_abi import (
     validate_public_stage1_contract,
 )
 from .stage2_abi import Stage2ArenaLayout
-
+from .rank_push_layout import RankPushWorkspace
+from .window_view import zero_window as _zero_window
 
 _STAGE1_MODULE = "aiter.ops.flydsl.kernels.megamoe_tile.stage1"
 _STAGE1_FACTORY = "compile_megamoe_tile_ep16_stage1"
-
 
 
 class _CudaArrayView:
@@ -56,9 +53,7 @@ class _CudaArrayView:
 
 def _window_view(ptr: int, shape, typestr: str, strides=None) -> torch.Tensor:
     """strides 以字节计(__cuda_array_interface__ 约定)。"""
-    return torch.as_tensor(
-        _CudaArrayView(ptr, shape, typestr, strides), device="cuda"
-    )
+    return torch.as_tensor(_CudaArrayView(ptr, shape, typestr, strides), device="cuda")
 
 
 @dataclass(frozen=True)
@@ -78,9 +73,6 @@ def _align_up(value: int, alignment: int) -> int:
     return (int(value) + int(alignment) - 1) // int(alignment) * int(alignment)
 
 
-
-from .window_view import zero_window as _zero_window  # noqa: E402
-
 def _import_factory(module_name: str, factory_name: str) -> Callable[..., Any]:
     try:
         module = importlib.import_module(module_name)
@@ -99,10 +91,9 @@ def _as_u8_contiguous(tensor: torch.Tensor, name: str) -> torch.Tensor:
     try:
         return tensor.view(torch.uint8)
     except RuntimeError as error:
-        raise ValueError(f"{name} must have a byte-addressable packed layout") from error
-
-
-from .rank_push_layout import RankPushWorkspace
+        raise ValueError(
+            f"{name} must have a byte-addressable packed layout"
+        ) from error
 
 
 # 建议在 TPR > 1024 时开启 push 段的 fp8 通信量化;TPR 更小时是净亏的
@@ -246,7 +237,7 @@ class MegaMoETileA4W4:
         self._w2_scale = _as_u8_contiguous(w2_scale, "w2_scale")
 
         # GMM1 的 tile 切块(tile_group G -> BM=32*G、gmm1_bn)按 shape 查表,
-        # 优先级 env > 表 > 解析式默认(见 stage1_tune.py)。G 同时是 arena
+        # 优先级 表 > 解析式默认(见 stage1_tune.py)。G 同时是 arena
         # 布局参数,所以必须在建 layout 之前定下来。
         from .stage1_tune import resolve_stage1_tile as _resolve_s1_tile
 

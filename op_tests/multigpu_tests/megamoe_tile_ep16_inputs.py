@@ -71,10 +71,13 @@ class SharedInputs:
 # Process setup
 # --------------------------------------------------------------------------
 
+
 def _idle_failures(cards, max_idle_vram):
     """Zero utilization alone does not exclude an idle inference server."""
     devices = {k: v for k, v in cards.items() if k.startswith("card")}
-    failures = [] if len(devices) == 8 else [f"expected 8 GPUs, observed {len(devices)}"]
+    failures = (
+        [] if len(devices) == 8 else [f"expected 8 GPUs, observed {len(devices)}"]
+    )
     for name, value in devices.items():
         try:
             used = int(value["VRAM Total Used Memory (B)"])
@@ -103,7 +106,11 @@ def _guard_idle_gpus(output_dir):
             try:
                 result = subprocess.run(
                     ["rocm-smi", "--showuse", "--showmeminfo", "vram", "--json"],
-                    capture_output=True, text=True, check=True, timeout=20)
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    timeout=20,
+                )
                 observed["cards"] = json.loads(result.stdout)
                 observed["failures"] = _idle_failures(observed["cards"], max_idle_vram)
             except (OSError, ValueError, subprocess.SubprocessError) as error:
@@ -113,7 +120,11 @@ def _guard_idle_gpus(output_dir):
                 break
             if attempt < 2:
                 time.sleep(1)
-        local = {"rank": dist.get_rank(), **observations[-1], "observations": observations}
+        local = {
+            "rank": dist.get_rank(),
+            **observations[-1],
+            "observations": observations,
+        }
     gathered = [None] * dist.get_world_size()
     dist.all_gather_object(gathered, local)
     nodes = [row for row in gathered if row is not None]
@@ -122,11 +133,14 @@ def _guard_idle_gpus(output_dir):
         path = Path(output_dir)
         path.mkdir(parents=True, exist_ok=True)
         (path / "occupancy_preflight.json").write_text(
-            json.dumps({"passed": not failed, "nodes": nodes}, indent=2) + "\n")
+            json.dumps({"passed": not failed, "nodes": nodes}, indent=2) + "\n"
+        )
     if failed:
-        raise RuntimeError("EP16 test window is occupied or unverified; no GPU job "
-                           f"started. See occupancy_preflight.json: "
-                           f"{[(r['rank'], r['failures'][:2]) for r in nodes]}")
+        raise RuntimeError(
+            "EP16 test window is occupied or unverified; no GPU job "
+            f"started. See occupancy_preflight.json: "
+            f"{[(r['rank'], r['failures'][:2]) for r in nodes]}"
+        )
 
 
 def setup_dist(preflight_dir):
@@ -170,13 +184,15 @@ def _permuted_arbitrary_topk(shape, rank):
     node, local_rank = divmod(rank, shape.gpus_per_node)
     remote = torch.tensor(_ARBITRARY_REMOTE, dtype=torch.int64).view(1, -1)
     delta = torch.tensor(_ARBITRARY_RANK_DELTA, dtype=torch.int64).view(1, -1)
-    owner_node = torch.where(remote != 0, torch.full_like(remote, 1 - node),
-                             torch.full_like(remote, node))
-    owner = (owner_node * shape.gpus_per_node
-             + (local_rank + delta) % shape.gpus_per_node).expand(shape.tokens, -1)
+    owner_node = torch.where(
+        remote != 0, torch.full_like(remote, 1 - node), torch.full_like(remote, node)
+    )
+    owner = (
+        owner_node * shape.gpus_per_node + (local_rank + delta) % shape.gpus_per_node
+    ).expand(shape.tokens, -1)
     variant = torch.tensor(_ARBITRARY_EXPERT_VARIANT, dtype=torch.int64).view(1, -1)
     base = (token * 7 + rank * 3) % shape.local_experts
-    topk_ids = (owner * shape.local_experts + (base + variant) % shape.local_experts)
+    topk_ids = owner * shape.local_experts + (base + variant) % shape.local_experts
     # Distinct weights per slot, depending on source rank and token.
     numerators = ((token * 17 + slot * 29 + rank * 11) % 251 + 1).to(torch.float32)
     return topk_ids.to(torch.int32), numerators / numerators.sum(dim=1, keepdim=True)
@@ -192,16 +208,23 @@ def _balanced_routes(shape, rank, generator, device, *, per_node_group):
     token = rank * shape.tokens + torch.arange(shape.tokens, device=device)
     slot = torch.arange(shape.topk, device=device)
     owner = (slot % 2)[None, :] * shape.gpus_per_node + (
-        token[:, None] + slot // 2) % shape.gpus_per_node
+        token[:, None] + slot // 2
+    ) % shape.gpus_per_node
     group = token[:, None] // shape.gpus_per_node if per_node_group else token[:, None]
     expert = (group * (shape.topk // 2) + slot // 2) % shape.local_experts
     topk_ids = (owner * shape.local_experts + expert).to(torch.int32)
-    route_weights = torch.rand((shape.tokens, shape.topk), generator=generator,
-                               device=device).softmax(dim=-1)
+    route_weights = torch.rand(
+        (shape.tokens, shape.topk), generator=generator, device=device
+    ).softmax(dim=-1)
     return topk_ids, route_weights
 
 
-ROUTE_PATTERNS = ("rank-balanced-hot", "cross_node", "eplb-balanced", "permuted-arbitrary-topk")
+ROUTE_PATTERNS = (
+    "rank-balanced-hot",
+    "cross_node",
+    "eplb-balanced",
+    "permuted-arbitrary-topk",
+)
 
 
 def shared_inputs(shape, rank, device, *, route_pattern, seed, prepared_weights):
@@ -213,8 +236,16 @@ def shared_inputs(shape, rank, device, *, route_pattern, seed, prepared_weights)
     if route_pattern not in ROUTE_PATTERNS:
         raise ValueError(f"unsupported route pattern {route_pattern!r}")
     x, route_weights, topk_ids = make_inputs(
-        shape.tokens, rank, shape.ep_size, shape.hidden, shape.experts, shape.topk,
-        "rank-balanced-hot", 0.6, device)
+        shape.tokens,
+        rank,
+        shape.ep_size,
+        shape.hidden,
+        shape.experts,
+        shape.topk,
+        "rank-balanced-hot",
+        0.6,
+        device,
+    )
     if seed != 1234:
         generator = torch.Generator(device=device).manual_seed(seed + rank)
         x.normal_(generator=generator)
@@ -226,7 +257,12 @@ def shared_inputs(shape, rank, device, *, route_pattern, seed, prepared_weights)
         generator = torch.Generator(device=device).manual_seed(seed + rank)
         x.normal_(generator=generator)
         topk_ids, route_weights = _balanced_routes(
-            shape, rank, generator, device, per_node_group=route_pattern == "eplb-balanced")
+            shape,
+            rank,
+            generator,
+            device,
+            per_node_group=route_pattern == "eplb-balanced",
+        )
     elif route_pattern == "permuted-arbitrary-topk":
         if shape.topk != 16:
             raise ValueError("the permuted fixture is defined for topk=16 only")
@@ -234,33 +270,47 @@ def shared_inputs(shape, rank, device, *, route_pattern, seed, prepared_weights)
         topk_ids, route_weights = ids.to(device), weights.to(device)
     a_quant, a_scale = per_1x32_f4_quant(x, shuffle=False)
     local_mask = torch.zeros(shape.experts, dtype=torch.int32, device=device)
-    local_mask[rank * shape.local_experts:(rank + 1) * shape.local_experts] = 1
-    return SharedInputs(x, a_quant, a_scale, route_weights, topk_ids,
-                        prepared_weights, local_mask)
+    local_mask[rank * shape.local_experts : (rank + 1) * shape.local_experts] = 1
+    return SharedInputs(
+        x, a_quant, a_scale, route_weights, topk_ids, prepared_weights, local_mask
+    )
 
 
 # --------------------------------------------------------------------------
 # Weights and the reference
 # --------------------------------------------------------------------------
 
+
 def prepare_weights(shape, rank, device, *, seed):
     """Random FP4 w1/w2 with E8M0 scales, in the operator's packed layouts."""
     from aiter.ops.quant import per_1x32_f4_quant
-    from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight, shuffle_weight_a16w4
+    from aiter.ops.shuffle import (
+        shuffle_scale_a16w4,
+        shuffle_weight,
+        shuffle_weight_a16w4,
+    )
     from aiter.utility.fp4_utils import e8m0_shuffle
 
     generator = torch.Generator(device=device).manual_seed(90_000 + rank + seed - 1234)
     # One BF16 source at a time: holding both while FP4 quantization builds its
     # FP32 workspace costs several GiB of peak memory.
-    w1 = torch.randn((shape.local_experts, 2 * shape.inter, shape.hidden),
-                     dtype=torch.bfloat16, device=device, generator=generator)
+    w1 = torch.randn(
+        (shape.local_experts, 2 * shape.inter, shape.hidden),
+        dtype=torch.bfloat16,
+        device=device,
+        generator=generator,
+    )
     w1.mul_(shape.hidden**-0.25)
     w1q, w1s = per_1x32_f4_quant(w1, shuffle=False)
     del w1
     w1q, w1s = shuffle_weight(w1q, layout=(16, 16)), e8m0_shuffle(w1s)
     torch.cuda.empty_cache()
-    w2 = torch.randn((shape.local_experts, shape.hidden, shape.inter),
-                     dtype=torch.bfloat16, device=device, generator=generator)
+    w2 = torch.randn(
+        (shape.local_experts, shape.hidden, shape.inter),
+        dtype=torch.bfloat16,
+        device=device,
+        generator=generator,
+    )
     w2.mul_(shape.inter**-0.25)
     w2q, w2s = per_1x32_f4_quant(w2, shuffle=False)
     del w2
@@ -292,8 +342,14 @@ def coalesce_reference_routes(ids, weights, *, experts_per_rank, num_experts):
             out_weights[slots[0]] = math.fsum(row_weights[s] for s in slots)
             for slot in slots[1:]:
                 begin = expert // experts_per_rank * experts_per_rank
-                spare = next((e for e in range(begin, begin + experts_per_rank)
-                              if e not in used), None)
+                spare = next(
+                    (
+                        e
+                        for e in range(begin, begin + experts_per_rank)
+                        if e not in used
+                    ),
+                    None,
+                )
                 if spare is None:
                     raise ValueError("no unused same-rank expert for zero-weight slot")
                 used.add(spare)

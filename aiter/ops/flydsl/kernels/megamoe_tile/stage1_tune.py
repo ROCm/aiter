@@ -63,6 +63,7 @@ not fit: the 256-row accumulator needs 256 KB of LDS.
     extra_consumers; unsplit: static_g0, seal_fast); split without
     early_local_gmm was measured a net loss.
 """
+
 from __future__ import annotations
 
 import csv
@@ -112,14 +113,18 @@ def _validate(row: dict, where: str) -> None:
             f"{where}: tile_group must be one of {TILE_GROUPS} (got {row['tile_group']})"
         )
     if row["split_local"] not in (0, 1):
-        raise ValueError(f"{where}: split_local must be 0 or 1 (got {row['split_local']})")
+        raise ValueError(
+            f"{where}: split_local must be 0 or 1 (got {row['split_local']})"
+        )
     fs = row["fanout_shards"]
     if not FANOUT_SHARDS_MIN <= fs <= FANOUT_SHARDS_MAX:
         raise ValueError(
             f"{where}: fanout_shards must be in [{FANOUT_SHARDS_MIN}, {FANOUT_SHARDS_MAX}] (got {fs})"
         )
     if row["split_local"] and fs < 17:
-        raise ValueError(f"{where}: the split path needs fanout_shards >= 17 (fan2 uses 16)")
+        raise ValueError(
+            f"{where}: the split path needs fanout_shards >= 17 (fan2 uses 16)"
+        )
 
 
 def _load(path: str) -> dict:
@@ -128,15 +133,16 @@ def _load(path: str) -> dict:
         return table
     with open(path, newline="") as handle:
         reader = csv.DictReader(handle)
-        missing = [f for f in _KEY_FIELDS + _VALUE_FIELDS if f not in (reader.fieldnames or ())]
+        missing = [
+            f for f in _KEY_FIELDS + _VALUE_FIELDS if f not in (reader.fieldnames or ())
+        ]
         if missing:
             raise ValueError(f"{path}: tune table is missing columns {missing}")
         for lineno, raw in enumerate(reader, start=2):
             if not raw.get("gfx") or raw["gfx"].lstrip().startswith("#"):
                 continue
             key = tuple(
-                raw["gfx"].strip() if f == "gfx" else int(raw[f])
-                for f in _KEY_FIELDS
+                raw["gfx"].strip() if f == "gfx" else int(raw[f]) for f in _KEY_FIELDS
             )
             row = {f: int(raw[f]) for f in _VALUE_FIELDS}
             _validate(row, f"{path}:{lineno}")
@@ -249,9 +255,11 @@ def resolve_stage1_tile(
         out, source = dict(tuned), "table"
     else:
         split = default_split_local(token, expert)
-        out = {"split_local": split,
-               "tile_group": default_tile_group(token, expert, split),
-               "fanout_shards": default_fanout_shards(split)}
+        out = {
+            "split_local": split,
+            "tile_group": default_tile_group(token, expert, split),
+            "fanout_shards": default_fanout_shards(split),
+        }
         source = "default"
         _validate(out, "stage1 tile rule")
     out.update(gmm1_bn=GMM1_BN, compute_first=COMPUTE_FIRST, source=source)

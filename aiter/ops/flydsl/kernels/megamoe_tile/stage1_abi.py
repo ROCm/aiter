@@ -17,7 +17,6 @@ from dataclasses import dataclass
 
 import torch
 
-
 SPARSE_QP_TOKEN_BITS = 32
 SPARSE_QP_GENERATION_SHIFT = 32
 MAX_FUSED_TOKENS_PER_RANK = 4096
@@ -100,7 +99,9 @@ class Stage1DispatchWire:
         if self.record_bytes > 64 * 1024:
             raise ValueError("one dispatch record must fit in the 64-KiB CCO group")
         if (64 * 1024) // self.record_bytes < self.num_qp:
-            raise ValueError("one dispatch group must contain at least one record per QP")
+            raise ValueError(
+                "one dispatch group must contain at least one record per QP"
+            )
 
     @property
     def payload_bytes(self) -> int:
@@ -239,9 +240,8 @@ class Stage1ArenaLayout:
         # E_local-1 additional partially occupied tiles.  Keep one extra tile
         # as the existing conservative bound does.
         return (
-            (self.route_capacity + self.block_m - 1) // self.block_m
-            + 2 * self.local_experts * self.tile_group  # 本地/远端各自按 G 补齐
-        )
+            self.route_capacity + self.block_m - 1
+        ) // self.block_m + 2 * self.local_experts * self.tile_group  # 本地/远端各自按 G 补齐
 
     @property
     def max_route_rows(self) -> int:
@@ -253,7 +253,9 @@ class Stage1ArenaLayout:
 
     @property
     def dispatch_chunks(self) -> int:
-        return (self.max_tokens + self.wire.records_per_chunk - 1) // self.wire.records_per_chunk
+        return (
+            self.max_tokens + self.wire.records_per_chunk - 1
+        ) // self.wire.records_per_chunk
 
     @property
     def wire(self) -> Stage1DispatchWire:
@@ -338,9 +340,7 @@ class Stage1ArenaLayout:
                 "max_tokens must be in [1, 4096] for the fused Stage-1 ABI"
             )
         if not 1 <= max_routes_per_token_per_rank <= topk:
-            raise ValueError(
-                "max_routes_per_token_per_rank must be in [1, topk]"
-            )
+            raise ValueError("max_routes_per_token_per_rank must be in [1, topk]")
         local_experts = experts // world_size
         source_capacity = world_size * max_tokens
         if source_capacity > MAX_PACKED_SOURCE_CAPACITY:
@@ -371,8 +371,7 @@ class Stage1ArenaLayout:
         }
         if oversized_payloads:
             detail = ", ".join(
-                f"{name}={nbytes}"
-                for name, nbytes in oversized_payloads.items()
+                f"{name}={nbytes}" for name, nbytes in oversized_payloads.items()
             )
             raise ValueError(
                 "Stage-1 parity-local payloads must each be smaller than 2 GiB "
@@ -393,9 +392,19 @@ class Stage1ArenaLayout:
         # in this single registered window.  Generation arrays are absolute and
         # parity buffered; payload clearing between hot forwards is unnecessary.
         specs: list[tuple[str, tuple[int, ...], torch.dtype, int]] = [
-            ("dispatch_staging", (parity_depth, max_tokens, wire.record_bytes), torch.uint8, 256),
+            (
+                "dispatch_staging",
+                (parity_depth, max_tokens, wire.record_bytes),
+                torch.uint8,
+                256,
+            ),
             ("dispatch_staging_ready", (parity_depth, max_tokens), torch.int64, 64),
-            ("remote_dispatch_rx", (parity_depth, max_tokens, wire.record_bytes), torch.uint8, 256),
+            (
+                "remote_dispatch_rx",
+                (parity_depth, max_tokens, wire.record_bytes),
+                torch.uint8,
+                256,
+            ),
             ("remote_chunk_ready", (parity_depth, chunks, num_qp), torch.int64, 64),
             ("remote_chunk_credit", (parity_depth, chunks, num_qp), torch.int64, 64),
             ("remote_chunk_request", (parity_depth, chunks, num_qp), torch.int64, 64),
@@ -562,23 +571,42 @@ class Stage1ArenaLayout:
 
         if dispatch_plan:
             gpn = gpus_per_node
-            specs.extend([
-                # 每个源 rank 报给本 rank 每个本地 expert 的行数。
-                ("plan_count", (parity_depth, world_size, local_experts),
-                 torch.int32, 64),
-                ("plan_count_ready", (parity_depth, world_size), torch.int64, 64),
-                # 目的端算完后留在自己 arena:node 内的推送方/转发方来读。
-                ("plan_row_base", (parity_depth, world_size, local_experts),
-                 torch.int32, 64),
-                ("plan_expert_rows", (parity_depth, local_experts), torch.int32, 64),
-                ("plan_ready", (parity_depth,), torch.int64, 64),
-                # 本 rank 自己的全局 expert 直方图(算计数用)。
-                ("plan_local_hist", (parity_depth, experts), torch.int32, 64),
-                # rail 伙伴送来的计数:它那 8 个本 node 目的端各一段。
-                ("rail_count_inbox", (parity_depth, gpn, local_experts),
-                 torch.int32, 64),
-                ("rail_count_inbox_ready", (parity_depth,), torch.int64, 64),
-            ])
+            specs.extend(
+                [
+                    # 每个源 rank 报给本 rank 每个本地 expert 的行数。
+                    (
+                        "plan_count",
+                        (parity_depth, world_size, local_experts),
+                        torch.int32,
+                        64,
+                    ),
+                    ("plan_count_ready", (parity_depth, world_size), torch.int64, 64),
+                    # 目的端算完后留在自己 arena:node 内的推送方/转发方来读。
+                    (
+                        "plan_row_base",
+                        (parity_depth, world_size, local_experts),
+                        torch.int32,
+                        64,
+                    ),
+                    (
+                        "plan_expert_rows",
+                        (parity_depth, local_experts),
+                        torch.int32,
+                        64,
+                    ),
+                    ("plan_ready", (parity_depth,), torch.int64, 64),
+                    # 本 rank 自己的全局 expert 直方图(算计数用)。
+                    ("plan_local_hist", (parity_depth, experts), torch.int32, 64),
+                    # rail 伙伴送来的计数:它那 8 个本 node 目的端各一段。
+                    (
+                        "rail_count_inbox",
+                        (parity_depth, gpn, local_experts),
+                        torch.int32,
+                        64,
+                    ),
+                    ("rail_count_inbox_ready", (parity_depth,), torch.int64, 64),
+                ]
+            )
 
         # 被 RDMA(rail GDA)读写的 region 排在窗口最前,其后预留 stage2 整块(embed_stage2_bytes),
         # 再放其余(LSA/本地,按 max_route_rows 放大的大块都在这里)。CCO 的 GDA 把整窗注册成一个
@@ -586,14 +614,22 @@ class Stage1ArenaLayout:
         # 全部不落地,10-08 TPR1024 random 挂死)。这样 RDMA 偏移只随 tokens 增长,与路由上限无关。
         # 所有 kernel/host 都按名字取偏移,顺序可以随意调;stage1 仍从窗口偏移 0 开始。
         _rdma_first = (
-            "dispatch_staging", "remote_dispatch_rx", "remote_chunk_ready",
-            "remote_chunk_credit", "sparse_remote_qp_ready", "sparse_remote_credit",
-            "plan_local_hist", "rail_count_inbox", "rail_count_inbox_ready",
+            "dispatch_staging",
+            "remote_dispatch_rx",
+            "remote_chunk_ready",
+            "remote_chunk_credit",
+            "sparse_remote_qp_ready",
+            "sparse_remote_credit",
+            "plan_local_hist",
+            "rail_count_inbox",
+            "rail_count_inbox_ready",
         )
         _head = [sp for sp in specs if sp[0] in _rdma_first]
         _tail = [sp for sp in specs if sp[0] not in _rdma_first]
         if int(embed_stage2_bytes) > 0:
-            _head.append(("stage2_embed", (int(embed_stage2_bytes),), torch.uint8, 4096))
+            _head.append(
+                ("stage2_embed", (int(embed_stage2_bytes),), torch.uint8, 4096)
+            )
         specs = _head + _tail
 
         offset = 0
@@ -678,8 +714,12 @@ class TwoKernelArenaLayout:
             # stage2 嵌在 stage1 的 RDMA 前缀之后(见 Stage1ArenaLayout.create 的 embed_stage2_bytes)。
             slot = stage1.region("stage2_embed")
             if slot.nbytes < int(stage2.total_bytes) or slot.offset % alignment:
-                raise ValueError("stage2_embed slot is smaller than stage2 or misaligned")
-            return cls(stage1, stage2, slot.offset, _align_up(stage1.total_bytes, alignment))
+                raise ValueError(
+                    "stage2_embed slot is smaller than stage2 or misaligned"
+                )
+            return cls(
+                stage1, stage2, slot.offset, _align_up(stage1.total_bytes, alignment)
+            )
         stage2_offset = _align_up(stage1.total_bytes, alignment)
         total_bytes = _align_up(stage2_offset + int(stage2.total_bytes), alignment)
         return cls(stage1, stage2, stage2_offset, total_bytes)

@@ -123,8 +123,12 @@ def get_bitcode_path(cov: int = 6, *, ndebug: bool = False) -> str:
                 if ndebug:
                     defines.append("-DNDEBUG")
                 _hipcc_device_bc(
-                    cfg, source, _collect_include_dirs(mori_root), raw,
-                    cov=cov, extra_defines=defines,
+                    cfg,
+                    source,
+                    _collect_include_dirs(mori_root),
+                    raw,
+                    cov=cov,
+                    extra_defines=defines,
                 )
                 _strip_lifetime_intrinsics(cfg, raw, output)
 
@@ -171,21 +175,43 @@ class RailGda:
             "megamoe_gda_wait_request_warp", _WAIT_ARGS, ndebug
         )
 
-    def put(self, dev_comm, ctx, peer, dst_win, dst_off, src_win, src_off,
-            nbytes, *, aggregate=True):
+    def put(
+        self,
+        dev_comm,
+        ctx,
+        peer,
+        dst_win,
+        dst_off,
+        src_win,
+        src_off,
+        nbytes,
+        *,
+        aggregate=True,
+    ):
         """Post a window-to-window RDMA write to ``peer`` (a NODE index).
 
         ``aggregate=True`` leaves the doorbell unrung: the transfer is only
         released by a later :meth:`flush_peer` on the same ctx.
         """
-        return self._put(dev_comm, ctx, peer, dst_win, dst_off, src_win,
-                         src_off, nbytes, int(aggregate))
+        return self._put(
+            dev_comm,
+            ctx,
+            peer,
+            dst_win,
+            dst_off,
+            src_win,
+            src_off,
+            nbytes,
+            int(aggregate),
+        )
 
-    def put_value(self, dev_comm, ctx, peer, dst_win, dst_off, value,
-                  *, aggregate=True):
+    def put_value(
+        self, dev_comm, ctx, peer, dst_win, dst_off, value, *, aggregate=True
+    ):
         """Post an inline 8-byte write; same doorbell rule as :meth:`put`."""
-        return self._put_value(dev_comm, ctx, peer, dst_win, dst_off, value,
-                               int(aggregate))
+        return self._put_value(
+            dev_comm, ctx, peer, dst_win, dst_off, value, int(aggregate)
+        )
 
     def flush_peer(self, dev_comm, ctx, peer):
         """Ring the doorbell for ctx/peer and poll its CQ to completion."""
