@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import importlib
+import os
 import sys
 import tempfile
 import unittest
@@ -320,6 +322,197 @@ class TestMxfp4FlydslInputsAndCandidates(unittest.TestCase):
         self.assertTrue(all(job["native_scale_layout"] for job in stage1))
         self.assertEqual({job["D_INTER"] for job in stage1}, {384})
         self.assertEqual({job["interleave"] for job in stage1}, {False, True})
+        for precision in ("fp4", "fp8"):
+            matching = [job for job in stage1 if job["a_dtype"] == precision]
+            self.assertEqual(
+                {(job["interleave"], job["enable_bias"]) for job in matching},
+                {(False, False), (False, True), (True, False), (True, True)},
+            )
+
+    def test_mxmoe_aot_shared_expert_has_no_bias_variant(self) -> None:
+        from aiter.aot.flydsl.mxfp4_moe import parse_csv
+
+        row = shape_row(shared_expert_id=0)
+        row.update(
+            kernelName1="flydsl_mxmoe_g1_a4w4_16x128x256_f16in_nt",
+            kernelName2="flydsl_moe2_layout_afp4_wfp4_bf16_t16x128x128_atomic_sbm16",
+        )
+        path = Path(self.directory.name) / "shared.csv"
+        pd.DataFrame([row, row]).to_csv(path, index=False)
+        jobs = [job for job in parse_csv(str(path)) if job["stage"] == 1]
+        self.assertEqual(len(jobs), 2)
+        self.assertTrue(all(not job["enable_bias"] for job in jobs))
+
+    def test_mxmoe_bias_names_raise_in_parser_and_aot(self) -> None:
+        from aiter.aot.flydsl.mxfp4_moe import parse_csv
+
+        for a_bits, suffix in ((4, ""), (8, "_fp8out")):
+            name = f"flydsl_mxmoe_g1_a{a_bits}w4_32x128x256{suffix}"
+            self.assertNotIn("enable_bias", _parse_mxfp4_g1_kname(name))
+            for bias_suffix in ("_bias", "_BIAS"):
+                with self.subTest(name=name + bias_suffix), self.assertRaisesRegex(
+                    ValueError, "unknown token"
+                ):
+                    _parse_mxfp4_g1_kname(name + bias_suffix)
+            row = shape_row(kernelName1=name + "_bias", kernelName2="")
+            path = Path(self.directory.name) / "legacy.csv"
+            pd.DataFrame([row]).to_csv(path, index=False)
+            with self.assertRaisesRegex(ValueError, "unknown token 'bias'"):
+                parse_csv(str(path))
+
+    def test_mxmoe_wrapper_passes_runtime_bias_without_name_flag(self) -> None:
+        fm = importlib.import_module("aiter.fused_moe")
+        hidden = torch.empty((2, 512), dtype=torch.float8_e4m3fn)
+        w1 = torch.empty((4, 768, 256), dtype=torch.uint8)
+        w2 = torch.empty((4, 512, 192), dtype=torch.uint8)
+        bias = torch.randn((4, 768), dtype=torch.float32)
+        result = (object(), object())
+        with mock.patch.object(
+            fm, "_mxfp4_a4w4_stage1", return_value=result
+        ) as stage1, mock.patch.object(
+            fm, "_empty_bf16", return_value=torch.empty(0, dtype=torch.bfloat16)
+        ):
+            for runtime_bias in (bias, None, bias):
+                actual = fm._mxfp4_a4w4_stage1_fw(
+                    hidden,
+                    w1,
+                    w2,
+                    torch.empty(32, dtype=torch.int32),
+                    None,
+                    None,
+                    None,
+                    2,
+                    kernelName1="flydsl_mxmoe_g1_a8w4_32x128x256_fp8out",
+                    m_indices=torch.empty(0, dtype=torch.int32),
+                    bias1=runtime_bias,
+                )
+                self.assertEqual(actual, result)
+                self.assertIs(stage1.call_args.kwargs["bias1"], runtime_bias)
+
+    def test_tuned_mxmoe_keeps_pair_with_runtime_bias_and_rejects_legacy_name(
+        self,
+    ) -> None:
+        fm = importlib.import_module("aiter.fused_moe")
+        from aiter import ActivationType, QuantType, dtypes
+
+        key = (
+            "gfx950",
+            256,
+            32,
+            1024,
+            384,
+            4,
+            2,
+            str(ActivationType.Silu),
+            str(dtypes.bf16),
+            str(dtypes.fp8),
+            str(dtypes.fp4x2),
+            str(QuantType.per_1x32),
+            True,
+            False,
+        )
+        g1 = "flydsl_mxmoe_g1_a8w4_32x128x256_fp8out"
+        g2 = "flydsl_moe2_layout_afp8_wfp4_bf16_t32x128x128_reduce_sbm32"
+        cfg = {"kernelName1": g1, "kernelName2": g2, "block_m": 32, "ksplit": 0}
+        with mock.patch.object(
+            fm, "get_gfx_runtime", return_value="gfx950"
+        ), mock.patch.object(fm, "get_cu_num", return_value=256), mock.patch.object(
+            fm, "cfg_2stages", ({key: cfg}, {})
+        ), mock.patch.object(
+            fm.aiter, "is_mxfp4_moe_shape_supported", return_value=True
+        ), mock.patch.dict(
+            os.environ, {"AITER_BYPASS_TUNE_CONFIG": "0"}
+        ):
+            self.addCleanup(fm.get_2stage_cfgs.cache_clear)
+            for has_bias in (True, False, True):
+                fm.get_2stage_cfgs.cache_clear()
+                meta = fm.get_2stage_cfgs(
+                    32,
+                    1024,
+                    384,
+                    4,
+                    2,
+                    dtypes.bf16,
+                    dtypes.fp8,
+                    dtypes.fp4x2,
+                    QuantType.per_1x32,
+                    True,
+                    ActivationType.Silu,
+                    False,
+                    0,
+                    0,
+                    gate_mode="interleave",
+                    has_stage1_bias=has_bias,
+                )
+                self.assertEqual(meta.stage1.keywords["kernelName1"], g1)
+                self.assertEqual(meta.stage2.keywords["kernelName2"], g2)
+                self.assertEqual(meta.has_bias, has_bias)
+            cfg["kernelName1"] = g1 + "_bias"
+            # Even incompatible OPUS weight layout must not mask bad G1 names.
+            for kernel2, shuffled in ((g2, True), ("opus_test", False)):
+                cfg["kernelName2"] = kernel2
+                fm.get_2stage_cfgs.cache_clear()
+                with self.assertRaisesRegex(ValueError, "unknown token 'bias'"):
+                    fm.get_2stage_cfgs(
+                        32,
+                        1024,
+                        384,
+                        4,
+                        2,
+                        dtypes.bf16,
+                        dtypes.fp8,
+                        dtypes.fp4x2,
+                        QuantType.per_1x32,
+                        True,
+                        ActivationType.Silu,
+                        False,
+                        0,
+                        0,
+                        gate_mode="interleave",
+                        has_stage1_bias=True,
+                        opus_weights_shuffled=shuffled,
+                    )
+        fm.get_2stage_cfgs.cache_clear()
+
+    def test_mxmoe_fallback_still_skips_calls_with_bias(self) -> None:
+        fm = importlib.import_module("aiter.fused_moe")
+        from aiter import ActivationType, QuantType, dtypes
+
+        with mock.patch.object(
+            fm, "get_gfx_runtime", return_value="gfx950"
+        ), mock.patch.object(fm, "get_cu_num", return_value=256), mock.patch.object(
+            fm, "cfg_2stages", ({}, {})
+        ), mock.patch.object(
+            fm.aiter, "is_mxfp4_moe_shape_supported", return_value=True
+        ), mock.patch.dict(
+            os.environ, {"AITER_ONLINE_TUNE": "0", "AITER_MXMOE_FALLBACK": "1"}
+        ):
+            self.addCleanup(fm.get_2stage_cfgs.cache_clear)
+            for has_bias in (False, True):
+                fm.get_2stage_cfgs.cache_clear()
+                meta = fm.get_2stage_cfgs(
+                    32,
+                    1024,
+                    384,
+                    4,
+                    2,
+                    dtypes.bf16,
+                    dtypes.fp4x2,
+                    dtypes.fp4x2,
+                    QuantType.per_1x32,
+                    True,
+                    ActivationType.Situv2,
+                    False,
+                    0,
+                    0,
+                    gate_mode="separated",
+                    has_stage1_bias=has_bias,
+                )
+                self.assertIs(
+                    meta.stage1.func,
+                    fm._flydsl_stage1_wrapper if has_bias else fm._mxfp4_a4w4_stage1_fw,
+                )
+        fm.get_2stage_cfgs.cache_clear()
 
     def test_bm16_a8_candidates_reach_the_persisted_winner_and_profile(self) -> None:
         row = self.read_rows([shape_row(token=64, q_dtype_a="torch.float8_e4m3fn")])

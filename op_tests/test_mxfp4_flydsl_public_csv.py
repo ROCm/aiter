@@ -30,6 +30,7 @@ from aiter.ops.flydsl.mxfp4_kname import (
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.utility import fp4_utils
 from csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune import (
+    FmoeTuner,
     Mxfp4FlydslTuner,
     cosine_diff_compare,
 )
@@ -39,10 +40,39 @@ SUPPORTED_GFX = ("gfx950",)
 
 
 def run_torch(
-    data: dict[str, Any], topk: int, activation: ActivationType, limit: float | None
+    data: dict[str, Any],
+    topk: int,
+    activation: ActivationType,
+    limit: float | None,
+    bias1: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    return Mxfp4FlydslTuner._torch_ref(
-        data, topk, dtypes.bf16, activation, swiglu_limit=limit
+    ref1 = FmoeTuner.run_torch_moe_stage1(
+        data["a1_qt"],
+        data["w1_qt"],
+        data["w2_qt"],
+        data["topk_weights"],
+        data["topk_ids"],
+        data["a1_scale"],
+        data["w1_scale"],
+        w1_bias=bias1,
+        dtype=dtypes.bf16,
+        activation=activation,
+        quant_type=QuantType.per_1x32,
+        doweight_stage1=False,
+        topk=topk,
+        swiglu_limit=limit,
+    )
+    return FmoeTuner.run_torch_moe_stage2(
+        ref1,
+        data["w1_qt"],
+        data["w2_qt"],
+        data["topk_weights"],
+        data["topk_ids"],
+        a2_scale=None,
+        w2_scale=data["w2_scale"],
+        dtype=dtypes.bf16,
+        quant_type=QuantType.per_1x32,
+        doweight_stage1=False,
     )
 
 
@@ -167,6 +197,7 @@ def test_public_a8w4_csv(
     kernel2: str,
     expected_pair: tuple[str, str] | None = None,
     lookup_csv_token: int | None = None,
+    stage1_bias: int = 0,
 ) -> dict[str, Any]:
     expected_pair = (kernel1, kernel2) if expected_pair is None else expected_pair
     g1 = _parse_mxfp4_g1_kname(kernel1)
@@ -185,7 +216,11 @@ def test_public_a8w4_csv(
         if limit_env not in (None, "")
         else (7.0 if activation == ActivationType.Swiglu else None)
     )
-    reference = run_torch(data, topk, activation, limit)
+    bias1 = (
+        torch.randn((expert, 2 * inter_dim), device="cuda", dtype=torch.float32)
+        if stage1_bias else None
+    )
+    reference = run_torch(data, topk, activation, limit, bias1=bias1)
     output = torch.empty((token, model_dim), device="cuda", dtype=dtypes.bf16)
     original1, original2 = fm._mxfp4_a4w4_stage1_fw, fm._mxfp4_a4w4_stage2_fw
     calls, intermediate = [], {}
@@ -203,6 +238,7 @@ def test_public_a8w4_csv(
             inline=_parse_mxfp4_g1_kname(kwargs["kernelName1"])["inline_quant"],
             interleave=kwargs["interleave"],
             prequant_has_scales=kwargs.get("a1_scale") is not None,
+            stage1_has_bias=kwargs.get("bias1") is not None,
         )
         if payload.dtype == dtypes.fp8:
             active_scales = decode_valid_scales(
@@ -244,6 +280,7 @@ def test_public_a8w4_csv(
             linear_beta=25.0 if activation == ActivationType.Situv2 else None,
             swiglu_limit=limit,
             output=output,
+            bias1=bias1,
         )
 
     ret = {
@@ -286,6 +323,7 @@ def test_public_a8w4_csv(
             == str(dtypes.fp8_e8m0)
         )
         assert intermediate["interleave"] is True
+        assert intermediate["stage1_has_bias"] == bool(stage1_bias)
         assert intermediate["inline"] == (
             intermediate["input_dtype"] == str(dtypes.bf16)
         )
@@ -316,6 +354,7 @@ def test_public_a8w4_csv(
             data["topk_ids"],
             data["topk_weights"],
             output,
+            *([bias1] if bias1 is not None else []),
         )
     )
     for name, fn in candidates.items():
@@ -348,6 +387,7 @@ def main() -> None:
         help="zero-based CSV data row indices; default all",
     )
     parser.add_argument("--report", type=Path, required=True)
+    parser.add_argument("--stage1-bias", type=int, choices=(0, 1), nargs="+", default=[0])
     args = parser.parse_args()
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning("public A8W4 CSV validation unsupported on %s", get_gfx())
@@ -359,11 +399,12 @@ def main() -> None:
     fm.cfg_2stages = None
     fm.get_2stage_cfgs.cache_clear()
     records = []
-    for (index,) in itertools.product(indices):
+    for index, stage1_bias in itertools.product(indices, args.stage1_bias):
         row = rows[index]
         lookup = select_csv_lookup(rows, row, fm.get_padded_M(int(row["token"])))
         base = {
             "csv_row": index,
+            "stage1_bias": stage1_bias,
             "source_tag": row.get("_tag", ""),
             "shape": row,
             "requested_pair": {"G1": row["kernelName1"], "G2": row["kernelName2"]},
@@ -407,6 +448,7 @@ def main() -> None:
                                 else ()
                             ),
                             lookup_csv_token=lookup["token"] if lookup else None,
+                            stage1_bias=stage1_bias,
                         )
                     )
         except Exception as exc:  # noqa: BLE001
