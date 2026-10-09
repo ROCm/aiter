@@ -3,42 +3,97 @@
 # Adapted from flash-linear-attention: Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
 
 """
-Kimi Delta Attention (KDA) chunked forward pass (Forward Only).
+Kimi Delta Attention (KDA) chunked forward and backward pass.
 
 This is the public entry point for the ``chunk_delta_attn`` Triton kernels. The
 signature mirrors ``fla.ops.kda.chunk_kda`` so serving stacks can swap the two
 backends without reshaping tensors or re-deriving the gate.
 
-Important Note:
-    Only the forward pass is implemented. These functions do NOT support
-    gradient computation. For training, use the flash-linear-attention library.
+When any tensor input requires grad, the call runs under an autograd function
+whose backward is ``chunk_delta_attn_bwd``. It saves only the inputs and
+recomputes the default pipeline's intermediates, as fla does with
+``disable_recompute=False``.
 
 Notes on the fla-compatible surface:
     * ``state_v_first`` is spelled as fla spells it from 0.5.1 onward. fla's
       pre-0.5.1 name ``transpose_state_layout`` is deliberately not accepted, so
       a shared argument dict requires fla >= 0.5.1 on the other side.
     * ``disable_recompute`` is accepted for signature parity but has no effect.
-      In both libraries it only decides whether the gated query ``qg`` is
-      materialized for a backward pass to reuse -- neither forward output
-      kernel reads it. Since this path is forward-only and returns no scratch,
-      honouring ``True`` would allocate and write a ``T x HV x K`` tensor that
-      nothing can observe, so the flag is pinned off internally.
+      In fla, ``True`` keeps the forward's intermediates alive for the backward
+      to reuse. Here the backward always recomputes them from the inputs, which
+      also lets the forward take the FlashKDA path, which materializes none.
     * ``allow_neg_eigval`` / ``return_intermediate_states`` / ``cp_context`` /
       ``cu_seqlens_cpu`` have no counterpart yet and are rejected rather than
       silently ignored.
     * Tensor arguments are made contiguous here, as fla's ``@input_guard``
       does, because some kernels below assume contiguous strides.
-    * This path is forward-only, so the output carries no ``grad_fn`` even
-      when the inputs require grad, whereas fla returns a differentiable
-      tensor.
+    * ``out`` and the paged ``state_cache`` are inference-only and are rejected
+      when an input requires grad.
 """
 
 import torch
 
-from aiter.ops.triton._triton_kernels.kimi_delta_attn import chunk_delta_attn_fwd
+from aiter.ops.triton._triton_kernels.kimi_delta_attn import (
+    chunk_delta_attn_bwd,
+    chunk_delta_attn_fwd,
+)
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
+
+# What the backward recomputes with: the default pipeline's chunk size, which is
+# what an unset `chunk_size` falls back to there.
+_BWD_DEFAULT_CHUNK_SIZE = 64
+
+
+class _ChunkKimiDeltaAttnFunction(torch.autograd.Function):
+    """Runs ``chunk_delta_attn_fwd``, saving only its inputs, and ``chunk_delta_attn_bwd``."""
+
+    @staticmethod
+    def forward(ctx, q, k, v, g, beta, A_log, dt_bias, initial_state, kwargs):
+        o, final_state, *_ = chunk_delta_attn_fwd(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            initial_state=initial_state,
+            disable_recompute=False,
+            **kwargs,
+        )
+        ctx.save_for_backward(
+            q, k, v, g, beta, A_log, dt_bias, initial_state, kwargs["cu_seqlens"]
+        )
+        ctx.kwargs = {
+            key: val
+            for key, val in kwargs.items()
+            if key not in ("cu_seqlens", "output_final_state")
+        }
+        return o, final_state
+
+    @staticmethod
+    def backward(ctx, do, dht):
+        q, k, v, g, beta, A_log, dt_bias, initial_state, cu_seqlens = ctx.saved_tensors
+        kwargs = dict(ctx.kwargs)
+        if kwargs["chunk_size"] is None:
+            kwargs["chunk_size"] = _BWD_DEFAULT_CHUNK_SIZE
+        grads = chunk_delta_attn_bwd(
+            do=do,
+            dht=dht,
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            initial_state=initial_state,
+            cu_seqlens=cu_seqlens,
+            **kwargs,
+        )
+        return (*grads, None)
 
 
 def chunk_kimi_delta_attn(
@@ -67,10 +122,12 @@ def chunk_kimi_delta_attn(
     has_initial_state: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     r"""
-    Chunked Kimi Delta Attention forward pass using Triton (Forward only).
+    Chunked Kimi Delta Attention using Triton.
 
-    Warning:
-        Forward only; this function does NOT compute gradients.
+    Differentiable w.r.t. every float tensor input (`q`, `k`, `v`, `g`, `beta`,
+    `A_log`, `dt_bias`, `initial_state`) when any of them requires grad. The
+    backward recomputes the default pipeline's intermediates at chunk size 64
+    unless `chunk_size` is given, whichever path ran the forward.
 
     Args:
         q (torch.Tensor):
@@ -123,9 +180,9 @@ def chunk_kimi_delta_attn(
         state_v_first (bool):
             Store the recurrent state V-first (`[V, K]`) instead of `[K, V]`.
         disable_recompute (bool):
-            Ignored. In fla this keeps the gated query `qg` alive for the
-            backward pass; this path is forward-only and returns no scratch,
-            so the flag is accepted for signature parity only.
+            Ignored. In fla this keeps the forward's intermediates alive for
+            the backward pass; here the backward always recomputes them, so
+            the flag is accepted for signature parity only.
         chunk_size (int, optional):
             Chunk size, either 32 or 64. Default: `None`, which lets the
             library choose. fla has no counterpart and pins 64 internally, so
@@ -148,13 +205,13 @@ def chunk_kimi_delta_attn(
             Caller-owned output buffer, same shape as `v`, and contiguous.
             Written in place rather than allocated and copied. Required with
             `state_cache`. FlashKDA-only; the default pipeline rejects this
-            argument rather than ignoring it.
+            argument rather than ignoring it, as does a call that needs grad.
         state_cache (torch.Tensor, optional):
             Paged fp32 V-first cache `[slots, H, V, K]`. Replaces
             `initial_state`: sequence `n` is row `state_indices[n]`. Each
             slot's `[H, V, K]` plane must be dense; `stride(0)` may be padded.
             FlashKDA-only; the default pipeline rejects this argument rather
-            than ignoring it.
+            than ignoring it, as does a call that needs grad.
         state_indices (torch.Tensor, optional):
             Int32 `[N]` cache row per sequence, each in `[0, slots)`. Required
             with `state_cache`. Trusted as given, not range-checked.
@@ -276,6 +333,32 @@ def chunk_kimi_delta_attn(
     # state_cache is not packed: stride(0) may be padded. Packing it would
     # copy the pool and write a clone.
 
+    tensors = (q, k, v, g, beta, A_log, dt_bias, initial_state)
+    if torch.is_grad_enabled() and any(
+        t is not None and t.requires_grad for t in tensors
+    ):
+        if out is not None or state_cache is not None:
+            raise ValueError(
+                "`out` and `state_cache` are inference-only; they are not "
+                "supported when an input requires grad."
+            )
+        o, final_state = _ChunkKimiDeltaAttnFunction.apply(
+            *tensors,
+            {
+                "scale": scale,
+                "output_final_state": output_final_state,
+                "cu_seqlens": cu_seqlens,
+                "chunk_size": chunk_size,
+                "safe_gate": safe_gate,
+                "lower_bound": lower_bound,
+                "use_gate_in_kernel": use_gate_in_kernel,
+                "use_qk_l2norm_in_kernel": use_qk_l2norm_in_kernel,
+                "use_beta_sigmoid_in_kernel": use_beta_sigmoid_in_kernel,
+                "state_v_first": state_v_first,
+            },
+        )
+        return o.to(q.dtype), final_state
+
     o, final_state, *_ = chunk_delta_attn_fwd(
         q=q,
         k=k,
@@ -292,8 +375,8 @@ def chunk_kimi_delta_attn(
         use_gate_in_kernel=use_gate_in_kernel,
         A_log=A_log,
         dt_bias=dt_bias,
-        # Pinned off: it would only materialize `qg` for a backward that does
-        # not exist here, and the scratch is discarded below either way.
+        # Pinned off: it would only materialize `qg` for a backward, which
+        # recomputes it anyway, and the scratch is discarded below either way.
         disable_recompute=False,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,

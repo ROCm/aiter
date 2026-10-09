@@ -4,11 +4,12 @@
 
 """
 chunk_delta_attn – Triton kernels for the chunk-based delta-attention
-forward pass (prefill / training).
+forward and backward passes (prefill / training).
 
 Public API
 ----------
 chunk_delta_attn_fwd          Top-level forward: gate cumsum → intra → inter → output.
+chunk_delta_attn_bwd          Backward, recomputing the forward's intermediates.
 chunk_delta_attn_fwd_intra    Intra-chunk attention (Aqk/Akk + W/U recompute).
 chunk_gla_fwd_o               GLA output kernel (q*exp2(g)*h + A*v).
 recompute_w_u_fwd             W/U recompute from Akk inverse.
@@ -18,6 +19,9 @@ chunk_delta_attn_gate_fwd     Per-token gate without cumsum (forward only).
 flash_kda_fwd                 Two-kernel fused forward (opt-in, narrower shapes).
 """
 
+from aiter.ops.triton._triton_kernels.kimi_delta_attn.chunk_bwd import (
+    chunk_delta_attn_bwd,
+)
 from aiter.ops.triton._triton_kernels.kimi_delta_attn.chunk_fwd import (
     chunk_delta_attn_fwd,
 )
@@ -43,6 +47,7 @@ from aiter.ops.triton._triton_kernels.kimi_delta_attn.wy_fast import (
 
 __all__ = [
     "beta_sigmoid_fwd",
+    "chunk_delta_attn_bwd",
     "chunk_delta_attn_fwd",
     "chunk_delta_attn_fwd_intra",
     "chunk_delta_attn_gate_fwd",
