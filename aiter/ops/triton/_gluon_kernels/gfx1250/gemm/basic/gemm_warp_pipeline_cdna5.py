@@ -1407,35 +1407,67 @@ def mxfp8_gemm_warp_pipeline_bk512(
             scale_a_layout,
             scale_b_layout,
         )
+    # Flatten the final two K tiles; convert in the final compute stage.
+    # Output stores remain outside the warp pipeline.
     tdm.async_wait(3)
-    acc = _mxfp8_tiled_consume_tail(
-        a_buf,
-        b_buf,
-        as_buf,
-        bs_buf,
-        (iter_max - 2) % 2,
-        acc,
-        dot_a,
-        dot_b,
-        scale_a_layout,
-        scale_b_layout,
-        512,
-    )
+    with gl.amd.warp_pipeline_stage("flat_tail_load_0"):
+        a0 = a_buf.index((iter_max - 2) % 2).slice(0, 128, 1).load(layout=dot_a)
+        as0 = _mxfp8_tiled_load_scale(as_buf, (iter_max - 2) % 2, 0, scale_a_layout, a_buf.type.shape[1])
+        b0 = b_buf.index((iter_max - 2) % 2).slice(0, 128, 1).permute([1, 0]).load(layout=dot_b)
+        bs0 = _mxfp8_tiled_load_scale(bs_buf, (iter_max - 2) % 2, 0, scale_b_layout, b_buf.type.shape[1])
+    with gl.amd.warp_pipeline_stage("flat_tail_compute_0"):
+        acc = gl.amd.cdna5.wmma_scaled(a0, as0, "e4m3", b0, bs0, "e4m3", acc)
+    with gl.amd.warp_pipeline_stage("flat_tail_load_1"):
+        a1 = a_buf.index((iter_max - 2) % 2).slice(128, 128, 1).load(layout=dot_a)
+        as1 = _mxfp8_tiled_load_scale(as_buf, (iter_max - 2) % 2, 4, scale_a_layout, a_buf.type.shape[1])
+        b1 = b_buf.index((iter_max - 2) % 2).slice(128, 128, 1).permute([1, 0]).load(layout=dot_b)
+        bs1 = _mxfp8_tiled_load_scale(bs_buf, (iter_max - 2) % 2, 4, scale_b_layout, b_buf.type.shape[1])
+    with gl.amd.warp_pipeline_stage("flat_tail_compute_1"):
+        acc = gl.amd.cdna5.wmma_scaled(a1, as1, "e4m3", b1, bs1, "e4m3", acc)
+    with gl.amd.warp_pipeline_stage("flat_tail_load_2"):
+        a2 = a_buf.index((iter_max - 2) % 2).slice(256, 128, 1).load(layout=dot_a)
+        as2 = _mxfp8_tiled_load_scale(as_buf, (iter_max - 2) % 2, 8, scale_a_layout, a_buf.type.shape[1])
+        b2 = b_buf.index((iter_max - 2) % 2).slice(256, 128, 1).permute([1, 0]).load(layout=dot_b)
+        bs2 = _mxfp8_tiled_load_scale(bs_buf, (iter_max - 2) % 2, 8, scale_b_layout, b_buf.type.shape[1])
+    with gl.amd.warp_pipeline_stage("flat_tail_compute_2"):
+        acc = gl.amd.cdna5.wmma_scaled(a2, as2, "e4m3", b2, bs2, "e4m3", acc)
+    with gl.amd.warp_pipeline_stage("flat_tail_load_3"):
+        a3 = a_buf.index((iter_max - 2) % 2).slice(384, 128, 1).load(layout=dot_a)
+        as3 = _mxfp8_tiled_load_scale(as_buf, (iter_max - 2) % 2, 12, scale_a_layout, a_buf.type.shape[1])
+        b3 = b_buf.index((iter_max - 2) % 2).slice(384, 128, 1).permute([1, 0]).load(layout=dot_b)
+        bs3 = _mxfp8_tiled_load_scale(bs_buf, (iter_max - 2) % 2, 12, scale_b_layout, b_buf.type.shape[1])
+    with gl.amd.warp_pipeline_stage("flat_tail_compute_3"):
+        acc = gl.amd.cdna5.wmma_scaled(a3, as3, "e4m3", b3, bs3, "e4m3", acc)
     tdm.async_wait(0)
-    acc = _mxfp8_tiled_consume_tail(
-        a_buf,
-        b_buf,
-        as_buf,
-        bs_buf,
-        (iter_max - 1) % 2,
-        acc,
-        dot_a,
-        dot_b,
-        scale_a_layout,
-        scale_b_layout,
-        512,
-    )
-    _cluster_sync()
+    with gl.amd.warp_pipeline_stage("flat_tail_load_4"):
+        a4 = a_buf.index((iter_max - 1) % 2).slice(0, 128, 1).load(layout=dot_a)
+        as4 = _mxfp8_tiled_load_scale(as_buf, (iter_max - 1) % 2, 0, scale_a_layout, a_buf.type.shape[1])
+        b4 = b_buf.index((iter_max - 1) % 2).slice(0, 128, 1).permute([1, 0]).load(layout=dot_b)
+        bs4 = _mxfp8_tiled_load_scale(bs_buf, (iter_max - 1) % 2, 0, scale_b_layout, b_buf.type.shape[1])
+    with gl.amd.warp_pipeline_stage("flat_tail_compute_4"):
+        acc = gl.amd.cdna5.wmma_scaled(a4, as4, "e4m3", b4, bs4, "e4m3", acc)
+    with gl.amd.warp_pipeline_stage("flat_tail_load_5"):
+        a5 = a_buf.index((iter_max - 1) % 2).slice(128, 128, 1).load(layout=dot_a)
+        as5 = _mxfp8_tiled_load_scale(as_buf, (iter_max - 1) % 2, 4, scale_a_layout, a_buf.type.shape[1])
+        b5 = b_buf.index((iter_max - 1) % 2).slice(128, 128, 1).permute([1, 0]).load(layout=dot_b)
+        bs5 = _mxfp8_tiled_load_scale(bs_buf, (iter_max - 1) % 2, 4, scale_b_layout, b_buf.type.shape[1])
+    with gl.amd.warp_pipeline_stage("flat_tail_compute_5"):
+        acc = gl.amd.cdna5.wmma_scaled(a5, as5, "e4m3", b5, bs5, "e4m3", acc)
+    with gl.amd.warp_pipeline_stage("flat_tail_load_6"):
+        a6 = a_buf.index((iter_max - 1) % 2).slice(256, 128, 1).load(layout=dot_a)
+        as6 = _mxfp8_tiled_load_scale(as_buf, (iter_max - 1) % 2, 8, scale_a_layout, a_buf.type.shape[1])
+        b6 = b_buf.index((iter_max - 1) % 2).slice(256, 128, 1).permute([1, 0]).load(layout=dot_b)
+        bs6 = _mxfp8_tiled_load_scale(bs_buf, (iter_max - 1) % 2, 8, scale_b_layout, b_buf.type.shape[1])
+    with gl.amd.warp_pipeline_stage("flat_tail_compute_6"):
+        acc = gl.amd.cdna5.wmma_scaled(a6, as6, "e4m3", b6, bs6, "e4m3", acc)
+    with gl.amd.warp_pipeline_stage("flat_tail_load_7"):
+        a7 = a_buf.index((iter_max - 1) % 2).slice(384, 128, 1).load(layout=dot_a)
+        as7 = _mxfp8_tiled_load_scale(as_buf, (iter_max - 1) % 2, 12, scale_a_layout, a_buf.type.shape[1])
+        b7 = b_buf.index((iter_max - 1) % 2).slice(384, 128, 1).permute([1, 0]).load(layout=dot_b)
+        bs7 = _mxfp8_tiled_load_scale(bs_buf, (iter_max - 1) % 2, 12, scale_b_layout, b_buf.type.shape[1])
+    with gl.amd.warp_pipeline_stage("flat_tail_compute_7"):
+        acc = gl.amd.cdna5.wmma_scaled(a7, as7, "e4m3", b7, bs7, "e4m3", acc)
+        acc = acc.to(c_ptr.type.element_ty)
     a_buf._keep_alive()
     b_buf._keep_alive()
     as_buf._keep_alive()
