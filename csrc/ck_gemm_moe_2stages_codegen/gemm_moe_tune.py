@@ -69,6 +69,7 @@ from aiter.ops.flydsl.moe_kernels import (
 )
 from aiter.ops.flydsl.mxfp4_kname import (
     _parse_mxfp4_g1_kname,
+    parse_flydsl_v2_gemm2_kernel,
     parse_g2_kname_any,
 )
 from aiter.ops.quant import per_1x32_f8_scale_f8_quant, per_1x32_i4_quant
@@ -6470,7 +6471,9 @@ class Mxfp4FlydslTuner(FmoeTuner):
         {"dtype", "q_dtype_a", "q_dtype_w"}
     )
 
-    def run(self, args, fast_mode=False):
+    def run(
+        self, args: "argparse.Namespace", fast_mode: "bool" = False
+    ) -> "pd.DataFrame | None":
         self._mxfp4_output_file = self.get_out_file(args.tune_file)
         self._mxfp4_err_ratio = args.errRatio
         result = super().run(args, fast_mode)
@@ -6481,7 +6484,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
             )
         return result
 
-    def pre_process(self, args):
+    def pre_process(self, args: "argparse.Namespace") -> "None":
         self._mxfp4_run_config = bool(args.run_config)
         super().pre_process(args)
         if args.run_config:
@@ -6512,11 +6515,11 @@ class Mxfp4FlydslTuner(FmoeTuner):
         if shapes and os.environ.get("AITER_REBUILD", "0") != "0":
             # Spawned workers import the JIT layer again. The parent prepared
             # this module; workers reuse it rather than force a shared rebuild.
-            self._mxfp4_aux_rebuild_requested = os.environ["AITER_REBUILD"]
             os.environ["AITER_REBUILD"] = "0"
 
-    @staticmethod
-    def _valid_tuned_mask(tunedf, err_ratio):
+    def _valid_tuned_mask(
+        self, tunedf: "pd.DataFrame", err_ratio: "float"
+    ) -> "pd.Series":
         times = pd.to_numeric(tunedf["us"], errors="coerce")
         valid = times.map(math.isfinite) & times.gt(0)
         for column in ("err1", "err2"):
@@ -6528,23 +6531,56 @@ class Mxfp4FlydslTuner(FmoeTuner):
             valid &= errors.map(math.isfinite) & errors.ge(0) & errors.le(err_ratio)
         if "status" in tunedf:
             valid &= tunedf["status"].fillna("").astype(str).isin(("", "ok"))
+        if not tunedf.empty:
+            valid &= tunedf.apply(self._valid_saved_pair, axis=1)
         return valid
+
+    def _valid_saved_pair(self, row: "dict[str, Any] | pd.Series") -> "bool":
+        try:
+            self._validate_row(row)
+            if any(
+                not isinstance(row[column], str)
+                for column in ("kernelName1", "kernelName2")
+            ):
+                return False
+            g1 = _parse_mxfp4_g1_kname(row["kernelName1"])
+            precision = "fp8" if self._row_precision(row) == "A8W4" else "fp4"
+            if (
+                g1["a_dtype"] != precision
+                or g1["out_dtype"] != precision
+                or g1["act"] != self._row_act(row)
+                or float(row["block_m"]) != g1["BM"]
+            ):
+                return False
+            g2 = parse_flydsl_v2_gemm2_kernel(row["kernelName2"])
+            if g2 is not None:
+                return (
+                    (g2["a_dtype"], g2["b_dtype"], g2["out_dtype"])
+                    == (precision, "fp4", "bf16")
+                    and g1["BM"] == g2["tile_m"]
+                    and g1["BM"] == (g2["sort_block_m"] or g2["tile_m"])
+                )
+            # Native legacy GEMM2 names encode the original FP4 A/W contract.
+            g2_native = parse_g2_kname_any(row["kernelName2"])
+            return precision == "fp4" and g1["BM"] == g2_native["BM"]
+        except (ArgumentTypeError, KeyError, TypeError, ValueError):
+            return False
 
     @staticmethod
     def _g1_kname(
-        bm,
-        use_nt,
-        inline_quant,
-        act="silu",
-        prefetch_hidden=False,
-        bn=256,
-        bk=256,
-        k_wave=1,
-        xcd_swizzle=0,
-        num_waves=4,
-        a_dtype="fp4",
-        out_dtype="fp4",
-    ):
+        bm: "int",
+        use_nt: "bool",
+        inline_quant: "bool",
+        act: "str" = "silu",
+        prefetch_hidden: "bool" = False,
+        bn: "int" = 256,
+        bk: "int" = 256,
+        k_wave: "int" = 1,
+        xcd_swizzle: "int" = 0,
+        num_waves: "int" = 4,
+        a_dtype: "str" = "fp4",
+        out_dtype: "str" = "fp4",
+    ) -> "str":
         # flydsl_mxmoe_g1_a{4,8}w4_<BM>x<BN>x<BK>[_f16in][_hpf][_nt][_fp8out]
         #   [_situv2|_swiglu][_kw<n>][_xcd<n>][_w2];
         # token order must match _parse_mxfp4_g1_kname in mxfp4_kname.py.
@@ -6684,7 +6720,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         return kept
 
     @staticmethod
-    def _row_precision(row):
+    def _row_precision(row: "dict[str, Any] | pd.Series") -> "str":
         a_dtype = _parse_tuning_type(row["q_dtype_a"])
         if a_dtype == dtypes.fp4x2:
             return "A4W4"
@@ -6692,12 +6728,14 @@ class Mxfp4FlydslTuner(FmoeTuner):
             return "A8W4"
         raise ValueError(f"unsupported MXMOE activation dtype {row['q_dtype_a']!r}")
 
-    def _effective_search_mode(self, row, args):
+    def _effective_search_mode(
+        self, row: "dict[str, Any] | pd.Series", args: "argparse.Namespace"
+    ) -> "str":
         return getattr(args, "mxfp4_search_mode", None) or (
             "full" if self._row_precision(row) == "A8W4" else "prune"
         )
 
-    def _validate_row(self, row):
+    def _validate_row(self, row: "dict[str, Any] | pd.Series") -> "None":
         for col in ("token", "model_dim", "inter_dim", "expert", "topk"):
             value = row[col]
             try:
@@ -6733,7 +6771,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
             if value not in (0, 1) or bool(value) != expected:
                 raise ValueError(f"{col} must be {expected}, got {row[col]!r}")
 
-    def get_untuned_gemm_list(self, untuned_gemm_file):
+    def get_untuned_gemm_list(self, untuned_gemm_file: "str") -> "pd.DataFrame":
         if getattr(self, "_mxfp4_run_config", False):
             return super().get_untuned_gemm_list(untuned_gemm_file)
         untunedf = _read_csv(untuned_gemm_file)
@@ -6861,7 +6899,15 @@ class Mxfp4FlydslTuner(FmoeTuner):
         return cands
 
     @staticmethod
-    def _prepare_case(token, model_dim, inter_dim, expert, topk, dtype, a_dtype="fp4"):
+    def _prepare_case(
+        token: "int",
+        model_dim: "int",
+        inter_dim: "int",
+        expert: "int",
+        topk: "int",
+        dtype: "torch.dtype",
+        a_dtype: "str" = "fp4",
+    ) -> "dict[str, Any]":
         q_dtype_a = dtypes.fp8 if a_dtype == "fp8" else dtypes.fp4x2
         data = FmoeTuner.generate_data(
             token,
@@ -7305,7 +7351,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
             results, columns=self.columns + ["status", "failure_reason"]
         )
 
-    def tune_summary(self, status):
+    def tune_summary(self, status: "str") -> "None":
         observed = pd.concat([self.success, self.failed], ignore_index=True)
         observed_keys = set(observed[self.keys].astype(str).apply(tuple, axis=1))
         missing = self.untunedf[
