@@ -396,7 +396,7 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
             q_pe.to(q_out_ptr.dtype.element_ty),
         )
 
-        if OUTPUT_Q_NOPE_ZEROS_AND_Q_PE and pid < num_decode_toks_for_zeros * QH:
+        if OUTPUT_Q_NOPE_ZEROS_AND_Q_PE and pid_b < num_decode_toks_for_zeros:
             decode_q_pe_out_ptrs = (
                 decode_q_pe_out_ptr
                 + pid_b * decode_q_pe_out_stride_b

@@ -260,6 +260,110 @@ def test_fused_qk_rope_cat_and_cache_mla(
     torch.testing.assert_close(torch_k_pe_og_dtype, triton_k_pe, atol=1e-1, rtol=1e-1)
 
 
+# The decode outputs (decode_q_pe_out, q_nope_zeros_out) only cover the first
+# num_decode_toks_for_zeros tokens. Check every (token, head) entry of them for
+# num_decode_toks_for_zeros < T, and that nothing is written past their last row.
+@pytest.mark.parametrize(
+    "T, num_decode_toks_for_zeros",
+    [(5, 2), (8, 3), (4, 1), (128, 37), (128, 127)],
+)
+@pytest.mark.parametrize("QH_per_KH", [4, 16])
+@pytest.mark.parametrize("D_pe, D_lora", [(64, 512)])
+@pytest.mark.parametrize("rotate_style", [RotateStyle.GPTJ, RotateStyle.NEOX])
+def test_fused_qk_rope_cat_and_cache_mla_partial_decode_zeros(
+    T: int,
+    num_decode_toks_for_zeros: int,
+    QH_per_KH: int,
+    D_pe: int,
+    D_lora: int,
+    rotate_style: int,
+):
+    torch.manual_seed(0)
+    dtype = torch.bfloat16
+    KH = 1
+    QH = QH_per_KH * KH
+    num_kv_cache_tokens = 1024
+    _, _, _, _, freqs, positions, _, cos, sin = generate_rope_inputs(
+        1,
+        T,
+        KH,
+        QH_per_KH,
+        D_pe,
+        cached=True,
+        reuse_freqs_front_part=True,
+        nope=False,
+        pos=True,
+        offs=False,
+        two_inputs=True,
+        layout="thd",
+        dtype=dtype,
+    )
+    q_nope = torch.randn((T, QH, D_lora), dtype=dtype, device="cuda")
+    q_pe = torch.randn((T, QH, D_pe), dtype=dtype, device="cuda")
+    k_lora = torch.randn((T, KH, D_lora), dtype=dtype, device="cuda")
+    k_pe = torch.randn((T, KH, D_pe), dtype=dtype, device="cuda")
+    kv_cache = torch.zeros(
+        (num_kv_cache_tokens, KH, D_lora + D_pe), dtype=dtype, device="cuda"
+    )
+    slot_mapping = torch.randperm(T, device="cuda")
+
+    torch_q_pe = ref_rope_sbhd_fwd(
+        q_pe.unsqueeze(0),
+        freqs[positions].squeeze(-2),
+        rotate_style=rotate_style,
+        reuse_freqs_front_part=True,
+        nope_first=False,
+    ).squeeze(0)
+
+    # decode_q_pe_out is a view of the first rows of a NaN-filled buffer; the
+    # extra rows act as guard rows that must stay untouched.
+    num_guard_rows = 2
+    decode_q_pe_buf = torch.full(
+        (num_decode_toks_for_zeros + num_guard_rows, QH, D_pe),
+        float("nan"),
+        dtype=dtype,
+        device="cuda",
+    )
+    decode_q_pe_out = decode_q_pe_buf[:num_decode_toks_for_zeros]
+
+    triton_q, triton_decode_q_pe, _, triton_zeros = fused_qk_rope_cat_and_cache_mla(
+        q_nope,
+        q_pe,
+        k_lora,
+        k_pe,
+        kv_cache,
+        slot_mapping,
+        positions,
+        cos,
+        sin,
+        None,
+        (rotate_style == RotateStyle.NEOX),
+        num_decode_toks_for_zeros=num_decode_toks_for_zeros,
+        decode_q_pe_out=decode_q_pe_out,
+    )
+
+    torch.testing.assert_close(
+        torch.cat((q_nope, torch_q_pe), dim=-1), triton_q, atol=1e-1, rtol=1e-1
+    )
+    torch.testing.assert_close(
+        torch_q_pe[:num_decode_toks_for_zeros],
+        triton_decode_q_pe,
+        atol=1e-1,
+        rtol=1e-1,
+    )
+    torch.testing.assert_close(
+        torch.zeros(
+            (num_decode_toks_for_zeros, QH, D_lora), dtype=dtype, device="cuda"
+        ),
+        triton_zeros,
+        atol=0,
+        rtol=0,
+    )
+    assert torch.isnan(
+        decode_q_pe_buf[num_decode_toks_for_zeros:]
+    ).all(), "decode_q_pe_out written past num_decode_toks_for_zeros rows"
+
+
 @pytest.mark.parametrize("T", [1, 8, 2048])
 @pytest.mark.parametrize("QH_per_KH", [16])
 @pytest.mark.parametrize("KH", [8])
