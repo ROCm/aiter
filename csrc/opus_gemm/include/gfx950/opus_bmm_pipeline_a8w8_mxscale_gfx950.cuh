@@ -108,7 +108,7 @@ OPUS_D void mma_scale_accum(Mma& mma, const VA& v_a, const VB& v_b,
 // Kernel definition visible on both passes (host pass needs it for stub generation).
 // ============================================================================
 
-template<typename Traits, bool K1024_ONLY, bool PRELOAD_SFA_LDS = false,
+template<typename Traits, bool PRELOAD_SFA_LDS = false,
          bool PRELOAD_SFB_LDS = false>
 __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_kargs_gfx950 kargs) {
 #ifdef __HIP_DEVICE_COMPILE__
@@ -325,10 +325,6 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
     constexpr int SFA_VM = PRELOAD_SFA_LDS ? 0 : T::sfa_buffer_load_insts;
     constexpr int SFB_VM = PRELOAD_SFB_LDS ? 0 : T::sfb_buffer_load_insts;
 
-    if constexpr (K1024_ONLY) {
-        static_assert(T::B_K == 128, "K1024_ONLY expects eight 128-wide K tiles");
-        if (kargs.k != 1024) return;
-    }
     // Bailing out here would overrun the LDS panels below, so the guard stays --
     // but it must not be the only one: returning leaves Y untouched, which the
     // caller cannot tell from a computed answer (a zeroed output tensor looks
@@ -340,7 +336,7 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
     if constexpr (PRELOAD_SFB_LDS) {
         if (kargs.k > SFB_K_MAX || (kargs.k % T::B_K) != 0) return;
     }
-    const int loops = K1024_ONLY ? 8 : ceil_div(kargs.k, T::B_K);
+    const int loops = ceil_div(kargs.k, T::B_K);
     int tic = 0, toc = 1;
 
     // kid158: issue the B-scale fetch before the A panel fill so the two global round
@@ -693,29 +689,7 @@ template<typename Traits>
 __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_scale_kernel(opus_gemm_scale_kargs_gfx950 kargs) {
 #ifdef __HIP_DEVICE_COMPILE__
 #if defined(__gfx950__)
-    gemm_a8w8_scale_kernel_impl<Traits, false>(kargs);
-#else
-    // Non-gfx950 device pass: empty stub.
-#endif // __gfx950__
-#endif // __HIP_DEVICE_COMPILE__
-}
-
-template<typename Traits>
-__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_scale_k1024_kernel(opus_gemm_scale_kargs_gfx950 kargs) {
-#ifdef __HIP_DEVICE_COMPILE__
-#if defined(__gfx950__)
-    gemm_a8w8_scale_kernel_impl<Traits, true>(kargs);
-#else
-    // Non-gfx950 device pass: empty stub.
-#endif // __gfx950__
-#endif // __HIP_DEVICE_COMPILE__
-}
-
-template<typename Traits>
-__global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void gemm_a8w8_scale_k1024_lb1_kernel(opus_gemm_scale_kargs_gfx950 kargs) {
-#ifdef __HIP_DEVICE_COMPILE__
-#if defined(__gfx950__)
-    gemm_a8w8_scale_kernel_impl<Traits, true>(kargs);
+    gemm_a8w8_scale_kernel_impl<Traits>(kargs);
 #else
     // Non-gfx950 device pass: empty stub.
 #endif // __gfx950__
@@ -731,7 +705,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2)
 void gemm_a8w8_scale_preload_sf_kernel(opus_gemm_scale_kargs_gfx950 kargs) {
 #ifdef __HIP_DEVICE_COMPILE__
 #if defined(__gfx950__)
-    gemm_a8w8_scale_kernel_impl<Traits, false, true, true>(kargs);
+    gemm_a8w8_scale_kernel_impl<Traits, true, true>(kargs);
 #endif // __gfx950__
 #endif // __HIP_DEVICE_COMPILE__
 }

@@ -10,3 +10,14 @@ struct opus_bmm_mxscale_compact_traits_gfx950
     static constexpr int WM = WM_, WN = WN_, NB = NB_, BLOCK_SIZE = WM * WN * 64;
     static constexpr bool NT = NT_, EARLY_B = EARLY_B_;
 };
+
+// Only the fields consumed by compact BMM; dimensions remain runtime values.
+struct opus_bmm_compact_kargs_gfx950 {
+    const void* __restrict__ ptr_a;
+    const void* __restrict__ ptr_b;
+    void* __restrict__ ptr_c;
+    const void* __restrict__ ptr_sfa;
+    const void* __restrict__ ptr_sfb;
+    int m, n, k, batch;
+};
+static_assert(sizeof(opus_bmm_compact_kargs_gfx950) == 56);

@@ -144,13 +144,9 @@ _TUNE_POLICY = {
     # panel into LDS.
     8149: [1],
     8150: [1],
-    8151: [1],
-    8152: [1],
     8158: [1],
     149: [1],
     150: [1],
-    151: [1],
-    152: [1],
     158: [1],
     # kid158's scale preload at the two half tiles. Narrow-N wo_a (n1024) gives
     # the 256x256 tile only 4 N-tiles, so mid-M shapes leave half the CUs idle;
@@ -321,7 +317,7 @@ def _globalise_policy(policy):
     }
 
 
-# All seven production compact schedules enter both policy and exhaustive sweeps.
+# All registered compact schedules enter both policy and exhaustive sweeps.
 _TUNE_POLICY.update(
     {
         kid: [1]

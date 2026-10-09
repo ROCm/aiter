@@ -706,8 +706,6 @@ def _build_a8w8_mxscale_bmm_plan(
         raise ValueError(
             f"OPUS BMM kid {resolved_kid} requires K % {k_align} == 0; got K={K}"
         )
-    if (instance.k1024_only or instance.k1024_lb1) and K != 1024:
-        raise ValueError(f"OPUS BMM kid {resolved_kid} requires K == 1024; got K={K}")
     if instance.direct_only and abi_split_k != 1:
         raise ValueError(f"OPUS BMM kid {resolved_kid} requires split_k <= 1")
 

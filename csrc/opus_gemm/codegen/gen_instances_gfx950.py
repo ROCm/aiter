@@ -2428,7 +2428,7 @@ _BMM_SPEC_KARGS = r"""
 """
 
 
-# Compact family: fixed fast path plus a bounded, segmented general N/K path.
+# Compact family: one runtime-dimension path with bounded K segments.
 _BMM_COMPACT_LAUNCHER_BODY = (
     _BMM_SPEC_SIG.replace("@@SPLITK_ARG@@", "splitK")
     + r"""  AITER_CHECK(splitK == 0 || splitK == 1, "@@NAME@@ requires splitK <= 1");
@@ -2457,22 +2457,23 @@ _BMM_COMPACT_LAUNCHER_BODY = (
               reinterpret_cast<uintptr_t>(w_scale.data_ptr()) % 4 == 0,
               "@@NAME@@ requires 16-byte A/B/Y alignment and 4-byte scale alignment");
 """
-    + _BMM_SPEC_KARGS
+    + r"""
+  auto stream = aiter::getCurrentHIPStream();
+
+  opus_bmm_compact_kargs_gfx950 kargs{};
+  kargs.ptr_a = O.data_ptr(); kargs.ptr_b = wo_a.data_ptr();
+  kargs.ptr_c = Y.data_ptr();
+  kargs.ptr_sfa = x_scale.data_ptr(); kargs.ptr_sfb = w_scale.data_ptr();
+  kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = batch;
+"""
     + r"""
   const int tiles = (M + Traits::B_M - 1) / Traits::B_M * (N / Traits::B_N);
   dim3 grid_main((tiles * batch + 7) / 8 * 8);
   dim3 block_main(Traits::BLOCK_SIZE);
-  if (Y.dtype() == AITER_DTYPE_bf16) {
-    if (N == 1024 && K == 4096)
-      @@KERNEL@@<Traits, __bf16><<<grid_main, block_main, 0, stream>>>(kargs);
-    else
-      @@KERNEL@@_general<Traits, __bf16><<<grid_main, block_main, 0, stream>>>(kargs);
-  } else {
-    if (N == 1024 && K == 4096)
-      @@KERNEL@@<Traits, float><<<grid_main, block_main, 0, stream>>>(kargs);
-    else
-      @@KERNEL@@_general<Traits, float><<<grid_main, block_main, 0, stream>>>(kargs);
-  }
+  if (Y.dtype() == AITER_DTYPE_bf16)
+    @@KERNEL@@<Traits, __bf16><<<grid_main, block_main, 0, stream>>>(kargs);
+  else
+    @@KERNEL@@<Traits, float><<<grid_main, block_main, 0, stream>>>(kargs);
 }
 #endif
 """
@@ -2494,11 +2495,11 @@ def gen_bmm_mxscale_compact_instance(
     instance_impl_host_tu_split,
     **_unused,
 ):
+    kargs_name = "opus_bmm_compact_kargs_gfx950"
     _, tpl, fn = kargs_template_vars(k.kernel_tag, kargs_name)
     launcher = _BMM_COMPACT_LAUNCHER_BODY.replace("@@NAME@@", k.name).replace(
         "@@KERNEL@@", kernel_func
     )
-    device_begin = len(cg._device_instantiations)
     _emit_bmm_specialized(
         cg,
         k,
@@ -2510,23 +2511,10 @@ def gen_bmm_mxscale_compact_instance(
         instance_impl_preamble(),
         instance_impl_host_tu_split(
             traits_header, pipeline_header, tpl, kernel_func, fn
-        )
-        + (
-            f"\n#ifdef OPUS_FUSED_HOST_TU\n"
-            f"template<typename Traits, typename D_OUT>\n"
-            f"__global__ void {kernel_func}_general({kargs_name} kargs);\n"
-            f"#endif\n"
         ),
         launcher,
         "",
     )
-    # Emit both bodies in each compact dtype TU, retaining the fast symbol.
-    for record in cg._device_instantiations[device_begin:]:
-        d_out = "__bf16" if record["dtype"] == "bf16" else "float"
-        record["device_decl"] += (
-            f"template __global__ void {kernel_func}_general<\n"
-            f"    {k.name}_Traits, {d_out}>({kargs_name});\n"
-        )
 
 
 # ---- wave8n2 (kid 132) ----
@@ -2904,7 +2892,7 @@ void
               "@@NAME@@ requires N % ", Bf16Traits::B_N, " == 0, got ", N);
   AITER_CHECK(K % Bf16Traits::B_K == 0,
               "@@NAME@@ requires K % ", Bf16Traits::B_K, " == 0, got ", K);
-@@K1024_CHECK@@
+@@PRELOAD_CHECK@@
   opus_gemm_scale_kargs_gfx950 kargs{};
   kargs.ptr_a = O.data_ptr();
   kargs.ptr_b = wo_a.data_ptr();
@@ -2972,24 +2960,16 @@ def gen_bmm_mxscale_pipeline_instance(
 ):
     if k.preload_sf_lds:
         real_kernel = "gemm_a8w8_scale_preload_sf_kernel"
-    elif k.k1024_lb1:
-        real_kernel = "gemm_a8w8_scale_k1024_lb1_kernel"
-    elif k.k1024_only:
-        real_kernel = "gemm_a8w8_scale_k1024_kernel"
     else:
         real_kernel = "gemm_a8w8_scale_kernel"
 
     _, tpl, fn = kargs_template_vars(k.kernel_tag, kargs_name)
-    k1024_check = ""
-    if k.k1024_only or k.k1024_lb1:
-        k1024_check = (
-            f'  AITER_CHECK(K == 1024, "{k.name} requires K == 1024, got ", K);\n'
-        )
-    elif k.preload_sf_lds:
+    preload_check = ""
+    if k.preload_sf_lds:
         # The kernel returns without writing Y when K exceeds the LDS scale
         # panel, which a caller reads as a GEMM that produced zeros. Check the
         # traits bound here so it raises instead.
-        k1024_check = (
+        preload_check = (
             "  AITER_CHECK(K <= Bf16Traits::SF_PRELOAD_K_MAX,\n"
             f'              "{k.name} preloads the scale panel into LDS and '
             'so requires K <= ", Bf16Traits::SF_PRELOAD_K_MAX, ", got ", K);\n'
@@ -2997,7 +2977,7 @@ def gen_bmm_mxscale_pipeline_instance(
     launcher = (
         _BMM_PIPELINE_LAUNCHER_BODY.replace("@@NAME@@", k.name)
         .replace("@@KERNEL@@", real_kernel)
-        .replace("@@K1024_CHECK@@", k1024_check)
+        .replace("@@PRELOAD_CHECK@@", preload_check)
     )
 
     traits_aliases = _bmm_pipeline_dual_traits_alias(k, traits_name)

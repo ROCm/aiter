@@ -178,8 +178,6 @@ class OpusGemmInstance:
     workspace_preload_sf: bool | None = None
     skip_scale_wait: bool = False
     pack_scale_on_demand: bool = False
-    k1024_only: bool = False
-    k1024_lb1: bool = False
     preload_sf_lds: bool = False
     name_root: str = "opus_gemm"
 
@@ -343,11 +341,7 @@ class OpusGemmInstance:
             parts.append(f"wgpcu{self.WG_PER_CU}")
         elif self.kernel_tag == "a8w8_mxscale_bmm_pipeline":
             parts.insert(tag_at, "a8w8_mxscale_pipeline")
-            if self.k1024_only:
-                parts.append("k1024")
-            elif self.k1024_lb1:
-                parts.append("k1024lb1")
-            elif self.preload_sf_lds:
+            if self.preload_sf_lds:
                 parts.append("preload_sf")
         elif self.kernel_tag == "a8w8_mxscale_bmm_pipeline_bpreshuffle":
             # opus_bmm_a8w8_mxscale_pipeline_bpreshuffle_<geom>[_preload_sf].
@@ -1618,8 +1612,6 @@ def _a8w8_mxscale_bmm_pipeline(**flags):
 _bmm_pipeline_local = {
     149: _a8w8_mxscale_bmm_pipeline(B_M=128),
     150: _a8w8_mxscale_bmm_pipeline(),
-    151: _a8w8_mxscale_bmm_pipeline(k1024_only=True),
-    152: _a8w8_mxscale_bmm_pipeline(k1024_lb1=True),
     158: _a8w8_mxscale_bmm_pipeline(preload_sf_lds=True),
     # kid159 uses preloaded scales at the half-M tile.
     159: _a8w8_mxscale_bmm_pipeline(B_M=128, preload_sf_lds=True),
