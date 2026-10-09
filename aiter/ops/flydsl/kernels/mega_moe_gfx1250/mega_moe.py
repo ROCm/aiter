@@ -1595,14 +1595,19 @@ class MegaMoEGfx1250:
         # the cco window into tokoff-ext memory, and selfFirst, which follows
         # from where the word lives. A mori from before selfFirst has neither
         # helper and rejects the kwarg; its op layer kept tokoff-ext on unless
-        # MORI_EP_TOKOFF_EXT=0/false/no/off.
+        # MORI_EP_TOKOFF_EXT=0/false/no/off. A mori from #726 on dropped
+        # self_first_enabled and takes tok_off_ext instead.
         from mori.ops.dispatch_combine_v2.hip_backend import TokOffExt
+        from mori.ops.dispatch_combine_v2 import ep_plans
 
         if hasattr(TokOffExt, "wanted"):
-            from mori.ops.dispatch_combine_v2.ep_plans import self_first_enabled
-
             tokoff_ext = TokOffExt.wanted(config.world_size)
-            self_first_kw = {"self_first": int(self_first_enabled(not tokoff_ext))}
+            if hasattr(ep_plans, "self_first_enabled"):
+                self_first_kw = {
+                    "self_first": int(ep_plans.self_first_enabled(not tokoff_ext))
+                }
+            else:
+                self_first_kw = {"tok_off_ext": int(tokoff_ext)}
         else:
             env = os.environ.get("MORI_EP_TOKOFF_EXT", "1").strip().lower()
             tokoff_ext = env not in ("0", "false", "no", "off")
