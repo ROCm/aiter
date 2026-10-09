@@ -859,7 +859,27 @@ def fused_moe(
     quant_type_a: QuantType | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    fp4_format: str = "mxfp4",
+    w1_global_scale: torch.Tensor | None = None,
+    w2_global_scale: torch.Tensor | None = None,
+    a1_global_scale: torch.Tensor | None = None,
+    a2_global_scale: torch.Tensor | None = None,
 ):
+    """Run fused MoE, selecting MXFP4 or NVFP4 explicitly for FP4 inputs.
+
+    ``fp4_format="mxfp4"`` preserves the existing dispatch. ``"nvfp4"`` selects
+    local-expert FlyDSL on gfx1250 with BF16 activations, preshuffled FP4 weights,
+    and K16 E4M3 ``w1_scale`` / ``w2_scale``. The four ``*_global_scale`` inputs
+    are FP32 dequantization factors, scalar or per expert; ``w1_global_scale``
+    also accepts [experts, 2] for separate gate/up factors. NVFP4 requires
+    ``gate_mode="interleave"`` and uses its format's quantization granularity.
+    """
+    if fp4_format not in ("mxfp4", "nvfp4"):
+        raise ValueError(f"unsupported fp4_format: {fp4_format!r}")
+    if fp4_format == "nvfp4" and (
+        shared_w1 is not None or shared_w2 is not None or shared_expert_id != -1
+    ):
+        raise ValueError("NVFP4 does not support fused shared experts")
     if (
         any(
             tensor is not None
@@ -949,6 +969,11 @@ def fused_moe(
         quant_type_a=None if quant_type_a is None else quant_type_a.value,
         quant_dtype_a=quant_dtype_a,
         quant_dtype_a2=quant_dtype_a2,
+        fp4_format=fp4_format,
+        w1_global_scale=w1_global_scale,
+        w2_global_scale=w2_global_scale,
+        a1_global_scale=a1_global_scale,
+        a2_global_scale=a2_global_scale,
     )
 
 
@@ -991,6 +1016,11 @@ def fused_moe_fake(
     quant_type_a: int | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    fp4_format: str = "mxfp4",
+    w1_global_scale: torch.Tensor | None = None,
+    w2_global_scale: torch.Tensor | None = None,
+    a1_global_scale: torch.Tensor | None = None,
+    a2_global_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, _topk = topk_ids.shape
@@ -1052,6 +1082,11 @@ def fused_moe_(
     quant_type_a: int | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    fp4_format: str = "mxfp4",
+    w1_global_scale: torch.Tensor | None = None,
+    w2_global_scale: torch.Tensor | None = None,
+    a1_global_scale: torch.Tensor | None = None,
+    a2_global_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     stage2_scatter = None
     if ep_source_token_map is not None:
@@ -1095,6 +1130,11 @@ def fused_moe_(
         quant_type_a=quant_type_a,
         quant_dtype_a=quant_dtype_a,
         quant_dtype_a2=quant_dtype_a2,
+        fp4_format=fp4_format,
+        w1_global_scale=w1_global_scale,
+        w2_global_scale=w2_global_scale,
+        a1_global_scale=a1_global_scale,
+        a2_global_scale=a2_global_scale,
     )
 
 
@@ -1129,6 +1169,11 @@ def _fused_moe_impl(
     quant_type_a: int | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    fp4_format: str = "mxfp4",
+    w1_global_scale: torch.Tensor | None = None,
+    w2_global_scale: torch.Tensor | None = None,
+    a1_global_scale: torch.Tensor | None = None,
+    a2_global_scale: torch.Tensor | None = None,
     *,
     _q_dtype_a: torch.dtype | None = None,
     _metadata_transform: Callable | None = None,
@@ -1137,6 +1182,68 @@ def _fused_moe_impl(
     _stage2_extra_args: dict | None = None,
     _stage2_override: Callable | None = None,
 ) -> torch.Tensor:
+    if fp4_format == "nvfp4":
+        from aiter.ops.flydsl.grouped_moe_gfx1250 import grouped_gemm_gfx1250_a8w4
+
+        if (
+            expert_mask is not None
+            or stage2_scatter is not None
+            or num_local_tokens is not None
+            or doweight_stage1
+            or hidden_pad
+            or intermediate_pad
+            or a1_scale is not None
+            or a2_scale is not None
+        ):
+            raise ValueError("NVFP4 requires local experts and unpadded BF16 input")
+        if (
+            get_gfx() != "gfx1250"
+            or hidden_states.dtype != torch.bfloat16
+            or dtype not in (None, torch.bfloat16)
+            or GateMode(gate_mode) != GateMode.INTERLEAVE
+        ):
+            raise ValueError("NVFP4 requires gfx1250, BF16, and gate_mode='interleave'")
+        if ActivationType(activation) not in (
+            ActivationType.Silu,
+            ActivationType.Swiglu,
+        ):
+            raise ValueError("NVFP4 supports SiLU and SwiGLU")
+        ret = grouped_gemm_gfx1250_a8w4(
+            hidden_states,
+            w1,
+            w2,
+            topk_weight,
+            topk_ids,
+            E=w2.shape[0],
+            model_dim=w2.shape[1],
+            inter_dim=w2.shape[2] * 2,
+            dtype=torch.bfloat16,
+            activation=ActivationType(activation),
+            quant_type=QuantType.per_1x32,
+            q_dtype_a=dtypes.fp4x2,
+            q_dtype_w=dtypes.fp4x2,
+            isG1U1=True,
+            doweight_stage1=False,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            expert_mask=None,
+            hidden_pad=0,
+            intermediate_pad=0,
+            bias1=bias1,
+            bias2=bias2,
+            swiglu_limit=swiglu_limit,
+            nvfp4_scales=(
+                w1_global_scale,
+                w2_global_scale,
+                a1_global_scale,
+                a2_global_scale,
+            ),
+        )
+        if ret is None:
+            raise ValueError("NVFP4 requires the FlyDSL grouped GEMM path")
+        _validate_output_buffer_metadata(output, ret.shape, ret.dtype, ret.device)
+        _validate_output_buffer_no_overlap(output, hidden_states)
+        return _return_output(ret, output)
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
     quant_type = QuantType(quant_type)

@@ -139,6 +139,9 @@ def flydsl_grouped_gemm_a8w4_masked(
     row_major_ascale=0,
     a_row_stride_bytes=0,
     a_scale_row_stride_bytes=0,
+    nvfp4=False,
+    gemm_alpha=None,
+    quant_global_scale=None,
 ):
     """Launches a contiguous-M grouped a8w4 GEMM on the TDM kernel."""
     from .kernels.mxfp4_preshuffle_gfx1250_tdm import launch_gemm_a8w4_tdm
@@ -230,5 +233,10 @@ def flydsl_grouped_gemm_a8w4_masked(
         a_row_stride_bytes=int(a_row_stride_bytes),
         a_scale_row_stride_bytes=int(a_scale_row_stride_bytes),
         lds_soa_load_interleave=int(lds_soa_load_interleave),
+        nvfp4=int(nvfp4),
+        arg_gemm_alpha=gemm_alpha if gemm_alpha is not None else out,
+        arg_quant_global_scale=(
+            quant_global_scale if quant_global_scale is not None else out
+        ),
     )
     return out

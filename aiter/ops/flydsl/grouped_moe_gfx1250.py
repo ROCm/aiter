@@ -544,6 +544,18 @@ def get_wmma_m_rep(
     return tile_m // m_warp // wmma_m
 
 
+def _nvfp4_global_scale(scale, experts, device, *, gate_up=False):
+    """Normalize positive FP32 decode factors without a device synchronization."""
+    if scale is None or scale.dtype != torch.float32 or scale.device != device:
+        raise ValueError("NVFP4 global scales must be FP32 on the input device")
+    if gate_up and tuple(scale.shape) == (experts, 2):
+        return scale.contiguous()
+    if scale.numel() not in (1, experts):
+        raise ValueError("NVFP4 global scales must be scalar or per expert")
+    scale = scale.reshape(-1).expand(experts)
+    return (scale[:, None].expand(experts, 2) if gate_up else scale).contiguous()
+
+
 def _grouped_a8w4_tdm_moe(
     hidden_states,
     w1,
@@ -591,6 +603,7 @@ def _grouped_a8w4_tdm_moe(
     situ_beta=1.0,
     situ_linear_beta=1.0,
     a1_scale=None,
+    nvfp4_scales=None,
 ):
     import functools
 
@@ -602,6 +615,71 @@ def _grouped_a8w4_tdm_moe(
         flydsl_moe_fused_quant_preshuffle,
         flydsl_moe_topids_to_rows,
     )
+
+    nvfp4 = nvfp4_scales is not None
+    quantize = flydsl_moe_fused_quant_preshuffle
+    nvfp4_gemm1, nvfp4_gemm2 = {}, {}
+    if nvfp4:
+        from aiter.ops.flydsl.kernels.nvfp4_quant import launch_nvfp4_quant
+
+        wg1, wg2, ag1, ag2 = nvfp4_scales
+        wg1 = _nvfp4_global_scale(wg1, E, hidden_states.device, gate_up=True)
+        wg2 = _nvfp4_global_scale(wg2, E, hidden_states.device)
+        ag1 = _nvfp4_global_scale(ag1, E, hidden_states.device)
+        ag2 = _nvfp4_global_scale(ag2, E, hidden_states.device)
+        for scale, rows, cols in (
+            (w1_scale, 2 * inter_dim, model_dim),
+            (w2_scale, model_dim, inter_dim),
+        ):
+            if (
+                scale is None
+                or scale.dtype not in (torch.uint8, torch.float8_e4m3fn)
+                or scale.numel() != E * rows * cols // 16
+                or not scale.is_contiguous()
+            ):
+                raise ValueError("NVFP4 requires preshuffled K16 E4M3 weight scales")
+        nvfp4_gemm1 = dict(
+            nvfp4=True, gemm_alpha=ag1[:, None] * wg1, quant_global_scale=ag2
+        )
+        nvfp4_gemm2 = dict(nvfp4=True, gemm_alpha=ag2 * wg2)
+
+        def quantize(
+            source,
+            _groups,
+            rows,
+            *,
+            wmma_rep,
+            topids_to_rows,
+            source_topk=0,
+            out_payload=None,
+            out_scale=None,
+            **_unused,
+        ):
+            features = source.shape[-1]
+            if out_payload is None:
+                out_payload = torch.empty(
+                    (1, rows, features // 2), dtype=torch.uint8, device=source.device
+                )
+            if out_scale is None:
+                out_scale = torch.empty(
+                    rows * features // 16, dtype=torch.uint8, device=source.device
+                )
+            launch_nvfp4_quant(
+                source,
+                out_payload,
+                out_scale,
+                ag1 if source_topk else ag2,
+                topids_to_rows if source_topk else psum,
+                topk_ids,
+                psum,
+                token_num * source_topk if source_topk else rows,
+                features,
+                wmma_rep,
+                source_topk,
+                E,
+                torch.cuda.current_stream(),
+            )
+            return out_payload, out_scale
 
     device = hidden_states.device
     token_num, topk = topk_ids.shape
@@ -874,7 +952,11 @@ def _grouped_a8w4_tdm_moe(
         if swiglu_limit
         else (7.0 if activation == ActivationType.Swiglu else float("inf"))
     )
-    _situ_kw = {"situ_beta": situ_beta, "situ_linear_beta": situ_linear_beta}
+    _situ_kw = {
+        "situ_beta": situ_beta,
+        "situ_linear_beta": situ_linear_beta,
+        **nvfp4_gemm1,
+    }
     _b1 = (
         bias1.to(dtype).contiguous()
         if (bias1 is not None and bias1.numel() > 0)
@@ -927,7 +1009,8 @@ def _grouped_a8w4_tdm_moe(
     # 4 B per cache line. A compact plan drives the GEMM off recv rows and passes
     # dummy topk_ids, so its token count cannot size a per-token scale buffer.
     _compact_ascale = (
-        not _compact
+        not nvfp4
+        and not _compact
         and not _prequantized
         and _ep_nvr is None
         and _use_fused_quant_preshuffle(
@@ -977,7 +1060,7 @@ def _grouped_a8w4_tdm_moe(
             slot_stride=int(stage2_scatter.max_tokens_per_rank) * int(topk),
         )
     else:
-        a1_payload, a1_scale = flydsl_moe_fused_quant_preshuffle(
+        a1_payload, a1_scale = quantize(
             hidden_states.reshape(1, token_num, _src_width),
             1,
             contiguous_m,
@@ -1016,7 +1099,7 @@ def _grouped_a8w4_tdm_moe(
         # Pre-allocate MX payload + preshuffled e8m0 scale for gemm1 output.
         # These are written directly by the kernel's fused quant epilogue.
         payload_bytes = inter_dim // 2 if _is_fp4 else inter_dim
-        scale_bytes = inter_dim // 32  # one e8m0 byte per 32-element MX block
+        scale_bytes = inter_dim // (16 if nvfp4 else 32)
         a2_payload = torch.empty(
             (1, contiguous_m, payload_bytes), dtype=torch.uint8, device=device
         )
@@ -1102,7 +1185,7 @@ def _grouped_a8w4_tdm_moe(
             a_scale_row_stride_bytes=_a1_wire_stride,
             **_situ_kw,
         )
-        a2_payload, a2_scale = flydsl_moe_fused_quant_preshuffle(
+        a2_payload, a2_scale = quantize(
             y,
             1,
             contiguous_m,
@@ -1144,6 +1227,7 @@ def _grouped_a8w4_tdm_moe(
         tdm_b_th=tdm_b_th,
         lds_soa_load_interleave=lds_soa_load_interleave,
         **_ep_gemm2_kwargs,
+        **nvfp4_gemm2,
     )
 
     if kernel_bench_callable is not None:
@@ -1151,7 +1235,7 @@ def _grouped_a8w4_tdm_moe(
             (
                 "quant_a1",
                 functools.partial(
-                    flydsl_moe_fused_quant_preshuffle,
+                    quantize,
                     hidden_states.reshape(1, token_num, _src_width),
                     1,
                     contiguous_m,
@@ -1172,7 +1256,7 @@ def _grouped_a8w4_tdm_moe(
                 (
                     "quant_a2",
                     functools.partial(
-                        flydsl_moe_fused_quant_preshuffle,
+                        quantize,
                         y,
                         1,
                         contiguous_m,
@@ -1296,6 +1380,7 @@ def _grouped_a8w4_tdm_moe(
                     tdm_as_in_prologue=tdm_as_in_prologue,
                     tdm_b_th=tdm_b_th,
                     lds_soa_load_interleave=lds_soa_load_interleave,
+                    **nvfp4_gemm2,
                 ),
             )
         )
@@ -1359,6 +1444,7 @@ def grouped_gemm_gfx1250_a8w4(
     situ_linear_beta: float = 1.0,
     stage2_scatter: Stage2ScatterContext | None = None,
     a1_scale: torch.Tensor | None = None,
+    nvfp4_scales=None,
 ):
     """Grouped a8w4/a4w4 MoE on the TDM batched GEMM (gfx1250).
 
@@ -1655,6 +1741,7 @@ def grouped_gemm_gfx1250_a8w4(
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
             a1_scale=a1_scale,
+            nvfp4_scales=nvfp4_scales,
             **_tdm_kw,
         )
 

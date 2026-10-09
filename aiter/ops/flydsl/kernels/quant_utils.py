@@ -317,6 +317,47 @@ def emit_amax_e8m0_native_scale(
     return scale_f32, e8m0_byte
 
 
+def emit_nvfp4_scale(values, global_scale, *, peer_lane=None):
+    """Return the reciprocal decode scale and E4M3 byte for a K16 block.
+
+    ``global_scale`` is the FP32 dequantization factor, not its reciprocal.
+    ``peer_lane`` joins two lanes when each owns half of the block.
+    """
+    level = [abs(fx.Float32(value)) for value in values]
+    while len(level) > 1:
+        level = [
+            (
+                fx.Float32(arith.maxnumf(level[i], level[i + 1]))
+                if i + 1 < len(level)
+                else level[i]
+            )
+            for i in range(0, len(level), 2)
+        ]
+    amax = level[0]
+    if peer_lane is not None:
+        peer = _raw(amax).shuffle_xor(fx.Int32(peer_lane), fx.Int32(32))
+        amax = fx.Float32(arith.maxnumf(amax, peer))
+    unrounded = amax / (fx.Float32(global_scale) * fx.Float32(6.0))
+    unrounded = fx.Float32(arith.minnumf(unrounded, fx.Float32(448.0)))
+    packed = rocdl.cvt_pk_fp8_f32(
+        T.i32, _raw(unrounded), _raw(unrounded), _raw(fx.Int32(0)), False
+    )
+    # Quantize the payload using the rounded scale that WMMA will consume.
+    # gfx1250 has no packed FP8-to-F32 conversion. Decode the positive,
+    # finite E4M3 scale with integer fields, including its subnormal range.
+    byte = fx.Int32(packed) & 0xFF
+    exponent = byte >> 3
+    mantissa = byte & 7
+    normal = ((exponent + 120) << 23 | (mantissa << 20)).bitcast(fx.Float32)
+    subnormal = mantissa.to(fx.Float32) * fx.Float32(2.0**-9)
+    rounded = (exponent != 0).select(normal, subnormal)
+    decode_scale = rounded * fx.Float32(global_scale)
+    reciprocal = (decode_scale > fx.Float32(0.0)).select(
+        fx.Float32(1.0) / decode_scale, fx.Float32(0.0)
+    )
+    return reciprocal, arith.trunci(T.i8, packed)
+
+
 def emit_cvt_scalef32_pk8_fp8_f32(src_v8f32, scale_f32, *, v2i32_ty, rocdl):
     """Native gfx1250 ``v_cvt_scalef32_pk8_fp8_f32``: 8 f32 -> 8 fp8 e4m3.
 

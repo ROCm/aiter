@@ -3,13 +3,14 @@
 
 """gfx1250 grouped MoE GEMM tests through ``aiter.fused_moe``.
 
-Two formats covered:
+Three formats covered:
 
 * **a4w4** -- MXFP4 activations × MXFP4 weights (``w1.dtype = fp4x2``).
 * **a8w4** -- MXFP8 activations × MXFP4 weights (``w1.dtype = uint8``).
+* **nvfp4** -- FP4 with K16 E4M3 scales and FP32 global factors, selected with
+  ``fused_moe(..., fp4_format="nvfp4")``.
 
-Both go through the public ``fused_moe`` API; we never call the underlying
-grouped GEMM launcher directly. The grouped path is opted-in via the
+All formats go through ``fused_moe``. The grouped path is opted-in via the
 ``AITER_USE_GROUPED_GEMM=1`` env (set automatically by the runner below).
 
 Pytest covers a small correctness case for each format. Direct execution
@@ -149,8 +150,56 @@ def _torch_moe_ref(
     swiglu_limit: float,
     situ_beta: float,
     situ_linear_beta: float,
+    nvfp4_scales=None,
 ) -> torch.Tensor:
     """Two-stage MoE reference reusing ``aiter.fused_moe.torch_moe_stage{1,2}``."""
+    if data_format == "nvfp4":
+        wg1, wg2, ag1, ag2 = nvfp4_scales
+        inter = w2_packed.shape[-1] * 2
+        result = torch.zeros_like(hidden, dtype=torch.float32)
+
+        def qdq(values, global_scale):
+            blocks = values.float().reshape(*values.shape[:-1], -1, 16)
+            scales = (blocks.abs().amax(-1) / (6 * global_scale)).clamp(max=448)
+            decode = scales.to(torch.float8_e4m3fn).float() * global_scale
+            reciprocal = torch.where(decode > 0, decode.reciprocal(), 0.0)
+            packed = fp4_utils.f32_to_mxfp4(
+                (blocks * reciprocal.unsqueeze(-1)).reshape_as(values)
+            )
+            decoded = fp4_utils.mxfp4_to_f32(packed).reshape_as(blocks)
+            return (decoded * decode.unsqueeze(-1)).reshape_as(values)
+
+        for expert in range(w1_packed.shape[0]):
+            token, route = torch.where(topk_id == expert)
+            if token.numel() == 0:
+                continue
+            first = fp4_utils.mxfp4_to_f32(w1_packed[expert]).reshape(2 * inter, -1, 16)
+            first *= w1_scale_raw[expert].float().unsqueeze(-1)
+            first = (
+                first.reshape(2 * inter, -1)
+                * wg1[expert].repeat_interleave(inter)[:, None]
+            )
+            accum = qdq(hidden[token], ag1[expert]) @ first.T
+            accum += w1_bias[expert].to(torch.bfloat16).float()
+            activated = apply_gate_up(
+                accum[:, :inter],
+                accum[:, inter:],
+                "silu" if activation == ActivationType.Silu else "swiglu",
+                swiglu_limit,
+            )
+            second = fp4_utils.mxfp4_to_f32(w2_packed[expert]).reshape(
+                hidden.shape[1], -1, 16
+            )
+            second *= w2_scale_raw[expert].float().unsqueeze(-1)
+            second = second.reshape(hidden.shape[1], inter) * wg2[expert]
+            output = qdq(activated.to(torch.bfloat16), ag2[expert]) @ second.T
+            output += w2_bias[expert].to(torch.bfloat16).float()
+            output = (
+                output.to(torch.bfloat16).float() * topk_w[token, route, None].float()
+            )
+            result.index_add_(0, token, output)
+        return result.to(torch.bfloat16)
+
     if data_format not in ("a4w4", "a8w4"):
         raise ValueError(f"data_format must be a4w4 or a8w4, got {data_format!r}")
 
@@ -283,7 +332,7 @@ def _init_hidden(
         return torch.zeros(shape, dtype=torch.bfloat16)
     if data_init == "constant":
         return torch.full(shape, 0.5, dtype=torch.bfloat16)
-    if data_format == "a4w4":
+    if data_format in ("a4w4", "nvfp4"):
         packed = bench_init.fill_fp4(shape, data_init, generator)
         return fp4_utils.mxfp4_to_f32(packed).to(torch.bfloat16)
     return bench_init.fill_fp8(shape, data_init, generator).to(torch.bfloat16)
@@ -381,9 +430,11 @@ def _run_grouped_via_fused_moe(
     (looping each launch alone) and returns their per-kernel us in ``kernel_us``.
     Returns ``(out, ref, us_or_None, kernel_us_or_None)``.
     """
-    if data_format not in ("a4w4", "a8w4"):
-        raise ValueError(f"data_format must be a4w4 or a8w4, got {data_format!r}")
-
+    if data_format not in ("a4w4", "a8w4", "nvfp4"):
+        raise ValueError(f"unsupported data_format: {data_format!r}")
+    nvfp4 = data_format == "nvfp4"
+    scale_block = 16 if nvfp4 else SCALE_BLOCK
+    quant_kwargs = {"fp4_format": "mxfp4", "quant_type": QuantType.per_1x32}
     K = model_dim
     inter = inter_dim
     K_pack = K // 2
@@ -409,17 +460,37 @@ def _run_grouped_via_fused_moe(
     w1_scale_raw = init_weight_scales(
         experts,
         2 * inter,
-        K // SCALE_BLOCK,
+        K // scale_block,
         scale_init=scale_init,
         generator=generator,
     )
     w2_scale_raw = init_weight_scales(
         experts,
         K,
-        inter // SCALE_BLOCK,
+        inter // scale_block,
         scale_init=scale_init,
         generator=generator,
     )
+    if nvfp4:
+
+        def to_e4m3(raw):
+            values = fp4_utils.e8m0_to_f32(raw)
+            if scale_init == "zero":
+                values.zero_()
+            elif scale_init != "constant":
+                values *= 1.375  # Exercise E4M3 mantissas, not just powers of two.
+            return values.clamp(max=448).to(torch.float8_e4m3fn)
+
+        w1_scale_raw, w2_scale_raw = map(to_e4m3, (w1_scale_raw, w2_scale_raw))
+        quant_kwargs = dict(
+            fp4_format="nvfp4",
+            w1_global_scale=torch.linspace(0.011, 0.053, experts * 2).reshape(
+                experts, 2
+            ),
+            w2_global_scale=torch.linspace(0.017, 0.061, experts),
+            a1_global_scale=torch.linspace(0.001, 0.002, experts),
+            a2_global_scale=torch.linspace(0.023, 0.041, experts),
+        )
     if use_bias:
         if data_init == "constant":
             bias1 = torch.full((experts, 2 * inter), 0.5)
@@ -466,7 +537,7 @@ def _run_grouped_via_fused_moe(
     )
     w2_scale = moe_shuffle_scale(w2_scale_raw.contiguous(), experts_cnt=experts)
 
-    if data_format == "a4w4":
+    if data_format in ("a4w4", "nvfp4"):
         w1_arg = w1_grouped.view(dtypes.fp4x2)
         w2_arg = w2_grouped.view(dtypes.fp4x2)
     else:  # a8w4
@@ -481,7 +552,7 @@ def _run_grouped_via_fused_moe(
             topk_w,
             topk_id,
             activation=activation,
-            quant_type=QuantType.per_1x32,
+            **quant_kwargs,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
             bias1=bias1_phys if use_bias else None,
@@ -548,6 +619,19 @@ def _run_grouped_via_fused_moe(
         swiglu_limit=swiglu_limit,
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
+        nvfp4_scales=(
+            tuple(
+                quant_kwargs[name]
+                for name in (
+                    "w1_global_scale",
+                    "w2_global_scale",
+                    "a1_global_scale",
+                    "a2_global_scale",
+                )
+            )
+            if nvfp4
+            else None
+        ),
     ).to(out.dtype)
     return out, ref, us, kernel_us
 
@@ -590,7 +674,8 @@ def _gemm_work_metrics(
     quantization, bias, and other fused-MoE auxiliary traffic, so the reported
     bandwidth is effective bandwidth rather than measured HBM traffic.
     """
-    input_bytes = 0.5 if data_format == "a4w4" else 1.0
+    input_bytes = 0.5 if data_format in ("a4w4", "nvfp4") else 1.0
+    scale_block = 16 if data_format == "nvfp4" else SCALE_BLOCK
     weight_bytes = 0.5
     output_bytes = 2.0
     stage1_n = 2 * inter_dim
@@ -599,18 +684,18 @@ def _gemm_work_metrics(
     gemm1_flops = routed_rows * stage1_n * model_dim * 2
     gemm1_bytes = (
         routed_rows * model_dim * input_bytes
-        + routed_rows * model_dim // SCALE_BLOCK
+        + routed_rows * model_dim // scale_block
         + routed_rows * inter_dim * output_bytes
         + experts * model_dim * stage1_n * weight_bytes
-        + experts * model_dim * stage1_n // SCALE_BLOCK
+        + experts * model_dim * stage1_n // scale_block
     )
     gemm2_flops = tokens * topk * model_dim * inter_dim * 2
     gemm2_bytes = (
         tokens * topk * inter_dim * input_bytes
-        + routed_rows * inter_dim // SCALE_BLOCK
+        + routed_rows * inter_dim // scale_block
         + routed_rows * model_dim * output_bytes
         + experts * inter_dim * model_dim * weight_bytes
-        + experts * inter_dim * model_dim // SCALE_BLOCK
+        + experts * inter_dim * model_dim // scale_block
     )
     return {
         "gemm1": (gemm1_flops, gemm1_bytes),
@@ -1227,7 +1312,9 @@ def main() -> None:
         help="CSV of grouped-MoE settings to sweep with --scenario csv "
         f"(default: {DEFAULT_CSV_PATH}). Each row is one case.",
     )
-    parser.add_argument("--data-format", choices=("a4w4", "a8w4"), default="a8w4")
+    parser.add_argument(
+        "--data-format", choices=("a4w4", "a8w4", "nvfp4"), default="a8w4"
+    )
     parser.add_argument("--experts", type=int, default=256)
     parser.add_argument(
         "--tokens",
