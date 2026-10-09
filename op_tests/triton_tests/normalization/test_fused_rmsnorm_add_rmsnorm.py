@@ -8,7 +8,6 @@ from aiter.ops.triton.normalization.fused_rmsnorm_add_rmsnorm import (
     fused_rmsnorm_add_rmsnorm,
 )
 
-
 POST_EPS = 1e-8
 PRE_EPS = 1e-5
 
@@ -37,9 +36,7 @@ def test_fused_rmsnorm_add_rmsnorm(rows, width):
     post_weight = torch.randn(width, device="cuda", dtype=torch.bfloat16) * 0.1
     pre_weight = torch.randn(width, device="cuda", dtype=torch.bfloat16) * 0.1
 
-    expected_residual, expected_norm = reference(
-        x, residual, post_weight, pre_weight
-    )
+    expected_residual, expected_norm = reference(x, residual, post_weight, pre_weight)
     residual_out = torch.empty_like(x)
     pre_norm = fused_rmsnorm_add_rmsnorm(
         x, residual, post_weight, pre_weight, POST_EPS, PRE_EPS, residual_out
@@ -59,13 +56,9 @@ def test_fused_rmsnorm_add_rmsnorm_torch_compile(rows, width):
     compiled_residual = torch.empty_like(x)
     eager_residual = torch.empty_like(x)
     compiled = torch.compile(fused_rmsnorm_add_rmsnorm, fullgraph=True)
-    actual = compiled(
-        x, residual, weight, weight, POST_EPS, PRE_EPS, compiled_residual
-    )
+    actual = compiled(x, residual, weight, weight, POST_EPS, PRE_EPS, compiled_residual)
     expected = fused_rmsnorm_add_rmsnorm(
         x, residual, weight, weight, POST_EPS, PRE_EPS, eager_residual
     )
     torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.02)
-    torch.testing.assert_close(
-        compiled_residual, eager_residual, atol=0.02, rtol=0.02
-    )
+    torch.testing.assert_close(compiled_residual, eager_residual, atol=0.02, rtol=0.02)

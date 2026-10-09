@@ -8,7 +8,6 @@ import triton.language as tl
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
-
 _fused_rmsnorm_add_rmsnorm_repr = make_kernel_repr(
     "_fused_rmsnorm_add_rmsnorm_kernel", ["BLOCK_SIZE_N"]
 )
