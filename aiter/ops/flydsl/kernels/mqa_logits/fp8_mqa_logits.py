@@ -152,6 +152,153 @@ def _emit_acc_reduce(mfma, c_frags, w_row, kv_scale, f32_0, reduce=True):
     return warp_reduce_strided(col_sum, fx.ReductionOp.ADD, stride=mfma.MFMA_N)
 
 
+# ---- LDS-builder epilogues ----
+# One function per epilogue shape of ``_build_kernel_mfma_lds_pipe``; the
+# builder picks one at build time and calls it once per KV tile. They hold only
+# trace-time Python control flow: the one runtime branch, the window-guarded
+# store, is ``_EpilogueCtx.store_if``, which has to be defined lexically inside
+# the ``@flyc.kernel`` body for the AST rewriter to turn it into an ``scf.if``.
+
+
+@dataclass(frozen=True)
+class _EpilogueCtx:
+    """Per-kernel state shared by every tile's epilogue (one wave's view)."""
+
+    mfma: "MfmaAtom"
+    mma: object  # the MMA atom
+    gemm_kw: dict  # fx.gemm atom state (identity scales)
+    a_packs: list  # [row][mi][kk] A-fragments
+    w_frag: list  # [row][mi] per-head weights in accumulator order
+    starts: list  # [row] window start (fx.Int32)
+    ends: list  # [row] window end (fx.Int32)
+    lane: object  # fx.Int32 lane in the wave
+    lane_div_N: object  # lane // MFMA_N
+    f32_0: object
+    store_if: Callable  # (pred, out_row_t, col, value) -> None
+    iglp: bool = False  # rocdl.iglp_opt(0) ahead of the sw_pipe nest
+
+
+@dataclass(frozen=True)
+class _TileOperands:
+    """One KV tile's operands, as read out of its LDS slot."""
+
+    col0: object  # fx.Int32 first KV column of the tile
+    cols: list  # [ni] this lane's column of n-tile ni
+    b_packs: list  # [ni][kk] B-fragments
+    kv_scales: list  # [ni] per-lane column scale, or None (scaled after rs)
+    rs_scales: list  # [g] scale of the column a lane owns after the rs, or None
+    out_row_ts: list  # [row] 1-D output views
+
+
+def _store_tile_cols(ctx, j, out_row_t, col, col_sum):
+    """Store one head-reduced n-tile: the MFMA_N lanes of group 0 write."""
+    in_window = (col >= ctx.starts[j]) & (col < ctx.ends[j])
+    is_writer = (ctx.lane_div_N == fx.Int32(0)) & in_window
+    ctx.store_if(is_writer, out_row_t, col, col_sum)
+
+
+def _store_rs_group(ctx, j, out_row_t, col0, g, parts, rs_scale):
+    """Reduce-scatter one group of ``64 // MFMA_N`` n-tiles and store it.
+
+    After the reduce-scatter lane ``l`` owns the group's column ``l``
+    (tile-major), so all 64 lanes store one contiguous run.
+    """
+    col_sum = warp_reduce_scatter_strided(parts, fx.ReductionOp.ADD, stride=ctx.mfma.MFMA_N)
+    if rs_scale is not None:
+        col_sum = col_sum * rs_scale
+    col = col0 + fx.Int32(g * 64) + ctx.lane
+    in_window = (col >= ctx.starts[j]) & (col < ctx.ends[j])
+    ctx.store_if(in_window, out_row_t, col, col_sum)
+
+
+def _epilogue_per_tile(ctx, tile):
+    """Per n-tile shuffle head-reduce; MFMA_N writer lanes per n-tile."""
+    for j in range_constexpr(len(ctx.a_packs)):
+        for ni in range_constexpr(len(tile.b_packs)):
+            col_sum = _emit_col_sum(
+                ctx.mfma,
+                ctx.mma,
+                ctx.gemm_kw,
+                ctx.a_packs[j],
+                tile.b_packs[ni],
+                ctx.w_frag[j],
+                tile.kv_scales[ni],
+                ctx.f32_0,
+            )
+            _store_tile_cols(ctx, j, tile.out_row_ts[j], tile.cols[ni], col_sum)
+
+
+def _epilogue_reduce_scatter(ctx, tile):
+    """``rs_head``: the n-tiles of a group are head-reduced together by
+    ``warp_reduce_scatter_strided`` and stored by all 64 lanes."""
+    rs_group = 64 // ctx.mfma.MFMA_N
+    for j in range_constexpr(len(ctx.a_packs)):
+        for g in range_constexpr(len(tile.b_packs) // rs_group):
+            parts = [
+                _emit_col_sum(
+                    ctx.mfma,
+                    ctx.mma,
+                    ctx.gemm_kw,
+                    ctx.a_packs[j],
+                    tile.b_packs[g * rs_group + q],
+                    ctx.w_frag[j],
+                    tile.kv_scales[g * rs_group + q],
+                    ctx.f32_0,
+                    reduce=False,
+                )
+                for q in range_constexpr(rs_group)
+            ]
+            _store_rs_group(
+                ctx, j, tile.out_row_ts[j], tile.col0, g, parts, tile.rs_scales[g]
+            )
+
+
+def _epilogue_sw_pipe(ctx, tile, rs_head):
+    """Depth-2 software pipeline over the flattened (row, n-tile) items.
+
+    Issues item k+1's MFMAs before consuming item k's accumulators, so the
+    next GEMMs overlap this item's exposed accumulator-read latency. With
+    ``rs_head`` the consumed partials are reduce-scattered per group (items
+    are row-major, so a group's n-tiles are consecutive items); otherwise each
+    item is head-reduced and stored on its own.
+    """
+    mfma, mma, gemm_kw = ctx.mfma, ctx.mma, ctx.gemm_kw
+    rs_group = 64 // mfma.MFMA_N
+    items = [
+        (j, ni)
+        for j in range_constexpr(len(ctx.a_packs))
+        for ni in range_constexpr(len(tile.b_packs))
+    ]
+    if ctx.iglp:
+        rocdl.iglp_opt(0)
+    cf = _emit_acc_issue(
+        mfma, mma, gemm_kw, ctx.a_packs[items[0][0]], tile.b_packs[items[0][1]]
+    )
+    parts = []
+    for k in range_constexpr(len(items)):
+        j, ni = items[k]
+        if k + 1 < len(items):
+            jn, nin = items[k + 1]
+            cf_next = _emit_acc_issue(
+                mfma, mma, gemm_kw, ctx.a_packs[jn], tile.b_packs[nin]
+            )
+        col_sum = _emit_acc_reduce(
+            mfma, cf, ctx.w_frag[j], tile.kv_scales[ni], ctx.f32_0, reduce=not rs_head
+        )
+        if not rs_head:
+            _store_tile_cols(ctx, j, tile.out_row_ts[j], tile.cols[ni], col_sum)
+        else:
+            parts.append(col_sum)
+            if len(parts) == rs_group:
+                g = ni // rs_group
+                _store_rs_group(
+                    ctx, j, tile.out_row_ts[j], tile.col0, g, parts, tile.rs_scales[g]
+                )
+                parts = []
+        if k + 1 < len(items):
+            cf = cf_next
+
+
 def _emit_row_neg_inf_fill(
     *,
     logits,  # the output kernel arg
@@ -805,6 +952,12 @@ def _build_kernel_mfma_lds_pipe(
         f"rs_head needs N_TILES ({N_TILES}) to be a multiple of "
         f"64 // MFMA_N ({RS_GROUP})"
     )
+    if sw_pipe:
+        _epilogue = lambda ctx, tile: _epilogue_sw_pipe(ctx, tile, rs_head)  # noqa: E731
+    elif rs_head:
+        _epilogue = _epilogue_reduce_scatter
+    else:
+        _epilogue = _epilogue_per_tile
 
     # LDS multi-buffer: NUM_BUFFERS slots of [BKV, D] fp8 (row-major, row == KV
     # column index). Addressed as i32 dwords for the vector reads.
@@ -1141,6 +1294,35 @@ def _build_kernel_mfma_lds_pipe(
                 tile_start + fx.Int32(_p * BKV),
             )
 
+        def _store_if(pred, out_row_t, col, value):
+            """``out_row_t[col] = value`` where ``pred`` holds.
+
+            Via a closure, not a bare ``out_row_t[col] = ...`` in the branch:
+            the rewriter reads a subscript store as an assignment to
+            ``out_row_t`` and tries to carry the TensorView out of the scf.if.
+            """
+
+            def _store():
+                out_row_t[col] = value
+
+            if pred:
+                _store()
+
+        ep_ctx = _EpilogueCtx(
+            mfma=mfma,
+            mma=mma,
+            gemm_kw=gemm_kw,
+            a_packs=a_packs,
+            w_frag=w_frag,
+            starts=starts,
+            ends=ends,
+            lane=lane,
+            lane_div_N=lane_div_N,
+            f32_0=f32_0,
+            store_if=_store_if,
+            iglp=IGLP_SW_PIPE,
+        )
+
         # ---- Steady-state software pipeline over BKV tiles ----
         # slot_static: compile-time slot (unroll_slots) or None (t % NB).
         def _tile(t, slot_static):
@@ -1236,135 +1418,17 @@ def _build_kernel_mfma_lds_pipe(
                 for j in range_constexpr(RPW)
             ]
 
-            if const_expr(rs_head and not sw_pipe):
-                for j in range_constexpr(RPW):
-                    out_row_t = out_row_ts[j]
-                    for g in range_constexpr(N_TILES // RS_GROUP):
-                        parts = [
-                            _emit_col_sum(
-                                mfma,
-                                mma,
-                                gemm_kw,
-                                a_packs[j],
-                                b_packs[g * RS_GROUP + q],
-                                w_frag[j],
-                                kv_scales_tile[g * RS_GROUP + q],
-                                f32_0,
-                                reduce=False,
-                            )
-                            for q in range_constexpr(RS_GROUP)
-                        ]
-                        col_sum = warp_reduce_scatter_strided(
-                            parts, fx.ReductionOp.ADD, stride=mfma.MFMA_N
-                        )
-                        if const_expr(lds_scales):
-                            col_sum = col_sum * rs_scales[g]
-                        # Lane l owns the group's column l (tile-major).
-                        col = col0 + fx.Int32(g * 64) + lane
-                        in_window = (col >= starts[j]) & (col < ends[j])
-
-                        def _store():
-                            out_row_t[col] = col_sum  # noqa: B023
-
-                        if in_window:
-                            _store()
-            elif const_expr(not sw_pipe):
-                for j in range_constexpr(RPW):
-                    out_row_t = out_row_ts[j]
-                    for ni in range_constexpr(N_TILES):
-                        col = cols[ni]
-                        col_sum = _emit_col_sum(
-                            mfma,
-                            mma,
-                            gemm_kw,
-                            a_packs[j],
-                            b_packs[ni],
-                            w_frag[j],
-                            kv_scales_tile[ni],
-                            f32_0,
-                        )
-
-                        in_window = (col >= starts[j]) & (col < ends[j])
-                        is_writer = (lane_div_N == fx.Int32(0)) & in_window
-
-                        # Closure, not a bare subscript store -- see the
-                        # direct-load builder's epilogue for why.
-                        def _store():
-                            out_row_t[col] = col_sum  # noqa: B023
-
-                        if is_writer:
-                            _store()
-            else:
-                # Depth-2 software pipeline over the flattened (j, ni) items:
-                # issue item k+1's MFMAs before consuming item k's accumulators,
-                # so the next GEMMs overlap this item's exposed accumulator-read
-                # latency.
-                items = [
-                    (j, ni)
-                    for j in range_constexpr(RPW)
-                    for ni in range_constexpr(N_TILES)
-                ]
-                if const_expr(IGLP_SW_PIPE):
-                    rocdl.iglp_opt(0)
-                cf = _emit_acc_issue(
-                    mfma, mma, gemm_kw, a_packs[items[0][0]], b_packs[items[0][1]]
-                )
-                # rs_head: partials of the current reduce-scatter group. Items
-                # are row-major, so a group's n-tiles are consecutive items.
-                parts = []
-                for k in range_constexpr(len(items)):
-                    j, ni = items[k]
-                    out_row_t = out_row_ts[j]
-                    col = cols[ni]
-                    # Issue the NEXT item's MFMAs before reading THIS item's
-                    # accumulators, so those GEMMs cover the exposed acc-read nop.
-                    if const_expr(k + 1 < len(items)):
-                        jn, nin = items[k + 1]
-                        cf_next = _emit_acc_issue(
-                            mfma, mma, gemm_kw, a_packs[jn], b_packs[nin]
-                        )
-                    col_sum = _emit_acc_reduce(
-                        mfma,
-                        cf,
-                        w_frag[j],
-                        kv_scales_tile[ni],
-                        f32_0,
-                        reduce=not rs_head,
-                    )
-
-                    if const_expr(rs_head):
-                        parts.append(col_sum)
-                        if const_expr(len(parts) == RS_GROUP):
-                            col_sum = warp_reduce_scatter_strided(
-                                parts, fx.ReductionOp.ADD, stride=mfma.MFMA_N
-                            )
-                            if const_expr(lds_scales):
-                                col_sum = col_sum * rs_scales[ni // RS_GROUP]
-                            parts = []
-                            col = (
-                                col0
-                                + fx.Int32((ni // RS_GROUP) * RS_GROUP * mfma.MFMA_N)
-                                + lane
-                            )
-                            in_window = (col >= starts[j]) & (col < ends[j])
-
-                            def _store():
-                                out_row_t[col] = col_sum  # noqa: B023
-
-                            if in_window:
-                                _store()
-                    else:
-                        in_window = (col >= starts[j]) & (col < ends[j])
-                        is_writer = (lane_div_N == fx.Int32(0)) & in_window
-
-                        def _store():
-                            out_row_t[col] = col_sum  # noqa: B023
-
-                        if is_writer:
-                            _store()
-
-                    if const_expr(k + 1 < len(items)):
-                        cf = cf_next
+            _epilogue(
+                ep_ctx,
+                _TileOperands(
+                    col0=col0,
+                    cols=cols,
+                    b_packs=b_packs,
+                    kv_scales=kv_scales_tile,
+                    rs_scales=rs_scales,
+                    out_row_ts=out_row_ts,
+                ),
+            )
 
         if const_expr(UNROLL_KV_TILE_LOOP):
             # Unrolled by NUM_BUFFERS so every slot offset is a constant (tile
