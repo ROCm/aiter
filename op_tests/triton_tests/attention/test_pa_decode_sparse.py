@@ -9,6 +9,7 @@ import triton
 
 from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from aiter.test_common import checkAllclose
 
 
@@ -248,7 +249,7 @@ def _reduce_partials_torch(
     return out
 
 
-@pytest.mark.parametrize("T", [1, 64, 256, 2048])
+@pytest.mark.parametrize("T", [1, 64, 256, 2437])
 @pytest.mark.parametrize("H", [16, 32, 64, 128])
 @pytest.mark.parametrize("D", [512])
 @pytest.mark.parametrize("kv_len", [136, 388, 1024])
@@ -311,18 +312,14 @@ def test_pa_decode_sparse_vs_reference(
     )
 
 
-# ---------------------------------------------------------------------------
-# FP8 KV cache quantization helpers
-# ---------------------------------------------------------------------------
-
 _FP8_GROUP_SIZE = 64
-_FP8_DTYPE = torch.float8_e4m3fnuz
+_FP8_DTYPE = get_fp8_e4m3_dtype()
 
 
 def _quantize_kv_fp8(unified_kv, group_size=_FP8_GROUP_SIZE):
     """Quantize bf16/fp16 unified_kv to (fp8, scales) with 1xGROUP_SIZE block scaling.
 
-    Returns (kv_fp8, kv_scales) where kv_fp8 is float8_e4m3fnuz and
+    Returns (kv_fp8, kv_scales) where kv_fp8 is _FP8_DTYPE and
     kv_scales is [total_pages, D // group_size] fp32.
     """
     total_pages, D = unified_kv.shape
@@ -477,6 +474,7 @@ def two_loop_reference(
     T = main_indptr.numel() - 1
     mi, mp = main_idx.long(), main_indptr.long()
     ei, ep = extra_idx.long(), extra_indptr.long()
+    ei = torch.where(ei < 0, -1 - main_pages, ei)  # -1 again after the shift below
     rows, lens = [], []
     for tok in range(T):
         row = torch.cat(
@@ -492,7 +490,7 @@ def two_loop_reference(
     )
 
 
-@pytest.mark.parametrize("T", [1, 32, 128])
+@pytest.mark.parametrize("T", [1, 32, 128, 2437])
 @pytest.mark.parametrize("H", [16])
 @pytest.mark.parametrize("D", [512])
 @pytest.mark.parametrize("main_len", [128])
@@ -539,6 +537,7 @@ def test_pa_decode_sparse_two_loop(T, H, D, main_len, extra_len, dtype, strided_
     extra_idx = torch.randint(
         0, extra_pool, (T, extra_len), device=device, dtype=torch.int32
     ).reshape(-1)
+    extra_idx[::5] = -1  # -1 sentinels, skipped by the kernel
     extra_indptr = torch.arange(
         0, T * extra_len + 1, extra_len, dtype=torch.int32, device=device
     )
@@ -568,3 +567,122 @@ def test_pa_decode_sparse_two_loop(T, H, D, main_len, extra_len, dtype, strided_
 
     tol = 1e-2 if dtype == "fp8" else 5e-3
     torch.testing.assert_close(out, ref, atol=tol, rtol=tol)
+
+
+@pytest.mark.parametrize("has_invalid", [False, True])
+@pytest.mark.parametrize("T", [13, 2437])
+def test_pa_decode_sparse_global_gather(T, has_invalid):
+    """A pool past 2 GiB takes the 64-bit gathers, where the launcher unpeels
+    the tile loop without has_invalid. T=2437 takes the prefill config."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    if arch_info.get_arch() != "gfx950":
+        pytest.skip("the packed fp8_dsv4_mla cache is a gfx950 gluon path")
+    if torch.cuda.mem_get_info()[0] < 4 * 1024**3:
+        pytest.skip("needs ~3 GiB free for the >2 GiB strided pool")
+
+    device = "cuda"
+    H, D = 16, 512
+    torch.manual_seed(0)
+    q = torch.randn(T, H, D, dtype=torch.bfloat16, device=device) * 0.125
+    attn_sink = torch.randn(H, dtype=torch.float32, device=device) * 0.1
+    softmax_scale = float(D) ** -0.5
+
+    lens = torch.randint(1, 300, (T,), device=device)
+    cache, deq = make_packed_cache(int(lens.sum()), D, "fp8")
+    cache, deq = widen_to_int32_overflow(cache, deq)
+    indptr = torch.zeros(T + 1, dtype=torch.int32, device=device)
+    indptr[1:] = lens.cumsum(0)
+    idx = torch.randperm(int(lens.sum()), device=device).to(torch.int32)
+    if has_invalid:
+        drop = torch.rand(idx.shape, device=device) < 0.2
+        drop[indptr[:-1].long()] = False  # every row keeps a key
+        idx[drop] = -1
+
+    ref = pa_decode_sparse_reference(
+        q, deq.to(q.dtype), idx, indptr, attn_sink, softmax_scale
+    )
+    out = pa_decode_sparse(
+        q, cache, idx, indptr, attn_sink, softmax_scale, has_invalid=has_invalid
+    )
+    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+def _inv_rope_ref(x, pos, cos_sin):
+    """Inverse GPT-J RoPE on the trailing rope lanes of x [T, H, D], in f32."""
+    x = x.float().clone()
+    half = cos_sin.shape[1] // 2
+    even, odd = x[..., -2 * half :: 2].clone(), x[..., -2 * half + 1 :: 2].clone()
+    cos, sin = cos_sin[pos, None, :half], cos_sin[pos, None, half:]
+    x[..., -2 * half :: 2] = even * cos + odd * sin
+    x[..., -2 * half + 1 :: 2] = odd * cos - even * sin
+    return x
+
+
+# T=4: split-K, the reduce writes the output. T=256: one 32-head program per row
+# writes it.
+@pytest.mark.parametrize("T, H", [(4, 16), (256, 32)])
+@pytest.mark.parametrize("mxfp8", [False, True])
+def test_pa_decode_sparse_inv_rope_mxfp8_epilogue(T, H, mxfp8):
+    """The fused output epilogue (inverse RoPE, optionally MXFP8) on the SWA +
+    top-k two-loop, against the reference rotated back; MXFP8 is dequantized."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    if arch_info.get_arch() != "gfx950":
+        pytest.skip("the output epilogue is a gfx950 gluon path")
+
+    device = "cuda"
+    D, main_len, extra_len = 512, 128, 256
+    torch.manual_seed(0)
+    q = torch.randn(T, H, D, dtype=torch.bfloat16, device=device) * 0.125
+    attn_sink = torch.randn(H, dtype=torch.float32, device=device) * 0.1
+    softmax_scale = float(D) ** -0.5
+    main_cache, main_deq = make_packed_cache(T * main_len, D, "fp8")
+    main_idx = torch.arange(T * main_len, device=device, dtype=torch.int32)
+    main_indptr = torch.arange(
+        0, T * main_len + 1, main_len, dtype=torch.int32, device=device
+    )
+    extra_cache, extra_deq = make_packed_cache(T * extra_len, D, "fp8")
+    extra_idx = torch.randint(
+        0, T * extra_len, (T * extra_len,), device=device, dtype=torch.int32
+    )
+    extra_idx[::5] = -1
+    extra_indptr = torch.arange(
+        0, T * extra_len + 1, extra_len, dtype=torch.int32, device=device
+    )
+    ang = torch.rand(4096, 32, device=device) * 6.2831853
+    cos_sin = torch.cat([ang.cos(), ang.sin()], dim=1).contiguous()
+    pos = torch.randint(0, 4096, (T,), device=device)
+
+    ref = two_loop_reference(
+        q,
+        main_deq,
+        main_idx,
+        main_indptr,
+        extra_deq,
+        extra_idx,
+        extra_indptr,
+        attn_sink,
+        softmax_scale,
+    )
+    ref = _inv_rope_ref(ref, pos, cos_sin)
+    kw = {
+        "extra_cache": extra_cache,
+        "extra_indices": extra_idx,
+        "extra_indptr": extra_indptr,
+        "inv_rope_positions": pos,
+        "inv_rope_cos_sin_cache": cos_sin,
+    }
+    args = (q, main_cache, main_idx, main_indptr, attn_sink, softmax_scale)
+    if mxfp8:
+        data = torch.empty(T, H * D, dtype=torch.float8_e4m3fn, device=device)
+        scale = torch.empty(T, H * D // 32, dtype=torch.uint8, device=device)
+        out = pa_decode_sparse(*args, out_mxfp8=(data, scale), **kw)
+        assert out.data_ptr() == data.data_ptr() and out.shape == (T, H, D)
+        step = torch.exp2(scale.float() - 127.0).view(T, H * D // 32, 1)
+        deq = (data.float().view(T, H * D // 32, 32) * step).view(T, H, D)
+        # e4m3 keeps 3 mantissa bits: within 1/16 of the value
+        torch.testing.assert_close(deq, ref, atol=1e-2, rtol=0.07)
+    else:
+        out = pa_decode_sparse(*args, **kw)
+        torch.testing.assert_close(out.float(), ref, atol=1e-2, rtol=1e-2)

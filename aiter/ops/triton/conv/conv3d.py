@@ -1,0 +1,686 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+from enum import Enum
+
+import torch
+
+from aiter.ops.triton.conv._launch import (
+    _launch_1x1x1_3d,
+    _launch_3x3x3_cblocked,
+    _launch_3x3x3_ndhwc,
+    _launch_general_3d,
+    _launch_winograd_hw_f4x3,
+)
+from aiter.ops.triton.conv._prepack import (
+    get_or_make_weight_pack_3d,
+    get_or_make_weight_pack_3x3x3,
+    get_or_make_winograd_hw_filter_f4x3,
+    prepack_ncdhw_to_cblocked,
+)
+from aiter.ops.triton.conv._utils import (
+    BLOCK_K,
+    _alloc_output_3d,
+    _conv3d_dims,
+    _ensure_layout,
+    _is_1x1x1_conv,
+    _is_3x3x3_conv,
+    _is_amd_wave32,
+    _is_winograd_hw_3d_eligible,
+    _normalize_conv3d_params,
+    _out_dhw,
+    _prep_bias,
+    _require_winograd_hw_3d_eligible,
+)
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+_LOGGER = AiterTritonLogger()
+
+
+def _require_cuda_inputs(x, w_oidhw) -> None:
+    """Reject tensors that cannot be consumed by the Triton Conv3D kernels."""
+    if not x.is_cuda or not w_oidhw.is_cuda:
+        raise ValueError(
+            "Conv3D requires CUDA input and weight tensors, got "
+            f"input on {x.device} and weight on {w_oidhw.device}"
+        )
+
+
+class Route3D(Enum):
+    # Values are the kernel display names used in benchmark output.
+    ONE_X_ONE_X_ONE = "_conv3d_1x1x1_kernel"
+    WINOGRAD_HW = "_winograd_hw_f4x3_* (3 kernels)"
+    WINOGRAD_HW_CBLOCKED = "_winograd_hw_f4x3_cblocked_* (3 kernels)"
+    CBLOCKED_NCDHW = "_conv3d_3x3x3_cblocked_kernel"
+    NDHWC_3X3X3 = "_conv3d_3x3x3_ndhwc_kernel"
+    GENERAL = "_conv3d_general_kernel"
+
+
+def _select_3x3x3_ncdhw_method(
+    N,
+    C,
+    D,
+    H,
+    W,
+    K_out,
+    stride,
+    padding,
+    dilation,
+    block_c=BLOCK_K,
+):
+    """Pick the NCDHW 3x3x3 method using shape and architecture heuristics.
+
+    The wave32 policy was fitted conservatively to complete-path measurements
+    on gfx1201, including activation packing. Wave64 retains its conservative
+    fallback until the same sweep can be run on that hardware.
+    """
+    if not _is_winograd_hw_3d_eligible(3, 3, 3, stride, dilation, C):
+        return "general" if C < block_c else "cblocked"
+
+    OD, P, Q = _out_dhw(D, H, W, 3, 3, 3, stride, padding, dilation)
+    tile_h = (P + 3) // 4
+    tile_w = (Q + 3) // 4
+    tiles = N * OD * tile_h * tile_w
+
+    if not _is_amd_wave32():
+        if C < block_c:
+            return "general"
+        if C >= 512 and K_out >= 512 and tiles >= 98:
+            return "winograd_hw"
+        return "cblocked"
+
+    # Very narrow expanding projections are the only measured region where
+    # padding C to a full dot tile costs more than the general reduction.
+    if C < 16 or (C < 32 and K_out >= 4 * C):
+        return "general"
+
+    # These regions are transform- or padded-GEMM-bound. The 8x expansion cap
+    # also avoids a large Winograd output-transform temporary.
+    if C < 160 or K_out < 96 or K_out >= 8 * C or tiles < 98:
+        return "cblocked"
+
+    # With one output depth plane, H/W Winograd transforms all three input
+    # planes for one result plane. Require a measured high-reuse channel shape.
+    if OD == 1:
+        expands_channels = K_out >= 2 * C
+        balanced_channels = C >= 320 and K_out >= 320 and tiles >= 220
+        compresses_channels = C >= 4 * K_out and K_out >= 96
+        if not (expands_channels or balanced_channels or compresses_channels):
+            return "cblocked"
+
+    input_elements = N * C * D * H * W
+    small_input = input_elements <= 64 * 1024 * 1024
+    if C >= 1024 and K_out <= 128 and not small_input:
+        return "cblocked"
+    if (C >= 1024 and small_input) or (
+        C >= 512 and small_input and (tiles <= 220 or padding != (0, 0, 0))
+    ):
+        return "winograd_hw_cblocked"
+    return "winograd_hw"
+
+
+def _resolve_route(
+    T,
+    R,
+    S,
+    stride,
+    dilation,
+    N,
+    C,
+    D,
+    H,
+    W,
+    K_out,
+    layout,
+    padding=(0, 0, 0),
+):
+    """Single source of dispatch for conv3d.
+
+    1x1x1 -> specialized channel-GEMM kernel. 3x3x3 -> specialized kernel picked
+    by layout: NCDHW selects among cblocked and two H/W Winograd input paths;
+    NDHWC uses the channels-last kernel. Everything else uses the im2col-free
+    general kernel.
+    """
+    if _is_1x1x1_conv(T, R, S, dilation):
+        return Route3D.ONE_X_ONE_X_ONE
+    if _is_3x3x3_conv(T, R, S) and dilation == (1, 1, 1):
+        if layout == "ndhwc":
+            return Route3D.NDHWC_3X3X3
+        method = _select_3x3x3_ncdhw_method(
+            N, C, D, H, W, K_out, stride, padding, dilation
+        )
+        if method == "general":
+            return Route3D.GENERAL
+        if method == "winograd_hw_cblocked":
+            return Route3D.WINOGRAD_HW_CBLOCKED
+        if method == "winograd_hw":
+            return Route3D.WINOGRAD_HW
+        return Route3D.CBLOCKED_NCDHW
+    return Route3D.GENERAL
+
+
+def conv3d(
+    x,
+    w_oidhw,
+    bias=None,
+    stride=(1, 1, 1),
+    padding=(0, 0, 0),
+    dilation=(1, 1, 1),
+    activation="none",
+    layout="ncdhw",
+):
+    """Forward 3-D conv on AMD ROCm via Triton. Drop-in for the forward of
+    ``torch.nn.functional.conv3d`` (no backward).
+
+    Parameters
+    ----------
+    x : Tensor
+        Input with logical shape ``[N, C, D, H, W]``, fp16 or bf16. For
+        ``layout="ndhwc"`` it may carry channels-last-3d strides (or be
+        converted to them internally).
+    w_oidhw : Tensor
+        Weight in PyTorch-canonical ``[K_out, C, T, R, S]`` layout
+        (T = depth tap).
+    bias : Tensor, optional
+        1-D bias of length ``K_out``; kernel loads promote it to fp32.
+    stride, padding, dilation : int or 3-tuple of int
+        Standard ``Conv3d`` semantics (depth, height, width).
+    activation : str
+        ``"none" / "relu" / "relu6" / "gelu"`` — fused into the epilogue.
+    layout : str
+        ``"ncdhw"`` (channels-first) or ``"ndhwc"`` (channels-last-3d).
+        Case-insensitive. NDHWC runs a channels-last-3d kernel with no internal
+        layout conversion of the compute; the output matches the input layout.
+
+    Notes
+    -----
+    - Output dtype always matches the input dtype (fp32 accumulator downcast
+      at store), mirroring ``torch.nn.Conv3d``.
+    - Only ``groups=1``; only ``padding_mode="zeros"``.
+    """
+    if x.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(f"conv3d only supports fp16 and bf16 inputs, got {x.dtype}")
+    layout = layout.lower()
+    if layout not in ("ncdhw", "ndhwc"):
+        raise ValueError(f"layout must be 'ncdhw' or 'ndhwc', got '{layout}'")
+    stride, padding, dilation = _normalize_conv3d_params(stride, padding, dilation)
+
+    _LOGGER.get_logger().info(
+        "CONV3D: x=%s w=%s stride=%s padding=%s dilation=%s "
+        "layout=%s dtype=%s bias=%s act=%s",
+        tuple(x.shape),
+        tuple(w_oidhw.shape),
+        stride,
+        padding,
+        dilation,
+        layout,
+        x.dtype,
+        "yes" if bias is not None else "no",
+        activation,
+    )
+
+    if layout == "ndhwc":
+        return conv3d_ndhwc(x, w_oidhw, bias, stride, padding, dilation, activation)
+    else:
+        return conv3d_ncdhw(x, w_oidhw, bias, stride, padding, dilation, activation)
+
+
+def conv3d_general(
+    x,
+    w_oidhw,
+    bias=None,
+    stride=(1, 1, 1),
+    padding=(0, 0, 0),
+    dilation=(1, 1, 1),
+    activation="none",
+    block_k=BLOCK_K,
+    layout="ncdhw",
+):
+    """conv3d using the general im2col-free kernel with K-major prepacked
+    weights. Handles any kernel size / stride / padding / dilation in either
+    layout. Safe to call directly: the input is forced into the physical layout
+    the kernel assumes (the kernel computes strides analytically)."""
+    layout = layout.lower()
+    if layout not in ("ncdhw", "ndhwc"):
+        raise ValueError(f"layout must be 'ncdhw' or 'ndhwc', got '{layout}'")
+    stride, padding, dilation = _normalize_conv3d_params(stride, padding, dilation)
+    _require_cuda_inputs(x, w_oidhw)
+    x = _ensure_layout(x, layout)
+    N, C, D, H, W_in, K_out, T, R, S, OD, P, Q = _conv3d_dims(
+        x, w_oidhw, stride, padding, dilation
+    )
+
+    y = _alloc_output_3d(N, K_out, OD, P, Q, x, layout)
+    bias_fp32 = _prep_bias(bias)
+    w_k, K_pad = get_or_make_weight_pack_3d(w_oidhw, block_k)
+    _launch_general_3d(
+        x,
+        w_k,
+        bias_fp32,
+        y,
+        N,
+        C,
+        D,
+        H,
+        W_in,
+        K_out,
+        T,
+        R,
+        S,
+        OD,
+        P,
+        Q,
+        K_pad,
+        stride,
+        padding,
+        dilation,
+        block_k,
+        activation,
+        layout=layout,
+    )
+    return y
+
+
+def conv3d_1x1x1(
+    x,
+    w_oidhw,
+    bias=None,
+    stride=(1, 1, 1),
+    padding=(0, 0, 0),
+    dilation=(1, 1, 1),
+    activation="none",
+    block_k=BLOCK_K,
+    layout="ncdhw",
+):
+    """conv3d for 1x1x1 kernels — a pure channel-reduction GEMM. Raises
+    ValueError for non-1x1x1. Safe to call directly: the input is forced into
+    the physical layout the kernel assumes."""
+    layout = layout.lower()
+    if layout not in ("ncdhw", "ndhwc"):
+        raise ValueError(f"layout must be 'ncdhw' or 'ndhwc', got '{layout}'")
+    stride, padding, dilation = _normalize_conv3d_params(stride, padding, dilation)
+    _require_cuda_inputs(x, w_oidhw)
+    x = _ensure_layout(x, layout)
+    N, C, D, H, W_in, K_out, T, R, S, OD, P, Q = _conv3d_dims(
+        x, w_oidhw, stride, padding, dilation
+    )
+    if not _is_1x1x1_conv(T, R, S, dilation):
+        raise ValueError(
+            f"conv3d_1x1x1 requires 1x1x1 kernel with dilation=1, "
+            f"got {T}x{R}x{S} dilation={dilation}"
+        )
+
+    y = _alloc_output_3d(N, K_out, OD, P, Q, x, layout)
+    bias_fp32 = _prep_bias(bias)
+    _launch_1x1x1_3d(
+        x,
+        w_oidhw.contiguous(),
+        bias_fp32,
+        y,
+        N,
+        C,
+        D,
+        H,
+        W_in,
+        K_out,
+        OD,
+        P,
+        Q,
+        stride,
+        padding,
+        activation,
+        layout=layout,
+    )
+    return y
+
+
+def conv3d_ndhwc_3x3x3(
+    x,
+    w_oidhw,
+    bias=None,
+    stride=(1, 1, 1),
+    padding=(0, 0, 0),
+    dilation=(1, 1, 1),
+    activation="none",
+    block_k=BLOCK_K,
+):
+    """NDHWC-native 3x3x3 conv3d (channels-last-3d). Raises ValueError for
+    non-3x3x3. ``x`` is trusted to carry channels_last_3d strides."""
+    stride, padding, dilation = _normalize_conv3d_params(stride, padding, dilation)
+    _require_cuda_inputs(x, w_oidhw)
+    x = _ensure_layout(x, "ndhwc")
+    N, C, D, H, W_in, K_out, T, R, S, OD, P, Q = _conv3d_dims(
+        x, w_oidhw, stride, padding, dilation
+    )
+    if not _is_3x3x3_conv(T, R, S):
+        raise ValueError(f"conv3d_ndhwc_3x3x3 requires 3x3x3 kernel, got {T}x{R}x{S}")
+
+    y = _alloc_output_3d(N, K_out, OD, P, Q, x, "ndhwc")
+    bias_fp32 = _prep_bias(bias)
+    w_3x3x3, C_pad = get_or_make_weight_pack_3x3x3(w_oidhw, block_k)
+    _launch_3x3x3_ndhwc(
+        x,
+        w_3x3x3,
+        bias_fp32,
+        y,
+        N,
+        C,
+        D,
+        H,
+        W_in,
+        K_out,
+        OD,
+        P,
+        Q,
+        C_pad,
+        stride,
+        padding,
+        dilation,
+        activation,
+    )
+    return y
+
+
+def conv3d_ncdhw_cblocked(
+    x,
+    w_oidhw,
+    bias=None,
+    stride=(1, 1, 1),
+    padding=(0, 0, 0),
+    dilation=(1, 1, 1),
+    activation="none",
+    block_k=BLOCK_K,
+    x_blocked=None,
+):
+    """NCDHW 3x3x3 conv3d with channel-blocked (NCDHWc) input packing for
+    coalesced channel loads. Raises ValueError for non-3x3x3.
+
+    x_blocked: optional pre-packed NCDHWc input (used by the benchmark to time
+    the kernel without host-side packing); when None the input is packed here."""
+    stride, padding, dilation = _normalize_conv3d_params(stride, padding, dilation)
+    _require_cuda_inputs(x, w_oidhw)
+    x = _ensure_layout(x, "ncdhw")
+    N, C, D, H, W_in, K_out, T, R, S, OD, P, Q = _conv3d_dims(
+        x, w_oidhw, stride, padding, dilation
+    )
+    if not _is_3x3x3_conv(T, R, S):
+        raise ValueError(
+            f"conv3d_ncdhw_cblocked requires 3x3x3 kernel, got {T}x{R}x{S}"
+        )
+
+    y = _alloc_output_3d(N, K_out, OD, P, Q, x, "ncdhw")
+    bias_fp32 = _prep_bias(bias)
+    w_3x3x3, C_pad = get_or_make_weight_pack_3x3x3(w_oidhw, block_k)
+    if x_blocked is None:
+        x_blocked, C_pad_x = prepack_ncdhw_to_cblocked(x, block_k)
+    else:
+        if x_blocked.ndim != 6:
+            raise ValueError(
+                "conv3d_ncdhw_cblocked requires a 6-D NCDHWc x_blocked "
+                f"tensor, got {x_blocked.ndim}-D"
+            )
+        C_pad_x = x_blocked.shape[-1] * x_blocked.shape[1]
+    assert (
+        C_pad_x == C_pad
+    ), f"Channel padding mismatch: input {C_pad_x} vs weight {C_pad}"
+    _launch_3x3x3_cblocked(
+        x_blocked,
+        w_3x3x3,
+        bias_fp32,
+        y,
+        N,
+        C,
+        D,
+        H,
+        W_in,
+        K_out,
+        OD,
+        P,
+        Q,
+        C_pad,
+        block_k,
+        stride,
+        padding,
+        dilation,
+        activation,
+    )
+    return y
+
+
+def conv3d_winograd_hw_f4x3(
+    x,
+    w_oidhw,
+    bias=None,
+    stride=(1, 1, 1),
+    padding=(0, 0, 0),
+    dilation=(1, 1, 1),
+    activation="none",
+    block_k=BLOCK_K,
+):
+    """NCDHW 3x3x3 conv3d via 2.5D Winograd (F(4x4,3x3) on H,W + direct depth).
+    Raises ValueError for non-eligible convs (needs 3x3x3, stride=1, dilation=1,
+    C>=4)."""
+    stride, padding, dilation = _normalize_conv3d_params(stride, padding, dilation)
+    _require_cuda_inputs(x, w_oidhw)
+    x = _ensure_layout(x, "ncdhw")
+    N, C, D, H, W_in, K_out, T, R, S, OD, P, Q = _conv3d_dims(
+        x, w_oidhw, stride, padding, dilation
+    )
+    _require_winograd_hw_3d_eligible(
+        "conv3d_winograd_hw_f4x3", T, R, S, stride, dilation, C
+    )
+
+    y = _alloc_output_3d(N, K_out, OD, P, Q, x, "ncdhw")
+    bias_fp32 = _prep_bias(bias)
+    U, C_pad = get_or_make_winograd_hw_filter_f4x3(w_oidhw, block_k)
+    _launch_winograd_hw_f4x3(
+        x,
+        U,
+        bias_fp32,
+        y,
+        N,
+        C,
+        D,
+        H,
+        W_in,
+        K_out,
+        OD,
+        P,
+        Q,
+        C_pad,
+        padding,
+        activation,
+        block_k=block_k,
+    )
+    return y
+
+
+def conv3d_winograd_hw_f4x3_cblocked(
+    x,
+    w_oidhw,
+    bias=None,
+    stride=(1, 1, 1),
+    padding=(0, 0, 0),
+    dilation=(1, 1, 1),
+    activation="none",
+    block_k=BLOCK_K,
+    x_blocked=None,
+):
+    """2.5D Winograd with a channel-blocked (NCDHWc) input transform for
+    coalesced channel loads. Same GEMM/output transform as
+    :func:`conv3d_winograd_hw_f4x3`; only the input read changes. Raises
+    ValueError for non-eligible convs.
+
+    x_blocked: optional pre-packed NCDHWc input (used by the benchmark to time
+    the kernel without host-side packing); when None the input is packed here."""
+    stride, padding, dilation = _normalize_conv3d_params(stride, padding, dilation)
+    _require_cuda_inputs(x, w_oidhw)
+    x = _ensure_layout(x, "ncdhw")
+    N, C, D, H, W_in, K_out, T, R, S, OD, P, Q = _conv3d_dims(
+        x, w_oidhw, stride, padding, dilation
+    )
+    _require_winograd_hw_3d_eligible(
+        "conv3d_winograd_hw_f4x3_cblocked", T, R, S, stride, dilation, C
+    )
+
+    y = _alloc_output_3d(N, K_out, OD, P, Q, x, "ncdhw")
+    bias_fp32 = _prep_bias(bias)
+    U, C_pad = get_or_make_winograd_hw_filter_f4x3(w_oidhw, block_k)
+    if x_blocked is None:
+        x_blocked, C_pad_x = prepack_ncdhw_to_cblocked(x, block_k)
+    else:
+        if x_blocked.ndim != 6:
+            raise ValueError(
+                "conv3d_winograd_hw_f4x3_cblocked requires a 6-D NCDHWc "
+                f"x_blocked tensor, got {x_blocked.ndim}-D"
+            )
+        C_pad_x = x_blocked.shape[-1] * x_blocked.shape[1]
+    assert (
+        C_pad_x == C_pad
+    ), f"Channel padding mismatch: input {C_pad_x} vs weight {C_pad}"
+    _launch_winograd_hw_f4x3(
+        x,
+        U,
+        bias_fp32,
+        y,
+        N,
+        C,
+        D,
+        H,
+        W_in,
+        K_out,
+        OD,
+        P,
+        Q,
+        C_pad,
+        padding,
+        activation,
+        block_k=block_k,
+        x_blocked=x_blocked,
+    )
+    return y
+
+
+def _route_and_run(
+    x, w_oidhw, bias, stride, padding, dilation, activation, block_k, layout
+):
+    """Shared dispatch body for conv3d_ncdhw / conv3d_ndhwc: resolve the route
+    once and dispatch to the matching wrapper.
+    """
+    N, C, D, H, W = x.shape
+    K_out, _C, T, R, S = w_oidhw.shape
+    route = _resolve_route(
+        T,
+        R,
+        S,
+        stride,
+        dilation,
+        N,
+        C,
+        D,
+        H,
+        W,
+        K_out,
+        layout,
+        padding=padding,
+    )
+
+    if route == Route3D.ONE_X_ONE_X_ONE:
+        return conv3d_1x1x1(
+            x,
+            w_oidhw,
+            bias,
+            stride,
+            padding,
+            dilation,
+            activation,
+            block_k,
+            layout=layout,
+        )
+    if route == Route3D.WINOGRAD_HW:
+        return conv3d_winograd_hw_f4x3(
+            x, w_oidhw, bias, stride, padding, dilation, activation, block_k
+        )
+    if route == Route3D.WINOGRAD_HW_CBLOCKED:
+        return conv3d_winograd_hw_f4x3_cblocked(
+            x, w_oidhw, bias, stride, padding, dilation, activation, block_k
+        )
+    if route == Route3D.CBLOCKED_NCDHW:
+        return conv3d_ncdhw_cblocked(
+            x, w_oidhw, bias, stride, padding, dilation, activation, block_k
+        )
+    if route == Route3D.NDHWC_3X3X3:
+        return conv3d_ndhwc_3x3x3(
+            x, w_oidhw, bias, stride, padding, dilation, activation, block_k
+        )
+    return conv3d_general(
+        x,
+        w_oidhw,
+        bias,
+        stride,
+        padding,
+        dilation,
+        activation,
+        block_k,
+        layout=layout,
+    )
+
+
+def conv3d_ncdhw(
+    x,
+    w_oidhw,
+    bias=None,
+    stride=(1, 1, 1),
+    padding=(0, 0, 0),
+    dilation=(1, 1, 1),
+    activation="none",
+    block_k=BLOCK_K,
+):
+    """NCDHW Conv3D with shape-driven specialized-kernel routing."""
+    _require_cuda_inputs(x, w_oidhw)
+    stride, padding, dilation = _normalize_conv3d_params(stride, padding, dilation)
+    x = _ensure_layout(x, "ncdhw")
+    return _route_and_run(
+        x,
+        w_oidhw,
+        bias,
+        stride,
+        padding,
+        dilation,
+        activation,
+        block_k,
+        layout="ncdhw",
+    )
+
+
+def conv3d_ndhwc(
+    x,
+    w_oidhw,
+    bias=None,
+    stride=(1, 1, 1),
+    padding=(0, 0, 0),
+    dilation=(1, 1, 1),
+    activation="none",
+    block_k=BLOCK_K,
+):
+    """Conv3d with NDHWC (channels-last-3d) input and output.
+
+    Input ``x`` has logical NCDHW shape but is converted to channels_last_3d so
+    channels are the inner contiguous axis (coalesced loads). Output is
+    allocated channels_last_3d and returned in logical NCDHW shape with
+    channels_last_3d strides.
+    """
+    _require_cuda_inputs(x, w_oidhw)
+    stride, padding, dilation = _normalize_conv3d_params(stride, padding, dilation)
+    x = _ensure_layout(x, "ndhwc")
+    return _route_and_run(
+        x,
+        w_oidhw,
+        bias,
+        stride,
+        padding,
+        dilation,
+        activation,
+        block_k,
+        layout="ndhwc",
+    )

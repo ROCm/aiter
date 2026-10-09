@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-import logging
 import math
 
 import numpy as np
 import pytest
 import torch
 
+from aiter import logger
 from aiter.ops.triton.attention.fav3_sage import (
     fav3_sage_wrapper_func,
     get_sage_fwd_configs,
@@ -23,9 +23,6 @@ from aiter.test_mha_common import (
     attention_ref_block_sparse,
 )
 
-logging.basicConfig(level=logging.DEBUG)
-logger = logging.getLogger(__name__)
-DEBUG_MODE = False
 ATOL_fp8 = 3.0e-1
 RTOL_fp8 = 2.5e-1
 
@@ -55,26 +52,34 @@ def compare_accuracy(current, reference):
     reference_f = reference.float()
     abs_diff = torch.abs(reference_f - current_f)
 
-    print("Output Tensor Stats:")
-    print(
-        f"  Reference ({tuple(reference_f.shape)}): min={reference_f.min().item():.6f}, max={reference_f.max().item():.6f}, "
-        f"mean={reference_f.mean().item():.6f}, std={reference_f.std().item():.6f}"
+    logger.info("Output Tensor Stats:")
+    logger.info(
+        "  Reference (%s): min=%.6f, max=%.6f, mean=%.6f, std=%.6f",
+        tuple(reference_f.shape),
+        reference_f.min().item(),
+        reference_f.max().item(),
+        reference_f.mean().item(),
+        reference_f.std().item(),
     )
-    print(
-        f"  Test      ({tuple(current_f.shape)}): min={current_f.min().item():.6f}, max={current_f.max().item():.6f}, "
-        f"mean={current_f.mean().item():.6f}, std={current_f.std().item():.6f}"
+    logger.info(
+        "  Test      (%s): min=%.6f, max=%.6f, mean=%.6f, std=%.6f",
+        tuple(current_f.shape),
+        current_f.min().item(),
+        current_f.max().item(),
+        current_f.mean().item(),
+        current_f.std().item(),
     )
 
-    print("Correctness Comparison:")
-    print(f"  Mean Absolute Error: {abs_diff.mean().item():.6e}")
-    print(f"  Max Absolute Error: {abs_diff.max().item():.6e}")
-    print(f"  Std Absolute Error: {abs_diff.std().item():.6e}")
+    logger.info("Correctness Comparison:")
+    logger.info("  Mean Absolute Error: %.6e", abs_diff.mean().item())
+    logger.info("  Max Absolute Error: %.6e", abs_diff.max().item())
+    logger.info("  Std Absolute Error: %.6e", abs_diff.std().item())
     ref_flat = reference_f.reshape(-1)
     test_flat = current_f.reshape(-1)
     cos_sim = torch.nn.functional.cosine_similarity(
         ref_flat.unsqueeze(0), test_flat.unsqueeze(0)
     )
-    print(f"  Cosine Similarity: {cos_sim.item():.8f}")
+    logger.info("  Cosine Similarity: %.8f", cos_sim.item())
     # Per-row (per-query) cosine over the head-dim D (last axis). Robust to a few outlier
     # rows: the global flatten cosine is dominated by the largest-magnitude elements, so an
     # aligned kernel with a handful of blown-up rows still reports a low global cosine. The
@@ -82,10 +87,12 @@ def compare_accuracy(current, reference):
     rc = torch.nn.functional.cosine_similarity(current_f, reference_f, dim=-1).reshape(
         -1
     )
-    print(
-        f"  Per-row cosine (over D): mean={rc.mean().item():.6f} "
-        f"median={rc.median().item():.6f} p10={rc.quantile(0.10).item():.6f} "
-        f"frac>0.99={(rc > 0.99).float().mean().item():.4f}"
+    logger.info(
+        "  Per-row cosine (over D): mean=%.6f median=%.6f p10=%.6f frac>0.99=%.4f",
+        rc.mean().item(),
+        rc.median().item(),
+        rc.quantile(0.10).item(),
+        (rc > 0.99).float().mean().item(),
     )
 
 
@@ -275,8 +282,7 @@ def test_sage(
         layout=layout,
     )
 
-    if DEBUG_MODE:
-        print(f"triton_out.shape={triton_out.shape}, triton_out={triton_out}")
+    logger.debug("triton_out.shape=%s, triton_out=%s", triton_out.shape, triton_out)
 
     if layout == "bhsd":
         q = q.permute(0, 2, 1, 3).contiguous()
@@ -291,11 +297,12 @@ def test_sage(
 
     assert torch_out.shape == triton_out.shape
 
-    if DEBUG_MODE:
-        print(f"torch_out.shape={torch_out.shape}, torch_out={torch_out}")
-        print(
-            f"attention_scores.shape={attention_scores.shape}, attention_scores={attention_scores}"
-        )
+    logger.debug("torch_out.shape=%s, torch_out=%s", torch_out.shape, torch_out)
+    logger.debug(
+        "attention_scores.shape=%s, attention_scores=%s",
+        attention_scores.shape,
+        attention_scores,
+    )
 
     check_attention_outputs(
         triton_out,
@@ -905,8 +912,7 @@ def test_sage_mxfp4(
         hadamard_rotation=hadamard_rotate,
     )
 
-    if DEBUG_MODE:
-        print(f"triton_out.shape={triton_out.shape}, triton_out={triton_out}")
+    logger.debug("triton_out.shape=%s, triton_out=%s", triton_out.shape, triton_out)
 
     if layout == "bhsd":
         q = q.permute(0, 2, 1, 3).contiguous()
@@ -921,11 +927,12 @@ def test_sage_mxfp4(
 
     assert torch_out.shape == triton_out.shape
 
-    if DEBUG_MODE:
-        print(f"torch_out.shape={torch_out.shape}, torch_out={torch_out}")
-        print(
-            f"attention_scores.shape={attention_scores.shape}, attention_scores={attention_scores}"
-        )
+    logger.debug("torch_out.shape=%s, torch_out=%s", torch_out.shape, torch_out)
+    logger.debug(
+        "attention_scores.shape=%s, attention_scores=%s",
+        attention_scores.shape,
+        attention_scores,
+    )
 
     check_attention_outputs(
         triton_out,

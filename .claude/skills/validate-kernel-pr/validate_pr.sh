@@ -877,6 +877,16 @@ changed = subprocess.run(
     capture_output=True,
     text=True,
 ).stdout.splitlines()
+# `git apply` introduces added files as UNTRACKED, and `git diff HEAD` never lists
+# those. Without this a PR whose whole point is a new kernel reads as touching no
+# kernel code, and a tolerance widened alongside it is reported under the weaker
+# finding. --exclude-standard keeps .gitignore'd build output out.
+changed += subprocess.run(
+    ["git", "-C", worktree, "ls-files", "--others", "--exclude-standard"],
+    check=True,
+    capture_output=True,
+    text=True,
+).stdout.splitlines()
 
 def tolerances(source):
     # A tolerance declared as a named constant -- DEFAULT_REL_TOL = 2e-2, TOL = 1e-3 -- was

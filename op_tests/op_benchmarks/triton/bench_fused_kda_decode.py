@@ -21,7 +21,7 @@ import triton
 import triton.language as tl
 from einops import rearrange
 
-from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.fused_sigmoid_gating_recurrent import (
+from aiter.ops.triton._triton_kernels.gated_delta_net.decode.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
 from aiter.ops.triton.gated_delta_net.causal_conv1d_decode import (
@@ -122,7 +122,151 @@ def _make_inputs(batch, Hloc):
     }
 
 
+def _make_spec_inputs(batch, Hloc, num_spec):
+    """Speculative decode inputs: num_spec + 1 tokens per sequence, 2-D state
+    indices (slot 0 is vLLM's NULL block, so real slots start at 1), and a
+    convolution cache that holds history plus previous draft candidates."""
+    lp = Hloc * D
+    S = num_spec + 1
+    T = batch * S
+    num_slots = batch * S + 2
+    torch.manual_seed(0)
+    return {
+        "mixed_qkv": torch.randn(T, 3 * lp, dtype=DTYPE, device=DEVICE),
+        "conv_weight": torch.randn(3 * lp, W, dtype=DTYPE, device=DEVICE) * 0.1,
+        "conv_state": torch.randn(
+            num_slots, 3 * lp, W - 1 + num_spec, dtype=DTYPE, device=DEVICE
+        )
+        * 0.1,
+        "gate": torch.randn(1, T, Hloc, D, dtype=DTYPE, device=DEVICE) * 0.5,
+        "beta": torch.randn(1, T, Hloc, dtype=DTYPE, device=DEVICE),
+        "out_gate": torch.randn(T, lp, dtype=DTYPE, device=DEVICE),
+        "A_log": torch.randn(Hloc, dtype=DTYPE, device=DEVICE) * 0.1,
+        "dt_bias": torch.randn(lp, dtype=DTYPE, device=DEVICE) * 0.1,
+        "ssm_state": torch.randn(
+            num_slots, Hloc, D, D, dtype=torch.float32, device=DEVICE
+        )
+        * 0.01,
+        "norm_weight": torch.ones(D, dtype=DTYPE, device=DEVICE),
+        "ssm_state_indices": torch.arange(
+            1, T + 1, dtype=torch.int32, device=DEVICE
+        ).reshape(batch, S),
+        "num_accepted_tokens": torch.ones(batch, dtype=torch.int32, device=DEVICE),
+        "conv_state_indices": torch.arange(
+            1, batch + 1, dtype=torch.int32, device=DEVICE
+        ),
+        "cu_seqlens": torch.arange(0, T + 1, S, dtype=torch.int64, device=DEVICE),
+    }
+
+
+def _count_parallel_launches(fkd_module, fn):
+    """How many times one call launches the parallel-V kernel.
+
+    Observing the launch keeps this benchmark honest about which path the
+    dispatch gate chose, without restating the gate's conditions here.
+    """
+    real = fkd_module.fused_kda_spec_parallel_v_kernel
+    calls = []
+
+    class _Spy:
+        def __getitem__(self, grid):
+            inner = real[grid]
+
+            def launch(*a, **k):
+                calls.append(1)
+                return inner(*a, **k)
+
+            return launch
+
+    fkd_module.fused_kda_spec_parallel_v_kernel = _Spy()
+    try:
+        fn()
+    finally:
+        fkd_module.fused_kda_spec_parallel_v_kernel = real
+    return len(calls)
+
+
+def run_spec_benchmark(args):
+    Hloc, num_spec = args.Hloc, args.num_spec
+    print(f"\nSpeculative decode: Hloc={Hloc}, D={D}, W={W}, tokens/seq={num_spec + 1}")
+    header = (
+        f"{'Batch':>6}  {'Generic(us)':>12}  {'Selected(us)':>13}  "
+        f"{'Speedup':>8}  {'Kernel':>10}"
+    )
+    print(header)
+    print("-" * len(header))
+    for batch in args.batches:
+        inp = _make_spec_inputs(batch, Hloc, num_spec)
+        # Clone once, outside the timed region: per-iteration clones bill the
+        # kernel for bookkeeping serving never does. State values drift, but
+        # they do not change the launch shape or instruction path.
+        cs = inp["conv_state"].clone()
+        ss = inp["ssm_state"].clone()
+        out = torch.empty(
+            inp["mixed_qkv"].shape[0],
+            Hloc * D,
+            dtype=DTYPE,
+            device=DEVICE,
+        )
+
+        def fn_fused(inp=inp, cs=cs, ss=ss, out=out):
+            fused_kda_decode(
+                inp["mixed_qkv"],
+                cs,
+                inp["conv_weight"],
+                inp["gate"],
+                inp["beta"],
+                inp["out_gate"],
+                inp["A_log"],
+                inp["dt_bias"],
+                ss,
+                inp["ssm_state_indices"],
+                inp["cu_seqlens"],
+                inp["norm_weight"],
+                1e-6,
+                D,
+                Hloc,
+                -5.0,
+                num_accepted_tokens=inp["num_accepted_tokens"],
+                conv_state_indices=inp["conv_state_indices"],
+                out=out,
+            )
+
+        # Time the generic kernel on the same inputs by failing the dispatch
+        # gate's arch test, so the speedup is reproducible rather than taken on
+        # trust. Which kernel the gate picks is observed, not recomputed: the
+        # gate has several other conditions (tile config, K, V, conv width) and
+        # a copy of it here would drift out of date silently.
+        import aiter.ops.triton.gated_delta_net.fused_kda_decode as _fkd
+
+        real_arch = _fkd.get_arch
+        try:
+            # Fail only the gfx950 specialized-path gate. Do not return gfx942:
+            # that would also change the generic launch from gfx950's four
+            # warps to gfx942's two warps.
+            _fkd.get_arch = lambda: "gfx950-generic"
+            t_generic = triton.testing.do_bench(fn_fused, warmup=50, rep=200) * 1000
+        finally:
+            _fkd.get_arch = real_arch
+
+        launched = _count_parallel_launches(_fkd, fn_fused)
+        t_fused = triton.testing.do_bench(fn_fused, warmup=50, rep=200) * 1000
+
+        picked = "parallel" if launched else "generic"
+        # A "generic" row timed the same kernel twice, so its ratio would be
+        # 1.00x by construction. Print "-" so it cannot be read as a measured
+        # tie between the two paths.
+        ratio = f"{t_generic / t_fused:>7.2f}x" if launched else f"{'-':>8}"
+        print(
+            f"{batch:>6}  {t_generic:>12.1f}  {t_fused:>13.1f}  "
+            f"{ratio}  {picked:>10}"
+        )
+
+
 def run_benchmark(args):
+    if args.num_spec > 0:
+        run_spec_benchmark(args)
+        return
     Hloc = args.Hloc
     batches = args.batches
 
@@ -133,10 +277,14 @@ def run_benchmark(args):
 
     for batch in batches:
         inp = _make_inputs(batch, Hloc)
+        # Clone once per arm, outside the timed region; see run_spec_benchmark.
+        # Charging both arms does not cancel out, it drags the ratio toward 1.0.
+        cs_3k = inp["conv_state"].clone()
+        ss_3k = inp["ssm_state"].clone()
+        cs_f = inp["conv_state"].clone()
+        ss_f = inp["ssm_state"].clone()
 
-        def fn_3k(inp=inp):
-            cs = inp["conv_state"].clone()
-            ss = inp["ssm_state"].clone()
+        def fn_3k(inp=inp, cs=cs_3k, ss=ss_3k):
             T = inp["mixed_qkv"].shape[0]
             lp = Hloc * D
             q, k, v = causal_conv1d_update_split_qkv(
@@ -169,9 +317,7 @@ def run_benchmark(args):
             og3d = rearrange(inp["out_gate"][:T], "t (h d) -> t h d", d=D)
             rmsnorm_gated_bf16(out, inp["norm_weight"], og3d, 1e-6)
 
-        def fn_fused(inp=inp):
-            cs = inp["conv_state"].clone()
-            ss = inp["ssm_state"].clone()
+        def fn_fused(inp=inp, cs=cs_f, ss=ss_f):
             fused_kda_decode(
                 inp["mixed_qkv"],
                 cs,
@@ -215,6 +361,13 @@ def parse_args(args=None):
         nargs="+",
         default=[1, 4, 8, 16, 32, 64, 128, 256],
         help="Batch sizes to benchmark",
+    )
+    parser.add_argument(
+        "--num-spec",
+        type=int,
+        default=0,
+        help="Draft tokens per sequence; > 0 benchmarks the speculative path "
+        "(Kimi-K3 DSpark uses 7)",
     )
     return parser.parse_args(args=args)
 

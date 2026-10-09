@@ -31,9 +31,9 @@ configs/<arch>/<backend>/<op>/<d_type>/<CONFIG_NAME>-<suffix>.json
 
 | Segment     | Values                                                      |
 | ----------- | ----------------------------------------------------------- |
-| `<arch>`    | `gfx942`, `gfx950`, `gfx1100`, `gfx1151`, `gfx1200`, `gfx1201`, `gfx1250` |
+| `<arch>`    | `gfx942`, `gfx950`, `gfx1100`, `gfx1101`, `gfx1150`, `gfx1151`, `gfx1200`, `gfx1201`, `gfx1250` |
 | `<backend>` | `triton` or `gluon`                                          |
-| `<op>`      | `gemm`, `moe`, `conv`, `mhc`, `attention`, `gmm`, `fusions`  |
+| `<op>`      | `gemm`, `moe`, `conv`, `mhc`, `attention`, `gmm`, `fusions`, `quant` |
 | `<d_type>`  | `config_name.lower().replace("-", "_")` — `GEMM-AFP4WFP4` → `gemm_afp4wfp4`. The transform is `config_utils._dtype_dir()` |
 | filename    | **no arch prefix** — the arch is the directory. The default is literally `DEFAULT.json`; specialized files keep the `<CONFIG_NAME>-` stem |
 
@@ -73,8 +73,9 @@ directory; it never probes, never searches, and has no fallback chain:
 ```
 
 - `arch` defaults to `arch_info.get_arch()`. The `arch=` argument is an
-  explicit override for loaders that deliberately retry under another
-  architecture (MHC's gfx942 fallback, §5.3) — not a search order.
+  explicit override for documented compatibility fallbacks: MHC retries
+  gfx942 (§5.3), and Triton `fused_clamp_act_mul` retries its legacy gfx950
+  table. It is not a search order.
 - `backend` is **declared by the caller** and defaults to `"triton"`. Gluon
   kernels and gluon dispatch paths pass `"gluon"`. There is no cross-backend
   search: the two backends take disjoint config params, so a config tuned for
@@ -115,6 +116,20 @@ load_config_json(fpath, required=True) -> dict | None
   shallow `.copy()` for flat bucket dicts, `copy.deepcopy` when nested
   sub-dicts get mutated. The family loaders already do this for their callers.
 
+### `select_leq_config()`
+
+`select_leq_config(configs, value, prefix="N_LEQ_", fallback_key="any")`
+selects the smallest numeric upper bound containing `value`, then falls back
+to `fallback_key`. It returns a shallow copy so callers may consume the flat
+config without mutating the cached table.
+
+For tables keyed on several axes, pass `axes=("M", "N")` and one keyword value
+per axis, for example `select_leq_config(table, axes=("M", "N"), M=m, N=n)`.
+A key joins one `<axis>_LEQ_<n>` or `<axis>_GEQ_<n>` part per constrained axis
+with `.`, for example `M_LEQ_32.N_LEQ_1024`. Per axis, in `axes` order
+(leftmost wins ties), the lookup tries LEQ bounds ascending, then GEQ bounds
+descending, then `any`. The `any` key is required.
+
 ---
 
 ## 3. Loader modules
@@ -126,28 +141,31 @@ exactly one home; there is no facade or re-export layer.
 
 | Module | Entry points | Reads |
 | ------ | ------------ | ----- |
-| `utils/config_utils.py` | `resolve_config_dir`, `load_config_json`, `AITER_TRITON_CONFIGS_PATH`, `AITER_TRITON_OPS_PATH`, `USE_LRU_CACHE` | — (core) |
+| `utils/config_utils.py` | `resolve_config_dir`, `load_config_json`, `select_leq_config`, `AITER_TRITON_CONFIGS_PATH`, `AITER_TRITON_OPS_PATH`, `USE_LRU_CACHE` | — (core) |
 | `utils/gemm_config_utils.py` | `get_gemm_config`, `add_default_gemm_config_params`, `compute_splitk_params`, `pick_gemm_num_stages`, `STANDARD_M_BOUNDS` | `<arch>/<backend>/gemm/<d_type>/` |
 | `utils/conv_config_utils.py` | `get_conv_config`, `has_conv_config`, `has_exact_conv_config`, `conv_config_uses_exact_routes`, `format_shape_key`, `format_prepack_shape_key`, `CONV_STANDARD_M_BOUNDS` | `<arch>/triton/conv/<d_type>/` |
 | `utils/mhc_config_utils.py` | `get_mhc_config`, `get_mhc_post_config`, `hip_post_dispatch_block` | `<arch>/triton/mhc/<d_type>/` (gfx942 fallback) |
 | `utils/moe_config_utils.py` | `get_moe_dispatch` | `<arch>/<backend>/moe/<d_type>/` |
 | `utils/tuned_config_utils.py` | `get_tuned_kernel_config` | `<arch>/<backend>/<op>/<d_type>/DEFAULT.json` |
+| `utils/quant_config_utils.py` | `get_quant_config` | `<arch>/gluon/quant/<d_type>/DEFAULT.json` |
 
 Attention and GMM kernels have no family module: they call
 `resolve_config_dir()` + `load_config_json()` directly from their kernel file,
 which is fine for a single `DEFAULT.json` read with no selection logic.
+GMM adds one small exception: an optional per-variant `"dispatch"` list of
+`{"config", "min_K", "min_N", "min_avg_rows_per_group"}` rules, first match
+wins, skipped for `accumulate=True`, falling back to `"default"` (see
+`aiter/ops/triton/README.md`). Thresholds live in the JSON, never in Python.
 
 Adding a family module is the right move only when a family grows real
 selection logic (bucket walks, specialized-file discovery, fallbacks). Until
 then, two lines against the core beat a module.
 
-Two places still interpolate `AITER_TRITON_CONFIGS_PATH` by hand instead of
-calling the resolver: `tuned_config_utils._get_tuned_kernel_entry()` and
-`fusions/fused_clamp_act_mul.py::_get_config()` (whose gfx950 fallback is
-exactly the resolver's `arch=` override). Both land on the same directory the
-resolver would build, but they re-encode the layout and skip the argument
-validation. Move them onto `resolve_config_dir()` when you touch them; do not
-add a third.
+`tuned_config_utils._get_tuned_kernel_entry()` still interpolates
+`AITER_TRITON_CONFIGS_PATH` instead of calling the resolver. It lands on the
+same directory the resolver would build, but re-encodes the layout and skips
+argument validation. Move it onto `resolve_config_dir()` when you touch it;
+do not add another.
 
 ---
 
@@ -191,7 +209,9 @@ The returned config is a fresh deep copy, safe to mutate.
 - `M_LEQ_x` is searched over `STANDARD_M_BOUNDS =
   (1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)`. A caller may
   override with `bounds=(...)`, which must be strictly increasing positive
-  ints.
+  ints. A file may instead declare a top-level `M_BOUNDS` list to keep
+  nonstandard tuning boundaries in JSON. Explicit `bounds=` wins; files
+  without `M_BOUNDS` retain the standard bounds.
 - `any` must exist unless every reachable `M` is covered by an explicit bound.
   A `KeyError` at lookup time usually means it is missing.
 - The deprecated `{"large": …, "small": …}` shape must not be introduced.

@@ -3,7 +3,7 @@
 #include "rocm_ops.hpp"
 #include "gemm_a4w4_blockscale.h"
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
 {
     GEMM_A4W4_BLOCKSCALE_TUNE_PYBIND;
 }

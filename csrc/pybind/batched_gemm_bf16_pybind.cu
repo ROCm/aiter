@@ -3,7 +3,7 @@
 #include "rocm_ops.hpp"
 #include "batched_gemm_bf16.h"
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
 {
     BATCHED_GEMM_BF16_PYBIND;
 }

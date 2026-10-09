@@ -41,7 +41,7 @@ def tanh(x):
 
 
 _fwd_kernel_stage1_repr = make_kernel_repr(
-    "_fwd_kernel_stage1",
+    "mla_decode_fwd_kernel_stage1",
     [
         "kv_group_num",
         "BLOCK_DMODEL",
@@ -296,7 +296,7 @@ def _decode_att_m_fwd(
 
 
 _fwd_grouped_kernel_stage1_repr = make_kernel_repr(
-    "_fwd_grouped_kernel_stage1",
+    "mla_decode_fwd_grouped_kernel_stage1",
     [
         "kv_group_num",
         "q_head_num",
@@ -580,7 +580,7 @@ def _decode_grouped_att_m_fwd(
 
 
 _fwd_kernel_stage2_repr = make_kernel_repr(
-    "_fwd_kernel_stage2",
+    "mla_decode_fwd_kernel_stage2",
     [
         "NUM_KV_SPLITS",
         "BLOCK_DV",
@@ -693,7 +693,7 @@ def _decode_softmax_reducev_fwd(
 
 
 _csr_to_dense_kernel_repr = make_kernel_repr(
-    "_csr_to_dense_kernel",
+    "mla_decode_csr_to_dense_kernel",
     [
         "BLOCK_N",
     ],

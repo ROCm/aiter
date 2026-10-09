@@ -8,7 +8,6 @@ import logging
 import multiprocessing
 import os
 import re
-import shlex
 import shutil
 import sys
 import time
@@ -22,9 +21,17 @@ from packaging.version import Version, parse
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f"{this_dir}/utils/")
-from chip_info import get_gfx, get_gfx_list, get_gfx_runtime
+from chip_info import _detect_native, get_gfx, get_gfx_list, get_gfx_runtime
 from cpp_extension import _jit_compile, executable_path, get_hip_version
 from file_baton import FileBaton
+from jit_cache import (
+    atomic_copy,
+    publish_blob_sources,
+    publish_compiled_kids,
+    require_blob_generation,
+    snapshot_compiled_kids,
+    stage_blob_sources,
+)
 from torch_guard import torch_compile_guard
 
 AITER_REBUILD = int(os.environ.get("AITER_REBUILD", "0"))
@@ -53,9 +60,13 @@ def mp_lock(
     MainFunc: Callable,
     FinalFunc: Callable | None = None,
     WaitFunc: Callable | None = None,
+    build_after_wait: bool = False,
 ):
     """
     Using FileBaton for multiprocessing.
+
+    With build_after_wait, a peer completing does not satisfy this invocation:
+    acquire the lock and run MainFunc with our request-specific arguments.
     """
     baton = FileBaton(lockPath)
     while True:
@@ -71,7 +82,7 @@ def mp_lock(
         # wait() returns True if the holder released normally (work done),
         # or False if it broke a stale lock left by a dead/abandoned holder --
         # in which case we loop and try to acquire + build ourselves.
-        if baton.wait():
+        if baton.wait() and not build_after_wait:
             if WaitFunc is not None:
                 return WaitFunc()
             return None
@@ -81,6 +92,13 @@ logger = logging.getLogger("aiter")
 
 PY = sys.executable
 this_dir = os.path.dirname(os.path.abspath(__file__))
+
+# Platform helpers to keep aiter importable and buildable on Windows.
+IS_WINDOWS = sys.platform == "win32"
+NULL_DEVICE = "NUL" if IS_WINDOWS else "/dev/null"
+# Suffix for built JIT modules. Linux extensions ship as `.so`; on Windows
+# Python loads `.pyd` (which is just a renamed `.dll`).
+JIT_LIB_EXT = ".pyd" if IS_WINDOWS else ".so"
 
 AITER_ROOT_DIR = os.path.abspath(f"{this_dir}/../../")
 AITER_LOG_MORE = int(os.getenv("AITER_LOG_MORE", "0"))
@@ -98,6 +116,16 @@ AITER_CONFIG_GEMM_A6W6 = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/a6w6_blockscale_tuned_gemm.csv",
 )
 
+AITER_CONFIG_GEMM_A6W4_ASM = (
+    os.getenv("AITER_CONFIG_GEMM_A6W4_ASM", "").strip()
+    or f"{AITER_ROOT_DIR}/aiter/configs/a6w4_asm_tuned_gemm.csv"
+)
+
+AITER_CONFIG_GEMM_A4W6_ASM = (
+    os.getenv("AITER_CONFIG_GEMM_A4W6_ASM", "").strip()
+    or f"{AITER_ROOT_DIR}/aiter/configs/a4w6_asm_tuned_gemm.csv"
+)
+
 AITER_CONFIG_GEMM_A8W8 = os.getenv(
     "AITER_CONFIG_GEMM_A8W8",
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_tuned_gemm.csv",
@@ -113,9 +141,27 @@ AITER_CONFIG_GEMM_A8W8_BLOCKSCALE = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_tuned_gemm.csv",
 )
 
+# Native E8M0 group32 scales have a different operand contract from the
+# FP32 128x128 blockscale family, so shape-identical rows must stay separate.
+AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_GROUP32 = os.getenv(
+    "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_GROUP32",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_group32_tuned_gemm.csv",
+)
+# E8M0 block-scale GEMM rows (1x32/32x32 and 1x128/128x128) for (16, 16)-
+# preshuffled weights, keyed on the w_scale block as well.
+AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE = os.getenv(
+    "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm.csv",
+)
+
 AITER_CONFIG_FMOE = os.getenv(
     "AITER_CONFIG_FMOE",
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_fmoe.csv",
+)
+
+AITER_CONFIG_COMM_FUSED_MOE = os.getenv(
+    "AITER_CONFIG_COMM_FUSED_MOE",
+    f"{AITER_ROOT_DIR}/aiter/configs/comm_fused_moe.csv",
 )
 
 AITER_CONFIG_FHMOE = os.getenv(
@@ -133,6 +179,16 @@ AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv",
 )
 
+AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE = os.getenv(
+    "AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_mxfp8_bpreshuffle_tuned_gemm.csv",
+)
+
+AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_ABPRESHUFFLE = os.getenv(
+    "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_ABPRESHUFFLE",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_abpreshuffle_tuned_gemm.csv",
+)
+
 AITER_CONFIG_A8W8_BATCHED_GEMM = os.getenv(
     "AITER_CONFIG_A8W8_BATCHED_GEMM",
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_tuned_batched_gemm.csv",
@@ -146,8 +202,9 @@ AITER_CONFIG_BF16_BATCHED_GEMM = os.getenv(
 # fp8 e8m0 mxscale (block-scale) batched-GEMM tuned config. Its own family
 # (scale type baked into the filename, matching the a8w8_/bf16_ split) so a
 # future fp32 rowwise-scale variant lands in a separate CSV and never collides
-# on key. The scale type is identified by the filename alone. The
-# per-model tuned data currently lives under model_configs/ (e.g.
+# on key. Within the family the e8m0 weight-scale block (32x32, 128x128, 1x32
+# or 1x128) is the w_scale_block key column. The per-model tuned data
+# currently lives under model_configs/ (e.g.
 # dsv4_batched_gemm_a8w8_blockscale_mxscale_tuned.csv), merged in at runtime by
 # get_config_file; this canonical path may not exist on disk.
 AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE = os.getenv(
@@ -166,9 +223,12 @@ AITER_CONFIG_GEMM_BF16 = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_gemm.csv",
 )
 
-AITER_CONFIG_GDR_DECODE = os.getenv(
-    "AITER_CONFIG_GDR_DECODE",
-    f"{AITER_ROOT_DIR}/aiter/configs/gdr_decode_tuned.csv",
+# Per-model tuned rows live under model_configs/
+# (qwenimage_vae_bf16_tuned_conv3d.csv, wan21_vae_bf16_tuned_conv3d.csv) and
+# get merged into this canonical file by get_config_file. It ships header-only.
+AITER_CONFIG_CONV3D_BF16 = os.getenv(
+    "AITER_CONFIG_CONV3D_BF16",
+    f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_conv3d.csv",
 )
 
 # K5 opt BV tuned config. Per-model tuned rows live under model_configs/
@@ -179,6 +239,11 @@ AITER_CONFIG_GDR_DECODE = os.getenv(
 AITER_CONFIG_GDN_K5_OPT = os.getenv(
     "AITER_CONFIG_GDN_K5_OPT",
     f"{AITER_ROOT_DIR}/aiter/configs/chunk_gdn_h_opt_tuned.csv",
+)
+
+AITER_CONFIG_DISPATCH_COMBINE_INTRANODE = os.getenv(
+    "AITER_CONFIG_DISPATCH_COMBINE_INTRANODE",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_dispatch_combine_intranode.csv",
 )
 
 
@@ -197,6 +262,22 @@ class AITER_CONFIG:
             "AITER_CONFIG_GEMM_A6W6",
             AITER_CONFIG_GEMM_A6W6,
             "a6w6_blockscale_tuned_gemm",
+        )
+
+    @property
+    def AITER_CONFIG_GEMM_A6W4_ASM_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A6W4_ASM",
+            AITER_CONFIG_GEMM_A6W4_ASM,
+            "a6w4_asm_tuned_gemm",
+        )
+
+    @property
+    def AITER_CONFIG_GEMM_A4W6_ASM_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A4W6_ASM",
+            AITER_CONFIG_GEMM_A4W6_ASM,
+            "a4w6_asm_tuned_gemm",
         )
 
     @property
@@ -222,9 +303,33 @@ class AITER_CONFIG:
         )
 
     @property
+    def AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_GROUP32_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_GROUP32",
+            AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_GROUP32,
+            "a8w8_blockscale_group32_tuned_gemm",
+        )
+
+    @property
+    def AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE",
+            AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE,
+            "a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm",
+        )
+
+    @property
     def AITER_CONFIG_FMOE_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_FMOE", AITER_CONFIG_FMOE, "tuned_fmoe"
+        )
+
+    @property
+    def AITER_CONFIG_COMM_FUSED_MOE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_COMM_FUSED_MOE",
+            AITER_CONFIG_COMM_FUSED_MOE,
+            "tuned_comm_fused_moe",
         )
 
     @property
@@ -250,6 +355,22 @@ class AITER_CONFIG:
         )
 
     @property
+    def AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE",
+            AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE,
+            "a8w8_mxfp8_bpreshuffle_tuned_gemm",
+        )
+
+    @property
+    def AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_ABPRESHUFFLE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_ABPRESHUFFLE",
+            AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_ABPRESHUFFLE,
+            "a8w8_blockscale_abpreshuffle_tuned_gemm",
+        )
+
+    @property
     def AITER_CONFIG_A8W8_BATCHED_GEMM_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_A8W8_BATCHED_GEMM",
@@ -272,8 +393,10 @@ class AITER_CONFIG:
         )
 
     @property
-    def AITER_CONFIG_GDR_DECODE_FILE(self):
-        return AITER_CONFIG_GDR_DECODE
+    def AITER_CONFIG_CONV3D_BF16_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_CONV3D_BF16", AITER_CONFIG_CONV3D_BF16, "bf16_tuned_conv3d"
+        )
 
     @property
     def AITER_CONFIG_GDN_K5_OPT_FILE(self):
@@ -281,6 +404,14 @@ class AITER_CONFIG:
             "AITER_CONFIG_GDN_K5_OPT",
             AITER_CONFIG_GDN_K5_OPT,
             "chunk_gdn_h_opt_tuned",
+        )
+
+    @property
+    def AITER_CONFIG_DISPATCH_COMBINE_INTRANODE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_DISPATCH_COMBINE_INTRANODE",
+            AITER_CONFIG_DISPATCH_COMBINE_INTRANODE,
+            "tuned_dispatch_combine_intranode",
         )
 
     @property
@@ -419,13 +550,13 @@ class AITER_CONFIG:
             logger.warning(
                 f"Untuned config file not found: {untuned_path}. Using all columns for deduplication."
             )
-
+        import tempfile
         from pathlib import Path
 
-        config_path = Path("/tmp/aiter_configs/")
+        config_path = Path(tempfile.gettempdir()) / "aiter_configs"
         if not config_path.exists():
             config_path.mkdir(parents=True, exist_ok=True)
-        new_file_path = f"{config_path}/{merge_name}.csv"
+        new_file_path = str(config_path / f"{merge_name}.csv")
         lock_path = f"{new_file_path}.lock"
         tmp_file_path = f"{new_file_path}.tmp"
 
@@ -438,9 +569,9 @@ class AITER_CONFIG:
 
     # Cache is keyed on (self, env_name, ...); this object is a
     # process-lifetime singleton, so the retained reference is not a leak.
-    @functools.lru_cache(maxsize=20)  # noqa: B019
+    @functools.lru_cache(maxsize=64)  # noqa: B019
     def get_config_file(self, env_name, default_file, tuned_file_name):
-        config_env_file = os.getenv(env_name)
+        config_env_file = (os.getenv(env_name) or "").strip()
         # default_file = f"{AITER_ROOT_DIR}/aiter/configs/{tuned_file_name}.csv"
         from pathlib import Path
 
@@ -561,6 +692,12 @@ if multiprocessing.current_process().name == "MainProcess":
 def validate_and_update_archs():
     archs = os.getenv("GPU_ARCHS", "native").split(";")
     archs = [arch.strip() for arch in archs]
+
+    # clang's `--offload-arch=native` shells out to offload-arch, which cannot
+    # detect the GPU on Windows, so resolve the arch ourselves instead.
+    if IS_WINDOWS and archs == ["native"]:
+        archs = _detect_native()
+
     # List of allowed architectures
     allowed_archs = [
         "native",
@@ -597,11 +734,11 @@ def hip_flag_checker(flag_hip: str) -> bool:
     cmd = (
         [executable_path("hipcc")]
         + flag_hip.split()
-        + ["-x", "hip", "-E", "-P", "/dev/null", "-o", "/dev/null"]
+        + ["-x", "hip", "-E", "-P", NULL_DEVICE, "-o", NULL_DEVICE]
     )
     try:
         subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
-    except subprocess.CalledProcessError:
+    except (subprocess.CalledProcessError, FileNotFoundError):
         logger.warning(f"Current hipcc not support: {flag_hip}, skip it.")
         return False
     return True
@@ -616,14 +753,46 @@ def check_LLVM_MAIN_REVISION():
     #else
     #define CK_TILE_HOST_DEVICE_EXTERN"""
     import subprocess
+    import tempfile
 
+    # Compile a probe file rather than piping the source through the shell:
+    # the `echo ... | hipcc -` idiom quotes differently under cmd.exe, so the
+    # probe silently always failed on Windows. The standard is pinned to the
+    # one the modules are built with, otherwise the compiler default decides
+    # whether the probe's CTAD is even legal and the answer stops being about
+    # __host__ __device__ at all.
+    probe_src = (
+        "#include <tuple>\n"
+        "__host__ __device__ void func(){"
+        "std::tuple<int, int> t = std::tuple(1, 1);"
+        "}\n"
+    )
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".cpp", delete=False) as tf:
+        tf.write(probe_src)
+        probe_path = tf.name
     try:
-        hipcc = shlex.quote(executable_path("hipcc"))
-        cmd = f"""echo "#include <tuple>
-__host__ __device__ void func(){{std::tuple<int, int> t = std::tuple(1, 1);}}" | {hipcc} -x hip -P -c -Wno-unused-command-line-argument -o /dev/null -"""
-        subprocess.check_output(cmd, shell=True, text=True, stderr=subprocess.STDOUT)
+        subprocess.check_output(
+            [
+                executable_path("hipcc"),
+                "-x",
+                "hip",
+                "-std=c++20",
+                "-P",
+                "-c",
+                "-Wno-unused-command-line-argument",
+                "-o",
+                NULL_DEVICE,
+                probe_path,
+            ],
+            stderr=subprocess.STDOUT,
+        )
     except (subprocess.CalledProcessError, AssertionError):
         return 554785
+    finally:
+        try:
+            os.remove(probe_path)
+        except OSError:
+            pass
     return 554785 - 1
 
 
@@ -658,11 +827,11 @@ def rename_cpp_to_cu(els, dst, hipify, recursive=False):
         if hipify:
             if name.endswith((".cpp", ".cu")):
                 newName = name.replace(".cpp", ".cu")
-                ret.append(f"{dst}/{newName}")
-            shutil.copy(f"{src}/{name}", f"{dst}/{newName}")
+                ret.append(os.path.join(dst, newName))
+            shutil.copy(os.path.join(src, name), os.path.join(dst, newName))
         else:
             if name.endswith((".cpp", ".cu")):
-                ret.append(f"{src}/{newName}")
+                ret.append(os.path.join(src, newName))
 
     ret = []
     for el in els:
@@ -671,11 +840,10 @@ def rename_cpp_to_cu(els, dst, hipify, recursive=False):
             continue
         if os.path.isdir(el):
             for entry in os.listdir(el):
-                if os.path.isdir(f"{el}/{entry}"):
+                child = os.path.join(el, entry)
+                if os.path.isdir(child):
                     if recursive:
-                        ret += rename_cpp_to_cu(
-                            [f"{el}/{entry}"], dst, hipify, recursive
-                        )
+                        ret += rename_cpp_to_cu([child], dst, hipify, recursive)
                     continue
                 do_rename_and_mv(entry, el, dst, ret)
         else:
@@ -683,9 +851,36 @@ def rename_cpp_to_cu(els, dst, hipify, recursive=False):
     return ret
 
 
+def _stage_blob_sources(
+    blob_gen_cmd, op_dir, src_dir, sources, hipify, seed_files=None
+):
+    """Generate JIT sources in a deterministic transactional working tree."""
+    staging_dir, token = stage_blob_sources(
+        blob_gen_cmd,
+        op_dir,
+        PY,
+        logger=logger,
+        log_commands=AITER_LOG_MORE > 0,
+        seed_files=seed_files,
+        return_token=True,
+    )
+    if staging_dir is None:
+        return sources, None, None
+    generated_sources = rename_cpp_to_cu([staging_dir], src_dir, hipify, recursive=True)
+    require_blob_generation(staging_dir, token)
+    return sources + generated_sources, staging_dir, token
+
+
 @torch_compile_guard()
 def check_numa_custom_op() -> None:
-    numa_balance_set = os.popen("cat /proc/sys/kernel/numa_balancing").read().strip()
+    # /proc/sys/kernel/numa_balancing is Linux-only.
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        with open("/proc/sys/kernel/numa_balancing") as f:
+            numa_balance_set = f.read().strip()
+    except OSError:
+        return
     if numa_balance_set == "1":
         logger.warning(
             "WARNING: NUMA balancing is enabled, which may cause errors. "
@@ -731,6 +926,77 @@ def _so_offload_archs(so_path):
     return archs
 
 
+_PYBIND11_ABI_KEY_RE = re.compile(rb"__pybind11_internals_v[0-9A-Za-z_]+__")
+
+
+def _so_pybind11_abi_key(so_path):
+    # the key of pybind11's cross-module type registry, as embedded in a built
+    # .so. two extensions see the same registry only when this string matches
+    # byte for byte; it encodes the pybind11 internals version plus the compiler
+    # / stdlib / C++ ABI the module was built with. None means missing file or a
+    # module built without pybind11.
+    # find() first, then the regex: a plain scan over a several-hundred-MB CK
+    # module would otherwise touch every page just to reach one short string.
+    import mmap
+
+    try:
+        with open(so_path, "rb") as f, mmap.mmap(
+            f.fileno(), 0, access=mmap.ACCESS_READ
+        ) as mm:
+            pos = mm.find(b"__pybind11_internals_v")
+            if pos < 0:
+                return None
+            m = _PYBIND11_ABI_KEY_RE.match(mm, pos)
+            return m.group(0).decode() if m else None
+    except (OSError, ValueError, OverflowError):
+        return None
+
+
+@functools.lru_cache(maxsize=1024)
+def _pybind11_abi_keys(md_name, so_path, core_so_path):
+    # (module key, core key) when the two disagree, else None. lru_cached on the
+    # paths, so each .so is read at most once per process and the healthy answer
+    # costs one dict lookup. A module with no key at all (host-only, or built
+    # without pybind11) counts as agreeing: there is nothing to mismatch.
+    core_key = _so_pybind11_abi_key(core_so_path)
+    mod_key = _so_pybind11_abi_key(so_path)
+    if not core_key or not mod_key or core_key == mod_key:
+        return None
+    return (mod_key, core_key)
+
+
+def _raise_on_pybind11_abi_split(md_name, so_path, core_so_path, has_tensor_arg):
+    # aiter_tensor_t is registered exactly once, by module_aiter_core, and
+    # develop=True ops hand one of those objects to a different .so. That
+    # resolves only if both modules landed in the same pybind11 type registry,
+    # i.e. share the key above. When they do not, pybind11 sees an unregistered
+    # type and rejects the tensor arguments with a bare "incompatible function
+    # arguments", naming neither cause nor cure -- which is what PR #4847 hit and
+    # worked around by reverting a module to at::Tensor.
+    #
+    # The call is going to fail either way, so fail it here with the reason
+    # attached instead. Gated on an argument actually being a tensor: a mismatch
+    # only bites when an aiter_tensor_t has to cross, and a develop op called
+    # with none would otherwise still work.
+    keys = _pybind11_abi_keys(md_name, so_path, core_so_path)
+    if keys is None or not has_tensor_arg():
+        return
+    mod_key, core_key = keys
+    raise RuntimeError(
+        f"[{md_name}] was built against a different pybind11 ABI than "
+        f"module_aiter_core, so it cannot see the aiter_tensor_t registration "
+        f"and every tensor argument would be rejected:\n"
+        f"    {md_name}: {mod_key}\n"
+        f"      ({so_path})\n"
+        f"    module_aiter_core: {core_key}\n"
+        f"      ({core_so_path})\n"
+        f"The two .so files come from different build environments -- differing "
+        f"pybind11 version, C++ ABI, or one built against torch and one not. "
+        f"Rebuild both in one environment: AITER_REBUILD=1, or remove "
+        f"{get_user_jit_dir()} and let them rebuild."
+    )
+
+
 def _needs_arch_rebuild(md_name):
     # a prebuilt .so is a valid host extension on any GPU, so importing one
     # built for the wrong arch succeeds and only faults later at kernel launch.
@@ -741,7 +1007,7 @@ def _needs_arch_rebuild(md_name):
     except Exception:  # noqa: BLE001
         # running arch undetectable (e.g. no GPU) -> keep normal behaviour
         return False
-    so_path = os.path.join(get_user_jit_dir(), f"{md_name}.so")
+    so_path = os.path.join(get_user_jit_dir(), f"{md_name}{JIT_LIB_EXT}")
     built = _so_offload_archs(so_path)
     if not built or cur in built:
         return False
@@ -761,7 +1027,7 @@ def get_module(md_name):
     return __mds[md_name]
 
 
-rebuilded_list = ["module_aiter_core"]
+rebuilded_list = []
 
 
 def clone_3rdparty(third_party: str) -> None:
@@ -890,11 +1156,19 @@ def clone_3rdparty(third_party: str) -> None:
 
 
 def rm_module(md_name):
-    os.system(f"rm -rf {get_user_jit_dir()}/{md_name}.so")
+    path = os.path.join(get_user_jit_dir(), f"{md_name}{JIT_LIB_EXT}")
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        logger.warning(f"Failed to remove {path}: {e}")
 
 
 def clear_build(md_name):
-    os.system(f"rm -rf {bd_dir}/{md_name}")
+    path = os.path.join(bd_dir, md_name)
+    if os.path.isdir(path):
+        shutil.rmtree(path, ignore_errors=True)
 
 
 def build_module(
@@ -912,11 +1186,12 @@ def build_module(
     third_party,
     hipify=False,
     flags_extra_hip_per_source=None,
+    build_after_wait=False,
 ):
     os.makedirs(bd_dir, exist_ok=True)
     lock_path = f"{bd_dir}/lock_{md_name}"
     startTS = time.perf_counter()
-    target_name = f"{md_name}.so" if not is_standalone else md_name
+    target_name = f"{md_name}{JIT_LIB_EXT}" if not is_standalone else md_name
 
     for tp in third_party:
         clone_3rdparty(tp)
@@ -936,8 +1211,22 @@ def build_module(
         opbd_dir = f"{op_dir}/build"
         src_dir = f"{op_dir}/build/srcs"
         os.makedirs(src_dir, exist_ok=True)
-        if os.path.exists(f"{get_user_jit_dir()}/{target_name}"):
-            os.remove(f"{get_user_jit_dir()}/{target_name}")
+
+        def raise_build_error(error):
+            tag = f"\033[31mfailed jit build [{md_name}]\033[0m"
+            logger.error(
+                f"{tag}\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\n-->[History]: {{}}{tag}\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191".format(
+                    re.sub(
+                        "error:",
+                        "\033[31merror:\033[0m",
+                        "-->".join(traceback.format_exception(*sys.exc_info())),
+                        flags=re.IGNORECASE,
+                    ),
+                )
+            )
+            raise RuntimeError(
+                f"[aiter] build [{md_name}] under {opbd_dir} failed !!!!!!"
+            ) from error
 
         sources = rename_cpp_to_cu(srcs, src_dir, hipify)
 
@@ -1030,21 +1319,35 @@ def build_module(
         flags_hip = [el for el in flags_hip if hip_flag_checker(el)]
         check_and_set_ninja_worker()
 
-        def exec_blob(blob_gen_cmd, op_dir, src_dir, sources):
-            if blob_gen_cmd:
-                blob_dir = f"{op_dir}/blob/"
-                os.makedirs(blob_dir, exist_ok=True)
-                if AITER_LOG_MORE:
-                    logger.info(f"exec_blob ---> {PY} {blob_gen_cmd.format(blob_dir)}")
-                os.system(f"{PY} {blob_gen_cmd.format(blob_dir)}")
-                sources += rename_cpp_to_cu([blob_dir], src_dir, hipify, recursive=True)
-            return sources
-
-        if isinstance(blob_gen_cmd, list):
-            for s_blob_gen_cmd in blob_gen_cmd:
-                sources = exec_blob(s_blob_gen_cmd, op_dir, src_dir, sources)
-        else:
-            sources = exec_blob(blob_gen_cmd, op_dir, src_dir, sources)
+        blob_dir = f"{op_dir}/blob"
+        staged_blob_dir = None
+        staged_token = None
+        compiled_kids_snapshot = None
+        seed_files = None
+        if md_name == "module_deepgemm_opus":
+            seed_files = [
+                (
+                    f"{bd_dir}/compiled_kids_opus.json",
+                    "compiled_kids_opus.json",
+                )
+            ]
+        try:
+            sources, staged_blob_dir, staged_token = _stage_blob_sources(
+                blob_gen_cmd,
+                op_dir,
+                src_dir,
+                sources,
+                hipify,
+                seed_files=seed_files,
+            )
+            if staged_blob_dir is not None and md_name == "module_deepgemm_opus":
+                compiled_kids_snapshot = snapshot_compiled_kids(
+                    f"{staged_blob_dir}/compiled_kids_opus.json"
+                )
+                require_blob_generation(staged_blob_dir, staged_token)
+        except Exception as error:  # noqa: BLE001
+            raise_build_error(error)
+        active_blob_dir = staged_blob_dir or blob_dir
 
         extra_include_paths = []
 
@@ -1073,7 +1376,7 @@ def build_module(
                 _extra_inc = [p for p in extra_include if os.path.isdir(str(p))]
             extra_include_paths += [
                 f"{AITER_CSRC_DIR}/include",
-                f"{op_dir}/blob",
+                active_blob_dir,
             ] + _extra_inc
             if not is_standalone and not torch_exclude:
                 extra_include_paths += [f"{AITER_CSRC_DIR}/include/torch"]
@@ -1097,6 +1400,12 @@ def build_module(
                 )
 
         try:
+
+            def validate_generation():
+                if staged_blob_dir is not None:
+                    require_blob_generation(staged_blob_dir, staged_token)
+
+            validate_generation()
             _jit_compile(
                 md_name,
                 sorted(set(sources)),
@@ -1112,28 +1421,52 @@ def build_module(
                 torch_exclude=torch_exclude,
                 hipify=hipify,
                 extra_cuda_cflags_per_source=flags_extra_hip_per_source,
+                # We install a stable module name. Let Ninja check incremental
+                # dependencies and retry failures, not the Python loader cache.
+                use_versioner=False,
             )
+            validate_generation()
             if is_python_module and not is_standalone:
-                shutil.copy(f"{opbd_dir}/{target_name}", f"{get_user_jit_dir()}")
+                artifact_path = f"{get_user_jit_dir()}/{target_name}"
             else:
-                shutil.copy(
-                    f"{opbd_dir}/{target_name}", f"{AITER_ROOT_DIR}/op_tests/cpp/mha"
-                )
-        except Exception as e:
-            tag = f"\033[31mfailed jit build [{md_name}]\033[0m"
-            logger.error(
-                f"{tag}\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\n-->[History]: {{}}{tag}\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191".format(
-                    re.sub(
-                        "error:",
-                        "\033[31merror:\033[0m",
-                        "-->".join(traceback.format_exception(*sys.exc_info())),
-                        flags=re.IGNORECASE,
-                    ),
-                )
+                artifact_path = f"{AITER_ROOT_DIR}/op_tests/cpp/mha/{target_name}"
+            installed_identity = atomic_copy(
+                f"{opbd_dir}/{target_name}",
+                artifact_path,
+                validate=validate_generation,
             )
-            raise RuntimeError(
-                f"[aiter] build [{md_name}] under {opbd_dir} failed !!!!!!"
-            ) from e
+        except Exception as error:  # noqa: BLE001
+            raise_build_error(error)
+
+        if staged_blob_dir is not None:
+            if md_name == "module_deepgemm_opus":
+                try:
+                    publish_compiled_kids(
+                        compiled_kids_snapshot,
+                        f"{bd_dir}/compiled_kids_opus.json",
+                        artifact_path,
+                        installed_identity,
+                    )
+                except Exception:
+                    # A stale receipt cannot validate the newly installed .so.
+                    # Do not make a successful build fail because of metadata.
+                    logger.warning(
+                        "JIT build [%s] succeeded, but publishing its compiled-kid "
+                        "metadata failed; the tuner will revalidate by rebuilding",
+                        md_name,
+                        exc_info=AITER_LOG_MORE > 0,
+                    )
+            try:
+                publish_blob_sources(
+                    staged_blob_dir, blob_dir, expected_token=staged_token
+                )
+            except Exception:
+                logger.warning(
+                    "JIT build [%s] succeeded, but publishing its generated-source "
+                    "cache failed; keeping the installed artifact",
+                    md_name,
+                    exc_info=AITER_LOG_MORE > 0,
+                )
 
     def FinalFunc():
         logger.info(
@@ -1141,7 +1474,12 @@ def build_module(
             f"\033[32mfinish build [{md_name}], cost {time.perf_counter() - startTS:.1f}s \033[0m"
         )
 
-    mp_lock(lockPath=lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
+    mp_lock(
+        lockPath=lock_path,
+        MainFunc=MainFunc,
+        FinalFunc=FinalFunc,
+        build_after_wait=build_after_wait,
+    )
 
 
 def _get_ck_exclude_modules():
@@ -1309,6 +1647,7 @@ def get_args_of_build(ops_name: str, exclude=None):
                         "extra_include": single_ops["extra_include"],
                         "blob_gen_cmd": single_ops["blob_gen_cmd"],
                         "third_party": single_ops["third_party"],
+                        "torch_exclude": single_ops["torch_exclude"],
                     }
                     for (  # noqa: PLC0206  loop mutates d_all_ops[k] by key while reading single_ops[k]; .items() does not help
                         k
@@ -1403,7 +1742,7 @@ def _ctypes_call(func, fc_name, md_name):
     def _ensure_loaded():
         if _cache:
             return
-        so_path = os.path.join(get_user_jit_dir(), f"{md_name}.so")
+        so_path = os.path.join(get_user_jit_dir(), f"{md_name}{JIT_LIB_EXT}")
         if not os.path.exists(so_path) or _needs_arch_rebuild(md_name):
             d_args = get_args_of_build(md_name)
             d_args["torch_exclude"] = True
@@ -1997,6 +2336,24 @@ def compile_ops(
                     convert, tensor_cls, raw_stream, current_device = (
                         _pybind_develop_hooks()
                     )
+
+                    # Both .so files are loaded by now, so their real paths are
+                    # known (a prebuilt module lives in the package dir, a JIT
+                    # one under the user jit dir; only __file__ tells them
+                    # apart). The scan of each .so happens once per process; the
+                    # tensor-argument sweep is passed as a thunk so it only runs
+                    # on the broken path.
+                    core_mod = __mds.get("module_aiter_core")
+                    if core_mod is not None:
+                        _raise_on_pybind11_abi_split(
+                            md_name,
+                            getattr(module, "__file__", "") or "",
+                            getattr(core_mod, "__file__", "") or "",
+                            lambda: any(
+                                isinstance(a, tensor_cls)
+                                for a in (*args, *kwargs.values())
+                            ),
+                        )
 
                     args = tuple(
                         convert(a) if isinstance(a, tensor_cls) else a for a in args

@@ -5,14 +5,14 @@
 #pragma once
 
 #include "../../opus_gemm_utils.cuh"
-#include "opus_gemm_traits_a16w16.cuh"  // opus_splitk_ws_handle
+#include "opus_gemm_traits_a16w16.cuh"  // opus_gfx942_uniform_ws_ptr
 #include <cstdint>
 
 template<int VEC_ = 16, int BLOCK_ = 64, typename D_WS = float,
          typename D_OUT = __bf16, bool HAS_BIAS_ = false,
          typename D_BIAS_ = D_OUT, bool HAS_OOB_ = true>
 __device__ __forceinline__ void splitk_reduce_kernel_fallback_body(
-    const opus_splitk_ws_handle* __restrict__ ws_handle,
+    const void* __restrict__ ws_ptr,
     D_OUT*       __restrict__ c_out,
     int split_k, int M, int N, int batch,
     int padded_M, int padded_N,
@@ -47,7 +47,7 @@ __device__ __forceinline__ void splitk_reduce_kernel_fallback_body(
 
     const int b = bm_id / M;
     const int m = bm_id - b * M;
-    const D_WS* workspace = opus_splitk_ws_ptr<const D_WS>(ws_handle);
+    const D_WS* workspace = opus_gfx942_uniform_ws_ptr<D_WS>(ws_ptr);
 
     opus::vector_t<float, VEC> bias_fp32;
     if constexpr (HAS_BIAS) {
@@ -194,7 +194,7 @@ template<int VEC_ = 16, int BLOCK_ = 64, typename D_OUT = __bf16,
          bool HAS_BIAS_ = false, typename D_BIAS_ = D_OUT,
          bool HAS_OOB_ = true>
 __global__ void splitk_reduce_kernel_fallback(
-    const opus_splitk_ws_handle* __restrict__ ws_handle,
+    const void* __restrict__ ws_ptr,
     D_OUT*       __restrict__ c_out,
     int split_k, int M, int N, int batch,
     int padded_M, int padded_N,
@@ -202,14 +202,14 @@ __global__ void splitk_reduce_kernel_fallback(
     int bias_stride_batch)
 {
     splitk_reduce_kernel_fallback_body<VEC_, BLOCK_, float, D_OUT, HAS_BIAS_, D_BIAS_, HAS_OOB_>(
-        ws_handle, c_out, split_k, M, N, batch, padded_M, padded_N, bias, bias_stride_batch);
+        ws_ptr, c_out, split_k, M, N, batch, padded_M, padded_N, bias, bias_stride_batch);
 }
 
 template<int VEC_ = 16, int BLOCK_ = 64, typename D_OUT = __bf16,
          bool HAS_BIAS_ = false, typename D_BIAS_ = D_OUT,
          bool HAS_OOB_ = true>
 __global__ void splitk_reduce_kernel_bf16ws_fallback(
-    const opus_splitk_ws_handle* __restrict__ ws_handle,
+    const void* __restrict__ ws_ptr,
     D_OUT*       __restrict__ c_out,
     int split_k, int M, int N, int batch,
     int padded_M, int padded_N,
@@ -217,7 +217,7 @@ __global__ void splitk_reduce_kernel_bf16ws_fallback(
     int bias_stride_batch)
 {
     splitk_reduce_kernel_fallback_body<VEC_, BLOCK_, __bf16, D_OUT, HAS_BIAS_, D_BIAS_, HAS_OOB_>(
-        ws_handle, c_out, split_k, M, N, batch, padded_M, padded_N, bias, bias_stride_batch);
+        ws_ptr, c_out, split_k, M, N, batch, padded_M, padded_N, bias, bias_stride_batch);
 }
 
 // Exact-N row-block fast path: static split_k unroll, guarded M tail.
@@ -225,7 +225,7 @@ template<int SPLIT_K, int N_VEC, int ROWS_PER_BLOCK, int VEC_ = 8,
          typename D_WS = float, typename D_OUT = __bf16,
          bool HAS_BIAS_ = false, typename D_BIAS_ = D_OUT>
 __global__ void splitk_reduce_kernel_exact_n_rowblock(
-    const opus_splitk_ws_handle* __restrict__ ws_handle,
+    const void* __restrict__ ws_ptr,
     D_OUT*       __restrict__ c_out,
     int M, int N, int batch,
     int padded_M, int padded_N,
@@ -257,7 +257,7 @@ __global__ void splitk_reduce_kernel_exact_n_rowblock(
     if (m >= M) {
         return;
     }
-    const D_WS* workspace = opus_splitk_ws_ptr<const D_WS>(ws_handle);
+    const D_WS* workspace = opus_gfx942_uniform_ws_ptr<D_WS>(ws_ptr);
 
     opus::vector_t<float, VEC> bias_fp32;
     if constexpr (HAS_BIAS) {

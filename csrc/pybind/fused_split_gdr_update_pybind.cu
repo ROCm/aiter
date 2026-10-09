@@ -5,7 +5,7 @@
 #include "rocm_ops.hpp"
 #include "fused_split_gdr_update.h"
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
 {
     AITER_SET_STREAM_PYBIND
     FUSED_SPLIT_GDR_UPDATE_PYBIND;

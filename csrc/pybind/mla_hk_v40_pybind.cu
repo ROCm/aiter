@@ -5,7 +5,7 @@
 #include "mla_hk.h"
 #include "rocm_ops.hpp"
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
 {
     AITER_SET_STREAM_PYBIND
     MLA_HK_V40_PYBIND;

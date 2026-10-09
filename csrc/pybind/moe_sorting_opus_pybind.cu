@@ -4,7 +4,7 @@
 #include "aiter_stream.h"
 #include "moe_sorting_opus.h"
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
 {
     AITER_SET_STREAM_PYBIND
     MOE_SORTING_OPUS_PYBIND;

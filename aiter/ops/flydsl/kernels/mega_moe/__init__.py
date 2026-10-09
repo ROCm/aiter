@@ -6,10 +6,14 @@
 import importlib
 
 _LAZY = {
+    "MegaMoEBundleEntry": "mega_moe_config",
+    "MegaMoEBundlePlan": "mega_moe_config",
     "MegaMoEConfig": "mega_moe_config",
     "MegaMoEV2": "mega_moe_v2",
     "Stage1Config": "mega_moe_config",
     "Stage2Config": "mega_moe_config",
+    "Stage2BundleKey": "mega_moe_config",
+    "build_mega_moe_bundle_plan": "mega_moe_config",
     "compile_gemm1": "gemm1",
     "gemm1_kernel": "gemm1",
     "select_mega_moe_config": "mega_moe_config",

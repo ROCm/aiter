@@ -11,6 +11,8 @@ import torch
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.runtime.device import get_rocm_arch
 
+from aiter.utility.graph_alloc import persistent_alloc
+
 from .gemm_a16w16_gfx950_utils import (
     GFX950_DMA_BYTES,
     GFX950_WAVE_SIZE,
@@ -1382,15 +1384,20 @@ def assert_no_k_tail(k: int, kwargs: dict):
 
 @functools.lru_cache(maxsize=128)
 def get_split_k_buffers(stream, device):
-    semaphore = torch.zeros(
-        (SPLIT_K_SEMAPHORE_MAX_LEN,), dtype=torch.int32, device=device
-    )
-    signal = torch.zeros((SPLIT_K_SEMAPHORE_MAX_LEN,), dtype=torch.int32, device=device)
+    with persistent_alloc(torch.device(device)):
+        semaphore = torch.zeros(
+            (SPLIT_K_SEMAPHORE_MAX_LEN,), dtype=torch.int32, device=device
+        )
+        signal = torch.zeros(
+            (SPLIT_K_SEMAPHORE_MAX_LEN,), dtype=torch.int32, device=device
+        )
     return semaphore, signal
 
 
 def _dynamic_tensor_arg(tensor, leading_dim):
-    return flyc.from_dlpack(tensor).mark_layout_dynamic(leading_dim=leading_dim)
+    return flyc.from_dlpack(tensor.detach()).mark_layout_dynamic(
+        leading_dim=leading_dim
+    )
 
 
 def gemm_a16w16(

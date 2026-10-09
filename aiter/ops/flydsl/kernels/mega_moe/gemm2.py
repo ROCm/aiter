@@ -14,8 +14,6 @@ from flydsl.expr.typing import (
 )
 from flydsl.expr.typing import Vector as Vec
 
-from aiter.ops.flydsl.kernels import buffer_ops
-
 from ..mxfp4_gemm_common import _lds_swizzle_mask as lds_swizzle_mask
 from ..mxfp4_gemm_common import (
     flat_buffer_view,
@@ -27,6 +25,7 @@ from ..mxfp4_gemm_common import (
     lds_swizzle_mask_f8,
     lds_vec_load,
 )
+from ..tensor_shim import buf_copy_load, ptr_buf_tensor
 
 
 def scale_view(
@@ -184,8 +183,11 @@ def gemm2_compute_v2(
     g2_bhoist=True,
     g2_ascale_pf=True,
     expert_offset=0,
+    explicit_m_row=None,
+    explicit_n_block=None,
+    explicit_expert=None,
 ):
-    """Run the GEMM2 K-loop and return accumulators for the selected epilogue."""
+    """Run GEMM2, optionally using an explicitly selected expert row/tile."""
     # SBM is the sort padding unit; BM is the compute tile and must divide SBM.
     if SBM is None:
         SBM = BM
@@ -226,15 +228,21 @@ def gemm2_compute_v2(
         N_real = N_OUT_rt - fx.Int32(i32_npad)
 
     # Map each compute block to its SBM-padded expert metadata row.
-    m_block_idx = bx_i32 // num_n_blocks
-    n_block_idx = bx_i32 - m_block_idx * num_n_blocks
-    eids_ptr = global_typed_ptr(arg_eids, T.i32)
-    if const_expr(SBM == BM):
-        e = rocdl.readfirstlane(T.i32, eids_ptr[m_block_idx])
-        m_row = m_block_idx * BM
+    if const_expr(explicit_m_row is not None):
+        m_row = fx.Int32(explicit_m_row)
+        m_block_idx = m_row // fx.Int32(BM)
+        n_block_idx = fx.Int32(explicit_n_block)
+        e = fx.Int32(explicit_expert)
     else:
-        m_row = m_block_idx * BM
-        e = rocdl.readfirstlane(T.i32, eids_ptr[m_row // fx.Int32(SBM)])
+        m_block_idx = bx_i32 // num_n_blocks
+        n_block_idx = bx_i32 - m_block_idx * num_n_blocks
+        eids_ptr = global_typed_ptr(arg_eids, T.i32)
+        if const_expr(SBM == BM):
+            e = rocdl.readfirstlane(T.i32, eids_ptr[m_block_idx])
+            m_row = m_block_idx * BM
+        else:
+            m_row = m_block_idx * BM
+            e = rocdl.readfirstlane(T.i32, eids_ptr[m_row // fx.Int32(SBM)])
     if const_expr(expert_offset != 0):
         e = e - fx.Int32(expert_offset)
 
@@ -351,7 +359,7 @@ def gemm2_compute_v2(
         return out
 
     # Stream B weights and scales through registers so use_nt reaches the ISA cache policy.
-    bq_rsrc = buffer_ops.create_buffer_resource_from_addr(arg_bq)
+    bq_buffer = ptr_buf_tensor(arg_bq, fx.Int32, unit_elems=4)
 
     bq_base_dw = [
         rocdl.readfirstlane(
@@ -392,13 +400,28 @@ def gemm2_compute_v2(
                     load_mask = (col < N_real) & (
                         kt_rt * fx.Int32(kHalves) + fx.Int32(half) < halves_real
                     )
-                bq_vec = buffer_ops.buffer_load(
-                    bq_rsrc,
-                    bq_off_dw,
-                    vec_width=4,
-                    dtype=T.i32,
-                    mask=load_mask,
+                safe_bq_off_dw = (
+                    load_mask.select(bq_off_dw, fx.Int32(0))
+                    if load_mask is not None
+                    else bq_off_dw
+                )
+                loaded_bq = buf_copy_load(
+                    bq_buffer,
+                    safe_bq_off_dw // fx.Int32(4),
+                    fx.Int32,
+                    unit_elems=4,
                     cache_modifier=2 if use_nt else 0,
+                )
+                bq_vec = (
+                    fx.Vector.from_elements(
+                        [
+                            load_mask.select(loaded_bq[i], fx.Int32(0))
+                            for i in range_constexpr(4)
+                        ],
+                        fx.Int32,
+                    )
+                    if load_mask is not None
+                    else loaded_bq
                 )
                 bqf[j][half].store(Vec(bq_vec))
         chunk_kt = (
