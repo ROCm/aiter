@@ -94,6 +94,15 @@ def _fp4x8_to_fp8x8(raw_i32):
     return fx.Vector.from_elements([_raw(ev), _raw(od)], fx.Int32).bitcast(fx.Int64)[0]
 
 
+def _to_k8_order(v_i64):
+    """8 fp8 bytes in natural K order -> A8W4_K8_ORDER (x0,x2,x4,x6, x1,x3,x5,x7)."""
+    w = fx.Vector.from_elements([_raw(v_i64)], fx.Int64).bitcast(fx.Int32)
+    lo, hi = _raw(fx.Int32(w[0])), _raw(fx.Int32(w[1]))
+    ev = rocdl.perm_b32(hi, lo, _raw(fx.Int32(0x06040200)))
+    od = rocdl.perm_b32(hi, lo, _raw(fx.Int32(0x07050301)))
+    return fx.Vector.from_elements([ev, od], fx.Int32).bitcast(fx.Int64)[0]
+
+
 def _gemm1_body_a8w4(
     lds_raw_ptr,
     arg_x,
@@ -121,8 +130,15 @@ def _gemm1_body_a8w4(
     rocm_arch,
     x_scale="mx",
     k_wave=1,
+    x_layout="a8w4",
 ):
     _row_xs = x_scale == "row"
+    # x_layout="moe_sort": x and its scales come straight from aiter's
+    # fused_dynamic_mxfp8_quant_moe_sort (the a8w4 quant fused_moe already runs with the
+    # sorting): x in natural K order, E8M0 scales per SORTED row in aiter's MX scale
+    # swizzle. "a8w4": mxfp8_quant_a8w4_gfx942 (A8W4_K8_ORDER, [n_tokens, K/32]).
+    _ms = x_layout == "moe_sort"
+    _ms_npad = ((K // MX_BLOCK + 7) // 8) * 8  # aiter scaleN_pad
     N_OUT = 2 * INTER
     m_repeat = BM // 16
     n_k0 = TILE_K // 128  # 128-wide K groups per tile (4 MX blocks each)
@@ -237,7 +253,7 @@ def _gemm1_body_a8w4(
         1,
     )
     xs_row_base = []  # [mi][i]: "mx" dword index of the row's first scale; "row" f32
-    for mi in range_constexpr(m_repeat):
+    for mi in range_constexpr(0 if _ms else m_repeat):
         bases = []
         for ii in range_constexpr(4):
             row = bx_m + fx.Int32(mi * 16) + lane_div_16 * fx.Int32(4) + fx.Int32(ii)
@@ -281,10 +297,46 @@ def _gemm1_body_a8w4(
                 scales.append(_e8m0_byte_to_f32(dw, fx.Int32(j)))
         return scales
 
+    xs_ms_tiles4 = _global_i32_buffer_tiles(arg_xscale, 0xFFFFFFFF, 4)
+    xs_ms_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(0), fx.Int32)
+
+    def load_x_scale_moe_sort(base_k):
+        """aiter swizzle (mx_scale_shuffle_idx): byte of (sorted row x, k-group y) at
+        (x//32*npad)*32 + (y//8)*256 + (y%4)*64 + (x%16)*4 + (y%8)//4*2 + (x%32)//16.
+        This lane's accumulator rows x = r0 + ii (r0 = bx_m + mi*16 + 4*grp) are 4
+        consecutive dwords, so one dwordx4 per y%4 serves all 4 rows. Returns
+        (xs[mi][j] = v4i32, byte_hi) with the byte of block b of the tile at
+        2 * ((y0 + b) % 8 // 4) + ((bx_m + mi*16)//16 % 2) in dword ii.
+        """
+        y0 = base_k // fx.Int32(MX_BLOCK)
+        out = []
+        for mi in range_constexpr(m_repeat):
+            r0 = bx_m + fx.Int32(mi * 16) + lane_div_16 * fx.Int32(4)
+            base = (
+                (r0 // fx.Int32(32)) * fx.Int32(_ms_npad * 32)
+                + (y0 // fx.Int32(8)) * fx.Int32(256)
+                + (r0 % fx.Int32(16)) * fx.Int32(4)
+            )
+            vs = []
+            for j in range_constexpr(4):
+                r = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
+                fx.copy(
+                    xs_ms_atom,
+                    fx.slice(
+                        xs_ms_tiles4, (None, (base + fx.Int32(j * 64)) // fx.Int32(16))
+                    ),
+                    r,
+                )
+                vs.append(Vec(fx.memref_load_vec(r)))
+            out.append(vs)
+        return out, y0
+
     def load_x_scale(base_k):
         """xs[mi][i] = list of TILE_K/128 dwords (4 e8m0 bytes each) for that row."""
         if const_expr(_row_xs):
             return None
+        if const_expr(_ms):
+            return load_x_scale_moe_sort(base_k)
         out = []
         k_dw = base_k // fx.Int32(128)
         for mi in range_constexpr(m_repeat):
@@ -321,18 +373,19 @@ def _gemm1_body_a8w4(
                 + fx.Int32(slot * A_SLOT_BYTES)
                 + row * fx.Int32(TILE_K)
             )
-            frags.append(
-                [
-                    lds_vec_load(
-                        lds_base_i32,
-                        row_byte + fx.Int32(b * MX_BLOCK) + lane_div_16 * fx.Int32(8),
-                        T.i64,
-                        T.i64,
-                        align=8,
-                    )
-                    for b in range_constexpr(n_blk)
-                ]
-            )
+            fr = [
+                lds_vec_load(
+                    lds_base_i32,
+                    row_byte + fx.Int32(b * MX_BLOCK) + lane_div_16 * fx.Int32(8),
+                    T.i64,
+                    T.i64,
+                    align=8,
+                )
+                for b in range_constexpr(n_blk)
+            ]
+            if const_expr(_ms):
+                fr = [_to_k8_order(v) for v in fr]
+            frags.append(fr)
         return frags
 
     zero4 = _raw(fx.Vector.filled(4, 0.0, fx.Float32))
@@ -379,18 +432,45 @@ def _gemm1_body_a8w4(
                             )
                     continue
                 # x scales of this lane's 4 accumulator rows for block b, as one vector
-                xs4 = [
-                    Vec.from_elements(
-                        [
-                            _raw(
-                                _e8m0_byte_to_f32(x_sc[mi][ii][b // 4], fx.Int32(b % 4))
+                if const_expr(_ms):
+                    xs_v, y0 = x_sc
+                    xs4 = []
+                    for mi in range_constexpr(m_repeat):
+                        byte = (
+                            (y0 + fx.Int32(b)) % fx.Int32(8) // fx.Int32(4)
+                        ) * fx.Int32(2) + (
+                            (bx_m + fx.Int32(mi * 16)) // fx.Int32(16)
+                        ) % fx.Int32(
+                            2
+                        )
+                        xs4.append(
+                            Vec.from_elements(
+                                [
+                                    _raw(
+                                        _e8m0_byte_to_f32(
+                                            fx.Int32(xs_v[mi][b % 4][ii]), byte
+                                        )
+                                    )
+                                    for ii in range_constexpr(4)
+                                ],
+                                fx.Float32,
                             )
-                            for ii in range_constexpr(4)
-                        ],
-                        fx.Float32,
-                    )
-                    for mi in range_constexpr(m_repeat)
-                ]
+                        )
+                else:
+                    xs4 = [
+                        Vec.from_elements(
+                            [
+                                _raw(
+                                    _e8m0_byte_to_f32(
+                                        x_sc[mi][ii][b // 4], fx.Int32(b % 4)
+                                    )
+                                )
+                                for ii in range_constexpr(4)
+                            ],
+                            fx.Float32,
+                        )
+                        for mi in range_constexpr(m_repeat)
+                    ]
                 for ni in range_constexpr(num_acc_n):
                     sg4 = _splat4(g_sc[ni][b])
                     su4 = _splat4(u_sc[ni][b])
@@ -504,8 +584,10 @@ def _mxfp8_exponent(amax):
     """Shared-exponent rule: the smallest e with amax / 2**e <= 240 (E4M3FNUZ max).
 
     With amax = (1 + f) * 2**E this is E - 7, or E - 6 when 1 + f > 1.875, i.e.
-    ceil(log2(amax / 240)) computed on the float bits, so torch, Triton and the vLLM
-    accuracy plugin agree bit for bit. Clamped to the E8M0 range.
+    ceil(log2(amax / 240)) computed on the float bits. Bitwise equal to aiter's
+    gfx942 ``fused_dynamic_mxfp8_quant_moe_sort`` (checked incl. amax = 1.875 * 2**E,
+    zero and -0 blocks), the Triton quantiser below and the vLLM accuracy plugin.
+    Clamped to the E8M0 range.
     """
     bits = amax.float().view(torch.int32)
     e = ((bits >> 23) & 0xFF) - 127 - 7 + ((bits & 0x7FFFFF) > 0x700000).to(torch.int32)
@@ -625,7 +707,8 @@ def compile_gemm1_a8w4_gfx942(
     waves_per_eu=None,
     x_scale="mx",
     k_wave=1,
-    rev="r9",  # bump on kernel changes: the FlyDSL cache key hashes this factory only
+    x_layout="a8w4",
+    rev="r10",  # bump on kernel changes: the FlyDSL cache key hashes this factory only
     rocm_arch,
 ):
     """Build the gfx942 a8w4 (MXFP8 A x MXFP4 W) fused stage1 (gate+up + act)."""
@@ -651,6 +734,10 @@ def compile_gemm1_a8w4_gfx942(
     assert (BM * TILE_K) % 1024 == 0, "BM*TILE_K must be a multiple of 1024"
     assert act in ("silu", "swiglu", "situv2"), f"bad act {act!r}"
     assert x_scale in ("mx", "row"), f"x_scale must be 'mx' or 'row', got {x_scale!r}"
+    assert x_layout in ("a8w4", "moe_sort"), f"bad x_layout {x_layout!r}"
+    assert (
+        x_layout == "a8w4" or x_scale == "mx"
+    ), "x_layout='moe_sort' carries MX scales"
     NUM_N_BLOCKS = _INTER // TILE_N
     _a_lds_stages = 2 if (_K // k_wave // TILE_K) > 1 else 1
     lds_bytes = k_wave * _a_lds_stages * BM * TILE_K
@@ -667,7 +754,7 @@ def compile_gemm1_a8w4_gfx942(
     name_suffix = (
         f"a8w4_h{_K}_i{_INTER}_ne{NE}_bm{BM}_tn{TILE_N}_tk{TILE_K}"
         f"{_act_tag}{_bcm_tag}{_xcd_tag}{_wpe_tag}"
-        f"{'' if x_scale == 'mx' else '_xrow'}{f'_kw{k_wave}' if k_wave > 1 else ''}_{rev}"
+        f"{'' if x_scale == 'mx' else '_xrow'}{f'_kw{k_wave}' if k_wave > 1 else ''}{'_ms' if x_layout == 'moe_sort' else ''}_{rev}"
     )
 
     @fx.struct
@@ -756,6 +843,7 @@ def compile_gemm1_a8w4_gfx942(
                 rocm_arch=rocm_arch,
                 x_scale=x_scale,
                 k_wave=k_wave,
+                x_layout=x_layout,
             )
 
     @flyc.jit
@@ -824,9 +912,12 @@ def flydsl_a8w4_gemm1_gfx942(
     swiglu_limit=float("inf"),
     x_scale="mx",
     k_wave=1,
+    x_layout="a8w4",
     stream=None,
 ):
-    """gfx942 a8w4 fused stage1. ``a_fp8``: E4M3FNUZ ``[n_tokens, D_HIDDEN]``;
+    """gfx942 a8w4 fused stage1. ``x_layout="moe_sort"``: ``a_fp8`` / ``a_scale_u8`` are
+    the outputs of aiter's ``fused_dynamic_mxfp8_quant_moe_sort`` (as in fused_moe).
+    ``x_layout="a8w4"``: ``a_fp8``: E4M3FNUZ ``[n_tokens, D_HIDDEN]``;
     ``a_scale_u8``: E8M0 ``[n_tokens, D_HIDDEN/32]`` row-major. W1/scale: the a16w4
     preshuffle relaid by ``shuffle_weight_a8w4_gfx942`` / ``shuffle_scale_a8w4_gfx942``.
     """
@@ -843,6 +934,7 @@ def flydsl_a8w4_gemm1_gfx942(
         waves_per_eu=waves_per_eu,
         x_scale=x_scale,
         k_wave=k_wave,
+        x_layout=x_layout,
         rocm_arch=str(get_rocm_arch()),
     )
     grid = gemm1_a8w4_grid(
