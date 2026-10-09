@@ -179,9 +179,7 @@ def _issue_loads(
     )
     if W_PRESHUFFLED:
         # hi and lo together: 2*KS packed bf16 columns per KS block of k.
-        gl.amd.gfx1250.tdm.async_load(
-            fn_desc, [0, 0, kb * 2 * KS], fn_smem.index(slot)
-        )
+        gl.amd.gfx1250.tdm.async_load(fn_desc, [0, 0, kb * 2 * KS], fn_smem.index(slot))
     else:
         gl.amd.gfx1250.tdm.async_load(fn_desc, [0, 0, kb * KS], fn_smem.index(slot))
 
@@ -193,9 +191,7 @@ def _wait_next_stage(i, NUM_STAGES: gl.constexpr, K_LOOP: gl.constexpr):
     issued after them: the stores of up to NUM_STAGES-2 earlier k-steps and the loads
     of the later stages (x, res, fn: 3 per stage). s_wait_tensorcnt takes an
     immediate, so the count is picked from a ladder of uniform branches."""
-    n = gl.minimum(i, NUM_STAGES - 2) + 3 * gl.minimum(
-        NUM_STAGES - 2, K_LOOP - 2 - i
-    )
+    n = gl.minimum(i, NUM_STAGES - 2) + 3 * gl.minimum(NUM_STAGES - 2, K_LOOP - 2 - i)
     for v in gl.static_range(4 * (NUM_STAGES - 2) + 1):
         if n == v:
             gl.amd.gfx1250.tdm.async_wait(v)
@@ -928,7 +924,9 @@ def _reduce_apply_main(
             block_shape=(ROWS, HC, KBC, 32),
             layout=SMEM_RES,
         )
-        res_smem = gl.allocate_shared_memory(dt, [N_CHUNKS, ROWS, HC, KBC, 32], SMEM_RES)
+        res_smem = gl.allocate_shared_memory(
+            dt, [N_CHUNKS, ROWS, HC, KBC, 32], SMEM_RES
+        )
         for j in gl.static_range(N_CHUNKS):
             gl.amd.gfx1250.tdm.async_load(
                 res_desc, [row0, 0, (c0 + j * CHUNK) // 32, 0], res_smem.index(j)
@@ -1192,7 +1190,7 @@ def _mhc_pre_reduce_apply_gfx1250_kernel(
         SK,
         SMEM_MIX,
         SMEM_RES,
-            RES_KS,
+        RES_KS,
     )
     if WS:
         gl.warp_specialize(
