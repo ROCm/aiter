@@ -62,7 +62,6 @@ EXPLICIT_VGPR_PARTITION = int(
 )
 PLANAR_LDS = int(os.environ.get("AITER_FLYDSL_PLANAR_LDS", "0"))
 INTERLEAVED_LDS_LOAD = int(os.environ.get("AITER_FLYDSL_INTERLEAVED_LDS_LOAD", "0"))
-ROLLED_DRAIN = int(os.environ.get("AITER_FLYDSL_ROLLED_DRAIN", "1"))
 LDS_SOA_LOAD_INTERLEAVE = os.environ.get("LDS_SOA_LOAD_INTERLEAVE")
 if LDS_SOA_LOAD_INTERLEAVE is not None:
     LDS_SOA_LOAD_INTERLEAVE = int(LDS_SOA_LOAD_INTERLEAVE)
@@ -78,8 +77,6 @@ if PLANAR_LDS not in (0, 1):
     raise ValueError("AITER_FLYDSL_PLANAR_LDS must be 0 or 1")
 if INTERLEAVED_LDS_LOAD not in (0, 1):
     raise ValueError("AITER_FLYDSL_INTERLEAVED_LDS_LOAD must be 0 or 1")
-if ROLLED_DRAIN not in (0, 1):
-    raise ValueError("AITER_FLYDSL_ROLLED_DRAIN must be 0 or 1")
 if LDS_SOA_LOAD_INTERLEAVE not in (None, 0, 1):
     raise ValueError("LDS_SOA_LOAD_INTERLEAVE must be 0 or 1")
 if FORCE_1X4_CLUSTER not in (0, 1):
@@ -173,6 +170,7 @@ def launch_gemm_a8w4_tdm(
     a_scale_row_stride_bytes: Constexpr[int] = 0,
     lds_soa_load_interleave: Constexpr[int] = 0,
     persistent_workers: Constexpr[int] = 0,
+    rolled_drain: Constexpr[int] = 0,
 ):
     """Launch the grouped contiguous-M a8w4 MoE GEMM for gfx1250.
 
@@ -229,7 +227,8 @@ def launch_gemm_a8w4_tdm(
     # Double buffering is sufficient: the carry reads the other LDS buffer
     # before the post-compute barrier permits reusing the current buffer.
     next_stage_on = 1 if (next_stage_prefetch and num_buffers >= 2) else 0
-    rolled_drain = bool(ROLLED_DRAIN)
+    assert rolled_drain in (0, 1), "rolled_drain must be 0 or 1"
+    rolled_drain = bool(rolled_drain)
     # Keep the experiment switch as an override while normal dispatch obtains
     # both cluster dimensions from the tuned configuration.
     cluster_m = 1 if FORCE_1X4_CLUSTER else cluster_m

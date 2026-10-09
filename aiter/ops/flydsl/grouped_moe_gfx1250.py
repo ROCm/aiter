@@ -584,6 +584,7 @@ def _grouped_a8w4_tdm_moe(
     tdm_as_in_prologue=0,
     tdm_b_th=0,
     lds_soa_load_interleave=0,
+    rolled_drain=0,
     persistent_workers=0,
     persistent_workers2=0,
     data_format="a8w4",
@@ -1063,6 +1064,7 @@ def _grouped_a8w4_tdm_moe(
             tdm_as_in_prologue=tdm_as_in_prologue,
             tdm_b_th=tdm_b_th,
             lds_soa_load_interleave=lds_soa_load_interleave,
+            rolled_drain=rolled_drain,
             row_major_ascale=int(_row_major_ascale),
             a_row_stride_bytes=_a1_wire_stride,
             a_scale_row_stride_bytes=_a1_wire_stride,
@@ -1101,6 +1103,7 @@ def _grouped_a8w4_tdm_moe(
             tdm_as_in_prologue=tdm_as_in_prologue,
             tdm_b_th=tdm_b_th,
             lds_soa_load_interleave=lds_soa_load_interleave,
+            rolled_drain=rolled_drain,
             row_major_ascale=int(_row_major_ascale),
             a_row_stride_bytes=_a1_wire_stride,
             a_scale_row_stride_bytes=_a1_wire_stride,
@@ -1148,6 +1151,7 @@ def _grouped_a8w4_tdm_moe(
         tdm_as_in_prologue=tdm_as_in_prologue,
         tdm_b_th=tdm_b_th,
         lds_soa_load_interleave=lds_soa_load_interleave,
+        rolled_drain=rolled_drain,
         **_ep_gemm2_kwargs,
     )
 
@@ -1228,6 +1232,7 @@ def _grouped_a8w4_tdm_moe(
                         tdm_as_in_prologue=tdm_as_in_prologue,
                         tdm_b_th=tdm_b_th,
                         lds_soa_load_interleave=lds_soa_load_interleave,
+                        rolled_drain=rolled_drain,
                         **_situ_kw,
                     ),
                 )
@@ -1267,6 +1272,7 @@ def _grouped_a8w4_tdm_moe(
                         tdm_as_in_prologue=tdm_as_in_prologue,
                         tdm_b_th=tdm_b_th,
                         lds_soa_load_interleave=lds_soa_load_interleave,
+                        rolled_drain=rolled_drain,
                         **_situ_kw,
                     ),
                 )
@@ -1304,6 +1310,7 @@ def _grouped_a8w4_tdm_moe(
                     tdm_as_in_prologue=tdm_as_in_prologue,
                     tdm_b_th=tdm_b_th,
                     lds_soa_load_interleave=lds_soa_load_interleave,
+                    rolled_drain=rolled_drain,
                 ),
             )
         )
@@ -1583,6 +1590,7 @@ def grouped_gemm_gfx1250_a8w4(
             _tdm_kw["lds_soa_load_interleave"] = _as_int(
                 cfg_row.get("lds_soa_load_interleave"), 0
             )
+            _tdm_kw["rolled_drain"] = _as_int(cfg_row.get("rolled_drain"), 0)
             # GEMM1 always has a local epilogue; stage2_scatter only changes
             # GEMM2, so it does not restrict GEMM1's persistent scheduler.
             _tdm_kw["persistent_workers"] = _as_int(
