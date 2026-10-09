@@ -62,10 +62,10 @@ FP8 = get_fp8_e4m3_dtype()
 
 
 def _variable_ctx(batch, lo=2048, hi=65536):
-    g = torch.Generator().manual_seed(SEED)
+    g = torch.Generator(device="cpu").manual_seed(SEED)
     return [
         max(KV_BLOCK, (c // KV_BLOCK) * KV_BLOCK)
-        for c in torch.randint(lo, hi, (batch,), generator=g).tolist()
+        for c in torch.randint(lo, hi, (batch,), generator=g, device="cpu").tolist()
     ]
 
 
