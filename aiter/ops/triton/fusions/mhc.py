@@ -515,7 +515,7 @@ def mhc_post(
 # ---- gfx1250: Gluon split kernel + Gluon reduce/apply (TDM + WMMA) ----
 #
 # On gfx1250, mhc_post_pre runs two Gluon launches
-# (_gluon_kernels/gfx1250/fusions/mhc_post_pre.py) -- the post + split-K pre
+# (_gluon_kernels/gfx1250/fusions/mhc.py) -- the post + split-K pre
 # GEMM/sqrsum, then the pre reduce/apply (RMS, sigmoid, Sinkhorn, apply-pre,
 # optional fused RMSNorm) -- matching the two launches of aiter.mhc_fused_post_pre
 # (HIP gemm_sqrsum + mhc_pre_big_fuse[_rmsnorm]). It also accepts the HIP-side
@@ -603,7 +603,7 @@ def _gluon_post_pre_layouts(
     w_preshuffled: bool,
     num_warps: int,
 ):
-    from aiter.ops.triton._gluon_kernels.gfx1250.fusions.mhc_post_pre import (
+    from aiter.ops.triton._gluon_kernels.gfx1250.fusions.mhc import (
         create_layouts,
     )
 
@@ -612,7 +612,7 @@ def _gluon_post_pre_layouts(
 
 @functools.lru_cache(maxsize=16)
 def _gluon_reduce_apply_layouts(n: int, rows: int, num_warps: int, split_k: int):
-    from aiter.ops.triton._gluon_kernels.gfx1250.fusions.mhc_post_pre import (
+    from aiter.ops.triton._gluon_kernels.gfx1250.fusions.mhc import (
         create_reduce_apply_layouts,
     )
 
@@ -726,7 +726,7 @@ def _mhc_post_pre_gluon_gfx1250(
     """
     from aiter.jit.utils.chip_info import get_cu_num
     from aiter.ops.mhc import MHC_RES_KS_GLUON, mhc_res_shuffle_enabled
-    from aiter.ops.triton._gluon_kernels.gfx1250.fusions.mhc_post_pre import (
+    from aiter.ops.triton._gluon_kernels.gfx1250.fusions.mhc import (
         _mhc_post_pre_gemm_sqrsum_gfx1250_kernel,
         _mhc_pre_reduce_apply_gfx1250_kernel,
     )

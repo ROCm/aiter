@@ -100,13 +100,20 @@ def create_layouts(
     return wmma, op_a, op_b, smem_x, smem_res, smem_fn, smem_nres, smem_red, smem_red2
 
 
-@gluon.constexpr_function
-def _tdm_ops_after_load(i, num_stages, k_loop):
-    """TDM ops a wave issues after the loads of step i and before step i's wait:
-    the stores of the previous num_stages-1 steps and the loads of each later
-    stage already in flight (x, res, fn: 3 per stage). This is the wait for step
-    i's fn; its x and res, issued one op earlier, allow one more op (+1)."""
-    return min(i, num_stages - 1) + 3 * min(num_stages - 1, k_loop - 1 - i)
+@gluon.jit
+def _wait_after_load(
+    i, EXTRA: gl.constexpr, NUM_STAGES: gl.constexpr, K_LOOP: gl.constexpr
+):
+    """Wait for k-step i's loads, i a loop variable. Each wave may leave the TDM ops
+    it issued after them in flight: the stores of the previous NUM_STAGES-1 steps
+    and the loads of each later stage (x, res, fn: 3 per stage). That count is the
+    wait for step i's fn; its x and res, issued one op earlier, allow one more op
+    (EXTRA=1). s_wait_tensorcnt takes an immediate, so the count is picked from a
+    ladder of uniform branches."""
+    n = gl.minimum(i, NUM_STAGES - 1) + 3 * gl.minimum(NUM_STAGES - 1, K_LOOP - 1 - i)
+    for v in gl.static_range(4 * (NUM_STAGES - 1) + 1):
+        if n == v:
+            gl.amd.gfx1250.tdm.async_wait(v + EXTRA)
 
 
 @gluon.constexpr_function
@@ -354,14 +361,13 @@ def _mhc_post_pre_gemm_sqrsum_gfx1250_kernel(
     X_TILE: gl.constexpr = gl.SliceLayout(0, OP_A)  # [BLOCK_M, KS]
     sq = gl.zeros([HC, BLOCK_M, KS], dtype=gl.float32, layout=OP_A)
 
-    # ---- main loop, fully unrolled so every ring slot and wait count is static ----
-    for i in gl.static_range(K_LOOP):
+    # ---- main loop, rolled: the code size does not grow with K_LOOP (unrolled, the
+    # kernel misses the instruction cache whenever other kernels ran before it) ----
+    for i in range(K_LOOP):
         # Wait for x and res only (TDM completes in issue order: x, res, fn); fn, the
         # largest tile, is waited for right before its reads below, so the post mix
         # runs while it lands.
-        gl.amd.gfx1250.tdm.async_wait(
-            _tdm_ops_after_load(i, NUM_STAGES, K_LOOP) + 1
-        )
+        _wait_after_load(i, 1, NUM_STAGES, K_LOOP)
         gl.barrier()
 
         # x and each residual head as [1, BLOCK_M, KS] in the A-operand layout
@@ -387,7 +393,7 @@ def _mhc_post_pre_gemm_sqrsum_gfx1250_kernel(
 
         a_bf = a.to(nres_ptr.type.element_ty)
 
-        gl.amd.gfx1250.tdm.async_wait(_tdm_ops_after_load(i, NUM_STAGES, K_LOOP))
+        _wait_after_load(i, 0, NUM_STAGES, K_LOOP)
         gl.barrier()
         if W_PRESHUFFLED:
             b_hi = _load_fn_plane(fn_rd, slot, 0, HC, N_PAD, KS, OP_B)
