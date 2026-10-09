@@ -407,6 +407,15 @@ def test_invariants(m, n, k):
         torch.cuda.synchronize()
         want(torch.equal(pinned, repeat), f"sorted_index is reproducible under {kw}")
 
+    # Without `end` every row spans the buffer, so a smaller bound would compile
+    # the adaptive decode short of the row and must be refused.
+    try:
+        topk_select(x, k, max_row_len=n - 1)
+    except ValueError:
+        pass
+    else:
+        failures.append("rejects max_row_len below the width when end is omitted")
+
     for label in failures:
         aiter.logger.error("INVARIANT FAILED: %s", label)
     return failures

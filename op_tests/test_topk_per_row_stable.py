@@ -137,7 +137,7 @@ def check_prefill_many_tied_rows():
     return valid and det and ascending and matches_ref
 
 
-def check_decode(batch, ctx, k, next_n, tie_level):
+def check_decode(batch, ctx, k, next_n, tie_level, max_row_len=None):
     num_rows = batch * next_n
     seq_lens = torch.full((batch,), ctx, dtype=torch.int32, device="cuda")
     row_idx = torch.arange(num_rows, device="cuda") // next_n
@@ -159,6 +159,7 @@ def check_decode(batch, ctx, k, next_n, tie_level):
             logits.stride(1),
             k=k,
             stable=True,
+            max_row_len=max_row_len,
         )
         torch.cuda.synchronize()
         return idx
@@ -175,7 +176,10 @@ def check_decode(batch, ctx, k, next_n, tie_level):
             ok_order = False
         if row != ref_stable_topk(logits[r][:rlen], k):
             ok_ref = False
-    tag = f"decode b={batch} ctx={ctx} k={k} n={next_n} tie={tie_level}"
+    tag = (
+        f"decode b={batch} ctx={ctx} k={k} n={next_n} tie={tie_level}"
+        f" max_row_len={max_row_len}"
+    )
     print(f"[{tag}] deterministic={det} ascending={ok_order} matches_ref={ok_ref}")
     return det and ok_order and ok_ref
 
@@ -196,6 +200,8 @@ def main():
         for k in ks:
             all_ok &= check_decode(4, 4096, k, 1, tie)
             all_ok &= check_decode(4, 61440, k, 1, tie)
+            # A stated bound is what routes this shape to the adaptive kernel.
+            all_ok &= check_decode(4, 131072, k, 1, tie, max_row_len=131072)
     # k > 2048 -> scan fallback
     for tie in ("none", "heavy"):
         all_ok &= check_prefill(2, 16384, 4096, tie)
