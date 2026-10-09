@@ -566,7 +566,32 @@ def _should_use_flydsl_topk_decode(
     ):
         return False
 
-    from .flydsl.topk.topk_per_row import is_flydsl_top_k_per_row_decode_supported
+    from .flydsl.topk.topk_per_row import (
+        _is_flydsl_radix_topk_one_block_supported,
+        is_flydsl_top_k_per_row_decode_supported,
+        prefers_one_block_split_decode,
+    )
+
+    # The chunked gates predate the split, which reaches the same shapes in two
+    # launches instead of seven. Only yield to it once it has taken the call.
+    if (
+        not stable
+        and prefers_one_block_split_decode(num_rows, logits.shape[1], k)
+        and _is_flydsl_radix_topk_one_block_supported(
+            logits,
+            None,
+            seq_lens,
+            indices,
+            values,
+            num_rows,
+            stride0,
+            stride1,
+            k,
+            is_decode=True,
+            next_n=next_n,
+        )
+    ):
+        return False
 
     return is_flydsl_top_k_per_row_decode_supported(
         logits,
