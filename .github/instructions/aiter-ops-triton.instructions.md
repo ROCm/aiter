@@ -48,14 +48,14 @@ to extend or import the existing implementation, not to add a parallel copy.
 (`resolve_config_dir`, `load_config_json`, `select_leq_config`, the path
 constants) and each family keeps its own loader module (`gemm_config_utils`,
 `conv_config_utils`, `mhc_config_utils`, `moe_config_utils`,
-`tuned_config_utils`) on top of it.
+`quant_config_utils`, `tuned_config_utils`) on top of it.
 Flag a function given a second home — a re-export, a wrapper that only
 forwards to another module, or a copy of a core helper inside a family module.
 
 ## Folder structure and imports
 
 The layout is: public wrapper modules in category folders
-(`gemm/{basic,batched,feed_forward,fused}/`, `attention/`, `moe/`,
+(`gemm/{basic,batched,feed_forward,fused,grouped}/`, `attention/`, `moe/`,
 `normalization/`, `quant/`, `rope/`, `fusions/`, `comms/`, `conv/`,
 `gated_delta_net/`, `kimi_delta_attn/`, `gluon/`), kernel bodies under
 `_triton_kernels/` at the same relative category path, or under
@@ -118,7 +118,7 @@ their tuned configs can be imported by a framework that is not PyTorch
 Every tuned config lives in one nested layout:
 `configs/<arch>/<backend>/<op>/<d_type>/`, e.g.
 `configs/gfx950/triton/gemm/gemm_afp4wfp4/DEFAULT.json`. `<op>` is `gemm`,
-`moe`, `conv`, `mhc`, `attention`, `gmm` or `fusions`; `<d_type>` is
+`moe`, `conv`, `mhc`, `attention`, `gmm`, `fusions` or `quant`; `<d_type>` is
 `config_name.lower().replace("-", "_")`. The flat arch-prefixed directories
 and every fallback that reached them are gone. Flag:
 
@@ -143,11 +143,11 @@ and every fallback that reached them are gone. Flag:
   byte-identical and called out in the commit message. The one seeding rule in
   force is gfx950 → gfx1250, triton only — never into a gluon directory, never
   backwards into gfx950.
-- `kpack` newly added to a gfx950 config. Triton's AMD backend deprecates
-  `kpack` on CDNA4 — it warns and force-overrides `kpack = 1` there, and the
-  parameter is slated for removal. The gfx950 tree is clean of it; gfx942 may
-  still carry it, and existing RDNA (gfx1151/gfx1201/gfx1250) entries predate
-  the rule, so flag additions rather than the entries already there.
+- `kpack` in any config outside gfx942, whether added or already there.
+  Triton's AMD backend deprecates `kpack` on CDNA4 — it warns and
+  force-overrides `kpack = 1` on gfx950, and the parameter is slated for
+  removal — gfx1250 does not support it, and on the RDNA targets (gfx11xx,
+  gfx120x) it is a no-op. Only gfx942 configs may carry it.
 - Checked-in files under `configs/gemm/aot/` or `configs/paged_mqa_logits/aot/`
   — these are runtime AOT caches, never committed.
 
@@ -230,7 +230,8 @@ values for either backend live in JSON, never in Python. Flag:
   second place the layout is encoded, and it skips the argument validation
   that makes a wrong value fail closed.
 - A hand-written loop selecting the smallest matching `N_LEQ_*` (or another
-  upper-bound prefix) entry — use `select_leq_config()` so threshold ordering,
+  upper-bound prefix) entry, or a hand-written multi-axis bucket walk — use
+  `select_leq_config()` (`axes=` for several axes) so threshold ordering,
   fallback, and copying semantics have one implementation.
 - A second MOE config reader. `utils/moe_config_utils.py::get_moe_dispatch` is
   the only MOE fetcher; flag any new MOE path built by hand, any direct

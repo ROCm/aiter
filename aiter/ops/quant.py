@@ -709,7 +709,6 @@ def get_torch_act(aType):
         ActivationType.Silu: F.silu,
         ActivationType.Gelu: F.gelu,
         ActivationType.GeluTanh: lambda x: F.gelu(x, approximate="tanh"),
-        ActivationType.Relu2: lambda x: F.relu(x) ** 2,
     }
     return tmp.get(aType, NotImplementedError)
 
@@ -1354,6 +1353,7 @@ def _rope_rotate_activation_fp4quant(
     group_size: int = 32,
     shuffle_scale: bool = True,
     do_rotate_act: bool = True,
+    round_rope: bool = False,
 ) -> None:
     """Apply GPT-J style (interleaved) RoPE to trailing ``rope_dim``,
     Hadamard-rotate, then FP4-quantize into packed ``out`` + e8m0 ``scale``."""
@@ -1403,6 +1403,7 @@ def rope_rotate_activation(
     group_size: int | None = None,
     shuffle_scale: bool = True,
     do_rotate_act: bool = True,
+    round_rope: bool = False,
 ) -> None:
     """Apply GPT-J style (interleaved) RoPE to trailing ``rope_dim``, then
     Hadamard-rotate, dispatching on ``out.dtype``:
@@ -1415,7 +1416,9 @@ def rope_rotate_activation(
       ``scale`` (``scale`` required; ``group_size`` defaults to 128).
 
     When ``do_rotate_act`` is False, the Hadamard rotate is skipped and only
-    RoPE (plus any quantization) is applied.
+    RoPE (plus any quantization) is applied. ``round_rope`` (fp4 only) rounds
+    the rotated values to ``input``'s dtype before quantizing them, as a model
+    whose RoPE writes its output back in that dtype has them.
     """
     if out.dtype == dtypes.fp4x2:
         assert out_scale is not None, "fp4 rope_rotate_activation requires `out_scale`"
@@ -1430,6 +1433,7 @@ def rope_rotate_activation(
             group_size=32 if group_size is None else group_size,
             shuffle_scale=shuffle_scale,
             do_rotate_act=do_rotate_act,
+            round_rope=round_rope,
         )
     elif out.dtype == dtypes.fp8:
         assert out_scale is not None, "fp8 rope_rotate_activation requires `out_scale`"
