@@ -60,7 +60,7 @@ from aiter.ops.topk_plain import topk_plain, topk_plain_batches_ragged_rows
 
 __all__ = ["topk_select", "topk_select_backend"]
 
-_SUPPORTED_GFX = ("gfx942", "gfx950")
+_SUPPORTED_GFX = ("gfx942", "gfx950", "gfx1250")
 
 _PLAIN_MAX_K = 2048
 # Which backends can promise a column order among equal scores. `plain` appears
