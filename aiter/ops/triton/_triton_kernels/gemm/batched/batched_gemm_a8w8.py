@@ -145,8 +145,8 @@ def _batched_gemm_a8w8_kernel(
     )
 
     # Create pointers for the scale tensors and load them
-    offs_a_scale = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M) % M
-    offs_b_scale = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N) % N
+    offs_a_scale = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_b_scale = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
     a_scale = tl.load(a_scale_ptr + batch_id * stride_ascaleb + offs_a_scale)
     b_scale = tl.load(b_scale_ptr + batch_id * stride_bscaleb + offs_b_scale)
 
