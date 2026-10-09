@@ -369,10 +369,18 @@ def _prepare_autotuned_plan(
     num_cu = torch.cuda.get_device_properties(query.device).multi_processor_count
     limit = num_cu if case["max_partitions"] is None else case["max_partitions"]
     monkeypatch.delenv("FLYDSL_AUTOTUNE_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("FLYDSL_AUTOTUNE_CACHE_DIR", raising=False)
     monkeypatch.setenv("FLYDSL_AUTOTUNE", "1")
-    cache_file = tmp_path / "_pa_decode_autotuner.json"
-    tuner = _isolated_pa_decode_autotuner(pa, cache_file)
-    monkeypatch.setattr(pa, "_pa_decode_autotuner", tuner)
+    config_root = tmp_path / "configs" / "pa"
+    monkeypatch.setattr(pa, "_PA_DECODE_CONFIGS_PATH", config_root)
+    arch = torch.cuda.get_device_properties(query.device).gcnArchName.split(":", 1)[0]
+    # Use the production path selection without retaining temporary test tuners
+    # in the process-wide cache after monkeypatch restores the config root.
+    get_autotuner = pa._get_pa_decode_autotuner.__wrapped__
+    tuner = get_autotuner(arch)
+    cache_file = config_root / arch / "_pa_decode_autotuner.json"
+    assert tuner._cache_file == cache_file
+    monkeypatch.setattr(pa, "_get_pa_decode_autotuner", {arch: tuner}.__getitem__)
     assert tuner._do_bench is do_bench
     assert tuner.select_config is None
     snapshots = [
@@ -437,9 +445,20 @@ def _prepare_autotuned_plan(
         pytest.fail("cache/default lookup benchmarked an autotune candidate")
 
     monkeypatch.setenv("FLYDSL_AUTOTUNE", "0")
-    reloaded = _isolated_pa_decode_autotuner(pa, cache_file)
+    reloaded = get_autotuner(arch)
     assert reloaded.cache
-    monkeypatch.setattr(pa, "_pa_decode_autotuner", reloaded)
+    other_arch = "gfx950" if arch == "gfx942" else "gfx942"
+    other = get_autotuner(other_arch)
+    assert other._cache_file == config_root / other_arch / cache_file.name
+    assert not other.cache
+    assert other.cache is not reloaded.cache
+    with monkeypatch.context() as custom_cache:
+        custom_cache.setenv("FLYDSL_AUTOTUNE_CACHE_DIR", str(tmp_path / "custom-cache"))
+        # An override keeps the original native tuner's cache/path, selected
+        # when the module was imported, shared across device architectures.
+        assert get_autotuner(arch) is pa._pa_decode_autotuner
+        assert get_autotuner(other_arch) is pa._pa_decode_autotuner
+    monkeypatch.setattr(pa, "_get_pa_decode_autotuner", {arch: reloaded}.__getitem__)
     monkeypatch.setattr(pa._PADecodeAutotuneResources, "prepare", forbidden_prepare)
     monkeypatch.setattr(reloaded, "_do_bench", forbidden_benchmark)
     cached_plan = pa.prepare_pa_decode_plan(*arguments, max_partitions=limit, **options)
@@ -451,7 +470,7 @@ def _prepare_autotuned_plan(
 
     # A fresh native-cache miss uses 2*CU without preparing or timing graphs.
     miss = _isolated_pa_decode_autotuner(pa, tmp_path / "empty.json")
-    monkeypatch.setattr(pa, "_pa_decode_autotuner", miss)
+    monkeypatch.setattr(pa, "_get_pa_decode_autotuner", {arch: miss}.__getitem__)
     monkeypatch.setattr(miss, "_do_bench", forbidden_benchmark)
     default_plan = pa.prepare_pa_decode_plan(
         *arguments, max_partitions=limit, **options

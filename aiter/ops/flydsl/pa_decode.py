@@ -9,7 +9,11 @@ MFMA specialization details. Native BF16 uses unscaled, 8-element vectorized
 K/V caches and BF16 queries.
 """
 
+import os
 from contextlib import contextmanager
+from copy import copy
+from functools import cache
+from pathlib import Path
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -24,6 +28,8 @@ from .kernels.pa_decode_plan import PADecodePlan
 from .kernels.pa_decode_plan import plan_pa_decode as plan_pa_decode  # noqa: PLC0414
 from .kernels.pa_decode_reduce import compile_pa_decode_ps_reduce
 from .kernels.tensor_shim import _run_compiled, get_dtype_str, ptr_arg
+
+_PA_DECODE_CONFIGS_PATH = Path(__file__).parent / "configs" / "pa"
 
 
 def _flydsl_pointer_dtype(dtype: torch.dtype):
@@ -884,6 +890,21 @@ def _pa_decode_autotuner(
     resources.graphs[workgroup_budget].replay()
 
 
+@cache
+def _get_pa_decode_autotuner(arch):
+    """Keep native PA tuning results in the target architecture's directory."""
+    if "FLYDSL_AUTOTUNE_CACHE_DIR" in os.environ:
+        return _pa_decode_autotuner
+    tuner = copy(_pa_decode_autotuner)
+    tuner._cache_file = _PA_DECODE_CONFIGS_PATH / arch / "_pa_decode_autotuner.json"
+    # Each architecture owns its native in-memory and disk caches. Discard the
+    # template's default-directory entries before loading the selected file.
+    tuner.cache = {}
+    tuner._artifact_cache = {}
+    tuner._load_disk_cache()
+    return tuner
+
+
 def prepare_pa_decode_plan(
     query: torch.Tensor,
     key_cache: torch.Tensor,
@@ -908,8 +929,9 @@ def prepare_pa_decode_plan(
     Set FLYDSL_AUTOTUNE=1 to prepare candidate workspaces/graphs and search with
     FlyDSL's default benchmark and fastest-config selection. Candidates must
     agree with the 2*CU baseline; independent FP32 accuracy is covered by tests.
-    Set FLYDSL_AUTOTUNE_CACHE_DIR before importing this module to choose the
-    native cache directory.
+    Results are saved to configs/pa/<arch>/_pa_decode_autotuner.json under the
+    FlyDSL operator package. Set FLYDSL_AUTOTUNE_CACHE_DIR before importing this
+    module to override the native cache directory.
 
     Cache by attention geometry and execution modes. Tensor strides, total KV
     cache pages, block-table padding, and max_context_length do not partition
@@ -922,7 +944,8 @@ def prepare_pa_decode_plan(
     with torch.cuda.device(query.device):
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("prepare_pa_decode_plan must run before graph capture")
-        num_cu = torch.cuda.get_device_properties(query.device).multi_processor_count
+        properties = torch.cuda.get_device_properties(query.device)
+        num_cu = properties.multi_processor_count
         limit = num_cu if max_partitions is None else max_partitions
         # Validate plan geometry even when native autotune takes the default.
         default_plan = plan_pa_decode(
@@ -954,7 +977,8 @@ def prepare_pa_decode_plan(
             limit,
         )
 
-        config = _pa_decode_autotuner.resolve_config(
+        arch = properties.gcnArchName.split(":", 1)[0]
+        config = _get_pa_decode_autotuner(arch).resolve_config(
             num_seqs=context_lengths.numel(),
             num_kv_heads=key_cache.shape[1],
             query_group_size=query.shape[1] // key_cache.shape[1],
