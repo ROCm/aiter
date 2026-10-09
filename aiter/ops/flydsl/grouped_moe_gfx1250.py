@@ -68,7 +68,7 @@ def _as_int(value, default: int | None) -> int | None:
     text = "" if value is None else str(value).strip()
     if text == "" or text.lower() in ("nan", "none"):
         return default
-    return int(text)
+    return int(float(text))
 
 
 def _dtype_name(dtype) -> str:
