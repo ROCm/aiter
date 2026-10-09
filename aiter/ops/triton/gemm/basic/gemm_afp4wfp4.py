@@ -159,7 +159,12 @@ def gemm_afp4wfp4_(
         "gluon",
     ), f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
 
-    assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
+    # gfx1151 can lower this Triton dot_scaled kernel without native FP4
+    # instructions. Keep the exception local: other FP4 entry points need
+    # their own configs and validation before they can run on this target.
+    assert arch_info.is_fp4_avail() or (
+        backend == "triton" and arch_info.get_arch() == "gfx1151"
+    ), "MXFP4 is not available on your device"
 
     if backend == "gluon":
         arch = arch_info.get_arch()
@@ -565,10 +570,11 @@ def gemm_afp4wfp4_preshuffle(
 
     if use_gluon:
         from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_mxfp4 import (
-            gemm_mxfp4_preshuffle_gfx1250 as _gluon_gemm_mxfp4_preshuffle_gfx1250,
+            cluster_shape,
+            get_gemm_afp4wfp4_preshuffle_layouts,
         )
         from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_mxfp4 import (
-            get_gemm_afp4wfp4_preshuffle_layouts,
+            gemm_mxfp4_preshuffle_gfx1250 as _gluon_gemm_mxfp4_preshuffle_gfx1250,
         )
 
         grid = lambda META: (
@@ -586,11 +592,22 @@ def gemm_afp4wfp4_preshuffle(
         k_tiles = triton.cdiv(K_bytes, BLOCK_K_BYTES)
         config["NUM_BUFFERS"] = min(config["NUM_BUFFERS"], k_tiles)
 
+        num_ctas = config["num_ctas"]
+        ctas_m, _ = cluster_shape(
+            num_ctas, config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"]
+        )
+        # The kernel takes a CTA's A scales as preshuffled iff it has 32+ rows.
+        assert M < 32 or config["BLOCK_SIZE_M"] // ctas_m >= 32, (
+            f"for M >= 32, each CTA needs 32 or more rows of BLOCK_SIZE_M="
+            f"{config['BLOCK_SIZE_M']}, which num_ctas={num_ctas} splits {ctas_m} ways"
+        )
+
         layouts = get_gemm_afp4wfp4_preshuffle_layouts(
             config["num_warps"],
             config["BLOCK_SIZE_M"],
             config["BLOCK_SIZE_N"],
             config["BLOCK_SIZE_K"],
+            num_ctas,
         )
 
         _gluon_gemm_mxfp4_preshuffle_gfx1250[grid](

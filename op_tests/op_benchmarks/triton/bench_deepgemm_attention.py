@@ -205,10 +205,14 @@ def run_benchmark(args: argparse.Namespace, data_init: str = "norm"):
         gen = make_generator(args.seed)
 
         max_model_len = 2 * avg_kv_length
-        blocksize = args.blocksize if args.kv_preshuffle else 1
+        # Unset means the page size each layout has always run here: one token
+        # per page plain, one MFMA tile per page preshuffled.
+        blocksize = args.blocksize or (16 if args.kv_preshuffle else 1)
         num_blocks = (max_model_len + blocksize - 1) // blocksize
 
-        assert blocksize == 1 or args.kv_preshuffle and blocksize % 16 == 0
+        assert (
+            not args.kv_preshuffle or blocksize % 16 == 0 or blocksize == 8
+        ), f"Preshuffle needs a page that is a multiple of the 16-token MFMA tile, or 8; got {blocksize}."
 
         var_ratio = 0.5
         # varctx gluon kernel only exists on the preshuffle path; passing a
@@ -305,16 +309,20 @@ def run_benchmark(args: argparse.Namespace, data_init: str = "norm"):
         )
 
         if kv_storage_kind == "non_ragged_k":
-            Preshuffle = blocksize % 16 == 0
+            Preshuffle = args.kv_preshuffle
 
             if Preshuffle:
                 kv_num_block, kv_block_Size, _, kv_index_dim = kv_cache_fp8.size()
 
                 split_kv_cache = kv_cache_fp8.view(-1, blocksize * kv_index_dim)
+                # A page shorter than the 16-token MFMA tile is shuffled in
+                # groups of its own length; the kernel then assembles one tile
+                # from two pages.
                 split_kv_cache_data = shuffle_weight(
                     split_kv_cache[..., : kv_block_Size * index_dim]
                     .contiguous()
-                    .view([kv_num_block, kv_block_Size, index_dim])
+                    .view([kv_num_block, kv_block_Size, index_dim]),
+                    layout=(min(blocksize, 16), 16),
                 )
                 split_kv_cache[..., : kv_block_Size * index_dim] = (
                     split_kv_cache_data.view(kv_num_block, kv_block_Size * index_dim)
@@ -411,6 +419,11 @@ def run_benchmark(args: argparse.Namespace, data_init: str = "norm"):
             # Inner quotes must differ from the outer ones: reusing them is PEP 701
             # (Python 3.12+) and leaves this module unparseable on 3.10/3.11.
             aot_name = f"paged_mqa_logits{'_preshuffle' if args.kv_preshuffle else ''}{'_varctx' if EnableVarCtxOpt else ''}_{heads}x{ChunkK}x{index_dim}_B{blocksize}P{padded_str}W{WavePerEU}"
+            if (
+                not args.kv_preshuffle
+                and kv_cache_fp8.shape[0] * kv_cache_fp8.stride(0) >= 2**31
+            ):
+                aot_name += "_kv64"
 
             src = os.path.join(triton_cache_dir, cache_key)
             dst = os.path.join(aot_kernel_dir, aot_name)
@@ -432,6 +445,7 @@ def run_benchmark(args: argparse.Namespace, data_init: str = "norm"):
                 "avg_kv_len": avg_kv_length,
                 "kv_storage": kv_storage_kind,
                 "blocksize": blocksize,
+                "kv_tokens": int(context_lens.sum().item()),
                 "latency_us": elapsed_us,
                 "TFLOPS": flops,
                 "logits_diff": float(logits_diff),
@@ -494,8 +508,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--blocksize",
         type=int,
-        default=16,
-        help="KVCache block size, only used when kv_preshuffle is enabled, must be multiple of 16",
+        default=None,
+        help="KVCache page size in tokens. Preshuffle needs a multiple of the "
+        "16-token MFMA tile, or 8. Default: 16 with --kv_preshuffle, 1 without.",
     )
     parser.add_argument(
         "--no-varctx",

@@ -2337,10 +2337,6 @@ def flydsl_fused_compress_attn(
     from aiter.jit.utils.chip_info import get_gfx as _get_gfx
 
     if _get_gfx() == "gfx1250":
-        if _fp4:
-            raise NotImplementedError(
-                "fused_compress_attn FP4 path is not implemented for gfx1250"
-            )
         from .fused_compress_attn_gfx1250 import flydsl_fused_compress_attn_gfx1250
 
         return flydsl_fused_compress_attn_gfx1250(
@@ -2362,12 +2358,12 @@ def flydsl_fused_compress_attn(
             ratio=ratio,
             head_dim=head_dim,
             rope_head_dim=rope_head_dim,
-            quant=quant,
+            quant=_quant,
             cache_scale=cache_scale,
             use_ue8m0=use_ue8m0,
             preshuffle=preshuffle,
             k_split_num_waves=k_split_num_waves,
-            quant_mode=quant_mode,
+            quant_mode=_mode,
             k_rope_cache=k_rope_cache,
             stream=stream,
         )
