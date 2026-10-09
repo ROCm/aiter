@@ -2447,10 +2447,6 @@ def _mxfp4_a4w4_stage1_fw(
     runtime_swiglu_limit = _get_flydsl_moe_kernels().runtime_swiglu_limit(
         swiglu_limit, p1["act"]
     )
-    if not p1.get("enable_bias", False) and bias1 is not None:
-        raise ValueError(
-            "MXMOE bias presence does not match the cache-safe kernel name"
-        )
     BM = p1["BM"]
     if native_scale_layout is None:
         native_scale_layout = native_scale_layout_for(BM, p1["out_dtype"])
@@ -2463,8 +2459,6 @@ def _mxfp4_a4w4_stage1_fw(
     # packed and unpacked inputs, so it is the stable source of the GEMM1 K.
     D_HIDDEN = w2.shape[1]
     D_INTER = w1.shape[1] // 2
-    if p1.get("enable_bias", False) and bias1 is None:
-        bias1 = torch.zeros((NE, D_INTER * 2), dtype=dtypes.fp32, device=device)
     Kpad_inter = ((D_INTER + 255) // 256) * 256
     M = hidden_states.shape[0]
     if m_indices is None:
@@ -2894,7 +2888,7 @@ def _make_mxfp4_metadata(
         fuse_quant=p1["out_dtype"],
         output_aux=AUX_SORT_OPUS,
         prequant=p1["a_dtype"] == "fp8" and not p1["inline_quant"],
-        has_bias=has_stage1_bias and p1.get("enable_bias", False),
+        has_bias=has_stage1_bias,
         stage2_has_bias=has_stage2_bias and is_layout_gemm2,
     )
 
@@ -3194,6 +3188,9 @@ def get_2stage_cfgs(
     if cfg is not None:
         kn1 = str(cfg.get("kernelName1", "") or "").strip()
         kn2 = str(cfg.get("kernelName2", "") or "").strip()
+        # Invalid MXMOE names must fail before a backend/layout check can
+        # silently discard the row and substitute a heuristic kernel.
+        parsed_g1 = _parse_mxfp4_g1_kname(kn1) if _is_mxfp4_kname(kn1) else None
         has_opus = kn1.startswith("opus_") or kn2.startswith("opus_")
         if opus_weights_shuffled is None:
             opus_weights_shuffled = is_shuffled
@@ -3242,7 +3239,6 @@ def get_2stage_cfgs(
                 )
 
     if cfg is not None and _is_mxfp4_kname(kn1):
-        parsed_g1 = _parse_mxfp4_g1_kname(kn1)
         configured_act = parsed_g1["act"]
         # Gelu/GeluTanh are real ActivationType values that MXMOE has no kernel
         # for. Folding them to "silu" would match a SiLU-tuned row and silently
@@ -3270,8 +3266,6 @@ def get_2stage_cfgs(
                 f"(expert={expert}, model_dim={model_dim}, "
                 f"inter_dim={inter_dim}, topk={topk})"
             )
-        elif has_stage1_bias and not parsed_g1.get("enable_bias", False):
-            reject_reason = "stage1 bias is present but kernelName1 lacks '_bias'"
         elif has_stage2_bias and parse_flydsl_v2_gemm2_kernel(kn2) is None:
             reject_reason = (
                 f"stage2 bias requires a flydsl_moe2_layout_ kernel, got {kn2!r}"

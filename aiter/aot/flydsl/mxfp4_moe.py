@@ -15,6 +15,7 @@ Standalone:
 import argparse
 import csv
 import glob
+import itertools
 import os
 import sys
 import time
@@ -148,6 +149,12 @@ def parse_csv(csv_path: str):
                 v2_d_inter = inter_dim
             else:
                 v2_d_inter = d_inter
+            bias_supported = (
+                row.get("q_type", "").strip().split(".")[-1] == "per_1x32"
+                and row.get("dtype", "") in ("torch.bfloat16", "torch.float16")
+                and "float4_e2m1fn_x2" in row.get("q_dtype_w", "")
+            )
+            enable_bias_options = [False, True] if bias_supported else [False]
 
             if _is_mxfp4_kname(kn1):
                 p1 = _parse_mxfp4_g1_kname(kn1)
@@ -159,7 +166,16 @@ def parse_csv(csv_path: str):
                 for situ_beta, situ_linear_beta in situ_params:
                     # gate_mode selects the layout at runtime; CSV kernel names
                     # represent both layouts, with separate compiled cache keys.
-                    for interleave in (False, True):
+                    # Like ordinary MOE1, one CSV name covers both runtime
+                    # bias choices. Shared-expert calls have no bias variant.
+                    g1_bias_options = (
+                        [False]
+                        if int(row.get("shared_expert_id", "-1") or "-1") >= 0
+                        else enable_bias_options
+                    )
+                    for interleave, enable_bias in itertools.product(
+                        (False, True), g1_bias_options
+                    ):
                         _add(
                             {
                                 "stage": 1,
@@ -189,7 +205,7 @@ def parse_csv(csv_path: str):
                                 "swiglu_limit": (
                                     7.0 if p1["act"] == "swiglu" else float("inf")
                                 ),
-                                "enable_bias": p1["enable_bias"],
+                                "enable_bias": enable_bias,
                                 "interleave": interleave,
                                 "native_scale_layout": native_scale_layout_for(
                                     p1["BM"], p1["out_dtype"]
@@ -206,12 +222,6 @@ def parse_csv(csv_path: str):
                     if v2_g2["epilog"] == "reduce" and _STAGE2_FP8_ROUTE_OUT
                     else "bf16"
                 )
-                bias_supported = (
-                    row.get("q_type", "").strip().split(".")[-1] == "per_1x32"
-                    and row.get("dtype", "") in ("torch.bfloat16", "torch.float16")
-                    and "float4_e2m1fn_x2" in row.get("q_dtype_w", "")
-                )
-                enable_bias_options = [False, True] if bias_supported else [False]
                 for enable_bias in enable_bias_options:
                     _add(
                         {

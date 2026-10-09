@@ -313,6 +313,183 @@ def decode_bm16_intermediate(
 
 
 @benchmark()
+def test_runtime_bias_stage1(
+    precision: str, activation: str, block_m: int
+) -> dict[str, Any]:
+    """Zero A isolates expert bias, including cache switches on one CSV name."""
+    token, model_dim, inter_dim, expert, topk = 33, 512, 256, 2, 2
+    a_dtype = "fp8" if precision == "A8W4" else "fp4"
+    data = Mxfp4FlydslTuner._prepare_case(
+        token, model_dim, inter_dim, expert, topk, dtypes.bf16, a_dtype=a_dtype
+    )
+    data["input"].zero_()
+    quant = per_1x32_f8_scale_f8_quant if a_dtype == "fp8" else per_1x32_f4_quant
+    quant_kwargs = {"scale_type": dtypes.fp8_e8m0} if a_dtype == "fp8" else {}
+    data["a1_qt"], data["a1_scale"] = quant(data["input"], **quant_kwargs)
+    bias = torch.empty((expert, 2 * inter_dim), dtype=torch.float32)
+    bias[:, :inter_dim] = torch.linspace(0.5, 1.5, inter_dim)
+    bias[:, inter_dim:] = torch.linspace(-2.0, 2.0, inter_dim)
+    bias[1] *= 2
+    data["topk_ids"] = (
+        torch.arange(expert, dtype=dtypes.i32).expand(token, topk).contiguous()
+    )
+    data["topk_weights"] = torch.full((token, topk), 0.5, dtype=dtypes.fp32)
+    act = {"Silu": "silu", "Situv2": "situv2", "Swiglu": "swiglu"}[activation]
+    inline = block_m == 16
+    g1 = Mxfp4FlydslTuner._g1_kname(
+        block_m, inline, inline, bn=128, act=act, a_dtype=a_dtype, out_dtype=a_dtype
+    )
+    assert "_bias" not in g1
+    sti, sw, sei, nvi, moe_buf, indices, reverse = moe_sorting(
+        data["topk_ids"],
+        data["topk_weights"],
+        expert,
+        model_dim,
+        dtypes.bf16,
+        block_size=block_m,
+        accumulate=False,
+        output_aux="opus",
+    )
+    stage1_input, stage1_scale = data["input"], None
+    if not inline:
+        prequant = (
+            aiter.fused_dynamic_mxfp8_quant_moe_sort
+            if a_dtype == "fp8"
+            else aiter.fused_dynamic_mxfp4_quant_moe_sort
+        )
+        stage1_input, stage1_scale = prequant(
+            input=data["input"],
+            sorted_ids=sti,
+            num_valid_ids=nvi,
+            token_num=token,
+            topk=topk,
+            block_size=block_m,
+            sorted_weights=sw,
+            num_experts_upper_bound=expert,
+        )
+    stage1 = functools.partial(
+        _mxfp4_a4w4_stage1_fw,
+        stage1_input,
+        data["w1_a16"],
+        data["w2_a16"],
+        sti,
+        sei,
+        nvi,
+        None,
+        topk,
+        block_m=block_m,
+        a1_scale=stage1_scale,
+        w1_scale=data["w1s_a16"],
+        kernelName1=g1,
+        m_indices=indices,
+        interleave=a_dtype == "fp8",
+        moe_buf=moe_buf,
+        situ_beta=DEFAULT_SITUV2_BETA if act == "situv2" else 1.0,
+        situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA if act == "situv2" else 1.0,
+    )
+    references = {}
+    for enabled, runtime_bias in ((True, bias), (False, None)):
+        ref = FmoeTuner.run_torch_moe_stage1(
+            data["a1_qt"],
+            data["w1_qt"],
+            data["w2_qt"],
+            data["topk_weights"],
+            data["topk_ids"],
+            data["a1_scale"],
+            data["w1_scale"],
+            w1_bias=runtime_bias,
+            # A4W4 quantizes FP32 activation directly; A8W4 materializes
+            # BF16 before MXFP8 quantization.
+            dtype=dtypes.bf16 if a_dtype == "fp8" else dtypes.fp32,
+            activation=getattr(ActivationType, activation),
+            quant_type=QuantType.per_1x32,
+            doweight_stage1=False,
+            topk=topk,
+        )
+        ref_q, ref_s = quant(
+            (ref if a_dtype == "fp8" else ref.float()).reshape(-1, inter_dim),
+            **quant_kwargs,
+        )
+        ref_values = (
+            ref_q.float() if a_dtype == "fp8" else fp4_utils.mxfp4_to_f32(ref_q)
+        )
+        references[enabled] = ref_values * fp4_utils.e8m0_to_f32(
+            ref_s
+        ).repeat_interleave(32, 1)
+    snapshots = []
+    for runtime_bias in (bias, None, bias):
+        payload, scales = stage1(bias1=runtime_bias)
+        decoded, _ = decode_bm16_intermediate(
+            payload, scales, inter_dim, native=block_m == 16
+        )
+        selected = decoded[reverse.long()]
+        assert torch.isfinite(selected).all()
+        error = checkAllclose(
+            references[runtime_bias is not None],
+            selected,
+            rtol=0.01,
+            atol=0.01,
+            tol_err_ratio=0,
+            msg=f"{precision} {activation} BM{block_m} runtime bias",
+        )
+        assert error == 0
+        snapshots.append(selected.clone())
+    assert torch.equal(snapshots[0], snapshots[2])
+    assert torch.count_nonzero(snapshots[1]) == 0
+    assert torch.count_nonzero(snapshots[0]) > 0
+    flops = 4 * token * topk * model_dim * inter_dim
+    nbytes = sum(
+        data[key].numel() * data[key].element_size()
+        for key in ("input", "w1_a16", "w1s_a16")
+    )
+    ret = {"gfx": get_gfx(), "GEMM1": g1, "bias switch err": 0}
+    candidates = {
+        "bias": functools.partial(stage1, bias1=bias),
+        "no_bias": functools.partial(stage1, bias1=None),
+    }
+    for name, candidate in candidates.items():
+        (payload, scales), us = run_perftest(candidate, num_warmup=2, num_iters=5)
+        decoded, _ = decode_bm16_intermediate(
+            payload, scales, inter_dim, native=block_m == 16
+        )
+        error = checkAllclose(
+            references[name == "bias"],
+            decoded[reverse.long()],
+            rtol=0.01,
+            atol=0.01,
+            tol_err_ratio=0,
+            msg=f"{name} timed output",
+        )
+        assert error == 0 and math.isfinite(us) and us > 0
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = (
+            (nbytes + (bias.numel() * bias.element_size() if name == "bias" else 0))
+            / us
+            / 1e6
+        )
+        ret[f"{name} err"] = error
+    return ret
+
+
+test_runtime_bias_stage1.__test__ = False
+
+
+@pytest.mark.parametrize("precision", ["A4W4", "A8W4"])
+@pytest.mark.parametrize("activation", ["Silu", "Situv2", "Swiglu"])
+@pytest.mark.parametrize("block_m", [16, 32])
+def test_mxmoe_runtime_bias_switch(
+    precision: str, activation: str, block_m: int
+) -> None:
+    with torch.device("cuda"):
+        result = test_runtime_bias_stage1(precision, activation, block_m)
+    aiter.logger.info(
+        "MXMOE runtime bias summary (markdown):\n%s",
+        pd.DataFrame([result]).to_markdown(index=False),
+    )
+
+
+@benchmark()
 def test_bm16_scale_pipeline(
     token: int,
     model_dim: int,
