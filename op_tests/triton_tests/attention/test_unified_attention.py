@@ -436,7 +436,12 @@ def test_triton_unified_attn_3d(
             pytest.skip("NVFP4 KV cache requires shuffled KV cache")
 
     if shuffled_kv_cache:
-        if q_dtype == e4m3_dtype and kv_dtype == e4m3_dtype and block_size < 32:
+        if (
+            DEVICE_ARCH == "gfx1250"
+            and q_dtype == e4m3_dtype
+            and kv_dtype == e4m3_dtype
+            and block_size < 32
+        ):
             pytest.skip(
                 "For A8W8 Unified Attention with pre-shuffled KV cache, only block_size >= 32 is supported"
             )

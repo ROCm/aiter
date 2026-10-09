@@ -198,6 +198,20 @@ def _as_field(x):
 
 @aggregate
 @strip_annotate
+class TileLoad:
+    """Offsets of one K or V tile; mask is None when nothing is masked."""
+
+    offset: tl.tensor
+    mask: tl.tensor | tl.constexpr
+
+    @triton.constexpr_function
+    def __init__(self, offset, mask):
+        self.offset = offset
+        self.mask = _as_field(mask)
+
+
+@aggregate
+@strip_annotate
 class KVLoader:
     """Loads K/V tiles of one sequence from the paged cache.
 
@@ -206,7 +220,8 @@ class KVLoader:
     V = [num_blks, num_kv_heads, blk_size // W, head_size, W], read a page at a
     time and un-shuffled in registers.
 
-    Offsets and masks are built before either load, so the loads can be reordered.
+    prepare_k_load / prepare_v_load build the offsets and masks; load_k / load_v
+    only read them, so the loop can order the four steps as it likes.
     """
 
     cfg: AttentionConfig
@@ -274,29 +289,6 @@ class KVLoader:
         self.max_seq_prefix_len = max_seq_prefix_len
 
     @triton.jit
-    def load_tile(self, j, target_dtype: tl.constexpr, MASKED: tl.constexpr):
-        """Returns K (HEAD_SIZE_PADDED, TILE_SIZE), V (TILE_SIZE, V_HEAD_SIZE_PADDED)
-        and the tile's key positions. Without MASKED every key of the tile is
-        assumed to be in range."""
-        seq_offset = j * self.cfg.TILE_SIZE + self.offs_t
-        tile_mask = self.tile_mask(seq_offset, MASKED)
-        block_idx = self.block_ids(j, seq_offset)
-        # address math before either load; moving it changes the schedule
-        if self.cfg.SHUFFLED_KV_CACHE:
-            k_offset = self.k_offset(j, seq_offset, block_idx)
-            v_offset = self.v_offset(j, seq_offset, block_idx)
-            k_mask = self.k_mask(j, tile_mask)
-            v_mask = self.v_mask(j, tile_mask)
-        else:
-            v_offset = self.v_offset(j, seq_offset, block_idx)
-            v_mask = self.v_mask(j, tile_mask)
-            k_offset = self.k_offset(j, seq_offset, block_idx)
-            k_mask = self.k_mask(j, tile_mask)
-        K = self.load_k(k_offset, k_mask, target_dtype)
-        V = self.load_v(v_offset, v_mask, target_dtype)
-        return K, V, seq_offset
-
-    @triton.jit
     def tile_mask(self, seq_offset, MASKED: tl.constexpr):
         # None when every key is in range
         mask = None
@@ -339,7 +331,7 @@ class KVLoader:
         return block_idx.to(tl.int64)
 
     @triton.jit
-    def k_offset(self, j, seq_offset, block_idx):
+    def prepare_k_load(self, j, seq_offset, block_idx, tile_mask):
         cfg = self.cfg
         if not cfg.SHUFFLED_KV_CACHE:
             offset = (
@@ -379,10 +371,27 @@ class KVLoader:
                 * (cfg.BLOCK_SIZE * W)
                 + tl.arange(0, cfg.SLOT_SIZE * W)[None, None, :]
             )
-        return offset
+
+        # None when nothing needs masking
+        mask = None
+        if not cfg.SHUFFLED_KV_CACHE:
+            if tile_mask is None:
+                mask = self.dim_mask[:, None]
+            else:
+                mask = self.dim_mask[:, None] & tile_mask[None, :]
+        elif cfg.NUM_SLOTS > 1:
+            mask = tl.broadcast_to(
+                self.slot_mask(j)[None, :, None],
+                (
+                    cfg.HEAD_SIZE_PADDED // cfg.K_WIDTH,
+                    cfg.NUM_SLOTS,
+                    cfg.BLOCK_SIZE * cfg.K_WIDTH,
+                ),
+            ).reshape(cfg.TILE_SIZE * cfg.HEAD_SIZE_PADDED)
+        return TileLoad(offset, mask)
 
     @triton.jit
-    def v_offset(self, j, seq_offset, block_idx):
+    def prepare_v_load(self, j, seq_offset, block_idx, tile_mask):
         cfg = self.cfg
         if not cfg.SHUFFLED_KV_CACHE:
             offset = (
@@ -414,33 +423,8 @@ class KVLoader:
                 + self.kv_head_idx * self.stride_v_cache_1
                 + (in_page // cfg.K_WIDTH) * self.stride_v_cache_2
             )[:, None] + tl.arange(0, cfg.SLOT_SIZE * cfg.HEAD_SIZE_PADDED)[None, :]
-        return offset
 
-    @triton.jit
-    def k_mask(self, j, tile_mask):
         # None when nothing needs masking
-        cfg = self.cfg
-        mask = None
-        if not cfg.SHUFFLED_KV_CACHE:
-            if tile_mask is None:
-                mask = self.dim_mask[:, None]
-            else:
-                mask = self.dim_mask[:, None] & tile_mask[None, :]
-        elif cfg.NUM_SLOTS > 1:
-            mask = tl.broadcast_to(
-                self.slot_mask(j)[None, :, None],
-                (
-                    cfg.HEAD_SIZE_PADDED // cfg.K_WIDTH,
-                    cfg.NUM_SLOTS,
-                    cfg.BLOCK_SIZE * cfg.K_WIDTH,
-                ),
-            ).reshape(cfg.TILE_SIZE * cfg.HEAD_SIZE_PADDED)
-        return mask
-
-    @triton.jit
-    def v_mask(self, j, tile_mask):
-        # None when nothing needs masking
-        cfg = self.cfg
         mask = None
         if not cfg.SHUFFLED_KV_CACHE:
             if tile_mask is None:
@@ -452,18 +436,18 @@ class KVLoader:
                 self.slot_mask(j)[:, None],
                 (cfg.NUM_SLOTS, cfg.BLOCK_SIZE * cfg.HEAD_SIZE_PADDED),
             ).reshape(cfg.TILE_SIZE * cfg.HEAD_SIZE_PADDED)
-        return mask
+        return TileLoad(offset, mask)
 
     @triton.jit
-    def load_k(self, k_offset, k_mask, target_dtype: tl.constexpr):
+    def load_k(self, k_load, target_dtype: tl.constexpr):
         """K : (HEAD_SIZE_PADDED, TILE_SIZE)"""
         cfg = self.cfg
-        ptrs = self.key_cache_ptr + k_offset
-        if k_mask is None:
+        ptrs = self.key_cache_ptr + k_load.offset
+        if k_load.mask is None:
             K = tl.load(ptrs, cache_modifier=cfg.KV_CACHE_MODIFIER)
         else:
             K = tl.load(
-                ptrs, mask=k_mask, other=0.0, cache_modifier=cfg.KV_CACHE_MODIFIER
+                ptrs, mask=k_load.mask, other=0.0, cache_modifier=cfg.KV_CACHE_MODIFIER
             )
         K = K.to(target_dtype)
 
@@ -481,15 +465,15 @@ class KVLoader:
         return K
 
     @triton.jit
-    def load_v(self, v_offset, v_mask, target_dtype: tl.constexpr):
+    def load_v(self, v_load, target_dtype: tl.constexpr):
         """V : (TILE_SIZE, V_HEAD_SIZE_PADDED)"""
         cfg = self.cfg
-        ptrs = self.value_cache_ptr + v_offset
-        if v_mask is None:
+        ptrs = self.value_cache_ptr + v_load.offset
+        if v_load.mask is None:
             V = tl.load(ptrs, cache_modifier=cfg.KV_CACHE_MODIFIER)
         else:
             V = tl.load(
-                ptrs, mask=v_mask, other=0.0, cache_modifier=cfg.KV_CACHE_MODIFIER
+                ptrs, mask=v_load.mask, other=0.0, cache_modifier=cfg.KV_CACHE_MODIFIER
             )
         V = V.to(target_dtype)
 
@@ -910,8 +894,15 @@ def attention_loop(
     pgm, kv_loader, M, L, acc, tile_start, tile_end, MASKED: tl.constexpr
 ):
     """Online softmax over tiles [tile_start, tile_end)."""
+    cfg = pgm.cfg
     for j in range(tile_start, tile_end):
-        K, V, seq_offset = kv_loader.load_tile(j, pgm.q.dtype, MASKED)
+        seq_offset = j * cfg.TILE_SIZE + kv_loader.offs_t
+        block_idx = kv_loader.block_ids(j, seq_offset)
+        tile_mask = kv_loader.tile_mask(seq_offset, MASKED)
+        k_load = kv_loader.prepare_k_load(j, seq_offset, block_idx, tile_mask)
+        v_load = kv_loader.prepare_v_load(j, seq_offset, block_idx, tile_mask)
+        K = kv_loader.load_k(k_load, pgm.q.dtype)
+        V = kv_loader.load_v(v_load, pgm.q.dtype)
         # position-only, so it can overlap the QK dot
         if MASKED:
             seq_mask = pgm.causal_mask(seq_offset)
