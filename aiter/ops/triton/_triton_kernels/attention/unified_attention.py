@@ -102,7 +102,7 @@ kernel_unified_attention_3d_repr = make_kernel_repr(
 
 
 def _kernel_unified_attention_repr(specialization):
-    # one kernel, named after the grid it is launched on
+    # keep the 2d / 3d kernel names
     if specialization.constants.get("GRID_3D", False):
         return kernel_unified_attention_3d_repr(specialization)
     return _kernel_unified_attention_2d_repr(specialization)
@@ -179,7 +179,7 @@ class AttentionConfig:
         self.SHUFFLED_KV_CACHE = tl.constexpr(SHUFFLED_KV_CACHE)
         self.SPLIT_UNMASKED_LOOP = tl.constexpr(SPLIT_UNMASKED_LOOP)
         self.K_WIDTH = tl.constexpr(K_WIDTH)
-        # a shuffled tile is NUM_SLOTS slots of SLOT_SIZE keys, each inside one page
+        # a shuffled tile is NUM_SLOTS slots of SLOT_SIZE keys, each within one page
         self.SLOT_SIZE = tl.constexpr(min(TILE_SIZE, BLOCK_SIZE))
         self.NUM_SLOTS = tl.constexpr(TILE_SIZE // min(TILE_SIZE, BLOCK_SIZE))
         self.NUM_SEGMENTS_PER_SEQ = tl.constexpr(NUM_SEGMENTS_PER_SEQ)
@@ -192,26 +192,21 @@ class AttentionConfig:
 
 @triton.constexpr_function
 def _as_field(x):
-    # an aggregate field may be a tensor or a compile-time value (an int argument
-    # of 1, an absent pointer, a folded scale); __init__ sees the latter unwrapped
+    # __init__ gets compile-time values (int args of 1, None, folded scales) unwrapped
     return x if isinstance(x, tl.tensor) else tl.constexpr(x)
 
 
 @aggregate
 @strip_annotate
 class KVLoader:
-    """Loads TILE_SIZE wide K/V tiles of a sequence from the paged KV cache.
+    """Loads K/V tiles of one sequence from the paged cache.
 
-    Plain layout: K/V = [num_blks, blk_size, num_kv_heads, head_size]; the block
-    table is read per key, so a tile may straddle pages.
-    Shuffled layout: K = [num_blks, num_kv_heads, head_size // W, blk_size, W],
-    V = [num_blks, num_kv_heads, blk_size // W, head_size, W]. A one-page tile is
-    one contiguous run; any other tile is read as NUM_SLOTS slots of SLOT_SIZE
-    keys, each inside one page. Both are un-shuffled in registers.
+    Plain: K/V = [num_blks, blk_size, num_kv_heads, head_size].
+    Shuffled: K = [num_blks, num_kv_heads, head_size // W, blk_size, W],
+    V = [num_blks, num_kv_heads, blk_size // W, head_size, W], read a page at a
+    time and un-shuffled in registers.
 
-    block_ids() looks the tile up once; k_offset() / k_mask() and v_offset() /
-    v_mask() build the addresses, load_k() / load_v() issue the loads, so either
-    load can move.
+    Offsets and masks are built before either load, so the loads can be reordered.
     """
 
     cfg: AttentionConfig
@@ -286,7 +281,7 @@ class KVLoader:
         seq_offset = j * self.cfg.TILE_SIZE + self.offs_t
         tile_mask = self.tile_mask(seq_offset, MASKED)
         block_idx = self.block_ids(j, seq_offset)
-        # address math ahead of both loads, in the order the kernels are tuned with
+        # address math before either load; moving it changes the schedule
         if self.cfg.SHUFFLED_KV_CACHE:
             k_offset = self.k_offset(j, seq_offset, block_idx)
             v_offset = self.v_offset(j, seq_offset, block_idx)
@@ -303,7 +298,7 @@ class KVLoader:
 
     @triton.jit
     def tile_mask(self, seq_offset, MASKED: tl.constexpr):
-        # keys of the plain layout past the prefix; None when all are in range
+        # None when every key is in range
         mask = None
         if MASKED and not self.cfg.SHUFFLED_KV_CACHE:
             # to reduce the masking effect when not needed
@@ -315,14 +310,12 @@ class KVLoader:
 
     @triton.jit
     def slot_start(self, j):
-        # first key of each slot of a shuffled tile that is not one page
         cfg = self.cfg
         return j * cfg.TILE_SIZE + tl.arange(0, cfg.NUM_SLOTS) * cfg.SLOT_SIZE
 
     @triton.jit
     def slot_mask(self, j):
-        # with several slots, those past the prefix are skipped, which also keeps
-        # the block table read inside this sequence; a single slot is in range
+        # also keeps the block table read inside this sequence
         return self.slot_start(j) < self.max_seq_prefix_len
 
     @triton.jit
@@ -374,7 +367,7 @@ class KVLoader:
                 + tl.arange(0, cfg.BLOCK_SIZE * W)[None, None, :]
             ).reshape(cfg.TILE_SIZE * cfg.HEAD_SIZE_PADDED)
         else:
-            # part of one page: HEAD_SIZE // W runs of TILE_SIZE * W elements
+            # part of one page
             W: tl.constexpr = cfg.K_WIDTH
             in_page = self.slot_start(j) % cfg.BLOCK_SIZE
             offset = (
@@ -405,8 +398,7 @@ class KVLoader:
                 + self.offs_shfl
             )
         elif cfg.NUM_SLOTS > 1:
-            # whole pages, flattened: concatenated pages are the one-page
-            # [TILE // W, HEAD_SIZE, W] order
+            # whole pages; concatenated they are already the one-page order
             offset = (
                 (
                     block_idx * self.stride_v_cache_0
@@ -415,7 +407,7 @@ class KVLoader:
                 + tl.arange(0, cfg.BLOCK_SIZE * cfg.HEAD_SIZE_PADDED)[None, :]
             ).reshape(cfg.TILE_SIZE * cfg.HEAD_SIZE_PADDED)
         else:
-            # part of one page: a single run of TILE_SIZE * HEAD_SIZE_PADDED elements
+            # part of one page: one contiguous run
             in_page = self.slot_start(j) % cfg.BLOCK_SIZE
             offset = (
                 block_idx * self.stride_v_cache_0
@@ -426,7 +418,7 @@ class KVLoader:
 
     @triton.jit
     def k_mask(self, j, tile_mask):
-        # None when every element of the K tile is in range
+        # None when nothing needs masking
         cfg = self.cfg
         mask = None
         if not cfg.SHUFFLED_KV_CACHE:
@@ -447,7 +439,7 @@ class KVLoader:
 
     @triton.jit
     def v_mask(self, j, tile_mask):
-        # None when every element of the V tile is in range
+        # None when nothing needs masking
         cfg = self.cfg
         mask = None
         if not cfg.SHUFFLED_KV_CACHE:
@@ -517,9 +509,8 @@ class KVLoader:
 @aggregate
 @strip_annotate
 class AttentionProgram:
-    """Per-program state: the query block, its masks and scales, and the KV tile
-    range [tile_start, tile_end) it covers. Tiles below unmasked_tile_end need no
-    causal or length mask (only computed with SPLIT_UNMASKED_LOOP)."""
+    """Per-program state: query block, masks, scales and the KV tile range
+    [tile_start, tile_end); unmasked_tile_end is only set with SPLIT_UNMASKED_LOOP."""
 
     cfg: AttentionConfig
 
@@ -648,8 +639,7 @@ class AttentionProgram:
         # this prefix can be skipped)
         num_tiles = cdiv_fn(max_seq_prefix_len, cfg.TILE_SIZE)
 
-        # ---- Sliding-window tile pruning --------------------
-        # Default: keep previous global behavior
+        # sliding window: skip the tiles outside the window
         tile_start = 0
         tile_end = num_tiles
         if cfg.SLIDING_WINDOW > 0:
@@ -670,9 +660,7 @@ class AttentionProgram:
             tile_start = tl.maximum(0, first_allowed_key // cfg.TILE_SIZE)
             tile_end = tl.minimum((last_allowed_key // cfg.TILE_SIZE) + 1, num_tiles)
 
-        # ---- Split-KV: this program's segment of the tiles --------------------
-        # Segments split the whole sequence, so reduce_segments can recover the
-        # same partition from seq_len alone.
+        # split-KV: reduce_segments rebuilds the same partition from seq_len
         if cfg.NUM_SEGMENTS_PER_SEQ > 1:
             segm_tile_start = segm_idx * tiles_per_segment
             if cfg.SLIDING_WINDOW > 0:
@@ -682,7 +670,7 @@ class AttentionProgram:
             tile_end = tl.minimum((segm_idx + 1) * tiles_per_segment, tile_end)
 
         # qk_scale = scale * RCP_LN2 (log_2 e) so that we can use exp2 later;
-        # a local float is an fp32 scalar, so the product rounds in fp32
+        # a local float keeps the product in fp32
         RCP_LN2 = 1.4426950408889634
         qk_scale = scale * RCP_LN2
         if q_descale_ptr is not None:
@@ -921,15 +909,10 @@ def initial_row_max(cfg, sink_ptr, query_offset_1, query_mask_1, segm_idx):
 def attention_loop(
     pgm, kv_loader, M, L, acc, tile_start, tile_end, MASKED: tl.constexpr
 ):
-    """Online softmax over tiles [tile_start, tile_end).
-
-    Per iter:
-        load K/V -> QK (+softcap) -> [causal/window mask] -> bias -> softmax -> PV
-    """
+    """Online softmax over tiles [tile_start, tile_end)."""
     for j in range(tile_start, tile_end):
         K, V, seq_offset = kv_loader.load_tile(j, pgm.q.dtype, MASKED)
-        # the mask only depends on positions; built ahead of the dot it can
-        # overlap the matrix instructions
+        # position-only, so it can overlap the QK dot
         if MASKED:
             seq_mask = pgm.causal_mask(seq_offset)
         S = pgm.compute_qk(K)
@@ -1002,7 +985,7 @@ def kernel_unified_attention(
     # Split-KV (3d grid)
     GRID_3D: tl.constexpr = False,  # bool, (q_block, kv_head, segment) grid
     NUM_SEGMENTS_PER_SEQ: tl.constexpr = 1,  # int
-    # launch options and dtypes, only read by the 3d kernel name
+    # only used to name the 3d kernel
     num_warps: tl.constexpr = 4,  # int
     waves_per_eu: tl.constexpr = 0,  # int
     num_stages: tl.constexpr = 2,  # int
@@ -1011,10 +994,9 @@ def kernel_unified_attention(
 ):
     """Paged causal attention, one program per (query block, kv head[, segment]).
 
-    GRID_3D=False: grid (num_kv_heads, num_q_blocks), output written directly.
-    GRID_3D=True:  grid (num_q_blocks, num_kv_heads, NUM_SEGMENTS_PER_SEQ). With
-    more than one segment the KV range is split and each program writes fp32
-    partials (acc, max, expsum) that reduce_segments merges.
+    GRID_3D=False: grid (num_kv_heads, num_q_blocks).
+    GRID_3D=True: grid (num_q_blocks, num_kv_heads, NUM_SEGMENTS_PER_SEQ); with more
+    than one segment the program writes fp32 partials for reduce_segments.
     """
     # SPLIT_UNMASKED_LOOP does not support SHUFFLED_KV_CACHE or SLIDING_WINDOW.
     tl.static_assert(
@@ -1093,7 +1075,6 @@ def kernel_unified_attention(
     if NUM_SEGMENTS_PER_SEQ > 1:
         # sequence len for this particular sequence
         seq_len = tl.load(seq_lens_ptr + seq_idx)
-        # number of tiles each segment of this sequence covers
         tiles_per_segment = cdiv_fn(seq_len, NUM_SEGMENTS_PER_SEQ * TILE_SIZE)
         # This segment owns no tiles
         if segm_idx * tiles_per_segment * TILE_SIZE >= seq_len:

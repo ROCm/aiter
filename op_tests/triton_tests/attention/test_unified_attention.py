@@ -556,7 +556,7 @@ _SHUFFLED_DECODE = [(1, 8191), (1, 5003), (1, 77), (1, 4096)]  # 3d grid
 @pytest.mark.parametrize(
     "seq_lens, block_size, dtype",
     [
-        # tiles wider than a page (16) and inside one (128), lengths off the page
+        # tile 64 over 16-token pages and within 128-token pages, lengths ending mid-page
         (_SHUFFLED_PREFILL, 16, torch.bfloat16),
         (_SHUFFLED_PREFILL, 128, torch.bfloat16),
         (_SHUFFLED_PREFILL, 16, e4m3_dtype),
@@ -570,7 +570,6 @@ _SHUFFLED_DECODE = [(1, 8191), (1, 5003), (1, 77), (1, 4096)]  # 3d grid
 def test_triton_unified_attn_shuffled_tile(
     seq_lens: list[tuple[int, int]], block_size: int, dtype: torch.dtype
 ) -> None:
-    # the triton kernels gather a shuffled tile per token when it is not one page
     num_heads = (16, 2)
     (
         query,
@@ -650,9 +649,8 @@ def test_triton_unified_attn_shuffled_tile(
 
 @torch.inference_mode()
 def test_triton_unified_attn_3d_one_segment() -> None:
-    # a decode batch of exactly target_num_prgms programs stays on the 3d grid
-    # but leaves no room for a KV split, so the kernel writes out directly;
-    # head 80 checks the store with the unpadded output strides
+    # CUs * 4 programs: 3d grid without a split, so the kernel writes out directly;
+    # head 80 checks the unpadded output strides
     num_heads = (64, 8)
     num_seqs = get_num_sms() * 4 // num_heads[1]
     seq_lens = [(1, 2048)] * num_seqs

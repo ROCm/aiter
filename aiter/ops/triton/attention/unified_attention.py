@@ -254,9 +254,7 @@ def unified_attention(
         SCALE_K_WIDTH = 4
 
     if shuffled_kv_cache:
-        # The kernels read a one-page shuffled tile as TILE_SIZE * HEAD_SIZE_PADDED
-        # contiguous elements and gather any other tile per token. Shuffled pages
-        # are kept to powers of 2; non-shuffled pages have no such constraint.
+        # shuffled pages must be a power of 2; plain pages have no such constraint
         assert block_size & (block_size - 1) == 0, (
             "Unified Attention with pre-shuffled KV cache requires a power-of-2 "
             f"page, got block_size={block_size}"
@@ -621,8 +619,7 @@ def _unified_attention_3d_triton(
     else:
         total_num_q_blocks = params.num_tokens // config["BLOCK_Q"] + params.num_seqs
 
-    # A single segment writes the output directly; a split writes fp32 partials
-    # for reduce_segments, which then applies output_scale.
+    # a split writes fp32 partials; reduce_segments applies output_scale
     split = NUM_SEGMENTS > 1
     kernel_unified_attention[(total_num_q_blocks, params.num_kv_heads, NUM_SEGMENTS)](
         output_ptr=None if split else params.out,
