@@ -550,6 +550,7 @@ class AITER_CONFIG:
             logger.warning(
                 f"Untuned config file not found: {untuned_path}. Using all columns for deduplication."
             )
+            merge_df = merge_df.drop_duplicates()
         import tempfile
         from pathlib import Path
 
