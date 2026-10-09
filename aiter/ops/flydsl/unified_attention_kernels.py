@@ -14,7 +14,8 @@ E4M3FNUZ K/V with page 32, 64 or 128, per-tensor fp32 descales, and bf16
 output. That covers both Gemma-4 layer types. One launch serves a whole varlen
 batch: multi-token sequences run as prefill tiles, one-token sequences as KV
 splits that a second launch combines. A batch of only one-token sequences runs
-a decode-only build of the same kernel. A lone multi-token sequence has no
+a decode-only build of the same kernel, which writes the output itself when a
+sequence needs one split. A lone multi-token sequence has no
 decode combine; when its tiles cannot fill the GPU it splits their KV range,
 and a prefill combine merges the splits.
 """
@@ -42,8 +43,6 @@ _HEAD_DIMS = (256, 512)
 # vLLM pages Gemma-4's head-512 layers at twice the block size of its head-256
 # layers (equal page bytes), so block size 64 gives them page 128.
 _PAGE_SIZES = (32, 64, 128)
-# fp32 split partials, one buffer per (device, stream), grown on demand.
-_workspaces = {}
 
 
 @lru_cache(maxsize=1)
@@ -261,51 +260,15 @@ def _cede_to_triton(
 ) -> bool:
     """Keep measured FlyDSL loss regions on the tuned Triton implementation."""
     if max_seqlen_q == 1:
-        # Tiny full-attention decode is launch-latency bound.
-        if head_size == 512 and num_seqs * max_seqlen_k <= 2048:
-            return True
-        # Page-32 full decode loses its margin once long-context batches fill
-        # the machine; Triton's page-specific shape is faster there.
-        if (
-            head_size == 512
-            and block_size == 32
-            and (
-                (max_seqlen_k >= 32768 and (num_seqs == 16 or num_seqs >= 32))
-                or (4096 <= max_seqlen_k < 32768 and num_seqs == 32)
+        if head_size == 512:
+            # Tiny decode is launch-latency bound, and page 64 has no
+            # measured margin past 256 sequences.
+            return num_seqs * max_seqlen_k <= 2048 or (
+                block_size == 64 and num_seqs > 256
             )
-        ):
-            return True
-        # Page-64 full decode uses the faster two-wave Triton table in these
-        # bandwidth-saturated cells. Page 128 remains faster on FlyDSL.
-        if head_size == 512 and block_size == 64:
-            if max_seqlen_k >= 32768 and num_seqs >= 16:
-                return True
-            if max_seqlen_k >= 4096 and (
-                32 <= num_seqs <= 64 or num_seqs == 128 or num_seqs >= 256
-            ):
-                return True
-        # At page 128 these 4K occupancy points are effectively tied; cede
-        # them so served FlyDSL cells retain a useful margin.
-        if (
-            head_size == 512
-            and block_size == 128
-            and num_seqs in (32, 40, 48, 56, 64, 96)
-            and 4096 <= max_seqlen_k < 32768
-        ):
-            return True
-        # Triton's page-32 sliding decode becomes faster from batch 32.
-        if (
-            head_size == 256
-            and block_size == 32
-            and window is not None
-            and num_seqs >= 24
-        ):
-            return True
-        # The page-64 crossover is much later, with one measured occupancy
-        # hole at batch 96 in the mid-context regime.
-        if head_size == 256 and block_size == 64 and window is not None:
-            return num_seqs >= 256 or (num_seqs == 96 and 4096 <= max_seqlen_k < 32768)
-        return False
+        # Triton's page-32 sliding decode is as fast or faster past 38
+        # sequences.
+        return window is not None and block_size == 32 and num_seqs > 38
     if num_seqs == 1:
         # A lone sequence: a prefix chunk over a cached prefix of at least
         # four tiles splits its KV range and wins. A short fresh prefill is
@@ -316,9 +279,12 @@ def _cede_to_triton(
             prefix = min(prefix, window - 1)
         short = 384 if head_size == 256 else 256
         return max_seqlen_q <= short and prefix < 4 * prefill_block_k(head_size)
-    # Mixed batches cannot split a chunk's KV range, so a short chunk over a
-    # long prefix walks it alone; through 512 queries Triton keeps the batch.
-    return max_seqlen_q <= 512
+    # Mixed batches cannot split a chunk's KV range, so a short chunk walks
+    # its prefix alone. Triton is as fast or faster through 128 queries at
+    # head 512, and at head 256 through 512 queries on page 32 and 256 above.
+    if head_size == 512:
+        return max_seqlen_q <= 128
+    return max_seqlen_q <= (512 if block_size == 32 else 256)
 
 
 def _as_i8(t: torch.Tensor) -> torch.Tensor:
@@ -326,13 +292,11 @@ def _as_i8(t: torch.Tensor) -> torch.Tensor:
     return t.view(torch.int8) if t.dtype == _FP8_DTYPE else t
 
 
-def _workspace(device, stream, numel):
-    key = (device, stream.cuda_stream)
-    part = _workspaces.get(key)
-    if part is None or part.numel() < numel:
-        part = torch.empty(numel, device=device, dtype=torch.float32)
-        _workspaces[key] = part
-    return part
+def _workspace(device, numel):
+    """fp32 split partials, allocated per call: a shared buffer replaced when a
+    later call needs more would leave graphs captured earlier holding a freed
+    pointer."""
+    return torch.empty(numel, device=device, dtype=torch.float32)
 
 
 def _launch(
@@ -389,17 +353,22 @@ def _launch(
         window,
         head_size,
         decode_only=decode_only,
+        num_cus=_num_cus(q.device.index),
     )
     # Each decode wave runs one split; the unified kernel has four per workgroup.
     waves = 1 if decode_only else 4
     groups = (splits + waves - 1) // waves
+    # A one-split decode-only launch writes the output itself.
+    direct = decode_only and groups == 1
     decode_slots = 0 if lone_prefill else num_seqs * groups
     stream = torch.cuda.current_stream(q.device)
     if lone_prefill:
         partials = num_tokens * num_query_heads * psplits if psplits > 1 else 0
+    elif direct:
+        partials = 0
     else:
         partials = num_seqs * num_query_heads * groups * waves
-    workspace = _workspace(q.device, stream, max(4, partials * (head_size + 4)))
+    workspace = _workspace(q.device, max(4, partials * (head_size + 4)))
     with torch.cuda.device(q.device):
         kernel = build_flash_attn_fp8_gfx942_module(
             head_size,
@@ -438,7 +407,7 @@ def _launch(
                 head_size, num_query_heads, prefill=True
             )
             combine(workspace, out, cu_seqlens_q, num_tokens, psplits, stream=stream)
-        elif not lone_prefill:
+        elif not lone_prefill and not direct:
             combine = build_flash_attn_fp8_gfx942_combine_module(
                 head_size, num_query_heads
             )

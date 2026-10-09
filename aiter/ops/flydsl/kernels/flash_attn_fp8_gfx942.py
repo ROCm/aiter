@@ -18,7 +18,8 @@ psplits adjacent slots, which write fp32 partials for a prefill combine.
 Decode slots give each wave one split of a one-token sequence, running a
 32-key decode body entirely in registers: K loads straight into MFMA
 operands, and V is byte-transposed in place, so decode waves need no LDS and
-no barriers. A combine launch merges the splits.
+no barriers. A combine launch merges the splits; a decode-only launch with one
+split writes the output itself.
 
 Both GEMMs use mfma_f32_16x16x32_fp8_fp8 in transposed form (S^T = K Q^T,
 O^T += V^T P^T), so P needs no cross-lane moves. P is scaled by 240 before
@@ -41,9 +42,9 @@ NK = 32  # decode key tile
 NO_WINDOW = 1 << 30
 
 
-def _load(ptr, offset, dtype, alignment):
+def _load(ptr, offset, dtype, alignment, nontemporal=False):
     p = buffer_ops.get_element_ptr(fx.to_llvm_ptr(ptr), byte_offset=offset)
-    return llvm.LoadOp(dtype, p, alignment=alignment).result
+    return llvm.LoadOp(dtype, p, alignment=alignment, nontemporal=nontemporal).result
 
 
 def _store(ptr, offset, value, alignment):
@@ -124,6 +125,7 @@ def plan_num_kv_splits(
     window,
     head_dim,
     decode_only=False,
+    num_cus=304,
 ):
     """Decode split count, fitted to MI325X sweeps (batch 1-256, context
     0.5K-32K): about 128K / head_dim split waves in all, and at least
@@ -137,18 +139,25 @@ def plan_num_kv_splits(
     splits = min(want, tiles * 128 // head_dim)
     if splits * units < 128:
         splits = min(want, tiles * 256 // head_dim)
-    # Head-512 decode has occupancy holes between the power-of-two batch
-    # points used by the original fit. Extra splits fill those holes and beat
-    # both Triton tables at 4K-32K; mixed batches keep the conservative model.
-    if decode_only and window is None and head_dim == 512 and max_seqlen_k >= 4096:
-        if 20 <= num_seqs < 44:
-            splits = max(splits, 3)
-        elif 44 <= num_seqs < 60:
-            splits = max(splits, 4)
-        elif 60 <= num_seqs < 80:
-            splits = max(splits, 3)
-        elif 80 <= num_seqs < 112:
-            splits = max(splits, 2)
+    # Head-512 decode slows when its waves spill just past a whole number of
+    # rounds over the CUs. For 64-511 sequence-heads at 4K+ keys, take the
+    # count with one to four waves per CU whose waves fill their rounds best,
+    # the fewer splits on a tie; mixed batches keep the conservative model.
+    if (
+        decode_only
+        and window is None
+        and head_dim == 512
+        and max_seqlen_k >= 4096
+        and 64 <= units < 512
+    ):
+
+        def fill(s):
+            waves = units * s
+            return waves / (num_cus * -(-waves // num_cus))
+
+        fits = [s for s in (1, 2, 3, 4, 5, 6, 8) if num_cus <= units * s <= 4 * num_cus]
+        if fits:
+            splits = max(fits, key=lambda s: (round(fill(s), 2), -s))
         splits = min(splits, tiles)
     return max(1, splits)
 
@@ -737,6 +746,9 @@ def build_flash_attn_fp8_gfx942_module(
                     # vmcnt queue behind the K/V loads.
                     return fx.Int32(fx.memref_load(BT, (dseq, block * NK // page_size)))
 
+                # Decode-only launches load K and V non-temporal: each key is read
+                # once, and the hint lifts decode bandwidth. In a unified launch
+                # the hint measured slower beside the prefill tiles.
                 def d_load_k(block, page):
                     # Lane (c, g) holds keys c and 16 + c.
                     base = fx.Int64(page) * k_strides[0] + fx.Int64(kvh) * k_strides[2]
@@ -753,6 +765,7 @@ def build_flash_attn_fp8_gfx942_module(
                                 ),
                                 fx.Vector.make_type(4, fx.Int32),
                                 16,
+                                nontemporal=decode_only,
                             )
                         )
                         for half in range(2)
@@ -783,6 +796,7 @@ def build_flash_attn_fp8_gfx942_module(
                                             ),
                                             fx.Vector.make_type(4, fx.Int32),
                                             16,
+                                            nontemporal=decode_only,
                                         )
                                     )
                                 )
@@ -912,29 +926,61 @@ def build_flash_attn_fp8_gfx942_module(
                         [d_m, d_l] + d_o + [d_page_ahead] + d_k_ahead + d_v_ahead
                     )
 
-                if c < group:
+                def d_rows(norm):
+                    """(depth, four scaled values) per output chunk: row 4g + i
+                    of depth block 16m + e is depth 256m + 16(4g + i) + e."""
+                    return [
+                        (
+                            m * 256 + (g * 4 + i) * 16 + e4 * 4,
+                            [
+                                fx.Vector(dresult[2 + m * 16 + e4 * 4 + k])[i] * norm
+                                for k in range(4)
+                            ],
+                        )
+                        for m in range(vchunks)
+                        for i in range(4)
+                        for e4 in range(4)
+                    ]
+
+                def d_write_partials():
                     pbase = (
                         (fx.Int64(dseq) * num_q_heads + fx.Int64(dhead))
                         * fx.Int64(splits)
                         + fx.Int64(dsplit)
                     ) * stride
-                    # Row 4g + i of depth block 16m + e is depth 256m + 16(4g + i) + e.
-                    for m in range_constexpr(vchunks):
-                        for i in range_constexpr(4):
-                            for e4 in range_constexpr(4):
-                                vals = fx.Vector.from_elements(
-                                    [
-                                        fx.Vector(dresult[2 + m * 16 + e4 * 4 + k])[i]
-                                        * vscale
-                                        for k in range(4)
-                                    ],
-                                    fx.Float32,
-                                )
-                                depth = m * 256 + (g * 4 + i) * 16 + e4 * 4
-                                _store(pp, (pbase + fx.Int64(depth)) * 4, vals, 16)
+                    for depth, vals in d_rows(vscale):
+                        _store(
+                            pp,
+                            (pbase + fx.Int64(depth)) * 4,
+                            fx.Vector.from_elements(vals, fx.Float32),
+                            16,
+                        )
                     if g == 0:
                         _store(pp, (pbase + dim) * 4, fx.Float32(dresult[0]), 4)
                         _store(pp, (pbase + dim + 1) * 4, fx.Float32(dresult[1]), 4)
+
+                def d_write_out():
+                    orow = (fx.Int64(dq0) * num_q_heads + fx.Int64(dhead)) * dim
+                    for depth, vals in d_rows(vscale / fx.Float32(dresult[1])):
+                        words = [
+                            _pack_bf16(vals[0], vals[1]),
+                            _pack_bf16(vals[2], vals[3]),
+                        ]
+                        _store(
+                            op,
+                            (orow + fx.Int64(depth)) * 2,
+                            fx.Vector.from_elements(words, fx.Int32),
+                            8,
+                        )
+
+                if c < group:
+                    if const_expr(decode_only):
+                        if splits == 1:
+                            d_write_out()
+                        else:
+                            d_write_partials()
+                    else:
+                        d_write_partials()
 
     @flyc.jit
     def launch(

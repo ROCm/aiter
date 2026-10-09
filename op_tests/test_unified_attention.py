@@ -380,18 +380,27 @@ def test_cross_attention_mask(shape, query_len, kv_len):
     return measure(candidates, case, want, [query_len], [kv_len])
 
 
-@benchmark()
-def test_splitk_combine(shape, splits):
+def nan_workspace(device, numel):
+    """Split partials pre-filled with NaN: one the kernel never writes poisons
+    the combine."""
+    return torch.full((numel,), float("nan"), device=device, dtype=torch.float32)
+
+
+def check_on_nan_workspace(launch, case, want, name):
+    """Every split must write its partial before a combine reads it."""
     from aiter.ops.flydsl import unified_attention_kernels as adapter
 
+    with mock.patch.object(adapter, "_workspace", nan_workspace):
+        compare(want, launch(), TOLERANCE * want.float().abs().max().item(), name)
+    case["out"].fill_(float("nan"))
+
+
+@benchmark()
+def test_splitk_combine(shape, splits):
     case = make_case(DECODE_QUERY_LENS, DECODE_KV_LENS, shape)
     want = reference(case, DECODE_QUERY_LENS, DECODE_KV_LENS)
     launch = direct_candidate(case, DECODE_KV_LENS, splits)
-    launch()
-    # Every split must write its partial before the combine reads it.
-    for workspace in adapter._workspaces.values():
-        workspace.fill_(float("nan"))
-    case["out"].fill_(float("nan"))
+    check_on_nan_workspace(launch, case, want, f"{splits} splits on a NaN workspace")
     ret = measure({"splitk": launch}, case, want, DECODE_QUERY_LENS, DECODE_KV_LENS)
     ret["splits run"] = splits
     return ret
@@ -401,19 +410,13 @@ def test_splitk_combine(shape, splits):
 def test_prefill_splits(shape, page, chunk, splits):
     """A lone prefix chunk whose KV range splits across workgroups, merged by
     the prefill combine; None takes the planner's count."""
-    from aiter.ops.flydsl import unified_attention_kernels as adapter
-
     query_lens, kv_lens = [chunk[0]], [chunk[1]]
     case = make_case(query_lens, kv_lens, shape, page)
     case["softmax_scale"] = 1.0
     want = reference(case, query_lens, kv_lens)
     case["k"], case["v"] = interleave_kv(case["k"], case["v"])
     launch = direct_candidate(case, kv_lens, prefill_splits=splits)
-    launch()
-    # Every split must write its partial before the combine reads it.
-    for workspace in adapter._workspaces.values():
-        workspace.fill_(float("nan"))
-    case["out"].fill_(float("nan"))
+    check_on_nan_workspace(launch, case, want, "prefill splits on a NaN workspace")
     ret = measure({"prefill_splits": launch}, case, want, query_lens, kv_lens)
     ret["splits run"] = splits or "planned"
     return ret
@@ -471,7 +474,7 @@ def test_routing_backend_gate(config):
         query_lens, kv_lens = [256], [256]
         case = make_case(query_lens, kv_lens, "full")
     elif config == "page32 sliding decode":
-        query_lens, kv_lens = [1] * 32, [32] * 32
+        query_lens, kv_lens = [1] * 48, [32] * 48
         case = make_case(query_lens, kv_lens, "sliding", page=32)
     else:
         query_lens, kv_lens = [768, 1], [768, 700]
@@ -527,35 +530,37 @@ def test_cede_policy():
     assert not _cede_to_triton(512, 16, 1, 4096, 64, None)
     assert not _cede_to_triton(256, 16, 1, 16384, 32, 1024)
     assert not _cede_to_triton(256, 4096, 1, 4096, 32, 1024)
-    # Mixed batches keep chunks through 512 queries on Triton.
-    assert _cede_to_triton(512, 512, 4, 4096, 64, None)
+    # Mixed batches keep short chunks on Triton: through 128 queries at head
+    # 512, and at head 256 through 512 on page 32 and 256 on page 64.
+    assert _cede_to_triton(512, 128, 33, 16384, 64, None)
+    assert not _cede_to_triton(512, 256, 33, 16384, 64, None)
+    assert not _cede_to_triton(512, 512, 4, 4096, 64, None)
     assert not _cede_to_triton(512, 1024, 33, 16384, 64, None)
+    assert _cede_to_triton(256, 512, 33, 16384, 32, 1024)
+    assert not _cede_to_triton(256, 1024, 33, 16384, 32, 1024)
+    assert _cede_to_triton(256, 256, 33, 16384, 64, 1024)
+    assert not _cede_to_triton(256, 384, 33, 16384, 64, 1024)
     # A fresh prefill never splits; a short chunk fills the GPU.
     assert plan_prefill_splits(4096, 4096, 4096, 32, 4, None, 512, 304) == 1
     assert plan_prefill_splits(16, 4096, 16, 32, 4, None, 512, 304) == 38
     assert plan_prefill_splits(256, 4096, 256, 32, 4, None, 512, 304) == 2
     assert plan_prefill_splits(16, 4096, 16, 32, 16, 1024, 256, 304) == 7
-    assert _cede_to_triton(512, 1, 16, 32768, 64, None)
-    assert _cede_to_triton(512, 1, 40, 4096, 64, None)
-    assert _cede_to_triton(512, 1, 32, 4096, 64, None)
-    assert _cede_to_triton(512, 1, 256, 4096, 64, None)
-    assert not _cede_to_triton(512, 1, 24, 4096, 64, None)
-    assert _cede_to_triton(512, 1, 128, 4096, 64, None)
-    assert _cede_to_triton(512, 1, 16, 32768, 32, None)
-    assert _cede_to_triton(512, 1, 32, 32768, 32, None)
-    assert not _cede_to_triton(512, 1, 24, 32768, 32, None)
-    assert _cede_to_triton(512, 1, 32, 4096, 32, None)
-    assert not _cede_to_triton(512, 1, 24, 4096, 32, None)
-    assert not _cede_to_triton(512, 1, 16, 32768, 128, None)
-    for batch in (32, 40, 48, 56, 64, 96):
-        assert _cede_to_triton(512, 1, batch, 4096, 128, None)
-    assert not _cede_to_triton(512, 1, 48, 32768, 128, None)
-    assert _cede_to_triton(256, 1, 24, 1024, 32, 1024)
-    assert _cede_to_triton(256, 1, 256, 1024, 64, 1024)
-    assert _cede_to_triton(256, 1, 96, 4096, 64, 1024)
-    assert not _cede_to_triton(256, 1, 96, 32768, 64, 1024)
-    assert not _cede_to_triton(256, 1, 128, 1024, 64, 1024)
-    expected_splits = {24: 3, 40: 3, 48: 4, 64: 3, 96: 2}
+    # Decode cedes tiny head-512 batches, page-64 head-512 batches past 256
+    # sequences, and page-32 sliding batches past 38 sequences.
+    assert _cede_to_triton(512, 1, 2, 1024, 64, None)
+    assert not _cede_to_triton(512, 1, 16, 32768, 64, None)
+    assert not _cede_to_triton(512, 1, 128, 4096, 64, None)
+    assert not _cede_to_triton(512, 1, 256, 4096, 64, None)
+    assert _cede_to_triton(512, 1, 384, 4096, 64, None)
+    assert not _cede_to_triton(512, 1, 32, 32768, 32, None)
+    assert not _cede_to_triton(512, 1, 512, 4096, 32, None)
+    assert not _cede_to_triton(512, 1, 64, 4096, 128, None)
+    assert not _cede_to_triton(256, 1, 38, 1024, 32, 1024)
+    assert _cede_to_triton(256, 1, 39, 1024, 32, 1024)
+    assert _cede_to_triton(256, 1, 128, 32768, 32, 1024)
+    assert not _cede_to_triton(256, 1, 96, 4096, 64, 1024)
+    assert not _cede_to_triton(256, 1, 512, 4096, 64, 1024)
+    expected_splits = {24: 6, 28: 8, 32: 4, 40: 5, 48: 3, 64: 2, 80: 3, 96: 3}
     for batch, expected in expected_splits.items():
         assert (
             plan_num_kv_splits(batch, 32768, 4, None, 512, decode_only=True) == expected
