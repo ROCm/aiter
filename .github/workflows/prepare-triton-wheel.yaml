@@ -84,22 +84,24 @@ jobs:
         id: download_triton_wheel
         env:
           TRITON_DEFAULT_ROCM_VERSION: "7.2.0"
+          DOCKER_IMAGE: ${{ inputs.docker-image }}
+          WORKSPACE: ${{ github.workspace }}
         run: |
           set -euo pipefail
           rm -rf triton_wheels
 
-          if bash .github/scripts/docker_pull_with_retry.sh "${{ inputs.docker-image }}"; then
+          if bash .github/scripts/docker_pull_with_retry.sh "${DOCKER_IMAGE}"; then
             if docker run --rm \
-              -v "${{ github.workspace }}:/workspace" \
+              -v "${WORKSPACE}:/workspace" \
               -w /workspace \
-              "${{ inputs.docker-image }}" \
+              "${DOCKER_IMAGE}" \
               bash ./.github/scripts/download_triton_wheel.sh triton_wheels; then
               echo "source=image" >> "${GITHUB_OUTPUT}"
               exit 0
             fi
-            echo "::warning::Triton wheel download inside ${{ inputs.docker-image }} failed; falling back to ROCm ${TRITON_DEFAULT_ROCM_VERSION}"
+            echo "::warning::Triton wheel download inside ${DOCKER_IMAGE} failed; falling back to ROCm ${TRITON_DEFAULT_ROCM_VERSION}"
           else
-            echo "::warning::Failed to pull ${{ inputs.docker-image }}; falling back to ROCm ${TRITON_DEFAULT_ROCM_VERSION}"
+            echo "::warning::Failed to pull ${DOCKER_IMAGE}; falling back to ROCm ${TRITON_DEFAULT_ROCM_VERSION}"
           fi
 
           docker system prune -af || true

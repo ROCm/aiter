@@ -46,6 +46,8 @@ jobs:
           ./.github/scripts/clean_up_rocm.sh
 
       - name: Run the container
+        env:
+          WORKSPACE: ${{ github.workspace }}
         run: |
           set -ex
           echo "Starting container: operators_tuning_test"
@@ -55,7 +57,7 @@ jobs:
           --shm-size=16G \
           --group-add $(getent group render | cut -d: -f3) \
           --group-add $(getent group video | cut -d: -f3) \
-          -v "${{ github.workspace }}:/workspace" \
+          -v "${WORKSPACE}:/workspace" \
           -w /workspace \
           --name operators_tuning_test \
           $DOCKER_IMAGE
@@ -79,21 +81,26 @@ jobs:
           rocminfo | grep -i 'Compute Unit'
     
       - name: Test Performance before tuning
+        env:
+          SHAPES: ${{ github.event.inputs.shapes }}
         run: |
           set -ex
           docker exec \
           -w /workspace \
           operators_tuning_test \
-          ./.github/scripts/op_tune.sh test "${{ github.event.inputs.shapes }}"
+          ./.github/scripts/op_tune.sh test "${SHAPES}"
 
       - name: Operators tuning Tests
+        env:
+          SHAPES: ${{ github.event.inputs.shapes }}
+          ARGUMENTS: ${{ github.event.inputs.arguments }}
         run: |
           set -ex
           echo "Running Operators tuning Tests..."
           docker exec \
           -w /workspace \
           operators_tuning_test \
-          ./.github/scripts/op_tune.sh tune "${{ github.event.inputs.shapes }}" "${{ github.event.inputs.arguments }}"
+          ./.github/scripts/op_tune.sh tune "${SHAPES}" "${ARGUMENTS}"
       
       - name: Show the difference after tuning
         run: |
@@ -101,12 +108,14 @@ jobs:
           git diff --color-words --word-diff=porcelain
 
       - name: Test Performance after tuning
+        env:
+          SHAPES: ${{ github.event.inputs.shapes }}
         run: |
           set -ex
           docker exec \
           -w /workspace \
           operators_tuning_test \
-          ./.github/scripts/op_tune.sh test "${{ github.event.inputs.shapes }}"
+          ./.github/scripts/op_tune.sh test "${SHAPES}"
 
       - name: Upload tuned CSVs
         if: always()
