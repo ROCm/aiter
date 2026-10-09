@@ -9,8 +9,89 @@
 #include <cmath>
 #include <iostream>
 #include <limits>
+#include <vector>
 
 namespace py = pybind11;
+
+static void test_head_padding_cache_reuse() {
+    const int num_seqs = 2;
+    const int query_length = 4;
+    const int num_query_heads = 4;
+    const int num_kv_heads = 1;
+    const int query_group_size = num_query_heads / num_kv_heads;
+    const int context_length = 1025;
+    const int partition_size = 256;
+    const int page_size = 64;
+    const int num_parts = (context_length + partition_size - 1) / partition_size;
+    const int blocks_per_seq = (context_length + page_size - 1) / page_size;
+    const int num_blocks = num_seqs * blocks_per_seq;
+    const int eq_query_group_size = query_length * query_group_size;
+    const int vec = 16 / static_cast<int>(torch::elementSize(torch::kBFloat16));
+    auto bf16 = torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA);
+    auto f32 = bf16.dtype(torch::kFloat32);
+    auto i32 = bf16.dtype(torch::kInt32);
+    auto lengths = torch::full({num_seqs}, context_length, i32);
+    auto tables = torch::arange(num_blocks, i32).reshape({num_seqs, blocks_per_seq});
+    torch::Tensor no_scale;
+
+    // Count native C++ cache misses through its Python warmup entry point.
+    auto warmup_mod = py::module_::import(
+        "csrc.cpp_itfs.pa_gluon_aot.pa_decode_gluon_aot_warmup");
+    py::object original_warmup = warmup_mod.attr("warmup_pa_decode");
+    std::vector<int> warmup_heads;
+    warmup_mod.attr("warmup_pa_decode") = py::cpp_function(
+        [&warmup_heads, original_warmup](py::args args) {
+            warmup_heads.push_back(args[3].cast<int>());
+            return original_warmup(*args);
+        });
+
+    try {
+        for (int head_size : {256, 192, 256}) {
+            auto query = torch::zeros(
+                {num_seqs * query_length, num_query_heads, head_size}, bf16);
+            auto output = torch::empty_like(query);
+            // The extra NaN block catches an unmasked D192 read without leaving
+            // allocated storage. Valid K=0 and V=1 give the exact reference 1.
+            auto key_storage = torch::full(
+                {num_blocks + 1, num_kv_heads, head_size / vec, page_size, vec},
+                std::numeric_limits<float>::quiet_NaN(), bf16);
+            auto value_storage = torch::full(
+                {num_blocks + 1, num_kv_heads, page_size / vec, head_size, vec},
+                std::numeric_limits<float>::quiet_NaN(), bf16);
+            auto key = key_storage.narrow(0, 0, num_blocks);
+            auto value = value_storage.narrow(0, 0, num_blocks);
+            key.zero_();
+            value.fill_(1);
+            auto exp_sums = torch::zeros(
+                {num_seqs, num_kv_heads, num_parts, eq_query_group_size}, f32);
+            auto max_logits = torch::full(
+                {num_seqs, num_kv_heads, num_parts, eq_query_group_size},
+                -std::numeric_limits<float>::infinity(), f32);
+            auto temporary_output = torch::zeros(
+                {num_seqs, num_kv_heads, num_parts, eq_query_group_size, head_size},
+                bf16);
+
+            aiter::pa_decode_gluon_aot(
+                output, query, key, value, lengths, tables,
+                1.0f / std::sqrt(static_cast<float>(head_size)),
+                query_length, num_parts, partition_size, at::ScalarType::BFloat16,
+                {}, no_scale, no_scale, exp_sums, max_logits, temporary_output);
+            torch::cuda::synchronize();
+            TORCH_CHECK(torch::equal(output, torch::ones_like(output)),
+                "AOT padding cache regression: incorrect output for D", head_size,
+                ", page ", page_size, ", dtype BFloat16");
+        }
+    } catch (...) {
+        warmup_mod.attr("warmup_pa_decode") = original_warmup;
+        throw;
+    }
+    warmup_mod.attr("warmup_pa_decode") = original_warmup;
+    TORCH_CHECK(warmup_heads == std::vector<int>({256, 192}),
+        "Expected separate D256/D192 warmups followed by a D256 cache hit");
+    std::cout << "[PASS] D256 -> D192 -> D256, page " << page_size
+              << ", BFloat16: two warmups, exact outputs"
+              << std::endl;
+}
 
 int main() {
     py::scoped_interpreter guard{};
@@ -129,6 +210,13 @@ int main() {
         std::cout << "Hot-path  output sum = " << hot_sum << std::endl;
     } catch (const std::exception& e) {
         std::cerr << "[FAIL] Hot-path error: " << e.what() << std::endl;
+        return 1;
+    }
+
+    try {
+        test_head_padding_cache_reuse();
+    } catch (const std::exception& e) {
+        std::cerr << "[FAIL] Padding cache regression: " << e.what() << std::endl;
         return 1;
     }
 
