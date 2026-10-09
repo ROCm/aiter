@@ -30,7 +30,6 @@ class OpKind(enum.Enum):
     construction errors instead of silently routing to the wrong code path."""
 
     MOE = "moe"
-    MXFP4_MOE = "mxfp4_moe"
     GEMM = "gemm"
     CONV = "conv"
     GROUPED_MOE = "grouped_moe"
@@ -147,11 +146,7 @@ def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
         from .fmha_fp8 import default_jobs
 
         return default_jobs()
-    if kind is OpKind.MOE:
-        from .moe import DEFAULT_CSVS, parse_csv
-    elif kind is OpKind.MXFP4_MOE:
-        from .mxfp4_moe import DEFAULT_CSVS, parse_csv
-    elif kind is OpKind.GEMM:
+    if kind is OpKind.GEMM:
         from .gemm import DEFAULT_CSVS, parse_csv
     elif kind is OpKind.CONV:
         from .conv import DEFAULT_CSVS, parse_csv
@@ -169,10 +164,6 @@ def _compile_one_config_for(kind: OpKind) -> Callable[..., dict[str, Any]]:
         from .mega_moe import compile_one_config
     elif kind is OpKind.FMHA_FP8:
         from .fmha_fp8 import compile_one_config
-    elif kind is OpKind.MOE:
-        from .moe import compile_one_config
-    elif kind is OpKind.MXFP4_MOE:
-        from .mxfp4_moe import compile_one_config
     elif kind is OpKind.GEMM:
         from .gemm import compile_one_config
     elif kind is OpKind.CONV:
@@ -431,12 +422,27 @@ def run_aot(cache_dir: str) -> None:
     os.makedirs(cache_dir, exist_ok=True)
     os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = cache_dir
 
+    # MoE replays the runtime itself, which needs aiter fully imported for each
+    # target arch, so it runs in per-arch processes of its own.
+    from .moe import DEFAULT_CSVS as MOE_CSVS
+    from .moe import run as run_moe_replay
+
+    moe_failed_archs = run_moe_replay([p for p in MOE_CSVS if os.path.isfile(p)])
+    moe_errors = (
+        [f"FlyDSL MOE replay failed for {moe_failed_archs} arch(es)"]
+        if moe_failed_archs
+        else []
+    )
+
+    pooled_kinds = [kind for kind in OpKind if kind is not OpKind.MOE]
     all_jobs: list[tuple[OpKind, dict[str, Any]]] = []
-    for kind in OpKind:
+    for kind in pooled_kinds:
         for job in _collect_aot_jobs_for(kind):
             all_jobs.append((kind, job))
 
     if not all_jobs:
+        if moe_errors:
+            raise AssertionError(f"[aiter] FlyDSL AOT failures: {moe_errors[0]}")
         print("[aiter] FlyDSL AOT: no kernels to compile, skipping")
         return
 
@@ -451,7 +457,7 @@ def run_aot(cache_dir: str) -> None:
 
     print(
         f"[aiter] FlyDSL AOT: {len(all_jobs)} kernels "
-        f"({'+'.join(k.name for k in OpKind)}), "
+        f"({'+'.join(k.name for k in pooled_kinds)}), "
         f"{max_workers} worker processes (cache: {cache_dir})"
     )
 
@@ -474,9 +480,9 @@ def run_aot(cache_dir: str) -> None:
             result_dir,
         )
 
-        ok_by_kind: dict[OpKind, int] = {k: 0 for k in OpKind}
-        fail_by_kind: dict[OpKind, int] = {k: 0 for k in OpKind}
-        errors: list[str] = []
+        ok_by_kind: dict[OpKind, int] = {k: 0 for k in pooled_kinds}
+        fail_by_kind: dict[OpKind, int] = {k: 0 for k in pooled_kinds}
+        errors: list[str] = list(moe_errors)
         for (kind, _job), result, spec in zip(all_jobs, raw, specs):
             label = spec[2]
             if result is not None and result.get("compile_time") is not None:
@@ -490,7 +496,7 @@ def run_aot(cache_dir: str) -> None:
                 fail_by_kind[kind] += 1
                 errors.append(f"FlyDSL {label} produced no kernel")
 
-        for kind in OpKind:
+        for kind in pooled_kinds:
             print(
                 f"[aiter] FlyDSL {kind.name} AOT: "
                 f"compiled {ok_by_kind[kind]} ok, {fail_by_kind[kind]} failed"
@@ -504,7 +510,9 @@ def run_aot(cache_dir: str) -> None:
                 suffix = (
                     f"; ... ({len(unique_errors) - _MAX_ERRORS_IN_MSG} more unique)"
                 )
-            tally = ", ".join(f"{k.name}: {fail_by_kind[k]} failed" for k in OpKind)
+            tally = ", ".join(
+                f"{k.name}: {fail_by_kind[k]} failed" for k in pooled_kinds
+            )
             raise AssertionError(
                 f"[aiter] FlyDSL AOT failures ({tally}): " + "; ".join(head) + suffix
             )

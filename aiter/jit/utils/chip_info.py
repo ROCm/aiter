@@ -112,8 +112,18 @@ def get_gfx_runtime() -> str:
     GPU.  Use for runtime dispatch decisions (selecting tuned kernels, picking
     code paths).  Use get_gfx() for build-time codegen paths (gen_instances,
     csrc module-level arch selection) where no GPU may be available.
+
+    With no GPU to detect (CPU-only builds, AOT compilation), a single explicit
+    GPU_ARCHS target stands in for the live GPU.
     """
-    gfx_arch = _detect_native()[0]
+    try:
+        gfx_arch = _detect_native()[0]
+    except RuntimeError:
+        targets = [t.strip() for t in os.getenv("GPU_ARCHS", "").split(";")]
+        targets = [t for t in targets if t]
+        if len(targets) != 1 or targets[0].lower() == "native":
+            raise
+        gfx_arch = targets[0]
     supported = set(GFX_MAP.values())
     if gfx_arch not in supported:
         raise KeyError(
