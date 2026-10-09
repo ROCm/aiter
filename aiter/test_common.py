@@ -3,7 +3,7 @@
 import copy
 import multiprocessing as mp
 import os
-from functools import wraps
+from functools import lru_cache, wraps
 
 import numpy as np
 import pandas as pd
@@ -46,6 +46,24 @@ def ensure_spawn_method():
         pass
 
 
+@lru_cache(maxsize=1)
+def kineto_available() -> bool:
+    """Whether torch.profiler can time GPU work on this build.
+
+    The Windows ROCm torch wheels are built without Kineto. There the profiler
+    still runs but records no device events, so ``get_trace_perf`` sees an empty
+    device frame and every measurement comes back as ``0 us`` -- which then
+    turns any uplift ratio into ``nan``. Timing falls back to ``cuda.Event``
+    when that is the case; Linux builds ship Kineto and are unaffected.
+    """
+    try:
+        return bool(torch.autograd.profiler.kineto_available())
+    except (AttributeError, RuntimeError):
+        # Older/newer torch may move or drop the probe. Assume the profiler
+        # works rather than silently switching everyone to cuda.Event.
+        return True
+
+
 def perftest(
     num_iters=101,
     num_warmup=2,
@@ -56,6 +74,9 @@ def perftest(
 ):
     def decorator(func):
         def wrapper(*args, **kwargs):
+            # Without Kineto the profiler reports zeros, so time with
+            # cuda.Event instead of handing the caller a meaningless 0.
+            cuda_event = use_cuda_event or not kineto_available()
             num = num_rotate_args
             if num < 1:
                 gpu_id = torch.cuda.current_device()
@@ -78,7 +99,7 @@ def perftest(
             ] + [(args, kwargs)]
             run_iters(num_warmup, func, *args, **kwargs)
             torch.cuda.synchronize()
-            if int(os.environ.get("AITER_LOG_MORE", "0")) or use_cuda_event:
+            if int(os.environ.get("AITER_LOG_MORE", "0")) or cuda_event:
                 latencies = []
                 start_event = torch.cuda.Event(enable_timing=True)
                 end_event = torch.cuda.Event(enable_timing=True)
@@ -90,7 +111,7 @@ def perftest(
                     latencies.append(start_event.elapsed_time(end_event))
                 avg = np.mean(latencies) * 1000
                 logger.info(f"avg: {avg} us/iter from cuda.Event")
-                if use_cuda_event:
+                if cuda_event:
                     return data, avg
 
             with tpf.profile(
