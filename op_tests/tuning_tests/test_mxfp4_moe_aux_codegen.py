@@ -2,14 +2,18 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """CPU checks at the MXMOE catalog and generated auxiliary output boundaries."""
 
+from __future__ import annotations
+
 import ast
 import re
 import subprocess
 import sys
 import tempfile
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[2]
 AUX_MODULE = ROOT / "aiter/ops/moe_mxfp4_aux.py"
@@ -21,7 +25,7 @@ MODEL_SHAPES = (
 )
 
 
-def load_aux_module(capability_probe=None):
+def load_aux_module(capability_probe: Any = None) -> Any:
     # The HIP/JIT extension is the system boundary. Keep the Python API real
     # without importing GPU packages or causing a shared module build.
     tree = ast.parse(AUX_MODULE.read_text(), filename=str(AUX_MODULE))
@@ -29,8 +33,8 @@ def load_aux_module(capability_probe=None):
         node for node in tree.body if not isinstance(node, (ast.Import, ast.ImportFrom))
     ]
 
-    def compile_ops(*args, **kwargs):
-        def decorate(fn):
+    def compile_ops(*args: Any, **kwargs: Any) -> Callable[..., Any]:
+        def decorate(fn: Any) -> Callable[..., Any]:
             if fn.__name__ == "_mxfp4_moe_sort_internal_is_supported":
                 return capability_probe or fn
             return fn
@@ -45,13 +49,13 @@ def load_aux_module(capability_probe=None):
 
 
 class TestMxfp4MoeAuxCatalog(unittest.TestCase):
-    def test_retune_model_shapes_are_registered(self):
+    def test_retune_model_shapes_are_registered(self) -> None:
         aux = load_aux_module()
         for shape in MODEL_SHAPES:
             with self.subTest(shape=shape):
                 self.assertTrue(aux.is_mxfp4_moe_shape_supported(*shape))
 
-    def test_generates_missing_instances_and_reuses_existing_keys_once(self):
+    def test_generates_missing_instances_and_reuses_existing_keys_once(self) -> None:
         expected_ne24 = {
             "aux_quant_NE24_TOPK6_MB128_H7168",
             "aux_quant_NE24_TOPK6_MB32_H7168",
@@ -104,8 +108,10 @@ class TestMxfp4MoeAuxCatalog(unittest.TestCase):
                     self.assertIn(key, names)
                     self.assertEqual(lookup.count(f'{{"{key}", &{key}}}'), 1)
 
-    def test_preflight_reports_missing_compiled_instance_without_fallback(self):
-        def capability_probe(expert, topk, hidden, block_m, zero_init):
+    def test_preflight_reports_missing_compiled_instance_without_fallback(self) -> None:
+        def capability_probe(
+            expert: int, topk: int, hidden: int, block_m: int, zero_init: bool
+        ) -> bool:
             return expert != 24 or not zero_init
 
         aux = load_aux_module(capability_probe)
@@ -114,13 +120,17 @@ class TestMxfp4MoeAuxCatalog(unittest.TestCase):
         ):
             aux.prepare_mxfp4_moe_aux(MODEL_SHAPES)
 
-    def test_preflight_accepts_new_inter_dim_when_compiled_aux_keys_cover_it(self):
+    def test_preflight_accepts_new_inter_dim_when_compiled_aux_keys_cover_it(
+        self,
+    ) -> None:
         covered = {(24, 6, 7168, 16, False), (24, 6, 7168, 16, True)}
         aux = load_aux_module(lambda *key: key in covered)
         self.assertIsNone(aux.prepare_mxfp4_moe_aux([(24, 7168, 512, 6)]))
 
-    def test_preflight_skips_extension_preparation_for_no_generated_sort_rows(self):
-        def capability_probe(*key):
+    def test_preflight_skips_extension_preparation_for_no_generated_sort_rows(
+        self,
+    ) -> None:
+        def capability_probe(*key: Any) -> bool:
             raise AssertionError("empty preflight must not load or build the extension")
 
         aux = load_aux_module(capability_probe)

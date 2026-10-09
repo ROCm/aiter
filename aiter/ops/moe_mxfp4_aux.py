@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+from collections.abc import Iterable
+
 from torch import Tensor
 
 from ..jit.core import compile_ops
@@ -96,7 +98,7 @@ def _mxfp4_moe_sort_internal_is_supported(
     """Private dispatch probe; not exported through ``aiter.ops`` or ``aiter``."""
 
 
-def prepare_mxfp4_moe_aux(shapes) -> None:
+def prepare_mxfp4_moe_aux(shapes: "Iterable[tuple[int, int, int, int]]") -> None:
     """Load/build and verify the BM16 sort instances before tuning workers start.
 
     ``shapes`` contains (expert, model_dim, inter_dim, topk) tuples. Instances

@@ -2,17 +2,20 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """CPU CSV-selection coverage for public padded-token integration reports."""
 
+from __future__ import annotations
+
 import ast
 import csv
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 HARNESS = Path(__file__).resolve().parents[1] / "test_mxfp4_flydsl_public_csv.py"
 
 
-def load_csv_boundary():
+def load_csv_boundary() -> Any:
     # Execute only the CSV boundary; importing the GPU harness is unnecessary.
     tree = ast.parse(HARNESS.read_text())
     tree.body = [
@@ -32,7 +35,7 @@ def load_csv_boundary():
     return SimpleNamespace(**namespace)
 
 
-def row(token, kernel):
+def row(token: int, kernel: str) -> dict[str, Any]:
     return {
         "gfx": "gfx950",
         "cu_num": "256",
@@ -55,7 +58,7 @@ def row(token, kernel):
 
 
 class TestPublicCsvLookup(unittest.TestCase):
-    def test_request_token3_reports_actual_token4_primary_in_same_csv(self):
+    def test_request_token3_reports_actual_token4_primary_in_same_csv(self) -> None:
         harness = load_csv_boundary()
         request, lookup = row(3, "requested_pair"), row(4, "lookup_pair")
         with tempfile.TemporaryDirectory() as directory:
@@ -73,7 +76,9 @@ class TestPublicCsvLookup(unittest.TestCase):
             self.assertEqual(selection["kernelName1"], "lookup_pair")
             self.assertEqual(rows[0]["kernelName1"], "requested_pair")
 
-    def test_large_token_lookup_and_smaller_tier_do_not_claim_requested_pair(self):
+    def test_large_token_lookup_and_smaller_tier_do_not_claim_requested_pair(
+        self,
+    ) -> None:
         harness = load_csv_boundary()
         request = row(65536, "requested_pair")
         self.assertEqual(

@@ -2,6 +2,8 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Execute actual tuned CSV rows through public fused_moe with explicit A8W4."""
 
+from __future__ import annotations
+
 import argparse
 import csv
 import functools
@@ -12,6 +14,7 @@ import json
 import math
 import os
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import pandas as pd
@@ -35,13 +38,15 @@ fm = importlib.import_module("aiter.fused_moe")
 SUPPORTED_GFX = ("gfx950",)
 
 
-def run_torch(data, topk, activation, limit):
+def run_torch(
+    data: dict[str, Any], topk: int, activation: ActivationType, limit: float | None
+) -> torch.Tensor:
     return Mxfp4FlydslTuner._torch_ref(
         data, topk, dtypes.bf16, activation, swiglu_limit=limit
     )
 
 
-def csv_rows(path):
+def csv_rows(path: str | Path) -> list[dict[str, str]]:
     with Path(path).open(newline="") as source:
         return [
             {key.strip(): (value or "").strip() for key, value in row.items()}
@@ -49,7 +54,9 @@ def csv_rows(path):
         ]
 
 
-def select_csv_lookup(rows, requested, lookup_token):
+def select_csv_lookup(
+    rows: list[dict[str, str]], requested: dict[str, Any], lookup_token: int
+) -> dict[str, Any] | None:
     """Identify the primary CSV row for the public token key; never override it."""
     fields = (
         "gfx",
@@ -67,7 +74,7 @@ def select_csv_lookup(rows, requested, lookup_token):
         "doweight_stage1",
     )
 
-    def key(row):
+    def key(row: dict[str, Any]) -> tuple[str, ...]:
         values = []
         for field in fields:
             value = str(row.get(field, "")).strip()
@@ -105,8 +112,14 @@ def select_csv_lookup(rows, requested, lookup_token):
 
 
 def decode_valid_scales(
-    payload, scales, inter_dim, block_m, sorted_ids, valid_ids, token
-):
+    payload: torch.Tensor,
+    scales: torch.Tensor,
+    inter_dim: int,
+    block_m: int,
+    sorted_ids: torch.Tensor,
+    valid_ids: torch.Tensor,
+    token: int,
+) -> torch.Tensor:
     """Check only E8M0 bytes actually consumed for live sorted intermediate rows."""
     from aiter.ops.flydsl.kernels.mxfp4_gemm_common import kas_per_chunk_dw_for
 
@@ -144,17 +157,17 @@ def decode_valid_scales(
 
 @benchmark()
 def test_public_a8w4_csv(
-    token,
-    model_dim,
-    inter_dim,
-    expert,
-    topk,
-    activation,
-    kernel1,
-    kernel2,
-    expected_pair=None,
-    lookup_csv_token=None,
-):
+    token: int,
+    model_dim: int,
+    inter_dim: int,
+    expert: int,
+    topk: int,
+    activation: ActivationType,
+    kernel1: str,
+    kernel2: str,
+    expected_pair: tuple[str, str] | None = None,
+    lookup_csv_token: int | None = None,
+) -> dict[str, Any]:
     expected_pair = (kernel1, kernel2) if expected_pair is None else expected_pair
     g1 = _parse_mxfp4_g1_kname(kernel1)
     g2 = parse_flydsl_v2_gemm2_kernel(kernel2)
@@ -178,7 +191,7 @@ def test_public_a8w4_csv(
     calls, intermediate = [], {}
 
     @functools.wraps(original1)
-    def observe1(*args, **kwargs):
+    def observe1(*args: Any, **kwargs: Any) -> Any:
         result = original1(*args, **kwargs)
         calls.append(("g1", kwargs["kernelName1"]))
         payload, scales = result
@@ -202,7 +215,7 @@ def test_public_a8w4_csv(
         return result
 
     @functools.wraps(original2)
-    def observe2(*args, **kwargs):
+    def observe2(*args: Any, **kwargs: Any) -> Any:
         calls.append(("g2", kwargs["kernelName2"]))
         intermediate.update(
             reader_payload_dtype=str(args[0].dtype),
@@ -210,7 +223,7 @@ def test_public_a8w4_csv(
         )
         return original2(*args, **kwargs)
 
-    def public():
+    def public() -> torch.Tensor:
         return fm.fused_moe(
             data["input"],
             data["w1_a16"],
@@ -325,7 +338,7 @@ def test_public_a8w4_csv(
     return ret
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--csv", type=Path, required=True)
     parser.add_argument(

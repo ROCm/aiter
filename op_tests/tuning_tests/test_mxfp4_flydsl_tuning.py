@@ -1,11 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+from __future__ import annotations
+
+import argparse
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest import mock
 
 import pandas as pd
@@ -36,7 +40,7 @@ KEYS = [
 ]
 
 
-def shape_row(**changes):
+def shape_row(**changes: dict[str, Any]) -> dict[str, Any]:
     row = {
         "gfx": "gfx950",
         "cu_num": 256,
@@ -58,7 +62,7 @@ def shape_row(**changes):
 
 
 class TestMxfp4FlydslInputsAndCandidates(unittest.TestCase):
-    def setUp(self):
+    def setUp(self) -> None:
         torch.set_default_device("cpu")
         self.tuner = Mxfp4FlydslTuner.__new__(Mxfp4FlydslTuner)
         self.tuner.keys = KEYS
@@ -66,12 +70,14 @@ class TestMxfp4FlydslInputsAndCandidates(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.addCleanup(torch.set_default_device, "cuda")
 
-    def read_rows(self, rows):
+    def read_rows(self, rows: list[dict[str, Any]]) -> pd.DataFrame:
         path = Path(self.directory.name) / "input.csv"
         pd.DataFrame(rows).to_csv(path, index=False)
         return self.tuner.get_untuned_gemm_list(str(path))
 
-    def test_parent_prepares_only_generated_sort_rows_before_shape_workers(self):
+    def test_parent_prepares_only_generated_sort_rows_before_shape_workers(
+        self,
+    ) -> None:
         from aiter.ops import moe_mxfp4_aux
         from csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune import FmoeTuner
 
@@ -108,7 +114,7 @@ class TestMxfp4FlydslInputsAndCandidates(unittest.TestCase):
         )
         observed = []
 
-        def prepare(_self, _args):
+        def prepare(_self: Any, _args: argparse.Namespace) -> None:
             _self.untunedf = rows
 
         with mock.patch.object(FmoeTuner, "pre_process", prepare), mock.patch.object(
@@ -119,7 +125,7 @@ class TestMxfp4FlydslInputsAndCandidates(unittest.TestCase):
             self.tuner.pre_process(args)
         self.assertEqual(observed, [(128, 3072, 512, 4), (128, 3072, 1536, 4)])
 
-    def test_run_config_leaves_auxiliary_preparation_to_production(self):
+    def test_run_config_leaves_auxiliary_preparation_to_production(self) -> None:
         from aiter.ops import moe_mxfp4_aux
         from csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune import FmoeTuner
 
@@ -132,7 +138,7 @@ class TestMxfp4FlydslInputsAndCandidates(unittest.TestCase):
         ):
             self.tuner.pre_process(SimpleNamespace(run_config=True, compare=False))
 
-    def test_mixed_rows_use_their_own_precision_and_default_search(self):
+    def test_mixed_rows_use_their_own_precision_and_default_search(self) -> None:
         rows = self.read_rows([shape_row(), shape_row(q_dtype_a="torch.float8_e4m3fn")])
         a4, a8 = [row.to_dict() for _, row in rows.iterrows()]
         a4_default = self.tuner._candidate_rows(a4)
@@ -160,7 +166,7 @@ class TestMxfp4FlydslInputsAndCandidates(unittest.TestCase):
             self.assertEqual(g1["num_waves"], 4)
             self.assertFalse(g2["persist"])
 
-    def test_invalid_csv_reports_the_original_row_and_reason(self):
+    def test_invalid_csv_reports_the_original_row_and_reason(self) -> None:
         invalid = (
             ({"dtype": "torch.float16"}, "dtype"),
             ({"q_dtype_a": "torch.bfloat16"}, "activation dtype"),
@@ -184,13 +190,13 @@ class TestMxfp4FlydslInputsAndCandidates(unittest.TestCase):
             ):
                 self.read_rows([shape_row(), shape_row(), shape_row(**changes)])
 
-    def test_missing_required_column_reports_the_input_file(self):
+    def test_missing_required_column_reports_the_input_file(self) -> None:
         row = shape_row()
         del row["q_dtype_a"]
         with self.assertRaisesRegex(ValueError, r"input.csv.*q_dtype_a"):
             self.read_rows([row])
 
-    def test_explicit_search_mode_is_used_in_serial_and_spawned_workers(self):
+    def test_explicit_search_mode_is_used_in_serial_and_spawned_workers(self) -> None:
         a8 = self.read_rows([shape_row(token=64, q_dtype_a="torch.float8_e4m3fn")])
         for mode in (None, "prune", "full"):
             args = SimpleNamespace(
@@ -203,7 +209,12 @@ class TestMxfp4FlydslInputsAndCandidates(unittest.TestCase):
 
             # Substitute only the GPU evaluation boundary. Real candidate
             # generation and the shape worker still run in both paths.
-            def evaluate(_self, row, candidate, _args):
+            def evaluate(
+                _self: Any,
+                row: dict[str, Any],
+                candidate: dict[str, Any],
+                _args: argparse.Namespace,
+            ) -> float:
                 candidate["us"] = 128.0 / candidate["block_m"]
                 candidate["error"] = 0.0
                 return candidate["us"]
@@ -216,7 +227,9 @@ class TestMxfp4FlydslInputsAndCandidates(unittest.TestCase):
                 # Two distinct workloads exercise the shape worker branch.
                 mp_rows = pd.concat([a8, a8.assign(token=65)], ignore_index=True)
 
-                def isolated(payloads, _mp_num, _ctx):
+                def isolated(
+                    payloads: list[tuple], _mp_num: int, _ctx: Any
+                ) -> list[dict[str, Any] | None]:
                     with mock.patch.object(torch.cuda, "set_device"):
                         return [
                             gemm_moe_tune._mxfp4_tune_shape_worker((*payload[:3], 0))
@@ -230,7 +243,7 @@ class TestMxfp4FlydslInputsAndCandidates(unittest.TestCase):
                 expected_bm = 64 if mode == "prune" else 128
                 self.assertEqual(serial["block_m"], expected_bm)
 
-    def test_cli_preserves_an_omitted_mode_and_explicit_overrides(self):
+    def test_cli_preserves_an_omitted_mode_and_explicit_overrides(self) -> None:
         tuner = Mxfp4FlydslTuner("test", KEYS, [])
         for mode in (None, "prune", "full"):
             argv = ["gemm_moe_tune.py", "--mxfp4-flydsl", "--mp", "1"]
@@ -240,7 +253,7 @@ class TestMxfp4FlydslInputsAndCandidates(unittest.TestCase):
                 args = tuner.parse_args()
                 self.assertEqual(args.mxfp4_search_mode, mode)
 
-    def test_full_search_keeps_only_the_coupled_shape_support_domain(self):
+    def test_full_search_keeps_only_the_coupled_shape_support_domain(self) -> None:
         unsupported = (
             {"model_dim": 256},  # GEMM1's pipelined loop needs two K tiles.
             {"model_dim": 768},  # More than one tile, but non-divisible k_wave.
@@ -262,7 +275,9 @@ class TestMxfp4FlydslInputsAndCandidates(unittest.TestCase):
             else:
                 self.assertFalse(candidates, changes)
 
-    def test_scatter_candidates_require_the_matching_generated_auxiliary_key(self):
+    def test_scatter_candidates_require_the_matching_generated_auxiliary_key(
+        self,
+    ) -> None:
         for hidden, topk, expected in (
             (1024, 2, {"atomic", "reduce"}),
             (3072, 4, {"atomic", "reduce", "scatter"}),
@@ -279,7 +294,9 @@ class TestMxfp4FlydslInputsAndCandidates(unittest.TestCase):
             }
             self.assertEqual(epilogs, expected)
 
-    def test_bm16_aot_jobs_use_the_same_native_scale_contract_for_both_precisions(self):
+    def test_bm16_aot_jobs_use_the_same_native_scale_contract_for_both_precisions(
+        self,
+    ) -> None:
         from aiter.aot.flydsl.mxfp4_moe import parse_csv
 
         rows = []
@@ -304,7 +321,7 @@ class TestMxfp4FlydslInputsAndCandidates(unittest.TestCase):
         self.assertEqual({job["D_INTER"] for job in stage1}, {384})
         self.assertEqual({job["interleave"] for job in stage1}, {False, True})
 
-    def test_bm16_a8_candidates_reach_the_persisted_winner_and_profile(self):
+    def test_bm16_a8_candidates_reach_the_persisted_winner_and_profile(self) -> None:
         row = self.read_rows([shape_row(token=64, q_dtype_a="torch.float8_e4m3fn")])
         result_columns = [
             "block_m",
@@ -331,7 +348,9 @@ class TestMxfp4FlydslInputsAndCandidates(unittest.TestCase):
             profile_file=str(Path(self.directory.name) / "profile.csv"),
         )
 
-        def evaluate(_self, _row, candidate, _args):
+        def evaluate(
+            _self: Any, _row: Any, candidate: dict[str, Any], _args: argparse.Namespace
+        ) -> float:
             candidate["error"] = 0.01
             candidate["us"] = float(candidate["block_m"])
             return candidate["us"]
