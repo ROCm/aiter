@@ -16,9 +16,9 @@ from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
 
 from ..kernels_common import atomic_add_i32, atomic_or_i32
-from .topk_common import _load_f32x4, _row_length
-from .topk_per_row_decode import (
-    build_topk_per_row_decode_direct_epilogue,
+from .topk_common import (
+    _load_f32x4,
+    _row_length,
     build_topk_per_row_decode_geometry,
 )
 
@@ -117,9 +117,6 @@ def build_radix_topk_one_block_module(
         raise ValueError("direct values require a value-writing decode split")
     if decode_split:
         decode_geometry = build_topk_per_row_decode_geometry(k, stable)
-        direct_epilogue = build_topk_per_row_decode_direct_epilogue(
-            k, block_threads, write_direct_values
-        )
 
     num_waves = block_threads // wave_size
     long_radix_bits, pass1_replicas = _LONG_RADIX_BY_ARCH.get(arch, _LONG_RADIX_DEFAULT)
@@ -259,6 +256,19 @@ def build_radix_topk_one_block_module(
         row_values = fx.slice(value_output, (row, None))
         row_direct_indices = fx.slice(direct_indices, (row, None))
         row_direct_values = fx.slice(direct_value_output, (row, None))
+        if const_expr(decode_split):
+            index_iter = direct_row.select(
+                fx.get_iter(row_direct_indices), fx.get_iter(row_indices)
+            )
+            row_indices = fx.make_view(index_iter, row_indices.layout)
+            if const_expr(write_direct_values):
+                value_iter = direct_row.select(
+                    fx.get_iter(row_direct_values), fx.get_iter(row_values)
+                )
+                row_values = fx.make_view(value_iter, row_values.layout)
+        write_row_values = True
+        if const_expr(decode_split and not write_direct_values):
+            write_row_values = ~direct_row
         row_labels = fx.slice(index_labels, (row, None)) if map_indices else None
 
         def reported_index(col):
@@ -383,14 +393,14 @@ def build_radix_topk_one_block_module(
                 out_pos = atomic_add_i32(metadata, one, _RUNNING_ABOVE, "workgroup")
                 if out_pos < top_k:
                     row_indices[output_base + out_pos] = reported_index(col)
-                    if const_expr(write_values):
+                    if const_expr(write_values) and write_row_values:
                         row_values[output_base + out_pos] = ordered_value(key)
             elif equal:
                 back_pos = atomic_add_i32(metadata, one, _RUNNING_EQUAL, "workgroup")
                 if back_pos < num_needed:
                     out_pos = top_k - one - back_pos
                     row_indices[output_base + out_pos] = reported_index(col)
-                    if const_expr(write_values):
+                    if const_expr(write_values) and write_row_values:
                         row_values[output_base + out_pos] = ordered_value(key)
 
         def reset_scatter_counters(metadata, reset_above=True):
@@ -633,7 +643,7 @@ def build_radix_topk_one_block_module(
                 pos = tid + item * block_threads
                 if pos < top_k:
                     row_indices[output_base + pos] = reported_index(local_indices[item])
-                    if const_expr(write_values):
+                    if const_expr(write_values) and write_row_values:
                         row_values[output_base + pos] = input_row[local_indices[item]]
 
         def sort_and_store_stable(
@@ -670,7 +680,7 @@ def build_radix_topk_one_block_module(
                         bit_idx = fx.math.cttz(word)
                         col = word_idx * fx.Int32(32) + bit_idx
                         row_indices[output_base + out_pos] = reported_index(col)
-                        if const_expr(write_values):
+                        if const_expr(write_values) and write_row_values:
                             row_values[output_base + out_pos] = input_row[col]
                         out_pos = out_pos + one
                         word = word & (word - one)
@@ -783,13 +793,13 @@ def build_radix_topk_one_block_module(
                         out_pos = my_above + accepted_equal
                         if cls == 2:
                             row_indices[output_base + out_pos] = reported_index(col)
-                            if const_expr(write_values):
+                            if const_expr(write_values) and write_row_values:
                                 row_values[output_base + out_pos] = ordered_value(key)
                             my_above = my_above + 1
                         elif cls == 1:
                             if my_eq < num_needed:
                                 row_indices[output_base + out_pos] = reported_index(col)
-                                if const_expr(write_values):
+                                if const_expr(write_values) and write_row_values:
                                     row_values[output_base + out_pos] = ordered_value(
                                         key
                                     )
@@ -1094,7 +1104,7 @@ def build_radix_topk_one_block_module(
                                 staged_local_indices[out_pos] = col
                         else:
                             row_indices[output_base + out_pos] = reported_index(col)
-                            if const_expr(write_values):
+                            if const_expr(write_values) and write_row_values:
                                 row_values[output_base + out_pos] = ordered_value(key)
                 active = active & (prefix == prefix_threshold)
                 if active:
@@ -1294,7 +1304,7 @@ def build_radix_topk_one_block_module(
             col = tid
             if col < k:
                 row_indices[col] = (col < row_len).select(row_start + col, fx.Int32(-1))
-                if const_expr(write_values):
+                if const_expr(write_values) and write_row_values:
                     value = fx.Float32(float("-inf"))
                     if col < row_len:
                         value = physical_row[row_start + col]
@@ -1332,7 +1342,7 @@ def build_radix_topk_one_block_module(
                         fx.slice(row_index_tiles, (None, vector_idx)),
                     )
 
-                    if const_expr(write_values):
+                    if const_expr(write_values) and write_row_values:
                         value_fragment = fx.make_rmem_tensor(
                             value_fragment_layout, fx.Float32
                         )
@@ -1370,7 +1380,7 @@ def build_radix_topk_one_block_module(
                 valid = tail < row_len
                 safe_tail = valid.select(tail, zero)
                 row_indices[tail] = valid.select(row_start + tail, fx.Int32(-1))
-                if const_expr(write_values):
+                if const_expr(write_values) and write_row_values:
                     row_values[tail] = valid.select(
                         input_row[safe_tail], fx.Float32(float("-inf"))
                     )
@@ -1385,7 +1395,7 @@ def build_radix_topk_one_block_module(
                         row_indices[output_base + col] = valid.select(
                             reported_index(safe_col), fx.Int32(-1)
                         )
-                        if const_expr(write_values):
+                        if const_expr(write_values) and write_row_values:
                             row_values[output_base + col] = valid.select(
                                 input_row[safe_col], fx.Float32(float("-inf"))
                             )
@@ -1416,17 +1426,6 @@ def build_radix_topk_one_block_module(
                         candidate_local_indices,
                         staged_local_indices,
                     )
-
-        if const_expr(decode_split):
-            direct_epilogue(
-                part,
-                direct_row,
-                tid,
-                row_indices,
-                row_values,
-                row_direct_indices,
-                row_direct_values,
-            )
 
     @flyc.kernel(
         name=(

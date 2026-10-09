@@ -3,8 +3,18 @@
 
 """Shared scalar, load, and wave helpers for FlyDSL TopK kernels."""
 
+from functools import cache
+
+import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import Float32, Int32, arith, as_ir_value, const_expr
+from flydsl.expr import (
+    Float32,
+    Int32,
+    arith,
+    as_ir_value,
+    const_expr,
+    range_constexpr,
+)
 from flydsl.expr import rocdl as fly_rocdl
 from flydsl.expr.typing import T
 
@@ -13,6 +23,9 @@ from aiter.ops.flydsl.kernels.tensor_shim import buf_copy_atom
 
 _DPP_ROW_MASK = 0xF
 _DPP_BANK_MASK = 0xF
+_DECODE_SPLIT_PART_ELEMENTS = 32_768
+_DECODE_SPLIT_STABLE_PART_ELEMENTS = 65_536
+_VEC = 4
 
 
 def _f32_to_ord(val):
@@ -36,6 +49,60 @@ def _load_f32x4(tensor, vec_idx):
     fragment = fx.make_fragment_like(src)
     fx.copy(buf_copy_atom(16, Float32), src, fragment)
     return fx.Vector(fx.memref_load_vec(fragment))
+
+
+@cache
+def build_topk_per_row_decode_geometry(k: int, stable: bool):
+    aligned_k = (k + _VEC - 1) // _VEC * _VEC
+    target_part_elements = (
+        _DECODE_SPLIT_STABLE_PART_ELEMENTS if stable else _DECODE_SPLIT_PART_ELEMENTS
+    )
+    target_part_elements = max(target_part_elements, aligned_k)
+    part_options = (2, 4, 8, 16)
+
+    @flyc.jit
+    def decode_geometry(
+        block,
+        tid,
+        row_ends,
+        merge_lengths,
+        width,
+        next_n,
+        num_parts,
+    ):
+        zero = fx.Int32(0)
+        one = fx.Int32(1)
+        row = block // num_parts
+        part = block % num_parts
+        full_len = _row_length(row, row_ends, width, next_n)
+        active_parts = one
+        for i in range_constexpr(len(part_options)):
+            parts = fx.Int32(part_options[i])
+            target = fx.min(num_parts, parts)
+            enough_work = full_len >= parts * fx.Int32(target_part_elements)
+            promote = (active_parts < target) & enough_work
+            active_parts = promote.select(target, active_parts)
+        direct_row = active_parts == one
+        if (part == zero) & (tid == zero):
+            merge_lengths[row] = direct_row.select(zero, active_parts * fx.Int32(k))
+        chunk = (full_len // (active_parts * fx.Int32(_VEC))) * fx.Int32(_VEC)
+        row_start = part * chunk
+        active = part < active_parts
+        row_end = active.select(
+            (part == active_parts - one).select(full_len, row_start + chunk),
+            row_start,
+        )
+        return (
+            row,
+            part,
+            row_start,
+            row_end,
+            fx.Int32(k) * part,
+            active,
+            direct_row,
+        )
+
+    return decode_geometry
 
 
 def _warp_inclusive_prefix_i32(val, lane, wave_size):

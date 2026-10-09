@@ -17,7 +17,7 @@ from ..kernels.topk.radix_topk_one_block import (
     build_radix_topk_one_block_module,
 )
 from ..kernels.topk.topk_per_row_decode import (
-    ONE_CTA_MAX_ROW_LENGTH,
+    ONE_WORKGROUP_MAX_ROW_WIDTH,
     launch_topk_per_row_decode_split,
 )
 from ..kernels.topk.topk_per_row_decode import (
@@ -357,7 +357,7 @@ def flydsl_top_k_per_row_decode(
     # Allocated width bounds every row: at or below the one-CTA limit no row
     # can be long. A wider buffer may still hold short rows; the multi-CTA
     # kernel reads each row's length and gives a short one a single CTA.
-    if width <= ONE_CTA_MAX_ROW_LENGTH:
+    if width <= ONE_WORKGROUP_MAX_ROW_WIDTH:
         launcher = build_topk_per_row_decode_one_workgroup_module(
             k, wave_size=wave_size, write_values=values is not None
         )
@@ -390,7 +390,6 @@ def flydsl_top_k_per_row_decode(
         properties.multi_processor_count,
         stream,
     )
-    return
 
 
 def flydsl_radix_topk_one_block(

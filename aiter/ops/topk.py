@@ -12,6 +12,7 @@ from ..jit.core import compile_ops
 from ..jit.utils.chip_info import get_cu_num, get_gfx
 from ..utility import dtypes
 from ..utility.graph_alloc import persistent_alloc
+from .flydsl.kernels.topk.topk_per_row_decode import ONE_WORKGROUP_MAX_ROW_WIDTH
 
 
 # Raw binding: no argument validation, correction_bias must be a real tensor.
@@ -504,7 +505,7 @@ _FLYDSL_TOPK_DECODE_GATES = {
     },
     "gfx950": {
         True: (
-            (0, 20_000, 128),
+            (0, ONE_WORKGROUP_MAX_ROW_WIDTH, 128),
             (32_768, 65_535, 16),
             (65_536, 131072, 32),
             (131072, 200_000, 48),

@@ -6,7 +6,10 @@ import torch
 
 import aiter
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.topk.topk_per_row import _FLYDSL_TOPK_ONE_BLOCK_ARCHES
+from aiter.ops.flydsl.topk.topk_per_row import (
+    _FLYDSL_TOPK_ONE_BLOCK_ARCHES,
+    clear_topk_per_row_decode_workspace_cache,
+)
 from aiter.ops.topk import _FLYDSL_TOPK_DECODE_GATES
 from aiter.test_common import benchmark, perftest
 
@@ -465,6 +468,108 @@ def test_mb_workspace_reuse():
     print("[mb_workspace_reuse] PASS: 3 reused-buffer mb calls matched torch.topk")
 
 
+def test_decode_split_regressions():
+    """Cover mixed direct/merge rows and the stream-local split workspace."""
+
+    if get_gfx() not in _FLYDSL_TOPK_DECODE_GATES:
+        return
+
+    width, top_k, next_n = 524288, 512, 2
+    seq_lens = torch.tensor([20001, width], dtype=torch.int32, device="cuda")
+    num_rows = seq_lens.numel() * next_n
+    row_starts = torch.zeros(num_rows, dtype=torch.int32, device="cuda")
+    row_ids = torch.arange(num_rows, device="cuda")
+    row_ends = seq_lens[row_ids // next_n] - next_n + row_ids % next_n + 1
+
+    def make_logits(seed, tied=False):
+        logits = create_random_logits(
+            row_starts,
+            row_ends,
+            torch.float32,
+            seed,
+            physical_width=width,
+        )
+        if tied:
+            logits[-1, : row_ends[-1]] = 1.0
+        return logits
+
+    def launch(logits, stable, write_values):
+        indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
+        values = (
+            torch.empty((num_rows, top_k), dtype=torch.float32, device="cuda")
+            if write_values
+            else None
+        )
+
+        def call():
+            aiter.top_k_per_row_decode(
+                logits,
+                next_n,
+                seq_lens,
+                indices,
+                num_rows,
+                logits.stride(0),
+                logits.stride(1),
+                k=top_k,
+                stable=stable,
+                values=values,
+            )
+
+        return call, indices, values
+
+    def check(logits, indices, values, stable):
+        reference = logits.topk(top_k, dim=-1).indices
+        assert compare_topk_results(
+            logits,
+            indices,
+            reference,
+            row_starts,
+            row_ends,
+            top_k,
+            stable=stable,
+            values=values,
+        )
+        if stable:
+            assert torch.equal(
+                indices[-1], torch.arange(top_k, dtype=torch.int32, device="cuda")
+            )
+
+    clear_topk_per_row_decode_workspace_cache()
+    for stable in (False, True):
+        for write_values in (False, True):
+            # The second seed reuses the same stream-local workspace.
+            for seed in (123, 456):
+                logits = make_logits(seed, tied=stable)
+                call, indices, values = launch(logits, stable, write_values)
+                call()
+                check(logits, indices, values, stable)
+
+    logits = make_logits(789, tied=True)
+    call, indices, values = launch(logits, True, True)
+    call()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        call()
+    graph.replay()
+    check(logits, indices, values, True)
+
+    streams = (torch.cuda.Stream(), torch.cuda.Stream())
+    stream_inputs = (make_logits(901), make_logits(902))
+    torch.cuda.synchronize()
+    pending = []
+    for logits, stream in zip(stream_inputs, streams):
+        call, indices, values = launch(logits, False, False)
+        with torch.cuda.stream(stream):
+            call()
+        pending.append((logits, indices, values))
+    for stream in streams:
+        stream.synchronize()
+    for logits, indices, values in pending:
+        check(logits, indices, values, False)
+
+    print("[decode_split] PASS: mixed, stable, values, graph, reuse, and streams")
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -535,6 +640,7 @@ args = parser.parse_args()
 
 # Self-reset / persistent-workspace regression (runs in CI via `python3 <file>`).
 test_mb_workspace_reuse()
+test_decode_split_regressions()
 
 
 # Ask each path which arches it serves rather than keeping a second copy
